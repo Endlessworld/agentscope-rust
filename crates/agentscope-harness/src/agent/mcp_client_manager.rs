@@ -1,0 +1,346 @@
+//! MCP Client Manager for managing MCP client connections and lifecycle.
+//!
+//! This module provides a manager for MCP client connections, handling
+//! client creation, connection, disconnection, and tool discovery.
+
+use agentscope_core::error::{Error, Result};
+use rust_mcp_sdk::error::SdkResult;
+use rust_mcp_sdk::mcp_client::{client_runtime, ClientHandler, McpClientOptions};
+use rust_mcp_sdk::schema::{
+    ClientCapabilities, Implementation, InitializeRequestParams,
+    LATEST_PROTOCOL_VERSION,
+};
+use rust_mcp_sdk::{McpClient, StdioTransport, ToMcpClientHandler, TransportOptions};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Represents a connected MCP client instance.
+#[derive(Clone)]
+pub struct McpClientInstance {
+    /// Unique identifier for this client instance.
+    pub id: String,
+    /// Server configuration used to create this client.
+    pub config: McpServerConfig,
+    /// Whether the client is currently connected.
+    pub connected: bool,
+    /// Tools discovered from the MCP server.
+    pub tools: Vec<McpToolInfo>,
+    /// The actual MCP client runtime.
+    client: Option<Arc<dyn McpClient>>,
+}
+
+/// Information about an MCP tool discovered from a server.
+#[derive(Debug, Clone)]
+pub struct McpToolInfo {
+    /// Tool name.
+    pub name: String,
+    /// Tool description.
+    pub description: Option<String>,
+    /// JSON Schema for tool parameters.
+    pub parameters: serde_json::Value,
+    /// Server name this tool belongs to.
+    pub server: String,
+}
+
+/// Configuration for an MCP server to register as a tool source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    /// stdio launch command (e.g. `npx -y @modelcontextprotocol/server-filesystem`).
+    pub command: Option<String>,
+    /// SSE/HTTP transport endpoint (alternative to `command`).
+    pub url: Option<String>,
+}
+
+impl McpServerConfig {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: None,
+            url: None,
+        }
+    }
+
+    pub fn command(mut self, command: impl Into<String>) -> Self {
+        self.command = Some(command.into());
+        self
+    }
+
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+}
+
+/// Manages MCP client connections and lifecycle.
+pub struct McpClientManager {
+    /// Map of client ID to client instance.
+    clients: Mutex<HashMap<String, McpClientInstance>>,
+    /// Counter for generating unique client IDs.
+    id_counter: Mutex<u64>,
+}
+
+impl McpClientManager {
+    /// Creates a new MCP client manager.
+    pub fn new() -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            id_counter: Mutex::new(0),
+        }
+    }
+
+    /// Creates a new client instance with the given configuration.
+    ///
+    /// This method creates a client but does not connect to the server.
+    /// Use `connect` to establish the connection.
+    pub async fn create_client(&self, config: McpServerConfig) -> Result<String> {
+        let mut counter = self.id_counter.lock().await;
+        let id = format!("mcp_client_{}", *counter);
+        *counter += 1;
+
+        let instance = McpClientInstance {
+            id: id.clone(),
+            config,
+            connected: false,
+            tools: Vec::new(),
+            client: None,
+        };
+
+        let mut clients = self.clients.lock().await;
+        clients.insert(id.clone(), instance);
+
+        Ok(id)
+    }
+
+    /// Connects to an MCP server using the specified client ID.
+    ///
+    /// This method establishes the connection to the MCP server and
+    /// performs the initialization handshake.
+    pub async fn connect(&self, client_id: &str) -> Result<()> {
+        let mut clients = self.clients.lock().await;
+        let client = clients
+            .get_mut(client_id)
+            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+
+        if client.connected {
+            return Ok(());
+        }
+
+        // Create client details
+        let client_details = InitializeRequestParams {
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "agentscope-harness-mcp-client".into(),
+                version: "0.1.0".into(),
+                title: Some("AgentScope Harness MCP Client".into()),
+                description: Some("MCP Client for AgentScope Harness".into()),
+                icons: vec![],
+                website_url: None,
+            },
+            protocol_version: LATEST_PROTOCOL_VERSION.into(),
+            meta: None,
+        };
+
+        // Create transport based on config
+        let transport = if let Some(command) = &client.config.command {
+            // Parse command and arguments
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err(Error::Other("Empty command".to_string()));
+            }
+            let program = parts[0];
+            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            
+            StdioTransport::create_with_server_launch(
+                program,
+                args,
+                None,
+                TransportOptions::default(),
+            )
+            .map_err(|e| Error::Other(format!("Failed to create stdio transport: {}", e)))?
+        } else if let Some(url) = &client.config.url {
+            // For SSE transport, we need to handle differently
+            // For now, return an error as SSE is more complex
+            return Err(Error::Other(format!(
+                "SSE transport not yet implemented for URL: {}",
+                url
+            )));
+        } else {
+            return Err(Error::Other("No command or URL specified".to_string()));
+        };
+
+        // Create handler
+        let handler = DefaultClientHandler {};
+
+        // Create MCP client
+        let mcp_client = client_runtime::create_client(McpClientOptions {
+            client_details,
+            transport,
+            handler: handler.to_mcp_client_handler(),
+            task_store: None,
+            server_task_store: None,
+            message_observer: None,
+        });
+
+        // Start the client
+        mcp_client
+            .clone()
+            .start()
+            .await
+            .map_err(|e| Error::Other(format!("Failed to start MCP client: {}", e)))?;
+
+        // Update client instance
+        client.connected = true;
+        client.client = Some(mcp_client);
+
+        tracing::info!(
+            "MCP client '{}' connected to server '{}'",
+            client_id,
+            client.config.name
+        );
+
+        Ok(())
+    }
+
+    /// Disconnects from an MCP server.
+    pub async fn disconnect(&self, client_id: &str) -> Result<()> {
+        let mut clients = self.clients.lock().await;
+        let client = clients
+            .get_mut(client_id)
+            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+
+        if !client.connected {
+            return Ok(());
+        }
+
+        // Shutdown the client
+        if let Some(mcp_client) = &client.client {
+            mcp_client
+                .shut_down()
+                .await
+                .map_err(|e| Error::Other(format!("Failed to shut down MCP client: {}", e)))?;
+        }
+
+        client.connected = false;
+        client.tools.clear();
+        client.client = None;
+
+        tracing::info!(
+            "MCP client '{}' disconnected from server '{}'",
+            client_id,
+            client.config.name
+        );
+
+        Ok(())
+    }
+
+    /// Lists tools available from the specified client.
+    pub async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>> {
+        let clients = self.clients.lock().await;
+        let client = clients
+            .get(client_id)
+            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+
+        if !client.connected {
+            return Err(Error::Other(format!(
+                "Client '{}' is not connected",
+                client_id
+            )));
+        }
+
+        Ok(client.tools.clone())
+    }
+
+    /// Gets a list of all connected clients.
+    pub async fn connected_clients(&self) -> Vec<String> {
+        let clients = self.clients.lock().await;
+        clients
+            .iter()
+            .filter(|(_, instance)| instance.connected)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Gets client information by ID.
+    pub async fn get_client(&self, client_id: &str) -> Option<McpClientInstance> {
+        let clients = self.clients.lock().await;
+        clients.get(client_id).cloned()
+    }
+
+    /// Removes a client instance.
+    pub async fn remove_client(&self, client_id: &str) -> Result<()> {
+        let mut clients = self.clients.lock().await;
+        clients
+            .remove(client_id)
+            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+
+        Ok(())
+    }
+
+    /// Calls a tool on the specified client.
+    pub async fn call_tool(
+        &self,
+        client_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let clients = self.clients.lock().await;
+        let client = clients
+            .get(client_id)
+            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+
+        if !client.connected {
+            return Err(Error::Other(format!(
+                "Client '{}' is not connected",
+                client_id
+            )));
+        }
+
+        if let Some(mcp_client) = &client.client {
+            // Convert arguments to MCP tool call params
+            let params = rust_mcp_sdk::schema::CallToolRequestParams {
+                name: tool_name.to_string(),
+                arguments: Some(arguments.as_object().cloned().unwrap_or_default()),
+                meta: None,
+                task: None,
+            };
+
+            // Call the tool
+            let result = mcp_client
+                .request_tool_call(params)
+                .await
+                .map_err(|e| Error::Other(format!("Tool call failed: {}", e)))?;
+
+            // Convert result to serde_json::Value
+            Ok(serde_json::to_value(result)
+                .map_err(|e| Error::Other(format!("Failed to serialize result: {}", e)))?)
+        } else {
+            Err(Error::Other("Client not initialized".to_string()))
+        }
+    }
+}
+
+/// Default client handler for MCP client.
+struct DefaultClientHandler;
+
+#[async_trait::async_trait]
+impl ClientHandler for DefaultClientHandler {
+    // Use default implementations for all methods
+}
+
+impl std::fmt::Debug for McpClientInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpClientInstance")
+            .field("id", &self.id)
+            .field("config", &self.config)
+            .field("connected", &self.connected)
+            .field("tools_count", &self.tools.len())
+            .finish()
+    }
+}
+impl Default for McpClientManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

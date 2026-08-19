@@ -1,0 +1,27 @@
+[package]
+name = "agentscope-core"
+description = "AgentScope Rust - Core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+serde_yaml.workspace = true
+base64.workspace = true
+jsonschema.workspace = true
+tracing-subscriber.workspace = true
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "chat-completion-types", "byot", "middleware", "rustls"] }
+
+[dev-dependencies]

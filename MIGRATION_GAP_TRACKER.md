@@ -1,0 +1,363 @@
+# AgentScope Java → Rust 迁移 — 跨会话进度跟踪文件（Gap Tracker）
+
+> 用途：本文件是**所有迁移会话共享的单一事实来源**。任何会话在开始工作前必须先读本文件；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件与 `git status`/`cargo build` 实际验证为准。
+> 对照基准：`MIGRATION_PLAN.md`（方案）+ 本文件（已整合原 worker_output 8 份分析报告）+ `crates/*`（实际代码）。
+> 覆盖统计截至：本轮 WorkspaceManager 完整迁移（WorkspaceManager + WorkspaceIndex + NamespaceFactory）落地后。
+
+## 0. 如何阅读本文件
+- **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
+- **优先级**：P0=核心链路 / P1=重要 / P2=增强。
+- **对齐度**：由分析报告给出（可能滞后于代码，见各条目实际状态）。
+- 每完成一项：把状态改 `已完成`，在 `交接信息` 更新为最新验证结果。
+
+## 1. 全局状态总览（对齐度汇总）
+
+| 模块/包 | Java 规模 | Rust 实际状态 | 对齐度(报告) | 关键结论 |
+|---|---|---|---|---|
+| core.message | 23 类 | 6 文件完整 | ≈90% | 9 内容块+Source+State 枚举齐全；4 个消息子类折叠进 Msg+MsgRole |
+| core.model | 18 类 | 11 文件 | ≈80% | 数据层 + **真实 provider（async-openai）** + ModelRegistry/ModelContextWindows；可发真实 HTTP/SSE |
+| core.credential | 6 类 | 3 文件 | ≈90% | DeepSeek/Kimi/XAI 均纯凭据元数据，与 Java 同水位 |
+| core.formatter | 6 类 | 3 文件 | ≈90% | ResponseFormat/JsonSchema + MediaUtils 全套；缺 Formatter/AbstractBaseFormatter（Msg→provider 转换） |
+| core.agent | 13 类 | 6 文件（ReActAgent + lifecycle/stream_options） | ≈5%→大幅提升 | ReAct 循环 + stream_events + 结构化调用 + 串行门/优雅关闭守卫已实现；缺 AgentBase 全生命周期细节（hooks/per-session 属性袋） |
+| core.event | 35 类 | 4 文件 | ≈95% | 31/31 事件变体齐全 + AgentEventEmitter/ConfirmResult 已补 |
+| core.middleware | 7 类 | 4 文件 | ≈95% | 5 钩子洋葱链完整 + TaskReminderMiddleware 已补 |
+| core.hook | 21 类 | **0 文件** | 0%（设计决定） | Java 已 @Deprecated，走 2.0 middleware 架构，不迁移 |
+| core.tool | 38 类 | 20 文件 | ≈30%→再提升 | 治理层 + 结果转换/消息构造/挂起语义/危险路径/注册 builder + meta（ToolCallParam/ExtendedModel/reset_equipped_tools）+ TodoWriteTool 已补 |
+| core.state | 13 类 | 6 文件 | ≈85% | 核心 + ListHashUtil/SessionInfo 已补；缺 LegacyStateLoader/State 标记接口/readFileCache LRU |
+| core.memory | 8 类 | 1 文件 | ≈60% | 缺 AgentStateMemoryView；LongTermMemory 系列已 deprecated |
+| core.permission | 8 类 | 1 文件 | ≈90% | 流程高度对齐；缺 tool 自身规则集成 |
+| core.interruption | 3 类 | 1 文件 | ≈100% | 完全对齐 |
+| core.shutdown | 10 类 | 1 文件 | ≈45% | 状态机在；缺 per-request 跟踪/中间件/钩子 |
+| core.tracing | 4 类 | 1 文件 | ≈15% | 仅日志初始化；缺 OtelTracingMiddleware |
+| core.rag | 4 类 | **0 文件** | 0% | 完全缺失 |
+| core.skill | 10 类 | **0 文件(core)** | 0% | core 无 skill；harness 有同名模块 |
+| core.util | 8 类 | 无 util 模块 | ≈30% | 功能散落 serde_json；缺 ExceptionUtils/TypeUtils |
+| core.exception | 1 类 | error.rs | ≈100% | CompositeAgentException+AgentExceptionInfo 已补 |
+| core.workspace | 占位 | 无 | 0%（双方均未落地） | 占位对齐 |
+| harness.agent | — | harness_agent.rs | 骨架 | 无 call()/ReAct，仅装配器 |
+| harness.filesystem | — | 6 文件 | 高 | Local/Overlay/Composite/Sandbox/Remote 完整 |
+| harness.tool | — | 4 文件 | 高 | FilesystemTool/ShellExecute/FuzzyTextMatcher |
+| harness.gateway | 29 类 | 8 文件 + channel/(7) | ≈98% | HarnessGateway/GatewayBootstrap/SessionTurnGate/WakeupDispatcher/MsgContext/SubagentRegistry 完整；channel/* 7 层路由 + chatui 已建（本轮） |
+| harness.memory | 10 类 | 6 文件 | ≈95% | compaction+flush+consolidation+eviction+session+MemoryConfig 完整 |
+| harness.bus | 6 类 | 4 文件 | ≈90% | MessageBus（Mode A/C/D）+ WorkspaceMessageBus + AsyncToolRegistry 系完整；Mode D 降级轮询 |
+| harness.sandbox | — | sandbox.rs | 骨架 | docker(bollard) 待接 |
+| harness.middleware | 18+ | 11 文件 | 高 | 3 系统提示转换 + Inbox + AsyncTool + MemoryFlush + MemoryMaintenance + ToolResultEviction + SubagentsMiddleware + DynamicSubagentsMiddleware + **AgentTraceMiddleware（本轮）** + 配套 TaskTool/SubagentEntry/DefaultAgentManager/AgentSpecLoader；余 WorkspaceContext/SandboxLifecycle 待办 |
+| harness.subagent | — | subagent/task/ 目录 | task 仓库已建 | BackgroundTask/TaskRepository/WorkspaceTaskRepository 完整；Local/Adopted 动态 spawn 已实现 |
+| harness.mcp | — | mcp.rs | 骨架 | registrar 为 stub，rust-mcp-sdk 待接 |
+| harness.skill | — | 7 文件 | 高 | curator/runtime/stager/prompt 完整，LLM 模式待接 |
+| harness.workspace | — | 7 文件 | 高 | constants/path_normalizer/plan/manager/index/namespace 已实现；**完整版 WorkspaceManager（两层次读写 + 命名空间 + SQLite 索引 + session/task/memory/skill 操作）本轮完成** |
+
+
+## 2. agentscope-core 详细缺口清单（按模块）
+
+### 2.1 tool（优先级 P0）— 治理层本轮已补，剩余中高层缺口
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| ToolExecutor 已补（timeout/retry/parallel/外部短路/激活校验/schema 校验/预设覆盖） | ToolExecutor | ✅ 已完成 | group/config/validator/executor.rs 已建，7 个治理测试通过 |
+| ToolGroupManager 已补 | ToolGroupManager/ToolGroup/ToolGroupScope | ✅ 已完成 | group.rs；含 META/EXTERNAL、替换语义、孤儿回收 |
+| ToolValidator 已补 | ToolValidator | ✅ 已完成 | validator.rs，jsonschema DRAFT-2020-12 |
+| ToolkitConfig 已补 | ToolkitConfig | ✅ 已完成 | config.rs；parallel/execution_config/allow_tool_deletion |
+| **ToolRegistration 流式 builder** | Toolkit$ToolRegistration | ✅ 已完成 | registration.rs + `Toolkit::register()`；tool/group/presetParameters/apply 已实现（集成测试过）；agentTool/mcpClient/subAgent/enableTools 待扩展 |
+| **MetaToolFactory + reset_equipped_tools** | MetaToolFactory | ✅ 已完成 | meta.rs：`Toolkit::register_meta_tools()`/`reset_equipped_tools()`；ToolGroupManager 新增 `get_meta_group_names`/`validate_group_exists`/`get_notes`/`replace_meta_active_groups`；EXTERNAL 组不受影响（6 个集成测试过） |
+| **ToolDangerousPathConstants + isDangerousPath** | ToolDangerousPathConstants/ToolBase | ✅ 已完成 | dangerous.rs：DEFAULT_DANGEROUS_FILES/DIRS/COMMANDS 常量 + `is_dangerous_path`（目录段/文件尾/tilde） + `is_dangerous_command`；harness shell 自检接入仍待办（见 3.2） |
+| **ToolSuspendException + suspended 语义** | ToolSuspendException | ✅ 已完成 | suspend.rs + `Error::ToolSuspended`；executor 将 suspend 转 `ToolResultBlock::suspended`（id/name 回填）；ReAct 循环检测到 suspended 即返回 `GenerateReason::ToolSuspended`（单元测试过） |
+| **ToolRegistry + RegisteredToolFunction 元数据** | ToolRegistry/RegisteredToolFunction | 部分 | registry 逻辑折入 toolkit；缺 preset/extendedModel/mcpClientName 包装 |
+| **ToolResultConverter / DefaultToolResultConverter** | ToolResultConverter | ✅ 已完成 | result.rs；trait `convert(Option<&Value>)`；null→"null"、String 直通、其余紧凑 JSON（Void→"Done" 因 Rust 无 void 返回略过） |
+| **ToolResultMessageBuilder** | ToolResultMessageBuilder | ✅ 已完成 | result.rs；`build_tool_result_msg` 用原 call id/name 回填 + agent name（集成测试过） |
+| **ToolEmitter / DefaultToolEmitter** | ToolEmitter | ✅ 已完成 | emitter.rs：`ToolEmitter`/`DefaultToolEmitter`/`NoOpToolEmitter`/`emit_to`；`ToolExecutionContext.emitter` 已接入 ReActAgent 执行上下文 |
+| **ToolCallParam** | ToolCallParam | ✅ 已完成 | meta.rs：builder+访问器+`ToolCallParam::from`；agent 适配为 agent_id 字符串、runtimeContext 为扁平 JSON |
+| **ToolExecutionContextProvider / ContextStore** | ContextStore/DefaultContextStore | 待办 | 已废弃→RuntimeContext；缺类型化属性袋 |
+| **ToolParam/@Tool 注解 + proc-macro** | Tool/@ToolParam | 待办 | 反射→宏；参考 rust-mcp-macros |
+| **ToolkitAware / ExtendedModel** | ToolkitAware/ExtendedModel | 部分 | ExtendedModel + SimpleExtendedModel 已实现（meta.rs，含冲突检测/required 合并）；ToolkitAware 的 rebindToolkit 深拷贝重绑待做 |
+| **McpClientManager** | McpClientManager | 待办 | rust-mcp-sdk 客户端生命周期管理（见 2.14 MCP） |
+| **并行安全分区（isConcurrencySafe 独占槽）** | ToolExecutor.execute_all | ✅ 已完成 | executor.rs `execute_all` 已实现：并行模式下将连续 concurrency-safe 工具并发执行（`run_safe_batch` + join_all，保持声明顺序），不安全/未知工具各自形成独立串行槽；`Toolkit::is_concurrency_safe_tool` 查询；4 个新测试覆盖（unsafe 串行 peak=1、safe 并发 peak>=2、混合分区保序、顺序模式） |
+| **TodoWriteTool** | TodoTools | ✅ 已完成 | tool/todo.rs：`TodoWriteTool`（基于任务清单全量替换）+ `render`/`parse_state`/`normalize_priority` 辅助；`ReActAgentBuilder::build` 默认注册；调用后同步 `AgentState.tasks_context` 与 `AgentCore.tasks`（`Arc<Mutex<TaskContextState>>`）；单测过 |
+
+### 2.2 model（优先级 P0）— 最大运行缺口：无法真正发 HTTP
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Model trait / ChatModelBase 能力位 | Model/ChatModelBase | ✅ 已完成 | model.rs；纯抽象，无实现者 |
+| GenerateOptions(25字段)/ChatResponse/ChatUsage/ExecutionConfig/ToolChoice/ToolSchema/CachePolicy | 同名 | ✅ 已完成 | 字段级对齐 |
+| **ModelRegistry** | ModelRegistry(428行) | ✅ 已完成 | provider.rs；register/canResolve/resolve_with（`provider:model` 拆分，无前缀时按序询问） |
+| **ModelCreationContext** | ModelCreationContext | ✅ 已完成 | provider.rs；apiKey/baseUrl/endpointPath/stream/enableThinking/cachePolicy/cacheId/options |
+| **ModelContextWindows** | ModelContextWindows | ✅ 已完成 | context_windows.rs；最长前缀匹配表（gpt/deepseek/glm/qwen/kimi/claude/...） |
+| **ModelProviderSupport** | ModelProviderSupport | ✅ 已完成 | provider.rs；firstNonBlank/intOption/findAssignableComponent 桩 |
+| **ModelUtils** | ModelUtils | ✅ 已完成 | provider.rs；ensure_default_execution_config |
+| **StructuredOutputReminder** | StructuredOutputReminder | ✅ 已完成 | provider.rs；TOOL_CHOICE/PROMPT 枚举 |
+| **ModelProvider SPI** | spi.ModelProvider | ✅ 已完成 | provider.rs；providerId/supports/create；静态注册替代 ServiceLoader |
+| **真实 provider 接入（用 async-openai）** | agentscope-extensions-model-* | ✅ 已完成 | **`async-openai` v0.41.3（远程 crates.io，MIT）**。`OpenAiChatModel::stream` 内调 `chat().create_stream()`，SSE delta→`ChatResponse`/`ContentBlock`（含流式 tool_call 分片按 index 聚合）；OpenAI 兼容 provider 用 `OpenAIConfig` 改 base_url+key。见方案 §4.2。**live 真实 HTTP 验证待 key（见 §7.3）** |
+
+### 2.3 model.transport（优先级 P1）— 手写方案作废，改用 async-openai
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| HttpTransport/HttpRequest/HttpResponse | HttpTransport | 设计决定（不迁移） | 手写 transport 作废；由 `async-openai` 内部（reqwest + eventsource-stream）提供 |
+| HttpTransportFactory | HttpTransportFactory | 设计决定（不迁移） | 同上，`async-openai::Client` 内置 |
+| JdkHttpTransport/OkHttpTransport | 同名 | 设计决定（不迁移） | 同上 |
+| WebSocketTransport 子包 | WebSocketTransport/JdkWebSocketTransport | 待办 | 若需 realtime/WS，`async-openai` 已带 `realtime` feature（tokio-tungstenite） |
+| **async-openai 接入层** | agentscope-extensions-model-* | ✅ 已完成 | openai.rs；`impl Model for OpenAiChatModel`：内部 `chat().create_stream()`，delta→ContentBlock 映射；feature `chat-completion`+`byot`+`middleware`；`OpenAiProvider` 注册进 `default_registry()` |
+
+
+### 2.4 agent（优先级 P0）— ReAct 循环已实现，缺生命周期治理细节
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Agent/CallableAgent/ObservableAgent trait | 同名 | ✅ 已完成 | agent_traits.rs |
+| ReActAgent reasoning→acting 循环 | ReActAgent(4727行) | ✅ 已完成 | react_agent.rs；含 maxIters/permission/middleware/事件 |
+| RuntimeContext | RuntimeContext | 部分 | 有 agent_name/user_input/memory/toolkit/metadata/cwd/**response_format**/**session_id/user_id/agent_id**（本轮补 + with_*/访问器）；**缺 agentState 绑定/属性袋/asToolExecutionContext/resolveAgentState** |
+| **AgentBase 生命周期**（serialization gate、per-call 串行 callGates、graceful shutdown guard、hooks 分发） | AgentBase(1040行) | 部分 | `CallGate`（按 key FIFO 串行，lifecycle.rs）+ `ExecutionGuard`（acquire/release 优雅关闭，register/unregister request）已实现并接入 ReActAgent.call；**缺 hooks 分发**（走 middleware，AgentBase 抽象类本身不迁移） |
+| **CallableAgent 结构化 overloads** | call(List,Class/JsonNode) | ✅ 已完成 | `call_with_schema` + 便捷 `call_single`/`call_text`；native response_format(json_schema) 路径 + **fallback（generate_response 工具）** 均已实现：`call_with_schema` 按 `supports_native_structured_output` 分派到 `call_native_structured`/`call_fallback_structured`（后者注入 `generate_response` 工具循环，含 `<structured-output-instruction>`），单测过 |
+| **StreamableAgent / streamEvents / StreamOptions** | StreamableAgent/StreamOptions | ✅ 已完成 | `ReActAgent::stream_events(msgs, StreamOptions)` 返回过滤后的 `EventStream`；`StreamOptions`（EventCategory 过滤 + incremental + includeReasoningChunk/Result/ActingChunk/SummaryChunk/Result）+ `EventCategory::of` 映射 31 事件；v1 `StreamableAgent`/粗粒度 `Event` 为设计决定不迁移 |
+| **ObservableAgent observe（接收不回复）** | ObservableAgent | 待办 | 多智能体协作；当前 subscribe 是 sink |
+| **Event/EventSource/EventType（v1 粗粒度，已废弃）** | Event/EventSource/EventType | 设计决定 | Java @Deprecated；不迁移，用新版 AgentEvent |
+| **ReasoningContext 完善**（ThinkingAccumulator/ToolCallsAccumulator/usage） | ReasoningContext | 部分 | 已有 text/thinking/tool_calls/usage 累积；缺 per-chunk 即时事件 |
+| **SubagentEventBus** | SubagentEventBus | 待办 | Reactor Context 中继子 agent 事件 |
+
+### 2.5 event（优先级 P0）— 高度对齐
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| AgentEvent enum + AgentEventType + EventData | 同名 | ✅ 已完成 | 31/31 变体 + wire name + legacy alias |
+| **AgentEventEmitter** | AgentEventEmitter | ✅ 已完成 | event/emitter.rs：发射器（emit_agent_event/emit），经 AgentEventEmitter 接口下发事件 |
+| **ConfirmResult** | ConfirmResult | ✅ 已完成 | event/emitter.rs：HITL 确认结果 record（同意/拒绝/补充/重试枚举 + 加载器）；为 PermissionBehavior::Ask 预留 |
+
+### 2.6 middleware（优先级 P0）— 高对齐
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Middleware trait（5 钩子）+ MiddlewareChain + 4 输入类型 | MiddlewareBase/MiddlewareChain/AgentInput/ReasoningInput/ModelCallInput/ActingInput | ✅ 已完成 | middleware.rs/input.rs |
+| **TaskReminderMiddleware** | TaskReminderMiddleware | ✅ 已完成 | middleware/task_reminder.rs：`on_reasoning` 注入 `<system-reminder>`、`on_system_prompt` 注入 GROUNDING；经 `Arc<Mutex<TaskContextState>>` 共享任务状态（builder 内创建，与 TodoWriteTool 共同持有） |
+
+### 2.7 hook（优先级 P2）— 设计决定
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Hook 体系全套 | Hook/HookEvent/.../recorder/JsonlTraceExporter | 设计决定 | Java 全部 @Deprecated(forRemoval,2.0)，被 middleware 替代；Rust 走 2.0 新架构，不迁移 |
+
+### 2.8 formatter（优先级 P1）— 薄弱
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| ResponseFormat/JsonSchema | 同名 | ✅ 已完成 | 数据类型；JsonSchema 缺 description 字段 |
+| **Formatter / AbstractBaseFormatter** | Formatter/AbstractBaseFormatter | 待办 | Msg→provider 请求转换；extractTextContent/hasMediaContent/formatRoleLabel/convertToolResultToString/saveBase64DataToTempFile/shouldBypassHistory |
+| **MediaUtils** | MediaUtils(452行) | ✅ 已完成 | formatter/media_utils.rs：is_local_file/is_file_exists/get_extension/determine_media_type/resolve_mime_type/validate_image|audio|video_extension/determine_audio_format/infer_audio_format_from_media_type/file_to_base64/to_file_protocol_url/url_to_protocol_url + async download_url_to_base64/url_to_base64_data_url（reqwest 限时）；9 单测；urlToRgbaImage/urlToInputStream 因需 image 解码略过 |
+| **FormatterException** | FormatterException | ✅ 已完成 | 映射通用 `Error`（`Error::Other`/`Error::Io`/`Error::HttpStatus`），不单独建异常类型 |
+
+### 2.9 state（优先级 P1）— 核心全齐，辅助缺
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| AgentState + 子上下文 + 3 种 Store | 同名 | ✅ 已完成 | agent_state/context/store.rs |
+| **LegacyStateLoader** | LegacyStateLoader | 待办 | v1→v2 状态迁移 |
+| **ListHashUtil** | ListHashUtil | ✅ 已完成 | state/list_hash.rs：compute_hash（采样 0/1/4/1/2/3/4/末尾，DefaultHasher 十六进制）、has_changed、needs_full_rewrite（缩小/缺 hash/前缀变化判定）；6 单测 |
+| **SessionInfo** | SessionInfo | ✅ 已完成 | state/session_info.rs：session_id/size/last_modified/component_count + Display + camelCase serde；2 单测 |
+| **State 标记接口** | State | 待办 | 类型化 get(Class<T>) |
+| **ToolContextState.readFileCache LRU + mtime 校验** | ToolContextState | 待办 | tool/file.rs 未接入缓存 |
+
+### 2.10 memory（优先级 P1）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Memory/InMemoryMemory/StateBackedMemory | 同名 | ✅ 已完成 | memory/mod.rs |
+| **AgentStateMemoryView** | AgentStateMemoryView | 待办 | 活跃 API，StateBackedMemory 只是近似 |
+| LongTermMemory 系列 / StaticLongTermMemoryHook | LongTermMemory/LongTermMemoryMode/LongTermMemoryTools | 设计决定 | Java 全部 @Deprecated(forRemoval,2.0)，不迁移 |
+
+### 2.11 permission（优先级 P1）— 高对齐
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| 枚举/规则/引擎 + 流程 | PermissionMode/Behavior/Rule/Decision/Context/Engine | ✅ 已完成 | deny→ask→tool→allow→bypass→default 一致 |
+| **tool 自身规则集成**（checkPermissions/generateSuggestions/危险路径） | ToolBase | 待办 | 当前 tool_check 仅做 EXPLORE/ACCEPT_EDITS 只读判断 |
+| **ask 决策带 suggested_rules** | ToolBase.generateSuggestions | 待办 | 当前 ask 决策不带 |
+
+### 2.12 shutdown（优先级 P1）— 状态机在，周边缺
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| 状态机+单例+active 计数 | GracefulShutdownManager | ✅ 已完成 | shutdown/mod.rs；含 perform/await/ensure |
+| **per-request 粒度跟踪 / ActiveRequestContext** | ActiveRequestContext | 待办 | 当前仅原子计数 |
+| **GracefulShutdownMiddleware** | GracefulShutdownMiddleware | 待办 | Rust middleware 层无 shutdown 集成 |
+| **ShutdownStateSaver / bindStateSaver** | ShutdownStateSaver | 待办 | |
+| **AgentScopeJvmShutdownHook（信号处理）** | AgentScopeJvmShutdownHook | 待办 | Rust 无 JVM；可 tokio ctrl_c + CancellationToken |
+| **超时强制中断监控循环 / resetForTesting** | GracefulShutdownManager | 待办 | |
+
+### 2.13 tracing（优先级 P2）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| init_tracing / init_tracing_with_filter | — | ✅ 已完成 | tracing.rs |
+| **OtelTracingMiddleware** | OtelTracingMiddleware | 待办 | 需 opentelemetry + tracing-opentelemetry |
+| Tracer/TracerRegistry/NoopTracer | 同名 | 设计决定 | Java @Deprecated，不迁移 |
+
+
+### 2.14 MCP（core.tool.mcp + harness mcp，优先级 P1）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| McpTool（handler 注入 + not_connected fallback） | — | ✅ 已完成 | tool/mcp.rs |
+| harness McpServerConfig/Registrar 声明 | — | ✅ 已完成 | agent/mcp.rs（注册为 stub） |
+| **rust-mcp-sdk path 依赖接入** | McpClientManager | ✅ 已完成 | 已接入 `rust-mcp-sdk` v1.0.1 path 依赖；`McpClientManager` 实现客户端生命周期管理（create/connect/disconnect/list_tools/call_tool）；`McpClientInstance` 管理连接状态和工具列表 |
+| **McpServerRegistrar 真实实现** | harness Registrar | ✅ 已完成 | `McpServerRegistrar` 已实现：使用 `McpClientManager` 管理连接；`register()` 方法异步创建客户端并连接；新增 `disconnect_all()`、`registered_servers()` 辅助方法 |
+
+### 2.15 其余 core 缺失模块（优先级 P2）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| **rag 全套** | GenericRAGHook/Knowledge/KnowledgeRetrievalTools/RAGMode | 待办 | core 无 rag 模块 |
+| **util 工具类** | ExceptionUtils/TypeUtils/JsonUtils | 待办 | ExceptionUtils 可映射 error.rs；TypeUtils 类型反射辅助 |
+| **CompositeAgentException** | CompositeAgentException+AgentExceptionInfo | ✅ 已完成 | error.rs：`AgentExceptionInfo`（agent_id/agent_name/throwable_message）+ `CompositeAgentException`（message+causes，Display 复刻 Java getMessage 拼装）+ `Error::CompositeAgent` 变体；2 单测 |
+| core **workspace** 契约 | WorkspaceBase/LocalWorkspace | 设计决定 | Java 仅 package-info 占位；Rust harness 已有 workspace 模块 |
+
+## 3. agentscope-harness 详细缺口清单（按模块）
+
+### 3.1 filesystem（优先级 P0）— 高对齐
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Filesystem trait + 6 实现 | LocalFilesystem/OverlayFilesystem/CompositeFilesystem/SandboxBackedFilesystem/RemoteFilesystem | ✅ 已完成 | filesystem/*.rs |
+| **RemoteFilesystem 真实后端** | RemoteFilesystem | 待办 | 当前 stub，待接远程 store |
+
+### 3.2 tool（优先级 P0）— 高对齐
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| FilesystemTool/ShellExecuteTool/FuzzyTextMatcher | 同名 | ✅ 已完成 | tool/*.rs |
+| **DANGEROUS_COMMANDS shell 自检** | ToolDangerousPathConstants | ✅ 已完成 | ShellExecuteTool::call 已接入 core `is_dangerous_command`；rm -rf/sudo rm/dd/mkfs/chmod 777 等直接返回 error 块（测试通过） |
+
+### 3.3 gateway（优先级 P1）— 差距最大（5%）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| Channel/Gateway mpsc 事件通道 | Channel | ✅ 已完成 | 43 行；语义是事件 mpsc 而非 Java 外发通道 |
+| **Gateway 接口（bindMainAgent/run/runSubagent/...）** | Gateway | ✅ 已完成 | gateway/harness_gateway.rs：`GatewayAgent` trait + `HarnessGateway`（多 agent 注册表 + canonicalKey→sessionId + SessionTurnGate 互斥 + exposeSubagent/revoke + runWakeup + isSessionRunning + deliver_to_session） |
+| **HarnessGateway 完整** | HarnessGateway(589行) | ✅ 已完成 | harness_gateway.rs（430 行）；含 ChannelManager/OutboundAddress/GatewayTurnContext/SubagentMaterializer；resolve_agent fallback 链路；集成测试 `gateway_emits_to_channel` 通过 |
+| **GatewayBootstrap / ChannelManager** | GatewayBootstrap/ChannelManager | ✅ 已完成 | gateway_bootstrap.rs：builder（agent/main_agent/message_bus/channel_manager/build）+ ChannelManager（register/get/deliver） |
+| **SessionTurnGate / WakeupDispatcher** | SessionTurnGate/WakeupDispatcher | ✅ 已完成 | session_turn_gate.rs（公平互斥，4 单测）+ wakeup_dispatcher.rs（唤醒分发，1 单测） |
+| **MsgContext / SessionIdUtils** | MsgContext/SessionIdUtils | ✅ 已完成 | msg_context.rs：canonicalKey + deterministic_hash（3 单测） |
+| **SubagentRegistry/Record/Materializer/GatewayBridge** | SubagentRegistry 系 | ✅ 已完成 | subagent.rs：SubagentRecord/SubagentRegistry/InMemorySubagentRegistry（3 单测）+ harness_gateway 的 SubagentMaterializer/GatewayBridge |
+| **channel/* 全套** | ChannelRouter(7层)/ChannelConfig/Binding/DmScope/InboundMessage/OutboundAddress/Peer/PeerKind/RouteResult | ✅ 已完成 | `gateway/channel/` 新建：peer.rs(PeerKind/Peer) + dm_scope.rs(DmScope) + binding.rs(ChannelBinding) + config.rs(ChannelConfig/Builder) + inbound.rs(InboundMessage/Builder) + router.rs(ChannelRouter 7 层路由 + RouteResult) + channel.rs(Channel trait/ChannelFactory)；OutboundAddress 升级为完整版(channel_id/account_id/to/thread_id)；7 层(explicit/peer/parentPeer/guild+roles/guild/team/account/channel→default)；router 8 单测 + peer 2 单测通过 |
+| **channel/chatui/** | ChatUiChannel/Request/Envelope/SendOptions | ✅ 已完成 | `gateway/channel/chatui.rs`：ChatUiChannel(create/with_config/per_peer/with_gateway) + ChatUiRequest + SendOptions + OutboundEnvelope；dispatch/preview_route/send/send_peer/send_to_subagent/send_request/poll_outbound；实现 Channel trait + ChannelSink(缓冲投递)；streaming 待接 gateway runStream(见 7.1) |
+
+### 3.4 memory（优先级 P1）— compaction 完整，两条 LLM 流水线缺
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| compaction 全链路（TokenCounter/Config/ConversationCompactor/Prune/Truncate） | 同名 | ✅ 已完成 | ~90%；flush/offload 钩子被略过 |
+| session（SessionEntry/SessionTree/FreshnessEvaluator） | 同名 | ✅ 已完成 | ~90% 结构；SessionTree 无文件 IO/remote 镜像/deferred flush |
+| **MemoryFlushManager** | MemoryFlushManager | ✅ 已完成 | memory/flush.rs（403 行）：LLM 抽取→今日 ledger（memory/YYYY-MM-DD.md），NO_REPLY 兜底，跳过 internal context；3 单测通过 |
+| **MemoryConsolidator** | MemoryConsolidator | ✅ 已完成 | memory/consolidator.rs（305 行）：定时合并每日 ledger→MEMORY.md；2 单测通过 |
+| **ToolResultEvictionConfig** | ToolResultEvictionConfig | ✅ 已完成 | memory/eviction.rs（165 行）：单超大结果落盘+占位符（head/tail/path）；2 单测通过 |
+| **MemoryConfig 补全**（FlushTrigger/prompt/保留天数） | MemoryConfig | ✅ 已完成 | memory/mod.rs：MemoryConfig/FlushMode/FlushTrigger + 4 单测；3 条 LLM 流水线（flush/consolidation/compaction）配置统一 |
+
+### 3.5 bus（优先级 P1）— 已完成
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| **MessageBus** | MessageBus(267行) | ✅ 已完成 | bus/message_bus.rs；Mode A drain / Mode C replay + inbox*/enqueue_wakeup/session* 域助手（默认方法） |
+| **WorkspaceMessageBus** | WorkspaceMessageBus | ✅ 已完成 | bus/workspace_message_bus.rs；基于 Filesystem trait，queue/log 文件布局；Mode D 降级为 3s 轮询（unbounded receiver） |
+| **AsyncToolRegistry / WorkspaceAsyncToolRegistry / AsyncToolRecord** | 同名 | ✅ 已完成 | bus/async_tool.rs；{root}/{session}/{id}.json；register/complete/fail/findStale/markTimeout |
+
+### 3.6 sandbox（优先级 P1）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| ExecResult/WorkspaceSpec/DefaultWorkspaceSpecApplier | 同名 | ✅ 已完成 | sandbox.rs |
+| **Sandbox trait + SandboxClient + SandboxManager** | Sandbox/SandboxClient/SandboxManager | ✅ 已完成（本轮） | sandbox/ 目录模块：Sandbox trait (start/stop/shutdown/exec/persist_workspace/hydrate_workspace)、SandboxClient trait (create/resume/delete/serialize_state/deserialize_state)、SandboxManager (4优先级获取策略：external sandbox > external state > persisted state > new create)、SandboxContext (builder模式)、SandboxState (Docker/Local/Remote enum)、SandboxIsolationKey、SandboxExecutionGuard (并发隔离)、SandboxLease (执行租约)、InMemorySandboxStateStore；25 个测试通过 |
+| **SandboxLifecycleMiddleware** | SandboxLifecycleMiddleware | 待办 | 依赖 SandboxManager + SandboxBackedFilesystem |
+| **docker 后端（bollard）** | DockerSandbox | 待办 | 布局/快照/容器生命周期 |
+| **snapshot 持久化** | SnapshotSpec | 待办 | |
+
+### 3.7 middleware（优先级 P1）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| CompactionMiddleware/PlanModeMiddleware/AtPathExpansionMiddleware | 同名 | ✅ 已完成 | 系统提示词转换；middleware.rs 已重构为 middleware/ 目录模块 |
+| **InboxMiddleware** | InboxMiddleware | ✅ 已完成 | middleware/inbox.rs：on_reasoning 排空 inbox + stale async tools（find_stale/mark_timeout）→ 注入 HintBlock 到 reasoning 输入 + 发 HintBlock 事件；`once(fut).flatten()` 组合流；4 集成测试通过 |
+| **AsyncToolMiddleware** | AsyncToolMiddleware | ✅ 已完成 | middleware/async_tool.rs：on_acting 超时后台化——spawn 后台任务执行 next + watch 信号竞争 offload_timeout；超时注册 async record + 发 placeholder ToolResult 事件，后台完成后 inbox 回投 hint + enqueue_wakeup；依赖 RuntimeContext.session_id；集成测试通过 |
+| **MemoryFlushMiddleware** | MemoryFlushMiddleware | ✅ 已完成 | middleware/memory_flush.rs：on_agent 尾部执行 LLM 记忆抽取（MemoryFlushManager::flush_memories）+ 消息 offload（JSONL 按 msg id 幂等）；FlushTrigger 节流（进程级 SHARED_LAST_FLUSH_AT）；`once(tail).map(iter).flatten()` 尾部流；2 内联单测通过 |
+| **MemoryMaintenanceMiddleware** | MemoryMaintenanceMiddleware | ✅ 已完成 | middleware/memory_maintenance.rs：on_agent 尾部节流执行 ①过期每日记忆归档 memory/archive ②LLM 合并（MemoryConsolidator）③清理过期 *.log.jsonl；glob 用 `{MEMORY_DIR}/*.md`、`{AGENTS_DIR}/**/*.log.jsonl`（根路径，匹配 root 相对路径）；2 内联单测通过 |
+| **ToolResultEvictionMiddleware** | ToolResultEvictionMiddleware | ✅ 已完成 | middleware/tool_result_eviction.rs：on_reasoning 将超限 ToolResultBlock 落盘 {eviction_path}/{agent}/{toolCallId}-{hash}，原位替换为 head+tail 占位符 + EVICTED_METADATA_KEY 防递归驱逐；3 内联单测通过 |
+| **SubagentsMiddleware** | SubagentsMiddleware | ✅ 已完成 | middleware/subagents.rs：on_reasoning 注入 ①subagents 系统提示节（render_subagent_section，过滤 hidden/Primary）②Async tasks 摘要（build_task_summary，≤10 条）③待交付 <system-reminder>（build_delivery_reminder，≤10 条），交付后 mark_delivered；公共辅助 prepend_to_system_message；依赖 WorkspaceTaskRepository（find_pending_deliveries/list_tasks）；配套 SubagentDeclaration 扩展（mode/hidden/persist_session/url/headers）+ SubagentEntry/SubagentFactory/DefaultAgentManager + TaskTool（task_output/task_cancel/task_list）；9 集成测试通过 |
+| **DynamicSubagentsMiddleware** | DynamicSubagentsMiddleware | ✅ 已完成（已滞后） | middleware/dynamic_subagents.rs：on_reasoning 每步重新解析两层（Layer2 本地 subagents/ 目录 + Layer1 Filesystem glob subagents/*.md），动态覆盖静态同名；可选 factory_builder 物化 + DefaultAgentManager 刷新 + extra_tools；`load_from_directory`/`load_from_filesystem`/`parse`（AgentSpecLoader .md front-matter）；10 测试（4 单测 loader + 5 集成 + 1 含 middleware）通过；**本会话修复其 1 个失败测试（NoopFactory.create unreachable → DummyAgent 返回）** |
+| **AgentTraceMiddleware** | AgentTraceMiddleware | ✅ 已完成（本轮） | middleware/agent_trace.rs：INFO 概要日志（PRE/POST_CALL、PRE/POST_REASONING、PRE_ACTING/POST_ACTING）+ DEBUG 详情；用 `WithDone` 流包装器在阶段流完成时触发回调；ReasoningTrace 累积 TextBlockDelta delta + ToolCallStart；ActingTrace 观察 ToolResultStart/TextDelta/End（toolCallId→name，result_len/state）；`AgentTraceMiddleware::new`/`with_debug`；6 单测 + 2 集成通过；**注：on_agent 的 POST_CALL 用事件流观察近似（Rust 无 resolveAgentState），on_reasoning/on_acting 完整等价**；**注：这些细分事件当前在 core 无实际发射点（类型齐全），中间件就绪待事件接入** |
+| **WorkspaceContextMiddleware** | WorkspaceContextMiddleware | ✅ 已完成（本轮） | middleware/workspace_context.rs：core `Middleware::on_system_prompt` 为同步（无法异步读文件）→ 改用 `on_agent` 拦截（每次 call 运行一次，匹配 Java 语义），async 构建 section 后追加到首条 system 消息（复用 `subagents::prepend_to_system_message`）；含 workspace 段落（Java "Other" legacy 单行分支）+ session context 节（日期/OS/arch/temp）+ session dynamic part（AgentStateStore ID + environment memory）+ loaded context + XML context + additional context files + knowledge block + token 预算截断（estimate len/4、`chars().take` 防 UTF-8 边界 panic）；10 内联测试通过 |
+| **SandboxLifecycleMiddleware** | SandboxLifecycleMiddleware | 待办 | 依赖 SandboxManager + SandboxBackedFilesystem（sandbox 骨架） |
+
+### 3.8 subagent（优先级 P1）
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| SubagentDeclaration 数据类 | SubagentDeclaration | ✅ 已完成 | |
+| **task 仓库 / 动态 spawn** | SubagentTask/SubagentTaskRepository | ✅ 已完成 | `subagent/task/` 目录：background/status/spec/delivery/record/repository/workspace；TaskRunSpec Local/Remote/Adopted；WorkspaceTaskRepository 基于 Filesystem（`tasks/<session>.json`）+ 内存覆盖层 + 推送交付 API；5 集成测试通过 |
+| **Subagent task 接线**（DefaultSubagentMaterializer + TaskCompletionBridge） | SubagentMaterializer + GatewayBridge | ✅ 已完成（本轮） | gateway/task_bridge.rs：DefaultSubagentMaterializer（从 DefaultAgentManager 工厂注册表重建 GatewayAgent）+ CallableAgentBridge（CallableAgent→GatewayAgent 适配器）+ TaskCompletionBridge（completion_callback → MessageBus.enqueue_wakeup 桥接）+ wire_task_completion 便捷函数 + create_completion_callback；DefaultAgentManager 新增 get_factory 方法；3 内联测试（materializer create/unknown/bridge wakeup）通过 |
+
+### 3.9 mcp / workspace / skill
+| 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| harness mcp 声明 + Registrar | McpServerConfig/Registrar | ✅ 已完成 | 注册 stub 待接 |
+| **完整版 WorkspaceManager** | WorkspaceManager(1032行) | ✅ 已完成（本轮） | workspace/manager.rs：两层次读（filesystem 优先 + 本地 fallback）、写经 Filesystem、命名空间 resolve_runtime_data_path、逐路径锁（read-merge-write 原子）、append/write 本地原子写（temp+rename）、session index upsert、task record JSON map 读写、sweep marker、skill draft/move、listMemory/listSessionLog/toWorkspaceRelativeString；**限制**：writeDraftSkillFile 的 overlay-lower 跨副本直写因 Rust Filesystem 无 downcast 略过（走标准路径） |
+| **WorkspaceIndex（SQLite）** | WorkspaceIndex(372行) | ✅ 已完成（本轮） | workspace/index.rs：rusqlite(bundled)，files 表（path PK/size/mtime/present_local）+ index_state；is_indexable（agents//, memory/）、upsert/upsert_from_local_file/remove/rename/exists/list_by_prefix/has_prefix/rebuild_from_disk；**Connection 非 Sync → 用 Mutex 包裹使 Arc 共享合法**；5 单测过 |
+| **NamespaceFactory** | NamespaceFactory | ✅ 已完成（本轮） | workspace/namespace.rs：trait `get_namespace(&RuntimeContext)` + NoNamespace + UserSessionNamespace（user_id/session_id → `users/<uid>/sessions/<sid>` 元组） |
+| WorkspaceConstants/PathNormalizer/PlanModeManager | 同名 | ✅ 已完成 | workspace/*.rs |
+| skill 全模块 | curator/runtime/stager/prompt/shell_path | ✅ 已完成 | 7 文件；LLM umbrella 模式待接 |
+
+
+## 4. 项目状态与下一步
+
+### 4.1 当前状态
+- **测试基线**：`cargo test` → core 106 通过（lib 54 + 集成 52）、harness 203 通过（lib 128 + 集成 75），共 **309** 通过
+- **clippy 基线**：core 16 条既有警告；harness lib 4 条既有（ExposedSession dead_code + 3 unused imports）
+- **关键文件**：`MIGRATION_PLAN.md`（方案）、`MIGRATION_GAP_TRACKER.md`（本文件）
+- **依赖说明**：`async-openai` v0.41.3（远程 crates.io）、`rusqlite` v0.31（bundled，SQLite 索引）
+- **已验证功能**：async-openai 自定义 base URL 生效（chat_demo 使用 https://opencode.ai/zen/go/v1 成功）
+
+### 4.2 下一步建议（按优先级）
+1. **P0 已完成**：model 层真实 provider 接入（async-openai）已验证，chat_demo 可正常运行
+2. **P1 重要待办**：
+   - MCP 集成（rust-mcp-sdk 接入）
+   - SandboxLifecycleMiddleware（依赖 SandboxManager + SandboxBackedFilesystem）
+   - Formatter 转换层（Msg→provider 请求转换）
+   - Tool 残余中高层（ToolkitAware rebindToolkit、McpClientManager 等）
+3. **P2 增强可选**：
+   - Shutdown 精细化（GracefulShutdownMiddleware）
+   - Observability 增强（OtelTracingMiddleware）
+   - RAG 模块（全新模块）
+   - Agent 协作（ObservableAgent observe、SubagentEventBus）
+
+> 下一步开工前请先读 `MIGRATION_GAP_TRACKER.md` 4.1/4.2，并确认 `cargo test` 基线 309 通过。
+
+## 5. 执行状态约定（所有会话必须遵守）
+- 开工前：读本文件 + `git status` + 确认 `cargo build`/`cargo test` 基线。
+- 改动中：保持每阶段 `cargo build`/`cargo test` 通过（增量可编译验证）。
+- 完工后：把对应条目的 `执行状态` 改为 `已完成`，更新 `交接信息`（验证结果），并把 `下一步建议` 归档到 `4.1 上次会话`。
+- 涉及 Java 参考时：以 `D:\IdeaProjects\agentscope-java` 源码为准（工作区外，需 workspaceOnly:false）。
+- 不迁移项（hook/Event v1/LongTermMemory/Tracer 等 Java 已 @Deprecated）一律标注 `设计决定（不迁移）` 而非 `待办`。
+
+## 6. 优先级路线图（Roadmap）
+| 里程碑 | 范围 | 建议并行度 |
+|---|---|---|
+| M1+（当前） | model 层可发 HTTP + agent 生命周期 | 2 个 worker |
+| M3+ | tool 中高层 + MCP 接入 | 1-2 个 worker |
+| M4/M5 | harness bus/gateway/middleware/sandbox | 2 个 worker |
+| M6 | 全量测试对齐、API 打磨 | 1 个 worker |
+
+## 7. 框架可用性验收清单（"基本可用"的最终标准）
+
+> 本节回答"全部 P0/P1 项完成后，框架是否就能开箱即用"。**代码完整 ≠ 可用**——即使上面所有 Java 类都有 Rust 等价物、能编译、能测，仍需以下端到端能力真正"通电"，框架才算可用。
+> **原则**：本节各项是**独立的可执行验收**，与前面章节的"逐类对齐"互补。完成前，不要宣称框架"可用"。
+
+### 7.1 端到端可运行 demo（最关键，当前盲区）
+| 验收项 | 说明 | 执行状态 | 交接信息 |
+|---|---|---|---|
+| **example/bin 入口** | 新增 `examples/`（或 `crates/*/examples/`），把 `Model + ReActAgent + Toolkit + 至少一个工具` 串成命令行程序 | ✅ 已完成 | 两个入口已建：`crates/agentscope-core/examples/chat_demo.rs`（Model 真实 provider 串通，需 key）；`crates/agentscope-core/examples/tool_agent_demo.rs`（**ReActAgent + Toolkit + add 工具**，脚本化 Model 无需 key）。tool_agent_demo 运行验证输出 `final reply: The sum of 3 and 4 is 7.`，证明 Model→Toolkit→工具→结果回填→最终回复 e2e 链路 ✓ |
+| **完整对话跑通** | 命令行发起一次用户消息 → 模型响应（含工具调用 → 工具结果 → 最终回复）全程走通 | 进行中 | 脚本化 Model 版已跑通（tool_agent_demo，无需 key）；真实 provider 版待 key（chat_demo 可跑，缺 key 时用脚本化 Model 兜底） |
+
+### 7.2 凭据 / 配置加载机制（当前盲区）
+| 验收项 | 说明 | 执行状态 | 交接信息 |
+|---|---|---|---|
+| **凭据加载** | `async-openai` 自动读 `OPENAI_API_KEY`/`OPENAI_BASE_URL`；DeepSeek/Kimi 等自定义 provider 用 `OpenAIConfig` 注入 key/base_url | ✅ 已完成 | `OpenAIConfig::new()` 内置 env 读取；`OpenAiChatModel::new/from_context` 可显式注入 key/base_url；credential 纯数据类用于跨 provider 映射 |
+| **模型 ID 解析** | 解析 `provider:model` 形式（如 `openai:gpt-4o`）→ 选择 provider + model | ✅ 已完成 | `ModelRegistry::resolve_with`（见 2.2），`default_registry()` 内置 OpenAI provider |
+
+### 7.3 真实 provider 打通（用 async-openai，不再手写）
+| 验收项 | 说明 | 执行状态 | 交接信息 |
+|---|---|---|---|
+| **至少一个真实 provider** | 用 `async-openai` 包装实现 `Model::stream`：内部 `chat().create_stream()` 发真实 HTTP/SSE，delta→`ChatResponse`/`ContentBlock`。建议先 **OpenAI**（读 `OPENAI_API_KEY`）或 **Ollama**（本地，改 base_url） | ✅ 已完成 | 接入层已实现（`OpenAiChatModel`，见 2.3），单测 ✅；**live 真实 HTTP/SSE 验证通过**（chat_demo 使用自定义 base URL https://opencode.ai/zen/go/v1 成功发送请求并获得回复） |
+| **带回退与错误映射** | async-openai 内置限流指数退避；429/5xx 重试、超时、错误→ `Error::HttpStatus/Model` 映射 | 待办 | 复用 ExecutionConfig（已实现）+ async-openai 内置重试 |
+
+### 7.4 核心能力端到端验证
+| 验收项 | 说明 | 执行状态 | 交接信息 |
+|---|---|---|---|
+| **工具调用 e2e** | 真实 provider 下，模型发起工具调用 → 框架执行 → 结果回填 → 继续 | 待办 | 依赖 7.3；Toolkit 治理层已就绪 |
+| **结构化输出 e2e** | 走通 `generate_response` 工具（fallback）或原生 `response_format`（native）任一路径 | 部分 | **native 路径已就绪**：`CallableAgent::call_with_schema` 设 `response_format(json_schema)` + 解析 reply 存结构化元数据（单测过）；fallback（`generate_response` 工具）仍待补 |
+| **状态持久化 e2e** | 用 `JsonFileAgentStateStore` 存会话，重启后从磁盘恢复并续接 | 待办 | store.rs 已实现；需 demo 接线验证 |
+
+### 7.5 集成连通性
+| 验收项 | 说明 | 执行状态 | 交接信息 |
+|---|---|---|---|
+| **MCP 连通** | 接一个本地 stdio MCP server，其 tool 能被 ReActAgent 调用 | 待办 | 依赖 2.14 rust-mcp-sdk 接入 |
+| **harness 端到端** | HarnessAgent + FilesystemTool + 工作区操作跑通一次 | 部分 | harness 有测试（74 个通过），但无真实 model 驱动 e2e |
+
+### 7.6 可用性验收结论判定
+- **达成"基本可用"的标志**：7.1 + 7.2 + 7.3（任一 provider）三项全绿，7.4 任一项 e2e 跑通。
+- **达成"完全可用"的标志**：7.4 全部 + 7.5 全部。
+- **判定方法**：新建 `examples/demo.rs`（或 cargo run），人工/脚本执行并确认输出符合预期；不以"编译通过 + 单测通过"替代 e2e。
+- 全部验收项完成后：在本节把对应 `执行状态` 改为 `已完成`，并在 `4.1 上次会话` 记录"框架已基本可用"的验证过程。

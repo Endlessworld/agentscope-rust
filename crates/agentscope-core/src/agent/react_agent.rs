@@ -1,0 +1,1253 @@
+//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
+//!
+//! The ReAct agent runs an iterative reasoning → acting loop: it streams a model
+//! call, accumulates the reasoning result, and if the model requested tool calls
+//! it executes them and feeds the results back, repeating until the model stops
+//! or the maximum number of iterations is reached.
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use futures::StreamExt;
+
+use crate::error::{Error, Result};
+use crate::event::{AgentEvent, EventData};
+use crate::formatter::{JsonSchema, ResponseFormat};
+use crate::interruption::InterruptControl;
+use crate::message::{
+    ChatUsage, ContentBlock, GenerateReason, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock,
+    ToolResultBlock, ToolResultState, ToolUseBlock,
+};
+use crate::middleware::{
+    AgentInput, EventStream, MiddlewareChain, ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware,
+};
+use crate::model::{GenerateOptions, Model};
+use crate::permission::{
+    PermissionBehavior, PermissionContextState, PermissionDecision, PermissionEngine,
+};
+use crate::state::AgentState;
+use crate::state::context::TaskContextState;
+use crate::tool::{TodoWriteTool, ToolExecutionContext, Toolkit};
+use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
+use super::lifecycle::{CallGate, ExecutionGuard};
+use super::stream_options::StreamOptions;
+
+/// A boxed event sink registered via [`ObservableAgent::subscribe`].
+type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+
+/// Default maximum number of reasoning→acting iterations per call.
+pub const DEFAULT_MAX_ITERS: i32 = 10;
+
+/// Tool name used for the per-call structured-output `generate_response` tool.
+pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "generate_response";
+
+/// Immutable core of a [`ReActAgent`], shared across clones and calls.
+struct AgentCore {
+    model: Arc<dyn Model>,
+    toolkit: Toolkit,
+    sys_prompt: String,
+    max_iters: i32,
+    state: Arc<Mutex<AgentState>>,
+    #[allow(dead_code)]
+    enable_pending_tool_recovery: bool,
+    permission_engine: PermissionEngine,
+    interrupt: Arc<InterruptControl>,
+    middleware_chain: Arc<MiddlewareChain>,
+    call_gate: Arc<CallGate>,
+    subscriber: Arc<Mutex<Option<EventSink>>>,
+    tasks: Arc<Mutex<TaskContextState>>,
+}
+
+/// Accumulates streamed model chunks into a single assistant message.
+#[derive(Debug, Default)]
+struct ReasoningContext {
+    id: String,
+    text: String,
+    thinking: String,
+    tool_calls: Vec<ToolUseBlock>,
+    usage: Option<ChatUsage>,
+}
+
+impl ReasoningContext {
+    /// Merges a streamed chunk into this accumulator.
+    fn accumulate(&mut self, chunk: crate::model::ChatResponse) {
+        if self.id.is_empty() {
+            self.id = chunk.id.clone();
+        }
+        for block in chunk.content {
+            match block {
+                ContentBlock::Text(t) => self.text.push_str(&t.text),
+                ContentBlock::Thinking(t) => self.thinking.push_str(&t.thinking),
+                ContentBlock::ToolUse(t) => self.tool_calls.push(t),
+                _ => {}
+            }
+        }
+        if chunk.usage.total_tokens() > 0 {
+            self.usage = Some(chunk.usage);
+        }
+    }
+
+    /// Builds the final assistant message from the accumulated content.
+    fn build_final_message(self) -> Msg {
+        let mut blocks = Vec::new();
+        if !self.thinking.is_empty() {
+            blocks.push(ContentBlock::Thinking(ThinkingBlock::new(self.thinking)));
+        }
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text(TextBlock::new(self.text)));
+        }
+        for tc in self.tool_calls {
+            blocks.push(ContentBlock::ToolUse(tc));
+        }
+        let mut b = Msg::builder().role(MsgRole::Assistant).content(blocks);
+        if !self.id.is_empty() {
+            b = b.id(self.id);
+        }
+        if let Some(u) = self.usage {
+            b = b.usage(u);
+        }
+        b.build()
+    }
+}
+
+/// A ReAct (Reasoning + Acting) agent.
+///
+/// Each call runs the reasoning→acting loop against the bound model and toolkit,
+/// honouring the middleware chain, permission engine and per-call interrupt.
+#[derive(Clone)]
+pub struct ReActAgent {
+    id: String,
+    name: String,
+    description: String,
+    core: Arc<AgentCore>,
+}
+
+impl std::fmt::Debug for ReActAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReActAgent")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl ReActAgent {
+    /// Returns the stable unique identifier.
+    pub fn agent_id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the display name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the description.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Returns the model bound to this agent.
+    pub fn model(&self) -> &Arc<dyn Model> {
+        &self.core.model
+    }
+
+    /// Creates a new builder.
+    pub fn builder() -> ReActAgentBuilder {
+        ReActAgentBuilder::default()
+    }
+
+    /// Runs the agent against the given input messages and returns the reply.
+    pub async fn call(&self, messages: Vec<Msg>) -> Result<Msg> {
+        self.call_with_format(messages, None).await
+    }
+
+    /// Internal: runs the full lifecycle (graceful-shutdown guard + per-session
+    /// serialization) and returns the reply message.
+    async fn call_with_format(
+        &self,
+        messages: Vec<Msg>,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<Msg> {
+        let _guard = ExecutionGuard::acquire()?;
+        // Seed the shared task bag from the persisted state, then restore it after the run
+        // so any `todo_write` mutations survive.
+        let seed = self.core.state.lock().unwrap().tasks_context.clone();
+        *self.core.tasks.lock().unwrap() = seed;
+        let key = self.core.state.lock().unwrap().session_id().to_string();
+        let gate = Arc::clone(&self.core.call_gate);
+        let this = self.clone();
+        gate.run(&key, async move {
+            let (stream, slot) = this.run_stream(messages, response_format);
+            let events: Vec<Result<AgentEvent>> = stream.collect().await;
+            for ev in events.into_iter().flatten() {
+                if let Some(sink) = this.core.subscriber.lock().unwrap().as_ref() {
+                    sink(ev);
+                }
+            }
+            let result = slot.lock().unwrap().take().unwrap_or_else(|| {
+                Err(Error::Agent("agent produced no result message".into()))
+            });
+            // Persist task-list mutations made by the `todo_write` tool back into state.
+            let tasks = this.core.tasks.lock().unwrap().clone();
+            this.core.state.lock().unwrap().tasks_context = tasks;
+            result
+        })
+        .await
+    }
+
+    /// Builds the (middleware-wrapped) event stream for a single agent invocation,
+    /// together with a slot the core loop writes its final result into.
+    fn run_stream(
+        &self,
+        messages: Vec<Msg>,
+        response_format: Option<ResponseFormat>,
+    ) -> (EventStream, Arc<Mutex<Option<Result<Msg>>>>) {
+        let input = AgentInput::new(messages);
+        let mut ctx = self.new_context(&input);
+        ctx.response_format = response_format;
+        let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
+        let core = Arc::clone(&self.core);
+        let ctx_core = ctx.clone();
+        let slot_core = Arc::clone(&slot);
+        let agent_core: Box<dyn FnOnce(AgentInput) -> EventStream + Send> =
+            Box::new(move |input: AgentInput| {
+                let fut = async move {
+                    let mut events = Vec::new();
+                    events.push(Ok(AgentEvent::AgentStart(EventData::default())));
+                    let res = run_agent_loop(&core, &ctx_core, input.messages).await;
+                    if let Ok(msg) = &res {
+                        let mut data = EventData::default();
+                        data.fields.insert(
+                            "reply".to_string(),
+                            serde_json::to_value(msg).unwrap_or_default(),
+                        );
+                        events.push(Ok(AgentEvent::AgentResult(data)));
+                    }
+                    *slot_core.lock().unwrap() = Some(res);
+                    events.push(Ok(AgentEvent::AgentEnd(EventData::default())));
+                    futures::stream::iter(events)
+                };
+                Box::pin(futures::stream::once(fut).flatten())
+            });
+        let stream = self.core.middleware_chain.wrap_agent(ctx, input, agent_core);
+        (stream, slot)
+    }
+
+    /// Streams fine-grained agent events, filtered by the given [`StreamOptions`].
+    pub fn stream_events(&self, messages: Vec<Msg>, options: StreamOptions) -> EventStream {
+        let (stream, _slot) = self.run_stream(messages, None);
+        Box::pin(stream.filter_map(move |res| {
+            let opts = options.clone();
+            async move {
+                match res {
+                    Ok(ev) if opts.should_stream(&ev) => Some(Ok(ev)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        }))
+    }
+
+    /// Structured-output call: runs the agent with the given JSON schema and stores
+    /// the parsed JSON reply in the returned message's structured-output metadata.
+    /// Uses the native `response_format` path when the model supports it, otherwise
+    /// falls back to the synthetic `generate_response` tool.
+    pub async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
+        let has_tools = !self.core.toolkit.tool_schemas().is_empty();
+        let use_native = if has_tools {
+            self.core.model.supports_native_structured_output_with_tools()
+        } else {
+            self.core.model.supports_native_structured_output()
+        };
+        if use_native {
+            self.call_native_structured(messages, schema).await
+        } else {
+            self.call_fallback_structured(messages, schema).await
+        }
+    }
+
+    /// Native structured-output path: passes the schema via `response_format` and parses
+    /// the model's JSON text reply into structured-output metadata.
+    async fn call_native_structured(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
+        let reply = self
+            .call_with_format(messages, Some(ResponseFormat::json_schema(schema)))
+            .await?;
+        let text = reply.text_content();
+        let parsed = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        Ok(reply.with_structured_data(parsed))
+    }
+
+    /// Structured-output fallback path: injects a synthetic `generate_response` tool so the
+    /// model produces the response via a tool call. Used when the model does not support
+    /// native `response_format`. Mirrors the Java `doFallbackStructuredCall`.
+    async fn call_fallback_structured(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
+        let _guard = ExecutionGuard::acquire()?;
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+
+        // Per-call toolkit that additionally exposes the `generate_response` tool.
+        let toolkit = self.core.toolkit.clone();
+        let captured_tool = Arc::clone(&captured);
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            STRUCTURED_OUTPUT_TOOL_NAME,
+            "Generate the final structured response. Call this function when you have all the information needed to provide a complete answer.",
+            generate_response_parameters(&schema),
+            Box::new(move |args: JsonMap, _ctx: crate::tool::ToolExecutionContext| {
+                let resp = args.get("response").cloned();
+                *captured_tool.lock().unwrap() = resp.clone();
+                let text = match &resp {
+                    Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                    None => String::new(),
+                };
+                Ok(ToolResultBlock::text(text))
+            }),
+        )));
+
+        let mut state = self.core.state.lock().unwrap().clone();
+        for m in messages {
+            state.context_mut().push(m);
+        }
+        state.context_mut().push(structured_output_reminder(&schema));
+
+        let tools = toolkit.tool_schemas();
+        let mut last_text = String::new();
+        for _ in 0..self.core.max_iters {
+            let msgs = state.context().to_vec();
+            let options = GenerateOptions::builder()
+                .model_name(self.core.model.model_name())
+                .build();
+            let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&self.core.model));
+            let msg = model_call_impl(&self.core, input).await?;
+            state.context_mut().push(msg.clone());
+
+            let mut gen_called = false;
+            for tc in msg.tool_use_blocks() {
+                if tc.name == STRUCTURED_OUTPUT_TOOL_NAME {
+                    let tctx = crate::tool::ToolExecutionContext {
+                        tool_call: Some(tc.clone()),
+                        runtime: Default::default(),
+                        emitter: None,
+                    };
+                    if let Ok(rb) = toolkit.call_tool(tc, tctx).await {
+                        state.context_mut().push(
+                            Msg::builder()
+                                .role(MsgRole::Tool)
+                                .content(vec![ContentBlock::ToolResult(rb)])
+                                .build(),
+                        );
+                    }
+                    gen_called = true;
+                }
+            }
+            if gen_called {
+                break;
+            }
+            if msg.tool_use_blocks().next().is_none() {
+                last_text = msg.text_content();
+                break;
+            }
+        }
+        *self.core.state.lock().unwrap() = state;
+
+        let structured = captured.lock().unwrap().clone().or_else(|| {
+            let t = last_text.trim();
+            if t.is_empty() {
+                None
+            } else {
+                serde_json::from_str(t).ok()
+            }
+        });
+        let text = match &structured {
+            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+            None => last_text,
+        };
+        let mut reply = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Text(TextBlock::new(text))])
+            .build();
+        if let Some(s) = structured {
+            reply = reply.with_structured_data(s);
+        }
+        Ok(reply)
+    }
+
+    fn new_context(&self, input: &AgentInput) -> crate::agent::RuntimeContext {
+        crate::agent::RuntimeContext {
+            agent_name: Some(self.name.clone()),
+            user_input: input.messages.last().map(|m| m.text_content()),
+            memory: input.messages.clone(),
+            toolkit: Some(self.core.toolkit.clone()),
+            metadata: Default::default(),
+            cwd: None,
+            response_format: None,
+            session_id: None,
+            user_id: None,
+            agent_id: None,
+        }
+    }
+}
+
+impl Agent for ReActAgent {
+    fn agent_id(&self) -> &str {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn interrupt(&self) {
+        self.core.interrupt.trigger(None, None);
+    }
+    fn agent_state(&self) -> AgentState {
+        self.core.state.lock().unwrap().clone()
+    }
+    fn toolkit(&self) -> &Toolkit {
+        &self.core.toolkit
+    }
+}
+
+#[async_trait]
+impl CallableAgent for ReActAgent {
+    async fn call(&self, messages: Vec<Msg>) -> Result<Msg> {
+        ReActAgent::call(self, messages).await
+    }
+
+    async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
+        ReActAgent::call_with_schema(self, messages, schema).await
+    }
+}
+
+impl ObservableAgent for ReActAgent {
+    fn subscribe(&self, sink: Box<dyn Fn(AgentEvent) + Send + Sync>) {
+        *self.core.subscriber.lock().unwrap() = Some(Arc::new(sink));
+    }
+}
+
+/// Builder for [`ReActAgent`].
+pub struct ReActAgentBuilder {
+    id: String,
+    name: String,
+    description: String,
+    model: Option<Arc<dyn Model>>,
+    toolkit: Option<Toolkit>,
+    sys_prompt: String,
+    max_iters: i32,
+    middleware_chain: Option<MiddlewareChain>,
+    state: Option<AgentState>,
+    enable_pending_tool_recovery: bool,
+    permission_context: Option<PermissionContextState>,
+    enable_todo_tool: bool,
+}
+
+impl Default for ReActAgentBuilder {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            model: None,
+            toolkit: None,
+            sys_prompt: String::new(),
+            max_iters: 0,
+            middleware_chain: None,
+            state: None,
+            enable_pending_tool_recovery: false,
+            permission_context: None,
+            enable_todo_tool: true,
+        }
+    }
+}
+
+impl ReActAgentBuilder {
+    /// Creates a new builder with a randomly generated agent id.
+    pub fn new() -> Self {
+        Self::default().id(uuid::Uuid::new_v4().to_string().replace('-', ""))
+    }
+
+    /// Sets the stable agent id.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+    /// Sets the display name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+    /// Sets the description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+    /// Sets the backing model (required).
+    pub fn model(mut self, model: Arc<dyn Model>) -> Self {
+        self.model = Some(model);
+        self
+    }
+    /// Sets the toolkit used for tool execution.
+    pub fn toolkit(mut self, toolkit: Toolkit) -> Self {
+        self.toolkit = Some(toolkit);
+        self
+    }
+    /// Sets the system prompt prepended to every reasoning call.
+    pub fn sys_prompt(mut self, sys_prompt: impl Into<String>) -> Self {
+        self.sys_prompt = sys_prompt.into();
+        self
+    }
+    /// Sets the maximum reasoning→acting iterations (default 10).
+    pub fn max_iters(mut self, max_iters: i32) -> Self {
+        self.max_iters = max_iters;
+        self
+    }
+    /// Sets the middleware chain.
+    pub fn middleware_chain(mut self, chain: MiddlewareChain) -> Self {
+        self.middleware_chain = Some(chain);
+        self
+    }
+    /// Sets the initial agent state.
+    pub fn state(mut self, state: AgentState) -> Self {
+        self.state = Some(state);
+        self
+    }
+    /// Enables or disables pending-tool recovery across calls.
+    pub fn enable_pending_tool_recovery(mut self, v: bool) -> Self {
+        self.enable_pending_tool_recovery = v;
+        self
+    }
+    /// Sets the permission context used to evaluate tool requests.
+    pub fn permission_context(mut self, ctx: PermissionContextState) -> Self {
+        self.permission_context = Some(ctx);
+        self
+    }
+    /// Enables or disables the built-in `todo_write` tool + `TaskReminderMiddleware` (default on).
+    pub fn todo_tool(mut self, v: bool) -> Self {
+        self.enable_todo_tool = v;
+        self
+    }
+
+    /// Builds the [`ReActAgent`].
+    pub fn build(self) -> Result<ReActAgent> {
+        let model = self.model.ok_or_else(|| {
+            Error::Agent("ReActAgent requires a model".into())
+        })?;
+        let id = if self.id.is_empty() {
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        } else {
+            self.id
+        };
+        let name = if self.name.is_empty() { id.clone() } else { self.name };
+        let max_iters = if self.max_iters <= 0 { DEFAULT_MAX_ITERS } else { self.max_iters };
+        let initial_state = self.state.unwrap_or_default();
+        let tasks: Arc<Mutex<TaskContextState>> =
+            Arc::new(Mutex::new(initial_state.tasks_context.clone()));
+
+        let toolkit = self.toolkit.unwrap_or_default();
+        let mut chain = self.middleware_chain.unwrap_or_default();
+        if self.enable_todo_tool {
+            toolkit.register_tool(Arc::new(TodoWriteTool::new(Arc::clone(&tasks))));
+            chain.add(Box::new(TaskReminderMiddleware::new(Arc::clone(&tasks))));
+        }
+
+        let core = Arc::new(AgentCore {
+            model,
+            toolkit,
+            sys_prompt: self.sys_prompt,
+            max_iters,
+            state: Arc::new(Mutex::new(initial_state)),
+            enable_pending_tool_recovery: self.enable_pending_tool_recovery,
+            permission_engine: PermissionEngine::new(self.permission_context.unwrap_or_default()),
+            interrupt: Arc::new(InterruptControl::new()),
+            middleware_chain: Arc::new(chain),
+            call_gate: Arc::new(CallGate::new()),
+            subscriber: Arc::new(Mutex::new(None)),
+            tasks,
+        });
+        Ok(ReActAgent { id, name, description: self.description, core })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution loop
+// ---------------------------------------------------------------------------
+
+/// Entry point of the reasoning→acting loop. Copies the shared state out, appends
+/// the input messages, runs the iteration loop and writes the state back.
+async fn run_agent_loop(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    messages: Vec<Msg>,
+) -> Result<Msg> {
+    let mut state = core.state.lock().unwrap().clone();
+    for m in messages {
+        state.context_mut().push(m);
+    }
+    state.set_cur_iter(0);
+    let result = execute_iteration(core, ctx, &mut state, 0).await?;
+    *core.state.lock().unwrap() = state;
+    Ok(result)
+}
+
+async fn execute_iteration(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    state: &mut AgentState,
+    mut iter: i32,
+) -> Result<Msg> {
+    loop {
+        let msg = reasoning_phase(core, ctx, state, iter).await?;
+        let reason = msg.generate_reason();
+        let has_tool_calls = msg.tool_use_blocks().next().is_some();
+        let suspended = match reason {
+            GenerateReason::ModelStop | GenerateReason::ToolCalls => {
+                if has_tool_calls {
+                    let suspended = acting_phase(core, state).await?;
+                    iter += 1;
+                    suspended
+                } else {
+                    return Ok(msg);
+                }
+            }
+            GenerateReason::ReasoningStopRequested | GenerateReason::MaxIterations => {
+                return Ok(msg);
+            }
+            _ => {
+                if has_tool_calls {
+                    let suspended = acting_phase(core, state).await?;
+                    iter += 1;
+                    suspended
+                } else {
+                    return Ok(msg);
+                }
+            }
+        };
+        if suspended {
+            return Ok(msg.with_generate_reason(GenerateReason::ToolSuspended));
+        }
+    }
+}
+
+/// Runs one reasoning phase: check interrupt, possibly summarize if over budget,
+/// build the model input and run the (middleware-wrapped) model call. Appends the
+/// resulting assistant message to the context and returns it for the loop to decide
+/// whether to act or terminate.
+async fn reasoning_phase(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    state: &mut AgentState,
+    iter: i32,
+) -> Result<Msg> {
+    check_interrupted(core)?;
+    state.set_cur_iter(iter);
+    if iter >= core.max_iters {
+        return summarizing(core).await;
+    }
+
+    let sys_prompt = core
+        .middleware_chain
+        .apply_system_prompt(ctx, core.sys_prompt.clone());
+    let mut messages = Vec::new();
+    if !sys_prompt.trim().is_empty() {
+        messages.push(Msg::system(sys_prompt));
+    }
+    messages.extend(state.context().to_vec());
+
+    let tools = core.toolkit.tool_schemas();
+    let mut ob = GenerateOptions::builder().model_name(core.model.model_name());
+    if let Some(rf) = &ctx.response_format {
+        ob = ob.response_format(rf.clone());
+    }
+    let options = ob.build();
+    let input = ReasoningInput::new(messages, tools, options);
+
+    let final_msg = run_reasoning(core, ctx, input).await?;
+    state.context_mut().push(final_msg.clone());
+    Ok(final_msg)
+}
+
+/// Runs the reasoning phase through the middleware chain, wrapping the raw model
+/// call, and returns the accumulated assistant message.
+async fn run_reasoning(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    input: ReasoningInput,
+) -> Result<Msg> {
+    let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
+    let chain = Arc::clone(&core.middleware_chain);
+    let mc_input = ModelCallInput::new(
+        input.messages.clone(),
+        input.tools.clone(),
+        input.options.clone(),
+        Arc::clone(&core.model),
+    );
+
+    let model_core: Next<ModelCallInput> = {
+        let slot = Arc::clone(&slot);
+        let core = Arc::clone(core);
+        Box::new(move |mc_input: ModelCallInput| -> EventStream {
+            let fut = async move {
+                let msg = model_call_impl(&core, mc_input).await;
+                *slot.lock().unwrap() = Some(msg);
+                Ok(AgentEvent::ModelCallEnd(EventData::default()))
+            };
+            Box::pin(futures::stream::once(fut))
+        })
+    };
+
+    let reasoning_core: Next<ReasoningInput> = {
+        let chain = Arc::clone(&chain);
+        let ctx = ctx.clone();
+        Box::new(move |_r: ReasoningInput| -> EventStream {
+            chain.wrap_model_call(ctx.clone(), mc_input.clone(), model_core)
+        })
+    };
+
+    let stream = chain.wrap_reasoning(ctx.clone(), input, reasoning_core);
+    let _events: Vec<_> = stream.collect().await;
+    let result = slot.lock().unwrap().take().unwrap_or_else(|| {
+        Err(Error::Agent("model produced no message".into()))
+    });
+    result
+}
+
+/// Calls the raw model stream and accumulates all chunks into one message.
+async fn model_call_impl(
+    core: &Arc<AgentCore>,
+    mc_input: ModelCallInput,
+) -> Result<Msg> {
+    let model = Arc::clone(&mc_input.model);
+    let mut acc = ReasoningContext::default();
+    let mut stream = model.stream(mc_input.messages, mc_input.tools, mc_input.options);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        check_interrupted(core)?;
+        acc.accumulate(chunk);
+    }
+    Ok(acc.build_final_message())
+}
+
+/// Executes the pending tool calls from the last assistant message and feeds the
+/// results back into the context. The outer loop decides whether to continue.
+async fn acting_phase(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<bool> {
+    check_interrupted(core)?;
+    let pending = extract_pending_tool_calls(state);
+    if pending.is_empty() {
+        return Ok(false);
+    }
+
+    let mut results = Vec::new();
+    let mut suspended = false;
+    for call in &pending {
+        let decision = evaluate_permission(core, call);
+        match decision.behavior {
+            PermissionBehavior::Deny => {
+                results.push(denied_result(call, &decision.message));
+            }
+            PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
+                let tctx = ToolExecutionContext {
+                    tool_call: Some(call.clone()),
+                    runtime: Default::default(),
+                    emitter: None,
+                };
+                match core.toolkit.call_tool(call, tctx).await {
+                    Ok(rb) => {
+                        let bound = bind_result(call, rb);
+                        suspended = suspended || bound.is_suspended();
+                        results.push(bound);
+                    }
+                    Err(e) => results.push(error_result(call, &e.to_string())),
+                }
+            }
+            PermissionBehavior::Ask => {
+                return Err(Error::Agent(format!(
+                    "permission asking (HITL) is not yet supported; tool '{}' requires user confirmation",
+                    call.name
+                )));
+            }
+        }
+    }
+
+    let result_msg = Msg::builder()
+        .role(MsgRole::Tool)
+        .content(results.into_iter().map(ContentBlock::ToolResult).collect())
+        .build();
+    state.context_mut().push(result_msg);
+    Ok(suspended)
+}
+
+/// Produces the termination message when the maximum number of iterations is hit.
+async fn summarizing(core: &Arc<AgentCore>) -> Result<Msg> {
+    check_interrupted(core)?;
+    let msg = Msg::builder()
+        .role(MsgRole::Assistant)
+        .content(vec![ContentBlock::ToolResult(ToolResultBlock {
+            id: None,
+            name: None,
+            output: vec![ContentBlock::Text(TextBlock::new(
+                "Reached the maximum number of iterations; the task could not be completed.",
+            ))],
+            metadata: Default::default(),
+            state: ToolResultState::Error,
+        })])
+        .generate_reason(GenerateReason::MaxIterations)
+        .build();
+    Ok(msg)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Builds the `generate_response` tool's parameter schema wrapping the target JSON
+/// schema under a single `response` property.
+fn generate_response_parameters(schema: &JsonSchema) -> serde_json::Value {
+    let mut props = serde_json::Map::new();
+    props.insert("response".to_string(), serde_json::Value::Object(schema.schema.clone()));
+    let mut params = serde_json::Map::new();
+    params.insert("type".to_string(), serde_json::json!("object"));
+    params.insert("properties".to_string(), serde_json::Value::Object(props));
+    params.insert("required".to_string(), serde_json::json!(["response"]));
+    serde_json::Value::Object(params)
+}
+
+/// Builds the transient structured-output reminder message injected before the model
+/// sees the input, instructing it to call `generate_response` with the target schema.
+fn structured_output_reminder(schema: &JsonSchema) -> Msg {
+    let mut metadata = JsonMap::new();
+    metadata.insert(
+        crate::message::keys::metadata_keys::SYNTHETIC.to_string(),
+        serde_json::json!(true),
+    );
+    metadata.insert(
+        crate::message::keys::metadata_keys::STRUCTURED_OUTPUT_REMINDER.to_string(),
+        serde_json::json!(true),
+    );
+    Msg::builder()
+        .role(MsgRole::User)
+        .name("system")
+        .text_content(format!(
+            "Produce the final structured response by calling the `generate_response` tool.\nJSON schema:\n{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(schema.schema.clone()))
+                .unwrap_or_default()
+        ))
+        .metadata(metadata)
+        .build()
+}
+
+/// Aborts execution if the agent has been interrupted.
+fn check_interrupted(core: &Arc<AgentCore>) -> Result<()> {
+    if core.interrupt.is_interrupted() {
+        return Err(Error::Interrupted("agent execution interrupted".into()));
+    }
+    Ok(())
+}
+
+/// Collects the tool-use blocks from the most recent assistant message.
+fn extract_pending_tool_calls(state: &AgentState) -> Vec<ToolUseBlock> {
+    state
+        .context()
+        .iter()
+        .rev()
+        .find(|m| m.role() == MsgRole::Assistant)
+        .map(|m| m.tool_use_blocks().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Evaluates the permission decision for a single tool invocation.
+fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> PermissionDecision {
+    // An unconfigured (trivial) permission context allows all tool calls, so a
+    // default ReActAgent works out of the box without explicit rules.
+    if core.permission_engine.context().is_trivial() {
+        return PermissionDecision::allow(format!("Permission granted for {}", call.name));
+    }
+    let is_read_only = core
+        .toolkit
+        .get_tool(&call.name)
+        .map(|t| t.is_read_only())
+        .unwrap_or(false);
+    let matcher = |pattern: &str, input: &JsonMap| {
+        let serialized = serde_json::to_string(input).unwrap_or_default();
+        serialized.contains(pattern)
+    };
+    core.permission_engine
+        .check_permission(&call.name, is_read_only, &call.input, matcher)
+}
+
+/// Binds a tool's raw result block back to the originating call.
+fn bind_result(call: &ToolUseBlock, rb: ToolResultBlock) -> ToolResultBlock {
+    ToolResultBlock {
+        id: Some(call.id.clone()),
+        name: Some(call.name.clone()),
+        output: rb.output,
+        metadata: rb.metadata,
+        state: rb.state,
+    }
+}
+
+/// Builds a denied result block for a call.
+fn denied_result(call: &ToolUseBlock, message: &str) -> ToolResultBlock {
+    ToolResultBlock {
+        id: Some(call.id.clone()),
+        name: Some(call.name.clone()),
+        output: vec![ContentBlock::Text(TextBlock::new(format!(
+            "Permission denied: {}",
+            message
+        )))],
+        metadata: Default::default(),
+        state: ToolResultState::Denied,
+    }
+}
+
+/// Builds an error result block for a call.
+fn error_result(call: &ToolUseBlock, message: &str) -> ToolResultBlock {
+    ToolResultBlock {
+        id: Some(call.id.clone()),
+        name: Some(call.name.clone()),
+        output: vec![ContentBlock::Text(TextBlock::new(format!(
+            "Error: {}",
+            message
+        )))],
+        metadata: Default::default(),
+        state: ToolResultState::Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::stream::BoxStream;
+
+    use super::*;
+    use crate::message::{TextBlock, ToolUseBlock};
+    use crate::model::ChatResponse;
+    use crate::permission::PermissionRule;
+    use crate::tool::Tool;
+
+    /// A mock model that pops queued responses, falling back to a fixed "done".
+    struct MockModel {
+        name: String,
+        responses: Arc<Mutex<Vec<ChatResponse>>>,
+    }
+
+    impl MockModel {
+        fn new(name: &str, responses: Vec<ChatResponse>) -> Self {
+            Self {
+                name: name.to_string(),
+                responses: Arc::new(Mutex::new(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Model for MockModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let responses = Arc::clone(&self.responses);
+            Box::pin(futures::stream::once(async move {
+                let mut g = responses.lock().unwrap();
+                let r = if g.is_empty() {
+                    text_response("done")
+                } else {
+                    g.remove(0)
+                };
+                Ok(r)
+            }))
+        }
+        fn model_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    fn text_response(text: &str) -> ChatResponse {
+        ChatResponse::builder()
+            .content(vec![ContentBlock::Text(TextBlock::new(text))])
+            .build()
+    }
+
+    fn tool_use_response(id: &str, name: &str, input: JsonMap) -> ChatResponse {
+        ChatResponse::builder()
+            .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(id, name, input))])
+            .build()
+    }
+
+    fn add_tool(counter: Arc<Mutex<u32>>) -> Arc<dyn Tool> {
+        let counter = Arc::clone(&counter);
+        Arc::new(crate::tool::FunctionTool::new(
+            "add",
+            "adds two integers",
+            serde_json::json!({"type": "object"}),
+            Box::new(move |args: JsonMap, _ctx: ToolExecutionContext| {
+                let a = args.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
+                let b = args.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
+                *counter.lock().unwrap() += 1;
+                Ok(ToolResultBlock::text(format!("{}", a + b)))
+            }),
+        ))
+    }
+
+    #[tokio::test]
+    async fn plain_text_reply() {
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hello world")]));
+        let agent = ReActAgent::builder()
+            .name("t1")
+            .model(model)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "hello world");
+        assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+    }
+
+    #[tokio::test]
+    async fn tool_call_loop() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("the answer is 3"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t2")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "the answer is 3");
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn suspended_tool_halts_with_tool_suspended() {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "external",
+            "needs human",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| {
+                Err(crate::tool::ToolSuspendException::new("waiting for input").to_error())
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "external", JsonMap::new()),
+                // If the loop incorrectly continued, this second response would be
+                // consumed; the assertion below guards against that.
+                text_response("should not happen"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-suspend")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("go")]).await.unwrap();
+        assert_eq!(reply.generate_reason(), GenerateReason::ToolSuspended);
+    }
+
+    #[tokio::test]
+    async fn max_iters_terminates() {
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "nope", JsonMap::new()),
+                tool_use_response("c2", "nope", JsonMap::new()),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t3")
+            .model(model)
+            .max_iters(2)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("loop")]).await.unwrap();
+        assert_eq!(reply.generate_reason(), GenerateReason::MaxIterations);
+    }
+
+    #[tokio::test]
+    async fn permission_denies_tool() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let ctx = PermissionContextState::builder()
+            .add_deny_rule(
+                "add",
+                PermissionRule::new("add", None, PermissionBehavior::Deny, "test"),
+            )
+            .build();
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        // The tool must never have been invoked.
+        assert_eq!(*counter.lock().unwrap(), 0);
+        assert_eq!(reply.text_content(), "done");
+    }
+
+    #[tokio::test]
+    async fn subscriber_receives_events() {
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hi")]));
+        let agent = ReActAgent::builder().name("t5").model(model).build().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        agent.subscribe(Box::new(move |ev| {
+            s.lock().unwrap().push(ev.event_type().wire_name().to_string());
+        }));
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+        let names = seen.lock().unwrap().clone();
+        assert!(names.iter().any(|n| n == "AGENT_START"));
+        assert!(names.iter().any(|n| n == "AGENT_RESULT"));
+        assert!(names.iter().any(|n| n == "AGENT_END"));
+    }
+
+    #[tokio::test]
+    async fn stream_events_filters_by_category() {
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hi")]));
+        let agent = ReActAgent::builder().name("t-stream").model(model).build().unwrap();
+
+        // Defaults stream everything, including AGENT_START.
+        let events: Vec<String> = agent
+            .stream_events(vec![Msg::user("hi")], crate::agent::stream_options::StreamOptions::defaults())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap().event_type().wire_name().to_string())
+            .collect();
+        assert!(events.iter().any(|n| n == "AGENT_START"));
+        assert!(events.iter().any(|n| n == "AGENT_END"));
+
+        // A non-agent category hides the lifecycle events.
+        let opts = crate::agent::stream_options::StreamOptions::builder()
+            .event_types(&[crate::agent::stream_options::EventCategory::ToolResult])
+            .build();
+        let events: Vec<String> = agent
+            .stream_events(vec![Msg::user("hi")], opts)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap().event_type().wire_name().to_string())
+            .collect();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_with_schema_parses_structured_output() {
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![text_response("{\"name\":\"alice\",\"age\":30}")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-structured")
+            .model(model)
+            .build()
+            .unwrap();
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        let reply = agent
+            .call_with_schema(
+                vec![Msg::user("give json")],
+                crate::formatter::JsonSchema::new("person", schema),
+            )
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+        let data = reply.structured_data().unwrap();
+        assert_eq!(data["name"], serde_json::json!("alice"));
+        assert_eq!(data["age"], serde_json::json!(30));
+    }
+
+    #[tokio::test]
+    async fn call_with_schema_fallback_via_generate_response_tool() {
+        // The mock model does not support native structured output, so the agent must
+        // route through the synthetic `generate_response` tool path.
+        let mut resp_input = JsonMap::new();
+        resp_input.insert(
+            "response".to_string(),
+            serde_json::json!({"name": "bob", "age": 42}),
+        );
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("g1", STRUCTURED_OUTPUT_TOOL_NAME, resp_input),
+                text_response("unused"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-fallback")
+            .model(model)
+            .build()
+            .unwrap();
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        schema.insert(
+            "properties".into(),
+            serde_json::json!({"name": {"type": "string"}, "age": {"type": "integer"}}),
+        );
+        let reply = agent
+            .call_with_schema(
+                vec![Msg::user("give json")],
+                crate::formatter::JsonSchema::new("person", schema),
+            )
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+        let data = reply.structured_data().unwrap();
+        assert_eq!(data["name"], serde_json::json!("bob"));
+        assert_eq!(data["age"], serde_json::json!(42));
+    }
+
+    #[tokio::test]
+    async fn todo_tool_is_registered_and_persists_to_state() {
+        // The built-in todo_write tool should be present and its mutations should persist
+        // into AgentState.tasks_context after a call.
+        let mut input = JsonMap::new();
+        input.insert(
+            "todos".to_string(),
+            serde_json::json!([{"content": "step one", "status": "in_progress"}]),
+        );
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("t1", "todo_write", input), text_response("done")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-todo")
+            .model(model)
+            .build()
+            .unwrap();
+        // The agent's toolkit must expose todo_write.
+        assert!(agent.toolkit().get_tool("todo_write").is_some());
+        agent.call(vec![Msg::user("plan")]).await.unwrap();
+        let state = agent.agent_state();
+        let tasks = state.tasks_context().tasks().to_vec();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].subject, "step one");
+        assert_eq!(tasks[0].state, crate::state::context::TaskState::InProgress);
+    }
+}
