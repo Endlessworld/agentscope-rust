@@ -41,7 +41,9 @@ use crate::model::provider::{
 };
 use crate::model::tool_choice::ToolChoice;
 use crate::model::tool_schema::ToolSchema;
-use crate::formatter::ResponseFormat;
+use crate::formatter::{
+    convert_tool_result_to_string, extract_text_content, ResponseFormat,
+};
 
 /// An OpenAI-compatible chat model backed by `async-openai`.
 pub struct OpenAiChatModel {
@@ -283,7 +285,7 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
                 out.push(ChatCompletionRequestMessage::System(
                     ChatCompletionRequestSystemMessage {
                         content: ChatCompletionRequestSystemMessageContent::Text(
-                            msg.text_content(),
+                            extract_text_content(&msg),
                         ),
                         name: None,
                     },
@@ -291,12 +293,12 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
             }
             MsgRole::User => {
                 out.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(msg.text_content()),
+                    content: ChatCompletionRequestUserMessageContent::Text(extract_text_content(&msg)),
                     name: None,
                 }));
             }
             MsgRole::Assistant => {
-                let text = msg.text_content();
+                let text = extract_text_content(&msg);
                 let mut tool_calls = Vec::new();
                 for tu in msg.tool_use_blocks() {
                     let args = serde_json::to_string(&tu.input).unwrap_or_default();
@@ -329,15 +331,7 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
             }
             MsgRole::Tool => {
                 for tr in msg.tool_result_blocks() {
-                    let text = tr
-                        .output
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let text = convert_tool_result_to_string(&tr.output);
                     if let Some(id) = &tr.id {
                         out.push(ChatCompletionRequestMessage::Tool(
                             ChatCompletionRequestToolMessage {

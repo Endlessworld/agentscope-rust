@@ -8,7 +8,7 @@ version = "0.1.0"
 dependencies = [
  "async-openai",
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "chrono",
  "futures",
  "jsonschema",
@@ -30,7 +30,7 @@ version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "chrono",
  "futures",
  "reqwest 0.12.28",
@@ -85,7 +85,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d72db2750faea2ca5edbf6d0c50277a89dc8f75f5e6ddd695ef30f75e335019b"
 dependencies = [
  "async-openai-macros",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "derive_builder",
  "eventsource-stream",
@@ -168,12 +168,6 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
-name = "base64"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bit-set"
@@ -796,7 +790,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1046,7 +1040,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1b46a0365a611fbf1d2143104dcf910aada96fafd295bab16c60b802bf6fa1d"
 dependencies = [
  "ahash",
- "base64 0.22.1",
+ "base64",
  "bytecount",
  "email_address",
  "fancy-regex",
@@ -1579,7 +1573,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -1621,7 +1615,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-core",
  "futures-util",
@@ -1688,6 +1682,8 @@ dependencies = [
 [[package]]
 name = "rust-mcp-macros"
 version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c45f463eab09f406e89fe82faf0ab9a0121d45f13269939f6ec95579ac853b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1709,9 +1705,11 @@ dependencies = [
 [[package]]
 name = "rust-mcp-sdk"
 version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f9d16186b325686d9672bb88b5d75ebe71a9e045612a79c710d2f7ccee98ce5"
 dependencies = [
  "async-trait",
- "base64 0.23.1",
+ "base64",
  "bytes",
  "futures",
  "rust-mcp-macros",
@@ -1729,6 +1727,8 @@ dependencies = [
 [[package]]
 name = "rust-mcp-transport"
 version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "548e8ae3d28673b20666f9ce6f711ec22f0a8f0b33907295c5184044a4c79312"
 dependencies = [
  "async-trait",
  "bytes",

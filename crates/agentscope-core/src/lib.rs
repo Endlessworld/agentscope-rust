@@ -31,12 +31,15 @@ pub use credential::{
 pub use error::{AgentExceptionInfo, CompositeAgentException, Error, Result};
 pub use event::{AgentEvent, AgentEventEmitter, AgentEventType, ConfirmResult, EventData};
 pub use formatter::{
-    determine_audio_format, determine_media_type, download_url_to_base64, file_to_base64,
-    get_extension, infer_audio_format_from_media_type, is_file_exists, is_local_file, JsonSchema,
-    JsonSchemaBuilder, resolve_mime_type, ResponseFormat, ResponseFormatBuilder,
+    convert_tool_result_to_string, determine_audio_format, determine_media_type,
+    download_url_to_base64, extract_text_content, extract_text_content_from_block, file_to_base64,
+    format_role_label, get_extension, has_media_content, infer_audio_format_from_media_type,
+    is_file_exists, is_local_file, JsonSchema, JsonSchemaBuilder, resolve_mime_type, ResponseFormat,
+    ResponseFormatBuilder, save_base64_data_to_temp_file, should_bypass_history,
     to_file_protocol_url, url_to_base64_data_url, url_to_protocol_url, validate_audio_extension,
-    validate_image_extension, validate_video_extension, MAX_SIZE_BYTES, SUPPORTED_AUDIO_EXTENSIONS,
-    SUPPORTED_IMAGE_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS, WARN_SIZE_BYTES,
+    validate_image_extension, validate_video_extension, BYPASS_MULTIAGENT_HISTORY_MERGE,
+    MAX_SIZE_BYTES, SUPPORTED_AUDIO_EXTENSIONS, SUPPORTED_IMAGE_EXTENSIONS,
+    SUPPORTED_VIDEO_EXTENSIONS, WARN_SIZE_BYTES,
 };
 pub use message::{
     metadata_keys, AudioBlock, Base64Source, ChatUsage, ContentBlock, DataBlock, GenerateReason,

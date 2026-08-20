@@ -6,7 +6,7 @@
 ## 技术栈
 - **语言**: Rust 2021 Edition
 - **异步运行时**: Tokio
-- **核心依赖**: async-openai v0.41.3, rusqlite v0.31, reqwest, serde_json
+- **核心依赖**: async-openai v0.41.3, rust-mcp-sdk v1.0.1, rusqlite v0.31, reqwest, serde_json
 - **构建工具**: Cargo (workspace 结构)
 
 ## 关键路径
@@ -17,5 +17,5 @@
 
 ## 版本状态
 - **当前版本**: 0.1.0
-- **迁移进度**: 约 70% 对齐
-- **关键里程碑**: async-openai 集成已完成（2024年12月）
+- **迁移进度**: 约 75% 对齐
+- **关键里程碑**: async-openai 集成（2024-12）、Formatter 转换层 + 状态持久化 e2e（2025-01）

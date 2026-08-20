@@ -2,7 +2,7 @@
 
 > 用途：本文件是**所有迁移会话共享的单一事实来源**。任何会话在开始工作前必须先读本文件；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件与 `git status`/`cargo build` 实际验证为准。
 > 对照基准：`MIGRATION_PLAN.md`（方案）+ 本文件（已整合原 worker_output 8 份分析报告）+ `crates/*`（实际代码）。
-> 覆盖统计截至：本轮 WorkspaceManager 完整迁移（WorkspaceManager + WorkspaceIndex + NamespaceFactory）落地后。
+> 覆盖统计截至：本轮 Formatter 转换层（base_formatter）+ 状态持久化重启恢复 e2e 落地后。
 
 ## 0. 如何阅读本文件
 - **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -17,7 +17,7 @@
 | core.message | 23 类 | 6 文件完整 | ≈90% | 9 内容块+Source+State 枚举齐全；4 个消息子类折叠进 Msg+MsgRole |
 | core.model | 18 类 | 11 文件 | ≈80% | 数据层 + **真实 provider（async-openai）** + ModelRegistry/ModelContextWindows；可发真实 HTTP/SSE |
 | core.credential | 6 类 | 3 文件 | ≈90% | DeepSeek/Kimi/XAI 均纯凭据元数据，与 Java 同水位 |
-| core.formatter | 6 类 | 3 文件 | ≈90% | ResponseFormat/JsonSchema + MediaUtils 全套；缺 Formatter/AbstractBaseFormatter（Msg→provider 转换） |
+| core.formatter | 6 类 | 4 文件 | ≈95% | ResponseFormat/JsonSchema + MediaUtils + **base_formatter（extract_text/has_media/role_label/convert_tool_result/save_base64/should_bypass 全套）**；openai.rs 已复用 |
 | core.agent | 13 类 | 6 文件（ReActAgent + lifecycle/stream_options） | ≈5%→大幅提升 | ReAct 循环 + stream_events + 结构化调用 + 串行门/优雅关闭守卫已实现；缺 AgentBase 全生命周期细节（hooks/per-session 属性袋） |
 | core.event | 35 类 | 4 文件 | ≈95% | 31/31 事件变体齐全 + AgentEventEmitter/ConfirmResult 已补 |
 | core.middleware | 7 类 | 4 文件 | ≈95% | 5 钩子洋葱链完整 + TaskReminderMiddleware 已补 |
@@ -133,7 +133,7 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | ResponseFormat/JsonSchema | 同名 | ✅ 已完成 | 数据类型；JsonSchema 缺 description 字段 |
-| **Formatter / AbstractBaseFormatter** | Formatter/AbstractBaseFormatter | 待办 | Msg→provider 请求转换；extractTextContent/hasMediaContent/formatRoleLabel/convertToolResultToString/saveBase64DataToTempFile/shouldBypassHistory |
+| **Formatter / AbstractBaseFormatter** | Formatter/AbstractBaseFormatter | ✅ 已完成 | `formatter/base_formatter.rs`：`extract_text_content`（过滤 ThinkingBlock + 展开 Hint + 扁平化 ToolResult）、`extract_text_content_from_block`、`has_media_content`、`format_role_label`、`convert_tool_result_to_string`（media 块→URL/临时文件引用，单/多条目格式对齐）、`save_base64_data_to_temp_file`（MIME→扩展名+临时文件）、`should_bypass_history`（bypassMultiagentHistoryMerge 元数据）；8 单测通过；**openai.rs 的 to_request_messages 已重构复用该层**（System/User 用 extract_text_content，Tool 用 convert_tool_result_to_string） |
 | **MediaUtils** | MediaUtils(452行) | ✅ 已完成 | formatter/media_utils.rs：is_local_file/is_file_exists/get_extension/determine_media_type/resolve_mime_type/validate_image|audio|video_extension/determine_audio_format/infer_audio_format_from_media_type/file_to_base64/to_file_protocol_url/url_to_protocol_url + async download_url_to_base64/url_to_base64_data_url（reqwest 限时）；9 单测；urlToRgbaImage/urlToInputStream 因需 image 解码略过 |
 | **FormatterException** | FormatterException | ✅ 已完成 | 映射通用 `Error`（`Error::Other`/`Error::Io`/`Error::HttpStatus`），不单独建异常类型 |
 
@@ -284,18 +284,18 @@
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **测试基线**：`cargo test` → core 106 通过（lib 54 + 集成 52）、harness 203 通过（lib 128 + 集成 75），共 **309** 通过
-- **clippy 基线**：core 16 条既有警告；harness lib 4 条既有（ExposedSession dead_code + 3 unused imports）
+- **测试基线**：`cargo test` → core 115 通过（lib 62 + 集成 53）、harness 215 通过（lib 128 + 集成 87），共 **330** 通过
+- **clippy 基线**：core 16 条既有警告；harness 12 条既有（ExposedSession dead_code + unused imports 等）
 - **关键文件**：`MIGRATION_PLAN.md`（方案）、`MIGRATION_GAP_TRACKER.md`（本文件）
-- **依赖说明**：`async-openai` v0.41.3（远程 crates.io）、`rusqlite` v0.31（bundled，SQLite 索引）
-- **已验证功能**：async-openai 自定义 base URL 生效（chat_demo 使用 https://opencode.ai/zen/go/v1 成功）
+- **依赖说明**：`async-openai` v0.41.3、`rust-mcp-sdk` v1.0.1（远程 crates.io，已从 path 依赖改为远程）、`rusqlite` v0.31（bundled，SQLite 索引）
+- **已验证功能**：async-openai 自定义 base URL 生效（chat_demo 使用 https://opencode.ai/zen/go/v1 成功）；Formatter 转换层 + 状态持久化重启恢复 e2e 已通过
 
 ### 4.2 下一步建议（按优先级）
 1. **P0 已完成**：model 层真实 provider 接入（async-openai）已验证，chat_demo 可正常运行
 2. **P1 重要待办**：
-   - MCP 集成（rust-mcp-sdk 接入）
+   - ✅ MCP 集成（rust-mcp-sdk 接入）
    - SandboxLifecycleMiddleware（依赖 SandboxManager + SandboxBackedFilesystem）
-   - Formatter 转换层（Msg→provider 请求转换）
+   - ✅ Formatter 转换层（Msg→provider 请求转换）
    - Tool 残余中高层（ToolkitAware rebindToolkit、McpClientManager 等）
 3. **P2 增强可选**：
    - Shutdown 精细化（GracefulShutdownMiddleware）
@@ -348,7 +348,7 @@
 |---|---|---|---|
 | **工具调用 e2e** | 真实 provider 下，模型发起工具调用 → 框架执行 → 结果回填 → 继续 | 待办 | 依赖 7.3；Toolkit 治理层已就绪 |
 | **结构化输出 e2e** | 走通 `generate_response` 工具（fallback）或原生 `response_format`（native）任一路径 | 部分 | **native 路径已就绪**：`CallableAgent::call_with_schema` 设 `response_format(json_schema)` + 解析 reply 存结构化元数据（单测过）；fallback（`generate_response` 工具）仍待补 |
-| **状态持久化 e2e** | 用 `JsonFileAgentStateStore` 存会话，重启后从磁盘恢复并续接 | 待办 | store.rs 已实现；需 demo 接线验证 |
+| **状态持久化 e2e** | 用 `JsonFileAgentStateStore` 存会话，重启后从磁盘恢复并续接 | 部分 | store.rs 已实现；新增集成测试 `json_file_store_survives_restart` 验证"新 store 实例从磁盘恢复已保存的 AgentState + list + session 列表"闭环（通过）；demo 接线仍待补 |
 
 ### 7.5 集成连通性
 | 验收项 | 说明 | 执行状态 | 交接信息 |

@@ -79,6 +79,56 @@ async fn json_file_store_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn json_file_store_survives_restart() {
+    // Simulates a process restart: a brand-new store instance (same root) must
+    // recover state persisted by an earlier store instance.
+    let dir = std::env::temp_dir().join(format!("agentscope-restart-{}", uuid::Uuid::new_v4()));
+
+    // "First run": save state + a list, then drop the store.
+    {
+        let store = JsonFileAgentStateStore::new(&dir);
+        let state = AgentState::builder()
+            .session_id("persist-sess")
+            .user_id("bob")
+            .summary("persisted summary")
+            .add_message(sample_msg(MsgRole::User, "hello from run 1"))
+            .build();
+        store
+            .save(Some("bob"), "persist-sess", "agent_state", serde_json::to_value(&state).unwrap())
+            .await;
+        store
+            .save_list(Some("bob"), "persist-sess", "history", &[serde_json::json!("a"), serde_json::json!("b")])
+            .await;
+    }
+
+    // "Second run": a fresh store instance reads the same files from disk.
+    {
+        let store = JsonFileAgentStateStore::new(&dir);
+        assert!(store.exists(Some("bob"), "persist-sess").await);
+
+        let loaded: AgentState = serde_json::from_value(
+            store.get(Some("bob"), "persist-sess", "agent_state").await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.session_id(), "persist-sess");
+        assert_eq!(loaded.user_id(), Some("bob"));
+        assert_eq!(loaded.summary(), "persisted summary");
+        assert_eq!(loaded.context().len(), 1);
+        assert_eq!(loaded.context()[0].text_content(), "hello from run 1");
+
+        let history = store.get_list(Some("bob"), "persist-sess", "history").await;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], serde_json::json!("a"));
+
+        // list_session_ids must survive restart too.
+        let sessions = store.list_session_ids(Some("bob")).await;
+        assert!(sessions.contains(&"persist-sess".to_string()));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn permission_bypass_allows() {
     let ctx = PermissionContextState::builder()

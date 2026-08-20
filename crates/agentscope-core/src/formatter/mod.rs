@@ -1,9 +1,16 @@
 //! Formatter layer: response format and JSON schema configuration.
 //! Mirrors `io.agentscope.core.formatter`.
 
+pub mod base_formatter;
 pub mod json_schema;
 pub mod media_utils;
 pub mod response_format;
+
+pub use base_formatter::{
+    convert_tool_result_to_string, extract_text_content, extract_text_content_from_block,
+    format_role_label, has_media_content, save_base64_data_to_temp_file, should_bypass_history,
+    BYPASS_MULTIAGENT_HISTORY_MERGE,
+};
 
 pub use json_schema::{JsonSchema, JsonSchemaBuilder};
 pub use media_utils::{

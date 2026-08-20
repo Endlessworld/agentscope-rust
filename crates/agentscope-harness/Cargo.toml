@@ -22,4 +22,4 @@ uuid.workspace = true
 base64.workspace = true
 sha2.workspace = true
 rusqlite.workspace = true
-rust-mcp-sdk = { path = "D:/IdeaProjects/rust-mcp-sdk/crates/rust-mcp-sdk", default-features = false, features = ["client", "stdio", "macros"] }
+rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["client", "stdio", "macros"] }

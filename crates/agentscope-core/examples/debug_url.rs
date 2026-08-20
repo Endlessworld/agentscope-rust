@@ -1,9 +1,7 @@
-use agentscope_core::{default_registry, ContentBlock, ModelCreationContext};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::message::{ContentBlock as CB, Msg, TextBlock};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 
 /// A simple reqwest-based model for OpenAI-compatible APIs.
 /// Works around async-openai URL issues with certain providers.
@@ -56,7 +54,7 @@ impl Model for ReqwestModel {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
 
-        Box::pin(async move {
+        let fut = async move {
             let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
@@ -88,8 +86,9 @@ impl Model for ReqwestModel {
                 .content(vec![CB::Text(TextBlock::new(text))])
                 .build();
 
-            Ok(Box::pin(futures::stream::once(async move { Ok(resp) })))
-        })
+            Ok(resp)
+        };
+        Box::pin(futures::stream::once(fut))
     }
 
     fn model_name(&self) -> &str {
