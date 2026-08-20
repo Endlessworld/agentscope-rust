@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agentscope_core::agent::{ReActAgent, StreamOptions};
+use agentscope_core::event::AgentEvent;
 use agentscope_core::middleware::MiddlewareChain;
 use agentscope_core::model::Model;
 use agentscope_core::tool::Toolkit;
@@ -20,6 +22,9 @@ pub struct HarnessAgent {
     middleware: MiddlewareChain,
     cwd: PathBuf,
     distributed_store: Option<DistributedStore>,
+    /// The embedded ReAct agent that drives the reasoning→acting loop.
+    /// `None` when no model was configured (assembly-only mode).
+    agent: Option<ReActAgent>,
 }
 
 impl HarnessAgent {
@@ -54,6 +59,31 @@ impl HarnessAgent {
     pub fn distributed_store(&self) -> Option<&DistributedStore> {
         self.distributed_store.as_ref()
     }
+
+    /// The embedded ReAct agent driving the reasoning→acting loop, if a model was configured.
+    pub fn agent(&self) -> Option<&ReActAgent> {
+        self.agent.as_ref()
+    }
+
+    /// Streams agent events for the given messages through the embedded ReAct agent.
+    ///
+    /// This is the primary driver entry: it runs the middleware-wrapped ReAct loop and
+    /// yields filtered [`AgentEvent`]s for the given [`StreamOptions`]. Returns a stream
+    /// that yields a single error when no model was configured (assembly-only mode).
+    pub fn stream_events(
+        &self,
+        messages: Vec<agentscope_core::message::Msg>,
+        options: StreamOptions,
+    ) -> futures::stream::BoxStream<'static, agentscope_core::error::Result<AgentEvent>> {
+        match &self.agent {
+            Some(agent) => agent.stream_events(messages, options),
+            None => Box::pin(futures::stream::once(async move {
+                Err(agentscope_core::error::Error::Agent(
+                    "HarnessAgent has no model configured; cannot run".into(),
+                ))
+            })),
+        }
+    }
 }
 /// Builder for `HarnessAgent`.
 #[derive(Default)]
@@ -65,6 +95,8 @@ pub struct HarnessAgentBuilder {
     distributed_store: Option<DistributedStore>,
     with_filesystem_tools: bool,
     middleware: Option<MiddlewareChain>,
+    sys_prompt: String,
+    max_iters: i32,
 }
 
 impl HarnessAgentBuilder {
@@ -93,6 +125,18 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Sets the system prompt prepended to every reasoning call of the embedded ReAct agent.
+    pub fn sys_prompt(mut self, sys_prompt: impl Into<String>) -> Self {
+        self.sys_prompt = sys_prompt.into();
+        self
+    }
+
+    /// Sets the maximum reasoning→acting iterations of the embedded ReAct agent.
+    pub fn max_iters(mut self, max_iters: i32) -> Self {
+        self.max_iters = max_iters;
+        self
+    }
+
     /// Registers the standard filesystem tools (`read_file`, `write_file`, ...) into the toolkit.
     pub fn register_filesystem_tools(mut self, on: bool) -> Self {
         self.with_filesystem_tools = on;
@@ -116,6 +160,24 @@ impl HarnessAgentBuilder {
             crate::tool::FilesystemTool::register(&toolkit, filesystem.clone());
         }
         let middleware = self.middleware.unwrap_or_default();
+
+        // Build the embedded ReAct agent from the configured model/toolkit/middleware.
+        // Only built when a model is provided (assembly-only mode leaves it `None`).
+        let agent = self.model.as_ref().map(|model| {
+            let mut agent_builder = ReActAgent::builder()
+                .name(self.name.clone().unwrap_or_else(|| "agent".to_string()))
+                .model(Arc::clone(model))
+                .toolkit(toolkit.clone())
+                .middleware_chain(middleware.clone());
+            if !self.sys_prompt.is_empty() {
+                agent_builder = agent_builder.sys_prompt(self.sys_prompt.clone());
+            }
+            if self.max_iters > 0 {
+                agent_builder = agent_builder.max_iters(self.max_iters);
+            }
+            agent_builder.build().expect("build ReActAgent")
+        });
+
         HarnessAgent {
             name: self.name.unwrap_or_else(|| "agent".to_string()),
             model: self.model,
@@ -124,6 +186,7 @@ impl HarnessAgentBuilder {
             middleware,
             cwd,
             distributed_store: self.distributed_store,
+            agent,
         }
     }
 }

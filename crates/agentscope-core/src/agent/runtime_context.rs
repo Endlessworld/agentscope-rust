@@ -26,6 +26,10 @@ pub struct RuntimeContext {
     pub user_id: Option<String>,
     /// Agent id (as opposed to agent name) for this execution.
     pub agent_id: Option<String>,
+    /// Optional sender used to forward fine-grained delta events (text/thinking)
+    /// from deep inside the model call up to the agent-level event stream, enabling
+    /// incremental (token-by-token) rendering.
+    pub delta_tx: Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<crate::event::AgentEvent>>>,
 }
 
 impl RuntimeContext {

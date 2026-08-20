@@ -4,10 +4,12 @@
 //! runtime with workspace context, filesystem abstraction, sandbox backends, subagent
 //! orchestration, memory management and gateway.
 
+pub mod acp;
 pub mod agent;
 pub mod filesystem;
 pub mod tool;
 
+pub use acp::{AcpAgentSession, AcpCodingAgent, AcpCodingAgentBuilder};
 pub use agent::{
     AgentSkill, AgentSkillBuilder, AgentTraceMiddleware, AsyncToolMiddleware, AsyncToolRecord,
     AsyncToolRegistry,

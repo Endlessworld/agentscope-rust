@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::error::{Error, Result};
-use crate::event::{AgentEvent, EventData};
+use crate::event::{AgentEvent, AgentEventType, EventData};
 use crate::formatter::{JsonSchema, ResponseFormat};
 use crate::interruption::InterruptControl;
 use crate::message::{
@@ -207,6 +207,11 @@ impl ReActAgent {
         let mut ctx = self.new_context(&input);
         ctx.response_format = response_format;
         let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
+        // Shared channel: the model-call loop forwards fine-grained delta events
+        // (text/thinking) through `delta_tx`, and the agent-level stream merges them
+        // in so callers can render incrementally (边生成边打印).
+        let (delta_tx, delta_rx) = futures::channel::mpsc::unbounded::<Result<AgentEvent>>();
+        ctx.delta_tx = Some(delta_tx);
         let core = Arc::clone(&self.core);
         let ctx_core = ctx.clone();
         let slot_core = Arc::clone(&slot);
@@ -231,6 +236,8 @@ impl ReActAgent {
                 Box::pin(futures::stream::once(fut).flatten())
             });
         let stream = self.core.middleware_chain.wrap_agent(ctx, input, agent_core);
+        // Merge the forwarded delta events into the agent-level stream.
+        let stream = Box::pin(futures::stream::select(stream, delta_rx));
         (stream, slot)
     }
 
@@ -317,7 +324,7 @@ impl ReActAgent {
                 .model_name(self.core.model.model_name())
                 .build();
             let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&self.core.model));
-            let msg = model_call_impl(&self.core, input).await?;
+            let msg = model_call_impl(&self.core, input, |_| {}).await?;
             state.context_mut().push(msg.clone());
 
             let mut gen_called = false;
@@ -383,6 +390,7 @@ impl ReActAgent {
             session_id: None,
             user_id: None,
             agent_id: None,
+            delta_tx: None,
         }
     }
 }
@@ -682,12 +690,22 @@ async fn run_reasoning(
         Arc::clone(&core.model),
     );
 
+    let delta_tx = ctx.delta_tx.clone();
     let model_core: Next<ModelCallInput> = {
         let slot = Arc::clone(&slot);
         let core = Arc::clone(core);
+        let delta_tx = delta_tx.clone();
         Box::new(move |mc_input: ModelCallInput| -> EventStream {
+            let slot = Arc::clone(&slot);
+            let core = Arc::clone(&core);
+            let delta_tx = delta_tx.clone();
             let fut = async move {
-                let msg = model_call_impl(&core, mc_input).await;
+                let msg = model_call_impl(&core, mc_input, |ev| {
+                    if let Some(tx) = &delta_tx {
+                        let _ = tx.unbounded_send(ev);
+                    }
+                })
+                .await;
                 *slot.lock().unwrap() = Some(msg);
                 Ok(AgentEvent::ModelCallEnd(EventData::default()))
             };
@@ -711,10 +729,20 @@ async fn run_reasoning(
     result
 }
 
-/// Calls the raw model stream and accumulates all chunks into one message.
+/// Builds a text/thinking delta event carrying the given incremental text.
+fn delta_event(event_type: AgentEventType, delta: &str) -> AgentEvent {
+    let mut fields = JsonMap::new();
+    fields.insert("delta".to_string(), serde_json::Value::String(delta.to_string()));
+    AgentEvent::with_fields(event_type, fields)
+}
+
+/// Calls the raw model stream, forwarding each text/thinking delta as an agent
+/// event (so callers can render incrementally) while accumulating the chunks into
+/// a single assistant message.
 async fn model_call_impl(
     core: &Arc<AgentCore>,
     mc_input: ModelCallInput,
+    mut emit: impl FnMut(Result<AgentEvent>),
 ) -> Result<Msg> {
     let model = Arc::clone(&mc_input.model);
     let mut acc = ReasoningContext::default();
@@ -722,6 +750,21 @@ async fn model_call_impl(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         check_interrupted(core)?;
+        for block in &chunk.content {
+            match block {
+                ContentBlock::Text(t) => {
+                    if !t.text.is_empty() {
+                        emit(Ok(delta_event(AgentEventType::TextBlockDelta, &t.text)));
+                    }
+                }
+                ContentBlock::Thinking(t) => {
+                    if !t.thinking.is_empty() {
+                        emit(Ok(delta_event(AgentEventType::ThinkingBlockDelta, &t.thinking)));
+                    }
+                }
+                _ => {}
+            }
+        }
         acc.accumulate(chunk);
     }
     Ok(acc.build_final_message())
@@ -1155,6 +1198,35 @@ mod tests {
             .map(|r| r.unwrap().event_type().wire_name().to_string())
             .collect();
         assert!(events.is_empty());
+    }
+    #[tokio::test]
+    async fn stream_events_emits_text_delta() {
+        // A streamed model response must surface TEXT_BLOCK_DELTA events carrying the
+        // incremental text, so callers can render token-by-token while the model
+        // generates (边生成边打印).
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hello world")]));
+        let agent = ReActAgent::builder().name("t-delta").model(model).build().unwrap();
+
+        let events: Vec<AgentEvent> = agent
+            .stream_events(
+                vec![Msg::user("hi")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let deltas: Vec<String> = events
+            .iter()
+            .filter(|ev| ev.event_type() == AgentEventType::TextBlockDelta)
+            .filter_map(|ev| {
+                ev.data().fields.get("delta").and_then(|v| v.as_str()).map(|s| s.to_string())
+            })
+            .collect();
+        assert!(!deltas.is_empty(), "expected at least one TEXT_BLOCK_DELTA; got {events:?}");
+        assert_eq!(deltas.join(""), "hello world");
     }
 
     #[tokio::test]

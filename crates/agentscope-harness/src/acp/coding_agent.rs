@@ -1,0 +1,368 @@
+//! ACP CodingAgent: an ACP **agent** (server role) that wraps the core
+//! [`ReActAgent`] and speaks the Agent Client Protocol over stdio.
+//!
+//! Mirrors the Kotlin `AgiAgent` / `AgiAgentSession` and Java
+//! `HarnessCodingAgent`: handles `initialize`, session lifecycle, prompts
+//! (streaming `SessionUpdate` notifications), config options, and cancellation.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use agent_client_protocol::schema::v1::{
+    AgentAuthCapabilities, AgentCapabilities, CloseSessionRequest, CloseSessionResponse,
+    DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
+    Implementation, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, PromptCapabilities, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionResumeCapabilities, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+};
+use agent_client_protocol::{Agent, Stdio};
+
+use crate::agent::HarnessAgent;
+
+use super::config::{ModeChoice, ModelChoice};
+use super::session::AcpAgentSession;
+
+/// Default agent info advertised during initialization.
+const AGENT_NAME: &str = "agentscope-coding-agent";
+const AGENT_VERSION: &str = "0.1.0";
+
+/// An ACP CodingAgent with a session registry and a factory for building the
+/// underlying [`HarnessAgent`] per session.
+pub struct AcpCodingAgent {
+    name: String,
+    model_factory: Arc<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync>,
+    models: Vec<ModelChoice>,
+    modes: Vec<ModeChoice>,
+    sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
+}
+
+impl AcpCodingAgent {
+    /// Creates a new `AcpCodingAgent`.
+    pub fn new(
+        model_factory: impl Fn(PathBuf) -> HarnessAgent + Send + Sync + 'static,
+        models: Vec<ModelChoice>,
+        modes: Vec<ModeChoice>,
+    ) -> Self {
+        Self {
+            name: AGENT_NAME.to_string(),
+            model_factory: Arc::new(model_factory),
+            models,
+            modes,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Overrides the agent display name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Returns a builder for this agent.
+    pub fn builder() -> AcpCodingAgentBuilder {
+        AcpCodingAgentBuilder::default()
+    }
+
+    /// Builds the ACP agent capabilities advertised during initialization.
+    pub fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::new()
+            .load_session(true)
+            .prompt_capabilities(
+                PromptCapabilities::new()
+                    .image(false)
+                    .audio(false)
+                    .embedded_context(true),
+            )
+            .mcp_capabilities(McpCapabilities::default())
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .list(SessionListCapabilities::new())
+                    .delete(SessionDeleteCapabilities::new())
+                    .resume(SessionResumeCapabilities::new())
+                    .close(SessionCloseCapabilities::new()),
+            )
+            .auth(AgentAuthCapabilities::new())
+    }
+
+    /// Creates a new session using the model factory.
+    fn create_session(&self, session_id: SessionId, cwd: PathBuf) -> AcpAgentSession {
+        let agent = (self.model_factory)(cwd.clone());
+        AcpAgentSession::new(
+            session_id,
+            cwd,
+            agent,
+            self.models.clone(),
+            self.modes.clone(),
+        )
+    }
+
+    /// Registers the session in the registry.
+    fn register_session(&self, session: AcpAgentSession) {
+        let id = session.session_id().to_string();
+        self.sessions.lock().unwrap().insert(id, session);
+    }
+
+    /// Removes a session from the registry.
+    fn remove_session(&self, session_id: &SessionId) {
+        self.sessions.lock().unwrap().remove(&session_id.to_string());
+    }
+
+    /// Returns a clone of the session (for handlers).
+    fn get_session(&self, session_id: &SessionId) -> Option<AcpAgentSession> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&session_id.to_string())
+            .cloned()
+    }
+
+    /// Currently registered session ids.
+    fn session_ids(&self) -> Vec<SessionId> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|k| SessionId::new(k.clone()))
+            .collect()
+    }
+
+    /// Assembles and runs the ACP agent over stdio until the connection closes.
+    pub async fn run_stdio(self) -> agent_client_protocol::Result<()> {
+        let agent = Arc::new(self);
+        let a_init = agent.clone();
+        let a_new = agent.clone();
+        let a_prompt = agent.clone();
+        let a_cfg = agent.clone();
+        let a_mode = agent.clone();
+        let a_close = agent.clone();
+        let a_list = agent.clone();
+        let a_load = agent.clone();
+        let a_resume = agent.clone();
+        let a_delete = agent.clone();
+        Agent
+            .builder()
+            .on_receive_request(
+                async move |initialize: InitializeRequest, responder, _cx| {
+                    let response = InitializeResponse::new(initialize.protocol_version)
+                        .agent_capabilities(a_init.capabilities())
+                        .agent_info(Implementation::new(AGENT_NAME, AGENT_VERSION));
+                    responder.respond(response)
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: NewSessionRequest, responder, _cx| {
+                    let cwd = req.cwd;
+                    let session_id = SessionId::new(format!(
+                        "session-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    ));
+                    let session = a_new.create_session(session_id.clone(), cwd);
+                    let config_options = session.config_options();
+                    let modes = session.session_mode_state();
+                    a_new.register_session(session);
+                    let response = NewSessionResponse::new(session_id)
+                        .modes(modes)
+                        .config_options(config_options);
+                    responder.respond(response)
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest, responder, cx| {
+                    let sid = req.session_id;
+                    let mut session = match a_prompt.get_session(&sid) {
+                        Some(s) => s,
+                        None => {
+                            return responder.respond(PromptResponse::new(StopReason::Refusal));
+                        }
+                    };
+                    let emit_cx = cx.clone();
+                    let stop = session
+                        .run_prompt(req.prompt, move |notif| {
+                            let _ = emit_cx.send_notification(notif);
+                        })
+                        .await;
+                    a_prompt.register_session(session);
+                    responder.respond(PromptResponse::new(stop))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                    let sid = req.session_id;
+                    let mut session = match a_cfg.get_session(&sid) {
+                        Some(s) => s,
+                        None => {
+                            return responder.respond(SetSessionConfigOptionResponse::new(vec![]));
+                        }
+                    };
+                    let value = req.value.as_value_id().map(|v| v.to_string());
+                    match req.config_id.to_string().as_str() {
+                        "model" => {
+                            if let Some(v) = value {
+                                session.set_model(v);
+                            }
+                        }
+                        "mode" => {
+                            if let Some(v) = value {
+                                session.set_mode(v);
+                            }
+                        }
+                        _ => {}
+                    }
+                    let config_options = session.config_options();
+                    a_cfg.register_session(session);
+                    responder.respond(SetSessionConfigOptionResponse::new(config_options))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetSessionModeRequest, responder, _cx| {
+                    let sid = req.session_id;
+                    let mut session = match a_mode.get_session(&sid) {
+                        Some(s) => s,
+                        None => return responder.respond(SetSessionModeResponse::new()),
+                    };
+                    session.set_mode(req.mode_id.to_string());
+                    a_mode.register_session(session);
+                    responder.respond(SetSessionModeResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: CloseSessionRequest, responder, _cx| {
+                    let sid = req.session_id;
+                    if let Some(session) = a_close.get_session(&sid) {
+                        session.cancel();
+                    }
+                    a_close.remove_session(&sid);
+                    responder.respond(CloseSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ListSessionsRequest, responder, _cx| {
+                    let infos: Vec<SessionInfo> = a_list
+                        .session_ids()
+                        .into_iter()
+                        .map(|id| SessionInfo::new(id, PathBuf::from(".")))
+                        .collect();
+                    responder.respond(ListSessionsResponse::new(infos))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: LoadSessionRequest, responder, _cx| {
+                    let sid = req.session_id;
+                    let session = match a_load.get_session(&sid) {
+                        Some(s) => s,
+                        None => {
+                            let session =
+                                a_load.create_session(sid.clone(), req.cwd.clone());
+                            a_load.register_session(session);
+                            a_load.get_session(&sid).unwrap()
+                        }
+                    };
+                    let config_options = session.config_options();
+                    let modes = session.session_mode_state();
+                    let response = LoadSessionResponse::new()
+                        .modes(modes)
+                        .config_options(config_options);
+                    responder.respond(response)
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ResumeSessionRequest, responder, _cx| {
+                    let sid = req.session_id;
+                    let session = match a_resume.get_session(&sid) {
+                        Some(s) => s,
+                        None => {
+                            let session =
+                                a_resume.create_session(sid.clone(), req.cwd.clone());
+                            a_resume.register_session(session);
+                            a_resume.get_session(&sid).unwrap()
+                        }
+                    };
+                    let config_options = session.config_options();
+                    let modes = session.session_mode_state();
+                    let response = ResumeSessionResponse::new()
+                        .modes(modes)
+                        .config_options(config_options);
+                    responder.respond(response)
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: DeleteSessionRequest, responder, _cx| {
+                    a_delete.remove_session(&req.session_id);
+                    responder.respond(DeleteSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_to(Stdio::new())
+            .await
+    }
+}
+
+/// Builder for [`AcpCodingAgent`].
+#[derive(Default)]
+pub struct AcpCodingAgentBuilder {
+    name: Option<String>,
+    model_factory: Option<Box<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync>>,
+    models: Vec<ModelChoice>,
+    modes: Vec<ModeChoice>,
+}
+
+impl AcpCodingAgentBuilder {
+    /// Sets the agent display name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the factory used to build a [`HarnessAgent`] per session.
+    pub fn model_factory(
+        mut self,
+        factory: impl Fn(PathBuf) -> HarnessAgent + Send + Sync + 'static,
+    ) -> Self {
+        self.model_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Sets the available models advertised to the client.
+    pub fn models(mut self, models: Vec<ModelChoice>) -> Self {
+        self.models = models;
+        self
+    }
+
+    /// Sets the available modes advertised to the client.
+    pub fn modes(mut self, modes: Vec<ModeChoice>) -> Self {
+        self.modes = modes;
+        self
+    }
+
+    /// Builds the [`AcpCodingAgent`].
+    pub fn build(self) -> Result<AcpCodingAgent, Box<dyn std::error::Error>> {
+        let factory = self.model_factory.ok_or("model_factory is required")?;
+        let mut agent = AcpCodingAgent::new(
+            move |cwd| factory(cwd),
+            self.models,
+            self.modes,
+        );
+        if let Some(name) = self.name {
+            agent = agent.with_name(name);
+        }
+        Ok(agent)
+    }
+}
+
+

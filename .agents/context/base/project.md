@@ -18,4 +18,10 @@
 ## 版本状态
 - **当前版本**: 0.1.0
 - **迁移进度**: 约 75% 对齐
-- **关键里程碑**: async-openai 集成（2024-12）、Formatter 转换层 + 状态持久化 e2e（2025-01）
+- **关键里程碑**: async-openai 集成（2024-12）、Formatter 转换层 + 状态持久化 e2e（2025-01）、**ACP CodingAgent（2026-08，harness acp/ 模块）**
+
+## 关键路径（新增）
+- **crates/agentscope-harness/src/acp/**: ACP 协议 CodingAgent（AcpCodingAgent/AcpAgentSession/config/event），底层包装 `HarnessAgent`（嵌入 ReActAgent）
+- **crates/agentscope-harness/src/agent/harness_agent.rs**: `HarnessAgent` 装配 filesystem+toolkit+middleware，嵌入 `ReActAgent` 提供 `stream_events()` 驱动
+- **docs/ACP_AGENT_PLAN.md**: ACP CodingAgent 方案
+- **docs/ACP_AGENT__GAP_TRACKER.md**: ACP CodingAgent 进度跟踪

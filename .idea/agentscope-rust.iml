@@ -8,6 +8,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-core/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-harness/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-harness/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-harness/examples" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

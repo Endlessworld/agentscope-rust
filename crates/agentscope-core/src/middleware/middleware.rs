@@ -59,6 +59,7 @@ pub trait Middleware: Send + Sync {
 ///
 /// Middlewares are stored behind `Arc` so the chain can be shared across calls and
 /// the individual middleware references can be moved into `'static` closures.
+#[derive(Clone)]
 pub struct MiddlewareChain {
     middlewares: Vec<Arc<dyn Middleware>>,
 }

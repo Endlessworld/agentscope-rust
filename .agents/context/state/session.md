@@ -1,39 +1,38 @@
 # 当前会话状态
 
 ## 当前目标
-- 推进 P1 待办项：Formatter 转换层 + 状态持久化 e2e
+- 重构 ACP CodingAgent 底层：由直接包装 `ReActAgent` 改为包装 `HarnessAgent`（已完成）
 
 ## 进行中任务
-- 无（本轮已完成）
+- 无（本轮完成 ACP CodingAgent 底层切换为 HarnessAgent）
 
 ## 已完成任务
-- **修复 rust-mcp-sdk 依赖** ✅
-  - path 依赖指向不存在的 D:/IdeaProjects/rust-mcp-sdk → 改为远程 crates.io v1.0.1
-- **修复 debug_url.rs 示例编译错误** ✅
-  - stream 返回类型错误（async block 不是 Stream）→ 用 futures::stream::once 包装
-- **Formatter 转换层（P1）** ✅
-  - formatter/base_formatter.rs：extract_text_content / extract_text_content_from_block / has_media_content / format_role_label / convert_tool_result_to_string / save_base64_data_to_temp_file / should_bypass_history
-  - 8 单测通过
-  - openai.rs 的 to_request_messages 已重构复用该层
-- **状态持久化重启恢复 e2e（P1）** ✅
-  - 新增集成测试 json_file_store_survives_restart：新 store 实例从磁盘恢复 AgentState + list + session 列表
+- **HarnessAgent 增加 ReAct 驱动能力** ✅
+  - `agent/harness_agent.rs`：嵌入 `ReActAgent`（含 model/toolkit/middleware/sys_prompt/max_iters），新增 `stream_events()` 驱动入口 + `agent()` getter
+  - `HarnessAgentBuilder` 新增 `sys_prompt()`/`max_iters()`；model 未配置时 agent=None（装配-only 模式），`stream_events` 返回错误流
+  - `agentscope-core` `MiddlewareChain` 派生 `Clone`（供 HarnessAgent build 时克隆给内部 ReActAgent）
+- **ACP 底层切换为 HarnessAgent** ✅
+  - `acp/coding_agent.rs`：`model_factory` 签名 `Fn(PathBuf)->ReActAgent` → `Fn(PathBuf)->HarnessAgent`
+  - `acp/session.rs`：`AcpAgentSession.agent` 由 `Arc<ReActAgent>` → `Arc<HarnessAgent>`
+  - `examples/acp_agent_demo.rs`：`build_agent` 改为构造 `HarnessAgent`（add 工具注册到 harness toolkit，内部 ReActAgent 共享 toolkit）
+- **stdio 端到端验证** ✅（initialize / session/new / session/prompt / session/close 全通过）
 
 ## 下一步建议
-1. **P1 重要待办**：
-   - SandboxLifecycleMiddleware（依赖 SandboxManager + SandboxBackedFilesystem，需解决 &mut self 借用 + set_sandbox 注入）
-   - Tool 残余中高层（ToolkitAware rebindToolkit、McpClientManager 等）
-   - Formatter 的 Formatter trait 泛型化（如需多 provider）
-2. **P2 增强可选**：
-   - Shutdown 精细化（GracefulShutdownMiddleware）
-   - Observability 增强（OtelTracingMiddleware）
-   - RAG 模块（全新模块）
-   - Agent 协作（ObservableAgent observe、SubagentEventBus）
+1. **P1 残余**：
+   - `$/cancel_request` 通知 handler（on_receive_notification + CancelRequestNotification）→ 触发会话 cancel
+   - 权限 HITL（RequestPermissionRequest 往返）— 需在 ReActAgent 侧支持 Ask 决策回调
+2. **P2 增强**：
+   - UsageUpdate 通知（当前 PromptResponse 未带 usage，需 unstable_end_turn_token_usage feature）
+   - MCP server 对接（unstable_mcp_over_acp）
+   - WebSocket/HTTP transport
+3. **既有问题**：`examples/harness_agent.rs` 为损坏示例（AgentSkillBuilder 等），非本次改动引入，未处理
 
 ## 测试基线
-- **cargo test**: core 115 通过（lib 62 + 集成 53）, harness 215 通过（lib 128 + 集成 87）, 共 **330** 通过
-- **clippy 基线**: core 16 条既有警告; harness 12 条既有
+- **cargo test -p agentscope-harness --lib**: 135 通过
+- **cargo test -p agentscope-harness --test harness_agent_test**: 6 通过
+- **cargo build -p agentscope-harness / -p agentscope-core / --example acp_agent_demo**: 通过
+- **注意**：`cargo build -p agentscope-harness --examples` 会因既有损坏示例 harness_agent.rs 失败（非本次改动引入）
 
 ## 已验证功能
-- Formatter 转换层（Msg→provider 请求转换公共层）
-- JsonFileAgentStateStore 重启恢复 e2e
-- rust-mcp-sdk 远程依赖可正常编译
+- ACP stdio 全链路（HarnessAgent 底层）：initialize / session/new / session/prompt（流式通知）/ session/close
+- HarnessAgent 嵌入 ReActAgent 的装配与驱动
