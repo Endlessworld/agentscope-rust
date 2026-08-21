@@ -169,6 +169,7 @@ impl AcpAgentSession {
         // Tracks whether any incremental text delta was already emitted, so we
         // don't duplicate the final reply text when it was streamed token-by-token.
         let mut emitted_text = false;
+        let mut tool_events = super::event::ToolEventMapper::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
@@ -206,7 +207,7 @@ impl AcpAgentSession {
                                     emit(notif);
                                 }
                                 if let Some(notif) =
-                                    super::event::map_tool_event(self.session_id.clone(), &ev)
+                                    tool_events.map(self.session_id.clone(), &ev)
                                 {
                                     emit(notif);
                                 }

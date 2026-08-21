@@ -642,7 +642,9 @@ impl HarnessAgentBuilder {
             middleware.add(Box::new(ws_ctx));
         }
         if !self.disable_at_path_expansion {
-            middleware.add(Box::new(AtPathExpansionMiddleware));
+            middleware.add(Box::new(AtPathExpansionMiddleware::new(Arc::clone(
+                &filesystem,
+            ))));
         }
 
         // ---- Memory pipeline (flush + consolidation + maintenance) ----

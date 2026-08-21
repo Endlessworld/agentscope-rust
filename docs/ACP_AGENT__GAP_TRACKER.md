@@ -70,7 +70,7 @@
 - **ACP CodingAgent 核心已实现并通过 stdio 端到端验证**（initialize/new_session/prompt/close 全链路）。
 - 测试：harness lib 135 通过（含 acp 7 个新单测，原 128）。
 - `cargo build -p agentscope-harness` 通过；`cargo build -p agentscope-core` 通过。
-- **注意**：`crates/agentscope-harness/examples/harness_agent.rs` 为既有损坏示例（AgentSkillBuilder 等错误），与本次改动无关，未处理。
+- **注意**：`../crates/agentscope-harness/examples/acp_harness_agent.rs` 为既有损坏示例（AgentSkillBuilder 等错误），与本次改动无关，未处理。
 
 ### 3.2 下一步建议
 1. **Phase 1**：建 `acp/` 模块 + Initialize 处理器 + connect_stdio，编译通过

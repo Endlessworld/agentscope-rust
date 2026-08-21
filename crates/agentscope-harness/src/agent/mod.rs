@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod sandbox;
 pub mod skill;
 pub mod subagent;
+pub mod transcript;
 pub mod workspace;
 
 pub use bus::{
@@ -53,10 +54,10 @@ pub use middleware::{
     ToolResultEvictionMiddleware,
 };
 pub use sandbox::{
-    DefaultWorkspaceSpecApplier, ExecResult, Sandbox, SandboxClient, SandboxClientOptions,
-    SandboxContext, SandboxError, SandboxExecutionGuard, SandboxIsolationKey, SandboxLease,
-    SandboxManager, SandboxSnapshotSpec, SandboxState, SandboxStateStore, WorkspaceSpec,
-    WorkspaceSpecApplier,
+    DefaultWorkspaceSpecApplier, ExecResult, InMemorySandboxStateStore, LocalSandboxState,
+    Sandbox, SandboxClient, SandboxClientOptions, SandboxContext, SandboxError,
+    SandboxExecutionGuard, SandboxIsolationKey, SandboxLease, SandboxManager, SandboxSnapshotSpec,
+    SandboxState, SandboxStateStore, WorkspaceSpec, WorkspaceSpecApplier,
 };
 pub use skill::{
     AgentSkill, AgentSkillBuilder, AllowListFilter, AllowListGate, AuditEntry, DenyListFilter,
@@ -74,6 +75,9 @@ pub use subagent::{
     SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode, SubagentWorkspaceMode,
     SUBAGENTS_DIR, SUBAGENT_GLOB, TaskCompletionCallback, TaskDelivery, TaskRecord,
     TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository,
+};
+pub use transcript::{
+    FilesystemTranscriptStore, TranscriptRef, TranscriptSegment, TranscriptStore,
 };
 pub use workspace::{
     NamespaceFactory, NoNamespace, PlanModeManager, UserSessionNamespace, WorkspaceConstants,

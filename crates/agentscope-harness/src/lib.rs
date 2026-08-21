@@ -48,6 +48,7 @@ pub use filesystem::{
     SandboxBackedFilesystem, SandboxFilesystem,
 };
 pub use tool::{
-    command_with_working_directory, FilesystemTool, Level, MatchRange, SearchResult,
-    ShellExecuteTool, TaskCancelTool, TaskListTool, TaskOutputTool, TaskTool,
+    command_with_working_directory, AgentGenerateTool, FilesystemTool, Level, MatchRange,
+    MemoryGetTool, MemorySaveTool, MemorySearchTool, SearchResult, ShellExecuteTool, TaskCancelTool,
+    TaskListTool, TaskOutputTool, TaskTool,
 };

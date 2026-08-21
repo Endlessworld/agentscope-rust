@@ -618,7 +618,7 @@ async fn execute_iteration(
         let suspended = match reason {
             GenerateReason::ModelStop | GenerateReason::ToolCalls => {
                 if has_tool_calls {
-                    let suspended = acting_phase(core, state).await?;
+                    let suspended = acting_phase(core, ctx, state).await?;
                     iter += 1;
                     suspended
                 } else {
@@ -630,7 +630,7 @@ async fn execute_iteration(
             }
             _ => {
                 if has_tool_calls {
-                    let suspended = acting_phase(core, state).await?;
+                    let suspended = acting_phase(core, ctx, state).await?;
                     iter += 1;
                     suspended
                 } else {
@@ -657,7 +657,7 @@ async fn reasoning_phase(
     check_interrupted(core)?;
     state.set_cur_iter(iter);
     if iter >= core.max_iters {
-        return summarizing(core).await;
+        return summarizing(core, state).await;
     }
 
     let sys_prompt = core
@@ -736,6 +736,68 @@ async fn run_reasoning(
     });
     result
 }
+/// Helper: emit an agent event through the delta_tx channel if available.
+fn emit_delta(delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>, ev: AgentEvent) {
+    if let Some(tx) = delta_tx {
+        let _ = tx.unbounded_send(Ok(ev));
+    }
+}
+
+/// Builds an agent event carrying tool-call metadata fields.
+fn tool_event(event_type: AgentEventType, tool_call_id: &str, tool_name: &str) -> AgentEvent {
+    let mut fields = JsonMap::new();
+    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
+    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+    AgentEvent::with_fields(event_type, fields)
+}
+
+
+/// Emits a ToolResultStart event through the delta_tx channel.
+fn emit_tool_result_start(
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    tool_call_id: &str,
+    tool_name: &str,
+) {
+    let mut fields = JsonMap::new();
+    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
+    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+    emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultStart, fields));
+}
+
+/// Emits a ToolResultTextDelta event through the delta_tx channel.
+fn emit_tool_result_text_delta(
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    tool_call_id: &str,
+    tool_name: &str,
+    delta: &str,
+) {
+    let mut fields = JsonMap::new();
+    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
+    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+    fields.insert("delta".to_string(), serde_json::Value::String(delta.to_string()));
+    emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultTextDelta, fields));
+}
+
+/// Emits a ToolResultEnd event through the delta_tx channel.
+fn emit_tool_result_end(
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    tool_call_id: &str,
+    tool_name: &str,
+    state: ToolResultState,
+) {
+    let mut fields = JsonMap::new();
+    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
+    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+    let state_str = match state {
+        ToolResultState::Success => "SUCCESS",
+        ToolResultState::Error => "ERROR",
+        ToolResultState::Denied => "DENIED",
+        ToolResultState::Running => "RUNNING",
+        ToolResultState::Interrupted => "ERROR",
+    };
+    fields.insert("state".to_string(), serde_json::Value::String(state_str.to_string()));
+    emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields));
+}
 
 /// Builds a text/thinking delta event carrying the given incremental text.
 fn delta_event(event_type: AgentEventType, delta: &str) -> AgentEvent {
@@ -744,9 +806,115 @@ fn delta_event(event_type: AgentEventType, delta: &str) -> AgentEvent {
     AgentEvent::with_fields(event_type, fields)
 }
 
+/// State machine tracking the start/end lifecycle of text, thinking, and tool-call
+/// blocks during model streaming. Mirrors the Java `ModelCallBlockLifecycle`.
+///
+/// Each block type follows a Start → Delta(s) → End cadence. When a new block
+/// type starts, the previous one is automatically flushed (end event emitted).
+struct BlockLifecycle {
+    reply_id: String,
+    text_started: bool,
+    thinking_started: bool,
+    started_tool_calls: std::collections::HashMap<String, String>,
+}
+
+impl BlockLifecycle {
+    fn new(reply_id: String) -> Self {
+        Self {
+            reply_id,
+            text_started: false,
+            thinking_started: false,
+            started_tool_calls: std::collections::HashMap::new(),
+        }
+    }
+
+    fn block_field(block_type: &str) -> serde_json::Value {
+        serde_json::Value::String(block_type.to_string())
+    }
+
+    fn start_text(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        self.flush_thinking(emit);
+        if !self.text_started {
+            self.text_started = true;
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert("block_type".to_string(), Self::block_field("text"));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::TextBlockStart, fields)));
+        }
+    }
+
+    fn start_thinking(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        if !self.thinking_started {
+            self.thinking_started = true;
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert("block_type".to_string(), Self::block_field("thinking"));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::ThinkingBlockStart, fields)));
+        }
+    }
+
+    fn start_tool_call(&mut self, tool_id: &str, tool_name: &str, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        if tool_id.is_empty() || self.started_tool_calls.contains_key(tool_id) {
+            return;
+        }
+        self.flush_text(emit);
+        self.flush_thinking(emit);
+        self.flush_all_tool_calls(emit);
+        let visible = !tool_name.starts_with("__");
+        if visible && !self.started_tool_calls.contains_key(tool_id) {
+            self.started_tool_calls.insert(tool_id.to_string(), tool_name.to_string());
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_id.to_string()));
+            fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallStart, fields)));
+        }
+    }
+
+    fn flush_text(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        if self.text_started {
+            self.text_started = false;
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert("block_type".to_string(), Self::block_field("text"));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::TextBlockEnd, fields)));
+        }
+    }
+
+    fn flush_thinking(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        if self.thinking_started {
+            self.thinking_started = false;
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert("block_type".to_string(), Self::block_field("thinking"));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::ThinkingBlockEnd, fields)));
+        }
+    }
+
+    fn flush_all_tool_calls(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        for (tool_id, tool_name) in self.started_tool_calls.drain() {
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_id));
+            fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallEnd, fields)));
+        }
+    }
+
+    fn flush_all(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        self.flush_text(emit);
+        self.flush_thinking(emit);
+        self.flush_all_tool_calls(emit);
+    }
+}
+
 /// Calls the raw model stream, forwarding each text/thinking delta as an agent
 /// event (so callers can render incrementally) while accumulating the chunks into
 /// a single assistant message.
+///
+/// Emits the full block lifecycle: ModelCallStart → (TextBlockStart → TextBlockDelta(s) → TextBlockEnd)
+/// / (ThinkingBlockStart → ThinkingBlockDelta(s) → ThinkingBlockEnd)
+/// / (ToolCallStart → ToolCallDelta(s) → ToolCallEnd) → ModelCallEnd.
 async fn model_call_impl(
     core: &Arc<AgentCore>,
     mc_input: ModelCallInput,
@@ -754,6 +922,18 @@ async fn model_call_impl(
 ) -> Result<Msg> {
     let model = Arc::clone(&mc_input.model);
     let mut acc = ReasoningContext::default();
+
+    // Generate a reply id for this model call, used for block lifecycle correlation.
+    let reply_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let mut block_lifecycle = BlockLifecycle::new(reply_id.clone());
+
+    // Emit ModelCallStart at the beginning of the model call.
+    {
+        let mut fields = JsonMap::new();
+        fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+        emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallStart, fields)));
+    }
+
     let mut stream = model.stream(mc_input.messages, mc_input.tools, mc_input.options);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -761,13 +941,29 @@ async fn model_call_impl(
         for block in &chunk.content {
             match block {
                 ContentBlock::Text(t) => {
+                    block_lifecycle.start_text(&mut emit);
                     if !t.text.is_empty() {
                         emit(Ok(delta_event(AgentEventType::TextBlockDelta, &t.text)));
                     }
                 }
                 ContentBlock::Thinking(t) => {
+                    block_lifecycle.start_thinking(&mut emit);
                     if !t.thinking.is_empty() {
                         emit(Ok(delta_event(AgentEventType::ThinkingBlockDelta, &t.thinking)));
+                    }
+                }
+                ContentBlock::ToolUse(tu) => {
+                    block_lifecycle.start_tool_call(&tu.id, &tu.name, &mut emit);
+                    // Emit ToolCallDelta for incremental tool call parameter content.
+                    if let Some(ref content) = tu.content {
+                        if !content.is_empty() {
+                            let mut fields = JsonMap::new();
+                            fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+                            fields.insert("tool_call_id".to_string(), serde_json::Value::String(tu.id.clone()));
+                            fields.insert("tool_name".to_string(), serde_json::Value::String(tu.name.clone()));
+                            fields.insert("delta".to_string(), serde_json::Value::String(content.clone()));
+                            emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallDelta, fields)));
+                        }
                     }
                 }
                 _ => {}
@@ -775,12 +971,27 @@ async fn model_call_impl(
         }
         acc.accumulate(chunk);
     }
+
+    // Flush all remaining blocks and emit ModelCallEnd.
+    block_lifecycle.flush_all(&mut emit);
+    {
+        let mut fields = JsonMap::new();
+        fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+        let usage = acc.usage.clone().unwrap_or_default();
+        fields.insert("usage".to_string(), serde_json::to_value(&usage).unwrap_or_default());
+        emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallEnd, fields)));
+    }
+
     Ok(acc.build_final_message())
 }
 
 /// Executes the pending tool calls from the last assistant message and feeds the
 /// results back into the context. The outer loop decides whether to continue.
-async fn acting_phase(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<bool> {
+async fn acting_phase(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    state: &mut AgentState,
+) -> Result<bool> {
     check_interrupted(core)?;
     let pending = extract_pending_tool_calls(state);
     if pending.is_empty() {
@@ -793,9 +1004,16 @@ async fn acting_phase(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<b
         let decision = evaluate_permission(core, call);
         match decision.behavior {
             PermissionBehavior::Deny => {
+                // Emit ToolResultStart → TextDelta → End for denied calls.
+                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                let denied_text = "Permission denied by rules";
+                emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
                 results.push(denied_result(call, &decision.message));
+                emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied);
             }
             PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
+                // Emit ToolResultStart for this tool execution.
+                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
                 let tctx = ToolExecutionContext {
                     tool_call: Some(call.clone()),
                     runtime: Default::default(),
@@ -803,11 +1021,29 @@ async fn acting_phase(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<b
                 };
                 match core.toolkit.call_tool(call, tctx).await {
                     Ok(rb) => {
+                        // Emit text delta for non-streaming results (streaming tools
+                        // emit their own deltas via the emitter callback).
+                        let mut result_text = String::new();
+                        for block in &rb.output {
+                            if let ContentBlock::Text(t) = block {
+                                result_text.push_str(&t.text);
+                            }
+                        }
+                        if !result_text.trim().is_empty() {
+                            emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &result_text);
+                        }
+                        let final_state = if rb.state == ToolResultState::Error { ToolResultState::Error } else { ToolResultState::Success };
                         let bound = bind_result(call, rb);
                         suspended = suspended || bound.is_suspended();
                         results.push(bound);
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state);
                     }
-                    Err(e) => results.push(error_result(call, &e.to_string())),
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &err_msg);
+                        results.push(error_result(call, &err_msg));
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error);
+                    }
                 }
             }
             PermissionBehavior::Ask => {
@@ -828,21 +1064,41 @@ async fn acting_phase(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<b
 }
 
 /// Produces the termination message when the maximum number of iterations is hit.
-async fn summarizing(core: &Arc<AgentCore>) -> Result<Msg> {
+///
+/// Mirrors the Java `summarizing()`: handles pending tool calls that were not completed
+/// before max iterations, and emits `ExceedMaxItersEvent`.
+async fn summarizing(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<Msg> {
     check_interrupted(core)?;
+
+    // Handle pending tool calls that were not completed before max iterations.
+    let pending = extract_pending_tool_calls(state);
+    if !pending.is_empty() {
+        for tool_use in &pending {
+            let error_result = ToolResultBlock {
+                id: Some(tool_use.id.clone()),
+                name: Some(tool_use.name.clone()),
+                output: vec![ContentBlock::Text(TextBlock::new(format!(
+                    "Tool execution cancelled because maximum iterations limit was reached",
+                )))],
+                metadata: Default::default(),
+                state: ToolResultState::Error,
+            };
+            let result_msg = Msg::builder()
+                .role(MsgRole::Tool)
+                .content(vec![ContentBlock::ToolResult(error_result)])
+                .build();
+            state.context_mut().push(result_msg);
+        }
+    }
+
     let msg = Msg::builder()
         .role(MsgRole::Assistant)
-        .content(vec![ContentBlock::ToolResult(ToolResultBlock {
-            id: None,
-            name: None,
-            output: vec![ContentBlock::Text(TextBlock::new(
-                "Reached the maximum number of iterations; the task could not be completed.",
-            ))],
-            metadata: Default::default(),
-            state: ToolResultState::Error,
-        })])
+        .content(vec![ContentBlock::Text(TextBlock::new(
+            "Reached the maximum number of iterations; the task could not be completed.",
+        ))])
         .generate_reason(GenerateReason::MaxIterations)
         .build();
+    state.context_mut().push(msg.clone());
     Ok(msg)
 }
 

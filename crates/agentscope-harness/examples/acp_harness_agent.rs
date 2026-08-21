@@ -16,6 +16,7 @@ use async_trait::async_trait;
 
 use agentscope_core::model::{Model, OpenAiChatModel};
 use agentscope_harness::acp::{config::ModeChoice, AcpCodingAgent};
+use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
     CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
 };
@@ -89,11 +90,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ModeChoice { id: "yolo".to_string(), name: "YOLO".to_string() },
         ModeChoice { id: "plan".to_string(), name: "Plan".to_string() },
     ];
+    let models = vec![
+        ModelChoice { id: "deepseek-v4-flash".to_string(), name: "deepseek-v4-flash".to_string() },
+        ModelChoice { id: "mimo-v2.5".to_string(), name: "mimo-v2.5".to_string() },
+    ];
 
     let agent = AcpCodingAgent::builder()
         .name("agentscope-coding-agent")
         .model_factory(build_agent)
         .modes(modes)
+        .models(models)
         .build()?;
 
     tracing::info!("ACP CodingAgent starting over stdio...");

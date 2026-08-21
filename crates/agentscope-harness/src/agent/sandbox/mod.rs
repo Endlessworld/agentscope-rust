@@ -27,7 +27,7 @@ pub use guard::SandboxExecutionGuard;
 pub use key::SandboxIsolationKey;
 pub use lease::SandboxLease;
 pub use manager::{SandboxAcquireResult, SandboxManager};
-pub use state::{InMemorySandboxStateStore, SandboxState, SandboxStateStore};
+pub use state::{InMemorySandboxStateStore, LocalSandboxState, SandboxState, SandboxStateStore};
 pub use workspace_spec::{
     CopySpec, DefaultWorkspaceSpecApplier, ExecResult, WorkspaceSpec, WorkspaceSpecApplier,
 };

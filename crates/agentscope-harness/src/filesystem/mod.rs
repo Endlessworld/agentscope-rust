@@ -6,6 +6,7 @@ pub mod composite;
 pub mod local;
 pub mod overlay;
 pub mod remote;
+pub mod result;
 pub mod sandbox;
 
 use async_trait::async_trait;
@@ -16,6 +17,10 @@ pub use composite::CompositeFilesystem;
 pub use local::{LocalFilesystem, LocalFsMode};
 pub use overlay::OverlayFilesystem;
 pub use remote::RemoteFilesystem;
+pub use result::{
+    EditResult, FileDownloadResponse, FileUploadResponse, GlobResult, GrepResult, LsResult,
+    ReadResult, WriteResult,
+};
 pub use sandbox::{SandboxBackedFilesystem, SandboxFilesystem};
 
 /// Directory/listing entry.

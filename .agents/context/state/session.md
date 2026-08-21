@@ -24,18 +24,38 @@
   - 修复过程中：AgentSkillBuilder::new() → AgentSkillBuilder::default()（无 new 关联函数）；
     bytes move 借用错误（先取 len 再 move）；移除未用 mut
   - 同步更新 `examples/README.md` 为 ACP stdio 用法
+- **扩展 harness crate 功能** ✅（30 files changed, 2271 insertions, 156 deletions）
+  - 新增 memory 工具：MemorySearchTool / MemoryGetTool / MemorySaveTool（P0 核心功能缺口）
+  - 新增 transcript 存储：TranscriptStore trait + FilesystemTranscriptStore + TranscriptRef（P1）
+  - 新增中间件：AtPathExpansionMiddleware（@path 扩展）、SandboxLifecycleMiddleware、TranscriptMiddleware
+  - 新增文件系统结果类型：EditResult / WriteResult / ReadResult / LsResult / GlobResult / GrepResult 等
+  - 更新 react_agent 支持流式事件（BlockLifecycle 状态机、ToolResultStart/TextDelta/End）
+  - 更新 ACP 事件映射（ToolResultEnd → ToolCallUpdate）
+  - 添加示例：acp_agent_cli.rs（ACP 客户端 REPL）
+  - 添加测试：harness_agent_generate_test / harness_at_path_test / harness_memory_tool_test / harness_transcript_test
+  - 更新文档：Feature_Gap_Analysis.md / MIGRATION_GAP_TRACKER.md / MIGRATION_PLAN.md
 
 ## 下一步建议
-1. **P1 残余**：
+1. **P0 核心功能缺口**：
+   - 实现 `AgentSpawnTool`（84KB，子代理生成核心工具）
+   - 实现 Docker Sandbox 后端（`bollard` 依赖）
+2. **P1 残余**：
    - `$/cancel_request` 通知 handler → 触发会话 cancel
    - 权限 HITL（RequestPermissionRequest 往返）
-2. **P2 增强**：
+   - 实现 `TeamTool` / `TeamsMiddleware`（多代理团队协调）
+   - 实现 `PlanModeTools`（plan_enter/plan_write/plan_exit）
+   - 实现 `WaitAsyncResultsTool`（异步结果等待）
+3. **P2 增强**：
    - UsageUpdate 通知 / MCP server 对接 / WebSocket-HTTP transport
+   - 实现 `SessionSearchTool`（历史对话搜索）
+   - 实现 `WebTools`（web_fetch/web_search）
+   - 实现 `SkillSecurityScanner`（安全扫描）
+   - 实现 `RemoteFilesystem` 完整实现
 
 ## 测试基线
-- **cargo test -p agentscope-harness --lib**: 135 通过
+- **cargo test -p agentscope-harness --lib**: 145 通过（较上次增加10个，新增memory/transcript/at_path/agent_generate测试）
 - **cargo test -p agentscope-harness --test harness_agent_test**: 8 通过
-- **cargo check --examples -p agentscope-harness**: 通过（harness_agent + acp_agent_demo 均编译通过）
+- **cargo check --examples -p agentscope-harness**: 通过（harness_agent + acp_agent_cli 均编译通过）
 
 ## 已验证功能
 - ACP stdio 全链路（HarnessAgent 底层）：initialize / session/new / session/prompt / session/close

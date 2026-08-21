@@ -65,6 +65,12 @@ pub fn tool_call_update(
 
 /// Maps a core tool-call event into the appropriate ACP session update.
 ///
+/// Handles:
+/// - `ToolCallStart` → `ToolCall` (creation with InProgress status)
+/// - `ToolCallEnd` → `ToolCallUpdate` (completed status)
+/// - `ToolResultStart` → `ToolCallUpdate` (in-progress status, tool execution started)
+/// - `ToolResultEnd` → `ToolCallUpdate` (completed/failed status based on state)
+///
 /// Returns `None` for events that don't map to a tool-call update.
 pub fn map_tool_event(
     session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
@@ -83,8 +89,152 @@ pub fn map_tool_event(
             let id = data.fields.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             Some(tool_call_update(sid, id, ToolKind::Edit, ToolCallStatus::Completed))
         }
+        AgentEventType::ToolResultEnd => {
+            let data = ev.data();
+            let id = data.fields.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let state = data.fields.get("state").and_then(|v| v.as_str()).unwrap_or("SUCCESS");
+            let status = match state {
+                "ERROR" | "DENIED" => ToolCallStatus::Failed,
+                _ => ToolCallStatus::Completed,
+            };
+            Some(tool_call_update(sid, id, ToolKind::Edit, status))
+        }
         _ => None,
     }
+}
+
+/// Stateful mapper that accumulates streamed tool-call inputs (`ToolCallDelta`)
+/// and outputs (`ToolResultTextDelta`) per tool call, then attaches them as
+/// `raw_input` / `raw_output` on the corresponding `ToolCallUpdate`.
+pub struct ToolEventMapper {
+    inputs: std::collections::HashMap<String, String>,
+    outputs: std::collections::HashMap<String, String>,
+}
+
+impl Default for ToolEventMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolEventMapper {
+    pub fn new() -> Self {
+        Self {
+            inputs: std::collections::HashMap::new(),
+            outputs: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Map one core event; returns a notification when there is something
+    /// visible to send, or `None` for pure bookkeeping events.
+    pub fn map(
+        &mut self,
+        session_id: impl Into<agent_client_protocol::schema::v1::SessionId> + Clone,
+        ev: &AgentEvent,
+    ) -> Option<SessionNotification> {
+        let sid = session_id.into();
+        let data = ev.data();
+        let id = data
+            .fields
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match ev.event_type() {
+            AgentEventType::ToolCallStart => {
+                let name = data
+                    .fields
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                self.inputs.entry(id.clone()).or_default();
+                self.outputs.entry(id.clone()).or_default();
+                Some(tool_call_start(
+                    sid.clone(),
+                    id,
+                    name,
+                    ToolKind::Edit,
+                ))
+            }
+            AgentEventType::ToolCallDelta => {
+                if let Some(buf) = self.inputs.get_mut(&id) {
+                    if let Some(d) = data.fields.get("delta").and_then(|v| v.as_str()) {
+                        buf.push_str(d);
+                    }
+                }
+                None
+            }
+            AgentEventType::ToolCallEnd => {
+                let input = self.inputs.remove(&id);
+                Some(tool_call_update_io(
+                    sid.clone(),
+                    id,
+                    ToolKind::Edit,
+                    ToolCallStatus::Completed,
+                    input,
+                    None,
+                ))
+            }
+            AgentEventType::ToolResultTextDelta => {
+                if let Some(buf) = self.outputs.get_mut(&id) {
+                    if let Some(d) = data.fields.get("delta").and_then(|v| v.as_str()) {
+                        buf.push_str(d);
+                    }
+                }
+                None
+            }
+            AgentEventType::ToolResultEnd => {
+                let state = data
+                    .fields
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("SUCCESS");
+                let status = match state {
+                    "ERROR" | "DENIED" => ToolCallStatus::Failed,
+                    _ => ToolCallStatus::Completed,
+                };
+                let input = self.inputs.remove(&id);
+                let output = self.outputs.remove(&id);
+                Some(tool_call_update_io(
+                    sid.clone(),
+                    id,
+                    ToolKind::Edit,
+                    status,
+                    input,
+                    output,
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parses an accumulated string as JSON if possible, else wraps it as a string value.
+fn json_value_from(s: String) -> serde_json::Value {
+    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+}
+
+/// Builds a `ToolCallUpdate` carrying optional raw input / output payloads.
+fn tool_call_update_io(
+    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    id: String,
+    kind: ToolKind,
+    status: ToolCallStatus,
+    raw_input: Option<String>,
+    raw_output: Option<String>,
+) -> SessionNotification {
+    let mut fields = ToolCallUpdateFields::new().kind(kind).status(status);
+    if let Some(v) = raw_input.map(json_value_from) {
+        fields = fields.raw_input(v);
+    }
+    if let Some(v) = raw_output.map(json_value_from) {
+        fields = fields.raw_output(v);
+    }
+    SessionNotification::new(
+        session_id,
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
+    )
 }
 
 /// Maps the final agent result into an ACP message chunk so that answers which
