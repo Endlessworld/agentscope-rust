@@ -164,7 +164,11 @@ impl AcpAgentSession {
         let stream = self.agent.stream_events(msgs, StreamOptions::defaults());
         let mut stream = std::pin::pin!(stream);
 
+        use agentscope_core::event::AgentEventType;
         use futures::StreamExt;
+        // Tracks whether any incremental text delta was already emitted, so we
+        // don't duplicate the final reply text when it was streamed token-by-token.
+        let mut emitted_text = false;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
@@ -174,15 +178,45 @@ impl AcpAgentSession {
                 }
                 item = stream.next() => {
                     match item {
-                        Some(Ok(ev)) => {
-                            if let Some(notif) = super::event::map_delta_event(self.session_id.clone(), &ev) {
-                                emit(notif);
+                        Some(Ok(ev)) => match ev.event_type() {
+                            AgentEventType::TextBlockDelta => {
+                                if let Some(notif) =
+                                    super::event::map_delta_event(self.session_id.clone(), &ev)
+                                {
+                                    emitted_text = true;
+                                    emit(notif);
+                                }
                             }
-                            if let Some(notif) = super::event::map_tool_event(self.session_id.clone(), &ev) {
-                                emit(notif);
+                            AgentEventType::AgentResult => {
+                                // Emit the final reply only if it wasn't already
+                                // streamed incrementally (avoids duplicate output).
+                                if !emitted_text {
+                                    if let Some(notif) = super::event::map_result_event(
+                                        self.session_id.clone(),
+                                        &ev,
+                                    ) {
+                                        emit(notif);
+                                    }
+                                }
                             }
-                        }
-                        Some(Err(_)) => {
+                            _ => {
+                                if let Some(notif) =
+                                    super::event::map_delta_event(self.session_id.clone(), &ev)
+                                {
+                                    emit(notif);
+                                }
+                                if let Some(notif) =
+                                    super::event::map_tool_event(self.session_id.clone(), &ev)
+                                {
+                                    emit(notif);
+                                }
+                            }
+                        },
+                        Some(Err(e)) => {
+                            emit(super::event::message_chunk(
+                                self.session_id.clone(),
+                                format!("Agent error: {e}"),
+                            ));
                             return StopReason::Refusal;
                         }
                         None => break,

@@ -87,6 +87,25 @@ pub fn map_tool_event(
     }
 }
 
+/// Maps the final agent result into an ACP message chunk so that answers which
+/// are *not* streamed as incremental `TextBlockDelta`s are still surfaced to the
+/// client (otherwise the turn ends with `end_turn` and no visible output).
+///
+/// Returns `None` when the reply carries no text.
+pub fn map_result_event(
+    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    ev: &AgentEvent,
+) -> Option<SessionNotification> {
+    let sid = session_id.into();
+    let reply = ev.data().fields.get("reply")?;
+    let msg: agentscope_core::message::Msg = serde_json::from_value(reply.clone()).ok()?;
+    let text = msg.text_content();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(message_chunk(sid, text))
+}
+
 /// Maps a core text/thinking delta event into an ACP message/thought chunk.
 pub fn map_delta_event(
     session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,

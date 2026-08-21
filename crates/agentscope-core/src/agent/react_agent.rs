@@ -221,13 +221,21 @@ impl ReActAgent {
                     let mut events = Vec::new();
                     events.push(Ok(AgentEvent::AgentStart(EventData::default())));
                     let res = run_agent_loop(&core, &ctx_core, input.messages).await;
-                    if let Ok(msg) = &res {
-                        let mut data = EventData::default();
-                        data.fields.insert(
-                            "reply".to_string(),
-                            serde_json::to_value(msg).unwrap_or_default(),
-                        );
-                        events.push(Ok(AgentEvent::AgentResult(data)));
+                    match &res {
+                        Ok(msg) => {
+                            let mut data = EventData::default();
+                            data.fields.insert(
+                                "reply".to_string(),
+                                serde_json::to_value(msg).unwrap_or_default(),
+                            );
+                            events.push(Ok(AgentEvent::AgentResult(data)));
+                        }
+                        Err(e) => {
+                            // Surface the failure into the stream so consumers
+                            // (e.g. ACP `stream_events`) don't silently swallow it
+                            // and report `end_turn` with no events.
+                            events.push(Err(Error::Agent(e.to_string())));
+                        }
                     }
                     *slot_core.lock().unwrap() = Some(res);
                     events.push(Ok(AgentEvent::AgentEnd(EventData::default())));

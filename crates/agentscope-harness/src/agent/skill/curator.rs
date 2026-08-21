@@ -21,7 +21,8 @@ pub const CURATOR_STATE_PATH: &str = "skills/.curator_state.json";
 pub const CURATOR_REPORTS_DIR: &str = "skills/.curator_reports";
 
 /// Lifecycle state of a usage-tracked skill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SkillState {
     Active,
     Stale,
@@ -30,7 +31,8 @@ pub enum SkillState {
 }
 
 /// Usage / lifecycle record for a single skill.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct SkillUsageRecord {
     pub created_by: String,
     pub pinned: bool,
@@ -55,6 +57,12 @@ impl SkillUsageRecord {
 pub trait SkillUsageStore: Send + Sync {
     fn agent_created(&self) -> Vec<(String, SkillUsageRecord)>;
     fn set_state(&mut self, name: &str, state: SkillState);
+    /// Records (or replaces) a usage/lifecycle record for a skill.
+    fn put(&mut self, name: String, record: SkillUsageRecord);
+    /// Records recent activity for an agent-created skill (updates `latest_activity_at`).
+    fn touch_latest_activity(&mut self, name: &str) {
+        let _ = name;
+    }
 }
 
 /// In-memory [`SkillUsageStore`] for tests and lightweight deployments.
@@ -83,6 +91,75 @@ impl SkillUsageStore for InMemorySkillUsageStore {
     fn set_state(&mut self, name: &str, state: SkillState) {
         if let Some(r) = self.records.get_mut(name) {
             r.state = state;
+        }
+    }
+    fn put(&mut self, name: String, record: SkillUsageRecord) {
+        self.records.insert(name, record);
+    }
+    fn touch_latest_activity(&mut self, name: &str) {
+        if let Some(r) = self.records.get_mut(name) {
+            r.latest_activity_at = chrono::Utc::now();
+        }
+    }
+}
+
+/// Filesystem-backed [`SkillUsageStore`] persisting usage/lifecycle records to a
+/// JSON file, mirroring the default Java `new SkillUsageStore(filesystem)`.
+#[derive(Debug)]
+pub struct FilesystemSkillUsageStore {
+    path: std::path::PathBuf,
+    records: BTreeMap<String, SkillUsageRecord>,
+}
+
+impl FilesystemSkillUsageStore {
+    /// Opens (or creates) a usage store backed by the JSON file at `path`.
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let records = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<BTreeMap<String, SkillUsageRecord>>(&s).ok())
+            .unwrap_or_default();
+        Self { path, records }
+    }
+
+    /// Creates a store rooted at a workspace, persisting to
+    /// `skills/.usage.json`.
+    pub fn at_workspace(workspace: impl Into<std::path::PathBuf>) -> Self {
+        Self::new(workspace.into().join("skills").join(".usage.json"))
+    }
+
+    fn persist(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.records) {
+            let _ = std::fs::write(&self.path, json);
+        }
+    }
+}
+
+impl SkillUsageStore for FilesystemSkillUsageStore {
+    fn agent_created(&self) -> Vec<(String, SkillUsageRecord)> {
+        self.records
+            .iter()
+            .filter(|(_, r)| r.created_by == "agent" && !r.pinned)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+    fn set_state(&mut self, name: &str, state: SkillState) {
+        if let Some(r) = self.records.get_mut(name) {
+            r.state = state;
+            self.persist();
+        }
+    }
+    fn put(&mut self, name: String, record: SkillUsageRecord) {
+        self.records.insert(name, record);
+        self.persist();
+    }
+    fn touch_latest_activity(&mut self, name: &str) {
+        if let Some(r) = self.records.get_mut(name) {
+            r.latest_activity_at = chrono::Utc::now();
+            self.persist();
         }
     }
 }
@@ -483,6 +560,28 @@ mod tests {
         assert_eq!(counts.archived, 1);
         assert_eq!(counts.marked_stale, 0);
         assert_eq!(*archived_names.lock().unwrap(), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn filesystem_store_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("asr_fsus_{}", std::process::id()));
+        let path = dir.join("skills").join(".usage.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut store = FilesystemSkillUsageStore::new(path.clone());
+        store.put(
+            "tool".to_string(),
+            SkillUsageRecord::agent_created(SkillState::Active, Utc::now()),
+        );
+        drop(store);
+
+        let reloaded = FilesystemSkillUsageStore::new(path.clone());
+        let records = reloaded.agent_created();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "tool");
+        assert_eq!(records[0].1.state, SkillState::Active);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

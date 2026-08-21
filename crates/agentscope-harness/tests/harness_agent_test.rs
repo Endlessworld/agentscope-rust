@@ -103,3 +103,33 @@ async fn gateway_emits_to_channel() {
     let value = rx.recv().await.unwrap();
     assert_eq!(value["type"], "hello");
 }
+
+
+#[test]
+fn harness_agent_builder_memory_and_plan_mode() {
+    // Workspace context is enabled by default; plan mode + memory pipeline wire up cleanly.
+    let agent = HarnessAgent::builder()
+        .name("orchestrated")
+        .register_filesystem_tools(true)
+        .enable_plan_mode()
+        .plan_file_directory("plans")
+        .build();
+    assert_eq!(agent.name(), "orchestrated");
+    // Plan-mode coordinator is present once enabled.
+    assert!(agent.plan_mode_manager().is_some());
+    // Workspace manager is bound.
+    assert!(agent.workspace_manager().is_some());
+    // Memory config defaults are applied.
+    assert_eq!(agent.memory_config().consolidation_max_tokens, 4_000);
+}
+
+#[test]
+fn harness_agent_disable_workspace_context() {
+    let agent = HarnessAgent::builder()
+        .name("bare")
+        .disable_workspace_context()
+        .disable_memory_hooks()
+        .build();
+    assert_eq!(agent.name(), "bare");
+    assert!(agent.workspace_manager().is_some());
+}

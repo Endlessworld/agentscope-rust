@@ -21,7 +21,10 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Stdio};
 
-use crate::agent::HarnessAgent;
+use agentscope_core::model::{Model, OpenAiChatModel};
+
+use crate::agent::{HarnessAgent, HarnessAgentBuilder};
+use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
 use super::session::AcpAgentSession;
@@ -29,6 +32,47 @@ use super::session::AcpAgentSession;
 /// Default agent info advertised during initialization.
 const AGENT_NAME: &str = "agentscope-coding-agent";
 const AGENT_VERSION: &str = "0.1.0";
+
+
+/// Default model id used when `CODING_MODEL_ID` is not set.
+const DEFAULT_MODEL_ID: &str = "gpt-4o";
+
+/// Builds an [`OpenAiChatModel`] from the environment (mirrors Java `CodingAgentFactory`).
+///
+/// Reads `CODING_MODEL_ID` (default `gpt-4o`), `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
+fn build_env_model() -> Arc<dyn Model> {
+    let model_id = std::env::var("CODING_MODEL_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+    let api_key = std::env::var("OPENAI_API_KEY").ok();
+    let base_url = std::env::var("OPENAI_BASE_URL").ok();
+    let model = OpenAiChatModel::new(model_id, api_key, base_url)
+        .expect("failed to build OpenAiChatModel");
+    Arc::new(model)
+}
+
+/// The default per-session factory: builds a fully-wired [`HarnessAgent`] using the
+/// [`HarnessAgentBuilder`]'s complete orchestration (workspace, filesystem tools, shell,
+/// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
+fn default_model_factory(cwd: std::path::PathBuf) -> HarnessAgent {
+    let model = build_env_model();
+    let compaction = CompactionMiddlewareConfig {
+        enabled: true,
+        max_tokens: 16_000,
+    };
+    let workspace = cwd.join(".agentscope").join("workspace");
+    HarnessAgent::builder()
+        .name("agentscope-coding-agent")
+        .model(model)
+        .cwd(cwd)
+        .workspace(workspace)
+        .register_filesystem_tools(true)
+        .register_shell_tool(true)
+        .compaction(compaction)
+        .max_iters(50)
+        .build()
+}
 
 /// An ACP CodingAgent with a session registry and a factory for building the
 /// underlying [`HarnessAgent`] per session.
@@ -352,7 +396,10 @@ impl AcpCodingAgentBuilder {
 
     /// Builds the [`AcpCodingAgent`].
     pub fn build(self) -> Result<AcpCodingAgent, Box<dyn std::error::Error>> {
-        let factory = self.model_factory.ok_or("model_factory is required")?;
+        let factory = self
+            .model_factory
+            .map(|f| -> Box<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync> { f })
+            .unwrap_or_else(|| Box::new(default_model_factory));
         let mut agent = AcpCodingAgent::new(
             move |cwd| factory(cwd),
             self.models,

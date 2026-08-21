@@ -59,9 +59,15 @@ pub use sandbox::{
     WorkspaceSpecApplier,
 };
 pub use skill::{
-    AgentSkill, AgentSkillBuilder, HarnessSkillEntry, ShellPathPolicy, SkillCatalog, SkillCurator,
-    SkillCuratorConfig, SkillCuratorState, SkillFilter, SkillPromptBuilder, SkillRuntime, SkillState,
-    StageResult,
+    AgentSkill, AgentSkillBuilder, AllowListFilter, AllowListGate, AuditEntry, DenyListFilter,
+    FilesystemSkillUsageStore, FileSystemSkillRepository, HarnessSkillEntry, LoadSkillTool,
+    ProposeSkillTool, PromotionDecision,
+    PromotionResult, RejectAllGate, ShellPathPolicy, SkillAuditLog, SkillCatalog, SkillCurator,
+    SkillCuratorConfig, SkillCuratorState, SkillFilter, SkillManageConfig, SkillManageTool,
+    SkillPromoter, SkillPromotionGate, SkillPromptBuilder, SkillRepository, SkillRuntime,
+    SkillState, SkillUsageStore, SkillVisibilityFilter, StageResult, WorkspaceSkillRepository,
+    build_promoter,
+    compose_skill_repositories, default_gate,
 };
 pub use subagent::{
     load_from_directory, load_from_filesystem, parse, BackgroundTask, DefaultAgentManager,

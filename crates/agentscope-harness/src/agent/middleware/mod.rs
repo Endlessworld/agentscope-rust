@@ -14,6 +14,7 @@ pub mod dynamic_subagents;
 pub mod inbox;
 pub mod memory_flush;
 pub mod memory_maintenance;
+pub mod skill_middleware;
 pub mod subagents;
 pub mod tool_result_eviction;
 pub mod workspace_context;
@@ -24,6 +25,9 @@ pub use dynamic_subagents::DynamicSubagentsMiddleware;
 pub use inbox::InboxMiddleware;
 pub use memory_flush::MemoryFlushMiddleware;
 pub use memory_maintenance::MemoryMaintenanceMiddleware;
+pub use skill_middleware::{
+    build_skill_entries, HarnessSkillMiddleware, SkillCuratorMiddleware, SkillUsageMiddleware,
+};
 pub use subagents::{
     build_delivery_reminder, build_task_summary, prepend_to_system_message,
     render_subagent_section, SubagentsMiddleware,
