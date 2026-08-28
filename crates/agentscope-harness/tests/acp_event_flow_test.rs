@@ -100,9 +100,21 @@ async fn thinking_and_tool_call_reach_client() {
                     }
                     SessionUpdate::ToolCall(tc) => {
                         assert!(!tc.title.is_empty(), "tool call must have a title");
+                        assert_eq!(
+                            tc.raw_input,
+                            Some(serde_json::json!({"path": "/tmp/x"})),
+                            "the creation notification must carry the tool arguments"
+                        );
                         u.push("TOOL_CALL".into())
                     }
-                    SessionUpdate::ToolCallUpdate(_) => u.push("TOOL_CALL_UPDATE".into()),
+                    SessionUpdate::ToolCallUpdate(tu) => {
+                        if let Some(status) = tu.fields.status {
+                            u.push(format!(
+                                "TOOL_CALL_UPDATE status={status:?} in={:?} out={:?}",
+                                tu.fields.raw_input, tu.fields.raw_output
+                            ));
+                        }
+                    }
                     SessionUpdate::AgentMessageChunk(_) => u.push("MESSAGE".into()),
                     _ => {}
                 }
@@ -120,5 +132,24 @@ async fn thinking_and_tool_call_reach_client() {
     assert!(
         updates.iter().any(|u| u == "TOOL_CALL"),
         "expected TOOL_CALL notification, got {updates:?}"
+    );
+    // pending (args ready) → running (executing) → failed (file missing).
+    let statuses: Vec<&str> = updates
+        .iter()
+        .filter_map(|u| u.strip_prefix("TOOL_CALL_UPDATE status="))
+        .map(|s| s.split(' ').next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["InProgress", "Failed"],
+        "tool call must transition through the ACP lifecycle, got {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|u| u.contains("in=Some(Object {\"path\": String(\"/tmp/x\")})")),
+        "the tool arguments must stay attached until the call finishes, got {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|u| u.contains("out=Some(")),
+        "the tool output must be reported, got {updates:?}"
     );
 }

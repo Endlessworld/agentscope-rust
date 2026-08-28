@@ -20,7 +20,8 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, PermissionOptionKind, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallStatus,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolKind,
 };
 use std::collections::HashMap;
 use agent_client_protocol::util::MatchDispatch;
@@ -85,12 +86,22 @@ const RESET: &str = "\x1b[0m";
 
 /// Compact single-line rendering of a JSON value, truncated for display.
 fn truncate_json(v: &serde_json::Value, max: usize) -> String {
-    let mut s = v.to_string();
-    if s.len() > max {
-        s.truncate(max);
-        s.push_str("…");
+    truncate_str(&v.to_string(), max)
+}
+
+/// Truncates to `max` bytes, snapping back to a UTF-8 character boundary so
+/// multi-byte characters are never split.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
     }
-    s
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push('…');
+    out
 }
 
 /// Pretty status label for a tool call.
@@ -102,6 +113,109 @@ fn status_label(status: &ToolCallStatus) -> &'static str {
         ToolCallStatus::Failed => "failed",
         _ => "unknown",
     }
+}
+
+/// Pretty label for an ACP `ToolKind`.
+fn kind_label(kind: &ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "read",
+        ToolKind::Edit => "edit",
+        ToolKind::Delete => "delete",
+        ToolKind::Move => "move",
+        ToolKind::Search => "search",
+        ToolKind::Execute => "execute",
+        ToolKind::Think => "think",
+        ToolKind::Fetch => "fetch",
+        ToolKind::SwitchMode => "switch-mode",
+        _ => "other",
+    }
+}
+
+/// Per-tool-call rendering state. Streaming updates repeat the same `raw_input`
+/// / `raw_output` payloads, so the last printed values are tracked to avoid
+/// flooding the terminal.
+#[derive(Default)]
+struct ToolView {
+    name: Option<String>,
+    title: Option<String>,
+    kind: Option<&'static str>,
+    last_input: Option<String>,
+    last_output: Option<String>,
+}
+
+/// Renders a tool-call notification into the lines to print, updating the
+/// per-call view. Covers every field the agent pushes: name, title, status,
+/// kind, locations, raw input and output (preferring structured `content`).
+fn render_tool(
+    views: &mut HashMap<String, ToolView>,
+    id: &str,
+    name: Option<String>,
+    title: Option<String>,
+    kind: Option<ToolKind>,
+    status: Option<ToolCallStatus>,
+    locations: &[ToolCallLocation],
+    content: &[ToolCallContent],
+    raw_input: Option<&serde_json::Value>,
+    raw_output: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let view = views.entry(id.to_string()).or_default();
+    if name.is_some() {
+        view.name = name;
+    }
+    if title.is_some() {
+        view.title = title;
+    }
+    let mut lines = Vec::new();
+    if let Some(status) = status {
+        let label = view.name.as_deref().or(view.title.as_deref()).unwrap_or(id);
+        lines.push(format!("[tool] {} ({})", label, status_label(&status)));
+    }
+    if let Some(kind) = kind {
+        let label = kind_label(&kind);
+        if view.kind.is_none() {
+            view.kind = Some(label);
+            lines.push(format!("{DIM}  kind: {label}{RESET}"));
+        }
+    }
+    if !locations.is_empty() {
+        let paths: Vec<String> = locations
+            .iter()
+            .map(|l| match l.line {
+                Some(line) => format!("{}:{}", l.path.display(), line),
+                None => l.path.display().to_string(),
+            })
+            .collect();
+        lines.push(format!("{DIM}  at : {}{RESET}", paths.join(", ")));
+    }
+    if let Some(input) = raw_input {
+        let rendered = truncate_json(input, 2000);
+        if view.last_input.as_deref() != Some(rendered.as_str()) {
+            view.last_input = Some(rendered.clone());
+            lines.push(format!("{DIM}  in : {rendered}{RESET}"));
+        }
+    }
+    let output = content
+        .iter()
+        .find_map(|c| match c {
+            ToolCallContent::Content(c) => {
+                let text = content_to_string(&c.content);
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => None,
+        })
+        .or_else(|| raw_output.map(|v| v.to_string()));
+    if let Some(output) = output {
+        let rendered = truncate_str(&output, 2000);
+        if view.last_output.as_deref() != Some(rendered.as_str()) {
+            view.last_output = Some(rendered.clone());
+            lines.push(format!("{DIM}  out: {rendered}{RESET}"));
+        }
+    }
+    lines
 }
 
 /// Frame-paced stdout writer. Incoming chunks are queued and drained by a
@@ -199,7 +313,7 @@ impl Output {
 async fn process_update(
     output: &mut Output,
     update: agent_client_protocol::SessionMessage,
-    title_map: &mut HashMap<String, String>,
+    views: &mut HashMap<String, ToolView>,
 ) -> Result<bool> {
     match update {
         agent_client_protocol::SessionMessage::SessionMessage(message) => {
@@ -220,54 +334,35 @@ async fn process_update(
                             }
                         }
                         SessionUpdate::ToolCall(tc) => {
-                            // Record the title for this tool call id.
-                            title_map.insert(
-                                tc.tool_call_id.0.to_string(),
-                                tc.title.clone(),
-                            );
-                            output.line(&format!(
-                                "[tool] {} ({})",
-                                tc.title,
-                                status_label(&tc.status)
-                            ));
-                            if let Some(input) = &tc.raw_input {
-                                output.line(&format!(
-                                    "{DIM}  in : {}{RESET}",
-                                    truncate_json(input, 2000)
-                                ));
+                            for line in render_tool(
+                                views,
+                                &tc.tool_call_id.0,
+                                tc.name.clone(),
+                                Some(tc.title.clone()),
+                                Some(tc.kind),
+                                Some(tc.status),
+                                &tc.locations,
+                                &tc.content,
+                                tc.raw_input.as_ref(),
+                                tc.raw_output.as_ref(),
+                            ) {
+                                output.line(&line);
                             }
                         }
                         SessionUpdate::ToolCallUpdate(u) => {
-                            // If the update carries a title, record it.
-                            if let Some(ref title) = u.fields.title {
-                                title_map.insert(
-                                    u.tool_call_id.0.to_string(),
-                                    title.clone(),
-                                );
-                            }
-                            let display_name = title_map
-                                .get(u.tool_call_id.0.as_ref())
-                                .cloned()
-                                .unwrap_or_else(|| u.tool_call_id.0.to_string());
-
-                            if let Some(status) = u.fields.status {
-                                output.line(&format!(
-                                    "[tool] {} ({})",
-                                    display_name,
-                                    status_label(&status)
-                                ));
-                            }
-                            if let Some(input) = &u.fields.raw_input {
-                                output.line(&format!(
-                                    "{DIM}  in : {}{RESET}",
-                                    truncate_json(input, 2000)
-                                ));
-                            }
-                            if let Some(out) = &u.fields.raw_output {
-                                output.line(&format!(
-                                    "{DIM}  out: {}{RESET}",
-                                    truncate_json(out, 2000)
-                                ));
+                            for line in render_tool(
+                                views,
+                                &u.tool_call_id.0,
+                                u.fields.name.clone(),
+                                u.fields.title.clone(),
+                                u.fields.kind,
+                                u.fields.status,
+                                u.fields.locations.as_deref().unwrap_or(&[]),
+                                u.fields.content.as_deref().unwrap_or(&[]),
+                                u.fields.raw_input.as_ref(),
+                                u.fields.raw_output.as_ref(),
+                            ) {
+                                output.line(&line);
                             }
                         }
                         _ => {}
@@ -330,7 +425,7 @@ fn read_input() -> Result<Option<String>> {
 
 /// Run the interactive REPL loop.
 async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
-    let mut title_map: HashMap<String, String> = HashMap::new();
+    let mut views: HashMap<String, ToolView> = HashMap::new();
     loop {
         let input = match read_input()? {
             Some(s) if s.is_empty() => continue,
@@ -344,7 +439,7 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
         let mut output = Output::new();
         loop {
             let update = session.read_update().await?;
-            if process_update(&mut output, update, &mut title_map).await? {
+            if process_update(&mut output, update, &mut views).await? {
                 break;
             }
         }

@@ -593,11 +593,15 @@ impl StreamIncrementer {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for frag in self.tool_calls.values() {
             let input = parse_arguments(&frag.arguments);
-            blocks.push(ContentBlock::ToolUse(ToolUseBlock::new(
-                frag.id.clone(),
-                frag.name.clone(),
-                input,
-            )));
+            let mut tool_use = ToolUseBlock::new(frag.id.clone(), frag.name.clone(), input);
+            if tool_use.input.is_empty() && !frag.arguments.is_empty() {
+                // The gateway streamed arguments that are not a JSON object
+                // (or not valid JSON at all): keep the raw text so the
+                // parameters still reach the event stream instead of being
+                // silently dropped.
+                tool_use.content = Some(frag.arguments.clone());
+            }
+            blocks.push(ContentBlock::ToolUse(tool_use));
         }
         if blocks.is_empty() && self.usage.is_none() {
             return None;

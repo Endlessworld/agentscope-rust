@@ -954,16 +954,25 @@ async fn model_call_impl(
                 }
                 ContentBlock::ToolUse(tu) => {
                     block_lifecycle.start_tool_call(&tu.id, &tu.name, &mut emit);
-                    // Emit ToolCallDelta for incremental tool call parameter content.
-                    if let Some(ref content) = tu.content {
-                        if !content.is_empty() {
-                            let mut fields = JsonMap::new();
-                            fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-                            fields.insert("tool_call_id".to_string(), serde_json::Value::String(tu.id.clone()));
-                            fields.insert("tool_name".to_string(), serde_json::Value::String(tu.name.clone()));
-                            fields.insert("delta".to_string(), serde_json::Value::String(content.clone()));
-                            emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallDelta, fields)));
-                        }
+                    // Emit ToolCallDelta carrying the tool-call arguments.
+                    // Providers that stream argument fragments expose them in
+                    // `content`; OpenAI-compatible providers only flush a fully
+                    // parsed tool call at end-of-stream, so the arguments live
+                    // in `input` and are re-serialized here — otherwise
+                    // downstream consumers never see the parameters.
+                    let delta = match tu.content.as_deref().filter(|c| !c.is_empty()) {
+                        Some(content) => Some(content.to_string()),
+                        None => serde_json::to_string(&tu.input)
+                            .ok()
+                            .filter(|s| s != "{}"),
+                    };
+                    if let Some(delta) = delta {
+                        let mut fields = JsonMap::new();
+                        fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+                        fields.insert("tool_call_id".to_string(), serde_json::Value::String(tu.id.clone()));
+                        fields.insert("tool_name".to_string(), serde_json::Value::String(tu.name.clone()));
+                        fields.insert("delta".to_string(), serde_json::Value::String(delta));
+                        emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallDelta, fields)));
                     }
                 }
                 _ => {}
@@ -1491,6 +1500,56 @@ mod tests {
             .collect();
         assert!(!deltas.is_empty(), "expected at least one TEXT_BLOCK_DELTA; got {events:?}");
         assert_eq!(deltas.join(""), "hello world");
+    }
+
+    #[tokio::test]
+    async fn stream_events_emits_tool_call_arguments_as_delta() {
+        // OpenAI-compatible providers flush a fully parsed tool call at
+        // end-of-stream (no incremental `content`), so the arguments must still
+        // reach the stream as a ToolCallDelta — otherwise downstream consumers
+        // (e.g. the ACP CLI) render empty tool-call input.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("the answer is 3"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-args-delta")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let events: Vec<AgentEvent> = agent
+            .stream_events(
+                vec![Msg::user("compute")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let args: Vec<String> = events
+            .iter()
+            .filter(|ev| ev.event_type() == AgentEventType::ToolCallDelta)
+            .filter_map(|ev| {
+                ev.data().fields.get("delta").and_then(|v| v.as_str()).map(|s| s.to_string())
+            })
+            .collect();
+        assert_eq!(args.len(), 1, "expected exactly one ToolCallDelta; got {args:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&args[0]).unwrap();
+        assert_eq!(parsed["a"], serde_json::json!(1));
+        assert_eq!(parsed["b"], serde_json::json!(2));
     }
 
     #[tokio::test]

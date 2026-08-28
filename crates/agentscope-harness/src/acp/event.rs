@@ -4,9 +4,13 @@
 //! `AgiHarnessAgent`: maps text/thinking deltas and tool-call progress into ACP
 //! session updates.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, MessageId, SessionNotification, SessionUpdate, TextContent, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, ContentChunk, MessageId, SessionId, SessionNotification, SessionUpdate,
+    TextContent, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use agentscope_core::event::{AgentEvent, AgentEventType};
 
@@ -68,7 +72,7 @@ fn human_title(name: &str) -> String {
 /// deltas of one assistant message; without it many clients refuse to render
 /// thoughts / tool calls that belong to the same message.
 pub fn message_chunk(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    session_id: impl Into<SessionId>,
     text: String,
     message_id: Option<MessageId>,
 ) -> SessionNotification {
@@ -81,7 +85,7 @@ pub fn message_chunk(
 
 /// Emits a thinking/reasoning chunk update.
 pub fn thought_chunk(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    session_id: impl Into<SessionId>,
     text: String,
     message_id: Option<MessageId>,
 ) -> SessionNotification {
@@ -92,18 +96,88 @@ pub fn thought_chunk(
     SessionNotification::new(session_id, SessionUpdate::AgentThoughtChunk(chunk))
 }
 
+/// Argument keys whose value is a file path. Used to derive `locations` so
+/// clients can offer "follow-along" navigation to the files the agent touches.
+const PATH_ARG_KEYS: &[&str] = &[
+    "path", "file", "file_path", "filePath", "filepath", "filename", "dir", "directory",
+    "target", "source",
+];
+
+/// Derives ACP `locations` from the tool-call arguments.
+fn locations_from(raw_input: &str) -> Vec<ToolCallLocation> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_input) else {
+        return Vec::new();
+    };
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let line = object
+        .get("line")
+        .or_else(|| object.get("line_number"))
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let mut locations = Vec::new();
+    for key in PATH_ARG_KEYS {
+        if let Some(p) = object.get(*key).and_then(|v| v.as_str()) {
+            if !p.trim().is_empty() {
+                locations.push(ToolCallLocation::new(PathBuf::from(p)).line(line));
+            }
+        }
+    }
+    locations
+}
+
+/// Wraps a tool's text output as ACP `content` so clients can render it in the
+/// tool-call body, not only as a raw JSON blob.
+fn content_from(text: &str) -> Vec<ToolCallContent> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+        TextContent::new(text),
+    )))]
+}
+
+/// Parses an accumulated string as JSON if possible, else wraps it as a string
+/// value. Returns `None` for empty payloads so clients never render `""`.
+fn json_value_from(s: String) -> Option<serde_json::Value> {
+    if s.is_empty() {
+        return None;
+    }
+    Some(serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)))
+}
+
+/// `Some` only for non-empty collections: ACP updates *overwrite* collections,
+/// so sending an empty one would erase values already reported to the client.
+fn non_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 /// Builds a `ToolCall` (creation) update.
+///
+/// Carries every field a client needs to render the call up front: the programmatic
+/// `name`, the inferred `kind`, the arguments known so far as `raw_input` and the
+/// `locations` derived from them.
 pub fn tool_call_start(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    session_id: impl Into<SessionId>,
     id: String,
-    title: String,
+    name: String,
     kind: ToolKind,
     raw_input: Option<serde_json::Value>,
 ) -> SessionNotification {
-    let mut tc = ToolCall::new(id, title)
+    let mut tc = ToolCall::new(id, human_title(&name))
+        .name(name)
         .kind(kind)
-        .status(ToolCallStatus::InProgress);
+        .status(ToolCallStatus::Pending);
     if let Some(v) = raw_input {
+        let locations = locations_from(&v.to_string());
+        if !locations.is_empty() {
+            tc = tc.locations(locations);
+        }
         tc = tc.raw_input(v);
     }
     SessionNotification::new(session_id, SessionUpdate::ToolCall(tc))
@@ -111,69 +185,59 @@ pub fn tool_call_start(
 
 /// Builds a `ToolCallUpdate` (progress/completion) update.
 pub fn tool_call_update(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    session_id: impl Into<SessionId>,
     id: String,
-    kind: ToolKind,
-    status: ToolCallStatus,
+    fields: ToolCallUpdateFields,
 ) -> SessionNotification {
     SessionNotification::new(
         session_id,
-        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-            id,
-            ToolCallUpdateFields::new().kind(kind).status(status),
-        )),
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
     )
 }
 
-/// Maps a core tool-call event into the appropriate ACP session update.
-///
-/// Handles:
-/// - `ToolCallStart` → `ToolCall` (creation with InProgress status)
-/// - `ToolCallEnd` → `ToolCallUpdate` (completed status)
-/// - `ToolResultStart` → `ToolCallUpdate` (in-progress status, tool execution started)
-/// - `ToolResultEnd` → `ToolCallUpdate` (completed/failed status based on state)
-///
-/// Returns `None` for events that don't map to a tool-call update.
-pub fn map_tool_event(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
-    ev: &AgentEvent,
-) -> Option<SessionNotification> {
-    let sid = session_id.into();
-    match ev.event_type() {
-        AgentEventType::ToolCallStart => {
-            let data = ev.data();
-            let id = data.fields.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = data.fields.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool").to_string();
-            Some(tool_call_start(sid.clone(), id, human_title(&name), tool_kind_for(&name), None))
-        }
-        AgentEventType::ToolCallEnd => {
-            let data = ev.data();
-            let id = data.fields.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = data.fields.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool").to_string();
-            Some(tool_call_update(sid, id, tool_kind_for(&name), ToolCallStatus::Completed))
-        }
-        AgentEventType::ToolResultEnd => {
-            let data = ev.data();
-            let id = data.fields.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = data.fields.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool").to_string();
-            let state = data.fields.get("state").and_then(|v| v.as_str()).unwrap_or("SUCCESS");
-            let status = match state {
-                "ERROR" | "DENIED" => ToolCallStatus::Failed,
-                _ => ToolCallStatus::Completed,
-            };
-            Some(tool_call_update(sid, id, tool_kind_for(&name), status))
-        }
-        _ => None,
-    }
+/// Update fields for a tool call whose arguments are (at least partially) known:
+/// streams `raw_input` plus the `locations` derived from it.
+fn input_fields(name: &str, raw_input: &str) -> ToolCallUpdateFields {
+    ToolCallUpdateFields::new()
+        .title(human_title(name))
+        .kind(tool_kind_for(name))
+        .raw_input(json_value_from(raw_input.to_string()))
+        .locations(non_empty(locations_from(raw_input)))
+}
+
+/// Update fields for the terminal state of a tool call: final `status` plus the
+/// arguments and the output (both as `raw_output` and as structured `content`).
+fn result_fields(
+    name: &str,
+    status: ToolCallStatus,
+    raw_input: &str,
+    raw_output: &str,
+) -> ToolCallUpdateFields {
+    ToolCallUpdateFields::new()
+        .title(human_title(name))
+        .kind(tool_kind_for(name))
+        .status(status)
+        .raw_input(json_value_from(raw_input.to_string()))
+        .locations(non_empty(locations_from(raw_input)))
+        .raw_output(json_value_from(raw_output.to_string()))
+        .content(non_empty(content_from(raw_output)))
+}
+
+/// Accumulated state of a single tool call.
+#[derive(Default)]
+struct ToolCallAcc {
+    name: String,
+    input: String,
+    output: String,
+    /// `false` until the ACP `ToolCall` creation notification has been sent.
+    created: bool,
 }
 
 /// Stateful mapper that accumulates streamed tool-call inputs (`ToolCallDelta`)
-/// and outputs (`ToolResultTextDelta`) per tool call, then attaches them as
-/// `raw_input` / `raw_output` on the corresponding `ToolCallUpdate`.
+/// and outputs (`ToolResultTextDelta`) per tool call and pushes them as ACP
+/// `ToolCall` / `ToolCallUpdate` notifications.
 pub struct ToolEventMapper {
-    inputs: std::collections::HashMap<String, String>,
-    outputs: std::collections::HashMap<String, String>,
-    names: std::collections::HashMap<String, String>,
+    calls: HashMap<String, ToolCallAcc>,
     message_id: Option<MessageId>,
 }
 
@@ -186,9 +250,7 @@ impl Default for ToolEventMapper {
 impl ToolEventMapper {
     pub fn new() -> Self {
         Self {
-            inputs: std::collections::HashMap::new(),
-            outputs: std::collections::HashMap::new(),
-            names: std::collections::HashMap::new(),
+            calls: HashMap::new(),
             message_id: None,
         }
     }
@@ -202,9 +264,16 @@ impl ToolEventMapper {
 
     /// Map one core event; returns a notification when there is something
     /// visible to send, or `None` for pure bookkeeping events.
+    ///
+    /// The lifecycle sent to the client is:
+    /// - `ToolCall` creation (`Pending`) as soon as the arguments are known
+    /// - `ToolCallUpdate`s streaming `raw_input` / `locations` while the model
+    ///   emits arguments
+    /// - `ToolCallUpdate` (`InProgress`) when the tool actually starts running
+    /// - `ToolCallUpdate` (`Completed` / `Failed`) with `raw_output` + `content`
     pub fn map(
         &mut self,
-        session_id: impl Into<agent_client_protocol::schema::v1::SessionId> + Clone,
+        session_id: impl Into<SessionId> + Clone,
         ev: &AgentEvent,
     ) -> Option<SessionNotification> {
         let sid = session_id.into();
@@ -216,6 +285,9 @@ impl ToolEventMapper {
             .unwrap_or("")
             .to_string();
         match ev.event_type() {
+            // Creation is deferred until the arguments are known (normally the
+            // first `ToolCallDelta`), so clients can render the parameters as
+            // soon as the tool call appears instead of waiting for an update.
             AgentEventType::ToolCallStart => {
                 let name = data
                     .fields
@@ -223,45 +295,65 @@ impl ToolEventMapper {
                     .and_then(|v| v.as_str())
                     .unwrap_or("tool")
                     .to_string();
-                self.inputs.entry(id.clone()).or_default();
-                self.outputs.entry(id.clone()).or_default();
-                self.names.entry(id.clone()).or_insert_with(|| name.clone());
-                // Attach the accumulated tool-call arguments as `raw_input` at
-                // creation so clients can render the parameters immediately.
-                let raw = self.inputs.get(&id).cloned().map(json_value_from);
-                Some(tool_call_start(
-                    sid.clone(),
-                    id,
-                    human_title(&name),
-                    tool_kind_for(&name),
-                    raw,
-                ))
-            }
-            AgentEventType::ToolCallDelta => {
-                if let Some(buf) = self.inputs.get_mut(&id) {
-                    if let Some(d) = data.fields.get("delta").and_then(|v| v.as_str()) {
-                        buf.push_str(d);
-                    }
-                }
+                self.calls.entry(id).or_insert_with(|| ToolCallAcc {
+                    name,
+                    ..Default::default()
+                });
                 None
             }
+            AgentEventType::ToolCallDelta => {
+                let delta = data.fields.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                let acc = self.calls.get_mut(&id)?;
+                if delta.is_empty() {
+                    return None;
+                }
+                acc.input.push_str(delta);
+                if !acc.created {
+                    acc.created = true;
+                    let name = acc.name.clone();
+                    let raw_input = json_value_from(acc.input.clone());
+                    return Some(tool_call_start(
+                        sid,
+                        id,
+                        name.clone(),
+                        tool_kind_for(&name),
+                        raw_input,
+                    ));
+                }
+                let (name, input) = (acc.name.clone(), acc.input.clone());
+                Some(tool_call_update(sid, id, input_fields(&name, &input)))
+            }
             AgentEventType::ToolCallEnd => {
-                let input = self.inputs.remove(&id);
-                let name = self.names.get(&id).cloned().unwrap_or_else(|| "tool".to_string());
-                Some(tool_call_update_io(
-                    sid.clone(),
+                let acc = self.calls.get_mut(&id)?;
+                if !acc.created {
+                    // A parameterless tool call: no delta ever arrives, so the
+                    // creation notification must be sent here.
+                    acc.created = true;
+                    let name = acc.name.clone();
+                    let kind = tool_kind_for(&name);
+                    return Some(tool_call_start(sid, id, name, kind, None));
+                }
+                let (name, input) = (acc.name.clone(), acc.input.clone());
+                Some(tool_call_update(sid, id, input_fields(&name, &input)))
+            }
+            AgentEventType::ToolResultStart => {
+                // The tool is actually executing now.
+                let acc = self.calls.get_mut(&id)?;
+                if !acc.created {
+                    acc.created = true;
+                    let name = acc.name.clone();
+                    let kind = tool_kind_for(&name);
+                    return Some(tool_call_start(sid, id, name, kind, None));
+                }
+                Some(tool_call_update(
+                    sid,
                     id,
-                    tool_kind_for(&name),
-                    ToolCallStatus::Completed,
-                    input,
-                    None,
+                    ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
                 ))
             }
             AgentEventType::ToolResultTextDelta => {
-                if let Some(buf) = self.outputs.get_mut(&id) {
-                    if let Some(d) = data.fields.get("delta").and_then(|v| v.as_str()) {
-                        buf.push_str(d);
-                    }
+                if let Some(d) = data.fields.get("delta").and_then(|v| v.as_str()) {
+                    self.calls.get_mut(&id)?.output.push_str(d);
                 }
                 None
             }
@@ -275,48 +367,18 @@ impl ToolEventMapper {
                     "ERROR" | "DENIED" => ToolCallStatus::Failed,
                     _ => ToolCallStatus::Completed,
                 };
-                let input = self.inputs.remove(&id);
-                let output = self.outputs.remove(&id);
-                let name = self.names.get(&id).cloned().unwrap_or_else(|| "tool".to_string());
-                Some(tool_call_update_io(
-                    sid.clone(),
-                    id,
-                    tool_kind_for(&name),
-                    status,
-                    input,
-                    output,
-                ))
+                let acc = self.calls.get_mut(&id)?;
+                let (name, input, output) = (
+                    acc.name.clone(),
+                    acc.input.clone(),
+                    acc.output.clone(),
+                );
+                self.calls.remove(&id);
+                Some(tool_call_update(sid, id, result_fields(&name, status, &input, &output)))
             }
             _ => None,
         }
     }
-}
-
-/// Parses an accumulated string as JSON if possible, else wraps it as a string value.
-fn json_value_from(s: String) -> serde_json::Value {
-    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
-}
-
-/// Builds a `ToolCallUpdate` carrying optional raw input / output payloads.
-fn tool_call_update_io(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
-    id: String,
-    kind: ToolKind,
-    status: ToolCallStatus,
-    raw_input: Option<String>,
-    raw_output: Option<String>,
-) -> SessionNotification {
-    let mut fields = ToolCallUpdateFields::new().kind(kind).status(status);
-    if let Some(v) = raw_input.map(json_value_from) {
-        fields = fields.raw_input(v);
-    }
-    if let Some(v) = raw_output.map(json_value_from) {
-        fields = fields.raw_output(v);
-    }
-    SessionNotification::new(
-        session_id,
-        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
-    )
 }
 
 /// Maps the final agent result into an ACP message chunk so that answers which
@@ -325,7 +387,7 @@ fn tool_call_update_io(
 ///
 /// Returns `None` when the reply carries no text.
 pub fn map_result_event(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    session_id: impl Into<SessionId>,
     ev: &AgentEvent,
     message_id: Option<MessageId>,
 ) -> Option<SessionNotification> {
@@ -341,7 +403,7 @@ pub fn map_result_event(
 
 /// Maps a core text/thinking delta event into an ACP message/thought chunk.
 pub fn map_delta_event(
-    session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
+    session_id: impl Into<SessionId>,
     ev: &AgentEvent,
     message_id: Option<MessageId>,
 ) -> Option<SessionNotification> {
@@ -402,13 +464,124 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_start_maps_to_tool_call() {
+    fn tool_call_creation_waits_for_arguments_then_carries_them() {
+        let mut mapper = ToolEventMapper::new();
+        let mut start = serde_json::Map::new();
+        start.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        start.insert("tool_name".to_string(), serde_json::json!("read_file"));
+        // Creation is deferred: nothing is sent until the arguments are known,
+        // so the client can render the parameters with the tool call itself.
+        assert!(mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallStart, start))
+            .is_none());
+
+        let mut delta = serde_json::Map::new();
+        delta.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        delta.insert("delta".to_string(), serde_json::json!("{\"path\":\"a.txt\"}"));
+        let notif = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta))
+            .expect("creation emitted once the arguments are known");
+        match &notif.update {
+            SessionUpdate::ToolCall(tc) => {
+                assert_eq!(tc.title, "Read File");
+                assert_eq!(tc.name.as_deref(), Some("read_file"));
+                assert_eq!(tc.status, ToolCallStatus::Pending);
+                assert_eq!(tc.raw_input, Some(serde_json::json!({"path": "a.txt"})));
+                assert_eq!(tc.locations.len(), 1, "path argument must become a location");
+                assert_eq!(tc.locations[0].path, std::path::PathBuf::from("a.txt"));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_lifecycle_streams_input_then_output() {
+        let mut mapper = ToolEventMapper::new();
         let mut fields = serde_json::Map::new();
         fields.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
         fields.insert("tool_name".to_string(), serde_json::json!("read_file"));
-        let ev = AgentEvent::with_fields(AgentEventType::ToolCallStart, fields);
-        let notif = map_tool_event(sid(), &ev).expect("maps to tool call");
-        assert!(matches!(notif.update, SessionUpdate::ToolCall(_)));
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallStart, fields));
+
+        // Arguments arrive as deltas; later ones are streamed as updates.
+        for chunk in [r#"{"path":"a.t"#, r#"xt","line":3}"#] {
+            let mut delta = serde_json::Map::new();
+            delta.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+            delta.insert("delta".to_string(), serde_json::json!(chunk));
+            mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta));
+        }
+
+        // The model finished emitting arguments: the tool has not run yet.
+        let mut end = serde_json::Map::new();
+        end.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        let notif = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallEnd, end))
+            .expect("maps to tool call update");
+        match &notif.update {
+            SessionUpdate::ToolCallUpdate(u) => {
+                assert_eq!(u.fields.title.as_deref(), Some("Read File"));
+                assert_eq!(
+                    u.fields.raw_input,
+                    Some(serde_json::json!({"path": "a.txt", "line": 3}))
+                );
+                assert_eq!(u.fields.locations.as_ref().map(|l| l.len()), Some(1));
+                assert!(u.fields.status.is_none(), "the tool has not started yet");
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+
+        // Execution starts.
+        let mut started = serde_json::Map::new();
+        started.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        let notif = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultStart, started))
+            .expect("maps to in-progress update");
+        match &notif.update {
+            SessionUpdate::ToolCallUpdate(u) => {
+                assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+
+        // Output is accumulated and attached on completion, together with the
+        // arguments (so the final update fully describes the call).
+        let mut out = serde_json::Map::new();
+        out.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        out.insert("delta".to_string(), serde_json::json!("file contents"));
+        assert!(mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultTextDelta, out))
+            .is_none());
+
+        let mut done = serde_json::Map::new();
+        done.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        done.insert("state".to_string(), serde_json::json!("SUCCESS"));
+        let notif = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultEnd, done))
+            .expect("maps to completion update");
+        match &notif.update {
+            SessionUpdate::ToolCallUpdate(u) => {
+                assert_eq!(u.fields.status, Some(ToolCallStatus::Completed));
+                assert_eq!(
+                    u.fields.raw_input,
+                    Some(serde_json::json!({"path": "a.txt", "line": 3}))
+                );
+                assert_eq!(u.fields.raw_output, Some(serde_json::json!("file contents")));
+                assert_eq!(u.fields.content.as_ref().map(|c| c.len()), Some(1));
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_tool_call_id_produces_no_notification() {
+        // Tools hidden from the UI (`__` prefix) never emit `ToolCallStart`, so
+        // their deltas / results must not create a tool call out of thin air.
+        let mut mapper = ToolEventMapper::new();
+        let mut delta = serde_json::Map::new();
+        delta.insert("tool_call_id".to_string(), serde_json::json!("call_x"));
+        delta.insert("delta".to_string(), serde_json::json!("{}"));
+        assert!(mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta))
+            .is_none());
     }
 
     #[test]

@@ -25,4 +25,6 @@ sha2.workspace = true
 rusqlite.workspace = true
 rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["client", "stdio", "macros"] }
 
-agent-client-protocol = { path = "E:/local-github/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0" }
+# `unstable_tool_call_name` exposes the programmatic `name` field on tool calls;
+# clients that do not know it simply ignore it.
+agent-client-protocol = { path = "E:/local-github/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0", features = ["unstable_tool_call_name"] }
