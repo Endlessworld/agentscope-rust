@@ -65,3 +65,11 @@ cargo clippy -p agentscope-harness
 - `AgentSpawnTool` and Docker are large; deliver a compiling skeleton + tests, then
   deepen in follow-up passes rather than blocking the crate.
 - Each completed item flips its tracker row to ✅ and is committed separately.
+
+## Progress Log
+
+- 2026-08-24: T8 PlanModeTools + T9 WaitAsyncResultsTool (barrier mode) landed; M6 SandboxLifecycleMiddleware verified already implemented; AsyncToolRegistry gained list_session. Baseline: cargo test all green (core 119, harness 244). T1 AgentSpawnTool thin slice landed (5 tests).
+- Next: B1 Docker sandbox; deepen AgentSpawnTool (streaming events, remote targets).
+- 2026-08-24 (2): M1 agent/team landed: TeamClient trait + data model + LocalTeamClient (versioned CAS, mailboxes, wakeups, role clipping), 7 tests. Baseline core 119 + harness 256 = 375. Next: T3 TeamTool + M5 TeamsMiddleware on top of team/, B1 Docker sandbox.
+- 2026-08-24 (3): T3 TeamTool landed: 10 ops dispatched over TeamClient with TeamContext role clipping, 4 tests. Baseline core 119 + harness 260 = 379. P1 remaining: M5 TeamsMiddleware. Next: M5 on top of team/ + team.rs, then B1 Docker sandbox.
+- 2026-08-24 (4): M5 TeamsMiddleware landed: <agent-teams> system-prompt section + per-turn mailbox drain as <team-message> assistant tail; 4 tests. P1 complete (9/9). Baseline core 119 + harness 264 = 383. Next: B1 Docker sandbox (last P0).

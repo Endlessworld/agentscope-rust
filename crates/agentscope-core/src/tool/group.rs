@@ -78,7 +78,7 @@ pub struct ToolGroupManager {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Inner {
     tool_groups: HashMap<String, ToolGroup>,
     /// Reverse index: tool name -> set of group names containing it.
@@ -89,6 +89,13 @@ struct Inner {
 
 impl ToolGroupManager {
     pub fn new() -> Self { Self::default() }
+
+    /// Returns an independent deep copy (Java `copy` semantics): mutations on
+    /// the copy never affect the original. `Clone` deliberately shares state.
+    pub fn copy(&self) -> ToolGroupManager {
+        let inner = self.inner.lock().unwrap().clone();
+        ToolGroupManager { inner: Arc::new(Mutex::new(inner)) }
+    }
 
     /// Creates a group and registers it as active/inactive.
     pub fn create_tool_group(&self, name: &str, description: &str, active: bool) {

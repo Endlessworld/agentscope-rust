@@ -49,6 +49,7 @@ pub use filesystem::{
 };
 pub use tool::{
     command_with_working_directory, AgentGenerateTool, FilesystemTool, Level, MatchRange,
-    MemoryGetTool, MemorySaveTool, MemorySearchTool, SearchResult, ShellExecuteTool, TaskCancelTool,
-    TaskListTool, TaskOutputTool, TaskTool,
+    MemoryGetTool, MemorySaveTool, MemorySearchTool, SearchResult, SessionHistoryTool,
+    SessionListTool, SessionSearchTool, ShellExecuteTool, TaskCancelTool,
+    TaskListTool, TaskOutputTool, TaskTool, WebFetchTool, WebSearchTool,
 };

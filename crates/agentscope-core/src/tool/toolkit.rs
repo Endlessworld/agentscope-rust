@@ -20,6 +20,10 @@ pub struct Toolkit {
     config: ToolkitConfig,
     executor: ToolExecutor,
     presets: Arc<std::sync::Mutex<HashMap<String, JsonMap>>>,
+    /// Tool name → originating MCP client (Java `RegisteredToolFunction.mcpClientName`).
+    mcp_client_names: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Tool name → sub-agent entry point (Java `RegisteredToolFunction.subAgent`).
+    sub_agent_names: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl Default for Toolkit {
@@ -30,6 +34,8 @@ impl Default for Toolkit {
             config: ToolkitConfig::default(),
             executor: ToolExecutor::new(),
             presets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mcp_client_names: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sub_agent_names: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -63,16 +69,37 @@ impl Toolkit {
 
     /// Returns a copy of this toolkit (shared tool instances, independent
     /// grouping and configuration).
+    ///
+    /// Toolkit-aware tools (Java `ToolkitAware`) are deep-copy rebound to the
+    /// new copy via [`Tool::rebind_toolkit`], so meta tools such as
+    /// `reset_equipped_tools` mutate the owning snapshot, never the original.
     pub fn copy(&self) -> Toolkit {
         let tools = self.tools.lock().unwrap().clone();
         let presets = self.presets.lock().unwrap().clone();
-        Toolkit {
+        let mcp_client_names = self.mcp_client_names.lock().unwrap().clone();
+        let sub_agent_names = self.sub_agent_names.lock().unwrap().clone();
+        let copied = Toolkit {
             tools: Arc::new(std::sync::Mutex::new(tools)),
-            groups: self.groups.clone(),
+            groups: self.groups.copy(),
             config: self.config.clone(),
             executor: self.executor.clone(),
             presets: Arc::new(std::sync::Mutex::new(presets)),
+            mcp_client_names: Arc::new(std::sync::Mutex::new(mcp_client_names)),
+            sub_agent_names: Arc::new(std::sync::Mutex::new(sub_agent_names)),
+        };
+        let rebinds: Vec<(String, Arc<dyn Tool>)> = copied
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(name, tool)| {
+                tool.rebind_toolkit(&copied).map(|t| (name.clone(), t))
+            })
+            .collect();
+        for (name, tool) in rebinds {
+            copied.tools.lock().unwrap().insert(name, tool);
         }
+        copied
     }
 
     // ------------------------------------------------------------------
@@ -223,6 +250,30 @@ impl Toolkit {
             }
             None => input,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Registration metadata (mcpClientName / subAgent)
+    // ------------------------------------------------------------------
+
+    /// Tags a tool with its originating MCP client name.
+    pub fn set_mcp_client_name(&self, tool: &str, client: String) {
+        self.mcp_client_names.lock().unwrap().insert(tool.to_string(), client);
+    }
+
+    /// Returns the MCP client a tool originates from, if any.
+    pub fn mcp_client_name(&self, tool: &str) -> Option<String> {
+        self.mcp_client_names.lock().unwrap().get(tool).cloned()
+    }
+
+    /// Tags a tool as a sub-agent entry point.
+    pub fn set_sub_agent_name(&self, tool: &str, agent: String) {
+        self.sub_agent_names.lock().unwrap().insert(tool.to_string(), agent);
+    }
+
+    /// Returns the sub-agent behind a tool, if any.
+    pub fn sub_agent_name(&self, tool: &str) -> Option<String> {
+        self.sub_agent_names.lock().unwrap().get(tool).cloned()
     }
 
     // ------------------------------------------------------------------

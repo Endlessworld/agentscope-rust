@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::message::{JsonMap, ToolResultBlock, ToolUseBlock};
 use crate::model::ToolSchema;
+use std::sync::Arc;
 
 use super::emitter::ToolEmitter;
 
@@ -68,6 +69,13 @@ pub trait Tool: Send + Sync {
         }
         ToolSchema::new(self.name(), self.description()).parameters(parameters)
     }
+    /// Toolkit-aware deep-copy rebinding hook, mirroring Java `ToolkitAware`.
+    /// When a [`Toolkit`](super::toolkit::Toolkit) is copied, aware tools are
+    /// asked to rebind themselves to the new copy. Returns `None` by default,
+    /// meaning the tool is not toolkit-aware and is shared as-is.
+    fn rebind_toolkit(&self, _toolkit: &super::toolkit::Toolkit) -> Option<std::sync::Arc<dyn Tool>> {
+        None
+    }
 }
 
 /// A wrapper for a function-based tool.
@@ -77,6 +85,7 @@ pub struct FunctionTool {
     parameters: serde_json::Value,
     read_only: bool,
     handler: Box<dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync>,
+    rebind: Option<Box<dyn Fn(&super::toolkit::Toolkit) -> Arc<dyn Tool> + Send + Sync>>,
 }
 
 impl FunctionTool {
@@ -93,12 +102,24 @@ impl FunctionTool {
             parameters,
             read_only: false,
             handler,
+            rebind: None,
         }
     }
 
     /// Marks this tool as read-only.
     pub fn read_only(mut self, v: bool) -> Self {
         self.read_only = v;
+        self
+    }
+
+    /// Marks this tool as toolkit-aware: when the owning toolkit is copied,
+    /// `factory` builds the rebound instance against the new copy (Java
+    /// `ToolkitAware.rebindToolkit` deep-copy semantics).
+    pub fn toolkit_aware(
+        mut self,
+        factory: Box<dyn Fn(&super::toolkit::Toolkit) -> Arc<dyn Tool> + Send + Sync>,
+    ) -> Self {
+        self.rebind = Some(factory);
         self
     }
 }
@@ -119,5 +140,11 @@ impl Tool for FunctionTool {
     }
     async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         (self.handler)(args, ctx)
+    }
+    fn rebind_toolkit(
+        &self,
+        toolkit: &super::toolkit::Toolkit,
+    ) -> Option<Arc<dyn Tool>> {
+        self.rebind.as_ref().map(|f| f(toolkit))
     }
 }

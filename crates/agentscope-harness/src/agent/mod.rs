@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod sandbox;
 pub mod skill;
 pub mod subagent;
+pub mod team;
 pub mod transcript;
 pub mod workspace;
 

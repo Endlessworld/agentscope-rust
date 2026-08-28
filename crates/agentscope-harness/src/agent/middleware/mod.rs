@@ -19,6 +19,7 @@ pub mod sandbox_lifecycle;
 pub mod skill_middleware;
 pub mod subagents;
 pub mod tool_result_eviction;
+pub mod teams;
 pub mod transcript;
 pub mod workspace_context;
 
@@ -38,6 +39,7 @@ pub use subagents::{
     render_subagent_section, SubagentsMiddleware,
 };
 pub use tool_result_eviction::{EVICTED_METADATA_KEY, ToolResultEvictionMiddleware};
+pub use teams::TeamsMiddleware;
 pub use transcript::TranscriptMiddleware;
 pub use workspace_context::WorkspaceContextMiddleware;
 

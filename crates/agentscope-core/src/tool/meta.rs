@@ -238,8 +238,17 @@ impl MetaToolFactory {
     }
 
     /// Creates the `reset_equipped_tools` meta tool.
+    ///
+    /// The returned tool is toolkit-aware: [`Toolkit::copy`] rebinds it to the
+    /// new copy so group mutations always hit the owning toolkit snapshot
+    /// (Java `ToolkitAware.rebindToolkit` semantics).
     pub fn create_reset_equipped_tools(&self) -> FunctionTool {
-        let toolkit = self.toolkit.clone();
+        Self::build_reset_equipped_tools(&self.toolkit)
+    }
+
+    /// Builds a rebound reset tool bound to `toolkit`.
+    fn build_reset_equipped_tools(toolkit: &Toolkit) -> FunctionTool {
+        let toolkit = toolkit.clone();
         let description = format!(
             "Reset your equipped tools based on your current task requirements. These tools \
 tools are organized into different groups, and you can activate/deactivate them by \
@@ -272,6 +281,9 @@ deactivate groups as soon as they are no longer needed to conserve context space
                 }
             }),
         )
+        .toolkit_aware(Box::new(|new_toolkit: &Toolkit| {
+            Arc::new(Self::build_reset_equipped_tools(new_toolkit))
+        }))
     }
 }
 

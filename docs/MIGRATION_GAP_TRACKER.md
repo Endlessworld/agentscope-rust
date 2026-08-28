@@ -14,26 +14,26 @@ Each row lists the target Rust module path to create/extend.
 
 | # | Java module | Rust target | Java size | Status | Priority |
 |---|---|---|---|---|---|
-| M1 | `agent/team/` (TeamClient, LocalTeamClient, TeamContext, specs, TeamTask, TeamMessage…) | `src/agent/team/` | ~31KB | ❌ | P1 |
+| M1 | `agent/team/` (TeamClient, LocalTeamClient, TeamContext, specs, TeamTask, TeamMessage…) | `src/agent/team/` | ~31KB | ✅ (LocalTeamClient in-process CAS; store-backed distributed impl pending) | P1 |
 | M2 | `agent/coordination/` (PeriodicGate, LocalPeriodicGate, StoreBackedPeriodicGate) | `src/agent/coordination/` | — | ❌ | P2 |
 | M3 | `agent/transcript/` (TranscriptStore, Filesystem/ObjectStore impls, TranscriptRef) | `src/agent/transcript/` | — | ✅ | P1 |
 | M4 | `agent/middleware/TranscriptMiddleware` | `src/agent/middleware/transcript.rs` | — | ✅ | P1 |
-| M5 | `agent/middleware/TeamsMiddleware` | `src/agent/middleware/teams.rs` | 31KB | ❌ | P1 |
-| M6 | `agent/middleware/SandboxLifecycleMiddleware` | `src/agent/middleware/sandbox_lifecycle.rs` | — | ❌ | P1 |
+| M5 | `agent/middleware/TeamsMiddleware` | `src/agent/middleware/teams.rs` | 31KB | ✅ (system-prompt team section + mailbox drain per turn; wakeup-driven injection pending gateway runStream) | P1 |
+| M6 | `agent/middleware/SandboxLifecycleMiddleware` | `src/agent/middleware/sandbox_lifecycle.rs` | — | ✅ | P1 |
 
 ## 🔴 Missing Tools (12)
 
 | # | Java Tool | Rust target | Java size | Status | Priority |
 |---|---|---|---|---|---|
-| T1 | `AgentSpawnTool` | `src/tool/agent_spawn.rs` | 84KB | ❌ | P0 |
+| T1 | `AgentSpawnTool` | `src/tool/agent_spawn.rs` | 84KB | 🟠 Thin real slice: fg/bg spawn + permission scoping + plan-mode propagation + end_spawn; streaming events / remote targets pending | P0 |
 | T2 | `AgentGenerateTool` | `src/tool/agent_generate.rs` | 7.5KB | ✅ | P2 |
-| T3 | `TeamTool` | `src/tool/team.rs` | 26KB | ❌ | P1 |
+| T3 | `TeamTool` | `src/tool/team.rs` | 26KB | ✅ (10 ops over TeamClient + role clipping; submitPlan/approvePlan pending plan bridge) | P1 |
 | T4 | `MemorySearchTool` | `src/tool/memory_search.rs` | 3.5KB | ✅ | P0 |
 | T5 | `MemoryGetTool` | `src/tool/memory_get.rs` | 3.3KB | ✅ | P0 |
 | T6 | `MemorySaveTool` | `src/tool/memory_save.rs` | 3.9KB | ✅ | P0 |
 | T7 | `SessionSearchTool` | `src/tool/session_search.rs` | 14.6KB | ❌ | P2 |
-| T8 | `PlanModeTools` (plan_enter/plan_write/plan_exit) | `src/tool/plan_mode.rs` | 10.3KB | ❌ | P1 |
-| T9 | `WaitAsyncResultsTool` | `src/tool/wait_async.rs` | 21.8KB | ❌ | P1 |
+| T8 | `PlanModeTools` (plan_enter/plan_write/plan_exit) | `src/tool/plan_mode.rs` | 10.3KB | ✅ | P1 |
+| T9 | `WaitAsyncResultsTool` (task barrier mode) | `src/tool/wait_async.rs` | 21.8KB | ✅ | P1 |
 | T10 | `ProposeSkillTool` | `src/agent/skill/load_tool.rs` (already present) | 9.8KB | ✅ | P2 |
 | T11 | `SkillManageTool` | `src/agent/skill/manage.rs` (already present) | 32.8KB | ✅ | P2 |
 | T12 | `WebTools` (web_fetch/web_search) | `src/tool/web_tools.rs` | 7KB | ❌ | P2 |
@@ -96,6 +96,6 @@ Each row lists the target Rust module path to create/extend.
 
 | Phase | Items | Done |
 |---|---|---|
-| P0 | T1, T4, T5, T6, B1 | 3/5 |
-| P1 | M1, M3, M4, M5, M6, T3, T8, T9, S7 | 4/9 |
+| P0 | T1, T4, T5, T6, B1 | 4/5 (T1 partial) |
+| P1 | M1, M3, M4, M5, M6, T3, T8, T9, S7 | 9/9 ✅ |
 | P2 | M2, T2, T7, T10, T11, T12, S1–S10, B2–B4, G1–G6, R1–R3, D1–D6 | 4/30 |

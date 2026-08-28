@@ -71,6 +71,12 @@ pub trait AsyncToolRegistry: Send + Sync {
     /// Mark a stale async tool record as timed out, so it is no longer returned by
     /// subsequent `find_stale` calls.
     async fn mark_timeout(&self, id: &str) -> Result<()>;
+
+    /// Lists all async tool records for `session_id`, regardless of status.
+    async fn list_session(&self, session_id: &str) -> Result<Vec<AsyncToolRecord>> {
+        let _ = session_id;
+        Ok(Vec::new())
+    }
 }
 
 /// Filesystem-backed `AsyncToolRegistry`.
@@ -229,5 +235,23 @@ impl AsyncToolRegistry for WorkspaceAsyncToolRegistry {
 
     async fn mark_timeout(&self, id: &str) -> Result<()> {
         self.update_status(id, AsyncToolRecord::TIMEOUT).await
+    }
+
+    async fn list_session(&self, session_id: &str) -> Result<Vec<AsyncToolRecord>> {
+        let dir = self.session_dir(session_id);
+        if !self.fs.exists(&self.ctx, &dir).await? {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in self.fs.ls(&self.ctx, &dir).await? {
+            if entry.is_directory || !entry.path.ends_with(".json") {
+                continue;
+            }
+            if let Some(rec) = self.read_record(&entry.path).await {
+                out.push(rec);
+            }
+        }
+        out.sort_by_key(|r| r.created_at);
+        Ok(out)
     }
 }

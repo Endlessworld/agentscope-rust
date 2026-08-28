@@ -136,3 +136,99 @@ fn reset_tool_schema_lists_meta_groups() {
     assert!(enum_list.iter().any(|v| v == "coding"));
     assert!(!enum_list.iter().any(|v| v == "ext"), "external groups not in enum");
 }
+
+// ---------------------------------------------------------------------------
+// ToolkitAware rebindToolkit deep-copy rebinding
+// ---------------------------------------------------------------------------
+
+#[test]
+fn toolkit_copy_rebinds_meta_tool_to_new_snapshot() {
+    let tk = Toolkit::new();
+    tk.create_tool_group_with_scope("coding", "code tools", false, ToolGroupScope::Meta);
+    tk.register_meta_tools();
+
+    let copy = tk.copy();
+
+    // Mutate the COPY through its rebound meta tool; the original is untouched.
+    let mut input = JsonMap::new();
+    input.insert("to_activate".to_string(), serde_json::json!(["coding"]));
+    let call = ToolUseBlock::new("m1", "reset_equipped_tools", input);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rb_block(rt.block_on(copy.call_tool(&call, ToolExecutionContext::default())));
+
+    // The rebound tool's schema enum reflects only groups present at rebind time.
+    let rebound_schema = copy.get_tool("reset_equipped_tools").unwrap().schema();
+    let enum_list =
+        &rebound_schema.parameters["properties"]["to_activate"]["items"]["enum"];
+    assert!(enum_list.as_array().unwrap().iter().any(|v| v == "coding"));
+
+    // Original toolkit still has coding deactivated.
+    assert!(
+        !tk.get_active_groups().contains(&"coding".to_string()),
+        "original must not be mutated by the copy: {:?}",
+        tk.get_active_groups()
+    );
+    assert!(
+        copy.get_active_groups().contains(&"coding".to_string()),
+        "copy activated via rebound meta tool"
+    );
+}
+
+fn rb_block(r: agentscope_core::Result<ToolResultBlock>) -> ToolResultBlock {
+    r.expect("call succeeds")
+}
+
+#[test]
+fn registration_extended_model_and_mcp_client_metadata() {
+    let tk = Toolkit::new();
+    let mut props = JsonMap::new();
+    props.insert("timeout".to_string(), serde_json::json!({"type": "integer"}));
+    let model: Arc<dyn ExtendedModel> = Arc::new(SimpleExtendedModel::new(
+        props,
+        vec!["timeout".to_string()],
+    ));
+
+    tk.register()
+        .tool(Arc::new(FunctionTool::new(
+            "deploy",
+            "deploy service",
+            serde_json::json!({"type": "object", "properties": {"env": {"type": "string"}}}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("done"))),
+        )))
+        .extended_model(model)
+        .mcp_client("mcp-ops")
+        .preset_parameters(JsonMap::new())
+        .apply()
+        .expect("registration applies");
+
+    let schema = tk.get_tool("deploy").unwrap().schema();
+    let merged_props = schema.parameters["properties"].as_object().unwrap();
+    assert!(merged_props.contains_key("env"));
+    assert!(merged_props.contains_key("timeout"), "extended property merged");
+    assert!(
+        schema.parameters["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "timeout"),
+        "extended required merged"
+    );
+    assert_eq!(tk.mcp_client_name("deploy").as_deref(), Some("mcp-ops"));
+    assert_eq!(tk.sub_agent_name("deploy"), None);
+}
+
+#[test]
+fn registration_sub_agent_tagging() {
+    let tk = Toolkit::new();
+    tk.register()
+        .tool(Arc::new(FunctionTool::new(
+            "dispatch",
+            "dispatch subagent",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )))
+        .sub_agent("researcher")
+        .apply()
+        .expect("registration applies");
+    assert_eq!(tk.sub_agent_name("dispatch").as_deref(), Some("researcher"));
+}

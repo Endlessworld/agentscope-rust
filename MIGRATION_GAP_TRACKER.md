@@ -22,7 +22,7 @@
 | core.event | 35 类 | 4 文件 | ≈95% | 31/31 事件变体齐全 + AgentEventEmitter/ConfirmResult 已补 |
 | core.middleware | 7 类 | 4 文件 | ≈95% | 5 钩子洋葱链完整 + TaskReminderMiddleware 已补 |
 | core.hook | 21 类 | **0 文件** | 0%（设计决定） | Java 已 @Deprecated，走 2.0 middleware 架构，不迁移 |
-| core.tool | 38 类 | 20 文件 | ≈30%→再提升 | 治理层 + 结果转换/消息构造/挂起语义/危险路径/注册 builder + meta（ToolCallParam/ExtendedModel/reset_equipped_tools）+ TodoWriteTool 已补 |
+| core.tool | 38 类 | 20 文件 | ≈75% | 治理层 + 结果转换/消息构造/挂起语义/危险路径/注册 builder + meta（ToolCallParam/ExtendedModel/reset_equipped_tools/**ToolkitAware rebindToolkit**）+ 注册元数据（extendedModel/mcpClient/subAgent）+ TodoWriteTool 已补；余 @Tool proc-macro/ContextStore 属性袋 | |
 | core.state | 13 类 | 6 文件 | ≈85% | 核心 + ListHashUtil/SessionInfo 已补；缺 LegacyStateLoader/State 标记接口/readFileCache LRU |
 | core.memory | 8 类 | 1 文件 | ≈60% | 缺 AgentStateMemoryView；LongTermMemory 系列已 deprecated |
 | core.permission | 8 类 | 1 文件 | ≈90% | 流程高度对齐；缺 tool 自身规则集成 |
@@ -40,10 +40,10 @@
 | harness.gateway | 29 类 | 8 文件 + channel/(7) | ≈98% | HarnessGateway/GatewayBootstrap/SessionTurnGate/WakeupDispatcher/MsgContext/SubagentRegistry 完整；channel/* 7 层路由 + chatui 已建（本轮） |
 | harness.memory | 10 类 | 6 文件 | ≈95% | compaction+flush+consolidation+eviction+session+MemoryConfig 完整 |
 | harness.bus | 6 类 | 4 文件 | ≈90% | MessageBus（Mode A/C/D）+ WorkspaceMessageBus + AsyncToolRegistry 系完整；Mode D 降级轮询 |
-| harness.sandbox | — | sandbox.rs | 骨架 | docker(bollard) 待接 |
+| harness.sandbox | — | sandbox/ 模块 | 高 | Sandbox/SandboxClient/SandboxManager(4 级获取策略)/Guard/Lease/StateStore 完整；docker 后端与 snapshot/layout 待接 |
 | harness.middleware | 18+ | 11 文件 | 高 | 3 系统提示转换 + Inbox + AsyncTool + MemoryFlush + MemoryMaintenance + ToolResultEviction + SubagentsMiddleware + DynamicSubagentsMiddleware + **AgentTraceMiddleware（本轮）** + 配套 TaskTool/SubagentEntry/DefaultAgentManager/AgentSpecLoader；余 WorkspaceContext/SandboxLifecycle 待办 |
 | harness.subagent | — | subagent/task/ 目录 | task 仓库已建 | BackgroundTask/TaskRepository/WorkspaceTaskRepository 完整；Local/Adopted 动态 spawn 已实现 |
-| harness.mcp | — | mcp.rs | 骨架 | registrar 为 stub，rust-mcp-sdk 待接 |
+| harness.mcp | — | mcp.rs + mcp_client_manager.rs | 高 | McpClientManager（rust-mcp-sdk v1.0.1 stdio）+ McpServerRegistrar 已实现；SSE/WS 传输待接 |
 | harness.skill | — | 7 文件 | 高 | curator/runtime/stager/prompt 完整，LLM 模式待接 |
 | harness.workspace | — | 7 文件 | 高 | constants/path_normalizer/plan/manager/index/namespace 已实现；**完整版 WorkspaceManager（两层次读写 + 命名空间 + SQLite 索引 + session/task/memory/skill 操作）本轮完成** |
 
@@ -57,18 +57,18 @@
 | ToolGroupManager 已补 | ToolGroupManager/ToolGroup/ToolGroupScope | ✅ 已完成 | group.rs；含 META/EXTERNAL、替换语义、孤儿回收 |
 | ToolValidator 已补 | ToolValidator | ✅ 已完成 | validator.rs，jsonschema DRAFT-2020-12 |
 | ToolkitConfig 已补 | ToolkitConfig | ✅ 已完成 | config.rs；parallel/execution_config/allow_tool_deletion |
-| **ToolRegistration 流式 builder** | Toolkit$ToolRegistration | ✅ 已完成 | registration.rs + `Toolkit::register()`；tool/group/presetParameters/apply 已实现（集成测试过）；agentTool/mcpClient/subAgent/enableTools 待扩展 |
+| **ToolRegistration 流式 builder** | Toolkit$ToolRegistration | ✅ 已完成 | registration.rs + `Toolkit::register()`；tool/group/presetParameters/apply/**extendedModel（ExtendedSchemaTool 合并 schema）/mcp_client/sub_agent** 已实现；enableTools 待扩展 |
 | **MetaToolFactory + reset_equipped_tools** | MetaToolFactory | ✅ 已完成 | meta.rs：`Toolkit::register_meta_tools()`/`reset_equipped_tools()`；ToolGroupManager 新增 `get_meta_group_names`/`validate_group_exists`/`get_notes`/`replace_meta_active_groups`；EXTERNAL 组不受影响（6 个集成测试过） |
 | **ToolDangerousPathConstants + isDangerousPath** | ToolDangerousPathConstants/ToolBase | ✅ 已完成 | dangerous.rs：DEFAULT_DANGEROUS_FILES/DIRS/COMMANDS 常量 + `is_dangerous_path`（目录段/文件尾/tilde） + `is_dangerous_command`；harness shell 自检接入仍待办（见 3.2） |
 | **ToolSuspendException + suspended 语义** | ToolSuspendException | ✅ 已完成 | suspend.rs + `Error::ToolSuspended`；executor 将 suspend 转 `ToolResultBlock::suspended`（id/name 回填）；ReAct 循环检测到 suspended 即返回 `GenerateReason::ToolSuspended`（单元测试过） |
-| **ToolRegistry + RegisteredToolFunction 元数据** | ToolRegistry/RegisteredToolFunction | 部分 | registry 逻辑折入 toolkit；缺 preset/extendedModel/mcpClientName 包装 |
+| **ToolRegistry + RegisteredToolFunction 元数据** | ToolRegistry/RegisteredToolFunction | ✅ 已完成（本轮补齐） | registry 逻辑折入 toolkit；preset/extendedModel/mcpClientName/subAgent 元数据已补（`Toolkit::set_mcp_client_name/mcp_client_name/set_sub_agent_name/sub_agent_name`，copy() 一并复制）；enableTools 语义并入 group 管理 |
 | **ToolResultConverter / DefaultToolResultConverter** | ToolResultConverter | ✅ 已完成 | result.rs；trait `convert(Option<&Value>)`；null→"null"、String 直通、其余紧凑 JSON（Void→"Done" 因 Rust 无 void 返回略过） |
 | **ToolResultMessageBuilder** | ToolResultMessageBuilder | ✅ 已完成 | result.rs；`build_tool_result_msg` 用原 call id/name 回填 + agent name（集成测试过） |
 | **ToolEmitter / DefaultToolEmitter** | ToolEmitter | ✅ 已完成 | emitter.rs：`ToolEmitter`/`DefaultToolEmitter`/`NoOpToolEmitter`/`emit_to`；`ToolExecutionContext.emitter` 已接入 ReActAgent 执行上下文 |
 | **ToolCallParam** | ToolCallParam | ✅ 已完成 | meta.rs：builder+访问器+`ToolCallParam::from`；agent 适配为 agent_id 字符串、runtimeContext 为扁平 JSON |
 | **ToolExecutionContextProvider / ContextStore** | ContextStore/DefaultContextStore | 待办 | 已废弃→RuntimeContext；缺类型化属性袋 |
 | **ToolParam/@Tool 注解 + proc-macro** | Tool/@ToolParam | 待办 | 反射→宏；参考 rust-mcp-macros |
-| **ToolkitAware / ExtendedModel** | ToolkitAware/ExtendedModel | 部分 | ExtendedModel + SimpleExtendedModel 已实现（meta.rs，含冲突检测/required 合并）；ToolkitAware 的 rebindToolkit 深拷贝重绑待做 |
+| **ToolkitAware / ExtendedModel** | ToolkitAware/ExtendedModel | ✅ 已完成 | ExtendedModel + SimpleExtendedModel 已实现（meta.rs，含冲突检测/required 合并）；**ToolkitAware rebindToolkit 深拷贝重绑已补：`Tool::rebind_toolkit` 钩子 + `FunctionTool::toolkit_aware(factory)`，`Toolkit::copy()` 对 aware 工具重绑到新副本；顺带修复 `ToolGroupManager::clone` 共享状态的既有 bug（新增 `copy()` 深拷贝，Inner derive Clone）；3 个新集成测试过** |
 | **McpClientManager** | McpClientManager | 待办 | rust-mcp-sdk 客户端生命周期管理（见 2.14 MCP） |
 | **并行安全分区（isConcurrencySafe 独占槽）** | ToolExecutor.execute_all | ✅ 已完成 | executor.rs `execute_all` 已实现：并行模式下将连续 concurrency-safe 工具并发执行（`run_safe_batch` + join_all，保持声明顺序），不安全/未知工具各自形成独立串行槽；`Toolkit::is_concurrency_safe_tool` 查询；4 个新测试覆盖（unsafe 串行 peak=1、safe 并发 peak>=2、混合分区保序、顺序模式） |
 | **TodoWriteTool** | TodoTools | ✅ 已完成 | tool/todo.rs：`TodoWriteTool`（基于任务清单全量替换）+ `render`/`parse_state`/`normalize_priority` 辅助；`ReActAgentBuilder::build` 默认注册；调用后同步 `AgentState.tasks_context` 与 `AgentCore.tasks`（`Arc<Mutex<TaskContextState>>`）；单测过 |
@@ -208,6 +208,8 @@
 |---|---|---|---|
 | FilesystemTool/ShellExecuteTool/FuzzyTextMatcher | 同名 | ✅ 已完成 | tool/*.rs |
 | **DANGEROUS_COMMANDS shell 自检** | ToolDangerousPathConstants | ✅ 已完成 | ShellExecuteTool::call 已接入 core `is_dangerous_command`；rm -rf/sudo rm/dd/mkfs/chmod 777 等直接返回 error 块（测试通过） |
+| **SessionSearchTool**（session_search/session_list/session_history） | SessionSearchTool | ✅ 已完成（本轮） | tool/session_search.rs：基于 WorkspaceManager.list_session_log_files + SessionTree JSONL；search 支持可选 agentId 过滤 + maxResults、list 优先 sessions.json store 索引、history 取最后 N 条消息（500 字符截断）；7 集成测试过 |
+| **WebTools**（web_fetch/web_search） | WebTools | ✅ 已完成（本轮） | tool/web_tools.rs：reqwest 实现，fetch 仅 http/https + max_chars 截断；search 走 Tavily API（TAVILY_API_KEY env 或 with_api_key 注入，缺失返回明确配置错误）；register_web_tools 一键注册；测试过（无 key 分支 + 参数校验；live HTTP 未验） |
 
 ### 3.3 gateway（优先级 P1）— 差距最大（5%）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -284,7 +286,8 @@
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **测试基线**：`cargo test` → core 115 通过（lib 62 + 集成 53）、harness 215 通过（lib 128 + 集成 87），共 **330** 通过
+- **测试基线**：`cargo test` → core 119 通过、harness 全绿（lib 145 + 集成含新增 session/web tools 7 个），无新增告警。本轮补齐 harness.tool：SessionSearchTool 三件套（tool/session_search.rs）+ WebTools 两件套（tool/web_tools.rs）
+- **harness docs/ 迁移进度（本轮）**：T8 PlanModeTools、T9 WaitAsyncResultsTool（barrier + `AsyncToolRegistry::list_session`）、T1 AgentSpawnTool（薄实现：前台/后台 spawn + 权限范围 + plan-mode 传播 + end_spawn）、M1 agent/team/（TeamClient + LocalTeamClient 版本化 CAS + 邮箱/唤醒）、T3 TeamTool（10 操作 + 角色裁剪）、M5 TeamsMiddleware（<agent-teams> prompt 注入 + 每轮邮箱排空）均已落地；M6 SandboxLifecycleMiddleware 与 M3/M4 Transcript 经核实早已实现。**P1 9/9 全绿**；进度详见 `docs/MIGRATION_GAP_TRACKER.md`
 - **clippy 基线**：core 16 条既有警告；harness 12 条既有（ExposedSession dead_code + unused imports 等）
 - **关键文件**：`MIGRATION_PLAN.md`（方案）、`MIGRATION_GAP_TRACKER.md`（本文件）
 - **依赖说明**：`async-openai` v0.41.3、`rust-mcp-sdk` v1.0.1（远程 crates.io，已从 path 依赖改为远程）、`rusqlite` v0.31（bundled，SQLite 索引）
@@ -295,8 +298,7 @@
 2. **P1 重要待办**：
    - ✅ MCP 集成（rust-mcp-sdk 接入）
    - SandboxLifecycleMiddleware（依赖 SandboxManager + SandboxBackedFilesystem）
-   - ✅ Formatter 转换层（Msg→provider 请求转换）
-   - Tool 残余中高层（ToolkitAware rebindToolkit、McpClientManager 等）
+   - ✅ Tool 残余中高层（ToolkitAware rebindToolkit、ToolRegistration extendedModel/mcpClient/subAgent 元数据）— 本轮完成；McpClientManager 此前已在 harness `agent/mcp_client_manager.rs` 落地（rust-mcp-sdk）
 3. **P2 增强可选**：
    - Shutdown 精细化（GracefulShutdownMiddleware）
    - Observability 增强（OtelTracingMiddleware）
