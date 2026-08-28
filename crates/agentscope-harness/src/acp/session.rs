@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, SessionConfigOption, SessionId, SessionMode, SessionModeState, StopReason,
+    ContentBlock, MessageId, SessionConfigOption, SessionId, SessionMode, SessionModeState, StopReason,
 };
 use agentscope_core::agent::StreamOptions;
 use agentscope_core::message::{ChatUsage, Msg};
@@ -169,7 +169,19 @@ impl AcpAgentSession {
         // Tracks whether any incremental text delta was already emitted, so we
         // don't duplicate the final reply text when it was streamed token-by-token.
         let mut emitted_text = false;
-        let mut tool_events = super::event::ToolEventMapper::new();
+        // One stable message id per turn: every text/thinking chunk and tool call
+        // emitted this turn shares it, so ACP clients group them into one
+        // assistant message and render tool calls / thoughts correctly.
+        let message_id = MessageId::new(format!(
+            "turn-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let message_id_opt: Option<MessageId> = Some(message_id);
+        let mut tool_events =
+            super::event::ToolEventMapper::new().with_message_id(message_id_opt.clone());
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
@@ -181,9 +193,11 @@ impl AcpAgentSession {
                     match item {
                         Some(Ok(ev)) => match ev.event_type() {
                             AgentEventType::TextBlockDelta => {
-                                if let Some(notif) =
-                                    super::event::map_delta_event(self.session_id.clone(), &ev)
-                                {
+                                if let Some(notif) = super::event::map_delta_event(
+                                    self.session_id.clone(),
+                                    &ev,
+                                    message_id_opt.clone(),
+                                ) {
                                     emitted_text = true;
                                     emit(notif);
                                 }
@@ -195,15 +209,18 @@ impl AcpAgentSession {
                                     if let Some(notif) = super::event::map_result_event(
                                         self.session_id.clone(),
                                         &ev,
+                                        message_id_opt.clone(),
                                     ) {
                                         emit(notif);
                                     }
                                 }
                             }
                             _ => {
-                                if let Some(notif) =
-                                    super::event::map_delta_event(self.session_id.clone(), &ev)
-                                {
+                                if let Some(notif) = super::event::map_delta_event(
+                                    self.session_id.clone(),
+                                    &ev,
+                                    message_id_opt.clone(),
+                                ) {
                                     emit(notif);
                                 }
                                 if let Some(notif) =
@@ -217,6 +234,7 @@ impl AcpAgentSession {
                             emit(super::event::message_chunk(
                                 self.session_id.clone(),
                                 format!("Agent error: {e}"),
+                                message_id_opt.clone(),
                             ));
                             return StopReason::Refusal;
                         }

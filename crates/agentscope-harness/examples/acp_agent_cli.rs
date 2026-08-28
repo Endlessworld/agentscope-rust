@@ -6,6 +6,10 @@
 //!
 //! Usage:
 //!   cargo run -p agentscope-harness --example acp_agent_cli
+//!   (or run the built acp_agent_cli.exe next to acp_harness_agent.exe)
+//!
+//! The agent subprocess is resolved as a sibling `acp_harness_agent.exe` next
+//! to this binary, or via the `ACP_AGENT_EXE` environment variable.
 //!
 //! Environment variables (inherited by the agent subprocess):
 //!   CODING_MODEL_ID  — model id (default: mimo-v2.5)
@@ -18,6 +22,7 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallStatus,
 };
+use std::collections::HashMap;
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
     AcpAgent, ActiveSession, Agent, Client, ConnectionTo, Dispatch, Handled, UntypedMessage,
@@ -38,32 +43,31 @@ enum CliError {
 
 type Result<T> = std::result::Result<T, CliError>;
 
-#[derive(Debug, Clone)]
-struct CliConfig {
-    agent_package: String,
-    agent_example: String,
-}
-
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            agent_package: "agentscope-harness".to_string(),
-            agent_example: "acp_harness_agent".to_string(),
+/// Build the `AcpAgent` that spawns the harness agent as a subprocess.
+///
+/// The agent executable is resolved from the directory of the currently running
+/// CLI binary (they are built together), and can be overridden with the
+/// `ACP_AGENT_EXE` environment variable.
+fn build_agent_command() -> Result<AcpAgent> {
+    // 1) explicit override via env var
+    if let Ok(exe) = std::env::var("ACP_AGENT_EXE") {
+        if !exe.trim().is_empty() {
+            return AcpAgent::from_args([exe])
+                .map_err(|e| CliError::AgentCommand(e.to_string()));
         }
     }
-}
-
-/// Build the `AcpAgent` that spawns the harness agent as a subprocess.
-fn build_agent_command(config: &CliConfig) -> Result<AcpAgent> {
-    AcpAgent::from_args([
-        "cargo",
-        "run",
-        "-p",
-        &config.agent_package,
-        "--example",
-        &config.agent_example,
-    ])
-    .map_err(|e| CliError::AgentCommand(e.to_string()))
+    // 2) sibling executable next to this CLI binary
+    let mut path = std::env::current_exe()
+        .map_err(|e| CliError::AgentCommand(e.to_string()))?;
+    path.set_file_name("acp_harness_agent.exe");
+    if !path.exists() {
+        return Err(CliError::AgentCommand(format!(
+            "agent executable not found at {} (set ACP_AGENT_EXE to override)",
+            path.display()
+        )));
+    }
+    AcpAgent::from_args([path.to_string_lossy().to_string()])
+        .map_err(|e| CliError::AgentCommand(e.to_string()))
 }
 
 /// Converts a `ContentBlock` to displayable text.
@@ -195,6 +199,7 @@ impl Output {
 async fn process_update(
     output: &mut Output,
     update: agent_client_protocol::SessionMessage,
+    title_map: &mut HashMap<String, String>,
 ) -> Result<bool> {
     match update {
         agent_client_protocol::SessionMessage::SessionMessage(message) => {
@@ -215,6 +220,11 @@ async fn process_update(
                             }
                         }
                         SessionUpdate::ToolCall(tc) => {
+                            // Record the title for this tool call id.
+                            title_map.insert(
+                                tc.tool_call_id.0.to_string(),
+                                tc.title.clone(),
+                            );
                             output.line(&format!(
                                 "[tool] {} ({})",
                                 tc.title,
@@ -228,11 +238,24 @@ async fn process_update(
                             }
                         }
                         SessionUpdate::ToolCallUpdate(u) => {
-                            if let Some(status) = u.fields.status {
-                                output.line(&format!("[tool] #{} {}", u.tool_call_id.0, status_label(&status)));
+                            // If the update carries a title, record it.
+                            if let Some(ref title) = u.fields.title {
+                                title_map.insert(
+                                    u.tool_call_id.0.to_string(),
+                                    title.clone(),
+                                );
                             }
-                            if let Some(title) = &u.fields.title {
-                                output.line(&format!("[tool] {title}"));
+                            let display_name = title_map
+                                .get(u.tool_call_id.0.as_ref())
+                                .cloned()
+                                .unwrap_or_else(|| u.tool_call_id.0.to_string());
+
+                            if let Some(status) = u.fields.status {
+                                output.line(&format!(
+                                    "[tool] {} ({})",
+                                    display_name,
+                                    status_label(&status)
+                                ));
                             }
                             if let Some(input) = &u.fields.raw_input {
                                 output.line(&format!(
@@ -307,6 +330,7 @@ fn read_input() -> Result<Option<String>> {
 
 /// Run the interactive REPL loop.
 async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
+    let mut title_map: HashMap<String, String> = HashMap::new();
     loop {
         let input = match read_input()? {
             Some(s) if s.is_empty() => continue,
@@ -320,7 +344,7 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
         let mut output = Output::new();
         loop {
             let update = session.read_update().await?;
-            if process_update(&mut output, update).await? {
+            if process_update(&mut output, update, &mut title_map).await? {
                 break;
             }
         }
@@ -336,8 +360,7 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config = CliConfig::default();
-    let agent = build_agent_command(&config)?;
+    let agent = build_agent_command()?;
     eprintln!("Spawning harness agent...");
 
     Client.builder()

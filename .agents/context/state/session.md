@@ -7,6 +7,27 @@
 - 无（HarnessAgent 完善 + AcpCodingAgent 默认工厂 + harness_agent 示例改造 三个子任务已完成）
 
 ## 已完成任务
+- **修复 release 版 CLI 无思考过程输出** ✅（`crates/agentscope-core/src/model/openai.rs`）
+  - 根因：opencode zen 网关思考字段是 `reasoning`，代码只解析 `reasoning_content`，思考被 serde 丢弃
+  - 修复：`OpenAiStreamDelta` 增加 `reasoning` 字段 + `reasoning_text()` 方法（兼容两者）
+  - 新增端到端 stdio 测试：`tests/acp_stdio_thought_test.rs`（拉起真实 agent 子进程，断言 AgentThoughtChunk）
+  - 验证：debug 测试通过；release 版 acp_agent_cli + acp_harness_agent 重建后，CLI 实际输出浅灰思考过程（ANSI \x1b[90m 出现 14 次）
+- **修复 ACP 事件在客户端不渲染问题** ✅（`acp/event.rs` + `acp/session.rs`）
+  - 根因：`AgentMessageChunk`/`AgentThoughtChunk` 未带 `message_id`，且工具调用硬编码 `ToolKind::Edit` + `title=tool_name` + 无 `raw_input`，
+    导致真实 ACP 客户端无法把思考/工具调用归组到同一 assistant 消息，从而不渲染
+  - 修复：`session.rs` 每轮生成稳定 `message_id` 并透传到所有 chunk 与 `ToolEventMapper`；
+    `event.rs` 新增 `tool_kind_for`（按工具名推断 Read/Edit/Execute/Fetch 等）、`human_title`（人性化标题），
+    `ToolEventMapper` 在 ToolCallStart 即附带 `raw_input`
+  - 新增测试：acp/event.rs 6 单测 + tests/acp_event_flow_test.rs 端到端（思考 chunk 带 message_id、工具调用带标题）
+  - 验证：cargo test -p agentscope-harness --lib acp 9 通过；acp_event_flow_test 通过；examples cargo check 通过
+- **修复 ACP 流式输出累积问题** ✅（`crates/agentscope-core/src/model/openai.rs`）
+  - 根因：`OpenAiChatModel::stream()` 的 `StreamAccumulator` 把整个 SSE 流累积到流末才产出一个完整 `ChatResponse`，
+    导致 text/thinking 增量丢失、`ThinkingBlockDelta` 从不触发（accumulate 不填充 thinking）、跨工具调用积累到下次才推送
+  - 修复：利用已启用的 byot feature，用 `create_stream_byot::<OpenAiStreamChunk>` 自定义 chunk 类型（捕获 `reasoning_content`），
+    逐 chunk 产出增量 `ChatResponse`（text/thinking 逐个增量块），tool_calls 片段累积到流末完整产出
+  - 新结构：`OpenAiStreamChunk`/`OpenAiStreamChoice`/`OpenAiStreamDelta`（含 reasoning_content）、`StreamIncrementer`
+  - 新增测试：stream_incrementer_emits_text_and_thinking_deltas / stream_incrementer_flushes_tool_calls_and_usage_at_end
+  - 验证：cargo test -p agentscope-core model::openai 9 通过；cargo build -p agentscope-harness 通过
 - **完善 HarnessAgent/HarnessAgentBuilder** ✅（`agent/harness_agent.rs` 654 行）
   - Builder 新增 25+ 能力：workspace/environment_memory/max_context_tokens/additional_context_file/
     memory/compaction/tool_result_eviction/plan_mode/disable_* 系列/register_* 工具/message_bus/subagent 等

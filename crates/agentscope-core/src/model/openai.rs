@@ -12,19 +12,21 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use serde::Deserialize;
+
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionNamedToolChoice, ChatCompletionRequestAssistantMessage,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
-    ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionName, FunctionObject,
-    ReasoningEffort, ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
+    ChatCompletionToolChoiceOption, CompletionUsage, CreateChatCompletionRequest, FinishReason,
+    FunctionCall, FunctionCallStream, FunctionName, FunctionObject, ReasoningEffort,
+    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
     ToolChoiceOptions,
 };
 use async_openai::Client;
@@ -132,11 +134,14 @@ impl Model for OpenAiChatModel {
             .unwrap_or_else(|| self.model_name.clone());
         let request = build_request(model_name, messages, tools, options);
 
-        // create_stream is async; wrap in a once-stream then flatten.
+        // create_stream_byot lets us deserialize each SSE chunk into a custom
+        // type that also captures `reasoning_content`, so thinking deltas can be
+        // streamed incrementally instead of being swallowed by the default
+        // `CreateChatCompletionStreamResponse` (which has no reasoning field).
         let setup = futures::stream::once(async move {
             client
                 .chat()
-                .create_stream(request)
+                .create_stream_byot::<_, OpenAiStreamChunk>(request)
                 .await
                 .map_err(map_openai_error)
         });
@@ -145,19 +150,32 @@ impl Model for OpenAiChatModel {
             .try_flatten()
             .boxed();
 
-        let stream = futures::stream::unfold((chunks, StreamAccumulator::default()), |state| {
+        // Yield one incremental `ChatResponse` per SSE chunk: text/thinking
+        // deltas are emitted immediately (token-by-token), while tool-call
+        // fragments are accumulated and flushed as a single block when the
+        // stream ends. This preserves true streaming for consumers that render
+        // `TextBlockDelta`/`ThinkingBlockDelta` events as they arrive.
+        let stream = futures::stream::unfold((chunks, StreamIncrementer::default()), |state| {
             let (mut chunks, mut acc) = state;
             async move {
                 loop {
                     match chunks.next().await {
-                        Some(Ok(chunk)) => acc.accumulate(chunk),
-                        Some(Err(e)) => return Some((Err(e), (chunks, acc))),
-                        None => match acc.into_response() {
-                            Some(resp) => {
-                                return Some((Ok(resp), (chunks, StreamAccumulator::default())))
+                        Some(Ok(chunk)) => {
+                            if let Some(resp) = acc.accumulate(&chunk) {
+                                return Some((Ok(resp), (chunks, acc)));
                             }
-                            None => return None,
-                        },
+                            // No incremental content in this chunk; keep polling.
+                        }
+                        Some(Err(e)) => return Some((Err(e), (chunks, acc))),
+                        None => {
+                            let final_resp = acc.into_final();
+                            match final_resp {
+                                Some(resp) => {
+                                    return Some((Ok(resp), (chunks, StreamIncrementer::default())))
+                                }
+                                None => return None,
+                            }
+                        }
                     }
                 }
             }
@@ -437,51 +455,118 @@ struct ToolCallFragment {
     arguments: String,
 }
 
-/// Accumulates all deltas of one chat completion into a single [`ChatResponse`].
-#[derive(Default)]
-struct StreamAccumulator {
+/// A single SSE chunk from an OpenAI-compatible streaming response, decoded with
+/// an extra `reasoning_content` field so thinking deltas (e.g. DeepSeek/O1) can
+/// be surfaced incrementally. Serde ignores any other unknown fields.
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChunk {
+    #[serde(default)]
     id: String,
-    text: String,
-    thinking: String,
+    #[serde(default)]
+    choices: Vec<OpenAiStreamChoice>,
+    #[serde(default)]
+    usage: Option<CompletionUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    #[serde(default)]
+    delta: OpenAiStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+}
+
+impl OpenAiStreamDelta {
+    /// Reasoning text carried by this chunk, from either the OpenAI-style
+    /// `reasoning_content` field (DeepSeek/O1) or the `reasoning` field used by
+    /// some gateways (e.g. opencode zen). Whichever is present wins.
+    fn reasoning_text(&self) -> Option<&str> {
+        if let Some(r) = &self.reasoning_content {
+            if !r.is_empty() {
+                return Some(r);
+            }
+        }
+        if let Some(r) = &self.reasoning {
+            if !r.is_empty() {
+                return Some(r);
+            }
+        }
+        None
+    }
+}
+
+/// Incremental stream decoder: emits one [`ChatResponse`] per SSE chunk for
+/// text/thinking deltas (true token-by-token streaming) while accumulating
+/// tool-call fragments, usage and finish reason across chunks. The accumulated
+/// tool calls / usage are flushed as a single final [`ChatResponse`] when the
+/// underlying stream ends.
+#[derive(Default)]
+struct StreamIncrementer {
+    id: String,
     tool_calls: BTreeMap<u32, ToolCallFragment>,
     usage: Option<ChatUsage>,
     finish_reason: Option<String>,
 }
 
-impl StreamAccumulator {
-    fn accumulate(&mut self, chunk: CreateChatCompletionStreamResponse) {
+impl StreamIncrementer {
+    /// Consumes one chunk, returning a `ChatResponse` carrying only the
+    /// incremental text/thinking content of this chunk (or `None` when the chunk
+    /// carries no incremental content, e.g. an empty usage-only chunk).
+    fn accumulate(&mut self, chunk: &OpenAiStreamChunk) -> Option<crate::model::ChatResponse> {
         if self.id.is_empty() && !chunk.id.is_empty() {
-            self.id = chunk.id;
+            self.id = chunk.id.clone();
         }
-        for choice in chunk.choices {
-            let delta = choice.delta;
-            if let Some(content) = delta.content {
-                self.text.push_str(&content);
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        for choice in &chunk.choices {
+            let delta = &choice.delta;
+            if let Some(content) = &delta.content {
+                if !content.is_empty() {
+                    blocks.push(ContentBlock::Text(TextBlock::new(content.clone())));
+                }
             }
-            if let Some(refusal) = delta.refusal {
-                self.text.push_str(&refusal);
+            if let Some(reasoning) = delta.reasoning_text() {
+                blocks.push(ContentBlock::Thinking(ThinkingBlock::new(reasoning.to_string())));
             }
-            if let Some(tool_calls) = delta.tool_calls {
+            if let Some(refusal) = &delta.refusal {
+                if !refusal.is_empty() {
+                    blocks.push(ContentBlock::Text(TextBlock::new(refusal.clone())));
+                }
+            }
+            if let Some(tool_calls) = &delta.tool_calls {
                 for tc in tool_calls {
                     let frag = self.tool_calls.entry(tc.index).or_default();
-                    if let Some(id) = tc.id {
-                        frag.id = id;
+                    if let Some(id) = &tc.id {
+                        frag.id = id.clone();
                     }
-                    if let Some(f) = tc.function {
-                        if let Some(name) = f.name {
-                            frag.name = name;
+                    if let Some(f) = &tc.function {
+                        if let Some(name) = &f.name {
+                            frag.name = name.clone();
                         }
-                        if let Some(args) = f.arguments {
-                            frag.arguments.push_str(&args);
+                        if let Some(args) = &f.arguments {
+                            frag.arguments.push_str(args);
                         }
                     }
                 }
             }
-            if let Some(fr) = choice.finish_reason {
-                self.finish_reason = Some(finish_reason_string(fr));
+            if let Some(fr) = &choice.finish_reason {
+                self.finish_reason = Some(finish_reason_string(fr.clone()));
             }
         }
-        if let Some(usage) = chunk.usage {
+        if let Some(usage) = &chunk.usage {
             self.usage = Some(ChatUsage {
                 input_tokens: usage.prompt_tokens as u64,
                 output_tokens: usage.completion_tokens as u64,
@@ -489,16 +574,23 @@ impl StreamAccumulator {
                 time: 0.0,
             });
         }
+        if blocks.is_empty() {
+            None
+        } else {
+            Some(crate::model::ChatResponse::new(
+                self.id.clone(),
+                blocks,
+                ChatUsage::default(),
+                None,
+                None,
+            ))
+        }
     }
 
-    fn into_response(self) -> Option<crate::model::ChatResponse> {
+    /// Flushes the accumulated tool calls, usage and finish reason into a final
+    /// [`ChatResponse`]. Returns `None` when nothing was accumulated.
+    fn into_final(self) -> Option<crate::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
-        if !self.thinking.is_empty() {
-            blocks.push(ContentBlock::Thinking(ThinkingBlock::new(self.thinking)));
-        }
-        if !self.text.is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock::new(self.text)));
-        }
         for frag in self.tool_calls.values() {
             let input = parse_arguments(&frag.arguments);
             blocks.push(ContentBlock::ToolUse(ToolUseBlock::new(
@@ -626,5 +718,116 @@ mod tests {
     fn parse_arguments_object_and_garbage() {
         assert!(parse_arguments(r#"{"a":1}"#).contains_key("a"));
         assert!(parse_arguments("not json").is_empty());
+    }
+
+    #[test]
+    fn stream_incrementer_emits_text_and_thinking_deltas() {
+        let mut inc = StreamIncrementer::default();
+        // Chunk 1: only reasoning_content (thinking delta).
+        let chunk1 = OpenAiStreamChunk {
+            id: "r1".into(),
+            choices: vec![OpenAiStreamChoice {
+                delta: OpenAiStreamDelta {
+                    content: None,
+                    reasoning_content: Some("let me think".into()),
+                    reasoning: None,
+                    refusal: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let r1 = inc.accumulate(&chunk1).expect("thinking delta emitted");
+        assert!(matches!(
+            &r1.content[0],
+            ContentBlock::Thinking(t) if t.thinking == "let me think"
+        ));
+
+        // Chunk 2: only content (text delta).
+        let chunk2 = OpenAiStreamChunk {
+            id: "r1".into(),
+            choices: vec![OpenAiStreamChoice {
+                delta: OpenAiStreamDelta {
+                    content: Some("hello".into()),
+                    reasoning_content: None,
+                    reasoning: None,
+                    refusal: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let r2 = inc.accumulate(&chunk2).expect("text delta emitted");
+        assert!(matches!(
+            &r2.content[0],
+            ContentBlock::Text(t) if t.text == "hello"
+        ));
+
+        // No tool calls accumulated -> into_final yields nothing.
+        assert!(inc.into_final().is_none());
+    }
+
+    #[test]
+    fn stream_incrementer_flushes_tool_calls_and_usage_at_end() {
+        let mut inc = StreamIncrementer::default();
+        // Tool-call fragment arrives split across two chunks.
+        let frag1 = OpenAiStreamChunk {
+            id: "r2".into(),
+            choices: vec![OpenAiStreamChoice {
+                delta: OpenAiStreamDelta {
+                    content: None,
+                    reasoning_content: None,
+                    reasoning: None,
+                    refusal: None,
+                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        r#type: None,
+                        function: Some(FunctionCallStream {
+                            name: Some("get_weather".into()),
+                            arguments: Some(r#"{"city":"Bei"#.into()),
+                        }),
+                    }]),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        assert!(inc.accumulate(&frag1).is_none());
+        let frag2 = OpenAiStreamChunk {
+            id: "r2".into(),
+            choices: vec![OpenAiStreamChoice {
+                delta: OpenAiStreamDelta {
+                    content: None,
+                    reasoning_content: None,
+                    reasoning: None,
+                    refusal: None,
+                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                        index: 0,
+                        id: None,
+                        r#type: None,
+                        function: Some(FunctionCallStream {
+                            name: None,
+                            arguments: Some(r#"jing"}"#.into()),
+                        }),
+                    }]),
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: None,
+        };
+        assert!(inc.accumulate(&frag2).is_none());
+
+        let final_resp = inc.into_final().expect("tool call flushed");
+        let tool = match &final_resp.content[0] {
+            ContentBlock::ToolUse(t) => t,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "get_weather");
+        assert_eq!(tool.input.get("city").and_then(|v| v.as_str()), Some("Beijing"));
+        assert_eq!(final_resp.finish_reason.as_deref(), Some("tool_calls"));
     }
 }
