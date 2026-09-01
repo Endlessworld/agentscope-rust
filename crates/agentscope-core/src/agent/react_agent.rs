@@ -399,6 +399,9 @@ impl ReActAgent {
             user_id: None,
             agent_id: None,
             delta_tx: None,
+            // Expose the shared state so context-managing middlewares (e.g.
+            // conversation compaction) can read/rewrite the accumulated history.
+            state: Some(Arc::clone(&self.core.state)),
         }
     }
 }

@@ -25,7 +25,7 @@ pub use curator::{
     ScriptFilePreview, SkillCandidate, SkillCurator, SkillCuratorConfig, SkillCuratorState,
     SkillState, SkillUsageRecord, SkillUsageStore, TransitionCounts, UmbrellaPassMode,
 };
-pub use load_tool::LoadSkillTool;
+pub use load_tool::{LazyLoadSkillTool, LoadSkillTool};
 pub use manage::{build_promoter, default_gate, ProposeSkillTool, SkillManageConfig, SkillManageTool};
 pub use model::{AgentSkill, AgentSkillBuilder, HarnessSkillEntry, SkillCatalog, SkillFilter};
 pub use prompt::{SkillPromptBuilder, DEFAULT_CODE_EXECUTION_INSTRUCTION, DEFAULT_HEADER};

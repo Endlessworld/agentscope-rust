@@ -1,0 +1,105 @@
+//! Conversation-compaction middleware, mirroring the Java `ConversationCompactionMiddleware`.
+//!
+//! Runs at the start of each agent call (`on_agent`): reads the accumulated
+//! non-SYSTEM history from the shared agent state, asks the [`ConversationCompactor`]
+//! whether it has grown past the trigger, and if so rewrites the state with the
+//! compacted `[summary] + preserved_tail` replacement. Unlike a naive sliding window,
+//! the preserved tail stays verbatim so recent context (and its prefix KV-cache
+//! reuse) is untouched; only the summarized prefix is replaced.
+
+use std::sync::Arc;
+
+use agentscope_core::agent::RuntimeContext;
+use agentscope_core::message::{Msg, MsgRole};
+use agentscope_core::middleware::{AgentInput, EventStream, Middleware, Next};
+use futures::StreamExt;
+
+use crate::agent::memory::compaction::{CompactionConfig, ConversationCompactor};
+
+/// Middleware that compacts the accumulated conversation history before each
+/// agent call when it exceeds the configured trigger.
+pub struct ConversationCompactionMiddleware {
+    compactor: Arc<ConversationCompactor>,
+    config: CompactionConfig,
+    agent_id: String,
+}
+
+impl ConversationCompactionMiddleware {
+    /// Creates a middleware with the given compactor, config and agent id.
+    pub fn new(
+        compactor: Arc<ConversationCompactor>,
+        config: CompactionConfig,
+        agent_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            compactor,
+            config,
+            agent_id: agent_id.into(),
+        }
+    }
+
+    /// Convenience constructor using the agent's primary model for summarization.
+    pub fn with_model(
+        model: Arc<dyn agentscope_core::model::Model>,
+        config: CompactionConfig,
+        agent_id: impl Into<String>,
+    ) -> Self {
+        Self::new(Arc::new(ConversationCompactor::with_model(model)), config, agent_id)
+    }
+}
+
+impl Middleware for ConversationCompactionMiddleware {
+    fn on_agent(
+        &self,
+        ctx: &RuntimeContext,
+        input: AgentInput,
+        next: Next<AgentInput>,
+    ) -> EventStream {
+        // No shared state handle (ad-hoc context) -> nothing to compact.
+        let Some(state) = ctx.state.clone() else {
+            return next(input);
+        };
+        let compactor = Arc::clone(&self.compactor);
+        let config = self.config.clone();
+        let agent_id = self.agent_id.clone();
+
+        let fut = async move {
+            let compacted = {
+                let (history, session_id): (Vec<Msg>, String) = {
+                    let guard = state.lock().unwrap();
+                    let session_id = guard.session_id().to_string();
+                    let history = guard
+                        .context()
+                        .iter()
+                        .filter(|m| m.role != MsgRole::System)
+                        .cloned()
+                        .collect();
+                    (history, session_id)
+                };
+                if history.is_empty() {
+                    None
+                } else {
+                    compactor
+                        .compact_if_needed(history, &config, &agent_id, &session_id)
+                        .await
+                        .unwrap_or(None)
+                }
+            };
+            if let Some(replacement) = compacted {
+                let mut guard = state.lock().unwrap();
+                let sys: Vec<Msg> = guard
+                    .context()
+                    .iter()
+                    .filter(|m| m.role == MsgRole::System)
+                    .cloned()
+                    .collect();
+                let mut new_ctx = sys;
+                new_ctx.extend(replacement);
+                *guard.context_mut() = new_ctx;
+                tracing::debug!(agent = %agent_id, "conversation compacted");
+            }
+            next(input)
+        };
+        Box::pin(futures::stream::once(fut).flatten())
+    }
+}

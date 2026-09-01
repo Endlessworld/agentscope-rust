@@ -310,10 +310,15 @@ impl Output {
 }
 
 /// Process a single session update, returning `true` if the turn ended.
+///
+/// `last_was_thinking` tracks whether the most recent output was thinking
+/// text so that a blank line can be inserted before the next non-thinking
+/// content (tool call or agent message).
 async fn process_update(
     output: &mut Output,
     update: agent_client_protocol::SessionMessage,
     views: &mut HashMap<String, ToolView>,
+    last_was_thinking: &mut bool,
 ) -> Result<bool> {
     match update {
         agent_client_protocol::SessionMessage::SessionMessage(message) => {
@@ -323,6 +328,10 @@ async fn process_update(
                         SessionUpdate::AgentMessageChunk(chunk) => {
                             let text = content_to_string(&chunk.content);
                             if !text.is_empty() {
+                                if *last_was_thinking {
+                                    output.line("");
+                                    *last_was_thinking = false;
+                                }
                                 output.write(&text);
                             }
                         }
@@ -331,9 +340,14 @@ async fn process_update(
                             let text = content_to_string(&chunk.content);
                             if !text.is_empty() {
                                 output.write(&format!("{DIM}{text}{RESET}"));
+                                *last_was_thinking = true;
                             }
                         }
                         SessionUpdate::ToolCall(tc) => {
+                            if *last_was_thinking {
+                                output.line("");
+                                *last_was_thinking = false;
+                            }
                             for line in render_tool(
                                 views,
                                 &tc.tool_call_id.0,
@@ -350,6 +364,10 @@ async fn process_update(
                             }
                         }
                         SessionUpdate::ToolCallUpdate(u) => {
+                            if *last_was_thinking {
+                                output.line("");
+                                *last_was_thinking = false;
+                            }
                             for line in render_tool(
                                 views,
                                 &u.tool_call_id.0,
@@ -437,9 +455,10 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
         session.send_prompt(input)?;
 
         let mut output = Output::new();
+        let mut last_was_thinking = false;
         loop {
             let update = session.read_update().await?;
-            if process_update(&mut output, update, &mut views).await? {
+            if process_update(&mut output, update, &mut views, &mut last_was_thinking).await? {
                 break;
             }
         }
@@ -449,8 +468,16 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // 嵌入式优化：单线程 current_thread 运行时，避免多线程 worker 栈开销。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(CliError::Io)?;
+    rt.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

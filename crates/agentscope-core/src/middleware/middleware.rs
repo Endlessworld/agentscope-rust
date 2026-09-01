@@ -81,6 +81,14 @@ impl MiddlewareChain {
         self.middlewares.push(Arc::from(mw));
     }
 
+    /// Adds an already-`Arc`-wrapped middleware to the chain.
+    ///
+    /// Useful when a middleware must also be shared elsewhere (e.g. a lazy tool
+    /// holding the same `Arc`) — avoids cloning the concrete type (嵌入式优化).
+    pub fn add_arc(&mut self, mw: Arc<dyn Middleware>) {
+        self.middlewares.push(mw);
+    }
+
     /// Returns the number of middlewares in the chain.
     pub fn len(&self) -> usize {
         self.middlewares.len()

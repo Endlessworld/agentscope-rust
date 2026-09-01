@@ -104,7 +104,7 @@ impl FilesystemTool {
         Self {
             fs,
             name: "write_file".into(),
-            description: "Write content to one or more files, creating parent directories if needed. Accepts a batch of write operations.".into(),
+            description: "Write content to one or more files, creating parent directories if needed. Accepts a batch of write operations. This tool cannot overwrite existing files".into(),
             read_only: false,
             schema: serde_json::json!({
                 "type": "object",
@@ -160,14 +160,14 @@ impl FilesystemTool {
         Self {
             fs,
             name: "grep_files".into(),
-            description: "Search file contents for a literal text pattern.".into(),
+            description: "Search file contents with a regular expression pattern (supports inline flags like (?i); invalid regex falls back to literal substring matching).".into(),
             read_only: true,
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Literal text pattern to search for"},
-                    "path": {"type": "string", "description": "Directory or file to search"},
-                    "glob": {"type": "string", "description": "Optional file glob filter (e.g. *.java)"}
+                    "pattern": {"type": "string", "description": "正则表达式（支持 (?i) 等内联 flag；非法正则会回退为字面量匹配）"},
+                    "path": {"type": "string", "description": "Directory or file to search; defaults to the filesystem root"},
+                    "glob": {"type": "string", "description": "Optional file-name glob filter, e.g. *.rs or **/*.java"}
                 },
                 "required": ["pattern"]
             }),
@@ -178,12 +178,12 @@ impl FilesystemTool {
         Self {
             fs,
             name: "glob_files".into(),
-            description: "Find files matching a glob pattern.".into(),
+            description: "Find files matching a glob pattern relative to the base path (supports *, ?, **, [abc], {a,b}).".into(),
             read_only: true,
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern (e.g. **/*.java)"},
+                    "pattern": {"type": "string", "description": "Glob pattern, matched relative to the base path (e.g. *.java, **/*.java, src/**/*.rs)"},
                     "path": {"type": "string", "description": "Base directory to search from", "default": "/"}
                 },
                 "required": ["pattern"]

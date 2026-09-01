@@ -66,6 +66,15 @@ pub struct HarnessSkillMiddleware {
     shell_policy: ShellPathPolicy,
     workspace_root: Option<PathBuf>,
     frozen: bool,
+    /// 惰性缓存：首次访问时才构建目录/索引，避免启动即全量读盘（嵌入式优化）。
+    cache: std::sync::Mutex<SkillCache>,
+}
+
+/// 惰性构建的技能目录与索引缓存。
+#[derive(Default)]
+struct SkillCache {
+    catalog: Option<SkillCatalog>,
+    index: Option<HashMap<String, PathBuf>>,
 }
 
 impl HarnessSkillMiddleware {
@@ -83,6 +92,7 @@ impl HarnessSkillMiddleware {
             shell_policy,
             workspace_root,
             frozen: false,
+            cache: std::sync::Mutex::new(SkillCache::default()),
         }
     }
 
@@ -101,6 +111,7 @@ impl HarnessSkillMiddleware {
             shell_policy,
             workspace_root,
             frozen: true,
+            cache: std::sync::Mutex::new(SkillCache::default()),
         }
     }
 
@@ -114,7 +125,12 @@ impl HarnessSkillMiddleware {
     }
 
     /// Builds the `skillId -> on-disk dir` index for `LoadSkillTool`.
+    /// 惰性构建：首次调用时全量扫描并缓存，后续直接返回缓存。
     pub fn load_index(&self) -> HashMap<String, PathBuf> {
+        let mut guard = self.cache.lock().unwrap();
+        if let Some(index) = &guard.index {
+            return index.clone();
+        }
         let mut index = HashMap::new();
         for repo in &self.repos {
             for skill in repo.load() {
@@ -124,7 +140,26 @@ impl HarnessSkillMiddleware {
                 }
             }
         }
+        guard.index = Some(index.clone());
         index
+    }
+
+    /// 惰性构建并缓存渲染目录（首次 on_system_prompt 时才扫描磁盘）。
+    pub fn cached_catalog(&self) -> SkillCatalog {
+        let mut guard = self.cache.lock().unwrap();
+        if let Some(catalog) = &guard.catalog {
+            return catalog.clone();
+        }
+        let catalog = self.build_rendered_catalog();
+        guard.catalog = Some(catalog.clone());
+        catalog
+    }
+
+    /// 使缓存失效（技能写盘/删除后调用），下次访问时重新扫描。
+    pub fn invalidate(&self) {
+        let mut guard = self.cache.lock().unwrap();
+        guard.catalog = None;
+        guard.index = None;
     }
 
     /// Builds the catalog with shell-reachable `filesRoot` resolved per skill.
@@ -169,7 +204,7 @@ impl Middleware for HarnessSkillMiddleware {
         if self.repos.is_empty() {
             return current_prompt;
         }
-        let catalog = self.build_rendered_catalog();
+        let catalog = self.cached_catalog();
         if catalog.is_empty() {
             return current_prompt;
         }

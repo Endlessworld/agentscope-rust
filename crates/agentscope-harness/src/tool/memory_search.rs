@@ -66,8 +66,8 @@ impl Tool for MemorySearchTool {
         })?;
         let limit = int_arg(&args, "limit").unwrap_or(20);
         let rt = RuntimeContext::default();
-        let glob = format!("{}/*.md", self.memory_root);
-        match self.fs.grep(&rt, &query, Some(&self.memory_root), Some(&glob)).await {
+        let glob = "*.md";
+        match self.fs.grep(&rt, &query, Some(&self.memory_root), Some(glob)).await {
             Ok(matches) => {
                 if matches.is_empty() {
                     return Ok(ToolResultBlock::text("No matching memories found"));

@@ -70,6 +70,96 @@ async fn local_glob_and_grep() {
 }
 
 #[tokio::test]
+async fn grep_single_file_and_regex() {
+    let dir = temp_dir("grep_single").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/src/main.rs", "fn main() {\n    println!(\"hi\");\n}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/README.md", "fn docs only").await.unwrap();
+
+    // grep on a single file path works (Linux `grep pattern file`)
+    let matches = fs.grep(&ctx(), "println", Some("/src/main.rs"), None).await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].line, 2);
+
+    // pattern is a regex: `fn\s+main` matches "fn main("
+    let matches = fs.grep(&ctx(), r"fn\s+main", Some("/src"), None).await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].path, "/src/main.rs");
+
+    // invalid regex falls back to literal substring matching
+    let matches = fs.grep(&ctx(), "fn (", Some("/src"), None).await.unwrap();
+    assert_eq!(matches.len(), 0);
+
+    // inline (?i) flag is honored
+    let matches = fs.grep(&ctx(), "(?i)PRINTLN", Some("/src/main.rs"), None).await.unwrap();
+    assert_eq!(matches.len(), 1);
+}
+
+#[tokio::test]
+async fn grep_glob_filter_matches_basename() {
+    let dir = temp_dir("grep_glob").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
+    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()").await.unwrap();
+    fs.write(&ctx(), "/README.md", "fn docs").await.unwrap();
+
+    // glob filter is matched against the file name (like grep --include=*.rs)
+    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("*.rs")).await.unwrap();
+    assert_eq!(matches.len(), 2);
+    assert!(matches.iter().all(|m| m.path.ends_with(".rs")));
+}
+
+#[tokio::test]
+async fn glob_pattern_is_relative_to_base() {
+    let dir = temp_dir("glob_base").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
+    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()").await.unwrap();
+    fs.write(&ctx(), "/src/nested/extra.rs", "fn extra()").await.unwrap();
+    fs.write(&ctx(), "/README.md", "docs").await.unwrap();
+
+    // `*.rs` matches files directly under /src (like `cd /src && ls *.rs`)
+    let files = fs.glob(&ctx(), "*.rs", "/src").await.unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|f| !f.path.contains("/nested/")));
+
+    // `**/*.rs` recurses from /src and includes nested files
+    let files = fs.glob(&ctx(), "**/*.rs", "/src").await.unwrap();
+    assert_eq!(files.len(), 3);
+
+    // patterns may include a leading directory component relative to the base
+    let files = fs.glob(&ctx(), "nested/*.rs", "/src").await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "/src/nested/extra.rs");
+}
+
+#[tokio::test]
+async fn grep_and_glob_skip_generated_dirs() {
+    let dir = temp_dir("skip_generated").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
+    fs.write(&ctx(), "/target/gen.rs", "fn main() in target").await.unwrap();
+    fs.write(&ctx(), "/node_modules/pkg/index.rs", "fn main() in node_modules").await.unwrap();
+
+    // glob does not descend into generated dirs
+    let files = fs.glob(&ctx(), "**/*.rs", "/").await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "/src/main.rs");
+
+    // grep does not search generated dirs
+    let matches = fs.grep(&ctx(), "fn main", Some("/"), None).await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].path, "/src/main.rs");
+
+    // searching a generated dir directly still works (base itself is walked)
+    let files = fs.glob(&ctx(), "**/*.rs", "/target").await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "/target/gen.rs");
+}
+
+#[tokio::test]
 async fn overlay_copy_on_write() {
     let upper_dir = temp_dir("overlay_upper").await;
     let lower_dir = temp_dir("overlay_lower").await;

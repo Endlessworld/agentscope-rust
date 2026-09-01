@@ -1,6 +1,9 @@
 //! Runtime context shared across agent execution.
+use std::sync::{Arc, Mutex};
+
 use crate::formatter::ResponseFormat;
 use crate::message::{JsonMap, Msg};
+use crate::state::AgentState;
 use crate::tool::Toolkit;
 
 /// Runtime context shared across agent execution, mirroring `RuntimeContext`.
@@ -30,6 +33,10 @@ pub struct RuntimeContext {
     /// from deep inside the model call up to the agent-level event stream, enabling
     /// incremental (token-by-token) rendering.
     pub delta_tx: Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<crate::event::AgentEvent>>>,
+    /// Shared per-agent state handle, exposed so context-managing middlewares
+    /// (e.g. conversation compaction) can read and rewrite the accumulated
+    /// history across calls. `None` for ad-hoc contexts (tool calls, tests).
+    pub state: Option<Arc<Mutex<AgentState>>>,
 }
 
 impl RuntimeContext {

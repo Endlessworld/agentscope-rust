@@ -49,10 +49,10 @@ pub use memory::{
 pub use middleware::{
     AgentTraceMiddleware, AsyncToolMiddleware, AtPathExpansionMiddleware, build_delivery_reminder,
     build_task_summary,
-    CompactionMiddleware, CompactionMiddlewareConfig, DynamicSubagentsMiddleware,
-    InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware, PlanModeConfig,
-    PlanModeMiddleware, prepend_to_system_message, render_subagent_section, SubagentsMiddleware,
-    ToolResultEvictionMiddleware,
+    CompactionMiddleware, CompactionMiddlewareConfig, ConversationCompactionMiddleware,
+    DynamicSubagentsMiddleware, InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware,
+    PlanModeConfig, PlanModeMiddleware, prepend_to_system_message, render_subagent_section,
+    SubagentsMiddleware, ToolResultEvictionMiddleware,
 };
 pub use sandbox::{
     DefaultWorkspaceSpecApplier, ExecResult, InMemorySandboxStateStore, LocalSandboxState,

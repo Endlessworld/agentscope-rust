@@ -22,9 +22,23 @@ chrono.workspace = true
 uuid.workspace = true
 base64.workspace = true
 sha2.workspace = true
-rusqlite.workspace = true
+regex = "1"
+globset = "0.4"
+rusqlite = { workspace = true, optional = true }
 rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["client", "stdio", "macros"] }
 
 # `unstable_tool_call_name` exposes the programmatic `name` field on tool calls;
 # clients that do not know it simply ignore it.
 agent-client-protocol = { path = "E:/local-github/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0", features = ["unstable_tool_call_name"] }
+
+[[example]]
+name = "acp_agent_cli"
+path = "examples/acp_agent_cli.rs"
+
+[features]
+# 默认启用 SQLite 索引（原行为）；`lite` 为嵌入式最小集，
+# 通过 `--no-default-features --features lite` 构建，去掉 rusqlite bundled
+# （C 引擎静态链接 1~3MB），workspace 索引降级为全量目录扫描。
+default = ["rusqlite"]
+rusqlite = ["dep:rusqlite"]
+lite = []

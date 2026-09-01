@@ -12,13 +12,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
 use agentscope_core::model::{Model, OpenAiChatModel};
 use agentscope_harness::acp::{config::ModeChoice, AcpCodingAgent};
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
-    CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
+    CompactionConfig, CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
+    ToolResultEvictionConfig,
 };
 
 /// User-level skills directory (`$HOME/.agents/skills`).
@@ -67,7 +66,23 @@ fn build_agent(cwd: PathBuf) -> HarnessAgent {
         .compaction(CompactionMiddlewareConfig {
             enabled: true,
             max_tokens: 16_000,
-        })
+        }).disable_memory_hooks()
+        // 对话压缩：历史超过触发阈值时由 LLM 总结早期对话并保留最近 tail，
+        // 控制 AgentState.context 的持续增长（保留 tail 不破坏前缀 KV 缓存）。
+        .conversation_compaction(CompactionConfig::builder()
+            .trigger_messages(100)
+            .trigger_tokens(0)
+            .keep_messages(12)
+            .keep_tokens(-1)
+            .keep_tokens_min(2_000)
+            .keep_tokens_max(8_000)
+            .keep_tokens_ratio(0.25)
+            .flush_before_compact(false)
+            .offload_before_compact(false)
+            .build())
+        // 工具结果外置：超过 80k 字符的工具输出（如构建日志）写入磁盘，
+        // context 只保留预览占位符，避免大输出驻留内存。
+        .tool_result_eviction(ToolResultEvictionConfig::defaults())
         .max_iters(50);
 
     // Skill support: register the user-level skill repository. The harness composes
@@ -84,8 +99,17 @@ fn build_agent(cwd: PathBuf) -> HarnessAgent {
     builder.build()
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 嵌入式优化：使用单线程 current_thread 运行时替代默认的多线程运行时，
+    // 避免按 CPU 核数创建 worker 线程（每线程栈 2MB+）带来的固定内存开销。
+    // ACP 会话是串行 stdio I/O 模型，单线程运行时完全足够。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let modes = vec![
         ModeChoice { id: "yolo".to_string(), name: "YOLO".to_string() },
         ModeChoice { id: "plan".to_string(), name: "Plan".to_string() },
@@ -100,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model_factory(build_agent)
         .modes(modes)
         .models(models)
+        .max_sessions(3)
         .build()?;
 
     tracing::info!("ACP CodingAgent starting over stdio...");

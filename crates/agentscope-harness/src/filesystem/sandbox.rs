@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
 
@@ -68,6 +69,22 @@ impl Filesystem for SandboxBackedFilesystem {
     }
 }
 
+/// Windows once 模式：使用 pwsh -EncodedCommand 执行命令。
+/// 不生成任何临时脚本文件（避免被安全软件识别为"落盘+执行"的可疑行为而频繁告警），
+/// 而是将命令以 UTF-16LE 编码后做 Base64，作为 -EncodedCommand 参数传给 pwsh。
+/// 优点：
+///  1. Base64 为纯 ASCII，彻底规避 ProcessBuilder/Command 在 Windows 下以 ANSI 编码传参导致的中文乱码；
+///  2. pwsh 没有 cmd 的 %VAR% 展开机制（% 原样保留，如 git log --format=%s 无需转义）；
+///  3. 不落盘，无临时文件残留，降低安全软件告警频率。
+#[cfg(windows)]
+fn build_windows_command(command: &str) -> Vec<String> {
+    // pwsh -EncodedCommand 要求 UTF-16LE 编码后再 Base64
+    let utf16 = command.encode_utf16().collect::<Vec<u16>>();
+    let byte_vec: Vec<u8> = utf16.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&byte_vec);
+    vec!["pwsh".into(), "-NoProfile".into(), "-EncodedCommand".into(), encoded]
+}
+
 #[async_trait]
 impl SandboxFilesystem for SandboxBackedFilesystem {
     async fn execute(
@@ -77,8 +94,9 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         timeout_seconds: u32,
     ) -> Result<ExecuteResponse> {
         let mut cmd = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(command);
+            let args = build_windows_command(command);
+            let mut c = tokio::process::Command::new(&args[0]);
+            c.args(&args[1..]);
             c
         } else {
             let mut c = tokio::process::Command::new("/bin/sh");

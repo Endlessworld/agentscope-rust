@@ -82,6 +82,9 @@ pub struct AcpCodingAgent {
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
+    /// 会话注册表上限（嵌入式优化）：超过上限时淘汰最旧会话，
+    /// 避免多会话成倍放大内存。默认 1。
+    max_sessions: usize,
 }
 
 impl AcpCodingAgent {
@@ -97,12 +100,19 @@ impl AcpCodingAgent {
             models,
             modes,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            max_sessions: 1,
         }
     }
 
     /// Overrides the agent display name.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// 设置会话注册表上限（嵌入式优化，默认 1）。
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max.max(1);
         self
     }
 
@@ -145,9 +155,29 @@ impl AcpCodingAgent {
     }
 
     /// Registers the session in the registry.
+    /// 嵌入式优化：超过 `max_sessions` 上限时淘汰最旧会话，
+    /// 避免多会话同时持有完整 `HarnessAgent` 成倍放大内存。
     fn register_session(&self, session: AcpAgentSession) {
         let id = session.session_id().to_string();
-        self.sessions.lock().unwrap().insert(id, session);
+        let mut guard = self.sessions.lock().unwrap();
+        if guard.len() >= self.max_sessions && !guard.contains_key(&id) {
+            // 淘汰最旧：session_id 形如 session-<epoch_millis>，取其时间戳最小者。
+            let mut oldest: Option<(String, i64)> = None;
+            for sid in guard.keys() {
+                let t = sid
+                    .strip_prefix("session-")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(i64::MAX);
+                match &oldest {
+                    Some((_, ot)) if *ot <= t => {}
+                    _ => oldest = Some((sid.clone(), t)),
+                }
+            }
+            if let Some((oldest_id, _)) = oldest {
+                guard.remove(&oldest_id);
+            }
+        }
+        guard.insert(id, session);
     }
 
     /// Removes a session from the registry.
@@ -364,6 +394,7 @@ pub struct AcpCodingAgentBuilder {
     model_factory: Option<Box<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync>>,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
+    max_sessions: Option<usize>,
 }
 
 impl AcpCodingAgentBuilder {
@@ -394,6 +425,12 @@ impl AcpCodingAgentBuilder {
         self
     }
 
+    /// 设置会话注册表上限（嵌入式优化，默认 1）。
+    pub fn max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = Some(max);
+        self
+    }
+
     /// Builds the [`AcpCodingAgent`].
     pub fn build(self) -> Result<AcpCodingAgent, Box<dyn std::error::Error>> {
         let factory = self
@@ -407,6 +444,9 @@ impl AcpCodingAgentBuilder {
         );
         if let Some(name) = self.name {
             agent = agent.with_name(name);
+        }
+        if let Some(max) = self.max_sessions {
+            agent = agent.with_max_sessions(max);
         }
         Ok(agent)
     }

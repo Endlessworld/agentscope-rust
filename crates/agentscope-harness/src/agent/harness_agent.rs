@@ -23,14 +23,15 @@ use super::isolation_scope::IsolationScope;
 use super::memory::{MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig};
 use super::middleware::{
     AgentTraceMiddleware, AtPathExpansionMiddleware, CompactionMiddleware,
-    CompactionMiddlewareConfig, DynamicSubagentsMiddleware, HarnessSkillMiddleware,
-    InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware, PlanModeConfig,
-    PlanModeMiddleware, SkillCuratorMiddleware, SkillUsageMiddleware, SubagentsMiddleware,
-    ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
+    CompactionMiddlewareConfig, ConversationCompactionMiddleware, DynamicSubagentsMiddleware,
+    HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
+    MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
+    SkillUsageMiddleware, SubagentsMiddleware, ToolResultEvictionMiddleware,
+    WorkspaceContextMiddleware,
 };
 use super::skill::{
     build_promoter, compose_skill_repositories, AuditEntry, default_gate, FilesystemSkillUsageStore,
-    LoadSkillTool, ProposeSkillTool, SkillAuditLog, SkillCurator, SkillCuratorConfig, SkillFilter,
+    LazyLoadSkillTool, ProposeSkillTool, SkillAuditLog, SkillCurator, SkillCuratorConfig, SkillFilter,
     SkillManageConfig, SkillManageTool, SkillPromoter, SkillPromotionGate, SkillRepository,
     SkillUsageStore, SkillVisibilityFilter, WorkspaceSkillRepository,
 };
@@ -226,6 +227,8 @@ pub struct HarnessAgentBuilder {
     memory_config: Option<MemoryConfig>,
     compaction_config: Option<CompactionMiddlewareConfig>,
     tool_result_eviction_config: Option<ToolResultEvictionConfig>,
+    /// Conversation-compaction configuration (`ConversationCompactionMiddleware`).
+    conversation_compaction_config: Option<super::memory::compaction::CompactionConfig>,
     plan_mode_enabled: bool,
     plan_mode_allow_shell: bool,
     plan_file_dir: String,
@@ -276,6 +279,7 @@ impl Default for HarnessAgentBuilder {
             memory_config: None,
             compaction_config: None,
             tool_result_eviction_config: None,
+            conversation_compaction_config: None,
             plan_mode_enabled: false,
             plan_mode_allow_shell: false,
             plan_file_dir: DEFAULT_PLAN_DIR.to_string(),
@@ -411,6 +415,17 @@ impl HarnessAgentBuilder {
     /// Overrides the tool-result eviction configuration.
     pub fn tool_result_eviction(mut self, config: ToolResultEvictionConfig) -> Self {
         self.tool_result_eviction_config = Some(config);
+        self
+    }
+
+    /// Enables conversation compaction: at the start of each agent call the
+    /// accumulated history is summarized (LLM) and replaced with
+    /// `[summary] + preserved tail` once it exceeds the configured trigger.
+    pub fn conversation_compaction(
+        mut self,
+        config: super::memory::compaction::CompactionConfig,
+    ) -> Self {
+        self.conversation_compaction_config = Some(config);
         self
     }
 
@@ -696,6 +711,17 @@ impl HarnessAgentBuilder {
             }
         }
 
+        // ---- Conversation compaction ----
+        if let Some(cfg) = self.conversation_compaction_config.clone() {
+            if let Some(model) = self.model.clone() {
+                middleware.add(Box::new(ConversationCompactionMiddleware::with_model(
+                    model,
+                    cfg,
+                    name.clone(),
+                )));
+            }
+        }
+
         // ---- Message bus / inbox ----
         let message_bus = self.message_bus.clone().or_else(|| {
             Some(Arc::new(WorkspaceMessageBus::new(
@@ -884,11 +910,11 @@ impl HarnessAgentBuilder {
                     Some(resolved_workspace.clone()),
                 )
             };
-            let index = skill_mw.load_index();
-            if !index.is_empty() {
-                toolkit.register_tool(Arc::new(LoadSkillTool::new(index)));
-            }
-            middleware.add(Box::new(skill_mw));
+            // 嵌入式优化：不再于启动时全量扫描技能目录，改为惰性工具，
+            // 首次调用 load_skill_through_path 时才构建索引（内部缓存）。
+            let skill_mw = Arc::new(skill_mw);
+            toolkit.register_tool(Arc::new(LazyLoadSkillTool::new(Arc::clone(&skill_mw))));
+            middleware.add_arc(skill_mw as Arc<dyn agentscope_core::middleware::Middleware>);
         }
 
         // ---- Toolkit (filesystem / shell tools) ----

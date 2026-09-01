@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::json;
-
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
@@ -122,5 +121,53 @@ impl Tool for LoadSkillTool {
                 byte_len
             ))),
         }
+    }
+}
+
+/// 惰性 `load_skill_through_path` 工具：持有 [`HarnessSkillMiddleware`] 的 Arc 引用，
+/// 首次被调用时才构建技能索引（`load_index` 内部惰性 + 缓存），
+/// 从而把启动时的全量磁盘扫描推迟到第一次实际加载技能时（嵌入式内存优化）。
+pub struct LazyLoadSkillTool {
+    middleware: std::sync::Arc<crate::agent::middleware::HarnessSkillMiddleware>,
+}
+
+impl LazyLoadSkillTool {
+    pub fn new(
+        middleware: std::sync::Arc<crate::agent::middleware::HarnessSkillMiddleware>,
+    ) -> Self {
+        Self { middleware }
+    }
+}
+
+#[async_trait]
+impl Tool for LazyLoadSkillTool {
+    fn name(&self) -> &str {
+        "load_skill_through_path"
+    }
+
+    fn description(&self) -> &str {
+        "Load the documentation or a resource file of an available skill. \
+         Provide skillId (from <available_skills>) and an optional relative path \
+         inside that skill (defaults to SKILL.md). Returns the file content."
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "skillId": {"type": "string", "description": "The skill id, e.g. <name>_<source> as shown in <available_skills>"},
+                "path": {"type": "string", "description": "Relative path inside the skill directory (default: SKILL.md)"}
+            },
+            "required": ["skillId"]
+        })
+    }
+
+    async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+        let index = self.middleware.load_index();
+        LoadSkillTool::new(index).call(args, ctx).await
     }
 }

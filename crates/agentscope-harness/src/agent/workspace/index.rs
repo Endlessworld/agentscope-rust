@@ -5,19 +5,29 @@
 //! remote-backed workspace mode by avoiding full-store key scans. File *content* is
 //! never stored — `grep` still fetches each candidate file authoritatively.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Arc;
 
+#[cfg(feature = "rusqlite")]
+use std::path::PathBuf;
+#[cfg(feature = "rusqlite")]
+use std::sync::Mutex;
+#[cfg(feature = "rusqlite")]
 use rusqlite::{Connection, OptionalExtension};
 
+#[cfg(feature = "rusqlite")]
 use super::constants::{AGENTS_DIR, MEMORY_DIR};
 
 /// Schema version stored in `index_state`; bump when the schema changes.
+#[cfg(feature = "rusqlite")]
 const SCHEMA_VERSION: i64 = 1;
+#[cfg(feature = "rusqlite")]
 const INDEX_DIR: &str = ".index";
+#[cfg(feature = "rusqlite")]
 const INDEX_DB: &str = "workspace.db";
 
 /// Workspace-relative prefixes eligible for indexing.
+#[cfg(feature = "rusqlite")]
 fn indexed_prefixes() -> Vec<String> {
     vec![format!("{AGENTS_DIR}/"), format!("{MEMORY_DIR}/")]
 }
@@ -29,7 +39,12 @@ fn indexed_prefixes() -> Vec<String> {
 pub struct WorkspaceIndex {
     // `rusqlite::Connection` is `Send` but not `Sync`, so guard it behind a `Mutex`
     // to make `WorkspaceIndex` shareable via `Arc`.
-    conn: Mutex<Connection>,
+    // 嵌入式优化：连接惰性打开——`open()` 仅记录 db 路径，首次真正读写时才
+    // `Connection::open`，避免 agent 构建阶段就占用 SQLite 页缓存等固定内存。
+    #[cfg(feature = "rusqlite")]
+    conn: Mutex<Option<Connection>>,
+    #[cfg(feature = "rusqlite")]
+    db_path: PathBuf,
 }
 
 impl WorkspaceIndex {
@@ -37,45 +52,55 @@ impl WorkspaceIndex {
     ///
     /// Returns `None` when the index cannot be initialized — callers should treat a
     /// missing index as "unavailable" and fall back to a full scan.
+    ///
+    /// 嵌入式优化：此处只记录路径、不打开连接；首次查询时通过 [`Self::ensure_open`]
+    /// 延迟建立 SQLite 连接。
     pub fn open(workspace_root: &Path) -> Option<Arc<Self>> {
-        let index_dir = workspace_root.join(INDEX_DIR);
-        if std::fs::create_dir_all(&index_dir).is_err() {
-            tracing::warn!("WorkspaceIndex unavailable (non-fatal): cannot create {index_dir:?}");
-            return None;
+        #[cfg(feature = "rusqlite")]
+        {
+            let index_dir = workspace_root.join(INDEX_DIR);
+            if std::fs::create_dir_all(&index_dir).is_err() {
+                tracing::warn!("WorkspaceIndex unavailable (non-fatal): cannot create {index_dir:?}");
+                return None;
+            }
+            let db_file = index_dir.join(INDEX_DB);
+            Some(Arc::new(WorkspaceIndex {
+                conn: Mutex::new(None),
+                db_path: db_file,
+            }))
         }
-        let db_file = index_dir.join(INDEX_DB);
-        let conn = Connection::open(&db_file).ok()?;
-        let index = WorkspaceIndex { conn: Mutex::new(conn) };
-        if index.init_schema().is_err() {
-            return None;
+        #[cfg(not(feature = "rusqlite"))]
+        {
+            // lite 模式（嵌入式）：不建立 SQLite 索引，调用方降级为全量目录扫描。
+            let _ = workspace_root;
+            None
         }
-        Some(Arc::new(index))
     }
 
-    fn init_schema(&self) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS files (
-                path         TEXT PRIMARY KEY,
-                size_bytes   INTEGER,
-                modified_at  TEXT,
-                content_type TEXT,
-                encoding     TEXT,
-                present_local INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS index_state (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO index_state(key, value) VALUES ('schema_version', ?1)",
-            rusqlite::params![SCHEMA_VERSION],
-        )?;
-        Ok(())
+    /// 惰性打开 SQLite 连接（幂等）。失败时保持 `None` 并降级为空索引。
+    #[cfg(feature = "rusqlite")]
+    fn ensure_open(&self) -> bool {
+        let mut guard = self.conn.lock().unwrap();
+        if guard.is_some() {
+            return true;
+        }
+        let conn = match Connection::open(&self.db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("WorkspaceIndex open deferred failed (non-fatal): {e}");
+                return false;
+            }
+        };
+        if init_schema_on(&conn).is_err() {
+            tracing::debug!("WorkspaceIndex schema init failed (non-fatal)");
+            return false;
+        }
+        *guard = Some(conn);
+        true
     }
 
     /// Whether the given workspace-relative path falls under an indexed prefix.
+    #[cfg(feature = "rusqlite")]
     pub fn is_indexable(path: &str) -> bool {
         if path.trim().is_empty() {
             return false;
@@ -84,6 +109,7 @@ impl WorkspaceIndex {
     }
 
     /// Upserts a file entry in the index. No-ops if the path is not indexable.
+    #[cfg(feature = "rusqlite")]
     pub fn upsert(&self, path: &str, size_bytes: i64, modified_at: Option<&str>) {
         if !Self::is_indexable(path) {
             return;
@@ -91,7 +117,10 @@ impl WorkspaceIndex {
         let ts = modified_at.map(str::to_string).unwrap_or_else(|| {
             chrono::Utc::now().to_rfc3339()
         });
-        let res = self.conn.lock().unwrap().execute(
+        if !self.ensure_open() {
+            return;
+        }
+        let res = self.conn.lock().unwrap().as_ref().unwrap().execute(
             "INSERT INTO files(path, size_bytes, modified_at, present_local)
              VALUES (?1, ?2, ?3, 1)
              ON CONFLICT(path) DO UPDATE SET
@@ -106,6 +135,7 @@ impl WorkspaceIndex {
     }
 
     /// Upserts using local file size/mtime when the file exists on disk.
+    #[cfg(feature = "rusqlite")]
     pub fn upsert_from_local_file(&self, path: &str, local_file: &Path) {
         if !Self::is_indexable(path) {
             return;
@@ -132,13 +162,19 @@ impl WorkspaceIndex {
     }
 
     /// Removes a file entry from the index. No-ops if not indexable.
+    #[cfg(feature = "rusqlite")]
     pub fn remove(&self, path: &str) {
         if !Self::is_indexable(path) {
+            return;
+        }
+        if !self.ensure_open() {
             return;
         }
         if let Err(e) = self
             .conn
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .execute("DELETE FROM files WHERE path=?1", rusqlite::params![path])
         {
@@ -147,11 +183,15 @@ impl WorkspaceIndex {
     }
 
     /// Renames (moves) an index entry from `from_path` to `to_path`.
+    #[cfg(feature = "rusqlite")]
     pub fn rename(&self, from_path: &str, to_path: &str) {
         if !Self::is_indexable(from_path) && !Self::is_indexable(to_path) {
             return;
         }
-        if let Err(e) = self.conn.lock().unwrap().execute(
+        if !self.ensure_open() {
+            return;
+        }
+        if let Err(e) = self.conn.lock().unwrap().as_ref().unwrap().execute(
             "UPDATE files SET path=?2 WHERE path=?1",
             rusqlite::params![from_path, to_path],
         ) {
@@ -162,13 +202,19 @@ impl WorkspaceIndex {
     }
 
     /// Whether the index contains a locally-present entry for the path.
+    #[cfg(feature = "rusqlite")]
     pub fn exists(&self, path: &str) -> bool {
         if !Self::is_indexable(path) {
+            return false;
+        }
+        if !self.ensure_open() {
             return false;
         }
         let found: Option<bool> = self
             .conn
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .query_row(
                 "SELECT 1 FROM files WHERE path=?1 AND present_local=1 LIMIT 1",
@@ -181,9 +227,14 @@ impl WorkspaceIndex {
     }
 
     /// Returns all locally-present paths that start with the given prefix.
+    #[cfg(feature = "rusqlite")]
     pub fn list_by_prefix(&self, prefix: &str) -> Vec<String> {
+        if !self.ensure_open() {
+            return Vec::new();
+        }
         let guard = self.conn.lock().unwrap();
-        let mut stmt = match guard.prepare("SELECT path FROM files WHERE path LIKE ?1 AND present_local=1")
+        let conn = guard.as_ref().unwrap();
+        let mut stmt = match conn.prepare("SELECT path FROM files WHERE path LIKE ?1 AND present_local=1")
         {
             Ok(s) => s,
             Err(e) => {
@@ -207,10 +258,16 @@ impl WorkspaceIndex {
     }
 
     /// Whether the index has any entries under the given prefix (faster than list).
+    #[cfg(feature = "rusqlite")]
     pub fn has_prefix(&self, prefix: &str) -> bool {
+        if !self.ensure_open() {
+            return false;
+        }
         let found: Option<bool> = self
             .conn
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .query_row(
                 "SELECT 1 FROM files WHERE path LIKE ?1 AND present_local=1 LIMIT 1",
@@ -224,8 +281,12 @@ impl WorkspaceIndex {
 
     /// Rebuilds the index by walking the local workspace directories
     /// (`agents/*/sessions` and `memory`). Best-effort.
+    #[cfg(feature = "rusqlite")]
     pub fn rebuild_from_disk(&self, workspace_root: &Path) {
-        let _ = self.conn.lock().unwrap().execute("DELETE FROM files", []);
+        if !self.ensure_open() {
+            return;
+        }
+        let _ = self.conn.lock().unwrap().as_ref().unwrap().execute("DELETE FROM files", []);
         for prefix in indexed_prefixes() {
             let dir = workspace_root.join(&prefix);
             if !dir.is_dir() {
@@ -245,7 +306,71 @@ impl WorkspaceIndex {
         tracing::info!("WorkspaceIndex rebuilt from local disk");
     }
 }
+/// lite 模式（`--no-default-features --features lite`，无 rusqlite）下的空实现：
+/// 索引不可用，所有方法 no-op，调用方（`WorkspaceManager`）退化到全量目录扫描。
+#[cfg(not(feature = "rusqlite"))]
+impl WorkspaceIndex {
+    /// Whether the given workspace-relative path falls under an indexed prefix.
+    pub fn is_indexable(_path: &str) -> bool {
+        false
+    }
 
+    /// Upserts a file entry in the index. No-op.
+    pub fn upsert(&self, _path: &str, _size_bytes: i64, _modified_at: Option<&str>) {}
+
+    /// Upserts using local file size/mtime when the file exists on disk. No-op.
+    pub fn upsert_from_local_file(&self, _path: &str, _local_file: &Path) {}
+
+    /// Removes a file entry from the index. No-op.
+    pub fn remove(&self, _path: &str) {}
+
+    /// Renames (moves) an index entry. No-op.
+    pub fn rename(&self, _from_path: &str, _to_path: &str) {}
+
+    /// Whether the index contains a locally-present entry for the path. Always false.
+    pub fn exists(&self, _path: &str) -> bool {
+        false
+    }
+
+    /// Returns all locally-present paths that start with the given prefix. Empty.
+    pub fn list_by_prefix(&self, _prefix: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Whether the index has any entries under the given prefix. Always false.
+    pub fn has_prefix(&self, _prefix: &str) -> bool {
+        false
+    }
+
+    /// Rebuilds the index by walking the local workspace directories. No-op.
+    pub fn rebuild_from_disk(&self, _workspace_root: &Path) {}
+}
+
+/// 在已打开的连接上初始化索引 schema（供惰性打开路径使用）。
+#[cfg(feature = "rusqlite")]
+fn init_schema_on(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS files (
+            path         TEXT PRIMARY KEY,
+            size_bytes   INTEGER,
+            modified_at  TEXT,
+            content_type TEXT,
+            encoding     TEXT,
+            present_local INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS index_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO index_state(key, value) VALUES ('schema_version', ?1)",
+        rusqlite::params![SCHEMA_VERSION],
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "rusqlite")]
 fn walk_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     fn rec(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -253,7 +378,7 @@ fn walk_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             let p = entry?.path();
             if p.is_dir() {
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rusqlite"))]
 mod tests {
     use super::*;
 
@@ -267,8 +392,10 @@ mod tests {
     fn open_creates_db_and_schema() {
         let root = temp_dir("open");
         let idx = WorkspaceIndex::open(&root).expect("index opens");
-        assert!(root.join(".index/workspace.db").exists());
+        // 惰性语义：open 只记录路径，首次读写才建立 db 文件。
+        assert!(root.join(".index").exists());
         idx.upsert("memory/2024-01-01.md", 10, None);
+        assert!(root.join(".index/workspace.db").exists());
         assert!(idx.exists("memory/2024-01-01.md"));
         let _ = std::fs::remove_dir_all(&root);
     }
