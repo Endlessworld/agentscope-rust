@@ -45,13 +45,14 @@ async fn filesystem_tools_registered_and_dispatch() {
     }
 
     // write_file then read_file roundtrip
-    let write_call = ToolUseBlock::new("1", "write_file", serde_json::json!({ "path": "/a.txt", "content": "hello world" }).as_object().cloned().unwrap());
+    let write_call = ToolUseBlock::new("1", "write_file", serde_json::json!({ "operations": [{ "path": "/a.txt", "content": "hello world" }] }).as_object().cloned().unwrap());
     let r = toolkit.call_tool(&write_call, Default::default()).await.unwrap();
-    assert!(result_text(&r).contains("Written to"));
+    assert!(result_text(&r).contains("### /a.txt"));
+    assert!(result_text(&r).contains("Written"));
 
-    let read_call = ToolUseBlock::new("2", "read_file", serde_json::json!({ "path": "/a.txt" }).as_object().cloned().unwrap());
+    let read_call = ToolUseBlock::new("2", "read_file", serde_json::json!({ "filePath": ["/a.txt"] }).as_object().cloned().unwrap());
     let r = toolkit.call_tool(&read_call, Default::default()).await.unwrap();
-    assert_eq!(result_text(&r), "hello world");
+    assert!(result_text(&r).contains("hello world"));
 }
 
 #[tokio::test]
@@ -62,7 +63,7 @@ async fn edit_file_via_toolkit() {
     let toolkit = Toolkit::new();
     FilesystemTool::register(&toolkit, fs.clone());
 
-    let call = ToolUseBlock::new("1", "edit_file", serde_json::json!({ "path": "/a.txt", "old_string": "two", "new_string": "three", "replace_all": true }).as_object().cloned().unwrap());
+    let call = ToolUseBlock::new("1", "edit_file", serde_json::json!({ "operations": [{ "path": "/a.txt", "old_string": "two", "new_string": "three", "replace_all": true }] }).as_object().cloned().unwrap());
     let r = toolkit.call_tool(&call, Default::default()).await.unwrap();
     assert!(result_text(&r).contains("2 replacement"));
     let data = fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap();
