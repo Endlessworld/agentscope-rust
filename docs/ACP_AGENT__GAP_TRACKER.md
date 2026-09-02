@@ -50,7 +50,7 @@
 |---|---|---|
 | SetSessionConfigOptionRequest（model/mode） | ✅ 已完成 | 更新 SessionConfig.model/mode + 返回新 config_options |
 | SetSessionModeRequest | ✅ 已完成 | 更新 mode |
-| `$/cancel_request` → 取消 + StopReason::Cancelled | ⚠️ 部分 | 会话内 cancel()（AtomicBool）已实现；`$/cancel_request` 通知 handler 未注册（需 on_receive_notification + CancelRequestNotification） |
+| `$/cancel_request` → 取消 + StopReason::Cancelled | ✅ 已完成 | 利用 SDK `Responder::cancellation()` marker：PromptRequest handler 取 `responder.cancellation()` 传给 `run_prompt_cancellable`，SDK 收到 `$/cancel_request` 自动置位 marker；handler 用 `cx.spawn` 把 prompt 移出 dispatch loop（否则长 handler 阻塞 loop 导致取消通知无法处理）；`run_prompt_cancellable` 在 select 中监听 `cancellation.cancelled()` 返回 Cancelled。e2e 测试 `acp_cancel_test.rs`（进程内 Channel::duplex + never-ending model）验证通过；`acp_event_flow_test` / `acp_stdio_thought_test`（真实 model）均无回归 |
 
 ### 2.5 权限 HITL（P2 增强）
 | 缺口项 | 执行状态 | 交接信息/说明 |
@@ -63,21 +63,23 @@
 | examples/acp_agent_demo.rs（脚本化 Model） | ✅ 已完成 | 脚本化 Model + add 工具；stdio 运行验证通过 |
 | 单元测试（事件转换/配置） | ✅ 已完成 | event.rs 4 单测 + config.rs 3 单测，共 7 个通过 |
 | 协议集成（stdio 握手+prompt） | ✅ 已完成 | groovy 驱动二进制：initialize→new_session→prompt(AgentMessageChunk)→end_turn→close 全链路验证 |
+| **取消 e2e（$/cancel_request）** | ✅ 已完成 | `acp_cancel_test.rs`：进程内 `Channel::duplex` transport + never-ending 脚本化 model，client 发 prompt 后 `SentRequest::cancel()`，断言 agent 返回 `StopReason::Cancelled`（0.33s，无需真实 model） |
 
 ## 3. 项目状态与下一步
 ### 3.1 当前状态
 - 方案文档 `docs/ACP_AGENT_PLAN.md` 已创建。
 - **ACP CodingAgent 核心已实现并通过 stdio 端到端验证**（initialize/new_session/prompt/close 全链路）。
-- 测试：harness lib 135 通过（含 acp 7 个新单测，原 128）。
+- **`$/cancel_request` 取消已实现并通过进程内 e2e 验证**（`acp_cancel_test.rs`，无需真实 model）。
+- 测试：harness lib 149 通过（含 acp 单测）；集成：acp_cancel_test（1）+ acp_event_flow_test（1）+ acp_stdio_thought_test（真实 model，1）全绿。
 - `cargo build -p agentscope-harness` 通过；`cargo build -p agentscope-core` 通过。
-- **注意**：`../crates/agentscope-harness/examples/acp_harness_agent.rs` 为既有损坏示例（AgentSkillBuilder 等错误），与本次改动无关，未处理。
 
 ### 3.2 下一步建议
-1. **Phase 1**：建 `acp/` 模块 + Initialize 处理器 + connect_stdio，编译通过
-2. **Phase 2**：会话生命周期（new/close/list/load/resume/delete）
-3. **Phase 3**：Prompt 核心（ReAct 驱动 + 事件转换）
-4. **Phase 4**：配置与取消
-5. **Phase 6**：示例与测试
+1. **Phase 1**：建 `acp/` 模块 + Initialize 处理器 + connect_stdio，编译通过 ✅
+2. **Phase 2**：会话生命周期（new/close/list/load/resume/delete）✅
+3. **Phase 3**：Prompt 核心（ReAct 驱动 + 事件转换）✅
+4. **Phase 4**：配置与取消 ✅（`$/cancel_request` 已完成）
+5. **Phase 5**：权限 HITL（RequestPermissionRequest 往返，Ask 决策）— 待办
+6. **Phase 6**：示例与测试 ✅
 
 ## 4. 执行状态约定（所有会话必须遵守）
 - 开工前：读本文件 + `git status` + 确认 `cargo build` 基线。

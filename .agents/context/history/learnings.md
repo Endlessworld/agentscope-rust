@@ -24,6 +24,22 @@
 - **注意**：`CompletionUsage` 在 `async_openai::types::chat` 模块（经 `pub use chat_::*` 导出），
   不在 `async_openai::types` 根。
 
+## 2026-09 ACP $/cancel_request 实现（SDK cancellation 机制）
+- **现象**：`AcpCodingAgent` 的 `$/cancel_request` 通知 handler 未注册（GAP_TRACKER 标 ⚠️），需实现取消。
+- **关键认知 1**：**无需注册 `on_receive_notification(CancelRequestNotification)`**——SDK 会在收到 `$/cancel_request` 时
+  自动更新对应 `Responder` 的 cancellation marker（`Responder::cancellation()` → `RequestCancellation`，Clone）。
+  正确做法是 handler 内取 marker 并监听 `cancellation.cancelled()`。
+- **关键认知 2（踩坑）**：**长 handler 会阻塞 dispatch loop**，导致 `$/cancel_request` 无法被处理、marker 永远不更新。
+  必须把长任务（如 `run_prompt`）用 `cx.spawn(...)` 移出 dispatch loop，handler 立即返回 `Ok(())`。
+  首次实现因 handler 内 `await run_prompt`（never-ending model）导致 e2e 测试 5 分钟超时卡死。
+- **关键认知 3**：SDK 提供 `Channel::duplex()`（内存双向通道，实现 `ConnectTo<R>` for all roles），
+  可做**进程内端到端测试**（无需子进程/真实 model）：agent 端 `run_with_transport(channel_a)`，
+  client 端 `Client.builder().connect_with(channel_b, ...)`。
+- **测试诀窍**：`NeverEndingModel`（`futures::stream::pending()`）让 `run_prompt` 永不结束，
+  client 侧 `prompt_request.cancel()` 后断言 `StopReason::Cancelled`。
+- **注意**：`Responder::respond(self, ...)` 消费 self，需连同 `responder` 一起 move 进 spawn 任务；
+  `cx.spawn` 要求 `Result<(), Error>` 输出。
+
 ## 2026-08-28 opencode zen 网关思考字段是 `reasoning` 而非 `reasoning_content`
 - **现象**：release 版 CLI 连接 `acp_harness_agent` 时，界面始终无思考过程输出（只有正文）。
 - **根因**：`openai.rs` 的 `OpenAiStreamDelta` 只解析 `reasoning_content` 字段，但 opencode zen 网关

@@ -206,6 +206,21 @@ impl AcpCodingAgent {
 
     /// Assembles and runs the ACP agent over stdio until the connection closes.
     pub async fn run_stdio(self) -> agent_client_protocol::Result<()> {
+        self.run_with_transport(Stdio::new()).await
+    }
+
+    /// Assembles the full ACP agent (all request handlers) and connects it to
+    /// the given transport, running until the connection closes.
+    ///
+    /// This is the transport-agnostic core of [`run_stdio`](Self::run_stdio);
+    /// tests can inject an in-process [`Channel`] transport to exercise the
+    /// full handler chain without spawning a subprocess.
+    ///
+    /// [`Channel`]: agent_client_protocol::Channel
+    pub async fn run_with_transport(
+        self,
+        transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
+    ) -> agent_client_protocol::Result<()> {
         let agent = Arc::new(self);
         let a_init = agent.clone();
         let a_new = agent.clone();
@@ -259,13 +274,28 @@ impl AcpCodingAgent {
                         }
                     };
                     let emit_cx = cx.clone();
-                    let stop = session
-                        .run_prompt(req.prompt, move |notif| {
-                            let _ = emit_cx.send_notification(notif);
-                        })
-                        .await;
-                    a_prompt.register_session(session);
-                    responder.respond(PromptResponse::new(stop))
+                    // The SDK sets this marker when the client sends `$/cancel_request`
+                    // for this prompt's JSON-RPC request id; `run_prompt_cancellable`
+                    // watches it and returns `StopReason::Cancelled`.
+                    let cancellation = responder.cancellation();
+                    let registrar = a_prompt.clone();
+                    // Run the prompt on a spawned task: a long-running handler would
+                    // otherwise block the dispatch loop, so the SDK could never
+                    // process the incoming `$/cancel_request` and update the marker.
+                    cx.spawn(async move {
+                        let stop = session
+                            .run_prompt_cancellable(
+                                req.prompt,
+                                move |notif| {
+                                    let _ = emit_cx.send_notification(notif);
+                                },
+                                Some(cancellation),
+                            )
+                            .await;
+                        registrar.register_session(session);
+                        responder.respond(PromptResponse::new(stop))
+                    })?;
+                    Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -382,7 +412,7 @@ impl AcpCodingAgent {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
-            .connect_to(Stdio::new())
+            .connect_to(transport)
             .await
     }
 }

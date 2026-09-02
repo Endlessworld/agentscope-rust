@@ -128,6 +128,24 @@ impl AcpAgentSession {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    /// Runs a prompt against the core agent and streams updates, honouring the
+    /// SDK's per-request cancellation marker (`$/cancel_request`) in addition to
+    /// the session-level [`cancel`](Self::cancel) flag.
+    ///
+    /// The `emit` closure is invoked for each ACP `SessionNotification` to send
+    /// back to the client. Returns the `StopReason` for the turn.
+    pub async fn run_prompt_cancellable<F>(
+        &mut self,
+        content: Vec<ContentBlock>,
+        emit: F,
+        cancellation: Option<agent_client_protocol::RequestCancellation>,
+    ) -> StopReason
+    where
+        F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
+    {
+        self.run_prompt_inner(content, emit, cancellation).await
+    }
+
     /// Runs a prompt against the core agent and streams updates.
     ///
     /// The `emit` closure is invoked for each ACP `SessionNotification` to send
@@ -136,6 +154,20 @@ impl AcpAgentSession {
         &mut self,
         content: Vec<ContentBlock>,
         emit: F,
+    ) -> StopReason
+    where
+        F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
+    {
+        self.run_prompt_inner(content, emit, None).await
+    }
+
+    /// Shared implementation for [`run_prompt`](Self::run_prompt) and
+    /// [`run_prompt_cancellable`](Self::run_prompt_cancellable).
+    async fn run_prompt_inner<F>(
+        &mut self,
+        content: Vec<ContentBlock>,
+        emit: F,
+        cancellation: Option<agent_client_protocol::RequestCancellation>,
     ) -> StopReason
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
@@ -188,6 +220,17 @@ impl AcpAgentSession {
                     if cancel_flag.load(Ordering::SeqCst) {
                         return StopReason::Cancelled;
                     }
+                }
+                // The SDK sets this marker when the peer sends `$/cancel_request`
+                // for the prompt's JSON-RPC request id.
+                _ = async {
+                    if let Some(c) = &cancellation {
+                        c.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    return StopReason::Cancelled;
                 }
                 item = stream.next() => {
                     match item {
