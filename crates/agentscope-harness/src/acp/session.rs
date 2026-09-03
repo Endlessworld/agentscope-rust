@@ -8,14 +8,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, MessageId, SessionConfigOption, SessionId, SessionMode, SessionModeState, StopReason,
+    ContentBlock, MessageId, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigOption, SessionId, SessionMode, SessionModeState, StopReason, ToolCallUpdate,
 };
+use agent_client_protocol::{Client, ConnectionTo};
 use agentscope_core::agent::StreamOptions;
-use agentscope_core::message::{ChatUsage, Msg};
+use agentscope_core::event::ConfirmResult;
+use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
+use agentscope_core::permission::{PermissionBehavior, PermissionRule};
+use agentscope_core::ConfirmHandler;
 
 use crate::agent::HarnessAgent;
 
-use super::config::{ModeChoice, ModelChoice};
+use super::config::{self, ModeChoice, ModelChoice};
+use super::event;
+use super::permission_store::PermissionRuleStore;
 
 /// Current configuration of an ACP session.
 #[derive(Debug, Clone)]
@@ -28,10 +36,187 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             model: "default".to_string(),
-            mode: "yolo".to_string(),
+            mode: config::default_mode().to_string(),
         }
     }
 }
+
+/// Permission option ids advertised to ACP clients, mirroring the Java agent's
+/// `PermissionOptionKind` naming.
+const OPTION_ALLOW_ONCE: &str = "ALLOW_ONCE";
+const OPTION_ALLOW_ALWAYS: &str = "ALLOW_ALWAYS";
+const OPTION_REJECT_ONCE: &str = "REJECT_ONCE";
+const OPTION_REJECT_ALWAYS: &str = "REJECT_ALWAYS";
+
+/// Client handle used to push `session/request_permission` (human review)
+/// requests back to the ACP client and await the user's decision.
+///
+/// The wrapped connection is the same `ConnectionTo<Client>` the coding agent's
+/// prompt handler receives; it is cheaply cloneable and safe to share into the
+/// spawned task that runs the agent.
+#[derive(Clone)]
+pub struct AcpClientHandle {
+    connection: ConnectionTo<Client>,
+}
+
+impl AcpClientHandle {
+    /// Wraps an agent-side connection whose counterpart is the ACP client.
+    pub(crate) fn new(connection: ConnectionTo<Client>) -> Self {
+        Self { connection }
+    }
+
+    /// Asks the client to request the user's permission for `tool_call`,
+    /// returning the selected/rejected outcome.
+    ///
+    /// Only safe to await from a task outside the dispatch loop (the agent run
+    /// already lives in a `ConnectionTo::spawn`ed task), which is exactly how
+    /// the confirm handler invokes it.
+    pub(crate) async fn request_permission(
+        &self,
+        session_id: &SessionId,
+        tool_call: ToolCallUpdate,
+    ) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
+        let request =
+            RequestPermissionRequest::new(session_id.clone(), tool_call, permission_options());
+        self.connection.send_request(request).block_task().await
+    }
+}
+
+/// The four choices surfaced to the reviewer, mirroring the Java agent.
+fn permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new(
+            OPTION_ALLOW_ONCE,
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            OPTION_ALLOW_ALWAYS,
+            "Always allow",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            OPTION_REJECT_ONCE,
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            OPTION_REJECT_ALWAYS,
+            "Always reject",
+            PermissionOptionKind::RejectAlways,
+        ),
+    ]
+}
+
+/// Builds the rule recorded when the user picks an "always" option: it matches
+/// the exact tool call pattern (tool name + serialized arguments), so the same
+/// invocation is decided automatically on later turns.
+fn always_rule_for(call: &ToolUseBlock, allow: bool) -> PermissionRule {
+    let behavior = if allow {
+        PermissionBehavior::Allow
+    } else {
+        PermissionBehavior::Deny
+    };
+    let content = if call.input.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&call.input).unwrap_or_default())
+    };
+    PermissionRule::new(call.name.clone(), content, behavior, "user-permission")
+}
+
+/// Builds the core `ConfirmHandler` that turns an `Ask` permission decision
+/// into an ACP `session/request_permission` round-trip and maps the outcome
+/// back to a [`ConfirmResult`].
+fn acp_confirm_handler(
+    session_id: SessionId,
+    client: Arc<AcpClientHandle>,
+    agent: Arc<HarnessAgent>,
+    store: Arc<PermissionRuleStore>,
+) -> ConfirmHandler {
+    Arc::new(move |call: ToolUseBlock| {
+        let client = Arc::clone(&client);
+        let agent = Arc::clone(&agent);
+        let store = Arc::clone(&store);
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            let raw_input = if call.input.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(call.input.clone()))
+            };
+            let tool_call = event::tool_call_update_for_permission(
+                call.id.clone(),
+                &call.name,
+                raw_input,
+            );
+            match client.request_permission(&session_id, tool_call).await {
+                Ok(response) => match response.outcome {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                        option_id,
+                        ..
+                    }) => match option_id.to_string().as_str() {
+                        OPTION_ALLOW_ONCE => ConfirmResult::allowed(),
+                        OPTION_ALLOW_ALWAYS => {
+                            let rule = always_rule_for(&call, true);
+                            agent.add_permission_rule(rule.clone());
+                            if let Err(error) = store.add(rule) {
+                                tracing::warn!(
+                                    tool = %call.name,
+                                    %error,
+                                    "failed to persist 'always allow' permission rule"
+                                );
+                            }
+                            ConfirmResult::allowed()
+                        }
+                        OPTION_REJECT_ONCE => {
+                            ConfirmResult::denied("Permission rejected by user")
+                        }
+                        OPTION_REJECT_ALWAYS => {
+                            let rule = always_rule_for(&call, false);
+                            agent.add_permission_rule(rule.clone());
+                            if let Err(error) = store.add(rule) {
+                                tracing::warn!(
+                                    tool = %call.name,
+                                    %error,
+                                    "failed to persist 'always reject' permission rule"
+                                );
+                            }
+                            ConfirmResult::denied("Permission rejected by user")
+                        }
+                        other => {
+                            // Unknown option id: fail open to avoid stalling the
+                            // agent, and log so misconfiguration is visible.
+                            tracing::warn!(
+                                tool = %call.name,
+                                option = other,
+                                "unexpected permission option id; allowing"
+                            );
+                            ConfirmResult::allowed()
+                        }
+                    },
+                    RequestPermissionOutcome::Cancelled => {
+                        ConfirmResult::denied("Permission request cancelled")
+                    }
+                    // The schema enum is non-exhaustive; treat any future
+                    // outcome as a rejection to avoid executing on ambiguity.
+                    _ => ConfirmResult::denied("Unexpected permission outcome"),
+                },
+                Err(error) => {
+                    // No working client channel: mirror the Java behaviour of
+                    // auto-approving when ClientSessionOperations is absent.
+                    tracing::warn!(
+                        tool = %call.name,
+                        %error,
+                        "request_permission failed; auto-approving tool"
+                    );
+                    ConfirmResult::allowed()
+                }
+            }
+        })
+    })
+}
+
 
 /// A single ACP session backed by a [`HarnessAgent`].
 #[derive(Clone)]
@@ -45,6 +230,12 @@ pub struct AcpAgentSession {
     /// Cancel flag for the currently active prompt request.
     cancel: Arc<AtomicBool>,
     usage: ChatUsage,
+    /// Client connection used to push `session/request_permission` requests
+    /// when a tool call needs human confirmation. Set per prompt by the
+    /// connection layer (the coding agent has the live `ConnectionTo`).
+    client: Option<Arc<AcpClientHandle>>,
+    /// Persistent "always allow / always reject" rule store for this workspace.
+    permission_store: Arc<PermissionRuleStore>,
 }
 
 impl AcpAgentSession {
@@ -56,7 +247,8 @@ impl AcpAgentSession {
         models: Vec<ModelChoice>,
         modes: Vec<ModeChoice>,
     ) -> Self {
-        Self {
+        let permission_store = Arc::new(PermissionRuleStore::at_dir(&cwd));
+        let mut session = Self {
             session_id,
             cwd,
             agent: Arc::new(agent),
@@ -65,7 +257,11 @@ impl AcpAgentSession {
             modes,
             cancel: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
-        }
+            client: None,
+            permission_store,
+        };
+        session.apply_mode();
+        session
     }
 
     /// The session id.
@@ -101,6 +297,57 @@ impl AcpAgentSession {
     /// Sets the current mode.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
         self.config.mode = mode.into();
+        // Apply the mode's permission context to the live agent so the *next*
+        // request already runs under the new rules.
+        self.apply_mode();
+    }
+
+    /// Reconfigures the underlying agent's permission engine to match the
+    /// current session mode (`plan` / `accept_edits` / `yolo`), then layers the
+    /// persisted "always allow / always reject" user rules on top so they
+    /// survive mode switches and session restarts.
+    fn apply_mode(&mut self) {
+        let mode = self.config.mode.clone();
+        let ctx = config::permission_context_for_mode(&mode);
+        self.agent.set_permission_context(ctx);
+        let persisted = self.permission_store.load();
+        let persisted_count = persisted.len();
+        for rule in persisted {
+            self.agent.add_permission_rule(rule);
+        }
+        tracing::debug!(
+            session = %self.session_id,
+            mode,
+            persisted_rules = persisted_count,
+            "applied permission context for ACP session mode"
+        );
+    }
+
+    /// Binds the live client connection for this prompt/connection, so
+    /// `Ask` tool calls can push `session/request_permission` to the user.
+    pub fn set_client(&mut self, client: AcpClientHandle) {
+        self.client = Some(Arc::new(client));
+    }
+
+    /// Installs (or removes) the confirm handler that performs the ACP
+    /// permission round-trip. Called at the start of every prompt run.
+    fn install_confirm_handler(&self) {
+        match &self.client {
+            Some(client) => {
+                let handler = acp_confirm_handler(
+                    self.session_id.clone(),
+                    Arc::clone(client),
+                    Arc::clone(&self.agent),
+                    Arc::clone(&self.permission_store),
+                );
+                self.agent.set_confirm_handler(Some(handler));
+            }
+            None => {
+                // No client handle (e.g. an embedded run that never connected
+                // to an ACP peer): Ask decisions stay unsupported and error.
+                self.agent.set_confirm_handler(None);
+            }
+        }
     }
 
     /// Returns the session mode state advertised to the client.
@@ -174,6 +421,10 @@ impl AcpAgentSession {
     {
         self.cancel.store(false, Ordering::SeqCst);
         let cancel_flag = self.cancel.clone();
+
+        // Bind the confirm handler to the current client connection so tool
+        // calls that need approval push an ACP request_permission this turn.
+        self.install_confirm_handler();
 
         // Convert ACP content blocks into core messages.
         let mut msgs = Vec::new();

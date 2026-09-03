@@ -16,7 +16,7 @@ use agentscope_core::event::{AgentEvent, AgentEventType};
 
 /// Infers an ACP [`ToolKind`] from a tool name so clients can pick the right
 /// icon / UI treatment for a tool call.
-fn tool_kind_for(name: &str) -> ToolKind {
+pub(crate) fn tool_kind_for(name: &str) -> ToolKind {
     let n = name.to_ascii_lowercase();
     if n.contains("fetch") || n.contains("web") || n.contains("http") {
         ToolKind::Fetch
@@ -47,7 +47,7 @@ fn tool_kind_for(name: &str) -> ToolKind {
 
 /// Builds a human-readable tool-call title from the tool name, mirroring how
 /// reference agents label tool calls (e.g. `read_file` → "Reading file").
-fn human_title(name: &str) -> String {
+pub(crate) fn human_title(name: &str) -> String {
     let words: Vec<String> = name
         .split(['_', '-', ' '])
         .filter(|w| !w.is_empty())
@@ -104,7 +104,7 @@ const PATH_ARG_KEYS: &[&str] = &[
 ];
 
 /// Derives ACP `locations` from the tool-call arguments.
-fn locations_from(raw_input: &str) -> Vec<ToolCallLocation> {
+pub(crate) fn locations_from(raw_input: &str) -> Vec<ToolCallLocation> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_input) else {
         return Vec::new();
     };
@@ -149,7 +149,7 @@ fn json_value_from(s: String) -> Option<serde_json::Value> {
 
 /// `Some` only for non-empty collections: ACP updates *overwrite* collections,
 /// so sending an empty one would erase values already reported to the client.
-fn non_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
+pub(crate) fn non_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
     if v.is_empty() {
         None
     } else {
@@ -193,6 +193,28 @@ pub fn tool_call_update(
         session_id,
         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
     )
+}
+
+/// Builds the `ToolCallUpdate` payload embedded in an ACP
+/// `session/request_permission` request, describing the tool call whose
+/// execution needs human approval.
+pub(crate) fn tool_call_update_for_permission(
+    id: String,
+    name: &str,
+    raw_input: Option<serde_json::Value>,
+) -> ToolCallUpdate {
+    let mut fields = ToolCallUpdateFields::new()
+        .title(human_title(name))
+        .kind(tool_kind_for(name))
+        .status(ToolCallStatus::Pending)
+        .raw_input(raw_input.clone());
+    if let Some(v) = &raw_input {
+        let locations = locations_from(&v.to_string());
+        if !locations.is_empty() {
+            fields = fields.locations(locations);
+        }
+    }
+    ToolCallUpdate::new(id, fields)
 }
 
 /// Update fields for a tool call whose arguments are (at least partially) known:

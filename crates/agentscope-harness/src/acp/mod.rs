@@ -10,6 +10,7 @@
 pub mod coding_agent;
 pub mod config;
 pub mod event;
+pub mod permission_store;
 pub mod session;
 
 pub use coding_agent::{AcpCodingAgent, AcpCodingAgentBuilder};

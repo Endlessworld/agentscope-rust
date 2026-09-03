@@ -468,16 +468,8 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    // 嵌入式优化：单线程 current_thread 运行时，避免多线程 worker 栈开销。
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(CliError::Io)?;
-    rt.block_on(run())
-}
-
-async fn run() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

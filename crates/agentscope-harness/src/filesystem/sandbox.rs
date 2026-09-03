@@ -2,11 +2,13 @@
 //! mirroring `AbstractSandboxFilesystem`. The default backend runs commands on the local host.
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use tokio::io::AsyncReadExt;
 
 use super::{ExecuteResponse, FileData, FileInfo, Filesystem, GrepMatch};
 
@@ -85,6 +87,36 @@ fn build_windows_command(command: &str) -> Vec<String> {
     vec!["pwsh".into(), "-NoProfile".into(), "-EncodedCommand".into(), encoded]
 }
 
+/// Kills an entire process tree on Windows using `taskkill /F /T`.
+///
+/// This is critical: when we kill `pwsh.exe`, its child processes (`git.exe`,
+/// `git-credential-manager.exe`, etc.) become orphans that hold pipe handles
+/// open indefinitely, causing `tokio::process::Child::wait()` to hang forever.
+/// `taskkill /T` kills the process tree recursively.
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    use std::process::Command as StdCommand;
+    // Best-effort: don't unwrap — the process may have already exited.
+    let _ = StdCommand::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+}
+
+#[cfg(not(windows))]
+fn kill_process_tree(pid: u32) {
+    use std::process::Command as StdCommand;
+    // On Unix, send SIGTERM to the process group.
+    let _ = StdCommand::new("kill")
+        .args(["-TERM", "--", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+}
+
 #[async_trait]
 impl SandboxFilesystem for SandboxBackedFilesystem {
     async fn execute(
@@ -106,16 +138,67 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         cmd.current_dir(&self.cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let fut = cmd.output();
-        let out = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_seconds.max(1) as u64),
-            fut,
-        )
-        .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(Error::Io(e)),
-            Err(_) => {
+
+        // ── Key fix: spawn() + wait() instead of cmd.output() ──
+        //
+        // `cmd.output()` wraps the Child handle inside an anonymous future's
+        // state machine. When `tokio::time::timeout` fires and drops that future,
+        // `Child::drop()` only kills the *direct* child (pwsh.exe), but its
+        // grandchildren (git.exe, git-credential-manager.exe, etc.) become
+        // orphans that hold pipe handles open → wait() hangs forever → the
+        // tool appears to "timeout" even for trivial commands like `git --version`.
+        //
+        // By spawning first, the Child handle stays in scope and we can:
+        // 1. Take stdout/stderr BEFORE waiting (prevents pipe-full deadlock).
+        // 2. On timeout, kill the ENTIRE process tree via `taskkill /T`.
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to spawn command: {}", e),
+            )))?;
+
+        let pid = child.id().unwrap_or(0);
+
+        // Take the piped streams BEFORE awaiting — if we don't, and the child
+        // writes enough to fill the OS pipe buffer (~64KB on Windows), it blocks
+        // and our `wait()` never returns.
+        let mut stdout_stream = child.stdout.take();
+        let mut stderr_stream = child.stderr.take();
+
+        // Spawn background tasks to drain stdout/stderr concurrently.
+        let stdout_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(ref mut stream) = stdout_stream {
+                let _ = stream.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let stderr_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(ref mut stream) = stderr_stream {
+                let _ = stream.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let stdout_handle = tokio::spawn(stdout_fut);
+        let stderr_handle = tokio::spawn(stderr_fut);
+
+        // Wait for exit with timeout.
+        let timeout = Duration::from_secs(timeout_seconds.max(1) as u64);
+        let exit_status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(result) => result.map_err(Error::Io)?,
+            Err(_elapsed) => {
+                // Timeout: kill the entire process tree to avoid orphans.
+                kill_process_tree(pid);
+                // Also kill the direct child as a fallback.
+                let _ = child.kill().await;
+                // Wait for drain tasks to finish so we don't leak tasks.
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    let _ = stdout_handle.await;
+                    let _ = stderr_handle.await;
+                })
+                .await;
                 return Ok(ExecuteResponse {
                     output: "Command timed out".into(),
                     exit_code: -1,
@@ -123,16 +206,26 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
                 });
             }
         };
-        let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
-        if !out.stderr.is_empty() {
+
+        // Collect drained output.
+        let stdout_bytes = stdout_handle
+            .await
+            .unwrap_or_else(|e| { tracing::warn!("stdout task join error: {}", e); Vec::new() });
+        let stderr_bytes = stderr_handle
+            .await
+            .unwrap_or_else(|e| { tracing::warn!("stderr task join error: {}", e); Vec::new() });
+
+        let mut output = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        if !stderr_bytes.is_empty() {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(&String::from_utf8_lossy(&out.stderr));
+            output.push_str(&String::from_utf8_lossy(&stderr_bytes));
         }
+
         Ok(ExecuteResponse {
             output,
-            exit_code: out.status.code().unwrap_or(-1),
+            exit_code: exit_status.code().unwrap_or(-1),
             truncated: false,
         })
     }

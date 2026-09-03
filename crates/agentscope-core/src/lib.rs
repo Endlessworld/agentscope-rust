@@ -21,8 +21,8 @@ pub mod tool;
 pub mod tracing;
 
 pub use agent::{
-    Agent, CallableAgent, CallGate, EventCategory, ExecutionGuard, ObservableAgent, ReActAgent,
-    ReActAgentBuilder, RuntimeContext, StreamOptions, StreamOptionsBuilder,
+    Agent, CallableAgent, CallGate, ConfirmHandler, EventCategory, ExecutionGuard, ObservableAgent,
+    ReActAgent, ReActAgentBuilder, RuntimeContext, StreamOptions, StreamOptionsBuilder,
 };
 pub use credential::{
     Credential, DeepSeekCredential, DeepSeekCredentialBuilder, KimiCredential,

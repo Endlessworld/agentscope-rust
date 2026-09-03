@@ -7,6 +7,25 @@ use agent_client_protocol::schema::v1::{
     SessionConfigKind, SessionConfigOption, SessionConfigSelect, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionConfigValueId,
 };
+use agentscope_core::{
+    PermissionBehavior, PermissionContextState, PermissionMode, PermissionRule,
+};
+
+/// Mode id for the read-only exploration/planning mode.
+pub const MODE_PLAN: &str = "plan";
+/// Mode id for the auto-approve file edits / ask shell mode.
+pub const MODE_ACCEPT_EDITS: &str = "accept_edits";
+/// Mode id for the fully automatic mode (no permission prompts).
+pub const MODE_YOLO: &str = "yolo";
+
+/// Tools auto-approved in `accept_edits` mode (file writes + the internal
+/// `todo_write` bookkeeping tool). Everything else that is not read-only
+/// (e.g. the `execute` shell tool) falls through to `Ask` and requires human
+/// confirmation.
+const ACCEPT_EDITS_AUTO_ALLOW_TOOLS: &[&str] = &["write_file", "edit_file", "todo_write"];
+
+/// Tools allowed in `accept_edits` mode whose rule_content matches any input.
+const ACCEPT_EDITS_RULE_SOURCE: &str = "accept_edits-default";
 
 /// An available model descriptor (id + display name).
 #[derive(Debug, Clone)]
@@ -73,6 +92,62 @@ pub fn select_current_value(option: &SessionConfigOption) -> Option<String> {
     }
 }
 
+/// The canonical ACP mode list exposed to clients, ordered by escalating
+/// autonomy: `plan` (read-only) → `accept_edits` (auto file edits, shell asks)
+/// → `yolo` (everything auto-approved).
+pub fn default_modes() -> Vec<ModeChoice> {
+    vec![
+        ModeChoice { id: MODE_PLAN.to_string(), name: "Plan".to_string() },
+        ModeChoice { id: MODE_ACCEPT_EDITS.to_string(), name: "Accept Edits".to_string() },
+        ModeChoice { id: MODE_YOLO.to_string(), name: "YOLO".to_string() },
+    ]
+}
+
+/// The mode selected by default for a fresh session.
+pub fn default_mode() -> &'static str {
+    MODE_ACCEPT_EDITS
+}
+
+/// Maps an ACP session mode id onto a framework permission context ("default
+/// rules"), mirroring the Java `AgentMode` semantics:
+///
+/// - `plan` → `Explore`: read-only tools are auto-allowed, everything else is
+///   denied (a design/planning phase never mutates the workspace).
+/// - `accept_edits` → `AcceptEdits` + auto-allow rules for file-edit and
+///   `todo_write` tools; the `execute` shell tool has no allow rule and is
+///   therefore `Ask`-ed to the user for confirmation.
+/// - `yolo` → `Bypass`: all permission checks are skipped.
+///
+/// Unknown modes fall back to the default (trivial) context which allows
+/// everything — matching pre-existing behaviour for unconfigured agents.
+pub fn permission_context_for_mode(mode: &str) -> PermissionContextState {
+    match mode {
+        MODE_PLAN => PermissionContextState::builder()
+            .mode(PermissionMode::Explore)
+            .build(),
+        MODE_ACCEPT_EDITS => {
+            let mut builder = PermissionContextState::builder()
+                .mode(PermissionMode::AcceptEdits);
+            for tool in ACCEPT_EDITS_AUTO_ALLOW_TOOLS {
+                builder = builder.add_allow_rule(
+                    *tool,
+                    PermissionRule::new(
+                        *tool,
+                        None,
+                        PermissionBehavior::Allow,
+                        ACCEPT_EDITS_RULE_SOURCE,
+                    ),
+                );
+            }
+            builder.build()
+        }
+        MODE_YOLO => PermissionContextState::builder()
+            .mode(PermissionMode::Bypass)
+            .build(),
+        _ => PermissionContextState::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +177,43 @@ mod tests {
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0].id.to_string(), "model");
         assert_eq!(opts[1].id.to_string(), "mode");
+    }
+
+    #[test]
+    fn default_modes_are_the_three_supported_modes() {
+        let ids: Vec<String> = default_modes().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![MODE_PLAN, MODE_ACCEPT_EDITS, MODE_YOLO]);
+    }
+
+    #[test]
+    fn plan_maps_to_explore_read_only() {
+        let ctx = permission_context_for_mode(MODE_PLAN);
+        assert_eq!(ctx.mode, PermissionMode::Explore);
+        assert!(!ctx.is_trivial());
+    }
+
+    #[test]
+    fn accept_edits_maps_to_accept_edits_with_auto_allow_rules() {
+        let ctx = permission_context_for_mode(MODE_ACCEPT_EDITS);
+        assert_eq!(ctx.mode, PermissionMode::AcceptEdits);
+        // Every file-edit tool must carry an allow rule so no Ask interrupts.
+        for tool in ACCEPT_EDITS_AUTO_ALLOW_TOOLS {
+            let rules = ctx.allow_rules.get(*tool).expect("auto-allow rule present");
+            assert!(rules.iter().any(|r| r.behavior == PermissionBehavior::Allow));
+        }
+        // The shell tool must NOT be allow-listed: it should ask the user.
+        assert!(ctx.allow_rules.get("execute").is_none());
+    }
+
+    #[test]
+    fn yolo_maps_to_bypass() {
+        let ctx = permission_context_for_mode(MODE_YOLO);
+        assert_eq!(ctx.mode, PermissionMode::Bypass);
+    }
+
+    #[test]
+    fn unknown_mode_falls_back_to_trivial_allow_all() {
+        let ctx = permission_context_for_mode("whatever");
+        assert!(ctx.is_trivial());
     }
 }

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentscope_core::model::{Model, OpenAiChatModel};
-use agentscope_harness::acp::{config::ModeChoice, AcpCodingAgent};
+use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
     CompactionConfig, CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
@@ -99,21 +99,14 @@ fn build_agent(cwd: PathBuf) -> HarnessAgent {
     builder.build()
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 嵌入式优化：使用单线程 current_thread 运行时替代默认的多线程运行时，
-    // 避免按 CPU 核数创建 worker 线程（每线程栈 2MB+）带来的固定内存开销。
-    // ACP 会话是串行 stdio I/O 模型，单线程运行时完全足够。
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(run())
-}
-
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let modes = vec![
-        ModeChoice { id: "yolo".to_string(), name: "YOLO".to_string() },
-        ModeChoice { id: "plan".to_string(), name: "Plan".to_string() },
-    ];
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 三种 ACP 模式，分别映射到框架的权限模式（切换即时生效，作用于下一个请求）：
+    // - plan (Plan)        -> PermissionMode::Explore  ：只读，写/执行类工具一律拒绝
+    // - accept_edits (Accept Edits) -> PermissionMode::AcceptEdits：文件读写自动批准，
+    //                           shell (execute) 需要人工确认（走 ACP request_permission）
+    // - yolo (YOLO)        -> PermissionMode::Bypass  ：跳过所有权限检查
+    let modes = default_modes();
     let models = vec![
         ModelChoice { id: "deepseek-v4-flash".to_string(), name: "deepseek-v4-flash".to_string() },
         ModelChoice { id: "mimo-v2.5".to_string(), name: "mimo-v2.5".to_string() },

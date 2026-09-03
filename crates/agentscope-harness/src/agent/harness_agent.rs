@@ -206,6 +206,30 @@ impl HarnessAgent {
             })),
         }
     }
+
+    /// Replaces the embedded agent's permission engine with one built from `ctx`.
+    /// No-op when no model was configured (assembly-only mode).
+    pub fn set_permission_context(&self, ctx: agentscope_core::PermissionContextState) {
+        if let Some(agent) = &self.agent {
+            agent.set_permission_context(ctx);
+        }
+    }
+
+    /// Installs/removes the confirmation handler used for `Ask` tool decisions.
+    /// No-op when no model was configured (assembly-only mode).
+    pub fn set_confirm_handler(&self, handler: Option<agentscope_core::ConfirmHandler>) {
+        if let Some(agent) = &self.agent {
+            agent.set_confirm_handler(handler);
+        }
+    }
+
+    /// Adds a single permission rule to the embedded agent's current engine
+    /// (e.g. recording an "always allow/reject" user choice). No-op without a model.
+    pub fn add_permission_rule(&self, rule: agentscope_core::PermissionRule) {
+        if let Some(agent) = &self.agent {
+            agent.add_permission_rule(rule);
+        }
+    }
 }
 
 /// Builder for `HarnessAgent`.
@@ -258,6 +282,9 @@ pub struct HarnessAgentBuilder {
     promotion_gate: Option<Arc<dyn SkillPromotionGate>>,
     visibility_filter: Option<Arc<dyn SkillVisibilityFilter>>,
     skill_filter: SkillFilter,
+    confirm_handler: Option<agentscope_core::ConfirmHandler>,
+    /// Optional initial permission context forwarded to the embedded ReActAgent.
+    permission_context: Option<agentscope_core::PermissionContextState>,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -308,6 +335,8 @@ impl Default for HarnessAgentBuilder {
             promotion_gate: None,
             visibility_filter: None,
             skill_filter: SkillFilter::all(),
+            confirm_handler: None,
+            permission_context: None,
         }
     }
 }
@@ -601,6 +630,21 @@ impl HarnessAgentBuilder {
     /// Hides the named skills.
     pub fn disable_skills(mut self, names: &[&str]) -> Self {
         self.skill_filter = SkillFilter::except(names);
+        self
+    }
+
+    /// Sets an explicit permission context forwarded to the embedded ReActAgent
+    /// (mode + allow/deny/ask rules). When left unset the agent uses the default
+    /// trivial context (everything allowed).
+    pub fn permission_context(mut self, ctx: agentscope_core::PermissionContextState) -> Self {
+        self.permission_context = Some(ctx);
+        self
+    }
+
+    /// Sets the confirmation handler used when a tool call requires user approval
+    /// (`PermissionBehavior::Ask`). Forwarded to the embedded ReActAgent at build.
+    pub fn confirm_handler(mut self, handler: agentscope_core::ConfirmHandler) -> Self {
+        self.confirm_handler = Some(handler);
         self
     }
 
@@ -956,6 +1000,12 @@ impl HarnessAgentBuilder {
                 .model(Arc::clone(model))
                 .toolkit(toolkit.clone())
                 .middleware_chain(middleware.clone());
+            if let Some(ctx) = &self.permission_context {
+                agent_builder = agent_builder.permission_context(ctx.clone());
+            }
+            if let Some(handler) = &self.confirm_handler {
+                agent_builder = agent_builder.confirm_handler(handler.clone());
+            }
             if !self.sys_prompt.is_empty() {
                 agent_builder = agent_builder.sys_prompt(self.sys_prompt.clone());
             }

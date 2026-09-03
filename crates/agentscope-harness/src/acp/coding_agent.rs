@@ -27,7 +27,7 @@ use crate::agent::{HarnessAgent, HarnessAgentBuilder};
 use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
-use super::session::AcpAgentSession;
+use super::session::{AcpAgentSession, AcpClientHandle};
 
 /// Default agent info advertised during initialization.
 const AGENT_NAME: &str = "agentscope-coding-agent";
@@ -273,6 +273,9 @@ impl AcpCodingAgent {
                             return responder.respond(PromptResponse::new(StopReason::Refusal));
                         }
                     };
+                    // Bind the live client connection so Ask tool calls can push
+                    // `session/request_permission` to the user during this prompt.
+                    session.set_client(AcpClientHandle::new(cx.clone()));
                     let emit_cx = cx.clone();
                     // The SDK sets this marker when the client sends `$/cancel_request`
                     // for this prompt's JSON-RPC request id; `run_prompt_cancellable`
@@ -300,7 +303,7 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                async move |req: SetSessionConfigOptionRequest, responder, cx| {
                     let sid = req.session_id;
                     let mut session = match a_cfg.get_session(&sid) {
                         Some(s) => s,
@@ -308,6 +311,7 @@ impl AcpCodingAgent {
                             return responder.respond(SetSessionConfigOptionResponse::new(vec![]));
                         }
                     };
+                    session.set_client(AcpClientHandle::new(cx.clone()));
                     let value = req.value.as_value_id().map(|v| v.to_string());
                     match req.config_id.to_string().as_str() {
                         "model" => {
@@ -329,12 +333,16 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: SetSessionModeRequest, responder, _cx| {
+                async move |req: SetSessionModeRequest, responder, cx| {
                     let sid = req.session_id;
                     let mut session = match a_mode.get_session(&sid) {
                         Some(s) => s,
                         None => return responder.respond(SetSessionModeResponse::new()),
                     };
+                    // Bind the client connection too: the mode change applies a
+                    // new permission context immediately and later Ask tool
+                    // calls need the connection to push request_permission.
+                    session.set_client(AcpClientHandle::new(cx.clone()));
                     session.set_mode(req.mode_id.to_string());
                     a_mode.register_session(session);
                     responder.respond(SetSessionModeResponse::new())

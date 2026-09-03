@@ -4,13 +4,15 @@
 //! call, accumulates the reasoning result, and if the model requested tool calls
 //! it executes them and feeds the results back, repeating until the model stops
 //! or the maximum number of iterations is reached.
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::error::{Error, Result};
-use crate::event::{AgentEvent, AgentEventType, EventData};
+use crate::event::{AgentEvent, AgentEventType, ConfirmResult, EventData};
 use crate::formatter::{JsonSchema, ResponseFormat};
 use crate::interruption::InterruptControl;
 use crate::message::{
@@ -23,6 +25,7 @@ use crate::middleware::{
 use crate::model::{GenerateOptions, Model};
 use crate::permission::{
     PermissionBehavior, PermissionContextState, PermissionDecision, PermissionEngine,
+    PermissionRule,
 };
 use crate::state::AgentState;
 use crate::state::context::TaskContextState;
@@ -33,6 +36,17 @@ use super::stream_options::StreamOptions;
 
 /// A boxed event sink registered via [`ObservableAgent::subscribe`].
 type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// Confirmation handler invoked when a tool call requires user approval
+/// (`PermissionBehavior::Ask`).
+///
+/// The handler receives the tool call that needs confirmation and returns a
+/// future resolving to a [`ConfirmResult`]. Typical implementations emit a
+/// `RequireUserConfirm` event, wait for the user's response (e.g. via ACP
+/// `RequestPermissionRequest`), and return the decision.
+///
+/// If no handler is set, `Ask` results in an error (backward-compatible default).
+pub type ConfirmHandler = Arc<dyn Fn(ToolUseBlock) -> Pin<Box<dyn Future<Output = ConfirmResult> + Send>> + Send + Sync>;
 
 
 /// Default maximum number of reasoning→acting iterations per call.
@@ -50,12 +64,23 @@ struct AgentCore {
     state: Arc<Mutex<AgentState>>,
     #[allow(dead_code)]
     enable_pending_tool_recovery: bool,
-    permission_engine: PermissionEngine,
+    /// The permission engine evaluating every tool request. Guarded by a mutex so
+    /// the session can swap in a new permission context between requests (mode
+    /// switches take effect on the next tool call) without rebuilding the agent.
+    permission_engine: Mutex<PermissionEngine>,
     interrupt: Arc<InterruptControl>,
     middleware_chain: Arc<MiddlewareChain>,
     call_gate: Arc<CallGate>,
     subscriber: Arc<Mutex<Option<EventSink>>>,
     tasks: Arc<Mutex<TaskContextState>>,
+    /// Optional confirmation handler for tool calls that require user approval.
+    /// When `Some`, `acting_phase` invokes it on `PermissionBehavior::Ask` instead
+    /// of returning an error. The handler should emit a `RequireUserConfirm` event,
+    /// wait for the user's decision, and return a `ConfirmResult`.
+    ///
+    /// Guarded by a mutex so an ACP session can install/swap the handler per
+    /// prompt (e.g. bound to the current client connection) at runtime.
+    confirm_handler: Mutex<Option<ConfirmHandler>>,
 }
 
 /// Accumulates streamed model chunks into a single assistant message.
@@ -150,6 +175,31 @@ impl ReActAgent {
     /// Returns the model bound to this agent.
     pub fn model(&self) -> &Arc<dyn Model> {
         &self.core.model
+    }
+
+    /// Replaces the permission engine with one built from `ctx`.
+    ///
+    /// The engine is consulted on every tool call, so after a mode switch the
+    /// *next* tool call is already evaluated against the new rules. State such as
+    /// accumulated conversation history is untouched.
+    pub fn set_permission_context(&self, ctx: PermissionContextState) {
+        *self.core.permission_engine.lock().unwrap() = PermissionEngine::new(ctx);
+    }
+
+    /// Installs (or removes, with `None`) the confirmation handler used when a
+    /// tool call resolves to `PermissionBehavior::Ask`.
+    pub fn set_confirm_handler(&self, handler: Option<ConfirmHandler>) {
+        *self.core.confirm_handler.lock().unwrap() = handler;
+    }
+
+    /// Adds a single permission rule to the *current* engine.
+    ///
+    /// Used e.g. when the user picks "allow always / reject always" in an ACP
+    /// permission prompt, so later invocations of the same tool are decided
+    /// without asking again. The rule is lost when [`set_permission_context`]
+    /// (Self::set_permission_context) swaps in a fresh context on mode changes.
+    pub fn add_permission_rule(&self, rule: PermissionRule) {
+        self.core.permission_engine.lock().unwrap().add_rule(rule);
     }
 
     /// Creates a new builder.
@@ -458,6 +508,7 @@ pub struct ReActAgentBuilder {
     enable_pending_tool_recovery: bool,
     permission_context: Option<PermissionContextState>,
     enable_todo_tool: bool,
+    confirm_handler: Option<ConfirmHandler>,
 }
 
 impl Default for ReActAgentBuilder {
@@ -475,6 +526,7 @@ impl Default for ReActAgentBuilder {
             enable_pending_tool_recovery: false,
             permission_context: None,
             enable_todo_tool: true,
+            confirm_handler: None,
         }
     }
 }
@@ -546,6 +598,14 @@ impl ReActAgentBuilder {
         self
     }
 
+    /// Sets the confirmation handler invoked when a tool call requires user approval
+    /// (`PermissionBehavior::Ask`). When set, `acting_phase` delegates to this handler
+    /// instead of returning an error.
+    pub fn confirm_handler(mut self, handler: ConfirmHandler) -> Self {
+        self.confirm_handler = Some(handler);
+        self
+    }
+
     /// Builds the [`ReActAgent`].
     pub fn build(self) -> Result<ReActAgent> {
         let model = self.model.ok_or_else(|| {
@@ -576,12 +636,15 @@ impl ReActAgentBuilder {
             max_iters,
             state: Arc::new(Mutex::new(initial_state)),
             enable_pending_tool_recovery: self.enable_pending_tool_recovery,
-            permission_engine: PermissionEngine::new(self.permission_context.unwrap_or_default()),
+            permission_engine: Mutex::new(PermissionEngine::new(
+                self.permission_context.unwrap_or_default(),
+            )),
             interrupt: Arc::new(InterruptControl::new()),
             middleware_chain: Arc::new(chain),
             call_gate: Arc::new(CallGate::new()),
             subscriber: Arc::new(Mutex::new(None)),
             tasks,
+            confirm_handler: Mutex::new(self.confirm_handler),
         });
         Ok(ReActAgent { id, name, description: self.description, core })
     }
@@ -1059,10 +1122,58 @@ async fn acting_phase(
                 }
             }
             PermissionBehavior::Ask => {
-                return Err(Error::Agent(format!(
-                    "permission asking (HITL) is not yet supported; tool '{}' requires user confirmation",
-                    call.name
-                )));
+                let handler = core.confirm_handler.lock().unwrap().clone();
+                if let Some(handler) = handler {
+                    // Emit ToolResultStart so ACP clients know this tool is being
+                    // processed (even though it's waiting for user confirmation).
+                    emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                    let confirm_result = handler(call.clone()).await;
+                    if confirm_result.is_confirmed() {
+                        // Use the (possibly modified) tool call if the user tweaked input.
+                        let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
+                        emit_tool_result_start(&ctx.delta_tx, &effective_call.id, &effective_call.name);
+                        let tctx = ToolExecutionContext {
+                            tool_call: Some(effective_call.clone()),
+                            runtime: Default::default(),
+                            emitter: None,
+                        };
+                        match core.toolkit.call_tool(effective_call, tctx).await {
+                            Ok(rb) => {
+                                let mut result_text = String::new();
+                                for block in &rb.output {
+                                    if let ContentBlock::Text(t) = block {
+                                        result_text.push_str(&t.text);
+                                    }
+                                }
+                                if !result_text.trim().is_empty() {
+                                    emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
+                                }
+                                let final_state = if rb.state == ToolResultState::Error { ToolResultState::Error } else { ToolResultState::Success };
+                                let bound = bind_result(effective_call, rb);
+                                suspended = suspended || bound.is_suspended();
+                                results.push(bound);
+                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state);
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
+                                results.push(error_result(effective_call, &err_msg));
+                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error);
+                            }
+                        }
+                    } else {
+                        // User denied the tool call.
+                        let denied_text = &confirm_result.message;
+                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
+                        results.push(denied_result(call, denied_text));
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied);
+                    }
+                } else {
+                    return Err(Error::Agent(format!(
+                        "permission asking (HITL) is not yet supported; tool '{}' requires user confirmation",
+                        call.name
+                    )));
+                }
             }
         }
     }
@@ -1177,7 +1288,8 @@ fn extract_pending_tool_calls(state: &AgentState) -> Vec<ToolUseBlock> {
 fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> PermissionDecision {
     // An unconfigured (trivial) permission context allows all tool calls, so a
     // default ReActAgent works out of the box without explicit rules.
-    if core.permission_engine.context().is_trivial() {
+    let engine = core.permission_engine.lock().unwrap();
+    if engine.context().is_trivial() {
         return PermissionDecision::allow(format!("Permission granted for {}", call.name));
     }
     let is_read_only = core
@@ -1189,8 +1301,7 @@ fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> Permission
         let serialized = serde_json::to_string(input).unwrap_or_default();
         serialized.contains(pattern)
     };
-    core.permission_engine
-        .check_permission(&call.name, is_read_only, &call.input, matcher)
+    engine.check_permission(&call.name, is_read_only, &call.input, matcher)
 }
 
 /// Binds a tool's raw result block back to the originating call.
@@ -1647,5 +1758,199 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].subject, "step one");
         assert_eq!(tasks[0].state, crate::state::context::TaskState::InProgress);
+    }
+
+    #[tokio::test]
+    async fn permission_switch_takes_effect_on_next_call() {
+        // A single agent whose permission engine is replaced between calls: the
+        // *next* tool call is already evaluated against the new context.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input.clone()),
+                text_response("first"),
+                tool_use_response("c2", "add", input.clone()),
+                text_response("second"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-switch")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        // Trivial (default) context: the tool executes.
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "first");
+        assert_eq!(*counter.lock().unwrap(), 1);
+
+        // Switch to Explore (read-only): the very next call denies the write tool.
+        agent.set_permission_context(
+            crate::permission::PermissionContextState::builder()
+                .mode(crate::permission::PermissionMode::Explore)
+                .build(),
+        );
+        let reply = agent.call(vec![Msg::user("compute again")]).await.unwrap();
+        assert_eq!(reply.text_content(), "second");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the write tool must not run under Explore"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_approved_executes_the_tool() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("the answer is 3"),
+            ],
+        ));
+        // Force an `Ask` decision for the add tool.
+        let ctx = crate::permission::PermissionContextState::builder()
+            .add_ask_rule(
+                "add",
+                crate::permission::PermissionRule::new(
+                    "add",
+                    None,
+                    crate::permission::PermissionBehavior::Ask,
+                    "test",
+                ),
+            )
+            .build();
+        let handler: ConfirmHandler =
+            Arc::new(|_call: ToolUseBlock| Box::pin(async move { ConfirmResult::allowed() }));
+        let agent = ReActAgent::builder()
+            .name("t-ask-ok")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .confirm_handler(handler)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "the answer is 3");
+        assert_eq!(*counter.lock().unwrap(), 1, "approved tool must run");
+    }
+
+    #[tokio::test]
+    async fn ask_denied_skips_tool_and_reports_permission_denied() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("ok, skipping"),
+            ],
+        ));
+        let ctx = crate::permission::PermissionContextState::builder()
+            .add_ask_rule(
+                "add",
+                crate::permission::PermissionRule::new(
+                    "add",
+                    None,
+                    crate::permission::PermissionBehavior::Ask,
+                    "test",
+                ),
+            )
+            .build();
+        let handler: ConfirmHandler = Arc::new(|_call: ToolUseBlock| {
+            Box::pin(async move { ConfirmResult::denied("user said no") })
+        });
+        let agent = ReActAgent::builder()
+            .name("t-ask-no")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .confirm_handler(handler)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok, skipping");
+        assert_eq!(*counter.lock().unwrap(), 0, "denied tool must not run");
+
+        // The denial is fed back to the model as a Tool message.
+        let state = agent.agent_state();
+        let denied_feedback = state.context().iter().any(|m| {
+            m.tool_result_blocks().any(|rb| {
+                rb.output.iter().any(|block| {
+                    matches!(
+                        block,
+                        crate::message::ContentBlock::Text(t)
+                            if t.text.contains("Permission denied: user said no")
+                    )
+                })
+            })
+        });
+        assert!(
+            denied_feedback,
+            "the denial must be fed back to the model as a Tool result"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_handler_can_be_swapped_at_runtime() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        // Ask rules for add; the agent starts with NO handler so an Ask would error.
+        let ctx = crate::permission::PermissionContextState::builder()
+            .add_ask_rule(
+                "add",
+                crate::permission::PermissionRule::new(
+                    "add",
+                    None,
+                    crate::permission::PermissionBehavior::Ask,
+                    "test",
+                ),
+            )
+            .build();
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input.clone()),
+                text_response("after approved"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-handler-swap")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .build()
+            .unwrap();
+
+        // Install the handler *after* build; the next call must honor it.
+        agent.set_confirm_handler(Some(Arc::new(|_call: ToolUseBlock| {
+            Box::pin(async move { ConfirmResult::allowed() })
+        })));
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "after approved");
+        assert_eq!(*counter.lock().unwrap(), 1);
     }
 }
