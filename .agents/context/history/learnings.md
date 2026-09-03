@@ -53,3 +53,23 @@
   用 `on_receive_notification` 收集所有通知并断言 `AgentThoughtChunk`。
 - **坑**：改完 `agentscope-core` 后必须重新 `cargo build --example acp_harness_agent`，
   否则 example exe 仍链接旧库，测试/CLI 拉起的还是旧行为。
+## 2026-09 Windows进程树管理修复（sandbox.rs）
+- **现象**：Windows上执行shell命令（如`git --version`）时，即使超时很短，工具也报告超时。
+- **根因**：`tokio::process::Child::drop()`只杀死直接子进程（`pwsh.exe`），但其孙进程（`git.exe`、`git-credential-manager.exe`等）成为孤儿进程，持有管道句柄不释放→`wait()`永远挂起。
+- **关键认知**：**Windows进程树管理需要`taskkill /F /T`**：`taskkill /T`会递归杀死整个进程树，避免孤儿进程。
+- **管道死锁修复**：必须在`wait()`之前获取stdout/stderr（通过`tokio::spawn`并发读取），否则如果子进程写满OS管道缓冲区（~64KB），`wait()`永远不会返回。
+- **解法**：改用`spawn()`+`wait()`替代`cmd.output()`，超时时调用`kill_process_tree(pid)`，并行读取stdout/stderr避免死锁。
+- **跨平台处理**：Windows用`taskkill /F /T /PID`，Unix用`kill -TERM --`发送SIGTERM到进程组。
+- **测试要点**：即使简单命令如`git --version`，在Windows上也可能因管道死锁而挂起，需要验证超时机制。
+
+## 2026-09 ACP权限确认机制（PermissionBehavior::Ask）
+- **现象**：当工具调用需要用户确认时（`PermissionBehavior::Ask`），之前会返回错误，无法支持人机协作。
+- **关键认知1**：**权限引擎需要运行时可替换**：用`Mutex<PermissionEngine>`替代直接持有，允许在不重建agent的情况下切换权限上下文。
+- **关键认知2**：**确认处理需要异步回调**：定义`ConfirmHandler`类型（返回`Pin<Box<dyn Future>>`），支持ACP客户端异步交互。
+- **关键认知3**：**持久化规则需要原子写入**：使用临时文件+重命名模式，避免并发读写导致文件损坏。
+- **解法**：
+  1. `ReActAgent`新增`set_permission_context`、`set_confirm_handler`、`add_permission_rule`方法
+  2. 实现`AcpClientHandle`封装ACP客户端连接，发送`session/request_permission`请求
+  3. 创建`PermissionRuleStore`持久化"always allow/always reject"用户选择
+  4. 模式映射：plan→Explore（只读）、accept_edits→AcceptEdits（文件编辑自动批准，shell需确认）、yolo→Bypass
+- **测试要点**：需要验证权限模式切换、Ask批准/拒绝、handler运行时切换、持久化规则跨会话保留
