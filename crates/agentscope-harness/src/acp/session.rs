@@ -18,6 +18,7 @@ use agentscope_core::event::ConfirmResult;
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
+use agentscope_core::model::GenerateOptions;
 
 use crate::agent::HarnessAgent;
 
@@ -30,6 +31,10 @@ use super::permission_store::PermissionRuleStore;
 pub struct SessionConfig {
     pub model: String,
     pub mode: String,
+    /// Reasoning-effort / thought level (`disabled` / `low` / `medium` /
+    /// `high` / `max`), mirroring Java `ThoughtLevel`. Applied as per-call
+    /// generation defaults on the *next* prompt.
+    pub thought_level: String,
 }
 
 impl Default for SessionConfig {
@@ -37,6 +42,7 @@ impl Default for SessionConfig {
         Self {
             model: "default".to_string(),
             mode: config::default_mode().to_string(),
+            thought_level: config::DEFAULT_THOUGHT_LEVEL.to_string(),
         }
     }
 }
@@ -227,6 +233,14 @@ pub struct AcpAgentSession {
     config: SessionConfig,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
+    /// Optional resolver building a model from a model id (dynamic model
+    /// switching). When set, `setModel` swaps the live agent's model on the next
+    /// prompt.
+    model_builder: Option<
+        Arc<dyn Fn(&str) -> std::result::Result<Arc<dyn agentscope_core::model::Model>, String> + Send + Sync>,
+    >,
+    /// The model id currently applied to the live agent (for change detection).
+    applied_model: String,
     /// Cancel flag for the currently active prompt request.
     cancel: Arc<AtomicBool>,
     usage: ChatUsage,
@@ -255,6 +269,8 @@ impl AcpAgentSession {
             config: SessionConfig::default(),
             models,
             modes,
+            model_builder: None,
+            applied_model: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
             client: None,
@@ -294,6 +310,65 @@ impl AcpAgentSession {
         self.config.model = model.into();
     }
 
+    /// Installs the resolver used for dynamic model switching: a closure that
+    /// builds a live [`Model`](agentscope_core::model::Model) from a model id.
+    pub fn set_model_builder(
+        &mut self,
+        builder: Arc<dyn Fn(&str) -> std::result::Result<Arc<dyn agentscope_core::model::Model>, String> + Send + Sync>,
+    ) {
+        self.model_builder = Some(builder);
+    }
+
+    /// Applies pending session config to the live agent. Config changes
+    /// (thought level, model) take effect on the *next* prompt: the model is
+    /// rebuilt from the resolved endpoint and swapped into the live agent while
+    /// conversation state is preserved (mirrors Java `LocalAgent` rebuilding the
+    /// agent per prompt with the new config).
+    fn apply_session_config(&mut self) {
+        // Thought level -> per-call generation default (reasoning effort).
+        // `disabled` maps to no reasoning; `max` maps to OpenAI's `xhigh`.
+        let effort = match self.config.thought_level.as_str() {
+            "disabled" | "none" => None,
+            "max" => Some("xhigh"),
+            other => Some(other),
+        };
+        let mut opts = GenerateOptions::builder();
+        if let Some(effort) = effort {
+            opts = opts.reasoning_effort(effort);
+        }
+        self.agent.set_generate_options_defaults(opts.build());
+
+        // Dynamic model switching (next prompt).
+        if let Some(build) = &self.model_builder {
+            let id = self.config.model.clone();
+            if !id.is_empty() && id != "default" && id != self.applied_model {
+                match build(&id) {
+                    Ok(model) => {
+                        self.agent.set_model(model);
+                        self.applied_model = id.clone();
+                        tracing::info!(session = %self.session_id, model = %id,
+                            "switched model for session");
+                    }
+                    Err(e) => {
+                        tracing::warn!(session = %self.session_id, model = %id, error = %e,
+                            "failed to switch model; keeping current model");
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// Current thought level.
+    pub fn thought_level(&self) -> &str {
+        &self.config.thought_level
+    }
+
+    /// Sets the thought level (`disabled` / `low` / `medium` / `high` / `max`).
+    /// Applied as a per-call generation default on the next prompt.
+    pub fn set_thought_level(&mut self, level: impl Into<String>) {
+        self.config.thought_level = level.into();
+    }
     /// Sets the current mode.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
         self.config.mode = mode.into();
@@ -362,11 +437,12 @@ impl AcpAgentSession {
 
     /// Returns the session config options advertised to the client.
     pub fn config_options(&self) -> Vec<SessionConfigOption> {
-        super::config::default_config_options(
+        super::config::default_config_options_with_thought(
             &self.config.model,
             &self.models,
             &self.config.mode,
             &self.modes,
+            &self.config.thought_level,
         )
     }
 
@@ -426,6 +502,12 @@ impl AcpAgentSession {
         // calls that need approval push an ACP request_permission this turn.
         self.install_confirm_handler();
 
+
+        // Dynamic model switching + thought level: config changes (setModel /
+        // setConfigOption thought_level) take effect on the *next* prompt. The
+        // model is rebuilt from the resolved endpoint and swapped into the live
+        // agent while conversation state is preserved.
+        self.apply_session_config();
         // Convert ACP content blocks into core messages.
         let mut msgs = Vec::new();
         let mut text = String::new();
@@ -465,6 +547,14 @@ impl AcpAgentSession {
         let message_id_opt: Option<MessageId> = Some(message_id);
         let mut tool_events =
             super::event::ToolEventMapper::new().with_message_id(message_id_opt.clone());
+
+        // Push the initial context-window usage so clients render the gauge
+        // before the first model call completes.
+        let initial_used = self.usage.input_tokens.max(
+            self.usage.input_tokens + self.usage.output_tokens,
+        );
+        emit(self.usage_notification(initial_used));
+
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
@@ -509,6 +599,26 @@ impl AcpAgentSession {
                                     }
                                 }
                             }
+                            AgentEventType::ModelCallEnd => {
+                                // Accumulate usage and push a context-window
+                                // UsageUpdate after every model call.
+                                if let Some(u) = ev
+                                    .data()
+                                    .fields
+                                    .get("usage")
+                                    .and_then(|v| serde_json::from_value::<ChatUsage>(v.clone()).ok())
+                                {
+                                    let in_context = u
+                                        .input_tokens
+                                        .max(self.usage.input_tokens + self.usage.output_tokens);
+                                    self.accumulate_usage(u);
+                                    emit(self.usage_notification(in_context));
+                                } else {
+                                    emit(self.usage_notification(
+                                        self.usage.input_tokens + self.usage.output_tokens,
+                                    ));
+                                }
+                            }
                             _ => {
                                 if let Some(notif) = super::event::map_delta_event(
                                     self.session_id.clone(),
@@ -550,5 +660,24 @@ impl AcpAgentSession {
     pub fn accumulate_usage(&mut self, usage: ChatUsage) {
         self.usage.input_tokens += usage.input_tokens;
         self.usage.output_tokens += usage.output_tokens;
+    }
+
+    /// Builds the ACP `UsageUpdate` notification: `used` is the tokens in
+    /// context (latest model-call input tokens, falling back to the cumulative
+    /// count), `size` is the live model's context window.
+    fn usage_notification(
+        &self,
+        used: u64,
+    ) -> agent_client_protocol::schema::v1::SessionNotification {
+        use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
+        let model = self.agent.agent().map(|a| a.model());
+        let size = model
+            .as_ref()
+            .map(|m| m.context_window_size() as u64)
+            .unwrap_or(128_000);
+        SessionNotification::new(
+            self.session_id.clone(),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
+        )
     }
 }

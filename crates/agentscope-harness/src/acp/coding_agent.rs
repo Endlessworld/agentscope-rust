@@ -82,6 +82,9 @@ pub struct AcpCodingAgent {
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
+    /// Builds a live model from a model id (dynamic model switching).
+    model_builder:
+        Option<Arc<dyn Fn(&str) -> Result<Arc<dyn Model>, String> + Send + Sync>>,
     /// 会话注册表上限（嵌入式优化）：超过上限时淘汰最旧会话，
     /// 避免多会话成倍放大内存。默认 1。
     max_sessions: usize,
@@ -100,6 +103,7 @@ impl AcpCodingAgent {
             models,
             modes,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            model_builder: None,
             max_sessions: 1,
         }
     }
@@ -145,13 +149,17 @@ impl AcpCodingAgent {
     /// Creates a new session using the model factory.
     fn create_session(&self, session_id: SessionId, cwd: PathBuf) -> AcpAgentSession {
         let agent = (self.model_factory)(cwd.clone());
-        AcpAgentSession::new(
+        let mut session = AcpAgentSession::new(
             session_id,
             cwd,
             agent,
             self.models.clone(),
             self.modes.clone(),
-        )
+        );
+        if let Some(builder) = &self.model_builder {
+            session.set_model_builder(Arc::clone(builder));
+        }
+        session
     }
 
     /// Registers the session in the registry.
@@ -319,6 +327,11 @@ impl AcpCodingAgent {
                                 session.set_model(v);
                             }
                         }
+                        "thought_level" => {
+                            if let Some(v) = value {
+                                session.set_thought_level(v);
+                            }
+                        }
                         "mode" => {
                             if let Some(v) = value {
                                 session.set_mode(v);
@@ -433,6 +446,7 @@ pub struct AcpCodingAgentBuilder {
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     max_sessions: Option<usize>,
+    model_builder: Option<Arc<dyn Fn(&str) -> Result<Arc<dyn Model>, String> + Send + Sync>>,
 }
 
 impl AcpCodingAgentBuilder {
@@ -469,6 +483,17 @@ impl AcpCodingAgentBuilder {
         self
     }
 
+    /// Installs the resolver used for dynamic model switching: builds a live
+    /// [`Model`] from a model id when the client selects a different model
+    /// (takes effect on the next prompt).
+    pub fn model_builder(
+        mut self,
+        builder: impl Fn(&str) -> Result<Arc<dyn Model>, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.model_builder = Some(Arc::new(builder));
+        self
+    }
+
     /// Builds the [`AcpCodingAgent`].
     pub fn build(self) -> Result<AcpCodingAgent, Box<dyn std::error::Error>> {
         let factory = self
@@ -480,6 +505,7 @@ impl AcpCodingAgentBuilder {
             self.models,
             self.modes,
         );
+        agent.model_builder = self.model_builder;
         if let Some(name) = self.name {
             agent = agent.with_name(name);
         }

@@ -41,6 +41,38 @@ pub struct ModeChoice {
     pub name: String,
 }
 
+/// The thought-level (reasoning effort) selector id advertised to clients.
+pub const CONFIG_THOUGHT_LEVEL: &str = "thought_level";
+
+/// Default thought level (mirrors Java `ThoughtLevel.LOW`).
+pub const DEFAULT_THOUGHT_LEVEL: &str = "low";
+
+/// The available thought-level choices, mirroring Java `ThoughtLevel`:
+/// `disabled` (no thinking) / `low` / `medium` / `high` / `max`.
+pub fn thought_level_choices() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("disabled", "Disabled"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+        ("max", "Max"),
+    ]
+}
+
+/// Builds the `thought_level` select config option.
+pub fn thought_level_option(current: &str) -> SessionConfigOption {
+    let options: Vec<SessionConfigSelectOption> = thought_level_choices()
+        .into_iter()
+        .map(|(id, label)| SessionConfigSelectOption::new(id, label))
+        .collect();
+    SessionConfigOption::select(
+        CONFIG_THOUGHT_LEVEL,
+        "Thought",
+        SessionConfigValueId::new(current),
+        SessionConfigSelectOptions::Ungrouped(options),
+    )
+}
+
 /// Builds the `model` select config option.
 pub fn model_option(current: &str, models: &[ModelChoice]) -> SessionConfigOption {
     let options: Vec<SessionConfigSelectOption> = models
@@ -80,6 +112,19 @@ pub fn default_config_options(
         model_option(current_model, models),
         mode_option(current_mode, modes),
     ]
+}
+
+/// Returns the default set of config options (model + mode + thought level).
+pub fn default_config_options_with_thought(
+    current_model: &str,
+    models: &[ModelChoice],
+    current_mode: &str,
+    modes: &[ModeChoice],
+    current_thought_level: &str,
+) -> Vec<SessionConfigOption> {
+    let mut opts = default_config_options(current_model, models, current_mode, modes);
+    opts.push(thought_level_option(current_thought_level));
+    opts
 }
 
 /// Reads the current value of a select config option (or returns `None`).

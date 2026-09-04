@@ -12,16 +12,21 @@
 //! to this binary, or via the `ACP_AGENT_EXE` environment variable.
 //!
 //! Environment variables (inherited by the agent subprocess):
-//!   CODING_MODEL_ID  — model id (default: mimo-v2.5)
+//!   CODING_MODEL_ID  — model id (default: ling-3.0-flash-fin-free)
 //!   OPENAI_API_KEY   — API key
 //!   OPENAI_BASE_URL  — custom API base URL
+//!
+//! Slash commands:
+//!   /model <model-id>  — switch the active model at runtime
+//!   /models            — list available models (from ~/.agentscope/models.json)
+//!   /quit | /exit      — exit
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, PermissionOptionKind, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolKind,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use std::collections::HashMap;
 use agent_client_protocol::util::MatchDispatch;
@@ -441,6 +446,95 @@ fn read_input() -> Result<Option<String>> {
     }
 }
 
+/// List the available models by reading `~/.agentscope/models.json` (the same
+/// config file the harness agent reads at startup). Prints each provider's
+/// models and marks the configured default model.
+///
+/// Prints a hint when the file is missing or unparseable.
+fn list_models() {
+    let path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".agentscope").join("models.json"));
+
+    let Some(path) = path else {
+        eprintln!("[model] cannot locate the model config file (HOME/USERPROFILE not set)");
+        return;
+    };
+
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "[model] config file not found at {} (run the harness agent once to create it)",
+            path.display()
+        );
+        return;
+    };
+
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        eprintln!("[model] failed to parse config file at {}", path.display());
+        return;
+    };
+
+    let default_model = json
+        .get("default_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let providers = json
+        .get("providers")
+        .and_then(|v| v.as_object())
+        .map(|m| m.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if providers.is_empty() {
+        eprintln!("[model] no providers found in {}", path.display());
+        return;
+    }
+
+    println!("[model] available models (default: {default_model}):");
+    for (name, provider) in providers {
+        let models = provider
+            .get("models")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if models.is_empty() {
+            println!("  {name}: (no models)");
+            continue;
+        }
+        println!("  {name}:");
+        for m in models {
+            let mark = if m == default_model { " *" } else { "" };
+            println!("    - {m}{mark}");
+        }
+    }
+}
+
+/// Switch the session's active model via the `session/set_config_option`
+/// ACP request (config id `model`).
+///
+/// The agent updates its `config.model` for subsequent prompts. The model id
+/// must be one of the ids advertised by the agent (see the `models` list in
+/// `acp_harness_agent.rs`, which ultimately comes from `~/.agentscope/models.json`).
+async fn set_model(session: &ActiveSession<'static, Agent>, model: &str) -> Result<()> {
+    let session_id = session.session_id().clone();
+    let request = SetSessionConfigOptionRequest::new(
+        session_id,
+        "model",
+        model,
+    );
+    session
+        .connection()
+        .send_request_to(Agent, request)
+        .block_task()
+        .await?;
+    eprintln!("[model] switched to '{model}'");
+    Ok(())
+}
+
 /// Run the interactive REPL loop.
 async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
     let mut views: HashMap<String, ToolView> = HashMap::new();
@@ -448,6 +542,19 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
         let input = match read_input()? {
             Some(s) if s.is_empty() => continue,
             Some(s) if s == "/quit" || s == "/exit" => break,
+            Some(s) if s == "/model" || s.starts_with("/model ") => {
+                let model = s.trim_start_matches("/model").trim();
+                if model.is_empty() {
+                    eprintln!("Usage: /model <model-id>   (e.g. /model nemotron-3.5-lightning-free)");
+                    continue;
+                }
+                set_model(session, model).await?;
+                continue;
+            }
+            Some(s) if s == "/models" || s == "/model?" || s == "/model-list" => {
+                list_models();
+                continue;
+            }
             Some(s) => s,
             None => break,
         };

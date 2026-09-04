@@ -230,6 +230,23 @@ impl HarnessAgent {
             agent.add_permission_rule(rule);
         }
     }
+
+    /// Replaces the model bound to the embedded ReAct agent. The next reasoning
+    /// call uses the new model while conversation state is preserved (dynamic
+    /// model switching). No-op without a configured model.
+    pub fn set_model(&self, model: Arc<dyn Model>) {
+        if let Some(agent) = &self.agent {
+            agent.set_model(model);
+        }
+    }
+
+    /// Sets per-call generation defaults (reasoning effort, retry policy, ...)
+    /// merged into every model request of the embedded agent.
+    pub fn set_generate_options_defaults(&self, options: agentscope_core::model::GenerateOptions) {
+        if let Some(agent) = &self.agent {
+            agent.set_generate_options_defaults(options);
+        }
+    }
 }
 
 /// Builder for `HarnessAgent`.

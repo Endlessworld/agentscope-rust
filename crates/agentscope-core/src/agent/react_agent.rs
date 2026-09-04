@@ -22,8 +22,7 @@ use crate::message::{
 use crate::middleware::{
     AgentInput, EventStream, MiddlewareChain, ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware,
 };
-use crate::model::{GenerateOptions, Model};
-use crate::permission::{
+use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};use crate::permission::{
     PermissionBehavior, PermissionContextState, PermissionDecision, PermissionEngine,
     PermissionRule,
 };
@@ -57,7 +56,12 @@ pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "generate_response";
 
 /// Immutable core of a [`ReActAgent`], shared across clones and calls.
 struct AgentCore {
-    model: Arc<dyn Model>,
+    /// The model bound to this agent. Guarded by a mutex so a session can swap
+    /// the model at runtime (dynamic model switching) without rebuilding.
+    model: Mutex<Arc<dyn Model>>,
+    /// Per-call generation defaults (reasoning effort, retry policy, ...)
+    /// merged into every model request built by this agent.
+    generate_options_defaults: Mutex<GenerateOptions>,
     toolkit: Toolkit,
     sys_prompt: String,
     max_iters: i32,
@@ -173,8 +177,20 @@ impl ReActAgent {
     }
 
     /// Returns the model bound to this agent.
-    pub fn model(&self) -> &Arc<dyn Model> {
-        &self.core.model
+    pub fn model(&self) -> Arc<dyn Model> {
+        self.core.model.lock().unwrap().clone()
+    }
+
+    /// Replaces the model bound to this agent. The next reasoning call uses the
+    /// new model while preserving accumulated conversation state.
+    pub fn set_model(&self, model: Arc<dyn Model>) {
+        *self.core.model.lock().unwrap() = model;
+    }
+
+    /// Sets per-call generation defaults (e.g. reasoning effort, retry policy)
+    /// merged into every model request built by this agent.
+    pub fn set_generate_options_defaults(&self, options: GenerateOptions) {
+        *self.core.generate_options_defaults.lock().unwrap() = options;
     }
 
     /// Replaces the permission engine with one built from `ctx`.
@@ -320,10 +336,11 @@ impl ReActAgent {
     /// falls back to the synthetic `generate_response` tool.
     pub async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
         let has_tools = !self.core.toolkit.tool_schemas().is_empty();
+        let model = self.core.model.lock().unwrap().clone();
         let use_native = if has_tools {
-            self.core.model.supports_native_structured_output_with_tools()
+            model.supports_native_structured_output_with_tools()
         } else {
-            self.core.model.supports_native_structured_output()
+            model.supports_native_structured_output()
         };
         if use_native {
             self.call_native_structured(messages, schema).await
@@ -378,10 +395,11 @@ impl ReActAgent {
         let mut last_text = String::new();
         for _ in 0..self.core.max_iters {
             let msgs = state.context().to_vec();
+            let model = self.core.model.lock().unwrap().clone();
             let options = GenerateOptions::builder()
-                .model_name(self.core.model.model_name())
+                .model_name(model.model_name())
                 .build();
-            let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&self.core.model));
+            let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&model));
             let msg = model_call_impl(&self.core, input, |_| {}).await?;
             state.context_mut().push(msg.clone());
 
@@ -630,7 +648,8 @@ impl ReActAgentBuilder {
         }
 
         let core = Arc::new(AgentCore {
-            model,
+            model: Mutex::new(model),
+            generate_options_defaults: Mutex::new(GenerateOptions::default()),
             toolkit,
             sys_prompt: self.sys_prompt,
             max_iters,
@@ -736,11 +755,19 @@ async fn reasoning_phase(
     messages.extend(state.context().to_vec());
 
     let tools = core.toolkit.tool_schemas();
-    let mut ob = GenerateOptions::builder().model_name(core.model.model_name());
+    let model = core.model.lock().unwrap().clone();
+    let mut ob = GenerateOptions::builder().model_name(model.model_name());
     if let Some(rf) = &ctx.response_format {
         ob = ob.response_format(rf.clone());
     }
-    let options = ob.build();
+    // Merge per-agent generation defaults (reasoning effort, retry policy, ...)
+    // so runtime config (thought level, model retry) reaches every model call.
+    let defaults = core.generate_options_defaults.lock().unwrap().clone();
+    let options = GenerateOptions::merge_options(&ob.build(), &defaults);
+    let mut options = options;
+    // Model-level retry: apply the standard model retry policy (429/5xx/IO with
+    // exponential backoff) when no explicit execution config was supplied.
+    ModelUtils::ensure_default_execution_config(&mut options);
     let input = ReasoningInput::new(messages, tools, options);
 
     let final_msg = run_reasoning(core, ctx, input).await?;
@@ -757,11 +784,12 @@ async fn run_reasoning(
 ) -> Result<Msg> {
     let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
     let chain = Arc::clone(&core.middleware_chain);
+    let model = core.model.lock().unwrap().clone();
     let mc_input = ModelCallInput::new(
         input.messages.clone(),
         input.tools.clone(),
         input.options.clone(),
-        Arc::clone(&core.model),
+        Arc::clone(&model),
     );
 
     let delta_tx = ctx.delta_tx.clone();
@@ -987,77 +1015,109 @@ async fn model_call_impl(
     mut emit: impl FnMut(Result<AgentEvent>),
 ) -> Result<Msg> {
     let model = Arc::clone(&mc_input.model);
-    let mut acc = ReasoningContext::default();
+    let messages = mc_input.messages;
+    let tools = mc_input.tools;
+    let options = mc_input.options;
+
+    // Model-level retry policy (429 / 5xx / IO with exponential backoff).
+    // The standard model defaults (3 attempts) apply unless an explicit
+    // execution config was set on the request.
+    let cfg = options
+        .execution_config
+        .clone()
+        .unwrap_or_else(ExecutionConfig::model_defaults);
+    let max_attempts = cfg.max_attempts.unwrap_or(1).max(1);
 
     // Generate a reply id for this model call, used for block lifecycle correlation.
     let reply_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let mut block_lifecycle = BlockLifecycle::new(reply_id.clone());
 
-    // Emit ModelCallStart at the beginning of the model call.
-    {
-        let mut fields = JsonMap::new();
-        fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-        emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallStart, fields)));
-    }
+    let mut attempt: u32 = 0;
+    loop {
+        let mut acc = ReasoningContext::default();
+        let mut block_lifecycle = BlockLifecycle::new(reply_id.clone());
 
-    let mut stream = model.stream(mc_input.messages, mc_input.tools, mc_input.options);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        check_interrupted(core)?;
-        for block in &chunk.content {
-            match block {
-                ContentBlock::Text(t) => {
-                    block_lifecycle.start_text(&mut emit);
-                    if !t.text.is_empty() {
-                        emit(Ok(delta_event(AgentEventType::TextBlockDelta, &t.text)));
+        // Emit ModelCallStart at the beginning of each attempt.
+        {
+            let mut fields = JsonMap::new();
+            fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+            emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallStart, fields)));
+        }
+
+        let mut stream = model.stream(messages.clone(), tools.clone(), options.clone());
+        let consume = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                check_interrupted(core)?;
+                for block in &chunk.content {
+                    match block {
+                        ContentBlock::Text(t) => {
+                            block_lifecycle.start_text(&mut emit);
+                            if !t.text.is_empty() {
+                                emit(Ok(delta_event(AgentEventType::TextBlockDelta, &t.text)));
+                            }
+                        }
+                        ContentBlock::Thinking(t) => {
+                            block_lifecycle.start_thinking(&mut emit);
+                            if !t.thinking.is_empty() {
+                                emit(Ok(delta_event(AgentEventType::ThinkingBlockDelta, &t.thinking)));
+                            }
+                        }
+                        ContentBlock::ToolUse(tu) => {
+                            block_lifecycle.start_tool_call(&tu.id, &tu.name, &mut emit);
+                            let delta = match tu.content.as_deref().filter(|c| !c.is_empty()) {
+                                Some(content) => Some(content.to_string()),
+                                None => serde_json::to_string(&tu.input)
+                                    .ok()
+                                    .filter(|s| s != "{}"),
+                            };
+                            if let Some(delta) = delta {
+                                let mut fields = JsonMap::new();
+                                fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+                                fields.insert("tool_call_id".to_string(), serde_json::Value::String(tu.id.clone()));
+                                fields.insert("tool_name".to_string(), serde_json::Value::String(tu.name.clone()));
+                                fields.insert("delta".to_string(), serde_json::Value::String(delta));
+                                emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallDelta, fields)));
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                ContentBlock::Thinking(t) => {
-                    block_lifecycle.start_thinking(&mut emit);
-                    if !t.thinking.is_empty() {
-                        emit(Ok(delta_event(AgentEventType::ThinkingBlockDelta, &t.thinking)));
-                    }
+                acc.accumulate(chunk);
+            }
+            Ok::<_, Error>(())
+        };
+
+        match consume.await {
+            Ok(()) => {
+                // Flush all remaining blocks and emit ModelCallEnd.
+                block_lifecycle.flush_all(&mut emit);
+                {
+                    let mut fields = JsonMap::new();
+                    fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+                    let usage = acc.usage.clone().unwrap_or_default();
+                    fields.insert("usage".to_string(), serde_json::to_value(&usage).unwrap_or_default());
+                    emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallEnd, fields)));
                 }
-                ContentBlock::ToolUse(tu) => {
-                    block_lifecycle.start_tool_call(&tu.id, &tu.name, &mut emit);
-                    // Emit ToolCallDelta carrying the tool-call arguments.
-                    // Providers that stream argument fragments expose them in
-                    // `content`; OpenAI-compatible providers only flush a fully
-                    // parsed tool call at end-of-stream, so the arguments live
-                    // in `input` and are re-serialized here — otherwise
-                    // downstream consumers never see the parameters.
-                    let delta = match tu.content.as_deref().filter(|c| !c.is_empty()) {
-                        Some(content) => Some(content.to_string()),
-                        None => serde_json::to_string(&tu.input)
-                            .ok()
-                            .filter(|s| s != "{}"),
-                    };
-                    if let Some(delta) = delta {
-                        let mut fields = JsonMap::new();
-                        fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-                        fields.insert("tool_call_id".to_string(), serde_json::Value::String(tu.id.clone()));
-                        fields.insert("tool_name".to_string(), serde_json::Value::String(tu.name.clone()));
-                        fields.insert("delta".to_string(), serde_json::Value::String(delta));
-                        emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallDelta, fields)));
-                    }
+                return Ok(acc.build_final_message());
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_attempts || !e.is_retryable() {
+                    return Err(e);
                 }
-                _ => {}
+                let delay = cfg.backoff_for(attempt - 1);
+                tracing::warn!(
+                    model = model.model_name(),
+                    attempt,
+                    max_attempts,
+                    delay_ms = delay.as_millis(),
+                    error = %e,
+                    "model call failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
             }
         }
-        acc.accumulate(chunk);
     }
-
-    // Flush all remaining blocks and emit ModelCallEnd.
-    block_lifecycle.flush_all(&mut emit);
-    {
-        let mut fields = JsonMap::new();
-        fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-        let usage = acc.usage.clone().unwrap_or_default();
-        fields.insert("usage".to_string(), serde_json::to_value(&usage).unwrap_or_default());
-        emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallEnd, fields)));
-    }
-
-    Ok(acc.build_final_message())
 }
 
 /// Executes the pending tool calls from the last assistant message and feeds the
