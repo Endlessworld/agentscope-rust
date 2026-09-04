@@ -132,7 +132,27 @@ impl Model for OpenAiChatModel {
             .model_name
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
+        // Vendor-specific body params (e.g. `enable_thinking`) must reach the
+        // wire: `CreateChatCompletionRequest` has no extension field, so the
+        // typed request is serialized to a JSON object and the extra params
+        // are merged in before the BYOT call.
+        let extra_body = options.additional_body_params.clone();
         let request = build_request(model_name, messages, tools, options);
+        // Serialize eagerly; on failure fall back to the typed request so the
+        // call still proceeds (this can only fail on non-string map keys).
+        let body: serde_json::Value = match serde_json::to_value(&request) {
+            Ok(mut v) => {
+                if !extra_body.is_empty() {
+                    if let Some(obj) = v.as_object_mut() {
+                        for (k, v) in extra_body {
+                            obj.insert(k, v);
+                        }
+                    }
+                }
+                v
+            }
+            Err(_) => serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
+        };
 
         // create_stream_byot lets us deserialize each SSE chunk into a custom
         // type that also captures `reasoning_content`, so thinking deltas can be
@@ -141,7 +161,7 @@ impl Model for OpenAiChatModel {
         let setup = futures::stream::once(async move {
             client
                 .chat()
-                .create_stream_byot::<_, OpenAiStreamChunk>(request)
+                .create_stream_byot::<_, OpenAiStreamChunk>(body)
                 .await
                 .map_err(map_openai_error)
         });

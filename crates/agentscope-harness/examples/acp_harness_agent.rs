@@ -223,10 +223,15 @@ impl ModelConfig {
 
     /// 根据模型 ID 查找其所属的 provider，返回 `(base_url, api_key)`。
     ///
+    /// 兼容两种 ID 形式：裸 ID（`deepseek-v4-flash`）与带 provider 前缀的
+    /// ID（`Go/deepseek-v4-flash`，即客户端下拉里展示的 `provider/model`
+    /// 格式）——后者按 `/` 分割取尾段再匹配。
+    ///
     /// 环境变量 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 可覆盖查找结果。
     pub fn resolve_model(&self, model_id: &str) -> Result<(String, String), String> {
+        let bare = model_id.rsplit('/').next().unwrap_or(model_id);
         for (_key, provider) in &self.providers {
-            if provider.models.iter().any(|m| m == model_id) {
+            if provider.models.iter().any(|m| m == bare || m == model_id) {
                 let api_key = std::env::var("OPENAI_API_KEY")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
@@ -238,7 +243,9 @@ impl ModelConfig {
                 return Ok((base_url, api_key));
             }
         }
-        Err(format!("model '{model_id}' not found in any provider"))
+        Err(format!(
+            "model '{model_id}' not found in any provider of ~/.agentscope/models.json"
+        ))
     }
 
     /// 汇总所有 provider 下的模型列表，生成 ACP 的 `ModelChoice` 列表。
@@ -432,8 +439,46 @@ fn build_agent(cwd: PathBuf) -> HarnessAgent {
     builder.build()
 }
 
+/// Initializes tracing to a log file under `<cwd>/.agentscope/log/`.
+///
+/// The ACP transport is stdio: anything written to stdout corrupts the
+/// JSON-RPC stream, so logs MUST go to a file. Level defaults to `info` and
+/// can be overridden with `RUST_LOG` (e.g. `RUST_LOG=debug`).
+fn init_logging() {
+    use tracing_subscriber::EnvFilter;
+
+    let log_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".agentscope")
+        .join("log");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file = log_dir.join("acp-agent.log");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            // Last resort: stderr (never stdout) so the transport survives.
+            eprintln!("[log] cannot open {}: {e}; falling back to stderr", log_file.display());
+            return;
+        }
+    };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
     // 三种 ACP 模式，分别映射到框架的权限模式（切换即时生效，作用于下一个请求）：
     // - plan (Plan)        -> PermissionMode::Explore  ：只读，写/执行类工具一律拒绝
     // - accept_edits (Accept Edits) -> PermissionMode::AcceptEdits：文件读写自动批准，

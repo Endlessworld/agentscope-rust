@@ -388,6 +388,17 @@ async fn process_update(
                                 output.line(&line);
                             }
                         }
+                        SessionUpdate::UsageUpdate(u) => {
+                            // Context-window gauge: `used` tokens in context
+                            // out of `size`. Rendered inline as a dim line.
+                            if u.size > 0 {
+                                let pct = (u.used as f64 / u.size as f64 * 100.0).min(100.0);
+                                output.line(&format!(
+                                    "{DIM}[context] {}/{} tokens ({:.1}%){RESET}",
+                                    u.used, u.size, pct
+                                ));
+                            }
+                        }
                         _ => {}
                     }
                     Ok(())

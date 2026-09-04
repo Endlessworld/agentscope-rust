@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, MessageId, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
@@ -224,13 +224,68 @@ fn acp_confirm_handler(
 }
 
 
+/// Maps a thought level to per-call generation defaults for the given model.
+///
+/// - `auto` (default): sends nothing — the provider default applies. This is
+///   the only safe choice for models whose gateway rejects unknown params.
+/// - OpenAI o-series / gpt-5 family: `reasoning_effort` (official field).
+/// - Other OpenAI-compatible vendors (DeepSeek/GLM/Qwen/…): vendor-specific
+///   body params. `disabled` turns thinking off; explicit levels enable it
+///   with a budget. `max` is clamped to `high` for OpenAI (no `xhigh`).
+fn thought_level_params(level: &str, model_name: &str) -> GenerateOptions {
+    if level == "auto" || level.is_empty() {
+        return GenerateOptions::default();
+    }
+    let mut opts = GenerateOptions::builder();
+    let m = model_name.to_ascii_lowercase();
+    if m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("gpt-5")
+    {
+        // Official OpenAI reasoning-effort field.
+        let effort = match level {
+            "disabled" | "none" => "minimal",
+            "max" => "high",
+            other => other,
+        };
+        opts = opts.reasoning_effort(effort);
+    } else {
+        // OpenAI-compatible vendors: enable/disable thinking via body params.
+        // Unknown vendors simply ignore these keys.
+        match level {
+            "disabled" | "none" => {
+                opts = opts
+                    .additional_body_param("enable_thinking", serde_json::json!(false))
+                    .additional_body_param("thinking_budget", serde_json::json!(0));
+            }
+            "low" | "medium" | "high" | "max" => {
+                let budget = match level {
+                    "low" => 2048,
+                    "medium" => 8192,
+                    "high" => 24576,
+                    _ => 32768,
+                };
+                opts = opts
+                    .additional_body_param("enable_thinking", serde_json::json!(true))
+                    .additional_body_param("thinking_budget", serde_json::json!(budget));
+            }
+            _ => return GenerateOptions::default(),
+        }
+    }
+    opts.build()
+}
+
 /// A single ACP session backed by a [`HarnessAgent`].
 #[derive(Clone)]
 pub struct AcpAgentSession {
     session_id: SessionId,
     cwd: PathBuf,
     agent: Arc<HarnessAgent>,
-    config: SessionConfig,
+    /// Shared across clones: handlers mutate the live session while the
+    /// registry holds stale clones, so config changes (model / thought level /
+    /// mode) must not be lost on `register_session` write-back.
+    config: Arc<Mutex<SessionConfig>>,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     /// Optional resolver building a model from a model id (dynamic model
@@ -266,7 +321,7 @@ impl AcpAgentSession {
             session_id,
             cwd,
             agent: Arc::new(agent),
-            config: SessionConfig::default(),
+            config: Arc::new(Mutex::new(SessionConfig::default())),
             models,
             modes,
             model_builder: None,
@@ -296,18 +351,18 @@ impl AcpAgentSession {
     }
 
     /// Current model id.
-    pub fn model(&self) -> &str {
-        &self.config.model
+    pub fn model(&self) -> String {
+        self.config.lock().unwrap().model.clone()
     }
 
     /// Current mode id.
-    pub fn mode(&self) -> &str {
-        &self.config.mode
+    pub fn mode(&self) -> String {
+        self.config.lock().unwrap().mode.clone()
     }
 
     /// Sets the current model.
     pub fn set_model(&mut self, model: impl Into<String>) {
-        self.config.model = model.into();
+        self.config.lock().unwrap().model = model.into();
     }
 
     /// Installs the resolver used for dynamic model switching: a closure that
@@ -324,23 +379,28 @@ impl AcpAgentSession {
     /// rebuilt from the resolved endpoint and swapped into the live agent while
     /// conversation state is preserved (mirrors Java `LocalAgent` rebuilding the
     /// agent per prompt with the new config).
-    fn apply_session_config(&mut self) {
-        // Thought level -> per-call generation default (reasoning effort).
-        // `disabled` maps to no reasoning; `max` maps to OpenAI's `xhigh`.
-        let effort = match self.config.thought_level.as_str() {
-            "disabled" | "none" => None,
-            "max" => Some("xhigh"),
-            other => Some(other),
-        };
-        let mut opts = GenerateOptions::builder();
-        if let Some(effort) = effort {
-            opts = opts.reasoning_effort(effort);
-        }
-        self.agent.set_generate_options_defaults(opts.build());
+    fn apply_session_config(&mut self) -> Vec<String> {
+        // Thought level -> per-call generation defaults. `auto` sends nothing
+        // (provider default); explicit levels are mapped per model capability:
+        // OpenAI o/gpt-5 family -> `reasoning_effort`; other OpenAI-compatible
+        // vendors -> vendor-specific body params (e.g. `enable_thinking`).
+        let level = self.config.lock().unwrap().thought_level.clone();
+        // Read through the embedded ReAct agent so a dynamically switched
+        // model (set_model) is reflected here; HarnessAgent::model() still
+        // holds the builder-time model.
+        let model_name = self
+            .agent
+            .agent()
+            .map(|a| a.model().model_name().to_string())
+            .unwrap_or_default();
+        let opts = thought_level_params(&level, &model_name);
+        self.agent.set_generate_options_defaults(opts);
 
-        // Dynamic model switching (next prompt).
+        // Dynamic model switching (next prompt). Failures are returned so the
+        // caller can notify the client instead of failing silently.
+        let mut errors = Vec::new();
         if let Some(build) = &self.model_builder {
-            let id = self.config.model.clone();
+            let id = self.config.lock().unwrap().model.clone();
             if !id.is_empty() && id != "default" && id != self.applied_model {
                 match build(&id) {
                     Ok(model) => {
@@ -352,26 +412,30 @@ impl AcpAgentSession {
                     Err(e) => {
                         tracing::warn!(session = %self.session_id, model = %id, error = %e,
                             "failed to switch model; keeping current model");
+                        errors.push(format!(
+                            "⚠️ model switch to '{id}' failed: {e} (keeping current model)"
+                        ));
                     }
                 }
             }
         }
+        errors
     }
 
 
     /// Current thought level.
-    pub fn thought_level(&self) -> &str {
-        &self.config.thought_level
+    pub fn thought_level(&self) -> String {
+        self.config.lock().unwrap().thought_level.clone()
     }
 
-    /// Sets the thought level (`disabled` / `low` / `medium` / `high` / `max`).
-    /// Applied as a per-call generation default on the next prompt.
+    /// Sets the thought level (`auto` / `disabled` / `low` / `medium` / `high`
+    /// / `max`). Applied on the next prompt.
     pub fn set_thought_level(&mut self, level: impl Into<String>) {
-        self.config.thought_level = level.into();
+        self.config.lock().unwrap().thought_level = level.into();
     }
     /// Sets the current mode.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
-        self.config.mode = mode.into();
+        self.config.lock().unwrap().mode = mode.into();
         // Apply the mode's permission context to the live agent so the *next*
         // request already runs under the new rules.
         self.apply_mode();
@@ -382,7 +446,7 @@ impl AcpAgentSession {
     /// persisted "always allow / always reject" user rules on top so they
     /// survive mode switches and session restarts.
     fn apply_mode(&mut self) {
-        let mode = self.config.mode.clone();
+        let mode = self.config.lock().unwrap().mode.clone();
         let ctx = config::permission_context_for_mode(&mode);
         self.agent.set_permission_context(ctx);
         let persisted = self.permission_store.load();
@@ -432,17 +496,18 @@ impl AcpAgentSession {
             .iter()
             .map(|m| SessionMode::new(m.id.clone(), m.name.clone()))
             .collect();
-        SessionModeState::new(self.config.mode.clone(), modes)
+        SessionModeState::new(self.config.lock().unwrap().mode.clone(), modes)
     }
 
     /// Returns the session config options advertised to the client.
     pub fn config_options(&self) -> Vec<SessionConfigOption> {
+        let cfg = self.config.lock().unwrap();
         super::config::default_config_options_with_thought(
-            &self.config.model,
+            &cfg.model,
             &self.models,
-            &self.config.mode,
+            &cfg.mode,
             &self.modes,
-            &self.config.thought_level,
+            &cfg.thought_level,
         )
     }
 
@@ -506,8 +571,15 @@ impl AcpAgentSession {
         // Dynamic model switching + thought level: config changes (setModel /
         // setConfigOption thought_level) take effect on the *next* prompt. The
         // model is rebuilt from the resolved endpoint and swapped into the live
-        // agent while conversation state is preserved.
-        self.apply_session_config();
+        // agent while conversation state is preserved. Switch failures are
+        // surfaced to the client as a message chunk instead of failing silently.
+        for err in self.apply_session_config() {
+            emit(event::message_chunk(
+                self.session_id.clone(),
+                format!("{err}\n"),
+                None,
+            ));
+        }
         // Convert ACP content blocks into core messages.
         let mut msgs = Vec::new();
         let mut text = String::new();
@@ -549,11 +621,10 @@ impl AcpAgentSession {
             super::event::ToolEventMapper::new().with_message_id(message_id_opt.clone());
 
         // Push the initial context-window usage so clients render the gauge
-        // before the first model call completes.
-        let initial_used = self.usage.input_tokens.max(
-            self.usage.input_tokens + self.usage.output_tokens,
-        );
-        emit(self.usage_notification(initial_used));
+        // before the first model call completes. Without a prior model call
+        // there is no real "in-context" count, so report zero rather than the
+        // (inflated) cumulative session usage.
+        emit(self.usage_notification(0));
 
         loop {
             tokio::select! {
@@ -601,22 +672,20 @@ impl AcpAgentSession {
                             }
                             AgentEventType::ModelCallEnd => {
                                 // Accumulate usage and push a context-window
-                                // UsageUpdate after every model call.
+                                // UsageUpdate after every model call. `used`
+                                // reflects the tokens in the current context
+                                // (latest call's input tokens), NOT the
+                                // cumulative session count.
                                 if let Some(u) = ev
                                     .data()
                                     .fields
                                     .get("usage")
                                     .and_then(|v| serde_json::from_value::<ChatUsage>(v.clone()).ok())
                                 {
-                                    let in_context = u
-                                        .input_tokens
-                                        .max(self.usage.input_tokens + self.usage.output_tokens);
                                     self.accumulate_usage(u);
-                                    emit(self.usage_notification(in_context));
+                                    emit(self.usage_notification(u.input_tokens));
                                 } else {
-                                    emit(self.usage_notification(
-                                        self.usage.input_tokens + self.usage.output_tokens,
-                                    ));
+                                    emit(self.usage_notification(0));
                                 }
                             }
                             _ => {
@@ -670,10 +739,10 @@ impl AcpAgentSession {
         used: u64,
     ) -> agent_client_protocol::schema::v1::SessionNotification {
         use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
-        let model = self.agent.agent().map(|a| a.model());
-        let size = model
-            .as_ref()
-            .map(|m| m.context_window_size() as u64)
+        let size = self
+            .agent
+            .agent()
+            .map(|a| a.model().context_window_size() as u64)
             .unwrap_or(128_000);
         SessionNotification::new(
             self.session_id.clone(),

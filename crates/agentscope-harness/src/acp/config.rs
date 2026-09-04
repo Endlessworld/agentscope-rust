@@ -44,13 +44,16 @@ pub struct ModeChoice {
 /// The thought-level (reasoning effort) selector id advertised to clients.
 pub const CONFIG_THOUGHT_LEVEL: &str = "thought_level";
 
-/// Default thought level (mirrors Java `ThoughtLevel.LOW`).
-pub const DEFAULT_THOUGHT_LEVEL: &str = "low";
+/// Default thought level: `auto` sends no reasoning parameter at all
+/// (the model/provider default applies). Explicit levels are mapped
+/// per-model-capability in `session::thought_level_params`.
+pub const DEFAULT_THOUGHT_LEVEL: &str = "auto";
 
 /// The available thought-level choices, mirroring Java `ThoughtLevel`:
 /// `disabled` (no thinking) / `low` / `medium` / `high` / `max`.
 pub fn thought_level_choices() -> Vec<(&'static str, &'static str)> {
     vec![
+        ("auto", "Auto"),
         ("disabled", "Disabled"),
         ("low", "Low"),
         ("medium", "Medium"),
