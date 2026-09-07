@@ -18,7 +18,9 @@ pub mod memory_flush;
 pub mod memory_maintenance;
 pub mod sandbox_lifecycle;
 pub mod skill_middleware;
+pub mod state_checkpoint;
 pub mod subagents;
+pub mod tool_call_sanitizer;
 pub mod tool_result_eviction;
 pub mod teams;
 pub mod transcript;
@@ -36,11 +38,13 @@ pub use sandbox_lifecycle::SandboxLifecycleMiddleware;
 pub use skill_middleware::{
     build_skill_entries, HarnessSkillMiddleware, SkillCuratorMiddleware, SkillUsageMiddleware,
 };
+pub use state_checkpoint::{AGENT_STATE_KEY, StateCheckpointMiddleware};
 pub use subagents::{
     build_delivery_reminder, build_task_summary, prepend_to_system_message,
     render_subagent_section, SubagentsMiddleware,
 };
 pub use tool_result_eviction::{EVICTED_METADATA_KEY, ToolResultEvictionMiddleware};
+pub use tool_call_sanitizer::ToolCallPairSanitizerMiddleware;
 pub use teams::TeamsMiddleware;
 pub use transcript::TranscriptMiddleware;
 pub use workspace_context::WorkspaceContextMiddleware;

@@ -2,6 +2,9 @@
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
+use agentscope_core::message::{ContentBlock, ToolResultBlock};
+use agentscope_core::tool::{Tool, ToolExecutionContext};
+use agentscope_harness::tool::FilesystemTool;
 use agentscope_harness::{
     CompositeFilesystem, Filesystem, LocalFilesystem, OverlayFilesystem, SandboxBackedFilesystem,
     SandboxFilesystem,
@@ -9,6 +12,14 @@ use agentscope_harness::{
 
 fn ctx() -> RuntimeContext {
     RuntimeContext::default()
+}
+
+fn tool_ctx() -> ToolExecutionContext {
+    ToolExecutionContext {
+        tool_call: None,
+        runtime: serde_json::Map::new(),
+        emitter: None,
+    }
 }
 
 async fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -220,4 +231,64 @@ async fn sandbox_executes_shell() {
     let result = sandbox.execute(&ctx(), "echo hello-from-shell", 10).await.unwrap();
     assert!(result.is_success());
     assert!(result.output.contains("hello-from-shell"));
+}
+
+#[tokio::test]
+async fn ls_reports_errors_instead_of_silent_empty() {
+    let dir = temp_dir("ls_errors").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+
+    // non-existent path -> error (not silent empty)
+    let err = fs.ls(&ctx(), "/nope").await.unwrap_err().to_string();
+    assert!(err.contains("Path does not exist"), "got: {err}");
+
+    // a file (not a directory) -> error
+    fs.write(&ctx(), "/file.txt", "x").await.unwrap();
+    let err = fs.ls(&ctx(), "/file.txt").await.unwrap_err().to_string();
+    assert!(err.contains("Not a directory"), "got: {err}");
+}
+
+#[tokio::test]
+async fn search_tools_bound_output_by_limit() {
+    use serde_json::json;
+
+    let dir = temp_dir("search_limit").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    for i in 0..50 {
+        fs.write(&ctx(), &format!("/f{i}.rs"), "pub fn f()").await.unwrap();
+    }
+
+    let glob = FilesystemTool::glob_files(Arc::clone(&fs));
+    let out = glob
+        .call(
+            json!({ "pattern": "**/*.rs", "path": "/", "limit": 10 }).as_object().unwrap().clone(),
+            tool_ctx(),
+        )
+        .await
+        .unwrap();
+    let text = tool_text(&out);
+    assert!(text.contains("Truncated"), "expected truncation notice, got: {text}");
+    assert_eq!(text.lines().count(), 12, "10 entries + 2 notice lines");
+
+    // limit < 1 is rejected as an Err
+    let err = glob
+        .call(
+            json!({ "pattern": "**/*.rs", "path": "/", "limit": 0 }).as_object().unwrap().clone(),
+            tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("must be greater than 0"));
+}
+
+fn tool_text(block: &ToolResultBlock) -> String {
+    block
+        .output
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

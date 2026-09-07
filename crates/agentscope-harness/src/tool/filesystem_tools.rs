@@ -160,14 +160,15 @@ impl FilesystemTool {
         Self {
             fs,
             name: "grep_files".into(),
-            description: "Search file contents with a regular expression pattern (supports inline flags like (?i); invalid regex falls back to literal substring matching).".into(),
+            description: "Search file contents with a regular expression pattern (supports inline flags like (?i); invalid regex falls back to literal substring matching). Returns at most 100 matches by default to keep tool output bounded.".into(),
             read_only: true,
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "正则表达式（支持 (?i) 等内联 flag；非法正则会回退为字面量匹配）"},
                     "path": {"type": "string", "description": "Directory or file to search; defaults to the filesystem root"},
-                    "glob": {"type": "string", "description": "Optional file-name glob filter, e.g. *.rs or **/*.java"}
+                    "glob": {"type": "string", "description": "Optional file-name glob filter, e.g. *.rs or **/*.java"},
+                    "limit": {"type": "integer", "description": "Maximum matches to return (default/recommended: 100; hard maximum: 1000)", "default": 100}
                 },
                 "required": ["pattern"]
             }),
@@ -178,13 +179,14 @@ impl FilesystemTool {
         Self {
             fs,
             name: "glob_files".into(),
-            description: "Find files matching a glob pattern relative to the base path (supports *, ?, **, [abc], {a,b}).".into(),
+            description: "Find files matching a glob pattern relative to the base path (supports *, ?, **, [abc], {a,b}). Returns at most 200 files by default to keep tool output bounded.".into(),
             read_only: true,
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Glob pattern, matched relative to the base path (e.g. *.java, **/*.java, src/**/*.rs)"},
-                    "path": {"type": "string", "description": "Base directory to search from", "default": "/"}
+                    "path": {"type": "string", "description": "Base directory to search from", "default": "/"},
+                    "limit": {"type": "integer", "description": "Maximum files to return (default/recommended: 200; hard maximum: 1000)", "default": 200}
                 },
                 "required": ["pattern"]
             }),
@@ -232,6 +234,32 @@ fn opt_str_arg(args: &JsonMap, key: &str) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+
+/// Resolves a search-tool `limit` argument: missing → `default_limit`, present →
+/// clamped to `max_limit`. Returns an error when the caller passes a value < 1.
+fn search_limit(args: &JsonMap, key: &str, default_limit: usize, max_limit: usize) -> Result<usize> {
+    match args.get(key).and_then(|v| v.as_u64()) {
+        None => Ok(default_limit),
+        Some(0) => Err(agentscope_core::Error::Tool(format!(
+            "{key} must be greater than 0"
+        ))),
+        Some(u) => Ok((u as usize).min(max_limit)),
+    }
+}
+
+/// Appends a truncation notice when `total` exceeds `limit`, mirroring the Java
+/// `FilesystemTool#appendTruncationNotice`.
+fn append_truncation_notice(output: String, total: usize, limit: usize, result_label: &str) -> String {
+    if total <= limit {
+        return output;
+    }
+    let mut out = output;
+    out.push_str(&format!(
+        "\n\n(Truncated: showing {} of {} {result_label}. Narrow the path/pattern or increase limit to see more.)",
+        limit, total
+    ));
+    out
+}
 #[async_trait]
 impl Tool for FilesystemTool {
     fn name(&self) -> &str {
@@ -320,36 +348,48 @@ impl Tool for FilesystemTool {
                 let pattern = str_arg(&args, "pattern")?;
                 let path = opt_str_arg(&args, "path");
                 let glob = opt_str_arg(&args, "glob");
+                let limit = search_limit(&args, "limit", 100, 1000)?;
                 match self
                     .fs
                     .grep(&rt, &pattern, path.as_deref(), glob.as_deref())
                     .await
                 {
                     Ok(matches) if matches.is_empty() => "No matches found".to_string(),
-                    Ok(matches) => matches
-                        .iter()
-                        .map(|m| format!("{}:{}:{}", m.path, m.line, m.text))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+                    Ok(matches) => {
+                        let total = matches.len();
+                        let output = matches
+                            .iter()
+                            .take(limit)
+                            .map(|m| format!("{}:{}:{}", m.path, m.line, m.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        append_truncation_notice(output, total, limit, "matches")
+                    }
                     Err(e) => return Ok(ToolResultBlock::error(e.to_string())),
                 }
             }
             "glob_files" => {
                 let pattern = str_arg(&args, "pattern")?;
                 let path = opt_str_arg(&args, "path").unwrap_or_else(|| "/".into());
+                let limit = search_limit(&args, "limit", 200, 1000)?;
                 match self.fs.glob(&rt, &pattern, &path).await {
                     Ok(files) if files.is_empty() => "No matching files found".to_string(),
-                    Ok(files) => files
-                        .iter()
-                        .map(|f| {
-                            if f.is_directory {
-                                format!("{}/", f.path)
-                            } else {
-                                format!("{} ({} bytes)", f.path, f.size)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+                    Ok(files) => {
+                        let total = files.len();
+                        let output = files
+                            .iter()
+                            .take(limit)
+                            .map(|f| {
+                                if f.is_directory {
+                                    format!("{}/", f.path)
+                                } else {
+                                    format!("{} ({} bytes)", f.path, f.size)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        append_truncation_notice(output, total, limit, "files")
+                    }
                     Err(e) => return Ok(ToolResultBlock::error(e.to_string())),
                 }
             }
@@ -357,7 +397,7 @@ impl Tool for FilesystemTool {
                 let path = str_arg(&args, "path")?;
                 match self.fs.ls(&rt, &path).await {
                     Ok(entries) if entries.is_empty() => {
-                        format!("Empty or not a directory: {path}")
+                        format!("Empty directory: {path}")
                     }
                     Ok(entries) => entries
                         .iter()

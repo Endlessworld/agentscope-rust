@@ -33,7 +33,7 @@ pub use gateway::{
 };
 pub use harness_agent::{HarnessAgent, HarnessAgentBuilder};
 pub use isolation_scope::IsolationScope;
-pub use mcp::{McpServerConfig, McpServerRegistrar, Registrar};
+pub use mcp::{McpServerConfig, McpServerRegistrationListener, McpServerRegistrationResult, McpServerRegistrationStatus, McpServerRegistrar, Registrar};
 pub use mcp_client_manager::{McpClientManager, McpClientInstance, McpToolInfo};
 pub use memory::{
     compaction::{

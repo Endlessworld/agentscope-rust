@@ -2,7 +2,7 @@
 
 > 用途：本文件是**所有迁移会话共享的单一事实来源**。任何会话在开始工作前必须先读本文件；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件与 `git status`/`cargo build` 实际验证为准。
 > 对照基准：`MIGRATION_PLAN.md`（方案）+ 本文件（已整合原 worker_output 8 份分析报告）+ `crates/*`（实际代码）。
-> 覆盖统计截至：本轮 Formatter 转换层（base_formatter）+ 状态持久化重启恢复 e2e 落地后。
+> 覆盖统计截至：ACP 权限确认/取消/动态模型切换全套 + 嵌入式内存优化（lite feature + 对话压缩）+ 文件批量读写 + 沙箱 pwsh 修复后（b5e1635 之后 10 个提交已反映）。
 
 ## 0. 如何阅读本文件
 - **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -25,7 +25,7 @@
 | core.tool | 38 类 | 20 文件 | ≈75% | 治理层 + 结果转换/消息构造/挂起语义/危险路径/注册 builder + meta（ToolCallParam/ExtendedModel/reset_equipped_tools/**ToolkitAware rebindToolkit**）+ 注册元数据（extendedModel/mcpClient/subAgent）+ TodoWriteTool 已补；余 @Tool proc-macro/ContextStore 属性袋 | |
 | core.state | 13 类 | 6 文件 | ≈85% | 核心 + ListHashUtil/SessionInfo 已补；缺 LegacyStateLoader/State 标记接口/readFileCache LRU |
 | core.memory | 8 类 | 1 文件 | ≈60% | 缺 AgentStateMemoryView；LongTermMemory 系列已 deprecated |
-| core.permission | 8 类 | 1 文件 | ≈90% | 流程高度对齐；缺 tool 自身规则集成 |
+| core.permission | 8 类 | 2 文件 | ≈95% | 流程高度对齐；ConfirmHandler 用户交互确认 + PermissionRuleStore 持久化已补；余 tool 自身规则建议生成 |
 | core.interruption | 3 类 | 1 文件 | ≈100% | 完全对齐 |
 | core.shutdown | 10 类 | 1 文件 | ≈45% | 状态机在；缺 per-request 跟踪/中间件/钩子 |
 | core.tracing | 4 类 | 1 文件 | ≈15% | 仅日志初始化；缺 OtelTracingMiddleware |
@@ -34,13 +34,14 @@
 | core.util | 8 类 | 无 util 模块 | ≈30% | 功能散落 serde_json；缺 ExceptionUtils/TypeUtils |
 | core.exception | 1 类 | error.rs | ≈100% | CompositeAgentException+AgentExceptionInfo 已补 |
 | core.workspace | 占位 | 无 | 0%（双方均未落地） | 占位对齐 |
-| harness.agent | — | harness_agent.rs | 骨架 | 无 call()/ReAct，仅装配器 |
+| harness.agent | — | harness_agent.rs | 已实装 | 完整 builder（disable_* 开关/agent_tracing_log/message_bus/generate_options_defaults）+ model()/filesystem()/toolkit()/middleware() 访问器；ACP coding agent 全套已落地；**#2600/#2499 per-session interrupt/clear_context 已加（interrupt/interrupt_session/clear_context/clear_context_for）** |
 | harness.filesystem | — | 6 文件 | 高 | Local/Overlay/Composite/Sandbox/Remote 完整 |
 | harness.tool | — | 4 文件 | 高 | FilesystemTool/ShellExecute/FuzzyTextMatcher |
 | harness.gateway | 29 类 | 8 文件 + channel/(7) | ≈98% | HarnessGateway/GatewayBootstrap/SessionTurnGate/WakeupDispatcher/MsgContext/SubagentRegistry 完整；channel/* 7 层路由 + chatui 已建（本轮） |
 | harness.memory | 10 类 | 6 文件 | ≈95% | compaction+flush+consolidation+eviction+session+MemoryConfig 完整 |
 | harness.bus | 6 类 | 4 文件 | ≈90% | MessageBus（Mode A/C/D）+ WorkspaceMessageBus + AsyncToolRegistry 系完整；Mode D 降级轮询 |
-| harness.sandbox | — | sandbox/ 模块 | 高 | Sandbox/SandboxClient/SandboxManager(4 级获取策略)/Guard/Lease/StateStore 完整；docker 后端与 snapshot/layout 待接 |
+| harness.sandbox | — | sandbox/ 模块 | 高 | Sandbox/SandboxClient/SandboxManager(4 级获取策略)/Guard/Lease/StateStore 完整；Windows pwsh -EncodedCommand（UTF-16LE→Base64）+ 子进程 stdin 置空防挂起 + 进程树管道死锁修复；docker 后端与 snapshot/layout 待接 |
+| harness.acp | — | acp/ 6 文件 | 新增模块 | AcpCodingAgent 包装 core ReActAgent（镜像 Kotlin AgiAgent/AgiAgentSession）；AcpAgentSession 权限确认/取消/流式/动态模型切换/per-session headers 全套落地 |
 | harness.middleware | 18+ | 11 文件 | 高 | 3 系统提示转换 + Inbox + AsyncTool + MemoryFlush + MemoryMaintenance + ToolResultEviction + SubagentsMiddleware + DynamicSubagentsMiddleware + **AgentTraceMiddleware（本轮）** + 配套 TaskTool/SubagentEntry/DefaultAgentManager/AgentSpecLoader；余 WorkspaceContext/SandboxLifecycle 待办 |
 | harness.subagent | — | subagent/task/ 目录 | task 仓库已建 | BackgroundTask/TaskRepository/WorkspaceTaskRepository 完整；Local/Adopted 动态 spawn 已实现 |
 | harness.mcp | — | mcp.rs + mcp_client_manager.rs | 高 | McpClientManager（rust-mcp-sdk v1.0.1 stdio）+ McpServerRegistrar 已实现；SSE/WS 传输待接 |
@@ -160,6 +161,7 @@
 | 枚举/规则/引擎 + 流程 | PermissionMode/Behavior/Rule/Decision/Context/Engine | ✅ 已完成 | deny→ask→tool→allow→bypass→default 一致 |
 | **tool 自身规则集成**（checkPermissions/generateSuggestions/危险路径） | ToolBase | 待办 | 当前 tool_check 仅做 EXPLORE/ACCEPT_EDITS 只读判断 |
 | **ask 决策带 suggested_rules** | ToolBase.generateSuggestions | 待办 | 当前 ask 决策不带 |
+| **ConfirmHandler 用户交互确认** | — | ✅ 已完成 | ReActAgent::set_confirm_handler（含 PermissionRule/ConfirmHandler 类型）；ACP 模式映射 plan/accept_edits/yolo；PermissionRuleStore 持久化规则到磁盘 |
 
 ### 2.12 shutdown（优先级 P1）— 状态机在，周边缺
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -185,7 +187,7 @@
 | McpTool（handler 注入 + not_connected fallback） | — | ✅ 已完成 | tool/mcp.rs |
 | harness McpServerConfig/Registrar 声明 | — | ✅ 已完成 | agent/mcp.rs（注册为 stub） |
 | **rust-mcp-sdk path 依赖接入** | McpClientManager | ✅ 已完成 | 已接入 `rust-mcp-sdk` v1.0.1 path 依赖；`McpClientManager` 实现客户端生命周期管理（create/connect/disconnect/list_tools/call_tool）；`McpClientInstance` 管理连接状态和工具列表 |
-| **McpServerRegistrar 真实实现** | harness Registrar | ✅ 已完成 | `McpServerRegistrar` 已实现：使用 `McpClientManager` 管理连接；`register()` 方法异步创建客户端并连接；新增 `disconnect_all()`、`registered_servers()` 辅助方法 |
+| **McpServerRegistrar 真实实现** | harness Registrar | ✅ 已完成 | `McpServerRegistrar` 已实现：使用 `McpClientManager` 管理连接；`register()` 方法异步创建客户端并连接；新增 `disconnect_all()`、`registered_servers()` 辅助方法；**#2877 注册结果上报已加（McpServerRegistrationListener + Success/Failed/Skipped 结果，with_listener 注入）** |
 
 ### 2.15 其余 core 缺失模块（优先级 P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -206,7 +208,7 @@
 ### 3.2 tool（优先级 P0）— 高对齐
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| FilesystemTool/ShellExecuteTool/FuzzyTextMatcher | 同名 | ✅ 已完成 | tool/*.rs |
+| FilesystemTool/ShellExecuteTool/FuzzyTextMatcher | 同名 | ✅ 已完成 | tool/*.rs；**read/write/edit 均支持批量**（file_paths/operations 数组）；ShellExecuteTool 执行 trace（命令/超时/耗时）已加；**#2832 grep/glob limit 上界（默认 100/200/硬上限 1000）+ 截断提示**；**#2413 list_files 空结果改 "Empty directory" + local/ls 区分 not-exists/not-a-directory 报错** |
 | **DANGEROUS_COMMANDS shell 自检** | ToolDangerousPathConstants | ✅ 已完成 | ShellExecuteTool::call 已接入 core `is_dangerous_command`；rm -rf/sudo rm/dd/mkfs/chmod 777 等直接返回 error 块（测试通过） |
 | **SessionSearchTool**（session_search/session_list/session_history） | SessionSearchTool | ✅ 已完成（本轮） | tool/session_search.rs：基于 WorkspaceManager.list_session_log_files + SessionTree JSONL；search 支持可选 agentId 过滤 + maxResults、list 优先 sessions.json store 索引、history 取最后 N 条消息（500 字符截断）；7 集成测试过 |
 | **WebTools**（web_fetch/web_search） | WebTools | ✅ 已完成（本轮） | tool/web_tools.rs：reqwest 实现，fetch 仅 http/https + max_chars 截断；search 走 Tavily API（TAVILY_API_KEY env 或 with_api_key 注入，缺失返回明确配置错误）；register_web_tools 一键注册；测试过（无 key 分支 + 参数校验；live HTTP 未验） |
@@ -227,7 +229,7 @@
 ### 3.4 memory（优先级 P1）— compaction 完整，两条 LLM 流水线缺
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| compaction 全链路（TokenCounter/Config/ConversationCompactor/Prune/Truncate） | 同名 | ✅ 已完成 | ~90%；flush/offload 钩子被略过 |
+| compaction 全链路（TokenCounter/Config/ConversationCompactor/Prune/Truncate） | 同名 | ✅ 已完成 | ~90%；flush/offload 钩子被略过；**#3009 thinking block token 已按内容估算 + ToolResult 内嵌套 thinking 递归计数** |
 | session（SessionEntry/SessionTree/FreshnessEvaluator） | 同名 | ✅ 已完成 | ~90% 结构；SessionTree 无文件 IO/remote 镜像/deferred flush |
 | **MemoryFlushManager** | MemoryFlushManager | ✅ 已完成 | memory/flush.rs（403 行）：LLM 抽取→今日 ledger（memory/YYYY-MM-DD.md），NO_REPLY 兜底，跳过 internal context；3 单测通过 |
 | **MemoryConsolidator** | MemoryConsolidator | ✅ 已完成 | memory/consolidator.rs（305 行）：定时合并每日 ledger→MEMORY.md；2 单测通过 |
@@ -283,29 +285,41 @@
 | skill 全模块 | curator/runtime/stager/prompt/shell_path | ✅ 已完成 | 7 文件；LLM umbrella 模式待接 |
 
 
+### 3.10 acp（优先级 P1）— 新增模块，全链路落地
+| 缺口项 | Java/Kotlin 参考 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|
+| AcpCodingAgent（包装 ReActAgent） | Kotlin AgiAgent / Java HarnessCodingAgent | ✅ 已完成 | acp/coding_agent.rs；lib.rs 导出 AcpAgentSession/AcpCodingAgent/AcpCodingAgentBuilder |
+| AcpAgentSession（权限确认/取消/流式） | Kotlin AgiAgentSession | ✅ 已完成 | acp/session.rs：ConfirmHandler 用户交互确认 + PermissionRuleStore 持久化 + 模式映射（plan/accept_edits/yolo）；$/cancel_request 取消（SDK Responder cancellation marker + run_with_transport 可注入 transport，进程内 Channel::duplex 取消 e2e） |
+| 流式输出与工具调用流 | — | ✅ 已完成 | acp/event.rs：思考/工具调用带 message_id、逐 token 增量流式、兼容 reasoning 字段；工具参数与位置随通知推送、ToolCall 创建延迟至参数就绪（Pending→raw_input→Completed，raw_output+content） |
+| 动态模型切换 + per-session headers | — | ✅ 已完成 | session.rs：model_factory/model_builder 回调（签名含 sessionId）；模型切换失败通知客户端；x-opencode-session 由外部注入绑定 ACP sessionId（core 硬编码已移除）；思考等级按模型能力映射（auto 默认 + enable_thinking 直达请求体）；UsageUpdate 为当前上下文 token 计数；上下文窗口推送 |
+| 配置与日志 | — | ✅ 已完成 | acp/config.rs：会话配置 Arc<Mutex> 共享防克隆丢失；AGENTSCOPE_LOG_DIR 固定日志目录 + ACP agent 文件日志 |
+| 已知 flaky | — | ⚠️ 注意 | acp_stdio_thought_test 全量跑时首轮失败/卡顿（stdio 时序），单独复跑通过 |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **测试基线**：`cargo test` → core 119 通过、harness 全绿（lib 145 + 集成含新增 session/web tools 7 个），无新增告警。本轮补齐 harness.tool：SessionSearchTool 三件套（tool/session_search.rs）+ WebTools 两件套（tool/web_tools.rs）
-- **harness docs/ 迁移进度（本轮）**：T8 PlanModeTools、T9 WaitAsyncResultsTool（barrier + `AsyncToolRegistry::list_session`）、T1 AgentSpawnTool（薄实现：前台/后台 spawn + 权限范围 + plan-mode 传播 + end_spawn）、M1 agent/team/（TeamClient + LocalTeamClient 版本化 CAS + 邮箱/唤醒）、T3 TeamTool（10 操作 + 角色裁剪）、M5 TeamsMiddleware（<agent-teams> prompt 注入 + 每轮邮箱排空）均已落地；M6 SandboxLifecycleMiddleware 与 M3/M4 Transcript 经核实早已实现。**P1 9/9 全绿**；进度详见 `docs/MIGRATION_GAP_TRACKER.md`
-- **clippy 基线**：core 16 条既有警告；harness 12 条既有（ExposedSession dead_code + unused imports 等）
+- **测试基线**：`cargo test` 合计 **core 126 + harness 290 = 416 通过**（含 acp_cancel_test、acp_event_flow_test、harness_agent_spawn_test(5)、harness_agent_test(8)）；已知 flaky：`acp_stdio_thought_test` 全量跑首轮失败/卡顿（stdio 时序），单独复跑通过
+- **ACP 全套落地（b5e1635 后 10 个提交）**：ed87c57 流式修复 → d736e87 工具调用流增强 → b33e133 文件批量读写 → 6caf10c 嵌入式内存优化（lite feature + 对话压缩 + pwsh EncodedCommand）→ 684839e 取消 → abd29f7 权限确认+沙箱进程树修复 → ba7b73b 上下文 → ccba968 思考等级/动态模型切换/技能双目录 → 321d384 会话配置共享/UsageUpdate/CLI 仪表 → 833f280 日志/请求头/ShellExecute trace
+- **嵌入式内存优化**：lite feature（`--no-default-features --features lite` 去掉 rusqlite bundled）+ 对话压缩中间件（conversation_compaction.rs，超触发点重写为 [summary]+preserved_tail）+ 技能/索引惰性加载 + 会话上限淘汰 + grep 正则/glob 相对路径 + Windows pwsh EncodedCommand
+- **clippy 基线**：core 16 条既有警告；harness 12 条既有（ExposedSession subagent_id/agent_id dead_code + sandbox/manager.rs 未使用导入等）
 - **关键文件**：`MIGRATION_PLAN.md`（方案）、`MIGRATION_GAP_TRACKER.md`（本文件）
-- **依赖说明**：`async-openai` v0.41.3、`rust-mcp-sdk` v1.0.1（远程 crates.io，已从 path 依赖改为远程）、`rusqlite` v0.31（bundled，SQLite 索引）
-- **已验证功能**：async-openai 自定义 base URL 生效（chat_demo 使用 https://opencode.ai/zen/go/v1 成功）；Formatter 转换层 + 状态持久化重启恢复 e2e 已通过
+- **依赖说明**：`async-openai` v0.41.3、`rust-mcp-sdk` v1.0.1（远程 crates.io）、`rusqlite` v0.31（bundled，lite feature 可去）
+- **已验证功能**：async-openai 自定义 base URL 生效（chat_demo 使用 https://opencode.ai/zen/go/v1 成功）；ACP 权限确认/取消/动态模型切换全套 + 对话压缩 + 批量文件读写已通过测试
 
 ### 4.2 下一步建议（按优先级）
-1. **P0 已完成**：model 层真实 provider 接入（async-openai）已验证，chat_demo 可正常运行
+1. **P0 已完成**：model 层真实 provider 接入（async-openai）已验证；ACP coding agent 全套（权限确认/取消/流式/动态模型切换）已落地
 2. **P1 重要待办**：
-   - ✅ MCP 集成（rust-mcp-sdk 接入）
-   - SandboxLifecycleMiddleware（依赖 SandboxManager + SandboxBackedFilesystem）
-   - ✅ Tool 残余中高层（ToolkitAware rebindToolkit、ToolRegistration extendedModel/mcpClient/subAgent 元数据）— 本轮完成；McpClientManager 此前已在 harness `agent/mcp_client_manager.rs` 落地（rust-mcp-sdk）
+   - ACP 稳定性：修复 acp_stdio_thought_test flaky（stdio 时序）
+   - SandboxLifecycleMiddleware + docker 后端（bollard）
+   - RemoteFilesystem 真实后端
+   - MCP SSE/WS 传输待接
 3. **P2 增强可选**：
    - Shutdown 精细化（GracefulShutdownMiddleware）
    - Observability 增强（OtelTracingMiddleware）
    - RAG 模块（全新模块）
    - Agent 协作（ObservableAgent observe、SubagentEventBus）
 
-> 下一步开工前请先读 `MIGRATION_GAP_TRACKER.md` 4.1/4.2，并确认 `cargo test` 基线 309 通过。
+> 下一步开工前请先读 `MIGRATION_GAP_TRACKER.md` 4.1/4.2，并确认 `cargo test` 基线 416 通过（core 126 + harness 290）。
 
 ## 5. 执行状态约定（所有会话必须遵守）
 - 开工前：读本文件 + `git status` + 确认 `cargo build`/`cargo test` 基线。

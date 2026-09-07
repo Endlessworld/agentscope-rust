@@ -14,6 +14,8 @@ use agentscope_core::event::AgentEvent;
 use agentscope_core::message::Msg;
 use agentscope_core::middleware::MiddlewareChain;
 use agentscope_core::model::Model;
+use agentscope_core::state::AgentState;
+use agentscope_core::state::AgentStateStore;
 use agentscope_core::tool::{Tool, Toolkit};
 
 use crate::filesystem::{Filesystem, LocalFilesystem};
@@ -26,8 +28,8 @@ use super::middleware::{
     CompactionMiddlewareConfig, ConversationCompactionMiddleware, DynamicSubagentsMiddleware,
     HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
-    SkillUsageMiddleware, SubagentsMiddleware, ToolResultEvictionMiddleware,
-    WorkspaceContextMiddleware,
+    SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware,
+    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
 };
 use super::skill::{
     build_promoter, compose_skill_repositories, AuditEntry, default_gate, FilesystemSkillUsageStore,
@@ -231,6 +233,33 @@ impl HarnessAgent {
         }
     }
 
+    /// Interrupts the current session's execution. No-op without a configured model.
+    pub fn interrupt(&self) {
+        if let Some(agent) = &self.agent {
+            agent.interrupt();
+        }
+    }
+
+    /// Interrupts execution only when the current session matches `session_id`.
+    /// Returns `true` if the interrupt was triggered for that session.
+    pub fn interrupt_session(&self, session_id: &str) -> bool {
+        self.agent.as_ref().map(|a| a.interrupt_session(session_id)).unwrap_or(false)
+    }
+
+    /// Clears the current session's model-visible conversation context without
+    /// creating a new session. No-op without a configured model.
+    pub fn clear_context(&self) {
+        if let Some(agent) = &self.agent {
+            agent.clear_context();
+        }
+    }
+
+    /// Clears the model-visible context for the session identified by `session_id`.
+    /// Returns `true` when that session's context was cleared.
+    pub fn clear_context_for(&self, session_id: &str) -> bool {
+        self.agent.as_ref().map(|a| a.clear_context_for(session_id)).unwrap_or(false)
+    }
+
     /// Replaces the model bound to the embedded ReAct agent. The next reasoning
     /// call uses the new model while conversation state is preserved (dynamic
     /// model switching). No-op without a configured model.
@@ -256,6 +285,12 @@ pub struct HarnessAgentBuilder {
     filesystem: Option<Arc<dyn Filesystem>>,
     cwd: Option<PathBuf>,
     distributed_store: Option<DistributedStore>,
+    /// Optional persistent state store wired into a checkpoint middleware.
+    state_store: Option<Arc<dyn AgentStateStore>>,
+    /// Stable session key used for checkpoint save/restore (restart-resume).
+    session_id: Option<String>,
+    /// User namespace for checkpoint save/restore.
+    user_id: Option<String>,
     with_filesystem_tools: bool,
     middleware: Option<MiddlewareChain>,
     sys_prompt: String,
@@ -315,6 +350,9 @@ impl Default for HarnessAgentBuilder {
             filesystem: None,
             cwd: None,
             distributed_store: None,
+            state_store: None,
+            session_id: None,
+            user_id: None,
             with_filesystem_tools: false,
             middleware: None,
             sys_prompt: String::new(),
@@ -385,6 +423,31 @@ impl HarnessAgentBuilder {
 
     pub fn distributed_store(mut self, ds: DistributedStore) -> Self {
         self.distributed_store = Some(ds);
+        self
+    }
+
+    /// Wires a persistent state store into the agent: the full `AgentState`
+    /// (conversation history, task bag, …) is saved after every run and
+    /// restored on the first run, enabling checkpoint/resume across restarts.
+    ///
+    /// Takes precedence over `distributed_store().agent_state_store` when both
+    /// are configured. Pair with [`Self::session_id`]/[`Self::user_id`] for a
+    /// stable restore key.
+    pub fn state_store(mut self, store: Arc<dyn AgentStateStore>) -> Self {
+        self.state_store = Some(store);
+        self
+    }
+
+    /// Sets the stable session id used as the checkpoint save/restore key.
+    /// A stable id lets a restarted process resume the same conversation.
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Sets the user namespace used as the checkpoint save/restore key.
+    pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
         self
     }
 
@@ -718,6 +781,13 @@ impl HarnessAgentBuilder {
         // ---- Middleware chain ----
         let mut middleware = self.middleware.unwrap_or_default();
 
+        // Keep every outgoing model request provider-valid: strip trailing assistant
+        // `tool_calls` that were never answered and orphan TOOL results (e.g. after
+        // checkpoint restore / eviction artifacts) so the next call cannot fail with
+        // HTTP 400 "Messages with role 'tool' must be a response to a preceding
+        // message with 'tool_calls'".
+        middleware.add(Box::new(ToolCallPairSanitizerMiddleware::new()));
+
         if self.agent_tracing_log_enabled {
             middleware.add(Box::new(AgentTraceMiddleware::new()));
         }
@@ -1022,6 +1092,34 @@ impl HarnessAgentBuilder {
             &resolved_workspace.to_string_lossy(),
         ));
 
+        // ---- State checkpoint: persist/restore the full AgentState ----
+        // Effective store: explicit `state_store` wins over `distributed_store`'s.
+        let state_store = self.state_store.clone().or_else(|| {
+            self.distributed_store
+                .as_ref()
+                .and_then(|d| d.agent_state_store.clone())
+        });
+        if let Some(store) = &state_store {
+            // Added last -> outermost: restore runs before (and save after) all
+            // inner middlewares (compaction, plan mode, …).
+            middleware.add(Box::new(StateCheckpointMiddleware::new(Arc::clone(store))));
+        }
+
+        // Initial state: pin a stable session/user id so restart-resume can
+        // find the checkpoint under the same key.
+        let initial_state = if self.session_id.is_some() || self.user_id.is_some() {
+            let mut s = AgentState::default();
+            if let Some(sid) = &self.session_id {
+                s.session_id = sid.clone();
+            }
+            if let Some(uid) = &self.user_id {
+                s.user_id = Some(uid.clone());
+            }
+            Some(s)
+        } else {
+            None
+        };
+
         // Build the embedded ReAct agent from the configured model/toolkit/middleware.
         // Only built when a model is provided (assembly-only mode leaves it `None`).
         let model = self.model.clone();
@@ -1031,6 +1129,9 @@ impl HarnessAgentBuilder {
                 .model(Arc::clone(model))
                 .toolkit(toolkit.clone())
                 .middleware_chain(middleware.clone());
+            if let Some(state) = &initial_state {
+                agent_builder = agent_builder.state(state.clone());
+            }
             if let Some(ctx) = &self.permission_context {
                 agent_builder = agent_builder.permission_context(ctx.clone());
             }

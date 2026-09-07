@@ -58,6 +58,7 @@ fn estimate_content_block_tokens(block: &ContentBlock) -> usize {
         ContentBlock::Text(t) => estimate_text_tokens(&t.text),
         ContentBlock::ToolUse(tu) => estimate_tool_use_tokens(tu),
         ContentBlock::ToolResult(tr) => estimate_tool_result_tokens(tr),
+        ContentBlock::Thinking(th) => estimate_text_tokens(&th.thinking),
         _ => 5,
     }
 }

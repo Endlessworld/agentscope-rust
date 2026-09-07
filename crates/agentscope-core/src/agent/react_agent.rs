@@ -218,6 +218,39 @@ impl ReActAgent {
         self.core.permission_engine.lock().unwrap().add_rule(rule);
     }
 
+    /// Clears the current session's model-visible conversation context without
+    /// creating a new session, mirroring `ReActAgent#clearContext`. The session id
+    /// and persisted state metadata are preserved; only the message history is reset.
+    pub fn clear_context(&self) {
+        self.core.state.lock().unwrap().context_mut().clear();
+    }
+
+    /// Clears the model-visible context for the session identified by `session_id`.
+    /// No-op when the current state belongs to a different session.
+    pub fn clear_context_for(&self, session_id: &str) -> bool {
+        let mut state = self.core.state.lock().unwrap();
+        if state.session_id() != session_id {
+            return false;
+        }
+        state.context_mut().clear();
+        true
+    }
+
+    /// Interrupts the current session's execution, mirroring `ReActAgent#interrupt`.
+    pub fn interrupt(&self) {
+        self.core.interrupt.trigger(None, None);
+    }
+
+    /// Interrupts execution only when the current session matches `session_id`,
+    /// mirroring the per-session `HarnessAgent#interrupt(userId, sessionId)` overload.
+    pub fn interrupt_session(&self, session_id: &str) -> bool {
+        let matches = self.core.state.lock().unwrap().session_id() == session_id;
+        if matches {
+            self.core.interrupt.trigger(None, None);
+        }
+        matches
+    }
+
     /// Creates a new builder.
     pub fn builder() -> ReActAgentBuilder {
         ReActAgentBuilder::default()
@@ -1724,6 +1757,31 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&args[0]).unwrap();
         assert_eq!(parsed["a"], serde_json::json!(1));
         assert_eq!(parsed["b"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn clear_context_resets_message_history_but_keeps_session() {
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hi")]));
+        let agent = ReActAgent::builder()
+            .name("t-clear")
+            .model(model)
+            .build()
+            .unwrap();
+
+        let session_id = agent.core.state.lock().unwrap().session_id().to_string();
+
+        // seed some context
+        agent.core.state.lock().unwrap().context_mut().push(Msg::user("hello"));
+        assert_eq!(agent.core.state.lock().unwrap().context().len(), 1);
+
+        // clear_context_for with a wrong session is a no-op
+        assert!(!agent.clear_context_for("other-session"));
+        assert_eq!(agent.core.state.lock().unwrap().context().len(), 1);
+
+        // clear_context_for with the right session clears
+        assert!(agent.clear_context_for(&session_id));
+        assert_eq!(agent.core.state.lock().unwrap().context().len(), 0);
+        assert_eq!(agent.core.state.lock().unwrap().session_id(), session_id);
     }
 
     #[tokio::test]

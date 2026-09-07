@@ -186,10 +186,13 @@ fn modified_to_string(t: Option<std::time::SystemTime>) -> String {
 impl Filesystem for LocalFilesystem {
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let dir = self.resolve(ctx, path)?;
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => return Ok(Vec::new()),
-        };
+        if !dir.exists() {
+            return Err(Error::Tool(format!("Path does not exist: {path}")));
+        }
+        if !dir.is_dir() {
+            return Err(Error::Tool(format!("Not a directory: {path}")));
+        }
+        let mut entries = tokio::fs::read_dir(&dir).await.map_err(Error::Io)?;
         let mut out = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let entry_path = entry.path();

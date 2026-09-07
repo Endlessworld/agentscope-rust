@@ -47,6 +47,34 @@ fn token_counter_handles_empty_and_tool_blocks() {
     assert!(total > 30, "expected structural overhead, got {}", total);
 }
 
+
+#[test]
+fn token_counter_counts_thinking_content() {
+    use agentscope_core::message::ThinkingBlock;
+
+    // direct thinking block in an assistant message
+    let thinking = "x".repeat(1_000);
+    let msg = Msg::builder()
+        .role(MsgRole::Assistant)
+        .content(vec![ContentBlock::Thinking(ThinkingBlock::new(thinking.clone()))])
+        .build();
+    let direct = calculate_token(&[msg]);
+    // 1000 chars / 2.5 = 400, plus role + message overhead
+    assert_eq!(direct, 400 + 5 + 4, "direct thinking counted, got {direct}");
+
+    // thinking nested inside a ToolResultBlock
+    let msg = Msg::builder()
+        .role(MsgRole::Tool)
+        .content(vec![ContentBlock::ToolResult(ToolResultBlock::new(
+            "call-1",
+            "search",
+            vec![ContentBlock::Thinking(ThinkingBlock::new(thinking))],
+        ))])
+        .build();
+    let nested = calculate_token(&[msg]);
+    // 400 thinking + tool result overhead (8) + name/id + role + message overhead
+    assert!(nested > 400, "nested thinking counted, got {nested}");
+}
 #[test]
 fn compaction_config_defaults_and_builder() {
     let cfg = CompactionConfig::default();
