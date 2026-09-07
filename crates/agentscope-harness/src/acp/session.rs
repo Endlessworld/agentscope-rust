@@ -292,7 +292,7 @@ pub struct AcpAgentSession {
     /// switching). When set, `setModel` swaps the live agent's model on the next
     /// prompt.
     model_builder: Option<
-        Arc<dyn Fn(&str) -> std::result::Result<Arc<dyn agentscope_core::model::Model>, String> + Send + Sync>,
+        Arc<dyn Fn(&str, &str) -> std::result::Result<Arc<dyn agentscope_core::model::Model>, String> + Send + Sync>,
     >,
     /// The model id currently applied to the live agent (for change detection).
     applied_model: String,
@@ -369,7 +369,7 @@ impl AcpAgentSession {
     /// builds a live [`Model`](agentscope_core::model::Model) from a model id.
     pub fn set_model_builder(
         &mut self,
-        builder: Arc<dyn Fn(&str) -> std::result::Result<Arc<dyn agentscope_core::model::Model>, String> + Send + Sync>,
+        builder: Arc<dyn Fn(&str, &str) -> std::result::Result<Arc<dyn agentscope_core::model::Model>, String> + Send + Sync>,
     ) {
         self.model_builder = Some(builder);
     }
@@ -402,7 +402,7 @@ impl AcpAgentSession {
         if let Some(build) = &self.model_builder {
             let id = self.config.lock().unwrap().model.clone();
             if !id.is_empty() && id != "default" && id != self.applied_model {
-                match build(&id) {
+                match build(&id, self.session_id.to_string().as_str()) {
                     Ok(model) => {
                         self.agent.set_model(model);
                         self.applied_model = id.clone();

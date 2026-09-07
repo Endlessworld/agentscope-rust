@@ -47,7 +47,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentscope_core::model::{Model, OpenAiChatModel};
+use agentscope_core::model::provider::ModelCreationContext;
+use agentscope_core::model::{GenerateOptions, Model, OpenAiChatModel};
 use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
@@ -358,6 +359,21 @@ fn build_system_prompt(cwd: &std::path::Path) -> String {
         .replace("{language}", &language)
 }
 
+/// 通过 `ModelCreationContext` 构建模型，并注入外部指定的附加请求头
+///（如 `x-opencode-session`，用于 OpenCode Go 网关的 prompt-cache 会话路由）。
+/// 会话头取当前 ACP sessionId，同一会话内保持稳定（利于 prompt-cache 命中）。
+fn build_model(model_id: &str, base_url: &str, api_key: &str, session_id: &str) -> OpenAiChatModel {
+    let ctx = ModelCreationContext::new("openai", model_id)
+        .api_key(api_key)
+        .base_url(base_url)
+        .options(
+            GenerateOptions::builder()
+                .additional_header("x-opencode-session", session_id)
+                .build(),
+        );
+    OpenAiChatModel::from_context(&ctx).expect("failed to build OpenAiChatModel")
+}
+
 /// 构建一个绑定指定 cwd 的完整 `HarnessAgent`（文件系统工具 + shell + 压缩 + skills）。
 ///
 /// 模型配置通过 `$HOME/.agentscope/models.json` 管理：
@@ -371,7 +387,7 @@ fn build_system_prompt(cwd: &std::path::Path) -> String {
 /// injects the `<available_skills>` block into the system prompt, registers the
 /// `load_skill_through_path` tool, and (when enabled) the self-learning
 /// `skill_manage` / `propose_skill` tools.
-fn build_agent(cwd: PathBuf) -> HarnessAgent {
+fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
     let model_config = ModelConfig::load_or_create();
     let (base_url, api_key, model_id) = model_config.resolve();
 
@@ -382,10 +398,8 @@ fn build_agent(cwd: PathBuf) -> HarnessAgent {
         &api_key[..api_key.len().min(8)],
     );
 
-    let model: Arc<dyn Model> = Arc::new(
-        OpenAiChatModel::new(model_id, Some(api_key), Some(base_url))
-            .expect("failed to build OpenAiChatModel"),
-    );
+    // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
+    let model: Arc<dyn Model> = Arc::new(build_model(&model_id, &base_url, &api_key, session_id));
 
     let workspace = cwd.join(".agentscope").join("workspace");
     let mut builder = HarnessAgent::builder()
@@ -447,10 +461,16 @@ fn build_agent(cwd: PathBuf) -> HarnessAgent {
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
 
-    let log_dir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".agentscope")
-        .join("log");
+    // Prefer an explicitly injected log dir (stable across launch cwds);
+    // fall back to <cwd>/.agentscope/log.
+    let log_dir = std::env::var_os("AGENTSCOPE_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".agentscope")
+                .join("log")
+        });
     let _ = std::fs::create_dir_all(&log_dir);
     let log_file = log_dir.join("acp-agent.log");
     let file = match std::fs::OpenOptions::new()
@@ -492,17 +512,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = AcpCodingAgent::builder()
         .name("agentscope-coding-agent")
-        .model_factory(build_agent)
+        .model_factory(|cwd, sid| build_agent(cwd, sid))
         // Dynamic model switching: resolve the selected model id against the
         // config file (provider lookup) and build a fresh OpenAiChatModel.
         // Takes effect on the next prompt; conversation state is preserved.
-        .model_builder(move |model_id| {
+        .model_builder(move |model_id, session_id| {
             let cfg = ModelConfig::load_or_create();
             let (base_url, api_key) = cfg.resolve_model(model_id)?;
-            let model: Arc<dyn Model> = Arc::new(
-                OpenAiChatModel::new(model_id.to_string(), Some(api_key), Some(base_url))
-                    .map_err(|e| format!("failed to build model '{model_id}': {e}"))?,
-            );
+            let model: Arc<dyn Model> =
+                Arc::new(build_model(model_id, &base_url, &api_key, session_id));
             Ok(model)
         })
         .modes(modes)

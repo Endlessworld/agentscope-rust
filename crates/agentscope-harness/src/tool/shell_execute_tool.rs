@@ -94,10 +94,23 @@ impl Tool for ShellExecuteTool {
             command
         };
 
+        let started = std::time::Instant::now();
+        tracing::info!(
+            command = %effective_command,
+            timeout_s = timeout,
+            "shell execute start"
+        );
         let result = self
             .sandbox
             .execute(&rt, &effective_command, timeout)
-            .await?;
+            .await;
+        tracing::info!(
+            command = %effective_command,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "shell execute done"
+        );
+        let result = result?;
         let mut sb = format!("Exit code: {}\n", result.exit_code);
         if !result.output.trim().is_empty() {
             sb.push('\n');

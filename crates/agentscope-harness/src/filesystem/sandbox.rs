@@ -136,6 +136,10 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             c
         };
         cmd.current_dir(&self.cwd)
+            // Never inherit the parent's stdin: when the agent runs over ACP
+            // stdio, stdin is a pipe the client keeps open, and an inherited
+            // pipe makes pwsh wait for input instead of exiting.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 

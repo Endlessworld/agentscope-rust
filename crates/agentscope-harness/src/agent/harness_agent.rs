@@ -302,6 +302,9 @@ pub struct HarnessAgentBuilder {
     confirm_handler: Option<agentscope_core::ConfirmHandler>,
     /// Optional initial permission context forwarded to the embedded ReActAgent.
     permission_context: Option<agentscope_core::PermissionContextState>,
+    /// Per-call generation defaults (e.g. additional request headers) applied
+    /// to the embedded ReActAgent at build time.
+    generate_options_defaults: Option<agentscope_core::model::GenerateOptions>,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -354,6 +357,7 @@ impl Default for HarnessAgentBuilder {
             skill_filter: SkillFilter::all(),
             confirm_handler: None,
             permission_context: None,
+            generate_options_defaults: None,
         }
     }
 }
@@ -662,6 +666,16 @@ impl HarnessAgentBuilder {
     /// (`PermissionBehavior::Ask`). Forwarded to the embedded ReActAgent at build.
     pub fn confirm_handler(mut self, handler: agentscope_core::ConfirmHandler) -> Self {
         self.confirm_handler = Some(handler);
+        self
+    }
+
+    /// Sets per-call generation defaults (e.g. additional request headers)
+    /// merged into every model request of the embedded agent.
+    pub fn generate_options_defaults(
+        mut self,
+        options: agentscope_core::model::GenerateOptions,
+    ) -> Self {
+        self.generate_options_defaults = Some(options);
         self
     }
 
@@ -1028,7 +1042,11 @@ impl HarnessAgentBuilder {
             }
             let max_iters = if self.max_iters > 0 { self.max_iters } else { DEFAULT_MAX_ITERS };
             agent_builder = agent_builder.max_iters(max_iters);
-            agent_builder.build().expect("build ReActAgent")
+            let agent = agent_builder.build().expect("build ReActAgent");
+            if let Some(opts) = &self.generate_options_defaults {
+                agent.set_generate_options_defaults(opts.clone());
+            }
+            agent
         });
 
         HarnessAgent {

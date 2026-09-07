@@ -1,45 +1,19 @@
 # 会话状态
 
 ## 当前目标
-实现ACP权限确认机制与沙箱执行修复——已完成。
+修复 ACP agent 执行 git 命令"超时"问题 —— 已全部完成并端到端验证通过。
 
-## 已完成（本次提交）
-1. **ACP权限确认机制（ConfirmHandler）**：
-   - 新增 `ConfirmHandler` 类型，支持用户交互确认工具调用
-   - 实现 `PermissionBehavior::Ask` 决策，通过ACP `session/request_permission` 往返用户确认
-   - 添加 `set_permission_context`、`set_confirm_handler`、`add_permission_rule` 方法
-   - 模式映射：plan→Explore（只读）、accept_edits→AcceptEdits（文件编辑自动批准，shell需确认）、yolo→Bypass（跳过检查）
+## 已完成（未提交）
+1. **LLM 400 修复**：`agentscope-core/src/model/openai.rs` — base_url 含 opencode.ai 时自动注入 `x-opencode-session` 头（provider "Go" 必需）。
+2. **shell 超时根因修复**：`agentscope-harness/src/filesystem/sandbox.rs` — `execute()` 子进程 stdin 设为 `Stdio::null()`。此前 pwsh 继承 agent 的 ACP stdio 管道（client 持有不关闭），等待输入不退出导致 wait() 挂起超时。
+3. **yolo 模式验证**：`examples/repro_acp_driver.rs` — session/new 后发 `session/set_mode`（modeId=yolo）跳过权限审核，验证生效。
+4. **端到端验证通过**：driver → acp_harness_agent → LLM → execute 工具 → `git status --short` Exit code 0 → stopReason=end_turn。
+5. 此前会话：ACP 权限确认机制（ConfirmHandler/PermissionRuleStore/模式映射 plan/accept_edits/yolo）、进程树 taskkill、管道防死锁。
 
-2. **权限规则持久化（PermissionRuleStore）**：
-   - 新增 `permission_store.rs`，持久化"always allow/always reject"用户选择
-   - 规则存储在 `{cwd}/.agentscope/permissions.json`，支持跨会话保留
-   - 原子写入（临时文件+重命名）避免并发读写冲突
+## 经验教训
+- agent 进程内 spawn 子进程必须显式 `stdin(null)`，绝不能继承 stdio 管道。
+- 复现示例（控制台 stdin）无法暴露该问题；必须走真实 ACP stdio 驱动复现。
+- 日志文件 .agentscope/log/acp-agent.log 的 handler 字段有转义爆炸噪音，grep 时需过滤。
 
-3. **沙箱执行修复**：
-   - 修复Windows进程树管理：`taskkill /F /T`杀死整个进程树避免孤儿进程
-   - 修复管道死锁：先获取stdout/stderr再等待，避免缓冲区满导致挂起
-   - 更新示例程序使用标准 `#[tokio::main]` 宏替代嵌入式优化
-
-4. **代码重构与测试**：
-   - 新增单元测试：权限模式切换、Ask批准/拒绝、handler运行时切换
-   - 集成权限选项：ALLOW_ONCE、ALLOW_ALWAYS、REJECT_ONCE、REJECT_ALWAYS
-   - 更新HarnessAgent支持权限上下文和确认处理
-
-## 验证结果
-- Git提交：`abd29f7` 实现ACP权限确认机制与沙箱执行修复
-- 14个文件变更，1053行新增，67行删除
-- 创建新文件：`crates/agentscope-harness/src/acp/permission_store.rs`
-
-## 下一步
-1. 验证ACP权限确认机制在真实客户端中的表现
-2. 更新docs/ACP_AGENT__GAP_TRACKER.md状态
-3. 考虑添加权限规则的UI管理界面
-4. 继续harness P2增强：docker后端、snapshot持久化等
-
-## 关键产物
-- crates/agentscope-harness/src/acp/permission_store.rs（新文件：权限规则持久化）
-- crates/agentscope-core/src/agent/react_agent.rs（ConfirmHandler、权限引擎重构）
-- crates/agentscope-harness/src/acp/config.rs（ACP模式映射、权限上下文）
-- crates/agentscope-harness/src/acp/session.rs（ACP确认处理、客户端连接管理）
-- crates/agentscope-harness/src/filesystem/sandbox.rs（Windows进程树管理修复）
-- Git提交：abd29f7
+## 下一步（可选）
+- 用户确认后 git 提交；清理 driver 中遗留的权限自动回复逻辑（yolo 下已不需要）。

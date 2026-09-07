@@ -37,7 +37,7 @@ impl Model for NeverEndingModel {
 }
 
 /// Builds a fully-wired harness agent with the never-ending model.
-fn build_agent(_cwd: std::path::PathBuf) -> HarnessAgent {
+fn build_agent(_cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model: Arc<dyn Model> = Arc::new(NeverEndingModel);
     HarnessAgent::builder()
         .name("acp-cancel-test")
@@ -52,7 +52,7 @@ async fn cancel_request_stops_prompt_with_stop_reason_cancelled() {
 
     // Agent side: full AcpCodingAgent over the in-process channel.
     let agent = AcpCodingAgent::builder()
-        .model_factory(build_agent)
+        .model_factory(|cwd, sid| build_agent(cwd, sid))
         .build()
         .expect("build AcpCodingAgent");
     let agent_task = tokio::spawn(async move {

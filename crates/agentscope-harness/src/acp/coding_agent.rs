@@ -55,7 +55,7 @@ fn build_env_model() -> Arc<dyn Model> {
 /// The default per-session factory: builds a fully-wired [`HarnessAgent`] using the
 /// [`HarnessAgentBuilder`]'s complete orchestration (workspace, filesystem tools, shell,
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
-fn default_model_factory(cwd: std::path::PathBuf) -> HarnessAgent {
+fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model = build_env_model();
     let compaction = CompactionMiddlewareConfig {
         enabled: true,
@@ -78,13 +78,16 @@ fn default_model_factory(cwd: std::path::PathBuf) -> HarnessAgent {
 /// underlying [`HarnessAgent`] per session.
 pub struct AcpCodingAgent {
     name: String,
-    model_factory: Arc<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync>,
+    model_factory: Arc<dyn Fn(PathBuf, &str) -> HarnessAgent + Send + Sync>,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
-    /// Builds a live model from a model id (dynamic model switching).
-    model_builder:
-        Option<Arc<dyn Fn(&str) -> Result<Arc<dyn Model>, String> + Send + Sync>>,
+    /// Builds a live model from a model id + session id (dynamic model
+    /// switching). The session id lets callers derive per-session request
+    /// headers (e.g. `x-opencode-session` for prompt-cache routing).
+    model_builder: Option<
+        Arc<dyn Fn(&str, &str) -> Result<Arc<dyn Model>, String> + Send + Sync>,
+    >,
     /// 会话注册表上限（嵌入式优化）：超过上限时淘汰最旧会话，
     /// 避免多会话成倍放大内存。默认 1。
     max_sessions: usize,
@@ -93,7 +96,7 @@ pub struct AcpCodingAgent {
 impl AcpCodingAgent {
     /// Creates a new `AcpCodingAgent`.
     pub fn new(
-        model_factory: impl Fn(PathBuf) -> HarnessAgent + Send + Sync + 'static,
+        model_factory: impl Fn(PathBuf, &str) -> HarnessAgent + Send + Sync + 'static,
         models: Vec<ModelChoice>,
         modes: Vec<ModeChoice>,
     ) -> Self {
@@ -148,7 +151,7 @@ impl AcpCodingAgent {
 
     /// Creates a new session using the model factory.
     fn create_session(&self, session_id: SessionId, cwd: PathBuf) -> AcpAgentSession {
-        let agent = (self.model_factory)(cwd.clone());
+        let agent = (self.model_factory)(cwd.clone(), session_id.to_string().as_str());
         let mut session = AcpAgentSession::new(
             session_id,
             cwd,
@@ -442,11 +445,13 @@ impl AcpCodingAgent {
 #[derive(Default)]
 pub struct AcpCodingAgentBuilder {
     name: Option<String>,
-    model_factory: Option<Box<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync>>,
+    model_factory: Option<Box<dyn Fn(PathBuf, &str) -> HarnessAgent + Send + Sync>>,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     max_sessions: Option<usize>,
-    model_builder: Option<Arc<dyn Fn(&str) -> Result<Arc<dyn Model>, String> + Send + Sync>>,
+    model_builder: Option<
+        Arc<dyn Fn(&str, &str) -> Result<Arc<dyn Model>, String> + Send + Sync>,
+    >,
 }
 
 impl AcpCodingAgentBuilder {
@@ -456,10 +461,12 @@ impl AcpCodingAgentBuilder {
         self
     }
 
-    /// Sets the factory used to build a [`HarnessAgent`] per session.
+    /// Sets the factory used to build a [`HarnessAgent`] per session. The
+    /// second argument is the freshly assigned ACP session id, so callers can
+    /// derive per-session request headers (e.g. `x-opencode-session`).
     pub fn model_factory(
         mut self,
-        factory: impl Fn(PathBuf) -> HarnessAgent + Send + Sync + 'static,
+        factory: impl Fn(PathBuf, &str) -> HarnessAgent + Send + Sync + 'static,
     ) -> Self {
         self.model_factory = Some(Box::new(factory));
         self
@@ -488,7 +495,7 @@ impl AcpCodingAgentBuilder {
     /// (takes effect on the next prompt).
     pub fn model_builder(
         mut self,
-        builder: impl Fn(&str) -> Result<Arc<dyn Model>, String> + Send + Sync + 'static,
+        builder: impl Fn(&str, &str) -> Result<Arc<dyn Model>, String> + Send + Sync + 'static,
     ) -> Self {
         self.model_builder = Some(Arc::new(builder));
         self
@@ -498,10 +505,10 @@ impl AcpCodingAgentBuilder {
     pub fn build(self) -> Result<AcpCodingAgent, Box<dyn std::error::Error>> {
         let factory = self
             .model_factory
-            .map(|f| -> Box<dyn Fn(PathBuf) -> HarnessAgent + Send + Sync> { f })
+            .map(|f| -> Box<dyn Fn(PathBuf, &str) -> HarnessAgent + Send + Sync> { f })
             .unwrap_or_else(|| Box::new(default_model_factory));
         let mut agent = AcpCodingAgent::new(
-            move |cwd| factory(cwd),
+            move |cwd, sid| factory(cwd, sid),
             self.models,
             self.modes,
         );
