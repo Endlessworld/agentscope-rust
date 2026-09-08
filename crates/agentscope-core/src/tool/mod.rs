@@ -27,7 +27,7 @@ pub use executor::ToolExecutor;
 pub use file::FilesystemTool;
 pub use emitter::{emit_to, ChunkCallback, DefaultToolEmitter, NoOpToolEmitter, ToolEmitter};
 pub use group::{ToolGroup, ToolGroupBuilder, ToolGroupManager, ToolGroupScope};
-pub use mcp::McpTool;
+pub use mcp::{McpAsyncHandler, McpTool};
 pub use meta::{ExtendedModel, MetaToolFactory, SimpleExtendedModel, ToolCallParam};
 pub use meta::{ToolCallParamBuilder};
 pub use registration::ToolRegistration;

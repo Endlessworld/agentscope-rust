@@ -305,6 +305,12 @@ pub struct AcpAgentSession {
     client: Option<Arc<AcpClientHandle>>,
     /// Persistent "always allow / always reject" rule store for this workspace.
     permission_store: Arc<PermissionRuleStore>,
+    /// Manages MCP client connections for this session (stdio servers declared
+    /// by the ACP client via `mcp_servers`). Shared across clones so tools keep
+    /// working after `register_session` write-back.
+    mcp_manager: Arc<crate::agent::McpClientManager>,
+    /// Server names already bridged into the toolkit this session (dedup).
+    bridged_servers: Arc<Mutex<Vec<String>>>,
 }
 
 impl AcpAgentSession {
@@ -330,6 +336,8 @@ impl AcpAgentSession {
             usage: ChatUsage::default(),
             client: None,
             permission_store,
+            mcp_manager: Arc::new(crate::agent::McpClientManager::new()),
+            bridged_servers: Arc::new(Mutex::new(Vec::new())),
         };
         session.apply_mode();
         session
@@ -485,6 +493,99 @@ impl AcpAgentSession {
                 // No client handle (e.g. an embedded run that never connected
                 // to an ACP peer): Ask decisions stay unsupported and error.
                 self.agent.set_confirm_handler(None);
+            }
+        }
+    }
+
+    /// Connects the MCP servers declared by the ACP client (`mcp_servers` on
+    /// new/load/resume session) and bridges their tools into the session's
+    /// toolkit so the core agent can call them.
+    ///
+    /// Supports stdio (`McpServer::Stdio`), SSE (`McpServer::Sse`) and HTTP
+    /// (`McpServer::Http`) transports. Re-declaring an already bridged server is
+    /// a no-op.
+    pub async fn apply_mcp_servers(&self, servers: &[agent_client_protocol::schema::v1::McpServer]) {
+        use agent_client_protocol::schema::v1::McpServer;
+        for server in servers {
+            let (name, config) = match server {
+                McpServer::Stdio(stdio) => {
+                    let name = stdio.name.clone();
+                    // Build the stdio launch command: `command args...`.
+                    let command = std::iter::once(stdio.command.display().to_string())
+                        .chain(stdio.args.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (name.clone(), crate::agent::McpServerConfig::new(name).command(command))
+                }
+                McpServer::Sse(sse) => {
+                    let headers = sse
+                        .headers
+                        .iter()
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect::<Vec<_>>();
+                    (
+                        sse.name.clone(),
+                        crate::agent::McpServerConfig::new(sse.name.clone())
+                            .url(sse.url.clone())
+                            .headers(headers),
+                    )
+                }
+                McpServer::Http(http) => {
+                    let headers = http
+                        .headers
+                        .iter()
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect::<Vec<_>>();
+                    (
+                        http.name.clone(),
+                        crate::agent::McpServerConfig::new(http.name.clone())
+                            .url(http.url.clone())
+                            .headers(headers),
+                    )
+                }
+                _other => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        "MCP server transport not supported; skipping"
+                    );
+                    continue;
+                }
+            };
+            // Dedup: skip servers already bridged this session.
+            {
+                let mut bridged = self.bridged_servers.lock().unwrap();
+                if bridged.contains(&name) {
+                    continue;
+                }
+                bridged.push(name.clone());
+            }
+            match self.mcp_manager.create_client(config).await {
+                Ok(client_id) => {
+                    if let Err(e) = self.mcp_manager.connect(&client_id).await {
+                        tracing::warn!(
+                            session = %self.session_id,
+                            server = %name,
+                            %e,
+                            "failed to connect MCP server"
+                        );
+                        continue;
+                    }
+                    let toolkit = self.agent.toolkit();
+                    crate::agent::bridge_mcp_tools_to_toolkit(&self.mcp_manager, toolkit).await;
+                    tracing::info!(
+                        session = %self.session_id,
+                        server = %name,
+                        "bridged MCP server tools into session toolkit"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        server = %name,
+                        %e,
+                        "failed to create MCP client"
+                    );
+                }
             }
         }
     }

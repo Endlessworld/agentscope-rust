@@ -22,7 +22,7 @@ pub use agent::{
     ExecResult, Gateway, GatewayAgent, GatewayBootstrap, GatewayBootstrapBuilder, GatewayTurnContext,
     filter_summary_messages, format_messages_for_summary, HarnessAgent, HarnessAgentBuilder,
     DefaultAgentManager, HarnessGateway, HarnessSkillEntry, InMemorySubagentRegistry,
-    InboxMiddleware, IsolationScope, McpServerConfig, McpServerRegistrar, MemoryConfig,
+    InboxMiddleware, IsolationScope, bridge_mcp_tools_to_toolkit, McpServerConfig, McpServerRegistrar, MemoryConfig,
     MemoryConfigBuilder, MemoryConsolidator, MemoryFlushManager, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, DmScope, InboundMessage, MessageBus, MsgContext, OutboundAddress,
     OutboundEnvelope, Peer, PeerKind, PlanModeConfig, prepend_to_system_message, render_subagent_section,

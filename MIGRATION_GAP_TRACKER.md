@@ -22,9 +22,9 @@
 | core.event | 35 类 | 4 文件 | ≈95% | 31/31 事件变体齐全 + AgentEventEmitter/ConfirmResult 已补 |
 | core.middleware | 7 类 | 4 文件 | ≈95% | 5 钩子洋葱链完整 + TaskReminderMiddleware 已补 |
 | core.hook | 21 类 | **0 文件** | 0%（设计决定） | Java 已 @Deprecated，走 2.0 middleware 架构，不迁移 |
-| core.tool | 38 类 | 20 文件 | ≈75% | 治理层 + 结果转换/消息构造/挂起语义/危险路径/注册 builder + meta（ToolCallParam/ExtendedModel/reset_equipped_tools/**ToolkitAware rebindToolkit**）+ 注册元数据（extendedModel/mcpClient/subAgent）+ TodoWriteTool 已补；余 @Tool proc-macro/ContextStore 属性袋 | |
+| core.tool | 38 类 | 20 文件 | ≈80% | 治理层 + 结果转换/消息构造/挂起语义/危险路径/注册 builder + meta（ToolCallParam/ExtendedModel/reset_equipped_tools/**ToolkitAware rebindToolkit**）+ 注册元数据（extendedModel/mcpClient/subAgent）+ TodoWriteTool 已补；余 **@Tool proc-macro**（最大开发体验缺口）；ContextStore 属性袋为设计决定（走 RuntimeContext.metadata） |
 | core.state | 13 类 | 6 文件 | ≈85% | 核心 + ListHashUtil/SessionInfo 已补；缺 LegacyStateLoader/State 标记接口/readFileCache LRU |
-| core.memory | 8 类 | 1 文件 | ≈60% | 缺 AgentStateMemoryView；LongTermMemory 系列已 deprecated |
+| core.memory | 8 类 | 1 文件 | ≈85% | StateBackedMemory 已完整实现 Memory trait（add/get/delete/clear/save_to/load_from）；缺 AgentStateMemoryView（活跃 API）；LongTermMemory 系列已 deprecated |
 | core.permission | 8 类 | 2 文件 | ≈95% | 流程高度对齐；ConfirmHandler 用户交互确认 + PermissionRuleStore 持久化已补；余 tool 自身规则建议生成 |
 | core.interruption | 3 类 | 1 文件 | ≈100% | 完全对齐 |
 | core.shutdown | 10 类 | 1 文件 | ≈45% | 状态机在；缺 per-request 跟踪/中间件/钩子 |
@@ -58,7 +58,7 @@
 | ToolGroupManager 已补 | ToolGroupManager/ToolGroup/ToolGroupScope | ✅ 已完成 | group.rs；含 META/EXTERNAL、替换语义、孤儿回收 |
 | ToolValidator 已补 | ToolValidator | ✅ 已完成 | validator.rs，jsonschema DRAFT-2020-12 |
 | ToolkitConfig 已补 | ToolkitConfig | ✅ 已完成 | config.rs；parallel/execution_config/allow_tool_deletion |
-| **ToolRegistration 流式 builder** | Toolkit$ToolRegistration | ✅ 已完成 | registration.rs + `Toolkit::register()`；tool/group/presetParameters/apply/**extendedModel（ExtendedSchemaTool 合并 schema）/mcp_client/sub_agent** 已实现；enableTools 待扩展 |
+| **ToolRegistration 流式 builder** | Toolkit$ToolRegistration | ✅ 已完成 | registration.rs + `Toolkit::register()`；tool/group/presetParameters/apply/**extendedModel（ExtendedSchemaTool 合并 schema）/mcp_client/sub_agent** 已实现；enableTools 语义已并入 group 管理（见下条） |
 | **MetaToolFactory + reset_equipped_tools** | MetaToolFactory | ✅ 已完成 | meta.rs：`Toolkit::register_meta_tools()`/`reset_equipped_tools()`；ToolGroupManager 新增 `get_meta_group_names`/`validate_group_exists`/`get_notes`/`replace_meta_active_groups`；EXTERNAL 组不受影响（6 个集成测试过） |
 | **ToolDangerousPathConstants + isDangerousPath** | ToolDangerousPathConstants/ToolBase | ✅ 已完成 | dangerous.rs：DEFAULT_DANGEROUS_FILES/DIRS/COMMANDS 常量 + `is_dangerous_path`（目录段/文件尾/tilde） + `is_dangerous_command`；harness shell 自检接入仍待办（见 3.2） |
 | **ToolSuspendException + suspended 语义** | ToolSuspendException | ✅ 已完成 | suspend.rs + `Error::ToolSuspended`；executor 将 suspend 转 `ToolResultBlock::suspended`（id/name 回填）；ReAct 循环检测到 suspended 即返回 `GenerateReason::ToolSuspended`（单元测试过） |
@@ -67,10 +67,10 @@
 | **ToolResultMessageBuilder** | ToolResultMessageBuilder | ✅ 已完成 | result.rs；`build_tool_result_msg` 用原 call id/name 回填 + agent name（集成测试过） |
 | **ToolEmitter / DefaultToolEmitter** | ToolEmitter | ✅ 已完成 | emitter.rs：`ToolEmitter`/`DefaultToolEmitter`/`NoOpToolEmitter`/`emit_to`；`ToolExecutionContext.emitter` 已接入 ReActAgent 执行上下文 |
 | **ToolCallParam** | ToolCallParam | ✅ 已完成 | meta.rs：builder+访问器+`ToolCallParam::from`；agent 适配为 agent_id 字符串、runtimeContext 为扁平 JSON |
-| **ToolExecutionContextProvider / ContextStore** | ContextStore/DefaultContextStore | 待办 | 已废弃→RuntimeContext；缺类型化属性袋 |
-| **ToolParam/@Tool 注解 + proc-macro** | Tool/@ToolParam | 待办 | 反射→宏；参考 rust-mcp-macros |
+| **ToolExecutionContextProvider / ContextStore** | ContextStore/DefaultContextStore | 设计决定（不迁移） | Java 已废弃→RuntimeContext；Rust 属性袋语义由 `RuntimeContext.metadata: JsonMap` + `state: Option<Arc<Mutex<AgentState>>>` 承担，不单建类型化属性袋（如需可后续加 typed map） |
+| **ToolParam/@Tool 注解 + proc-macro** | Tool/@ToolParam | 待办 | **与已引入的 `rust-mcp-sdk` macros 区分**：SDK 的 `macros` feature 转引 `rust-mcp-macros`（#[mcp_tool]/#[mcp_resource]/#[mcp_elicit]），生成的是 `rust_mcp_schema::Tool`（MCP server 协议工具声明），**不是 agent 工具**。本项缺口是 agentscope 自身的 `@Tool` 宏——生成 `FunctionTool`（agent 本地工具，供 ReActAgent 调用）。当前工具注册全靠手写 `FunctionTool`，**这是 core 最大开发体验缺口**；可参考 rust-mcp-macros 的实现模式（属性解析 + type_to_json_schema + quote 生成）新建独立的 agentscope proc-macro crate。实现后 MCP server 侧可复用 SDK 宏 + 桥接 |
 | **ToolkitAware / ExtendedModel** | ToolkitAware/ExtendedModel | ✅ 已完成 | ExtendedModel + SimpleExtendedModel 已实现（meta.rs，含冲突检测/required 合并）；**ToolkitAware rebindToolkit 深拷贝重绑已补：`Tool::rebind_toolkit` 钩子 + `FunctionTool::toolkit_aware(factory)`，`Toolkit::copy()` 对 aware 工具重绑到新副本；顺带修复 `ToolGroupManager::clone` 共享状态的既有 bug（新增 `copy()` 深拷贝，Inner derive Clone）；3 个新集成测试过** |
-| **McpClientManager** | McpClientManager | 待办 | rust-mcp-sdk 客户端生命周期管理（见 2.14 MCP） |
+| **McpClientManager** | McpClientManager | ✅ 已完成 | 已在 harness 实现（mcp_client_manager.rs + McpServerRegistrar，见 2.14）；core 侧 `McpTool` e2e 接入 ReActAgent 执行链路仍待办（见 7.5：MCP 连通验收） |
 | **并行安全分区（isConcurrencySafe 独占槽）** | ToolExecutor.execute_all | ✅ 已完成 | executor.rs `execute_all` 已实现：并行模式下将连续 concurrency-safe 工具并发执行（`run_safe_batch` + join_all，保持声明顺序），不安全/未知工具各自形成独立串行槽；`Toolkit::is_concurrency_safe_tool` 查询；4 个新测试覆盖（unsafe 串行 peak=1、safe 并发 peak>=2、混合分区保序、顺序模式） |
 | **TodoWriteTool** | TodoTools | ✅ 已完成 | tool/todo.rs：`TodoWriteTool`（基于任务清单全量替换）+ `render`/`parse_state`/`normalize_priority` 辅助；`ReActAgentBuilder::build` 默认注册；调用后同步 `AgentState.tasks_context` 与 `AgentCore.tasks`（`Arc<Mutex<TaskContextState>>`）；单测过 |
 
@@ -103,11 +103,11 @@
 |---|---|---|---|
 | Agent/CallableAgent/ObservableAgent trait | 同名 | ✅ 已完成 | agent_traits.rs |
 | ReActAgent reasoning→acting 循环 | ReActAgent(4727行) | ✅ 已完成 | react_agent.rs；含 maxIters/permission/middleware/事件 |
-| RuntimeContext | RuntimeContext | 部分 | 有 agent_name/user_input/memory/toolkit/metadata/cwd/**response_format**/**session_id/user_id/agent_id**（本轮补 + with_*/访问器）；**缺 agentState 绑定/属性袋/asToolExecutionContext/resolveAgentState** |
+| RuntimeContext | RuntimeContext | ✅ 已完成 | 有 agent_name/user_input/memory/toolkit/metadata/cwd/**response_format**/**session_id/user_id/agent_id**（with_*/访问器）；**已含 `state: Option<Arc<Mutex<AgentState>>>`（agentState 绑定）+ `delta_tx` 增量事件通道（逐 token 渲染）**；asToolExecutionContext/resolveAgentState 便捷方法为设计决定不单建（直接以 RuntimeContext 本体充当执行上下文） |
 | **AgentBase 生命周期**（serialization gate、per-call 串行 callGates、graceful shutdown guard、hooks 分发） | AgentBase(1040行) | 部分 | `CallGate`（按 key FIFO 串行，lifecycle.rs）+ `ExecutionGuard`（acquire/release 优雅关闭，register/unregister request）已实现并接入 ReActAgent.call；**缺 hooks 分发**（走 middleware，AgentBase 抽象类本身不迁移） |
 | **CallableAgent 结构化 overloads** | call(List,Class/JsonNode) | ✅ 已完成 | `call_with_schema` + 便捷 `call_single`/`call_text`；native response_format(json_schema) 路径 + **fallback（generate_response 工具）** 均已实现：`call_with_schema` 按 `supports_native_structured_output` 分派到 `call_native_structured`/`call_fallback_structured`（后者注入 `generate_response` 工具循环，含 `<structured-output-instruction>`），单测过 |
 | **StreamableAgent / streamEvents / StreamOptions** | StreamableAgent/StreamOptions | ✅ 已完成 | `ReActAgent::stream_events(msgs, StreamOptions)` 返回过滤后的 `EventStream`；`StreamOptions`（EventCategory 过滤 + incremental + includeReasoningChunk/Result/ActingChunk/SummaryChunk/Result）+ `EventCategory::of` 映射 31 事件；v1 `StreamableAgent`/粗粒度 `Event` 为设计决定不迁移 |
-| **ObservableAgent observe（接收不回复）** | ObservableAgent | 待办 | 多智能体协作；当前 subscribe 是 sink |
+| **ObservableAgent observe（接收不回复）** | ObservableAgent | 待办 | 多智能体协作；当前 `subscribe(sink)` 是单向事件分发，缺 Java observe(observer) 的 observer 注册语义；依赖 SubagentEventBus 中继 |
 | **Event/EventSource/EventType（v1 粗粒度，已废弃）** | Event/EventSource/EventType | 设计决定 | Java @Deprecated；不迁移，用新版 AgentEvent |
 | **ReasoningContext 完善**（ThinkingAccumulator/ToolCallsAccumulator/usage） | ReasoningContext | 部分 | 已有 text/thinking/tool_calls/usage 累积；缺 per-chunk 即时事件 |
 | **SubagentEventBus** | SubagentEventBus | 待办 | Reactor Context 中继子 agent 事件 |
@@ -152,7 +152,7 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | Memory/InMemoryMemory/StateBackedMemory | 同名 | ✅ 已完成 | memory/mod.rs |
-| **AgentStateMemoryView** | AgentStateMemoryView | 待办 | 活跃 API，StateBackedMemory 只是近似 |
+| **AgentStateMemoryView** | AgentStateMemoryView | 待办 | 活跃 API；StateBackedMemory 已完整实现 Memory trait 但仍直接读写 context，缺视图语义（按 user/session 视角切片） |
 | LongTermMemory 系列 / StaticLongTermMemoryHook | LongTermMemory/LongTermMemoryMode/LongTermMemoryTools | 设计决定 | Java 全部 @Deprecated(forRemoval,2.0)，不迁移 |
 
 ### 2.11 permission（优先级 P1）— 高对齐
@@ -188,6 +188,8 @@
 | harness McpServerConfig/Registrar 声明 | — | ✅ 已完成 | agent/mcp.rs（注册为 stub） |
 | **rust-mcp-sdk path 依赖接入** | McpClientManager | ✅ 已完成 | 已接入 `rust-mcp-sdk` v1.0.1 path 依赖；`McpClientManager` 实现客户端生命周期管理（create/connect/disconnect/list_tools/call_tool）；`McpClientInstance` 管理连接状态和工具列表 |
 | **McpServerRegistrar 真实实现** | harness Registrar | ✅ 已完成 | `McpServerRegistrar` 已实现：使用 `McpClientManager` 管理连接；`register()` 方法异步创建客户端并连接；新增 `disconnect_all()`、`registered_servers()` 辅助方法；**#2877 注册结果上报已加（McpServerRegistrationListener + Success/Failed/Skipped 结果，with_listener 注入）** |
+| **McpTool e2e 接入 ReActAgent** | McpTool 被 agent 调用 | ✅ 已完成 | `McpClientManager::connect()` 现会在握手后调用 `request_tool_list()` 填充 `client.tools`（此前空列表）；新增 `find_client_id_by_server`/`call_tool_by_server` 辅助；`bridge_mcp_tools_to_toolkit()` 把已连接 server 的工具注册为 core `McpTool`（**core `McpTool` 新增 `async_handler`（`with_async_handler`）**，handler 直接 await `call_tool_by_server`，避免在 tokio 运行时内 `block_on` panic）；ACP 会话经 `AcpAgentSession::apply_mcp_servers` 桥接。**真实 e2e 通过**：`harness_mcp_bridge_test` 拉起 Node stdio MCP server → 发现 → 桥接 → 调用，输出回显验证（2 测试） |
+| **MCP SSE/HTTP 传输** | McpClientManager 传输层 | ✅ 已完成 | stdio 已通；新增 SSE（`ClientSseTransport`，URL 含 `/sse`）与 Streamable HTTP（`ClientStreamableTransport`，其余 URL）双传输，支持自定义 headers；依赖改为直接引入 `rust-mcp-transport` 的 `sse`/`streamable-http` feature（避开 rust-mcp-sdk 1.0.1 的 `sse`/`streamable-http` 会编译损坏的 server 侧 `mcp_http` 模块）；`McpServerConfig` 增 `headers`；ACP `apply_mcp_servers` 递归匹配 `McpServer::Http`/`Sse`，capabilities 声明 http/sse=true；2 单测（URL 路由 + config builder） |
 
 ### 2.15 其余 core 缺失模块（优先级 P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -293,12 +295,15 @@
 | 流式输出与工具调用流 | — | ✅ 已完成 | acp/event.rs：思考/工具调用带 message_id、逐 token 增量流式、兼容 reasoning 字段；工具参数与位置随通知推送、ToolCall 创建延迟至参数就绪（Pending→raw_input→Completed，raw_output+content） |
 | 动态模型切换 + per-session headers | — | ✅ 已完成 | session.rs：model_factory/model_builder 回调（签名含 sessionId）；模型切换失败通知客户端；x-opencode-session 由外部注入绑定 ACP sessionId（core 硬编码已移除）；思考等级按模型能力映射（auto 默认 + enable_thinking 直达请求体）；UsageUpdate 为当前上下文 token 计数；上下文窗口推送 |
 | 配置与日志 | — | ✅ 已完成 | acp/config.rs：会话配置 Arc<Mutex> 共享防克隆丢失；AGENTSCOPE_LOG_DIR 固定日志目录 + ACP agent 文件日志 |
+| **ACP 客户端 MCP 支持（mcp_servers 声明 → McpClientManager 桥接）** | ACP MCP 能力 | ✅ 已完成 | `AcpAgentSession` 新增 `apply_mcp_servers(&[McpServer])`：解析 stdio 声明（`McpServer::Stdio`，HTTP/SSE 跳过告警）、经 `McpClientManager` 连接 + `bridge_mcp_tools_to_toolkit` 注册到会话 Toolkit；`NewSessionRequest`/`LoadSessionRequest`/`ResumeSessionRequest` 的 `mcp_servers` 均已接入（幂等去重）；会话级动态注入（已存在会话再次 load/resume 补桥接） |
 | 已知 flaky | — | ⚠️ 注意 | acp_stdio_thought_test 全量跑时首轮失败/卡顿（stdio 时序），单独复跑通过 |
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **测试基线**：`cargo test` 合计 **core 126 + harness 290 = 416 通过**（含 acp_cancel_test、acp_event_flow_test、harness_agent_spawn_test(5)、harness_agent_test(8)）；已知 flaky：`acp_stdio_thought_test` 全量跑首轮失败/卡顿（stdio 时序），单独复跑通过
+- **测试基线**：`cargo test` 合计 **core 127 + harness 303 = 430 通过**（含 acp_cancel_test、acp_event_flow_test、harness_agent_spawn_test(5)、harness_agent_test(8)、**harness_mcp_bridge_test(2)**）；`acp_stdio_thought_test` 本轮全量跑已通过（非 flaky）
+- **本轮（MCP 工具接入 ReActAgent + ACP 客户端 MCP 支持）**：`McpClientManager::connect()` 握手后 `request_tool_list()` 填充 tools；core `McpTool` 新增 `async_handler`（`with_async_handler`）解决 tokio 运行时内 `block_on` panic；`bridge_mcp_tools_to_toolkit` 把 MCP 工具注册为 `McpTool`；ACP `AcpAgentSession::apply_mcp_servers` 解析 NewSession/LoadSession/ResumeSession 的 `mcp_servers` 桥接到会话 Toolkit；`harness_mcp_bridge_test` 真实 e2e（Node stdio MCP server 发现→桥接→调用）通过
+- **缺口核验（codegraph 对账）**：经 codegraph 对账，以下 Tracker 旧条目已滞后于代码——① `McpClientManager` 已在 harness 实现（非待办），核心待办是 **McpTool e2e 接入 ReActAgent**；② `RuntimeContext` 已含 `state`（agentState 绑定）+ `delta_tx` 增量事件通道；③ `StateBackedMemory` 已完整实现 Memory trait；④ enableTools 语义已并入 group 管理。
 - **ACP 全套落地（b5e1635 后 10 个提交）**：ed87c57 流式修复 → d736e87 工具调用流增强 → b33e133 文件批量读写 → 6caf10c 嵌入式内存优化（lite feature + 对话压缩 + pwsh EncodedCommand）→ 684839e 取消 → abd29f7 权限确认+沙箱进程树修复 → ba7b73b 上下文 → ccba968 思考等级/动态模型切换/技能双目录 → 321d384 会话配置共享/UsageUpdate/CLI 仪表 → 833f280 日志/请求头/ShellExecute trace
 - **嵌入式内存优化**：lite feature（`--no-default-features --features lite` 去掉 rusqlite bundled）+ 对话压缩中间件（conversation_compaction.rs，超触发点重写为 [summary]+preserved_tail）+ 技能/索引惰性加载 + 会话上限淘汰 + grep 正则/glob 相对路径 + Windows pwsh EncodedCommand
 - **clippy 基线**：core 16 条既有警告；harness 12 条既有（ExposedSession subagent_id/agent_id dead_code + sandbox/manager.rs 未使用导入等）
@@ -307,17 +312,27 @@
 - **已验证功能**：async-openai 自定义 base URL 生效（chat_demo 使用 https://opencode.ai/zen/go/v1 成功）；ACP 权限确认/取消/动态模型切换全套 + 对话压缩 + 批量文件读写已通过测试
 
 ### 4.2 下一步建议（按优先级）
-1. **P0 已完成**：model 层真实 provider 接入（async-openai）已验证；ACP coding agent 全套（权限确认/取消/流式/动态模型切换）已落地
-2. **P1 重要待办**：
-   - ACP 稳定性：修复 acp_stdio_thought_test flaky（stdio 时序）
+1. **P0 已完成**：model 层真实 provider 接入（async-openai）已验证（7.3 full）；ACP coding agent 全套（权限确认/取消/流式/动态模型切换）已落地
+2. **P0 待办（core 开发体验）**：**`@Tool` proc-macro**——生成 agentscope `FunctionTool`（agent 本地工具宏）；**注意与已引入的 `rust-mcp-sdk` 宏区分**（SDK 宏 `rust-mcp-macros` 生成 `rust_mcp_schema::Tool` 协议声明，非 agent 工具）。当前工具注册全靠手写 `FunctionTool`；新建 agentscope 自己的 proc-macro crate，参考 rust-mcp-macros 模式（属性解析 + type_to_json_schema + quote 生成）
+3. **P1 已完成（本轮）**：
+   - **McpTool e2e 接入 ReActAgent** ✅（McpClientManager 工具发现 + `bridge_mcp_tools_to_toolkit` → Toolkit；`harness_mcp_bridge_test` 真实 e2e 通过，见 §2.14）
+   - **ACP 客户端 MCP 支持** ✅（NewSession/LoadSession/ResumeSession 的 `mcp_servers` → `apply_mcp_servers` → 会话 Toolkit，见 §3.10）
+   - ACP 稳定性：`acp_stdio_thought_test` 本轮全量跑已通过（非 flaky）
+4. **P1 剩余待办**：
    - SandboxLifecycleMiddleware + docker 后端（bollard）
    - RemoteFilesystem 真实后端
-   - MCP SSE/WS 传输待接
-3. **P2 增强可选**：
-   - Shutdown 精细化（GracefulShutdownMiddleware）
+   - ~~MCP SSE/WS 传输待接~~ ✅（SSE + Streamable HTTP 已接，见 §2.14）
+   - shutdown 精细化（GracefulShutdownMiddleware / per-request 跟踪 / ctrl_c 信号）
+5. **P2 增强可选**：
    - Observability 增强（OtelTracingMiddleware）
    - RAG 模块（全新模块）
    - Agent 协作（ObservableAgent observe、SubagentEventBus）
+   - AgentStateMemoryView（视图语义）/ LegacyStateLoader（v1→v2 迁移）
+4. **P2 增强可选**：
+   - Observability 增强（OtelTracingMiddleware）
+   - RAG 模块（全新模块）
+   - Agent 协作（ObservableAgent observe、SubagentEventBus）
+   - AgentStateMemoryView（视图语义）/ LegacyStateLoader（v1→v2 迁移）
 
 > 下一步开工前请先读 `MIGRATION_GAP_TRACKER.md` 4.1/4.2，并确认 `cargo test` 基线 416 通过（core 126 + harness 290）。
 
@@ -369,7 +384,7 @@
 ### 7.5 集成连通性
 | 验收项 | 说明 | 执行状态 | 交接信息 |
 |---|---|---|---|
-| **MCP 连通** | 接一个本地 stdio MCP server，其 tool 能被 ReActAgent 调用 | 待办 | 依赖 2.14 rust-mcp-sdk 接入 |
+| **MCP 连通** | 接一个本地 stdio MCP server，其 tool 能被 ReActAgent 调用 | ✅ 已完成 | `harness_mcp_bridge_test` 拉起本地 Node stdio MCP server → `McpClientManager` 连接发现 → `bridge_mcp_tools_to_toolkit` 注册为 core `McpTool` → 调用回显验证通过；ACP 会话亦经 `apply_mcp_servers` 接入（见 §2.14/§3.10） |
 | **harness 端到端** | HarnessAgent + FilesystemTool + 工作区操作跑通一次 | 部分 | harness 有测试（74 个通过），但无真实 model 驱动 e2e |
 
 ### 7.6 可用性验收结论判定

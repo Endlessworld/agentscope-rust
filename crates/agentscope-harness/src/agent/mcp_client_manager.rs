@@ -11,6 +11,10 @@ use rust_mcp_sdk::schema::{
     LATEST_PROTOCOL_VERSION,
 };
 use rust_mcp_sdk::{McpClient, StdioTransport, ToMcpClientHandler, TransportOptions};
+use rust_mcp_transport::{
+    ClientSseTransport, ClientSseTransportOptions, ClientStreamableTransport,
+    RequestOptions, StreamableTransportOptions,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -51,6 +55,8 @@ pub struct McpServerConfig {
     pub command: Option<String>,
     /// SSE/HTTP transport endpoint (alternative to `command`).
     pub url: Option<String>,
+    /// Optional HTTP/SSE custom headers (name -> value).
+    pub headers: Vec<(String, String)>,
 }
 
 impl McpServerConfig {
@@ -59,6 +65,7 @@ impl McpServerConfig {
             name: name.into(),
             command: None,
             url: None,
+            headers: Vec::new(),
         }
     }
 
@@ -69,6 +76,11 @@ impl McpServerConfig {
 
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
+        self
+    }
+
+    pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 }
@@ -142,8 +154,25 @@ impl McpClientManager {
             meta: None,
         };
 
-        // Create transport based on config
-        let transport = if let Some(command) = &client.config.command {
+        // Create handler
+        let handler = DefaultClientHandler {};
+
+        // Create the MCP client. The transport type varies by config:
+        // - `command`  -> stdio
+        // - `url`      -> SSE (path ends with /sse) or Streamable HTTP otherwise
+        let headers_map = if client.config.headers.is_empty() {
+            None
+        } else {
+            Some(
+                client
+                    .config
+                    .headers
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+        };
+        let mcp_client = if let Some(command) = &client.config.command {
             // Parse command and arguments
             let parts: Vec<&str> = command.split_whitespace().collect();
             if parts.is_empty() {
@@ -151,37 +180,64 @@ impl McpClientManager {
             }
             let program = parts[0];
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-            
-            StdioTransport::create_with_server_launch(
+
+            let transport = StdioTransport::create_with_server_launch(
                 program,
                 args,
                 None,
                 TransportOptions::default(),
             )
-            .map_err(|e| Error::Other(format!("Failed to create stdio transport: {}", e)))?
+            .map_err(|e| Error::Other(format!("Failed to create stdio transport: {}", e)))?;
+            client_runtime::create_client(McpClientOptions {
+                client_details,
+                transport,
+                handler: handler.to_mcp_client_handler(),
+                task_store: None,
+                server_task_store: None,
+                message_observer: None,
+            })
         } else if let Some(url) = &client.config.url {
-            // For SSE transport, we need to handle differently
-            // For now, return an error as SSE is more complex
-            return Err(Error::Other(format!(
-                "SSE transport not yet implemented for URL: {}",
-                url
-            )));
+            if is_sse_url(url) {
+                // Legacy SSE transport.
+                let sse_options = ClientSseTransportOptions {
+                    custom_headers: headers_map,
+                    ..ClientSseTransportOptions::default()
+                };
+                let transport = ClientSseTransport::new(url, sse_options)
+                    .map_err(|e| Error::Other(format!("Failed to create SSE transport: {}", e)))?;
+                client_runtime::create_client(McpClientOptions {
+                    client_details,
+                    transport,
+                    handler: handler.to_mcp_client_handler(),
+                    task_store: None,
+                    server_task_store: None,
+                    message_observer: None,
+                })
+            } else {
+                // Streamable HTTP transport.
+                let transport_options = StreamableTransportOptions {
+                    mcp_url: url.clone(),
+                    request_options: RequestOptions {
+                        custom_headers: headers_map,
+                        ..RequestOptions::default()
+                    },
+                };
+                let transport = ClientStreamableTransport::new(&transport_options, None, true)
+                    .map_err(|e| {
+                        Error::Other(format!("Failed to create streamable HTTP transport: {}", e))
+                    })?;
+                client_runtime::create_client(McpClientOptions {
+                    client_details,
+                    transport,
+                    handler: handler.to_mcp_client_handler(),
+                    task_store: None,
+                    server_task_store: None,
+                    message_observer: None,
+                })
+            }
         } else {
             return Err(Error::Other("No command or URL specified".to_string()));
         };
-
-        // Create handler
-        let handler = DefaultClientHandler {};
-
-        // Create MCP client
-        let mcp_client = client_runtime::create_client(McpClientOptions {
-            client_details,
-            transport,
-            handler: handler.to_mcp_client_handler(),
-            task_store: None,
-            server_task_store: None,
-            message_observer: None,
-        });
 
         // Start the client
         mcp_client
@@ -194,10 +250,42 @@ impl McpClientManager {
         client.connected = true;
         client.client = Some(mcp_client);
 
+        // Discover the server's tools so they can be bridged into a Toolkit.
+        // Without this, `list_tools`/`call_tool` would see an empty tool list.
+        let server_name = client.config.name.clone();
+        let discovered = match client
+            .client
+            .as_ref()
+            .unwrap()
+            .request_tool_list(None)
+            .await
+        {
+            Ok(result) => result
+                .tools
+                .into_iter()
+                .map(|tool| McpToolInfo {
+                    name: tool.name,
+                    description: tool.description.clone(),
+                    parameters: serde_json::to_value(tool.input_schema)
+                        .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+                    server: server_name.clone(),
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to list tools for MCP client '{}': {}",
+                    client_id, e
+                );
+                Vec::new()
+            }
+        };
+        client.tools = discovered;
+
         tracing::info!(
-            "MCP client '{}' connected to server '{}'",
+            "MCP client '{}' connected to server '{}' ({} tools)",
             client_id,
-            client.config.name
+            client.config.name,
+            client.tools.len()
         );
 
         Ok(())
@@ -319,6 +407,34 @@ impl McpClientManager {
             Err(Error::Other("Client not initialized".to_string()))
         }
     }
+
+    /// Finds the connected client id for the given server name.
+    pub async fn find_client_id_by_server(&self, server: &str) -> Option<String> {
+        let clients = self.clients.lock().await;
+        clients.iter().find_map(|(id, inst)| {
+            if inst.connected && inst.config.name == server {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Calls a tool on the connected client for the given server name.
+    pub async fn call_tool_by_server(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let client_id = self
+            .find_client_id_by_server(server)
+            .await
+            .ok_or_else(|| {
+                Error::Other(format!("No connected MCP client for server '{server}'"))
+            })?;
+        self.call_tool(&client_id, tool_name, arguments).await
+    }
 }
 
 /// Default client handler for MCP client.
@@ -342,5 +458,34 @@ impl std::fmt::Debug for McpClientInstance {
 impl Default for McpClientManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns `true` when `url` should use the legacy SSE transport (path contains
+/// `/sse`), otherwise the URL is treated as a Streamable HTTP endpoint.
+fn is_sse_url(url: &str) -> bool {
+    url.contains("/sse")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_url_routing() {
+        assert!(is_sse_url("http://127.0.0.1:3001/sse"));
+        assert!(is_sse_url("https://mcp.example.com/v1/sse"));
+        assert!(!is_sse_url("http://127.0.0.1:3001/mcp"));
+        assert!(!is_sse_url("https://mcp.example.com/mcp"));
+    }
+
+    #[test]
+    fn config_builder_sets_url_and_headers() {
+        let cfg = McpServerConfig::new("s").url("http://x/sse").headers(vec![
+            ("Authorization".into(), "Bearer t".into()),
+        ]);
+        assert_eq!(cfg.url.as_deref(), Some("http://x/sse"));
+        assert_eq!(cfg.headers.len(), 1);
+        assert_eq!(cfg.headers[0], ("Authorization".to_string(), "Bearer t".to_string()));
     }
 }

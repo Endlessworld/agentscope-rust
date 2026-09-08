@@ -138,7 +138,7 @@ impl AcpCodingAgent {
                     .audio(false)
                     .embedded_context(true),
             )
-            .mcp_capabilities(McpCapabilities::default())
+            .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
             .session_capabilities(
                 SessionCapabilities::new()
                     .list(SessionListCapabilities::new())
@@ -265,6 +265,11 @@ impl AcpCodingAgent {
                             .unwrap_or(0)
                     ));
                     let session = a_new.create_session(session_id.clone(), cwd);
+                    // Bridge any MCP servers the client declared before serving
+                    // the first prompt, so their tools are available immediately.
+                    if !req.mcp_servers.is_empty() {
+                        session.apply_mcp_servers(&req.mcp_servers).await;
+                    }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
                     a_new.register_session(session);
@@ -399,6 +404,10 @@ impl AcpCodingAgent {
                             a_load.get_session(&sid).unwrap()
                         }
                     };
+                    // Bridge MCP servers declared on load (idempotent per server).
+                    if !req.mcp_servers.is_empty() {
+                        session.apply_mcp_servers(&req.mcp_servers).await;
+                    }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
                     let response = LoadSessionResponse::new()
@@ -420,6 +429,10 @@ impl AcpCodingAgent {
                             a_resume.get_session(&sid).unwrap()
                         }
                     };
+                    // Bridge MCP servers declared on resume (idempotent per server).
+                    if !req.mcp_servers.is_empty() {
+                        session.apply_mcp_servers(&req.mcp_servers).await;
+                    }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
                     let response = ResumeSessionResponse::new()

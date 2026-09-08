@@ -26,6 +26,10 @@ regex = "1"
 globset = "0.4"
 rusqlite = { workspace = true, optional = true }
 rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["client", "stdio", "macros"] }
+# Client-side SSE/Streamable-HTTP transports. Pulled directly (not via the sdk's
+# `sse`/`streamable-http` features) because those features also compile a broken
+# server-side `mcp_http` module in rust-mcp-sdk 1.0.1.
+rust-mcp-transport = { version = "1.0.0", default-features = false, features = ["sse", "streamable-http"] }
 
 # `unstable_tool_call_name` exposes the programmatic `name` field on tool calls;
 # clients that do not know it simply ignore it.

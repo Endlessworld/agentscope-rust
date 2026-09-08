@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use agentscope_core::model::provider::ModelCreationContext;
 use agentscope_core::model::{GenerateOptions, Model, OpenAiChatModel};
+use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
@@ -435,6 +436,13 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
         .model(model)
         .cwd(cwd.clone())
         .workspace(workspace)
+        // 会话状态持久化：以 ACP sessionId 为恢复键，每次运行后把完整 AgentState
+        // （对话历史 / task / plan 状态）原子写入 {cwd}/.agentscope/state。进程重启后
+        // 客户端用同一 sessionId 发 session/load|resume，即可续接之前的对话。
+        .session_id(session_id)
+        .state_store(Arc::new(JsonFileAgentStateStore::new(
+            cwd.join(".agentscope").join("state"),
+        )))
         .sys_prompt(build_system_prompt(&cwd))
         .register_filesystem_tools(true)
         .register_shell_tool(true)

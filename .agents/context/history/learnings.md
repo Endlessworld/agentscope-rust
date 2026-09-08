@@ -73,3 +73,49 @@
   3. 创建`PermissionRuleStore`持久化"always allow/always reject"用户选择
   4. 模式映射：plan→Explore（只读）、accept_edits→AcceptEdits（文件编辑自动批准，shell需确认）、yolo→Bypass
 - **测试要点**：需要验证权限模式切换、Ask批准/拒绝、handler运行时切换、持久化规则跨会话保留
+
+
+## 2026-09 MCP 工具桥接（tokio 运行时内不可 block_on）
+- **现象**：`McpClientManager::call_tool` 是 async，但 core `McpTool` 的 handler 是同步闭包。
+  最初在 handler 内用 `tokio::runtime::Handle::current().block_on(...)` 桥接，运行时报
+  "Cannot start a runtime from within a runtime" panic（`Tool::call` 本身在 tokio 运行时内执行）。
+- **关键认知**：**在 tokio 运行时内无法 `block_on`**（单线程/current-thread runtime 尤其如此）。
+  正确做法是让 `Tool::call`（async）直接 await 异步 handler，而不是用同步 handler 包一层再 block。
+- **解法**：core `McpTool` 新增 `async_handler: Option<McpAsyncHandler>` 字段 + `with_async_handler()`；
+  `call()` 优先 await async handler。类型别名 `McpAsyncHandler = Box<dyn Fn(&McpTool, JsonMap) -> Pin<Box<dyn Future<Output=Result<ToolResultBlock>> + Send>> + Send + Sync>`。
+  嵌套 `Pin<Box<dyn Future + Send>>` 与外层 `+ Send + Sync` 易混淆，用类型别名最清晰。
+- **测试要点**：真实 stdio MCP server 可用自包含 Node 脚本（纯 JSON-RPC，`readline` + `process.stdout`），
+  无外部依赖即可做 e2e；`McpServerConfig.command` 用 `node <script>`（node 在 PATH），
+  注意 `connect()` 里 `command.split_whitespace()` 对含空格路径会破坏（用 PATH 中的可执行名规避）。
+
+## 2026-09 MCP SSE/HTTP 传输接入（rust-mcp-sdk 的 sse/streamable-http feature 是坏的）
+- **现象**：给 harness 的 `rust-mcp-sdk` 加 `sse`/`streamable-http` feature 后编译失败，
+  `mcp_http.rs` 里 `handle_sse_message`（`#[cfg(feature="sse")]`）引用 `internal_handle_sse_message`
+  （`#[cfg(feature="server")]`），未开 `server` 时 E0599。
+- **根因**：rust-mcp-sdk 1.0.1 的 `sse`/`streamable-http` feature 会额外编译 server 侧 `mcp_http`
+  模块（`lib.rs` 里 `#[cfg(any(sse, streamable-http, auth))] pub mod mcp_http`），而该模块自身
+  feature 门控不一致（`server` 未开时引用了不存在的方法）。
+- **解法**：**绕开 sdk 的 sse/streamable-http feature**，直接依赖 `rust-mcp-transport`
+  （sdk 同款 1.0.0）并开 `sse`/`streamable-http`；客户端传输 `ClientSseTransport`/`ClientStreamableTransport`
+  在 transport crate 里工作正常。sdk 仅保留 `client`/`stdio`/`macros`。
+- **关键认知**：
+  1. `ClientSseTransport::new(&str, ClientSseTransportOptions)`；`ClientStreamableTransport::new(&StreamableTransportOptions, session_id: Option<_>, standalone: bool)`。
+  2. `create_client::<T>` 是泛型，三种 transport 是不同具体类型 → 必须在每个分支内各自 `create_client`，不能先构造统一类型再传。
+  3. `StreamableTransportOptions`/`RequestOptions` 的 `custom_headers` 是 `Option<HashMap<String,String>>`。
+  4. ACP `McpServer` 枚举 `#[non_exhaustive]`，match 需 `_other` 通配分支。
+  5. URL 含 `/sse` 判定为 legacy SSE，否则 Streamable HTTP（`is_sse_url` 辅助函数 + 单测）。
+
+## 2026-09 ACP 会话恢复语义（acp_harness_agent 仅进程内恢复）
+- **结论**：`AcpCodingAgent.sessions` 是内存 `HashMap`；`AcpAgentSession` 持有 `Arc<HarnessAgent>`，
+  对话历史只在嵌 `ReActAgent` 的 `AgentState.context` 里。**进程退出即全丢**，重启后同 sessionId
+  只能新建空会话（`load/resume` 未命中 → `create_session`），对未知 id 的 `prompt` 返回 `Refusal`。
+- **进程内可恢复**：断线重连用 `session/load`/`session/resume` 命中注册表即复用原 agent；
+  prompt handler 持 Clone，跑完必须 `register_session` 写回（`config`/`agent`/`mcp_manager` 为 Arc 才不丢）。
+  取消（`$/cancel_request` / `close`）→ `StopReason::Cancelled`，本轮未完成消息不入 AgentState。
+  `max_sessions` 超限按 `session-<epoch_ms>` 淘汰最旧 → 历史静默丢失。
+- **缺口**：`load_session` 不回放历史 `session/update`（协议要求），命中时出现"模型记得、UI 不显示"；
+  `load/resume` 不校验 sessionId 归属。
+- **跨重启能力已有但未接线**：core `JsonFileAgentStateStore` + harness `StateCheckpointMiddleware`
+  （首次 run 前恢复、每次 run 后保存，key=`agent_state`），由 `HarnessAgentBuilder::state_store()
+  + session_id()/user_id()` 装配（harness_agent.rs:1102-1121）。example `build_agent()` 未设置，
+  `session_id` 只用于 `x-opencode-session` 请求头。

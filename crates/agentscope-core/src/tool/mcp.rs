@@ -14,6 +14,15 @@ use crate::tool::ToolExecutionContext;
 use super::tool::Tool;
 
 /// A tool backed by a remote MCP server tool definition.
+/// An async MCP dispatch handler: given the tool and its argument map, returns
+/// a pinned future that resolves to a [`ToolResultBlock`].
+pub type McpAsyncHandler = Box<
+    dyn Fn(&McpTool, JsonMap) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResultBlock>> + Send>,
+    > + Send
+        + Sync,
+>;
+
 pub struct McpTool {
     name: String,
     description: String,
@@ -22,6 +31,10 @@ pub struct McpTool {
     server: String,
     handler:
         Box<dyn Fn(&McpTool, JsonMap) -> Result<ToolResultBlock> + Send + Sync>,
+    /// Optional async handler, preferred over [`handler`](Self::handler) when
+    /// present. Lets MCP tool calls await a real client round-trip without
+    /// blocking the tokio runtime.
+    async_handler: Option<McpAsyncHandler>,
 }
 
 impl std::fmt::Debug for McpTool {
@@ -48,7 +61,15 @@ impl McpTool {
             parameters,
             server: server.into(),
             handler,
+            async_handler: None,
         }
+    }
+
+    /// Attaches an async dispatch handler, preferred over the sync one in
+    /// [`call`](Self::call). Enables awaiting a real MCP client round-trip.
+    pub fn with_async_handler(mut self, handler: McpAsyncHandler) -> Self {
+        self.async_handler = Some(handler);
+        self
     }
 
     /// The MCP server this tool belongs to.
@@ -76,7 +97,12 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        match (self.handler)(self, args) {
+        let outcome = if let Some(async_handler) = &self.async_handler {
+            async_handler(self, args).await
+        } else {
+            (self.handler)(self, args)
+        };
+        match outcome {
             Ok(block) => Ok(block),
             Err(e) => Err(Error::Tool(format!(
                 "MCP tool '{}' on server '{}' failed: {}",

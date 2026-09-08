@@ -158,3 +158,82 @@ impl Registrar for McpServerRegistrar {
         Ok(())
     }
 }
+
+
+/// Bridges every connected MCP client's tools from [`McpClientManager`] into a
+/// [`Toolkit`] as [`McpTool`]s.
+///
+/// Each discovered MCP tool becomes a core [`McpTool`] whose **async** handler
+/// dispatches back through the manager (`call_tool_by_server`), so calls await
+/// the real client round-trip without blocking the tokio runtime.
+///
+/// Returns the number of tools registered.
+pub async fn bridge_mcp_tools_to_toolkit(
+    manager: &std::sync::Arc<McpClientManager>,
+    toolkit: &agentscope_core::tool::Toolkit,
+) -> usize {
+    let client_ids = manager.connected_clients().await;
+    let mut registered = 0usize;
+    for client_id in client_ids {
+        let Ok(tools) = manager.list_tools(&client_id).await else {
+            continue;
+        };
+        let manager = std::sync::Arc::clone(manager);
+        for info in tools {
+            let server = info.server.clone();
+            let tool_name = info.name.clone();
+            let description = info.description.clone().unwrap_or_default();
+            // Clones captured by the (move) async handler closure; the originals
+            // stay owned by the loop so we can still build the `McpTool` below.
+            let h_server = server.clone();
+            let h_tool_name = tool_name.clone();
+            let h_manager = std::sync::Arc::clone(&manager);
+            let async_handler: Box<
+                dyn Fn(&agentscope_core::tool::McpTool, serde_json::Map<String, serde_json::Value>) -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<agentscope_core::message::ToolResultBlock>> + Send>,
+                > + Send
+                    + Sync,
+            > = Box::new(move |_tool, args| {
+                let manager = std::sync::Arc::clone(&h_manager);
+                let server = h_server.clone();
+                let tool_name = h_tool_name.clone();
+                Box::pin(async move {
+                    let raw = serde_json::Value::Object(args);
+                    match manager.call_tool_by_server(&server, &tool_name, raw).await {
+                        Ok(value) => {
+                            let text = match value {
+                                serde_json::Value::String(s) => s,
+                                other => serde_json::to_string_pretty(&other).unwrap_or_default(),
+                            };
+                            Ok(agentscope_core::message::ToolResultBlock::new(
+                                "",
+                                &tool_name,
+                                vec![agentscope_core::message::ContentBlock::Text(
+                                    agentscope_core::message::TextBlock::new(text),
+                                )],
+                            ))
+                        }
+                        Err(e) => Err(e),
+                    }
+                })
+            });
+            let tool = agentscope_core::tool::McpTool::new(
+                server.clone(),
+                tool_name.clone(),
+                description,
+                info.parameters,
+                Box::new(|_t, _a| {
+                    Ok(agentscope_core::message::ToolResultBlock::new(
+                        "",
+                        "",
+                        vec![],
+                    ))
+                }),
+            )
+            .with_async_handler(async_handler);
+            toolkit.register_tool(std::sync::Arc::new(tool));
+            registered += 1;
+        }
+    }
+    registered
+}
