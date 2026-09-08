@@ -14,8 +14,8 @@ async fn main() {
     let cmds = vec![
         ("plain git status".to_string(), "git status --short".to_string()),
         (
-            "with cd /d prefix (cmd syntax)".to_string(),
-            format!("cd /d \"{}\" && git status --short", cwd),
+            "with Set-Location prefix (pwsh syntax)".to_string(),
+            format!("Set-Location -LiteralPath '{}' ; git status --short", cwd.replace('\'', "''")),
         ),
         ("git --version".to_string(), "git --version".to_string()),
     ];

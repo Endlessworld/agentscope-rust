@@ -36,7 +36,14 @@ fn int_arg(args: &JsonMap, key: &str) -> Option<u32> {
 /// Prefixes `command` with a `cd` into `working_directory`.
 pub fn command_with_working_directory(working_directory: &str, command: &str) -> String {
     if cfg!(windows) {
-        format!("cd /d \"{}\" && {}", working_directory.replace('\"', "\"\""), command)
+        // 执行器是 pwsh（见 filesystem/sandbox.rs build_windows_command），不能用 cmd 的 `cd /d` 语法。
+        // pwsh 中 `cd /d "path"` 会被解析为 `Set-Location /d <path>` 而报 "A positional parameter cannot be found"。
+        // 改用 pwsh 原生 `Set-Location -LiteralPath`，并用 `;` 分隔（pwsh 7 虽支持 `&&`，但 `;` 更稳妥）。
+        format!(
+            "Set-Location -LiteralPath '{}' ; {}",
+            working_directory.replace('\'', "''"),
+            command
+        )
     } else {
         format!("cd '{}' && {}", working_directory.replace('\'', "'\\\\''"), command)
     }
@@ -122,3 +129,33 @@ impl Tool for ShellExecuteTool {
         Ok(ToolResultBlock::text(sb))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::command_with_working_directory;
+
+    #[test]
+    fn windows_uses_pwsh_syntax() {
+        let s = command_with_working_directory("src/foo bar", "git status");
+        if cfg!(windows) {
+            assert!(s.starts_with("Set-Location -LiteralPath '"));
+            assert!(s.contains("src/foo bar"));
+            assert!(s.ends_with(" ; git status"));
+            assert!(!s.contains("cd /d"));
+        } else {
+            assert!(s.starts_with("cd '"));
+            assert!(s.ends_with(" && git status"));
+        }
+    }
+
+    #[test]
+    fn windows_escapes_single_quote() {
+        let s = command_with_working_directory("a'b", "echo hi");
+        if cfg!(windows) {
+            assert!(s.contains("'a''b'"));
+        } else {
+            assert!(s.contains("a'\\''b"));
+        }
+    }
+}
+
