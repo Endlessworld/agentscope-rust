@@ -13,7 +13,7 @@ use agentscope_core::error::Result;
 ///
 /// A workspace spec contains the list of directories, files, and environment
 /// configuration that should be present when the sandbox starts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceSpec {
     /// Root directory for the workspace (typically `/workspace` inside a sandbox).
     pub root: PathBuf,
@@ -94,7 +94,7 @@ impl WorkspaceSpec {
 }
 
 /// Specification for copying a file or directory into the sandbox workspace.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CopySpec {
     /// Source path (host filesystem or remote URI).
     pub source: String,

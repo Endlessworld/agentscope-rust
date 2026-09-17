@@ -15,6 +15,11 @@ use super::status::TaskStatus;
 /// Arguments: task id, parent session id, result (`None` for failed tasks).
 pub type TaskCompletionCallback = Arc<dyn Fn(String, String, Option<String>) + Send + Sync>;
 
+/// [`RuntimeContext`](agentscope_core::agent::RuntimeContext) `metadata` key for callers that
+/// retain execution ownership and collect results themselves; when set to `true` no completion
+/// callback is fired for that call. Mirrors Java `TaskRepository#SUPPRESS_COMPLETION_CALLBACK`.
+pub const SUPPRESS_COMPLETION_CALLBACK: &str = "harness.suppressTaskCompletionCallback";
+
 /// Repository for managing background subagent tasks, scoped by session. All operations are
 /// scoped to a `session_id` so that tasks from different parent sessions are isolated.
 #[async_trait]
@@ -75,4 +80,16 @@ pub trait TaskRepository: Send + Sync {
         let _ = (ctx, session_id, task_id);
         false
     }
+
+    // ---------------------------------------------------------------------
+    // Lifecycle. Persistent repositories override both; the defaults preserve the
+    // behaviour of in-memory repositories that have nothing to release.
+    // ---------------------------------------------------------------------
+
+    /// Registers a callback invoked when any task reaches a terminal state (COMPLETED or
+    /// FAILED). Only one callback is supported; a second call replaces the previous one.
+    async fn set_completion_callback(&self, _callback: TaskCompletionCallback) {}
+
+    /// Releases background maintenance resources (heartbeat / orphan sweeper).
+    async fn shutdown(&self) {}
 }

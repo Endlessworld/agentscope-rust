@@ -16,6 +16,7 @@ pub mod harness_gateway;
 pub mod msg_context;
 pub mod session_turn_gate;
 pub mod subagent;
+pub mod subagent_bridge;
 pub mod task_bridge;
 pub mod wakeup_dispatcher;
 
@@ -71,8 +72,11 @@ pub use harness_gateway::{
     SubagentMaterializer,
 };
 pub use msg_context::{deterministic_hash, MsgContext};
-pub use session_turn_gate::SessionTurnGate;
-pub use subagent::{InMemorySubagentRegistry, SubagentRecord, SubagentRegistry};
+pub use session_turn_gate::{SessionTurnGate, TurnBusyException};
+pub use subagent::{
+    InMemorySubagentRegistry, StoreBackedSubagentRegistry, SubagentRecord, SubagentRegistry,
+};
+pub use subagent_bridge::{ExposeResult, GatewaySubagentBridge, SubagentGatewayBridge};
 pub use task_bridge::{
     create_completion_callback, DefaultSubagentMaterializer, TaskCompletionBridge,
     wire_task_completion,

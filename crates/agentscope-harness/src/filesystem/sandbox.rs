@@ -94,7 +94,7 @@ fn build_windows_command(command: &str) -> Vec<String> {
 /// open indefinitely, causing `tokio::process::Child::wait()` to hang forever.
 /// `taskkill /T` kills the process tree recursively.
 #[cfg(windows)]
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     use std::process::Command as StdCommand;
     // Best-effort: don't unwrap — the process may have already exited.
     let _ = StdCommand::new("taskkill")
@@ -106,7 +106,7 @@ fn kill_process_tree(pid: u32) {
 }
 
 #[cfg(not(windows))]
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     use std::process::Command as StdCommand;
     // On Unix, send SIGTERM to the process group.
     let _ = StdCommand::new("kill")

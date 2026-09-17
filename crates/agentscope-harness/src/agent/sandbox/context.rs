@@ -1,4 +1,6 @@
 //! Sandbox configuration context.
+use std::sync::Arc;
+
 use super::state::SandboxState;
 use super::Sandbox;
 use super::SandboxClient;
@@ -21,7 +23,7 @@ pub struct SandboxContext {
     workspace_spec: Option<WorkspaceSpec>,
     
     /// Snapshot specification.
-    snapshot_spec: Option<SandboxSnapshotSpec>,
+    snapshot_spec: Option<Arc<dyn SandboxSnapshotSpec>>,
     
     /// External sandbox (user-managed).
     external_sandbox: Option<Box<dyn Sandbox>>,
@@ -84,7 +86,7 @@ impl SandboxContext {
     }
     
     /// Returns the snapshot specification.
-    pub fn snapshot_spec(&self) -> Option<&SandboxSnapshotSpec> {
+    pub fn snapshot_spec(&self) -> Option<&Arc<dyn SandboxSnapshotSpec>> {
         self.snapshot_spec.as_ref()
     }
     
@@ -109,7 +111,7 @@ pub struct SandboxContextBuilder {
     client: Option<Box<dyn SandboxClient>>,
     client_options: Option<SandboxClientOptions>,
     workspace_spec: Option<WorkspaceSpec>,
-    snapshot_spec: Option<SandboxSnapshotSpec>,
+    snapshot_spec: Option<Arc<dyn SandboxSnapshotSpec>>,
     external_sandbox: Option<Box<dyn Sandbox>>,
     external_sandbox_state: Option<SandboxState>,
     isolation_scope: Option<IsolationScope>,
@@ -159,7 +161,7 @@ impl SandboxContextBuilder {
         self
     }
     
-    pub fn snapshot_spec(mut self, spec: SandboxSnapshotSpec) -> Self {
+    pub fn snapshot_spec(mut self, spec: Arc<dyn SandboxSnapshotSpec>) -> Self {
         self.snapshot_spec = Some(spec);
         self
     }

@@ -8,6 +8,7 @@
 //! use `ReActAgent::builder()` directly.
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agentscope_core::agent::{ReActAgent, StreamOptions};
 use agentscope_core::event::AgentEvent;
@@ -28,8 +29,9 @@ use super::middleware::{
     CompactionMiddlewareConfig, ConversationCompactionMiddleware, DynamicSubagentsMiddleware,
     HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
-    SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware,
-    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
+    SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware, TeamsMiddleware,
+    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, TranscriptMiddleware,
+    WorkspaceContextMiddleware,
 };
 use super::skill::{
     build_promoter, compose_skill_repositories, AuditEntry, default_gate, FilesystemSkillUsageStore,
@@ -38,22 +40,42 @@ use super::skill::{
     SkillUsageStore, SkillVisibilityFilter, WorkspaceSkillRepository,
 };
 use super::subagent::task::WorkspaceTaskRepository;
+use super::subagent::task::repository::TaskRepository;
 use super::subagent::SubagentEntry;
+use super::team::{TeamClient, TeamContext};
+use super::transcript::{FilesystemTranscriptStore, TranscriptStore};
 use super::workspace::{
     PlanModeManager, WorkspaceIndex, WorkspaceManager, WorkspacePathNormalizer,
 };
 use super::bus::{MessageBus, WorkspaceMessageBus, WorkspaceAsyncToolRegistry, AsyncToolRegistry};
-use crate::tool::{FilesystemTool, ShellExecuteTool};
+use crate::tool::{
+    FilesystemTool, MemoryGetTool, MemorySaveTool, MemorySearchTool, ShellExecuteTool, TeamTool,
+    WebFetchTool, WebSearchTool,
+};
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
 pub struct HarnessAgent {
     name: String,
+    /// Stable agent id (mirrors Java `agentId`; defaults to `name` when unset).
+    agent_id: String,
+    /// Human-readable description forwarded to the embedded ReAct agent.
+    description: String,
     model: Option<Arc<dyn Model>>,
     filesystem: Arc<dyn Filesystem>,
     toolkit: Toolkit,
     middleware: MiddlewareChain,
     cwd: PathBuf,
     distributed_store: Option<DistributedStore>,
+    /// Whether the embedded agent checks/rejects concurrent runs (stored config).
+    check_running: bool,
+    /// Timeout applied to async tool executions when configured (stored config).
+    async_tool_timeout: Option<Duration>,
+    /// Deployment environment label (mirrors Java `environment`).
+    environment: String,
+    /// Whether the legacy XML workspace-context rendering was requested (stored config).
+    use_legacy_xml_workspace_context: bool,
+    /// Task repository bound to this agent (defaults to a `WorkspaceTaskRepository`).
+    task_repository: Arc<dyn TaskRepository>,
     /// The embedded ReAct agent that drives the reasoning→acting loop.
     /// `None` when no model was configured (assembly-only mode).
     agent: Option<ReActAgent>,
@@ -90,6 +112,41 @@ impl HarnessAgent {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The stable agent id (mirrors Java `agentId`); defaults to `name`.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// The human-readable description forwarded to the embedded ReAct agent.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Whether the embedded agent enforces a single in-flight run (stored config).
+    pub fn check_running(&self) -> bool {
+        self.check_running
+    }
+
+    /// The configured async-tool timeout, if any.
+    pub fn async_tool_timeout(&self) -> Option<Duration> {
+        self.async_tool_timeout
+    }
+
+    /// The deployment environment label (mirrors Java `environment`).
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    /// Whether the legacy XML workspace-context rendering was requested.
+    pub fn use_legacy_xml_workspace_context(&self) -> bool {
+        self.use_legacy_xml_workspace_context
+    }
+
+    /// The task repository bound to this agent.
+    pub fn task_repository(&self) -> &Arc<dyn TaskRepository> {
+        &self.task_repository
     }
 
     pub fn model(&self) -> Option<&Arc<dyn Model>> {
@@ -340,6 +397,25 @@ pub struct HarnessAgentBuilder {
     /// Per-call generation defaults (e.g. additional request headers) applied
     /// to the embedded ReActAgent at build time.
     generate_options_defaults: Option<agentscope_core::model::GenerateOptions>,
+    // ---- Java parity setters (D2) ----
+    agent_id: Option<String>,
+    description: String,
+    check_running: bool,
+    enable_pending_tool_recovery: Option<bool>,
+    enable_meta_tool: Option<bool>,
+    enable_task_list: Option<bool>,
+    use_legacy_xml_workspace_context: bool,
+    async_tool_timeout: Option<Duration>,
+    environment: Option<String>,
+    disable_memory_tools: bool,
+    disable_web_tools: bool,
+    web_http_client: Option<reqwest::Client>,
+    task_repository: Option<Arc<dyn TaskRepository>>,
+    transcript_store: Option<Arc<dyn TranscriptStore>>,
+    disable_transcript: bool,
+    transcript_tenant: Option<String>,
+    teams_client: Option<Arc<dyn TeamClient>>,
+    teams_context: Option<TeamContext>,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -396,6 +472,24 @@ impl Default for HarnessAgentBuilder {
             confirm_handler: None,
             permission_context: None,
             generate_options_defaults: None,
+            agent_id: None,
+            description: String::new(),
+            check_running: true,
+            enable_pending_tool_recovery: None,
+            enable_meta_tool: None,
+            enable_task_list: None,
+            use_legacy_xml_workspace_context: false,
+            async_tool_timeout: None,
+            environment: None,
+            disable_memory_tools: false,
+            disable_web_tools: false,
+            web_http_client: None,
+            task_repository: None,
+            transcript_store: None,
+            disable_transcript: false,
+            transcript_tenant: None,
+            teams_client: None,
+            teams_context: None,
         }
     }
 }
@@ -742,6 +836,118 @@ impl HarnessAgentBuilder {
         self
     }
 
+    // ---- Java-parity setters (D2) ----
+
+    /// Sets the stable agent id (mirrors Java `agentId`). Defaults to `name` when unset.
+    /// Used as the state/transcript/task scope key.
+    pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
+        self
+    }
+
+    /// Sets the human-readable description forwarded to the embedded ReAct agent.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Whether the embedded agent rejects a new run while another is in flight
+    /// (mirrors Java `checkRunning`; stored config).
+    pub fn check_running(mut self, check_running: bool) -> Self {
+        self.check_running = check_running;
+        self
+    }
+
+    /// Enables recovery of pending (unanswered) tool calls across invocations.
+    pub fn enable_pending_tool_recovery(mut self, enable: bool) -> Self {
+        self.enable_pending_tool_recovery = Some(enable);
+        self
+    }
+
+    /// Registers the `reset_equipped_tools` meta tool so the agent can manage its own
+    /// tool groups (mirrors Java `enableMetaTool`).
+    pub fn enable_meta_tool(mut self, enable: bool) -> Self {
+        self.enable_meta_tool = Some(enable);
+        self
+    }
+
+    /// Enables the built-in task list tool (`todo_write` + reminder middleware),
+    /// mirroring Java `enableTaskList`.
+    pub fn enable_task_list(mut self, enabled: bool) -> Self {
+        self.enable_task_list = Some(enabled);
+        self
+    }
+
+    /// Requests legacy XML workspace-context rendering (stored config; mirrors Java
+    /// `useLegacyXmlWorkspaceContext`).
+    pub fn use_legacy_xml_workspace_context(mut self, enabled: bool) -> Self {
+        self.use_legacy_xml_workspace_context = enabled;
+        self
+    }
+
+    /// Sets the timeout applied to async tool executions (mirrors Java `asyncToolTimeout`).
+    pub fn async_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.async_tool_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the deployment environment label (mirrors Java `environment`; default `"prod"`).
+    pub fn environment(mut self, environment: impl Into<String>) -> Self {
+        self.environment = Some(environment.into());
+        self
+    }
+
+    /// Disables the built-in long-term memory tools (`memory_search`/`memory_get`/`memory_save`).
+    pub fn disable_memory_tools(mut self) -> Self {
+        self.disable_memory_tools = true;
+        self
+    }
+
+    /// Disables the built-in web tools (`web_fetch`/`web_search`).
+    pub fn disable_web_tools(mut self) -> Self {
+        self.disable_web_tools = true;
+        self
+    }
+
+    /// Supplies the shared HTTP client used by the built-in web tools.
+    pub fn web_http_client(mut self, client: reqwest::Client) -> Self {
+        self.web_http_client = Some(client);
+        self
+    }
+
+    /// Uses a caller-supplied task repository instead of the default
+    /// `WorkspaceTaskRepository`.
+    pub fn task_repository(mut self, repo: Arc<dyn TaskRepository>) -> Self {
+        self.task_repository = Some(repo);
+        self
+    }
+
+    /// Supplies the transcript store used by `TranscriptMiddleware`.
+    pub fn transcript_store(mut self, store: Arc<dyn TranscriptStore>) -> Self {
+        self.transcript_store = Some(store);
+        self
+    }
+
+    /// Disables transcript persistence entirely (mirrors Java `disableTranscript`).
+    pub fn disable_transcript(mut self) -> Self {
+        self.disable_transcript = true;
+        self
+    }
+
+    /// Pins the tenant used for transcript routing (mirrors Java `transcriptTenant`).
+    pub fn transcript_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.transcript_tenant = Some(tenant.into());
+        self
+    }
+
+    /// Enables agent-teams mode: attaches `TeamsMiddleware` and registers the
+    /// role-clipped `team` tool. Mirrors Java `teamsMode(client, context)`.
+    pub fn teams_mode(mut self, client: Arc<dyn TeamClient>, context: TeamContext) -> Self {
+        self.teams_client = Some(client);
+        self.teams_context = Some(context);
+        self
+    }
+
     /// Resolves the workspace directory when none was set explicitly:
     /// `{cwd}/.agentscope/workspace` (mirrors the Java default).
     fn resolve_default_workspace(&self, cwd: &PathBuf) -> PathBuf {
@@ -764,6 +970,9 @@ impl HarnessAgentBuilder {
             .clone()
             .unwrap_or_else(|| self.resolve_default_workspace(&cwd));
         let name = self.name.clone().unwrap_or_else(|| "agent".to_string());
+        let agent_id = self.agent_id.clone().unwrap_or_else(|| name.clone());
+        let description = self.description.clone();
+        let environment = self.environment.clone().unwrap_or_else(|| "prod".to_string());
 
         // Toolkit deep-copy: each agent gets its own toolkit so harness-registered tools
         // never bleed across builds.
@@ -888,9 +1097,25 @@ impl HarnessAgentBuilder {
             middleware.add(Box::new(inbox.build()));
         }
 
+        // ---- Agent teams (teamsMode) ----
+        if let (Some(client), Some(context)) = (self.teams_client.clone(), self.teams_context.clone())
+        {
+            toolkit.register_tool(Arc::new(TeamTool::new(Arc::clone(&client))));
+            middleware.add(Box::new(TeamsMiddleware::from_context(
+                client,
+                &context,
+                agent_id.clone(),
+            )));
+        }
+
         // ---- Subagent orchestration ----
         let task_repo: Arc<dyn super::subagent::task::TaskRepository> =
-            Arc::new(WorkspaceTaskRepository::new(Arc::clone(&filesystem), name.clone()));
+            self.task_repository.clone().unwrap_or_else(|| {
+                Arc::new(WorkspaceTaskRepository::new(
+                    Arc::clone(&filesystem),
+                    agent_id.clone(),
+                ))
+            });
         if !self.leaf_subagent && !self.disable_subagents && self.model.is_some() {
             if !self.subagent_entries.is_empty() || !self.disable_dynamic_subagents {
                 if self.disable_dynamic_subagents {
@@ -1072,6 +1297,32 @@ impl HarnessAgentBuilder {
             }
         }
 
+        // ---- Long-term memory tools (Java registers these by default) ----
+        if !self.disable_memory_tools {
+            MemorySearchTool::register(&toolkit, Arc::clone(&filesystem));
+            MemoryGetTool::register(&toolkit, Arc::clone(&filesystem));
+            MemorySaveTool::register(&toolkit, Arc::clone(&filesystem));
+        }
+
+        // ---- Web tools (Java registers these by default) ----
+        if !self.disable_web_tools {
+            match &self.web_http_client {
+                Some(client) => {
+                    toolkit.register_tool(Arc::new(WebFetchTool::with_client(client.clone())));
+                    toolkit
+                        .register_tool(Arc::new(WebSearchTool::from_env().with_client(client.clone())));
+                }
+                None => crate::tool::register_web_tools(&toolkit),
+            }
+        }
+
+        // ---- Meta tool (reset_equipped_tools) ----
+        if self.enable_meta_tool.unwrap_or(false) {
+            let meta = agentscope_core::tool::MetaToolFactory::new(&toolkit)
+                .create_reset_equipped_tools();
+            toolkit.register_tool(Arc::new(meta));
+        }
+
         // ---- Plan mode ----
         let mut plan_mode_manager = None;
         if self.plan_mode_enabled {
@@ -1091,6 +1342,21 @@ impl HarnessAgentBuilder {
         let path_normalizer = Some(WorkspacePathNormalizer::of(
             &resolved_workspace.to_string_lossy(),
         ));
+
+        // ---- Transcript persistence ----
+        if !self.disable_transcript {
+            let store = self.transcript_store.clone().unwrap_or_else(|| {
+                Arc::new(FilesystemTranscriptStore::new(
+                    Arc::clone(&filesystem),
+                    ".agentscope/transcripts",
+                )) as Arc<dyn TranscriptStore>
+            });
+            let mut transcript = TranscriptMiddleware::new(store);
+            if let Some(tenant) = &self.transcript_tenant {
+                transcript = transcript.with_tenant(tenant.clone());
+            }
+            middleware.add(Box::new(transcript));
+        }
 
         // ---- State checkpoint: persist/restore the full AgentState ----
         // Effective store: explicit `state_store` wins over `distributed_store`'s.
@@ -1125,7 +1391,9 @@ impl HarnessAgentBuilder {
         let model = self.model.clone();
         let agent = model.as_ref().map(|model| {
             let mut agent_builder = ReActAgent::builder()
+                .id(agent_id.clone())
                 .name(name.clone())
+                .description(description.clone())
                 .model(Arc::clone(model))
                 .toolkit(toolkit.clone())
                 .middleware_chain(middleware.clone());
@@ -1143,6 +1411,12 @@ impl HarnessAgentBuilder {
             }
             let max_iters = if self.max_iters > 0 { self.max_iters } else { DEFAULT_MAX_ITERS };
             agent_builder = agent_builder.max_iters(max_iters);
+            if let Some(recovery) = self.enable_pending_tool_recovery {
+                agent_builder = agent_builder.enable_pending_tool_recovery(recovery);
+            }
+            if let Some(task_list) = self.enable_task_list {
+                agent_builder = agent_builder.todo_tool(task_list);
+            }
             let agent = agent_builder.build().expect("build ReActAgent");
             if let Some(opts) = &self.generate_options_defaults {
                 agent.set_generate_options_defaults(opts.clone());
@@ -1152,12 +1426,19 @@ impl HarnessAgentBuilder {
 
         HarnessAgent {
             name,
+            agent_id,
+            description,
             model,
             filesystem,
             toolkit,
             middleware,
             cwd,
             distributed_store: self.distributed_store,
+            check_running: self.check_running,
+            async_tool_timeout: self.async_tool_timeout,
+            environment,
+            use_legacy_xml_workspace_context: self.use_legacy_xml_workspace_context,
+            task_repository: task_repo,
             agent,
             workspace_manager: Some(workspace_manager),
             plan_mode_manager,

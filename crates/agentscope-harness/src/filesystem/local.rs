@@ -27,18 +27,18 @@ const GENERATED_DIRS: &[&str] = &[
 
 /// Grep pattern matcher: regex with a literal-substring fallback, so arbitrary
 /// user text (e.g. memory_search queries) never fails to compile.
-enum PatternMatcher {
+pub(crate) enum PatternMatcher {
     Regex(Regex),
     Literal(String),
 }
 impl PatternMatcher {
-    fn new(pattern: &str) -> Self {
+    pub(crate) fn new(pattern: &str) -> Self {
         match Regex::new(pattern) {
             Ok(r) => PatternMatcher::Regex(r),
             Err(_) => PatternMatcher::Literal(pattern.to_string()),
         }
     }
-    fn is_match(&self, line: &str) -> bool {
+    pub(crate) fn is_match(&self, line: &str) -> bool {
         match self {
             PatternMatcher::Regex(r) => r.is_match(line),
             PatternMatcher::Literal(l) => line.contains(l.as_str()),
@@ -50,7 +50,7 @@ impl PatternMatcher {
 /// treated as relative to the search base. `literal_separator` makes `*`/`?`
 /// not cross `/` (Linux glob semantics; `**` still recurses).
 /// Returns `None` for invalid patterns.
-fn build_glob_matcher(pattern: &str) -> Option<GlobMatcher> {
+pub(crate) fn build_glob_matcher(pattern: &str) -> Option<GlobMatcher> {
     let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
     GlobBuilder::new(pattern)
         .literal_separator(true)

@@ -23,11 +23,22 @@ fn client() -> reqwest::Client {
 
 /// Fetches content from an HTTP(S) URL and returns a truncated text preview.
 #[derive(Default)]
-pub struct WebFetchTool;
+pub struct WebFetchTool {
+    client: Option<reqwest::Client>,
+}
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        Self
+        Self { client: None }
+    }
+
+    /// Uses a caller-supplied HTTP client instead of the default one.
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client: Some(client) }
+    }
+
+    fn http(&self) -> reqwest::Client {
+        self.client.clone().unwrap_or_else(client)
     }
 
     pub fn register(toolkit: &agentscope_core::tool::Toolkit) {
@@ -76,7 +87,7 @@ impl Tool for WebFetchTool {
             .filter(|&n| n > 0)
             .map_or(20_000usize, |n| (n as usize).min(100_000));
 
-        match client().get(url).send().await {
+        match self.http().get(url).send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let mut body = resp.text().await.unwrap_or_default();
@@ -93,18 +104,35 @@ impl Tool for WebFetchTool {
 /// Searches the web via the Tavily API.
 pub struct WebSearchTool {
     api_key: Option<String>,
+    client: Option<reqwest::Client>,
 }
 
 impl WebSearchTool {
     /// Reads the API key from the `TAVILY_API_KEY` environment variable.
     pub fn from_env() -> Self {
-        Self { api_key: std::env::var("TAVILY_API_KEY").ok().filter(|k| !k.trim().is_empty()) }
+        Self {
+            api_key: std::env::var("TAVILY_API_KEY").ok().filter(|k| !k.trim().is_empty()),
+            client: None,
+        }
     }
 
     /// Supplies the Tavily API key explicitly (e.g. vault-injected).
     pub fn with_api_key(api_key: impl Into<String>) -> Self {
         let key = api_key.into();
-        Self { api_key: (!key.trim().is_empty()).then_some(key) }
+        Self {
+            api_key: (!key.trim().is_empty()).then_some(key),
+            client: None,
+        }
+    }
+
+    /// Uses a caller-supplied HTTP client instead of the default one.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    fn http(&self) -> reqwest::Client {
+        self.client.clone().unwrap_or_else(client)
     }
 
     pub fn register(toolkit: &agentscope_core::tool::Toolkit) {
@@ -162,7 +190,8 @@ impl Tool for WebSearchTool {
             "max_results": limit,
             "search_depth": "basic"
         });
-        let resp = client()
+        let resp = self
+            .http()
             .post(TAVILY_API)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&payload)

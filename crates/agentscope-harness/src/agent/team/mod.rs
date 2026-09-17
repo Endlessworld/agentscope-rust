@@ -149,12 +149,21 @@ impl TeamMemberSpec {
 #[derive(Debug, Clone, Default)]
 pub struct TeamContext {
     pub team_id: Option<String>,
+    /// This agent's member name on the team (used by `teamsMode` wiring).
+    pub member: Option<String>,
     pub role: Option<TeamRole>,
     /// Operation names permitted for this role, e.g. `["claim_task", ...]`.
     pub available_operations: Vec<String>,
 }
 
 impl TeamContext {
+    /// Builds a context for `member` in `team_id` with the given role.
+    pub fn new(team_id: impl Into<String>, member: impl Into<String>, role: TeamRole) -> Self {
+        let mut ctx = Self::for_role(&team_id.into(), role);
+        ctx.member = Some(member.into());
+        ctx
+    }
+
     /// Role-clipped operation set (leads may administer membership).
     pub fn for_role(team_id: &str, role: TeamRole) -> Self {
         let mut ops = vec![
@@ -172,6 +181,7 @@ impl TeamContext {
         }
         Self {
             team_id: Some(team_id.to_string()),
+            member: None,
             role: Some(role),
             available_operations: ops.into_iter().map(String::from).collect(),
         }

@@ -39,10 +39,13 @@ pub fn parse(
         return None;
     }
 
-    let description = as_str(obj.get("description"))?;
-    if description.trim().is_empty() {
-        return None;
-    }
+    let description = match as_str(obj.get("description")) {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => {
+            tracing::warn!("subagent '{name}': missing 'description' in front matter, skipping");
+            return None;
+        }
+    };
 
     // ---- workspace section ----
     let mut workspace_mode = SubagentWorkspaceMode::Isolated;
@@ -53,6 +56,10 @@ pub fn parse(
                 workspace_mode = SubagentWorkspaceMode::Shared;
             } else if m.eq_ignore_ascii_case("isolated") {
                 workspace_mode = SubagentWorkspaceMode::Isolated;
+            } else {
+                tracing::warn!(
+                    "subagent '{name}': unknown workspace.mode '{m}', defaulting to isolated"
+                );
             }
         }
         if let Some(p) = as_str(ws.get("path")) {
@@ -67,6 +74,10 @@ pub fn parse(
     // from `<workspace.path>/AGENTS.md` at runtime.
     let mut body = body.to_string();
     if workspace_path.is_some() && !body.trim().is_empty() {
+        tracing::warn!(
+            "subagent '{name}': 'workspace.path' is set, ignoring inline body (the prompt is \
+             read from <workspace.path>/AGENTS.md at runtime)"
+        );
         body = String::new();
     }
 
@@ -83,6 +94,8 @@ pub fn parse(
         .or_else(|| as_bool(obj.get("exposeToUser")));
     let tools = parse_tool_names(as_str(obj.get("tools")));
     let skills = parse_tool_names(as_str(obj.get("skills")));
+    let enable_pending_tool_recovery = as_bool(obj.get("enable_pending_tool_recovery"))
+        .or_else(|| as_bool(obj.get("enablePendingToolRecovery")));
 
     let mut decl = SubagentDeclaration::new(name, description, body);
     decl.workspace_mode = workspace_mode;
@@ -95,9 +108,22 @@ pub fn parse(
     decl.mode = mode;
     decl.hidden = hidden;
     decl.expose_to_user = expose_to_user;
+    decl.enable_pending_tool_recovery = enable_pending_tool_recovery;
     decl.tools = tools;
     decl.skills = skills;
     Some(decl)
+}
+
+/// Loads a single declaration from a filesystem path, mirroring Java
+/// `AgentSpecLoader#loadFromFile`. Returns `None` when the file is missing, unreadable, or its
+/// front matter is malformed. The filename (without `.md`) becomes the agent name.
+pub fn load_from_file(path: &Path, main_workspace: Option<&str>) -> Option<SubagentDeclaration> {
+    let name = path.file_name().and_then(|f| f.to_str())?;
+    if !name.ends_with(".md") {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    parse(&content, strip_md_extension(name), main_workspace)
 }
 
 /// Non-recursively scans `subagents_dir` for `.md` files and parses each into a
@@ -229,9 +255,13 @@ fn parse_steps(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> 
 
 fn parse_mode(s: Option<String>) -> SubagentMode {
     match s.as_deref().map(str::to_lowercase).as_deref() {
+        None | Some("all") => SubagentMode::All,
         Some("primary") => SubagentMode::Primary,
         Some("subagent") => SubagentMode::Subagent,
-        _ => SubagentMode::All,
+        Some(other) => {
+            tracing::warn!("unknown subagent mode '{other}', defaulting to ALL");
+            SubagentMode::All
+        }
     }
 }
 

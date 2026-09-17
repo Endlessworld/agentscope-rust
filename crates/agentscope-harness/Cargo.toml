@@ -46,3 +46,10 @@ path = "examples/acp_agent_cli.rs"
 default = ["rusqlite"]
 rusqlite = ["dep:rusqlite"]
 lite = []
+
+[profile.release]
+opt-level = "z"       # 优化体积，优先于速度
+lto = true            # 启用链接时优化，删除死代码
+codegen-units = 1     # 减少并行代码生成单元，增强优化
+panic = "abort"       # panic 时直接中止，移除栈展开代码
+strip = true          # 自动剥离调试符号

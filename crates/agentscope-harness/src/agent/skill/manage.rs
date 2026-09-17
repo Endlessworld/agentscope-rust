@@ -110,6 +110,7 @@ impl SkillManageTool {
                     state: SkillState::Draft,
                     created_at: now,
                     latest_activity_at: now,
+                    environments: Vec::new(),
                 },
             );
         }

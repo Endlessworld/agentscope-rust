@@ -15,18 +15,35 @@
 //! - `SandboxIsolationKey`: Key for sandbox isolation
 
 mod context;
+mod docker;
 mod guard;
+mod helpers;
 mod key;
+pub mod layout;
 mod lease;
 mod manager;
+pub mod snapshot;
 mod state;
 mod workspace_spec;
 
 pub use context::SandboxContext;
+pub use docker::{DockerSandbox, DockerSandboxClient};
 pub use guard::SandboxExecutionGuard;
+pub use helpers::{
+    ProjectionPayload, WorkspaceArchiveExtractor, WorkspaceMountSupport, WorkspaceProjectionApplier,
+};
 pub use key::SandboxIsolationKey;
+pub use layout::{
+    BindMountEntry, DirEntry, FileEntry, GitRepoEntry, LayoutSpec, LocalDirEntry, LocalFileEntry,
+    WorkspaceEntry, WorkspaceProjectionEntry,
+};
 pub use lease::SandboxLease;
 pub use manager::{SandboxAcquireResult, SandboxManager};
+pub use snapshot::{
+    LocalSandboxSnapshot, LocalSnapshotSpec, NoopSandboxSnapshot, NoopSnapshotSpec,
+    RemoteSandboxSnapshot, RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshot,
+    SandboxSnapshotSpec,
+};
 pub use state::{InMemorySandboxStateStore, LocalSandboxState, SandboxState, SandboxStateStore};
 pub use workspace_spec::{
     CopySpec, DefaultWorkspaceSpecApplier, ExecResult, WorkspaceSpec, WorkspaceSpecApplier,
@@ -100,7 +117,7 @@ pub trait SandboxClient: Send + Sync {
     async fn create(
         &self,
         workspace_spec: &WorkspaceSpec,
-        _snapshot_spec: Option<&SandboxSnapshotSpec>,
+        _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
         _options: Option<&SandboxClientOptions>,
     ) -> Result<Box<dyn Sandbox>>;
     
@@ -120,7 +137,7 @@ pub trait SandboxClient: Send + Sync {
     fn deserialize_state_with_spec(
         &self,
         json: &str,
-        _snapshot_spec: Option<&SandboxSnapshotSpec>,
+        _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
     ) -> Result<SandboxState> {
         self.deserialize_state(json)
     }
@@ -131,6 +148,15 @@ pub trait SandboxClient: Send + Sync {
 pub struct SandboxClientOptions {
     /// Docker image to use (for Docker sandboxes).
     pub docker_image: Option<String>,
+
+    /// Absolute workspace root path inside the sandbox (defaults to `/workspace`).
+    pub workspace_root: Option<String>,
+
+    /// Host ports to expose from the container (`host:container`, same port number).
+    pub exposed_ports: Vec<u16>,
+
+    /// Additional raw arguments appended to `docker run` before the image name.
+    pub additional_run_args: Vec<String>,
     
     /// Resource limits.
     pub resource_limits: ResourceLimits,
@@ -159,7 +185,7 @@ pub struct ResourceLimits {
 }
 
 /// Volume mount configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeMount {
     /// Host path.
     pub host_path: String,
@@ -169,19 +195,6 @@ pub struct VolumeMount {
     
     /// Read-only mount.
     pub read_only: bool,
-}
-
-/// Snapshot specification for sandbox persistence.
-#[derive(Debug, Clone, Default)]
-pub struct SandboxSnapshotSpec {
-    /// Whether to enable snapshots.
-    pub enabled: bool,
-    
-    /// Snapshot directory path.
-    pub snapshot_dir: Option<String>,
-    
-    /// Maximum number of snapshots to keep.
-    pub max_snapshots: Option<usize>,
 }
 
 /// Errors specific to sandbox operations.

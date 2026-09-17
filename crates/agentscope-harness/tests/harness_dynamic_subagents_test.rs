@@ -15,8 +15,8 @@ use agentscope_core::Middleware;
 use futures::StreamExt;
 use agentscope_harness::{
     load_from_directory, load_from_filesystem, parse as parse_decl, DefaultAgentManager,
-    DynamicSubagentsMiddleware, Filesystem, LocalFilesystem, SubagentDeclaration, SubagentEntry,
-    SubagentFactory, SubagentMode, SubagentWorkspaceMode, WorkspaceTaskRepository,
+    DynamicSubagentsMiddleware, Filesystem, LocalFilesystem, RemoteAskPolicy, SubagentDeclaration,
+    SubagentEntry, SubagentFactory, SubagentMode, SubagentWorkspaceMode, WorkspaceTaskRepository,
 };
 
 fn ctx() -> RuntimeContext {
@@ -176,6 +176,33 @@ Helper prompt.
     assert_eq!(decl.workspace_mode, SubagentWorkspaceMode::Shared);
     assert_eq!(decl.steps, Some(5));
     assert_eq!(decl.prompt, "Helper prompt.");
+}
+
+#[test]
+fn loader_parse_pending_tool_recovery_camel_case_alias_and_remote_defaults() {
+    let md = r#"---
+description: Remote worker.
+enablePendingToolRecovery: true
+---
+Worker prompt.
+"#;
+    let decl = parse_decl(md, "worker", None).expect("parses");
+    assert_eq!(decl.enable_pending_tool_recovery, Some(true));
+    // Front-matter fields that are absent keep the Java defaults.
+    assert!(decl.inherit_parent_permissions);
+    assert!(decl.is_remote_streaming());
+    assert_eq!(decl.remote_stream_detail_or_default().wire_value(), "full");
+    assert_eq!(decl.remote_ask_policy, RemoteAskPolicy::Deny);
+    assert!(decl.remote_context_attributes.is_none());
+    assert!(!decl.has_definition_workspace());
+}
+
+#[test]
+fn loader_parse_pending_tool_recovery_snake_case() {
+    let md = "---\ndescription: d\nenable_pending_tool_recovery: false\n---\nbody";
+    let decl = parse_decl(md, "worker", None).expect("parses");
+    assert_eq!(decl.enable_pending_tool_recovery, Some(false));
+    assert!(!decl.has_definition_workspace());
 }
 
 // ---------------------------------------------------------------------------

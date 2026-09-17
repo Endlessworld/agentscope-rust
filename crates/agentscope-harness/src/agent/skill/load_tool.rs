@@ -10,12 +10,17 @@ use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
+use super::model::SkillCatalogSnapshot;
+
 /// Tool that loads a skill's documentation or resource by `skillId`.
 pub struct LoadSkillTool {
     index: HashMap<String, PathBuf>,
 }
 
 impl LoadSkillTool {
+    /// Canonical tool name.
+    pub const TOOL_NAME: &'static str = "load_skill_through_path";
+
     pub fn new(index: HashMap<String, PathBuf>) -> Self {
         Self { index }
     }
@@ -26,12 +31,24 @@ impl LoadSkillTool {
             index: entries.into_iter().collect(),
         }
     }
+
+    /// Builds a tool restricted to the given catalog snapshot (skills without a
+    /// files root cannot be loaded).
+    pub fn from_snapshot(snapshot: &SkillCatalogSnapshot) -> Self {
+        Self {
+            index: snapshot
+                .files_roots
+                .iter()
+                .map(|(id, root)| (id.clone(), PathBuf::from(root)))
+                .collect(),
+        }
+    }
 }
 
 #[async_trait]
 impl Tool for LoadSkillTool {
     fn name(&self) -> &str {
-        "load_skill_through_path"
+        Self::TOOL_NAME
     }
 
     fn description(&self) -> &str {
@@ -142,7 +159,7 @@ impl LazyLoadSkillTool {
 #[async_trait]
 impl Tool for LazyLoadSkillTool {
     fn name(&self) -> &str {
-        "load_skill_through_path"
+        LoadSkillTool::TOOL_NAME
     }
 
     fn description(&self) -> &str {

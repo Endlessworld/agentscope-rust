@@ -265,6 +265,55 @@ impl SkillCatalog {
     }
 }
 
+/// Serializable projection of a [`SkillCatalog`]: the visible skill ids plus each
+/// skill's shell-reachable files root.
+///
+/// `AgentSkill` carries non-serializable resources, so a catalog bound to a
+/// `RuntimeContext` is represented by this snapshot. It is the authorization
+/// boundary used by the skill load tool: only ids present here can be loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkillCatalogSnapshot {
+    #[serde(default)]
+    pub ids: Vec<String>,
+    #[serde(default, rename = "filesRoots")]
+    pub files_roots: BTreeMap<String, String>,
+}
+
+impl SkillCatalogSnapshot {
+    /// Builds a snapshot from a catalog (skills without a files root are id-only).
+    pub fn from_catalog(catalog: &SkillCatalog) -> Self {
+        let ids = catalog.ids();
+        let files_roots = catalog
+            .all()
+            .iter()
+            .filter_map(|e| {
+                e.files_root().map(|root| (e.skill().skill_id(), root.to_string()))
+            })
+            .collect();
+        Self { ids, files_roots }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn contains(&self, skill_id: &str) -> bool {
+        self.ids.iter().any(|id| id == skill_id)
+    }
+
+    pub fn files_root(&self, skill_id: &str) -> Option<&str> {
+        self.files_roots.get(skill_id).map(String::as_str)
+    }
+
+    pub fn to_json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn from_json(value: &Value) -> Self {
+        serde_json::from_value(value.clone()).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

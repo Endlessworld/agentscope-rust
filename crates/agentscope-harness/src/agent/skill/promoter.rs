@@ -254,6 +254,7 @@ impl SkillPromoter {
                         state: super::curator::SkillState::Active,
                         created_at: chrono::Utc::now(),
                         latest_activity_at: chrono::Utc::now(),
+                        environments: Vec::new(),
                     };
                     store.lock().unwrap().put(name.to_string(), rec);
                 }
@@ -350,6 +351,7 @@ mod tests {
                 state: crate::agent::skill::curator::SkillState::Active,
                 created_at: chrono::Utc::now(),
                 latest_activity_at: chrono::Utc::now(),
+                environments: Vec::new(),
             },
         );
         let store = Arc::new(std::sync::Mutex::new(store));

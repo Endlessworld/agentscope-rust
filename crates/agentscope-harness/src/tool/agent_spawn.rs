@@ -15,6 +15,8 @@ use crate::agent::subagent::manager::DefaultAgentManager;
 use crate::agent::subagent::task::background::BackgroundTask;
 use crate::agent::subagent::task::repository::TaskRepository;
 use crate::agent::subagent::task::spec::TaskRunSpec;
+use crate::agent::subagent::task::RemoteSubmitContext;
+use crate::agent::subagent::SubagentDeclaration;
 
 /// Spawns registered subagents as tool invocations.
 pub struct AgentSpawnTool {
@@ -136,11 +138,11 @@ impl Tool for AgentSpawnTool {
                 "Agent '{agent_id}' is not in the list of spawnable agents."
             )));
         }
-        let Some(agent) = self.manager.create_agent_if_present(&agent_id, &ctx_runtime(&ctx)) else {
-            return Ok(ToolResultBlock::error(format!(
-                "No spawnable subagent named '{agent_id}' is registered."
-            )));
-        };
+
+        // A declaration carrying a remote URL routes to the agent-protocol transport
+        // (Java `runRemoteTask`) instead of an in-process local run.
+        let declaration = self.manager.get_declaration(&agent_id);
+        let remote = declaration.as_ref().filter(|d| d.is_remote());
 
         let plan_active = ctx
             .runtime
@@ -155,15 +157,29 @@ impl Tool for AgentSpawnTool {
             .unwrap_or("default")
             .to_string();
 
-        // Foreground: run inline and return the reply text.
-        if !background || self.tasks.is_none() {
+        // Foreground (and remote-less background without a repository): run inline.
+        if remote.is_none() && (!background || self.tasks.is_none()) {
+            let Some(agent) = self.manager.create_agent_if_present(&agent_id, &ctx_runtime(&ctx))
+            else {
+                return Ok(ToolResultBlock::error(format!(
+                    "No spawnable subagent named '{agent_id}' is registered."
+                )));
+            };
             return match self.manager.invoke_agent(&agent, &effective_prompt).await {
                 Ok(msg) => Ok(ToolResultBlock::text(msg.text_content())),
                 Err(e) => Ok(ToolResultBlock::error(format!("Subagent '{agent_id}' failed: {e}"))),
             };
         }
 
-        // Background: submit through the task repository (Local run spec).
+        // A remote target has no local factory; it must run in the background through the
+        // task repository, which owns the async transport.
+        if remote.is_some() && (!background || self.tasks.is_none()) {
+            return Ok(ToolResultBlock::error(format!(
+                "Subagent '{agent_id}' is a remote target; spawn it with background=true."
+            )));
+        }
+
+        // Background: submit through the task repository.
         let repo = self.tasks.as_ref().unwrap().clone();
         let task_id = opt_str(&args, "task_id")
             .map(str::to_string)
@@ -171,18 +187,28 @@ impl Tool for AgentSpawnTool {
                 format!("spawn-{}", self.counter.fetch_add(1, Ordering::Relaxed))
             });
 
-        let exec_agent = agent.clone();
-        let execution_prompt = effective_prompt.clone();
-        let spec = TaskRunSpec::Local {
-            execution: Box::new(move || {
-                let handle = tokio::runtime::Handle::current();
-                let msg = handle.block_on(
-                    exec_agent.call(vec![agentscope_core::message::Msg::user(
-                        &execution_prompt,
-                    )]),
-                )?;
-                Ok(msg.text_content())
-            }),
+        let spec = if let Some(decl) = remote {
+            remote_spec(decl, &agent_id, &effective_prompt)
+        } else {
+            let Some(agent) = self.manager.create_agent_if_present(&agent_id, &ctx_runtime(&ctx))
+            else {
+                return Ok(ToolResultBlock::error(format!(
+                    "No spawnable subagent named '{agent_id}' is registered."
+                )));
+            };
+            let exec_agent = agent.clone();
+            let execution_prompt = effective_prompt.clone();
+            TaskRunSpec::Local {
+                execution: Box::new(move || {
+                    let handle = tokio::runtime::Handle::current();
+                    let msg = handle.block_on(
+                        exec_agent.call(vec![agentscope_core::message::Msg::user(
+                            &execution_prompt,
+                        )]),
+                    )?;
+                    Ok(msg.text_content())
+                }),
+            }
         };
 
         let bg = repo.put_task(&ctx_runtime(&ctx), &task_id, &agent_id, &session_id, spec).await;
@@ -198,6 +224,24 @@ impl Tool for AgentSpawnTool {
     }
 }
 
+/// Builds the remote agent-protocol run spec for a remote subagent declaration, mirroring
+/// Java `runRemoteTask`'s submission context (streaming/detail/attributes).
+fn remote_spec(decl: &SubagentDeclaration, agent_id: &str, input: &str) -> TaskRunSpec {
+    let mut builder = RemoteSubmitContext::builder()
+        .stream(decl.is_remote_streaming())
+        .detail(decl.remote_stream_detail_or_default().wire_value());
+    if let Some(attrs) = &decl.remote_context_attributes {
+        builder = builder.attributes(attrs.clone());
+    }
+    TaskRunSpec::Remote {
+        base_url: decl.url.clone().unwrap_or_default(),
+        headers: decl.headers.clone(),
+        agent_id: agent_id.to_string(),
+        input: input.to_string(),
+        context: Some(builder.build()),
+    }
+}
+
 /// Rebuilds a lightweight RuntimeContext carrying only what tools may see.
 fn ctx_runtime(ctx: &ToolExecutionContext) -> agentscope_core::agent::RuntimeContext {
     let mut rt = agentscope_core::agent::RuntimeContext::default();
@@ -205,4 +249,52 @@ fn ctx_runtime(ctx: &ToolExecutionContext) -> agentscope_core::agent::RuntimeCon
         rt.metadata.insert(k.clone(), v.clone());
     }
     rt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_spec_maps_declaration_fields() {
+        let mut decl = SubagentDeclaration::new("coder", "desc", "prompt");
+        decl.url = Some("http://remote:8080".into());
+        decl.headers.insert("X-Auth".into(), "tok".into());
+        decl.remote_streaming = Some(false);
+        decl.remote_context_attributes = Some(
+            [("workspace".to_string(), serde_json::json!("proj"))]
+                .into_iter()
+                .collect(),
+        );
+
+        let spec = remote_spec(&decl, "coder", "do it");
+        match spec {
+            TaskRunSpec::Remote { base_url, headers, agent_id, input, context } => {
+                assert_eq!(base_url, "http://remote:8080");
+                assert_eq!(headers.get("X-Auth").map(String::as_str), Some("tok"));
+                assert_eq!(agent_id, "coder");
+                assert_eq!(input, "do it");
+                let ctx = context.expect("context");
+                assert!(!ctx.stream);
+                assert_eq!(ctx.detail, "full");
+                assert_eq!(ctx.attributes.get("workspace"), Some(&serde_json::json!("proj")));
+            }
+            _ => panic!("expected remote spec"),
+        }
+    }
+
+    #[test]
+    fn remote_spec_defaults_streaming_and_detail() {
+        let mut decl = SubagentDeclaration::new("coder", "desc", "prompt");
+        decl.url = Some("http://remote:8080".into());
+        let spec = remote_spec(&decl, "coder", "do it");
+        match spec {
+            TaskRunSpec::Remote { context, .. } => {
+                let ctx = context.expect("context");
+                assert!(ctx.stream);
+                assert_eq!(ctx.detail, "full");
+            }
+            _ => panic!("expected remote spec"),
+        }
+    }
 }

@@ -221,7 +221,7 @@ impl SandboxManager {
         
         let sandbox = self
             .client
-            .create(&workspace_spec, snapshot_spec.as_ref(), client_options.as_ref())
+            .create(&workspace_spec, snapshot_spec.as_deref(), client_options.as_ref())
             .await?;
         
         Ok(SandboxAcquireResult::self_managed(sandbox, lease))
@@ -404,7 +404,7 @@ mod tests {
         async fn create(
             &self,
             _workspace_spec: &WorkspaceSpec,
-            _snapshot_spec: Option<&SandboxSnapshotSpec>,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
             _options: Option<&SandboxClientOptions>,
         ) -> Result<Box<dyn Sandbox>> {
             Ok(Box::new(MockSandbox::new()))
@@ -429,7 +429,7 @@ mod tests {
         fn deserialize_state_with_spec(
             &self,
             json: &str,
-            _snapshot_spec: Option<&SandboxSnapshotSpec>,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
         ) -> Result<SandboxState> {
             self.deserialize_state(json)
         }

@@ -38,6 +38,27 @@ impl TeamsMiddleware {
         self
     }
 
+    /// Builds the middleware from a [`TeamContext`], defaulting the member to `fallback_member`
+    /// when the context does not name one. Mirrors Java `new TeamsMiddleware(client, context)`.
+    pub fn from_context(
+        client: Arc<dyn TeamClient>,
+        context: &TeamContext,
+        fallback_member: impl Into<String>,
+    ) -> Self {
+        let team_id = context.team_id.clone().unwrap_or_default();
+        let member = context
+            .member
+            .clone()
+            .unwrap_or_else(|| fallback_member.into());
+        let role = context.role.unwrap_or(TeamRole::Member);
+        Self {
+            client,
+            team_id,
+            member,
+            role,
+        }
+    }
+
     fn team_section(&self) -> Option<String> {
         let info = self.client.team_info(&self.team_id).ok()?;
         let mut members: Vec<String> = info

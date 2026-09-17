@@ -1,8 +1,38 @@
-//! Fair per-key mutual exclusion for gateway turns, mirroring `SessionTurnGate`.
+//! Fair per-key mutual exclusion for gateway turns, mirroring `SessionTurnGate`
+//! and `LocalSessionTurnGate`.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedMutexGuard, Mutex as TokioMutex};
+
+/// Thrown when a session turn gate cannot be acquired because another turn holds it.
+///
+/// Mirrors `io.agentscope.harness.agent.gateway.TurnBusyException`: the gateway maps
+/// this to a skipped (empty) result so duplicate wakeups / concurrent inbound requests
+/// for the same session are dropped rather than queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnBusyException {
+    gate_key: String,
+}
+
+impl TurnBusyException {
+    pub fn new(gate_key: impl Into<String>) -> Self {
+        Self { gate_key: gate_key.into() }
+    }
+
+    /// The canonical session gate key that is busy.
+    pub fn gate_key(&self) -> &str {
+        &self.gate_key
+    }
+}
+
+impl std::fmt::Display for TurnBusyException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Session turn gate busy: {}", self.gate_key)
+    }
+}
+
+impl std::error::Error for TurnBusyException {}
 
 /// Fair per-key mutual exclusion for gateway turns (user/channel inbound runs and
 /// subagent notification).
@@ -28,6 +58,23 @@ impl SessionTurnGate {
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone();
         m.lock_owned().await
+    }
+
+    /// Non-blocking acquire: returns [`TurnBusyException`] when another turn holds
+    /// the gate for `key`.
+    pub fn try_acquire(
+        &self,
+        key: &str,
+    ) -> Result<OwnedMutexGuard<()>, TurnBusyException> {
+        let m = self
+            .gates
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+        m.try_lock_owned()
+            .map_err(|_| TurnBusyException::new(key))
     }
 
     /// Non-blocking check: `true` when a turn is currently held for `key` (i.e. a
@@ -75,5 +122,16 @@ mod tests {
     async fn unknown_key_reports_not_running() {
         let gate = SessionTurnGate::new();
         assert!(!gate.is_running("nope").await);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_errors_when_busy() {
+        let gate = SessionTurnGate::new();
+        let guard = gate.try_acquire("k").unwrap();
+        let busy = gate.try_acquire("k").unwrap_err();
+        assert_eq!(busy.gate_key(), "k");
+        assert!(busy.to_string().contains("busy"));
+        drop(guard);
+        assert!(gate.try_acquire("k").is_ok());
     }
 }

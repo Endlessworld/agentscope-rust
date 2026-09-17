@@ -3,6 +3,7 @@
 
 pub mod background;
 pub mod delivery;
+pub mod protocol_client;
 pub mod record;
 pub mod repository;
 pub mod spec;
@@ -11,8 +12,12 @@ pub mod workspace;
 
 pub use background::BackgroundTask;
 pub use delivery::TaskDelivery;
+pub use protocol_client::{
+    AgentProtocolTaskClient, AgentProtocolTransport, EventStreamHandle, RemoteSubagentTransport,
+    RemoteSubmitContext, RemoteSubmitContextBuilder, RemoteTarget, RemoteTaskStatus,
+};
 pub use record::TaskRecord;
-pub use repository::{TaskCompletionCallback, TaskRepository};
+pub use repository::{TaskCompletionCallback, TaskRepository, SUPPRESS_COMPLETION_CALLBACK};
 pub use spec::TaskRunSpec;
 pub use status::TaskStatus;
 pub use workspace::WorkspaceTaskRepository;

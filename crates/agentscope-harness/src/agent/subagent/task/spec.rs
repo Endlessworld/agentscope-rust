@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use agentscope_core::error::Result;
 
+use super::protocol_client::RemoteSubmitContext;
+
 /// Describes how a background subagent task should execute.
 pub enum TaskRunSpec {
     /// In-process execution via a blocking closure returning a text result.
@@ -18,6 +20,8 @@ pub enum TaskRunSpec {
         headers: BTreeMap<String, String>,
         agent_id: String,
         input: String,
+        /// Optional submission context (permissions, streaming preferences, parent identity).
+        context: Option<RemoteSubmitContext>,
     },
     /// Adopts an already-running tokio task as a tracked background task (used when a sync
     /// execution is promoted to async on timeout).
@@ -49,6 +53,24 @@ impl TaskRunSpec {
             headers,
             agent_id: agent_id.into(),
             input: input.into(),
+            context: None,
+        }
+    }
+
+    /// Creates a remote agent-protocol execution spec with an explicit submission context.
+    pub fn remote_with_context(
+        base_url: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        agent_id: impl Into<String>,
+        input: impl Into<String>,
+        context: RemoteSubmitContext,
+    ) -> Self {
+        TaskRunSpec::Remote {
+            base_url: base_url.into(),
+            headers,
+            agent_id: agent_id.into(),
+            input: input.into(),
+            context: Some(context),
         }
     }
 }

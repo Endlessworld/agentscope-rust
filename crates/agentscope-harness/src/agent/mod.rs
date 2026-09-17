@@ -1,6 +1,7 @@
 //! Harness agent runtime, mirroring `io.agentscope.harness.agent`.
 
 pub mod bus;
+pub mod coordination;
 pub mod distributed_store;
 pub mod gateway;
 pub mod harness_agent;
@@ -58,10 +59,11 @@ pub use middleware::{
     SubagentsMiddleware, ToolResultEvictionMiddleware,
 };
 pub use sandbox::{
-    DefaultWorkspaceSpecApplier, ExecResult, InMemorySandboxStateStore, LocalSandboxState,
-    Sandbox, SandboxClient, SandboxClientOptions, SandboxContext, SandboxError,
-    SandboxExecutionGuard, SandboxIsolationKey, SandboxLease, SandboxManager, SandboxSnapshotSpec,
-    SandboxState, SandboxStateStore, WorkspaceSpec, WorkspaceSpecApplier,
+    DefaultWorkspaceSpecApplier, DockerSandbox, DockerSandboxClient, ExecResult,
+    InMemorySandboxStateStore, LocalSandboxState, Sandbox, SandboxClient, SandboxClientOptions,
+    SandboxContext, SandboxError, SandboxExecutionGuard, SandboxIsolationKey, SandboxLease,
+    SandboxManager, SandboxSnapshotSpec, SandboxState, SandboxStateStore, VolumeMount, WorkspaceSpec,
+    WorkspaceSpecApplier,
 };
 pub use skill::{
     AgentSkill, AgentSkillBuilder, AllowListFilter, AllowListGate, AuditEntry, DenyListFilter,
@@ -75,10 +77,13 @@ pub use skill::{
     compose_skill_repositories, default_gate,
 };
 pub use subagent::{
-    load_from_directory, load_from_filesystem, parse, BackgroundTask, DefaultAgentManager,
-    SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode, SubagentWorkspaceMode,
-    SUBAGENTS_DIR, SUBAGENT_GLOB, TaskCompletionCallback, TaskDelivery, TaskRecord,
+    load_from_directory, load_from_file, load_from_filesystem, parse, BackgroundTask,
+    DefaultAgentManager,
+    RemoteAskPolicy, SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode,
+    SubagentWorkspaceMode, SUBAGENTS_DIR, SUBAGENT_GLOB, TaskCompletionCallback, TaskDelivery,
+    TaskRecord,
     TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository,
+    SUPPRESS_COMPLETION_CALLBACK,
 };
 pub use transcript::{
     FilesystemTranscriptStore, TranscriptRef, TranscriptSegment, TranscriptStore,

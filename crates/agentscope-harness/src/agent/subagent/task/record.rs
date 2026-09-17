@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::now_millis;
 use super::status::TaskStatus;
+use crate::agent::subagent::protocol::RemotePendingConfirm;
 
 /// Persistent metadata for a background subagent task, stored as JSON in the workspace.
 /// This is the authoritative truth source for task state; in-memory `BackgroundTask` handles
@@ -27,10 +28,20 @@ pub struct TaskRecord {
     pub last_updated_at: u64,
     /// When this terminal-state task's result was pushed back to the parent agent.
     pub delivered_at: Option<u64>,
+    /// When `true`, the remote (or local) agent is paused waiting for user tool confirmation.
+    /// Status remains `Running` so barriers keep waiting.
+    pub awaiting_confirm: bool,
+    /// Tool calls awaiting user confirmation while `awaiting_confirm` is set.
+    pub pending_confirms: Option<Vec<RemotePendingConfirm>>,
+    /// Last remote event sequence observed by the parent (for SSE resume).
+    pub last_event_seq: i64,
     /// When `"agent-protocol"`, this task is driven by a remote agent-protocol client.
     pub transport_type: Option<String>,
     pub remote_base_url: Option<String>,
     pub remote_headers: Option<BTreeMap<String, String>>,
+    /// Monotonic record version, incremented on every guarded write. Used for optimistic
+    /// concurrency (CAS) when several nodes/threads update the same workspace task file.
+    pub version: u64,
 }
 
 impl Default for TaskRecord {
@@ -50,9 +61,13 @@ impl Default for TaskRecord {
             last_checked_at: now,
             last_updated_at: now,
             delivered_at: None,
+            awaiting_confirm: false,
+            pending_confirms: None,
+            last_event_seq: 0,
             transport_type: None,
             remote_base_url: None,
             remote_headers: None,
+            version: 0,
         }
     }
 }
@@ -91,5 +106,36 @@ impl TaskRecord {
     /// Whether this task is executed via the HTTP task protocol.
     pub fn is_agent_protocol_transport(&self) -> bool {
         self.transport_type.as_deref() == Some("agent-protocol")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_serializes_confirm_fields_in_camel_case() {
+        let mut rec = TaskRecord::new("t1", "sub1", "parent", "sess");
+        rec.awaiting_confirm = true;
+        rec.pending_confirms = Some(vec![RemotePendingConfirm::new("c1", "read_file", None)]);
+        rec.last_event_seq = 7;
+
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["awaitingConfirm"], true);
+        assert_eq!(json["lastEventSeq"], 7);
+        assert_eq!(json["pendingConfirms"][0]["toolCallId"], "c1");
+
+        let back: TaskRecord = serde_json::from_value(json).unwrap();
+        assert!(back.awaiting_confirm);
+        assert_eq!(back.last_event_seq, 7);
+        assert_eq!(back.pending_confirms.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_defaults_missing_confirm_fields() {
+        let rec: TaskRecord = serde_json::from_str("{\"taskId\":\"t1\"}").unwrap();
+        assert!(!rec.awaiting_confirm);
+        assert!(rec.pending_confirms.is_none());
+        assert_eq!(rec.last_event_seq, 0);
     }
 }

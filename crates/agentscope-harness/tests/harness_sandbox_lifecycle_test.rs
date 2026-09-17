@@ -61,7 +61,7 @@ impl SandboxClient for CountingClient {
     async fn create(
         &self,
         _spec: &WorkspaceSpec,
-        _snapshot: Option<&SandboxSnapshotSpec>,
+        _snapshot: Option<&dyn SandboxSnapshotSpec>,
         _options: Option<&SandboxClientOptions>,
     ) -> Result<Box<dyn Sandbox>> {
         self.created
@@ -95,7 +95,7 @@ impl SandboxClient for CountingClient {
     fn deserialize_state_with_spec(
         &self,
         json: &str,
-        _snapshot: Option<&SandboxSnapshotSpec>,
+        _snapshot: Option<&dyn SandboxSnapshotSpec>,
     ) -> Result<SandboxState> {
         self.deserialize_state(json)
     }

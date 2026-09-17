@@ -133,3 +133,77 @@ fn harness_agent_disable_workspace_context() {
     assert_eq!(agent.name(), "bare");
     assert!(agent.workspace_manager().is_some());
 }
+
+#[test]
+fn builder_java_parity_setters_round_trip() {
+    let agent = HarnessAgent::builder()
+        .name("dev")
+        .agent_id("dev-123")
+        .description("a dev agent")
+        .check_running(false)
+        .environment("staging")
+        .async_tool_timeout(std::time::Duration::from_secs(5))
+        .use_legacy_xml_workspace_context(true)
+        .build();
+    assert_eq!(agent.agent_id(), "dev-123");
+    assert_eq!(agent.description(), "a dev agent");
+    assert!(!agent.check_running());
+    assert_eq!(agent.environment(), "staging");
+    assert_eq!(agent.async_tool_timeout(), Some(std::time::Duration::from_secs(5)));
+    assert!(agent.use_legacy_xml_workspace_context());
+}
+
+#[test]
+fn agent_id_defaults_to_name() {
+    let agent = HarnessAgent::builder().name("dev").build();
+    assert_eq!(agent.agent_id(), "dev");
+    assert_eq!(agent.environment(), "prod");
+}
+
+#[test]
+fn memory_and_web_tools_registered_by_default_and_disableable() {
+    let agent = HarnessAgent::builder().name("dev").build();
+    let names = agent.toolkit().tool_names();
+    assert!(names.contains(&"memory_search".to_string()));
+    assert!(names.contains(&"memory_get".to_string()));
+    assert!(names.contains(&"memory_save".to_string()));
+    assert!(names.contains(&"web_fetch".to_string()));
+    assert!(names.contains(&"web_search".to_string()));
+
+    let bare = HarnessAgent::builder()
+        .name("dev")
+        .disable_memory_tools()
+        .disable_web_tools()
+        .build();
+    let names = bare.toolkit().tool_names();
+    assert!(!names.contains(&"memory_search".to_string()));
+    assert!(!names.contains(&"web_fetch".to_string()));
+    assert!(!names.contains(&"web_search".to_string()));
+}
+
+#[test]
+fn teams_mode_registers_team_tool() {
+    use agentscope_harness::agent::team::{LocalTeamClient, TeamClient, TeamContext, TeamRole};
+    let client: Arc<dyn TeamClient> = Arc::new(LocalTeamClient::new());
+    let ctx = TeamContext::new("t1", "alice", TeamRole::Lead);
+    let agent = HarnessAgent::builder()
+        .name("dev")
+        .teams_mode(client, ctx)
+        .build();
+    assert!(agent.toolkit().tool_names().contains(&"team".to_string()));
+}
+
+#[test]
+fn task_repository_override_is_used() {
+    let repo: Arc<dyn agentscope_harness::TaskRepository> = Arc::new(
+        agentscope_harness::WorkspaceTaskRepository::new(
+            Arc::new(LocalFilesystem::new(std::env::temp_dir())),
+            "custom-parent",
+        ),
+    );
+    let agent = HarnessAgent::builder()
+        .name("dev")
+        .task_repository(Arc::clone(&repo))
+        .build();
+    assert!(Arc::ptr_eq(agent.task_repository(), &repo));
+}

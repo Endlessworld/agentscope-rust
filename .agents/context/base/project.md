@@ -18,7 +18,12 @@
 ## 版本状态
 - **当前版本**: 0.1.0
 - **迁移进度**: 约 80% 对齐
-- **关键里程碑**: async-openai 集成（2024-12）、Formatter 转换层 + 状态持久化 e2e（2025-01）、**ACP CodingAgent（2026-08，harness acp/ 模块）**、**ACP权限确认机制（2026-09，harness acp/ 模块）**
+- **关键里程碑**: async-openai 集成（2024-12）、Formatter 转换层 + 状态持久化 e2e（2025-01）、**ACP CodingAgent（2026-08，harness acp/ 模块）**、**ACP权限确认机制（2026-09，harness acp/ 模块）**、**Docker 沙箱后端（2026-09-17，harness sandbox/docker.rs，docker CLI 实现，B1 最后一个 P0）**
+
+## 命令速查（补充）
+- 全量测试：`cargo test --workspace`（当前基线：core 127 + harness 318 = 445）
+- 若报 `os error 112`（磁盘空间不足）导致编译失败：先 `rm -rf target/debug/incremental`
+- Docker 沙箱集成测试：`cargo test -p agentscope-harness --test harness_docker_sandbox_test`（无 docker daemon 自动跳过）
 
 ## 关键路径（新增）
 - **crates/agentscope-harness/src/acp/**: ACP 协议 CodingAgent（AcpCodingAgent/AcpAgentSession/config/event），底层包装 `HarnessAgent`（嵌入 ReActAgent）

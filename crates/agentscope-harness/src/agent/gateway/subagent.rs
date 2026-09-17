@@ -1,10 +1,12 @@
-//! Durable registry of exposed subagents, mirroring `SubagentRecord`, `SubagentRegistry`
-//! and `InMemorySubagentRegistry`.
+//! Durable registry of exposed subagents, mirroring `SubagentRecord`, `SubagentRegistry`,
+//! `InMemorySubagentRegistry` and `StoreBackedSubagentRegistry`.
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::filesystem::remote::store::BaseStore;
 
 /// Milliseconds since the UNIX epoch.
 pub(crate) fn now_millis() -> i64 {
@@ -52,6 +54,21 @@ impl SubagentRecord {
     /// Whether this record has a TTL that has already elapsed relative to `now`.
     pub fn is_expired(&self, now: i64) -> bool {
         self.expires_at.map(|e| now > e).unwrap_or(false)
+    }
+
+    /// Serializes this record into a store value map.
+    pub fn to_store_value(&self) -> crate::filesystem::remote::store::StoreValue {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => crate::filesystem::remote::store::StoreValue::new(),
+        }
+    }
+
+    /// Deserializes a record from a store value map.
+    pub fn from_store_value(
+        value: &crate::filesystem::remote::store::StoreValue,
+    ) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::Object(value.clone())).ok()
     }
 }
 
@@ -118,6 +135,72 @@ impl SubagentRegistry for InMemorySubagentRegistry {
     }
 }
 
+/// Distributed [`SubagentRegistry`] backed by a [`BaseStore`].
+///
+/// Exposure records become visible to every node, so any replica can resolve a
+/// `subagent_id` and re-materialize the subagent. Records live under the namespace
+/// `["subagents", "exposed"]` keyed by `subagent_id`; TTL is enforced lazily on
+/// [`SubagentRegistry::find`].
+pub struct StoreBackedSubagentRegistry {
+    store: Arc<dyn BaseStore>,
+}
+
+const NAMESPACE: [&str; 2] = ["subagents", "exposed"];
+const SCAN_PAGE_SIZE: usize = 1000;
+
+impl StoreBackedSubagentRegistry {
+    pub fn new(store: Arc<dyn BaseStore>) -> Self {
+        Self { store }
+    }
+
+    fn namespace() -> Vec<String> {
+        NAMESPACE.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+impl SubagentRegistry for StoreBackedSubagentRegistry {
+    fn register(&self, record: SubagentRecord) {
+        if record.subagent_id.is_empty() {
+            return;
+        }
+        self.store
+            .put(&Self::namespace(), &record.subagent_id, record.to_store_value());
+    }
+
+    fn find(&self, subagent_id: &str) -> Option<SubagentRecord> {
+        if subagent_id.is_empty() {
+            return None;
+        }
+        let item = self.store.get(&Self::namespace(), subagent_id)?;
+        let record = SubagentRecord::from_store_value(&item.value)?;
+        if record.is_expired(now_millis()) {
+            self.revoke(subagent_id);
+            return None;
+        }
+        Some(record)
+    }
+
+    fn revoke(&self, subagent_id: &str) {
+        if subagent_id.is_empty() {
+            return;
+        }
+        self.store.delete(&Self::namespace(), subagent_id);
+    }
+
+    fn revoke_by_parent_session(&self, parent_session_id: &str) {
+        if parent_session_id.is_empty() {
+            return;
+        }
+        for item in self.store.search(&Self::namespace(), SCAN_PAGE_SIZE, 0) {
+            if let Some(r) = SubagentRecord::from_store_value(&item.value) {
+                if r.parent_session_id.as_deref() == Some(parent_session_id) {
+                    self.revoke(&r.subagent_id);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +246,45 @@ mod tests {
         assert!(reg.find("a").is_none());
         assert!(reg.find("b").is_none());
         assert!(reg.find("c").is_some());
+    }
+
+    #[test]
+    fn store_backed_registry_roundtrip() {
+        let store: Arc<dyn BaseStore> =
+            Arc::new(crate::filesystem::remote::store::InMemoryStore::new());
+        let reg = StoreBackedSubagentRegistry::new(store);
+        let rec = SubagentRecord::new(
+            "sub-1",
+            "coder",
+            "sess-1",
+            Some("alice".into()),
+            Some("parent-1".into()),
+            None,
+        );
+        reg.register(rec.clone());
+        assert_eq!(reg.find("sub-1").unwrap(), rec);
+        reg.revoke("sub-1");
+        assert!(reg.find("sub-1").is_none());
+    }
+
+    #[test]
+    fn store_backed_registry_enforces_ttl_and_parent_revoke() {
+        let store: Arc<dyn BaseStore> =
+            Arc::new(crate::filesystem::remote::store::InMemoryStore::new());
+        let reg = StoreBackedSubagentRegistry::new(store);
+        reg.register(SubagentRecord::new("a", "x", "s1", None, Some("p1".into()), None));
+        reg.register(SubagentRecord::new("b", "x", "s2", None, Some("p1".into()), None));
+        reg.register(SubagentRecord::new(
+            "exp",
+            "x",
+            "s3",
+            None,
+            None,
+            Some(now_millis() - 1000),
+        ));
+        reg.revoke_by_parent_session("p1");
+        assert!(reg.find("a").is_none());
+        assert!(reg.find("b").is_none());
+        assert!(reg.find("exp").is_none());
     }
 }

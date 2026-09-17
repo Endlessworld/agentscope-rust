@@ -2,20 +2,27 @@
 //! Provides list/read/write/edit/grep/glob/delete/move operations over a unified
 //! `Filesystem` trait, with local, overlay, composite and (stubbed) remote/sandbox backends.
 
+pub mod baked;
 pub mod composite;
 pub mod local;
 pub mod overlay;
 pub mod remote;
 pub mod result;
 pub mod sandbox;
+pub mod util;
 
 use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 
+pub use baked::BakedContextFilesystem;
 pub use composite::CompositeFilesystem;
 pub use local::{LocalFilesystem, LocalFsMode};
 pub use overlay::OverlayFilesystem;
+pub use remote::store::{
+    BaseStore, DefaultNamespace, InMemoryStore, NamespaceFactory, StaticNamespace, StoreItem,
+    StoreValue,
+};
 pub use remote::RemoteFilesystem;
 pub use result::{
     EditResult, FileDownloadResponse, FileUploadResponse, GlobResult, GrepResult, LsResult,

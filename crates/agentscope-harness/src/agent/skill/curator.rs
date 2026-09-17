@@ -15,6 +15,21 @@ use crate::filesystem::Filesystem;
 
 use super::model::SkillResources;
 
+/// Curator filters and usage backends live in `filters.rs`; re-exported here for
+/// parity with the Java `skill.curator` package layout.
+pub use super::filters::{
+    CanaryFilter, EnvironmentFilter, FilesystemSkillUsageBackend, LoggingNotificationSink,
+    NoopNotificationSink, NotificationSink, NotifyAndWaitGate, SkillUsageBackend,
+    DEFAULT_USAGE_RELATIVE_PATH,
+};
+/// Security scanner lives in `security.rs`; re-exported here for parity with the
+/// Java `skill.curator` package layout.
+pub use super::security::{
+    scan, scan_single_file, should_allow, Category as SecurityCategory,
+    Finding as SecurityFinding, ScanResult as SecurityScanResult, Severity as SecuritySeverity,
+    TrustLevel as SkillTrustLevel, Verdict as SecurityVerdict,
+};
+
 /// State sidecar path (workspace-relative).
 pub const CURATOR_STATE_PATH: &str = "skills/.curator_state.json";
 /// Reports directory (workspace-relative).
@@ -39,6 +54,11 @@ pub struct SkillUsageRecord {
     pub state: SkillState,
     pub created_at: DateTime<Utc>,
     pub latest_activity_at: DateTime<Utc>,
+    /// Deployment environments this skill is visible in (e.g. `["prod"]`).
+    ///
+    /// Empty/absent means "visible everywhere". Consumed by the environment filter.
+    #[serde(default)]
+    pub environments: Vec<String>,
 }
 
 impl SkillUsageRecord {
@@ -49,6 +69,7 @@ impl SkillUsageRecord {
             state,
             created_at: latest_activity_at,
             latest_activity_at,
+            environments: Vec::new(),
         }
     }
 }
@@ -56,6 +77,11 @@ impl SkillUsageRecord {
 /// Stores per-skill usage/lifecycle records for the curator.
 pub trait SkillUsageStore: Send + Sync {
     fn agent_created(&self) -> Vec<(String, SkillUsageRecord)>;
+    /// Reads a single record by skill name.
+    fn get(&self, name: &str) -> Option<SkillUsageRecord> {
+        let _ = name;
+        None
+    }
     fn set_state(&mut self, name: &str, state: SkillState);
     /// Records (or replaces) a usage/lifecycle record for a skill.
     fn put(&mut self, name: String, record: SkillUsageRecord);
@@ -87,6 +113,9 @@ impl SkillUsageStore for InMemorySkillUsageStore {
             .filter(|(_, r)| r.created_by == "agent" && !r.pinned)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+    fn get(&self, name: &str) -> Option<SkillUsageRecord> {
+        self.records.get(name).cloned()
     }
     fn set_state(&mut self, name: &str, state: SkillState) {
         if let Some(r) = self.records.get_mut(name) {
@@ -145,6 +174,9 @@ impl SkillUsageStore for FilesystemSkillUsageStore {
             .filter(|(_, r)| r.created_by == "agent" && !r.pinned)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+    fn get(&self, name: &str) -> Option<SkillUsageRecord> {
+        self.records.get(name).cloned()
     }
     fn set_state(&mut self, name: &str, state: SkillState) {
         if let Some(r) = self.records.get_mut(name) {

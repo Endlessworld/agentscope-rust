@@ -118,4 +118,35 @@
 - **跨重启能力已有但未接线**：core `JsonFileAgentStateStore` + harness `StateCheckpointMiddleware`
   （首次 run 前恢复、每次 run 后保存，key=`agent_state`），由 `HarnessAgentBuilder::state_store()
   + session_id()/user_id()` 装配（harness_agent.rs:1102-1121）。example `build_agent()` 未设置，
+
+## 2026-09 Docker 沙箱后端（CLI 实现）踩坑
+- **Java 的 `WorkspaceSpecApplier` 不能照搬**：Java 用宿主 `Files.writeString(Path.of("/workspace/..."))` 写容器路径，在 Windows/无该路径的宿主上会直接失败（Java 端隐含 Linux 宿主的假设）。Rust 实现改为经 `docker exec` 物化（`mkdir -p` + `printf %s <base64> | base64 -d > file`），避免宿主路径依赖，同时保证内容编码安全。
+- **状态字段扩展必须带 `#[serde(default)]`**：`DockerSandboxState` 新增字段后，旧 JSON（无这些字段）仍需可加载；`container_owned` 需 `default = "fn"` 才能缺省为 `true`（`#[serde(default)]` 会得到 `false`，语义变成“非自管容器”→ shutdown 不再清理）。写了一个 legacy-JSON 反序列化测试固定该行为。
+- **`container_id` 从 `String` 改 `Option<String>`**：容器要 `docker run` 之后才有 id，映射 Java 的 nullable containerId。
+- **命令超时与管道死锁**：所有 docker CLI 调用都复用 `filesystem/sandbox.rs` 的套路——先 `spawn()`、再并发 drain stdout/stderr、超时 `kill_process_tree(pid)`（Windows `taskkill /F /T`）。`hydrate_workspace` 要往 stdin 写 tar，必须一边写一边 drain stdout/stderr，否则 tar 输出填满管道即死锁。
+- **`ExecResult.exit_code = -1` 表示超时**：与 crate 既有约定（`ExecuteResponse`）一致，不要新造错误类型。
+- **E: 盘紧张会伪装成编译错误**：`cargo test --workspace` 报大量 `could not compile` + `error writing dependencies ... os error 112（磁盘空间不足）`。解法：`rm -rf target/debug/incremental`（释放约 1.6GB）后重跑；不要误判为代码错误。
   `session_id` 只用于 `x-opencode-session` 请求头。
+
+## 2026-09 worker 缺口报告必须抽样复核（幻觉案例）
+- **案例**：`worker_output/worker_result_d90adbd7.txt`（HarnessAgent Builder 对比）基线伪造——
+  声称 Java `HarnessAgentBuilderSupport` 有 62 setter、build() 2358-2987 行，Rust builder 有 68 方法
+  （`parse_agent_map` / `heartbeat_config` / `activityTrackerConfig` / `default_model`）。
+  实际该 Java 类只是第 71 行的 package-private 小助手；Rust `HarnessAgentBuilder` 仅 51 字段 / 53 `pub fn`；
+  报告点名的 16 个字段（`defaultToolProperties`/`toolPropertyOverride`/`disabledTools`/`allowedTools`/
+  `additionalEnvironment`/`dbConfig`/`codexExecutionMode`/`maxAgentContextTokens`/`fileContextMaxFiles`/
+  `perFileMaxTokens`/`extraFileAgentNames`/`logLevelOverrides`/`__MYSELF__`/`heartbeatConfig`/
+  `activityTrackerConfig`/`parse_agent_map`）在 **Java 与 Rust 两个仓库中 grep 均 0 命中**。
+- **陷阱**：行号可以看起来吻合（Rust `build()` 实际就在 753 行，与报告一致）→ 行号吻合 **不能** 作为可信度证据；
+  真正的判定标准是「字段名/方法名能否 grep 到」。
+- **做法**：对账此类报告时先做存在性 grep，再采信结论；不可复核的报告直接作废、重新推导，
+  不要在其基础上"补一半"。对账 Java 源时用 `grep`/`ls`（read_file 拒绝 workspace 外路径）。
+
+## 2026-09-17：对账 codex（E:\local-github\codex）大型仓库的侦察经验
+
+- **仓库规模决定搜索策略**：codex 是 ≈110 crate 的 monorepo。全仓 `rg -l -i <pattern>`（无路径限定）**会超时**（实测 60s 超时后被转为交互式 shell，需 KillShell）。正确做法：先按目录限定（`rg ... core/src tools/src`），或用 `Get-ChildItem -Recurse -Depth 2 -Filter Cargo.toml | Select-String` 这类有界搜索。
+- **尺寸统计比 grep 更快**：先 `Get-ChildItem -Directory` 拿 crate 清单，再对关键目录做「文件数 + 行数」统计，几次调用即可建立量级认知，避免逐文件读。
+- **pwsh 输出中文会乱码**（终端编码），但 `[System.IO.File]::ReadAllText(path)` + 正则统计不受影响——统计类检查优先用这种方式。
+- **codex 的工具名不在 ToolName 枚举里**：`protocol/src/tool_name.rs` 只是 `{namespace, name}` 结构体；真正工具名要 grep `ToolName::plain(...)` / `ToolName::namespaced(...)`（在 handler 里注册）。
+- **写大文档的可靠手法**：`write_file` 只写 ≤500 字符骨架 + 末尾唯一哨兵 `<!--END-->`，之后每次 `smart_edit` 用 `search_replace` 把哨兵替换为「新章节 + 哨兵」，可无上限续写且不丢定位；最后一次替换不带哨兵即收尾。写完后用 pwsh 把 LF 归一为 CRLF。
+- **smart_edit 的两个坑**：`insert_at_line` 会在「疑似字符串/块注释」的行上误报失败（markdown 里的引号可触发）；此时改用 `search_replace`，或把追加内容写成临时文件再用 .NET 追加。
