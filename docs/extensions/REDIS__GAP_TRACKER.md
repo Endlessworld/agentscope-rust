@@ -134,7 +134,7 @@
 - **基线（汇总方提供，本会话未重跑）**：
   - `cargo build -p agentscope-extensions-redis` → **通过**（1 条 pre-existing dead-code warning：`RedisSandboxLease::released`）。
   - `cargo test -p agentscope-extensions-redis` → **21 passed / 0 failed**（unit）+ **2 passed**（doc-tests）。
-  - 全量 `cargo test --workspace` → **1485 passed / 0 failed**。
+  - 全量 `cargo test --workspace` → **1866 passed / 0 failed**（86 test target）。
 - **crate 文件清单（实测行数，2026-09-19 收敛后）**：`Cargo.toml`(20)、`src/lib.rs`(49)、`src/distributed_store.rs`(210)、`src/sandbox.rs`(276)、`src/snapshot.rs`(163)、`src/store.rs`(351)、`src/state/mod.rs`(522)、`src/state/adapter.rs`(77)、`src/state/connection.rs`(201)、`src/state/version_support.rs`(97)。**`src/state/list_hash.rs` 已删除**（原 108 行）。
 
 ### 4.1.1 list_hash 向 core 收敛（2026-09-19）

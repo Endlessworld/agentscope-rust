@@ -18,7 +18,7 @@
 | Java 规模（实测行数） | 主代码 8024 / 测试 1577（见下表） |
 | Rust crate | `crates/agentscope-extensions-sandbox` |
 | 迁移波次 | A |
-| 当前状态 | **已完成**（build 通过；71 passed / 0 failed） |
+| 当前状态 | **已完成**（build 通过；**108 passed / 0 failed**；`fs_spec` 与 `kubernetes_files` 已落地） |
 
 | Java 子模块 | 主代码 文件/行 | 测试 文件/行 |
 |---|---|---|
@@ -28,7 +28,7 @@
 | kubernetes | 39 / 4094 | 8 / 850 |
 | **合计** | **71 / 8024** | **14 / 1577** |
 
-### 1.1 Rust crate 文件清单（10 个源文件，~171 KB）
+### 1.1 Rust crate 文件清单（12 个源文件，~6069 行）
 | 文件 | 职责 | 单测 |
 |---|---|---|
 | `src/lib.rs` | crate 根：模块声明、re-export、架构文档 | 0 |
@@ -41,7 +41,9 @@
 | `src/daytona.rs` | Daytona 后端（options/请求体/exec 解析） | 7 |
 | `src/e2b.rs` | E2B 后端（options/envd Connect/JSON 编解码/快照标记） | 15 |
 | `src/kubernetes.rs` | Kubernetes 后端（SandboxClaim CRD/exec/connector URL） | 9 |
-| **合计** | | **71** |
+| `src/fs_spec.rs` | 本 crate 自建的 `SandboxFilesystemSpec` 等价抽象（client + workspace + snapshot + isolation scope）+ 四个 `*FilesystemSpec` + `SandboxFilesystemAdapter`（impl harness `SandboxFilesystem`） | 17 |
+| `src/kubernetes_files.rs` | Kubernetes 文件 API（upload/download/list/exists）+ 本 crate 声明并实现的 `SandboxFileTransfer` trait（`KubernetesFileTransfer`），经 `FileApiTransport` seam 离线可测 | 20 |
+| **合计** | | **108** |
 
 ## 2. Java 清单与依赖映射
 
@@ -155,7 +157,7 @@
 | `agent::sandbox::SandboxClientOptions` | `SandboxClient::create` 参数（实现当前忽略 `_options`，配置由各后端 Options 承载） | 复用签名 |
 | `agent::sandbox::SandboxExecutionGuard`（具体 struct，`Clone`） | 本 crate **未使用**（属 harness `SandboxManager` 生命周期职责） | **已裁定（见汇总 §3.3）**：Java 侧为 `@FunctionalInterface` 接口，Rust 侧为具体 struct，属**确认的 harness 缺口**；本 crate 保持不重建平行类型 |
 | `agent::sandbox::SandboxIsolationKey` | 本 crate **未使用** | 未重建 |
-| `agent::filesystem::{SandboxFilesystem, SandboxBackedFilesystem}` | 本 crate **未实现**（Java 的 `*FilesystemSpec` 无对应） | 缺口，见 §3.2 |
+| `agent::filesystem::{SandboxFilesystem, SandboxBackedFilesystem}` | `fs_spec::SandboxFilesystemAdapter` 实现 harness `SandboxFilesystem`（经 live `Sandbox`）；`SandboxBackedFilesystem` 为 harness 本地 helper | 复用 + 适配层（`SandboxFilesystemSpec` 无 harness 对应，本 crate 自建等价抽象，见 §3.2/§4.2） |
 
 ## 3. 详细缺口清单
 
@@ -171,13 +173,13 @@
 | 快照接入 | `NoopSnapshotSpec`/快照链路 | 已完成 | 复用 harness `SandboxSnapshot(Spec)`；E2B 原生快照走 `E2bSnapshotRefs` |
 | 工作区投影 | `WorkspaceSpec`/`WorkspaceMountSupport` | 已完成 | `workspace.rs` 生成确定性 shell 脚本（tar/base64 上传） |
 | 共享 HTTP/重试 | `*Http`/`*Retry` | 已完成 | `http.rs` + `retry.rs` |
-| 离线单测（71 个） | Java 测试 1577 行 | 已完成 | 分布见 §1.1 |
+| 离线单测（108 个） | Java 测试 1577 行 | 已完成 | 分布见 §1.1 |
 
 ### 3.2 P1（重要）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `*FilesystemSpec` 四类 | `AgentRun/Daytona/E2b/KubernetesFilesystemSpec` | **待办** | Java 侧均 `extends harness SandboxFilesystemSpec`；**Rust harness 无对应 Spec 类型**（仅有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`），无法 1:1。见 §4.2（不改 harness） |
-| Kubernetes 文件 API | `client/Filesystem`、`client/model/FileEntry`、`SandboxFileTransfer` | **待办** | 仅 exec + 工作区投影可用；无独立文件读写/列目录接口 |
+| `*FilesystemSpec` 四类 | `AgentRun/Daytona/E2b/KubernetesFilesystemSpec` | **已完成（适配层）** | Java 侧均 `extends harness SandboxFilesystemSpec`；**Rust harness 无对应 Spec 类型**（仅有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`），故在 `src/fs_spec.rs` 自建等价的 `SandboxFilesystemSpec`（client + workspace 投影 + snapshot 覆盖 + isolation scope）与四类 spec，并以 `SandboxFilesystemAdapter` 实现 harness `SandboxFilesystem`。非 1:1 继承，语义等价。见 §4.2（不改 harness） |
+| Kubernetes 文件 API | `client/Filesystem`、`client/model/FileEntry`、`SandboxFileTransfer` | **已完成** | `src/kubernetes_files.rs`：`upload`/`download`/`list`/`exists` 四个端点（路径 percent-encoded），`FileEntry` 模型与 `KubernetesFileTransfer`。harness 无 `SandboxFileTransfer` trait，故契约在本 crate 声明（见 §4.2）；经 `FileApiTransport` seam 离线单测 |
 | E2B envd Proto codec | `E2bEnvdProcessClient`（protobuf DynamicMessage） | **部分完成** | 仅 JSON codec；`E2bCodec::Proto` 为占位默认，实际仅走 JSON |
 | K8s 连接策略 1:1 | `InClusterStrategy`/`PortForwardStrategy`/`ConnectionStrategy` | **部分完成** | 仅有 direct(pod IP) 与 gateway 的 URL 解析；无策略对象树 |
 | K8s 异常类 1:1 | `client/exceptions/*`（8 类） | 设计决定（归并） | 归并到 `SandboxErrorCode`/`SandboxExtensionError`；未逐类建模 |
@@ -196,19 +198,19 @@
 
 ### 4.1 当前状态
 - **已完成内容**：四个远端沙箱后端（agentrun / daytona / e2b / kubernetes）全部适配到 harness `Sandbox`/`SandboxClient` trait；共享 `RemoteBackend` glue、HTTP、重试、工作区投影、状态投影、快照接入均已落地。
-- **Rust 产物**：`src/` 10 个源文件（`lib/error/http/retry/workspace/remote/agentrun/daytona/e2b/kubernetes.rs`），~171 KB；71 个单测。
+- **Rust 产物**：`src/` 12 个源文件（`lib/error/http/retry/workspace/remote/agentrun/daytona/e2b/kubernetes/fs_spec/kubernetes_files.rs`），~6069 行；108 个单测。
 - **验证（实测，汇总方基线）**：
   ```
   cargo build -p agentscope-extensions-sandbox   -> 通过（0 error）
-  cargo test  -p agentscope-extensions-sandbox   -> 71 passed / 0 failed / 0 ignored
-  cargo test  --workspace                        -> 1485 passed / 0 failed
+  cargo test  -p agentscope-extensions-sandbox   -> 108 passed / 0 failed / 0 ignored
+  cargo test  --workspace                        -> 1866 passed / 0 failed（86 test target）
   ```
 - **已知问题**：无阻塞。真实厂商端点未联调（测试全离线）；若干 Java 侧能力未迁移（见 §3.2/§3.3）。
 
 ### 4.2 下一步与阻塞
 1. **harness 抽象缺口（不改 harness，仅记录）**：harness `agent::sandbox` 的 `state` 模块为私有（`mod state;`），`RemoteSandboxState` **未在 `sandbox/mod.rs` re-export**。本 crate 因此无法命名 `RemoteSandboxState`，只能经 `serde_json` 与 `SandboxState::Remote` 变体互转（见 `remote.rs` 内注释）。**建议汇总方考虑 re-export `RemoteSandboxState`**；在裁定前本 crate 用现有公开面绕过，**未修改 harness**。
-2. **harness 缺少 `SandboxFilesystemSpec`**：Java 扩展的 4 个 `*FilesystemSpec` 继承 harness Java `SandboxFilesystemSpec`，而 Rust harness 仅有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`，无 Spec 工厂类型。故该批类无法 1:1 迁移（列 §3.2 待办）。**如需，须由汇总方决定是否扩展 harness 或在本 crate 内建适配层**；本子智能体**未改 harness/core**。
-3. **P1 补齐**：Kubernetes 文件 API（`client/Filesystem`/`FileEntry`）、E2B Proto codec、K8s 连接策略对象树。
+2. **harness 缺少 `SandboxFilesystemSpec` / `SandboxFileTransfer`**：Java 扩展的 4 个 `*FilesystemSpec` 继承 harness Java `SandboxFilesystemSpec`，`SandboxFileTransfer` 亦为 harness Java 类型；Rust harness 仅有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`，两者皆无。**已按裁定在本 crate 内建适配层**（`fs_spec.rs` 的 `SandboxFilesystemSpec` + `kubernetes_files.rs` 的 `SandboxFileTransfer`），**未改 harness/core**。若 harness 后续补齐同名类型，本 crate 的实现可直接切换继承/实现面，无需改调用点。
+3. **P1 剩余**：E2B Proto codec、K8s 连接策略对象树（Kubernetes 文件 API 已落地，见 §3.2）。
 4. **真实端点联调**：需真实 E2B/Daytona/AgentRun/K8s 凭据；当前全部请求体构造/响应解析/重试均有离线单测覆盖。
 5. **跨模块需求**：无硬阻塞。本 crate 依赖 `agentscope-core`（`Msg`/`Error`/`RuntimeContext`）与 `agentscope-harness`（sandbox trait/类型、`WorkspaceSpec`/`ExecResult`/`SandboxState`/快照 trait、`filesystem`）。无 workspace 级依赖变更需求（所有依赖已在 workspace 定义或本 crate `[dependencies]` 声明）。
 

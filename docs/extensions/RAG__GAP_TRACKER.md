@@ -18,9 +18,9 @@
 | Java 规模（实测行数） | 主代码 **15438** / 测试 **16057**（bailian 1447/1479、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8068/10188） |
 | Rust crate | `crates/agentscope-extensions-rag` |
 | 迁移波次 | A |
-| 当前状态 | **部分完成** — `dify` 子模块全量迁移、`simple` 子模块的离线链路已落地，`cargo build`/`cargo test` 全绿（101 passed / 0 failed）；`bailian` / `haystack` / `ragflow` **尚未迁移**；`simple` 的 HTTP embedding 提供商与外部向量库 **尚未迁移** |
+| 当前状态 | **部分完成** — `dify`、`simple`（离线链路）、`ragflow` 子模块已迁移，`cargo build`/`cargo test` 全绿（**152 passed / 0 failed**）；`bailian` / `haystack` **尚未迁移**；`simple` 的 HTTP embedding 提供商与外部向量库 **尚未迁移** |
 
-### 1.1 Rust crate 文件清单（18 个源文件，~3705 行，101 个内联测试）
+### 1.1 Rust crate 文件清单（26 个源文件，6375 行，152 个内联测试）
 | 文件 | 职责 |
 |---|---|
 | `src/lib.rs` | crate 根：12 个模块声明 + re-export；说明 Java core `rag` 包已 `@Deprecated(forRemoval)` 且 core 无对应实现 |
@@ -37,12 +37,16 @@
 | `src/dify/{mod,config}.rs` | Dify 配置 + `RetrievalMode` / `RerankConfig` / `MetadataFilter(Condition)` |
 | `src/dify/{client,request}.rs` | Dify HTTP 客户端 + 可注入 `DifyTransport` + 请求体构造 |
 | `src/dify/{model,converter,knowledge}.rs` | Dify 响应 DTO、`DifyDocumentConverter`、`DifyKnowledge` |
+| `src/transport.rs` | 共享可注入 HTTP transport seam（ragflow 复用） |
+| `src/ragflow/{mod,config}.rs` | RAGFlow 配置 + builder（dataset/document ids、检索旋钮、重试） |
+| `src/ragflow/{client,request}.rs` | RAGFlow HTTP 客户端 + `POST /api/v1/retrieval` 请求体构造 |
+| `src/ragflow/{model,converter,knowledge}.rs` | RAGFlow 响应 DTO（含 `data: false|null|object` 自定义反序列化）、`RAGFlowDocumentConverter`、`RAGFlowKnowledge` |
 
 ### 1.2 验证基线（最近一次实测，由汇总方提供）
 ```
 cargo build -p agentscope-extensions-rag   -> Finished (0 errors)
-cargo test  -p agentscope-extensions-rag   -> 101 passed; 0 failed
-cargo test --workspace                     -> 1485 passed; 0 failed
+cargo test  -p agentscope-extensions-rag   -> 152 passed; 0 failed
+cargo test --workspace                     -> 1866 passed; 0 failed（86 test target）
 ```
 
 ## 2. Java 清单与依赖映射
@@ -130,15 +134,15 @@ cargo test --workspace                     -> 1485 passed; 0 failed
 | `model.HayStackDocument` / `HayStackResponse` / `SparseEmbedding` / `ByteStream` | 响应/文档/sparse 向量 DTO | 无 | **待办 P1** |
 | `exception.HayStackApiException` | API 异常 | 无 | **待办 P1** |
 
-### 2.6 ragflow 子模块（`io.agentscope.core.rag.integration.ragflow.*`，9 类）— **未迁移**
+### 2.6 ragflow 子模块（`io.agentscope.core.rag.integration.ragflow.*`，9 类）— **已迁移**
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
-| `RAGFlowClient` | OkHttp 调用 `POST /api/v1/retrieval` | 无 | **待办 P1** |
-| `RAGFlowConfig` (+Builder) | apiKey / datasetIds / topK / threshold / page 等 | 无 | **待办 P1** |
-| `RAGFlowDocumentConverter` | chunk → `Document`（payload 装配） | 无 | **待办 P1** |
-| `RAGFlowKnowledge` | `Knowledge` 适配器 | 无 | **待办 P1** |
-| `model.RAGFlowChunk` / `RAGFlowResponse` / `ResponseDataDeserializer` | chunk / 响应 DTO（`data` 可 false/null/object） | 无 | **待办 P1** |
-| `exception.RAGFlowApiException` / `RAGFlowAuthException` | API / 鉴权异常 | 无 | **待办 P1** |
+| `RAGFlowClient` | OkHttp 调用 `POST /api/v1/retrieval` | `ragflow::RAGFlowClient`（经 `crate::transport` seam，含错误映射与重试） | 已完成 |
+| `RAGFlowConfig` (+Builder) | apiKey / datasetIds / topK / threshold / page 等 | `ragflow::config::{RAGFlowConfig, RAGFlowConfigBuilder}` | 已完成 |
+| `RAGFlowDocumentConverter` | chunk → `Document`（payload 装配） | `ragflow::RAGFlowDocumentConverter` | 已完成 |
+| `RAGFlowKnowledge` | `Knowledge` 适配器 | `ragflow::RAGFlowKnowledge`（仅检索） | 已完成 |
+| `model.RAGFlowChunk` / `RAGFlowResponse` / `ResponseDataDeserializer` | chunk / 响应 DTO（`data` 可 false/null/object） | `ragflow::model::{RAGFlowChunk, RAGFlowResponse, ResponseData, DocAgg}`（自定义反序列化复刻） | 已完成 |
+| `exception.RAGFlowApiException` / `RAGFlowAuthException` | API / 鉴权异常 | `RagError::Api` / `RagError::Auth`（`src/error.rs`） | 已完成 |
 
 ## 3. 详细缺口清单
 
@@ -153,15 +157,16 @@ cargo test --workspace                     -> 1485 passed; 0 failed
 | 统一错误类型 | `EmbeddingException` / `VectorStoreException` / `ReaderException` / `Dify*Exception` | 已完成 | `src/error.rs` |
 | HTTP 重试 | `DifyRAGClient.RetryInterceptor` | 已完成 | `src/retry.rs` |
 | **dify 全链路** | dify 子模块 11 类 | 已完成 | `src/dify/**`；请求体 / 响应 / 转换 / 适配器 / 错误全覆盖 |
+| **ragflow 全链路** | ragflow 子模块 9 类 | 已完成 | `src/ragflow/**`；请求体 / 响应（`data` 多态反序列化）/ 转换 / 适配器 / 错误全覆盖 |
 | **simple 离线链路** | `SimpleKnowledge` / `InMemoryStore` / `DistanceCalculator` / `TextReader` / `TextChunker` / `SplitStrategy` / `ReaderInput` / `EmbeddingModel` | 已完成 | `src/{simple,store,reader,embedding}.rs` |
-| 离线单测（101 个） | Java 测试 16057 行 | 已完成 | 见 §1.2；HTTP 走注入式 mock transport，全离线 |
+| 离线单测（152 个） | Java 测试 16057 行 | 已完成 | 见 §1.1；HTTP 走注入式 mock transport，全离线 |
 
 ### 3.2 缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | Bailian 集成 | `bailian.*` 7 类 | 待办 | Java 用 `com.aliyun.bailian20231229` SDK；Rust 需评估 reqwest 直连或 SDK 取舍（§4.2） |
 | HayStack 集成 | `haystack.*` 10 类 | 待办 | OkHttp → reqwest；建议复用 `dify` 的 transport seam 模式 |
-| RAGFlow 集成 | `ragflow.*` 9 类 | 待办 | `POST /api/v1/retrieval`；`data` 字段可 `false`/`null`/object，需自定义反序列化（`ResponseDataDeserializer`） |
+| RAGFlow 集成 | `ragflow.*` 9 类 | **已完成** | `src/ragflow/**`；`POST /api/v1/retrieval`；`data` 字段可 `false`/`null`/object 的自定义反序列化已复刻（`ResponseData`） |
 | simple 外部向量库 | `ElasticsearchStore`(526) / `MilvusStore`(899) / `PgVectorStore`(979) / `QdrantStore`(996) | 待办 | 均以 `store::VdbStore` 为接口；各需 REST/gRPC 客户端，可离线 mock |
 | embedding HTTP 提供商 | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` | 待办 | 与 MODEL 扩展边界可能重叠，待裁定（§4.2） |
 
@@ -175,15 +180,15 @@ cargo test --workspace                     -> 1485 passed; 0 failed
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算），共 18 个源文件 ~3705 行、101 个内联测试。
-- **验证命令与结果**（最近一次实测，由汇总方提供）：
+- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路，共 26 个源文件 6375 行、152 个内联测试。
+- **验证命令与结果**（最近一次实测，汇总方执行）：
   - `cargo build -p agentscope-extensions-rag` → **通过（0 errors）**
-  - `cargo test -p agentscope-extensions-rag` → **101 passed / 0 failed**
-  - `cargo test --workspace` → **1485 passed / 0 failed**
+  - `cargo test -p agentscope-extensions-rag` → **152 passed / 0 failed**
+  - `cargo test --workspace` → **1866 passed / 0 failed**（86 test target）
 - **已知问题**：无编译/测试失败。设计上有一处显式取舍——core 侧 `RagMode`/hook 与 `io.agentscope.core.rag` 包未迁移，检索结果到消息的桥接以纯函数形式提供（`src/message.rs`），调用方需自行组装 hook/工具。
 
 ### 4.2 下一步与阻塞
-1. **bailian / haystack / ragflow 子模块迁移（P1）**：按 `dify` 的「可注入 transport trait + 离线 mock」模式实现各自 DTO / 客户端 / 转换器 / `Knowledge` 适配器。
+1. **bailian / haystack 子模块迁移（P1）**：按 `dify`/`ragflow` 的「可注入 transport trait + 离线 mock」模式实现各自 DTO / 客户端 / 转换器 / `Knowledge` 适配器。
 2. **simple 外部向量库（P1）**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`，均实现 `store::VdbStore`。
 3. **文档读取器与 embedding HTTP 提供商（P1/P2）**：见 §3.3。
 4. **待裁定事项**

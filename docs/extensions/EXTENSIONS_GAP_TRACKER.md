@@ -17,7 +17,7 @@
 | 1 | A | MODEL | `agentscope-extensions-model` | 24885 / 45043 | 部分完成（build + test 通过；58 test；`dashscope` 已落地；逐类映射/缺口见独立 tracker） | `MODEL__GAP_TRACKER.md` |
 | 2 | A | PROTOCOL | `agentscope-extensions-protocol` | 16844 / 18860 | 部分完成（build + test 通过；130 test；`chat-completions-web` 已落地，`agui` 部分迁移（event+model 已落地，converter/adapter/encoder/processor/registry/runtime 未迁移）） | `PROTOCOL__GAP_TRACKER.md` |
 | 3 | A | RAG | `agentscope-extensions-rag` | 15438 / 16057 | 部分完成（build + test 通过；152 test；`ragflow` 已落地；逐类映射/缺口见独立 tracker） | `RAG__GAP_TRACKER.md` |
-| 4 | A | SANDBOX | `agentscope-extensions-sandbox` | 8024 / 1577 | 部分完成（build + test 通过；108 test；`fs_spec` 已落地；harness trait 复用契约见独立 tracker） | `SANDBOX__GAP_TRACKER.md` |
+| 4 | A | SANDBOX | `agentscope-extensions-sandbox` | 8024 / 1577 | **已完成**（build + test 通过；**108 test**；P0+P1 已落地：四后端 + `fs_spec`（四类 `*FilesystemSpec` 适配层）+ `kubernetes_files`（文件 API + `SandboxFileTransfer`）；harness 抽象缺口见独立 tracker §4.2） | `SANDBOX__GAP_TRACKER.md` |
 | 5 | A | CHANNEL | `agentscope-extensions-channel` | 4879 / 0 | **已完成**（build + test 通过；**241 test**；P0+P1+P2 全部落地：common 全量 + 六平台 provider 件 + **5 个 `*Channel` 适配 + 4 个 axum CallbackController + `DingTalkStreamClient` 常驻 WebSocket 网关**） | `CHANNEL__GAP_TRACKER.md` |
 | 6 | A | MEM | `agentscope-extensions-mem` | 4821 / 5746 | 已完成（build + test 通过；66 test） | `MEM__GAP_TRACKER.md` |
 | 7 | B | JDBC | `agentscope-extensions-jdbc` | 3106 / 1558 | 部分完成（build + test 通过；5 个编译错误已修；测试仅 lib 2，对照 Java 98 个 `@Test` 为 P0 缺口，见 §3.1） | `JDBC__GAP_TRACKER.md` |
@@ -107,7 +107,8 @@
 | CHANNEL | WeCom 签名 `Clone` 约束；base64 `decode_allow_trailing_bits` 语义 | 修 `wecom/signature.rs`、`wecom/crypto.rs`（对齐 Java `Base64.getDecoder()`） | ✅ 149 test 通过 |
 | MODEL / STUDIO / HIGRESS | — | 复测绿 | ✅ 58 / 30 / 30 |
 
-- **第七批汇总验收（本批）**：`cargo build --workspace` → **BUILD_EXIT=0**；`cargo test --workspace -j 2` → **1846 passed / 0 failed**（较第六批 1746 增加 100：harness 299 +6，channel 227 +78，其余持平）。
+- **第九批汇总验收（文档同步批，2026-09-19）**：`cargo test --workspace -j 2 --no-fail-fast` → **1866 passed / 0 failed**（86 test target；唯一 `1 ignored` 为 `platform_channel.rs` 的 ` ```ignore ` 文档示例，早于基线即存在）。本批**仅改文档**：逐模块核对并修正独立 tracker 中过时/错误结论（MODEL `dashscope` 已接线非阻塞、RAG `ragflow` 已落地、SANDBOX `fs_spec`/`kubernetes_files` 已落地），汇总 §1 SANDBOX 行由「部分完成」校正为「已完成」。
+- **第七批汇总验收**（保留备查）：`cargo build --workspace` → **BUILD_EXIT=0**；`cargo test --workspace -j 2` → **1846 passed / 0 failed**（较第六批 1746 增加 100：harness 299 +6，channel 227 +78，其余持平）。
 - **第六批汇总验收**（保留备查）：`cargo build --workspace` → **BUILD_EXIT=0**；`cargo test --workspace` → **1746 passed / 0 failed**（86 test target，TEST_EXIT=0，见 §3.2）。
 - **第五批汇总验收**（保留备查）：`cargo test --workspace` → **1728 passed / 0 failed**（86 target）。
 

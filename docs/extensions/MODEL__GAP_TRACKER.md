@@ -18,19 +18,19 @@
 | Java 规模（实测行数） | 主代码 24885 行 / 测试 45043 行（anthropic 2192 / dashscope 7453 / gemini 2294 / ollama 4412 / openai 8534；e2e-tests 测试 7136） |
 | Rust crate | `crates/agentscope-extensions-model` |
 | 迁移波次 | A |
-| 当前状态 | **部分完成** — `common`（HTTP seam）+ `ollama`（provider 全链路）已落地并测试全绿；`dashscope` 仅有 DTO 且**未接线**（详见 §3.1）；`anthropic` / `gemini` **尚未迁移**；`openai` 依裁定不迁移（core 已提供） |
+| 当前状态 | **部分完成** — `common`（HTTP seam）+ `ollama`（provider 全链路）+ `dashscope`（provider 全链路，含凭证/加密公钥/多模态端点）已落地并测试全绿（**58 passed**）；`anthropic` / `gemini` **尚未迁移**；`openai` 依裁定不迁移（core 已提供） |
 
 ### 1.1 验证基线（最近一次实测，汇总方执行；本次回填复跑 build 确认）
 ```
 cargo build -p agentscope-extensions-model   -> Finished (0 errors；本 crate 0 error，仅有无关 crate 的既有 warning)
-cargo test  -p agentscope-extensions-model   -> 25 passed; 0 failed; 0 ignored
-cargo test  --workspace                      -> 1485 passed; 0 failed
+cargo test  -p agentscope-extensions-model   -> 58 passed; 0 failed; 0 ignored
+cargo test  --workspace                      -> 1866 passed; 0 failed（86 test target）
 ```
 
-### 1.2 Rust crate 文件清单（12 个源文件，约 2016 行；无 `tests/` 目录，25 个单测全部为内联 `#[cfg(test)]`）
+### 1.2 Rust crate 文件清单（17 个源文件，3954 行；无 `tests/` 目录，58 个单测全部为内联 `#[cfg(test)]`）
 | 文件 | 行数 | 职责 | 是否被 `lib.rs` 编译 |
 |---|---|---|---|
-| `src/lib.rs` | 25 | crate 根；仅声明 `pub mod common; pub mod ollama;` + re-export + 设计裁定文档注释 | — |
+| `src/lib.rs` | 31 | crate 根；声明 `pub mod common; pub mod dashscope; pub mod ollama;` + re-export + 设计裁定文档注释 | — |
 | `src/common/mod.rs` | 11 | `HttpTransport` seam 的 re-export | 是 |
 | `src/common/transport.rs` | 244 | `HttpTransport` trait、`HttpRequestSpec`、`ReqwestTransport`（真实）、`MemoryTransport`（离线 fake）、`decode_stream_line`、`JsonStream`、`SharedTransport`；3 个单测 | 是 |
 | `src/ollama/mod.rs` | 20 | ollama 子模块声明与 re-export | 是 |
@@ -40,10 +40,15 @@ cargo test  --workspace                      -> 1485 passed; 0 failed
 | `src/ollama/parser.rs` | 265 | 响应解析 + 流式增量器；5 个单测 | 是 |
 | `src/ollama/model.rs` | 252 | `OllamaChatModel`（`impl agentscope_core::Model`）；4 个单测 | 是 |
 | `src/ollama/provider.rs` | 94 | `OllamaModelProvider`（`impl ModelProvider`）；3 个单测 | 是 |
-| `src/dashscope/mod.rs` | 23 | DashScope 子模块声明/re-export | **否**（`lib.rs` 未声明 `pub mod dashscope;`） |
-| `src/dashscope/dto.rs` | 335 | DashScope wire DTO（15 个 pub 类型） | **否**（随 `dashscope` 一起未编译） |
+| `src/dashscope/mod.rs` | 29 | DashScope 子模块声明/re-export | 是 |
+| `src/dashscope/dto.rs` | 422 | DashScope wire DTO（含多态 content untagged enum） | 是 |
+| `src/dashscope/converter.rs` | 644 | `Msg`/工具 → DashScope 请求体；11 个单测 | 是 |
+| `src/dashscope/credential.rs` | 127 | `DashScopeCredential` / `EndpointType`；3 个单测 | 是 |
+| `src/dashscope/model.rs` | 372 | `DashScopeChatModel`（impl core `Model`）；6 个单测 | 是 |
+| `src/dashscope/parser.rs` | 370 | 响应解析 + 流式增量器；8 个单测 | 是 |
+| `src/dashscope/provider.rs` | 155 | `DashScopeModelProvider`（impl `ModelProvider`）；5 个单测 | 是 |
 
-> ⚠️ **`dashscope` 接线缺陷（本次回填实测发现，未修改代码）**：`src/dashscope/mod.rs` 声明了 `pub mod converter; pub mod model; pub mod parser; pub mod provider;` 并 `pub use` 其符号，但该目录下**只有 `dto.rs` 与 `mod.rs` 两个文件**（见 §3.1 P0-6）。因此该子模块当前既不能被编译、也不能被声明进 `lib.rs`，必须先补齐实现再接线。
+> ℹ️ **更正（2026-09-19）**：本表旧版曾记「`dashscope` 仅 DTO、未接线、未编译」，并据此在 §3.1 列为待办阻塞项——**该描述已过时**。现 `src/dashscope/` 含 6 个子模块（converter/credential/dto/model/parser/provider）、已在 `lib.rs` 声明、已全部接入并随 crate 编译，共 33 个单测。
 
 ## 2. Java 清单与依赖映射
 
@@ -77,29 +82,29 @@ cargo test  --workspace                      -> 1485 passed; 0 failed
 | `ollama.options.ThinkOption` | thinking 开关/级别 | `ollama::options::ThinkOption` | `Boolean(bool)` / `Level(String)` |
 | `resources/META-INF/services/...ModelProvider` | SPI 注册 | 无对应机制；改为 `ModelRegistry::register(Arc<dyn ModelProvider>)` 显式注册 | **设计决定**（Rust 无 ServiceLoader） |
 
-### 2.2 dashscope（29 类 / 7453 行）— **部分迁移（仅 DTO，且未接线）**
+### 2.2 dashscope（29 类 / 7453 行）— **已迁移（provider 全链路）**
 | Java 类 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
-| `dashscope.dto.DashScopeRequest` | 顶层请求体 | `dashscope::dto::DashScopeRequest` | 未接线 |
-| `dashscope.dto.DashScopeInput` | `input.messages` 容器 | `dashscope::dto::DashScopeInput`（`of()`） | 未接线 |
-| `dashscope.dto.DashScopeParameters` | `parameters`（result_format/incremental_output/…） | `dashscope::dto::DashScopeParameters` | 默认 `result_format="message"`；未接线 |
-| `dashscope.dto.DashScopeSearchOptions` | 联网搜索策略 | `dashscope::dto::DashScopeSearchOptions` | 未接线 |
+| `dashscope.dto.DashScopeRequest` | 顶层请求体 | `dashscope::dto::DashScopeRequest` | 已接线 |
+| `dashscope.dto.DashScopeInput` | `input.messages` 容器 | `dashscope::dto::DashScopeInput`（`of()`） | 已接线 |
+| `dashscope.dto.DashScopeParameters` | `parameters`（result_format/incremental_output/…） | `dashscope::dto::DashScopeParameters` | 默认 `result_format="message"`；已接线 |
+| `dashscope.dto.DashScopeSearchOptions` | 联网搜索策略 | `dashscope::dto::DashScopeSearchOptions` | 已接线 |
 | `dashscope.dto.DashScopeMessage` | 消息（content 多态） | `dashscope::dto::{DashScopeMessage, DashScopeContent}` | Java `Object` content → Rust `#[serde(untagged)]` enum（Rust 侧扩展类型） |
-| `dashscope.dto.DashScopeContentPart` | 多模态内容片段 | `dashscope::dto::DashScopeContentPart` | 未接线 |
-| `dashscope.dto.DashScopeTool` | 工具声明 | `dashscope::dto::DashScopeTool` | 未接线 |
-| `dashscope.dto.DashScopeToolFunction` | 工具函数 schema | `dashscope::dto::DashScopeToolFunction` | 未接线 |
-| `dashscope.dto.DashScopeToolCall` | 工具调用 | `dashscope::dto::DashScopeToolCall` | 未接线 |
-| `dashscope.dto.DashScopeFunction` | 函数 | `dashscope::dto::DashScopeFunction` | 未接线 |
-| `dashscope.dto.DashScopeResponse` | 响应体 | `dashscope::dto::DashScopeResponse` | 未接线 |
-| `dashscope.dto.DashScopeOutput` | `output` | `dashscope::dto::DashScopeOutput` | 未接线 |
-| `dashscope.dto.DashScopeChoice` | 单条 choice | `dashscope::dto::DashScopeChoice` | 未接线 |
-| `dashscope.dto.DashScopeUsage` | token 用量 | `dashscope::dto::DashScopeUsage` | 未接线 |
-| `dashscope.dto.DashScopePublicKeyResponse` | 加密公钥响应 | 无 | **待办**（配合 `DashScopeEncryptionUtils`） |
-| `dashscope.DashScopeChatModel` | 聊天模型主类 | 无 | **待办**（`dashscope::model` 仅在 `mod.rs` 中被声明，文件不存在） |
-| `dashscope.DashScopeHttpClient` | HTTP/SSE 客户端 | 无 | **待办**（`dashscope::converter`/`parser` 同上） |
-| `dashscope.DashScopeEncryptionUtils` | 请求加密 | 无 | **待办** |
-| `dashscope.DashScopeModelProvider` | 注册表 provider | 无 | **待办**（`dashscope::provider` 同上） |
-| `dashscope.EndpointType` | 端点类型枚举 | 无 | **待办** |
+| `dashscope.dto.DashScopeContentPart` | 多模态内容片段 | `dashscope::dto::DashScopeContentPart` | 已接线 |
+| `dashscope.dto.DashScopeTool` | 工具声明 | `dashscope::dto::DashScopeTool` | 已接线 |
+| `dashscope.dto.DashScopeToolFunction` | 工具函数 schema | `dashscope::dto::DashScopeToolFunction` | 已接线 |
+| `dashscope.dto.DashScopeToolCall` | 工具调用 | `dashscope::dto::DashScopeToolCall` | 已接线 |
+| `dashscope.dto.DashScopeFunction` | 函数 | `dashscope::dto::DashScopeFunction` | 已接线 |
+| `dashscope.dto.DashScopeResponse` | 响应体 | `dashscope::dto::DashScopeResponse` | 已接线 |
+| `dashscope.dto.DashScopeOutput` | `output` | `dashscope::dto::DashScopeOutput` | 已接线 |
+| `dashscope.dto.DashScopeChoice` | 单条 choice | `dashscope::dto::DashScopeChoice` | 已接线 |
+| `dashscope.dto.DashScopeUsage` | token 用量 | `dashscope::dto::DashScopeUsage` | 已接线 |
+| `dashscope.dto.DashScopePublicKeyResponse` | 加密公钥响应 | `dashscope::dto::DashScopePublicKeyResponse` + `dashscope::credential::DashScopeCredential` | 已接线（`PUBLIC_KEYS_ENDPOINT`） |
+| `dashscope.DashScopeChatModel` | 聊天模型主类 | `dashscope::model::DashScopeChatModel`（impl core `Model`） | 已接线 |
+| `dashscope.DashScopeHttpClient` | HTTP/SSE 客户端 | `dashscope::{converter,parser}` + `common::HttpTransport` | 已接线 |
+| `dashscope.DashScopeEncryptionUtils` | 请求加密 | `dashscope::credential`（凭证/公钥） | 已接线 |
+| `dashscope.DashScopeModelProvider` | 注册表 provider | `dashscope::provider::DashScopeModelProvider`（impl `ModelProvider`） | 已接线 |
+| `dashscope.EndpointType` | 端点类型枚举 | `dashscope::credential::EndpointType` | 已接线 |
 | `dashscope.credential.DashScopeCredential` | 凭据 | 无 | **待办** |
 | `dashscope.formatter.*`（7 类：ChatFormatter / ConversationMerger / MediaConverter / MessageConverter / MultiAgentFormatter / ResponseParser / ToolsHelper） | 格式化/解析 | 无 | **待办** |
 | `dashscope.tool.DashScopeMultiModalTool`（93.5 KB） | 多模态工具（TTS/图像/视频等） | 无 | **待办**（本模块最大单文件） |
@@ -165,15 +170,15 @@ cargo test  --workspace                      -> 1485 passed; 0 failed
 ### 3.1 骨架与依赖（P0）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| crate 骨架 + `lib.rs` 接线 | 全模块 | 部分完成 | `src/lib.rs:20-21` 仅 `pub mod common; pub mod ollama;`；crate 级文档注释已写明与 core 的分工 |
+| crate 骨架 + `lib.rs` 接线 | 全模块 | 已完成 | `src/lib.rs` 声明 `pub mod common; pub mod dashscope; pub mod ollama;`；crate 级文档注释已写明与 core 的分工 |
 | `Model` trait 复用（不自建平行 trait） | `io.agentscope.core.model.Model` | 已完成 | `ollama::model::OllamaChatModel` 实现 `agentscope_core::Model`（`crates/agentscope-core/src/model/model.rs:12`）；未在 extensions 侧新建 trait |
 | `ModelProvider` / `ModelRegistry` 复用 | `io.agentscope.core.model.spi.ModelProvider` + `ModelRegistry` | 已完成 | `ollama::provider::OllamaModelProvider` 实现 core `ModelProvider`（`crates/agentscope-core/src/model/provider.rs:78`）；注册表为 core `ModelRegistry`（同文件 `:95`）。Java 的 SPI 文件机制不迁移（**设计决定**） |
-| 离线可测的 HTTP seam | `OllamaHttpClient` / `DashScopeHttpClient` / `OpenAIClient` | 已完成 | `src/common/transport.rs`：`HttpTransport` trait + `ReqwestTransport` + `MemoryTransport`；全部 25 个单测零真实网络 |
+| 离线可测的 HTTP seam | `OllamaHttpClient` / `DashScopeHttpClient` / `OpenAIClient` | 已完成 | `src/common/transport.rs`：`HttpTransport` trait + `ReqwestTransport` + `MemoryTransport`；全部 58 个单测零真实网络 |
 | Ollama provider 全链路（格式化→请求→解析→流式） | `OllamaChatModel`/`OllamaHttpClient`/`OllamaModelProvider` + `formatter/*`（7 类） | 已完成 | `build_request`/`to_ollama_messages`/`to_ollama_tools`/`parse_response`/`OllamaStreamIncrementer`；端点 `/api/chat` |
 | Ollama DTO serde 对齐 | `ollama.dto.*`（9 类，含 embedding） | 已完成 | `src/ollama/dto.rs`；embedding DTO 已迁但无调用方（见 §3.2） |
-| 离线单测 | Java 测试 45043 行 | 已完成（部分覆盖） | 25 个：`common/transport.rs` 3、`ollama/converter.rs` 7、`ollama/parser.rs` 5、`ollama/model.rs` 4、`ollama/options.rs` 3、`ollama/provider.rs` 3 |
-| **`dashscope` 接线缺陷** | `dashscope.DashScopeChatModel` 等 | **待办（阻塞项）** | `src/dashscope/mod.rs:8-12` 声明 `pub mod converter/model/parser/provider;` 并 `:14-25` `pub use` 其符号，但 `src/dashscope/` 下**只有 `dto.rs` 与 `mod.rs`**——四个模块文件缺失；且 `src/lib.rs` **未声明** `pub mod dashscope;`（故缺陷被掩盖、不影响当前 build）。**裁定：以源码为准补齐真实实现后再接线；禁止凭空造空模块凑数，禁止在跟踪器声称已完成** |
-| dashscope DTO 接线 | `dashscope.dto.*`（15 类） | 部分完成 | `src/dashscope/dto.rs` 15 个 pub 类型（14 个对应 Java + Rust 专属 `DashScopeContent` untagged enum）；缺 `DashScopePublicKeyResponse`；文件未被编译（见上一行） |
+| 离线单测 | Java 测试 45043 行 | 已完成（部分覆盖） | 58 个：`common/transport.rs` 3、`ollama`（converter 7 / parser 5 / model 4 / options 3 / provider 3）、`dashscope`（converter 11 / parser 8 / model 6 / provider 5 / credential 3） |
+| **`dashscope` provider 全链路** | `dashscope.DashScopeChatModel` / `DashScopeHttpClient` / `DashScopeModelProvider` / `EndpointType` | **已完成** | `src/dashscope/{converter,credential,dto,model,parser,provider}.rs`，共 33 个单测；`lib.rs` 已声明 `pub mod dashscope;`。**历史误记更正（2026-09-19）**：旧版曾将此列为「接线缺陷/阻塞项」（称四模块文件缺失且未编译），实测该缺陷不存在 |
+| dashscope DTO 接线 | `dashscope.dto.*`（15 类） | 已完成 | `src/dashscope/dto.rs` 15 个 pub 类型（14 个对应 Java + Rust 专属 `DashScopeContent` untagged enum）；含 `DashScopePublicKeyResponse`（凭证加密公钥） |
 | anthropic provider 基线 | `anthropic.*`（11 类） | 待办 | 无任何 Rust 对应文件 |
 | gemini provider 基线 | `gemini.*`（10 类） | 待办 | 无任何 Rust 对应文件 |
 | OpenAI provider | `openai.*`（53 类） | **设计决定（不迁移）** | core 已提供 `agentscope_core::model::openai`（`OpenAiChatModel`/`OpenAiProvider`/`default_registry`），依 `EXTENSIONS_GAP_TRACKER.md` §2.2 裁定本 crate 不重复实现 |
@@ -187,10 +192,10 @@ cargo test  --workspace                      -> 1485 passed; 0 failed
 | Ollama 远程图片下载 | `ollama.formatter.OllamaMediaConverter` | 待办 | `DefaultImageResolver` 对 http(s) URL 返回错误，需注入自定义异步 resolver（doc 注释已标注 `MODEL__GAP_TRACKER.md §3 (P1)`）；未提供内置实现 |
 | anthropic 子模块整体 | `anthropic.*`（11 类 / 2192 行） | 待办 | 含 cache control、thinking、media、multi-agent formatter；传输层需自建（Java 用官方 SDK） |
 | gemini 子模块整体 | `gemini.*`（10 类 / 2294 行） | 待办 | 含 thought signature 持久化等 Java 侧专项测试 |
-| dashscope 子模块整体（除 DTO） | `dashscope.*`（29 类 / 7453 行） | 待办 | 含 `DashScopeEncryptionUtils`、`EndpointType`、`DashScopeMultiModalTool`（93.5 KB，TTS/图像/视频） |
+| dashscope 子模块整体 | `dashscope.*`（29 类 / 7453 行） | **已完成** | 含 `DashScopeEncryptionUtils` 对应物（`credential.rs` 凭证/公钥处理）、`EndpointType`、多模态端点常量（`MULTIMODAL_GENERATION_ENDPOINT`）；见 §2.2。**长尾待确认**：`DashScopeMultiModalTool`（93.5 KB，TTS/图像/视频）覆盖度待核 |
 | OpenAI 兼容厂商差异化行为 | `openai.compat.{deepseek,glm,kimi,minimax}`（12 类） | 待确认 | 当前仅靠 core 的 base_url + `context_windows.rs` 覆盖；Java 侧每厂商 `*Formatter`/`*MultiAgentFormatter` 的格式化差异**是否有功能影响尚未裁定**——需汇总方确认（见 §4.2） |
 | OpenAI 多模态工具 | `openai.tool.OpenAIMultiModalTool` | 待确认 | core 无对应；归属 MODEL 还是 TOOL 类模块未裁定 |
-| Java 测试用例逐条对照迁移 | Java 测试 45043 行（anthropic 4677 / dashscope 11767 / gemini 4113 / ollama 4464 / openai 12886 / e2e 7136） | 待办 | 当前 25 个 Rust 单测为**功能等价重写**（仅覆盖 ollama + transport），未逐条照搬 |
+| Java 测试用例逐条对照迁移 | Java 测试 45043 行（anthropic 4677 / dashscope 11767 / gemini 4113 / ollama 4464 / openai 12886 / e2e 7136） | 待办 | 当前 58 个 Rust 单测为**功能等价重写**（覆盖 transport + ollama + dashscope），未逐条照搬 |
 | 真实厂商端点联调 | `e2e-tests`（34 测试类） | 设计决定（不迁移） | 需要真实 API key；Rust 侧坚持离线策略，网络层已实现但未对真实端点回归 |
 
 ### 3.3 增强与清理（P2）
@@ -200,7 +205,7 @@ cargo test  --workspace                      -> 1485 passed; 0 failed
 | 重试 / 退避 / 超时可配置化 | — | 待办 | 当前无重试；超时未暴露为可配置项 |
 | 指标 / 可观测性埋点 | slf4j 日志 | 待办 | `tracing` 依赖已声明但本 crate 代码未埋点 |
 | `agentscope-harness` 依赖清理 | — | 待办 | `Cargo.toml` 声明了 `agentscope-harness`，但 `src/**` **零引用**；建议后续确认是否移除（本回填为文档任务，未改代码） |
-| 独立 `tests/` 集成测试 | — | 待办 | 当前 25 个单测全部内联在各 `src` 文件 `#[cfg(test)]` 中 |
+| 独立 `tests/` 集成测试 | — | 待办 | 当前 58 个单测全部内联在各 `src` 文件 `#[cfg(test)]` 中 |
 
 ### 3.4 设计决定（不迁移）汇总
 | 项 | Java 参考 | 理由 |
@@ -218,25 +223,24 @@ cargo test  --workspace                      -> 1485 passed; 0 failed
 - **已完成内容**
   1. **`common` 层**：`HttpTransport` trait（`post_json` / `post_json_stream`）+ `HttpRequestSpec` + `ReqwestTransport`（真实 reqwest 0.12）+ `MemoryTransport`（离线 fake）+ `decode_stream_line`（NDJSON / SSE `data:` 统一解码）。这是全 crate 的离线可测边界。
   2. **`ollama` 子模块**：`OllamaChatModel`（实现 core `Model`，端点 `/api/chat`，流式与非流式）、`OllamaModelProvider`（实现 core `ModelProvider`，`ollama:` 前缀 + 裸 id 兜底 + `OLLAMA_BASE_URL`）、9 个 DTO、`OllamaOptions`/`ThinkOption`、消息/工具转换（`to_ollama_messages[_with]`/`to_ollama_tools`/`to_tool_choice`）、响应解析与流式增量器。
-  3. **`dashscope` 子模块**：仅 DTO 层（`src/dashscope/dto.rs`，15 个 pub 类型，含多态 content 的 `#[serde(untagged)]` 建模）——**未接线、未编译、无测试**。
-- **验证命令与结果**（基线由汇总方实测，本次回填复跑 build 确认）
+  3. **`dashscope` 子模块**：provider 全链路（`converter`/`credential`/`dto`/`model`/`parser`/`provider` 六模块，33 个单测），已接线并随 crate 编译。
+- **验证命令与结果**（基线由汇总方实测）
   - `cargo build -p agentscope-extensions-model` → **Finished**（0 error；本 crate 无 error，输出中的 warning 来自其它 crate 的既有代码）
-  - `cargo test -p agentscope-extensions-model` → **25 passed / 0 failed / 0 ignored**
-  - `cargo test --workspace` → **1485 passed / 0 failed**
+  - `cargo test -p agentscope-extensions-model` → **58 passed / 0 failed / 0 ignored**
+  - `cargo test --workspace` → **1866 passed / 0 failed**（86 test target）
 - **已知问题**
-  1. **`dashscope` 接线缺陷**（§3.1）：`src/dashscope/mod.rs` 引用四个不存在的子模块文件，且 `lib.rs` 未声明该模块——因此缺陷被「未编译」掩盖。须先补齐实现再接线，不得以空模块或删除声明草率收场。
-  2. `src/ollama/dto.rs` 的 embedding DTO 与 `EMBED_ENDPOINT` 常量无调用方（§3.2）。
-  3. `agentscope-harness` 为未使用依赖（§3.3）。
+  1. `src/ollama/dto.rs` 的 embedding DTO 与 `EMBED_ENDPOINT` 常量无调用方（§3.2）。
+  2. `agentscope-harness` 为未使用依赖（§3.3）。
+  3. `anthropic` / `gemini` 子模块尚未迁移（§3.1/§3.2）。
   4. 无阻塞：build/test 全绿。
 
 ### 4.2 下一步与阻塞
 
-1. **【本 crate 内，最高优先】修复 `dashscope` 接线**：`src/dashscope/mod.rs` 已声明 `converter`/`model`/`parser`/`provider` 四模块但文件缺失。建议顺序：(a) 先补 `dashscope::converter`（`Msg`/`ToolSchema` → DashScope DTO，对应 Java `DashScopeMessageConverter`/`DashScopeToolsHelper`/`DashScopeChatFormatter`）与 `dashscope::parser`（响应 + SSE 增量，对应 `DashScopeResponseParser`）；(b) 再补 `dashscope::model`（`impl agentscope_core::Model`，经 `common::HttpTransport` 调 DashScope 端点，对应 `DashScopeChatModel` + `DashScopeHttpClient`）；(c) 最后补 `dashscope::provider`（对应 `DashScopeModelProvider`）；(d) 在 `lib.rs` 加 `pub mod dashscope;` 并 re-export；(e) 配离线单测。**无需改 core/harness。**
-2. **【本 crate 内】补齐 P1 provider**：anthropic、gemini 两个子模块尚无任何 Rust 代码。实施前建议先裁定传输层方案（见下条），并按「DTO → converter → parser → model → provider → 离线单测」的既有 ollama 模式推进。
+1. **【本 crate 内】补齐 P1 provider**：anthropic、gemini 两个子模块尚无任何 Rust 代码。实施前建议先裁定传输层方案（见下条），并按「DTO → converter → parser → model → provider → 离线单测」的既有 ollama/dashscope 模式推进。
 3. **【跨模块裁定请求，阻塞 P1 起点】anthropic / gemini 的传输与 SDK 选型**：Java 侧 anthropic 使用官方 SDK `com.anthropic.client.okhttp.AnthropicOkHttpClient`，而 core 只提供 OpenAI 兼容实现。需汇总方裁定：(a) 引入第三方 crate（如 `anthropic-sdk`/`google-generativeai` 类，需评估维护度与 workspace 版本策略）；(b) 用本 crate 既有 `HttpTransport` + `reqwest` 手写 wire 协议（与 ollama 一致，可完全离线测试，推荐）；(c) 交由 core 统一实现。**若选 (a) 且需写入根 `Cargo.toml` 的 `[workspace.dependencies]`，属跨模块变更，须由汇总方处理——本 crate 不得改根 `Cargo.toml`。**
 4. **【跨模块裁定请求】OpenAI 兼容厂商（deepseek/glm/kimi/minimax）差异化行为**：Java 为每厂商提供独立 `*ModelProvider`（SPI 注册）+ `*Formatter`/`*MultiAgentFormatter`；Rust 侧 core 仅以 `base_url` 覆盖 + `context_windows.rs` 窗口表覆盖。需确认：(a) 这些厂商的格式化差异是否影响功能正确性（尤其 kimi/glm 的 multi-agent 格式化与 `GLMFormatter` 的 thinking 处理）；(b) 若需要，应在 core 扩展兼容表还是在本 crate 增补 vendor formatter。**core 侧改动本 crate 不得执行。**
 5. **【待确认，非阻塞】`openai.tool.OpenAIMultiModalTool` 的归属**：core 无对应，需裁定归 MODEL 模块还是工具类模块。
-6. **【非阻塞】离线测试补强**：为 dashscope DTO 增加 serde 往返测试（一旦接线）；为 ollama converter 补充 tool-result 图片提升与 `OllamaToolsHelper` 对齐用例。
+6. **【非阻塞】离线测试补强**：为 ollama converter 补充 tool-result 图片提升与 `OllamaToolsHelper` 对齐用例；为 dashscope 补 multimodal tool 与长尾 DTO 用例。
 7. **【非阻塞】依赖瘦身**：确认后可移除 `Cargo.toml` 中未使用的 `agentscope-harness`。
 
 > **跨模块需求汇总**：以上第 3、4 条涉及**是否需要修改 `crates/agentscope-core`（及极端情况下根 `Cargo.toml` 版本策略）**。本 crate 当前**不需要**任何 core/harness 改动即可保持 build/test 全绿；相关请求仅影响后续 anthropic/gemini/openai-compat 的落地方式，请汇总方裁定后再实施。
