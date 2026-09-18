@@ -1,5 +1,4 @@
 .agentscope
 agents
-memory
 /target/**
 /MEMORY.md
