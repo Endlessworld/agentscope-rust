@@ -1,0 +1,12 @@
+//! Framework adapter SPI + platform adapters, mirroring
+//! `io.agentscope.extensions.aistio.adapter`.
+
+mod framework_adapter;
+
+pub use framework_adapter::{
+    CommandOutcome, FrameworkAdapter, CAP_AGENT_TASK, CAP_CONTEXT_QUERY, CAP_CONVERSATION_INBOUND,
+    CAP_EXPORT_TRANSCRIPT, CAP_MESSAGE_QUERY, CAP_PLAN_MODE, CAP_SESSION_ABORT,
+    CAP_SESSION_COMMAND, CAP_SUBAGENT_INVENTORY, CAP_SUBAGENT_TASK_COMMAND,
+    CAP_SUBAGENT_TASK_QUERY, CAP_TASK_QUERY, CAP_WORKSPACE_INVENTORY, COMMAND_ABORT,
+    COMMAND_COMPRESS, COMMAND_TERMINATE,
+};

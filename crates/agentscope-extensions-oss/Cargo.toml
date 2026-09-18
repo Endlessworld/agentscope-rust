@@ -1,0 +1,31 @@
+﻿[package]
+name = "agentscope-extensions-oss"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Enables the concrete Alibaba Cloud OSS backend. Off by default so the crate
+# builds without pulling the SDK; the trait-based surface (OssClient) is always
+# available and testable.
+aliyun = ["dep:aliyun-oss-rust-sdk"]
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# Optional concrete backend (feature `aliyun`).
+aliyun-oss-rust-sdk = { version = "0.0.4", optional = true, default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+

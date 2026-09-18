@@ -494,7 +494,7 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
         // 工具结果外置：超过 80k 字符的工具输出（如构建日志）写入磁盘，
         // context 只保留预览占位符，避免大输出驻留内存。
         .tool_result_eviction(ToolResultEvictionConfig::defaults())
-        .max_iters(50);
+        .max_iters(9999);
 
     // Skill support (Open Agent Skills protocol, mirrors Java commit b906d1b):
     // - global:   $HOME/.agents/skills   (installed via `npx skill` globally)

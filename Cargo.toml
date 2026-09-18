@@ -3,6 +3,27 @@ resolver = "2"
 members = [
     "crates/agentscope-core",
     "crates/agentscope-harness",
+    # agentscope-extensions/* 迁移 crate（每个 crate 由 docs/extensions/<MODULE>__GAP_TRACKER.md 跟踪）
+    "crates/agentscope-extensions-model",
+    "crates/agentscope-extensions-protocol",
+    "crates/agentscope-extensions-rag",
+    "crates/agentscope-extensions-sandbox",
+    "crates/agentscope-extensions-channel",
+    "crates/agentscope-extensions-mem",
+    "crates/agentscope-extensions-jdbc",
+    "crates/agentscope-extensions-redis",
+    "crates/agentscope-extensions-mongodb",
+    "crates/agentscope-extensions-mysql",
+    "crates/agentscope-extensions-postgresql",
+    "crates/agentscope-extensions-cos",
+    "crates/agentscope-extensions-oss",
+    "crates/agentscope-extensions-aistio",
+    "crates/agentscope-extensions-studio",
+    "crates/agentscope-extensions-skills",
+    "crates/agentscope-extensions-scheduler",
+    "crates/agentscope-extensions-training",
+    "crates/agentscope-extensions-nacos",
+    "crates/agentscope-extensions-higress",
 ]
 
 [workspace.package]

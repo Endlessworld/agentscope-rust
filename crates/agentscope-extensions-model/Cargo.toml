@@ -1,0 +1,24 @@
+﻿[package]
+name = "agentscope-extensions-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# 本 crate 新增依赖（用具体版本号，见 docs/extensions/MODEL__GAP_TRACKER.md §4.2）
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+base64 = "0.22"
+async-stream = "0.3"
+

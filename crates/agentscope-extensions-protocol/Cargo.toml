@@ -1,0 +1,30 @@
+﻿[package]
+name = "agentscope-extensions-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# HTTP 客户端/服务端（A2A / agent-protocol / chat-completions-web）
+reqwest = { workspace = true }
+axum = { version = "0.7", default-features = false, features = ["json", "tokio", "http1", "query"] }
+http = "1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+

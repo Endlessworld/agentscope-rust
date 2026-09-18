@@ -1,0 +1,31 @@
+﻿[package]
+name = "agentscope-extensions-postgresql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Default build is dependency-light so the crate compiles/tests without a live
+# PostgreSQL server. Enable `postgres-driver` to pull in the real `tokio-postgres`
+# adapter (`PgSimpleClient`).
+default = []
+postgres-driver = ["dep:tokio-postgres", "dep:bytes", "tokio/rt-multi-thread"]
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Real PostgreSQL driver (optional, feature = "postgres-driver").
+tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+bytes = { version = "1", optional = true }
+

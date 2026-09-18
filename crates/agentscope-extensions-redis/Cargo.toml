@@ -1,0 +1,22 @@
+﻿[package]
+name = "agentscope-extensions-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+# Redis driver (not in workspace.dependencies — recorded in REDIS__GAP_TRACKER §4.2)
+redis = { version = "1.7", default-features = false, features = ["script", "tokio-comp", "connection-manager"] }
+

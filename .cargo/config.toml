@@ -1,0 +1,7 @@
+# 构建配置：禁用 incremental 编译。
+# 原因：本仓库目标盘（E:）容量紧张，target/debug/incremental 曾累积 ~19.5GB
+# 导致 `os error 112` / rustc-LLVM IO failure 的假编译失败（见
+# docs/extensions/EXTENSIONS_GAP_TRACKER.md §3.2）。
+# 如需恢复默认行为，删除本文件或改为 incremental = true。
+[build]
+incremental = false

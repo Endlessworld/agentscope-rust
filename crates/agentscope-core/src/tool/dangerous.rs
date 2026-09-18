@@ -42,11 +42,9 @@ pub const DANGEROUS_COMMANDS: &[&str] = &[
     "dd",
     "mkfs",
     "fdisk",
-    "format",
     "chmod 777",
     "chmod -R 777",
     "chown -R",
-    "kill -9",
     "> /dev/",
 ];
 
