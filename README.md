@@ -82,7 +82,8 @@ cargo build --profile embedded -p agentscope-harness --no-default-features --fea
 体积优化（嵌入式场景）：
 
 ```bash
-cargo build --profile embedded --no-default-features --features lite
+#构建cli 和acp_harness_agent
+cargo build --profile embedded -p agentscope-harness --no-default-features --features lite --example acp_agent_cli --example acp_harness_agent
 ```
 
 - 默认 feature `rusqlite`：启用工作区 SQLite 索引；
@@ -146,7 +147,7 @@ cargo run -p agentscope-harness --example acp_harness_agent
 cargo run -p agentscope-harness --example acp_agent_cli
 ```
 
-模型集中在 `~/.agentscope/models.json`（首次运行自动生成，含默认 provider 与模型列表），
+模型集中在 `~/.agentscope/models.json`（首次运行自动生成，含默认 provider 与模型列表；解析为宽松模式，允许 `//`、`/* */` 注释与尾随逗号，文件已存在时不会被覆写），
 环境变量可临时覆盖配置：
 
 | 变量 | 说明 |

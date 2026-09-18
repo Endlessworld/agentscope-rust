@@ -224,56 +224,26 @@ fn acp_confirm_handler(
 }
 
 
-/// Maps a thought level to per-call generation defaults for the given model.
+/// Maps a thought level to per-call generation defaults.
 ///
-/// - `auto` (default): sends nothing — the provider default applies. This is
-///   the only safe choice for models whose gateway rejects unknown params.
-/// - OpenAI o-series / gpt-5 family: `reasoning_effort` (official field).
-/// - Other OpenAI-compatible vendors (DeepSeek/GLM/Qwen/…): vendor-specific
-///   body params. `disabled` turns thinking off; explicit levels enable it
-///   with a budget. `max` is clamped to `high` for OpenAI (no `xhigh`).
-fn thought_level_params(level: &str, model_name: &str) -> GenerateOptions {
+/// - `auto` (default): sends nothing — the provider default applies.
+/// - Any explicit level: `reasoning_effort` (the official field), `max`
+///   clamped to `high` (no `xhigh`).
+///
+/// Vendor-specific body params (`enable_thinking` / `thinking_budget`) are
+/// never sent: strict OpenAI-compatible gateways (e.g. the Go/Zen gateways)
+/// validate the body and reject unknown fields with
+/// `json: unknown field "thinking_budget"`.
+fn thought_level_params(level: &str) -> GenerateOptions {
     if level == "auto" || level.is_empty() {
         return GenerateOptions::default();
     }
-    let mut opts = GenerateOptions::builder();
-    let m = model_name.to_ascii_lowercase();
-    if m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
-        || m.starts_with("gpt-5")
-    {
-        // Official OpenAI reasoning-effort field.
-        let effort = match level {
-            "disabled" | "none" => "minimal",
-            "max" => "high",
-            other => other,
-        };
-        opts = opts.reasoning_effort(effort);
-    } else {
-        // OpenAI-compatible vendors: enable/disable thinking via body params.
-        // Unknown vendors simply ignore these keys.
-        match level {
-            "disabled" | "none" => {
-                opts = opts
-                    .additional_body_param("enable_thinking", serde_json::json!(false))
-                    .additional_body_param("thinking_budget", serde_json::json!(0));
-            }
-            "low" | "medium" | "high" | "max" => {
-                let budget = match level {
-                    "low" => 2048,
-                    "medium" => 8192,
-                    "high" => 24576,
-                    _ => 32768,
-                };
-                opts = opts
-                    .additional_body_param("enable_thinking", serde_json::json!(true))
-                    .additional_body_param("thinking_budget", serde_json::json!(budget));
-            }
-            _ => return GenerateOptions::default(),
-        }
-    }
-    opts.build()
+    let effort = match level {
+        "disabled" | "none" => "minimal",
+        "max" => "high",
+        other => other,
+    };
+    GenerateOptions::builder().reasoning_effort(effort).build()
 }
 
 /// A single ACP session backed by a [`HarnessAgent`].
@@ -389,19 +359,10 @@ impl AcpAgentSession {
     /// agent per prompt with the new config).
     fn apply_session_config(&mut self) -> Vec<String> {
         // Thought level -> per-call generation defaults. `auto` sends nothing
-        // (provider default); explicit levels are mapped per model capability:
-        // OpenAI o/gpt-5 family -> `reasoning_effort`; other OpenAI-compatible
-        // vendors -> vendor-specific body params (e.g. `enable_thinking`).
+        // (provider default); explicit levels send only `reasoning_effort`
+        // (see `thought_level_params`).
         let level = self.config.lock().unwrap().thought_level.clone();
-        // Read through the embedded ReAct agent so a dynamically switched
-        // model (set_model) is reflected here; HarnessAgent::model() still
-        // holds the builder-time model.
-        let model_name = self
-            .agent
-            .agent()
-            .map(|a| a.model().model_name().to_string())
-            .unwrap_or_default();
-        let opts = thought_level_params(&level, &model_name);
+        let opts = thought_level_params(&level);
         self.agent.set_generate_options_defaults(opts);
 
         // Dynamic model switching (next prompt). Failures are returned so the
@@ -849,5 +810,38 @@ impl AcpAgentSession {
             self.session_id.clone(),
             SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thought_level_params;
+
+    #[test]
+    fn auto_sends_nothing() {
+        let opts = thought_level_params("auto");
+        assert!(opts.reasoning_effort.is_none());
+        assert!(opts.additional_body_params.is_empty());
+    }
+
+    /// Regression: a strict OpenAI-compatible gateway rejects vendor-specific
+    /// body params with `json: unknown field "thinking_budget"`, so explicit
+    /// levels must send `reasoning_effort` *only*.
+    #[test]
+    fn explicit_levels_send_only_reasoning_effort() {
+        for (level, expected) in [
+            ("disabled", Some("minimal")),
+            ("low", Some("low")),
+            ("medium", Some("medium")),
+            ("high", Some("high")),
+            ("max", Some("high")),
+        ] {
+            let opts = thought_level_params(level);
+            assert_eq!(opts.reasoning_effort.as_deref(), expected, "level {level}");
+            assert!(
+                opts.additional_body_params.is_empty(),
+                "level {level} must not add body params"
+            );
+        }
     }
 }

@@ -27,28 +27,50 @@
 //! 所有模型通过 `$HOME/.agentscope/models.json` 配置文件管理。
 //! 首次运行时若该文件不存在，会自动写入包含以下默认配置的 JSON 文件：
 //!
+//! 解析采用**宽容模式**：允许 `//` 行注释、`/* */` 块注释、尾随逗号，
+//! 以及任意换行 / 缩进 / 空行（换行空白 serde_json 本就支持），方便手工编辑；
+//! 文件已存在时永远不会被覆写（即使语法出错）。
+//!
 //! ```json
 //! {
 //!   "default_provider": "opencode",
 //!   "default_model": "mimo-v2.5-free",
 //!   "providers": {
 //!     "opencode": {
-//!       "base_url": "https://opencode.ai/zen",
+//!       "base_url": "https://opencode.ai/zen/v1",
 //!       "api_key": "public",
-//!       "models": [
-//!         "mimo-v2.5-free",
-//!         "ling-3.0-flash-fin-free",
-//!         "nemotron-3-ultra-free",
-//!         "nemotron-3.5-lightning-free",
-//!         "muse-spark-1.3-contributor-free",
-//!         "muse-spark-1.2-contributor-free"
-//!       ]
+//!       "models": {
+//!         "completions": [
+//!           "mimo-v2.5-free",
+//!           "ling-3.0-flash-fin-free",
+//!           "nemotron-3-ultra-free",
+//!           "nemotron-3.5-lightning-free"
+//!         ],
+//!         "responses": [
+//!           "muse-spark-1.3-contributor-free",
+//!           "muse-spark-1.2-contributor-free"
+//!         ]
+//!       }
 //!     }
 //!   }
 //! }
 //! ```
 //!
-//! 用户可在此基础上自由增加新的模型服务提供者（provider）和对应的模型列表。
+//! # 端点协议分组
+//!
+//! 同一供应商下不同模型可能走不同端点，因此 `models` 按协议分组，
+//! 三个 key 与端点后缀一一对应（缺省组可省略）：
+//!
+//! | key | 端点 | 适用模型 |
+//! | --- | --- | --- |
+//! | `completions` | `POST {base_url}/chat/completions` | glm / kimi / deepseek / mimo / hy / longcat |
+//! | `messages` | `POST {base_url}/messages` | minimax / qwen（Anthropic 协议） |
+//! | `responses` | `POST {base_url}/responses` | grok / gpt / muse-spark |
+//!
+//! `base_url` 始终只写到版本前缀（如 `https://opencode.ai/zen/go/v1`），
+//! 端点后缀由协议决定，不要写进 `base_url`。
+//!
+//! 用户可在此基础上自由增加新的模型服务提供者（provider）和对应的模型分组。
 //!
 //! 环境变量可临时覆盖配置文件中的值：
 //! - `CODING_PROVIDER`  — 覆盖 default_provider
@@ -60,8 +82,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentscope_core::model::provider::ModelCreationContext;
-use agentscope_core::model::{GenerateOptions, Model, OpenAiChatModel};
+use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
+use agentscope_core::model::{
+    AnthropicMessagesModel, GenerateOptions, Model, OpenAiChatModel, OpenAiResponsesModel,
+};
 use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};
 use agentscope_harness::acp::config::ModelChoice;
@@ -75,6 +99,71 @@ use serde::{Deserialize, Serialize};
 // 模型配置 (JSON)
 // ---------------------------------------------------------------------------
 
+/// 按端点协议分组的模型列表。
+///
+/// 同一供应商下不同模型可能走不同端点，因此模型按协议分组：
+///
+/// ```json
+/// "models": {
+///   "completions": ["glm-5.3", "kimi-k3"],
+///   "messages":    ["minimax-m3", "qwen3.8-max"],
+///   "responses":   ["grok-4.6", "gpt-5.6-luna"]
+/// }
+/// ```
+///
+/// 三个 key 与端点后缀一一对应，缺省组可省略。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelsSpec {
+    /// `POST {base_url}/chat/completions`（OpenAI Chat Completions）。
+    #[serde(default)]
+    pub completions: Vec<String>,
+    /// `POST {base_url}/messages`（Anthropic Messages）。
+    #[serde(default)]
+    pub messages: Vec<String>,
+    /// `POST {base_url}/responses`（OpenAI Responses）。
+    #[serde(default)]
+    pub responses: Vec<String>,
+}
+
+impl ModelsSpec {
+    /// Iterates every configured model together with its wire protocol.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, ApiProtocol)> {
+        self.completions
+            .iter()
+            .map(|m| (m.as_str(), ApiProtocol::ChatCompletions))
+            .chain(
+                self.messages
+                    .iter()
+                    .map(|m| (m.as_str(), ApiProtocol::Messages)),
+            )
+            .chain(
+                self.responses
+                    .iter()
+                    .map(|m| (m.as_str(), ApiProtocol::Responses)),
+            )
+    }
+
+    /// Whether the given model id is listed under any protocol.
+    pub fn contains(&self, model: &str) -> bool {
+        self.iter().any(|(m, _)| m == model)
+    }
+
+    /// Whether no model is configured at all.
+    pub fn is_empty(&self) -> bool {
+        self.completions.is_empty() && self.messages.is_empty() && self.responses.is_empty()
+    }
+}
+
+/// A resolved model endpoint: model id + base URL + credentials + wire protocol.
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    /// Model id to send on the wire.
+    pub model_id: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub protocol: ApiProtocol,
+}
+
 /// 单个模型服务提供者（如 opencode、openai、custom）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProviderConfig {
@@ -82,8 +171,8 @@ pub struct ModelProviderConfig {
     pub base_url: String,
     /// API 密钥（部分免费服务可填 `"public"`）。
     pub api_key: String,
-    /// 该提供者下可用的模型 ID 列表。
-    pub models: Vec<String>,
+    /// 该提供者下可用的模型，按端点协议分组。
+    pub models: ModelsSpec,
 }
 
 /// 顶层模型配置文件结构。
@@ -107,22 +196,27 @@ impl Default for ModelConfig {
     fn default() -> Self {
         let mut providers = HashMap::new();
         providers.insert(
-            "opencode".to_string(),
+            "Zen".to_string(),
             ModelProviderConfig {
                 base_url: "https://opencode.ai/zen/v1".to_string(),
                 api_key: "public".to_string(),
-                models: vec![
-                    "mimo-v2.5-free".to_string(),
-                    "ling-3.0-flash-fin-free".to_string(),
-                    "nemotron-3-ultra-free".to_string(),
-                    "nemotron-3.5-lightning-free".to_string(),
-                    "muse-spark-1.3-contributor-free".to_string(),
-                    "muse-spark-1.2-contributor-free".to_string(),
-                ],
+                models: ModelsSpec {
+                    completions: vec![
+                        "big-pickle".to_string(),
+                        "mimo-v2.5-free".to_string(),
+                        "ling-3.0-flash-fin-free".to_string(),
+                        "nemotron-3-ultra-free".to_string(),
+                        "nemotron-3.5-lightning-free".to_string(),
+                    ],
+                    messages: vec![],
+                    responses: vec![
+                        "muse-spark-1.3-contributor-free".to_string(),
+                    ],
+                },
             },
         );
         Self {
-            default_provider: "opencode".to_string(),
+            default_provider: "Zen".to_string(),
             default_model: "mimo-v2.5-free".to_string(),
             providers,
         }
@@ -138,26 +232,48 @@ impl ModelConfig {
         Some(home.join(".agentscope").join("models.json"))
     }
 
-    /// 加载配置文件；若不存在则创建默认配置并写入磁盘。
+    /// 加载配置文件；仅当文件**不存在**时才创建默认配置并写入磁盘。
+    ///
+    /// 注意：文件已存在但内容无法解析时（例如编辑时引入的语法错误，或
+    /// Windows 编辑器写入的 UTF-8 BOM）**不会覆写原文件**——本次运行回退
+    /// 到内置默认值并打印告警，避免用户的自定义配置被静默丢弃。
+    ///
+    /// 解析前会做宽容预处理（剥离注释与尾随逗号），因此配置文件中可以
+    /// 写 `//` / `/* */` 注释和多余逗号。
     pub fn load_or_create() -> Self {
-        match Self::try_load() {
-            Some(cfg) => cfg,
-            None => {
-                let cfg = Self::default();
-                cfg.save();
-                cfg
+        let Some(path) = Self::default_path() else {
+            return Self::default();
+        };
+        if path.exists() {
+            if let Some(cfg) = Self::try_load(&path) {
+                return cfg;
             }
+            eprintln!(
+                "[model-config] warning: failed to parse {}; keeping the file \
+                 unchanged and using built-in defaults for this run",
+                path.display()
+            );
+            return Self::default();
         }
+        let cfg = Self::default();
+        cfg.save();
+        cfg
     }
 
-    /// 尝试从磁盘加载配置文件，文件不存在或解析失败时返回 `None`。
-    fn try_load() -> Option<Self> {
-        let path = Self::default_path()?;
-        if !path.exists() {
-            return None;
+    /// 尝试从磁盘加载配置文件，读取或解析失败时返回 `None`。
+    ///
+    /// 先按严格 JSON 解析；失败时再做一次宽容预处理（剥离注释与尾随逗号）
+    /// 后重试，使手工编辑的配置允许 `//`、`/* */` 注释和多余逗号。
+    /// 任意换行 / 缩进 / 空行 serde_json 本就支持，无需特殊处理。
+    fn try_load(path: &std::path::Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        // 容忍编辑器（尤其 Windows 记事本）写入的 UTF-8 BOM，
+        // 否则 serde_json 会解析失败并被误判为“配置文件无效”。
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        if let Ok(cfg) = serde_json::from_str::<Self>(content) {
+            return Some(cfg);
         }
-        let content = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
+        serde_json::from_str(&sanitize_json(content)).ok()
     }
 
     /// 将当前配置写入磁盘（覆盖已有文件）。目录不存在时自动创建。
@@ -193,7 +309,7 @@ impl ModelConfig {
     /// 查找优先级：
     /// 1. 环境变量 `CODING_PROVIDER` + `CODING_MODEL_ID`（覆盖配置文件）
     /// 2. 配置文件中的 default_provider / default_model
-    pub fn resolve(&self) -> (String, String, String) {
+    pub fn resolve(&self) -> ResolvedModel {
         // 1. 环境变量覆盖
         let provider_name = std::env::var("CODING_PROVIDER")
             .ok()
@@ -217,7 +333,13 @@ impl ModelConfig {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| provider.base_url.clone());
 
-            (base_url, api_key, model_id)
+            let protocol = protocol_for(&provider.models, &model_id);
+            ResolvedModel {
+                model_id,
+                base_url,
+                api_key,
+                protocol,
+            }
         } else {
             eprintln!(
                 "[model-config] warning: provider '{}' not found in config, \
@@ -232,7 +354,12 @@ impl ModelConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "public".to_string());
-            (base_url, api_key, model_id)
+            ResolvedModel {
+                model_id,
+                base_url,
+                api_key,
+                protocol: ApiProtocol::ChatCompletions,
+            }
         }
     }
 
@@ -243,10 +370,10 @@ impl ModelConfig {
     /// 格式）——后者按 `/` 分割取尾段再匹配。
     ///
     /// 环境变量 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 可覆盖查找结果。
-    pub fn resolve_model(&self, model_id: &str) -> Result<(String, String), String> {
+    pub fn resolve_model(&self, model_id: &str) -> Result<ResolvedModel, String> {
         let bare = model_id.rsplit('/').next().unwrap_or(model_id);
         for (_key, provider) in &self.providers {
-            if provider.models.iter().any(|m| m == bare || m == model_id) {
+            if provider.models.contains(bare) || provider.models.contains(model_id) {
                 let api_key = std::env::var("OPENAI_API_KEY")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
@@ -255,7 +382,13 @@ impl ModelConfig {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| provider.base_url.clone());
-                return Ok((base_url, api_key));
+                let protocol = protocol_for(&provider.models, bare);
+                return Ok(ResolvedModel {
+                    model_id: bare.to_string(),
+                    base_url,
+                    api_key,
+                    protocol,
+                });
             }
         }
         Err(format!(
@@ -273,10 +406,10 @@ impl ModelConfig {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for (provider_key, provider) in &self.providers {
-            for id in &provider.models {
-                if seen.insert(id.clone()) {
+            for (id, _protocol) in provider.models.iter() {
+                if seen.insert(id.to_string()) {
                     out.push(ModelChoice {
-                        id: id.clone(),
+                        id: id.to_string(),
                         name: format!("{}/{}", provider_key, id),
                     });
                 }
@@ -284,6 +417,66 @@ impl ModelConfig {
         }
         out
     }
+}
+
+/// 把“类 JSON5”文本预处理为严格 JSON：字符串感知地剥离 `//` 行注释、
+/// `/* */` 块注释，并删除 `}` / `]` 前的尾随逗号。
+///
+/// 仅做这两项变换——字符串内部的 `//`（如 URL `https://…`）与转义引号
+/// 不会被误伤；单引号、无引号 key 等更强的 JSON5 语法不在支持范围。
+fn sanitize_json(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+            // 行注释：跳到行尾（保留换行，便于报错定位）。
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            // 块注释：跳到闭合的 `*/`。
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+        } else if c == ',' {
+            // 尾随逗号：逗号后跳过空白若是 `}` / `]` 则丢弃。
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if matches!(chars.get(j), Some(&'}') | Some(&']')) {
+                i += 1;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -404,16 +597,53 @@ fn build_system_prompt(cwd: &std::path::Path) -> String {
 /// 通过 `ModelCreationContext` 构建模型，并注入外部指定的附加请求头
 ///（如 `x-opencode-session`，用于 OpenCode Go 网关的 prompt-cache 会话路由）。
 /// 会话头取当前 ACP sessionId，同一会话内保持稳定（利于 prompt-cache 命中）。
-fn build_model(model_id: &str, base_url: &str, api_key: &str, session_id: &str) -> OpenAiChatModel {
+fn build_model(
+    model_id: &str,
+    base_url: &str,
+    api_key: &str,
+    protocol: ApiProtocol,
+    session_id: &str,
+) -> Arc<dyn Model> {
     let ctx = ModelCreationContext::new("openai", model_id)
         .api_key(api_key)
         .base_url(base_url)
+        .protocol(protocol)
         .options(
             GenerateOptions::builder()
                 .additional_header("x-opencode-session", session_id)
                 .build(),
         );
-    OpenAiChatModel::from_context(&ctx).expect("failed to build OpenAiChatModel")
+    build_model_for_protocol(&ctx)
+        .unwrap_or_else(|e| panic!("failed to build model for protocol {protocol:?}: {e}"))
+}
+
+/// Dispatches to the concrete [`Model`] implementation matching the context's
+/// wire protocol. `base_url` always stops at the version prefix (e.g.
+/// `https://opencode.ai/zen/go/v1`); the protocol decides the endpoint suffix.
+fn build_model_for_protocol(ctx: &ModelCreationContext) -> Result<Arc<dyn Model>, String> {
+    match ctx.protocol {
+        ApiProtocol::ChatCompletions => OpenAiChatModel::from_context(ctx)
+            .map(|m| Arc::new(m) as Arc<dyn Model>)
+            .map_err(|e| e.to_string()),
+        ApiProtocol::Responses => OpenAiResponsesModel::from_context(ctx)
+            .map(|m| Arc::new(m) as Arc<dyn Model>)
+            .map_err(|e| e.to_string()),
+        ApiProtocol::Messages => AnthropicMessagesModel::from_context(ctx)
+            .map(|m| Arc::new(m) as Arc<dyn Model>)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Looks up the wire protocol a model id is configured under.
+///
+/// Falls back to [`ApiProtocol::ChatCompletions`] when the model is not listed
+/// (e.g. an env-var override pointing at an unlisted model).
+fn protocol_for(models: &ModelsSpec, model_id: &str) -> ApiProtocol {
+    models
+        .iter()
+        .find(|(m, _)| *m == model_id)
+        .map(|(_, p)| p)
+        .unwrap_or(ApiProtocol::ChatCompletions)
 }
 
 /// 构建一个绑定指定 cwd 的完整 `HarnessAgent`（文件系统工具 + shell + 压缩 + skills）。
@@ -431,17 +661,25 @@ fn build_model(model_id: &str, base_url: &str, api_key: &str, session_id: &str) 
 /// `skill_manage` / `propose_skill` tools.
 fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
     let model_config = ModelConfig::load_or_create();
-    let (base_url, api_key, model_id) = model_config.resolve();
+    let resolved = model_config.resolve();
+    let (base_url, api_key, model_id, protocol) = (
+        resolved.base_url,
+        resolved.api_key,
+        resolved.model_id,
+        resolved.protocol,
+    );
 
     eprintln!(
-        "[model-config] using provider model='{}', base_url='{}', api_key='{}...'",
+        "[model-config] using provider model='{}', base_url='{}', api_key='{}...', protocol='{}'",
         model_id,
         base_url,
         &api_key[..api_key.len().min(8)],
+        protocol.label(),
     );
 
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
-    let model: Arc<dyn Model> = Arc::new(build_model(&model_id, &base_url, &api_key, session_id));
+    let model: Arc<dyn Model> =
+        build_model(&model_id, &base_url, &api_key, protocol, session_id);
     // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
     // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
     let resolver_session = session_id.to_string();
@@ -454,10 +692,14 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
         // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
         .model_resolver(move |model_id: &str| {
             let cfg = ModelConfig::load_or_create();
-            let (base_url, api_key) = cfg.resolve_model(model_id).ok()?;
-            let model: Arc<dyn Model> =
-                Arc::new(build_model(model_id, &base_url, &api_key, &resolver_session));
-            Some(model)
+            let resolved = cfg.resolve_model(model_id).ok()?;
+            Some(build_model(
+                model_id,
+                &resolved.base_url,
+                &resolved.api_key,
+                resolved.protocol,
+                &resolver_session,
+            ))
         })
         .cwd(cwd.clone())
         .workspace(workspace)
@@ -575,14 +817,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("agentscope-coding-agent")
         .model_factory(|cwd, sid| build_agent(cwd, sid))
         // Dynamic model switching: resolve the selected model id against the
-        // config file (provider lookup) and build a fresh OpenAiChatModel.
+        // config file (provider lookup + protocol) and build a fresh model.
         // Takes effect on the next prompt; conversation state is preserved.
         .model_builder(move |model_id, session_id| {
             let cfg = ModelConfig::load_or_create();
-            let (base_url, api_key) = cfg.resolve_model(model_id)?;
-            let model: Arc<dyn Model> =
-                Arc::new(build_model(model_id, &base_url, &api_key, session_id));
-            Ok(model)
+            let resolved = cfg.resolve_model(model_id)?;
+            Ok(build_model(
+                model_id,
+                &resolved.base_url,
+                &resolved.api_key,
+                resolved.protocol,
+                session_id,
+            ))
         })
         .modes(modes)
         .models(models)

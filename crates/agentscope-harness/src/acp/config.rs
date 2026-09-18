@@ -45,8 +45,8 @@ pub struct ModeChoice {
 pub const CONFIG_THOUGHT_LEVEL: &str = "thought_level";
 
 /// Default thought level: `auto` sends no reasoning parameter at all
-/// (the model/provider default applies). Explicit levels are mapped
-/// per-model-capability in `session::thought_level_params`.
+/// (the model/provider default applies). Explicit levels are mapped to
+/// `reasoning_effort` in `session::thought_level_params`.
 pub const DEFAULT_THOUGHT_LEVEL: &str = "auto";
 
 /// The available thought-level choices, mirroring Java `ThoughtLevel`:

@@ -33,7 +33,7 @@ rust-mcp-transport = { version = "1.0.0", default-features = false, features = [
 
 # `unstable_tool_call_name` exposes the programmatic `name` field on tool calls;
 # clients that do not know it simply ignore it.
-agent-client-protocol = { path = "E:/local-github/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0", features = ["unstable_tool_call_name"] }
+agent-client-protocol = { path = "D:/IdeaProjects/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0", features = ["unstable_tool_call_name"] }
 
 [[example]]
 name = "acp_agent_cli"

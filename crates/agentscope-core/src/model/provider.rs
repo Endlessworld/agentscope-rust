@@ -16,6 +16,48 @@ use crate::model::model::Model;
 /// Provider id for the default OpenAI-compatible provider shipped in-core.
 pub const DEFAULT_PROVIDER_ID: &str = "openai";
 
+/// Provider id for the OpenAI Responses (`/responses`) provider.
+pub const RESPONSES_PROVIDER_ID: &str = "openai-responses";
+
+/// Provider id for the Anthropic Messages (`/messages`) provider.
+pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
+
+/// The wire protocol an API endpoint speaks.
+///
+/// This is an independent dimension from the base URL: `base_url` only carries
+/// the host + version prefix (e.g. `https://opencode.ai/zen/go/v1`), while the
+/// protocol decides which path suffix and payload shape is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiProtocol {
+    /// OpenAI Chat Completions: `POST {base_url}/chat/completions`.
+    #[default]
+    ChatCompletions,
+    /// OpenAI Responses: `POST {base_url}/responses`.
+    Responses,
+    /// Anthropic Messages: `POST {base_url}/messages`.
+    Messages,
+}
+
+impl ApiProtocol {
+    /// The path suffix appended to `base_url` for this protocol.
+    pub fn endpoint_suffix(&self) -> &'static str {
+        match self {
+            ApiProtocol::ChatCompletions => "/chat/completions",
+            ApiProtocol::Responses => "/responses",
+            ApiProtocol::Messages => "/messages",
+        }
+    }
+
+    /// A short lowercase label used in logs and CLI output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ApiProtocol::ChatCompletions => "completions",
+            ApiProtocol::Responses => "responses",
+            ApiProtocol::Messages => "messages",
+        }
+    }
+}
+
 /// Creation parameters for instantiating a concrete model, mirroring the Java
 /// `ModelCreationContext`.
 #[derive(Debug, Clone, Default)]
@@ -30,6 +72,8 @@ pub struct ModelCreationContext {
     pub base_url: Option<String>,
     /// Endpoint path override (defaults to `/chat/completions`).
     pub endpoint_path: Option<String>,
+    /// Wire protocol of the endpoint (defaults to [`ApiProtocol::ChatCompletions`]).
+    pub protocol: ApiProtocol,
     /// Whether to stream by default.
     pub stream: Option<bool>,
     /// Enable reasoning/thinking if the model supports it.
@@ -62,6 +106,10 @@ impl ModelCreationContext {
     }
     pub fn endpoint_path(mut self, v: impl Into<String>) -> Self {
         self.endpoint_path = Some(v.into());
+        self
+    }
+    pub fn protocol(mut self, v: ApiProtocol) -> Self {
+        self.protocol = v;
         self
     }
     pub fn enable_thinking(mut self, v: bool) -> Self {
@@ -154,6 +202,7 @@ impl ModelRegistry {
                 api_key: base.api_key,
                 base_url: base.base_url,
                 endpoint_path: base.endpoint_path,
+                protocol: base.protocol,
                 stream: base.stream,
                 enable_thinking: base.enable_thinking,
                 cache_policy: base.cache_policy,
@@ -173,6 +222,7 @@ impl ModelRegistry {
                     api_key: base.api_key,
                     base_url: base.base_url,
                     endpoint_path: base.endpoint_path,
+                    protocol: base.protocol,
                     stream: base.stream,
                     enable_thinking: base.enable_thinking,
                     cache_policy: base.cache_policy,

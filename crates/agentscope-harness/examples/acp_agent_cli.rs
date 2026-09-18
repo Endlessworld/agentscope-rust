@@ -503,23 +503,27 @@ fn list_models() {
 
     println!("[model] available models (default: {default_model}):");
     for (name, provider) in providers {
-        let models = provider
-            .get("models")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m.as_str())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if models.is_empty() {
-            println!("  {name}: (no models)");
-            continue;
+        // Models are grouped by wire protocol:
+        // `{ "completions": [...], "messages": [...], "responses": [...] }`.
+        let grouped = provider.get("models").and_then(|v| v.as_object());
+        let mut printed_any = false;
+        if let Some(groups) = grouped {
+            for group in ["completions", "messages", "responses"] {
+                let Some(models) = groups.get(group).and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for m in models.iter().filter_map(|m| m.as_str()) {
+                    if !printed_any {
+                        println!("  {name}:");
+                        printed_any = true;
+                    }
+                    let mark = if m == default_model { " *" } else { "" };
+                    println!("    - {m} ({group}){mark}");
+                }
+            }
         }
-        println!("  {name}:");
-        for m in models {
-            let mark = if m == default_model { " *" } else { "" };
-            println!("    - {m}{mark}");
+        if !printed_any {
+            println!("  {name}: (no models)");
         }
     }
 }

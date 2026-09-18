@@ -179,3 +179,70 @@
 - **教训**：洋葱式 middleware 链的 core 闭包**必须消费上游传入的 input**；一旦
   “提前求值 + 忽略参数”，中间件会静默失效（无编译错误、无告警、单测也可能全绿，
   因为中间件单测通常直接调用 `mw.on_reasoning(...)`）。给中间件写测试要端到端（真跑 agent + 记录模型）。
+
+## 2026-09-19：async-openai 0.41.3 实际支持的端点（核实结论）
+
+- **`/chat/completions`**：已用（`chat-completion` feature，`chat().create_stream_byot`）。
+- **`/responses`：原生支持**。feature `responses` + `response-types`；
+  `src/responses/responses_.rs` 的 `create`/`create_stream` 路径为 `{api_base}/responses`，
+  返回 `ResponseStream`（`ResponseStreamEvent`）。**无需自研 HTTP**。
+- **`/messages`：不支持**。crate 内无 Anthropic Messages 协议实现 → 必须 `reqwest` + 手写 SSE 解析。
+- `OpenAIConfig::url()` = `format!("{api_base}{path}")`（`config.rs:219`），所以 base_url 只写到 `/v1`，
+  端点后缀由各协议客户端内部拼。
+- **教训**：设计前先翻依赖源码（`~/.cargo/registry/src/.../async-openai-0.41.3`）确认能力，
+  不要凭“只支持 chat/completions”的旧印象下结论——会多写一个不必要的自研 Responses 客户端。
+
+## 2026-09-19：`async-anthropic` 0.6.0 能力（已下载 crate 源码核实）
+
+- 来源 `https://static.crates.io/crates/async-anthropic/async-anthropic-0.6.0.crate`（MIT，2026-08）。
+- `Client` 是 `derive_builder` 结构体，字段：`http_client: reqwest::Client` / `base_url` / `api_key: SecretString` /
+  `version`（默认 `2023-06-01`）/ `beta: Option<String>` / `backoff`。→ **可自定义 base_url + 注入带自定义 header 的 reqwest client**。
+- `messages().create_stream(req) -> CreateMessagesResponseStream`；`create(req)` 走非流式。
+- 工具调用完整：`CreateMessagesRequest.tools: Option<Vec<serde_json::Map>>`、`tool_choice`、
+  `MessageContent::{ToolUse, ToolResult}`、`Message::tool_uses()`、`ToolChoice::{Auto,Any,Tool(name)}`。
+- `format_url` = `{base_url}/{path}`，`messages.rs` 硬编码 `/v1/messages` → base_url 只写到 `/v1` 即可。
+- 流式事件枚举 `MessagesStreamEvent`：`message_start`/`content_block_start`/`content_block_delta`/
+  `content_block_stop`/`message_delta`/`message_stop`。
+- **依赖冲突提醒**：async-anthropic 用 `reqwest 0.12`，async-openai 0.41 用 `reqwest 0.13` → 双版本共存。
+- **教训**：选第三方 SDK 前先下载 crate 源码看 `client.rs`/`types.rs`，比翻 docs.rs（文档覆盖率仅 18%）可靠得多。
+
+## 2026-09-19：多端点改造落地要点（responses / anthropic）
+
+- **byot 宏**：`#[crate::byot]` 会生成 `xxx_byot` 泛型版本，但**原方法仍然保留**。所以
+  `client.responses().create_stream(req)` 可直接用，无需 `create_stream_byot`（后者仅在需要自定义
+  SSE chunk 类型时才用，如 openai.rs 为了拿 `reasoning_content`）。
+- **async-openai responses 关键类型**（`types::responses`）：`CreateResponse` 全 pub + Default；
+  `InputParam::Items(Vec<InputItem>)`；`InputItem::{EasyMessage, Item}`；`Item::{FunctionCall, FunctionCallOutput}`；
+  `Tool::Function(FunctionTool{parameters: Option<Value>})`；`ToolChoiceParam::Mode(ToolChoiceOptions)`；
+  事件 `ResponseStreamEvent::{ResponseOutputTextDelta, ResponseReasoningTextDelta,
+  ResponseFunctionCallArgumentsDelta/Done, ResponseOutputItemAdded, ResponseCompleted, ResponseError}`；
+  `Response { id, usage: Option<ResponseUsage>, status: Status, output }`。
+- **async-anthropic 关键陷阱**：
+  1. `ClientBuilder` 的 setter 是 `&mut self`（derive_builder 默认），不能 `Client::builder().a().b()` 链式
+     —— 临时值会被 drop。必须先 `let mut b = Client::builder(); b.x();`。
+  2. `messages().create_stream()` 直接返回 stream（不是 `Result<Stream>`）。
+  3. `ContentBlockDelta` 只有 `TextDelta`/`InputJsonDelta`，**无 thinking_delta** → Anthropic 链路不产 ThinkingBlock。
+  4. `MessageStart` 有 7 个字段（含 `stop_sequence`/`usage`），测试构造时易漏。
+  5. system 是**顶层字段**不是 message；tool_result 必须放在 **user** 消息里。
+- **reqwest 双版本共存验证通过**：async-anthropic 用 0.12、async-openai 0.41 用 0.13，同时编译无冲突。
+- **环境坑**：本机 `cargo test --workspace` 会因页面文件不足报 `os error 1455`（mmap rlib 失败），
+  必须加 `-j 2`。这类报错看起来像代码错误，实际是内存/虚拟内存不足。
+
+## 2026-09-19：acp_harness_agent 模型配置被静默覆写（BOM / 解析失败）
+
+- **现象**：`~/.agentscope/models.json` 已存在且被手工修改，每次运行仍被重置为内置默认。
+- **根因**：`ModelConfig::load_or_create()` 把“文件不存在”与“解析失败”混为一谈——
+  `try_load()` 任一失败（读失败/`serde_json` 解析失败）都返回 `None`，随后无条件 `save()` 写默认值，
+  把用户文件覆盖掉。Windows 编辑器（记事本等）给 UTF-8 加 BOM（`EF BB BF`），`serde_json::from_str`
+  直接报错 → 稳定复现“每次覆写”。
+- **修复**：① 仅当 `path.exists()==false` 时才写默认配置；已存在但解析失败则保持文件原样、
+  打印告警并本次回退内置默认。② `try_load` 读取后 `strip_prefix('\u{feff}')` 容忍 UTF-8 BOM。
+- **验证**（隔离 `HOME` 跑 `acp_harness_agent.exe`）：正常修改✅加载、BOM 修改✅加载、非法 JSON✅保留原文件+告警。
+- **教训**：“首次生成默认配置”类逻辑，写盘必须 gated 在**文件不存在**上，绝不能以解析成功为前提；
+  Windows 下所有读 JSON 配置的入口都应容忍 BOM。
+- **追加（宽松解析）**：`try_load` 先严格解析，失败再经 `sanitize_json` 剥离 `//`、`/* */` 注释与尾随逗号后重试；
+  任意换行/缩进 serde_json 本就支持，无需特殊处理。手写扫描器必须字符串感知（track `in_string`/`escaped`），
+  否则 URL `https://…` 里的 `//` 会被误删。未引入 `json5` 依赖（零新增依赖）。
+- **验证**：带注释+尾逗号的配置 → `model='LENIENT-MODEL'`、`base_url='https://opencode.ai/zen/v1'` 均正确；
+  真语法错误仍保留原文件 + 告警。真值验证手法：用 `Start-Process -RedirectStandardInput`
+  向 ACP agent 发 `initialize`+`session/new`，触发 `build_agent` 打印解析后的 base_url，比只看“无报错”可靠。
