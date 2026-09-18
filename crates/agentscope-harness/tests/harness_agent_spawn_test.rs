@@ -100,7 +100,9 @@ async fn foreground_spawn_returns_subagent_reply() {
         ]),
     )
     .await;
-    assert_eq!(out, "dummy reply from researcher");
+    // Responses carry the agent_key/session header (Java `formatSpawnInfo`) ahead of the reply.
+    assert!(out.ends_with("dummy reply from researcher"), "out: {out}");
+    assert!(out.contains("agent_key: agent:researcher:"), "out: {out}");
 }
 
 #[tokio::test]
@@ -183,7 +185,7 @@ async fn plan_mode_is_propagated_into_child_prompt() {
 
     // Without plan flag → NORMAL.
     let out = run(&tool, args(&[("agent", serde_json::json!("echo")), ("prompt", serde_json::json!("go"))])).await;
-    assert_eq!(out, "NORMAL");
+    assert!(out.ends_with("NORMAL"), "out: {out}");
 
     // With plan_mode_active runtime flag → PLAN.
     let mut ctx = ToolExecutionContext::default();
@@ -195,7 +197,7 @@ async fn plan_mode_is_propagated_into_child_prompt() {
         .call(args(&[("agent", serde_json::json!("echo")), ("prompt", serde_json::json!("go"))]), ctx)
         .await
         .unwrap();
-    assert_eq!(block.text_content(), "PLAN");
+    assert!(block.text_content().ends_with("PLAN"), "out: {}", block.text_content());
 }
 
 #[tokio::test]

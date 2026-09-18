@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentscope_core::agent::{ReActAgent, StreamOptions};
+use agentscope_core::agent::{Agent, CallableAgent, ReActAgent, StreamOptions};
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::Msg;
 use agentscope_core::middleware::MiddlewareChain;
@@ -41,7 +41,10 @@ use super::skill::{
 };
 use super::subagent::task::WorkspaceTaskRepository;
 use super::subagent::task::repository::TaskRepository;
-use super::subagent::SubagentEntry;
+use super::subagent::{
+    CustomSubagentFactory, DefaultAgentManager, SubagentBlueprint, SubagentDeclaration,
+    SubagentEntry,
+};
 use super::team::{TeamClient, TeamContext};
 use super::transcript::{FilesystemTranscriptStore, TranscriptStore};
 use super::workspace::{
@@ -49,8 +52,8 @@ use super::workspace::{
 };
 use super::bus::{MessageBus, WorkspaceMessageBus, WorkspaceAsyncToolRegistry, AsyncToolRegistry};
 use crate::tool::{
-    FilesystemTool, MemoryGetTool, MemorySaveTool, MemorySearchTool, ShellExecuteTool, TeamTool,
-    WebFetchTool, WebSearchTool,
+    AgentListTool, AgentSendTool, AgentSpawnTool, FilesystemTool, MemoryGetTool, MemorySaveTool,
+    MemorySearchTool, ShellExecuteTool, TeamTool, WebFetchTool, WebSearchTool,
 };
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
@@ -335,10 +338,72 @@ impl HarnessAgent {
     }
 }
 
+/// `HarnessAgent` is a first-class agent: invocation and inspection delegate to the
+/// embedded `ReActAgent`, so an `Arc<HarnessAgent>` can be handed to a
+/// `SubagentFactory` (mirrors Java `HarnessAgent implements Agent`).
+impl Agent for HarnessAgent {
+    fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn interrupt(&self) {
+        HarnessAgent::interrupt(self);
+    }
+
+    fn agent_state(&self) -> AgentState {
+        self.agent
+            .as_ref()
+            .map(|a| a.agent_state())
+            .unwrap_or_default()
+    }
+
+    fn toolkit(&self) -> &Toolkit {
+        &self.toolkit
+    }
+}
+
+#[async_trait::async_trait]
+impl CallableAgent for HarnessAgent {
+    async fn call(&self, messages: Vec<Msg>) -> agentscope_core::error::Result<Msg> {
+        match &self.agent {
+            Some(agent) => agent.call(messages).await,
+            None => Err(no_model_error()),
+        }
+    }
+
+    async fn call_with_schema(
+        &self,
+        messages: Vec<Msg>,
+        schema: agentscope_core::formatter::JsonSchema,
+    ) -> agentscope_core::error::Result<Msg> {
+        match &self.agent {
+            Some(agent) => agent.call_with_schema(messages, schema).await,
+            None => Err(no_model_error()),
+        }
+    }
+}
+
+/// Error returned when a `HarnessAgent` was built without a model.
+fn no_model_error() -> agentscope_core::error::Error {
+    agentscope_core::error::Error::Agent(
+        "HarnessAgent has no model configured; cannot run".into(),
+    )
+}
+
 /// Builder for `HarnessAgent`.
 pub struct HarnessAgentBuilder {
     name: Option<String>,
     model: Option<Arc<dyn Model>>,
+    /// Turns a subagent declaration's `model` id into a model (Java `Builder.modelResolver`).
+    model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
     filesystem: Option<Arc<dyn Filesystem>>,
     cwd: Option<PathBuf>,
     distributed_store: Option<DistributedStore>,
@@ -378,7 +443,13 @@ pub struct HarnessAgentBuilder {
     message_bus: Option<Arc<dyn MessageBus>>,
     async_tool_registry: Option<Arc<dyn AsyncToolRegistry>>,
     subagent_entries: Vec<SubagentEntry>,
+    /// Programmatic subagent declarations, materialised into leaf agents at build time.
+    subagent_declarations: Vec<SubagentDeclaration>,
+    /// Caller-supplied subagent factories (`subagent_factory`).
+    subagent_factories: Vec<CustomSubagentFactory>,
     leaf_subagent: bool,
+    /// Explicit base toolkit; harness-registered tools are added on top of it.
+    toolkit: Option<Toolkit>,
     // ---- Skill orchestration fields ----
     project_global_skills_dir: Option<PathBuf>,
     skill_repositories: Vec<Arc<dyn SkillRepository>>,
@@ -423,6 +494,7 @@ impl Default for HarnessAgentBuilder {
         Self {
             name: None,
             model: None,
+            model_resolver: None,
             filesystem: None,
             cwd: None,
             distributed_store: None,
@@ -457,7 +529,10 @@ impl Default for HarnessAgentBuilder {
             message_bus: None,
             async_tool_registry: None,
             subagent_entries: Vec::new(),
+            subagent_declarations: Vec::new(),
+            subagent_factories: Vec::new(),
             leaf_subagent: false,
+            toolkit: None,
             project_global_skills_dir: None,
             skill_repositories: Vec::new(),
             disable_dynamic_skills: false,
@@ -505,6 +580,16 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Sets the resolver used to honour a subagent declaration's `model` override (mirrors Java
+    /// `Builder.modelResolver`). Without one, `decl.model` is ignored and the child inherits the
+    /// parent model.
+    pub fn model_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync + 'static,
+    {
+        self.model_resolver = Some(Arc::new(resolver));
+        self
+    }
     pub fn filesystem(mut self, fs: Arc<dyn Filesystem>) -> Self {
         self.filesystem = Some(fs);
         self
@@ -720,6 +805,54 @@ impl HarnessAgentBuilder {
     /// Registers static subagent entries.
     pub fn subagent_entries(mut self, entries: Vec<SubagentEntry>) -> Self {
         self.subagent_entries = entries;
+        self
+    }
+
+    /// Sets the base toolkit every harness tool is registered onto. Children materialised
+    /// from declarations inherit a (filtered) copy of it (mirrors Java `Builder.toolkit`).
+    pub fn toolkit(mut self, toolkit: Toolkit) -> Self {
+        self.toolkit = Some(toolkit);
+        self
+    }
+
+    /// Adds a subagent declaration, materialised into a leaf agent on spawn
+    /// (mirrors Java `Builder.subagent`).
+    pub fn subagent(mut self, declaration: SubagentDeclaration) -> Self {
+        self.subagent_declarations.push(declaration);
+        self
+    }
+
+    /// Adds several subagent declarations (mirrors Java `Builder.subagents`).
+    pub fn subagents(mut self, declarations: Vec<SubagentDeclaration>) -> Self {
+        self.subagent_declarations.extend(declarations);
+        self
+    }
+
+    /// Adds a fully custom subagent factory for a given agent id, with no description
+    /// (mirrors Java `Builder.subagentFactory(name, factory)`).
+    pub fn subagent_factory<F>(self, name: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn(String) -> Arc<dyn CallableAgent> + Send + Sync + 'static,
+    {
+        self.subagent_factory_with_description(name, "", factory)
+    }
+
+    /// Adds a fully custom subagent factory with the description shown to the orchestrator
+    /// (mirrors Java `Builder.subagentFactory(name, description, factory)`).
+    pub fn subagent_factory_with_description<F>(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        factory: F,
+    ) -> Self
+    where
+        F: Fn(String) -> Arc<dyn CallableAgent> + Send + Sync + 'static,
+    {
+        self.subagent_factories.push(CustomSubagentFactory {
+            name: name.into(),
+            description: description.into(),
+            factory: Arc::new(factory),
+        });
         self
     }
 
@@ -975,8 +1108,9 @@ impl HarnessAgentBuilder {
         let environment = self.environment.clone().unwrap_or_else(|| "prod".to_string());
 
         // Toolkit deep-copy: each agent gets its own toolkit so harness-registered tools
-        // never bleed across builds.
-        let toolkit = Toolkit::new();
+        // never bleed across builds. A caller-supplied base toolkit is copied in first so
+        // subagents declared on it inherit exactly the parent's tools (Java `Builder.toolkit`).
+        let toolkit = self.toolkit.clone().unwrap_or_default();
 
         // ---- Workspace + filesystem orchestration ----
         let workspace_index = WorkspaceIndex::open(&resolved_workspace);
@@ -1109,35 +1243,8 @@ impl HarnessAgentBuilder {
         }
 
         // ---- Subagent orchestration ----
-        let task_repo: Arc<dyn super::subagent::task::TaskRepository> =
-            self.task_repository.clone().unwrap_or_else(|| {
-                Arc::new(WorkspaceTaskRepository::new(
-                    Arc::clone(&filesystem),
-                    agent_id.clone(),
-                ))
-            });
-        if !self.leaf_subagent && !self.disable_subagents && self.model.is_some() {
-            if !self.subagent_entries.is_empty() || !self.disable_dynamic_subagents {
-                if self.disable_dynamic_subagents {
-                    let mw = SubagentsMiddleware::new(self.subagent_entries.clone(), Arc::clone(&task_repo));
-                    for t in mw.get_tools() {
-                        toolkit.register_tool(t);
-                    }
-                    middleware.add(Box::new(mw));
-                } else {
-                    let mw = DynamicSubagentsMiddleware::new(
-                        self.subagent_entries.clone(),
-                        Arc::clone(&task_repo),
-                    )
-                    .with_filesystem(Arc::clone(&filesystem))
-                    .with_main_workspace(resolved_workspace.to_string_lossy().to_string());
-                    for t in mw.get_tools() {
-                        toolkit.register_tool(t);
-                    }
-                    middleware.add(Box::new(mw));
-                }
-            }
-        }
+        // Wired below, after every tool has been registered, so children materialised
+        // from declarations inherit a complete (non-empty) toolkit.
 
         // ---- Skills ----
         let workspace_skills_dir = Some(resolved_workspace.join(".agents").join("skills"));
@@ -1321,6 +1428,114 @@ impl HarnessAgentBuilder {
             let meta = agentscope_core::tool::MetaToolFactory::new(&toolkit)
                 .create_reset_equipped_tools();
             toolkit.register_tool(Arc::new(meta));
+        }
+
+        // ---- Subagent orchestration ----
+        // Mirrors Java `buildStaticSubagentEntries` + `buildDynamicSubagentsMiddleware`:
+        // `general-purpose` is always registered; declarations, custom factories and the
+        // `subagent_entries` escape hatch are materialised into leaf agents; the
+        // spawn/send/list tools are registered on the toolkit, which is complete here.
+        let task_repo: Arc<dyn super::subagent::task::TaskRepository> =
+            self.task_repository.clone().unwrap_or_else(|| {
+                Arc::new(WorkspaceTaskRepository::new(
+                    Arc::clone(&filesystem),
+                    agent_id.clone(),
+                ))
+            });
+        if !self.leaf_subagent && !self.disable_subagents && self.model.is_some() {
+            let blueprint = Arc::new(SubagentBlueprint {
+                model: self.model.clone(),
+                model_resolver: self.model_resolver.clone(),
+                skill_filter: self.skill_filter.clone(),
+                generate_options: self.generate_options_defaults.clone(),
+                // Snapshot taken before the agent tools join the toolkit: a child must not
+                // inherit `agent_spawn`, since it is a leaf worker.
+                toolkit: toolkit.copy(),
+                cwd: self.cwd.clone(),
+                main_workspace: resolved_workspace.clone(),
+                max_iters: if self.max_iters > 0 {
+                    self.max_iters
+                } else {
+                    DEFAULT_MAX_ITERS
+                },
+                state_store: self.state_store.clone().or_else(|| {
+                    self.distributed_store
+                        .as_ref()
+                        .and_then(|d| d.agent_state_store.clone())
+                }),
+            });
+            // --- subagent entries ---
+            let mut entries: Vec<SubagentEntry> = Vec::new();
+            entries.push(SubagentEntry::new(
+                "general-purpose",
+                "General-purpose subagent with same capabilities as the main agent. Use \
+                 for any isolated task that can be fully delegated.",
+                blueprint.general_purpose_factory(),
+            ));
+            for decl in &self.subagent_declarations {
+                if let Some(factory) = blueprint.declared_factory(decl) {
+                    entries.push(
+                        SubagentEntry::new(decl.name.clone(), decl.description.clone(), factory)
+                            .with_declaration(decl.clone()),
+                    );
+                }
+            }
+            for custom in self.subagent_factories {
+                let name = custom.name.clone();
+                let description = custom.display_description().to_string();
+                entries.push(SubagentEntry::new(name, description, Arc::new(custom)));
+            }
+            if self.disable_dynamic_subagents {
+                // The static middleware never re-materialises declarations, so the
+                // `workspace/subagents/*.md` scan happens here (Java `buildSubagentEntries`).
+                let ws = resolved_workspace.to_string_lossy().to_string();
+                let dir = resolved_workspace.join(super::subagent::SUBAGENTS_DIR);
+                for decl in super::subagent::load_from_directory(&dir.to_string_lossy(), Some(&ws)) {
+                    if let Some(factory) = blueprint.declared_factory(&decl) {
+                        entries.push(
+                            SubagentEntry::new(decl.name.clone(), decl.description.clone(), factory)
+                                .with_declaration(decl),
+                        );
+                    }
+                }
+            }
+            entries.extend(self.subagent_entries.clone());
+            let manager = Arc::new(DefaultAgentManager::new(&entries));
+            // --- agent tools ---
+            let spawn_tool = Arc::new(
+                AgentSpawnTool::new(Arc::clone(&manager))
+                    .with_task_repository(Arc::clone(&task_repo)),
+            );
+            let agent_tools: Vec<Arc<dyn Tool>> = vec![
+                Arc::clone(&spawn_tool) as Arc<dyn Tool>,
+                Arc::new(AgentSendTool::new(Arc::clone(&spawn_tool))) as Arc<dyn Tool>,
+                Arc::new(AgentListTool::new(Arc::clone(&spawn_tool))) as Arc<dyn Tool>,
+            ];
+
+            if self.disable_dynamic_subagents {
+                let mw = SubagentsMiddleware::new(entries, Arc::clone(&task_repo))
+                    .with_extra_tools(agent_tools.clone());
+                for t in mw.get_tools() {
+                    toolkit.register_tool(t);
+                }
+                middleware.add(Box::new(mw));
+            } else {
+                // Java `buildDynamicSubagentsMiddleware`: the middleware re-scans
+                // `subagents/*.md` every step and re-materialises them through this builder.
+                let factory_blueprint = Arc::clone(&blueprint);
+                let mw = DynamicSubagentsMiddleware::new(entries, Arc::clone(&task_repo))
+                    .with_filesystem(Arc::clone(&filesystem))
+                    .with_main_workspace(resolved_workspace.to_string_lossy().to_string())
+                    .with_agent_manager(Arc::clone(&manager))
+                    .with_factory_builder(move |decl: &SubagentDeclaration| {
+                        factory_blueprint.declared_factory(decl)
+                    })
+                    .with_extra_tools(agent_tools.clone());
+                for t in mw.get_tools() {
+                    toolkit.register_tool(t);
+                }
+                middleware.add(Box::new(mw));
+            }
         }
 
         // ---- Plan mode ----

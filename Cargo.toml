@@ -45,3 +45,4 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+debug = false     # 关键：不生成调试信息

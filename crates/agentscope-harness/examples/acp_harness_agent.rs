@@ -9,6 +9,19 @@
 //!
 //! A full interactive ACP client (IDE/CLI) is the intended peer.
 //!
+//! # 子 Agent（subagents）
+//!
+//! `HarnessAgent` 在构建时会自动接线子 agent 编排（对齐 Java `SubagentsMiddleware`）：
+//! 内置一个 `general-purpose` 子 agent（与主 agent 相同的模型/工具集，静态 leaf，
+//! 不能再 spawn），并把 `agent_spawn` / `agent_send` / `agent_list` 与
+//! `task_output` / `task_cancel` / `task_list` 注册进主 agent 的工具箱。
+//!
+//! 额外的子 agent 来自三处：
+//! - `<workspace>/subagents/*.md`（每次推理重新扫描，含 front-matter：tools / steps /
+//!   workspace.mode / model 等）
+//! - builder 上的 `.subagent(decl)` / `.subagents(vec)`（程序化声明）
+//! - builder 上的 `.subagent_factory(name, fn)`（完全自定义工厂）
+//!
 //! # 模型配置文件
 //!
 //! 所有模型通过 `$HOME/.agentscope/models.json` 配置文件管理。
@@ -429,11 +442,23 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
 
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
     let model: Arc<dyn Model> = Arc::new(build_model(&model_id, &base_url, &api_key, session_id));
+    // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
+    // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
+    let resolver_session = session_id.to_string();
 
     let workspace = cwd.join(".agentscope").join("workspace");
     let mut builder = HarnessAgent::builder()
         .name("agentscope-coding-agent")
         .model(model)
+        // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
+        // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
+        .model_resolver(move |model_id: &str| {
+            let cfg = ModelConfig::load_or_create();
+            let (base_url, api_key) = cfg.resolve_model(model_id).ok()?;
+            let model: Arc<dyn Model> =
+                Arc::new(build_model(model_id, &base_url, &api_key, &resolver_session));
+            Some(model)
+        })
         .cwd(cwd.clone())
         .workspace(workspace)
         // 会话状态持久化：以 ACP sessionId 为恢复键，每次运行后把完整 AgentState

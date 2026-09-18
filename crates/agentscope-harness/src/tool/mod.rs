@@ -20,7 +20,7 @@ pub mod team;
 pub mod wait_async;
 
 pub use agent_generate::AgentGenerateTool;
-pub use agent_spawn::AgentSpawnTool;
+pub use agent_spawn::{AgentListTool, AgentSendTool, AgentSpawnTool};
 pub use filesystem_tools::FilesystemTool;
 pub use fuzzy_text_matcher::{search, Level, MatchRange, SearchResult};
 pub use memory_get::MemoryGetTool;

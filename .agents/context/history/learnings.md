@@ -150,3 +150,32 @@
 - **codex 的工具名不在 ToolName 枚举里**：`protocol/src/tool_name.rs` 只是 `{namespace, name}` 结构体；真正工具名要 grep `ToolName::plain(...)` / `ToolName::namespaced(...)`（在 handler 里注册）。
 - **写大文档的可靠手法**：`write_file` 只写 ≤500 字符骨架 + 末尾唯一哨兵 `<!--END-->`，之后每次 `smart_edit` 用 `search_replace` 把哨兵替换为「新章节 + 哨兵」，可无上限续写且不丢定位；最后一次替换不带哨兵即收尾。写完后用 pwsh 把 LF 归一为 CRLF。
 - **smart_edit 的两个坑**：`insert_at_line` 会在「疑似字符串/块注释」的行上误报失败（markdown 里的引号可触发）；此时改用 `search_replace`，或把追加内容写成临时文件再用 .NET 追加。
+- **`insert_at_line` 不会自动处理行号偏移**：同一次调用里多个 `insert_at_line` 是顺序执行且不做偏移补偿，后一个若按「原文件行号」填写就会越过文件长度直接失败（而同一批后面的编辑会被跳过）。追加式写文件优先用 `search_replace` 锁住文件尾部唯一文本。
+
+## 2026-09-07：给 Rust harness 接 Java 式 subagent 物化链的经验
+
+- **`HarnessAgent` 必须先实现 `CallableAgent`**，否则 `SubagentFactory::create -> Arc<dyn CallableAgent>` 无处可返——Java 里 HarnessAgent 本身就是 Agent，Rust 它是纯包裹器（内嵌 `Option<ReActAgent>`），需要显式 `impl Agent/CallableAgent` 委托。
+- **子 agent 继承的父 toolkit 必须是「已注册完所有工具」的快照**：Rust 的 `build()` 原先把 subagent 段放在工具注册之前，直接拷贝会得到空 toolkit。接线的关键动作之一是把该段搬到工具全部注册之后，并在注册 `agent_spawn` **之前**做快照（leaf 不该继承 spawn 工具）。
+- **`load_from_directory(dir, main_workspace)` 第二个参数是 `Option<&str>`**（不是 `&str`），且 dynamic middleware 自己会扫描 `subagents/`；static 模式必须由 builder 自己扫，否则声明永远物化不出来。
+
+## 2026-09-18：会话续聊 HTTP 400（role 'tool'）根因 = reasoning 中间件的改写从未到达模型
+
+- **症状**：ACP `acp_harness_agent` 会话中断/收尾后继续对话报
+  `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`。
+- **两个叠加缺陷**（只修一个都不够）：
+  1. `react_agent::run_reasoning` 在中间件链**执行之前**就把 `ModelCallInput` 冻结了，
+     `reasoning_core` 闭包参数写作 `_r` 并被忽略 → 所有 `on_reasoning` 改写（不仅
+     `ToolCallPairSanitizerMiddleware`，还有 task_reminder / inbox / subagents /
+     dynamic_subagents / teams / tool_result_eviction）**全部是死代码**。
+  2. `extract_pending_tool_calls` 只看“最后一条 assistant 消息”的 tool_use，
+     **不检查是否已被后续 TOOL 消息应答** → `summarizing()`（max_iters 收尾）给已应答的
+     call 再写一条 TOOL 结果，持久化出“同一 tool_call_id 应答两次”的历史；下一次请求必 400。
+- **定位手法（可复用）**：不要去猜消息序列——直接解析 `.agentscope/state/<user>/<session>/agent_state.json`，
+  把 `context[]` 的 role + tool_use.id / tool_result.id 打成一行一条，悬空/重复立刻肉眼可见。
+  本次第 15/16 两条 TOOL 回答同一个 id，即缺陷 2 的铁证。
+- **验证手法**：写“记录模型”（RecordingModel 把收到的 messages 存下来）+ 断言
+  「同一 tool_call_id 在发给 provider 的消息里只能被应答一次」。先让测试在旧代码上失败
+  （实测 `left: 2, right: 1`），再改代码。
+- **教训**：洋葱式 middleware 链的 core 闭包**必须消费上游传入的 input**；一旦
+  “提前求值 + 忽略参数”，中间件会静默失效（无编译错误、无告警、单测也可能全绿，
+  因为中间件单测通常直接调用 `mw.on_reasoning(...)`）。给中间件写测试要端到端（真跑 agent + 记录模型）。

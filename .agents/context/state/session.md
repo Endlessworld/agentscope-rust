@@ -62,3 +62,58 @@
 - 建议优先级：P0 = execpolicy 类命令策略引擎、子智能体拓扑 + 深度限制；P1 = 工具延迟加载、常驻 shell、上下文片段可枚举化。
 - 未跑 cargo（仅新增文档）；未使用 worker（按要求）。
 
+## 追加（AgentSpawnTool 接线到 HarnessAgent / acp_harness_agent）
+- 对齐 Java `HarnessAgentBuilderSupport` + `SubagentsMiddleware.getTools()`：
+  - 新增 `agent/subagent/materialize.rs`：`SUBAGENT_CONTEXT_SECTION`、`build_subagent_sys_prompt`、
+    `allowlisted_inherited_toolkit`、`derive_child_session_id`（name@sid#uid）、
+    `resolve_declared_workspace`（SHARED→main / ISOLATED→agents/<name>/workspace）、
+    `SubagentBlueprint` + `LeafFactory`（每次 spawn 递归 build 一个 leaf HarnessAgent）。
+  - `subagent/mod.rs`：`CustomSubagentFactory`（Java `SubagentFactoryEntry`）+ materialize re-exports。
+  - `HarnessAgent` 实现 `Agent` / `CallableAgent`（委托内嵌 `ReActAgent`）→ `Arc<HarnessAgent>` 可作子 agent。
+  - builder 新增字段 `toolkit` / `subagent_declarations` / `subagent_factories`；新增方法
+    `toolkit()` / `subagent()` / `subagents()` / `subagent_factory[_with_description]()`。
+  - `build()`：subagent 段从「工具注册之前」搬到 meta tool 之后（children 必须继承完整父 toolkit）；
+    无条件注册 `general-purpose`；entries = declarations + custom factories + `subagent_entries`
+    +（static 模式）`workspace/subagents/*.md` 扫描；`DefaultAgentManager` → `AgentSpawnTool`
+    （+task repo）→ `AgentSendTool` / `AgentListTool`；middleware 接
+    `with_agent_manager` + `with_factory_builder` + `with_extra_tools`。
+- `examples/acp_harness_agent.rs`：仅加模块文档说明（代码零改动即自动获得 agent_spawn）。
+- 测试：新增 `tests/harness_subagent_wiring_test.rs`（4 例：工具注册 / general-purpose spawn /
+  声明式 leaf + label 通道 send + list / `workspace/subagents/*.md` 扫描→物化→spawn）；
+  修 `harness_agent_spawn_test.rs` 2 处断言（响应新增 agent_key header）。
+- 验证：`cargo test -p agentscope-harness`（lib 291 + 集成全绿）、`cargo test -p agentscope-core` 全绿、
+  `cargo build -p agentscope-harness --examples` 通过。
+- 已知差异（本轮未做）：`decl.model` 覆盖（Java modelResolver）、skills 白名单、父 middleware/plan-mode 转发、
+  `timeout_seconds`/`MAX_SPAWN_DEPTH`、`SubagentEventBus` 流式、gateway/暴露。
+
+## 追加（subagent 声明字段补全：decl.model 覆盖 + decl.skills 白名单）
+- `materialize.rs` 新增（对齐 Java `resolveModel` / `buildDeclaredFactory` 的 skillFilter 段）：
+  - `resolve_declared_model(override, parent, resolver, name)`：空/失败/无 resolver → 回退父模型（带 warn）。
+  - `declared_skill_filter(parent, decl)`：`decl.skills` 为空→继承父 filter；否则 `SkillFilter::only(decl.skills ∩ parent)`。
+  - `SubagentBlueprint` 新增 `model_resolver` / `skill_filter`；`LeafFactory` 新增
+    `model_override` / `skill_filter`（general-purpose 继承父 filter，declared 走白名单）。
+- builder 新增 `model_resolver(fn(&str) -> Option<Arc<dyn Model>>)`（对齐 Java `Builder.modelResolver`）。
+- `examples/acp_harness_agent.rs`：接上 `model_resolver`（用 `ModelConfig::resolve_model` 查 provider 后
+  新建模型，session 头复用当前 ACP sessionId）。
+- 测试：`harness_subagent_wiring_test.rs` 新增 `declared_model_override_uses_the_resolver`
+  （有 resolver → 子模型；无 resolver → 回退父模型）；`ScriptedModel` 改为携带固定应答文本。
+- 验证：`cargo test -p agentscope-harness` 全绿（lib 291 + 集成 5/5 新例）；
+  `cargo build -p agentscope-harness --examples` 通过。
+- 仍缺：父 middleware/plan-mode 转发、`timeout_seconds`/`MAX_SPAWN_DEPTH`、`SubagentEventBus` 流式、
+  gateway/`expose_to_user`、`decl.temperature/top_p` 叠加。
+
+## 追加（ACP 继续对话 400 修复：悬挂 tool 调用）
+- 根因 2 处（详见 history/learnings.md 2026-09-18 条目）：
+  `react_agent::run_reasoning` 忽略中间件改写后的 `ReasoningInput`（模型拿到的是中间件执行前的冻结消息）
+  → `ToolCallPairSanitizerMiddleware` 等所有 `on_reasoning` 中间件形同虚设；
+  `extract_pending_tool_calls` 把已应答的 tool_call 当挂起 → max_iters 收尾重复写 TOOL 结果。
+- 改动：`crates/agentscope-core/src/agent/react_agent.rs`（`run_reasoning` 改用链传入的
+  ReasoningInput 构造 `ModelCallInput`；`extract_pending_tool_calls` 跳过已被后续 TOOL 应答的调用）。
+- 测试：core 新增 2 例（`reasoning_middleware_rewrites_reach_the_model`、
+  `max_iters_does_not_duplicate_answered_tool_results`）；harness 新增
+  `tests/resume_dangling_tool_call_test.rs`（复现“续聊 + 重复 tool 应答”，旧代码实测失败 left:2/right:1）。
+- 验证：`cargo test --workspace` 全绿（0 failed）；重建
+  `target/embedded/examples/acp_harness_agent.exe`
+  （`cargo build --profile embedded --no-default-features --features lite --example acp_harness_agent`）。
+- 注：已存在的坏 state（如 session-1789696812989）**无需手工修**，sanitizer 生效后自动修剪。
+

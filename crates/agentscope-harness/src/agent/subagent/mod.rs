@@ -1,7 +1,9 @@
 //! Subagent declarations, factories, and background task repository, mirroring
 //! `io.agentscope.harness.agent.subagent`.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use agentscope_core::agent::{CallableAgent, RuntimeContext};
 use serde::{Deserialize, Serialize};
 
 use self::protocol::RemoteStreamDetail;
@@ -9,10 +11,16 @@ use self::protocol::RemoteStreamDetail;
 pub mod entry;
 pub mod loader;
 pub mod manager;
+pub mod materialize;
 pub mod protocol;
 pub mod task;
 
 pub use entry::{SubagentEntry, SubagentFactory};
+pub use materialize::{
+    allowlisted_inherited_toolkit, build_subagent_sys_prompt, declared_generate_options,
+    declared_skill_filter, derive_child_session_id, resolve_declared_model, SubagentBlueprint,
+    SUBAGENT_CONTEXT_SECTION,
+};
 pub use loader::{
     load_from_directory, load_from_file, load_from_filesystem, parse, SUBAGENTS_DIR, SUBAGENT_GLOB,
 };
@@ -188,5 +196,30 @@ impl SubagentDeclaration {
     /// Whether this entry should appear in the LLM-facing available-subagent list.
     pub fn is_visible_to_llm(&self) -> bool {
         !self.hidden && self.mode != SubagentMode::Primary
+    }
+}
+
+/// A caller-supplied subagent factory (`Builder::subagent_factory`), mirroring Java
+/// `HarnessAgentBuilderSupport.SubagentFactoryEntry`.
+pub struct CustomSubagentFactory {
+    pub name: String,
+    pub description: String,
+    pub factory: Arc<dyn Fn(String) -> Arc<dyn CallableAgent> + Send + Sync>,
+}
+
+impl CustomSubagentFactory {
+    /// Description shown to the orchestrator, falling back to the name when unset.
+    pub fn display_description(&self) -> &str {
+        if self.description.trim().is_empty() {
+            &self.name
+        } else {
+            &self.description
+        }
+    }
+}
+
+impl SubagentFactory for CustomSubagentFactory {
+    fn create(&self, _parent_rc: &RuntimeContext) -> Arc<dyn CallableAgent> {
+        (self.factory)(self.name.clone())
     }
 }

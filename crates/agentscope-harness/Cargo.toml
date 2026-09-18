@@ -47,9 +47,11 @@ default = ["rusqlite"]
 rusqlite = ["dep:rusqlite"]
 lite = []
 
-[profile.release]
-opt-level = "z"       # 优化体积，优先于速度
-lto = true            # 启用链接时优化，删除死代码
-codegen-units = 1     # 减少并行代码生成单元，增强优化
-panic = "abort"       # panic 时直接中止，移除栈展开代码
-strip = true          # 自动剥离调试符号
+[profile.embedded]
+inherits = "release"
+opt-level = "z"       # 或 "s"，优先优化体积
+lto = true            # 启用链接时优化，跨 crate 消除死代码
+codegen-units = 1     # 牺牲编译速度，换取更彻底的优化
+panic = "abort"       # 移除栈展开代码，显著减小体积
+strip = true          # 自动剥离所有符号信息
+debug = false     # 关键：不生成调试信息

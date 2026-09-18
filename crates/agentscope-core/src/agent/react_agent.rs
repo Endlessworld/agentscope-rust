@@ -4,6 +4,7 @@
 //! call, accumulates the reasoning result, and if the model requested tool calls
 //! it executes them and feeds the results back, repeating until the model stops
 //! or the maximum number of iterations is reached.
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -488,6 +489,17 @@ impl ReActAgent {
     }
 
     fn new_context(&self, input: &AgentInput) -> crate::agent::RuntimeContext {
+        // Call-scoped identity is taken from the agent state so that harness
+        // middlewares (inbox, async tools, subagent tasks) and the tools they
+        // register can scope their work to the current session/user.
+        let (session_id, user_id) = {
+            let st = self.core.state.lock().unwrap();
+            let sid = st.session_id().to_string();
+            (
+                if sid.is_empty() { None } else { Some(sid) },
+                st.user_id().map(str::to_string),
+            )
+        };
         crate::agent::RuntimeContext {
             agent_name: Some(self.name.clone()),
             user_input: input.messages.last().map(|m| m.text_content()),
@@ -496,9 +508,9 @@ impl ReActAgent {
             metadata: Default::default(),
             cwd: None,
             response_format: None,
-            session_id: None,
-            user_id: None,
-            agent_id: None,
+            session_id,
+            user_id,
+            agent_id: Some(self.id.clone()),
             delta_tx: None,
             // Expose the shared state so context-managing middlewares (e.g.
             // conversation compaction) can read/rewrite the accumulated history.
@@ -818,12 +830,6 @@ async fn run_reasoning(
     let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
     let chain = Arc::clone(&core.middleware_chain);
     let model = core.model.lock().unwrap().clone();
-    let mc_input = ModelCallInput::new(
-        input.messages.clone(),
-        input.tools.clone(),
-        input.options.clone(),
-        Arc::clone(&model),
-    );
 
     let delta_tx = ctx.delta_tx.clone();
     let model_core: Next<ModelCallInput> = {
@@ -848,11 +854,17 @@ async fn run_reasoning(
         })
     };
 
+    // The chain may rewrite the reasoning input (dangling tool-call pruning,
+    // tool-result eviction, inbox/task reminders, dynamic tools), so the model
+    // call MUST be built from the input the chain hands over — not from the
+    // original one. Otherwise those rewrites never reach the provider.
     let reasoning_core: Next<ReasoningInput> = {
         let chain = Arc::clone(&chain);
         let ctx = ctx.clone();
-        Box::new(move |_r: ReasoningInput| -> EventStream {
-            chain.wrap_model_call(ctx.clone(), mc_input.clone(), model_core)
+        let model = Arc::clone(&model);
+        Box::new(move |r: ReasoningInput| -> EventStream {
+            let mc_input = ModelCallInput::new(r.messages, r.tools, r.options, model);
+            chain.wrap_model_call(ctx.clone(), mc_input, model_core)
         })
     };
 
@@ -1153,6 +1165,22 @@ async fn model_call_impl(
     }
 }
 
+/// Builds the JSON runtime exposed to a tool call, carrying the call-scoped
+/// identity (session / user / agent) plus any metadata the agent recorded.
+fn tool_runtime(ctx: &crate::agent::RuntimeContext) -> JsonMap {
+    let mut rt = ctx.metadata.clone();
+    if let Some(sid) = ctx.session_id() {
+        rt.insert("sessionId".to_string(), serde_json::Value::String(sid.to_string()));
+    }
+    if let Some(uid) = ctx.user_id() {
+        rt.insert("userId".to_string(), serde_json::Value::String(uid.to_string()));
+    }
+    if let Some(aid) = ctx.agent_id() {
+        rt.insert("agentId".to_string(), serde_json::Value::String(aid.to_string()));
+    }
+    rt
+}
+
 /// Executes the pending tool calls from the last assistant message and feeds the
 /// results back into the context. The outer loop decides whether to continue.
 async fn acting_phase(
@@ -1168,6 +1196,7 @@ async fn acting_phase(
 
     let mut results = Vec::new();
     let mut suspended = false;
+    let runtime = tool_runtime(ctx);
     for call in &pending {
         let decision = evaluate_permission(core, call);
         match decision.behavior {
@@ -1184,7 +1213,7 @@ async fn acting_phase(
                 emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
                 let tctx = ToolExecutionContext {
                     tool_call: Some(call.clone()),
-                    runtime: Default::default(),
+                    runtime: runtime.clone(),
                     emitter: None,
                 };
                 match core.toolkit.call_tool(call, tctx).await {
@@ -1227,7 +1256,7 @@ async fn acting_phase(
                         emit_tool_result_start(&ctx.delta_tx, &effective_call.id, &effective_call.name);
                         let tctx = ToolExecutionContext {
                             tool_call: Some(effective_call.clone()),
-                            runtime: Default::default(),
+                            runtime: runtime.clone(),
                             emitter: None,
                         };
                         match core.toolkit.call_tool(effective_call, tctx).await {
@@ -1366,15 +1395,26 @@ fn check_interrupted(core: &Arc<AgentCore>) -> Result<()> {
     Ok(())
 }
 
-/// Collects the tool-use blocks from the most recent assistant message.
+/// Collects the still-unanswered tool-use blocks of the most recent assistant
+/// message. Calls already answered by a later TOOL message are skipped: treating
+/// them as pending would append a duplicate TOOL result (an id answered twice is
+/// rejected by OpenAI-compatible providers with HTTP 400).
 fn extract_pending_tool_calls(state: &AgentState) -> Vec<ToolUseBlock> {
-    state
-        .context()
+    let context = state.context();
+    let Some(owner) = context.iter().rposition(|m| m.role() == MsgRole::Assistant) else {
+        return Vec::new();
+    };
+    let answered: HashSet<&str> = context[owner + 1..]
         .iter()
-        .rev()
-        .find(|m| m.role() == MsgRole::Assistant)
-        .map(|m| m.tool_use_blocks().cloned().collect())
-        .unwrap_or_default()
+        .filter(|m| m.role() == MsgRole::Tool)
+        .flat_map(|m| m.tool_result_blocks())
+        .filter_map(|tr| tr.id.as_deref())
+        .collect();
+    context[owner]
+        .tool_use_blocks()
+        .filter(|tu| !answered.contains(tu.id.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Evaluates the permission decision for a single tool invocation.
@@ -1598,6 +1638,102 @@ mod tests {
             .unwrap();
         let reply = agent.call(vec![Msg::user("loop")]).await.unwrap();
         assert_eq!(reply.generate_reason(), GenerateReason::MaxIterations);
+    }
+
+
+    /// A model that records every message list it is called with.
+    struct RecordingModel {
+        seen: Arc<Mutex<Vec<Vec<Msg>>>>,
+    }
+
+    impl RecordingModel {
+        fn new() -> Self {
+            Self { seen: Arc::new(Mutex::new(Vec::new())) }
+        }
+    }
+
+    #[async_trait]
+    impl Model for RecordingModel {
+        fn stream(
+            &self,
+            messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            self.seen.lock().unwrap().push(messages);
+            Box::pin(futures::stream::once(async { Ok(text_response("ok")) }))
+        }
+        fn model_name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    /// Middleware that rewrites the reasoning input before the model call.
+    struct RewriteReasoningMiddleware;
+
+    impl crate::middleware::Middleware for RewriteReasoningMiddleware {
+        fn on_reasoning(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            mut input: ReasoningInput,
+            next: Next<ReasoningInput>,
+        ) -> EventStream {
+            input.messages.push(Msg::user("REWRITTEN"));
+            next(input)
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_middleware_rewrites_reach_the_model() {
+        let model = Arc::new(RecordingModel::new());
+        let seen = Arc::clone(&model.seen);
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(RewriteReasoningMiddleware));
+        let agent = ReActAgent::builder()
+            .name("t-rewrite")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].iter().any(|m| m.text_content() == "REWRITTEN"),
+            "reasoning middleware rewrite must reach the model call"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_iters_does_not_duplicate_answered_tool_results() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c1", "add", input)],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-max-iters")
+            .model(model)
+            .toolkit(toolkit)
+            .max_iters(1)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.generate_reason(), GenerateReason::MaxIterations);
+        assert_eq!(*counter.lock().unwrap(), 1);
+        let context = agent.core.state.lock().unwrap().context().to_vec();
+        let answers = context
+            .iter()
+            .filter(|m| m.role() == MsgRole::Tool)
+            .flat_map(|m| m.tool_result_blocks())
+            .filter(|tr| tr.id.as_deref() == Some("c1"))
+            .count();
+        assert_eq!(answers, 1, "an answered tool call must not be reported twice");
     }
 
     #[tokio::test]
