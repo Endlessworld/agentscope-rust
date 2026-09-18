@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use agentscope_core::state::AgentStateStore;
+use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -26,7 +26,6 @@ use crate::client::{
 use crate::constants::{DEFAULT_DATABASE, SESSIONS_COLLECTION};
 use crate::index_utils::{create_index_with_migration, IndexSpec};
 use crate::key_escaper;
-use crate::list_hash;
 
 const ANON_USER: &str = "__anon__";
 const FIELD_USER_ID: &str = "user_id";
@@ -361,14 +360,14 @@ impl MongodbAgentStateStore {
             .client
             .first_field_string(&self.collection, &filter, &hash_field)
             .await?;
-        let current_hash = list_hash::compute_hash(values);
+        let current_hash = compute_hash(values);
 
         let encoded: Vec<Value> = values.iter().map(key_escaper::escape).collect();
         let set_on_insert = Update::new()
             .set_on_insert(FIELD_USER_ID, json!(normalize_user(user_id)))
             .set_on_insert(FIELD_SESSION_ID, json!(session_id));
 
-        if list_hash::needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
+        if needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
             let set_fields = Update::new()
                 .set(state_field, Value::Array(encoded))
                 .set(hash_field, json!(current_hash))

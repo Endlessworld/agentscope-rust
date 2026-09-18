@@ -23,11 +23,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use agentscope_core::error::{Error, Result};
-use agentscope_core::state::AgentStateStore;
+use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};
 
 pub mod adapter;
 pub mod connection;
-mod list_hash;
 mod version_support;
 
 use self::adapter::RedisClientAdapter;
@@ -321,11 +320,11 @@ impl RedisAgentStateStore {
         let hash_key = format!("{list_key}{HASH_SUFFIX}");
         let keys_key = self.get_keys_key(&slot_id);
 
-        let current_hash = list_hash::compute_hash(values);
+        let current_hash = compute_hash(values);
         let stored_hash = self.client.get(&hash_key).await?;
         let existing_count = self.client.get_list_length(&list_key).await?.max(0) as usize;
 
-        if list_hash::needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
+        if needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
             self.client.delete_keys(&[list_key.clone()]).await?;
             for item in values {
                 let json = serde_json::to_string(item)?;
@@ -479,4 +478,45 @@ mod tests {
 
     #[derive(Debug)]
     struct DummyAdapter;
+
+    // Integration semantics of the list-hash change detection as consumed by
+    // `save_list_inner`. The pure algorithm lives in `agentscope_core::state::list_hash`
+    // (covered there); these assert the crate's persisted-hash contract end to end.
+    use agentscope_core::state::EMPTY_HASH;
+
+    #[test]
+    fn empty_hash_matches_java_constant() {
+        assert_eq!(compute_hash(&[] as &[Value]), EMPTY_HASH);
+    }
+
+    #[test]
+    fn unchanged_prefix_needs_no_rewrite() {
+        let a = vec![json!({"v":1}), json!({"v":2})];
+        let stored = compute_hash(&a);
+        assert!(!needs_full_rewrite(&a, Some(&stored), 2));
+    }
+
+    #[test]
+    fn append_growth_needs_no_rewrite() {
+        let a = vec![json!({"v":1}), json!({"v":2})];
+        let stored = compute_hash(&a);
+        let b = vec![json!({"v":1}), json!({"v":2}), json!({"v":3})];
+        assert!(!needs_full_rewrite(&b, Some(&stored), 2));
+    }
+
+    #[test]
+    fn shrink_or_edit_needs_rewrite() {
+        let a = vec![json!({"v":1}), json!({"v":2}), json!({"v":3})];
+        let stored = compute_hash(&a);
+        assert!(needs_full_rewrite(&a[..2], Some(&stored), 3)); // shrink
+        let edited = vec![json!({"v":9}), json!({"v":2}), json!({"v":3})];
+        assert!(needs_full_rewrite(&edited, Some(&stored), 3)); // prefix edit
+    }
+
+    #[test]
+    fn missing_hash_with_existing_data_needs_rewrite() {
+        let a = vec![json!({"v":1})];
+        assert!(needs_full_rewrite(&a, None, 1));
+        assert!(!needs_full_rewrite(&a, None, 0));
+    }
 }

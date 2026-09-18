@@ -38,7 +38,7 @@
 | `redis.snapshot.RedisRemoteSnapshotClient`（80 行） | 快照上传/下载/存在性（Redis binary value，key `{prefix}{snapshotId}.tar`，可选 TTL 秒） | `snapshot::RedisRemoteSnapshotClient`（`src/snapshot.rs`，`impl RemoteSnapshotClient`） | async；`download` 缺失返回 `Error::Io(NotFound)`（对应 Java `FileNotFoundException`） |
 | `redis.snapshot.RedisSnapshotSpec`（34 行，`extends RemoteSnapshotSpec`） | Redis 快照便捷 spec | `snapshot::RedisSnapshotSpec`（newtype 包装 harness `RemoteSnapshotSpec`，`impl SandboxSnapshotSpec`） | 快照 id 校验沿用 harness `RemoteSnapshotSpec::build` |
 | `redis.sandbox.RedisSandboxExecutionGuard`（241 行） | `SET NX PX` 分布式租约 + Lua token CAS 释放；`composeKey = <prefix><scope_lower>:<value>` | `sandbox::RedisSandboxExecutionGuard` + `RedisSandboxExecutionGuardBuilder` + `RedisSandboxLease` + 别名 `SharedRedisSandboxExecutionGuard`（`src/sandbox.rs`） | harness `SandboxExecutionGuard` 是**具体 struct 非 trait**（`crates/agentscope-harness/src/agent/sandbox/guard.rs:13`），故为镜像 API（`try_enter`/`release`/`is_held`）的独立类型；租约实现 `Drop` 释放；常量对齐（30min TTL / 500ms retry / `agentscope:sandbox:lock:`） |
-| （Java core）`io.agentscope.core.state.ListHashUtil` | 列表变更检测（size 前缀 + 采样 hash） | `state::list_hash`（`src/state/list_hash.rs`） | 策略对齐（`size:N;` 前缀；`<=5` 全量，否则取 `[0, n/4, n/2, 3n/4, n-1]`）；每元素 hash 用规范化 JSON 文本 + `DefaultHasher`，**非** Java `hashCode`，见 §3.3 |
+| （Java core）`io.agentscope.core.state.ListHashUtil` | 列表变更检测（size 前缀 + 采样 hash） | **已收敛到 core**：复用 `agentscope_core::state::{compute_hash, needs_full_rewrite}`（`crates/agentscope-core/src/state/list_hash.rs`，经 `state/mod.rs` `pub use`） | 本地平行实现 `src/state/list_hash.rs` **已删除**（2026-09-19）；`serde_json::Value` 实现 `Hash`，core 泛型 `compute_hash<T: Hash>` 直接接收 `&[Value]`（与 JDBC/PostgreSQL 调用方式一致），无需本地 JSON 串中转 |
 | （测试替身）Java 用 Mockito mock `RedisClientAdapter` / `JedisPool` / `RedissonClient` | 离线单测（`state/RedisAgentStateStoreTest.java` 71 行、`state/jedis/JedisAgentStateStoreTest.java` 67 行、`state/redisson/RedissonAgentStateStoreTest.java` 79 行） | crate 内 `#[cfg(test)]`（21 个纯逻辑单测） | 无 `tests/` 目录、无内存 Redis 替身，见 §3.1 覆盖缺口 |
 
 ### 2.1 依赖映射（Java → Rust）
@@ -79,7 +79,7 @@
 | `RedisSandboxExecutionGuard` + lease + builder | `sandbox/RedisSandboxExecutionGuard.java` | 已完成（语义差异见 §3.2/§3.3） | `SET NX PX` 轮询 + Lua token CAS；`Drop` 释放；`compose_key` 格式一致 |
 | `RedisDistributedStore` 组合者 | `RedisDistributedStore.java` | 已完成（`base_store()` 需 URL，见 §3.2） | 5 个组件工厂方法 + `to_distributed_store()` |
 | 依赖声明（`jedis`/`redisson`/`lettuce-core`） | `pom.xml` | 已完成 | 本 crate 仅 `redis = "1.7"`（features `script`/`tokio-comp`/`connection-manager`）；`serde`/`serde_json`/`thiserror`/`async-trait`/`tokio`/`futures`/`tracing`/`chrono`/`uuid` 取 workspace |
-| **离线单元测试** | Java 3 个测试类 217 行（Mockito mock 适配器/连接池） | **部分完成（P1 缺口）** | 现状：`cargo test -p agentscope-extensions-redis` = **21 passed / 0 failed**（+ 2 doc-tests），21 个全部为纯逻辑用例（前缀归一化、键名/命名空间拼接、`slot_id`、`list_hash` 策略、`value_to_i64`、guard 键格式），分布于 `src/state/list_hash.rs`(5)、`src/store.rs`(5)、`src/state/mod.rs`(4)、`src/sandbox.rs`(2)、`src/state/version_support.rs`(2)、`src/distributed_store.rs`(1)、`src/snapshot.rs`(1)、`src/state/connection.rs`(1)。**零测试经由 trait 对象 / `eval_script` / 真实 Redis 路径**（无内存 Redis 替身，crate 内无 `tests/` 目录）。补测方向：`RedisClientAdapter` 内存实现 + state 的 CAS 冲突/列表全量重写 vs 增量/`:_hash`、store 的 `put_if_version` 三分支、snapshot TTL 往返、guard 租约 token CAS 与释放 |
+| **离线单元测试** | Java 3 个测试类 217 行（Mockito mock 适配器/连接池） | **部分完成（P1 缺口）** | 现状：`cargo test -p agentscope-extensions-redis` = **21 passed / 0 failed**（+ 2 doc-tests），21 个全部为纯逻辑用例（前缀归一化、键名/命名空间拼接、`slot_id`、列表 hash 变更检测集成语义、`value_to_i64`、guard 键格式），分布于 `src/store.rs`(5)、`src/state/mod.rs`(9，含 2026-09-19 由已删除的 `src/state/list_hash.rs` 迁入的 5 个列表 hash 集成语义用例)、`src/sandbox.rs`(2)、`src/state/version_support.rs`(2)、`src/distributed_store.rs`(1)、`src/snapshot.rs`(1)、`src/state/connection.rs`(1)。**零测试经由 trait 对象 / `eval_script` / 真实 Redis 路径**（无内存 Redis 替身，crate 内无 `tests/` 目录）。补测方向：`RedisClientAdapter` 内存实现 + state 的 CAS 冲突/列表全量重写 vs 增量/`:_hash`、store 的 `put_if_version` 三分支、snapshot TTL 往返、guard 租约 token CAS 与释放 |
 
 ### 3.2 功能缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -99,7 +99,7 @@
 | `RedisSandboxLease::released` dead-code warning | `src/sandbox.rs:175` 字段 `released` 写入后从未读取，产生 dead-code warning；构建仍在，系既有代码 | **待办（P2 清理）** |
 | `save_if_version(expected_version=0)` 的 CAS 语义差异 | Java：`expectedVersion == UNVERSIONED`（`Long.MIN_VALUE`，非 0）才走无条件分支，`expected == 0` 会直接拿 `0` 与真实版本比较（除非键不存在）。Rust（`src/state/mod.rs`）：`expected_version == 0` 也走「无条件 bump」。而 harness `BaseStore::put_if_version` 约定 `0` = create-only-if-absent → 两语义**可能冲突**，需以 Java 实际调用约定 / harness 契约为准裁定 | **待确认** |
 | `find_keys_by_pattern` 使用 `KEYS` | 见 §3.2：`KEYS` 在大 keyspace 下会阻塞 Redis；Java 三个适配器的 `findKeysByPattern` 均基于 SCAN 游标 | **待办（P1）** |
-| `list_hash` 每元素 hash 输入差异 | Rust 用规范化 JSON 文本 + `DefaultHasher`（`src/state/list_hash.rs`），Java `ListHashUtil` 用对象 `hashCode`。因 hash 仅与同实例自身存储值比较，跨语言不互通，不影响单语言运行；但同一 Redis 实例若被 Java/Rust 混用同 slot，将导致全量重写（无数据丢失） | **待确认（低风险）** |
+| `list_hash` 每元素 hash 输入差异与收敛 | **已收敛到 core**（2026-09-19）：本地平行实现 `src/state/list_hash.rs` 已删除，改用 `agentscope_core::state::{compute_hash, needs_full_rewrite}`（泛型 `T: Hash` 直接接收 `&[Value]`）。core 亦用 `DefaultHasher`，**非** Java `hashCode`，故 hash 值仍与 Java 不互通。**存量数据影响**：收敛后算法（size 前缀 + 采样索引 + `DefaultHasher`）与旧本地实现**并非逐位一致**（旧实现 per-element hash 以 `Value::to_string()` 文本哈希后拼字符串；core 直接对 `Value` 调 `Hash`）→ 同一 Redis 实例中已存的 `:_hash` 与新算值不匹配，**首次 `save_list` 会走 Case3 全量重写一次**（`DEL` + `RPUSH` 原值），**数据无损、结果正确、自愈**；此后写入即稳定。跨语言 Java/Rust 混用同 slot 同理（仅多一次全量重写） | **已缓解（低风险，无需迁移脚本）** |
 | `state::adapter::RedisClientAdapter::close()` | Java `close()` 为必需方法；Rust 提供默认 no-op 实现（未强制实现） | 已完成（语义弱化） |
 | `RedisSandboxExecutionGuard::release()` 为 best-effort `DEL` | Java 无对应无 token 的 `release(key)`（仅 lease `close()` 做 token CAS）；Rust `release(&key)` 直接 `DEL`，可能误释放他人锁，仅作 parity | **待确认** |
 | store/snapshot/connection 无 `tracing` 埋点 | Java `RedisStore`/`RedisRemoteSnapshotClient` 无日志，guard 有 SLF4J debug/warn；Rust `sandbox.rs` 已对齐，store/snapshot 亦无（与 Java 一致） | 已完成（与 Java 对齐） |
@@ -119,8 +119,8 @@
 ### 4.1 当前状态
 - **编译修复会话（2026-09-18）**：`cargo build -p agentscope-extensions-redis` 原报 **9 个错误**，已全部修复，现 `build` 与 `test` 均通过。
 - **修复内容**：
-  1. `state/mod.rs` 缺少子模块声明：`adapter.rs` / `connection.rs` / `list_hash.rs` / `version_support.rs` 四个文件已存在，但 `mod.rs` 只 `use self::...` 未 `mod` 声明 → 补齐 `pub mod adapter; pub mod connection; mod list_hash; mod version_support;`（`adapter`/`connection` 需对 `lib.rs` re-export 可见，故 `pub`）。
-  2. 去掉随之冗余的 `use self::list_hash;` / `use self::version_support::{self, ...}`（与 `mod` 声明冲突，E0255），改为 `use self::version_support::{SAVE_SCRIPT, UNCONDITIONAL};`，`list_hash::` 调用改为 `self::list_hash::`。
+  1. `state/mod.rs` 缺少子模块声明：`adapter.rs` / `connection.rs` / `version_support.rs` 文件已存在（`list_hash.rs` 已于 2026-09-19 收敛删除），但 `mod.rs` 只 `use self::...` 未 `mod` 声明 → 补齐 `pub mod adapter; pub mod connection; mod version_support;`（`adapter`/`connection` 需对 `lib.rs` re-export 可见，故 `pub`）。
+  2. 去掉随之冗余的 `use self::version_support::{self, ...}`（与 `mod` 声明冲突，E0255），改为 `use self::version_support::{SAVE_SCRIPT, UNCONDITIONAL};`（`list_hash` 相关条目已在 2026-09-19 收敛后失效）。
   3. `state/connection.rs` 的 `lrange` 调用签名错误（`redis` 1.7.0 为 2 个泛型参数 `K, RV` 且边界为 `isize`）→ 改为 `conn.lrange::<_, Vec<String>>(key, start as isize, end as isize)`。
   4. `sandbox.rs` 引用了私有模块 `agentscope_harness::agent::sandbox::key::SandboxIsolationKey`（E0603）→ 改用 harness 已公开的 re-export `agentscope_harness::agent::sandbox::SandboxIsolationKey`（未改 harness）。
 - **改动文件（仅本 crate）**：
@@ -135,13 +135,25 @@
   - `cargo build -p agentscope-extensions-redis` → **通过**（1 条 pre-existing dead-code warning：`RedisSandboxLease::released`）。
   - `cargo test -p agentscope-extensions-redis` → **21 passed / 0 failed**（unit）+ **2 passed**（doc-tests）。
   - 全量 `cargo test --workspace` → **1485 passed / 0 failed**。
-- **crate 文件清单（实测行数）**：`Cargo.toml`(20)、`src/lib.rs`(46)、`src/distributed_store.rs`(187)、`src/sandbox.rs`(250)、`src/snapshot.rs`(143)、`src/store.rs`(316)、`src/state/mod.rs`(427)、`src/state/adapter.rs`(62)、`src/state/connection.rs`(176)、`src/state/list_hash.rs`(108)、`src/state/version_support.rs`(86)。
+- **crate 文件清单（实测行数，2026-09-19 收敛后）**：`Cargo.toml`(20)、`src/lib.rs`(49)、`src/distributed_store.rs`(210)、`src/sandbox.rs`(276)、`src/snapshot.rs`(163)、`src/store.rs`(351)、`src/state/mod.rs`(522)、`src/state/adapter.rs`(77)、`src/state/connection.rs`(201)、`src/state/version_support.rs`(97)。**`src/state/list_hash.rs` 已删除**（原 108 行）。
+
+### 4.1.1 list_hash 向 core 收敛（2026-09-19）
+- **背景**：Java `io.agentscope.core.state.ListHashUtil` 是唯一权威实现；Rust `agentscope_core::state::list_hash` 已忠实移植（`compute_hash<T: Hash>` / `has_changed` / `needs_full_rewrite` / `EMPTY_HASH` / `SAMPLING_THRESHOLD`，经 `core::state` `pub use`）。本 crate 存在**同策略的平行实现**，应收敛。
+- **变更**：
+  1. 删除 `crates/agentscope-extensions-redis/src/state/list_hash.rs`（本地实现）。
+  2. `src/state/mod.rs`：移除 `mod list_hash;`；改为 `use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};`；调用点 `save_list_inner` 的 `list_hash::compute_hash(values)` → `compute_hash(values)`、`list_hash::needs_full_rewrite(...)` → `needs_full_rewrite(...)`。
+  3. 保留 5 个**集成语义**测试（未修改前缀不需重写 / 追加增长不需重写 / 缩短或前缀编辑需重写 / 无 hash 但有既有数据需重写 / 空列表常量），从已删除文件迁入 `src/state/mod.rs` 的 `tests` 模块；纯算法重复测试（core 已有覆盖）不重复迁移。
+- **无命名冲突**：`src/state/mod.rs` 内不存在同名标识符/模块，无需改名。`EMPTY_HASH` / `SAMPLING_THRESHOLD` 在本 crate 其他位置**无引用**（原为私有 `mod`，未 `pub use`），故无需额外改写；测试中 `EMPTY_HASH` 改为 `use agentscope_core::state::EMPTY_HASH;`。
+- **行为等价性**：本地 Case3 曾用 `&current[..existing_count.min(current_size)]` 的 `.min` 保护；因 Case1 已保证 `current_size >= existing_count`，该保护等价于 core 的 `&current[..existing_count]`，**无行为差异**。
+- **存量数据影响（自愈，无迁移脚本）**：新 core 路径的 hash 值可能与旧本地实现存量 `:_hash` 不一致 → 每 slot 首次 `save_list` 多一次全量重写（`DEL` + `RPUSH` 原值），**数据无损、不丢不清、结果正确**，此后稳定。已知且接受。
+- **验证**：`cargo build -p agentscope-extensions-redis` → **通过**（仅 1 条 pre-existing warning：`RedisSandboxLease::released` 未读取）；`cargo test -p agentscope-extensions-redis` → **21 passed / 0 failed**（+ 2 doc-tests，与收敛前一致：删 0 增 0，仅用例从 `state::list_hash::tests` 位移为 `state::tests`）；`rg "fn compute_hash|fn needs_full_rewrite" crates/agentscope-extensions-redis` → **无结果**（无残留平行实现）。
+- **改动文件（仅本 crate + 本 tracker）**：`crates/agentscope-extensions-redis/src/state/mod.rs`（改）、`crates/agentscope-extensions-redis/src/state/list_hash.rs`（删）、`docs/extensions/REDIS__GAP_TRACKER.md`（改）。未改根 `Cargo.toml` / `core` / `harness` / 其它 crate。
 ### 4.2 下一步与阻塞
 1. 无阻塞项。`state` 四个子模块此前“缺失”实为**未接线**（文件均在），已按实际源码接入，未新增空模块凑数。
 2. 后续可考虑的增强（非本次任务）：清理 `RedisSandboxLease::released` 的 dead-code warning。§2/§3 的 Java→Rust 映射与缺口清单已由本会话（2026-09-18 回填）补齐，不再是占位。
 3. 未改根 `Cargo.toml` / `core` / `harness` / 其它 crate。
 4. **P1（本模块内）**：`RedisDistributedStore::base_store()` 未保留 URL，无法自动接线同步 `BaseStore`，需改用 `base_store_with_url(url)`（§3.2）；离线测试覆盖偏弱、无内存 Redis 替身（§3.1），建议补 `RedisClientAdapter` 内存实现并覆盖 state/store/snapshot/guard 分支。
-5. **P2 清理/待确认**：删除或启用 `RedisSandboxLease::released`（`src/sandbox.rs:175`）以消除 dead-code warning；核对 `save_if_version(expected=0)` 的 CAS 语义、`find_keys_by_pattern` 用 `KEYS` 而非 SCAN、列表 hash 跨语言不互通（均见 §3.3）。
+5. **P2 清理/待确认**：删除或启用 `RedisSandboxLease::released`（`src/sandbox.rs:175`）以消除 dead-code warning；核对 `save_if_version(expected=0)` 的 CAS 语义、`find_keys_by_pattern` 用 `KEYS` 而非 SCAN（均见 §3.3）。列表 hash 跨语言不互通一项已于 2026-09-19 收敛后降级为「已缓解」（见 §3.3 与 §4.1.1）。
 6. **跨模块需求（不改 harness）**：harness `DistributedStore` 是具体 struct（`crates/agentscope-harness/src/agent/distributed_store.rs:14`），仅含 `agent_state_store` + `isolation_scope`，无法承载 Java 的 `baseStore` / `sandboxSnapshotSpec` / `sandboxExecutionGuard`；本 crate 以镜像 combiner + `to_distributed_store()` 暴露，未扩展 harness。若后续扩展 harness 组合字段，`src/distributed_store.rs` 的投影函数是唯一改动点。请汇总方评估。
 
 ## 5. 执行约定（所有会话必须遵守）

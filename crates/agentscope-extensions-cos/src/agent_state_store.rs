@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite};
 use agentscope_core::state::AgentStateStore;
 use async_trait::async_trait;
 
@@ -106,33 +107,6 @@ impl CosAgentStateStoreBuilder {
     }
 }
 
-/// Computes the incremental-append hash mirroring `ListHashUtil.computeHash`.
-///
-/// Java's `ListHashUtil` is core-internal; this port keeps an equivalent stable
-/// hash (JSON-rendered length + content hash) so `.list.hash` values stay
-/// consistent across calls. The precise algorithm is not cross-language loadable.
-fn compute_list_hash(values: &[serde_json::Value]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for v in values {
-        let rendered = serde_json::to_string(v).unwrap_or_default();
-        hasher.update((rendered.len() as u64).to_le_bytes());
-        hasher.update(rendered.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-/// Whether the new list requires a full rewrite given the stored hash/count.
-///
-/// Mirrors `ListHashUtil.needsFullRewrite`: when there is no stored hash, or the
-/// stored hash is a prefix of the new hash (pure append), no rewrite is implied.
-fn needs_full_rewrite(values: &[serde_json::Value], stored_hash: Option<&str>, existing_count: usize) -> bool {
-    match stored_hash {
-        None => true,
-        Some(h) => values.len() < existing_count || !compute_list_hash(values).starts_with(h),
-    }
-}
-
 #[async_trait]
 impl AgentStateStore for CosAgentStateStore {
     async fn save(
@@ -177,19 +151,19 @@ impl AgentStateStore for CosAgentStateStore {
             Err(_) => return,
         };
 
-        let stored_hash = self.object_store.get_string(&hash_key).await.unwrap_or(None);
-        let existing_count = if stored_hash.is_some() {
-            match self.object_store.get_string(&list_key).await.unwrap_or(None) {
-                Some(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-                None => 0,
-            }
-        } else {
-            0
+        // `existing_count` mirrors Java's `existingCount`: the length of the list
+        // currently stored, independent of whether a hash object exists. Keeping
+        // these decoupled is what makes `needs_full_rewrite` Case 2 (missing hash
+        // but existing data) reachable.
+        let existing_count = match self.object_store.get_string(&list_key).await.unwrap_or(None) {
+            Some(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                .map(|v| v.len())
+                .unwrap_or(0),
+            None => 0,
         };
+        let stored_hash = self.object_store.get_string(&hash_key).await.unwrap_or(None);
 
-        let current_hash = compute_list_hash(values);
+        let current_hash = compute_hash(values);
         let full_rewrite = needs_full_rewrite(values, stored_hash.as_deref(), existing_count);
 
         if full_rewrite || values.len() != existing_count {
@@ -319,6 +293,47 @@ mod tests {
             .unwrap()
     }
 
+    /// In-memory backend that counts writes, used to assert that an unchanged list
+    /// skips the list-object rewrite (only `.list.hash` is refreshed).
+    #[derive(Debug, Default)]
+    struct CountingStore {
+        inner: InMemoryCosObjectStore,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl crate::CosObjectStore for CountingStore {
+        async fn get(&self, key: &str) -> crate::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, data: &[u8]) -> crate::Result<()> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(key, data).await
+        }
+        async fn delete(&self, key: &str) -> crate::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn exists(&self, key: &str) -> crate::Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn len(&self) -> usize {
+            self.inner.len().await
+        }
+        async fn list_prefix(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
     #[tokio::test]
     async fn save_get_roundtrip() {
         let s = store();
@@ -373,5 +388,145 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(s2.key_prefix(), DEFAULT_STATE_PREFIX);
+    }
+
+    /// `[a]` then `[a, b]`: the previously stored hash covers the unchanged prefix,
+    /// so the append must **not** raise the full-rewrite flag.
+    ///
+    /// Regression guard: the removed local implementation compared
+    /// `compute_list_hash(whole list).starts_with(stored_hash)`, which is never true
+    /// for the full-list hashes of different list sizes — appends were always
+    /// flagged as full rewrites.
+    ///
+    /// Note on the COS layout: the list lives in a single JSON object, so an append
+    /// still rewrites that object (the new element has to be persisted). What the
+    /// fix restores is the *predicate* semantics shared with Java/core.
+    #[tokio::test]
+    async fn pure_append_does_not_trigger_full_rewrite() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        s.save_list(Some("u1"), "s1", "items", &[serde_json::json!("a")]).await;
+        let hash_key = s.hash_key(Some("u1"), "s1", "items").unwrap();
+        let stored_hash = backend.get_string(&hash_key).await.unwrap().unwrap();
+
+        let appended = [serde_json::json!("a"), serde_json::json!("b")];
+
+        // The append is recognized as appending the existing `[a]` prefix ...
+        assert!(
+            !needs_full_rewrite(&appended[..], Some(&stored_hash), 1),
+            "appending to an unmodified prefix must not require a full rewrite"
+        );
+
+        // ... while the old implementation's `starts_with` condition is provably
+        // false here, i.e. it *did* demand a full rewrite for the same input.
+        let whole = compute_hash(&appended[..]);
+        let old_predicate = !whole.starts_with(&stored_hash);
+        assert!(
+            old_predicate,
+            "full-list hashes of different sizes are not prefix-related — the removed \
+             `!compute_list_hash(values).starts_with(stored_hash)` always yielded `true`"
+        );
+
+        s.save_list(Some("u1"), "s1", "items", &appended).await;
+
+        // The appended data is persisted and the hash tracks the new full list.
+        assert_eq!(s.get_list(Some("u1"), "s1", "items").await, appended.to_vec());
+        assert_eq!(backend.get_string(&hash_key).await.unwrap().unwrap(), whole);
+    }
+
+    /// A same-length, unmodified list is not rewritten (dedup path preserved).
+    #[tokio::test]
+    async fn identical_list_is_not_rewritten() {
+        let backend = CountingStore::new();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+        let values = vec![serde_json::json!(1), serde_json::json!(2)];
+
+        s.save_list(Some("u1"), "s1", "items", &values).await;
+        assert_eq!(backend.puts(), 2, "list object + hash object");
+
+        s.save_list(Some("u1"), "s1", "items", &values).await;
+        assert_eq!(
+            backend.puts(),
+            3,
+            "an unchanged list must not rewrite the list object"
+        );
+    }
+
+    /// `[a, b]` then `[a, b, c]` is likewise a pure append.
+    #[test]
+    fn appended_prefix_hash_stays_valid() {
+        let prefix = vec![serde_json::json!("a"), serde_json::json!("b")];
+        let full = vec![serde_json::json!("a"), serde_json::json!("b"), serde_json::json!("c")];
+        let stored = compute_hash(&prefix);
+        assert!(!needs_full_rewrite(&full, Some(&stored), prefix.len()));
+    }
+
+    /// Modifying an element inside the previously stored prefix requires a rewrite.
+    #[test]
+    fn modified_element_triggers_full_rewrite() {
+        let stored = compute_hash(&[serde_json::json!("a"), serde_json::json!("b")]);
+        let changed = vec![
+            serde_json::json!("a"),
+            serde_json::json!("CHANGED"),
+            serde_json::json!("c"),
+        ];
+        assert!(needs_full_rewrite(&changed, Some(&stored), 2));
+    }
+
+    /// Shrinking the list requires a rewrite.
+    #[test]
+    fn shrink_triggers_full_rewrite() {
+        let stored = compute_hash(&[serde_json::json!(1), serde_json::json!(2)]);
+        assert!(needs_full_rewrite(&[serde_json::json!(1)], Some(&stored), 2));
+    }
+
+    /// With no pre-existing data a missing hash must not force a rewrite.
+    #[test]
+    fn empty_existing_state_does_not_force_rewrite() {
+        assert!(!needs_full_rewrite(&[serde_json::json!(1)], None, 0));
+        // ... but a missing hash *with* existing data cannot be verified.
+        assert!(needs_full_rewrite(&[serde_json::json!(1)], None, 1));
+    }
+
+    /// First write over legacy `.list.json` data written by the old SHA-256 scheme:
+    /// `existing_count` is observed but the hash object is missing/stale, so the
+    /// store rewrites the list and self-heals. No data is lost.
+    #[tokio::test]
+    async fn legacy_state_without_hash_self_heals() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        let list_key = s.list_key(Some("u1"), "s1", "items").unwrap();
+        let hash_key = s.hash_key(Some("u1"), "s1", "items").unwrap();
+        let legacy = vec![serde_json::json!("old-1"), serde_json::json!("old-2")];
+        backend
+            .put_string(&list_key, &serde_json::to_string(&legacy).unwrap())
+            .await
+            .unwrap();
+        // Legacy SHA-256 hash object present, but unrelated to core's scheme.
+        backend.put_string(&hash_key, "deadbeef").await.unwrap();
+
+        let updated = vec![
+            serde_json::json!("old-1"),
+            serde_json::json!("old-2"),
+            serde_json::json!("new"),
+        ];
+        s.save_list(Some("u1"), "s1", "items", &updated).await;
+
+        assert_eq!(s.get_list(Some("u1"), "s1", "items").await, updated);
+        assert_eq!(
+            backend.get_string(&hash_key).await.unwrap().unwrap(),
+            compute_hash(&updated)
+        );
     }
 }
