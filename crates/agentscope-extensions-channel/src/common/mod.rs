@@ -4,6 +4,8 @@
 //! adapter would otherwise duplicate (outbound-address parsing, HTTP plumbing, token caching).
 
 pub mod bot_loop_guard;
+pub mod channel_core;
+pub mod channel_registry;
 pub mod crypto;
 pub mod error;
 pub mod http;
@@ -18,6 +20,8 @@ pub mod xml;
 pub mod testing;
 
 pub use bot_loop_guard::{BotLoopGuard, BotLoopGuardConfig};
+pub use channel_core::{to_core_error, ChannelCore};
+pub use channel_registry::ChannelRegistry;
 pub use crypto::{aes_256_cbc_decrypt, pkcs7_unpad, AES_BLOCK_SIZE, AES_KEY_SIZE};
 pub use error::{ChannelError, Result};
 pub use http::{HttpMethod, HttpTransport, PreparedRequest, PreparedResponse, ReqwestTransport};

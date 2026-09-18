@@ -14,6 +14,7 @@ pub mod channel;
 pub mod gateway_bootstrap;
 pub mod harness_gateway;
 pub mod msg_context;
+pub mod platform_channel;
 pub mod session_turn_gate;
 pub mod subagent;
 pub mod subagent_bridge;
@@ -82,3 +83,6 @@ pub use task_bridge::{
     wire_task_completion,
 };
 pub use wakeup_dispatcher::{WakeupDispatcher, WakeupTarget};
+// Shared platform-channel plumbing (inbound dispatch + outbound delivery) reused by the
+// `agentscope-extensions-channel` provider adapters. See `platform_channel` module docs.
+pub use platform_channel::{PlatformChannel, PlatformCtx};

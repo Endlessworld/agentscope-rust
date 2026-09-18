@@ -32,7 +32,8 @@ pub mod gitlab;
 pub mod wecom;
 
 pub use common::{
-    AccessTokenProvider, BotLoopGuard, ChannelError, HttpMethod, HttpTransport, IdempotencyStore,
-    PeerTarget, PreparedRequest, PreparedResponse, ReqwestTransport, Result, TokenCache,
+    AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelError, ChannelRegistry, HttpMethod,
+    HttpTransport, IdempotencyStore, PeerTarget, PreparedRequest, PreparedResponse, ReqwestTransport,
+    Result, TokenCache,
 };
 

@@ -6,15 +6,18 @@
 //! - [`FeishuOutboundClient`] — `POST /open-apis/im/v1/messages` request builders
 //! - [`FeishuAccessTokenProvider`] — cached `tenant_access_token` fetcher
 //!
-//! Not yet ported (see `docs/extensions/CHANNEL__GAP_TRACKER.md` §3): `FeishuCrypto` (AES-256-CBC
-//! payload decrypt), `FeishuCallbackController` (needs a web framework) and `FeishuChannel`.
+//! Not yet ported (see `docs/extensions/CHANNEL__GAP_TRACKER.md` §3): `FeishuCallbackController`
+//! (axum shell over [`FeishuChannel::handle_callback`]).
 
+pub mod channel;
+pub mod controller;
 pub mod crypto;
 pub mod inbound;
 pub mod outbound;
 pub mod properties;
 pub mod token;
 
+pub use channel::{FeishuCallbackOutcome, FeishuChannel, FeishuChannelRegistry};
 pub use crypto::FeishuCrypto;
 pub use inbound::FeishuInboundMapper;
 pub use outbound::FeishuOutboundClient;

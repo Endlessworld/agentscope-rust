@@ -18,6 +18,10 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 # --- CHANNEL platform-adapter deps (Java: okhttp/WebClient -> reqwest, jackson -> serde) ---
 reqwest = { workspace = true }
+# Callback/webhook HTTP entry points (Feishu/GitHub/GitLab/WeCom controllers).
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 sha1 = "0.10"

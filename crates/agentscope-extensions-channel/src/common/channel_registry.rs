@@ -23,7 +23,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use agentscope_harness::agent::{Channel, ChannelManager, ChannelSink};
+// NOTE: `agentscope_harness::agent::Channel` is the *legacy* event-emit struct kept in
+// `gateway/mod.rs` for backward compatibility; the routing trait with the same name lives at
+// `gateway::channel::Channel`, so it must be imported through its full path.
+use agentscope_harness::agent::gateway::channel::Channel;
+use agentscope_harness::agent::{ChannelManager, ChannelSink};
 
 /// Typed registry of platform channels, optionally mirrored into a harness [`ChannelManager`].
 pub struct ChannelRegistry<C>
@@ -79,7 +83,8 @@ where
     /// Register (or replace) a channel by its `channel_id`. Mirrors the Java `register(channel)`,
     /// additionally mirroring into the harness `ChannelManager` when configured.
     pub async fn register(&self, channel: Arc<C>) {
-        let channel_id = channel.channel_id().to_string();
+        // `Channel` and `ChannelSink` both declare `channel_id()`, so qualify the call.
+        let channel_id = Channel::channel_id(&*channel).to_string();
         self.channels
             .write()
             .expect("channel registry lock poisoned")

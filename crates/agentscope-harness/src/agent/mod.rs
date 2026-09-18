@@ -28,6 +28,7 @@ pub use gateway::{
     DefaultSubagentMaterializer, Gateway, GatewayAgent, GatewayBootstrap,
     GatewayBootstrapBuilder, GatewayTurnContext, HarnessGateway, InboundMessage,
     InMemorySubagentRegistry, MsgContext, OutboundAddress, OutboundEnvelope, Peer, PeerKind,
+    PlatformChannel, PlatformCtx,
     RouteResult, SendOptions, SessionTurnGate, SubagentMaterializer, SubagentRecord,
     SubagentRegistry, TaskCompletionBridge, wire_task_completion,
     WakeupDispatcher, WakeupTarget,

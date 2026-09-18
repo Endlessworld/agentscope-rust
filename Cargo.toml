@@ -51,6 +51,20 @@ base64 = "0.22"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP 服务端选型：统一 axum（protocol / aistio / channel；裁定见
+# docs/extensions/EXTENSIONS_GAP_TRACKER.md §2.1 "HTTP 框架选型"）。
+axum = { version = "0.7", default-features = false, features = ["json", "tokio", "http1", "query"] }
+http = "1"
+bytes = "1"
+
+# 真实后端驱动（存储/技能模块 P1；由各 crate 以可选依赖 + feature 引入，默认仍走内存实现）。
+sqlx = "0.9"
+mysql_async = "0.37"
+tokio-postgres = "0.7"
+mongodb = "3"
+object_store = "0.14"
+redis = { version = "1.7", default-features = false, features = ["script", "tokio-comp", "connection-manager"] }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

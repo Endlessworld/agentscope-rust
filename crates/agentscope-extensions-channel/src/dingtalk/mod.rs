@@ -5,15 +5,21 @@
 //! - [`DingTalkInboundMapper`] — Stream bot-message JSON → harness `InboundMessage`
 //! - [`DingTalkOutboundClient`] — outbound request builders for DM / group sends
 //! - [`DingTalkAccessTokenProvider`] — cached OpenAPI `accessToken` fetcher
-//!
-//! Not yet ported (see `docs/extensions/CHANNEL__GAP_TRACKER.md` §3): `DingTalkStreamClient`
-//! (persistent WebSocket gateway) and `DingTalkChannel` (the `Channel` lifecycle/routing adapter).
+//! - [`DingTalkChannel`] — the `Channel` lifecycle/routing adapter
+//! - [`DingTalkStreamClient`] — persistent WebSocket gateway client (register → connect → ACK loop)
 
+pub mod channel;
 pub mod inbound;
 pub mod outbound;
 pub mod properties;
+pub mod stream;
 pub mod token;
 
+pub use channel::{DingTalkChannel, DingTalkChannelRegistry};
+pub use stream::{
+    ChannelPayloadSink, DingTalkStreamClient, DingTalkStreamProtocol, StreamEndpoint,
+    StreamPayloadSink, StreamSocket, TungsteniteConnector, WebSocketConnector,
+};
 pub use inbound::DingTalkInboundMapper;
 pub use outbound::DingTalkOutboundClient;
 pub use properties::DingTalkChannelProperties;

@@ -8,23 +8,19 @@
 //! 4. send the reply back out through the platform outbound client (best-effort)
 //! 5. swap the routing config live via `applyRoutingConfig`
 //!
-//! Step 4 is the only platform-specific one, so it stays in each adapter; steps 1-3 and 5 live
-//! here in [`ChannelCore`].
-//!
-//! ## Harness boundary
-//!
-//! Routing and outbound-sink registration are **harness** responsibilities
-//! (`agentscope_harness::agent::{ChannelRouter, ChannelManager}`). This crate only supplies the
-//! platform payload handling, so `ChannelCore` deliberately delegates rather than reimplements:
-//! `ChannelRouter` evaluates the 7 binding tiers and `ChannelManager` owns the
-//! `channel_id -> ChannelSink` lookup used for proactive delivery.
+//! Steps 1-3 and 5 are *platform-agnostic*, so the harness owns them in
+//! [`PlatformCtx`](agentscope_harness::agent::PlatformCtx) together with the
+//! [`PlatformChannel`](agentscope_harness::agent::PlatformChannel) trait (which also provides the
+//! blanket `Channel`/`ChannelSink` wiring). [`ChannelCore`] therefore does **not** re-store the
+//! gateway/config/router — it composes a `PlatformCtx` and adds only the two guards the Java
+//! `*Channel` classes each hold privately (`IdempotencyStore`, `BotLoopGuard`).
 
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentscope_core::error::{Error, Result as CoreResult};
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{
-    ChannelConfig, ChannelRouter, HarnessGateway, InboundMessage, OutboundAddress, RouteResult,
+    ChannelConfig, HarnessGateway, InboundMessage, OutboundAddress, PlatformCtx, RouteResult,
 };
 
 use super::bot_loop_guard::BotLoopGuard;
@@ -39,30 +35,35 @@ pub fn to_core_error(err: ChannelError) -> Error {
 }
 
 /// Shared state + dispatch pipeline for a platform channel adapter.
-#[derive(Debug)]
+///
+/// Routing/gateway state lives in the harness `PlatformCtx`; this type only adds the per-channel
+/// guards. The counter lets tests assert how many events the guards admitted.
 pub struct ChannelCore {
-    channel_id: String,
-    config: RwLock<ChannelConfig>,
-    router: ChannelRouter,
+    ctx: PlatformCtx,
     idempotency: IdempotencyStore,
     bot_loop_guard: BotLoopGuard,
-    gateway: RwLock<Option<Arc<HarnessGateway>>>,
+    admitted: AtomicUsize,
+}
+
+impl std::fmt::Debug for ChannelCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelCore")
+            .field("ctx", &self.ctx)
+            .field("admitted", &self.admitted.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl ChannelCore {
     /// Build from the resolved routing config. Mirrors the Java constructor argument list
     /// (`channelId`, `ChannelConfig`, `new ChannelRouter(config.defaultAgentId())`).
     pub fn new(channel_id: impl Into<String>, config: ChannelConfig) -> Self {
-        let channel_id = channel_id.into();
-        let router = ChannelRouter::new(config.default_agent_id.as_deref());
-        Self {
+        Self::with_components(
             channel_id,
-            config: RwLock::new(config),
-            router,
-            idempotency: IdempotencyStore::with_defaults(),
-            bot_loop_guard: BotLoopGuard::with_defaults(),
-            gateway: RwLock::new(None),
-        }
+            config,
+            IdempotencyStore::with_defaults(),
+            BotLoopGuard::with_defaults(),
+        )
     }
 
     /// Build with explicit idempotency / loop-guard instances (Java tests inject fresh ones).
@@ -72,20 +73,21 @@ impl ChannelCore {
         idempotency: IdempotencyStore,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
-        let channel_id = channel_id.into();
-        let router = ChannelRouter::new(config.default_agent_id.as_deref());
         Self {
-            channel_id,
-            config: RwLock::new(config),
-            router,
+            ctx: PlatformCtx::new(channel_id, config),
             idempotency,
             bot_loop_guard,
-            gateway: RwLock::new(None),
+            admitted: AtomicUsize::new(0),
         }
     }
 
+    /// The shared routing/gateway state (also used by each adapter's `PlatformChannel::ctx`).
+    pub fn ctx(&self) -> &PlatformCtx {
+        &self.ctx
+    }
+
     pub fn channel_id(&self) -> &str {
-        &self.channel_id
+        self.ctx.channel_id()
     }
 
     /// The current routing config. Mirrors the Java `ChannelConfig config()` accessor.
@@ -93,53 +95,35 @@ impl ChannelCore {
     /// The Java `FeishuCallbackController` reads the *platform properties* rather than this, so the
     /// config snapshot is primarily used by `Channel::config()` and diagnostics.
     pub fn config(&self) -> ChannelConfig {
-        self.config.read().expect("config lock poisoned").clone()
+        self.ctx.config()
     }
 
     /// Inject the auto-wired gateway. Idempotent, mirroring the Java
     /// `if (this.gateway == null) { this.gateway = ... }` guard.
-    pub fn init(&self, gateway: Arc<HarnessGateway>) {
-        let mut slot = self.gateway.write().expect("gateway lock poisoned");
-        if slot.is_none() {
-            *slot = Some(gateway);
-        }
+    pub fn init(&self, gateway: std::sync::Arc<HarnessGateway>) {
+        self.ctx.init(gateway)
     }
 
     /// The stored gateway, or an error when `init` was never called. Mirrors the Java
     /// `IllegalStateException("<Platform>Channel '<id>' has no gateway")`.
-    pub fn gateway(&self) -> CoreResult<Arc<HarnessGateway>> {
-        self.gateway
-            .read()
-            .expect("gateway lock poisoned")
-            .clone()
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "channel '{}' has no gateway; call init(...) first",
-                    self.channel_id
-                ))
-            })
+    pub fn gateway(&self) -> CoreResult<std::sync::Arc<HarnessGateway>> {
+        self.ctx.gateway()
     }
 
     /// Whether a gateway has been injected.
     pub fn has_gateway(&self) -> bool {
-        self.gateway.read().expect("gateway lock poisoned").is_some()
+        self.ctx.has_gateway()
     }
 
-    /// Apply a new routing config in place and rebuild the router, mirroring the Java
-    /// `applyRoutingConfig` live swap. Returns `true` when applied.
+    /// Apply a new routing config in place, mirroring the Java `applyRoutingConfig` live swap.
+    /// Returns `true` when applied.
     pub fn apply_routing_config(&self, new_config: ChannelConfig) -> bool {
-        if new_config.channel_id != self.channel_id {
-            return false;
-        }
-        let mut slot = self.config.write().expect("config lock poisoned");
-        *slot = new_config;
-        true
+        self.ctx.apply_routing_config(new_config)
     }
 
     /// Resolve the route for `message` through the harness `ChannelRouter`.
     pub fn resolve_route(&self, message: &InboundMessage) -> RouteResult {
-        let config = self.config.read().expect("config lock poisoned");
-        self.router.resolve_route(&config, message)
+        self.ctx.resolve_route(message)
     }
 
     /// De-duplicate an inbound event key. `None` keys are always allowed through, mirroring the
@@ -147,10 +131,25 @@ impl ChannelCore {
     pub fn is_first_seen(&self, key: Option<&str>) -> bool {
         match key {
             Some(key) if !key.trim().is_empty() => {
-                self.idempotency.first_seen(&format!("{}|{key}", self.channel_id))
+                self.idempotency.first_seen(&format!("{}|{key}", self.ctx.channel_id()))
             }
             _ => true,
         }
+    }
+
+    /// Number of inbound events that passed both guards (idempotency + bot-loop).
+    pub fn admitted(&self) -> usize {
+        self.admitted.load(Ordering::Relaxed)
+    }
+
+    /// Run the two inbound guards in the Java order (idempotency, then bot-loop) and count the
+    /// admitted events. Returns `false` when the event must be dropped silently.
+    pub fn admit(&self, dedupe_key: Option<&str>, peer_key: &str) -> bool {
+        if !self.is_first_seen(dedupe_key) || !self.allow_peer(peer_key) {
+            return false;
+        }
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Per-peer bot-loop guard check.
@@ -172,22 +171,15 @@ impl ChannelCore {
     ///
     /// This is steps 1-3 of the Java `dispatch`; the caller then delivers the reply outbound.
     pub async fn run_turn(&self, message: &InboundMessage) -> CoreResult<(Msg, OutboundAddress)> {
-        let gateway = self.gateway()?;
-        let route = self.resolve_route(message);
-        let reply = gateway
-            .run_with_outbound(
-                Some(route.context),
-                message.messages.clone(),
-                Some(route.outbound_address.clone()),
-            )
-            .await?;
-        Ok((reply, route.outbound_address))
+        self.ctx.run_turn(message).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use agentscope_core::message::{Msg, MsgRole};
     use agentscope_harness::agent::{ChannelBinding, Peer};
 
@@ -274,6 +266,23 @@ mod tests {
         assert!(!c.allow_peer("direct:u1"));
         // A different peer keeps its own budget.
         assert!(c.allow_peer("direct:u2"));
+    }
+
+    #[test]
+    fn admit_applies_idempotency_then_the_loop_guard() {
+        let c = ChannelCore::with_components(
+            "feishu",
+            ChannelConfig::of("feishu"),
+            IdempotencyStore::with_defaults(),
+            BotLoopGuard::new(1, 60_000, 60_000).unwrap(),
+        );
+        // First event passes both guards.
+        assert!(c.admit(Some("evt-1"), "direct:u1"));
+        // Duplicate event id is dropped before the loop guard sees it.
+        assert!(!c.admit(Some("evt-1"), "direct:u1"));
+        // A fresh event id for the same peer still trips the per-peer budget.
+        assert!(!c.admit(Some("evt-2"), "direct:u1"));
+        assert_eq!(c.admitted(), 1);
     }
 
     #[test]

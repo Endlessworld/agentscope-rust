@@ -18,11 +18,10 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# HTTP 客户端/服务端（A2A / agent-protocol / chat-completions-web）
 reqwest = { workspace = true }
-axum = { version = "0.7", default-features = false, features = ["json", "tokio", "http1", "query"] }
-http = "1"
-bytes = "1"
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
