@@ -40,6 +40,12 @@
 
 结论：**Java 的 `AgentSkillRepository` 与 harness `SkillRepository` 是不同抽象层次**——前者是「后端 keyed CRUD」，后者是「harness 可消费的目录式只读装载」。本 crate 实现前者（后端适配），并提供后者适配器（`RepoBackedSkillRepository`），从而既覆盖 Java 行为、又接入 harness 消费路径，**零重复模型**。
 
+**Java 源码核实（2026-09-19，已定案，裁定生效）**：
+- Java 侧 `agentscope-extensions-skills` 模块**只有 repository 实现**，无业务逻辑：`agentscope-extensions-skill-git-repository/.../repository/GitSkillRepository.java`、`-skill-mysql-repository/.../repository/mysql/MysqlSkillRepository.java`、`-skill-postgresql-repository/.../repository/postgresql/PostgresSkillRepository.java`（模块根 `src/` 下无 `.java`）。
+- 接口 `AgentSkillRepository` 位于 **core**：`agentscope-core/src/main/java/io/agentscope/core/skill/repository/AgentSkillRepository.java`（正是扩展模块包名前缀 `io.agentscope.core.skill.repository` 的来源），由 core 的 `ReActAgent` 与 `DynamicSkillMiddleware` 消费。
+- ⇒ **Java 分层 = 【core：接口 + 模型】【extensions-skills：后端实现】**。本 crate 的分工与之一致；唯一差异是接口**落在 Rust harness 而非 core**（因 `agentscope-core` 无 `skill` 模块，见上表末行），属可接受的**归属位移而非层次错位**。**裁定维持原结论。**
+- 残留观察（非本 crate 职责）：Java 侧该接口被 **core 的 `ReActAgent`** 消费；Rust 侧对应 trait 仅在 harness。若将来 core 的 agent 也需挂载 skill 仓库，需重新讨论是否把 trait 上提到 core。
+
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
 | `io.agentscope.core.skill.repository.AgentSkillRepository`（core 接口） | skill 仓库契约：`getSkill/getAllSkillNames/getAllSkills/save/delete/skillExists/getRepositoryInfo/getSource/isWriteable/close` | `AgentSkillRepository`（本 crate，`src/repository.rs`） | 复用 harness `AgentSkill`；用 `Result` 表达错误，不再靠返回 bool + 抛异常混用 |

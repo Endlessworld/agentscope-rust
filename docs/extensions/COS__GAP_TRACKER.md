@@ -36,7 +36,7 @@
 |---|---|---|---|
 | `com.qcloud.cos:COSClient`（腾讯云 COS SDK） | `getObjectMetadata`/`getObject`/`putObject`/`deleteObject`/`listObjects` | 自有 async trait `CosObjectStore`（`get/put/delete/exists/len/list_prefix` + UTF-8 便捷方法）；测试用 `InMemoryCosObjectStore` | 未引入第三方 Rust COS SDK；真实适配器待办（§4.2） |
 | `io.agentscope.core.state.AgentStateStore` | 状态存储 trait | `agentscope_core::state::AgentStateStore` | §2.1 裁定：实现它，不重建 |
-| `io.agentscope.core.state.ListHashUtil` | list 增量 hash | 本 crate 内 `compute_list_hash` / `needs_full_rewrite` | core 无对应公开 API；用等价稳定 hash（见 §4.2） |
+| `io.agentscope.core.state.ListHashUtil` | list 增量 hash | 本 crate 内 `compute_list_hash` / `needs_full_rewrite` | **偏离**：core 已有公开 API `agentscope_core::state::list_hash`（采样策略，Java 忠实移植且已 `pub use`），本 crate 用全量 SHA-256；已裁定统一到 core（见汇总 §3.3、§4.2） |
 | `io.agentscope.core.util.JsonUtils` | JSON 编解码 | `serde_json` | |
 | `harness...remote.store.BaseStore` / `StoreItem` | 远程 KV trait | `agentscope_harness::filesystem::remote::store::{BaseStore, StoreItem, StoreValue}` | 实现既有 trait |
 | `harness...sandbox.snapshot.{RemoteSnapshotClient,RemoteSnapshotSpec,SandboxSnapshotSpec}` | 快照抽象 | 同名 harness trait | 实现/复用，不重建 |
@@ -61,7 +61,7 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | 真实 COS SDK 适配器 | `COSClient` 构造 | 待办 | 需 bucket/region/credential + HTTP 签名（自实现或接第三方）；实现 `CosObjectStore` 即可接入 |
-| `ListHashUtil` 精确对齐 | `ListHashUtil` | 待办 | 当前用等价稳定 hash；跨语言可加载性未验证 |
+| `ListHashUtil` 精确对齐 | `ListHashUtil` | 待办 | **已裁定（汇总 §3.3）**：core `agentscope_core::state::list_hash` 即 Java 采样策略的忠实移植，且已 `pub use`；本 crate 应改委托 core，本地 `compute_list_hash` 删除。**两处偏离**：① 本 crate 用全量 SHA-256（Java 为采样）；② `needs_full_rewrite` 拿**整个新列表**哈希做 `starts_with(存储哈希)`，而全量哈希下该前缀性质**不成立**（实测），故追加场景恒判为需全量重写 —— 增量追加优化失效（数据无损），应收敛为 core 的「取 `existing_count` 前缀哈希比较」 |
 | 分布式跨进程执行互斥 | （Java 亦为进程内） | 设计决定（不迁移） | harness guard 为进程内；跨进程协调未在 Java 实现，Rust 亦不做 |
 
 ## 4. 项目状态与下一步

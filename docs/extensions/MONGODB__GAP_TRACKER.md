@@ -34,7 +34,7 @@
 | `mongodb.snapshot.MongoSnapshotSpec`（33 行，`extends RemoteSnapshotSpec`） | 快照 spec 便捷包装 | `snapshot.rs::MongodbSnapshotSpec`，`impl SandboxSnapshotSpec` | 内部包装 harness `RemoteSnapshotSpec`；`new` 当前忽略 `database_name`（`snapshot.rs:58`） |
 | （测试替身）Java Testcontainers / Mockito | 离线/容器测试 | `client.rs::InMemoryMongoClient` | 忠实内存后端；duplicate-key 11000、`$set/$inc/$push/$setOnInsert/$unset`、dot-path 均已对齐 |
 | （驱动缝隙）Java 直依赖 `mongodb-driver-sync` | 文档/索引/GridFS 原始 API | `client.rs::MongoClient` trait（异步 seam） | driver-agnostic；真实驱动可后续实现同一 trait（§4.2） |
-| （列表哈希）Java core `ListHashUtil` | 列表变更检测 | `list_hash.rs`（crate 本地，SHA-256）**与** `agentscope_core::state::list_hash` 并存 | 两实现算法不同，见 §3.3 待确认 |
+| （列表哈希）Java core `ListHashUtil` | 列表变更检测 | `list_hash.rs`（crate 本地，SHA-256）**与** `agentscope_core::state::list_hash` 并存 | 两实现算法不同；**已裁定统一到 core**（见 §3.3、汇总 §3.3） |
 
 > 实测规模/测试数：`MongoDistributedStoreTest`15、`MongoIndexLifecycleContractTest`10、`MongoSandboxExecutionGuardTest`24、`MongoRemoteSnapshotClientTest`16、`MongoSnapshotSpecTest`2、`MongoAgentStateStoreContractTest`9、`MongoAgentStateStoreTest`39、`MongoBaseStoreContractTest`9、`MongoBaseStoreTest`23（合计 147 `@Test`）；`testutil/` 另有 `DockerAvailabilityCondition`(59 行) / `RequireDocker`(42 行) 各 1 个 `@Test` 注解用于 Docker 门控。
 
@@ -90,7 +90,7 @@
 ### 3.3 待确认 / 后续增强（P2）
 | 缺口项 | 说明 | 状态 |
 |---|---|---|
-| `list_hash` 双实现 | crate `list_hash.rs`（SHA-256 over canonical JSON）vs core `agentscope_core::state::list_hash`（`compute_hash<T: Hash>` DefaultHasher 采样 + `EMPTY_HASH`/`SAMPLING_THRESHOLD`）；`state_store.rs` 当前用 **crate 本地实现** | **待确认** |
+| `list_hash` 双实现 | crate `list_hash.rs`（SHA-256 over canonical JSON）vs core `agentscope_core::state::list_hash`（`compute_hash<T: Hash>` DefaultHasher 采样 + `EMPTY_HASH`/`SAMPLING_THRESHOLD`）；`state_store.rs` 当前用 **crate 本地实现** | **已裁定（见汇总 §3.3）：统一到 core，crate 本地转委托** |
 | `MongodbSnapshotSpec::new` 忽略 `database_name` | `snapshot.rs:58` 显式 `let _ = database_name...`；InMemory 后端仅按 bucket 键 | **待确认** |
 | `lib.rs` doc 表把 `MongodbGuardClient` 写作 "implements `SandboxExecutionGuard`" | harness 该类型是 struct 非 trait，实际为镜像方法，文档不准确 | **待办（文档）** |
 | `delete_key_inner` dead_code warning | `state_store.rs:433` 定义，仅测试 `:745` 引用；前一轮记录为唯一残留 warning（本次未重跑 cargo 复核） | **待办** |
@@ -123,7 +123,7 @@
 1. 无阻塞；`RemoteSnapshotSpec: Clone` / `dyn MongoClient: Debug` / 闭包 move 三类历史错误在当前代码中已不存在（`MongodbDistributedStore` 已手写 `Debug` impl、含 `dyn MongoClient` 的字段用 `Arc` 包裹），本会话未新增对 harness 的改动需求。
 2. 建议后续：确认 `state_store.rs::delete_key_inner` 是否接入 `delete` 路径，否则删除以消除唯一残留 warning。
 3. 建议后续：为 `find_one_and_update`/`update_one` 的 duplicate-key upsert 语义补充显式回归测试（本会话已通过 `state_store` 用例间接覆盖）。
-4. 待裁定：crate 本地 `list_hash.rs`（SHA-256）与 `agentscope_core::state::list_hash`（DefaultHasher 采样）算法不一致，`state_store.rs` 当前用 crate 本地实现。建议统一到 core，或在 tracker 明确「crate 本地优先」并说明跨进程稳定性理由（见 §3.3）。
+4. **已裁定（2026-09-19，依 Java 源码）**：crate 本地 `list_hash.rs`（SHA-256）与 `agentscope_core::state::list_hash` 并存 —— **以 core 为正解**。Java `io.agentscope.core.state.ListHashUtil` 采用**采样**策略（`"size:N;"` + 采样位 `"i:itemHashCode,"`，末了 `Integer.toHexString(sb.hashCode())`；`EMPTY_HASH="empty:0"`、`SAMPLING_THRESHOLD=5`、采样位 `[0,n/4,n/2,3n/4,n-1]`），**不是全量哈希**；本 crate 的 SHA-256 全量实现**偏离 Java**（也丧失了采样的 O(1) 特性）。**要求后续改动：`state_store.rs` 改调 `agentscope_core::state::list_hash`**，crate 本地 `list_hash.rs` 降为对 core 的 re-export（或删除）。若确有跨进程稳定性诉求，应作为**升级 core 算法**的独立议题讨论，而非保留双实现并存。
 5. 待裁定/缺口：`state_store.rs:433 delete_key_inner` 仅被测试 `:745` 调用，非 test 构建触发 `dead_code` warning；应接入 `delete(user,session,key)` 公共路径或删除（见 §3.2、§3.3）。
 6. 待裁定/缺口：`snapshot.rs` 未保留 Java 的 legacy 单文档回退与 GridFS 分块语义；`MongodbSnapshotSpec::new` 忽略 `database_name`。补真实驱动接入时一并处理（见 §3.2、§3.3）。
 
