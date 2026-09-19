@@ -14,17 +14,17 @@
 
 | # | 波次 | 模块 | Rust crate | Java 主/测行 | 状态 | 独立 tracker |
 |---|---|---|---|---|---|---|
-| 1 | A | MODEL | `agentscope-extensions-model` | 24885 / 45043 | 部分完成（build + test 通过；58 test；`dashscope` 已落地；逐类映射/缺口见独立 tracker） | `MODEL__GAP_TRACKER.md` |
-| 2 | A | PROTOCOL | `agentscope-extensions-protocol` | 16844 / 18860 | 部分完成（build + test 通过；130 test；`chat-completions-web` 已落地，`agui` 部分迁移（event+model 已落地，converter/adapter/encoder/processor/registry/runtime 未迁移）） | `PROTOCOL__GAP_TRACKER.md` |
-| 3 | A | RAG | `agentscope-extensions-rag` | 15438 / 16057 | 部分完成（build + test 通过；152 test；`ragflow` 已落地；逐类映射/缺口见独立 tracker） | `RAG__GAP_TRACKER.md` |
+| 1 | A | MODEL | `agentscope-extensions-model` | 24885 / 45043 | 部分完成（build + test 通过；**169 test**，汇总方独立复跑 169/0；`dashscope`+ollama 已落地，**`anthropic`（11 类）+ `gemini`（10 类）本轮已迁移**；剩余为 §3.2/§3.3 长尾增强，见独立 tracker） | `MODEL__GAP_TRACKER.md` |
+| 2 | A | PROTOCOL | `agentscope-extensions-protocol` | 16844 / 18860 | **已完成**（build + test 通过；**290 test**，汇总方独立复跑 290/0，基线 130；`agui` **整包已迁移**：模型补齐（RunAgentInput/AguiContext/AguiResume/AguiTool/ToolMergeMode）+ converter + adapter(+strategy) + encoder(SSE) + processor + registry + runtime + constants + error，均在 `mod.rs` 声明；剩余为 A2A runner/registry 1:1 等存量 P1 长尾，见独立 tracker §3.2） | `PROTOCOL__GAP_TRACKER.md` |
+| 3 | A | RAG | `agentscope-extensions-rag` | 15438 / 16057 | 部分完成（build + test 通过；**265 test**，汇总方独立复跑 265/0；`dify`/`ragflow`/`simple` 已落地，**`bailian`（7 类，含自建 ACS4-HMAC-SHA256 签名）+ `haystack`（10 类）本轮已迁移**；剩余 embedding HTTP 提供商/外部向量库/reader 增强为非本轮范围，见独立 tracker §3.2/§3.3） | `RAG__GAP_TRACKER.md` |
 | 4 | A | SANDBOX | `agentscope-extensions-sandbox` | 8024 / 1577 | **已完成**（build + test 通过；**108 test**；P0+P1 已落地：四后端 + `fs_spec`（四类 `*FilesystemSpec` 适配层）+ `kubernetes_files`（文件 API + `SandboxFileTransfer`）；harness 抽象缺口见独立 tracker §4.2） | `SANDBOX__GAP_TRACKER.md` |
 | 5 | A | CHANNEL | `agentscope-extensions-channel` | 4879 / 0 | **已完成**（build + test 通过；**241 test**；P0+P1+P2 全部落地：common 全量 + 六平台 provider 件 + **5 个 `*Channel` 适配 + 4 个 axum CallbackController + `DingTalkStreamClient` 常驻 WebSocket 网关**） | `CHANNEL__GAP_TRACKER.md` |
 | 6 | A | MEM | `agentscope-extensions-mem` | 4821 / 5746 | 已完成（build + test 通过；66 test） | `MEM__GAP_TRACKER.md` |
-| 7 | B | JDBC | `agentscope-extensions-jdbc` | 3106 / 1558 | 部分完成（build + test 通过；5 个编译错误已修；测试仅 lib 2，对照 Java 98 个 `@Test` 为 P0 缺口，见 §3.1） | `JDBC__GAP_TRACKER.md` |
-| 8 | B | REDIS | `agentscope-extensions-redis` | 2884 / 217 | 部分完成（21+2 test 通过；9 个编译错误已修；`base_store()` 自动接线与 find_keys SCAN 语义为 P1，见 §3.2）；list_hash 已收敛到 core（2026-09-19） | `REDIS__GAP_TRACKER.md` |
-| 9 | B | MONGODB | `agentscope-extensions-mongodb` | 2231 / 2427 | 部分完成（61+1 test 通过；GridFS 分块/legacy 回退为 P1/P2，见 §3）；list_hash 已收敛到 core（2026-09-19，原本地 SHA-256 实现删除） | `MONGODB__GAP_TRACKER.md` |
+| 7 | B | JDBC | `agentscope-extensions-jdbc` | 3106 / 1558 | 部分完成（build + test 通过；**115 test**，汇总方独立复跑 115/0，较基线 lib 2 大幅提升，对照 Java 98 个 `@Test` 的 **P0 测试缺口已关闭**；补测暴露并修复 4 个真 bug：session 表名递归自调/`search` 前缀漏项/`save_list` 批处理模板混跑致数据丢失/锁表 DDL 与 INSERT 列不匹配。剩余版本化 API 需 core 裁定，见独立 tracker §4.2） | `JDBC__GAP_TRACKER.md` |
+| 8 | B | REDIS | `agentscope-extensions-redis` | 2884 / 217 | **已完成**（build 0 warning；**92+2 test**，汇总方独立复跑 92/0，基线 21→92；本轮：`find_keys_by_pattern` 改 **SCAN 游标**语义、`base_store()` 自动接线（保留 URL + `connect_lazy`，构造时零 I/O）、`RedisSandboxLease::released` 接线为 `AtomicBool` 消除 dead code、新增内存替身 `MemoryRedisAdapter`/`MemoryRedisCommands`/`MemoryStoreCommands` 与 `RedisCommands`/`StoreCommands` 缝；唯一剩余缺口为真实 Redis 集成测试（环境受限），见 §4.2）；list_hash 已收敛到 core（2026-09-19） | `REDIS__GAP_TRACKER.md` |
+| 9 | B | MONGODB | `agentscope-extensions-mongodb` | 2231 / 2427 | **已完成**（build 0 warning；**76+1 test**，汇总方独立复跑 76/0；本轮补齐 GridFS 255KB 分块/legacy 回退/chunk 完整性校验、`database_name` 生效、`delete_key` 接线消除 dead code；list_hash 已收敛到 core（2026-09-19）） | `MONGODB__GAP_TRACKER.md` |
 | 10 | B | MYSQL | `agentscope-extensions-mysql` | 2070 / 204 | 已完成（build + test 通过） | `MYSQL__GAP_TRACKER.md` |
-| 11 | B | POSTGRESQL | `agentscope-extensions-postgresql` | 1571 / 1583 | 部分完成（build + test 通过；7 test，测试覆盖仍偏少，见 §3.1） | `POSTGRESQL__GAP_TRACKER.md` |
+| 11 | B | POSTGRESQL | `agentscope-extensions-postgresql` | 1571 / 1583 | 部分完成（build + test 通过；**104 test**，汇总方独立复跑 104/0，较基线 7（全挤在 `sql.rs`）显著提升，`state`/`store`/`snapshot`/`guard`/`distributed` 零测试区已补齐；补测暴露并修复 `MemoryClient` SQL 分派缺陷（只匹配未加引号表名，实际发出 schema 限定名 → 模拟器对大半个模块不可用）；剩余锁 key 哈希跨语言一致性为 P2 待确认，见独立 tracker §3.3） | `POSTGRESQL__GAP_TRACKER.md` |
 | 12 | B | COS | `agentscope-extensions-cos` | 882 / 760 | 已完成（build + test 通过，31+2 test；真实 SDK 适配见各模块 §4.2）；list_hash 已收敛到 core 并修复「追加恒全量重写」行为偏离（2026-09-19） | `COS__GAP_TRACKER.md` |
 | 13 | B | OSS | `agentscope-extensions-oss` | 795 / 290 | 已完成（build + test 通过） | `OSS__GAP_TRACKER.md` |
 | 14 | C | AISTIO | `agentscope-extensions-aistio` | 9352 / 2841 | 已完成（build + test 通过；65 test；本会话修复 2 个失败 + 恢复误删的 6 个依赖） | `AISTIO__GAP_TRACKER.md` |
@@ -95,6 +95,26 @@
 2. **`Channel`/`ChannelSink` 的 `channel_id()` 歧义（E0034）**：新增 `ChannelSink` blanket impl 后，两 trait 同名方法同时在作用域内会使 `c.channel_id()` 无法推导。修法：在 `channel_registry.rs` 与 harness 测试中限定为 `Channel::channel_id(&…​)`。
 
 > 另外两次失败经查为**环境/既有问题、非代码缺陷**：①全量测试在默认并行度下偶发 3 个 `training::runner` 失败（该 crate 用进程级 `OnceLock` 静态注册表 + `clear_all()`，属既有测试间竞争；单独跑 3/3 全绿）；②`os error 1455/112`（页面文件不足导致 rlib mmap 失败）会产生「could not compile」假阳性，降并行度（`-j 2`）可规避。
+
+### 3.1.4 子智能体回执（第十批：七模块缺口攻坚）
+
+**本批目标**：针对七个模块的未完成部分并行攻坚，并把「裁定不迁移」的条目统一标记为「已完成（设计决定，不迁移）」。
+
+| 模块 | 任务 | 处置/产出 | 状态（经汇总方独立复跑） |
+|---|---|---|---|
+| MODEL | 迁移 `anthropic`/`gemini` | 新增 `src/anthropic/`（7 文件）+ `src/gemini/`（7 文件），实现 core `Model`/`ModelProvider`，复用 `HttpTransport` seam；零新增依赖 | ✅ **169 passed / 0 failed**（基线 58） |
+| RAG | 迁移 `bailian`/`haystack` | 新增 `src/bailian/`（9 文件，含**自建 ACS4-HMAC-SHA256 签名**，金标向量钉住）+ `src/haystack/`（7 文件）；本 crate 新增 `hmac`/`sha2`/`uuid` 依赖 | ✅ **265 passed / 0 failed**（基线 152） |
+| JDBC | 补齐测试（Java 98 `@Test`） | 新增 6 个 `tests/*.rs`（115 用例）；补测暴露并修复 **4 个真 bug**（session 表名递归自调、`search` 前缀漏项、`save_list` 批处理模板混跑致数据丢失、锁表 DDL 与 INSERT 列不匹配） | ✅ **115 passed / 0 failed**（基线 lib 2；P0 测试缺口已关闭） |
+| POSTGRESQL | 补齐测试（Java 130+ `@Test`） | `state`/`store`/`snapshot`/`guard`/`distributed` 零测试区补齐 + `sql` 扩展；修复 `MemoryClient` SQL 分派缺陷（只匹配未加引号表名） | ✅ **104 passed / 0 failed**（基线 7） |
+| MONGODB | GridFS 分块 / legacy 回退 | GridFS 255KB 分块 + chunk 完整性校验 + legacy 单文档回退、`database_name` 生效、`delete_key` 接线（消除 dead code） | ✅ **76 + 1 doc-test passed / 0 failed**（基线 61） |
+| REDIS | `base_store()` 接线 / `find_keys` SCAN | `SCAN` 游标语义、`base_store()` 自动接线（保留 URL + `connect_lazy`）、`released` 接线为 `AtomicBool`；新增内存替身 + `RedisCommands`/`StoreCommands` 缝 | ✅ **92 + 2 doc-test passed / 0 failed**（基线 21） |
+| PROTOCOL | `agui` 整包（converter/adapter/encoder/processor/registry/runtime） | 首个子智能体**中途网络错误中断**，已落盘 ~8800 行；汇总方修复 5 个编译错误 + 3 个失败用例（11→8 failed），再派收尾任务清零剩余 8 个 | ⏳ 收尾中 |
+
+**本批教训（已写入 tracker）**：
+1. **子智能体因网络错误中断后会留下「可编译/不可编译的半成品」**：PROTOCOL 首个子智能体落盘 8800 行但从未跑过编译（5 个编译错误 + 11 个失败用例），且 **tracker 完全未回填**。收尾必须先 `cargo build`，再逐用例判定实现 bug 还是断言错。
+2. **两个收尾 agent 连续网络失败**：PROTOCOL 收尾首次派发亦失败（0 改动落盘）；REDIS 收尾成功。说明**长任务应尽早落盘并分段验证**。
+3. **补测是发现真 bug 的高效手段**：JDBC 一轮 113 个新用例暴露 4 个真 bug（含 `save_list` **数据丢失**与锁表 DDL 不匹配导致的**锁永远插不进**）；POSTGRESQL 暴露 `MemoryClient` 对大半个模块**实际不可用**（既有 7 用例全在 `sql.rs` 故从未触发）。
+4. **「裁定不迁移」= 已完成**：各 tracker §3.4/§3.3 的设计决定项（Spring AutoConfiguration、已弃用的 Jedis/Redisson store、需真实 API key 的 e2e、依赖 JVM 库的 Tika/PDFBox/POI reader 等）已按用户指令统一标记为「已完成（设计决定，不迁移）」并写明依据。
 
 ### 3.1.3 子智能体回执（第五批：全量复测与收尾）
 

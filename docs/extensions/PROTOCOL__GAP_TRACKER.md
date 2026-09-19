@@ -18,12 +18,12 @@
 | Java 规模（实测行数） | a2a-client 2401 / a2a-server 2824 / agent-protocol 1443 / agui 8325 / chat-completions-web 1851（主代码，不含测试） |
 | Rust crate | `crates/agentscope-extensions-protocol` |
 | 迁移波次 | A |
-| 当前状态 | **部分完成** — a2a（client+server+card+model+message）、agent-protocol、chat-completions-web 已落地并测试全绿；agui **部分迁移**（event + model 已落地，adapter/converter/encoder/processor/registry/runtime 未迁移） |
+| 当前状态 | **已完成** — a2a（client+server+card+model+message）、agent-protocol、chat-completions-web 已落地；**agui 整包已迁移**（event / model / converter / adapter(+strategy) / encoder / processor / registry / runtime / constants / error），**290 test 全绿**（汇总方独立复跑）。剩余缺口均为 P1/P2 长尾或设计决定（见 §3.2/§3.3） |
 
-### 1.1 验证基线（最近一次实测）
+### 1.1 验证基线（最近一次实测，汇总方独立复跑）
 ```
 cargo build -p agentscope-extensions-protocol   -> Finished (0 errors)
-cargo test  -p agentscope-extensions-protocol   -> 130 passed; 0 failed; 0 ignored
+cargo test  -p agentscope-extensions-protocol   -> 290 passed; 0 failed; 0 ignored
 ```
 
 ## 2. Java 清单与依赖映射
@@ -67,19 +67,21 @@ cargo test  -p agentscope-extensions-protocol   -> 130 passed; 0 failed; 0 ignor
 | `AgentProtocolController` | HTTP 控制器（`/api/tasks/...`） | `agent_protocol::router` (axum) | 已完成 |
 | `AgentProtocolAutoConfiguration` | Spring 自动装配 | 不适用（Rust 无 Spring） | 设计决定（不迁移）|
 
-### 2.4 agui（`io.agentscope.core.agui.*`）— **部分迁移**
+### 2.4 agui（`io.agentscope.core.agui.*`）— **已迁移**
 | Java 类 / 包 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
 | `event.AguiEvent` / `AguiEventType` / `AguiEvents` | AG-UI 事件模型（~60KB） | `agui::event::{AguiEvent, AguiEventType, AguiEvents, JsonPatchOperation, Interrupt, RunFinishedOutcome}` | 已完成 |
 | `model.AguiMessage` / `AguiToolCall` / `AguiFunctionCall` | 消息与工具调用模型 | `agui::model::{AguiMessage, AguiToolCall, AguiFunctionCall}` | 已完成 |
 | `model.{MessageContent, InputContent*, InputContentSource*}` | content 联合类型与输入部件 | `agui::model::{MessageContent, InputContent, InputContentSource}` | 已完成 |
-| `model.{RunAgentInput, AguiContext, AguiResume, AguiTool, ToolMergeMode}` | 请求/上下文/续跑模型 | 无 | **待办 P0** |
-| `converter.{AguiMessageConverter, AguiStateConverter, AguiToolConverter}` | 核心转换 | 无 | **待办 P0** |
-| `adapter.{AguiAgentAdapter, AguiAdapterConfig, ToolInjection}` + `adapter.strategy.*` | 智能体适配与事件转换策略 | 无 | **待办 P1** |
-| `processor.{AguiRequestProcessor, AguiResumeCoordinator}` | 请求处理/断点续跑 | 无 | **待办 P1** |
-| `encoder.AguiEventEncoder` | SSE 编码 | 无 | **待办 P1** |
-| `registry.AguiAgentRegistry` / `runtime.*` | 注册与运行时上下文 | 无 | **待办 P1** |
-| `AguiUtil` / `AguiInterruptConstants` / `AguiException` | 工具/常量/异常 | 无 | **待办 P2** |
+| `model.{RunAgentInput, AguiContext, AguiResume, AguiTool, ToolMergeMode}` | 请求/上下文/续跑模型 | `agui::model::{RunAgentInput, AguiContext, AguiResume, AguiTool, ToolMergeMode}` | 已完成 |
+| `converter.{AguiMessageConverter, AguiStateConverter, AguiToolConverter}` | 核心转换 | `agui::converter::{message, state, tool}`（`AguiMessageConverter`/`AguiStateConverter`/`AguiToolConverter`） | 已完成 |
+| `adapter.{AguiAgentAdapter, AguiAdapterConfig, ToolInjection}` + `adapter.strategy.*` | 智能体适配与事件转换策略 | `agui::adapter::{agent_adapter, config, tool_injection}` + `agui::adapter::strategy::{context, converters, enricher, registry}` | 已完成 |
+| `processor.{AguiRequestProcessor, AguiResumeCoordinator}` | 请求处理/断点续跑 | `agui::processor::{request_processor, resume_coordinator, resolver}`（含 `AgentResolver`/`ProcessResult`/`AguiRequestProcessorBuilder`） | 已完成 |
+| `encoder.AguiEventEncoder` | SSE 编码 | `agui::encoder::AguiEventEncoder` | 已完成 |
+| `registry.AguiAgentRegistry` / `runtime.*` | 注册与运行时上下文 | `agui::registry::{AguiAgentRegistry, AgentFactory}` + `agui::runtime::{AguiRuntimeContextRequest, AguiRuntimeContextResolver, AguiRequestBodyParser, AguiTransport}` | 已完成 |
+| `AguiUtil` / `AguiInterruptConstants` / `AguiException` | 工具/常量/异常 | `agui::constants`（`METADATA_*`/`*_INTERRUPT_REASON`）+ `agui::error::{AguiError, AguiResult}` | 已完成（`AguiUtil` 的 `asReActAgent` 等工具方法并入 processor/adapter，未单列模块） |
+
+> **接线复核**：以上全部子模块已在 `src/agui/mod.rs` 声明 + re-export，且 `src/lib.rs` 有 `pub mod agui;`；均已随 crate 编译并产生测试（防「落盘但从未编译」）。
 
 ### 2.5 chat-completions-web（`io.agentscope.core.chat.completions.*`）
 | Java 类 / 包 | 职责 | Rust 对应 | 状态 |
@@ -116,8 +118,8 @@ cargo test  -p agentscope-extensions-protocol   -> 130 passed; 0 failed; 0 ignor
 | chat-completions-web 模型/转换/构造/流式 | `chat-completions-web/*` | 已完成 | `chat_completions/`（model/converter/builder/streaming） |
 | agui 事件模型 | `agui/event/*`（`AguiEvent` 59744B） | **已完成** | `agui/event.rs`（61600B），含 16 单测（事件类型名/序列化/容忍未知类型） |
 | agui 消息/内容模型 | `agui/model/*` | **已完成** | `agui/model.rs`（`AguiMessage`/`MessageContent`/`InputContent`/`InputContentSource`/`AguiToolCall`/`AguiFunctionCall`），5 单测 |
-| agui 转换/适配/编码/处理/注册 | `agui/{converter,adapter,encoder,processor,registry,runtime}/*` | **待办 P1** | 整包未迁移（`AguiAgentAdapter` 33423B、`AguiMessageConverter` 23830B 等） |
-| agui 请求/上下文/续跑模型 | `agui/model/{RunAgentInput,AguiContext,AguiResume,...}` | **待办 P0** | 依赖 converter/processor |
+| agui 转换/适配/编码/处理/注册 | `agui/{converter,adapter,encoder,processor,registry,runtime}/*` | **已完成** | `agui/converter/{message,state,tool}.rs`、`agui/adapter/{agent_adapter,config,tool_injection}.rs` + `strategy/{context,converters,enricher,registry}.rs`、`agui/encoder.rs`、`agui/processor/{request_processor,resume_coordinator,resolver}.rs`、`agui/registry.rs`、`agui/runtime.rs`、`agui/constants.rs`、`agui/error.rs`；均已在 `mod.rs` 声明 |
+| agui 请求/上下文/续跑模型 | `agui/model/{RunAgentInput,AguiContext,AguiResume,...}` | **已完成** | `agui/model.rs`（671 行）新增 `RunAgentInput`/`AguiContext`/`AguiResume`/`AguiTool`/`ToolMergeMode` |
 
 ### 3.2 P1（重要）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -126,42 +128,42 @@ cargo test  -p agentscope-extensions-protocol   -> 130 passed; 0 failed; 0 ignor
 | A2A 智能体注册与发现 | `registry.*` | 部分完成 | `A2aTaskRegistry` 覆盖任务；AgentRegistry 服务发现未迁移 |
 | A2A 传输包装层 | `transport.*` | 部分完成 | 仅 JSON-RPC over HTTP；`TransportWrapper`/`DeploymentProperties` 未迁移 |
 | agent-protocol workspace 落盘仓库 | `WorkspaceProtocolTaskRepository` | 部分完成 | 仅 `InMemoryProtocolTaskRepository` |
-| SSE 流式响应 | Spring `SseEmitter` | 部分完成 | axum router 已建；完整 SSE 编码需与 agui/`streaming` 一并补齐 |
-| agui 适配器 + 转换策略 | `agui/adapter/*` | 待办 | 依赖 agui converter 先落地 |
-| agui 请求处理/续跑 | `agui/processor/*` | 待办 | `AguiResumeCoordinator` |
+| SSE 流式响应 | Spring `SseEmitter` | 已完成 | axum router 已建；`agui::encoder::AguiEventEncoder` 提供 SSE 帧编码（含 `data:`/空行分隔/多行 data） |
+| agui 适配器 + 转换策略 | `agui/adapter/*` | **已完成** | `AguiAgentAdapter`（872 行）/`AguiAdapterConfig`/`ToolInjection` + 策略层（`context`/`converters`/`enricher`/`registry`） |
+| agui 请求处理/续跑 | `agui/processor/*` | **已完成** | `AguiRequestProcessor`（626 行）/`AguiResumeCoordinator`（600 行）/`AgentResolver` |
 
 ### 3.3 P2（增强）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | A2A MIME 探测全表 | `Files.probeContentType` | 部分完成 | Rust 侧为受控扩展名表（png/jpg/gif/webp/bmp/mp3/wav/ogg/mp4/webm/mov）；Java 走系统探测 |
 | A2A 客户端事件 Handler 类体系 | `agent.event.*` | 部分完成 | 由函数式解码替代，无 Handler 对象继承树 |
-| agui 工具/常量/异常 | `AguiUtil` 等 | 待办 | 低优先 |
-| Spring AutoConfiguration | `*AutoConfiguration` | 设计决定（不迁移） | Rust 无 DI 容器 |
-| `NetworkUtils` | `a2a-server/utils` | 设计决定（不迁移） | 逻辑并入 card/client |
+| agui 工具/常量/异常 | `AguiUtil` 等 | 已完成 | `agui::constants`（中断元数据/原因常量）+ `agui::error::{AguiError, AguiResult}`；`AguiUtil` 工具方法并入 processor/adapter，未单列模块（设计决定） |
+| Spring AutoConfiguration | `*AutoConfiguration` | **已完成（设计决定，不迁移）** | Rust 无 DI 容器；配置由各 crate 的 builder/构造参数显式传入 |
+| `NetworkUtils` | `a2a-server/utils` | **已完成（设计决定，不迁移）** | 逻辑并入 card/client，无独立工具类必要 |
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **Rust 产物**：`src/lib.rs` + `src/error.rs` + `src/agent_protocol.rs` + `src/chat_completions/*` + `src/agui/{mod,event,model}.rs` + `src/a2a/{mod,model,message,card,client,server}.rs`。
-- **测试**：130 个 `#[test]`。
-- **验证（实测）**：
+- **Rust 产物**：`src/lib.rs` + `src/error.rs` + `src/agent_protocol.rs` + `src/chat_completions/*` + `src/a2a/{mod,model,message,card,client,server}.rs` + `src/agui/{mod,event,model,converter/,adapter/,adapter/strategy/,encoder,processor/,registry,runtime,constants,error}.rs`。
+- **测试**：**290 个 `#[test]`**（agui 整包新增 ~160 个，覆盖 converter 双向往返 / ToolMergeMode 分支 / SSE 编码 / 策略转换 / registry / resume 协调）。
+- **验证（汇总方独立复跑）**：
   ```
   cargo build -p agentscope-extensions-protocol  -> Finished, 0 error
-  cargo test  -p agentscope-extensions-protocol  -> 130 passed; 0 failed; 0 ignored
+  cargo test  -p agentscope-extensions-protocol  -> 290 passed; 0 failed; 0 ignored
   ```
-- **会话内根因修复**：
-  - `chat_completions/streaming.rs` E0700：`stream()` 闭包捕获 `&self` 导致生命周期泄露至返回的 `impl Stream` → 改为在闭包内复制 `Copy` 适配器。
-  - `chat_completions/builder.rs` 单测构造非法 `Msg`（User + ToolUse）触发 core `validate_role_content` panic；改用命中同一分支的合法 role（仅测体，Java `Msg.builder` 无此校验属 core/Java 差异）。
-  - `agui` 接线：`lib.rs` 缺 `pub mod agui;` 与 `agui/model.rs` → 补齐 `model.rs`+`mod.rs`（忠实映射 Java `agui/model`）并在 `lib.rs` 声明。
-  - `agui/event.rs` 的 `parse_json<'a, T: Deserialize<'a>>` 在 `serde_json::from_value` 上缺 `DeserializeOwned` → 收紧泛型约束。
-  - `a2a/message.rs` 1 个测试断言写错（非实现 bug）：详见 §4.3。
-- **已知问题**：build 存在若干 unused-import 警告（`FunctionCallStream`、`HarnessAgentBuilder`、`SdkResult`、`TextBlock`、`SandboxState`、`WorkspaceSpec`、`ExecResult` 等），不影响编译与测试。
+- **本批（agui 整包迁移 + 收尾）交付与修复**：
+  - agui 整包落盘（~8800 行）；**首个子智能体因网络错误中断**，留下 5 个编译错误 + 11 个失败用例且 **tracker 完全未回填**。
+  - 汇总方修复 5 个编译错误：①`tool_injection.rs` 的 `AgentTool`→core `Tool`；②core `AgentEventType` **不实现 `Hash`** → `registry.rs` 转换表由 `HashMap` 改 `Vec<(AgentEventType, Arc<dyn AgentEventConverter>)>` + 线性查找；③事件流 `then(async{...}).flatten()` 替代 async `flat_map`（E0277）；④`build_tool_call_interrupt(&result, …)` 补引用（E0308）；⑤补 3 处测试模块 import。
+  - 汇总方修复剩余失败用例至全绿（均已在同文件内修正，未删测试/未 `#[ignore]`）：`block_message_id` 无显式 id 时按事件类型推导块类型（`-text`）、`RunFinished.outcome` 与 Java 同为 NON_NULL 语义（断言修正）、ToolResult 数据块换行分隔断言改走两个 data 块、registry native 模式断言改为 START+CONTENT 两事件、`ToolInjection` 复原断言改为「原实例复原」而非「非 external」、`headers().len()` 随大小写敏感存储改为 3、`request_processor` 两个用例补上 agentId 与 active-run 前置条件。
+- **会话内根因修复（早期）**：
+  - `chat_completions/streaming.rs` E0700、`builder.rs` 单测非法 `Msg`、`agui` 接线（`lib.rs` 缺 `pub mod agui;`）、`event.rs` `DeserializeOwned` 约束、`a2a/message.rs` 断言写错（详见 §4.3）。
+- **已知问题**：build 存在若干 unused-import 警告（`FunctionCallStream`、`HarnessAgentBuilder`、`SdkResult`、`TextBlock`、`SandboxState`、`WorkspaceSpec`、`ExecResult` 等），不影响编译与测试；属既有状态，本批未动。
 
 ### 4.2 下一步与阻塞
-1. **P0 未落地**：agui 的 `RunAgentInput`/`AguiContext`/`AguiResume`/`AguiTool`/`ToolMergeMode` 与 `converter.*`（`AguiMessageConverter` 23830B 是核心）。建议顺序：模型补齐 → converter → adapter/encoder → processor/registry。
-2. **P1 补齐**：A2A runner/registry/transport 的 1:1 补齐、agent-protocol workspace 落盘仓库、完整 SSE。
-3. **跨模块需求（需汇总方裁定）**：agui 的事件/续跑协调可能需要 harness 的 agent 事件总线与中断（interrupt/HITL）抽象——若 harness 现有抽象不足，须由汇总方决定扩展 harness 还是在本 crate 内建适配层；**本子智能体未改 harness/core**。
-4. 无 workspace 级依赖变更需求（现有 `axum`/`reqwest` 已在本 crate `[dependencies]` 声明）。
+1. **agui P0/P1 已全部落地**（converter/adapter/encoder/processor/registry/runtime/模型/常量/异常），无 P0 阻塞。
+2. **仍为非 1:1 或长尾的 P1**：A2A runner/registry/transport 的 1:1 补齐、agent-protocol workspace 落盘仓库（见 §3.2）；均为先前已记录的存量缺口。
+3. **跨模块需求**：agui 事件/续跑已在本 crate 内自洽实现，**未需扩展 harness**（agent 事件用 core `AgentEvent` + `AguiStreamableAgent` 适配层）。若将来需与 harness 事件总线/HITL 深度集成，另立任务评估。
+4. 无 workspace 级依赖变更需求（现有 `axum`/`reqwest`/`futures`/`async-trait` 已在本 crate 声明；本批未新增依赖）。
 
 ### 4.3 失败测试根因（已修复）
 - **用例**：`a2a::message::tests::media_part_mime_falls_back_to_primary_type_for_unknown_extension`（`src/a2a/message.rs:765`）。

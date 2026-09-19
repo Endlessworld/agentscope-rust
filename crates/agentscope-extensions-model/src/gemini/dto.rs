@@ -1,0 +1,401 @@
+//! Google Gemini (GenAI) wire DTOs (`POST {base_url}/v1beta/models/{model}:generateContent`).
+//!
+//! Java talks to the official `com.google.genai.Client` SDK, whose types
+//! (`Content`, `Part`, `GenerateContentConfig`, `GenerateContentResponse`, ...)
+//! are not available in Rust. This adapter therefore re-declares the REST wire
+//! shape and (de)serializes it with `serde`, like the other adapters.
+//!
+//! Field names mirror the REST API (`camelCase`, e.g. `inlineData`,
+//! `functionCall`, `maxOutputTokens`); unknown fields are ignored so newer API
+//! revisions stay parseable.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// `generateContent` request body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiRequest {
+    /// Conversation contents. Gemini has no `system` role: system prompts are
+    /// sent as `user` contents (the format the Java converter produces).
+    pub contents: Vec<GeminiContent>,
+    /// Tool declarations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<GeminiTool>>,
+    /// Tool-choice configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<GeminiToolConfig>,
+    /// Sampling / output configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_config: Option<GeminiGenerationConfig>,
+}
+
+/// One conversation turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GeminiContent {
+    /// `user` or `model` (Gemini's name for the assistant role). Optional on
+    /// parse: streaming chunks may omit it.
+    pub role: String,
+    pub parts: Vec<GeminiPart>,
+}
+
+/// A content part: exactly one of the payload fields is set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiPart {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Inline binary payload (image/audio/video/data), base64-encoded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<GeminiBlob>,
+    /// Model-issued tool call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<GeminiFunctionCall>,
+    /// Tool execution result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_response: Option<GeminiFunctionResponse>,
+    /// Opaque signature Gemini requires on replayed tool calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+    /// Marks a text part as reasoning content (responses only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought: Option<bool>,
+}
+
+impl GeminiPart {
+    /// Creates a plain text part.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { text: Some(text.into()), ..Default::default() }
+    }
+
+    /// Creates an inline-data part from an already base64-encoded payload.
+    pub fn inline(mime_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            inline_data: Some(GeminiBlob {
+                mime_type: mime_type.into(),
+                data: data.into(),
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+/// Inline binary payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiBlob {
+    pub mime_type: String,
+    /// Base64-encoded bytes.
+    pub data: String,
+}
+
+/// A tool call emitted by the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeminiFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub args: Map<String, Value>,
+}
+
+/// A tool execution result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeminiFunctionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    /// Gemini wraps the payload in a `{"output": ...}` map.
+    pub response: Map<String, Value>,
+}
+
+/// Tool declaration container.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiTool {
+    pub function_declarations: Vec<GeminiFunctionDeclaration>,
+}
+
+/// A single function declaration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFunctionDeclaration {
+    pub name: String,
+    pub description: String,
+    /// The raw JSON Schema (Gemini's `parametersJsonSchema` avoids the
+    /// OpenAPI-schema subset restrictions of the `parameters` field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters_json_schema: Option<Value>,
+}
+
+/// Tool-choice configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiToolConfig {
+    pub function_calling_config: GeminiFunctionCallingConfig,
+}
+
+/// Mirrors `FunctionCallingConfig`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFunctionCallingConfig {
+    /// `AUTO`, `NONE` or `ANY`.
+    pub mode: String,
+    /// Restricts `ANY` to the listed tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_function_names: Option<Vec<String>>,
+}
+
+/// `generationConfig` block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiGenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// Gemini models `topK` as a floating-point value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<GeminiThinkingConfig>,
+}
+
+impl GeminiGenerationConfig {
+    /// Whether every field is unset (so the block can be omitted entirely).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Extended-thinking configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiThinkingConfig {
+    /// Always `true` when the adapter sets a budget (matching the Java formatter).
+    pub include_thoughts: bool,
+    /// The thinking budget in tokens.
+    pub thinking_budget: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+/// `generateContent` / `streamGenerateContent` response body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiResponse {
+    #[serde(default)]
+    pub candidates: Vec<GeminiCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_metadata: Option<GeminiUsageMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<GeminiErrorBody>,
+}
+
+/// A single generation candidate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiCandidate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<GeminiContent>,
+    /// e.g. `STOP`, `MAX_TOKENS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+/// Token accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiUsageMetadata {
+    #[serde(default)]
+    pub prompt_token_count: Option<u64>,
+    #[serde(default)]
+    pub candidates_token_count: Option<u64>,
+    #[serde(default)]
+    pub total_token_count: Option<u64>,
+    #[serde(default)]
+    pub cached_content_token_count: Option<u64>,
+    #[serde(default)]
+    pub thoughts_token_count: Option<u64>,
+    #[serde(default)]
+    pub tool_use_prompt_token_count: Option<u64>,
+}
+
+/// Error envelope body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeminiErrorBody {
+    #[serde(default)]
+    pub code: i64,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_serializes_camel_case_and_omits_absent_fields() {
+        let request = GeminiRequest {
+            contents: vec![GeminiContent {
+                role: "user".into(),
+                parts: vec![GeminiPart::text("hi")],
+            }],
+            tools: None,
+            tool_config: None,
+            generation_config: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["contents"][0]["role"], serde_json::json!("user"));
+        assert_eq!(value["contents"][0]["parts"][0]["text"], serde_json::json!("hi"));
+        assert!(!value.as_object().unwrap().contains_key("tools"));
+        assert!(!value.as_object().unwrap().contains_key("generationConfig"));
+    }
+
+    #[test]
+    fn generation_config_uses_camel_case_names() {
+        let config = GeminiGenerationConfig {
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            top_k: Some(40.0),
+            seed: Some(7),
+            max_output_tokens: Some(1024),
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(0.2),
+            thinking_config: Some(GeminiThinkingConfig {
+                include_thoughts: true,
+                thinking_budget: 512,
+            }),
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["topP"], serde_json::json!(0.9));
+        assert_eq!(value["topK"], serde_json::json!(40.0));
+        assert_eq!(value["maxOutputTokens"], serde_json::json!(1024));
+        assert_eq!(value["thinkingConfig"]["includeThoughts"], serde_json::json!(true));
+        assert_eq!(value["thinkingConfig"]["thinkingBudget"], serde_json::json!(512));
+        assert!(!config.is_empty());
+        assert!(GeminiGenerationConfig::default().is_empty());
+    }
+
+    #[test]
+    fn inline_data_and_thought_signature_round_trip() {
+        let part = GeminiPart {
+            text: None,
+            inline_data: Some(GeminiBlob {
+                mime_type: "image/png".into(),
+                data: "AAAA".into(),
+            }),
+            function_call: None,
+            function_response: None,
+            thought_signature: Some("sig".into()),
+            thought: None,
+        };
+        let value = serde_json::to_value(&part).unwrap();
+        assert_eq!(value["inlineData"]["mimeType"], serde_json::json!("image/png"));
+        assert_eq!(value["thoughtSignature"], serde_json::json!("sig"));
+    }
+
+    #[test]
+    fn tool_declaration_uses_parameters_json_schema() {
+        let tool = GeminiTool {
+            function_declarations: vec![GeminiFunctionDeclaration {
+                name: "f".into(),
+                description: "d".into(),
+                parameters_json_schema: Some(serde_json::json!({"type": "object"})),
+            }],
+        };
+        let value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            value["functionDeclarations"][0]["parametersJsonSchema"]["type"],
+            serde_json::json!("object")
+        );
+    }
+
+    #[test]
+    fn tool_config_serializes_mode_and_allowed_names() {
+        let config = GeminiToolConfig {
+            function_calling_config: GeminiFunctionCallingConfig {
+                mode: "ANY".into(),
+                allowed_function_names: Some(vec!["f".into()]),
+            },
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["functionCallingConfig"]["mode"], serde_json::json!("ANY"));
+        assert_eq!(
+            value["functionCallingConfig"]["allowedFunctionNames"][0],
+            serde_json::json!("f")
+        );
+    }
+
+    #[test]
+    fn content_role_is_optional_on_parse() {
+        // Streaming chunks may omit the role; parsing must not fail.
+        let content: GeminiContent = serde_json::from_value(serde_json::json!({
+            "parts": [{ "text": "x" }]
+        }))
+        .unwrap();
+        assert_eq!(content.role, "");
+        assert_eq!(content.parts.len(), 1);
+    }
+
+    #[test]
+    fn response_parses_candidates_usage_and_error() {
+        let response: GeminiResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        { "thought": true, "text": "thinking" },
+                        { "text": "answer" },
+                        { "functionCall": { "id": "call_1", "name": "get_weather", "args": { "city": "Paris" } } }
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 2,
+                "cachedContentTokenCount": 3,
+                "toolUsePromptTokenCount": 1
+            },
+            "responseId": "resp_1"
+        }))
+        .unwrap();
+        assert_eq!(response.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(response.candidates[0].finish_reason.as_deref(), Some("STOP"));
+        let parts = &response.candidates[0].content.as_ref().unwrap().parts;
+        assert_eq!(parts[0].thought, Some(true));
+        assert_eq!(parts[2].function_call.as_ref().unwrap().name, "get_weather");
+
+        let usage = response.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, Some(10));
+        assert_eq!(usage.cached_content_token_count, Some(3));
+        assert_eq!(usage.tool_use_prompt_token_count, Some(1));
+
+        let error: GeminiResponse = serde_json::from_value(serde_json::json!({
+            "error": { "code": 400, "message": "bad key", "status": "INVALID_ARGUMENT" }
+        }))
+        .unwrap();
+        let error = error.error.unwrap();
+        assert_eq!(error.code, 400);
+        assert_eq!(error.status, "INVALID_ARGUMENT");
+    }
+}

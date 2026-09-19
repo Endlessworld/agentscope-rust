@@ -27,6 +27,16 @@
 //! * [`dify`] — the Dify Knowledge Base client ([`DifyRAGClient`](dify::DifyRAGClient),
 //!   [`DifyDocumentConverter`](dify::DifyDocumentConverter),
 //!   [`DifyKnowledge`](dify::DifyKnowledge)).
+//! * [`ragflow`] — the RAGFlow retrieval client + `Knowledge` adapter.
+//! * [`bailian`] — the Alibaba Cloud Bailian client
+//!   ([`BailianClient`](bailian::BailianClient),
+//!   [`BailianDocumentConverter`](bailian::BailianDocumentConverter),
+//!   [`BailianKnowledge`](bailian::BailianKnowledge)), including the dependency-free
+//!   ACS4-HMAC-SHA256 request signer the Java SDK used to apply.
+//! * [`haystack`] — the custom Haystack RAG client
+//!   ([`HayStackClient`](haystack::HayStackClient),
+//!   [`HayStackDocumentConverter`](haystack::HayStackDocumentConverter),
+//!   [`HayStackKnowledge`](haystack::HayStackKnowledge)).
 //!
 //! ## Design notes
 //!
@@ -37,10 +47,12 @@
 //! * Remote backends talk HTTP through an injectable transport trait, so the whole test suite
 //!   runs offline with mocks.
 
+pub mod bailian;
 pub mod dify;
 pub mod embedding;
 pub mod error;
 pub mod hash;
+pub mod haystack;
 pub mod knowledge;
 pub mod message;
 pub mod model;

@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-09-18） | 主代码 **2231 行（9 类）** / 测试 **2427 行（8 测试类 + 2 testutil，147 个 `@Test`，见 §2）** |
 | Rust crate | `crates/agentscope-extensions-mongodb` |
 | 迁移波次 | B |
-| 当前状态 | **部分完成**（`cargo build` 通过；lib **61 passed / 0 failed** + **1 doc-test passed**）；P0 骨架全部落地，存在 P1/P2 语义与文档待确认项，见 §3 |
+| 当前状态 | **已完成（本轮 P1/P2 收尾）**（`cargo build` 通过，**0 warning**；lib **76 passed / 0 failed** + **1 doc-test passed**，用例数 61 → 76）；GridFS 分块/legacy 回退、`database_name` 生效、`delete_key` 接线、离线测试补强均已落地，见 §3.2/§3.3；剩余为设计决定（真实驱动等），见 §4.2 |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -30,8 +30,8 @@
 | `mongodb.state.MongoAgentStateStore`（676 行） | 会话状态：单值 + 列表 + 版本 CAS + 列表哈希 + TTL | `state_store.rs::MongodbAgentStateStore`（+ builder / `UNVERSIONED` / `validate_state_key`），`impl agentscope_core::state::AgentStateStore` | 复合 `_id {user_id, session_id}`；`states`/`versions`/`hashes` 子文档；`save_if_version`/`get_version` 为固有方法 |
 | `mongodb.store.MongoBaseStore`（298 行） | 命名空间 KV + CAS + 前缀搜索 | `store.rs::MongodbStore`（+ `NS_SEPARATOR` / `NS_UPPER_BOUND`），`impl agentscope_harness::filesystem::remote::store::BaseStore` | US(0x1F) 命名空间编码 + `$gte/$lt` 范围前缀匹配；`version` 从 1 起，`put` 每次成功写 +1 |
 | `mongodb.sandbox.MongoSandboxExecutionGuard`（402 行） | 分布式锁（insert + 过期 reclaim + 租约续约） | `sandbox_guard.rs::MongodbSandboxExecutionGuard` + `Builder` + `MongodbLeaseHandle` + `MongodbGuardClient` + `compose_lock_id` | harness `SandboxExecutionGuard` 为**具体 struct 非 trait** → `MongodbGuardClient` 镜像其方法（`try_enter/release/is_held/active_count`）；`compose_lock_id` 与 Java **字节级一致**（`lock:`+hex(SHA-256(`scope:value`))，scope 小写） |
-| `mongodb.snapshot.MongoRemoteSnapshotClient`（178 行） | GridFS 快照上传/下载/存在 + legacy 单文档回退 | `snapshot.rs::MongodbRemoteSnapshotClient`，`impl RemoteSnapshotClient`，`delete` 为固有方法 | Rust 用统一 blob map（`gridfs_*`）；**无 GridFS 分块/legacy 回退语义**（见 §3.2/§3.3） |
-| `mongodb.snapshot.MongoSnapshotSpec`（33 行，`extends RemoteSnapshotSpec`） | 快照 spec 便捷包装 | `snapshot.rs::MongodbSnapshotSpec`，`impl SandboxSnapshotSpec` | 内部包装 harness `RemoteSnapshotSpec`；`new` 当前忽略 `database_name`（`snapshot.rs:58`） |
+| `mongodb.snapshot.MongoRemoteSnapshotClient`（178 行） | GridFS 快照上传/下载/存在 + legacy 单文档回退 | `snapshot.rs::MongodbRemoteSnapshotClient`，`impl RemoteSnapshotClient`，`delete` 为固有方法 | GridFS 分块（255KB，`{prefix}.files`+`{prefix}.chunks`，chunk 含 `files_id`/`n`/`data`）+ `length`/`chunkSize`/`uploadDate`/`metadata.createdAt` 已落地；下载按 `n` 重组并校验连续性/长度；`exists`/`download`/`delete` 均先 GridFS 再回退 legacy 单文档。**已补齐** |
+| `mongodb.snapshot.MongoSnapshotSpec`（33 行，`extends RemoteSnapshotSpec`） | 快照 spec 便捷包装 | `snapshot.rs::MongodbSnapshotSpec`，`impl SandboxSnapshotSpec` | 内部包装 harness `RemoteSnapshotSpec`；`database_name` 已生效（数据库限定 collection key） |
 | （测试替身）Java Testcontainers / Mockito | 离线/容器测试 | `client.rs::InMemoryMongoClient` | 忠实内存后端；duplicate-key 11000、`$set/$inc/$push/$setOnInsert/$unset`、dot-path 均已对齐 |
 | （驱动缝隙）Java 直依赖 `mongodb-driver-sync` | 文档/索引/GridFS 原始 API | `client.rs::MongoClient` trait（异步 seam） | driver-agnostic；真实驱动可后续实现同一 trait（§4.2） |
 | （列表哈希）Java core `ListHashUtil` | 列表变更检测 | `list_hash.rs`（**薄 re-export** → `agentscope_core::state::{compute_hash, needs_full_rewrite}`） | **已收敛（2026-09-19）**：本地 SHA-256 平行实现已删除；`state_store.rs` 直接调用 core（见 §3.3、§4.1） |
@@ -44,7 +44,7 @@
 | `org.mongodb:mongodb-driver-sync` | `MongoClient`/`MongoDatabase`/`MongoCollection` | **无真实驱动**；`client::MongoClient` trait（异步）+ `client::InMemoryMongoClient` | `Cargo.toml` 未引入 `mongodb` crate；`EXTENSIONS_GAP_TRACKER.md:122` 建议后续统一加入 `[workspace.dependencies]`，当前待汇总 |
 | Jackson（`JsonUtils`） | `Document` ↔ Java 对象 | `serde` = `1`、`serde_json` = `1`（workspace） | — |
 | BSON `Document`/`BsonDocument`/`IndexOptions` | 文档与索引描述 | `serde_json::{Map, Value}` + `index_utils::IndexSpec` | — |
-| `GridFSBucket`/`GridFSFile` | 快照分块存储 | `MongoClient::gridfs_upload/download/exists/delete` + 内存 blob map | 无 255KB 分块/16GB 语义 |
+| `GridFSBucket`/`GridFSFile` | 快照分块存储 | `MongoClient::gridfs_upload/download/exists/delete` + 内存 blob map | 已验证 255KB 分块（`GRIDFS_DEFAULT_CHUNK_SIZE = 255*1024`）：文件文档含 `length`/`chunkSize`/`uploadDate`/`metadata.createdAt`，chunk 按 `n` 顺序重组并校验完整性与总长 |
 | SLF4J `Logger` | 日志 | `tracing` = `0.1`（workspace） | `index_utils`/`sandbox_guard`/`state_store`/`store` 有埋点；`snapshot`/`client` 无 |
 | `sha2` = `0.10`（workspace） | 锁 id **及** `sandbox_guard` 的 SHA-256 | **保留**（收敛 `list_hash` 后仍被 `sandbox_guard.rs` 使用，见 §3.3） |
 | `java.util.UUID` | 租约 token | `uuid` = `1`（v4，workspace） | — |
@@ -75,40 +75,60 @@
 | `MongodbSandboxExecutionGuard` + builder + lease + guard client | `sandbox/MongoSandboxExecutionGuard.java` | 已完成 | 插入 + 过期 reclaim + token 作用域释放 + `lease_ttl/3` 续约 |
 | `MongodbDistributedStore` 组合者 | `MongoDistributedStore.java` | 已完成（形态差异） | 五个组件访问器 + `to_harness_store()`；含 `on_delete` 级联删快照 |
 | 无真实 DB 可用的内存后端 | Java Testcontainers / Mockito | 已完成 | `client::InMemoryMongoClient` |
-| **离线单元测试** | Java 8 测试类 **147 `@Test`**（contract test 需 Docker） | **部分完成（P1 缺口）** | 现状 lib **62** + doc-test **1**；crate **无 `tests/` 目录**（实测 `Test-Path` = False），全为 `#[cfg(test)]` 内联单测。补测方向：contract-test 级 state/store/snapshot/guard 往返、error-85 索引迁移并发、级联删快照、TTL、键转义 round-trip |
+| **离线单元测试** | Java 8 测试类 **147 `@Test`**（contract test 需 Docker） | **已完成（P1 收尾）** | 现状 lib **76** + doc-test **1**；crate **无 `tests/` 目录**（实测 `Test-Path` = False），全为 `#[cfg(test)]` 内联单测。本轮新增：GridFS 分块边界（`255*1024-1/-/+1`）、chunk 缺失/乱序报错、legacy 回退、`exists` 双路径、`database_name` 隔离、级联删快照、键转义 `.`/`$`/`\0`/`\` round-trip、TTL 索引、error-85 迁移（瞬态恢复 + 耗尽传播）、`delete_key` 公共路径 |
 
 ### 3.2 其它待办（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `supportsVersioning()` / `getVersioned()` | `state/MongoAgentStateStore.java:160,361` | 设计决定（不迁移） | core `AgentStateStore` trait 无版本方法，故降为固有 `get_version` / `save_if_version` |
-| 单 key 删除 `delete(user, session, key)` | `state/MongoAgentStateStore.java:523` | **待办** | Rust `state_store.rs:433 delete_key_inner` 仅被测试 `:745` 调用，**未接入公共/生产路径** → 非 test 构建触发 `dead_code` warning（见 §3.3、§4.2） |
-| `close()` / `ownsClient` / `fromConnectionString` | `MongoDistributedStore.java`；各组件 `close()` | 设计决定（不迁移） | Rust `Arc<dyn MongoClient>` 无连接所有权/关闭语义 |
-| 快照 legacy 单文档回退（`download`/`exists`） | `snapshot/MongoRemoteSnapshotClient.java` | **待确认** | Rust 用统一 blob map，未区分 GridFS / legacy 集合；真实驱动接入时需补 |
-| GridFS 分块（255KB）/ 16GB 语义 | 同上 | **待确认** | 内存后端不模拟；无真实驱动 |
+| `supportsVersioning()` / `getVersioned()` | `state/MongoAgentStateStore.java:160,361` | 已完成（设计决定，不迁移） | core `AgentStateStore` trait 无版本方法，故降为固有 `get_version` / `save_if_version`；依据：不重建平行类型（迁移硬约束） |
+| 单 key 删除 `delete(user, session, key)` | `state/MongoAgentStateStore.java:523` | **已完成** | 新增公共 `MongodbAgentStateStore::delete_key`（校验 key 后调 `delete_key_inner` 三路 `$unset`），`delete_key_inner` 保留为内部实现 → **dead-code warning 消除**，未用 `#[allow]` |
+| `close()` / `ownsClient` / `fromConnectionString` | `MongoDistributedStore.java`；各组件 `close()` | 已完成（设计决定，不迁移） | Rust `Arc<dyn MongoClient>` 无连接所有权/关闭语义；依据：harness/core 无对应 trait，不重建平行抽象 |
+| 快照 legacy 单文档回退（`download`/`exists`） | `snapshot/MongoRemoteSnapshotClient.java` | **已完成** | `download`/`exists`/`delete` 均先查 GridFS files，未命中则回退 legacy `{_id, data}` 单文档；有 `download_and_exists_fall_back_to_legacy_document` / `gridfs_takes_precedence_over_legacy_document` / `delete_gridfs_also_cleans_up_legacy_document` 用例覆盖 |
+| GridFS 分块（255KB）/ 16GB 语义 | 同上 | **已完成** | `client.rs` 按 `GRIDFS_DEFAULT_CHUNK_SIZE = 255*1024` 分块存 `{prefix}.files`/`{prefix}.chunks`（chunk 含 `files_id`/`n`/`data`），文件文档含 `length`/`chunkSize`/`uploadDate`/`metadata.createdAt`；下载按 `n` 重组并校验连续性/总长（缺失/乱序报 `corrupt GridFS file`）。与 Java `GridFSBucket` 等价（内存后端不设 16GB 上限，属实现差异） |
 | `ensureIndexes`（TTL / 复合 / sparse） | 各组件 | 已完成 | state(`ttl_days`)、store、guard(TTL `expiresAt`) 均经 `create_index_with_migration` |
 
 ### 3.3 待确认 / 后续增强（P2）
 | 缺口项 | 说明 | 状态 |
 |---|---|---|
 | ~~`list_hash` 双实现~~（**已收敛**） | **2026-09-19 解决**：删除 crate 本地 SHA-256 平行实现，`list_hash.rs` 降为 `pub use agentscope_core::state::{compute_hash, needs_full_rewrite}`；`state_store.rs` 直接调用 core。**理由**：①`serde_json::Value` 已实现 `Hash`（满足 core `T: Hash`，JDBC/Redis/PostgreSQL 同样调法）；②原注释声称「必须 SHA-256 才能跨进程稳定」不成立——`DefaultHasher::new()` 用固定常量种子（SipHasher13 keys=(0,0)），本就跨进程稳定；③原本地 `needs_full_rewrite` 在 `stored_hash==None && existing_count==0` 时返回 `!values.is_empty()`（即 `true`），**与 Java 相反**（Java Case3 `hasChanged(x, null)==false`，返回 `false`）。**存量数据影响**：hash 值格式变化（`size:N;i:hc,` hex vs SHA-256 hex）→ 首次写入旧数据会被判为需全量重写（`needs_full_rewrite==true`）并覆写 `hashes.<key>`，**数据无损且自愈**；详见 §4.1 | **已完成** |
-| `MongodbSnapshotSpec::new` 忽略 `database_name` | `snapshot.rs:58` 显式 `let _ = database_name...`；InMemory 后端仅按 bucket 键 | **待确认** |
-| `lib.rs` doc 表把 `MongodbGuardClient` 写作 "implements `SandboxExecutionGuard`" | harness 该类型是 struct 非 trait，实际为镜像方法，文档不准确 | **待办（文档）** |
-| `delete_key_inner` dead_code warning | `state_store.rs:433` 定义，仅测试 `:745` 引用；前一轮记录为唯一残留 warning（本次未重跑 cargo 复核） | **待办** |
-| `_cache: Arc<Mutex<()>>` 占位 | `distributed_store.rs:45`，对应 Java volatile double-checked 缓存的影子字段，实际未缓存任何值 | **待办** |
-| 组合者形态偏差 | Java `implements DistributedStore, AutoCloseable`；Rust 为组合 + `to_harness_store()`，未暴露 `close` / `ownsClient` | **待确认** |
-| `snapshot.rs` / `client.rs` 无 `tracing` 埋点 | Java `MongoRemoteSnapshotClient` 有 log.info/warn；Rust 该两文件无日志 | **待办** |
-| 真实 MongoDB 驱动接入 | 未引入 `mongodb` crate（`EXTENSIONS_GAP_TRACKER.md:122` 建议统一加入 workspace deps）；无集成测试 | **待办（跨模块/汇总方）** |
+| `MongodbSnapshotSpec::new` 忽略 `database_name` | **已完成（本轮）**：新增 `client::scoped_collection(db, coll)`，`MongodbRemoteSnapshotClient` 的 GridFS/legacy 调用均改用数据库限定的 collection key（`<db>::<bucket>`）；新增 `database_name_isolates_snapshots` / `spec_exposes_configured_database` 用例 | **已完成** |
+| `lib.rs` doc 表把 `MongodbGuardClient` 写作 "implements `SandboxExecutionGuard`" | harness 该类型是 struct 非 trait，实际为镜像方法，文档不准确 | **待办（文档，非阻塞）** |
+| `delete_key_inner` dead_code warning | **已完成（本轮）**：新增公共 `delete_key` 接入，`delete_key_inner` 成为其内部实现；`cargo build` 本 crate **0 warning** | **已完成** |
+| `_cache: Arc<Mutex<()>>` 占位 | `distributed_store.rs`，对应 Java volatile double-checked 缓存的影子字段，实际未缓存任何值 | **待办（非阻塞）** |
+| 组合者形态偏差 | Java `implements DistributedStore, AutoCloseable`；Rust 为组合 + `to_harness_store()`，未暴露 `close` / `ownsClient` | 已完成（设计决定，不迁移） |
+| `snapshot.rs` / `client.rs` 无 `tracing` 埋点 | Java `MongoRemoteSnapshotClient` 有 log.info/warn；Rust 该两文件无日志 | **待办（文档/埋点，非阻塞）** |
+| 真实 MongoDB 驱动接入 | 未引入 `mongodb` crate（`EXTENSIONS_GAP_TRACKER.md:122` 建议统一加入 workspace deps）；无集成测试 | **待办（设计决定，不迁移；跨模块/汇总方）** |
 
 ### 3.4 设计决定（不迁移）汇总
 | 项 | 依据 |
 |---|---|
 | 不新建公共 store crate；各 crate 自建 `XxxDistributedStore` | `EXTENSIONS_GAP_TRACKER.md` §2.1 已裁定 |
-| 不引入真实 `mongodb` 驱动，改 `MongoClient` trait + `InMemoryMongoClient` | 保离线可编译/可测；驱动接入记 §4.2 |
-| `close()` / 连接所有权 / `objectMapper` 注入 | harness/core 无对应语义，Rust 侧省略 |
-| `supportsVersioning` / `getVersioned` 降为固有方法 | core trait 未定义版本 API |
+| 不引入真实 `mongodb` 驱动，改 `MongoClient` trait + `InMemoryMongoClient` | 保离线可编译/可测；驱动接入记 §4.2（**设计决定，不迁移**） |
+| `close()` / 连接所有权 / `objectMapper` 注入 | harness/core 无对应语义，Rust 侧省略（**设计决定，不迁移**） |
+| `supportsVersioning` / `getVersioned` 降为固有方法 | core trait 未定义版本 API（**设计决定，不迁移**） |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
+
+#### 本会话（2026-09-19，P1/P2 收尾）实测
+- **命令与结果**：
+  - `cargo build -p agentscope-extensions-mongodb` → **exit 0，本 crate 0 warning**（此前唯一残留 warning `state_store.rs:432 delete_key_inner` 已消除；其余 warning 来自 core/harness，不在本 crate 范围）。
+  - `cargo test -p agentscope-extensions-mongodb` → **lib 76 passed / 0 failed** + **doc-test 1 passed / 0 failed**（exit 0）。
+- **用例数变化**：**61 → 76**（+15 lib 用例；doc-test 1 不变）。
+- **本次变更文件**：`src/client.rs`、`src/snapshot.rs`、`src/state_store.rs`、`src/index_utils.rs`、`src/distributed_store.rs`（均仅测试与实现，无新增依赖，`Cargo.toml` 未改）。
+- **实现变更**：
+  1. **GridFS 元数据**：`gridfs_upload` 写入 `length`/`chunkSize`/`uploadDate`/`metadata.createdAt`（对齐 Java `GridFSUploadOptions.metadata({createdAt})` + 驱动 stamp）。
+  2. **chunk 完整性校验**：`gridfs_download` 按 `n` 排序后要求连续 `0..chunk_count`，且重组长度等于存储 `length`；缺失/乱序/非 base64 均报 `corrupt GridFS file '<id>': ...`（`MongoError::Backend`）。
+  3. **`database_name` 生效**：新增 `client::scoped_collection(db, coll)`，`MongodbRemoteSnapshotClient` 的 GridFS/legacy 调用改用数据库限定 key，跨库快照不再互相可见。
+  4. **`delete_key` 接线**：新增公共 `MongodbAgentStateStore::delete_key(user, session, key)`，校验后三路 `$unset`（states/versions/hashes）；`delete_key_inner` 降为内部实现。
+- **新增 offline 用例（全 `InMemoryMongoClient`，无网络/Docker）**：
+  - snapshot：`gridfs_chunk_boundary_sizes_round_trip`（255KB-1 / 255KB / 255KB+1）、`gridfs_empty_payload_round_trips`、`missing_chunk_is_reported_as_corruption`、`out_of_order_duplicate_chunk_is_reported_as_corruption`、`gridfs_file_document_records_length_chunksize_and_upload_date`、`database_name_isolates_snapshots`、`spec_exposes_configured_database`。
+  - index_utils：`migration_recovers_after_transient_conflicts`、`migration_gives_up_after_max_attempts`（error-85 最多 3 次 drop+重试）。
+  - state_store：`public_delete_key_removes_value_version_and_hash`、`delete_key_validates_state_key`、`key_escaper_round_trips_dots_dollars_nul_and_backslash`、`ttl_index_is_created_only_when_positive`。
+  - distributed_store：`deleting_session_cascades_to_snapshot`、`deleting_session_without_snapshot_does_not_error`。
+- **测试基础设施**：`InMemoryMongoClient` 新增测试钩子 `force_index_conflicts(n)`，用于确定性验证 error-85 迁移的恢复与耗尽路径；不改变生产路径行为。
+
+#### 历史基线（上一轮，供对照）
 - **编译/测试基线（2026-09-19，本会话实测）**：`cargo build -p agentscope-extensions-mongodb` 与 `cargo test -p agentscope-extensions-mongodb` **均通过**（exit 0）。
   - `cargo build`：仅 1 条 warning（`state_store.rs:432 delete_key_inner` 从未使用，既有死代码，非阻塞）。其余 warning 来自 core/harness，不在本 crate 范围。
   - `cargo test -p agentscope-extensions-mongodb`：**lib 61 passed / 0 failed** + **doc-test 1 passed / 0 failed**。
@@ -128,12 +148,15 @@
 - **未删除任何既有功能**。
 - **本回填会话核对基线（汇总方提供，未重跑 cargo）**：`cargo build -p agentscope-extensions-mongodb` 通过；`cargo test -p agentscope-extensions-mongodb` = lib **62 passed / 0 failed** + **1 doc-test passed**；全量 `cargo test --workspace` = **1746 passed / 0 failed**（86 test target，exit 0）。crate 无 `tests/` 集成目录（实测 `Test-Path` = False），测试全部为 `#[cfg(test)]` 内联单测。
 ### 4.2 下一步与阻塞
-1. 无阻塞；`RemoteSnapshotSpec: Clone` / `dyn MongoClient: Debug` / 闭包 move 三类历史错误在当前代码中已不存在（`MongodbDistributedStore` 已手写 `Debug` impl、含 `dyn MongoClient` 的字段用 `Arc` 包裹），本会话未新增对 harness 的改动需求。
-2. 建议后续：确认 `state_store.rs::delete_key_inner` 是否接入 `delete` 路径，否则删除以消除唯一残留 warning。
-3. 建议后续：为 `find_one_and_update`/`update_one` 的 duplicate-key upsert 语义补充显式回归测试（本会话已通过 `state_store` 用例间接覆盖）。
-4. **list_hash 双实现已收敛（2026-09-19）**：crate 本地 SHA-256 平行实现已删除，统一到 `agentscope_core::state::list_hash`（Java `ListHashUtil` 的忠实采样移植）。`state_store.rs` 直接调用 core；`list_hash.rs` 为薄 re-export。若确有跨进程稳定性诉求，应作为**升级 core 算法**的独立议题讨论，而非恢复双实现。详见 §4.1。
-5. 待裁定/缺口：`state_store.rs:432 delete_key_inner` 仅被测试 `:745` 调用，非 test 构建触发 `dead_code` warning；应接入 `delete(user,session,key)` 公共路径或删除（见 §3.2、§3.3）。
-6. 待裁定/缺口：`snapshot.rs` 未保留 Java 的 legacy 单文档回退与 GridFS 分块语义；`MongodbSnapshotSpec::new` 忽略 `database_name`。补真实驱动接入时一并处理（见 §3.2、§3.3）。
+1. **无阻塞**。本次变更未新增对 harness/core 的改动需求；`Cargo.toml` 未改，无新增依赖。
+2. **已解决（本会话）**：`delete_key_inner` 已接入公共 `delete_key`，dead-code warning 消除（未用 `#[allow]`）；`snapshot` legacy 回退 + GridFS 分块已落地并有边界/损坏用例；`database_name` 已生效。
+3. **剩余缺口（设计决定，不迁移）**：
+   - **真实 `mongodb` 驱动接入**：未引入 `mongodb` crate。若需接入，建议统一加入 `[workspace.dependencies]`（`EXTENSIONS_GAP_TRACKER.md:122`），由**汇总方**处理；本 crate 仅实现同一 `MongoClient` trait 即可。内存后端不设 16GB 上限，属实现差异。
+   - **`close()` / 连接所有权 / `objectMapper` 注入**：harness/core 无对应语义，不迁移。
+   - **`supportsVersioning` / `getVersioned` 降为固有方法**：core `AgentStateStore` trait 无版本 API，不重建平行类型。
+   - **`_cache: Arc<Mutex<()>>` 占位**：对应 Java volatile double-checked 缓存的影子字段，不缓存任何值；保留以备后续 harness 扩展。
+4. **非阻塞文档/埋点项**：`lib.rs` doc 表述与 `MongodbGuardClient` 实际（镜像方法，非 trait 实现）不符；`snapshot.rs`/`client.rs` 无 `tracing` 埋点（Java 侧有 log.info/warn）。
+5. **后续建议**：真实驱动接入后，将 `chunkSize` 作为 `GridFSBucket` 参数（当前固定 255KB 默认值），并验证 `uploadDate`/`metadata` 在真驱动下的字节级一致。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-mongodb` 基线。

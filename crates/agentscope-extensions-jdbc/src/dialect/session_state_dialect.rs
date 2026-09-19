@@ -7,34 +7,35 @@
 //! composed slot). Method names are prefixed with `session_state` to avoid collisions in
 //! the aggregate dialect.
 
+use super::abstract_dialect::TableNameConfigurable;
 use super::bound_sql::{BoundSql, SqlParam};
 
 /// ANSI baseline SQL for the session-state table.
-pub trait SessionStateDialect: Send + Sync {
+pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
     /// Base table name (without prefix).
     fn session_state_table_name(&self) -> &str {
         "sessions"
     }
 
     /// Table-name prefix (default `agentscope_`).
-    fn session_state_table_prefix(&self) -> &str {
-        super::abstract_dialect::DEFAULT_TABLE_PREFIX
+    fn session_state_table_prefix(&self) -> String {
+        self.table_config().prefix
     }
 
     /// Optional full-table-name override (takes priority over prefix + base).
-    fn session_state_table_name_override(&self) -> Option<&str> {
-        None
+    fn session_state_table_name_override(&self) -> Option<String> {
+        self.table_config().session_state_table_name
     }
 
     /// Physical table name used by every business SQL statement in this trait:
     /// per-table override > prefix + base (mirrors Java's final `sessionStateTableName()`).
     fn resolved_session_state_table_name(&self) -> String {
         match self.session_state_table_name_override() {
-            Some(name) => name.to_string(),
+            Some(name) => name,
             None => format!(
                 "{}{}",
                 self.session_state_table_prefix(),
-                self.resolved_session_state_table_name()
+                self.session_state_table_name()
             ),
         }
     }
@@ -44,7 +45,7 @@ pub trait SessionStateDialect: Send + Sync {
 
     /// The `LIKE` escape character used by [`Self::session_state_list_session_ids`].
     fn session_state_like_escape_char(&self) -> char {
-        '\\'
+        '!'
     }
 
     /// Table-existence probe (used when schema auto-creation is disabled).
@@ -87,7 +88,32 @@ pub trait SessionStateDialect: Send + Sync {
         )
     }
 
-    /// Conditional UPDATE for a versioned single write (`version + 1`).
+    /// INSERT one list item at a given index (used in batched appends). Mirrors the Java
+    /// `sessionStateInsert` — four params, `version` defaults to 1 in the schema.
+    fn session_state_insert(
+        &self,
+        slot_id: &str,
+        key: &str,
+        index: i32,
+        json: &str,
+    ) -> BoundSql {
+        BoundSql::new(
+            format!(
+                "INSERT INTO {} (session_id, state_key, item_index, state_data) VALUES (?, ?, ?, ?)",
+                self.resolved_session_state_table_name()
+            ),
+            vec![
+                SqlParam::Text(slot_id.to_string()),
+                SqlParam::Text(key.to_string()),
+                SqlParam::Int(index as i64),
+                SqlParam::Text(json.to_string()),
+            ],
+        )
+    }
+
+    /// Compare-and-swap UPDATE guarded by `version == expected_version`; writes
+    /// `version = expected_version + 1` directly (mirrors Java
+    /// `sessionStateUpdateIfVersion`).
     fn session_state_update_if_version(
         &self,
         slot_id: &str,
@@ -98,12 +124,13 @@ pub trait SessionStateDialect: Send + Sync {
     ) -> BoundSql {
         BoundSql::new(
             format!(
-                "UPDATE {} SET state_data = ?, version = version + 1 \
+                "UPDATE {} SET state_data = ?, version = ? \
                  WHERE session_id = ? AND state_key = ? AND item_index = ? AND version = ?",
                 self.resolved_session_state_table_name()
             ),
             vec![
                 SqlParam::Text(json.to_string()),
+                SqlParam::Int(expected_version + 1),
                 SqlParam::Text(slot_id.to_string()),
                 SqlParam::Text(key.to_string()),
                 SqlParam::Int(index as i64),
@@ -112,7 +139,8 @@ pub trait SessionStateDialect: Send + Sync {
         )
     }
 
-    /// SELECT a single row. Projection: `(state_data, version)`.
+    /// SELECT a single row. Projection: `(state_data, version)` (mirrors Java
+    /// `sessionStateSelectVersioned`).
     fn session_state_select(&self, slot_id: &str, key: &str, index: i32) -> BoundSql {
         BoundSql::new(
             format!(
@@ -153,29 +181,6 @@ pub trait SessionStateDialect: Send + Sync {
             vec![
                 SqlParam::Text(slot_id.to_string()),
                 SqlParam::Text(key.to_string()),
-            ],
-        )
-    }
-
-    /// INSERT one list item at a given index (used in batched appends).
-    fn session_state_insert(
-        &self,
-        slot_id: &str,
-        key: &str,
-        index: i32,
-        json: &str,
-    ) -> BoundSql {
-        BoundSql::new(
-            format!(
-                "INSERT INTO {} (session_id, state_key, item_index, state_data, version) \
-                 VALUES (?, ?, ?, ?, 1)",
-                self.resolved_session_state_table_name()
-            ),
-            vec![
-                SqlParam::Text(slot_id.to_string()),
-                SqlParam::Text(key.to_string()),
-                SqlParam::Int(index as i64),
-                SqlParam::Text(json.to_string()),
             ],
         )
     }

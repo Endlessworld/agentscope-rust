@@ -74,14 +74,24 @@ impl JdbcAgentStateStore {
     }
 
     /// Verifies the session-state table exists (used when auto-creation is disabled).
+    ///
+    /// Mirrors the Java `verifyTableExists`, which throws when the existence probe
+    /// returns no rows. The probe is a `SELECT 1 ... WHERE <name match>` query, so an
+    /// empty result — not a SQL error — signals a missing table.
     pub fn verify_table_exists(&self) -> JdbcResult<()> {
         let table = self.dialect.resolved_session_state_table_name();
         let bound = self.dialect.session_state_check_table_exists(&table);
-        self.executor.query(&bound).map(|_| ()).map_err(|e| {
+        let rows = self.executor.query(&bound).map_err(|e| {
             JdbcError::Database(format!(
                 "table does not exist: {table}. use create_if_not_exist=true to auto-create. ({e})"
             ))
-        })
+        })?;
+        if rows.is_empty() {
+            return Err(JdbcError::Database(format!(
+                "table does not exist: {table}. use create_if_not_exist=true to auto-create."
+            )));
+        }
+        Ok(())
     }
 
     /// Encodes `(user_id, session_id)` into the `slot_id` column value.
@@ -214,7 +224,11 @@ impl JdbcAgentStateStore {
                 SINGLE_STATE_INDEX as i32,
                 &current_hash,
             ));
-            self.executor.execute_prepared_batch(&batch)?;
+            // The tail inserts and the hash upsert use different SQL templates
+            // (INSERT vs UPSERT), so run them as a plain multi-statement transaction.
+            // Preparing only `batch[0]`'s SQL would execute the hash upsert with the
+            // INSERT template and corrupt/lose the append.
+            self.executor.execute_batch(&batch)?;
         }
         Ok(())
     }
@@ -308,7 +322,7 @@ impl AgentStateStore for JdbcAgentStateStore {
             _ => ANON_USER.to_string(),
         };
         let prefix = format!("{user_segment}{SLOT_SEPARATOR}");
-        let pattern = like_prefix_pattern(&prefix);
+        let pattern = like_prefix_pattern(&prefix, self.dialect.session_state_like_escape_char());
         let bound = self.dialect.session_state_list_session_ids(&pattern);
         let Ok(rows) = self.executor.query(&bound) else {
             return Vec::new();
@@ -329,12 +343,12 @@ impl AgentStateStore for JdbcAgentStateStore {
 }
 
 /// Builds a `LIKE` prefix pattern matching exactly `prefix` followed by anything,
-/// escaping every `_`, `%` and the escape char so the user segment is literal.
-fn like_prefix_pattern(prefix: &str) -> String {
+/// escaping every `_`, `%` and the dialect's escape char so the user segment is literal.
+fn like_prefix_pattern(prefix: &str, escape: char) -> String {
     let mut out = String::with_capacity(prefix.len() + 1);
     for ch in prefix.chars() {
-        if ch == '\\' || ch == '%' || ch == '_' {
-            out.push('\\');
+        if ch == escape || ch == '%' || ch == '_' {
+            out.push(escape);
         }
         out.push(ch);
     }

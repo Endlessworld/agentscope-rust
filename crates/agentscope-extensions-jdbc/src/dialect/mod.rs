@@ -23,7 +23,8 @@ mod store_dialect;
 pub mod vendor;
 
 pub use abstract_dialect::{
-    validate_identifier, AbstractJdbcDialect, DialectKind, DEFAULT_TABLE_PREFIX,
+    validate_identifier, AbstractJdbcDialect, DialectKind, TableNameConfig, TableNameConfigurable,
+    TableNames, DEFAULT_TABLE_PREFIX,
 };
 pub use bound_sql::{BoundSql, SqlParam};
 pub use detection::{detect_dialect, JdbcDialectBuilder};

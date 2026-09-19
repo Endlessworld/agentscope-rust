@@ -122,7 +122,14 @@ impl MemoryClient {
     }
 
     fn normalize(sql: &str) -> String {
-        sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase()
+        // Collapse whitespace, uppercase, and drop identifier quotes so that
+        // schema-qualified names (`"agentscope"."agentscope_sessions"`) normalise to
+        // `AGENTSCOPE.AGENTSCOPE_SESSIONS` and can be matched by column signature.
+        sql.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase()
+            .replace('"', "")
     }
 
     fn param<'a>(params: &'a [SqlValue], idx: usize) -> &'a SqlValue {
@@ -236,7 +243,9 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- session state: upsert (save / save_hash) ----
-        if n.starts_with("INSERT INTO") && n.contains("AGENTSCOPE_SESSIONS") {
+        // Dispatched by the `session_id` column so schema qualification / custom table
+        // names don't defeat recognition.
+        if n.starts_with("INSERT INTO") && n.contains("SESSION_ID") {
             let session_id = Self::text_of(params, 0);
             let key = Self::text_of(params, 1);
             let index = Self::i32_of(params, 2);
@@ -271,7 +280,7 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- session state: conditional CAS update ----
-        if n.starts_with("UPDATE") && n.contains("AGENTSCOPE_SESSIONS") {
+        if n.starts_with("UPDATE") && n.contains("STATE_DATA") {
             // UPDATE <table> SET state_data = ?, version = ?, updated_at = ?
             //   WHERE session_id = ? AND state_key = ? AND item_index = ? AND version = ?
             let data = Self::text_of(params, 0);
@@ -317,7 +326,7 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- session state: SELECT single/target row ----
-        if n.starts_with("SELECT") && n.contains("FROM AGENTSCOPE_SESSIONS") {
+        if n.starts_with("SELECT") && n.contains("SESSION_ID") {
             if n.contains("MAX(ITEM_INDEX)") {
                 let session_id = Self::text_of(params, 0);
                 let key = Self::text_of(params, 1);
@@ -386,7 +395,7 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- session state: DELETE ----
-        if n.starts_with("DELETE FROM") && n.contains("AGENTSCOPE_SESSIONS") {
+        if n.starts_with("DELETE FROM") && n.contains("SESSION_ID") {
             let session_id = Self::text_of(params, 0);
             if n.contains("STATE_KEY") {
                 let key = Self::text_of(params, 1);
@@ -508,7 +517,8 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- snapshots: upsert ----
-        if n.starts_with("INSERT INTO") && n.contains("AGENTSCOPE_SNAPSHOTS") {
+        // Dispatched by the `snapshot_id` column so custom table names are recognised.
+        if n.starts_with("INSERT INTO") && n.contains("SNAPSHOT_ID") {
             let id = Self::text_of(params, 0);
             let data = match Self::param(params, 1) {
                 SqlValue::Bytes(b) => b.clone(),
@@ -519,7 +529,7 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- snapshots: download ----
-        if n.starts_with("SELECT DATA FROM") && n.contains("AGENTSCOPE_SNAPSHOTS") {
+        if n.starts_with("SELECT DATA FROM") && n.contains("SNAPSHOT_ID") {
             let id = Self::text_of(params, 0);
             return Ok(match t.snapshots.get(&id) {
                 Some(data) => QueryOutcome::Rows(vec![vec![Cell::Bytes(data.clone())]]),
@@ -528,7 +538,7 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- snapshots: exists ----
-        if n.starts_with("SELECT 1 FROM") && n.contains("AGENTSCOPE_SNAPSHOTS") {
+        if n.starts_with("SELECT 1 FROM") && n.contains("SNAPSHOT_ID") {
             let id = Self::text_of(params, 0);
             let exists = t.snapshots.contains_key(&id);
             return Ok(QueryOutcome::Rows(if exists {

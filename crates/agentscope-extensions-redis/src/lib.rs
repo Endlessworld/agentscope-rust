@@ -36,9 +36,14 @@ pub mod snapshot;
 pub mod state;
 pub mod store;
 
+pub(crate) mod raw_client;
+#[cfg(test)]
+pub(crate) mod test_support;
+
 mod distributed_store;
 
 pub use distributed_store::RedisDistributedStore;
+pub use raw_client::ManagerRedisCommands;
 pub use sandbox::{
     RedisSandboxExecutionGuard, RedisSandboxExecutionGuardBuilder, RedisSandboxLease,
 };

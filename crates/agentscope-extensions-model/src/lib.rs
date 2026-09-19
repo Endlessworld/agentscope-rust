@@ -17,10 +17,13 @@
 //!
 //! See `docs/extensions/MODEL__GAP_TRACKER.md` for the authoritative gap list.
 
+pub mod anthropic;
 pub mod common;
 pub mod dashscope;
+pub mod gemini;
 pub mod ollama;
 
+pub use anthropic::{AnthropicChatModel, AnthropicModelProvider};
 pub use common::{
     decode_stream_line, HttpRequestSpec, HttpTransport, JsonStream, MemoryTransport,
     ReqwestTransport, SharedTransport,
@@ -28,4 +31,5 @@ pub use common::{
 pub use dashscope::{
     DashScopeChatModel, DashScopeCredential, DashScopeModelProvider, EndpointType,
 };
+pub use gemini::{GeminiChatModel, GeminiModelProvider};
 pub use ollama::{OllamaChatModel, OllamaModelProvider, OllamaOptions};

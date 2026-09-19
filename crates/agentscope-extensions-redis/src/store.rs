@@ -19,9 +19,18 @@
 //! making version read + hash write + index update one atomic operation. This makes
 //! `put_if_version` safe as a distributed compare-and-swap primitive, matching the harness
 //! [`BaseStore`] contract (`expected_version == 0` ⇒ create-only-if-absent).
+//!
+//! ## Seams
+//!
+//! The harness [`BaseStore`] trait is **synchronous**, while the `redis` crate is async.
+//! Instead of bridging sync→async on every call, the store talks to the crate-internal
+//! synchronous [`StoreCommands`] seam: the production implementation
+//! ([`BlockingRedisCommands`]) owns a blocking [`redis::Connection`], and offline tests
+//! inject an in-memory double. This keeps the trait shape natural *and* makes every branch
+//! of this module testable without a server.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::filesystem::remote::store::{BaseStore, StoreItem, StoreValue};
@@ -32,14 +41,14 @@ pub const DEFAULT_KEY_PREFIX: &str = "agentscope:store:";
 const NS_SEPARATOR: &str = "\0";
 
 /// Atomic put: increments the version unconditionally, writes value + version + index entry.
-const PUT_SCRIPT: &str =
+pub(crate) const PUT_SCRIPT: &str =
     "local v = tonumber(redis.call('HGET', KEYS[1], 'version') or '0') + 1 \
      redis.call('HSET', KEYS[1], 'value', ARGV[1], 'version', tostring(v)) \
      redis.call('ZADD', KEYS[2], 0, ARGV[2]) \
      return tostring(v)";
 
 /// Atomic CAS put: writes only when the stored version equals `ARGV[3]`.
-const PUT_IF_VERSION_SCRIPT: &str =
+pub(crate) const PUT_IF_VERSION_SCRIPT: &str =
     "local cur = tonumber(redis.call('HGET', KEYS[1], 'version') or '0') \
      if cur ~= tonumber(ARGV[3]) then return '0' end \
      local v = cur + 1 \
@@ -48,17 +57,146 @@ const PUT_IF_VERSION_SCRIPT: &str =
      return tostring(v)";
 
 /// Atomic delete: removes both the item hash and its index membership.
-const DELETE_SCRIPT: &str =
+pub(crate) const DELETE_SCRIPT: &str =
     "redis.call('DEL', KEYS[1]) redis.call('ZREM', KEYS[2], ARGV[1]) return 1";
+
+/// Synchronous command surface the [`BaseStore`] implementation requires.
+///
+/// This is an implementation seam (`pub(crate)`), not public API.
+pub(crate) trait StoreCommands: Send + Sync + std::fmt::Debug {
+    /// `HGETALL key`.
+    fn hgetall(&self, key: &str) -> Result<HashMap<String, String>>;
+
+    /// `EVAL script 2 key1 key2 argv...`.
+    fn eval_two_keys(
+        &self,
+        script: &str,
+        key1: &str,
+        key2: &str,
+        args: &[String],
+    ) -> Result<redis::Value>;
+
+    /// `ZRANGEBYLEX key - + LIMIT offset limit`.
+    fn zrangebylex(&self, key: &str, offset: usize, limit: usize) -> Result<Vec<String>>;
+
+    /// `PING` — validates a freshly opened connection.
+    fn ping(&self) -> Result<()>;
+}
+
+/// Production [`StoreCommands`] backed by a blocking [`redis::Connection`].
+///
+/// The connection is opened **lazily** on first use, so constructing a `RedisStore`
+/// performs no I/O. [`RedisStore::connect`] additionally issues `PING` to validate the
+/// endpoint eagerly, while [`RedisStore::connect_lazy`] (used by
+/// [`crate::RedisDistributedStore::base_store`]) stays pure wiring.
+pub(crate) struct BlockingRedisCommands {
+    /// Normalised URL used to open the connection on first use.
+    url: String,
+    conn: Mutex<Option<redis::Connection>>,
+}
+
+impl std::fmt::Debug for BlockingRedisCommands {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false);
+        f.debug_struct("BlockingRedisCommands")
+            .field("url", &self.url)
+            .field("connected", &connected)
+            .finish()
+    }
+}
+
+fn normalize_url(url: &str) -> String {
+    if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("redis://{url}")
+    }
+}
+
+impl BlockingRedisCommands {
+    /// Records a URL for a connection opened on first use. Does **not** connect.
+    pub fn open(url: &str) -> Result<Self> {
+        let normalized = normalize_url(url);
+        // Validate the URL shape without touching the network.
+        redis::Client::open(normalized.clone())
+            .map_err(|e| Error::Other(format!("Invalid Redis URL: {e}")))?;
+        Ok(Self { url: normalized, conn: Mutex::new(None) })
+    }
+
+    /// Wraps an already-open blocking connection.
+    pub fn new(conn: redis::Connection) -> Self {
+        Self { url: String::new(), conn: Mutex::new(Some(conn)) }
+    }
+
+    /// Runs `f` against a live connection, opening one on first use.
+    fn with_conn<T>(
+        &self,
+        context: &str,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> Result<T> {
+        let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            let client = redis::Client::open(self.url.clone())
+                .map_err(|e| Error::Other(format!("Invalid Redis URL: {e}")))?;
+            let conn = client.get_connection().map_err(|e| map_err("connect", e))?;
+            *guard = Some(conn);
+        }
+        let conn = guard.as_mut().expect("connection initialised above");
+        f(conn).map_err(|e| map_err(context, e))
+    }
+}
+
+fn map_err(context: &str, e: redis::RedisError) -> Error {
+    Error::Other(format!("Redis {context}: {e}"))
+}
+
+impl StoreCommands for BlockingRedisCommands {
+    fn hgetall(&self, key: &str) -> Result<HashMap<String, String>> {
+        self.with_conn("HGETALL", |conn| redis::cmd("HGETALL").arg(key).query(conn))
+    }
+
+    fn eval_two_keys(
+        &self,
+        script: &str,
+        key1: &str,
+        key2: &str,
+        args: &[String],
+    ) -> Result<redis::Value> {
+        self.with_conn("EVAL", |conn| {
+            let mut cmd = redis::cmd("EVAL");
+            cmd.arg(script).arg(2).arg(key1).arg(key2);
+            for a in args {
+                cmd.arg(a);
+            }
+            cmd.query(conn)
+        })
+    }
+
+    fn zrangebylex(&self, key: &str, offset: usize, limit: usize) -> Result<Vec<String>> {
+        self.with_conn("ZRANGEBYLEX", |conn| {
+            redis::cmd("ZRANGEBYLEX")
+                .arg(key)
+                .arg("-")
+                .arg("+")
+                .arg("LIMIT")
+                .arg(offset as i64)
+                .arg(limit as i64)
+                .query(conn)
+        })
+    }
+
+    fn ping(&self) -> Result<()> {
+        self.with_conn("PING", |conn| redis::cmd("PING").query::<String>(conn).map(|_| ()))
+    }
+}
 
 /// Redis-backed [`BaseStore`] implementation.
 ///
-/// The harness [`BaseStore`] trait is **synchronous**, while the `redis` crate's
-/// connection-managed client is async. [`RedisStore`] therefore uses a blocking
-/// [`redis::Connection`] guarded by a [`Mutex`], which matches the trait shape without a
-/// sync→async bridge. Use [`RedisStore::connect`] to create one from a URL.
+/// The harness [`BaseStore`] trait is **synchronous**; this store therefore owns a
+/// blocking connection through [`BlockingRedisCommands`]. Use [`RedisStore::connect`] to
+/// create one from a URL.
 pub struct RedisStore {
-    conn: Mutex<redis::Connection>,
+    commands: Arc<dyn StoreCommands>,
     key_prefix: String,
 }
 
@@ -68,10 +206,6 @@ impl std::fmt::Debug for RedisStore {
             .field("key_prefix", &self.key_prefix)
             .finish_non_exhaustive()
     }
-}
-
-fn map_err(context: &str, e: redis::RedisError) -> Error {
-    Error::Other(format!("Redis {context}: {e}"))
 }
 
 fn normalize_prefix(prefix: &str) -> String {
@@ -88,30 +222,37 @@ fn normalize_prefix(prefix: &str) -> String {
 
 impl RedisStore {
     /// Connects to Redis using a URL such as `redis://localhost:6379` or `localhost:6379`.
+    ///
+    /// The connection is opened eagerly and validated with `PING`.
     pub fn connect(url: &str, key_prefix: &str) -> Result<Self> {
-        let normalized = if url.contains("://") {
-            url.to_string()
-        } else {
-            format!("redis://{url}")
-        };
-        let client = redis::Client::open(normalized)
-            .map_err(|e| Error::Other(format!("Invalid Redis URL: {e}")))?;
-        let conn = client.get_connection().map_err(|e| map_err("connect", e))?;
-        Ok(Self { conn: Mutex::new(conn), key_prefix: normalize_prefix(key_prefix) })
+        let store = Self::connect_lazy(url, key_prefix)?;
+        store.commands.ping()?;
+        Ok(store)
+    }
+
+    /// Like [`RedisStore::connect`] but does **not** touch the server: the blocking
+    /// connection is created on first use. Used by
+    /// [`crate::RedisDistributedStore::base_store`] so a combiner can hand out a
+    /// synchronous store without performing I/O at wiring time.
+    pub(crate) fn connect_lazy(url: &str, key_prefix: &str) -> Result<Self> {
+        let commands = BlockingRedisCommands::open(url)?;
+        Ok(Self::from_commands(Arc::new(commands), key_prefix))
     }
 
     /// Wraps an already-open blocking connection.
     pub fn from_connection(conn: redis::Connection, key_prefix: &str) -> Self {
-        Self { conn: Mutex::new(conn), key_prefix: normalize_prefix(key_prefix) }
+        Self::from_commands(Arc::new(BlockingRedisCommands::new(conn)), key_prefix)
+    }
+
+    /// Builds a store over an arbitrary command backend (the production blocking
+    /// connection, or in tests an in-memory double).
+    pub(crate) fn from_commands(commands: Arc<dyn StoreCommands>, key_prefix: &str) -> Self {
+        Self { commands, key_prefix: normalize_prefix(key_prefix) }
     }
 
     /// The configured, normalized key prefix.
     pub fn key_prefix(&self) -> &str {
         &self.key_prefix
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, redis::Connection> {
-        self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     // ---- key helpers -------------------------------------------------------
@@ -141,7 +282,8 @@ impl RedisStore {
 
 /// Serialises a store value to JSON text.
 fn serialize(value: &StoreValue) -> Result<String> {
-    serde_json::to_string(value).map_err(|e| Error::Other(format!("Failed to JSON-encode store value: {e}")))
+    serde_json::to_string(value)
+        .map_err(|e| Error::Other(format!("Failed to JSON-encode store value: {e}")))
 }
 
 /// Deserialises JSON text to a store value, defaulting to an empty map.
@@ -185,10 +327,7 @@ impl BaseStore for RedisStore {
             return None;
         }
         let item_key = self.item_key(namespace, key);
-        let hash: HashMap<String, String> = redis::cmd("HGETALL")
-            .arg(&item_key)
-            .query(&mut *self.lock())
-            .ok()?;
+        let hash = self.commands.hgetall(&item_key).ok()?;
         if hash.is_empty() {
             return None;
         }
@@ -205,14 +344,9 @@ impl BaseStore for RedisStore {
         };
         let item_key = self.item_key(namespace, key);
         let idx_key = self.index_key(namespace);
-        let _: std::result::Result<redis::Value, redis::RedisError> = redis::cmd("EVAL")
-            .arg(PUT_SCRIPT)
-            .arg(2)
-            .arg(&item_key)
-            .arg(&idx_key)
-            .arg(&json)
-            .arg(key)
-            .query(&mut *self.lock());
+        let _ = self
+            .commands
+            .eval_two_keys(PUT_SCRIPT, &item_key, &idx_key, &[json, key.to_string()]);
     }
 
     fn put_if_version(
@@ -231,16 +365,12 @@ impl BaseStore for RedisStore {
         };
         let item_key = self.item_key(namespace, key);
         let idx_key = self.index_key(namespace);
-        let reply: redis::Value = match redis::cmd("EVAL")
-            .arg(PUT_IF_VERSION_SCRIPT)
-            .arg(2)
-            .arg(&item_key)
-            .arg(&idx_key)
-            .arg(&json)
-            .arg(key)
-            .arg(expected_version.to_string())
-            .query(&mut *self.lock())
-        {
+        let reply = match self.commands.eval_two_keys(
+            PUT_IF_VERSION_SCRIPT,
+            &item_key,
+            &idx_key,
+            &[json, key.to_string(), expected_version.to_string()],
+        ) {
             Ok(v) => v,
             Err(_) => return false,
         };
@@ -255,25 +385,14 @@ impl BaseStore for RedisStore {
             return Vec::new();
         }
         let idx_key = self.index_key(namespace);
-        let keys: Vec<String> = match redis::cmd("ZRANGEBYLEX")
-            .arg(&idx_key)
-            .arg("-")
-            .arg("+")
-            .arg("LIMIT")
-            .arg(offset as i64)
-            .arg(limit as i64)
-            .query(&mut *self.lock())
-        {
+        let keys = match self.commands.zrangebylex(&idx_key, offset, limit) {
             Ok(k) => k,
             Err(_) => return Vec::new(),
         };
         let mut items = Vec::with_capacity(keys.len());
         for k in keys {
             let item_key = self.item_key(namespace, &k);
-            let hash: HashMap<String, String> = match redis::cmd("HGETALL")
-                .arg(&item_key)
-                .query(&mut *self.lock())
-            {
+            let hash = match self.commands.hgetall(&item_key) {
                 Ok(h) => h,
                 Err(_) => continue,
             };
@@ -291,19 +410,32 @@ impl BaseStore for RedisStore {
         }
         let item_key = self.item_key(namespace, key);
         let idx_key = self.index_key(namespace);
-        let _: std::result::Result<redis::Value, redis::RedisError> = redis::cmd("EVAL")
-            .arg(DELETE_SCRIPT)
-            .arg(2)
-            .arg(&item_key)
-            .arg(&idx_key)
-            .arg(key)
-            .query(&mut *self.lock());
+        let _ = self
+            .commands
+            .eval_two_keys(DELETE_SCRIPT, &item_key, &idx_key, &[key.to_string()]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::MemoryStoreCommands;
+    use serde_json::json;
+
+    fn ns(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn value(k: &str, v: i64) -> StoreValue {
+        let mut map = StoreValue::new();
+        map.insert(k.to_string(), json!(v));
+        map
+    }
+
+    fn store() -> (RedisStore, Arc<MemoryStoreCommands>) {
+        let commands = Arc::new(MemoryStoreCommands::new());
+        (RedisStore::from_commands(commands.clone(), "t:"), commands)
+    }
 
     #[test]
     fn normalize_prefix_rules() {
@@ -343,9 +475,181 @@ mod tests {
             format!("{}item:{}{NS_SEPARATOR}key", "p:", namespace_path(&ns)),
             format!("p:item:{}\0key", namespace_path(&ns)),
         );
+        assert_eq!(format!("{}idx:{}", "p:", namespace_path(&ns)), "p:idx:ns1\0ns2",);
+    }
+
+    #[test]
+    fn eval_reply_to_version_accepts_bulk_string() {
+        // PUT_SCRIPT returns `tostring(v)`, i.e. a bulk string, not an integer.
         assert_eq!(
-            format!("{}idx:{}", "p:", namespace_path(&ns)),
-            "p:idx:ns1\0ns2",
+            eval_reply_to_version(redis::Value::BulkString(b"3".to_vec())),
+            Some("3".into())
         );
+        assert_eq!(eval_reply_to_version(redis::Value::Int(4)), Some("4".into()));
+        assert_eq!(eval_reply_to_version(redis::Value::Nil), None);
+    }
+
+    // ---- BaseStore behaviour (offline, in-memory backend) -----------------
+
+    #[test]
+    fn put_get_round_trip_and_index_entry() {
+        let (store, commands) = store();
+        let ns = ns(&["files"]);
+        store.put(&ns, "a.txt", value("size", 1));
+
+        let item = store.get(&ns, "a.txt").expect("item present");
+        assert_eq!(item.key, "a.txt");
+        assert_eq!(item.value.get("size"), Some(&json!(1)));
+        assert_eq!(item.version, 1, "version starts at 1 on first write");
+        assert_eq!(commands.index_members("t:idx:files"), vec!["a.txt".to_string()]);
+        assert_eq!(
+            commands.hash_of("t:item:files\0a.txt").get("version").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn put_bumps_version_for_same_key_and_keeps_single_index_entry() {
+        let (store, commands) = store();
+        let ns = ns(&["files"]);
+        store.put(&ns, "a", value("n", 1));
+        store.put(&ns, "a", value("n", 2));
+
+        assert_eq!(store.get(&ns, "a").unwrap().version, 2);
+        assert_eq!(store.get(&ns, "a").unwrap().value.get("n"), Some(&json!(2)));
+        assert_eq!(
+            commands.index_members("t:idx:files"),
+            vec!["a".to_string()],
+            "ZADD is idempotent"
+        );
+    }
+
+    #[test]
+    fn get_missing_key_and_invalid_key_return_none() {
+        let (store, commands) = store();
+        let ns = ns(&["files"]);
+        assert!(store.get(&ns, "nope").is_none());
+        assert!(store.get(&ns, "").is_none(), "empty key is rejected before I/O");
+        assert!(store.get(&ns, "a\0b").is_none(), "NUL in key is rejected");
+        assert_eq!(commands.eval_calls(), 0);
+    }
+
+    #[test]
+    fn put_if_version_create_only_when_absent() {
+        let (store, _commands) = store();
+        let ns = ns(&["files"]);
+        // expected 0 on an absent key: the harness contract is "create only if absent".
+        assert!(store.put_if_version(&ns, "k", value("v", 1), 0));
+        assert_eq!(store.get(&ns, "k").unwrap().version, 1);
+        // second attempt with expected 0 must now fail (version is 1)
+        assert!(!store.put_if_version(&ns, "k", value("v", 2), 0));
+        assert_eq!(store.get(&ns, "k").unwrap().value.get("v"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn put_if_version_matching_version_succeeds_and_bumps() {
+        let (store, _commands) = store();
+        let ns = ns(&["files"]);
+        store.put(&ns, "k", value("v", 1));
+        assert!(store.put_if_version(&ns, "k", value("v", 2), 1));
+        assert_eq!(store.get(&ns, "k").unwrap().version, 2);
+        assert_eq!(store.get(&ns, "k").unwrap().value.get("v"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn put_if_version_stale_version_is_rejected() {
+        let (store, _commands) = store();
+        let ns = ns(&["files"]);
+        store.put(&ns, "k", value("v", 1));
+        assert!(!store.put_if_version(&ns, "k", value("v", 9), 7));
+        assert_eq!(store.get(&ns, "k").unwrap().version, 1, "version unchanged");
+    }
+
+    #[test]
+    fn put_if_version_rejects_invalid_key_without_io() {
+        let (store, commands) = store();
+        let ns = ns(&["files"]);
+        assert!(!store.put_if_version(&ns, "", value("v", 1), 0));
+        assert_eq!(commands.eval_calls(), 0);
+    }
+
+    #[test]
+    fn search_paginates_in_index_order() {
+        let (store, _commands) = store();
+        let ns = ns(&["ns1", "ns2"]);
+        for k in ["d", "a", "c", "b"] {
+            store.put(&ns, k, value("n", 1));
+        }
+        let page1: Vec<String> = store.search(&ns, 2, 0).into_iter().map(|i| i.key).collect();
+        let page2: Vec<String> = store.search(&ns, 2, 2).into_iter().map(|i| i.key).collect();
+        let page3: Vec<String> = store.search(&ns, 2, 4).into_iter().map(|i| i.key).collect();
+        assert_eq!(page1, vec!["d", "a"], "index preserves insertion order (all scores 0)");
+        assert_eq!(page2, vec!["c", "b"]);
+        assert!(page3.is_empty(), "offset past the end yields nothing");
+    }
+
+    #[test]
+    fn search_with_zero_limit_and_unknown_namespace_is_empty() {
+        let (store, _commands) = store();
+        let files = ns(&["ns"]);
+        store.put(&files, "a", value("n", 1));
+        assert!(store.search(&files, 0, 0).is_empty(), "limit 0 performs no query");
+        assert!(store.search(&ns(&["other"]), 10, 0).is_empty());
+    }
+
+    #[test]
+    fn search_skips_stale_index_entries() {
+        let (store, commands) = store();
+        let ns = ns(&["ns"]);
+        // Index entry with no backing hash simulates an externally deleted item.
+        commands.seed_index("t:idx:ns", "ghost");
+        store.put(&ns, "real", value("n", 1));
+        let found: Vec<String> = store.search(&ns, 10, 0).into_iter().map(|i| i.key).collect();
+        assert_eq!(found, vec!["real"]);
+    }
+
+    #[test]
+    fn delete_removes_item_and_index_membership() {
+        let (store, commands) = store();
+        let ns = ns(&["ns"]);
+        store.put(&ns, "a", value("n", 1));
+        store.put(&ns, "b", value("n", 1));
+        store.delete(&ns, "a");
+
+        assert!(store.get(&ns, "a").is_none());
+        assert!(!commands.contains("t:item:ns\0a"));
+        assert_eq!(commands.index_members("t:idx:ns"), vec!["b".to_string()]);
+        assert!(store.get(&ns, "b").is_some(), "unrelated item untouched");
+    }
+
+    #[test]
+    fn delete_invalid_key_is_noop() {
+        let (store, commands) = store();
+        let ns = ns(&["ns"]);
+        store.delete(&ns, "");
+        store.delete(&ns, "a\0b");
+        assert_eq!(commands.eval_calls(), 0);
+    }
+
+    #[test]
+    fn unavailable_backend_degrades_to_empty_results() {
+        // BaseStore is infallible: an unreachable backend must not panic.
+        let commands = Arc::new(MemoryStoreCommands::unreachable());
+        assert!(commands.ping().is_err());
+        let store = RedisStore::from_commands(commands, "t:");
+        let ns = ns(&["ns"]);
+        assert!(store.get(&ns, "k").is_none());
+        assert!(store.search(&ns, 10, 0).is_empty());
+        assert!(!store.put_if_version(&ns, "k", value("n", 1), 0));
+    }
+
+    #[test]
+    fn corrupt_stored_json_degrades_to_empty_map() {
+        let (store, commands) = store();
+        let ns = ns(&["ns"]);
+        commands.seed_item("t:item:ns\0k", "{not json", 4);
+        let item = store.get(&ns, "k").expect("hash exists");
+        assert!(item.value.is_empty());
+        assert_eq!(item.version, 4, "version is still surfaced");
     }
 }

@@ -258,12 +258,40 @@ mod tests {
     use super::*;
     use crate::client::InMemoryMongoClient;
     // Traits providing the inherent-looking methods exercised below.
+    use agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient as _;
     use agentscope_harness::agent::sandbox::SandboxSnapshotSpec as _;
     use agentscope_harness::filesystem::remote::store::BaseStore as _;
     use serde_json::json;
 
     fn store() -> MongodbDistributedStore {
         MongodbDistributedStore::new(Arc::new(InMemoryMongoClient::new()), Some("agentscope"))
+    }
+
+    /// Seeds the harness sandbox-state slot so the cascade lookup finds a remote
+    /// snapshot id, mirroring what `SessionSandboxStateStore` writes.
+    async fn seed_session_snapshot(
+        raw: &InMemoryMongoClient,
+        session_id: &str,
+        snapshot_id: &str,
+    ) {
+        use crate::client::{FindFilter, InMemoryMongoClient as _, MongoClient as _, Update, UpdateOptions};
+        let filter = FindFilter::eq(
+            "_id",
+            json!({ "user": "__anon__", "session": format!("sandbox/session/{session_id}") }),
+        );
+        let state = json!({
+            "snapshot": { "type": "remote", "id": snapshot_id }
+        })
+        .to_string();
+        let update = Update::new().set("states._sandbox_state.json", json!(state));
+        raw.update_one(
+            crate::constants::SESSIONS_COLLECTION,
+            &filter,
+            &update,
+            &UpdateOptions { upsert: true },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -319,5 +347,36 @@ mod tests {
     fn defaults_to_agentscope_database() {
         let s = MongodbDistributedStore::new(Arc::new(InMemoryMongoClient::new()), None);
         assert_eq!(s.database_name(), "agentscope");
+    }
+
+    #[tokio::test]
+    async fn deleting_session_cascades_to_snapshot() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let s = MongodbDistributedStore::new(raw.clone(), Some("agentscope"));
+        use agentscope_core::state::AgentStateStore;
+
+        // Persist a snapshot and record it in the harness session sandbox-state slot.
+        s.snapshot_client()
+            .upload("snap-42", b"workspace-tar")
+            .await
+            .unwrap();
+        assert!(s.snapshot_client().exists("snap-42").await.unwrap());
+        seed_session_snapshot(&raw, "sess-1", "snap-42").await;
+
+        // Deleting the session triggers the on_delete cascade, which reclaims the
+        // snapshot because its id is discoverable from the session slot.
+        s.agent_state_store().delete(Some("__anon__"), "sess-1").await;
+        assert!(!s.snapshot_client().exists("snap-42").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleting_session_without_snapshot_does_not_error() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let s = MongodbDistributedStore::new(raw.clone(), Some("agentscope"));
+        use agentscope_core::state::AgentStateStore;
+        s.agent_state_store().save(Some("u"), "sess-2", "k", json!(1)).await;
+        // No sandbox-state slot → cascade lookup finds nothing; deletion still succeeds.
+        s.agent_state_store().delete(Some("u"), "sess-2").await;
+        assert!(!s.agent_state_store().exists(Some("u"), "sess-2").await);
     }
 }

@@ -171,3 +171,175 @@ pub async fn initialize_snapshot_table(
     let full_table = qualified_table(None, &table);
     batch_async(client, snapshots_ddl(&full_table)).await
 }
+
+#[cfg(test)]
+mod tests {
+    //! Offline unit tests mirroring `PostgresRemoteSnapshotClientTest` (JUnit5 + Mockito +
+    //! H2 on the Java side). `MemoryClient` stores `BYTEA` blobs in a `HashMap`, so the
+    //! upload/download/exists round-trips run without a live PostgreSQL server.
+
+    use super::*;
+    use crate::memory::MemoryClient;
+
+    fn client() -> Arc<MemoryClient> {
+        Arc::new(MemoryClient::new())
+    }
+
+    fn remote(c: &Arc<MemoryClient>, init: bool) -> PostgresRemoteSnapshotClient {
+        PostgresRemoteSnapshotClient::new(c.clone(), init).unwrap()
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#constructorWithDefaultTableInitializesSchema
+    #[test]
+    fn constructor_initializes_default_table() {
+        let c = client();
+        let r = remote(&c, true);
+        assert_eq!(r.table_name(), DEFAULT_TABLE);
+        assert!(c.has_table(DEFAULT_TABLE));
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#constructorWithCustomTableInitializesSchema
+    #[test]
+    fn constructor_initializes_custom_table() {
+        let c = client();
+        let r = PostgresRemoteSnapshotClient::with_table(c.clone(), "custom_snapshots", true)
+            .unwrap();
+        assert_eq!(r.table_name(), "custom_snapshots");
+        assert!(c.has_table("custom_snapshots"));
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#constructorDoesNotInitializeSchemaWhenFalse
+    #[test]
+    fn constructor_skips_schema_init_when_false() {
+        let c = client();
+        let _ = remote(&c, false);
+        assert!(!c.has_table(DEFAULT_TABLE));
+        assert!(c.ddl_statements().is_empty());
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#constructorRejectsNullDataSource (Rust: a blank
+    // / invalid table name is the analogue of the rejected null data source).
+    #[test]
+    fn constructor_rejects_invalid_table_name() {
+        let c = client();
+        assert!(PostgresRemoteSnapshotClient::with_table(c.clone(), "bad name", false).is_err());
+        assert!(PostgresRemoteSnapshotClient::with_table(c.clone(), "1bad", false).is_err());
+        assert!(PostgresRemoteSnapshotClient::with_table(c, "", false).is_err());
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#uploadReadsStreamAndExecutesUpsert,
+    //       #downloadReturnsByteArrayInputStream
+    #[tokio::test]
+    async fn upload_then_download_roundtrip() {
+        let c = client();
+        let r = remote(&c, true);
+        let data = b"snapshot-data".to_vec();
+        r.upload("snap-1", &data).await.unwrap();
+        assert_eq!(r.download("snap-1").await.unwrap(), data);
+        assert_eq!(c.snapshot_row_count(), 1);
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#uploadReadsStreamAndExecutesUpsert (ON CONFLICT
+    // DO UPDATE: re-uploading the same id overwrites in place rather than duplicating).
+    #[tokio::test]
+    async fn upload_overwrites_existing_snapshot() {
+        let c = client();
+        let r = remote(&c, true);
+        r.upload("snap-1", b"first").await.unwrap();
+        r.upload("snap-1", b"second-longer").await.unwrap();
+        assert_eq!(c.snapshot_row_count(), 1);
+        assert_eq!(r.download("snap-1").await.unwrap(), b"second-longer");
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#uploadRejectsNullSnapshotId
+    #[tokio::test]
+    async fn upload_rejects_blank_snapshot_id() {
+        let c = client();
+        let r = remote(&c, false);
+        assert!(r.upload("", b"x").await.is_err());
+        assert_eq!(c.snapshot_row_count(), 0);
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#downloadThrowsWhenSnapshotMissing
+    #[tokio::test]
+    async fn download_missing_snapshot_is_error() {
+        let c = client();
+        let r = remote(&c, true);
+        let err = r.download("absent").await.unwrap_err();
+        assert!(err.to_string().contains("Snapshot not found"));
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#existsReturnsTrue, #existsReturnsFalse
+    #[tokio::test]
+    async fn exists_reflects_stored_snapshots() {
+        let c = client();
+        let r = remote(&c, true);
+        assert!(!r.exists("snap-1").await.unwrap());
+        r.upload("snap-1", b"data").await.unwrap();
+        assert!(r.exists("snap-1").await.unwrap());
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#initSchemaFailureIsLogged (Java tolerates init
+    // failure; the Rust constructor propagates it — see the gap tracker §4.2).
+    #[test]
+    fn initialize_snapshot_table_is_idempotent() {
+        let c = client();
+        let handle = tokio::runtime::Runtime::new().unwrap();
+        handle.block_on(async {
+            initialize_snapshot_table(c.clone(), DEFAULT_TABLE).await.unwrap();
+            initialize_snapshot_table(c.clone(), DEFAULT_TABLE).await.unwrap();
+        });
+        assert!(c.has_table(DEFAULT_TABLE));
+    }
+
+    #[test]
+    fn initialize_snapshot_table_rejects_invalid_name() {
+        let c = client();
+        let handle = tokio::runtime::Runtime::new().unwrap();
+        let err = handle
+            .block_on(initialize_snapshot_table(c, "bad-name"))
+            .unwrap_err();
+        assert!(matches!(err, PostgresError::InvalidIdentifier(_)));
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#snapshotSpecWithCustomTableName
+    #[test]
+    fn snapshot_spec_helpers_build_expected_shape() {
+        let c = client();
+        let spec = postgres_snapshot_spec(c.clone(), true).unwrap();
+        assert!(spec.build("snap-1").is_ok());
+        assert!(c.has_table(DEFAULT_TABLE));
+
+        let c2 = client();
+        let _ = postgres_snapshot_spec_with_table(c2.clone(), "custom_snapshots", true).unwrap();
+        assert!(c2.has_table("custom_snapshots"));
+
+        let c3 = client();
+        let wrapped = PostgresSnapshotSpec::new(c3.clone()).unwrap();
+        let _ = wrapped.inner();
+        assert!(c3.has_table(DEFAULT_TABLE));
+    }
+
+    // Java: the same test class exercises the spec's `build` path indirectly.
+    #[tokio::test]
+    async fn snapshot_spec_builds_persisting_snapshot() {
+        let c = client();
+        let spec = PostgresSnapshotSpec::with_table(c.clone(), "custom_snapshots").unwrap();
+        let snap = spec.build("session-1").unwrap();
+        assert_eq!(snap.id(), "session-1");
+        assert!(!snap.is_restorable().await.unwrap());
+        snap.persist(b"archive-bytes").await.unwrap();
+        assert!(snap.is_restorable().await.unwrap());
+        assert_eq!(snap.restore().await.unwrap(), b"archive-bytes");
+    }
+
+    // Java: RemoteSnapshotSpec validates snapshot ids before binding them.
+    #[test]
+    fn snapshot_spec_rejects_unsafe_ids() {
+        let c = client();
+        let spec = PostgresSnapshotSpec::new(c).unwrap();
+        assert!(spec.build("../escape").is_err());
+        assert!(spec.build("  ").is_err());
+        assert!(spec.build("ok-id").is_ok());
+    }
+}

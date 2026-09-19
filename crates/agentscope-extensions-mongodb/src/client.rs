@@ -39,6 +39,14 @@ pub const GRIDFS_FIELD_FILENAME: &str = "filename";
 pub const GRIDFS_FIELD_FILES_ID: &str = "files_id";
 /// GridFS chunk-document field holding the chunk sequence number.
 pub const GRIDFS_FIELD_CHUNK_N: &str = "n";
+/// GridFS file-document field holding the total payload length in bytes.
+pub const GRIDFS_FIELD_LENGTH: &str = "length";
+/// GridFS file-document field holding the upload timestamp (millis since epoch).
+pub const GRIDFS_FIELD_UPLOAD_DATE: &str = "uploadDate";
+/// GridFS file-document field holding the free-form metadata sub-document.
+pub const GRIDFS_FIELD_METADATA: &str = "metadata";
+/// GridFS metadata key mirroring Java `META_CREATED_AT`.
+pub const GRIDFS_META_CREATED_AT: &str = "createdAt";
 /// Legacy single-document snapshot field holding the (base64-encoded) payload.
 pub const LEGACY_FIELD_DATA: &str = "data";
 
@@ -50,6 +58,19 @@ pub fn gridfs_files_collection(bucket: &str) -> String {
 /// The GridFS chunk collection for `bucket` (`<bucket>.chunks`).
 pub fn gridfs_chunks_collection(bucket: &str) -> String {
     format!("{bucket}.chunks")
+}
+
+/// Namespaces a logical collection name by database.
+///
+/// A real MongoDB server scopes collections per database, whereas the in-process
+/// backend keeps a single flat map keyed by collection name. Encoding the database
+/// into that key preserves the per-database isolation the snapshot client relies on
+/// (`MongoRemoteSnapshotClient` is constructed with a database name).
+///
+/// `::` is used as the separator so it cannot be confused with the `.files` /
+/// `.chunks` suffix GridFS appends to the bucket name.
+pub fn scoped_collection(database: &str, collection: &str) -> String {
+    format!("{database}::{collection}")
 }
 
 /// Encodes binary data the way it is stored in JSON documents (base64).
@@ -105,6 +126,12 @@ impl MongoError {
 
 /// Result alias for MongoDB backend operations.
 pub type MongoResult<T> = Result<T, MongoError>;
+
+/// Builds the error reported when a GridFS file cannot be faithfully
+/// reassembled (missing / out-of-order / malformed chunks).
+fn corrupt_chunk(filename: &str, detail: &str) -> MongoError {
+    MongoError::Backend(format!("corrupt GridFS file '{filename}': {detail}"))
+}
 
 /// Metadata describing an existing index.
 #[derive(Debug, Clone, PartialEq)]
@@ -504,11 +531,23 @@ struct CollectionState {
 #[derive(Debug, Default)]
 pub struct InMemoryMongoClient {
     collections: Mutex<BTreeMap<String, CollectionState>>,
+    /// Test hook: number of upcoming `create_index` calls to force-fail with error
+    /// 85, simulating a concurrent node that keeps re-creating a conflicting index.
+    forced_index_conflicts: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryMongoClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test hook: forces the next `n` [`MongoClient::create_index`] calls to fail with
+    /// [`MongoError::IndexOptionsConflict`] (error 85), even when the spec would
+    /// otherwise be accepted. Used to exercise the index-migration retry/exhaustion
+    /// paths deterministically.
+    pub fn force_index_conflicts(&self, n: usize) {
+        self.forced_index_conflicts
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn with_collection<R>(&self, name: &str, f: impl FnOnce(&mut CollectionState) -> R) -> R {
@@ -741,6 +780,18 @@ impl MongoClient for InMemoryMongoClient {
     }
 
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> MongoResult<()> {
+        // Test hook: simulate a concurrent conflicting create before touching state.
+        if self
+            .forced_index_conflicts
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| if n > 0 { Some(n - 1) } else { None },
+            )
+            .is_ok()
+        {
+            return Err(MongoError::IndexOptionsConflict);
+        }
         self.with_collection(collection, |state| {
             if let Some(existing) = state.indexes.iter().find(|i| i.keys == spec.keys) {
                 let same_options = existing.unique == spec.unique
@@ -808,13 +859,23 @@ impl MongoClient for InMemoryMongoClient {
                 let mut file = Map::new();
                 file.insert("_id".to_string(), json!(file_id));
                 file.insert(GRIDFS_FIELD_FILENAME.to_string(), json!(filename));
-                file.insert("length".to_string(), json!(data.len()));
+                file.insert(GRIDFS_FIELD_LENGTH.to_string(), json!(data.len()));
                 file.insert("chunkSize".to_string(), json!(chunk_size));
+                // Mirror the Java `GridFSUploadOptions.metadata({createdAt: new Date()})`:
+                // the driver stamps `uploadDate` on the file document and stores the
+                // caller-supplied metadata verbatim.
+                let now = chrono::Utc::now().timestamp_millis();
+                file.insert(GRIDFS_FIELD_UPLOAD_DATE.to_string(), json!(now));
+                let mut metadata = Map::new();
+                metadata.insert(GRIDFS_META_CREATED_AT.to_string(), json!(now));
+                file.insert(GRIDFS_FIELD_METADATA.to_string(), Value::Object(metadata));
                 files.docs.push(file);
                 file_id
             };
 
             let chunks = map.entry(chunks_name).or_default();
+            // A file shorter than one chunk still produces a single (partial) chunk;
+            // an empty payload produces no chunks, matching the driver (length 0).
             for (n, chunk) in data.chunks(chunk_size.max(1)).enumerate() {
                 let mut doc = Map::new();
                 doc.insert("_id".to_string(), json!(format!("{file_id}:{n}")));
@@ -834,33 +895,72 @@ impl MongoClient for InMemoryMongoClient {
             let Some(files) = map.get(files_name.as_str()) else {
                 return Ok(None);
             };
-            let Some(file_id) = files
+            let Some(file) = files
                 .docs
                 .iter()
                 .find(|d| d.get(GRIDFS_FIELD_FILENAME) == Some(&json!(filename)))
-                .and_then(|d| d.get("_id"))
-                .cloned()
             else {
                 return Ok(None);
             };
-            let mut chunks: Vec<(i64, Vec<u8>)> = map
-                .get(chunks_name.as_str())
-                .map(|c| {
-                    c.docs
-                        .iter()
-                        .filter(|d| d.get(GRIDFS_FIELD_FILES_ID) == Some(&file_id))
-                        .filter_map(|d| {
-                            let n = d.get(GRIDFS_FIELD_CHUNK_N)?.as_i64()?;
-                            let raw = d.get(LEGACY_FIELD_DATA)?.as_str()?;
-                            Some((n, decode_binary(raw)?))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let file_id = file.get("_id").cloned();
+            let expected_len = file
+                .get(GRIDFS_FIELD_LENGTH)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
+            // Collect `(n, data)` for the owning file. A malformed chunk (missing `n`
+            // or non-base64 `data`) is treated as a corrupt store rather than being
+            // silently skipped — matching the driver, which throws
+            // `MongoGridFSException` on a truncated/corrupt file.
+            let mut chunks: Vec<(i64, Vec<u8>)> = Vec::new();
+            if let Some(store) = map.get(chunks_name.as_str()) {
+                for d in store
+                    .docs
+                    .iter()
+                    .filter(|d| d.get(GRIDFS_FIELD_FILES_ID) == file_id.as_ref())
+                {
+                    let n = d
+                        .get(GRIDFS_FIELD_CHUNK_N)
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| corrupt_chunk(filename, "chunk document has no integer 'n'"))?;
+                    let raw = d
+                        .get(LEGACY_FIELD_DATA)
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| corrupt_chunk(filename, "chunk document has no 'data' field"))?;
+                    let bytes = decode_binary(raw)
+                        .ok_or_else(|| corrupt_chunk(filename, "chunk 'data' is not valid base64"))?;
+                    chunks.push((n, bytes));
+                }
+            }
+
+            // GridFS chunks must form the contiguous sequence `0..chunk_count`; a gap
+            // means a chunk was lost and the file cannot be faithfully reassembled.
             chunks.sort_by_key(|(n, _)| *n);
-            let mut data = Vec::new();
-            for (_, chunk) in chunks {
-                data.extend_from_slice(&chunk);
+            let mut data = Vec::with_capacity(expected_len.unwrap_or(0));
+            for (expected, (n, chunk)) in chunks.iter().enumerate() {
+                if *n != expected as i64 {
+                    return Err(corrupt_chunk(
+                        filename,
+                        &format!(
+                            "non-contiguous chunks: expected n={expected}, found n={n} ",
+                        ),
+                    ));
+                }
+                data.extend_from_slice(chunk);
+            }
+
+            // `length` is authoritative; a mismatch indicates truncation or stray
+            // chunks left behind by a botched re-upload.
+            if let Some(expected) = expected_len {
+                if data.len() != expected {
+                    return Err(corrupt_chunk(
+                        filename,
+                        &format!(
+                            "reassembled length {} does not match stored length {expected}",
+                            data.len()
+                        ),
+                    ));
+                }
             }
             Ok(Some(data))
         })

@@ -254,4 +254,36 @@ mod tests {
         let spec = IndexSpec::ascending(&["a", "b"]);
         assert_eq!(key_pattern_json(&spec), json!({ "a": 1, "b": 1 }));
     }
+
+    #[tokio::test]
+    async fn migration_recovers_after_transient_conflicts() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let client: Arc<dyn MongoClient> = raw.clone();
+        // Two forced conflicts: the initial create plus one retry fail, then a later
+        // attempt succeeds once the racing node stops re-creating the index.
+        raw.force_index_conflicts(2);
+        let spec = IndexSpec::ascending(&["_updated_at"]).sparse();
+        create_index_with_migration(&client, "sessions", &spec)
+            .await
+            .unwrap();
+        let indexes = client.list_indexes("sessions").await.unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert!(indexes[0].sparse);
+    }
+
+    #[tokio::test]
+    async fn migration_gives_up_after_max_attempts() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let client: Arc<dyn MongoClient> = raw.clone();
+        // Persistently conflicting node: every attempt fails with error 85. The helper
+        // must stop after MAX_MIGRATION_ATTEMPTS and surface the final error rather
+        // than looping forever.
+        raw.force_index_conflicts(MAX_MIGRATION_ATTEMPTS + 1);
+        let spec = IndexSpec::ascending(&["_updated_at"]).sparse();
+        let err = create_index_with_migration(&client, "sessions", &spec)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some(85));
+        assert!(client.list_indexes("sessions").await.unwrap().is_empty());
+    }
 }

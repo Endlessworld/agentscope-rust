@@ -48,6 +48,11 @@ impl JdbcSnapshotSpec {
             inner: RemoteSnapshotSpec::new(Arc::new(client)),
         })
     }
+
+    /// The underlying [`RemoteSnapshotClient`], mirroring the Java `getClient()`.
+    pub fn client(&self) -> &Arc<dyn agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient> {
+        self.inner.client()
+    }
 }
 
 impl SandboxSnapshotSpec for JdbcSnapshotSpec {

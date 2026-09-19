@@ -5,6 +5,11 @@
 //! [`RedisConnection::connect`], which builds a [`redis::aio::ConnectionManager`] from a
 //! URL (and tolerates a missing `redis://` scheme for parity with the Java examples that
 //! pass `"localhost:6379"`).
+//!
+//! `find_keys_by_pattern` uses the **`SCAN` cursor protocol** (never `KEYS`), matching all
+//! three Java adapters; the cursor loop lives in the trait impl below.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -13,10 +18,15 @@ use redis::aio::ConnectionManager;
 use agentscope_core::error::{Error, Result};
 
 use super::adapter::RedisClientAdapter;
+use crate::raw_client::{ManagerRedisCommands, RedisCommands};
 
 fn map_err(context: &str, e: redis::RedisError) -> Error {
     Error::Other(format!("Redis {context}: {e}"))
 }
+
+/// `COUNT` hint passed to `SCAN` — bounded work per round-trip, matching the intent of the
+/// Java adapters (which rely on the driver's default batching).
+const SCAN_COUNT: usize = 100;
 
 /// A connection-managed async Redis client.
 ///
@@ -65,6 +75,21 @@ impl RedisConnection {
     /// Creates a cheap clone sharing the same connection.
     pub fn clone_shared(&self) -> Self {
         self.clone()
+    }
+
+    /// Hands out this connection as a shared [`RedisClientAdapter`].
+    ///
+    /// Used by [`crate::RedisDistributedStore`] to wire the agent state store over the
+    /// same connection.
+    pub(crate) fn raw_adapter(&self) -> Arc<dyn RedisClientAdapter> {
+        Arc::new(self.clone())
+    }
+
+    /// Hands out the crate-internal low-level command seam backed by the same
+    /// connection, for the components that do not use [`RedisClientAdapter`]
+    /// (`RedisRemoteSnapshotClient` / `RedisSandboxExecutionGuard`).
+    pub(crate) fn raw_client(&self) -> Arc<dyn RedisCommands> {
+        Arc::new(ManagerRedisCommands::new(self.manager.clone()))
     }
 }
 
@@ -141,11 +166,32 @@ impl RedisClientAdapter for RedisConnection {
             .map_err(|e| map_err("EXISTS", e))
     }
 
+    /// Finds all keys matching a glob pattern using the `SCAN` cursor protocol.
+    ///
+    /// Implements the same contract as the Java adapters: loop `SCAN <cursor> MATCH
+    /// <pattern> COUNT <n>` until the returned cursor is `0`, accumulating keys into a set
+    /// (deduplicated) — never `KEYS`.
     async fn find_keys_by_pattern(&self, pattern: &str) -> Result<Vec<String>> {
         let mut conn = self.manager.clone();
-        conn.keys::<_, Vec<String>>(pattern)
-            .await
-            .map_err(|e| map_err("KEYS", e))
+        let mut cursor: u64 = 0;
+        let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| map_err("SCAN", e))?;
+            found.extend(batch);
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(found.into_iter().collect())
     }
 
     async fn eval_script(

@@ -83,6 +83,16 @@ impl MongodbRemoteSnapshotClient {
         &self.bucket
     }
 
+    /// The database-scoped backing collection/bucket key used for client calls.
+    ///
+    /// The Java client binds its GridFS bucket and legacy collection to a specific
+    /// `MongoDatabase`, so snapshots written under one database are invisible under
+    /// another. The in-process backend keeps a flat collection map, so the database
+    /// is encoded into the collection key to preserve that isolation.
+    fn scoped_bucket(&self) -> String {
+        crate::client::scoped_collection(&self.database, &self.bucket)
+    }
+
     /// The backing MongoDB client.
     pub fn client(&self) -> &Arc<dyn MongoClient> {
         &self.client
@@ -96,7 +106,7 @@ impl MongodbRemoteSnapshotClient {
     async fn exists_legacy(&self, snapshot_id: &str) -> Result<bool> {
         let doc = self
             .client
-            .find_one(&self.bucket, &Self::legacy_filter(snapshot_id))
+            .find_one(&self.scoped_bucket(), &Self::legacy_filter(snapshot_id))
             .await
             .map_err(map_err)?;
         Ok(doc.is_some())
@@ -106,7 +116,7 @@ impl MongodbRemoteSnapshotClient {
     async fn download_legacy(&self, snapshot_id: &str) -> Result<Option<Vec<u8>>> {
         let doc = self
             .client
-            .find_one(&self.bucket, &Self::legacy_filter(snapshot_id))
+            .find_one(&self.scoped_bucket(), &Self::legacy_filter(snapshot_id))
             .await
             .map_err(map_err)?;
         let Some(doc) = doc else {
@@ -130,7 +140,7 @@ impl MongodbRemoteSnapshotClient {
     /// Deletes the legacy single-document snapshot; returns whether one was removed.
     async fn delete_legacy(&self, snapshot_id: &str) -> Result<bool> {
         self.client
-            .delete_one(&self.bucket, &Self::legacy_filter(snapshot_id))
+            .delete_one(&self.scoped_bucket(), &Self::legacy_filter(snapshot_id))
             .await
             .map_err(map_err)
     }
@@ -146,7 +156,7 @@ impl MongodbRemoteSnapshotClient {
     pub async fn delete(&self, snapshot_id: &str) -> Result<bool> {
         let deleted_gridfs = self
             .client
-            .gridfs_delete(&self.bucket, snapshot_id)
+            .gridfs_delete(&self.scoped_bucket(), snapshot_id)
             .await
             .map_err(map_err)?;
         if deleted_gridfs {
@@ -167,7 +177,7 @@ impl MongodbRemoteSnapshotClient {
     /// writes GridFS).
     pub async fn insert_legacy(&self, snapshot_id: &str, data: &[u8]) -> Result<()> {
         self.client
-            .delete_one(&self.bucket, &Self::legacy_filter(snapshot_id))
+            .delete_one(&self.scoped_bucket(), &Self::legacy_filter(snapshot_id))
             .await
             .ok();
         let mut doc = serde_json::Map::new();
@@ -177,7 +187,7 @@ impl MongodbRemoteSnapshotClient {
             serde_json::json!(encode_binary(data)),
         );
         self.client
-            .insert_one(&self.bucket, doc)
+            .insert_one(&self.scoped_bucket(), doc)
             .await
             .map_err(map_err)
     }
@@ -194,13 +204,13 @@ impl RemoteSnapshotClient for MongodbRemoteSnapshotClient {
             return Err(Error::Tool("snapshotId must not be empty".to_string()));
         }
         self.client
-            .gridfs_upload(&self.bucket, snapshot_id, data.to_vec())
+            .gridfs_upload(&self.scoped_bucket(), snapshot_id, data.to_vec())
             .await
             .map_err(map_err)
     }
 
     async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
-        match self.client.gridfs_download(&self.bucket, snapshot_id).await {
+        match self.client.gridfs_download(&self.scoped_bucket(), snapshot_id).await {
             Ok(Some(data)) => Ok(data),
             Ok(None) => match self.download_legacy(snapshot_id).await? {
                 Some(data) => {
@@ -219,7 +229,7 @@ impl RemoteSnapshotClient for MongodbRemoteSnapshotClient {
     async fn exists(&self, snapshot_id: &str) -> Result<bool> {
         if self
             .client
-            .gridfs_exists(&self.bucket, snapshot_id)
+            .gridfs_exists(&self.scoped_bucket(), snapshot_id)
             .await
             .map_err(map_err)?
         {
@@ -273,6 +283,7 @@ impl SandboxSnapshotSpec for MongodbSnapshotSpec {
 mod tests {
     use super::*;
     use crate::client::InMemoryMongoClient;
+    use serde_json::{json, Value};
 
     fn client() -> Arc<dyn MongoClient> {
         Arc::new(InMemoryMongoClient::new())
@@ -339,10 +350,8 @@ mod tests {
         let payload: Vec<u8> = (0..(chunk * 3 + 7)).map(|i| (i % 251) as u8).collect();
         c.upload("big", &payload).await.unwrap();
 
-        let files = crate::client::gridfs_files_collection(crate::constants::SNAPSHOTS_COLLECTION);
-        let chunks = crate::client::gridfs_chunks_collection(crate::constants::SNAPSHOTS_COLLECTION);
-        assert_eq!(raw.document_count(&files), 1);
-        assert_eq!(raw.document_count(&chunks), 4);
+        assert_eq!(raw.document_count(&files_collection(&c)), 1);
+        assert_eq!(raw.document_count(&chunks_collection(&c)), 4);
         assert_eq!(c.download("big").await.unwrap(), payload);
     }
 
@@ -351,8 +360,8 @@ mod tests {
         let raw = Arc::new(InMemoryMongoClient::new());
         let c = MongodbRemoteSnapshotClient::new(raw.clone(), None, None);
         let chunk = crate::client::GRIDFS_DEFAULT_CHUNK_SIZE;
-        let files = crate::client::gridfs_files_collection(crate::constants::SNAPSHOTS_COLLECTION);
-        let chunks = crate::client::gridfs_chunks_collection(crate::constants::SNAPSHOTS_COLLECTION);
+        let files = files_collection(&c);
+        let chunks = chunks_collection(&c);
         c.upload("s", &vec![1u8; chunk * 3]).await.unwrap();
         assert_eq!(raw.document_count(&chunks), 3);
         c.upload("s", b"tiny").await.unwrap();
@@ -393,6 +402,177 @@ mod tests {
         c.upload("migrated", b"new").await.unwrap();
         assert!(c.delete("migrated").await.unwrap());
         // Legacy collection is empty again (the migrated document was cleaned up).
-        assert_eq!(raw.document_count(crate::constants::SNAPSHOTS_COLLECTION), 0);
+        assert_eq!(
+            raw.document_count(&crate::client::scoped_collection(
+                c.database(),
+                crate::constants::SNAPSHOTS_COLLECTION
+            )),
+            0
+        );
+    }
+
+    /// The backing collection key for a client, database-scoped the way the client
+    /// itself resolves it.
+    fn files_collection(c: &MongodbRemoteSnapshotClient) -> String {
+        crate::client::gridfs_files_collection(&c.scoped_bucket())
+    }
+
+    fn chunks_collection(c: &MongodbRemoteSnapshotClient) -> String {
+        crate::client::gridfs_chunks_collection(&c.scoped_bucket())
+    }
+
+    async fn gridfs_file_doc(
+        raw: &InMemoryMongoClient,
+        c: &MongodbRemoteSnapshotClient,
+        snapshot_id: &str,
+    ) -> Value {
+        use crate::client::{FindFilter, MongoClient as _};
+        let filter = FindFilter::eq(crate::client::GRIDFS_FIELD_FILENAME, json!(snapshot_id));
+        let doc = raw
+            .find_one(&files_collection(c), &filter)
+            .await
+            .unwrap()
+            .expect("gridfs file document");
+        Value::Object(doc)
+    }
+
+    #[tokio::test]
+    async fn gridfs_file_document_records_length_chunksize_and_upload_date() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let c = MongodbRemoteSnapshotClient::new(raw.clone(), Some("db"), None);
+        let chunk = crate::client::GRIDFS_DEFAULT_CHUNK_SIZE;
+        let payload = vec![7u8; chunk + 3];
+        c.upload("meta", &payload).await.unwrap();
+
+        let doc = gridfs_file_doc(&raw, &c, "meta").await;
+        assert_eq!(
+            doc.get("length").and_then(|v| v.as_u64()),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            doc.get("chunkSize").and_then(|v| v.as_u64()),
+            Some(chunk as u64)
+        );
+        assert!(doc
+            .get(crate::client::GRIDFS_FIELD_UPLOAD_DATE)
+            .and_then(|v| v.as_i64())
+            .is_some());
+        // Metadata mirrors Java `GridFSUploadOptions.metadata({createdAt})`.
+        let created_at = doc
+            .get(crate::client::GRIDFS_FIELD_METADATA)
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(crate::client::GRIDFS_META_CREATED_AT))
+            .and_then(|v| v.as_i64());
+        assert!(created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn gridfs_chunk_boundary_sizes_round_trip() {
+        let chunk = crate::client::GRIDFS_DEFAULT_CHUNK_SIZE;
+        for (label, len, expected_chunks) in [
+            ("one-below", chunk - 1, 1usize),
+            ("exact", chunk, 1usize),
+            ("one-above", chunk + 1, 2usize),
+        ] {
+            let raw = Arc::new(InMemoryMongoClient::new());
+            let c = MongodbRemoteSnapshotClient::new(raw.clone(), Some("db"), None);
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            c.upload("boundary", &payload).await.unwrap();
+            assert_eq!(
+                raw.document_count(&chunks_collection(&c)),
+                expected_chunks,
+                "{label} chunking"
+            );
+            assert_eq!(
+                c.download("boundary").await.unwrap(),
+                payload,
+                "{label} round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gridfs_empty_payload_round_trips() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let c = MongodbRemoteSnapshotClient::new(raw.clone(), None, None);
+        c.upload("empty", b"").await.unwrap();
+        assert_eq!(raw.document_count(&chunks_collection(&c)), 0);
+        assert!(c.exists("empty").await.unwrap());
+        assert_eq!(c.download("empty").await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn missing_chunk_is_reported_as_corruption() {
+        use crate::client::{FindFilter, MongoClient as _};
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let c = MongodbRemoteSnapshotClient::new(raw.clone(), Some("db"), None);
+        let chunk = crate::client::GRIDFS_DEFAULT_CHUNK_SIZE;
+        c.upload("gap", &vec![1u8; chunk * 3]).await.unwrap();
+        // Drop the middle chunk (n = 1).
+        let file_id = gridfs_file_doc(&raw, &c, "gap")
+            .await
+            .get("_id")
+            .cloned()
+            .unwrap();
+        let removed = raw
+            .delete_one(
+                &chunks_collection(&c),
+                &FindFilter::eq("_id", json!(format!("{}:1", file_id.as_str().unwrap()))),
+            )
+            .await
+            .unwrap();
+        assert!(removed);
+        let err = c.download("gap").await.unwrap_err().to_string();
+        assert!(err.contains("corrupt GridFS file"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn out_of_order_duplicate_chunk_is_reported_as_corruption() {
+        use crate::client::MongoClient as _;
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let c = MongodbRemoteSnapshotClient::new(raw.clone(), Some("db"), None);
+        c.upload("dup", b"short").await.unwrap();
+        // A stray second chunk with n = 0 makes the sequence non-contiguous and the
+        // reassembled length disagree with the stored `length`.
+        let mut stray = serde_json::Map::new();
+        stray.insert("_id".to_string(), json!("stray"));
+        stray.insert(
+            crate::client::GRIDFS_FIELD_FILES_ID.to_string(),
+            gridfs_file_doc(&raw, &c, "dup")
+                .await
+                .get("_id")
+                .cloned()
+                .unwrap(),
+        );
+        stray.insert(crate::client::GRIDFS_FIELD_CHUNK_N.to_string(), json!(0));
+        stray.insert(
+            crate::client::LEGACY_FIELD_DATA.to_string(),
+            json!(crate::client::encode_binary(b"x")),
+        );
+        raw.insert_one(&chunks_collection(&c), stray).await.unwrap();
+        assert!(c.download("dup").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn database_name_isolates_snapshots() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let a = MongodbRemoteSnapshotClient::new(raw.clone(), Some("db_a"), None);
+        let b = MongodbRemoteSnapshotClient::new(raw.clone(), Some("db_b"), None);
+        a.upload("shared-id", b"from-a").await.unwrap();
+        assert!(a.exists("shared-id").await.unwrap());
+        // The Java client binds its bucket to one database; another database must not
+        // observe the snapshot.
+        assert!(!b.exists("shared-id").await.unwrap());
+        assert!(b.download("shared-id").await.is_err());
+        b.upload("shared-id", b"from-b").await.unwrap();
+        assert_eq!(a.download("shared-id").await.unwrap(), b"from-a");
+        assert_eq!(b.download("shared-id").await.unwrap(), b"from-b");
+    }
+
+    #[tokio::test]
+    async fn spec_exposes_configured_database() {
+        let spec = MongodbSnapshotSpec::new(client(), Some("tenant_db"), Some("snaps"));
+        assert_eq!(spec.client().database(), "tenant_db");
+        assert_eq!(spec.client().bucket(), "snaps");
     }
 }

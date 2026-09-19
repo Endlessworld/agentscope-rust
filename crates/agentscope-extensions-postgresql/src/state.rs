@@ -539,3 +539,552 @@ impl AgentStateStore for PostgresAgentStateStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Offline unit tests mirroring `PostgresAgentStateStoreTest` (JUnit5 + Mockito + H2 on
+    //! the Java side). The crate's [`MemoryClient`] plays the role of H2: it recognises the
+    //! exact statement shapes emitted by this module and simulates `ON CONFLICT`, conditional
+    //! CAS, `LIKE` and the `INFORMATION_SCHEMA` existence checks.
+
+    use super::*;
+    use crate::memory::MemoryClient;
+    use crate::sql::{MAX_IDENTIFIER_LENGTH, SCHEMA_EXISTS_QUERY, TABLE_EXISTS_QUERY};
+    use agentscope_core::state::list_hash::compute_hash;
+    use agentscope_core::state::AgentStateStore;
+    use serde_json::json;
+
+    fn client() -> Arc<MemoryClient> {
+        Arc::new(MemoryClient::new())
+    }
+
+    /// Builds a store over the default schema/table, auto-creating them (the Java
+    /// `new PostgresAgentStateStore(dataSource, true)`).
+    fn store(client: &Arc<MemoryClient>) -> PostgresAgentStateStore {
+        PostgresAgentStateStore::create_if_not_exist(client.clone()).unwrap()
+    }
+
+    fn slot(session: &str) -> String {
+        format!("{ANON_USER}:{session}")
+    }
+
+    // ---- builder / schema verification -------------------------------------
+
+    // Java: PostgresAgentStateStoreTest#builderWithDefaultsCreatesStore, #constructorWithAutoCreate
+    #[test]
+    fn builder_create_if_not_exist_provisions_schema_and_table() {
+        let c = client();
+        let s = store(&c);
+        assert_eq!(s.schema_name(), DEFAULT_SCHEMA_NAME);
+        assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
+        assert!(c.has_schema(DEFAULT_SCHEMA_NAME));
+        assert!(c.has_table(DEFAULT_TABLE_NAME));
+        let ddl = c.ddl_statements();
+        assert!(ddl.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS")));
+        // Java ensureVersionColumn(): the back-fill ALTER runs on every build.
+        assert!(ddl
+            .iter()
+            .any(|s| s.contains("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0")));
+    }
+
+    // Java: PostgresAgentStateStoreTest#builderWithCustomNames
+    #[test]
+    fn builder_uses_custom_schema_and_table() {
+        let c = client();
+        let s = PostgresAgentStateStore::builder(c.clone())
+            .schema("custom_schema")
+            .unwrap()
+            .table("custom_sessions")
+            .unwrap()
+            .create_if_not_exist(true)
+            .build()
+            .unwrap();
+        assert_eq!(s.schema_name(), "custom_schema");
+        assert_eq!(s.table_name(), "custom_sessions");
+        assert!(c.has_schema("custom_schema"));
+        assert!(c.has_table("custom_sessions"));
+    }
+
+    // Java: PostgresAgentStateStoreTest#rejectsInvalidSchemaName
+    #[test]
+    fn builder_rejects_invalid_schema_name() {
+        let c = client();
+        assert!(PostgresAgentStateStore::builder(c.clone())
+            .schema("1bad")
+            .is_err());
+        assert!(PostgresAgentStateStore::builder(c.clone())
+            .schema("bad-name")
+            .is_err());
+        assert!(PostgresAgentStateStore::builder(c).schema("   ").is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#rejectsInvalidTableName
+    #[test]
+    fn builder_rejects_invalid_table_name() {
+        let c = client();
+        assert!(PostgresAgentStateStore::builder(c.clone())
+            .table("bad name")
+            .is_err());
+        assert!(PostgresAgentStateStore::builder(c).table("").is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#rejectsTooLongIdentifier
+    #[test]
+    fn builder_rejects_too_long_identifier() {
+        let c = client();
+        let ok = "a".repeat(MAX_IDENTIFIER_LENGTH);
+        let too_long = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
+        assert!(PostgresAgentStateStore::builder(c.clone()).table(ok).is_ok());
+        assert!(PostgresAgentStateStore::builder(c)
+            .table(too_long)
+            .is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#constructorDefaultsDoNotAutoCreate,
+    //       #verifySchemaMissingThrows
+    #[test]
+    fn build_without_auto_create_fails_when_schema_missing() {
+        let c = client();
+        let err = PostgresAgentStateStore::builder(c).build().unwrap_err();
+        assert!(matches!(err, PostgresError::Schema(_)));
+    }
+
+    // Java: PostgresAgentStateStoreTest#verifyTableMissingThrows
+    #[test]
+    fn build_without_auto_create_fails_when_table_missing() {
+        let c = client();
+        c.execute_batch("CREATE SCHEMA IF NOT EXISTS \"agentscope\"")
+            .unwrap();
+        let err = PostgresAgentStateStore::builder(c).build().unwrap_err();
+        assert!(matches!(err, PostgresError::Schema(_)));
+    }
+
+    // Java: PostgresAgentStateStoreTest#verifySchemaSqlExceptionThrows (Rust: the schema/
+    // table existence probes are the two INFORMATION_SCHEMA queries in `sql.rs`).
+    #[test]
+    fn build_succeeds_when_schema_and_table_already_exist() {
+        let c = client();
+        let _ = store(&c);
+        let s = PostgresAgentStateStore::builder(c).build().unwrap();
+        assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
+        assert!(SCHEMA_EXISTS_QUERY.contains("INFORMATION_SCHEMA.SCHEMATA"));
+        assert!(TABLE_EXISTS_QUERY.contains("INFORMATION_SCHEMA.TABLES"));
+    }
+
+    // ---- single-value operations -------------------------------------------
+
+    // Java: PostgresAgentStateStoreTest#saveSingleState, #getSingleState
+    #[tokio::test]
+    async fn save_and_get_single_state_roundtrip() {
+        let c = client();
+        let s = store(&c);
+        let v = json!({"count": 7, "name": "x"});
+        assert_eq!(s.save_versioned(None, "s1", "k", &v).unwrap(), 1);
+        assert_eq!(s.get(None, "s1", "k").await, Some(v.clone()));
+        assert_eq!(s.save_versioned(None, "s1", "k", &v).unwrap(), 2);
+    }
+
+    // Java: PostgresAgentStateStoreTest#getSingleStateReturnsEmptyWhenMissing
+    #[tokio::test]
+    async fn get_returns_none_when_missing() {
+        let c = client();
+        let s = store(&c);
+        assert!(s.get(None, "s1", "k").await.is_none());
+        assert!(s.get(Some("u1"), "s1", "k").await.is_none());
+    }
+
+    // Java: PostgresAgentStateStoreTest#existsTrue, #existsFalse
+    #[tokio::test]
+    async fn exists_tracks_session_presence() {
+        let c = client();
+        let s = store(&c);
+        assert!(!s.exists(None, "s1").await);
+        s.save(None, "s1", "k", json!(1)).await;
+        assert!(s.exists(None, "s1").await);
+    }
+
+    // Java: PostgresAgentStateStoreTest#deleteSession
+    #[tokio::test]
+    async fn delete_removes_all_rows_for_session() {
+        let c = client();
+        let s = store(&c);
+        s.save(None, "s1", "k1", json!(1)).await;
+        s.save(None, "s1", "k2", json!(2)).await;
+        s.save(None, "s2", "k1", json!(3)).await;
+        assert_eq!(c.session_row_count(), 3);
+        s.delete(None, "s1").await;
+        assert!(!s.exists(None, "s1").await);
+        assert!(s.exists(None, "s2").await);
+        assert_eq!(c.session_row_count(), 1);
+    }
+
+    // Java: PostgresAgentStateStoreTest#listSessionIds
+    #[tokio::test]
+    async fn list_session_ids_scopes_by_user() {
+        let c = client();
+        let s = store(&c);
+        s.save(Some("u1"), "s1", "k", json!(1)).await;
+        s.save(Some("u1"), "s2", "k", json!(1)).await;
+        s.save(Some("u2"), "s9", "k", json!(1)).await;
+        assert_eq!(s.list_session_ids(Some("u1")).await, vec!["s1", "s2"]);
+        assert_eq!(s.list_session_ids(Some("u2")).await, vec!["s9"]);
+    }
+
+    // Java: PostgresAgentStateStoreTest#listSessionIdsForAnonymousUser, #listSessionIdsForBlankUser
+    #[tokio::test]
+    async fn list_session_ids_treats_none_and_blank_as_anonymous() {
+        let c = client();
+        let s = store(&c);
+        s.save(None, "anon1", "k", json!(1)).await;
+        s.save(Some("   "), "anon2", "k", json!(1)).await;
+        assert_eq!(s.list_session_ids(None).await, vec!["anon1", "anon2"]);
+        assert_eq!(s.list_session_ids(Some("  ")).await, vec!["anon1", "anon2"]);
+        assert!(s.list_session_ids(Some("u1")).await.is_empty());
+    }
+
+    // ---- identifier validation ---------------------------------------------
+
+    // Java: PostgresAgentStateStoreTest#rejectsSessionIdWithPathSeparators, #rejectsTooLongSessionId
+    #[test]
+    fn slot_id_rejects_path_separators_and_overlong_ids() {
+        assert!(PostgresAgentStateStore::slot_id(None, "a/b").is_err());
+        assert!(PostgresAgentStateStore::slot_id(None, "a\\b").is_err());
+        let long = "s".repeat(MAX_SESSION_ID_LENGTH + 1);
+        assert!(PostgresAgentStateStore::slot_id(None, &long).is_err());
+        assert_eq!(slot("ok"), format!("{ANON_USER}:ok"));
+        assert_eq!(
+            PostgresAgentStateStore::slot_id(Some(""), "ok").unwrap(),
+            format!("{ANON_USER}:ok")
+        );
+        assert_eq!(
+            PostgresAgentStateStore::slot_id(Some("u1"), "ok").unwrap(),
+            "u1:ok"
+        );
+    }
+
+    // Java: PostgresAgentStateStoreTest#rejectsNullSessionId, #rejectsBlankSessionId,
+    //       #validateSessionIdRejectsNullOrEmpty
+    #[test]
+    fn slot_id_rejects_blank_session_id() {
+        assert!(PostgresAgentStateStore::slot_id(None, "").is_err());
+        assert!(PostgresAgentStateStore::slot_id(None, "   ").is_err());
+        assert!(PostgresAgentStateStore::slot_id(Some("u1"), "").is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#rejectsNullStateKey, #rejectsEmptyStateKey, #rejectsTooLongStateKey
+    #[test]
+    fn state_key_validation_boundaries() {
+        assert!(PostgresAgentStateStore::validate_state_key("").is_err());
+        assert!(PostgresAgentStateStore::validate_state_key("   ").is_err());
+        assert!(PostgresAgentStateStore::validate_state_key(&"k".repeat(MAX_SESSION_ID_LENGTH)).is_ok());
+        assert!(PostgresAgentStateStore::validate_state_key(&"k".repeat(MAX_SESSION_ID_LENGTH + 1)).is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveSingleStateThrowsWhenSqlFails (Rust: the
+    // `AgentStateStore` trait returns `()`, so invalid identifiers are swallowed).
+    #[tokio::test]
+    async fn invalid_identifiers_are_ignored_by_trait_methods() {
+        let c = client();
+        let s = store(&c);
+        s.save(None, "a/b", "k", json!(1)).await;
+        assert_eq!(c.session_row_count(), 0);
+        assert!(s.get(None, "a/b", "k").await.is_none());
+        assert!(s.get(None, "s1", "  ").await.is_none());
+        assert!(s.get_list(None, "s1", "").await.is_empty());
+    }
+
+    // ---- versioned CAS ------------------------------------------------------
+
+    // Java: PostgresAgentStateStoreTest#saveIfVersionUnconditionalAbsentKeyReturnsZero
+    #[tokio::test]
+    async fn version_of_is_zero_for_absent_key() {
+        let c = client();
+        let s = store(&c);
+        assert_eq!(s.version_of(None, "s", "k").unwrap(), 0);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveIfVersion* (version starts at 1; 0 = create-only;
+    // stale version fails; UNVERSIONED = unconditional overwrite)
+    #[tokio::test]
+    async fn save_if_version_cas_three_branches() {
+        let c = client();
+        let s = store(&c);
+        let v1 = json!({"n": 1});
+        let v2 = json!({"n": 2});
+
+        // create-only insert (expected 0) on an absent key succeeds with version 1.
+        assert_eq!(s.save_if_version(None, "s", "k", &v1, 0).unwrap(), 1);
+        assert_eq!(s.version_of(None, "s", "k").unwrap(), 1);
+
+        // create-only insert against an existing key: duplicate -> CAS failure.
+        assert_eq!(s.save_if_version(None, "s", "k", &v2, 0).unwrap(), UNVERSIONED);
+        assert_eq!(s.get(None, "s", "k").await, Some(v1.clone()));
+
+        // matching version succeeds and bumps to version 2.
+        assert_eq!(s.save_if_version(None, "s", "k", &v2, 1).unwrap(), 2);
+        assert_eq!(s.version_of(None, "s", "k").unwrap(), 2);
+
+        // stale versions fail without mutating the row.
+        assert_eq!(s.save_if_version(None, "s", "k", &v1, 1).unwrap(), UNVERSIONED);
+        assert_eq!(s.save_if_version(None, "s", "k", &v1, 99).unwrap(), UNVERSIONED);
+        assert_eq!(s.get(None, "s", "k").await, Some(v2.clone()));
+
+        // UNVERSIONED behaves as an unconditional save.
+        assert_eq!(s.save_if_version(None, "s", "k", &v1, UNVERSIONED).unwrap(), 3);
+        assert_eq!(s.get(None, "s", "k").await, Some(v1));
+    }
+
+    // ---- list hashing (`:_hash` companion row, core `list_hash`) -----------
+
+    // Java: PostgresAgentStateStoreTest#getList
+    #[tokio::test]
+    async fn get_list_returns_items_in_index_order() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[json!("a"), json!("b"), json!("c")])
+            .await;
+        assert_eq!(
+            s.get_list(None, "s1", "items").await,
+            vec![json!("a"), json!("b"), json!("c")]
+        );
+        assert!(s.get_list(None, "s1", "missing").await.is_empty());
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListAppendsNewItems (also covers the
+    // `state_key + ":_hash"` companion row).
+    #[tokio::test]
+    async fn save_list_writes_hash_companion_row() {
+        let c = client();
+        let s = store(&c);
+        let values = vec![json!({"i": 1}), json!({"i": 2})];
+        s.save_list(None, "s1", "items", &values).await;
+        assert_eq!(s.list_count_sync(&slot("s1"), "items").unwrap(), 2);
+        let stored = s
+            .get_sync(
+                &slot("s1"),
+                &format!("items{HASH_KEY_SUFFIX}"),
+                SINGLE_STATE_INDEX,
+            )
+            .unwrap();
+        let expected = compute_hash(&values);
+        assert_eq!(stored.as_deref(), Some(expected.as_str()));
+        // 2 items + 1 hash companion row.
+        assert_eq!(c.session_row_count(), 3);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListAppendsNewItems
+    #[tokio::test]
+    async fn save_list_appends_without_rewriting_when_prefix_unchanged() {
+        let c = client();
+        let s = store(&c);
+        let (a, b, d) = (json!("a"), json!("b"), json!("c"));
+        s.save_list(None, "s1", "items", &[a.clone(), b.clone()])
+            .await;
+        assert_eq!(c.session_row_count(), 3);
+        s.save_list(None, "s1", "items", &[a.clone(), b.clone(), d.clone()])
+            .await;
+        // One extra item row only: the previously-stored prefix was reused.
+        assert_eq!(c.session_row_count(), 4);
+        assert_eq!(s.get_list(None, "s1", "items").await, vec![a, b, d]);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListSkipsWhenHashMatchesAndSizeUnchanged
+    #[tokio::test]
+    async fn save_list_skips_when_hash_matches_and_size_unchanged() {
+        let c = client();
+        let s = store(&c);
+        let values = vec![json!(1), json!(2)];
+        s.save_list(None, "s1", "items", &values).await;
+        s.save_list(None, "s1", "items", &values).await;
+        assert_eq!(c.session_row_count(), 3);
+        assert_eq!(s.get_list(None, "s1", "items").await, values);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListFullRewriteWhenHashChanged
+    #[tokio::test]
+    async fn save_list_rewrites_when_prefix_modified() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[json!("a"), json!("b")])
+            .await;
+        s.save_list(None, "s1", "items", &[json!("x"), json!("b")])
+            .await;
+        assert_eq!(
+            s.get_list(None, "s1", "items").await,
+            vec![json!("x"), json!("b")]
+        );
+        // Full rewrite leaves exactly 2 items + 1 hash row.
+        assert_eq!(c.session_row_count(), 3);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListFullRewriteWhenHashChanged (shrink branch)
+    #[tokio::test]
+    async fn save_list_rewrites_when_list_shrinks() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[json!(1), json!(2), json!(3)])
+            .await;
+        assert_eq!(c.session_row_count(), 4);
+        s.save_list(None, "s1", "items", &[json!(1)]).await;
+        assert_eq!(s.get_list(None, "s1", "items").await, vec![json!(1)]);
+        assert_eq!(c.session_row_count(), 2);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListHashNotFound
+    #[tokio::test]
+    async fn save_list_rewrites_when_hash_missing_but_data_present() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[json!(1), json!(2)])
+            .await;
+        // Simulate legacy rows written before the ":_hash" companion row existed.
+        c.query(
+            &format!(
+                "DELETE FROM {} WHERE session_id = $1 AND state_key = $2",
+                s.full_table
+            ),
+            &[
+                SqlValue::text(slot("s1")),
+                SqlValue::text(format!("items{HASH_KEY_SUFFIX}")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.session_row_count(), 2);
+        s.save_list(None, "s1", "items", &[json!(1), json!(2)])
+            .await;
+        assert_eq!(c.session_row_count(), 3);
+        assert_eq!(s.get_list(None, "s1", "items").await, vec![json!(1), json!(2)]);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveListEmptyDoesNothing
+    #[tokio::test]
+    async fn save_list_empty_is_noop() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[]).await;
+        assert_eq!(c.session_row_count(), 0);
+    }
+
+    // ---- truncate -----------------------------------------------------------
+
+    // Java: PostgresAgentStateStoreTest#truncateAllSessionsTruncatesTable
+    #[tokio::test]
+    async fn truncate_all_sessions_clears_table() {
+        let c = client();
+        let s = store(&c);
+        s.save(None, "s1", "k", json!(1)).await;
+        s.save(None, "s2", "k", json!(2)).await;
+        assert!(s.exists(None, "s1").await);
+        s.truncate_all_sessions().unwrap();
+        assert!(!s.exists(None, "s1").await);
+        assert!(!s.exists(None, "s2").await);
+        assert_eq!(c.session_row_count(), 0);
+    }
+
+    /// A client that fails every non-DDL statement, used to check error propagation the way
+    /// the Java tests use a throwing mock.
+    #[derive(Debug)]
+    struct FailingClient;
+
+    impl PostgresClient for FailingClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            Err(PostgresError::Query("boom".into()))
+        }
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            Err(PostgresError::Query("boom".into()))
+        }
+    }
+
+    /// A client whose batch (DDL) calls succeed but whose statements all fail.
+    #[derive(Debug, Default)]
+    struct BatchOkQueryFailClient;
+
+    impl PostgresClient for BatchOkQueryFailClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            Err(PostgresError::Query("boom".into()))
+        }
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A client that succeeds all provisioning DDL but whose `TRUNCATE` batch fails.
+    #[derive(Debug, Default)]
+    struct TruncateFailClient;
+
+    impl PostgresClient for TruncateFailClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            Err(PostgresError::Query("boom".into()))
+        }
+        fn execute_batch(&self, sql: &str) -> PgResult<()> {
+            if sql.to_uppercase().contains("TRUNCATE") {
+                Err(PostgresError::Query("boom".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Java: PostgresAgentStateStoreTest#truncateAllSessionsThrowsWhenSqlFails
+    #[test]
+    fn truncate_propagates_sql_errors() {
+        let s = PostgresAgentStateStore::builder(Arc::new(TruncateFailClient))
+            .create_if_not_exist(true)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            s.truncate_all_sessions().unwrap_err(),
+            PostgresError::Query(_)
+        ));
+    }
+
+    // Java: PostgresAgentStateStoreTest#createSchemaFailureThrows, #verifySchemaSqlExceptionThrows
+    #[test]
+    fn build_propagates_batch_failures() {
+        let err = PostgresAgentStateStore::builder(Arc::new(FailingClient))
+            .create_if_not_exist(true)
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, PostgresError::Query(_)));
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveSingleStateThrowsWhenSqlFails,
+    //       #saveListThrowsWhenSqlFails, #getThrowsWhenQueryFails
+    #[tokio::test]
+    async fn query_failures_surface_through_inherent_methods() {
+        let s = PostgresAgentStateStore::builder(Arc::new(BatchOkQueryFailClient))
+            .create_if_not_exist(true)
+            .build()
+            .unwrap();
+        assert!(s.save_versioned(None, "s1", "k", &json!(1)).is_err());
+        assert!(s.get_sync(&slot("s1"), "k", SINGLE_STATE_INDEX).is_err());
+        assert!(s
+            .get_list_rows_sync(&slot("s1"), "k")
+            .is_err());
+        assert!(s.version_of(None, "s1", "k").is_err());
+        assert!(s.save_if_version(None, "s1", "k", &json!(1), 0).is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#getThrowsWhenJsonInvalid
+    #[tokio::test]
+    async fn get_returns_none_for_invalid_json_payload() {
+        let c = client();
+        let s = store(&c);
+        c.query(
+            &format!(
+                "INSERT INTO {} (session_id, state_key, item_index, state_data, version, updated_at) \
+                 VALUES ($1, $2, $3, $4, 1, $5)",
+                s.full_table
+            ),
+            &[
+                SqlValue::text(slot("s1")),
+                SqlValue::text("k"),
+                SqlValue::int(SINGLE_STATE_INDEX),
+                SqlValue::text("not json"),
+                SqlValue::BigInt(0),
+            ],
+        )
+        .unwrap();
+        assert!(s.get(None, "s1", "k").await.is_none());
+    }
+}

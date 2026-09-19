@@ -1,7 +1,7 @@
 ﻿# MODEL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **MODEL** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
-> **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-model\`
+> **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-model\`
 > **Java 子模块**：anthropic, dashscope, gemini, ollama, openai, e2e-tests
 > **Rust 目标**：`crates/agentscope-extensions-model/`（波次 A）
 
@@ -18,19 +18,19 @@
 | Java 规模（实测行数） | 主代码 24885 行 / 测试 45043 行（anthropic 2192 / dashscope 7453 / gemini 2294 / ollama 4412 / openai 8534；e2e-tests 测试 7136） |
 | Rust crate | `crates/agentscope-extensions-model` |
 | 迁移波次 | A |
-| 当前状态 | **部分完成** — `common`（HTTP seam）+ `ollama`（provider 全链路）+ `dashscope`（provider 全链路，含凭证/加密公钥/多模态端点）已落地并测试全绿（**58 passed**）；`anthropic` / `gemini` **尚未迁移**；`openai` 依裁定不迁移（core 已提供） |
+| 当前状态 | **已完成（provider 主链路）** — `common`（HTTP seam）+ `ollama`（provider 全链路）+ `dashscope`（provider 全链路，含凭证/加密公钥/多模态端点）+ **`anthropic`（本轮新增，11 类全数映射）** + **`gemini`（本轮新增，10 类全数映射）** 已落地并测试全绿（**169 passed**）；`openai` 依裁定不迁移（core 已提供）。§3.3 的长尾增强项（远程图片下载、独立 `tests/`、重试/指标等）按本轮范围约定保持待办 |
 
-### 1.1 验证基线（最近一次实测，汇总方执行；本次回填复跑 build 确认）
+### 1.1 验证基线（2026-09-19 本会话实测）
 ```
-cargo build -p agentscope-extensions-model   -> Finished (0 errors；本 crate 0 error，仅有无关 crate 的既有 warning)
-cargo test  -p agentscope-extensions-model   -> 58 passed; 0 failed; 0 ignored
-cargo test  --workspace                      -> 1866 passed; 0 failed（86 test target）
+cargo build -p agentscope-extensions-model   -> Finished (0 errors；本 crate 0 error/0 warning；输出中的 warning 均来自其它 crate 的既有代码)
+cargo test  -p agentscope-extensions-model   -> 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out（lib test，0.04s）
+                                                其中 anthropic 58 个、gemini 53 个（本轮新增 111 个），既有 common/ollama/dashscope 58 个不变
 ```
 
-### 1.2 Rust crate 文件清单（17 个源文件，3954 行；无 `tests/` 目录，58 个单测全部为内联 `#[cfg(test)]`）
+### 1.2 Rust crate 文件清单（31 个源文件，8146 行；无 `tests/` 目录，169 个单测全部为内联 `#[cfg(test)]`）
 | 文件 | 行数 | 职责 | 是否被 `lib.rs` 编译 |
 |---|---|---|---|
-| `src/lib.rs` | 31 | crate 根；声明 `pub mod common; pub mod dashscope; pub mod ollama;` + re-export + 设计裁定文档注释 | — |
+| `src/lib.rs` | 33 | crate 根；声明 `pub mod anthropic; pub mod common; pub mod dashscope; pub mod gemini; pub mod ollama;` + re-export + 设计裁定文档注释 | — |
 | `src/common/mod.rs` | 11 | `HttpTransport` seam 的 re-export | 是 |
 | `src/common/transport.rs` | 244 | `HttpTransport` trait、`HttpRequestSpec`、`ReqwestTransport`（真实）、`MemoryTransport`（离线 fake）、`decode_stream_line`、`JsonStream`、`SharedTransport`；3 个单测 | 是 |
 | `src/ollama/mod.rs` | 20 | ollama 子模块声明与 re-export | 是 |
@@ -47,8 +47,24 @@ cargo test  --workspace                      -> 1866 passed; 0 failed（86 test 
 | `src/dashscope/model.rs` | 372 | `DashScopeChatModel`（impl core `Model`）；6 个单测 | 是 |
 | `src/dashscope/parser.rs` | 370 | 响应解析 + 流式增量器；8 个单测 | 是 |
 | `src/dashscope/provider.rs` | 155 | `DashScopeModelProvider`（impl `ModelProvider`）；5 个单测 | 是 |
+| `src/anthropic/mod.rs` | 43 | anthropic 子模块声明/re-export + Java→Rust 文件映射表 | 是 |
+| `src/anthropic/dto.rs` | 417 | Anthropic Messages wire DTO（request/response/SSE event，tagged enum content block）；8 个单测 | 是 |
+| `src/anthropic/credential.rs` | 126 | `AnthropicCredential` / `AnthropicAuthMode` / 端点与版本常量；5 个单测 | 是 |
+| `src/anthropic/converter.rs` | 996 | `Msg`/`ToolSchema` → Anthropic 请求体（含 cache_control、多智能体合并）；22 个单测 | 是 |
+| `src/anthropic/parser.rs` | 350 | 响应解析 + SSE 流式增量器；8 个单测 | 是 |
+| `src/anthropic/model.rs` | 385 | `AnthropicChatModel`（impl core `Model`）；7 个单测 | 是 |
+| `src/anthropic/provider.rs` | 187 | `AnthropicModelProvider`（impl `ModelProvider`）；8 个单测 | 是 |
+| `src/gemini/mod.rs` | 44 | gemini 子模块声明/re-export + Java→Rust 文件映射表 | 是 |
+| `src/gemini/dto.rs` | 370 | Gemini REST wire DTO（camelCase，inlineData/functionCall/thoughtSignature）；7 个单测 | 是 |
+| `src/gemini/credential.rs` | 92 | `GeminiCredential` / 端点构造函数 / API 常量；4 个单测 | 是 |
+| `src/gemini/converter.rs` | 693 | `Msg`/`ToolSchema` → Gemini 请求体（含 thought signature、多智能体合并）；19 个单测 | 是 |
+| `src/gemini/parser.rs` | 318 | 响应解析 + 流式增量器（thoughtSignature 持久化）；8 个单测 | 是 |
+| `src/gemini/model.rs` | 339 | `GeminiChatModel`（impl core `Model`）；7 个单测 | 是 |
+| `src/gemini/provider.rs` | 184 | `GeminiModelProvider`（impl `ModelProvider`）；8 个单测 | 是 |
 
 > ℹ️ **更正（2026-09-19）**：本表旧版曾记「`dashscope` 仅 DTO、未接线、未编译」，并据此在 §3.1 列为待办阻塞项——**该描述已过时**。现 `src/dashscope/` 含 6 个子模块（converter/credential/dto/model/parser/provider）、已在 `lib.rs` 声明、已全部接入并随 crate 编译，共 33 个单测。
+>
+> ℹ️ **本轮（2026-09-19）新增 anthropic / gemini**：两子模块均已在 `lib.rs` 声明（`pub mod anthropic; pub mod gemini;`）并 re-export，14 个新源文件、共 111 个新单测，实测均已被 `cargo test` 执行（非「落盘未接线」）。
 
 ## 2. Java 清单与依赖映射
 
@@ -120,30 +136,40 @@ cargo test  --workspace                      -> 1866 passed; 0 failed（86 test 
 | `openai.compat.{deepseek,glm,kimi,minimax}`（12 类） | 兼容厂商 formatter + provider | 无专门类型；经 core `OpenAiProvider` + `ModelCreationContext.base_url` + `context_windows.rs`（含 deepseek/glm/kimi 窗口表）覆盖 | **设计决定**：Java 每厂商一个 `*ModelProvider` + `*Formatter` 的做法未被 1:1 迁移；其差异（base_url/模型窗口/格式化）当前靠 base_url + 上下文窗口表覆盖。**残留差异待确认**（见 §3.2） |
 | `resources/META-INF/services/...ModelProvider`（5 行） | SPI 注册 | core `default_registry()` / `ModelRegistry::register` | |
 
-### 2.4 anthropic（11 类 / 2192 行）— **未迁移**
+### 2.4 anthropic（11 类 / 2192 行）— **已完成（provider 全链路，本轮迁移）**
 | Java 类 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
-| `anthropic.AnthropicChatModel` | 聊天模型主类 | 无 | **待办 P1** |
-| `anthropic.AnthropicModelProvider` | provider 插件 | 无 | **待办 P1** |
-| `anthropic.credential.AnthropicCredential` | 凭据 | 无 | **待办**（可复用 `ModelCreationContext.api_key`） |
-| `anthropic.formatter.AnthropicBaseFormatter` | 基础格式化 | 无 | **待办** |
-| `anthropic.formatter.AnthropicChatFormatter` | 会话格式化 | 无 | **待办** |
-| `anthropic.formatter.AnthropicConversationMerger` | 会话合并 | 无 | **待办** |
-| `anthropic.formatter.AnthropicMediaConverter` | 媒体转换 | 无 | **待办** |
-| `anthropic.formatter.AnthropicMessageConverter` | 消息转换 | 无 | **待办** |
-| `anthropic.formatter.AnthropicMultiAgentFormatter` | 多智能体格式化 | 无 | **待办** |
-| `anthropic.formatter.AnthropicResponseParser` | 响应解析（含 cache control / thinking） | 无 | **待办** |
-| `anthropic.formatter.AnthropicToolsHelper` | 工具转换 | 无 | **待办** |
+| `anthropic.AnthropicChatModel` | 聊天模型主类 | `anthropic::model::AnthropicChatModel`（impl core `Model`） | 经注入的 `SharedTransport` 调 `POST {base_url}/v1/messages`；离线可测 |
+| `anthropic.AnthropicModelProvider` | provider 插件 | `anthropic::provider::AnthropicModelProvider`（impl `ModelProvider`） | `provider_id()=="anthropic"`；支持 `anthropic:` 前缀与裸 `claude*`；`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` |
+| `anthropic.credential.AnthropicCredential` | 凭据 | `anthropic::credential::AnthropicCredential` + `AnthropicAuthMode` | api_key（`x-api-key`）/ authToken（`Authorization: Bearer`）互斥 |
+| `anthropic.formatter.AnthropicBaseFormatter` | 基础格式化（system/cache/options） | `anthropic::converter::{build_request, system_prompt, apply_cache_control, ChatFormatOptions}` | system 提到顶层 `system` 字段；cache_control 标记 system/末条消息/末个工具 |
+| `anthropic.formatter.AnthropicChatFormatter` | 会话格式化 | `anthropic::converter::{to_anthropic_messages, build_request}` | |
+| `anthropic.formatter.AnthropicConversationMerger` | 会话合并 | `anthropic::converter::{merge_conversation, ConversationBlock}` | `<history>` 包裹，与 Java 同构；作为多智能体路径的可复用入口 |
+| `anthropic.formatter.AnthropicMediaConverter` | 媒体转换 | `anthropic::converter::{image_source, image_content_block, data_content_block}` | 本地文件→base64；远程 URL 直接透传 |
+| `anthropic.formatter.AnthropicMessageConverter` | 消息转换 | `anthropic::converter::{to_anthropic_messages, message_content_blocks, tool_result_message}` | tool_result 拆为独立 user 消息；未做 Java 的并行 tool-use 拆分（见 §3.2） |
+| `anthropic.formatter.AnthropicMultiAgentFormatter` | 多智能体格式化 | `anthropic::converter::to_multi_agent_messages` | system/tool-sequence/agent-conversation 分组；agent 组合并为单 user 消息 |
+| `anthropic.formatter.AnthropicResponseParser` | 响应解析（含 cache control / thinking） | `anthropic::parser::{parse_message, AnthropicStreamIncrementer}` | thinking→text→tool_use；cache token 加回 input；流式增量器缓冲 tool 参数分片 |
+| `anthropic.formatter.AnthropicToolsHelper` | 工具转换 | `anthropic::converter::{to_anthropic_tools, to_tool_choice, apply_extra_body_params}` | `disable_parallel_tool_use = !parallel_tool_calls`；`Required`→`any`；末个工具带 cache_control |
+| SDK wire 类型（`MessageCreateParams`/`MessageParam`/`Message`/`RawMessageStreamEvent`） | Anthropic 官方 SDK | `anthropic::dto::{AnthropicRequest, AnthropicMessage, AnthropicContentBlock, AnthropicMessageResponse, AnthropicStreamEvent}` | Java 用官方 SDK，Rust 无对应依赖→自建 DTO/parser（方案裁定见 §4.2） |
 
-> Anthropic 使用官方 SDK（`com.anthropic.client.okhttp.AnthropicOkHttpClient`），Rust 侧需 `reqwest` 手写或引入第三方 crate——**属 §4.2 待裁定项**。
+> **传输层裁定**（2026-09-19）：采用 §4.2 选项 (b) —— 复用本 crate 既有 `HttpTransport` seam + `ReqwestTransport`（生产）/`MemoryTransport`（离线测试）手写 Anthropic Messages 协议，**未引入新 HTTP / 厂商 SDK 依赖**。
 
-### 2.5 gemini（10 类 / 2294 行）— **未迁移**
+### 2.5 gemini（10 类 / 2294 行）— **已完成（provider 全链路，本轮迁移）**
 | Java 类 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
-| `gemini.GeminiChatModel` | 聊天模型主类 | 无 | **待办 P1** |
-| `gemini.GeminiModelProvider` | provider 插件 | 无 | **待办 P1** |
-| `gemini.credential.GeminiCredential` | 凭据 | 无 | **待办** |
-| `gemini.formatter.{GeminiChatFormatter, GeminiConversationMerger, GeminiMediaConverter, GeminiMessageConverter, GeminiMultiAgentFormatter, GeminiResponseParser, GeminiToolsHelper}`（7 类） | 格式化/转换/解析 | 无 | **待办 P1** |
+| `gemini.GeminiChatModel` | 聊天模型主类 | `gemini::model::GeminiChatModel`（impl core `Model`） | 经 `SharedTransport` 调 `models/{model}:generateContent` / `:streamGenerateContent?alt=sse` |
+| `gemini.GeminiModelProvider` | provider 插件 | `gemini::provider::GeminiModelProvider`（impl `ModelProvider`） | `provider_id()=="gemini"`；支持 `gemini:` 前缀与裸 `gemini-*`；`GEMINI_API_KEY`；**Vertex AI 明确拒绝**（见 §3.2/§4.2） |
+| `gemini.credential.GeminiCredential` | 凭据 | `gemini::credential::GeminiCredential` | `x-goog-api-key` |
+| `gemini.formatter.GeminiChatFormatter` | 会话格式化 + options/tools | `gemini::converter::{build_request, apply_options}` | `topK`→Float、`seed`→Int、`maxTokens`→`maxOutputTokens`；thinking→`thinkingConfig` |
+| `gemini.formatter.GeminiConversationMerger` | 会话合并 | `gemini::converter::merge_to_content` | `<history>` 包裹；`"<name>: <text>"`；tool result → `"Tool: <name>\n<output>"` |
+| `gemini.formatter.GeminiMultiAgentFormatter` | 多智能体格式化 | `gemini::converter::to_multi_agent_contents` | system→user 内容；tool 序列单独分组；agent 组合并为单 user Content |
+| `gemini.formatter.GeminiMessageConverter` | 消息转换 | `gemini::converter::{to_gemini_contents, tool_arguments, tool_call_part, tool_result_content}` | tool result 为独立 `user` content；tool 参数优先 `content` 原串再 `input` |
+| `gemini.formatter.GeminiMediaConverter` | 媒体转换 | `gemini::converter::{media_part, data_part}` | base64/本地文件→`inlineData`；**远程 URL 拒绝并回退文本**（见 §3.2） |
+| `gemini.formatter.GeminiResponseParser` | 响应解析（含 thought signature） | `gemini::parser::{parse_response, GeminiStreamIncrementer}` | thinking(`thought:true`)→text→tool_use；`thoughtSignature` 写入 `ToolUseBlock` metadata 以支持回放 |
+| `gemini.formatter.GeminiToolsHelper` | 工具转换 | `gemini::converter::{to_gemini_tools, to_tool_choice}` | `parametersJsonSchema`；Auto→默认、None→NONE、Required→ANY、Specific→ANY+allowedFunctionNames |
+| SDK wire 类型（`Content`/`Part`/`GenerateContentConfig`/`GenerateContentResponse`） | Google GenAI SDK | `gemini::dto::{GeminiRequest, GeminiContent, GeminiPart, GeminiResponse, ...}` | Java 用官方 SDK，Rust 无对应依赖→自建 DTO/parser（方案裁定见 §4.2） |
+
+> **传输层裁定**（2026-09-19）：同 anthropic，采用 §4.2 选项 (b) —— 复用 `HttpTransport` seam 手写 Gemini REST 协议，**未引入 Google SDK / 新依赖**。
 
 ### 2.6 e2e-tests（0 主代码 / 34 测试类 / 7136 行）— **未迁移**
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -155,7 +181,8 @@ cargo test  --workspace                      -> 1866 passed; 0 failed（86 test 
 |---|---|---|---|
 | Jackson (`@JsonProperty`/`@JsonInclude`/`@JsonAlias`/自定义 (De)Serializer) | JSON (反)序列化 | `serde` + `serde_json`（`[dependencies]` 经 workspace 引入）+ `#[serde(rename/skip_serializing_if/untagged)]` | 字段名 1:1 对齐 Java JSON |
 | OkHttp / `java.net.http.HttpClient` / core `OkHttpTransport` | HTTP 传输 | `reqwest` **0.12**（本 crate `Cargo.toml`，`default-features = false`，features `json`/`stream`/`rustls-tls`）+ 自建 `HttpTransport` trait seam | 生产 `ReqwestTransport`，测试 `MemoryTransport`（零真实 HTTP） |
-| `com.anthropic.client.okhttp.AnthropicOkHttpClient`（Anthropic 官方 SDK） | Anthropic 传输 | 无 | 随 anthropic 子模块一并**待办** |
+| `com.anthropic.client.okhttp.AnthropicOkHttpClient`（Anthropic 官方 SDK） | Anthropic 传输 | 复用 `common::HttpTransport` + `ReqwestTransport` + `anthropic::dto` 自建 Messages 协议 | **已完成**（2026-09-19）：未引入厂商 SDK；wire DTO 与 converter/parser 自建，可离线测 |
+| `com.google.genai.Client`（Google GenAI 官方 SDK） | Gemini 传输 | 复用 `common::HttpTransport` + `ReqwestTransport` + `gemini::dto` 自建 REST 协议 | **已完成**（2026-09-19）：同上；SSE 流式用 `:streamGenerateContent?alt=sse` |
 | reactor-core (`Flux`/`Mono`/`Schedulers`) | 响应式流 | `futures` (`BoxStream`) + `async-stream` **0.3**（本 crate） | core `Model::stream` 返回 `BoxStream` |
 | slf4j (`Logger`/`LoggerFactory`) | 日志 | `tracing`（workspace） | |
 | `java.util.UUID` | 合成工具调用 id / 请求 id | `uuid` **1**（本 crate，features `v4`, `serde`） | 与 Java 行为一致 |
@@ -170,17 +197,17 @@ cargo test  --workspace                      -> 1866 passed; 0 failed（86 test 
 ### 3.1 骨架与依赖（P0）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| crate 骨架 + `lib.rs` 接线 | 全模块 | 已完成 | `src/lib.rs` 声明 `pub mod common; pub mod dashscope; pub mod ollama;`；crate 级文档注释已写明与 core 的分工 |
+| crate 骨架 + `lib.rs` 接线 | 全模块 | 已完成 | `src/lib.rs` 声明 `pub mod anthropic; pub mod common; pub mod dashscope; pub mod gemini; pub mod ollama;` + re-export；crate 级文档注释已写明与 core 的分工 |
 | `Model` trait 复用（不自建平行 trait） | `io.agentscope.core.model.Model` | 已完成 | `ollama::model::OllamaChatModel` 实现 `agentscope_core::Model`（`crates/agentscope-core/src/model/model.rs:12`）；未在 extensions 侧新建 trait |
 | `ModelProvider` / `ModelRegistry` 复用 | `io.agentscope.core.model.spi.ModelProvider` + `ModelRegistry` | 已完成 | `ollama::provider::OllamaModelProvider` 实现 core `ModelProvider`（`crates/agentscope-core/src/model/provider.rs:78`）；注册表为 core `ModelRegistry`（同文件 `:95`）。Java 的 SPI 文件机制不迁移（**设计决定**） |
-| 离线可测的 HTTP seam | `OllamaHttpClient` / `DashScopeHttpClient` / `OpenAIClient` | 已完成 | `src/common/transport.rs`：`HttpTransport` trait + `ReqwestTransport` + `MemoryTransport`；全部 58 个单测零真实网络 |
+| 离线可测的 HTTP seam | `OllamaHttpClient` / `DashScopeHttpClient` / `OpenAIClient` / Anthropic SDK / Google GenAI SDK | 已完成 | `src/common/transport.rs`：`HttpTransport` trait + `ReqwestTransport` + `MemoryTransport`；全部 169 个单测零真实网络 |
 | Ollama provider 全链路（格式化→请求→解析→流式） | `OllamaChatModel`/`OllamaHttpClient`/`OllamaModelProvider` + `formatter/*`（7 类） | 已完成 | `build_request`/`to_ollama_messages`/`to_ollama_tools`/`parse_response`/`OllamaStreamIncrementer`；端点 `/api/chat` |
 | Ollama DTO serde 对齐 | `ollama.dto.*`（9 类，含 embedding） | 已完成 | `src/ollama/dto.rs`；embedding DTO 已迁但无调用方（见 §3.2） |
-| 离线单测 | Java 测试 45043 行 | 已完成（部分覆盖） | 58 个：`common/transport.rs` 3、`ollama`（converter 7 / parser 5 / model 4 / options 3 / provider 3）、`dashscope`（converter 11 / parser 8 / model 6 / provider 5 / credential 3） |
+| 离线单测 | Java 测试 45043 行 | 已完成（部分覆盖） | 169 个：`common/transport.rs` 3、`ollama`（converter 7 / parser 5 / model 4 / options 3 / provider 3）、`dashscope`（converter 11 / parser 8 / model 6 / provider 5 / credential 3）、**`anthropic` 58**（dto 8 / credential 5 / converter 22 / parser 8 / model 7 / provider 8）、**`gemini` 53**（dto 7 / credential 4 / converter 19 / parser 8 / model 7 / provider 8） |
 | **`dashscope` provider 全链路** | `dashscope.DashScopeChatModel` / `DashScopeHttpClient` / `DashScopeModelProvider` / `EndpointType` | **已完成** | `src/dashscope/{converter,credential,dto,model,parser,provider}.rs`，共 33 个单测；`lib.rs` 已声明 `pub mod dashscope;`。**历史误记更正（2026-09-19）**：旧版曾将此列为「接线缺陷/阻塞项」（称四模块文件缺失且未编译），实测该缺陷不存在 |
 | dashscope DTO 接线 | `dashscope.dto.*`（15 类） | 已完成 | `src/dashscope/dto.rs` 15 个 pub 类型（14 个对应 Java + Rust 专属 `DashScopeContent` untagged enum）；含 `DashScopePublicKeyResponse`（凭证加密公钥） |
-| anthropic provider 基线 | `anthropic.*`（11 类） | 待办 | 无任何 Rust 对应文件 |
-| gemini provider 基线 | `gemini.*`（10 类） | 待办 | 无任何 Rust 对应文件 |
+| anthropic provider 基线 | `anthropic.*`（11 类） | **已完成** | `src/anthropic/{dto,credential,converter,parser,model,provider,mod}.rs`，58 个单测；`lib.rs` 已声明 `pub mod anthropic;`；详见 §2.4 |
+| gemini provider 基线 | `gemini.*`（10 类） | **已完成** | `src/gemini/{dto,credential,converter,parser,model,provider,mod}.rs`，53 个单测；`lib.rs` 已声明 `pub mod gemini;`；详见 §2.5 |
 | OpenAI provider | `openai.*`（53 类） | **设计决定（不迁移）** | core 已提供 `agentscope_core::model::openai`（`OpenAiChatModel`/`OpenAiProvider`/`default_registry`），依 `EXTENSIONS_GAP_TRACKER.md` §2.2 裁定本 crate 不重复实现 |
 
 ### 3.2 功能缺口（P1）
@@ -190,22 +217,27 @@ cargo test  --workspace                      -> 1866 passed; 0 failed（86 test 
 | Ollama 会话合并 | `ollama.formatter.OllamaConversationMerger` | 待办 | 无 Rust 对应；影响多轮/多智能体长会话的消息合并语义 |
 | Ollama 多智能体格式化 | `ollama.formatter.OllamaMultiAgentFormatter` | 待办 | 仅 `hint_text` + tool-result 文本抽取被覆盖；`<system-info>` 图片提升等未完整对齐 |
 | Ollama 远程图片下载 | `ollama.formatter.OllamaMediaConverter` | 待办 | `DefaultImageResolver` 对 http(s) URL 返回错误，需注入自定义异步 resolver（doc 注释已标注 `MODEL__GAP_TRACKER.md §3 (P1)`）；未提供内置实现 |
-| anthropic 子模块整体 | `anthropic.*`（11 类 / 2192 行） | 待办 | 含 cache control、thinking、media、multi-agent formatter；传输层需自建（Java 用官方 SDK） |
-| gemini 子模块整体 | `gemini.*`（10 类 / 2294 行） | 待办 | 含 thought signature 持久化等 Java 侧专项测试 |
+| anthropic 子模块整体 | `anthropic.*`（11 类 / 2192 行） | **已完成** | cache control / thinking / media / multi-agent formatter 均已落地；传输层自建（§4.2 选项 b）。**剩余 2 项细化缺口见下** |
+| anthropic 并行 tool-use 拆分 | `AnthropicMessageConverter#collectSplitToolResults` / `#convertParallelToolCalls` | 待办（非本轮范围） | 本轮将多条 tool_use / tool_result 按“独立 user 消息”处理，但**未实现 Java 的「多 tool_use + 对应多 tool_result 交替拆分」**（Anthropic 要求 assistant(tool_use)→user(tool_result) 严格交替时）。触发条件苛刻（需 tool_use 数==tool_result 数且全部 id 可配），待后续轮次补齐 |
+| anthropic 多智能体 system 前导文本细节 | `AnthropicMultiAgentFormatter` | 部分完成（非本轮范围） | 分组与 `<history>` 合并已对齐；Java 的 `isFirstAgentMessageGroup` 首组标记已实现，但**系统消息在组内的特殊转换路径较 Java 略简化**（本轮未逐条对齐其 ground-truth 测试） |
+| gemini 子模块整体 | `gemini.*`（10 类 / 2294 行） | **已完成** | thought signature 持久化、thinking、多模态、multi-agent 均已落地。**剩余 2 项细化缺口见下** |
+| gemini Vertex AI 路径 | `GeminiModelProvider`（`project`/`location`/`vertexAI` + `GoogleCredentials`） | 待办（设计决定：本轮不迁移） | Vertex AI 与 Gemini API 的端点主机与认证完全不同（OAuth2 服务账号）；离线 adapter **明确报错拒绝**而非静默降级（已有单测 `create_rejects_vertex_ai`）。需汇总方裁定是否另建 vertex 适配（见 §4.2） |
+| gemini 远程图片下载 | `GeminiMediaConverter#readFileAsBytes`（http/https） | 待办（非本轮范围） | Rust 侧拒绝 `http(s)` URL 并回退文本（避免隐式网络 I/O）；仅支持 base64/本地文件。需与 ollama 远程下载一并裁定统一 resolver（见 §3.3） |
 | dashscope 子模块整体 | `dashscope.*`（29 类 / 7453 行） | **已完成** | 含 `DashScopeEncryptionUtils` 对应物（`credential.rs` 凭证/公钥处理）、`EndpointType`、多模态端点常量（`MULTIMODAL_GENERATION_ENDPOINT`）；见 §2.2。**长尾待确认**：`DashScopeMultiModalTool`（93.5 KB，TTS/图像/视频）覆盖度待核 |
 | OpenAI 兼容厂商差异化行为 | `openai.compat.{deepseek,glm,kimi,minimax}`（12 类） | 待确认 | 当前仅靠 core 的 base_url + `context_windows.rs` 覆盖；Java 侧每厂商 `*Formatter`/`*MultiAgentFormatter` 的格式化差异**是否有功能影响尚未裁定**——需汇总方确认（见 §4.2） |
 | OpenAI 多模态工具 | `openai.tool.OpenAIMultiModalTool` | 待确认 | core 无对应；归属 MODEL 还是 TOOL 类模块未裁定 |
-| Java 测试用例逐条对照迁移 | Java 测试 45043 行（anthropic 4677 / dashscope 11767 / gemini 4113 / ollama 4464 / openai 12886 / e2e 7136） | 待办 | 当前 58 个 Rust 单测为**功能等价重写**（覆盖 transport + ollama + dashscope），未逐条照搬 |
+| Java 测试用例逐条对照迁移 | Java 测试 45043 行（anthropic 4677 / dashscope 11767 / gemini 4113 / ollama 4464 / openai 12886 / e2e 7136） | 待办 | 当前 169 个 Rust 单测为**功能等价重写**（覆盖 transport + ollama + dashscope + anthropic + gemini），未逐条照搬；anthropic/gemini 的 ground-truth formatter 测试（如 `AnthropicChatFormatterGroundTruthTest`、`GeminiPythonConsistencyTest`）尚未逐条对照 |
 | 真实厂商端点联调 | `e2e-tests`（34 测试类） | 设计决定（不迁移） | 需要真实 API key；Rust 侧坚持离线策略，网络层已实现但未对真实端点回归 |
 
 ### 3.3 增强与清理（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | Ollama llama.cpp loader 长尾参数 | `ollama.options.OllamaOptions`（44.5 KB） | 待办 | Rust 仅迁移 `GenerateOptions` 子集 + `format`/`keep_alive`/`think`（源码 doc 已声明为 P2） |
-| 重试 / 退避 / 超时可配置化 | — | 待办 | 当前无重试；超时未暴露为可配置项 |
+| 统一远程媒体 resolver | `MediaUtils` + 各 `*MediaConverter` | 待办（非本轮范围） | anthropic 远程 URL 透传（由服务端拉取）、gemini/ollama 拒绑（回退文本）。是否提供统一异步 resolver 待裁定 |
+| 重试 / 退避 / 超时可配置化 | — | 待办 | 当前无重试；超时未暴露为可配置项（`GenerateOptions` 无对应字段） |
 | 指标 / 可观测性埋点 | slf4j 日志 | 待办 | `tracing` 依赖已声明但本 crate 代码未埋点 |
 | `agentscope-harness` 依赖清理 | — | 待办 | `Cargo.toml` 声明了 `agentscope-harness`，但 `src/**` **零引用**；建议后续确认是否移除（本回填为文档任务，未改代码） |
-| 独立 `tests/` 集成测试 | — | 待办 | 当前 58 个单测全部内联在各 `src` 文件 `#[cfg(test)]` 中 |
+| 独立 `tests/` 集成测试 | — | 待办（非本轮范围） | 当前 169 个单测全部内联在各 `src` 文件 `#[cfg(test)]` 中 |
 
 ### 3.4 设计决定（不迁移）汇总
 | 项 | Java 参考 | 理由 |
@@ -213,35 +245,41 @@ cargo test  --workspace                      -> 1866 passed; 0 failed（86 test 
 | OpenAI 全子模块（53 类） | `openai.OpenAIChatModel` / `OpenAIClient` / `dto.*` / `formatter.*` / `compat.*` | core `agentscope_core::model::openai` 已用 `async-openai` 提供等价能力；`EXTENSIONS_GAP_TRACKER.md` §2.2 已裁定「core 定义 trait + 注册表，本 crate 补 provider 适配，不重复实现 openai」 |
 | OpenAI 异常类层次（8 类） | `openai.exception.*` | Rust 以 `agentscope_core::Error`（`thiserror` 枚举）统一表达，不建平行异常继承体系 |
 | SPI `META-INF/services` 注册机制 | 各子模块 `resources/META-INF/services/io.agentscope.core.model.spi.ModelProvider` | Rust 无 `ServiceLoader`；改为显式 `ModelRegistry::register(Arc<dyn ModelProvider>)` |
-| Spring 自动装配 / DI | 本模块 `pom.xml` 无 Spring 依赖 | 不适用；Rust 侧由调用方显式构造 provider |
-| Ollama 凭据类型 | `ollama.credential.OllamaCredential` | 本地 Ollama 无鉴权头；凭据经 `ModelCreationContext.api_key`/环境变量表达，不引入平行类型 |
-| e2e-tests 真实网络回归（34 类） | `agentscope-extensions-model-e2e-tests` | 需真实 API key；改为 `HttpTransport` seam + `MemoryTransport` 离线策略 |
+| Spring 自动装配 / DI | 本模块 `pom.xml` 无 Spring 依赖 | **已完成（设计决定，不迁移）**：不适用；Rust 侧由调用方显式构造 provider |
+| Ollama 凭据类型 | `ollama.credential.OllamaCredential` | **已完成（设计决定，不迁移）**：本地 Ollama 无鉴权头；凭据经 `ModelCreationContext.api_key`/环境变量表达，不引入平行类型 |
+| e2e-tests 真实网络回归（34 类 / 7136 行） | `agentscope-extensions-model-e2e-tests` | **已完成（设计决定，不迁移）**：需真实 API key，无法在离线 CI 复现；改为 `HttpTransport` seam + `MemoryTransport` 离线策略，各 provider 的请求/响应/流式分支已有等价单测 |
+| anthropic / gemini 官方 SDK 类型（`AnthropicOkHttpClient` / `com.google.genai.Client`）不引入 | 两子模块 `pom.xml` | **已完成（设计决定）**：经 §4.2 裁定采用选项 (b)，用 `HttpTransport` + 自建 wire DTO 替代；避免引入新第三方依赖与机器绑定 |
+| Gemini Vertex AI（`project`/`location`/OAuth2 credentials） | `GeminiModelProvider` | **已完成（设计决定：本轮不迁移）**：端点为 Vertex AI 专用主机 + OAuth2 服务账号，与 API-key 流程正交；离线 adapter **显式报错拒绝**（单测 `create_rejects_vertex_ai`）避免静默降级。后续若需，另立适配 |
+| Anthropic SDK 的 `ProxyConfig` / Gemini SDK 的 `ProxyOptions` | 两子模块构造器 | **已完成（设计决定，不迁移）**：Rust 侧代理由调用方通过 `ReqwestTransport::with_client` 注入 `reqwest::Client`（支持代理/超时/TLS），不在 provider 层重复建模 |
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
 - **已完成内容**
   1. **`common` 层**：`HttpTransport` trait（`post_json` / `post_json_stream`）+ `HttpRequestSpec` + `ReqwestTransport`（真实 reqwest 0.12）+ `MemoryTransport`（离线 fake）+ `decode_stream_line`（NDJSON / SSE `data:` 统一解码）。这是全 crate 的离线可测边界。
-  2. **`ollama` 子模块**：`OllamaChatModel`（实现 core `Model`，端点 `/api/chat`，流式与非流式）、`OllamaModelProvider`（实现 core `ModelProvider`，`ollama:` 前缀 + 裸 id 兜底 + `OLLAMA_BASE_URL`）、9 个 DTO、`OllamaOptions`/`ThinkOption`、消息/工具转换（`to_ollama_messages[_with]`/`to_ollama_tools`/`to_tool_choice`）、响应解析与流式增量器。
-  3. **`dashscope` 子模块**：provider 全链路（`converter`/`credential`/`dto`/`model`/`parser`/`provider` 六模块，33 个单测），已接线并随 crate 编译。
-- **验证命令与结果**（基线由汇总方实测）
-  - `cargo build -p agentscope-extensions-model` → **Finished**（0 error；本 crate 无 error，输出中的 warning 来自其它 crate 的既有代码）
-  - `cargo test -p agentscope-extensions-model` → **58 passed / 0 failed / 0 ignored**
-  - `cargo test --workspace` → **1866 passed / 0 failed**（86 test target）
+  2. **`ollama` 子模块**：`OllamaChatModel`（实现 core `Model`，端点 `/api/chat`，流式与非流式）、`OllamaModelProvider`（实现 core `ModelProvider`，`ollama:` 前缀 + 裸 id 兜底 + `OLLAMA_BASE_URL`）、9 个 DTO、`OllamaOptions`/`ThinkOption`、消息/工具转换、响应解析与流式增量器。
+  3. **`dashscope` 子模块**：provider 全链路（`converter`/`credential`/`dto`/`model`/`parser`/`provider` 六模块，33 个单测）。
+  4. **`anthropic` 子模块（本轮新增）**：provider 全链路（`dto`/`credential`/`converter`/`parser`/`model`/`provider` 六模块，58 个单测）。覆盖：system 提升到顶层 `system`、prompt caching（`cache_control`/TTL，标记 system/末条消息/末个工具）、extended thinking（`thinking.budget_tokens`）、`tool_choice` 四变体与 `disable_parallel_tool_use`、tool_result 拆为独立 user 消息、多模态（base64/本地→base64，远程 URL 透传）、多智能体 `<history>` 合并、SSE 流式增量器（text/thinking 即时产出，tool 参数分片缓冲，usage 合并 message_start+message_delta）。
+  5. **`gemini` 子模块（本轮新增）**：provider 全链路（同构六模块，53 个单测）。覆盖：REST `generateContent`/`streamGenerateContent?alt=sse`、`generationConfig`（temperature/topP/topK/seed/maxOutputTokens/penalty/thinkingConfig）、`parametersJsonSchema` 工具声明与 `functionCallingConfig`（NONE/ANY/allowedFunctionNames）、tool result 独立 `user` content、`thoughtSignature` 持久化与回放、多模态 `inlineData`、多智能体 `<history>` 合并、流式增量器。
+- **验证命令与结果**（2026-09-19 本会话实测）
+  - `cargo build -p agentscope-extensions-model` → **Finished**（0 error；本 crate 0 error/0 warning）
+  - `cargo test -p agentscope-extensions-model` → **169 passed / 0 failed / 0 ignored**
 - **已知问题**
   1. `src/ollama/dto.rs` 的 embedding DTO 与 `EMBED_ENDPOINT` 常量无调用方（§3.2）。
   2. `agentscope-harness` 为未使用依赖（§3.3）。
-  3. `anthropic` / `gemini` 子模块尚未迁移（§3.1/§3.2）。
+  3. anthropic 并行 tool-use 拆分、gemini Vertex AI 与远程媒体下载为**非本轮范围**细化缺口（§3.2）。
   4. 无阻塞：build/test 全绿。
 
 ### 4.2 下一步与阻塞
 
-1. **【本 crate 内】补齐 P1 provider**：anthropic、gemini 两个子模块尚无任何 Rust 代码。实施前建议先裁定传输层方案（见下条），并按「DTO → converter → parser → model → provider → 离线单测」的既有 ollama/dashscope 模式推进。
-3. **【跨模块裁定请求，阻塞 P1 起点】anthropic / gemini 的传输与 SDK 选型**：Java 侧 anthropic 使用官方 SDK `com.anthropic.client.okhttp.AnthropicOkHttpClient`，而 core 只提供 OpenAI 兼容实现。需汇总方裁定：(a) 引入第三方 crate（如 `anthropic-sdk`/`google-generativeai` 类，需评估维护度与 workspace 版本策略）；(b) 用本 crate 既有 `HttpTransport` + `reqwest` 手写 wire 协议（与 ollama 一致，可完全离线测试，推荐）；(c) 交由 core 统一实现。**若选 (a) 且需写入根 `Cargo.toml` 的 `[workspace.dependencies]`，属跨模块变更，须由汇总方处理——本 crate 不得改根 `Cargo.toml`。**
-4. **【跨模块裁定请求】OpenAI 兼容厂商（deepseek/glm/kimi/minimax）差异化行为**：Java 为每厂商提供独立 `*ModelProvider`（SPI 注册）+ `*Formatter`/`*MultiAgentFormatter`；Rust 侧 core 仅以 `base_url` 覆盖 + `context_windows.rs` 窗口表覆盖。需确认：(a) 这些厂商的格式化差异是否影响功能正确性（尤其 kimi/glm 的 multi-agent 格式化与 `GLMFormatter` 的 thinking 处理）；(b) 若需要，应在 core 扩展兼容表还是在本 crate 增补 vendor formatter。**core 侧改动本 crate 不得执行。**
-5. **【待确认，非阻塞】`openai.tool.OpenAIMultiModalTool` 的归属**：core 无对应，需裁定归 MODEL 模块还是工具类模块。
-6. **【非阻塞】离线测试补强**：为 ollama converter 补充 tool-result 图片提升与 `OllamaToolsHelper` 对齐用例；为 dashscope 补 multimodal tool 与长尾 DTO 用例。
-7. **【非阻塞】依赖瘦身**：确认后可移除 `Cargo.toml` 中未使用的 `agentscope-harness`。
+1. **【本轮已完成，原阻塞项已解除】anthropic / gemini 的传输与 SDK 选型**：已按原第 3 条选项 **(b)** 执行——复用本 crate 既有 `HttpTransport` + `reqwest` 手写 wire 协议，未引入任何新依赖，未触碰根 `Cargo.toml`，测试完全离线（`MemoryTransport`）。两子模块 provider 全链路已落地并测试全绿。
+2. **【本 crate 内，非本轮范围】剩余 P1 细化缺口**：anthropic 并行 tool-use 拆分、gemini Vertex AI、统一远程媒体下载 resolver（§3.2/§3.3）。均可独立推进，无外部依赖。
+3. **【跨模块裁定请求】OpenAI 兼容厂商（deepseek/glm/kimi/minimax）差异化行为**：Java 为每厂商提供独立 `*ModelProvider`（SPI 注册）+ `*Formatter`/`*MultiAgentFormatter`；Rust 侧 core 仅以 `base_url` 覆盖 + `context_windows.rs` 窗口表覆盖。需确认：(a) 这些厂商的格式化差异是否影响功能正确性（尤其 kimi/glm 的 multi-agent 格式化与 `GLMFormatter` 的 thinking 处理）；(b) 若需要，应在 core 扩展兼容表还是在本 crate 增补 vendor formatter。**core 侧改动本 crate 不得执行。**
+4. **【待确认，非阻塞】`openai.tool.OpenAIMultiModalTool` 的归属**：core 无对应，需裁定归 MODEL 模块还是工具类模块。
+5. **【非阻塞】离线测试补强**：为 ollama converter 补充 tool-result 图片提升与 `OllamaToolsHelper` 对齐用例；为 dashscope 补 multimodal tool 与长尾 DTO 用例。
+6. **【非阻塞】依赖瘦身**：确认后可移除 `Cargo.toml` 中未使用的 `agentscope-harness`。
+
+> **跨模块需求汇总**：本轮 anthropic/gemini 落地**不需要任何 core/harness 改动**，也**不需要修改根 `Cargo.toml`**（未新增任何依赖）。当前剩余跨模块请求仅为第 3、4 条（OpenAI 兼容厂商与多模态工具归属），均属「待裁定」而非阻塞。
 
 > **跨模块需求汇总**：以上第 3、4 条涉及**是否需要修改 `crates/agentscope-core`（及极端情况下根 `Cargo.toml` 版本策略）**。本 crate 当前**不需要**任何 core/harness 改动即可保持 build/test 全绿；相关请求仅影响后续 anthropic/gemini/openai-compat 的落地方式，请汇总方裁定后再实施。
 

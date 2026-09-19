@@ -27,7 +27,7 @@ use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};
 
 pub mod adapter;
 pub mod connection;
-mod version_support;
+pub(crate) mod version_support;
 
 use self::adapter::RedisClientAdapter;
 use self::version_support::{SAVE_SCRIPT, UNCONDITIONAL};
@@ -428,7 +428,23 @@ impl RedisAgentStateStoreBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::MemoryRedisAdapter;
+    use agentscope_core::state::EMPTY_HASH;
     use serde_json::json;
+
+    const PREFIX: &str = "t:session:";
+
+    fn store() -> (RedisAgentStateStore, Arc<MemoryRedisAdapter>) {
+        let adapter = Arc::new(MemoryRedisAdapter::new());
+        let store = RedisAgentStateStore::builder()
+            .client(adapter.clone())
+            .key_prefix(PREFIX)
+            .build()
+            .expect("builder accepts the adapter");
+        (store, adapter)
+    }
+
+    // ---- pure helpers -----------------------------------------------------
 
     #[test]
     fn slot_id_uses_anon_for_missing_user() {
@@ -443,46 +459,357 @@ mod tests {
     }
 
     #[test]
-    fn builder_requires_client() {
+    fn builder_requires_client_and_rejects_blank_prefix() {
         assert!(RedisAgentStateStore::builder().build().is_err());
+        let adapter = Arc::new(MemoryRedisAdapter::new());
+        assert!(RedisAgentStateStore::builder()
+            .client(adapter)
+            .key_prefix("   ")
+            .build()
+            .is_err());
     }
 
     #[test]
-    fn builder_uses_default_prefix() {
-        // Only prefix validation is unit-testable without a live Redis; the client
-        // requirement is exercised above. Here we validate prefix rules via a dummy.
-        let store = RedisAgentStateStore::new(Arc::new(DummyAdapter), "custom:");
-        assert_eq!(store.key_prefix(), "custom:");
+    fn builder_uses_default_prefix_and_reports_versioning() {
+        let adapter = Arc::new(MemoryRedisAdapter::new());
+        let store = RedisAgentStateStore::builder().client(adapter).build().unwrap();
+        assert_eq!(store.key_prefix(), DEFAULT_KEY_PREFIX);
         assert!(store.supports_versioning());
-        let _ = json!({});
+        assert_eq!(DEFAULT_KEY_PREFIX, "agentscope:session:");
     }
 
-    /// Minimal adapter used only to satisfy the builder in pure-logic tests.
-    #[async_trait]
-    impl RedisClientAdapter for DummyAdapter {
-        async fn set(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn get(&self, _: &str) -> Result<Option<String>> { Ok(None) }
-        async fn right_push_list(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn range_list(&self, _: &str, _: i64, _: i64) -> Result<Vec<String>> { Ok(vec![]) }
-        async fn get_list_length(&self, _: &str) -> Result<i64> { Ok(0) }
-        async fn delete_keys(&self, _: &[String]) -> Result<()> { Ok(()) }
-        async fn add_to_set(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn get_set_members(&self, _: &str) -> Result<Vec<String>> { Ok(vec![]) }
-        async fn get_set_size(&self, _: &str) -> Result<i64> { Ok(0) }
-        async fn key_exists(&self, _: &str) -> Result<bool> { Ok(false) }
-        async fn find_keys_by_pattern(&self, _: &str) -> Result<Vec<String>> { Ok(vec![]) }
-        async fn eval_script(&self, _: &str, _: &[String], _: &[String]) -> Result<Option<i64>> {
-            Ok(Some(1))
-        }
+    #[test]
+    fn key_layout_matches_java() {
+        let (store, _adapter) = store();
+        assert_eq!(store.get_state_key("u/s", "k"), "t:session:u/s:k");
+        assert_eq!(store.get_list_key("u/s", "k"), "t:session:u/s:k:list");
+        assert_eq!(store.get_keys_key("u/s"), "t:session:u/s:_keys");
+        assert_eq!(ANON_USER, "__anon__");
+        assert_eq!(LIST_SUFFIX, ":list");
+        assert_eq!(HASH_SUFFIX, ":_hash");
+        assert_eq!(KEYS_SUFFIX, ":_keys");
     }
 
-    #[derive(Debug)]
-    struct DummyAdapter;
+    // ---- single-value save / get / exists / delete -----------------------
 
-    // Integration semantics of the list-hash change detection as consumed by
-    // `save_list_inner`. The pure algorithm lives in `agentscope_core::state::list_hash`
-    // (covered there); these assert the crate's persisted-hash contract end to end.
-    use agentscope_core::state::EMPTY_HASH;
+    #[tokio::test]
+    async fn save_then_get_round_trips_json() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!({"n": 1})).await;
+
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!({"n": 1})));
+        assert_eq!(adapter.string_of("t:session:u1/s1:k"), Some(r#"{"n":1}"#.to_string()));
+        assert_eq!(adapter.string_of("t:session:u1/s1:k:ver"), Some("1".to_string()));
+        assert_eq!(adapter.set_members("t:session:u1/s1:_keys"), vec!["k".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn save_is_unconditional_and_bumps_version() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save(Some("u1"), "s1", "k", json!(2)).await;
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
+        assert_eq!(adapter.string_of("t:session:u1/s1:k:ver"), Some("2".to_string()));
+        assert_eq!(adapter.eval_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_missing_key_is_none() {
+        let (store, adapter) = store();
+        assert_eq!(store.get(Some("u1"), "s1", "nope").await, None);
+        assert_eq!(adapter.eval_calls(), 0, "a read issues no script");
+    }
+
+    #[tokio::test]
+    async fn get_with_blank_session_is_none() {
+        let (store, _adapter) = store();
+        assert_eq!(store.get(Some("u1"), "  ", "k").await, None);
+    }
+
+    #[tokio::test]
+    async fn anonymous_user_uses_anon_slot() {
+        let (store, adapter) = store();
+        store.save(None, "s1", "k", json!(1)).await;
+        assert!(adapter.string_of("t:session:__anon__/s1:k").is_some());
+    }
+
+    #[tokio::test]
+    async fn corrupt_json_is_ignored_by_get() {
+        let (store, adapter) = store();
+        adapter.seed_string("t:session:u1/s1:k", "{not json");
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, None);
+    }
+
+    #[tokio::test]
+    async fn exists_reflects_tracked_keys() {
+        let (store, _adapter) = store();
+        assert!(!store.exists(Some("u1"), "s1").await);
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        assert!(store.exists(Some("u1"), "s1").await);
+        assert!(!store.exists(Some("u1"), "other").await, "per-slot tracking");
+        assert!(!store.exists(Some("u1"), "  ").await, "blank session");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_payload_version_and_tracking() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+
+        store.delete(Some("u1"), "s1").await;
+
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, None);
+        assert!(adapter.string_of("t:session:u1/s1:k").is_none());
+        assert!(adapter.string_of("t:session:u1/s1:k:ver").is_none());
+        assert!(adapter.string_of("t:session:u1/s1:l:list:_hash").is_none());
+        assert!(adapter.list("t:session:u1/s1:l:list").is_empty());
+        assert!(adapter.string_of("t:session:u1/s1:_keys").is_none());
+        assert!(!store.exists(Some("u1"), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn delete_on_untracked_slot_is_a_noop() {
+        let (store, adapter) = store();
+        store.delete(Some("u1"), "s1").await;
+        assert_eq!(adapter.delete_calls(), 0, "no DEL issued for an empty slot");
+        store.delete(Some("u1"), "  ").await;
+        assert_eq!(adapter.delete_calls(), 0);
+    }
+
+    // ---- list save / get -------------------------------------------------
+
+    #[tokio::test]
+    async fn save_list_writes_items_hash_and_tracking() {
+        let (store, adapter) = store();
+        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(1), json!(2)]);
+        assert_eq!(adapter.list("t:session:u1/s1:l:list"), vec!["1".to_string(), "2".to_string()]);
+        let expected_hash = compute_hash(&[json!(1), json!(2)]);
+        assert_eq!(adapter.string_of("t:session:u1/s1:l:list:_hash"), Some(expected_hash));
+        assert_eq!(adapter.set_members("t:session:u1/s1:_keys"), vec!["l:list".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn save_list_first_write_does_not_delete_for_empty_prefix() {
+        // core Case 3: an absent hash with no existing data means "no rewrite", so the
+        // very first write is a pure append (no DEL + full re-push).
+        let (store, adapter) = store();
+        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        assert_eq!(adapter.delete_calls(), 0, "no full rewrite on a fresh slot");
+        assert_eq!(adapter.push_calls(), 2, "exactly one RPUSH per item");
+    }
+
+    #[tokio::test]
+    async fn save_list_unchanged_prefix_is_a_noop() {
+        let (store, adapter) = store();
+        let values = vec![json!(1), json!(2)];
+        store.save_list(Some("u1"), "s1", "l", &values).await;
+        assert_eq!(adapter.push_calls(), 2);
+
+        // Identical list again: hash matches the stored prefix, length unchanged.
+        store.save_list(Some("u1"), "s1", "l", &values).await;
+        assert_eq!(adapter.push_calls(), 2, "no additional RPUSH");
+        assert_eq!(adapter.delete_calls(), 0, "no full rewrite");
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, values);
+    }
+
+    #[tokio::test]
+    async fn save_list_append_only_pushes_the_suffix() {
+        let (store, adapter) = store();
+        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2), json!(3)])
+            .await;
+
+        assert_eq!(adapter.push_calls(), 3, "only the appended item is pushed");
+        assert_eq!(adapter.delete_calls(), 0);
+        assert_eq!(
+            store.get_list(Some("u1"), "s1", "l").await,
+            vec![json!(1), json!(2), json!(3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn save_list_prefix_rewrite_triggers_full_rewrite() {
+        let (store, adapter) = store();
+        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        let pushes_before = adapter.push_calls();
+
+        // Same length, different first element: the prefix hash changes -> full rewrite.
+        store.save_list(Some("u1"), "s1", "l", &[json!(9), json!(2)]).await;
+
+        assert_eq!(adapter.delete_calls(), 1, "list key deleted before rewriting");
+        assert_eq!(adapter.push_calls(), pushes_before + 2, "whole list re-pushed");
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(9), json!(2)]);
+    }
+
+    #[tokio::test]
+    async fn save_list_shrink_triggers_full_rewrite() {
+        let (store, adapter) = store();
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2), json!(3)])
+            .await;
+        let pushes_before = adapter.push_calls();
+
+        store.save_list(Some("u1"), "s1", "l", &[json!(1)]).await;
+
+        assert_eq!(adapter.delete_calls(), 1);
+        assert_eq!(adapter.push_calls(), pushes_before + 1, "only the surviving item");
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(1)]);
+    }
+
+    #[tokio::test]
+    async fn save_list_with_legacy_data_and_no_hash_rewrites() {
+        // Pre-existing list data with no hash marker -> needs_full_rewrite (case 2).
+        let (store, adapter) = store();
+        adapter.seed_list("t:session:u1/s1:l:list", &["1", "2"]);
+
+        store.save_list(Some("u1"), "s1", "l", &[json!(7)]).await;
+
+        assert_eq!(adapter.delete_calls(), 1, "legacy data is replaced wholesale");
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(7)]);
+    }
+
+    #[tokio::test]
+    async fn save_list_empty_values_writes_empty_hash_constant() {
+        let (store, adapter) = store();
+        store.save_list(Some("u1"), "s1", "l", &[]).await;
+        assert_eq!(adapter.string_of("t:session:u1/s1:l:list:_hash"), Some(EMPTY_HASH.to_string()));
+        assert!(store.get_list(Some("u1"), "s1", "l").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_list_skips_corrupt_items() {
+        let (store, adapter) = store();
+        adapter.seed_list("t:session:u1/s1:l:list", &["1", "{bad", "2"]);
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(1), json!(2)]);
+        assert!(store.get_list(Some("u1"), "  ", "l").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_list_rejects_blank_session_without_writing() {
+        // `save_list` swallows errors (trait contract): nothing must be written.
+        let (store, adapter) = store();
+        store.save_list(Some("u1"), "  ", "l", &[json!(1)]).await;
+        assert_eq!(adapter.push_calls(), 0);
+        assert_eq!(adapter.eval_calls(), 0);
+    }
+
+    // ---- versioning / CAS ------------------------------------------------
+
+    #[tokio::test]
+    async fn supports_versioning_is_true() {
+        let (store, _adapter) = store();
+        assert!(store.supports_versioning());
+    }
+
+    #[tokio::test]
+    async fn get_versioned_missing_key_is_zero() {
+        let (store, _adapter) = store();
+        let versioned = store.get_versioned(Some("u1"), "s1", "k").await.unwrap();
+        assert_eq!(versioned, VersionedState { value: None, version: 0 });
+    }
+
+    #[tokio::test]
+    async fn get_versioned_returns_payload_and_version() {
+        let (store, _adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!({"a": 1})).await;
+        store.save(Some("u1"), "s1", "k", json!({"a": 2})).await;
+
+        let versioned = store.get_versioned(Some("u1"), "s1", "k").await.unwrap();
+        assert_eq!(versioned.value, Some(json!({"a": 2})));
+        assert_eq!(versioned.version, 2);
+    }
+
+    #[tokio::test]
+    async fn save_if_version_zero_bumps_unconditionally() {
+        let (store, _adapter) = store();
+        // Mirrors Java UNVERSIONED handling: 0 -> unconditional bump.
+        assert_eq!(store.save_if_version(Some("u1"), "s1", "k", &json!(1), 0).await.unwrap(), 1);
+        assert_eq!(store.save_if_version(Some("u1"), "s1", "k", &json!(2), 0).await.unwrap(), 2);
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
+    }
+
+    #[tokio::test]
+    async fn save_if_version_matching_version_succeeds() {
+        let (store, _adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await; // version 1
+        let new_version = store
+            .save_if_version(Some("u1"), "s1", "k", &json!(2), 1)
+            .await
+            .unwrap();
+        assert_eq!(new_version, 2);
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
+    }
+
+    #[tokio::test]
+    async fn save_if_version_conflict_returns_zero_and_leaves_state() {
+        let (store, _adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await; // version 1
+        let result = store
+            .save_if_version(Some("u1"), "s1", "k", &json!(99), 7)
+            .await
+            .unwrap();
+        assert_eq!(result, 0, "conflict is signalled as version 0");
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(1)));
+    }
+
+    // ---- session enumeration ---------------------------------------------
+
+    #[tokio::test]
+    async fn list_session_ids_returns_sorted_unique_sessions() {
+        let (store, _adapter) = store();
+        store.save(Some("u1"), "beta", "k", json!(1)).await;
+        store.save(Some("u1"), "alpha", "k", json!(1)).await;
+        store.save(Some("u2"), "gamma", "k", json!(1)).await;
+
+        assert_eq!(store.list_session_ids(Some("u1")).await, vec!["alpha", "beta"]);
+        assert_eq!(store.list_session_ids(Some("u2")).await, vec!["gamma"]);
+        assert!(store.list_session_ids(Some("u3")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_session_ids_handles_anonymous_slots() {
+        let (store, _adapter) = store();
+        store.save(None, "anon-session", "k", json!(1)).await;
+        assert_eq!(store.list_session_ids(None).await, vec!["anon-session"]);
+        assert_eq!(store.list_session_ids(Some("  ")).await, vec!["anon-session"]);
+    }
+
+    #[tokio::test]
+    async fn list_session_ids_is_not_confused_by_prefix_collisions() {
+        // `u1` must not pick up `u10`'s slot.
+        let (store, _adapter) = store();
+        store.save(Some("u1"), "mine", "k", json!(1)).await;
+        store.save(Some("u10"), "theirs", "k", json!(1)).await;
+        assert_eq!(store.list_session_ids(Some("u1")).await, vec!["mine"]);
+    }
+
+    // ---- maintenance -----------------------------------------------------
+
+    #[tokio::test]
+    async fn clear_all_sessions_counts_and_removes_everything() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save_list(Some("u1"), "s1", "l", &[json!(1)]).await;
+        store.save(Some("u2"), "s2", "k", json!(1)).await;
+        assert!(!adapter.all_keys().is_empty());
+
+        let removed = store.clear_all_sessions().await.unwrap();
+        assert!(removed > 0, "reported a nonzero key count, got {removed}");
+        assert!(adapter.all_keys().is_empty(), "every prefixed key deleted");
+        assert!(store.list_session_ids(Some("u1")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_all_sessions_is_a_noop_on_an_empty_store() {
+        let (store, adapter) = store();
+        assert_eq!(store.clear_all_sessions().await.unwrap(), 0);
+        assert_eq!(adapter.delete_calls(), 0);
+    }
+
+    // ---- core list-hash semantics (persisted-hash contract) --------------
 
     #[test]
     fn empty_hash_matches_java_constant() {

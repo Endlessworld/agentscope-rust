@@ -66,15 +66,13 @@ impl TableLockStrategy {
     }
 
     fn insert_lock(&self, lock_name: &str) -> JdbcResult<usize> {
+        // Mirrors the Java table lock: the lock row carries only the lock name.
         let bound = BoundSql::new(
             format!(
-                "INSERT INTO {} (lock_name, acquired_at) VALUES (?, ?)",
+                "INSERT INTO {} (lock_name) VALUES (?)",
                 self.dialect.resolved_lock_table_name()
             ),
-            vec![
-                SqlParam::Text(lock_name.to_string()),
-                SqlParam::Int(crate::now_millis()),
-            ],
+            vec![SqlParam::Text(lock_name.to_string())],
         );
         self.executor.execute(&bound)
     }

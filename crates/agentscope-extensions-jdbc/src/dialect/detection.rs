@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use super::abstract_dialect::{validate_identifier, AbstractJdbcDialect, DEFAULT_TABLE_PREFIX};
+use super::abstract_dialect::{
+    validate_identifier, AbstractJdbcDialect, TableNameConfig, DEFAULT_TABLE_PREFIX,
+};
 use super::vendor::{AnsiDialect, MysqlDialect, PostgresDialect, SqliteDialect};
 
 /// Detects a dialect from a database product name string, mirroring the SPI candidates'
@@ -142,7 +144,32 @@ impl JdbcDialectBuilder {
     }
 
     /// Returns the selected dialect.
+    ///
+    /// Chainable configuration (prefix + per-table overrides) is applied to the dialect
+    /// instance before it is returned, mirroring the Java `AbstractJdbcDialectBuilder.build()`
+    /// which sets the dialect's table-name fields. `auto_create_table` is record-only here:
+    /// schema creation is owned by the component constructors (which receive this builder's
+    /// value through [`Self::should_auto_create_table`]).
     pub fn build(self) -> Arc<dyn AbstractJdbcDialect> {
+        self.apply_table_name_config();
         self.dialect
+    }
+
+    /// Returns the configured [`TableNameConfig`] without mutating the dialect.
+    pub fn table_name_config(&self) -> TableNameConfig {
+        TableNameConfig {
+            prefix: self.table_prefix.clone(),
+            store_table_name: self.store_table_name.clone(),
+            session_state_table_name: self.session_state_table_name.clone(),
+            snapshot_table_name: self.snapshot_table_name.clone(),
+        }
+    }
+
+    /// Applies the chainable table-name configuration to the underlying dialect instance.
+    ///
+    /// [`AbstractJdbcDialect`] requires [`TableNameConfigurable`], so this works for every
+    /// dialect (built-in or third-party) sharing the hook.
+    fn apply_table_name_config(&self) {
+        self.dialect.apply_table_config(self.table_name_config());
     }
 }

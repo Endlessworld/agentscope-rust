@@ -17,6 +17,10 @@ futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Bailian signs its requests with ACS4-HMAC-SHA256; the Java SDK pulled these in transitively.
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

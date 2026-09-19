@@ -5,23 +5,24 @@
 //! [`crate::dialect::AbstractJdbcDialect`] implements this together with the other
 //! table-domain traits; vendor dialects override only what differs.
 
+use super::abstract_dialect::TableNameConfigurable;
 use super::bound_sql::{BoundSql, SqlParam};
 
 /// Canonical ANSI baseline SQL for the KV store table.
-pub trait StoreDialect: Send + Sync {
+pub trait StoreDialect: TableNameConfigurable + Send + Sync {
     /// Base table name (without prefix).
     fn store_table_name(&self) -> &str {
         "store"
     }
 
     /// Table-name prefix (default `agentscope_`).
-    fn store_table_prefix(&self) -> &str {
-        super::abstract_dialect::DEFAULT_TABLE_PREFIX
+    fn store_table_prefix(&self) -> String {
+        self.table_config().prefix
     }
 
     /// Optional full-table-name override (takes priority over prefix + base).
-    fn store_table_name_override(&self) -> Option<&str> {
-        None
+    fn store_table_name_override(&self) -> Option<String> {
+        self.table_config().store_table_name
     }
 
     /// Physical table name used by every business SQL statement in this trait:
@@ -33,7 +34,7 @@ pub trait StoreDialect: Send + Sync {
     /// aggregate trait simply inherits it.
     fn resolved_store_table_name(&self) -> String {
         match self.store_table_name_override() {
-            Some(name) => name.to_string(),
+            Some(name) => name,
             None => format!("{}{}", self.store_table_prefix(), self.store_table_name()),
         }
     }
@@ -129,7 +130,7 @@ pub trait StoreDialect: Send + Sync {
 
     /// The `LIKE` escape character used by [`Self::store_search`].
     fn store_like_escape_char(&self) -> char {
-        '\\'
+        '!'
     }
 
     /// Prefix search by `namespace_path LIKE 'prefix%'`, ordered by key with pagination.

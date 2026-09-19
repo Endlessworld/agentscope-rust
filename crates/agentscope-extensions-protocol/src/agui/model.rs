@@ -5,6 +5,11 @@
 //! * [`InputContent`] - a typed part discriminated by its `type` field.
 //! * [`InputContentSource`] - `data` (inline base64) or `url`, discriminated by `type`.
 //! * [`AguiToolCall`] / [`AguiFunctionCall`] - tool-call payloads.
+//! * [`RunAgentInput`] - the complete request payload (messages/tools/context/state/resume).
+//! * [`AguiContext`] - one contextual hint (description + value).
+//! * [`AguiResume`] - one resume response for a previously emitted interrupt.
+//! * [`AguiTool`] - a frontend-provided tool definition.
+//! * [`ToolMergeMode`] - how frontend tools interact with the agent toolkit.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -252,6 +257,391 @@ impl AguiFunctionCall {
             name: name.into(),
             arguments: arguments.unwrap_or_else(default_arguments),
         }
+    }
+}
+
+/// Input model for running an agent via the AG-UI protocol.
+///
+/// Mirrors Java `RunAgentInput`: `threadId`/`runId` are required (Java enforces them with
+/// `Objects.requireNonNull`), every collection defaults to empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAgentInput {
+    /// The thread id for this conversation.
+    pub thread_id: String,
+    /// The unique run id.
+    pub run_id: String,
+    /// The conversation messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<AguiMessage>,
+    /// Frontend-provided tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<AguiTool>,
+    /// Additional context information.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<AguiContext>,
+    /// Initial state to load.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub state: Map<String, Value>,
+    /// Additional properties to forward.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub forwarded_props: Map<String, Value>,
+    /// Resume responses for previously emitted interrupts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume: Vec<AguiResume>,
+}
+
+impl Default for RunAgentInput {
+    fn default() -> Self {
+        Self {
+            thread_id: String::new(),
+            run_id: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            context: Vec::new(),
+            state: Map::new(),
+            forwarded_props: Map::new(),
+            resume: Vec::new(),
+        }
+    }
+}
+
+impl RunAgentInput {
+    /// Creates a run input from its full set of fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        thread_id: impl Into<String>,
+        run_id: impl Into<String>,
+        messages: Vec<AguiMessage>,
+        tools: Vec<AguiTool>,
+        context: Vec<AguiContext>,
+        state: Map<String, Value>,
+        forwarded_props: Map<String, Value>,
+        resume: Vec<AguiResume>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            run_id: run_id.into(),
+            messages,
+            tools,
+            context,
+            state,
+            forwarded_props,
+            resume,
+        }
+    }
+
+    /// Creates a minimal run input carrying only the thread/run identifiers.
+    pub fn of(thread_id: impl Into<String>, run_id: impl Into<String>) -> Self {
+        Self::new(
+            thread_id,
+            run_id,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Map::new(),
+            Map::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Creates a builder-style copy with different messages.
+    pub fn with_messages(mut self, messages: Vec<AguiMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Creates a builder-style copy with different resume entries.
+    pub fn with_resume(mut self, resume: Vec<AguiResume>) -> Self {
+        self.resume = resume;
+        self
+    }
+
+    /// A specific forwarded property value, or `None` when absent.
+    pub fn forwarded_prop(&self, key: &str) -> Option<&Value> {
+        self.forwarded_props.get(key)
+    }
+
+    /// A specific forwarded property value, or `default` when absent.
+    pub fn forwarded_prop_or<'a>(&'a self, key: &str, default: &'a Value) -> &'a Value {
+        self.forwarded_props.get(key).unwrap_or(default)
+    }
+
+    /// Whether any messages are present.
+    pub fn has_messages(&self) -> bool {
+        !self.messages.is_empty()
+    }
+
+    /// Whether any frontend tools are present.
+    pub fn has_tools(&self) -> bool {
+        !self.tools.is_empty()
+    }
+
+    /// Whether any context items are present.
+    pub fn has_context(&self) -> bool {
+        !self.context.is_empty()
+    }
+
+    /// Whether any initial state is present.
+    pub fn has_state(&self) -> bool {
+        !self.state.is_empty()
+    }
+
+    /// Whether any interrupt resume responses are present.
+    pub fn has_resume(&self) -> bool {
+        !self.resume.is_empty()
+    }
+}
+
+/// A piece of contextual information in the AG-UI protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AguiContext {
+    /// Description of what this context represents.
+    pub description: String,
+    /// The actual context value.
+    pub value: String,
+}
+
+impl AguiContext {
+    /// Creates a context item.
+    pub fn new(description: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// One official AG-UI resume response for a previous interrupt.
+///
+/// Resume entries are sent on the next [`RunAgentInput`] for the same thread and are
+/// correlated with the interrupted run by `interruptId`.
+///
+/// A user response that explicitly denies the request is still `resolved`, **not**
+/// `cancelled`: the cancelled status is reserved for cases where the user provides no
+/// meaningful input and the payload is omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AguiResume {
+    /// The interrupt id from `RunFinished.outcome.interrupts[].id`.
+    pub interrupt_id: String,
+    /// The resume status, usually `resolved` or `cancelled`.
+    pub status: String,
+    /// Optional response payload for resolved interrupts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+impl AguiResume {
+    /// Resume status: the interrupt was resolved.
+    pub const STATUS_RESOLVED: &'static str = "resolved";
+    /// Resume status: the interrupt was cancelled.
+    pub const STATUS_CANCELLED: &'static str = "cancelled";
+
+    /// Creates a resume entry.
+    pub fn new(interrupt_id: impl Into<String>, status: impl Into<String>, payload: Option<Value>) -> Self {
+        Self {
+            interrupt_id: interrupt_id.into(),
+            status: status.into(),
+            payload,
+        }
+    }
+
+    /// Whether this resume entry resolved the interrupt.
+    pub fn is_resolved(&self) -> bool {
+        self.status == Self::STATUS_RESOLVED
+    }
+
+    /// Whether this resume entry cancelled the interrupt.
+    pub fn is_cancelled(&self) -> bool {
+        self.status == Self::STATUS_CANCELLED
+    }
+
+    /// The `approved` boolean of the payload, when present.
+    pub fn payload_approved(&self) -> Option<bool> {
+        self.payload
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(crate::agui::constants::RESUME_PAYLOAD_APPROVED))
+            .and_then(Value::as_bool)
+    }
+
+    /// The `editedArgs` object of the payload, when present.
+    pub fn payload_edited_args(&self) -> Option<&Map<String, Value>> {
+        self.payload
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(crate::agui::constants::RESUME_PAYLOAD_EDITED_ARGS))
+            .and_then(Value::as_object)
+    }
+}
+
+/// A tool definition in the AG-UI protocol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AguiTool {
+    /// The tool name.
+    pub name: String,
+    /// The tool description.
+    pub description: String,
+    /// The parameters JSON Schema.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub parameters: Map<String, Value>,
+}
+
+impl AguiTool {
+    /// Creates a tool definition.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Map<String, Value>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
+/// How tools from the frontend should be merged with the agent's toolkit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ToolMergeMode {
+    /// Use only tools provided from the frontend; the agent toolkit is ignored.
+    FrontendOnly,
+    /// Use only the agent's toolkit; frontend tools are ignored.
+    AgentOnly,
+    /// Merge both; frontend tools override agent tools on name conflicts.
+    #[default]
+    MergeFrontendPriority,
+}
+
+impl ToolMergeMode {
+    /// The Java enum constant name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolMergeMode::FrontendOnly => "FRONTEND_ONLY",
+            ToolMergeMode::AgentOnly => "AGENT_ONLY",
+            ToolMergeMode::MergeFrontendPriority => "MERGE_FRONTEND_PRIORITY",
+        }
+    }
+
+    /// Parses a Java enum constant name (case-insensitive).
+    pub fn from_wire(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "FRONTEND_ONLY" => Some(ToolMergeMode::FrontendOnly),
+            "AGENT_ONLY" => Some(ToolMergeMode::AgentOnly),
+            "MERGE_FRONTEND_PRIORITY" => Some(ToolMergeMode::MergeFrontendPriority),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn run_agent_input_round_trips_with_camel_case() {
+        let mut forwarded = Map::new();
+        forwarded.insert("agentId".to_string(), json!("assistant"));
+        let input = RunAgentInput::new(
+            "t1",
+            "r1",
+            vec![AguiMessage::user_message("m1", "hi")],
+            vec![AguiTool::new("search", "search the web", Map::new())],
+            vec![AguiContext::new("tenant", "acme")],
+            serde_json::from_value(json!({"count": 1})).unwrap(),
+            forwarded,
+            vec![AguiResume::new("i1", AguiResume::STATUS_RESOLVED, None)],
+        );
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["threadId"], json!("t1"));
+        assert_eq!(value["runId"], json!("r1"));
+        assert_eq!(value["forwardedProps"]["agentId"], json!("assistant"));
+        assert_eq!(value["tools"][0]["name"], json!("search"));
+        assert_eq!(value["context"][0]["description"], json!("tenant"));
+        assert_eq!(value["resume"][0]["interruptId"], json!("i1"));
+        assert_eq!(serde_json::from_value::<RunAgentInput>(value).unwrap(), input);
+        assert!(input.has_messages() && input.has_tools() && input.has_context());
+        assert!(input.has_state() && input.has_resume());
+        assert_eq!(input.forwarded_prop("agentId"), Some(&json!("assistant")));
+        assert_eq!(input.forwarded_prop("missing"), None);
+    }
+
+    #[test]
+    fn run_agent_input_defaults_optional_collections() {
+        let input: RunAgentInput = serde_json::from_str(r#"{"threadId":"t","runId":"r"}"#).unwrap();
+        assert_eq!(input, RunAgentInput::of("t", "r"));
+        assert!(!input.has_messages() && !input.has_tools() && !input.has_resume());
+        // Empty collections are omitted from the wire form, mirroring Java's absent-field shape.
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value, json!({"threadId": "t", "runId": "r"}));
+    }
+
+    #[test]
+    fn resume_helpers_distinguish_resolved_from_cancelled() {
+        let denied = AguiResume::new(
+            "i1",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"approved": false})),
+        );
+        assert!(denied.is_resolved());
+        assert!(!denied.is_cancelled());
+        assert_eq!(denied.payload_approved(), Some(false));
+        assert!(denied.payload_edited_args().is_none());
+
+        let cancelled = AguiResume::new("i2", AguiResume::STATUS_CANCELLED, None);
+        assert!(cancelled.is_cancelled());
+        assert!(!cancelled.is_resolved());
+        assert_eq!(cancelled.payload_approved(), None);
+    }
+
+    #[test]
+    fn resume_edited_args_requires_a_json_object() {
+        let resume = AguiResume::new(
+            "i1",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"editedArgs": {"a": 1}})),
+        );
+        let args = resume.payload_edited_args().unwrap();
+        assert_eq!(args.get("a"), Some(&json!(1)));
+        let scalar = AguiResume::new(
+            "i2",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"editedArgs": "nope"})),
+        );
+        assert!(scalar.payload_edited_args().is_none());
+    }
+
+    #[test]
+    fn tool_merge_mode_round_trips_java_names() {
+        assert_eq!(ToolMergeMode::default(), ToolMergeMode::MergeFrontendPriority);
+        for mode in [
+            ToolMergeMode::FrontendOnly,
+            ToolMergeMode::AgentOnly,
+            ToolMergeMode::MergeFrontendPriority,
+        ] {
+            assert_eq!(ToolMergeMode::from_wire(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ToolMergeMode::from_wire("merge_frontend_priority"), Some(ToolMergeMode::MergeFrontendPriority));
+        assert_eq!(ToolMergeMode::from_wire("NOPE"), None);
+        assert_eq!(
+            serde_json::to_value(ToolMergeMode::AgentOnly).unwrap(),
+            json!("AGENT_ONLY")
+        );
+    }
+
+    #[test]
+    fn context_and_tool_omit_empty_parameters() {
+        let tool = AguiTool::new("t", "d", Map::new());
+        assert_eq!(serde_json::to_value(&tool).unwrap(), json!({"name": "t", "description": "d"}));
+        assert_eq!(
+            serde_json::to_value(AguiContext::new("k", "v")).unwrap(),
+            json!({"description": "k", "value": "v"})
+        );
     }
 }
 

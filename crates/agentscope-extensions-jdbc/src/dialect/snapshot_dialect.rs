@@ -2,30 +2,31 @@
 //!
 //! Stores binary workspace tar archives keyed by `snapshot_id`.
 
+use super::abstract_dialect::TableNameConfigurable;
 use super::bound_sql::{BoundSql, SqlParam};
 
 /// ANSI baseline SQL for the snapshots table.
-pub trait SnapshotDialect: Send + Sync {
+pub trait SnapshotDialect: TableNameConfigurable + Send + Sync {
     /// Base table name (without prefix).
     fn snapshot_table_name(&self) -> &str {
         "snapshots"
     }
 
     /// Table-name prefix (default `agentscope_`).
-    fn snapshot_table_prefix(&self) -> &str {
-        super::abstract_dialect::DEFAULT_TABLE_PREFIX
+    fn snapshot_table_prefix(&self) -> String {
+        self.table_config().prefix
     }
 
     /// Optional full-table-name override (takes priority over prefix + base).
-    fn snapshot_table_name_override(&self) -> Option<&str> {
-        None
+    fn snapshot_table_name_override(&self) -> Option<String> {
+        self.table_config().snapshot_table_name
     }
 
     /// Physical table name used by every business SQL statement in this trait:
     /// per-table override > prefix + base (mirrors Java's final `snapshotTableName()`).
     fn resolved_snapshot_table_name(&self) -> String {
         match self.snapshot_table_name_override() {
-            Some(name) => name.to_string(),
+            Some(name) => name,
             None => format!(
                 "{}{}",
                 self.snapshot_table_prefix(),

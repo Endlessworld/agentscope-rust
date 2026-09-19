@@ -292,3 +292,319 @@ fn is_duplicate_key(e: &PostgresError) -> bool {
     let msg = e.to_string().to_lowercase();
     msg.contains("duplicate key") || msg.contains("23505") || msg.contains("unique constraint")
 }
+
+#[cfg(test)]
+mod tests {
+    //! Offline unit tests mirroring `PostgresBaseStoreTest` (JUnit5 + Mockito + H2 on the
+    //! Java side). [`MemoryClient`] replaces H2 here: it understands the exact statement
+    //! shapes emitted above, including `ON CONFLICT` upserts, conditional CAS updates and
+    //! `LIKE ... ESCAPE '!'` prefix search.
+
+    use super::*;
+    use crate::memory::MemoryClient;
+    use crate::sql::NS_SEPARATOR;
+    use serde_json::json;
+
+    fn client() -> Arc<MemoryClient> {
+        Arc::new(MemoryClient::new())
+    }
+
+    fn store(client: &Arc<MemoryClient>) -> PostgresStore {
+        PostgresStore::with_schema_init(client.clone()).unwrap()
+    }
+
+    fn ns(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn val(v: serde_json::Value) -> StoreValue {
+        v.as_object().expect("test value must be an object").clone()
+    }
+
+    // ---- builder ------------------------------------------------------------
+
+    // Java: PostgresBaseStoreTest#builderWithDefaultsCreatesStore
+    #[test]
+    fn builder_defaults_unqualified_default_table() {
+        let c = client();
+        let s = PostgresStore::builder(c).build().unwrap();
+        assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
+        assert!(s.schema_name().is_none());
+    }
+
+    // Java: PostgresBaseStoreTest#builderWithCustomTableName,
+    //       #builderWithCustomSchemaNameUsesQualifiedTableName
+    #[test]
+    fn builder_custom_schema_and_table_qualified() {
+        let c = client();
+        let s = PostgresStore::builder(c.clone())
+            .schema("custom")
+            .unwrap()
+            .table("custom_kv")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(s.schema_name(), Some("custom"));
+        assert_eq!(s.table_name(), "custom_kv");
+        assert_eq!(s.full_table, "\"custom\".\"custom_kv\"");
+        // initialize_schema is off by default: nothing provisioned yet.
+        assert!(!c.has_table("custom_kv"));
+    }
+
+    // Java: PostgresBaseStoreTest#builderRejectsInvalidTableName, #builderRejectsInvalidSchemaName
+    #[test]
+    fn builder_rejects_invalid_names() {
+        let c = client();
+        assert!(PostgresStore::builder(c.clone()).table("bad name").is_err());
+        assert!(PostgresStore::builder(c.clone()).table("1bad").is_err());
+        assert!(PostgresStore::builder(c).schema("bad-name").is_err());
+    }
+
+    // Java: PostgresBaseStoreTest#initializeSchemaDefaultDoesNotCreateTable,
+    //       #initializeSchemaTrueCreatesTable, #initializeSchemaTrueCreatesCustomSchemaAndTable
+    #[test]
+    fn initialize_schema_creates_schema_and_table() {
+        let c = client();
+        let _ = PostgresStore::builder(c.clone()).build().unwrap();
+        assert!(!c.has_table(DEFAULT_TABLE_NAME));
+
+        let c2 = client();
+        let _ = PostgresStore::with_schema_init(c2.clone()).unwrap();
+        assert!(c2.has_table(DEFAULT_TABLE_NAME));
+        assert!(c2.ddl_statements().iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS")));
+
+        let c3 = client();
+        let _ = PostgresStore::builder(c3.clone())
+            .schema("custom")
+            .unwrap()
+            .table("kv")
+            .unwrap()
+            .initialize_schema(true)
+            .build()
+            .unwrap();
+        assert!(c3.has_schema("custom"));
+        assert!(c3.has_table("kv"));
+    }
+
+    // ---- get / put ----------------------------------------------------------
+
+    // Java: PostgresBaseStoreTest#getReturnsItem
+    #[test]
+    fn get_returns_item_with_version() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "key1", val(json!({"a": 1})));
+        let item = s.get(&n, "key1").expect("item present");
+        assert_eq!(item.key, "key1");
+        assert_eq!(item.version, 1);
+        assert_eq!(item.value.get("a"), Some(&json!(1)));
+    }
+
+    // Java: PostgresBaseStoreTest#getReturnsNullWhenNotFound
+    #[test]
+    fn get_returns_none_when_missing() {
+        let c = client();
+        let s = store(&c);
+        assert!(s.get(&ns(&["filesystem"]), "nope").is_none());
+    }
+
+    // Java: PostgresBaseStoreTest#putWritesItem (version increments per write)
+    #[test]
+    fn put_upserts_and_increments_version() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "k", val(json!({"v": 1})));
+        assert_eq!(s.get(&n, "k").unwrap().version, 1);
+        s.put(&n, "k", val(json!({"v": 2})));
+        let item = s.get(&n, "k").unwrap();
+        assert_eq!(item.version, 2);
+        assert_eq!(item.value.get("v"), Some(&json!(2)));
+        assert_eq!(c.store_row_count(), 1);
+    }
+
+    // Java: PostgresBaseStoreTest#deserializeHandlesNullAndEmpty
+    #[test]
+    fn get_decodes_empty_json_as_empty_map() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        c.query(
+            &format!(
+                "INSERT INTO {} (namespace_path, item_key, value_json, version, updated_at) \
+                 VALUES ($1, $2, $3, 1, $4)",
+                s.full_table
+            ),
+            &[
+                SqlValue::text(crate::sql::namespace_path(&n).unwrap()),
+                SqlValue::text("k"),
+                SqlValue::text(""),
+                SqlValue::BigInt(0),
+            ],
+        )
+        .unwrap();
+        let item = s.get(&n, "k").unwrap();
+        assert!(item.value.is_empty());
+    }
+
+    // Java: PostgresBaseStoreTest#keyCannotBeNullOrEmpty
+    #[test]
+    fn empty_key_is_ignored() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "", val(json!({"a": 1})));
+        assert_eq!(c.store_row_count(), 0);
+        assert!(s.get(&n, "").is_none());
+    }
+
+    // ---- CAS ----------------------------------------------------------------
+
+    // Java: PostgresBaseStoreTest#putIfVersionInsertSucceeds
+    #[test]
+    fn put_if_version_zero_creates_then_fails_on_duplicate() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        assert!(s.put_if_version(&n, "k", val(json!({"v": 1})), 0));
+        assert_eq!(s.get(&n, "k").unwrap().version, 1);
+        // Duplicate key on the create-only branch: CAS correctly fails.
+        assert!(!s.put_if_version(&n, "k", val(json!({"v": 2})), 0));
+        assert_eq!(s.get(&n, "k").unwrap().value.get("v"), Some(&json!(1)));
+    }
+
+    // Java: PostgresBaseStoreTest#putIfVersionUpdateSucceeds
+    #[test]
+    fn put_if_version_match_updates_row() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "k", val(json!({"v": 1})));
+        assert!(s.put_if_version(&n, "k", val(json!({"v": 2})), 1));
+        let item = s.get(&n, "k").unwrap();
+        assert_eq!(item.version, 2);
+        assert_eq!(item.value.get("v"), Some(&json!(2)));
+    }
+
+    // Java: PostgresBaseStoreTest#putIfVersionUpdateMismatchReturnsFalse
+    #[test]
+    fn put_if_version_mismatch_fails() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "k", val(json!({"v": 1})));
+        assert!(!s.put_if_version(&n, "k", val(json!({"v": 2})), 5));
+        // A non-existent key also fails the conditional-update branch.
+        assert!(!s.put_if_version(&n, "absent", val(json!({})), 1));
+        assert_eq!(s.get(&n, "k").unwrap().value.get("v"), Some(&json!(1)));
+    }
+
+    // ---- search -------------------------------------------------------------
+
+    // Java: PostgresBaseStoreTest#searchReturnsItems
+    #[test]
+    fn search_returns_items_in_the_namespace_sorted_by_key() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem", "docs"]);
+        s.put(&n, "b", val(json!({"i": 2})));
+        s.put(&n, "a", val(json!({"i": 1})));
+        let hits = s.search(&n, 10, 0);
+        assert_eq!(hits.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        // Pagination.
+        let page = s.search(&n, 1, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].key, "b");
+    }
+
+    // Java: PostgresBaseStoreTest#searchReturnsEmptyForNonPositiveLimit
+    #[test]
+    fn search_with_zero_limit_returns_nothing() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "k", val(json!({})));
+        assert!(s.search(&n, 0, 0).is_empty());
+    }
+
+    // Java: PostgresBaseStoreTest#searchEscapesLikeSpecialCharacters — plus the US(0x1F)
+    // namespace encoding (trailing separator lets `LIKE 'prefix%'` match sub-namespaces).
+    #[test]
+    fn search_prefix_uses_encoded_namespace_and_isolates_siblings() {
+        let c = client();
+        let s = store(&c);
+        let root = ns(&["root"]);
+        let child = ns(&["root", "child"]);
+        let sibling = ns(&["root2"]);
+        s.put(&root, "r", val(json!({"scope": "root"})));
+        s.put(&child, "c", val(json!({"scope": "child"})));
+        s.put(&sibling, "x", val(json!({"scope": "sibling"})));
+
+        // The encoded path stores a trailing separator.
+        let encoded = namespace_path(&child).unwrap();
+        assert!(encoded.contains(NS_SEPARATOR));
+        assert_eq!(encoded.matches(NS_SEPARATOR).count(), 2);
+
+        // A prefix search on `root` sees its own item and descendants, but not `root2`.
+        let hits = s.search(&root, 10, 0);
+        let keys: Vec<&str> = hits.iter().map(|i| i.key.as_str()).collect();
+        assert!(keys.contains(&"r"));
+        assert!(keys.contains(&"c"));
+        assert!(!keys.contains(&"x"));
+    }
+
+    // Java: PostgresBaseStoreTest#searchEscapesLikeSpecialCharacters
+    #[test]
+    fn like_pattern_escapes_metacharacters_in_segments() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["a%b", "c_d"]);
+        s.put(&n, "k", val(json!({"ok": true})));
+        let hits = s.search(&n, 10, 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "k");
+        // Escaped pattern round-trips through the LIKE matcher.
+        let pat = like_prefix_pattern(&n).unwrap();
+        assert!(pat.contains("!%"));
+        assert!(pat.contains("!_"));
+    }
+
+    // Java: PostgresBaseStoreTest#namespaceSegmentCannotContainSeparator
+    #[test]
+    fn namespace_segment_with_separator_is_rejected() {
+        let c = client();
+        let s = store(&c);
+        let bad = vec![format!("bad{NS_SEPARATOR}seg")];
+        s.put(&bad, "k", val(json!({})));
+        assert_eq!(c.store_row_count(), 0);
+        assert!(s.get(&bad, "k").is_none());
+        assert!(s.search(&bad, 10, 0).is_empty());
+    }
+
+    // ---- delete -------------------------------------------------------------
+
+    // Java: PostgresBaseStoreTest#deleteRemovesItem
+    #[test]
+    fn delete_removes_item() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        s.put(&n, "k", val(json!({"a": 1})));
+        assert!(s.get(&n, "k").is_some());
+        s.delete(&n, "k");
+        assert!(s.get(&n, "k").is_none());
+        assert_eq!(c.store_row_count(), 0);
+    }
+
+    // Java: PostgresBaseStoreTest#isDuplicateKey* (the Rust heuristic mirrors
+    // `isDuplicateKey`; the create-only CAS path above exercises it end-to-end).
+    #[test]
+    fn duplicate_key_detection_recognises_sqlstate_and_message() {
+        assert!(is_duplicate_key(&PostgresError::Query(
+            "duplicate key value violates unique constraint \"x_pkey\"".into()
+        )));
+        assert!(is_duplicate_key(&PostgresError::Query("SQLSTATE 23505".into())));
+        assert!(!is_duplicate_key(&PostgresError::Query("connection reset".into())));
+    }
+}

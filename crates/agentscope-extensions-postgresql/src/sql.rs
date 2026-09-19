@@ -194,4 +194,138 @@ mod tests {
         assert!(SCHEMA_EXISTS_QUERY.contains("$1"));
         assert!(TABLE_EXISTS_QUERY.contains("$1") && TABLE_EXISTS_QUERY.contains("$2"));
     }
+
+    // ---- namespace encoding / LIKE escaping ---------------------------------
+
+    /// Java: `PostgresBaseStoreTest#namespaceSegmentCannotContainSeparator`
+    #[test]
+    fn namespace_path_of_empty_is_empty_and_each_segment_is_terminated() {
+        assert_eq!(namespace_path(&[]).unwrap(), "");
+        let p = namespace_path(&["root".into(), "child".into(), "leaf".into()]).unwrap();
+        assert_eq!(
+            p,
+            format!("root{NS_SEPARATOR}child{NS_SEPARATOR}leaf{NS_SEPARATOR}")
+        );
+        // Trailing separator => `LIKE 'root<US>%'` matches the namespace and descendants.
+        assert!(p.starts_with(&format!("root{NS_SEPARATOR}")));
+    }
+
+    /// Java: `PostgresBaseStoreTest#searchEscapesLikeSpecialCharacters`
+    #[test]
+    fn like_prefix_pattern_escapes_escape_percent_underscore_and_appends_wildcard() {
+        assert_eq!(like_prefix_pattern(&[]).unwrap(), "%");
+        let pat = like_prefix_pattern(&["a!b".into(), "c%d".into(), "e_f".into()]).unwrap();
+        assert!(pat.starts_with("a!!b"));
+        assert!(pat.contains("!%"));
+        assert!(pat.contains("!_"));
+        assert!(pat.ends_with('%'));
+    }
+
+    /// Java: namespace helpers reject the reserved separator.
+    #[test]
+    fn namespace_and_like_helpers_reject_embedded_separator() {
+        let bad = vec![format!("x{NS_SEPARATOR}y")];
+        assert!(namespace_path(&bad).is_err());
+        assert!(like_prefix_pattern(&bad).is_err());
+    }
+
+    // ---- identifier validation ----------------------------------------------
+
+    /// Java: `PostgresAgentStateStoreTest#rejectsTooLongIdentifier`
+    #[test]
+    fn identifier_length_limit_is_63() {
+        assert_eq!(MAX_IDENTIFIER_LENGTH, 63);
+        assert!(validate_identifier(&"a".repeat(63), "table").is_ok());
+        let err = validate_identifier(&"a".repeat(64), "table").unwrap_err();
+        assert!(matches!(err, PostgresError::InvalidIdentifier(_)));
+    }
+
+    /// Java: `PostgresAgentStateStoreTest#rejectsInvalidSchemaName` etc.
+    #[test]
+    fn identifier_rejects_illegal_first_and_subsequent_characters() {
+        assert!(validate_identifier("_ok", "x").is_ok());
+        assert!(validate_identifier("a_1", "x").is_ok());
+        assert!(validate_identifier("9lives", "x").is_err());
+        assert!(validate_identifier("has space", "x").is_err());
+        assert!(validate_identifier("has-hyphen", "x").is_err());
+        assert!(validate_identifier("has.dot", "x").is_err());
+        assert!(validate_identifier("", "x").is_err());
+    }
+
+    /// Identifier validation trims surrounding whitespace before checking.
+    #[test]
+    fn identifier_trims_whitespace() {
+        assert_eq!(validate_identifier("  users  ", "table").unwrap(), "users");
+        assert!(validate_identifier("\t\n", "table").is_err());
+    }
+
+    /// SQL-injection samples must all be rejected by the identifier validator (these are the
+    /// payloads that would otherwise be interpolated into DDL/statement text).
+    #[test]
+    fn identifier_rejects_injection_samples() {
+        for sample in [
+            "users; DROP TABLE agentscope_sessions;--",
+            "users\"--",
+            "users' OR '1'='1",
+            "1); DELETE FROM t; --",
+            "users--",
+            "users/*x*/",
+            "public.users",
+            "a b",
+        ] {
+            assert!(
+                validate_identifier(sample, "table").is_err(),
+                "injection sample unexpectedly accepted: {sample:?}"
+            );
+        }
+    }
+
+    // ---- qualified table + DDL ----------------------------------------------
+
+    /// Java: `PostgresBaseStoreTest#builderWithCustomSchemaNameUsesQualifiedTableName`
+    #[test]
+    fn qualified_table_quotes_each_component() {
+        assert_eq!(qualified_table(Some("public"), "agentscope_store"), "\"public\".\"agentscope_store\"");
+        assert_eq!(qualified_table(None, "agentscope_store"), "agentscope_store");
+    }
+
+    /// Java: the three shipped `CREATE TABLE IF NOT EXISTS` templates.
+    #[test]
+    fn sessions_ddl_declares_primary_key_and_version_column() {
+        let ddl = sessions_ddl("\"s\".\"t\"");
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS \"s\".\"t\""));
+        assert!(ddl.contains("PRIMARY KEY (session_id, state_key, item_index)"));
+        assert!(ddl.contains("state_data TEXT         NOT NULL"));
+        assert!(ddl.contains("version    BIGINT       NOT NULL DEFAULT 0"));
+    }
+
+    /// Java: the KV store DDL.
+    #[test]
+    fn store_ddl_declares_namespace_key_primary_key() {
+        let ddl = store_ddl("agentscope_store");
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS agentscope_store"));
+        assert!(ddl.contains("namespace_path VARCHAR(2048) NOT NULL"));
+        assert!(ddl.contains("value_json     TEXT          NOT NULL"));
+        assert!(ddl.contains("PRIMARY KEY (namespace_path, item_key)"));
+    }
+
+    /// Java: the snapshot DDL (BYTEA column keyed by `snapshot_id`).
+    #[test]
+    fn snapshots_ddl_declares_bytea_primary_key() {
+        let ddl = snapshots_ddl("agentscope_snapshots");
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS agentscope_snapshots"));
+        assert!(ddl.contains("snapshot_id VARCHAR(512) NOT NULL PRIMARY KEY"));
+        assert!(ddl.contains("data        BYTEA        NOT NULL"));
+    }
+
+    /// `ensure_version_column_ddl` and the existence queries are available for the
+    /// pre-existing-database migration / verification paths.
+    #[test]
+    fn migration_and_verification_sql_are_well_formed() {
+        let ddl = ensure_version_column_ddl("\"agentscope\".\"agentscope_sessions\"");
+        assert!(ddl.starts_with("ALTER TABLE \"agentscope\".\"agentscope_sessions\""));
+        assert!(ddl.ends_with("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0"));
+        assert!(SCHEMA_EXISTS_QUERY.contains("WHERE SCHEMA_NAME = $1"));
+        assert!(TABLE_EXISTS_QUERY.contains("WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2"));
+    }
 }

@@ -429,6 +429,21 @@ impl MongodbAgentStateStore {
         }
     }
 
+    /// Deletes a single key from a session slot, removing its value, version and
+    /// list hash (`$unset`), mirroring Java `MongoAgentStateStore.delete(userId,
+    /// sessionId, key)`.
+    ///
+    /// Returns an error when `key` is not a valid state key (see
+    /// [`validate_state_key`]); on a missing slot the update is a no-op.
+    pub async fn delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<(), MongoError> {
+        self.delete_key_inner(user_id, session_id, key).await
+    }
+
     async fn delete_key_inner(
         &self,
         user_id: Option<&str>,
@@ -743,6 +758,89 @@ mod tests {
         s.save(Some("u"), "sess", "k", json!(1)).await;
         s.delete_key_inner(Some("u"), "sess", "k").await.unwrap();
         assert_eq!(s.get(Some("u"), "sess", "k").await, None);
+    }
+
+    #[tokio::test]
+    async fn public_delete_key_removes_value_version_and_hash() {
+        let s = store();
+        // Single value plus a list key (which also stores a version + hash).
+        s.save(Some("u"), "sess", "value_key", json!(1)).await;
+        s.save_list(Some("u"), "sess", "list_key", &[json!(1), json!(2)])
+            .await;
+        assert_eq!(s.get_version(Some("u"), "sess", "value_key").await.unwrap().1, 1);
+
+        s.delete_key(Some("u"), "sess", "value_key").await.unwrap();
+        assert_eq!(s.get(Some("u"), "sess", "value_key").await, None);
+        // The whole `(states, versions, hashes)` entry is gone; re-saving starts fresh.
+        assert_eq!(s.get_version(Some("u"), "sess", "value_key").await.unwrap(), (None, 0));
+        assert_eq!(
+            s.save_if_version(Some("u"), "sess", "value_key", &json!(9), 0)
+                .await
+                .unwrap(),
+            1
+        );
+        // The unrelated list key is untouched.
+        assert_eq!(
+            s.get_list(Some("u"), "sess", "list_key").await,
+            vec![json!(1), json!(2)]
+        );
+        // Deleting a missing key is a no-op, not an error.
+        s.delete_key(Some("u"), "sess", "never_existed").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_key_validates_state_key() {
+        let s = store();
+        assert!(s.delete_key(Some("u"), "sess", "bad.key").await.is_err());
+        assert!(s.delete_key(Some("u"), "sess", "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn key_escaper_round_trips_dots_dollars_nul_and_backslash() {
+        let s = store();
+        // A value whose nested object keys exercise all four escape classes.
+        let tricky = json!({
+            "a.b": { "$c": { "d\\e": "v1", "nul\u{0}key": "v2" } },
+            "plain": 3
+        });
+        s.save(Some("u"), "sess", "k", tricky.clone()).await;
+        assert_eq!(s.get(Some("u"), "sess", "k").await, Some(tricky.clone()));
+
+        // The same value through the list path.
+        s.save_list(Some("u"), "sess", "l", std::slice::from_ref(&tricky))
+            .await;
+        assert_eq!(s.get_list(Some("u"), "sess", "l").await, vec![tricky]);
+    }
+
+    #[tokio::test]
+    async fn ttl_index_is_created_only_when_positive() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let client: Arc<dyn MongoClient> = raw.clone();
+        let s = MongodbAgentStateStore::with_defaults(client.clone());
+
+        s.ensure_indexes(Some(7)).await.unwrap();
+        let indexes = client
+            .list_indexes(crate::constants::SESSIONS_COLLECTION)
+            .await
+            .unwrap();
+        let ttl = indexes
+            .iter()
+            .find(|i| i.expire_after_seconds.is_some())
+            .expect("ttl index");
+        assert_eq!(ttl.expire_after_seconds, Some(7 * 24 * 3600));
+        assert!(ttl.sparse);
+
+        // A non-positive TTL is ignored: no additional TTL index is created.
+        let raw2 = Arc::new(InMemoryMongoClient::new());
+        let client2: Arc<dyn MongoClient> = raw2.clone();
+        let s2 = MongodbAgentStateStore::with_defaults(client2.clone());
+        s2.ensure_indexes(Some(0)).await.unwrap();
+        assert!(client2
+            .list_indexes(crate::constants::SESSIONS_COLLECTION)
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| i.expire_after_seconds.is_none()));
     }
 
     #[tokio::test]

@@ -13,6 +13,26 @@
 //! [`RedisDistributedStore::to_distributed_store`] to hand the harness exactly the
 //! slice it currently understands. When the harness `DistributedStore` grows the extra
 //! fields, this mapping is the single place to extend.
+//!
+//! ## Wiring
+//!
+//! The combiner retains the connection information it was built with, so every component
+//! — including the synchronous [`BaseStore`] — can be auto-wired from a single
+//! configuration, as Java's `RedisDistributedStore` does:
+//!
+//! * [`agent_state_store`](RedisDistributedStore::agent_state_store) — async, over the
+//!   shared [`RedisConnection`];
+//! * [`base_store`](RedisDistributedStore::base_store) — synchronous, over a **blocking**
+//!   connection opened from the retained URL (the harness [`BaseStore`] trait is sync and
+//!   cannot consume an async `ConnectionManager` without a runtime bridge);
+//! * snapshot spec / client and sandbox guard — over the shared connection.
+//!
+//! `base_store()` returns `Err` only for combiners built **without** a URL
+//! ([`RedisDistributedStore::from_connection`] / [`from_components`]) — the documented
+//! degradation path, where callers use [`base_store_with_url`].
+//!
+//! [`from_components`]: RedisDistributedStore::from_components
+//! [`base_store_with_url`]: RedisDistributedStore::base_store_with_url
 
 use std::sync::Arc;
 
@@ -20,11 +40,12 @@ use agentscope_core::error::{Error, Result};
 use agentscope_core::state::AgentStateStore;
 use agentscope_harness::agent::distributed_store::DistributedStore;
 use agentscope_harness::agent::isolation_scope::IsolationScope;
-use agentscope_harness::filesystem::remote::store::BaseStore;
 use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec;
+use agentscope_harness::filesystem::remote::store::BaseStore;
 
 use crate::sandbox::RedisSandboxExecutionGuard;
 use crate::snapshot::{RedisRemoteSnapshotClient, RedisSnapshotSpec};
+use crate::state::adapter::RedisClientAdapter;
 use crate::state::connection::RedisConnection;
 use crate::state::RedisAgentStateStore;
 use crate::store::RedisStore;
@@ -45,19 +66,24 @@ fn normalize_root(prefix: &str) -> String {
 }
 
 /// Redis-backed configuration bundle that wires all distributed storage components with a
-/// single Redis connection.
+/// single Redis configuration.
 ///
 /// ```no_run
 /// # async fn demo() -> agentscope_core::error::Result<()> {
 /// use agentscope_extensions_redis::RedisDistributedStore;
 /// let store = RedisDistributedStore::connect("redis://localhost:6379").await?;
-/// let agent_state = store.agent_state_store();
-/// let base = store.base_store();
+/// let agent_state = store.agent_state_store()?;
+/// let base = store.base_store()?;
 /// # let _ = (agent_state, base);
 /// # Ok(()) }
 /// ```
 pub struct RedisDistributedStore {
     connection: RedisConnection,
+    /// Adapter used by the agent state store (overridable for in-memory backends).
+    adapter: Arc<dyn RedisClientAdapter>,
+    /// Redis URL retained at construction so the synchronous `BaseStore` can be opened
+    /// later without re-configuration.
+    url: Option<String>,
     key_prefix: String,
     isolation_scope: IsolationScope,
 }
@@ -67,6 +93,7 @@ impl std::fmt::Debug for RedisDistributedStore {
         f.debug_struct("RedisDistributedStore")
             .field("key_prefix", &self.key_prefix)
             .field("isolation_scope", &self.isolation_scope)
+            .field("has_url", &self.url.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -81,19 +108,53 @@ impl RedisDistributedStore {
     pub async fn connect_with_prefix(url: &str, key_prefix: &str) -> Result<Self> {
         let connection = RedisConnection::connect(url).await?;
         Ok(Self {
+            adapter: connection.raw_adapter(),
             connection,
+            url: Some(url.to_string()),
             key_prefix: normalize_root(key_prefix),
             isolation_scope: IsolationScope::default(),
         })
     }
 
     /// Builds the bundle from an existing [`RedisConnection`].
+    ///
+    /// No URL is retained, so [`base_store`](Self::base_store) degrades to an error —
+    /// use [`with_url`](Self::with_url) to restore auto-wiring, or
+    /// [`base_store_with_url`](Self::base_store_with_url) at the call site.
     pub fn from_connection(connection: RedisConnection, key_prefix: &str) -> Self {
         Self {
+            adapter: connection.raw_adapter(),
             connection,
+            url: None,
             key_prefix: normalize_root(key_prefix),
             isolation_scope: IsolationScope::default(),
         }
+    }
+
+    /// Builds the bundle from explicit components (the pluggable-backend path, e.g. an
+    /// in-memory adapter in tests or a custom client wrapper).
+    pub fn from_components(
+        connection: RedisConnection,
+        adapter: Arc<dyn RedisClientAdapter>,
+        key_prefix: &str,
+    ) -> Self {
+        Self {
+            connection,
+            adapter,
+            url: None,
+            key_prefix: normalize_root(key_prefix),
+            isolation_scope: IsolationScope::default(),
+        }
+    }
+
+    /// Records the Redis URL used for the synchronous `BaseStore` auto-wiring.
+    ///
+    /// Lets a bundle built via [`from_connection`](Self::from_connection) /
+    /// [`from_components`](Self::from_components) regain a working
+    /// [`base_store`](Self::base_store).
+    pub fn with_url(mut self, url: &str) -> Self {
+        self.url = Some(url.to_string());
+        self
     }
 
     /// Sets the default isolation scope carried into [`to_distributed_store`].
@@ -114,52 +175,69 @@ impl RedisDistributedStore {
         &self.connection
     }
 
+    /// The retained Redis URL, if the bundle was built from one.
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    /// The adapter backing the agent state store.
+    pub fn adapter(&self) -> &Arc<dyn RedisClientAdapter> {
+        &self.adapter
+    }
+
     /// Agent session state store (auto-wired by `distributed_store`).
     ///
     /// Prefix: `{root}session:`.
     pub fn agent_state_store(&self) -> Result<Arc<dyn AgentStateStore>> {
         let store = RedisAgentStateStore::builder()
-            .client(Arc::new(self.connection.clone()))
+            .client(self.adapter.clone())
             .key_prefix(format!("{}session:", self.key_prefix))
             .build()?;
         Ok(Arc::new(store))
     }
 
-    /// Workspace filesystem KV store.
+    /// Workspace filesystem KV store, auto-wired from the retained URL.
     ///
     /// Prefix: `{root}store:`.
     ///
-    /// Uses a blocking connection derived from the same URL semantics; callers wiring a
-    /// `RemoteFilesystem` need the sync [`BaseStore`] shape.
+    /// The harness [`BaseStore`] is synchronous, so this opens a dedicated **blocking**
+    /// connection derived from the bundle's URL metadata (the async [`RedisConnection`]
+    /// cannot be reused directly without a runtime bridge). The connection is lazy: no
+    /// I/O happens here, so wiring a `RemoteFilesystem` is cheap and does not require a
+    /// reachable server at construction time.
+    ///
+    /// # Errors
+    /// Returns an error — the documented degradation path — when no URL is available
+    /// (i.e. the bundle was built by [`from_connection`](Self::from_connection) or
+    /// [`from_components`](Self::from_components) without
+    /// [`with_url`](Self::with_url)). Use
+    /// [`base_store_with_url`](Self::base_store_with_url) in that case.
     pub fn base_store(&self) -> Result<Arc<dyn BaseStore>> {
-        // The BaseStore trait is synchronous, so we open a dedicated blocking connection
-        // lazily via RedisStore::connect using the shared URL is not possible here (the
-        // URL is not retained). Callers that need a base store should use
-        // `RedisStore::connect` directly, or `base_store_with_url`.
-        Err(Error::Other(
-            "RedisDistributedStore::base_store requires a URL; use base_store_with_url(url)"
-                .to_string(),
-        ))
+        let url = self.url.as_deref().ok_or_else(|| {
+            Error::Other(
+                "RedisDistributedStore::base_store: no Redis URL retained by this bundle; \
+                 use with_url(url) / connect(url) or base_store_with_url(url)"
+                    .to_string(),
+            )
+        })?;
+        let prefix = format!("{}store:", self.key_prefix);
+        Ok(Arc::new(RedisStore::connect_lazy(url, &prefix)?))
     }
 
-    /// Workspace filesystem KV store built from an explicit Redis URL.
+    /// Workspace filesystem KV store built from an explicit Redis URL, validated with
+    /// `PING`.
     ///
     /// Prefix: `{root}store:`.
     pub fn base_store_with_url(&self, url: &str) -> Result<Arc<dyn BaseStore>> {
         let prefix = format!("{}store:", self.key_prefix);
-        let store = RedisStore::connect(url, &prefix)?;
-        Ok(Arc::new(store))
+        Ok(Arc::new(RedisStore::connect(url, &prefix)?))
     }
 
     /// Sandbox snapshot spec (auto-wired for sandbox mode).
     ///
     /// Prefix: `{root}snapshot:`.
     pub fn sandbox_snapshot_spec(&self) -> RedisSnapshotSpec {
-        RedisSnapshotSpec::new(
-            &self.connection,
-            &format!("{}snapshot:", self.key_prefix),
-            None,
-        )
+        RedisSnapshotSpec::new(&self.connection, &format!("{}snapshot:", self.key_prefix), None)
     }
 
     /// Snapshot spec as a trait object for direct harness wiring.
@@ -200,11 +278,98 @@ impl RedisDistributedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::MemoryRedisAdapter;
+
+    /// Builds a `ConnectionManager` **without** connecting.
+    ///
+    /// `ConnectionManager::new_lazy_with_config` defers the actual connect until the
+    /// first command, so this performs no I/O and no network access.
+    fn fake_manager() -> redis::aio::ConnectionManager {
+        let client = redis::Client::open("redis://127.0.0.1:6379").expect("valid URL");
+        redis::aio::ConnectionManager::new_lazy_with_config(
+            client,
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy manager")
+    }
+
+    fn offline_bundle() -> (RedisDistributedStore, Arc<MemoryRedisAdapter>) {
+        let adapter = Arc::new(MemoryRedisAdapter::new());
+        let connection = RedisConnection::from_manager(fake_manager());
+        let store = RedisDistributedStore::from_components(connection, adapter.clone(), "app");
+        (store, adapter)
+    }
 
     #[test]
     fn normalize_root_rules() {
         assert_eq!(normalize_root(""), DEFAULT_KEY_PREFIX);
+        assert_eq!(normalize_root("  "), DEFAULT_KEY_PREFIX);
         assert_eq!(normalize_root("app"), "app:");
         assert_eq!(normalize_root("app:"), "app:");
+    }
+
+    #[tokio::test]
+    async fn from_connection_normalizes_prefix_and_has_no_url() {
+        let store = RedisDistributedStore::from_connection(
+            RedisConnection::from_manager(fake_manager()),
+            "app",
+        );
+        assert_eq!(store.key_prefix(), "app:");
+        assert_eq!(store.url(), None);
+    }
+
+    #[tokio::test]
+    async fn retained_url_enables_lazy_base_store_auto_wiring() {
+        // No server is contacted at wiring time: `base_store` opens a *lazy* blocking
+        // connection, so auto-wiring succeeds purely from the retained URL.
+        let store = RedisDistributedStore::from_connection(
+            RedisConnection::from_manager(fake_manager()),
+            "app",
+        )
+        .with_url("redis://localhost:6379");
+
+        assert_eq!(store.url(), Some("redis://localhost:6379"));
+        assert!(store.base_store().is_ok(), "auto-wires without contacting the server");
+    }
+
+    #[tokio::test]
+    async fn base_store_degrades_without_a_retained_url() {
+        let (store, _adapter) = offline_bundle();
+        assert_eq!(store.url(), None);
+        let msg = match store.base_store() {
+            Ok(_) => panic!("base_store must fail without a retained URL"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(msg.contains("no Redis URL retained"), "{msg}");
+        assert!(msg.contains("base_store_with_url"), "degradation path is documented: {msg}");
+    }
+
+    #[tokio::test]
+    async fn agent_state_store_uses_session_prefix_and_memory_adapter() {
+        let (store, adapter) = offline_bundle();
+        let state = store.agent_state_store().expect("state store builds");
+        state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        assert_eq!(state.get(Some("u1"), "s1", "k").await, Some(serde_json::json!(1)));
+        assert!(adapter.string_of("app:session:u1/s1:k").is_some(), "prefix honoured");
+    }
+
+    #[tokio::test]
+    async fn to_distributed_store_projects_state_store_and_scope() {
+        let (store, _adapter) = offline_bundle();
+        let store = store.with_isolation_scope(IsolationScope::Session);
+        let projected = store.to_distributed_store().expect("projection succeeds");
+        assert!(projected.agent_state_store.is_some());
+        assert_eq!(projected.isolation_scope, IsolationScope::Session);
+    }
+
+    #[tokio::test]
+    async fn component_factories_are_constructible_offline() {
+        let (store, _adapter) = offline_bundle();
+        // Snapshot spec/client and guard only need the connection handle; no I/O here.
+        let _spec: Arc<dyn SandboxSnapshotSpec> = store.sandbox_snapshot_spec_dyn();
+        let _client = store.snapshot_client();
+        let guard = store.sandbox_execution_guard();
+        assert_eq!(guard.key_prefix(), "app:guard:");
+        assert!(Arc::ptr_eq(store.adapter(), store.adapter()), "adapter is stable");
     }
 }

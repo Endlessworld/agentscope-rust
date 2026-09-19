@@ -62,17 +62,26 @@ impl JdbcStore {
     }
 
     /// Encodes a namespace tuple into the single `namespace_path` column value.
+    ///
+    /// Mirrors the Java `JdbcStore.namespacePath`: every segment is followed by the unit
+    /// separator, including the last (`["parent"]` -> `"parent\u{1F}"`). The trailing
+    /// separator is what makes the prefix `LIKE 'parent<US>%'` match items stored both in
+    /// `parent` itself and in nested namespaces such as `parent<US>child`.
     fn namespace_path(namespace: &[String]) -> String {
-        namespace.join(&NS_SEPARATOR.to_string())
+        let mut out = String::new();
+        for segment in namespace {
+            out.push_str(segment);
+            out.push(NS_SEPARATOR);
+        }
+        out
     }
 
     /// The namespace prefix used by [`BaseStore::search`].
+    ///
+    /// Identical to [`Self::namespace_path`] — the Java `likePrefixPattern` escapes this
+    /// path and appends the `%` wildcard.
     fn namespace_prefix(namespace: &[String]) -> String {
-        if namespace.is_empty() {
-            String::new()
-        } else {
-            format!("{}{}", namespace.join(&NS_SEPARATOR.to_string()), NS_SEPARATOR)
-        }
+        Self::namespace_path(namespace)
     }
 
     fn parse_value(json: &str) -> StoreValue {

@@ -59,7 +59,21 @@ pub trait RedisClientAdapter: Send + Sync + std::fmt::Debug {
     /// Returns whether the given key exists.
     async fn key_exists(&self, key: &str) -> Result<bool>;
 
-    /// Finds all keys matching a glob pattern (Redis `KEYS`).
+    /// Finds all keys matching a glob pattern using the `SCAN` cursor protocol.
+    ///
+    /// Mirrors the Java adapters' `findKeysByPattern`, which all drive `SCAN` to
+    /// completion (`JedisClientAdapter` uses `UnifiedJedis.scan(cursor, params)`,
+    /// Lettuce uses `ScanCursor.INITIAL` … `isFinished()`, Redisson uses
+    /// `KeysScanOptions`) rather than `KEYS`. Implementations must:
+    ///
+    /// * match the glob `pattern` (wildcards supported, same syntax as `KEYS`),
+    /// * loop until the server cursor returns to `0`,
+    /// * return a **deduplicated** set of keys (`SCAN` may yield the same key more than
+    ///   once).
+    ///
+    /// The return type `Vec<String>` is the ordered Rust projection of the Java
+    /// `Set<String>`; callers that need determinism sort the result (see
+    /// [`super::RedisAgentStateStore::list_session_ids`]).
     async fn find_keys_by_pattern(&self, pattern: &str) -> Result<Vec<String>>;
 
     /// Evaluates a Lua script atomically (`EVAL`).

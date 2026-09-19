@@ -1,28 +1,41 @@
 //! MySQL / MariaDB dialect, mirroring `MysqlDialect`.
 
-use crate::dialect::abstract_dialect::{AbstractJdbcDialect, DialectKind};
+use crate::dialect::abstract_dialect::{
+    AbstractJdbcDialect, DialectKind, TableNameConfigurable, TableNames,
+};
 use crate::dialect::bound_sql::{BoundSql, SqlParam};
 use crate::dialect::{SessionStateDialect, SnapshotDialect, StoreDialect};
 
 /// MySQL dialect: `ON DUPLICATE KEY UPDATE`, `LONGBLOB` snapshots, native `GET_LOCK`.
 #[derive(Debug, Clone, Default)]
-pub struct MysqlDialect;
+pub struct MysqlDialect {
+    table_names: TableNames,
+}
 
 impl MysqlDialect {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+}
+
+impl TableNameConfigurable for MysqlDialect {
+    fn table_names(&self) -> &TableNames {
+        &self.table_names
     }
 }
 
 impl StoreDialect for MysqlDialect {
     fn store_create_table_ddls(&self) -> Vec<String> {
+        // Keep the composite PK under InnoDB's utf8mb4 3072-byte limit:
+        // (512 + 255) * 4 = 3068 bytes; idx_namespace (512 * 4 = 2048 bytes) also fits.
         vec![format!(
-            "CREATE TABLE IF NOT EXISTS {} (namespace_path VARCHAR(512) NOT NULL, \
+            "CREATE TABLE IF NOT EXISTS {} (\
+             namespace_path VARCHAR(512) NOT NULL, \
              item_key VARCHAR(255) NOT NULL, value_json LONGTEXT NOT NULL, \
              version BIGINT NOT NULL, updated_at BIGINT NOT NULL, \
              PRIMARY KEY (namespace_path, item_key), \
-             INDEX idx_{}_ns (namespace_path))",
-            self.resolved_store_table_name(),
+             INDEX idx_namespace (namespace_path)) \
+             ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
             self.resolved_store_table_name()
         )]
     }
@@ -55,12 +68,25 @@ impl StoreDialect for MysqlDialect {
 impl SessionStateDialect for MysqlDialect {
     fn session_state_create_table_ddls(&self) -> Vec<String> {
         vec![format!(
-            "CREATE TABLE IF NOT EXISTS {} (session_id VARCHAR(512) NOT NULL, \
-             state_key VARCHAR(255) NOT NULL, item_index INT NOT NULL, \
-             state_data LONGTEXT NOT NULL, version BIGINT NOT NULL, \
-             PRIMARY KEY (session_id, state_key, item_index))",
+            "CREATE TABLE IF NOT EXISTS {} (\
+             session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, \
+             item_index INT NOT NULL DEFAULT 0, state_data LONGTEXT NOT NULL, \
+             version BIGINT NOT NULL DEFAULT 0, \
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, \
+             PRIMARY KEY (session_id, state_key, item_index), \
+             INDEX idx_session (session_id)) \
+             DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
             self.resolved_session_state_table_name()
         )]
+    }
+
+    fn session_state_check_table_exists(&self, table_name: &str) -> BoundSql {
+        BoundSql::new(
+            "SELECT 1 FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+            vec![SqlParam::Text(table_name.to_string())],
+        )
     }
 
     fn session_state_upsert(
@@ -91,8 +117,10 @@ impl SessionStateDialect for MysqlDialect {
 impl SnapshotDialect for MysqlDialect {
     fn snapshot_create_table_ddls(&self) -> Vec<String> {
         vec![format!(
-            "CREATE TABLE IF NOT EXISTS {} (snapshot_id VARCHAR(255) PRIMARY KEY, \
-             data LONGBLOB NOT NULL, updated_at BIGINT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS {} (\
+             snapshot_id VARCHAR(512) NOT NULL PRIMARY KEY, \
+             data LONGBLOB NOT NULL, \
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
             self.resolved_snapshot_table_name()
         )]
     }
@@ -100,14 +128,14 @@ impl SnapshotDialect for MysqlDialect {
     fn snapshot_upsert(&self, snapshot_id: &str, data: &[u8]) -> BoundSql {
         BoundSql::new(
             format!(
-                "INSERT INTO {} (snapshot_id, data, updated_at) VALUES (?, ?, ?) \
-                 ON DUPLICATE KEY UPDATE data = VALUES(data), updated_at = VALUES(updated_at)",
+                "INSERT INTO {} (snapshot_id, data) VALUES (?, ?) \
+                 ON DUPLICATE KEY UPDATE data = VALUES(data), \
+                 created_at = CURRENT_TIMESTAMP",
                 self.resolved_snapshot_table_name()
             ),
             vec![
                 SqlParam::Text(snapshot_id.to_string()),
                 SqlParam::Blob(data.to_vec()),
-                SqlParam::Int(crate::now_millis()),
             ],
         )
     }

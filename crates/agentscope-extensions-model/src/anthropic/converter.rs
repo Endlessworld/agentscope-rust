@@ -1,0 +1,1069 @@
+//! Conversion between AgentScope [`Msg`]/[`ToolSchema`] and the Anthropic
+//! Messages wire format.
+//!
+//! Merges the responsibilities of the Java formatter classes:
+//!
+//! | Java | Rust |
+//! |---|---|
+//! | `AnthropicChatFormatter` / `AnthropicBaseFormatter` | [`build_request`] / [`ChatFormatOptions`] |
+//! | `AnthropicMessageConverter` | [`to_anthropic_messages`] |
+//! | `AnthropicToolsHelper` | [`to_anthropic_tools`], [`to_tool_choice`], [`apply_extra_body_params`] |
+//! | `AnthropicMediaConverter` | [`image_content_block`] |
+//! | `AnthropicConversationMerger` | [`merge_conversation`] (used by the multi-agent formatter) |
+//!
+//! Anthropic has three requirements the OpenAI shape does not:
+//! 1. The system prompt travels in the top-level `system` field, not as a message.
+//! 2. Tool results must be `user` messages, one per [`ToolResultBlock`].
+//! 3. A `user`/`assistant` message may not be emitted empty, so every branch
+//!    drops messages whose converted block list came out empty.
+
+use agentscope_core::{
+    convert_tool_result_to_string, determine_media_type, extract_text_content, file_to_base64,
+    is_local_file, resolve_mime_type, validate_image_extension, ContentBlock, DataBlock,
+    GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole, Result, Source, ToolChoice,
+    ToolResultBlock, ToolSchema, ToolUseBlock,
+};
+
+use super::dto::{
+    AnthropicCacheControl, AnthropicContentBlock, AnthropicImageBlock, AnthropicImageSource,
+    AnthropicMessage, AnthropicRequest, AnthropicTextBlock, AnthropicTool, AnthropicToolChoice,
+    AnthropicToolResultBlock, AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
+};
+
+/// Per-request formatting switches derived from [`GenerateOptions`].
+#[derive(Debug, Clone, Default)]
+pub struct ChatFormatOptions {
+    /// Whether `cache_control: {"type":"ephemeral"}` markers should be emitted.
+    pub cache_control: bool,
+    /// Optional TTL applied to those markers (e.g. `"1h"`).
+    pub cache_ttl: Option<String>,
+}
+
+impl ChatFormatOptions {
+    /// Derives the switches from the effective generation options.
+    pub fn from_options(options: &GenerateOptions, cache_ttl: Option<&str>) -> Self {
+        Self {
+            cache_control: options.cache_control == Some(true),
+            cache_ttl: cache_ttl.filter(|t| !t.is_empty()).map(str::to_string),
+        }
+    }
+
+    fn marker(&self) -> AnthropicCacheControl {
+        AnthropicCacheControl::ephemeral(self.cache_ttl.as_deref())
+    }
+}
+
+/// Maps an AgentScope role to an Anthropic role string.
+///
+/// Anthropic only accepts `user`/`assistant`; `system` and `tool` collapse to
+/// `user` (the same mapping as `AnthropicMessageConverter#convertRole`).
+pub fn role_str(role: MsgRole) -> &'static str {
+    match role {
+        MsgRole::Assistant => "assistant",
+        MsgRole::User | MsgRole::System | MsgRole::Tool => "user",
+    }
+}
+
+/// Extracts the system prompt from a leading [`MsgRole::System`] message.
+///
+/// Mirrors `AnthropicMessageConverter#extractSystemMessage`: only the first
+/// message is inspected and only its text blocks contribute.
+pub fn extract_system_message(messages: &[Msg]) -> Option<String> {
+    let first = messages.first()?;
+    if first.role != MsgRole::System {
+        return None;
+    }
+    let text = first
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Wraps the system prompt into the request `system` field, marking it for
+/// prompt caching when requested.
+pub fn system_prompt(text: &str, fmt: &ChatFormatOptions) -> SystemPrompt {
+    if fmt.cache_control {
+        SystemPrompt::Blocks(vec![AnthropicTextBlock {
+            text: text.to_string(),
+            cache_control: Some(fmt.marker()),
+        }])
+    } else {
+        SystemPrompt::Text(text.to_string())
+    }
+}
+
+/// Converts a media [`Source`] into an Anthropic image source.
+///
+/// Local files are inlined as base64 (Anthropic cannot read the client
+/// filesystem); remote URLs are forwarded verbatim.
+pub fn image_source(source: &Source) -> Result<AnthropicImageSource> {
+    match source {
+        Source::Base64(b64) => Ok(AnthropicImageSource::Base64 {
+            media_type: if b64.media_type.trim().is_empty() {
+                "image/png".to_string()
+            } else {
+                b64.media_type.clone()
+            },
+            data: b64.data.clone(),
+        }),
+        Source::Url(url_source) => {
+            let url = &url_source.url;
+            validate_image_extension(url)?;
+            if is_local_file(url) {
+                let path = url.strip_prefix("file://").unwrap_or(url);
+                let media_type = determine_media_type(path);
+                Ok(AnthropicImageSource::Base64 {
+                    media_type: if media_type == "application/octet-stream" {
+                        "image/png".to_string()
+                    } else {
+                        media_type
+                    },
+                    data: file_to_base64(path)?,
+                })
+            } else {
+                Ok(AnthropicImageSource::Url { url: url.clone() })
+            }
+        }
+    }
+}
+
+/// Converts an image block, or an `[Image - processing failed: ...]` text block
+/// on failure (mirroring the Java converter's fallback).
+pub fn image_content_block(block: &ImageBlock, fmt: &ChatFormatOptions) -> AnthropicContentBlock {
+    match image_source(&block.source) {
+        Ok(source) => AnthropicContentBlock::Image(AnthropicImageBlock {
+            source,
+            cache_control: fmt.cache_control.then(|| fmt.marker()),
+        }),
+        Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+            "[Image - processing failed: {e}]"
+        ))),
+    }
+}
+
+/// Converts a data block, routing through the image source resolver.
+pub fn data_content_block(block: &DataBlock, fmt: &ChatFormatOptions) -> AnthropicContentBlock {
+    // Anthropic only exposes an image content block; non-image MIME types are
+    // reported as a text fallback instead of failing the whole request.
+    match resolve_mime_type(&block.source) {
+        Ok(mime) if mime.starts_with("image/") => {
+            match image_source(&block.source) {
+                Ok(source) => AnthropicContentBlock::Image(AnthropicImageBlock {
+                    source,
+                    cache_control: fmt.cache_control.then(|| fmt.marker()),
+                }),
+                Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+                    "[Media - processing failed: {e}]"
+                ))),
+            }
+        }
+        Ok(mime) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+            "[Media - processing failed: Anthropic only supports image DataBlocks; got MIME type: {mime}]"
+        ))),
+        Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+            "[Media - processing failed: {e}]"
+        ))),
+    }
+}
+
+fn tool_use_block(block: &ToolUseBlock, fmt: &ChatFormatOptions) -> AnthropicContentBlock {
+    AnthropicContentBlock::ToolUse(AnthropicToolUseBlock {
+        id: block.id.clone(),
+        name: block.name.clone(),
+        input: block.input.clone(),
+        cache_control: fmt.cache_control.then(|| fmt.marker()),
+    })
+}
+
+/// Converts non-tool-result blocks of one message into Anthropic content blocks.
+///
+/// Returns an empty list when the message carries nothing transferable, which
+/// callers use to drop the message entirely.
+pub fn message_content_blocks(
+    blocks: &[ContentBlock],
+    fmt: &ChatFormatOptions,
+) -> Vec<AnthropicContentBlock> {
+    let mut out: Vec<AnthropicContentBlock> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(t) => {
+                out.push(AnthropicContentBlock::Text(AnthropicTextBlock {
+                    text: t.text.clone(),
+                    cache_control: fmt.cache_control.then(|| fmt.marker()),
+                }));
+            }
+            ContentBlock::Hint(h) => {
+                out.push(AnthropicContentBlock::Text(AnthropicTextBlock {
+                    text: h.hint.clone().unwrap_or_default(),
+                    cache_control: fmt.cache_control.then(|| fmt.marker()),
+                }));
+            }
+            ContentBlock::Thinking(t) => {
+                // Java sends thinking back as plain text (the SDK has no
+                // thinking request block param).
+                if !t.thinking.is_empty() {
+                    out.push(AnthropicContentBlock::Text(AnthropicTextBlock::new(
+                        t.thinking.clone(),
+                    )));
+                }
+            }
+            ContentBlock::Image(i) => out.push(image_content_block(i, fmt)),
+            ContentBlock::Data(d) => out.push(data_content_block(d, fmt)),
+            ContentBlock::ToolUse(t) => out.push(tool_use_block(t, fmt)),
+            // Tool results are emitted as standalone user messages.
+            ContentBlock::ToolResult(_) => {}
+            // Audio/video have no Anthropic request representation.
+            ContentBlock::Audio(_) | ContentBlock::Video(_) => {}
+        }
+    }
+    out
+}
+
+/// Converts one tool-result block into its standalone `user` message.
+pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> AnthropicMessage {
+    let mut content: Vec<AnthropicToolResultContent> = Vec::new();
+    for output in &block.output {
+        match output {
+            ContentBlock::Text(t) => {
+                content.push(AnthropicToolResultContent::Text { text: t.text.clone() });
+            }
+            ContentBlock::Image(i) => match image_source(&i.source) {
+                Ok(source) => content.push(AnthropicToolResultContent::Image { source }),
+                Err(_) => {}
+            },
+            ContentBlock::Data(d) => match image_source(&d.source) {
+                Ok(source) => content.push(AnthropicToolResultContent::Image { source }),
+                Err(_) => {}
+            },
+            _ => {}
+        }
+    }
+    if content.is_empty() {
+        // Java emits a text block with a null payload; use the canonical
+        // textual rendering of the outputs instead of an empty list (Anthropic
+        // rejects an empty tool_result content).
+        content.push(AnthropicToolResultContent::Text {
+            text: convert_tool_result_to_string(&block.output),
+        });
+    }
+    AnthropicMessage {
+        role: "user".to_string(),
+        content: vec![AnthropicContentBlock::ToolResult(AnthropicToolResultBlock {
+            tool_use_id: block.id.clone().unwrap_or_default(),
+            content,
+            is_error: None,
+            cache_control: fmt.cache_control.then(|| fmt.marker()),
+        })],
+    }
+}
+
+/// Converts a [`Msg`] list into Anthropic messages.
+///
+/// Mirrors `AnthropicMessageConverter#convert`: a `system` message is rendered as
+/// a `user` message (Anthropic has no `system` role inside `messages`). The
+/// *leading* system prompt is normally peeled off by [`build_request`] and sent
+/// through the top-level `system` field instead; this function converts whatever
+/// it is given. Messages that convert to no blocks are dropped (Anthropic rejects
+/// empty content).
+pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<AnthropicMessage> {
+    let mut out: Vec<AnthropicMessage> = Vec::new();
+    for msg in messages.iter() {
+        let (tool_results, regular): (Vec<ContentBlock>, Vec<ContentBlock>) = msg
+            .content
+            .iter()
+            .cloned()
+            .partition(|b| matches!(b, ContentBlock::ToolResult(_)));
+
+        if !regular.is_empty() {
+            let blocks = message_content_blocks(&regular, fmt);
+            if !blocks.is_empty() {
+                out.push(AnthropicMessage { role: role_str(msg.role).to_string(), content: blocks });
+            }
+        }
+
+        for block in tool_results {
+            if let ContentBlock::ToolResult(tr) = block {
+                out.push(tool_result_message(&tr, fmt));
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+/// Converts tool schemas into Anthropic tool declarations. When prompt caching
+/// is on, the **last** tool carries the marker so the whole tool prefix is
+/// cached (Anthropic caches everything up to and including the marked block).
+pub fn to_anthropic_tools(tools: &[ToolSchema], fmt: &ChatFormatOptions) -> Vec<AnthropicTool> {
+    let last = tools.len().saturating_sub(1);
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, schema)| AnthropicTool {
+            name: schema.name.clone(),
+            description: schema.description.clone(),
+            input_schema: serde_json::Value::Object(schema.parameters.clone()),
+            cache_control: (fmt.cache_control && index == last).then(|| fmt.marker()),
+        })
+        .collect()
+}
+
+/// Builds the Anthropic `tool_choice` object, translating AgentScope's
+/// [`ToolChoice`] into Anthropic's `auto`/`none`/`any`/`tool` variants.
+///
+/// `parallel_tool_calls` has no top-level field in the Anthropic API: it is
+/// expressed as `disable_parallel_tool_use = !parallel_tool_calls` nested in the
+/// choice object. `none` has no such sub-field, so the flag is dropped there
+/// (matching the Java helper's documented behaviour).
+pub fn to_tool_choice(
+    choice: &ToolChoice,
+    parallel_tool_calls: Option<bool>,
+) -> AnthropicToolChoice {
+    let disable = parallel_tool_calls.map(|v| !v);
+    match choice {
+        ToolChoice::Auto => AnthropicToolChoice::Auto { disable_parallel_tool_use: disable },
+        ToolChoice::None => AnthropicToolChoice::None,
+        // Anthropic has no "required"; `any` forces a tool call.
+        ToolChoice::Required => AnthropicToolChoice::Any { disable_parallel_tool_use: disable },
+        ToolChoice::Specific { tool_name } => AnthropicToolChoice::Tool {
+            name: tool_name.clone(),
+            disable_parallel_tool_use: disable,
+        },
+    }
+}
+
+/// Merges extra headers declared on [`GenerateOptions`] into the request spec.
+pub fn extra_headers(options: &[&GenerateOptions]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for opts in options {
+        for (name, value) in &opts.additional_headers {
+            out.retain(|(n, _)| n != name);
+            out.push((name.clone(), value.clone()));
+        }
+    }
+    out
+}
+
+/// Merges extra body parameters declared on [`GenerateOptions`] into the
+/// request body (top-level keys), later option sets winning.
+pub fn apply_extra_body_params(body: &mut serde_json::Value, options: &[&GenerateOptions]) {
+    let Some(map) = body.as_object_mut() else {
+        return;
+    };
+    for opts in options {
+        for (key, value) in &opts.additional_body_params {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Assembles the full Anthropic request body.
+///
+/// `options` overrides `default_options`, which in turn supplies the fallbacks
+/// for temperature / top_p / top_k / max_tokens. Additional body params from
+/// both option sets are merged last so callers can override anything.
+pub fn build_request(
+    model: &str,
+    messages: &[Msg],
+    tools: &[ToolSchema],
+    options: &GenerateOptions,
+    default_options: &GenerateOptions,
+    fmt: &ChatFormatOptions,
+    stream: bool,
+) -> AnthropicRequest {
+    let pick_f64 = |f: fn(&GenerateOptions) -> Option<f64>| f(options).or_else(|| f(default_options));
+    let pick_u32 = |f: fn(&GenerateOptions) -> Option<u32>| f(options).or_else(|| f(default_options));
+
+    // The leading system prompt is sent via the top-level `system` field, so it
+    // is excluded from the conversation body (mirrors the Java model, which
+    // slices it off before formatting).
+    let system_text = extract_system_message(messages);
+    let conversation = match (messages.first(), system_text.as_ref()) {
+        (Some(first), Some(_)) if first.role == MsgRole::System => &messages[1..],
+        _ => messages,
+    };
+    let anthropic_messages = to_anthropic_messages(conversation, fmt);
+
+    let tools_field = if tools.is_empty() {
+        None
+    } else {
+        Some(to_anthropic_tools(tools, fmt))
+    };
+
+    let tool_choice = options
+        .tool_choice
+        .as_ref()
+        .or(default_options.tool_choice.as_ref())
+        .map(|c| {
+            let parallel = options.parallel_tool_calls.or(default_options.parallel_tool_calls);
+            to_tool_choice(c, parallel)
+        })
+        .or_else(|| {
+            // No explicit choice but a parallel-tool-calls override: Anthropic
+            // requires an implicit `auto` choice to carry the flag.
+            let parallel = options.parallel_tool_calls.or(default_options.parallel_tool_calls);
+            parallel.map(|p| AnthropicToolChoice::Auto {
+                disable_parallel_tool_use: Some(!p),
+            })
+        });
+
+    let thinking = pick_u32(|o| o.thinking_budget).map(super::dto::AnthropicThinking::enabled);
+
+    AnthropicRequest {
+        model: model.to_string(),
+        max_tokens: pick_u32(|o| o.max_tokens).unwrap_or(super::credential::DEFAULT_MAX_TOKENS),
+        messages: anthropic_messages,
+        stream: stream.then_some(true),
+        system: system_text.as_deref().map(|text| system_prompt(text, fmt)),
+        tools: tools_field,
+        tool_choice,
+        temperature: pick_f64(|o| o.temperature),
+        top_p: pick_f64(|o| o.top_p),
+        top_k: pick_u32(|o| o.top_k),
+        thinking,
+    }
+}
+
+/// Adds `cache_control` to the last cacheable block of the last message.
+///
+/// Mirrors `AnthropicBaseFormatter#applyCacheControl`: anthropic caches the
+/// whole prefix up to and including the marked block, so this caches the
+/// conversation prefix across turns. Only text/image/tool_use/tool_result
+/// blocks accept the marker.
+pub fn apply_cache_control(messages: &mut [AnthropicMessage], fmt: &ChatFormatOptions) {
+    if !fmt.cache_control {
+        return;
+    }
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    let marker = fmt.marker();
+    for block in last.content.iter_mut().rev() {
+        match block {
+            AnthropicContentBlock::Text(t) => {
+                t.cache_control = Some(marker);
+                return;
+            }
+            AnthropicContentBlock::Image(i) => {
+                i.cache_control = Some(marker);
+                return;
+            }
+            AnthropicContentBlock::ToolUse(t) => {
+                t.cache_control = Some(marker);
+                return;
+            }
+            AnthropicContentBlock::ToolResult(t) => {
+                t.cache_control = Some(marker);
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-agent conversation merging
+// ---------------------------------------------------------------------------
+
+/// A merged conversation element: either accumulated text or a media block.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversationBlock {
+    /// A run of accumulated `"<name>: <text>"` lines.
+    Text(String),
+    /// A media block to be converted later.
+    Image(ImageBlock),
+    /// A generic data block to be converted later.
+    Data(DataBlock),
+}
+
+/// Merges multi-agent messages into a conversation transcript wrapped in
+/// `<history>` tags, mirroring `AnthropicConversationMerger`.
+///
+/// Text and hint blocks accumulate into `"<name>: <content>"` lines; images and
+/// data blocks flush the accumulated text and appear in place as their own
+/// elements. Thinking blocks are in-memory only and are not merged.
+pub fn merge_conversation(messages: &[Msg], conversation_history_prompt: &str) -> Vec<ConversationBlock> {
+    let mut blocks: Vec<ConversationBlock> = Vec::new();
+    let mut text: Vec<String> = Vec::new();
+
+    let flush = |text: &mut Vec<String>, blocks: &mut Vec<ConversationBlock>| {
+        if !text.is_empty() {
+            blocks.push(ConversationBlock::Text(text.join("\n")));
+            text.clear();
+        }
+    };
+
+    for msg in messages {
+        let name = msg.name.clone().unwrap_or_else(|| role_label(msg.role));
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(t) => text.push(format!("{name}: {}", t.text)),
+                ContentBlock::Hint(HintBlock { hint, .. }) => {
+                    text.push(format!("{name}: {}", hint.clone().unwrap_or_default()))
+                }
+                ContentBlock::Image(i) => {
+                    flush(&mut text, &mut blocks);
+                    blocks.push(ConversationBlock::Image(i.clone()));
+                }
+                ContentBlock::Data(d) => {
+                    flush(&mut text, &mut blocks);
+                    blocks.push(ConversationBlock::Data(d.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    flush(&mut text, &mut blocks);
+
+    // Wrap with the history tags.
+    if blocks.is_empty() {
+        return blocks;
+    }
+    match blocks.first_mut() {
+        Some(ConversationBlock::Text(first)) => {
+            *first = format!("{conversation_history_prompt}<history>\n{first}");
+        }
+        _ => blocks.insert(0, ConversationBlock::Text(format!("{conversation_history_prompt}<history>\n"))),
+    }
+    match blocks.last_mut() {
+        Some(ConversationBlock::Text(last)) => last.push_str("\n</history>"),
+        _ => blocks.push(ConversationBlock::Text("</history>".to_string())),
+    }
+    blocks
+}
+
+/// Full first name fallback: the message name, else the role's enum name.
+fn role_label(role: MsgRole) -> String {
+    match role {
+        MsgRole::User => "USER",
+        MsgRole::Assistant => "ASSISTANT",
+        MsgRole::System => "SYSTEM",
+        MsgRole::Tool => "TOOL",
+    }
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Multi-agent formatting
+// ---------------------------------------------------------------------------
+
+/// Default conversation-history preamble (identical to the Java constant).
+pub const DEFAULT_CONVERSATION_HISTORY_PROMPT: &str = "# Conversation History\nThe content between <history></history> tags contains your conversation history\n";
+
+/// Message group kind used by the multi-agent formatter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupType {
+    System,
+    ToolSequence,
+    AgentConversation,
+}
+
+/// Converts messages with multi-agent support, mirroring
+/// `AnthropicMultiAgentFormatter#doFormat`: system messages and tool sequences
+/// keep their normal conversion, while runs of plain agent messages are merged
+/// into a single `user` message carrying `<history>` tags.
+pub fn to_multi_agent_messages(
+    messages: &[Msg],
+    conversation_history_prompt: &str,
+    fmt: &ChatFormatOptions,
+) -> Vec<AnthropicMessage> {
+    let mut result: Vec<AnthropicMessage> = Vec::new();
+    let mut is_first_agent_group = true;
+    let mut current: Vec<Msg> = Vec::new();
+    let mut current_type: Option<GroupType> = None;
+
+    let flush = |group_type: GroupType,
+                 group: &[Msg],
+                 is_first: &mut bool,
+                 out: &mut Vec<AnthropicMessage>| {
+        match group_type {
+            GroupType::System => {
+                if let Some(msg) = group.first() {
+                    for m in to_anthropic_messages(std::slice::from_ref(msg), fmt) {
+                        out.push(m);
+                    }
+                }
+            }
+            GroupType::ToolSequence => {
+                out.extend(to_anthropic_messages(group, fmt));
+            }
+            GroupType::AgentConversation => {
+                let prompt = if *is_first { conversation_history_prompt } else { "" };
+                *is_first = false;
+                if let Some(message) = merged_agent_message(group, prompt, fmt) {
+                    out.push(message);
+                }
+            }
+        }
+    };
+
+    for msg in messages {
+        let msg_type = determine_group_type(msg);
+        if msg_type == GroupType::System {
+            if !current.is_empty() {
+                flush(current_type.unwrap_or(GroupType::AgentConversation), &current, &mut is_first_agent_group, &mut result);
+                current.clear();
+            }
+            flush(GroupType::System, std::slice::from_ref(msg), &mut is_first_agent_group, &mut result);
+            current_type = None;
+        } else if Some(msg_type) != current_type && !current.is_empty() {
+            flush(current_type.unwrap_or(GroupType::AgentConversation), &current, &mut is_first_agent_group, &mut result);
+            current.clear();
+            current_type = Some(msg_type);
+            current.push(msg.clone());
+        } else {
+            current_type = Some(msg_type);
+            current.push(msg.clone());
+        }
+    }
+    if !current.is_empty() {
+        flush(current_type.unwrap_or(GroupType::AgentConversation), &current, &mut is_first_agent_group, &mut result);
+    }
+    result
+}
+
+fn determine_group_type(msg: &Msg) -> GroupType {
+    if msg.role == MsgRole::System
+        && !msg.content.is_empty()
+        && !matches!(msg.content.first(), Some(ContentBlock::ToolResult(_)))
+    {
+        return GroupType::System;
+    }
+    let has_tool_use = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolUse(_)));
+    let has_tool_result = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolResult(_)));
+    if has_tool_use || has_tool_result {
+        GroupType::ToolSequence
+    } else {
+        GroupType::AgentConversation
+    }
+}
+
+/// Builds the single merged `user` message for an agent-conversation group.
+fn merged_agent_message(
+    group: &[Msg],
+    prompt: &str,
+    fmt: &ChatFormatOptions,
+) -> Option<AnthropicMessage> {
+    let merged = merge_conversation(group, prompt);
+    let blocks: Vec<AnthropicContentBlock> = merged
+        .into_iter()
+        .map(|block| match block {
+            ConversationBlock::Text(text) => {
+                AnthropicContentBlock::Text(AnthropicTextBlock::new(text))
+            }
+            ConversationBlock::Image(image) => image_content_block(&image, fmt),
+            ConversationBlock::Data(data) => data_content_block(&data, fmt),
+        })
+        .collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(AnthropicMessage { role: "user".to_string(), content: blocks })
+}
+
+/// Text-only view of a message (used by `extract_text_content` consumers).
+pub fn text_of(msg: &Msg) -> String {
+    extract_text_content(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::{
+        Base64Source, HintBlock, JsonMap, TextBlock, ThinkingBlock, ToolCallState, URLSource,
+    };
+
+    fn plain() -> ChatFormatOptions {
+        ChatFormatOptions::default()
+    }
+
+    fn tool_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: name.to_string(),
+            description: format!("{name} desc"),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            output_schema: None,
+            strict: None,
+        }
+    }
+
+    #[test]
+    fn leading_system_message_becomes_a_user_message_in_conversion() {
+        // `to_anthropic_messages` mirrors the Java converter, which renders a
+        // system message as `user`; the model peels it off before calling this.
+        let out = to_anthropic_messages(&[Msg::system("be brief"), Msg::user("hi")], &plain());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "user");
+        match &out[0].content[0] {
+            AnthropicContentBlock::Text(t) => assert_eq!(t.text, "be brief"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_message_is_extracted_not_sent_as_message() {
+        let messages = vec![Msg::system("be brief"), Msg::user("hi")];
+        let request = build_request(
+            "claude-sonnet-4-5-20250929",
+            &messages,
+            &[],
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &plain(),
+            false,
+        );
+        assert_eq!(request.system, Some(SystemPrompt::Text("be brief".into())));
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, "user");
+    }
+
+    #[test]
+    fn cached_system_prompt_uses_text_blocks() {
+        let messages = vec![Msg::system("be brief")];
+        let fmt = ChatFormatOptions { cache_control: true, cache_ttl: Some("1h".into()) };
+        let request = build_request(
+            "m",
+            &messages,
+            &[],
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &fmt,
+            false,
+        );
+        match request.system.unwrap() {
+            SystemPrompt::Blocks(blocks) => {
+                assert_eq!(blocks[0].text, "be brief");
+                let marker = blocks[0].cache_control.clone().unwrap();
+                assert_eq!(marker.kind, "ephemeral");
+                assert_eq!(marker.ttl.as_deref(), Some("1h"));
+            }
+            other => panic!("expected blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_results_become_standalone_user_messages() {
+        let messages = vec![
+            Msg::assistant_blocks(vec![
+                ContentBlock::Text(TextBlock::new("checking")),
+                ContentBlock::ToolUse(ToolUseBlock::new("toolu_1", "get_weather", JsonMap::new())),
+            ]),
+            Msg::tool("toolu_1", "get_weather", "sunny"),
+        ];
+        let out = to_anthropic_messages(&messages, &plain());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "assistant");
+        assert_eq!(out[1].role, "user");
+        match &out[1].content[0] {
+            AnthropicContentBlock::ToolResult(tr) => {
+                assert_eq!(tr.tool_use_id, "toolu_1");
+                assert_eq!(
+                    tr.content,
+                    vec![AnthropicToolResultContent::Text { text: "sunny".into() }]
+                );
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_message_is_dropped() {
+        // An empty-content message yields no transferable block and must not
+        // produce an empty-content request (Anthropic rejects one).
+        let messages = vec![Msg::assistant_blocks(vec![])];
+        assert!(to_anthropic_messages(&messages, &plain()).is_empty());
+    }
+
+    #[test]
+    fn image_falls_back_to_text_on_unsupported_extension() {
+        let block = ImageBlock::new(Source::Url(URLSource::new("https://x/a.txt")));
+        match image_content_block(&block, &plain()) {
+            AnthropicContentBlock::Text(t) => assert!(t.text.starts_with("[Image - processing failed:")),
+            other => panic!("expected text fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base64_image_maps_to_base64_source() {
+        let block = ImageBlock::new(Source::Base64(Base64Source::new("image/png", "AAAA")));
+        match image_content_block(&block, &plain()) {
+            AnthropicContentBlock::Image(i) => {
+                assert_eq!(
+                    i.source,
+                    AnthropicImageSource::Base64 { media_type: "image/png".into(), data: "AAAA".into() }
+                );
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_block_non_image_mime_falls_back_to_text() {
+        let block = DataBlock::new(Source::Base64(Base64Source::new("application/pdf", "AAAA")));
+        match data_content_block(&block, &plain()) {
+            AnthropicContentBlock::Text(t) => assert!(t.text.contains("only supports image")),
+            other => panic!("expected text fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tools_are_converted_and_last_one_cached() {
+        let tools = vec![tool_schema("a"), tool_schema("b")];
+        let plain_tools = to_anthropic_tools(&tools, &plain());
+        assert_eq!(plain_tools.len(), 2);
+        assert!(plain_tools.iter().all(|t| t.cache_control.is_none()));
+        assert_eq!(plain_tools[0].input_schema["type"], serde_json::json!("object"));
+
+        let cached = to_anthropic_tools(&tools, &ChatFormatOptions { cache_control: true, cache_ttl: None });
+        assert!(cached[0].cache_control.is_none());
+        assert_eq!(cached[1].cache_control.as_ref().unwrap().kind, "ephemeral");
+    }
+
+    #[test]
+    fn tool_choice_maps_all_variants_and_parallel_flag() {
+        assert_eq!(
+            to_tool_choice(&ToolChoice::None, Some(false)),
+            AnthropicToolChoice::None
+        );
+        assert_eq!(
+            to_tool_choice(&ToolChoice::Required, Some(false)),
+            AnthropicToolChoice::Any { disable_parallel_tool_use: Some(true) }
+        );
+        assert_eq!(
+            to_tool_choice(&ToolChoice::Specific { tool_name: "f".into() }, None),
+            AnthropicToolChoice::Tool { name: "f".into(), disable_parallel_tool_use: None }
+        );
+        assert_eq!(
+            to_tool_choice(&ToolChoice::Auto, Some(true)),
+            AnthropicToolChoice::Auto { disable_parallel_tool_use: Some(false) }
+        );
+    }
+
+    #[test]
+    fn implicit_auto_choice_when_only_parallel_flag_set() {
+        let options = GenerateOptions { parallel_tool_calls: Some(false), ..Default::default() };
+        let request = build_request(
+            "m",
+            &[Msg::user("hi")],
+            &[tool_schema("a")],
+            &options,
+            &GenerateOptions::default(),
+            &plain(),
+            false,
+        );
+        assert_eq!(
+            request.tool_choice,
+            Some(AnthropicToolChoice::Auto { disable_parallel_tool_use: Some(true) })
+        );
+    }
+
+    #[test]
+    fn options_fall_back_to_defaults_and_thinking_is_wired() {
+        let defaults = GenerateOptions {
+            temperature: Some(0.2),
+            top_k: Some(7),
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        let options = GenerateOptions { temperature: Some(0.9), ..Default::default() };
+        let request = build_request("m", &[Msg::user("hi")], &[], &options, &defaults, &plain(), true);
+        assert_eq!(request.temperature, Some(0.9));
+        assert_eq!(request.top_k, Some(7));
+        assert_eq!(request.max_tokens, 2048);
+        assert!(request.stream.is_some());
+
+        let thinking = GenerateOptions { thinking_budget: Some(1024), ..Default::default() };
+        let request = build_request("m", &[Msg::user("hi")], &[], &thinking, &defaults, &plain(), false);
+        assert_eq!(request.thinking.unwrap().budget_tokens, 1024);
+    }
+
+    #[test]
+    fn max_tokens_defaults_when_unset() {
+        let request = build_request(
+            "m",
+            &[Msg::user("hi")],
+            &[],
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &plain(),
+            false,
+        );
+        assert_eq!(request.max_tokens, super::super::credential::DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn extra_body_params_override_request_fields() {
+        let mut body = serde_json::to_value(AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 1,
+            messages: vec![],
+            stream: None,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+        })
+        .unwrap();
+        let extra = GenerateOptions {
+            additional_body_params: [("metadata".to_string(), serde_json::json!({"user_id": "u"}))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        apply_extra_body_params(&mut body, &[&extra]);
+        assert_eq!(body["metadata"]["user_id"], serde_json::json!("u"));
+    }
+
+    #[test]
+    fn apply_cache_control_marks_last_cacheable_block() {
+        let messages = vec![Msg::user("first"), Msg::user("second")];
+        let mut converted = to_anthropic_messages(&messages, &plain());
+        apply_cache_control(&mut converted, &ChatFormatOptions { cache_control: true, cache_ttl: None });
+        match &converted[1].content[0] {
+            AnthropicContentBlock::Text(t) => {
+                assert_eq!(t.cache_control.as_ref().unwrap().kind, "ephemeral")
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        // Earlier message stays untouched.
+        match &converted[0].content[0] {
+            AnthropicContentBlock::Text(t) => assert!(t.cache_control.is_none()),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_merge_wraps_history_tags() {
+        let messages = vec![
+            Msg::builder().role(MsgRole::User).name("Alice").text_content("hi").build(),
+            Msg::builder().role(MsgRole::Assistant).name("Bob").text_content("hello").build(),
+        ];
+        let blocks = merge_conversation(&messages, "PROMPT\n");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ConversationBlock::Text(t) => {
+                assert!(t.starts_with("PROMPT\n<history>\nAlice: hi\nBob: hello"));
+                assert!(t.ends_with("\n</history>"));
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_merge_flushes_text_before_media() {
+        let messages = vec![Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("look")),
+            ContentBlock::Image(ImageBlock::new(Source::Base64(Base64Source::new(
+                "image/png", "AAAA",
+            )))),
+        ])];
+        let blocks = merge_conversation(&messages, "");
+        // text, image, then the trailing `</history>` text element (the last
+        // element is media, so the closing tag is appended separately).
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], ConversationBlock::Text(_)));
+        assert!(matches!(blocks[1], ConversationBlock::Image(_)));
+        assert_eq!(blocks[2], ConversationBlock::Text("</history>".to_string()));
+    }
+
+    #[test]
+    fn multi_agent_groups_tool_sequences_separately() {
+        let messages = vec![
+            Msg::system("be brief"),
+            Msg::builder().role(MsgRole::User).name("Alice").text_content("hi").build(),
+            Msg::builder().role(MsgRole::Assistant).name("Bob").text_content("hello").build(),
+            Msg::assistant_blocks(vec![
+                ContentBlock::ToolUse(ToolUseBlock::new("toolu_1", "f", JsonMap::new())),
+            ]),
+            Msg::tool("toolu_1", "f", "done"),
+        ];
+        let out = to_multi_agent_messages(&messages, DEFAULT_CONVERSATION_HISTORY_PROMPT, &plain());
+        // system + merged agent conversation + assistant tool_use + tool result
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1].role, "user");
+        match &out[1].content[0] {
+            AnthropicContentBlock::Text(t) => {
+                assert!(t.text.contains("<history>"));
+                assert!(t.text.contains("Alice: hi"));
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(out[2].role, "assistant");
+        assert_eq!(out[3].role, "user");
+        assert!(matches!(&out[3].content[0], AnthropicContentBlock::ToolResult(_)));
+    }
+
+    #[test]
+    fn thinking_blocks_are_rendered_as_text() {
+        let messages = vec![Msg::assistant_blocks(vec![ContentBlock::Thinking(
+            ThinkingBlock::new("reasoning"),
+        )])];
+        let out = to_anthropic_messages(&messages, &plain());
+        match &out[0].content[0] {
+            AnthropicContentBlock::Text(t) => assert_eq!(t.text, "reasoning"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hint_and_tool_state_do_not_break_conversion() {
+        let mut tool_use = ToolUseBlock::new("toolu_1", "f", JsonMap::new());
+        tool_use.state = ToolCallState::Finished;
+        let messages = vec![Msg::assistant_blocks(vec![ContentBlock::ToolUse(tool_use)])];
+        let out = to_anthropic_messages(&messages, &plain());
+        assert!(matches!(&out[0].content[0], AnthropicContentBlock::ToolUse(_)));
+
+        let hint = Msg::builder()
+            .role(MsgRole::Tool)
+            .block(ContentBlock::Hint(HintBlock::new("hint", "hint")))
+            .build();
+        let out = to_anthropic_messages(&[hint], &plain());
+        match &out[0].content[0] {
+            AnthropicContentBlock::Text(t) => assert_eq!(t.text, "hint"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn role_mapping_collapses_system_and_tool_to_user() {
+        assert_eq!(role_str(MsgRole::Assistant), "assistant");
+        assert_eq!(role_str(MsgRole::User), "user");
+        assert_eq!(role_str(MsgRole::System), "user");
+        assert_eq!(role_str(MsgRole::Tool), "user");
+    }
+
+    #[test]
+    fn extra_headers_deduplicate_with_last_winning() {
+        let a = GenerateOptions {
+            additional_headers: [("x-a".to_string(), "1".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        let b = GenerateOptions {
+            additional_headers: [("x-a".to_string(), "2".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        let headers = extra_headers(&[&a, &b]);
+        assert_eq!(headers, vec![("x-a".to_string(), "2".to_string())]);
+    }
+}
