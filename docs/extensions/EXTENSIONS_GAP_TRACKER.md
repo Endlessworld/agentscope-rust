@@ -69,7 +69,7 @@
 | Sandbox 后端抽象 | 已裁定：SANDBOX 模块实现 harness `Sandbox`/`SandboxClient` trait | 已裁定 |
 | Channel 抽象 | 已裁定：harness `gateway/channel` 为路由骨架；**新增公共层 `gateway/platform_channel`**（`PlatformChannel`/`PlatformCtx`）承载各平台相同的分发/投递流程，各模块只写不通用部分 | **已裁定并已落地** |
 | Skills repository | SKILLS 模块与 harness `skill/` 存量代码的关系 | **已裁定**：分层与 Java 一致（Java 接口在 core、实现在 extensions-skills；Rust 接口在 harness、实现在本 crate），属**归属位移非层次错位**。见 §3.3 |
-| MODEL 模块与 core `model/openai.rs`（已用 async-openai） | 已下发约束：core 定义 trait + 注册表，本 crate 补 provider 适配，不重复实现 openai | 已裁定 |
+| MODEL 模块与 core `model/openai.rs`（已用 async-openai） | 已下发约束：core 定义 trait + 注册表，本 crate 补 provider 适配，不重复实现 openai。<br>**2026-09-21 更新（`d86a578`）**：该约束的「core 持有 openai 实现」前提已不成立——core 的 `model/{openai,responses,anthropic}.rs` **实现体已整体迁入** `agentscope-extensions-model`（`src/openai/mod.rs` / `src/responses/mod.rs` / `src/anthropic_async/mod.rs`），core 现仅保留 `Model` trait / `ModelRegistry` / provider SPI。原意（**不重复实现**）仍有效，但「归属 core」部分作废。详见 `MODEL__GAP_TRACKER.md` §2.3 与 §4.2 第 7 条。 | 已裁定（2026-09-21 部分被取代） |
 
 ## 3. 汇总登记区（执行后由汇总方填写）
 

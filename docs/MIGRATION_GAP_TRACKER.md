@@ -15,7 +15,7 @@
 | 模块/包 | Java 规模 | Rust 实际状态 | 对齐度(报告) | 关键结论 |
 |---|---|---|---|---|
 | core.message | 23 类 | 6 文件完整 | ≈90% | 9 内容块+Source+State 枚举齐全；4 个消息子类折叠进 Msg+MsgRole |
-| core.model | 18 类 | 11 文件 | ≈80% | 数据层 + **真实 provider（async-openai）** + ModelRegistry/ModelContextWindows；可发真实 HTTP/SSE |
+| core.model | 18 类 | 10 文件（原 11） | ≈80% | 数据层 + **真实 provider（async-openai）** + ModelRegistry/ModelContextWindows；可发真实 HTTP/SSE。**2026-09-21（`d86a578`）**：`openai`/`responses`/`anthropic` provider 实现已迁至 `agentscope-extensions-model/src/{openai,responses,anthropic_async}/mod.rs`，core 仅保留 trait / 注册表 / provider SPI |
 | core.credential | 6 类 | 3 文件 | ≈90% | DeepSeek/Kimi/XAI 均纯凭据元数据，与 Java 同水位 |
 | core.formatter | 6 类 | 4 文件 | ≈95% | ResponseFormat/JsonSchema + MediaUtils + **base_formatter（extract_text/has_media/role_label/convert_tool_result/save_base64/should_bypass 全套）**；openai.rs 已复用 |
 | core.agent | 13 类 | 6 文件（ReActAgent + lifecycle/stream_options） | ≈5%→大幅提升 | ReAct 循环 + stream_events + 结构化调用 + 串行门/优雅关闭守卫已实现；缺 AgentBase 全生命周期细节（hooks/per-session 属性袋） |
@@ -86,7 +86,7 @@
 | **ModelUtils** | ModelUtils | ✅ 已完成 | provider.rs；ensure_default_execution_config |
 | **StructuredOutputReminder** | StructuredOutputReminder | ✅ 已完成 | provider.rs；TOOL_CHOICE/PROMPT 枚举 |
 | **ModelProvider SPI** | spi.ModelProvider | ✅ 已完成 | provider.rs；providerId/supports/create；静态注册替代 ServiceLoader |
-| **真实 provider 接入（用 async-openai）** | agentscope-extensions-model-* | ✅ 已完成 | **`async-openai` v0.41.3（远程 crates.io，MIT）**。`OpenAiChatModel::stream` 内调 `chat().create_stream()`，SSE delta→`ChatResponse`/`ContentBlock`（含流式 tool_call 分片按 index 聚合）；OpenAI 兼容 provider 用 `OpenAIConfig` 改 base_url+key。见方案 §4.2。**live 真实 HTTP 验证待 key（见 §7.3）** |
+| **真实 provider 接入（用 async-openai）** | agentscope-extensions-model-* | ✅ 已完成 | **`async-openai` v0.41.3（远程 crates.io，MIT）**。`OpenAiChatModel::stream` 内调 `chat().create_stream()`，SSE delta→`ChatResponse`/`ContentBlock`（含流式 tool_call 分片按 index 聚合）；OpenAI 兼容 provider 用 `OpenAIConfig` 改 base_url+key。见方案 §4.2。**live 真实 HTTP 验证待 key（见 §7.3）**。**2026-09-21（`d86a578`）实现已迁至 `crates/agentscope-extensions-model/src/openai/mod.rs`**（core 仅留 trait/注册表/SPI） |
 
 ### 2.3 model.transport（优先级 P1）— 手写方案作废，改用 async-openai
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -95,7 +95,7 @@
 | HttpTransportFactory | HttpTransportFactory | 设计决定（不迁移） | 同上，`async-openai::Client` 内置 |
 | JdkHttpTransport/OkHttpTransport | 同名 | 设计决定（不迁移） | 同上 |
 | WebSocketTransport 子包 | WebSocketTransport/JdkWebSocketTransport | 待办 | 若需 realtime/WS，`async-openai` 已带 `realtime` feature（tokio-tungstenite） |
-| **async-openai 接入层** | agentscope-extensions-model-* | ✅ 已完成 | openai.rs；`impl Model for OpenAiChatModel`：内部 `chat().create_stream()`，delta→ContentBlock 映射；feature `chat-completion`+`byot`+`middleware`；`OpenAiProvider` 注册进 `default_registry()` |
+| **async-openai 接入层** | agentscope-extensions-model-* | ✅ 已完成 | `crates/agentscope-extensions-model/src/openai/mod.rs`（2026-09-21 自 `agentscope-core/src/model/openai.rs` 迁入）；`impl Model for OpenAiChatModel`：内部 `chat().create_stream()`，delta→ContentBlock 映射；feature `chat-completion`+`byot`+`middleware`；`OpenAiProvider` 注册进 `default_registry()` |
 
 
 ### 2.4 agent（优先级 P0）— ReAct 循环已实现，缺生命周期治理细节
@@ -547,7 +547,7 @@
 | 验收项 | 说明 | 执行状态 | 交接信息 |
 |---|---|---|---|
 | **凭据加载** | `async-openai` 自动读 `OPENAI_API_KEY`/`OPENAI_BASE_URL`；DeepSeek/Kimi 等自定义 provider 用 `OpenAIConfig` 注入 key/base_url | ✅ 已完成 | `OpenAIConfig::new()` 内置 env 读取；`OpenAiChatModel::new/from_context` 可显式注入 key/base_url；credential 纯数据类用于跨 provider 映射 |
-| **模型 ID 解析** | 解析 `provider:model` 形式（如 `openai:gpt-4o`）→ 选择 provider + model | ✅ 已完成 | `ModelRegistry::resolve_with`（见 2.2），`default_registry()` 内置 OpenAI provider |
+| **模型 ID 解析** | 解析 `provider:model` 形式（如 `openai:gpt-4o`）→ 选择 provider + model | ✅ 已完成 | `ModelRegistry::resolve_with`（见 2.2）仍属 core；但 `default_registry()` 自 2026-09-21（`d86a578`）起位于 **`agentscope_extensions_model::openai::default_registry`**，core 不再导出（另有 `responses::default_responses_registry` / `anthropic_async::default_anthropic_registry`） |
 
 ### 7.3 真实 provider 打通（用 async-openai，不再手写）
 | 验收项 | 说明 | 执行状态 | 交接信息 |

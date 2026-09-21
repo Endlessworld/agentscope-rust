@@ -116,7 +116,7 @@ ACP Client ──stdio──> AcpCodingAgent (Agent.builder())
 | 单元测试 | `#[cfg(test)]` + `tokio::test`，覆盖事件转换、配置构造、会话注册表 |
 | 协议集成 | `agent-client-protocol-test` mock transport 或内存 channel 走通握手+prompt |
 | e2e | `examples/acp_agent_demo.rs` 用脚本化 Model（无需 key）跑通 stdio |
-| 真实 provider | 复用 core `OpenAiChatModel`（需 key，可选） |
+| 真实 provider | 复用 `agentscope_extensions_model::OpenAiChatModel`（需 key，可选）。**2026-09-21 起** provider 实现位于 `agentscope-extensions-model`，core 仅留 trait / 注册表 / SPI |
 
 ## 6. 结论
 - **可行**：SDK 已提供完整的 Agent（服务端）builder 与 schema 类型；核心 ReActAgent 已就绪，只需做「ACP 协议层 ↔ 核心事件层」的桥接。

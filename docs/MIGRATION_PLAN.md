@@ -72,7 +72,7 @@
 - **对接本框架**：`Model::stream` 内部用 `async-openai` 的 `chat().create_stream()`，把 `CreateChatCompletionStreamResponse` 的 delta 映射为 `ChatResponse`/`ContentBlock`。
 - **OpenAI 兼容 provider**（DeepSeek/Kimi/GLM/Ollama 等）：用 `OpenAIConfig` 自定义 `base_url` + BYOT（`serde_json::Value`）规避请求/响应结构差异。
 - **feature**：`chat-completion`（+ `chat-completion-types`）、`byot`、`middleware`。
-- **引入方式**：`../Cargo.toml` 加 `async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "chat-completion-types", "byot", "middleware", "rustls"] }`（走远程 crates.io）。
+- **引入方式**：`crates/agentscope-extensions-model/Cargo.toml` 加 `async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "chat-completion-types", "byot", "middleware", "rustls"] }`（走远程 crates.io）。**2026-09-21 前**该依赖声明在 `agentscope-core/Cargo.toml`，随 provider 实现一并下沉。
 - **版本注意**：该库用 `reqwest 0.13`；若与 workspace 的 `reqwest 0.12` 冲突，考虑在其 feature 下统一或降级。
 
 ### 4.3 响应式流（Flux/Mono → async Stream）

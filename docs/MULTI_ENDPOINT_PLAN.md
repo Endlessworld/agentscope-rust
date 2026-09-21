@@ -4,6 +4,8 @@
 > 使 opencode zen / zen-go 等"同一供应商下不同模型走不同端点"的场景可正常工作，
 > 同时兼容其它供应商（Anthropic 原生、Azure OpenAI、Ollama 等）。
 
+> **实施后变更（2026-09-21，`d86a578`）**：本方案落地时把三个 Model 实现放在 `crates/agentscope-core/src/model/`；此后已**整体迁至 `crates/agentscope-extensions-model/src/`**（`openai/mod.rs`、`responses/mod.rs`、`anthropic_async/mod.rs`），core 仅保留 `Model` trait / `ModelRegistry` / provider SPI。下文出现的 `model/openai.rs` / `model/responses.rs` / `model/anthropic.rs` 路径请按此换算；`async-openai` / `async-anthropic` / `reqwest13` 依赖也随之下沉到 `agentscope-extensions-model/Cargo.toml`。
+
 ## 1. 背景与问题
 
 当前模型链路只有一条：
@@ -183,9 +185,9 @@ async-anthropic = { version = "0.6", default-features = false, features = ["rust
 
 | 协议 | 文件 | 实现基础 | 请求 | 事件映射 |
 | --- | --- | --- | --- | --- |
-| ChatCompletions | `model/openai.rs`（现有，不动） | async-openai chat | `/chat/completions` | 现有 `StreamIncrementer` |
-| Responses | `model/responses.rs`（新增） | async-openai `responses` feature | `/responses` | `ResponseStreamEvent` → `ChatResponse` |
-| Messages | `model/anthropic.rs`（新增） | **`async-anthropic` 0.6.0** | `/v1/messages` | `MessagesStreamEvent` → `ChatResponse` |
+| ChatCompletions | `extensions-model/src/openai/mod.rs`（原 `core/src/model/openai.rs`） | async-openai chat | `/chat/completions` | 现有 `StreamIncrementer` |
+| Responses | `extensions-model/src/responses/mod.rs`（原 `core/src/model/responses.rs`） | async-openai `responses` feature | `/responses` | `ResponseStreamEvent` → `ChatResponse` |
+| Messages | `extensions-model/src/anthropic_async/mod.rs`（原 `core/src/model/anthropic.rs`） | **`async-anthropic` 0.6.0** | `/v1/messages` | `MessagesStreamEvent` → `ChatResponse` |
 
 三者都实现同一个 `Model` trait，`stream()` 签名不变，所以对上层（ReActAgent、ACP）**完全透明**。
 
@@ -276,9 +278,9 @@ pub struct ModelsSpec {
 
 ## 6. 影响面与工作量
 
-- 新增：`model/responses.rs`（async-openai）、`model/anthropic.rs`（async-anthropic）。
+- 新增（落地时位于 core，2026-09-21 已迁至 `crates/agentscope-extensions-model/src/`）：`responses/mod.rs`（async-openai）、`anthropic_async/mod.rs`（async-anthropic）；同期 `openai/mod.rs` 亦随迁（接口名不变）。
 - 修改：`model/provider.rs`（+枚举/字段）、`model/mod.rs`（导出）、
-  `agentscope-core/Cargo.toml`（+async-openai features、+async-anthropic 依赖）、
+  `agentscope-extensions-model/Cargo.toml`（+async-openai features、+async-anthropic 依赖；2026-09-21 前为 `agentscope-core/Cargo.toml`）、
   `examples/acp_harness_agent.rs`、`examples/acp_agent_cli.rs`、`docs/models.json`、`README.md`。
 - 风险：
   - `async-anthropic`（reqwest 0.12）与 async-openai 0.41（reqwest 0.13）双版本共存，需编译验证。
