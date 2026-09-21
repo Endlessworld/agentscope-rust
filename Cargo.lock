@@ -69,15 +69,12 @@ dependencies = [
 name = "agentscope-core"
 version = "0.1.0"
 dependencies = [
- "async-anthropic",
- "async-openai",
  "async-trait",
  "base64 0.22.1",
  "chrono",
  "futures",
  "jsonschema",
  "reqwest 0.12.28",
- "reqwest 0.13.4",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -212,13 +209,15 @@ name = "agentscope-extensions-model"
 version = "0.1.0"
 dependencies = [
  "agentscope-core",
- "agentscope-harness",
+ "async-anthropic",
+ "async-openai",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
  "chrono",
  "futures",
  "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -452,6 +451,7 @@ name = "agentscope-extensions-training"
 version = "0.1.0"
 dependencies = [
  "agentscope-core",
+ "agentscope-extensions-model",
  "agentscope-harness",
  "async-trait",
  "chrono",
@@ -471,6 +471,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "agentscope-core",
+ "agentscope-extensions-model",
  "async-trait",
  "base64 0.22.1",
  "chrono",

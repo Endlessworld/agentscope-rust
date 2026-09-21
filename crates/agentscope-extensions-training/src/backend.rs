@@ -416,7 +416,7 @@ impl TrinityModelAdapterBuilder {
                     )
                 })?;
                 let name = model_name.unwrap_or_else(|| "training-model".to_string());
-                let model = agentscope_core::model::OpenAiChatModel::new(
+                let model = agentscope_extensions_model::OpenAiChatModel::new(
                     name.clone(),
                     api_key,
                     Some(base_url),

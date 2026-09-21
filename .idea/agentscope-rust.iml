@@ -31,6 +31,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-skills/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-studio/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-training/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-model/examples" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

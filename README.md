@@ -10,7 +10,7 @@ AgentScope（Java）的 Rust 实现：把 `io.agentscope.core` 与 `io.agentscop
 ## 核心能力
 
 - **ReAct 智能体运行时**：reasoning→acting 循环、流式事件（31 种 `AgentEvent`）、结构化输出、串行门与优雅关闭。
-- **模型层**：`Model` trait + `OpenAiChatModel`（async-openai，SSE 流式/重试/限流），兼容 DeepSeek、Kimi、GLM、Ollama 等 OpenAI 协议网关。
+- **模型层**：`Model` trait / `ModelRegistry` 等抽象在 `agentscope-core`；全部具体 provider（openai / responses / anthropic / dashscope / gemini / ollama）实现在 `agentscope-extensions-model`。
 - **工具系统**：`Tool` / `Toolkit` / `ToolGroup` / `ToolExecutor`（超时、重试、并行、JSON Schema 校验、挂起语义）+ MCP 工具桥。
 - **Harness 运行时**：`HarnessAgent` 一键装配文件系统工具、shell、压缩（compaction）、plan mode 与 skills。
 - **ACP Coding Agent**：stdio 上实现 ACP 协议（initialize / session.* / prompt / set_mode / cancel），含权限确认（HITL）与运行时模型切换。
@@ -21,20 +21,28 @@ AgentScope（Java）的 Rust 实现：把 `io.agentscope.core` 与 `io.agentscop
 
 ```text
 agentscope-rust/
-├── Cargo.toml                  # workspace：core + harness
+├── Cargo.toml                  # workspace：core + harness + extensions-*
 ├── crates/
-│   ├── agentscope-core/        # 核心抽象与运行时
-│   └── agentscope-harness/     # 增强运行时（workspace / ACP / 沙箱 / skill / subagent…）
+│   ├── agentscope-core/              # 公共抽象 + 核心实现（仅接口/运行时，不依赖其它模块）
+│   ├── agentscope-harness/           # 增强运行时（workspace / ACP / 沙箱 / skill / subagent…），最终使用者
+│   └── agentscope-extensions-*/      # 供应商 / 平台适配（model / rag / sandbox / channel / mem / store…）
 ├── docs/                       # 迁移方案与进度跟踪
 └── .agents/context/            # 跨会话项目上下文（画像 / 状态 / ADR / 经验）
 ```
+
+## 模块依赖规则
+
+- **`agentscope-core`**：公共抽象与核心实现，**如无必要不得引入其它模块 crate 依赖**（仅第三方依赖）。
+- **`agentscope-extensions-*`**：供应商 / 平台适配实现。一般只允许依赖 `agentscope-core`；如无必要尽量不引用其它模块。确需跨 extension 引用时，先在汇总 tracker 记「跨模块需求」并获裁定。
+- **`agentscope-harness`**：最终使用者 / 装配层，可以引入其它任意模块（core 与 extensions-*），负责把 provider 适配、运行时装配成完整应用。
+- **禁止循环引用**：模块依赖图必须保持 DAG。出现循环时由汇总方裁定归属（通常把公共抽象下沉到 core）。
 
 ### agentscope-core 模块
 
 | 模块 | 内容 |
 | --- | --- |
 | `agent` | `ReActAgent` + builder、生命周期、流式选项、`RuntimeContext` |
-| `model` | `Model` / `ModelRegistry`、OpenAI provider、`GenerateOptions`、上下文窗口 |
+| `model` | `Model` / `ModelRegistry` SPI、DTO（`GenerateOptions` / `ChatResponse` / `ToolSchema`…）、上下文窗口 |
 | `message` | `Msg` / `MsgRole`、9 类 `ContentBlock`、`Source`、`ChatUsage` |
 | `tool` | Tool / Toolkit / ToolGroup / Executor / Validator、MCP 桥、`TodoWriteTool` |
 | `middleware` | 5 钩子洋葱链 + `TaskReminderMiddleware` |
@@ -94,11 +102,11 @@ cargo build --profile embedded -p agentscope-harness --no-default-features --fea
 
 ## 示例
 
-`agentscope-core`（`tool_agent_demo` 用脚本化模型，**无需 API Key**）：
+`agentscope-core`（`tool_agent_demo` 用脚本化模型，**无需 API Key**）与 `agentscope-extensions-model`（真实 provider）：
 
 ```bash
-cargo run -p agentscope-core --example tool_agent_demo   # ReAct + 工具调用 e2e
-cargo run -p agentscope-core --example chat_demo         # 真实模型 + SSE 流式
+cargo run -p agentscope-core --example tool_agent_demo       # ReAct + 工具调用 e2e
+cargo run -p agentscope-extensions-model --example chat_demo # 真实模型 + SSE 流式
 ```
 
 `chat_demo` 通过环境变量取凭据（`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `AGENTSCOPE_MODEL`）。

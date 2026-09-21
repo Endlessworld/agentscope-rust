@@ -91,8 +91,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
-use agentscope_core::model::{
-    AnthropicMessagesModel, GenerateOptions, Model, OpenAiChatModel, OpenAiResponsesModel,
+use agentscope_core::model::{GenerateOptions, Model};
+use agentscope_extensions_model::{
+    AnthropicMessagesModel, OpenAiChatModel, OpenAiResponsesModel,
 };
 use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};

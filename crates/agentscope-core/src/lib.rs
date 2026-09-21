@@ -48,11 +48,10 @@ pub use message::{
 };
 pub use middleware::{ActingInput, AgentInput, Middleware, MiddlewareChain, ModelCallInput, ReasoningInput, TaskReminderMiddleware};
 pub use model::{
-    default_registry, resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder,
+    resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder,
     ExecutionConfig, ExecutionConfigBuilder, GenerateOptions, GenerateOptionsBuilder, Model,
     ModelCapabilities, ModelCreationContext, ModelProvider, ModelProviderSupport, ModelRegistry,
-    ModelUtils, OpenAiChatModel, OpenAiProvider, StructuredOutputReminder, ToolChoice, ToolSchema,
-    DEFAULT_PROVIDER_ID,
+    ModelUtils, StructuredOutputReminder, ToolChoice, ToolSchema, DEFAULT_PROVIDER_ID,
 };
 pub use tool::{
     DefaultToolResultConverter, ExtendedModel, FunctionTool, MetaToolFactory, is_dangerous_command,

@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -21,4 +20,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 base64 = "0.22"
 async-stream = "0.3"
+# OpenAI/Anthropic 官方协议实现（自 agentscope-core 迁入，2026-09-21）
+# `async-openai` 0.41 依赖 reqwest 0.13，与 workspace 的 0.12 不同；
+# 以别名 reqwest13 引入，匹配 Client::with_http_client 所需的版本。
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "chat-completion-types", "byot", "middleware", "rustls", "responses", "response-types"] }
+async-anthropic = { version = "0.6", default-features = false, features = ["rustls"] }
 

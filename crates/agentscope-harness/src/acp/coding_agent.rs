@@ -21,7 +21,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Stdio};
 
-use agentscope_core::model::{Model, OpenAiChatModel};
+use agentscope_core::model::Model;
+use agentscope_extensions_model::OpenAiChatModel;
 
 use crate::agent::{HarnessAgent, HarnessAgentBuilder};
 use crate::CompactionMiddlewareConfig;

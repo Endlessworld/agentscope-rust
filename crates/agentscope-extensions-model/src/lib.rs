@@ -5,10 +5,11 @@
 //!
 //! ## Scope (per `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §2.2)
 //! Core owns the [`Model`](agentscope_core::Model) trait, the
-//! [`ModelRegistry`](agentscope_core::ModelRegistry) and the **OpenAI-compatible**
-//! provider (`agentscope_core::model::openai`, built on `async-openai`). This
-//! crate therefore **does not re-implement OpenAI**; it adds the providers whose
-//! wire protocols differ from the OpenAI chat-completions shape.
+//! [`ModelRegistry`](agentscope_core::ModelRegistry) and the shared provider
+//! SPI. **All concrete model implementations live here**, including the
+//! OpenAI-compatible provider (`openai`, on `async-openai`), the OpenAI
+//! Responses provider (`responses`) and the async-anthropic-backed Messages
+//! provider (`anthropic_async`, alongside the transport-seam `anthropic`).
 //!
 //! ## Offline-testability
 //! Every provider talks to the network through [`common::HttpTransport`]. Tests
@@ -18,12 +19,18 @@
 //! See `docs/extensions/MODEL__GAP_TRACKER.md` for the authoritative gap list.
 
 pub mod anthropic;
+pub mod anthropic_async;
 pub mod common;
 pub mod dashscope;
 pub mod gemini;
 pub mod ollama;
+pub mod openai;
+pub mod responses;
 
 pub use anthropic::{AnthropicChatModel, AnthropicModelProvider};
+pub use anthropic_async::{
+    default_anthropic_registry, AnthropicMessagesModel, AnthropicMessagesProvider,
+};
 pub use common::{
     decode_stream_line, HttpRequestSpec, HttpTransport, JsonStream, MemoryTransport,
     ReqwestTransport, SharedTransport,
@@ -33,3 +40,5 @@ pub use dashscope::{
 };
 pub use gemini::{GeminiChatModel, GeminiModelProvider};
 pub use ollama::{OllamaChatModel, OllamaModelProvider, OllamaOptions};
+pub use openai::{default_registry, OpenAiChatModel, OpenAiProvider};
+pub use responses::{default_responses_registry, OpenAiResponsesModel, OpenAiResponsesProvider};

@@ -11,10 +11,11 @@
 //!
 //! Run:
 //! ```text
-//! cargo run -p agentscope-core --example chat_demo
+//! cargo run -p agentscope-extensions-model --example chat_demo
 //! ```
 
-use agentscope_core::{default_registry, ContentBlock, ModelCreationContext};
+use agentscope_core::{ContentBlock, ModelCreationContext};
+use agentscope_extensions_model::default_registry;
 use futures::StreamExt;
 
 #[tokio::main]

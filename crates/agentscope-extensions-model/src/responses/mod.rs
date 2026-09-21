@@ -1,9 +1,9 @@
 //! OpenAI Responses API model (`POST {base_url}/responses`), implemented on top
 //! of the `async-openai` crate's `responses` feature.
 //!
-//! This is a sibling of [`crate::model::openai`] (Chat Completions): it speaks a
+//! This is a sibling of [`crate::openai`] (Chat Completions): it speaks a
 //! different wire protocol but maps into the same
-//! [`crate::model::ChatResponse`]/[`ContentBlock`] types, so the ReAct agent and
+//! [`agentscope_core::model::ChatResponse`]/[`ContentBlock`] types, so the ReAct agent and
 //! ACP layers are protocol-agnostic.
 //!
 //! Streaming events are mapped as follows:
@@ -28,19 +28,19 @@ use async_openai::Client;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
-use crate::error::{Error, Result};
-use crate::formatter::{convert_tool_result_to_string, extract_text_content};
-use crate::message::{
+use agentscope_core::error::{Error, Result};
+use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content};
+use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock,
 };
-use crate::model::context_windows::resolve_context_window;
-use crate::model::generate_options::GenerateOptions;
-use crate::model::model::{Model, ModelCapabilities};
-use crate::model::provider::{
+use agentscope_core::model::context_windows::resolve_context_window;
+use agentscope_core::model::generate_options::GenerateOptions;
+use agentscope_core::model::model::{Model, ModelCapabilities};
+use agentscope_core::model::provider::{
     ModelCreationContext, ModelProvider, ModelRegistry, RESPONSES_PROVIDER_ID,
 };
-use crate::model::tool_choice::ToolChoice;
-use crate::model::tool_schema::ToolSchema;
+use agentscope_core::model::tool_choice::ToolChoice;
+use agentscope_core::model::tool_schema::ToolSchema;
 
 /// An OpenAI Responses API model backed by `async-openai`.
 pub struct OpenAiResponsesModel {
@@ -121,7 +121,7 @@ impl Model for OpenAiResponsesModel {
         messages: Vec<Msg>,
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
-    ) -> BoxStream<'_, Result<crate::model::ChatResponse>> {
+    ) -> BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
         let client = self.client.clone();
         let model_name = options
             .model_name
@@ -379,7 +379,7 @@ struct ResponsesIncrementer {
 }
 
 impl ResponsesIncrementer {
-    fn accumulate(&mut self, event: &ResponseStreamEvent) -> Option<crate::model::ChatResponse> {
+    fn accumulate(&mut self, event: &ResponseStreamEvent) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         match event {
             ResponseStreamEvent::ResponseOutputTextDelta(e) => {
@@ -428,7 +428,7 @@ impl ResponsesIncrementer {
                 self.finish_reason = Some(status_string(&e.response.status));
             }
             ResponseStreamEvent::ResponseError(e) => {
-                return Some(crate::model::ChatResponse::new(
+                return Some(agentscope_core::model::ChatResponse::new(
                     self.id.clone(),
                     vec![ContentBlock::Text(TextBlock::new(format!(
                         "[responses error] {}",
@@ -445,7 +445,7 @@ impl ResponsesIncrementer {
         if blocks.is_empty() {
             None
         } else {
-            Some(crate::model::ChatResponse::new(
+            Some(agentscope_core::model::ChatResponse::new(
                 self.id.clone(),
                 blocks,
                 ChatUsage::default(),
@@ -455,7 +455,7 @@ impl ResponsesIncrementer {
         }
     }
 
-    fn into_final(self) -> Option<crate::model::ChatResponse> {
+    fn into_final(self) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for frag in self.tool_calls.values() {
             let input = parse_arguments(&frag.arguments);
@@ -468,7 +468,7 @@ impl ResponsesIncrementer {
         if blocks.is_empty() && self.usage.is_none() {
             return None;
         }
-        Some(crate::model::ChatResponse::new(
+        Some(agentscope_core::model::ChatResponse::new(
             self.id,
             blocks,
             self.usage.unwrap_or_default(),
@@ -488,7 +488,7 @@ fn parse_arguments(args: &str) -> JsonMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{TextBlock, ToolResultBlock};
+    use agentscope_core::message::{TextBlock, ToolResultBlock};
     use async_openai::types::responses::{
         ResponseFunctionCallArgumentsDeltaEvent, ResponseOutputItemAddedEvent,
         ResponseTextDeltaEvent,

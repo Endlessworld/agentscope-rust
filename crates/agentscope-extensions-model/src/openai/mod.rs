@@ -3,7 +3,7 @@
 //!
 //! This is the first **real** provider: `Model::stream` calls
 //! `chat().create_stream()` and maps the SSE `delta` chunks into
-//! [`crate::model::ChatResponse`]/[`ContentBlock`]. Because `async-openai`
+//! [`agentscope_core::model::ChatResponse`]/[`ContentBlock`]. Because `async-openai`
 //! speaks the OpenAI protocol, this single provider also serves any
 //! OpenAI-compatible gateway (DeepSeek/Kimi/GLM/Ollama/... ) by overriding the
 //! base URL and API key.
@@ -25,7 +25,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions, ChatCompletionTool,
     ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
-    CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionCallStream, FunctionName,
+    CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionName,
     FunctionObject, ReasoningEffort, ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
     ToolChoiceOptions,
 };
@@ -33,19 +33,19 @@ use async_openai::Client;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
-use crate::error::{Error, Result};
-use crate::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
-use crate::message::{
+use agentscope_core::error::{Error, Result};
+use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
+use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock,
 };
-use crate::model::context_windows::resolve_context_window;
-use crate::model::generate_options::GenerateOptions;
-use crate::model::model::{Model, ModelCapabilities};
-use crate::model::provider::{
+use agentscope_core::model::context_windows::resolve_context_window;
+use agentscope_core::model::generate_options::GenerateOptions;
+use agentscope_core::model::model::{Model, ModelCapabilities};
+use agentscope_core::model::provider::{
     ModelCreationContext, ModelProvider, ModelRegistry, DEFAULT_PROVIDER_ID,
 };
-use crate::model::tool_choice::ToolChoice;
-use crate::model::tool_schema::ToolSchema;
+use agentscope_core::model::tool_choice::ToolChoice;
+use agentscope_core::model::tool_schema::ToolSchema;
 
 /// Connection-establishment timeout for the underlying HTTP client.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -170,7 +170,7 @@ impl Model for OpenAiChatModel {
         messages: Vec<Msg>,
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
-    ) -> BoxStream<'_, Result<crate::model::ChatResponse>> {
+    ) -> BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
         let client = self.client.clone();
         let model_name = options
             .model_name
@@ -679,7 +679,7 @@ impl StreamIncrementer {
     /// Consumes one chunk, returning a `ChatResponse` carrying only the
     /// incremental text/thinking content of this chunk (or `None` when the chunk
     /// carries no incremental content, e.g. an empty usage-only chunk).
-    fn accumulate(&mut self, chunk: &OpenAiStreamChunk) -> Option<crate::model::ChatResponse> {
+    fn accumulate(&mut self, chunk: &OpenAiStreamChunk) -> Option<agentscope_core::model::ChatResponse> {
         if self.id.is_empty() && !chunk.id.is_empty() {
             self.id = chunk.id.clone();
         }
@@ -732,7 +732,7 @@ impl StreamIncrementer {
         if blocks.is_empty() {
             None
         } else {
-            Some(crate::model::ChatResponse::new(
+            Some(agentscope_core::model::ChatResponse::new(
                 self.id.clone(),
                 blocks,
                 ChatUsage::default(),
@@ -744,7 +744,7 @@ impl StreamIncrementer {
 
     /// Flushes the accumulated tool calls, usage and finish reason into a final
     /// [`ChatResponse`]. Returns `None` when nothing was accumulated.
-    fn into_final(self) -> Option<crate::model::ChatResponse> {
+    fn into_final(self) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for frag in self.tool_calls.values() {
             let input = parse_arguments(&frag.arguments);
@@ -761,7 +761,7 @@ impl StreamIncrementer {
         if blocks.is_empty() && self.usage.is_none() {
             return None;
         }
-        Some(crate::model::ChatResponse::new(
+        Some(agentscope_core::model::ChatResponse::new(
             self.id,
             blocks,
             self.usage.unwrap_or_default(),
@@ -791,7 +791,8 @@ fn parse_arguments(args: &str) -> JsonMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+    use agentscope_core::message::{Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+    use async_openai::types::chat::FunctionCallStream;
 
     fn sample_msg() -> Msg {
         Msg::builder()
