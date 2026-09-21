@@ -56,9 +56,15 @@
 //! }
 //! ```
 //!
+//! `models` 也支持**扁平数组**写法（按模型命名自动推断协议分组）：
+//!
+//! ```json
+//! "models": ["glm-5.3", "kimi-k3", "minimax-m3", "qwen3.8-max", "grok-4.6"]
+//! ```
+//!
 //! # 端点协议分组
 //!
-//! 同一供应商下不同模型可能走不同端点，因此 `models` 按协议分组，
+//! 同一供应商下不同模型可能走不同端点，因此 `models` 推荐按协议分组，
 //! 三个 key 与端点后缀一一对应（缺省组可省略）：
 //!
 //! | key | 端点 | 适用模型 |
@@ -66,6 +72,8 @@
 //! | `completions` | `POST {base_url}/chat/completions` | glm / kimi / deepseek / mimo / hy / longcat |
 //! | `messages` | `POST {base_url}/messages` | minimax / qwen（Anthropic 协议） |
 //! | `responses` | `POST {base_url}/responses` | grok / gpt / muse-spark |
+//!
+//! 写成扁平数组时，会按上表前缀自动归入对应分组。
 //!
 //! `base_url` 始终只写到版本前缀（如 `https://opencode.ai/zen/go/v1`），
 //! 端点后缀由协议决定，不要写进 `base_url`。
@@ -101,8 +109,9 @@ use serde::{Deserialize, Serialize};
 
 /// 按端点协议分组的模型列表。
 ///
-/// 同一供应商下不同模型可能走不同端点，因此模型按协议分组：
+/// 支持两种写法（`models` 字段）：
 ///
+/// 1. **分组对象**（显式指定协议，推荐）：
 /// ```json
 /// "models": {
 ///   "completions": ["glm-5.3", "kimi-k3"],
@@ -111,8 +120,13 @@ use serde::{Deserialize, Serialize};
 /// }
 /// ```
 ///
+/// 2. **扁平数组**（按模型命名自动推断协议）：
+/// ```json
+/// "models": ["glm-5.3", "kimi-k3", "minimax-m3", "qwen3.8-max", "grok-4.6"]
+/// ```
+///
 /// 三个 key 与端点后缀一一对应，缺省组可省略。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ModelsSpec {
     /// `POST {base_url}/chat/completions`（OpenAI Chat Completions）。
     #[serde(default)]
@@ -152,6 +166,97 @@ impl ModelsSpec {
     pub fn is_empty(&self) -> bool {
         self.completions.is_empty() && self.messages.is_empty() && self.responses.is_empty()
     }
+
+    /// 按模型命名推断其端点协议，用于扁平数组写法。
+    ///
+    /// - `minimax*` / `qwen*` → Anthropic `messages` 端点
+    /// - `grok*` / `gpt*` / `muse-spark*` → OpenAI `responses` 端点
+    /// - 其余（glm / kimi / deepseek / mimo / hy / longcat …）→ Chat Completions
+    ///
+    /// 带 provider 前缀的 ID（如 `Go/deepseek-v4-flash`）按 `/` 取尾段再匹配。
+    pub fn infer_protocol(model: &str) -> ApiProtocol {
+        let lower = model.to_ascii_lowercase();
+        let bare = lower.rsplit('/').next().unwrap_or(lower.as_str());
+        if bare.starts_with("minimax") || bare.starts_with("qwen") {
+            ApiProtocol::Messages
+        } else if bare.starts_with("grok")
+            || bare.starts_with("gpt")
+            || bare.starts_with("muse-spark")
+        {
+            ApiProtocol::Responses
+        } else {
+            ApiProtocol::ChatCompletions
+        }
+    }
+
+    /// 按推断出的协议把一个模型追加到对应分组。
+    pub fn push_inferred(&mut self, model: String) {
+        match Self::infer_protocol(&model) {
+            ApiProtocol::Messages => self.messages.push(model),
+            ApiProtocol::Responses => self.responses.push(model),
+            ApiProtocol::ChatCompletions => self.completions.push(model),
+        }
+    }
+}
+
+/// 兼容两种 `models` 写法的反序列化：分组对象或扁平数组。
+///
+/// serde 的 derive 只能处理对象形式，因此这里手写 visitor：
+/// - 数组：逐个按 [`ModelsSpec::infer_protocol`] 归组；
+/// - 对象：读取 `completions` / `messages` / `responses`，未知 key 忽略（向前兼容）。
+impl<'de> Deserialize<'de> for ModelsSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct ModelsSpecVisitor;
+
+        impl<'de> Visitor<'de> for ModelsSpecVisitor {
+            type Value = ModelsSpec;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("模型 ID 数组或按协议分组的对象")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut spec = ModelsSpec::default();
+                while let Some(model) = seq.next_element::<String>()? {
+                    spec.push_inferred(model);
+                }
+                Ok(spec)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut spec = ModelsSpec::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.trim().to_ascii_lowercase().as_str() {
+                        "completions" | "chat_completions" => {
+                            spec.completions.extend(map.next_value::<Vec<String>>()?)
+                        }
+                        "messages" => spec.messages.extend(map.next_value::<Vec<String>>()?),
+                        "responses" => spec.responses.extend(map.next_value::<Vec<String>>()?),
+                        _ => {
+                            // 未知分组：消费值后忽略，保持向前兼容。
+                            let _: serde_json::Value = map.next_value()?;
+                            tracing::warn!("models: ignoring unknown protocol group '{key}'");
+                        }
+                    }
+                }
+                Ok(spec)
+            }
+        }
+
+        deserializer.deserialize_any(ModelsSpecVisitor)
+    }
 }
 
 /// A resolved model endpoint: model id + base URL + credentials + wire protocol.
@@ -171,7 +276,7 @@ pub struct ModelProviderConfig {
     pub base_url: String,
     /// API 密钥（部分免费服务可填 `"public"`）。
     pub api_key: String,
-    /// 该提供者下可用的模型，按端点协议分组。
+    /// 该提供者下可用的模型：按端点协议分组的对象，或扁平数组（自动推断协议）。
     pub models: ModelsSpec,
 }
 
@@ -242,12 +347,27 @@ impl ModelConfig {
     /// 写 `//` / `/* */` 注释和多余逗号。
     pub fn load_or_create() -> Self {
         let Some(path) = Self::default_path() else {
+            tracing::warn!("model-config: cannot resolve $HOME; using built-in defaults");
+            eprintln!("[model-config] warning: cannot resolve $HOME; using built-in defaults");
             return Self::default();
         };
+        tracing::debug!("model-config: config path {}", path.display());
         if path.exists() {
             if let Some(cfg) = Self::try_load(&path) {
+                tracing::info!(
+                    "model-config: loaded {} (default_provider='{}', default_model='{}', providers={}, models={})",
+                    path.display(),
+                    cfg.default_provider,
+                    cfg.default_model,
+                    cfg.providers.len(),
+                    cfg.model_count(),
+                );
                 return cfg;
             }
+            tracing::error!(
+                "model-config: failed to parse {}; keeping file and falling back to built-in defaults",
+                path.display()
+            );
             eprintln!(
                 "[model-config] warning: failed to parse {}; keeping the file \
                  unchanged and using built-in defaults for this run",
@@ -266,14 +386,36 @@ impl ModelConfig {
     /// 后重试，使手工编辑的配置允许 `//`、`/* */` 注释和多余逗号。
     /// 任意换行 / 缩进 / 空行 serde_json 本就支持，无需特殊处理。
     fn try_load(path: &std::path::Path) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("model-config: failed to read {}: {e}", path.display());
+                return None;
+            }
+        };
+        tracing::debug!("model-config: read {} bytes", content.len());
         // 容忍编辑器（尤其 Windows 记事本）写入的 UTF-8 BOM，
         // 否则 serde_json 会解析失败并被误判为“配置文件无效”。
         let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-        if let Ok(cfg) = serde_json::from_str::<Self>(content) {
-            return Some(cfg);
+        match serde_json::from_str::<Self>(content) {
+            Ok(cfg) => return Some(cfg),
+            Err(e) => {
+                tracing::debug!(
+                    "model-config: strict JSON parse failed ({e}); retrying lenient pass"
+                );
+            }
         }
-        serde_json::from_str(&sanitize_json(content)).ok()
+        let sanitized = sanitize_json(content);
+        match serde_json::from_str::<Self>(&sanitized) {
+            Ok(cfg) => {
+                tracing::debug!("model-config: lenient pass parsed successfully");
+                Some(cfg)
+            }
+            Err(e) => {
+                tracing::error!("model-config: lenient pass still failed: {e}");
+                None
+            }
+        }
     }
 
     /// 将当前配置写入磁盘（覆盖已有文件）。目录不存在时自动创建。
@@ -334,6 +476,11 @@ impl ModelConfig {
                 .unwrap_or_else(|| provider.base_url.clone());
 
             let protocol = protocol_for(&provider.models, &model_id);
+            tracing::info!(
+                "model-config: resolve default provider='{provider_name}' model='{model_id}' \
+                 protocol={} base_url='{base_url}'",
+                protocol.label()
+            );
             ResolvedModel {
                 model_id,
                 base_url,
@@ -341,6 +488,9 @@ impl ModelConfig {
                 protocol,
             }
         } else {
+            tracing::warn!(
+                "model-config: provider '{provider_name}' not found; falling back to env/defaults"
+            );
             eprintln!(
                 "[model-config] warning: provider '{}' not found in config, \
                  falling back to environment variables or defaults",
@@ -367,12 +517,31 @@ impl ModelConfig {
     ///
     /// 兼容两种 ID 形式：裸 ID（`deepseek-v4-flash`）与带 provider 前缀的
     /// ID（`Go/deepseek-v4-flash`，即客户端下拉里展示的 `provider/model`
-    /// 格式）——后者按 `/` 分割取尾段再匹配。
+    /// 格式）——后者优先在指定 provider 下查找，找不到再退回全量查找。
+    ///
+    /// provider 按 key 排序后确定性遍历，避免同一模型 ID 出现在多个 provider
+    /// 时（HashMap 迭代顺序随机）解析到不稳定的 base_url / api_key。
     ///
     /// 环境变量 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 可覆盖查找结果。
     pub fn resolve_model(&self, model_id: &str) -> Result<ResolvedModel, String> {
         let bare = model_id.rsplit('/').next().unwrap_or(model_id);
-        for (_key, provider) in &self.providers {
+        // 带前缀时（如 `Go/deepseek-v4-flash`）优先精确匹配该 provider。
+        let prefix = model_id
+            .split_once('/')
+            .map(|(p, _)| p)
+            .filter(|p| !p.is_empty());
+
+        let mut keys: Vec<&String> = self.providers.keys().collect();
+        keys.sort();
+        if let Some(p) = prefix {
+            if let Some(pos) = keys.iter().position(|k| k.eq_ignore_ascii_case(p)) {
+                let key = keys.remove(pos);
+                keys.insert(0, key);
+            }
+        }
+
+        for key in keys {
+            let provider = &self.providers[key];
             if provider.models.contains(bare) || provider.models.contains(model_id) {
                 let api_key = std::env::var("OPENAI_API_KEY")
                     .ok()
@@ -383,6 +552,11 @@ impl ModelConfig {
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| provider.base_url.clone());
                 let protocol = protocol_for(&provider.models, bare);
+                tracing::info!(
+                    "model-config: resolve_model '{model_id}' -> provider='{key}' \
+                     model='{bare}' protocol={} base_url='{base_url}'",
+                    protocol.label()
+                );
                 return Ok(ResolvedModel {
                     model_id: bare.to_string(),
                     base_url,
@@ -391,9 +565,21 @@ impl ModelConfig {
                 });
             }
         }
+        tracing::error!("model-config: model '{model_id}' not found in any provider");
         Err(format!(
             "model '{model_id}' not found in any provider of ~/.agentscope/models.json"
         ))
+    }
+
+    /// 统计去重后的模型总数（不产生日志，供 `load_or_create` 打印摘要用）。
+    pub fn model_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for provider in self.providers.values() {
+            for (id, _) in provider.models.iter() {
+                seen.insert(id);
+            }
+        }
+        seen.len()
     }
 
     /// 汇总所有 provider 下的模型列表，生成 ACP 的 `ModelChoice` 列表。
@@ -402,19 +588,38 @@ impl ModelConfig {
     /// `ModelChoice { id, name }`。其中 `name` 使用 `provider_key/model_id`
     /// 格式以区分不同供应商，`id` 保持为模型 ID。用于动态填充 ACP
     /// `setModel` 下拉可选项，无需在代码中硬编码。
+    ///
+    /// provider 按 key 排序后确定性遍历，保证下拉顺序稳定。
     pub fn all_models(&self) -> Vec<ModelChoice> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for (provider_key, provider) in &self.providers {
-            for (id, _protocol) in provider.models.iter() {
+        let mut keys: Vec<&String> = self.providers.keys().collect();
+        keys.sort();
+        for provider_key in keys {
+            let provider = &self.providers[provider_key];
+            let mut per_provider = 0usize;
+            for (id, protocol) in provider.models.iter() {
                 if seen.insert(id.to_string()) {
+                    per_provider += 1;
+                    tracing::debug!(
+                        "model-config: provider='{provider_key}' model='{id}' protocol={}",
+                        protocol.label()
+                    );
                     out.push(ModelChoice {
                         id: id.to_string(),
                         name: format!("{}/{}", provider_key, id),
                     });
                 }
             }
+            tracing::info!(
+                "model-config: provider '{provider_key}' provides {per_provider} models \
+                 (completions={}, messages={}, responses={})",
+                provider.models.completions.len(),
+                provider.models.messages.len(),
+                provider.models.responses.len(),
+            );
         }
+        tracing::info!("model-config: {} selectable models in total", out.len());
         out
     }
 }
@@ -676,6 +881,12 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
         &api_key[..api_key.len().min(8)],
         protocol.label(),
     );
+    tracing::info!(
+        "model-config: build_agent model='{}' base_url='{}' protocol={}",
+        model_id,
+        base_url,
+        protocol.label()
+    );
 
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
     let model: Arc<dyn Model> =
@@ -759,8 +970,10 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
 /// Initializes tracing to a log file under `<cwd>/.agentscope/log/`.
 ///
 /// The ACP transport is stdio: anything written to stdout corrupts the
-/// JSON-RPC stream, so logs MUST go to a file. Level defaults to `info` and
-/// can be overridden with `RUST_LOG` (e.g. `RUST_LOG=debug`).
+/// JSON-RPC stream, so logs MUST go to a file. Level defaults to `info` for
+/// third-party crates plus `debug` for this agent's own modules (config
+/// parsing / model resolution), and can be overridden with `RUST_LOG`
+/// (e.g. `RUST_LOG=trace`).
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
 
@@ -788,14 +1001,18 @@ fn init_logging() {
             return;
         }
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    // 本 agent 自身模块（配置解析 / 模型解析）默认 debug，便于排障；
+    // 依赖保持 info 以免刷屏。RUST_LOG 可完全覆盖。
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,acp_harness_agent=debug,agentscope_harness=debug")
+    });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
         .with_target(false)
         .try_init();
+    tracing::info!("logging to {}", log_file.display());
 }
 
 #[tokio::main]
