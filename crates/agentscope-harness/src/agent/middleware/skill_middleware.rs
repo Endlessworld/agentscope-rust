@@ -289,3 +289,43 @@ impl Middleware for SkillCuratorMiddleware {
         Box::pin(futures::stream::once(fut).flatten())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::skill::repository::FileSystemSkillRepository;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("asr_mw_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_skill(dir: &std::path::Path, name: &str, body: &str) {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("SKILL.md"), body).unwrap();
+    }
+
+    /// 回归：load_index 必须把每个技能解析到磁盘目录（load_skill_through_path 的索引源）。
+    /// 此前 FileSystemSkillRepository 未转发 skill_dir，导致索引为空、工具报 Unknown skillId。
+    #[test]
+    fn load_index_resolves_dirs_from_repos() {
+        let root = temp_dir("index");
+        write_skill(&root, "data", "# Data skill\n");
+        let repo: Arc<dyn SkillRepository> =
+            Arc::new(FileSystemSkillRepository::new(&root, "user"));
+        let mw = HarnessSkillMiddleware::new(
+            vec![repo],
+            SkillFilter::all(),
+            None,
+            ShellPathPolicy::no_shell(),
+            Some(root.clone()),
+        );
+        let index = mw.load_index();
+        assert_eq!(index.len(), 1);
+        let dir = index.get("data_user").expect("skill_dir must be indexed");
+        assert!(dir.join("SKILL.md").is_file());
+    }
+}

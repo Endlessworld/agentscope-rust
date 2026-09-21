@@ -265,6 +265,9 @@ impl SkillRepository for FileSystemSkillRepository {
     fn load(&self) -> Vec<AgentSkill> {
         self.inner.load()
     }
+    fn skill_dir(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.inner.skill_dir(name)
+    }
     fn write_skill(&self, skill: &AgentSkill) -> std::io::Result<()> {
         self.inner.write_skill(skill)
     }
@@ -328,6 +331,9 @@ impl SkillRepository for WorkspaceSkillRepository {
     }
     fn load(&self) -> Vec<AgentSkill> {
         self.inner.load()
+    }
+    fn skill_dir(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.inner.skill_dir(name)
     }
     fn write_skill(&self, skill: &AgentSkill) -> std::io::Result<()> {
         self.inner.write_skill(skill)
@@ -403,6 +409,24 @@ mod tests {
         assert_eq!(skills.len(), 2);
         assert!(skills.iter().all(|s| s.source() == "market"));
         assert!(skills.iter().any(|s| s.name() == "alpha" && s.description().starts_with("Alpha")));
+    }
+
+    #[test]
+    fn file_repo_skill_dir_resolves_subdir() {
+        let root = temp_dir("filedir");
+        write_skill(&root, "alpha", "# Alpha skill\n");
+        let repo = FileSystemSkillRepository::new(&root, "user");
+        assert_eq!(repo.skill_dir("alpha"), Some(root.join("alpha")));
+        // 目录解析不分存在性：load_index 依赖它映射到磁盘路径，由加载工具负责校验。
+        assert_eq!(repo.skill_dir("missing"), Some(root.join("missing")));
+    }
+
+    #[test]
+    fn workspace_repo_skill_dir_resolves_subdir() {
+        let root = temp_dir("wsdir");
+        write_skill(&root, "beta", "# Beta skill\n");
+        let repo = WorkspaceSkillRepository::new_read_only(&root);
+        assert_eq!(repo.skill_dir("beta"), Some(root.join("beta")));
     }
 
     #[test]
