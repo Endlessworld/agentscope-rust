@@ -18,15 +18,15 @@ use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
-    ChatCompletionToolChoiceOption, CompletionUsage, CreateChatCompletionRequest, FinishReason,
-    FunctionCall, FunctionCallStream, FunctionName, FunctionObject, ReasoningEffort,
-    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
+    ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
+    CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionCallStream, FunctionName,
+    FunctionObject, ReasoningEffort, ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
     ToolChoiceOptions,
 };
 use async_openai::Client;
@@ -34,27 +34,69 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::error::{Error, Result};
-use crate::message::{ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock};
+use crate::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
+use crate::message::{
+    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock,
+};
 use crate::model::context_windows::resolve_context_window;
 use crate::model::generate_options::GenerateOptions;
 use crate::model::model::{Model, ModelCapabilities};
 use crate::model::provider::{
-    DEFAULT_PROVIDER_ID, ModelCreationContext, ModelProvider, ModelRegistry,
+    ModelCreationContext, ModelProvider, ModelRegistry, DEFAULT_PROVIDER_ID,
 };
 use crate::model::tool_choice::ToolChoice;
 use crate::model::tool_schema::ToolSchema;
-use crate::formatter::{
-    convert_tool_result_to_string, extract_text_content, ResponseFormat,
-};
+
+/// Connection-establishment timeout for the underlying HTTP client.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Idle timeout for streaming responses: if no bytes arrive for this long the
+/// connection is treated as dead (e.g. the Wi-Fi dropped) so the call errors
+/// out and is retried instead of hanging the agent forever.
+const STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// TCP keepalive probe interval, so half-open connections are detected.
+const TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Builds the HTTP client used for all chat completions.
+///
+/// A stalled network (or a dropped Wi-Fi link) otherwise leaves the SSE stream
+/// pending indefinitely, which freezes the agent and its ACP UI. The connect /
+/// read timeouts turn such a stall into a retryable transport error.
+fn build_http_client() -> reqwest13::Client {
+    reqwest13::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(STREAM_READ_TIMEOUT)
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .build()
+        .unwrap_or_else(|_| reqwest13::Client::new())
+}
 
 /// An OpenAI-compatible chat model backed by `async-openai`.
 pub struct OpenAiChatModel {
     client: Client<OpenAIConfig>,
     model_name: String,
     capabilities: ModelCapabilities,
+    /// Whether historical assistant `ThinkingBlock`s must be replayed as the
+    /// `reasoning_content` request field. DeepSeek requires this whenever the
+    /// request carries tools, or the API returns HTTP 400.
+    reasoning_passback: bool,
 }
 
 impl OpenAiChatModel {
+    /// Whether the given model id requires `reasoning_content` passback.
+    ///
+    /// DeepSeek (and its OpenAI-compatible endpoints) hard-require the field to
+    /// be echoed back on historical turns when tools are in play. Other
+    /// providers ignore it, so this is only enabled for DeepSeek by default.
+    pub fn requires_reasoning_passback(model_name: &str) -> bool {
+        model_name.to_ascii_lowercase().contains("deepseek")
+    }
+
+    /// Overrides the automatic `reasoning_content` passback detection.
+    pub fn with_reasoning_passback(mut self, enabled: bool) -> Self {
+        self.reasoning_passback = enabled;
+        self
+    }
+
     /// Creates a model from an explicit model id, api key and base URL.
     pub fn new(
         model_name: impl Into<String>,
@@ -69,11 +111,12 @@ impl OpenAiChatModel {
         if let Some(base) = base_url {
             cfg = cfg.with_api_base(base);
         }
-        let client = Client::with_config(cfg);
+        let client = Client::with_config(cfg).with_http_client(build_http_client());
         let context = resolve_context_window(&model_name);
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
+            reasoning_passback: Self::requires_reasoning_passback(&model_name),
             model_name,
         })
     }
@@ -100,15 +143,16 @@ impl OpenAiChatModel {
         for (k, v) in &ctx.options.additional_headers {
             let name = reqwest::header::HeaderName::from_str(k)
                 .map_err(|e| Error::Model(format!("invalid header name '{k}': {e}")))?;
-            cfg = cfg.with_header(name.clone(), v.as_str()).map_err(|e| {
-                Error::Model(format!("failed to set header '{k}': {e}"))
-            })?;
+            cfg = cfg
+                .with_header(name.clone(), v.as_str())
+                .map_err(|e| Error::Model(format!("failed to set header '{k}': {e}")))?;
         }
-        let client = Client::with_config(cfg);
+        let client = Client::with_config(cfg).with_http_client(build_http_client());
         let context = resolve_context_window(&model_name);
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
+            reasoning_passback: Self::requires_reasoning_passback(&model_name),
             model_name,
         })
     }
@@ -137,10 +181,16 @@ impl Model for OpenAiChatModel {
         // typed request is serialized to a JSON object and the extra params
         // are merged in before the BYOT call.
         let extra_body = options.additional_body_params.clone();
-        let request = build_request(model_name, messages, tools, options);
+        let (request, reasoning) = build_request(
+            model_name,
+            messages,
+            tools,
+            options,
+            self.reasoning_passback,
+        );
         // Serialize eagerly; on failure fall back to the typed request so the
         // call still proceeds (this can only fail on non-string map keys).
-        let body: serde_json::Value = match serde_json::to_value(&request) {
+        let mut body: serde_json::Value = match serde_json::to_value(&request) {
             Ok(mut v) => {
                 if !extra_body.is_empty() {
                     if let Some(obj) = v.as_object_mut() {
@@ -153,6 +203,13 @@ impl Model for OpenAiChatModel {
             }
             Err(_) => serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
         };
+        // `async-openai` cannot model DeepSeek's `reasoning_content` field, so it
+        // is injected into the serialized assistant messages here. The typed
+        // conversion is not 1:1 (a tool message may fan out to N wire messages),
+        // hence the parallel `reasoning` vector recorded at build time.
+        if self.reasoning_passback {
+            inject_reasoning_content(&mut body, &reasoning);
+        }
 
         // create_stream_byot lets us deserialize each SSE chunk into a custom
         // type that also captures `reasoning_content`, so thinking deltas can be
@@ -252,6 +309,11 @@ fn map_openai_error(e: OpenAIError) -> Error {
             status: a.status_code.as_u16(),
             message: a.api_error.message,
         },
+        // Transport failures (connection reset, a dropped Wi-Fi link, a read
+        // timeout) must be retryable so the model call is re-established once
+        // the network returns instead of hanging or failing the whole turn.
+        OpenAIError::Reqwest(e) => Error::Http(e.to_string()),
+        OpenAIError::StreamError(e) => Error::Http(format!("stream error: {e}")),
         other => Error::Model(format!("{other}")),
     }
 }
@@ -262,13 +324,18 @@ fn build_request(
     messages: Vec<Msg>,
     tools: Vec<ToolSchema>,
     options: GenerateOptions,
-) -> CreateChatCompletionRequest {
+    reasoning_passback: bool,
+) -> (CreateChatCompletionRequest, Vec<Option<String>>) {
     let request_tools = to_request_tools(tools);
     let has_tools = request_tools.is_some();
 
+    let RequestMessages {
+        messages: request_messages,
+        reasoning,
+    } = to_request_messages(messages, reasoning_passback);
     let mut req = CreateChatCompletionRequest {
         model,
-        messages: to_request_messages(messages),
+        messages: request_messages,
         stream: Some(true),
         stream_options: Some(ChatCompletionStreamOptions {
             include_usage: Some(true),
@@ -312,11 +379,21 @@ fn build_request(
     if let Some(rf) = &options.response_format {
         req.response_format = to_response_format(rf);
     }
-    req
+    (req, reasoning)
 }
 
-fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> {
+/// The result of converting core [`Msg`]s into OpenAI wire messages.
+struct RequestMessages {
+    /// The typed messages sent to the provider.
+    messages: Vec<ChatCompletionRequestMessage>,
+    /// Parallel to `messages`: the `reasoning_content` to replay for each wire
+    /// message (only populated for assistant turns when passback is enabled).
+    reasoning: Vec<Option<String>>,
+}
+
+fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestMessages {
     let mut out = Vec::new();
+    let mut reasoning = Vec::new();
     for msg in messages {
         match msg.role {
             MsgRole::System => {
@@ -328,12 +405,17 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
                         name: None,
                     },
                 ));
+                reasoning.push(None);
             }
             MsgRole::User => {
-                out.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(extract_text_content(&msg)),
-                    name: None,
-                }));
+                out.push(ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(
+                            extract_text_content(&msg),
+                        ),
+                        name: None,
+                    },
+                ));
             }
             MsgRole::Assistant => {
                 let text = extract_text_content(&msg);
@@ -350,11 +432,12 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
                         },
                     ));
                 }
-                let content = if text.is_empty() {
-                    None
-                } else {
-                    Some(ChatCompletionRequestAssistantMessageContent::Text(text))
-                };
+                // Reasoning models (Qwen3, etc.) may yield assistant messages with only
+                // thinking blocks (or whose tool_calls were pruned), leaving no text and no
+                // tool_calls. Strict OpenAI-compatible APIs reject such a message with
+                // "content or tool_calls must be set". Always send `content`, using "" as the
+                // fallback �?mirrors Java OpenAIMessageConverter.convertAssistantMessage.
+                let content = Some(ChatCompletionRequestAssistantMessageContent::Text(text));
                 out.push(ChatCompletionRequestMessage::Assistant(
                     ChatCompletionRequestAssistantMessage {
                         content,
@@ -366,6 +449,9 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
                         ..Default::default()
                     },
                 ));
+                // DeepSeek requires the assistant turn's reasoning to be echoed
+                // back as `reasoning_content`; other providers ignore it.
+                reasoning.push(reasoning_text(&msg).filter(|_| reasoning_passback));
             }
             MsgRole::Tool => {
                 for tr in msg.tool_result_blocks() {
@@ -377,12 +463,55 @@ fn to_request_messages(messages: Vec<Msg>) -> Vec<ChatCompletionRequestMessage> 
                                 tool_call_id: id.clone(),
                             },
                         ));
+                        reasoning.push(None);
                     }
                 }
             }
         }
     }
-    out
+    RequestMessages {
+        messages: out,
+        reasoning,
+    }
+}
+
+/// Concatenates the thinking blocks of a message into the provider's
+/// `reasoning_content` string, or `None` when the message has no thinking.
+fn reasoning_text(msg: &Msg) -> Option<String> {
+    let text = msg
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking(t) => Some(t.thinking.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Injects the per-message `reasoning_content` into the serialized request body
+/// (`body["messages"][i]["reasoning_content"] = ...`), leaving messages without
+/// reasoning untouched.
+fn inject_reasoning_content(body: &mut serde_json::Value, reasoning: &[Option<String>]) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for (i, entry) in reasoning.iter().enumerate() {
+        let Some(text) = entry.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(object) = messages.get_mut(i).and_then(|m| m.as_object_mut()) {
+            object.insert(
+                "reasoning_content".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
+        }
+    }
 }
 
 fn to_request_tools(tools: Vec<ToolSchema>) -> Option<Vec<ChatCompletionTools>> {
@@ -418,11 +547,15 @@ fn to_request_tools(tools: Vec<ToolSchema>) -> Option<Vec<ChatCompletionTools>> 
 
 fn to_tool_choice(tc: &ToolChoice) -> Option<ChatCompletionToolChoiceOption> {
     match tc {
-        ToolChoice::Auto => Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)),
-        ToolChoice::None => Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None)),
-        ToolChoice::Required => {
-            Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required))
-        }
+        ToolChoice::Auto => Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        )),
+        ToolChoice::None => Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::None,
+        )),
+        ToolChoice::Required => Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Required,
+        )),
         ToolChoice::Specific { tool_name } => Some(ChatCompletionToolChoiceOption::Function(
             ChatCompletionNamedToolChoice {
                 function: FunctionName {
@@ -559,7 +692,9 @@ impl StreamIncrementer {
                 }
             }
             if let Some(reasoning) = delta.reasoning_text() {
-                blocks.push(ContentBlock::Thinking(ThinkingBlock::new(reasoning.to_string())));
+                blocks.push(ContentBlock::Thinking(ThinkingBlock::new(
+                    reasoning.to_string(),
+                )));
             }
             if let Some(refusal) = &delta.refusal {
                 if !refusal.is_empty() {
@@ -667,7 +802,7 @@ mod tests {
 
     #[test]
     fn user_message_converts_to_user_role() {
-        let msgs = to_request_messages(vec![sample_msg()]);
+        let msgs = to_request_messages(vec![sample_msg()], false).messages;
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
             ChatCompletionRequestMessage::User(u) => {
@@ -687,10 +822,12 @@ mod tests {
         let msg = Msg::builder()
             .role(MsgRole::Assistant)
             .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
-                "call_1", "get_weather", input,
+                "call_1",
+                "get_weather",
+                input,
             ))])
             .build();
-        let msgs = to_request_messages(vec![msg]);
+        let msgs = to_request_messages(vec![msg], false).messages;
         match &msgs[0] {
             ChatCompletionRequestMessage::Assistant(a) => {
                 let calls = a.tool_calls.as_ref().unwrap();
@@ -701,15 +838,128 @@ mod tests {
     }
 
     #[test]
+    fn assistant_without_text_or_tool_calls_still_has_content() {
+        // Only a thinking block: extract_text_content yields "", so tool_calls is None.
+        let msg = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(ThinkingBlock::new("hmm"))])
+            .build();
+        let msgs = to_request_messages(vec![msg], false).messages;
+        let json = serde_json::to_value(&msgs[0]).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"], "");
+        assert!(json.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn assistant_with_only_tool_calls_still_has_content() {
+        let input: JsonMap = serde_json::from_str(r#"{"city":"Beijing"}"#).unwrap();
+        let msg = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                "call_1",
+                "get_weather",
+                input,
+            ))])
+            .build();
+        let msgs = to_request_messages(vec![msg], false).messages;
+        let json = serde_json::to_value(&msgs[0]).unwrap();
+        assert_eq!(json["content"], "");
+        assert_eq!(json["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reasoning_passback_replays_thinking_as_reasoning_content() {
+        let msg = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("step 1")),
+                ContentBlock::Text(TextBlock::new("answer")),
+            ])
+            .build();
+        let RequestMessages {
+            messages,
+            reasoning,
+        } = to_request_messages(vec![msg], true);
+        let mut body = serde_json::json!({ "messages": messages });
+        inject_reasoning_content(&mut body, &reasoning);
+        assert_eq!(body["messages"][0]["reasoning_content"], "step 1");
+        assert_eq!(body["messages"][0]["content"], "answer");
+    }
+
+    #[test]
+    fn reasoning_passback_disabled_omits_field() {
+        let msg = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("step 1")),
+                ContentBlock::Text(TextBlock::new("answer")),
+            ])
+            .build();
+        let RequestMessages {
+            messages,
+            reasoning,
+        } = to_request_messages(vec![msg], false);
+        let mut body = serde_json::json!({ "messages": messages });
+        inject_reasoning_content(&mut body, &reasoning);
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_passback_stays_aligned_when_tool_message_fans_out() {
+        let assistant = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(ThinkingBlock::new("why"))])
+            .build();
+        let tool = Msg::builder()
+            .role(MsgRole::Tool)
+            .content(vec![
+                ContentBlock::ToolResult(ToolResultBlock::new(
+                    "call_1",
+                    "get_weather",
+                    vec![ContentBlock::Text(TextBlock::new("a"))],
+                )),
+                ContentBlock::ToolResult(ToolResultBlock::new(
+                    "call_2",
+                    "get_weather",
+                    vec![ContentBlock::Text(TextBlock::new("b"))],
+                )),
+            ])
+            .build();
+        let RequestMessages {
+            messages,
+            reasoning,
+        } = to_request_messages(vec![assistant, tool], true);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(reasoning.len(), 3);
+        assert_eq!(reasoning[0].as_deref(), Some("why"));
+        assert!(reasoning[1].is_none());
+        assert!(reasoning[2].is_none());
+    }
+
+    #[test]
+    fn deepseek_models_require_reasoning_passback() {
+        assert!(OpenAiChatModel::requires_reasoning_passback(
+            "opencode-go/deepseek-v4.1-flash"
+        ));
+        assert!(OpenAiChatModel::requires_reasoning_passback(
+            "DeepSeek-Chat"
+        ));
+        assert!(!OpenAiChatModel::requires_reasoning_passback("gpt-4o"));
+    }
+
+    #[test]
     fn tool_message_uses_result_id() {
-        let tr = ToolResultBlock::new("call_9", "get_weather", vec![ContentBlock::Text(
-            TextBlock::new("sunny"),
-        )]);
+        let tr = ToolResultBlock::new(
+            "call_9",
+            "get_weather",
+            vec![ContentBlock::Text(TextBlock::new("sunny"))],
+        );
         let msg = Msg::builder()
             .role(MsgRole::Tool)
             .content(vec![ContentBlock::ToolResult(tr)])
             .build();
-        let msgs = to_request_messages(vec![msg]);
+        let msgs = to_request_messages(vec![msg], false).messages;
         match &msgs[0] {
             ChatCompletionRequestMessage::Tool(t) => assert_eq!(t.tool_call_id, "call_9"),
             _ => panic!("expected tool message"),
@@ -851,7 +1101,10 @@ mod tests {
         };
         assert_eq!(tool.id, "call_1");
         assert_eq!(tool.name, "get_weather");
-        assert_eq!(tool.input.get("city").and_then(|v| v.as_str()), Some("Beijing"));
+        assert_eq!(
+            tool.input.get("city").and_then(|v| v.as_str()),
+            Some("Beijing")
+        );
         assert_eq!(final_resp.finish_reason.as_deref(), Some("tool_calls"));
     }
 }

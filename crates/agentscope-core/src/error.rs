@@ -58,7 +58,10 @@ pub enum Error {
 impl Error {
     /// Creates an HTTP error with the given status code.
     pub fn http_status(status: u16, message: impl Into<String>) -> Self {
-        Error::HttpStatus { status, message: message.into() }
+        Error::HttpStatus {
+            status,
+            message: message.into(),
+        }
     }
 
     /// Creates a tool-suspension error signalling external execution.
@@ -67,9 +70,14 @@ impl Error {
     }
 
     /// Whether this error is retryable (429 or 5xx, or IO/network errors).
+    ///
+    /// Transport-level failures ([`Error::Http`], e.g. a dropped Wi-Fi
+    /// connection or a read timeout) are always retryable so the model call is
+    /// re-established once the network returns.
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+            Error::Http(_) => true,
             Error::Io(_) => true,
             _ => false,
         }

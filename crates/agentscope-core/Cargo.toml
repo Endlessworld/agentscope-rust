@@ -17,6 +17,10 @@ futures.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
+# `async-openai` 0.41 depends on reqwest 0.13 while the rest of the workspace
+# pins 0.12; aliased so the custom (timeout-configured) HTTP client built here
+# matches the version `Client::with_http_client` expects.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 schemars.workspace = true
 serde_yaml.workspace = true
 base64.workspace = true
