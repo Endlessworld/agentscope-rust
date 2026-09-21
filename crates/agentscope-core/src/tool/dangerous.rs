@@ -36,17 +36,12 @@ pub const DEFAULT_DANGEROUS_FILES: &[&str] = &[
 pub const DEFAULT_DANGEROUS_DIRECTORIES: &[&str] = &[".git", ".vscode", ".idea", ".ssh"];
 
 /// Shell command fragments that always require explicit user approval.
-pub const DANGEROUS_COMMANDS: &[&str] = &[
-    "rm -rf",
-    "sudo rm",
-    "dd",
-    "mkfs",
-    "fdisk",
-    "chmod 777",
-    "chmod -R 777",
-    "chown -R",
-    "> /dev/",
-];
+///
+/// 注意：本数组已置空。历史实现用 `contains` 子串匹配，导致严重误判
+/// （如 `"dd"` 命中 `git add` / `middleware`；旧 `"format"` 命中
+/// `--format`），把普通命令误当作危险命令拦截。命令安全改由工具侧
+/// 人工审批模式（request_permission）保障，此处不再做子串黑名单。
+pub const DANGEROUS_COMMANDS: &[&str] = &[];
 
 /// Normalizes path separators and a leading `./` for matching.
 fn normalize(path: &str) -> String {

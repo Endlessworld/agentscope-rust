@@ -77,9 +77,11 @@ fn dangerous_path_flags_sensitive_files_and_dirs() {
 
 #[test]
 fn dangerous_command_flags_disruptive_fragments() {
-    assert!(is_dangerous_command("rm -rf /tmp/x"));
-    assert!(is_dangerous_command("sudo rm -rf /"));
-    assert!(is_dangerous_command("dd if=/dev/zero of=/dev/sda"));
+    // DANGEROUS_COMMANDS 已置空（子串 contains 曾误判 `git add`/middleware/--format），
+    // 命令安全改由工具侧审批模式保障。空表对所有常规命令放行。
+    assert!(!is_dangerous_command("rm -rf /tmp/x"));
+    assert!(!is_dangerous_command("sudo rm -rf /"));
+    assert!(!is_dangerous_command("dd if=/dev/zero of=/dev/sda"));
     assert!(!is_dangerous_command("ls -la"));
     assert!(!is_dangerous_command("echo hello"));
 }
