@@ -9,6 +9,28 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-harness/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-harness/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-harness/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-aistio/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-channel/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-cos/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-higress/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-jdbc/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-jdbc/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-mem/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-model/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-mongodb/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-mysql/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-nacos/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-oss/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-oss/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-postgresql/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-protocol/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-rag/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-redis/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-sandbox/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-scheduler/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-skills/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-studio/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/agentscope-extensions-training/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
