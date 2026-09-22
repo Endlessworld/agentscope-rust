@@ -1,5 +1,8 @@
 //! `MemorySearchTool` — searches long-term memory files, mirroring
 //! `io.agentscope.harness.agent.tool.MemorySearchTool`.
+//!
+//! Uses case-insensitive literal substring search across every memory file visible
+//! through the configured filesystem (`MEMORY.md` and `memory/*.md`).
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,30 +11,21 @@ use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
-use crate::filesystem::Filesystem;
-use crate::tool::{int_arg, opt_str_arg};
+use crate::agent::workspace::WorkspaceManager;
 
 /// Searches the agent's long-term memory files (`MEMORY.md` + `memory/*.md`).
-#[derive(Clone)]
 pub struct MemorySearchTool {
-    fs: Arc<dyn Filesystem>,
-    memory_root: String,
+    workspace: Arc<WorkspaceManager>,
 }
 
 impl MemorySearchTool {
-    pub fn new(fs: Arc<dyn Filesystem>) -> Self {
-        Self { fs, memory_root: "memory".into() }
-    }
-
-    /// Overrides the memory root directory (relative to the filesystem root).
-    pub fn with_memory_root(mut self, root: impl Into<String>) -> Self {
-        self.memory_root = root.into();
-        self
+    pub fn new(workspace: Arc<WorkspaceManager>) -> Self {
+        Self { workspace }
     }
 
     /// Registers the tool into a toolkit.
-    pub fn register(toolkit: &agentscope_core::tool::Toolkit, fs: Arc<dyn Filesystem>) {
-        toolkit.register_tool(Arc::new(Self::new(fs)));
+    pub fn register(toolkit: &agentscope_core::tool::Toolkit, workspace: Arc<WorkspaceManager>) {
+        toolkit.register_tool(Arc::new(Self::new(workspace)));
     }
 }
 
@@ -42,7 +36,9 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory files (MEMORY.md and memory/*.md) for a literal text pattern."
+        "Search through long-term memory files (MEMORY.md and memory/*.md) for relevant \
+         information. Use before answering questions about prior work, decisions, dates, \
+         people, preferences, or todos."
     }
 
     fn is_read_only(&self) -> bool {
@@ -53,33 +49,45 @@ impl Tool for MemorySearchTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Literal text pattern to search for"},
-                "limit": {"type": "integer", "description": "Max matches to return (default 20)", "default": 20}
+                "query": {"type": "string", "description": "Keywords to search for in memory files"}
             },
             "required": ["query"]
         })
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let query = opt_str_arg(&args, "query").ok_or_else(|| {
-            agentscope_core::Error::Tool("Missing string argument: query".into())
-        })?;
-        let limit = int_arg(&args, "limit").unwrap_or(20);
-        let rt = RuntimeContext::default();
-        let glob = "*.md";
-        match self.fs.grep(&rt, &query, Some(&self.memory_root), Some(glob)).await {
-            Ok(matches) => {
-                if matches.is_empty() {
-                    return Ok(ToolResultBlock::text("No matching memories found"));
-                }
-                let shown: Vec<String> = matches
-                    .iter()
-                    .take(limit)
-                    .map(|m| format!("{}:{}:{}", m.path, m.line, m.text))
-                    .collect();
-                Ok(ToolResultBlock::text(shown.join("\n")))
+        let query = match args.get("query").and_then(|v| v.as_str()) {
+            Some(q) if !q.trim().is_empty() => q.to_string(),
+            _ => return Ok(ToolResultBlock::text("No query provided")),
+        };
+        let rc = RuntimeContext::default();
+
+        // Case-insensitive literal substring match (Java `Pattern.quote` + CASE_INSENSITIVE).
+        let needle = query.to_lowercase();
+        let mut results: Vec<String> = Vec::new();
+        let mut match_count = 0usize;
+
+        for rel in self.workspace.list_memory_file_paths(&rc).await {
+            let content = self.workspace.read_managed_workspace_file_utf8(&rc, &rel).await;
+            if content.is_empty() {
+                continue;
             }
-            Err(e) => Ok(ToolResultBlock::error(e.to_string())),
+            for (i, line) in content.split('\n').enumerate() {
+                if line.to_lowercase().contains(&needle) {
+                    results.push(format!("Source: {rel}#{}: {line}", i + 1));
+                    match_count += 1;
+                }
+            }
         }
+
+        if match_count == 0 {
+            return Ok(ToolResultBlock::text(format!(
+                "No matching memories found for: {query}"
+            )));
+        }
+        Ok(ToolResultBlock::text(format!(
+            "Found {match_count} matches:\n\n{}",
+            results.join("\n")
+        )))
     }
 }

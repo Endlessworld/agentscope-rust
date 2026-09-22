@@ -36,9 +36,13 @@ rust-mcp-transport = { version = "1.0.0", default-features = false, features = [
 # clients that do not know it simply ignore it.
 agent-client-protocol = { path = "D:/IdeaProjects/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0", features = ["unstable_tool_call_name"] }
 
-[[example]]
+[[bin]]
 name = "acp_agent_cli"
-path = "examples/acp_agent_cli.rs"
+path = "src/acp/acp_agent_cli.rs"
+
+[[bin]]
+name = "acp_harness_agent"
+path = "src/acp/acp_harness_agent.rs"
 
 [features]
 # 默认启用 SQLite 索引（原行为）；`lite` 为嵌入式最小集，
@@ -47,12 +51,3 @@ path = "examples/acp_agent_cli.rs"
 default = ["rusqlite"]
 rusqlite = ["dep:rusqlite"]
 lite = []
-
-[profile.embedded]
-inherits = "release"
-opt-level = "z"       # 或 "s"，优先优化体积
-lto = true            # 启用链接时优化，跨 crate 消除死代码
-codegen-units = 1     # 牺牲编译速度，换取更彻底的优化
-panic = "abort"       # 移除栈展开代码，显著减小体积
-strip = true          # 自动剥离所有符号信息
-debug = false     # 关键：不生成调试信息

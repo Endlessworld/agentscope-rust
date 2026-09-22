@@ -170,10 +170,25 @@
   `acp_stdio_thought_test` 失败是 **live 网络测试**（opencode 免费层返回 403 "can only be used from within OpenCode"），与本次改动无关。
 
 ## 追加（修复：models.json 每次运行被覆写）
-- 文件：`crates/agentscope-harness/examples/acp_harness_agent.rs`。
+- 文件：`../../../crates/agentscope-harness/src/acp/acp_harness_agent.rs`。
 - 修复 `ModelConfig::load_or_create()`：仅文件不存在才写默认；已存在但解析失败→不覆写、告警、本次用内置默认。
 - `try_load(path)` 改为容忍 UTF-8 BOM（`strip_prefix('\u{feff}')`）。
 - 已 `cargo build -p agentscope-harness --example acp_harness_agent` ✅；隔离 HOME 三场景实测通过。
+
+## 追加（ACP 入口转正：examples → src/acp + [[bin]]）
+- `crates/agentscope-harness/Cargo.toml`：`acp_agent_cli` / `acp_harness_agent` 由 `[[example]]` 改为 `[[bin]]`，
+  `path` 指向 `src/acp/*.rs`（两者已成为正式框架入口，`examples/` 仅剩 core/model 的 demo）。
+- 源码/文档同步：
+  - `src/acp/acp_agent_cli.rs` / `acp_harness_agent.rs` 模块级 usage 改为 `--bin`；head 命令名纠正为 `acp_harness_agent`。
+  - `src/acp/README.md`：措辞去例子化 + 命令改 `--bin`，补“源码位于 src/acp/，以 [[bin]] 目标提供”。
+  - 根 `README.md`：`--example ... --example ...` → `--bins`；`cargo run ... --example` → `--bin`；文档表路径改为 `src/acp/README.md`。
+  - `docs/MULTI_ENDPOINT_PLAN.md` / `docs/ACP_AGENT_PLAN.md` / `docs/ACP_AGENT__GAP_TRACKER.md`：
+    路径引用改 `src/acp/*`；删除已不存在的 `examples/acp_agent_demo.rs` 待办；标题“示例与测试”→“入口与测试”。
+- 测试随动：`tests/acp_stdio_thought_test.rs` 的 exe 定位由 `target/<profile>/examples/` 改为 `target/<profile>/`，
+  断言提示改 `--bin acp_harness_agent`；`tests/acp_session_resume_test.rs` 注释指向 `src/acp/acp_harness_agent.rs`。
+- 验证：`cargo build -p agentscope-harness --bins` ✅（产物 `target/debug/acp_agent_cli.exe` / `acp_harness_agent.exe`）；
+  `cargo test -p agentscope-harness --test acp_cancel_test --test acp_event_flow_test --test acp_session_resume_test`
+  3 passed ✅；`cargo build --workspace` ✅。
 
 ## 追加（宽松 JSON 解析）
 - 新增模块级 `sanitize_json()`：字符串感知剥离 `//` 行注释、`/* */` 块注释，删除 `}`/`]` 前尾随逗号。

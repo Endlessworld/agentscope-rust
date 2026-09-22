@@ -105,8 +105,7 @@ ACP Client ──stdio──> AcpCodingAgent (Agent.builder())
 - [ ] 工具调用前，若会话权限为 Ask → 发 `RequestPermissionRequest` 给客户端，等待 `RequestPermissionResponse`
 - [ ] 依据 outcome 决定批准/拒绝工具调用
 
-### Phase 6：示例与测试
-- [ ] `examples/acp_agent_demo.rs`：启动 stdio agent（脚本化 Model）
+### Phase 6：入口与测试
 - [ ] 单元测试：会话生命周期、Prompt 事件转换、配置更新
 - [ ] 集成：用 `agent-client-protocol-test` 的 mock transport 走通 initialize→new_session→prompt→close
 
@@ -115,7 +114,7 @@ ACP Client ──stdio──> AcpCodingAgent (Agent.builder())
 |---|---|
 | 单元测试 | `#[cfg(test)]` + `tokio::test`，覆盖事件转换、配置构造、会话注册表 |
 | 协议集成 | `agent-client-protocol-test` mock transport 或内存 channel 走通握手+prompt |
-| e2e | `examples/acp_agent_demo.rs` 用脚本化 Model（无需 key）跑通 stdio |
+| e2e | `tests/acp_cancel_test.rs` 用脚本化 Model（无需 key）在进程内跑通 stdio 链路；`tests/acp_stdio_thought_test.rs` 用真实模型跑通 stdio |
 | 真实 provider | 复用 `agentscope_extensions_model::OpenAiChatModel`（需 key，可选）。**2026-09-21 起** provider 实现位于 `agentscope-extensions-model`，core 仅留 trait / 注册表 / SPI |
 
 ## 6. 结论

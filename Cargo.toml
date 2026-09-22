@@ -72,12 +72,29 @@ panic = "abort"
 strip = true
 opt-level = "z"
 
+# 依赖求快、自身代码求小（体积/性能折中，通常不增体积却明显提速）。
+[profile.release.package."*"]
+opt-level = 3
+
 # 嵌入式极限优化 profile：继承 release，供 `cargo build --profile embedded` 使用。
 [profile.embedded]
 inherits = "release"
-opt-level = "z"
-lto = "fat"
+opt-level = "z"        # 已定：体积优先
+lto = true            # 启用链接时优化，跨 crate 消除死代码
 codegen-units = 1
+# panic 策略：immediate-abort 在新 nightly 需 `cargo-features = ["panic-immediate-abort"]`
+# opt-in（写 profile 或 config 都一样），而那个 key 会让 stable cargo 拒绝解析 manifest。
+# 用 rustflags 传 -Cpanic=immediate-abort 则与 cargo 自带的 -Cpanic=abort 冲突（实测：
+# "core was compiled with a panic strategy which is incompatible with immediate-abort"）。
+# 故此处保持 abort。
 panic = "abort"
 strip = "symbols"
 debug = false     # 关键：不生成调试信息
+
+# 嵌入式要的是体积：依赖也按尺寸优化（与 release 的「依赖求快」相反）。
+[profile.embedded.package."*"]
+opt-level = "z"
+
+# 构建脚本 / proc-macro 提速（只影响编译期，不影响产物）。
+[profile.embedded.build-override]
+opt-level = 3

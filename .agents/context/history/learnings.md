@@ -51,8 +51,8 @@
   再取 `reasoning`，`accumulate` 改用该方法。
 - **调试方法**：写端到端 stdio 测试（`tests/acp_stdio_thought_test.rs`）拉起真实 `acp_harness_agent` 子进程，
   用 `on_receive_notification` 收集所有通知并断言 `AgentThoughtChunk`。
-- **坑**：改完 `agentscope-core` 后必须重新 `cargo build --example acp_harness_agent`，
-  否则 example exe 仍链接旧库，测试/CLI 拉起的还是旧行为。
+- **坑**：改完 `agentscope-core` 后必须重新 `cargo build -p agentscope-harness --bin acp_harness_agent`，
+  否则二进制仍链接旧库，测试/CLI 拉起的还是旧行为。
 ## 2026-09 Windows进程树管理修复（sandbox.rs）
 - **现象**：Windows上执行shell命令（如`git --version`）时，即使超时很短，工具也报告超时。
 - **根因**：`tokio::process::Child::drop()`只杀死直接子进程（`pwsh.exe`），但其孙进程（`git.exe`、`git-credential-manager.exe`等）成为孤儿进程，持有管道句柄不释放→`wait()`永远挂起。

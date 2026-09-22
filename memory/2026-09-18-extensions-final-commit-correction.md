@@ -4,7 +4,7 @@
 
 - 该 2 处改动经用户说明系**其手动修改**，已一并提交为 **`1126549`**：`调整危险命令清单与 ACP 示例迭代上限`（2 files changed, 1 insertion(+), 3 deletions(-)）。
   - `crates/agentscope-core/src/tool/dangerous.rs`：`DANGEROUS_COMMANDS` 删除 `"format"`、`"kill -9"`。
-  - `crates/agentscope-harness/examples/acp_harness_agent.rs`：`.max_iters(50)` → `.max_iters(9999)`。
+  - `../crates/agentscope-harness/src/acp/acp_harness_agent.rs`：`.max_iters(50)` → `.max_iters(9999)`。
 - 提交后 `git status --porcelain` 为空，工作区干净。extensions 收尾波次至此完全收口。
 - 交付提交链：`b4c91ad`（20 模块迁移）→ `178867a`（收尾波次 86 files）→ `1126549`（手动调整 2 files）。
 

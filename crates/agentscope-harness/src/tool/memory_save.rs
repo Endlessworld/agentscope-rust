@@ -1,5 +1,9 @@
-//! `MemorySaveTool` — saves/updates a long-term memory file, mirroring
+//! `MemorySaveTool` — appends facts to `MEMORY.md` and today's daily ledger, mirroring
 //! `io.agentscope.harness.agent.tool.MemorySaveTool`.
+//!
+//! This is the only sanctioned entry point for the agent to write long-term memories.
+//! Writes are append-only; deduplication and size-trimming are handled by the periodic
+//! `MemoryConsolidator`.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,39 +12,22 @@ use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
-use crate::filesystem::Filesystem;
-use crate::tool::str_arg;
+use crate::agent::workspace::constants::{MEMORY_DIR, MEMORY_MD};
+use crate::agent::workspace::WorkspaceManager;
 
-/// Saves a memory file under the agent's memory root (default `memory/`).
-#[derive(Clone)]
+/// Persists memories to both `MEMORY.md` and `memory/YYYY-MM-DD.md`.
 pub struct MemorySaveTool {
-    fs: Arc<dyn Filesystem>,
-    memory_root: String,
+    workspace: Arc<WorkspaceManager>,
 }
 
 impl MemorySaveTool {
-    pub fn new(fs: Arc<dyn Filesystem>) -> Self {
-        Self { fs, memory_root: "memory".into() }
-    }
-
-    /// Overrides the memory root directory (relative to the filesystem root).
-    pub fn with_memory_root(mut self, root: impl Into<String>) -> Self {
-        self.memory_root = root.into();
-        self
-    }
-
-    fn resolve(&self, path: &str) -> String {
-        let p = path.trim_start_matches('/');
-        if p.is_empty() {
-            self.memory_root.clone()
-        } else {
-            format!("{}/{}", self.memory_root, p)
-        }
+    pub fn new(workspace: Arc<WorkspaceManager>) -> Self {
+        Self { workspace }
     }
 
     /// Registers the tool into a toolkit.
-    pub fn register(toolkit: &agentscope_core::tool::Toolkit, fs: Arc<dyn Filesystem>) {
-        toolkit.register_tool(Arc::new(Self::new(fs)));
+    pub fn register(toolkit: &agentscope_core::tool::Toolkit, workspace: Arc<WorkspaceManager>) {
+        toolkit.register_tool(Arc::new(Self::new(workspace)));
     }
 }
 
@@ -51,7 +38,10 @@ impl Tool for MemorySaveTool {
     }
 
     fn description(&self) -> &str {
-        "Save or update a long-term memory file under the agent memory directory (memory/)."
+        "Persist one or more facts to long-term memory. Use whenever the user asks you to \
+         remember something, or when you observe important preferences, decisions, or context \
+         worth keeping across conversations. Do NOT use write_file or edit_file on MEMORY.md — \
+         always use this tool instead."
     }
 
     fn is_read_only(&self) -> bool {
@@ -62,21 +52,44 @@ impl Tool for MemorySaveTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Memory file path relative to memory root (e.g. facts.md)"},
-                "content": {"type": "string", "description": "Full content to write"}
+                "content": {"type": "string", "description": "Markdown bullet list of facts to remember. Each bullet should be a concise, self-contained fact. Example:\n- User prefers dark mode\n- Project deadline is 2026-07-01"}
             },
-            "required": ["path", "content"]
+            "required": ["content"]
         })
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let path = str_arg(&args, "path")?;
-        let content = str_arg(&args, "content")?;
-        let full = self.resolve(&path);
-        let rt = RuntimeContext::default();
-        match self.fs.write(&rt, &full, &content).await {
-            Ok(()) => Ok(ToolResultBlock::text(format!("Saved memory to {full}"))),
-            Err(e) => Ok(ToolResultBlock::error(e.to_string())),
+        let content = match args.get("content").and_then(|v| v.as_str()) {
+            Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+            _ => return Ok(ToolResultBlock::text("Error: content is required")),
+        };
+        let rc = RuntimeContext::default();
+
+        let section = format!("\n{content}\n");
+        self.workspace
+            .append_utf8_workspace_relative(&rc, MEMORY_MD, &section)
+            .await;
+
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let daily_path = format!("{MEMORY_DIR}/{today}.md");
+        let daily_entry = format!(
+            "\n## Memory Save — {}\n{content}\n",
+            chrono::Utc::now().to_rfc3339()
+        );
+        self.workspace
+            .append_utf8_workspace_relative(&rc, &daily_path, &daily_entry)
+            .await;
+
+        let mut count = content
+            .lines()
+            .filter(|l| l.trim_start().starts_with('-'))
+            .count();
+        if count == 0 {
+            count = 1;
         }
+        let noun = if count == 1 { "memory" } else { "memories" };
+        Ok(ToolResultBlock::text(format!(
+            "Saved {count} {noun} to MEMORY.md"
+        )))
     }
 }

@@ -1,0 +1,27 @@
+# 极限嵌入构建专用配置。此文件不会被 cargo 自动加载，必须显式指定：
+#
+#   cargo +nightly build --profile embedded --config .cargo/config.embedded.toml
+#
+# 之所以单独成文件：内容含 nightly-only 选项（cargo 的 `-Z` 与 rustc 的 `-Z`），
+# 而 cargo 无法按 profile / toolchain 区分这些设置。若写进 .cargo/config.toml，
+# 会作用于本仓库【所有】构建（包括默认 stable 工具链下的 cargo build / cargo test）。
+
+# build-std / build-std-features 是 cargo 的 unstable 选项（不是 rustc 的），
+# 必须放这里。放进 [build] rustflags 会被原样转发给 rustc，报
+# "unknown unstable option: `build-std`"。
+[unstable]
+build-std = ["std", "panic_abort"]
+# 注意：不要再写 build-std-features = ["panic_immediate_abort"]。
+# 新版 nightly 已将其废弃，std 里的该 feature 会直接 compile_error。
+
+[build]
+rustflags = [
+    # rustc 的 unstable 选项：去掉 panic 字符串里的文件/行号
+    "-Z", "location-detail=none",
+    # 链接期死代码消除（Windows MSVC）；Linux 改用 -Wl,--gc-sections,--icf=all
+    "-C", "link-arg=/OPT:REF",
+    "-C", "link-arg=/OPT:ICF",
+    "-C", "link-arg=/DEBUG:NONE",
+    # 可选：本机指令集（不可移植，实测后再开）
+    # "-C", "target-cpu=native",
+]

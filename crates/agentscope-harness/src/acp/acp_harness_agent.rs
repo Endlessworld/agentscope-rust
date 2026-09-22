@@ -5,7 +5,7 @@
 //!
 //! Run:
 //!   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}' \
-//!     | cargo run -p agentscope-harness --example harness_agent
+//!     | cargo run -p agentscope-harness --bin acp_harness_agent
 //!
 //! A full interactive ACP client (IDE/CLI) is the intended peer.
 //!
@@ -984,7 +984,7 @@ fn init_logging() {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
+                .unwrap_or_else(|_| PathBuf::from("../../../.."))
                 .join(".agentscope")
                 .join("log")
         });

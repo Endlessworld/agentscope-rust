@@ -5,7 +5,7 @@
 //! receiving streaming responses with tool-call visibility.
 //!
 //! Usage:
-//!   cargo run -p agentscope-harness --example acp_agent_cli
+//!   cargo run -p agentscope-harness --bin acp_agent_cli
 //!   (or run the built acp_agent_cli.exe next to acp_harness_agent.exe)
 //!
 //! The agent subprocess is resolved as a sibling `acp_harness_agent.exe` next

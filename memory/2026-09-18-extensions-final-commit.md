@@ -14,7 +14,7 @@
 
 ## 未提交的工作区改动（越界，非迁移产物）
 - `crates/agentscope-core/src/tool/dangerous.rs`：`DANGEROUS_COMMANDS` 删除 `"format"`、`"kill -9"`。
-- `crates/agentscope-harness/examples/acp_harness_agent.rs`：`.max_iters(50)` → `.max_iters(9999)`。
+- `../crates/agentscope-harness/src/acp/acp_harness_agent.rs`：`.max_iters(50)` → `.max_iters(9999)`。
 - 违反「禁改 core/harness」硬约束且与迁移无关 → **未提交、未还原**，保留待汇总方裁定。
 
 ## 清理

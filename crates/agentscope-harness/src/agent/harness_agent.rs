@@ -1405,10 +1405,12 @@ impl HarnessAgentBuilder {
         }
 
         // ---- Long-term memory tools (Java registers these by default) ----
+        // Registered against the `WorkspaceManager` (not the raw filesystem) so they
+        // mirror Java's `MEMORY.md` + `memory/*.md` read/append semantics.
         if !self.disable_memory_tools {
-            MemorySearchTool::register(&toolkit, Arc::clone(&filesystem));
-            MemoryGetTool::register(&toolkit, Arc::clone(&filesystem));
-            MemorySaveTool::register(&toolkit, Arc::clone(&filesystem));
+            MemorySearchTool::register(&toolkit, Arc::clone(&workspace_manager));
+            MemoryGetTool::register(&toolkit, Arc::clone(&workspace_manager));
+            MemorySaveTool::register(&toolkit, Arc::clone(&workspace_manager));
         }
 
         // ---- Web tools (Java registers these by default) ----

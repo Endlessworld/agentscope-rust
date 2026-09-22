@@ -28,8 +28,8 @@ fn content_to_string(block: &ContentBlock) -> String {
     }
 }
 
-/// Locates the built `acp_harness_agent` executable next to this test binary's
-/// sibling examples directory (debug or release), mirroring how the CLI resolves it.
+/// Locates the built `acp_harness_agent` executable under this test binary's
+/// profile directory (debug or release), mirroring how the CLI resolves it.
 fn agent_exe() -> PathBuf {
     // Prefer ACP_AGENT_EXE if set (allows pointing at a specific build).
     if let Ok(exe) = std::env::var("ACP_AGENT_EXE") {
@@ -37,18 +37,18 @@ fn agent_exe() -> PathBuf {
             return PathBuf::from(exe);
         }
     }
-    // Fall back to the example binaries under target/{profile}/examples.
+    // Fall back to the binary built directly under target/{profile}/.
     let exe = std::env::current_exe().expect("current_exe");
     // .../target/debug/deps/acp_stdio_thought_test-<hash>.exe
     let profile_dir = exe
         .parent() // deps
         .and_then(|p| p.parent()) // profile dir
         .expect("profile dir");
-    let candidate = profile_dir.join("examples").join("acp_harness_agent.exe");
+    let candidate = profile_dir.join("acp_harness_agent.exe");
     assert!(
         candidate.exists(),
         "agent executable not found at {}; build it with \
-         `cargo build -p agentscope-harness --example acp_harness_agent`",
+         `cargo build -p agentscope-harness --bin acp_harness_agent`",
         candidate.display()
     );
     candidate

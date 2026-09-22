@@ -1,6 +1,6 @@
 //! End-to-end "restart then resume" test for the ACP CodingAgent.
 //!
-//! Mirrors the persistence wiring of `examples/acp_harness_agent.rs`: the session
+//! Mirrors the persistence wiring of `src/acp/acp_harness_agent.rs`: the session
 //! factory maps the ACP session id onto the harness agent's `session_id` and
 //! attaches a `JsonFileAgentStateStore`. A restarted process (fresh registry,
 //! fresh agent) that receives `session/load` with the same id must therefore
@@ -52,7 +52,7 @@ impl Model for RecordingModel {
 }
 
 /// Session factory carrying the same persistence wiring as the
-/// `acp_harness_agent` example. A fresh store instance per session models a
+/// `acp_harness_agent` binary. A fresh store instance per session models a
 /// restarted process.
 fn session_factory(
     state_root: PathBuf,
@@ -66,7 +66,7 @@ fn session_factory(
             }))
             .session_id(session_id)
             .state_store(Arc::new(JsonFileAgentStateStore::new(state_root.clone())))
-            // Memory hooks are disabled in the example too; keeping them out here
+            // Memory hooks are disabled in the binary too; keeping them out here
             // makes each turn exactly one reasoning call and keeps the test from
             // writing into a shared memory ledger.
             .disable_memory_hooks()

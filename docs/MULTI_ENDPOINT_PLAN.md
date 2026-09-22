@@ -227,7 +227,7 @@ harness 侧真正需要的就是这个分派函数。
 
 ### 4.2 agentscope-harness：配置解析 + 分派
 
-`examples/acp_harness_agent.rs`：
+`src/acp/acp_harness_agent.rs`：
 
 ```rust
 /// 按端点协议分组的模型列表（新格式，唯一支持格式）。
@@ -252,7 +252,7 @@ pub struct ModelsSpec {
 - **迁移**：`docs/models.json` 与用户 `~/.agentscope/models.json` 需改为新格式；
   旧数组配置会解析失败（无兼容层，已确认）。
 
-### 4.3 examples/acp_agent_cli.rs
+### 4.3 src/acp/acp_agent_cli.rs
 
 `list_models()` 目前把 `models` 当数组读（`.as_array()`），需改为遍历
 `completions/messages/responses` 三组并打印协议标签，例如 `- grok-4.6 (responses)`。
@@ -281,7 +281,7 @@ pub struct ModelsSpec {
 - 新增（落地时位于 core，2026-09-21 已迁至 `crates/agentscope-extensions-model/src/`）：`responses/mod.rs`（async-openai）、`anthropic_async/mod.rs`（async-anthropic）；同期 `openai/mod.rs` 亦随迁（接口名不变）。
 - 修改：`model/provider.rs`（+枚举/字段）、`model/mod.rs`（导出）、
   `agentscope-extensions-model/Cargo.toml`（+async-openai features、+async-anthropic 依赖；2026-09-21 前为 `agentscope-core/Cargo.toml`）、
-  `examples/acp_harness_agent.rs`、`examples/acp_agent_cli.rs`、`docs/models.json`、`README.md`。
+  `src/acp/acp_harness_agent.rs`、`src/acp/acp_agent_cli.rs`、`docs/models.json`、`README.md`。
 - 风险：
   - `async-anthropic`（reqwest 0.12）与 async-openai 0.41（reqwest 0.13）双版本共存，需编译验证。
   - Anthropic 工具调用流式 JSON 分片（`input_json_delta`）需按 index 累加解析，需重点测。

@@ -57,10 +57,10 @@
 |---|---|---|
 | RequestPermissionRequest 往返 | 待办 | 工具调用前 Ask 决策 |
 
-### 2.6 示例与测试（P1）
+### 2.6 入口与测试（P1）
 | 缺口项 | 执行状态 | 交接信息/说明 |
 |---|---|---|
-| examples/acp_agent_demo.rs（脚本化 Model） | ✅ 已完成 | 脚本化 Model + add 工具；stdio 运行验证通过 |
+| `src/acp/acp_harness_agent.rs`（stdio ACP agent，`[[bin]]` 目标） | ✅ 已完成 | HarnessAgent 全装配（文件系统/shell/compaction/plan mode/skills）+ 真实 stdio 运行验证通过 |
 | 单元测试（事件转换/配置） | ✅ 已完成 | event.rs 4 单测 + config.rs 3 单测，共 7 个通过 |
 | 协议集成（stdio 握手+prompt） | ✅ 已完成 | groovy 驱动二进制：initialize→new_session→prompt(AgentMessageChunk)→end_turn→close 全链路验证 |
 | **取消 e2e（$/cancel_request）** | ✅ 已完成 | `acp_cancel_test.rs`：进程内 `Channel::duplex` transport + never-ending 脚本化 model，client 发 prompt 后 `SentRequest::cancel()`，断言 agent 返回 `StopReason::Cancelled`（0.33s，无需真实 model） |
@@ -79,7 +79,7 @@
 3. **Phase 3**：Prompt 核心（ReAct 驱动 + 事件转换）✅
 4. **Phase 4**：配置与取消 ✅（`$/cancel_request` 已完成）
 5. **Phase 5**：权限 HITL（RequestPermissionRequest 往返，Ask 决策）— 待办
-6. **Phase 6**：示例与测试 ✅
+6. **Phase 6**：入口与测试 ✅
 
 ## 4. 执行状态约定（所有会话必须遵守）
 - 开工前：读本文件 + `git status` + 确认 `cargo build` 基线。

@@ -5,3 +5,8 @@
 # 如需恢复默认行为，删除本文件或改为 incremental = true。
 [build]
 incremental = false
+
+# 极限嵌入构建的额外 RUSTFLAGS（含 nightly `-Z`）不写在本文件——cargo 无法按
+# profile / toolchain 区分 rustflags，写在此处会连累 stable 下的 cargo build/test。
+# 它们存放在 .cargo/config.embedded.toml，需显式指定：
+#   cargo +nightly build --profile embedded --config .cargo/config.embedded.toml
