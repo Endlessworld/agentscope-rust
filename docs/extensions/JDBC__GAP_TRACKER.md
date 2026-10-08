@@ -18,15 +18,15 @@
 | Java 规模（实测） | 主代码 **3106 行**（20 个 `.java`）/ 测试 **1558 行**（11 个 `.java`；其中 10 个测试类共 **98** 个 `@Test`，1 个 `H2TestSupport` 支撑类） |
 | Rust crate | `crates/agentscope-extensions-jdbc` |
 | 迁移波次 | B |
-| 当前状态 | **部分完成**（`cargo build` exit 0；`cargo test` = **115 passed / 0 failed**，含 lib 2 + 6 个集成测试文件；离线测试覆盖已对齐 Java 98 个 `@Test` 的可离线子集，见 §3.1。**测试覆盖 P0 缺口已关闭**） |
+| 当前状态 | **部分完成**（`cargo build` exit 0；`cargo test` = **146 passed / 0 failed**，含 lib 2 + 7 个集成测试文件；**本轮关闭两项 P1 功能缺口**：MySQL/PG 原生 advisory lock + state 版本化 API。剩余为环境受限的集成测试与跨语言不兼容项，见 §3.1/§3.2） |
 
 ### 1.1 基线（开工/完工实测）
 | 项 | 开工基线 | 完工基线 |
 |---|---|---|
-| `cargo build -p agentscope-extensions-jdbc` | exit 0（9 warning） | exit 0（8 warning，均为既有 dead_code 辅助函数） |
-| `cargo test -p agentscope-extensions-jdbc` | **2 passed / 0 failed**（仅 lib）+ doc-tests 0 | **115 passed / 0 failed** + doc-tests 0 |
-| test target 数 | 1（lib） | 7（lib + `tests/` 下 6 个） |
-| `crate` 内 `tests/` 目录 | 无 | `tests/{dialect_sql,store,state,snapshot,sandbox,distributed_store}_tests.rs` |
+| `cargo build -p agentscope-extensions-jdbc` | exit 0（9 warning） | exit 0（**7 warning**，均为既有 dead_code 辅助函数） |
+| `cargo test -p agentscope-extensions-jdbc` | **2 passed / 0 failed**（仅 lib）+ doc-tests 0 | **146 passed / 0 failed** + doc-tests 0 |
+| test target 数 | 1（lib） | 8（lib + `tests/` 下 7 个） |
+| `crate` 内 `tests/` 目录 | 无 | `tests/{dialect_sql,store,state,snapshot,sandbox,native_lock,distributed_store}_tests.rs` |
 | Java 测试类 `@Test` 总数 | 98（10 测试类 + `H2TestSupport`） | 98（未变） |
 | 本模块离线可覆盖的 Java `@Test` | — | 62 条 1:1 命名对齐（见 §3.1 逐类映射） |
 
@@ -42,21 +42,21 @@
 | `jdbc.dialect.table.StoreDialect` | KV 表方言（DDL 抽象 + ANSI 默认 SQL） | `dialect::StoreDialect`（`src/dialect/store_dialect.rs`） | SQL 模板逐条对齐（insert/cas_update/select/delete/search/upsert） |
 | `jdbc.dialect.table.SessionStateDialect` | 会话状态表方言 | `dialect::SessionStateDialect`（`src/dialect/session_state_dialect.rs`） | Rust 用 `slot_id` 列编码 `user:session`；**Java 列名为 `session_id`**（见 §3.3） |
 | `jdbc.dialect.table.SnapshotDialect` | 快照表方言 | `dialect::SnapshotDialect`（`src/dialect/snapshot_dialect.rs`） | — |
-| `jdbc.dialect.vendor.MysqlDialect` | MySQL 方言（`ON DUPLICATE KEY UPDATE`、`LONGBLOB`、原生 `GET_LOCK`） | `dialect::vendor::MysqlDialect`（`src/dialect/vendor/mysql.rs`） | DDL/UPSERT 已迁移；**原生 `GET_LOCK` 未迁移**（见 §3.2） |
-| `jdbc.dialect.vendor.PostgresDialect` | PG 方言（`ON CONFLICT DO UPDATE`、`BYTEA`、`pg_try_advisory_lock`） | `dialect::vendor::PostgresDialect`（`src/dialect/vendor/postgres.rs`） | DDL/UPSERT 已迁移；**原生 advisory lock 未迁移** |
+| `jdbc.dialect.vendor.MysqlDialect` | MySQL 方言（`ON DUPLICATE KEY UPDATE`、`LONGBLOB`、原生 `GET_LOCK`） | `dialect::vendor::MysqlDialect`（`src/dialect/vendor/mysql.rs`）+ `dialect::native_lock::MysqlNativeLockStrategy` | DDL/UPSERT 已迁移；**原生 `GET_LOCK` 已迁移**（锁名为连接级会话作用域，故独立成策略类型而非挂在方言上，见 §3.2） |
+| `jdbc.dialect.vendor.PostgresDialect` | PG 方言（`ON CONFLICT DO UPDATE`、`BYTEA`、`pg_try_advisory_lock`） | `dialect::vendor::PostgresDialect`（`src/dialect/vendor/postgres.rs`）+ `dialect::native_lock::PostgresNativeLockStrategy` | DDL/UPSERT 已迁移；**原生 advisory lock 已迁移**（同上） |
 | `jdbc.dialect.vendor.SqliteDialect` | SQLite 方言 | `dialect::vendor::SqliteDialect`（`src/dialect/vendor/sqlite.rs`） | — |
 | `jdbc.dialect.vendor.H2Dialect` | H2 方言 | 无独立类型；由 `dialect::vendor::AnsiDialect` 承担（`detect_dialect` 对未知/`h2` 默认返回 Ansi） | 见 §3.4 |
 | `jdbc.dialect.package-info` / `dialect.table.package-info` / `dialect.vendor.package-info` | 包文档（无逻辑） | 无 | — |
 | `META-INF/services/io.agentscope.extensions.jdbc.dialect.AbstractJdbcDialect` | JDK SPI 方言注册表 | 无 | Rust 无 SPI 自动注册（见 §3.3） |
 | `jdbc.store.JdbcStore` | JDBC `BaseStore`（零内联 SQL） | `store::JdbcStore`（`src/store/jdbc_store.rs`，`impl agentscope_harness::filesystem::BaseStore`）+ `store::store_value` | `get`/`put`/`put_if_version`/`search`/`delete` 逐一对齐；CAS：`expected==0`→`store_insert`（唯一键冲突=失败），`>0`→`store_cas_update` 影响行数==1 |
 | `jdbc.store.JdbcStore.Builder` | 组件构建器 | `JdbcStore::new`/`with_schema`（无独立 Builder 类型） | Java 可注入 `dialect`/`ObjectMapper`/`initializeSchema`；Rust 固定 serde_json |
-| `jdbc.state.JdbcAgentStateStore` | JDBC `AgentStateStore`（单值 + 增量列表 + `:_hash`） | `state::JdbcAgentStateStore`（`src/state/jdbc_agent_state_store.rs`，`impl agentscope_core::state::AgentStateStore`） | 覆盖 `save`/`save_list`/`get`/`get_list`/`exists`/`delete`/`list_session_ids`；列表哈希复用 `agentscope_core::state::list_hash`；**版本化 API 未公开**（见 §3.2） |
+| `jdbc.state.JdbcAgentStateStore` | JDBC `AgentStateStore`（单值 + 增量列表 + `:_hash`） | `state::JdbcAgentStateStore`（`src/state/jdbc_agent_state_store.rs`，`impl agentscope_core::state::AgentStateStore`） | 覆盖 `save`/`save_list`/`get`/`get_list`/`exists`/`delete`/`list_session_ids`；列表哈希复用 `agentscope_core::state::list_hash`；**版本化 API 已以固有方法公开**（`save_if_version`/`get_versioned`/`read_version`/`supports_versioning` + `VersionedState`/`UNVERSIONED`，见 §3.2） |
 | `jdbc.snapshot.JdbcRemoteSnapshotClient` | BLOB 上传/下载/存在性 | `snapshot::JdbcRemoteSnapshotClient`（`src/snapshot/jdbc_remote_snapshot_client.rs`，`impl RemoteSnapshotClient`） | 表默认 `agentscope_snapshots`；`upload` 用方言 `snapshot_upsert` |
 | `jdbc.snapshot.JdbcSnapshotSpec` | 快照 spec 便捷类（extends `RemoteSnapshotSpec`） | `snapshot::JdbcSnapshotSpec`（`src/snapshot/jdbc_snapshot_spec.rs`，newtype 包装 harness `RemoteSnapshotSpec`，`impl SandboxSnapshotSpec`） | 快照 id 校验沿用 harness |
 | `jdbc.sandbox.JdbcSandboxExecutionGuard` | JDBC `SandboxExecutionGuard`，委托方言锁策略 | `sandbox::JdbcSandboxExecutionGuard`（`src/sandbox/jdbc_guard.rs`） | harness guard 为 **struct 非 trait**，故为固有方法 `try_enter`/`release`/`is_held`（见 §3.4） |
 | `jdbc.sandbox.JdbcSandboxExecutionGuard.Builder` + 内部 lease | 构建器与租约 | `JdbcSandboxExecutionGuard::{new,table_lock,with_key_prefix,with_timeout_seconds}` + `sandbox::TableLockStrategy` + `dialect::LockLease` | 常量对齐：`DEFAULT_KEY_PREFIX="agentscope:sandbox:lock:"`、`DEFAULT_LOCK_TIMEOUT_SECONDS=1800` |
 | `javax.sql.DataSource` / JDBC（组件入参） | 连接与 SQL 执行 | **Rust 独有**：`backend::JdbcExecutor` trait + `backend::RusqliteExecutor`（`src/backend/{mod,sqlite}.rs`）+ `ColumnValue`/`JdbcError`/`SharedExecutor`/`is_unique_violation` | Java 无对应类；Rust 以 executor seam 替代 DataSource（见 §2.1） |
-| （测试支撑）`H2TestSupport` + 10 个 `*Test`（H2/SQLite/Testcontainers） | 离线/集成测试 | `RusqliteExecutor::in_memory()`（测试后端） | Rust 侧已建 6 个 `tests/*.rs` 离线用例（115 passed），详见 §3.1 逐类映射 |
+| （测试支撑）`H2TestSupport` + 10 个 `*Test`（H2/SQLite/Testcontainers） | 离线/集成测试 | `RusqliteExecutor::in_memory()`（测试后端） | Rust 侧已建 7 个 `tests/*.rs` 离线用例（146 passed），详见 §3.1 逐类映射 |
 
 ### 2.1 依赖映射（Java → Rust）
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
@@ -89,22 +89,22 @@
 | 3 个 table 域方言 trait | `dialect/table/*.java` | 已完成 | `StoreDialect`/`SessionStateDialect`/`SnapshotDialect` |
 | 聚合方言 trait + 表名解析 + 标识符校验 + 锁表 DDL | `dialect/AbstractJdbcDialect.java` | 已完成 | `AbstractJdbcDialect`（trait）、`validate_identifier`、`DEFAULT_TABLE_PREFIX="agentscope_"` |
 | 方言检测 + 链式 builder | `dialect/AbstractJdbcDialectBuilder.java` | 已完成 | `detect_dialect` 用产品名子串匹配（替代 SPI）；**本轮补齐**：新增 `TableNameConfig`/`TableNameConfigurable`（`AbstractJdbcDialect` 超级 trait），`JdbcDialectBuilder.build()` 现将 prefix/三张表 override 应用到方言实例（与 Java `Builder.build()` 同语义），新增 4 条用例覆盖 `custom_prefix`/`per_table_override`/`snapshot_override` |
-| 4 个厂商方言（MySQL/PG/SQLite/H2） | `dialect/vendor/*.java` | 已完成（DDL/UPSERT 层面） | MySQL/PG/SQLite 的 DDL/UPSERT/check-exists 已逐条对齐 Java（含 `ENGINE=InnoDB`/`utf8mb4`、`VARCHAR(2048)`/`CLOB`、`created_at` 列、独立 `CREATE INDEX IF NOT EXISTS`）；**H2 合并进 `AnsiDialect`**；**MySQL/PG 原生锁仍未迁移**（§3.2，仅 `supports_native_locks()` 报告能力） |
+| 4 个厂商方言（MySQL/PG/SQLite/H2） | `dialect/vendor/*.java` | 已完成（DDL/UPSERT 层面） | MySQL/PG/SQLite 的 DDL/UPSERT/check-exists 已逐条对齐 Java（含 `ENGINE=InnoDB`/`utf8mb4`、`VARCHAR(2048)`/`CLOB`、`created_at` 列、独立 `CREATE INDEX IF NOT EXISTS`）；**H2 合并进 `AnsiDialect`**；**MySQL/PG 原生锁已迁移**（`dialect/native_lock.rs` 两个策略，未挂在方言类型上：锁为连接级会话作用域，见 §3.2） |
 | `JdbcStore`（`impl BaseStore`）+ CAS | `store/JdbcStore.java` | 已完成 | 5 个 trait 方法全实现；`put_if_version` 严格对齐 harness CAS |
-| `JdbcAgentStateStore`（`impl AgentStateStore`） | `state/JdbcAgentStateStore.java` | 部分完成 | 7 个 trait 方法全实现 + `create_table_if_not_exist`/`verify_table_exists`；**版本化 API 未公开**（§3.2） |
+| `JdbcAgentStateStore`（`impl AgentStateStore`） | `state/JdbcAgentStateStore.java` | 部分完成 | 7 个 trait 方法全实现 + `create_table_if_not_exist`/`verify_table_exists`；**版本化 API 已以固有方法公开**（§3.2） |
 | `JdbcRemoteSnapshotClient`（`impl RemoteSnapshotClient`） | `snapshot/JdbcRemoteSnapshotClient.java` | 已完成 | upload/download/exists |
 | `JdbcSnapshotSpec`（`impl SandboxSnapshotSpec`） | `snapshot/JdbcSnapshotSpec.java` | 已完成 | 包装 harness `RemoteSnapshotSpec` |
 | `JdbcSandboxExecutionGuard` + 表锁策略 | `sandbox/JdbcSandboxExecutionGuard.java` | 已完成 | 仅 `TableLockStrategy`；**本轮修正**：`insert_lock` 与原 `lock_create_table_ddl` 列不一致（DDL 建 `lock_name PK` 但 INSERT 写 `(lock_name, acquired_at)`）→ 统一为 Java 的 `(lock_name) VALUES (?)`；`release`/`is_held` 已是真实探针（`is_held` 查锁表，非恒 false） |
 | `JdbcDistributedStore` 组合者 | `JdbcDistributedStore.java` | 已完成 | 4 组件访问器 + `to_harness_store()`（仅投影半量，§4.2） |
 | 无真实 DB 的内存后端 | Java H2/SQLite | 已完成 | `RusqliteExecutor::in_memory()` |
-| **离线单元测试** | 10 个测试类，共 **98** 个 `@Test`（H2 为主 + SQLite + 2 个 Testcontainers 集成） | **已完成（离线可覆盖部分）** | 现状：`cargo test -p agentscope-extensions-jdbc` = **115 passed / 0 failed**（lib 2 + 6 个集成测试文件）。逐类映射（Rust target ← Java 类 / 用例名已写入每条测试注释）：<br>• `tests/dialect_sql_tests.rs`（**42**）← `DialectSqlTests`（21/21 全覆盖，`H2Dialect`→`AnsiDialect`）+ `AbstractJdbcDialectFromTest`（6/8：`detectsPostgres/Mysql/MariaDb/H2/Sqlite` + 不支持库降级；`throwsOnConnectionFailure`/`throwsForNullDataSource` 对应 Rust 无 `DataSource` 的连接面，见 §3.4）。<br>• `tests/store_tests.rs`（**14**）← `JdbcStoreH2Test` 10/10 全覆盖 + 4 条 CAS 三分支/命名空间编码加固。<br>• `tests/state_tests.rs`（**21**）← `JdbcAgentStateStoreH2Test` 非版本化 13/13 全覆盖（`supportsVersioning`/`getVersioned`/`saveIfVersion`/并发 CAS 6 条依赖 core 未暴露的版本化 API，见 §3.2）+ 3 条隔离/校验/`:_hash` 加固。<br>• `tests/snapshot_tests.rs`（**10**）← `JdbcRemoteSnapshotClientH2Test` 6/6 全覆盖 + `JdbcSnapshotSpec` 4 条（含 `getClient` 往返、id 校验）。<br>• `tests/sandbox_tests.rs`（**13**）← `JdbcSandboxExecutionGuardH2Test` 4/4 + `JdbcSandboxExecutionGuardSqliteTest` 2/2 + `DEFAULT_*` 常量/`with_key_prefix`/`release`/`is_held` 7 条。<br>• `tests/distributed_store_tests.rs`（**13**）← `JdbcDistributedStoreH2Test` 5/5 + 组件工厂/`to_harness_store()` 投影/共享句柄/schema 关闭 8 条。<br>未覆盖（环境受限，非缺口）：`MysqlIntegrationTest`/`PostgresIntegrationTest`（10 条，Testcontainers + Docker）；`DialectSqlTests` 中依赖真实 H2 `MERGE INTO` 执行语义的部分。补测已全部离线（`RusqliteExecutor::in_memory()` + `SqliteDialect`），无新依赖、无网络。 |
+| **离线单元测试** | 10 个测试类，共 **98** 个 `@Test`（H2 为主 + SQLite + 2 个 Testcontainers 集成） | **已完成（离线可覆盖部分）** | 现状：`cargo test -p agentscope-extensions-jdbc` = **146 passed / 0 failed**（lib 2 + 7 个集成测试文件）。逐类映射（Rust target ← Java 类 / 用例名已写入每条测试注释）：<br>• `tests/dialect_sql_tests.rs`（**42**）← `DialectSqlTests`（21/21 全覆盖，`H2Dialect`→`AnsiDialect`）+ `AbstractJdbcDialectFromTest`（6/8：`detectsPostgres/Mysql/MariaDb/H2/Sqlite` + 不支持库降级；`throwsOnConnectionFailure`/`throwsForNullDataSource` 对应 Rust 无 `DataSource` 的连接面，见 §3.4）。<br>• `tests/store_tests.rs`（**14**）← `JdbcStoreH2Test` 10/10 全覆盖 + 4 条 CAS 三分支/命名空间编码加固。<br>• `tests/state_tests.rs`（**31**）← `JdbcAgentStateStoreH2Test` 非版本化 13/13 全覆盖 + **10 条版本化用例**（`supportsVersioning`/`getVersioned`/`saveIfVersion` 三分支 + 冲突不写 + 隔离/校验）+ 8 条隔离/校验/`:_hash` 加固。版本化用例打在 `JdbcAgentStateStore` 的**固有方法**上（core trait 无版本化面，见 §3.2/§4.2）。<br>• `tests/snapshot_tests.rs`（**10**）← `JdbcRemoteSnapshotClientH2Test` 6/6 全覆盖 + `JdbcSnapshotSpec` 4 条（含 `getClient` 往返、id 校验）。<br>• `tests/sandbox_tests.rs`（**13**）← `JdbcSandboxExecutionGuardH2Test` 4/4 + `JdbcSandboxExecutionGuardSqliteTest` 2/2 + `DEFAULT_*` 常量/`with_key_prefix`/`release`/`is_held` 7 条（便携表锁路径）。<br>• `tests/native_lock_tests.rs`（**21**）← `MysqlDialect.tryEnter`/`PostgresDialect.tryEnter` 行为对齐：MySQL 锁名归一（短名/恰 64 字符/超长截断+摘要、长名互异）、PG advisory key 折叠、两策略 acquire/release/is_held/drop、超时与后端失败不 panic、guard 接线。SHA-256 期望值用独立字面量 + dev-dep 重算双向交叉验证。<br>• `tests/distributed_store_tests.rs`（**13**）← `JdbcDistributedStoreH2Test` 5/5 + 组件工厂/`to_harness_store()` 投影/共享句柄/schema 关闭 8 条。<br>未覆盖（环境受限，非缺口）：`MysqlIntegrationTest`/`PostgresIntegrationTest`（10 条，Testcontainers + Docker）；`DialectSqlTests` 中依赖真实 H2 `MERGE INTO` 执行语义的部分。补测已全部离线（`RusqliteExecutor::in_memory()` + `SqliteDialect`），无新依赖、无网络。 |
 
 ### 3.2 功能缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| MySQL 原生 `GET_LOCK`/`RELEASE_LOCK` 锁 | `dialect/vendor/MysqlDialect.java:181-238` | 待办 | Rust `MysqlDialect` 未 `impl SandboxLockStrategy`；**本轮已将 `supports_native_locks()` 覆盖为 `true`**（仅能力声明，实际策略仍为 `TableLockStrategy`），并新增断言用例；过长锁名的 SHA-256 归一仅 Java 侧有 |
-| PostgreSQL 原生 `pg_try_advisory_lock`/`pg_advisory_unlock` | `dialect/vendor/PostgresDialect.java:182-252` | 待办 | 同上（`supports_native_locks()` = `true`，无原生策略实现） |
-| state 版本化写入/读取（`saveIfVersion`/`readVersion`/`supportsVersioning`） | `state/JdbcAgentStateStore.java:203,231,252` | 待办 | Rust dialect 已定义 `session_state_insert_if_absent`/`session_state_update_if_version`，但 `JdbcAgentStateStore` 仅有私有 `read_version`，**未公开 `save_if_version`/`version_of`**；当前单值写入仅走 `session_state_upsert`（last-write-wins） |
+| MySQL 原生 `GET_LOCK`/`RELEASE_LOCK` 锁 | `dialect/vendor/MysqlDialect.java:181-238` | **已完成** | `dialect/native_lock.rs` 的 `MysqlNativeLockStrategy`。**未**在方言类型上 `impl SandboxLockStrategy`：`GET_LOCK` 是会话级锁，Java 靠每 lease 独占 Connection + `close()` 释放，而方言不持有连接（见该模块头注释）。锁名归一已移植：超 64 字符则截为 31 字符 + `:` + SHA-256 前 32 hex（防高基数碰撞，Java 注释明确弃用 32-bit `String.hashCode`）。路由缝 `NativeLockSession` + SQL 常量 `MYSQL_GET_LOCK_SQL`/`MYSQL_RELEASE_LOCK_SQL` |
+| PostgreSQL 原生 `pg_try_advisory_lock`/`pg_advisory_unlock` | `dialect/vendor/PostgresDialect.java:182-252` | **已完成** | 同 `dialect/native_lock.rs` 的 `PostgresNativeLockStrategy`；`postgres_lock_key` 折叠 SHA-256 前 8 字节（与 Java 一致，碰撞 ~2^-32）。与 Java 差异：Java 在策略内轮询至 deadline，Rust 交给 `NativeLockSession::try_acquire(timeout)`；`NATIVE_LOCK_POLL_INTERVAL=100ms` 已导出供真实适配层。后端失败 → `LockOutcome::TimedOut`（guard 降为 no-op lease，不 panic，见 §3.4） |
+| state 版本化写入/读取（`saveIfVersion`/`readVersion`/`supportsVersioning`） | `state/JdbcAgentStateStore.java:203,231,252` | **已完成** | `JdbcAgentStateStore` 新增固有方法 `supports_versioning()`/`read_version()`/`get_versioned()`/`save_if_version()` + `VersionedState`/`UNVERSIONED`（已导出）。`save_if_version` 三分支：`-1` → 无条件覆写并回读版本；`0` → `session_state_insert_if_absent`（已存在则 `UNVERSIONED`）；其余 → `session_state_update_if_version`（CAS，版本不符返回 `UNVERSIONED` 且不写入）。**注意：** core `AgentStateStore` trait 无版本化面，故这些**只能**以固有方法暴露（跨模块待裁定，见 §4.2）；两分支均为单语句，无需 Java 的 `executeInWriteTransaction` |
 | 快照上传流式绑定（避免整包入内存） | `snapshot/JdbcRemoteSnapshotClient.java`（`setBinaryStream`） | 待确认 | Rust `RemoteSnapshotClient::upload(&[u8])` 需整包驻留内存；大快照场景存在内存差异 |
 | 真实 MySQL/PostgreSQL 集成测试 | `integration/MysqlIntegrationTest.java`、`integration/PostgresIntegrationTest.java`（Testcontainers） | 待办（环境受限） | Rust 仍无 mysql/pg 驱动与 Docker 集成；本轮新增的 `tests/` 仅覆盖离线 SQLite 路径。对应 10 条 Java `@Test` 映射见 §3.1 |
 | 列表增量语义（`getListCount`/`likePrefixPattern`） | `state/JdbcAgentStateStore.java:414,481` | 已完成 | Rust `list_count`/`like_prefix_pattern` 已实现；本轮修正 `like_prefix_pattern` 使用方言 `*_like_escape_char()`（由 `'\\'` 改为与 Java 一致的 `'!'`），并新增增量追加/哈希伴生行用例 |
@@ -135,14 +135,16 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **本会话主题：补齐离线测试覆盖（原 P0 缺口）+ 修复测试暴露的实现 bug。** `cargo build -p agentscope-extensions-jdbc` 与 `cargo test -p agentscope-extensions-jdbc` 均通过。
+- **本会话主题（2026-10-08）：关闭两项 P1 功能缺口——MySQL/PG 原生 advisory lock 与 state 版本化 API——并补齐其离线测试。** `cargo build -p agentscope-extensions-jdbc` 与 `cargo test -p agentscope-extensions-jdbc` 均通过。
+- **上一会话主题（保留记录）：补齐离线测试覆盖（原 P0 缺口）+ 修复测试暴露的实现 bug。**
 - 验证命令与结果（实测）：
-  - `cargo build -p agentscope-extensions-jdbc` → `Finished dev profile`，**退出码 0**（8 warning，均为既有 dead_code 辅助函数，无 error）。
-  - `cargo test -p agentscope-extensions-jdbc` → **退出码 0**；各 target 结果：`unittests src/lib.rs` = **2 passed / 0 failed**；`tests/dialect_sql_tests.rs` = **42 / 0**；`tests/distributed_store_tests.rs` = **13 / 0**；`tests/sandbox_tests.rs` = **13 / 0**；`tests/snapshot_tests.rs` = **10 / 0**；`tests/state_tests.rs` = **21 / 0**；`tests/store_tests.rs` = **14 / 0**；doc-tests = **0**。合计 **115 passed / 0 failed**（用例数 **2 → 115**，新增 113；7 个 test target）。
+  - `cargo build -p agentscope-extensions-jdbc` → `Finished dev profile`，**退出码 0**（**crate 自身 7 warning**，均为既有 dead_code 辅助函数（`query_optional_int`/`slot_param`）+ 测试/快照等既有未用导入；无 error。较上一会话 8 → 7：原死代码 `read_version` 已接线为公开 `read_version`/`get_versioned`）。
+  - `cargo test -p agentscope-extensions-jdbc` → **退出码 0**；各 target 结果：`unittests src/lib.rs` = **2 passed / 0 failed**；`tests/dialect_sql_tests.rs` = **42 / 0**；`tests/distributed_store_tests.rs` = **13 / 0**；`tests/sandbox_tests.rs` = **13 / 0**；`tests/native_lock_tests.rs` = **21 / 0**；`tests/snapshot_tests.rs` = **10 / 0**；`tests/state_tests.rs` = **31 / 0**；`tests/store_tests.rs` = **14 / 0**；doc-tests = **0**。合计 **146 passed / 0 failed**（上一会话 115 → 本会话 146，新增 31；8 个 test target）。
 - 本会话新增 `tests/`（全部离线，`RusqliteExecutor::in_memory()` + `SqliteDialect`/`AnsiDialect`/`MysqlDialect`/`PostgresDialect`；无网络、无新依赖、无 `#[ignore]`）：
   - `crates/agentscope-extensions-jdbc/tests/dialect_sql_tests.rs`（42，← `DialectSqlTests` + `AbstractJdbcDialectFromTest`）
   - `crates/agentscope-extensions-jdbc/tests/store_tests.rs`（14，← `JdbcStoreH2Test`）
-  - `crates/agentscope-extensions-jdbc/tests/state_tests.rs`（21，← `JdbcAgentStateStoreH2Test`）
+  - `crates/agentscope-extensions-jdbc/tests/state_tests.rs`（31，← `JdbcAgentStateStoreH2Test` + 版本化固有 API）
+  - `crates/agentscope-extensions-jdbc/tests/native_lock_tests.rs`（21，← `MysqlDialect.tryEnter` / `PostgresDialect.tryEnter`）
   - `crates/agentscope-extensions-jdbc/tests/snapshot_tests.rs`（10，← `JdbcRemoteSnapshotClientH2Test` + `JdbcSnapshotSpec`）
   - `crates/agentscope-extensions-jdbc/tests/sandbox_tests.rs`（13，← `JdbcSandboxExecutionGuardH2Test` + `...SqliteTest`）
   - `crates/agentscope-extensions-jdbc/tests/distributed_store_tests.rs`（13，← `JdbcDistributedStoreH2Test`）
@@ -162,14 +164,15 @@
   3. `jdbc_agent_state_store.rs` 增量追加用错执行器（混跑 SQL 模板，新增条目丢失/哈希行错乱）。
   4. `jdbc_guard.rs` 锁表 INSERT/DDL 列不一致（锁永远插不进）。
 - 遵守约束：未改根 `Cargo.toml`、未改 core/harness 或其它 crate；未新增/变更依赖（`rusqlite` 已是 workspace 固定依赖）；未删除任何既有功能、测试或断言；未 `#[ignore]`。
-- **crate 文件清单**（实测，新增 `tests/`）：`Cargo.toml`；`src/lib.rs`；`src/distributed_store.rs`；`src/backend/{mod.rs,sqlite.rs}`；`src/dialect/{mod.rs,abstract_dialect.rs,bound_sql.rs,detection.rs,lock_strategy.rs,session_state_dialect.rs,snapshot_dialect.rs,store_dialect.rs}` + `src/dialect/vendor/{mod.rs,ansi.rs,mysql.rs,postgres.rs,sqlite.rs}`；`src/{store,state,snapshot,sandbox}/`；`tests/{dialect_sql,store,state,snapshot,sandbox,distributed_store}_tests.rs`。
+- **crate 文件清单**（实测，新增 `tests/`）：`Cargo.toml`；`src/lib.rs`；`src/distributed_store.rs`；`src/backend/{mod.rs,sqlite.rs}`；`src/dialect/{mod.rs,abstract_dialect.rs,bound_sql.rs,detection.rs,lock_strategy.rs,native_lock.rs,session_state_dialect.rs,snapshot_dialect.rs,store_dialect.rs}` + `src/dialect/vendor/{mod.rs,ansi.rs,mysql.rs,postgres.rs,sqlite.rs}`；`src/{store,state,snapshot,sandbox}/`；`tests/{dialect_sql,store,state,native_lock,snapshot,sandbox,distributed_store}_tests.rs`。
+- **本会话（2026-10-08）修改的 `src/`（仅本 crate）**：新增 `src/dialect/native_lock.rs`（`NativeLockSession` 缝 + `normalize_lock_name`/`postgres_lock_key` + `MysqlNativeLockStrategy`/`PostgresNativeLockStrategy` + `NativeLockError` + 4 个 SQL 常量 + `NATIVE_LOCK_POLL_INTERVAL`/`MYSQL_MAX_LOCK_NAME_LENGTH`）；`src/dialect/mod.rs` 接线导出；`src/dialect/lock_strategy.rs` 模块文档更新（指向新策略）；`src/state/jdbc_agent_state_store.rs` 新增 `supports_versioning`/`read_version`/`get_versioned`/`save_if_version` + `VersionedState`/`UNVERSIONED`（并将私有 `read_version` 改名为 `read_version_at` 以免与公开方法冲突）；`src/state/mod.rs`、`src/lib.rs` re-export；`Cargo.toml` 新增 `sha2 = { workspace = true }`（+ dev-dep）。
 
 ### 4.2 下一步与阻塞
-1. **测试覆盖 P0 缺口已关闭**（115 passed / 0 failed）。剩余未覆盖：`MysqlIntegrationTest`/`PostgresIntegrationTest`（10 条 Testcontainers 用例，需 Docker + mysql/pg 驱动，环境受限）；`DialectSqlTests` 中依赖真实 H2 `MERGE INTO` 执行语义的部分。二者均**不可离线**，归入下述功能缺口而非测试缺口。
-2. **功能缺口（P1，本轮未动，仅补 `supports_native_locks()` 能力声明）**：MySQL `GET_LOCK`/`RELEASE_LOCK`、PostgreSQL `pg_try_advisory_lock`/`pg_advisory_unlock` 原生锁（长锁名 SHA-256 归一仅 Java 侧有）；state 版本化 API `saveIfVersion`/`getVersioned`/`readVersion`/`supportsVersioning`（Rust dialect 已定义 `session_state_insert_if_absent`/`session_state_update_if_version`，但 core `AgentStateStore` trait 无版本化方法，**需汇总方裁定是否改 core**，本 crate 无法自行暴露）。
-3. **跨模块需求（不改 harness/core）**：(a) harness `DistributedStore` 仅含 `agent_state_store` + `isolation_scope`，本 crate 已在 `JdbcDistributedStore` 内保留全量 4 组件并通过 `to_harness_store()` 输出子集，是否扩展 harness 类型（`EXTENSIONS_GAP_TRACKER.md` §2.2）待裁定；(b) harness `SandboxExecutionGuard` 为具体 struct，本 crate 无法 `impl`（§3.4）；(c) core `AgentStateStore` 无版本化面（见上第 2 条）。
+1. **测试覆盖 P0 缺口已关闭**（146 passed / 0 failed）。剩余未覆盖：`MysqlIntegrationTest`/`PostgresIntegrationTest`（10 条 Testcontainers 用例，需 Docker + mysql/pg 驱动，环境受限）；`DialectSqlTests` 中依赖真实 H2 `MERGE INTO` 执行语义的部分。二者均**不可离线**，归入下述功能缺口而非测试缺口。
+2. **功能缺口（P1）——本轮已关闭两项**：MySQL `GET_LOCK`/`RELEASE_LOCK`、PostgreSQL `pg_try_advisory_lock`/`pg_advisory_unlock` 原生锁（含长锁名 SHA-256 归一）；state 版本化 API `saveIfVersion`/`getVersioned`/`readVersion`/`supportsVersioning`。均见 §3.2「已完成」行。**遗留（均需真实数据库/Docker，不可离线）**：`MysqlIntegrationTest`/`PostgresIntegrationTest`（10 条 Testcontainers）；真实适配层仍需实现 `NativeLockSession`（每获取一条独占连接）——本 crate 只提供缝与策略。
+3. **跨模块需求（不改 harness/core）**：(a) harness `DistributedStore` 仅含 `agent_state_store` + `isolation_scope`，本 crate 已在 `JdbcDistributedStore` 内保留全量 4 组件并通过 `to_harness_store()` 输出子集，是否扩展 harness 类型（`EXTENSIONS_GAP_TRACKER.md` §2.2）待裁定；(b) harness `SandboxExecutionGuard` 为具体 struct，本 crate 无法 `impl`（§3.4）；(c) **core `AgentStateStore` 无版本化面**：本轮已将版本化 API 以**固有方法**暴露（`supports_versioning`/`get_versioned`/`save_if_version`/`read_version` + `VersionedState`/`UNVERSIONED`），需汇总方裁定是否将 `supportsVersioning`/`getVersioned`/`saveIfVersion` + `VersionedState`/`UNVERSIONED` 提升为 core trait 方法（影响 JDBC/MYSQL/POSTGRESQL/MONGODB/REDIS 全部存储侧）。
 4. **设计决定（不迁移）已逐条标记为「已完成（设计决定，不迁移）」于 §3.4**，依据已写明（H2 由 `AnsiDialect` 承担、SPI 自动注册改产品名匹配、`objectMapper` 注入/连接所有权/`close` 随 `DataSource` 消失等）。
-5. 剩余 dead_code helper（`query_optional_int`/`delete_lock`/`read_version`/`slot_param`/`namespace_param`）在组件全线接线后应被调用；如长期不用可评估删除。
+5. 剩余 dead_code helper：`query_optional_int`/`delete_lock`/`namespace_param` 仍无生产调用方（既有项）；`slot_param` 同理。组件全线接线后应被调用；如长期不用可评估删除。
 6. **旧记录已更正（§3.3）**：会话表列名、锁表名两语言现已一致（`session_id` / `{prefix}distributed_locks`），早前「跨语言同库不兼容」结论**已失效**。
 
 ## 5. 执行约定（所有会话必须遵守）

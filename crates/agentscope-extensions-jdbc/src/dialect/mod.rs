@@ -17,6 +17,7 @@ mod abstract_dialect;
 mod bound_sql;
 mod detection;
 mod lock_strategy;
+mod native_lock;
 mod session_state_dialect;
 mod snapshot_dialect;
 mod store_dialect;
@@ -29,6 +30,12 @@ pub use abstract_dialect::{
 pub use bound_sql::{BoundSql, SqlParam};
 pub use detection::{detect_dialect, JdbcDialectBuilder};
 pub use lock_strategy::{LockLease, LockOutcome, SandboxLockStrategy};
+pub use native_lock::{
+    normalize_lock_name, postgres_lock_key, MysqlNativeLockStrategy, NativeLockError,
+    NativeLockSession, PostgresNativeLockStrategy, MYSQL_GET_LOCK_SQL, MYSQL_MAX_LOCK_NAME_LENGTH,
+    MYSQL_RELEASE_LOCK_SQL, NATIVE_LOCK_POLL_INTERVAL, PG_ADVISORY_UNLOCK_SQL,
+    PG_TRY_ADVISORY_LOCK_SQL,
+};
 pub use session_state_dialect::SessionStateDialect;
 pub use snapshot_dialect::SnapshotDialect;
 pub use store_dialect::StoreDialect;

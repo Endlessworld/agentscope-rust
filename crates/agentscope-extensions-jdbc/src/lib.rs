@@ -51,7 +51,7 @@ pub use backend::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult, RusqliteExec
 pub use distributed_store::JdbcDistributedStore;
 pub use sandbox::{JdbcSandboxExecutionGuard, JdbcSandboxLease, TableLockStrategy};
 pub use snapshot::{JdbcRemoteSnapshotClient, JdbcSnapshotSpec};
-pub use state::JdbcAgentStateStore;
+pub use state::{JdbcAgentStateStore, VersionedState, UNVERSIONED};
 pub use store::JdbcStore;
 // Re-export the reused harness/core traits for ergonomic use by callers.
 pub use agentscope_core::state::AgentStateStore;

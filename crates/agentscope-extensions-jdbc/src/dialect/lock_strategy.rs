@@ -1,10 +1,11 @@
-//! Distributed lock contract implemented by [`crate::dialect::AbstractJdbcDialect`],
-//! mirroring `SandboxLockStrategy`.
+//! Distributed lock contract, mirroring `SandboxLockStrategy`.
 //!
-//! The default implementation uses a portable table-based lock (INSERT/DELETE with
-//! polling). Vendor dialects with native advisory locks override `try_enter` — e.g.
-//! [`crate::dialect::MysqlDialect`] uses `GET_LOCK` and
-//! [`crate::dialect::PostgresDialect`] uses `pg_try_advisory_lock`.
+//! The portable implementation is [`crate::sandbox::TableLockStrategy`] (INSERT/DELETE with
+//! polling). Databases with native advisory locks are served by the strategies in
+//! [`crate::dialect::native_lock`] — [`crate::MysqlNativeLockStrategy`] (`GET_LOCK`) and
+//! [`crate::PostgresNativeLockStrategy`] (`pg_try_advisory_lock`). Those are separate types
+//! rather than dialect overrides because the lock is session-scoped and a dialect carries no
+//! connection (see the `native_lock` module docs).
 
 use std::time::Duration;
 

@@ -30,6 +30,28 @@ const SINGLE_STATE_INDEX: i64 = 0;
 /// The anonymous user namespace, mirroring core's `ANON_USER`.
 const ANON_USER: &str = "__anon__";
 
+/// Sentinel version for backends without optimistic concurrency, mirroring the Java
+/// `AgentStateStore.UNVERSIONED`. Also returned by [`JdbcAgentStateStore::save_if_version`]
+/// when a CAS write conflicts (and nothing was written).
+pub const UNVERSIONED: i64 = -1;
+
+/// A state value paired with its optimistic-concurrency version, mirroring the Java
+/// `VersionedState<T>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionedState {
+    /// The loaded state, or `None` when the key is absent.
+    pub value: Option<Value>,
+    /// The store version (`0` when the key does not yet exist on this versioning backend).
+    pub version: i64,
+}
+
+impl VersionedState {
+    /// Returns `true` when a value was present in the store.
+    pub fn is_present(&self) -> bool {
+        self.value.is_some()
+    }
+}
+
 /// JDBC-backed [`AgentStateStore`].
 pub struct JdbcAgentStateStore {
     executor: SharedExecutor,
@@ -147,7 +169,12 @@ impl JdbcAgentStateStore {
         Ok(max.map(|m| (m + 1) as usize).unwrap_or(0))
     }
 
-    fn read_version(&self, slot_id: &str, key: &str) -> JdbcResult<i64> {
+    /// Reads the stored version for a single key without deserializing `state_data`.
+    ///
+    /// Mirrors the Java `readVersion`: reading the version must never touch the payload
+    /// (the `State` marker type has no concrete counterpart to deserialize into), so only
+    /// the `version` column of the dialect's versioned projection is consumed.
+    fn read_version_at(&self, slot_id: &str, key: &str) -> JdbcResult<i64> {
         let bound = self
             .dialect
             .session_state_select(slot_id, key, SINGLE_STATE_INDEX as i32);
@@ -158,6 +185,119 @@ impl JdbcAgentStateStore {
             .and_then(|r| r.into_iter().nth(1))
             .and_then(|c| c.as_int())
             .unwrap_or(0))
+    }
+
+    /// Whether this backend supports optimistic concurrency, mirroring the Java
+    /// `supportsVersioning()`. Always `true` for JDBC.
+    ///
+    /// Core's `AgentStateStore` trait exposes no versioning surface, so the versioned API
+    /// below is reachable only as inherent methods (see §3.2 / §4.2).
+    pub fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    /// Reads the stored version for `(user_id, session_id, key)`, or `0` when absent
+    /// (mirrors the Java `readVersion`).
+    pub fn read_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> JdbcResult<i64> {
+        Self::validate_session(session_id)?;
+        Self::validate_key(key)?;
+        let slot = Self::slot_id(user_id, session_id);
+        self.read_version_at(&slot, key)
+    }
+
+    /// Loads a single state value together with its store version, mirroring the Java
+    /// `getVersioned`. An absent key reports `version == 0` on this versioning backend.
+    pub fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> JdbcResult<VersionedState> {
+        Self::validate_session(session_id)?;
+        Self::validate_key(key)?;
+        let slot = Self::slot_id(user_id, session_id);
+        let bound = self
+            .dialect
+            .session_state_select(&slot, key, SINGLE_STATE_INDEX as i32);
+        let rows = self.executor.query(&bound)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(VersionedState {
+                value: None,
+                version: 0,
+            });
+        };
+        let mut columns = row.into_iter();
+        let json = columns
+            .next()
+            .and_then(|c| c.as_text().map(str::to_string));
+        let version = columns.next().and_then(|c| c.as_int()).unwrap_or(0);
+        let value = match json {
+            Some(j) => Some(
+                serde_json::from_str(&j)
+                    .map_err(|e| JdbcError::Database(format!("deserialize state: {e}")))?,
+            ),
+            None => None,
+        };
+        Ok(VersionedState { value, version })
+    }
+
+    /// Compare-and-swap write of a single state value, mirroring the Java `saveIfVersion`.
+    ///
+    /// * `expected_version == 0` — create-if-absent (returns [`UNVERSIONED`] when the key
+    ///   already exists).
+    /// * `expected_version == `[`UNVERSIONED`] — unconditional overwrite (same as `save`).
+    /// * otherwise — writes only when the stored version equals `expected_version`.
+    ///
+    /// Returns the new version on success, or [`UNVERSIONED`] on conflict (nothing written).
+    pub fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+        expected_version: i64,
+    ) -> JdbcResult<i64> {
+        Self::validate_session(session_id)?;
+        Self::validate_key(key)?;
+        let slot = Self::slot_id(user_id, session_id);
+        let json = Self::json_of(&value)?;
+
+        if expected_version == UNVERSIONED {
+            self.save_single(&slot, key, &json)?;
+            return self.read_version_at(&slot, key);
+        }
+
+        // Both CAS branches are single statements, so each is already atomic and the Java
+        // `executeInWriteTransaction` wrapper has no counterpart here.
+        let bound = if expected_version == 0 {
+            self.dialect
+                .session_state_insert_if_absent(&slot, key, SINGLE_STATE_INDEX as i32, &json)
+        } else {
+            self.dialect.session_state_update_if_version(
+                &slot,
+                key,
+                SINGLE_STATE_INDEX as i32,
+                &json,
+                expected_version,
+            )
+        };
+        match self.executor.execute(&bound) {
+            Ok(1) => Ok(if expected_version == 0 {
+                1
+            } else {
+                expected_version + 1
+            }),
+            Ok(_) => Ok(UNVERSIONED),
+            Err(e) if expected_version == 0 && crate::backend::is_unique_violation(&e) => {
+                Ok(UNVERSIONED)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn save_single(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<()> {

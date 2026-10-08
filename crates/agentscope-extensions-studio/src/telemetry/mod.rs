@@ -8,13 +8,22 @@
 //! - Pure attribute extractors ([`extractors`]).
 //! - Streaming response aggregation ([`aggregator`]).
 //!
-//! The full OTLP exporter / [`TelemetryTracer`] span pipeline is deliberately
-//! deferred (tracker §4.2): it would require an `opentelemetry` workspace dependency,
-//! which is owned by the aggregation agent. Extracted attributes are returned as
-//! plain `(String, serde_json::Value)` pairs so the logic stays testable offline.
+//! The OTLP exporter / `TelemetryTracer` span pipeline lives in [`exporter`]: a small [`Span`]
+//! model, the [`OtlpEncoder`] and the [`TraceExporter`] seam (`OtlpHttpExporter` +
+//! recording/no-op doubles). The `opentelemetry` workspace dependency is deliberately not
+//! pulled in (tracker §4.2).
+//!
+//! [`Span`]: exporter::Span
+//! [`OtlpEncoder`]: exporter::OtlpEncoder
+//! [`TraceExporter`]: exporter::TraceExporter
+//! [`OtlpHttpExporter`]: exporter::OtlpHttpExporter
+//!
+//! Extracted attributes are returned as plain `(String, serde_json::Value)` pairs so the
+//! logic stays testable offline.
 
 pub mod agent_scope_attributes;
 pub mod aggregator;
+pub mod exporter;
 pub mod extractors;
 pub mod gen_ai_attributes;
 pub mod model;

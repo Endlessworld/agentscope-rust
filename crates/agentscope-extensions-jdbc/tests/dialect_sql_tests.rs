@@ -345,8 +345,10 @@ fn store_search_uses_dialect_escape_char_and_pagination() {
 #[test]
 fn mysql_dialect_declares_native_lock_support() {
     // Java: DialectSqlTests.mysqlDialectIsLockStrategy.
-    // Rust does not implement `SandboxLockStrategy` on the MySQL dialect (native GET_LOCK is
-    // a tracked P1 gap, §3.2), so this asserts the dialect contract it *does* expose.
+    // Rust does not implement `SandboxLockStrategy` on the MySQL dialect: the native lock is
+    // session-scoped and the dialect holds no connection, so it lives in
+    // `dialect::native_lock::MysqlNativeLockStrategy` instead. This asserts the dialect
+    // contract the dialect *does* expose.
     let d: Arc<dyn AbstractJdbcDialect> = Arc::new(MysqlDialect::new());
     assert_eq!(d.kind(), DialectKind::Mysql);
     assert!(d.supports_native_locks());

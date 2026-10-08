@@ -3,4 +3,4 @@
 
 mod jdbc_agent_state_store;
 
-pub use jdbc_agent_state_store::JdbcAgentStateStore;
+pub use jdbc_agent_state_store::{JdbcAgentStateStore, VersionedState, UNVERSIONED};

@@ -21,4 +21,13 @@ chrono = { workspace = true }
 # [workspace.dependencies]. If SQLite is later promoted to an optional feature, this line
 # moves behind a feature gate (see JDBC__GAP_TRACKER.md §4.2).
 rusqlite = { workspace = true }
+# SHA-256 for native advisory-lock name/key mapping (MySQL name normalization, PostgreSQL
+# advisory-lock key folding). `sha2` is already a workspace-pinned dependency; referenced
+# by name here, not added to the root [workspace.dependencies].
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Ground-truth SHA-256 for the native-lock key/name assertions (same pinned version as the
+# crate dependency above; a dev-dependency so integration tests can recompute digests).
+sha2 = { workspace = true }
 

@@ -85,6 +85,10 @@ pub trait FrameworkAdapter: Send + Sync {
     /// Removes the interception and restores the framework object.
     fn detach(&mut self) -> AistioResult<()>;
 
+    /// Called when the owning bridge is attached, so the adapter can obtain a reporter
+    /// handle for publishing events out-of-band. Default: no-op.
+    fn on_bridge_attached(&mut self, _reporter: crate::bridge::BridgeReporter) {}
+
     /// Level 4: the context that the session's next model call will actually see.
     async fn extract_context(&self, session_id: &str) -> AistioResult<ContextSnapshot>;
 

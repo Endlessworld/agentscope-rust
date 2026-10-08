@@ -2,8 +2,8 @@
 //! `JdbcSandboxExecutionGuardH2Test` and `JdbcSandboxExecutionGuardSqliteTest`.
 //!
 //! Backend: in-memory SQLite (`RusqliteExecutor::in_memory()`) with `SqliteDialect` — the Rust
-//! analogue of Java's H2/SQLite pair. The portable table lock is the only strategy in Rust
-//! (native MySQL/PG locks are a tracked P1 gap, §3.2).
+//! analogue of Java's H2/SQLite pair. These cases exercise the portable table lock; the
+//! native MySQL/PostgreSQL strategies are covered in `native_lock_tests.rs`.
 //!
 //! Semantics difference (see §3.4): the Java guard *throws* `InterruptedException` when the lock
 //! cannot be acquired before the timeout; the Rust guard returns a no-op lease

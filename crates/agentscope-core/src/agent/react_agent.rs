@@ -177,6 +177,16 @@ impl ReActAgent {
         &self.description
     }
 
+    /// Returns the system prompt bound to this agent.
+    pub fn sys_prompt(&self) -> &str {
+        &self.core.sys_prompt
+    }
+
+    /// Returns the maximum number of reasoning→acting iterations per call.
+    pub fn max_iters(&self) -> i32 {
+        self.core.max_iters
+    }
+
     /// Returns the model bound to this agent.
     pub fn model(&self) -> Arc<dyn Model> {
         self.core.model.lock().unwrap().clone()

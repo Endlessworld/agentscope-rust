@@ -143,10 +143,22 @@ impl StudioWebSocketClient {
         config: StudioConfig,
         transport: Arc<dyn StudioTransport>,
     ) -> Self {
+        Self::with_transport_and_registry(config, transport, Arc::new(PendingInputRegistry::new()))
+    }
+
+    /// Creates a client over a transport that resolves its own pending requests.
+    ///
+    /// Use this when the transport already owns a [`PendingInputRegistry`] it resolves incoming
+    /// `forwardUserInput` events into (e.g. `SocketIoTransport`).
+    pub fn with_transport_and_registry(
+        config: StudioConfig,
+        transport: Arc<dyn StudioTransport>,
+        registry: Arc<PendingInputRegistry>,
+    ) -> Self {
         Self {
             config,
             transport,
-            registry: Arc::new(PendingInputRegistry::new()),
+            registry,
         }
     }
 

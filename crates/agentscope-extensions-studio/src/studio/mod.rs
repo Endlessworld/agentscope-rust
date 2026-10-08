@@ -8,12 +8,17 @@ pub mod client;
 pub mod config;
 pub mod message_hook;
 pub mod pojo;
+pub mod socket_io;
 pub mod user_agent;
 pub mod websocket;
 
 pub use client::StudioClient;
 pub use config::{StudioConfig, StudioConfigBuilder};
 pub use message_hook::StudioMessageHook;
+pub use socket_io::{
+    EngineIoHandshake, ProtocolAction, SocketIoEvent, SocketIoProtocol, SocketIoTransport,
+    DEFAULT_NAMESPACE, ENGINE_IO_VERSION,
+};
 pub use user_agent::StudioUserAgent;
 pub use websocket::{
     normalize_tool_result, parse_content_blocks, parse_user_input, preprocess_tool_result_block,
@@ -90,8 +95,20 @@ impl StudioManager {
 
     /// Runs initialization directly (non-builder convenience).
     pub async fn initialize_with(config: StudioConfig) -> StudioResult<()> {
+        Self::initialize_with_transport(config, Arc::new(NoopStudioTransport)).await
+    }
+
+    /// Runs initialization with an explicit transport.
+    ///
+    /// Hosts that want the real Socket.IO connection pass a
+    /// [`SocketIoTransport`](super::socket_io::SocketIoTransport) built over a shared
+    /// [`PendingInputRegistry`]; the default is a no-op transport so tests stay offline.
+    pub async fn initialize_with_transport(
+        config: StudioConfig,
+        transport: Arc<dyn StudioTransport>,
+    ) -> StudioResult<()> {
         let client = Arc::new(StudioClient::new(config.clone()));
-        let ws_client = Arc::new(StudioWebSocketClient::disconnected(config.clone()));
+        let ws_client = Arc::new(StudioWebSocketClient::with_transport(config.clone(), transport));
 
         // Register the run and (best-effort) connect the socket.
         client.register_run().await?;

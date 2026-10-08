@@ -18,7 +18,7 @@
 | Java 规模（初测） | 主代码 ~3700 行 / 测试 ~1452 行 |
 | Rust crate | `crates/agentscope-extensions-studio` |
 | 迁移波次 | C |
-| 当前状态 | 已完成（build/test 全绿；30 个离线单测）|
+| 当前状态 | 已完成（build/test 全绿；**52 个离线单测**；Socket.IO 真实传输 + OTLP 降级导出已落地）|
 
 ## 2. Java 清单与依赖映射
 
@@ -29,7 +29,7 @@
 |---|---|---|---|
 | `studio.StudioConfig` | 连接配置（url/tracingUrl/project/runName/runId/maxRetries/reconnect*）| `studio::StudioConfig` + `StudioConfigBuilder` | 默认值对齐：url=`http://localhost:3000`、project=`UnnamedProject`、runName=`run_<ts>`、runId=UUID、maxRetries=3、reconnectAttempts=3、delay=1s、maxDelay=5s；tracingUrl 默认 `studioUrl + /v1/traces` |
 | `studio.StudioClient` | OkHttp HTTP 客户端（registerRun/pushMessage/requestUserInput + 重试 + shutdown）| `studio::StudioClient` | reqwest + 指数退避重试（仅 IO/网络错误重试，`max_retries`，base 100ms，max 5s）；时间戳 `yyyy-MM-dd HH:mm:ss.SSS` |
-| `studio.StudioWebSocketClient` | Socket.IO 连接 `/python` namespace，监听 `forwardUserInput`，`waitForInput` 等待 Mono | `studio::StudioWebSocketClient` | Rust 无 socket.io 客户端；抽 `StudioTransport` trait（可插拔），内置 `PendingInputRegistry`（`HashMap<requestId, oneshot>`）；解析/规范化为纯函数 |
+| `studio.StudioWebSocketClient` | Socket.IO 连接 `/python` namespace，监听 `forwardUserInput`，`waitForInput` 等待 Mono | `studio::StudioWebSocketClient` + `studio::socket_io` | `StudioTransport` trait（可插拔）+ `PendingInputRegistry`（`HashMap<requestId, oneshot>`）；**`SocketIoTransport` 为真实实现**（tokio-tungstenite 0.29 + 自实现 Engine.IO v4 握手/`40` 入房/ping-pong/指数退避重连）；帧解析为纯函数 |
 | `studio.StudioWebSocketClient.UserInputData` | 用户输入载荷（blocksInput + structuredInput）| `studio::UserInputData` | |
 | `studio.StudioManager` | 全局静态单例（config/client/wsClient + init builder + shutdown + TracerRegistry 注册）| `studio::StudioManager` | Rust 用 `OnceLock<RwLock<Option<...>>>` 全局；不依赖 core `TracerRegistry`（core 无此类型，见 §4.2） |
 | `studio.StudioMessageHook` | `Hook`，拦截 `PostCallEvent` 把最终消息推给 Studio | `studio::StudioMessageHook` | Rust 无 `Hook`（core `hook` 为设计决定不迁移）；改为 core `Middleware`：`on_agent` 包裹后在事件流上捕获终态消息并推送（fire-and-forget） |
@@ -44,7 +44,7 @@
 | `telemetry.AttributesExtractors.FormatterConverter` | formatter 简单类名 → provider 名映射 | `telemetry::FormatterConverter` | DashScope/Gemini/OpenAI→dashscope；Anthropic→anthropic；其余 unknown |
 | `telemetry.AttributesExtractors.ProviderNameConverter` | ChatModelBase 实例 → provider 名（按类继承链判断）| `telemetry::ProviderNameConverter` | Rust 无运行时类反射；改为按模型名/`Model` 显式 provider 探测（见 §4.1） |
 | `telemetry.StreamChatResponseAggregator` | 流式 ChatResponse 聚合（text/thinking/tool_calls + usage max + finishReason）| `telemetry::StreamChatResponseAggregator` | 复用 core `ChatResponse`/`ChatUsage`/`ContentBlock` |
-| `telemetry.TelemetryTracer` | `Tracer` 实现：agent/model/tool/format 四类 span + OTLP HTTP 导出 | `telemetry::TelemetryTracer` | 包装为 core `Middleware`（on_agent/on_reasoning/on_acting/on_model_call）；OTLP 导出见 §4.2 |
+| `telemetry.TelemetryTracer` | `Tracer` 实现：agent/model/tool/format 四类 span + OTLP HTTP 导出 | `telemetry::TelemetryTracer` | 包装为 core `Middleware`（on_agent/on_reasoning/on_acting/on_model_call）；OTLP 导出已落地为降级 exporter（`telemetry::exporter`，见 §4.1.0s） |
 | `telemetry.model.*`（15 个类）| OTel 消息部件模型（Text/Reasoning/ToolCallRequest/ToolCallResponse/Blob/File/Uri Part、Input/OutputMessage、Role、SystemInstructions、ToolDefinition）| `telemetry::model` | serde 结构；`type` 字段判别 + JSON 字段名对齐（`mime_type`/`file_id`/`finish_reason`）|
 
 ### 2.1 依赖映射（Java → Rust）
@@ -52,11 +52,11 @@
 |---|---|---|---|
 | okhttp3 (OkHttpClient) | Studio HTTP | `reqwest`（workspace 0.12, json/rustls）| 仅写本 crate Cargo.toml；根 `[workspace.dependencies]` 已有 reqwest，直接用 `reqwest = { workspace = true }` |
 | reactor.core (Mono/Flux/Sinks) | 响应式 | `tokio::sync::oneshot/mpsc` + `futures::Stream` | 单值→async fn；等待→oneshot |
-| socket.io-client（java） | Studio WS | **无直接等价**；`StudioTransport` trait + 纯函数解析 | 见 §4.1/§4.2；`tokio-tungstenite` 仅底层 WS，需自实现 Socket.IO 握手 → 本 crate 先出 trait，真实实现留待接线 |
+| socket.io-client（java） | Studio WS | `tokio-tungstenite = 0.29`（本 crate 直声明，default-features=false + connect/handshake/rustls-tls-webpki-roots）+ 本 crate 自实现 Engine.IO v4/Socket.IO 帧 | 已落地 `studio::socket_io`（见 §4.1.0s）；仅写本 crate `Cargo.toml`，未改根 `[workspace.dependencies]` |
 | com.fasterxml.jackson（JSON） | 序列化 | `serde` / `serde_json` | 已建 |
 | org.json (JSONArray/JSONObject) | WS 事件解析 | `serde_json::Value` | |
 | reactor.util.retry.Retry | 重试退避 | 手写 `retry_with_backoff` 辅助 | base 100ms → max 5s，仅 IO/网络错误 |
-| opentelemetry-api / sdk / exporter-otlp-http | OTel span + 导出 | **设计：核心 span 抽象 + 属性抽取先落地**；OTLP 导出见 §4.2 | core/harness 当前无 `opentelemetry` 依赖；加 workspace 依赖需汇总方裁定 |
+| opentelemetry-api / sdk / exporter-otlp-http | OTel span + 导出 | **降级路径已落地**：自建 `Span` 模型 + `OtlpEncoder`（OTLP/HTTP JSON）+ `TraceExporter` trait（`OtlpHttpExporter` 真实 reqwest 实现）| 不引入 `opentelemetry`/`opentelemetry-otlp`（避免根 `[workspace.dependencies]` 变更）；见 §4.1.0s |
 | io.opentelemetry.instrumentation.reactor | Reactor 上下文传播 | core `Middleware` 洋葱链天然携带 `RuntimeContext` | 无需等价物 |
 | slf4j | 日志 | `tracing` | 已建 |
 
@@ -91,15 +91,15 @@
 ### 3.2 重要但可延后（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| Socket.IO 真实握手/鉴权/重连 | StudioWebSocketClient.connect | 待办 | 本 crate 仅落地 `StudioTransport` trait + `NoopStudioTransport`；真实实现待依赖裁定（§4.2） |
+| Socket.IO 真实握手/鉴权/重连 | StudioWebSocketClient.connect | 已完成（2026-10-08） | `studio::socket_io`：`socket_io_url`（http(s)→ws(s) + `?EIO=4&transport=websocket`）、`parse_engine_io_open`（`0{...}` 握手）、`namespace_connect_frame`（`40/python,{"runId":...}`）、`is_ping`/`pong_frame`、`parse_socket_io_event`（`42[...]`）、`reconnect_delay`（指数退避封顶）+ `SocketIoProtocol` 状态机 + `SocketIoTransport`（真实 WS）|
 | `StudioClient` 网络路径离线测（mock HTTP） | StudioClient | 待办 | 需注入 HTTP 传输抽象或 mock server；当前仅离测请求体构造 |
 | `StudioUserAgent` 与 core agent 循环集成 | StudioUserAgent | 待办 | 当前为独立输入提供者，调用方自行接入 agent 轮次 |
 
 ### 3.3 增强（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `TelemetryTracer`（core `Middleware` 包装 + span 生命周期） | TelemetryTracer | 待办 | 依赖 OTel 依赖裁定（§4.2） |
-| OTLP HTTP 导出 | exporter-otlp-http | 待办 | 需 `opentelemetry`(exporter-otlp-http) workspace 依赖，由汇总方裁定（§4.2） |
+| `TelemetryTracer`（core `Middleware` 包装 + span 生命周期） | TelemetryTracer | 待办 | 仍待办：需将 `telemetry::exporter::Span` 绑定到 middleware 的四个拦截点；导出器与编码器已就绪（§4.1.0s），不阻塞依赖 |
+| OTLP HTTP 导出 | exporter-otlp-http | 已完成（降级 exporter）| `telemetry::exporter`：`Span`/`SpanKind`/`SpanStatus`/`OtlpEncoder`（`resourceSpans`→`scopeSpans`→`spans`，id 十六进制校验、纳秒字符串、`AnyValue` 映射）+ `TraceExporter` trait + `OtlpHttpExporter`（reqwest `POST {tracingUrl}`）/`RecordingTraceExporter`/`NoopTraceExporter`；**未引入 `opentelemetry` 依赖**（设计决定，见 §4.2） |
 | 多模态内容部件抽取 | TODO(multi-modal) | 待办 | Java 亦为 TODO；`block_to_part` 对 Image/Audio/Video 返回 None |
 
 ## 4. 项目状态与下一步
@@ -118,9 +118,31 @@
 - 新增离线单测 30 个（均为 `#[cfg(test)]` 内联，无网络/无外部服务）：POJO serde 往返与字段名、Config 默认值与 tracingUrl 推导、WS `forwardUserInput` 事件映射与 `PendingInputRegistry` 解析/超时、telemetry 属性抽取器、流式响应聚合。
 - 已知问题：`AttributesExtractors::get_llm_response_attributes(None)` 会写入 `agentscope.function.output="null"`（Jackson `writeValueAsString(null)` 行为），已按 Java 实际行为对齐并在单测中断言。
 
+#### 4.1.0s 本次交付：Socket.IO 真实传输 + OTLP 降级导出（2026-10-08）
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `src/studio/socket_io.rs` | 新 | 纯帧层：`socket_io_url`（http(s)→ws(s) + `?EIO=4&transport=websocket`）、`parse_engine_io_open`（`0{sid,pingInterval,pingTimeout}`）、`namespace_connect_frame`（`40/python,{...}`）、`is_ping`/`pong_frame`、`parse_socket_io_event`（`42[...]` / `42/ns,[...]`）、`reconnect_delay`（指数退避封顶）+ `SocketIoProtocol`（状态机，`on_text -> Vec<ProtocolAction>`）+ `SocketIoTransport`（tokio-tungstenite 真实连接：握手→入 namespace→回 pong→真重连；`forwardUserInput` 解析后 resolve 到共享 `PendingInputRegistry`）|
+| `src/telemetry/exporter.rs` | 新 | `Span`/`SpanKind`/`SpanStatus` + `is_hex_id`/`unix_nanos`/`encode_attribute_value`/`encode_attributes` + `OtlpEncoder`（OTLP/HTTP JSON `ExportTraceServiceRequest`）+ `TraceExporter` trait + `OtlpHttpExporter`（`from_config` 取 `tracing_url`）/`RecordingTraceExporter`/`NoopTraceExporter` + `resource_attributes` |
+| `src/studio/websocket.rs` | 改 | 新增 `StudioWebSocketClient::with_transport_and_registry`（让 transport 持有共享 registry）；`with_transport` 委派 |
+| `src/studio/mod.rs` | 改 | 声明/导出 `socket_io`；新增 `StudioManager::initialize_with_transport`（`initialize_with` 委派，默认仍为 `NoopStudioTransport`）|
+| `src/telemetry/mod.rs` | 改 | 声明/导出 `exporter`；更新模块文档（OTLP 不再是 deferred）|
+| `Cargo.toml` | 改 | 新增 `tokio-tungstenite = 0.29`（default-features=false + connect/handshake/rustls-tls-webpki-roots，与 CHANNEL crate 同版本/同 features）|
+
+新测试 22 个（52 − 30），全离线：Socket.IO 帧层 11 个（URL 改写/握手与缺 sid/连接帧/事件解析/ping 检测/退避封顶/协议三态），OTLP 导出 11 个（id 校验/时间范围/纳秒/AnyValue 映射/完整 payload/非法 span 报错/顺序与键/recording/noop/`from_config` 端点）。**真实 socket 路径无法离线测**（需运行中的 Studio 服务），已将其逻辑拆到纯函数/状态机以覆盖。
+
+验证命令与结果（本次实测，2026-10-08）：
+- `cargo test -p agentscope-extensions-studio` → **52 passed / 0 failed / 0 ignored**（基线 30，**+22**）
+- `cargo build --workspace` → **BUILD_EXIT=0**；本 crate 0 warning
+
+#### 4.1.0t 修正：`encode_attribute_value` 的 `AnyValue` 注释与数组/对象保留（2026-10-08）
+**问题（交叉审核发现，已复核原文）**：`src/telemetry/exporter.rs` 原注释断言「OTLP `AnyValue` has no map/array variant」——**事实错误**：OTLP `AnyValue` 确含 `arrayValue`/`kvlistValue`。当前实现把 JSON 数组/对象一律降级为 `stringValue`（丢类型），属**记录在案的降级**，但注释断言不成立，违反本仓「未验证断言不得落笔」教训。
+**修复**：`encode_attribute_value` 现正确编码 `Value::Array` → `{"arrayValue":{"values":[...]}}`、`Value::Object` → `{"kvlistValue":{"values":[{"key":..,"value":..}]}}`（逐元素递归）；仅 `null` 仍降级为空串 `{"stringValue":""}`（**OTLP 无 null 类型**，这一处才是不变量）。原错误注释已删除。
+**测试同步**：`attribute_values_map_to_the_otlp_any_value_shape` 原断言对象降级为 `stringValue` 字符串（**该断言本身编码了错误行为**）→ 改为断言 `kvlistValue`，并新增数组 → `arrayValue` 断言。测试数不变（仍 52，为同测试内断言加强）。
+
 ### 4.2 下一步与阻塞（待汇总方裁定）
-1. **【跨模块/workspace】** OTLP 导出与 `TelemetryTracer` 全链路需 `opentelemetry` + `opentelemetry-otlp` 依赖，属根 `[workspace.dependencies]` 变更 → 本子智能体未改根 `Cargo.toml`，提请汇总方裁定。
-2. **【跨模块/workspace】** Socket.IO：workspace 无 Socket.IO/Engine.IO 客户端；若需真实实现需引入新依赖或自实现握手，需汇总方裁定依赖归属。
+1. **【已解决 — 降级方案】** OTLP 导出**不引入 `opentelemetry`/`opentelemetry-otlp`**（避免根 `[workspace.dependencies]` 变更）：以 `telemetry::exporter` 自建 `Span` 模型 + `OtlpEncoder`（OTLP/HTTP JSON）+ `TraceExporter` trait 实现等价导出。仅 `TelemetryTracer`（把 span 绑定到 middleware 四个拦截点）仍待办（§3.3），但其依赖（编码器/导出器）已就绪，不再阻塞。若后续要求与 OTel SDK 字节级兼容，再提请裁定。
+2. **【已解决 — 本 crate 自声明依赖】** Socket.IO：已用 `tokio-tungstenite = 0.29`（与 CHANNEL crate 同版本/同 features）+ 自实现 Engine.IO v4/Socket.IO 帧（`studio::socket_io`）。**未改根 `Cargo.toml`。**
+   附带说明：`StudioManager::initialize_with` 默认仍用 `NoopStudioTransport`（Java 为无条件连接）；宿主要启用真实连接需走 `initialize_with_transport` / `StudioWebSocketClient::with_transport_and_registry`。**原因**：默认连接会让本 crate 现有离线测试向 `localhost:3000` 发起真实网络请求（违反离线测试约定）。
 3. **【core 缺口】** `GenerateOptions` 未实现 `Serialize`（本 crate 已用本地投影绕过，未改 core）；core 无 `Hook`/`TracerRegistry`（已按 §2 用 `Middleware` 替代）。
 
 ## 5. 执行约定（所有会话必须遵守）

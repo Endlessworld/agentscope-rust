@@ -4,17 +4,16 @@
 //! Backend: in-memory SQLite (`RusqliteExecutor::in_memory()`) with `SqliteDialect` — the Rust
 //! analogue of Java's H2 + `H2Dialect` pairing.
 //!
-//! Note on the versioned-API subset: the Rust `AgentStateStore` trait (core) has no
-//! `supportsVersioning` / `getVersioned` / `saveIfVersion` surface (tracked as a functional gap
-//! in §3.2), so the Java versioned-state cases cannot be asserted here. The cases below cover
-//! everything the reused core trait exposes.
+//! Note on the versioned-API subset: core's `AgentStateStore` trait exposes no versioning
+//! surface, so the Java `supportsVersioning` / `getVersioned` / `saveIfVersion` cases are
+//! covered against the inherent methods of [`JdbcAgentStateStore`] instead (see §3.2).
 
 use std::sync::Arc;
 
 use agentscope_extensions_jdbc::dialect::vendor::SqliteDialect;
 use agentscope_extensions_jdbc::dialect::{AbstractJdbcDialect, SessionStateDialect};
 use agentscope_extensions_jdbc::{
-    AgentStateStore, JdbcAgentStateStore, JdbcExecutor, RusqliteExecutor,
+    AgentStateStore, JdbcAgentStateStore, JdbcExecutor, RusqliteExecutor, UNVERSIONED,
 };
 
 fn new_store() -> JdbcAgentStateStore {
@@ -367,4 +366,130 @@ async fn incremental_append_preserves_prior_items_and_hash() {
             text("d")
         ])
     );
+}
+
+// ---------------------------------------------------------------------------
+//  Java: AgentStateStoreVersioningContractTest / JdbcAgentStateStoreH2Test
+//  (versioned subset — inherent API, since core's trait has no versioning surface)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn supports_versioning_is_true() {
+    assert!(new_store().supports_versioning());
+}
+
+#[tokio::test]
+async fn version_of_absent_key_is_zero() {
+    let store = new_store();
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn get_versioned_absent_key_is_absent_with_version_zero() {
+    let store = new_store();
+    let vs = store.get_versioned(Some("u"), "s", "k").unwrap();
+    assert!(!vs.is_present());
+    assert_eq!(vs.value, None);
+    assert_eq!(vs.version, 0);
+}
+
+#[tokio::test]
+async fn save_if_version_zero_creates_and_returns_one() {
+    let store = new_store();
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("a"), 0)
+            .unwrap(),
+        1
+    );
+    let vs = store.get_versioned(Some("u"), "s", "k").unwrap();
+    assert!(vs.is_present());
+    assert_eq!(text_of(vs.value.as_ref().unwrap()), "a");
+    assert_eq!(vs.version, 1);
+}
+
+#[tokio::test]
+async fn save_if_version_zero_conflicts_on_existing_key() {
+    let store = new_store();
+    store
+        .save_if_version(Some("u"), "s", "k", text("a"), 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("b"), 0)
+            .unwrap(),
+        UNVERSIONED,
+        "create-if-absent must report a conflict once the key exists"
+    );
+    // The conflicting write must not clobber the stored value.
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "a");
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 1);
+}
+
+#[tokio::test]
+async fn save_if_version_matching_bumps_version() {
+    let store = new_store();
+    store
+        .save_if_version(Some("u"), "s", "k", text("a"), 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("b"), 1)
+            .unwrap(),
+        2
+    );
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "b");
+}
+
+#[tokio::test]
+async fn save_if_version_stale_is_rejected_without_writing() {
+    let store = new_store();
+    store
+        .save_if_version(Some("u"), "s", "k", text("a"), 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("b"), 7)
+            .unwrap(),
+        UNVERSIONED
+    );
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "a");
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 1);
+}
+
+#[tokio::test]
+async fn save_if_version_unversioned_overwrites_unconditionally() {
+    let store = new_store();
+    store
+        .save_if_version(Some("u"), "s", "k", text("a"), 0)
+        .unwrap();
+    let returned = store
+        .save_if_version(Some("u"), "s", "k", text("b"), UNVERSIONED)
+        .unwrap();
+    assert_ne!(returned, UNVERSIONED, "unconditional overwrite always succeeds");
+    assert_eq!(returned, store.read_version(Some("u"), "s", "k").unwrap());
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "b");
+}
+
+#[tokio::test]
+async fn versioned_reads_are_scoped_per_user() {
+    let store = new_store();
+    store
+        .save_if_version(Some("alice"), "s", "k", text("a"), 0)
+        .unwrap();
+    assert_eq!(store.read_version(Some("bob"), "s", "k").unwrap(), 0);
+    assert!(!store.get_versioned(Some("bob"), "s", "k").unwrap().is_present());
+}
+
+#[tokio::test]
+async fn versioned_api_rejects_blank_session_or_key() {
+    let store = new_store();
+    assert!(store.read_version(Some("u"), "  ", "k").is_err());
+    assert!(store.get_versioned(Some("u"), "s", "").is_err());
+    assert!(store
+        .save_if_version(Some("u"), "", "k", text("a"), 0)
+        .is_err());
+    assert!(store
+        .save_if_version(Some("u"), "s", " ", text("a"), 0)
+        .is_err());
 }
