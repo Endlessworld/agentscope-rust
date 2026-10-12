@@ -32,8 +32,10 @@ pub use anthropic_async::{
     default_anthropic_registry, AnthropicMessagesModel, AnthropicMessagesProvider,
 };
 pub use common::{
-    decode_stream_line, HttpRequestSpec, HttpTransport, JsonStream, MemoryTransport,
-    ReqwestTransport, SharedTransport,
+    decode_stream_line, merge_non_zero, resolve_capabilities, resolve_media, set_media_resolver,
+    strip_reasoning_suffix, ConversionDiagnostic, DefaultMediaResolver, Diagnostics, ErrorKind,
+    HttpRequestSpec, HttpTransport, JsonStream, MediaResolver, MemoryTransport, ModelCapabilities,
+    ModelError, ModelMap, ReqwestTransport, ResolvedMedia, SharedTransport, TransportConfig,
 };
 pub use dashscope::{
     DashScopeChatModel, DashScopeCredential, DashScopeModelProvider, EndpointType,
