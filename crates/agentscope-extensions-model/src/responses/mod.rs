@@ -42,6 +42,8 @@ use agentscope_core::model::provider::{
 use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
+use crate::common::{diagnostics, resolve_capabilities, usage};
+
 /// An OpenAI Responses API model backed by `async-openai`.
 pub struct OpenAiResponsesModel {
     client: Client<OpenAIConfig>,
@@ -270,6 +272,7 @@ fn build_request(
 
     let request_tools = to_request_tools(tools);
     let has_tools = request_tools.is_some();
+    let caps = resolve_capabilities(&model);
 
     let mut req = CreateResponse {
         input: InputParam::Items(items),
@@ -286,12 +289,28 @@ fn build_request(
         if let Some(tc) = &options.tool_choice {
             req.tool_choice = to_tool_choice(tc);
         }
+    } else if options.tool_choice.is_some() {
+        diagnostics::warn(
+            "tool_choice_omitted",
+            "tool_choice",
+            "tool_choice was omitted because the request declares no tools",
+        );
     }
     if let Some(t) = options.temperature {
-        req.temperature = Some(t as f32);
+        if caps.supports_sampling {
+            req.temperature = Some(t as f32);
+        } else {
+            diagnostics::info(
+                "sampling_unsupported",
+                "temperature",
+                "the target model does not accept temperature; parameter dropped",
+            );
+        }
     }
     if let Some(p) = options.top_p {
-        req.top_p = Some(p as f32);
+        if caps.supports_sampling {
+            req.top_p = Some(p as f32);
+        }
     }
     if let Some(n) = options.max_completion_tokens.or(options.max_tokens) {
         req.max_output_tokens = Some(n);
@@ -418,12 +437,16 @@ impl ResponsesIncrementer {
                     self.id = e.response.id.clone();
                 }
                 if let Some(u) = &e.response.usage {
-                    self.usage = Some(ChatUsage {
+                    let incoming = ChatUsage {
                         input_tokens: u.input_tokens as u64,
                         output_tokens: u.output_tokens as u64,
                         cached_tokens: 0,
                         time: 0.0,
-                    });
+                    };
+                    self.usage = Some(usage::merge_non_zero(
+                        &self.usage.unwrap_or_default(),
+                        &incoming,
+                    ));
                 }
                 self.finish_reason = Some(status_string(&e.response.status));
             }

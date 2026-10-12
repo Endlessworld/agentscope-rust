@@ -4,8 +4,8 @@
 //! `OllamaToolsHelper` + `OllamaMediaConverter`.
 
 use agentscope_core::{
-    extract_text_content, is_local_file, validate_image_extension, ContentBlock, Error, HintBlock,
-    ImageBlock, Msg, MsgRole, Result, Source, ToolChoice, ToolSchema,
+    extract_text_content, ContentBlock, HintBlock, ImageBlock, Msg, MsgRole, Result, Source,
+    ToolChoice, ToolSchema,
 };
 
 use super::dto::{
@@ -33,22 +33,10 @@ pub struct DefaultImageResolver;
 
 impl ImageResolver for DefaultImageResolver {
     fn resolve(&self, block: &ImageBlock) -> Result<String> {
-        match &block.source {
-            Source::Base64(b) => Ok(b.data.clone()),
-            Source::Url(u) => {
-                validate_image_extension(&u.url)?;
-                if is_local_file(&u.url) {
-                    let path = u.url.strip_prefix("file://").unwrap_or(&u.url);
-                    agentscope_core::file_to_base64(path)
-                } else {
-                    Err(Error::Model(format!(
-                        "OllamaImageResolver: remote image URL '{}' requires an async resolver; \
-                         configure a custom ImageResolver",
-                        u.url
-                    )))
-                }
-            }
-        }
+        // Route through the shared media resolver so a host that registers one
+        // (see `crate::common::media`) transparently gains remote downloads.
+        // The default resolver reads base64/local paths and rejects remote URLs.
+        Ok(crate::common::resolve_media(&block.source, "formatting image for Ollama")?.base64)
     }
 }
 
@@ -265,7 +253,14 @@ pub fn to_tool_choice(choice: &ToolChoice) -> serde_json::Value {
     match choice {
         ToolChoice::Auto => serde_json::json!("auto"),
         ToolChoice::None => serde_json::json!("none"),
-        ToolChoice::Required => serde_json::json!("auto"),
+        ToolChoice::Required => {
+            crate::common::diagnostics::warn(
+                "tool_choice_downgraded",
+                "tool_choice",
+                "Ollama has no 'required' tool-choice mode; downgraded to 'auto'",
+            );
+            serde_json::json!("auto")
+        }
         ToolChoice::Specific { tool_name } => serde_json::json!({
             "type": "function",
             "function": { "name": tool_name }
@@ -312,7 +307,7 @@ pub fn hint_text(hint: &HintBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::{Base64Source, ToolUseBlock, URLSource};
+    use agentscope_core::{Base64Source, Error, ToolUseBlock, URLSource};
 
     fn resolver_that_errors() -> &'static dyn ImageResolver {
         struct Never;

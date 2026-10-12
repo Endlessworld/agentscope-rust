@@ -145,12 +145,16 @@ impl OllamaStreamIncrementer {
             }
         }
         if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
-            self.usage = Some(ChatUsage {
+            let incoming = ChatUsage {
                 input_tokens: response.prompt_eval_count.unwrap_or(0).max(0) as u64,
                 output_tokens: response.eval_count.unwrap_or(0).max(0) as u64,
                 cached_tokens: 0,
                 time: response.total_duration.map(|d| d as f64 / 1e9).unwrap_or(0.0),
-            });
+            };
+            self.usage = Some(crate::common::usage::merge_non_zero(
+                &self.usage.unwrap_or_default(),
+                &incoming,
+            ));
         }
         if let Some(reason) = &response.done_reason {
             self.finish_reason = Some(reason.clone());

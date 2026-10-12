@@ -103,8 +103,16 @@ impl AnthropicMessagesModel {
                 .map_err(|e| Error::Model(format!("invalid header value for '{k}': {e}")))?;
             headers.insert(name, value);
         }
+        // Apply the shared transport timeouts so the SDK path cannot hang where
+        // the transport-seam providers would have timed out (see
+        // `MODEL__GAP_TRACKER.md` §3.3 / the anthropic double-implementation
+        // convergence note in §4.2).
+        let transport_cfg = crate::common::TransportConfig::default();
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(transport_cfg.connect_timeout)
+            .read_timeout(transport_cfg.read_timeout)
+            .tcp_keepalive(transport_cfg.tcp_keepalive)
             .build()
             .map_err(|e| Error::Model(format!("failed to build http client: {e}")))?;
 

@@ -141,6 +141,7 @@ impl DashScopeChatModel {
             body,
         )
         .streaming(stream)
+        .provider("dashscope")
         .header("Authorization", format!("Bearer {}", self.api_key))
         .header("Content-Type", "application/json");
         if stream {
@@ -182,10 +183,14 @@ impl Model for DashScopeChatModel {
                         }
                     };
                     if let Some(code) = response.code.clone() {
-                        yield Err(Error::Model(format!(
-                            "DashScope error {code}: {}",
-                            response.message.clone().unwrap_or_default()
-                        )));
+                        yield Err(crate::common::error::ModelError::from_parts(
+                            "dashscope",
+                            0,
+                            response.message.clone().unwrap_or_default(),
+                            None,
+                            Some(code),
+                        )
+                        .to_core());
                         return;
                     }
                     if let Some(chunk) = incrementer.accumulate(&response) {
@@ -200,10 +205,14 @@ impl Model for DashScopeChatModel {
                     Ok(value) => match serde_json::from_value::<DashScopeResponse>(value) {
                         Ok(response) => {
                             if let Some(code) = response.code.clone() {
-                                yield Err(Error::Model(format!(
-                                    "DashScope error {code}: {}",
-                                    response.message.clone().unwrap_or_default()
-                                )));
+                                yield Err(crate::common::error::ModelError::from_parts(
+                                    "dashscope",
+                                    0,
+                                    response.message.clone().unwrap_or_default(),
+                                    None,
+                                    Some(code),
+                                )
+                                .to_core());
                             } else {
                                 yield Ok(parse_response(&response));
                             }

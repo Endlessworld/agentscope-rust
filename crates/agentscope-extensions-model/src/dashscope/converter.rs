@@ -354,7 +354,14 @@ pub fn to_tool_choice_value(choice: &ToolChoice) -> serde_json::Value {
     match choice {
         ToolChoice::Auto => serde_json::json!("auto"),
         ToolChoice::None => serde_json::json!("none"),
-        ToolChoice::Required => serde_json::json!("auto"),
+        ToolChoice::Required => {
+            crate::common::diagnostics::warn(
+                "tool_choice_downgraded",
+                "tool_choice",
+                "DashScope has no 'required' tool-choice mode; downgraded to 'auto'",
+            );
+            serde_json::json!("auto")
+        }
         ToolChoice::Specific { tool_name } => serde_json::json!({
             "type": "function",
             "function": { "name": tool_name }

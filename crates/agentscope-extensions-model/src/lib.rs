@@ -25,6 +25,7 @@ pub mod dashscope;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod relay;
 pub mod responses;
 
 pub use anthropic::{AnthropicChatModel, AnthropicModelProvider};
@@ -43,4 +44,8 @@ pub use dashscope::{
 pub use gemini::{GeminiChatModel, GeminiModelProvider};
 pub use ollama::{OllamaChatModel, OllamaModelProvider, OllamaOptions};
 pub use openai::{default_registry, OpenAiChatModel, OpenAiProvider};
+pub use relay::{
+    encode_error, encode_response, find_route, stream_terminator, ConverterQuality, ConverterSpec,
+    RelayFormat, BUILTIN_CONVERTERS,
+};
 pub use responses::{default_responses_registry, OpenAiResponsesModel, OpenAiResponsesProvider};

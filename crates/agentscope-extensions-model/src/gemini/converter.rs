@@ -18,9 +18,9 @@
 //! * tool-call replay must carry back the `thoughtSignature` from metadata.
 
 use agentscope_core::{
-    determine_media_type, extract_text_content, file_to_base64, is_local_file, resolve_mime_type,
-    AudioBlock, ContentBlock, DataBlock, GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole,
-    Result, Source, ToolChoice, ToolSchema, ToolUseBlock, VideoBlock,
+    extract_text_content, resolve_mime_type, AudioBlock, ContentBlock, DataBlock, GenerateOptions,
+    HintBlock, ImageBlock, Msg, MsgRole, Result, Source, ToolChoice, ToolSchema, ToolUseBlock,
+    VideoBlock,
 };
 
 use super::dto::{
@@ -50,82 +50,64 @@ pub fn role_str(role: MsgRole) -> &'static str {
 
 /// Converts a media [`Source`] into a Gemini inline-data part.
 ///
-/// Gemini accepts only inline bytes (or Files API URIs). Local paths are read
-/// from disk; remote URLs and `oss://` URLs are rejected because the adapter
-/// intentionally performs no network download (see `MODEL__GAP_TRACKER.md`
-/// §3.2 P1 ``remote image download``).
+/// Gemini accepts only inline bytes (or Files API URIs), so every source is
+/// resolved to base64 through the shared [`crate::common::media`] resolver:
+/// base64 passes through, local paths are read, and remote `http(s)` URLs are
+/// handled by a registered resolver (the default rejects them, emitting a
+/// diagnostic instead of silently dropping the media).
 pub fn media_part(source: &Source, media_type: &str) -> Result<GeminiPart> {
-    match source {
-        Source::Base64(b64) => {
-            let mime = if b64.media_type.trim().is_empty() {
-                format!("{media_type}/png")
-            } else {
-                b64.media_type.clone()
-            };
-            Ok(GeminiPart::inline(mime, b64.data.clone()))
-        }
-        Source::Url(url_source) => {
-            let url = &url_source.url;
-            if is_local_file(url) {
-                let path = url.strip_prefix("file://").unwrap_or(url);
-                Ok(GeminiPart::inline(
-                    determine_media_type(path),
-                    file_to_base64(path)?,
-                ))
-            } else {
-                Err(agentscope_core::Error::Other(format!(
-                    "Gemini adapter cannot download remote media '{url}'; provide a base64 source or a local path"
-                )))
-            }
-        }
-    }
+    let resolved = crate::common::resolve_media(source, "formatting media for Gemini")?;
+    let mime = if resolved.mime_type.trim().is_empty()
+        || resolved.mime_type == "application/octet-stream"
+    {
+        format!("{media_type}/png")
+    } else {
+        resolved.mime_type
+    };
+    Ok(GeminiPart::inline(mime, resolved.base64))
 }
 
 /// Converts a data block, resolving its MIME type first.
 pub fn data_part(block: &DataBlock) -> Result<GeminiPart> {
     let mime = resolve_mime_type(&block.source)?;
-    match &block.source {
-        Source::Base64(b64) => Ok(GeminiPart::inline(mime, b64.data.clone())),
-        Source::Url(url_source) if is_local_file(&url_source.url) => {
-            let path = url_source.url.strip_prefix("file://").unwrap_or(&url_source.url);
-            Ok(GeminiPart::inline(mime, file_to_base64(path)?))
-        }
-        Source::Url(url_source) => Err(agentscope_core::Error::Other(format!(
-            "Gemini adapter cannot download remote media '{}'; provide a base64 source or a local path",
-            url_source.url
-        ))),
-    }
+    let resolved = crate::common::resolve_media(&block.source, "formatting data for Gemini")?;
+    Ok(GeminiPart::inline(mime, resolved.base64))
 }
 
-fn media_fallback(text: &str) -> GeminiPart {
+fn media_fallback(text: &str, path: &str) -> GeminiPart {
+    crate::common::diagnostics::warn(
+        "unsupported_media_type",
+        path,
+        format!("media part omitted; replaced with text: {text}"),
+    );
     GeminiPart::text(text)
 }
 
 fn image_part(block: &ImageBlock) -> GeminiPart {
     match media_part(&block.source, "image") {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Image - processing failed: {e}]")),
+        Err(e) => media_fallback(&format!("[Image - processing failed: {e}]"), "content.image"),
     }
 }
 
 fn audio_part(block: &AudioBlock) -> GeminiPart {
     match media_part(&block.source, "audio") {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Audio - processing failed: {e}]")),
+        Err(e) => media_fallback(&format!("[Audio - processing failed: {e}]"), "content.audio"),
     }
 }
 
 fn video_part(block: &VideoBlock) -> GeminiPart {
     match media_part(&block.source, "video") {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Video - processing failed: {e}]")),
+        Err(e) => media_fallback(&format!("[Video - processing failed: {e}]"), "content.video"),
     }
 }
 
 fn block_data_part(block: &DataBlock) -> GeminiPart {
     match data_part(block) {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Data - processing failed: {e}]")),
+        Err(e) => media_fallback(&format!("[Data - processing failed: {e}]"), "content.data"),
     }
 }
 
@@ -577,7 +559,7 @@ mod tests {
         )])]);
         let text = contents[0].parts[0].text.as_deref().unwrap();
         assert!(text.starts_with("[Image - processing failed:"), "got {text}");
-        assert!(text.contains("cannot download remote media"));
+        assert!(text.contains("requires a registered MediaResolver"));
     }
 
     #[test]

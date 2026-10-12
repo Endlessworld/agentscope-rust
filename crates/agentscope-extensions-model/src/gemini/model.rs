@@ -13,13 +13,26 @@ use futures::StreamExt;
 
 use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
+use crate::common::error::ModelError;
 use crate::common::{HttpRequestSpec, SharedTransport};
 use crate::gemini::converter::build_request;
 use crate::gemini::credential::{
     generate_content_path, stream_generate_content_path, API_KEY_HEADER, DEFAULT_BASE_URL,
 };
-use crate::gemini::dto::GeminiResponse;
+use crate::gemini::dto::{GeminiErrorBody, GeminiResponse};
 use crate::gemini::parser::{parse_response, GeminiStreamIncrementer};
+
+/// Normalises a Gemini error body into a structured [`ModelError`].
+fn gemini_error(error: &GeminiErrorBody) -> Error {
+    ModelError::from_parts(
+        "gemini",
+        error.code.clamp(0, u16::MAX as i64) as u16,
+        error.message.clone(),
+        Some(error.status.clone()),
+        Some(error.code.to_string()),
+    )
+    .to_core()
+}
 
 /// A chat model backed by the Google Gemini (GenAI) REST API.
 pub struct GeminiChatModel {
@@ -107,6 +120,7 @@ impl GeminiChatModel {
         let url = format!("{}{}", self.base_url, self.endpoint_path(stream));
         let mut spec = HttpRequestSpec::new(url, body)
             .streaming(stream)
+            .provider("gemini")
             .header("content-type", "application/json")
             .header(API_KEY_HEADER, self.api_key.clone());
         for opts in [&self.default_options, options] {
@@ -147,10 +161,7 @@ impl Model for GeminiChatModel {
                         }
                     };
                     if let Some(error) = &response.error {
-                        yield Err(Error::Model(format!(
-                            "Gemini error {} ({}): {}",
-                            error.code, error.status, error.message
-                        )));
+                        yield Err(gemini_error(error));
                         return;
                     }
                     if let Some(chunk) = incrementer.accumulate(&response) {
@@ -165,10 +176,7 @@ impl Model for GeminiChatModel {
                     Ok(value) => match serde_json::from_value::<GeminiResponse>(value) {
                         Ok(response) => {
                             if let Some(error) = &response.error {
-                                yield Err(Error::Model(format!(
-                                    "Gemini error {} ({}): {}",
-                                    error.code, error.status, error.message
-                                )));
+                                yield Err(gemini_error(error));
                             } else {
                                 yield Ok(parse_response(&response));
                             }

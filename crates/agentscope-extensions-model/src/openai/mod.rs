@@ -47,6 +47,9 @@ use agentscope_core::model::provider::{
 use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
+use crate::common::error::{ErrorKind, ModelError};
+use crate::common::{diagnostics, resolve_capabilities, usage};
+
 /// Connection-establishment timeout for the underlying HTTP client.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Idle timeout for streaming responses: if no bytes arrive for this long the
@@ -305,14 +308,23 @@ pub fn default_registry() -> ModelRegistry {
 
 fn map_openai_error(e: OpenAIError) -> Error {
     match e {
-        OpenAIError::ApiError(a) => Error::HttpStatus {
-            status: a.status_code.as_u16(),
-            message: a.api_error.message,
-        },
+        OpenAIError::ApiError(a) => {
+            let api = a.api_error;
+            ModelError::from_parts("openai", a.status_code.as_u16(), api.message, api.r#type, api.code)
+                .to_core()
+        }
         // Transport failures (connection reset, a dropped Wi-Fi link, a read
         // timeout) must be retryable so the model call is re-established once
         // the network returns instead of hanging or failing the whole turn.
-        OpenAIError::Reqwest(e) => Error::Http(e.to_string()),
+        OpenAIError::Reqwest(e) => {
+            let mut err = ModelError::new("openai", 0, e.to_string());
+            err.kind = if e.is_timeout() {
+                ErrorKind::Timeout
+            } else {
+                ErrorKind::Network
+            };
+            err.to_core()
+        }
         OpenAIError::StreamError(e) => Error::Http(format!("stream error: {e}")),
         other => Error::Model(format!("{other}")),
     }
@@ -345,33 +357,68 @@ fn build_request(
         ..Default::default()
     };
 
+    // Resolve per-model capabilities so unsupported parameters are never sent
+    // (reasoning models 400 on temperature/top_p/penalties/seed; several
+    // gateways only accept `max_tokens`, not `max_completion_tokens`).
+    let caps = resolve_capabilities(&req.model);
+    if !caps.supports_stream_options {
+        req.stream_options = None;
+    }
+
     if let Some(tc) = &options.tool_choice {
         if has_tools {
             req.tool_choice = to_tool_choice(tc);
+        } else {
+            diagnostics::warn(
+                "tool_choice_omitted",
+                "tool_choice",
+                "tool_choice was omitted because the request declares no tools",
+            );
         }
     }
     if let Some(t) = options.temperature {
-        req.temperature = Some(t as f32);
+        if caps.supports_sampling {
+            req.temperature = Some(t as f32);
+        } else {
+            diagnostics::info(
+                "sampling_unsupported",
+                "temperature",
+                format!("model '{}' does not accept temperature; parameter dropped", req.model),
+            );
+        }
     }
     if let Some(p) = options.top_p {
-        req.top_p = Some(p as f32);
+        if caps.supports_sampling {
+            req.top_p = Some(p as f32);
+        }
     }
-    if let Some(n) = options.max_completion_tokens {
-        req.max_completion_tokens = Some(n);
-    } else if let Some(n) = options.max_tokens {
-        req.max_completion_tokens = Some(n);
+    let max_tokens = options.max_completion_tokens.or(options.max_tokens);
+    if let Some(n) = max_tokens {
+        if caps.use_max_completion_tokens {
+            req.max_completion_tokens = Some(n);
+        } else {
+            req.max_tokens = Some(n);
+        }
     }
     if let Some(f) = options.frequency_penalty {
-        req.frequency_penalty = Some(f as f32);
+        if caps.supports_penalties {
+            req.frequency_penalty = Some(f as f32);
+        }
     }
     if let Some(p) = options.presence_penalty {
-        req.presence_penalty = Some(p as f32);
+        if caps.supports_penalties {
+            req.presence_penalty = Some(p as f32);
+        }
     }
     if let Some(s) = options.seed {
-        req.seed = Some(s);
+        if caps.supports_seed {
+            req.seed = Some(s);
+        }
     }
     if let Some(p) = options.parallel_tool_calls {
-        req.parallel_tool_calls = Some(p);
+        if caps.supports_parallel_tool_calls {
+            req.parallel_tool_calls = Some(p);
+        }
     }
     if let Some(rc) = options.reasoning_effort.as_deref() {
         req.reasoning_effort = to_reasoning_effort(rc);
@@ -722,12 +769,16 @@ impl StreamIncrementer {
             }
         }
         if let Some(usage) = &chunk.usage {
-            self.usage = Some(ChatUsage {
+            let incoming = ChatUsage {
                 input_tokens: usage.prompt_tokens as u64,
                 output_tokens: usage.completion_tokens as u64,
                 cached_tokens: 0,
                 time: 0.0,
-            });
+            };
+            self.usage = Some(usage::merge_non_zero(
+                &self.usage.unwrap_or_default(),
+                &incoming,
+            ));
         }
         if blocks.is_empty() {
             None
@@ -815,6 +866,56 @@ mod tests {
             }
             _ => panic!("expected user message"),
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn reasoning_model_drops_unsupported_sampling_params() {
+        let options = GenerateOptions {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.1),
+            seed: Some(7),
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let (req, _) = build_request("o3-mini".into(), vec![sample_msg()], vec![], options, false);
+        assert!(req.temperature.is_none(), "o3 rejects temperature");
+        assert!(req.top_p.is_none(), "o3 rejects top_p");
+        assert!(req.frequency_penalty.is_none(), "o3 rejects penalties");
+        assert!(req.seed.is_none(), "o3 rejects seed");
+        assert_eq!(req.max_completion_tokens, Some(100));
+        assert!(req.max_tokens.is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn compatible_gateway_uses_legacy_max_tokens() {
+        let options = GenerateOptions { max_tokens: Some(64), temperature: Some(0.2), ..Default::default() };
+        let (req, _) =
+            build_request("deepseek-chat".into(), vec![sample_msg()], vec![], options, false);
+        assert_eq!(req.max_tokens, Some(64));
+        assert!(req.max_completion_tokens.is_none());
+        assert_eq!(req.temperature, Some(0.2), "deepseek accepts temperature");
+    }
+
+    #[test]
+    fn usage_merges_across_chunks_without_zero_clobber() {
+        let chunk = |json: serde_json::Value| {
+            serde_json::from_value::<OpenAiStreamChunk>(json).unwrap()
+        };
+        let mut inc = StreamIncrementer::default();
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "x", "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10}
+        })));
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "x", "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 5, "total_tokens": 5}
+        })));
+        let final_resp = inc.into_final().expect("final response");
+        assert_eq!(final_resp.usage.input_tokens, 10);
+        assert_eq!(final_resp.usage.output_tokens, 5);
     }
 
     #[test]

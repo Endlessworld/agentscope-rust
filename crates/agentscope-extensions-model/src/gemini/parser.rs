@@ -153,7 +153,11 @@ impl GeminiStreamIncrementer {
                 .filter(|s| !s.trim().is_empty());
         }
         if let Some(metadata) = &response.usage_metadata {
-            self.usage = Some(usage_of(metadata));
+            let incoming = usage_of(metadata);
+            self.usage = Some(crate::common::usage::merge_non_zero(
+                &self.usage.unwrap_or_default(),
+                &incoming,
+            ));
         }
         if let Some(reason) = finish_reason_of(response) {
             self.finish_reason = Some(reason);

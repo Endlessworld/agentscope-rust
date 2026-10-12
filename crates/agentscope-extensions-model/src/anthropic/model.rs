@@ -133,6 +133,7 @@ impl AnthropicChatModel {
 
         let mut spec = HttpRequestSpec::new(self.endpoint_url(), body)
             .streaming(stream)
+            .provider("anthropic")
             .header("content-type", "application/json")
             .header(
                 ANTHROPIC_VERSION_HEADER,
@@ -180,10 +181,14 @@ impl Model for AnthropicChatModel {
                         }
                     };
                     if let Some(error) = &event.error {
-                        yield Err(Error::Model(format!(
-                            "Anthropic error {}: {}",
-                            error.kind, error.message
-                        )));
+                        yield Err(crate::common::error::ModelError::from_parts(
+                            "anthropic",
+                            0,
+                            error.message.clone(),
+                            Some(error.kind.clone()),
+                            None,
+                        )
+                        .to_core());
                         return;
                     }
                     if let Some(chunk) = incrementer.accumulate(&event) {
@@ -198,10 +203,14 @@ impl Model for AnthropicChatModel {
                     Ok(value) => match serde_json::from_value::<AnthropicMessageResponse>(value) {
                         Ok(response) => {
                             if let Some(error) = &response.error {
-                                yield Err(Error::Model(format!(
-                                    "Anthropic error {}: {}",
-                                    error.kind, error.message
-                                )));
+                                yield Err(crate::common::error::ModelError::from_parts(
+                                    "anthropic",
+                                    0,
+                                    error.message.clone(),
+                                    Some(error.kind.clone()),
+                                    None,
+                                )
+                                .to_core());
                             } else {
                                 yield Ok(parse_message(&response));
                             }

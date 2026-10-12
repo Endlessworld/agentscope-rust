@@ -68,6 +68,32 @@ impl OllamaChatModel {
         self
     }
 
+    /// Generates embeddings via `POST {base_url}/api/embed` (mirrors Java's
+    /// `OllamaHttpClient.embed`). Returns one embedding vector per input string.
+    pub async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed_with_options(input, None).await
+    }
+
+    /// Embedding variant carrying an optional per-call `OllamaOptions`.
+    pub async fn embed_with_options(
+        &self,
+        input: Vec<String>,
+        options: Option<&OllamaOptions>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let request = crate::ollama::dto::OllamaEmbeddingRequest::new(&self.model_name, input);
+        let body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        let spec = HttpRequestSpec::new(
+            format!("{}{}", self.base_url.trim_end_matches('/'), EMBED_ENDPOINT),
+            body,
+        )
+        .provider("ollama");
+        let _ = options; // reserved for future per-call options plumbing
+        let value = self.transport.post_json(spec).await?;
+        let response: crate::ollama::dto::OllamaEmbeddingResponse =
+            serde_json::from_value(value).map_err(Error::from)?;
+        Ok(response.embeddings)
+    }
+
     /// Sets the reported context window size in tokens.
     pub fn with_context_window_size(mut self, size: usize) -> Self {
         self.context_window_size = size;
@@ -128,7 +154,8 @@ impl Model for OllamaChatModel {
                 format!("{}{}", self.base_url.trim_end_matches('/'), CHAT_ENDPOINT),
                 body,
             )
-            .streaming(stream_enabled);
+            .streaming(stream_enabled)
+            .provider("ollama");
 
             if stream_enabled {
                 let mut frames = self.transport.post_json_stream(spec);
@@ -149,7 +176,7 @@ impl Model for OllamaChatModel {
                         }
                     };
                     if let Some(message) = response.error {
-                        yield Err(Error::Model(format!("Ollama error: {message}")));
+                        yield Err(crate::common::error::ModelError::new("ollama", 0, message).to_core());
                         return;
                     }
                     if let Some(chunk) = incrementer.accumulate(&response) {
@@ -164,7 +191,7 @@ impl Model for OllamaChatModel {
                     Ok(value) => match serde_json::from_value::<OllamaResponse>(value) {
                         Ok(response) => {
                             if let Some(message) = response.error {
-                                yield Err(Error::Model(format!("Ollama error: {message}")));
+                                yield Err(crate::common::error::ModelError::new("ollama", 0, message).to_core());
                             } else {
                                 yield Ok(parse_response(&response));
                             }
@@ -200,6 +227,21 @@ mod tests {
 
     fn model_with(transport: MemoryTransport) -> OllamaChatModel {
         OllamaChatModel::new("llama3", None, Arc::new(transport))
+    }
+
+    #[tokio::test]
+    async fn embed_posts_to_embed_endpoint() {
+        let transport = MemoryTransport::with_response(serde_json::json!({
+            "model": "nomic-embed-text",
+            "embeddings": [[0.1, 0.2], [0.3, 0.4]]
+        }));
+        let model = OllamaChatModel::new("nomic-embed-text", None, Arc::new(transport.clone()));
+        let vectors = model.embed(vec!["a".into(), "b".into()]).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![0.1_f32, 0.2]);
+        let req = transport.last_request().unwrap();
+        assert!(req.url.ends_with("/api/embed"), "url={}", req.url);
+        assert_eq!(req.provider, "ollama");
     }
 
     async fn collect(model: &OllamaChatModel, options: GenerateOptions) -> Vec<Result<ChatResponse>> {

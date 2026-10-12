@@ -136,7 +136,11 @@ impl DashScopeStreamIncrementer {
                 .filter(|s| !s.trim().is_empty());
         }
         if response.usage.is_some() {
-            self.usage = Some(usage_of(response));
+            let incoming = usage_of(response);
+            self.usage = Some(crate::common::usage::merge_non_zero(
+                &self.usage.unwrap_or_default(),
+                &incoming,
+            ));
         }
 
         let mut blocks: Vec<ContentBlock> = Vec::new();

@@ -145,9 +145,16 @@ pub fn image_content_block(block: &ImageBlock, fmt: &ChatFormatOptions) -> Anthr
             source,
             cache_control: fmt.cache_control.then(|| fmt.marker()),
         }),
-        Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
-            "[Image - processing failed: {e}]"
-        ))),
+        Err(e) => {
+            crate::common::diagnostics::warn(
+                "unsupported_media_type",
+                "content.image",
+                format!("image part omitted; replaced with text: {e}"),
+            );
+            AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+                "[Image - processing failed: {e}]"
+            )))
+        }
     }
 }
 
@@ -167,9 +174,16 @@ pub fn data_content_block(block: &DataBlock, fmt: &ChatFormatOptions) -> Anthrop
                 ))),
             }
         }
-        Ok(mime) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
-            "[Media - processing failed: Anthropic only supports image DataBlocks; got MIME type: {mime}]"
-        ))),
+        Ok(mime) => {
+            crate::common::diagnostics::warn(
+                "unsupported_media_type",
+                "content.data",
+                format!("Anthropic only supports image DataBlocks; got MIME type: {mime}"),
+            );
+            AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+                "[Media - processing failed: Anthropic only supports image DataBlocks; got MIME type: {mime}]"
+            )))
+        }
         Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
             "[Media - processing failed: {e}]"
         ))),

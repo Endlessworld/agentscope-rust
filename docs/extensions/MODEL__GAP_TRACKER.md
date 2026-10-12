@@ -18,7 +18,7 @@
 | Java 规模（实测行数） | 主代码 24885 行 / 测试 45043 行（anthropic 2192 / dashscope 7453 / gemini 2294 / ollama 4412 / openai 8534；e2e-tests 测试 7136） |
 | Rust crate | `crates/agentscope-extensions-model` |
 | 迁移波次 | A |
-| 当前状态 | **已完成（provider 主链路）** — `common`（HTTP seam）+ `ollama`（provider 全链路）+ `dashscope`（provider 全链路，含凭证/加密公钥/多模态端点）+ **`anthropic`（11 类全数映射）** + **`gemini`（10 类全数映射）** + **`openai` / `responses` / `anthropic_async`（2026-09-21 自 `agentscope-core/src/model/` 整体迁入本 crate）** 已落地并测试全绿（**198 passed**）。§3.3 的长尾增强项（远程图片下载、独立 `tests/`、重试/指标等）按本轮范围约定保持待办 |
+| 当前状态 | **已完成（provider 主链路）** — `common`（HTTP seam）+ `ollama`（provider 全链路）+ `dashscope`（provider 全链路，含凭证/加密公钥/多模态端点）+ **`anthropic`（11 类全数映射）** + **`gemini`（10 类全数映射）** + **`openai` / `responses` / `anthropic_async`（2026-09-21 自 `agentscope-core/src/model/` 整体迁入本 crate）** 已落地并测试全绿（**2026-10-12 优化轮后 236 passed**，见 §6）。§3.3 的长尾增强项（远程图片下载、独立 `tests/`、重试/指标等）按本轮范围约定保持待办 |
 
 ### 1.1 验证基线（2026-09-19 实测；2026-09-21 更新）
 ```
@@ -273,6 +273,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed; 0 failed; 0 ignored;
   4. **`anthropic` 子模块（本轮新增）**：provider 全链路（`dto`/`credential`/`converter`/`parser`/`model`/`provider` 六模块，58 个单测）。覆盖：system 提升到顶层 `system`、prompt caching（`cache_control`/TTL，标记 system/末条消息/末个工具）、extended thinking（`thinking.budget_tokens`）、`tool_choice` 四变体与 `disable_parallel_tool_use`、tool_result 拆为独立 user 消息、多模态（base64/本地→base64，远程 URL 透传）、多智能体 `<history>` 合并、SSE 流式增量器（text/thinking 即时产出，tool 参数分片缓冲，usage 合并 message_start+message_delta）。
   5. **`gemini` 子模块（本轮新增）**：provider 全链路（同构六模块，53 个单测）。覆盖：REST `generateContent`/`streamGenerateContent?alt=sse`、`generationConfig`（temperature/topP/topK/seed/maxOutputTokens/penalty/thinkingConfig）、`parametersJsonSchema` 工具声明与 `functionCallingConfig`（NONE/ANY/allowedFunctionNames）、tool result 独立 `user` content、`thoughtSignature` 持久化与回放、多模态 `inlineData`、多智能体 `<history>` 合并、流式增量器。
 - **验证命令与结果**
+  - （2026-10-12 优化轮实测，对标 new-api；详见 §6）`cargo test -p agentscope-extensions-model` → **236 passed / 0 failed**（231 lib + 5 集成）；`cargo check --workspace` → Finished（仅其它 crate 存量 warning）
   - （2026-09-19 实测）`cargo build -p agentscope-extensions-model` → **Finished**（0 error；本 crate 0 error/0 warning）
   - （2026-09-19 实测）`cargo test -p agentscope-extensions-model` → **169 passed / 0 failed / 0 ignored**
   - （2026-09-21 实测，core 实现迁入后）`cargo test -p agentscope-extensions-model` → **198 passed / 0 failed / 0 ignored**；`cargo check --workspace` → **Finished**（0 error，仅其它 crate 存量 warning）
@@ -302,4 +303,40 @@ cargo test  -p agentscope-extensions-model   -> 198 passed; 0 failed; 0 ignored;
 - 完工后：更新 §3 条目状态与 §4，并在 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` 对应行登记。
 - **仅在本 crate 内改动**；新增依赖写入 `crates/agentscope-extensions-model/Cargo.toml` 的 `[dependencies]`，不要改根 `Cargo.toml` 的 `[workspace.dependencies]`（如需请记入 §4.2 由汇总方处理）。
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
+
+## 6. 2026-10-12 优化轮（对标 Go 网关 new-api）
+
+> 参考 `E:\local-github\new-api` 的协议转换/错误/用量/能力设计，在本 crate 内完成一轮“客户端保真度 + 可观测性 + 网关化前置”优化。**全程未改动 core/harness/根 Cargo.toml**；`cargo test -p agentscope-extensions-model` → **236 passed**（231 lib + 5 集成），`cargo check --workspace` → Finished（仅存量 warning）。
+
+### 6.1 新增模块
+| 文件 | 职责 |
+|---|---|
+| `src/common/error.rs` | `ModelError` + `ErrorKind`：归一化 8 种厂商错误体字段（`error.message`/`message`/`msg`/`err`/`errorMsg`/`detail`/`header.message`/`response.error.message`），分类（auth/quota/rate_limit/context_length/…）与 `retryable()`；`parse_stream_value` 处理流内 `error` 帧 |
+| `src/common/capabilities.rs` | `ModelCapabilities` + `resolve_capabilities`（最长前缀匹配）：推理模型禁 sampling/penalty/seed；兼容网关用 `max_tokens` 而非 `max_completion_tokens` |
+| `src/common/usage.rs` | `merge_non_zero`（后到非零才覆盖，0 不清正） |
+| `src/common/diagnostics.rs` | `ConversionDiagnostic{code,path,message,severity}` + `emit`/`warn`/`info`（tracing 落点）+ `Diagnostics` 收集器 |
+| `src/common/media.rs` | `MediaResolver` seam + 全局 `set_media_resolver`：「base64 直通 / 本地文件读取 / 远程 URL 显式拒绝」统一实现 |
+| `src/common/model_map.rs` | `ModelMap`（链式映射 + 环检测 + base-name 回退）、`strip_reasoning_suffix`（`-thinking-N` / `-<effort>`） |
+| `src/relay.rs` | 反向编码器 `encode_response`（IR → OpenAI Chat / Responses / Claude / Gemini）+ `encode_error` + 路由注册表 `BUILTIN_CONVERTERS`（含 `Quality` 与显式多跳 `steps`） |
+
+### 6.2 改动落点（对应 §3 缺口）
+- **P0 错误归一化**：`common/transport.rs` 非 2xx 与流内 `error` 帧经 `ModelError`；`openai::map_openai_error` / gemini / anthropic / dashscope / ollama 全部改为结构化错误（§3.2「OpenAI 异常类层次」细化）。
+- **P0 超时统一**：`TransportConfig{connect/read/keepalive}`；4 个 provider 的 `default_transport()` 改经 `ReqwestTransport::new()`（此前**零超时**）；`anthropic_async` 的 reqwest client 同步套用（§3.3「超时未可配置」）。
+- **P0 重试**：`ReqwestTransport::post_json` 依 `ModelError::retryable()` + 指数退避重试（默认 2 次）；流式不重试（§3.3「当前无重试」部分解决）。
+- **P0 usage 合并**：openai / responses / gemini / dashscope / ollama 增量器改用 `merge_non_zero`（anthropic 两条路径原本已正确合并）。
+- **P1 能力降级**：openai / responses 的请求构建按 `resolve_capabilities` 过滤参数（§3.2「OpenAI 兼容厂商差异化行为」的运行时实现）。
+- **P1 诊断**：`tool_choice` 因无工具被丢弃、`Required→auto` 降级（dashscope/ollama）、媒体回退、sampling 参数被丢弃等一律 `diagnostics::warn/info`；本 crate 首次引入 `tracing` 落点（§3.3「指标/可观测性埋点」）。
+- **P1 媒体**：gemini `media_part`/`data_part`、ollama `DefaultImageResolver` 改走共享 `resolve_media`（§3.2/§3.3「远程媒体下载」— 由宿主注入 resolver 后即支持）。
+- **P1 端点**：Ollama `embed`/`embed_with_options` 接线 `POST /api/embed`（§3.2「Ollama embedding 调用链」）。
+- **P2 反向编码 + 注册表**：`relay.rs`（网关化前置，无需改 core）。
+- **P2 收敛**：`anthropic_async` 复用 `TransportConfig` 超时；`anthropic` vs `anthropic_async`、`reqwest 0.12 vs reqwest13` 的取舍记入下方 §6.3。
+- **测试**：新增 `tests/model_extensions_integration.rs`（5 例，覆盖 resolver 注入、错误归一化、四协议反向编码、路由质量、能力/用量/命名）；各 provider 内联单测同步扩充（+9）。
+
+### 6.3 仍开放 / 有意保留
+1. **`anthropic` 双实现**：保留 `anthropic`（自建 wire DTO，规范路径）与 `anthropic_async`（SDK 路径），两者共用超时配置；是否下线其一仍待汇总方裁定（§4.2-7）。
+2. **`reqwest` 0.12 + `reqwest13` 双栈**：`async-openai 0.41` 强绑 reqwest 0.13，无法收敛；本 crate 自有 HTTP 走 0.12，已在 `Cargo.toml` 注释与本节登记，属有意保留。
+3. **流式重试**：仅在**首包前**安全；当前实现对流式不做重试（`end_reason` 语义未引入），保持保守。
+4. **反向编码仅覆盖非流式体**：SSE 逐事件编码（Claude `content_block_delta` 等）与真正的 OpenAI 兼容 HTTP 端点尚未落地——`relay.rs` 提供构建块与 `stream_terminator`。
+5. e2e 真实端点回归、`OpenAIMultiModalTool` 归属仍按 §4.2 待裁定。
+
 
