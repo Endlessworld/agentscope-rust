@@ -13,5 +13,5 @@ pub mod event;
 pub mod permission_store;
 pub mod session;
 
-pub use coding_agent::{AcpCodingAgent, AcpCodingAgentBuilder};
+pub use coding_agent::{AcpCodingAgent, AcpCodingAgentBuilder, ACP_CONTEXT_WINDOW_TOKENS};
 pub use session::AcpAgentSession;

@@ -409,7 +409,7 @@ impl ConversationCompactor {
             return Ok(None);
         }
         let tail = messages[cutoff..].to_vec();
-        let summary = self.summarize_prefix(&messages[..cutoff], config).await;
+        let summary = self.summarize_prefix(&messages[..cutoff], config).await?;
         let summary_msg = build_summary_message(&summary, None);
         let mut compacted = Vec::with_capacity(1 + tail.len());
         compacted.push(summary_msg);
@@ -417,12 +417,18 @@ impl ConversationCompactor {
         Ok(Some(compacted))
     }
 
-    async fn summarize_prefix(&self, prefix: &[Msg], config: &CompactionConfig) -> String {
+    /// Summarizes the prefix. A model failure or an empty summary is returned as an error so
+    /// the caller keeps the original history instead of discarding it for a placeholder.
+    async fn summarize_prefix(
+        &self,
+        prefix: &[Msg],
+        config: &CompactionConfig,
+    ) -> agentscope_core::error::Result<String> {
         if prefix.is_empty() {
-            return "No previous conversation history.".to_string();
+            return Ok("No previous conversation history.".to_string());
         }
         let Some(model) = &self.model else {
-            return "(summary unavailable - no model configured)".to_string();
+            return Ok("(summary unavailable - no model configured)".to_string());
         };
         let formatted = format_messages_for_summary(prefix);
         let prompt = config.summary_prompt.replace("{messages}", &formatted);
@@ -431,23 +437,20 @@ impl ConversationCompactor {
         let mut stream = model.stream(input, Vec::new(), GenerateOptions::default());
         use futures::StreamExt;
         while let Some(resp) = stream.next().await {
-            match resp {
-                Ok(r) => {
-                    for block in &r.content {
-                        if let ContentBlock::Text(t) = block {
-                            out.push_str(&t.text);
-                        }
-                    }
+            let r = resp?;
+            for block in &r.content {
+                if let ContentBlock::Text(t) = block {
+                    out.push_str(&t.text);
                 }
-                Err(_) => break,
             }
         }
         let trimmed = out.trim();
         if trimmed.is_empty() {
-            "(Summary unavailable)".to_string()
-        } else {
-            trimmed.to_string()
+            return Err(agentscope_core::error::Error::Agent(
+                "conversation compaction produced an empty summary".into(),
+            ));
         }
+        Ok(trimmed.to_string())
     }
 }
 

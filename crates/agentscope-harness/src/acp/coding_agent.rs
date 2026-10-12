@@ -24,7 +24,7 @@ use agent_client_protocol::{Agent, Stdio};
 use agentscope_core::model::Model;
 use agentscope_extensions_model::OpenAiChatModel;
 
-use crate::agent::{HarnessAgent, HarnessAgentBuilder};
+use crate::agent::{CompactionConfig, HarnessAgent, HarnessAgentBuilder};
 use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
@@ -37,6 +37,10 @@ const AGENT_VERSION: &str = "0.1.0";
 
 /// Default model id used when `CODING_MODEL_ID` is not set.
 const DEFAULT_MODEL_ID: &str = "gpt-4o";
+
+/// Context window the ACP agents compact against: conversation compaction triggers once the
+/// accumulated context reaches this many tokens.
+pub const ACP_CONTEXT_WINDOW_TOKENS: usize = 256_000;
 
 /// Builds an [`OpenAiChatModel`] from the environment (mirrors Java `CodingAgentFactory`).
 ///
@@ -60,7 +64,7 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
     let model = build_env_model();
     let compaction = CompactionMiddlewareConfig {
         enabled: true,
-        max_tokens: 16_000,
+        max_tokens: ACP_CONTEXT_WINDOW_TOKENS,
     };
     let workspace = cwd.join(".agentscope").join("workspace");
     HarnessAgent::builder()
@@ -71,6 +75,12 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
         .register_filesystem_tools(true)
         .register_shell_tool(true)
         .compaction(compaction)
+        .conversation_compaction(
+            CompactionConfig::builder()
+                .trigger_messages(0)
+                .trigger_tokens(ACP_CONTEXT_WINDOW_TOKENS)
+                .build(),
+        )
         .max_iters(50)
         .build()
 }

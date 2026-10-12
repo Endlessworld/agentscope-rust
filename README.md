@@ -85,6 +85,9 @@ cargo test   --workspace                 # 单元 + 集成测试
 cargo clippy --workspace --all-targets   # 静态检查
 #构建cli 和acp_harness_agent
 cargo build --profile embedded -p agentscope-harness --no-default-features --features lite --bins
+# release / embedded 构建两个 ACP 二进制（Windows 便捷脚本）
+build-acp-release.bat
+build-acp-embedded.bat
 ```
 
 体积优化（嵌入式场景）：

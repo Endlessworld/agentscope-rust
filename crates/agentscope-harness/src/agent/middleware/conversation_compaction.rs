@@ -79,10 +79,20 @@ impl Middleware for ConversationCompactionMiddleware {
                 if history.is_empty() {
                     None
                 } else {
-                    compactor
+                    match compactor
                         .compact_if_needed(history, &config, &agent_id, &session_id)
                         .await
-                        .unwrap_or(None)
+                    {
+                        Ok(replacement) => replacement,
+                        Err(e) => {
+                            tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "conversation compaction failed; keeping full history"
+                            );
+                            None
+                        }
+                    }
                 }
             };
             if let Some(replacement) = compacted {

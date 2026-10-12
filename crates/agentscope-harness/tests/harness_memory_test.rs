@@ -1,7 +1,11 @@
 //! Tests for the harness memory module: compaction (token counter / config /
 //! pre-pass pipeline / summary building) and session (entries / tree / freshness).
 
+use std::sync::Arc;
+
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::{
     build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
     prune_tool_results, truncate_args, CompactionConfig, ConversationCompactor,
@@ -9,6 +13,26 @@ use agentscope_harness::{
     TruncateArgsConfig,
 };
 use chrono::{Duration as ChronoDuration, Local, Timelike};
+
+/// A summarization model whose stream always fails.
+struct FailingModel;
+
+#[async_trait::async_trait]
+impl Model for FailingModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        let items: Vec<agentscope_core::error::Result<ChatResponse>> =
+            vec![Err(agentscope_core::error::Error::Agent("model down".into()))];
+        Box::pin(futures::stream::iter(items))
+    }
+    fn model_name(&self) -> &str {
+        "failing"
+    }
+}
 
 fn assistant_with_tool_use(name: &str, id: &str, arg_key: &str, arg_value: String) -> Msg {
     let mut input = agentscope_core::message::JsonMap::new();
@@ -198,6 +222,42 @@ async fn compact_if_needed_is_noop_below_trigger() {
     let cfg = CompactionConfig::default(); // trigger 50
     let result = compactor.compact_if_needed(messages, &cfg, "a", "s").await.unwrap();
     assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn compact_if_needed_triggers_only_at_acp_token_window() {
+    let cfg = CompactionConfig::builder()
+        .trigger_messages(0)
+        .trigger_tokens(ACP_CONTEXT_WINDOW_TOKENS)
+        .build();
+    let chunk = Msg::user("x".repeat(10_000));
+    let per_chunk = calculate_token(std::slice::from_ref(&chunk)).max(1);
+    let below = ACP_CONTEXT_WINDOW_TOKENS / per_chunk - 1;
+    let compactor = ConversationCompactor::new(None);
+
+    let under: Vec<Msg> = vec![chunk.clone(); below];
+    assert!(calculate_token(&under) < ACP_CONTEXT_WINDOW_TOKENS);
+    let result = compactor.compact_if_needed(under, &cfg, "a", "s").await.unwrap();
+    assert!(result.is_none(), "must not compact below the 256k window");
+
+    let over: Vec<Msg> = vec![chunk; below + 2];
+    assert!(calculate_token(&over) >= ACP_CONTEXT_WINDOW_TOKENS);
+    let result = compactor.compact_if_needed(over, &cfg, "a", "s").await.unwrap();
+    assert!(result.is_some(), "must compact once the context reaches 256k");
+}
+
+#[tokio::test]
+async fn compaction_failure_keeps_full_history() {
+    let messages: Vec<Msg> = (0..60)
+        .map(|i| Msg::user(format!("message number {}", i)))
+        .collect();
+    let compactor = ConversationCompactor::with_model(Arc::new(FailingModel));
+    let cfg = CompactionConfig::builder()
+        .trigger_messages(50)
+        .trigger_tokens(0)
+        .build();
+    let result = compactor.compact_if_needed(messages, &cfg, "agent", "session").await;
+    assert!(result.is_err(), "a failed summary must surface as an error, not a placeholder");
 }
 
 #[test]

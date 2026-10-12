@@ -97,6 +97,7 @@ use agentscope_extensions_model::{
 };
 use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};
+use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
     CompactionConfig, CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
@@ -927,15 +928,15 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
         .register_shell_tool(true)
         .compaction(CompactionMiddlewareConfig {
             enabled: true,
-            max_tokens: 16_000,
+            max_tokens: ACP_CONTEXT_WINDOW_TOKENS,
         })
         .disable_memory_hooks()
-        // 对话压缩：历史超过触发阈值时由 LLM 总结早期对话并保留最近 tail，
+        // 对话压缩：上下文 token 数达到 256k 窗口上限时由 LLM 总结早期对话并保留最近 tail，
         // 控制 AgentState.context 的持续增长（保留 tail 不破坏前缀 KV 缓存）。
         .conversation_compaction(
             CompactionConfig::builder()
-                .trigger_messages(100)
-                .trigger_tokens(0)
+                .trigger_messages(0)
+                .trigger_tokens(ACP_CONTEXT_WINDOW_TOKENS)
                 .keep_messages(12)
                 .keep_tokens(-1)
                 .keep_tokens_min(2_000)

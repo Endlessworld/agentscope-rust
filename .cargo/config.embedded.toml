@@ -17,7 +17,7 @@ build-std = ["std", "panic_abort"]
 [build]
 rustflags = [
     # rustc 的 unstable 选项：去掉 panic 字符串里的文件/行号
-    "-Z", "location-detail=none",
+
     # 链接期死代码消除（Windows MSVC）；Linux 改用 -Wl,--gc-sections,--icf=all
     "-C", "link-arg=/OPT:REF",
     "-C", "link-arg=/OPT:ICF",
