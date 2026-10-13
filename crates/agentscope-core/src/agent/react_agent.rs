@@ -928,11 +928,15 @@ fn emit_tool_result_text_delta(
 }
 
 /// Emits a ToolResultEnd event through the delta_tx channel.
+///
+/// `metadata` is attached verbatim under the `metadata` field so transport layers
+/// (e.g. the ACP mapper) can surface structured side data such as file diffs.
 fn emit_tool_result_end(
     delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
     tool_call_id: &str,
     tool_name: &str,
     state: ToolResultState,
+    metadata: &JsonMap,
 ) {
     let mut fields = JsonMap::new();
     fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
@@ -945,6 +949,12 @@ fn emit_tool_result_end(
         ToolResultState::Interrupted => "ERROR",
     };
     fields.insert("state".to_string(), serde_json::Value::String(state_str.to_string()));
+    if !metadata.is_empty() {
+        fields.insert(
+            "metadata".to_string(),
+            serde_json::to_value(metadata).unwrap_or(serde_json::Value::Null),
+        );
+    }
     emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields));
 }
 
@@ -1216,7 +1226,7 @@ async fn acting_phase(
                 let denied_text = "Permission denied by rules";
                 emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
                 results.push(denied_result(call, &decision.message));
-                emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied);
+                emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
             }
             PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
                 // Emit ToolResultStart for this tool execution.
@@ -1240,16 +1250,17 @@ async fn acting_phase(
                             emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &result_text);
                         }
                         let final_state = if rb.state == ToolResultState::Error { ToolResultState::Error } else { ToolResultState::Success };
+                        let metadata = rb.metadata.clone();
                         let bound = bind_result(call, rb);
                         suspended = suspended || bound.is_suspended();
                         results.push(bound);
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state);
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
                         emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &err_msg);
                         results.push(error_result(call, &err_msg));
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error);
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
                     }
                 }
             }
@@ -1281,16 +1292,17 @@ async fn acting_phase(
                                     emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
                                 }
                                 let final_state = if rb.state == ToolResultState::Error { ToolResultState::Error } else { ToolResultState::Success };
+                                let metadata = rb.metadata.clone();
                                 let bound = bind_result(effective_call, rb);
                                 suspended = suspended || bound.is_suspended();
                                 results.push(bound);
-                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state);
+                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
                             }
                             Err(e) => {
                                 let err_msg = e.to_string();
                                 emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
                                 results.push(error_result(effective_call, &err_msg));
-                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error);
+                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
                             }
                         }
                     } else {
@@ -1298,7 +1310,7 @@ async fn acting_phase(
                         let denied_text = &confirm_result.message;
                         emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
                         results.push(denied_result(call, denied_text));
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied);
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
                     }
                 } else {
                     return Err(Error::Agent(format!(

@@ -146,6 +146,45 @@ struct ToolView {
     kind: Option<&'static str>,
     last_input: Option<String>,
     last_output: Option<String>,
+    last_diff: Option<String>,
+}
+
+/// Renders an ACP `Plan` (structured todo list) into printable lines.
+fn render_plan(entries: &[agent_client_protocol::schema::v1::PlanEntry]) -> Vec<String> {
+    use agent_client_protocol::schema::v1::{PlanEntryPriority, PlanEntryStatus};
+    if entries.is_empty() {
+        return vec![format!("{DIM}[plan] cleared{RESET}")];
+    }
+    let open = entries
+        .iter()
+        .filter(|e| !matches!(e.status, PlanEntryStatus::Completed))
+        .count();
+    let mut lines = vec![format!("{DIM}[plan] {open} open todo(s){RESET}")];
+    for e in entries {
+        let marker = match e.status {
+            PlanEntryStatus::Completed => "[x]",
+            PlanEntryStatus::InProgress => "[~]",
+            _ => "[ ]",
+        };
+        let prio = match e.priority {
+            PlanEntryPriority::High => " (high)",
+            PlanEntryPriority::Low => " (low)",
+            _ => "",
+        };
+        lines.push(format!("{DIM}  {marker} {}{prio}{RESET}", e.content));
+    }
+    lines
+}
+
+/// Renders a `ToolCallContent::Diff` as a compact `diff: path (-a/+b)` summary line.
+fn render_diff(diff: &agent_client_protocol::schema::v1::Diff) -> String {
+    let old = diff.old_text.as_deref().unwrap_or("");
+    let removed = old.lines().count();
+    let added = diff.new_text.lines().count();
+    format!(
+        "{DIM}  diff: {} (-{removed}/+{added} lines){RESET}",
+        diff.path.display()
+    )
 }
 
 /// Renders a tool-call notification into the lines to print, updating the
@@ -218,6 +257,16 @@ fn render_tool(
         if view.last_output.as_deref() != Some(rendered.as_str()) {
             view.last_output = Some(rendered.clone());
             lines.push(format!("{DIM}  out: {rendered}{RESET}"));
+        }
+    }
+    // Inline file diffs attached by write/edit tools.
+    for c in content {
+        if let ToolCallContent::Diff(diff) = c {
+            let rendered = render_diff(diff);
+            if view.last_diff.as_deref() != Some(rendered.as_str()) {
+                view.last_diff = Some(rendered.clone());
+                lines.push(rendered);
+            }
         }
     }
     lines
@@ -397,6 +446,15 @@ async fn process_update(
                                     "{DIM}[context] {}/{} tokens ({:.1}%){RESET}",
                                     u.used, u.size, pct
                                 ));
+                            }
+                        }
+                        SessionUpdate::Plan(plan) => {
+                            if *last_was_thinking {
+                                output.line("");
+                                *last_was_thinking = false;
+                            }
+                            for line in render_plan(&plan.entries) {
+                                output.line(&line);
                             }
                         }
                         _ => {}

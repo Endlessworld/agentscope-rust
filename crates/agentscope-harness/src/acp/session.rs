@@ -758,7 +758,7 @@ impl AcpAgentSession {
                                 ) {
                                     emit(notif);
                                 }
-                                if let Some(notif) =
+                                for notif in
                                     tool_events.map(self.session_id.clone(), &ev)
                                 {
                                     emit(notif);

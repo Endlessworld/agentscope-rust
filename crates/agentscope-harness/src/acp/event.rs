@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, ContentChunk, MessageId, SessionId, SessionNotification, SessionUpdate,
-    TextContent, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, ContentChunk, Diff, MessageId, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use agentscope_core::event::{AgentEvent, AgentEventType};
 
@@ -138,6 +139,76 @@ fn content_from(text: &str) -> Vec<ToolCallContent> {
     )))]
 }
 
+/// Metadata key under which filesystem tools report ACP diffs.
+const METADATA_ACP_DIFFS: &str = "acp_diffs";
+
+/// Builds ACP `ToolCallContent::Diff` entries from a tool result's `metadata`
+/// (`acp_diffs: [{path, old_text?, new_text}]`), so clients render inline file
+/// diffs instead of only the plain-text summary.
+fn diffs_from(metadata: Option<&serde_json::Value>) -> Vec<ToolCallContent> {
+    let Some(entries) = metadata
+        .and_then(|m| m.get(METADATA_ACP_DIFFS))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let path = e.get("path").and_then(|v| v.as_str())?;
+            let new_text = e.get("new_text").and_then(|v| v.as_str())?;
+            let mut diff = Diff::new(PathBuf::from(path), new_text);
+            if let Some(old) = e.get("old_text").and_then(|v| v.as_str()) {
+                diff = diff.old_text(old);
+            }
+            Some(ToolCallContent::Diff(diff))
+        })
+        .collect()
+}
+
+/// Builds an ACP `Plan` session update from a `todo_write` call's arguments.
+///
+/// Returns `None` when the arguments are not a valid `todo_write` payload, so a
+/// malformed call never erases the client's current plan.
+fn plan_from_todos(raw_input: Option<&serde_json::Value>) -> Option<Plan> {
+    let todos = raw_input?.get("todos")?.as_array()?;
+    let entries = todos
+        .iter()
+        .filter_map(|t| {
+            let content = t.get("content")?.as_str()?;
+            let status = match t.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
+                "completed" => PlanEntryStatus::Completed,
+                "in_progress" => PlanEntryStatus::InProgress,
+                _ => PlanEntryStatus::Pending,
+            };
+            let priority = match t.get("priority").and_then(|v| v.as_str()) {
+                Some("high") => PlanEntryPriority::High,
+                Some("low") => PlanEntryPriority::Low,
+                _ => PlanEntryPriority::Medium,
+            };
+            Some(PlanEntry::new(content, priority, status))
+        })
+        .collect::<Vec<_>>();
+    Some(Plan::new(entries))
+}
+
+/// Builds the `SessionUpdate::Plan` notification for a completed `todo_write`
+/// call, when the tool arguments carry a todo list.
+fn plan_notification(
+    session_id: impl Into<SessionId>,
+    name: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<SessionNotification> {
+    if name != "todo_write" {
+        return None;
+    }
+    let plan = plan_from_todos(raw_input)?;
+    Some(SessionNotification::new(
+        session_id,
+        SessionUpdate::Plan(plan),
+    ))
+}
+
 /// Parses an accumulated string as JSON if possible, else wraps it as a string
 /// value. Returns `None` for empty payloads so clients never render `""`.
 fn json_value_from(s: String) -> Option<serde_json::Value> {
@@ -229,12 +300,18 @@ fn input_fields(name: &str, raw_input: &str) -> ToolCallUpdateFields {
 
 /// Update fields for the terminal state of a tool call: final `status` plus the
 /// arguments and the output (both as `raw_output` and as structured `content`).
+///
+/// When `metadata` carries ACP diffs (`acp_diffs`), matching `Diff` content is
+/// appended so clients render the file change inline.
 fn result_fields(
     name: &str,
     status: ToolCallStatus,
     raw_input: &str,
     raw_output: &str,
+    metadata: Option<&serde_json::Value>,
 ) -> ToolCallUpdateFields {
+    let mut content = content_from(raw_output);
+    content.extend(diffs_from(metadata));
     ToolCallUpdateFields::new()
         .title(human_title(name))
         .kind(tool_kind_for(name))
@@ -242,7 +319,7 @@ fn result_fields(
         .raw_input(json_value_from(raw_input.to_string()))
         .locations(non_empty(locations_from(raw_input)))
         .raw_output(json_value_from(raw_output.to_string()))
-        .content(non_empty(content_from(raw_output)))
+        .content(non_empty(content))
 }
 
 /// Accumulated state of a single tool call.
@@ -284,8 +361,8 @@ impl ToolEventMapper {
         self
     }
 
-    /// Map one core event; returns a notification when there is something
-    /// visible to send, or `None` for pure bookkeeping events.
+    /// Map one core event; returns the notifications to send, or an empty vector
+    /// for pure bookkeeping events.
     ///
     /// The lifecycle sent to the client is:
     /// - `ToolCall` creation (`Pending`) as soon as the arguments are known
@@ -293,11 +370,13 @@ impl ToolEventMapper {
     ///   emits arguments
     /// - `ToolCallUpdate` (`InProgress`) when the tool actually starts running
     /// - `ToolCallUpdate` (`Completed` / `Failed`) with `raw_output` + `content`
+    ///   (plus `Diff` content for filesystem writes, and a `Plan` update for
+    ///   `todo_write`).
     pub fn map(
         &mut self,
         session_id: impl Into<SessionId> + Clone,
         ev: &AgentEvent,
-    ) -> Option<SessionNotification> {
+    ) -> Vec<SessionNotification> {
         let sid = session_id.into();
         let data = ev.data();
         let id = data
@@ -321,63 +400,71 @@ impl ToolEventMapper {
                     name,
                     ..Default::default()
                 });
-                None
+                Vec::new()
             }
             AgentEventType::ToolCallDelta => {
                 let delta = data.fields.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                let acc = self.calls.get_mut(&id)?;
+                let Some(acc) = self.calls.get_mut(&id) else {
+                    return Vec::new();
+                };
                 if delta.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 acc.input.push_str(delta);
                 if !acc.created {
                     acc.created = true;
                     let name = acc.name.clone();
                     let raw_input = json_value_from(acc.input.clone());
-                    return Some(tool_call_start(
+                    return vec![tool_call_start(
                         sid,
                         id,
                         name.clone(),
                         tool_kind_for(&name),
                         raw_input,
-                    ));
+                    )];
                 }
                 let (name, input) = (acc.name.clone(), acc.input.clone());
-                Some(tool_call_update(sid, id, input_fields(&name, &input)))
+                vec![tool_call_update(sid, id, input_fields(&name, &input))]
             }
             AgentEventType::ToolCallEnd => {
-                let acc = self.calls.get_mut(&id)?;
+                let Some(acc) = self.calls.get_mut(&id) else {
+                    return Vec::new();
+                };
                 if !acc.created {
                     // A parameterless tool call: no delta ever arrives, so the
                     // creation notification must be sent here.
                     acc.created = true;
                     let name = acc.name.clone();
                     let kind = tool_kind_for(&name);
-                    return Some(tool_call_start(sid, id, name, kind, None));
+                    return vec![tool_call_start(sid, id, name, kind, None)];
                 }
                 let (name, input) = (acc.name.clone(), acc.input.clone());
-                Some(tool_call_update(sid, id, input_fields(&name, &input)))
+                vec![tool_call_update(sid, id, input_fields(&name, &input))]
             }
             AgentEventType::ToolResultStart => {
                 // The tool is actually executing now.
-                let acc = self.calls.get_mut(&id)?;
+                let Some(acc) = self.calls.get_mut(&id) else {
+                    return Vec::new();
+                };
                 if !acc.created {
                     acc.created = true;
                     let name = acc.name.clone();
                     let kind = tool_kind_for(&name);
-                    return Some(tool_call_start(sid, id, name, kind, None));
+                    return vec![tool_call_start(sid, id, name, kind, None)];
                 }
-                Some(tool_call_update(
+                vec![tool_call_update(
                     sid,
                     id,
                     ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
-                ))
+                )]
             }
             AgentEventType::ToolResultTextDelta => {
                 if let Some(d) = data.fields.get("delta").and_then(|v| v.as_str()) {
-                    self.calls.get_mut(&id)?.output.push_str(d);
+                    if let Some(acc) = self.calls.get_mut(&id) {
+                        acc.output.push_str(d);
+                    }
                 }
-                None
+                Vec::new()
             }
             AgentEventType::ToolResultEnd => {
                 let state = data
@@ -389,16 +476,31 @@ impl ToolEventMapper {
                     "ERROR" | "DENIED" => ToolCallStatus::Failed,
                     _ => ToolCallStatus::Completed,
                 };
-                let acc = self.calls.get_mut(&id)?;
+                let metadata = data.fields.get("metadata");
+                let Some(acc) = self.calls.get_mut(&id) else {
+                    return Vec::new();
+                };
                 let (name, input, output) = (
                     acc.name.clone(),
                     acc.input.clone(),
                     acc.output.clone(),
                 );
+                let raw_input = json_value_from(input.clone());
                 self.calls.remove(&id);
-                Some(tool_call_update(sid, id, result_fields(&name, status, &input, &output)))
+                let mut notifications = vec![tool_call_update(
+                    sid.clone(),
+                    id,
+                    result_fields(&name, status, &input, &output, metadata),
+                )];
+                // `todo_write` also drives the client's structured todo list: emit
+                // a `Plan` update built from the tool's own arguments so clients
+                // render a real todo widget rather than only the text summary.
+                if let Some(plan) = plan_notification(sid, &name, raw_input.as_ref()) {
+                    notifications.push(plan);
+                }
+                notifications
             }
-            _ => None,
+            _ => Vec::new(),
         }
     }
 }
@@ -495,14 +597,14 @@ mod tests {
         // so the client can render the parameters with the tool call itself.
         assert!(mapper
             .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallStart, start))
-            .is_none());
+            .is_empty());
 
         let mut delta = serde_json::Map::new();
         delta.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
         delta.insert("delta".to_string(), serde_json::json!("{\"path\":\"a.txt\"}"));
-        let notif = mapper
-            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta))
-            .expect("creation emitted once the arguments are known");
+        let notifs = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta));
+        let notif = notifs.first().expect("creation emitted once arguments are known");
         match &notif.update {
             SessionUpdate::ToolCall(tc) => {
                 assert_eq!(tc.title, "Read File");
@@ -535,9 +637,9 @@ mod tests {
         // The model finished emitting arguments: the tool has not run yet.
         let mut end = serde_json::Map::new();
         end.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
-        let notif = mapper
-            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallEnd, end))
-            .expect("maps to tool call update");
+        let notifs = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallEnd, end));
+        let notif = notifs.first().expect("maps to tool call update");
         match &notif.update {
             SessionUpdate::ToolCallUpdate(u) => {
                 assert_eq!(u.fields.title.as_deref(), Some("Read File"));
@@ -554,9 +656,9 @@ mod tests {
         // Execution starts.
         let mut started = serde_json::Map::new();
         started.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
-        let notif = mapper
-            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultStart, started))
-            .expect("maps to in-progress update");
+        let notifs = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultStart, started));
+        let notif = notifs.first().expect("maps to in-progress update");
         match &notif.update {
             SessionUpdate::ToolCallUpdate(u) => {
                 assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
@@ -571,14 +673,14 @@ mod tests {
         out.insert("delta".to_string(), serde_json::json!("file contents"));
         assert!(mapper
             .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultTextDelta, out))
-            .is_none());
+            .is_empty());
 
         let mut done = serde_json::Map::new();
         done.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
         done.insert("state".to_string(), serde_json::json!("SUCCESS"));
-        let notif = mapper
-            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultEnd, done))
-            .expect("maps to completion update");
+        let notifs = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultEnd, done));
+        let notif = notifs.first().expect("maps to completion update");
         match &notif.update {
             SessionUpdate::ToolCallUpdate(u) => {
                 assert_eq!(u.fields.status, Some(ToolCallStatus::Completed));
@@ -603,7 +705,88 @@ mod tests {
         delta.insert("delta".to_string(), serde_json::json!("{}"));
         assert!(mapper
             .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta))
-            .is_none());
+            .is_empty());
+    }
+
+    #[test]
+    fn edit_result_metadata_becomes_diff_content() {
+        let mut mapper = ToolEventMapper::new();
+        let mut start = serde_json::Map::new();
+        start.insert("tool_call_id".to_string(), serde_json::json!("call_e"));
+        start.insert("tool_name".to_string(), serde_json::json!("edit_file"));
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallStart, start));
+        let mut delta = serde_json::Map::new();
+        delta.insert("tool_call_id".to_string(), serde_json::json!("call_e"));
+        delta.insert(
+            "delta".to_string(),
+            serde_json::json!("{\"operations\":[{\"path\":\"a.txt\"}]}"),
+        );
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta));
+
+        let mut done = serde_json::Map::new();
+        done.insert("tool_call_id".to_string(), serde_json::json!("call_e"));
+        done.insert("state".to_string(), serde_json::json!("SUCCESS"));
+        done.insert(
+            "metadata".to_string(),
+            serde_json::json!({
+                "acp_diffs": [{"path": "a.txt", "old_text": "old\n", "new_text": "new\n"}]
+            }),
+        );
+        let notifs = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultEnd, done));
+        let u = match &notifs[0].update {
+            SessionUpdate::ToolCallUpdate(u) => u,
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        };
+        let diffs: Vec<_> = u
+            .fields
+            .content
+            .as_ref()
+            .expect("content present")
+            .iter()
+            .filter_map(|c| match c {
+                ToolCallContent::Diff(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diffs.len(), 1, "one diff expected");
+        assert_eq!(diffs[0].path, std::path::PathBuf::from("a.txt"));
+        assert_eq!(diffs[0].old_text.as_deref(), Some("old\n"));
+        assert_eq!(diffs[0].new_text, "new\n");
+    }
+
+    #[test]
+    fn todo_write_emits_plan_update() {
+        let mut mapper = ToolEventMapper::new();
+        let mut start = serde_json::Map::new();
+        start.insert("tool_call_id".to_string(), serde_json::json!("call_t"));
+        start.insert("tool_name".to_string(), serde_json::json!("todo_write"));
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallStart, start));
+        let mut delta = serde_json::Map::new();
+        delta.insert("tool_call_id".to_string(), serde_json::json!("call_t"));
+        delta.insert(
+            "delta".to_string(),
+            serde_json::json!(
+                "{\"todos\":[{\"content\":\"step one\",\"status\":\"completed\",\"priority\":\"high\"},{\"content\":\"step two\",\"status\":\"in_progress\"}]}"
+            ),
+        );
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta));
+
+        let mut done = serde_json::Map::new();
+        done.insert("tool_call_id".to_string(), serde_json::json!("call_t"));
+        done.insert("state".to_string(), serde_json::json!("SUCCESS"));
+        let notifs = mapper
+            .map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultEnd, done));
+        assert_eq!(notifs.len(), 2, "tool update + plan update");
+        let plan = match &notifs[1].update {
+            SessionUpdate::Plan(plan) => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.entries[0].content, "step one");
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
+        assert_eq!(plan.entries[0].priority, PlanEntryPriority::High);
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
     }
 
     #[test]

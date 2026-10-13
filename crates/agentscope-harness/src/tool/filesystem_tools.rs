@@ -11,6 +11,33 @@ use agentscope_core::message::ToolResultBlock;
 
 use crate::filesystem::Filesystem;
 
+/// Metadata key carrying ACP file diffs (`[{path, old_text, new_text}]`) produced by
+/// a write/edit tool, so the ACP event mapper can emit `ToolCallContent::Diff` for
+/// clients that render inline diffs.
+pub const METADATA_ACP_DIFFS: &str = "acp_diffs";
+
+/// Builds one ACP diff entry as JSON (`path`, optional `old_text`, `new_text`).
+fn diff_entry(path: &str, old_text: Option<String>, new_text: String) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+    if let Some(old) = old_text {
+        entry.insert("old_text".to_string(), serde_json::Value::String(old));
+    }
+    entry.insert("new_text".to_string(), serde_json::Value::String(new_text));
+    serde_json::Value::Object(entry)
+}
+
+/// Attaches ACP diff entries to a tool result's metadata (no-op when empty).
+fn with_diffs(mut result: ToolResultBlock, diffs: Vec<serde_json::Value>) -> ToolResultBlock {
+    if !diffs.is_empty() {
+        result.metadata.insert(
+            METADATA_ACP_DIFFS.to_string(),
+            serde_json::Value::Array(diffs),
+        );
+    }
+    result
+}
+
 /// Read-file parameters, mirroring `ReadFileTool.FilesReader`.
 /// `file_paths` supports batching multiple absolute paths.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -309,17 +336,30 @@ impl Tool for FilesystemTool {
                             agentscope_core::Error::Tool(format!("Invalid write_file params: {e}"))
                         })?;
                 let mut outputs = Vec::new();
+                let mut diffs = Vec::new();
                 for op in &params.operations {
+                    // Capture the pre-write content (None for a new file) so the ACP
+                    // client can render a proper diff. A failed read is non-fatal.
+                    let before = self
+                        .fs
+                        .read(&rt, &op.path, 0, 0)
+                        .await
+                        .ok()
+                        .map(|d| d.content);
                     match self.fs.write(&rt, &op.path, &op.content).await {
-                        Ok(()) => outputs.push(format!("### {}\nWritten", op.path)),
+                        Ok(()) => {
+                            outputs.push(format!("### {}\nWritten", op.path));
+                            diffs.push(diff_entry(&op.path, before, op.content.clone()));
+                        }
                         Err(e) => outputs.push(format!("### {}\nERROR: {e}", op.path)),
                     }
                 }
-                if outputs.is_empty() {
+                let text = if outputs.is_empty() {
                     "No operations to write".to_string()
                 } else {
                     outputs.join("\n\n")
-                }
+                };
+                return Ok(with_diffs(ToolResultBlock::text(text), diffs));
             }
             "edit_file" => {
                 let params: EditFileParams =
@@ -328,21 +368,41 @@ impl Tool for FilesystemTool {
                             agentscope_core::Error::Tool(format!("Invalid edit_file params: {e}"))
                         })?;
                 let mut outputs = Vec::new();
+                let mut diffs = Vec::new();
                 for op in &params.operations {
+                    let before = self
+                        .fs
+                        .read(&rt, &op.path, 0, 0)
+                        .await
+                        .ok()
+                        .map(|d| d.content);
                     match self
                         .fs
                         .edit(&rt, &op.path, &op.old_string, &op.new_string, op.replace_all)
                         .await
                     {
-                        Ok(n) => outputs.push(format!("### {}\n{} replacement(s)", op.path, n)),
+                        Ok(n) => {
+                            outputs.push(format!("### {}\n{} replacement(s)", op.path, n));
+                            if let Some(old) = before {
+                                let new = self
+                                    .fs
+                                    .read(&rt, &op.path, 0, 0)
+                                    .await
+                                    .ok()
+                                    .map(|d| d.content)
+                                    .unwrap_or_default();
+                                diffs.push(diff_entry(&op.path, Some(old), new));
+                            }
+                        }
                         Err(e) => outputs.push(format!("### {}\nERROR: {e}", op.path)),
                     }
                 }
-                if outputs.is_empty() {
+                let text = if outputs.is_empty() {
                     "No operations to edit".to_string()
                 } else {
                     outputs.join("\n\n")
-                }
+                };
+                return Ok(with_diffs(ToolResultBlock::text(text), diffs));
             }
             "grep_files" => {
                 let pattern = str_arg(&args, "pattern")?;
