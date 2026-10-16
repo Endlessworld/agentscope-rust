@@ -24,7 +24,7 @@ use agent_client_protocol::{Agent, Stdio};
 use agentscope_core::model::Model;
 use agentscope_extensions_model::OpenAiChatModel;
 
-use crate::agent::{CompactionConfig, HarnessAgent, HarnessAgentBuilder};
+use crate::agent::{CompactionConfig, HarnessAgent};
 use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
@@ -58,7 +58,7 @@ fn build_env_model() -> Arc<dyn Model> {
 }
 
 /// The default per-session factory: builds a fully-wired [`HarnessAgent`] using the
-/// [`HarnessAgentBuilder`]'s complete orchestration (workspace, filesystem tools, shell,
+/// [`HarnessAgent::builder`]'s complete orchestration (workspace, filesystem tools, shell,
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
 fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model = build_env_model();
