@@ -212,13 +212,22 @@ pub struct SubagentBlueprint {
     pub main_workspace: PathBuf,
     pub max_iters: i32,
     pub state_store: Option<Arc<dyn AgentStateStore>>,
+    /// Parent default children inherit unless their declaration overrides it
+    /// (mirrors Java `capturedPendingToolRecovery`).
+    pub enable_pending_tool_recovery: bool,
 }
 
 impl SubagentBlueprint {
     /// `general-purpose` (Java `buildGeneralPurposeFactory`): parent model and
     /// the full parent toolkit, static leaf so it cannot spawn further.
     pub fn general_purpose_factory(self: &Arc<Self>) -> Arc<dyn SubagentFactory> {
-        Arc::new(LeafFactory {
+        Arc::new(self.general_purpose_leaf())
+    }
+
+    /// Leaf configuration for the built-in `general-purpose` subagent, split out of
+    /// [`Self::general_purpose_factory`] so a test can inspect the resulting agent.
+    fn general_purpose_leaf(self: &Arc<Self>) -> LeafFactory {
+        LeafFactory {
             blueprint: Arc::clone(self),
             name: "general-purpose-subagent".into(),
             description: "General-purpose subagent for isolated task execution".into(),
@@ -230,7 +239,8 @@ impl SubagentBlueprint {
             skill_filter: Some(self.skill_filter.clone()),
             generate_options: self.generate_options.clone(),
             decl: None,
-        })
+            enable_pending_tool_recovery: self.enable_pending_tool_recovery,
+        }
     }
 
     /// Declared subagent (Java `buildDeclaredFactory`); `None` for remote targets.
@@ -238,10 +248,19 @@ impl SubagentBlueprint {
         self: &Arc<Self>,
         decl: &SubagentDeclaration,
     ) -> Option<Arc<dyn SubagentFactory>> {
+        Some(Arc::new(self.declared_leaf(decl)?))
+    }
+
+    /// Leaf configuration for a declaration, split out of [`Self::declared_factory`] so a
+    /// test can inspect the resulting `HarnessAgent` (the factory trait erases the type).
+    fn declared_leaf(
+        self: &Arc<Self>,
+        decl: &SubagentDeclaration,
+    ) -> Option<LeafFactory> {
         if decl.is_remote() {
             return None;
         }
-        Some(Arc::new(LeafFactory {
+        Some(LeafFactory {
             blueprint: Arc::clone(self),
             name: decl.name.clone(),
             description: decl.description.clone(),
@@ -252,8 +271,12 @@ impl SubagentBlueprint {
             model_override: decl.model.clone(),
             skill_filter: Some(declared_skill_filter(&self.skill_filter, decl)),
             generate_options: declared_generate_options(self.generate_options.as_ref(), decl),
+            // A declaration may override the parent default (Java: `decl.getEnablePendingToolRecovery() != null ? ... : b.enablePendingToolRecovery`).
+            enable_pending_tool_recovery: decl
+                .enable_pending_tool_recovery
+                .unwrap_or(self.enable_pending_tool_recovery),
             decl: Some(decl.clone()),
-        }))
+        })
     }
 }
 
@@ -274,10 +297,16 @@ struct LeafFactory {
     generate_options: Option<GenerateOptions>,
     /// `None` for `general-purpose` (no parent-identity bucketing).
     decl: Option<SubagentDeclaration>,
+    /// Effective pending-tool recovery flag for the child (declaration override or
+    /// parent default). Mirrors Java `capturedPendingToolRecovery`.
+    enable_pending_tool_recovery: bool,
 }
 
-impl SubagentFactory for LeafFactory {
-    fn create(&self, parent_rc: &RuntimeContext) -> Arc<dyn CallableAgent> {
+impl LeafFactory {
+    /// Builds the child agent. Split out of [`SubagentFactory::create`] so a test can
+    /// read the concrete `HarnessAgent` configuration (the trait returns
+    /// `Arc<dyn CallableAgent>`, which has no downcast hook).
+    fn build(&self, parent_rc: &RuntimeContext) -> HarnessAgent {
         let mut builder = HarnessAgent::builder()
             .name(self.name.clone())
             .description(self.description.clone())
@@ -285,7 +314,8 @@ impl SubagentFactory for LeafFactory {
             .toolkit(self.toolkit.copy())
             .workspace(self.workspace.clone())
             .sys_prompt(self.sys_prompt.clone())
-            .max_iters(self.max_iters);
+            .max_iters(self.max_iters)
+            .enable_pending_tool_recovery(self.enable_pending_tool_recovery);
         let model = resolve_declared_model(
             self.model_override.as_deref(),
             self.blueprint.model.as_ref(),
@@ -310,6 +340,123 @@ impl SubagentFactory for LeafFactory {
         if let Some(decl) = &self.decl {
             builder = builder.session_id(derive_child_session_id(decl, parent_rc));
         }
-        Arc::new(builder.build()) as Arc<dyn CallableAgent>
+        builder.build()
+    }
+}
+
+impl SubagentFactory for LeafFactory {
+    fn create(&self, parent_rc: &RuntimeContext) -> Arc<dyn CallableAgent> {
+        Arc::new(self.build(parent_rc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::message::{ContentBlock, Msg, TextBlock};
+    use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+
+    /// A model that always answers with a fixed text block.
+    struct StubModel;
+
+    #[async_trait::async_trait]
+    impl Model for StubModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+            Box::pin(futures::stream::once(async {
+                Ok(ChatResponse::builder()
+                    .content(vec![ContentBlock::Text(TextBlock::new("ok"))])
+                    .build())
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    /// Isolated scratch dir so a child build never touches the repository tree.
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentscope_subagent_recovery_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A blueprint carrying the parent's pending-tool-recovery default.
+    fn blueprint(parent_flag: bool) -> Arc<SubagentBlueprint> {
+        let dir = scratch();
+        Arc::new(SubagentBlueprint {
+            model: Some(Arc::new(StubModel) as Arc<dyn Model>),
+            model_resolver: None,
+            skill_filter: SkillFilter::only(&[]),
+            generate_options: None,
+            toolkit: Toolkit::new(),
+            cwd: Some(dir.clone()),
+            main_workspace: dir,
+            max_iters: 5,
+            state_store: None,
+            enable_pending_tool_recovery: parent_flag,
+        })
+    }
+
+    /// The flag a declared child would actually run with.
+    fn declared_child_flag(parent_flag: bool, decl_flag: Option<bool>) -> bool {
+        let mut decl = SubagentDeclaration::new("worker", "does work", "You work.");
+        decl.enable_pending_tool_recovery = decl_flag;
+        blueprint(parent_flag)
+            .declared_leaf(&decl)
+            .expect("a local declaration yields a leaf")
+            .build(&RuntimeContext::new())
+            .agent()
+            .expect("the child is built with a model")
+            .enable_pending_tool_recovery()
+    }
+
+    #[test]
+    fn declared_child_inherits_the_parent_default() {
+        assert!(
+            declared_child_flag(true, None),
+            "a declaration without an override must inherit the parent's true"
+        );
+        assert!(
+            !declared_child_flag(false, None),
+            "a declaration without an override must inherit the parent's false"
+        );
+    }
+
+    #[test]
+    fn declaration_override_beats_the_parent_default() {
+        assert!(
+            declared_child_flag(false, Some(true)),
+            "declaration true must beat parent false"
+        );
+        assert!(
+            !declared_child_flag(true, Some(false)),
+            "declaration false must beat parent true"
+        );
+    }
+
+    #[test]
+    fn general_purpose_child_inherits_the_parent_default() {
+        for flag in [true, false] {
+            let child = blueprint(flag)
+                .general_purpose_leaf()
+                .build(&RuntimeContext::new());
+            assert_eq!(
+                child
+                    .agent()
+                    .expect("the child is built with a model")
+                    .enable_pending_tool_recovery(),
+                flag,
+                "general-purpose must inherit the parent flag ({flag})"
+            );
+        }
     }
 }

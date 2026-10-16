@@ -86,6 +86,8 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
                 .build(),
         )
         .max_iters(50)
+        // 同 ACP 主路径：中断/崩溃后把悬挂的 tool_use 补成 error result。
+        .enable_pending_tool_recovery(true)
         .build()
 }
 
@@ -148,6 +150,17 @@ impl AcpCodingAgent {
     }
 
     /// Returns a builder for this agent.
+    /// Returns the shared session registry.
+    ///
+    /// Exposed so host wiring (e.g. the Ctrl-C/SIGTERM handler in the binary
+    /// entry point) can observe sessions created *after* the agent started
+    /// running and interrupt them, letting every in-flight turn unwind through
+    /// the normal path — reconcile + state checkpoint — before the process
+    /// exits, instead of being killed mid-turn.
+    pub fn session_registry(&self) -> Arc<Mutex<HashMap<String, AcpAgentSession>>> {
+        Arc::clone(&self.sessions)
+    }
+
     pub fn builder() -> AcpCodingAgentBuilder {
         AcpCodingAgentBuilder::default()
     }

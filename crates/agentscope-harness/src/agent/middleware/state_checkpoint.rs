@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::AgentEvent;
-use agentscope_core::middleware::{AgentInput, EventStream, Middleware, Next};
+use agentscope_core::middleware::{AgentInput, EventStream, Middleware, Next, ReasoningInput};
 use agentscope_core::state::{AgentState, AgentStateStore};
 use futures::Stream;
 
@@ -44,6 +44,22 @@ impl StateCheckpointMiddleware {
             restored: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+/// Serializes the shared agent state and writes it under the checkpoint key.
+async fn save_state_snapshot(
+    store: Arc<dyn AgentStateStore>,
+    state: Arc<std::sync::Mutex<AgentState>>,
+) {
+    let (uid, sid, value) = {
+        let g = state.lock().unwrap();
+        (
+            g.user_id().map(str::to_string),
+            g.session_id().to_string(),
+            serde_json::to_value(&*g).unwrap_or_default(),
+        )
+    };
+    store.save(uid.as_deref(), &sid, AGENT_STATE_KEY, value).await;
 }
 
 impl Middleware for StateCheckpointMiddleware {
@@ -101,6 +117,29 @@ impl Middleware for StateCheckpointMiddleware {
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         };
 
+        Box::pin(AsyncGate::new(inner, pre, post))
+    }
+
+    /// Per-iteration checkpoint.
+    ///
+    /// Fires once per reasoning iteration; its post phase runs after the previous
+    /// iteration's assistant/tool messages have been published to the shared state
+    /// (see `reasoning_phase`). Persisting here caps the loss from an abrupt process
+    /// death — `kill -9`, OOM kill or power loss, none of which can run shutdown
+    /// code — at the in-flight iteration instead of the whole turn.
+    fn on_reasoning(
+        &self,
+        ctx: &RuntimeContext,
+        input: ReasoningInput,
+        next: Next<ReasoningInput>,
+    ) -> EventStream {
+        let Some(state) = ctx.state.clone() else {
+            return next(input);
+        };
+        let inner = next(input);
+        let pre = Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>;
+        let post = Box::pin(save_state_snapshot(Arc::clone(&self.store), Arc::clone(&state)))
+            as Pin<Box<dyn Future<Output = ()> + Send>>;
         Box::pin(AsyncGate::new(inner, pre, post))
     }
 }

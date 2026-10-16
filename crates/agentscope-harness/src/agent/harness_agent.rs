@@ -1465,6 +1465,7 @@ impl HarnessAgentBuilder {
                         .as_ref()
                         .and_then(|d| d.agent_state_store.clone())
                 }),
+                enable_pending_tool_recovery: self.enable_pending_tool_recovery.unwrap_or(false),
             });
             // --- subagent entries ---
             let mut entries: Vec<SubagentEntry> = Vec::new();

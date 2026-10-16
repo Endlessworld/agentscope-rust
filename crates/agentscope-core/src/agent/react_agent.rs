@@ -86,6 +86,13 @@ struct AgentCore {
     /// Guarded by a mutex so an ACP session can install/swap the handler per
     /// prompt (e.g. bound to the current client connection) at runtime.
     confirm_handler: Mutex<Option<ConfirmHandler>>,
+    /// Partial assistant message produced by the most recent model call, recorded
+    /// when that call was interrupted mid-stream. `reasoning_phase` appends it to
+    /// the context so an interrupted turn keeps what the model had already
+    /// produced and the caller's reconciliation can answer its dangling tool_use
+    /// blocks. Mirrors Java's `InterruptedException` branch, which adds
+    /// `buildFinalMessage()` to the context.
+    partial_assistant: Mutex<Option<Msg>>,
 }
 
 /// Accumulates streamed model chunks into a single assistant message.
@@ -187,6 +194,12 @@ impl ReActAgent {
         self.core.max_iters
     }
 
+    /// Whether orphaned pending tool calls are auto-patched with synthetic error
+    /// results before a turn runs (mirrors Java `isPendingToolRecoveryEnabled`).
+    pub fn enable_pending_tool_recovery(&self) -> bool {
+        self.core.enable_pending_tool_recovery
+    }
+
     /// Returns the model bound to this agent.
     pub fn model(&self) -> Arc<dyn Model> {
         self.core.model.lock().unwrap().clone()
@@ -280,6 +293,12 @@ impl ReActAgent {
         response_format: Option<ResponseFormat>,
     ) -> Result<Msg> {
         let _guard = ExecutionGuard::acquire()?;
+        // A new call clears the previous run's interrupt signal, so an earlier
+        // user interrupt cannot permanently wedge the agent. Java models this as a
+        // fresh per-`CallExecution` `InterruptControl`; Rust keeps one flag per
+        // agent (calls on a session are serialized by `call_gate`), so it is reset
+        // here at the call boundary.
+        self.core.interrupt.reset();
         // Seed the shared task bag from the persisted state, then restore it after the run
         // so any `todo_write` mutations survive.
         let seed = self.core.state.lock().unwrap().tasks_context.clone();
@@ -719,6 +738,7 @@ impl ReActAgentBuilder {
             subscriber: Arc::new(Mutex::new(None)),
             tasks,
             confirm_handler: Mutex::new(self.confirm_handler),
+            partial_assistant: Mutex::new(None),
         });
         Ok(ReActAgent { id, name, description: self.description, core })
     }
@@ -736,13 +756,56 @@ async fn run_agent_loop(
     messages: Vec<Msg>,
 ) -> Result<Msg> {
     let mut state = core.state.lock().unwrap().clone();
+
+    // Mirrors Java `doCallInner`: when the previous turn left unresolved tool calls,
+    // decide how to proceed *before* appending the new input. Two of Java's four
+    // branches are ported — recovery (patch orphans) and the fail-fast guard below.
+    // Java's "resume" branch (act on the pending tools without another reasoning
+    // step) is not migrated, and Java's ASKING branch is unreachable here because
+    // this loop never persists `ToolCallState::Asking` (HITL is resolved inline by
+    // the confirm handler during the acting phase).
+    let mut pending = extract_pending_tool_calls(&state);
+    if !pending.is_empty() {
+        if core.enable_pending_tool_recovery {
+            patch_pending_tool_calls(&mut state, &messages);
+            pending = extract_pending_tool_calls(&state);
+        }
+        // Java throws here — and so do we. Without this the dangling tool_use is sent
+        // to the provider verbatim (rejected with HTTP 400) or silently dropped by the
+        // harness sanitizer, leaving no hint about the real cause. The caller can still
+        // resolve the orphan itself by supplying tool results in `messages`.
+        let caller_supplied_results = messages
+            .iter()
+            .any(|m| m.tool_result_blocks().next().is_some());
+        if !pending.is_empty() && !messages.is_empty() && !caller_supplied_results {
+            let ids: Vec<&str> = pending.iter().map(|c| c.id.as_str()).collect();
+            return Err(Error::Agent(format!(
+                "Pending tool calls exist without results. Enable \
+                 enable_pending_tool_recovery or provide tool results. Pending IDs: {ids:?}"
+            )));
+        }
+    }
+
     for m in messages {
         state.context_mut().push(m);
     }
     state.set_cur_iter(0);
-    let result = execute_iteration(core, ctx, &mut state, 0).await?;
+    let result = match execute_iteration(core, ctx, &mut state, 0).await {
+        // An interrupt is not a failure: reconcile the dangling tool_use left by
+        // the interrupted turn and append a recovery message, so the caller sees
+        // a normal reply and the next turn continues from a consistent context.
+        // Mirrors Java `handleInterrupt`.
+        Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
+        other => other,
+    };
+    // Commit the accumulated state even when the run failed or was interrupted:
+    // the messages that completed before the error (user input, finished
+    // assistant turns, tool results) must survive, so a follow-up "continue"
+    // resumes instead of replaying from the previous turn boundary. Mirrors
+    // Java, where `scope.state` is mutated in place and
+    // `saveStateAfterCallFailure` persists it on the error path.
     *core.state.lock().unwrap() = state;
-    Ok(result)
+    result
 }
 
 async fn execute_iteration(
@@ -796,6 +859,13 @@ async fn reasoning_phase(
 ) -> Result<Msg> {
     check_interrupted(core)?;
     state.set_cur_iter(iter);
+    // Publish the state accumulated so far (this turn's input plus the previous
+    // iteration's assistant/tool messages) into the shared state before the
+    // reasoning chain runs. Without this, `core.state` would stay frozen at the
+    // previous turn boundary for the whole turn, so a per-iteration checkpoint
+    // middleware would have nothing to persist and an abrupt process death
+    // (kill -9 / OOM / power loss) would lose the entire turn.
+    *core.state.lock().unwrap() = state.clone();
     if iter >= core.max_iters {
         return summarizing(core, state).await;
     }
@@ -825,7 +895,22 @@ async fn reasoning_phase(
     ModelUtils::ensure_default_execution_config(&mut options);
     let input = ReasoningInput::new(messages, tools, options);
 
-    let final_msg = run_reasoning(core, ctx, input).await?;
+    let final_msg = match run_reasoning(core, ctx, input).await {
+        Ok(msg) => msg,
+        Err(e) => {
+            // Keep the assistant message the model had already produced when the
+            // call was interrupted, so the interrupted turn can reconcile its
+            // dangling tool_use blocks instead of losing the response entirely
+            // (Java parity).
+            if matches!(e, Error::Interrupted(_)) {
+                let partial = core.partial_assistant.lock().unwrap().take();
+                if let Some(partial) = partial {
+                    state.context_mut().push(partial);
+                }
+            }
+            return Err(e);
+        }
+    };
     state.context_mut().push(final_msg.clone());
     Ok(final_msg)
 }
@@ -1112,7 +1197,6 @@ async fn model_call_impl(
         let consume = async {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                check_interrupted(core)?;
                 for block in &chunk.content {
                     match block {
                         ContentBlock::Text(t) => {
@@ -1148,6 +1232,10 @@ async fn model_call_impl(
                     }
                 }
                 acc.accumulate(chunk);
+                // Checked after accumulating so an interrupt still preserves the
+                // chunks already received (Java parity: its InterruptedException
+                // branch persists `buildFinalMessage()`).
+                check_interrupted(core)?;
             }
             Ok::<_, Error>(())
         };
@@ -1168,6 +1256,20 @@ async fn model_call_impl(
             Err(e) => {
                 attempt += 1;
                 if attempt >= max_attempts || !e.is_retryable() {
+                    // Preserve what the model had already produced when the call was
+                    // interrupted, so the turn can reconcile its dangling tool_use
+                    // instead of silently dropping the partial response. Other
+                    // failures drop it: a half-formed message must never be
+                    // replayed to the provider. Mirrors Java's InterruptedException
+                    // branch, which persists `buildFinalMessage()`.
+                    if matches!(e, Error::Interrupted(_)) {
+                        let partial = acc.build_final_message();
+                        let has_content = partial.tool_use_blocks().next().is_some()
+                            || !partial.text_content().is_empty();
+                        if has_content {
+                            *core.partial_assistant.lock().unwrap() = Some(partial);
+                        }
+                    }
                     return Err(e);
                 }
                 let delay = cfg.backoff_for(attempt - 1);
@@ -1437,6 +1539,68 @@ fn extract_pending_tool_calls(state: &AgentState) -> Vec<ToolUseBlock> {
         .filter(|tu| !answered.contains(tu.id.as_str()))
         .cloned()
         .collect()
+}
+
+/// Builds a TOOL-role message carrying a single tool-result block.
+fn tool_result_msg(result: ToolResultBlock) -> Msg {
+    Msg::builder()
+        .role(MsgRole::Tool)
+        .content(vec![ContentBlock::ToolResult(result)])
+        .build()
+}
+
+/// Patches orphaned pending tool calls with synthetic error results so the next
+/// turn can proceed from a consistent context instead of failing on a dangling
+/// tool_use. No-op when the caller supplied its own tool results. Mirrors Java
+/// `maybePatchPendingToolCalls`; gated by `enable_pending_tool_recovery` at the
+/// call site.
+fn patch_pending_tool_calls(state: &mut AgentState, messages: &[Msg]) {
+    let pending = extract_pending_tool_calls(state);
+    if pending.is_empty() {
+        return;
+    }
+    // The caller provided tool results itself: let the normal path validate them.
+    if messages.iter().any(|m| m.tool_result_blocks().next().is_some()) {
+        return;
+    }
+    for call in pending {
+        let result = error_result(
+            &call,
+            &format!(
+                "Previous tool execution failed or was interrupted. Tool: {}",
+                call.name
+            ),
+        );
+        state.context_mut().push(tool_result_msg(result));
+    }
+}
+
+/// Reconciles an interrupted turn and returns the recovery message.
+///
+/// The assistant message written by the interrupted reasoning phase may carry
+/// tool_use blocks that never ran; those are answered with synthetic error
+/// results (so the persisted context has no dangling tool call), then an
+/// assistant recovery message is appended. Mirrors Java `handleInterrupt`.
+fn reconcile_interrupted(state: &mut AgentState) -> Msg {
+    for call in extract_pending_tool_calls(state) {
+        let result = error_result(
+            &call,
+            &format!(
+                "Tool execution was interrupted before it could run. Tool: {}",
+                call.name
+            ),
+        );
+        state.context_mut().push(tool_result_msg(result));
+    }
+    let recovery = Msg::builder()
+        .role(MsgRole::Assistant)
+        .content(vec![ContentBlock::Text(TextBlock::new(
+            "I noticed that you have interrupted me. What can I do for you?",
+        ))])
+        .generate_reason(GenerateReason::Interrupted)
+        .build();
+    state.context_mut().push(recovery.clone());
+    recovery
 }
 
 /// Evaluates the permission decision for a single tool invocation.
@@ -2228,5 +2392,220 @@ mod tests {
         let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
         assert_eq!(reply.text_content(), "after approved");
         assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    /// A model that raises the agent's interrupt signal right before yielding its
+    /// response, simulating an interrupt that lands after the reasoning phase has
+    /// completed but before the acting phase runs.
+    struct InterruptingModel {
+        name: String,
+        responses: Arc<Mutex<Vec<ChatResponse>>>,
+        agent: Arc<Mutex<Option<std::sync::Weak<ReActAgent>>>>,
+    }
+
+    impl InterruptingModel {
+        fn new(name: &str, responses: Vec<ChatResponse>) -> Self {
+            Self {
+                name: name.to_string(),
+                responses: Arc::new(Mutex::new(responses)),
+                agent: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn attach(&self, agent: &Arc<ReActAgent>) {
+            *self.agent.lock().unwrap() = Some(Arc::downgrade(agent));
+        }
+    }
+
+    #[async_trait]
+    impl Model for InterruptingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let responses = Arc::clone(&self.responses);
+            let agent = Arc::clone(&self.agent);
+            Box::pin(futures::stream::once(async move {
+                let upgraded = agent.lock().unwrap().as_ref().and_then(|w| w.upgrade());
+                if let Some(a) = upgraded {
+                    a.interrupt();
+                }
+                let mut g = responses.lock().unwrap();
+                let r = if g.is_empty() { text_response("done") } else { g.remove(0) };
+                Ok(r)
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_preserves_progress_and_returns_recovery() {
+        // The interrupt lands after the reasoning phase produced an assistant
+        // tool_use but before the acting phase could run. The turn must still
+        // commit the user input and that assistant message, answer the dangling
+        // tool_use, and return a recovery reply instead of discarding the turn.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let mut toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(InterruptingModel::new(
+            "mock",
+            vec![tool_use_response("c1", "add", input)],
+        ));
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("t-interrupt")
+                .model(model.clone() as Arc<dyn Model>)
+                .toolkit(toolkit)
+                .build()
+                .unwrap(),
+        );
+        model.attach(&agent);
+
+        let reply = agent.call(vec![Msg::user("compute 1+2")]).await.unwrap();
+        assert_eq!(reply.generate_reason(), GenerateReason::Interrupted);
+
+        let state = agent.core.state.lock().unwrap();
+        let ctx = state.context();
+        assert!(
+            ctx.iter()
+                .any(|m| m.role() == MsgRole::User && m.text_content() == "compute 1+2"),
+            "the user input must survive an interrupt; got {ctx:?}"
+        );
+        assert!(
+            ctx.iter()
+                .any(|m| m.role() == MsgRole::Assistant && m.tool_use_blocks().next().is_some()),
+            "the assistant message produced before the interrupt must survive"
+        );
+        // The dangling tool_use is answered with a synthesized error result so the
+        // committed context stays provider-valid.
+        let answered = ctx
+            .iter()
+            .filter(|m| m.role() == MsgRole::Tool)
+            .flat_map(|m| m.tool_result_blocks())
+            .any(|t| t.id.as_deref() == Some("c1"));
+        assert!(answered, "the dangling c1 tool_use must be answered; got {ctx:?}");
+        assert_eq!(*counter.lock().unwrap(), 0, "the interrupted tool must not run");
+    }
+
+    #[tokio::test]
+    async fn interrupt_flag_is_reset_on_the_next_call() {
+        // A user interrupt must not wedge the agent for good: Java gives every call
+        // a fresh InterruptControl, so the next call has to run normally rather
+        // than immediately failing on the stale signal.
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hello")]));
+        let agent = ReActAgent::builder().name("t-reset").model(model).build().unwrap();
+
+        agent.interrupt();
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "hello");
+    }
+
+    #[tokio::test]
+    async fn pending_tool_recovery_patches_orphaned_tool_use() {
+        // A persisted state may hold an assistant tool_use with no matching result
+        // (the process died mid-acting). With recovery enabled the next call
+        // answers it with a synthetic error result instead of failing.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let mut toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let initial = AgentState::builder()
+            .session_id("s-recovery")
+            .add_message(Msg::user("compute"))
+            .add_message(
+                Msg::builder()
+                    .role(MsgRole::Assistant)
+                    .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                        "c9",
+                        "add",
+                        JsonMap::new(),
+                    ))])
+                    .build(),
+            )
+            .build();
+        let model = Arc::new(MockModel::new("mock", vec![text_response("resumed")]));
+        let agent = ReActAgent::builder()
+            .name("t-patch")
+            .model(model)
+            .toolkit(toolkit)
+            .state(initial)
+            .enable_pending_tool_recovery(true)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("continue")]).await.unwrap();
+        assert_eq!(reply.text_content(), "resumed");
+        let state = agent.core.state.lock().unwrap();
+        let ctx = state.context();
+        let answered = ctx
+            .iter()
+            .filter(|m| m.role() == MsgRole::Tool)
+            .flat_map(|m| m.tool_result_blocks())
+            .any(|t| t.id.as_deref() == Some("c9"));
+        assert!(answered, "orphaned c9 tool_use must be patched; got {ctx:?}");
+        assert_eq!(*counter.lock().unwrap(), 0, "the orphaned tool must not execute");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_pending_tool_call_fails_fast() {
+        // Same dangling state as the recovery test above, but with recovery disabled
+        // and a prompt that carries no tool results: the loop must refuse with an
+        // actionable error instead of shipping a dangling tool_use to the provider
+        // (HTTP 400) or letting the harness sanitizer silently drop it. Mirrors Java
+        // `doCallInner`'s `IllegalStateException`.
+        let mut toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::new(Mutex::new(0))));
+        let initial = AgentState::builder()
+            .session_id("s-unresolvable")
+            .add_message(Msg::user("compute"))
+            .add_message(
+                Msg::builder()
+                    .role(MsgRole::Assistant)
+                    .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                        "c9",
+                        "add",
+                        JsonMap::new(),
+                    ))])
+                    .build(),
+            )
+            .build();
+        let model = Arc::new(MockModel::new("mock", vec![text_response("unreachable")]));
+        let agent = ReActAgent::builder()
+            .name("t-unresolvable")
+            .model(model)
+            .toolkit(toolkit)
+            .state(initial)
+            .build()
+            .unwrap();
+
+        let err = agent
+            .call(vec![Msg::user("continue")])
+            .await
+            .expect_err("a dangling tool call with no recovery must fail fast");
+        let text = err.to_string();
+        assert!(
+            text.contains("Pending tool calls exist without results"),
+            "expected the fail-fast guard; got: {text}"
+        );
+        assert!(
+            text.contains("c9"),
+            "the error must name the pending id; got: {text}"
+        );
+        // The turn must not have been committed: no follow-up reply was produced.
+        let state = agent.core.state.lock().unwrap();
+        assert!(
+            !state
+                .context()
+                .iter()
+                .any(|m| m.text_content().contains("unreachable")),
+            "the model must not have been called"
+        );
     }
 }

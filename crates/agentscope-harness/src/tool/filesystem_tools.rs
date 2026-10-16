@@ -158,7 +158,21 @@ impl FilesystemTool {
         Self {
             fs,
             name: "edit_file".into(),
-            description: "Perform exact string replacement in one or more files. old_string must be unique unless replace_all is true. Accepts a batch of edit operations.".into(),
+            description: r#" 在单个或多个文件中执行精确字符串替换，支持批量编辑。
+                             参数：
+                             - path（必填）：目标文件路径。
+                             - old_string（必填）：要替换的原字符串。
+                             - new_string（必填）：替换后的新字符串。
+                             - replace_all（可选）：为 true 时替换所有匹配项；否则 old_string 在目标文件中必须唯一，否则不应执行替换。
+                             - path、old_string、new_string 为必填字段，且必须处于同一参数层级。
+                             使用要求：
+                             - 支持一次传入多个编辑操作。
+                             - 所有替换均按精确字符串匹配执行。
+                             - 每次尽可能执行更多的编辑操作以增加编辑效率
+                             - 先想清楚需要修改哪些文件和内容，再一次性完成所有编辑。
+                             示例:
+                             {operations:[{path:"filePath1","old_string":"aaa",new_string:"bbb","replace_all":false}]}
+             \"#.into(),
             read_only: false,
             schema: serde_json::json!({
                 "type": "object",
@@ -168,7 +182,7 @@ impl FilesystemTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "File to edit"},
+                                "path": {"type": "string", "description": "File to edit is required"},
                                 "old_string": {"type": "string", "description": "Text to find"},
                                 "new_string": {"type": "string", "description": "Replacement text"},
                                 "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)", "default": false}

@@ -88,7 +88,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
 use agentscope_core::model::{GenerateOptions, Model};
@@ -96,7 +97,7 @@ use agentscope_extensions_model::{
     AnthropicMessagesModel, OpenAiChatModel, OpenAiResponsesModel,
 };
 use agentscope_core::state::JsonFileAgentStateStore;
-use agentscope_harness::acp::{config::default_modes, AcpCodingAgent};
+use agentscope_harness::acp::{config::default_modes, AcpAgentSession, AcpCodingAgent};
 use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::agent::{
@@ -949,7 +950,10 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
         // 工具结果外置：超过 80k 字符的工具输出（如构建日志）写入磁盘，
         // context 只保留预览占位符，避免大输出驻留内存。
         .tool_result_eviction(ToolResultEvictionConfig::defaults())
-        .max_iters(9999);
+        .max_iters(9999)
+        // 被中断/崩溃打断后，把悬挂的 tool_use 补成 error result 再续跑，避免
+        // ToolCallPairSanitizer 静默丢弃整条 assistant 消息（对齐 Java maybePatchPendingToolCalls）。
+        .enable_pending_tool_recovery(true);
 
     // Skill support (Open Agent Skills protocol, mirrors Java commit b906d1b):
     // - global:   $HOME/.agents/skills   (installed via `npx skill` globally)
@@ -1054,7 +1058,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_sessions(3)
         .build()?;
 
+    // Shutdown handling: on Ctrl-C / SIGTERM, interrupt every live session so its
+    // in-flight turn unwinds through the normal path — interrupt reconciliation
+    // plus the state checkpoint — before the process exits, instead of being
+    // killed mid-turn and losing the iteration.
+    //
+    // `kill -9`, OOM kills and power loss cannot run any handler at all; those rely
+    // on the per-iteration checkpoint (`StateCheckpointMiddleware::on_reasoning`)
+    // to cap the loss at the in-flight iteration.
+    spawn_shutdown_handler(agent.session_registry());
+
     tracing::info!("ACP CodingAgent starting over stdio...");
     agent.run_stdio().await?;
     Ok(())
+}
+
+/// Waits for a shutdown signal: Ctrl-C on every platform, plus SIGTERM on unix.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Interrupts every live session on shutdown so in-flight turns unwind through the
+/// normal path and get checkpointed before the process exits.
+///
+/// Polls the shared registry at signal time because sessions can be created after
+/// startup.
+fn spawn_shutdown_handler(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>) {
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        eprintln!("\n[shutdown] interrupt received; saving session state...");
+        {
+            let guard = sessions.lock().unwrap();
+            for session in guard.values() {
+                session.agent().interrupt();
+            }
+        }
+        // `ExecutionGuard` tracks live calls, so poll that rather than guessing a
+        // fixed delay: exit only after the interrupted turns have unwound and their
+        // state has been checkpointed.
+        let manager = agentscope_core::GracefulShutdownManager::instance();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while manager.get_active_request_count() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        eprintln!("[shutdown] state saved; exiting");
+        std::process::exit(130);
+    });
 }
