@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, ContentChunk, Diff, MessageId, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    Content, ContentBlock, ContentChunk, Diff, MessageId, Notice, NoticeSeverity, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use agentscope_core::event::{AgentEvent, AgentEventType};
 
@@ -67,6 +67,72 @@ pub(crate) fn human_title(name: &str) -> String {
     }
 }
 
+/// Builds the ID-addressed `SessionUpdate::CompactionUpdate` for a completed
+/// context compaction (capability-gated on `session.compaction`).
+///
+/// The summary is sent as a single text `CompactionSummaryChunk` alongside an
+/// `in_progress` → `completed` upsert pair, so clients that render the retained
+/// summary see it flow in exactly once.
+pub fn compaction_notifications(
+    session_id: impl Into<SessionId>,
+    compaction_id: &str,
+    summary: &str,
+) -> Vec<SessionNotification> {
+    use agent_client_protocol::schema::v1::{
+        CompactionStatus, CompactionSummaryChunk, CompactionUpdate,
+    };
+    let sid = session_id.into();
+    let mut updates = vec![
+        SessionNotification::new(
+            sid.clone(),
+            SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                compaction_id.to_string(),
+                CompactionStatus::InProgress,
+            )),
+        ),
+    ];
+    if !summary.trim().is_empty() {
+        updates.push(SessionNotification::new(
+            sid.clone(),
+            SessionUpdate::CompactionSummaryChunk(CompactionSummaryChunk::new(
+                compaction_id.to_string(),
+                ContentBlock::Text(TextContent::new(summary.to_string())),
+            )),
+        ));
+    }
+    updates.push(SessionNotification::new(
+        sid,
+        SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+            compaction_id.to_string(),
+            CompactionStatus::Completed,
+        )),
+    ));
+    updates
+}
+
+/// Recognizes the in-band compaction marker emitted by
+/// `ConversationCompactionMiddleware` and returns `(agent_id, summary)`.
+pub(crate) fn compaction_marker(ev: &AgentEvent) -> Option<(String, String)> {
+    if ev.event_type() != AgentEventType::Custom {
+        return None;
+    }
+    let fields = &ev.data().fields;
+    if fields.get("kind").and_then(|v| v.as_str()) != Some("compaction") {
+        return None;
+    }
+    let agent_id = fields
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let summary = fields
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some((agent_id, summary))
+}
+
 /// Emits a plain-text agent message chunk update.
 ///
 /// The chunk is tagged with `message_id` so clients can group the streamed
@@ -95,6 +161,25 @@ pub fn thought_chunk(
         chunk = chunk.message_id(id);
     }
     SessionNotification::new(session_id, SessionUpdate::AgentThoughtChunk(chunk))
+}
+
+/// Builds a capability-gated `SessionUpdate::Notice` (advisory, non-history
+/// information such as a failed MCP server or a model-switch failure).
+///
+/// The protocol only allows notices when the client advertised
+/// `session.notices`; when it did not, the caller must fall back to a normal
+/// agent message so the information still reaches the user.
+pub fn notice(
+    session_id: impl Into<SessionId>,
+    severity: NoticeSeverity,
+    title: impl Into<String>,
+    description: Option<String>,
+) -> SessionNotification {
+    let mut n = Notice::new(severity, title.into());
+    if let Some(d) = description {
+        n = n.description(d);
+    }
+    SessionNotification::new(session_id, SessionUpdate::Notice(n))
 }
 
 /// Argument keys whose value is a file path. Used to derive `locations` so
@@ -206,6 +291,41 @@ fn plan_notification(
     Some(SessionNotification::new(
         session_id,
         SessionUpdate::Plan(plan),
+    ))
+}
+
+/// Stable plan id used for the `todo_write`-derived plan. The legacy
+/// `SessionUpdate::Plan` there is only ever one plan per session, so a constant
+/// id is sufficient to address it through the ID-addressed plan operations.
+pub(crate) const TODO_PLAN_ID: &str = "todos";
+
+/// Builds the ID-addressed `SessionUpdate::PlanUpdate` for a completed
+/// `todo_write` call (used when the client advertises `plan` capabilities, i.e.
+/// it can consume `plan_update` / `plan_removed`).
+fn plan_update_notification(
+    session_id: impl Into<SessionId>,
+    name: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<SessionNotification> {
+    if name != "todo_write" {
+        return None;
+    }
+    let plan = plan_from_todos(raw_input)?;
+    use agent_client_protocol::schema::v1::{PlanRemoved, PlanUpdate, PlanUpdateContent};
+    // An empty entry list means the todo list was cleared: the ID-addressed
+    // protocol removes the plan instead of rendering an empty one.
+    if plan.entries.is_empty() {
+        return Some(SessionNotification::new(
+            session_id,
+            SessionUpdate::PlanRemoved(PlanRemoved::new(TODO_PLAN_ID)),
+        ));
+    }
+    Some(SessionNotification::new(
+        session_id,
+        SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+            TODO_PLAN_ID,
+            plan.entries,
+        ))),
     ))
 }
 
@@ -338,6 +458,10 @@ struct ToolCallAcc {
 pub struct ToolEventMapper {
     calls: HashMap<String, ToolCallAcc>,
     message_id: Option<MessageId>,
+    /// Whether the client advertised plan operations. When true the
+    /// `todo_write`-derived plan is sent as `plan_update` (ID-addressed);
+    /// otherwise the legacy `SessionUpdate::Plan` is used.
+    plan_operations: bool,
 }
 
 impl Default for ToolEventMapper {
@@ -351,7 +475,15 @@ impl ToolEventMapper {
         Self {
             calls: HashMap::new(),
             message_id: None,
+            plan_operations: false,
         }
+    }
+
+    /// Selects the ID-addressed plan operations (`plan_update`) instead of the
+    /// legacy `SessionUpdate::Plan` for `todo_write`-derived plans.
+    pub fn with_plan_operations(mut self, enabled: bool) -> Self {
+        self.plan_operations = enabled;
+        self
     }
 
     /// Sets the `message_id` shared by the tool calls of the current turn, so
@@ -495,7 +627,14 @@ impl ToolEventMapper {
                 // `todo_write` also drives the client's structured todo list: emit
                 // a `Plan` update built from the tool's own arguments so clients
                 // render a real todo widget rather than only the text summary.
-                if let Some(plan) = plan_notification(sid, &name, raw_input.as_ref()) {
+                // Clients that advertised plan operations get the ID-addressed
+                // `plan_update` form instead.
+                let plan = if self.plan_operations {
+                    plan_update_notification(sid, &name, raw_input.as_ref())
+                } else {
+                    plan_notification(sid, &name, raw_input.as_ref())
+                };
+                if let Some(plan) = plan {
                     notifications.push(plan);
                 }
                 notifications
@@ -795,6 +934,98 @@ mod tests {
         assert_eq!(tool_kind_for("edit_file"), ToolKind::Edit);
         assert_eq!(tool_kind_for("bash"), ToolKind::Execute);
         assert_eq!(tool_kind_for("web_search"), ToolKind::Fetch);
+    }
+
+    #[test]
+    fn plan_operations_use_id_addressed_update_when_enabled() {
+        let mut mapper = ToolEventMapper::new().with_plan_operations(true);
+        let notifs = todo_write_result(&mut mapper, "[{\"content\":\"a\",\"status\":\"pending\"}]");
+        assert_eq!(notifs.len(), 2, "tool update + plan update");
+        let plan = match &notifs[1].update {
+            SessionUpdate::PlanUpdate(update) => update,
+            other => panic!("expected PlanUpdate, got {other:?}"),
+        };
+        match &plan.plan {
+            agent_client_protocol::schema::v1::PlanUpdateContent::Items(items) => {
+                assert_eq!(items.plan_id.to_string(), TODO_PLAN_ID);
+                assert_eq!(items.entries.len(), 1);
+            }
+            other => panic!("expected itemized plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_todo_list_removes_the_id_addressed_plan() {
+        let mut mapper = ToolEventMapper::new().with_plan_operations(true);
+        let notifs = todo_write_result(&mut mapper, "[]");
+        assert_eq!(notifs.len(), 2);
+        match &notifs[1].update {
+            SessionUpdate::PlanRemoved(removed) => {
+                assert_eq!(removed.plan_id.to_string(), TODO_PLAN_ID);
+            }
+            other => panic!("expected PlanRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_notifications_go_in_progress_then_completed() {
+        let notifs = compaction_notifications(sid(), "compaction-1", "retained summary");
+        assert_eq!(notifs.len(), 3, "in_progress + summary + completed");
+        use agent_client_protocol::schema::v1::CompactionStatus;
+        match &notifs[0].update {
+            SessionUpdate::CompactionUpdate(u) => {
+                assert_eq!(u.compaction_id.to_string(), "compaction-1");
+                assert_eq!(u.status, CompactionStatus::InProgress);
+            }
+            other => panic!("expected CompactionUpdate, got {other:?}"),
+        }
+        assert!(matches!(
+            &notifs[1].update,
+            SessionUpdate::CompactionSummaryChunk(_)
+        ));
+        match &notifs[2].update {
+            SessionUpdate::CompactionUpdate(u) => {
+                assert_eq!(u.status, CompactionStatus::Completed);
+            }
+            other => panic!("expected CompactionUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_marker_is_recognized_and_other_custom_events_are_not() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("kind".to_string(), serde_json::json!("compaction"));
+        fields.insert("agent_id".to_string(), serde_json::json!("a1"));
+        fields.insert("summary".to_string(), serde_json::json!("s"));
+        let ev = AgentEvent::with_fields(AgentEventType::Custom, fields);
+        assert_eq!(compaction_marker(&ev), Some(("a1".to_string(), "s".to_string())));
+
+        let other = AgentEvent::with_fields(AgentEventType::Custom, serde_json::Map::new());
+        assert!(compaction_marker(&other).is_none());
+        assert!(compaction_marker(&AgentEvent::AgentEnd(EventData::default())).is_none());
+    }
+
+    /// Drives a `todo_write` call through the mapper and returns the completion
+    /// notifications (tool update first, plan update second).
+    fn todo_write_result(
+        mapper: &mut ToolEventMapper,
+        todos_json: &str,
+    ) -> Vec<SessionNotification> {
+        let mut start = serde_json::Map::new();
+        start.insert("tool_call_id".to_string(), serde_json::json!("call_t"));
+        start.insert("tool_name".to_string(), serde_json::json!("todo_write"));
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallStart, start));
+        let mut delta = serde_json::Map::new();
+        delta.insert("tool_call_id".to_string(), serde_json::json!("call_t"));
+        delta.insert(
+            "delta".to_string(),
+            serde_json::json!(format!("{{\"todos\":{todos_json}}}")),
+        );
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolCallDelta, delta));
+        let mut done = serde_json::Map::new();
+        done.insert("tool_call_id".to_string(), serde_json::json!("call_t"));
+        done.insert("state".to_string(), serde_json::json!("SUCCESS"));
+        mapper.map(sid(), &AgentEvent::with_fields(AgentEventType::ToolResultEnd, done))
     }
 
     #[test]

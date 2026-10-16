@@ -23,10 +23,11 @@
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
+    ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ContentBlock,
+    InitializeRequest, NoticeCapabilities, PermissionOptionKind, PlanCapabilities,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason, TextContent, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use std::collections::HashMap;
 use agent_client_protocol::util::MatchDispatch;
@@ -457,6 +458,50 @@ async fn process_update(
                                 output.line(&line);
                             }
                         }
+                        SessionUpdate::Notice(n) => {
+                            if *last_was_thinking {
+                                output.line("");
+                                *last_was_thinking = false;
+                            }
+                            let detail = n
+                                .description
+                                .as_ref()
+                                .map(|d| format!(": {d}"))
+                                .unwrap_or_default();
+                            output.line(&format!("{DIM}[notice] {}{detail}{RESET}", n.title));
+                        }
+                        SessionUpdate::CurrentModeUpdate(u) => {
+                            output.line(&format!("{DIM}[mode] {}{RESET}", u.current_mode_id));
+                        }
+                        SessionUpdate::ConfigOptionUpdate(u) => {
+                            output.line(&format!(
+                                "{DIM}[config] {} option(s) updated{RESET}",
+                                u.config_options.len()
+                            ));
+                        }
+                        SessionUpdate::CompactionUpdate(u) => {
+                            output.line(&format!(
+                                "{DIM}[compaction] {} ({:?}){RESET}",
+                                u.compaction_id, u.status
+                            ));
+                        }
+                        SessionUpdate::PlanUpdate(u) => {
+                            if let agent_client_protocol::schema::v1::PlanUpdateContent::Items(
+                                items,
+                            ) = &u.plan
+                            {
+                                if *last_was_thinking {
+                                    output.line("");
+                                    *last_was_thinking = false;
+                                }
+                                for line in render_plan(&items.entries) {
+                                    output.line(&line);
+                                }
+                            }
+                        }
+                        SessionUpdate::PlanRemoved(_) => {
+                            output.line(&format!("{DIM}[plan] cleared{RESET}"));
+                        }
                         _ => {}
                     }
                     Ok(())
@@ -666,15 +711,59 @@ async fn main() -> Result<()> {
         )
         .connect_with(agent, |cx: ConnectionTo<Agent>| async move {
             let _init = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .send_request(
+                    // Advertise the client-side capabilities this CLI can consume so
+                    // the agent may emit notices / compaction / plan operations
+                    // instead of degrading them to plain messages.
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                        ClientCapabilities::new()
+                            .session(
+                                ClientSessionCapabilities::new()
+                                    .notices(NoticeCapabilities::new())
+                                    .compaction(CompactionCapabilities::new()),
+                            )
+                            .plan(PlanCapabilities::new()),
+                    ),
+                )
                 .block_task()
                 .await?;
 
-            let mut session = cx
-                .build_session(PathBuf::from("."))
-                .block_task()
-                .start_session()
-                .await?;
+            let mut session = match std::env::var("ACP_SESSION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
+                // Restore an existing session by id: `session/load` replays
+                // history, `session/resume` continues without replay. Both are
+                // only valid when the agent advertised the matching capability;
+                // the CLI passes the id explicitly, so it trusts the caller.
+                Some(id) => {
+                    let cwd = PathBuf::from(".");
+                    if std::env::var("ACP_SESSION_REPLAY").is_ok() {
+                        let session = cx
+                            .load_session(id, cwd)
+                            .block_task()
+                            .start_session()
+                            .await?
+                            .into_session();
+                        eprintln!("[session] restored via session/load");
+                        session
+                    } else {
+                        let session = cx
+                            .resume_session(id, cwd)
+                            .block_task()
+                            .start_session()
+                            .await?
+                            .into_session();
+                        eprintln!("[session] restored via session/resume");
+                        session
+                    }
+                }
+                None => cx
+                    .build_session(PathBuf::from("."))
+                    .block_task()
+                    .start_session()
+                    .await?,
+            };
 
             eprintln!("Connected! Type your prompts below. (Ctrl-D or /quit to exit)\n");
 

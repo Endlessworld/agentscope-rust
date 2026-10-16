@@ -11,12 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, CloseSessionRequest, CloseSessionResponse,
-    DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
-    Implementation, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    DeleteSessionRequest, DeleteSessionResponse, DisableProviderRequest, DisableProviderResponse,
+    InitializeRequest, InitializeResponse, Implementation, ListProvidersRequest,
+    ListProvidersResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, PromptCapabilities, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionResumeCapabilities, SetSessionConfigOptionRequest,
+    PromptResponse, PromptCapabilities, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
+    SetProviderRequest, SetProviderResponse, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
 use agent_client_protocol::{Agent, Stdio};
@@ -28,7 +30,9 @@ use crate::agent::{CompactionConfig, HarnessAgent};
 use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
+use super::provider::ProviderRegistry;
 use super::session::{AcpAgentSession, AcpClientHandle};
+use super::support::ClientSupport;
 
 /// Default agent info advertised during initialization.
 const AGENT_NAME: &str = "agentscope-coding-agent";
@@ -102,6 +106,13 @@ pub struct AcpCodingAgent {
     /// 会话注册表上限（嵌入式优化）：超过上限时淘汰最旧会话，
     /// 避免多会话成倍放大内存。默认 1。
     max_sessions: usize,
+    /// Capabilities advertised by the connected client at `initialize`.
+    /// Several optional `session/update` variants are capability-gated; every
+    /// session shares this view so the gates reflect the live negotiation.
+    client_support: ClientSupport,
+    /// Provider descriptors advertised through `providers/list`, keyed by
+    /// provider id. Empty when the client did not negotiate `providers`.
+    providers: ProviderRegistry,
 }
 
 impl AcpCodingAgent {
@@ -119,6 +130,8 @@ impl AcpCodingAgent {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             model_builder: None,
             max_sessions: 1,
+            client_support: ClientSupport::new(),
+            providers: ProviderRegistry::default(),
         }
     }
 
@@ -149,7 +162,7 @@ impl AcpCodingAgent {
                     .audio(false)
                     .embedded_context(true),
             )
-            .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
+            .mcp_capabilities(McpCapabilities::new().http(true).sse(true).acp(true))
             .session_capabilities(
                 SessionCapabilities::new()
                     .list(SessionListCapabilities::new())
@@ -170,6 +183,9 @@ impl AcpCodingAgent {
             self.models.clone(),
             self.modes.clone(),
         );
+        // Clones share the same underlying capability store, so a late
+        // `initialize` still gates this session's optional updates correctly.
+        session.set_client_support(self.client_support.clone());
         if let Some(builder) = &self.model_builder {
             session.set_model_builder(Arc::clone(builder));
         }
@@ -216,14 +232,35 @@ impl AcpCodingAgent {
             .cloned()
     }
 
-    /// Currently registered session ids.
-    fn session_ids(&self) -> Vec<SessionId> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .keys()
-            .map(|k| SessionId::new(k.clone()))
-            .collect()
+    /// Builds the `session/list` response, honouring the request's `cursor`.
+    ///
+    /// Sessions are ordered by id (stable, and the id embeds the creation
+    /// timestamp) so pagination is deterministic. `next_cursor` is the last id
+    /// of a non-final page; the client passes it back to fetch the next page.
+    fn session_infos(&self, cursor: Option<&str>) -> ListSessionsResponse {
+        const PAGE_SIZE: usize = 50;
+        let guard = self.sessions.lock().unwrap();
+        let mut entries: Vec<&AcpAgentSession> = guard.values().collect();
+        entries.sort_by(|a, b| a.session_id().to_string().cmp(&b.session_id().to_string()));
+
+        // The cursor is the exclusive lower bound (last id of the prior page).
+        let start = match cursor {
+            Some(c) => entries
+                .iter()
+                .position(|s| s.session_id().to_string() == c)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let page: Vec<&AcpAgentSession> = entries.into_iter().skip(start).take(PAGE_SIZE).collect();
+        let has_more = start + page.len() < guard.len();
+        let next_cursor = if has_more {
+            page.last().map(|s| s.session_id().to_string())
+        } else {
+            None
+        };
+        let infos: Vec<SessionInfo> = page.into_iter().map(|s| s.session_info()).collect();
+        ListSessionsResponse::new(infos).next_cursor(next_cursor)
     }
 
     /// Assembles and runs the ACP agent over stdio until the connection closes.
@@ -254,12 +291,27 @@ impl AcpCodingAgent {
         let a_load = agent.clone();
         let a_resume = agent.clone();
         let a_delete = agent.clone();
+        let a_providers = agent.clone();
+        let a_providers_set = agent.clone();
+        let a_providers_disable = agent.clone();
         Agent
             .builder()
             .on_receive_request(
                 async move |initialize: InitializeRequest, responder, _cx| {
+                    // Record what the client advertised so capability-gated
+                    // session updates (`session/notice`, compaction, plan ops)
+                    // can be suppressed when unsupported.
+                    a_init
+                        .client_support
+                        .set_capabilities(initialize.client_capabilities.clone());
+                    let mut caps = a_init.capabilities();
+                    if !a_init.providers.is_empty() {
+                        caps = caps.providers(
+                            agent_client_protocol::schema::v1::ProvidersCapabilities::new(),
+                        );
+                    }
                     let response = InitializeResponse::new(initialize.protocol_version)
-                        .agent_capabilities(a_init.capabilities())
+                        .agent_capabilities(caps)
                         .agent_info(Implementation::new(AGENT_NAME, AGENT_VERSION));
                     responder.respond(response)
                 },
@@ -275,7 +327,8 @@ impl AcpCodingAgent {
                             .map(|d| d.as_millis())
                             .unwrap_or(0)
                     ));
-                    let session = a_new.create_session(session_id.clone(), cwd);
+                    let mut session = a_new.create_session(session_id.clone(), cwd);
+                    session.set_additional_directories(req.additional_directories.clone());
                     // Bridge any MCP servers the client declared before serving
                     // the first prompt, so their tools are available immediately.
                     if !req.mcp_servers.is_empty() {
@@ -322,8 +375,11 @@ impl AcpCodingAgent {
                                 Some(cancellation),
                             )
                             .await;
+                        // Turn-level token usage must be read before the session
+                        // is moved back into the registry.
+                        let usage = session.turn_usage_response();
                         registrar.register_session(session);
-                        responder.respond(PromptResponse::new(stop))
+                        responder.respond(PromptResponse::new(stop).usage(usage))
                     })?;
                     Ok(())
                 },
@@ -359,12 +415,20 @@ impl AcpCodingAgent {
                         _ => {}
                     }
                     let config_options = session.config_options();
+                    let update = agent_client_protocol::schema::v1::SessionNotification::new(
+                        session.session_id().clone(),
+                        agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+                            agent_client_protocol::schema::v1::ConfigOptionUpdate::new(
+                                config_options.clone(),
+                            ),
+                        ),
+                    );
+                    let _ = cx.send_notification(update);
                     a_cfg.register_session(session);
                     responder.respond(SetSessionConfigOptionResponse::new(config_options))
                 },
                 agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_request(
+            )            .on_receive_request(
                 async move |req: SetSessionModeRequest, responder, cx| {
                     let sid = req.session_id;
                     let mut session = match a_mode.get_session(&sid) {
@@ -376,6 +440,17 @@ impl AcpCodingAgent {
                     // calls need the connection to push request_permission.
                     session.set_client(AcpClientHandle::new(cx.clone()));
                     session.set_mode(req.mode_id.to_string());
+                    // Reflect the mode change to the client so its UI updates
+                    // without waiting for the next prompt turn.
+                    let update = agent_client_protocol::schema::v1::SessionNotification::new(
+                        session.session_id().clone(),
+                        agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
+                            agent_client_protocol::schema::v1::CurrentModeUpdate::new(
+                                req.mode_id.clone(),
+                            ),
+                        ),
+                    );
+                    let _ = cx.send_notification(update);
                     a_mode.register_session(session);
                     responder.respond(SetSessionModeResponse::new())
                 },
@@ -393,13 +468,9 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |_req: ListSessionsRequest, responder, _cx| {
-                    let infos: Vec<SessionInfo> = a_list
-                        .session_ids()
-                        .into_iter()
-                        .map(|id| SessionInfo::new(id, PathBuf::from(".")))
-                        .collect();
-                    responder.respond(ListSessionsResponse::new(infos))
+                async move |req: ListSessionsRequest, responder, _cx| {
+                    let infos = a_list.session_infos(req.cursor.as_deref());
+                    responder.respond(infos)
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -415,6 +486,8 @@ impl AcpCodingAgent {
                             a_load.get_session(&sid).unwrap()
                         }
                     };
+                    let mut session = session;
+                    session.set_additional_directories(req.additional_directories.clone());
                     // Bridge MCP servers declared on load (idempotent per server).
                     if !req.mcp_servers.is_empty() {
                         session.apply_mcp_servers(&req.mcp_servers).await;
@@ -440,6 +513,8 @@ impl AcpCodingAgent {
                             a_resume.get_session(&sid).unwrap()
                         }
                     };
+                    let mut session = session;
+                    session.set_additional_directories(req.additional_directories.clone());
                     // Bridge MCP servers declared on resume (idempotent per server).
                     if !req.mcp_servers.is_empty() {
                         session.apply_mcp_servers(&req.mcp_servers).await;
@@ -457,6 +532,49 @@ impl AcpCodingAgent {
                 async move |req: DeleteSessionRequest, responder, _cx| {
                     a_delete.remove_session(&req.session_id);
                     responder.respond(DeleteSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ListProvidersRequest, responder, _cx| {
+                    responder.respond(ListProvidersResponse::new(a_providers.providers.list()))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetProviderRequest, responder, _cx| {
+                    let ok = a_providers_set.providers.set(
+                        &req.provider_id.to_string(),
+                        req.api_type,
+                        req.base_url,
+                        req.headers,
+                    );
+                    if ok {
+                        responder.respond(SetProviderResponse::new())
+                    } else {
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(format!(
+                                "unknown provider '{}'",
+                                req.provider_id
+                            )),
+                        )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: DisableProviderRequest, responder, _cx| {
+                    let ok = a_providers_disable.providers.disable(&req.provider_id.to_string());
+                    if ok {
+                        responder.respond(DisableProviderResponse::new())
+                    } else {
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(format!(
+                                "provider '{}' is unknown or required",
+                                req.provider_id
+                            )),
+                        )
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )

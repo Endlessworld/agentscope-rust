@@ -10,8 +10,14 @@
 pub mod coding_agent;
 pub mod config;
 pub mod event;
+pub mod mcp_over_acp;
 pub mod permission_store;
+pub mod provider;
 pub mod session;
+pub mod support;
 
 pub use coding_agent::{AcpCodingAgent, AcpCodingAgentBuilder, ACP_CONTEXT_WINDOW_TOKENS};
+pub use mcp_over_acp::{McpAcpConnection, McpAcpTool};
+pub use provider::{ProviderDescriptor, ProviderRegistry};
 pub use session::AcpAgentSession;
+pub use support::ClientSupport;

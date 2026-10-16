@@ -95,7 +95,8 @@ impl Middleware for ConversationCompactionMiddleware {
                     }
                 }
             };
-            if let Some(replacement) = compacted {
+            let summary = compacted.as_ref().and_then(|replacement| {
+                let summary = replacement.first().map(|m| m.text_content());
                 let mut guard = state.lock().unwrap();
                 let sys: Vec<Msg> = guard
                     .context()
@@ -104,12 +105,38 @@ impl Middleware for ConversationCompactionMiddleware {
                     .cloned()
                     .collect();
                 let mut new_ctx = sys;
-                new_ctx.extend(replacement);
+                new_ctx.extend(replacement.iter().cloned());
                 *guard.context_mut() = new_ctx;
                 tracing::debug!(agent = %agent_id, "conversation compacted");
+                summary
+            });
+            // Announce the compaction in-band so the ACP layer can translate it
+            // into a capability-gated `compaction_update` session notification.
+            if let Some(summary) = summary {
+                let event = compaction_event(&agent_id, &summary);
+                return futures::stream::once(async move { Ok(event) })
+                    .chain(next(input))
+                    .boxed();
             }
             next(input)
         };
         Box::pin(futures::stream::once(fut).flatten())
     }
+}
+
+/// Builds the in-band marker event announcing a completed conversation
+/// compaction.
+///
+/// The ACP layer intercepts this `Custom` event and translates it into a
+/// capability-gated `compaction_update` session notification; other consumers
+/// can ignore it.
+fn compaction_event(agent_id: &str, summary: &str) -> agentscope_core::event::AgentEvent {
+    let mut fields = serde_json::Map::new();
+    fields.insert("kind".to_string(), serde_json::json!("compaction"));
+    fields.insert("agent_id".to_string(), serde_json::json!(agent_id));
+    fields.insert("summary".to_string(), serde_json::json!(summary));
+    agentscope_core::event::AgentEvent::with_fields(
+        agentscope_core::event::AgentEventType::Custom,
+        fields,
+    )
 }

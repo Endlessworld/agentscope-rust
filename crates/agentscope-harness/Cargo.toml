@@ -33,8 +33,24 @@ rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["clien
 rust-mcp-transport = { version = "1.0.0", default-features = false, features = ["sse", "streamable-http"] }
 
 # 2.2.0（schema 1.9）起「程序化工具名」已在 v1 稳定，`unstable_tool_call_name`
-# 特性被移除，故不再声明任何 feature。改动理由与影响见 memory/2026-10-16.md。
-agent-client-protocol = { version = "2.2.0" }
+# 特性被移除。改动理由与影响见 memory/2026-10-16.md。
+#
+# 下列 unstable feature 逐个开启（不用聚合 `unstable`，因为它还含本项目
+# 明确暂缓的 `unstable_protocol_v2` / `unstable_session_fork`）：
+#   - unstable_session_notices        Session Notices（schema 1.9.0）
+#   - unstable_session_compaction     压缩进度通知
+#   - unstable_plan_operations        存续式 Plan（PlanUpdate/PlanRemoved）
+#   - unstable_llm_providers          providers/list|set|disable
+#   - unstable_end_turn_token_usage   PromptResponse.usage
+#   - unstable_mcp_over_acp           MCP-over-ACP 传输
+agent-client-protocol = { version = "2.2.0", features = [
+    "unstable_session_notices",
+    "unstable_session_compaction",
+    "unstable_plan_operations",
+    "unstable_llm_providers",
+    "unstable_end_turn_token_usage",
+    "unstable_mcp_over_acp",
+] }
 
 [[bin]]
 name = "acp_agent_cli"
