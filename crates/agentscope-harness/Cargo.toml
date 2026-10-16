@@ -32,9 +32,9 @@ rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["clien
 # server-side `mcp_http` module in rust-mcp-sdk 1.0.1.
 rust-mcp-transport = { version = "1.0.0", default-features = false, features = ["sse", "streamable-http"] }
 
-# `unstable_tool_call_name` exposes the programmatic `name` field on tool calls;
-# clients that do not know it simply ignore it.
-agent-client-protocol = { path = "D:/IdeaProjects/agentclientprotocol/rust-sdk/src/agent-client-protocol", version = "2.0.0", features = ["unstable_tool_call_name"] }
+# 2.2.0（schema 1.9）起「程序化工具名」已在 v1 稳定，`unstable_tool_call_name`
+# 特性被移除，故不再声明任何 feature。改动理由与影响见 memory/2026-10-16.md。
+agent-client-protocol = { version = "2.2.0" }
 
 [[bin]]
 name = "acp_agent_cli"
