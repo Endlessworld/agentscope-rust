@@ -69,7 +69,16 @@ fn execution_config_merge() {
     let fallback = ExecutionConfig::model_defaults();
     let merged = ExecutionConfig::merge_configs(Some(&primary), Some(&fallback)).unwrap();
     assert_eq!(merged.timeout, Some(std::time::Duration::from_secs(30)));
-    assert_eq!(merged.max_attempts, Some(3));
+    assert_eq!(merged.max_attempts, Some(7));
+}
+
+#[test]
+fn model_defaults_backoff_reaches_a_minute() {
+    let cfg = ExecutionConfig::model_defaults();
+    // Six waits (2s, 4s, 8s, 16s, 32s, then capped at 60s) before giving up.
+    let waits: Vec<u64> = (0..6).map(|a| cfg.backoff_for(a).as_secs()).collect();
+    assert_eq!(waits, vec![2, 4, 8, 16, 32, 60]);
+    assert_eq!(cfg.max_attempts, Some(7));
 }
 
 #[test]

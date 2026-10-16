@@ -56,7 +56,14 @@ impl Tool for ShellExecuteTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command. Use for git, npm, build, test, and other terminal operations. Returns combined output and exit code. If a dedicated tool exists (e.g., read_file, write_file), you MUST use it instead of shell commands."
+        // Windows 下命令由 PowerShell (pwsh) 执行（见 filesystem/sandbox.rs build_windows_command），
+        // 而 pwsh 把 `$` 当变量/插值前缀：未定义的 `$5`/`$1` 会展开为空串而“消失”。
+        // 把该语义提示写进 description，避免模型按 cmd/bash 直觉写命令导致 `$` 被吞。
+        if cfg!(windows) {
+            "Execute a shell command and return combined output + exit code. Use for git, npm, build, test, and other terminal operations. If a dedicated tool exists (e.g., read_file, write_file), you MUST use it instead of shell commands. Note: on Windows the command runs in PowerShell (pwsh), not cmd or bash. PowerShell treats `$` as a variable/interpolation prefix, so an unquoted or double-quoted `$` is expanded and silently eaten (e.g. `echo price is $5` prints `price is `; `awk {print $1}` loses `$1`). Always wrap any literal `$` in SINGLE quotes: `echo 'price is $5'`, `awk '{print $1}'`, `git log --format='%h %s'`. Single quotes keep text verbatim in pwsh; the same applies to other PowerShell metacharacters such as backtick (escape char), `@(...)` (array splat) and `#` (comment)."
+        } else {
+            "Execute a shell command and return combined output + exit code. Use for git, npm, build, test, and other terminal operations. If a dedicated tool exists (e.g., read_file, write_file), you MUST use it instead of shell commands."
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

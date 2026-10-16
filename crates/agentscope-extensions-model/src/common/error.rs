@@ -195,9 +195,18 @@ impl ModelError {
         format!("[{}] {} ({})", self.provider, self.message, suffix.join(", "))
     }
 
-    /// Converts into the core error type, preserving the status code so
-    /// `agentscope_core::Error::is_retryable` keeps working in the agent layer.
+    /// Converts into the core error type, preserving both the status code and
+    /// the retryability classification.
+    ///
+    /// `agentscope_core::Error::is_retryable` only retries 429/5xx
+    /// [`Error::HttpStatus`], so a retryable failure that carries no such status
+    /// (a transport failure, whose status is 0, or a 408 the gateway reported)
+    /// is surfaced as [`Error::Http`] — always retryable. Without this the
+    /// agent's model retry loop never fires for those failures.
     pub fn to_core(&self) -> Error {
+        if self.retryable() && !matches!(self.status, 429 | 500..=599) {
+            return Error::Http(self.display_message());
+        }
         Error::http_status(self.status, self.display_message())
     }
 
@@ -505,6 +514,69 @@ mod tests {
         let err = ModelError::parse("gemini", 503, "upstream unavailable");
         assert_eq!(err.message, "upstream unavailable");
         assert_eq!(err.kind, ErrorKind::Server);
+    }
+
+    /// A transport failure (no HTTP status at all) must stay retryable after the
+    /// conversion to the core error, otherwise the agent's model retry loop does
+    /// not fire and the timeout fails the whole turn.
+    #[test]
+    fn retryable_statusless_error_stays_retryable_in_core() {
+        let mut timeout = ModelError::new(
+            "openai",
+            0,
+            "error sending request for url (https://example.invalid/v1/chat/completions)",
+        );
+        timeout.kind = ErrorKind::Timeout;
+        assert!(timeout.retryable());
+        assert!(timeout.to_core().is_retryable(), "timeout must be retried");
+
+        // Same shape, but a kind that is not worth retrying keeps failing fast.
+        let mut invalid = ModelError::new("openai", 0, "invalid tool schema");
+        invalid.kind = ErrorKind::InvalidRequest;
+        assert!(!invalid.to_core().is_retryable());
+    }
+
+    /// The transport failure reported against the `opencode.ai/zen` gateway
+    /// (`HTTP error 0: [openai] error sending request for url (...)
+    /// (kind=network_error)`) carries no HTTP status, so it must be converted to
+    /// a retryable core error — otherwise the whole turn dies on a network blip.
+    #[test]
+    fn gateway_network_error_is_retried() {
+        let mut network = ModelError::new(
+            "openai",
+            0,
+            "error sending request for url (https://opencode.ai/zen/go/v1/chat/completions)",
+        );
+        network.kind = ErrorKind::Network;
+        assert_eq!(network.kind.as_str(), "network_error");
+        assert!(network.retryable());
+        assert!(
+            network.to_core().is_retryable(),
+            "a transport failure must be retried"
+        );
+    }
+
+    /// A retryable status that `Error::is_retryable` does not recognise (408) is
+    /// carried through as a transport error; 429/5xx keep their status code.
+    #[test]
+    fn retryable_status_is_preserved_for_core() {
+        let gateway_timeout = ModelError::new("gateway", 408, "request timeout");
+        assert_eq!(gateway_timeout.kind, ErrorKind::Timeout);
+        assert!(gateway_timeout.to_core().is_retryable());
+
+        let rate_limited = ModelError::parse(
+            "openai",
+            429,
+            r#"{"error":{"message":"slow down","type":"rate_limit_error"}}"#,
+        );
+        let core = rate_limited.to_core();
+        assert_eq!(core.http_status_code(), Some(429));
+        assert!(core.is_retryable());
+
+        let auth = ModelError::parse("openai", 401, r#"{"error":{"message":"nope"}}"#);
+        let core = auth.to_core();
+        assert_eq!(core.http_status_code(), Some(401));
+        assert!(!core.is_retryable());
     }
 
     #[test]

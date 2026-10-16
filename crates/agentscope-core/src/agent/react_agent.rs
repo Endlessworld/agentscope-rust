@@ -1085,7 +1085,7 @@ async fn model_call_impl(
     let options = mc_input.options;
 
     // Model-level retry policy (429 / 5xx / IO with exponential backoff).
-    // The standard model defaults (3 attempts) apply unless an explicit
+    // The standard model defaults (7 attempts, 2s→60s backoff) apply unless an explicit
     // execution config was set on the request.
     let cfg = options
         .execution_config

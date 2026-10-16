@@ -31,13 +31,18 @@ impl Default for ExecutionConfig {
 }
 
 impl ExecutionConfig {
-    /// Standard defaults for model API calls (5min timeout, 3 attempts, exp backoff).
+    /// Standard defaults for model API calls (5min per-attempt timeout, 7 attempts).
+    ///
+    /// The backoff doubles from 2s and is capped at 60s, so the waits after a
+    /// failed attempt are 2s, 4s, 8s, 16s, 32s, 60s (~2min of waiting in total)
+    /// — long enough for a rate-limited or briefly unreachable gateway to
+    /// recover, which the previous 2s/4s ladder was not.
     pub fn model_defaults() -> Self {
         Self {
             timeout: Some(Duration::from_secs(300)),
-            max_attempts: Some(3),
+            max_attempts: Some(7),
             initial_backoff: Some(Duration::from_secs(2)),
-            max_backoff: Some(Duration::from_secs(30)),
+            max_backoff: Some(Duration::from_secs(60)),
             backoff_multiplier: Some(2.0),
         }
     }
