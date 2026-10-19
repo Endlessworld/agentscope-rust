@@ -489,6 +489,7 @@ fn tool_result_state(event: &AgentEvent) -> Option<ToolResultState> {
         "INTERRUPTED" => Some(ToolResultState::Interrupted),
         "DENIED" => Some(ToolResultState::Denied),
         "RUNNING" => Some(ToolResultState::Running),
+        "SUSPENDED" => Some(ToolResultState::Suspended),
         _ => None,
     }
 }
@@ -1364,6 +1365,7 @@ mod tests {
             output_tokens: 5,
             cached_tokens: 2,
             time: 1.5,
+            ..Default::default()
         };
         let event = delta_event(
             AgentEventType::ModelCallEnd,

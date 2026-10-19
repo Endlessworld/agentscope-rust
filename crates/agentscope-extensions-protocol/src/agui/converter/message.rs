@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use agentscope_core::{
     AudioBlock, Base64Source, ConfirmResult, ContentBlock, ImageBlock, Msg, MsgRole, Source,
-    TextBlock, ToolResultBlock, ToolResultState, ToolUseBlock, URLSource, VideoBlock,
+    TextBlock, ThinkingBlock, ToolResultBlock, ToolResultState, ToolUseBlock, URLSource, VideoBlock,
 };
 use serde_json::{Map, Value};
 
@@ -41,14 +41,21 @@ impl AguiMessageConverter {
     /// Converts an AG-UI message into an AgentScope [`Msg`].
     ///
     /// Tool messages always yield a `ToolResultBlock`, even when the frontend returned no
-    /// content, so a pending tool call is resolved downstream.
+    /// content, so a pending tool call is resolved downstream. A non-blank `error` on a tool
+    /// message makes that block an error result, with the error text kept alongside any
+    /// content the frontend also reported. A `reasoning` message becomes an assistant message
+    /// carrying a `ThinkingBlock`.
     pub fn to_msg(&self, agui_message: &AguiMessage) -> AguiResult<Msg> {
         let role = convert_role_in(&agui_message.role);
         let mut blocks: Vec<ContentBlock> = Vec::new();
 
         match &agui_message.content {
             Some(MessageContent::Text(text)) => {
-                add_text_block(&mut blocks, Some(text.as_str()), agui_message);
+                if agui_message.is_reasoning_message() {
+                    add_thinking_block(&mut blocks, text);
+                } else {
+                    add_text_block(&mut blocks, Some(text.as_str()), agui_message);
+                }
             }
             Some(MessageContent::Blocks(parts)) => {
                 if !agui_message.is_user_message() {
@@ -78,25 +85,74 @@ impl AguiMessageConverter {
             .build())
     }
 
-    /// Converts an AgentScope [`Msg`] into an AG-UI message.
+    /// Converts an AgentScope [`Msg`] into a single AG-UI message.
     ///
     /// Text blocks and tool-result text are joined with `\n`; tool-use blocks become
-    /// `toolCalls`; a tool-result block also sets `toolCallId`.
+    /// `toolCalls`; a tool-result block also sets `toolCallId`. An assistant message that
+    /// carries only reasoning becomes a `reasoning` message. A message that expands into
+    /// several AG-UI messages — reasoning mixed with text or tool calls, or a TOOL message
+    /// with several tool results — has to go through
+    /// [`to_agui_messages`](Self::to_agui_messages), which is what
+    /// [`to_agui_message_list`](Self::to_agui_message_list) uses.
     pub fn to_agui_message(&self, msg: &Msg) -> AguiMessage {
+        self.to_single_agui_message(msg)
+    }
+
+    /// Converts an AgentScope [`Msg`] into one or more AG-UI messages.
+    ///
+    /// A message mixing reasoning with text or tool calls is split into a reasoning message
+    /// followed by the standard message. A TOOL message carrying several tool results is
+    /// expanded into one AG-UI tool message per result, each keeping its own `toolCallId`,
+    /// content and error. Expanded messages get a distinct, deterministic id derived from the
+    /// source id (`<sourceId>-reasoning`, `<sourceId>-<index>`), so the split is always
+    /// observable.
+    pub fn to_agui_messages(&self, msg: &Msg) -> Vec<AguiMessage> {
+        if msg.role() == MsgRole::Tool {
+            let tool_results: Vec<&ToolResultBlock> = msg.tool_result_blocks().collect();
+            if tool_results.len() > 1 {
+                return tool_results
+                    .iter()
+                    .enumerate()
+                    .map(|(index, result)| tool_result_message(msg, result, index))
+                    .collect();
+            }
+        }
+
+        let standard = self.to_single_agui_message(msg);
+        let reasoning = thinking_content(msg);
+        if reasoning.is_empty() || standard.is_reasoning_message() {
+            return vec![standard];
+        }
+        vec![
+            AguiMessage::reasoning_message(reasoning_message_id(msg), reasoning),
+            standard,
+        ]
+    }
+
+    /// Converts an AgentScope [`Msg`] that maps to exactly one AG-UI message.
+    fn to_single_agui_message(&self, msg: &Msg) -> AguiMessage {
         let role = convert_role_out(msg.role());
+        let tool_message = msg.role() == MsgRole::Tool;
         let mut content = String::new();
         let mut tool_calls: Vec<AguiToolCall> = Vec::new();
         let mut tool_call_id: Option<String> = None;
+        let mut error: Option<String> = None;
 
         for block in msg.content() {
             match block {
-                ContentBlock::Text(tb) => push_line(&mut content, &tb.text),
+                ContentBlock::Text(tb) => append_content(&mut content, &tb.text),
                 ContentBlock::ToolUse(tub) => tool_calls.push(to_agui_tool_call(tub)),
                 ContentBlock::ToolResult(trb) => {
                     tool_call_id = trb.id.clone();
-                    for output in &trb.output {
-                        if let ContentBlock::Text(tb) = output {
-                            push_line(&mut content, &tb.text);
+                    // `error` belongs to the protocol's tool message; for any other role the
+                    // result text has to stay in `content`. Mirrors `toSingleAguiMessage`.
+                    if tool_message && trb.state == ToolResultState::Error {
+                        error = Some(tool_result_text(trb));
+                    } else {
+                        for output in &trb.output {
+                            if let ContentBlock::Text(tb) = output {
+                                append_content(&mut content, &tb.text);
+                            }
                         }
                     }
                 }
@@ -104,13 +160,26 @@ impl AguiMessageConverter {
             }
         }
 
-        AguiMessage::new(
+        // A message that only reasoned has no assistant content to carry the reasoning, so it
+        // becomes a reasoning message instead of losing it.
+        let reasoning = thinking_content(msg);
+        if !reasoning.is_empty()
+            && content.is_empty()
+            && tool_calls.is_empty()
+            && tool_call_id.is_none()
+        {
+            return AguiMessage::reasoning_message(msg.id(), reasoning);
+        }
+
+        let mut message = AguiMessage::new(
             msg.id(),
             role,
             (!content.is_empty()).then(|| MessageContent::Text(content)),
             tool_calls,
             tool_call_id,
-        )
+        );
+        message.error = error;
+        message
     }
 
     /// Converts a list of AG-UI messages into AgentScope messages.
@@ -119,8 +188,12 @@ impl AguiMessageConverter {
     }
 
     /// Converts a list of AgentScope messages into AG-UI messages.
+    ///
+    /// The output can be longer than the input: a message that mixes reasoning with other
+    /// content, or a TOOL message with several results, expands into one AG-UI message per
+    /// part.
     pub fn to_agui_message_list(&self, msgs: &[Msg]) -> Vec<AguiMessage> {
-        msgs.iter().map(|m| self.to_agui_message(m)).collect()
+        msgs.iter().flat_map(|m| self.to_agui_messages(m)).collect()
     }
 
     /// Converts a run input (messages plus official resume entries) into AgentScope messages.
@@ -242,9 +315,31 @@ fn to_tool_result_msg(resume: &AguiResume, tool_call_id: &str) -> Msg {
 }
 
 /// Appends a text block, wrapping tool messages in a `ToolResultBlock`.
+///
+/// A non-blank `error` on the tool message turns the block into an error result: the error
+/// text comes first and any content the frontend also sent is appended after it. Blank or
+/// absent errors keep the previous success behaviour.
 fn add_text_block(blocks: &mut Vec<ContentBlock>, text: Option<&str>, agui_message: &AguiMessage) {
     if agui_message.is_tool_message() {
         if let Some(tool_call_id) = &agui_message.tool_call_id {
+            if let Some(error) = agui_message
+                .error
+                .as_deref()
+                .filter(|error| !error.trim().is_empty())
+            {
+                let output = match text {
+                    Some(text) if !text.is_empty() => format!("{error}\n{text}"),
+                    _ => error.to_string(),
+                };
+                blocks.push(ContentBlock::ToolResult(
+                    ToolResultBlock::builder()
+                        .id(tool_call_id)
+                        .output(ContentBlock::Text(TextBlock::new(output)))
+                        .state(ToolResultState::Error)
+                        .build(),
+                ));
+                return;
+            }
             blocks.push(ContentBlock::ToolResult(
                 ToolResultBlock::builder()
                     .id(tool_call_id)
@@ -260,6 +355,64 @@ fn add_text_block(blocks: &mut Vec<ContentBlock>, text: Option<&str>, agui_messa
             blocks.push(ContentBlock::Text(TextBlock::new(text)));
         }
     }
+}
+
+/// Appends a `ThinkingBlock` for a reasoning payload; empty reasoning is dropped.
+fn add_thinking_block(blocks: &mut Vec<ContentBlock>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    blocks.push(ContentBlock::Thinking(ThinkingBlock::new(text)));
+}
+
+/// Joins the text blocks of one tool result into a single string.
+fn tool_result_text(result: &ToolResultBlock) -> String {
+    let mut text = String::new();
+    for output in &result.output {
+        if let ContentBlock::Text(tb) = output {
+            append_content(&mut text, &tb.text);
+        }
+    }
+    text
+}
+
+/// Builds one AG-UI tool message from a single AgentScope tool result.
+///
+/// The first expanded message keeps the source message id; later ones get an index suffix so
+/// every emitted AG-UI message has a distinct id.
+fn tool_result_message(msg: &Msg, result: &ToolResultBlock, index: usize) -> AguiMessage {
+    let id = if index == 0 {
+        msg.id().to_string()
+    } else {
+        format!("{}-{}", msg.id(), index)
+    };
+    let text = tool_result_text(result);
+    let error = result.state == ToolResultState::Error;
+    let mut message = AguiMessage::new(
+        id,
+        convert_role_out(msg.role()),
+        (!error && !text.is_empty()).then(|| MessageContent::Text(text.clone())),
+        Vec::new(),
+        result.id.clone(),
+    );
+    message.error = error.then_some(text);
+    message
+}
+
+/// The id of the reasoning message split out of a source message.
+fn reasoning_message_id(msg: &Msg) -> String {
+    format!("{}-reasoning", msg.id())
+}
+
+/// Joins the `ThinkingBlock` texts of a message into a single string.
+fn thinking_content(msg: &Msg) -> String {
+    let mut reasoning = String::new();
+    for block in msg.content() {
+        if let ContentBlock::Thinking(tb) = block {
+            append_content(&mut reasoning, &tb.thinking);
+        }
+    }
+    reasoning
 }
 
 /// Converts an AG-UI [`InputContent`] into a core [`ContentBlock`].
@@ -326,6 +479,8 @@ fn convert_role_in(role: &str) -> MsgRole {
         "assistant" => MsgRole::Assistant,
         "system" => MsgRole::System,
         "tool" => MsgRole::Tool,
+        // A reasoning message is assistant-authored thinking content.
+        "reasoning" => MsgRole::Assistant,
         _ => MsgRole::User,
     }
 }
@@ -340,8 +495,12 @@ fn convert_role_out(role: MsgRole) -> &'static str {
     }
 }
 
-/// Appends a newline-separated segment to the accumulated content.
-fn push_line(content: &mut String, segment: &str) {
+/// Appends a newline-separated segment to the accumulated content; empty segments are
+/// skipped so they cannot introduce a blank line.
+fn append_content(content: &mut String, segment: &str) {
+    if segment.is_empty() {
+        return;
+    }
     if !content.is_empty() {
         content.push('\n');
     }
@@ -600,6 +759,277 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_message_converts_to_a_thinking_block() {
+        let converter = converter();
+        let agui = AguiMessage::reasoning_message("m-r1", "Inspect the tool result");
+
+        let msg = converter.to_msg(&agui).unwrap();
+
+        assert_eq!(msg.role(), MsgRole::Assistant);
+        assert_eq!(msg.content().len(), 1);
+        match &msg.content()[0] {
+            ContentBlock::Thinking(thinking) => {
+                assert_eq!(thinking.thinking, "Inspect the tool result")
+            }
+            other => panic!("expected a thinking block, got {other:?}"),
+        }
+        assert!(msg.tool_result_blocks().next().is_none());
+    }
+
+    #[test]
+    fn thinking_block_is_converted_into_a_reasoning_message() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-thinking")
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(ThinkingBlock::new(
+                "Need to inspect the weather",
+            ))])
+            .build();
+
+        let result = converter.to_agui_message(&msg);
+
+        assert_eq!(result.id, "msg-thinking");
+        assert_eq!(result.role, "reasoning");
+        assert!(result.is_reasoning_message());
+        assert_eq!(result.text_content(), Some("Need to inspect the weather"));
+        assert!(result.tool_calls.is_empty());
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn mixed_reasoning_and_text_splits_into_two_distinct_messages() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-mixed")
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("Need a tool")),
+                ContentBlock::Text(TextBlock::new("Let me check")),
+                ContentBlock::ToolUse(
+                    ToolUseBlock::builder()
+                        .id("tc-weather")
+                        .name("get_weather")
+                        .input(parse_json_arguments(r#"{"city":"Beijing"}"#))
+                        .build(),
+                ),
+            ])
+            .build();
+
+        let results = converter.to_agui_messages(&msg);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "msg-mixed-reasoning");
+        assert!(results[0].is_reasoning_message());
+        assert_eq!(results[0].text_content(), Some("Need a tool"));
+        assert_ne!(results[0].id, results[1].id);
+        assert!(results[1].is_assistant_message());
+        assert_eq!(results[1].id, "msg-mixed");
+        assert_eq!(results[1].text_content(), Some("Let me check"));
+        assert_eq!(results[1].tool_calls.len(), 1);
+        assert_eq!(results[1].tool_calls[0].id, "tc-weather");
+
+        // Reasoning-only messages still map to exactly one AG-UI message.
+        let reasoning_only = Msg::builder()
+            .id("msg-reasoning")
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(ThinkingBlock::new("only"))])
+            .build();
+        assert_eq!(converter.to_agui_messages(&reasoning_only).len(), 1);
+    }
+
+    #[test]
+    fn message_list_expands_reasoning_messages() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-mixed")
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("Thinking")),
+                ContentBlock::Text(TextBlock::new("Answer")),
+            ])
+            .build();
+
+        let results = converter.to_agui_message_list(&[msg]);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].role, "reasoning");
+        assert_eq!(results[0].text_content(), Some("Thinking"));
+        assert_eq!(results[1].role, "assistant");
+        assert_eq!(results[1].text_content(), Some("Answer"));
+    }
+
+    #[test]
+    fn tool_message_with_several_results_expands_one_message_per_result() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-multi")
+            .role(MsgRole::Tool)
+            .content(vec![
+                ContentBlock::ToolResult(
+                    ToolResultBlock::builder()
+                        .id("tc-1")
+                        .output(ContentBlock::Text(TextBlock::new("first")))
+                        .state(ToolResultState::Success)
+                        .build(),
+                ),
+                ContentBlock::ToolResult(
+                    ToolResultBlock::builder()
+                        .id("tc-2")
+                        .output(ContentBlock::Text(TextBlock::new("second")))
+                        .state(ToolResultState::Error)
+                        .build(),
+                ),
+            ])
+            .build();
+
+        let results = converter.to_agui_messages(&msg);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "msg-multi");
+        assert_eq!(results[1].id, "msg-multi-1");
+        assert_eq!(results[0].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(results[0].text_content(), Some("first"));
+        assert!(results[0].error.is_none());
+        assert_eq!(results[1].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(results[1].error.as_deref(), Some("second"));
+        assert_eq!(results[1].text_content(), None);
+    }
+
+    #[test]
+    fn frontend_tool_error_becomes_an_error_tool_result() {
+        let converter = converter();
+        let agui = AguiMessage::new("msg-t1", "tool", None, Vec::new(), Some("tc-1".into()))
+            .with_error("sandbox unavailable");
+
+        let msg = converter.to_msg(&agui).unwrap();
+
+        assert_eq!(msg.role(), MsgRole::Tool);
+        let result = msg.tool_result_blocks().next().unwrap();
+        assert_eq!(result.id.as_deref(), Some("tc-1"));
+        assert_eq!(result.state, ToolResultState::Error);
+        assert_eq!(result.text_content(), "sandbox unavailable");
+
+        // The error text comes first and the payload the frontend also sent is kept.
+        let agui = AguiMessage::new(
+            "msg-t1",
+            "tool",
+            Some(MessageContent::Text("partial output".into())),
+            Vec::new(),
+            Some("tc-1".into()),
+        )
+        .with_error("sandbox unavailable");
+        let result = converter
+            .to_msg(&agui)
+            .unwrap()
+            .tool_result_blocks()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(result.state, ToolResultState::Error);
+        assert_eq!(result.text_content(), "sandbox unavailable\npartial output");
+    }
+
+    #[test]
+    fn blank_frontend_tool_error_and_non_tool_error_stay_success() {
+        let converter = converter();
+        let blank = AguiMessage::new(
+            "msg-t1",
+            "tool",
+            Some(MessageContent::Text("Tool result here".into())),
+            Vec::new(),
+            Some("tc-1".into()),
+        )
+        .with_error("   ");
+        let result = converter
+            .to_msg(&blank)
+            .unwrap()
+            .tool_result_blocks()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(result.state, ToolResultState::Success);
+        assert_eq!(result.text_content(), "Tool result here");
+
+        // `error` is only read for tool messages, so on an assistant message it is a no-op.
+        let assistant = AguiMessage::new(
+            "msg-t5",
+            "assistant",
+            Some(MessageContent::Text("Calling tool...".into())),
+            Vec::new(),
+            None,
+        )
+        .with_error("sandbox unavailable");
+        let msg = converter.to_msg(&assistant).unwrap();
+        assert_eq!(msg.role(), MsgRole::Assistant);
+        assert!(msg.tool_result_blocks().next().is_none());
+        assert_eq!(msg.text_content(), "Calling tool...");
+    }
+
+    #[test]
+    fn error_tool_result_round_trips_through_both_directions() {
+        let converter = converter();
+        let original = AguiMessage::new(
+            "msg-t4",
+            "tool",
+            Some(MessageContent::Text("partial output".into())),
+            Vec::new(),
+            Some("tc-1".into()),
+        )
+        .with_error("sandbox unavailable");
+
+        let msg = converter.to_msg(&original).unwrap();
+        let round_tripped = converter.to_agui_message(&msg);
+        assert_eq!(round_tripped.id, "msg-t4");
+        assert_eq!(round_tripped.role, "tool");
+        assert_eq!(round_tripped.tool_call_id.as_deref(), Some("tc-1"));
+
+        // The payload sent alongside the error stays part of the error text, so the round trip
+        // carries both rather than dropping the payload.
+        assert_eq!(
+            round_tripped.error.as_deref(),
+            Some("sandbox unavailable\npartial output")
+        );
+
+        let result = converter
+            .to_msg(&round_tripped)
+            .unwrap()
+            .tool_result_blocks()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(result.state, ToolResultState::Error);
+        assert_eq!(result.text_content(), "sandbox unavailable\npartial output");
+    }
+
+    #[test]
+    fn error_tool_result_on_an_assistant_role_keeps_its_text_in_content() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-t20")
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::ToolResult(
+                ToolResultBlock::builder()
+                    .id("srv-1")
+                    .output(ContentBlock::Text(TextBlock::new(
+                        "web search failed: too_many_requests",
+                    )))
+                    .state(ToolResultState::Error)
+                    .build(),
+            )])
+            .build();
+
+        let agui = converter.to_agui_message(&msg);
+
+        assert_eq!(agui.role, "assistant");
+        assert!(agui.error.is_none());
+        assert_eq!(
+            agui.text_content(),
+            Some("web search failed: too_many_requests")
+        );
+    }
+
+    #[test]
     fn user_blocks_convert_to_media_blocks() {
         let converter = converter();
         let agui = AguiMessage::user_message_blocks(
@@ -726,6 +1156,7 @@ mod tests {
         assert_eq!(back[0].text_content(), Some("a"));
         assert_eq!(back[1].text_content(), Some("b"));
         assert!(converter.to_msg_list(&[]).unwrap().is_empty());
+        assert!(converter.to_agui_message_list(&[]).is_empty());
     }
 
     #[test]

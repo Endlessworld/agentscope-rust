@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 pub struct AguiMessage {
     /// Unique message id.
     pub id: String,
-    /// Role: `user`, `assistant`, `system` or `tool`.
+    /// Role: `user`, `assistant`, `system`, `tool` or `reasoning`.
     pub role: String,
     /// Plain text or structured content parts; may be absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +31,10 @@ pub struct AguiMessage {
     /// Tool call id carried by tool messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Error a frontend tool reported, per the AG-UI protocol's `error` field on tool
+    /// messages; absent when the tool reported no failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl AguiMessage {
@@ -48,7 +52,25 @@ impl AguiMessage {
             content,
             tool_calls,
             tool_call_id,
+            error: None,
         }
+    }
+
+    /// Attaches the error a frontend tool reported (the AG-UI `error` field).
+    pub fn with_error(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self
+    }
+
+    /// Creates a reasoning message carrying plain text reasoning content.
+    pub fn reasoning_message(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::new(
+            id,
+            "reasoning",
+            Some(MessageContent::Text(content.into())),
+            Vec::new(),
+            None,
+        )
     }
 
     /// Creates a user message with plain text content.
@@ -126,6 +148,11 @@ impl AguiMessage {
     /// Whether the role is `tool` (case-insensitive).
     pub fn is_tool_message(&self) -> bool {
         self.role.eq_ignore_ascii_case("tool")
+    }
+
+    /// Whether the role is `reasoning` (case-insensitive).
+    pub fn is_reasoning_message(&self) -> bool {
+        self.role.eq_ignore_ascii_case("reasoning")
     }
 }
 
@@ -730,5 +757,43 @@ mod tests {
         assert!(!message.is_user_message());
         assert!(!message.has_tool_calls());
         assert_eq!(message.content, None);
+        let reasoning = AguiMessage::new("m", "REASONING", None, Vec::new(), None);
+        assert!(reasoning.is_reasoning_message());
+        assert!(!reasoning.is_assistant_message());
+    }
+
+    #[test]
+    fn reasoning_message_factory_sets_the_reasoning_role() {
+        let message = AguiMessage::reasoning_message("r1", "Think step by step");
+        assert_eq!(message.id, "r1");
+        assert_eq!(message.role, "reasoning");
+        assert!(message.is_reasoning_message());
+        assert_eq!(message.text_content(), Some("Think step by step"));
+        assert_eq!(message.error, None);
+    }
+
+    #[test]
+    fn error_field_is_omitted_when_absent_and_carried_when_reported() {
+        // The field is newer than the wire format it joins: a message without an error keeps
+        // the representation it had before the field existed.
+        let without_error = AguiMessage::new("m1", "tool", None, Vec::new(), Some("tc-1".into()));
+        let value = serde_json::to_value(&without_error).unwrap();
+        assert!(value.get("error").is_none());
+
+        let reported = without_error.clone().with_error("sandbox unavailable");
+        let value = serde_json::to_value(&reported).unwrap();
+        assert_eq!(value["error"], json!("sandbox unavailable"));
+
+        // A binding for the protocol's `error` field exists, so it survives a round trip.
+        let wire = json!({
+            "id": "m1",
+            "role": "tool",
+            "toolCallId": "tc-1",
+            "error": "sandbox unavailable"
+        });
+        let decoded: AguiMessage = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.error.as_deref(), Some("sandbox unavailable"));
+        assert_eq!(decoded.tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(decoded, reported);
     }
 }
