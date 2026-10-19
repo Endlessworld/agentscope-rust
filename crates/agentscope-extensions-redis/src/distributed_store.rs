@@ -47,7 +47,7 @@ use crate::sandbox::RedisSandboxExecutionGuard;
 use crate::snapshot::{RedisRemoteSnapshotClient, RedisSnapshotSpec};
 use crate::state::adapter::RedisClientAdapter;
 use crate::state::connection::RedisConnection;
-use crate::state::RedisAgentStateStore;
+use crate::state::{KeyLayoutVersion, RedisAgentStateStore};
 use crate::store::RedisStore;
 
 /// Default root key prefix; component sub-prefixes are appended to it.
@@ -85,6 +85,7 @@ pub struct RedisDistributedStore {
     /// later without re-configuration.
     url: Option<String>,
     key_prefix: String,
+    key_layout_version: KeyLayoutVersion,
     isolation_scope: IsolationScope,
 }
 
@@ -92,6 +93,7 @@ impl std::fmt::Debug for RedisDistributedStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisDistributedStore")
             .field("key_prefix", &self.key_prefix)
+            .field("key_layout_version", &self.key_layout_version)
             .field("isolation_scope", &self.isolation_scope)
             .field("has_url", &self.url.is_some())
             .finish_non_exhaustive()
@@ -112,6 +114,7 @@ impl RedisDistributedStore {
             connection,
             url: Some(url.to_string()),
             key_prefix: normalize_root(key_prefix),
+            key_layout_version: KeyLayoutVersion::default(),
             isolation_scope: IsolationScope::default(),
         })
     }
@@ -127,6 +130,7 @@ impl RedisDistributedStore {
             connection,
             url: None,
             key_prefix: normalize_root(key_prefix),
+            key_layout_version: KeyLayoutVersion::default(),
             isolation_scope: IsolationScope::default(),
         }
     }
@@ -143,6 +147,7 @@ impl RedisDistributedStore {
             adapter,
             url: None,
             key_prefix: normalize_root(key_prefix),
+            key_layout_version: KeyLayoutVersion::default(),
             isolation_scope: IsolationScope::default(),
         }
     }
@@ -163,6 +168,22 @@ impl RedisDistributedStore {
     pub fn with_isolation_scope(mut self, scope: IsolationScope) -> Self {
         self.isolation_scope = scope;
         self
+    }
+
+    /// Selects the agent-state key layout (mirrors Java
+    /// `RedisDistributedStore.fromJedis(jedis, prefix, keyLayoutVersion)`).
+    ///
+    /// Use [`KeyLayoutVersion::V1`] for Redis Cluster: it wraps the session segment in a Redis
+    /// hash tag so every key of one session shares one slot. V0 (the default) keeps the
+    /// original keys. Every instance sharing a key prefix must use the same layout.
+    pub fn with_key_layout_version(mut self, version: KeyLayoutVersion) -> Self {
+        self.key_layout_version = version;
+        self
+    }
+
+    /// The configured agent-state key layout version.
+    pub fn key_layout_version(&self) -> KeyLayoutVersion {
+        self.key_layout_version
     }
 
     /// The configured root key prefix.
@@ -187,11 +208,12 @@ impl RedisDistributedStore {
 
     /// Agent session state store (auto-wired by `distributed_store`).
     ///
-    /// Prefix: `{root}session:`.
+    /// Prefix: `{root}session:`. Layout: [`Self::key_layout_version`] (V0 by default).
     pub fn agent_state_store(&self) -> Result<Arc<dyn AgentStateStore>> {
         let store = RedisAgentStateStore::builder()
             .client(self.adapter.clone())
             .key_prefix(format!("{}session:", self.key_prefix))
+            .key_layout_version(self.key_layout_version)
             .build()?;
         Ok(Arc::new(store))
     }
@@ -351,6 +373,34 @@ mod tests {
         state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
         assert_eq!(state.get(Some("u1"), "s1", "k").await, Some(serde_json::json!(1)));
         assert!(adapter.string_of("app:session:u1/s1:k").is_some(), "prefix honoured");
+    }
+
+    #[tokio::test]
+    async fn v1_layout_reaches_the_auto_wired_agent_state_store() {
+        // Mirrors Java `RedisDistributedStore.fromJedis(jedis, prefix, KeyLayoutVersion.V1)`.
+        let (store, adapter) = offline_bundle();
+        let store = store.with_key_layout_version(KeyLayoutVersion::V1);
+        assert_eq!(store.key_layout_version(), KeyLayoutVersion::V1);
+
+        let state = store.agent_state_store().expect("state store builds");
+        state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+
+        assert!(
+            adapter.string_of("app:session:{u1/s1}:k").is_some(),
+            "V1 hash tag is applied through the combiner: {:?}",
+            adapter.all_keys()
+        );
+        assert!(adapter.all_keys().iter().all(|k| k.starts_with("app:session:{u1/s1}")));
+    }
+
+    #[tokio::test]
+    async fn default_layout_remains_v0() {
+        let (store, adapter) = offline_bundle();
+        assert_eq!(store.key_layout_version(), KeyLayoutVersion::V0);
+        let state = store.agent_state_store().expect("state store builds");
+        state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        assert!(adapter.string_of("app:session:u1/s1:k").is_some());
+        assert!(adapter.all_keys().iter().all(|k| !k.contains('{')));
     }
 
     #[tokio::test]

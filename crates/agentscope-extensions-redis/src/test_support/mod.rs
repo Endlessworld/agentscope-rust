@@ -63,6 +63,9 @@ pub(crate) struct MemoryRedisData {
     // --- call counters -----------------------------------------------------
     pub adapter_eval_calls: usize,
     pub adapter_delete_calls: usize,
+    /// Total number of keys passed to `delete_keys` across all calls.
+    pub adapter_deleted_key_total: usize,
+    pub adapter_max_delete_batch: usize,
     pub adapter_push_calls: usize,
     pub raw_eval_calls: usize,
     pub store_eval_calls: usize,
@@ -159,6 +162,14 @@ impl MemoryRedisAdapter {
     /// Number of `delete_keys` calls that carried at least one key.
     pub fn delete_calls(&self) -> usize {
         self.data_guard().adapter_delete_calls
+    }
+
+    /// Largest number of keys passed in a single `delete_keys` call.
+    ///
+    /// `1` proves every `DEL` was issued per key, which Redis Cluster requires when the
+    /// keys may span slots.
+    pub fn max_delete_batch(&self) -> usize {
+        self.data_guard().adapter_max_delete_batch
     }
 
     /// Number of individual `right_push_list` calls.
@@ -259,7 +270,10 @@ impl RedisClientAdapter for MemoryRedisAdapter {
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         if !keys.is_empty() {
-            self.data_guard().adapter_delete_calls += 1;
+            let mut data = self.data_guard();
+            data.adapter_delete_calls += 1;
+            data.adapter_deleted_key_total += keys.len();
+            data.adapter_max_delete_batch = data.adapter_max_delete_batch.max(keys.len());
         }
         for key in keys {
             self.purge(key);

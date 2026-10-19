@@ -50,5 +50,5 @@ pub use sandbox::{
 pub use snapshot::{RedisRemoteSnapshotClient, RedisSnapshotSpec};
 pub use state::adapter::RedisClientAdapter;
 pub use state::connection::RedisConnection;
-pub use state::{RedisAgentStateStore, RedisAgentStateStoreBuilder, VersionedState};
+pub use state::{KeyLayoutVersion, RedisAgentStateStore, RedisAgentStateStoreBuilder, VersionedState};
 pub use store::RedisStore;

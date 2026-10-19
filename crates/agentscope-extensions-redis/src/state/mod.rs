@@ -1,13 +1,17 @@
 //! Redis-backed [`AgentStateStore`], mirroring
 //! `io.agentscope.extensions.redis.state.RedisAgentStateStore`.
 //!
-//! ## Key layout (per `slot = {userId}/{sessionId}`)
+//! ## Key layout (per `slot` = `{userId}/{sessionId}` for V0, `{{userId}/{sessionId}}` for V1)
 //!
 //! * single state: `{prefix}{slot}:{key}` — Redis String containing JSON
 //! * single version: `{prefix}{slot}:{key}:ver` — monotonic counter String
 //! * list state: `{prefix}{slot}:{key}:list` — Redis List of JSON items
 //! * list hash: `{prefix}{slot}:{key}:list:_hash` — change-detection String
 //! * session key index: `{prefix}{slot}:_keys` — Redis Set of state keys
+//!
+//! See [`KeyLayoutVersion`] / [`key_layout`] for the V0/V1 difference: V1 wraps the session
+//! segment in a Redis hash tag so that all keys of one session land in a single Redis Cluster
+//! slot (the CAS Lua script touches three keys at once).
 //!
 //! ## Versioning / CAS
 //!
@@ -27,18 +31,22 @@ use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};
 
 pub mod adapter;
 pub mod connection;
+pub mod key_layout;
 pub(crate) mod version_support;
 
 use self::adapter::RedisClientAdapter;
+use self::key_layout::{
+    parse_v0_session_id_from_keys_key, parse_v1_session_id_from_keys_key, v0_keys_pattern,
+    v1_keys_pattern, validate_v1_key_prefix, validate_v1_user_id, RedisAgentStateKeyLayout,
+};
 use self::version_support::{SAVE_SCRIPT, UNCONDITIONAL};
+
+pub use self::key_layout::KeyLayoutVersion;
 
 /// Default key prefix (matches Java `DEFAULT_KEY_PREFIX`).
 pub const DEFAULT_KEY_PREFIX: &str = "agentscope:session:";
 
-const KEYS_SUFFIX: &str = ":_keys";
-const LIST_SUFFIX: &str = ":list";
 const HASH_SUFFIX: &str = ":_hash";
-const ANON_USER: &str = "__anon__";
 
 /// A versioned state value (payload + version), mirroring Java `VersionedState`.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,12 +66,14 @@ const UNCONDITIONAL_EXPECTED: u64 = u64::MAX;
 pub struct RedisAgentStateStore {
     client: Arc<dyn RedisClientAdapter>,
     key_prefix: String,
+    key_layout_version: KeyLayoutVersion,
 }
 
 impl std::fmt::Debug for RedisAgentStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisAgentStateStore")
             .field("key_prefix", &self.key_prefix)
+            .field("key_layout_version", &self.key_layout_version)
             .finish_non_exhaustive()
     }
 }
@@ -75,8 +85,15 @@ impl RedisAgentStateStore {
     }
 
     /// Creates a store from an adapter with an explicit key prefix.
+    ///
+    /// Uses the default [`KeyLayoutVersion::V0`] layout; use
+    /// [`RedisAgentStateStoreBuilder::key_layout_version`] to select V1 for Redis Cluster.
     pub fn new(client: Arc<dyn RedisClientAdapter>, key_prefix: impl Into<String>) -> Self {
-        Self { client, key_prefix: key_prefix.into() }
+        Self {
+            client,
+            key_prefix: key_prefix.into(),
+            key_layout_version: KeyLayoutVersion::default(),
+        }
     }
 
     /// The configured key prefix.
@@ -84,23 +101,30 @@ impl RedisAgentStateStore {
         &self.key_prefix
     }
 
+    /// The configured key layout version.
+    pub fn key_layout_version(&self) -> KeyLayoutVersion {
+        self.key_layout_version
+    }
+
+    /// Resolves the key layout for one session, validating V1 identifiers as Java does.
+    fn resolve_key_layout(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<RedisAgentStateKeyLayout> {
+        match self.key_layout_version {
+            KeyLayoutVersion::V0 => {
+                RedisAgentStateKeyLayout::v0(&self.key_prefix, user_id, session_id)
+            }
+            KeyLayoutVersion::V1 => {
+                RedisAgentStateKeyLayout::v1(&self.key_prefix, user_id, session_id)
+            }
+        }
+    }
+
     /// Whether this store supports optimistic-concurrency versioning (always `true`).
     pub fn supports_versioning(&self) -> bool {
         true
-    }
-
-    // ---- key helpers -------------------------------------------------------
-
-    fn get_state_key(&self, slot_id: &str, key: &str) -> String {
-        format!("{}{slot_id}:{key}", self.key_prefix)
-    }
-
-    fn get_list_key(&self, slot_id: &str, key: &str) -> String {
-        format!("{}{slot_id}:{key}{LIST_SUFFIX}", self.key_prefix)
-    }
-
-    fn get_keys_key(&self, slot_id: &str) -> String {
-        format!("{}{slot_id}{KEYS_SUFFIX}", self.key_prefix)
     }
 
     /// Unconditionally writes a versioned value, returning the new version.
@@ -112,10 +136,10 @@ impl RedisAgentStateStore {
         value: &Value,
         expected_version: u64,
     ) -> Result<u64> {
-        let slot_id = slot_id(user_id, session_id)?;
-        let redis_key = self.get_state_key(&slot_id, key);
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let redis_key = layout.state_key(key);
         let version_key = version_support::version_key(&redis_key);
-        let keys_key = self.get_keys_key(&slot_id);
+        let keys_key = layout.keys_key();
         let json = serde_json::to_string(value)?;
 
         let args = if expected_version == UNCONDITIONAL_EXPECTED {
@@ -142,8 +166,8 @@ impl RedisAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Result<VersionedState> {
-        let slot_id = slot_id(user_id, session_id)?;
-        let redis_key = self.get_state_key(&slot_id, key);
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let redis_key = layout.state_key(key);
         let version_key = version_support::version_key(&redis_key);
 
         let json = self.client.get(&redis_key).await?;
@@ -175,10 +199,10 @@ impl RedisAgentStateStore {
                 .save_versioned(user_id, session_id, key, value, UNCONDITIONAL_EXPECTED)
                 .await;
         }
-        let slot_id = slot_id(user_id, session_id)?;
-        let redis_key = self.get_state_key(&slot_id, key);
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let redis_key = layout.state_key(key);
         let version_key = version_support::version_key(&redis_key);
-        let keys_key = self.get_keys_key(&slot_id);
+        let keys_key = layout.keys_key();
         let json = serde_json::to_string(value)?;
 
         let args = vec![json, expected_version.to_string(), key.to_string()];
@@ -235,8 +259,8 @@ impl AgentStateStore for RedisAgentStateStore {
     }
 
     async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
-        let slot_id = slot_id(user_id, session_id).ok()?;
-        let redis_key = self.get_state_key(&slot_id, key);
+        let layout = self.resolve_key_layout(user_id, session_id).ok()?;
+        let redis_key = layout.state_key(key);
         match self.client.get(&redis_key).await {
             Ok(Some(json)) => serde_json::from_str(&json).ok(),
             Ok(None) => None,
@@ -248,10 +272,10 @@ impl AgentStateStore for RedisAgentStateStore {
     }
 
     async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<Value> {
-        let Ok(slot_id) = slot_id(user_id, session_id) else {
+        let Ok(layout) = self.resolve_key_layout(user_id, session_id) else {
             return Vec::new();
         };
-        let redis_key = self.get_list_key(&slot_id, key);
+        let redis_key = layout.list_key(key);
         match self.client.range_list(&redis_key, 0, -1).await {
             Ok(jsons) => jsons
                 .into_iter()
@@ -265,10 +289,10 @@ impl AgentStateStore for RedisAgentStateStore {
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        let Ok(slot_id) = slot_id(user_id, session_id) else {
+        let Ok(layout) = self.resolve_key_layout(user_id, session_id) else {
             return false;
         };
-        let keys_key = self.get_keys_key(&slot_id);
+        let keys_key = layout.keys_key();
         match self.client.key_exists(&keys_key).await {
             Ok(true) => self.client.get_set_size(&keys_key).await.map(|n| n > 0).unwrap_or(false),
             _ => false,
@@ -282,9 +306,17 @@ impl AgentStateStore for RedisAgentStateStore {
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
-        let user_segment = normalize_user(user_id);
-        // Pattern: {prefix}{userSegment}/{sessionId}:_keys
-        let pattern = format!("{}{user_segment}/*{KEYS_SUFFIX}", self.key_prefix);
+        let user_segment = key_layout::normalize_user(user_id);
+        let pattern = match self.key_layout_version {
+            KeyLayoutVersion::V0 => v0_keys_pattern(&self.key_prefix, &user_segment),
+            KeyLayoutVersion::V1 => {
+                if let Err(e) = validate_v1_user_id(&user_segment) {
+                    tracing::error!("RedisAgentStateStore::list_session_ids failed: {e}");
+                    return Vec::new();
+                }
+                v1_keys_pattern(&self.key_prefix, &user_segment)
+            }
+        };
         let keys = match self.client.find_keys_by_pattern(&pattern).await {
             Ok(k) => k,
             Err(e) => {
@@ -292,13 +324,18 @@ impl AgentStateStore for RedisAgentStateStore {
                 return Vec::new();
             }
         };
-        let user_prefix = format!("{}{user_segment}/", self.key_prefix);
         let mut sessions = std::collections::HashSet::new();
         for keys_key in keys {
-            if let Some(without_prefix) = keys_key.strip_prefix(&user_prefix) {
-                if let Some(session_id) = without_prefix.strip_suffix(KEYS_SUFFIX) {
-                    sessions.insert(session_id.to_string());
+            let parsed = match self.key_layout_version {
+                KeyLayoutVersion::V0 => {
+                    parse_v0_session_id_from_keys_key(&keys_key, &self.key_prefix, &user_segment)
                 }
+                KeyLayoutVersion::V1 => {
+                    parse_v1_session_id_from_keys_key(&keys_key, &self.key_prefix, &user_segment)
+                }
+            };
+            if let Some(session_id) = parsed {
+                sessions.insert(session_id);
             }
         }
         let mut out: Vec<String> = sessions.into_iter().collect();
@@ -315,10 +352,10 @@ impl RedisAgentStateStore {
         key: &str,
         values: &[Value],
     ) -> Result<()> {
-        let slot_id = slot_id(user_id, session_id)?;
-        let list_key = self.get_list_key(&slot_id, key);
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let list_key = layout.list_key(key);
         let hash_key = format!("{list_key}{HASH_SUFFIX}");
-        let keys_key = self.get_keys_key(&slot_id);
+        let keys_key = layout.keys_key();
 
         let current_hash = compute_hash(values);
         let stored_hash = self.client.get(&hash_key).await?;
@@ -338,15 +375,13 @@ impl RedisAgentStateStore {
         }
 
         self.client.set(&hash_key, &current_hash).await?;
-        self.client
-            .add_to_set(&keys_key, &format!("{key}{LIST_SUFFIX}"))
-            .await?;
+        self.client.add_to_set(&keys_key, &layout.list_track_key(key)).await?;
         Ok(())
     }
 
     async fn delete_inner(&self, user_id: Option<&str>, session_id: &str) -> Result<()> {
-        let slot_id = slot_id(user_id, session_id)?;
-        let keys_key = self.get_keys_key(&slot_id);
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let keys_key = layout.keys_key();
         let tracked = self.client.get_set_members(&keys_key).await?;
         if tracked.is_empty() {
             return Ok(());
@@ -355,44 +390,34 @@ impl RedisAgentStateStore {
         let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
         to_delete.insert(keys_key);
         for tracked_key in tracked {
-            if let Some(base_key) = tracked_key.strip_suffix(LIST_SUFFIX) {
-                let list_key = self.get_list_key(&slot_id, base_key);
+            if RedisAgentStateKeyLayout::is_list_track_key(&tracked_key) {
+                let base_key = RedisAgentStateKeyLayout::base_key_from_list_track_key(&tracked_key);
+                let list_key = layout.list_key(base_key);
                 to_delete.insert(format!("{list_key}{HASH_SUFFIX}"));
                 to_delete.insert(list_key);
             } else {
-                let state_key = self.get_state_key(&slot_id, &tracked_key);
+                let state_key = layout.state_key(&tracked_key);
                 to_delete.insert(version_support::version_key(&state_key));
                 to_delete.insert(state_key);
             }
         }
-        let keys: Vec<String> = to_delete.into_iter().collect();
-        self.client.delete_keys(&keys).await?;
+        // Delete one key per command: a tracked member may reference an unknown slot, and a
+        // single multi-key `DEL` would be rejected with CROSSSLOT on Redis Cluster.
+        for key in to_delete {
+            self.client.delete_keys(&[key]).await?;
+        }
         Ok(())
     }
 }
 
 // ---- free helpers ----------------------------------------------------------
 
-fn normalize_user(user_id: Option<&str>) -> String {
-    match user_id {
-        Some(u) if !u.trim().is_empty() => u.to_string(),
-        _ => ANON_USER.to_string(),
-    }
-}
-
-/// Combines `(userId, sessionId)` into a single Redis slot identifier.
-fn slot_id(user_id: Option<&str>, session_id: &str) -> Result<String> {
-    if session_id.trim().is_empty() {
-        return Err(Error::Other("sessionId must not be blank".into()));
-    }
-    Ok(format!("{}/{}", normalize_user(user_id), session_id))
-}
-
 /// Builder for [`RedisAgentStateStore`].
 #[derive(Default)]
 pub struct RedisAgentStateStoreBuilder {
     client: Option<Arc<dyn RedisClientAdapter>>,
     key_prefix: Option<String>,
+    key_layout_version: KeyLayoutVersion,
 }
 
 impl RedisAgentStateStoreBuilder {
@@ -408,10 +433,20 @@ impl RedisAgentStateStoreBuilder {
         self
     }
 
+    /// Selects the agent-state key layout.
+    ///
+    /// V0 is the default for compatibility. V1 must be selected explicitly for Redis Cluster
+    /// and used consistently by every store instance sharing a key prefix.
+    pub fn key_layout_version(mut self, version: KeyLayoutVersion) -> Self {
+        self.key_layout_version = version;
+        self
+    }
+
     /// Builds the store.
     ///
     /// # Errors
-    /// Returns an error when no client is configured or the prefix is blank.
+    /// Returns an error when no client is configured, the prefix is blank, or a V1 prefix
+    /// contains a Redis hash-tag brace.
     pub fn build(self) -> Result<RedisAgentStateStore> {
         let client = self
             .client
@@ -421,13 +456,21 @@ impl RedisAgentStateStoreBuilder {
             Some(_) => return Err(Error::Other("Key prefix cannot be empty".into())),
             None => DEFAULT_KEY_PREFIX.to_string(),
         };
-        Ok(RedisAgentStateStore { client, key_prefix })
+        if self.key_layout_version == KeyLayoutVersion::V1 {
+            validate_v1_key_prefix(&key_prefix)?;
+        }
+        Ok(RedisAgentStateStore {
+            client,
+            key_prefix,
+            key_layout_version: self.key_layout_version,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::key_layout::ANON_USER;
     use crate::test_support::MemoryRedisAdapter;
     use agentscope_core::state::EMPTY_HASH;
     use serde_json::json;
@@ -444,18 +487,32 @@ mod tests {
         (store, adapter)
     }
 
+    fn v1_store() -> (RedisAgentStateStore, Arc<MemoryRedisAdapter>) {
+        let adapter = Arc::new(MemoryRedisAdapter::new());
+        let store = RedisAgentStateStore::builder()
+            .client(adapter.clone())
+            .key_prefix(PREFIX)
+            .key_layout_version(KeyLayoutVersion::V1)
+            .build()
+            .expect("builder accepts the adapter");
+        (store, adapter)
+    }
+
     // ---- pure helpers -----------------------------------------------------
 
     #[test]
     fn slot_id_uses_anon_for_missing_user() {
-        assert_eq!(slot_id(None, "s1").unwrap(), "__anon__/s1");
-        assert_eq!(slot_id(Some("u1"), "s1").unwrap(), "u1/s1");
-        assert_eq!(slot_id(Some("  "), "s1").unwrap(), "__anon__/s1");
+        let anon = RedisAgentStateKeyLayout::v0(PREFIX, None, "s1").unwrap();
+        assert_eq!(anon.slot_id(), "__anon__/s1");
+        let named = RedisAgentStateKeyLayout::v0(PREFIX, Some("u1"), "s1").unwrap();
+        assert_eq!(named.slot_id(), "u1/s1");
+        let blank = RedisAgentStateKeyLayout::v0(PREFIX, Some("  "), "s1").unwrap();
+        assert_eq!(blank.slot_id(), "__anon__/s1");
     }
 
     #[test]
     fn slot_id_rejects_blank_session() {
-        assert!(slot_id(Some("u"), "  ").is_err());
+        assert!(RedisAgentStateKeyLayout::v0(PREFIX, Some("u"), "  ").is_err());
     }
 
     #[test]
@@ -480,14 +537,14 @@ mod tests {
 
     #[test]
     fn key_layout_matches_java() {
-        let (store, _adapter) = store();
-        assert_eq!(store.get_state_key("u/s", "k"), "t:session:u/s:k");
-        assert_eq!(store.get_list_key("u/s", "k"), "t:session:u/s:k:list");
-        assert_eq!(store.get_keys_key("u/s"), "t:session:u/s:_keys");
+        let v0 = RedisAgentStateKeyLayout::v0(PREFIX, Some("u"), "s").unwrap();
+        assert_eq!(v0.state_key("k"), "t:session:u/s:k");
+        assert_eq!(v0.list_key("k"), "t:session:u/s:k:list");
+        assert_eq!(v0.keys_key(), "t:session:u/s:_keys");
         assert_eq!(ANON_USER, "__anon__");
-        assert_eq!(LIST_SUFFIX, ":list");
+        assert_eq!(crate::state::key_layout::LIST_SUFFIX, ":list");
         assert_eq!(HASH_SUFFIX, ":_hash");
-        assert_eq!(KEYS_SUFFIX, ":_keys");
+        assert_eq!(crate::state::key_layout::KEYS_SUFFIX, ":_keys");
     }
 
     // ---- single-value save / get / exists / delete -----------------------
@@ -531,6 +588,169 @@ mod tests {
         let (store, adapter) = store();
         store.save(None, "s1", "k", json!(1)).await;
         assert!(adapter.string_of("t:session:__anon__/s1:k").is_some());
+    }
+
+    // ---- V1 cluster-safe layout -----------------------------------------
+
+    #[test]
+    fn builder_records_the_configured_layout_version() {
+        let (v0, _) = store();
+        assert_eq!(v0.key_layout_version(), KeyLayoutVersion::V0, "V0 is the default");
+        let (v1, _) = v1_store();
+        assert_eq!(v1.key_layout_version(), KeyLayoutVersion::V1);
+    }
+
+    #[test]
+    fn builder_rejects_a_v1_prefix_containing_a_hash_tag_brace() {
+        for prefix in ["scope{bad:", "scope}bad:"] {
+            let adapter = Arc::new(MemoryRedisAdapter::new());
+            let err = RedisAgentStateStore::builder()
+                .client(adapter)
+                .key_prefix(prefix)
+                .key_layout_version(KeyLayoutVersion::V1)
+                .build()
+                .unwrap_err();
+            assert!(err.to_string().contains("not supported by V1"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_save_writes_every_key_under_the_same_hash_tag() {
+        let (store, adapter) = v1_store();
+        store.save(Some("u1"), "s1", "agent_state", json!({"n": 1})).await;
+        store.save_list(Some("u1"), "s1", "messages", &[json!("m")]).await;
+
+        assert_eq!(store.get(Some("u1"), "s1", "agent_state").await, Some(json!({"n": 1})));
+        assert_eq!(adapter.string_of("t:session:{u1/s1}:agent_state"), Some(r#"{"n":1}"#.to_string()));
+        assert_eq!(adapter.string_of("t:session:{u1/s1}:agent_state:ver"), Some("1".to_string()));
+        assert_eq!(
+            adapter.string_of("t:session:{u1/s1}:messages:list:_hash"),
+            Some(compute_hash(&[json!("m")]))
+        );
+        assert_eq!(adapter.list("t:session:{u1/s1}:messages:list"), vec![r#""m""#.to_string()]);
+        assert_eq!(
+            adapter.set_members("t:session:{u1/s1}:_keys"),
+            vec!["agent_state".to_string(), "messages:list".to_string()]
+        );
+        assert!(
+            adapter.all_keys().iter().all(|k| k.starts_with("t:session:{u1/s1}")),
+            "every key of one session shares the hash tag: {:?}",
+            adapter.all_keys()
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_cas_keeps_three_keys_in_one_hash_tag() {
+        let (store, adapter) = v1_store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        let version = store.get_versioned(Some("u1"), "s1", "k").await.unwrap();
+        assert_eq!(version.version, 1);
+        assert_eq!(
+            store.save_if_version(Some("u1"), "s1", "k", &json!(2), version.version).await.unwrap(),
+            2
+        );
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
+
+        // The three keys passed to the CAS Lua script must agree on the hash tag, otherwise a
+        // Redis Cluster rejects the EVAL with CROSSSLOT.
+        let tag = |key: &str| {
+            let start = key.find('{').map(|i| i + 1).unwrap();
+            let end = start + key[start..].find('}').unwrap();
+            key[start..end].to_string()
+        };
+        let keys = [
+            "t:session:{u1/s1}:k",
+            "t:session:{u1/s1}:k:ver",
+            "t:session:{u1/s1}:_keys",
+        ];
+        assert!(keys.iter().all(|k| adapter.string_of(k).is_some() || adapter.set_members(k).len() == 1));
+        assert!(keys.iter().all(|k| tag(k) == "u1/s1"), "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn v1_delete_tracks_and_removes_only_hash_tagged_keys() {
+        let (store, adapter) = v1_store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save_list(Some("u1"), "s1", "l", &[json!(1)]).await;
+
+        store.delete(Some("u1"), "s1").await;
+
+        assert!(adapter.all_keys().is_empty(), "{:?}", adapter.all_keys());
+        assert!(!store.exists(Some("u1"), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn v1_list_session_ids_strips_the_hash_tag() {
+        let (store, _adapter) = v1_store();
+        store.save(Some("u1"), "beta", "k", json!(1)).await;
+        store.save(Some("u1"), "alpha", "k", json!(1)).await;
+        store.save(Some("u2"), "gamma", "k", json!(1)).await;
+
+        assert_eq!(store.list_session_ids(Some("u1")).await, vec!["alpha", "beta"]);
+        assert_eq!(store.list_session_ids(Some("u2")).await, vec!["gamma"]);
+        assert!(store.list_session_ids(Some("u3")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v1_and_v0_are_disjoint_namespaces() {
+        // A V1 store never sees V0 data, and vice versa.
+        let (v0, adapter) = store();
+        let v1 = RedisAgentStateStore::builder()
+            .client(adapter.clone())
+            .key_prefix(PREFIX)
+            .key_layout_version(KeyLayoutVersion::V1)
+            .build()
+            .unwrap();
+
+        v0.save(Some("u1"), "s1", "k", json!("v0")).await;
+        assert_eq!(v1.get(Some("u1"), "s1", "k").await, None);
+        v1.save(Some("u1"), "s1", "k", json!("v1")).await;
+        assert_eq!(v0.get(Some("u1"), "s1", "k").await, Some(json!("v0")));
+        assert_eq!(v1.get(Some("u1"), "s1", "k").await, Some(json!("v1")));
+    }
+
+    #[tokio::test]
+    async fn v1_rejects_unsafe_identifiers_before_redis_io() {
+        let (store, adapter) = v1_store();
+
+        assert!(store.get_versioned(Some("bad/user"), "s1", "k").await.is_err());
+        store.get(Some("bad{user"), "s1", "k").await;
+        store.save(Some("bad}user"), "s1", "k", json!(1)).await;
+        store.save_list(Some("u1"), "bad/session", "k", &[json!(1)]).await;
+        store.save_list(Some("u1"), "bad{session", "k", &[json!(1)]).await;
+        store.delete(Some("bad/user"), "s1").await;
+        assert!(store.list_session_ids(Some("bad/user")).await.is_empty());
+
+        assert_eq!(adapter.eval_calls(), 0, "no CAS script reached Redis");
+        assert_eq!(adapter.delete_calls(), 0, "no DEL reached Redis");
+        assert!(adapter.all_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v1_delete_issues_one_key_per_command() {
+        // A tracked member may reference an unknown slot, and a multi-key DEL is rejected with
+        // CROSSSLOT on Redis Cluster, so every deletion must be a single-key command.
+        let (store, adapter) = v1_store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save_list(Some("u1"), "s1", "l", &[json!(1)]).await;
+
+        store.delete(Some("u1"), "s1").await;
+
+        assert!(adapter.delete_calls() >= 4, "each tracked key is deleted on its own");
+        assert_eq!(adapter.max_delete_batch(), 1, "never a multi-key DEL");
+        assert!(adapter.all_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v0_delete_also_issues_one_key_per_command() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save_list(Some("u1"), "s1", "l", &[json!(1)]).await;
+
+        store.delete(Some("u1"), "s1").await;
+
+        assert_eq!(adapter.max_delete_batch(), 1, "never a multi-key DEL");
+        assert!(adapter.all_keys().is_empty());
     }
 
     #[tokio::test]
