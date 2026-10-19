@@ -1,0 +1,15 @@
+[package]
+name = "agentscope-extensions-judge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Ports `agentscope-extensions-judge/agentscope-extensions-jev` (TypeSafe System One).
+# The landed scope is dependency-free DTO + pure functions; the HTTP client lands later
+# (see the module docs in `src/lib.rs`), so `agentscope-core` / `agentscope-harness` /
+# `reqwest` are deliberately not declared yet.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
