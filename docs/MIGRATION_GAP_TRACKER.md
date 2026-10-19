@@ -215,7 +215,7 @@
 | FilesystemTool/ShellExecuteTool/FuzzyTextMatcher | 同名 | ✅ 已完成 | tool/*.rs；**read/write/edit 均支持批量**（file_paths/operations 数组）；ShellExecuteTool 执行 trace（命令/超时/耗时）已加；**#2832 grep/glob limit 上界（默认 100/200/硬上限 1000）+ 截断提示**；**#2413 list_files 空结果改 "Empty directory" + local/ls 区分 not-exists/not-a-directory 报错** |
 | **DANGEROUS_COMMANDS shell 自检** | ToolDangerousPathConstants | ✅ 已完成 | ShellExecuteTool::call 已接入 core `is_dangerous_command`；rm -rf/sudo rm/dd/mkfs/chmod 777 等直接返回 error 块（测试通过） |
 | **SessionSearchTool**（session_search/session_list/session_history） | SessionSearchTool | ✅ 已完成（本轮） | tool/session_search.rs：基于 WorkspaceManager.list_session_log_files + SessionTree JSONL；search 支持可选 agentId 过滤 + maxResults、list 优先 sessions.json store 索引、history 取最后 N 条消息（500 字符截断）；7 集成测试过 |
-| **WebTools**（web_fetch/web_search） | WebTools | ✅ 已完成（本轮） | tool/web_tools.rs：reqwest 实现，fetch 仅 http/https + max_chars 截断；search 走 DeepSeek Web Search API（`https://api.deepseek.com/v1/tools/search`，DEEPSEEK_API_KEY env 或 with_api_key 注入，缺失返回明确配置错误）；register_web_tools 一键注册；测试过（无 key 分支 + 参数校验；live HTTP 未验） |
+| **WebTools**（web_fetch/web_search） | WebTools | ✅ 已完成（本轮） | tool/web_tools.rs：reqwest 实现，fetch 仅 http/https + max_chars 截断；有 `DEEPSEEK_API_KEY` 时 fetch/search 均走 DeepSeek（`/v1/tools/fetch` 返回 Markdown、`/v1/tools/search`），无 key 时 fetch 回落免 key 裸 GET（HTML 正文经内置 `html_to_text` 降为纯文本，无三方解析库）；register_web_tools 一键注册；测试过（html_to_text/body_of/truncate 纯函数单测 6 + 无 key 分支 + 参数校验；live HTTP 未验） |
 
 ### 3.3 gateway（优先级 P1）— 差距最大（5%）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |

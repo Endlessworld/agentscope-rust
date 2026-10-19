@@ -88,11 +88,53 @@ pub struct EditOperation {
     pub replace_all: bool,
 }
 
-/// Edit-file parameters; `operations` supports batching multiple edits.
+/// Edit-file parameters. Two shapes are accepted and normalised by
+/// [`EditFileParams::into_operations`]:
+///
+/// - batched (preferred): `{"operations": [{path, old_string, new_string, replace_all?}, ...]}`
+/// - flat single operation: `{path, old_string, new_string, replace_all?}`
+///
+/// The flat form is kept because the tool description advertises top-level
+/// `path`/`old_string`/`new_string`; rejecting it only produced an unactionable
+/// `"path" is a required property` validation error.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct EditFileParams {
-    /// Batch of edit operations.
+    /// Batch of edit operations (preferred form).
+    #[serde(default)]
     pub operations: Vec<EditOperation>,
+    /// Flat single-operation form: target file path.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Flat single-operation form: text to find.
+    #[serde(default)]
+    pub old_string: Option<String>,
+    /// Flat single-operation form: replacement text.
+    #[serde(default)]
+    pub new_string: Option<String>,
+    /// Flat single-operation form: replace all occurrences.
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+impl EditFileParams {
+    /// Normalises both accepted shapes into a list of operations.
+    ///
+    /// An empty result means neither shape supplied a usable operation; the
+    /// caller reports that explicitly instead of silently doing nothing.
+    pub fn into_operations(self) -> Vec<EditOperation> {
+        if !self.operations.is_empty() {
+            return self.operations;
+        }
+        match (self.path, self.old_string, self.new_string) {
+            (Some(path), Some(old_string), Some(new_string)) => vec![EditOperation {
+                path,
+                old_string,
+                new_string,
+                replace_all: self.replace_all,
+            }],
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// A single filesystem tool; constructed via the factory methods below.
@@ -158,21 +200,21 @@ impl FilesystemTool {
         Self {
             fs,
             name: "edit_file".into(),
-            description: r#" 在单个或多个文件中执行精确字符串替换，支持批量编辑。
+            description: r#"在单个或多个文件中执行精确字符串替换，支持批量编辑。
+                             调用格式（二选一，推荐批量）：
+                             1) 批量：{"operations":[{"path":"filePath1","old_string":"aaa","new_string":"bbb","replace_all":false}]}
+                             2) 单个：{"path":"filePath1","old_string":"aaa","new_string":"bbb"}
                              参数：
                              - path（必填）：目标文件路径。
-                             - old_string（必填）：要替换的原字符串。
+                             - old_string（必填）：要替换的原字符串（不得为空）。
                              - new_string（必填）：替换后的新字符串。
-                             - replace_all（可选）：为 true 时替换所有匹配项；否则 old_string 在目标文件中必须唯一，否则不应执行替换。
-                             - path、old_string、new_string 为必填字段，且必须处于同一参数层级。
+                             - replace_all（可选，默认 false）：为 true 时替换所有匹配项；否则 old_string 在文件中必须唯一，否则不执行任何替换。
                              使用要求：
-                             - 支持一次传入多个编辑操作。
-                             - 所有替换均按精确字符串匹配执行。
-                             - 每次尽可能执行更多的编辑操作以增加编辑效率
+                             - 所有替换均按精确字符串匹配（含换行与缩进）执行。
+                             - 单次调用建议不超过 10 个操作；new_string 很长时请拆成多次调用，避免单次参数过大。
                              - 先想清楚需要修改哪些文件和内容，再一次性完成所有编辑。
-                             示例:
-                             {operations:[{path:"filePath1","old_string":"aaa",new_string:"bbb","replace_all":false}]}
-             \"#.into(),
+                             返回：成功时每个文件给出 ### <path> 与 n replacement(s)，末尾以 Applied X/Y operation(s) 汇总；失败时会标出是第几个操作。
+             "#.into(),
             read_only: false,
             schema: serde_json::json!({
                 "type": "object",
@@ -190,9 +232,12 @@ impl FilesystemTool {
                             "required": ["path", "old_string", "new_string"]
                         },
                         "description": "要编辑的文件操作列表，支持批量编辑多个文件"
-                    }
-                },
-                "required": ["operations"]
+                    },
+                    "path": {"type": "string", "description": "单个编辑形式的目标文件路径（与 operations 二选一）"},
+                    "old_string": {"type": "string", "description": "单个编辑形式的原字符串"},
+                    "new_string": {"type": "string", "description": "单个编辑形式的替换文本"},
+                    "replace_all": {"type": "boolean", "description": "单个编辑形式：是否替换所有匹配项（默认 false）", "default": false}
+                }
             }),
         }
     }
@@ -381,9 +426,18 @@ impl Tool for FilesystemTool {
                         .map_err(|e| {
                             agentscope_core::Error::Tool(format!("Invalid edit_file params: {e}"))
                         })?;
+                let operations = params.into_operations();
+                if operations.is_empty() {
+                    return Ok(ToolResultBlock::text(
+                        "No operations provided: pass `operations: [{path, old_string, new_string}]` \
+                         or the flat `{path, old_string, new_string}` form.",
+                    ));
+                }
+                let total = operations.len();
                 let mut outputs = Vec::new();
                 let mut diffs = Vec::new();
-                for op in &params.operations {
+                let mut applied = 0usize;
+                for (i, op) in operations.iter().enumerate() {
                     let before = self
                         .fs
                         .read(&rt, &op.path, 0, 0)
@@ -396,7 +450,8 @@ impl Tool for FilesystemTool {
                         .await
                     {
                         Ok(n) => {
-//                             outputs.push(format!("### {}\n{} replacement(s)", op.path, n));
+                            applied += 1;
+                            outputs.push(format!("### {}\n{n} replacement(s)", op.path));
                             if let Some(old) = before {
                                 let new = self
                                     .fs
@@ -408,14 +463,14 @@ impl Tool for FilesystemTool {
                                 diffs.push(diff_entry(&op.path, Some(old), new));
                             }
                         }
-                        Err(e) => outputs.push(format!("### {}\nERROR: {e}", op.path)),
+                        Err(e) => outputs
+                            .push(format!("### {}\nERROR (operation #{}): {e}", op.path, i + 1)),
                     }
                 }
-                let text = if outputs.is_empty() {
-                    "No operations to edit".to_string()
-                } else {
+                let text = format!(
+                    "{}\n\nApplied {applied}/{total} operation(s)",
                     outputs.join("\n\n")
-                };
+                );
                 return Ok(with_diffs(ToolResultBlock::text(text), diffs));
             }
             "grep_files" => {

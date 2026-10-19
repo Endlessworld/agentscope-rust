@@ -285,6 +285,10 @@ impl Filesystem for LocalFilesystem {
         let content = tokio::fs::read_to_string(&resolved).await.map_err(Error::Io)?;
         let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
         let old_norm = old.replace("\r\n", "\n").replace('\r', "\n");
+        // Normalise the replacement too: the file was matched and rewritten in
+        // LF form, so writing a CRLF replacement verbatim would leave the file
+        // with mixed line endings.
+        let new_norm = new.replace("\r\n", "\n").replace('\r', "\n");
         if old_norm.is_empty() {
             return Err(Error::Tool("old_string must not be empty".into()));
         }
@@ -298,9 +302,9 @@ impl Filesystem for LocalFilesystem {
             )));
         }
         let new_content = if replace_all {
-            normalized.replace(&old_norm, new)
+            normalized.replace(&old_norm, &new_norm)
         } else {
-            normalized.replacen(&old_norm, new, 1)
+            normalized.replacen(&old_norm, &new_norm, 1)
         };
         tokio::fs::write(&resolved, new_content).await.map_err(Error::Io)?;
         Ok(count)

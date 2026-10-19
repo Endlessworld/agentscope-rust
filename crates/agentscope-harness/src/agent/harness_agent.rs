@@ -1417,7 +1417,7 @@ impl HarnessAgentBuilder {
         if !self.disable_web_tools {
             match &self.web_http_client {
                 Some(client) => {
-                    toolkit.register_tool(Arc::new(WebFetchTool::with_client(client.clone())));
+                    toolkit.register_tool(Arc::new(WebFetchTool::from_env().with_client(client.clone())));
                     toolkit
                         .register_tool(Arc::new(WebSearchTool::from_env().with_client(client.clone())));
                 }

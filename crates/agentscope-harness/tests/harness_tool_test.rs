@@ -79,6 +79,95 @@ async fn edit_file_via_toolkit() {
 }
 
 #[tokio::test]
+async fn edit_file_accepts_flat_single_operation_form() {
+    let dir = temp_dir("edit_flat").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    fs.write(&ctx(), "/a.txt", "one two").await.unwrap();
+    let toolkit = Toolkit::new();
+    FilesystemTool::register(&toolkit, fs.clone());
+
+    // The tool description advertises top-level path/old_string/new_string, so
+    // that shape must validate and behave like a one-element batch.
+    let call = ToolUseBlock::new(
+        "1",
+        "edit_file",
+        serde_json::json!({ "path": "/a.txt", "old_string": "two", "new_string": "three" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let r = toolkit.call_tool(&call, Default::default()).await.unwrap();
+    let text = result_text(&r);
+    assert!(text.contains("1 replacement"), "got: {text}");
+    assert!(text.contains("Applied 1/1"), "got: {text}");
+    assert_eq!(fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap().content, "one three");
+}
+
+#[tokio::test]
+async fn edit_file_reports_empty_operations_distinctly() {
+    let dir = temp_dir("edit_empty").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let toolkit = Toolkit::new();
+    FilesystemTool::register(&toolkit, fs);
+
+    let call = ToolUseBlock::new(
+        "1",
+        "edit_file",
+        serde_json::json!({ "operations": [] }).as_object().cloned().unwrap(),
+    );
+    let r = toolkit.call_tool(&call, Default::default()).await.unwrap();
+    let text = result_text(&r);
+    assert!(text.contains("No operations provided"), "got: {text}");
+    assert!(!text.contains("Applied"), "got: {text}");
+}
+
+#[tokio::test]
+async fn edit_file_error_names_the_failing_operation() {
+    let dir = temp_dir("edit_err").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    fs.write(&ctx(), "/a.txt", "one").await.unwrap();
+    let toolkit = Toolkit::new();
+    FilesystemTool::register(&toolkit, fs);
+
+    let call = ToolUseBlock::new(
+        "1",
+        "edit_file",
+        serde_json::json!({ "operations": [
+            { "path": "/a.txt", "old_string": "one", "new_string": "ONE" },
+            { "path": "/a.txt", "old_string": "absent", "new_string": "x" }
+        ] })
+        .as_object()
+        .cloned()
+        .unwrap(),
+    );
+    let r = toolkit.call_tool(&call, Default::default()).await.unwrap();
+    let text = result_text(&r);
+    assert!(text.contains("ERROR (operation #2)"), "got: {text}");
+    assert!(text.contains("Applied 1/2"), "got: {text}");
+}
+
+#[tokio::test]
+async fn edit_file_normalises_crlf_in_the_replacement() {
+    let dir = temp_dir("edit_crlf").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    fs.write(&ctx(), "/a.txt", "a\nb\nc").await.unwrap();
+    let toolkit = Toolkit::new();
+    FilesystemTool::register(&toolkit, fs.clone());
+
+    let call = ToolUseBlock::new(
+        "1",
+        "edit_file",
+        serde_json::json!({ "path": "/a.txt", "old_string": "b", "new_string": "B1\r\nB2" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    toolkit.call_tool(&call, Default::default()).await.unwrap();
+    let got = fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap().content;
+    assert_eq!(got, "a\nB1\nB2\nc");
+}
+
+#[tokio::test]
 async fn shell_execute_tool() {
     let dir = temp_dir("shell_tool").await;
     let inner = Arc::new(LocalFilesystem::sandboxed(&dir));
