@@ -358,6 +358,10 @@ impl ToolUseBlock {
     /// Metadata key for Gemini thought signature.
     pub const METADATA_THOUGHT_SIGNATURE: &'static str = "thoughtSignature";
 
+    /// Metadata key marking a tool call as executed by the provider (server tool).
+    /// Mirrors the Java `ToolUseBlock.METADATA_SERVER_TOOL`.
+    pub const METADATA_SERVER_TOOL: &'static str = "serverTool";
+
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -375,6 +379,17 @@ impl ToolUseBlock {
 
     pub fn builder() -> ToolUseBlockBuilder {
         ToolUseBlockBuilder::default()
+    }
+
+    /// Whether the provider executes this tool itself (Google Search, web search, …).
+    ///
+    /// Server-tool calls are never dispatched to the local toolkit; their results are
+    /// expected to arrive inline in the same assistant message.
+    pub fn is_server_tool(&self) -> bool {
+        self.metadata
+            .get(Self::METADATA_SERVER_TOOL)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 }
 
@@ -468,6 +483,10 @@ impl ToolResultBlock {
     ///
     /// Control-plane information; never rendered through `output`.
     pub const METADATA_SUSPEND_REASON: &'static str = "agentscope_suspend_reason";
+
+    /// Metadata key marking a tool result produced by a provider-side (server) tool.
+    /// Mirrors the Java `ToolResultBlock.METADATA_SERVER_TOOL`.
+    pub const METADATA_SERVER_TOOL: &'static str = "serverTool";
 
     pub fn new(id: &str, name: &str, output: Vec<ContentBlock>) -> Self {
         Self {
@@ -648,6 +667,14 @@ impl ToolResultBlock {
         self.metadata
             .get(Self::METADATA_SUSPEND_REASON)
             .and_then(|v| v.as_str())
+    }
+
+    /// Whether this result was produced by a provider-side (server) tool.
+    pub fn is_server_tool(&self) -> bool {
+        self.metadata
+            .get(Self::METADATA_SERVER_TOOL)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     pub fn builder() -> ToolResultBlockBuilder {

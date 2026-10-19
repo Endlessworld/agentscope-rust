@@ -6,10 +6,31 @@
 //! replayed on the next turn (Gemini rejects replayed tool calls without it).
 
 use agentscope_core::{
-    ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ThinkingBlock, ToolUseBlock,
+    ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ThinkingBlock, ToolCallState,
+    ToolResultBlock, ToolResultState, ToolUseBlock,
 };
 
 use super::dto::{GeminiResponse, GeminiUsageMetadata};
+
+/// Metadata key preserving the raw Gemini server-tool response payload.
+pub const METADATA_SERVER_TOOL_RESPONSE: &str = "gemini.serverToolResponse";
+
+/// Metadata key marking a block as produced by Gemini code execution.
+const METADATA_CODE_EXECUTION: &str = "gemini.codeExecution";
+
+/// Metadata key carrying the raw code-execution result.
+const METADATA_CODE_EXECUTION_RESULT: &str = "gemini.codeExecutionResult";
+
+/// Metadata key carrying the code-execution outcome (`OUTCOME_OK`, ...).
+const METADATA_CODE_EXECUTION_OUTCOME: &str = "gemini.codeExecution.outcome";
+
+/// Name AgentScope gives to the built-in Gemini code-execution tool.
+const CODE_EXECUTION_NAME: &str = "CODE_EXECUTION";
+
+/// Wraps the non-empty-`json` metadata insert used by the server-tool blocks.
+fn insert_metadata(metadata: &mut JsonMap, key: &str, value: serde_json::Value) {
+    metadata.insert(key.to_string(), value);
+}
 
 /// Builds the AgentScope usage from Gemini's `usageMetadata`.
 ///
@@ -53,6 +74,7 @@ pub fn blocks_of(response: &GeminiResponse) -> Vec<ContentBlock> {
         return blocks;
     };
 
+    let mut pending_code_execution_id: Option<String> = None;
     for part in &content.parts {
         if part.thought == Some(true) {
             if let Some(text) = part.text.as_ref().filter(|t| !t.is_empty()) {
@@ -63,6 +85,83 @@ pub fn blocks_of(response: &GeminiResponse) -> Vec<ContentBlock> {
 
         if let Some(text) = part.text.as_ref().filter(|t| !t.is_empty()) {
             blocks.push(ContentBlock::Text(TextBlock::new(text.clone())));
+        }
+
+        // Gemini code execution uses dedicated parts instead of toolCall/toolResponse.
+        if let Some(code) = &part.executable_code {
+            let id = code
+                .id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| pending_code_execution_id.clone())
+                .unwrap_or_else(|| format!("code_execution_{}", uuid::Uuid::new_v4().simple()));
+            let mut input = JsonMap::new();
+            if let Some(language) = &code.language {
+                input.insert("language".to_string(), serde_json::json!(language));
+            }
+            if let Some(source) = &code.code {
+                input.insert("code".to_string(), serde_json::json!(source));
+            }
+            let mut tool = ToolUseBlock::new(id.clone(), CODE_EXECUTION_NAME, input.clone());
+            if !input.is_empty() {
+                tool.content = Some(serde_json::Value::Object(input).to_string());
+            }
+            tool.state = ToolCallState::Finished;
+            insert_metadata(
+                &mut tool.metadata,
+                ToolUseBlock::METADATA_SERVER_TOOL,
+                serde_json::json!(true),
+            );
+            insert_metadata(
+                &mut tool.metadata,
+                METADATA_CODE_EXECUTION,
+                serde_json::json!(true),
+            );
+            blocks.push(ContentBlock::ToolUse(tool));
+            pending_code_execution_id = Some(id);
+        }
+
+        if let Some(exec) = &part.code_execution_result {
+            let id = exec
+                .id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| pending_code_execution_id.clone())
+                .unwrap_or_else(|| format!("code_execution_{}", uuid::Uuid::new_v4().simple()));
+            let state = match exec.outcome.as_deref() {
+                Some("OUTCOME_FAILED") | Some("OUTCOME_DEADLINE_EXCEEDED") => ToolResultState::Error,
+                _ => ToolResultState::Success,
+            };
+            let mut metadata = JsonMap::new();
+            insert_metadata(
+                &mut metadata,
+                ToolResultBlock::METADATA_SERVER_TOOL,
+                serde_json::json!(true),
+            );
+            insert_metadata(&mut metadata, METADATA_CODE_EXECUTION, serde_json::json!(true));
+            if let Ok(raw) = serde_json::to_value(exec) {
+                insert_metadata(&mut metadata, METADATA_CODE_EXECUTION_RESULT, raw);
+            }
+            if let Some(outcome) = &exec.outcome {
+                insert_metadata(
+                    &mut metadata,
+                    METADATA_CODE_EXECUTION_OUTCOME,
+                    serde_json::json!(outcome),
+                );
+            }
+            let output = exec
+                .output
+                .as_ref()
+                .map(|o| vec![ContentBlock::Text(TextBlock::new(o.clone()))])
+                .unwrap_or_default();
+            blocks.push(ContentBlock::ToolResult(ToolResultBlock {
+                id: Some(id),
+                name: Some(CODE_EXECUTION_NAME.to_string()),
+                output,
+                metadata,
+                state,
+            }));
+            pending_code_execution_id = None;
         }
 
         if let Some(call) = &part.function_call {
@@ -86,6 +185,73 @@ pub fn blocks_of(response: &GeminiResponse) -> Vec<ContentBlock> {
                 tool.metadata = metadata;
             }
             blocks.push(ContentBlock::ToolUse(tool));
+        }
+
+        // Provider-executed (server) tool call, e.g. Google Search.
+        if let Some(call) = &part.tool_call {
+            let id = call
+                .id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("tool_call_{}", uuid::Uuid::new_v4().simple()));
+            let name = call.tool_type.clone().unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let mut tool = ToolUseBlock::new(id, name, call.args.clone());
+            if !call.args.is_empty() {
+                tool.content = Some(serde_json::Value::Object(call.args.clone()).to_string());
+            }
+            tool.state = ToolCallState::Finished;
+            insert_metadata(
+                &mut tool.metadata,
+                ToolUseBlock::METADATA_SERVER_TOOL,
+                serde_json::json!(true),
+            );
+            if let Some(signature) = &part.thought_signature {
+                insert_metadata(
+                    &mut tool.metadata,
+                    ToolUseBlock::METADATA_THOUGHT_SIGNATURE,
+                    serde_json::json!(signature),
+                );
+            }
+            blocks.push(ContentBlock::ToolUse(tool));
+        }
+
+        // Result of the matching server-tool call, inlined in the same message.
+        if let Some(response) = &part.tool_response {
+            let id = response
+                .id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("tool_call_{}", uuid::Uuid::new_v4().simple()));
+            let name = response.tool_type.clone().unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let mut metadata = JsonMap::new();
+            insert_metadata(
+                &mut metadata,
+                ToolResultBlock::METADATA_SERVER_TOOL,
+                serde_json::json!(true),
+            );
+            insert_metadata(
+                &mut metadata,
+                METADATA_SERVER_TOOL_RESPONSE,
+                response.response.clone().unwrap_or(serde_json::Value::Null),
+            );
+            let output = response
+                .response
+                .as_ref()
+                .map(|r| vec![ContentBlock::Text(TextBlock::new(r.to_string()))])
+                .unwrap_or_default();
+            blocks.push(ContentBlock::ToolResult(ToolResultBlock {
+                id: Some(id),
+                name: Some(name),
+                output,
+                metadata,
+                state: ToolResultState::Success,
+            }));
         }
     }
     blocks
@@ -269,6 +435,77 @@ mod tests {
                 );
             }
             other => panic!("expected tool use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_tool_call_and_response_become_marked_blocks() {
+        let parsed = parse_response(&response(serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "toolCall": { "id": "c1", "toolType": "GOOGLE_SEARCH_WEB", "args": { "query": "rust" } } },
+                { "toolResponse": { "id": "c1", "toolType": "GOOGLE_SEARCH_WEB", "response": { "hits": 3 } } }
+            ] } }]
+        })));
+        assert_eq!(parsed.content.len(), 2);
+        match &parsed.content[0] {
+            ContentBlock::ToolUse(t) => {
+                assert_eq!(t.id, "c1");
+                assert_eq!(t.name, "GOOGLE_SEARCH_WEB");
+                assert!(t.is_server_tool());
+                assert_eq!(t.state, ToolCallState::Finished);
+            }
+            other => panic!("expected server tool use, got {other:?}"),
+        }
+        match &parsed.content[1] {
+            ContentBlock::ToolResult(r) => {
+                assert_eq!(r.id.as_deref(), Some("c1"));
+                assert!(r.is_server_tool());
+                assert_eq!(r.state, ToolResultState::Success);
+                assert!(r.metadata.contains_key(METADATA_SERVER_TOOL_RESPONSE));
+            }
+            other => panic!("expected server tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_execution_parts_become_linked_server_tool_blocks() {
+        let parsed = parse_response(&response(serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "executableCode": { "id": "e1", "language": "PYTHON", "code": "print(1)" } },
+                { "codeExecutionResult": { "id": "e1", "outcome": "OUTCOME_OK", "output": "1\\n" } }
+            ] } }]
+        })));
+        match &parsed.content[0] {
+            ContentBlock::ToolUse(t) => {
+                assert_eq!(t.name, CODE_EXECUTION_NAME);
+                assert!(t.is_server_tool());
+                assert_eq!(t.input.get("code"), Some(&serde_json::json!("print(1)")));
+            }
+            other => panic!("expected code-execution tool use, got {other:?}"),
+        }
+        match &parsed.content[1] {
+            ContentBlock::ToolResult(r) => {
+                assert_eq!(r.id.as_deref(), Some("e1"));
+                assert_eq!(r.state, ToolResultState::Success);
+                assert_eq!(
+                    r.metadata.get(METADATA_CODE_EXECUTION_OUTCOME),
+                    Some(&serde_json::json!("OUTCOME_OK"))
+                );
+            }
+            other => panic!("expected code-execution result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_code_execution_maps_to_error_state() {
+        let parsed = parse_response(&response(serde_json::json!({
+            "candidates": [{ "content": { "parts": [
+                { "codeExecutionResult": { "outcome": "OUTCOME_FAILED", "output": "boom" } }
+            ] } }]
+        })));
+        match &parsed.content[0] {
+            ContentBlock::ToolResult(r) => assert_eq!(r.state, ToolResultState::Error),
+            other => panic!("expected code-execution result, got {other:?}"),
         }
     }
 

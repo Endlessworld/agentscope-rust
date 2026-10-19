@@ -27,8 +27,10 @@ use agentscope_core::{
 use super::dto::{
     AnthropicCacheControl, AnthropicContentBlock, AnthropicImageBlock, AnthropicImageSource,
     AnthropicMessage, AnthropicRequest, AnthropicTextBlock, AnthropicTool, AnthropicToolChoice,
-    AnthropicToolResultBlock, AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
+    AnthropicToolResultBlock, AnthropicToolResultContent, AnthropicServerToolUseBlock,
+    AnthropicToolUseBlock, SystemPrompt,
 };
+use super::parser::METADATA_SERVER_TOOL_RESULT;
 
 /// Per-request formatting switches derived from [`GenerateOptions`].
 #[derive(Debug, Clone, Default)]
@@ -191,6 +193,14 @@ pub fn data_content_block(block: &DataBlock, fmt: &ChatFormatOptions) -> Anthrop
 }
 
 fn tool_use_block(block: &ToolUseBlock, fmt: &ChatFormatOptions) -> AnthropicContentBlock {
+    // Server-tool calls are echoed as `server_tool_use`, not `tool_use`.
+    if block.is_server_tool() {
+        return AnthropicContentBlock::ServerToolUse(AnthropicServerToolUseBlock {
+            id: block.id.clone(),
+            name: block.name.clone(),
+            input: block.input.clone(),
+        });
+    }
     AnthropicContentBlock::ToolUse(AnthropicToolUseBlock {
         id: block.id.clone(),
         name: block.name.clone(),
@@ -245,6 +255,15 @@ pub fn message_content_blocks(
 
 /// Converts one tool-result block into its standalone `user` message.
 pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> AnthropicMessage {
+    // A provider-executed (server) tool result is echoed back verbatim: the
+    // raw wire block was captured in metadata when the response was parsed.
+    if block.is_server_tool() {
+        if let Some(raw) = block.metadata.get(METADATA_SERVER_TOOL_RESULT) {
+            if let Ok(restored) = serde_json::from_value::<AnthropicContentBlock>(raw.clone()) {
+                return AnthropicMessage { role: "user".to_string(), content: vec![restored] };
+            }
+        }
+    }
     let mut content: Vec<AnthropicToolResultContent> = Vec::new();
     for output in &block.output {
         match output {
@@ -483,6 +502,15 @@ pub fn apply_cache_control(messages: &mut [AnthropicMessage], fmt: &ChatFormatOp
                 t.cache_control = Some(marker);
                 return;
             }
+            // Provider-executed blocks carry no cache marker, but keep scanning:
+            // an earlier cacheable block may still precede them.
+            AnthropicContentBlock::ServerToolUse(_)
+            | AnthropicContentBlock::WebSearchToolResult(_)
+            | AnthropicContentBlock::WebFetchToolResult(_)
+            | AnthropicContentBlock::CodeExecutionToolResult(_)
+            | AnthropicContentBlock::BashCodeExecutionToolResult(_)
+            | AnthropicContentBlock::TextEditorCodeExecutionToolResult(_)
+            | AnthropicContentBlock::ToolSearchToolResult(_) => {}
         }
     }
 }
@@ -1038,6 +1066,41 @@ mod tests {
         match &out[0].content[0] {
             AnthropicContentBlock::Text(t) => assert_eq!(t.text, "reasoning"),
             other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_tool_blocks_are_echoed_back_verbatim() {
+        // Round trip: parse a server-tool exchange, then re-encode it for the
+        // next request turn. The provider blocks must survive unchanged.
+        let parsed = crate::anthropic::parser::parse_message(
+            &serde_json::from_value(serde_json::json!({
+                "id": "msg_s",
+                "content": [
+                    { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": "rust" } },
+                    { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                      "content": [{ "type": "web_search_result", "title": "Rust", "url": "https://rust-lang.org" }] }
+                ]
+            }))
+            .unwrap(),
+        );
+        let messages = vec![Msg::assistant_blocks(parsed.content.clone())];
+        let out = to_anthropic_messages(&messages, &plain());
+        match &out[0].content[0] {
+            AnthropicContentBlock::ServerToolUse(t) => {
+                assert_eq!(t.id, "srvtoolu_1");
+                assert_eq!(t.name, "web_search");
+            }
+            other => panic!("expected server_tool_use, got {other:?}"),
+        }
+        // The tool result travels as its own user message and is restored verbatim.
+        let user = out.iter().find(|m| m.role == "user").expect("result message");
+        match &user.content[0] {
+            AnthropicContentBlock::WebSearchToolResult(r) => {
+                assert_eq!(r.tool_use_id, "srvtoolu_1");
+                assert!(r.content.is_some());
+            }
+            other => panic!("expected web_search_tool_result, got {other:?}"),
         }
     }
 

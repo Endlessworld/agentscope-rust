@@ -7,16 +7,23 @@
 use std::collections::BTreeMap;
 
 use agentscope_core::{
-    ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ThinkingBlock, ToolUseBlock,
+    ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ThinkingBlock, ToolCallState,
+    ToolResultBlock, ToolResultState, ToolUseBlock,
 };
 
 use super::dto::{
-    AnthropicContentBlock, AnthropicMessageResponse, AnthropicStreamEvent, AnthropicUsage,
+    AnthropicContentBlock, AnthropicMessageResponse, AnthropicServerToolResultBlock,
+    AnthropicStreamEvent, AnthropicUsage,
 };
 
 /// Placeholder tool name used for streamed argument fragments that arrive
 /// without name/id metadata (same sentinel as the Java `__fragment__`).
 pub const FRAGMENT_PLACEHOLDER: &str = "__fragment__";
+
+/// Metadata key preserving the raw Anthropic server-tool result block so a later
+/// turn can echo it back without reconstructing provider-only fields.
+/// Mirrors Java `AnthropicServerToolHelper.RESULT_METADATA`.
+pub const METADATA_SERVER_TOOL_RESULT: &str = "anthropicServerToolResult";
 
 fn usage_of(usage: &AnthropicUsage) -> ChatUsage {
     ChatUsage {
@@ -50,9 +57,94 @@ pub fn blocks_of(content: &[AnthropicContentBlock]) -> Vec<ContentBlock> {
             }
             // Images never appear in a response.
             AnthropicContentBlock::Image(_) | AnthropicContentBlock::ToolResult(_) => {}
+            AnthropicContentBlock::ServerToolUse(t) => {
+                if t.name.is_empty() {
+                    continue;
+                }
+                let raw = serde_json::Value::Object(t.input.clone()).to_string();
+                let mut tool = ToolUseBlock::new(t.id.clone(), t.name.clone(), t.input.clone());
+                tool.content = Some(raw);
+                tool.state = ToolCallState::Finished;
+                tool.metadata.insert(
+                    ToolUseBlock::METADATA_SERVER_TOOL.to_string(),
+                    serde_json::json!(true),
+                );
+                blocks.push(ContentBlock::ToolUse(tool));
+            }
+            // Provider-executed tool results, one wire type per server tool.
+            AnthropicContentBlock::WebSearchToolResult(r) => blocks.push(ContentBlock::ToolResult(
+                server_tool_result_block(r, "web_search", block),
+            )),
+            AnthropicContentBlock::WebFetchToolResult(r) => blocks.push(ContentBlock::ToolResult(
+                server_tool_result_block(r, "web_fetch", block),
+            )),
+            AnthropicContentBlock::CodeExecutionToolResult(r) => blocks.push(
+                ContentBlock::ToolResult(server_tool_result_block(r, "code_execution", block)),
+            ),
+            AnthropicContentBlock::BashCodeExecutionToolResult(r) => blocks.push(
+                ContentBlock::ToolResult(server_tool_result_block(r, "bash_code_execution", block)),
+            ),
+            AnthropicContentBlock::TextEditorCodeExecutionToolResult(r) => blocks.push(
+                ContentBlock::ToolResult(server_tool_result_block(
+                    r,
+                    "text_editor_code_execution",
+                    block,
+                )),
+            ),
+            AnthropicContentBlock::ToolSearchToolResult(r) => blocks.push(ContentBlock::ToolResult(
+                server_tool_result_block(r, "tool_search", block),
+            )),
         }
     }
     blocks
+}
+
+/// Builds the AgentScope result block for a provider-executed tool, keeping the
+/// raw wire payload so it can be replayed verbatim on the next turn.
+fn server_tool_result_block(
+    result: &AnthropicServerToolResultBlock,
+    name: &str,
+    raw: &AnthropicContentBlock,
+) -> ToolResultBlock {
+    let mut metadata = JsonMap::new();
+    metadata.insert(
+        ToolResultBlock::METADATA_SERVER_TOOL.to_string(),
+        serde_json::json!(true),
+    );
+    // Keep the whole wire block so a later turn can echo it back unchanged.
+    if let Ok(value) = serde_json::to_value(raw) {
+        metadata.insert(METADATA_SERVER_TOOL_RESULT.to_string(), value);
+    }
+    let mut state = ToolResultState::Success;
+    let mut output = Vec::new();
+
+    if let Some(content) = &result.content {
+        if let Some(error_code) = content.get("error_code").and_then(|v| v.as_str()) {
+            state = ToolResultState::Error;
+            output.push(ContentBlock::Text(TextBlock::new(format!(
+                "[ERROR] {name} failed: {error_code}"
+            ))));
+        } else if name == "web_search" {
+            if let Some(items) = content.as_array() {
+                for item in items {
+                    let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    output.push(ContentBlock::Text(TextBlock::new(format!("{title} ({url})"))));
+                }
+            }
+        }
+        if output.is_empty() {
+            output.push(ContentBlock::Text(TextBlock::new(content.to_string())));
+        }
+    }
+
+    ToolResultBlock {
+        id: Some(result.tool_use_id.clone()),
+        name: Some(name.to_string()),
+        output,
+        metadata,
+        state,
+    }
 }
 
 /// Parses a non-streaming `Message` response.
@@ -257,6 +349,57 @@ mod tests {
                 assert_eq!(t.content.as_deref(), Some("{\"city\":\"Paris\"}"));
             }
             other => panic!("expected tool use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_server_tool_use_and_web_search_result() {
+        let parsed = parse_message(&response(serde_json::json!({
+            "id": "msg_s",
+            "content": [
+                { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": "rust" } },
+                { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                    { "type": "web_search_result", "title": "Rust", "url": "https://rust-lang.org" }
+                ] }
+            ],
+            "stop_reason": "end_turn"
+        })));
+        match &parsed.content[0] {
+            ContentBlock::ToolUse(t) => {
+                assert_eq!(t.id, "srvtoolu_1");
+                assert_eq!(t.name, "web_search");
+                assert!(t.is_server_tool());
+                assert_eq!(t.state, ToolCallState::Finished);
+            }
+            other => panic!("expected server tool use, got {other:?}"),
+        }
+        match &parsed.content[1] {
+            ContentBlock::ToolResult(r) => {
+                assert_eq!(r.id.as_deref(), Some("srvtoolu_1"));
+                assert_eq!(r.name.as_deref(), Some("web_search"));
+                assert!(r.is_server_tool());
+                assert_eq!(r.state, ToolResultState::Success);
+                assert!(r.metadata.contains_key(METADATA_SERVER_TOOL_RESULT));
+            }
+            other => panic!("expected server tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_tool_error_result_maps_to_error_state() {
+        let parsed = parse_message(&response(serde_json::json!({
+            "id": "msg_s",
+            "content": [
+                { "type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+                  "content": { "error_code": "unavailable" } }
+            ]
+        })));
+        match &parsed.content[0] {
+            ContentBlock::ToolResult(r) => {
+                assert_eq!(r.name.as_deref(), Some("code_execution"));
+                assert_eq!(r.state, ToolResultState::Error);
+            }
+            other => panic!("expected server tool result, got {other:?}"),
         }
     }
 

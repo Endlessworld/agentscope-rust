@@ -230,7 +230,58 @@ pub fn to_gemini_tools(tools: &[ToolSchema]) -> Option<GeminiTool> {
                 .then(|| serde_json::Value::Object(schema.parameters.clone())),
         })
         .collect();
-    Some(GeminiTool { function_declarations: declarations })
+    Some(GeminiTool { function_declarations: declarations, ..Default::default() })
+}
+
+/// A provider-executed (server) tool declaration.
+///
+/// Mirrors the Java `GeminiServerTool`: these are executed by Gemini instead of
+/// the local toolkit, so they are never emitted as function declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiServerTool {
+    /// Built-in Google Search grounding (`googleSearch`).
+    GoogleSearch,
+    /// Built-in URL fetching (`urlContext`).
+    UrlContext,
+    /// Built-in Python code execution (`codeExecution`).
+    CodeExecution,
+}
+
+impl GeminiServerTool {
+    /// The wire representation of this server tool (an empty object, as Gemini
+    /// takes the presence of the key as the configuration).
+    pub fn to_tool(self) -> GeminiTool {
+        let mut tool = GeminiTool::default();
+        let empty = Some(serde_json::json!({}));
+        match self {
+            GeminiServerTool::GoogleSearch => tool.google_search = empty,
+            GeminiServerTool::UrlContext => tool.url_context = empty,
+            GeminiServerTool::CodeExecution => tool.code_execution = empty,
+        }
+        tool
+    }
+}
+
+/// Appends server-tool entries to the request's `tools` and turns on
+/// `includeServerSideToolInvocations`, mirroring `GeminiToolsHelper.mergeServerTools`.
+pub fn merge_server_tools(
+    tools: &mut Option<Vec<GeminiTool>>,
+    tool_config: &mut Option<GeminiToolConfig>,
+    server_tools: &[GeminiServerTool],
+) {
+    if server_tools.is_empty() {
+        return;
+    }
+    let list = tools.get_or_insert_with(Vec::new);
+    list.extend(server_tools.iter().map(|tool| tool.to_tool()));
+    let config = tool_config.get_or_insert_with(|| GeminiToolConfig {
+        function_calling_config: GeminiFunctionCallingConfig {
+            mode: "AUTO".to_string(),
+            allowed_function_names: None,
+            include_server_side_tool_invocations: None,
+        },
+    });
+    config.function_calling_config.include_server_side_tool_invocations = Some(true);
 }
 
 /// Builds the Gemini `toolConfig`, or `None` for the default `AUTO` mode.
@@ -248,6 +299,7 @@ pub fn to_tool_choice(choice: &ToolChoice) -> Option<GeminiToolConfig> {
         function_calling_config: GeminiFunctionCallingConfig {
             mode: mode.to_string(),
             allowed_function_names: names,
+            include_server_side_tool_invocations: None,
         },
     })
 }
@@ -285,17 +337,31 @@ pub fn build_request(
     options: &GenerateOptions,
     default_options: &GenerateOptions,
 ) -> GeminiRequest {
+    build_request_with_server_tools(messages, tools, options, default_options, &[])
+}
+
+/// Assembles the full Gemini request body, appending provider-executed tools.
+pub fn build_request_with_server_tools(
+    messages: &[Msg],
+    tools: &[ToolSchema],
+    options: &GenerateOptions,
+    default_options: &GenerateOptions,
+    server_tools: &[GeminiServerTool],
+) -> GeminiRequest {
     let generation_config = apply_options(options, default_options);
     let tool_choice = options
         .tool_choice
         .as_ref()
         .or(default_options.tool_choice.as_ref())
         .and_then(to_tool_choice);
+    let mut tools_body = to_gemini_tools(tools).map(|tool| vec![tool]);
+    let mut tool_config = tool_choice;
+    merge_server_tools(&mut tools_body, &mut tool_config, server_tools);
 
     GeminiRequest {
         contents: to_gemini_contents(messages),
-        tools: to_gemini_tools(tools).map(|tool| vec![tool]),
-        tool_config: tool_choice,
+        tools: tools_body,
+        tool_config,
         generation_config: (!generation_config.is_empty()).then_some(generation_config),
     }
 }
@@ -656,6 +722,43 @@ mod tests {
             request.tool_config.unwrap().function_calling_config.allowed_function_names,
             Some(vec!["f".to_string()])
         );
+    }
+
+    #[test]
+    fn server_tools_are_appended_and_enable_the_tool_context_loop() {
+        let request = build_request_with_server_tools(
+            &[Msg::user("hi")],
+            &[tool_schema("f")],
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &[GeminiServerTool::GoogleSearch],
+        );
+        let tools = request.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 2, "function tool entry + 1 server tool entry");
+        assert_eq!(tools[1].google_search, Some(serde_json::json!({})));
+        assert!(tools[1].function_declarations.is_empty());
+        assert_eq!(
+            request
+                .tool_config
+                .unwrap()
+                .function_calling_config
+                .include_server_side_tool_invocations,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn server_tools_alone_create_the_tools_list() {
+        let request = build_request_with_server_tools(
+            &[Msg::user("hi")],
+            &[],
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &[GeminiServerTool::CodeExecution],
+        );
+        let tools = request.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].code_execution, Some(serde_json::json!({})));
     }
 
     #[test]

@@ -94,6 +94,41 @@ pub enum AnthropicContentBlock {
     ToolUse(AnthropicToolUseBlock),
     /// A tool execution result (always inside a `user` message).
     ToolResult(AnthropicToolResultBlock),
+    /// A call to a provider-executed (server) tool, e.g. `web_search`.
+    ServerToolUse(AnthropicServerToolUseBlock),
+    /// Result of a server-side web search.
+    WebSearchToolResult(AnthropicServerToolResultBlock),
+    /// Result of a server-side web fetch.
+    WebFetchToolResult(AnthropicServerToolResultBlock),
+    /// Result of server-side code execution.
+    CodeExecutionToolResult(AnthropicServerToolResultBlock),
+    /// Result of server-side bash execution.
+    BashCodeExecutionToolResult(AnthropicServerToolResultBlock),
+    /// Result of server-side text-editor execution.
+    TextEditorCodeExecutionToolResult(AnthropicServerToolResultBlock),
+    /// Result of the server-side tool-search tool.
+    ToolSearchToolResult(AnthropicServerToolResultBlock),
+}
+
+/// A provider-executed tool call (`server_tool_use`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicServerToolUseBlock {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub input: serde_json::Map<String, Value>,
+}
+
+/// A provider-executed tool result block.
+///
+/// Anthropic gives every server tool its own result block type but they all
+/// share the `{tool_use_id, content}` shape, where `content` is provider-typed
+/// (a result array for web search, an object for code execution).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicServerToolResultBlock {
+    pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
 }
 
 /// Text block with optional prompt-cache marker.

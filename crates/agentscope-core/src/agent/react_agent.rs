@@ -116,6 +116,7 @@ struct ReasoningContext {
 
 impl ReasoningContext {
     /// Merges a streamed chunk into this accumulator.
+    tool_results: Vec<ToolResultBlock>,
     fn accumulate(&mut self, chunk: crate::model::ChatResponse) {
         if self.id.is_empty() {
             self.id = chunk.id.clone();
@@ -130,6 +131,7 @@ impl ReasoningContext {
         }
         if chunk.usage.total_tokens() > 0 {
             self.usage = Some(chunk.usage);
+                ContentBlock::ToolResult(t) => self.tool_results.push(t),
         }
     }
 
@@ -150,6 +152,11 @@ impl ReasoningContext {
             b = b.id(self.id);
         }
         if let Some(u) = self.usage {
+        // Inline provider-side tool results (server tools) travel in the same
+        // assistant message, so the turn can be recognized as already finished.
+        for tr in self.tool_results {
+            blocks.push(ContentBlock::ToolResult(tr));
+        }
             b = b.usage(u);
         }
         b.build()
@@ -938,7 +945,7 @@ async fn execute_iteration(
     loop {
         let msg = reasoning_phase(core, ctx, state, iter).await?;
         let reason = msg.generate_reason();
-        let has_tool_calls = msg.tool_use_blocks().next().is_some();
+        let has_tool_calls = has_actionable_tool_calls(&msg);
         let outcome = match reason {
             GenerateReason::ModelStop | GenerateReason::ToolCalls => {
                 if has_tool_calls {
@@ -982,6 +989,22 @@ async fn execute_iteration(
 
 /// The result of one acting phase.
 #[derive(Default)]
+/// Whether a reasoning message still has tool calls that need local action.
+///
+/// Server-tool calls are executed by the provider and their results arrive inline in
+/// the same assistant message, so a message whose tool calls are all server tools with
+/// results present is already finished. Mirrors the Java `isFinished` tail.
+fn has_actionable_tool_calls(msg: &Msg) -> bool {
+    let calls: Vec<&ToolUseBlock> = msg.tool_use_blocks().collect();
+    if calls.is_empty() {
+        return false;
+    }
+    let inline = msg.inline_server_tool_result_ids();
+    !calls
+        .iter()
+        .all(|c| c.is_server_tool() && inline.contains(&c.id))
+}
+
 struct ActingOutcome {
     /// At least one tool call suspended itself and awaits external execution.
     suspended: bool,
@@ -2062,6 +2085,9 @@ fn reconcile_interrupted(state: &mut AgentState) -> Msg {
     }
     let recovery = Msg::builder()
         .role(MsgRole::Assistant)
+        // Server-tool calls are executed by the provider and answered inline; they must
+        // never be dispatched to the local toolkit (Java `extractPendingToolCalls` filter).
+        .filter(|tu| !tu.is_server_tool())
         .content(vec![ContentBlock::Text(TextBlock::new(
             "I noticed that you have interrupted me. What can I do for you?",
         ))])
@@ -3794,6 +3820,52 @@ mod tests {
             .any(|t| t.id.as_deref() == Some("c1"));
         assert!(answered, "the dangling c1 tool_use must be answered; got {ctx:?}");
         assert_eq!(*counter.lock().unwrap(), 0, "the interrupted tool must not run");
+    #[tokio::test]
+    async fn server_tool_call_is_not_dispatched_and_ends_the_turn() {
+        // A provider-executed (server) tool call arrives with its result already inline.
+        // The agent must not dispatch it to the local toolkit and must treat the turn as
+        // finished (no acting phase, no synthetic "tool not found" error).
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![server_tool_response("s1", "google_search")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-server-tool")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("search the web")]).await.unwrap();
+        assert_eq!(*counter.lock().unwrap(), 0, "server tool must not hit the local toolkit");
+        // The turn ends on the provider's assistant message, not a fabricated error result.
+        assert!(reply
+            .tool_use_blocks()
+            .any(|t| t.id == "s1" && t.is_server_tool()));
+    }
+
+    /// Provider-executed calls must never be dispatched locally, even when the inline
+    /// result is missing (e.g. a chunked stream that dropped it).
+    #[test]
+    fn pending_tool_calls_skip_server_tools_without_inline_results() {
+        let mut server_call = ToolUseBlock::new("s1", "google_search", JsonMap::new());
+        server_call
+            .metadata
+            .insert(ToolUseBlock::METADATA_SERVER_TOOL.to_string(), serde_json::json!(true));
+        let mut local_call = ToolUseBlock::new("c1", "add", JsonMap::new());
+        local_call.id = "c1".to_string();
+        let mut state = AgentState::default();
+        state.context.push(Msg::assistant_blocks(vec![
+            ContentBlock::ToolUse(server_call),
+            ContentBlock::ToolUse(local_call),
+        ]));
+        let pending = extract_pending_tool_calls(&state);
+        assert_eq!(pending.len(), 1, "only the local tool call stays pending");
+        assert_eq!(pending[0].id, "c1");
+    }
+
     }
 
     #[tokio::test]

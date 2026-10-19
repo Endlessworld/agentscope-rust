@@ -15,7 +15,7 @@ use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, 
 
 use crate::common::error::ModelError;
 use crate::common::{HttpRequestSpec, SharedTransport};
-use crate::gemini::converter::build_request;
+use crate::gemini::converter::{build_request_with_server_tools, GeminiServerTool};
 use crate::gemini::credential::{
     generate_content_path, stream_generate_content_path, API_KEY_HEADER, DEFAULT_BASE_URL,
 };
@@ -43,6 +43,7 @@ pub struct GeminiChatModel {
     default_options: GenerateOptions,
     stream: bool,
     context_window_size: usize,
+    server_tools: Vec<GeminiServerTool>,
 }
 
 impl GeminiChatModel {
@@ -63,7 +64,14 @@ impl GeminiChatModel {
             default_options: GenerateOptions::default(),
             stream: true,
             context_window_size: 0,
+            server_tools: Vec::new(),
         }
+    }
+
+    /// Registers provider-executed (server) tools such as Google Search.
+    pub fn with_server_tools(mut self, tools: Vec<GeminiServerTool>) -> Self {
+        self.server_tools = tools;
+        self
     }
 
     /// Sets the default options merged under every request.
@@ -106,7 +114,13 @@ impl GeminiChatModel {
         options: &GenerateOptions,
         stream: bool,
     ) -> HttpRequestSpec {
-        let request = build_request(&messages, &tools, options, &self.default_options);
+        let request = build_request_with_server_tools(
+            &messages,
+            &tools,
+            options,
+            &self.default_options,
+            &self.server_tools,
+        );
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
         // Extra body params merge last so callers can override any field.
         if let Some(map) = body.as_object_mut() {
@@ -197,6 +211,10 @@ impl Model for GeminiChatModel {
         true
     }
 
+    fn supports_tool_choice_specific(&self) -> bool {
+        true
+    }
+
     fn context_window_size(&self) -> usize {
         self.context_window_size
     }
@@ -211,10 +229,6 @@ pub fn default_transport() -> SharedTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn supports_tool_choice_specific(&self) -> bool {
-        true
-    }
-
     use crate::common::MemoryTransport;
     use agentscope_core::{ContentBlock, JsonMap, ToolChoice, ToolUseBlock};
 

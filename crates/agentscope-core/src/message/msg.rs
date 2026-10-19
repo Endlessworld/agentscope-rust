@@ -287,6 +287,18 @@ impl Msg {
         })
     }
 
+    /// Ids of tool results that are already inlined in this message.
+    ///
+    /// Used to decide whether a message's server-tool calls have all been answered
+    /// within the same message (so nothing is left to act on). Mirrors the Java
+    /// `MessageUtils.inlineServerToolResultIds`.
+    pub fn inline_server_tool_result_ids(&self) -> std::collections::HashSet<String> {
+        self.tool_result_blocks()
+            .filter_map(|tr| tr.id.as_ref())
+            .cloned()
+            .collect()
+    }
+
     /// Returns the accumulated chat usage, either from the `usage` field or from the
     /// `_chat_usage` metadata entry (parsed without caching).
     pub fn chat_usage(&self) -> Option<ChatUsage> {
