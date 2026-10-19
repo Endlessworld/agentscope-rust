@@ -1,6 +1,6 @@
 # MEMORY.md
 
-> 精简于 2026-10-19（并入 G1–G10 提交级分析、Java 迁移裁决清单 A1–D3、P0/P1 并行实施、judge crate、extensions-model 目录结构、e2b 落地确认）；旧全文备份在 `.agentscope/workspace/MEMORY.md.bak`。原则：只保留对**后续任务仍有指导意义**的稳定事实、约定与教训，删除一次性过程叙述。
+> 精简于 2026-10-19（并入 G1–G10 提交级分析、Java 迁移裁决清单 A1–D3、P0/P1 并行实施、judge crate、extensions-model 目录结构、e2b 落地确认、SKILLS JDBC 持久化落点、子智能体上下文爆炸规避、wave-reports 回执落盘约定）；旧全文备份在 `.agentscope/workspace/MEMORY.md.bak`。原则：只保留对**后续任务仍有指导意义**的稳定事实、约定与教训，删除一次性过程叙述。
 
 ## 环境与工作方式
 - 路径跨会话不同（见过 `E:\local-github\agentscope-rust` 与 `D:\IdeaProjects\agentscope-rust`；Java 源在 `E:\local-github\agentscope-java`，`D:\IdeaProjects\agentscope-java` 不存在）。**以任务说明中的路径为准**，勿凭记忆断言盘符。
@@ -194,3 +194,12 @@
   - 更新 `docs/java-recent-commits-migration-analysis.md` 附录 A.5（4 项全部「已修/已实施」+ 实施说明 + 反向验证）。
   - 教训：`edit_file` 多次因在 old_string 末尾多带/少带一行导致「误删相邻行」（promote 分支体、`subscriber_receives_events` 的 model 行、`propose_creates_draft` 的 drafts 行）→ 每次替换后须立即 read_file 核对。
   - 剩余大项（core 串行队列，未做）：A1(session 大重构)/A2(版本化上提 core trait)/A3(run 级控制)/A5(响应侧 schema 校验+strict 合并)/C4(server tools)/B1(skill namespace)/B3(MCP meta fail-open)/B5(tracer seam)/C1(liteparse，待 reqwest 0.13 决策)/C3(JDBC 破坏性重构)。
+
+- 2026-10-19 会话（A2/A5/C4/A3 实施，工作区未提交，分支 `dev`）：
+  - **A2 完成**：core `AgentStateStore` trait 增加版本化/CAS；5 个存储 crate（jdbc/mongodb/mysql/postgresql/redis）实现；harness `state_checkpoint.rs` post 阶段走 CAS + 冲突回退；新增 `core/tests/state_store_versioning_test.rs`。
+  - **A5 完成**：`ToolChoice::Specific` 能力位（`Model::supports_tool_choice_specific()`，openai/responses/anthropic_async/dashscope/gemini 覆盖 true）；`tool/validator.rs::validate_json_output` + `ReActAgent` 响应侧 schema 校验（失败回退 generate_response 工具路径，最多 3 次强制 `ToolChoice::Specific`）；openai `strict_json_schema` 模型级默认 + `to_response_format(rf, strict_default)` 请求级优先合并。
+  - **C4 完成**：core `ToolUseBlock/ToolResultBlock::METADATA_SERVER_TOOL`("serverTool") + `is_server_tool()`；`Msg::inline_server_tool_result_ids()`；`has_actionable_tool_calls`（服务端工具+内联结果=回合已完成）；`extract_pending_tool_calls` 过滤 server tool；**关键**：`ReasoningContext` 必须累积 `ToolResultBlock` 并在 `build_final_message` 输出，否则内联结果丢失、服务端工具会被当本地工具派发。gemini：DTO `tool_call/tool_response/executable_code/code_execution_result` + `includeServerSideToolInvocations`；`GeminiServerTool` 枚举（google_search/url_context/code_execution）+ `merge_server_tools`；`GeminiChatModel::with_server_tools`。anthropic：DTO 新增 `ServerToolUse` + 6 个 `*ToolResult` 变体（共用 `{tool_use_id, content}`）；parser 产出 server 标记块、整块 JSON 存 `anthropicServerToolResult` 元数据；converter `tool_use_block` 回写 `server_tool_use`、`tool_result_message` 从元数据原样回放。实测 model 262 passed。
+  - **A3 完成**：新增 `core/src/agent/run.rs`（`RunStatus` Created/Queued/Running/Completed/Failed/Cancelled + `is_terminal`、`RunControl`（agent_id/run_id/InterruptControl/AtomicU8 状态机/queue/start/cancel/interrupt/finish）、`AgentRun` 单次句柄、`generate_run_id()` 32-hex）；`RuntimeContext` 增 `run_id` 字段 + `with_run_id`/`run_id()`；`AgentCore` 增 `active_run: Mutex<Option<Arc<RunControl>>>`；`ReActAgent::call_with_format` 每次调用创建 RunControl（queue→start→…→finish→清空），`interrupt()` 优先走 active_run（否则回退 agent 级标志），新增 `active_run()`/`prepare_run()`；`check_interrupted` 优先读 active run 的 InterruptControl；`Agent::interrupt` 改为转调。取消优先于结果（`is_cancelled()` → Cancelled）。
+  - 反向验证（均确认 FAILED 后恢复）：extract_pending_tool_calls 的 server-tool 过滤、gemini `merge_server_tools`、anthropic `tool_result_message` 的元数据回放、`RuntimeContext.run_id`。
+  - 全量回归：`cargo build --workspace` EXIT=0；`cargo test --workspace -j 2 --no-fail-fast` EXIT=0（101 test result 行、0 FAILED、0 failures 段、0 error）；core lib 120 passed、model 262 passed、harness lib 355 passed。
+  - 遗留：`crates/agentscope-core/src/agent/react_agent.rs::tool_event` 在 HEAD 上即为 dead code（`dead_code` warning），非本次引入，未删。A1 未开始。
