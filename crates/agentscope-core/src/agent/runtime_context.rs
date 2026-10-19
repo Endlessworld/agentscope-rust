@@ -29,6 +29,8 @@ pub struct RuntimeContext {
     pub user_id: Option<String>,
     /// Agent id (as opposed to agent name) for this execution.
     pub agent_id: Option<String>,
+    /// Correlation id for this single execution, aligned with [`crate::agent::AgentRun::run_id`].
+    pub run_id: Option<String>,
     /// Optional sender used to forward fine-grained delta events (text/thinking)
     /// from deep inside the model call up to the agent-level event stream, enabling
     /// incremental (token-by-token) rendering.
@@ -71,6 +73,21 @@ impl RuntimeContext {
     /// Returns the agent id, if any.
     pub fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
+    }
+
+    /// Sets the run id, adopting `run_id` when non-blank and generating one otherwise.
+    pub fn with_run_id(mut self, run_id: Option<String>) -> Self {
+        self.run_id = Some(
+            run_id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(super::run::generate_run_id),
+        );
+        self
+    }
+
+    /// Returns the run id, or `None` for an ad-hoc context (tool calls, tests).
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 }
 
