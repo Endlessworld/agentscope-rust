@@ -1,8 +1,8 @@
 //! `WebTools` — builtin `web_fetch` / `web_search` tools, mirroring
 //! `io.agentscope.harness.agent.tool.WebTools`.
 //!
-//! `web_search` uses the Tavily API when `TAVILY_API_KEY` is present;
-//! otherwise returns a clear configuration error.
+//! `web_search` uses the DeepSeek Web Search API when `DEEPSEEK_API_KEY` is
+//! present; otherwise returns a clear configuration error.
 use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
@@ -10,7 +10,7 @@ use agentscope_core::tool::{Tool, ToolExecutionContext};
 use std::time::Duration;
 
 const USER_AGENT: &str = "AgentScope-Harness-WebFetch/1.0";
-const TAVILY_API: &str = "https://api.tavily.com/search";
+const DEEPSEEK_SEARCH_API: &str = "https://api.deepseek.com/v1/tools/search";
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -101,22 +101,22 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Searches the web via the Tavily API.
+/// Searches the web via the DeepSeek Web Search API.
 pub struct WebSearchTool {
     api_key: Option<String>,
     client: Option<reqwest::Client>,
 }
 
 impl WebSearchTool {
-    /// Reads the API key from the `TAVILY_API_KEY` environment variable.
+    /// Reads the API key from the `DEEPSEEK_API_KEY` environment variable.
     pub fn from_env() -> Self {
         Self {
-            api_key: std::env::var("TAVILY_API_KEY").ok().filter(|k| !k.trim().is_empty()),
+            api_key: std::env::var("DEEPSEEK_API_KEY").ok().filter(|k| !k.trim().is_empty()),
             client: None,
         }
     }
 
-    /// Supplies the Tavily API key explicitly (e.g. vault-injected).
+    /// Supplies the DeepSeek API key explicitly (e.g. vault-injected).
     pub fn with_api_key(api_key: impl Into<String>) -> Self {
         let key = api_key.into();
         Self {
@@ -147,8 +147,8 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Requires TAVILY_API_KEY. Returns titles, \
-         URLs and snippets."
+        "Search the web for information. Requires DEEPSEEK_API_KEY. Returns titles, \
+         URLs and summaries."
     }
 
     fn is_read_only(&self) -> bool {
@@ -175,7 +175,7 @@ impl Tool for WebSearchTool {
         }
         let Some(api_key) = self.api_key.clone() else {
             return Ok(ToolResultBlock::error(
-                "Error: TAVILY_API_KEY is not set. Configure the key via Environment vault \
+                "Error: DEEPSEEK_API_KEY is not set. Configure the key via Environment vault \
                  credentials or process env to enable web_search.",
             ));
         };
@@ -187,12 +187,12 @@ impl Tool for WebSearchTool {
 
         let payload = serde_json::json!({
             "query": query,
-            "max_results": limit,
-            "search_depth": "basic"
+            "count": limit,
+            "need_content": false
         });
         let resp = self
             .http()
-            .post(TAVILY_API)
+            .post(DEEPSEEK_SEARCH_API)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&payload)
             .send()
@@ -202,7 +202,7 @@ impl Tool for WebSearchTool {
                 let status = resp.status().as_u16();
                 if status != 200 {
                     return Ok(ToolResultBlock::text(format!(
-                        "Error: Tavily API returned {status}"
+                        "Error: DeepSeek search API returned {status}"
                     )));
                 }
                 let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap_or_default())
@@ -218,12 +218,18 @@ impl Tool for WebSearchTool {
                 };
                 let mut sb = String::new();
                 for (i, r) in results.iter().enumerate() {
+                    let summary = get_str(r, "summary");
+                    let text = if summary.is_empty() {
+                        get_str(r, "snippet")
+                    } else {
+                        summary
+                    };
                     sb.push_str(&format!(
                         "{}. {}\n   {}\n   {}\n\n",
                         i + 1,
                         get_str(r, "title"),
                         get_str(r, "url"),
-                        get_str(r, "content")
+                        text
                     ));
                 }
                 Ok(ToolResultBlock::text(sb.trim_end().to_string()))

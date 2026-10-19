@@ -151,5 +151,5 @@ async fn web_search_without_key_reports_config_error() {
         serde_json::json!({"query": "rust"}).as_object().unwrap().clone(),
     )
     .await;
-    assert!(out.contains("TAVILY_API_KEY is not set"));
+    assert!(out.contains("DEEPSEEK_API_KEY is not set"));
 }

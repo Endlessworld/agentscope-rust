@@ -396,7 +396,7 @@ impl Tool for FilesystemTool {
                         .await
                     {
                         Ok(n) => {
-                            outputs.push(format!("### {}\n{} replacement(s)", op.path, n));
+//                             outputs.push(format!("### {}\n{} replacement(s)", op.path, n));
                             if let Some(old) = before {
                                 let new = self
                                     .fs

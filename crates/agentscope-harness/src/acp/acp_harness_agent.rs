@@ -100,6 +100,7 @@ use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::{config::default_modes, AcpAgentSession, AcpCodingAgent};
 use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::acp::config::ModelChoice;
+use agentscope_harness::acp::{AskUserTool, SessionBuild};
 use agentscope_harness::agent::{
     CompactionConfig, CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
     ToolResultEvictionConfig,
@@ -716,6 +717,7 @@ The current working directory is：{cwd} 所有文件操作仅限于工作目录
     - 如果存在多种解读，就提出来——不要默默选择。
     - 如果存在更简单的方法，请说明。必要时反驳。
     - 如果有什么不清楚的，就停。说出什么让人困惑。问吧。
+    - 澄清问题应在实施前而非错误之后。
 ## 2.简洁优先
     **解决问题的最低代码。没有任何推测性内容。**
     - 没有超出要求的特征。
@@ -751,37 +753,9 @@ The current working directory is：{cwd} 所有文件操作仅限于工作目录
     ```
 ## 5.代码库探索与加载
     - 如果工作目录下存在 AGENTS.md 或 README.md 可以通过它们快速了解当前项目
-    - 使用codegraph加载代码仓库 : 适用于任何代码库的代码智能与知识图谱
-    -  codegraph -h
-    Usage: codegraph [options] [command]
-    Code intelligence and knowledge graph for any codebase
-    Options:
-      -h, --help                     display help for command
-    Commands:
-      init [options] [path]          Initialize CodeGraph in a project directory and build the initial index
-      uninit [options] [path]        Remove CodeGraph from a project (deletes .codegraph/ directory)
-      index [options] [path]         Rebuild the full index from scratch (same result as a fresh init)
-      sync [options] [path]          Sync changes since last index
-      status [options] [path]        Show index status and statistics
-      query [options] <search>       Search for symbols in the codebase
-      explore [options] <query...>   Explore an area: relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
-      node [options] [name]          One symbol's source + caller/callee trail, or read a file with line numbers + dependents (same output as the codegraph_node MCP tool)
-      files [options]                Show project file structure from the index
-      daemon|daemons                 Manage running CodeGraph background daemons — pick one and press enter to stop it
-      unlock [path]                  Remove a stale lock file that is blocking indexing
-      callers [options] <symbol>     Find all functions/methods that call a specific symbol
-      callees [options] <symbol>     Find all functions/methods that a specific symbol calls
-      impact [options] <symbol>      Analyze what code is affected by changing a symbol
-      affected [options] [files...]  Find test files affected by changed source files
-      install [options]              Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)
-      uninstall [options]            Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)
-      telemetry [action]             Show or change anonymous usage telemetry (status, on, off)
-      version                        Print the installed CodeGraph version (also: -v, --version)
-      help [command]                 display help for command
-    - 使用rg命令代替grep glob命令
+    - 使用codegraph加载代码仓库 : 适用于任何代码库的代码智能与知识图谱 使用codegraph -h查看用法
+    - 使用rg命令代替grep glob工具
     - 无论何时优先使用codegraph进行代码查找与读取
-**这些指南有效条件是：**
-    差异中不必要的更改减少，因过度复杂而减少重写，澄清问题应在实施前而非错误之后。
 </编码指南>
 "#;
 
@@ -867,7 +841,14 @@ fn protocol_for(models: &ModelsSpec, model_id: &str) -> ApiProtocol {
 /// injects the `<available_skills>` block into the system prompt, registers the
 /// `load_skill_through_path` tool, and (when enabled) the self-learning
 /// `skill_manage` / `propose_skill` tools.
-fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
+fn build_agent(ctx: SessionBuild) -> HarnessAgent {
+    let SessionBuild {
+        cwd,
+        session_id,
+        client_support,
+        elicitation_slot,
+    } = ctx;
+    let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create();
     let resolved = model_config.resolve();
     let (base_url, api_key, model_id, protocol) = (
@@ -966,9 +947,24 @@ fn build_agent(cwd: PathBuf, session_id: &str) -> HarnessAgent {
     }
     builder = builder.project_global_skills_dir(cwd.join(".agents").join("skills"));
 
-    // Enable the self-learning loop (skill_manage + propose_skill tools). Drafts are
+    // The self-learning loop (skill_manage + propose_skill tools). Drafts are
     // promoted only through an explicit promotion gate (auto-promote off).
     builder = builder.enable_skill_manage_tool_auto_promote(false);
+
+    // `ask_user` pushes an ACP elicitation form. It is registered on the base
+    // toolkit *before* `build()` because the subagent blueprint snapshots the
+    // toolkit once at build time — registering later would leave subagents
+    // without the tool. It is capability-gated: when the client did not
+    // advertise `elicitation.form` the tool is not exposed at all (the protocol
+    // forbids requesting an un-advertised mode).
+    if client_support.supports_elicitation_form() {
+        let toolkit = agentscope_core::tool::Toolkit::new();
+        toolkit.register_tool(Arc::new(AskUserTool::new(
+            elicitation_slot,
+            agent_client_protocol::schema::v1::SessionId::new(session_id.to_string()),
+        )));
+        builder = builder.toolkit(toolkit);
+    }
 
     builder.build()
 }
@@ -1038,7 +1034,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = AcpCodingAgent::builder()
         .name("agentscope-coding-agent")
-        .model_factory(|cwd, sid| build_agent(cwd, sid))
+        // Capability-aware factory: lets `ask_user` be registered at build time
+        // (capability-gated on `elicitation.form`, and inherited by subagents).
+        .session_factory(build_agent)
         // Dynamic model switching: resolve the selected model id against the
         // config file (provider lookup + protocol) and build a fresh model.
         // Takes effect on the next prompt; conversation state is preserved.

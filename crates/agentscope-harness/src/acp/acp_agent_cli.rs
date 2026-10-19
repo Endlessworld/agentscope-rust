@@ -24,12 +24,15 @@
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ContentBlock,
-    InitializeRequest, NoticeCapabilities, PermissionOptionKind, PlanCapabilities,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    StopReason, TextContent, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
+    CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
+    ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
+    ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, InitializeRequest,
+    NoticeCapabilities, PermissionOptionKind, PlanCapabilities, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
     AcpAgent, ActiveSession, Agent, Client, ConnectionTo, Dispatch, Handled, UntypedMessage,
@@ -531,6 +534,13 @@ async fn process_update(
                     },
                 )
                 .await
+                .if_request(
+                    async |req: CreateElicitationRequest, responder| {
+                        responder.respond(prompt_elicitation(&req))?;
+                        Ok(())
+                    },
+                )
+                .await
                 .otherwise(async |_| Ok(()))
                 .await?;
             Ok(false)
@@ -545,6 +555,216 @@ async fn process_update(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// Reads one answer line for a form field; `None` on EOF (treated as cancel).
+fn read_answer(label: &str) -> Option<String> {
+    eprint!("{label}: ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line.trim().to_string()),
+        Err(_) => None,
+    }
+}
+
+/// The user's answer to one form field.
+enum FieldAnswer {
+    Value(ElicitationContentValue),
+    Skip,
+    Decline,
+    Cancel,
+}
+
+/// Renders an elicitation form on stderr and collects the user's answers from
+/// stdin, returning the ACP response.
+///
+/// Runs inside the connection's `if_request` handler. During a prompt turn the
+/// REPL is parked in `read_update()`, so stdin is free for the form. `/decline`
+/// and `/cancel` abort; an empty line accepts the default (or skips).
+fn prompt_elicitation(req: &CreateElicitationRequest) -> CreateElicitationResponse {
+    let ElicitationMode::Form(form) = &req.mode else {
+        // This CLI only advertises form mode.
+        eprintln!("{DIM}[elicitation] unsupported mode{RESET}");
+        return CreateElicitationResponse::new(ElicitationAction::Cancel);
+    };
+
+    eprintln!();
+    eprintln!("[form] {}", req.message);
+    if let Some(title) = &form.requested_schema.title {
+        eprintln!("[form] {title}");
+    }
+    if let Some(description) = &form.requested_schema.description {
+        eprintln!("{DIM}{description}{RESET}");
+    }
+
+    let required: Vec<&str> = form
+        .requested_schema
+        .required
+        .as_ref()
+        .map(|names| names.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let mut content = BTreeMap::new();
+    for (name, schema) in &form.requested_schema.properties {
+        match ask_property(name, schema, required.contains(&name.as_str())) {
+            FieldAnswer::Value(value) => {
+                content.insert(name.clone(), value);
+            }
+            FieldAnswer::Skip => {}
+            FieldAnswer::Decline => {
+                return CreateElicitationResponse::new(ElicitationAction::Decline);
+            }
+            FieldAnswer::Cancel => {
+                return CreateElicitationResponse::new(ElicitationAction::Cancel);
+            }
+        }
+    }
+
+    CreateElicitationResponse::new(ElicitationAction::Accept(
+        ElicitationAcceptAction::new().content(content),
+    ))
+}
+
+/// Prompts for a single property, honouring its schema kind.
+fn ask_property(name: &str, schema: &ElicitationPropertySchema, required: bool) -> FieldAnswer {
+    let mut label = format!("{name}");
+    if required {
+        label.push_str(" (required)");
+    }
+    let mut hint = String::new();
+
+    match schema {
+        ElicitationPropertySchema::String(prop) => {
+            if let Some(options) = &prop.enum_values {
+                hint = format!(" [{}]", options.join(" | "));
+            } else if let Some(options) = &prop.one_of {
+                let rendered: Vec<&str> = options.iter().map(|o| o.title.as_str()).collect();
+                hint = format!(" [{}]", rendered.join(" | "));
+            }
+        }
+        ElicitationPropertySchema::Number(prop) => {
+            hint = range_hint(prop.minimum, prop.maximum);
+        }
+        ElicitationPropertySchema::Integer(prop) => {
+            hint = range_hint(prop.minimum.map(|v| v as f64), prop.maximum.map(|v| v as f64));
+        }
+        ElicitationPropertySchema::Boolean(_) => hint = " [y/n]".to_string(),
+        ElicitationPropertySchema::Array(_) => hint = " [comma-separated]".to_string(),
+        _ => {
+            // Unknown/future control: the protocol forbids rendering it as a
+            // known one, so the CLI skips it.
+            eprintln!("{DIM}[form] skipping unsupported field `{name}`{RESET}");
+            return FieldAnswer::Skip;
+        }
+    }
+
+    let Some(raw) = read_answer(&format!("{label}{hint}")) else {
+        return FieldAnswer::Cancel;
+    };
+    match raw.as_str() {
+        "/decline" => return FieldAnswer::Decline,
+        "/cancel" => return FieldAnswer::Cancel,
+        "" => {
+            // Empty accepts the declared default, else skips.
+            if let Some(value) = default_value(schema) {
+                return FieldAnswer::Value(value);
+            }
+            if required {
+                eprintln!("{DIM}[form] `{name}` is required and was left empty{RESET}");
+            }
+            return FieldAnswer::Skip;
+        }
+        _ => {}
+    }
+
+    match parse_answer(schema, &raw) {
+        Some(value) => FieldAnswer::Value(value),
+        None => {
+            eprintln!("{DIM}[form] could not parse `{raw}` for `{name}`; skipping{RESET}");
+            FieldAnswer::Skip
+        }
+    }
+}
+
+/// Formats a `[min..max]` hint, or an empty string when unconstrained.
+fn range_hint(minimum: Option<f64>, maximum: Option<f64>) -> String {
+    match (minimum, maximum) {
+        (None, None) => String::new(),
+        (min, max) => format!(" [{}..{}]", display_bound(min), display_bound(max)),
+    }
+}
+
+fn display_bound(value: Option<f64>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "*".to_string(),
+    }
+}
+
+/// Parses a raw line into the value kind the property declares.
+fn parse_answer(schema: &ElicitationPropertySchema, raw: &str) -> Option<ElicitationContentValue> {
+    match schema {
+        ElicitationPropertySchema::String(prop) => {
+            if let Some(options) = &prop.enum_values {
+                if !options.iter().any(|option| option == raw) {
+                    return None;
+                }
+            }
+            if let Some(options) = &prop.one_of {
+                let matched = options
+                    .iter()
+                    .find(|option| option.value == raw || option.title == raw)?;
+                return Some(ElicitationContentValue::String(matched.value.clone()));
+            }
+            Some(ElicitationContentValue::String(raw.to_string()))
+        }
+        ElicitationPropertySchema::Number(_) => {
+            Some(ElicitationContentValue::Number(raw.parse::<f64>().ok()?))
+        }
+        ElicitationPropertySchema::Integer(_) => {
+            Some(ElicitationContentValue::Integer(raw.parse::<i64>().ok()?))
+        }
+        ElicitationPropertySchema::Boolean(_) => {
+            match raw.to_ascii_lowercase().as_str() {
+                "y" | "yes" | "true" | "1" => Some(ElicitationContentValue::Boolean(true)),
+                "n" | "no" | "false" | "0" => Some(ElicitationContentValue::Boolean(false)),
+                _ => None,
+            }
+        }
+        ElicitationPropertySchema::Array(_) => Some(ElicitationContentValue::StringArray(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// The field's declared default, when present.
+fn default_value(schema: &ElicitationPropertySchema) -> Option<ElicitationContentValue> {
+    match schema {
+        ElicitationPropertySchema::String(prop) => {
+            prop.default.clone().map(ElicitationContentValue::String)
+        }
+        ElicitationPropertySchema::Number(prop) => {
+            prop.default.map(ElicitationContentValue::Number)
+        }
+        ElicitationPropertySchema::Integer(prop) => {
+            prop.default.map(ElicitationContentValue::Integer)
+        }
+        ElicitationPropertySchema::Boolean(prop) => {
+            prop.default.map(ElicitationContentValue::Boolean)
+        }
+        ElicitationPropertySchema::Array(prop) => prop
+            .default
+            .clone()
+            .map(ElicitationContentValue::StringArray),
+        _ => None,
     }
 }
 
@@ -722,7 +942,15 @@ async fn main() -> Result<()> {
                                     .notices(NoticeCapabilities::new())
                                     .compaction(CompactionCapabilities::new()),
                             )
-                            .plan(PlanCapabilities::new()),
+                            .plan(PlanCapabilities::new())
+                            // Advertise form elicitation so the agent may expose
+                            // its `ask_user` tool (it is not registered
+                            // otherwise: the protocol forbids requesting an
+                            // un-advertised mode).
+                            .elicitation(
+                                ElicitationCapabilities::new()
+                                    .form(ElicitationFormCapabilities::new()),
+                            ),
                     ),
                 )
                 .block_task()

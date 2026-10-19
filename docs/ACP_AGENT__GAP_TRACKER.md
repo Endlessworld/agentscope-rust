@@ -2,7 +2,7 @@
 
 > **用途**：本文件是 ACP CodingAgent 实现工作的**单一事实来源**。任何会话开工前必须先读本文件；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。以本文件 + `git status`/`cargo build` 实际验证为准。
 > **对照基准**：`docs/ACP_AGENT_PLAN.md`（方案）+ 本文件 + `crates/*`（实际代码）。
-> **参考**：Kotlin `AgiHarnessAgent.kt`、Java `HarnessCodingAgent.java`、ACP Rust SDK（`E:\local-github\agentclientprotocol\rust-sdk`）。
+> **参考**：Kotlin `AgiHarnessAgent.kt`、Java `HarnessCodingAgent.java`、ACP RDF 文档 (E:\local-github\agentclientprotocol\agent-client-protocol)、ACP Rust SDK 源码（`E:\local-github\agentclientprotocol\rust-sdk`）。
 
 ## 0. 如何阅读本文件
 - **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -100,16 +100,42 @@
 | **Proxy / Conductor 与协议路由**：`Proxy`、`ProxyProtocolRouter`、`AgentProtocolRouter`、`ClientProtocolConnector` | SDK ≥2.0.0 | 待办（暂缓） | `rg "Proxy|protocol_router|AgentProtocolRouter"` 0 命中 |
 | **MCP-over-ACP**：`McpServer::Acp(McpServerAcp)` + `mcp/connect` / `mcp/message` / `mcp/disconnect` + `McpCapabilities.acp` | ≤ schema 1.7.0（`unstable_mcp_over_acp`） | ✅ 已完成 | feature 已开启；`coding_agent.rs` 声明 `.acp(true)`。新增 `acp/mcp_over_acp.rs::McpAcpConnection`（connect → `tools/list`/`tools/call` → disconnect；纯函数 `parse_tools_list`/`render_tool_result` 离线可测）；`session.rs::apply_mcp_servers` 新增 `McpServer::Acp` 分支，连接后把服务端工具桥接进本会话 `Toolkit`（`bridge_tools`）。方向：**client 声明 server、agent 发 `mcp/message`** |
 | **SDK 内建 MCP *server* 运行时**：`agent_client_protocol::mcp_server`（`McpServerConnect` / `McpServer::new` / `McpConnectionTo`） | ≤ SDK 1.3.0 | 设计决定（不迁移） | 本项目 MCP **client** 走 `rust-mcp-sdk`（`agent/mcp_client_manager.rs`）；SDK 的 mcp_server 半边与本仓职责重叠，不引入 |
-| **Client 侧能力与请求**：fs（`fs/read_text_file` / `fs/write_text_file`）、terminal（`terminal/create|output|wait_for_exit|kill|release`）、elicitation（`elicitation/create`） | ≤ schema 1.7.0（elicitation 于 1.7.0 稳定） | 设计决定（不迁移） | CLI 现已在 `initialize` 构造 `ClientCapabilities`（notices/compaction/plan），但**仍不广告 fs/terminal/elicitation**：agent 自有本地工具与 shell 工具，无需通过客户端执行；工具审批走 `session/request_permission`（与此无关，见 §2.5） |
+| **Client 侧能力与请求**：fs（`fs/read_text_file` / `fs/write_text_file`）、terminal（`terminal/create|output|wait_for_exit|kill|release`） | ≤ schema 1.7.0 | 设计决定（不迁移） | CLI 现已在 `initialize` 构造 `ClientCapabilities`（notices/compaction/plan/elicitation），但**仍不广告 fs/terminal**：agent 自有本地工具与 shell 工具，无需通过客户端执行；工具审批走 `session/request_permission`（与此无关，见 §2.5）。原本同列的 elicitation 已落地，见下条与 §2.7.2a |
+| **Elicitation 表单推送（`ask_user`）**：`elicitation/create` + `ElicitationSchema` / `ElicitationAction` / `ElicitationContentValue` | ≤ schema 1.7.0（1.7.0 稳定） | ✅ 已完成（2026-10-19） | agent 向 client 推送表单，以 LLM 工具 `ask_user` 暴露（对齐 MCP elicitation 模型）。新增 `acp/elicitation.rs`（`AskUserTool` + `ElicitationClient` seam + `ElicitationSlot`）；`session.rs` 把 live 连接写入 slot；`coding_agent.rs` 新增 `SessionBuild` + `session_factory` 以便**在 build 前**按能力注入工具；`acp_harness_agent.rs` 用 `session_factory` 注入（子 agent 因此继承）；`acp_agent_cli.rs` 广告 `elicitation.form` 并渲染/回填表单。纯函数映射见 §2.7.2a |
+| **Elicitation 表单渲染（Form mode）** | ≤ schema 1.7.0（1.7.0 稳定） | 设计决定（不迁移） | 本项目**未接入**：`rg "elicitation|Elicitation"` 在 `crates/agentscope-harness/**` 0 命中，CLI 的 `ClientCapabilities` 构造（`acp_agent_cli.rs:718`）只设 `session{notices,compaction}` + `plan`，**未设 `elicitation`**；agent 侧亦未注册 `elicitation/create` handler。若接入，`ElicitationPropertySchema` 已覆盖完整表单控件（字段→控件映射见 §2.7.2a）；当前 agent 只能自建本地工具/走 `session/request_permission` |
 | **会话元数据与分页**：`ListSessionsRequest.cursor` / `ListSessionsResponse.next_cursor`、`SessionInfo.title` / `updated_at` / `additional_directories`、`NewSessionRequest.additional_directories` | ≤ schema 1.7.0 | ✅ 已完成 | `coding_agent.rs::session_infos` 按 id 排序分页（PAGE_SIZE=50，`cursor` 为上一页末 id），回 `next_cursor`；`SessionInfo` 用真实 `cwd`/`additional_directories`/`title`/`updated_at`（`AcpAgentSession::session_info`，不再硬编码 `"."`）。`additional_directories` 从 `session/new`、`session/load`、`session/resume` 请求写入（`set_additional_directories`） |
 | **未发送的 `SessionUpdate` 变体**：`AvailableCommandsUpdate` / `CurrentModeUpdate` / `ConfigOptionUpdate` / `SessionInfoUpdate` | ≤ schema 1.7.0 | ✅ 已完成（除 AvailableCommandsUpdate） | `set_mode`（`coding_agent.rs`）现在同推 `CurrentModeUpdate`；`set_config_option` 同推 `ConfigOptionUpdate`（完整 config options）；每轮 prompt 推 `SessionInfoUpdate`（`updated_at`，`session.rs::session_info_update`）。`AvailableCommandsUpdate` 未接（无命令目录来源，属设计决定） |
 | **客户端会话恢复 builder**：stable `load_session*` / `resume_session*` → `RestoredSession` | SDK 2.1.0 | ✅ 已完成 | `acp_agent_cli.rs` 现读 `ACP_SESSION_ID`：非空时用 `cx.load_session(id, cwd)`（`ACP_SESSION_REPLAY` 置位时）或 `cx.resume_session(id, cwd)` 的 `.block_task().start_session().into_session()` 恢复；空则仍 `build_session(..).start_session()`。CLI 同时在 `initialize` 广告 `ClientCapabilities`（notices/compaction/plan），并渲染 `Notice`/`CompactionUpdate`/`CurrentModeUpdate`/`ConfigOptionUpdate`/`PlanUpdate`/`PlanRemoved` |
-| **SDK 杂项工具**：`util::json_cast`、`MatchDispatchFrom`、`TypeNotification`、`JsonRpcBatch`、`MetaCapability`（`_meta.symposium` 能力协商）、`DynConnectTo`、`AcpAgent::with_debug` / `AcpAgentConfig` / `LineDirection`、NES（`agent-client-protocol` 2.2.0 的 `unstable` 聚合未转发 schema 的 `unstable_nes`） | ≤ SDK 1.3.0 | 设计决定（不迁移） | 全部 0 命中；本项目非嵌入式（`LineDirection`）也非代理链（`MetaCapability`）角色 |
+| **SDK 杂项工具**：`util::json_cast`、`MatchDispatchFrom`、`TypeNotification`、`JsonRpcBatch`、`MetaCapability`（`_meta.symposium` 能力协商）、`DynConnectTo`、`AcpAgent::with_debug` / `AcpAgentConfig` / `LineDirection`、NES（`agent-client-protocol` 2.2.0 的 `unstable` 聚合未转发 schema 的 `unstable_nes`） | ≤ SDK 1.3.0 | 设计决定（不迁移） | 全部 0 命中。**2026-10-16 措辞更正**：`LineDirection`（`acp_agent.rs:28`）是 **native-only stdio 行级调试回调**的参数（`AcpAgent::with_debug` / `Stdio::with_debug`，唯一消费者是 conductor 的 `DebugLogger`，标 Stdin/Stdout/Stderr 方向），与「嵌入式」无关 —— lib.rs 里说的 embedder 指「自带 runtime+transport 的宿主（含 wasm）」，正因 `AcpAgent`/`Stdio` 依赖子进程+阻塞线程，二者连同 `LineDirection` 在 wasm target 上不导出；原「本项目非嵌入式（`LineDirection`）」的因果表述有误，已改。`MetaCapability`（`capabilities.rs:31`）是**代理链** `_meta.symposium` 能力协商原语（`add/has/remove_meta_capability`，用于 Conductor↔Proxy 的 `proxy=true` 双向握手；`McpAcpTransport` 的 impl 已于 SDK 移除）。二者本项目均无对应角色（不做 Conductor/Proxy、也不用 debug 回调） |
+
+#### 2.7.2a Elicitation Form 模式的表单渲染能力（✅ 2026-10-19 已接入）
+
+> **依据**：`agent-client-protocol-schema` v1 `elicitation.rs` + 协议文档 `docs/protocol/v1/elicitation.mdx`（对应 MCP 2026-07-28 RC 的 elicitation）。
+
+Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`ElicitationPropertySchema` 变体逐一对应用户控件：
+
+| Schema 类型（`ElicitationPropertySchema` 变体） | 关键字段 | 对应 UI 控件 |
+|---|---|---|
+| `String(StringPropertySchema)` | `minLength` / `maxLength` / `pattern` / `default` | 文本框；`format` 为 `email` / `uri` / `date` / `date-time` 时对应专用输入（邮箱 / URL / 日期 / 日期时间） |
+| `String` + `enum` / `oneOf` | `EnumOption{value,title,description}` | 单选下拉 / 单选组（`enum` 与带标题的 `oneOf`） |
+| `Number(NumberPropertySchema)` | `minimum` / `maximum` / `default` | 数字（浮点）输入，含 min/max 约束 |
+| `Integer(IntegerPropertySchema)` | `minimum` / `maximum` / `default` | 数字（整数）输入，含 min/max 约束 |
+| `Boolean(BooleanPropertySchema)` | `default` | 复选框 / 开关 |
+| `Array(MultiSelectPropertySchema)` | `items`（`MultiSelectItems`）/ `minItems` / `maxItems` / `default` | 多选控件；`items` 三态：`String(StringMultiSelectItems)` = 纯字符串多选、`Titled(TitledMultiSelectItems)` = 带人类可读标签的多选、`Other(OtherMultiSelectItems)` = 未知判别的透传 |
+| `Other(OtherElicitationPropertySchema)` | 保留 `type` 与其余字段 | **不得**当已知控件渲染（客户端须原样保留以便存储/回放/代理转发） |
+
+**本项目落地（2026-10-19）**：
+- agent 侧：`acp/elicitation.rs` 把该受限 schema 作为 LLM 工具 `ask_user` 暴露——模型给出 `message` + 扁平 `properties`（+ 可选 `required` / `title` / `description`），工具把它**逐字段映射**为 `ElicitationPropertySchema`（`enum` → 无标题单选、`oneOf:[{const,title,description}]` → 有标题单选、`items.enum` → 纯字符串多选、`items.oneOf`（线上写作 `anyOf`）→ 有标题多选）；不认识的 `type` / `format` / 组合一律**拒绝**（返回工具错误，让模型改述），不伪造控件。scope 用 `ElicitationSessionScope`，并把触发它的 `tool_call_id` 带上。
+- 回传：`ElicitationAction::{Accept,Decline,Cancel}` → `ToolResultBlock`；accept 的 `content`（`ElicitationContentValue`）转成 JSON 对象文本回灌给模型；decline/cancel/传输失败各有明确文案，保证模型能安全兜底。
+- client 侧：`acp_agent_cli.rs` 在 `initialize` 广告 `elicitation.form`，并在 `read_update` 的 dispatch 上用 `if_request::<CreateElicitationRequest>` 渲染表单（逐字段提示、展示 `default`、支持 `/decline` `/cancel`、空行取默认值）、回填 `ElicitationContentValue`。
+- **能力门控（协议硬约束）**：`ClientSupport::supports_elicitation_form()` 在**创建会话、构建 agent 之前**判定；未广告时 `ask_user` **根本不注册**（模型看不到该工具），符合「不得请求未广告模式」。
+- **子 agent 继承**：工具在 `HarnessAgent::build()` **之前**注册进 base toolkit，故 `SubagentBlueprint` 的 `toolkit.copy()` 快照含该工具 → 子 agent 也可推表单（主 agent 与所有叶 agent 共享同一 slot）。
+- 协议约束遵守：`form` 模式**禁止**索取密码/密钥/token（工具描述已明示，模型侧提示走纯文本/URL）；值校验在映射层拒绝非法 schema。URL 模式未实现（CLI 只广告 form）。
 
 #### 2.7.3 结论
 
 - **2026-10-16 接线波次**：§2.7.2 中所有「待办（不包含暂缓）」项均已实现，harness 依赖改为逐个开启 6 个 unstable feature（`unstable_session_notices` / `unstable_session_compaction` / `unstable_plan_operations` / `unstable_llm_providers` / `unstable_end_turn_token_usage` / `unstable_mcp_over_acp`），**不**开聚合 `unstable`（它会连带开启暂缓的 `unstable_protocol_v2` / `unstable_session_fork`）。
-- 仍为「设计决定（不迁移）」的：SDK 内建 MCP server 运行时、client 侧 fs/terminal/elicitation、SDK 杂项工具。仍为「待办（暂缓）」的：ACP v2 协议与 Proxy/Conductor 路由。`AvailableCommandsUpdate` 未接（无命令目录来源，无产品需求）。
+- 仍为「设计决定（不迁移）」的：SDK 内建 MCP server 运行时、client 侧 fs/terminal（elicitation 已于 2026-10-19 接入，见 §2.7.2a）、SDK 杂项工具。仍为「待办（暂缓）」的：ACP v2 协议与 Proxy/Conductor 路由。`AvailableCommandsUpdate` 未接（无命令目录来源，无产品需求）。
 - 协议合规要点：所有新增通知均**按 client 能力门控**（未广告则降级或静默），避免向不支持的客户端发送非能力更新。
 
 ## 3. 项目状态与下一步
@@ -118,7 +144,8 @@
 - **ACP CodingAgent 核心已实现并通过 stdio 端到端验证**（initialize/new_session/prompt/close 全链路）。
 - **`$/cancel_request` 取消已实现并通过进程内 e2e 验证**（`acp_cancel_test.rs`，无需真实 model）。
 - **SDK v2.2.0 未接线能力已全部补完（除暂缓项）**：Session Notices、Compaction 通知、Plan 操作、Provider 方法、`PromptResponse.usage`、`CurrentModeUpdate`/`ConfigOptionUpdate`/`SessionInfoUpdate`、会话分页与元数据、MCP-over-ACP、CLI 会话恢复。详见 §2.7.2。
-- 测试（2026-10-16 实测）：`cargo test -p agentscope-harness --lib` = **320 passed / 0 failed**；`acp_cancel_test` / `acp_event_flow_test` / `acp_session_resume_test` 三个集成测试全绿（各 1 passed）。
+- **Elicitation 表单推送（`ask_user`）已实现并通过进程内 e2e 验证**（`acp_elicitation_test.rs`，2 passed）：`ask_user` → `elicitation/create`（含 `sessionId`/`toolCallId`/`requestedSchema`）→ client accept → 答案回灌模型；并含「未广告 elicitation 时不推送表单」的反向用例。
+- 测试（2026-10-19 实测）：`cargo test -p agentscope-harness --lib` = **330 passed / 0 failed**；`acp_elicitation_test`（2）/ `acp_cancel_test`（1）/ `acp_event_flow_test`（1）/ `acp_session_resume_test`（1）四个集成测试全绿。`cargo build --workspace` = 0。
 - `cargo build -p agentscope-harness` 通过（含两个 `[[bin]]`）；新增代码 **0 新增编译告警**（剩余 6 个告警均为既有）。
 - 本次改动均只碰 `crates/agentscope-harness/**` 与 `docs/ACP_AGENT__GAP_TRACKER.md`；未改根 `Cargo.toml`/core/其它 crate。
 

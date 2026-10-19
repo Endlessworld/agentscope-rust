@@ -30,6 +30,7 @@ use crate::agent::{CompactionConfig, HarnessAgent};
 use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
+use super::elicitation::ElicitationSlot;
 use super::provider::ProviderRegistry;
 use super::session::{AcpAgentSession, AcpClientHandle};
 use super::support::ClientSupport;
@@ -91,11 +92,32 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
         .build()
 }
 
+/// Everything a session factory needs to build a [`HarnessAgent`].
+///
+/// Capabilities must be known *before* the agent is built: the subagent
+/// blueprint snapshots the toolkit at build time (`HarnessAgent::build`), so a
+/// tool registered only afterwards would never reach subagents.
+pub struct SessionBuild {
+    /// Working directory the session was opened with.
+    pub cwd: PathBuf,
+    /// The freshly assigned ACP session id.
+    pub session_id: String,
+    /// Capabilities the client advertised at `initialize`.
+    pub client_support: ClientSupport,
+    /// Slot the `ask_user` tool reads the live connection from. The session
+    /// fills it on every prompt; the tool holds the same handle.
+    pub elicitation_slot: ElicitationSlot,
+}
+
 /// An ACP CodingAgent with a session registry and a factory for building the
 /// underlying [`HarnessAgent`] per session.
 pub struct AcpCodingAgent {
     name: String,
     model_factory: Arc<dyn Fn(PathBuf, &str) -> HarnessAgent + Send + Sync>,
+    /// Capability-aware factory; takes precedence over `model_factory` when set.
+    /// Only this variant can gate tools on client capabilities at build time
+    /// (and therefore have them inherited by subagents).
+    session_factory: Option<Arc<dyn Fn(SessionBuild) -> HarnessAgent + Send + Sync>>,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
@@ -127,6 +149,7 @@ impl AcpCodingAgent {
         Self {
             name: AGENT_NAME.to_string(),
             model_factory: Arc::new(model_factory),
+            session_factory: None,
             models,
             modes,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -186,9 +209,21 @@ impl AcpCodingAgent {
             .auth(AgentAuthCapabilities::new())
     }
 
-    /// Creates a new session using the model factory.
+    /// Creates a new session using the session factory.
     fn create_session(&self, session_id: SessionId, cwd: PathBuf) -> AcpAgentSession {
-        let agent = (self.model_factory)(cwd.clone(), session_id.to_string().as_str());
+        // The slot is created *before* the agent so a capability-gated `ask_user`
+        // tool can be baked into the toolkit at build time — that is what makes
+        // subagents inherit it, since the blueprint snapshots the toolkit once.
+        let elicitation_slot: ElicitationSlot = Arc::new(Mutex::new(None));
+        let agent = match &self.session_factory {
+            Some(factory) => factory(SessionBuild {
+                cwd: cwd.clone(),
+                session_id: session_id.to_string(),
+                client_support: self.client_support.clone(),
+                elicitation_slot: Arc::clone(&elicitation_slot),
+            }),
+            None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
+        };
         let mut session = AcpAgentSession::new(
             session_id,
             cwd,
@@ -196,6 +231,7 @@ impl AcpCodingAgent {
             self.models.clone(),
             self.modes.clone(),
         );
+        session.set_elicitation_slot(elicitation_slot);
         // Clones share the same underlying capability store, so a late
         // `initialize` still gates this session's optional updates correctly.
         session.set_client_support(self.client_support.clone());
@@ -601,6 +637,7 @@ impl AcpCodingAgent {
 pub struct AcpCodingAgentBuilder {
     name: Option<String>,
     model_factory: Option<Box<dyn Fn(PathBuf, &str) -> HarnessAgent + Send + Sync>>,
+    session_factory: Option<Arc<dyn Fn(SessionBuild) -> HarnessAgent + Send + Sync>>,
     models: Vec<ModelChoice>,
     modes: Vec<ModeChoice>,
     max_sessions: Option<usize>,
@@ -624,6 +661,20 @@ impl AcpCodingAgentBuilder {
         factory: impl Fn(PathBuf, &str) -> HarnessAgent + Send + Sync + 'static,
     ) -> Self {
         self.model_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Sets the capability-aware factory used to build a [`HarnessAgent`] per
+    /// session. Takes precedence over [`model_factory`](Self::model_factory).
+    ///
+    /// Use this instead of [`model_factory`](Self::model_factory) when the agent
+    /// must expose capability-gated tools (e.g. `ask_user`, which requires
+    /// `elicitation.form`) that subagents should inherit.
+    pub fn session_factory(
+        mut self,
+        factory: impl Fn(SessionBuild) -> HarnessAgent + Send + Sync + 'static,
+    ) -> Self {
+        self.session_factory = Some(Arc::new(factory));
         self
     }
 
@@ -667,6 +718,7 @@ impl AcpCodingAgentBuilder {
             self.models,
             self.modes,
         );
+        agent.session_factory = self.session_factory;
         agent.model_builder = self.model_builder;
         if let Some(name) = self.name {
             agent = agent.with_name(name);

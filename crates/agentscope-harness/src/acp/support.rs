@@ -59,14 +59,29 @@ impl ClientSupport {
     pub fn supports_plan_operations(&self) -> bool {
         self.capabilities.read().unwrap().plan.is_some()
     }
+
+    /// Whether the client advertised form-based elicitation (`elicitation.form`).
+    ///
+    /// Per the elicitation spec each mode must be advertised *explicitly*: an
+    /// omitted or `null` `elicitation` field, or a missing/`null` `form` entry,
+    /// all mean the agent MUST NOT send `elicitation/create` in form mode.
+    pub fn supports_elicitation_form(&self) -> bool {
+        self.capabilities
+            .read()
+            .unwrap()
+            .elicitation
+            .as_ref()
+            .is_some_and(|elicitation| elicitation.form.is_some())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ClientSupport;
     use agent_client_protocol::schema::v1::{
-        ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, NoticeCapabilities,
-        PlanCapabilities,
+        ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities,
+        ElicitationCapabilities, ElicitationFormCapabilities, ElicitationUrlCapabilities,
+        NoticeCapabilities, PlanCapabilities,
     };
 
     #[test]
@@ -98,5 +113,27 @@ mod tests {
         support.set_capabilities(ClientCapabilities::new().plan(PlanCapabilities::new()));
         assert!(support.supports_plan_operations());
         assert!(!support.supports_notices());
+    }
+
+    #[test]
+    fn elicitation_form_is_only_detected_when_explicitly_advertised() {
+        let support = ClientSupport::new();
+        assert!(!support.supports_elicitation_form());
+
+        // A present-but-empty elicitation object advertises no mode.
+        support
+            .set_capabilities(ClientCapabilities::new().elicitation(ElicitationCapabilities::new()));
+        assert!(!support.supports_elicitation_form());
+
+        // URL-only support must not enable form mode.
+        support.set_capabilities(ClientCapabilities::new().elicitation(
+            ElicitationCapabilities::new().url(ElicitationUrlCapabilities::new()),
+        ));
+        assert!(!support.supports_elicitation_form());
+
+        support.set_capabilities(ClientCapabilities::new().elicitation(
+            ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+        ));
+        assert!(support.supports_elicitation_form());
     }
 }

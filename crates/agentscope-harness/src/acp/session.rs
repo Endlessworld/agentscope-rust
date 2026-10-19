@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, MessageId, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigOption, SessionId, SessionMode, SessionModeState, StopReason, ToolCallUpdate,
+    ContentBlock, CreateElicitationRequest, CreateElicitationResponse, MessageId,
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption, SessionId,
+    SessionMode, SessionModeState, StopReason, ToolCallUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use agentscope_core::agent::StreamOptions;
@@ -23,6 +24,7 @@ use agentscope_core::model::GenerateOptions;
 use crate::agent::HarnessAgent;
 
 use super::config::{self, ModeChoice, ModelChoice};
+use super::elicitation::{ElicitationClient, ElicitationSlot};
 use super::event;
 use super::permission_store::PermissionRuleStore;
 use super::support::ClientSupport;
@@ -88,6 +90,22 @@ impl AcpClientHandle {
         self.connection.send_request(request).block_task().await
     }
 
+    /// Pushes an `elicitation/create` form to the user and awaits their answer.
+    ///
+    /// Only safe to await from a task outside the dispatch loop (the agent run
+    /// already lives in a `ConnectionTo::spawn`ed task), which is how the
+    /// `ask_user` tool invokes it.
+    pub(crate) async fn elicit(
+        &self,
+        request: CreateElicitationRequest,
+    ) -> std::result::Result<CreateElicitationResponse, String> {
+        self.connection
+            .send_request(request)
+            .block_task()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Opens an MCP-over-ACP connection to a client-declared MCP server
     /// (`mcp/connect`) and returns a handle that can list/call its tools.
     pub(crate) async fn connect_mcp_acp(
@@ -101,6 +119,17 @@ impl AcpClientHandle {
             server_id,
         )
         .await
+    }
+}
+
+/// Bridges the live ACP connection into the `ask_user` tool.
+#[async_trait::async_trait]
+impl ElicitationClient for AcpClientHandle {
+    async fn elicit(
+        &self,
+        request: CreateElicitationRequest,
+    ) -> std::result::Result<CreateElicitationResponse, String> {
+        AcpClientHandle::elicit(self, request).await
     }
 }
 
@@ -306,6 +335,10 @@ pub struct AcpAgentSession {
     /// when a tool call needs human confirmation. Set per prompt by the
     /// connection layer (the coding agent has the live `ConnectionTo`).
     client: Option<Arc<AcpClientHandle>>,
+    /// Shared slot the `ask_user` tool reads the live connection from. It is
+    /// filled whenever [`set_client`](Self::set_client) binds a connection; the
+    /// tool holds the same `Arc`, so it sees the update without being rebuilt.
+    elicitation_slot: ElicitationSlot,
     /// Persistent "always allow / always reject" rule store for this workspace.
     permission_store: Arc<PermissionRuleStore>,
     /// Manages MCP client connections for this session (stdio servers declared
@@ -355,6 +388,7 @@ impl AcpAgentSession {
             cancel: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
             client: None,
+            elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
             mcp_manager: Arc::new(crate::agent::McpClientManager::new()),
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
@@ -572,9 +606,28 @@ impl AcpAgentSession {
     }
 
     /// Binds the live client connection for this prompt/connection, so
-    /// `Ask` tool calls can push `session/request_permission` to the user.
+    /// `Ask` tool calls can push `session/request_permission` to the user and
+    /// `ask_user` can push an `elicitation/create` form.
     pub fn set_client(&mut self, client: AcpClientHandle) {
-        self.client = Some(Arc::new(client));
+        let handle = Arc::new(client);
+        // Publish the connection to the elicitation tool (which holds the same
+        // slot across prompts, so it never needs rebuilding).
+        let erased: Arc<dyn ElicitationClient> = handle.clone();
+        *self.elicitation_slot.lock().unwrap() = Some(erased);
+        self.client = Some(handle);
+    }
+
+    /// The slot the `ask_user` tool reads the live connection from. Shared with
+    /// the tool built at session-creation time.
+    pub fn elicitation_slot(&self) -> ElicitationSlot {
+        Arc::clone(&self.elicitation_slot)
+    }
+
+    /// Installs the slot the `ask_user` tool was built with. Called with the
+    /// very slot handed to the session factory, so the tool and the session
+    /// share one handle.
+    pub fn set_elicitation_slot(&mut self, slot: ElicitationSlot) {
+        self.elicitation_slot = slot;
     }
 
     /// Installs (or removes) the confirm handler that performs the ACP

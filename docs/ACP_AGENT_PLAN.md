@@ -2,7 +2,7 @@
 
 > **定位**：本文档承载**方案**（可行性、依赖映射、技术难点、测试策略、架构设计）。
 > **进度与缺口清单**：见 `docs/ACP_AGENT__GAP_TRACKER.md`（跨会话单一事实来源）。
-> **参考**：Kotlin `AgiHarnessAgent.kt`（ACP AgentSession 实现）、Java `HarnessCodingAgent.java`（Harness Agent 装配）、ACP Rust SDK（`E:\local-github\agentclientprotocol\rust-sdk`）。
+> **参考**：Kotlin `AgiHarnessAgent.kt`（ACP AgentSession 实现）、Java `HarnessCodingAgent.java`（Harness Agent 装配）、ACP RDF 文档 (E:\local-github\agentclientprotocol\agent-client-protocol)、ACP Rust SDK（`E:\local-github\agentclientprotocol\rust-sdk`）。
 > **目标**：在 `agentscope-harness` crate 内实现功能完整的 ACP 协议 CodingAgent（Rust 版），包装核心 `ReActAgent`，通过 stdio 与 ACP 客户端（IDE/CLI）通信。
 
 ## 1. 背景与目标
