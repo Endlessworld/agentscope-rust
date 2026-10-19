@@ -10,8 +10,8 @@
 //!   (bounded TTL de-duplication), outbound-address parsing, a pluggable
 //!   [`common::HttpTransport`] (real [`common::ReqwestTransport`] + offline test doubles) and
 //!   an [`common::AccessTokenProvider`] cache abstra.
-//! - **dingtalk** / **feishu** / **github** / **gitlab** / **wecom** — per-platform inbound
-//!   webhook/event → `InboundMessage` mappers, outbound request builders, provider
+//! - **dingtalk** / **feishu** / **github** / **gitlab** / **wecom** / **weixin** — per-platform
+//!   inbound webhook/event → `InboundMessage` mappers, outbound request builders, provider
 //!   configuration parsing and webhook signature verification.
 //!
 //! Design notes:
@@ -30,6 +30,7 @@ pub mod feishu;
 pub mod github;
 pub mod gitlab;
 pub mod wecom;
+pub mod weixin;
 
 pub use common::{
     AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelError, ChannelRegistry, HttpMethod,
