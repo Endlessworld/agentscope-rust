@@ -17,7 +17,7 @@ futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
 base64 = { workspace = true }
 
 [dev-dependencies]

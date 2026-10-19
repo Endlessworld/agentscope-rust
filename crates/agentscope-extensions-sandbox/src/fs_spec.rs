@@ -377,7 +377,10 @@ impl SandboxFilesystem for SandboxFilesystemAdapter {
         command: &str,
         timeout_seconds: u32,
     ) -> Result<ExecuteResponse> {
-        let wrapped = format!("cd {} && ({command})", shell_quote(&self.cwd_or_root()));
+        // Subshell delimiters go on their own lines: a trailing `)` glued to the last
+        // payload line breaks heredocs (the shell would see `EOF)` instead of `EOF`).
+        // Mirrors the Java fix in `KubernetesSandbox#doExec` (commit c767160b1).
+        let wrapped = format!("cd {} && (\n{command}\n)", shell_quote(&self.cwd_or_root()));
         self.run(&wrapped, u64::from(timeout_seconds)).await
     }
 }
@@ -910,7 +913,22 @@ mod tests {
         let response = fs.execute(&ctx, "echo hi", 5).await.unwrap();
         assert_eq!(response.exit_code, 0);
         let seen = sandbox.commands.lock().unwrap().clone();
-        assert_eq!(seen, vec!["cd /workspace && (echo hi)".to_string()]);
+        assert_eq!(seen, vec!["cd /workspace && (\necho hi\n)".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn adapter_execute_keeps_closing_paren_off_heredoc_terminator() {
+        let sandbox = Arc::new(FakeSandbox::default());
+        let fs = SandboxFilesystemAdapter::new(sandbox.clone(), "/workspace", ".");
+        let ctx = RuntimeContext::new();
+        let command = "cat <<'EOF'\nhello\nEOF";
+        fs.execute(&ctx, command, 5).await.unwrap();
+        let seen = sandbox.commands.lock().unwrap().clone();
+        let wrapped = seen.first().expect("a command was sent");
+        assert_eq!(wrapped, &format!("cd /workspace && (\n{command}\n)"));
+        // The trailing `)` must sit on its own line, never glued to `EOF`.
+        assert!(wrapped.ends_with("\n)"), "wrapped: {wrapped:?}");
+        assert!(!wrapped.contains("EOF)"), "wrapped: {wrapped:?}");
     }
 
     #[tokio::test]

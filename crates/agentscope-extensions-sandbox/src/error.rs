@@ -15,6 +15,10 @@ pub enum SandboxErrorCode {
     WorkspaceStopError,
     /// A command execution failed on the remote side.
     CommandExecutionError,
+    /// Failure while reading a workspace archive from the remote sandbox.
+    WorkspaceArchiveReadError,
+    /// Failure while writing a workspace archive to the remote sandbox.
+    WorkspaceArchiveWriteError,
     /// The remote sandbox could not be reached or answered with an unexpected payload.
     RemoteTransportError,
     /// The supplied client options are invalid.
@@ -28,6 +32,8 @@ impl SandboxErrorCode {
             SandboxErrorCode::WorkspaceStartError => "WORKSPACE_START_ERROR",
             SandboxErrorCode::WorkspaceStopError => "WORKSPACE_STOP_ERROR",
             SandboxErrorCode::CommandExecutionError => "COMMAND_EXECUTION_ERROR",
+            SandboxErrorCode::WorkspaceArchiveReadError => "WORKSPACE_ARCHIVE_READ_ERROR",
+            SandboxErrorCode::WorkspaceArchiveWriteError => "WORKSPACE_ARCHIVE_WRITE_ERROR",
             SandboxErrorCode::RemoteTransportError => "REMOTE_TRANSPORT_ERROR",
             SandboxErrorCode::ConfigurationError => "CONFIGURATION_ERROR",
         }

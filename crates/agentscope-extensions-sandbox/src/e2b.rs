@@ -3,9 +3,12 @@
 //! Mirrors the Java `io.agentscope.extensions.sandbox.e2b` package:
 //!
 //! * platform lifecycle (`POST /sandboxes`, `POST /sandboxes/{id}/connect`,
-//!   `DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/snapshots`), and
+//!   `DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/snapshots`),
 //! * command execution through envd (`process.Process/Start` over Connect, JSON codec),
-//!   including the 5-byte Connect frame envelope and base64 `stdout`/`stderr` events.
+//!   including the 5-byte Connect frame envelope and base64 `stdout`/`stderr` events, and
+//! * envd file transfer through the Filesystem REST API (`POST`/`GET /files`) — the prerequisite
+//!   for the workspace-projection work; the envd data-plane base URL can be overridden with the
+//!   [`E2B_SANDBOX_URL_ENV`] environment variable (the official SDK's `E2B_SANDBOX_URL`).
 //!
 //! The `PROTO` codec is not implemented (it needs the envd protobuf schema); selecting it
 //! yields [`SandboxExtensionError::Unsupported`] rather than silently mis-encoding. See the
@@ -31,6 +34,14 @@ use crate::workspace::{shell_quote, short_hash};
 pub const ENVD_PORT: u16 = 49983;
 /// Connect-Protocol framing: flag byte + 4-byte big-endian length.
 pub const CONNECT_HEADER_LEN: usize = 5;
+/// Connect envelope flag bit 0: the frame payload is compressed (unsupported here).
+pub const CONNECT_FLAG_COMPRESSED: u8 = 0x01;
+/// Connect envelope flag bit 1: end-of-stream trailer carrying an `EndStreamMessage`.
+pub const CONNECT_FLAG_END_STREAM: u8 = 0x02;
+/// Connect envelope flag bits 2-7: reserved for future extensions (skipped).
+pub const CONNECT_FLAG_RESERVED: u8 = 0xfc;
+/// Upper bound for a single Connect frame payload (mirrors the Java 64 MiB guard).
+pub const MAX_CONNECT_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 /// How workspace bytes are persisted for E2B sandboxes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +108,13 @@ pub struct E2bSandboxClientOptions {
     pub api_base_url: String,
     /// Sandbox domain used to derive the envd host.
     pub domain: String,
+    /// Fixed envd data-plane gateway URL, equivalent to the official SDK's `E2B_SANDBOX_URL`.
+    ///
+    /// When set, envd traffic for every sandbox is sent to this gateway and routed by the
+    /// `E2b-Sandbox-Id` / `E2b-Sandbox-Port` request headers instead of a per-sandbox
+    /// wildcard-DNS host derived from [`Self::domain`]. Control-plane calls still use
+    /// [`Self::api_base_url`]. [`E2B_SANDBOX_URL_ENV`] is consulted when this is `None`.
+    pub envd_sandbox_url: Option<String>,
     /// E2B template id (or snapshot id when creating from a snapshot).
     pub template_id: String,
     /// Absolute workspace root inside the sandbox.
@@ -123,6 +141,7 @@ impl Default for E2bSandboxClientOptions {
             api_key: None,
             api_base_url: "https://api.e2b.app".to_string(),
             domain: "e2b.app".to_string(),
+            envd_sandbox_url: None,
             template_id: "base".to_string(),
             workspace_root: "/home/user".to_string(),
             sandbox_timeout_seconds: 300,
@@ -203,6 +222,50 @@ pub fn envd_host(sandbox_id: &str, domain: &str) -> String {
     format!("https://{ENVD_PORT}-{sandbox_id}.{dom}")
 }
 
+/// Environment variable overriding the envd data-plane URL (the official SDK's `E2B_SANDBOX_URL`).
+pub const E2B_SANDBOX_URL_ENV: &str = "E2B_SANDBOX_URL";
+
+fn trim_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.trim_end_matches('/').to_string())
+    }
+}
+
+/// Resolves the envd data-plane base URL: explicit option > environment override > per-sandbox host.
+///
+/// Mirrors `E2bEnvdProcessClient#envdHost` after the Java `E2B_SANDBOX_URL` commit: a configured
+/// gateway wins over the wildcard-DNS address built by [`envd_host`], and blank values are ignored.
+pub fn resolve_envd_base_url(
+    override_url: Option<&str>,
+    env_url: Option<&str>,
+    sandbox_id: &str,
+    domain: &str,
+) -> String {
+    if let Some(url) = override_url.and_then(trim_url) {
+        return url;
+    }
+    if let Some(url) = env_url.and_then(trim_url) {
+        return url;
+    }
+    envd_host(sandbox_id, domain)
+}
+
+/// Reads the [`E2B_SANDBOX_URL_ENV`] override through an injectable lookup (offline-testable).
+pub fn envd_sandbox_url_from<F>(lookup: F) -> Option<String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    lookup(E2B_SANDBOX_URL_ENV).and_then(|value| trim_url(&value))
+}
+
+/// Reads the [`E2B_SANDBOX_URL_ENV`] process environment variable.
+pub fn envd_sandbox_url_from_env() -> Option<String> {
+    envd_sandbox_url_from(|key| std::env::var(key).ok())
+}
+
 /// Builds the envd `process.Process/Start` JSON request payload (`ProcessConfig`).
 pub fn build_envd_start_json_body(command: &str, cwd: Option<&str>) -> Value {
     let mut process = json!({
@@ -224,9 +287,31 @@ pub fn encode_connect_envelope(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Splits a Connect response body into data-frame payloads (skipping trailers/invalid frames).
-pub fn decode_connect_frames(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
+/// One decoded Connect envelope, with the raw flag byte preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectEnvelope {
+    /// Connect flag byte (bit 0 = compressed, bit 1 = end stream, bits 2-7 reserved).
+    pub flags: u8,
+    /// Frame payload bytes.
+    pub payload: Vec<u8>,
+}
+
+/// Splits a Connect response body into envelopes, tolerating fragmented/truncated streams.
+///
+/// Hardened against the failure modes the Java `E2bEnvdProcessClient` fixes address
+/// (commit `897c4866e`):
+///
+/// * the length prefix is read as an *unsigned* 4-byte big-endian integer (no erroneous
+///   `& 0x7fff_ffff` mask),
+/// * a payload that runs past the end of the buffer (a frame still in flight, or a truncated
+///   body) stops decoding **without panicking**, keeping every complete envelope decoded so far,
+/// * an implausible length (> [`MAX_CONNECT_FRAME_LEN`]) stops decoding instead of allocating,
+/// * reserved flag bits (`0xfc`) are skipped rather than surfaced as data frames.
+///
+/// Compressed (`0x01`) and end-stream (`0x02`) envelopes are returned to the caller so it can
+/// decide whether they are fatal; [`decode_connect_frames`] filters them out.
+pub fn decode_connect_envelopes(data: &[u8]) -> Vec<ConnectEnvelope> {
+    let mut envelopes = Vec::new();
     let mut cursor = 0usize;
     while cursor + CONNECT_HEADER_LEN <= data.len() {
         let flags = data[cursor];
@@ -235,19 +320,35 @@ pub fn decode_connect_frames(data: &[u8]) -> Vec<Vec<u8>> {
             data[cursor + 2],
             data[cursor + 3],
             data[cursor + 4],
-        ]) & 0x7fff_ffff;
+        ]) as usize;
         cursor += CONNECT_HEADER_LEN;
-        let len = len as usize;
-        if cursor + len > data.len() {
+        if len > MAX_CONNECT_FRAME_LEN {
             break;
         }
-        let payload = data[cursor..cursor + len].to_vec();
-        cursor += len;
-        if flags == 0x00 {
-            frames.push(payload);
+        let Some(end_of_payload) = cursor.checked_add(len) else {
+            break;
+        };
+        if end_of_payload > data.len() {
+            // Partial frame: keep what we have and stop (no panic, no partial payload).
+            break;
         }
+        let payload = data[cursor..end_of_payload].to_vec();
+        cursor = end_of_payload;
+        if flags & CONNECT_FLAG_RESERVED != 0 {
+            continue;
+        }
+        envelopes.push(ConnectEnvelope { flags, payload });
     }
-    frames
+    envelopes
+}
+
+/// Splits a Connect response body into data-frame payloads (skipping trailers/invalid frames).
+pub fn decode_connect_frames(data: &[u8]) -> Vec<Vec<u8>> {
+    decode_connect_envelopes(data)
+        .into_iter()
+        .filter(|envelope| envelope.flags == 0x00)
+        .map(|envelope| envelope.payload)
+        .collect()
 }
 
 /// A decoded envd `process` event.
@@ -262,8 +363,7 @@ pub struct EnvdEvent {
 }
 
 /// Parses one JSON-coded envd `StartResponse` frame.
-pub fn parse_envd_event(payload: &[u8]) -> SandboxResult<EnvdEvent> {
-    let value: Value = serde_json::from_slice(payload).map_err(|e| {
+pub fn parse_envd_event(payload: &[u8]) -> SandboxResult<EnvdEvent> {    let value: Value = serde_json::from_slice(payload).map_err(|e| {
         SandboxExtensionError::Serialization(format!("invalid envd event JSON: {e}"))
     })?;
     let event = value.get("event").cloned().unwrap_or(Value::Null);
@@ -273,9 +373,28 @@ pub fn parse_envd_event(payload: &[u8]) -> SandboxResult<EnvdEvent> {
         out.stderr = decode_b64_field(data, "stderr");
     }
     if let Some(end) = event.get("end") {
-        out.exit_code = end.get("exitCode").and_then(Value::as_i64).map(|v| v as i32);
+        // protojson accepts both the camelCase `jsonName` and the original proto field name.
+        out.exit_code = end
+            .get("exitCode")
+            .or_else(|| end.get("exit_code"))
+            .and_then(Value::as_i64)
+            .map(|v| v as i32);
+        // `EndEvent.error` is populated when the process was signalled or exited non-zero
+        // (`signal: killed`, `exit status N`); surface it on stderr, visually separated from
+        // stderr output that may not end with a newline.
+        if let Some(error) = end.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            append_separated_line(&mut out.stderr, error.as_bytes());
+        }
     }
     Ok(out)
+}
+
+/// Appends `text` to `out`, inserting a newline when `out` does not already end with one.
+fn append_separated_line(out: &mut Vec<u8>, text: &[u8]) {
+    if !out.is_empty() && out.last() != Some(&b'\n') {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(text);
 }
 
 fn decode_b64_field(parent: &Value, field: &str) -> Vec<u8> {
@@ -298,10 +417,35 @@ pub struct EnvdStreamResult {
 }
 
 /// Drains a full Connect response body into an aggregated result.
+///
+/// Corrupt *data* frames are skipped (a single bad frame must not abort a stream that still
+/// yields an exit code), while stream-level conditions are fatal — matching the Java
+/// `drainStartStream` contract:
+///
+/// * a compressed frame (`0x01`) is rejected as [`SandboxExtensionError::Unsupported`],
+/// * an end-stream trailer (`0x02`) whose `EndStreamMessage` carries a truthy `error` is rejected
+///   as [`SandboxErrorCode::WorkspaceStartError`],
+/// * an unterminated stream yields `exit_code == None` so the caller can report it.
 pub fn drain_envd_stream(data: &[u8]) -> SandboxResult<EnvdStreamResult> {
     let mut result = EnvdStreamResult::default();
-    for frame in decode_connect_frames(data) {
-        if let Ok(event) = parse_envd_event(&frame) {
+    for envelope in decode_connect_envelopes(data) {
+        if envelope.flags & CONNECT_FLAG_COMPRESSED != 0 {
+            return Err(SandboxExtensionError::Unsupported(
+                "compressed envd connect frames are not supported".to_string(),
+            ));
+        }
+        if envelope.flags & CONNECT_FLAG_END_STREAM != 0 {
+            // A trailer that is not valid `EndStreamMessage` JSON is tolerated here (Java throws):
+            // the stream itself is complete, so a missing exit code is reported by the caller.
+            if let Some(description) = parse_end_stream_error(&envelope.payload) {
+                return Err(SandboxExtensionError::Runtime(
+                    SandboxErrorCode::WorkspaceStartError,
+                    format!("process start failed: {description}"),
+                ));
+            }
+            continue;
+        }
+        if let Ok(event) = parse_envd_event(&envelope.payload) {
             result.stdout.extend_from_slice(&event.stdout);
             result.stderr.extend_from_slice(&event.stderr);
             if let Some(code) = event.exit_code {
@@ -310,6 +454,40 @@ pub fn drain_envd_stream(data: &[u8]) -> SandboxResult<EnvdStreamResult> {
         }
     }
     Ok(result)
+}
+
+/// Parses a Connect `EndStreamMessage` trailer, returning its error description when present.
+///
+/// Mirrors the official Connect reader (and the Python SDK's `ServerStreamParser`): the `error`
+/// key's presence alone is not enough — the value must be *truthy* (missing / `null` / empty
+/// object / empty string / `0` / `false` all mean success).
+pub fn parse_end_stream_error(payload: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    let error = value.get("error")?;
+    if is_falsy(error) {
+        return None;
+    }
+    let code = error.get("code").and_then(Value::as_str);
+    let message = error.get("message").and_then(Value::as_str);
+    Some(match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => error.to_string(),
+    })
+}
+
+/// Connect / Python-SDK truthiness: missing, `null`, empty containers, `""`, `0` and `false`
+/// all mean "no error".
+fn is_falsy(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(flag) => !*flag,
+        Value::Number(number) => number.as_f64().map(|n| n == 0.0).unwrap_or(false),
+        Value::String(text) => text.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+    }
 }
 
 /// E2B [`RemoteBackend`] implementation.
@@ -358,6 +536,43 @@ impl E2bBackend {
             .unwrap_or_else(|| self.options.domain.clone())
     }
 
+    /// Resolves the envd data-plane base URL for a handle.
+    ///
+    /// Precedence: the handle's own `envd_sandbox_url` (restored state) wins, then the client
+    /// option, then the [`E2B_SANDBOX_URL_ENV`] process environment variable, then the
+    /// per-sandbox wildcard-DNS host. Mirrors the Java `E2bEnvdProcessClient#envdHost`.
+    fn envd_base_url(&self, handle: &RemoteSandboxHandle) -> String {
+        let handle_url = handle.extra.get("envd_sandbox_url").map(String::as_str);
+        let env_url = envd_sandbox_url_from_env();
+        resolve_envd_base_url(
+            handle_url.or(self.options.envd_sandbox_url.as_deref()),
+            env_url.as_deref(),
+            &handle.id,
+            &self.domain_from(handle),
+        )
+    }
+
+    /// Builds the envd `/files` REST URL for `remote_path`, mirroring the Java `filesUrl`.
+    ///
+    /// `path` and `username` are percent-encoded with the `application/x-www-form-urlencoded`
+    /// alphabet used by the Java `URLEncoder`, so `/` becomes `%2F` exactly as Java produces.
+    pub fn files_url(&self, remote_path: &str) -> String {
+        format!(
+            "/files?path={}&username={}",
+            encode_query_component(remote_path),
+            encode_query_component(&self.effective_run_user())
+        )
+    }
+
+    fn effective_run_user(&self) -> String {
+        let user = self.options.run_user.trim();
+        if user.is_empty() {
+            "user".to_string()
+        } else {
+            user.to_string()
+        }
+    }
+
     async fn decode_json(response: Response, url: &str) -> SandboxResult<Value> {
         let status = response.status();
         let text = response
@@ -404,6 +619,146 @@ impl E2bBackend {
         let value = self.platform_post("/sandboxes", &body).await?;
         Ok(parse_sandbox_fields(&value))
     }
+
+    /// Uploads a file to the sandbox via the envd `/files` REST API (multipart form POST).
+    ///
+    /// Mirrors the Java `E2bEnvdProcessClient#uploadFile`: parent directories are created
+    /// automatically and existing files are overwritten by envd itself. The request carries the
+    /// same `E2b-Sandbox-Id` / `E2b-Sandbox-Port` / `X-Access-Token` / `Authorization` headers as
+    /// the Connect exec path, so a fixed gateway can route it.
+    pub async fn upload_file(
+        &self,
+        handle: &RemoteSandboxHandle,
+        remote_path: &str,
+        data: &[u8],
+    ) -> SandboxResult<()> {
+        let filename = filename_from_path(remote_path);
+        if filename.is_empty() {
+            return Err(SandboxExtensionError::Configuration(format!(
+                "remotePath must be a file path: {remote_path}"
+            )));
+        }
+        let url = join_url(&self.envd_base_url(handle), &self.files_url(remote_path));
+        let payload = Arc::new(data.to_vec());
+        let filename = filename.to_string();
+        let build_url = url.clone();
+        let build = move || {
+            let part = reqwest::multipart::Part::bytes((*payload).clone())
+                .file_name(filename.clone())
+                .mime_str("application/octet-stream")
+                .expect("application/octet-stream is always a valid mime type");
+            let form = reqwest::multipart::Form::new().part("file", part);
+            self.envd_request(reqwest::Method::POST, &build_url, handle)
+                .multipart(form)
+        };
+        self.execute_envd(
+            &url,
+            SandboxErrorCode::WorkspaceArchiveWriteError,
+            build,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Downloads a file from the sandbox via the envd `/files` REST API (GET).
+    ///
+    /// Mirrors the Java `E2bEnvdProcessClient#downloadFile`.
+    pub async fn download_file(
+        &self,
+        handle: &RemoteSandboxHandle,
+        remote_path: &str,
+    ) -> SandboxResult<Vec<u8>> {
+        let url = join_url(&self.envd_base_url(handle), &self.files_url(remote_path));
+        let build_url = url.clone();
+        let build = move || self.envd_request(reqwest::Method::GET, &build_url, handle);
+        self.execute_envd(&url, SandboxErrorCode::WorkspaceArchiveReadError, build)
+            .await
+    }
+
+    /// Builds an envd request with the shared data-plane headers (`baseRequest` in Java).
+    fn envd_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        handle: &RemoteSandboxHandle,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .request(method, url)
+            .header("User-Agent", "agentscope-rust-e2b")
+            .header("E2b-Sandbox-Id", handle.id.clone())
+            .header("E2b-Sandbox-Port", ENVD_PORT.to_string())
+            .header("Authorization", basic_auth_header(&self.options.run_user));
+        if let Some(token) = handle
+            .extra
+            .get("envd_access_token")
+            .filter(|t| !t.trim().is_empty())
+        {
+            request = request.header("X-Access-Token", token.clone());
+        }
+        request
+    }
+
+    /// Sends an envd request, mapping non-success statuses onto `code` and returning the body.
+    ///
+    /// `build` is re-invoked for every attempt because multipart bodies are streaming and cannot
+    /// be replayed; the resulting request is therefore built fresh each time.
+    async fn execute_envd<F>(
+        &self,
+        url: &str,
+        code: SandboxErrorCode,
+        build: F,
+    ) -> SandboxResult<Vec<u8>>
+    where
+        F: Fn() -> reqwest::RequestBuilder + Clone,
+    {
+        let client = self.client.clone();
+        let retry = self.retry.clone();
+        let url = url.to_string();
+        with_retries(&retry, move || {
+            let client = client.clone();
+            let url = url.clone();
+            let build = build.clone();
+            async move {
+                let request = build().build().map_err(|e| {
+                    SandboxExtensionError::Transport(format!(
+                        "failed to build request for {url}: {e}"
+                    ))
+                })?;
+                send_envd(&client, request, &url, code).await
+            }
+        })
+        .await
+    }
+}
+
+/// Executes one envd request and decodes the response body.
+async fn send_envd(
+    client: &Client,
+    request: reqwest::Request,
+    url: &str,
+    code: SandboxErrorCode,
+) -> SandboxResult<Vec<u8>> {
+    let response = client
+        .execute(request)
+        .await
+        .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
+    if !status.is_success() {
+        return Err(SandboxExtensionError::Runtime(
+            code,
+            format!(
+                "envd filesystem request failed HTTP {} from {url}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&bytes)
+            ),
+        ));
+    }
+    Ok(bytes.to_vec())
 }
 
 #[async_trait::async_trait]
@@ -493,7 +848,7 @@ impl RemoteBackend for E2bBackend {
                 "E2B envd PROTO codec is not implemented; set codec = E2bCodec::Json".to_string(),
             ));
         }
-        let host = envd_host(&handle.id, &self.domain_from(handle));
+        let host = self.envd_base_url(handle);
         let url = join_url(&host, "process.Process/Start");
         let payload = serde_json::to_vec(&build_envd_start_json_body(command, cwd))
             .map_err(|e| SandboxExtensionError::Serialization(e.to_string()))?;
@@ -625,6 +980,32 @@ pub fn basic_auth_header(run_user: &str) -> String {
     format!("Basic {encoded}")
 }
 
+/// Percent-encodes a query component using the `application/x-www-form-urlencoded` alphabet.
+///
+/// Matches Java's `URLEncoder.encode(value, UTF_8)`: unreserved `A-Za-z0-9-_.*` pass through and
+/// a space becomes `+`; everything else (notably `/` → `%2F`) is percent-encoded byte-wise.
+pub fn encode_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                out.push(*byte as char);
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Extracts the file name from a remote path (Java `filenameFromPath`).
+pub fn filename_from_path(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(idx) => &path[idx + 1..],
+        None => path,
+    }
+}
+
 /// E2B sandbox client (harness [`agentscope_harness::agent::sandbox::SandboxClient`]).
 pub type E2bSandboxClient = RemoteSandboxClient;
 
@@ -713,6 +1094,208 @@ mod tests {
         data.extend_from_slice(&[0x00, 0, 0, 0, 9]); // truncated -> stop
         let frames = decode_connect_frames(&data);
         assert_eq!(frames, vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn decode_frames_tolerates_fragmented_tail_without_panicking() {
+        // A fully decoded frame followed by a frame whose payload has not fully arrived yet:
+        // decoding must stop cleanly (no panic, no partial payload) and keep the complete frame.
+        let mut data = encode_connect_envelope(b"complete");
+        data.extend_from_slice(&[0x00, 0, 0, 0, 10, b'p', b'a', b'r']); // 10 bytes promised, 3 sent
+        assert_eq!(decode_connect_frames(&data), vec![b"complete".to_vec()]);
+
+        // Header itself is split across the read boundary (fewer than 5 bytes).
+        let partial_header = &encode_connect_envelope(b"x")[..3];
+        assert!(decode_connect_frames(partial_header).is_empty());
+        assert!(decode_connect_frames(&[]).is_empty());
+    }
+
+    #[test]
+    fn decode_frames_rejects_oversized_and_reserved_frames() {
+        // A length far beyond the 64 MiB guard must stop decoding rather than allocate.
+        let mut data = encode_connect_envelope(b"ok");
+        data.extend_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(decode_connect_frames(&data), vec![b"ok".to_vec()]);
+
+        // Reserved flag bits (0x04/0x08/...) are not data frames.
+        let mut reserved = encode_connect_envelope(b"data");
+        reserved.extend_from_slice(&[0x04, 0, 0, 0, 3, b'x', b'y', b'z']);
+        assert_eq!(decode_connect_frames(&reserved), vec![b"data".to_vec()]);
+
+        // Envelope decoding preserves the raw flags so callers can distinguish trailers.
+        let envelopes = decode_connect_envelopes(&encode_connect_envelope(b"z"));
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].flags, 0x00);
+        assert_eq!(envelopes[0].payload, b"z".to_vec());
+    }
+
+    #[test]
+    fn drain_envd_stream_tolerates_split_frames_and_missing_tail() {
+        // Frames arriving across a chunk boundary: stdout then a truncated trailing frame.
+        let stdout_b64 = base64::engine::general_purpose::STANDARD.encode(b"partial output");
+        let mut body = encode_connect_envelope(
+            serde_json::to_vec(&json!({"event":{"data":{"stdout":stdout_b64}}})).unwrap().as_slice(),
+        );
+        body.extend_from_slice(&[0x00, 0, 0, 0, 30, b'{']); // truncated end frame
+        let result = drain_envd_stream(&body).expect("fragmented stream must not fail");
+        assert_eq!(result.stdout, b"partial output".to_vec());
+        // No exit code: the caller decides how to report an unterminated stream.
+        assert_eq!(result.exit_code, None);
+    }
+
+    #[test]
+    fn drain_envd_stream_skips_corrupt_data_frames() {
+        // A corrupt data frame must not abort the stream; the end frame still yields an exit code.
+        let mut body = encode_connect_envelope(b"not json at all");
+        body.extend_from_slice(&encode_connect_envelope(
+            serde_json::to_vec(&json!({"event":{"end":{"exitCode":1}}})).unwrap().as_slice(),
+        ));
+        let result = drain_envd_stream(&body).unwrap();
+        assert_eq!(result.exit_code, Some(1));
+    }
+
+    #[test]
+    fn drain_envd_stream_rejects_compressed_frames() {
+        let mut body = encode_connect_envelope(b"whatever");
+        body[0] = CONNECT_FLAG_COMPRESSED;
+        let err = drain_envd_stream(&body).unwrap_err();
+        assert!(matches!(err, SandboxExtensionError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn drain_envd_stream_propagates_end_stream_error() {
+        // flags 0x02: end-stream trailer carrying a Connect Error.
+        let trailer = serde_json::to_vec(&json!({
+            "error": {"code": "internal", "message": "boom"}
+        }))
+        .unwrap();
+        let mut body = vec![CONNECT_FLAG_END_STREAM];
+        body.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+        body.extend_from_slice(&trailer);
+        let err = drain_envd_stream(&body).unwrap_err();
+        match err {
+            SandboxExtensionError::Runtime(code, msg) => {
+                assert_eq!(code, SandboxErrorCode::WorkspaceStartError);
+                assert!(msg.contains("internal: boom"), "got {msg}");
+            }
+            other => panic!("expected runtime error, got {other:?}"),
+        }
+
+        // A trailer without an error is a clean end of stream.
+        let ok = serde_json::to_vec(&json!({})).unwrap();
+        let mut clean = vec![CONNECT_FLAG_END_STREAM];
+        clean.extend_from_slice(&(ok.len() as u32).to_be_bytes());
+        clean.extend_from_slice(&ok);
+        assert_eq!(drain_envd_stream(&clean).unwrap().exit_code, None);
+    }
+
+    #[test]
+    fn parse_end_stream_error_applies_connect_truthiness() {
+        assert_eq!(parse_end_stream_error(br#"{}"#), None);
+        assert_eq!(parse_end_stream_error(br#"{"error":null}"#), None);
+        assert_eq!(parse_end_stream_error(br#"{"error":{}}"#), None);
+        assert_eq!(parse_end_stream_error(br#"{"error":""}"#), None);
+        assert_eq!(parse_end_stream_error(br#"{"error":0}"#), None);
+        assert_eq!(parse_end_stream_error(br#"{"error":false}"#), None);
+        assert_eq!(parse_end_stream_error(b"not json"), None);
+        assert_eq!(
+            parse_end_stream_error(br#"{"error":{"code":"internal","message":"boom"}}"#).as_deref(),
+            Some("internal: boom")
+        );
+        assert_eq!(
+            parse_end_stream_error(br#"{"error":{"code":"unavailable"}}"#).as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            parse_end_stream_error(br#"{"error":"plain text"}"#).as_deref(),
+            Some(r#""plain text""#)
+        );
+    }
+
+    #[test]
+    fn parse_envd_event_reads_exit_code_and_error() {
+        // camelCase exitCode (protojson jsonName) ...
+        let event = parse_envd_event(br#"{"event":{"end":{"exitCode":3}}}"#).unwrap();
+        assert_eq!(event.exit_code, Some(3));
+        // ... and the original snake_case proto field name.
+        let snake = parse_envd_event(br#"{"event":{"end":{"exit_code":7}}}"#).unwrap();
+        assert_eq!(snake.exit_code, Some(7));
+        // exit code 0 must not be misreported as "absent".
+        assert_eq!(parse_envd_event(br#"{"event":{"end":{"exitCode":0}}}"#).unwrap().exit_code, Some(0));
+
+        // EndEvent.error is forwarded to stderr, separated from unterminated stderr output.
+        let with_error = parse_envd_event(
+            br#"{"event":{"end":{"exitCode":137,"error":"signal: killed"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(with_error.stderr, b"signal: killed".to_vec());
+        assert_eq!(with_error.exit_code, Some(137));
+
+        let stderr_b64 = base64::engine::general_purpose::STANDARD.encode(b"oops");
+        let combined = parse_envd_event(
+            format!(r#"{{"event":{{"data":{{"stderr":"{stderr_b64}"}},"end":{{"exitCode":1,"error":"exit status 1"}}}}}}"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(combined.stderr, b"oops\nexit status 1".to_vec());
+    }
+
+    #[test]
+    fn resolve_envd_base_url_prefers_option_then_env_then_host() {
+        assert_eq!(
+            resolve_envd_base_url(Some("http://10.0.0.1:8080"), Some("http://env:1"), "sbx", "e2b.app"),
+            "http://10.0.0.1:8080"
+        );
+        assert_eq!(
+            resolve_envd_base_url(None, Some("http://env:1/"), "sbx", "e2b.app"),
+            "http://env:1"
+        );
+        // Blank values are ignored at every level.
+        assert_eq!(
+            resolve_envd_base_url(Some("  "), Some("   "), "sbx", "e2b.app"),
+            "https://49983-sbx.e2b.app"
+        );
+        assert_eq!(
+            resolve_envd_base_url(None, None, "sbx", "e2b.app"),
+            "https://49983-sbx.e2b.app"
+        );
+        // Trailing slash trimming matches the Java `E2bPlatformHttp.trimSlash`.
+        assert_eq!(
+            resolve_envd_base_url(Some("http://gateway.local:9000///"), None, "sbx", "e2b.app"),
+            "http://gateway.local:9000"
+        );
+    }
+
+    #[test]
+    fn envd_sandbox_url_reads_from_injected_env_lookup() {
+        assert_eq!(envd_sandbox_url_from(|_| None), None);
+        assert_eq!(envd_sandbox_url_from(|_| Some("  ".to_string())), None);
+        assert_eq!(
+            envd_sandbox_url_from(|key| {
+                assert_eq!(key, E2B_SANDBOX_URL_ENV);
+                Some(" http://cube.local:8080/ ".to_string())
+            })
+            .as_deref(),
+            Some("http://cube.local:8080")
+        );
+        assert_eq!(E2B_SANDBOX_URL_ENV, "E2B_SANDBOX_URL");
+    }
+
+    #[test]
+    fn encode_query_component_matches_java_url_encoder() {
+        // Java: URLEncoder.encode("/tmp/test.txt", UTF_8) == "%2Ftmp%2Ftest.txt"
+        assert_eq!(encode_query_component("/tmp/test.txt"), "%2Ftmp%2Ftest.txt");
+        assert_eq!(encode_query_component("user"), "user");
+        assert_eq!(encode_query_component("a b"), "a+b");
+        assert_eq!(encode_query_component("a-b_c.d*e"), "a-b_c.d*e");
+        assert_eq!(encode_query_component("a=b&c"), "a%3Db%26c");
+    }
+
+    #[test]
+    fn filename_from_path_extracts_basename() {
+        assert_eq!(filename_from_path("/tmp/test.txt"), "test.txt");
+        assert_eq!(filename_from_path("relative.md"), "relative.md");
+        assert_eq!(filename_from_path("/tmp/dir/"), "");
     }
 
     #[test]
@@ -830,5 +1413,147 @@ mod tests {
             workspace_spec: None,
         };
         assert_eq!(data.to_harness_state().session_id(), "sess-1");
+    }
+
+    fn http_backend(api_base_url: String, envd_sandbox_url: Option<String>) -> E2bBackend {
+        E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url,
+            envd_sandbox_url,
+            codec: E2bCodec::Json,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upload_file_posts_multipart_to_envd_files() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/files")
+                    .query_param("path", "/tmp/test.txt")
+                    .query_param("username", "user")
+                    .header("e2b-sandbox-id", "sbx-1")
+                    .header("e2b-sandbox-port", "49983")
+                    .header("authorization", basic_auth_header("user"))
+                    .body_contains("hello world");
+                then.status(200).body("");
+            })
+            .await;
+        let backend = http_backend(server.base_url(), Some(server.base_url()));
+        let mut extra = BTreeMap::new();
+        extra.insert("sandbox_domain".to_string(), "e2b.dev".to_string());
+        let handle = RemoteSandboxHandle::new("sbx-1", extra);
+
+        backend
+            .upload_file(&handle, "/tmp/test.txt", b"hello world")
+            .await
+            .expect("upload succeeds");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn upload_file_rejects_directory_path() {
+        let backend = http_backend("http://127.0.0.1:1".to_string(), None);
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+        let err = backend
+            .upload_file(&handle, "/tmp/dir/", b"x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxExtensionError::Configuration(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn download_file_gets_from_envd_files() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/files")
+                    .query_param("path", "/home/user/a.txt")
+                    .query_param("username", "user")
+                    .header("e2b-sandbox-id", "sbx-1")
+                    .header("x-access-token", "tok");
+                then.status(200).body("file-bytes");
+            })
+            .await;
+        let backend = http_backend(server.base_url(), Some(server.base_url()));
+        let mut extra = BTreeMap::new();
+        extra.insert("envd_access_token".to_string(), "tok".to_string());
+        let handle = RemoteSandboxHandle::new("sbx-1", extra);
+
+        let bytes = backend
+            .download_file(&handle, "/home/user/a.txt")
+            .await
+            .expect("download succeeds");
+        assert_eq!(bytes, b"file-bytes".to_vec());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn download_file_reports_archive_read_error_on_failure() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/files");
+                then.status(404).body("missing");
+            })
+            .await;
+        let backend = http_backend(server.base_url(), Some(server.base_url()));
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let err = backend
+            .download_file(&handle, "/home/user/a.txt")
+            .await
+            .unwrap_err();
+        match err {
+            SandboxExtensionError::Runtime(code, msg) => {
+                assert_eq!(code, SandboxErrorCode::WorkspaceArchiveReadError);
+                assert!(msg.contains("404"), "got {msg}");
+            }
+            other => panic!("expected runtime error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn envd_sandbox_url_option_routes_exec_through_gateway() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        // The mock only answers on the gateway path; a wildcard-DNS host would never reach it.
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/process.Process/Start")
+                    .header("e2b-sandbox-id", "sbx-1")
+                    .header("e2b-sandbox-port", "49983")
+                    .header("content-type", "application/connect+json");
+                then.status(200).body(envd_body_with_exit(0, b"hi"));
+            })
+            .await;
+        let backend = http_backend("http://127.0.0.1:1".to_string(), Some(server.base_url()));
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let output = backend.exec_in(&handle, "echo hi", None, 5).await.unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "hi");
+        mock.assert_async().await;
+    }
+
+    /// Builds a Connect response body carrying one stdout event and one end event.
+    fn envd_body_with_exit(exit_code: i32, stdout: &[u8]) -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(stdout);
+        let mut body = encode_connect_envelope(
+            serde_json::to_vec(&json!({"event":{"data":{"stdout":encoded}}})).unwrap().as_slice(),
+        );
+        body.extend_from_slice(&encode_connect_envelope(
+            serde_json::to_vec(&json!({"event":{"end":{"exitCode":exit_code}}})).unwrap().as_slice(),
+        ));
+        body
     }
 }
