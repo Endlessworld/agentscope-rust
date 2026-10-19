@@ -232,6 +232,20 @@ mod tests {
         assert!(cfg.model.is_none());
     }
 
+    /// Java documents this invariant on `MemoryConfig.DEFAULT_CONSOLIDATION_MIN_GAP`
+    /// ("matches `MemoryMaintenanceMiddleware`"); keep both sides in lockstep.
+    #[test]
+    fn consolidation_min_gap_default_matches_maintenance_middleware() {
+        let cfg = MemoryConfig::defaults();
+        let mw = crate::agent::middleware::MemoryMaintenanceMiddleware::new(
+            std::sync::Arc::new(crate::filesystem::LocalFilesystem::sandboxed(
+                std::env::temp_dir(),
+            )),
+            None,
+        );
+        assert_eq!(cfg.consolidation_min_gap, *mw.min_gap());
+    }
+
     #[test]
     fn throttled_zero_gap_normalizes_to_always() {
         let t = FlushTrigger::throttled(ChronoDuration::zero());

@@ -67,6 +67,11 @@ impl MemoryMaintenanceMiddleware {
         }
     }
 
+    /// Minimum gap enforced between two maintenance runs.
+    pub fn min_gap(&self) -> &chrono::Duration {
+        &self.min_gap
+    }
+
     fn timer_key_for(&self, ctx: &RuntimeContext) -> String {
         match self.isolation_scope {
             IsolationScope::User => ctx

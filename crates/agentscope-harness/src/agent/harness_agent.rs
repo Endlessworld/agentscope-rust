@@ -1175,9 +1175,13 @@ impl HarnessAgentBuilder {
                     memory_config.consolidation_prompt.clone(),
                     memory_config.consolidation_max_tokens,
                 );
-                middleware.add(Box::new(MemoryMaintenanceMiddleware::new(
+                middleware.add(Box::new(MemoryMaintenanceMiddleware::new_with_config(
                     Arc::clone(&filesystem),
-                    Some(consolidator),
+                    Some(Arc::new(consolidator)),
+                    memory_config.daily_file_retention_days,
+                    memory_config.session_retention_days,
+                    memory_config.consolidation_min_gap,
+                    IsolationScope::User,
                 )));
             }
         }
