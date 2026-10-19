@@ -31,6 +31,12 @@ pub trait Model: Send + Sync {
         self.supports_native_structured_output()
     }
 
+    /// Whether this model honours a request-level `ToolChoice::Specific` constraint.
+    /// Defaults to `false`; providers that support forcing a named tool override this.
+    fn supports_tool_choice_specific(&self) -> bool {
+        false
+    }
+
     /// The model's context window size in tokens, or 0 if unknown.
     fn context_window_size(&self) -> usize {
         0

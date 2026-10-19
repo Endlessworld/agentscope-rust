@@ -211,6 +211,10 @@ pub fn default_transport() -> SharedTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn supports_tool_choice_specific(&self) -> bool {
+        true
+    }
+
     use crate::common::MemoryTransport;
     use agentscope_core::{ContentBlock, JsonMap, ToolChoice, ToolUseBlock};
 

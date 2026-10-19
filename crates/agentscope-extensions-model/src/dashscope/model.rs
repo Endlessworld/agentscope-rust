@@ -233,6 +233,10 @@ impl Model for DashScopeChatModel {
         true
     }
 
+    fn supports_tool_choice_specific(&self) -> bool {
+        true
+    }
+
     fn context_window_size(&self) -> usize {
         self.context_window_size
     }

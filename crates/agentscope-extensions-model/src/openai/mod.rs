@@ -82,6 +82,9 @@ pub struct OpenAiChatModel {
     /// `reasoning_content` request field. DeepSeek requires this whenever the
     /// request carries tools, or the API returns HTTP 400.
     reasoning_passback: bool,
+    /// Model-level default for the JSON-schema `strict` flag, applied only when the
+    /// request-level schema leaves `strict` unset. Mirrors Java `strictJsonSchema`.
+    strict_json_schema: Option<bool>,
 }
 
 impl OpenAiChatModel {
@@ -100,6 +103,13 @@ impl OpenAiChatModel {
     /// Overrides the automatic `reasoning_content` passback detection.
     pub fn with_reasoning_passback(mut self, enabled: bool) -> Self {
         self.reasoning_passback = enabled;
+        self
+    }
+
+    /// Sets the model-level default `strict` flag for JSON-schema structured output.
+    /// Only applied when the request-level schema does not specify `strict`.
+    pub fn strict_json_schema(mut self, strict: bool) -> Self {
+        self.strict_json_schema = Some(strict);
         self
     }
 
@@ -123,6 +133,7 @@ impl OpenAiChatModel {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
             reasoning_passback: Self::requires_reasoning_passback(&model_name),
+            strict_json_schema: None,
             model_name,
         })
     }
@@ -159,10 +170,16 @@ impl OpenAiChatModel {
         }
         let client = Client::with_config(cfg).with_http_client(build_http_client());
         let context = resolve_context_window(&model_name);
+        let strict_json_schema = ctx
+            .options
+            .additional_body_params
+            .get("strictJsonSchema")
+            .and_then(|v| v.as_bool());
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
             reasoning_passback: Self::requires_reasoning_passback(&model_name),
+            strict_json_schema,
             model_name,
         })
     }
@@ -197,6 +214,7 @@ impl Model for OpenAiChatModel {
             tools,
             options,
             self.reasoning_passback,
+            self.strict_json_schema,
         );
         // Serialize eagerly; on failure fall back to the typed request so the
         // call still proceeds (this can only fail on non-string map keys).
@@ -286,6 +304,10 @@ impl Model for OpenAiChatModel {
     fn supports_native_structured_output_with_tools(&self) -> bool {
         self.capabilities.native_structured_output_with_tools
     }
+
+    fn supports_tool_choice_specific(&self) -> bool {
+        true
+    }
 }
 
 /// Provider that registers [`OpenAiChatModel`] under the `openai` provider id.
@@ -344,6 +366,7 @@ fn build_request(
     tools: Vec<ToolSchema>,
     options: GenerateOptions,
     reasoning_passback: bool,
+    strict_json_schema: Option<bool>,
 ) -> (CreateChatCompletionRequest, Vec<Option<String>>) {
     let request_tools = to_request_tools(tools);
     let has_tools = request_tools.is_some();
@@ -431,7 +454,7 @@ fn build_request(
         req.reasoning_effort = to_reasoning_effort(rc);
     }
     if let Some(rf) = &options.response_format {
-        req.response_format = to_response_format(rf);
+        req.response_format = to_response_format(rf, strict_json_schema);
     }
     (req, reasoning)
 }
@@ -470,6 +493,11 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                         name: None,
                     },
                 ));
+                // Keep `reasoning` 1:1 with the wire messages: the injection step
+                // addresses assistant reasoning by message index, so a missing
+                // entry here shifts every later assistant turn and drops its
+                // `reasoning_content`.
+                reasoning.push(None);
             }
             MsgRole::Assistant => {
                 let text = extract_text_content(&msg);
@@ -644,7 +672,7 @@ fn to_reasoning_effort(s: &str) -> Option<ReasoningEffort> {
     }
 }
 
-fn to_response_format(rf: &ResponseFormat) -> Option<OaiResponseFormat> {
+fn to_response_format(rf: &ResponseFormat, strict_default: Option<bool>) -> Option<OaiResponseFormat> {
     match rf.format_type.as_str() {
         "json_object" => Some(OaiResponseFormat::JsonObject),
         "json_schema" => {
@@ -653,11 +681,14 @@ fn to_response_format(rf: &ResponseFormat) -> Option<OaiResponseFormat> {
                 .name
                 .clone()
                 .unwrap_or_else(|| "output_schema".to_string());
+            // A schema-level `strict` always wins; the model-level default only fills
+            // the gap when the request schema leaves it unset (Java `applyStrictJsonSchemaDefault`).
+            let strict = js.strict.or(strict_default);
             Some(OaiResponseFormat::JsonSchema {
                 json_schema: ResponseFormatJsonSchema {
                     name,
                     schema: serde_json::Value::Object(js.schema.clone()),
-                    strict: js.strict,
+                    strict,
                     description: None,
                 },
             })
@@ -899,7 +930,7 @@ mod tests {
             max_tokens: Some(100),
             ..Default::default()
         };
-        let (req, _) = build_request("o3-mini".into(), vec![sample_msg()], vec![], options, false);
+        let (req, _) = build_request("o3-mini".into(), vec![sample_msg()], vec![], options, false, None);
         assert!(req.temperature.is_none(), "o3 rejects temperature");
         assert!(req.top_p.is_none(), "o3 rejects top_p");
         assert!(req.frequency_penalty.is_none(), "o3 rejects penalties");
@@ -913,7 +944,7 @@ mod tests {
     fn compatible_gateway_uses_legacy_max_tokens() {
         let options = GenerateOptions { max_tokens: Some(64), temperature: Some(0.2), ..Default::default() };
         let (req, _) =
-            build_request("deepseek-chat".into(), vec![sample_msg()], vec![], options, false);
+            build_request("deepseek-chat".into(), vec![sample_msg()], vec![], options, false, None);
         assert_eq!(req.max_tokens, Some(64));
         assert!(req.max_completion_tokens.is_none());
         assert_eq!(req.temperature, Some(0.2), "deepseek accepts temperature");
@@ -1097,6 +1128,37 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_passback_stays_aligned_across_user_turns() {
+        // A user turn produces a wire message too, so the parallel `reasoning`
+        // vector must be extended for it as well. Otherwise every later
+        // assistant turn is shifted by one and its `reasoning_content` lands on
+        // the preceding user message, leaving the assistant turn without the
+        // field — DeepSeek then answers HTTP 400 ("The reasoning_content in the
+        // thinking mode must be passed back to the API").
+        let user = Msg::builder()
+            .role(MsgRole::User)
+            .content(vec![ContentBlock::Text(TextBlock::new("hi"))])
+            .build();
+        let assistant = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("why")),
+                ContentBlock::Text(TextBlock::new("hello")),
+            ])
+            .build();
+        let RequestMessages {
+            messages,
+            reasoning,
+        } = to_request_messages(vec![user, assistant], true);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(reasoning.len(), messages.len(), "reasoning must stay 1:1");
+        let mut body = serde_json::json!({ "messages": messages });
+        inject_reasoning_content(&mut body, &reasoning);
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(body["messages"][1]["reasoning_content"], "why");
+    }
+
+    #[test]
     fn deepseek_models_require_reasoning_passback() {
         assert!(OpenAiChatModel::requires_reasoning_passback(
             "opencode-go/deepseek-v4.1-flash"
@@ -1265,5 +1327,54 @@ mod tests {
             Some("Beijing")
         );
         assert_eq!(final_resp.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    fn json_schema_response_format(strict: Option<bool>) -> ResponseFormat {
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        ResponseFormat {
+            format_type: "json_schema".into(),
+            json_schema: Some(agentscope_core::formatter::JsonSchema {
+                name: Some("person".into()),
+                schema,
+                strict,
+            }),
+        }
+    }
+
+    #[test]
+    fn strict_json_schema_default_applied_when_request_unset() {
+        let rf = json_schema_response_format(None);
+        let out = to_response_format(&rf, Some(true)).expect("json_schema format");
+        match out {
+            OaiResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.strict, Some(true));
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_level_strict_wins_over_model_default() {
+        let rf = json_schema_response_format(Some(false));
+        let out = to_response_format(&rf, Some(true)).expect("json_schema format");
+        match out {
+            OaiResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.strict, Some(false));
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_omitted_when_neither_request_nor_model_sets_it() {
+        let rf = json_schema_response_format(None);
+        let out = to_response_format(&rf, None).expect("json_schema format");
+        match out {
+            OaiResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.strict, None);
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
     }
 }

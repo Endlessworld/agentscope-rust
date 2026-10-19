@@ -185,6 +185,10 @@ impl Model for OpenAiResponsesModel {
     fn supports_native_structured_output_with_tools(&self) -> bool {
         self.capabilities.native_structured_output_with_tools
     }
+
+    fn supports_tool_choice_specific(&self) -> bool {
+        true
+    }
 }
 
 /// Provider that registers [`OpenAiResponsesModel`] under the responses provider id.

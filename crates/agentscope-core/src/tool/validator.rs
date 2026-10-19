@@ -25,6 +25,37 @@ impl ToolValidator {
             Err(e) => Some(e.to_string()),
         }
     }
+
+    /// Validates an already-parsed structured-output payload against a JSON Schema,
+    /// mirroring the Java `ToolValidator.validateJsonOutput`.
+    ///
+    /// Unlike [`ToolValidator::validate_input`], this does **not** normalize optional
+    /// `null` fields: structured output follows JSON Schema semantics directly, so an
+    /// explicit `null` is valid only when the schema allows it.
+    ///
+    /// Returns `None` when the output conforms (or the schema is empty), otherwise a
+    /// newline-separated error list.
+    pub fn validate_json_output(output: &Value, schema: &Map<String, Value>) -> Option<String> {
+        if schema.is_empty() {
+            return None;
+        }
+        if output.is_null() {
+            return Some("$: output is null".to_string());
+        }
+        let validator = match jsonschema::validator_for(&Value::Object(schema.clone())) {
+            Ok(v) => v,
+            Err(e) => return Some(format!("Schema validation error: {}", e)),
+        };
+        let errors: Vec<String> = validator
+            .iter_errors(output)
+            .map(|e| format!("{}: {}", e.instance_path, e))
+            .collect();
+        if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("\n"))
+        }
+    }
 }
 
 /// Recursively drops optional fields that are explicitly `null`, so an explicit

@@ -56,6 +56,11 @@ pub const DEFAULT_MAX_ITERS: i32 = 10;
 pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "generate_response";
 
 /// Immutable core of a [`ReActAgent`], shared across clones and calls.
+/// Maximum number of forced retries when the model returns without calling the
+/// `generate_response` tool on the structured-output fallback path (Java
+/// `soForceToolChoiceCount`).
+pub const MAX_STRUCTURED_OUTPUT_FORCE_RETRIES: u32 = 3;
+
 struct AgentCore {
     /// The model bound to this agent. Guarded by a mutex so a session can swap
     /// the model at runtime (dynamic model switching) without rebuilding.
@@ -98,6 +103,10 @@ struct AgentCore {
 /// Accumulates streamed model chunks into a single assistant message.
 #[derive(Debug, Default)]
 struct ReasoningContext {
+    /// Whether native structured-output responses are validated against the requested
+    /// JSON Schema before being accepted (default `true`). Mirrors Java
+    /// `validateStructuredOutput`.
+    validate_structured_output: bool,
     id: String,
     text: String,
     thinking: String,
@@ -212,6 +221,12 @@ impl ReActAgent {
     /// such as `plan_mode_context` across turns. Mirrors Java tools reaching state via
     /// `RuntimeContext.resolveAgentState(...)`.
     pub fn state_handle(&self) -> Arc<Mutex<AgentState>> {
+    /// Whether native structured-output responses are validated against the requested
+    /// JSON Schema (mirrors Java `validateStructuredOutput`).
+    pub fn validate_structured_output(&self) -> bool {
+        self.core.validate_structured_output
+    }
+
         Arc::clone(&self.core.state)
     }
 
@@ -416,7 +431,16 @@ impl ReActAgent {
             model.supports_native_structured_output()
         };
         if use_native {
-            self.call_native_structured(messages, schema).await
+            match self.call_native_structured(messages.clone(), schema.clone()).await {
+                Ok(reply) => Ok(reply),
+                Err(e) => {
+                    // A rejected native response (transport error, empty/invalid JSON or
+                    // schema-invalid) falls back to the synthetic tool path; the rejected
+                    // native reply never entered the context (Java `onErrorResume`).
+                    tracing::warn!("native structured output rejected, falling back to tool path: {e}");
+                    self.call_fallback_structured(messages, schema).await
+                }
+            }
         } else {
             self.call_fallback_structured(messages, schema).await
         }
@@ -429,7 +453,21 @@ impl ReActAgent {
             .call_with_format(messages, Some(ResponseFormat::json_schema(schema)))
             .await?;
         let text = reply.text_content();
-        let parsed = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        if text.trim().is_empty() {
+            return Err(Error::Agent("Native structured output is empty".into()));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            Error::Agent(format!("Native structured output is not valid JSON: {e}"))
+        })?;
+        if self.core.validate_structured_output {
+            if let Some(err) =
+                crate::tool::ToolValidator::validate_json_output(&parsed, &schema.schema)
+            {
+                return Err(Error::Agent(format!(
+                    "Native structured output failed schema validation: {err}"
+                )));
+            }
+        }
         Ok(reply.with_structured_data(parsed))
     }
 
@@ -476,8 +514,12 @@ impl ReActAgent {
             let mut msgs = state.context().to_vec();
             // Append the transient reminder to the request-local copy only.
             msgs.push(so_reminder.clone());
+    ///
+    /// The parsed payload is validated against the schema when
+    /// [`ReActAgent::validate_structured_output`] is enabled; empty text, invalid JSON or a
+    /// schema mismatch returns an error so the caller can fall back to the tool path.
             let model = self.core.model.lock().unwrap().clone();
-            let options = GenerateOptions::builder()
+            let mut options = GenerateOptions::builder()
                 .model_name(model.model_name())
                 .build();
             let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&model));
@@ -505,7 +547,10 @@ impl ReActAgent {
                 so_reply = Some(msg.clone());
                 break;
             }
-            if msg.tool_use_blocks().next().is_none() {
+            // The model finished without calling `generate_response`.
+            // Keep the first non-empty text seen so a lenient final parse is still possible
+            // (existing behaviour), then force a retry (up to 3) with a forced tool choice.
+            if last_text.is_empty() {
                 last_text = msg.text_content();
                 break;
             }
@@ -524,6 +569,9 @@ impl ReActAgent {
             Some(v) => serde_json::to_string(v).unwrap_or_default(),
             None => last_text,
         };
+        // Number of retries spent steering the model toward `generate_response` without a
+        // tool call. Capped at 3 (Java `soForceToolChoiceCount`) to avoid an endless loop.
+        let mut force_retries = 0u32;
         let mut builder = Msg::builder()
             .role(MsgRole::Assistant)
             .content(vec![ContentBlock::Text(TextBlock::new(text))]);
@@ -532,6 +580,12 @@ impl ReActAgent {
         // c2ff087ca). Only reached once the `generate_response` tool actually ran
         // (Java's `soCompleted` guard).
         if let Some(src) = &so_reply {
+            // From the first retry on, force the tool when the provider supports it.
+            if force_retries > 0 && model.supports_tool_choice_specific() {
+                options.tool_choice = Some(crate::model::ToolChoice::specific(
+                    STRUCTURED_OUTPUT_TOOL_NAME,
+                ));
+            }
             builder = builder.id(src.id()).timestamp(src.timestamp());
             if let Some(usage) = src.usage() {
                 builder = builder.usage(*usage);
@@ -560,6 +614,17 @@ impl ReActAgent {
             agent_name: Some(self.name.clone()),
             user_input: input.messages.last().map(|m| m.text_content()),
             memory: input.messages.clone(),
+            if msg.tool_use_blocks().next().is_none() {
+                force_retries += 1;
+                if force_retries > MAX_STRUCTURED_OUTPUT_FORCE_RETRIES {
+                    tracing::warn!(
+                        "structured output: model did not call `generate_response` after {} forced retries; returning unstructured reply",
+                        MAX_STRUCTURED_OUTPUT_FORCE_RETRIES
+                    );
+                    break;
+                }
+            }
+            // Other (non-structured) tool calls: keep looping, bounded by `max_iters`.
             toolkit: Some(self.core.toolkit.clone()),
             metadata: Default::default(),
             cwd: None,
@@ -687,6 +752,7 @@ impl ReActAgentBuilder {
         self
     }
     /// Sets the maximum reasoning→acting iterations (default 10).
+    validate_structured_output: bool,
     pub fn max_iters(mut self, max_iters: i32) -> Self {
         self.max_iters = max_iters;
         self
@@ -705,6 +771,7 @@ impl ReActAgentBuilder {
     pub fn enable_pending_tool_recovery(mut self, v: bool) -> Self {
         self.enable_pending_tool_recovery = v;
         self
+            validate_structured_output: true,
     }
     /// Sets the permission context used to evaluate tool requests.
     pub fn permission_context(mut self, ctx: PermissionContextState) -> Self {
@@ -784,6 +851,14 @@ async fn run_agent_loop(
 ) -> Result<Msg> {
     let mut state = core.state.lock().unwrap().clone();
 
+    /// Controls whether native structured-output responses are validated against the
+    /// requested JSON Schema after the model returns (default `true`). When disabled the
+    /// reply must still be valid JSON, but schema conformance is trusted to the provider.
+    pub fn validate_structured_output(mut self, v: bool) -> Self {
+        self.validate_structured_output = v;
+        self
+    }
+
     // The call-scoped state is now bound: notify the middlewares that participate in
     // `OnAgentStateReady` before the input enters the pipeline. This is the only seam
     // that exposes the state a call will actually use *before* that input is
@@ -826,6 +901,7 @@ async fn run_agent_loop(
     }
     state.set_cur_iter(0);
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
+            validate_structured_output: self.validate_structured_output,
     // be detected and carried over (the loop otherwise runs on a private clone).
     let plan_mode_at_start = state.plan_mode_context.clone();
     let result = match execute_iteration(core, ctx, &mut state, 0).await {
@@ -2232,6 +2308,82 @@ mod tests {
             "mock",
             vec![
                 tool_use_response("c-rd2", "final_answer", JsonMap::new()),
+    /// A native-structured-output model that records every `GenerateOptions` it sees,
+    /// so tests can assert a forced `ToolChoice::Specific` is being sent.
+    struct OptionsRecordingModel {
+        responses: Arc<Mutex<Vec<ChatResponse>>>,
+        seen_choices: Arc<Mutex<Vec<Option<crate::model::ToolChoice>>>>,
+    }
+
+    impl OptionsRecordingModel {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+                seen_choices: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Model for OptionsRecordingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            self.seen_choices.lock().unwrap().push(options.tool_choice.clone());
+            let responses = Arc::clone(&self.responses);
+            Box::pin(futures::stream::once(async move {
+                let mut g = responses.lock().unwrap();
+                let r = if g.is_empty() {
+                    text_response("done")
+                } else {
+                    g.remove(0)
+                };
+                Ok(r)
+            }))
+        }
+        fn model_name(&self) -> &str {
+            "opts-recording"
+        }
+
+        fn supports_native_structured_output(&self) -> bool {
+            true
+        }
+
+        fn supports_tool_choice_specific(&self) -> bool {
+            true
+        }
+    }
+
+    /// Builds an assistant message containing a server-tool call plus its inline result.
+    fn server_tool_response(id: &str, name: &str) -> ChatResponse {
+        let mut use_meta = JsonMap::new();
+        use_meta.insert("serverTool".to_string(), serde_json::json!(true));
+        let call = ToolUseBlock::builder()
+            .id(id)
+            .name(name)
+            .input(JsonMap::new())
+            .metadata(use_meta)
+            .build();
+        let mut res_meta = JsonMap::new();
+        res_meta.insert("serverTool".to_string(), serde_json::json!(true));
+        let result = ToolResultBlock {
+            id: Some(id.to_string()),
+            name: Some(name.to_string()),
+            output: vec![ContentBlock::Text(TextBlock::new("search done"))],
+            metadata: res_meta,
+            state: crate::message::ToolResultState::Success,
+        };
+        ChatResponse::builder()
+            .content(vec![
+                ContentBlock::ToolUse(call),
+                ContentBlock::ToolResult(result),
+            ])
+            .build()
+    }
+
                 text_response("should not happen"),
             ],
         ));
@@ -3349,6 +3501,103 @@ mod tests {
         let mut input = JsonMap::new();
         input.insert("a".to_string(), serde_json::json!(1));
         input.insert("b".to_string(), serde_json::json!(2));
+    /// A schema that requires `name:string` and `age:integer`.
+    fn person_schema() -> crate::formatter::JsonSchema {
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        schema.insert(
+            "properties".into(),
+            serde_json::json!({"name": {"type": "string"}, "age": {"type": "integer"}}),
+        );
+        schema.insert("required".into(), serde_json::json!(["name", "age"]));
+        crate::formatter::JsonSchema::new("person", schema)
+    }
+
+    #[tokio::test]
+    async fn native_structured_output_rejects_schema_mismatch_and_falls_back() {
+        // First call returns a schema-invalid native reply (age is a string), so the
+        // agent must discard it and route through the synthetic tool path.
+        let mut resp_input = JsonMap::new();
+        resp_input.insert(
+            "response".to_string(),
+            serde_json::json!({"name": "ann", "age": 7}),
+        );
+        let model = Arc::new(OptionsRecordingModel::new(vec![
+            text_response("{\"name\":\"ann\",\"age\":\"seven\"}"),
+            tool_use_response("g1", STRUCTURED_OUTPUT_TOOL_NAME, resp_input),
+        ]));
+        let agent = ReActAgent::builder()
+            .name("t-native-validate")
+            .model(model.clone() as Arc<dyn Model>)
+            .build()
+            .unwrap();
+        // Native path is used (no tools bound -> `supports_native_structured_output()`).
+        let reply = agent
+            .call_with_schema(vec![Msg::user("give json")], person_schema())
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+        let data = reply.structured_data().unwrap();
+        assert_eq!(data["name"], serde_json::json!("ann"));
+        assert_eq!(data["age"], serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn native_structured_output_validation_can_be_disabled() {
+        // With validation off, the schema-invalid native reply is accepted as-is (still
+        // valid JSON) instead of triggering a fallback round trip.
+        let model = Arc::new(OptionsRecordingModel::new(vec![text_response(
+            "{\"name\":\"ann\",\"age\":\"seven\"}",
+        )]));
+        let agent = ReActAgent::builder()
+            .name("t-native-no-validate")
+            .model(model.clone() as Arc<dyn Model>)
+            .validate_structured_output(false)
+            .build()
+            .unwrap();
+        let reply = agent
+            .call_with_schema(vec![Msg::user("give json")], person_schema())
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+        assert_eq!(reply.structured_data().unwrap()["age"], serde_json::json!("seven"));
+        assert_eq!(model.seen_choices.lock().unwrap().len(), 1, "no fallback round trip");
+    }
+
+    #[tokio::test]
+    async fn fallback_forces_specific_tool_choice_on_retry() {
+        // The model returns plain text twice (never calling `generate_response`), then
+        // finally calls it. The retries must carry a forced `ToolChoice::Specific`.
+        let mut resp_input = JsonMap::new();
+        resp_input.insert("response".to_string(), serde_json::json!({"name": "z", "age": 1}));
+        let model = Arc::new(OptionsRecordingModel::new(vec![
+            text_response("no tool"),
+            text_response("still no tool"),
+            tool_use_response("g1", STRUCTURED_OUTPUT_TOOL_NAME, resp_input),
+        ]));
+        let agent = ReActAgent::builder()
+            .name("t-fallback-force")
+            .model(model.clone() as Arc<dyn Model>)
+            .build()
+            .unwrap();
+        let reply = agent
+            .call_with_schema(vec![Msg::user("give json")], person_schema())
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+        let choices = model.seen_choices.lock().unwrap().clone();
+        // 1) native attempt (invalid JSON -> rejected, no forced choice)
+        // 2) fallback attempt #1 (no forced choice, force_retries == 0)
+        // 3) fallback attempt #2 (forced `generate_response`)
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0], None);
+        assert_eq!(choices[1], None);
+        assert_eq!(
+            choices[2],
+            Some(crate::model::ToolChoice::Specific { tool_name: STRUCTURED_OUTPUT_TOOL_NAME.into() })
+        );
+    }
+
         let model = Arc::new(MockModel::new(
             "mock",
             vec![

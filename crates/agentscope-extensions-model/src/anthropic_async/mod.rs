@@ -204,6 +204,10 @@ impl Model for AnthropicMessagesModel {
     fn supports_native_structured_output_with_tools(&self) -> bool {
         self.capabilities.native_structured_output_with_tools
     }
+
+    fn supports_tool_choice_specific(&self) -> bool {
+        true
+    }
 }
 
 /// Provider that registers [`AnthropicMessagesModel`] under the anthropic provider id.
