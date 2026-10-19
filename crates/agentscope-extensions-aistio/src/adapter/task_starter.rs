@@ -268,6 +268,7 @@ fn reason_name(reason: GenerateReason) -> &'static str {
         GenerateReason::AllToolsDenied => "ALL_TOOLS_DENIED",
         GenerateReason::Interrupted => "INTERRUPTED",
         GenerateReason::MaxIterations => "MAX_ITERATIONS",
+        GenerateReason::ToolReturnDirect => "TOOL_RETURN_DIRECT",
     }
 }
 

@@ -158,12 +158,11 @@ impl PostgresAgentStateStore {
         if session_id.trim().is_empty() {
             return Err(PostgresError::Query("sessionId must not be blank".into()));
         }
-        // Parity with the Java `validateSessionId`: no path separators, bounded length.
-        if session_id.contains('/') || session_id.contains('\\') {
-            return Err(PostgresError::Query(
-                "AgentStateStore ID cannot contain path separators".into(),
-            ));
-        }
+        // Path separators are allowed: the slot id is only ever bound as a prepared-statement
+        // parameter here, never used as a filesystem path, and sandbox stores legitimately
+        // generate slash-separated slot ids (`sandbox/session/<id>`); rejecting them silently
+        // dropped all sandbox resume state (Java 7d10efc3b, #3231). Only the blank check and
+        // the bounded length remain.
         if session_id.len() > MAX_SESSION_ID_LENGTH {
             return Err(PostgresError::Query(format!(
                 "AgentStateStore ID cannot exceed {MAX_SESSION_ID_LENGTH} characters"
@@ -693,6 +692,29 @@ mod tests {
         assert!(s.get(Some("u1"), "s1", "k").await.is_none());
     }
 
+    // Regression for #3231 (Java PostgresAgentStateStoreTest#acceptsSandboxShapedSessionIds):
+    // sandbox-shaped slot ids containing path separators persist and reload.
+    #[tokio::test]
+    async fn save_and_get_roundtrip_for_sandbox_shaped_session_id() {
+        let c = client();
+        let s = store(&c);
+        let flat = "sandbox/session/01M31AQP7A24X0Y4A12RKADD5P";
+        let nested = "sandbox/user/agent-7/01M31AQP7A24X0Y4A12RKADD5P";
+        let v = json!({"resumed": true});
+
+        assert_eq!(s.save_versioned(None, flat, "k", &v).unwrap(), 1);
+        assert_eq!(s.get(None, flat, "k").await, Some(v.clone()));
+        assert!(s.exists(None, flat).await);
+
+        s.save(None, nested, "k", json!(2)).await;
+        assert_eq!(s.get(None, nested, "k").await, Some(json!(2)));
+        assert_eq!(s.list_session_ids(None).await, vec![flat.to_string(), nested.to_string()]);
+
+        s.delete(None, flat).await;
+        assert!(s.get(None, flat, "k").await.is_none());
+        assert_eq!(s.get(None, nested, "k").await, Some(json!(2)));
+    }
+
     // Java: PostgresAgentStateStoreTest#existsTrue, #existsFalse
     #[tokio::test]
     async fn exists_tracks_session_presence() {
@@ -744,11 +766,19 @@ mod tests {
 
     // ---- identifier validation ---------------------------------------------
 
-    // Java: PostgresAgentStateStoreTest#rejectsSessionIdWithPathSeparators, #rejectsTooLongSessionId
+    // Java: PostgresAgentStateStoreTest#acceptsSandboxShapedSessionIds, #rejectsTooLongSessionId
     #[test]
-    fn slot_id_rejects_path_separators_and_overlong_ids() {
-        assert!(PostgresAgentStateStore::slot_id(None, "a/b").is_err());
-        assert!(PostgresAgentStateStore::slot_id(None, "a\\b").is_err());
+    fn slot_id_accepts_path_separators_and_rejects_overlong_ids() {
+        // Regression for #3231: slash-separated sandbox slot ids are opaque bind values.
+        assert_eq!(
+            PostgresAgentStateStore::slot_id(None, "sandbox/session/01M31AQP7A24X0Y4A12RKADD5P")
+                .unwrap(),
+            format!("{ANON_USER}:sandbox/session/01M31AQP7A24X0Y4A12RKADD5P")
+        );
+        assert_eq!(
+            PostgresAgentStateStore::slot_id(None, "a\\b").unwrap(),
+            format!("{ANON_USER}:a\\b")
+        );
         let long = "s".repeat(MAX_SESSION_ID_LENGTH + 1);
         assert!(PostgresAgentStateStore::slot_id(None, &long).is_err());
         assert_eq!(slot("ok"), format!("{ANON_USER}:ok"));
@@ -786,9 +816,9 @@ mod tests {
     async fn invalid_identifiers_are_ignored_by_trait_methods() {
         let c = client();
         let s = store(&c);
-        s.save(None, "a/b", "k", json!(1)).await;
+        s.save(None, "   ", "k", json!(1)).await;
         assert_eq!(c.session_row_count(), 0);
-        assert!(s.get(None, "a/b", "k").await.is_none());
+        assert!(s.get(None, "   ", "k").await.is_none());
         assert!(s.get(None, "s1", "  ").await.is_none());
         assert!(s.get_list(None, "s1", "").await.is_empty());
     }

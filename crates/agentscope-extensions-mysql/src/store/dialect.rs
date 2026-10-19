@@ -88,10 +88,18 @@ impl StoreDialect for MysqlStoreDialect {
     }
 
     fn create_table_sql(&self) -> &'static str {
-        // Keep the composite primary key under InnoDB's utf8mb4 3072-byte limit.
+        // Keep the composite primary key under InnoDB's utf8mb4 3072-byte limit
+        // ((512 + 255) * 4 = 3068 bytes, still under 3072).
+        //
+        // The key columns pin a binary collation: `DEFAULT CHARSET=utf8mb4` without an
+        // explicit `COLLATE` resolves to the charset default, which is case-insensitive
+        // (`utf8mb4_0900_ai_ci` on MySQL 8.0+, `utf8mb4_general_ci` on 5.7 and MariaDB).
+        // Two keys differing only in letter case then collide on the primary key, so
+        // `put(ns, "README.md", a)` followed by `put(ns, "readme.md", b)` silently
+        // overwrites `a`. Payload columns keep the table default (Java 2349533a1, #3288).
         "CREATE TABLE IF NOT EXISTS {table} (\
-           namespace_path VARCHAR(512) NOT NULL,\
-           item_key       VARCHAR(255) NOT NULL,\
+           namespace_path VARCHAR(512) COLLATE utf8mb4_bin NOT NULL,\
+           item_key       VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,\
            value_json     LONGTEXT     NOT NULL,\
            version        BIGINT       NOT NULL,\
            updated_at     BIGINT       NOT NULL,\
@@ -333,5 +341,34 @@ mod tests {
     fn validate_key_rejects_empty() {
         assert!(validate_key("").is_err());
         assert!(validate_key("k").is_ok());
+    }
+
+    // Java: DialectSqlTests#mysqlKeyColumnsUseBinaryCollation
+    #[test]
+    fn mysql_key_columns_use_binary_collation() {
+        let ddl = MysqlStoreDialect.create_table_sql();
+        assert!(ddl.contains("namespace_path VARCHAR(512) COLLATE utf8mb4_bin NOT NULL"));
+        assert!(ddl.contains("item_key       VARCHAR(255) COLLATE utf8mb4_bin NOT NULL"));
+        // Only the two key columns pin the collation; the payload column keeps the default.
+        assert_eq!(ddl.matches("COLLATE utf8mb4_bin").count(), 2);
+        assert!(ddl.contains("value_json     LONGTEXT     NOT NULL"));
+        assert!(!ddl.contains("value_json     LONGTEXT     COLLATE"));
+    }
+
+    // Java: DialectSqlTests#mysqlPayloadColumnsKeepDefaultCollation — PostgreSQL, H2 and
+    // SQLite already compare these columns case-sensitively, so no COLLATE clause leaks in.
+    #[test]
+    fn non_mysql_dialects_have_no_collation_clause() {
+        for d in [
+            &PostgresStoreDialect as &dyn StoreDialect,
+            &SqliteStoreDialect,
+            &H2StoreDialect,
+        ] {
+            assert!(
+                !d.create_table_sql().contains("COLLATE"),
+                "dialect {} leaked a collation clause",
+                d.name()
+            );
+        }
     }
 }

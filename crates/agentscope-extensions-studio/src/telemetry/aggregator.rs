@@ -131,6 +131,7 @@ impl StreamChatResponseAggregator {
                 output_tokens: self.output_tokens,
                 cached_tokens: 0,
                 time: self.time,
+                ..Default::default()
             },
             metadata: Default::default(),
             finish_reason: self.finish_reason.clone(),
