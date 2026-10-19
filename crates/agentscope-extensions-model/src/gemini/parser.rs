@@ -31,6 +31,9 @@ fn usage_of(metadata: &GeminiUsageMetadata) -> ChatUsage {
         input_tokens,
         output_tokens,
         cached_tokens: metadata.cached_content_token_count.unwrap_or(0),
+        cache_creation_tokens: 0,
+        reasoning_tokens: thinking_tokens,
+        tool_use_prompt_tokens: metadata.tool_use_prompt_token_count.unwrap_or(0),
         time: 0.0,
     }
 }

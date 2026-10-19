@@ -70,6 +70,7 @@ impl OllamaOptions {
             frequency_penalty: options.frequency_penalty,
             presence_penalty: options.presence_penalty,
             model: options.model_name.clone(),
+            format: native_format(options).or_else(|| options.additional_body_params.get("format").cloned()),
             ..Default::default()
         }
     }
@@ -142,6 +143,23 @@ impl OllamaOptions {
     }
 }
 
+/// Maps a core [`ResponseFormat`] onto Ollama's native top-level `format` field.
+///
+/// Ollama expects the bare JSON Schema document (not the OpenAI
+/// `response_format` wrapper) for structured output, and the literal `"json"`
+/// for a JSON-object response. Mirrors `OllamaOptions.fromGenerateOptions`.
+fn native_format(options: &GenerateOptions) -> Option<serde_json::Value> {
+    let rf = options.response_format.as_ref()?;
+    match rf.format_type.as_str() {
+        "json_schema" => rf
+            .json_schema
+            .as_ref()
+            .map(|js| serde_json::Value::Object(js.schema.clone())),
+        "json_object" => Some(serde_json::json!("json")),
+        _ => None,
+    }
+}
+
 /// Converts a tool-call argument map into the Ollama function payload.
 pub fn function_from_parts(
     name: impl Into<String>,
@@ -175,6 +193,45 @@ mod tests {
         assert_eq!(map.get("top_k"), Some(&serde_json::json!(40)));
         assert!(!map.contains_key("format"));
         assert!(!map.contains_key("think"));
+    }
+
+    #[test]
+    fn from_generate_options_maps_json_schema_to_native_format() {
+        use agentscope_core::formatter::{JsonSchema, ResponseFormat};
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        schema.insert(
+            "properties".into(),
+            serde_json::json!({"city": {"type": "string"}}),
+        );
+        let mut gen = GenerateOptions::default();
+        gen.response_format = Some(ResponseFormat::json_schema(JsonSchema::new(
+            "Weather",
+            schema.clone(),
+        )));
+
+        let opts = OllamaOptions::from_generate_options(&gen);
+        // Ollama wants the bare schema, not the OpenAI response_format wrapper.
+        assert_eq!(opts.format, Some(serde_json::Value::Object(schema)));
+    }
+
+    #[test]
+    fn from_generate_options_maps_json_object_to_literal_json() {
+        use agentscope_core::formatter::ResponseFormat;
+        let mut gen = GenerateOptions::default();
+        gen.response_format = Some(ResponseFormat::json_object());
+        assert_eq!(
+            OllamaOptions::from_generate_options(&gen).format,
+            Some(serde_json::json!("json"))
+        );
+    }
+
+    #[test]
+    fn from_generate_options_ignores_text_response_format() {
+        use agentscope_core::formatter::ResponseFormat;
+        let mut gen = GenerateOptions::default();
+        gen.response_format = Some(ResponseFormat::text());
+        assert!(OllamaOptions::from_generate_options(&gen).format.is_none());
     }
 
     #[test]

@@ -79,7 +79,7 @@ fn reverse_encoder_covers_all_client_protocols() {
             ContentBlock::Text(TextBlock::new("answer")),
             ContentBlock::ToolUse(ToolUseBlock::new("call_1", "search", input)),
         ],
-        ChatUsage { input_tokens: 3, output_tokens: 2, cached_tokens: 0, time: 0.0 },
+        ChatUsage { input_tokens: 3, output_tokens: 2, cached_tokens: 0, time: 0.0, ..Default::default() },
         None,
         Some("tool_calls".to_string()),
     );

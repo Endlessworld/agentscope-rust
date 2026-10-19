@@ -19,10 +19,14 @@ pub use converter::{
 };
 pub use credential::{DashScopeCredential, EndpointType, CREDENTIAL_TYPE};
 pub use dto::{
-    DashScopeChoice, DashScopeContent, DashScopeContentPart, DashScopeFunction, DashScopeInput,
-    DashScopeMessage, DashScopeOutput, DashScopeParameters, DashScopePublicKeyResponse,
-    DashScopeRequest, DashScopeResponse, DashScopeSearchOptions, DashScopeTool, DashScopeToolCall,
-    DashScopeToolFunction, DashScopeUsage, PublicKeyData,
+    CacheControl, DashScopeChoice, DashScopeContent, DashScopeContentPart, DashScopeFunction,
+    DashScopeInput, DashScopeMessage, DashScopeOutput, DashScopeParameters,
+    DashScopePublicKeyResponse, DashScopeRequest, DashScopeResponse, DashScopeSearchOptions,
+    DashScopeTool, DashScopeToolCall, DashScopeToolFunction, DashScopeUsage, PublicKeyData,
+};
+pub use converter::{
+    apply_automatic_cache_control, ephemeral_cache_control, to_dashscope_messages_with_options,
+    MAX_CACHE_MARKERS,
 };
 pub use model::{DashScopeChatModel, PUBLIC_KEYS_ENDPOINT};
 pub use parser::{parse_response, DashScopeStreamIncrementer, FRAGMENT_PLACEHOLDER};

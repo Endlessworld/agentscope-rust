@@ -15,7 +15,7 @@ use agentscope_core::{
 
 use crate::common::{HttpRequestSpec, SharedTransport};
 use crate::dashscope::converter::{
-    build_request, is_multimodal_model, to_dashscope_messages, DEFAULT_BASE_URL,
+    build_request, is_multimodal_model, to_dashscope_messages_with_options, DEFAULT_BASE_URL,
     MULTIMODAL_GENERATION_ENDPOINT, TEXT_GENERATION_ENDPOINT,
 };
 use crate::dashscope::credential::EndpointType;
@@ -123,7 +123,7 @@ impl DashScopeChatModel {
         stream: bool,
     ) -> HttpRequestSpec {
         let force_multimodal = self.requires_multimodal_api();
-        let ds_messages = to_dashscope_messages(messages, force_multimodal);
+        let ds_messages = to_dashscope_messages_with_options(messages, force_multimodal, options);
         let request = build_request(
             &self.model_name,
             ds_messages,

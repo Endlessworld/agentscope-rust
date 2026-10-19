@@ -716,6 +716,7 @@ mod tests {
             .clone(),
             output_schema: None,
             strict: None,
+            defer_loading: None,
         }
     }
 

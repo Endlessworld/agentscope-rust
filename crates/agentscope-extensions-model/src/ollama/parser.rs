@@ -53,6 +53,7 @@ pub fn parse_response(response: &OllamaResponse) -> ChatResponse {
         output_tokens: response.eval_count.unwrap_or(0).max(0) as u64,
         cached_tokens: 0,
         time,
+        ..Default::default()
     };
 
     let mut metadata = JsonMap::new();
@@ -150,6 +151,7 @@ impl OllamaStreamIncrementer {
                 output_tokens: response.eval_count.unwrap_or(0).max(0) as u64,
                 cached_tokens: 0,
                 time: response.total_duration.map(|d| d as f64 / 1e9).unwrap_or(0.0),
+                ..Default::default()
             };
             self.usage = Some(crate::common::usage::merge_non_zero(
                 &self.usage.unwrap_or_default(),

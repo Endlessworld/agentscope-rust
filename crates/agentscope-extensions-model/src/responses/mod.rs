@@ -442,6 +442,7 @@ impl ResponsesIncrementer {
                         output_tokens: u.output_tokens as u64,
                         cached_tokens: 0,
                         time: 0.0,
+                        ..Default::default()
                     };
                     self.usage = Some(usage::merge_non_zero(
                         &self.usage.unwrap_or_default(),

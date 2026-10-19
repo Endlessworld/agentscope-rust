@@ -20,6 +20,9 @@ use crate::gemini::model::{default_transport, GeminiChatModel};
 /// Provider id used in `provider:model` ids.
 pub const PROVIDER_ID: &str = "gemini";
 
+/// Environment variable consulted when no explicit base URL is supplied.
+pub const BASE_URL_ENV: &str = "GEMINI_BASE_URL";
+
 /// Provider plugin that builds [`GeminiChatModel`] instances.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GeminiModelProvider;
@@ -96,7 +99,13 @@ impl ModelProvider for GeminiModelProvider {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
-        let model = GeminiChatModel::new(model_name, api_key, ctx.base_url.clone(), default_transport())
+        let base_url = crate::common::resolve_base_url(
+            ctx.base_url.clone(),
+            BASE_URL_ENV,
+            crate::gemini::credential::DEFAULT_BASE_URL,
+        );
+
+        let model = GeminiChatModel::new(model_name, api_key, Some(base_url), default_transport())
             .with_default_options(ctx.options.clone())
             .with_stream(ctx.stream.unwrap_or(true))
             .with_context_window_size(context_window_size);

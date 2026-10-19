@@ -474,6 +474,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}).as_object().unwrap().clone(),
             output_schema: None,
             strict: None,
+            defer_loading: None,
         }
     }
 

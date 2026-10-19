@@ -19,6 +19,9 @@ pub fn merge_non_zero(current: &ChatUsage, incoming: &ChatUsage) -> ChatUsage {
         input_tokens: pick(current.input_tokens, incoming.input_tokens),
         output_tokens: pick(current.output_tokens, incoming.output_tokens),
         cached_tokens: pick(current.cached_tokens, incoming.cached_tokens),
+        cache_creation_tokens: pick(current.cache_creation_tokens, incoming.cache_creation_tokens),
+        reasoning_tokens: pick(current.reasoning_tokens, incoming.reasoning_tokens),
+        tool_use_prompt_tokens: pick(current.tool_use_prompt_tokens, incoming.tool_use_prompt_tokens),
         time: if incoming.time > current.time {
             incoming.time
         } else {
@@ -46,10 +49,10 @@ mod tests {
 
     #[test]
     fn later_non_zero_fields_override() {
-        let mut acc = ChatUsage { input_tokens: 10, output_tokens: 0, cached_tokens: 3, time: 0.0 };
+        let mut acc = ChatUsage { input_tokens: 10, output_tokens: 0, cached_tokens: 3, time: 0.0, ..Default::default() };
         merge_into(
             &mut acc,
-            &ChatUsage { input_tokens: 0, output_tokens: 20, cached_tokens: 0, time: 0.0 },
+            &ChatUsage { input_tokens: 0, output_tokens: 20, cached_tokens: 0, time: 0.0, ..Default::default() },
         );
         assert_eq!(acc.input_tokens, 10, "zero must not clear a previous value");
         assert_eq!(acc.output_tokens, 20);
@@ -58,7 +61,7 @@ mod tests {
 
     #[test]
     fn zero_frames_are_no_ops() {
-        let acc = ChatUsage { input_tokens: 5, output_tokens: 6, cached_tokens: 1, time: 2.0 };
+        let acc = ChatUsage { input_tokens: 5, output_tokens: 6, cached_tokens: 1, time: 2.0, ..Default::default() };
         let merged = merge_non_zero(&acc, &ChatUsage::default());
         assert_eq!(merged, acc);
     }

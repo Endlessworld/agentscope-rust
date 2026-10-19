@@ -55,6 +55,8 @@ pub struct DashScopeParameters {
     pub enable_thinking: Option<bool>,
     #[serde(rename = "thinking_budget", skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    #[serde(rename = "reasoning_effort", skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(rename = "enable_search", skip_serializing_if = "Option::is_none")]
     pub enable_search: Option<bool>,
     #[serde(rename = "search_options", skip_serializing_if = "Option::is_none")]
@@ -95,6 +97,7 @@ impl Default for DashScopeParameters {
             stop: None,
             enable_thinking: None,
             thinking_budget: None,
+            reasoning_effort: None,
             enable_search: None,
             search_options: None,
             enable_code_interpreter: None,
@@ -194,17 +197,6 @@ pub struct DashScopeMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_content: Option<String>,
-    /// Prompt-cache hint; omitted when `None` or empty (Java `NON_EMPTY`).
-    #[serde(rename = "cache_control", skip_serializing_if = "cache_control_is_empty")]
-    pub cache_control: Option<CacheControl>,
-}
-
-impl DashScopeMessage {
-    /// Attaches a `cache_control` hint.
-    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
-        self.cache_control = Some(cache_control);
-        self
-    }
 }
 
 /// One multimodal content part; omitted fields are not serialized, matching
@@ -229,6 +221,10 @@ pub struct DashScopeContentPart {
     pub max_pixels: Option<u32>,
     #[serde(rename = "total_pixels", skip_serializing_if = "Option::is_none")]
     pub total_pixels: Option<u32>,
+    /// Prompt-cache hint; omitted when `None` or empty. Lives on the content
+    /// block (not the message) so DashScope caches the prefix up to that part.
+    #[serde(rename = "cache_control", skip_serializing_if = "cache_control_is_empty")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl DashScopeContentPart {

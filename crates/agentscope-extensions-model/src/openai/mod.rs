@@ -85,6 +85,9 @@ pub struct OpenAiChatModel {
 }
 
 impl OpenAiChatModel {
+    /// Environment variable consulted when no explicit base URL is supplied.
+    pub const BASE_URL_ENV: &'static str = "OPENAI_BASE_URL";
+
     /// Whether the given model id requires `reasoning_content` passback.
     ///
     /// DeepSeek (and its OpenAI-compatible endpoints) hard-require the field to
@@ -139,9 +142,13 @@ impl OpenAiChatModel {
         if let Some(key) = &ctx.api_key {
             cfg = cfg.with_api_key(key);
         }
-        if let Some(base) = &ctx.base_url {
-            cfg = cfg.with_api_base(base);
-        }
+        // Explicit context value, else `OPENAI_BASE_URL`, else the SDK default.
+        let base_url = crate::common::resolve_base_url(
+            ctx.base_url.clone(),
+            Self::BASE_URL_ENV,
+            "https://api.openai.com/v1",
+        );
+        cfg = cfg.with_api_base(base_url);
         // Merge per-request additional headers into the client config.
         for (k, v) in &ctx.options.additional_headers {
             let name = reqwest::header::HeaderName::from_str(k)
@@ -497,8 +504,16 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                     },
                 ));
                 // DeepSeek requires the assistant turn's reasoning to be echoed
-                // back as `reasoning_content`; other providers ignore it.
-                reasoning.push(reasoning_text(&msg).filter(|_| reasoning_passback));
+                // back as `reasoning_content`; other providers ignore it. The
+                // field must be present (empty string is fine) on *every*
+                // assistant turn: a plain-text or synthesized assistant message
+                // that omits the key entirely is rejected with HTTP 400 whenever
+                // tools are in play.
+                reasoning.push(if reasoning_passback {
+                    Some(reasoning_text(&msg).unwrap_or_default())
+                } else {
+                    None
+                });
             }
             MsgRole::Tool => {
                 for tr in msg.tool_result_blocks() {
@@ -542,14 +557,18 @@ fn reasoning_text(msg: &Msg) -> Option<String> {
 }
 
 /// Injects the per-message `reasoning_content` into the serialized request body
-/// (`body["messages"][i]["reasoning_content"] = ...`), leaving messages without
-/// reasoning untouched.
+/// (`body["messages"][i]["reasoning_content"] = ...`).
+///
+/// `Some("")` (an assistant turn without thinking) is written as an empty
+/// string rather than skipped: DeepSeek rejects requests whose assistant turns
+/// omit the key, so the field must always be present when passback is enabled.
+/// Messages that are not assistant turns carry `None` and are left untouched.
 fn inject_reasoning_content(body: &mut serde_json::Value, reasoning: &[Option<String>]) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
     for (i, entry) in reasoning.iter().enumerate() {
-        let Some(text) = entry.as_deref().filter(|s| !s.is_empty()) else {
+        let Some(text) = entry.as_deref() else {
             continue;
         };
         if let Some(object) = messages.get_mut(i).and_then(|m| m.as_object_mut()) {
@@ -774,6 +793,7 @@ impl StreamIncrementer {
                 output_tokens: usage.completion_tokens as u64,
                 cached_tokens: 0,
                 time: 0.0,
+                ..Default::default()
             };
             self.usage = Some(usage::merge_non_zero(
                 &self.usage.unwrap_or_default(),
@@ -1005,6 +1025,43 @@ mod tests {
         let mut body = serde_json::json!({ "messages": messages });
         inject_reasoning_content(&mut body, &reasoning);
         assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_passback_backfills_empty_string_without_thinking() {
+        // A plain-text assistant turn (no ThinkingBlock) must still carry the
+        // `reasoning_content` key as an empty string, otherwise DeepSeek rejects
+        // the request with HTTP 400 when tools are in play.
+        let msg = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Text(TextBlock::new("answer"))])
+            .build();
+        let RequestMessages {
+            messages,
+            reasoning,
+        } = to_request_messages(vec![msg], true);
+        let mut body = serde_json::json!({ "messages": messages });
+        inject_reasoning_content(&mut body, &reasoning);
+        assert_eq!(body["messages"][0]["reasoning_content"], "");
+        assert_eq!(body["messages"][0]["content"], "answer");
+    }
+
+    #[test]
+    fn reasoning_passback_keeps_non_empty_thinking_verbatim() {
+        let msg = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("step 1")),
+                ContentBlock::Text(TextBlock::new("answer")),
+            ])
+            .build();
+        let RequestMessages {
+            messages,
+            reasoning,
+        } = to_request_messages(vec![msg], true);
+        let mut body = serde_json::json!({ "messages": messages });
+        inject_reasoning_content(&mut body, &reasoning);
+        assert_eq!(body["messages"][0]["reasoning_content"], "step 1");
     }
 
     #[test]

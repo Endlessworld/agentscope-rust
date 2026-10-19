@@ -23,7 +23,8 @@ fn usage_of(usage: &AnthropicUsage) -> ChatUsage {
         input_tokens: usage.total_input(),
         output_tokens: usage.output_tokens,
         cached_tokens: usage.cached(),
-        time: 0.0,
+        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+        ..Default::default()
     }
 }
 

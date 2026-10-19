@@ -16,9 +16,95 @@ use agentscope_core::{
 };
 
 use super::dto::{
-    DashScopeContent, DashScopeContentPart, DashScopeFunction, DashScopeInput, DashScopeMessage,
-    DashScopeParameters, DashScopeRequest, DashScopeTool, DashScopeToolCall, DashScopeToolFunction,
+    CacheControl, DashScopeContent, DashScopeContentPart, DashScopeFunction, DashScopeInput,
+    DashScopeMessage, DashScopeParameters, DashScopeRequest, DashScopeTool, DashScopeToolCall,
+    DashScopeToolFunction,
 };
+
+/// Maximum number of `cache_control` markers DashScope accepts per request.
+pub const MAX_CACHE_MARKERS: usize = 4;
+
+/// The `{"type": "ephemeral"}` marker used for automatic cache marking.
+pub fn ephemeral_cache_control() -> CacheControl {
+    let mut map = CacheControl::new();
+    map.insert("type".to_string(), "ephemeral".to_string());
+    map
+}
+
+/// Places a `cache_control` marker on the final content part of `message`,
+/// converting string content into a single text part when required.
+///
+/// Mirrors `DashScopeChatFormatter#setCacheControlOnContent`: an existing marker
+/// on the target part is preserved (never overwritten).
+fn set_cache_control_on_content(message: &mut DashScopeMessage) {
+    let marker = ephemeral_cache_control();
+    match message.content.as_mut() {
+        Some(DashScopeContent::Text(text)) => {
+            let mut part = DashScopeContentPart::text(text.clone());
+            part.cache_control = Some(marker);
+            message.content = Some(DashScopeContent::Parts(vec![part]));
+        }
+        Some(DashScopeContent::Parts(parts)) => {
+            if let Some(last) = parts.last_mut() {
+                if last.cache_control.is_none() {
+                    last.cache_control = Some(marker);
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+/// Whether `message` already carries at least one content-level cache marker.
+fn has_cache_marker(message: &DashScopeMessage) -> bool {
+    match &message.content {
+        Some(DashScopeContent::Parts(parts)) => {
+            parts.iter().any(|p| p.cache_control.is_some())
+        }
+        _ => false,
+    }
+}
+
+/// Applies the automatic cache policy: when `options.cache_control == Some(true)`
+/// the final message and every system message (that is not already explicitly
+/// marked) receive a marker, capped at [`MAX_CACHE_MARKERS`] total markers.
+///
+/// Mirrors `DashScopeChatFormatter#applyAutomaticCacheControl`.
+pub fn apply_automatic_cache_control(messages: &mut [DashScopeMessage], options: &GenerateOptions) {
+    if messages.is_empty() || options.cache_control != Some(true) {
+        return;
+    }
+    let mut marker_count = messages.iter().filter(|m| has_cache_marker(m)).count();
+    if marker_count > MAX_CACHE_MARKERS {
+        return;
+    }
+    // Candidate indices: the final message, then each system message, in order.
+    let mut candidates: Vec<usize> = Vec::new();
+    let last = messages.len() - 1;
+    candidates.push(last);
+    for (i, m) in messages.iter().enumerate() {
+        if m.role.as_deref() == Some("system") {
+            candidates.push(i);
+        }
+    }
+    for index in candidates {
+        if marker_count >= MAX_CACHE_MARKERS {
+            break;
+        }
+        if has_cache_marker(&messages[index]) {
+            continue;
+        }
+        set_cache_control_on_content(&mut messages[index]);
+        marker_count += 1;
+    }
+}
+
+/// Whether `msg` explicitly requests caching via its `CACHE_CONTROL` metadata.
+fn metadata_cache_directive(msg: &Msg) -> Option<bool> {
+    msg.metadata
+        .get(agentscope_core::metadata_keys::CACHE_CONTROL)
+        .and_then(|v| v.as_bool())
+}
 
 /// DashScope native text-generation endpoint.
 pub const TEXT_GENERATION_ENDPOINT: &str =
@@ -315,13 +401,32 @@ pub fn to_dashscope_messages(
     messages
         .into_iter()
         .map(|msg| {
-            if force_multimodal || has_media_content(&msg) {
+            let explicit = metadata_cache_directive(&msg) == Some(true);
+            let mut converted = if force_multimodal || has_media_content(&msg) {
                 multimodal_message(&msg)
             } else {
                 simple_message(&msg)
+            };
+            // Explicit `Msg` metadata markers are emitted as supplied; the
+            // automatic pass (if enabled) only fills in unmarked boundaries.
+            if explicit {
+                set_cache_control_on_content(&mut converted);
             }
+            converted
         })
         .collect()
+}
+
+/// Converts messages and then applies the automatic cache policy from
+/// `options` (mirrors the request-scoped `format(msgs, options)` overload).
+pub fn to_dashscope_messages_with_options(
+    messages: Vec<Msg>,
+    force_multimodal: bool,
+    options: &GenerateOptions,
+) -> Vec<DashScopeMessage> {
+    let mut converted = to_dashscope_messages(messages, force_multimodal);
+    apply_automatic_cache_control(&mut converted, options);
+    converted
 }
 
 /// Converts tool schemas into DashScope tool definitions.
@@ -394,6 +499,8 @@ pub fn build_request(
         frequency_penalty: merged.frequency_penalty,
         presence_penalty: merged.presence_penalty,
         parallel_tool_calls: merged.parallel_tool_calls,
+        // DashScope accepts the effort string verbatim (low/medium/high).
+        reasoning_effort: merged.reasoning_effort.clone(),
         response_format: merged
             .response_format
             .as_ref()
@@ -629,9 +736,9 @@ mod tests {
     }
 
     #[test]
-    fn build_request_enables_thinking_for_budget() {
+    fn build_request_maps_reasoning_effort() {
         let runtime = GenerateOptions {
-            thinking_budget: Some(1024),
+            reasoning_effort: Some("high".to_string()),
             ..Default::default()
         };
         let req = build_request(
@@ -645,7 +752,68 @@ mod tests {
             false,
         );
         let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value["parameters"]["enable_thinking"], serde_json::json!(true));
-        assert_eq!(value["parameters"]["thinking_budget"], serde_json::json!(1024));
+        assert_eq!(value["parameters"]["reasoning_effort"], serde_json::json!("high"));
+
+        // Absent by default.
+        let req = build_request(
+            "qwen3-max",
+            to_dashscope_messages(vec![user("hi")], false),
+            false,
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            Vec::new(),
+            None,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(value["parameters"].get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn metadata_cache_control_marks_content_not_message() {
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .content(vec![ContentBlock::Text(TextBlock::new("hello"))])
+            .metadata_entry("_cache_control", serde_json::json!(true))
+            .build();
+        let msgs = to_dashscope_messages(vec![msg], false);
+        let value = serde_json::to_value(&msgs[0]).unwrap();
+        // The marker must live inside the content block, not at message level.
+        assert!(value.get("cache_control").is_none());
+        assert_eq!(
+            value["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(value["content"][0]["text"], serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn automatic_cache_control_marks_final_and_system_messages() {
+        let msgs = vec![
+            Msg::builder()
+                .role(MsgRole::System)
+                .content(vec![ContentBlock::Text(TextBlock::new("sys"))])
+                .build(),
+            user("hello"),
+        ];
+        let options = GenerateOptions { cache_control: Some(true), ..Default::default() };
+        let converted = to_dashscope_messages_with_options(msgs, false, &options);
+        let value = serde_json::to_value(&converted).unwrap();
+        assert_eq!(
+            value[0]["content"][0]["cache_control"]["type"],
+            serde_json::json!("ephemeral")
+        );
+        assert_eq!(
+            value[1]["content"][0]["cache_control"]["type"],
+            serde_json::json!("ephemeral")
+        );
+    }
+
+    #[test]
+    fn automatic_cache_control_disabled_by_default() {
+        let msgs = vec![user("hello")];
+        let converted = to_dashscope_messages_with_options(msgs, false, &GenerateOptions::default());
+        let value = serde_json::to_value(&converted).unwrap();
+        assert!(value[0]["content"][0].get("cache_control").is_none());
     }
 }

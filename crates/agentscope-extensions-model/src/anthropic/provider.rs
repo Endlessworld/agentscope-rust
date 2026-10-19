@@ -15,6 +15,9 @@ use crate::anthropic::model::{default_transport, AnthropicChatModel};
 /// Provider id used in `provider:model` ids.
 pub const PROVIDER_ID: &str = "anthropic";
 
+/// Environment variable consulted when no explicit base URL is supplied.
+pub const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+
 /// Context option carrying a bearer token for compatible gateways.
 pub const OPTION_AUTH_TOKEN: &str = "authToken";
 
@@ -93,11 +96,16 @@ impl ModelProvider for AnthropicModelProvider {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
+        let base_url = crate::common::resolve_base_url(
+            ctx.base_url.clone(),
+            BASE_URL_ENV,
+            crate::anthropic::credential::DEFAULT_BASE_URL,
+        );
         let mut model = AnthropicChatModel::new(
             model_name,
             auth_mode,
             secret,
-            ctx.base_url.clone(),
+            Some(base_url),
             default_transport(),
         )
         .with_default_options(ctx.options.clone())

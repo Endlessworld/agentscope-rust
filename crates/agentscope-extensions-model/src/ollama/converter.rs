@@ -414,6 +414,32 @@ mod tests {
     }
 
     #[test]
+    fn build_request_carries_native_schema_format() {
+        use agentscope_core::formatter::{JsonSchema, ResponseFormat};
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        let mut gen = agentscope_core::GenerateOptions::default();
+        gen.response_format = Some(ResponseFormat::json_schema(JsonSchema::new(
+            "Weather",
+            schema.clone(),
+        )));
+        let runtime = OllamaOptions::from_generate_options(&gen);
+        let request = build_request(
+            "llama3",
+            vec![OllamaMessage::new("user", "hi")],
+            false,
+            &runtime,
+            &OllamaOptions::default(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(request.format, Some(serde_json::Value::Object(schema)));
+        // The schema must be a top-level `format`, never nested under `options`.
+        let opts = request.options.unwrap_or_default();
+        assert!(!opts.contains_key("format"));
+    }
+
+    #[test]
     fn tools_convert_with_schema_and_empty_description() {
         let mut params = serde_json::Map::new();
         params.insert("type".into(), serde_json::json!("object"));

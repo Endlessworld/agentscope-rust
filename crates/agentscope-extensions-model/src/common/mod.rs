@@ -12,6 +12,7 @@
 //! ([`diagnostics`]), media resolution ([`media`]) and model-name mapping
 //! ([`model_map`]).
 
+pub mod base_url;
 pub mod capabilities;
 pub mod diagnostics;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod model_map;
 pub mod transport;
 pub mod usage;
 
+pub use base_url::{resolve_base_url, resolve_base_url_with};
 pub use capabilities::{resolve_capabilities, ModelCapabilities};
 pub use diagnostics::{ConversionDiagnostic, Diagnostics, Severity};
 pub use error::{ErrorKind, ModelError};

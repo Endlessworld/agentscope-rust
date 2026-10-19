@@ -370,7 +370,7 @@ mod tests {
                 ContentBlock::Text(TextBlock::new("hello")),
                 ContentBlock::ToolUse(ToolUseBlock::new("call_1", "get_weather", input)),
             ],
-            ChatUsage { input_tokens: 11, output_tokens: 4, cached_tokens: 0, time: 0.0 },
+            ChatUsage { input_tokens: 11, output_tokens: 4, cached_tokens: 0, time: 0.0, ..Default::default() },
             None,
             Some("tool_calls".to_string()),
         )
