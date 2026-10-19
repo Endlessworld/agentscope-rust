@@ -31,4 +31,16 @@ pub mod metadata_keys {
 
     /// Metadata key (string) describing the kind of synthetic reminder, e.g. "todo_state".
     pub const REMINDER_KIND: &str = "agentscope_reminder_kind";
+
+    /// Metadata key (bool) marking an assistant message synthesized by the
+    /// `returnDirect` tool path — the tool result presented as the turn's final
+    /// answer. Mirrors Java `MessageMetadataKeys.TOOL_RETURN_DIRECT`.
+    pub const TOOL_RETURN_DIRECT: &str = "_tool_return_direct";
+
+    /// Metadata key (string) carrying the `GenerateReason` name behind a text
+    /// projection. Attached to the `TextBlock` events synthesized for a
+    /// `returnDirect` closing message so observers can distinguish "the model said
+    /// this" from "a tool result was substituted for the model's final answer".
+    /// Mirrors Java `AgentEvent.METADATA_GENERATE_REASON`.
+    pub const EVENT_GENERATE_REASON: &str = "generate_reason";
 }

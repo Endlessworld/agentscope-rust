@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use agentscope_core::{
     DefaultToolResultConverter, Error, FunctionTool, JsonMap, MsgRole, ToolExecutionContext,
-    ToolRegistration, ToolResultBlock, ToolResultConverter, ToolResultMessageBuilder,
+    ToolRegistration, ToolResultBlock, ToolResultConverter, ToolResultMessageBuilder, ToolResultState,
     ToolSuspendException, ToolUseBlock, Toolkit, is_dangerous_command, is_dangerous_path,
 };
 
@@ -55,7 +55,10 @@ async fn suspended_tool_returns_suspended_block() {
         .expect("suspended is a success result");
     assert!(rb.is_suspended(), "result should be flagged suspended");
     assert_eq!(rb.id.as_deref(), Some("c1"));
-    assert_eq!(rb.text_content(), "needs human");
+    // Java #3435: a suspended result carries NO output; the reason travels in metadata.
+    assert_eq!(rb.state, ToolResultState::Suspended);
+    assert_eq!(rb.suspend_reason(), Some("needs human"));
+    assert_eq!(rb.text_content(), "");
 }
 
 #[test]

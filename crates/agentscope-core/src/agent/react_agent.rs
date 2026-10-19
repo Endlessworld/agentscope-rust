@@ -205,6 +205,16 @@ impl ReActAgent {
         self.core.model.lock().unwrap().clone()
     }
 
+    /// Returns the shared, call-scoped agent-state handle.
+    ///
+    /// Exposes the same `Arc<Mutex<AgentState>>` the runner uses, so host-provided
+    /// tools (e.g. plan-mode control tools) can read/update persisted session state
+    /// such as `plan_mode_context` across turns. Mirrors Java tools reaching state via
+    /// `RuntimeContext.resolveAgentState(...)`.
+    pub fn state_handle(&self) -> Arc<Mutex<AgentState>> {
+        Arc::clone(&self.core.state)
+    }
+
     /// Replaces the model bound to this agent. The next reasoning call uses the
     /// new model while preserving accumulated conversation state.
     pub fn set_model(&self, model: Arc<dyn Model>) {
@@ -452,12 +462,20 @@ impl ReActAgent {
         for m in messages {
             state.context_mut().push(m);
         }
-        state.context_mut().push(structured_output_reminder(&schema));
+        // The reminder is request-local: it steers this retry request only and never
+        // enters `state.context`, so hooks, middleware and session persistence observe
+        // only the caller's real messages (Java `appendTransientSoToolReminder`).
+        let so_reminder = structured_output_reminder(&schema);
 
         let tools = toolkit.tool_schemas();
         let mut last_text = String::new();
+        // The assistant message that produced the structured output. Its identity and
+        // token accounting are carried over to the rebuilt reply below.
+        let mut so_reply: Option<Msg> = None;
         for _ in 0..self.core.max_iters {
-            let msgs = state.context().to_vec();
+            let mut msgs = state.context().to_vec();
+            // Append the transient reminder to the request-local copy only.
+            msgs.push(so_reminder.clone());
             let model = self.core.model.lock().unwrap().clone();
             let options = GenerateOptions::builder()
                 .model_name(model.model_name())
@@ -469,11 +487,9 @@ impl ReActAgent {
             let mut gen_called = false;
             for tc in msg.tool_use_blocks() {
                 if tc.name == STRUCTURED_OUTPUT_TOOL_NAME {
-                    let tctx = crate::tool::ToolExecutionContext {
-                        tool_call: Some(tc.clone()),
-                        runtime: Default::default(),
-                        emitter: None,
-                    };
+                    // No delta channel here: the structured-output retry path is not
+                    // streamed, so the emitter (still carrying the call id) discards.
+                    let tctx = tool_execution_context(tc, Default::default(), &None);
                     if let Ok(rb) = toolkit.call_tool(tc, tctx).await {
                         state.context_mut().push(
                             Msg::builder()
@@ -486,6 +502,7 @@ impl ReActAgent {
                 }
             }
             if gen_called {
+                so_reply = Some(msg.clone());
                 break;
             }
             if msg.tool_use_blocks().next().is_none() {
@@ -507,10 +524,20 @@ impl ReActAgent {
             Some(v) => serde_json::to_string(v).unwrap_or_default(),
             None => last_text,
         };
-        let mut reply = Msg::builder()
+        let mut builder = Msg::builder()
             .role(MsgRole::Assistant)
-            .content(vec![ContentBlock::Text(TextBlock::new(text))])
-            .build();
+            .content(vec![ContentBlock::Text(TextBlock::new(text))]);
+        // Rebuilding the reply must not mint a fresh id/timestamp nor drop the token
+        // usage: those belong to the original reply (Java `extractResponseData`, commit
+        // c2ff087ca). Only reached once the `generate_response` tool actually ran
+        // (Java's `soCompleted` guard).
+        if let Some(src) = &so_reply {
+            builder = builder.id(src.id()).timestamp(src.timestamp());
+            if let Some(usage) = src.usage() {
+                builder = builder.usage(*usage);
+            }
+        }
+        let mut reply = builder.build();
         if let Some(s) = structured {
             reply = reply.with_structured_data(s);
         }
@@ -757,6 +784,14 @@ async fn run_agent_loop(
 ) -> Result<Msg> {
     let mut state = core.state.lock().unwrap().clone();
 
+    // The call-scoped state is now bound: notify the middlewares that participate in
+    // `OnAgentStateReady` before the input enters the pipeline. This is the only seam
+    // that exposes the state a call will actually use *before* that input is
+    // persisted (session bootstrapping, state-driven decisions, per-session audit).
+    // Mirrors Java `ReActAgent.beforeAgentExecution`.
+    core.middleware_chain
+        .notify_agent_state_ready(ctx, &mut state, &messages);
+
     // Mirrors Java `doCallInner`: when the previous turn left unresolved tool calls,
     // decide how to proceed *before* appending the new input. Two of Java's four
     // branches are ported — recovery (patch orphans) and the fail-fast guard below.
@@ -790,6 +825,9 @@ async fn run_agent_loop(
         state.context_mut().push(m);
     }
     state.set_cur_iter(0);
+    // Snapshot plan mode so a plan-control tool's direct write to the shared state can
+    // be detected and carried over (the loop otherwise runs on a private clone).
+    let plan_mode_at_start = state.plan_mode_context.clone();
     let result = match execute_iteration(core, ctx, &mut state, 0).await {
         // An interrupt is not a failure: reconcile the dangling tool_use left by
         // the interrupted turn and append a recovery message, so the caller sees
@@ -804,10 +842,17 @@ async fn run_agent_loop(
     // resumes instead of replaying from the previous turn boundary. Mirrors
     // Java, where `scope.state` is mutated in place and
     // `saveStateAfterCallFailure` persists it on the error path.
-    *core.state.lock().unwrap() = state;
+    {
+        let mut shared = core.state.lock().unwrap();
+        // Carry over plan-mode updates a plan-control tool made directly on the shared
+        // state (the loop ran on a private clone; only rebind when it actually changed).
+        if shared.plan_mode_context != plan_mode_at_start {
+            state.plan_mode_context = shared.plan_mode_context.clone();
+        }
+        *shared = state;
+    }
     result
 }
-
 async fn execute_iteration(
     core: &Arc<AgentCore>,
     ctx: &crate::agent::RuntimeContext,
@@ -818,12 +863,12 @@ async fn execute_iteration(
         let msg = reasoning_phase(core, ctx, state, iter).await?;
         let reason = msg.generate_reason();
         let has_tool_calls = msg.tool_use_blocks().next().is_some();
-        let suspended = match reason {
+        let outcome = match reason {
             GenerateReason::ModelStop | GenerateReason::ToolCalls => {
                 if has_tool_calls {
-                    let suspended = acting_phase(core, ctx, state).await?;
+                    let outcome = acting_phase(core, ctx, state).await?;
                     iter += 1;
-                    suspended
+                    outcome
                 } else {
                     return Ok(msg);
                 }
@@ -833,19 +878,173 @@ async fn execute_iteration(
             }
             _ => {
                 if has_tool_calls {
-                    let suspended = acting_phase(core, ctx, state).await?;
+                    let outcome = acting_phase(core, ctx, state).await?;
                     iter += 1;
-                    suspended
+                    outcome
                 } else {
                     return Ok(msg);
                 }
             }
         };
-        if suspended {
+        if outcome.return_direct {
+            // returnDirect short-circuit: the successful tool result *is* the turn's
+            // final answer, so no further reasoning iteration runs. The closing
+            // assistant message is synthesized from the executed results and returned
+            // with `GenerateReason::ToolReturnDirect`. Mirrors Java
+            // `finalizeReturnDirect`, which is shared by the in-framework and the
+            // external-resume path.
+            let closing = build_return_direct_result(ctx, &outcome.results);
+            state.context_mut().push(closing.clone());
+            publish_return_direct_text_events(ctx, &closing);
+            return Ok(closing);
+        }
+        if outcome.suspended {
             return Ok(msg.with_generate_reason(GenerateReason::ToolSuspended));
         }
     }
 }
+
+/// The result of one acting phase.
+#[derive(Default)]
+struct ActingOutcome {
+    /// At least one tool call suspended itself and awaits external execution.
+    suspended: bool,
+    /// Every executed tool declared `returnDirect` and succeeded, so the batch's
+    /// results are the turn's final answer (no follow-up model call).
+    return_direct: bool,
+    /// The executed results, in tool-call order (used to build the closing message).
+    results: Vec<ToolResultBlock>,
+}
+
+/// Synthesizes the closing assistant message of a `returnDirect` turn, mirroring
+/// Java `buildReturnDirectResultMsg`.
+///
+/// The output blocks are concatenated in execution order (= the model's tool_calls
+/// order) without inlining tool names or separators: like a model-generated summary,
+/// the message carries no per-block provenance. A tool whose result has zero content
+/// blocks contributes nothing; only when the whole batch yields zero blocks is a
+/// defensive `"(no output)"` placeholder inserted, keeping the message non-empty for
+/// providers that reject empty assistant content.
+fn build_return_direct_result(
+    ctx: &crate::agent::RuntimeContext,
+    results: &[ToolResultBlock],
+) -> Msg {
+    let mut content: Vec<ContentBlock> = Vec::new();
+    for rb in results {
+        content.extend(rb.output.iter().cloned());
+    }
+    if content.is_empty() {
+        content.push(ContentBlock::Text(TextBlock::new("(no output)")));
+    }
+    let mut metadata = JsonMap::new();
+    metadata.insert(
+        crate::message::metadata_keys::TOOL_RETURN_DIRECT.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let mut builder = Msg::builder()
+        .role(MsgRole::Assistant)
+        .content(content)
+        .metadata(metadata)
+        .generate_reason(GenerateReason::ToolReturnDirect);
+    if let Some(name) = ctx.agent_name.as_deref() {
+        builder = builder.name(name);
+    }
+    builder.build()
+}
+
+/// Emits the standard text-block lifecycle (`TextBlockStart` → `TextBlockDelta` →
+/// `TextBlockEnd`) for a `returnDirect` closing message, so event-stream consumers
+/// (AG-UI, A2A, ...) see the same projection as for a model-generated final answer.
+///
+/// The delta carries the `generate_reason` metadata key set to `TOOL_RETURN_DIRECT`,
+/// letting observers distinguish "the model said this" from "a tool result was
+/// substituted for the model's final answer". Non-text blocks emit nothing and still
+/// travel via the message-level result event.
+fn publish_return_direct_text_events(ctx: &crate::agent::RuntimeContext, closing: &Msg) {
+    let reply_id = closing.id().to_string();
+    for block in closing.content() {
+        let ContentBlock::Text(t) = block else {
+            continue;
+        };
+        let block_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let mut start = JsonMap::new();
+        start.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+        start.insert("block_id".to_string(), serde_json::Value::String(block_id.clone()));
+        start.insert(
+            "block_type".to_string(),
+            serde_json::Value::String("text".to_string()),
+        );
+        emit_delta(
+            &ctx.delta_tx,
+            AgentEvent::with_fields(AgentEventType::TextBlockStart, start),
+        );
+
+        let mut delta = JsonMap::new();
+        delta.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+        delta.insert("block_id".to_string(), serde_json::Value::String(block_id.clone()));
+        delta.insert(
+            "block_type".to_string(),
+            serde_json::Value::String("text".to_string()),
+        );
+        delta.insert("delta".to_string(), serde_json::Value::String(t.text.clone()));
+        emit_delta(
+            &ctx.delta_tx,
+            AgentEvent::with_fields(AgentEventType::TextBlockDelta, delta).with_metadata(
+                crate::message::metadata_keys::EVENT_GENERATE_REASON,
+                serde_json::Value::String("TOOL_RETURN_DIRECT".to_string()),
+            ),
+        );
+
+        let mut end = JsonMap::new();
+        end.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+        end.insert("block_id".to_string(), serde_json::Value::String(block_id));
+        end.insert(
+            "block_type".to_string(),
+            serde_json::Value::String("text".to_string()),
+        );
+        emit_delta(
+            &ctx.delta_tx,
+            AgentEvent::with_fields(AgentEventType::TextBlockEnd, end),
+        );
+    }
+}
+
+/// Whether a tool result may participate in the `returnDirect` short-circuit: the
+/// tool declared `returnDirect` and its result actually succeeded. `Denied` /
+/// `Error` / `Interrupted` / `Suspended` results must never be presented as the
+/// final answer. Mirrors Java `isReturnDirectToolCall`.
+fn is_return_direct_result(core: &Arc<AgentCore>, rb: &ToolResultBlock) -> bool {
+    if rb.final_state() != ToolResultState::Success {
+        return false;
+    }
+    rb.name
+        .as_deref()
+        .and_then(|name| core.toolkit.get_tool(name))
+        .map(|t| t.is_return_direct())
+        .unwrap_or(false)
+}
+
+/// The placeholder-shaped [`ToolResultBlock`] persisted in place of a `returnDirect`
+/// tool's real result: same id/name/state, output swapped for the placeholder
+/// sentence. Mirrors Java `placeholderResultBlock`.
+fn placeholder_result_block(rb: &ToolResultBlock) -> ToolResultBlock {
+    ToolResultBlock {
+        id: rb.id.clone(),
+        name: rb.name.clone(),
+        output: vec![ContentBlock::Text(TextBlock::new(
+            RETURN_DIRECT_PLACEHOLDER,
+        ))],
+        metadata: rb.metadata.clone(),
+        state: rb.state,
+    }
+}
+
+/// Placeholder sentence written to the `tool_result` of a `returnDirect` tool.
+///
+/// The real result is lifted into the closing assistant message, so the context
+/// keeps `[tool_use, tool_result(placeholder), assistant(full result)]` and the
+/// model never sees the payload duplicated.
+const RETURN_DIRECT_PLACEHOLDER: &str = "Tool call completed. The result has been presented to the user as the final output of this turn.";
 
 /// Runs one reasoning phase: check interrupt, possibly summarize if over budget,
 /// build the model input and run the (middleware-wrapped) model call. Appends the
@@ -1032,6 +1231,7 @@ fn emit_tool_result_end(
         ToolResultState::Denied => "DENIED",
         ToolResultState::Running => "RUNNING",
         ToolResultState::Interrupted => "ERROR",
+        ToolResultState::Suspended => "SUSPENDED",
     };
     fields.insert("state".to_string(), serde_json::Value::String(state_str.to_string()));
     if !metadata.is_empty() {
@@ -1041,6 +1241,53 @@ fn emit_tool_result_end(
         );
     }
     emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields));
+}
+
+/// Emits a `RequireExternalExecution` event through the delta_tx channel for a tool
+/// call that suspended itself pending out-of-process execution.
+///
+/// Java #3435: this is the **single** signal for a suspended call — no
+/// ToolResultTextDelta/ToolResultEnd is emitted for it, because the framework must
+/// not fabricate a result it never produced. The event carries the suspended call's
+/// id/name (flat fields, matching the other tool events) plus the suspend reason and,
+/// mirroring Java `RequireExternalExecutionEvent.getToolCalls()`, the call itself under
+/// `tool_calls` in the same shape the `REQUIRE_USER_CONFIRM` payload uses.
+fn emit_require_external_execution(
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    reply_id: &str,
+    call: &ToolUseBlock,
+    reason: Option<&str>,
+) {
+    let mut fields = JsonMap::new();
+    fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.to_string()));
+    fields.insert("tool_call_id".to_string(), serde_json::Value::String(call.id.clone()));
+    fields.insert("tool_name".to_string(), serde_json::Value::String(call.name.clone()));
+    if let Some(reason) = reason.filter(|r| !r.is_empty()) {
+        fields.insert("reason".to_string(), serde_json::Value::String(reason.to_string()));
+    }
+    fields.insert(
+        "tool_calls".to_string(),
+        serde_json::to_value(std::slice::from_ref(call)).unwrap_or(serde_json::Value::Array(Vec::new())),
+    );
+    emit_delta(
+        delta_tx,
+        AgentEvent::with_fields(AgentEventType::RequireExternalExecution, fields),
+    );
+}
+
+/// The id of the current turn's reply: the last assistant message in the context.
+///
+/// Acting runs after the reasoning phase appended that message, so this is the reply
+/// whose tool calls are being executed (Java correlates the event through
+/// `RequireExternalExecutionEvent.getReplyId()`).
+fn current_reply_id(state: &AgentState) -> String {
+    state
+        .context()
+        .iter()
+        .rev()
+        .find(|m| m.role() == MsgRole::Assistant)
+        .map(|m| m.id().to_string())
+        .unwrap_or_default()
 }
 
 /// Builds a text/thinking delta event carrying the given incremental text.
@@ -1287,6 +1534,58 @@ async fn model_call_impl(
     }
 }
 
+/// Builds the chunk callback handed to a tool through its emitter.
+///
+/// Each emitted chunk is forwarded as a `ToolResultDataDelta` event carrying the
+/// originating tool call's id/name, so consumers can correlate streamed progress
+/// with the exact call. Returns `None` when the call has no event channel (e.g.
+/// structured-output retries), in which case the emitter silently discards chunks.
+fn tool_chunk_callback(
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    call: &ToolUseBlock,
+) -> Option<crate::tool::ChunkCallback> {
+    let tx = delta_tx.clone()?;
+    let id = call.id.clone();
+    let name = call.name.clone();
+    Some(Arc::new(move |chunk: ToolResultBlock| {
+        for block in chunk.output {
+            let mut fields = JsonMap::new();
+            fields.insert("tool_call_id".to_string(), serde_json::Value::String(id.clone()));
+            fields.insert("tool_name".to_string(), serde_json::Value::String(name.clone()));
+            fields.insert(
+                "data".to_string(),
+                serde_json::to_value(&block).unwrap_or(serde_json::Value::Null),
+            );
+            let _ = tx.unbounded_send(Ok(AgentEvent::with_fields(
+                AgentEventType::ToolResultDataDelta,
+                fields,
+            )));
+        }
+    }))
+}
+
+/// Builds the [`ToolExecutionContext`] for a tool call, including a streaming
+/// emitter that knows the call id.
+///
+/// Java always hands each invocation its own `DefaultToolEmitter` built from the
+/// `ToolUseBlock`, so a tool can read back the id of the call it is servicing
+/// (`ToolEmitter.getToolCallId()`) as well as stream progress. Passing `None`
+/// here would make the id unreachable and turn `emit` into a silent no-op.
+fn tool_execution_context(
+    call: &ToolUseBlock,
+    runtime: JsonMap,
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+) -> ToolExecutionContext {
+    ToolExecutionContext {
+        tool_call: Some(call.clone()),
+        runtime,
+        emitter: Some(crate::tool::tool_emitter_for_call(
+            call,
+            tool_chunk_callback(delta_tx, call),
+        )),
+    }
+}
+
 /// Builds the JSON runtime exposed to a tool call, carrying the call-scoped
 /// identity (session / user / agent) plus any metadata the agent recorded.
 fn tool_runtime(ctx: &crate::agent::RuntimeContext) -> JsonMap {
@@ -1305,21 +1604,54 @@ fn tool_runtime(ctx: &crate::agent::RuntimeContext) -> JsonMap {
 
 /// Executes the pending tool calls from the last assistant message and feeds the
 /// results back into the context. The outer loop decides whether to continue.
+///
+/// Beyond the fed-back results, the phase reports whether a `returnDirect`
+/// short-circuit applies (every executed tool declared it and succeeded). In that
+/// case the results written to the context are replaced by placeholder-shaped
+/// copies — the real payload travels back in [`ActingOutcome::results`] and becomes
+/// the closing assistant message — keeping the context invariant
+/// `[tool_use, tool_result(placeholder), assistant(full result)]`. Mirrors Java
+/// `acting` + `notifyPostActingHook`.
 async fn acting_phase(
     core: &Arc<AgentCore>,
     ctx: &crate::agent::RuntimeContext,
     state: &mut AgentState,
-) -> Result<bool> {
+) -> Result<ActingOutcome> {
     check_interrupted(core)?;
     let pending = extract_pending_tool_calls(state);
     if pending.is_empty() {
-        return Ok(false);
+        return Ok(ActingOutcome::default());
     }
 
     let mut results = Vec::new();
     let mut suspended = false;
+    let mut return_direct_eligible = true;
+    let mut executed = 0usize;
+    let reply_id = current_reply_id(state);
     let runtime = tool_runtime(ctx);
     for call in &pending {
+        // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`): while plan
+        // mode is active, only read-only tools and the always-allowed orchestration/plan
+        // tools may run; every other call gets a synthetic DENIED result without executing.
+        if plan_mode_denies(core, state, call) {
+            emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+            emit_tool_result_text_delta(
+                &ctx.delta_tx,
+                &call.id,
+                &call.name,
+                PLAN_MODE_DENY_MESSAGE,
+            );
+            return_direct_eligible = false;
+            results.push(denied_result(call, PLAN_MODE_DENY_MESSAGE));
+            emit_tool_result_end(
+                &ctx.delta_tx,
+                &call.id,
+                &call.name,
+                ToolResultState::Denied,
+                &JsonMap::new(),
+            );
+            continue;
+        }
         let decision = evaluate_permission(core, call);
         match decision.behavior {
             PermissionBehavior::Deny => {
@@ -1327,17 +1659,15 @@ async fn acting_phase(
                 emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
                 let denied_text = "Permission denied by rules";
                 emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
-                results.push(denied_result(call, &decision.message));
+                let denied = denied_result(call, &decision.message);
+                return_direct_eligible = false;
+                results.push(denied);
                 emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
             }
             PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
                 // Emit ToolResultStart for this tool execution.
                 emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
-                let tctx = ToolExecutionContext {
-                    tool_call: Some(call.clone()),
-                    runtime: runtime.clone(),
-                    emitter: None,
-                };
+                let tctx = tool_execution_context(call, runtime.clone(), &ctx.delta_tx);
                 match core.toolkit.call_tool(call, tctx).await {
                     Ok(rb) => {
                         // Emit text delta for non-streaming results (streaming tools
@@ -1351,16 +1681,35 @@ async fn acting_phase(
                         if !result_text.trim().is_empty() {
                             emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &result_text);
                         }
-                        let final_state = if rb.state == ToolResultState::Error { ToolResultState::Error } else { ToolResultState::Success };
+                        // Java #3435: a suspended call must not fabricate a result — no
+                        // ToolResultEnd event is emitted (the external-execution requirement
+                        // is the single signal). The block still carries `Suspended` state.
+                        let was_suspended = rb.is_suspended();
+                        let suspend_reason = rb.suspend_reason().map(str::to_string);
+                        let final_state = rb.final_state();
                         let metadata = rb.metadata.clone();
                         let bound = bind_result(call, rb);
                         suspended = suspended || bound.is_suspended();
+                        executed += 1;
+                        if !is_return_direct_result(core, &bound) {
+                            return_direct_eligible = false;
+                        }
                         results.push(bound);
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
+                        if was_suspended {
+                            emit_require_external_execution(
+                                &ctx.delta_tx,
+                                &reply_id,
+                                call,
+                                suspend_reason.as_deref(),
+                            );
+                        } else {
+                            emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
+                        }
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
                         emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &err_msg);
+                        return_direct_eligible = false;
                         results.push(error_result(call, &err_msg));
                         emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
                     }
@@ -1377,11 +1726,11 @@ async fn acting_phase(
                         // Use the (possibly modified) tool call if the user tweaked input.
                         let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
                         emit_tool_result_start(&ctx.delta_tx, &effective_call.id, &effective_call.name);
-                        let tctx = ToolExecutionContext {
-                            tool_call: Some(effective_call.clone()),
-                            runtime: runtime.clone(),
-                            emitter: None,
-                        };
+                        let tctx = tool_execution_context(
+                            effective_call,
+                            runtime.clone(),
+                            &ctx.delta_tx,
+                        );
                         match core.toolkit.call_tool(effective_call, tctx).await {
                             Ok(rb) => {
                                 let mut result_text = String::new();
@@ -1393,16 +1742,32 @@ async fn acting_phase(
                                 if !result_text.trim().is_empty() {
                                     emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
                                 }
-                                let final_state = if rb.state == ToolResultState::Error { ToolResultState::Error } else { ToolResultState::Success };
+                                let was_suspended = rb.is_suspended();
+                                let suspend_reason = rb.suspend_reason().map(str::to_string);
+                                let final_state = rb.final_state();
                                 let metadata = rb.metadata.clone();
                                 let bound = bind_result(effective_call, rb);
                                 suspended = suspended || bound.is_suspended();
+                                executed += 1;
+                                if !is_return_direct_result(core, &bound) {
+                                    return_direct_eligible = false;
+                                }
                                 results.push(bound);
-                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
+                                if was_suspended {
+                                    emit_require_external_execution(
+                                        &ctx.delta_tx,
+                                        &reply_id,
+                                        effective_call,
+                                        suspend_reason.as_deref(),
+                                    );
+                                } else {
+                                    emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
+                                }
                             }
                             Err(e) => {
                                 let err_msg = e.to_string();
                                 emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
+                                return_direct_eligible = false;
                                 results.push(error_result(effective_call, &err_msg));
                                 emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
                             }
@@ -1411,6 +1776,7 @@ async fn acting_phase(
                         // User denied the tool call.
                         let denied_text = &confirm_result.message;
                         emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
+                        return_direct_eligible = false;
                         results.push(denied_result(call, denied_text));
                         emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
                     }
@@ -1424,12 +1790,38 @@ async fn acting_phase(
         }
     }
 
+    // A returnDirect batch short-circuits only when at least one tool ran and every
+    // executed result was a returnDirect success; a suspended/denied/errored result
+    // disqualifies the whole batch (Java: `pendingPairs.isEmpty() && !successPairs.isEmpty()
+    // && allMatch(isReturnDirectToolCall)`).
+    let return_direct = return_direct_eligible && !suspended && executed > 0;
+
+    // On a short-circuit the payload moves to the closing assistant message, so the
+    // context gets placeholder-shaped copies instead. The messages are built from the
+    // pre-hook execution results (`results`), which is what `ActingOutcome::results`
+    // also carries back to the caller.
+    let persisted: Vec<ContentBlock> = if return_direct {
+        results
+            .iter()
+            .map(|rb| ContentBlock::ToolResult(placeholder_result_block(rb)))
+            .collect()
+    } else {
+        results
+            .iter()
+            .cloned()
+            .map(ContentBlock::ToolResult)
+            .collect()
+    };
     let result_msg = Msg::builder()
         .role(MsgRole::Tool)
-        .content(results.into_iter().map(ContentBlock::ToolResult).collect())
+        .content(persisted)
         .build();
     state.context_mut().push(result_msg);
-    Ok(suspended)
+    Ok(ActingOutcome {
+        suspended,
+        return_direct,
+        results,
+    })
 }
 
 /// Produces the termination message when the maximum number of iterations is hit.
@@ -1603,6 +1995,44 @@ fn reconcile_interrupted(state: &mut AgentState) -> Msg {
     recovery
 }
 
+/// Tool names always permitted while plan mode is active, mirroring Java
+/// `PlanModeMiddleware.ALWAYS_ALLOWED`: the plan-control tools plus the read-only
+/// orchestration tools (sub-agent spawn/send/list, async task output/list).
+const PLAN_MODE_ALWAYS_ALLOWED: &[&str] = &[
+    "plan_enter",
+    "plan_write",
+    "plan_exit",
+    "todo_write",
+    "agent_spawn",
+    "agent_send",
+    "agent_list",
+    "task_output",
+    "task_list",
+];
+
+/// Message returned for a tool call denied by plan mode (mirrors Java `DENY_MESSAGE`).
+const PLAN_MODE_DENY_MESSAGE: &str = "Blocked: you are in PLAN mode (read-only). You may \
+investigate and run read-only tools, record your plan with plan_write, and call plan_exit when \
+ready to execute. Do not modify files or run mutating commands until the plan is approved.";
+
+/// Whether plan mode forbids executing `call`: active plan mode denies everything except
+/// read-only tools and [`PLAN_MODE_ALWAYS_ALLOWED`]. Mirrors Java
+/// `PlanModeMiddleware.onActing`.
+fn plan_mode_denies(core: &Arc<AgentCore>, state: &AgentState, call: &ToolUseBlock) -> bool {
+    if !state.plan_mode_context.plan_active {
+        return false;
+    }
+    if PLAN_MODE_ALWAYS_ALLOWED.contains(&call.name.as_str()) {
+        return false;
+    }
+    let is_read_only = core
+        .toolkit
+        .get_tool(&call.name)
+        .map(|t| t.is_read_only())
+        .unwrap_or(false);
+    !is_read_only
+}
+
 /// Evaluates the permission decision for a single tool invocation.
 fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> PermissionDecision {
     // An unconfigured (trivial) permission context allows all tool calls, so a
@@ -1624,13 +2054,20 @@ fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> Permission
 }
 
 /// Binds a tool's raw result block back to the originating call.
+///
+/// The state is normalized through [`ToolResultBlock::final_state`] (Java
+/// `determineToolResultState`) so the block persisted in the context carries the
+/// real terminal state (`Success`/`Error`/`Suspended`) instead of the `Running`
+/// default that built-in tools leave behind. Without it, history queries via the
+/// agent state would always observe `RUNNING` (Java #2745).
 fn bind_result(call: &ToolUseBlock, rb: ToolResultBlock) -> ToolResultBlock {
+    let state = rb.final_state();
     ToolResultBlock {
         id: Some(call.id.clone()),
         name: Some(call.name.clone()),
         output: rb.output,
         metadata: rb.metadata,
-        state: rb.state,
+        state,
     }
 }
 
@@ -1738,6 +2175,223 @@ mod tests {
         ))
     }
 
+    /// A returnDirect tool: its successful result becomes the turn's final answer.
+    fn return_direct_tool(payload: &'static str) -> Arc<dyn Tool> {
+        Arc::new(
+            crate::tool::FunctionTool::new(
+                "final_answer",
+                "returns the turn's final answer",
+                serde_json::json!({"type": "object"}),
+                Box::new(move |_args: JsonMap, _ctx: ToolExecutionContext| {
+                    Ok(ToolResultBlock::success(payload))
+                }),
+            )
+            .return_direct(true),
+        )
+    }
+
+    #[tokio::test]
+    async fn return_direct_tool_short_circuits_the_loop() {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(return_direct_tool("the final answer"));
+        // A second model response is queued: if the loop failed to short-circuit it
+        // would be consumed and the reply would be "should not happen".
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c-rd", "final_answer", JsonMap::new()),
+                text_response("should not happen"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("go")]).await.unwrap();
+
+        assert_eq!(reply.text_content(), "the final answer");
+        assert_eq!(reply.generate_reason(), GenerateReason::ToolReturnDirect);
+        assert_eq!(
+            reply
+                .metadata()
+                .get(crate::message::metadata_keys::TOOL_RETURN_DIRECT),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn return_direct_context_keeps_a_placeholder_tool_result() {
+        // The payload moves to the closing assistant message, so the persisted context
+        // must hold `[tool_use, tool_result(placeholder), assistant(full result)]`
+        // rather than duplicating the payload back to the model.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(return_direct_tool("payload only once"));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c-rd2", "final_answer", JsonMap::new()),
+                text_response("should not happen"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4-placeholder")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("go")]).await.unwrap();
+
+        let state = agent.agent_state();
+        let tool_result = state
+            .context()
+            .iter()
+            .flat_map(|m| m.tool_result_blocks())
+            .find(|rb| rb.id.as_deref() == Some("c-rd2"))
+            .expect("placeholder tool result persisted");
+        assert_eq!(tool_result.state, ToolResultState::Success);
+        assert!(
+            !tool_result.text_content().contains("payload only once"),
+            "payload must not be duplicated into the tool result: {}",
+            tool_result.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_return_direct_tool_does_not_short_circuit() {
+        // The flag is per-tool: an ordinary tool must keep feeding results back.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(2));
+        input.insert("b".to_string(), serde_json::json!(3));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("the answer is 5"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4-off")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "the answer is 5");
+        assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+    }
+
+    #[tokio::test]
+    async fn mixed_return_direct_batch_is_fed_back_to_the_model() {
+        // Java: a batch takes effect only when *every* executed tool is returnDirect.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(return_direct_tool("direct"));
+        toolkit.register_tool(add_tool(Arc::new(Mutex::new(0))));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(1));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                ChatResponse::builder()
+                    .content(vec![
+                        ContentBlock::ToolUse(ToolUseBlock::new(
+                            "c-rd3",
+                            "final_answer",
+                            JsonMap::new(),
+                        )),
+                        ContentBlock::ToolUse(ToolUseBlock::new("c-add3", "add", input)),
+                    ])
+                    .build(),
+                text_response("the model summarized both"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4-mixed")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("go")]).await.unwrap();
+        assert_eq!(reply.text_content(), "the model summarized both");
+        assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+    }
+
+    #[tokio::test]
+    async fn failing_return_direct_tool_does_not_short_circuit() {
+        // A failed tool must never be presented as the final answer (Java:
+        // DENIED/ERROR/INTERRUPTED disqualify the batch).
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(
+            crate::tool::FunctionTool::new(
+                "failing_direct",
+                "fails",
+                serde_json::json!({"type": "object"}),
+                Box::new(|_, _| Ok(ToolResultBlock::error("boom"))),
+            )
+            .return_direct(true),
+        ));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c-err", "failing_direct", JsonMap::new()),
+                text_response("the model recovered"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4-err")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("go")]).await.unwrap();
+        assert_eq!(reply.text_content(), "the model recovered");
+        assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+    }
+
+    #[tokio::test]
+    async fn return_direct_closing_message_emits_text_events_with_generate_reason() {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(return_direct_tool("streamed final answer"));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c-rd4", "final_answer", JsonMap::new()),
+                text_response("should not happen"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t4-events")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let events: Vec<AgentEvent> = agent
+            .stream_events(vec![Msg::user("go")], StreamOptions::defaults())
+            .filter_map(|r| async move { r.ok() })
+            .collect()
+            .await;
+
+        let delta = events
+            .iter()
+            .find(|e| {
+                e.event_type() == AgentEventType::TextBlockDelta
+                    && e.data().fields.get("delta")
+                        == Some(&serde_json::json!("streamed final answer"))
+            })
+            .expect("closing message emitted a TextBlockDelta");
+        assert_eq!(
+            delta
+                .metadata()
+                .get(crate::message::metadata_keys::EVENT_GENERATE_REASON),
+            Some(&serde_json::json!("TOOL_RETURN_DIRECT"))
+        );
+    }
+
     #[tokio::test]
     async fn plain_text_reply() {
         let model = Arc::new(MockModel::new("mock", vec![text_response("hello world")]));
@@ -1778,6 +2432,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_state_is_terminal_in_persisted_context() {
+        // Built-in tools return plain blocks (`ToolResultBlock::text`), leaving the
+        // `Running` default in place. Java #2745: the state persisted in the context
+        // must be the resolved terminal state, otherwise history queries always
+        // observe RUNNING.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::new(Mutex::new(0))));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t2-state")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        let state = agent.agent_state();
+        let stored = state
+            .context()
+            .iter()
+            .flat_map(|m| m.tool_result_blocks())
+            .find(|rb| rb.id.as_deref() == Some("c1"))
+            .expect("tool result persisted in context");
+        assert_eq!(stored.state, ToolResultState::Success);
+    }
+
+    #[tokio::test]
+    async fn failing_tool_result_state_is_error_in_persisted_context() {        let toolkit = Toolkit::new();
+        // Java #2745: a tool that reports failure via its output text must surface
+        // as ERROR, not SUCCESS.
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "broken",
+            "always fails",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("[ERROR] boom"))),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c9", "broken", JsonMap::new()),
+                text_response("recovered"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t2-err")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("go")]).await.unwrap();
+
+        let state = agent.agent_state();
+        let stored = state
+            .context()
+            .iter()
+            .flat_map(|m| m.tool_result_blocks())
+            .find(|rb| rb.id.as_deref() == Some("c9"))
+            .expect("tool result persisted in context");
+        assert_eq!(stored.state, ToolResultState::Error);
+    }
+
+    #[tokio::test]
+    async fn tool_context_exposes_emitter_with_the_call_id() {
+        // Java #2720: the emitter handed to a tool must know which tool call it
+        // belongs to. Driven through the real acting phase so a regression that
+        // passes `emitter: None` again fails here.
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "probe",
+            "records its emitter's call id",
+            serde_json::json!({"type": "object"}),
+            Box::new(move |_args: JsonMap, ctx: ToolExecutionContext| {
+                let id = ctx
+                    .emitter
+                    .as_ref()
+                    .and_then(|e| e.tool_call_id().map(str::to_string));
+                captured.lock().unwrap().push(id);
+                Ok(ToolResultBlock::success("probed"))
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("call-probe-1", "probe", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t3")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("go")]).await.unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Some("call-probe-1".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_emitted_chunks_reach_the_event_stream() {
+        // The emitter's chunks must surface as ToolResultDataDelta events carrying
+        // the call id, otherwise the emitter is effectively dead wiring.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "streamer",
+            "emits a chunk then returns",
+            serde_json::json!({"type": "object"}),
+            Box::new(move |_args: JsonMap, ctx: ToolExecutionContext| {
+                if let Some(e) = &ctx.emitter {
+                    crate::tool::emit_to(
+                        &Some(Arc::clone(e)),
+                        ToolResultBlock::text("partial progress"),
+                    );
+                }
+                Ok(ToolResultBlock::success("final"))
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("call-stream-1", "streamer", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t3-stream")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        let events: Vec<AgentEvent> = agent
+            .stream_events(
+                vec![Msg::user("go")],
+                StreamOptions::builder().include_acting_chunk(true).build(),
+            )
+            .filter_map(|r| async move { r.ok() })
+            .collect()
+            .await;
+
+        let delta = events
+            .iter()
+            .find(|e| e.event_type() == AgentEventType::ToolResultDataDelta)
+            .expect("emitted chunk surfaced as a ToolResultDataDelta event");
+        assert_eq!(
+            delta.data().fields.get("tool_call_id"),
+            Some(&serde_json::json!("call-stream-1"))
+        );
+    }
+
+    #[tokio::test]
     async fn suspended_tool_halts_with_tool_suspended() {
         let toolkit = Toolkit::new();
         toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
@@ -1805,6 +2623,122 @@ mod tests {
             .unwrap();
         let reply = agent.call(vec![Msg::user("go")]).await.unwrap();
         assert_eq!(reply.generate_reason(), GenerateReason::ToolSuspended);
+    }
+
+    #[tokio::test]
+    async fn suspended_tool_emits_require_external_execution_and_no_result_end() {
+        // Java #3435: a suspended call emits RequireExternalExecution as the *single*
+        // signal; no ToolResultTextDelta/ToolResultEnd may be fabricated for it.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "external",
+            "needs human",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| {
+                Err(crate::tool::ToolSuspendException::new("waiting for input").to_error())
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("ext1", "external", JsonMap::new())],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-suspend-events")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let events: Vec<AgentEvent> = agent
+            .stream_events(
+                vec![Msg::user("go")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type() == AgentEventType::ToolResultEnd),
+            "a suspended tool must not emit ToolResultEnd; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type() == AgentEventType::ToolResultTextDelta),
+            "a suspended tool must not emit result content; got {events:?}"
+        );
+
+        let require: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| e.event_type() == AgentEventType::RequireExternalExecution)
+            .collect();
+        assert_eq!(require.len(), 1, "expected exactly one require event; got {events:?}");
+        let fields = &require[0].data().fields;
+        assert_eq!(fields.get("tool_call_id"), Some(&serde_json::json!("ext1")));
+        assert_eq!(fields.get("tool_name"), Some(&serde_json::json!("external")));
+        assert_eq!(
+            fields.get("reason"),
+            Some(&serde_json::json!("waiting for input"))
+        );
+        // Mirrors Java `RequireExternalExecutionEvent.getToolCalls()`.
+        let calls = fields.get("tool_calls").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].get("id"), Some(&serde_json::json!("ext1")));
+        assert_eq!(calls[0].get("name"), Some(&serde_json::json!("external")));
+    }
+
+    #[tokio::test]
+    async fn successful_tool_emits_result_end_and_no_require_external_execution() {
+        // The non-suspended path is unaffected: ToolResultEnd is emitted and no
+        // external-execution requirement is raised.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-ok-events")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let events: Vec<AgentEvent> = agent
+            .stream_events(
+                vec![Msg::user("compute")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type() == AgentEventType::ToolResultEnd),
+            "an executed tool must emit ToolResultEnd; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type() == AgentEventType::RequireExternalExecution),
+            "an executed tool must not require external execution; got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1869,9 +2803,88 @@ mod tests {
         }
     }
 
+    /// Middleware that records each `on_agent_state_ready` notification and can
+    /// optionally decline participation.
+    struct StateReadyMiddleware {
+        calls: Arc<Mutex<Vec<(usize, Option<String>)>>>,
+        participate: bool,
+    }
+
+    impl crate::middleware::Middleware for StateReadyMiddleware {
+        fn on_agent_state_ready(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            state: &mut crate::state::AgentState,
+            input_messages: &[Msg],
+        ) {
+            let session = state.session_id().to_string();
+            self.calls.lock().unwrap().push((
+                input_messages.len(),
+                if session.is_empty() { None } else { Some(session) },
+            ));
+        }
+
+        fn active_points(&self) -> Vec<crate::middleware::ExtensionPoint> {
+            if self.participate {
+                crate::middleware::ExtensionPoint::ALL.to_vec()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn reasoning_middleware_rewrites_reach_the_model() {
-        let model = Arc::new(RecordingModel::new());
+    async fn agent_state_ready_callback_runs_through_the_real_assembly_path() {
+        // Built through the public builder + `call`, so a regression that drops the
+        // `notify_agent_state_ready` wiring from the real execution entry point fails
+        // here (unlike a test that pokes the chain's internals directly).
+        let calls: Arc<Mutex<Vec<(usize, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(StateReadyMiddleware {
+            calls: Arc::clone(&calls),
+            participate: true,
+        }));
+        let model = Arc::new(MockModel::new("mock", vec![text_response("ok")]));
+        let agent = ReActAgent::builder()
+            .name("t-state-ready")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "on_agent_state_ready must fire once per call");
+        assert_eq!(
+            recorded[0].0, 1,
+            "the callback must receive this call's input messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_state_ready_skips_non_participating_middlewares() {
+        // `active_points()` is a participation switch: an empty set disables the
+        // middleware at every point while keeping its registration.
+        let calls: Arc<Mutex<Vec<(usize, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(StateReadyMiddleware {
+            calls: Arc::clone(&calls),
+            participate: false,
+        }));
+        let model = Arc::new(MockModel::new("mock", vec![text_response("ok")]));
+        let agent = ReActAgent::builder()
+            .name("t-state-ready-off")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reasoning_middleware_rewrites_reach_the_model() {        let model = Arc::new(RecordingModel::new());
         let seen = Arc::clone(&model.seen);
         let mut chain = MiddlewareChain::new();
         chain.add(Box::new(RewriteReasoningMiddleware));
@@ -1954,6 +2967,45 @@ mod tests {
         // The tool must never have been invoked.
         assert_eq!(*counter.lock().unwrap(), 0);
         assert_eq!(reply.text_content(), "done");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_mutating_tool() {
+        // While plan mode is active, a non-read-only tool is denied without executing.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c1", "add", input), text_response("done")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-plan")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        // Activate plan mode on the persisted state the call will run against.
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .plan_mode_context
+            .set_plan_active(true);
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(*counter.lock().unwrap(), 0, "mutating tool must be denied in plan mode");
+        assert_eq!(reply.text_content(), "done");
+        // The denied call is recorded as a DENIED tool result, not silently dropped.
+        let context = agent.core.state.lock().unwrap().context().to_vec();
+        let denied = context
+            .iter()
+            .filter(|m| m.role() == MsgRole::Tool)
+            .flat_map(|m| m.tool_result_blocks())
+            .any(|tr| tr.id.as_deref() == Some("c1") && tr.state == ToolResultState::Denied);
+        assert!(denied, "plan-mode denial must surface a Denied tool result");
     }
 
     #[tokio::test]

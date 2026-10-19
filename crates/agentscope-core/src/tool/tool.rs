@@ -37,6 +37,17 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     /// The tool description shown to the model.
     fn description(&self) -> &str;
+    /// Human-readable title meant **for display purposes** (e.g. rendering a
+    /// permission confirmation to an end user), as opposed to [`name`](Self::name)
+    /// (a programmatic identifier such as `repair__create_ticket`) and
+    /// [`description`](Self::description) (model-facing guidance).
+    ///
+    /// Mirrors Java `AgentTool.getTitle()`, including its additive shape: the
+    /// default is `None`, so no implementer must change. MCP servers may supply it
+    /// as `Tool.title` or `ToolAnnotations.title`.
+    fn title(&self) -> Option<&str> {
+        None
+    }
     /// Whether this tool performs no observable side effects.
     fn is_read_only(&self) -> bool {
         false
@@ -48,6 +59,35 @@ pub trait Tool: Send + Sync {
     /// Whether multiple invocations may run in parallel.
     fn is_concurrency_safe(&self) -> bool {
         true
+    }
+    /// Whether this tool's result should be returned **directly to the caller as
+    /// the turn's final answer**, skipping the next reasoning iteration.
+    ///
+    /// Defaults to `false`. Mirrors Java `AgentTool.isReturnDirect()`:
+    /// - the flag is invisible to the model (it is never part of the tool schema),
+    ///   so it cannot influence the model's decision to call the tool — it only
+    ///   controls what happens after a *successful* call;
+    /// - it only applies when **every** executed tool in the round is
+    ///   `returnDirect` **and** every result is successful; otherwise all results
+    ///   are fed back to the model;
+    /// - a result that is denied / errored / interrupted must never be presented
+    ///   as the final answer.
+    ///
+    /// Implementers declaring `true` should therefore always produce presentable
+    /// (non-empty) content blocks on success.
+    fn is_return_direct(&self) -> bool {
+        false
+    }
+    /// Whether this tool's full definition may be **deferred** until the model needs
+    /// it, mirroring Java `AgentTool.getDeferLoading()`.
+    ///
+    /// Providers that support tool search (e.g. the OpenAI Responses `tool_search`
+    /// server tool) may then load the parameter schema lazily; the name and
+    /// description stay visible to the model. Defaults to `false`, so any unmarked
+    /// tool is sent eagerly loaded — deferral is a per-tool opt-in. Providers without
+    /// deferred loading support ignore the flag.
+    fn defer_loading(&self) -> bool {
+        false
     }
     /// The JSON Schema for the tool parameters.
     fn parameters_schema(&self) -> serde_json::Value;
@@ -67,7 +107,14 @@ pub trait Tool: Send + Sync {
         if !parameters.contains_key("type") {
             parameters.insert("type".into(), serde_json::Value::String("object".into()));
         }
-        ToolSchema::new(self.name(), self.description()).parameters(parameters)
+        let schema = ToolSchema::new(self.name(), self.description()).parameters(parameters);
+        // Java only sends `defer_loading: true` for explicitly marked tools; an
+        // unmarked tool carries `null` and stays eagerly loaded.
+        if self.defer_loading() {
+            schema.defer_loading(Some(true))
+        } else {
+            schema
+        }
     }
     /// Toolkit-aware deep-copy rebinding hook, mirroring Java `ToolkitAware`.
     /// When a [`Toolkit`](super::toolkit::Toolkit) is copied, aware tools are
@@ -82,8 +129,12 @@ pub trait Tool: Send + Sync {
 pub struct FunctionTool {
     name: String,
     description: String,
+    /// Optional display title (see [`Tool::title`]).
+    title: Option<String>,
     parameters: serde_json::Value,
     read_only: bool,
+    return_direct: bool,
+    defer_loading: bool,
     handler: Box<dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync>,
     rebind: Option<Box<dyn Fn(&super::toolkit::Toolkit) -> Arc<dyn Tool> + Send + Sync>>,
 }
@@ -99,8 +150,11 @@ impl FunctionTool {
         Self {
             name: name.into(),
             description: description.into(),
+            title: None,
             parameters,
             read_only: false,
+            return_direct: false,
+            defer_loading: false,
             handler,
             rebind: None,
         }
@@ -109,6 +163,30 @@ impl FunctionTool {
     /// Marks this tool as read-only.
     pub fn read_only(mut self, v: bool) -> Self {
         self.read_only = v;
+        self
+    }
+
+    /// Marks this tool's successful result as the turn's final answer, skipping
+    /// the follow-up model call (see [`Tool::is_return_direct`]).
+    pub fn return_direct(mut self, v: bool) -> Self {
+        self.return_direct = v;
+        self
+    }
+
+    /// Marks this tool as eligible for deferred definition loading (see
+    /// [`Tool::defer_loading`]).
+    pub fn defer_loading(mut self, v: bool) -> Self {
+        self.defer_loading = v;
+        self
+    }
+
+    /// Sets the human-readable display title (see [`Tool::title`]). Blank values
+    /// are ignored, matching Java `McpTool.resolveDisplayTitle`.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        let title = title.into();
+        if !title.trim().is_empty() {
+            self.title = Some(title);
+        }
         self
     }
 
@@ -132,8 +210,17 @@ impl Tool for FunctionTool {
     fn description(&self) -> &str {
         &self.description
     }
+    fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
     fn is_read_only(&self) -> bool {
         self.read_only
+    }
+    fn is_return_direct(&self) -> bool {
+        self.return_direct
+    }
+    fn defer_loading(&self) -> bool {
+        self.defer_loading
     }
     fn parameters_schema(&self) -> serde_json::Value {
         self.parameters.clone()
@@ -146,5 +233,66 @@ impl Tool for FunctionTool {
         toolkit: &super::toolkit::Toolkit,
     ) -> Option<Arc<dyn Tool>> {
         self.rebind.as_ref().map(|f| f(toolkit))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fn_tool() -> FunctionTool {
+        FunctionTool::new(
+            "lookup",
+            "looks things up",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )
+    }
+
+    #[test]
+    fn title_is_additive_and_defaults_to_none() {
+        assert_eq!(fn_tool().title(), None);
+        assert_eq!(fn_tool().with_title("Lookup").title(), Some("Lookup"));
+    }
+
+    #[test]
+    fn blank_title_is_ignored() {
+        assert_eq!(fn_tool().with_title("  ").title(), None);
+        assert_eq!(fn_tool().with_title("").title(), None);
+    }
+
+    #[test]
+    fn defer_loading_is_opt_in_and_defaults_to_false() {
+        // The trait default keeps every existing tool eagerly loaded.
+        struct Bare;
+        #[async_trait]
+        impl Tool for Bare {
+            fn name(&self) -> &str {
+                "bare"
+            }
+            fn description(&self) -> &str {
+                "b"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+                Ok(ToolResultBlock::text("ok"))
+            }
+        }
+        let bare = Bare;
+        assert!(!Tool::defer_loading(&bare));
+        assert_eq!(bare.schema().defer_loading, None);
+
+        // `FunctionTool` has both an inherent setter (`defer_loading(bool)`) and the trait
+        // getter, so the trait method must be called explicitly here.
+        let eager = fn_tool();
+        assert!(!Tool::defer_loading(&eager));
+        assert_eq!(eager.schema().defer_loading, None);
+
+        // Marked tools carry `defer_loading: true` on their schema.
+        let deferred = fn_tool().defer_loading(true);
+        assert!(Tool::defer_loading(&deferred));
+        assert_eq!(deferred.schema().defer_loading, Some(true));
     }
 }

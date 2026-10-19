@@ -53,6 +53,65 @@ pub trait Middleware: Send + Sync {
     fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         current_prompt
     }
+
+    /// Notified once per call as soon as the call-scoped `AgentState` is bound to
+    /// the runtime context, before the input enters the pipeline.
+    ///
+    /// This is the window the other hooks miss: `on_agent` is too early (the state
+    /// is not yet bound) and `on_reasoning`/`on_acting` are too late. It enables
+    /// session bootstrapping, state-driven decisions and per-session auditing.
+    ///
+    /// A pure notification (no `next` delegation): it may mutate `state`, but a
+    /// panic/exception propagates to the caller unchanged. Mirrors Java
+    /// `MiddlewareBase.onAgentStateReady`; the default is a no-op.
+    fn on_agent_state_ready(
+        &self,
+        _ctx: &RuntimeContext,
+        _state: &mut crate::state::AgentState,
+        _input_messages: &[crate::message::Msg],
+    ) {
+    }
+
+    /// The extension points where this middleware is active.
+    ///
+    /// This is a **participation switch**, not a statement about which methods are
+    /// overridden: a point declared active but not overridden simply runs its
+    /// default (pass-through / no-op), and a point omitted is never invoked — even
+    /// if overridden. The default is active at every point (including ones added in
+    /// future releases), so middlewares that do not override this keep today's
+    /// behaviour. An empty set disables the middleware at every point while keeping
+    /// its registration.
+    ///
+    /// Activation is decided once when the agent is built. Mirrors Java
+    /// `MiddlewareBase.activePoints()`.
+    fn active_points(&self) -> Vec<ExtensionPoint> {
+        ExtensionPoint::ALL.to_vec()
+    }
+}
+
+/// The middleware extension points, mirroring Java `MiddlewareBase.ExtensionPoint`.
+///
+/// Used by [`Middleware::active_points`] to declare participation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtensionPoint {
+    OnAgent,
+    OnReasoning,
+    OnActing,
+    OnModelCall,
+    OnSystemPrompt,
+    OnAgentStateReady,
+}
+
+impl ExtensionPoint {
+    /// Every extension point, in declaration order.
+    pub const ALL: [ExtensionPoint; 6] = [
+        ExtensionPoint::OnAgent,
+        ExtensionPoint::OnReasoning,
+        ExtensionPoint::OnActing,
+        ExtensionPoint::OnModelCall,
+        ExtensionPoint::OnSystemPrompt,
+        ExtensionPoint::OnAgentStateReady,
+    ];
 }
 
 /// A chain of middleware executed in order (onion pattern).
@@ -99,9 +158,42 @@ impl MiddlewareChain {
         self.middlewares.is_empty()
     }
 
-    /// Applies the chain's system-prompt transformers in order.
-    pub fn apply_system_prompt(&self, ctx: &RuntimeContext, prompt: String) -> String {
+    /// The middlewares participating in the given extension point, in registration
+    /// order.
+    ///
+    /// A middleware participates when its [`Middleware::active_points`] contains
+    /// `point`. Points with no participants yield an empty slice, which lets the
+    /// caller skip building a wrapper layer entirely (Java `activePoints()`).
+    pub fn participants(&self, point: ExtensionPoint) -> Vec<&Arc<dyn Middleware>> {
         self.middlewares
+            .iter()
+            .filter(|mw| mw.active_points().contains(&point))
+            .collect()
+    }
+
+    /// Notifies every participating middleware that this call's `AgentState` is
+    /// ready, in registration order.
+    ///
+    /// Mirrors Java `ReActAgent.beforeAgentExecution`: invoked once per call right
+    /// after the call-scoped state is bound, before the input enters the pipeline.
+    /// A middleware's panic propagates unchanged and the remaining participants are
+    /// not invoked (Java: "a consumer exception propagates ... and the remaining
+    /// consumers are not invoked").
+    pub fn notify_agent_state_ready(
+        &self,
+        ctx: &RuntimeContext,
+        state: &mut crate::state::AgentState,
+        input_messages: &[crate::message::Msg],
+    ) {
+        for mw in self.participants(ExtensionPoint::OnAgentStateReady) {
+            mw.on_agent_state_ready(ctx, state, input_messages);
+        }
+    }
+
+    /// Applies the chain's system-prompt transformers in order, skipping
+    /// middlewares that do not participate in `OnSystemPrompt`.
+    pub fn apply_system_prompt(&self, ctx: &RuntimeContext, prompt: String) -> String {
+        self.participants(ExtensionPoint::OnSystemPrompt)
             .iter()
             .fold(prompt, |p, mw| mw.on_system_prompt(ctx, p))
     }
@@ -113,11 +205,15 @@ impl MiddlewareChain {
         input: AgentInput,
         core: Box<dyn FnOnce(AgentInput) -> EventStream + Send>,
     ) -> EventStream {
+        let participants: Vec<Arc<dyn Middleware>> = self
+            .participants(ExtensionPoint::OnAgent)
+            .into_iter()
+            .map(Arc::clone)
+            .collect();
         let mut pipeline: Next<AgentInput> = Box::new(core);
-        for mw in self.middlewares.iter().rev() {
+        for mw in participants.into_iter().rev() {
             let prev = pipeline;
             let ctx = ctx.clone();
-            let mw = Arc::clone(mw);
             pipeline = Box::new(move |input| mw.on_agent(&ctx, input, prev));
         }
         pipeline(input)
@@ -130,11 +226,15 @@ impl MiddlewareChain {
         input: ReasoningInput,
         core: Box<dyn FnOnce(ReasoningInput) -> EventStream + Send>,
     ) -> EventStream {
+        let participants: Vec<Arc<dyn Middleware>> = self
+            .participants(ExtensionPoint::OnReasoning)
+            .into_iter()
+            .map(Arc::clone)
+            .collect();
         let mut pipeline: Next<ReasoningInput> = Box::new(core);
-        for mw in self.middlewares.iter().rev() {
+        for mw in participants.into_iter().rev() {
             let prev = pipeline;
             let ctx = ctx.clone();
-            let mw = Arc::clone(mw);
             pipeline = Box::new(move |input| mw.on_reasoning(&ctx, input, prev));
         }
         pipeline(input)
@@ -147,11 +247,15 @@ impl MiddlewareChain {
         input: ActingInput,
         core: Box<dyn FnOnce(ActingInput) -> EventStream + Send>,
     ) -> EventStream {
+        let participants: Vec<Arc<dyn Middleware>> = self
+            .participants(ExtensionPoint::OnActing)
+            .into_iter()
+            .map(Arc::clone)
+            .collect();
         let mut pipeline: Next<ActingInput> = Box::new(core);
-        for mw in self.middlewares.iter().rev() {
+        for mw in participants.into_iter().rev() {
             let prev = pipeline;
             let ctx = ctx.clone();
-            let mw = Arc::clone(mw);
             pipeline = Box::new(move |input| mw.on_acting(&ctx, input, prev));
         }
         pipeline(input)
@@ -164,11 +268,15 @@ impl MiddlewareChain {
         input: ModelCallInput,
         core: Box<dyn FnOnce(ModelCallInput) -> EventStream + Send>,
     ) -> EventStream {
+        let participants: Vec<Arc<dyn Middleware>> = self
+            .participants(ExtensionPoint::OnModelCall)
+            .into_iter()
+            .map(Arc::clone)
+            .collect();
         let mut pipeline: Next<ModelCallInput> = Box::new(core);
-        for mw in self.middlewares.iter().rev() {
+        for mw in participants.into_iter().rev() {
             let prev = pipeline;
             let ctx = ctx.clone();
-            let mw = Arc::clone(mw);
             pipeline = Box::new(move |input| mw.on_model_call(&ctx, input, prev));
         }
         pipeline(input)

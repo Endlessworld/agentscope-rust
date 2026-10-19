@@ -46,7 +46,7 @@ pub use message::{
     HintBlock, ImageBlock, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock, ThinkingBlock,
     ToolCallState, ToolResultBlock, ToolResultState, ToolUseBlock, URLSource, VideoBlock,
 };
-pub use middleware::{ActingInput, AgentInput, Middleware, MiddlewareChain, ModelCallInput, ReasoningInput, TaskReminderMiddleware};
+pub use middleware::{ActingInput, AgentInput, ExtensionPoint, Middleware, MiddlewareChain, ModelCallInput, ReasoningInput, TaskReminderMiddleware};
 pub use model::{
     resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder,
     ExecutionConfig, ExecutionConfigBuilder, GenerateOptions, GenerateOptionsBuilder, Model,

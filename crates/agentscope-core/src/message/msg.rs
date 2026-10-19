@@ -41,6 +41,9 @@ pub enum GenerateReason {
     Interrupted,
     /// Maximum iterations reached.
     MaxIterations,
+    /// A `returnDirect` tool's result was returned directly to the caller as the
+    /// turn's final answer, skipping the follow-up model call.
+    ToolReturnDirect,
 }
 
 /// Timestamp format `yyyy-MM-dd HH:mm:ss.SSS` in the system's default time zone,

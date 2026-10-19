@@ -25,7 +25,9 @@ pub use config::{ToolkitConfig, ToolkitConfigBuilder};
 pub use dangerous::{is_dangerous_command, is_dangerous_path};
 pub use executor::ToolExecutor;
 pub use file::FilesystemTool;
-pub use emitter::{emit_to, ChunkCallback, DefaultToolEmitter, NoOpToolEmitter, ToolEmitter};
+pub use emitter::{
+    emit_to, tool_emitter_for_call, ChunkCallback, DefaultToolEmitter, NoOpToolEmitter, ToolEmitter,
+};
 pub use group::{ToolGroup, ToolGroupBuilder, ToolGroupManager, ToolGroupScope};
 pub use mcp::{McpAsyncHandler, McpTool};
 pub use meta::{ExtendedModel, MetaToolFactory, SimpleExtendedModel, ToolCallParam};

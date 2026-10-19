@@ -19,6 +19,13 @@ pub struct ToolSchema {
     /// Strict mode flag for schema validation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// Deferred tool definition loading flag.
+    ///
+    /// Providers that support tool search can defer loading this tool's parameter
+    /// schema until the model searches for it. `None` means unspecified, which leaves
+    /// the tool eagerly loaded. Mirrors Java `ToolSchema.getDeferLoading`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
 }
 
 impl ToolSchema {
@@ -30,6 +37,7 @@ impl ToolSchema {
             parameters: Map::new(),
             output_schema: None,
             strict: None,
+            defer_loading: None,
         }
     }
 
@@ -49,5 +57,42 @@ impl ToolSchema {
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = Some(strict);
         self
+    }
+
+    /// Sets the deferred tool definition loading flag. `None` leaves the tool eagerly
+    /// loaded (Java `ToolSchema.Builder.deferLoading` accepts a nullable Boolean).
+    pub fn defer_loading(mut self, defer_loading: Option<bool>) -> Self {
+        self.defer_loading = defer_loading;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn defer_loading_defaults_to_unspecified() {
+        let schema = ToolSchema::new("t", "d");
+        assert_eq!(schema.defer_loading, None);
+        // Unspecified must not be serialized at all (Java sends `defer_loading` only
+        // for explicitly marked tools).
+        let value = serde_json::to_value(&schema).unwrap();
+        assert!(value.get("deferLoading").is_none(), "{value}");
+    }
+
+    #[test]
+    fn defer_loading_round_trips_when_set() {
+        let schema = ToolSchema::new("t", "d").defer_loading(Some(true));
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(value["deferLoading"], json!(true));
+        let back: ToolSchema = serde_json::from_value(value).unwrap();
+        assert_eq!(back.defer_loading, Some(true));
+
+        // A legacy payload without the key deserializes to `None`.
+        let legacy = json!({"name": "t", "description": "d", "parameters": {}});
+        let back: ToolSchema = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.defer_loading, None);
     }
 }

@@ -23,6 +23,11 @@ pub enum ToolResultState {
     Error,
     Interrupted,
     Denied,
+    /// The tool call was suspended and awaits execution outside the agent runtime.
+    ///
+    /// A suspended result carries no output: the real result is supplied by the
+    /// caller on resume. Mirrors `ToolResultState.SUSPENDED` in the Java SDK.
+    Suspended,
     #[default]
     Running,
 }
@@ -451,8 +456,18 @@ pub struct ToolResultBlock {
 }
 
 impl ToolResultBlock {
-    /// Metadata key indicating this result is suspended for external execution.
+    /// Legacy metadata key indicating this result is suspended for external execution.
+    ///
+    /// Superseded by [`ToolResultState::Suspended`]; still written alongside the new
+    /// encoding and still recognised by [`ToolResultBlock::is_suspended`] so blocks
+    /// serialized by older versions keep working (one transition window).
     pub const METADATA_SUSPENDED: &'static str = "agentscope_suspended";
+
+    /// Metadata key carrying the suspend reason (the `ToolSuspendException` message)
+    /// when the tool supplied one.
+    ///
+    /// Control-plane information; never rendered through `output`.
+    pub const METADATA_SUSPEND_REASON: &'static str = "agentscope_suspend_reason";
 
     pub fn new(id: &str, name: &str, output: Vec<ContentBlock>) -> Self {
         Self {
@@ -480,6 +495,50 @@ impl ToolResultBlock {
             )))],
             metadata: super::JsonMap::new(),
             state: ToolResultState::Error,
+        }
+    }
+
+    /// Creates an explicit success result (for tool function return values).
+    ///
+    /// Mirrors Java `ToolResultBlock.success(String)`: a successful tool call
+    /// carries an explicit terminal state instead of relying on an inferrer that
+    /// misreads content merely starting with `Error:`/`[ERROR]`.
+    pub fn success(text: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            name: None,
+            output: vec![ContentBlock::Text(TextBlock::new(text))],
+            metadata: super::JsonMap::new(),
+            state: ToolResultState::Success,
+        }
+    }
+
+    /// Resolves the terminal state of a tool result, mirroring Java
+    /// `ReActAgent.determineToolResultState`.
+    ///
+    /// Order: a suspended result is [`ToolResultState::Suspended`]; an explicit
+    /// terminal state (anything other than [`ToolResultState::Running`]) is kept
+    /// verbatim; a `[ERROR]`-prefixed text output is [`ToolResultState::Error`];
+    /// everything else is [`ToolResultState::Success`].
+    ///
+    /// Why this exists: tools that return a plain block leave `state` at its
+    /// `Running` default, so history queries would otherwise always observe
+    /// `RUNNING` even after the call finished (Java #2745).
+    pub fn final_state(&self) -> ToolResultState {
+        if self.is_suspended() {
+            return ToolResultState::Suspended;
+        }
+        if self.state != ToolResultState::Running {
+            return self.state;
+        }
+        let has_error_prefix = self.output.iter().any(|b| match b {
+            ContentBlock::Text(t) => t.text.starts_with("[ERROR]"),
+            _ => false,
+        });
+        if has_error_prefix {
+            ToolResultState::Error
+        } else {
+            ToolResultState::Success
         }
     }
 
@@ -526,8 +585,11 @@ impl ToolResultBlock {
 
     /// Creates a suspended result for external execution.
     ///
-    /// Mirrors `ToolSuspendException`: the block carries a `suspended` metadata flag and
-    /// a human-readable reason as its text output, keyed by the original tool call.
+    /// Mirrors Java `ToolResultBlock.suspended(...)`: the tool has not executed, so the
+    /// result carries **no output** (the real result arrives from the caller on resume),
+    /// the state is [`ToolResultState::Suspended`] and, when a reason was supplied, it
+    /// travels in [`Self::METADATA_SUSPEND_REASON`]. The legacy `METADATA_SUSPENDED`
+    /// marker is dual-written so older readers keep detecting the suspension.
     pub fn suspended(reason: impl Into<String>, id: &str, name: &str) -> Self {
         let reason = reason.into();
         let mut metadata = super::JsonMap::new();
@@ -535,16 +597,18 @@ impl ToolResultBlock {
             Self::METADATA_SUSPENDED.to_string(),
             serde_json::Value::Bool(true),
         );
+        if !reason.is_empty() {
+            metadata.insert(
+                Self::METADATA_SUSPEND_REASON.to_string(),
+                serde_json::Value::String(reason),
+            );
+        }
         Self {
             id: Some(id.to_string()),
             name: Some(name.to_string()),
-            output: vec![ContentBlock::Text(TextBlock::new(if reason.is_empty() {
-                "Tool execution suspended".to_string()
-            } else {
-                reason
-            }))],
+            output: Vec::new(),
             metadata,
-            state: ToolResultState::Running,
+            state: ToolResultState::Suspended,
         }
     }
 
@@ -561,11 +625,29 @@ impl ToolResultBlock {
     }
 
     /// Whether this result is suspended for external execution.
+    ///
+    /// Recognises the canonical encoding ([`ToolResultState::Suspended`]) and the
+    /// legacy wire marker ([`Self::METADATA_SUSPENDED`]), so blocks serialized by
+    /// older versions keep working.
     pub fn is_suspended(&self) -> bool {
+        self.state == ToolResultState::Suspended
+            || self
+                .metadata
+                .get(Self::METADATA_SUSPENDED)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+    }
+
+    /// The suspend reason when this result is suspended and the tool supplied one.
+    ///
+    /// Returns `None` when the result is not suspended or when no reason was recorded.
+    pub fn suspend_reason(&self) -> Option<&str> {
+        if !self.is_suspended() {
+            return None;
+        }
         self.metadata
-            .get(Self::METADATA_SUSPENDED)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .get(Self::METADATA_SUSPEND_REASON)
+            .and_then(|v| v.as_str())
     }
 
     pub fn builder() -> ToolResultBlockBuilder {
@@ -747,5 +829,59 @@ impl DataBlockBuilder {
                 .unwrap_or_else(new_data_id),
             name: self.name,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_sets_explicit_success_state() {
+        let rb = ToolResultBlock::success("all good");
+        assert_eq!(rb.state, ToolResultState::Success);
+        assert_eq!(rb.text_content(), "all good");
+    }
+
+    #[test]
+    fn error_sets_explicit_error_state() {
+        let rb = ToolResultBlock::error("boom");
+        assert_eq!(rb.state, ToolResultState::Error);
+        assert_eq!(rb.text_content(), "Error: boom");
+    }
+
+    #[test]
+    fn final_state_resolves_running_default_to_success() {
+        // `of`/`text` leave the `Running` default; a finished call must report
+        // Success rather than staying RUNNING forever (Java #2745).
+        assert_eq!(ToolResultBlock::text("42").final_state(), ToolResultState::Success);
+        assert_eq!(ToolResultBlock::of_blocks(vec![]).final_state(), ToolResultState::Success);
+    }
+
+    #[test]
+    fn final_state_infers_error_from_error_prefixed_output() {
+        let rb = ToolResultBlock::text("[ERROR] disk full");
+        assert_eq!(rb.state, ToolResultState::Running);
+        assert_eq!(rb.final_state(), ToolResultState::Error);
+    }
+
+    #[test]
+    fn final_state_keeps_explicit_terminal_states_verbatim() {
+        // A successful literal that merely *starts with* "Error:" is not an error:
+        // the explicit state wins over any text heuristic.
+        let rb = ToolResultBlock::success("Error: none, everything is fine");
+        assert_eq!(rb.final_state(), ToolResultState::Success);
+
+        let denied = ToolResultBlock::text("nope").with_state(ToolResultState::Denied);
+        assert_eq!(denied.final_state(), ToolResultState::Denied);
+
+        let interrupted = ToolResultBlock::text("stopped").with_state(ToolResultState::Interrupted);
+        assert_eq!(interrupted.final_state(), ToolResultState::Interrupted);
+    }
+
+    #[test]
+    fn final_state_reports_suspended_first() {
+        let rb = ToolResultBlock::suspended("awaiting user", "c1", "external");
+        assert_eq!(rb.final_state(), ToolResultState::Suspended);
     }
 }

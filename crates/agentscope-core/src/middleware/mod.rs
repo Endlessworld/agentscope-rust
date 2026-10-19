@@ -6,5 +6,5 @@ pub mod middleware;
 pub mod task_reminder;
 
 pub use input::{ActingInput, AgentInput, EventStream, ModelCallInput, ReasoningInput};
-pub use middleware::{Middleware, MiddlewareChain, Next};
+pub use middleware::{ExtensionPoint, Middleware, MiddlewareChain, Next};
 pub use task_reminder::TaskReminderMiddleware;
