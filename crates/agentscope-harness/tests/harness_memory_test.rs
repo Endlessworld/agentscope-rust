@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::message::{
+    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ToolResultBlock, ToolResultState,
+    ToolUseBlock,
+};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::{
@@ -194,6 +197,201 @@ fn prune_tool_results_trims_old_oversized_output() {
     } else {
         panic!("expected tool_result block");
     }
+}
+
+/// Creates a prune config: `max_output_chars`, `minimum_tokens`, `protect_tokens`, `excluded_tools`.
+fn prune_cfg(
+    max_output_chars: usize,
+    minimum_tokens: usize,
+    protect_tokens: usize,
+    excluded_tools: &[&str],
+) -> PruneConfig {
+    PruneConfig {
+        protect_tokens,
+        minimum_tokens,
+        max_output_chars,
+        excluded_tools: excluded_tools.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn block_text(tr: &ToolResultBlock) -> String {
+    match &tr.output[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text block, got {other:?}"),
+    }
+}
+
+/// A pruned tool result keeps metadata markers (eviction, suspension), the execution state,
+/// and the carrying message keeps its id/metadata/timestamp/usage.
+#[test]
+fn prune_tool_results_preserves_metadata_state_and_usage() {
+    let mut metadata = JsonMap::new();
+    metadata.insert("agentscope.tool_result_evicted".into(), serde_json::Value::Bool(true));
+    metadata.insert(
+        ToolResultBlock::METADATA_SUSPENDED.into(),
+        serde_json::Value::Bool(true),
+    );
+    metadata.insert("custom_key".into(), serde_json::Value::String("custom_value".into()));
+    let original = ToolResultBlock::builder()
+        .id("call-1")
+        .name("execute")
+        .output(ContentBlock::Text(TextBlock::new("x".repeat(1_000))))
+        .metadata(metadata.clone())
+        .state(ToolResultState::Error)
+        .build();
+    let mut msg_meta = JsonMap::new();
+    msg_meta.insert("msg_meta".into(), serde_json::Value::String("kept".into()));
+    let tool_msg = Msg::builder()
+        .id("msg-1")
+        .role(MsgRole::Tool)
+        .content(vec![ContentBlock::ToolResult(original)])
+        .metadata(msg_meta)
+        .timestamp("2026-09-28T10:00:00Z")
+        .usage(ChatUsage::builder().input_tokens(10).output_tokens(5).build())
+        .build();
+
+    let out = prune_tool_results(&[tool_msg], Some(&prune_cfg(100, 1, 0, &[])));
+
+    let ContentBlock::ToolResult(pruned) = &out[0].content[0] else {
+        panic!("expected tool_result block");
+    };
+    let text = block_text(pruned);
+    assert!(text.contains("chars pruned"), "expected trimmed preview");
+    assert!(text.chars().count() < 1_000);
+    assert_eq!(pruned.metadata, metadata);
+    assert!(pruned.is_suspended());
+    assert_eq!(pruned.state, ToolResultState::Error);
+    assert_eq!(pruned.id.as_deref(), Some("call-1"));
+    assert_eq!(pruned.name.as_deref(), Some("execute"));
+
+    let rebuilt = &out[0];
+    assert_eq!(rebuilt.id, "msg-1");
+    assert_eq!(rebuilt.role, MsgRole::Tool);
+    assert_eq!(
+        rebuilt.metadata.get("msg_meta").and_then(|v| v.as_str()),
+        Some("kept")
+    );
+    assert_eq!(rebuilt.timestamp, "2026-09-28T10:00:00Z");
+    let usage = rebuilt.usage.expect("usage preserved");
+    assert_eq!(usage.input_tokens, 10);
+    assert_eq!(usage.output_tokens, 5);
+}
+
+/// A message carrying several tool results is rebuilt with only the oversized block replaced.
+#[test]
+fn prune_tool_results_multi_block_prunes_only_oversized_block() {
+    let mut small_meta = JsonMap::new();
+    small_meta.insert("small_meta".into(), serde_json::Value::String("v".into()));
+    let small = ToolResultBlock::builder()
+        .id("call-small")
+        .name("execute")
+        .output(ContentBlock::Text(TextBlock::new("short output")))
+        .metadata(small_meta)
+        .state(ToolResultState::Success)
+        .build();
+    let mut large_meta = JsonMap::new();
+    large_meta.insert("large_meta".into(), serde_json::Value::String("v".into()));
+    let large = ToolResultBlock::builder()
+        .id("call-large")
+        .name("execute")
+        .output(ContentBlock::Text(TextBlock::new("x".repeat(1_000))))
+        .metadata(large_meta)
+        .state(ToolResultState::Error)
+        .build();
+    let tool_msg = Msg::builder()
+        .id("msg-5")
+        .role(MsgRole::Tool)
+        .content(vec![
+            ContentBlock::ToolResult(small.clone()),
+            ContentBlock::ToolResult(large),
+        ])
+        .build();
+
+    let out = prune_tool_results(&[tool_msg], Some(&prune_cfg(100, 1, 0, &[])));
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].content.len(), 2);
+    assert_eq!(out[0].content[0], ContentBlock::ToolResult(small.clone()));
+    let ContentBlock::ToolResult(pruned_large) = &out[0].content[1] else {
+        panic!("expected tool_result block");
+    };
+    assert!(block_text(pruned_large).contains("chars pruned"));
+    assert_eq!(
+        pruned_large.metadata.get("large_meta").and_then(|v| v.as_str()),
+        Some("v")
+    );
+    assert_eq!(pruned_large.state, ToolResultState::Error);
+    assert_eq!(pruned_large.id.as_deref(), Some("call-large"));
+    assert_eq!(out[0].id, "msg-5");
+}
+
+/// Excluded tools are never pruned even when oversized and outside the protection budget.
+#[test]
+fn prune_tool_results_skips_excluded_tools() {
+    let msg = tool_result_msg("call-2", "read_file", "x".repeat(1_000));
+    let messages = [msg];
+    let out = prune_tool_results(&messages, Some(&prune_cfg(100, 1, 0, &["read_file"])));
+    assert_eq!(out, messages);
+    let ContentBlock::ToolResult(tr) = &out[0].content[0] else {
+        panic!("expected tool_result block");
+    };
+    assert_eq!(block_text(tr).chars().count(), 1_000);
+}
+
+/// A conversation whose prunable total is below the threshold is returned unchanged.
+#[test]
+fn prune_tool_results_returns_original_below_minimum() {
+    let msg = tool_result_msg("call-3", "execute", "x".repeat(1_000));
+    let messages = [msg];
+    let out = prune_tool_results(&messages, Some(&prune_cfg(100, usize::MAX, 0, &[])));
+    assert_eq!(out, messages);
+}
+
+/// A block without metadata or explicit state prunes without failing, defaults intact.
+#[test]
+fn prune_tool_results_handles_block_without_metadata_or_state() {
+    let msg = tool_result_msg("call-4", "execute", "y".repeat(500));
+    let out = prune_tool_results(&[msg], Some(&prune_cfg(100, 1, 0, &[])));
+    let ContentBlock::ToolResult(pruned) = &out[0].content[0] else {
+        panic!("expected tool_result block");
+    };
+    assert!(pruned.metadata.is_empty());
+    assert_eq!(pruned.state, ToolResultState::Running);
+    assert!(block_text(pruned).contains("chars pruned"));
+}
+
+/// Budgets are charged per tool result, not per batched message: six 1,000-char results are
+/// ~2,400 prunable tokens, so a 3,000-token minimum must leave the batch untouched.
+#[test]
+fn prune_budget_is_charged_per_tool_result_not_per_message() {
+    let blocks: Vec<ContentBlock> = (0..6)
+        .map(|i| {
+            ContentBlock::ToolResult(ToolResultBlock::new(
+                &format!("call-{i}"),
+                "execute",
+                vec![ContentBlock::Text(TextBlock::new("x".repeat(1_000)))],
+            ))
+        })
+        .collect();
+    let batched = Msg::builder()
+        .role(MsgRole::Tool)
+        .content(blocks)
+        .build();
+    let messages = [batched.clone()];
+
+    let out = prune_tool_results(&messages, Some(&prune_cfg(100, 3_000, 100, &[])));
+    assert_eq!(out, messages, "below-threshold batch must be untouched");
+
+    // Sanity: once the minimum is reachable the same batch is pruned, so the assertion above
+    // guards against a "never prune" regression rather than a no-op implementation.
+    let pruned = prune_tool_results(&messages, Some(&prune_cfg(100, 1_000, 100, &[])));
+    let must_prune = pruned.iter().any(|m| {
+        m.content.iter().any(|b| match b {
+            ContentBlock::ToolResult(tr) => block_text(tr).contains("chars pruned"),
+            _ => false,
+        })
+    });
+    assert!(must_prune, "above-threshold batch should be pruned");
 }
 
 #[tokio::test]

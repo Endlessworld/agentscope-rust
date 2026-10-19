@@ -783,7 +783,8 @@ pub fn prune_tool_results(messages: &[Msg], prune: Option<&PruneConfig>) -> Vec<
             if text.trim().is_empty() {
                 continue;
             }
-            let tokens = calculate_token(std::slice::from_ref(msg));
+            // Charge this result only, not every sibling in a batched tool message.
+            let tokens = estimate_single_tool_result_cost(msg, tr);
             if protected_tokens < protect_budget {
                 protected_tokens += tokens;
                 continue;
@@ -809,6 +810,8 @@ pub fn prune_tool_results(messages: &[Msg], prune: Option<&PruneConfig>) -> Vec<
             .id(tr.id.clone().unwrap_or_default())
             .name(tr.name.clone().unwrap_or_default())
             .output(ContentBlock::Text(TextBlock::new(preview)))
+            .metadata(tr.metadata.clone())
+            .state(tr.state)
             .build();
         let mut new_blocks = msg.content.clone();
         new_blocks[block_idx] = ContentBlock::ToolResult(pruned);
@@ -820,9 +823,21 @@ pub fn prune_tool_results(messages: &[Msg], prune: Option<&PruneConfig>) -> Vec<
             .timestamp(msg.timestamp.clone())
             .build();
         m.name = msg.name.clone();
+        m.usage = msg.usage.clone();
         result[msg_idx] = m;
     }
     result
+}
+
+/// Charges a single tool result: the carrying message's structural overhead plus this
+/// result block, mirroring `calculateToken(List.of(msg.withContent(List.of(tr))))`.
+/// Sibling results in a batched TOOL message are not counted.
+fn estimate_single_tool_result_cost(msg: &Msg, tr: &ToolResultBlock) -> usize {
+    let mut tokens = MESSAGE_OVERHEAD + estimate_text_tokens(role_name(msg.role));
+    if let Some(name) = &msg.name {
+        tokens += estimate_text_tokens(name);
+    }
+    tokens + estimate_tool_result_tokens(tr)
 }
 
 fn build_prune_preview(text: &str, max_chars: usize) -> String {

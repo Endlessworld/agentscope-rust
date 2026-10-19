@@ -43,6 +43,11 @@ impl SkillRepo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageResult {
     /// No staging applied — skill has no shell-reachable representation.
+    ///
+    /// Also returned when a repository published no resources that could be staged (a lazy
+    /// repository, or a map whose entries were all rejected). Nothing was staged and nothing is
+    /// retained for the skill on this pass, so a directory written by an earlier call becomes
+    /// orphan-GC eligible: `None` does not mean "the files cached earlier are still there".
     None,
     /// Skill comes from `WorkspaceSkillRepository` (already in `workspace/skills/`).
     WorkspaceNative,
@@ -150,7 +155,15 @@ pub fn stage(
                     .unwrap_or_else(|| bound.repo.source());
                 let ns = if ns.is_empty() { GLOBAL_NAMESPACE.to_string() } else { ns };
                 let staged_dir = cache_root.join(&ns).join(&name);
-                materialize_if_changed(&staged_dir, bound.skill.resources())?;
+                if !materialize_if_changed(&staged_dir, bound.skill.resources())? {
+                    // Nothing was materialised — exactly what a lazy repository produces, since it
+                    // publishes no in-memory resources. Reporting `Cached` here would advertise a
+                    // `files-root` for a directory that stays permanently empty, so report `None`
+                    // and let shell-mode rendering omit the skill. The directory is also left
+                    // unretained, making a directory written by an earlier call GC-eligible.
+                    roots.insert(name, StageResult::None);
+                    continue;
+                }
                 retained.push(staged_dir.clone());
                 roots.insert(
                     name,
@@ -167,10 +180,15 @@ pub fn stage(
     Ok(roots)
 }
 
-fn materialize_if_changed(staged_dir: &Path, resources: &SkillResources) -> std::io::Result<()> {
-    std::fs::create_dir_all(staged_dir)?;
+/// Materialises `resources` under `staged_dir`, returning whether anything was staged.
+///
+/// Returns `false` — and leaves no directory behind — when the map is empty or every entry is
+/// rejected by the path-safety filter. The directory is created lazily by [`write_if_changed`] on
+/// the first surviving entry, so a directory whose files are all rejected is not materialised for
+/// nothing.
+fn materialize_if_changed(staged_dir: &Path, resources: &SkillResources) -> std::io::Result<bool> {
     if resources.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut expected = Vec::new();
     for (rel, content) in resources {
@@ -186,7 +204,7 @@ fn materialize_if_changed(staged_dir: &Path, resources: &SkillResources) -> std:
         expected.push(target);
     }
     remove_unexpected(staged_dir, &expected);
-    Ok(())
+    Ok(!expected.is_empty())
 }
 
 fn write_if_changed(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -357,6 +375,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn stage_materializes_to_cache_dir() {
         let base = std::env::temp_dir().join(format!("asr_stager_{}", std::process::id()));
         let cache = base.join(CACHE_DIR).join("market").join("tool");
@@ -378,6 +397,66 @@ mod tests {
         assert!(cache.join("SKILL.md").exists());
         assert!(cache.join("scripts/run.py").exists());
         assert!(cache.join("scripts").join("run.py").is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_empty_resources_reports_none_and_creates_no_dir() {
+        // A lazy repository publishes no in-memory resources; staging must report `None`
+        // and leave no staged directory behind (a `<files-root>` for a permanently empty
+        // directory makes the skill's files unreachable inside a sandbox).
+        let base = std::env::temp_dir().join(format!("asr_stager_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let skill = AgentSkill::builder()
+            .name("lazy")
+            .source("market")
+            .description("d")
+            .build();
+        let visible = vec![RepoBound::new(
+            skill,
+            SkillRepo::External { source: "market".to_string() },
+        )];
+        let ns = resolve_source_namespaces(&[SkillRepo::External { source: "market".to_string() }]);
+
+        let roots = stage(Some(&base), &visible, &ns).unwrap();
+        assert_eq!(roots.get("lazy"), Some(&StageResult::None));
+        let staged_dir = base.join(CACHE_DIR).join("market").join("lazy");
+        assert!(
+            !staged_dir.exists(),
+            "nothing was staged, so no staged directory may be left behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_all_rejected_resources_reports_none_and_creates_no_dir() {
+        // A non-empty map whose entries are all rejected by the path-safety filter must
+        // behave like the empty-map case rather than creating a directory no file lands in.
+        let base = std::env::temp_dir().join(format!("asr_stager_reject_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let skill = AgentSkill::builder()
+            .name("unsafe")
+            .source("market")
+            .description("d")
+            .add_resource("/etc/passwd", "root\n")
+            .add_resource("../escape.sh", "#!/bin/sh\n")
+            .build();
+        let visible = vec![RepoBound::new(
+            skill,
+            SkillRepo::External { source: "market".to_string() },
+        )];
+        let ns = resolve_source_namespaces(&[SkillRepo::External { source: "market".to_string() }]);
+
+        let roots = stage(Some(&base), &visible, &ns).unwrap();
+        assert_eq!(roots.get("unsafe"), Some(&StageResult::None));
+        let staged_dir = base.join(CACHE_DIR).join("market").join("unsafe");
+        assert!(!staged_dir.exists(), "no file survived the filter, so no directory may remain");
 
         let _ = std::fs::remove_dir_all(&base);
     }
