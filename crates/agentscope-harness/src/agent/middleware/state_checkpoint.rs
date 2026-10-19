@@ -8,16 +8,17 @@
 //!
 //! Mirrors the checkpoint/resume idea conceptually; the storage layer is the
 //! core [`AgentStateStore`] (e.g. [`JsonFileAgentStateStore`]).
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::AgentEvent;
 use agentscope_core::middleware::{AgentInput, EventStream, Middleware, Next, ReasoningInput};
-use agentscope_core::state::{AgentState, AgentStateStore};
+use agentscope_core::state::{AgentState, AgentStateStore, UNVERSIONED};
 use futures::Stream;
 
 /// Key under which the full `AgentState` is persisted in the store.
@@ -34,6 +35,8 @@ pub struct StateCheckpointMiddleware {
     store: Arc<dyn AgentStateStore>,
     /// Guards the one-time restore from storage on the first run of the process.
     restored: Arc<AtomicBool>,
+    /// Last store version observed per `(user, session)` slot on versioning backends.
+    versions: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl StateCheckpointMiddleware {
@@ -42,13 +45,25 @@ impl StateCheckpointMiddleware {
         Self {
             store,
             restored: Arc::new(AtomicBool::new(false)),
+            versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-/// Serializes the shared agent state and writes it under the checkpoint key.
+/// Slot key mirroring the Java `slotKey`: `(userId or anon) + "/" + sessionId`.
+fn slot_key(user_id: Option<&str>, session_id: &str) -> String {
+    let user = match user_id {
+        Some(u) if !u.trim().is_empty() => u,
+        _ => "__anon__",
+    };
+    format!("{user}/{session_id}")
+}
+
+/// Compare-and-swap write, applying the Java default `ConflictPolicy.OVERWRITE` on conflict.
+
 async fn save_state_snapshot(
     store: Arc<dyn AgentStateStore>,
+    versions: Arc<Mutex<HashMap<String, i64>>>,
     state: Arc<std::sync::Mutex<AgentState>>,
 ) {
     let (uid, sid, value) = {
@@ -59,6 +74,32 @@ async fn save_state_snapshot(
             serde_json::to_value(&*g).unwrap_or_default(),
         )
     };
+    let slot = slot_key(uid.as_deref(), &sid);
+    let expected = versions
+        .lock()
+        .unwrap()
+        .get(&slot)
+        .copied()
+        .unwrap_or(UNVERSIONED);
+    let written = store
+        .save_if_version(uid.as_deref(), &sid, AGENT_STATE_KEY, value.clone(), expected)
+        .await;
+    if written != UNVERSIONED {
+        versions.lock().unwrap().insert(slot, written);
+        return;
+    }
+    if store.supports_versioning() && expected != UNVERSIONED {
+        // Conflict: the Java default `ConflictPolicy.OVERWRITE` rewrites unconditionally.
+        let overwritten = store
+            .save_if_version(uid.as_deref(), &sid, AGENT_STATE_KEY, value.clone(), UNVERSIONED)
+            .await;
+        if overwritten != UNVERSIONED {
+            versions.lock().unwrap().insert(slot, overwritten);
+            tracing::warn!(session_id = %sid, "agent_state CAS conflict — OVERWRITE applied");
+            return;
+        }
+        tracing::warn!(session_id = %sid, "agent_state CAS conflict — falling back to save");
+    }
     store.save(uid.as_deref(), &sid, AGENT_STATE_KEY, value).await;
 }
 
@@ -75,10 +116,12 @@ impl Middleware for StateCheckpointMiddleware {
         };
         let store = Arc::clone(&self.store);
         let restored = Arc::clone(&self.restored);
+        let versions = Arc::clone(&self.versions);
 
         // Pre: restore the checkpoint once, before the inner run starts.
         let pre = {
             let store = Arc::clone(&store);
+            let versions = Arc::clone(&versions);
             let state = Arc::clone(&state);
             Box::pin(async move {
                 if restored.swap(true, Ordering::SeqCst) {
@@ -88,11 +131,18 @@ impl Middleware for StateCheckpointMiddleware {
                     let g = state.lock().unwrap();
                     (g.user_id().map(str::to_string), g.session_id().to_string())
                 };
-                if let Some(value) = store.get(uid.as_deref(), &sid, AGENT_STATE_KEY).await {
-                    if let Ok(saved) = serde_json::from_value::<AgentState>(value) {
-                        let mut g = state.lock().unwrap();
-                        *g = saved;
-                    }
+                let loaded = store
+                    .get_versioned(uid.as_deref(), &sid, AGENT_STATE_KEY)
+                    .await;
+                if let Some(saved) = loaded.value.clone().and_then(|v| serde_json::from_value::<AgentState>(v).ok()) {
+                    let mut g = state.lock().unwrap();
+                    *g = saved;
+                }
+                if store.supports_versioning() {
+                    versions
+                        .lock()
+                        .unwrap()
+                        .insert(slot_key(uid.as_deref(), &sid), loaded.version);
                 }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         };
@@ -102,19 +152,10 @@ impl Middleware for StateCheckpointMiddleware {
         // Post: persist the final state after the run drains.
         let post = {
             let store = Arc::clone(&store);
+            let versions = Arc::clone(&versions);
             let state = Arc::clone(&state);
-            Box::pin(async move {
-                let (uid, sid, value) = {
-                    let g = state.lock().unwrap();
-                    let uid = g.user_id().map(str::to_string);
-                    let sid = g.session_id().to_string();
-                    let value = serde_json::to_value(&*g).unwrap_or_default();
-                    (uid, sid, value)
-                };
-                store
-                    .save(uid.as_deref(), &sid, AGENT_STATE_KEY, value)
-                    .await;
-            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            Box::pin(save_state_snapshot(store, versions, state))
+                as Pin<Box<dyn Future<Output = ()> + Send>>
         };
 
         Box::pin(AsyncGate::new(inner, pre, post))
@@ -138,8 +179,11 @@ impl Middleware for StateCheckpointMiddleware {
         };
         let inner = next(input);
         let pre = Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>;
-        let post = Box::pin(save_state_snapshot(Arc::clone(&self.store), Arc::clone(&state)))
-            as Pin<Box<dyn Future<Output = ()> + Send>>;
+        let post = Box::pin(save_state_snapshot(
+            Arc::clone(&self.store),
+            Arc::clone(&self.versions),
+            Arc::clone(&state),
+        )) as Pin<Box<dyn Future<Output = ()> + Send>>;
         Box::pin(AsyncGate::new(inner, pre, post))
     }
 }

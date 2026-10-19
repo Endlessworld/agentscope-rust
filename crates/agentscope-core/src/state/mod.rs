@@ -13,4 +13,6 @@ pub use context::{
 };
 pub use list_hash::{compute_hash, has_changed, needs_full_rewrite, EMPTY_HASH, SAMPLING_THRESHOLD};
 pub use session_info::SessionInfo;
-pub use store::{AgentStateStore, InMemoryAgentStateStore, JsonFileAgentStateStore};
+pub use store::{
+    AgentStateStore, InMemoryAgentStateStore, JsonFileAgentStateStore, VersionedState, UNVERSIONED,
+};

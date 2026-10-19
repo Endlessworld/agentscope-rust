@@ -340,6 +340,53 @@ impl AgentStateStore for MysqlAgentStateStore {
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
         self.backend.list_session_ids(user_id).unwrap_or_default()
     }
+
+    fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::state::VersionedState {
+        if require_session_id(session_id).is_err() {
+            return agentscope_core::state::VersionedState {
+                value: None,
+                version: agentscope_core::state::UNVERSIONED,
+            };
+        }
+        let version = self
+            .backend
+            .read_version(user_id, session_id, key)
+            .unwrap_or(agentscope_core::state::UNVERSIONED);
+        agentscope_core::state::VersionedState {
+            value: self.get(user_id, session_id, key).await,
+            version,
+        }
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> i64 {
+        let expected = if expected_version == agentscope_core::state::UNVERSIONED {
+            None
+        } else {
+            Some(expected_version)
+        };
+        match MysqlAgentStateStore::save_if_version(self, user_id, session_id, key, value, expected)
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => agentscope_core::state::UNVERSIONED,
+        }
+    }
 }
 
 fn require_session_id(session_id: &str) -> MysqlResult<String> {

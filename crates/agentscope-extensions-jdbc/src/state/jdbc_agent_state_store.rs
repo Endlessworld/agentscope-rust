@@ -480,6 +480,55 @@ impl AgentStateStore for JdbcAgentStateStore {
         out.dedup();
         out
     }
+
+    fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::state::VersionedState {
+        match JdbcAgentStateStore::get_versioned(self, user_id, session_id, key) {
+            Ok(v) => agentscope_core::state::VersionedState {
+                value: v.value,
+                version: v.version,
+            },
+            Err(e) => {
+                tracing::warn!("[jdbc-state] get_versioned failed for {key}: {e}");
+                agentscope_core::state::VersionedState {
+                    value: None,
+                    version: agentscope_core::state::UNVERSIONED,
+                }
+            }
+        }
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+        expected_version: i64,
+    ) -> i64 {
+        match JdbcAgentStateStore::save_if_version(
+            self,
+            user_id,
+            session_id,
+            key,
+            value,
+            expected_version,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[jdbc-state] save_if_version failed for {key}: {e}");
+                agentscope_core::state::UNVERSIONED
+            }
+        }
+    }
 }
 
 /// Builds a `LIKE` prefix pattern matching exactly `prefix` followed by anything,

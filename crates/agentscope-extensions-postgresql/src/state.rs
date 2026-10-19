@@ -537,6 +537,58 @@ impl AgentStateStore for PostgresAgentStateStore {
             _ => Vec::new(),
         }
     }
+
+    fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::state::VersionedState {
+        let Ok(slot) = Self::slot_id(user_id, session_id) else {
+            return agentscope_core::state::VersionedState {
+                value: None,
+                version: agentscope_core::state::UNVERSIONED,
+            };
+        };
+        if Self::validate_state_key(key).is_err() {
+            return agentscope_core::state::VersionedState {
+                value: None,
+                version: agentscope_core::state::UNVERSIONED,
+            };
+        }
+        let value = self
+            .get_sync(&slot, key, SINGLE_STATE_INDEX)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok());
+        let version = self.read_version_sync(&slot, key).unwrap_or(0);
+        agentscope_core::state::VersionedState { value, version }
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+        expected_version: i64,
+    ) -> i64 {
+        match PostgresAgentStateStore::save_if_version(
+            self,
+            user_id,
+            session_id,
+            key,
+            &value,
+            expected_version,
+        ) {
+            Ok(v) => v,
+            Err(_) => agentscope_core::state::UNVERSIONED,
+        }
+    }
 }
 
 #[cfg(test)]

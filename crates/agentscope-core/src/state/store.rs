@@ -6,6 +6,29 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use crate::error::Result;
 
+/// Sentinel version for backends that do not support optimistic concurrency, and the
+/// value returned by [`AgentStateStore::save_if_version`] when a CAS write conflicts
+/// (nothing written). Mirrors the Java `AgentStateStore.UNVERSIONED`.
+pub const UNVERSIONED: i64 = -1;
+
+/// A state value paired with its optimistic-concurrency version, mirroring the Java
+/// `VersionedState`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionedState {
+    /// The loaded state, or `None` when the key is absent.
+    pub value: Option<serde_json::Value>,
+    /// Store version (`0` for an absent key on a versioning backend, [`UNVERSIONED`]
+    /// on a backend without optimistic concurrency).
+    pub version: i64,
+}
+
+impl VersionedState {
+    /// Whether a value was present in the store.
+    pub fn is_present(&self) -> bool {
+        self.value.is_some()
+    }
+}
+
 /// Persistent storage interface for AgentScope agent state, keyed by a
 /// `(userId, sessionId)` pair.
 #[async_trait]
@@ -37,6 +60,53 @@ pub trait AgentStateStore: Send + Sync {
     /// List session identifiers under the given user namespace (`None` = anonymous).
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String>;
 
+    /// Whether this backend supports optimistic concurrency through
+    /// [`AgentStateStore::get_versioned`] / [`AgentStateStore::save_if_version`].
+    ///
+    /// Default `false`: [`AgentStateStore::save_if_version`] degrades to an
+    /// unconditional [`AgentStateStore::save`].
+    fn supports_versioning(&self) -> bool {
+        false
+    }
+
+    /// Loads a single state value together with its store version.
+    ///
+    /// The default implementation wraps [`AgentStateStore::get`] and reports
+    /// [`UNVERSIONED`]. On versioning backends an absent key reports version `0`.
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> VersionedState {
+        VersionedState {
+            value: self.get(user_id, session_id, key).await,
+            version: UNVERSIONED,
+        }
+    }
+
+    /// Compare-and-swap write of a single state value.
+    ///
+    /// * `expected_version == 0` — create-if-absent (also satisfied by a row whose stored
+    ///   version is still `0`, e.g. backfilled by a schema migration).
+    /// * `expected_version == `[`UNVERSIONED`] — unconditional overwrite (same as `save`).
+    /// * otherwise — write only when the stored version equals `expected_version`.
+    ///
+    /// Returns the new version on success, or [`UNVERSIONED`] on conflict (nothing written).
+    /// The default implementation always calls [`AgentStateStore::save`] and returns
+    /// [`UNVERSIONED`], preserving last-writer-wins behaviour for non-versioning backends.
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> i64 {
+        let _ = expected_version;
+        self.save(user_id, session_id, key, value).await;
+        UNVERSIONED
+    }
 }
 
 const ANON_USER: &str = "__anon__";
@@ -59,6 +129,8 @@ fn require_session_id(session_id: &str) -> Result<String> {
 struct SessionData {
     single: HashMap<String, serde_json::Value>,
     list: HashMap<String, Vec<serde_json::Value>>,
+    /// Version assigned to each single-value key (absent = never written).
+    versions: HashMap<String, i64>,
 }
 
 /// In-memory implementation of [`AgentStateStore`] (single-process, not persistent).
@@ -86,9 +158,14 @@ impl AgentStateStore for InMemoryAgentStateStore {
     async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: serde_json::Value) {
         let _ = require_session_id(session_id);
         let mut g = self.inner.write().unwrap();
-        g.entry(normalize_user(user_id)).or_default()
-            .entry(session_id.to_string()).or_insert_with(SessionData::default)
-            .single.insert(key.to_string(), value);
+        let session = g
+            .entry(normalize_user(user_id))
+            .or_default()
+            .entry(session_id.to_string())
+            .or_insert_with(SessionData::default);
+        let next = session.versions.get(key).copied().unwrap_or(0) + 1;
+        session.single.insert(key.to_string(), value);
+        session.versions.insert(key.to_string(), next);
     }
 
     async fn save_list(&self, user_id: Option<&str>, session_id: &str, key: &str, values: &[serde_json::Value]) {
@@ -128,6 +205,59 @@ impl AgentStateStore for InMemoryAgentStateStore {
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
         self.inner.read().unwrap().get(&normalize_user(user_id)).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+    }
+
+    fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> VersionedState {
+        let g = self.inner.read().unwrap();
+        let session = g
+            .get(&normalize_user(user_id))
+            .and_then(|bucket| bucket.get(session_id));
+        let Some(session) = session else {
+            return VersionedState {
+                value: None,
+                version: 0,
+            };
+        };
+        VersionedState {
+            value: session.single.get(key).cloned(),
+            version: session.versions.get(key).copied().unwrap_or(0),
+        }
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> i64 {
+        let _ = require_session_id(session_id);
+        // A single write lock covers the read-check-write so the caller never observes a
+        // concurrent writer's version (Java #3236 / #3220).
+        let mut g = self.inner.write().unwrap();
+        let session = g
+            .entry(normalize_user(user_id))
+            .or_default()
+            .entry(session_id.to_string())
+            .or_insert_with(SessionData::default);
+        let current = session.versions.get(key).copied().unwrap_or(0);
+        if expected_version != UNVERSIONED && current != expected_version {
+            return UNVERSIONED;
+        }
+        let next = current + 1;
+        session.single.insert(key.to_string(), value);
+        session.versions.insert(key.to_string(), next);
+        next
     }
 }
 

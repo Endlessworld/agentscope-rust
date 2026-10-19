@@ -554,6 +554,48 @@ impl AgentStateStore for MongodbAgentStateStore {
             Err(_) => Vec::new(),
         }
     }
+
+    fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::state::VersionedState {
+        match MongodbAgentStateStore::get_version(self, user_id, session_id, key).await {
+            Ok((value, version)) => agentscope_core::state::VersionedState { value, version },
+            Err(_) => agentscope_core::state::VersionedState {
+                value: None,
+                version: agentscope_core::state::UNVERSIONED,
+            },
+        }
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> i64 {
+        match MongodbAgentStateStore::save_if_version(
+            self,
+            user_id,
+            session_id,
+            key,
+            &value,
+            expected_version,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => agentscope_core::state::UNVERSIONED,
+        }
+    }
 }
 
 /// Builder for [`MongodbAgentStateStore`].

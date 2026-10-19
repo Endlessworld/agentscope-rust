@@ -342,6 +342,54 @@ impl AgentStateStore for RedisAgentStateStore {
         out.sort();
         out
     }
+
+    fn supports_versioning(&self) -> bool {
+        true
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::state::VersionedState {
+        match RedisAgentStateStore::get_versioned(self, user_id, session_id, key).await {
+            Ok(v) => agentscope_core::state::VersionedState {
+                value: v.value,
+                version: i64::try_from(v.version).unwrap_or(i64::MAX),
+            },
+            Err(_) => agentscope_core::state::VersionedState {
+                value: None,
+                version: agentscope_core::state::UNVERSIONED,
+            },
+        }
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+        expected_version: i64,
+    ) -> i64 {
+        // Redis versions are `u64` and use `0` as its conflict sentinel; the core contract
+        // uses `i64` and `UNVERSIONED`. `0` on the Redis side means "unconditional bump".
+        let expected = if expected_version == agentscope_core::state::UNVERSIONED {
+            0
+        } else if expected_version < 0 {
+            return agentscope_core::state::UNVERSIONED;
+        } else {
+            expected_version as u64
+        };
+        match RedisAgentStateStore::save_if_version(self, user_id, session_id, key, &value, expected)
+            .await
+        {
+            Ok(0) if expected != 0 => agentscope_core::state::UNVERSIONED,
+            Ok(v) => i64::try_from(v).unwrap_or(i64::MAX),
+            Err(_) => agentscope_core::state::UNVERSIONED,
+        }
+    }
 }
 
 impl RedisAgentStateStore {
