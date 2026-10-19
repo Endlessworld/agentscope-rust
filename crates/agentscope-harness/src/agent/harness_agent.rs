@@ -53,7 +53,8 @@ use super::workspace::{
 use super::bus::{MessageBus, WorkspaceMessageBus, WorkspaceAsyncToolRegistry, AsyncToolRegistry};
 use crate::tool::{
     AgentListTool, AgentSendTool, AgentSpawnTool, FilesystemTool, MemoryGetTool, MemorySaveTool,
-    MemorySearchTool, ShellExecuteTool, TeamTool, WebFetchTool, WebSearchTool,
+    MemorySearchTool, PlanModeHandle, SessionSearchTool, ShellExecuteTool, TeamTool, WebFetchTool,
+    WebSearchTool,
 };
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
@@ -1263,6 +1264,11 @@ impl HarnessAgentBuilder {
         );
 
         let mut pending_skill_promoter: Option<Arc<SkillPromoter>> = None;
+        // Late-bound slot so `skill_manage` can invalidate the skill middleware's
+        // lazily-built catalog cache after it writes skills (the middleware is
+        // constructed after the manage tool in this builder).
+        let skill_mw_slot: Arc<Mutex<Option<Arc<HarnessSkillMiddleware>>>> =
+            Arc::new(Mutex::new(None));
         let mut pending_skill_usage_store: Option<Arc<Mutex<dyn SkillUsageStore>>> = None;
         let mut pending_skill_curator: Option<Arc<SkillCurator>> = None;
         let mut pending_skill_audit_log: Option<Arc<SkillAuditLog>> = None;
@@ -1324,7 +1330,15 @@ impl HarnessAgentBuilder {
                 sm_config,
             )
             .with_usage_store(Arc::clone(&usage_store))
-            .with_audit_log(Arc::clone(&audit_log));
+            .with_audit_log(Arc::clone(&audit_log))
+            .with_on_write({
+                let slot = Arc::clone(&skill_mw_slot);
+                Arc::new(move || {
+                    if let Some(mw) = slot.lock().unwrap().as_ref() {
+                        mw.invalidate();
+                    }
+                })
+            });
             let promoter = build_promoter(
                 Arc::clone(&drafts_writable),
                 Arc::clone(&main_writable),
@@ -1394,6 +1408,9 @@ impl HarnessAgentBuilder {
             // 嵌入式优化：不再于启动时全量扫描技能目录，改为惰性工具，
             // 首次调用 load_skill_through_path 时才构建索引（内部缓存）。
             let skill_mw = Arc::new(skill_mw);
+            // Bind the (already-constructed) `skill_manage` tool to this middleware so
+            // skill writes drop the cached catalog.
+            *skill_mw_slot.lock().unwrap() = Some(Arc::clone(&skill_mw));
             toolkit.register_tool(Arc::new(LazyLoadSkillTool::new(Arc::clone(&skill_mw))));
             middleware.add_arc(skill_mw as Arc<dyn agentscope_core::middleware::Middleware>);
         }
@@ -1415,6 +1432,9 @@ impl HarnessAgentBuilder {
             MemorySearchTool::register(&toolkit, Arc::clone(&workspace_manager));
             MemoryGetTool::register(&toolkit, Arc::clone(&workspace_manager));
             MemorySaveTool::register(&toolkit, Arc::clone(&workspace_manager));
+            // Session transcript tools (Java registers `SessionSearchTool` by default in the
+            // same `!disableMemoryTools` block; Rust exposes the search/list/history trio).
+            SessionSearchTool::register_all(&toolkit, Arc::clone(&workspace_manager));
         }
 
         // ---- Web tools (Java registers these by default) ----
@@ -1642,6 +1662,18 @@ impl HarnessAgentBuilder {
             let agent = agent_builder.build().expect("build ReActAgent");
             if let Some(opts) = &self.generate_options_defaults {
                 agent.set_generate_options_defaults(opts.clone());
+            }
+            // Register the plan-control tools bound to the session state, so
+            // `plan_enter`/`plan_exit` flip the persisted `plan_active` flag that core's
+            // acting phase enforces. Like Java `PlanModeTools`, they mutate
+            // `RuntimeContext`-resolved agent state (here the shared state handle).
+            if self.plan_mode_enabled {
+                PlanModeHandle::with_state(
+                    Arc::clone(&filesystem),
+                    Some(&self.plan_file_dir),
+                    agent.state_handle(),
+                )
+                .register(&toolkit);
             }
             agent
         });

@@ -41,11 +41,11 @@ async fn plan_mode_tools_enter_write_exit_roundtrip() {
     let write = agentscope_harness::tool::PlanWriteTool::new(handle.clone());
     let exit = agentscope_harness::tool::PlanExitTool::new(handle.clone());
 
-    assert!(!handle.is_plan_active().await);
+    assert!(!handle.is_plan_active());
 
     let out = run(&enter, JsonMap::new()).await;
     assert!(out.contains("plans/PLAN.md"), "enter output: {out}");
-    assert!(handle.is_plan_active().await);
+    assert!(handle.is_plan_active());
 
     let out = run(
         &write,
@@ -63,7 +63,35 @@ async fn plan_mode_tools_enter_write_exit_roundtrip() {
 
     let out = run(&exit, JsonMap::new()).await;
     assert!(out.contains("Exited plan mode"), "exit output: {out}");
-    assert!(!handle.is_plan_active().await);
+    assert!(!handle.is_plan_active());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn plan_mode_handle_binds_shared_state() {
+    // A handle built via `with_state` mutates the provided session state, so
+    // `plan_enter`/`plan_exit` flip the flag core's acting phase enforces.
+    use agentscope_core::state::AgentState;
+    use std::sync::Mutex;
+
+    let dir = temp_dir("plan_state");
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let state = Arc::new(Mutex::new(AgentState::default()));
+
+    let handle = PlanModeHandle::with_state(Arc::clone(&fs), None, Arc::clone(&state));
+    let enter = agentscope_harness::tool::PlanEnterTool::new(handle.clone());
+    let exit = agentscope_harness::tool::PlanExitTool::new(handle.clone());
+
+    run(&enter, JsonMap::new()).await;
+    assert!(
+        state.lock().unwrap().plan_mode_context.plan_active,
+        "plan_enter must set plan_active on the shared (session) state"
+    );
+    assert!(handle.is_plan_active());
+
+    run(&exit, JsonMap::new()).await;
+    assert!(!state.lock().unwrap().plan_mode_context.plan_active);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -97,4 +97,16 @@ impl PlanModeManager {
     fn default_plan_file(&self) -> String {
         format!("{}/PLAN.md", self.plan_dir)
     }
+
+    /// Writes `content` to an explicit workspace-relative plan path through the
+    /// configured filesystem (the caller owns state bookkeeping). Used by the
+    /// `plan_write` tool so it need not hold the shared state lock across the await.
+    pub async fn write_plan_file(
+        &self,
+        rc: &RuntimeContext,
+        path: &str,
+        content: &str,
+    ) -> Result<()> {
+        self.filesystem.write(rc, path, content).await
+    }
 }

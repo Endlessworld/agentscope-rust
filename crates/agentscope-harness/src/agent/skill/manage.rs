@@ -14,6 +14,7 @@ use super::curator::{SkillState, SkillUsageRecord, SkillUsageStore};
 use super::model::AgentSkill;
 use super::promoter::{SkillAuditLog, SkillPromoter, SkillPromotionGate, AllowListGate};
 use super::repository::SkillRepository;
+use crate::tool::fuzzy_text_matcher;
 
 /// Configuration for the `skill_manage` tool, mirroring `SkillManageConfig`.
 #[derive(Debug, Clone)]
@@ -58,6 +59,9 @@ pub struct SkillManageTool {
     usage_store: Option<Arc<Mutex<dyn SkillUsageStore>>>,
     audit_log: Option<Arc<SkillAuditLog>>,
     promoter: Option<Arc<SkillPromoter>>,
+    /// Called after any mutation that changes the on-disk skill set, so the
+    /// skill middleware can drop its lazily-built catalog cache.
+    on_write: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SkillManageTool {
@@ -73,7 +77,136 @@ impl SkillManageTool {
             usage_store: None,
             audit_log: None,
             promoter: None,
+            on_write: None,
         }
+    }
+
+    /// Registers a callback invoked after every skill mutation, used to invalidate
+    /// the skill middleware's catalog cache (aligns with Java rebuilding the catalog
+    /// per `onSystemPrompt` pass).
+    pub fn with_on_write(mut self, cb: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.on_write = Some(cb);
+        self
+    }
+
+    fn notify_write(&self) {
+        if let Some(cb) = &self.on_write {
+            cb();
+        }
+    }
+
+    /// Locates the writable repository holding `name` (drafts take precedence).
+    fn locate(&self, name: &str) -> Option<Arc<dyn SkillRepository>> {
+        for repo in [&self.drafts_repo, &self.main_repo] {
+            if repo.load().iter().any(|s| s.name() == name) {
+                return Some(Arc::clone(repo));
+            }
+        }
+        None
+    }
+
+    fn load_skill(&self, repo: &Arc<dyn SkillRepository>, name: &str) -> Option<AgentSkill> {
+        repo.load().into_iter().find(|s| s.name() == name)
+    }
+
+    /// Overwrites a single resource of `skill` (persisting the full resource map).
+    fn write_resource(
+        &self,
+        repo: &Arc<dyn SkillRepository>,
+        skill: &AgentSkill,
+        rel: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
+        let mut resources = skill.resources().clone();
+        resources.insert(rel.to_string(), content.to_string());
+        let updated = AgentSkill::builder()
+            .name(skill.name())
+            .source(skill.source())
+            .description(skill.description())
+            .metadata(skill.metadata().clone())
+            .resources(resources)
+            .build();
+        repo.write_skill(&updated)
+    }
+
+    /// Replaces a skill's `SKILL.md` wholesale (Java `doEdit`).
+    fn do_edit(&self, name: &str, content: &str) -> ToolResultBlock {
+        if content.trim().is_empty() {
+            return ToolResultBlock::error("Missing 'content' parameter (full SKILL.md).");
+        }
+        let Some(repo) = self.locate(name) else {
+            return ToolResultBlock::error(format!("Skill '{name}' not found."));
+        };
+        let Some(skill) = self.load_skill(&repo, name) else {
+            return ToolResultBlock::error(format!("Skill '{name}' not found."));
+        };
+        if let Err(e) = self.write_resource(&repo, &skill, "SKILL.md", content) {
+            return ToolResultBlock::error(format!("Failed to edit skill '{name}': {e}"));
+        }
+        self.notify_write();
+        ToolResultBlock::text(format!("Skill '{name}' SKILL.md replaced."))
+    }
+
+    /// Fuzzy patch of a single skill resource (Java `doPatch`).
+    fn do_patch(
+        &self,
+        name: &str,
+        old_string: &str,
+        new_string: &str,
+        file_path: Option<&str>,
+        replace_all: bool,
+    ) -> ToolResultBlock {
+        let rel = file_path.filter(|p| !p.is_empty()).unwrap_or("SKILL.md");
+        let Some(repo) = self.locate(name) else {
+            return ToolResultBlock::error(format!("Skill '{name}' not found."));
+        };
+        let Some(skill) = self.load_skill(&repo, name) else {
+            return ToolResultBlock::error(format!("Skill '{name}' not found."));
+        };
+        let Some(existing) = skill.resources().get(rel).cloned() else {
+            return ToolResultBlock::error(format!("File not found: {rel} (in skill '{name}')"));
+        };
+        let found = fuzzy_text_matcher::search(&existing, old_string);
+        if found.is_empty() {
+            return ToolResultBlock::error(format!(
+                "old_string not found in {rel} at any fuzziness level (tried exact, \
+                 trailing-whitespace, and collapsed-whitespace)."
+            ));
+        }
+        let (updated, replacements) = if replace_all {
+            // Apply right-to-left so earlier byte offsets stay valid.
+            let mut s = existing.clone();
+            for m in found.matches.iter().rev() {
+                s.replace_range(m.start..m.end, new_string);
+            }
+            (s, found.matches.len())
+        } else {
+            if found.matches.len() > 1 {
+                return ToolResultBlock::error(format!(
+                    "old_string is not unique in {rel} (found {} occurrences at match level \
+                     {:?}). Add more surrounding context to make it unique, or set \
+                     replace_all=true.",
+                    found.matches.len(),
+                    found.level
+                ));
+            }
+            let m = &found.matches[0];
+            let mut s = existing.clone();
+            s.replace_range(m.start..m.end, new_string);
+            (s, 1)
+        };
+        if let Err(e) = self.write_resource(&repo, &skill, rel, &updated) {
+            return ToolResultBlock::error(format!("Failed to write patched file: {e}"));
+        }
+        self.notify_write();
+        let suffix = if found.level == fuzzy_text_matcher::Level::Exact {
+            String::new()
+        } else {
+            format!(" [fuzzy: {:?}]", found.level)
+        };
+        ToolResultBlock::text(format!(
+            "Patched {rel} in '{name}' ({replacements} replacement(s)){suffix}"
+        ))
     }
 
     pub fn with_usage_store(mut self, store: Arc<Mutex<dyn SkillUsageStore>>) -> Self {
@@ -181,11 +314,16 @@ impl Tool for SkillManageTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "update", "promote", "archive", "list"],
+                    "enum": ["create", "update", "edit", "patch", "promote", "archive", "list"],
                     "description": "The skill-management action to perform."
                 },
-                "name": {"type": "string", "description": "Skill name (required for create/update/promote/archive)."},
+                "name": {"type": "string", "description": "Skill name (required for create/update/edit/patch/promote/archive)."},
                 "skill_md": {"type": "string", "description": "SKILL.md content (create/update)."},
+                "content": {"type": "string", "description": "Full SKILL.md content (edit)."},
+                "old_string": {"type": "string", "description": "Text to replace (patch)."},
+                "new_string": {"type": "string", "description": "Replacement text (patch)."},
+                "file_path": {"type": "string", "description": "Skill-relative file to patch (patch; default SKILL.md)."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (patch; default false)."},
                 "reviewer": {"type": "string", "description": "Reviewer id for promotion (default 'agent')."}
             },
             "required": ["action"]
@@ -206,9 +344,37 @@ impl Tool for SkillManageTool {
                     .unwrap_or("# Skill\n")
                     .to_string();
                 match self.create_draft(name, &skill_md, vec![]) {
-                    Ok(()) => Ok(ToolResultBlock::text(format!("skill '{name}' {action}d"))),
+                    Ok(()) => {
+                        self.notify_write();
+                        Ok(ToolResultBlock::text(format!("skill '{name}' {action}d")))
+                    }
                     Err(e) => Ok(ToolResultBlock::error(format!("failed: {e}"))),
                 }
+            }
+            "edit" => {
+                let name = required_str(&args, "name")?;
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| agentscope_core::Error::Tool("missing 'content'".into()))?;
+                Ok(self.do_edit(name, content))
+            }
+            "patch" => {
+                let name = required_str(&args, "name")?;
+                let old_string = args
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| agentscope_core::Error::Tool("missing 'old_string'".into()))?;
+                let new_string = args
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| agentscope_core::Error::Tool("missing 'new_string'".into()))?;
+                let file_path = args.get("file_path").and_then(|v| v.as_str());
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Ok(self.do_patch(name, old_string, new_string, file_path, replace_all))
             }
             "promote" => {
                 let name = required_str(&args, "name")?;
@@ -217,12 +383,17 @@ impl Tool for SkillManageTool {
                     .and_then(|v| v.as_str())
                     .unwrap_or("agent")
                     .to_string();
-                Ok(ToolResultBlock::text(self.promote(name, &reviewer)))
+                let out = self.promote(name, &reviewer);
+                self.notify_write();
+                Ok(ToolResultBlock::text(out))
             }
             "archive" => {
                 let name = required_str(&args, "name")?;
                 match self.main_repo.delete_skill(name) {
-                    Ok(()) => Ok(ToolResultBlock::text(format!("archived '{name}'"))),
+                    Ok(()) => {
+                        self.notify_write();
+                        Ok(ToolResultBlock::text(format!("archived '{name}'")))
+                    }
                     Err(e) => Ok(ToolResultBlock::error(format!("failed: {e}"))),
                 }
             }
@@ -377,5 +548,101 @@ mod tests {
         let out = propose.call(args, ToolExecutionContext::default()).await.unwrap();
         assert!(out.text_content().contains("probe"));
         assert_eq!(manage.drafts_repo.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_skill_md() {
+        let drafts = temp("ed");
+        let main = temp("em");
+        let tool = SkillManageTool::new(
+            Arc::new(WorkspaceSkillRepository::new_writable(&main, "main")),
+            Arc::new(WorkspaceSkillRepository::new_writable(&drafts, "drafts")),
+            SkillManageConfig::new(main, drafts),
+        );
+        tool.create_draft("demo", "# Demo\n\nold body\n", vec![]).unwrap();
+        let args = json!({"action": "edit", "name": "demo", "content": "# Demo\n\nnew body\n"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        assert!(out.text_content().contains("SKILL.md replaced"));
+        let skill = tool.drafts_repo.load().into_iter().find(|s| s.name() == "demo").unwrap();
+        assert_eq!(skill.resources().get("SKILL.md").unwrap(), "# Demo\n\nnew body\n");
+    }
+
+    #[tokio::test]
+    async fn patch_applies_fuzzy_and_reports_level() {
+        let drafts = temp("pa");
+        let main = temp("pm2");
+        let tool = SkillManageTool::new(
+            Arc::new(WorkspaceSkillRepository::new_writable(&main, "main")),
+            Arc::new(WorkspaceSkillRepository::new_writable(&drafts, "drafts")),
+            SkillManageConfig::new(main, drafts),
+        );
+        // Trailing-whitespace-normalised match: the old_string carries different
+        // trailing spaces than the stored file.
+        tool.create_draft("demo", "# Demo\ntarget line   \nend\n", vec![]).unwrap();
+        let args = json!({
+            "action": "patch",
+            "name": "demo",
+            "old_string": "target line\n",
+            "new_string": "replaced\n"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let text = out.text_content();
+        assert!(text.contains("Patched SKILL.md"), "got: {text}");
+        assert!(text.contains("fuzzy"), "expected fuzzy level suffix, got: {text}");
+        let skill = tool.drafts_repo.load().into_iter().find(|s| s.name() == "demo").unwrap();
+        assert!(skill.resources().get("SKILL.md").unwrap().contains("replaced"));
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_non_unique_without_replace_all() {
+        let drafts = temp("pn");
+        let main = temp("pm3");
+        let tool = SkillManageTool::new(
+            Arc::new(WorkspaceSkillRepository::new_writable(&main, "main")),
+            Arc::new(WorkspaceSkillRepository::new_writable(&drafts, "drafts")),
+            SkillManageConfig::new(main, drafts),
+        );
+        tool.create_draft("demo", "dup\ndup\n", vec![]).unwrap();
+        let args = json!({
+            "action": "patch",
+            "name": "demo",
+            "old_string": "dup",
+            "new_string": "x"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        assert!(out.text_content().contains("not unique"), "got: {}", out.text_content());
+    }
+
+    #[tokio::test]
+    async fn on_write_callback_fires_on_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let drafts = temp("owd");
+        let main = temp("owm");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&counter);
+        let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        let tool = SkillManageTool::new(
+            Arc::new(WorkspaceSkillRepository::new_writable(&main, "main")),
+            Arc::new(WorkspaceSkillRepository::new_writable(&drafts, "drafts")),
+            SkillManageConfig::new(main, drafts),
+        )
+        .with_on_write(cb);
+        let args = json!({"action": "create", "name": "demo", "skill_md": "# D\n"})
+            .as_object()
+            .unwrap()
+            .clone();
+        tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

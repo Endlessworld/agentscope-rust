@@ -6,7 +6,7 @@
 //! Wiring to the session's real `AgentState` happens when `RuntimeContext`
 //! gains an agent-state binding (see root tracker 2.4); until then the shared
 //! state is owned by the tool set, which is sufficient for single-agent usage.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
@@ -22,24 +22,40 @@ use crate::filesystem::Filesystem;
 #[derive(Clone)]
 pub struct PlanModeHandle {
     manager: Arc<PlanModeManager>,
-    state: Arc<tokio::sync::Mutex<AgentState>>,
+    state: Arc<Mutex<AgentState>>,
 }
 
 impl PlanModeHandle {
+    /// Builds a handle over a private state (standalone / test use).
     pub fn new(fs: Arc<dyn Filesystem>, plan_dir: Option<&str>) -> Self {
         Self {
             manager: Arc::new(PlanModeManager::new(fs, plan_dir)),
-            state: Arc::new(tokio::sync::Mutex::new(AgentState::default())),
+            state: Arc::new(Mutex::new(AgentState::default())),
         }
+    }
+
+    /// Builds a handle bound to an existing (session) state handle, so plan-mode
+    /// changes persist with the session and are visible to the acting phase.
+    pub fn with_state(
+        fs: Arc<dyn Filesystem>,
+        plan_dir: Option<&str>,
+        state: Arc<Mutex<AgentState>>,
+    ) -> Self {
+        Self { manager: Arc::new(PlanModeManager::new(fs, plan_dir)), state }
     }
 
     pub fn manager(&self) -> &PlanModeManager {
         &self.manager
     }
 
+    /// The shared agent-state handle behind these tools.
+    pub fn state(&self) -> &Arc<Mutex<AgentState>> {
+        &self.state
+    }
+
     /// Whether plan mode is currently active.
-    pub async fn is_plan_active(&self) -> bool {
-        let state = self.state.lock().await;
+    pub fn is_plan_active(&self) -> bool {
+        let state = self.state.lock().unwrap();
         self.manager.is_plan_active(&state)
     }
 
@@ -77,7 +93,7 @@ impl Tool for PlanEnterTool {
     }
 
     async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let mut state = self.handle.state.lock().await;
+        let mut state = self.handle.state.lock().unwrap();
         let path = self.handle.manager.enter(&mut state);
         Ok(ToolResultBlock::text(format!(
             "Entered plan mode. Write your plan with plan_write to `{path}`, then call \
@@ -127,9 +143,16 @@ impl Tool for PlanWriteTool {
             return Ok(ToolResultBlock::error("Missing string argument: content"));
         };
         let rt = RuntimeContext::default();
-        let mut state = self.handle.state.lock().await;
-        match self.handle.manager.write_plan(&rt, &mut state, content).await {
-            Ok(path) => Ok(ToolResultBlock::text(format!("Plan written to {path}"))),
+        // Compute/record the path under the lock, then release it before the async file
+        // write (the std guard is not held across the await).
+        let path = {
+            let mut state = self.handle.state.lock().unwrap();
+            let path = self.handle.manager.plan_file_path(&state);
+            state.plan_mode_context.current_plan_file = Some(path.clone());
+            path
+        };
+        match self.handle.manager.write_plan_file(&rt, &path, content).await {
+            Ok(()) => Ok(ToolResultBlock::text(format!("Plan written to {path}"))),
             Err(e) => Ok(ToolResultBlock::error(e.to_string())),
         }
     }
@@ -161,7 +184,7 @@ impl Tool for PlanExitTool {
     }
 
     async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let mut state = self.handle.state.lock().await;
+        let mut state = self.handle.state.lock().unwrap();
         let file = self.handle.manager.plan_file_path(&state);
         self.handle.manager.exit(&mut state);
         Ok(ToolResultBlock::text(format!(

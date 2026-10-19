@@ -106,6 +106,23 @@ fn find_all_normalized(haystack: &Normalized, needle: &Normalized, level: Level)
     out
 }
 
+/// End (exclusive) of the line body within `[line_start, line_end)`. A `'\r'` that immediately
+/// precedes the line's `'\n'` belongs to a CRLF terminator, not to the line body.
+///
+/// Without this, a Windows-authored file normalises to `"foo\r\n"` while an LF-only needle
+/// normalises to `"foo\n"`, so *no* rung of the ladder matches — including
+/// `WhitespaceCollapsed`, whose whole purpose is to absorb exactly this kind of difference. The
+/// same offset doubles as the map target for the emitted newline, so a match ending at a line
+/// boundary stops *before* the whole CRLF sequence instead of swallowing the `'\r'`.
+#[allow(clippy::needless_range_loop)]
+fn line_body_end(chars: &[char], line_start: usize, line_end: usize) -> usize {
+    if line_end < chars.len() && line_end > line_start && chars[line_end - 1] == '\r' {
+        line_end - 1
+    } else {
+        line_end
+    }
+}
+
 #[allow(clippy::needless_range_loop)]
 fn strip_trailing_whitespace(s: &str) -> Normalized {
     let chars: Vec<char> = s.chars().collect();
@@ -119,7 +136,9 @@ fn strip_trailing_whitespace(s: &str) -> Normalized {
         while line_end < len && chars[line_end] != '\n' {
             line_end += 1;
         }
-        let mut trim_end = line_end;
+        // CRLF: the carriage return is part of the terminator, not the line body.
+        let body_end = line_body_end(&chars, line_start, line_end);
+        let mut trim_end = body_end;
         while trim_end > line_start
             && (chars[trim_end - 1] == ' ' || chars[trim_end - 1] == '\t')
         {
@@ -131,7 +150,7 @@ fn strip_trailing_whitespace(s: &str) -> Normalized {
         }
         if line_end < len {
             out.push('\n');
-            map.push(line_end);
+            map.push(body_end);
         }
         i = line_end + 1;
     }
@@ -151,14 +170,16 @@ fn collapse_whitespace(s: &str) -> Normalized {
         while line_end < len && chars[line_end] != '\n' {
             line_end += 1;
         }
+        // CRLF: the carriage return is part of the terminator, not line content.
+        let body_end = line_body_end(&chars, line_start, line_end);
         let mut j = line_start;
-        while j < line_end && (chars[j] == ' ' || chars[j] == '\t') {
+        while j < body_end && (chars[j] == ' ' || chars[j] == '\t') {
             j += 1;
         }
         let mut in_run = false;
         let mut run_orig_start = 0usize;
         let content_emitted_at = map.len();
-        while j < line_end {
+        while j < body_end {
             let c = chars[j];
             if c == ' ' || c == '\t' {
                 if !in_run {
@@ -178,7 +199,7 @@ fn collapse_whitespace(s: &str) -> Normalized {
         }
         if line_end < len && map.len() > content_emitted_at {
             out.push('\n');
-            map.push(line_end);
+            map.push(body_end);
         }
         i = line_end + 1;
     }
@@ -225,5 +246,62 @@ mod tests {
         let r = search("aa bb aa", "aa");
         assert_eq!(r.level, Level::Exact);
         assert_eq!(r.matches.len(), 2);
+    }
+
+    #[test]
+    fn crlf_existing_matches_lf_needle() {
+        // Core repro: a Windows-authored file normalises to "foo\r\n" while an LF-only needle
+        // normalises to "foo\n", so no rung of the ladder used to match.
+        let existing = "PREFIX_KEEP\r\nalpha\r\nbeta\r\nSUFFIX_KEEP\r\n";
+        let needle = "alpha\nbeta";
+        let r = search(existing, needle);
+        assert_eq!(r.level, Level::TrailingWsStripped);
+        assert_eq!(r.matches.len(), 1);
+    }
+
+    #[test]
+    fn crlf_match_range_preserves_terminators() {
+        // The mapped range must stop *before* the whole CRLF sequence instead of swallowing
+        // the '\r' and silently downgrading that line's terminator to LF.
+        let existing = "PREFIX_KEEP\r\nalpha \r\nbeta\r\nSUFFIX_KEEP\r\n";
+        let needle = "alpha\nbeta";
+        let r = search(existing, needle);
+        assert_eq!(r.matches.len(), 1);
+        let m = &r.matches[0];
+        assert_eq!(&existing[m.start..m.end], "alpha \r\nbeta");
+
+        // Splicing the replacement over that range leaves surrounding bytes verbatim.
+        let patched = format!("{}ALPHA{}", &existing[..m.start], &existing[m.end..]);
+        assert_eq!(patched, "PREFIX_KEEP\r\nALPHA\r\nSUFFIX_KEEP\r\n");
+    }
+
+    #[test]
+    fn crlf_collapse_level_handles_indent_drift() {
+        let existing = "\talpha\t\tbeta\r\n";
+        let needle = "alpha beta";
+        let r = search(existing, needle);
+        assert_eq!(r.level, Level::WhitespaceCollapsed);
+        assert_eq!(r.matches.len(), 1);
+    }
+
+    #[test]
+    fn crlf_behaves_like_lf_twin() {
+        let crlf = "PREFIX_KEEP\r\nalpha \r\nbeta\r\nSUFFIX_KEEP\r\n";
+        let lf = "PREFIX_KEEP\nalpha \nbeta\nSUFFIX_KEEP\n";
+        for needle in ["alpha\nbeta", "SUFFIX_KEEP"] {
+            let a = search(crlf, needle);
+            let b = search(lf, needle);
+            assert_eq!(a.is_empty(), b.is_empty(), "needle {needle}");
+            assert_eq!(a.level, b.level, "needle {needle}");
+            assert_eq!(a.matches.len(), b.matches.len(), "needle {needle}");
+            if let Some(m) = a.matches.first() {
+                // Same matched text modulo the CRLF terminator folding.
+                assert_eq!(
+                    crlf[m.start..m.end].replace('\r', ""),
+                    lf[b.matches[0].start..b.matches[0].end],
+                    "needle {needle}"
+                );
+            }
+        }
     }
 }
