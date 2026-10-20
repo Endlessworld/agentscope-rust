@@ -95,11 +95,11 @@ impl AnthropicMessagesModel {
         // `async-anthropic` sends every request through `Client::http_client`,
         // so per-request additional headers (e.g. `x-opencode-session`) are
         // injected as default headers of a dedicated reqwest client.
-        let mut headers = reqwest::header::HeaderMap::new();
+        let mut headers = reqwest12::header::HeaderMap::new();
         for (k, v) in additional_headers {
-            let name = reqwest::header::HeaderName::from_str(k)
+            let name = reqwest12::header::HeaderName::from_str(k)
                 .map_err(|e| Error::Model(format!("invalid header name '{k}': {e}")))?;
-            let value = reqwest::header::HeaderValue::from_str(v)
+            let value = reqwest12::header::HeaderValue::from_str(v)
                 .map_err(|e| Error::Model(format!("invalid header value for '{k}': {e}")))?;
             headers.insert(name, value);
         }
@@ -108,7 +108,7 @@ impl AnthropicMessagesModel {
         // `MODEL__GAP_TRACKER.md` §3.3 / the anthropic double-implementation
         // convergence note in §4.2).
         let transport_cfg = crate::common::TransportConfig::default();
-        let http = reqwest::Client::builder()
+        let http = reqwest12::Client::builder()
             .default_headers(headers)
             .connect_timeout(transport_cfg.connect_timeout)
             .read_timeout(transport_cfg.read_timeout)

@@ -23,7 +23,9 @@ tokio = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-# Optional concrete backend (feature `aliyun`).
+# Optional concrete backend (feature `aliyun`)，当前代码未接线（无 `cfg(feature = "aliyun")`
+# 使用点）。0.0.4 仍钉 reqwest 0.11（仅存在于 Cargo.lock，未参与构建）；升级到 0.2.2
+# 需要联网取包，本轮离线环境未做。
 aliyun-oss-rust-sdk = { version = "0.0.4", optional = true, default-features = false }
 
 [dev-dependencies]

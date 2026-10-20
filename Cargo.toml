@@ -43,9 +43,11 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 futures = "0.3"
 tracing = "0.1"
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 schemars = "1"
-jsonschema = "0.30"
+# 关闭默认特性：默认开启的 `resolve-http` 会拉入 reqwest 0.12，与 workspace 统一的
+# 0.13 冲突。本仓只用内联 schema 校验（`validator_for`），不需要远程 `$ref` 解析。
+jsonschema = { version = "0.30", default-features = false, features = ["resolve-file"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 base64 = "0.22"

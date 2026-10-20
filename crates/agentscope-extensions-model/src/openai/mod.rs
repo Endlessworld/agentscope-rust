@@ -64,13 +64,13 @@ const TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
 /// A stalled network (or a dropped Wi-Fi link) otherwise leaves the SSE stream
 /// pending indefinitely, which freezes the agent and its ACP UI. The connect /
 /// read timeouts turn such a stall into a retryable transport error.
-fn build_http_client() -> reqwest13::Client {
-    reqwest13::Client::builder()
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_READ_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)
         .build()
-        .unwrap_or_else(|_| reqwest13::Client::new())
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// An OpenAI-compatible chat model backed by `async-openai`.

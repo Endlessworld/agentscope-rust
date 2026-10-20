@@ -17,13 +17,14 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 # 本 crate 新增依赖（用具体版本号，见 docs/extensions/MODEL__GAP_TRACKER.md §4.2）
 uuid = { version = "1", features = ["v4", "serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { workspace = true }
 base64 = "0.22"
 async-stream = "0.3"
 # OpenAI/Anthropic 官方协议实现（自 agentscope-core 迁入，2026-09-21）
-# `async-openai` 0.41 依赖 reqwest 0.13，与 workspace 的 0.12 不同；
-# 以别名 reqwest13 引入，匹配 Client::with_http_client 所需的版本。
-reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+# `async-anthropic` 0.6 仍钉住 reqwest 0.12（其 `Client::http_client` 参数类型
+# 即该版本的 `reqwest::Client`），workspace 统一到 0.13 后只能以别名保留一个
+# 0.12 实例，仅用于 anthropic_async 注入自定义 HTTP client。
+reqwest12 = { package = "reqwest", version = "0.12", default-features = false, features = ["json"] }
 async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "chat-completion-types", "byot", "middleware", "rustls", "responses", "response-types"] }
 async-anthropic = { version = "0.6", default-features = false, features = ["rustls"] }
 
