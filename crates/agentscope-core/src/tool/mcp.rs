@@ -14,10 +14,16 @@ use crate::tool::ToolExecutionContext;
 use super::tool::Tool;
 
 /// A tool backed by a remote MCP server tool definition.
-/// An async MCP dispatch handler: given the tool and its argument map, returns
-/// a pinned future that resolves to a [`ToolResultBlock`].
+/// An async MCP dispatch handler: given the tool, its argument map and the request
+/// metadata to propagate (`None` when propagation is disabled), returns a pinned
+/// future that resolves to a [`ToolResultBlock`].
+///
+/// The metadata argument is the Rust equivalent of Java
+/// `McpTool.buildMetaMap(...)`: it carries `io.agentscope/toolCallId` and is
+/// `None` — not an empty map — when propagation is off, so the transport omits the
+/// `_meta` field entirely.
 pub type McpAsyncHandler = Box<
-    dyn Fn(&McpTool, JsonMap) -> std::pin::Pin<
+    dyn Fn(&McpTool, JsonMap, Option<JsonMap>) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ToolResultBlock>> + Send>,
     > + Send
         + Sync,
@@ -37,6 +43,13 @@ pub struct McpTool {
     /// present. Lets MCP tool calls await a real client round-trip without
     /// blocking the tokio runtime.
     async_handler: Option<McpAsyncHandler>,
+    /// Per-tool restriction for request metadata propagation.
+    ///
+    /// Effective propagation is the logical AND of this flag and the
+    /// connection-level switch (`McpServerConfig::propagate_meta`, read live on every
+    /// call). Mirrors Java `McpTool.propagateMeta`: the value is fixed at
+    /// registration time and can only further restrict propagation.
+    propagate_meta: bool,
 }
 
 impl std::fmt::Debug for McpTool {
@@ -65,6 +78,7 @@ impl McpTool {
             server: server.into(),
             handler,
             async_handler: None,
+            propagate_meta: true,
         }
     }
 
@@ -112,6 +126,41 @@ impl McpTool {
     pub fn server(&self) -> &str {
         &self.server
     }
+
+    /// Whether this tool allows request metadata propagation.
+    ///
+    /// This is a per-tool restriction only: the actual decision also ANDs the
+    /// connection-level switch, which is read live on every call.
+    pub fn propagate_meta(&self) -> bool {
+        self.propagate_meta
+    }
+
+    /// Configures whether this tool allows request metadata propagation.
+    ///
+    /// Setting this to `false` permanently restricts this tool; setting it back to
+    /// `true` only re-enables propagation if the connection-level switch also allows
+    /// it.
+    pub fn with_propagate_meta(mut self, propagate_meta: bool) -> Self {
+        self.propagate_meta = propagate_meta;
+        self
+    }
+
+    /// Builds the request metadata sent to the server (Java `McpTool.buildMetaMap`).
+    ///
+    /// Today this carries the framework tool-call id under
+    /// `io.agentscope/toolCallId`. Java additionally merges user `McpMeta` entries
+    /// registered in the runtime context; Rust has no typed context-key mechanism, so
+    /// that half is not implemented (see the module report).
+    fn build_meta(&self, ctx: &ToolExecutionContext) -> JsonMap {
+        let mut meta = JsonMap::new();
+        if let Some(call) = &ctx.tool_call {
+            meta.insert(
+                "io.agentscope/toolCallId".to_string(),
+                serde_json::Value::String(call.id.clone()),
+            );
+        }
+        meta
+    }
 }
 
 #[async_trait]
@@ -137,8 +186,11 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+        // Request metadata is propagated only when this tool allows it; `None` omits
+        // the MCP `_meta` field entirely so no metadata leaves the process.
+        let meta = if self.propagate_meta { Some(self.build_meta(&_ctx)) } else { None };
         let outcome = if let Some(async_handler) = &self.async_handler {
-            async_handler(self, args).await
+            async_handler(self, args, meta).await
         } else {
             (self.handler)(self, args)
         };
@@ -167,6 +219,70 @@ pub fn not_connected_handler(tool: &McpTool, _args: JsonMap) -> Result<ToolResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::ToolUseBlock;
+    use std::sync::{Arc, Mutex};
+
+    /// Builds a tool whose async handler records the propagated metadata.
+    fn meta_recording_tool(
+        propagate: bool,
+    ) -> (McpTool, Arc<Mutex<Option<Option<JsonMap>>>>) {
+        let seen: Arc<Mutex<Option<Option<JsonMap>>>> = Arc::new(Mutex::new(None));
+        let seen_handler = Arc::clone(&seen);
+        let tool = McpTool::new(
+            "srv",
+            "remote_tool",
+            "desc",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("sync"))),
+        )
+        .with_async_handler(Box::new(move |_t, _a, meta| {
+            let seen = Arc::clone(&seen_handler);
+            Box::pin(async move {
+                *seen.lock().unwrap() = Some(meta);
+                Ok(ToolResultBlock::text("ok"))
+            })
+        }))
+        .with_propagate_meta(propagate);
+        (tool, seen)
+    }
+
+    fn ctx_with_call(id: &str) -> ToolExecutionContext {
+        ToolExecutionContext {
+            tool_call: Some(ToolUseBlock::new(id, "remote_tool", JsonMap::new())),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_carries_the_tool_call_id_when_propagation_is_enabled() {
+        let (tool, seen) = meta_recording_tool(true);
+        assert!(tool.propagate_meta());
+
+        tool.call(JsonMap::new(), ctx_with_call("call-42"))
+            .await
+            .unwrap();
+
+        let meta = seen.lock().unwrap().clone().expect("handler must be called");
+        let meta = meta.expect("propagation on -> Some(meta)");
+        assert_eq!(
+            meta.get("io.agentscope/toolCallId"),
+            Some(&serde_json::Value::String("call-42".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_is_none_when_the_tool_disables_propagation() {
+        // Fail-closed: the whole `_meta` field is omitted, not sent empty.
+        let (tool, seen) = meta_recording_tool(false);
+        assert!(!tool.propagate_meta());
+
+        tool.call(JsonMap::new(), ctx_with_call("call-7"))
+            .await
+            .unwrap();
+
+        let meta = seen.lock().unwrap().clone().expect("handler must be called");
+        assert!(meta.is_none(), "propagation off -> None, got {meta:?}");
+    }
 
     fn bare_tool() -> McpTool {
         McpTool::new(
@@ -176,6 +292,11 @@ mod tests {
             serde_json::json!({"type": "object"}),
             Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
         )
+    }
+
+    #[test]
+    fn propagation_defaults_to_enabled() {
+        assert!(bare_tool().propagate_meta());
     }
 
     #[test]

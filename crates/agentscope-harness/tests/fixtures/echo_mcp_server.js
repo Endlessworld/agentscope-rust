@@ -44,10 +44,15 @@ function handle(method, params, id) {
     case 'tools/call':
       const args = (params && params.arguments) || {};
       const msg = args.message || '';
+      // Echo the propagated request metadata so tests can assert on the wire.
+      const meta = (params && params._meta) || null;
+      const text = meta === null
+        ? `echo: ${msg}`
+        : `echo: ${msg} | meta: ${JSON.stringify(meta)}`;
       send({
         jsonrpc: '2.0', id,
         result: {
-          content: [{ type: 'text', text: `echo: ${msg}` }],
+          content: [{ type: 'text', text }],
         },
       });
       break;

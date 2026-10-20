@@ -185,6 +185,7 @@ impl McpAcpConnection {
                 dyn Fn(
                         &McpTool,
                         serde_json::Map<String, serde_json::Value>,
+                        Option<serde_json::Map<String, serde_json::Value>>,
                     ) -> Pin<
                         Box<
                             dyn Future<
@@ -193,7 +194,10 @@ impl McpAcpConnection {
                         >,
                     > + Send
                     + Sync,
-            > = Box::new(move |_tool, args| {
+            > = Box::new(move |_tool, args, _meta| {
+                // MCP-over-ACP has no `_meta` channel on the ACP request, so the
+                // propagated metadata is deliberately dropped here rather than being
+                // smuggled into the tool arguments.
                 let connection = connection.clone();
                 let tool_name = tool_name.clone();
                 Box::pin(async move {

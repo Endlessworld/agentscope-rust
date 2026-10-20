@@ -160,20 +160,96 @@ impl Registrar for McpServerRegistrar {
 }
 
 
+/// Per-registration metadata-propagation options, mirroring Java
+/// `Toolkit.ToolRegistration#propagateMeta`.
+///
+/// Effective propagation for a tool is the logical AND of:
+/// this registration-level decision (fixed when the tool is bridged), the tool's own
+/// switch, and the connection-level switch read live on every call.
+#[derive(Debug, Clone, Default)]
+pub struct McpMetaPropagationOptions {
+    /// Client-wide default for every tool bridged from a server; `None` leaves the
+    /// per-tool default (`true`).
+    pub propagate_meta: Option<bool>,
+    /// Per-tool overrides keyed by the remote tool name (before any prefix). A later
+    /// entry for the same name overwrites the earlier one.
+    pub tool_overrides: Vec<(String, bool)>,
+}
+
+impl McpMetaPropagationOptions {
+    /// Creates empty options: everything defaults to `true`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the registration-wide default.
+    pub fn propagate_meta(mut self, propagate_meta: bool) -> Self {
+        self.propagate_meta = Some(propagate_meta);
+        self
+    }
+
+    /// Sets a per-tool override.
+    ///
+    /// Mirrors Java `ToolRegistration.propagateMeta(String, boolean)`: a blank tool
+    /// name is rejected instead of being silently ignored.
+    pub fn propagate_meta_for(
+        mut self,
+        tool_name: impl Into<String>,
+        propagate_meta: bool,
+    ) -> Result<Self> {
+        let tool_name = tool_name.into();
+        if tool_name.trim().is_empty() {
+            return Err(agentscope_core::error::Error::Other(
+                "MCP tool name cannot be null or blank".to_string(),
+            ));
+        }
+        self.tool_overrides.push((tool_name, propagate_meta));
+        Ok(self)
+    }
+
+    /// The effective per-tool switch for `tool_name`.
+    fn effective_for(&self, tool_name: &str) -> bool {
+        self.tool_overrides
+            .iter()
+            .rev()
+            .find(|(name, _)| name == tool_name)
+            .map(|(_, value)| *value)
+            .or(self.propagate_meta)
+            .unwrap_or(true)
+    }
+}
+
 /// Bridges every connected MCP client's tools from [`McpClientManager`] into a
 /// [`Toolkit`] as [`McpTool`]s.
 ///
 /// Each discovered MCP tool becomes a core [`McpTool`] whose **async** handler
-/// dispatches back through the manager (`call_tool_by_server`), so calls await
-/// the real client round-trip without blocking the tokio runtime.
+/// dispatches back through the manager (`call_tool_by_server_with_meta`), so calls
+/// await the real client round-trip without blocking the tokio runtime.
 ///
 /// Returns the number of tools registered.
 pub async fn bridge_mcp_tools_to_toolkit(
     manager: &std::sync::Arc<McpClientManager>,
     toolkit: &agentscope_core::tool::Toolkit,
 ) -> usize {
+    try_bridge_mcp_tools_to_toolkit(manager, toolkit, &McpMetaPropagationOptions::new())
+        .await
+        .unwrap_or(0)
+}
+
+/// Bridges MCP tools with explicit metadata-propagation options.
+///
+/// Mirrors Java `Toolkit.ToolRegistration`: per-tool override keys must match a tool
+/// that is actually bridged — a typo or a renamed/filtered tool fails the whole
+/// registration with the rejected names listed in stable (sorted) order, so a
+/// silencing override is never lost silently.
+pub async fn try_bridge_mcp_tools_to_toolkit(
+    manager: &std::sync::Arc<McpClientManager>,
+    toolkit: &agentscope_core::tool::Toolkit,
+    options: &McpMetaPropagationOptions,
+) -> Result<usize> {
     let client_ids = manager.connected_clients().await;
     let mut registered = 0usize;
+    let mut bridged_names: Vec<String> = Vec::new();
     for client_id in client_ids {
         let Ok(tools) = manager.list_tools(&client_id).await else {
             continue;
@@ -183,23 +259,38 @@ pub async fn bridge_mcp_tools_to_toolkit(
             let server = info.server.clone();
             let tool_name = info.name.clone();
             let description = info.description.clone().unwrap_or_default();
+            let propagate_meta = options.effective_for(&tool_name);
+            bridged_names.push(tool_name.clone());
             // Clones captured by the (move) async handler closure; the originals
             // stay owned by the loop so we can still build the `McpTool` below.
             let h_server = server.clone();
             let h_tool_name = tool_name.clone();
             let h_manager = std::sync::Arc::clone(&manager);
             let async_handler: Box<
-                dyn Fn(&agentscope_core::tool::McpTool, serde_json::Map<String, serde_json::Value>) -> std::pin::Pin<
+                dyn Fn(&agentscope_core::tool::McpTool, serde_json::Map<String, serde_json::Value>, Option<serde_json::Map<String, serde_json::Value>>) -> std::pin::Pin<
                     Box<dyn std::future::Future<Output = Result<agentscope_core::message::ToolResultBlock>> + Send>,
                 > + Send
                     + Sync,
-            > = Box::new(move |_tool, args| {
+            > = Box::new(move |_tool, args, meta| {
                 let manager = std::sync::Arc::clone(&h_manager);
                 let server = h_server.clone();
                 let tool_name = h_tool_name.clone();
                 Box::pin(async move {
+                    // The connection-level switch is read live on every call
+                    // (Java `McpClientWrapper.isPropagateMeta`), so disabling a
+                    // connection takes effect immediately for already-bridged tools.
+                    let meta = match manager.find_client_id_by_server(&server).await {
+                        Some(client_id) => match manager.propagate_meta(&client_id).await {
+                            Some(true) => meta,
+                            _ => None,
+                        },
+                        None => None,
+                    };
                     let raw = serde_json::Value::Object(args);
-                    match manager.call_tool_by_server(&server, &tool_name, raw).await {
+                    match manager
+                        .call_tool_by_server_with_meta(&server, &tool_name, raw, meta)
+                        .await
+                    {
                         Ok(value) => {
                             let text = match value {
                                 serde_json::Value::String(s) => s,
@@ -230,10 +321,29 @@ pub async fn bridge_mcp_tools_to_toolkit(
                     ))
                 }),
             )
-            .with_async_handler(async_handler);
+            .with_async_handler(async_handler)
+            .with_propagate_meta(propagate_meta);
             toolkit.register_tool(std::sync::Arc::new(tool));
             registered += 1;
         }
     }
-    registered
+
+    // Fail-loud: an override that matches no bridged tool is a configuration bug
+    // (typo, remote rename, or a tool filtered out upstream).
+    let mut rejected: Vec<&str> = options
+        .tool_overrides
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !bridged_names.iter().any(|n| n == *name))
+        .collect();
+    rejected.sort_unstable();
+    rejected.dedup();
+    if !rejected.is_empty() {
+        return Err(agentscope_core::error::Error::Other(format!(
+            "MCP meta-propagation overrides name tool(s) that were not registered: [{}]",
+            rejected.join(", ")
+        )));
+    }
+
+    Ok(registered)
 }

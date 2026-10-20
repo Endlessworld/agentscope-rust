@@ -57,6 +57,12 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     /// Optional HTTP/SSE custom headers (name -> value).
     pub headers: Vec<(String, String)>,
+    /// Whether request metadata is propagated to this MCP server.
+    ///
+    /// Mirrors Java `McpClientWrapper.propagateMeta`: default `true`, ANDed with the
+    /// per-tool switch at call time. The value is read live from the stored client
+    /// instance on every call, so `set_propagate_meta` takes effect immediately.
+    pub propagate_meta: bool,
 }
 
 impl McpServerConfig {
@@ -66,6 +72,7 @@ impl McpServerConfig {
             command: None,
             url: None,
             headers: Vec::new(),
+            propagate_meta: true,
         }
     }
 
@@ -81,6 +88,16 @@ impl McpServerConfig {
 
     pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Configures whether request metadata is propagated to this server.
+    ///
+    /// Disable it for MCP servers that are not fully trusted so internal metadata
+    /// (e.g. trace ids or callback URLs) never leaves the process. Mirrors Java
+    /// `McpClientBuilder.propagateMeta`.
+    pub fn propagate_meta(mut self, propagate_meta: bool) -> Self {
+        self.propagate_meta = propagate_meta;
         self
     }
 }
@@ -373,6 +390,22 @@ impl McpClientManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.call_tool_with_meta(client_id, tool_name, arguments, None)
+            .await
+    }
+
+    /// Calls a tool on the specified client with request metadata.
+    ///
+    /// `meta` becomes the MCP request's `_meta` field; `None` omits the field
+    /// entirely (fail-closed), mirroring Java `McpClientWrapper.callTool` when
+    /// propagation is disabled.
+    pub async fn call_tool_with_meta(
+        &self,
+        client_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<serde_json::Value> {
         let clients = self.clients.lock().await;
         let client = clients
             .get(client_id)
@@ -390,7 +423,10 @@ impl McpClientManager {
             let params = rust_mcp_sdk::schema::CallToolRequestParams {
                 name: tool_name.to_string(),
                 arguments: Some(arguments.as_object().cloned().unwrap_or_default()),
-                meta: None,
+                meta: meta.map(|extra| rust_mcp_sdk::schema::CallToolMeta {
+                    progress_token: None,
+                    extra: Some(extra),
+                }),
                 task: None,
             };
 
@@ -427,13 +463,51 @@ impl McpClientManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.call_tool_by_server_with_meta(server, tool_name, arguments, None)
+            .await
+    }
+
+    /// Calls a tool on the connected client for the given server name, propagating
+    /// request metadata when supplied.
+    pub async fn call_tool_by_server_with_meta(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<serde_json::Value> {
         let client_id = self
             .find_client_id_by_server(server)
             .await
             .ok_or_else(|| {
                 Error::Other(format!("No connected MCP client for server '{server}'"))
             })?;
-        self.call_tool(&client_id, tool_name, arguments).await
+        self.call_tool_with_meta(&client_id, tool_name, arguments, meta)
+            .await
+    }
+
+    /// Returns whether the connection for `client_id` currently propagates metadata.
+    ///
+    /// `None` when the client id is unknown.
+    pub async fn propagate_meta(&self, client_id: &str) -> Option<bool> {
+        let clients = self.clients.lock().await;
+        clients.get(client_id).map(|c| c.config.propagate_meta)
+    }
+
+    /// Turns request-metadata propagation on or off for an existing connection.
+    ///
+    /// Mirrors Java `McpClientWrapper.setPropagateMeta`: the switch is stored on the
+    /// live client instance, so the next tool call sees it. Returns `false` when the
+    /// client id is unknown.
+    pub async fn set_propagate_meta(&self, client_id: &str, propagate_meta: bool) -> bool {
+        let mut clients = self.clients.lock().await;
+        match clients.get_mut(client_id) {
+            Some(client) => {
+                client.config.propagate_meta = propagate_meta;
+                true
+            }
+            None => false,
+        }
     }
 }
 
