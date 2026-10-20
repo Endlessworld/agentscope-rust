@@ -10,13 +10,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentscope_core::agent::{Agent, CallableAgent, ReActAgent, StreamOptions};
+use agentscope_core::agent::{Agent, CallableAgent, ReActAgent, RuntimeContext, StreamOptions};
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::Msg;
 use agentscope_core::middleware::MiddlewareChain;
 use agentscope_core::model::Model;
+use agentscope_core::session::{
+    SessionHistoryMode, SessionKey, SessionLog, SessionLogStore, SessionProjection, Transcript,
+};
 use agentscope_core::state::AgentState;
 use agentscope_core::state::AgentStateStore;
+use agentscope_core::state::ConflictPolicy;
 use agentscope_core::tool::{Tool, Toolkit};
 
 use crate::filesystem::{Filesystem, LocalFilesystem};
@@ -30,7 +34,7 @@ use super::middleware::{
     HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
     SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware, TeamsMiddleware,
-    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, TranscriptMiddleware,
+    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware,
     WorkspaceContextMiddleware,
 };
 use super::skill::{
@@ -46,7 +50,6 @@ use super::subagent::{
     SubagentEntry,
 };
 use super::team::{TeamClient, TeamContext};
-use super::transcript::{FilesystemTranscriptStore, TranscriptStore};
 use super::workspace::{
     PlanModeManager, WorkspaceIndex, WorkspaceManager, WorkspacePathNormalizer,
 };
@@ -180,6 +183,67 @@ impl HarnessAgent {
     /// The embedded ReAct agent driving the reasoning→acting loop, if a model was configured.
     pub fn agent(&self) -> Option<&ReActAgent> {
         self.agent.as_ref()
+    }
+
+    /// The native journal identity for `context`, or `None` when history is not
+    /// journal-backed (no model, legacy mode, or no session id yet).
+    ///
+    /// Mirrors Java `HarnessAgent.sessionKey(RuntimeContext)`.
+    pub fn session_key(&self, context: &RuntimeContext) -> Option<SessionKey> {
+        self.agent
+            .as_ref()
+            .filter(|agent| agent.session_log_enabled())
+            .and_then(|agent| agent.session_key(context))
+    }
+
+    /// Opens the native journal for `context`. Mirrors Java
+    /// `HarnessAgent.sessionLog(RuntimeContext)`.
+    ///
+    /// Opening a reader never acquires a writer or repairs history, so this is safe to call
+    /// while another call is running.
+    pub async fn session_log(&self, context: &RuntimeContext) -> crate::Result<Arc<dyn SessionLog>> {
+        match self.agent.as_ref() {
+            Some(agent) if agent.session_log_enabled() => agent.session_log(context).await,
+            _ => Err(crate::Error::Session(
+                "native session history is not enabled for this agent".into(),
+            )),
+        }
+    }
+
+    /// Reads the committed projection of the session bound to `context`. Mirrors Java
+    /// `HarnessAgent.inspectSession(RuntimeContext)`.
+    pub async fn inspect_session(
+        &self,
+        context: &RuntimeContext,
+    ) -> crate::Result<SessionProjection> {
+        let log = self.session_log(context).await?;
+        SessionProjection::read(&*log).await
+    }
+
+    /// Reads the replayable transcript of the session bound to `context`. Mirrors Java
+    /// `HarnessAgent.sessionTranscript(RuntimeContext)`.
+    pub async fn session_transcript(
+        &self,
+        context: &RuntimeContext,
+    ) -> crate::Result<Transcript> {
+        let log = self.session_log(context).await?;
+        agentscope_core::session::transcript(&*log).await
+    }
+
+    /// Binds a conversation's commands and read views. Obtaining this handle never starts
+    /// inference. Mirrors Java `HarnessAgent.session(RuntimeContext)`.
+    ///
+    /// Unlike Java this does not memoise the handle: a cached `AgentSession` would hold an
+    /// `Arc<HarnessAgent>` inside the agent itself and leak the reference cycle.
+    pub async fn session(
+        self: &Arc<Self>,
+        context: RuntimeContext,
+    ) -> crate::Result<super::session::AgentSession> {
+        let key = self.session_key(&context).ok_or_else(|| {
+            crate::Error::Session("native session history is not enabled for this agent".into())
+        })?;
+        let log = self.session_log(&context).await?;
+        super::session::AgentSession::open(Arc::clone(self), context, key, log)
     }
 
     /// Returns the workspace manager bound to this agent, if configured.
@@ -410,6 +474,9 @@ pub struct HarnessAgentBuilder {
     distributed_store: Option<DistributedStore>,
     /// Optional persistent state store wired into a checkpoint middleware.
     state_store: Option<Arc<dyn AgentStateStore>>,
+    /// How a checkpoint save that loses the CAS race is resolved. Mirrors Java
+    /// `HarnessAgent.Builder.conflictPolicy` (default `OVERWRITE`).
+    conflict_policy: ConflictPolicy,
     /// Stable session key used for checkpoint save/restore (restart-resume).
     session_id: Option<String>,
     /// User namespace for checkpoint save/restore.
@@ -483,11 +550,21 @@ pub struct HarnessAgentBuilder {
     disable_web_tools: bool,
     web_http_client: Option<reqwest::Client>,
     task_repository: Option<Arc<dyn TaskRepository>>,
-    transcript_store: Option<Arc<dyn TranscriptStore>>,
-    disable_transcript: bool,
-    transcript_tenant: Option<String>,
     teams_client: Option<Arc<dyn TeamClient>>,
     teams_context: Option<TeamContext>,
+    /// Context material registered for the context compiler. Empty means "not configured".
+    context_sources: crate::agent::context::ContextSources,
+    /// Budget policy for the context compiler; `None` derives everything from the model.
+    context_policy: Option<crate::agent::context::ContextPolicy>,
+    /// Deferred error from an invalid context registration, surfaced at `build()`.
+    context_source_error: Option<String>,
+    /// Native session journal backend. `None` means "use the workspace default", which
+    /// `build()` materialises when history is journal-backed. Mirrors Java
+    /// `HarnessAgent.Builder.sessionLogStore`.
+    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    /// Exactly one history authority (default [`SessionHistoryMode::EventLog`]). Mirrors
+    /// Java `HarnessAgent.Builder.sessionHistoryMode`.
+    session_history_mode: SessionHistoryMode,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -500,6 +577,7 @@ impl Default for HarnessAgentBuilder {
             cwd: None,
             distributed_store: None,
             state_store: None,
+            conflict_policy: ConflictPolicy::default(),
             session_id: None,
             user_id: None,
             with_filesystem_tools: false,
@@ -561,11 +639,13 @@ impl Default for HarnessAgentBuilder {
             disable_web_tools: false,
             web_http_client: None,
             task_repository: None,
-            transcript_store: None,
-            disable_transcript: false,
-            transcript_tenant: None,
             teams_client: None,
             teams_context: None,
+            context_sources: crate::agent::context::ContextSources::empty(),
+            context_policy: None,
+            context_source_error: None,
+            session_log_store: None,
+            session_history_mode: SessionHistoryMode::EventLog,
         }
     }
 }
@@ -618,6 +698,17 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Sets how a checkpoint save resolves an optimistic-concurrency conflict.
+    ///
+    /// Defaults to [`ConflictPolicy::Overwrite`] (last-writer-wins, no error). Prefer
+    /// [`ConflictPolicy::Fail`] when a distributed turn gate already serialises writers,
+    /// and [`ConflictPolicy::AppendMerge`] for append-only turns. Mirrors Java
+    /// `HarnessAgent.Builder.conflictPolicy`.
+    pub fn conflict_policy(mut self, policy: ConflictPolicy) -> Self {
+        self.conflict_policy = policy;
+        self
+    }
+
     /// Sets the stable session id used as the checkpoint save/restore key.
     /// A stable id lets a restarted process resume the same conversation.
     pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
@@ -658,6 +749,46 @@ impl HarnessAgentBuilder {
 
     pub fn middleware(mut self, mw: MiddlewareChain) -> Self {
         self.middleware = Some(mw);
+        self
+    }
+
+    /// Registers a dynamic context source for the context compiler.
+    ///
+    /// Registering any source or instruction opts this agent into the compiler: every model
+    /// request is then assembled from material and fitted into the budget before dispatch.
+    pub fn context_source(
+        mut self,
+        id: impl Into<String>,
+        source: crate::agent::context::BoxedContextSource,
+        options: crate::agent::context::ContextSourceOptions,
+    ) -> Self {
+        match self
+            .context_sources
+            .clone()
+            .with_source(id, source, options)
+        {
+            Ok(next) => self.context_sources = next,
+            Err(error) => self.context_source_error = Some(error.to_string()),
+        }
+        self
+    }
+
+    /// Registers a stable instruction (trusted System material) for the context compiler.
+    pub fn instruction(
+        mut self,
+        id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        match self.context_sources.clone().with_instruction(id, content) {
+            Ok(next) => self.context_sources = next,
+            Err(error) => self.context_source_error = Some(error.to_string()),
+        }
+        self
+    }
+
+    /// Overrides the budget/accounting policy of the context compiler.
+    pub fn context_policy(mut self, policy: crate::agent::context::ContextPolicy) -> Self {
+        self.context_policy = Some(policy);
         self
     }
 
@@ -1056,21 +1187,25 @@ impl HarnessAgentBuilder {
         self
     }
 
-    /// Supplies the transcript store used by `TranscriptMiddleware`.
-    pub fn transcript_store(mut self, store: Arc<dyn TranscriptStore>) -> Self {
-        self.transcript_store = Some(store);
+    /// Installs a native session journal backend. Mirrors Java
+    /// `HarnessAgent.Builder.sessionLogStore`.
+    ///
+    /// Leaving this unset is the common case: `build()` falls back to a
+    /// [`WorkspaceSessionLogStore`](crate::agent::session::WorkspaceSessionLogStore) over the
+    /// configured filesystem, so journaling is on by default (Java does the same).
+    pub fn session_log_store(mut self, store: Arc<dyn SessionLogStore>) -> Self {
+        self.session_log_store = Some(store);
         self
     }
 
-    /// Disables transcript persistence entirely (mirrors Java `disableTranscript`).
-    pub fn disable_transcript(mut self) -> Self {
-        self.disable_transcript = true;
-        self
-    }
-
-    /// Pins the tenant used for transcript routing (mirrors Java `transcriptTenant`).
-    pub fn transcript_tenant(mut self, tenant: impl Into<String>) -> Self {
-        self.transcript_tenant = Some(tenant.into());
+    /// Selects the single history authority. Mirrors Java
+    /// `HarnessAgent.Builder.sessionHistoryMode`; defaults to
+    /// [`SessionHistoryMode::EventLog`].
+    ///
+    /// [`SessionHistoryMode::Legacy`] exists only as an explicit opt-out: it keeps the
+    /// state-store checkpoint as the history authority and installs no journal.
+    pub fn session_history_mode(mut self, mode: SessionHistoryMode) -> Self {
+        self.session_history_mode = mode;
         self
     }
 
@@ -1090,7 +1225,7 @@ impl HarnessAgentBuilder {
 
     /// Builds the `HarnessAgent`, wiring the filesystem, tools, middleware chain and
     /// embedded ReAct agent according to the configured orchestration.
-    pub fn build(self) -> HarnessAgent {
+    pub fn build(mut self) -> HarnessAgent {
         let cwd = self
             .cwd
             .clone()
@@ -1122,8 +1257,48 @@ impl HarnessAgentBuilder {
         ));
         let _ = workspace_manager.validate();
 
+        // ---- Native session journal ----
+        // History is journal-backed by default. Resolving the store once keeps the ReAct
+        // agent and the session tools on the exact same backend, so a tool can never read a
+        // different store than the one the agent wrote (Java `HarnessAgent.build()`).
+        let session_log_store: Option<Arc<dyn SessionLogStore>> =
+            if self.session_history_mode == SessionHistoryMode::EventLog {
+                Some(self.session_log_store.clone().unwrap_or_else(|| {
+                    Arc::new(super::session::WorkspaceSessionLogStore::new(Arc::clone(
+                        &filesystem,
+                    ))) as Arc<dyn SessionLogStore>
+                }))
+            } else {
+                None
+            };
+
         // ---- Middleware chain ----
         let mut middleware = self.middleware.unwrap_or_default();
+
+        // A deferred registration error must surface here rather than silently dropping the
+        // caller's context source. `build()` is infallible by contract, and an invalid context
+        // registration is a programming error (Java throws `IllegalArgumentException`).
+        if let Some(error) = self.context_source_error.take() {
+            panic!("invalid context registration: {error}");
+        }
+
+        // ---- Context compiler ----
+        // The compiler is opt-in: an agent with no registered material keeps the plain
+        // reasoning path. Once material is configured, every model request is assembled and
+        // budgeted here, which is the only place all middleware rewrites are already applied.
+        if !self.context_sources.is_empty() {
+            let config = crate::agent::context::ContextPipelineConfig {
+                policy: self
+                    .context_policy
+                    .take()
+                    .unwrap_or_default(),
+                sources: self.context_sources.clone(),
+                ..Default::default()
+            };
+            middleware.add(Box::new(crate::agent::context::ContextMiddleware::new(
+                Arc::new(crate::agent::context::ContextPipeline::new(config)),
+            )));
+        }
 
         // Keep every outgoing model request provider-valid: strip trailing assistant
         // `tool_calls` that were never answered and orphan TOOL results (e.g. after
@@ -1433,8 +1608,10 @@ impl HarnessAgentBuilder {
             MemoryGetTool::register(&toolkit, Arc::clone(&workspace_manager));
             MemorySaveTool::register(&toolkit, Arc::clone(&workspace_manager));
             // Session transcript tools (Java registers `SessionSearchTool` by default in the
-            // same `!disableMemoryTools` block; Rust exposes the search/list/history trio).
-            SessionSearchTool::register_all(&toolkit, Arc::clone(&workspace_manager));
+            // same `!disableMemoryTools` block, and only when history is journal-backed).
+            if let Some(store) = &session_log_store {
+                SessionSearchTool::register_all(&toolkit, Arc::clone(store));
+            }
         }
 
         // ---- Web tools (Java registers these by default) ----
@@ -1585,21 +1762,6 @@ impl HarnessAgentBuilder {
             &resolved_workspace.to_string_lossy(),
         ));
 
-        // ---- Transcript persistence ----
-        if !self.disable_transcript {
-            let store = self.transcript_store.clone().unwrap_or_else(|| {
-                Arc::new(FilesystemTranscriptStore::new(
-                    Arc::clone(&filesystem),
-                    ".agentscope/transcripts",
-                )) as Arc<dyn TranscriptStore>
-            });
-            let mut transcript = TranscriptMiddleware::new(store);
-            if let Some(tenant) = &self.transcript_tenant {
-                transcript = transcript.with_tenant(tenant.clone());
-            }
-            middleware.add(Box::new(transcript));
-        }
-
         // ---- State checkpoint: persist/restore the full AgentState ----
         // Effective store: explicit `state_store` wins over `distributed_store`'s.
         let state_store = self.state_store.clone().or_else(|| {
@@ -1610,7 +1772,10 @@ impl HarnessAgentBuilder {
         if let Some(store) = &state_store {
             // Added last -> outermost: restore runs before (and save after) all
             // inner middlewares (compaction, plan mode, …).
-            middleware.add(Box::new(StateCheckpointMiddleware::new(Arc::clone(store))));
+            middleware.add(Box::new(StateCheckpointMiddleware::with_conflict_policy(
+                Arc::clone(store),
+                self.conflict_policy,
+            )));
         }
 
         // Initial state: pin a stable session/user id so restart-resume can
@@ -1658,6 +1823,20 @@ impl HarnessAgentBuilder {
             }
             if let Some(task_list) = self.enable_task_list {
                 agent_builder = agent_builder.todo_tool(task_list);
+            }
+            // Native committed history is the default authority. The store is resolved in
+            // `build()` rather than left to the caller, so a bare `HarnessAgent` journals
+            // without any host-side `AgentSession` (Java does the same).
+            match &session_log_store {
+                Some(store) => {
+                    agent_builder = agent_builder
+                        .session_log_agent_id(agent_id.clone())
+                        .session_log_store(Arc::clone(store))
+                        .session_history_mode(SessionHistoryMode::EventLog);
+                }
+                None => {
+                    agent_builder = agent_builder.session_history_mode(SessionHistoryMode::Legacy);
+                }
             }
             let agent = agent_builder.build().expect("build ReActAgent");
             if let Some(opts) = &self.generate_options_defaults {

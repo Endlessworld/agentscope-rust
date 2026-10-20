@@ -23,7 +23,7 @@ use crate::filesystem::{validate_path, Filesystem};
 
 use super::constants::{
     AGENTS_DIR, AGENTS_MD, KNOWLEDGE_DIR, KNOWLEDGE_MD, MEMORY_DIR, MEMORY_MD, SESSIONS_DIR,
-    SESSION_CONTEXT_EXT, SESSION_LOG_EXT, SESSIONS_STORE, SKILLS_DIR, TASKS_DIR,
+    SKILLS_DIR, TASKS_DIR,
 };
 use super::index::WorkspaceIndex;
 use super::namespace::NamespaceFactory;
@@ -253,28 +253,6 @@ impl WorkspaceManager {
         self.resolve_runtime_data_path(ctx, &rel)
     }
 
-    /// Returns the JSONL session context file path (LLM-facing, compacted).
-    pub fn resolve_session_context_file(
-        &self,
-        ctx: &RuntimeContext,
-        agent_id: &str,
-        session_id: &str,
-    ) -> PathBuf {
-        self.get_session_dir(ctx, agent_id)
-            .join(format!("{session_id}{SESSION_CONTEXT_EXT}"))
-    }
-
-    /// Returns the JSONL session log file path (full history, append-only).
-    pub fn resolve_session_log_file(
-        &self,
-        ctx: &RuntimeContext,
-        agent_id: &str,
-        session_id: &str,
-    ) -> PathBuf {
-        self.get_session_dir(ctx, agent_id)
-            .join(format!("{session_id}{SESSION_LOG_EXT}"))
-    }
-
     /// Appends UTF-8 text to a workspace-relative file, creating parents when needed.
     /// All writes go through the `Filesystem`. A per-path lock serialises concurrent
     /// read-merge-write cycles.
@@ -334,46 +312,6 @@ impl WorkspaceManager {
                 }
                 let _ = write_through_fs(fs.as_ref(), ctx, &normalized, content).await;
             }
-        }
-    }
-
-    /// Upserts metadata for a session in `agents/<agentId>/sessions/sessions.json`.
-    /// A per-path lock serialises concurrent read-merge-write cycles.
-    pub async fn update_session_index(
-        &self,
-        ctx: &RuntimeContext,
-        agent_id: &str,
-        session_id: &str,
-        summary: &str,
-    ) {
-        if agent_id.trim().is_empty() || session_id.trim().is_empty() {
-            return;
-        }
-        let rel = format!("{AGENTS_DIR}/{agent_id}/{SESSIONS_DIR}/{SESSIONS_STORE}");
-        let lock = self.lock_for(&rel);
-        let _guard = lock.lock().await;
-        let existing = self.read_writable_workspace_relative_utf8(ctx, &rel).await;
-        let mut root: serde_json::Value =
-            serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
-        if !root.is_object() {
-            root = serde_json::json!({});
-        }
-        let obj = root.as_object_mut().unwrap();
-        let sessions = obj
-            .entry("sessions")
-            .or_insert_with(|| serde_json::json!({}));
-        if !sessions.is_object() {
-            *sessions = serde_json::json!({});
-        }
-        sessions.as_object_mut().unwrap().insert(
-            session_id.to_string(),
-            serde_json::json!({ "summary": summary, "updatedAt": now_rfc3339() }),
-        );
-        if !obj.contains_key("version") {
-            obj.insert("version".into(), serde_json::json!(1));
-        }
-        if let Ok(serialized) = serde_json::to_string_pretty(&root) {
-            self.write_utf8_workspace_relative(ctx, &rel, &serialized).await;
         }
     }
 
@@ -563,42 +501,6 @@ impl WorkspaceManager {
                     if p.is_file() && p.extension().map(|e| e == "md").unwrap_or(false) {
                         let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
                         paths.insert(format!("{MEMORY_DIR}/{name}"));
-                    }
-                }
-            }
-        }
-        paths.into_iter().collect()
-    }
-
-    /// Lists workspace-relative paths of all session log files (`*.log.jsonl`).
-    pub async fn list_session_log_files(&self, ctx: &RuntimeContext) -> Vec<String> {
-        let mut paths: std::collections::BTreeSet<String> = Default::default();
-
-        if let Some(fs) = &self.filesystem {
-            if let Ok(matches) = fs.glob(ctx, "*.log.jsonl", AGENTS_DIR).await {
-                for fi in matches {
-                    if !fi.path.trim().is_empty() {
-                        let rel = normalize_relative_path(fi.path.trim());
-                        if !rel.is_empty() {
-                            paths.insert(rel);
-                        }
-                    }
-                }
-            }
-        }
-
-        let agents_dir = self.resolve_runtime_data_path(ctx, AGENTS_DIR);
-        if agents_dir.is_dir() {
-            if let Ok(walk) = walk_files(&agents_dir) {
-                let base = agents_dir.parent().map(|p| p.to_path_buf());
-                for p in walk {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy();
-                    if name.ends_with(SESSION_LOG_EXT) {
-                        if let Some(base) = &base {
-                            if let Ok(rel) = p.strip_prefix(base) {
-                                paths.insert(rel.to_string_lossy().replace('\\', "/"));
-                            }
-                        }
                     }
                 }
             }
@@ -818,22 +720,6 @@ mod tests {
         mgr.append_utf8_workspace_relative(&ctx, rel, "line2\n").await;
         let content = mgr.read_managed_workspace_file_utf8(&ctx, rel).await;
         assert_eq!(content, "line1\nline2\n");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn update_session_index_merges_entries() {
-        let root = temp_dir("session");
-        let mgr = WorkspaceManager::new(root.clone());
-        let ctx = RuntimeContext::new();
-        mgr.update_session_index(&ctx, "agent-a", "s1", "summary1").await;
-        mgr.update_session_index(&ctx, "agent-a", "s2", "summary2").await;
-        let rel = "agents/agent-a/sessions/sessions.json";
-        let content = mgr.read_managed_workspace_file_utf8(&ctx, rel).await;
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(v["sessions"].get("s1").is_some());
-        assert!(v["sessions"].get("s2").is_some());
-        assert_eq!(v["version"], 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

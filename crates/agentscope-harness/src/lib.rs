@@ -9,6 +9,10 @@ pub mod agent;
 pub mod filesystem;
 pub mod tool;
 
+// The context compiler is written against the core error model; re-export it so the
+// `crate::Result` / `crate::Error` paths used across harness modules stay uniform.
+pub use agentscope_core::error::{Error, Result};
+
 pub use acp::{AcpAgentSession, AcpCodingAgent, AcpCodingAgentBuilder};
 pub use agent::{
     AgentSkill, AgentSkillBuilder, AgentTraceMiddleware, AsyncToolMiddleware, AsyncToolRecord,
@@ -17,7 +21,8 @@ pub use agent::{
     build_task_summary, calculate_token,
     Channel, ChannelBinding, ChannelConfig, ChannelManager, ChannelRouter, ChannelSink,
     ChatUiChannel, ChatUiRequest, create_completion_callback, CompactionConfig, CompactionConfigBuilder,
-    CompactionMiddleware, CompactionMiddlewareConfig, ConversationCompactor, DEFAULT_SUMMARY_PROMPT,
+    CompactionMiddleware, CompactionMiddlewareConfig, CompactionMetrics, CompactionStatus,
+    ConversationCompactor, DEFAULT_SUMMARY_PROMPT,
     DefaultSubagentMaterializer, DefaultWorkspaceSpecApplier, deterministic_hash, DistributedStore, DistributedStoreBuilder,
     DockerSandbox, DockerSandboxClient,
     ExecResult, Gateway, GatewayAgent, GatewayBootstrap, GatewayBootstrapBuilder, GatewayTurnContext,
@@ -28,8 +33,8 @@ pub use agent::{
     MemoryMaintenanceMiddleware, DmScope, InboundMessage, MessageBus, MsgContext, OutboundAddress,
     OutboundEnvelope, Peer, PeerKind, PlanModeConfig, prepend_to_system_message, render_subagent_section,
     RouteResult, SendOptions,
-    PlanModeManager, PlanModeMiddleware, prune_tool_results, PruneConfig, Registrar, SessionEntry,
-    SessionFreshnessEvaluator, SessionTree, SessionTurnGate, ShellPathPolicy, SkillCatalog,
+    PlanModeManager, PlanModeMiddleware, prune_tool_results, PruneConfig, Registrar,
+    SessionFreshnessEvaluator, SessionTurnGate, ShellPathPolicy, SkillCatalog,
     SkillCurator, SkillCuratorConfig, SkillCuratorState, SkillFilter, SkillPromptBuilder,
     BackgroundTask, RemoteAskPolicy, SkillRuntime, SkillState, StageResult, SubagentDeclaration,
     SubagentEntry,

@@ -1,27 +1,30 @@
-//! `SessionSearchTool` — searches past session transcripts and views session
-//! history, mirroring `io.agentscope.harness.agent.tool.SessionSearchTool`.
+//! Session transcript tools, mirroring `io.agentscope.harness.agent.tool.SessionSearchTool`.
 //!
-//! Operates exclusively on the local session cache (`agents/<agentId>/sessions/`);
-//! remote synchronisation happens at write time, keeping these tools lightweight.
+//! All three tools read the **native session journal** through [`SessionLogStore`], exactly
+//! like Java after the session redesign: discovery scans journal headers and history is a
+//! read-time projection of committed events. There is no `sessions.json` index and no
+//! `.log.jsonl` mirror — those belonged to the retired design.
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
-use agentscope_core::message::{JsonMap, ToolResultBlock};
+use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
+use agentscope_core::session::{SessionKey, SessionLogStore, Transcript};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
-use crate::agent::memory::session::{SessionEntry, SessionTree};
-use crate::agent::workspace::manager::WorkspaceManager;
 use crate::tool::{int_arg, opt_str_arg};
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 
 /// Hard ceiling for model-supplied result limits. Both session tools are excluded from
-/// tool-result eviction on the "bounded results" rationale, so nothing downstream trims an
+/// tool-result eviction on the bounded-results rationale, so nothing downstream trims an
 /// oversized result — the clamp has to happen here.
 const MAX_RESULTS_CEILING: usize = 100;
+
+/// Characters kept from a matched message before the preview is elided.
+const PREVIEW_CHARS: usize = 200;
 
 /// Clamps a model-supplied limit: non-positive values fall back to `fallback`, otherwise the
 /// value is capped at [`MAX_RESULTS_CEILING`].
@@ -103,47 +106,79 @@ impl KeywordMatcher {
     }
 }
 
-/// Extracts lowercase-searchable text from a session entry.
-fn searchable_text(entry: &SessionEntry) -> Option<String> {
-    match entry {
-        SessionEntry::Message { content, .. } => Some(content.clone()),
-        SessionEntry::Summary { summary, .. } => Some(summary.clone()),
-        _ => None,
+/// Case-insensitive searchable text of one committed message.
+fn searchable_text(message: &Msg) -> Option<String> {
+    let text = message.text_content();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
-/// Human-readable role label for an entry.
-fn role_label(entry: &SessionEntry) -> String {
-    match entry {
-        SessionEntry::Message { role, .. } => role.clone(),
-        SessionEntry::Compaction { .. } => "COMPACTION".into(),
-        SessionEntry::Summary { .. } => "SUMMARY".into(),
+/// Human-readable role label for a message.
+fn role_label(message: &Msg) -> String {
+    format!("{:?}", message.role).to_uppercase()
+}
+
+/// Truncates `text` to a single-line preview.
+fn preview(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(PREVIEW_CHARS).collect();
+    if flat.chars().count() > PREVIEW_CHARS {
+        out.push_str("...");
     }
+    out
 }
 
-/// Loads a session tree from a JSONL file on local disk.
-fn load_tree(path: &std::path::Path) -> Option<SessionTree> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut tree = SessionTree::new();
-    tree.load_jsonl(&content);
-    Some(tree)
+/// Opens the journal for `key` and rebuilds its committed transcript.
+async fn read_transcript(
+    store: &dyn SessionLogStore,
+    key: &SessionKey,
+    context: &RuntimeContext,
+) -> Result<Transcript> {
+    let log = store.open(key, context).await?;
+    agentscope_core::session::transcript(&*log).await
 }
 
-/// Searches past session transcripts for a keyword or phrase.
+/// Discovers the caller's sessions for `agent_id`, sorted by session id.
+async fn sessions_of(
+    store: &dyn SessionLogStore,
+    context: &RuntimeContext,
+    agent_id: &str,
+) -> Result<Vec<SessionKey>> {
+    let mut keys: Vec<SessionKey> = store
+        .list(context)
+        .await?
+        .into_iter()
+        .filter(|key| key.agent_id == agent_id)
+        .collect();
+    keys.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(keys)
+}
+
+/// Searches past session journals for a keyword or phrase.
 pub struct SessionSearchTool {
-    workspace: Arc<WorkspaceManager>,
+    store: Arc<dyn SessionLogStore>,
+    context: RuntimeContext,
 }
 
 impl SessionSearchTool {
-    pub fn new(workspace: Arc<WorkspaceManager>) -> Self {
-        Self { workspace }
+    pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
+        Self { store, context: RuntimeContext::default() }
+    }
+
+    /// Binds the caller identity used for journal discovery.
+    pub fn with_context(mut self, context: RuntimeContext) -> Self {
+        self.context = context;
+        self
     }
 
     /// Registers all three session tools into a toolkit.
-    pub fn register_all(toolkit: &agentscope_core::tool::Toolkit, workspace: Arc<WorkspaceManager>) {
-        toolkit.register_tool(Arc::new(SessionSearchTool::new(workspace.clone())));
-        toolkit.register_tool(Arc::new(SessionListTool::new(workspace.clone())));
-        toolkit.register_tool(Arc::new(SessionHistoryTool::new(workspace)));
+    pub fn register_all(toolkit: &agentscope_core::tool::Toolkit, store: Arc<dyn SessionLogStore>) {
+        toolkit.register_tool(Arc::new(SessionSearchTool::new(Arc::clone(&store))));
+        toolkit.register_tool(Arc::new(SessionListTool::new(Arc::clone(&store))));
+        toolkit.register_tool(Arc::new(SessionHistoryTool::new(store)));
     }
 }
 
@@ -154,8 +189,7 @@ impl Tool for SessionSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search past session transcripts for a keyword or phrase. Returns matching \
-         entries with session context."
+        "Search past session transcripts for a keyword or phrase. Returns matching entries with session context."
     }
 
     fn is_read_only(&self) -> bool {
@@ -190,47 +224,40 @@ impl Tool for SessionSearchTool {
             Err(e) => return Ok(ToolResultBlock::error(e)),
         };
 
-        let rc = RuntimeContext::default();
-        let mut results: Vec<String> = Vec::new();
+        // Without an explicit agent filter, every session the caller can see is searched.
+        let keys = match &agent_id {
+            Some(agent) => sessions_of(&*self.store, &self.context, agent).await?,
+            None => {
+                let mut keys = self.store.list(&self.context).await?;
+                keys.sort_by(|a, b| {
+                    a.agent_id
+                        .cmp(&b.agent_id)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                });
+                keys
+            }
+        };
 
-        for rel_log in self.workspace.list_session_log_files(&rc).await {
-            if results.len() >= limit {
-                break;
-            }
-            // Filter by agent id when provided (`agents/<agentId>/sessions/...`).
-            if let Some(agent) = &agent_id {
-                if !rel_log.starts_with(&format!("agents/{agent}/")) {
-                    continue;
-                }
-            }
-            let log_path = self.workspace.workspace().join(&rel_log);
-            let ctx_path = log_path.with_file_name(
-                log_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .replace(".log.jsonl", ".jsonl"),
-            );
-            let Some(tree) = load_tree(&ctx_path) else {
+        let mut results: Vec<String> = Vec::new();
+        'outer: for key in keys {
+            // A journal that cannot be read must not abort the whole search; report the rest.
+            let Ok(transcript) = read_transcript(&*self.store, &key, &self.context).await else {
                 continue;
             };
-            for entry in tree.get_all_entries() {
+            for message in &transcript.messages {
                 if results.len() >= limit {
-                    break;
+                    break 'outer;
                 }
-                let Some(text) = searchable_text(entry) else {
+                let Some(text) = searchable_text(message) else {
                     continue;
                 };
                 if matcher.matches(&text.to_lowercase()) {
-                    let mut preview: String = text.chars().take(200).collect();
-                    if text.chars().count() > 200 {
-                        preview.push_str("...");
-                    }
                     results.push(format!(
-                        "  [{rel_log}] {} \u{2014} [{}]: {}",
-                        entry.id(),
-                        role_label(entry),
-                        preview
+                        "  [{}] {} - [{}]: {}",
+                        key.session_id,
+                        message.id,
+                        role_label(message),
+                        preview(&text)
                     ));
                 }
             }
@@ -239,7 +266,7 @@ impl Tool for SessionSearchTool {
         if results.is_empty() {
             return Ok(ToolResultBlock::text(format!("No matches found for: {query}")));
         }
-        let mut sb = format!("Found {} matches for \"{query}\":\n\n", results.len());
+        let mut sb = format!("Found {} matches for '{query}':\n\n", results.len());
         for r in &results {
             sb.push_str(r);
             sb.push('\n');
@@ -250,12 +277,19 @@ impl Tool for SessionSearchTool {
 
 /// Lists available sessions for an agent.
 pub struct SessionListTool {
-    workspace: Arc<WorkspaceManager>,
+    store: Arc<dyn SessionLogStore>,
+    context: RuntimeContext,
 }
 
 impl SessionListTool {
-    pub fn new(workspace: Arc<WorkspaceManager>) -> Self {
-        Self { workspace }
+    pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
+        Self { store, context: RuntimeContext::default() }
+    }
+
+    /// Binds the caller identity used for journal discovery.
+    pub fn with_context(mut self, context: RuntimeContext) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -287,38 +321,20 @@ impl Tool for SessionListTool {
         let Some(agent_id) = opt_str_arg(&args, "agentId").filter(|a| !a.trim().is_empty()) else {
             return Ok(ToolResultBlock::error("Error: agentId is required"));
         };
-        let rc = RuntimeContext::default();
-
-        // Prefer the structured session-store index (remote then local).
-        let store_rel = format!("agents/{agent_id}/sessions/sessions.json");
-        let store_content = self.workspace.read_managed_workspace_file_utf8(&rc, &store_rel).await;
-        if !store_content.trim().is_empty() {
-            return Ok(ToolResultBlock::text(store_content));
-        }
-
-        // List sessions from local cache only.
-        let session_dir = self.workspace.get_session_dir(&rc, &agent_id);
-        let mut ids: Vec<String> = Vec::new();
-        if session_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&session_dir) {
-                for e in entries.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if e.path().is_file() && name.ends_with(".jsonl") && !name.ends_with(".log.jsonl")
-                    {
-                        ids.push(name.trim_end_matches(".jsonl").to_string());
-                    }
-                }
-            }
-        }
-        if ids.is_empty() {
+        let keys = sessions_of(&*self.store, &self.context, &agent_id).await?;
+        if keys.is_empty() {
             return Ok(ToolResultBlock::text(format!(
                 "No sessions found for agent: {agent_id}"
             )));
         }
-        ids.sort();
         let mut sb = format!("Sessions for agent {agent_id}:\n");
-        for id in ids {
-            sb.push_str(&format!("  - {id}\n"));
+        for key in keys {
+            // The head reports how much committed history exists without reading it.
+            let head = self.store.open(&key, &self.context).await?.head().await?;
+            sb.push_str(&format!(
+                "  - {} (events: {}, lease_until: {})\n",
+                key.session_id, head.seq, head.lease_until
+            ));
         }
         Ok(ToolResultBlock::text(sb))
     }
@@ -326,12 +342,19 @@ impl Tool for SessionListTool {
 
 /// Gets the conversation history for a specific session.
 pub struct SessionHistoryTool {
-    workspace: Arc<WorkspaceManager>,
+    store: Arc<dyn SessionLogStore>,
+    context: RuntimeContext,
 }
 
 impl SessionHistoryTool {
-    pub fn new(workspace: Arc<WorkspaceManager>) -> Self {
-        Self { workspace }
+    pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
+        Self { store, context: RuntimeContext::default() }
+    }
+
+    /// Binds the caller identity used for journal discovery.
+    pub fn with_context(mut self, context: RuntimeContext) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -342,8 +365,7 @@ impl Tool for SessionHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Get the conversation history for a specific session. Returns the messages \
-         in the session."
+        "Get the conversation history for a specific session. Returns the messages in the session."
     }
 
     fn is_read_only(&self) -> bool {
@@ -371,47 +393,32 @@ impl Tool for SessionHistoryTool {
             return Ok(ToolResultBlock::error("Error: sessionId is required"));
         };
         let limit = capped_limit(int_arg(&args, "lastN"), DEFAULT_HISTORY_LIMIT);
-        let rc = RuntimeContext::default();
 
-        let context_file = self
-            .workspace
-            .resolve_session_context_file(&rc, &agent_id, &session_id);
-        let log_file = self
-            .workspace
-            .resolve_session_log_file(&rc, &agent_id, &session_id);
-
-        let tree_path = if context_file.is_file() {
-            context_file
-        } else if log_file.is_file() {
-            log_file
-        } else {
+        let key = SessionKey::new(
+            self.context.user_id().map(str::to_string),
+            agent_id.clone(),
+            session_id.clone(),
+        )?;
+        let transcript = read_transcript(&*self.store, &key, &self.context).await?;
+        if transcript.messages.is_empty() {
             return Ok(ToolResultBlock::text(format!(
-                "Session not found: {session_id}"
+                "No history found for session: {session_id}"
             )));
-        };
+        }
 
-        let Some(tree) = load_tree(&tree_path) else {
-            return Ok(ToolResultBlock::text(format!(
-                "Session not found: {session_id}"
-            )));
-        };
-
-        let messages = tree.get_message_entries();
-        let start = messages.len().saturating_sub(limit);
-        let shown = messages.len() - start;
-
+        let start = transcript.messages.len().saturating_sub(limit);
         let mut sb = format!(
-            "Session {session_id} ({} total messages, showing last {shown}):\n\n",
-            messages.len()
+            "History for agent {agent_id}, session {session_id} ({} of {} messages):\n",
+            transcript.messages.len() - start,
+            transcript.messages.len()
         );
-        for msg in &messages[start..] {
-            if let SessionEntry::Message { role, content, .. } = msg {
-                let mut text = content.clone();
-                if text.chars().count() > 500 {
-                    text = text.chars().take(500).collect::<String>() + "... [truncated]";
-                }
-                sb.push_str(&format!("[{role}]: {text}\n"));
-            }
+        for message in &transcript.messages[start..] {
+            sb.push_str(&format!(
+                "  [{}] {}: {}\n",
+                message.id,
+                role_label(message),
+                preview(&message.text_content())
+            ));
         }
         Ok(ToolResultBlock::text(sb))
     }
@@ -420,180 +427,158 @@ impl Tool for SessionHistoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentscope_core::session::{InMemorySessionLogStore, SessionRecorder};
+    use agentscope_core::state::AgentState;
 
-    fn temp_ws(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("asr_sess_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn ctx(user: Option<&str>) -> RuntimeContext {
+        match user {
+            Some(user) => RuntimeContext::new().with_user_id(user),
+            None => RuntimeContext::new(),
+        }
     }
 
-    /// Writes a session context file (`<session>.jsonl`) plus the `.log.jsonl` marker the
-    /// searcher lists sessions by.
-    fn write_session(
-        root: &std::path::Path,
+    /// Commits a journal for `session` with `messages` as its persisted context.
+    async fn seed(
+        store: &InMemorySessionLogStore,
+        user: Option<&str>,
         agent: &str,
         session: &str,
-        entries: &[(&str, String)],
+        messages: Vec<Msg>,
     ) {
-        let dir = root.join("agents").join(agent).join("sessions");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{session}.log.jsonl")), "").unwrap();
-        let mut jsonl = String::new();
-        for (i, (role, content)) in entries.iter().enumerate() {
-            let v = serde_json::json!({
-                "type": "message",
-                "id": format!("m{i}"),
-                "timestamp": "2026-01-01T00:00:00Z",
-                "role": role,
-                "content": content,
-            });
-            jsonl.push_str(&v.to_string());
-            jsonl.push('\n');
+        let context = ctx(user);
+        let key = SessionKey::new(user.map(str::to_string), agent, session).unwrap();
+        let log = store.open(&key, &context).await.unwrap();
+        let recorder = SessionRecorder::open(log, None).await.unwrap();
+        let mut state = AgentState::builder().session_id(session).build();
+        if let Some(user) = user {
+            state.user_id = Some(user.to_string());
         }
-        std::fs::write(dir.join(format!("{session}.jsonl")), jsonl).unwrap();
+        for message in messages {
+            state.context.push(message);
+        }
+        recorder.start(&[], &state).await.unwrap();
+        recorder.finish(&state, "completed").await.unwrap();
     }
 
-    fn args(v: serde_json::Value) -> JsonMap {
-        v.as_object().unwrap().clone()
+    fn args(pairs: &[(&str, serde_json::Value)]) -> JsonMap {
+        let mut map = JsonMap::new();
+        for (k, v) in pairs {
+            map.insert((*k).to_string(), v.clone());
+        }
+        map
     }
 
-    /// Counts needle occurrences the way the Java ceiling test does.
-    fn count(text: &str, needle: &str) -> usize {
-        (text.len() - text.replace(needle, "").len()) / needle.len()
-    }
-
-    async fn search_out(
-        tool: &SessionSearchTool,
-        query: &str,
-        max: Option<usize>,
-        mode: Option<&str>,
-    ) -> String {
-        let mut a = serde_json::json!({"query": query});
-        if let Some(m) = max {
-            a["maxResults"] = serde_json::json!(m);
-        }
-        if let Some(m) = mode {
-            a["matchMode"] = serde_json::json!(m);
-        }
-        tool.call(args(a), ToolExecutionContext::default())
+    #[tokio::test]
+    async fn search_reads_committed_journal_events() {
+        let store = Arc::new(InMemorySessionLogStore::new());
+        seed(
+            &store,
+            Some("alice"),
+            "a1",
+            "s1",
+            vec![Msg::user("How do quantum computers work?")],
+        )
+        .await;
+        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .with_context(ctx(Some("alice")));
+        let out = tool
+            .call(args(&[("query", serde_json::json!("quantum"))]), Default::default())
             .await
-            .unwrap()
-            .text_content()
+            .unwrap();
+        let text = out.text_content();
+        assert!(text.contains("Found 1 matches"), "{text}");
+        assert!(text.contains("s1"), "{text}");
     }
 
     #[tokio::test]
-    async fn session_search_clamps_model_supplied_max_results() {
-        let root = temp_ws("search_clamp");
-        let entries: Vec<(&str, String)> =
-            (1..=150).map(|i| ("user", format!("needle item {i}"))).collect();
-        write_session(&root, "agent-a", "s1", &entries);
-        let tool = SessionSearchTool::new(Arc::new(WorkspaceManager::new(root.clone())));
-
-        let out = search_out(&tool, "needle", Some(100_000), None).await;
-        assert!(out.starts_with("Found 100 matches"), "{out}");
-        assert_eq!(count(&out, "needle item"), 100);
-
-        let _ = std::fs::remove_dir_all(&root);
+    async fn search_does_not_leak_other_users_sessions() {
+        let store = Arc::new(InMemorySessionLogStore::new());
+        seed(&store, Some("bob"), "a1", "b1", vec![Msg::user("quantum notes")]).await;
+        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .with_context(ctx(Some("alice")));
+        let out = tool
+            .call(args(&[("query", serde_json::json!("quantum"))]), Default::default())
+            .await
+            .unwrap();
+        assert!(out.text_content().contains("No matches found"));
     }
 
     #[tokio::test]
-    async fn session_history_clamps_model_supplied_last_n() {
-        let root = temp_ws("history_clamp");
-        let entries: Vec<(&str, String)> =
-            (1..=150).map(|i| ("user", format!("needle item {i}"))).collect();
-        write_session(&root, "agent-a", "s1", &entries);
-        let tool = SessionHistoryTool::new(Arc::new(WorkspaceManager::new(root.clone())));
+    async fn list_reports_journal_heads() {
+        let store = Arc::new(InMemorySessionLogStore::new());
+        seed(&store, Some("alice"), "a1", "s1", vec![Msg::user("hi")]).await;
+        let tool = SessionListTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .with_context(ctx(Some("alice")));
+        let out = tool
+            .call(args(&[("agentId", serde_json::json!("a1"))]), Default::default())
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(text.contains("- s1"), "{text}");
+        assert!(text.contains("events:"), "{text}");
+    }
 
+    #[tokio::test]
+    async fn history_returns_the_last_n_messages() {
+        let store = Arc::new(InMemorySessionLogStore::new());
+        seed(
+            &store,
+            Some("alice"),
+            "a1",
+            "s1",
+            vec![Msg::user("one"), Msg::assistant("two"), Msg::user("three")],
+        )
+        .await;
+        let tool = SessionHistoryTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .with_context(ctx(Some("alice")));
         let out = tool
             .call(
-                args(serde_json::json!({"agentId": "agent-a", "sessionId": "s1", "lastN": 100_000})),
-                ToolExecutionContext::default(),
+                args(&[
+                    ("agentId", serde_json::json!("a1")),
+                    ("sessionId", serde_json::json!("s1")),
+                    ("lastN", serde_json::json!(2)),
+                ]),
+                Default::default(),
             )
             .await
-            .unwrap()
-            .text_content();
-        assert!(out.contains("showing last 100"), "{out}");
-        assert_eq!(count(&out, "needle item"), 100);
-
-        let _ = std::fs::remove_dir_all(&root);
+            .unwrap();
+        let text = out.text_content();
+        assert!(text.contains("2 of 3"), "{text}");
+        assert!(text.contains("three"), "{text}");
+        assert!(!text.contains("one"), "{text}");
     }
 
     #[tokio::test]
-    async fn session_search_default_limit_still_applies() {
-        let root = temp_ws("search_default");
-        let entries: Vec<(&str, String)> =
-            (1..=15).map(|i| ("user", format!("needle item {i}"))).collect();
-        write_session(&root, "agent-a", "s1", &entries);
-        let tool = SessionSearchTool::new(Arc::new(WorkspaceManager::new(root.clone())));
-
-        let out = search_out(&tool, "needle", None, None).await;
-        assert!(out.starts_with("Found 10 matches"), "{out}");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn session_search_match_mode_all_and_any() {
-        let root = temp_ws("search_mode");
-        write_session(
-            &root,
-            "agent-a",
+    async fn limits_are_capped_at_the_ceiling() {
+        let store = Arc::new(InMemorySessionLogStore::new());
+        seed(
+            &store,
+            Some("alice"),
+            "a1",
             "s1",
-            &[
-                ("user", "only-first".to_string()),
-                ("assistant", "only-second".to_string()),
-                ("user", "部署决定：使用蓝鲸方案".to_string()),
-            ],
-        );
-        let tool = SessionSearchTool::new(Arc::new(WorkspaceManager::new(root.clone())));
-
-        // `all` requires every keyword in the same entry: they live in different entries.
-        let all = search_out(&tool, "only-first only-second", None, Some("all")).await;
-        assert!(all.starts_with("No matches"), "{all}");
-        // `any` matches each entry separately.
-        let any = search_out(&tool, "only-first only-second", None, Some("any")).await;
-        assert!(any.starts_with("Found 2 matches"), "{any}");
-        // Default phrase keeps the query verbatim, so the space-joined query matches nothing.
-        let phrase = search_out(&tool, "only-first only-second", None, None).await;
-        assert!(phrase.starts_with("No matches"), "{phrase}");
-        // Single keyword still matches in `all`.
-        let single = search_out(&tool, "蓝鲸", None, Some("all")).await;
-        assert!(single.starts_with("Found 1 matches"), "{single}");
-        // Duplicates and unicode whitespace collapse to one distinct term.
-        let dup = search_out(&tool, " \t蓝鲸\n蓝鲸\u{3000}", None, Some("all")).await;
-        assert!(dup.starts_with("Found 1 matches"), "{dup}");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn session_search_rejects_invalid_match_mode() {
-        let root = temp_ws("search_badmode");
-        let tool = SessionSearchTool::new(Arc::new(WorkspaceManager::new(root.clone())));
-
-        for bad in ["", "ALL", "unknown"] {
-            let out = search_out(&tool, "蓝鲸", None, Some(bad)).await;
-            assert!(out.starts_with("Error: matchMode"), "mode {bad:?}: {out}");
-        }
-
-        let _ = std::fs::remove_dir_all(&root);
+            (0..150).map(|i| Msg::user(format!("needle {i}"))).collect(),
+        )
+        .await;
+        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .with_context(ctx(Some("alice")));
+        let out = tool
+            .call(
+                args(&[
+                    ("query", serde_json::json!("needle")),
+                    ("maxResults", serde_json::json!(100_000)),
+                ]),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.text_content().contains("Found 100 matches"));
     }
 
     #[test]
-    fn keyword_matcher_rejects_empty_all_query() {
-        assert!(KeywordMatcher::compile("   \t\n", MatchMode::All).is_err());
-        assert!(KeywordMatcher::compile("", MatchMode::Any).is_err());
-        // Phrase mode accepts an empty query (caller guards on blank query first).
-        assert!(KeywordMatcher::compile("  ", MatchMode::Phrase).is_ok());
-    }
-
-    #[test]
-    fn capped_limit_bounds_and_falls_back() {
-        assert_eq!(capped_limit(None, 10), 10);
-        assert_eq!(capped_limit(Some(0), 10), 10);
-        assert_eq!(capped_limit(Some(5), 10), 5);
-        assert_eq!(capped_limit(Some(100), 10), 100);
-        assert_eq!(capped_limit(Some(100_000), 10), 100);
+    fn match_mode_defaults_to_phrase_and_rejects_unknown_values() {
+        assert_eq!(MatchMode::parse(None).unwrap(), MatchMode::Phrase);
+        assert!(MatchMode::parse(Some("bogus")).is_err());
+        // An ALL query with no keywords must not match everything.
+        assert!(KeywordMatcher::compile("   ", MatchMode::All).is_err());
     }
 }

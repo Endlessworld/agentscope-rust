@@ -12,8 +12,7 @@ use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::{
     build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
     prune_tool_results, truncate_args, CompactionConfig, ConversationCompactor,
-    PruneConfig, SUMMARY_MSG_NAME, SessionEntry, SessionFreshnessEvaluator, SessionTree,
-    TruncateArgsConfig,
+    PruneConfig, SUMMARY_MSG_NAME, SessionFreshnessEvaluator, TruncateArgsConfig,
 };
 use chrono::{Duration as ChronoDuration, Local, Timelike};
 
@@ -456,59 +455,6 @@ async fn compaction_failure_keeps_full_history() {
         .build();
     let result = compactor.compact_if_needed(messages, &cfg, "agent", "session").await;
     assert!(result.is_err(), "a failed summary must surface as an error, not a placeholder");
-}
-
-#[test]
-fn session_entry_serde_roundtrip_with_type_tag() {
-    let e = SessionEntry::message(None, "user", "hello");
-    let json = serde_json::to_string(&e).unwrap();
-    assert!(json.contains("\"type\":\"message\""), "got {}", json);
-    assert!(json.contains("\"role\":\"user\""));
-    let back: SessionEntry = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, e);
-
-    let s = SessionEntry::summary(Some("parent"), "the summary");
-    let json = serde_json::to_string(&s).unwrap();
-    assert!(json.contains("\"type\":\"summary\""));
-    assert!(json.contains("\"format\":\"structured\""));
-    let back: SessionEntry = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, s);
-}
-
-#[test]
-fn session_tree_build_context_respects_compaction() {
-    let mut tree = SessionTree::new();
-    let m1 = tree.append(SessionEntry::message(None, "user", "a"));
-    let m2 = tree.append(SessionEntry::message(Some(&m1), "assistant", "b"));
-    let m3 = tree.append(SessionEntry::message(Some(&m2), "user", "c"));
-    // No compaction yet -> all messages visible.
-    assert_eq!(tree.build_context().len(), 3);
-
-    let s = tree.append(SessionEntry::summary(Some(&m2), "summary text"));
-    tree.append(SessionEntry::compaction(Some(&m2), m2.clone(), s.clone()));
-    let ctx = tree.build_context();
-    assert_eq!(ctx.len(), 3); // summary + m2 + m3
-    assert_eq!(ctx[0].id(), s);
-    assert_eq!(ctx[1].id(), m2);
-    assert_eq!(ctx[2].id(), m3);
-}
-
-#[test]
-fn session_tree_jsonl_roundtrip() {
-    let mut tree = SessionTree::new();
-    let m1 = tree.append(SessionEntry::message(None, "user", "a"));
-    tree.append(SessionEntry::message(Some(&m1), "assistant", "b"));
-    tree.append(SessionEntry::summary(Some(&m1), "s"));
-    assert_eq!(tree.size(), 3);
-
-    let jsonl = tree.to_jsonl();
-    assert_eq!(jsonl.lines().count(), 3);
-
-    let mut loaded = SessionTree::new();
-    let added = loaded.load_jsonl(&jsonl);
-    assert_eq!(added, 3);
-    assert_eq!(loaded.size(), 3);
-    assert_eq!(loaded.get_all_entries(), tree.get_all_entries());
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Harness agent runtime, mirroring `io.agentscope.harness.agent`.
 
 pub mod bus;
+pub mod context;
 pub mod coordination;
 pub mod distributed_store;
 pub mod gateway;
@@ -11,15 +12,26 @@ pub mod mcp_client_manager;
 pub mod memory;
 pub mod middleware;
 pub mod sandbox;
+pub mod session;
 pub mod skill;
 pub mod subagent;
 pub mod team;
-pub mod transcript;
 pub mod workspace;
 
 pub use bus::{
     AsyncToolRecord, AsyncToolRegistry, BusEntry, MessageBus, WorkspaceAsyncToolRegistry,
     WorkspaceMessageBus,
+};
+pub use context::{
+    ApproximateEstimator, BoxedContextSource, ContextBlock, ContextItem, ContextItemPlacement,
+    ContextManifest, ContextManifestItem, ContextMiddleware, ContextPipeline,
+    ContextPipelineConfig, ContextPolicy, ContextPurpose, ContextRequest, ContextSelectionPolicy,
+    ContextSource, ContextSourceOptions, ContextSources, DefaultSelectionPolicy, Estimate,
+    SourceFailurePolicy, TaskContextOptions, TokenEstimator,
+};
+pub use session::{
+    AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
+    WorkspaceSessionLogStore, WorkspaceSessionStorage,
 };
 pub use distributed_store::{DistributedStore, DistributedStoreBuilder};
 pub use gateway::{
@@ -36,18 +48,19 @@ pub use gateway::{
 pub use harness_agent::{HarnessAgent, HarnessAgentBuilder};
 pub use isolation_scope::IsolationScope;
 pub use mcp::{
-    bridge_mcp_tools_to_toolkit, McpServerConfig, McpServerRegistrationListener,
-    McpServerRegistrationResult, McpServerRegistrationStatus, McpServerRegistrar, Registrar,
+    bridge_mcp_tools_to_toolkit, try_bridge_mcp_tools_to_toolkit, McpMetaPropagationOptions,
+    McpServerConfig, McpServerRegistrationListener, McpServerRegistrationResult,
+    McpServerRegistrationStatus, McpServerRegistrar, Registrar,
 };
 pub use mcp_client_manager::{McpClientManager, McpClientInstance, McpToolInfo};
 pub use memory::{
     compaction::{
         build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
         prune_tool_results, truncate_args, CompactionConfig, CompactionConfigBuilder,
-        ConversationCompactor, DEFAULT_SUMMARY_PROMPT, PruneConfig, SUMMARY_MSG_NAME,
-        TruncateArgsConfig, TruncateArgsConfigBuilder,
+        CompactionMetrics, CompactionStatus, ConversationCompactor, DEFAULT_SUMMARY_PROMPT,
+        PruneConfig, SUMMARY_MSG_NAME, TruncateArgsConfig, TruncateArgsConfigBuilder,
     },
-    session::{SessionEntry, SessionFreshnessEvaluator, SessionTree},
+    session::SessionFreshnessEvaluator,
     MemoryConfig, MemoryConfigBuilder, MemoryConsolidator, MemoryFlushManager,
     ToolResultEvictionConfig,
 };
@@ -85,9 +98,6 @@ pub use subagent::{
     TaskRecord,
     TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository,
     SUPPRESS_COMPLETION_CALLBACK,
-};
-pub use transcript::{
-    FilesystemTranscriptStore, TranscriptRef, TranscriptSegment, TranscriptStore,
 };
 pub use workspace::{
     NamespaceFactory, NoNamespace, PlanModeManager, UserSessionNamespace, WorkspaceConstants,

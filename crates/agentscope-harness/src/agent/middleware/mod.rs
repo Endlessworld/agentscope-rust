@@ -23,7 +23,6 @@ pub mod subagents;
 pub mod tool_call_sanitizer;
 pub mod tool_result_eviction;
 pub mod teams;
-pub mod transcript;
 pub mod workspace_context;
 
 pub use agent_trace::AgentTraceMiddleware;
@@ -46,7 +45,6 @@ pub use subagents::{
 pub use tool_result_eviction::{EVICTED_METADATA_KEY, ToolResultEvictionMiddleware};
 pub use tool_call_sanitizer::ToolCallPairSanitizerMiddleware;
 pub use teams::TeamsMiddleware;
-pub use transcript::TranscriptMiddleware;
 pub use workspace_context::WorkspaceContextMiddleware;
 
 /// Config for compaction-based conversation trimming.
