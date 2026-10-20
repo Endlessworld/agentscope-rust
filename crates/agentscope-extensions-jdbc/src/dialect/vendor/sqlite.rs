@@ -124,6 +124,34 @@ impl SessionStateDialect for SqliteDialect {
             ],
         )
     }
+
+    /// `RETURNING version` makes the write and the version read a single statement, so the
+    /// version handed back to the caller is always the one this write produced.
+    fn session_state_upsert_returning_version(
+        &self,
+        slot_id: &str,
+        key: &str,
+        index: i32,
+        json: &str,
+    ) -> Option<BoundSql> {
+        Some(BoundSql::new(
+            format!(
+                "INSERT INTO {} (session_id, state_key, item_index, state_data, version) \
+                 VALUES (?, ?, ?, ?, 1) \
+                 ON CONFLICT (session_id, state_key, item_index) DO UPDATE \
+                 SET state_data = excluded.state_data, version = {}.version + 1 \
+                 RETURNING version",
+                self.resolved_session_state_table_name(),
+                self.resolved_session_state_table_name()
+            ),
+            vec![
+                SqlParam::Text(slot_id.to_string()),
+                SqlParam::Text(key.to_string()),
+                SqlParam::Int(index as i64),
+                SqlParam::Text(json.to_string()),
+            ],
+        ))
+    }
 }
 
 impl SnapshotDialect for SqliteDialect {
@@ -156,5 +184,14 @@ impl SnapshotDialect for SqliteDialect {
 impl AbstractJdbcDialect for SqliteDialect {
     fn kind(&self) -> DialectKind {
         DialectKind::Sqlite
+    }
+
+    /// SQLite has no `information_schema`; the pragma table-valued function accepts
+    /// the table name as a bound parameter.
+    fn table_columns_query(&self, table_name: &str) -> BoundSql {
+        BoundSql::new(
+            "SELECT name FROM pragma_table_info(?)",
+            vec![SqlParam::Text(table_name.to_string())],
+        )
     }
 }

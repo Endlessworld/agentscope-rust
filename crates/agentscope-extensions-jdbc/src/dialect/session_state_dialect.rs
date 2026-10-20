@@ -57,6 +57,10 @@ pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
     }
 
     /// UPSERT a single state row (last-write-wins).
+    ///
+    /// Insert semantics: every vendor override binds `version = 1` explicitly, so a fresh
+    /// row starts at `1` — the DDL's `version ... DEFAULT 0` never applies to this
+    /// statement (only [`Self::session_state_insert`], which omits the column, gets `0`).
     fn session_state_upsert(
         &self,
         slot_id: &str,
@@ -64,6 +68,26 @@ pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
         index: i32,
         json: &str,
     ) -> BoundSql;
+
+    /// UPSERT a single state row and return the resulting version in the same round trip.
+    ///
+    /// Used by `save_if_version(UNVERSIONED)`: the write and the version read must be one
+    /// statement, otherwise a concurrent writer can slip in between the write and a
+    /// follow-up `SELECT version` and the caller would observe *that* writer's version.
+    ///
+    /// Returns `None` when the dialect cannot express a returning upsert — MySQL has no
+    /// `RETURNING`, and H2's `MERGE` has no portable returning form. Callers must then
+    /// fall back to UPSERT followed by a separate `SELECT version`, which is a **known
+    /// non-atomic degradation**, not an equivalent.
+    fn session_state_upsert_returning_version(
+        &self,
+        _slot_id: &str,
+        _key: &str,
+        _index: i32,
+        _json: &str,
+    ) -> Option<BoundSql> {
+        None
+    }
 
     /// INSERT a row, failing on a duplicate PK (used for create-only versioned writes).
     fn session_state_insert_if_absent(

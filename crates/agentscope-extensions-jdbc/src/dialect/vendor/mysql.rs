@@ -28,10 +28,19 @@ impl StoreDialect for MysqlDialect {
     fn store_create_table_ddls(&self) -> Vec<String> {
         // Keep the composite PK under InnoDB's utf8mb4 3072-byte limit:
         // (512 + 255) * 4 = 3068 bytes; idx_namespace (512 * 4 = 2048 bytes) also fits.
+        //
+        // Key columns pin `utf8mb4_bin` for the same reason as the session-state and snapshot
+        // tables: `DEFAULT CHARSET=utf8mb4` alone resolves to a case-insensitive collation,
+        // so `put(ns, "README.md")` and `put(ns, "readme.md")` collide on the primary key and
+        // the second silently overwrites the first. `value_json` keeps the table default.
+        //
+        // This dialect resolves to the same physical table name (`agentscope_store`) as
+        // `agentscope-extensions-mysql`'s store dialect, so both bootstrap paths must agree.
         vec![format!(
             "CREATE TABLE IF NOT EXISTS {} (\
-             namespace_path VARCHAR(512) NOT NULL, \
-             item_key VARCHAR(255) NOT NULL, value_json LONGTEXT NOT NULL, \
+             namespace_path VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+             item_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+             value_json LONGTEXT NOT NULL, \
              version BIGINT NOT NULL, updated_at BIGINT NOT NULL, \
              PRIMARY KEY (namespace_path, item_key), \
              INDEX idx_namespace (namespace_path)) \
@@ -67,9 +76,23 @@ impl StoreDialect for MysqlDialect {
 
 impl SessionStateDialect for MysqlDialect {
     fn session_state_create_table_ddls(&self) -> Vec<String> {
+        // `session_id`/`state_key` pin a binary collation. The table default stays
+        // `utf8mb4_unicode_ci` (case-insensitive) for the payload column, but a key column
+        // inheriting it makes `(session_id, state_key, item_index)` treat two keys that
+        // differ only in letter case as equal — the second write then collides on the
+        // primary key and silently overwrites the first. Same defect as the store table
+        // (`agentscope-extensions-mysql/src/store/dialect.rs`), same fix.
+        //
+        // A column-level `COLLATE` is required even though the table already declares
+        // `DEFAULT CHARACTER SET utf8mb4`: the table default is only used by columns with no
+        // collation of their own, which is exactly the case this fixes. `CHARACTER SET` is
+        // spelled out because `COLLATE` must match the column charset.
+        //
+        // PK size stays under InnoDB's 3072-byte limit: (255 + 255) * 4 + 4 = 2044 bytes.
         vec![format!(
             "CREATE TABLE IF NOT EXISTS {} (\
-             session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, \
+             session_id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+             state_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
              item_index INT NOT NULL DEFAULT 0, state_data LONGTEXT NOT NULL, \
              version BIGINT NOT NULL DEFAULT 0, \
              created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
@@ -116,9 +139,14 @@ impl SessionStateDialect for MysqlDialect {
 
 impl SnapshotDialect for MysqlDialect {
     fn snapshot_create_table_ddls(&self) -> Vec<String> {
+        // `snapshot_id` is the primary key, so it needs the same binary collation as the
+        // other key columns: under a case-insensitive collation two snapshot ids differing
+        // only in letter case collide, and the UPSERT silently overwrites the first archive
+        // with the second. The table declares no default charset/collation today, so the
+        // column is fully explicit (`CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`).
         vec![format!(
             "CREATE TABLE IF NOT EXISTS {} (\
-             snapshot_id VARCHAR(512) NOT NULL PRIMARY KEY, \
+             snapshot_id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY, \
              data LONGBLOB NOT NULL, \
              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
             self.resolved_snapshot_table_name()
@@ -148,5 +176,15 @@ impl AbstractJdbcDialect for MysqlDialect {
 
     fn supports_native_locks(&self) -> bool {
         true
+    }
+
+    /// Restrict the probe to the connected database (`DATABASE()`), so a same-named
+    /// table in another schema cannot mask a missing column.
+    fn table_columns_query(&self, table_name: &str) -> BoundSql {
+        BoundSql::new(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE LOWER(table_name) = LOWER(?) AND table_schema = DATABASE()",
+            vec![SqlParam::Text(table_name.to_string())],
+        )
     }
 }

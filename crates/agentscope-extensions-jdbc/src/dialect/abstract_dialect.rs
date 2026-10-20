@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use super::bound_sql::BoundSql;
 use super::store_dialect::StoreDialect;
 use super::session_state_dialect::SessionStateDialect;
 use super::snapshot_dialect::SnapshotDialect;
@@ -199,5 +200,19 @@ pub trait AbstractJdbcDialect:
     /// PostgreSQL `pg_try_advisory_lock`). The portable table lock is the default.
     fn supports_native_locks(&self) -> bool {
         false
+    }
+
+    /// A query returning the column names of `table_name`, one row per column.
+    ///
+    /// Feeds the assemble-time schema validation
+    /// ([`crate::dialect::validate_table_schema`]). The default targets
+    /// `information_schema.columns`, which ANSI/H2/PostgreSQL/MySQL all provide;
+    /// vendors override it where they need a schema qualifier or a different catalog.
+    fn table_columns_query(&self, table_name: &str) -> BoundSql {
+        BoundSql::new(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE LOWER(table_name) = LOWER(?)",
+            vec![crate::dialect::SqlParam::Text(table_name.to_string())],
+        )
     }
 }

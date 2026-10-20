@@ -8,7 +8,9 @@ use std::sync::Arc;
 use agentscope_harness::filesystem::{BaseStore, StoreItem, StoreValue};
 
 use crate::backend::{is_unique_violation, JdbcExecutor, JdbcResult, SharedExecutor};
-use crate::dialect::{AbstractJdbcDialect, BoundSql, SqlParam, StoreDialect};
+use crate::dialect::{
+    validate_table_schema, AbstractJdbcDialect, BoundSql, SqlParam, StoreDialect,
+};
 
 /// ASCII unit separator (U+001F) between namespace segments, mirroring the Java
 /// `NS_SEPARATOR`.
@@ -51,13 +53,20 @@ impl JdbcStore {
         Self::new(executor, dialect, true)
     }
 
-    /// Runs the dialect's idempotent DDL for the KV store table.
+    /// Runs the dialect's idempotent DDL for the KV store table, then validates the
+    /// resulting schema (Java `TableSchemaValidator`).
     pub fn initialize_schema(&self) -> JdbcResult<()> {
         let ddls = self.dialect.store_create_table_ddls();
         for ddl in &ddls {
             self.executor
                 .execute(&BoundSql::no_params(ddl.clone()))?;
         }
+        validate_table_schema(
+            &*self.executor,
+            self.dialect.as_ref(),
+            &self.dialect.resolved_store_table_name(),
+            &ddls,
+        )?;
         Ok(())
     }
 

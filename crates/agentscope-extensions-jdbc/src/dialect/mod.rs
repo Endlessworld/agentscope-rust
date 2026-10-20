@@ -21,6 +21,7 @@ mod native_lock;
 mod session_state_dialect;
 mod snapshot_dialect;
 mod store_dialect;
+mod table_schema;
 pub mod vendor;
 
 pub use abstract_dialect::{
@@ -39,4 +40,5 @@ pub use native_lock::{
 pub use session_state_dialect::SessionStateDialect;
 pub use snapshot_dialect::SnapshotDialect;
 pub use store_dialect::StoreDialect;
+pub use table_schema::{parse_create_table_columns, validate_table_schema};
 pub use vendor::{AnsiDialect, MysqlDialect, PostgresDialect, SqliteDialect};

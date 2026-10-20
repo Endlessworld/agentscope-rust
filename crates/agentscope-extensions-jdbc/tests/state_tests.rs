@@ -61,6 +61,116 @@ fn text_of(v: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Wraps a real executor to observe how many statements a call issues, and to let a test
+/// inject a *competing writer* at a precise point (GAP-01).
+///
+/// Interposition happens **after** the triggering statement has completed but before the
+/// caller regains control. That is exactly the window a non-atomic
+/// "UPSERT then SELECT version" implementation exposes: the write lands, another writer
+/// commits, and the follow-up read reports the other writer's version. For a
+/// `RETURNING`-based implementation the row is already produced by the single statement, so
+/// interposition cannot corrupt what the caller sees.
+#[derive(Debug)]
+struct InstrumentedExecutor {
+    inner: Arc<RusqliteExecutor>,
+    /// Statements touching the session-state table, in order.
+    session_statements: std::sync::atomic::AtomicUsize,
+    /// Fire the competing write right after the Nth session statement
+    /// (`usize::MAX` = disarmed). Starts disarmed so schema creation is not counted.
+    interpose_after: std::sync::atomic::AtomicUsize,
+    interposed: std::sync::atomic::AtomicBool,
+}
+
+impl InstrumentedExecutor {
+    fn new(inner: Arc<RusqliteExecutor>) -> Self {
+        Self {
+            inner,
+            session_statements: std::sync::atomic::AtomicUsize::new(0),
+            interpose_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            interposed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Starts counting from zero and arms the competing write for after statement `n`.
+    fn arm_after(&self, n: usize) {
+        self.session_statements
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.interposed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.interpose_after
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn session_statement_count(&self) -> usize {
+        self.session_statements
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn was_interposed(&self) -> bool {
+        self.interposed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A competing `save_if_version(UNVERSIONED)`-style overwrite of the same key, run as a
+    /// separate UPSERT (it bumps `version` and replaces the payload).
+    fn interpose_competing_write(&self) {
+        let bound = SqliteDialect::new().session_state_upsert(
+            "u:s",
+            "k",
+            0,
+            &serde_json::to_string(&text("competitor")).unwrap(),
+        );
+        self.inner
+            .execute(&bound)
+            .expect("competing write must succeed");
+    }
+
+    fn observe(&self, sql: &str) {
+        if !sql.to_ascii_uppercase().contains("AGENTSCOPE_SESSIONS") {
+            return;
+        }
+        let n = self
+            .session_statements
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if self.interpose_after.load(std::sync::atomic::Ordering::SeqCst) == n
+            && !self
+                .interposed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.interpose_competing_write();
+        }
+    }
+}
+
+impl JdbcExecutor for InstrumentedExecutor {
+    fn execute(
+        &self,
+        bound: &agentscope_extensions_jdbc::dialect::BoundSql,
+    ) -> agentscope_extensions_jdbc::JdbcResult<usize> {
+        let affected = self.inner.execute(bound)?;
+        self.observe(&bound.sql);
+        Ok(affected)
+    }
+
+    fn query(
+        &self,
+        bound: &agentscope_extensions_jdbc::dialect::BoundSql,
+    ) -> agentscope_extensions_jdbc::JdbcResult<Vec<Vec<agentscope_extensions_jdbc::ColumnValue>>> {
+        let rows = self.inner.query(bound)?;
+        self.observe(&bound.sql);
+        Ok(rows)
+    }
+}
+
+fn new_instrumented_store() -> (JdbcAgentStateStore, Arc<InstrumentedExecutor>) {
+    let inner = Arc::new(RusqliteExecutor::in_memory().unwrap());
+    let instrumented = Arc::new(InstrumentedExecutor::new(inner));
+    let executor: Arc<dyn JdbcExecutor> = instrumented.clone();
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    let store = JdbcAgentStateStore::with_schema(executor, dialect).unwrap();
+    (store, instrumented)
+}
+
 // ---------------------------------------------------------------------------
 //  Java: JdbcAgentStateStoreH2Test
 // ---------------------------------------------------------------------------
@@ -492,4 +602,172 @@ async fn versioned_api_rejects_blank_session_or_key() {
     assert!(store
         .save_if_version(Some("u"), "s", " ", text("a"), 0)
         .is_err());
+}
+
+// ---------------------------------------------------------------------------
+//  GAP-01: `UNVERSIONED` write-then-read must be one round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unversioned_write_returns_the_version_a_following_read_sees() {
+    // (a) The returned version is exactly the one `read_version` reports right after.
+    let store = new_store();
+    let returned = store
+        .save_if_version(Some("u"), "s", "k", text("a"), UNVERSIONED)
+        .unwrap();
+    assert_eq!(
+        returned,
+        store.read_version(Some("u"), "s", "k").unwrap(),
+        "the version returned by an UNVERSIONED write must match the stored version"
+    );
+    // A fresh row inserted by the UPSERT starts at 1 (the statement binds `version = 1`; the
+    // DDL's `DEFAULT 0` only applies to `session_state_insert`, which omits the column).
+    assert_eq!(returned, 1);
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "a");
+}
+
+#[tokio::test]
+async fn consecutive_unversioned_writes_increase_the_version() {
+    // (b) Repeated unconditional overwrites keep bumping the version monotonically, and each
+    // returned version is the committed one.
+    let store = new_store();
+    let first = store
+        .save_if_version(Some("u"), "s", "k", text("a"), UNVERSIONED)
+        .unwrap();
+    let second = store
+        .save_if_version(Some("u"), "s", "k", text("b"), UNVERSIONED)
+        .unwrap();
+    let third = store
+        .save_if_version(Some("u"), "s", "k", text("c"), UNVERSIONED)
+        .unwrap();
+
+    assert_eq!((first, second, third), (1, 2, 3));
+    assert!(second > first && third > second, "versions must increase monotonically");
+    assert_eq!(third, store.read_version(Some("u"), "s", "k").unwrap());
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "c");
+}
+
+#[tokio::test]
+async fn unversioned_write_is_one_statement_and_ignores_a_concurrent_writer() {
+    // The atomicity guarantee, made deterministic: a competing writer commits immediately
+    // after the store's *first* session-state statement.
+    //
+    //  * Single-statement (`RETURNING`) implementation: the UPSERT already produced version 1
+    //    and returned it; the competitor's later bump to 2 cannot change what we report.
+    //  * Write-then-read implementation: the UPSERT lands at 1, the competitor bumps to 2,
+    //    and the follow-up SELECT wrongly reports 2 — a version this call never wrote.
+    let (store, instrumented) = new_instrumented_store();
+    instrumented.arm_after(1);
+
+    let returned = store
+        .save_if_version(Some("u"), "s", "k", text("mine"), UNVERSIONED)
+        .unwrap();
+
+    assert!(
+        instrumented.was_interposed(),
+        "the competing write must have been injected; otherwise this test proves nothing"
+    );
+    assert_eq!(
+        instrumented.session_statement_count(),
+        1,
+        "an UNVERSIONED write must issue exactly one statement (write + version in one trip)"
+    );
+    assert_eq!(
+        returned, 1,
+        "must report the version this write produced, not a concurrent writer's"
+    );
+    // The competitor's write is the one that ended up last-write-wins on the payload; the
+    // point is only that our *version* is attributable to our own write.
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 2);
+}
+
+// ---------------------------------------------------------------------------
+//  GAP-02: `version = 0` rows must not be permanently un-writable
+// ---------------------------------------------------------------------------
+
+/// Pre-seeds a row the way the production code can leave one behind: a `session_state_insert`
+/// (the list-element INSERT) omits the `version` column, so it lands on the DDL default `0`.
+fn seed_version_zero_row(
+    executor: &RusqliteExecutor,
+    slot_id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    let dialect = SqliteDialect::new();
+    executor
+        .execute(&dialect.session_state_insert(
+            slot_id,
+            key,
+            0,
+            &serde_json::to_string(value).unwrap(),
+        ))
+        .expect("seeding a version-0 row must succeed");
+}
+
+fn raw_version(executor: &RusqliteExecutor, slot_id: &str, key: &str) -> i64 {
+    let dialect = SqliteDialect::new();
+    executor
+        .query(&dialect.session_state_select(slot_id, key, 0))
+        .unwrap()
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().nth(1))
+        .and_then(|c| c.as_int())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn save_if_version_zero_self_heals_a_stale_version_zero_row() {
+    // (a) A row sitting on the DDL default must be writable by create-if-absent.
+    let (store, executor) = new_store_with_executor();
+    seed_version_zero_row(&executor, "u:s", "k", &text("stale"));
+    assert_eq!(raw_version(&executor, "u:s", "k"), 0, "fixture must be version 0");
+
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("fresh"), 0)
+            .unwrap(),
+        1,
+        "a version-0 row must be accepted as create-if-absent, not reported as a conflict"
+    );
+
+    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "fresh");
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 1);
+}
+
+#[tokio::test]
+async fn save_if_version_zero_does_not_overwrite_a_versioned_row() {
+    // (b) The self-heal must stay a CAS, not become an unconditional overwrite.
+    let store = new_store();
+    store
+        .save_if_version(Some("u"), "s", "k", text("a"), 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("b"), 1)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("c"), 2)
+            .unwrap(),
+        3
+    );
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 3);
+
+    // Version is 3 here; expected=0 must still conflict and leave the data untouched.
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", "k", text("d"), 0)
+            .unwrap(),
+        UNVERSIONED,
+        "expected=0 against a version-3 row must still conflict"
+    );
+    assert_eq!(
+        text_of(&store.get(Some("u"), "s", "k").await.unwrap()),
+        "c",
+        "a rejected create-if-absent must not modify the stored value"
+    );
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 3);
 }

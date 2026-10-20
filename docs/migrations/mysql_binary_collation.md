@@ -71,13 +71,17 @@ HAVING c > 1;
   `ALTER TABLE agentscope_store MODIFY item_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL;`
   （回滚后大小写变体键将再次互相覆盖，故不建议回滚。）
 
-## 5. 已知同类问题（待办，非本文档修复范围）
+## 5. 会话/快照表（代码已修，存量库仍需迁移）
 
-- `crates/agentscope-extensions-jdbc/src/dialect/vendor/mysql.rs` 的**会话状态表** DDL 仍为
-  `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`，其主键 `(session_id, state_key, item_index)` 的 `session_id`/`state_key` 因此仍是大小写不敏感——与 §1 同类缺陷。**尚未修复**，建议后续按同一方式改为 `COLLATE utf8mb4_bin` 并纳入本文档脚本。
+- 代码侧已对齐：`crates/agentscope-extensions-jdbc/src/dialect/vendor/mysql.rs` 的**会话状态表**
+  `session_id`/`state_key` 与**快照表** `snapshot_id` 均已显式 `CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`
+  （表级默认仍为 `utf8mb4_unicode_ci`，只影响非键列）。
+- **存量库不会自动变**：已部署的旧表仍是大小写不敏感，需执行与 §3 同类的
+  `ALTER TABLE ... MODIFY ... COLLATE utf8mb4_bin`（表名 `agentscope_session_state` / `agentscope_snapshots`，以实际前缀为准）。
+- 迁移前的变体键去重检查同 §3.1。
 
 ## 6. 交叉引用
 
 - Java 源：`2349533a1`（#3288）。
 - Rust 落点：`crates/agentscope-extensions-mysql/src/store/dialect.rs`。
-- 分析报告：`docs/java-recent-commits-migration-analysis.md`（P0-2 及附录 A.4）。
+- 分析报告：`docs/java-recent-commits-migration-analysis.md`（GAP-03 与 OPS-01）。

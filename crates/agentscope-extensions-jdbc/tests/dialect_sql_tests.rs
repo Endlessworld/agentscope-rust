@@ -128,6 +128,73 @@ fn mysql_store_ddl_has_innodb_utf8mb4_longtext() {
     assert!(ddl.contains("utf8mb4"));
 }
 
+// ---------------------------------------------------------------------------
+//  GAP-03: every MySQL key column must be binary-collated
+//  (same defect class as Java 2349533a1 / #3288, which only fixed the store table)
+// ---------------------------------------------------------------------------
+
+/// Extracts the column definition for `column` from a `CREATE TABLE` statement.
+fn column_def<'a>(ddl: &'a str, column: &str) -> &'a str {
+    let lower = ddl.to_ascii_lowercase();
+    let needle = format!("{} ", column.to_ascii_lowercase());
+    let start = lower
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing column `{column}` in DDL: {ddl}"));
+    let rest = &ddl[start..];
+    let end = rest.find(',').or_else(|| rest.find(')')).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn assert_binary_key_column(ddl: &str, column: &str) {
+    let def = column_def(ddl, column);
+    assert!(
+        def.contains("COLLATE utf8mb4_bin"),
+        "key column `{column}` must pin a binary collation, got: {def}"
+    );
+    assert!(
+        def.contains("CHARACTER SET utf8mb4"),
+        "key column `{column}` must name its charset so COLLATE matches, got: {def}"
+    );
+}
+
+#[test]
+fn mysql_store_key_columns_use_binary_collation() {
+    // Cases differing only in letter case must not collide on a primary key. A
+    // case-insensitive collation makes `put("README.md")` then `put("readme.md")` a PK
+    // conflict, so the UPSERT silently overwrites the first value.
+    let store = MysqlDialect::new().store_create_table_ddls().remove(0);
+    assert_binary_key_column(&store, "namespace_path");
+    assert_binary_key_column(&store, "item_key");
+    // The payload column is deliberately left on the table default.
+    assert!(
+        !column_def(&store, "value_json").contains("COLLATE"),
+        "value_json must keep the table collation: {store}"
+    );
+}
+
+#[test]
+fn mysql_session_state_key_columns_use_binary_collation() {
+    // The session-state PK is `(session_id, state_key, item_index)`. The table declares
+    // `DEFAULT ... COLLATE utf8mb4_unicode_ci`, so without a column-level override both key
+    // columns inherit a case-insensitive collation and two sessions/keys differing only in
+    // letter case overwrite each other.
+    let session = MysqlDialect::new().session_state_create_table_ddls().remove(0);
+    assert_binary_key_column(&session, "session_id");
+    assert_binary_key_column(&session, "state_key");
+    assert!(
+        !column_def(&session, "state_data").contains("COLLATE"),
+        "state_data must keep the table collation: {session}"
+    );
+}
+
+#[test]
+fn mysql_snapshot_key_column_uses_binary_collation() {
+    // `snapshot_id` is the snapshots-table primary key; the table declared no collation at
+    // all, so the column inherited the server/database default (case-insensitive).
+    let snapshot = MysqlDialect::new().snapshot_create_table_ddls().remove(0);
+    assert_binary_key_column(&snapshot, "snapshot_id");
+}
+
 #[test]
 fn sqlite_store_ddl_uses_text_and_integer() {
     // Java: DialectSqlTests.sqliteStoreDdlUsesTextInteger

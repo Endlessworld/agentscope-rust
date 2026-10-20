@@ -19,7 +19,9 @@ use agentscope_core::state::list_hash::{
 use serde_json::Value;
 
 use crate::backend::{JdbcError, JdbcResult, SharedExecutor};
-use crate::dialect::{AbstractJdbcDialect, BoundSql, SessionStateDialect, SqlParam};
+use crate::dialect::{
+    validate_table_schema, AbstractJdbcDialect, BoundSql, SessionStateDialect, SqlParam,
+};
 
 /// The separator between the user segment and session id inside a `slot_id`.
 const SLOT_SEPARATOR: char = ':';
@@ -87,11 +89,19 @@ impl JdbcAgentStateStore {
         Self::new(executor, dialect, true)
     }
 
-    /// Runs the dialect's idempotent DDL for the session-state table.
+    /// Runs the dialect's idempotent DDL for the session-state table, then validates
+    /// the resulting schema (Java `TableSchemaValidator`).
     pub fn create_table_if_not_exist(&self) -> JdbcResult<()> {
-        for ddl in self.dialect.session_state_create_table_ddls() {
-            self.executor.execute(&BoundSql::no_params(ddl))?;
+        let ddls = self.dialect.session_state_create_table_ddls();
+        for ddl in &ddls {
+            self.executor.execute(&BoundSql::no_params(ddl.clone()))?;
         }
+        validate_table_schema(
+            &*self.executor,
+            self.dialect.as_ref(),
+            &self.dialect.resolved_session_state_table_name(),
+            &ddls,
+        )?;
         Ok(())
     }
 
@@ -268,34 +278,64 @@ impl JdbcAgentStateStore {
         let json = Self::json_of(&value)?;
 
         if expected_version == UNVERSIONED {
-            self.save_single(&slot, key, &json)?;
-            return self.read_version_at(&slot, key);
+            return self.upsert_returning_version(&slot, key, &json);
         }
 
-        // Both CAS branches are single statements, so each is already atomic and the Java
+        // Every branch below is a single statement, so each is already atomic and the Java
         // `executeInWriteTransaction` wrapper has no counterpart here.
-        let bound = if expected_version == 0 {
-            self.dialect
-                .session_state_insert_if_absent(&slot, key, SINGLE_STATE_INDEX as i32, &json)
-        } else {
-            self.dialect.session_state_update_if_version(
+        if expected_version == 0 {
+            let bound = self.dialect.session_state_insert_if_absent(
                 &slot,
                 key,
                 SINGLE_STATE_INDEX as i32,
                 &json,
-                expected_version,
-            )
-        };
+            );
+            return match self.executor.execute(&bound) {
+                Ok(1) => Ok(1),
+                // The key already exists. `session_state_insert` (list elements) omits the
+                // `version` column, so it lands on the DDL default `0`. Such a row can never
+                // be create-if-absent written (PK conflict every time) and version `0` is
+                // also never taken by the CAS path — the key would be stuck forever.
+                // Self-heal: retry as a CAS at version `0`.
+                Ok(_) => self.cas_zero_version(&slot, key, &json),
+                Err(e) if crate::backend::is_unique_violation(&e) => {
+                    self.cas_zero_version(&slot, key, &json)
+                }
+                Err(e) => Err(e),
+            };
+        }
+
+        let bound = self.dialect.session_state_update_if_version(
+            &slot,
+            key,
+            SINGLE_STATE_INDEX as i32,
+            &json,
+            expected_version,
+        );
         match self.executor.execute(&bound) {
-            Ok(1) => Ok(if expected_version == 0 {
-                1
-            } else {
-                expected_version + 1
-            }),
+            Ok(1) => Ok(expected_version + 1),
             Ok(_) => Ok(UNVERSIONED),
-            Err(e) if expected_version == 0 && crate::backend::is_unique_violation(&e) => {
-                Ok(UNVERSIONED)
-            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Retries a failed create-if-absent as a CAS at version `0`, unblocking rows that sit on
+    /// the DDL default.
+    ///
+    /// The `WHERE version = 0` guard is what keeps this a genuine CAS rather than an
+    /// unconditional overwrite: a row at any other version reports `0` affected rows and the
+    /// caller still sees [`UNVERSIONED`].
+    fn cas_zero_version(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<i64> {
+        let bound = self.dialect.session_state_update_if_version(
+            slot_id,
+            key,
+            SINGLE_STATE_INDEX as i32,
+            json,
+            0,
+        );
+        match self.executor.execute(&bound) {
+            Ok(1) => Ok(1),
+            Ok(_) => Ok(UNVERSIONED),
             Err(e) => Err(e),
         }
     }
@@ -306,6 +346,47 @@ impl JdbcAgentStateStore {
             .session_state_upsert(slot_id, key, SINGLE_STATE_INDEX as i32, json);
         self.executor.execute(&bound)?;
         Ok(())
+    }
+
+    /// UPSERTs a single row and returns the version that this very write produced.
+    ///
+    /// Preferred path: one statement (`INSERT ... ON CONFLICT DO UPDATE ... RETURNING
+    /// version`), so no concurrent writer can interleave between the write and the read.
+    ///
+    /// Fallback path: dialects without `RETURNING` (MySQL's `ON DUPLICATE KEY UPDATE`,
+    /// H2's `MERGE`) run the UPSERT then a separate `SELECT version`. That is a **known
+    /// non-atomic degradation**: a concurrent `save`/`save_if_version` committing in
+    /// between makes the returned version belong to that other write. It is still
+    /// monotonic (never lower than our own write's version) and always reflects committed
+    /// data, so callers can use it as a CAS token — they just cannot assume it identifies
+    /// *their* payload.
+    fn upsert_returning_version(
+        &self,
+        slot_id: &str,
+        key: &str,
+        json: &str,
+    ) -> JdbcResult<i64> {
+        let Some(bound) = self.dialect.session_state_upsert_returning_version(
+            slot_id,
+            key,
+            SINGLE_STATE_INDEX as i32,
+            json,
+        ) else {
+            self.save_single(slot_id, key, json)?;
+            return self.read_version_at(slot_id, key);
+        };
+        let rows = self.executor.query(&bound)?;
+        let version = rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .and_then(|c| c.as_int());
+        match version {
+            Some(v) => Ok(v),
+            // A dialect advertising a returning UPSERT must hand back exactly one row; if it
+            // does not, fall back to a plain read instead of reporting a bogus version.
+            None => self.read_version_at(slot_id, key),
+        }
     }
 
     /// Saves a list using hash-based change detection, mirroring Java semantics.

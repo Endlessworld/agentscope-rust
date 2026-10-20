@@ -65,6 +65,7 @@
 | 集合/集成测试 | 需真实 MySQL 实例（当前仅内存后端验证语义） | 待办（环境受限） |
 | `tracing` 日志 | 对齐 SLF4J 日志点 | 待办（P2） |
 | `JdbcStore.validateIdentifier` 等价 | 表/库名合法性校验（已在 state 模块有；store 的表名允许自定义） | 部分 |
+| MySQL 键列二进制排序（`2349533a1`） | 本 crate `store/dialect.rs` 的 `namespace_path`/`item_key` 早已 `COLLATE utf8mb4_bin`；**同族修复（2026-10-20）落在 `agentscope-extensions-jdbc`**：其 `dialect/vendor/mysql.rs` 的会话状态表 `session_id`/`state_key` 与快照表 `snapshot_id` 已补 `CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`。存量库仍需手工 ALTER，见 `docs/migrations/mysql_binary_collation.md` | 已完成（2026-10-20） |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态

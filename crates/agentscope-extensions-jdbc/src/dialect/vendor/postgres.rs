@@ -125,6 +125,34 @@ impl SessionStateDialect for PostgresDialect {
             ],
         )
     }
+
+    /// `RETURNING version` makes the write and the version read a single statement, so the
+    /// version handed back to the caller is always the one this write produced.
+    fn session_state_upsert_returning_version(
+        &self,
+        slot_id: &str,
+        key: &str,
+        index: i32,
+        json: &str,
+    ) -> Option<BoundSql> {
+        Some(BoundSql::new(
+            format!(
+                "INSERT INTO {} (session_id, state_key, item_index, state_data, version) \
+                 VALUES (?, ?, ?, ?, 1) \
+                 ON CONFLICT (session_id, state_key, item_index) DO UPDATE \
+                 SET state_data = EXCLUDED.state_data, version = {}.version + 1 \
+                 RETURNING version",
+                self.resolved_session_state_table_name(),
+                self.resolved_session_state_table_name()
+            ),
+            vec![
+                SqlParam::Text(slot_id.to_string()),
+                SqlParam::Text(key.to_string()),
+                SqlParam::Int(index as i64),
+                SqlParam::Text(json.to_string()),
+            ],
+        ))
+    }
 }
 
 impl SnapshotDialect for PostgresDialect {
@@ -161,5 +189,15 @@ impl AbstractJdbcDialect for PostgresDialect {
 
     fn supports_native_locks(&self) -> bool {
         true
+    }
+
+    /// Restrict the probe to the current schema so a same-named table in another
+    /// schema (e.g. `public` vs an app schema) cannot mask a missing column.
+    fn table_columns_query(&self, table_name: &str) -> BoundSql {
+        BoundSql::new(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE LOWER(table_name) = LOWER(?) AND table_schema = current_schema()",
+            vec![SqlParam::Text(table_name.to_string())],
+        )
     }
 }

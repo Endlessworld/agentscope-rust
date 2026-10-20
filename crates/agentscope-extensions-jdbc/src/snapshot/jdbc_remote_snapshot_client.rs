@@ -10,7 +10,7 @@ use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient;
 
 use crate::backend::{JdbcResult, SharedExecutor};
-use crate::dialect::{AbstractJdbcDialect, BoundSql, SnapshotDialect};
+use crate::dialect::{validate_table_schema, AbstractJdbcDialect, BoundSql, SnapshotDialect};
 
 /// [`RemoteSnapshotClient`] backed by a JDBC BLOB column.
 #[derive(Clone)]
@@ -46,12 +46,21 @@ impl JdbcRemoteSnapshotClient {
         Self::new(executor, dialect, true)
     }
 
-    /// Runs the dialect's idempotent DDL for the snapshots table.
+    /// Runs the dialect's idempotent DDL for the snapshots table, then validates the
+    /// resulting schema (Java `TableSchemaValidator`).
     pub fn init_schema(&self) -> JdbcResult<()> {
-        for ddl in self.dialect.snapshot_create_table_ddls() {
-            self.executor.execute(&BoundSql::no_params(ddl))?;
+        let ddls = self.dialect.snapshot_create_table_ddls();
+        for ddl in &ddls {
+            self.executor.execute(&BoundSql::no_params(ddl.clone()))?;
         }
-        Ok(())}
+        validate_table_schema(
+            &*self.executor,
+            self.dialect.as_ref(),
+            &self.dialect.resolved_snapshot_table_name(),
+            &ddls,
+        )?;
+        Ok(())
+    }
 }
 
 #[async_trait]
