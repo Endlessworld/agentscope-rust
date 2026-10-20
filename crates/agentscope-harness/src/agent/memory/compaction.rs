@@ -365,6 +365,67 @@ impl Default for PruneConfig {
 // ConversationCompactor
 // ---------------------------------------------------------------------------
 
+/// How a compaction ended, mirroring the Java `compaction/end` status values.
+///
+/// Java also has `cancelled`; Rust has no cancellation path (a failed summary keeps the
+/// full history and reports `failed`), so the enum is two-valued and that is intentional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionStatus {
+    Completed,
+    Failed,
+}
+
+impl CompactionStatus {
+    /// The Java wire value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompactionStatus::Completed => "completed",
+            CompactionStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Quantified compaction outcome, mirroring the Java `compaction/end` payload.
+///
+/// `before_*` counts describe the input conversation; `after_*` counts describe the
+/// effective history after compaction and are present only when the compaction completed
+/// (a failed run has no meaningful "after" state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionMetrics {
+    /// Identifier correlating the `compaction/start` and `compaction/end` events.
+    pub compaction_id: String,
+    /// Message count of the input conversation.
+    pub before_msg_count: usize,
+    /// Estimated token count of the input conversation.
+    pub before_token_count: usize,
+    /// The `compaction/end` status.
+    pub status: CompactionStatus,
+    /// Message count of the effective history after compaction (`None` when failed).
+    pub after_msg_count: Option<usize>,
+    /// Estimated token count of the effective history (`None` when failed).
+    pub after_token_count: Option<usize>,
+}
+
+impl CompactionMetrics {
+    /// The `compaction/end` payload, omitting the `after_*` keys when they are unknown.
+    fn end_payload(&self) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "compactionId": self.compaction_id,
+            "status": self.status.as_str(),
+            "beforeMsgCount": self.before_msg_count,
+            "beforeTokenCount": self.before_token_count,
+        });
+        let map = payload.as_object_mut().expect("payload is an object");
+        if let Some(count) = self.after_msg_count {
+            map.insert("afterMsgCount".to_string(), serde_json::json!(count));
+        }
+        if let Some(count) = self.after_token_count {
+            map.insert("afterTokenCount".to_string(), serde_json::json!(count));
+        }
+        payload
+    }
+}
+
 /// Orchestrates conversation compaction (summarization).
 ///
 /// Algorithm: truncate args -> prune tool results -> check trigger -> compute a safe
@@ -391,8 +452,93 @@ impl ConversationCompactor {
         &self,
         conversation: Vec<Msg>,
         config: &CompactionConfig,
+        agent_id: &str,
+        session_id: &str,
+    ) -> agentscope_core::error::Result<Option<Vec<Msg>>> {
+        Ok(self
+            .compact_if_needed_with_metrics(conversation, config, agent_id, session_id, None)
+            .await?
+            .0)
+    }
+
+    /// Runs compaction and reports the quantified outcome.
+    ///
+    /// The metrics mirror the Java `compaction/end` payload. They are produced even when
+    /// the trigger is not met (`status = completed`, `after_*` equal to the input counts),
+    /// so the caller can always emit a `compaction/end` fact once it decided to run.
+    ///
+    /// `recorder` is optional: when present, `compaction/start` and `compaction/end` are
+    /// appended as durable session events, matching Java. Metrics are still computed
+    /// without a recorder so callers can surface them in-band.
+    pub async fn compact_if_needed_with_metrics(
+        &self,
+        conversation: Vec<Msg>,
+        config: &CompactionConfig,
         _agent_id: &str,
         _session_id: &str,
+        recorder: Option<&std::sync::Arc<agentscope_core::session::SessionRecorder>>,
+    ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
+        let before_msg_count = conversation.len();
+        let before_token_count = calculate_token(&conversation);
+        let compaction_id = uuid::Uuid::new_v4().to_string();
+        let metrics = |status: CompactionStatus, after: Option<&[Msg]>| CompactionMetrics {
+            compaction_id: compaction_id.clone(),
+            before_msg_count,
+            before_token_count,
+            status,
+            after_msg_count: after.map(|messages| messages.len()),
+            after_token_count: after.map(calculate_token),
+        };
+
+        if conversation.is_empty() {
+            return Ok((None, metrics(CompactionStatus::Completed, Some(&[]))));
+        }
+
+        // `compaction/start` is a durable fact about the *attempt*, so it is recorded
+        // before any work: if the summarizer dies, the journal still shows what was
+        // being attempted and which messages it started from.
+        if let Some(recorder) = recorder {
+            recorder
+                .record(
+                    "compaction/start",
+                    &serde_json::json!({
+                        "compactionId": compaction_id,
+                        "inputMessages": conversation,
+                    }),
+                )
+                .await?;
+        }
+
+        let outcome = self.compact_candidate(conversation, config).await;
+        let metrics = match &outcome {
+            Ok(replacement) => match replacement {
+                Some(compacted) => metrics(CompactionStatus::Completed, Some(compacted)),
+                None => {
+                    // No compaction needed: the effective history is the input itself.
+                    CompactionMetrics {
+                        after_msg_count: Some(before_msg_count),
+                        after_token_count: Some(before_token_count),
+                        ..metrics(CompactionStatus::Completed, None)
+                    }
+                }
+            },
+            Err(_) => metrics(CompactionStatus::Failed, None),
+        };
+
+        if let Some(recorder) = recorder {
+            recorder
+                .record("compaction/end", &metrics.end_payload())
+                .await?;
+        }
+
+        Ok((outcome?, metrics))
+    }
+
+    /// The summarization itself, with no metric bookkeeping.
+    async fn compact_candidate(
+        &self,
+        conversation: Vec<Msg>,
+        config: &CompactionConfig,
     ) -> agentscope_core::error::Result<Option<Vec<Msg>>> {
         if conversation.is_empty() {
             return Ok(None);
