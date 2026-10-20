@@ -42,6 +42,36 @@ pub enum Error {
     #[error("Interrupted: {0}")]
     Interrupted(String),
 
+    /// Session journal persistence failure.
+    ///
+    /// Persistence failures must propagate and must never become a successful
+    /// model/tool result. Mirrors Java `SessionLogException`.
+    #[error("{0}")]
+    Session(String),
+
+    /// An action observation could not be acknowledged.
+    ///
+    /// Never convert this into a retryable tool result: replaying an action whose
+    /// lifecycle fact was not persisted is unsafe. Mirrors Java
+    /// `ActionObservationException`.
+    #[error("Unable to persist action observation; do not replay the action automatically: {0}")]
+    ActionObservation(String),
+
+    /// An `agent_state` save lost an optimistic-concurrency race under
+    /// [`ConflictPolicy::Fail`](crate::state::ConflictPolicy::Fail).
+    ///
+    /// Mirrors Java `ConcurrentSessionModificationException`: the write was rejected and
+    /// nothing was persisted, so the caller may retry from a freshly loaded baseline.
+    #[error(
+        "Concurrent modification of session state (userId={user_id}, sessionId={session_id}, key={key}, expectedVersion={expected_version})"
+    )]
+    ConcurrentSessionModification {
+        user_id: String,
+        session_id: String,
+        key: String,
+        expected_version: i64,
+    },
+
     /// Agent is shutting down.
     #[error("Agent is shutting down: {0}")]
     ShuttingDown(String),

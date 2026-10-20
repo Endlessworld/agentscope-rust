@@ -8,7 +8,9 @@ use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::event::{AgentEvent, AgentEventType};
 use agentscope_core::message::{ContentBlock, Msg, ToolUseBlock};
-use agentscope_core::middleware::{ActingInput, EventStream, Middleware, Next, ReasoningInput};
+use agentscope_core::middleware::{
+    ActingInput, ActingResultsHandle, EventStream, Middleware, Next, ReasoningInput,
+};
 use agentscope_core::model::GenerateOptions;
 use agentscope_harness::{
     AsyncToolMiddleware, AsyncToolRegistry, Filesystem, InboxMiddleware, LocalFilesystem,
@@ -131,7 +133,8 @@ async fn async_tool_offloads_slow_tool_to_background() {
     });
 
     let tool_call = ToolUseBlock::new("call-1", "slow_tool", json_map(json!({})));
-    let input = ActingInput::new(vec![tool_call]);
+    let results = ActingResultsHandle::new();
+    let input = ActingInput::with_results(vec![tool_call], results.clone());
 
     let events = mw.on_acting(&ctx, input, next).collect::<Vec<_>>().await;
 
@@ -141,6 +144,19 @@ async fn async_tool_offloads_slow_tool_to_background() {
         .filter(|r| r.as_ref().ok().map(|e| e.event_type()) == Some(AgentEventType::ToolResultStart))
         .count();
     assert_eq!(starts, 1, "expected placeholder ToolResultStart, got {:?}", events);
+
+    // The placeholder is persisted through the acting results handle — that is the
+    // Rust equivalent of Java writing the placeholder into the mutable AgentState
+    // (`on_acting` only receives `&RuntimeContext`).
+    let snapshot = results.snapshot();
+    assert_eq!(snapshot.executed, 0, "a placeholder must not count as an execution");
+    assert!(!snapshot.finished, "the core did not finish before the offload");
+    assert_eq!(snapshot.results.len(), 1, "one placeholder result per tool call");
+    let placeholder = format!("{:?}", snapshot.results[0].output);
+    assert!(
+        placeholder.contains("running in background"),
+        "placeholder text missing from the recorded result: {placeholder}"
+    );
 
     // The slow tool continues in the background and eventually delivers to inbox.
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -183,13 +199,18 @@ async fn async_tool_passes_through_fast_tool() {
     });
 
     let tool_call = ToolUseBlock::new("c1", "fast_tool", json_map(json!({})));
-    let input = ActingInput::new(vec![tool_call]);
+    let results = ActingResultsHandle::new();
+    let input = ActingInput::with_results(vec![tool_call], results.clone());
 
     let events: Vec<Result<AgentEvent>> = mw.on_acting(&ctx, input, next).collect().await;
 
     // Passthrough: exactly the one real event, no placeholder deltas.
     assert_eq!(events.len(), 1, "expected passthrough of a single event, got {:?}", events);
     assert_eq!(events[0].as_ref().unwrap().event_type(), AgentEventType::ToolResultStart);
+    assert!(
+        results.snapshot().results.is_empty(),
+        "a passthrough must not record a placeholder"
+    );
 
     // Nothing offloaded -> inbox stays empty.
     assert!(!bus.inbox_has_messages(session).await.unwrap());

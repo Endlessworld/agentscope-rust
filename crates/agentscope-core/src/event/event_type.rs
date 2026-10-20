@@ -22,6 +22,11 @@ pub enum AgentEventType {
     ToolCallDelta,
     ToolCallEnd,
     ToolResultStart,
+    /// Intermediate progress published by a running tool through its emitter.
+    ///
+    /// Mirrors the Java `AgentEventType.TOOL_PROGRESS`. Progress is display-only: it
+    /// is never fed back to the model, only the tool's return value is.
+    ToolProgress,
     ToolResultTextDelta,
     ToolResultDataDelta,
     ToolResultEnd,
@@ -59,6 +64,7 @@ impl AgentEventType {
             AgentEventType::ToolCallDelta => "TOOL_CALL_DELTA",
             AgentEventType::ToolCallEnd => "TOOL_CALL_END",
             AgentEventType::ToolResultStart => "TOOL_RESULT_START",
+            AgentEventType::ToolProgress => "TOOL_PROGRESS",
             AgentEventType::ToolResultTextDelta => "TOOL_RESULT_TEXT_DELTA",
             AgentEventType::ToolResultDataDelta => "TOOL_RESULT_DATA_DELTA",
             AgentEventType::ToolResultEnd => "TOOL_RESULT_END",
@@ -112,6 +118,7 @@ impl AgentEventType {
             "TOOL_CALL_DELTA" => AgentEventType::ToolCallDelta,
             "TOOL_CALL_END" => AgentEventType::ToolCallEnd,
             "TOOL_RESULT_START" => AgentEventType::ToolResultStart,
+            "TOOL_PROGRESS" => AgentEventType::ToolProgress,
             "TOOL_RESULT_TEXT_DELTA" => AgentEventType::ToolResultTextDelta,
             "TOOL_RESULT_DATA_DELTA" => AgentEventType::ToolResultDataDelta,
             "TOOL_RESULT_END" => AgentEventType::ToolResultEnd,

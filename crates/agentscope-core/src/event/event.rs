@@ -55,6 +55,8 @@ pub enum AgentEvent {
     ToolCallEnd(EventData),
     #[serde(rename = "TOOL_RESULT_START")]
     ToolResultStart(EventData),
+    #[serde(rename = "TOOL_PROGRESS")]
+    ToolProgress(EventData),
     #[serde(rename = "TOOL_RESULT_TEXT_DELTA")]
     ToolResultTextDelta(EventData),
     #[serde(rename = "TOOL_RESULT_DATA_DELTA")]
@@ -126,6 +128,7 @@ impl AgentEvent {
             AgentEvent::ToolCallDelta(_) => AgentEventType::ToolCallDelta,
             AgentEvent::ToolCallEnd(_) => AgentEventType::ToolCallEnd,
             AgentEvent::ToolResultStart(_) => AgentEventType::ToolResultStart,
+            AgentEvent::ToolProgress(_) => AgentEventType::ToolProgress,
             AgentEvent::ToolResultTextDelta(_) => AgentEventType::ToolResultTextDelta,
             AgentEvent::ToolResultDataDelta(_) => AgentEventType::ToolResultDataDelta,
             AgentEvent::ToolResultEnd(_) => AgentEventType::ToolResultEnd,
@@ -163,6 +166,7 @@ impl AgentEvent {
             AgentEvent::ToolCallDelta(d) => d,
             AgentEvent::ToolCallEnd(d) => d,
             AgentEvent::ToolResultStart(d) => d,
+            AgentEvent::ToolProgress(d) => d,
             AgentEvent::ToolResultTextDelta(d) => d,
             AgentEvent::ToolResultDataDelta(d) => d,
             AgentEvent::ToolResultEnd(d) => d,
@@ -236,6 +240,7 @@ impl AgentEvent {
             AgentEventType::ToolCallDelta => AgentEvent::ToolCallDelta(data),
             AgentEventType::ToolCallEnd => AgentEvent::ToolCallEnd(data),
             AgentEventType::ToolResultStart => AgentEvent::ToolResultStart(data),
+            AgentEventType::ToolProgress => AgentEvent::ToolProgress(data),
             AgentEventType::ToolResultTextDelta => AgentEvent::ToolResultTextDelta(data),
             AgentEventType::ToolResultDataDelta => AgentEvent::ToolResultDataDelta(data),
             AgentEventType::ToolResultEnd => AgentEvent::ToolResultEnd(data),
@@ -273,6 +278,7 @@ impl AgentEvent {
             AgentEvent::ToolCallDelta(d) => d.source = Some(source.into()),
             AgentEvent::ToolCallEnd(d) => d.source = Some(source.into()),
             AgentEvent::ToolResultStart(d) => d.source = Some(source.into()),
+            AgentEvent::ToolProgress(d) => d.source = Some(source.into()),
             AgentEvent::ToolResultTextDelta(d) => d.source = Some(source.into()),
             AgentEvent::ToolResultDataDelta(d) => d.source = Some(source.into()),
             AgentEvent::ToolResultEnd(d) => d.source = Some(source.into()),
@@ -297,6 +303,15 @@ impl AgentEvent {
         self
     }
 
+    /// Replaces the whole metadata map and returns the event.
+    ///
+    /// Used when metadata arrives as one map (e.g. a tool's progress chunk metadata, which
+    /// Java forwards verbatim via `withMetadata(chunk.getMetadata())`).
+    pub fn with_metadata_map(mut self, metadata: JsonMap) -> Self {
+        self.data_mut().metadata = metadata;
+        self
+    }
+
     fn data_mut(&mut self) -> &mut EventData {
         match self {
             AgentEvent::AgentStart(d) => d,
@@ -317,6 +332,7 @@ impl AgentEvent {
             AgentEvent::ToolCallDelta(d) => d,
             AgentEvent::ToolCallEnd(d) => d,
             AgentEvent::ToolResultStart(d) => d,
+            AgentEvent::ToolProgress(d) => d,
             AgentEvent::ToolResultTextDelta(d) => d,
             AgentEvent::ToolResultDataDelta(d) => d,
             AgentEvent::ToolResultEnd(d) => d,

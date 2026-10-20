@@ -14,15 +14,18 @@ pub mod memory;
 pub mod message;
 pub mod middleware;
 pub mod model;
+pub mod observation;
 pub mod permission;
+pub mod session;
 pub mod shutdown;
 pub mod state;
 pub mod tool;
 pub mod tracing;
 
 pub use agent::{
-    Agent, CallableAgent, CallGate, ConfirmHandler, EventCategory, ExecutionGuard, ObservableAgent,
-    ReActAgent, ReActAgentBuilder, RuntimeContext, StreamOptions, StreamOptionsBuilder,
+    normalize_agent_id, Agent, CallableAgent, CallGate, ConfirmHandler, EventCategory,
+    ExecutionGuard, Extensions, ObservableAgent, ReActAgent, ReActAgentBuilder, RuntimeContext,
+    StreamOptions, StreamOptionsBuilder, DEFAULT_AGENT_ID, MAX_AGENT_ID_LENGTH,
 };
 pub use credential::{
     Credential, DeepSeekCredential, DeepSeekCredentialBuilder, KimiCredential,
@@ -46,7 +49,7 @@ pub use message::{
     HintBlock, ImageBlock, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock, ThinkingBlock,
     ToolCallState, ToolResultBlock, ToolResultState, ToolUseBlock, URLSource, VideoBlock,
 };
-pub use middleware::{ActingInput, AgentInput, ExtensionPoint, Middleware, MiddlewareChain, ModelCallInput, ReasoningInput, TaskReminderMiddleware};
+pub use middleware::{ActingInput, ActingResultsHandle, ActingResultsSnapshot, AgentInput, ExtensionPoint, Middleware, MiddlewareChain, ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware};
 pub use model::{
     resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder,
     ExecutionConfig, ExecutionConfigBuilder, GenerateOptions, GenerateOptionsBuilder, Model,
@@ -61,6 +64,10 @@ pub use tool::{
     ToolSuspendException, ToolValidator,
 };
 pub use interruption::{InterruptContext, InterruptControl, InterruptSource};
+pub use observation::{
+    observe_action, status_of, ActionObservation, ActionObserver, ActionStatus, ObserverHandle,
+    SessionActionObserver, EVENT_NAME as ACTION_OBSERVATION_EVENT, OBSERVER_CONTEXT_KEY,
+};
 pub use memory::{InMemoryMemory, Memory, StateBackedMemory};
 pub use permission::{
     AdditionalWorkingDirectory, PermissionBehavior, PermissionContextState, PermissionDecision,
@@ -70,8 +77,9 @@ pub use shutdown::{
     GracefulShutdownConfig, GracefulShutdownManager, PartialReasoningPolicy, ShutdownState,
 };
 pub use state::{
-    AgentState, AgentStateStore, InMemoryAgentStateStore, JsonFileAgentStateStore,
-    PlanModeContextState, ReadCacheEntry, SessionInfo, Task, TaskContextState, TaskState,
-    ToolContextState, compute_hash, has_changed, needs_full_rewrite,
+    AgentState, AgentStateStore, ConflictPolicy, EvidenceBinding, InMemoryAgentStateStore,
+    JsonFileAgentStateStore, PlanModeContextState, ReadCacheEntry, SessionInfo, Task,
+    TaskContextState, TaskState, TaskVerification, ToolContextState, VerificationOutcome,
+    compute_hash, has_changed, needs_full_rewrite,
 };
 pub use tracing::{init_tracing, init_tracing_with_filter};

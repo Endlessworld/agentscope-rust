@@ -22,7 +22,8 @@ use crate::message::{
     ToolResultBlock, ToolResultState, ToolUseBlock,
 };
 use crate::middleware::{
-    AgentInput, EventStream, MiddlewareChain, ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware,
+    ActingInput, ActingResultsHandle, AgentInput, EventStream, ExtensionPoint, MiddlewareChain,
+    ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware,
 };
 use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};use crate::permission::{
     PermissionBehavior, PermissionContextState, PermissionDecision, PermissionEngine,
@@ -30,6 +31,10 @@ use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};use crat
 };
 use crate::state::AgentState;
 use crate::state::context::TaskContextState;
+use crate::session::{
+    SessionHistoryMode, SessionKey, SessionLog, SessionLogStore, SessionRecorder,
+    RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+};
 use crate::tool::{TodoWriteTool, ToolExecutionContext, Toolkit};
 use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
 use super::lifecycle::{CallGate, ExecutionGuard};
@@ -103,10 +108,25 @@ struct AgentCore {
     /// blocks. Mirrors Java's `InterruptedException` branch, which adds
     /// `buildFinalMessage()` to the context.
     partial_assistant: Mutex<Option<Msg>>,
+    /// Execution-scoped services copied into every call context (session recorder,
+    /// caller-supplied action observer, …). Mirrors the Java `RuntimeContext`
+    /// attribute map being seeded by the host before an execution.
+    extensions: crate::agent::Extensions,
     /// Whether native structured-output responses are validated against the requested
     /// JSON Schema before being accepted (default `true`). Mirrors Java
     /// `validateStructuredOutput`.
     validate_structured_output: bool,
+    /// Native session journal backend. When set together with
+    /// [`SessionHistoryMode::EventLog`], every call owns a [`SessionRecorder`] and
+    /// history is reconstructed from committed events instead of a state store.
+    /// Mirrors Java `ReActAgent.sessionLogStore`.
+    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    /// Agent id used inside the native journal key. Mirrors Java
+    /// `sessionLogAgentId` (defaults to the agent name/id).
+    session_log_agent_id: String,
+    /// Exactly one history authority: state store (legacy) or native event log.
+    /// Mirrors Java `ReActAgent.sessionHistoryMode` (default `EVENT_LOG`).
+    session_history_mode: SessionHistoryMode,
 }
 
 /// Accumulates streamed model chunks into a single assistant message.
@@ -225,6 +245,59 @@ impl ReActAgent {
     /// JSON Schema (mirrors Java `validateStructuredOutput`).
     pub fn validate_structured_output(&self) -> bool {
         self.core.validate_structured_output
+    }
+
+    /// Whether native committed history is authoritative for this agent.
+    ///
+    /// Mirrors Java `ReActAgent.sessionLogEnabled()`: a journal backend must be installed
+    /// and the mode must be [`SessionHistoryMode::EventLog`].
+    pub fn session_log_enabled(&self) -> bool {
+        self.core.session_log_store.is_some()
+            && self.core.session_history_mode == SessionHistoryMode::EventLog
+    }
+
+    /// The logical journal identity for `context`, or `None` when no journal is installed.
+    /// Mirrors Java `ReActAgent.sessionKey(RuntimeContext)`.
+    ///
+    /// The context wins for each component independently; a component it omits falls back to
+    /// the agent state. Both [`ReActAgent::session_key`] and the recorder created during a call
+    /// resolve through this one function, so a caller reading the journal can never address a
+    /// different session than the one the call wrote.
+    pub fn session_key(&self, context: &crate::agent::RuntimeContext) -> Option<SessionKey> {
+        self.core.session_log_store.as_ref()?;
+        let state = self.core.state.lock().unwrap();
+        let session_id = context
+            .session_id()
+            .map(str::to_string)
+            .or_else(|| {
+                let sid = state.session_id().to_string();
+                if sid.is_empty() {
+                    None
+                } else {
+                    Some(sid)
+                }
+            })?;
+        let user_id = context
+            .user_id()
+            .map(str::to_string)
+            .or_else(|| state.user_id().map(str::to_string));
+        SessionKey::new(user_id, self.core.session_log_agent_id.clone(), session_id).ok()
+    }
+
+    /// Opens the journal for `context`. Mirrors Java `ReActAgent.sessionLog(RuntimeContext)`.
+    pub async fn session_log(
+        &self,
+        context: &crate::agent::RuntimeContext,
+    ) -> Result<Arc<dyn SessionLog>> {
+        let store = self
+            .core
+            .session_log_store
+            .as_ref()
+            .ok_or_else(|| Error::Session("session log is not configured".into()))?;
+        let key = self.session_key(context).ok_or_else(|| {
+            Error::Session("session identity is incomplete (missing session id)".into())
+        })?;
+        store.open(&key, context).await
     }
 
     /// Returns the model bound to this agent.
@@ -351,6 +424,24 @@ impl ReActAgent {
         messages: Vec<Msg>,
         response_format: Option<ResponseFormat>,
     ) -> Result<Msg> {
+        self.call_with_format_and_extensions(messages, response_format, Default::default())
+            .await
+    }
+
+    /// Runs one call, merging caller-supplied per-run services into the call context.
+    ///
+    /// When native committed history is enabled and the caller did **not** already attach a
+    /// [`SessionRecorder`], this call owns one for its lifetime: it is opened inside the
+    /// per-session gate, attached to the runtime context (so `observe`, tools and middlewares
+    /// see it), and finished when the call ends. This is the Rust equivalent of Java
+    /// `ReActAgent.acquireCallExecution`, which is why a bare `HarnessAgent::call` journals
+    /// without any host-side `AgentSession`.
+    async fn call_with_format_and_extensions(
+        &self,
+        messages: Vec<Msg>,
+        response_format: Option<ResponseFormat>,
+        extensions: crate::agent::Extensions,
+    ) -> Result<Msg> {
         let _guard = ExecutionGuard::acquire()?;
         // Every call runs under its own `RunControl`: fresh interrupt flag, own
         // status machine and own `run_id`. This replaces the agent-level singleton
@@ -369,9 +460,29 @@ impl ReActAgent {
         let key = self.core.state.lock().unwrap().session_id().to_string();
         let gate = Arc::clone(&self.core.call_gate);
         let this = self.clone();
+        let run_status = Arc::clone(&run);
+        // The journal admits a single execution writer per session. Opening the recorder
+        // *inside* the per-session gate keeps concurrent calls on one session from racing for
+        // that lease; opening it earlier would make the loser fail instead of queue.
         let result = gate
             .run(&key, async move {
-                let (stream, slot) = this.run_stream(messages, response_format);
+                let mut extensions = extensions;
+                // Native history: own a recorder unless the caller already supplied one.
+                let owned_recorder = if extensions.contains(RECORDER_CONTEXT_KEY) {
+                    None
+                } else {
+                    this.open_owned_recorder(&mut extensions).await?
+                };
+                // Record the turn's start facts against the state the call will actually use.
+                // The loop appends the input itself, so the pre-call snapshot is the right
+                // baseline (Java `acquireCallExecution` records the same facts).
+                if let Some(recorder) = &owned_recorder {
+                    let state = this.core.state.lock().unwrap().clone();
+                    recorder.start(&messages, &state).await?;
+                }
+
+                let (stream, slot) =
+                    this.run_stream_with_extensions(messages, response_format, extensions);
                 let events: Vec<Result<AgentEvent>> = stream.collect().await;
                 for ev in events.into_iter().flatten() {
                     if let Some(sink) = this.core.subscriber.lock().unwrap().as_ref() {
@@ -384,22 +495,83 @@ impl ReActAgent {
                 // Persist task-list mutations made by the `todo_write` tool back into state.
                 let tasks = this.core.tasks.lock().unwrap().clone();
                 this.core.state.lock().unwrap().tasks_context = tasks;
+
+                // Close the turn before releasing the gate so the journal's terminal facts
+                // match what the caller observes.
+                if let Some(recorder) = owned_recorder {
+                    if let Ok(reply) = &result {
+                        let _ = recorder.result(Some(reply));
+                    }
+                    let status = if run_status.is_cancelled() {
+                        "interrupted"
+                    } else if result.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
+                    let state = this.core.state.lock().unwrap().clone();
+                    if let Err(error) = recorder.finish(&state, status).await {
+                        // Persistence failures must be visible, never silently downgraded.
+                        tracing::warn!("failed to close session journal: {error}");
+                    }
+                }
                 result
             })
             .await;
 
         // A cancellation must win over the run's own outcome so the terminal status
         // is not reported as `Completed` after `cancel()` was observed.
-        let status = if run.is_cancelled() {
+        let outcome = if run.is_cancelled() {
             RunStatus::Cancelled
         } else if result.is_ok() {
             RunStatus::Completed
         } else {
             RunStatus::Failed
         };
-        run.finish(status);
+        run.finish(outcome);
         *self.core.active_run.lock().unwrap() = None;
         result
+    }
+
+    /// Opens a recorder this call owns, attaching it to `extensions`.
+    ///
+    /// Returns `None` when native history is disabled or the agent has no session identity
+    /// yet (a caller that never pinned a session id keeps the stateless behaviour).
+    async fn open_owned_recorder(
+        &self,
+        extensions: &mut crate::agent::Extensions,
+    ) -> Result<Option<Arc<SessionRecorder>>> {
+        if !self.session_log_enabled() {
+            return Ok(None);
+        }
+        // The turn id may be supplied by a host that wants to address this exact turn
+        // (Java `RuntimeContext.put(TURN_ID_KEY, ...)`); otherwise the recorder allocates one.
+        let turn_id = extensions
+            .get::<String>(TURN_ID_CONTEXT_KEY)
+            .map(|id| id.as_str().to_string());
+        let Some(key) = self.state_session_key() else {
+            return Ok(None);
+        };
+        let store = Arc::clone(self.core.session_log_store.as_ref().unwrap());
+        let context = crate::agent::RuntimeContext::new()
+            .with_session_id(key.session_id.clone())
+            .with_agent_id(key.agent_id.clone());
+        let context = match key.user_id.clone() {
+            Some(user_id) => context.with_user_id(user_id),
+            None => context,
+        };
+        let log = store.open(&key, &context).await?;
+        let recorder = Arc::new(SessionRecorder::open(log, turn_id.as_deref()).await?);
+        extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
+        Ok(Some(recorder))
+    }
+
+    /// The journal identity derived from the agent's pinned state.
+    ///
+    /// Delegates to [`ReActAgent::session_key`] with an empty context so the call path and any
+    /// reader share one resolution rule.
+    fn state_session_key(&self) -> Option<SessionKey> {
+        self.session_key(&crate::agent::RuntimeContext::new())
     }
 
     /// Builds the (middleware-wrapped) event stream for a single agent invocation,
@@ -409,8 +581,25 @@ impl ReActAgent {
         messages: Vec<Msg>,
         response_format: Option<ResponseFormat>,
     ) -> (EventStream, Arc<Mutex<Option<Result<Msg>>>>) {
+        self.run_stream_with_extensions(messages, response_format, Default::default())
+    }
+
+    /// Runs one invocation, merging `extensions` into the call-scoped context.
+    ///
+    /// This is the seam a session scheduler uses to attach per-run services (session
+    /// recorder, inbox command) without leaking them into later runs: the base context is
+    /// rebuilt each call and the previous run's services are never inherited.
+    pub fn run_stream_with_extensions(
+        &self,
+        messages: Vec<Msg>,
+        response_format: Option<ResponseFormat>,
+        extensions: crate::agent::Extensions,
+    ) -> (EventStream, Arc<Mutex<Option<Result<Msg>>>>) {
         let input = AgentInput::new(messages);
         let mut ctx = self.new_context(&input);
+        // Layer the per-run services on top of the build-time ones: assigning would silently
+        // drop everything the agent was configured with (recorders, observers).
+        ctx.extensions.extend(&extensions);
         ctx.response_format = response_format;
         let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
         // Shared channel: the model-call loop forwards fine-grained delta events
@@ -457,7 +646,20 @@ impl ReActAgent {
 
     /// Streams fine-grained agent events, filtered by the given [`StreamOptions`].
     pub fn stream_events(&self, messages: Vec<Msg>, options: StreamOptions) -> EventStream {
-        let (stream, _slot) = self.run_stream(messages, None);
+        self.stream_events_with_extensions(messages, options, Default::default())
+    }
+
+    /// Streams one invocation with per-run context extensions.
+    ///
+    /// Used by session schedulers to attach a run-scoped recorder; ordinary callers should
+    /// use [`ReActAgent::stream_events`].
+    pub fn stream_events_with_extensions(
+        &self,
+        messages: Vec<Msg>,
+        options: StreamOptions,
+        extensions: crate::agent::Extensions,
+    ) -> EventStream {
+        let (stream, _slot) = self.run_stream_with_extensions(messages, None, extensions);
         Box::pin(stream.filter_map(move |res| {
             let opts = options.clone();
             async move {
@@ -584,7 +786,9 @@ impl ReActAgent {
                 ));
             }
             let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&model));
-            let msg = model_call_impl(&self.core, input, |_| {}).await?;
+            // The structured-output retry path is not streamed: this emitter drops
+            // every event, so nothing becomes visible and retries stay allowed.
+            let msg = model_call_impl(&self.core, input, false, |_| {}).await?;
             state.context_mut().push(msg.clone());
 
             let mut gen_called = false;
@@ -592,7 +796,7 @@ impl ReActAgent {
                 if tc.name == STRUCTURED_OUTPUT_TOOL_NAME {
                     // No delta channel here: the structured-output retry path is not
                     // streamed, so the emitter (still carrying the call id) discards.
-                    let tctx = tool_execution_context(tc, Default::default(), &None);
+                    let tctx = tool_execution_context(tc, Default::default(), &None, None, "");
                     if let Ok(rb) = toolkit.call_tool(tc, tctx).await {
                         state.context_mut().push(
                             Msg::builder()
@@ -695,6 +899,7 @@ impl ReActAgent {
             // Expose the shared state so context-managing middlewares (e.g.
             // conversation compaction) can read/rewrite the accumulated history.
             state: Some(Arc::clone(&self.core.state)),
+            extensions: self.core.extensions.clone(),
         }
     }
 }
@@ -753,6 +958,10 @@ pub struct ReActAgentBuilder {
     enable_todo_tool: bool,
     confirm_handler: Option<ConfirmHandler>,
     validate_structured_output: bool,
+    extensions: crate::agent::Extensions,
+    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    session_log_agent_id: Option<String>,
+    session_history_mode: SessionHistoryMode,
 }
 
 impl Default for ReActAgentBuilder {
@@ -772,6 +981,10 @@ impl Default for ReActAgentBuilder {
             enable_todo_tool: true,
             confirm_handler: None,
             validate_structured_output: true,
+            extensions: crate::agent::Extensions::new(),
+            session_log_store: None,
+            session_log_agent_id: None,
+            session_history_mode: SessionHistoryMode::EventLog,
         }
     }
 }
@@ -805,6 +1018,21 @@ impl ReActAgentBuilder {
     /// Sets the toolkit used for tool execution.
     pub fn toolkit(mut self, toolkit: Toolkit) -> Self {
         self.toolkit = Some(toolkit);
+        self
+    }
+    /// Attaches an execution-scoped service to every call context, e.g. a session
+    /// recorder or a caller-supplied action observer.
+    pub fn extension<T: std::any::Any + Send + Sync>(mut self, key: &'static str, value: T) -> Self {
+        self.extensions.insert(key, value);
+        self
+    }
+    /// Attaches an already-shared execution-scoped service.
+    pub fn extension_arc<T: std::any::Any + Send + Sync>(
+        mut self,
+        key: &'static str,
+        value: Arc<T>,
+    ) -> Self {
+        self.extensions.insert_arc(key, value);
         self
     }
     /// Sets the system prompt prepended to every reasoning call.
@@ -859,6 +1087,30 @@ impl ReActAgentBuilder {
         self
     }
 
+    /// Installs the native session journal backend. Mirrors Java
+    /// `ReActAgent.Builder.sessionLogStore`.
+    ///
+    /// Setting a store enables journal-backed history (the default mode). Without one the
+    /// agent keeps no journal and history is whatever the caller persists.
+    pub fn session_log_store(mut self, store: Arc<dyn SessionLogStore>) -> Self {
+        self.session_log_store = Some(store);
+        self
+    }
+
+    /// Overrides the agent id stored in the journal key. Mirrors Java
+    /// `sessionLogAgentId`; defaults to the agent's own id.
+    pub fn session_log_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.session_log_agent_id = Some(agent_id.into());
+        self
+    }
+
+    /// Selects the single history authority. Mirrors Java `sessionHistoryMode`,
+    /// defaulting to [`SessionHistoryMode::EventLog`].
+    pub fn session_history_mode(mut self, mode: SessionHistoryMode) -> Self {
+        self.session_history_mode = mode;
+        self
+    }
+
     /// Builds the [`ReActAgent`].
     pub fn build(self) -> Result<ReActAgent> {
         let model = self.model.ok_or_else(|| {
@@ -902,6 +1154,11 @@ impl ReActAgentBuilder {
             confirm_handler: Mutex::new(self.confirm_handler),
             partial_assistant: Mutex::new(None),
             validate_structured_output: self.validate_structured_output,
+            extensions: self.extensions,
+            session_log_store: self.session_log_store,
+            // Java: `builder.sessionLogAgentId == null ? getName() : builder.sessionLogAgentId`.
+            session_log_agent_id: self.session_log_agent_id.unwrap_or_else(|| name.clone()),
+            session_history_mode: self.session_history_mode,
         });
         Ok(ReActAgent { id, name, description: self.description, core })
     }
@@ -1230,7 +1487,10 @@ async fn reasoning_phase(
     }
     messages.extend(state.context().to_vec());
 
-    let tools = core.toolkit.tool_schemas();
+    let tool_request_config = ctx.extension::<crate::tool::ToolRequestConfig>(
+        crate::tool::tool_request_config::TOOL_REQUEST_CONFIG_CONTEXT_KEY,
+    );
+    let tools = core.toolkit.tool_schemas_with(tool_request_config.as_deref());
     let model = core.model.lock().unwrap().clone();
     let mut ob = GenerateOptions::builder().model_name(model.model_name());
     if let Some(rf) = &ctx.response_format {
@@ -1287,7 +1547,9 @@ async fn run_reasoning(
             let core = Arc::clone(&core);
             let delta_tx = delta_tx.clone();
             let fut = async move {
-                let msg = model_call_impl(&core, mc_input, |ev| {
+                // Deltas only reach a consumer when the agent-level stream has a
+                // channel; without one nothing is visible, so retries stay allowed.
+                let msg = model_call_impl(&core, mc_input, delta_tx.is_some(), |ev| {
                     if let Some(tx) = &delta_tx {
                         let _ = tx.unbounded_send(ev);
                     }
@@ -1363,6 +1625,24 @@ fn emit_tool_result_text_delta(
     emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultTextDelta, fields));
 }
 
+/// The wire name of a tool-result state, as carried by `TOOL_RESULT_END`'s `state`
+/// field.
+///
+/// One name per variant, spelled like the other `ToolResultState` projections
+/// (`observation::ActionStatus::as_str`). `Interrupted` must stay distinct from
+/// `Error`: a user cancellation is not a tool failure, and consumers (AG-UI,
+/// Studio) surface the two differently.
+fn tool_result_state_str(state: ToolResultState) -> &'static str {
+    match state {
+        ToolResultState::Success => "SUCCESS",
+        ToolResultState::Error => "ERROR",
+        ToolResultState::Denied => "DENIED",
+        ToolResultState::Running => "RUNNING",
+        ToolResultState::Interrupted => "INTERRUPTED",
+        ToolResultState::Suspended => "SUSPENDED",
+    }
+}
+
 /// Emits a ToolResultEnd event through the delta_tx channel.
 ///
 /// `metadata` is attached verbatim under the `metadata` field so transport layers
@@ -1377,15 +1657,10 @@ fn emit_tool_result_end(
     let mut fields = JsonMap::new();
     fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
     fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
-    let state_str = match state {
-        ToolResultState::Success => "SUCCESS",
-        ToolResultState::Error => "ERROR",
-        ToolResultState::Denied => "DENIED",
-        ToolResultState::Running => "RUNNING",
-        ToolResultState::Interrupted => "ERROR",
-        ToolResultState::Suspended => "SUSPENDED",
-    };
-    fields.insert("state".to_string(), serde_json::Value::String(state_str.to_string()));
+    fields.insert(
+        "state".to_string(),
+        serde_json::Value::String(tool_result_state_str(state).to_string()),
+    );
     if !metadata.is_empty() {
         fields.insert(
             "metadata".to_string(),
@@ -1558,9 +1833,15 @@ impl BlockLifecycle {
 /// Emits the full block lifecycle: ModelCallStart → (TextBlockStart → TextBlockDelta(s) → TextBlockEnd)
 /// / (ThinkingBlockStart → ThinkingBlockDelta(s) → ThinkingBlockEnd)
 /// / (ToolCallStart → ToolCallDelta(s) → ToolCallEnd) → ModelCallEnd.
+///
+/// `emit_reaches_consumer` states whether events handed to `emit` actually reach a
+/// downstream consumer. Retry suppression after partial output depends on it: the
+/// structured-output path passes a discarding emitter, so its text chunks are not
+/// visible to anyone and its retries must keep working.
 async fn model_call_impl(
     core: &Arc<AgentCore>,
     mc_input: ModelCallInput,
+    emit_reaches_consumer: bool,
     mut emit: impl FnMut(Result<AgentEvent>),
 ) -> Result<Msg> {
     let model = Arc::clone(&mc_input.model);
@@ -1579,6 +1860,18 @@ async fn model_call_impl(
 
     // Generate a reply id for this model call, used for block lifecycle correlation.
     let reply_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+
+    // Whether this call has already streamed **visible** output (assistant text) to
+    // the consumer. A retry replays the request from scratch, so a retry after a
+    // partial answer would render that prefix twice. Call-local state on purpose:
+    // putting it on `RuntimeContext` or the agent would leak across calls (and, on
+    // the agent, across concurrent runs).
+    //
+    // Only text deltas count. Reasoning/thinking deltas are not rendered as answer
+    // text, so a retry after them cannot duplicate anything the user reads; tool-call
+    // argument deltas are likewise excluded to keep the suppression as narrow as the
+    // problem it fixes.
+    let mut visible_output_emitted = false;
 
     let mut attempt: u32 = 0;
     loop {
@@ -1602,6 +1895,9 @@ async fn model_call_impl(
                             block_lifecycle.start_text(&mut emit);
                             if !t.text.is_empty() {
                                 emit(Ok(delta_event(AgentEventType::TextBlockDelta, &t.text)));
+                                // The delta has left the framework: retrying now would
+                                // make the consumer render this prefix a second time.
+                                visible_output_emitted |= emit_reaches_consumer;
                             }
                         }
                         ContentBlock::Thinking(t) => {
@@ -1654,6 +1950,22 @@ async fn model_call_impl(
             }
             Err(e) => {
                 attempt += 1;
+                // Retrying is only safe while nothing has been shown to the user.
+                // Once visible text has been streamed, re-running the request would
+                // make the consumer render the same prefix again; surface the error
+                // instead and let the caller decide.
+                let retry_suppressed =
+                    visible_output_emitted && e.is_retryable() && attempt < max_attempts;
+                if retry_suppressed {
+                    tracing::warn!(
+                        model = model.model_name(),
+                        attempt,
+                        max_attempts,
+                        error = %e,
+                        "model call failed after partial output was emitted; retry suppressed"
+                    );
+                    return Err(retry_suppressed_error(e));
+                }
                 if attempt >= max_attempts || !e.is_retryable() {
                     // Preserve what the model had already produced when the call was
                     // interrupted, so the turn can reconcile its dangling tool_use
@@ -1686,32 +1998,72 @@ async fn model_call_impl(
     }
 }
 
+/// Marks a model failure whose retry was skipped because part of the answer had
+/// already been streamed to the consumer.
+///
+/// The variant is preserved where it carries information (an `HttpStatus` keeps its
+/// status code) so callers can still classify the failure; the note explains why the
+/// retry policy did not fire. `is_retryable` stays truthful about the *transport*
+/// error, but callers must not re-run the call — the guard exists precisely to stop
+/// duplicated output.
+fn retry_suppressed_error(e: Error) -> Error {
+    const NOTE: &str = "retry suppressed: partial output already emitted";
+    match e {
+        Error::HttpStatus { status, message } => Error::HttpStatus {
+            status,
+            message: format!("{message} ({NOTE})"),
+        },
+        Error::Http(message) => Error::Http(format!("{message} ({NOTE})")),
+        Error::Io(err) => Error::Io(std::io::Error::new(
+            err.kind(),
+            format!("{err} ({NOTE})"),
+        )),
+        other => Error::Agent(format!("{other} ({NOTE})")),
+    }
+}
+
 /// Builds the chunk callback handed to a tool through its emitter.
 ///
-/// Each emitted chunk is forwarded as a `ToolResultDataDelta` event carrying the
-/// originating tool call's id/name, so consumers can correlate streamed progress
-/// with the exact call. Returns `None` when the call has no event channel (e.g.
-/// structured-output retries), in which case the emitter silently discards chunks.
+/// Every emitted chunk is published as one [`AgentEvent::ToolProgress`] per output block,
+/// matching Java's `ToolProgressEvent` emission in `ReActAgent.internalChunkCallback`
+/// (each block of `chunk.getOutput()` becomes its own event, carrying the chunk metadata).
+///
+/// Progress is display-only: per the `ToolEmitter` contract it never reaches the model. The
+/// tool's return value travels separately as `TOOL_RESULT_TEXT_DELTA`, so consumers must not
+/// fold these events into a tool result.
+///
+/// Returns `None` when the call has no event channel (e.g. structured-output retries), in
+/// which case the emitter silently discards chunks.
 fn tool_chunk_callback(
     delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
     call: &ToolUseBlock,
+    reply_id: &str,
 ) -> Option<crate::tool::ChunkCallback> {
     let tx = delta_tx.clone()?;
     let id = call.id.clone();
     let name = call.name.clone();
+    let reply_id = reply_id.to_string();
     Some(Arc::new(move |chunk: ToolResultBlock| {
+        // Java attaches `chunk.getMetadata()` to each progress event; an empty map is
+        // simply omitted from the serialized event.
+        let metadata = chunk.metadata.clone();
         for block in chunk.output {
             let mut fields = JsonMap::new();
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(reply_id.clone()),
+            );
             fields.insert("tool_call_id".to_string(), serde_json::Value::String(id.clone()));
             fields.insert("tool_name".to_string(), serde_json::Value::String(name.clone()));
+            // Java carries the whole `ContentBlock`, not just its text, so non-text
+            // progress (images, data blocks) survives the trip.
             fields.insert(
-                "data".to_string(),
+                "content".to_string(),
                 serde_json::to_value(&block).unwrap_or(serde_json::Value::Null),
             );
-            let _ = tx.unbounded_send(Ok(AgentEvent::with_fields(
-                AgentEventType::ToolResultDataDelta,
-                fields,
-            )));
+            let event = AgentEvent::with_fields(AgentEventType::ToolProgress, fields)
+                .with_metadata_map(metadata.clone());
+            let _ = tx.unbounded_send(Ok(event));
         }
     }))
 }
@@ -1727,15 +2079,27 @@ fn tool_execution_context(
     call: &ToolUseBlock,
     runtime: JsonMap,
     delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    request_config: Option<Arc<crate::tool::ToolRequestConfig>>,
+    reply_id: &str,
 ) -> ToolExecutionContext {
     ToolExecutionContext {
         tool_call: Some(call.clone()),
         runtime,
         emitter: Some(crate::tool::tool_emitter_for_call(
             call,
-            tool_chunk_callback(delta_tx, call),
+            tool_chunk_callback(delta_tx, call, reply_id),
         )),
+        tool_request_config: request_config,
     }
+}
+
+/// The per-call tool view carried by the runtime context, if any.
+fn tool_request_config(
+    ctx: &crate::agent::RuntimeContext,
+) -> Option<Arc<crate::tool::ToolRequestConfig>> {
+    ctx.extension::<crate::tool::ToolRequestConfig>(
+        crate::tool::tool_request_config::TOOL_REQUEST_CONFIG_CONTEXT_KEY,
+    )
 }
 
 /// Builds the JSON runtime exposed to a tool call, carrying the call-scoped
@@ -1775,179 +2139,60 @@ async fn acting_phase(
         return Ok(ActingOutcome::default());
     }
 
-    let mut results = Vec::new();
-    let mut suspended = false;
-    let mut return_direct_eligible = true;
-    let mut executed = 0usize;
     let reply_id = current_reply_id(state);
     let runtime = tool_runtime(ctx);
-    for call in &pending {
-        // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`): while plan
-        // mode is active, only read-only tools and the always-allowed orchestration/plan
-        // tools may run; every other call gets a synthetic DENIED result without executing.
-        if plan_mode_denies(core, state, call) {
-            emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
-            emit_tool_result_text_delta(
-                &ctx.delta_tx,
-                &call.id,
-                &call.name,
-                PLAN_MODE_DENY_MESSAGE,
-            );
-            return_direct_eligible = false;
-            results.push(denied_result(call, PLAN_MODE_DENY_MESSAGE));
-            emit_tool_result_end(
-                &ctx.delta_tx,
-                &call.id,
-                &call.name,
-                ToolResultState::Denied,
-                &JsonMap::new(),
-            );
-            continue;
-        }
-        let decision = evaluate_permission(core, call);
-        match decision.behavior {
-            PermissionBehavior::Deny => {
-                // Emit ToolResultStart → TextDelta → End for denied calls.
-                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
-                let denied_text = "Permission denied by rules";
-                emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
-                let denied = denied_result(call, &decision.message);
-                return_direct_eligible = false;
-                results.push(denied);
-                emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
-            }
-            PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
-                // Emit ToolResultStart for this tool execution.
-                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
-                let tctx = tool_execution_context(call, runtime.clone(), &ctx.delta_tx);
-                match core.toolkit.call_tool(call, tctx).await {
-                    Ok(rb) => {
-                        // Emit text delta for non-streaming results (streaming tools
-                        // emit their own deltas via the emitter callback).
-                        let mut result_text = String::new();
-                        for block in &rb.output {
-                            if let ContentBlock::Text(t) = block {
-                                result_text.push_str(&t.text);
-                            }
-                        }
-                        if !result_text.trim().is_empty() {
-                            emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &result_text);
-                        }
-                        // Java #3435: a suspended call must not fabricate a result — no
-                        // ToolResultEnd event is emitted (the external-execution requirement
-                        // is the single signal). The block still carries `Suspended` state.
-                        let was_suspended = rb.is_suspended();
-                        let suspend_reason = rb.suspend_reason().map(str::to_string);
-                        let final_state = rb.final_state();
-                        let metadata = rb.metadata.clone();
-                        let bound = bind_result(call, rb);
-                        suspended = suspended || bound.is_suspended();
-                        executed += 1;
-                        if !is_return_direct_result(core, &bound) {
-                            return_direct_eligible = false;
-                        }
-                        results.push(bound);
-                        if was_suspended {
-                            emit_require_external_execution(
-                                &ctx.delta_tx,
-                                &reply_id,
-                                call,
-                                suspend_reason.as_deref(),
-                            );
-                        } else {
-                            emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
-                        }
-                    }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &err_msg);
-                        return_direct_eligible = false;
-                        results.push(error_result(call, &err_msg));
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
-                    }
-                }
-            }
-            PermissionBehavior::Ask => {
-                let handler = core.confirm_handler.lock().unwrap().clone();
-                if let Some(handler) = handler {
-                    // Emit ToolResultStart so ACP clients know this tool is being
-                    // processed (even though it's waiting for user confirmation).
-                    emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
-                    let confirm_result = handler(call.clone()).await;
-                    if confirm_result.is_confirmed() {
-                        // Use the (possibly modified) tool call if the user tweaked input.
-                        let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
-                        emit_tool_result_start(&ctx.delta_tx, &effective_call.id, &effective_call.name);
-                        let tctx = tool_execution_context(
-                            effective_call,
-                            runtime.clone(),
-                            &ctx.delta_tx,
-                        );
-                        match core.toolkit.call_tool(effective_call, tctx).await {
-                            Ok(rb) => {
-                                let mut result_text = String::new();
-                                for block in &rb.output {
-                                    if let ContentBlock::Text(t) = block {
-                                        result_text.push_str(&t.text);
-                                    }
-                                }
-                                if !result_text.trim().is_empty() {
-                                    emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
-                                }
-                                let was_suspended = rb.is_suspended();
-                                let suspend_reason = rb.suspend_reason().map(str::to_string);
-                                let final_state = rb.final_state();
-                                let metadata = rb.metadata.clone();
-                                let bound = bind_result(effective_call, rb);
-                                suspended = suspended || bound.is_suspended();
-                                executed += 1;
-                                if !is_return_direct_result(core, &bound) {
-                                    return_direct_eligible = false;
-                                }
-                                results.push(bound);
-                                if was_suspended {
-                                    emit_require_external_execution(
-                                        &ctx.delta_tx,
-                                        &reply_id,
-                                        effective_call,
-                                        suspend_reason.as_deref(),
-                                    );
-                                } else {
-                                    emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
-                                }
-                            }
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
-                                return_direct_eligible = false;
-                                results.push(error_result(effective_call, &err_msg));
-                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
-                            }
-                        }
-                    } else {
-                        // User denied the tool call.
-                        let denied_text = &confirm_result.message;
-                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
-                        return_direct_eligible = false;
-                        results.push(denied_result(call, denied_text));
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
-                    }
-                } else {
-                    return Err(Error::Agent(format!(
-                        "permission asking (HITL) is not yet supported; tool '{}' requires user confirmation",
-                        call.name
-                    )));
-                }
+    // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`) is the only
+    // acting decision that reads `AgentState`; resolve it up front so the execution
+    // core runs without borrowing the state — that borrow is what would otherwise pin
+    // the core to this frame and stop a middleware from driving it.
+    let plan_denied: Vec<(String, bool)> = pending
+        .iter()
+        .map(|call| (call.id.clone(), plan_mode_denies(core, state, call)))
+        .collect();
+    let results = ActingResultsHandle::new();
+
+    if core.middleware_chain.participants(ExtensionPoint::OnActing).is_empty() {
+        // No middleware participates: keep the single-pass path — events go straight to
+        // `delta_tx`, with no channel hop and no spawned task.
+        run_acting_calls(core, ctx, &pending, &reply_id, &runtime, &plan_denied, &results).await?;
+    } else {
+        let mut stream = core.middleware_chain.wrap_acting(
+            ctx.clone(),
+            ActingInput::with_results(pending.clone(), results.clone()),
+            acting_stream_core(core, ctx, &reply_id, &runtime, &plan_denied),
+        );
+        while let Some(item) = stream.next().await {
+            if let Some(tx) = &ctx.delta_tx {
+                let _ = tx.unbounded_send(item);
             }
         }
     }
+
+    let snapshot = results.snapshot();
+    if let Some(message) = snapshot.error {
+        return Err(Error::Agent(message));
+    }
+    // A short-circuit needs the core to have run to completion: an offloaded phase (a
+    // middleware completed the stream first) must not lift results into the closing
+    // assistant message.
+    let return_direct = snapshot.finished
+        && snapshot.return_direct_eligible
+        && !snapshot.suspended
+        && snapshot.executed > 0;
+    if snapshot.results.is_empty() {
+        return Err(Error::Agent(format!(
+            "acting phase produced no result for {} pending tool call(s): a middleware \
+             completed the stream without executing them or recording placeholders",
+            pending.len()
+        )));
+    }
+    let results = snapshot.results;
 
     // A returnDirect batch short-circuits only when at least one tool ran and every
     // executed result was a returnDirect success; a suspended/denied/errored result
     // disqualifies the whole batch (Java: `pendingPairs.isEmpty() && !successPairs.isEmpty()
     // && allMatch(isReturnDirectToolCall)`).
-    let return_direct = return_direct_eligible && !suspended && executed > 0;
-
+    //
     // On a short-circuit the payload moves to the closing assistant message, so the
     // context gets placeholder-shaped copies instead. The messages are built from the
     // pre-hook execution results (`results`), which is what `ActingOutcome::results`
@@ -1970,10 +2215,243 @@ async fn acting_phase(
         .build();
     state.context_mut().push(result_msg);
     Ok(ActingOutcome {
-        suspended,
+        suspended: snapshot.suspended,
         return_direct,
         results,
     })
+}
+
+/// Builds the acting core handed to [`MiddlewareChain::wrap_acting`].
+///
+/// The core runs the tool calls on a spawned task and streams their events through an
+/// unbounded channel; [`ActingInput::results`] carries the outcome back. This mirrors
+/// Java `ReActAgent.acting`, where `actingStream` writes into an `AtomicReference`
+/// result holder and the middleware chain wraps the event flux.
+fn acting_stream_core(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    reply_id: &str,
+    runtime: &JsonMap,
+    plan_denied: &[(String, bool)],
+) -> Box<dyn FnOnce(ActingInput) -> EventStream + Send> {
+    let core = Arc::clone(core);
+    let ctx = ctx.clone();
+    let reply_id = reply_id.to_string();
+    let runtime = runtime.clone();
+    let plan_denied = plan_denied.to_vec();
+    Box::new(move |input: ActingInput| {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut inner_ctx = ctx;
+        inner_ctx.delta_tx = Some(tx);
+        let results = input.results.clone();
+        let calls = input.tool_calls;
+        tokio::spawn(async move {
+            if let Err(e) = run_acting_calls(
+                &core,
+                &inner_ctx,
+                &calls,
+                &reply_id,
+                &runtime,
+                &plan_denied,
+                &results,
+            )
+            .await
+            {
+                results.fail(e.to_string());
+            }
+        });
+        Box::pin(rx)
+    })
+}
+
+/// Executes the pending tool calls and records every result into `results`.
+///
+/// Split out of [`acting_phase`] so the work can run on a spawned task: it takes no
+/// `&mut AgentState` (plan-mode denials are pre-computed by the caller) and reports
+/// through `results` instead of returning them.
+async fn run_acting_calls(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    pending: &[ToolUseBlock],
+    reply_id: &str,
+    runtime: &JsonMap,
+    plan_denied: &[(String, bool)],
+    results: &ActingResultsHandle,
+) -> Result<()> {
+    for call in pending {
+        // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`): while plan
+        // mode is active, only read-only tools and the always-allowed orchestration/plan
+        // tools may run; every other call gets a synthetic DENIED result without executing.
+        let denied_by_plan = plan_denied.iter().any(|(id, denied)| id == &call.id && *denied);
+        if denied_by_plan {
+            emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+            emit_tool_result_text_delta(
+                &ctx.delta_tx,
+                &call.id,
+                &call.name,
+                PLAN_MODE_DENY_MESSAGE,
+            );
+            results.record(denied_result(call, PLAN_MODE_DENY_MESSAGE), false);
+            emit_tool_result_end(
+                &ctx.delta_tx,
+                &call.id,
+                &call.name,
+                ToolResultState::Denied,
+                &JsonMap::new(),
+            );
+            continue;
+        }
+        let decision = evaluate_permission(core, call);
+        match decision.behavior {
+            PermissionBehavior::Deny => {
+                // Emit ToolResultStart → TextDelta → End for denied calls.
+                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                let denied_text = "Permission denied by rules";
+                emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
+                results.record(denied_result(call, &decision.message), false);
+                emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+            }
+            PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
+                // Emit ToolResultStart for this tool execution.
+                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                let tctx = tool_execution_context(
+                    call,
+                    runtime.clone(),
+                    &ctx.delta_tx,
+                    tool_request_config(ctx),
+                    &reply_id,
+                );
+                // Record the action lifecycle around the real tool call. An acknowledgement
+                // failure is a run-level error: it must never become a retryable tool result.
+                let observed = crate::observation::observe(
+                    ctx,
+                    call,
+                    core.toolkit.call_tool(call, tctx),
+                )
+                .await;
+                match observed {
+                    Ok(rb) => {
+                        // Emit text delta for non-streaming results (streaming tools
+                        // emit their own deltas via the emitter callback).
+                        let mut result_text = String::new();
+                        for block in &rb.output {
+                            if let ContentBlock::Text(t) = block {
+                                result_text.push_str(&t.text);
+                            }
+                        }
+                        if !result_text.trim().is_empty() {
+                            emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &result_text);
+                        }
+                        // Java #3435: a suspended call must not fabricate a result — no
+                        // ToolResultEnd event is emitted (the external-execution requirement
+                        // is the single signal). The block still carries `Suspended` state.
+                        let was_suspended = rb.is_suspended();
+                        let suspend_reason = rb.suspend_reason().map(str::to_string);
+                        let final_state = rb.final_state();
+                        let metadata = rb.metadata.clone();
+                        let bound = bind_result(call, rb);
+                        let rd = is_return_direct_result(core, &bound);
+                        results.record(bound, rd);
+                        if was_suspended {
+                            emit_require_external_execution(
+                                &ctx.delta_tx,
+                                &reply_id,
+                                call,
+                                suspend_reason.as_deref(),
+                            );
+                        } else {
+                            emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &err_msg);
+                        results.record(error_result(call, &err_msg), false);
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
+                    }
+                }
+            }
+            PermissionBehavior::Ask => {
+                let handler = core.confirm_handler.lock().unwrap().clone();
+                if let Some(handler) = handler {
+                    // Emit ToolResultStart so ACP clients know this tool is being
+                    // processed (even though it's waiting for user confirmation).
+                    emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                    let confirm_result = handler(call.clone()).await;
+                    if confirm_result.is_confirmed() {
+                        // Use the (possibly modified) tool call if the user tweaked input.
+                        let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
+                        emit_tool_result_start(&ctx.delta_tx, &effective_call.id, &effective_call.name);
+                        let tctx = tool_execution_context(
+                            effective_call,
+                            runtime.clone(),
+                            &ctx.delta_tx,
+                            tool_request_config(ctx),
+                            &reply_id,
+                        );
+                        // Same observation boundary as the allow path: a failed
+                        // acknowledgement is a run-level error, never a tool result.
+                        let observed = crate::observation::observe(
+                            ctx,
+                            effective_call,
+                            core.toolkit.call_tool(effective_call, tctx),
+                        )
+                        .await;
+                        match observed {
+                            Ok(rb) => {
+                                let mut result_text = String::new();
+                                for block in &rb.output {
+                                    if let ContentBlock::Text(t) = block {
+                                        result_text.push_str(&t.text);
+                                    }
+                                }
+                                if !result_text.trim().is_empty() {
+                                    emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
+                                }
+                                let was_suspended = rb.is_suspended();
+                                let suspend_reason = rb.suspend_reason().map(str::to_string);
+                                let final_state = rb.final_state();
+                                let metadata = rb.metadata.clone();
+                                let bound = bind_result(effective_call, rb);
+                                let rd = is_return_direct_result(core, &bound);
+                                results.record(bound, rd);
+                                if was_suspended {
+                                    emit_require_external_execution(
+                                        &ctx.delta_tx,
+                                        &reply_id,
+                                        effective_call,
+                                        suspend_reason.as_deref(),
+                                    );
+                                } else {
+                                    emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
+                                }
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
+                                results.record(error_result(effective_call, &err_msg), false);
+                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
+                            }
+                        }
+                    } else {
+                        // User denied the tool call.
+                        let denied_text = &confirm_result.message;
+                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
+                        results.record(denied_result(call, denied_text), false);
+                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+                    }
+                } else {
+                    return Err(Error::Agent(format!(
+                        "permission asking (HITL) is not yet supported; tool '{}' requires user confirmation",
+                        call.name
+                    )));
+                }
+            }
+        }
+    }
+
+    results.finish();
+    Ok(())
 }
 
 /// Produces the termination message when the maximum number of iterations is hit.
@@ -2265,6 +2743,7 @@ mod tests {
 
     use super::*;
     use crate::message::{TextBlock, ToolUseBlock};
+    use crate::middleware::Middleware;
     use crate::model::ChatResponse;
     use crate::permission::PermissionRule;
     use crate::tool::Tool;
@@ -2521,6 +3000,56 @@ mod tests {
         assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
     }
 
+    /// Wiring guard: the observation boundary must be reachable from the *real* build entry.
+    /// Poking `acting_phase` internals would hide a missing builder/context plumbing step.
+    #[tokio::test]
+    async fn tool_execution_records_action_facts_through_the_real_agent_entry() {
+        let storage: Arc<dyn crate::session::AtomicSessionStorage> =
+            Arc::new(crate::session::MemorySessionStorage::new());
+        let log: Arc<dyn crate::session::SessionLog> =
+            Arc::new(crate::session::JournalSessionLog::new(storage, "s1"));
+        let recorder = Arc::new(
+            crate::session::SessionRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
+
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::new(Mutex::new(0))));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(2));
+        input.insert("b".to_string(), serde_json::json!(3));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c-action", "add", input),
+                text_response("5"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-action")
+            .model(model)
+            .toolkit(toolkit)
+            .extension_arc(crate::session::RECORDER_CONTEXT_KEY, Arc::clone(&recorder))
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        let head = log.head().await.unwrap();
+        let types: Vec<String> = log
+            .scan(0, head.seq)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert!(types.contains(&"action/start".to_string()), "{types:?}");
+        assert!(types.contains(&"action/end".to_string()), "{types:?}");
+        // The action id observed at the tool boundary is correlated with the tool call.
+        assert!(!recorder.action_id("c-action").is_empty());
+        recorder.close().await;
+    }
+
     #[tokio::test]
     async fn mixed_return_direct_batch_is_fed_back_to_the_model() {
         // Java: a batch takes effect only when *every* executed tool is returnDirect.
@@ -2639,6 +3168,93 @@ mod tests {
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(reply.text_content(), "hello world");
         assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+    }
+
+    #[tokio::test]
+    async fn call_owns_a_recorder_and_commits_the_turn() {
+        // Java `ReActAgent.acquireCallExecution`: the call itself opens the recorder, so a
+        // bare `ReActAgent::call` journals without any host-side `AgentSession`.
+        let store = Arc::new(crate::session::InMemorySessionLogStore::new());
+        let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
+        let agent = ReActAgent::builder()
+            .name("t-journal")
+            .model(model)
+            .state(
+                AgentState::builder()
+                    .session_id("s-journal")
+                    .user_id("alice")
+                    .build(),
+            )
+            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .build()
+            .unwrap();
+        assert!(agent.session_log_enabled());
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "journaled");
+
+        let ctx = crate::agent::RuntimeContext::new();
+        let key = agent.session_key(&ctx).expect("journal key");
+        let log = store.open(&key, &ctx).await.unwrap();
+        let types: Vec<String> = log
+            .read_after(0, 256)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        for expected in [
+            "run/start",
+            "turn/start",
+            "input/received",
+            "turn/completed",
+            "run/end",
+        ] {
+            assert!(
+                types.iter().any(|t| t == expected),
+                "missing {expected} in {types:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_recorder_is_not_reopened() {
+        // The journal allows one execution writer. When a host (harness `AgentSession`)
+        // already attached a recorder, the call must reuse it — opening a second one would
+        // fail with a lease/duplicate-run error, so success here *is* the assertion.
+        let store = Arc::new(crate::session::InMemorySessionLogStore::new());
+        let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
+        let agent = ReActAgent::builder()
+            .name("t-journal")
+            .model(model)
+            .state(
+                AgentState::builder()
+                    .session_id("s-journal")
+                    .user_id("alice")
+                    .build(),
+            )
+            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .build()
+            .unwrap();
+
+        let ctx = crate::agent::RuntimeContext::new();
+        let key = agent.state_session_key().expect("journal key");
+        let log = store.open(&key, &ctx).await.unwrap();
+        let recorder = Arc::new(
+            SessionRecorder::open(log, Some("turn-host"))
+                .await
+                .unwrap(),
+        );
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
+
+        let reply = agent
+            .call_with_format_and_extensions(vec![Msg::user("hi")], None, extensions)
+            .await
+            .unwrap();
+        assert_eq!(reply.text_content(), "journaled");
+        // The call did not close the host-owned recorder; the host still owns it.
+        recorder.close().await;
     }
 
     #[tokio::test]
@@ -2780,25 +3396,135 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tool_emitted_chunks_reach_the_event_stream() {
-        // The emitter's chunks must surface as ToolResultDataDelta events carrying
-        // the call id, otherwise the emitter is effectively dead wiring.
+    /// A tool that emits one chunk carrying two output blocks and returns a distinct
+    /// value, so progress and the return value can be told apart in the event stream.
+    fn two_block_streamer_toolkit() -> Toolkit {
         let toolkit = Toolkit::new();
         toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
             "streamer",
-            "emits a chunk then returns",
+            "emits a two-block chunk then returns",
             serde_json::json!({"type": "object"}),
             Box::new(move |_args: JsonMap, ctx: ToolExecutionContext| {
                 if let Some(e) = &ctx.emitter {
-                    crate::tool::emit_to(
-                        &Some(Arc::clone(e)),
-                        ToolResultBlock::text("partial progress"),
-                    );
+                    let mut metadata = JsonMap::new();
+                    metadata.insert("step".to_string(), serde_json::json!(1));
+                    let chunk = ToolResultBlock::builder()
+                        .outputs(vec![
+                            ContentBlock::Text(TextBlock::new("step one")),
+                            ContentBlock::Text(TextBlock::new("step two")),
+                        ])
+                        .metadata(metadata)
+                        .build();
+                    crate::tool::emit_to(&Some(Arc::clone(e)), chunk);
                 }
-                Ok(ToolResultBlock::success("final"))
+                Ok(ToolResultBlock::success("final answer"))
             }),
         )));
+        toolkit
+    }
+
+    /// Runs the two-block streamer once and returns the collected event stream.
+    async fn two_block_streamer_events() -> Vec<AgentEvent> {
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("call-stream-1", "streamer", JsonMap::new())
+                    .with_id("reply-1"),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t3-stream")
+            .model(model)
+            .toolkit(two_block_streamer_toolkit())
+            .build()
+            .unwrap();
+        agent
+            .stream_events(
+                vec![Msg::user("go")],
+                StreamOptions::builder().include_acting_chunk(true).build(),
+            )
+            .filter_map(|r| async move { r.ok() })
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn tool_emitted_chunk_produces_one_progress_event_per_block() {
+        // Java `ReActAgent.internalChunkCallback`: every block of the emitted chunk
+        // becomes its own `ToolProgressEvent`, carrying reply id, call id, call name,
+        // the block itself and the chunk metadata.
+        let events = two_block_streamer_events().await;
+        let progress: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| e.event_type() == AgentEventType::ToolProgress)
+            .collect();
+        assert_eq!(
+            progress.len(),
+            2,
+            "two output blocks must become two progress events, got {progress:#?}"
+        );
+
+        for (event, expected_text) in progress.iter().zip(["step one", "step two"]) {
+            let fields = &event.data().fields;
+            assert_eq!(fields.get("reply_id"), Some(&serde_json::json!("reply-1")));
+            assert_eq!(
+                fields.get("tool_call_id"),
+                Some(&serde_json::json!("call-stream-1"))
+            );
+            assert_eq!(fields.get("tool_name"), Some(&serde_json::json!("streamer")));
+            // `content` is the whole block, not just its text (Java `ContentBlock content`).
+            let content = fields.get("content").expect("progress carries its block");
+            assert_eq!(
+                content,
+                &serde_json::json!({"type": "text", "text": expected_text}),
+                "progress block is carried verbatim"
+            );
+            // The chunk metadata travels with each event (Java `withMetadata`).
+            assert_eq!(event.metadata().get("step"), Some(&serde_json::json!(1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_return_value_still_arrives_as_a_result_delta() {
+        // Anti-regression for the progress split: progress must not swallow the tool's
+        // return value, which is the only thing the model ever sees. Java doc:
+        // "emitted chunks do NOT affect what the LLM receives - only the tool method's
+        // return value is sent to the LLM".
+        let events = two_block_streamer_events().await;
+        let deltas: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| e.event_type() == AgentEventType::ToolResultTextDelta)
+            .collect();
+        assert_eq!(deltas.len(), 1, "the return value is emitted exactly once");
+        assert_eq!(
+            deltas[0].data().fields.get("delta"),
+            Some(&serde_json::json!("final answer"))
+        );
+        assert_eq!(
+            deltas[0].data().fields.get("tool_call_id"),
+            Some(&serde_json::json!("call-stream-1"))
+        );
+        // Progress text is display-only and must not leak into the result stream.
+        assert!(
+            !serde_json::to_string(deltas[0])
+                .unwrap()
+                .contains("step one"),
+            "progress text leaked into the tool result delta"
+        );
+        // The old borrowing is gone: no progress-shaped data delta is produced.
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type() != AgentEventType::ToolResultDataDelta),
+            "the progress path must no longer emit ToolResultDataDelta"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_progress_events_are_suppressed_when_acting_chunks_are_filtered() {
+        // `include_acting_chunk` is Java's `isIncludeActingChunk`; progress belongs to the
+        // acting-chunk family, so turning it off suppresses the events entirely.
         let model = Arc::new(MockModel::new(
             "mock",
             vec![
@@ -2807,28 +3533,41 @@ mod tests {
             ],
         ));
         let agent = ReActAgent::builder()
-            .name("t3-stream")
+            .name("t3-stream-off")
             .model(model)
-            .toolkit(toolkit)
+            .toolkit(two_block_streamer_toolkit())
             .build()
             .unwrap();
         let events: Vec<AgentEvent> = agent
             .stream_events(
                 vec![Msg::user("go")],
-                StreamOptions::builder().include_acting_chunk(true).build(),
+                StreamOptions::builder().include_acting_chunk(false).build(),
             )
             .filter_map(|r| async move { r.ok() })
             .collect()
             .await;
-
-        let delta = events
-            .iter()
-            .find(|e| e.event_type() == AgentEventType::ToolResultDataDelta)
-            .expect("emitted chunk surfaced as a ToolResultDataDelta event");
-        assert_eq!(
-            delta.data().fields.get("tool_call_id"),
-            Some(&serde_json::json!("call-stream-1"))
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type() != AgentEventType::ToolProgress),
+            "acting chunks are filtered, so no progress event is published"
         );
+    }
+
+    #[test]
+    fn tool_progress_without_a_delta_channel_is_a_silent_no_op() {
+        // The structured-output retry path has no event channel. The emitter is still
+        // installed (so tools can call `emit` unconditionally) but discards, and the
+        // callback itself is not built at all.
+        let call = ToolUseBlock::new("call-so-1", "generate_response", JsonMap::new());
+        assert!(
+            tool_chunk_callback(&None, &call, "reply-so").is_none(),
+            "no channel means no callback"
+        );
+        let tctx = tool_execution_context(&call, JsonMap::new(), &None, None, "reply-so");
+        let emitter = tctx.emitter.expect("an emitter is always installed");
+        // Must not panic, and must not reach any consumer.
+        crate::tool::emit_to(&Some(emitter), ToolResultBlock::text("ignored progress"));
     }
 
     #[tokio::test]
@@ -2975,6 +3714,247 @@ mod tests {
                 .any(|e| e.event_type() == AgentEventType::RequireExternalExecution),
             "an executed tool must not require external execution; got {events:?}"
         );
+    }
+
+    #[test]
+    fn tool_result_end_state_names_are_distinct_per_state() {
+        // The `TOOL_RESULT_END` `state` field is the only tool-outcome signal most
+        // consumers see. Every state needs its own name: collapsing `Interrupted`
+        // onto `ERROR` makes a user cancellation indistinguishable from a tool
+        // failure in AG-UI / Studio.
+        let cases = [
+            (ToolResultState::Success, "SUCCESS"),
+            (ToolResultState::Error, "ERROR"),
+            (ToolResultState::Denied, "DENIED"),
+            (ToolResultState::Running, "RUNNING"),
+            (ToolResultState::Interrupted, "INTERRUPTED"),
+            (ToolResultState::Suspended, "SUSPENDED"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(
+                tool_result_state_str(state),
+                expected,
+                "wrong wire name for {state:?}"
+            );
+        }
+        assert_ne!(
+            tool_result_state_str(ToolResultState::Interrupted),
+            tool_result_state_str(ToolResultState::Error),
+            "an interruption must not be reported as a tool failure"
+        );
+
+        // And the projection actually applied to the emitted event carries it.
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let tx = Some(tx);
+        emit_tool_result_end(
+            &tx,
+            "c-int",
+            "some_tool",
+            ToolResultState::Interrupted,
+            &JsonMap::new(),
+        );
+        let event = rx.try_next().unwrap().expect("a ToolResultEnd event").unwrap();
+        assert_eq!(event.event_type(), AgentEventType::ToolResultEnd);
+        assert_eq!(
+            event.data().fields.get("state"),
+            Some(&serde_json::json!("INTERRUPTED")),
+            "the emitted event must not downgrade an interrupt to ERROR"
+        );
+    }
+
+    /// A model that fails with a retryable error on its first call, optionally after
+    /// streaming some visible text, and succeeds on the next one. Records how many
+    /// times it was invoked so a test can tell a retry from a suppressed retry.
+    struct FlakyStreamModel {
+        calls: Arc<Mutex<u32>>,
+        partial_text: &'static str,
+    }
+
+    impl FlakyStreamModel {
+        fn new(partial_text: &'static str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(0)),
+                partial_text,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Model for FlakyStreamModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let calls = Arc::clone(&self.calls);
+            let partial = self.partial_text;
+            let mut call_no = calls.lock().unwrap();
+            *call_no += 1;
+            let attempt = *call_no;
+            drop(call_no);
+            Box::pin(futures::stream::iter(if attempt == 1 {
+                let mut chunks: Vec<Result<ChatResponse>> = Vec::new();
+                if !partial.is_empty() {
+                    chunks.push(Ok(text_response(partial)));
+                }
+                chunks.push(Err(Error::http_status(503, "upstream unavailable")));
+                chunks
+            } else {
+                vec![Ok(text_response("second attempt"))]
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "flaky-stream"
+        }
+    }
+
+    /// Fast retry policy so the tests do not wait out the production backoff.
+    fn fast_retry_options(max_attempts: u32) -> GenerateOptions {
+        GenerateOptions::builder()
+            .execution_config(
+                ExecutionConfig::builder()
+                    .max_attempts(max_attempts)
+                    .initial_backoff(std::time::Duration::from_millis(1))
+                    .max_backoff(std::time::Duration::from_millis(1))
+                    .build(),
+            )
+            .build()
+    }
+
+    #[tokio::test]
+    async fn retry_is_suppressed_after_visible_text_was_emitted() {
+        // A retry replays the request from scratch, so retrying after a partial
+        // answer would render that prefix twice. Once a text delta has reached the
+        // consumer, the failure must surface instead of being retried.
+        let model = Arc::new(FlakyStreamModel::new("partial answer"));
+        let calls = Arc::clone(&model.calls);
+        let agent = ReActAgent::builder()
+            .name("t-retry-visible")
+            .model(model)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(3));
+
+        let mut stream = agent.stream_events(
+            vec![Msg::user("hi")],
+            crate::agent::stream_options::StreamOptions::defaults(),
+        );
+
+        // Drain the whole stream: the merge of lifecycle events and forwarded deltas
+        // does not promise an order between the error and the deltas already queued.
+        let items: Vec<Result<AgentEvent>> = stream.collect().await;
+        let deltas: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .filter(|ev| ev.event_type() == AgentEventType::TextBlockDelta)
+            .filter_map(|ev| {
+                ev.data()
+                    .fields
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let error = items.into_iter().find_map(|item| item.err());
+
+        assert_eq!(deltas.join(""), "partial answer", "the prefix reached the consumer once");
+        let error = error.expect("the failure must be surfaced, not retried");
+        assert!(
+            error.to_string().contains("retry suppressed"),
+            "the error must explain why it was not retried; got: {error}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "the model must not be called again after visible output"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_still_happens_when_no_visible_text_was_emitted() {
+        // The guard must stay narrow: a retryable failure that produced no visible
+        // text (here: nothing at all) must still be retried.
+        let model = Arc::new(FlakyStreamModel::new(""));
+        let calls = Arc::clone(&model.calls);
+        let agent = ReActAgent::builder()
+            .name("t-retry-invisible")
+            .model(model)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(3));
+
+        let reply = agent
+            .call(vec![Msg::user("hi")])
+            .await
+            .expect("the second attempt succeeds");
+        assert_eq!(reply.text_content(), "second attempt");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "a retryable failure with no visible output must still be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_output_still_allows_a_retry() {
+        // Thinking deltas are not answer text, so they cannot duplicate anything the
+        // user reads: a failure after them must still be retried.
+        let model = Arc::new(ThinkingThenFailModel::default());
+        let calls = Arc::clone(&model.calls);
+        let agent = ReActAgent::builder()
+            .name("t-retry-thinking")
+            .model(model)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(3));
+
+        let reply = agent
+            .call(vec![Msg::user("hi")])
+            .await
+            .expect("the second attempt succeeds");
+        assert_eq!(reply.text_content(), "second attempt");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "thinking output alone must not suppress a retry"
+        );
+    }
+
+    /// Streams a thinking chunk, then fails retryably; succeeds on the second call.
+    #[derive(Default)]
+    struct ThinkingThenFailModel {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for ThinkingThenFailModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let mut call_no = self.calls.lock().unwrap();
+            *call_no += 1;
+            let attempt = *call_no;
+            drop(call_no);
+            Box::pin(futures::stream::iter(if attempt == 1 {
+                vec![
+                    Ok(ChatResponse::builder()
+                        .content(vec![ContentBlock::Thinking(ThinkingBlock::new("hmm"))])
+                        .build()),
+                    Err(Error::http_status(503, "upstream unavailable")),
+                ]
+            } else {
+                vec![Ok(text_response("second attempt"))]
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "thinking-then-fail"
+        }
     }
 
     #[tokio::test]
@@ -3244,6 +4224,115 @@ mod tests {
         // The tool must never have been invoked.
         assert_eq!(*counter.lock().unwrap(), 0);
         assert_eq!(reply.text_content(), "done");
+    }
+
+    /// Counts `on_acting` invocations and records the tool-call ids it was handed.
+    struct ActingProbeMiddleware {
+        calls: Arc<Mutex<usize>>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Middleware for ActingProbeMiddleware {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnActing]
+        }
+
+        fn on_acting(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            input: ActingInput,
+            next: Next<ActingInput>,
+        ) -> EventStream {
+            *self.calls.lock().unwrap() += 1;
+            self.seen
+                .lock()
+                .unwrap()
+                .extend(input.tool_calls.iter().map(|c| c.id.clone()));
+            next(input)
+        }
+    }
+
+    #[tokio::test]
+    async fn acting_middleware_is_invoked_and_the_tool_still_runs_once() {
+        // GAP-16: `wrap_acting` used to be dead code — `on_acting` existed but no code
+        // path ever called it. This test drives the real entry point.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c-acting", "add", input),
+                text_response("done"),
+            ],
+        ));
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ActingProbeMiddleware {
+            calls: Arc::clone(&calls),
+            seen: Arc::clone(&seen),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-acting")
+            .model(model)
+            .toolkit(toolkit)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(*calls.lock().unwrap(), 1, "on_acting must be invoked once per acting phase");
+        assert_eq!(*seen.lock().unwrap(), vec!["c-acting".to_string()]);
+        assert_eq!(*counter.lock().unwrap(), 1, "the wrapped core must execute the tool exactly once");
+    }
+
+    #[tokio::test]
+    async fn acting_middleware_that_completes_without_results_is_a_diagnosable_error() {
+        // A middleware that swallows the acting phase must not look like a completed
+        // turn: the agent has pending calls but no results to feed back.
+        struct ShortCircuit;
+        impl Middleware for ShortCircuit {
+            fn active_points(&self) -> Vec<ExtensionPoint> {
+                vec![ExtensionPoint::OnActing]
+            }
+            fn on_acting(
+                &self,
+                _ctx: &crate::agent::RuntimeContext,
+                _input: ActingInput,
+                _next: Next<ActingInput>,
+            ) -> EventStream {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c-swallowed", "add", JsonMap::new())],
+        ));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ShortCircuit));
+        let agent = ReActAgent::builder()
+            .name("t-acting-short")
+            .model(model)
+            .toolkit(toolkit)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let err = agent.call(vec![Msg::user("compute")]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("produced no result"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

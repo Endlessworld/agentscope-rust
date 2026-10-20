@@ -93,6 +93,32 @@ fn event_type_wire_names() {
 }
 
 #[test]
+fn tool_progress_wire_name_round_trips() {
+    // Mirror of Java `AgentEventType.TOOL_PROGRESS`: a distinct type now that progress
+    // no longer borrows `TOOL_RESULT_DATA_DELTA`.
+    assert_eq!(AgentEventType::ToolProgress.wire_name(), "TOOL_PROGRESS");
+    assert_eq!(
+        AgentEventType::from_wire_name("TOOL_PROGRESS"),
+        Some(AgentEventType::ToolProgress)
+    );
+    // The legacy alias still resolves to the data delta, i.e. the two are distinct.
+    assert_eq!(
+        AgentEventType::from_wire_name("TOOL_RESULT_DATA_DELTA"),
+        Some(AgentEventType::ToolResultDataDelta)
+    );
+
+    let ev = AgentEvent::with_fields(AgentEventType::ToolProgress, JsonMap::new());
+    let json = serde_json::to_string(&ev).unwrap();
+    assert!(
+        json.contains("\"type\":\"TOOL_PROGRESS\""),
+        "unexpected serialization: {json}"
+    );
+    let back: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.event_type(), AgentEventType::ToolProgress);
+    assert!(matches!(back, AgentEvent::ToolProgress(_)));
+}
+
+#[test]
 fn agent_event_creation_and_metadata() {
     let ev = AgentEvent::with_fields(AgentEventType::TextBlockDelta, parse_args(r#"{"text": "hi"}"#))
         .with_source("main/researcher")

@@ -43,6 +43,7 @@ impl EventCategory {
             | AgentEventType::ToolCallDelta
             | AgentEventType::ToolCallEnd => EventCategory::ToolCall,
             AgentEventType::ToolResultStart
+            | AgentEventType::ToolProgress
             | AgentEventType::ToolResultTextDelta
             | AgentEventType::ToolResultDataDelta
             | AgentEventType::ToolResultEnd => EventCategory::ToolResult,
@@ -122,6 +123,7 @@ impl StreamOptions {
             | AgentEventType::ThinkingBlockDelta => self.include_reasoning_chunk,
             AgentEventType::ThinkingBlockEnd => self.include_reasoning_result,
             AgentEventType::ToolResultStart
+            | AgentEventType::ToolProgress
             | AgentEventType::ToolResultTextDelta
             | AgentEventType::ToolResultDataDelta => self.include_acting_chunk,
             AgentEventType::ExceedMaxIters => self.include_summary_result,
