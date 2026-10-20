@@ -125,6 +125,10 @@ impl Middleware for AsyncToolMiddleware {
         let user_id = ctx.user_id().map(str::to_string).unwrap_or_default();
         let agent_id = ctx.agent_id().map(str::to_string).unwrap_or_default();
         let tool_calls: Vec<ToolUseBlock> = input.tool_calls.clone();
+        // Where the placeholder results go: `on_acting` only gets `&RuntimeContext`, so
+        // the equivalent of Java's direct `state.contextMutable().add(...)` write in
+        // `emitPlaceholderAndComplete` is a write to the acting results handle.
+        let results_handle = input.results.clone();
 
         // Shared state between the background task and the outer stream.
         let buffer = Arc::new(std::sync::Mutex::new(Vec::<Result<AgentEvent>>::new()));
@@ -229,6 +233,9 @@ impl Middleware for AsyncToolMiddleware {
                     let mut events: Vec<agentscope_core::error::Result<AgentEvent>> = Vec::new();
                     for tc in &tool_calls {
                         let text = placeholder_text(&tc.name, &tc.id, offload_timeout.as_secs());
+                        // Persist the placeholder so the next reasoning step sees a tool
+                        // result for this call instead of an unanswered tool_use.
+                        results_handle.record_placeholder(tc, &text);
                         events.push(Ok(AgentEvent::with_fields(
                             AgentEventType::ToolResultStart,
                             ev_fields(json!({
