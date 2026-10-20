@@ -19,6 +19,7 @@ fn tool_ctx() -> ToolExecutionContext {
         tool_call: None,
         runtime: serde_json::Map::new(),
         emitter: None,
+        tool_request_config: None,
     }
 }
 
@@ -475,4 +476,54 @@ async fn generated_dir_names_do_not_prune_regular_files() {
         "only the plain file should match: {matches:?}"
     );
     assert_eq!(matches[0].path, "/build");
+}
+
+/// GAP-12: `read` must sniff only the first 8 KiB for NUL, so a large text file
+/// that happens to contain a NUL byte past that point is still returned as text.
+#[tokio::test]
+async fn read_treats_nul_after_sniff_window_as_text() {
+    let dir = temp_dir("read_nul_late").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    let mut bytes = b"first line\n".repeat(1000); // 11 000 bytes: past the 8 KiB window
+    bytes.push(0);
+    bytes.extend_from_slice(b"\ntail line\n");
+    tokio::fs::write(dir.join("late_nul.txt"), &bytes).await.unwrap();
+
+    let data = fs.read(&ctx(), "/late_nul.txt", 0, 0).await.unwrap();
+    assert_eq!(
+        data.encoding, "utf-8",
+        "a NUL after the 8 KiB sniff window must not mark the file binary"
+    );
+    assert!(
+        data.content.starts_with("first line\n"),
+        "content should be raw text, not base64"
+    );
+}
+
+/// GAP-12: a NUL inside the first 8 KiB still means binary (base64 result).
+#[tokio::test]
+async fn read_treats_nul_within_sniff_window_as_binary() {
+    let dir = temp_dir("read_nul_early").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    tokio::fs::write(dir.join("blob.dat"), [b'a', b'b', 0u8, b'c', b'd'])
+        .await
+        .unwrap();
+
+    let data = fs.read(&ctx(), "/blob.dat", 0, 0).await.unwrap();
+    assert_eq!(data.encoding, "base64");
+    assert_eq!(data.content, "YWIAY2Q="); // base64("ab\0cd")
+}
+
+/// GAP-12: a large pure-text file stays text.
+#[tokio::test]
+async fn read_large_text_file_is_text() {
+    let dir = temp_dir("read_large_text").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    let body = "x".repeat(600) + "\n";
+    let content = body.repeat(60); // ~36 KiB, well beyond the sniff window
+    fs.write(&ctx(), "/big.txt", &content).await.unwrap();
+
+    let data = fs.read(&ctx(), "/big.txt", 0, 0).await.unwrap();
+    assert_eq!(data.encoding, "utf-8");
+    assert_eq!(data.content, content);
 }

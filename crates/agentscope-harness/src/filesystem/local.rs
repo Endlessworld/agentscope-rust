@@ -10,6 +10,21 @@ use regex::{Regex, RegexBuilder};
 
 use super::{validate_path, FileData, FileInfo, Filesystem, GrepMatch};
 
+/// Number of leading bytes inspected when deciding whether a file is binary.
+///
+/// Only the head is checked so a large text file that happens to contain a NUL
+/// byte far into its content is still treated as text.
+const BINARY_SNIFF_LEN: usize = 8 * 1024;
+
+/// Returns true when `bytes` look binary, i.e. a NUL byte occurs in the first
+/// [`BINARY_SNIFF_LEN`] bytes.
+///
+/// Single source of truth for the binary heuristic: [`LocalFilesystem::read`]
+/// (base64 result) and [`read_text`] (grep skip) must not drift apart.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SNIFF_LEN).any(|b| *b == 0)
+}
+
 /// Generated/build directories skipped during recursive grep/glob walks.
 /// The search base itself is always walked even if its name matches.
 const GENERATED_DIRS: &[&str] = &[
@@ -337,7 +352,7 @@ impl Filesystem for LocalFilesystem {
             return Err(Error::Tool(format!("File '{path}' not found")));
         }
         let bytes = tokio::fs::read(&resolved).await.map_err(Error::Io)?;
-        if bytes.contains(&0) {
+        if looks_binary(&bytes) {
             use base64::Engine as _;
             let encoded =
                 base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -592,11 +607,11 @@ impl LocalFilesystem {
     }
 }
 
-/// Reads a text file for grep: binary files (NUL byte in the first 8 KiB) are
-/// skipped, non-UTF-8 content is decoded lossily instead of being dropped.
+/// Reads a text file for grep: binary files (see [`looks_binary`]) are skipped,
+/// non-UTF-8 content is decoded lossily instead of being dropped.
 async fn read_text(path: &Path) -> Option<String> {
     let bytes = tokio::fs::read(path).await.ok()?;
-    if bytes.iter().take(8192).any(|b| *b == 0) {
+    if looks_binary(&bytes) {
         return None;
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())

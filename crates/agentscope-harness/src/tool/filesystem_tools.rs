@@ -411,10 +411,10 @@ impl Tool for FilesystemTool {
                         .map(|d| d.content);
                     match self.fs.write(&rt, &op.path, &op.content).await {
                         Ok(()) => {
-                            outputs.push(format!("### {}\nWritten", op.path));
+                            outputs.push(format!(" {} Written", op.path));
                             diffs.push(diff_entry(&op.path, before, op.content.clone()));
                         }
-                        Err(e) => outputs.push(format!("### {}\nERROR: {e}", op.path)),
+                        Err(e) => outputs.push(format!(" {}\nERROR: {e}", op.path)),
                     }
                 }
                 let text = if outputs.is_empty() {
@@ -455,7 +455,7 @@ impl Tool for FilesystemTool {
                     {
                         Ok(n) => {
                             applied += 1;
-                            outputs.push(format!("### {}\n{n} replacement(s)", op.path));
+                            outputs.push(format!("{} {n} replacement(s)", op.path));
                             if let Some(old) = before {
                                 let new = self
                                     .fs
@@ -468,7 +468,7 @@ impl Tool for FilesystemTool {
                             }
                         }
                         Err(e) => outputs
-                            .push(format!("### {}\nERROR (operation #{}): {e}", op.path, i + 1)),
+                            .push(format!("{}\nERROR (operation #{}): {e}", op.path, i + 1)),
                     }
                 }
                 let text = format!(
