@@ -28,8 +28,11 @@ impl ToolExecutor {
         ctx: ToolExecutionContext,
         config: Option<&ExecutionConfig>,
     ) -> Result<ToolResultBlock> {
-        // 1. Lookup.
-        let tool = toolkit.get_tool(&call.name).ok_or_else(|| {
+        // 1. Lookup (composed with the per-call request config: external tools take
+        //    priority; EXTERNAL_ONLY hides the backend).
+        let request_config = ctx.tool_request_config.clone();
+        let view = request_config.as_deref();
+        let tool = toolkit.get_tool_with(&call.name, view).ok_or_else(|| {
             Error::Tool(format!("Tool not found: {}", call.name))
         })?;
         // 2. External short-circuit (suspended semantics).
@@ -39,8 +42,11 @@ impl ToolExecutor {
                 call.name
             )));
         }
-        // 3. Group activation check.
-        if !toolkit.is_tool_active(&call.name) {
+        // 3. Group activation check. Only backend tools are gated: a tool injected through
+        //    the request config is ungrouped and always callable, so a same-named but
+        //    inactive backend tool must not reject the call the model was shown.
+        let from_request_config = view.map(|c| c.overrides(&call.name)).unwrap_or(false);
+        if !from_request_config && !toolkit.is_tool_active(&call.name) {
             return Err(Error::Tool(format!(
                 "Unauthorized tool call: {} is not available",
                 call.name

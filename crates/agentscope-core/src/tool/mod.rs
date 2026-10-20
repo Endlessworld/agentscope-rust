@@ -18,6 +18,7 @@ pub mod suspend;
 pub mod todo;
 pub mod tool;
 pub mod toolkit;
+pub mod tool_request_config;
 pub mod validator;
 
 pub use coding::{validate_command, CommandCheck};
@@ -38,5 +39,8 @@ pub use schema_only_tool::SchemaOnlyTool;
 pub use suspend::ToolSuspendException;
 pub use todo::TodoWriteTool;
 pub use tool::{FunctionTool, Tool, ToolExecutionContext};
+pub use tool_request_config::{
+    ToolMergeMode, ToolRequestConfig, TOOL_REQUEST_CONFIG_CONTEXT_KEY,
+};
 pub use toolkit::Toolkit;
 pub use validator::ToolValidator;

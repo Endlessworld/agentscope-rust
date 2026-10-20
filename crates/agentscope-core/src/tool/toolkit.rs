@@ -139,6 +139,21 @@ impl Toolkit {
         self.tools.lock().unwrap().get(name).cloned()
     }
 
+    /// Resolves a tool by name under a per-call [`ToolRequestConfig`], composing it with
+    /// this shared registry. External tools from the config take priority; in
+    /// [`ToolMergeMode::ExternalOnly`] the backend is hidden entirely. Neither the
+    /// registry nor the config is mutated.
+    pub fn get_tool_with(
+        &self,
+        name: &str,
+        config: Option<&super::tool_request_config::ToolRequestConfig>,
+    ) -> Option<Arc<dyn Tool>> {
+        match config {
+            Some(config) => config.resolve_tool(name, self),
+            None => self.get_tool(name),
+        }
+    }
+
     /// Returns the schemas of all currently active tools.
     pub fn tool_schemas(&self) -> Vec<ToolSchema> {
         self.tool_schemas_for(&self.groups.get_active_groups())
@@ -159,6 +174,50 @@ impl Toolkit {
     /// Whether a tool is registered as external.
     pub fn is_external_tool(&self, name: &str) -> bool {
         self.tools.lock().unwrap().get(name).map(|t| t.is_external()).unwrap_or(false)
+    }
+
+    /// Whether `name` resolves to an external tool under a per-call
+    /// [`ToolRequestConfig`]. Externally injected (schema-only) tools are recognised here in
+    /// addition to backend-registered external tools.
+    pub fn is_external_tool_with(
+        &self,
+        name: &str,
+        config: Option<&super::tool_request_config::ToolRequestConfig>,
+    ) -> bool {
+        self.get_tool_with(name, config)
+            .map(|t| t.is_external())
+            .unwrap_or(false)
+    }
+
+    /// Returns the schemas visible for the active groups under a per-call config.
+    ///
+    /// Backend schemas shadowed by an external tool are dropped, and
+    /// [`ToolMergeMode::ExternalOnly`](super::tool_request_config::ToolMergeMode::ExternalOnly)
+    /// skips the backend entirely — both without unregistering anything.
+    pub fn tool_schemas_with(
+        &self,
+        config: Option<&super::tool_request_config::ToolRequestConfig>,
+    ) -> Vec<ToolSchema> {
+        let Some(config) = config else {
+            return self.tool_schemas();
+        };
+        let active_groups = self.groups.get_active_groups();
+        let mut out = Vec::new();
+        if !config.hides_backend() {
+            let tools = self.tools.lock().unwrap();
+            for (name, tool) in tools.iter() {
+                if config.overrides(name) {
+                    continue;
+                }
+                if self.groups.is_active_tool_for(name, &active_groups) {
+                    out.push(tool.schema());
+                }
+            }
+        }
+        for tool in config.external_tools().values() {
+            out.push(tool.schema());
+        }
+        out
     }
 
     /// Whether a tool may run in parallel with itself. Unknown tools default to

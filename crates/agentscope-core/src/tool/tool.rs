@@ -18,6 +18,23 @@ pub struct ToolExecutionContext {
     /// Optional streaming emitter for intermediate progress chunks. When
     /// absent, [`emit_to`](super::emitter::emit_to) falls back to a no-op.
     pub emitter: Option<std::sync::Arc<dyn ToolEmitter>>,
+    /// Per-call tool view (external tools + merge mode). Read from the call's
+    /// [`RuntimeContext`], never mutating the shared [`Toolkit`].
+    ///
+    /// [`RuntimeContext`]: crate::agent::RuntimeContext
+    /// [`Toolkit`]: super::toolkit::Toolkit
+    pub tool_request_config: Option<Arc<super::tool_request_config::ToolRequestConfig>>,
+}
+
+impl ToolExecutionContext {
+    /// Attaches a per-call tool view.
+    pub fn with_tool_request_config(
+        mut self,
+        config: Arc<super::tool_request_config::ToolRequestConfig>,
+    ) -> Self {
+        self.tool_request_config = Some(config);
+        self
+    }
 }
 
 impl std::fmt::Debug for ToolExecutionContext {
@@ -26,6 +43,7 @@ impl std::fmt::Debug for ToolExecutionContext {
             .field("tool_call", &self.tool_call)
             .field("runtime", &self.runtime)
             .field("has_emitter", &self.emitter.is_some())
+            .field("has_tool_request_config", &self.tool_request_config.is_some())
             .finish()
     }
 }
