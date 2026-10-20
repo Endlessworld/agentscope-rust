@@ -53,6 +53,19 @@ fn build_main(dir: &std::path::Path) -> HarnessAgent {
         .build()
 }
 
+/// Same as [`build_main`], but with the static `SubagentsMiddleware`.
+fn build_main_static(dir: &std::path::Path) -> HarnessAgent {
+    HarnessAgent::builder()
+        .name("main")
+        .model(Arc::new(ScriptedModel("child reply")))
+        .cwd(dir.to_path_buf())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .subagent(SubagentDeclaration::new("worker", "does work", "You work."))
+        .disable_dynamic_subagents()
+        .build()
+}
+
 /// Same as [`build_main`], plus a resolver mapping `fast` to a distinct child model.
 fn build_main_with_resolver(dir: &std::path::Path) -> HarnessAgent {
     let mut decl = SubagentDeclaration::new("fast", "uses a faster model", "Be fast.");
@@ -107,6 +120,84 @@ async fn build_registers_agent_and_task_tools() {
             "missing {expected} in {names:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn static_middleware_also_registers_agent_and_task_tools() {
+    // The static branch must ship the same task tools as the dynamic one: without
+    // `task_output` a background spawn would be uncollectable.
+    let dir = temp_dir("static-tools");
+    let agent = build_main_static(&dir);
+    let names = agent.toolkit().tool_names();
+    for expected in [
+        "agent_spawn",
+        "agent_send",
+        "agent_list",
+        "task_output",
+        "task_cancel",
+        "task_list",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing {expected} in {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn background_spawn_output_is_collectable_via_task_output() {
+    // End-to-end pull path: `agent_spawn(background=true)` must land in the session the
+    // `task_output` tool resolves from `RuntimeContext.session_id`.
+    let dir = temp_dir("bg-collect");
+    let agent = build_main(&dir);
+    let spawn = agent
+        .toolkit()
+        .get_tool("agent_spawn")
+        .expect("agent_spawn registered");
+    let ctx = ToolExecutionContext {
+        runtime: serde_json::Map::from_iter([(
+            "sessionId".to_string(),
+            serde_json::Value::String("sess-1".to_string()),
+        )]),
+        ..Default::default()
+    };
+
+    let started = spawn
+        .call(
+            args(&[
+                ("agent", serde_json::json!("worker")),
+                ("prompt", serde_json::json!("do it")),
+                ("background", serde_json::json!(true)),
+            ]),
+            ctx.clone(),
+        )
+        .await
+        .expect("spawn ok")
+        .text_content();
+    assert!(started.contains("started in background as task"), "out: {started}");
+    let task_id = started
+        .split("as task '")
+        .nth(1)
+        .and_then(|s| s.split('\'').next())
+        .expect("task id in spawn output");
+
+    let out = agent
+        .toolkit()
+        .get_tool("task_output")
+        .expect("task_output registered")
+        .call(
+            args(&[
+                ("task_id", serde_json::json!(task_id)),
+                ("block", serde_json::json!(true)),
+                ("timeout", serde_json::json!(5000)),
+            ]),
+            ctx,
+        )
+        .await
+        .expect("task_output ok")
+        .text_content();
+    assert!(out.contains("status: Completed"), "out: {out}");
+    assert!(out.contains("child reply"), "out: {out}");
 }
 
 #[tokio::test]

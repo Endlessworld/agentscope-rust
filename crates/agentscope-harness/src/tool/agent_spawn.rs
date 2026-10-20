@@ -327,7 +327,7 @@ impl Tool for AgentSpawnTool {
 
         Ok(ToolResultBlock::text(format!(
             "{header}Subagent '{agent_id}' started in background as task '{task_id}'. Use \
-             task_output('{task_id}') / wait_async_results to collect the result."
+             task_output('{task_id}') to collect the result."
         )))
     }
 }

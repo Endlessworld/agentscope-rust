@@ -89,9 +89,12 @@ impl Tool for WaitAsyncResultsTool {
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_MS);
+        // `sessionId` is the key `tool_runtime` injects; `session_id` is accepted as a
+        // fallback for callers that put it in metadata directly.
         let session_id = ctx
             .runtime
-            .get("session_id")
+            .get("sessionId")
+            .or_else(|| ctx.runtime.get("session_id"))
             .and_then(|v| v.as_str())
             .unwrap_or("default")
             .to_string();

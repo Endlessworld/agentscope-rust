@@ -151,7 +151,12 @@ impl Tool for TaskOutputTool {
         if should_block && !bg.is_completed() {
             let st = bg.get_task_status();
             if st == TaskStatus::Pending || st == TaskStatus::Running {
-                bg.wait_for_completion(timeout);
+                // `wait_for_completion` parks the calling thread on a condvar; run it on the
+                // blocking pool so this async tool does not starve a runtime worker (and, on a
+                // current-thread runtime, does not deadlock against the task it is waiting for).
+                let waiter = Arc::clone(&bg);
+                let _ = tokio::task::spawn_blocking(move || waiter.wait_for_completion(timeout))
+                    .await;
             }
         }
         if bg.is_completed() && bg.get_task_status().is_terminal() {

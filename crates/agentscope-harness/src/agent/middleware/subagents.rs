@@ -15,6 +15,7 @@ use futures::StreamExt;
 
 use crate::agent::subagent::task::{TaskDelivery, TaskRepository, TaskStatus};
 use crate::agent::subagent::SubagentEntry;
+use crate::tool::TaskTool;
 
 /// Cap on individual task results aggregated into one delivery message.
 const MAX_DELIVERIES_PER_REMINDER: usize = 10;
@@ -30,10 +31,10 @@ Subagents are ephemeral — they live only for the duration of the task and retu
 ### Agent Tools
 
 **`%s`** — Spawn an isolated subagent
-- `agent_id` (required): which subagent to instantiate
-- `task` (optional): initial prompt; omit to create a persistent session
+- `agent` (required): which subagent to instantiate
+- `prompt` (required): the task prompt for the subagent
 - `label` (optional): human-readable name for referencing via send
-- `timeout_seconds`: wait time; 0=fire-and-forget (returns task_id), default=30, max=600
+- `background` (optional): run in the background and return a task_id instead of waiting
 - Response always includes `agent_key:` (opaque handle) — save it for follow-up sends
 
 **`%s`** — Send a follow-up message to an existing subagent
@@ -46,20 +47,17 @@ Subagents are ephemeral — they live only for the duration of the task and retu
 ### Task Tools (for async/background operations)
 
 **`task_output`** — Retrieve the result of a background task by task_id.
-- **You rarely need this.** Completed tasks are pushed back to you automatically as a `<system-reminder>` block before your next reasoning step.
-- Use `task_output(block=false)` only when you need the full result or to inspect a specific task on demand.
+- Completed tasks may also arrive as a `<system-reminder>` block before your next reasoning step.
+- Use `task_output(block=false)` when you need the full result or to inspect a specific task on demand; omit `block` (default true) to wait for completion.
 
 **`task_cancel`** — Cancel a running background task by task_id. No effect on already-completed tasks.
 
 **`task_list`** — List all in-flight background tasks.
 
 ### Background task flow
-1. Spawn with `timeout_seconds=0` to fire-and-forget; the response gives you a task_id.
+1. Spawn with `background=true` to fire-and-forget; the response gives you a task_id.
 2. **Do not poll.** Continue with other work; when the task finishes you'll see a `<system-reminder>` containing its result.
 3. If the agent has nothing useful to do, hand control back to the user — the next reasoning round will surface any completions.
-
-### Timeout promotion
-When a sync spawn/send exceeds its timeout, the task is **not lost** — it is automatically promoted to a background task. You receive `status: timeout_promoted` with a `task_id`. Do NOT retry the same task.
 
 ### Available agent ids
 %s
@@ -77,9 +75,9 @@ When a sync spawn/send exceeds its timeout, the task is **not lost** — it is a
 4. **Reconcile** → Incorporate or synthesize the result into the main thread
 
 ### Usage patterns
-- **Parallel execution**: Launch multiple subagents concurrently with timeout_seconds=0, then collect results with task_output(block=false) after a delay
-- **Sync delegation**: Use default timeout for simple one-shot delegation
-- **Persistent session**: Spawn without a task, then use send for multi-turn interaction
+- **Parallel execution**: Launch multiple subagents concurrently with background=true, then collect results with task_output(block=false) after a delay
+- **Sync delegation**: Omit background for simple one-shot delegation
+- **Persistent session**: Reuse the `agent_key` from spawn with send for multi-turn interaction
 - **Cancel stale work**: Use task_cancel to stop background tasks that are no longer needed
 - Subagent results are NOT visible to the user — always summarize them in your response
 "#;
@@ -88,6 +86,8 @@ When a sync spawn/send exceeds its timeout, the task is **not lost** — it is a
 /// and task-delivery push to the reasoning loop.
 pub struct SubagentsMiddleware {
     entries: Mutex<Vec<SubagentEntry>>,
+    /// Task lifecycle tools (`task_output` / `task_cancel` / `task_list`).
+    task_tool: Arc<TaskTool>,
     task_repository: Arc<dyn TaskRepository>,
     /// Additional agent tools (e.g. `agent_spawn`/`agent_send`/`agent_list`) to register.
     extra_tools: Vec<Arc<dyn Tool>>,
@@ -100,6 +100,7 @@ impl SubagentsMiddleware {
     ) -> Self {
         Self {
             entries: Mutex::new(entries),
+            task_tool: TaskTool::new(Arc::clone(&task_repository)),
             task_repository,
             extra_tools: Vec::new(),
         }
@@ -118,7 +119,12 @@ impl SubagentsMiddleware {
 
     /// Returns the tools this middleware contributes to the agent toolkit.
     pub fn get_tools(&self) -> Vec<Arc<dyn Tool>> {
-        let mut out = Vec::new();
+        let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+        // Mirrors Java `SubagentsMiddleware.getTools()`: the task tools ship with the
+        // middleware, so the static branch keeps pull access to background results.
+        out.push(self.task_tool.output_tool());
+        out.push(self.task_tool.cancel_tool());
+        out.push(self.task_tool.list_tool());
         out.extend(self.extra_tools.iter().cloned());
         out
     }

@@ -336,16 +336,7 @@ impl AgentProtocolTaskClient {
         task_id: &str,
         decisions: &[RemoteConfirmDecision],
     ) -> Result<()> {
-        let decisions: Vec<serde_json::Value> = decisions
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "toolCallId": d.tool_call_id,
-                    "approved": d.approved,
-                })
-            })
-            .collect();
-        let body = serde_json::json!({ "decisions": decisions });
+        let body = resume_body(decisions);
         let req = apply_headers(
             self.http
                 .post(join(base_url, &format!("/tasks/{}/resume", encode(task_id))))
@@ -546,6 +537,29 @@ impl RemoteSubagentTransport for AgentProtocolTransport {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// Builds the `{decisions: [...]}` body for `POST /tasks/{taskId}/resume`.
+///
+/// The optional `reason` is forwarded verbatim and omitted when absent, so a peer
+/// that does not know the field sees exactly the payload it always did.
+fn resume_body(decisions: &[RemoteConfirmDecision]) -> serde_json::Value {
+    let decisions: Vec<serde_json::Value> = decisions
+        .iter()
+        .map(|d| {
+            let mut value = serde_json::json!({
+                "toolCallId": d.tool_call_id,
+                "approved": d.approved,
+            });
+            if let Some(reason) = &d.reason {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("reason".to_string(), serde_json::Value::String(reason.clone()));
+                }
+            }
+            value
+        })
+        .collect();
+    serde_json::json!({ "decisions": decisions })
+}
+
 fn http_err(e: reqwest::Error) -> Error {
     if e.is_timeout() {
         Error::Other(format!("Agent Protocol request timed out: {e}"))
@@ -690,6 +704,23 @@ mod tests {
         assert_eq!(parsed[0].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(parsed[1].tool_name.as_deref(), Some("read"));
         assert!(parse_pending_confirms(None).is_empty());
+    }
+
+    #[test]
+    fn resume_body_forwards_reason_and_omits_it_when_absent() {
+        let body = resume_body(&[
+            RemoteConfirmDecision::new("c1", false).with_reason("user denied"),
+            RemoteConfirmDecision::new("c2", true),
+        ]);
+        let decisions = body["decisions"].as_array().unwrap();
+        assert_eq!(decisions[0]["toolCallId"], "c1");
+        assert_eq!(decisions[0]["approved"], false);
+        assert_eq!(decisions[0]["reason"], "user denied");
+        assert_eq!(decisions[1]["approved"], true);
+        assert!(
+            decisions[1].get("reason").is_none(),
+            "absent reason must not reach the wire: {decisions:?}"
+        );
     }
 
     #[test]

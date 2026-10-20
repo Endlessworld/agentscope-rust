@@ -52,11 +52,22 @@ impl RemotePendingConfirm {
 pub struct RemoteConfirmDecision {
     pub tool_call_id: Option<String>,
     pub approved: bool,
+    /// Optional human-readable reason (notably for a denial). Omitted from the
+    /// wire when `None`; older peers that do not send the key still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl RemoteConfirmDecision {
     pub fn new(tool_call_id: impl Into<String>, approved: bool) -> Self {
-        Self { tool_call_id: Some(tool_call_id.into()), approved }
+        Self { tool_call_id: Some(tool_call_id.into()), approved, reason: None }
+    }
+
+    /// Attaches a reason for the decision (e.g. why the user denied the call).
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
 }
 
@@ -228,5 +239,43 @@ mod tests {
         assert_eq!(p.tool_call_id.as_deref(), Some("c1"));
         let d = RemoteConfirmDecision::new("c1", true);
         assert!(d.approved);
+        assert!(d.reason.is_none(), "`new` must not invent a reason");
+    }
+
+    /// GAP-13 (a): a decision carrying a reason serializes it under `reason`.
+    #[test]
+    fn confirm_decision_serializes_reason_when_present() {
+        let d = RemoteConfirmDecision::new("c1", false).with_reason("user denied rm -rf");
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["toolCallId"], "c1");
+        assert_eq!(json["approved"], false);
+        assert_eq!(json["reason"], "user denied rm -rf");
+    }
+
+    /// GAP-13 (b): a decision without a reason omits the key entirely.
+    #[test]
+    fn confirm_decision_omits_reason_when_none() {
+        let d = RemoteConfirmDecision::new("c1", true);
+        let json = serde_json::to_value(&d).unwrap();
+        assert!(
+            json.get("reason").is_none(),
+            "absent reason must not be serialized: {json}"
+        );
+    }
+
+    /// GAP-13 (c): JSON from an older peer (no `reason` key) still deserializes.
+    #[test]
+    fn confirm_decision_deserializes_legacy_json() {
+        let d: RemoteConfirmDecision =
+            serde_json::from_str(r#"{"toolCallId":"c1","approved":false}"#).unwrap();
+        assert_eq!(d.tool_call_id.as_deref(), Some("c1"));
+        assert!(!d.approved);
+        assert!(d.reason.is_none());
+
+        // And a payload that does carry the reason round-trips it.
+        let with_reason: RemoteConfirmDecision =
+            serde_json::from_str(r#"{"toolCallId":"c2","approved":false,"reason":"no"}"#)
+                .unwrap();
+        assert_eq!(with_reason.reason.as_deref(), Some("no"));
     }
 }
