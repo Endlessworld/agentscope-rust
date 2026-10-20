@@ -4,6 +4,10 @@
 //!
 //! * platform lifecycle (`POST /sandboxes`, `POST /sandboxes/{id}/connect`,
 //!   `DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/snapshots`),
+//! * snapshot maintenance (`DELETE /templates/{snapshotId}`) plus the opt-in
+//!   [`E2bSandboxClientOptions::snapshot_retention`] window described on
+//!   [`E2bBackend::prune_known_snapshots`] — note that E2B has **no snapshot listing endpoint**,
+//!   so retention only ever sees the ids this process recorded,
 //! * command execution through envd (`process.Process/Start` over Connect, JSON codec),
 //!   including the 5-byte Connect frame envelope and base64 `stdout`/`stderr` events, and
 //! * envd file transfer through the Filesystem REST API (`POST`/`GET /files`) — the prerequisite
@@ -15,7 +19,7 @@
 //! module tracker for this recorded gap.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -125,6 +129,14 @@ pub struct E2bSandboxClientOptions {
     pub run_user: String,
     /// Persistence mode.
     pub persistence_mode: E2bPersistenceMode,
+    /// How many NATIVE_SNAPSHOT snapshots to keep per sandbox, pruning the oldest ones.
+    ///
+    /// `None` (the default) and `Some(0)` both disable pruning, matching the Java
+    /// `snapshotRetention` default of `0` (`<= 0` disables). The window is applied to the ids this
+    /// process created — E2B exposes create/delete but **no snapshot listing endpoint**, so
+    /// snapshots written by earlier processes cannot be discovered, counted or pruned. See
+    /// [`E2bBackend::prune_known_snapshots`].
+    pub snapshot_retention: Option<usize>,
     /// envd Connect codec.
     pub codec: E2bCodec,
     /// TCP connect timeout in seconds.
@@ -147,6 +159,7 @@ impl Default for E2bSandboxClientOptions {
             sandbox_timeout_seconds: 300,
             run_user: "user".to_string(),
             persistence_mode: E2bPersistenceMode::Tar,
+            snapshot_retention: None,
             codec: E2bCodec::Proto,
             connect_timeout_seconds: 30,
             read_timeout_seconds: 120,
@@ -496,6 +509,13 @@ pub struct E2bBackend {
     options: E2bSandboxClientOptions,
     client: Client,
     retry: RetryPolicy,
+    /// Snapshot ids created through this backend instance, oldest first.
+    ///
+    /// E2B exposes create (`POST /sandboxes/{id}/snapshots`) and delete
+    /// (`DELETE /templates/{id}`) but **no listing endpoint**, so this record is the only view of
+    /// "which snapshots exist" available to the retention window. It is process-local: after a
+    /// restart the list starts empty again and pre-existing snapshots become invisible.
+    known_snapshots: Mutex<Vec<String>>,
 }
 
 impl E2bBackend {
@@ -507,7 +527,166 @@ impl E2bBackend {
             .build()
             .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
         let retry = RetryPolicy::e2b(options.max_retries);
-        Ok(Self { options, client, retry })
+        Ok(Self {
+            options,
+            client,
+            retry,
+            known_snapshots: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Locks the snapshot record, tolerating poisoning (the record is plain data, never
+    /// invariants-bearing, so a panicked thread must not take the backend down with it).
+    fn known_snapshots_guard(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.known_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns the snapshot ids this process created, oldest first.
+    pub fn known_snapshot_ids(&self) -> Vec<String> {
+        self.known_snapshots_guard().clone()
+    }
+
+    /// Records a snapshot id this process created (most recent last).
+    ///
+    /// Blank ids are ignored and duplicates keep their original (oldest) position, mirroring the
+    /// Java `LinkedHashSet` de-duplication where the first occurrence wins.
+    pub fn note_snapshot(&self, snapshot_id: &str) {
+        let id = snapshot_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let mut ids = self.known_snapshots_guard();
+        if ids.iter().any(|existing| existing == id) {
+            return;
+        }
+        ids.push(id.to_string());
+    }
+
+    /// Deletes one snapshot template via `DELETE /templates/{snapshotId}`.
+    ///
+    /// The id is percent-encoded as a **single path segment**, so a namespaced id such as
+    /// `team/alias:tag` becomes `/templates/team%2Falias:tag`; an unencoded `/` would be parsed as
+    /// an extra segment and E2B answers 404 (mirrors the Java `HttpUrl.addPathSegment` fix).
+    ///
+    /// Unlike the Java helper, a 404 is surfaced as an error instead of being swallowed, so the
+    /// caller can tell "deleted" from "never existed". Callers performing best-effort pruning
+    /// treat `status() == Some(404)` as already-absent; see [`Self::prune_snapshot_ids`].
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> SandboxResult<()> {
+        let template = snapshot_id.trim();
+        if template.is_empty() {
+            return Err(SandboxExtensionError::Configuration(
+                "E2B snapshot id must not be blank".to_string(),
+            ));
+        }
+        let url = join_url(
+            &self.options.api_base_url,
+            &format!("/templates/{}", encode_path_segment(template)),
+        );
+        let api_key = self.api_key()?;
+        let template = template.to_string();
+        let client = self.client.clone();
+        let retry = self.retry.clone();
+        with_retries(&retry, move || {
+            let client = client.clone();
+            let url = url.clone();
+            let api_key = api_key.clone();
+            let template = template.clone();
+            async move {
+                let response = client
+                    .delete(&url)
+                    .header("X-API-Key", api_key)
+                    .send()
+                    .await
+                    .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
+                let status = response.status().as_u16();
+                if response.status().is_success() {
+                    return Ok(());
+                }
+                let body = response.text().await.unwrap_or_default();
+                let detail = body.trim();
+                let suffix = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                };
+                Err(match status {
+                    401 | 403 => SandboxExtensionError::http(
+                        status,
+                        format!(
+                            "E2B snapshot delete unauthorized for template {template} (HTTP {status}); \
+                             check E2bSandboxClientOptions::api_key{suffix}"
+                        ),
+                    ),
+                    404 => SandboxExtensionError::http(
+                        404,
+                        format!(
+                            "E2B snapshot delete failed: template {template} not found (HTTP 404); \
+                             it may already be deleted, or the id/namespace is wrong{suffix}"
+                        ),
+                    ),
+                    _ => SandboxExtensionError::http(
+                        status,
+                        format!("E2B snapshot delete failed for template {template} (HTTP {status}){suffix}"),
+                    ),
+                })
+            }
+        })
+        .await
+    }
+
+    /// Applies the configured [`E2bSandboxClientOptions::snapshot_retention`] window to the ids
+    /// this process recorded, deleting the oldest overflow and updating the record.
+    ///
+    /// No-op (and no HTTP traffic) when retention is unset or `0`. Pruning is best-effort: an
+    /// individual failure is logged and the id is kept for a later attempt, so it never fails the
+    /// persisting caller. A 404 counts as "already gone" and is dropped.
+    ///
+    /// # Capability boundary
+    ///
+    /// E2B has no snapshot listing endpoint, so this can **only** prune snapshots created by this
+    /// process. Snapshots left behind by a previous process (or by another host) are invisible
+    /// here and must be deleted explicitly with [`Self::delete_snapshot`].
+    pub async fn prune_known_snapshots(&self) -> SandboxResult<()> {
+        let retention = match self.options.snapshot_retention {
+            Some(n) if n > 0 => n,
+            _ => return Ok(()),
+        };
+        let ids = self.known_snapshot_ids();
+        let kept = self.prune_snapshot_ids(&ids, retention).await;
+        *self.known_snapshots_guard() = kept;
+        Ok(())
+    }
+
+    /// Keeps the last `retention` ids (most recent last) and deletes the rest, returning the ids
+    /// that remain known (surviving prune window plus any id whose delete failed).
+    ///
+    /// `retention == 0` disables pruning and returns the normalized input untouched.
+    pub async fn prune_snapshot_ids(&self, snapshot_ids: &[String], retention: usize) -> Vec<String> {
+        let ids = dedupe_snapshot_ids(snapshot_ids);
+        if retention == 0 || ids.len() <= retention {
+            return ids;
+        }
+        let split = ids.len() - retention;
+        let mut kept: Vec<String> = Vec::new();
+        for id in &ids[..split] {
+            let outcome = self.delete_snapshot(id).await;
+            match outcome {
+                Ok(()) => {
+                    tracing::debug!(snapshot = %id, "e2b: pruned snapshot");
+                }
+                Err(err) if err.status() == Some(404) => {
+                    tracing::debug!(snapshot = %id, "e2b: snapshot already absent ({err})");
+                }
+                Err(err) => {
+                    tracing::warn!(snapshot = %id, "e2b: failed to prune snapshot: {err}");
+                    kept.push(id.clone());
+                }
+            }
+        }
+        kept.extend(ids[split..].iter().cloned());
+        kept
     }
 
     /// Returns the configured options.
@@ -935,8 +1114,16 @@ impl RemoteBackend for E2bBackend {
                         SandboxErrorCode::WorkspaceStopError,
                         format!("E2B snapshot response missing snapshotID: {value}"),
                     )
-                })?;
-            return Ok(E2bSnapshotRefs::encode_snapshot_id(snapshot_id));
+                })?
+                .to_string();
+            self.note_snapshot(&snapshot_id);
+            // Best-effort: pruning must never block persistence, and E2B may reject deletes for
+            // snapshots still backing a live sandbox (the Java code defers pruning to shutdown
+            // for that reason). Failures keep the id recorded for a later attempt.
+            if let Err(err) = self.prune_known_snapshots().await {
+                tracing::warn!("e2b: snapshot retention pass failed: {err}");
+            }
+            return Ok(E2bSnapshotRefs::encode_snapshot_id(&snapshot_id));
         }
         persist_tar(self, handle, root).await
     }
@@ -971,6 +1158,56 @@ impl RemoteBackend for E2bBackend {
         crate::remote::hydrate_tar(self, handle, root, archive).await?;
         Ok(None)
     }
+}
+
+/// De-duplicates snapshot ids, dropping blanks and keeping the first (oldest) occurrence.
+///
+/// Mirrors the Java `E2bPlatformHttp#dedupe`, so "keep the last N" counts distinct snapshots.
+pub fn dedupe_snapshot_ids(snapshot_ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(snapshot_ids.len());
+    for id in snapshot_ids {
+        let trimmed = id.trim();
+        if trimmed.is_empty() || out.iter().any(|seen| seen == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+/// Percent-encodes a value for use as a **single** URL path segment.
+///
+/// Mirrors OkHttp's `HttpUrl.addPathSegment`: `/` becomes `%2F` (so a namespaced snapshot id stays
+/// one segment) while the RFC 3986 sub-delims and `:` stay readable, matching the Java test
+/// expectation `/templates/team%2Fstale:v1`.
+pub fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b':'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => out.push(*byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Builds the envd `Authorization: Basic` header for the run user.
@@ -1555,5 +1792,277 @@ mod tests {
             serde_json::to_vec(&json!({"event":{"end":{"exitCode":exit_code}}})).unwrap().as_slice(),
         ));
         body
+    }
+
+    // ---------------------------------------------------------------- snapshot pruning (GAP-11)
+
+    fn retention_backend(server: &httpmock::MockServer, retention: Option<usize>) -> E2bBackend {
+        E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url: server.base_url(),
+            snapshot_retention: retention,
+            persistence_mode: E2bPersistenceMode::NativeSnapshot,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn encode_path_segment_matches_okhttp_add_path_segment() {
+        assert_eq!(encode_path_segment("snap-1"), "snap-1");
+        // A namespaced id must stay one segment, otherwise E2B parses it as an extra path part.
+        assert_eq!(encode_path_segment("team/stale:v1"), "team%2Fstale:v1");
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+        assert_eq!(encode_path_segment("q?x#y"), "q%3Fx%23y");
+    }
+
+    #[test]
+    fn dedupe_snapshot_ids_drops_blanks_and_keeps_first_occurrence() {
+        let input = vec![
+            "snap-1".to_string(),
+            "  ".to_string(),
+            "snap-2".to_string(),
+            "snap-1".to_string(),
+            "snap-3".to_string(),
+        ];
+        assert_eq!(
+            dedupe_snapshot_ids(&input),
+            vec!["snap-1".to_string(), "snap-2".to_string(), "snap-3".to_string()]
+        );
+        assert!(dedupe_snapshot_ids(&[]).is_empty());
+    }
+
+    /// (a) `DELETE /templates/{snapshotId}` — method, encoded path and API-key header.
+    #[tokio::test]
+    async fn delete_snapshot_sends_delete_to_templates_endpoint() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/templates/team%2Falias:tag")
+                    .header("x-api-key", "secret");
+                then.status(204).body("");
+            })
+            .await;
+        let backend = retention_backend(&server, None);
+
+        backend
+            .delete_snapshot("team/alias:tag")
+            .await
+            .expect("delete succeeds");
+        mock.assert_async().await;
+    }
+
+    /// (b) A 404 must surface as a diagnosable error rather than a panic or silent success.
+    #[tokio::test]
+    async fn delete_snapshot_404_returns_diagnostic_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-gone");
+                then.status(404).body("snapshot not found");
+            })
+            .await;
+        let backend = retention_backend(&server, None);
+
+        let err = backend.delete_snapshot("snap-gone").await.unwrap_err();
+        assert_eq!(err.status(), Some(404), "got {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("404"), "got {message}");
+        assert!(message.contains("snap-gone"), "got {message}");
+        assert!(message.contains("not found"), "got {message}");
+        assert!(message.contains("snapshot not found"), "got {message}");
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_401_points_at_the_api_key_option() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-1");
+                then.status(401).body("invalid api key");
+            })
+            .await;
+        let backend = retention_backend(&server, None);
+
+        let err = backend.delete_snapshot("snap-1").await.unwrap_err();
+        assert_eq!(err.status(), Some(401), "got {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("401"), "got {message}");
+        assert!(message.contains("api_key"), "got {message}");
+        assert!(message.contains("snap-1"), "got {message}");
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_rejects_blank_id_without_traffic() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE);
+                then.status(200);
+            })
+            .await;
+        let backend = retention_backend(&server, None);
+
+        let err = backend.delete_snapshot("   ").await.unwrap_err();
+        assert!(matches!(err, SandboxExtensionError::Configuration(_)), "got {err:?}");
+        assert_eq!(mock.hits_async().await, 0);
+    }
+
+    /// (c) N=2 with three known snapshots must delete exactly the oldest one.
+    #[tokio::test]
+    async fn snapshot_retention_keeps_last_n_and_prunes_only_the_oldest() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let oldest = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-1");
+                then.status(200).body("");
+            })
+            .await;
+        let newer = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-2");
+                then.status(200).body("");
+            })
+            .await;
+        let newest = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-3");
+                then.status(200).body("");
+            })
+            .await;
+        let backend = retention_backend(&server, Some(2));
+        backend.note_snapshot("snap-1");
+        backend.note_snapshot("snap-2");
+        backend.note_snapshot("snap-3");
+
+        backend.prune_known_snapshots().await.expect("prune succeeds");
+
+        assert_eq!(oldest.hits_async().await, 1, "oldest snapshot must be deleted once");
+        assert_eq!(newer.hits_async().await, 0, "snap-2 is inside the window");
+        assert_eq!(newest.hits_async().await, 0, "snap-3 is inside the window");
+        assert_eq!(
+            backend.known_snapshot_ids(),
+            vec!["snap-2".to_string(), "snap-3".to_string()]
+        );
+    }
+
+    /// (d) Retention disabled (unset / 0) must not issue any delete request.
+    #[tokio::test]
+    async fn snapshot_retention_disabled_makes_no_delete_request() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE);
+                then.status(200);
+            })
+            .await;
+
+        for retention in [None, Some(0)] {
+            let backend = retention_backend(&server, retention);
+            backend.note_snapshot("snap-1");
+            backend.note_snapshot("snap-2");
+            backend.note_snapshot("snap-3");
+            backend.prune_known_snapshots().await.expect("no-op succeeds");
+            assert_eq!(
+                backend.known_snapshot_ids(),
+                vec!["snap-1".to_string(), "snap-2".to_string(), "snap-3".to_string()],
+                "retention {retention:?} must retain every id"
+            );
+        }
+        assert_eq!(mock.hits_async().await, 0, "disabled retention must stay offline");
+    }
+
+    #[tokio::test]
+    async fn snapshot_retention_404_counts_as_already_pruned() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-1");
+                then.status(404).body("gone");
+            })
+            .await;
+        let backend = retention_backend(&server, Some(1));
+        backend.note_snapshot("snap-1");
+        backend.note_snapshot("snap-2");
+
+        let kept = backend
+            .prune_snapshot_ids(&backend.known_snapshot_ids(), 1)
+            .await;
+        assert_eq!(kept, vec!["snap-2".to_string()], "a 404 must not be retried forever");
+    }
+
+    #[tokio::test]
+    async fn snapshot_retention_keeps_ids_whose_delete_failed() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-1");
+                then.status(500).body("locked");
+            })
+            .await;
+        let backend = retention_backend(&server, Some(1));
+        backend.note_snapshot("snap-1");
+        backend.note_snapshot("snap-2");
+
+        backend.prune_known_snapshots().await.expect("prune is best effort");
+        assert_eq!(
+            backend.known_snapshot_ids(),
+            vec!["snap-1".to_string(), "snap-2".to_string()],
+            "a failed delete stays recorded for a later attempt"
+        );
+    }
+
+    /// Persisting a native snapshot records the id, then applies the window to it.
+    #[tokio::test]
+    async fn persist_native_snapshot_records_id_and_applies_retention() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let create = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/sandboxes/sbx-1/snapshots");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body("{\"snapshotID\":\"snap-1\"}");
+            })
+            .await;
+        let prune = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-0");
+                then.status(200).body("");
+            })
+            .await;
+        let keep = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-1");
+                then.status(200).body("");
+            })
+            .await;
+        let backend = retention_backend(&server, Some(1));
+        backend.note_snapshot("snap-0");
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let archive = backend
+            .persist_workspace_bytes(&handle, "/home/user")
+            .await
+            .expect("native snapshot persists");
+        assert_eq!(
+            E2bSnapshotRefs::decode_snapshot_id_if_present(&archive).as_deref(),
+            Some("snap-1")
+        );
+
+        create.assert_async().await;
+        prune.assert_async().await;
+        assert_eq!(keep.hits_async().await, 0, "the newest snapshot must survive");
+        assert_eq!(backend.known_snapshot_ids(), vec!["snap-1".to_string()]);
     }
 }
