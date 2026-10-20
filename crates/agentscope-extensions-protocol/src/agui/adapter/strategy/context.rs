@@ -642,6 +642,7 @@ pub(crate) const BUILT_IN_EVENT_TYPES: &[AgentEventType] = &[
     AgentEventType::ToolCallDelta,
     AgentEventType::ToolCallEnd,
     AgentEventType::ToolResultStart,
+    AgentEventType::ToolProgress,
     AgentEventType::ToolResultTextDelta,
     AgentEventType::ToolResultDataDelta,
     AgentEventType::ToolResultEnd,

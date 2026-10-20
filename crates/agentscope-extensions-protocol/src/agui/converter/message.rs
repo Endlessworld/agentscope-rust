@@ -270,7 +270,16 @@ impl AguiMessageConverter {
         }
         tool_use.content = tool_content;
 
-        let confirm_result = ConfirmResult::new(approved, Some(tool_use), Vec::new());
+        let confirm_result = {
+            let mut result = ConfirmResult::new(approved, Some(tool_use), Vec::new());
+            // Mirrors Java `c0d03ccea`: `resume.payload.reason` becomes `ConfirmResult.reason`
+            // and, on denial, the text of the DENIED tool result. Core carries that text in
+            // `ConfirmResult::message`.
+            if let Some(reason) = resume.reason() {
+                result.message = reason.to_string();
+            }
+            result
+        };
         let mut msg_metadata = Map::new();
         msg_metadata.insert(
             Msg::METADATA_CONFIRM_RESULTS.to_string(),
@@ -596,9 +605,16 @@ fn resolve_tool_call_id(interrupt_id: &str, interrupt: Option<&Interrupt>) -> Op
 }
 
 /// Renders the resume payload as tool-result text.
+///
+/// A cancelled interrupt with an explicit reason reports that reason; without one it keeps
+/// the historical default text. This is where an inbound `resume.reason` (or
+/// `resume.payload.reason`) turns into the tool-result text the agent sees.
 fn resume_content(resume: &AguiResume) -> String {
     if resume.is_cancelled() {
-        return "Interrupt cancelled by user".to_string();
+        return match resume.reason() {
+            Some(reason) => reason.to_string(),
+            None => "Interrupt cancelled by user".to_string(),
+        };
     }
     match &resume.payload {
         None => String::new(),
@@ -1405,6 +1421,97 @@ mod tests {
             resume_content(&AguiResume::new("i", AguiResume::STATUS_RESOLVED, None)),
             ""
         );
+    }
+
+    #[test]
+    fn cancelled_resume_reason_becomes_the_tool_result_text() {
+        let converter = converter();
+        // No reason: the historical default text still applies.
+        let input = RunAgentInput::of("t", "r").with_resume(vec![AguiResume::new(
+            "c2",
+            AguiResume::STATUS_CANCELLED,
+            None,
+        )]);
+        let msgs = converter.to_input_msg_list(&input).unwrap();
+        let result = msgs[0].tool_result_blocks().next().unwrap();
+        assert_eq!(result.text_content(), "Interrupt cancelled by user");
+        assert_eq!(result.state, ToolResultState::Interrupted);
+
+        // Top-level `reason` is carried through to the cancelled tool result.
+        let input = RunAgentInput::of("t", "r").with_resume(vec![AguiResume::new(
+            "c2",
+            AguiResume::STATUS_CANCELLED,
+            None,
+        )
+        .with_reason("user closed the dialog")]);
+        let msgs = converter.to_input_msg_list(&input).unwrap();
+        let result = msgs[0].tool_result_blocks().next().unwrap();
+        assert_eq!(result.text_content(), "user closed the dialog");
+        assert_eq!(result.state, ToolResultState::Interrupted);
+
+        // `payload.reason` works too, matching the Java wire shape.
+        let input = RunAgentInput::of("t", "r").with_resume(vec![AguiResume::new(
+            "c2",
+            AguiResume::STATUS_CANCELLED,
+            Some(json!({"reason": "policy blocked it"})),
+        )]);
+        let msgs = converter.to_input_msg_list(&input).unwrap();
+        assert_eq!(
+            msgs[0].tool_result_blocks().next().unwrap().text_content(),
+            "policy blocked it"
+        );
+    }
+
+    #[test]
+    fn permission_confirm_resume_reason_reaches_the_confirm_result() {
+        let converter = converter();
+        let mut metadata = Map::new();
+        metadata.insert(
+            METADATA_AGENTSCOPE_INTERRUPT_KIND.to_string(),
+            json!(INTERRUPT_KIND_PERMISSION_CONFIRM),
+        );
+        metadata.insert(METADATA_TOOL_NAME.to_string(), json!("shell"));
+        metadata.insert(METADATA_TOOL_INPUT.to_string(), json!({"cmd": "rm -rf /"}));
+        let mut interrupts = HashMap::new();
+        interrupts.insert(
+            "c8".to_string(),
+            interrupt_with_metadata("c8", Some("c8"), Some(metadata)),
+        );
+
+        // Java `c0d03ccea`: `payload.reason` becomes `ConfirmResult.reason`, which core
+        // carries as `ConfirmResult::message` and uses as the DENIED tool-result text.
+        let input = RunAgentInput::of("t", "r").with_resume(vec![AguiResume::new(
+            "c8",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"approved": false, "reason": "too destructive"})),
+        )]);
+        let msgs = converter
+            .to_input_msg_list_with_interrupts(&input, &interrupts)
+            .unwrap();
+        let confirmations = msgs[0]
+            .metadata()
+            .get(Msg::METADATA_CONFIRM_RESULTS)
+            .unwrap();
+        let result: ConfirmResult = serde_json::from_value(confirmations[0].clone()).unwrap();
+        assert!(!result.confirmed);
+        assert_eq!(result.message, "too destructive");
+
+        // Without a reason the confirm result keeps an empty message so core falls back to
+        // its default denial text.
+        let input = RunAgentInput::of("t", "r").with_resume(vec![AguiResume::new(
+            "c8",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"approved": false})),
+        )]);
+        let msgs = converter
+            .to_input_msg_list_with_interrupts(&input, &interrupts)
+            .unwrap();
+        let confirmations = msgs[0]
+            .metadata()
+            .get(Msg::METADATA_CONFIRM_RESULTS)
+            .unwrap();
+        let result: ConfirmResult = serde_json::from_value(confirmations[0].clone()).unwrap();
+        assert!(result.message.is_empty());
     }
 
     #[test]

@@ -131,6 +131,8 @@ cargo test  -p agentscope-extensions-protocol   -> 290 passed; 0 failed; 0 ignor
 | SSE 流式响应 | Spring `SseEmitter` | 已完成 | axum router 已建；`agui::encoder::AguiEventEncoder` 提供 SSE 帧编码（含 `data:`/空行分隔/多行 data） |
 | agui 适配器 + 转换策略 | `agui/adapter/*` | **已完成** | `AguiAgentAdapter`（872 行）/`AguiAdapterConfig`/`ToolInjection` + 策略层（`context`/`converters`/`enricher`/`registry`） |
 | agui 请求处理/续跑 | `agui/processor/*` | **已完成** | `AguiRequestProcessor`（626 行）/`AguiResumeCoordinator`（600 行）/`AgentResolver` |
+| `TOOL_PROGRESS` 事件投影（`707400eb`） | `agui/adapter/strategy/ToolResultEventConverter` | **已完成（2026-10-20，有意不映射）** | core 已发独立 `TOOL_PROGRESS` 事件；AG-UI 侧按 Java 既定行为**显式丢弃**（Java 注释：AG-UI 没有工具进度通道，故丢弃而非透传为原始事件），Rust 用带注释的 no-op 分支对齐，**未新增任何 AG-UI 事件**。原先进度借 `TOOL_RESULT_DATA_DELTA` 透传导致的「进度被当成工具结果」风险已消除 |
+| `AguiResume.reason`（`c0d03ccea`） | `AguiMessageConverter#RESUME_PAYLOAD_REASON` | **已完成（2026-10-20）** | `AguiResume` 增 `reason: Option<String>`（`serde(default)` + `skip_serializing_if`，旧客户端缺键可反序列化）；`cancelled` 且带 reason 时，`resume_content` 用它作工具结果文本，并写入 `ConfirmResult.message`；无 reason 时保留历史默认文案 |
 
 ### 3.3 P2（增强）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |

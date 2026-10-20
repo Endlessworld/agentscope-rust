@@ -437,6 +437,7 @@ impl AgentEventConverter for ToolResultEventConverter {
     fn event_types(&self) -> Vec<AgentEventType> {
         vec![
             AgentEventType::ToolResultStart,
+            AgentEventType::ToolProgress,
             AgentEventType::ToolResultTextDelta,
             AgentEventType::ToolResultDataDelta,
             AgentEventType::ToolResultEnd,
@@ -448,6 +449,13 @@ impl AgentEventConverter for ToolResultEventConverter {
             AgentEventType::ToolResultStart => {
                 let tool_call_id = event_string_or_default(event, "tool_call_id");
                 context.begin_tool_result(&tool_call_id);
+            }
+            AgentEventType::ToolProgress => {
+                // Deliberate no-op, mirroring Java `ToolResultEventConverter`: AG-UI has
+                // no channel for tool progress. A progress chunk is dropped rather than
+                // passed through as a raw event, because folding it into the tool result
+                // buffer would feed display-only text back to the model on the next turn.
+                // Customize the converter to surface it differently.
             }
             AgentEventType::ToolResultTextDelta => {
                 let tool_call_id = event_string_or_default(event, "tool_call_id");
@@ -1107,6 +1115,66 @@ mod tests {
         let events = context.drain_events();
         let result = events.last().unwrap();
         assert!(render(result).contains("body\\ntail"), "got {}", render(result));
+    }
+
+    #[test]
+    fn tool_progress_is_dropped_without_affecting_the_tool_result() {
+        // Mirrors Java `ToolResultEventConverter`: AG-UI has no channel for tool
+        // progress, so a progress event is converted to nothing. It must also not
+        // leak into the tool result buffer that is handed back to the model.
+        let mut context = context();
+        ToolCallEventConverter.convert(
+            &delta_event(
+                AgentEventType::ToolCallStart,
+                &[("tool_call_id", json!("c1")), ("tool_name", json!("t"))],
+            ),
+            &mut context,
+        );
+        let converter = ToolResultEventConverter;
+        converter.convert(
+            &delta_event(AgentEventType::ToolResultStart, &[("tool_call_id", json!("c1"))]),
+            &mut context,
+        );
+        context.drain_events();
+        converter.convert(
+            &delta_event(
+                AgentEventType::ToolProgress,
+                &[
+                    ("reply_id", json!("r")),
+                    ("tool_call_id", json!("c1")),
+                    ("tool_name", json!("t")),
+                    ("content", json!({"type": "text", "text": "step 1"})),
+                ],
+            ),
+            &mut context,
+        );
+        assert!(
+            context.drain_events().is_empty(),
+            "tool progress must not surface as an AG-UI event"
+        );
+        converter.convert(
+            &delta_event(
+                AgentEventType::ToolResultTextDelta,
+                &[("tool_call_id", json!("c1")), ("delta", json!("final"))],
+            ),
+            &mut context,
+        );
+        context.drain_events();
+        converter.convert(
+            &delta_event(
+                AgentEventType::ToolResultEnd,
+                &[("reply_id", json!("r")), ("tool_call_id", json!("c1"))],
+            ),
+            &mut context,
+        );
+        let events = context.drain_events();
+        let result = events.last().expect("tool result is emitted");
+        let rendered = render(result);
+        assert!(rendered.contains("final"), "got {rendered}");
+        assert!(
+            !rendered.contains("step 1"),
+            "progress text must not enter the tool result: {rendered}"
+        );
     }
 
     #[test]

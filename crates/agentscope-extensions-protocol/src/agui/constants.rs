@@ -30,6 +30,9 @@ pub const RESUME_PAYLOAD_APPROVED: &str = "approved";
 /// Resume payload key: full replacement tool arguments.
 pub const RESUME_PAYLOAD_EDITED_ARGS: &str = "editedArgs";
 
+/// Resume payload key: optional reason supplied when denying the tool call.
+pub const RESUME_PAYLOAD_REASON: &str = "reason";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +49,6 @@ mod tests {
         assert_eq!(METADATA_REPLY_ID, "replyId");
         assert_eq!(RESUME_PAYLOAD_APPROVED, "approved");
         assert_eq!(RESUME_PAYLOAD_EDITED_ARGS, "editedArgs");
+        assert_eq!(RESUME_PAYLOAD_REASON, "reason");
     }
 }

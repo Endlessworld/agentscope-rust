@@ -225,6 +225,7 @@ mod tests {
             AgentEventType::ToolCallDelta,
             AgentEventType::ToolCallEnd,
             AgentEventType::ToolResultStart,
+            AgentEventType::ToolProgress,
             AgentEventType::ToolResultTextDelta,
             AgentEventType::ToolResultDataDelta,
             AgentEventType::ToolResultEnd,

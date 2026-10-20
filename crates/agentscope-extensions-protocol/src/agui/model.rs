@@ -447,6 +447,11 @@ impl AguiContext {
 /// A user response that explicitly denies the request is still `resolved`, **not**
 /// `cancelled`: the cancelled status is reserved for cases where the user provides no
 /// meaningful input and the payload is omitted.
+///
+/// `reason` is an optional human-readable explanation, mirroring
+/// `io.agentscope.core.agui.converter.AguiMessageConverter#RESUME_PAYLOAD_REASON`.
+/// Old clients that never send the key deserialize with `reason = None`, and `None` is
+/// omitted from the wire form so the field stays invisible until someone sets it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AguiResume {
@@ -457,6 +462,9 @@ pub struct AguiResume {
     /// Optional response payload for resolved interrupts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    /// Optional explanation supplied when the interrupt is denied or cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl AguiResume {
@@ -465,13 +473,20 @@ impl AguiResume {
     /// Resume status: the interrupt was cancelled.
     pub const STATUS_CANCELLED: &'static str = "cancelled";
 
-    /// Creates a resume entry.
+    /// Creates a resume entry without a reason.
     pub fn new(interrupt_id: impl Into<String>, status: impl Into<String>, payload: Option<Value>) -> Self {
         Self {
             interrupt_id: interrupt_id.into(),
             status: status.into(),
             payload,
+            reason: None,
         }
+    }
+
+    /// Attaches a human-readable reason (typically a denial or cancellation explanation).
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
 
     /// Whether this resume entry resolved the interrupt.
@@ -500,6 +515,29 @@ impl AguiResume {
             .and_then(|v| v.as_object())
             .and_then(|m| m.get(crate::agui::constants::RESUME_PAYLOAD_EDITED_ARGS))
             .and_then(Value::as_object)
+    }
+
+    /// The optional reason of the payload (`payload.reason`), when present and non-blank.
+    pub fn payload_reason(&self) -> Option<&str> {
+        self.payload
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(crate::agui::constants::RESUME_PAYLOAD_REASON))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+    }
+
+    /// The effective reason, preferring the top-level `reason` key over `payload.reason`.
+    ///
+    /// Accepting both shapes keeps Java callers (which only send `payload.reason`) and
+    /// clients that promote the reason onto the resume entry itself working.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .or_else(|| self.payload_reason())
     }
 }
 
@@ -624,6 +662,76 @@ mod request_tests {
         assert!(cancelled.is_cancelled());
         assert!(!cancelled.is_resolved());
         assert_eq!(cancelled.payload_approved(), None);
+    }
+
+    #[test]
+    fn resume_serializes_reason_when_present() {
+        let resume = AguiResume::new("i1", AguiResume::STATUS_CANCELLED, None)
+            .with_reason("user closed the approval dialog");
+        let value = serde_json::to_value(&resume).unwrap();
+        assert_eq!(value["interruptId"], json!("i1"));
+        assert_eq!(value["status"], json!("cancelled"));
+        assert_eq!(value["reason"], json!("user closed the approval dialog"));
+        // The reason round-trips through the wire form unchanged.
+        assert_eq!(serde_json::from_value::<AguiResume>(value).unwrap(), resume);
+        assert_eq!(resume.reason(), Some("user closed the approval dialog"));
+    }
+
+    #[test]
+    fn resume_omits_reason_when_absent() {
+        let resume = AguiResume::new("i1", AguiResume::STATUS_RESOLVED, Some(json!({"approved": true})));
+        let value = serde_json::to_value(&resume).unwrap();
+        assert!(
+            value.get("reason").is_none(),
+            "skip_serializing_if must keep the reason key off the wire: {value}"
+        );
+    }
+
+    #[test]
+    fn resume_deserializes_without_reason_for_backward_compatibility() {
+        // Shape emitted by pre-`reason` clients: no `reason` key at all.
+        let resume: AguiResume =
+            serde_json::from_str(r#"{"interruptId":"i1","status":"cancelled"}"#).unwrap();
+        assert_eq!(resume.interrupt_id, "i1");
+        assert_eq!(resume.status, AguiResume::STATUS_CANCELLED);
+        assert_eq!(resume.reason, None);
+        assert_eq!(resume.reason(), None);
+        // An explicit `null` is accepted as well.
+        let explicit_null: AguiResume =
+            serde_json::from_str(r#"{"interruptId":"i2","status":"resolved","reason":null}"#)
+                .unwrap();
+        assert_eq!(explicit_null.reason, None);
+    }
+
+    #[test]
+    fn resume_reason_accepts_the_payload_key_and_prefers_the_top_level_one() {
+        // Java only ever reads `payload.reason`; the Rust side accepts both shapes.
+        let payload_only = AguiResume::new(
+            "i1",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"approved": false, "reason": "too destructive"})),
+        );
+        assert_eq!(payload_only.reason, None);
+        assert_eq!(payload_only.payload_reason(), Some("too destructive"));
+        assert_eq!(payload_only.reason(), Some("too destructive"));
+
+        // A blank payload reason is treated as absent, matching Java's `isBlank()` check.
+        let blank = AguiResume::new(
+            "i2",
+            AguiResume::STATUS_RESOLVED,
+            Some(json!({"approved": false, "reason": "   "})),
+        );
+        assert_eq!(blank.payload_reason(), None);
+        assert_eq!(blank.reason(), None);
+
+        // A top-level reason wins when both are present.
+        let both = AguiResume::new(
+            "i3",
+            AguiResume::STATUS_CANCELLED,
+            Some(json!({"reason": "payload wins?"})),
+        )
+        .with_reason("top level wins");
+        assert_eq!(both.reason(), Some("top level wins"));
     }
 
     #[test]
