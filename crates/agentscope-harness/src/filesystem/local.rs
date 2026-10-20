@@ -1,11 +1,12 @@
 //! Local-disk filesystem backend, mirroring `LocalFilesystem`.
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
 use globset::{GlobBuilder, GlobMatcher};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use super::{validate_path, FileData, FileInfo, Filesystem, GrepMatch};
 
@@ -29,19 +30,34 @@ const GENERATED_DIRS: &[&str] = &[
 /// user text (e.g. memory_search queries) never fails to compile.
 pub(crate) enum PatternMatcher {
     Regex(Regex),
-    Literal(String),
+    Literal { text: String, ignore_case: bool },
 }
 impl PatternMatcher {
     pub(crate) fn new(pattern: &str) -> Self {
-        match Regex::new(pattern) {
+        // A leading (?i) is honoured by the literal fallback too: leaving it inside
+        // the pattern would turn it into matchable text and never match.
+        let (ignore_case, body) = match pattern.strip_prefix("(?i)") {
+            Some(rest) => (true, rest),
+            None => (false, pattern),
+        };
+        match RegexBuilder::new(body).case_insensitive(ignore_case).build() {
             Ok(r) => PatternMatcher::Regex(r),
-            Err(_) => PatternMatcher::Literal(pattern.to_string()),
+            Err(_) => PatternMatcher::Literal {
+                text: body.to_string(),
+                ignore_case,
+            },
         }
     }
     pub(crate) fn is_match(&self, line: &str) -> bool {
         match self {
             PatternMatcher::Regex(r) => r.is_match(line),
-            PatternMatcher::Literal(l) => line.contains(l.as_str()),
+            PatternMatcher::Literal { text, ignore_case } => {
+                if *ignore_case {
+                    line.to_lowercase().contains(&text.to_lowercase())
+                } else {
+                    line.contains(text.as_str())
+                }
+            }
         }
     }
 }
@@ -57,6 +73,93 @@ pub(crate) fn build_glob_matcher(pattern: &str) -> Option<GlobMatcher> {
         .build()
         .ok()
         .map(|g| g.compile_matcher())
+}
+
+/// Glob filter for `grep`, following the `rg -g` rule: a pattern containing `/`
+/// is matched against the path relative to the search base, any other pattern
+/// against the file name (so `*.rs` stays recursive while `src/*.rs` /
+/// `**/*.java` select by path).
+pub(crate) struct GrepGlob {
+    matcher: GlobMatcher,
+    path_based: bool,
+}
+
+impl GrepGlob {
+    pub(crate) fn build(pattern: &str) -> Option<Self> {
+        let matcher = build_glob_matcher(pattern)?;
+        Some(Self {
+            matcher,
+            path_based: pattern.contains('/'),
+        })
+    }
+
+    pub(crate) fn matches(&self, rel_path: &str, file_name: &str) -> bool {
+        if self.path_based {
+            self.matcher.is_match(rel_path)
+        } else {
+            self.matcher.is_match(file_name)
+        }
+    }
+}
+
+/// Builds the walker used by recursive `grep`/`glob`.
+///
+/// `.gitignore` / `.ignore` / global git excludes are honoured (`require_git(false)`
+/// keeps that behaviour outside a git repository, e.g. in a bare workspace); hidden
+/// files are still walked, and build directories are pruned by name.
+fn build_walker(base: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(base)
+        .hidden(false)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e
+                    .file_type()
+                    .is_some_and(|t| t.is_dir() && is_generated_name(e.file_name()))
+        })
+        .build()
+}
+
+/// Collects `(path, is_dir)` below `base` via [`build_walker`].
+///
+/// The `ignore` walker is synchronous, so it runs on the blocking pool to keep the
+/// async runtime free.
+async fn walk_entries(base: &Path) -> Vec<(PathBuf, bool)> {
+    let base = base.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut entries = Vec::new();
+        for entry in build_walker(&base) {
+            let Ok(entry) = entry else { continue };
+            if entry.depth() == 0 {
+                continue;
+            }
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            entries.push((entry.into_path(), is_dir));
+        }
+        entries
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Relative POSIX path of `path` under `base`; falls back to the file name when
+/// `path` is the search base itself (single-file grep).
+fn relative_path(path: &Path, base: &Path) -> String {
+    let rel = path
+        .strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        rel.to_string()
+    }
 }
 
 /// Path-resolution policy for a `LocalFilesystem`.
@@ -351,13 +454,14 @@ impl Filesystem for LocalFilesystem {
             return Ok(Vec::new());
         }
         let matcher = PatternMatcher::new(pattern);
-        let glob = glob.and_then(build_glob_matcher);
+        let glob = glob.filter(|g| !g.trim().is_empty()).and_then(GrepGlob::build);
         let mut matches = Vec::new();
         if base.is_file() {
             // Linux grep semantics: a single-file path searches that file.
-            self.grep_file(&base, &matcher, glob.as_ref(), &mut matches).await;
+            self.grep_file(&base, &base, &matcher, glob.as_ref(), &mut matches)
+                .await;
         } else {
-            self.grep_recursive(&base, &base, &matcher, glob.as_ref(), &mut matches)
+            self.grep_recursive(&base, &matcher, glob.as_ref(), &mut matches)
                 .await?;
         }
         Ok(matches)
@@ -390,7 +494,7 @@ impl Filesystem for LocalFilesystem {
                 }
             }
         } else {
-            self.glob_recursive(&search, &search, &matcher, &mut out).await?;
+            self.glob_recursive(&search, &matcher, &mut out).await?;
         }
         out.sort_by_key(|f| f.path.clone());
         Ok(out)
@@ -398,12 +502,13 @@ impl Filesystem for LocalFilesystem {
 }
 
 impl LocalFilesystem {
-    /// Greps a single file, applying the optional glob filter to its basename.
+    /// Greps a single file, applying the optional glob filter to its path.
     async fn grep_file(
         &self,
         path: &Path,
+        base: &Path,
         matcher: &PatternMatcher,
-        glob: Option<&GlobMatcher>,
+        glob: Option<&GrepGlob>,
         out: &mut Vec<GrepMatch>,
     ) {
         let md = match path.metadata() {
@@ -415,11 +520,14 @@ impl LocalFilesystem {
         }
         if let Some(glob) = glob {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !glob.is_match(name) {
+            if !glob.matches(&relative_path(path, base), name) {
                 return;
             }
         }
-        if let Ok(content) = tokio::fs::read_to_string(path).await {
+        let Some(content) = read_text(path).await else {
+            return;
+        };
+        {
             let display = self.display_path(path);
             for (i, line) in content.lines().enumerate() {
                 if matcher.is_match(line) {
@@ -435,89 +543,66 @@ impl LocalFilesystem {
 
     async fn grep_recursive(
         &self,
-        dir: &Path,
         base: &Path,
         matcher: &PatternMatcher,
-        glob: Option<&GlobMatcher>,
+        glob: Option<&GrepGlob>,
         out: &mut Vec<GrepMatch>,
     ) -> Result<()> {
-        let mut entries = tokio::fs::read_dir(dir).await.map_err(Error::Io)?;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let p = entry.path();
-            let md = match entry.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if md.is_dir() {
-                // Skip generated dirs, but always walk the search base itself.
-                if p != base && is_generated_dir(&entry) {
-                    continue;
-                }
-                Box::pin(self.grep_recursive(&p, base, matcher, glob, out)).await?;
+        for (path, is_dir) in walk_entries(base).await {
+            if is_dir {
                 continue;
             }
-            self.grep_file(&p, matcher, glob, out).await;
+            self.grep_file(&path, base, matcher, glob, out).await;
         }
         Ok(())
     }
 
     async fn glob_recursive(
         &self,
-        dir: &Path,
         base: &Path,
         matcher: &GlobMatcher,
         out: &mut Vec<FileInfo>,
     ) -> Result<()> {
-        let mut entries = tokio::fs::read_dir(dir).await.map_err(Error::Io)?;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let p = entry.path();
-            let md = match entry.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+        for (p, is_dir) in walk_entries(base).await {
             // The pattern is matched against the path relative to the search base,
             // mirroring `cd <base> && ls <pattern>` / `find <base> -name <pattern>`.
-            let rel = p
-                .strip_prefix(base)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let rel = rel.trim_start_matches('/');
-            let display = self.display_path(&p);
-            if matcher.is_match(rel) {
-                if md.is_dir() {
-                    out.push(FileInfo {
-                        path: format!("{display}/"),
-                        is_directory: true,
-                        size: 0,
-                        modified_at: String::new(),
-                    });
-                } else {
-                    out.push(FileInfo {
-                        path: display,
-                        is_directory: false,
-                        size: md.len(),
-                        modified_at: String::new(),
-                    });
-                }
+            let rel = relative_path(&p, base);
+            if !matcher.is_match(&rel) {
+                continue;
             }
-            if md.is_dir() {
-                // Skip generated dirs, but always walk the search base itself.
-                if p != base && is_generated_dir(&entry) {
-                    continue;
-                }
-                Box::pin(self.glob_recursive(&p, base, matcher, out)).await?;
+            let display = self.display_path(&p);
+            if is_dir {
+                out.push(FileInfo {
+                    path: format!("{display}/"),
+                    is_directory: true,
+                    size: 0,
+                    modified_at: String::new(),
+                });
+            } else {
+                let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(FileInfo {
+                    path: display,
+                    is_directory: false,
+                    size,
+                    modified_at: String::new(),
+                });
             }
         }
         Ok(())
     }
 }
 
-/// Returns true when `entry` is a directory whose name is a known generated dir.
-fn is_generated_dir(entry: &tokio::fs::DirEntry) -> bool {
-    let name = entry.file_name();
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    GENERATED_DIRS.contains(&name)
+/// Reads a text file for grep: binary files (NUL byte in the first 8 KiB) are
+/// skipped, non-UTF-8 content is decoded lossily instead of being dropped.
+async fn read_text(path: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    if bytes.iter().take(8192).any(|b| *b == 0) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Returns true when `name` is a directory basename in [`GENERATED_DIRS`].
+fn is_generated_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|n| GENERATED_DIRS.contains(&n))
 }

@@ -25,6 +25,7 @@ base64.workspace = true
 sha2.workspace = true
 regex = "1"
 globset = "0.4"
+ignore.workspace = true
 rusqlite = { workspace = true, optional = true }
 rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["client", "stdio", "macros"] }
 # Client-side SSE/Streamable-HTTP transports. Pulled directly (not via the sdk's

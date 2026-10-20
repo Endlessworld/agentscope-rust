@@ -51,6 +51,8 @@ jsonschema = { version = "0.30", default-features = false, features = ["resolve-
 serde_yaml = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
+# 目录遍历（harness 的 grep/glob 需要 .gitignore / .ignore 语义；与 rg 同源实现）。
+ignore = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

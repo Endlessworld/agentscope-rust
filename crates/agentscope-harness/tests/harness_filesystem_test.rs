@@ -292,3 +292,187 @@ fn tool_text(block: &ToolResultBlock) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[tokio::test]
+async fn grep_glob_with_slash_matches_relative_path() {
+    let dir = temp_dir("grep_glob_path").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
+    fs.write(&ctx(), "/src/nested/extra.rs", "fn extra() {}").await.unwrap();
+    fs.write(&ctx(), "/other/keep.rs", "fn keep() {}").await.unwrap();
+
+    // No slash: matched against the file name, so it stays recursive.
+    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("*.rs")).await.unwrap();
+    assert_eq!(matches.len(), 3);
+
+    // A slash makes the pattern relative to the search base.
+    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("src/*.rs")).await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].path, "/src/main.rs");
+
+    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("src/**/*.rs")).await.unwrap();
+    assert_eq!(matches.len(), 2);
+
+    let matches = fs
+        .grep(&ctx(), "fn", Some("/src"), Some("nested/*.rs"))
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].path, "/src/nested/extra.rs");
+}
+
+#[tokio::test]
+async fn grep_and_glob_respect_gitignore() {
+    let dir = temp_dir("gitignore").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/.gitignore", "ignored/\n*.log\n")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/keep.rs", "fn keep() {}").await.unwrap();
+    fs.write(&ctx(), "/ignored/skip.rs", "fn skip() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/debug.log", "fn logged").await.unwrap();
+
+    let matches = fs.grep(&ctx(), "fn", Some("/"), None).await.unwrap();
+    assert_eq!(
+        matches.len(),
+        1,
+        "gitignored files must be skipped: {matches:?}"
+    );
+    assert_eq!(matches[0].path, "/keep.rs");
+
+    let files = fs.glob(&ctx(), "**/*.rs", "/").await.unwrap();
+    assert_eq!(files.len(), 1, "expected only keep.rs: {files:?}");
+    assert_eq!(files[0].path, "/keep.rs");
+}
+
+#[tokio::test]
+async fn grep_skips_binary_and_keeps_non_utf8_text() {
+    let dir = temp_dir("grep_binary").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    // NUL byte -> treated as binary and skipped.
+    tokio::fs::write(dir.join("blob.dat"), [0u8, 1, 2, b'f', b'n'])
+        .await
+        .unwrap();
+    // Latin-1 bytes: not valid UTF-8, but still text -> searched lossily.
+    tokio::fs::write(dir.join("latin1.txt"), [b'c', b'a', b'f', 0xe9, b' ', b'f', b'n'])
+        .await
+        .unwrap();
+
+    let matches = fs.grep(&ctx(), "fn", Some("/"), None).await.unwrap();
+    assert_eq!(
+        matches.len(),
+        1,
+        "binary skipped, non-UTF-8 text kept: {matches:?}"
+    );
+    assert_eq!(matches[0].path, "/latin1.txt");
+}
+
+#[tokio::test]
+async fn grep_tool_flags_and_output_modes() {
+    use serde_json::json;
+
+    let dir = temp_dir("grep_flags").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    fs.write(&ctx(), "/a.rs", "fn a()").await.unwrap();
+    fs.write(&ctx(), "/b.rs", "FN b()").await.unwrap();
+    fs.write(&ctx(), "/c.md", "fn c()").await.unwrap();
+    let grep = FilesystemTool::grep_files(Arc::clone(&fs));
+
+    let call = |args: serde_json::Value| {
+        let grep = &grep;
+        async move {
+            grep.call(args.as_object().unwrap().clone(), tool_ctx())
+                .await
+        }
+    };
+
+    // ignore_case (-i): all three files match.
+    let out = call(json!({"pattern": "fn", "path": "/", "ignore_case": true}))
+        .await
+        .unwrap();
+    assert_eq!(tool_text(&out).lines().count(), 3);
+
+    // type filter (-t rust): only the lowercase hit in a.rs remains.
+    let out = call(json!({"pattern": "fn", "path": "/", "type": "rust"}))
+        .await
+        .unwrap();
+    let text = tool_text(&out);
+    assert_eq!(text.lines().count(), 1, "got: {text}");
+    assert!(text.contains("a.rs"), "got: {text}");
+
+    // -c: one line per file with a hit count.
+    let out = call(json!({"pattern": "fn", "path": "/", "output_mode": "count"}))
+        .await
+        .unwrap();
+    let text = tool_text(&out);
+    assert_eq!(text.lines().count(), 2, "got: {text}");
+    assert!(text.contains("a.rs:1"), "got: {text}");
+
+    // -l: unique paths only.
+    let out = call(json!({"pattern": "fn", "path": "/", "output_mode": "files_with_matches"}))
+        .await
+        .unwrap();
+    let text = tool_text(&out);
+    assert_eq!(text.lines().count(), 2, "got: {text}");
+    assert!(!text.contains(":1:"), "paths only, got: {text}");
+
+    // Explicit file list instead of a single path.
+    let out = call(json!({"pattern": "fn", "paths": ["/a.rs", "/c.md"]}))
+        .await
+        .unwrap();
+    assert_eq!(tool_text(&out).lines().count(), 2);
+
+    // glob and type are mutually exclusive.
+    let err = call(json!({"pattern": "fn", "glob": "*.rs", "type": "rust"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("either glob or type"), "got: {err}");
+
+    // Unknown type names are reported with the known set.
+    let err = call(json!({"pattern": "fn", "type": "cobol"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Unknown type"), "got: {err}");
+}
+
+#[tokio::test]
+async fn grep_ignore_case_survives_literal_fallback() {
+    let dir = temp_dir("grep_literal_ci").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    // `fn (` is not a valid regex, so the matcher falls back to literal substring.
+    fs.write(&ctx(), "/a.txt", "see FN ( here").await.unwrap();
+    fs.write(&ctx(), "/b.txt", "nothing").await.unwrap();
+
+    let matches = fs.grep(&ctx(), "fn (", Some("/"), None).await.unwrap();
+    assert!(matches.is_empty(), "case-sensitive literal: {matches:?}");
+
+    let matches = fs.grep(&ctx(), "(?i)fn (", Some("/"), None).await.unwrap();
+    assert_eq!(
+        matches.len(),
+        1,
+        "(?i) must still apply on the literal fallback path: {matches:?}"
+    );
+    assert_eq!(matches[0].path, "/a.txt");
+}
+
+#[tokio::test]
+async fn generated_dir_names_do_not_prune_regular_files() {
+    let dir = temp_dir("generated_name_file").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    // `build` is a generated *directory* name; a regular file of that name must
+    // still be searched.
+    fs.write(&ctx(), "/build", "fn in_plain_file").await.unwrap();
+    fs.write(&ctx(), "/node_modules/skip.rs", "fn in_build_dir")
+        .await
+        .unwrap();
+
+    let matches = fs.grep(&ctx(), "fn", Some("/"), None).await.unwrap();
+    assert_eq!(
+        matches.len(),
+        1,
+        "only the plain file should match: {matches:?}"
+    );
+    assert_eq!(matches[0].path, "/build");
+}

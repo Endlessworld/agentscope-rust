@@ -8,6 +8,7 @@ pub mod agent_generate;
 pub mod agent_spawn;
 pub mod filesystem_tools;
 pub mod fuzzy_text_matcher;
+pub mod grep_options;
 pub mod memory_get;
 pub mod memory_save;
 pub mod memory_search;

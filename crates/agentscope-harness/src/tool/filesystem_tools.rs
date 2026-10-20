@@ -253,7 +253,11 @@ impl FilesystemTool {
                 "properties": {
                     "pattern": {"type": "string", "description": "正则表达式（支持 (?i) 等内联 flag；非法正则会回退为字面量匹配）"},
                     "path": {"type": "string", "description": "Directory or file to search; defaults to the filesystem root"},
-                    "glob": {"type": "string", "description": "Optional file-name glob filter, e.g. *.rs or **/*.java"},
+                    "glob": {"type": "string", "description": "Optional file filter glob. A pattern without / matches the file name at any depth (e.g. *.rs); a pattern containing / matches the path relative to path (e.g. src/**/*.java)"},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive pattern matching (default false)", "default": false},
+                    "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "content = matching lines (default); files_with_matches = paths only; count = matches per file", "default": "content"},
+                    "type": {"type": "string", "description": "Optional file type name (rust, python, js, ts, go, java, c, cpp, markdown, json, toml, yaml, html, css, shell). Mutually exclusive with glob"},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional list of files/dirs to search instead of path"},
                     "limit": {"type": "integer", "description": "Maximum matches to return (default/recommended: 100; hard maximum: 1000)", "default": 100}
                 },
                 "required": ["pattern"]
@@ -335,7 +339,7 @@ fn search_limit(args: &JsonMap, key: &str, default_limit: usize, max_limit: usiz
 
 /// Appends a truncation notice when `total` exceeds `limit`, mirroring the Java
 /// `FilesystemTool#appendTruncationNotice`.
-fn append_truncation_notice(output: String, total: usize, limit: usize, result_label: &str) -> String {
+pub(super) fn append_truncation_notice(output: String, total: usize, limit: usize, result_label: &str) -> String {
     if total <= limit {
         return output;
     }
@@ -474,28 +478,23 @@ impl Tool for FilesystemTool {
                 return Ok(with_diffs(ToolResultBlock::text(text), diffs));
             }
             "grep_files" => {
-                let pattern = str_arg(&args, "pattern")?;
-                let path = opt_str_arg(&args, "path");
-                let glob = opt_str_arg(&args, "glob");
+                let pattern = super::grep_options::pattern(&args)?;
+                let glob = super::grep_options::glob(&args)?;
                 let limit = search_limit(&args, "limit", 100, 1000)?;
-                match self
-                    .fs
-                    .grep(&rt, &pattern, path.as_deref(), glob.as_deref())
-                    .await
-                {
-                    Ok(matches) if matches.is_empty() => "No matches found".to_string(),
-                    Ok(matches) => {
-                        let total = matches.len();
-                        let output = matches
-                            .iter()
-                            .take(limit)
-                            .map(|m| format!("{}:{}:{}", m.path, m.line, m.text))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        append_truncation_notice(output, total, limit, "matches")
-                    }
-                    Err(e) => return Ok(ToolResultBlock::error(e.to_string())),
+                let mode = opt_str_arg(&args, "output_mode").unwrap_or_else(|| "content".into());
+                let mut matches = Vec::new();
+                for target in super::grep_options::targets(&args) {
+                    let found = match self
+                        .fs
+                        .grep(&rt, &pattern, Some(&target), glob.as_deref())
+                        .await
+                    {
+                        Ok(found) => found,
+                        Err(e) => return Ok(ToolResultBlock::error(e.to_string())),
+                    };
+                    matches.extend(found);
                 }
+                super::grep_options::format_matches(&matches, limit, &mode)
             }
             "glob_files" => {
                 let pattern = str_arg(&args, "pattern")?;

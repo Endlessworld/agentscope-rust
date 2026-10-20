@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
 
-use super::local::{build_glob_matcher, PatternMatcher};
+use super::local::{build_glob_matcher, GrepGlob, PatternMatcher};
 use super::util;
 use super::{validate_path, FileData, FileInfo, Filesystem, GrepMatch};
 use store::{BaseStore, DefaultNamespace, NamespaceFactory, StaticNamespace, StoreItem, StoreValue};
@@ -310,9 +310,7 @@ impl Filesystem for RemoteFilesystem {
         glob: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
         let normalized_path = normalize_path(path.unwrap_or("/"));
-        let glob_matcher = glob
-            .filter(|g| !g.trim().is_empty())
-            .and_then(build_glob_matcher);
+        let glob = glob.filter(|g| !g.trim().is_empty()).and_then(GrepGlob::build);
         let matcher = PatternMatcher::new(pattern);
 
         let items = self.search_all_items(ctx)?;
@@ -322,12 +320,12 @@ impl Filesystem for RemoteFilesystem {
             if !matches_path_prefix(&key, &normalized_path) {
                 continue;
             }
-            if let Some(gm) = &glob_matcher {
+            if let Some(gm) = &glob {
                 let file_name = match key.rfind('/') {
                     Some(i) => &key[i + 1..],
                     None => key.as_str(),
                 };
-                if !gm.is_match(std::path::Path::new(file_name)) {
+                if !gm.matches(&relative_to(&key, &normalized_path), file_name) {
                     continue;
                 }
             }
