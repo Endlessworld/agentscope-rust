@@ -246,3 +246,35 @@
 - **验证**：带注释+尾逗号的配置 → `model='LENIENT-MODEL'`、`base_url='https://opencode.ai/zen/v1'` 均正确；
   真语法错误仍保留原文件 + 告警。真值验证手法：用 `Start-Process -RedirectStandardInput`
   向 ACP agent 发 `initialize`+`session/new`，触发 `build_agent` 打印解析后的 base_url，比只看“无报错”可靠。
+
+## subagent 输出获取链路（`task_output` 只是其中一条）
+
+- **前台 spawn**（`background=false`）由 `AgentSpawnTool::call` 直接 `manager.invoke_agent` 返回子 agent 文本，
+  **完全不经过 TaskRepository**。
+- **后台 spawn** 走 `WorkspaceTaskRepository`：`TaskRecord` 权威落盘 `agents/<parentAgentId>/tasks/<sessionId>.json`，
+  内存 `BackgroundTask`（`Mutex<TaskInner>` + `Condvar`）只是本地覆盖层；终态写盘用 `version` 乐观锁 + 终态不可覆盖守卫。
+- **拉**：`TaskOutputTool`（`task_output`）从 `ctx.runtime["sessionId"]` 定位会话，`block` 默认 true 用 Condvar
+  阻塞（默认 30s / 上限 600s），读取后 `mark_delivered` 盖戳去重。
+- **推**：仅 `SubagentsMiddleware::on_reasoning` 做 `find_pending_deliveries` → `<system-reminder>` 追加到消息尾部，
+  且要等下游推理成功后才 `mark_delivered`（防失败丢结果）。
+- **缺口**：默认启用的 `DynamicSubagentsMiddleware` 只渲染 `## Subagents` 段 + 异步任务摘要，**不推送 delivery**，
+  所以默认配置下后台结果没人推回，模型必须自己 `task_output` 拉。
+- **坑**：`TaskOutputTool` 在 `async fn` 里用 std `Condvar` 同步阻塞，会占住 tokio worker 线程。
+
+### 复核补充（静态模式 / 超时升级 / registry 三条缺口）
+
+- **静态分支缺 3 个工具**：`disable_dynamic_subagents()` 分支只 `with_extra_tools(agent_tools)`，
+  而 `SubagentsMiddleware::get_tools()`（subagents.rs:120-124）只回 extra_tools；`TaskTool::register_all`
+  **全库无生产调用方**。故静态模式下 `task_output/task_cancel/task_list` 全不存在，只能靠 push。
+  测试 `harness_subagent_wiring_test.rs:93` 只走默认动态路径，未覆盖 `disable_dynamic_subagents`。
+- **超时升级纯属文档**：`timeout_seconds` / `timeout_promoted` 在 `crates/` 下仅出现于
+  `subagents.rs` 提示词模板（36/57/62/80 行）；`agent_spawn` schema 无 `timeout_seconds`；
+  `TaskRunSpec::Adopted` 只有 `spec.rs:28` 定义 + `workspace.rs:296` 消费，**无任何生产构造方**。
+  模板参数名也与 schema 不符：模板写 `agent_id`/`task`，schema 实为 `agent`/`prompt`。
+- **`wait_async_results` 整条链未接上**：工具本身无生产注册点（仅 `export` + 测试）；
+  `AsyncToolMiddleware` 未被 `HarnessAgent` 装配（只出现在测试），所以 `AsyncToolRegistry` 无写入方；
+  即便接上，`wait_async.rs:92-97` 读 `runtime["session_id"]`，而 `react_agent.rs:2109` 注入的是
+  `sessionId` → 永远落 `"default"`。而 `agent_spawn.rs:330` 的文案仍引导模型去调它。
+- **结论**：`crates/` 内真正被 HarnessAgent 装配的只有 `agent_spawn/agent_send/agent_list` +
+  动态分支的 `task_output/task_cancel/task_list`。`WaitAsyncResultsTool`、`TaskTool::register_all`、
+  `AgentGenerateTool`、`AsyncToolMiddleware` 均为「已实现但未接线」状态。
