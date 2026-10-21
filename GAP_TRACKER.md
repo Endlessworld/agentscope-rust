@@ -4,6 +4,7 @@ Last updated: 2026-10-21
 
 Batch 1: GAP-101 through GAP-112.
 Batch 2: GAP-201 through GAP-205, GAP-301 through GAP-303.
+Batch 3: GAP-115, GAP-302 refinement, GAP-304, GAP-305.
 
 This file tracks framework-level differences between the Rust harness and the Java
 `agentscope-harness` implementation. It is intentionally implementation-oriented:
@@ -42,7 +43,7 @@ each item names the observable behaviour, the Java reference, and the Rust statu
 | GAP-112 | `use_legacy_xml_workspace_context` propagation | `DONE` |
 | GAP-113 | At-path expansion inheritance | `MATCHES_JAVA` |
 | GAP-114 | Declared-subagent compaction/eviction/workspace-context asymmetry | `MATCHES_JAVA` |
-| GAP-115 | Subagent `disable_session_persistence` inheritance | `TODO` |
+| GAP-115 | Subagent `disable_session_persistence` inheritance | `DONE` |
 | GAP-201 | Async system-prompt hook | `DONE` |
 | GAP-202 | Middleware `order()` / priority | `DONE` |
 | GAP-203 | Full restored-state snapshot in pre-call hook | `DONE` |
@@ -51,8 +52,8 @@ each item names the observable behaviour, the Java reference, and the Rust statu
 | GAP-301 | Effective workspace for local overlay | `DONE` |
 | GAP-302 | Filesystem-specific workspace paragraph | `DONE` |
 | GAP-303 | Artifact-delivery workspace notice | `DONE` |
-| GAP-304 | Session-context OS/date/temp formatting parity | `TODO` |
-| GAP-305 | Consume or retire `use_legacy_xml_workspace_context` | `TODO` |
+| GAP-304 | Session-context OS/date/temp formatting parity | `DONE` |
+| GAP-305 | Consume or retire `use_legacy_xml_workspace_context` | `DONE` |
 
 ---
 
@@ -231,7 +232,7 @@ Status: `DONE` (propagation only)
 
 - Java propagates the flag to both child kinds.
 - Rust now does the same.
-- The flag is still not consumed by the workspace-context implementation; see GAP-305.
+- The flag is now consumed by the workspace-context implementation; see GAP-305.
 
 ### GAP-113 — At-path expansion inheritance
 
@@ -262,11 +263,11 @@ these values, update the Rust blueprint and this tracker together.
 
 ### GAP-115 — `disable_session_persistence`
 
-Status: `TODO`
+Status: `DONE`
 
 Java propagates `disableSessionPersistence` to both general-purpose and declared
-children. Rust's blueprint currently carries `state_store` but not a dedicated
-session-persistence disable flag. Needs a Rust equivalent before this can be closed.
+children. Rust now has the same builder flag, carries it in `SubagentBlueprint`, and
+applies it to both child kinds. Like Java, the flag is currently retained but inert.
 
 ---
 
@@ -343,8 +344,8 @@ Java-style branches are now rendered for:
 - composite / remote: distributed workspace wording
 - legacy: single-line working directory
 
-Additional allow-list roots are not yet available through Rust's `LocalFilesystem`
-metadata; that is a remaining content-level refinement.
+Rust's `LocalFilesystem` now supports additional allow-list roots and the local
+overlay paragraph renders them when configured.
 
 ### GAP-303 — Artifact-delivery workspace notice
 
@@ -356,22 +357,20 @@ Status: `DONE`
 
 ### GAP-304 — Session-context OS/date/temp formatting parity
 
-Status: `TODO`
+Status: `DONE`
 
-Java uses `os.name + os.version`, `EEEE MMM d, yyyy`, and `java.io.tmpdir`.
-Rust uses `OS + ARCH`, `%A %b %-d, %Y`, and `std::env::temp_dir()`. This is cosmetic
-but still a textual difference.
+- OS description now uses a best-effort `os.name + os.version` equivalent (`uname -sr`
+  on Unix, `cmd /C ver` on Windows) with an `OS + ARCH` fallback.
+- Date format already matches Java's `EEEE MMM d, yyyy`.
+- Temporary directory text now keeps a trailing separator, matching `java.io.tmpdir`.
 
 ### GAP-305 — `use_legacy_xml_workspace_context` consumption
 
-Status: `TODO`
+Status: `DONE`
 
-Both Java and Rust currently store/propagate the flag but do not appear to consume it
-in the workspace-context implementation. Decide whether to:
-
-1. implement the legacy XML rendering path,
-2. mark the flag deprecated, or
-3. remove it.
+`WorkspaceContextMiddleware` now consumes the flag: when enabled, it renders a legacy
+`<workspace_context>` XML document with `<session_context>` and `<workspace_files>`
+sections instead of the markdown + `<loaded_context>` layout.
 
 ---
 
@@ -380,7 +379,7 @@ in the workspace-context implementation. Decide whether to:
 | Check | Result |
 |---|---|
 | `cargo test -p agentscope-core --lib` | 289 passed |
-| `cargo test -p agentscope-harness --lib -- --test-threads=1` | 437 passed |
+| `cargo test -p agentscope-harness --lib -- --test-threads=1` | 441 passed |
 | `cargo test -p agentscope-harness --test harness_context_wiring_test` | 4 passed |
 | `cargo test -p agentscope-harness --test harness_agent_test` | 14 passed |
 | ACP event / session resume integration subset | all passed |

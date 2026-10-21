@@ -227,6 +227,7 @@ pub fn declared_generate_options(
 }
 
 /// Immutable snapshot of the parent build used to materialise children.
+#[derive(Clone)]
 pub struct SubagentBlueprint {
     pub model: Option<Arc<dyn Model>>,
     /// Turns a `decl.model` override id into a model (mirrors Java `Builder.modelResolver`).
@@ -276,6 +277,8 @@ pub struct SubagentBlueprint {
     /// Java propagates this to both child kinds (even though the flag is currently
     /// not consumed by the main build path).
     pub use_legacy_xml_workspace_context: bool,
+    /// Mirrors Java `capturedDisableSessionPersistence`; both child kinds inherit it.
+    pub disable_session_persistence: bool,
 }
 
 impl SubagentBlueprint {
@@ -417,6 +420,9 @@ impl LeafFactory {
         if self.blueprint.use_legacy_xml_workspace_context {
             builder = builder.use_legacy_xml_workspace_context(true);
         }
+        if self.blueprint.disable_session_persistence {
+            builder = builder.disable_session_persistence();
+        }
 
         // The following were captured only by Java's `buildGeneralPurposeFactory`.
         // Declared children keep the parent defaults, matching Java's current
@@ -536,6 +542,7 @@ mod tests {
             max_context_tokens: 8000,
             environment_memory: None,
             use_legacy_xml_workspace_context: false,
+            disable_session_persistence: false,
         })
     }
 
@@ -550,6 +557,16 @@ mod tests {
             .agent()
             .expect("the child is built with a model")
             .enable_pending_tool_recovery()
+    }
+
+    #[test]
+    fn disable_session_persistence_is_inherited() {
+        let mut blueprint = (*blueprint(false)).clone();
+        blueprint.disable_session_persistence = true;
+        let child = Arc::new(blueprint)
+            .general_purpose_leaf()
+            .build(&RuntimeContext::new());
+        assert!(child.disable_session_persistence());
     }
 
     #[test]

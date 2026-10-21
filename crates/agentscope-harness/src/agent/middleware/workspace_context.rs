@@ -7,7 +7,8 @@
 //! prepends a fresh copy to every reasoning request without persisting it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::middleware::Middleware;
@@ -93,6 +94,7 @@ pub struct WorkspaceContextMiddleware {
     disable_memory_tools: bool,
     disable_memory_hooks: bool,
     artifact_delivery_enabled: bool,
+    use_legacy_xml_workspace_context: bool,
 }
 
 impl WorkspaceContextMiddleware {
@@ -133,6 +135,7 @@ impl WorkspaceContextMiddleware {
             disable_memory_tools: false,
             disable_memory_hooks: false,
             artifact_delivery_enabled: false,
+            use_legacy_xml_workspace_context: false,
         }
     }
 
@@ -154,6 +157,12 @@ impl WorkspaceContextMiddleware {
     pub fn set_artifact_delivery_enabled(&mut self, enabled: bool) {
         self.artifact_delivery_enabled = enabled;
     }
+
+    /// Mirrors Java `useLegacyXmlWorkspaceContext`: render the workspace section as a
+    /// legacy XML document instead of the markdown + `<loaded_context>` layout.
+    pub fn set_use_legacy_xml_workspace_context(&mut self, enabled: bool) {
+        self.use_legacy_xml_workspace_context = enabled;
+    }
 }
 
 #[async_trait::async_trait]
@@ -169,6 +178,7 @@ impl Middleware for WorkspaceContextMiddleware {
             self.disable_memory_tools,
             self.disable_memory_hooks,
             self.artifact_delivery_enabled,
+            self.use_legacy_xml_workspace_context,
         )
         .await;
         let separator = if current_prompt.is_empty() || current_prompt.ends_with('\n') {
@@ -191,6 +201,7 @@ async fn build_workspace_section(
     disable_memory_tools: bool,
     disable_memory_hooks: bool,
     artifact_delivery_enabled: bool,
+    use_legacy_xml_workspace_context: bool,
 ) -> String {
     // Mirrors Java `includeMemoryContext()`: MEMORY.md is hidden only when both the
     // memory tools and the background hooks are off.
@@ -223,6 +234,17 @@ async fn build_workspace_section(
         memory_content
     };
 
+    if use_legacy_xml_workspace_context {
+        return build_legacy_xml_section(
+            &session_context,
+            &agents_content,
+            &memory_content,
+            &knowledge_block,
+            &additional_block,
+            include_memory_context,
+        );
+    }
+
     let guidance = build_guidance(disable_memory_tools, disable_memory_hooks);
     let workspace_paragraph = build_workspace_paragraph(
         workspace,
@@ -238,6 +260,53 @@ async fn build_workspace_section(
         include_memory_context,
     );
     assemble_section(&session_context, &guidance, &workspace_paragraph, &loaded_context)
+}
+
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn build_legacy_xml_section(
+    session_context: &str,
+    agents_content: &str,
+    memory_content: &str,
+    knowledge_block: &str,
+    additional_block: &str,
+    include_memory_context: bool,
+) -> String {
+    let mut sb = String::from("<workspace_context>\n");
+    sb.push_str("  <session_context>\n");
+    sb.push_str(&indent_by_two(&escape_xml(session_context)));
+    sb.push_str("\n  </session_context>\n");
+    sb.push_str("  <workspace_files>\n");
+    sb.push_str("    <agents_md>\n");
+    sb.push_str(&indent_by_two_four(&escape_xml(agents_content)));
+    sb.push_str("\n    </agents_md>\n");
+    if include_memory_context {
+        sb.push_str("    <memory_md>\n");
+        sb.push_str(&indent_by_two_four(&escape_xml(memory_content)));
+        sb.push_str("\n    </memory_md>\n");
+    }
+    sb.push_str("    <knowledge>\n");
+    sb.push_str(&indent_by_two_four(&escape_xml(knowledge_block)));
+    sb.push_str("\n    </knowledge>\n");
+    if !additional_block.trim().is_empty() {
+        sb.push_str("    <additional_files>\n");
+        sb.push_str(&indent_by_two_four(&escape_xml(additional_block)));
+        sb.push_str("\n    </additional_files>\n");
+    }
+    sb.push_str("  </workspace_files>\n");
+    sb.push_str("</workspace_context>\n");
+    sb
+}
+
+fn indent_by_two_four(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn assemble_section(
@@ -335,6 +404,21 @@ fn local_overlay(workspace: &Path, effective: &Path, fs: Option<&dyn Filesystem>
     sb.push_str("Workspace (your home base — memory, sessions, skills, runtime data): ");
     sb.push_str(&effective.to_string_lossy());
     sb.push('\n');
+    let extras: Vec<_> = local
+        .additional_roots()
+        .iter()
+        .filter(|root| root.as_path() != local.root() && root.as_path() != effective)
+        .collect();
+    if !extras.is_empty() {
+        sb.push_str("Additional roots: ");
+        for (index, root) in extras.iter().enumerate() {
+            if index > 0 {
+                sb.push_str(", ");
+            }
+            sb.push_str(&root.to_string_lossy());
+        }
+        sb.push('\n');
+    }
     sb.push_str("Path access policy: ");
     sb.push_str(describe_mode(local.mode()));
     sb.push_str(". File tools reject absolute paths outside the roots above");
@@ -456,12 +540,8 @@ fn build_session_context_section(
     environment_memory: Option<&str>,
 ) -> String {
     let today = chrono::Local::now().format("%A %b %-d, %Y").to_string();
-    let platform = format!(
-        "{} {}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
-    let temp_dir = std::env::temp_dir().display().to_string();
+    let platform = platform_description();
+    let temp_dir = java_style_temp_dir();
     let dynamic_part = build_session_dynamic_part(rc, environment_memory);
 
     SESSION_CONTEXT_SECTION_TEMPLATE
@@ -473,6 +553,51 @@ fn build_session_context_section(
         .replace("{dynamic}", &dynamic_part)
         .trim()
         .to_string()
+}
+
+/// Best-effort equivalent of Java `os.name + " " + os.version`.
+fn platform_description() -> &'static str {
+    static PLATFORM: OnceLock<String> = OnceLock::new();
+    PLATFORM
+        .get_or_init(|| {
+            #[cfg(windows)]
+            {
+                if let Ok(output) = Command::new("cmd").args(["/C", "ver"]).output() {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if let Some(start) = text.find(|c: char| c.is_ascii_digit()) {
+                        let version = text[start..]
+                            .trim_end_matches([']', ' ', '\r', '\n'])
+                            .to_string();
+                        if !version.is_empty() {
+                            return format!("Windows {version}");
+                        }
+                    }
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+            #[cfg(unix)]
+            {
+                if let Ok(output) = Command::new("uname").arg("-sr").output() {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+            format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+        })
+        .as_str()
+}
+
+/// Java's `java.io.tmpdir` commonly carries a trailing separator.
+fn java_style_temp_dir() -> String {
+    let mut text = std::env::temp_dir().display().to_string();
+    if !text.ends_with(std::path::MAIN_SEPARATOR) {
+        text.push(std::path::MAIN_SEPARATOR);
+    }
+    text
 }
 
 fn build_session_dynamic_part(rc: &RuntimeContext, environment_memory: Option<&str>) -> String {
@@ -699,6 +824,35 @@ mod tests {
     }
 
     #[test]
+    fn java_style_temp_dir_keeps_a_trailing_separator() {
+        assert!(java_style_temp_dir().ends_with(std::path::MAIN_SEPARATOR));
+        assert!(!platform_description().trim().is_empty());
+    }
+
+    #[test]
+    fn local_overlay_prompt_lists_additional_roots() {
+        let ws = std::env::temp_dir().join(format!("wctx-roots-{}", uuid::Uuid::new_v4()));
+        let extra = std::env::temp_dir().join(format!("wctx-extra-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let upper: Arc<dyn Filesystem> = Arc::new(
+            LocalFilesystem::new(ws.clone()).with_additional_roots(vec![extra.clone()]),
+        );
+        let lower: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(ws.clone()));
+        let fs: Arc<dyn Filesystem> = Arc::new(OverlayFilesystem::new(upper, lower));
+
+        let paragraph = build_workspace_paragraph(&ws, &ws, Some(fs.as_ref()), false);
+        assert!(paragraph.contains("Additional roots:"), "{paragraph}");
+        assert!(
+            paragraph.contains(&extra.to_string_lossy().to_string()),
+            "{paragraph}"
+        );
+
+        std::fs::remove_dir_all(ws).ok();
+        std::fs::remove_dir_all(extra).ok();
+    }
+
+    #[test]
     fn sandbox_prompt_includes_artifact_notice_only_when_enabled() {
         let ws = std::env::temp_dir().join(format!("wctx-sandbox-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&ws).unwrap();
@@ -724,7 +878,7 @@ mod tests {
         let wm = WorkspaceManager::new(ws.clone());
         let rc = RuntimeContext::new().with_session_id("s1");
         let section =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false)
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false, false)
                 .await;
         assert!(section.contains("AgentStateStore Context"));
         assert!(section.contains("Persona"));
@@ -744,7 +898,7 @@ mod tests {
         let rc = RuntimeContext::new().with_session_id("s1");
 
         let both_enabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false)
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false, false)
                 .await;
         assert!(both_enabled.contains("## Memory Recall"));
         assert!(both_enabled.contains("memory_save"));
@@ -753,7 +907,7 @@ mod tests {
         assert!(both_enabled.contains("remember the project conventions"));
 
         let tools_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, false, false)
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, false, false, false)
                 .await;
         assert!(!tools_disabled.contains("## Memory Recall"));
         assert!(!tools_disabled.contains("memory_save"));
@@ -763,7 +917,7 @@ mod tests {
         assert!(tools_disabled.contains("<memory_context>"));
 
         let hooks_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, true, false)
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, true, false, false)
                 .await;
         assert!(hooks_disabled.contains("## Memory Recall"));
         assert!(hooks_disabled.contains("memory_save"));
@@ -771,7 +925,7 @@ mod tests {
         assert!(hooks_disabled.contains("<memory_context>"));
 
         let both_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, true, false)
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, true, false, false)
                 .await;
         assert!(!both_disabled.contains("## Memory Recall"));
         assert!(!both_disabled.contains("memory_save"));
@@ -779,6 +933,27 @@ mod tests {
         assert!(!both_disabled.contains("<memory_context>"));
         assert!(!both_disabled.contains("remember the project conventions"));
         assert!(both_disabled.contains("AGENTS.md` and `knowledge/KNOWLEDGE.md`"));
+
+        std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_xml_workspace_context_is_used_when_enabled() {
+        let ws = std::env::temp_dir().join(format!("wctx-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "# Persona\nFriendly.").unwrap();
+        let wm = WorkspaceManager::new(ws.clone());
+        let rc = RuntimeContext::new().with_session_id("s1");
+
+        let xml = build_workspace_section(
+            &wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false, true,
+        )
+        .await;
+        assert!(xml.starts_with("<workspace_context>"), "{xml}");
+        assert!(xml.contains("<agents_md>"), "{xml}");
+        assert!(xml.contains("Persona"), "{xml}");
+        assert!(!xml.contains("<loaded_context>"), "{xml}");
+        assert!(!xml.contains("## Workspace Files"), "{xml}");
 
         std::fs::remove_dir_all(ws).ok();
     }

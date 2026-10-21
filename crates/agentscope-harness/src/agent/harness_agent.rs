@@ -81,6 +81,8 @@ pub struct HarnessAgent {
     environment: String,
     /// Whether the legacy XML workspace-context rendering was requested (stored config).
     use_legacy_xml_workspace_context: bool,
+    /// Whether `disableSessionPersistence` was requested (stored/propagated config).
+    disable_session_persistence: bool,
     /// Task repository bound to this agent (defaults to a `WorkspaceTaskRepository`).
     task_repository: Arc<dyn TaskRepository>,
     /// The embedded ReAct agent that drives the reasoning→acting loop.
@@ -149,6 +151,12 @@ impl HarnessAgent {
     /// Whether the legacy XML workspace-context rendering was requested.
     pub fn use_legacy_xml_workspace_context(&self) -> bool {
         self.use_legacy_xml_workspace_context
+    }
+
+    /// Whether `disableSessionPersistence` was requested. Mirrors Java's currently
+    /// inert flag but is retained for configuration parity.
+    pub fn disable_session_persistence(&self) -> bool {
+        self.disable_session_persistence
     }
 
     /// The task repository bound to this agent.
@@ -583,6 +591,9 @@ pub struct HarnessAgentBuilder {
     /// Exactly one history authority (default [`SessionHistoryMode::EventLog`]). Mirrors
     /// Java `HarnessAgent.Builder.sessionHistoryMode`.
     session_history_mode: SessionHistoryMode,
+    /// Mirrors Java's currently inert `disableSessionPersistence` flag. It is retained
+    /// and propagated to subagents so the configuration surface stays aligned.
+    disable_session_persistence: bool,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -664,6 +675,7 @@ impl Default for HarnessAgentBuilder {
             context_source_error: None,
             session_log_store: None,
             session_history_mode: SessionHistoryMode::EventLog,
+            disable_session_persistence: false,
         }
     }
 }
@@ -1258,6 +1270,15 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Mirrors Java `HarnessAgent.Builder.disableSessionPersistence`.
+    ///
+    /// Java currently retains this flag without consuming it in the main build path;
+    /// Rust keeps the same configuration surface and propagates it to subagents.
+    pub fn disable_session_persistence(mut self) -> Self {
+        self.disable_session_persistence = true;
+        self
+    }
+
     /// Enables agent-teams mode: attaches `TeamsMiddleware` and registers the
     /// role-clipped `team` tool. Mirrors Java `teamsMode(client, context)`.
     pub fn teams_mode(mut self, client: Arc<dyn TeamClient>, context: TeamContext) -> Self {
@@ -1385,6 +1406,7 @@ impl HarnessAgentBuilder {
             );
             ws_ctx.set_memory_flags(self.disable_memory_tools, self.disable_memory_hooks);
             ws_ctx.set_artifact_delivery_enabled(self.artifact_delivery_target.is_some());
+            ws_ctx.set_use_legacy_xml_workspace_context(self.use_legacy_xml_workspace_context);
             ws_ctx.set_additional_context_files(self.additional_context_files.clone());
             middleware.add(Box::new(ws_ctx));
         }
@@ -1761,6 +1783,7 @@ impl HarnessAgentBuilder {
                 max_context_tokens: self.max_context_tokens,
                 environment_memory: self.environment_memory.clone(),
                 use_legacy_xml_workspace_context: self.use_legacy_xml_workspace_context,
+                disable_session_persistence: self.disable_session_persistence,
             });
             // --- subagent entries ---
             let mut entries: Vec<SubagentEntry> = Vec::new();
@@ -1981,6 +2004,7 @@ impl HarnessAgentBuilder {
             async_tool_timeout: self.async_tool_timeout,
             environment,
             use_legacy_xml_workspace_context: self.use_legacy_xml_workspace_context,
+            disable_session_persistence: self.disable_session_persistence,
             task_repository: task_repo,
             agent,
             workspace_manager: Some(workspace_manager),

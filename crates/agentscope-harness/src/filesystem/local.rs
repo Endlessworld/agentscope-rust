@@ -195,6 +195,9 @@ pub struct LocalFilesystem {
     root: PathBuf,
     mode: LocalFsMode,
     max_file_size: usize,
+    /// Extra absolute roots accepted in [`LocalFsMode::Rooted`], mirroring Java
+    /// `LocalFilesystemSpec.additionalRoots`.
+    additional_roots: Vec<PathBuf>,
 }
 impl LocalFilesystem {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -221,6 +224,7 @@ impl LocalFilesystem {
             root,
             mode,
             max_file_size: max_file_size_mb * 1024 * 1024,
+            additional_roots: Vec::new(),
         }
     }
 
@@ -230,6 +234,28 @@ impl LocalFilesystem {
 
     pub fn mode(&self) -> LocalFsMode {
         self.mode
+    }
+
+    /// Adds absolute allow-list roots accepted in [`LocalFsMode::Rooted`].
+    pub fn with_additional_roots(
+        mut self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        self.additional_roots = roots
+            .into_iter()
+            .map(|root| {
+                if root.is_absolute() {
+                    lexical_normalize(&root)
+                } else {
+                    lexical_normalize(&std::env::current_dir().unwrap_or_default().join(root))
+                }
+            })
+            .collect();
+        self
+    }
+
+    pub fn additional_roots(&self) -> &[PathBuf] {
+        &self.additional_roots
     }
 
     fn resolve(&self, _ctx: &RuntimeContext, path: &str) -> Result<PathBuf> {
@@ -257,7 +283,12 @@ impl LocalFilesystem {
             LocalFsMode::Rooted => {
                 if p.is_absolute() {
                     let canonical = lexical_normalize(p);
-                    if canonical.starts_with(&self.root) {
+                    if canonical.starts_with(&self.root)
+                        || self
+                            .additional_roots
+                            .iter()
+                            .any(|root| canonical.starts_with(root))
+                    {
                         Ok(canonical)
                     } else {
                         Err(Error::Tool(format!("Path outside root: {path}")))
