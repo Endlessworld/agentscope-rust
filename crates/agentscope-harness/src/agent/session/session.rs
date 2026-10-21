@@ -650,13 +650,9 @@ async fn launch(
         return Err(error);
     }
 
-    // Guidance accepted before this run starts is applied once (see the module scope note).
-    if let Err(error) = execution.before_step(&recorder, &mut working).await {
-        inbox.reject(&command, &error.to_string()).await?;
-        recorder.close().await;
-        return Err(error);
-    }
-
+    // Guidance accepted before this run starts is folded in by the agent loop's step boundary
+    // (Java `reasoning` is the only caller of `beforeStep`), so the launch path must not apply
+    // it a second time.
     let mut inputs = execution.inputs().to_vec();
     if inputs.is_empty() {
         inputs = working.context.clone();

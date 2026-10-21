@@ -195,6 +195,12 @@ impl BaseStore for JdbcStore {
         }
     }
 
+    /// Conditional row update / insert-if-absent: atomic in the database (Java
+    /// `supportsAtomicSessionStorage`).
+    fn supports_atomic_session_storage(&self) -> bool {
+        true
+    }
+
     fn search(&self, namespace: &[String], limit: usize, offset: usize) -> Vec<StoreItem> {
         if limit == 0 {
             return Vec::new();

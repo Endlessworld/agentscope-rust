@@ -380,6 +380,12 @@ impl BaseStore for RedisStore {
         }
     }
 
+    /// `put_if_version` runs as one server-side script, so the compare and the write cannot
+    /// interleave (Java `supportsAtomicSessionStorage`).
+    fn supports_atomic_session_storage(&self) -> bool {
+        true
+    }
+
     fn search(&self, namespace: &[String], limit: usize, offset: usize) -> Vec<StoreItem> {
         if limit == 0 {
             return Vec::new();

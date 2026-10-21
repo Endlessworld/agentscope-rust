@@ -6,8 +6,14 @@
 
 pub mod answer;
 pub mod session;
+#[cfg(feature = "rusqlite")]
+pub mod sqlite;
 pub mod storage;
+pub mod store;
 
 pub use answer::{SessionAnswer, SessionConfirm};
 pub use session::{AgentSession, InputReceipt, Task};
+#[cfg(feature = "rusqlite")]
+pub use sqlite::SqliteSessionStorage;
 pub use storage::{WorkspaceSessionLogStore, WorkspaceSessionStorage};
+pub use store::StoreSessionStorage;

@@ -54,6 +54,16 @@ pub trait BaseStore: Send + Sync {
         false
     }
 
+    /// Declares whether [`BaseStore::put_if_version`] is genuinely atomic in this deployment.
+    ///
+    /// The session journal relies on compare-and-set being atomic across *all* writers
+    /// sharing the namespace: a false negative only refuses journal use on this store, while
+    /// a false positive would silently break the single-writer guarantee. The default is
+    /// therefore `false`, and backends whose conditional write is a real CAS must opt in.
+    fn supports_atomic_session_storage(&self) -> bool {
+        false
+    }
+
     /// Searches for items within a namespace with pagination, ordered by key.
     fn search(&self, namespace: &[String], limit: usize, offset: usize) -> Vec<StoreItem>;
 
@@ -153,6 +163,12 @@ impl BaseStore for InMemoryStore {
             return false;
         }
         guard.insert(ck, StoreItem::new(key, value, current_version + 1));
+        true
+    }
+
+    /// `put_if_version` compares and swaps under one mutex guard, so it is a real CAS for
+    /// every writer that reaches this store instance.
+    fn supports_atomic_session_storage(&self) -> bool {
         true
     }
 

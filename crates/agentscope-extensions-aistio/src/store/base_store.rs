@@ -151,6 +151,12 @@ impl BaseStore for ControlPlaneBaseStore {
         }
     }
 
+    /// `put_if_version` is a single conditional record write, so it is atomic across every
+    /// writer sharing the store (Java `supportsAtomicSessionStorage`).
+    fn supports_atomic_session_storage(&self) -> bool {
+        true
+    }
+
     fn search(&self, namespace: &[String], limit: usize, offset: usize) -> Vec<StoreItem> {
         let path = format!(
             "/api/v1/dp/kv/search?{}{}&limit={}&offset={}",
