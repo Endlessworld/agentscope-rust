@@ -469,15 +469,8 @@ impl ModelConfig {
 
         // 2. 从 providers 中查找
         if let Some(provider) = self.providers.get(&provider_name) {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| provider.api_key.clone());
-
-            let base_url = std::env::var("OPENAI_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| provider.base_url.clone());
+            let api_key = resolve_api_key(&provider_name, &provider.api_key);
+            let base_url = resolve_base_url(&provider_name, &provider.base_url);
 
             let protocol = protocol_for(&provider.models, &model_id);
             tracing::info!(
@@ -547,14 +540,8 @@ impl ModelConfig {
         for key in keys {
             let provider = &self.providers[key];
             if provider.models.contains(bare) || provider.models.contains(model_id) {
-                let api_key = std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| provider.api_key.clone());
-                let base_url = std::env::var("OPENAI_BASE_URL")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| provider.base_url.clone());
+                let api_key = resolve_api_key(key, &provider.api_key);
+                let base_url = resolve_base_url(key, &provider.base_url);
                 let protocol = protocol_for(&provider.models, bare);
                 tracing::info!(
                     "model-config: resolve_model '{model_id}' -> provider='{key}' \
@@ -832,6 +819,63 @@ fn protocol_for(models: &ModelsSpec, model_id: &str) -> ApiProtocol {
         .unwrap_or(ApiProtocol::ChatCompletions)
 }
 
+/// Reads an override from the environment, treating unset/blank as absent.
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Masks a secret for logs (`oc_s...FBM5`), keeping only enough to identify it.
+fn mask_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 8 {
+        return "***".to_string();
+    }
+    let head: String = chars.iter().take(4).collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
+}
+
+/// Resolves a provider's api key, letting `OPENAI_API_KEY` override the config file.
+///
+/// A globally exported key silently taking precedence over `models.json` is a common
+/// source of confusing 401s, so the override is called out in the log (and stderr).
+fn resolve_api_key(provider_name: &str, configured: &str) -> String {
+    let Some(key) = env_override("OPENAI_API_KEY") else {
+        return configured.to_string();
+    };
+    if key != configured {
+        tracing::warn!(
+            "model-config: OPENAI_API_KEY overrides provider '{provider_name}' api_key \
+             (env={}, config={})",
+            mask_secret(&key),
+            mask_secret(configured),
+        );
+        eprintln!(
+            "[model-config] warning: OPENAI_API_KEY is set and overrides the api_key \
+             configured for provider '{provider_name}' (using env key {}); unset it or \
+             update it to use the provider key",
+            mask_secret(&key),
+        );
+    }
+    key
+}
+
+/// Resolves a provider's base URL, letting `OPENAI_BASE_URL` override the config file.
+fn resolve_base_url(provider_name: &str, configured: &str) -> String {
+    let Some(url) = env_override("OPENAI_BASE_URL") else {
+        return configured.to_string();
+    };
+    if url.trim_end_matches('/') != configured.trim_end_matches('/') {
+        tracing::warn!(
+            "model-config: OPENAI_BASE_URL overrides provider '{provider_name}' base_url \
+             (env='{url}', config='{configured}')"
+        );
+    }
+    url
+}
+
 /// 构建一个绑定指定 cwd 的完整 `HarnessAgent`（文件系统工具 + shell + 压缩 + skills）。
 ///
 /// 模型配置通过 `$HOME/.agentscope/models.json` 管理：
@@ -863,17 +907,18 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     );
 
     eprintln!(
-        "[model-config] using provider model='{}', base_url='{}', api_key='{}...', protocol='{}'",
+        "[model-config] using provider model='{}', base_url='{}', api_key='{}', protocol='{}'",
         model_id,
         base_url,
-        &api_key[..api_key.len().min(8)],
+        mask_secret(&api_key),
         protocol.label(),
     );
     tracing::info!(
-        "model-config: build_agent model='{}' base_url='{}' protocol={}",
+        "model-config: build_agent model='{}' base_url='{}' protocol={} api_key={}",
         model_id,
         base_url,
-        protocol.label()
+        protocol.label(),
+        mask_secret(&api_key)
     );
 
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。

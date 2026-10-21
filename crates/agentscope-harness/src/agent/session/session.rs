@@ -36,6 +36,7 @@ pub struct Task {
     pub turn_id: String,
     pub run_id: Option<String>,
     pub status: String,
+    /// The failure detail persisted with `run/end`, when the task failed.
     pub error: Option<String>,
 }
 
@@ -518,6 +519,7 @@ impl AgentSession {
         let head = self.log.head().await?;
         let mut run: Option<String> = None;
         let mut status = "queued".to_string();
+        let mut error: Option<String> = None;
         for event in self.log.scan(0, head.seq).await? {
             let records_start = event.event_type == "inbox/started"
                 && event
@@ -533,20 +535,28 @@ impl AgentSession {
             if records_start {
                 run = event.execution_run_id.clone();
                 status = "running".into();
+                error = None;
             }
             if let Some(run_id) = &run {
                 if event.execution_run_id.as_deref() == Some(run_id.as_str())
                     && event.event_type == "run/end"
                 {
-                    status = event
-                        .data()
-                        .ok()
+                    let data = event.data().ok();
+                    status = data
+                        .as_ref()
                         .and_then(|d| {
                             d.get("status")
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string)
                         })
                         .unwrap_or_else(|| "completed".into());
+                    // `run/end` carries the failure detail persisted by the runtime;
+                    // surfacing it turns "run failed" into the actual provider/tool error.
+                    error = data
+                        .as_ref()
+                        .and_then(|d| d.get("error"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                 }
             }
         }
@@ -566,6 +576,7 @@ impl AgentSession {
             let owns = run.as_deref() == head.owner.as_deref() && head.lease_until > now_millis();
             if !owns {
                 status = "interrupted".into();
+                error = None;
             }
         }
         Ok(Task {
@@ -573,7 +584,7 @@ impl AgentSession {
             turn_id: command.turn_id.clone().unwrap_or_default(),
             run_id: run,
             status,
-            error: None,
+            error,
         })
     }
 }
@@ -784,6 +795,9 @@ async fn launch(
         Err(agentscope_core::Error::Interrupted(_)) => "interrupted",
         Err(_) => "failed",
     };
+    // Keep the failure detail with the terminal facts so receipts (ACP, host views)
+    // can report the actual cause instead of a bare status.
+    let detail = result.as_ref().err().map(|error| error.to_string());
     if let Ok(Some(message)) = &result {
         let _ = recorder.result(Some(message));
     }
@@ -794,15 +808,17 @@ async fn launch(
         Some(react) => react.state_handle().lock().unwrap().clone(),
         None => working.clone(),
     };
-    let finish = recorder.finish(&final_state, status).await;
+    let finish = recorder
+        .finish_with_error(&final_state, status, detail.as_deref())
+        .await;
     let _ = execution.close(&recorder).await;
 
     {
         let mut guard = state.lock().unwrap();
         guard.active_command = None;
         guard.active_run = None;
-        if let Err(error) = &result {
-            guard.error = Some(error.to_string());
+        if let Some(error) = &detail {
+            guard.error = Some(error.clone());
         }
     }
 

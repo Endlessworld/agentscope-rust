@@ -40,6 +40,130 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     base
 }
 
+/// Fails the run immediately, like an expired provider API key.
+struct FailingModel;
+
+#[async_trait::async_trait]
+impl Model for FailingModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        Box::pin(futures::stream::once(async {
+            Err(agentscope_core::error::Error::Model(
+                "api_key_expired: This API key has expired".into(),
+            ))
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "failing"
+    }
+}
+
+/// Fails once, then answers normally.
+struct FailOnceModel {
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Model for FailOnceModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        let failed = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0;
+        Box::pin(futures::stream::once(async move {
+            if failed {
+                Err(agentscope_core::error::Error::Agent(
+                    "api_key_expired: This API key has expired".into(),
+                ))
+            } else {
+                Ok(ChatResponse::builder()
+                    .content(vec![CoreBlock::Text(TextBlock::new("recovered"))])
+                    .build())
+            }
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "fail-once"
+    }
+}
+
+#[tokio::test]
+async fn a_submit_after_a_failed_run_starts() {
+    let dir = temp_dir("after_failure");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(FailOnceModel {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-retry");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-retry").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+
+    let failed = session.submit("fail please").await.unwrap();
+    let failed = session.await_task(&failed.command_id).await.unwrap();
+    assert_eq!(failed.status, "failed", "{failed:?}");
+
+    // A failed turn is terminal: the next submission must start a new run instead of
+    // waiting for the failed turn to continue.
+    let retry = session.submit("try again").await.unwrap();
+    let retry = session.await_task(&retry.command_id).await.unwrap();
+    assert_eq!(retry.status, "completed", "{retry:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_failed_run_carries_its_error_on_the_task_receipt() {
+    let dir = temp_dir("failed_receipt");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(FailingModel))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-fail");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-fail").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+
+    let task = session.submit("fail please").await.unwrap();
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert_eq!(settled.status, "failed", "{settled:?}");
+    let error = settled
+        .error
+        .expect("a failed task must carry its failure detail");
+    assert!(error.contains("api_key_expired"), "{error}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 async fn open_session(tag: &str, reply: &'static str) -> (AgentSession, std::path::PathBuf) {
     let dir = temp_dir(tag);
     let agent = Arc::new(

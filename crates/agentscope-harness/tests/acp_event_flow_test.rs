@@ -153,3 +153,80 @@ async fn thinking_and_tool_call_reach_client() {
         "the tool output must be reported, got {updates:?}"
     );
 }
+
+/// A model that fails before producing any output, like an expired API key.
+struct FailingModel;
+
+#[async_trait::async_trait]
+impl Model for FailingModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        Box::pin(futures::stream::once(async {
+            Err(agentscope_core::error::Error::Agent(
+                "api_key_expired: This API key has expired".into(),
+            ))
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "failing"
+    }
+}
+
+#[tokio::test]
+async fn failed_run_reports_the_actual_error() {
+    let model: Arc<dyn Model> = Arc::new(FailingModel);
+    let agent = HarnessAgent::builder()
+        .name("acp-failure")
+        .model(model)
+        .max_iters(2)
+        .build();
+
+    let mut session = AcpAgentSession::new(
+        SessionId::new("s-failure"),
+        std::env::temp_dir(),
+        agent,
+        vec![],
+        vec![],
+    );
+
+    let chunks: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chunks_c = Arc::clone(&chunks);
+    let stop = session
+        .run_prompt(
+            vec![ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("do it"),
+            )],
+            move |n: SessionNotification| {
+                if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
+                    if let ContentBlock::Text(text) = chunk.content {
+                        chunks_c.lock().unwrap().push(text.text);
+                    }
+                }
+            },
+        )
+        .await;
+
+    assert_eq!(
+        stop,
+        agent_client_protocol::schema::v1::StopReason::Refusal,
+        "a failed run must stop with refusal"
+    );
+    let text = chunks.lock().unwrap().join("\n");
+    assert!(
+        text.contains("api_key_expired"),
+        "the provider failure detail must reach the client, got {text:?}"
+    );
+    assert!(
+        !text.contains("run failed"),
+        "the generic fallback must not hide the actual error, got {text:?}"
+    );
+    assert!(
+        !text.contains("Agent error: Agent error:"),
+        "the error prefix must not be duplicated, got {text:?}"
+    );
+}

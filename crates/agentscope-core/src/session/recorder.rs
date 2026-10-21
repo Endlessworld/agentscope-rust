@@ -615,17 +615,31 @@ impl SessionRecorder {
     }
 
     /// Records the terminal turn/run facts and releases the writer lease.
-    pub async fn finish(
+    pub async fn finish(&self, state: &AgentState, status: &str) -> crate::error::Result<()> {
+        self.finish_with_error(state, status, None).await
+    }
+
+    /// Records the terminal turn/run facts and releases the writer lease.
+    ///
+    /// `error` is persisted on `turn/*` and `run/end`, so a failed run can report the
+    /// provider/tool failure message instead of a generic "run failed" later on.
+    pub async fn finish_with_error(
         &self,
         state: &AgentState,
         status: &str,
+        error: Option<&str>,
     ) -> crate::error::Result<()> {
-        let result = self.finish_inner(state, status).await;
+        let result = self.finish_inner(state, status, error).await;
         self.close().await;
         result
     }
 
-    async fn finish_inner(&self, state: &AgentState, status: &str) -> crate::error::Result<()> {
+    async fn finish_inner(
+        &self,
+        state: &AgentState,
+        status: &str,
+        error: Option<&str>,
+    ) -> crate::error::Result<()> {
         self.capture_state(state, &format!("run_{status}"))?;
         let (result_json, result_reason, result_status, step_id) = {
             let mut guard = self.lock();
@@ -652,7 +666,13 @@ impl SessionRecorder {
                 )?;
             }
         }
-        let outcome_payload = serde_json::json!({ "status": terminal, "reason": result_reason });
+        let outcome_payload = {
+            let mut payload = serde_json::json!({ "status": terminal, "reason": result_reason });
+            if let Some(error) = error.filter(|error| !error.is_empty()) {
+                payload["error"] = serde_json::Value::String(error.to_string());
+            }
+            payload
+        };
         if let Some(step_id) = step_id {
             self.append(
                 "step/end",

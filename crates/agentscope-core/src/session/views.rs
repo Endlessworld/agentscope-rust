@@ -37,8 +37,11 @@ pub struct Turn {
 
 impl Turn {
     /// Whether the turn can no longer be continued.
+    ///
+    /// A failed run is terminal: there is nothing to resume, so the next submit must be
+    /// allowed to start instead of waiting for the failed turn forever.
     pub fn ended(&self) -> bool {
-        self.status == "completed" || self.status == "cancelled"
+        self.status == "completed" || self.status == "cancelled" || self.status == "failed"
     }
 }
 
@@ -698,6 +701,29 @@ mod tests {
             &[
                 event(1, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
                 event(2, "turn/cancelled", None, Some("t1"), serde_json::json!({})),
+            ],
+        )
+        .await;
+        let turns = SessionTurns::read(&*log).await.unwrap();
+        assert!(turns.latest().unwrap().ended());
+    }
+
+    #[tokio::test]
+    async fn failed_turns_are_terminal() {
+        let (_storage, log, writer) = journal().await;
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(1, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
+                event(
+                    2,
+                    "run/end",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "status": "failed" }),
+                ),
             ],
         )
         .await;

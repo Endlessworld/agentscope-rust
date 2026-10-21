@@ -1131,10 +1131,20 @@ impl AcpAgentSession {
 
         if let Some(current) = &settled_task {
             if current.status == "failed" {
+                // Prefer the error persisted with `run/end`; older journals (and a run
+                // that settled between the last poll and the terminal write) may only
+                // have the in-memory dispatch error.
                 let detail = current
                     .error
                     .clone()
+                    .or_else(|| session.execution_error())
                     .unwrap_or_else(|| "run failed".to_string());
+                // Core errors may already carry the `Agent error:` prefix (possibly more
+                // than once through wrapping); keep exactly one.
+                let mut detail = detail.as_str();
+                while let Some(rest) = detail.strip_prefix("Agent error: ") {
+                    detail = rest;
+                }
                 emit(super::event::message_chunk(
                     self.session_id.clone(),
                     format!("Agent error: {detail}"),

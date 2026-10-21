@@ -600,8 +600,14 @@ impl ReActAgent {
                     } else {
                         "failed"
                     };
+                    // Persist the failure detail with the terminal facts so a host reading
+                    // the run receipt reports the real cause, not just "run failed".
+                    let detail = result.as_ref().err().map(|error| error.to_string());
                     let state = this.core.state.lock().unwrap().clone();
-                    if let Err(error) = recorder.finish(&state, status).await {
+                    if let Err(error) = recorder
+                        .finish_with_error(&state, status, detail.as_deref())
+                        .await
+                    {
                         // Persistence failures must be visible, never silently downgraded.
                         tracing::warn!("failed to close session journal: {error}");
                     }
