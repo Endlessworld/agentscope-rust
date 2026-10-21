@@ -12,6 +12,7 @@ use agentscope_core::agent::StreamOptions;
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::state::{AgentState, AgentStateStore, JsonFileAgentStateStore};
+use agentscope_core::session::SessionHistoryMode;
 use agentscope_harness::agent::HarnessAgent;
 use futures::StreamExt;
 
@@ -99,6 +100,7 @@ async fn resume_prunes_duplicated_tool_result_before_model_call() {
     let agent = HarnessAgent::builder()
         .name("resume-dangling")
         .model(model)
+        .session_history_mode(SessionHistoryMode::Legacy)
         .state_store(Arc::clone(&store))
         .session_id("sess-broken")
         .build();

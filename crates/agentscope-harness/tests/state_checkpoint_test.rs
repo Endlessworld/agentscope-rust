@@ -8,6 +8,7 @@ use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::state::{AgentStateStore, JsonFileAgentStateStore};
 use agentscope_core::Agent;
+use agentscope_core::session::SessionHistoryMode;
 use agentscope_harness::agent::HarnessAgent;
 
 /// A scripted model that always answers "done".
@@ -61,6 +62,7 @@ async fn checkpoint_persists_and_resumes_across_restart() {
     let agent1 = HarnessAgent::builder()
         .name("ckpt")
         .model(Arc::new(ScriptedModel))
+        .session_history_mode(SessionHistoryMode::Legacy)
         .state_store(Arc::clone(&store_arc))
         .session_id("sess-ckpt")
         .user_id("alice")
@@ -91,6 +93,7 @@ async fn checkpoint_persists_and_resumes_across_restart() {
     let agent2 = HarnessAgent::builder()
         .name("ckpt")
         .model(Arc::new(ScriptedModel))
+        .session_history_mode(SessionHistoryMode::Legacy)
         .state_store(Arc::clone(&store_arc))
         .session_id("sess-ckpt")
         .user_id("alice")
@@ -127,6 +130,7 @@ async fn checkpoint_saves_after_every_run() {
     let agent = HarnessAgent::builder()
         .name("ckpt-multi")
         .model(Arc::new(ScriptedModel))
+        .session_history_mode(SessionHistoryMode::Legacy)
         .state_store(Arc::clone(&store))
         .session_id("sess-multi")
         .max_iters(3)

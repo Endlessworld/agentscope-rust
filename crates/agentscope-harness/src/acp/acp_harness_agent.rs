@@ -96,7 +96,6 @@ use agentscope_core::model::{GenerateOptions, Model};
 use agentscope_extensions_model::{
     AnthropicMessagesModel, OpenAiChatModel, OpenAiResponsesModel,
 };
-use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::{config::default_modes, AcpAgentSession, AcpCodingAgent};
 use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::acp::config::ModelChoice;
@@ -903,13 +902,12 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         })
         .cwd(cwd.clone())
         .workspace(workspace)
-        // 会话状态持久化：以 ACP sessionId 为恢复键，每次运行后把完整 AgentState
-        // （对话历史 / task / plan 状态）原子写入 {cwd}/.agentscope/state。进程重启后
-        // 客户端用同一 sessionId 发 session/load|resume，即可续接之前的对话。
+        // 会话历史以 **journal 为唯一权威**（对齐 Java native session）：`session_id` 既是
+        // journal 的会话键，也是恢复键。进程重启后客户端用同一 sessionId 发
+        // `session/load|resume`，运行时用 `SessionProjection::restore()` 从已提交事实恢复
+        // 对话历史 / task / plan 状态，因此不再需要额外挂 `AgentStateStore`（那是 Java 的
+        // legacy 模式和沙箱元数据才用的第二条轨）。
         .session_id(session_id)
-        .state_store(Arc::new(JsonFileAgentStateStore::new(
-            cwd.join(".agentscope").join("state"),
-        )))
         .sys_prompt(build_system_prompt(&cwd))
         // 任务投影：每步把已提交的 todo / 需求 / 已验证项投影成 `<TASK_STATE>` 视图，并让
         // 上下文编译器产出 manifest（预算、transforms、taskRevision）；没有注册 source，

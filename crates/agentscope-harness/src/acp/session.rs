@@ -1104,9 +1104,28 @@ impl AcpAgentSession {
             // The ACP cancel flag is the only client-facing cancellation, so stop the run and
             // close its turn: an interrupted turn stays open in the journal (only
             // `completed`/`cancelled` end one), and the next prompt must be able to submit.
-            let _ = session.interrupt().await;
-            let _ = session.await_task(&task.command_id).await;
-            let _ = agentscope_core::session::cancel_pending(session.log(), &task.turn_id).await;
+            //
+            // Signal the agent directly, not only through the session: `AgentSession::interrupt`
+            // needs the journal to already carry a run id, so a prompt cancelled while the
+            // dispatcher is still admitting it would otherwise never reach the run at all.
+            self.agent.interrupt();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let _ = session.interrupt().await;
+                match session.task(&task.command_id).await {
+                    Ok(current) if current.settled() => break,
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+
+            let log = session.log();
+            let turn_id = task.turn_id.clone();
+            tokio::spawn(async move {
+                // Waiting here would hold the prompt open for as long as the run's writer
+                // lease lasts; the turn must be closed either way, just not on this path.
+                let _ = agentscope_core::session::cancel_pending(log, &turn_id).await;
+            });
             return StopReason::Cancelled;
         }
 

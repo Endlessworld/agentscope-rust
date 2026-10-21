@@ -1,10 +1,12 @@
 //! End-to-end "restart then resume" test for the ACP CodingAgent.
 //!
-//! Mirrors the persistence wiring of `src/acp/acp_harness_agent.rs`: the session
-//! factory maps the ACP session id onto the harness agent's `session_id` and
-//! attaches a `JsonFileAgentStateStore`. A restarted process (fresh registry,
-//! fresh agent) that receives `session/load` with the same id must therefore
-//! restore the prior conversation instead of starting empty.
+//! Native sessions restore **only from their journal** (Java
+//! `HarnessAgent`: "Native sessions restore only from their journal"), so the
+//! session factory here attaches no `AgentStateStore`: the ACP session id is
+//! mapped onto the harness agent's `session_id`, which is the journal key. A
+//! restarted process (fresh registry, fresh agent) that receives `session/load`
+//! with the same id must restore the prior conversation from committed facts,
+//! not from a snapshot.
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +18,6 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, Channel, Client, ConnectionTo};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::state::JsonFileAgentStateStore;
 use agentscope_harness::acp::AcpCodingAgent;
 use agentscope_harness::agent::HarnessAgent;
 
@@ -52,10 +53,11 @@ impl Model for RecordingModel {
 }
 
 /// Session factory carrying the same persistence wiring as the
-/// `acp_harness_agent` binary. A fresh store instance per session models a
-/// restarted process.
+/// `acp_harness_agent` binary: identity for the journal, no state store. A
+/// fresh agent per session models a restarted process; only the journal on disk
+/// survives.
 fn session_factory(
-    state_root: PathBuf,
+    root: PathBuf,
     seen: Arc<Mutex<Vec<Vec<String>>>>,
 ) -> impl Fn(PathBuf, &str) -> HarnessAgent + Send + Sync + 'static {
     move |_cwd, session_id| {
@@ -64,8 +66,11 @@ fn session_factory(
             .model(Arc::new(RecordingModel {
                 seen: Arc::clone(&seen),
             }))
+            // The journal key. Nothing else is persisted explicitly: history comes
+            // from committed facts under the workspace's session namespace.
             .session_id(session_id)
-            .state_store(Arc::new(JsonFileAgentStateStore::new(state_root.clone())))
+            .cwd(root.clone())
+            .workspace(root.join(".agentscope").join("workspace"))
             // Memory hooks are disabled in the binary too; keeping them out here
             // makes each turn exactly one reasoning call and keeps the test from
             // writing into a shared memory ledger.
@@ -77,16 +82,16 @@ fn session_factory(
 
 #[tokio::test]
 async fn session_load_after_restart_resumes_conversation() {
-    let state_root =
+    let root =
         std::env::temp_dir().join(format!("agentscope_acp_resume_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_root);
-    std::fs::create_dir_all(&state_root).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // ---- Process 1: open a session and take one turn (state is saved). ----
     let (agent_channel, client_channel) = Channel::duplex();
     let agent = AcpCodingAgent::builder()
-        .model_factory(session_factory(state_root.clone(), Arc::clone(&seen)))
+        .model_factory(session_factory(root.clone(), Arc::clone(&seen)))
         .build()
         .expect("build AcpCodingAgent");
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
@@ -125,7 +130,7 @@ async fn session_load_after_restart_resumes_conversation() {
     // ---- Process 2 (restart): fresh agent, empty registry, same id ----
     let (agent_channel, client_channel) = Channel::duplex();
     let agent = AcpCodingAgent::builder()
-        .model_factory(session_factory(state_root.clone(), Arc::clone(&seen)))
+        .model_factory(session_factory(root.clone(), Arc::clone(&seen)))
         .build()
         .expect("build AcpCodingAgent");
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
@@ -175,5 +180,5 @@ async fn session_load_after_restart_resumes_conversation() {
         "restored history must reach the model after restart, got: {run2:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&state_root);
+    let _ = std::fs::remove_dir_all(&root);
 }

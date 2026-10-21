@@ -11,6 +11,7 @@ use agentscope_core::agent::StreamOptions;
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::state::{AgentState, AgentStateStore, ConflictPolicy, InMemoryAgentStateStore};
+use agentscope_core::session::SessionHistoryMode;
 use agentscope_harness::agent::HarnessAgent;
 
 /// A model that always answers with a fixed text block.
@@ -44,6 +45,7 @@ fn agent(
     HarnessAgent::builder()
         .name("policy")
         .model(Arc::new(ScriptedModel))
+        .session_history_mode(SessionHistoryMode::Legacy)
         .state_store(store)
         .session_id(session)
         .conflict_policy(policy)

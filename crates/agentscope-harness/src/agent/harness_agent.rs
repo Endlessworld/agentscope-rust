@@ -1706,11 +1706,18 @@ impl HarnessAgentBuilder {
                 } else {
                     DEFAULT_MAX_ITERS
                 },
-                state_store: self.state_store.clone().or_else(|| {
-                    self.distributed_store
-                        .as_ref()
-                        .and_then(|d| d.agent_state_store.clone())
-                }),
+                state_store: if self.session_history_mode == SessionHistoryMode::Legacy {
+                    self.state_store.clone().or_else(|| {
+                        self.distributed_store
+                            .as_ref()
+                            .and_then(|d| d.agent_state_store.clone())
+                    })
+                } else {
+                    // EventLog children recover from the journal like their parent; handing
+                    // them a snapshot store would configure a second history authority that
+                    // `build()` correctly ignores, which only invites confusion.
+                    None
+                },
                 enable_pending_tool_recovery: self.enable_pending_tool_recovery.unwrap_or(false),
             });
             // --- subagent entries ---
@@ -1809,18 +1816,25 @@ impl HarnessAgentBuilder {
 
         // ---- State checkpoint: persist/restore the full AgentState ----
         // Effective store: explicit `state_store` wins over `distributed_store`'s.
+        //
+        // Exactly one history authority. In [`SessionHistoryMode::EventLog`] the journal owns
+        // recovery, so a snapshot store must not also write state: two writers that disagree
+        // after a crash make the reader pick a winner it cannot verify (Java keeps the same
+        // rule — `if (legacySessionHistory) inner.stateStore(...)`).
         let state_store = self.state_store.clone().or_else(|| {
             self.distributed_store
                 .as_ref()
                 .and_then(|d| d.agent_state_store.clone())
         });
-        if let Some(store) = &state_store {
-            // Added last -> outermost: restore runs before (and save after) all
-            // inner middlewares (compaction, plan mode, …).
-            middleware.add(Box::new(StateCheckpointMiddleware::with_conflict_policy(
-                Arc::clone(store),
-                self.conflict_policy,
-            )));
+        if self.session_history_mode == SessionHistoryMode::Legacy {
+            if let Some(store) = &state_store {
+                // Added last -> outermost: restore runs before (and save after) all
+                // inner middlewares (compaction, plan mode, …).
+                middleware.add(Box::new(StateCheckpointMiddleware::with_conflict_policy(
+                    Arc::clone(store),
+                    self.conflict_policy,
+                )));
+            }
         }
 
         // The compiler is registered last on purpose: the chain wraps in reverse, so the last

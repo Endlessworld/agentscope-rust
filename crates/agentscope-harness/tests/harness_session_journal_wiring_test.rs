@@ -155,6 +155,41 @@ async fn a_caller_supplied_store_is_used_instead_of_the_workspace_default() {
 }
 
 #[tokio::test]
+async fn event_log_mode_writes_no_state_snapshot() {
+    // Exactly one history authority. A configured store must not be installed as a second
+    // writer while the journal owns recovery: two writers that disagree after a crash would
+    // leave the reader picking a winner it cannot verify (Java gates this on
+    // `legacySessionHistory` for the same reason).
+    let dir = temp_dir("single-authority");
+    let store = Arc::new(agentscope_core::state::InMemoryAgentStateStore::new());
+    let agent = HarnessAgent::builder()
+        .name("single-authority")
+        .model(Arc::new(FixedModel {
+            reply: "done".into(),
+            calls: Arc::new(Mutex::new(0)),
+        }))
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
+        .session_id("s-single")
+        .user_id("alice")
+        .max_iters(1)
+        .state_store(Arc::clone(&store) as Arc<dyn agentscope_core::state::AgentStateStore>)
+        .build();
+
+    // The default mode journals...
+    assert!(agent.session_key(&ctx()).is_some());
+    CallableAgent::call(&agent, vec![Msg::user("hi")])
+        .await
+        .expect("agent call");
+    // ...and the store stayed untouched, so a restart recovers from the journal alone.
+    assert_eq!(
+        store.get_session_count(),
+        0,
+        "the snapshot store must not be written while the journal owns history"
+    );
+}
+
+#[tokio::test]
 async fn legacy_mode_installs_no_journal() {
     // LEGACY is the explicit opt-out: no store, so the facade cannot address a journal and
     // the tools are not registered. Nothing silently writes both.

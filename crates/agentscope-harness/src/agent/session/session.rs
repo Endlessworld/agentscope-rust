@@ -658,13 +658,27 @@ async fn launch(
     };
     let mut execution = SessionExecution::new(Arc::clone(log), command.clone());
 
-    let mut working = match SessionProjection::read(&**log).await?.restore()? {
+    // The committed projection is the state this run must start from: the journal is the
+    // only history authority, so an agent built fresh for this process has nothing in its
+    // in-memory state (Java `stateForCall` → `nativeWorkingCopy`).
+    let mut restored = match SessionProjection::read(&**log).await?.restore()? {
         Some(state) => state,
         None => AgentState::builder()
             .session_id(&turn_id)
             .user_id(context.user_id().unwrap_or_default())
             .build(),
     };
+    // Identity is pinned by the agent that owns this session, never by whatever a previous
+    // process happened to checkpoint: a restored state with another session id would journal
+    // the next facts under the wrong key.
+    if let Some(react) = agent.agent() {
+        let pinned = react.state_handle();
+        let pinned = pinned.lock().unwrap();
+        restored.session_id = pinned.session_id().to_string();
+        if restored.user_id.is_none() {
+            restored.user_id = pinned.user_id().map(str::to_string);
+        }
+    }
     if let Err(error) = execution.prepare(&recorder).await {
         inbox.reject(&command, &error.to_string()).await?;
         recorder.close().await;
@@ -676,15 +690,21 @@ async fn launch(
     // it a second time.
     let mut inputs = execution.inputs().to_vec();
     if inputs.is_empty() {
-        inputs = working.context.clone();
+        inputs = restored.context.clone();
     }
-    // The admitted input must be part of the working state before the first checkpoint:
-    // `input/received` is journal metadata, while `message/user` facts come from the state
-    // snapshot (Java `SessionRecorder.captureState` does the same).
+    // Bookkeeping works on a copy that already carries the admitted input: `input/received`
+    // is journal metadata, while `message/user` facts come from the state snapshot (Java
+    // `SessionRecorder.captureState` does the same). The agent itself gets the state
+    // *without* the input, because the loop appends the input when it runs — handing it both
+    // would put every admitted message into the context twice.
+    let mut working = restored.clone();
     for message in &inputs {
         if !working.context.iter().any(|existing| existing.id == message.id) {
             working.context.push(message.clone());
         }
+    }
+    if let Some(react) = agent.agent() {
+        *react.state_handle().lock().unwrap() = restored;
     }
     if let Err(error) = recorder.start(&inputs, &working).await {
         inbox.reject(&command, &error.to_string()).await?;
@@ -728,6 +748,10 @@ async fn launch(
                 if let (Ok(observed), Some(sink)) = (&event, &sink) {
                     sink(observed);
                 }
+                let terminal = matches!(
+                    &event,
+                    Ok(AgentEvent::AgentResult(_)) | Ok(AgentEvent::AgentEnd(_))
+                );
                 match event {
                     Ok(AgentEvent::AgentResult(data)) => {
                         if let Some(value) = data.fields.get("reply") {
@@ -736,6 +760,12 @@ async fn launch(
                     }
                     Ok(_) => {}
                     Err(error) => failure = Some(error),
+                }
+                if terminal || failure.is_some() {
+                    // The merged stream also carries a delta channel that only closes when the
+                    // run's own context drops, so waiting for the stream to end would leave a
+                    // cancelled or failed run open (and its journal lease held) indefinitely.
+                    break;
                 }
             }
             match failure {
@@ -757,7 +787,14 @@ async fn launch(
     if let Ok(Some(message)) = &result {
         let _ = recorder.result(Some(message));
     }
-    let finish = recorder.finish(&working, status).await;
+    // The terminal checkpoint must be the state the run actually ended with (assistant reply,
+    // tool results, tasks, plan mode), not the pre-run copy this launcher built. Java
+    // `finishSession` reads the live call state for exactly this reason.
+    let final_state = match agent.agent() {
+        Some(react) => react.state_handle().lock().unwrap().clone(),
+        None => working.clone(),
+    };
+    let finish = recorder.finish(&final_state, status).await;
     let _ = execution.close(&recorder).await;
 
     {
