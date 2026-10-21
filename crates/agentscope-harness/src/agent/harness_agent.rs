@@ -334,6 +334,23 @@ impl HarnessAgent {
         }
     }
 
+    /// Streams agent events with per-run context extensions.
+    ///
+    /// Extensions reach the embedded [`ReActAgent`]'s `RuntimeContext`, which is how a caller
+    /// hands one run a value the build-time configuration cannot express (the AG-UI adapter
+    /// passes a per-call `ToolRequestConfig` this way).
+    pub fn stream_events_with_extensions(
+        &self,
+        messages: Vec<Msg>,
+        options: StreamOptions,
+        extensions: agentscope_core::agent::Extensions,
+    ) -> futures::stream::BoxStream<'static, agentscope_core::error::Result<AgentEvent>> {
+        match &self.agent {
+            Some(agent) => agent.stream_events_with_extensions(messages, options, extensions),
+            None => Box::pin(futures::stream::once(async move { Err(no_model_error()) })),
+        }
+    }
+
     /// Replaces the embedded agent's permission engine with one built from `ctx`.
     /// No-op when no model was configured (assembly-only mode).
     pub fn set_permission_context(&self, ctx: agentscope_core::PermissionContextState) {

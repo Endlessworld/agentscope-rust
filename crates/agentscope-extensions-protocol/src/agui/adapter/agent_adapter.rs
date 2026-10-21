@@ -1,7 +1,8 @@
 //! AG-UI agent adapter, mirroring `AguiAgentAdapter` and `AguiAgentAdapterFactory`.
 //!
-//! The adapter converts a [`RunAgentInput`] into AgentScope messages, injects frontend tools, runs
-//! the agent's fine-grained event stream and converts every AgentScope event into AG-UI events.
+//! The adapter converts a [`RunAgentInput`] into AgentScope messages, builds the run-scoped tool
+//! view, runs the agent's fine-grained event stream and converts every AgentScope event into
+//! AG-UI events.
 //!
 //! **Adapter layer (design note).** Java's adapter reaches into `ReActAgent` and `HarnessAgent`
 //! through reflection (`AguiUtil.isHarnessAgent` / `getDelegate`) to avoid a compile-time harness
@@ -12,14 +13,18 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use agentscope_core::agent::Extensions;
+use agentscope_core::tool::{
+    ToolMergeMode, ToolRequestConfig, TOOL_REQUEST_CONFIG_CONTEXT_KEY,
+};
 use agentscope_core::{Agent, AgentEvent, EventCategory, Msg, RuntimeContext, StreamOptions};
 use futures::stream::{self, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::agui::adapter::config::AguiAdapterConfig;
 use crate::agui::adapter::strategy::{AgentEventConverterRegistry, AguiStreamContext};
-use crate::agui::adapter::tool_injection::ToolInjection;
 use crate::agui::converter::message::AguiMessageConverter;
+use crate::agui::converter::tool::AguiToolConverter;
 use crate::agui::event::{AguiEvent, Interrupt};
 use crate::agui::model::RunAgentInput;
 
@@ -53,6 +58,20 @@ pub trait AguiStreamableAgent: Agent {
         messages: Vec<Msg>,
         options: StreamOptions,
     ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>>;
+
+    /// Streams fine-grained agent events with per-run context extensions.
+    ///
+    /// The adapter carries a per-call [`ToolRequestConfig`] this way, so external tools never
+    /// touch the shared toolkit (mirroring Java's `RuntimeContext`-carried config). Agents that
+    /// cannot accept extensions keep the default, which drops them.
+    fn stream_events_with_extensions(
+        &self,
+        messages: Vec<Msg>,
+        options: StreamOptions,
+        _extensions: Extensions,
+    ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
+        self.stream_events(messages, options)
+    }
 }
 
 impl AguiStreamableAgent for agentscope_core::ReActAgent {
@@ -62,6 +81,15 @@ impl AguiStreamableAgent for agentscope_core::ReActAgent {
         options: StreamOptions,
     ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
         agentscope_core::ReActAgent::stream_events(self, messages, options)
+    }
+
+    fn stream_events_with_extensions(
+        &self,
+        messages: Vec<Msg>,
+        options: StreamOptions,
+        extensions: Extensions,
+    ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
+        agentscope_core::ReActAgent::stream_events_with_extensions(self, messages, options, extensions)
     }
 }
 
@@ -73,6 +101,17 @@ impl AguiStreamableAgent for agentscope_harness::agent::HarnessAgent {
     ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
         agentscope_harness::agent::HarnessAgent::stream_events(self, messages, options)
     }
+
+    fn stream_events_with_extensions(
+        &self,
+        messages: Vec<Msg>,
+        options: StreamOptions,
+        extensions: Extensions,
+    ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
+        agentscope_harness::agent::HarnessAgent::stream_events_with_extensions(
+            self, messages, options, extensions,
+        )
+    }
 }
 
 /// A boxed stream of AG-UI events.
@@ -81,10 +120,9 @@ impl AguiStreamableAgent for agentscope_harness::agent::HarnessAgent {
 /// lifecycle owns error reporting.
 pub type AguiEventStream = futures::stream::BoxStream<'static, AguiEvent>;
 
-/// The result of running the adapter: the AG-UI event stream plus the frontend-tool scope.
+/// The result of running the adapter: the AG-UI event stream plus the conversion context.
 pub struct AguiRunStream {
     events: AguiEventStream,
-    tool_injection: ToolInjection,
     stream_context: Arc<Mutex<AguiStreamContext>>,
 }
 
@@ -104,27 +142,19 @@ impl AguiRunStream {
         Arc::clone(&self.stream_context)
     }
 
-    /// Removes the injected frontend tools and restores displaced toolkit entries.
-    pub fn close(&mut self) {
-        self.tool_injection.close();
-    }
-
-    /// Drains the run into the ordered list of AG-UI events and closes the tool scope.
+    /// Drains the run into the ordered list of AG-UI events.
     pub async fn collect_events(mut self) -> Vec<AguiEvent> {
         let mut events = Vec::new();
         while let Some(event) = self.events.next().await {
             events.push(event);
         }
-        self.tool_injection.close();
         events
     }
 }
 
 impl std::fmt::Debug for AguiRunStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AguiRunStream")
-            .field("tool_injection", &self.tool_injection)
-            .finish()
+        f.debug_struct("AguiRunStream").finish_non_exhaustive()
     }
 }
 
@@ -199,10 +229,17 @@ impl AguiAgentAdapter {
             Err(error) => return self.failed_run(input, &error.to_string(), true),
         };
 
-        // 2. Inject the frontend tools for the duration of the run.
+        // 2. Build the run-scoped tool view. It travels as a runtime-context extension, so the
+        // shared toolkit is never mutated and concurrent runs each keep their own tool visibility.
         let toolkit = self.agent.toolkit().clone();
-        let tool_injection =
-            ToolInjection::inject(Some(&toolkit), input, self.config.tool_merge_mode());
+        let tool_config = match self.tool_request_config(input) {
+            Ok(config) => config,
+            Err(error) => return self.failed_run(input, &error, true),
+        };
+        let mut extensions = Extensions::new();
+        if let Some(config) = tool_config {
+            extensions.insert(TOOL_REQUEST_CONFIG_CONTEXT_KEY, config);
+        }
 
         // 3. Drive the agent and convert every event.
         //
@@ -211,7 +248,9 @@ impl AguiAgentAdapter {
             .event_types(&[EventCategory::All])
             .incremental(true)
             .build();
-        let agent_stream = self.agent.stream_events(msgs, options);
+        let agent_stream = self
+            .agent
+            .stream_events_with_extensions(msgs, options, extensions);
         let context = Arc::new(Mutex::new(AguiStreamContext::with_toolkit(
             input.thread_id.clone(),
             input.run_id.clone(),
@@ -257,9 +296,23 @@ impl AguiAgentAdapter {
 
         AguiRunStream {
             events,
-            tool_injection,
             stream_context: Arc::clone(&context),
         }
+    }
+
+    /// Builds the run-scoped tool view from the request.
+    ///
+    /// Returns `None` when the request carries nothing to inject (`AGENT_ONLY`, or no frontend
+    /// tools): the shared toolkit is then used as-is, exactly like `ToolRequestConfig.NONE`.
+    fn tool_request_config(&self, input: &RunAgentInput) -> Result<Option<ToolRequestConfig>, String> {
+        let mode = self.config.tool_merge_mode();
+        if mode == ToolMergeMode::AgentOnly || !input.has_tools() {
+            return Ok(None);
+        }
+        let schemas = AguiToolConverter::new().to_tool_schema_list(&input.tools);
+        ToolRequestConfig::from_schemas(schemas, mode)
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     /// Builds the AG-UI error lifecycle events describing a run failure.
@@ -314,7 +367,6 @@ impl AguiAgentAdapter {
         )));
         AguiRunStream {
             events: Box::pin(stream::iter(events)),
-            tool_injection: ToolInjection::empty(),
             stream_context: context,
         }
     }
@@ -528,6 +580,7 @@ mod tests {
         script: Mutex<Vec<AgentEvent>>,
         fail_with: Mutex<Option<String>>,
         seen_messages: Mutex<Vec<Msg>>,
+        seen_extensions: Mutex<Vec<Extensions>>,
     }
 
     impl ScriptedAgent {
@@ -539,6 +592,7 @@ mod tests {
                 script: Mutex::new(script),
                 fail_with: Mutex::new(None),
                 seen_messages: Mutex::new(Vec::new()),
+                seen_extensions: Mutex::new(Vec::new()),
             }
         }
 
@@ -550,6 +604,17 @@ mod tests {
 
         fn captured_messages(&self) -> Vec<Msg> {
             self.seen_messages.lock().unwrap().clone()
+        }
+
+        /// The tool config the adapter handed this run, if any.
+        fn captured_tool_config(&self) -> Option<Arc<ToolRequestConfig>> {
+            self.seen_extensions
+                .lock()
+                .unwrap()
+                .last()
+                .and_then(|extensions| {
+                    extensions.get::<ToolRequestConfig>(TOOL_REQUEST_CONFIG_CONTEXT_KEY)
+                })
         }
     }
 
@@ -586,6 +651,16 @@ mod tests {
             }
             let scripted = self.script.lock().unwrap().clone();
             Box::pin(stream::iter(scripted.into_iter().map(Ok)))
+        }
+
+        fn stream_events_with_extensions(
+            &self,
+            messages: Vec<Msg>,
+            options: StreamOptions,
+            extensions: Extensions,
+        ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
+            self.seen_extensions.lock().unwrap().push(extensions);
+            self.stream_events(messages, options)
         }
     }
 
@@ -738,7 +813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frontend_tools_are_injected_for_the_run_and_restored_afterwards() {
+    async fn frontend_tools_travel_as_a_per_call_config_without_touching_the_toolkit() {
         let agent = Arc::new(ScriptedAgent::new(vec![AgentEvent::new(CoreEventType::AgentStart)]));
         agent
             .toolkit
@@ -749,16 +824,52 @@ mod tests {
             .tools
             .push(AguiTool::new("frontend", "d", serde_json::Map::new()));
 
-        assert!(agent.toolkit.get_tool("frontend").is_none());
         let events = adapter.run(&input).collect_events().await;
         assert!(!events.is_empty());
-        // After the run the injected tool is gone and the agent tool survives.
+
+        // The shared registry is never mutated: the frontend tool was never registered.
         assert!(agent.toolkit.get_tool("frontend").is_none());
+        assert!(agent.toolkit.get_tool("agent_tool").is_some());
+
+        // Instead the run received an immutable per-call view.
+        let config = agent.captured_tool_config().expect("tool config passed to the run");
+        assert_eq!(config.merge_mode(), ToolMergeMode::MergeExternalPriority);
+        assert!(config.overrides("frontend"));
+        assert!(!config.hides_backend());
+        assert_eq!(
+            config.resolve_tool("agent_tool", &agent.toolkit).map(|t| t.name().to_string()),
+            Some("agent_tool".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn external_only_hides_the_backend_without_mutating_the_toolkit() {
+        let agent = Arc::new(ScriptedAgent::new(vec![AgentEvent::new(CoreEventType::AgentStart)]));
+        agent
+            .toolkit
+            .register_schema(ToolSchema::new("agent_tool", "agent"));
+        let adapter = adapter_for(
+            agent.clone(),
+            AguiAdapterConfig::builder()
+                .tool_merge_mode(ToolMergeMode::ExternalOnly)
+                .build(),
+        );
+        let mut input = RunAgentInput::of("t", "r");
+        input
+            .tools
+            .push(AguiTool::new("frontend", "d", serde_json::Map::new()));
+        adapter.run(&input).collect_events().await;
+
+        let config = agent.captured_tool_config().expect("tool config passed to the run");
+        assert!(config.hides_backend());
+        assert!(config.resolve_tool("agent_tool", &agent.toolkit).is_none());
+        assert!(config.resolve_tool("frontend", &agent.toolkit).is_some());
+        // Hidden, not unregistered.
         assert!(agent.toolkit.get_tool("agent_tool").is_some());
     }
 
     #[tokio::test]
-    async fn agent_only_mode_leaves_the_toolkit_untouched() {
+    async fn agent_only_mode_passes_no_tool_config() {
         let agent = Arc::new(ScriptedAgent::new(vec![AgentEvent::new(CoreEventType::AgentStart)]));
         let adapter = adapter_for(
             agent.clone(),
@@ -771,6 +882,7 @@ mod tests {
             .tools
             .push(AguiTool::new("frontend", "d", serde_json::Map::new()));
         adapter.run(&input).collect_events().await;
+        assert!(agent.captured_tool_config().is_none());
         assert!(agent.toolkit.get_tool("frontend").is_none());
     }
 
@@ -939,7 +1051,6 @@ mod tests {
         assert!(format!("{run:?}").contains("AguiRunStream"));
         let context = run.stream_context();
         let _events = run.take_events();
-        run.close();
         assert!(context.lock().unwrap().pending_interrupts().is_empty());
     }
 

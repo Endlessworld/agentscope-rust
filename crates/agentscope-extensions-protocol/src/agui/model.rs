@@ -9,7 +9,7 @@
 //! * [`AguiContext`] - one contextual hint (description + value).
 //! * [`AguiResume`] - one resume response for a previously emitted interrupt.
 //! * [`AguiTool`] - a frontend-provided tool definition.
-//! * [`ToolMergeMode`] - how frontend tools interact with the agent toolkit.
+//! * [`ToolMergeMode`] - how injected tools interact with the agent toolkit (core's type).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -569,39 +569,11 @@ impl AguiTool {
     }
 }
 
-/// How tools from the frontend should be merged with the agent's toolkit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ToolMergeMode {
-    /// Use only tools provided from the frontend; the agent toolkit is ignored.
-    FrontendOnly,
-    /// Use only the agent's toolkit; frontend tools are ignored.
-    AgentOnly,
-    /// Merge both; frontend tools override agent tools on name conflicts.
-    #[default]
-    MergeFrontendPriority,
-}
-
-impl ToolMergeMode {
-    /// The Java enum constant name.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ToolMergeMode::FrontendOnly => "FRONTEND_ONLY",
-            ToolMergeMode::AgentOnly => "AGENT_ONLY",
-            ToolMergeMode::MergeFrontendPriority => "MERGE_FRONTEND_PRIORITY",
-        }
-    }
-
-    /// Parses a Java enum constant name (case-insensitive).
-    pub fn from_wire(name: &str) -> Option<Self> {
-        match name.to_ascii_uppercase().as_str() {
-            "FRONTEND_ONLY" => Some(ToolMergeMode::FrontendOnly),
-            "AGENT_ONLY" => Some(ToolMergeMode::AgentOnly),
-            "MERGE_FRONTEND_PRIORITY" => Some(ToolMergeMode::MergeFrontendPriority),
-            _ => None,
-        }
-    }
-}
+/// How externally injected tools combine with the agent's toolkit.
+///
+/// Re-exported from [`agentscope_core::tool`] instead of being defined here: the merge policy is
+/// a core tool concept, and a second parallel enum would let the adapter and the toolkit drift.
+pub use agentscope_core::tool::ToolMergeMode;
 
 #[cfg(test)]
 mod request_tests {
@@ -752,21 +724,24 @@ mod request_tests {
     }
 
     #[test]
-    fn tool_merge_mode_round_trips_java_names() {
-        assert_eq!(ToolMergeMode::default(), ToolMergeMode::MergeFrontendPriority);
+    fn tool_merge_mode_is_core_s_enum() {
+        // The model re-exports core's enum, so there is exactly one policy type.
+        assert_eq!(
+            ToolMergeMode::default(),
+            ToolMergeMode::MergeExternalPriority
+        );
         for mode in [
-            ToolMergeMode::FrontendOnly,
+            ToolMergeMode::ExternalOnly,
             ToolMergeMode::AgentOnly,
-            ToolMergeMode::MergeFrontendPriority,
+            ToolMergeMode::MergeExternalPriority,
         ] {
             assert_eq!(ToolMergeMode::from_wire(mode.as_str()), Some(mode));
         }
-        assert_eq!(ToolMergeMode::from_wire("merge_frontend_priority"), Some(ToolMergeMode::MergeFrontendPriority));
-        assert_eq!(ToolMergeMode::from_wire("NOPE"), None);
         assert_eq!(
-            serde_json::to_value(ToolMergeMode::AgentOnly).unwrap(),
-            json!("AGENT_ONLY")
+            ToolMergeMode::from_wire("merge_external_priority"),
+            Some(ToolMergeMode::MergeExternalPriority)
         );
+        assert_eq!(ToolMergeMode::from_wire("NOPE"), None);
     }
 
     #[test]

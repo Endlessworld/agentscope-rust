@@ -175,6 +175,17 @@ cargo test  -p agentscope-extensions-protocol   -> 290 passed; 0 failed; 0 ignor
 - **变更文件**：`crates/agentscope-extensions-protocol/src/a2a/message.rs`（仅测试体）。
 - **Java 依据**：`a2a-client/src/main/java/io/agentscope/core/a2a/agent/message/FilePartParser.java`（`getPrimaryType` + `switch ... TYPE_AUDIO`）。
 
+### 4.4 GAP-17：AG-UI 工具视图对齐 Java（2026-10-21）
+- **裁定**：用户「对齐 Java」。Java `3c1c29c01` 把「运行时注入/回滚 toolkit」改为「不可变 per-call `ToolRequestConfig`」，并删除 `agui.adapter.ToolInjection` 与 `agui.model.ToolMergeMode`（后者上移 core）。
+- **改动**：
+  - `agui/model.rs`：删除本地 `ToolMergeMode`，改 `pub use agentscope_core::tool::ToolMergeMode`（`agui::model::ToolMergeMode` 路径不变，wire 名从 `FRONTEND_ONLY/MERGE_FRONTEND_PRIORITY` 变为 `EXTERNAL_ONLY/MERGE_EXTERNAL_PRIORITY`；该枚举不在 AG-UI 线上协议里，无 wire 兼容负担）。
+  - `agui/adapter/tool_injection.rs`：**整文件删除**；`AguiRunStream` 不再持有 scope，`close()` 移除（不再有 registry 需要复原）。
+  - `agui/adapter/agent_adapter.rs`：`buildToolRequestConfig` 等价逻辑（`tool_request_config()`）把前端工具转成 core `ToolRequestConfig`，经 `Extensions` 的 `TOOL_REQUEST_CONFIG_CONTEXT_KEY` 随新增 trait 方法 `stream_events_with_extensions` 下传；共享 `Toolkit` 全程只读。
+  - `agentscope-harness`：`HarnessAgent::stream_events_with_extensions` 透传到内嵌 `ReActAgent`。
+  - `AguiAdapterConfig` 默认 `MergeExternalPriority`（语义等同旧的 `MergeFrontendPriority`）。
+- **测试**：`frontend_tools_travel_as_a_per_call_config_without_touching_the_toolkit`、`external_only_hides_the_backend_without_mutating_the_toolkit`、`agent_only_mode_passes_no_tool_config`、`tool_merge_mode_is_core_s_enum`（均为回退实现即失败的行为断言）。
+- **基线**：`cargo test -p agentscope-extensions-protocol` → 302 passed；`cargo check --workspace --all-targets` 通过。
+
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-protocol` 基线。
 - 改动中：保持 `cargo build -p agentscope-extensions-protocol` / `cargo test -p agentscope-extensions-protocol` 通过。

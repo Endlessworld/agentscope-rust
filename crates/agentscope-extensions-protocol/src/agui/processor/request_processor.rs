@@ -159,7 +159,6 @@ impl AguiRequestProcessor {
                 .track_pending_interrupts(&thread_id, &run_id, &event, run_error_seen);
             events.push(event);
         }
-        run.close();
         self.resume_coordinator.finish_run(&thread_id, &run_id);
 
         ProcessResult {
@@ -695,7 +694,7 @@ mod tests {
         assert!(!result.has_error());
         assert!(format!("{result:?}").contains("ProcessResult"));
         let processor = processor(TestResolver::default(), AguiAdapterConfig::default_config());
-        assert_eq!(processor.config().tool_merge_mode(), crate::agui::model::ToolMergeMode::MergeFrontendPriority);
+        assert_eq!(processor.config().tool_merge_mode(), crate::agui::model::ToolMergeMode::MergeExternalPriority);
         assert!(format!("{processor:?}").contains("AguiRequestProcessor"));
     }
 }

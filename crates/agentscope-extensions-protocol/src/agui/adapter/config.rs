@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::agui::adapter::strategy::{
     AgentEventConverter, AguiEventEnricher, BaseEventPropertiesEnricher,
 };
-use crate::agui::model::ToolMergeMode;
+use agentscope_core::tool::ToolMergeMode;
 
 /// Default run timeout, mirroring the Java `Duration.ofMinutes(10)`.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -255,7 +255,7 @@ impl AguiAdapterConfigBuilder {
         AguiAdapterConfig {
             tool_merge_mode: self
                 .tool_merge_mode
-                .unwrap_or(ToolMergeMode::MergeFrontendPriority),
+                .unwrap_or(ToolMergeMode::MergeExternalPriority),
             emit_state_events: self.emit_state_events.unwrap_or(true),
             emit_tool_call_args: self.emit_tool_call_args.unwrap_or(true),
             emit_token_usage: self.emit_token_usage.unwrap_or(false),
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn defaults_match_the_java_builder() {
         let config = AguiAdapterConfig::default_config();
-        assert_eq!(config.tool_merge_mode(), ToolMergeMode::MergeFrontendPriority);
+        assert_eq!(config.tool_merge_mode(), ToolMergeMode::MergeExternalPriority);
         assert!(config.emit_state_events());
         assert!(config.emit_tool_call_args());
         assert!(!config.emit_token_usage());
@@ -339,6 +339,6 @@ mod tests {
     fn with_run_timeout_replaces_only_the_timeout() {
         let config = AguiAdapterConfig::default_config().with_run_timeout(Duration::from_secs(1));
         assert_eq!(config.run_timeout(), Duration::from_secs(1));
-        assert_eq!(config.tool_merge_mode(), ToolMergeMode::MergeFrontendPriority);
+        assert_eq!(config.tool_merge_mode(), ToolMergeMode::MergeExternalPriority);
     }
 }

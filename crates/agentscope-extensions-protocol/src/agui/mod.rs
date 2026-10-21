@@ -26,7 +26,7 @@ pub mod runtime;
 pub use adapter::{
     AguiAdapterConfig, AguiAdapterConfigBuilder, AguiAgentAdapter, AguiAgentAdapterFactory,
     AguiEventEnricher, AguiStreamContext, AguiStreamableAgent, AgentEventConverterRegistry,
-    DefaultAguiAgentAdapterFactory, ToolInjection,
+    DefaultAguiAgentAdapterFactory,
 };
 pub use constants::{
     INPUT_REQUIRED_INTERRUPT_REASON, INTERRUPT_KIND_PERMISSION_CONFIRM,

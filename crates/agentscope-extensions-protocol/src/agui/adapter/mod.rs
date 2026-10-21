@@ -2,13 +2,11 @@
 //!
 //! * [`config`] - `AguiAdapterConfig` (tool merge mode, event toggles, timeouts).
 //! * [`strategy`] - `AguiStreamContext`, event converters and enrichers.
-//! * [`tool_injection`] - scoped registration of frontend tools.
 //! * [`agent_adapter`] - `AguiAgentAdapter` / `AguiAgentAdapterFactory`.
 
 pub mod agent_adapter;
 pub mod config;
 pub mod strategy;
-pub mod tool_injection;
 
 pub use agent_adapter::{
     build_runtime_context, map_error_code, put_resume_interrupts, resume_interrupts,
@@ -26,4 +24,3 @@ pub use strategy::{
     BaseEventPropertiesEnricher, RawEventPropertiesEnricher, TokenUsage, TokenUsageAccumulator,
     TokenUsageSnapshot,
 };
-pub use tool_injection::ToolInjection;
