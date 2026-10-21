@@ -718,7 +718,7 @@ impl ReActAgent {
                 let fut = async move {
                     let mut events = Vec::new();
                     events.push(Ok(AgentEvent::AgentStart(EventData::default())));
-                    let res = run_agent_loop(&core, &ctx_core, input.messages).await;
+                    let res = run_agent_loop(&core, &ctx_core, input).await;
                     match &res {
                         Ok(msg) => {
                             let mut data = EventData::default();
@@ -1275,14 +1275,39 @@ impl ReActAgentBuilder {
 // Execution loop
 // ---------------------------------------------------------------------------
 
-/// Entry point of the reasoning→acting loop. Copies the shared state out, appends
-/// the input messages, runs the iteration loop and writes the state back.
+/// Entry point of the reasoning→acting loop. Copies the shared state out, folds
+/// request-scoped system material into a frozen system message, appends the input
+/// messages, runs the iteration loop and writes the state back.
 async fn run_agent_loop(
     core: &Arc<AgentCore>,
     ctx: &crate::agent::RuntimeContext,
-    messages: Vec<Msg>,
+    input: AgentInput,
 ) -> Result<Msg> {
+    let AgentInput { mut messages, mut system_prompt } = input;
+
+    // Legacy compatibility: middlewares used to attach a SYSTEM message directly to
+    // `AgentInput.messages`. Fold that material into the request-scoped system
+    // prompt and remove it from the conversation input. Java forbids this shape
+    // outright (`AgentBase.notifyPreCall` guard); Rust accepts it but never persists
+    // it, so a request-scoped prompt cannot accumulate across turns.
+    let legacy_system: Vec<Msg> = messages
+        .iter()
+        .filter(|message| message.role == MsgRole::System)
+        .cloned()
+        .collect();
+    for message in legacy_system {
+        crate::middleware::input::append_system_prompt_text(
+            &mut system_prompt,
+            &message.text_content(),
+        );
+    }
+    messages.retain(|message| message.role != MsgRole::System);
+
     let mut state = core.state.lock().unwrap().clone();
+    // Java's `AgentState.context` never stores the system message: it is frozen
+    // per call in `CallExecution.systemMsg`. Drop any SYSTEM material persisted by
+    // older builds before this request enters the loop.
+    state.context_mut().retain(|message| message.role != MsgRole::System);
 
     // The call-scoped state is now bound: notify the middlewares that participate in
     // `OnAgentStateReady` before the input enters the pipeline. This is the only seam
@@ -1321,33 +1346,33 @@ async fn run_agent_loop(
         }
     }
 
-    // A middleware may attach request-scoped SYSTEM material (workspace/memory
-    // context, subagent catalog) to the input on every call. System prompts are
-    // prompt material, not conversation history: appending them would persist one
-    // full copy per turn and eventually exhaust the model's context budget.
-    // Replace the previous system view instead.
-    let incoming_system: Vec<Msg> = messages
-        .iter()
-        .filter(|message| message.role == MsgRole::System)
-        .cloned()
-        .collect();
-    if !incoming_system.is_empty() {
-        let context = state.context_mut();
-        context.retain(|message| message.role != MsgRole::System);
-        for (index, message) in incoming_system.into_iter().enumerate() {
-            context.insert(index, message);
-        }
+    // Freeze the system prompt once per call. Mirrors Java `seedSystemMsg` +
+    // `applySystemPromptMiddlewares`: request-scoped workspace/memory material and
+    // the agent-level prompt are merged first, then `on_system_prompt` transformers
+    // run once. Every reasoning iteration receives a fresh copy of this frozen
+    // message, never a persisted conversation entry.
+    let mut frozen_prompt = if core.sys_prompt.trim().is_empty() {
+        None
+    } else {
+        Some(core.sys_prompt.trim().to_string())
+    };
+    if let Some(extra) = system_prompt.as_deref() {
+        crate::middleware::input::append_system_prompt_text(&mut frozen_prompt, extra);
     }
-    for m in messages {
-        if m.role != MsgRole::System {
-            state.context_mut().push(m);
-        }
+    let frozen_prompt = core
+        .middleware_chain
+        .apply_system_prompt(ctx, frozen_prompt.unwrap_or_default());
+    let system_msg =
+        (!frozen_prompt.trim().is_empty()).then(|| Msg::system(frozen_prompt));
+
+    for message in messages {
+        state.context_mut().push(message);
     }
     state.set_cur_iter(0);
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
     // be detected and carried over (the loop otherwise runs on a private clone).
     let plan_mode_at_start = state.plan_mode_context.clone();
-    let mut result = match execute_iteration(core, ctx, &mut state, 0).await {
+    let mut result = match execute_iteration(core, ctx, &mut state, 0, system_msg.as_ref()).await {
         // An interrupt is not a failure: reconcile the dangling tool_use left by
         // the interrupted turn and append a recovery message, so the caller sees
         // a normal reply and the next turn continues from a consistent context.
@@ -1361,7 +1386,7 @@ async fn run_agent_loop(
     // close that follows.
     while session_continues(ctx, &result).await? {
         let next = state.cur_iter() + 1;
-        result = match execute_iteration(core, ctx, &mut state, next).await {
+        result = match execute_iteration(core, ctx, &mut state, next, system_msg.as_ref()).await {
             Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
             other => other,
         };
@@ -1431,9 +1456,10 @@ async fn execute_iteration(
     ctx: &crate::agent::RuntimeContext,
     state: &mut AgentState,
     mut iter: i32,
+    system_msg: Option<&Msg>,
 ) -> Result<Msg> {
     loop {
-        let msg = reasoning_phase(core, ctx, state, iter).await?;
+        let msg = reasoning_phase(core, ctx, state, iter, system_msg).await?;
         let reason = msg.generate_reason();
         let has_tool_calls = has_actionable_tool_calls(&msg);
         let outcome = match reason {
@@ -1628,6 +1654,7 @@ async fn reasoning_phase(
     ctx: &crate::agent::RuntimeContext,
     state: &mut AgentState,
     iter: i32,
+    system_msg: Option<&Msg>,
 ) -> Result<Msg> {
     check_interrupted(core, Some(ctx))?;
     state.set_cur_iter(iter);
@@ -1660,12 +1687,11 @@ async fn reasoning_phase(
         }
     }
 
-    let sys_prompt = core
-        .middleware_chain
-        .apply_system_prompt(ctx, core.sys_prompt.clone());
+    // Java prepends a fresh copy of the frozen `CallExecution.systemMsg` to every
+    // reasoning request. The conversation state itself remains system-free.
     let mut messages = Vec::new();
-    if !sys_prompt.trim().is_empty() {
-        messages.push(Msg::system(sys_prompt));
+    if let Some(system_msg) = system_msg {
+        messages.push(system_msg.clone());
     }
     messages.extend(state.context().to_vec());
 
@@ -1768,7 +1794,12 @@ async fn run_reasoning(
             // attached to `ctx`, each dispatch records
             // request/prepared → model/dispatch → model/chunk… → model/end.
             let model = SessionModels::wrap(Arc::clone(&model), &ctx, "REASONING");
-            let mc_input = ModelCallInput::new(r.messages, r.tools, r.options, model);
+            // Java keeps exactly one system message at the head of every request:
+            // `PreReasoningEvent` hooks may append to it but cannot inject additional
+            // SYSTEM entries into `inputMessages`. Normalise here so a third-party
+            // `on_reasoning` middleware cannot leave two system messages behind.
+            let messages = normalize_system_messages(r.messages);
+            let mc_input = ModelCallInput::new(messages, r.tools, r.options, model);
             chain.wrap_model_call(ctx.clone(), mc_input, model_core)
         })
     };
@@ -2718,6 +2749,43 @@ async fn summarizing(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Enforces the single-system-message invariant before the provider call.
+///
+/// `run_agent_loop` already freezes the request-scoped system prompt and keeps
+/// `AgentState.context` system-free. A reasoning middleware can still push an extra
+/// SYSTEM message into `ReasoningInput.messages`; Java rejects that shape. Merge any
+/// such additions into one leading system message instead of leaking multiple
+/// system entries to the provider.
+fn normalize_system_messages(mut messages: Vec<Msg>) -> Vec<Msg> {
+    let system_count = messages
+        .iter()
+        .filter(|message| message.role == MsgRole::System)
+        .count();
+    if system_count == 0 {
+        return messages;
+    }
+    if system_count == 1
+        && messages
+            .first()
+            .is_some_and(|message| message.role == MsgRole::System)
+    {
+        return messages;
+    }
+
+    let merged = messages
+        .iter()
+        .filter(|message| message.role == MsgRole::System)
+        .map(Msg::text_content)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    messages.retain(|message| message.role != MsgRole::System);
+    if !merged.trim().is_empty() {
+        messages.insert(0, Msg::system(merged));
+    }
+    messages
+}
 
 /// Builds the `generate_response` tool's parameter schema wrapping the target JSON
 /// schema under a single `response` property.
@@ -4258,6 +4326,46 @@ mod tests {
         }
     }
 
+    /// Records every request and pops queued responses, so a test can force multiple
+    /// reasoning iterations while inspecting the exact system message sent each time.
+    struct SequenceRecordingModel {
+        seen: Arc<Mutex<Vec<Vec<Msg>>>>,
+        responses: Arc<Mutex<Vec<ChatResponse>>>,
+    }
+
+    impl SequenceRecordingModel {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Model for SequenceRecordingModel {
+        fn stream(
+            &self,
+            messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            self.seen.lock().unwrap().push(messages);
+            let response = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    text_response("done")
+                } else {
+                    responses.remove(0)
+                }
+            };
+            Box::pin(futures::stream::once(async move { Ok(response) }))
+        }
+        fn model_name(&self) -> &str {
+            "sequence-recording"
+        }
+    }
+
     /// Middleware that rewrites the reasoning input before the model call.
     struct RewriteReasoningMiddleware;
 
@@ -4285,6 +4393,52 @@ mod tests {
             next: Next<AgentInput>,
         ) -> EventStream {
             input.messages.insert(0, Msg::system(self.0));
+            next(input)
+        }
+    }
+
+    /// Middleware that uses the request-scoped system prompt channel.
+    struct RequestSystemPromptMiddleware(&'static str);
+
+    impl crate::middleware::Middleware for RequestSystemPromptMiddleware {
+        fn on_agent(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            mut input: AgentInput,
+            next: Next<AgentInput>,
+        ) -> EventStream {
+            input.append_system_prompt(self.0);
+            next(input)
+        }
+    }
+
+    /// Middleware that counts how often the system prompt transformer runs.
+    struct CountingSystemPromptMiddleware {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl crate::middleware::Middleware for CountingSystemPromptMiddleware {
+        fn on_system_prompt(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            current_prompt: String,
+        ) -> String {
+            *self.calls.lock().unwrap() += 1;
+            format!("{current_prompt}\nFROZEN")
+        }
+    }
+
+    /// Middleware that incorrectly appends a second SYSTEM message at reasoning time.
+    struct ExtraSystemMiddleware;
+
+    impl crate::middleware::Middleware for ExtraSystemMiddleware {
+        fn on_reasoning(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            mut input: ReasoningInput,
+            next: Next<ReasoningInput>,
+        ) -> EventStream {
+            input.messages.push(Msg::system("EXTRA SYSTEM"));
             next(input)
         }
     }
@@ -4447,11 +4601,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_system_prompts_replace_instead_of_accumulating() {
+    async fn legacy_injected_system_prompts_are_request_scoped() {
         // Regression: ACP passes only the new user input to the agent, so a middleware
         // attaching workspace context created a new SYSTEM message every turn. The loop
-        // persisted each one, growing the request by a full system prompt per turn until
-        // the context compiler rejected it as over budget.
+        // used to persist each one, growing the request by a full system prompt per turn
+        // until the context compiler rejected it as over budget. Legacy SYSTEM messages
+        // are now folded into the request-scoped prompt and never enter the state.
         let model = Arc::new(RecordingModel::new());
         let seen = Arc::clone(&model.seen);
         let mut chain = MiddlewareChain::new();
@@ -4475,12 +4630,11 @@ mod tests {
             .collect();
         assert_eq!(
             systems.len(),
-            1,
-            "a request-scoped system prompt must not accumulate"
+            0,
+            "request-scoped system prompts must never enter the conversation state"
         );
-        assert!(systems[0].text_content().contains("WORKSPACE CONTEXT"));
 
-        // The replaced prompt still reaches every model request.
+        // The request-scoped prompt still reaches every model request.
         let calls = seen.lock().unwrap();
         assert_eq!(calls.len(), 2);
         for call in calls.iter() {
@@ -4490,6 +4644,144 @@ mod tests {
                 "every request must carry the current system prompt"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_system_messages_are_purged_from_restored_state() {
+        // Older Rust builds persisted the workspace system prompt into AgentState.
+        // A restored session must not keep sending that stale copy now that the
+        // prompt is request-scoped.
+        let model = Arc::new(RecordingModel::new());
+        let seen = Arc::clone(&model.seen);
+        let agent = ReActAgent::builder()
+            .name("t-system-migration")
+            .model(model)
+            .sys_prompt("BASE SYSTEM")
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("first")]).await.unwrap();
+        {
+            let state = agent.state_handle();
+            let mut guard = state.lock().unwrap();
+            guard.context_mut().insert(0, Msg::system("STALE WORKSPACE PROMPT"));
+        }
+        agent.call(vec![Msg::user("second")]).await.unwrap();
+
+        {
+            let state = agent.state_handle();
+            let guard = state.lock().unwrap();
+            assert!(
+                guard
+                    .context()
+                    .iter()
+                    .all(|message| message.role != MsgRole::System),
+                "restored SYSTEM material must be dropped from conversation state"
+            );
+        }
+
+        let calls = seen.lock().unwrap();
+        let last = calls.last().expect("the second call reached the model");
+        let systems: Vec<_> = last
+            .iter()
+            .filter(|message| message.role == MsgRole::System)
+            .collect();
+        assert_eq!(systems.len(), 1);
+        assert!(systems[0].text_content().contains("BASE SYSTEM"));
+        assert!(!systems[0].text_content().contains("STALE WORKSPACE PROMPT"));
+    }
+
+    #[tokio::test]
+    async fn system_prompt_is_frozen_once_per_call_and_prepended_to_every_request() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(SequenceRecordingModel::new(vec![
+            tool_use_response("c1", "add", input),
+            text_response("done"),
+        ]));
+        let seen = Arc::clone(&model.seen);
+
+        let prompt_calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(RequestSystemPromptMiddleware("REQUEST SYSTEM")));
+        chain.add(Box::new(CountingSystemPromptMiddleware {
+            calls: Arc::clone(&prompt_calls),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-system-freeze")
+            .model(model)
+            .toolkit(toolkit)
+            .sys_prompt("BASE SYSTEM")
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert_eq!(
+            *prompt_calls.lock().unwrap(),
+            1,
+            "on_system_prompt must run once per call, not once per reasoning step"
+        );
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the tool call must force a second reasoning step");
+        for call in calls.iter() {
+            let systems: Vec<_> = call
+                .iter()
+                .filter(|message| message.role == MsgRole::System)
+                .collect();
+            assert_eq!(
+                systems.len(),
+                1,
+                "base and request-scoped prompt material must be merged into one system message"
+            );
+            assert!(systems[0].text_content().contains("BASE SYSTEM"));
+            assert!(systems[0].text_content().contains("REQUEST SYSTEM"));
+            assert!(systems[0].text_content().contains("FROZEN"));
+            assert_eq!(systems[0].text_content(), calls[0][0].text_content());
+        }
+
+        let state = agent.state_handle();
+        let guard = state.lock().unwrap();
+        assert!(
+            guard
+                .context()
+                .iter()
+                .all(|message| message.role != MsgRole::System),
+            "the frozen prompt must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_middleware_cannot_leave_multiple_system_messages() {
+        let model = Arc::new(RecordingModel::new());
+        let seen = Arc::clone(&model.seen);
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ExtraSystemMiddleware));
+        let agent = ReActAgent::builder()
+            .name("t-system-normalize")
+            .model(model)
+            .sys_prompt("BASE SYSTEM")
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        let calls = seen.lock().unwrap();
+        let systems: Vec<_> = calls[0]
+            .iter()
+            .filter(|message| message.role == MsgRole::System)
+            .collect();
+        assert_eq!(systems.len(), 1, "the provider must see exactly one system message");
+        assert!(systems[0].text_content().contains("BASE SYSTEM"));
+        assert!(systems[0].text_content().contains("EXTRA SYSTEM"));
     }
 
     #[tokio::test]

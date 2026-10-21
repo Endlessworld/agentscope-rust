@@ -8,12 +8,56 @@ use crate::model::{GenerateOptions, Model, ToolSchema};
 #[derive(Debug, Clone)]
 pub struct AgentInput {
     /// The input messages.
+    ///
+    /// For `ReActAgent` this is request input, not the persisted conversation
+    /// history. SYSTEM messages here are treated as request-scoped prompt material
+    /// and are never written to `AgentState.context`.
     pub messages: Vec<Msg>,
+    /// Request-scoped system prompt material.
+    ///
+    /// This is the Rust equivalent of Java's per-call `HookEvent.systemMsg` /
+    /// `CallExecution.systemMsg`: it is frozen once for the call and prepended to
+    /// every reasoning request. It is **not** persisted to the conversation
+    /// history. Middlewares that build prompt material asynchronously should append
+    /// to this field instead of inserting a SYSTEM message into `messages`.
+    pub system_prompt: Option<String>,
 }
 
 impl AgentInput {
     pub fn new(messages: Vec<Msg>) -> Self {
-        Self { messages }
+        Self { messages, system_prompt: None }
+    }
+
+    /// Appends request-scoped system prompt material, separating it from existing
+    /// material with a newline when needed.
+    pub fn append_system_prompt(&mut self, extra: &str) {
+        append_system_prompt_text(&mut self.system_prompt, extra);
+    }
+
+    /// Replaces the request-scoped system prompt material.
+    pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
+        let prompt = prompt.into();
+        self.system_prompt = if prompt.trim().is_empty() { None } else { Some(prompt) };
+    }
+}
+
+/// Merges `extra` into a request-scoped system prompt slot.
+///
+/// Empty additions are ignored. A non-empty addition is separated from existing
+/// material by a single newline (unless the existing material already ends with
+/// one), matching Java's `onSystemPrompt` separator behavior.
+pub(crate) fn append_system_prompt_text(target: &mut Option<String>, extra: &str) {
+    if extra.trim().is_empty() {
+        return;
+    }
+    match target {
+        Some(existing) if !existing.is_empty() => {
+            if !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(extra);
+        }
+        _ => *target = Some(extra.to_string()),
     }
 }
 
@@ -21,6 +65,11 @@ impl AgentInput {
 #[derive(Debug, Clone)]
 pub struct ReasoningInput {
     /// The messages sent to the model.
+    ///
+    /// When the call has a frozen system prompt, a fresh copy of it is already at
+    /// index 0. This is the Rust equivalent of Java's `PreReasoningEvent` carrying
+    /// the frozen `systemMsg` plus `inputMessages`; middleware may append to the
+    /// system prompt with `prepend_to_system_message`.
     pub messages: Vec<Msg>,
     /// The tool schemas available to the model.
     pub tools: Vec<ToolSchema>,

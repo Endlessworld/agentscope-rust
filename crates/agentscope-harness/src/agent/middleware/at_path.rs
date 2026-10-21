@@ -47,11 +47,13 @@ impl Middleware for AtPathExpansionMiddleware {
         let fs = Arc::clone(&self.fs);
         let max = self.max_read_chars;
         let fut = async move {
+            let mut input = input;
             let mut messages = input.messages.clone();
             for msg in &mut messages {
                 expand_message(msg, &fs, max).await;
             }
-            next(AgentInput::new(messages))
+            input.messages = messages;
+            next(input)
         };
         stream::once(fut).flatten().boxed()
     }

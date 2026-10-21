@@ -1362,6 +1362,7 @@ impl HarnessAgentBuilder {
                 self.environment_memory.clone(),
                 self.max_context_tokens,
             );
+            ws_ctx.set_memory_flags(self.disable_memory_tools, self.disable_memory_hooks);
             ws_ctx.set_additional_context_files(self.additional_context_files.clone());
             middleware.add(Box::new(ws_ctx));
         }
@@ -1719,6 +1720,8 @@ impl HarnessAgentBuilder {
                     None
                 },
                 enable_pending_tool_recovery: self.enable_pending_tool_recovery.unwrap_or(false),
+                disable_memory_tools: self.disable_memory_tools,
+                disable_memory_hooks: self.disable_memory_hooks,
             });
             // --- subagent entries ---
             let mut entries: Vec<SubagentEntry> = Vec::new();

@@ -49,7 +49,12 @@ pub trait Middleware: Send + Sync {
         next(input)
     }
 
-    /// Transforms the system prompt (pipeline pattern).
+    /// Transforms the request-scoped system prompt (pipeline pattern).
+    ///
+    /// Runs once per call, after `on_agent` has supplied any request-scoped system
+    /// material and before the prompt is frozen for the reasoning loop. Mirrors
+    /// Java `MiddlewareBase.onSystemPrompt` / `ReActAgent.seedSystemMsg`; it is not
+    /// invoked once per reasoning iteration.
     fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         current_prompt
     }
@@ -192,6 +197,9 @@ impl MiddlewareChain {
 
     /// Applies the chain's system-prompt transformers in order, skipping
     /// middlewares that do not participate in `OnSystemPrompt`.
+    ///
+    /// Called once per agent call by `ReActAgent`; callers must freeze the result
+    /// rather than re-running the chain for every reasoning step.
     pub fn apply_system_prompt(&self, ctx: &RuntimeContext, prompt: String) -> String {
         self.participants(ExtensionPoint::OnSystemPrompt)
             .iter()

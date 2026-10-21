@@ -215,6 +215,10 @@ pub struct SubagentBlueprint {
     /// Parent default children inherit unless their declaration overrides it
     /// (mirrors Java `capturedPendingToolRecovery`).
     pub enable_pending_tool_recovery: bool,
+    /// Memory capability flags inherited from the parent
+    /// (mirrors Java `capturedDisableMemoryTools` / `capturedDisableMemoryHooks`).
+    pub disable_memory_tools: bool,
+    pub disable_memory_hooks: bool,
 }
 
 impl SubagentBlueprint {
@@ -340,6 +344,15 @@ impl LeafFactory {
         if let Some(decl) = &self.decl {
             builder = builder.session_id(derive_child_session_id(decl, parent_rc));
         }
+        // Java `HarnessAgentBuilderSupport` propagates both memory flags to every
+        // declared / general-purpose child. Do the same so a child prompt never
+        // advertises memory tools or hooks the parent turned off.
+        if self.blueprint.disable_memory_tools {
+            builder = builder.disable_memory_tools();
+        }
+        if self.blueprint.disable_memory_hooks {
+            builder = builder.disable_memory_hooks();
+        }
         builder.build()
     }
 }
@@ -403,6 +416,8 @@ mod tests {
             max_iters: 5,
             state_store: None,
             enable_pending_tool_recovery: parent_flag,
+            disable_memory_tools: false,
+            disable_memory_hooks: false,
         })
     }
 

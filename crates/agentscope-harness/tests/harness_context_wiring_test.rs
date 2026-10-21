@@ -156,3 +156,43 @@ fn an_empty_registration_keeps_the_compiler_disabled() {
     // Guards the opt-in rule: `ContextSources::empty()` must not enable the compiler.
     assert!(ContextSources::empty().is_empty());
 }
+
+#[tokio::test]
+async fn workspace_context_honors_memory_flags_through_the_real_build_path() {
+    let dir = temp_dir("memory-flags");
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "# Persona\nFriendly.").unwrap();
+    std::fs::write(ws.join("MEMORY.md"), "MEMORY-MARKER").unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = HarnessAgent::builder()
+        .name("mem-flags")
+        .model(Arc::new(RecordingModel {
+            seen: Arc::clone(&seen),
+        }))
+        .cwd(dir.clone())
+        .workspace(ws)
+        .max_iters(1)
+        .disable_memory_tools()
+        .disable_memory_hooks()
+        .build();
+
+    {
+        use futures::StreamExt;
+        let _: Vec<_> = agent
+            .stream_events(vec![Msg::user("hello")], StreamOptions::default())
+            .collect()
+            .await;
+    }
+
+    let batches = seen.lock().unwrap().clone();
+    assert!(!batches.is_empty(), "the model was never called");
+    let rendered = batches[0].join("\n");
+    assert!(!rendered.contains("## Memory Recall"), "{rendered}");
+    assert!(!rendered.contains("MEMORY-MARKER"), "{rendered}");
+    assert!(!rendered.contains("<memory_context>"), "{rendered}");
+    assert!(!rendered.contains("memory_save"), "{rendered}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

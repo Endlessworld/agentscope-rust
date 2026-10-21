@@ -1,11 +1,12 @@
 //! Middleware that appends workspace context (session info, AGENTS.md, MEMORY.md,
-//! knowledge, additional files) to the leading system message, mirroring
+//! knowledge, additional files) to the request-scoped system prompt, mirroring
 //! `io.agentscope.harness.agent.middleware.WorkspaceContextMiddleware`.
 //!
 //! Runs once per agent call (like the Java `onSystemPrompt` hook fired at call
 //! time). Because the core `Middleware::on_system_prompt` hook is synchronous and
 //! this middleware needs asynchronous filesystem reads, the section is built in
-//! `on_agent` and appended to the leading SYSTEM message instead.
+//! `on_agent` and stored in `AgentInput.system_prompt`; the core freezes it for the
+//! call and prepends a fresh copy to every reasoning request without persisting it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +15,6 @@ use agentscope_core::agent::RuntimeContext;
 use agentscope_core::middleware::{AgentInput, EventStream, Middleware, Next};
 use futures::StreamExt;
 
-use super::subagents::prepend_to_system_message;
 use crate::agent::workspace::WorkspaceManager;
 
 const SESSION_CONTEXT_SECTION_TEMPLATE: &str = "\
@@ -27,40 +27,70 @@ The project's temporary directory is: {temp}
 {dynamic}
 ";
 
-const GUIDANCE_TEMPLATE: &str = "\
+const DOMAIN_KNOWLEDGE_GUIDANCE: &str = "\
 ## Domain Knowledge
 The workspace `knowledge/` tree holds many detailed reference documents (not only a single summary file). When the task needs specs, procedures, schemas, or domain facts, treat that directory as the source of truth.
 Below, `<domain_knowledge_context>` already includes what you need to navigate it: injected `knowledge/KNOWLEDGE.md` (if present) plus a **full list of knowledge file paths** under `knowledge/` — use that as the catalog of what exists and where.
 For content not inlined here, open only the paths you need with read_file, grep, or glob (prefer targeted reads over loading entire trees into the reply).
+";
 
+const MEMORY_RECALL_GUIDANCE: &str = "\
 ## Memory Recall
 Before answering questions about prior work, decisions, dates, people, or preferences: run memory_search on MEMORY.md + memory/*.md, then memory_get for needed lines. Include Source: <path#line> citations when helpful.
+";
 
+const MEMORY_PERSISTENCE_HEADER: &str = "\
 ## Memory Persistence
 You have a persistent MEMORY.md. Update it proactively when:
 - User shares preferences, project context, or decisions
 - Important outcomes or action items are established
-Use the **memory_save** tool to persist memories — it atomically updates both MEMORY.md and the daily ledger. Do NOT use write_file or edit_file on MEMORY.md or any path under memory/ — always use memory_save instead. Memory is also automatically extracted at conversation end.
 ";
 
-const WORKSPACE_FILES_NOTICE: &str = "\
+const MEMORY_PERSISTENCE_HEADER_HOOKS_ONLY: &str = "\
+## Memory Persistence
+You have a persistent MEMORY.md that the harness maintains automatically.
+";
+
+const MEMORY_SAVE_TOOL_GUIDANCE: &str = "\
+Use the **memory_save** tool to persist memories — it atomically updates both MEMORY.md and the daily ledger. Do NOT use write_file or edit_file on MEMORY.md or any path under memory/ — always use memory_save instead.
+";
+
+const MEMORY_WRITE_FILE_GUARD: &str = "\
+Do NOT use write_file or edit_file on MEMORY.md or any path under memory/ — the harness owns those files.
+";
+
+const MEMORY_AUTO_EXTRACT_GUIDANCE: &str =
+    "Memory is also automatically extracted at conversation end.\n";
+
+const WORKSPACE_FILES_NOTICE_WITH_MEMORY: &str = "\
 ## Workspace Files (Injected)
 The following <loaded_context> was loaded in from files in your workspace.
 These files (for example, `AGENTS.md`, `MEMORY.md`, and `knowledge/KNOWLEDGE.md`) contain memory, facts, preferences, guidelines, and user-specific details learned from prior interactions with user.
 ";
 
-const TRUNCATION_NOTICE: &str =
+const WORKSPACE_FILES_NOTICE_WITHOUT_MEMORY: &str = "\
+## Workspace Files (Injected)
+The following <loaded_context> was loaded in from files in your workspace.
+These files (for example, `AGENTS.md` and `knowledge/KNOWLEDGE.md`) contain guidelines and domain context for this agent.
+";
+
+const TRUNCATION_NOTICE_WITH_SEARCH: &str =
     "\n\n... (memory truncated — use memory_search for older entries) ...\n";
+
+const TRUNCATION_NOTICE_PLAIN: &str = "\n\n... (memory truncated) ...\n";
 
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 8000;
 
-/// Middleware that appends workspace context to the leading system message once per call.
+/// Middleware that appends workspace context to the request-scoped system prompt once
+/// per call. Mirrors Java `WorkspaceContextMiddleware`.
 pub struct WorkspaceContextMiddleware {
     workspace_manager: Arc<WorkspaceManager>,
     agent_name: String,
     environment_memory: Option<String>,
     max_context_tokens: usize,
     additional_context_files: Vec<String>,
+    disable_memory_tools: bool,
+    disable_memory_hooks: bool,
 }
 
 impl WorkspaceContextMiddleware {
@@ -98,12 +128,22 @@ impl WorkspaceContextMiddleware {
             environment_memory,
             max_context_tokens,
             additional_context_files: Vec::new(),
+            disable_memory_tools: false,
+            disable_memory_hooks: false,
         }
     }
 
     /// Sets the additional context files (workspace-relative) to inline.
     pub fn set_additional_context_files(&mut self, files: Vec<String>) {
         self.additional_context_files = files;
+    }
+
+    /// Mirrors `HarnessAgent.Builder.disableMemoryTools` /
+    /// `disableMemoryHooks`: the prompt must not advertise memory capabilities
+    /// that the agent does not have.
+    pub fn set_memory_flags(&mut self, disable_memory_tools: bool, disable_memory_hooks: bool) {
+        self.disable_memory_tools = disable_memory_tools;
+        self.disable_memory_hooks = disable_memory_hooks;
     }
 }
 
@@ -114,17 +154,24 @@ impl Middleware for WorkspaceContextMiddleware {
         let environment_memory = self.environment_memory.clone();
         let max_context_tokens = self.max_context_tokens;
         let additional_context_files = self.additional_context_files.clone();
+        let disable_memory_tools = self.disable_memory_tools;
+        let disable_memory_hooks = self.disable_memory_hooks;
         let ctx = ctx.clone();
 
         let fut = async move {
             let mut input = input;
             let section = build_workspace_section(
-                &wm, &ctx, &agent_name, environment_memory.as_deref(), max_context_tokens,
+                &wm,
+                &ctx,
+                &agent_name,
+                environment_memory.as_deref(),
+                max_context_tokens,
                 &additional_context_files,
-            ).await;
-            if !section.is_empty() {
-                input.messages = prepend_to_system_message(input.messages, &section);
-            }
+                disable_memory_tools,
+                disable_memory_hooks,
+            )
+            .await;
+            input.append_system_prompt(&section);
             next(input)
         };
 
@@ -140,9 +187,19 @@ async fn build_workspace_section(
     environment_memory: Option<&str>,
     max_context_tokens: usize,
     additional_context_files: &[String],
+    disable_memory_tools: bool,
+    disable_memory_hooks: bool,
 ) -> String {
+    // Mirrors Java `includeMemoryContext()`: MEMORY.md is hidden only when both the
+    // memory tools and the background hooks are off.
+    let include_memory_context = !(disable_memory_tools && disable_memory_hooks);
+
     let agents_content = wm.read_agents_md(rc).await.trim().to_string();
-    let memory_content = wm.read_memory_md(rc).await.trim().to_string();
+    let memory_content = if include_memory_context {
+        wm.read_memory_md(rc).await.trim().to_string()
+    } else {
+        String::new()
+    };
     let knowledge_content = wm.read_knowledge_md(rc).await.trim().to_string();
     let workspace = wm.workspace();
     let session_context = build_session_context_section(workspace, rc, agent_name, environment_memory);
@@ -156,21 +213,27 @@ async fn build_workspace_section(
         + estimate_tokens(&additional_block);
     let memory_tokens = estimate_tokens(&memory_content);
     let available = max_context_tokens.saturating_sub(fixed_tokens);
-    let memory_content = if available > 0 && memory_tokens > available {
-        truncate_to_token_budget(&memory_content, available)
+    let memory_content = if include_memory_context && available > 0 && memory_tokens > available {
+        truncate_to_token_budget(&memory_content, available, disable_memory_tools)
     } else {
         memory_content
     };
 
+    let guidance = build_guidance(disable_memory_tools, disable_memory_hooks);
     let workspace_paragraph = build_workspace_paragraph(workspace);
     let loaded_context = build_loaded_context_section(
-        &agents_content, &memory_content, &knowledge_block, &additional_block,
+        &agents_content,
+        &memory_content,
+        &knowledge_block,
+        &additional_block,
+        include_memory_context,
     );
-    assemble_section(&session_context, &workspace_paragraph, &loaded_context)
+    assemble_section(&session_context, &guidance, &workspace_paragraph, &loaded_context)
 }
 
 fn assemble_section(
     session_context: &str,
+    guidance: &str,
     workspace_paragraph: &str,
     loaded_context_section: &str,
 ) -> String {
@@ -179,15 +242,61 @@ fn assemble_section(
         sb.push_str(session_context);
         sb.push_str("\n\n");
     }
-    sb.push_str(GUIDANCE_TEMPLATE);
+    sb.push_str(guidance);
     if !workspace_paragraph.is_empty() {
         sb.push('\n');
         sb.push_str(workspace_paragraph);
     }
     sb.push('\n');
-    sb.push_str(WORKSPACE_FILES_NOTICE);
-    sb.push('\n');
     sb.push_str(loaded_context_section);
+    sb
+}
+
+fn build_guidance(disable_memory_tools: bool, disable_memory_hooks: bool) -> String {
+    let mut sb = String::new();
+    sb.push_str(DOMAIN_KNOWLEDGE_GUIDANCE.trim());
+    sb.push_str("\n\n");
+
+    if !disable_memory_tools {
+        sb.push_str(MEMORY_RECALL_GUIDANCE.trim());
+        sb.push_str("\n\n");
+    }
+
+    let persistence = build_memory_persistence_guidance(disable_memory_tools, disable_memory_hooks);
+    if !persistence.is_empty() {
+        sb.push_str(persistence.trim());
+        sb.push_str("\n\n");
+    }
+
+    format!("{}\n", sb.trim_end())
+}
+
+fn build_memory_persistence_guidance(
+    disable_memory_tools: bool,
+    disable_memory_hooks: bool,
+) -> String {
+    if disable_memory_tools && disable_memory_hooks {
+        return String::new();
+    }
+
+    let mut sb = String::new();
+    if !disable_memory_tools {
+        sb.push_str(MEMORY_PERSISTENCE_HEADER.trim());
+        sb.push('\n');
+        sb.push_str(MEMORY_SAVE_TOOL_GUIDANCE.trim());
+        sb.push('\n');
+    } else {
+        sb.push_str(MEMORY_PERSISTENCE_HEADER_HOOKS_ONLY.trim());
+        sb.push('\n');
+        sb.push_str(MEMORY_WRITE_FILE_GUARD.trim());
+        sb.push('\n');
+    }
+
+    if !disable_memory_hooks {
+        sb.push_str(MEMORY_AUTO_EXTRACT_GUIDANCE.trim());
+        sb.push('\n');
+    }
+
     sb
 }
 
@@ -252,10 +361,20 @@ fn build_loaded_context_section(
     memory_content: &str,
     knowledge_block: &str,
     additional_block: &str,
+    include_memory_context: bool,
 ) -> String {
-    let mut sb = String::from("<loaded_context>\n");
+    let notice = if include_memory_context {
+        WORKSPACE_FILES_NOTICE_WITH_MEMORY
+    } else {
+        WORKSPACE_FILES_NOTICE_WITHOUT_MEMORY
+    };
+    let mut sb = String::from(notice);
+    sb.push('\n');
+    sb.push_str("<loaded_context>\n");
     sb.push_str(&build_xml_context("agents_context", agents_content));
-    sb.push_str(&build_xml_context("memory_context", memory_content));
+    if include_memory_context {
+        sb.push_str(&build_xml_context("memory_context", memory_content));
+    }
     sb.push_str(&build_xml_context("domain_knowledge_context", knowledge_block));
     if !additional_block.trim().is_empty() {
         sb.push_str(additional_block);
@@ -309,13 +428,22 @@ fn estimate_tokens(text: &str) -> usize {
     }
 }
 
-fn truncate_to_token_budget(text: &str, max_tokens: usize) -> String {
+fn truncate_to_token_budget(
+    text: &str,
+    max_tokens: usize,
+    disable_memory_tools: bool,
+) -> String {
     let max_chars = max_tokens * 4;
     if text.len() <= max_chars {
         return text.to_string();
     }
     let prefix: String = text.chars().take(max_chars).collect();
-    format!("{prefix}{TRUNCATION_NOTICE}")
+    let notice = if disable_memory_tools {
+        TRUNCATION_NOTICE_PLAIN
+    } else {
+        TRUNCATION_NOTICE_WITH_SEARCH
+    };
+    format!("{prefix}{notice}")
 }
 
 async fn build_knowledge_block(
@@ -367,14 +495,22 @@ mod tests {
     #[test]
     fn truncate_short_text_unchanged() {
         let text = "short";
-        assert_eq!(truncate_to_token_budget(text, 100), text);
+        assert_eq!(truncate_to_token_budget(text, 100, false), text);
     }
 
     #[test]
-    fn truncate_long_text_appends_notice() {
+    fn truncate_long_text_appends_search_aware_notice() {
         let text = "a".repeat(200);
-        let out = truncate_to_token_budget(&text, 10);
-        assert!(out.ends_with(TRUNCATION_NOTICE));
+        let out = truncate_to_token_budget(&text, 10, false);
+        assert!(out.ends_with(TRUNCATION_NOTICE_WITH_SEARCH));
+        assert!(out.len() < text.len());
+    }
+
+    #[test]
+    fn truncate_long_text_uses_plain_notice_when_memory_tools_disabled() {
+        let text = "a".repeat(200);
+        let out = truncate_to_token_budget(&text, 10, true);
+        assert!(out.ends_with(TRUNCATION_NOTICE_PLAIN));
         assert!(out.len() < text.len());
     }
 
@@ -422,11 +558,58 @@ mod tests {
         std::fs::write(ws.join("AGENTS.md"), "# Persona\nFriendly.").unwrap();
         let wm = WorkspaceManager::new(ws.clone());
         let rc = RuntimeContext::new().with_session_id("s1");
-        let section = build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[]).await;
+        let section =
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false).await;
         assert!(section.contains("AgentStateStore Context"));
         assert!(section.contains("Persona"));
         assert!(section.contains("<loaded_context>"));
         assert!(section.contains("<agents_context>"));
+        std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_prompt_respects_disable_flags() {
+        let ws = std::env::temp_dir().join(format!("wctx-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(ws.join("knowledge")).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "# Persona\nFriendly.").unwrap();
+        std::fs::write(ws.join("MEMORY.md"), "remember the project conventions").unwrap();
+        std::fs::write(ws.join("knowledge/KNOWLEDGE.md"), "# Knowledge").unwrap();
+        let wm = WorkspaceManager::new(ws.clone());
+        let rc = RuntimeContext::new().with_session_id("s1");
+
+        let both_enabled =
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false).await;
+        assert!(both_enabled.contains("## Memory Recall"));
+        assert!(both_enabled.contains("memory_save"));
+        assert!(both_enabled.contains("automatically extracted"));
+        assert!(both_enabled.contains("<memory_context>"));
+        assert!(both_enabled.contains("remember the project conventions"));
+
+        let tools_disabled =
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, false).await;
+        assert!(!tools_disabled.contains("## Memory Recall"));
+        assert!(!tools_disabled.contains("memory_save"));
+        assert!(tools_disabled.contains("harness maintains automatically"));
+        assert!(tools_disabled.contains("Do NOT use write_file"));
+        assert!(tools_disabled.contains("automatically extracted"));
+        assert!(tools_disabled.contains("<memory_context>"));
+
+        let hooks_disabled =
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, true).await;
+        assert!(hooks_disabled.contains("## Memory Recall"));
+        assert!(hooks_disabled.contains("memory_save"));
+        assert!(!hooks_disabled.contains("automatically extracted"));
+        assert!(hooks_disabled.contains("<memory_context>"));
+
+        let both_disabled =
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, true).await;
+        assert!(!both_disabled.contains("## Memory Recall"));
+        assert!(!both_disabled.contains("memory_save"));
+        assert!(!both_disabled.contains("automatically extracted"));
+        assert!(!both_disabled.contains("<memory_context>"));
+        assert!(!both_disabled.contains("remember the project conventions"));
+        assert!(both_disabled.contains("AGENTS.md` and `knowledge/KNOWLEDGE.md`"));
+
         std::fs::remove_dir_all(ws).ok();
     }
 }
