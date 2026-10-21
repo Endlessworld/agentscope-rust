@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::message::{JsonMap, ToolResultBlock};
+use crate::message::{ContentBlock, JsonMap, TextBlock, ToolResultBlock, ToolResultState};
 use crate::state::context::{Task, TaskContextState, TaskState};
 
 use super::tool::{Tool, ToolExecutionContext};
@@ -24,6 +24,24 @@ pub struct TodoItem {
 const DESCRIPTION: &str = "Create and maintain a structured task list for the current session. \
 Tracks progress, organizes multi-step work, and surfaces status to the user. Pass the COMPLETE \
 updated list every call - this tool replaces the whole list (it does not merge).";
+
+/// Metadata key naming the state bag a tool receipt belongs to.
+pub const METADATA_STATE_KEY: &str = "context.state_key";
+
+/// Metadata key carrying the task-context revision the receipt was produced at.
+pub const METADATA_STATE_REVISION: &str = "context.state_revision";
+
+/// Metadata key distinguishing the complete current state from a superseded receipt.
+pub const METADATA_REPRESENTATION: &str = "context.representation";
+
+/// [`METADATA_STATE_KEY`] value of the session task context.
+pub const STATE_KEY_TASKS_CONTEXT: &str = "tasksContext";
+
+/// [`METADATA_REPRESENTATION`] value for the complete, current state.
+pub const REPRESENTATION_FULL: &str = "full";
+
+/// [`METADATA_REPRESENTATION`] value for a superseded receipt (written by the projection).
+pub const REPRESENTATION_RECEIPT: &str = "receipt";
 
 /// A tool that maintains the agent's structured todo list using full-list-replace semantics.
 pub struct TodoWriteTool {
@@ -100,8 +118,9 @@ impl Tool for TodoWriteTool {
         }
 
         let mut ctx = self.tasks.lock().unwrap();
+        let snapshot = ctx.snapshot();
         let mut by_content: HashMap<String, Task> = HashMap::new();
-        for existing in &ctx.tasks {
+        for existing in snapshot.tasks() {
             by_content.entry(existing.subject.clone()).or_insert_with(|| existing.clone());
         }
 
@@ -126,10 +145,33 @@ impl Tool for TodoWriteTool {
             }
             rebuilt.push(b.build());
         }
-        ctx.tasks = rebuilt;
+        // Replace through the revision-checked API: a concurrent writer that already moved the
+        // task context past the snapshot must not be clobbered, and the receipt below has to
+        // cite the revision it actually produced.
+        if let Err(error) = ctx.replace_tasks(rebuilt.clone(), snapshot.revision()) {
+            return Ok(ToolResultBlock::error(error.to_string()));
+        }
+        let revision = ctx.revision();
         drop(ctx);
 
-        Ok(ToolResultBlock::text(render(&self.tasks.lock().unwrap().tasks)))
+        let mut metadata = JsonMap::new();
+        metadata.insert(
+            METADATA_STATE_KEY.to_string(),
+            serde_json::json!(STATE_KEY_TASKS_CONTEXT),
+        );
+        metadata.insert(
+            METADATA_STATE_REVISION.to_string(),
+            serde_json::json!(revision),
+        );
+        metadata.insert(
+            METADATA_REPRESENTATION.to_string(),
+            serde_json::json!(REPRESENTATION_FULL),
+        );
+        Ok(ToolResultBlock::builder()
+            .output(ContentBlock::Text(TextBlock::new(render(&rebuilt))))
+            .metadata(metadata)
+            .state(ToolResultState::Success)
+            .build())
     }
 }
 
@@ -175,4 +217,111 @@ pub fn render(tasks: &[Task]) -> String {
         s.push_str(&format!("{}{}{}\n", marker(t.state), t.subject, suffix));
     }
     s.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(todos: serde_json::Value) -> JsonMap {
+        let mut args = JsonMap::new();
+        args.insert("todos".to_string(), todos);
+        args
+    }
+
+    fn metadata_str<'a>(result: &'a ToolResultBlock, key: &str) -> Option<&'a str> {
+        result.metadata.get(key).and_then(|value| value.as_str())
+    }
+
+    #[tokio::test]
+    async fn write_returns_a_full_receipt_citing_the_new_revision() {
+        let tasks = Arc::new(Mutex::new(TaskContextState::new()));
+        let tool = TodoWriteTool::new(Arc::clone(&tasks));
+        let result = tool
+            .call(
+                args(serde_json::json!([
+                    {"content": "step one", "status": "in_progress"},
+                    {"content": "step two", "status": "pending", "priority": "high"}
+                ])),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.state, ToolResultState::Success);
+        assert_eq!(metadata_str(&result, METADATA_STATE_KEY), Some(STATE_KEY_TASKS_CONTEXT));
+        assert_eq!(
+            result.metadata.get(METADATA_STATE_REVISION).and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            metadata_str(&result, METADATA_REPRESENTATION),
+            Some(REPRESENTATION_FULL)
+        );
+        assert_eq!(result.output.len(), 1);
+        assert_eq!(result.id, None);
+        assert_eq!(result.name, None);
+
+        let rendered = render(tasks.lock().unwrap().tasks());
+        assert_eq!(result.text_content(), rendered);
+        assert_eq!(tasks.lock().unwrap().revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_write_advances_the_revision_and_keeps_task_ids() {
+        let tasks = Arc::new(Mutex::new(TaskContextState::new()));
+        let tool = TodoWriteTool::new(Arc::clone(&tasks));
+
+        let first = tool
+            .call(
+                args(serde_json::json!([{"content": "step one", "status": "pending"}])),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.metadata.get(METADATA_STATE_REVISION).and_then(|v| v.as_u64()),
+            Some(1)
+        );
+
+        let second = tool
+            .call(
+                args(serde_json::json!([{"content": "step one", "status": "completed"}])),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.metadata.get(METADATA_STATE_REVISION).and_then(|v| v.as_u64()),
+            Some(2)
+        );
+
+        let state = tasks.lock().unwrap();
+        assert_eq!(state.revision(), 2);
+        assert_eq!(state.tasks().len(), 1);
+        assert_eq!(state.tasks()[0].state, TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn validation_errors_keep_their_text_and_do_not_touch_the_state() {
+        let tasks = Arc::new(Mutex::new(TaskContextState::new()));
+        let tool = TodoWriteTool::new(Arc::clone(&tasks));
+        let result = tool
+            .call(
+                args(serde_json::json!([
+                    {"content": "a", "status": "in_progress"},
+                    {"content": "b", "status": "in_progress"}
+                ])),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.text_content(),
+            "Error: at most one task may be in_progress at a time, but 2 were provided."
+        );
+        assert!(result.metadata.is_empty());
+        assert_eq!(tasks.lock().unwrap().revision(), 0);
+        assert!(tasks.lock().unwrap().tasks().is_empty());
+    }
 }
