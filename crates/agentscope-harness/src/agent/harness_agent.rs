@@ -1314,12 +1314,18 @@ impl HarnessAgentBuilder {
         // The compiler is opt-in: an agent with no registered material keeps the plain
         // reasoning path. Once material is configured, every model request is assembled and
         // budgeted here, which is the only place all middleware rewrites are already applied.
-        if !self.context_sources.is_empty() || self.context_sources.task_context().is_enabled() {
+        //
+        // It is *registered last* (see the end of the chain): `wrap_model_call` wraps in
+        // reverse, so the last registration is the innermost model-call middleware — the compiler
+        // must measure the request exactly as the provider will receive it. Note that
+        // `OnReasoning` rewrites (tool-pair sanitising, eviction, compaction) already run before
+        // any `OnModelCall` middleware by extension-point ordering, so the compiler always sees
+        // their output regardless of registration order.
+        let context_pipeline = if !self.context_sources.is_empty()
+            || self.context_sources.task_context().is_enabled()
+        {
             let config = crate::agent::context::ContextPipelineConfig {
-                policy: self
-                    .context_policy
-                    .take()
-                    .unwrap_or_default(),
+                policy: self.context_policy.take().unwrap_or_default(),
                 sources: self.context_sources.clone(),
                 ..Default::default()
             };
@@ -1334,10 +1340,10 @@ impl HarnessAgentBuilder {
                     });
                 }
             }
-            middleware.add(Box::new(crate::agent::context::ContextMiddleware::new(
-                Arc::new(pipeline),
-            )));
-        }
+            Some(Arc::new(pipeline))
+        } else {
+            None
+        };
 
         // Keep every outgoing model request provider-valid: strip trailing assistant
         // `tool_calls` that were never answered and orphan TOOL results (e.g. after
@@ -1814,6 +1820,15 @@ impl HarnessAgentBuilder {
             middleware.add(Box::new(StateCheckpointMiddleware::with_conflict_policy(
                 Arc::clone(store),
                 self.conflict_policy,
+            )));
+        }
+
+        // The compiler is registered last on purpose: the chain wraps in reverse, so the last
+        // registration is the innermost model-call middleware. It validates and budgets the final
+        // request, after every other rewrite has been applied.
+        if let Some(pipeline) = context_pipeline {
+            middleware.add(Box::new(crate::agent::context::ContextMiddleware::new(
+                pipeline,
             )));
         }
 

@@ -230,3 +230,67 @@ async fn task_projection_stays_off_without_opting_in() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A tool result whose `id` has no matching `tool_use`: only the sanitiser can repair this.
+fn orphan_tool_result(id: &str, text: &str) -> Msg {
+    let result = agentscope_core::message::ToolResultBlock::builder()
+        .id(id)
+        .name("ls")
+        .output(CoreBlock::Text(TextBlock::new(text)))
+        .build();
+    Msg::builder()
+        .role(agentscope_core::message::MsgRole::Tool)
+        .content(vec![CoreBlock::ToolResult(result)])
+        .build()
+}
+
+#[tokio::test]
+async fn the_compiler_accepts_input_the_sanitizer_repaired() {
+    // The history carries an orphan tool result, which `ToolCallPairSanitizerMiddleware` strips
+    // at the reasoning extension point. The compiler must therefore validate the repaired view —
+    // if it saw the raw history instead it would fail with `invalid_tool_pairs`.
+    let dir = temp_dir("sanitized");
+    let seen: Arc<Mutex<Vec<Vec<Msg>>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = HarnessAgent::builder()
+        .name("sanitized")
+        .model(Arc::new(ScriptedModel {
+            responses: Mutex::new(vec![text_response("done")]),
+            seen: Arc::clone(&seen),
+        }))
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
+        .max_iters(1)
+        .task_context(TaskContextOptions {
+            requirements: true,
+            verification_results: false,
+            requirement_proposals: false,
+        })
+        .build();
+
+    use futures::StreamExt;
+    let events: Vec<_> = agent
+        .stream_events(
+            vec![Msg::user("hi"), orphan_tool_result("ghost", "ghost output")],
+            StreamOptions::default(),
+        )
+        .collect()
+        .await;
+    assert!(
+        !events.iter().any(|event| event.is_err()),
+        "the compiler must not reject a request the sanitiser repairs: {:?}",
+        events.iter().find(|event| event.is_err())
+    );
+
+    let batches = seen.lock().unwrap().clone();
+    assert!(!batches.is_empty(), "the model was never called");
+    // Auxiliary (memory) calls flatten the transcript into text, so assert on the block: the
+    // orphan result must never reach a request as a `tool_result`.
+    let leaked = batches.iter().flatten().any(|message| {
+        message
+            .tool_result_blocks()
+            .any(|result| result.id.as_deref() == Some("ghost"))
+    });
+    assert!(!leaked, "the orphan tool result reached the model");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

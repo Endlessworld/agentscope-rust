@@ -26,6 +26,7 @@ use agent_client_protocol::{Agent, Stdio};
 use agentscope_core::model::Model;
 use agentscope_extensions_model::OpenAiChatModel;
 
+use crate::agent::context::TaskContextOptions;
 use crate::agent::{CompactionConfig, HarnessAgent};
 use crate::CompactionMiddlewareConfig;
 
@@ -89,6 +90,12 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
         .max_iters(50)
         // 同 ACP 主路径：中断/崩溃后把悬挂的 tool_use 补成 error result。
         .enable_pending_tool_recovery(true)
+        // 与 ACP 主路径一致：开启任务投影，交给上下文编译器产出 `<TASK_STATE>` 与 manifest。
+        .task_context(TaskContextOptions {
+            requirements: true,
+            verification_results: true,
+            requirement_proposals: false,
+        })
         .build()
 }
 

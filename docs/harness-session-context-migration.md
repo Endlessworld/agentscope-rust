@@ -83,6 +83,8 @@ Java 该提交新增 4 个包（非测试源码约 5,640 行）：
 - **执行级扩展**：`ReActAgentBuilder::extension/extension_arc` 挂载、`run_stream_with_extensions` / `stream_events_with_extensions` 按次**合并**（不是覆盖）进 `RuntimeContext`。
 - **上下文编译**：`HarnessAgentBuilder::{context_source, instruction, context_policy, task_context}` 为**显式 opt-in**；注册了材料**或**开启任一 task 投影（`TaskContextOptions::is_enabled()`）才在 `build()` 里加入 `ContextMiddleware`（挂 `OnModelCall`），否则完全保持原路径。
 - **任务快照**：`react_agent.rs::reasoning_phase` 每步把共享任务袋（`core.tasks`，`todo_write` 就地修改）折叠进发布快照后才编译请求，因此投影与 manifest 的 `task_revision` 看到的是本步的实时任务状态（Java 靠可变 `AgentState` 达到同样效果）。
+- **编译器位置**：`build()` 把 `ContextMiddleware` 注册在中间件链**末尾**；`wrap_model_call` 是反向包装，因此它是最内层的 `OnModelCall` 中间件，校验与预算都作用在最终请求上。`OnReasoning` 重写（tool-pair 清洗、tool-result eviction、compaction）按扩展点顺序先于任何 `OnModelCall`，所以编译器看到的永远是修复后的视图。
+- **ACP 接线**：`acp/acp_harness_agent.rs` 与 `acp/coding_agent.rs` 的构建点均加 `.task_context(TaskContextOptions { requirements: true, verification_results: true, .. })`：只开任务投影、**不注册 source**，避免与 `WorkspaceContextMiddleware` 的 system prompt 注入重复。
 - **会话运行时**：`AgentSession` → `SessionInbox`（受理）→ `SessionRecorder`（事实）→ `ReActAgent`（执行）→ `SessionTurns`（投影）。
 
 ## 5. 未落地项（不是缺陷，是待办）
@@ -111,6 +113,8 @@ Java 该提交新增 4 个包（非测试源码约 5,640 行）：
 | `cargo test -p agentscope-harness --test harness_context_wiring_test` | 3 passed |
 | `cargo test -p agentscope-harness --test harness_session_test` | 9 passed |
 | `cargo test -p agentscope-core --test session_step_boundary` | 2 passed |
+| `cargo test -p agentscope-harness --test harness_task_context_wiring_test` | 3 passed（含新增：sanitizer 修复后的输入不被编译器拒绝） |
+| ACP 集成测试（`acp_event_flow` / `acp_cancel` / `acp_elicitation` / `acp_session_resume`） | 1 / 2 / 1 / 1 passed |
 | `cargo test --workspace -j 2 --no-fail-fast` | 112 个 target / 3397 passed / 1 ignored；唯一失败 `agentscope-extensions-training::runner::tests::run_registry_allocates_incrementing_ids`（进程级 `OnceLock` 静态注册表竞争，既有 flake；`cargo test -p agentscope-extensions-training --lib` 单跑 64 passed / 0 failed） |
 
 反向验证（回退实现→对应测试 FAILED→恢复）：①`session_continues` 强制 `Ok(false)` → settle 回环 2 例 FAILED；②去掉 `reasoning_phase` 的 `before_step` → 「运行前 steer 折叠」FAILED；③把 `iter >= max_iters` 改成 `>` → 「每步一个 step」FAILED（3≠2）；④删除 `reasoning_phase` 的 `core.tasks` 折叠 → 任务投影测试 FAILED（revision `[0,0,0]`）；⑤`build()` 去掉 `is_enabled()` 门禁 → 任务投影测试 FAILED（manifest 为空）。

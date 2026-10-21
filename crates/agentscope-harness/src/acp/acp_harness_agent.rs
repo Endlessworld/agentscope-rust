@@ -101,6 +101,7 @@ use agentscope_harness::acp::{config::default_modes, AcpAgentSession, AcpCodingA
 use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
 use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::acp::{AskUserTool, SessionBuild};
+use agentscope_harness::agent::context::TaskContextOptions;
 use agentscope_harness::agent::{
     CompactionConfig, CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
     ToolResultEvictionConfig,
@@ -910,6 +911,14 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
             cwd.join(".agentscope").join("state"),
         )))
         .sys_prompt(build_system_prompt(&cwd))
+        // 任务投影：每步把已提交的 todo / 需求 / 已验证项投影成 `<TASK_STATE>` 视图，并让
+        // 上下文编译器产出 manifest（预算、transforms、taskRevision）；没有注册 source，
+        // 因此不会与 `WorkspaceContextMiddleware` 的 system prompt 注入重复。
+        .task_context(TaskContextOptions {
+            requirements: true,
+            verification_results: true,
+            requirement_proposals: false,
+        })
         .register_filesystem_tools(true)
         .register_shell_tool(true)
         .compaction(CompactionMiddlewareConfig {
