@@ -16,6 +16,7 @@ pub mod session;
 pub mod skill;
 pub mod subagent;
 pub mod team;
+pub mod verification;
 pub mod workspace;
 
 pub use bus::{
@@ -99,6 +100,7 @@ pub use subagent::{
     TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository,
     SUPPRESS_COMPLETION_CALLBACK,
 };
+pub use verification::{verify, DeterministicVerifier, SettledAction, Verdict};
 pub use workspace::{
     NamespaceFactory, NoNamespace, PlanModeManager, UserSessionNamespace, WorkspaceConstants,
     WorkspaceIndex, WorkspaceManager, WorkspacePathNormalizer,
