@@ -7,7 +7,7 @@
 - Windows + PowerShell；偏好简洁中文；目录勘察一行一条并标 `[目录]`/`[文件]`，最多 20 个顶层条目；只读探索不落盘。
 - 常见只读角色：①「只读任务模式」——用户明确「不要修改任何文件」，如全量测试跑 `cargo test --workspace -j 2 --no-fail-fast` 并把输出落文件，汇总须含所有 `test result:` 行、`FAILED`/`failures:`/`panicked` 原文与「是否有编译错误」；②「Rust 代码审核员」——对象为新增未提交文件 + 相关 `Cargo.toml`，逐文件给「路径 → 结论：OK / 具体问题+行号」，末尾按「必须修复 / 建议改进 / 可接受」三档 + 测试数量线索。
 - 审核固定维度：①依赖最小必要、与 workspace 其它 crate 版本一致（须 grep 核对）、是否本应放 workspace 依赖却写死；②协议实现正确性（握手 / namespace connect / ping-pong / 事件解析 / 重连退避）；③单测充分且离线；④`unwrap`/panic 风险；⑤schema 符合性、id 校验、类型映射；⑥是否引入被限制 crate；⑦死代码 / 未接线模块；⑧**trait 方法是否漏实现**。
-
+- 全局上下文： E:\local-github\agentscope-rust\.agents\context\index.md
 ## 构建 / 测试环境（Windows + PowerShell）
 - **不要用 PowerShell 管道直连 `cargo test --workspace`**（巨量输出触发 .NET Stack overflow）→ 先 `Out-File $env:TEMP\xx.log` 再 `Select-String`。
 - 全量用 `cargo test --workspace -j 2 --no-fail-fast`（降并行避 `os error 1455` 页面文件/rlib mmap 失败；`os error 112`=磁盘满）。`cargo test -p agentscope-harness` 全量可能 >300s 工具超时 → 改跑 `--lib`。`-j 2` 亦规避 `training::runner` 静态注册表竞争。

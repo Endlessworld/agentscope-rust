@@ -327,8 +327,8 @@
 |---|---|---|---|---|
 | M1 | `agent/team/` | `src/agent/team/` | ✅（LocalTeamClient 进程内 CAS；store-backed 分布式实现待办） | P1 |
 | M2 | `agent/coordination/` | `src/agent/coordination/` | ✅ | P2 |
-| M3 | `agent/transcript/` | `src/agent/transcript/` | ✅ | P1 |
-| M4 | `agent/middleware/TranscriptMiddleware` | `src/agent/middleware/transcript.rs` | ✅ | P1 |
+| M3 | `agent/transcript/` | `src/agent/transcript/` | ⛔ 已删除（2026-10-21）——由 `core/session` journal 取代 | P1 |
+| M4 | `agent/middleware/TranscriptMiddleware` | `src/agent/middleware/transcript.rs` | ⛔ 已删除（2026-10-21）——由 `SessionRecorder` 取代 | P1 |
 | M5 | `agent/middleware/TeamsMiddleware` | `src/agent/middleware/teams.rs` | ✅（系统提示队伍节 + 每轮 mailbox drain；wakeup 注入待 gateway runStream） | P1 |
 | M6 | `agent/middleware/SandboxLifecycleMiddleware` | `src/agent/middleware/sandbox_lifecycle.rs` | ✅ | P1 |
 
@@ -457,7 +457,7 @@
   - ✅ `asyncToolTimeout(Duration)`（存储 + getter）
   - ✅ `environment(String)`（默认 `"prod"`）
   - ✅ `taskRepository(repo)`（覆盖默认 `WorkspaceTaskRepository`）
-  - ✅ `transcriptStore` + `disableTranscript()` + `transcriptTenant(...)`（接线 `TranscriptMiddleware`，默认 root `.agentscope/transcripts`）
+  - ~~✅ `transcriptStore` + `disableTranscript()` + `transcriptTenant(...)`（接线 `TranscriptMiddleware`，默认 root `.agentscope/transcripts`）~~ —— **已废弃（2026-10-21）**：`TranscriptMiddleware` / `agent/transcript/` / `.agentscope/transcripts` 均已删除，会话历史统一由 `SessionLog`（journal）承载，对应 builder 旋钮不复存在。见 `docs/harness-session-context-migration.md`。
   - ✅ `teamsMode(TeamClient, TeamContext)`（注册角色裁剪 `team` 工具 + `TeamsMiddleware`；`TeamContext` 增 `member` 字段与 `new()`）
   - ✅ `disableMemoryTools()` / `disableWebTools()` / `webHttpClient(HttpClient)`（默认注册 `memory_search/get/save` + `web_fetch/web_search`，可禁用，客户端可注入）
 - 仍缺口：
@@ -504,7 +504,7 @@
    - shutdown 精细化（GracefulShutdownMiddleware / per-request 跟踪 / ctrl_c 信号）
 5. **P2 本轮完成**（§3.13 P2 清单，2026-09-17）：M2 coordination、S1–S3/S8 RemoteFilesystem+store+utils+baked、S9/S10 安全扫描+curator 过滤器、B2–B4 snapshot/layout/helpers、G2/G4/G6 gateway、R1–R3 subagent protocol+HTTP client。
 6. **P2 剩余（部分）**（2026-09-17 复核，详见 §3.14）：
-   - D2 `HarnessAgent.Builder` 自动装配：**2026-09-17 已补 13 项 setter**（agentId/description/checkRunning/enablePendingToolRecovery/enableMetaTool/enableTaskList/useLegacyXmlWorkspaceContext/asyncToolTimeout/environment/taskRepository/transcript*/teamsMode/disableMemoryTools+disableWebTools+webHttpClient）；剩余 `toolsConfig`+`disableToolsConfig`、`filesystem(Local/Remote/SandboxFilesystemSpec)`、`artifactDeliveryTarget`、`subagentFactory`、`modelResolver`、`externalSubagentTool`、`filesystemRoute`、`mcpServerRegistrationListener`、`registerExternalSchemas`（无对应子系统，见 §3.14 D2）
+   - D2 `HarnessAgent.Builder` 自动装配：**2026-09-17 已补 13 项 setter**（agentId/description/checkRunning/enablePendingToolRecovery/enableMetaTool/enableTaskList/useLegacyXmlWorkspaceContext/asyncToolTimeout/environment/taskRepository/~~transcript*~~（已随 `TranscriptMiddleware` 删除，2026-10-21）/teamsMode/disableMemoryTools+disableWebTools+webHttpClient）；剩余 `toolsConfig`+`disableToolsConfig`、`filesystem(Local/Remote/SandboxFilesystemSpec)`、`artifactDeliveryTarget`、`subagentFactory`、`modelResolver`、`externalSubagentTool`、`filesystemRoute`、`mcpServerRegistrationListener`、`registerExternalSchemas`（无对应子系统，见 §3.14 D2）
    - ~~D3 `SkillRuntime` 完整性~~ ✅（2026-09-17，context 快照绑定 + prepare_toolkit 授权边界，见 §3.9）
    - D5 `SubagentDeclaration` 残余：`SubagentSpecGenerator`（LLM spec 生成）缺失、`SubagentDeclaration::new()` 的 `steps` 无默认、无 `load_from_file`
    - D6 `WorkspaceTaskRepository` 残余：仅 `BackgroundTask::when_complete` 未做（Rust 走 `set_done`+Future）；**维护循环、远程轮询、update_awaiting_confirm、trait lifecycle、持久化 version CAS、`TaskRunSpec::Remote` 生产接线均已于 2026-09-17 落地**，见 §3.14 D6

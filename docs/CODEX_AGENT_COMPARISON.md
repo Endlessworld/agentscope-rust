@@ -204,7 +204,7 @@
 ### 10.2 AgentScope-Rust：middleware（进程内洋葱链）
 
 - **core**：`Middleware` trait 5 钩子：`on_agent` / `on_reasoning` / `on_acting` / `on_model_call` / `on_system_prompt`（可改系统提示）。
-- **harness 内置 18 个中间件**：`conversation_compaction`、`tool_result_eviction`、`memory_flush`、`memory_maintenance`、`sandbox_lifecycle`、`state_checkpoint`、`skill_middleware`、`subagents`、`dynamic_subagents`、`teams`、`transcript`、`workspace_context`、`at_path`、`inbox`、`agent_trace`、`async_tool`、`tool_call_sanitizer`。
+- **harness 内置 16 个中间件**：`conversation_compaction`、`tool_result_eviction`、`memory_flush`、`memory_maintenance`、`sandbox_lifecycle`、`state_checkpoint`、`skill_middleware`、`subagents`、`dynamic_subagents`、`teams`、`workspace_context`、`at_path`、`inbox`、`agent_trace`、`async_tool`、`tool_call_sanitizer`。会话历史不再由中间件写入（原 `transcript` 中间件已于 2026-10-21 删除，改由 core `SessionRecorder` 写 journal）。
 
 ### 10.3 差异判定
 
@@ -244,7 +244,7 @@
 | 后台任务持久化 | ✅ thread-store + rollout | ✅ `TaskRepository`（本地/远程） |
 | 子体结果回流 | 类型化 context 注入 | 后台任务回调 + gateway |
 | 消息总线/通道 | ❌（仅 agent 间消息） | ✅ `bus` + `channel`（ChatUI/DM/Router） |
-| 多团队协作 | ❌ | ✅ `team` + `transcript` |
+| 多团队协作 | ❌ | ✅ `team` + 会话 journal（`SessionLog`） |
 
 **结论**：两者互补。AgentScope 的「消息总线 + 通道路由 + 团队」是 Codex 没有的；Codex 的「拓扑 + 深度治理 + 授权/驻留/服务级」是 AgentScope 缺的。建议优先补 **子智能体拓扑与深度限制**（成本低、防御价值高）。
 
@@ -307,7 +307,7 @@
 
 - **技能治理**：安全扫描（6 类 18 规则）、Canary/环境过滤、审计日志、策展与晋升。
 - **多通道网关**：`channel/{chatui,dm_scope,peer,router}` + `bus` + `PeriodicGate` 唤醒调度。
-- **团队协作与转录**：`team` + `transcript`。
+- **团队协作与转录**：`team` + 会话 journal（`SessionLog`）。
 - **文件系统抽象谱系**：Local / Overlay / Composite / Sandbox / **Remote** / Baked（Codex 是单一本地 FS + 进程）。
 - **Java 生态互通**：状态文件格式与事件/API 语义对齐（迁移项目的核心目标）。
 - **可嵌入/可裁剪**：`lite` feature（去 rusqlite）+ `embedded` profile（极端体积优化）——Codex 无此轴。
