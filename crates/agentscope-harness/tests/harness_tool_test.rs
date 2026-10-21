@@ -55,7 +55,8 @@ async fn filesystem_tools_registered_and_dispatch() {
     // write_file then read_file roundtrip
     let write_call = ToolUseBlock::new("1", "write_file", serde_json::json!({ "operations": [{ "path": "/a.txt", "content": "hello world" }] }).as_object().cloned().unwrap());
     let r = toolkit.call_tool(&write_call, Default::default()).await.unwrap();
-    assert!(result_text(&r).contains("### /a.txt"));
+    // The batch tools dropped the historical `### ` header on purpose (580691b).
+    assert!(result_text(&r).contains("/a.txt"));
     assert!(result_text(&r).contains("Written"));
 
     let read_call = ToolUseBlock::new("2", "read_file", serde_json::json!({ "filePath": ["/a.txt"] }).as_object().cloned().unwrap());
