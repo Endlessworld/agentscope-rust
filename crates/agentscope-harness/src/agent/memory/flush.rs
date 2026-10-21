@@ -10,8 +10,9 @@ use std::sync::Arc;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
-use agentscope_core::model::{GenerateOptions, Model};
+use agentscope_core::model::Model;
 
+use crate::agent::context::auxiliary_text;
 use crate::agent::memory::compaction::SUMMARY_MSG_NAME;
 use crate::filesystem::Filesystem;
 
@@ -148,7 +149,7 @@ impl MemoryFlushManager {
             Msg::builder().role(MsgRole::System).content(vec![ContentBlock::Text(TextBlock::new(self.flush_prompt.clone()))]).build(),
             Msg::builder().role(MsgRole::User).content(vec![ContentBlock::Text(TextBlock::new(user_prompt))]).build(),
         ];
-        let extracted = self.collect_text(input).await;
+        let extracted = self.collect_text(ctx, input).await;
         let extracted = extracted.trim();
         if extracted.is_empty() || extracted == "NO_REPLY" {
             return Ok(());
@@ -164,20 +165,16 @@ impl MemoryFlushManager {
         format!("agents/{agent_id}/sessions/{session_id}.jsonl")
     }
 
-    async fn collect_text(&self, messages: Vec<Msg>) -> String {
-        use futures::StreamExt;
-        let mut out = String::new();
-        let mut stream = self.model.stream(messages, Vec::new(), GenerateOptions::default());
-        while let Some(resp) = stream.next().await {
-            if let Ok(r) = resp {
-                for block in &r.content {
-                    if let ContentBlock::Text(t) = block {
-                        out.push_str(&t.text);
-                    }
-                }
-            }
-        }
-        out
+    /// Runs the memory-extraction auxiliary call and returns its concatenated text.
+    ///
+    /// Extraction goes through the budget-only auxiliary path (System material only, no task
+    /// state, no context middleware), so a flush can never recursively compact or inject task
+    /// state. A failing model must not fail the flush: the extraction is best-effort and the
+    /// daily ledger simply gains no entry, matching the previous ignore-errors behaviour.
+    async fn collect_text(&self, ctx: &RuntimeContext, messages: Vec<Msg>) -> String {
+        auxiliary_text(Arc::clone(&self.model), messages, Some(ctx))
+            .await
+            .unwrap_or_default()
     }
 }
 
@@ -289,7 +286,7 @@ mod tests {
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
     use agentscope_core::message::{ChatUsage, TextBlock};
-    use agentscope_core::model::ChatResponse;
+    use agentscope_core::model::{ChatResponse, GenerateOptions};
 
     use crate::filesystem::LocalFilesystem;
 

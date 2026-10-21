@@ -165,6 +165,14 @@ impl TaskContextOptions {
         self.requirements = true;
         self
     }
+
+    /// Whether any projection is enabled.
+    ///
+    /// An agent with nothing else registered but a task projection still needs the compiler:
+    /// the projection only happens inside it, so this is what opts the agent in.
+    pub fn is_enabled(self) -> bool {
+        self.requirements || self.verification_results || self.requirement_proposals
+    }
 }
 
 /// One material entry in the manifest (metadata only, no bodies).

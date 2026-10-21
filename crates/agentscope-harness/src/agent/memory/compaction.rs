@@ -9,7 +9,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
-use agentscope_core::model::{GenerateOptions, Model};
+use agentscope_core::model::Model;
+
+use crate::agent::context::auxiliary_text;
 
 /// ~1 token per 2.5 characters (mixed English/Chinese heuristic).
 const CHARS_PER_TOKEN: f64 = 2.5;
@@ -579,17 +581,10 @@ impl ConversationCompactor {
         let formatted = format_messages_for_summary(prefix);
         let prompt = config.summary_prompt.replace("{messages}", &formatted);
         let input = vec![Msg::user(prompt)];
-        let mut out = String::new();
-        let mut stream = model.stream(input, Vec::new(), GenerateOptions::default());
-        use futures::StreamExt;
-        while let Some(resp) = stream.next().await {
-            let r = resp?;
-            for block in &r.content {
-                if let ContentBlock::Text(t) = block {
-                    out.push_str(&t.text);
-                }
-            }
-        }
+        // Compaction summarizes through the budget-only auxiliary path: it cannot re-enter the
+        // context middleware, so a summary can never trigger another compaction. A model
+        // failure stays an error so the caller keeps the original history.
+        let out = auxiliary_text(Arc::clone(model), input, None).await?;
         let trimmed = out.trim();
         if trimmed.is_empty() {
             return Err(agentscope_core::error::Error::Agent(

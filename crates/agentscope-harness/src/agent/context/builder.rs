@@ -8,8 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use agentscope_core::agent::RuntimeContext;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, ToolResultBlock};
 use agentscope_core::model::{GenerateOptions, Model, ToolSchema};
+use agentscope_core::state::TaskContextState;
 
 use super::item::{ContextItem, ContextItemPlacement, ContextPurpose};
 use super::policy::{
@@ -20,6 +22,26 @@ use super::render::{
     layout_messages, material_message, remove_synthetic, render_context_blocks, MessageKind,
 };
 use super::source::{CollectedMaterials, ContextRequest, ContextSources};
+use crate::agent::middleware::tool_result_eviction::{evict_messages, ToolResultFingerprint};
+
+/// Filesystem identity for one preparation.
+///
+/// Evicted results are written through the workspace filesystem, which scopes paths by the
+/// call identity. The compiler therefore rebuilds that identity from [`ContextRequest`]
+/// instead of reading mutable agent state.
+fn call_context(request: &ContextRequest) -> RuntimeContext {
+    let mut ctx = RuntimeContext::new();
+    if let Some(agent_id) = &request.agent_id {
+        ctx = ctx.with_agent_id(agent_id.clone());
+    }
+    if let Some(user_id) = &request.user_id {
+        ctx = ctx.with_user_id(user_id.clone());
+    }
+    if let Some(session_id) = &request.session_id {
+        ctx = ctx.with_session_id(session_id.clone());
+    }
+    ctx
+}
 
 /// Runtime-context key prefix carrying the manifest of one prepared call.
 pub const MANIFEST_ATTRIBUTE_PREFIX: &str = "agentscope.model_request_manifest.";
@@ -35,6 +57,21 @@ pub struct ContextPipelineConfig {
     pub selection: Arc<dyn ContextSelectionPolicy>,
     /// Project task state (PLAN/BUILD) into the request.
     pub project_plan_state: bool,
+    /// Per-tool-result eviction run in the budget pass.
+    ///
+    /// Eviction belongs to the single compiler: an oversized historical tool result must be
+    /// offloaded *before* the request is measured and layouted, otherwise the budget decision
+    /// is made on a view the provider never receives.
+    pub eviction: Option<ContextEviction>,
+}
+
+/// Per-tool-result eviction wired into the compiler's budget pass.
+#[derive(Clone)]
+pub struct ContextEviction {
+    /// Workspace the offloaded results are written to.
+    pub fs: Arc<dyn crate::filesystem::Filesystem>,
+    /// Thresholds and exclusions, shared with the eviction middleware.
+    pub config: crate::agent::memory::ToolResultEvictionConfig,
 }
 
 impl std::fmt::Debug for ContextPipelineConfig {
@@ -54,6 +91,7 @@ impl Default for ContextPipelineConfig {
             sources: ContextSources::empty(),
             selection: Arc::new(DefaultSelectionPolicy),
             project_plan_state: true,
+            eviction: None,
         }
     }
 }
@@ -99,11 +137,34 @@ impl ContextPipeline {
         &self.config.policy
     }
 
+    /// Wires per-tool-result eviction into the budget pass.
+    pub fn with_eviction(mut self, eviction: ContextEviction) -> Self {
+        self.config.eviction = Some(eviction);
+        self
+    }
+
+    /// Projects the committed task state into a request view.
+    ///
+    /// Pure and transient: the caller's history is never rewritten, only the view handed to the
+    /// provider. Requirement and verification sections follow the configured options.
+    fn project_task(&self, messages: Vec<Msg>, task_state: Option<&TaskContextState>) -> Vec<Msg> {
+        let Some(state) = task_state else {
+            return messages;
+        };
+        let options = self.config.sources.task_context();
+        agentscope_core::middleware::project(
+            messages,
+            state,
+            options.requirements,
+            options.verification_results,
+        )
+    }
+
     /// Compiles one model request.
     ///
     /// `history` is the committed conversation; `messages` are the messages the caller already
     /// assembled (typically the same history). Sources are loaded once and reused by both the
-    /// budget pass and the rendering pass.
+    /// budget pass and the rendering pass. Task state is not projected.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &self,
@@ -113,7 +174,26 @@ impl ContextPipeline {
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
     ) -> crate::Result<PreparedRequest> {
+        self.prepare_with_task(model, request, messages, tools, options, None)
+            .await
+    }
+
+    /// Compiles one model request, projecting the committed task state.
+    ///
+    /// The projection is transient: it rewrites historical `todo_write` receipts and appends
+    /// one synthetic `<TASK_STATE>` message for this request only, never to durable history.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_with_task(
+        &self,
+        model: Arc<dyn Model>,
+        request: ContextRequest,
+        messages: Vec<Msg>,
+        tools: Vec<ToolSchema>,
+        options: GenerateOptions,
+        task_state: Option<&TaskContextState>,
+    ) -> crate::Result<PreparedRequest> {
         let purpose = request.purpose;
+        let task_revision = task_state.map(|state| state.revision()).unwrap_or(0);
         let mut transforms: Vec<String> = Vec::new();
 
         // 1. Collect material. Only a reasoning preparation loads dynamic sources.
@@ -137,8 +217,36 @@ impl ContextPipeline {
             }
         }
 
-        // 3. Build the request with the material and honour the budget.
+        // 3. Tool-result eviction. Java runs this inside the compiler as well: offloading an
+        // oversized historical result changes the view that is measured and sent, so doing it
+        // only in a sibling middleware pass would budget a request nobody ever sees.
         let mut current = self.with_materials(messages.clone(), &selected);
+        if purpose == ContextPurpose::Reasoning {
+            if let Some(eviction) = &self.config.eviction {
+                let fs_ctx = call_context(&request);
+                let agent_name = request.agent_id.clone().unwrap_or_default();
+                let mut replacements: HashMap<ToolResultFingerprint, String> = HashMap::new();
+                let (rebuilt, changed) = evict_messages(
+                    &eviction.fs,
+                    &eviction.config,
+                    &agent_name,
+                    &fs_ctx,
+                    current.clone(),
+                    &mut replacements,
+                )
+                .await;
+                if changed {
+                    transforms.push("tool_result_offload".to_string());
+                    current = rebuilt;
+                }
+            }
+        }
+        // 3.5 Task projection. Java projects inside the compiler before measuring, so the
+        // budget counts the synthetic state message the provider will actually receive.
+        if purpose == ContextPurpose::Reasoning && task_state.is_some() {
+            current = self.project_task(current, task_state);
+            transforms.push("task_state_projection".to_string());
+        }
         let limit = self.input_limit(model.as_ref(), &options);
         let mut estimate = self
             .config
@@ -178,7 +286,8 @@ impl ContextPipeline {
                 }
                 selected.retain(|candidate| candidate.source_id != id);
                 transforms.push(format!("omitted_for_budget:{id}"));
-                current = self.with_materials(messages.clone(), &selected);
+                current =
+                    self.project_task(self.with_materials(messages.clone(), &selected), task_state);
                 estimate = self
                     .config
                     .policy
@@ -212,6 +321,7 @@ impl ContextPipeline {
                 &selected,
                 &transforms,
                 &validation,
+                task_revision,
             );
             self.observe(&manifest);
             return Err(crate::Error::Agent(error));
@@ -228,6 +338,7 @@ impl ContextPipeline {
                 &selected,
                 &transforms,
                 &validation,
+                task_revision,
             );
             self.observe(&manifest);
             return Err(crate::Error::Agent(format!(
@@ -246,6 +357,7 @@ impl ContextPipeline {
             &selected,
             &transforms,
             &validation,
+            task_revision,
         );
         self.observe(&manifest);
 
@@ -287,6 +399,7 @@ impl ContextPipeline {
         selected: &[ContextItem],
         transforms: &[String],
         validation: &str,
+        task_revision: u64,
     ) -> ContextManifest {
         let mut items = Vec::new();
         for message in messages {
@@ -327,7 +440,7 @@ impl ContextPipeline {
             input_limit: limit,
             counting_method: estimate.method.clone(),
             exact: estimate.exact,
-            task_revision: 0,
+            task_revision,
             items,
             transforms: transforms.to_vec(),
             validation: validation.to_string(),

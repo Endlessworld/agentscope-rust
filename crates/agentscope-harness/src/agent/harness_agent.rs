@@ -771,7 +771,8 @@ impl HarnessAgentBuilder {
 
     /// Registers a dynamic context source for the context compiler.
     ///
-    /// Registering any source or instruction opts this agent into the compiler: every model
+    /// Registering any source or instruction (or enabling a task projection, see
+    /// [`HarnessAgentBuilder::task_context`]) opts this agent into the compiler: every model
     /// request is then assembled from material and fitted into the budget before dispatch.
     pub fn context_source(
         mut self,
@@ -806,6 +807,16 @@ impl HarnessAgentBuilder {
     /// Overrides the budget/accounting policy of the context compiler.
     pub fn context_policy(mut self, policy: crate::agent::context::ContextPolicy) -> Self {
         self.context_policy = Some(policy);
+        self
+    }
+
+    /// Enables task projections inside the context compiler. Mirrors Java
+    /// `HarnessAgent.Builder.taskContext`.
+    ///
+    /// Projections only exist inside the compiler, so enabling one opts the agent in even when
+    /// no source or instruction is registered.
+    pub fn task_context(mut self, options: crate::agent::context::TaskContextOptions) -> Self {
+        self.context_sources = self.context_sources.clone().with_task_context(options);
         self
     }
 
@@ -1303,7 +1314,7 @@ impl HarnessAgentBuilder {
         // The compiler is opt-in: an agent with no registered material keeps the plain
         // reasoning path. Once material is configured, every model request is assembled and
         // budgeted here, which is the only place all middleware rewrites are already applied.
-        if !self.context_sources.is_empty() {
+        if !self.context_sources.is_empty() || self.context_sources.task_context().is_enabled() {
             let config = crate::agent::context::ContextPipelineConfig {
                 policy: self
                     .context_policy
@@ -1312,8 +1323,19 @@ impl HarnessAgentBuilder {
                 sources: self.context_sources.clone(),
                 ..Default::default()
             };
+            let mut pipeline = crate::agent::context::ContextPipeline::new(config);
+            // Compiler-driven eviction uses the same thresholds as the middleware: one
+            // policy, two call sites (the compiler runs first).
+            if !self.disable_tool_result_eviction {
+                if let Some(cfg) = self.tool_result_eviction_config.clone() {
+                    pipeline = pipeline.with_eviction(crate::agent::context::ContextEviction {
+                        fs: Arc::clone(&filesystem),
+                        config: cfg,
+                    });
+                }
+            }
             middleware.add(Box::new(crate::agent::context::ContextMiddleware::new(
-                Arc::new(crate::agent::context::ContextPipeline::new(config)),
+                Arc::new(pipeline),
             )));
         }
 

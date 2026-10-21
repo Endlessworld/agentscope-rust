@@ -24,7 +24,7 @@ pub const EVICTED_METADATA_KEY: &str = "agentscope.tool_result_evicted";
 
 /// Fingerprint identifying an evictable tool result (id + name + text).
 #[derive(PartialEq, Eq, Hash)]
-struct ToolResultFingerprint {
+pub(crate) struct ToolResultFingerprint {
     id: Option<String>,
     name: Option<String>,
     text: String,
@@ -71,7 +71,10 @@ impl Middleware for ToolResultEvictionMiddleware {
 }
 
 /// Returns the eviction `(messages, changed)` after replacing oversized tool results.
-async fn evict_messages(
+///
+/// Shared with the context compiler, which runs eviction in its budget pass so an
+/// oversized historical tool result is offloaded before the request is layouted.
+pub(crate) async fn evict_messages(
     fs: &Arc<dyn Filesystem>,
     config: &ToolResultEvictionConfig,
     agent_name: &str,

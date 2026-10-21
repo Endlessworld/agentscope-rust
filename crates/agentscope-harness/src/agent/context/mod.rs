@@ -11,15 +11,17 @@
 pub mod builder;
 pub mod context_middleware;
 pub mod item;
+pub mod model_calls;
 pub mod policy;
 pub mod render;
 pub mod source;
 
-pub use builder::{ContextPipeline, ContextPipelineConfig, MANIFEST_ATTRIBUTE_PREFIX};
+pub use builder::{ContextEviction, ContextPipeline, ContextPipelineConfig, MANIFEST_ATTRIBUTE_PREFIX};
 pub use context_middleware::ContextMiddleware;
 pub use item::{
     content_hash, ContextBlock, ContextItem, ContextItemPlacement, ContextPurpose,
 };
+pub use model_calls::{auxiliary, auxiliary_text};
 pub use policy::{
     ApproximateEstimator, ContextManifest, ContextManifestItem, ContextPolicy,
     ContextSelectionPolicy, DefaultSelectionPolicy, Estimate, TaskContextOptions, TokenEstimator,

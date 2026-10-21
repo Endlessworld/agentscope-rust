@@ -56,6 +56,13 @@ impl Middleware for ContextMiddleware {
         };
         let pipeline = Arc::clone(&self.pipeline);
         let model = Arc::clone(&input.model);
+        // The committed task snapshot travels with the call: the compiler runs here, where no
+        // agent state is reachable (core publishes the snapshot before the reasoning phase).
+        let task_state = ctx
+            .extension::<agentscope_core::state::TaskContextState>(
+                agentscope_core::middleware::TASK_CONTEXT_STATE_CONTEXT_KEY,
+            )
+            .map(|state| (*state).clone());
         let ModelCallInput {
             messages,
             tools,
@@ -65,7 +72,14 @@ impl Middleware for ContextMiddleware {
 
         let fut = async move {
             match pipeline
-                .prepare(model.clone(), request, messages, tools, options)
+                .prepare_with_task(
+                    model.clone(),
+                    request,
+                    messages,
+                    tools,
+                    options,
+                    task_state.as_ref(),
+                )
                 .await
             {
                 // The continuation receives the compiled request, never the original one.
