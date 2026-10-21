@@ -5,9 +5,10 @@ use agentscope_core::agent::RuntimeContext;
 use agentscope_core::middleware::Middleware;
 use agentscope_core::state::InMemoryAgentStateStore;
 use agentscope_harness::{
-    Channel, CompactionMiddleware, CompactionMiddlewareConfig, DefaultWorkspaceSpecApplier, DistributedStore,
-    Filesystem, Gateway, HarnessAgent, IsolationScope, LocalFilesystem, PlanModeConfig,
-    PlanModeMiddleware, WorkspaceSpec, WorkspaceSpecApplier,
+    ArtifactDeliveryRequest, ArtifactDeliveryResult, ArtifactDeliveryTarget, Channel,
+    CompactionMiddleware, CompactionMiddlewareConfig, DefaultWorkspaceSpecApplier,
+    DistributedStore, Filesystem, Gateway, HarnessAgent, IsolationScope, LocalFilesystem,
+    PlanModeConfig, PlanModeMiddleware, WorkspaceSpec, WorkspaceSpecApplier,
 };
 
 async fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -62,13 +63,15 @@ fn distributed_store_builder() {
     assert_eq!(ds.isolation_scope, IsolationScope::Session);
 }
 
-#[test]
-fn middleware_transforms_system_prompt() {
+#[tokio::test]
+async fn middleware_transforms_system_prompt() {
     let compaction = CompactionMiddleware::new(CompactionMiddlewareConfig {
         enabled: true,
         max_tokens: 1000,
     });
-    let out = compaction.on_system_prompt(&RuntimeContext::default(), "You are a helper".into());
+    let out = compaction
+        .on_system_prompt(&RuntimeContext::default(), "You are a helper".into())
+        .await;
     assert!(out.contains("[compaction]"));
     assert!(out.contains("1000"));
 
@@ -76,7 +79,9 @@ fn middleware_transforms_system_prompt() {
         enabled: true,
         plan: "1. read files".into(),
     });
-    let out = plan.on_system_prompt(&RuntimeContext::default(), "base".into());
+    let out = plan
+        .on_system_prompt(&RuntimeContext::default(), "base".into())
+        .await;
     assert!(out.contains("Current plan"));
 }
 
@@ -179,6 +184,37 @@ fn memory_and_web_tools_registered_by_default_and_disableable() {
     assert!(!names.contains(&"memory_search".to_string()));
     assert!(!names.contains(&"web_fetch".to_string()));
     assert!(!names.contains(&"web_search".to_string()));
+}
+
+struct NoopArtifactTarget;
+
+#[async_trait::async_trait]
+impl ArtifactDeliveryTarget for NoopArtifactTarget {
+    async fn deliver(
+        &self,
+        _runtime_context: &RuntimeContext,
+        _request: ArtifactDeliveryRequest,
+    ) -> agentscope_harness::Result<ArtifactDeliveryResult> {
+        Ok(ArtifactDeliveryResult::success())
+    }
+}
+
+#[test]
+fn artifact_delivery_target_registers_the_tool() {
+    let without = HarnessAgent::builder().name("no-artifacts").build();
+    assert!(!without
+        .toolkit()
+        .tool_names()
+        .contains(&"deliver_artifact".to_string()));
+
+    let with = HarnessAgent::builder()
+        .name("artifacts")
+        .artifact_delivery_target(Arc::new(NoopArtifactTarget))
+        .build();
+    assert!(with
+        .toolkit()
+        .tool_names()
+        .contains(&"deliver_artifact".to_string()));
 }
 
 #[test]

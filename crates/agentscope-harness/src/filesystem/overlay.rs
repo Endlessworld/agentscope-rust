@@ -31,6 +31,14 @@ impl OverlayFilesystem {
 
 #[async_trait]
 impl Filesystem for OverlayFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> super::FilesystemKind {
+        super::FilesystemKind::Overlay
+    }
+
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let upper = self.upper.ls(ctx, path).await.unwrap_or_default();
         let lower = self.lower.ls(ctx, path).await.unwrap_or_default();

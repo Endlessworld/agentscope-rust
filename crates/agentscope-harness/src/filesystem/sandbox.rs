@@ -38,10 +38,23 @@ impl SandboxBackedFilesystem {
     pub fn inner(&self) -> &dyn Filesystem {
         self.inner.as_ref()
     }
+
+    /// Directory shell commands run from.
+    pub fn cwd(&self) -> &PathBuf {
+        &self.cwd
+    }
 }
 
 #[async_trait]
 impl Filesystem for SandboxBackedFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> super::FilesystemKind {
+        super::FilesystemKind::Sandbox
+    }
+
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         self.inner.ls(ctx, path).await
     }

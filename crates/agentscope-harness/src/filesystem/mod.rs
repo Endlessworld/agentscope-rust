@@ -11,6 +11,8 @@ pub mod result;
 pub mod sandbox;
 pub mod util;
 
+use std::any::Any;
+
 use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
@@ -85,12 +87,32 @@ impl ExecuteResponse {
     }
 }
 
+/// Concrete filesystem family, used where Java would use `instanceof`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemKind {
+    Local,
+    Overlay,
+    Sandbox,
+    Composite,
+    Remote,
+    Other,
+}
+
 /// Unified filesystem API for agents.
 ///
 /// Mirrors `AbstractFilesystem`. Every operation accepts a `RuntimeContext` so stores can
 /// scope work to the current session/user/sandbox; local backends ignore it.
 #[async_trait]
-pub trait Filesystem: Send + Sync {
+pub trait Filesystem: Send + Sync + 'static {
+    /// Downcast hook for the few prompt/configuration paths that need concrete
+    /// filesystem metadata (Java uses `instanceof`).
+    fn as_any(&self) -> &dyn Any;
+
+    /// Concrete family marker.
+    fn kind(&self) -> FilesystemKind {
+        FilesystemKind::Other
+    }
+
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>>;
     async fn read(
         &self,

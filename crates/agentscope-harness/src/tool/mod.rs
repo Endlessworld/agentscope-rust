@@ -6,6 +6,7 @@ use agentscope_core::message::JsonMap;
 
 pub mod agent_generate;
 pub mod agent_spawn;
+pub mod artifact_delivery;
 pub mod filesystem_tools;
 pub mod fuzzy_text_matcher;
 pub mod grep_options;
@@ -22,6 +23,7 @@ pub mod wait_async;
 
 pub use agent_generate::AgentGenerateTool;
 pub use agent_spawn::{AgentListTool, AgentSendTool, AgentSpawnTool};
+pub use artifact_delivery::ArtifactDeliveryTool;
 pub use filesystem_tools::FilesystemTool;
 pub use fuzzy_text_matcher::{search, Level, MatchRange, SearchResult};
 pub use memory_get::MemoryGetTool;

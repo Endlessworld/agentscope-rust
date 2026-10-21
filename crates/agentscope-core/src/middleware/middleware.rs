@@ -1,14 +1,24 @@
 //! Middleware trait and chain for intercepting agent execution.
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use super::input::{ActingInput, AgentInput, EventStream, ModelCallInput, ReasoningInput};
 use crate::agent::RuntimeContext;
+use crate::message::Msg;
 
 /// A boxed continuation for the next middleware or core logic.
 pub type Next<T> = Box<dyn FnOnce(T) -> EventStream + Send>;
 
 /// Middleware provides interception at key execution points (onion pattern).
+#[async_trait]
 pub trait Middleware: Send + Sync {
+    /// Execution priority, mirroring Java `MiddlewareBase.order()`. Higher values run
+    /// earlier (closer to the outside of the onion). Ties keep registration order.
+    fn order(&self) -> i32 {
+        1
+    }
+
     /// Intercepts the entire agent invocation.
     fn on_agent(
         &self,
@@ -55,8 +65,23 @@ pub trait Middleware: Send + Sync {
     /// material and before the prompt is frozen for the reasoning loop. Mirrors
     /// Java `MiddlewareBase.onSystemPrompt` / `ReActAgent.seedSystemMsg`; it is not
     /// invoked once per reasoning iteration.
-    fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         current_prompt
+    }
+
+    /// Async pre-call hook with the full restored state snapshot and the call input.
+    ///
+    /// Runs once per call after the call-scoped `AgentState` is bound and after the
+    /// system-prompt transformer chain has produced its current value. Mirrors Java
+    /// `PreCallEvent`: middlewares can inspect the restored history plus the input
+    /// messages and append request-scoped system material before the prompt is frozen.
+    async fn on_pre_call(
+        &self,
+        _ctx: &RuntimeContext,
+        _state: &mut crate::state::AgentState,
+        _input_messages: &[Msg],
+        _system_prompt: &mut String,
+    ) {
     }
 
     /// Notified once per call as soon as the call-scoped `AgentState` is bound to
@@ -104,17 +129,19 @@ pub enum ExtensionPoint {
     OnActing,
     OnModelCall,
     OnSystemPrompt,
+    OnPreCall,
     OnAgentStateReady,
 }
 
 impl ExtensionPoint {
     /// Every extension point, in declaration order.
-    pub const ALL: [ExtensionPoint; 6] = [
+    pub const ALL: [ExtensionPoint; 7] = [
         ExtensionPoint::OnAgent,
         ExtensionPoint::OnReasoning,
         ExtensionPoint::OnActing,
         ExtensionPoint::OnModelCall,
         ExtensionPoint::OnSystemPrompt,
+        ExtensionPoint::OnPreCall,
         ExtensionPoint::OnAgentStateReady,
     ];
 }
@@ -140,9 +167,12 @@ impl MiddlewareChain {
         Self { middlewares: Vec::new() }
     }
 
-    /// Adds a middleware to the chain.
+    /// Adds a middleware to the chain, keeping the chain sorted by descending
+    /// [`Middleware::order`]. `sort_by` is stable, so equal priorities retain
+    /// registration order (Java `Comparator.comparingInt(order).reversed()`).
     pub fn add(&mut self, mw: Box<dyn Middleware>) {
         self.middlewares.push(Arc::from(mw));
+        self.sort_by_order();
     }
 
     /// Adds an already-`Arc`-wrapped middleware to the chain.
@@ -151,6 +181,11 @@ impl MiddlewareChain {
     /// holding the same `Arc`) — avoids cloning the concrete type (嵌入式优化).
     pub fn add_arc(&mut self, mw: Arc<dyn Middleware>) {
         self.middlewares.push(mw);
+        self.sort_by_order();
+    }
+
+    fn sort_by_order(&mut self) {
+        self.middlewares.sort_by(|a, b| b.order().cmp(&a.order()));
     }
 
     /// Returns the number of middlewares in the chain.
@@ -163,8 +198,8 @@ impl MiddlewareChain {
         self.middlewares.is_empty()
     }
 
-    /// The middlewares participating in the given extension point, in registration
-    /// order.
+    /// The middlewares participating in the given extension point, in priority order
+    /// (higher [`Middleware::order`] first; ties keep registration order).
     ///
     /// A middleware participates when its [`Middleware::active_points`] contains
     /// `point`. Points with no participants yield an empty slice, which lets the
@@ -176,8 +211,22 @@ impl MiddlewareChain {
             .collect()
     }
 
+    /// Runs the async pre-call hooks with the full restored state snapshot.
+    pub async fn notify_pre_call(
+        &self,
+        ctx: &RuntimeContext,
+        state: &mut crate::state::AgentState,
+        input_messages: &[Msg],
+        system_prompt: &mut String,
+    ) {
+        for mw in self.participants(ExtensionPoint::OnPreCall) {
+            mw.on_pre_call(ctx, state, input_messages, system_prompt)
+                .await;
+        }
+    }
+
     /// Notifies every participating middleware that this call's `AgentState` is
-    /// ready, in registration order.
+    /// ready, in priority order.
     ///
     /// Mirrors Java `ReActAgent.beforeAgentExecution`: invoked once per call right
     /// after the call-scoped state is bound, before the input enters the pipeline.
@@ -200,10 +249,11 @@ impl MiddlewareChain {
     ///
     /// Called once per agent call by `ReActAgent`; callers must freeze the result
     /// rather than re-running the chain for every reasoning step.
-    pub fn apply_system_prompt(&self, ctx: &RuntimeContext, prompt: String) -> String {
-        self.participants(ExtensionPoint::OnSystemPrompt)
-            .iter()
-            .fold(prompt, |p, mw| mw.on_system_prompt(ctx, p))
+    pub async fn apply_system_prompt(&self, ctx: &RuntimeContext, mut prompt: String) -> String {
+        for mw in self.participants(ExtensionPoint::OnSystemPrompt) {
+            prompt = mw.on_system_prompt(ctx, prompt).await;
+        }
+        prompt
     }
 
     /// Builds the event stream for an agent invocation, wrapping the core logic.
@@ -288,5 +338,34 @@ impl MiddlewareChain {
             pipeline = Box::new(move |input| mw.on_model_call(&ctx, input, prev));
         }
         pipeline(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Ordered(i32);
+
+    impl Middleware for Ordered {
+        fn order(&self) -> i32 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn middleware_chain_sorts_by_descending_order() {
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(Ordered(0)));
+        chain.add(Box::new(Ordered(2)));
+        chain.add(Box::new(Ordered(1)));
+        chain.add(Box::new(Ordered(2)));
+
+        let orders: Vec<i32> = chain
+            .participants(ExtensionPoint::OnAgent)
+            .into_iter()
+            .map(|middleware| middleware.order())
+            .collect();
+        assert_eq!(orders, vec![2, 2, 1, 0]);
     }
 }

@@ -26,7 +26,7 @@ use agentscope_harness::agent::sandbox::{
     SandboxSnapshotSpec, SandboxState, WorkspaceSpec,
 };
 use agentscope_harness::filesystem::{
-    ExecuteResponse, FileData, FileInfo, Filesystem, GrepMatch, SandboxFilesystem,
+    ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch, SandboxFilesystem,
 };
 use async_trait::async_trait;
 
@@ -387,6 +387,14 @@ impl SandboxFilesystem for SandboxFilesystemAdapter {
 
 #[async_trait]
 impl Filesystem for SandboxFilesystemAdapter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> FilesystemKind {
+        FilesystemKind::Sandbox
+    }
+
     async fn ls(&self, _ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let absolute = self.resolve_path(path);
         let output = self.run_checked(&build_ls_command(&absolute), "ls", 60).await?;

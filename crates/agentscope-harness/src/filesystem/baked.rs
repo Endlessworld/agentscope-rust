@@ -48,6 +48,14 @@ impl std::fmt::Debug for BakedContextFilesystem {
 
 #[async_trait]
 impl Filesystem for BakedContextFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> super::FilesystemKind {
+        self.delegate.kind()
+    }
+
     async fn ls(&self, _ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         self.delegate.ls(&self.baked_rc, path).await
     }

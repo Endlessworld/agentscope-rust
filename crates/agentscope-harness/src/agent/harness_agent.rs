@@ -25,6 +25,7 @@ use agentscope_core::tool::{Tool, Toolkit};
 
 use crate::filesystem::{Filesystem, LocalFilesystem};
 
+use super::artifact::ArtifactDeliveryTarget;
 use super::distributed_store::DistributedStore;
 use super::isolation_scope::IsolationScope;
 use super::memory::{MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig};
@@ -54,9 +55,9 @@ use super::workspace::{
 };
 use super::bus::{MessageBus, WorkspaceMessageBus, WorkspaceAsyncToolRegistry, AsyncToolRegistry};
 use crate::tool::{
-    AgentListTool, AgentSendTool, AgentSpawnTool, FilesystemTool, MemoryGetTool, MemorySaveTool,
-    MemorySearchTool, PlanModeHandle, SessionSearchTool, ShellExecuteTool, TeamTool, WebFetchTool,
-    WebSearchTool,
+    AgentListTool, AgentSendTool, AgentSpawnTool, ArtifactDeliveryTool, FilesystemTool,
+    MemoryGetTool, MemorySaveTool, MemorySearchTool, PlanModeHandle, SessionSearchTool,
+    ShellExecuteTool, TeamTool, WebFetchTool, WebSearchTool,
 };
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
@@ -565,6 +566,7 @@ pub struct HarnessAgentBuilder {
     disable_memory_tools: bool,
     disable_web_tools: bool,
     web_http_client: Option<reqwest::Client>,
+    artifact_delivery_target: Option<Arc<dyn ArtifactDeliveryTarget>>,
     task_repository: Option<Arc<dyn TaskRepository>>,
     teams_client: Option<Arc<dyn TeamClient>>,
     teams_context: Option<TeamContext>,
@@ -653,6 +655,7 @@ impl Default for HarnessAgentBuilder {
             disable_memory_tools: false,
             disable_web_tools: false,
             web_http_client: None,
+            artifact_delivery_target: None,
             task_repository: None,
             teams_client: None,
             teams_context: None,
@@ -1213,6 +1216,19 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Configures the destination used by the `deliver_artifact` tool.
+    ///
+    /// Mirrors Java `HarnessAgent.Builder.artifactDeliveryTarget`: when set, the
+    /// tool is registered and the sandbox workspace prompt receives the File
+    /// Isolation Notice.
+    pub fn artifact_delivery_target(
+        mut self,
+        target: Arc<dyn ArtifactDeliveryTarget>,
+    ) -> Self {
+        self.artifact_delivery_target = Some(target);
+        self
+    }
+
     /// Uses a caller-supplied task repository instead of the default
     /// `WorkspaceTaskRepository`.
     pub fn task_repository(mut self, repo: Arc<dyn TaskRepository>) -> Self {
@@ -1368,6 +1384,7 @@ impl HarnessAgentBuilder {
                 self.max_context_tokens,
             );
             ws_ctx.set_memory_flags(self.disable_memory_tools, self.disable_memory_hooks);
+            ws_ctx.set_artifact_delivery_enabled(self.artifact_delivery_target.is_some());
             ws_ctx.set_additional_context_files(self.additional_context_files.clone());
             middleware.add(Box::new(ws_ctx));
         }
@@ -1646,6 +1663,12 @@ impl HarnessAgentBuilder {
             if let Some(sandbox) = sandbox_filesystem(&filesystem, &cwd) {
                 ShellExecuteTool::register(&toolkit, sandbox);
             }
+        }
+        if let Some(target) = &self.artifact_delivery_target {
+            toolkit.register_tool(Arc::new(ArtifactDeliveryTool::new(
+                Arc::clone(&filesystem),
+                Arc::clone(target),
+            )));
         }
 
         // ---- Long-term memory tools (Java registers these by default) ----

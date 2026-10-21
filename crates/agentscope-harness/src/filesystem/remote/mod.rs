@@ -176,6 +176,14 @@ fn relative_to(key: &str, normalized_path: &str) -> String {
 
 #[async_trait]
 impl Filesystem for RemoteFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> crate::filesystem::FilesystemKind {
+        crate::filesystem::FilesystemKind::Remote
+    }
+
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let normalized_path = {
             let n = normalize_path(path);

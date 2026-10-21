@@ -3,6 +3,7 @@
 Last updated: 2026-10-21
 
 Batch 1: GAP-101 through GAP-112.
+Batch 2: GAP-201 through GAP-205, GAP-301 through GAP-303.
 
 This file tracks framework-level differences between the Rust harness and the Java
 `agentscope-harness` implementation. It is intentionally implementation-oriented:
@@ -42,14 +43,14 @@ each item names the observable behaviour, the Java reference, and the Rust statu
 | GAP-113 | At-path expansion inheritance | `MATCHES_JAVA` |
 | GAP-114 | Declared-subagent compaction/eviction/workspace-context asymmetry | `MATCHES_JAVA` |
 | GAP-115 | Subagent `disable_session_persistence` inheritance | `TODO` |
-| GAP-201 | Async system-prompt hook | `TODO` |
-| GAP-202 | Middleware `order()` / priority | `TODO` |
-| GAP-203 | Full restored-state snapshot in pre-call hook | `TODO` |
-| GAP-204 | Filesystem type reflection (`kind` / `as_any`) | `TODO` |
-| GAP-205 | Artifact delivery (`deliver_artifact`) | `TODO` |
-| GAP-301 | Effective workspace for local overlay | `TODO` |
-| GAP-302 | Filesystem-specific workspace paragraph | `BLOCKED` by GAP-204 |
-| GAP-303 | Artifact-delivery workspace notice | `BLOCKED` by GAP-205 |
+| GAP-201 | Async system-prompt hook | `DONE` |
+| GAP-202 | Middleware `order()` / priority | `DONE` |
+| GAP-203 | Full restored-state snapshot in pre-call hook | `DONE` |
+| GAP-204 | Filesystem type reflection (`kind` / `as_any`) | `DONE` |
+| GAP-205 | Artifact delivery (`deliver_artifact`) | `DONE` |
+| GAP-301 | Effective workspace for local overlay | `DONE` |
+| GAP-302 | Filesystem-specific workspace paragraph | `DONE` |
+| GAP-303 | Artifact-delivery workspace notice | `DONE` |
 | GAP-304 | Session-context OS/date/temp formatting parity | `TODO` |
 | GAP-305 | Consume or retire `use_legacy_xml_workspace_context` | `TODO` |
 
@@ -273,53 +274,51 @@ session-persistence disable flag. Needs a Rust equivalent before this can be clo
 
 ### GAP-201 — Async system-prompt hook
 
-Status: `TODO`
+Status: `DONE`
 
-- Java `MiddlewareBase.onSystemPrompt` returns `Mono<String>` and can perform async
-  work.
-- Rust `Middleware::on_system_prompt` returns `String`.
-- Workspace context currently works around this by building in `on_agent` and storing
-  the result in `AgentInput.system_prompt`.
-
-Possible fixes:
-
-1. Make `on_system_prompt` async and await the chain once per call.
-2. Add a dedicated async pre-call hook.
-3. Keep the two-phase design (async build + sync transform) and document it.
+- `Middleware::on_system_prompt` is now async (`#[async_trait]`).
+- `MiddlewareChain::apply_system_prompt` awaits the chain once per call.
+- `WorkspaceContextMiddleware` builds its section directly in `on_system_prompt`;
+  `on_agent` no longer needs to precompute it.
 
 ### GAP-202 — Middleware `order()` / priority
 
-Status: `TODO`
+Status: `DONE`
 
-- Java `MiddlewareBase.order()` sorts middleware by descending priority.
-- Rust `MiddlewareChain` uses registration order only.
-- This can change workspace/task-reminder/subagent composition as more middleware is
-  added.
+- `Middleware::order()` defaults to 1.
+- `MiddlewareChain` keeps a stable descending-order sort after every `add`.
+- Higher priorities run earlier; ties retain registration order.
+- Added `middleware_chain_sorts_by_descending_order`.
 
 ### GAP-203 — Full restored-state snapshot in pre-call hook
 
-Status: `TODO`
+Status: `DONE`
 
-- Java `PreCallEvent` sees the existing `AgentState` snapshot plus call arguments.
-- Rust `on_agent` runs before the call-scoped state is bound and only sees the input
-  messages.
-- `on_agent_state_ready` is synchronous and cannot build async prompt material.
+- Added async `Middleware::on_pre_call(ctx, state, input_messages, system_prompt)`.
+- `run_agent_loop` invokes it after the call-scoped state is bound and after the
+  system-prompt transformer chain, before the prompt is frozen.
+- The hook sees the restored history plus call input and may append prompt material.
+- Added `pre_call_hook_sees_the_restored_state_snapshot`.
 
 ### GAP-204 — Filesystem type reflection
 
-Status: `TODO`
+Status: `DONE`
 
-- Java uses `instanceof` for overlay / sandbox / composite filesystems.
-- Rust's `Filesystem` trait has no `as_any()` / `kind()`.
-- This blocks GAP-301 and GAP-302 and prevents Java's effective-workspace logic.
+- Added `Filesystem::as_any()` and `Filesystem::kind()`.
+- Implemented `FilesystemKind` for local, overlay, sandbox, composite, remote, and
+  baked wrappers (plus the extension sandbox adapter).
+- The workspace prompt can now use concrete filesystem metadata.
 
 ### GAP-205 — Artifact delivery
 
-Status: `TODO`
+Status: `DONE`
 
-- Java has `ArtifactDeliveryTarget`, `ArtifactDeliveryTool`, `deliver_artifact`, and
-  sandbox File Isolation Notice.
-- Rust has no equivalent capability.
+- Added `ArtifactDeliveryTarget`, `ArtifactDeliveryRequest`, and
+  `ArtifactDeliveryResult` in `agent/artifact.rs`.
+- Added `ArtifactDeliveryTool` (`deliver_artifact`) in `tool/artifact_delivery.rs`.
+- Added `HarnessAgentBuilder::artifact_delivery_target(...)`; setting it registers the
+  tool and enables the sandbox File Isolation Notice.
+- Added tool and registration tests.
 
 ---
 
@@ -327,30 +326,33 @@ Status: `TODO`
 
 ### GAP-301 — Effective workspace for local overlay
 
-Status: `TODO`
+Status: `DONE`
 
-Java uses `resolveRuntimeDataPath(rc, "")` when a local overlay upper filesystem is
-detected. Rust currently always uses `wm.workspace()`. Blocked by GAP-204.
+- Local overlays now use `WorkspaceManager::resolve_runtime_data_path(rc, "")` as the
+  effective workspace, matching Java.
+- Detection uses `FilesystemKind::Overlay` plus the upper layer's `FilesystemKind`.
 
 ### GAP-302 — Filesystem-specific workspace paragraph
 
-Status: `BLOCKED` by GAP-204
+Status: `DONE`
 
-Java branches between:
+Java-style branches are now rendered for:
 
-- local overlay: project / workspace / additional roots / path policy
-- sandbox: container id / artifact delivery
-- composite: distributed store wording
+- local overlay: project / workspace / path policy / overlay semantics
+- sandbox: sandbox root / isolation wording
+- composite / remote: distributed workspace wording
 - legacy: single-line working directory
 
-Rust currently always renders the legacy form.
+Additional allow-list roots are not yet available through Rust's `LocalFilesystem`
+metadata; that is a remaining content-level refinement.
 
 ### GAP-303 — Artifact-delivery workspace notice
 
-Status: `BLOCKED` by GAP-205
+Status: `DONE`
 
-The sandbox File Isolation Notice and `deliver_artifact` guidance cannot be added
-until artifact delivery exists.
+- Sandbox prompts add the File Isolation Notice when an artifact delivery target is
+  configured.
+- Without a target, the prompt keeps the "no mechanism to move files" wording.
 
 ### GAP-304 — Session-context OS/date/temp formatting parity
 
@@ -377,10 +379,11 @@ in the workspace-context implementation. Decide whether to:
 
 | Check | Result |
 |---|---|
-| `cargo test -p agentscope-core --lib` | 287 passed |
-| `cargo test -p agentscope-harness --lib` | 434 passed |
+| `cargo test -p agentscope-core --lib` | 289 passed |
+| `cargo test -p agentscope-harness --lib -- --test-threads=1` | 437 passed |
 | `cargo test -p agentscope-harness --test harness_context_wiring_test` | 4 passed |
-| ACP/session/middleware/tool integration subset | all passed |
+| `cargo test -p agentscope-harness --test harness_agent_test` | 14 passed |
+| ACP event / session resume integration subset | all passed |
 | `cargo check --workspace` | passed |
 
 Re-run these after each batch of changes and update the statuses above.

@@ -1359,9 +1359,15 @@ async fn run_agent_loop(
     if let Some(extra) = system_prompt.as_deref() {
         crate::middleware::input::append_system_prompt_text(&mut frozen_prompt, extra);
     }
-    let frozen_prompt = core
+    let mut frozen_prompt = core
         .middleware_chain
-        .apply_system_prompt(ctx, frozen_prompt.unwrap_or_default());
+        .apply_system_prompt(ctx, frozen_prompt.unwrap_or_default())
+        .await;
+    // Java `PreCallEvent`: the hooks see the restored history snapshot, the call
+    // input, and may append request-scoped system material before it is frozen.
+    core.middleware_chain
+        .notify_pre_call(ctx, &mut state, &messages, &mut frozen_prompt)
+        .await;
     let system_msg =
         (!frozen_prompt.trim().is_empty()).then(|| Msg::system(frozen_prompt));
 
@@ -4417,14 +4423,37 @@ mod tests {
         calls: Arc<Mutex<u32>>,
     }
 
+    #[async_trait]
     impl crate::middleware::Middleware for CountingSystemPromptMiddleware {
-        fn on_system_prompt(
+        async fn on_system_prompt(
             &self,
             _ctx: &crate::agent::RuntimeContext,
             current_prompt: String,
         ) -> String {
             *self.calls.lock().unwrap() += 1;
             format!("{current_prompt}\nFROZEN")
+        }
+    }
+
+    /// Middleware that captures the full pre-call state snapshot and appends prompt material.
+    struct PreCallSnapshotMiddleware {
+        snapshots: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    #[async_trait]
+    impl crate::middleware::Middleware for PreCallSnapshotMiddleware {
+        async fn on_pre_call(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            state: &mut crate::state::AgentState,
+            input_messages: &[Msg],
+            system_prompt: &mut String,
+        ) {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push((state.context().len(), input_messages.len()));
+            system_prompt.push_str("\nPRE_CALL");
         }
     }
 
@@ -4756,6 +4785,41 @@ mod tests {
                 .all(|message| message.role != MsgRole::System),
             "the frozen prompt must not be persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn pre_call_hook_sees_the_restored_state_snapshot() {
+        let model = Arc::new(RecordingModel::new());
+        let seen = Arc::clone(&model.seen);
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(PreCallSnapshotMiddleware {
+            snapshots: Arc::clone(&snapshots),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-pre-call")
+            .model(model)
+            .sys_prompt("BASE SYSTEM")
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("first")]).await.unwrap();
+        agent.call(vec![Msg::user("second")]).await.unwrap();
+
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0], (0, 1), "first call sees an empty restored history");
+        assert!(snapshots[1].0 > 0, "second call sees the previous turn in state");
+
+        let calls = seen.lock().unwrap();
+        for call in calls.iter() {
+            let system = call
+                .iter()
+                .find(|message| message.role == MsgRole::System)
+                .expect("a frozen system message");
+            assert!(system.text_content().contains("PRE_CALL"));
+        }
     }
 
     #[tokio::test]

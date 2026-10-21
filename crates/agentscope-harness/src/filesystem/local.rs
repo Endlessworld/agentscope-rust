@@ -228,6 +228,10 @@ impl LocalFilesystem {
         &self.root
     }
 
+    pub fn mode(&self) -> LocalFsMode {
+        self.mode
+    }
+
     fn resolve(&self, _ctx: &RuntimeContext, path: &str) -> Result<PathBuf> {
         validate_path(path)?;
         let p = Path::new(path);
@@ -302,6 +306,14 @@ fn modified_to_string(t: Option<std::time::SystemTime>) -> String {
 
 #[async_trait]
 impl Filesystem for LocalFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> super::FilesystemKind {
+        super::FilesystemKind::Local
+    }
+
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let dir = self.resolve(ctx, path)?;
         if !dir.exists() {

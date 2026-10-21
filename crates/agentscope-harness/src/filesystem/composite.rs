@@ -86,6 +86,14 @@ impl CompositeFilesystem {
 
 #[async_trait]
 impl Filesystem for CompositeFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> super::FilesystemKind {
+        super::FilesystemKind::Composite
+    }
+
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let route = self.route_for_path(path);
         if let Some(prefix) = &route.prefix {

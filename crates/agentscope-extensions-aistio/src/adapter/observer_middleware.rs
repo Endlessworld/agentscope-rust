@@ -70,6 +70,7 @@ impl AistioObserverMiddleware {
     }
 }
 
+#[async_trait::async_trait]
 impl Middleware for AistioObserverMiddleware {
     fn on_agent(
         &self,
@@ -154,7 +155,7 @@ impl Middleware for AistioObserverMiddleware {
 
     /// Captures the fully composed system prompt when this middleware is registered last in
     /// the `on_system_prompt` chain.
-    fn on_system_prompt(&self, ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, ctx: &RuntimeContext, current_prompt: String) -> String {
         if let Some(reporter) = self.reporter() {
             reporter.set_effective_system_prompt(&session_id_of(ctx), current_prompt.clone());
         }

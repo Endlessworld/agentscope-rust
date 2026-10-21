@@ -1,5 +1,6 @@
 //! Harness agent runtime, mirroring `io.agentscope.harness.agent`.
 
+pub mod artifact;
 pub mod bus;
 pub mod context;
 pub mod coordination;
@@ -19,6 +20,9 @@ pub mod team;
 pub mod verification;
 pub mod workspace;
 
+pub use artifact::{
+    ArtifactDeliveryRequest, ArtifactDeliveryResult, ArtifactDeliveryTarget,
+};
 pub use bus::{
     AsyncToolRecord, AsyncToolRegistry, BusEntry, MessageBus, WorkspaceAsyncToolRegistry,
     WorkspaceMessageBus,

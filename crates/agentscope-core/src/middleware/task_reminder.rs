@@ -27,8 +27,9 @@ impl TaskReminderMiddleware {
     }
 }
 
+#[async_trait::async_trait]
 impl Middleware for TaskReminderMiddleware {
-    fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         format!("{}{}", current_prompt, GROUNDING)
     }
 

@@ -199,8 +199,9 @@ impl HarnessSkillMiddleware {
     }
 }
 
+#[async_trait::async_trait]
 impl Middleware for HarnessSkillMiddleware {
-    fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         if self.repos.is_empty() {
             return current_prompt;
         }

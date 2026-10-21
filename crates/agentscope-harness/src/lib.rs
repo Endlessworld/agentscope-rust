@@ -15,7 +15,8 @@ pub use agentscope_core::error::{Error, Result};
 
 pub use acp::{AcpAgentSession, AcpCodingAgent, AcpCodingAgentBuilder};
 pub use agent::{
-    AgentSkill, AgentSkillBuilder, AgentTraceMiddleware, AsyncToolMiddleware, AsyncToolRecord,
+    AgentSkill, AgentSkillBuilder, AgentTraceMiddleware, ArtifactDeliveryRequest,
+    ArtifactDeliveryResult, ArtifactDeliveryTarget, AsyncToolMiddleware, AsyncToolRecord,
     AsyncToolRegistry,
     AtPathExpansionMiddleware, BusEntry, build_delivery_reminder, build_summary_message,
     build_task_summary, calculate_token,
@@ -56,7 +57,7 @@ pub use filesystem::{
     SandboxBackedFilesystem, SandboxFilesystem,
 };
 pub use tool::{
-    command_with_working_directory, AgentGenerateTool, FilesystemTool, Level, MatchRange,
+    command_with_working_directory, AgentGenerateTool, ArtifactDeliveryTool, FilesystemTool, Level, MatchRange,
     MemoryGetTool, MemorySaveTool, MemorySearchTool, SearchResult, SessionHistoryTool,
     SessionListTool, SessionSearchTool, ShellExecuteTool, TaskCancelTool,
     TaskListTool, TaskOutputTool, TaskTool, WebFetchTool, WebSearchTool,

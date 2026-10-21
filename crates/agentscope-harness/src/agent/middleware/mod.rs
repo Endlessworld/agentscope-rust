@@ -64,8 +64,9 @@ impl CompactionMiddleware {
     }
 }
 
+#[async_trait::async_trait]
 impl Middleware for CompactionMiddleware {
-    fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         if self.config.enabled {
             format!(
                 "{}\n\n[compaction] Max tokens: {}",
@@ -95,8 +96,9 @@ impl PlanModeMiddleware {
     }
 }
 
+#[async_trait::async_trait]
 impl Middleware for PlanModeMiddleware {
-    fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         if self.config.enabled && !self.config.plan.is_empty() {
             format!("{}\n\nCurrent plan:\n{}", current_prompt, self.config.plan)
         } else {

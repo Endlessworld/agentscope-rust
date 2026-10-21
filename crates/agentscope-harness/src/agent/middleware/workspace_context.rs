@@ -2,20 +2,21 @@
 //! knowledge, additional files) to the request-scoped system prompt, mirroring
 //! `io.agentscope.harness.agent.middleware.WorkspaceContextMiddleware`.
 //!
-//! Runs once per agent call (like the Java `onSystemPrompt` hook fired at call
-//! time). Because the core `Middleware::on_system_prompt` hook is synchronous and
-//! this middleware needs asynchronous filesystem reads, the section is built in
-//! `on_agent` and stored in `AgentInput.system_prompt`; the core freezes it for the
-//! call and prepends a fresh copy to every reasoning request without persisting it.
+//! Runs once per agent call in the async `on_system_prompt` hook, mirroring Java
+//! `WorkspaceContextMiddleware.onSystemPrompt`. The core freezes the result and
+//! prepends a fresh copy to every reasoning request without persisting it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::middleware::{AgentInput, EventStream, Middleware, Next};
-use futures::StreamExt;
+use agentscope_core::middleware::Middleware;
 
 use crate::agent::workspace::WorkspaceManager;
+use crate::filesystem::{
+    Filesystem, FilesystemKind, LocalFilesystem, LocalFsMode, OverlayFilesystem,
+    SandboxBackedFilesystem,
+};
 
 const SESSION_CONTEXT_SECTION_TEMPLATE: &str = "\
 ## AgentStateStore Context
@@ -91,6 +92,7 @@ pub struct WorkspaceContextMiddleware {
     additional_context_files: Vec<String>,
     disable_memory_tools: bool,
     disable_memory_hooks: bool,
+    artifact_delivery_enabled: bool,
 }
 
 impl WorkspaceContextMiddleware {
@@ -130,6 +132,7 @@ impl WorkspaceContextMiddleware {
             additional_context_files: Vec::new(),
             disable_memory_tools: false,
             disable_memory_hooks: false,
+            artifact_delivery_enabled: false,
         }
     }
 
@@ -145,37 +148,35 @@ impl WorkspaceContextMiddleware {
         self.disable_memory_tools = disable_memory_tools;
         self.disable_memory_hooks = disable_memory_hooks;
     }
+
+    /// Mirrors Java `setArtifactDeliveryEnabled`: adds the sandbox File Isolation
+    /// Notice only when a `deliver_artifact` target is configured.
+    pub fn set_artifact_delivery_enabled(&mut self, enabled: bool) {
+        self.artifact_delivery_enabled = enabled;
+    }
 }
 
+#[async_trait::async_trait]
 impl Middleware for WorkspaceContextMiddleware {
-    fn on_agent(&self, ctx: &RuntimeContext, input: AgentInput, next: Next<AgentInput>) -> EventStream {
-        let wm = Arc::clone(&self.workspace_manager);
-        let agent_name = self.agent_name.clone();
-        let environment_memory = self.environment_memory.clone();
-        let max_context_tokens = self.max_context_tokens;
-        let additional_context_files = self.additional_context_files.clone();
-        let disable_memory_tools = self.disable_memory_tools;
-        let disable_memory_hooks = self.disable_memory_hooks;
-        let ctx = ctx.clone();
-
-        let fut = async move {
-            let mut input = input;
-            let section = build_workspace_section(
-                &wm,
-                &ctx,
-                &agent_name,
-                environment_memory.as_deref(),
-                max_context_tokens,
-                &additional_context_files,
-                disable_memory_tools,
-                disable_memory_hooks,
-            )
-            .await;
-            input.append_system_prompt(&section);
-            next(input)
+    async fn on_system_prompt(&self, ctx: &RuntimeContext, current_prompt: String) -> String {
+        let section = build_workspace_section(
+            &self.workspace_manager,
+            ctx,
+            &self.agent_name,
+            self.environment_memory.as_deref(),
+            self.max_context_tokens,
+            &self.additional_context_files,
+            self.disable_memory_tools,
+            self.disable_memory_hooks,
+            self.artifact_delivery_enabled,
+        )
+        .await;
+        let separator = if current_prompt.is_empty() || current_prompt.ends_with('\n') {
+            ""
+        } else {
+            "\n"
         };
-
-        Box::pin(futures::stream::once(fut).flatten())
+        format!("{current_prompt}{separator}{section}")
     }
 }
 
@@ -189,6 +190,7 @@ async fn build_workspace_section(
     additional_context_files: &[String],
     disable_memory_tools: bool,
     disable_memory_hooks: bool,
+    artifact_delivery_enabled: bool,
 ) -> String {
     // Mirrors Java `includeMemoryContext()`: MEMORY.md is hidden only when both the
     // memory tools and the background hooks are off.
@@ -202,7 +204,9 @@ async fn build_workspace_section(
     };
     let knowledge_content = wm.read_knowledge_md(rc).await.trim().to_string();
     let workspace = wm.workspace();
-    let session_context = build_session_context_section(workspace, rc, agent_name, environment_memory);
+    let effective_workspace = effective_workspace(wm, rc, workspace);
+    let session_context =
+        build_session_context_section(&effective_workspace, rc, agent_name, environment_memory);
 
     let knowledge_block = build_knowledge_block(wm, rc, &knowledge_content, workspace).await;
     let additional_block = build_additional_context_block(wm, rc, additional_context_files).await;
@@ -220,7 +224,12 @@ async fn build_workspace_section(
     };
 
     let guidance = build_guidance(disable_memory_tools, disable_memory_hooks);
-    let workspace_paragraph = build_workspace_paragraph(workspace);
+    let workspace_paragraph = build_workspace_paragraph(
+        workspace,
+        &effective_workspace,
+        wm.filesystem(),
+        artifact_delivery_enabled,
+    );
     let loaded_context = build_loaded_context_section(
         &agents_content,
         &memory_content,
@@ -300,21 +309,142 @@ fn build_memory_persistence_guidance(
     sb
 }
 
-/// Builds the `## Workspace` paragraph. In Rust the filesystem is a `dyn Filesystem`
-/// with no downcasting, so this renders the single-line legacy form.
-fn build_workspace_paragraph(workspace: &Path) -> String {
+/// Java's `effectiveWorkspace`: local overlays expose their runtime-data path (the
+/// writable workspace layer) rather than the raw workspace root.
+fn effective_workspace(wm: &WorkspaceManager, rc: &RuntimeContext, raw: &Path) -> PathBuf {
+    let Some(filesystem) = wm.filesystem() else {
+        return raw.to_path_buf();
+    };
+    if filesystem.kind() == FilesystemKind::Overlay {
+        if let Some(overlay) = filesystem.as_any().downcast_ref::<OverlayFilesystem>() {
+            if overlay.upper().kind() == FilesystemKind::Local {
+                return wm.resolve_runtime_data_path(rc, "");
+            }
+        }
+    }
+    raw.to_path_buf()
+}
+
+fn local_overlay(workspace: &Path, effective: &Path, fs: Option<&dyn Filesystem>) -> Option<String> {
+    let overlay = fs?.as_any().downcast_ref::<OverlayFilesystem>()?;
+    let local = overlay.upper().as_any().downcast_ref::<LocalFilesystem>()?;
+    let mut sb = String::from("## Workspace\n");
+    sb.push_str("Project (the user's source tree you're assisting with): ");
+    sb.push_str(&local.root().to_string_lossy());
+    sb.push('\n');
+    sb.push_str("Workspace (your home base — memory, sessions, skills, runtime data): ");
+    sb.push_str(&effective.to_string_lossy());
+    sb.push('\n');
+    sb.push_str("Path access policy: ");
+    sb.push_str(describe_mode(local.mode()));
+    sb.push_str(". File tools reject absolute paths outside the roots above");
+    sb.push_str(if local.mode() == LocalFsMode::Rooted {
+        " with a security error"
+    } else {
+        ""
+    });
+    sb.push_str(".\n");
+    sb.push_str(
+        "Relative paths resolve under the workspace and read-fall-back to the project \
+(overlay copy-on-write).\n",
+    );
+    sb.push_str("Treat this directory as the single global workspace for file operations \
+unless explicitly instructed otherwise.\n");
+    let _ = workspace;
+    Some(sb)
+}
+
+fn sandbox_paragraph(effective: &Path, fs: &dyn Filesystem, artifact_enabled: bool) -> String {
+    let cwd = fs
+        .as_any()
+        .downcast_ref::<SandboxBackedFilesystem>()
+        .map(|sandbox| sandbox.cwd().to_string_lossy().to_string())
+        .unwrap_or_else(|| effective.to_string_lossy().to_string());
+    let mut sb = String::from("## Workspace\n");
+    sb.push_str("Sandbox root: ");
+    sb.push_str(&cwd);
+    sb.push('\n');
+    if artifact_enabled {
+        sb.push_str(
+            "Files are isolated inside this container. The host filesystem is not directly \
+accessible — see the File Isolation Notice below for how to deliver files out of the sandbox.\n",
+        );
+    } else {
+        sb.push_str(
+            "Files are isolated inside this container. The host filesystem is not accessible \
+and there is no mechanism for moving files across the boundary.\n",
+        );
+    }
+    sb
+}
+
+fn distributed_paragraph(workspace: &Path) -> String {
+    let mut sb = String::from("## Workspace\n");
+    sb.push_str("Distributed workspace template root: ");
+    sb.push_str(&workspace.to_string_lossy());
+    sb.push('\n');
+    sb.push_str(
+        "Runtime data (MEMORY.md, sessions, tasks, skills) lives in a shared remote store, \
+not on the local host. Reads of project-authored template files fall back to the workspace \
+template root above.\n",
+    );
+    sb
+}
+
+fn legacy_paragraph(workspace: &Path) -> String {
     let mut sb = String::from("## Workspace\n");
     sb.push_str("Your working directory is: ");
     sb.push_str(&workspace.to_string_lossy());
-    sb.push_str("\n");
+    sb.push('\n');
     sb.push_str(
         "Treat this directory as the single global workspace for file operations \
 unless explicitly instructed otherwise.\n",
     );
+    sb
+}
+
+fn describe_mode(mode: LocalFsMode) -> &'static str {
+    match mode {
+        LocalFsMode::Sandboxed => "SANDBOXED (all paths anchored to the workspace; `..` blocked)",
+        LocalFsMode::Rooted => "ROOTED (absolute paths accepted only inside the roots above)",
+        LocalFsMode::Unrestricted => "UNRESTRICTED (absolute paths pass through unchanged)",
+    }
+}
+
+/// Builds the `## Workspace` paragraph, branching on the concrete filesystem family.
+fn build_workspace_paragraph(
+    workspace: &Path,
+    effective: &Path,
+    fs: Option<&dyn Filesystem>,
+    artifact_delivery_enabled: bool,
+) -> String {
+    let kind = fs.map(Filesystem::kind);
+    let mut sb = match kind {
+        Some(FilesystemKind::Overlay) => local_overlay(workspace, effective, fs)
+            .unwrap_or_else(|| legacy_paragraph(workspace)),
+        Some(FilesystemKind::Sandbox) => fs
+            .map(|fs| sandbox_paragraph(effective, fs, artifact_delivery_enabled))
+            .unwrap_or_else(|| legacy_paragraph(workspace)),
+        Some(FilesystemKind::Composite) | Some(FilesystemKind::Remote) => {
+            distributed_paragraph(workspace)
+        }
+        _ => legacy_paragraph(workspace),
+    };
     sb.push_str(
         "AGENTS.md defines persona and local conventions — honor them when consistent \
 with safety and policy.\n",
     );
+    if matches!(kind, Some(FilesystemKind::Sandbox)) && artifact_delivery_enabled {
+        sb.push_str(
+            "**File Isolation Notice**\nFiles inside this container are isolated from the \
+host filesystem and are not directly accessible from outside. If your work produces any \
+final deliverables—such as documents, reports, images, spreadsheets, archives, audio/video \
+files, code artifacts, or similar—you **must** call deliver_artifact automatically when you \
+finish the task to export them to their configured external destination. Deliver it silently: \
+do not ask the user whether they want it delivered; the tool call itself lets the user see and \
+retrieve the artifact directly. Do not mention the delivery or the tool in your reply.\n",
+        );
+    }
     sb
 }
 
@@ -533,7 +663,7 @@ mod tests {
     #[test]
     fn workspace_paragraph_mentions_directory() {
         let p = Path::new("/tmp/ws");
-        let out = build_workspace_paragraph(p);
+        let out = build_workspace_paragraph(p, p, None, false);
         assert!(out.starts_with("## Workspace\n"));
         assert!(out.contains("/tmp/ws"));
         assert!(out.contains("AGENTS.md"));
@@ -551,6 +681,41 @@ mod tests {
         assert_eq!(build_session_dynamic_part(&rc, None), "");
     }
 
+    #[test]
+    fn local_overlay_uses_the_runtime_data_workspace() {
+        let ws = std::env::temp_dir().join(format!("wctx-overlay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let upper: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(ws.clone()));
+        let lower: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(ws.clone()));
+        let fs: Arc<dyn Filesystem> = Arc::new(OverlayFilesystem::new(upper, lower));
+        let wm = WorkspaceManager::with_fs(ws.clone(), Some(fs));
+        let rc = RuntimeContext::new();
+
+        assert_eq!(
+            effective_workspace(&wm, &rc, &ws),
+            wm.resolve_runtime_data_path(&rc, "")
+        );
+        std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
+    fn sandbox_prompt_includes_artifact_notice_only_when_enabled() {
+        let ws = std::env::temp_dir().join(format!("wctx-sandbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let fs = SandboxBackedFilesystem::new(
+            Arc::new(LocalFilesystem::new(ws.clone())) as Arc<dyn Filesystem>,
+            ws.clone(),
+        );
+
+        let enabled = build_workspace_paragraph(&ws, &ws, Some(&fs), true);
+        assert!(enabled.contains("File Isolation Notice"), "{enabled}");
+        assert!(enabled.contains("deliver_artifact"), "{enabled}");
+
+        let disabled = build_workspace_paragraph(&ws, &ws, Some(&fs), false);
+        assert!(!disabled.contains("File Isolation Notice"), "{disabled}");
+        std::fs::remove_dir_all(ws).ok();
+    }
+
     #[tokio::test]
     async fn build_section_includes_agents_and_guidance() {
         let ws = std::env::temp_dir().join(format!("wctx-test-{}", uuid::Uuid::new_v4()));
@@ -559,7 +724,8 @@ mod tests {
         let wm = WorkspaceManager::new(ws.clone());
         let rc = RuntimeContext::new().with_session_id("s1");
         let section =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false).await;
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false)
+                .await;
         assert!(section.contains("AgentStateStore Context"));
         assert!(section.contains("Persona"));
         assert!(section.contains("<loaded_context>"));
@@ -578,7 +744,8 @@ mod tests {
         let rc = RuntimeContext::new().with_session_id("s1");
 
         let both_enabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false).await;
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false)
+                .await;
         assert!(both_enabled.contains("## Memory Recall"));
         assert!(both_enabled.contains("memory_save"));
         assert!(both_enabled.contains("automatically extracted"));
@@ -586,7 +753,8 @@ mod tests {
         assert!(both_enabled.contains("remember the project conventions"));
 
         let tools_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, false).await;
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, false, false)
+                .await;
         assert!(!tools_disabled.contains("## Memory Recall"));
         assert!(!tools_disabled.contains("memory_save"));
         assert!(tools_disabled.contains("harness maintains automatically"));
@@ -595,14 +763,16 @@ mod tests {
         assert!(tools_disabled.contains("<memory_context>"));
 
         let hooks_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, true).await;
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, true, false)
+                .await;
         assert!(hooks_disabled.contains("## Memory Recall"));
         assert!(hooks_disabled.contains("memory_save"));
         assert!(!hooks_disabled.contains("automatically extracted"));
         assert!(hooks_disabled.contains("<memory_context>"));
 
         let both_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, true).await;
+            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, true, false)
+                .await;
         assert!(!both_disabled.contains("## Memory Recall"));
         assert!(!both_disabled.contains("memory_save"));
         assert!(!both_disabled.contains("automatically extracted"));
