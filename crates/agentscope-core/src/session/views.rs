@@ -284,7 +284,10 @@ impl SessionProjection {
                     }
                 }
                 "action/end" => {
-                    if let Some(value) = data.get("result") {
+                    // An explicit null is a missing result, not a result to decode: earlier
+                    // writers recorded the field unconditionally, and trying to parse it fails
+                    // the whole projection (and with it every resume of that session).
+                    if let Some(value) = data.get("result").filter(|value| !value.is_null()) {
                         let id = json_str(&data, "toolCallId").unwrap_or_default();
                         uncertain.remove(&id);
                         // Early native action payloads omitted the polymorphic discriminator.
@@ -853,6 +856,41 @@ mod tests {
             .filter(|m| m.id.starts_with("recovered_call-1"))
             .collect();
         assert_eq!(recovered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn action_end_with_a_null_result_does_not_break_the_projection() {
+        // Earlier writers recorded the field unconditionally. A null result means "no result
+        // captured", not a payload to decode: failing here used to make every resume of the
+        // session fail with a JSON error.
+        let (_storage, log, writer) = journal().await;
+        let state = crate::state::AgentState::builder().session_id("s1").build();
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "state/checkpoint",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+                ),
+                event(
+                    2,
+                    "action/end",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-1", "result": null }),
+                ),
+            ],
+        )
+        .await;
+
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert_eq!(projection.as_of_seq, 2);
+        assert!(projection.uncertain_tool_calls.is_empty());
     }
 
     #[tokio::test]

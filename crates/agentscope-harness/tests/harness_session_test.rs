@@ -183,3 +183,34 @@ async fn reading_views_never_starts_inference() {
     assert_eq!(session.head().await.unwrap().seq, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn the_event_sink_observes_the_whole_run() {
+    use std::sync::Mutex;
+
+    use agentscope_core::event::AgentEvent;
+
+    let (session, dir) = open_session("sink", "the sink sees this reply").await;
+    // A host renders from the sink instead of driving `stream_events` itself; the runtime
+    // keeps the task bookkeeping. Both must observe the same run.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    session.set_event_sink(Arc::new(move |event: &AgentEvent| {
+        recorder
+            .lock()
+            .unwrap()
+            .push(format!("{:?}", event.event_type()));
+    }));
+
+    let task = session.submit("say something").await.unwrap();
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+
+    let types = seen.lock().unwrap().clone();
+    assert!(!types.is_empty(), "the sink must observe the run");
+    assert!(
+        types.iter().any(|kind| kind.contains("AgentResult")),
+        "the terminal result must reach the host: {types:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2060,7 +2060,21 @@ async fn model_call_impl(
 
         let mut stream = model.stream(messages.clone(), tools.clone(), options.clone());
         let consume = async {
-            while let Some(chunk) = stream.next().await {
+            loop {
+                // An interrupt has to land while the provider is still streaming. Waiting on
+                // the stream alone would keep the run (and its journal writer lease) alive
+                // until the provider answered — for a stalled provider, forever.
+                let next = tokio::select! {
+                    next = stream.next() => next,
+                    _ = interrupt_pending(core, ctx) => {
+                        // The predicate fired: surface the precise error (cancelled vs
+                        // interrupted) instead of guessing which signal it was.
+                        return check_interrupted(core, ctx).and(Err(Error::Interrupted(
+                            "agent execution interrupted".into(),
+                        )));
+                    }
+                };
+                let Some(chunk) = next else { break };
                 let chunk = chunk?;
                 for block in &chunk.content {
                     match block {
@@ -2739,6 +2753,20 @@ fn check_interrupted(core: &Arc<AgentCore>, ctx: Option<&crate::agent::RuntimeCo
         return Err(Error::Interrupted("agent execution interrupted".into()));
     }
     Ok(())
+}
+
+/// Awaits until the current execution is interrupted or cancelled.
+///
+/// Uses the same predicate as the phase boundaries, so a run cannot be interruptible in one
+/// place and immune in another. Polling rather than a notification keeps
+/// [`InterruptControl`] unchanged; the timer is dropped as soon as a chunk arrives.
+async fn interrupt_pending(core: &Arc<AgentCore>, ctx: Option<&crate::agent::RuntimeContext>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if check_interrupted(core, ctx).is_err() {
+            return;
+        }
+    }
 }
 
 /// Collects the still-unanswered tool-use blocks of the most recent assistant

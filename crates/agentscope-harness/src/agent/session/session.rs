@@ -61,6 +61,10 @@ struct SessionState {
     active_run: Option<String>,
     error: Option<String>,
     closed: bool,
+    /// Receives every event of dispatched executions. A host that renders streaming
+    /// output (ACP, a CLI) installs one instead of driving `stream_events` itself, so
+    /// the journal writer and the task bookkeeping stay in one place.
+    sink: Option<Arc<dyn Fn(&AgentEvent) + Send + Sync>>,
 }
 
 /// A session's durable task operations and read views.
@@ -128,6 +132,15 @@ impl AgentSession {
     /// The last dispatch error, if any.
     pub fn execution_error(&self) -> Option<String> {
         self.state.lock().unwrap().error.clone()
+    }
+
+    /// Installs the subscriber that receives every event of dispatched executions.
+    ///
+    /// The runtime keeps rendering independent of task bookkeeping: a host renders from the
+    /// sink while [`await_task`](Self::await_task) tracks settlement. The sink is captured
+    /// once per execution, so replacing it never splits a single turn between two renderers.
+    pub fn set_event_sink(&self, sink: Arc<dyn Fn(&AgentEvent) + Send + Sync>) {
+        self.state.lock().unwrap().sink = Some(sink);
     }
 
     /// The committed head of the journal (sequence, writer lease, commit id).
@@ -405,8 +418,16 @@ impl AgentSession {
             Vec::new(),
             vec![run_id],
         )?;
-        self.inbox.accept(&command).await?;
+        // Signal before recording. Accepting input needs the journal writer lease, which the
+        // running execution holds until it stops: recording first would make `interrupt` wait
+        // for the run it is trying to stop (up to the lease timeout).
         self.agent.interrupt();
+        // Record the command off the caller's path. The interrupt is already delivered, so a
+        // busy journal must not turn it into an error, and the host must not block on it.
+        let inbox = self.inbox.clone();
+        tokio::spawn(async move {
+            let _ = inbox.accept(&command).await;
+        });
         Ok(true)
     }
 
@@ -687,6 +708,10 @@ async fn launch(
     extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
     extensions.insert(EXECUTION_CONTEXT_KEY, execution.clone());
 
+    // Capture the subscriber once per execution so a host that replaces it mid-run gets a
+    // clean cut instead of a half-rendered turn split across two renderers.
+    let sink = state.lock().unwrap().sink.clone();
+
     let react = agent.agent().cloned();
     let result: crate::Result<Option<Msg>> = match react {
         Some(react) => {
@@ -698,6 +723,11 @@ async fn launch(
             let mut reply = None;
             let mut failure = None;
             while let Some(event) = stream.next().await {
+                // Forward before interpreting: the host renders the same events the runtime
+                // uses for bookkeeping, including the terminal `AgentResult`.
+                if let (Ok(observed), Some(sink)) = (&event, &sink) {
+                    sink(observed);
+                }
                 match event {
                     Ok(AgentEvent::AgentResult(data)) => {
                         if let Some(value) = data.fields.get("reply") {

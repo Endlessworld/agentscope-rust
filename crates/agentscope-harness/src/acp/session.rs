@@ -14,9 +14,8 @@ use agent_client_protocol::schema::v1::{
     SessionMode, SessionModeState, StopReason, ToolCallUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use agentscope_core::agent::StreamOptions;
-use agentscope_core::event::ConfirmResult;
-use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
+use agentscope_core::event::{AgentEvent, ConfirmResult};
+use agentscope_core::message::{ChatUsage, ToolUseBlock};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
 use agentscope_core::model::GenerateOptions;
@@ -406,6 +405,14 @@ impl AcpAgentSession {
     /// The session id.
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The runtime context that identifies this ACP session in the journal.
+    ///
+    /// The user id is left unset on purpose: `HarnessAgent::session_key` falls back to the
+    /// agent's pinned state, so a host that configured a tenant keeps it.
+    fn session_context(&self) -> agentscope_core::agent::RuntimeContext {
+        agentscope_core::agent::RuntimeContext::new().with_session_id(self.session_id.to_string())
     }
 
     /// The working directory.
@@ -895,8 +902,8 @@ impl AcpAgentSession {
         // shows the current `updatedAt` without a separate `session/list` call.
         self.updated_at = Some(chrono::Utc::now().to_rfc3339());
         emit(self.session_info_update());
-        // Convert ACP content blocks into core messages.
-        let mut msgs = Vec::new();
+        // Convert ACP content blocks into one prompt string; the session runtime wraps it in
+        // the user message that becomes the turn's admitted input.
         let mut text = String::new();
         for block in content {
             if let ContentBlock::Text(t) = block {
@@ -906,18 +913,40 @@ impl AcpAgentSession {
                 text.push_str(&t.text);
             }
         }
-        let user_msg = if text.is_empty() {
-            Msg::user("")
-        } else {
-            Msg::user(text)
+        // Run the turn through the session runtime instead of driving `stream_events`
+        // directly: the runtime owns the journal writer, restores the committed state from
+        // the journal before the run, and admits steering/interrupts. This client only
+        // renders — events arrive through the sink below.
+        let session = match self.agent.session(self.session_context()).await {
+            Ok(session) => session,
+            Err(error) => {
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: {error}"),
+                    None,
+                ));
+                return StopReason::Refusal;
+            }
         };
-        msgs.push(user_msg);
-
-        let stream = self.agent.stream_events(msgs, StreamOptions::defaults());
-        let mut stream = std::pin::pin!(stream);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        session.set_event_sink(Arc::new(move |event: &AgentEvent| {
+            // A closed receiver only means the prompt already returned; the run itself is
+            // unaffected, so dropping the event here is safe.
+            let _ = events_tx.send(event.clone());
+        }));
+        let task = match session.submit(text).await {
+            Ok(task) => task,
+            Err(error) => {
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: {error}"),
+                    None,
+                ));
+                return StopReason::Refusal;
+            }
+        };
 
         use agentscope_core::event::AgentEventType;
-        use futures::StreamExt;
         // Tracks whether any incremental text delta was already emitted, so we
         // don't duplicate the final reply text when it was streamed token-by-token.
         let mut emitted_text = false;
@@ -944,11 +973,27 @@ impl AcpAgentSession {
         // (inflated) cumulative session usage.
         emit(self.usage_notification(0));
 
+        // Settlement is the exit condition: the sink keeps the channel open, so "no more
+        // events" never happens on its own. Events keep rendering in this loop until the
+        // queue is drained after settlement.
+        let mut settled_task: Option<crate::agent::session::Task> = None;
+        let mut cancelled = false;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
                     if cancel_flag.load(Ordering::SeqCst) {
-                        return StopReason::Cancelled;
+                        cancelled = true;
+                        break;
+                    }
+                    if settled_task.is_none() {
+                        if let Ok(current) = session.task(&task.command_id).await {
+                            if current.settled() {
+                                settled_task = Some(current);
+                            }
+                        }
+                    }
+                    if settled_task.is_some() && events_rx.is_empty() {
+                        break;
                     }
                 }
                 // The SDK sets this marker when the peer sends `$/cancel_request`
@@ -960,11 +1005,12 @@ impl AcpAgentSession {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    return StopReason::Cancelled;
+                    cancelled = true;
+                    break;
                 }
-                item = stream.next() => {
-                    match item {
-                        Some(Ok(ev)) => match ev.event_type() {
+                event = events_rx.recv() => {
+                    match event {
+                        Some(ev) => match ev.event_type() {
                             AgentEventType::TextBlockDelta => {
                                 if let Some(notif) = super::event::map_delta_event(
                                     self.session_id.clone(),
@@ -1048,17 +1094,34 @@ impl AcpAgentSession {
                                 }
                             }
                         },
-                        Some(Err(e)) => {
-                            emit(super::event::message_chunk(
-                                self.session_id.clone(),
-                                format!("Agent error: {e}"),
-                                message_id_opt.clone(),
-                            ));
-                            return StopReason::Refusal;
-                        }
                         None => break,
                     }
                 }
+            }
+        }
+
+        if cancelled {
+            // The ACP cancel flag is the only client-facing cancellation, so stop the run and
+            // close its turn: an interrupted turn stays open in the journal (only
+            // `completed`/`cancelled` end one), and the next prompt must be able to submit.
+            let _ = session.interrupt().await;
+            let _ = session.await_task(&task.command_id).await;
+            let _ = agentscope_core::session::cancel_pending(session.log(), &task.turn_id).await;
+            return StopReason::Cancelled;
+        }
+
+        if let Some(current) = &settled_task {
+            if current.status == "failed" {
+                let detail = current
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "run failed".to_string());
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: {detail}"),
+                    message_id_opt.clone(),
+                ));
+                return StopReason::Refusal;
             }
         }
 
