@@ -98,7 +98,7 @@
 ### 3.3 增强（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `TelemetryTracer`（core `Middleware` 包装 + span 生命周期） | TelemetryTracer | 待办 | 仍待办：需将 `telemetry::exporter::Span` 绑定到 middleware 的四个拦截点；导出器与编码器已就绪（§4.1.0s），不阻塞依赖 |
+| `TelemetryTracer`（core `Middleware` 包装 + span 生命周期） | TelemetryTracer | 已完成（2026-10-21，`TelemetryTracing`） | `telemetry/tracing.rs`：`Middleware` 三拦截点（`OnAgent`/`OnModelCall`/`OnActing`）产出 `invoke_agent` / `chat {model}` / `execute_tool {name}`；span 用 **RAII 收尾**（guard 随事件流 drop 而结束，取消路径不漏 span）；父子靠 `RuntimeContext.run_id` 映射（`&RuntimeContext` 不可变，不能用 ctx 存 span）。`TraceExporter::export` 是 async 而 hook 是同步 → `SpanSink` 后台批量导出 + `flush()` 供测试/短进程。单元 7 个（含「drop 掉流仍导出 span」与真实 `ReActAgent` 端到端）|
 | OTLP HTTP 导出 | exporter-otlp-http | 已完成（降级 exporter）| `telemetry::exporter`：`Span`/`SpanKind`/`SpanStatus`/`OtlpEncoder`（`resourceSpans`→`scopeSpans`→`spans`，id 十六进制校验、纳秒字符串、`AnyValue` 映射）+ `TraceExporter` trait + `OtlpHttpExporter`（reqwest `POST {tracingUrl}`）/`RecordingTraceExporter`/`NoopTraceExporter`；**未引入 `opentelemetry` 依赖**（设计决定，见 §4.2） |
 | 多模态内容部件抽取 | TODO(multi-modal) | 待办 | Java 亦为 TODO；`block_to_part` 对 Image/Audio/Video 返回 None |
 
@@ -139,11 +139,30 @@
 **修复**：`encode_attribute_value` 现正确编码 `Value::Array` → `{"arrayValue":{"values":[...]}}`、`Value::Object` → `{"kvlistValue":{"values":[{"key":..,"value":..}]}}`（逐元素递归）；仅 `null` 仍降级为空串 `{"stringValue":""}`（**OTLP 无 null 类型**，这一处才是不变量）。原错误注释已删除。
 **测试同步**：`attribute_values_map_to_the_otlp_any_value_shape` 原断言对象降级为 `stringValue` 字符串（**该断言本身编码了错误行为**）→ 改为断言 `kvlistValue`，并新增数组 → `arrayValue` 断言。测试数不变（仍 52，为同测试内断言加强）。
 
+#### 4.1.0u 新增：`TelemetryTracing` span 生产者（2026-10-21，关闭汇总 tracker GAP-18）
+**裁定**：GAP-18「tracer 归 core 还是 studio」→ **归 studio**（core 不加 `opentelemetry` 依赖、不改 feature 矩阵）。理由见汇总 tracker §2。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `src/telemetry/tracing.rs` | 新 | `TelemetryTracing`（`impl Middleware`，`active_points` 只开三个点）+ `SpanGuard`（RAII end）+ `SpanStream`（持有 guard 的事件流，drop 即结束 span）+ `SpanSink`（`mpsc` 队列 + 后台批量 `export` + `flush()`）+ `new_trace_id`(32 hex)/`new_span_id`(16 hex) |
+| `src/telemetry/mod.rs` | 改 | 声明/导出 `tracing`、`TelemetryTracing`、`DEFAULT_PROVIDER_NAME`；模块文档补生产者 |
+
+**设计要点**
+- **RAII**：span guard 放在 `on_*` 返回的事件流里，`SpanStream::drop`/`SpanGuard::drop` 都会收尾 —— 这正是 GAP-19「取消 = drop future」下 span 不漏 end 的唯一保证；不需要 `on_cancel` 钩子。
+- **父子关联**：`on_*` 只拿到 `&RuntimeContext`（不可变），无法往 ctx 写当前 span，故用 `Arc<Mutex<HashMap<run_key, SpanCtx>>>`，`run_key` = `run_id` → `session_id` → `agent_id` 降级；run 结束（流结束或 drop）即移除。
+- **同步 hook / 异步 exporter**：`SpanSink` 用无界 channel + 后台任务，等价 Java `BatchSpanProcessor`；无 tokio runtime 时丢弃 span 并 warn（不 panic、不阻塞）。
+- **首版不含响应侧属性**（`gen_ai.usage.*`）：需从事件流聚合，留作后续；当前只记请求侧 + 状态 + 时间。
+
+**测试**：`a_completed_run_exports_the_agent_span`、`a_failed_run_marks_the_span_as_error`、`a_dropped_run_still_ends_the_span`（**反向验证：去掉 Drop 路径后仅此用例 FAILED**）、`nested_phases_attach_to_the_run_span`、`a_run_without_a_run_id_falls_back_to_the_session`、`only_the_three_traced_points_are_active`、`a_real_agent_run_exports_agent_and_model_spans`（真实 `ReActAgent` + Mock 模型）。
+
+**验证**：`cargo test -p agentscope-extensions-studio` → **59 passed / 0 failed**（基线 52，+7）。
+
 ### 4.2 下一步与阻塞（待汇总方裁定）
-1. **【已解决 — 降级方案】** OTLP 导出**不引入 `opentelemetry`/`opentelemetry-otlp`**（避免根 `[workspace.dependencies]` 变更）：以 `telemetry::exporter` 自建 `Span` 模型 + `OtlpEncoder`（OTLP/HTTP JSON）+ `TraceExporter` trait 实现等价导出。仅 `TelemetryTracer`（把 span 绑定到 middleware 四个拦截点）仍待办（§3.3），但其依赖（编码器/导出器）已就绪，不再阻塞。若后续要求与 OTel SDK 字节级兼容，再提请裁定。
+1. **【已解决 — 降级方案】** OTLP 导出**不引入 `opentelemetry`/`opentelemetry-otlp`**（避免根 `[workspace.dependencies]` 变更）：以 `telemetry::exporter` 自建 `Span` 模型 + `OtlpEncoder`（OTLP/HTTP JSON）+ `TraceExporter` trait 实现等价导出。`TelemetryTracer` 等价物已于 2026-10-21 落地（`TelemetryTracing`，§4.1.0u）。若后续要求与 OTel SDK 字节级兼容，再提请裁定。
 2. **【已解决 — 本 crate 自声明依赖】** Socket.IO：已用 `tokio-tungstenite = 0.29`（与 CHANNEL crate 同版本/同 features）+ 自实现 Engine.IO v4/Socket.IO 帧（`studio::socket_io`）。**未改根 `Cargo.toml`。**
    附带说明：`StudioManager::initialize_with` 默认仍用 `NoopStudioTransport`（Java 为无条件连接）；宿主要启用真实连接需走 `initialize_with_transport` / `StudioWebSocketClient::with_transport_and_registry`。**原因**：默认连接会让本 crate 现有离线测试向 `localhost:3000` 发起真实网络请求（违反离线测试约定）。
 3. **【core 缺口】** `GenerateOptions` 未实现 `Serialize`（本 crate 已用本地投影绕过，未改 core）；core 无 `Hook`/`TracerRegistry`（已按 §2 用 `Middleware` 替代）。
+4. **【接线待办】** `TelemetryTracing` 目前由宿主显式挂到 `MiddlewareChain`（`chain.add(Box::new(tracing.clone()))`），尚未在 `StudioManager::initialize` 里按 `StudioConfig.tracing_url` 自动装配 —— 自动装配需决定「一个 Studio 实例 vs 每个 agent 一条链」，留待后续。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-studio` 基线。

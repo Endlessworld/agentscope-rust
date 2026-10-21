@@ -13,6 +13,10 @@
 //! recording/no-op doubles). The `opentelemetry` workspace dependency is deliberately not
 //! pulled in (tracker §4.2).
 //!
+//! [`tracing::TelemetryTracing`] is the producer that was missing: a core `Middleware` that
+//! turns agent runs into `invoke_agent` / `chat` / `execute_tool` spans and feeds them to a
+//! [`TraceExporter`]. Span lifetime is RAII, so a dropped (cancelled) run still closes its spans.
+//!
 //! [`Span`]: exporter::Span
 //! [`OtlpEncoder`]: exporter::OtlpEncoder
 //! [`TraceExporter`]: exporter::TraceExporter
@@ -27,8 +31,10 @@ pub mod exporter;
 pub mod extractors;
 pub mod gen_ai_attributes;
 pub mod model;
+pub mod tracing;
 
 pub use aggregator::StreamChatResponseAggregator;
+pub use tracing::{TelemetryTracing, DEFAULT_PROVIDER_NAME};
 pub use extractors::{
     get_agent_request_attributes, get_agent_response_attributes, get_common_attributes,
     get_format_request_attributes, get_format_response_attributes, get_function_name,
