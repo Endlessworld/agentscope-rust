@@ -1321,8 +1321,27 @@ async fn run_agent_loop(
         }
     }
 
+    // A middleware may attach request-scoped SYSTEM material (workspace/memory
+    // context, subagent catalog) to the input on every call. System prompts are
+    // prompt material, not conversation history: appending them would persist one
+    // full copy per turn and eventually exhaust the model's context budget.
+    // Replace the previous system view instead.
+    let incoming_system: Vec<Msg> = messages
+        .iter()
+        .filter(|message| message.role == MsgRole::System)
+        .cloned()
+        .collect();
+    if !incoming_system.is_empty() {
+        let context = state.context_mut();
+        context.retain(|message| message.role != MsgRole::System);
+        for (index, message) in incoming_system.into_iter().enumerate() {
+            context.insert(index, message);
+        }
+    }
     for m in messages {
-        state.context_mut().push(m);
+        if m.role != MsgRole::System {
+            state.context_mut().push(m);
+        }
     }
     state.set_cur_iter(0);
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
@@ -1755,9 +1774,15 @@ async fn run_reasoning(
     };
 
     let stream = chain.wrap_reasoning(ctx.clone(), input, reasoning_core);
-    let _events: Vec<_> = stream.collect().await;
-    let result = slot.lock().unwrap().take().unwrap_or_else(|| {
-        Err(Error::Agent("model produced no message".into()))
+    let events: Vec<_> = stream.collect().await;
+    // A middleware can fail before the model core runs (for example the context
+    // compiler rejecting an over-budget request). That failure only exists as a
+    // stream item; discarding it here would turn every such failure into the
+    // indistinguishable "model produced no message" error.
+    let stream_error = events.into_iter().find_map(|event| event.err());
+    let result = slot.lock().unwrap().take().unwrap_or_else(|| match stream_error {
+        Some(error) => Err(error),
+        None => Err(Error::Agent("model produced no message".into())),
     });
     result
 }
@@ -4248,6 +4273,38 @@ mod tests {
         }
     }
 
+    /// Middleware that attaches a freshly built SYSTEM prompt to every call, like
+    /// `WorkspaceContextMiddleware` does for workspace/memory context.
+    struct SystemInjectingMiddleware(&'static str);
+
+    impl crate::middleware::Middleware for SystemInjectingMiddleware {
+        fn on_agent(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            mut input: AgentInput,
+            next: Next<AgentInput>,
+        ) -> EventStream {
+            input.messages.insert(0, Msg::system(self.0));
+            next(input)
+        }
+    }
+
+    /// Middleware that fails before the model core runs.
+    struct FailingReasoningMiddleware;
+
+    impl crate::middleware::Middleware for FailingReasoningMiddleware {
+        fn on_reasoning(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            _input: ReasoningInput,
+            _next: Next<ReasoningInput>,
+        ) -> EventStream {
+            Box::pin(futures::stream::once(async {
+                Err(Error::Agent("context preparation failed".into()))
+            }))
+        }
+    }
+
     /// Middleware that records each `on_agent_state_ready` notification and can
     /// optionally decline participation.
     struct StateReadyMiddleware {
@@ -4386,6 +4443,77 @@ mod tests {
         assert!(
             calls[0].iter().any(|m| m.text_content() == "REWRITTEN"),
             "reasoning middleware rewrite must reach the model call"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_system_prompts_replace_instead_of_accumulating() {
+        // Regression: ACP passes only the new user input to the agent, so a middleware
+        // attaching workspace context created a new SYSTEM message every turn. The loop
+        // persisted each one, growing the request by a full system prompt per turn until
+        // the context compiler rejected it as over budget.
+        let model = Arc::new(RecordingModel::new());
+        let seen = Arc::clone(&model.seen);
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(SystemInjectingMiddleware("WORKSPACE CONTEXT")));
+        let agent = ReActAgent::builder()
+            .name("t-system-dedup")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("first")]).await.unwrap();
+        agent.call(vec![Msg::user("second")]).await.unwrap();
+
+        let state = agent.state_handle();
+        let guard = state.lock().unwrap();
+        let systems: Vec<_> = guard
+            .context()
+            .iter()
+            .filter(|message| message.role == MsgRole::System)
+            .collect();
+        assert_eq!(
+            systems.len(),
+            1,
+            "a request-scoped system prompt must not accumulate"
+        );
+        assert!(systems[0].text_content().contains("WORKSPACE CONTEXT"));
+
+        // The replaced prompt still reaches every model request.
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert!(
+                call.iter().any(|message| message.role == MsgRole::System
+                    && message.text_content().contains("WORKSPACE CONTEXT")),
+                "every request must carry the current system prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_middleware_failure_is_not_reported_as_empty_completion() {
+        // The context compiler reports an over-budget request as a stream error before
+        // the model core runs. `run_reasoning` must surface that error instead of
+        // collapsing it into "model produced no message".
+        let model = Arc::new(MockModel::new("mock", vec![text_response("unused")]));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(FailingReasoningMiddleware));
+        let agent = ReActAgent::builder()
+            .name("t-reasoning-error")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let error = agent
+            .call(vec![Msg::user("hi")])
+            .await
+            .expect_err("the middleware failure must abort the call");
+        assert!(
+            error.to_string().contains("context preparation failed"),
+            "unexpected error: {error}"
         );
     }
 
