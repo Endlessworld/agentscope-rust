@@ -29,9 +29,8 @@ use super::distributed_store::DistributedStore;
 use super::isolation_scope::IsolationScope;
 use super::memory::{MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig};
 use super::middleware::{
-    AgentTraceMiddleware, AtPathExpansionMiddleware, CompactionMiddleware,
-    CompactionMiddlewareConfig, ConversationCompactionMiddleware, DynamicSubagentsMiddleware,
-    HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
+    AgentTraceMiddleware, AtPathExpansionMiddleware, ConversationCompactionMiddleware,
+    DynamicSubagentsMiddleware, HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
     SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware, TeamsMiddleware,
     ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware,
@@ -508,9 +507,9 @@ pub struct HarnessAgentBuilder {
     max_context_tokens: usize,
     additional_context_files: Vec<String>,
     memory_config: Option<MemoryConfig>,
-    compaction_config: Option<CompactionMiddlewareConfig>,
     tool_result_eviction_config: Option<ToolResultEvictionConfig>,
     /// Conversation-compaction configuration (`ConversationCompactionMiddleware`).
+    /// This is the Java `CompactionMiddleware` equivalent.
     conversation_compaction_config: Option<super::memory::compaction::CompactionConfig>,
     plan_mode_enabled: bool,
     plan_mode_allow_shell: bool,
@@ -606,7 +605,6 @@ impl Default for HarnessAgentBuilder {
             max_context_tokens: 8000,
             additional_context_files: Vec::new(),
             memory_config: None,
-            compaction_config: None,
             tool_result_eviction_config: None,
             conversation_compaction_config: None,
             plan_mode_enabled: false,
@@ -852,13 +850,31 @@ impl HarnessAgentBuilder {
         self
     }
 
-    /// Enables the compaction middleware with the given config.
-    pub fn compaction(mut self, config: CompactionMiddlewareConfig) -> Self {
-        self.compaction_config = Some(config);
+    /// Enables conversation compaction with the given config.
+    ///
+    /// This is the Java `HarnessAgent.Builder.compaction(CompactionConfig)` equivalent:
+    /// at the start of each agent call the accumulated history is summarized (LLM)
+    /// and replaced with `[summary] + preserved tail` once it exceeds the trigger.
+    pub fn compaction(
+        mut self,
+        config: super::memory::compaction::CompactionConfig,
+    ) -> Self {
+        self.conversation_compaction_config = Some(config);
         self
     }
 
-    /// Disables the compaction middleware entirely.
+    /// Alias for [`Self::compaction`], kept for callers that used the older name.
+    pub fn conversation_compaction(
+        self,
+        config: super::memory::compaction::CompactionConfig,
+    ) -> Self {
+        self.compaction(config)
+    }
+
+    /// Disables conversation compaction entirely.
+    ///
+    /// Mirrors Java `HarnessAgent.Builder.disableCompaction()`: it gates the real
+    /// compaction middleware, not just a prompt marker.
     pub fn disable_compaction(mut self) -> Self {
         self.disable_compaction = true;
         self
@@ -867,17 +883,6 @@ impl HarnessAgentBuilder {
     /// Overrides the tool-result eviction configuration.
     pub fn tool_result_eviction(mut self, config: ToolResultEvictionConfig) -> Self {
         self.tool_result_eviction_config = Some(config);
-        self
-    }
-
-    /// Enables conversation compaction: at the start of each agent call the
-    /// accumulated history is summarized (LLM) and replaced with
-    /// `[summary] + preserved tail` once it exceeds the configured trigger.
-    pub fn conversation_compaction(
-        mut self,
-        config: super::memory::compaction::CompactionConfig,
-    ) -> Self {
-        self.conversation_compaction_config = Some(config);
         self
     }
 
@@ -1373,7 +1378,7 @@ impl HarnessAgentBuilder {
         }
 
         // ---- Memory pipeline (flush + consolidation + maintenance) ----
-        let memory_config = self.memory_config.unwrap_or_default();
+        let memory_config = self.memory_config.clone().unwrap_or_default();
         let memory_model = memory_config
             .model
             .clone()
@@ -1408,10 +1413,18 @@ impl HarnessAgentBuilder {
             }
         }
 
-        // ---- Compaction ----
+        // ---- Conversation compaction ----
+        // Java `CompactionMiddleware` performs the real summarize-and-replace pass.
+        // `disable_compaction()` must gate this path, not a prompt marker.
         if !self.disable_compaction {
-            if let Some(cfg) = self.compaction_config.clone() {
-                middleware.add(Box::new(CompactionMiddleware::new(cfg)));
+            if let Some(cfg) = self.conversation_compaction_config.clone() {
+                if let Some(model) = self.model.clone() {
+                    middleware.add(Box::new(ConversationCompactionMiddleware::with_model(
+                        model,
+                        cfg,
+                        name.clone(),
+                    )));
+                }
             }
         }
 
@@ -1421,17 +1434,6 @@ impl HarnessAgentBuilder {
                 middleware.add(Box::new(ToolResultEvictionMiddleware::new(
                     Arc::clone(&filesystem),
                     cfg,
-                )));
-            }
-        }
-
-        // ---- Conversation compaction ----
-        if let Some(cfg) = self.conversation_compaction_config.clone() {
-            if let Some(model) = self.model.clone() {
-                middleware.add(Box::new(ConversationCompactionMiddleware::with_model(
-                    model,
-                    cfg,
-                    name.clone(),
                 )));
             }
         }
@@ -1722,6 +1724,20 @@ impl HarnessAgentBuilder {
                 enable_pending_tool_recovery: self.enable_pending_tool_recovery.unwrap_or(false),
                 disable_memory_tools: self.disable_memory_tools,
                 disable_memory_hooks: self.disable_memory_hooks,
+                memory_config: self.memory_config.clone(),
+                disable_workspace_context: self.disable_workspace_context,
+                plan_mode_enabled: self.plan_mode_enabled,
+                plan_mode_allow_shell: self.plan_mode_allow_shell,
+                plan_file_dir: self.plan_file_dir.clone(),
+                compaction_config: self.conversation_compaction_config.clone(),
+                disable_compaction: self.disable_compaction,
+                tool_result_eviction_config: self.tool_result_eviction_config.clone(),
+                disable_tool_result_eviction: self.disable_tool_result_eviction,
+                agent_tracing_log_enabled: self.agent_tracing_log_enabled,
+                additional_context_files: self.additional_context_files.clone(),
+                max_context_tokens: self.max_context_tokens,
+                environment_memory: self.environment_memory.clone(),
+                use_legacy_xml_workspace_context: self.use_legacy_xml_workspace_context,
             });
             // --- subagent entries ---
             let mut entries: Vec<SubagentEntry> = Vec::new();

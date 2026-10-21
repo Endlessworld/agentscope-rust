@@ -28,7 +28,6 @@ use agentscope_extensions_model::OpenAiChatModel;
 
 use crate::agent::context::TaskContextOptions;
 use crate::agent::{CompactionConfig, HarnessAgent};
-use crate::CompactionMiddlewareConfig;
 
 use super::config::{ModeChoice, ModelChoice};
 use super::elicitation::ElicitationSlot;
@@ -68,10 +67,6 @@ fn build_env_model() -> Arc<dyn Model> {
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
 fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model = build_env_model();
-    let compaction = CompactionMiddlewareConfig {
-        enabled: true,
-        max_tokens: ACP_CONTEXT_WINDOW_TOKENS,
-    };
     let workspace = cwd.join(".agentscope").join("workspace");
     HarnessAgent::builder()
         .name("agentscope-coding-agent")
@@ -80,7 +75,6 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
         .workspace(workspace)
         .register_filesystem_tools(true)
         .register_shell_tool(true)
-        .compaction(compaction)
         .conversation_compaction(
             CompactionConfig::builder()
                 .trigger_messages(0)

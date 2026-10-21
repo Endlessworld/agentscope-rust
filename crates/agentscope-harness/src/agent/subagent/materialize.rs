@@ -11,6 +11,8 @@ use agentscope_core::state::AgentStateStore;
 use agentscope_core::tool::Toolkit;
 
 use super::{SubagentDeclaration, SubagentFactory, SubagentWorkspaceMode};
+use crate::agent::memory::compaction::CompactionConfig;
+use crate::agent::memory::{MemoryConfig, ToolResultEvictionConfig};
 use crate::agent::skill::SkillFilter;
 use crate::agent::HarnessAgent;
 
@@ -111,6 +113,32 @@ fn sanitize_identifier(s: Option<&str>) -> Option<String> {
             })
             .collect(),
     )
+}
+
+/// Resolves the declared subagent's system-prompt base.
+///
+/// Mirrors Java `resolveDeclaredSysPromptBase`: a declaration workspace reads
+/// `<workspace_path>/AGENTS.md`; otherwise the inline prompt body is used.
+fn resolve_declared_sys_prompt_base(decl: &SubagentDeclaration) -> String {
+    let Some(workspace_path) = &decl.workspace_path else {
+        return decl.prompt.clone();
+    };
+    let agents_md = Path::new(workspace_path).join("AGENTS.md");
+    if !agents_md.is_file() {
+        return String::new();
+    }
+    match std::fs::read_to_string(&agents_md) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::warn!(
+                subagent = %decl.name,
+                path = %agents_md.display(),
+                %error,
+                "failed to read subagent AGENTS.md; using an empty base prompt"
+            );
+            String::new()
+        }
+    }
 }
 
 /// Runtime workspace root for a declared subagent: SHARED reuses the main
@@ -219,6 +247,35 @@ pub struct SubagentBlueprint {
     /// (mirrors Java `capturedDisableMemoryTools` / `capturedDisableMemoryHooks`).
     pub disable_memory_tools: bool,
     pub disable_memory_hooks: bool,
+    /// Java `capturedMemoryConfig`: inherited by both general-purpose and declared
+    /// children.
+    pub memory_config: Option<MemoryConfig>,
+    /// Java `capturedDisableWorkspaceContext`: general-purpose children inherit it.
+    pub disable_workspace_context: bool,
+    /// Java `configurePlanMode`: both general-purpose and declared children inherit
+    /// the parent's plan-mode configuration.
+    pub plan_mode_enabled: bool,
+    pub plan_mode_allow_shell: bool,
+    pub plan_file_dir: String,
+    /// Java `capturedCompactionConfig` / `capturedDisableCompaction`: general-purpose
+    /// children inherit the parent's conversation-compaction settings.
+    pub compaction_config: Option<CompactionConfig>,
+    pub disable_compaction: bool,
+    /// Java `capturedToolResultEvictionConfig` / `capturedDisableToolResultEviction`:
+    /// general-purpose children inherit the parent's eviction settings.
+    pub tool_result_eviction_config: Option<ToolResultEvictionConfig>,
+    pub disable_tool_result_eviction: bool,
+    /// Java `capturedAgentTracingLogEnabled`: general-purpose children inherit it.
+    pub agent_tracing_log_enabled: bool,
+    /// Java `capturedAdditionalContextFiles`: general-purpose children inherit them.
+    pub additional_context_files: Vec<String>,
+    /// Java `capturedMaxContextTokens`: general-purpose children inherit it.
+    pub max_context_tokens: usize,
+    /// Java `capturedEnvMemory`: general-purpose children inherit it.
+    pub environment_memory: Option<String>,
+    /// Java propagates this to both child kinds (even though the flag is currently
+    /// not consumed by the main build path).
+    pub use_legacy_xml_workspace_context: bool,
 }
 
 impl SubagentBlueprint {
@@ -268,7 +325,7 @@ impl SubagentBlueprint {
             blueprint: Arc::clone(self),
             name: decl.name.clone(),
             description: decl.description.clone(),
-            sys_prompt: build_subagent_sys_prompt(&decl.prompt),
+            sys_prompt: build_subagent_sys_prompt(&resolve_declared_sys_prompt_base(decl)),
             toolkit: allowlisted_inherited_toolkit(&self.toolkit, &decl.tools),
             workspace: resolve_declared_workspace(decl, &self.main_workspace),
             max_iters: decl.steps.map(|s| s as i32).unwrap_or(self.max_iters),
@@ -344,6 +401,53 @@ impl LeafFactory {
         if let Some(decl) = &self.decl {
             builder = builder.session_id(derive_child_session_id(decl, parent_rc));
         }
+        // Java `configurePlanMode` propagates plan mode to both child kinds.
+        if self.blueprint.plan_mode_enabled {
+            builder = builder
+                .enable_plan_mode()
+                .plan_file_directory(self.blueprint.plan_file_dir.clone());
+            if self.blueprint.plan_mode_allow_shell {
+                builder = builder.allow_shell_in_plan_mode();
+            }
+        }
+        // Java propagates the memory pipeline config to both child kinds.
+        if let Some(memory_config) = &self.blueprint.memory_config {
+            builder = builder.memory(memory_config.clone());
+        }
+        if self.blueprint.use_legacy_xml_workspace_context {
+            builder = builder.use_legacy_xml_workspace_context(true);
+        }
+
+        // The following were captured only by Java's `buildGeneralPurposeFactory`.
+        // Declared children keep the parent defaults, matching Java's current
+        // asymmetry.
+        if self.decl.is_none() {
+            if self.blueprint.disable_workspace_context {
+                builder = builder.disable_workspace_context();
+            }
+            if let Some(environment_memory) = &self.blueprint.environment_memory {
+                builder = builder.environment_memory(environment_memory.clone());
+            }
+            for relative_path in &self.blueprint.additional_context_files {
+                builder = builder.additional_context_file(relative_path.clone());
+            }
+            builder = builder
+                .max_context_tokens(self.blueprint.max_context_tokens)
+                .enable_agent_tracing_log(self.blueprint.agent_tracing_log_enabled);
+
+            if self.blueprint.disable_compaction {
+                builder = builder.disable_compaction();
+            } else if let Some(config) = &self.blueprint.compaction_config {
+                builder = builder.compaction(config.clone());
+            }
+
+            if self.blueprint.disable_tool_result_eviction {
+                builder = builder.disable_tool_result_eviction();
+            } else if let Some(config) = &self.blueprint.tool_result_eviction_config {
+                builder = builder.tool_result_eviction(config.clone());
+            }
+        }
+
         // Java `HarnessAgentBuilderSupport` propagates both memory flags to every
         // declared / general-purpose child. Do the same so a child prompt never
         // advertises memory tools or hooks the parent turned off.
@@ -418,6 +522,20 @@ mod tests {
             enable_pending_tool_recovery: parent_flag,
             disable_memory_tools: false,
             disable_memory_hooks: false,
+            memory_config: None,
+            disable_workspace_context: false,
+            plan_mode_enabled: false,
+            plan_mode_allow_shell: false,
+            plan_file_dir: "plans".into(),
+            compaction_config: None,
+            disable_compaction: false,
+            tool_result_eviction_config: None,
+            disable_tool_result_eviction: false,
+            agent_tracing_log_enabled: true,
+            additional_context_files: Vec::new(),
+            max_context_tokens: 8000,
+            environment_memory: None,
+            use_legacy_xml_workspace_context: false,
         })
     }
 
@@ -432,6 +550,41 @@ mod tests {
             .agent()
             .expect("the child is built with a model")
             .enable_pending_tool_recovery()
+    }
+
+    #[test]
+    fn declared_workspace_reads_agents_md_for_the_system_prompt() {
+        let workspace = scratch().join("declared_agents_md");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "# Workspace Persona\nUse the project conventions.",
+        )
+        .unwrap();
+
+        let mut decl = SubagentDeclaration::new("worker", "does work", "");
+        decl.workspace_path = Some(workspace.to_string_lossy().to_string());
+        let child = blueprint(false)
+            .declared_leaf(&decl)
+            .expect("a local declaration yields a leaf")
+            .build(&RuntimeContext::new());
+        let prompt = child.agent().expect("the child is built with a model").sys_prompt();
+        assert!(prompt.contains("Workspace Persona"), "{prompt}");
+        assert!(prompt.contains("Use the project conventions."), "{prompt}");
+        assert!(prompt.contains("Subagent Context"), "{prompt}");
+    }
+
+    #[test]
+    fn declared_inline_prompt_is_used_without_a_workspace() {
+        let mut decl = SubagentDeclaration::new("worker", "does work", "Inline Persona");
+        decl.workspace_path = None;
+        let child = blueprint(false)
+            .declared_leaf(&decl)
+            .expect("a local declaration yields a leaf")
+            .build(&RuntimeContext::new());
+        let prompt = child.agent().expect("the child is built with a model").sys_prompt();
+        assert!(prompt.contains("Inline Persona"), "{prompt}");
+        assert!(prompt.contains("Subagent Context"), "{prompt}");
     }
 
     #[test]

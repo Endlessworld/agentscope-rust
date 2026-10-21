@@ -102,8 +102,7 @@ use agentscope_harness::acp::config::ModelChoice;
 use agentscope_harness::acp::{AskUserTool, SessionBuild};
 use agentscope_harness::agent::context::TaskContextOptions;
 use agentscope_harness::agent::{
-    CompactionConfig, CompactionMiddlewareConfig, FileSystemSkillRepository, HarnessAgent,
-    ToolResultEvictionConfig,
+    CompactionConfig, FileSystemSkillRepository, HarnessAgent, ToolResultEvictionConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -964,10 +963,6 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         })
         .register_filesystem_tools(true)
         .register_shell_tool(true)
-        .compaction(CompactionMiddlewareConfig {
-            enabled: true,
-            max_tokens: ACP_CONTEXT_WINDOW_TOKENS,
-        })
         .disable_memory_hooks()
         // 对话压缩：上下文 token 数达到 256k 窗口上限时由 LLM 总结早期对话并保留最近 tail，
         // 控制 AgentState.context 的持续增长（保留 tail 不破坏前缀 KV 缓存）。
