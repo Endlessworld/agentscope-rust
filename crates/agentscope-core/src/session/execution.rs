@@ -4,6 +4,7 @@
 //! against the committed turns and pending interactions, never against caller-supplied
 //! assumptions about what the session contains.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{
@@ -23,14 +24,16 @@ pub struct SessionExecution {
     log: Arc<dyn SessionLog>,
     command: Command,
     inputs: Vec<Msg>,
-    opened: bool,
+    // Shared so every clone of one execution agrees on whether the inbox turn is still open:
+    // the host holds one handle and the agent loop another, like Java's single object.
+    opened: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SessionExecution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionExecution")
             .field("command", &self.command)
-            .field("opened", &self.opened)
+            .field("opened", &self.opened.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -42,7 +45,7 @@ impl SessionExecution {
             log,
             command,
             inputs: Vec::new(),
-            opened: false,
+            opened: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -134,7 +137,7 @@ impl SessionExecution {
         let inbox = SessionInbox::new(Arc::clone(&self.log))?;
         let turn_id = self.effective_turn_id()?;
         inbox.open(&turn_id, recorder.run_id()).await?;
-        self.opened = true;
+        self.opened.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -210,7 +213,7 @@ impl SessionExecution {
     ///
     /// Returns `true` when unapplied steering for this turn still exists, so the caller keeps
     /// consuming instead of closing and losing the accepted guidance.
-    pub async fn continue_or_close(&mut self, recorder: &SessionRecorder) -> crate::error::Result<bool> {
+    pub async fn continue_or_close(&self, recorder: &SessionRecorder) -> crate::error::Result<bool> {
         let inbox = SessionInbox::new(Arc::clone(&self.log))?;
         let applied = SessionTurns::read(&*self.log).await?.applied;
         let snapshot = inbox.snapshot().await?;
@@ -226,14 +229,14 @@ impl SessionExecution {
     }
 
     /// Closes the inbox turn once.
-    pub async fn close(&mut self, recorder: &SessionRecorder) -> crate::error::Result<()> {
-        if !self.opened {
+    pub async fn close(&self, recorder: &SessionRecorder) -> crate::error::Result<()> {
+        if !self.opened.load(Ordering::SeqCst) {
             return Ok(());
         }
         let inbox = SessionInbox::new(Arc::clone(&self.log))?;
         let turn_id = self.effective_turn_id()?;
         inbox.close(&turn_id, recorder.run_id()).await?;
-        self.opened = false;
+        self.opened.store(false, Ordering::SeqCst);
         Ok(())
     }
 

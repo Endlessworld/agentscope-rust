@@ -15,6 +15,7 @@ pub mod journal;
 pub mod key;
 pub mod log;
 pub mod migration;
+pub mod models;
 pub mod recorder;
 pub mod recovery;
 pub mod state_access;
@@ -30,6 +31,10 @@ pub use header::{SessionHeader, SessionHistoryMode};
 pub use inbox::{Command, InboxSnapshot, SessionInbox};
 pub use recorder::{
     outcome, SessionRecorder, PARENT_CONTEXT_KEY, RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+};
+pub use models::{
+    policy_from_context, wrap as wrap_model, SessionModelPolicy, SessionModelPolicyHandle,
+    SessionModels, MODEL_POLICY_CONTEXT_KEY,
 };
 pub use migration::{
     export_snapshot, export_state, fork, import_baseline, ExportedState,

@@ -35,8 +35,8 @@ use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};use crat
 use crate::state::AgentState;
 use crate::state::context::TaskContextState;
 use crate::session::{
-    SessionHistoryMode, SessionKey, SessionLog, SessionLogStore, SessionRecorder,
-    RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+    outcome, SessionExecution, SessionHistoryMode, SessionKey, SessionLog, SessionLogStore,
+    SessionRecorder, SessionModels, RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
 };
 use crate::tool::{TodoWriteTool, ToolExecutionContext, Toolkit};
 use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
@@ -1322,7 +1322,7 @@ async fn run_agent_loop(
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
     // be detected and carried over (the loop otherwise runs on a private clone).
     let plan_mode_at_start = state.plan_mode_context.clone();
-    let result = match execute_iteration(core, ctx, &mut state, 0).await {
+    let mut result = match execute_iteration(core, ctx, &mut state, 0).await {
         // An interrupt is not a failure: reconcile the dangling tool_use left by
         // the interrupted turn and append a recovery message, so the caller sees
         // a normal reply and the next turn continues from a consistent context.
@@ -1330,6 +1330,17 @@ async fn run_agent_loop(
         Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
         other => other,
     };
+    // Session settle loop (Java `settleSession`): a completed result does not end the turn
+    // when guidance accepted during the run has not been consumed yet. Continuing keeps the
+    // inbox turn open so the accepted steering is acted on instead of being dropped by the
+    // close that follows.
+    while session_continues(ctx, &result).await? {
+        let next = state.cur_iter() + 1;
+        result = match execute_iteration(core, ctx, &mut state, next).await {
+            Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
+            other => other,
+        };
+    }
     // Commit the accumulated state even when the run failed or was interrupted:
     // the messages that completed before the error (user input, finished
     // assistant turns, tool results) must survive, so a follow-up "continue"
@@ -1347,6 +1358,33 @@ async fn run_agent_loop(
     }
     result
 }
+
+/// Whether the session settle loop must run one more iteration.
+///
+/// Mirrors Java `settleSession`: only a *completed* outcome can continue, and only when the
+/// execution still holds unconsumed guidance for this turn. Everything else (suspended,
+/// failed, interrupted, no execution attached) ends the turn as before. A persistence failure
+/// propagates instead of being read as "nothing pending" — silently dropping accepted guidance
+/// is exactly what the settle loop exists to prevent.
+async fn session_continues(
+    ctx: &crate::agent::RuntimeContext,
+    result: &Result<Msg>,
+) -> Result<bool> {
+    let Ok(message) = result else {
+        return Ok(false);
+    };
+    if outcome(message.generate_reason()) != "completed" {
+        return Ok(false);
+    }
+    let (Some(execution), Some(recorder)) = (
+        SessionExecution::from_context(ctx),
+        SessionRecorder::from_context(ctx),
+    ) else {
+        return Ok(false);
+    };
+    execution.continue_or_close(&recorder).await
+}
+
 /// Whether a reasoning message still has tool calls that need local action.
 ///
 /// Server-tool calls are executed by the provider and their results arrive inline in
@@ -1568,6 +1606,11 @@ async fn reasoning_phase(
 ) -> Result<Msg> {
     check_interrupted(core, Some(ctx))?;
     state.set_cur_iter(iter);
+    // `todo_write` mutates the shared task bag, which only lands in the caller's state at the
+    // end of the call. Folding it in here keeps every published snapshot (per-iteration
+    // checkpoint, context compilation, journal) on the live task state, as Java does by
+    // mutating `AgentState` in place.
+    state.tasks_context = core.tasks.lock().unwrap().clone();
     // Publish the state accumulated so far (this turn's input plus the previous
     // iteration's assistant/tool messages) into the shared state before the
     // reasoning chain runs. Without this, `core.state` would stay frozen at the
@@ -1575,8 +1618,21 @@ async fn reasoning_phase(
     // middleware would have nothing to persist and an abrupt process death
     // (kill -9 / OOM / power loss) would lose the entire turn.
     *core.state.lock().unwrap() = state.clone();
+    // The summarizing path is not a step: Java checks `maxIters` before `step(iter)`, so an
+    // over-budget iteration never opens a step boundary nor folds in guidance.
     if iter >= core.max_iters {
         return summarizing(core, ctx, state).await;
+    }
+    // Step boundary plus mid-run guidance (Java `reasoning`): the recorder marks the step and
+    // the execution folds in accepted `steer`/`inject` input *before* the model call, so
+    // guidance accepted while the previous step was running reaches this one instead of
+    // waiting for the turn to end. A persistence failure propagates: a step that never reached
+    // the journal must not look like one that did.
+    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+        recorder.step(iter.max(0) as usize)?;
+        if let Some(execution) = SessionExecution::from_context(ctx) {
+            execution.before_step(&recorder, state).await?;
+        }
     }
 
     let sys_prompt = core
@@ -1607,7 +1663,15 @@ async fn reasoning_phase(
     ModelUtils::ensure_default_execution_config(&mut options);
     let input = ReasoningInput::new(messages, tools, options);
 
-    let final_msg = match run_reasoning(core, ctx, input).await {
+    // The context compiler runs inside the middleware chain and holds no agent state, so the
+    // committed task snapshot travels with this call (Java resolves the live state from its
+    // runtime context instead). The clone is per-call and read-only for the compiler.
+    let mut call_ctx = ctx.clone();
+    call_ctx.set_extension(
+        crate::middleware::TASK_CONTEXT_STATE_CONTEXT_KEY,
+        state.tasks_context.clone(),
+    );
+    let final_msg = match run_reasoning(core, &call_ctx, input).await {
         Ok(msg) => msg,
         Err(e) => {
             // Keep the assistant message the model had already produced when the
@@ -1675,6 +1739,10 @@ async fn run_reasoning(
         let ctx = ctx.clone();
         let model = Arc::clone(&model);
         Box::new(move |r: ReasoningInput| -> EventStream {
+            // Journal the final adapter boundary (Java `SessionModels.wrap`): with a recorder
+            // attached to `ctx`, each dispatch records
+            // request/prepared → model/dispatch → model/chunk… → model/end.
+            let model = SessionModels::wrap(Arc::clone(&model), &ctx, "REASONING");
             let mc_input = ModelCallInput::new(r.messages, r.tools, r.options, model);
             chain.wrap_model_call(ctx.clone(), mc_input, model_core)
         })

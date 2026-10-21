@@ -47,6 +47,33 @@ pub fn outcome(reason: GenerateReason) -> &'static str {
     }
 }
 
+/// Journal-safe view of [`crate::model::GenerateOptions`].
+///
+/// Unlike Java, Rust `GenerateOptions` is not `Serialize`: it also carries secrets (`api_key`)
+/// and opaque passthrough maps (`additional_headers` / `additional_body_params`). The journal
+/// therefore records only the generation-relevant, non-secret subset; the request content is
+/// already covered by `messages` and `tools`.
+fn options_payload(options: &crate::model::GenerateOptions) -> serde_json::Value {
+    serde_json::json!({
+        "modelName": options.model_name,
+        "stream": options.stream,
+        "temperature": options.temperature,
+        "topP": options.top_p,
+        "topK": options.top_k,
+        "maxTokens": options.max_tokens,
+        "maxCompletionTokens": options.max_completion_tokens,
+        "frequencyPenalty": options.frequency_penalty,
+        "presencePenalty": options.presence_penalty,
+        "thinkingBudget": options.thinking_budget,
+        "reasoningEffort": options.reasoning_effort,
+        "seed": options.seed,
+        "cacheControl": options.cache_control,
+        "parallelToolCalls": options.parallel_tool_calls,
+        "toolChoice": options.tool_choice,
+        "responseFormat": options.response_format,
+    })
+}
+
 /// Mutable recording state guarded by one mutex.
 #[derive(Default)]
 struct RecorderState {
@@ -551,6 +578,39 @@ impl SessionRecorder {
         reason: &str,
     ) -> crate::error::Result<()> {
         self.capture_state(state, reason)?;
+        self.flush().await
+    }
+
+    /// Records a prepared model request and its dispatch, mirroring Java `prepareModel`.
+    ///
+    /// The `before_model` checkpoint runs first, so recovery never replays a model call whose
+    /// input the journal does not have. `request/prepared` and `model/dispatch` are published
+    /// by one commit: a request that reached the provider must be discoverable as dispatched.
+    pub async fn prepare_model(
+        &self,
+        input: &crate::middleware::ModelCallInput,
+        call_id: &str,
+        purpose: &str,
+        state: Option<&AgentState>,
+    ) -> crate::error::Result<()> {
+        if let Some(state) = state {
+            self.checkpoint_now(state, "before_model").await?;
+        }
+        self.append(
+            "request/prepared",
+            &serde_json::json!({
+                "modelCallId": call_id,
+                "purpose": purpose,
+                "model": input.model.model_name(),
+                "messages": input.messages,
+                "tools": input.tools,
+                "options": options_payload(&input.options),
+            }),
+        )?;
+        self.append(
+            "model/dispatch",
+            &serde_json::json!({ "modelCallId": call_id, "attemptId": call_id }),
+        )?;
         self.flush().await
     }
 
