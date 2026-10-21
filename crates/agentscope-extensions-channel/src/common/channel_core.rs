@@ -17,6 +17,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::{Error, Result as CoreResult};
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{
@@ -170,8 +171,16 @@ impl ChannelCore {
     /// Resolve the route, run the turn on the gateway, and return the agent reply.
     ///
     /// This is steps 1-3 of the Java `dispatch`; the caller then delivers the reply outbound.
-    pub async fn run_turn(&self, message: &InboundMessage) -> CoreResult<(Msg, OutboundAddress)> {
-        self.ctx.run_turn(message).await
+    ///
+    /// `cancel` is the caller's cancellation signal: a platform that loses its lease (or
+    /// otherwise gives up on the turn) passes it so the execution can be stopped instead of
+    /// only having its reply suppressed.
+    pub async fn run_turn(
+        &self,
+        message: &InboundMessage,
+        cancel: Option<CancelSignal>,
+    ) -> CoreResult<(Msg, OutboundAddress)> {
+        self.ctx.run_turn(message, cancel).await
     }
 }
 
@@ -295,11 +304,11 @@ mod tests {
     async fn run_turn_requires_a_gateway_and_reports_a_missing_agent() {
         let c = core();
         // No gateway injected yet.
-        assert!(c.run_turn(&inbound(Peer::direct("u1"))).await.is_err());
+        assert!(c.run_turn(&inbound(Peer::direct("u1")), None).await.is_err());
 
         // Gateway present but no agent bound -> the harness gateway reports the missing agent.
         c.init(Arc::new(HarnessGateway::create_standalone()));
-        let err = c.run_turn(&inbound(Peer::direct("u1"))).await.unwrap_err();
+        let err = c.run_turn(&inbound(Peer::direct("u1")), None).await.unwrap_err();
         assert!(err.to_string().contains("bind_main_agent"), "{err}");
     }
 }

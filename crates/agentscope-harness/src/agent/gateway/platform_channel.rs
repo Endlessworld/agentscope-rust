@@ -34,6 +34,7 @@
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
 
@@ -132,7 +133,15 @@ impl PlatformCtx {
 
     /// Resolve the route, run the turn on the gateway, and return the reply plus the address it
     /// must be delivered to. This is steps 2-3 shared by every platform `dispatch`.
-    pub async fn run_turn(&self, message: &InboundMessage) -> Result<(Msg, OutboundAddress)> {
+    ///
+    /// `cancel` is the caller's cancellation signal: a platform that loses its lease (or
+    /// otherwise gives up on the turn) passes it so the execution can be stopped instead of
+    /// only having its reply suppressed.
+    pub async fn run_turn(
+        &self,
+        message: &InboundMessage,
+        cancel: Option<CancelSignal>,
+    ) -> Result<(Msg, OutboundAddress)> {
         let gateway = self.gateway()?;
         let route = self.resolve_route(message);
         let reply = gateway
@@ -140,6 +149,7 @@ impl PlatformCtx {
                 Some(route.context),
                 message.messages.clone(),
                 Some(route.outbound_address.clone()),
+                cancel,
             )
             .await?;
         Ok((reply, route.outbound_address))
@@ -159,7 +169,7 @@ pub trait PlatformChannel: Send + Sync {
 
     /// Full inbound turn: route, run, and deliver the reply back out.
     async fn dispatch(&self, message: InboundMessage) -> Result<Msg> {
-        let (reply, address) = self.ctx().run_turn(&message).await?;
+        let (reply, address) = self.ctx().run_turn(&message, None).await?;
         self.deliver_reply(&address, vec![reply.clone()]).await?;
         Ok(reply)
     }

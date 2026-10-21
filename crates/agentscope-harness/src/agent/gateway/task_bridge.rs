@@ -55,14 +55,24 @@ impl SubagentMaterializer for DefaultSubagentMaterializer {
 }
 
 /// Wraps a `CallableAgent` (from `SubagentFactory`) as a `GatewayAgent` (for
-/// `HarnessGateway`). The `GatewayTurnContext` is used to extract the session
-/// metadata; the messages are forwarded directly.
-struct CallableAgentBridge(Arc<dyn agentscope_core::agent::CallableAgent>);
+/// `HarnessGateway`). The `GatewayTurnContext` carries the caller's cancellation
+/// signal, which is forwarded to the agent so a turn can actually be stopped.
+pub struct CallableAgentBridge(Arc<dyn agentscope_core::agent::CallableAgent>);
+
+impl CallableAgentBridge {
+    /// Wraps `callable` so the gateway can drive it.
+    pub fn new(callable: Arc<dyn agentscope_core::agent::CallableAgent>) -> Self {
+        Self(callable)
+    }
+}
 
 #[async_trait]
 impl GatewayAgent for CallableAgentBridge {
-    async fn call(&self, messages: Vec<Msg>, _ctx: &GatewayTurnContext) -> Result<Msg> {
-        self.0.call(messages).await
+    async fn call(&self, messages: Vec<Msg>, ctx: &GatewayTurnContext) -> Result<Msg> {
+        match &ctx.cancel {
+            Some(signal) => self.0.call_with_cancel(messages, signal.clone()).await,
+            None => self.0.call(messages).await,
+        }
     }
 }
 
@@ -209,6 +219,7 @@ mod tests {
                 msg_context: super::super::msg_context::MsgContext::default_context(),
                 user_id: None,
                 outbound: None,
+                cancel: None,
             })
             .await
             .unwrap();

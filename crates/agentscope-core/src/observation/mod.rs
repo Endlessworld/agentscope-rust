@@ -289,6 +289,7 @@ fn error_kind(error: &crate::error::Error) -> String {
         crate::error::Error::ToolSuspended(_) => "ToolSuspended".into(),
         crate::error::Error::Agent(_) => "Agent".into(),
         crate::error::Error::Interrupted(_) => "Interrupted".into(),
+        crate::error::Error::Cancelled(_) => "Cancelled".into(),
         crate::error::Error::ShuttingDown(_) => "ShuttingDown".into(),
         crate::error::Error::Session(_) => "Session".into(),
         crate::error::Error::ActionObservation(_) => "ActionObservation".into(),

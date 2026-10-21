@@ -42,6 +42,14 @@ pub enum Error {
     #[error("Interrupted: {0}")]
     Interrupted(String),
 
+    /// An execution was cancelled by its caller.
+    ///
+    /// Distinct from [`Error::Interrupted`]: an interrupt asks a running loop to stop and may
+    /// still produce a result, while a cancellation aborts the execution outright. Mirrors
+    /// Java's `CancellationException`.
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
+
     /// Session journal persistence failure.
     ///
     /// Persistence failures must propagate and must never become a successful

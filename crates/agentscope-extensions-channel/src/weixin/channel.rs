@@ -18,11 +18,17 @@
 //!
 //! ## Design decisions (vs. Java)
 //!
-//! - Java's `Sinks.Empty` cancellation aborts the *in-flight* turn when the lease is lost. Rust's
-//!   `PlatformChannel::dispatch` has no cancellation seam, so a lost lease suppresses the **send**
-//!   (checked immediately before every outbound call, mirroring the Java `beforeSend` hook) but
-//!   cannot abort a turn already running. The observable guarantee kept is the one the Java module
-//!   states as its contract: a late reply is never delivered by a stale consumer.
+//! - Java's `Sinks.Empty` cancellation aborts the *in-flight* turn when the lease is lost.
+//!   Rust keeps the same guarantee with the same two layers: the lease session owns a
+//!   [`CancelSignal`], and the turn is driven with that signal so a lost lease ends the
+//!   execution instead of only suppressing the **send** (which is still checked immediately
+//!   before every outbound call, mirroring the Java `beforeSend` hook). The observable
+//!   guarantee kept is the one the Java module states as its contract: a late reply is never
+//!   delivered by a stale consumer.
+//! - Java renews the account lease on a scheduler (`weixin-lease-renewal`, every
+//!   `leaseMs / 3`) and loses the lease when a renewal fails. Rust has no scheduler, so the
+//!   same job is a spawned task; it is also what makes a lease loss *observable while a turn
+//!   is running* — the only place the channel is not polling the lease itself.
 //! - Java's `Gateway` abstraction does not exist here; `PlatformCtx::run_turn` plays its role, so
 //!   the consumer routes through the shared harness router exactly like the other adapters.
 //! - Java keeps `MAX_DISPATCH_ATTEMPTS` and the retry counter inside the lease session; the same
@@ -33,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
@@ -57,6 +64,13 @@ pub const CHANNEL_TYPE: &str = "weixin";
 /// forever.
 pub const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 
+/// Grace period for a cancelled turn to wind down before it is dropped.
+///
+/// The agent observes the cancellation at its next checkpoint and ends the turn through the
+/// normal (async) path, which is the path that closes the journal. The grace period is how long
+/// that path may take before the turn is dropped and the execution is hard-stopped.
+const TURN_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Typed registry of `WeixinChannel` handles, keyed by `channel_id`.
 pub type WeixinChannelRegistry = ChannelRegistry<WeixinChannel>;
 
@@ -64,6 +78,11 @@ pub type WeixinChannelRegistry = ChannelRegistry<WeixinChannel>;
 pub struct LeaseSession {
     lease: WeixinLease,
     valid: AtomicBool,
+    /// Fires when this tenure ends, so the turn in flight can be stopped.
+    ///
+    /// Mirrors Java's `LeaseSession.cancelled` sink: the session is fenced (lease lost, channel
+    /// stopped) and every observer of the tenure is released at once.
+    cancel: CancelSignal,
     /// Only the consumer task mutates this map.
     dispatch_failures: Mutex<HashMap<String, i32>>,
 }
@@ -82,6 +101,7 @@ impl LeaseSession {
         Self {
             lease,
             valid: AtomicBool::new(true),
+            cancel: CancelSignal::new(),
             dispatch_failures: Mutex::new(HashMap::new()),
         }
     }
@@ -96,8 +116,17 @@ impl LeaseSession {
         self.valid.load(Ordering::SeqCst)
     }
 
+    /// The signal that fires when this tenure ends.
+    ///
+    /// A turn driven with this signal stops when the lease is lost or the channel is stopped.
+    pub fn cancel_signal(&self) -> CancelSignal {
+        self.cancel.clone()
+    }
+
     fn invalidate(&self) {
         self.valid.store(false, Ordering::SeqCst);
+        // Release everything waiting on this tenure: the turn in flight is stopped too.
+        self.cancel.cancel();
     }
 
     fn record_dispatch_failure(&self, message_id: &str) -> i32 {
@@ -370,6 +399,8 @@ impl WeixinChannel {
         if let Err(error) = self.require_lease(session) {
             return ConsumeOutcome::LeaseLost(error);
         }
+        // Keep the lease alive and notice its loss while a turn is running.
+        self.spawn_lease_renewal(session);
         match self.outbound.notify_start().await {
             Ok(()) => {}
             Err(error) if error.is_credential_rejected() => {
@@ -422,6 +453,36 @@ impl WeixinChannel {
             });
         }
         ConsumeOutcome::LeaseLost(WeixinError::operation("Weixin consumer stopped"))
+    }
+
+    /// Keeps the lease alive and notices its loss while a turn is running.
+    ///
+    /// Java schedules a renewal every `leaseMs / 3` and loses the lease when a renewal fails
+    /// (`WeixinChannel#renew` → `loseLease` → `session.cancelled`). Rust has no scheduler, so
+    /// the same job is a spawned task that ends with the session.
+    ///
+    /// This is also the only place where a lease loss becomes observable *while a turn is
+    /// running*: the consumer loop itself only checks the lease between polls and claims.
+    fn spawn_lease_renewal(&self, session: &Arc<LeaseSession>) {
+        let store = Arc::clone(&self.state_store);
+        let account_id = self.properties.account_id.clone();
+        let lease_ms = self.properties.lease_ms;
+        let session = Arc::clone(session);
+        let period = std::time::Duration::from_millis((lease_ms / 3).max(1) as u64);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                if !session.is_valid() {
+                    return;
+                }
+                if !store.renew_lease(&account_id, session.lease(), lease_ms) {
+                    // The lease is gone: fence the session, which fires the cancel signal
+                    // and stops the turn in flight.
+                    session.invalidate();
+                    return;
+                }
+            }
+        });
     }
 
     /// One long poll and the batch it accepted.
@@ -547,8 +608,26 @@ impl WeixinChannel {
             }
         }
         let dispatch_timeout = std::time::Duration::from_millis(self.properties.dispatch_timeout_ms as u64);
-        let turn = tokio::time::timeout(dispatch_timeout, self.core.run_turn(&inbound)).await;
-        let (reply, address) = match turn {
+        // The turn runs under the session's cancel signal: a lease lost (or a stopped channel)
+        // ends the execution instead of only suppressing the reply.
+        let cancel = session.cancel_signal();
+        let turn = self.core.run_turn(&inbound, Some(cancel.clone()));
+        tokio::pin!(turn);
+        let outcome = tokio::select! {
+            timed = tokio::time::timeout(dispatch_timeout, &mut turn) => timed,
+            _ = cancel.cancelled() => {
+                // The agent observes the same signal and winds the execution down
+                // cooperatively; if it does not within the grace period, the turn is dropped
+                // and the execution is hard-stopped.
+                match tokio::time::timeout(TURN_CANCEL_GRACE, &mut turn).await {
+                    Ok(result) => Ok(result),
+                    Err(_elapsed) => Ok(Err(agentscope_core::error::Error::Cancelled(
+                        "turn cancelled: the lease was lost".into(),
+                    ))),
+                }
+            }
+        };
+        let (reply, address) = match outcome {
             Err(_elapsed) => {
                 return Err(WeixinError::operation("Weixin dispatch timed out"));
             }
@@ -797,6 +876,7 @@ mod tests {
     use crate::weixin::listener::RecordingWeixinRuntimeListener;
     use crate::weixin::state_store::in_memory_store;
     use agentscope_core::message::MsgRole;
+    use agentscope_harness::agent::{GatewayAgent, GatewayTurnContext};
     // `channel_id` / `config` / `init` come from the blanket `Channel` impl, so the trait has to be
     // in scope (the same pattern the other platform adapters' test modules use).
     use agentscope_harness::agent::gateway::channel::Channel as _;
@@ -1120,8 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_consuming_returns_none_while_another_holder_owns_the_account() {
-        let transport = Arc::new(RecordingTransport::new());
+    fn begin_consuming_returns_none_while_another_holder_owns_the_account() {        let transport = Arc::new(RecordingTransport::new());
         let (channel, store) = channel(transport);
         let other = store.acquire_lease(ACCOUNT, "other-holder", 60_000).unwrap();
         assert!(channel.begin_consuming().unwrap().is_none());
@@ -1130,5 +1209,95 @@ mod tests {
         let session = channel.begin_consuming().unwrap().unwrap();
         assert!(session.lease().generation > other.generation);
         assert_eq!(session.lease().holder_id, channel.lease_holder);
+    }
+
+    /// A gateway agent that never answers on its own: the turn stays in flight until the
+    /// cancellation signal fires.
+    struct BlockingGatewayAgent {
+        started: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl GatewayAgent for BlockingGatewayAgent {
+        async fn call(
+            &self,
+            _messages: Vec<Msg>,
+            ctx: &GatewayTurnContext,
+        ) -> agentscope_core::error::Result<Msg> {
+            self.started.store(true, Ordering::SeqCst);
+            let signal = ctx
+                .cancel
+                .clone()
+                .expect("the turn must carry the session's cancel signal");
+            signal.cancelled().await;
+            self.cancelled.store(true, Ordering::SeqCst);
+            Err(agentscope_core::error::Error::Cancelled(
+                "cancelled by the lease loss".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_lease_aborts_the_turn_in_flight() {
+        // GAP-19: the lease loss must stop the turn that is already running, not only
+        // suppress the reply. The session's cancel signal is the seam: the agent observes
+        // it and the turn ends.
+        let transport = Arc::new(RecordingTransport::new());
+        let (channel, store) = channel(transport.clone());
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let gateway = Arc::new(agentscope_harness::agent::HarnessGateway::create_standalone());
+        gateway
+            .bind_main_agent(Arc::new(BlockingGatewayAgent {
+                started: Arc::clone(&started),
+                cancelled: Arc::clone(&cancelled),
+            }))
+            .await;
+        channel.init(gateway);
+
+        let session = channel.begin_consuming().unwrap().unwrap();
+        let payload = serde_json::json!({
+            "message_type": 1,
+            "message_id": "m1",
+            "from_user_id": "u1",
+            "item_list": [{"type": 1, "text_item": {"text": "hi"}}],
+        })
+        .to_string();
+        assert!(store.accept_batch(
+            ACCOUNT,
+            session.lease(),
+            "c1",
+            &[WeixinInboxMessage::new("m1", payload).unwrap()],
+        ));
+
+        let drain_session = Arc::clone(&session);
+        let drain_channel = Arc::clone(&channel);
+        let drain = tokio::spawn(async move { drain_channel.drain_inbox(&drain_session).await });
+        // Wait for the turn to be in flight.
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The lease is lost: the session is fenced, which fires the cancel signal.
+        session.invalidate();
+
+        let error = drain
+            .await
+            .expect("the drain task must not panic")
+            .expect_err("a cancelled turn must not succeed");
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the agent must have observed the cancellation"
+        );
+        assert_eq!(
+            transport.request_count(),
+            0,
+            "a cancelled turn must not send a reply"
+        );
+        assert!(
+            error.safe_message().starts_with("WeixinOperationException"),
+            "{error}"
+        );
     }
 }

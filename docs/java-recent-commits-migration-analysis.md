@@ -14,7 +14,7 @@
 - **证据列**必须可 `rg` 复现。行号会随代码漂移，**实施前必须重新定位**，不得直接照抄。
 - 开工前：读本文件 + `git status` + 跑目标 crate 基线。
 - 完工后：从本文件**整行删除**该条目（不是改成「已完成」），并在对应模块 tracker 记一行。
-- **编号会不连续**：2026-10-20 已关闭 GAP-01…GAP-13、GAP-15、GAP-16；仍开放 GAP-14、GAP-17…GAP-19 + OPS-01。剩余条目**保留原编号**，以免外部引用失效。
+- **编号会不连续**：2026-10-20 已关闭 GAP-01…GAP-13、GAP-15、GAP-16；2026-10-21 关闭 GAP-17、GAP-19；仍开放 GAP-14、GAP-18 + OPS-01。剩余条目**保留原编号**，以免外部引用失效。
 - **反向验证强制**：每个条目都要先有失败测试，再改实现。既有教训——`grep` 零命中不等于未实现（e2b `/files`、Redis `KeyLayoutVersion` 都曾误判），须用 2–3 个同义词交叉验证。
 
 ## 1. 缺口清单
@@ -34,20 +34,12 @@
 
 | ID | 缺口 | Java 参考 | Rust 现状（证据） | 裁定问题 | 状态 |
 |---|---|---|---|---|---|
-| GAP-17 | AG-UI 工具注入窗口未走 core `ToolRequestConfig`，协议 crate 另有一套语义 | G3 `3c1c29c01` | core 已有 `tool/tool_request_config.rs`（`ToolMergeMode{ExternalOnly,AgentOnly,MergeExternalPriority}`）；协议侧 `agui/model.rs:537` 仍是 `ToolMergeMode{FrontendOnly,AgentOnly,MergeFrontendPriority}`，字段语义是 frontend 而非 external | 是否把协议枚举收敛为 core 唯一类型的投影？（禁止再造第二份平行类型的教训） | 已阻塞（待裁定） |
 | GAP-18 | core 无 tracer seam，OTel span 无处挂 | G3 `9b611928e` | core 无 `Tracer`；`extensions-studio/src/telemetry/mod.rs:13` 明确「`opentelemetry` 依赖被刻意排除」，只到 `Span` 抽象 | tracer 归 core 还是 studio？与 STUDIO telemetry 一并定 | 已阻塞（待裁定） |
-| GAP-19 | `PlatformChannel` 无取消缝：lease 丢失只能抑制发送，无法中止在跑的一轮 | §A.4 | weixin 侧已实现 lease 与抑制发送 | 是否引入等价 `Sinks.Empty` 的中止通道？ | 已阻塞（待裁定） |
 
-### 1.4 运维/部署（非代码）
-
-| ID | 事项 | 影响 | 状态 |
-|---|---|---|---|
-| OPS-01 | 已部署 MySQL 库需手工 `ALTER TABLE ... MODIFY <key> VARCHAR(...) COLLATE utf8mb4_bin` | 代码侧三张表已改为二进制排序（原 GAP-03），但**存量库不会自动变**；已写入大小写变体键的库**已丢失其中一行**，需低峰执行 | 待办 |
 
 ## 2. 建议顺序
 
-1. **OPS-01**：代码已就绪，只剩运维执行（存量 MySQL 库手工 ALTER）。
-2. **GAP-17/18/19**：三项都需先裁定方向（枚举收敛 / tracer 归属 / 取消缝），未裁定前不动手。
+2. **GAP-18**：唯一仍需裁定的条目（tracer 归属）。裁定时注意：GAP-19 已把「取消」做成 **drop 语义**（future 被丢弃即中止），因此 tracer 的 span 必须用 **RAII 收尾**（span guard 随 future 一起 drop），而不是依赖一个「取消事件」钩子——后者在 drop 路径上根本不会触发。
 3. **GAP-14**：RAG 文档解析需新依赖，另行立项。
 
 ## 3. 执行约定
@@ -68,6 +60,8 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-10-21 | 关闭并删除 GAP-19（用户裁定「(c) 为主 + (a) 兜底」）：Java 的 `Sinks.Empty` 在 Rust 里等价于 **drop 掉 turn future**，故按 drop 语义实现并补齐 drop 安全。core 新增 `agent::CancelSignal`（调用方持有的取消信号，随 `RuntimeContext` 下传，`Error::Cancelled` 与 `Interrupted` 分离）；`ReActAgent::call_with_cancel` + `CallableAgent::call_with_cancel`（默认忽略）；**每次调用的 run 随 context 下传**（`RUN_CONTROL_CONTEXT_KEY`），修掉 `check_interrupted` 读 agent 级单槽的并发串号；新增 `RunGuard`（Drop 实现）：future 被丢弃时把 run 标记 Cancelled、只清自己那次的 `active_run`、释放 journal 写租约（不写终态事实，由既有 interrupted-run 恢复机制记账）。harness：`GatewayTurnContext` 增 `cancel` 字段，`run_with_outbound`/`PlatformCtx::run_turn`/`ChannelCore::run_turn` 增 `Option<CancelSignal>` 参数，`CallableAgentBridge` 公开并转发信号。weixin：`LeaseSession` 持有 `CancelSignal`（`invalidate()` 即广播），新增 lease 续租任务（对齐 Java `weixin-lease-renewal`，每 `leaseMs/3`，续租失败即 fence），`process_claim` 用 `select!` 实现「先协作式中止、宽限 2s 后再硬 drop」。测试：core `a_caller_cancel_signal_ends_the_run_as_cancelled`/`dropping_the_call_future_marks_the_run_cancelled_and_clears_the_slot`/`a_cancel_signal_is_observed_by_its_waiter`/`a_cancelled_signal_releases_a_late_waiter`，weixin `a_lost_lease_aborts_the_turn_in_flight`（均已反向验证：回退实现后 FAILED）。基线：core 255 / channel 327 / protocol 302 / harness 411 全绿；`cargo check --workspace --all-targets` 通过 |
+| 2026-10-21 | 关闭并删除 GAP-17（用户裁定「对齐 Java」）：协议 crate 的 `agui::model::ToolMergeMode` 改为 `pub use agentscope_core::tool::ToolMergeMode`（唯一类型，旧路径仍可用）；`AguiAgentAdapter` 不再往共享 `Toolkit` 注册前端工具，改为构造不可变 `ToolRequestConfig` 经 `Extensions` 随 `stream_events_with_extensions` 下传；删除 `agui/adapter/tool_injection.rs` 及 `AguiRunStream::close()`（无 registry 需要复原）；默认模式 `MergeFrontendPriority → MergeExternalPriority`。新增 `AguiStreamableAgent::stream_events_with_extensions`（带默认实现），`HarnessAgent` 同步透传。基线：protocol 302 passed / core+harness check 通过 |
 | 2026-10-20 | 精简为纯缺口跟踪：移除全部已落地/已完成/不迁移/已等价条目（原 §A/§B 附录、P0/P1 完成表、§6/§7 快照），只保留经 grep 复核的未处理项；重编为 GAP-01…GAP-19 + OPS-01/02 |
 | 2026-10-20 | 并行实施后关闭并删除 GAP-01…GAP-06、GAP-09…GAP-13（JDBC 版本原子性、幽灵 CAS、MySQL COLLATE、`Interrupted` 映射、重试守卫、agent id 规范化、AG-UI resume `reason`、`TaskVerification` 回放、e2b 快照删除/保留、NUL 嗅探窗口、`RemoteConfirmDecision.reason`）；OPS-02 随之删除（GAP-02 改用自愈方案，未改哨兵值，无需数据迁移） |
 | 2026-10-20 | 关闭并删除 GAP-08（`TOOL_PROGRESS` 独立事件；AG-UI 侧按 Java `ToolResultEventConverter` 的既定行为**有意丢弃**，不新增 AG-UI 事件）。验收基线：core lib 246 / jdbc 154 / protocol 308 / sandbox 137 / harness 411 全绿；`cargo check --workspace --all-targets` 通过；GAP-04/08/12 均已做反向验证（回退实现→对应测试 FAILED）|

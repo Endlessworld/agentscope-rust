@@ -16,7 +16,10 @@ use crate::error::{Error, Result};
 use crate::event::{AgentEvent, AgentEventType, ConfirmResult, EventData};
 use crate::formatter::{JsonSchema, ResponseFormat};
 use crate::interruption::InterruptControl;
-use crate::agent::run::{AgentRun, RunControl, RunStatus};
+use crate::agent::run::{
+    AgentRun, CancelSignal, RunControl, RunStatus, CANCEL_SIGNAL_CONTEXT_KEY,
+    RUN_CONTROL_CONTEXT_KEY,
+};
 use crate::message::{
     ChatUsage, ContentBlock, GenerateReason, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock,
     ToolResultBlock, ToolResultState, ToolUseBlock,
@@ -127,6 +130,57 @@ struct AgentCore {
     /// Exactly one history authority: state store (legacy) or native event log.
     /// Mirrors Java `ReActAgent.sessionHistoryMode` (default `EVENT_LOG`).
     session_history_mode: SessionHistoryMode,
+}
+
+/// RAII guard that finalizes a call's run when the call's future goes away.
+///
+/// A call that returns normally finalizes its own run; a call whose future is **dropped**
+/// (a timeout, an abort, a lost lease) never reaches that code. Without this guard such a
+/// call would leave the run stuck in `Running`, the agent-level slot pointing at a dead run,
+/// and the journal's writer lease held — blocking the next turn on the same session.
+///
+/// The guard mirrors the release semantics of Java's `Mono.usingWhen(..., cancelled ->
+/// release)`: the release happens on the disposal path, exactly once.
+struct RunGuard {
+    core: Arc<AgentCore>,
+    run: Arc<RunControl>,
+    /// The journal this call owns, if any. Released (not finished) on the disposal path:
+    /// the terminal facts of an aborted run are the recovery path's business, and writing
+    /// them twice would duplicate the `run/end` event.
+    journal: Arc<Mutex<Option<Arc<SessionRecorder>>>>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        // The run never reached its own terminal transition: the call was dropped.
+        if !self.run.status().is_terminal() {
+            self.run.cancel();
+        }
+        // Clear the agent-level slot only when it still points at *this* run: a concurrent
+        // call may have installed its own run in the meantime.
+        {
+            let mut slot = self.core.active_run.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.run))
+            {
+                *slot = None;
+            }
+        }
+        // Release the journal's writer lease so the next turn on this session can write.
+        // `close` is idempotent, and the run stays unterminated in the journal, which the
+        // recovery path reports as an interrupted run.
+        let recorder = self.journal.lock().unwrap().take();
+        if let Some(recorder) = recorder {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    recorder.close().await;
+                });
+            }
+            // Without a runtime the process is shutting down: the lease is released with
+            // the process, so there is nothing left to do.
+        }
+    }
 }
 
 /// Accumulates streamed model chunks into a single assistant message.
@@ -417,6 +471,22 @@ impl ReActAgent {
         self.call_with_format(messages, None).await
     }
 
+    /// Runs the agent with a caller-held cancellation signal.
+    ///
+    /// The signal lets the caller stop this execution from another task: the agent observes
+    /// it at its next checkpoint and ends the run as cancelled (the reply is never produced).
+    /// Mirrors Java's `RunControl` being handed to the call through the runtime context.
+    pub async fn call_with_cancel(
+        &self,
+        messages: Vec<Msg>,
+        signal: CancelSignal,
+    ) -> Result<Msg> {
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert(CANCEL_SIGNAL_CONTEXT_KEY, signal);
+        self.call_with_format_and_extensions(messages, None, extensions)
+            .await
+    }
+
     /// Internal: runs the full lifecycle (graceful-shutdown guard + per-session
     /// serialization) and returns the reply message.
     async fn call_with_format(
@@ -452,6 +522,20 @@ impl ReActAgent {
         run.queue();
         run.start();
         *self.core.active_run.lock().unwrap() = Some(Arc::clone(&run));
+        // The run travels in this call's own context, so the interrupt check reads the run that
+        // belongs to *this* call instead of the agent-level slot a concurrent call may have
+        // replaced.
+        let mut extensions = extensions;
+        extensions.insert_arc(RUN_CONTROL_CONTEXT_KEY, Arc::clone(&run));
+        // The journal handle is shared with the drop guard: when the call's future is dropped
+        // (timeout, abort, lost lease) the guard releases the writer lease instead of leaving
+        // the session blocked.
+        let journal_slot: Arc<Mutex<Option<Arc<SessionRecorder>>>> = Arc::new(Mutex::new(None));
+        let _run_guard = RunGuard {
+            core: Arc::clone(&self.core),
+            run: Arc::clone(&run),
+            journal: Arc::clone(&journal_slot),
+        };
 
         // Seed the shared task bag from the persisted state, then restore it after the run
         // so any `todo_write` mutations survive.
@@ -477,6 +561,9 @@ impl ReActAgent {
                 // The loop appends the input itself, so the pre-call snapshot is the right
                 // baseline (Java `acquireCallExecution` records the same facts).
                 if let Some(recorder) = &owned_recorder {
+                    // Publish the recorder to the drop guard: a call whose future is dropped
+                    // must still release the journal's writer lease.
+                    *journal_slot.lock().unwrap() = Some(Arc::clone(recorder));
                     let state = this.core.state.lock().unwrap().clone();
                     recorder.start(&messages, &state).await?;
                 }
@@ -503,6 +590,10 @@ impl ReActAgent {
                         let _ = recorder.result(Some(reply));
                     }
                     let status = if run_status.is_cancelled() {
+                        "cancelled"
+                    } else if matches!(result, Err(Error::Cancelled(_))) {
+                        "cancelled"
+                    } else if matches!(result, Err(Error::Interrupted(_))) {
                         "interrupted"
                     } else if result.is_ok() {
                         "completed"
@@ -514,6 +605,8 @@ impl ReActAgent {
                         // Persistence failures must be visible, never silently downgraded.
                         tracing::warn!("failed to close session journal: {error}");
                     }
+                    // The journal is closed; the drop guard must not close it a second time.
+                    *journal_slot.lock().unwrap() = None;
                 }
                 result
             })
@@ -529,7 +622,6 @@ impl ReActAgent {
             RunStatus::Failed
         };
         run.finish(outcome);
-        *self.core.active_run.lock().unwrap() = None;
         result
     }
 
@@ -600,6 +692,11 @@ impl ReActAgent {
         // Layer the per-run services on top of the build-time ones: assigning would silently
         // drop everything the agent was configured with (recorders, observers).
         ctx.extensions.extend(&extensions);
+        // The run id belongs to *this* call's run, not to whatever run the agent-level slot
+        // currently holds (a concurrent call may have replaced it).
+        if let Some(run) = extensions.get::<RunControl>(RUN_CONTROL_CONTEXT_KEY) {
+            ctx.run_id = Some(run.run_id().to_string());
+        }
         ctx.response_format = response_format;
         let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
         // Shared channel: the model-call loop forwards fine-grained delta events
@@ -788,7 +885,7 @@ impl ReActAgent {
             let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&model));
             // The structured-output retry path is not streamed: this emitter drops
             // every event, so nothing becomes visible and retries stay allowed.
-            let msg = model_call_impl(&self.core, input, false, |_| {}).await?;
+            let msg = model_call_impl(&self.core, None, input, false, |_| {}).await?;
             state.context_mut().push(msg.clone());
 
             let mut gen_called = false;
@@ -929,6 +1026,10 @@ impl Agent for ReActAgent {
 impl CallableAgent for ReActAgent {
     async fn call(&self, messages: Vec<Msg>) -> Result<Msg> {
         ReActAgent::call(self, messages).await
+    }
+
+    async fn call_with_cancel(&self, messages: Vec<Msg>, signal: CancelSignal) -> Result<Msg> {
+        ReActAgent::call_with_cancel(self, messages, signal).await
     }
 
     async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
@@ -1465,7 +1566,7 @@ async fn reasoning_phase(
     state: &mut AgentState,
     iter: i32,
 ) -> Result<Msg> {
-    check_interrupted(core)?;
+    check_interrupted(core, Some(ctx))?;
     state.set_cur_iter(iter);
     // Publish the state accumulated so far (this turn's input plus the previous
     // iteration's assistant/tool messages) into the shared state before the
@@ -1475,7 +1576,7 @@ async fn reasoning_phase(
     // (kill -9 / OOM / power loss) would lose the entire turn.
     *core.state.lock().unwrap() = state.clone();
     if iter >= core.max_iters {
-        return summarizing(core, state).await;
+        return summarizing(core, ctx, state).await;
     }
 
     let sys_prompt = core
@@ -1542,6 +1643,9 @@ async fn run_reasoning(
         let slot = Arc::clone(&slot);
         let core = Arc::clone(core);
         let delta_tx = delta_tx.clone();
+        // The call context is cloned in: the model call runs on a `'static` future, so it
+        // cannot borrow the caller's context.
+        let ctx = ctx.clone();
         Box::new(move |mc_input: ModelCallInput| -> EventStream {
             let slot = Arc::clone(&slot);
             let core = Arc::clone(&core);
@@ -1549,7 +1653,7 @@ async fn run_reasoning(
             let fut = async move {
                 // Deltas only reach a consumer when the agent-level stream has a
                 // channel; without one nothing is visible, so retries stay allowed.
-                let msg = model_call_impl(&core, mc_input, delta_tx.is_some(), |ev| {
+                let msg = model_call_impl(&core, Some(&ctx), mc_input, delta_tx.is_some(), |ev| {
                     if let Some(tx) = &delta_tx {
                         let _ = tx.unbounded_send(ev);
                     }
@@ -1840,6 +1944,7 @@ impl BlockLifecycle {
 /// visible to anyone and its retries must keep working.
 async fn model_call_impl(
     core: &Arc<AgentCore>,
+    ctx: Option<&crate::agent::RuntimeContext>,
     mc_input: ModelCallInput,
     emit_reaches_consumer: bool,
     mut emit: impl FnMut(Result<AgentEvent>),
@@ -1930,7 +2035,7 @@ async fn model_call_impl(
                 // Checked after accumulating so an interrupt still preserves the
                 // chunks already received (Java parity: its InterruptedException
                 // branch persists `buildFinalMessage()`).
-                check_interrupted(core)?;
+                check_interrupted(core, ctx)?;
             }
             Ok::<_, Error>(())
         };
@@ -2133,7 +2238,7 @@ async fn acting_phase(
     ctx: &crate::agent::RuntimeContext,
     state: &mut AgentState,
 ) -> Result<ActingOutcome> {
-    check_interrupted(core)?;
+    check_interrupted(core, Some(ctx))?;
     let pending = extract_pending_tool_calls(state);
     if pending.is_empty() {
         return Ok(ActingOutcome::default());
@@ -2458,8 +2563,12 @@ async fn run_acting_calls(
 ///
 /// Mirrors the Java `summarizing()`: handles pending tool calls that were not completed
 /// before max iterations, and emits `ExceedMaxItersEvent`.
-async fn summarizing(core: &Arc<AgentCore>, state: &mut AgentState) -> Result<Msg> {
-    check_interrupted(core)?;
+async fn summarizing(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    state: &mut AgentState,
+) -> Result<Msg> {
+    check_interrupted(core, Some(ctx))?;
 
     // Handle pending tool calls that were not completed before max iterations.
     let pending = extract_pending_tool_calls(state);
@@ -2533,12 +2642,30 @@ fn structured_output_reminder(schema: &JsonSchema) -> Msg {
         .build()
 }
 
-/// Aborts execution if the agent's active run (or, absent one, the agent itself)
-/// has been interrupted.
-fn check_interrupted(core: &Arc<AgentCore>) -> Result<()> {
-    let interrupted = match core.active_run.lock().unwrap().as_ref() {
+/// Aborts execution if the caller cancelled it, or if the call's own run was interrupted.
+///
+/// The caller's cancel signal wins: it is the only signal that means "stop this execution
+/// now", so it also marks the run cancelled (the outcome must not be reported as a failure).
+/// The interrupt check then reads the run that belongs to *this* call — carried in the call's
+/// context — instead of the agent-level slot, which a concurrent call may have replaced.
+fn check_interrupted(core: &Arc<AgentCore>, ctx: Option<&crate::agent::RuntimeContext>) -> Result<()> {
+    let run = ctx.and_then(|c| c.extension::<RunControl>(RUN_CONTROL_CONTEXT_KEY));
+    if let Some(signal) = ctx.and_then(|c| c.extension::<CancelSignal>(CANCEL_SIGNAL_CONTEXT_KEY)) {
+        if signal.is_cancelled() {
+            // The caller asked this execution to stop: mark the run cancelled so the
+            // outcome is not reported as a failure.
+            if let Some(run) = &run {
+                run.cancel();
+            }
+            return Err(Error::Cancelled("execution cancelled by the caller".into()));
+        }
+    }
+    let interrupted = match run {
         Some(run) => run.interruption().is_interrupted(),
-        None => core.interrupt.is_interrupted(),
+        None => match core.active_run.lock().unwrap().as_ref() {
+            Some(run) => run.interruption().is_interrupted(),
+            None => core.interrupt.is_interrupted(),
+        },
     };
     if interrupted {
         return Err(Error::Interrupted("agent execution interrupted".into()));
@@ -5167,6 +5294,108 @@ mod tests {
                 .iter()
                 .any(|m| m.text_content().contains("unreachable")),
             "the model must not have been called"
+        );
+    }
+
+    /// A model whose stream never completes: the call stays in flight until it is dropped.
+    struct BlockingModel;
+
+    #[async_trait]
+    impl Model for BlockingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            Box::pin(futures::stream::pending())
+        }
+
+        fn model_name(&self) -> &str {
+            "blocking"
+        }
+    }
+
+    /// A model that keeps producing chunks, so the loop keeps reaching its checkpoints
+    /// (where a cancellation is observed) while the call is in flight.
+    struct TickingModel;
+
+    #[async_trait]
+    impl Model for TickingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            Box::pin(futures::stream::unfold((), |_| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Some((Ok(text_response("tick")), ()))
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "ticking"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_cancel_signal_ends_the_run_as_cancelled() {
+        // GAP-19: the caller holds a signal and stops the execution from another task.
+        // The agent observes it at its next checkpoint and reports the run as cancelled
+        // (not as a failure).
+        let agent = ReActAgent::builder()
+            .name("t-cancel")
+            .model(Arc::new(TickingModel))
+            .build()
+            .unwrap();
+        let signal = CancelSignal::new();
+        let call_signal = signal.clone();
+        let handle = tokio::spawn(async move {
+            agent.call_with_cancel(vec![Msg::user("hi")], call_signal).await
+        });
+        // Let the call start, then ask it to stop.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(signal.cancel());
+
+        let error = handle
+            .await
+            .expect("the call task must not panic")
+            .expect_err("a cancelled call must not produce a reply");
+        assert!(
+            matches!(error, Error::Cancelled(_)),
+            "expected a cancellation, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_call_future_marks_the_run_cancelled_and_clears_the_slot() {
+        // The disposal path: a call whose future is dropped (timeout, abort, lost lease)
+        // never reaches its own cleanup. The run must still end as cancelled, the agent-level
+        // slot must not keep a dead run, and the next call must run normally.
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("t-drop")
+                .model(Arc::new(BlockingModel))
+                .build()
+                .unwrap(),
+        );
+        let call_agent = Arc::clone(&agent);
+        let handle = tokio::spawn(async move { call_agent.call(vec![Msg::user("hi")]).await });
+        tokio::task::yield_now().await;
+
+        let run = agent.active_run().expect("the call must be in flight");
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(
+            run.status(),
+            RunStatus::Cancelled,
+            "a dropped call must end its run as cancelled"
+        );
+        assert!(
+            agent.active_run().is_none(),
+            "the agent-level slot must not keep a dead run"
         );
     }
 }

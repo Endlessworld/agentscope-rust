@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
 
@@ -81,6 +82,12 @@ pub struct GatewayTurnContext {
     pub msg_context: MsgContext,
     pub user_id: Option<String>,
     pub outbound: Option<OutboundAddress>,
+    /// The caller's cancellation signal, when the turn can be stopped.
+    ///
+    /// The gateway hands the signal to the agent so a caller that loses its lease (or
+    /// otherwise gives up on the turn) can end the execution instead of only suppressing
+    /// the reply. An agent that cannot be cancelled simply ignores it.
+    pub cancel: Option<CancelSignal>,
 }
 
 /// An agent that can be invoked by the gateway.
@@ -229,15 +236,19 @@ impl HarnessGateway {
 
     /// Inbound turn (single return), resolving the agent and session by context.
     pub async fn run(&self, context: Option<MsgContext>, messages: Vec<Msg>) -> Result<Msg> {
-        self.run_with_outbound(context, messages, None).await
+        self.run_with_outbound(context, messages, None, None).await
     }
 
     /// Inbound turn with outbound address, recorded as the session's last route.
+    ///
+    /// `cancel` is the caller's cancellation signal: when it fires, the agent ends the
+    /// execution instead of the caller merely suppressing the reply.
     pub async fn run_with_outbound(
         &self,
         context: Option<MsgContext>,
         messages: Vec<Msg>,
         outbound: Option<OutboundAddress>,
+        cancel: Option<CancelSignal>,
     ) -> Result<Msg> {
         let ctx = context.unwrap_or_else(MsgContext::default_context);
         let gate_key = ctx.canonical_key();
@@ -258,6 +269,7 @@ impl HarnessGateway {
             user_id: ctx.user_id.clone(),
             msg_context: ctx,
             outbound,
+            cancel,
         };
 
         let _guard = self.session_turn_gate.acquire(&gate_key).await;
@@ -350,6 +362,7 @@ impl HarnessGateway {
             msg_context: MsgContext::default_context(),
             user_id: None,
             outbound: session.reply_to.clone(),
+            cancel: None,
         };
         let _guard = self.session_turn_gate.acquire(&gate_key).await;
         let reply = session.agent.call(messages, &turn_ctx).await?;
@@ -384,6 +397,7 @@ impl HarnessGateway {
             msg_context: MsgContext::default_context(),
             user_id: user_id.map(str::to_string),
             outbound: self.last_route_by_session.read().await.get(session_id).cloned(),
+            cancel: None,
         };
         let _guard = self.session_turn_gate.acquire(&gate_key).await;
         let reply = agent.call(Vec::new(), &turn_ctx).await?;

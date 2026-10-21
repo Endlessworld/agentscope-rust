@@ -10,8 +10,84 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::Notify;
+
 use crate::interruption::{InterruptControl, InterruptSource};
 use crate::message::Msg;
+
+/// Runtime-context key under which a caller's [`CancelSignal`] travels.
+///
+/// The signal is what lets a caller (a channel adapter, a session runner) stop an execution it
+/// started, mirroring Java's `RunControl.CONTEXT_KEY`.
+pub const CANCEL_SIGNAL_CONTEXT_KEY: &str = "cancel_signal";
+
+/// Runtime-context key under which the current call's [`RunControl`] travels.
+///
+/// The run lives in the call's own context, so the interrupt check reads *this* call's signal
+/// instead of the agent-level slot, which concurrent calls overwrite.
+pub const RUN_CONTROL_CONTEXT_KEY: &str = "run_control";
+
+/// A caller-held signal that requests the cancellation of one execution.
+///
+/// Mirrors Java's `Sinks.Empty` cancellation: the holder asks a running execution to stop, and
+/// the execution observes the request at its next checkpoint. A model call already in flight
+/// still finishes; everything scheduled after it is skipped and the run ends as cancelled.
+///
+/// The signal is also awaitable, so the holder can race it against the work it wants to abandon
+/// and hard-stop that work when the graceful path takes too long.
+#[derive(Debug, Clone)]
+pub struct CancelSignal {
+    inner: Arc<CancelInner>,
+}
+
+#[derive(Debug)]
+struct CancelInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelSignal {
+    /// Creates a signal that has not been triggered.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(CancelInner {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    /// Requests cancellation. Returns `true` for the first request only.
+    ///
+    /// The permit from [`Notify::notify_one`] covers a waiter that registers *after* this call;
+    /// [`Notify::notify_waiters`] wakes the ones already waiting.
+    pub fn cancel(&self) -> bool {
+        if self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.inner.notify.notify_one();
+        self.inner.notify.notify_waiters();
+        true
+    }
+
+    /// Whether cancellation was requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once cancellation is requested.
+    pub async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            self.inner.notify.notified().await;
+        }
+    }
+}
 
 /// Execution-handle state, mirroring `AgentRun.Status`.
 ///
@@ -332,5 +408,27 @@ mod tests {
         let blank = AgentRun::with_run_id("a", Some("   ".to_string()));
         assert_eq!(blank.run_id().len(), 32, "blank ids fall back to a generated 32-hex id");
         assert!(blank.run_id().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_signal_is_observed_by_its_waiter() {
+        let signal = CancelSignal::new();
+        assert!(!signal.is_cancelled());
+        let waiter = signal.clone();
+        let handle = tokio::spawn(async move { waiter.cancelled().await });
+        // The waiter is registered before the request, so it must observe it.
+        tokio::task::yield_now().await;
+        assert!(signal.cancel());
+        assert!(!signal.cancel(), "a second request must not report a new cancellation");
+        assert!(signal.is_cancelled());
+        handle.await.expect("the waiter must be released");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_signal_releases_a_late_waiter() {
+        let signal = CancelSignal::new();
+        signal.cancel();
+        // A waiter that arrives after the request must not block forever.
+        signal.cancelled().await;
     }
 }

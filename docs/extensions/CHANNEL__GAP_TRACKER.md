@@ -188,6 +188,16 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 3. `common/idempotency_store.rs` 测试 `capacity_is_bounded_by_evicting_oldest` **期望与 Java 语义冲突**：`order` 是**惰性重建**的（仅在 `sweep` 内按 `entry.seq` 重建），而 `first_seen_at("a", 4)` 本身会先跑 `sweep`（对齐 Java `sweep(now)` 在 `putIfAbsent` 之前），此时最老者已变成 `"b"` 而被淘汰。修法：断言改为 `first_seen_at("b", 4) == true` 并补 `size() == 3`。
 - **已知问题**：无已知编译失败。全量 `cargo test --workspace` 曾在默认并行度下偶发 3 个 `agentscope-extensions-training::runner` 失败（该 crate 用进程级 `OnceLock` 静态注册表 + `clear_all()`，属**既有的测试间竞争**，与本轮改动无关；单独跑与 `-j 2` 均 3/3 全绿）。另：全量测试需保证页面文件充足，否则会因 `os error 1455/112`（mmap 失败）产生「could not compile」假阳性。
 
+### 4.1.4 GAP-19：lease 丢失可中止在跑的一轮（2026-10-21，汇总 tracker 关闭 GAP-19）
+- **裁定**：用户「(c) 为主 + (a) 兜底」——先协作式中止、宽限期内优雅收尾，超时再硬中止。
+- **Java 依据**：`WeixinChannel.java:200` 的 `takeUntilOther(session.cancelled.asMono())`（取消订阅 = 中断在飞的那一轮）、`:435-438` `loseLease` 广播 `cancelled`、`:65` 的 `weixin-lease-renewal` 续租线程（续租失败 → 丢租约 → 广播）。Rust 无调度器，续租改为 spawn 任务。
+- **本 crate 改动**：
+  - `weixin/channel.rs`：`LeaseSession` 持有 `agentscope_core::agent::CancelSignal`（`invalidate()` 即广播 = Java 的 `cancelled` sink）；新增 `spawn_lease_renewal`（每 `leaseMs/3` 续租，失败即 fence）；`process_claim` 改为 `select!` —— 租约丢失时先让 agent 协作式收尾（宽限 2s，`TURN_CANCEL_GRACE`），超时则丢弃 turn future 硬中止；**发送前的 `require_lease` 闸门保留**（“晚到的回复绝不外发”契约不变）。
+  - `common/channel_core.rs`：`run_turn` 增 `Option<CancelSignal>` 参数并下传。
+- **跨模块改动（经授权）**：harness `GatewayTurnContext` 增 `cancel` 字段，`run_with_outbound` / `PlatformCtx::run_turn` 增 `Option<CancelSignal>` 参数，`CallableAgentBridge` 公开并转发信号；core 侧新增 `CancelSignal` / `Error::Cancelled` / `RunGuard`（drop 安全）。
+- **测试**：`weixin::channel::tests::a_lost_lease_aborts_the_turn_in_flight`（租约在 turn 运行中丢失 → agent 观察到取消 → 不发任何请求）；已反向验证（把 `run_turn` 改回不传信号 → 该用例 FAILED）。
+- **基线**：`cargo test -p agentscope-extensions-channel` → 327 passed / 0 failed；`cargo check --workspace --all-targets` 通过。
+
 ### 4.2 下一步与阻塞
 1. **无剩余 P0/P1 项**：`DingTalkStreamClient` 已落地（`dingtalk/stream.rs`，227 → 241 tests）。§3.3 唯一「待确认」项为 A2A/长轮询拉取式入站，Java 侧无对应类，属不迁移项。
 2. **已裁定事项（本轮均已执行）**：

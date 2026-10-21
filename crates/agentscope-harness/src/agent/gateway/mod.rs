@@ -79,8 +79,8 @@ pub use subagent::{
 };
 pub use subagent_bridge::{ExposeResult, GatewaySubagentBridge, SubagentGatewayBridge};
 pub use task_bridge::{
-    create_completion_callback, DefaultSubagentMaterializer, TaskCompletionBridge,
-    wire_task_completion,
+    create_completion_callback, CallableAgentBridge, DefaultSubagentMaterializer,
+    TaskCompletionBridge, wire_task_completion,
 };
 pub use wakeup_dispatcher::{WakeupDispatcher, WakeupTarget};
 // Shared platform-channel plumbing (inbound dispatch + outbound delivery) reused by the

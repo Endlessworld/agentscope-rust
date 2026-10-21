@@ -234,7 +234,7 @@ impl ChatUiChannel {
         let outbound = self.build_outbound_from_options(options);
         self.resolve_gateway()
             .await?
-            .run_with_outbound(Some(ctx), messages, Some(outbound))
+            .run_with_outbound(Some(ctx), messages, Some(outbound), None)
             .await
     }
 
@@ -310,7 +310,7 @@ impl Channel for ChatUiChannel {
         let route = self.router.resolve_route(&config, &message);
         let gateway = self.resolve_gateway().await?;
         gateway
-            .run_with_outbound(Some(route.context), message.messages, Some(route.outbound_address))
+            .run_with_outbound(Some(route.context), message.messages, Some(route.outbound_address), None)
             .await
     }
 
