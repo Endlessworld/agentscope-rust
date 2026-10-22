@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentscope_core::error::{Error, Result};
-use agentscope_harness::agent::{McpClientManager, McpServerConfig};
+use agentscope_harness::agent::{McpClientManager, McpServerConfig, McpToolInfo};
+use async_trait::async_trait;
 use rust_mcp_sdk::schema::{CallToolResult, TextContent, Tool, ToolInputSchema};
 use serde_json::{Map, Value};
 
@@ -97,10 +98,115 @@ impl HigressClientConfig {
 
     /// Projects this configuration into a harness [`McpServerConfig`] so the
     /// caller can establish a real connection through [`McpClientManager`].
+    ///
+    /// The harness selects the concrete transport from the URL (SSE when the
+    /// URL contains `/sse`, Streamable HTTP otherwise). `transport_type` is
+    /// validated against that routing rule in
+    /// [`HigressMcpClientWrapper::initialize`], so a misconfigured transport is
+    /// reported instead of being silently ignored.
     pub fn to_server_config(&self) -> McpServerConfig {
         McpServerConfig::new(self.client_name.clone())
             .url(self.endpoint_with_query())
             .headers(self.headers.clone())
+    }
+}
+
+/// Everything the wrapper needs to hand to the connection layer when it
+/// establishes the real MCP connection.
+///
+/// [`McpServerConfig`] cannot carry the transport choice or the two timeouts,
+/// so they travel alongside it. Keeping them in one value makes it possible to
+/// assert (in tests and in diagnostics) that no configured knob is dropped.
+#[derive(Debug, Clone)]
+pub(crate) struct McpConnectRequest {
+    /// Server projection consumed by [`McpClientManager`].
+    pub server: McpServerConfig,
+    /// Caller-selected transport.
+    pub transport: TransportType,
+    /// Per-request timeout.
+    pub timeout: Duration,
+    /// Connection/initialization timeout.
+    pub initialization_timeout: Duration,
+}
+
+/// Narrow port over the harness MCP connection lifecycle.
+///
+/// [`McpClientManager`] is a concrete type that opens real sockets, which makes
+/// it impossible to observe or fail deterministically in unit tests. This trait
+/// exists only as a seam for the Higress wrapper: it is implemented for the real
+/// manager below and by an in-test recorder. It deliberately covers nothing but
+/// the operations the wrapper uses — it is not a parallel MCP abstraction.
+#[async_trait]
+pub(crate) trait McpConnection: Send + Sync {
+    /// Creates and connects a client for `request`, propagating any failure.
+    async fn connect_server(&self, request: McpConnectRequest) -> Result<()>;
+    /// Returns the connected client id for `server`, if any.
+    async fn find_client_id_by_server(&self, server: &str) -> Option<String>;
+    /// Lists the tools discovered for `client_id`.
+    async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>>;
+    /// Calls a tool on the connected client for `server`.
+    async fn call_tool_by_server(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value>;
+    /// Disconnects the client for `server`, if one is connected.
+    async fn disconnect_by_server(&self, server: &str) -> Result<()>;
+}
+
+#[async_trait]
+impl McpConnection for McpClientManager {
+    async fn connect_server(&self, request: McpConnectRequest) -> Result<()> {
+        tracing::debug!(
+            server = %request.server.name,
+            transport = request.transport.as_str(),
+            timeout = ?request.timeout,
+            initialization_timeout = ?request.initialization_timeout,
+            "Connecting Higress MCP server"
+        );
+        // Another wrapper may already own a connection for this server.
+        if self.find_client_id_by_server(&request.server.name).await.is_some() {
+            return Ok(());
+        }
+        let client_id = self.create_client(request.server).await?;
+        if let Err(error) = self.connect(&client_id).await {
+            // Do not leave a half-registered client behind, otherwise retries
+            // accumulate dead instances in the manager.
+            if let Err(cleanup_error) = self.remove_client(&client_id).await {
+                tracing::warn!(
+                    "Failed to remove MCP client '{}' after connect error: {}",
+                    client_id,
+                    cleanup_error
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn find_client_id_by_server(&self, server: &str) -> Option<String> {
+        McpClientManager::find_client_id_by_server(self, server).await
+    }
+
+    async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>> {
+        McpClientManager::list_tools(self, client_id).await
+    }
+
+    async fn call_tool_by_server(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value> {
+        McpClientManager::call_tool_by_server(self, server, tool_name, arguments).await
+    }
+
+    async fn disconnect_by_server(&self, server: &str) -> Result<()> {
+        match McpClientManager::find_client_id_by_server(self, server).await {
+            Some(client_id) => McpClientManager::disconnect(self, &client_id).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -328,11 +434,18 @@ impl HigressMcpClientBuilder {
 /// MCP protocol operations to a harness [`McpClientManager`].
 pub struct HigressMcpClientWrapper {
     name: String,
-    manager: Arc<McpClientManager>,
+    connection: Arc<dyn McpConnection>,
+    /// Server projection handed to the connection layer on `initialize`.
+    server_config: McpServerConfig,
+    transport_type: TransportType,
+    timeout: Duration,
+    initialization_timeout: Duration,
     enable_tool_search: bool,
     tool_search_query: Option<String>,
     tool_search_top_k: usize,
     initialized: Mutex<bool>,
+    /// Serialises `initialize` so concurrent callers connect at most once.
+    init_guard: tokio::sync::Mutex<()>,
     cached_tools: Mutex<HashMap<String, Tool>>,
 }
 
@@ -349,18 +462,35 @@ impl std::fmt::Debug for HigressMcpClientWrapper {
 impl HigressMcpClientWrapper {
     /// Creates a wrapper from an already-validated [`HigressClientConfig`].
     pub fn new(config: HigressClientConfig, manager: Arc<McpClientManager>) -> Self {
+        Self::with_connection(config, manager)
+    }
+
+    /// Creates a wrapper backed by an arbitrary [`McpConnection`].
+    fn with_connection(
+        config: HigressClientConfig,
+        connection: Arc<dyn McpConnection>,
+    ) -> Self {
+        let server_config = config.to_server_config();
         Self {
             name: config.client_name,
-            manager,
+            connection,
+            server_config,
+            transport_type: config.transport_type,
+            timeout: config.timeout,
+            initialization_timeout: config.initialization_timeout,
             enable_tool_search: config.enable_tool_search,
             tool_search_query: config.tool_search_query,
             tool_search_top_k: config.tool_search_top_k,
             initialized: Mutex::new(false),
+            init_guard: tokio::sync::Mutex::new(()),
             cached_tools: Mutex::new(HashMap::new()),
         }
     }
 
     /// Creates a wrapper directly, primarily for tests and advanced wiring.
+    ///
+    /// No endpoint is configured here, so [`initialize`](Self::initialize) only
+    /// succeeds if `manager` already holds a connection for `name`.
     pub fn with_options(
         name: impl Into<String>,
         manager: Arc<McpClientManager>,
@@ -368,13 +498,19 @@ impl HigressMcpClientWrapper {
         tool_search_query: Option<String>,
         tool_search_top_k: usize,
     ) -> Self {
+        let name = name.into();
         Self {
-            name: name.into(),
-            manager,
+            server_config: McpServerConfig::new(name.clone()),
+            name,
+            connection: manager,
+            transport_type: TransportType::StreamableHttp,
+            timeout: DEFAULT_TIMEOUT,
+            initialization_timeout: DEFAULT_INITIALIZATION_TIMEOUT,
             enable_tool_search,
             tool_search_query,
             tool_search_top_k,
             initialized: Mutex::new(false),
+            init_guard: tokio::sync::Mutex::new(()),
             cached_tools: Mutex::new(HashMap::new()),
         }
     }
@@ -394,18 +530,129 @@ impl HigressMcpClientWrapper {
         *self.initialized.lock().unwrap()
     }
 
-    /// Marks the client initialized.
+    /// Establishes the real MCP connection, mirroring Java's
+    /// `HigressMcpClientWrapper.initialize()`, which delegates to the underlying
+    /// MCP client.
     ///
-    /// The harness [`McpClientManager`] owns the real connection lifecycle, so
-    /// this only flips the local flag (idempotent, matching Java).
+    /// The connection is created through [`McpClientManager`] and is bounded by
+    /// the configured `initialization_timeout`. Any failure is returned to the
+    /// caller and leaves the wrapper uninitialized, so `build()` can never hand
+    /// back an object that merely claims to be connected.
+    ///
+    /// Idempotent: a second call (concurrent or sequential) is a no-op.
     pub async fn initialize(&self) -> Result<()> {
         if self.is_initialized() {
             tracing::debug!("Higress MCP client '{}' already initialized", self.name);
             return Ok(());
         }
+
+        // Serialise the check-then-connect sequence; without this, two
+        // concurrent callers would each create a client instance.
+        let _guard = self.init_guard.lock().await;
+        if self.is_initialized() {
+            return Ok(());
+        }
+
+        if self.server_config.url.is_none() && self.server_config.command.is_none() {
+            return Err(Error::Other(format!(
+                "Higress MCP client '{}' has no endpoint configured; build it via \
+                 HigressMcpClientBuilder::build()",
+                self.name
+            )));
+        }
+
+        self.validate_transport()?;
+
+        // A connection for this server may already exist on the shared manager
+        // (another wrapper, or a previous initialize). Reuse it rather than
+        // opening a second one.
+        if self
+            .connection
+            .find_client_id_by_server(&self.name)
+            .await
+            .is_some()
+        {
+            tracing::debug!(
+                "Higress MCP client '{}' reusing existing connection",
+                self.name
+            );
+            *self.initialized.lock().unwrap() = true;
+            return Ok(());
+        }
+
         tracing::info!("Initializing Higress MCP client: {}", self.name);
-        *self.initialized.lock().unwrap() = true;
-        Ok(())
+        let request = McpConnectRequest {
+            server: self.server_config.clone(),
+            transport: self.transport_type,
+            timeout: self.timeout,
+            initialization_timeout: self.initialization_timeout,
+        };
+
+        match tokio::time::timeout(
+            self.initialization_timeout,
+            self.connection.connect_server(request),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                *self.initialized.lock().unwrap() = true;
+                tracing::info!("Higress MCP client '{}' initialized", self.name);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "Failed to initialize Higress MCP client '{}': {}",
+                    self.name,
+                    error
+                );
+                Err(error)
+            }
+            Err(_) => Err(Error::Other(format!(
+                "Timed out after {:?} initializing Higress MCP client '{}'",
+                self.initialization_timeout, self.name
+            ))),
+        }
+    }
+
+    /// Ensures the configured transport agrees with how the harness routes the
+    /// URL (`/sse` in the URL selects SSE, everything else Streamable HTTP).
+    ///
+    /// Without this check `transport_type` would be silently ignored, because
+    /// [`McpServerConfig`] has no transport field and the manager infers it.
+    fn validate_transport(&self) -> Result<()> {
+        let Some(url) = self.server_config.url.as_deref() else {
+            return Ok(());
+        };
+        let routes_to_sse = url.contains("/sse");
+        match (self.transport_type, routes_to_sse) {
+            (TransportType::Sse, false) => Err(Error::Other(format!(
+                "Higress MCP client '{}' is configured for SSE but endpoint '{}' does not \
+                 contain '/sse'; the harness McpClientManager would use Streamable HTTP. \
+                 Use an SSE endpoint or streamable_http_endpoint().",
+                self.name, url
+            ))),
+            (TransportType::StreamableHttp, true) => Err(Error::Other(format!(
+                "Higress MCP client '{}' is configured for Streamable HTTP but endpoint '{}' \
+                 contains '/sse'; the harness McpClientManager would use SSE. Use \
+                 sse_endpoint() or an endpoint without '/sse'.",
+                self.name, url
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Applies the configured per-request `timeout` to one MCP operation.
+    async fn with_request_timeout<F, T>(&self, operation: &str, future: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        match tokio::time::timeout(self.timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Other(format!(
+                "Higress MCP client '{}' timed out after {:?} during {}",
+                self.name, self.timeout, operation
+            ))),
+        }
     }
 
     /// Lists the tools exposed by the gateway.
@@ -439,16 +686,21 @@ impl HigressMcpClientWrapper {
             Ok(tools)
         } else {
             let client_id = self
-                .manager
-                .find_client_id_by_server(&self.name)
-                .await
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "No connected MCP client for server '{}'",
-                        self.name
-                    ))
-                })?;
-            let infos = self.manager.list_tools(&client_id).await?;
+                .with_request_timeout("find_client", async {
+                    self.connection
+                        .find_client_id_by_server(&self.name)
+                        .await
+                        .ok_or_else(|| {
+                            Error::Other(format!(
+                                "No connected MCP client for server '{}'",
+                                self.name
+                            ))
+                        })
+                })
+                .await?;
+            let infos = self
+                .with_request_timeout("list_tools", self.connection.list_tools(&client_id))
+                .await?;
             let tools: Vec<Tool> = infos.iter().map(mcp_tool_info_to_tool).collect();
             self.cache_tools(&tools);
             tracing::debug!(
@@ -475,8 +727,11 @@ impl HigressMcpClientWrapper {
             arguments
         );
         let raw = self
-            .manager
-            .call_tool_by_server(&self.name, tool_name, arguments)
+            .with_request_timeout(
+                "call_tool",
+                self.connection
+                    .call_tool_by_server(&self.name, tool_name, arguments),
+            )
             .await?;
         let result: CallToolResult = serde_json::from_value(raw)
             .map_err(|e| Error::Other(format!("Failed to decode tool call result: {}", e)))?;
@@ -520,12 +775,27 @@ impl HigressMcpClientWrapper {
         self.cached_tools.lock().unwrap().get(name).cloned()
     }
 
-    /// Closes the client and clears cached data.
+    /// Closes the client.
     ///
-    /// Connection teardown is owned by the harness [`McpClientManager`]; this
-    /// resets local state only.
+    /// Disconnects the underlying harness connection (if this wrapper started
+    /// one) and clears cached data, mirroring Java's `close()`.
     pub async fn close(&self) {
         tracing::info!("Closing Higress MCP client: {}", self.name);
+        if self.is_initialized() {
+            if let Err(error) = self
+                .with_request_timeout(
+                    "disconnect",
+                    self.connection.disconnect_by_server(&self.name),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to disconnect Higress MCP client '{}': {}",
+                    self.name,
+                    error
+                );
+            }
+        }
         *self.initialized.lock().unwrap() = false;
         self.cached_tools.lock().unwrap().clear();
     }
@@ -608,6 +878,223 @@ pub(crate) fn text_content(text: impl Into<String>) -> TextContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal recording double for [`McpConnection`].
+    ///
+    /// The harness [`McpClientManager`] is concrete and opens real sockets, so
+    /// it cannot be observed from a unit test. This double records every
+    /// connect request and simulates a live server, which is exactly the seam
+    /// `initialize`/`list_tools` talk to.
+    #[derive(Default)]
+    struct RecordingConnection {
+        requests: Mutex<Vec<McpConnectRequest>>,
+        connected: Mutex<HashMap<String, Vec<McpToolInfo>>>,
+        tools: Vec<McpToolInfo>,
+        connect_error: Mutex<Option<String>>,
+        connect_delay: Mutex<Option<Duration>>,
+        tool_calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingConnection {
+        fn with_tools(tools: Vec<McpToolInfo>) -> Self {
+            Self {
+                tools,
+                ..Self::default()
+            }
+        }
+
+        fn requests(&self) -> Vec<McpConnectRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl McpConnection for RecordingConnection {
+        async fn connect_server(&self, request: McpConnectRequest) -> Result<()> {
+            self.requests.lock().unwrap().push(request.clone());
+            if let Some(error) = self.connect_error.lock().unwrap().clone() {
+                return Err(Error::Other(error));
+            }
+            let delay = *self.connect_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.connected
+                .lock()
+                .unwrap()
+                .insert(request.server.name, self.tools.clone());
+            Ok(())
+        }
+
+        async fn find_client_id_by_server(&self, server: &str) -> Option<String> {
+            self.connected
+                .lock()
+                .unwrap()
+                .contains_key(server)
+                .then(|| server.to_string())
+        }
+
+        async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>> {
+            self.connected
+                .lock()
+                .unwrap()
+                .get(client_id)
+                .cloned()
+                .ok_or_else(|| Error::Other(format!("Client '{}' is not connected", client_id)))
+        }
+
+        async fn call_tool_by_server(
+            &self,
+            server: &str,
+            tool_name: &str,
+            _arguments: Value,
+        ) -> Result<Value> {
+            self.tool_calls
+                .lock()
+                .unwrap()
+                .push((server.to_string(), tool_name.to_string()));
+            Ok(serde_json::json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "isError": false
+            }))
+        }
+
+        async fn disconnect_by_server(&self, server: &str) -> Result<()> {
+            self.connected.lock().unwrap().remove(server);
+            Ok(())
+        }
+    }
+
+    fn test_tool(name: &str) -> McpToolInfo {
+        McpToolInfo {
+            name: name.to_string(),
+            description: Some(format!("{name} tool")),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"]
+            }),
+            server: "higress".to_string(),
+        }
+    }
+
+    fn test_config() -> HigressClientConfig {
+        HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .header("Authorization", "Bearer t")
+            .query_param("x", "1")
+            .timeout(Duration::from_secs(5))
+            .initialization_timeout(Duration::from_secs(7))
+            .build_config()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn initialize_connects_and_records_full_config() {
+        let recording = Arc::new(RecordingConnection::default());
+        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+
+        wrapper.initialize().await.unwrap();
+
+        assert!(wrapper.is_initialized());
+        // The regression: before the fix nothing registered a client, so this
+        // lookup always returned None.
+        assert!(recording
+            .find_client_id_by_server("higress")
+            .await
+            .is_some());
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.server.name, "higress");
+        assert_eq!(
+            request.server.url.as_deref(),
+            Some("https://gw.example.com/mcp?x=1")
+        );
+        assert_eq!(
+            request.server.headers,
+            vec![("Authorization".to_string(), "Bearer t".to_string())]
+        );
+        assert_eq!(request.transport, TransportType::StreamableHttp);
+        assert_eq!(request.timeout, Duration::from_secs(5));
+        assert_eq!(request.initialization_timeout, Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn initialize_is_idempotent_and_only_connects_once() {
+        let recording = Arc::new(RecordingConnection::default());
+        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+
+        wrapper.initialize().await.unwrap();
+        wrapper.initialize().await.unwrap();
+
+        assert_eq!(recording.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn initialize_propagates_connection_failure() {
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.connect_error.lock().unwrap() = Some("connection refused".to_string());
+        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+
+        let error = wrapper.initialize().await.unwrap_err();
+        assert!(error.to_string().contains("connection refused"));
+        assert!(!wrapper.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn initialize_applies_initialization_timeout() {
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.connect_delay.lock().unwrap() = Some(Duration::from_millis(500));
+        let config = HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .initialization_timeout(Duration::from_millis(10))
+            .build_config()
+            .unwrap();
+        let wrapper = HigressMcpClientWrapper::with_connection(config, recording);
+
+        let error = wrapper.initialize().await.unwrap_err();
+        assert!(error.to_string().contains("Timed out"));
+        assert!(!wrapper.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_transport_mismatch() {
+        let recording = Arc::new(RecordingConnection::default());
+        let config = HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            // SSE selected but the URL has no `/sse`, so the manager would
+            // silently route it to Streamable HTTP.
+            .sse_endpoint("https://gw.example.com/mcp")
+            .build_config()
+            .unwrap();
+        let wrapper = HigressMcpClientWrapper::with_connection(config, recording.clone());
+
+        let error = wrapper.initialize().await.unwrap_err();
+        assert!(error.to_string().contains("configured for SSE"));
+        assert!(recording.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_tools_after_initialize_does_not_report_missing_client() {
+        let recording =
+            Arc::new(RecordingConnection::with_tools(vec![test_tool("echo"), test_tool("add")]));
+        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording);
+
+        wrapper.initialize().await.unwrap();
+        let tools = wrapper.list_tools().await.unwrap();
+
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["echo", "add"]
+        );
+        assert_eq!(tools[0].description.as_deref(), Some("echo tool"));
+        assert_eq!(tools[0].input_schema.required, vec!["q".to_string()]);
+        assert!(wrapper.get_cached_tool("echo").is_some());
+    }
 
     #[test]
     fn create_rejects_blank_client_name() {
@@ -857,23 +1344,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_is_idempotent_and_close_resets_state() {
-        let manager = Arc::new(McpClientManager::new());
-        let wrapper = HigressMcpClientWrapper::with_options(
-            "higress",
-            manager,
-            false,
-            None,
-            DEFAULT_TOOL_SEARCH_TOP_K,
-        );
-        wrapper.initialize().await.unwrap();
-        assert!(wrapper.is_initialized());
-        // Second call is a no-op, not an error.
+    async fn close_disconnects_and_resets_state() {
+        let recording = Arc::new(RecordingConnection::default());
+        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
         wrapper.initialize().await.unwrap();
         assert!(wrapper.is_initialized());
 
         wrapper.close().await;
+
         assert!(!wrapper.is_initialized());
+        assert!(recording
+            .find_client_id_by_server("higress")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
