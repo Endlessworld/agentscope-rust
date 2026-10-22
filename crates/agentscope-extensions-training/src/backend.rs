@@ -296,11 +296,24 @@ impl Model for TrinityModelAdapter {
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
     ) -> futures::stream::BoxStream<'_, Result<ChatResponse>> {
+        // Java `TrinityModelAdapter.Builder#build` constructs the delegate with
+        // `.stream(false)` — "Trinity doesn't support streaming, force disable".
+        // Rust delegates to an arbitrary `Model`, so the same constraint is applied to
+        // the options handed to it (a delegate that honours `options.stream` will send a
+        // non-streaming request).
+        let mut options = options;
+        options.stream = Some(false);
+
         let ctx = self.execution_context.clone();
+        // With a non-streaming backend one id arrives per call. A delegate that still
+        // yields N chunks repeats the same id; Java would have recorded it once, so
+        // collapse consecutive duplicates.
+        let mut last_recorded: Option<String> = None;
         let inner = self.delegate.stream(messages, tools, options);
         Box::pin(inner.map(move |item| {
             if let Ok(resp) = &item {
-                if !resp.id.is_empty() {
+                if !resp.id.is_empty() && last_recorded.as_deref() != Some(resp.id.as_str()) {
+                    last_recorded = Some(resp.id.clone());
                     match &ctx {
                         Some(context) => context.add_msg_id(resp.id.clone()),
                         None => tracing::warn!(
@@ -527,6 +540,90 @@ mod tests {
         assert_eq!(ctx.get_msg_ids(), vec!["resp-42".to_string()]);
         assert_eq!(adapter.get_model_name(), "fake");
         assert!(adapter.get_execution_context().is_some());
+    }
+
+    /// Records the options it receives and emits `chunks` responses sharing one id.
+    struct RecordingModel {
+        received: Arc<std::sync::Mutex<Option<GenerateOptions>>>,
+        chunks: usize,
+        id: &'static str,
+    }
+
+    impl Model for RecordingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, Result<ChatResponse>> {
+            *self.received.lock().unwrap() = Some(options);
+            let id = self.id.to_string();
+            let responses: Vec<Result<ChatResponse>> = (0..self.chunks)
+                .map(|_| {
+                    Ok(ChatResponse::new(
+                        id.clone(),
+                        vec![],
+                        ChatUsage::default(),
+                        None,
+                        None,
+                    ))
+                })
+                .collect();
+            Box::pin(stream::iter(responses))
+        }
+
+        fn model_name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    // Java: `TrinityModelAdapter` builds the delegate with `.stream(false)` —
+    // "Trinity doesn't support streaming, force disable".
+    #[tokio::test]
+    async fn adapter_forces_stream_off() {
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let adapter = TrinityModelAdapter::builder()
+            .delegate(Arc::new(RecordingModel {
+                received: received.clone(),
+                chunks: 1,
+                id: "resp-1",
+            }))
+            .build()
+            .unwrap();
+        let mut s = adapter.stream(
+            vec![],
+            vec![],
+            GenerateOptions {
+                stream: Some(true),
+                ..Default::default()
+            },
+        );
+        while let Some(item) = s.next().await {
+            item.unwrap();
+        }
+        let opts = received.lock().unwrap().take().expect("options captured");
+        assert_eq!(opts.stream, Some(false));
+    }
+
+    // A streaming delegate repeats one id per chunk; Java records one id per call.
+    #[tokio::test]
+    async fn adapter_records_duplicate_chunk_ids_once() {
+        use crate::runner::RunExecutionContext;
+        let ctx = Arc::new(RunExecutionContext::create("task-1", "0"));
+        let adapter = TrinityModelAdapter::builder()
+            .delegate(Arc::new(RecordingModel {
+                received: Arc::new(std::sync::Mutex::new(None)),
+                chunks: 3,
+                id: "resp-9",
+            }))
+            .execution_context(ctx.clone())
+            .build()
+            .unwrap();
+        let mut s = adapter.stream(vec![], vec![], GenerateOptions::default());
+        while let Some(item) = s.next().await {
+            item.unwrap();
+        }
+        assert_eq!(ctx.get_msg_ids(), vec!["resp-9".to_string()]);
     }
 
     #[test]
