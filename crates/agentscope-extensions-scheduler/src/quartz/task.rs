@@ -35,6 +35,9 @@ pub struct QuartzScheduleAgentTask {
     name: String,
     factory: Arc<dyn AgentFactory>,
     runtime: Arc<RuntimeAgentConfig>,
+    /// Initial input stored at scheduling time, mirroring the Quartz
+    /// `JobDataMap#inputMsg` entry. Replayed on every automatic firing.
+    initial_input: Option<Msg>,
     paused: AtomicBool,
     running: AtomicBool,
     cancelled: AtomicBool,
@@ -51,14 +54,16 @@ impl QuartzScheduleAgentTask {
         runtime: Arc<RuntimeAgentConfig>,
         schedule_config: ScheduleConfig,
         name: String,
+        factory: Arc<dyn AgentFactory>,
+        initial_input: Option<Msg>,
     ) -> Self {
-        let factory: Arc<dyn AgentFactory> = Arc::new(NoopFactory);
         let inner = BaseScheduleAgentTask::new(runtime.clone(), schedule_config, factory.clone());
         Self {
             inner,
             name,
             factory,
             runtime,
+            initial_input,
             paused: AtomicBool::new(false),
             running: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -91,6 +96,17 @@ impl QuartzScheduleAgentTask {
     /// The agent factory used for executions.
     pub fn factory(&self) -> Arc<dyn AgentFactory> {
         self.factory.clone()
+    }
+
+    /// Total executions (scheduled + manual), mirroring Java
+    /// `BaseScheduleAgentTask#getExecutionCount`.
+    pub fn execution_count(&self) -> u64 {
+        self.inner.execution_count()
+    }
+
+    /// The initial input message stored at scheduling time, if any.
+    pub fn initial_input(&self) -> Option<&Msg> {
+        self.initial_input.as_ref()
     }
 
     /// Returns the current status.
@@ -173,7 +189,9 @@ impl QuartzScheduleAgentTask {
             )));
         }
         self.running.store(true, Ordering::SeqCst);
-        let result = self.inner.run_with(Vec::new()).await;
+        // Mirror `AgentQuartzJob`: replay the stored input on each firing.
+        let messages = self.initial_input.clone().map(|msg| vec![msg]).unwrap_or_default();
+        let result = self.inner.run_with(messages).await;
         self.running.store(false, Ordering::SeqCst);
         result
     }
@@ -225,18 +243,6 @@ impl ScheduleAgentTask for QuartzScheduleAgentTask {
     }
 }
 
-/// Placeholder factory used before a real factory is attached.
-struct NoopFactory;
-
-#[async_trait]
-impl AgentFactory for NoopFactory {
-    async fn run(&self, _config: &RuntimeAgentConfig, _messages: Vec<Msg>) -> Result<Msg> {
-        Err(Error::Agent(
-            "No agent factory attached to this scheduled task".into(),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,8 +265,9 @@ mod tests {
             runtime("A"),
             ScheduleConfig::none(),
             "A".to_string(),
-        )
-        .with_factory(Arc::new(EchoFactory));
+            Arc::new(EchoFactory),
+            None,
+        );
         assert_eq!(task.status(), TaskStatus::Scheduled);
         task.pause();
         assert_eq!(task.status(), TaskStatus::Paused);
@@ -276,11 +283,12 @@ mod tests {
             runtime("A"),
             ScheduleConfig::none(),
             "A".to_string(),
-        )
-        .with_factory(Arc::new(EchoFactory));
+            Arc::new(EchoFactory),
+            None,
+        );
         let out = task.execute().await.unwrap();
         assert_eq!(out.text_content(), "echo:0");
-        assert_eq!(task.inner.execution_count(), 1);
+        assert_eq!(task.execution_count(), 1);
     }
 
     #[tokio::test]
@@ -289,8 +297,9 @@ mod tests {
             runtime("A"),
             ScheduleConfig::none(),
             "A".to_string(),
-        )
-        .with_factory(Arc::new(EchoFactory));
+            Arc::new(EchoFactory),
+            None,
+        );
         task.shutdown();
         assert!(task.execute().await.is_err());
     }

@@ -33,23 +33,12 @@ use crate::common::scheduler::task::{AgentFactory, ScheduleAgentTask};
 
 use self::job::spawn_job;
 
-/// Payload carried from scheduling time to the backend execution loop.
-#[derive(Default)]
-pub(crate) struct SchedulerRuntime {
-    /// Runtime agent config, when scheduled through `schedule_runtime`.
-    pub(crate) runtime: Option<Arc<RuntimeAgentConfig>>,
-    /// Optional initial input message (JSON-serialized, mirroring Quartz JobDataMap).
-    pub(crate) input: Option<Msg>,
-}
-
 /// AgentScheduler implementation backed by tokio timers (Quartz-equivalent).
 pub struct QuartzAgentScheduler {
     scheduler_id: String,
     factory: Arc<dyn AgentFactory>,
     /// name -> running job handle
     jobs: RwLock<HashMap<String, Arc<QuartzScheduleAgentTask>>>,
-    /// Extra runtime payload keyed by task name.
-    runtimes: RwLock<HashMap<String, SchedulerRuntime>>,
     shutdown: AtomicBool,
     next_seq: AtomicU64,
 }
@@ -62,7 +51,6 @@ impl QuartzAgentScheduler {
             scheduler_id,
             factory,
             jobs: RwLock::new(HashMap::new()),
-            runtimes: RwLock::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             next_seq: AtomicU64::new(0),
         };
@@ -104,16 +92,18 @@ impl QuartzAgentScheduler {
             return Ok(existing);
         }
 
+        // Java keeps the initial message in the Quartz JobDataMap
+        // (`QuartzAgentScheduler.java:233-241`) and reads it back on every
+        // firing (`AgentQuartzJob.java:67-101`). The Rust task owns the same
+        // payload so both the job loop and manual triggers honour it.
         let task = Arc::new(QuartzScheduleAgentTask::new(
-            runtime.clone(),
+            runtime,
             schedule_config.clone(),
             name.clone(),
+            self.factory.clone(),
+            input,
         ));
 
-        self.runtimes.write().unwrap().insert(
-            name.clone(),
-            SchedulerRuntime { runtime: Some(runtime), input },
-        );
         self.jobs.write().unwrap().insert(name.clone(), task.clone());
 
         let handle = spawn_job(self.context(), task.clone(), schedule_config.clone());
@@ -235,7 +225,6 @@ impl AgentScheduler for QuartzAgentScheduler {
         match removed {
             Some(task) => {
                 task.shutdown();
-                self.runtimes.write().unwrap().remove(name);
                 tracing::info!(task = %name, "cancelled task");
                 true
             }
