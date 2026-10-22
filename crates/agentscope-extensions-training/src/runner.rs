@@ -1029,6 +1029,18 @@ mod tests {
     use crate::reward::ZeroRewardCalculator;
     use crate::strategy::{SamplingRateStrategy, TrainingAnnotation};
 
+    /// Serialises tests that touch the process-global `RunRegistry` /
+    /// `TaskExecutionRegistry`.
+    ///
+    /// Without this they run concurrently under `cargo test`'s default thread
+    /// pool and each test's `clear_all()` wipes the other's counters, which made
+    /// `run_registry_allocates_incrementing_ids` flaky (observed:
+    /// `get_current_run_count("task-a") == 0` instead of `2`).
+    fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn run_execution_context_collects() {
         let ctx = RunExecutionContext::create("t1", "0");
@@ -1059,6 +1071,7 @@ mod tests {
 
     #[test]
     fn run_registry_allocates_incrementing_ids() {
+        let _guard = registry_test_lock();
         RunRegistry::clear_all();
         assert_eq!(RunRegistry::allocate_run_id("task-a"), "0");
         assert_eq!(RunRegistry::allocate_run_id("task-a"), "1");
@@ -1071,6 +1084,7 @@ mod tests {
 
     #[test]
     fn task_execution_registry_flow() {
+        let _guard = registry_test_lock();
         TaskExecutionRegistry::clear_all();
         let c1 = Arc::new(RunExecutionContext::create("t", "1"));
         let c0 = Arc::new(RunExecutionContext::create("t", "0"));
@@ -1270,6 +1284,7 @@ mod tests {
 
     #[test]
     fn run_registry_handles_empty_ids_and_cleanup_old_tasks() {
+        let _guard = registry_test_lock();
         RunRegistry::clear_all();
         assert_eq!(RunRegistry::get_current_run_count(""), 0);
         RunRegistry::cleanup(""); // no-op
@@ -1281,11 +1296,13 @@ mod tests {
     #[test]
     #[should_panic]
     fn run_registry_rejects_empty_task_id() {
+        let _guard = registry_test_lock();
         let _ = RunRegistry::allocate_run_id("");
     }
 
     #[test]
     fn task_execution_registry_empty_lookups() {
+        let _guard = registry_test_lock();
         TaskExecutionRegistry::clear_all();
         assert!(TaskExecutionRegistry::get_runs_by_task("").is_empty());
         assert!(TaskExecutionRegistry::get_runs_by_task("missing").is_empty());
@@ -1302,6 +1319,7 @@ mod tests {
 
     #[test]
     fn task_execution_registry_lists_task_ids() {
+        let _guard = registry_test_lock();
         TaskExecutionRegistry::clear_all();
         TaskExecutionRegistry::register(Arc::new(RunExecutionContext::create("t-a", "0")));
         TaskExecutionRegistry::register(Arc::new(RunExecutionContext::create("t-b", "0")));
