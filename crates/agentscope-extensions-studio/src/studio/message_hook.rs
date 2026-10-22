@@ -86,12 +86,54 @@ impl Middleware for StudioMessageHook {
 /// Extracts a forwardable final message from an agent event.
 ///
 /// Mirrors Java's `PostCallEvent#getFinalMessage`: the `AGENT_RESULT` payload.
+///
+/// The core writes the final reply under `fields["reply"]`
+/// (`react_agent.rs`: `data.fields.insert("reply", ...)`). Reading `"message"`
+/// here made `final_message()` always `None`, so Studio forwarding never fired.
+/// `"message"` is still accepted as a fallback for third-party producers.
 fn final_message(event: &AgentEvent) -> Option<Msg> {
     match event {
         AgentEvent::AgentResult(data) | AgentEvent::AgentEnd(data) => data
             .fields
-            .get("message")
+            .get("reply")
+            .or_else(|| data.fields.get("message"))
             .and_then(|v| serde_json::from_value::<Msg>(v.clone()).ok()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::event::EventData;
+
+    fn result_with(fields: &[(&str, serde_json::Value)]) -> AgentEvent {
+        let mut data = EventData::default();
+        for (k, v) in fields {
+            data.fields.insert((*k).to_string(), v.clone());
+        }
+        AgentEvent::AgentResult(data)
+    }
+
+    /// The key the core actually writes must be the one we read.
+    #[test]
+    fn reads_reply_key_written_by_core() {
+        let msg = Msg::assistant("hello");
+        let event = result_with(&[("reply", serde_json::json!(msg))]);
+        let extracted = final_message(&event).expect("reply should be extracted");
+        assert_eq!(extracted, msg);
+    }
+
+    /// Legacy/third-party producers using `message` keep working.
+    #[test]
+    fn falls_back_to_message_key() {
+        let msg = Msg::assistant("legacy");
+        let event = result_with(&[("message", serde_json::json!(msg))]);
+        assert_eq!(final_message(&event), Some(msg));
+    }
+
+    #[test]
+    fn non_result_events_yield_none() {
+        assert!(final_message(&AgentEvent::AgentStart(EventData::default())).is_none());
     }
 }
