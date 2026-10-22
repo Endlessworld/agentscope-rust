@@ -6,6 +6,7 @@
 //! `agentscope-extensions-model` (see `docs/extensions/MODEL__GAP_TRACKER.md`).
 
 pub mod cache_policy;
+pub mod catalog;
 pub mod chat_response;
 pub mod context_windows;
 pub mod execution_config;
@@ -16,8 +17,12 @@ pub mod tool_choice;
 pub mod tool_schema;
 
 pub use cache_policy::CachePolicy;
+pub use catalog::{
+    CatalogConfig, CatalogEvent, CatalogSnapshot, ModelCatalog, ModelDescriptor, ModelKind,
+    ModelStatus, ReasoningOption, ResolveRequest, Resolution,
+};
 pub use chat_response::{ChatResponse, ChatResponseBuilder};
-pub use context_windows::resolve_context_window;
+pub use context_windows::{resolve_context_window, DEFAULT_CONTEXT_WINDOW};
 pub use execution_config::{ExecutionConfig, ExecutionConfigBuilder};
 pub use generate_options::{GenerateOptions, GenerateOptionsBuilder};
 pub use model::{Model, ModelCapabilities};

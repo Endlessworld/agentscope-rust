@@ -188,11 +188,16 @@ impl AcpCodingAgent {
 
     /// Builds the ACP agent capabilities advertised during initialization.
     pub fn capabilities(&self) -> AgentCapabilities {
+        let image = self
+            .models
+            .iter()
+            .filter_map(super::config::resolve_choice)
+            .any(|descriptor| descriptor.input_modalities.contains("image"));
         AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(
                 PromptCapabilities::new()
-                    .image(false)
+                    .image(image)
                     .audio(false)
                     .embedded_context(true),
             )
@@ -440,28 +445,48 @@ impl AcpCodingAgent {
                     let mut session = match a_cfg.get_session(&sid) {
                         Some(s) => s,
                         None => {
-                            return responder.respond(SetSessionConfigOptionResponse::new(vec![]));
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("unknown session"),
+                            );
                         }
                     };
                     session.set_client(AcpClientHandle::new(cx.clone()));
-                    let value = req.value.as_value_id().map(|v| v.to_string());
+                    let Some(value) = req.value.as_value_id().map(|v| v.to_string()) else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("config option requires a value id"),
+                        );
+                    };
                     match req.config_id.to_string().as_str() {
                         "model" => {
-                            if let Some(v) = value {
-                                session.set_model(v);
+                            if !session.has_model(&value) {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data(format!("unknown model '{value}'")),
+                                );
                             }
+                            session.set_model(value);
                         }
                         "thought_level" => {
-                            if let Some(v) = value {
-                                session.set_thought_level(v);
+                            if !session.has_thought_level(&value) {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params().data(format!(
+                                        "thought level '{value}' is not supported by the selected model"
+                                    )),
+                                );
                             }
+                            session.set_thought_level(value);
                         }
                         "mode" => {
-                            if let Some(v) = value {
-                                session.set_mode(v);
-                            }
+                            session.set_mode(value);
                         }
-                        _ => {}
+                        other => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("unknown config option '{other}'")),
+                            );
+                        }
                     }
                     let config_options = session.config_options();
                     let update = agent_client_protocol::schema::v1::SessionNotification::new(

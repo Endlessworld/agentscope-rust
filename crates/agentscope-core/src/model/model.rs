@@ -41,6 +41,16 @@ pub trait Model: Send + Sync {
     fn context_window_size(&self) -> usize {
         0
     }
+
+    /// The model's maximum output tokens, or 0 if unknown.
+    fn max_output_tokens(&self) -> usize {
+        0
+    }
+
+    /// Catalog descriptor for this model, when the model was built with catalog data.
+    fn descriptor(&self) -> Option<&super::catalog::ModelDescriptor> {
+        None
+    }
 }
 
 /// Shared capability flags for models, mirroring `ChatModelBase`.

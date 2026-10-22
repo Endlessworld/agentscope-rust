@@ -180,6 +180,20 @@ impl CompactionConfig {
         c.keep_tokens = keep_tokens as i64;
         c
     }
+
+    /// Scales the compaction budgets (reserved + tool-result pruning) to the model
+    /// window. `0` keeps the configured defaults.
+    pub fn scaled_for_window(&self, window: usize) -> Self {
+        if window == 0 {
+            return self.clone();
+        }
+        let mut c = self.clone();
+        c.reserved = (window / 16).clamp(8_000, 64_000);
+        if let Some(prune) = &self.prune {
+            c.prune = Some(prune.scaled_for_window(window));
+        }
+        c
+    }
 }
 
 /// Builder for [`CompactionConfig`].
@@ -354,6 +368,17 @@ impl PruneConfig {
                 .map(str::to_string)
                 .collect(),
         }
+    }
+
+    /// Scales the protected/minimum budgets to the model window. `0` keeps defaults.
+    pub fn scaled_for_window(&self, window: usize) -> Self {
+        if window == 0 {
+            return self.clone();
+        }
+        let mut scaled = self.clone();
+        scaled.protect_tokens = (window / 6).clamp(16_000, 120_000);
+        scaled.minimum_tokens = (window / 12).clamp(8_000, 60_000);
+        scaled
     }
 }
 

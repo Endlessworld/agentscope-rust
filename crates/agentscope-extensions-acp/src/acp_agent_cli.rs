@@ -29,7 +29,8 @@ use agent_client_protocol::schema::v1::{
     NoticeCapabilities, PermissionOptionKind, PlanCapabilities, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind, SessionConfigKind,
+    SessionConfigSelectOptions,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
@@ -474,10 +475,36 @@ async fn process_update(
                             output.line(&format!("{DIM}[mode] {}{RESET}", u.current_mode_id));
                         }
                         SessionUpdate::ConfigOptionUpdate(u) => {
-                            output.line(&format!(
-                                "{DIM}[config] {} option(s) updated{RESET}",
-                                u.config_options.len()
-                            ));
+                            for option in &u.config_options {
+                                if let SessionConfigKind::Select(select) = &option.kind {
+                                    let mut values = Vec::new();
+                                    match &select.options {
+                                        SessionConfigSelectOptions::Ungrouped(items) => {
+                                            values.extend(items.iter());
+                                        }
+                                        SessionConfigSelectOptions::Grouped(groups) => {
+                                            for group in groups {
+                                                values.extend(group.options.iter());
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    let current = values
+                                        .into_iter()
+                                        .find(|value| value.value == select.current_value);
+                                    let current_name = current
+                                        .map(|value| value.name.clone())
+                                        .unwrap_or_else(|| select.current_value.to_string());
+                                    let detail = current
+                                        .and_then(|value| value.description.as_deref())
+                                        .map(|description| format!(" — {description}"))
+                                        .unwrap_or_default();
+                                    output.line(&format!(
+                                        "{DIM}[config] {} = {current_name}{detail}{RESET}",
+                                        option.name
+                                    ));
+                                }
+                            }
                         }
                         SessionUpdate::CompactionUpdate(u) => {
                             output.line(&format!(
@@ -907,6 +934,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    agentscope_core::model::catalog::ModelCatalog::global().spawn_background_refresh();
 
     let agent = build_agent_command()?;
     eprintln!("Spawning harness agent...");

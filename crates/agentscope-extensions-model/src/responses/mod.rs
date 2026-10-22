@@ -33,6 +33,7 @@ use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_con
 use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock,
 };
+use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
@@ -42,7 +43,7 @@ use agentscope_core::model::provider::{
 use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
-use crate::common::{diagnostics, resolve_capabilities, usage};
+use crate::common::{clamp_max_tokens, diagnostics, resolve_capabilities_with, usage};
 use crate::common::error::{ErrorKind, ModelError};
 
 /// An OpenAI Responses API model backed by `async-openai`.
@@ -50,6 +51,7 @@ pub struct OpenAiResponsesModel {
     client: Client<OpenAIConfig>,
     model_name: String,
     capabilities: ModelCapabilities,
+    descriptor: Option<Arc<ModelDescriptor>>,
 }
 
 impl OpenAiResponsesModel {
@@ -60,6 +62,7 @@ impl OpenAiResponsesModel {
         base_url: Option<String>,
     ) -> Result<Self> {
         let model_name = model_name.into();
+        let base_url_for_catalog = base_url.clone();
         let mut cfg = OpenAIConfig::new();
         if let Some(key) = api_key {
             cfg = cfg.with_api_key(key);
@@ -68,10 +71,15 @@ impl OpenAiResponsesModel {
             cfg = cfg.with_api_base(base);
         }
         let client = Client::with_config(cfg);
-        let context = resolve_context_window(&model_name);
+        let descriptor = descriptor_for(None, &model_name, base_url_for_catalog.as_deref());
+        let context = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.effective_context())
+            .unwrap_or_else(|| resolve_context_window(&model_name));
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
+            descriptor,
             model_name,
         })
     }
@@ -103,10 +111,21 @@ impl OpenAiResponsesModel {
             })?;
         }
         let client = Client::with_config(cfg);
-        let context = resolve_context_window(&model_name);
+        let descriptor = ctx.catalog.clone().or_else(|| {
+            descriptor_for(
+                Some(&ctx.provider_id),
+                &model_name,
+                ctx.base_url.as_deref(),
+            )
+        });
+        let context = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.effective_context())
+            .unwrap_or_else(|| resolve_context_window(&model_name));
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
+            descriptor,
             model_name,
         })
     }
@@ -130,7 +149,9 @@ impl Model for OpenAiResponsesModel {
             .model_name
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let request = build_request(model_name, messages, tools, options);
+        let options = clamp_max_tokens(options, self.max_output_tokens());
+        let capabilities = resolve_capabilities_with(&model_name, self.descriptor.as_deref());
+        let request = build_request(model_name, messages, tools, options, Some(capabilities));
 
         let setup = futures::stream::once(async move {
             client
@@ -177,6 +198,17 @@ impl Model for OpenAiResponsesModel {
 
     fn context_window_size(&self) -> usize {
         self.capabilities.context_window_size
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.max_output)
+            .unwrap_or(0)
+    }
+
+    fn descriptor(&self) -> Option<&ModelDescriptor> {
+        self.descriptor.as_deref()
     }
 
     fn supports_native_structured_output(&self) -> bool {
@@ -249,6 +281,7 @@ fn build_request(
     messages: Vec<Msg>,
     tools: Vec<ToolSchema>,
     options: GenerateOptions,
+    capabilities: Option<crate::common::ModelCapabilities>,
 ) -> CreateResponse {
     let mut instructions: Vec<String> = Vec::new();
     let mut items: Vec<InputItem> = Vec::new();
@@ -297,7 +330,7 @@ fn build_request(
 
     let request_tools = to_request_tools(tools);
     let has_tools = request_tools.is_some();
-    let caps = resolve_capabilities(&model);
+    let caps = capabilities.unwrap_or_else(|| crate::common::resolve_capabilities(&model));
 
     let mut req = CreateResponse {
         input: InputParam::Items(items),
@@ -561,6 +594,7 @@ mod tests {
             vec![msg, user_msg("hi")],
             vec![],
             GenerateOptions::default(),
+            None,
         );
         assert_eq!(req.instructions.as_deref(), Some("be nice"));
         match req.input {
@@ -576,6 +610,7 @@ mod tests {
             vec![user_msg("hello")],
             vec![],
             GenerateOptions::default(),
+            None,
         );
         match &req.input {
             InputParam::Items(items) => match &items[0] {
@@ -608,6 +643,7 @@ mod tests {
             vec![msg],
             vec![],
             GenerateOptions::default(),
+            None,
         );
         match &req.input {
             InputParam::Items(items) => match &items[0] {
@@ -638,6 +674,7 @@ mod tests {
             vec![msg],
             vec![],
             GenerateOptions::default(),
+            None,
         );
         match &req.input {
             InputParam::Items(items) => match &items[0] {

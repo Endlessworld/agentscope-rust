@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::model::cache_policy::CachePolicy;
+use crate::model::catalog::CatalogAwareModel;
 use crate::model::generate_options::GenerateOptions;
 use crate::model::model::Model;
 
@@ -84,6 +85,10 @@ pub struct ModelCreationContext {
     pub cache_id: Option<String>,
     /// Additional per-request options.
     pub options: GenerateOptions,
+    /// Pre-resolved catalog descriptor, when the caller already resolved one.
+    ///
+    /// Providers may use this instead of consulting the process-wide catalog.
+    pub catalog: Option<std::sync::Arc<crate::model::catalog::ModelDescriptor>>,
 }
 
 impl ModelCreationContext {
@@ -118,6 +123,13 @@ impl ModelCreationContext {
     }
     pub fn options(mut self, v: GenerateOptions) -> Self {
         self.options = v;
+        self
+    }
+    pub fn catalog_descriptor(
+        mut self,
+        v: std::sync::Arc<crate::model::catalog::ModelDescriptor>,
+    ) -> Self {
+        self.catalog = Some(v);
         self
     }
 }
@@ -208,15 +220,29 @@ impl ModelRegistry {
                 cache_policy: base.cache_policy,
                 cache_id: base.cache_id,
                 options: base.options,
+                catalog: base.catalog,
             };
-            return p.create(ctx);
+            let descriptor = ctx.catalog.clone();
+            let wrap_provider = ctx.provider_id.clone();
+            let wrap_model = ctx.model.clone();
+            let base_url = ctx.base_url.clone();
+            let created = p.create(ctx)?;
+            return Ok(match descriptor {
+                Some(descriptor) => CatalogAwareModel::from_descriptor(created, descriptor),
+                None => CatalogAwareModel::wrap(
+                    created,
+                    Some(&wrap_provider),
+                    &wrap_model,
+                    base_url.as_deref(),
+                ),
+            });
         }
 
         // No explicit provider id: ask each provider in order.
         let model_only = if model.is_empty() { model_id } else { model };
         for p in &self.providers {
             if p.supports(model_only) {
-                return p.create(ModelCreationContext {
+                let ctx = ModelCreationContext {
                     provider_id: p.provider_id().to_string(),
                     model: model_only.to_string(),
                     api_key: base.api_key,
@@ -228,6 +254,21 @@ impl ModelRegistry {
                     cache_policy: base.cache_policy,
                     cache_id: base.cache_id,
                     options: base.options,
+                    catalog: base.catalog,
+                };
+                let descriptor = ctx.catalog.clone();
+                let wrap_provider = ctx.provider_id.clone();
+                let wrap_model = ctx.model.clone();
+                let base_url = ctx.base_url.clone();
+                let created = p.create(ctx)?;
+                return Ok(match descriptor {
+                    Some(descriptor) => CatalogAwareModel::from_descriptor(created, descriptor),
+                    None => CatalogAwareModel::wrap(
+                        created,
+                        Some(&wrap_provider),
+                        &wrap_model,
+                        base_url.as_deref(),
+                    ),
                 });
             }
         }

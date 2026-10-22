@@ -60,6 +60,17 @@ impl ToolResultEvictionConfig {
         ToolResultEvictionConfigBuilder::default()
     }
 
+    /// Scales the eviction threshold to the model window (10% of the window in
+    /// characters, clamped to `[20_000, 200_000]`). `0` keeps the defaults.
+    pub fn scaled_for_window(&self, window: usize) -> Self {
+        if window == 0 {
+            return self.clone();
+        }
+        let mut scaled = self.clone();
+        scaled.max_result_chars = (window.saturating_mul(4) / 10).clamp(20_000, 200_000);
+        scaled
+    }
+
     /// Whether a result from `tool_name` with `output_chars` characters should be evicted.
     pub fn should_evict(&self, tool_name: &str, output_chars: usize) -> bool {
         output_chars > self.max_result_chars && !self.excluded_tool_names.contains(tool_name)

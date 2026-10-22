@@ -152,8 +152,13 @@ impl AgentSession {
 
     /// Submits a new task with a fresh idempotency key.
     pub async fn submit(&self, input: impl Into<String>) -> crate::Result<Task> {
+        self.submit_msg(Msg::user(input)).await
+    }
+
+    /// Submits a pre-built user message (text, images, resources, ...).
+    pub async fn submit_msg(&self, message: Msg) -> crate::Result<Task> {
         let key = uuid::Uuid::new_v4().to_string();
-        self.submit_with_key(&key, input).await
+        self.submit_with_key_msg(&key, message).await
     }
 
     /// Submits a new task; retry with the same key and identical input to get the same receipt.
@@ -162,9 +167,24 @@ impl AgentSession {
         idempotency_key: &str,
         input: impl Into<String>,
     ) -> crate::Result<Task> {
+        self.submit_with_key_msg(idempotency_key, Msg::user(input))
+            .await
+    }
+
+    /// Submits a pre-built message with an explicit idempotency key.
+    pub async fn submit_with_key_msg(
+        &self,
+        idempotency_key: &str,
+        message: Msg,
+    ) -> crate::Result<Task> {
         self.ensure_open()?;
-        let input = input.into();
-        if input.is_empty() {
+        if message.content.is_empty() {
+            return Err(session_error("A new task requires input"));
+        }
+        if matches!(
+            message.content.as_slice(),
+            [ContentBlock::Text(text)] if text.text.is_empty()
+        ) {
             return Err(session_error("A new task requires input"));
         }
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 200 {
@@ -175,7 +195,7 @@ impl AgentSession {
             idempotency_key,
             "submit",
             Some(turn_id),
-            freeze(idempotency_key, vec![Msg::user(input)]),
+            freeze(idempotency_key, vec![message]),
             Vec::new(),
         )?;
         let accepted = self.inbox.accept(&command).await?;

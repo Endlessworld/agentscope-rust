@@ -148,6 +148,39 @@ impl Overrides {
     };
 }
 
+/// Clamps `max_tokens` / `max_completion_tokens` to the model's output limit.
+pub fn clamp_max_tokens(mut options: agentscope_core::GenerateOptions, max_output: usize) -> agentscope_core::GenerateOptions {
+    if max_output == 0 {
+        return options;
+    }
+    let max_output = max_output.min(u32::MAX as usize) as u32;
+    options.max_tokens = options.max_tokens.map(|value| value.min(max_output));
+    options.max_completion_tokens = options
+        .max_completion_tokens
+        .map(|value| value.min(max_output));
+    options
+}
+
+/// Resolves capabilities using catalog data when available, falling back to the
+/// prefix table for fields the catalog does not model.
+pub fn resolve_capabilities_with(
+    model_id: &str,
+    descriptor: Option<&agentscope_core::model::catalog::ModelDescriptor>,
+) -> ModelCapabilities {
+    let mut caps = resolve_capabilities(model_id);
+    if let Some(descriptor) = descriptor {
+        if !descriptor.temperature {
+            // OpenAI reasoning endpoints reject the whole sampling/penalty group.
+            caps.supports_sampling = false;
+            caps.supports_penalties = false;
+        }
+        if !descriptor.tool_call {
+            caps.supports_parallel_tool_calls = false;
+        }
+    }
+    caps
+}
+
 /// Resolves the capabilities of a model id by layering every matching prefix
 /// override, shortest first (longest prefix wins on conflicts).
 pub fn resolve_capabilities(model_id: &str) -> ModelCapabilities {

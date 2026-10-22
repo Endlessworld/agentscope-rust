@@ -105,6 +105,12 @@ pub struct ContextSnapshot {
     /// Model identifier.
     #[serde(default)]
     pub model: String,
+    /// Resolved models.dev key, when the catalog knows the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_key: Option<String>,
+    /// Catalog generation used to resolve `catalog_key`.
+    #[serde(default)]
+    pub catalog_generation: u64,
     /// Framework-private state blob (opaque).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework_state: Option<serde_json::Value>,
@@ -133,6 +139,8 @@ impl ContextSnapshot {
                 max_tokens: 0,
                 framework: String::new(),
                 model: String::new(),
+                catalog_key: None,
+                catalog_generation: 0,
                 framework_state: None,
                 captured_at: 0,
                 context_hash: String::new(),
@@ -293,6 +301,13 @@ impl ContextSnapshotBuilder {
     /// Model identifier.
     pub fn model(mut self, v: impl Into<String>) -> Self {
         self.snapshot.model = v.into();
+        self
+    }
+
+    /// Resolved catalog key and generation.
+    pub fn catalog(mut self, key: Option<String>, generation: u64) -> Self {
+        self.snapshot.catalog_key = key;
+        self.snapshot.catalog_generation = generation;
         self
     }
 

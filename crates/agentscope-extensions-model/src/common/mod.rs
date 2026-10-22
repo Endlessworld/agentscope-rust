@@ -22,7 +22,7 @@ pub mod transport;
 pub mod usage;
 
 pub use base_url::{resolve_base_url, resolve_base_url_with};
-pub use capabilities::{resolve_capabilities, ModelCapabilities};
+pub use capabilities::{clamp_max_tokens, resolve_capabilities, resolve_capabilities_with, ModelCapabilities};
 pub use diagnostics::{ConversionDiagnostic, Diagnostics, Severity};
 pub use error::{ErrorKind, ModelError};
 pub use media::{

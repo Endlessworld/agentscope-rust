@@ -15,6 +15,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use agentscope_core::error::{Error, Result};
+use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model};
 use agentscope_core::{Msg, ToolSchema};
@@ -42,6 +43,7 @@ pub struct OpenAIResponsesChatModel {
     formatter: Option<ResponsesMultiAgentFormatter>,
     server_tools: Vec<OpenAIServerTool>,
     context_window_size: usize,
+    descriptor: Option<Arc<ModelDescriptor>>,
 }
 
 impl OpenAIResponsesChatModel {
@@ -53,8 +55,18 @@ impl OpenAIResponsesChatModel {
         transport: SharedTransport,
     ) -> Self {
         let model_name = model_name.into();
+        let configured_base_url = base_url.clone();
+        let descriptor = descriptor_for(
+            Some(PROVIDER_ID),
+            &model_name,
+            configured_base_url.as_deref(),
+        );
+        let context_window_size = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.effective_context())
+            .unwrap_or_else(|| resolve_context_window(&model_name));
         Self {
-            context_window_size: resolve_context_window(&model_name),
+            context_window_size,
             model_name,
             api_key: api_key.into(),
             base_url: base_url
@@ -67,6 +79,7 @@ impl OpenAIResponsesChatModel {
             strict_json_schema: None,
             formatter: None,
             server_tools: Vec::new(),
+            descriptor,
         }
     }
 
@@ -108,7 +121,9 @@ impl OpenAIResponsesChatModel {
 
     /// Sets the reported context window size in tokens.
     pub fn with_context_window_size(mut self, size: usize) -> Self {
-        self.context_window_size = size;
+        if size > 0 {
+            self.context_window_size = size;
+        }
         self
     }
 
@@ -211,6 +226,7 @@ impl Model for OpenAIResponsesChatModel {
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
     ) -> BoxStream<'_, Result<ChatResponse>> {
+        let options = crate::common::clamp_max_tokens(options, self.max_output_tokens());
         let stream_enabled = options.stream.unwrap_or(self.stream);
         Box::pin(async_stream::stream! {
             let spec = match self.build_http_request(messages, tools, &options, stream_enabled) {
@@ -270,6 +286,17 @@ impl Model for OpenAIResponsesChatModel {
 
     fn context_window_size(&self) -> usize {
         self.context_window_size
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.max_output)
+            .unwrap_or(0)
+    }
+
+    fn descriptor(&self) -> Option<&ModelDescriptor> {
+        self.descriptor.as_deref()
     }
 
     fn supports_native_structured_output(&self) -> bool {

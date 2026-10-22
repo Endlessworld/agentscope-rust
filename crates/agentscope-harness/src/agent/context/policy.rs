@@ -51,7 +51,8 @@ impl<'a> EstimateInput<'a> {
 
 /// The default character-based approximation used by the Java harness.
 ///
-/// Method string: `mixed-text-2.5chars-media-2048-v1`.
+/// Method string: `mixed-text-2.5chars-media-sized-v2`. Media blocks are charged by
+/// payload size (images) or a fixed budget (audio/video) instead of one flat rate.
 pub struct ApproximateEstimator;
 
 impl TokenEstimator for ApproximateEstimator {
@@ -69,7 +70,7 @@ impl TokenEstimator for ApproximateEstimator {
         }
         Estimate {
             tokens: count,
-            method: "mixed-text-2.5chars-media-2048-v1".into(),
+            method: "mixed-text-2.5chars-media-sized-v2".into(),
             exact: false,
         }
     }
@@ -100,8 +101,23 @@ fn block_cost(block: &ContentBlock) -> i64 {
             }
             tokens
         }
-        // Explicitly approximate: media cost depends on provider, resolution and duration.
-        _ => 2048,
+        ContentBlock::Image(image) => image_cost(&image.source),
+        ContentBlock::Audio(_) => 2_048,
+        ContentBlock::Video(_) => 4_096,
+        ContentBlock::Data(_) => 2_048,
+        // Explicitly approximate: any other media cost depends on the provider.
+        _ => 2_048,
+    }
+}
+
+/// Images are charged by encoded payload size, clamped to a plausible range.
+fn image_cost(source: &agentscope_core::message::Source) -> i64 {
+    match source {
+        agentscope_core::message::Source::Base64(base64) => {
+            let bytes = base64.data.len() as i64;
+            (bytes / 1_000).clamp(256, 4_096)
+        }
+        agentscope_core::message::Source::Url(_) => 2_048,
     }
 }
 
@@ -244,6 +260,9 @@ pub struct ContextManifest {
     pub purpose: String,
     pub model: String,
     pub policy_version: String,
+    pub context_window: i64,
+    pub catalog_generation: u64,
+    pub catalog_key: Option<String>,
     pub estimated_input_tokens: i64,
     pub input_limit: i64,
     pub counting_method: String,
@@ -270,11 +289,14 @@ impl ContextManifest {
 impl serde::Serialize for ContextManifest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ContextManifest", 12)?;
+        let mut state = serializer.serialize_struct("ContextManifest", 15)?;
         state.serialize_field("callId", &self.call_id)?;
         state.serialize_field("purpose", &self.purpose)?;
         state.serialize_field("model", &self.model)?;
         state.serialize_field("policyVersion", &self.policy_version)?;
+        state.serialize_field("contextWindow", &self.context_window)?;
+        state.serialize_field("catalogGeneration", &self.catalog_generation)?;
+        state.serialize_field("catalogKey", &self.catalog_key)?;
         state.serialize_field("estimatedInputTokens", &self.estimated_input_tokens)?;
         state.serialize_field("inputLimit", &self.input_limit)?;
         state.serialize_field("countingMethod", &self.counting_method)?;
@@ -388,7 +410,7 @@ mod tests {
         let estimate = ApproximateEstimator.estimate(&EstimateInput::new(&[msg], &[]));
         // 12 (per-message overhead) + ceil(4 / 2.5) = 14.
         assert_eq!(estimate.tokens, 14);
-        assert_eq!(estimate.method, "mixed-text-2.5chars-media-2048-v1");
+        assert_eq!(estimate.method, "mixed-text-2.5chars-media-sized-v2");
         assert!(!estimate.exact);
     }
 
@@ -481,6 +503,9 @@ mod tests {
             purpose: "REASONING".into(),
             model: "m".into(),
             policy_version: ContextManifest::POLICY_VERSION.into(),
+            context_window: 256_000,
+            catalog_generation: 0,
+            catalog_key: None,
             estimated_input_tokens: 10,
             input_limit: 100,
             counting_method: "method".into(),

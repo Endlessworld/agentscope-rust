@@ -91,6 +91,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentscope_core::model::catalog::CatalogAwareModel;
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
 use agentscope_core::model::{GenerateOptions, Model};
 use agentscope_extensions_acp::config::ModelChoice;
@@ -580,25 +581,46 @@ impl ModelConfig {
     ///
     /// provider 按 key 排序后确定性遍历，保证下拉顺序稳定。
     pub fn all_models(&self) -> Vec<ModelChoice> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
         let mut keys: Vec<&String> = self.providers.keys().collect();
         keys.sort();
+
+        // Count bare ids first so only genuinely ambiguous ids get a provider prefix.
+        let mut counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for provider_key in &keys {
+            for id in self.providers[*provider_key].models.iter().map(|(id, _)| id) {
+                *counts.entry(id.to_string()).or_default() += 1;
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
         for provider_key in keys {
             let provider = &self.providers[provider_key];
             let mut per_provider = 0usize;
             for (id, protocol) in provider.models.iter() {
-                if seen.insert(id.to_string()) {
-                    per_provider += 1;
-                    tracing::debug!(
-                        "model-config: provider='{provider_key}' model='{id}' protocol={}",
-                        protocol.label()
-                    );
-                    out.push(ModelChoice {
-                        id: id.to_string(),
-                        name: format!("{}/{}", provider_key, id),
-                    });
+                let dedupe_key = (provider_key.to_string(), id.to_string());
+                if !seen.insert(dedupe_key) {
+                    continue;
                 }
+                per_provider += 1;
+                let ambiguous = counts.get(id).copied().unwrap_or(0) > 1;
+                let value = if ambiguous {
+                    format!("{provider_key}/{id}")
+                } else {
+                    id.to_string()
+                };
+                tracing::debug!(
+                    "model-config: provider='{provider_key}' model='{id}' protocol={}",
+                    protocol.label()
+                );
+                out.push(ModelChoice {
+                    id: value,
+                    name: format!("{provider_key}/{id}"),
+                    provider: Some(provider_key.clone()),
+                    catalog_key: None,
+                    base_url: Some(provider.base_url.clone()),
+                });
             }
             tracing::info!(
                 "model-config: provider '{provider_key}' provides {per_provider} models \
@@ -792,17 +814,26 @@ fn build_model(
 /// wire protocol. `base_url` always stops at the version prefix (e.g.
 /// `https://opencode.ai/zen/go/v1`); the protocol decides the endpoint suffix.
 fn build_model_for_protocol(ctx: &ModelCreationContext) -> Result<Arc<dyn Model>, String> {
-    match ctx.protocol {
+    let model = match ctx.protocol {
         ApiProtocol::ChatCompletions => OpenAiChatModel::from_context(ctx)
             .map(|m| Arc::new(m) as Arc<dyn Model>)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| e.to_string())?,
         ApiProtocol::Responses => OpenAiResponsesModel::from_context(ctx)
             .map(|m| Arc::new(m) as Arc<dyn Model>)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| e.to_string())?,
         ApiProtocol::Messages => AnthropicMessagesModel::from_context(ctx)
             .map(|m| Arc::new(m) as Arc<dyn Model>)
-            .map_err(|e| e.to_string()),
-    }
+            .map_err(|e| e.to_string())?,
+    };
+    Ok(match &ctx.catalog {
+        Some(descriptor) => CatalogAwareModel::from_descriptor(model, Arc::clone(descriptor)),
+        None => CatalogAwareModel::wrap(
+            model,
+            Some(&ctx.provider_id),
+            &ctx.model,
+            ctx.base_url.as_deref(),
+        ),
+    })
 }
 
 /// Looks up the wire protocol a model id is configured under.
@@ -921,6 +952,12 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
 
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
     let model: Arc<dyn Model> = build_model(&model_id, &base_url, &api_key, protocol, session_id);
+    let context_window = model.context_window_size();
+    let compaction_trigger = if context_window > 0 {
+        context_window.saturating_mul(9) / 10
+    } else {
+        ACP_CONTEXT_WINDOW_TOKENS
+    };
     // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
     // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
     let resolver_session = session_id.to_string();
@@ -967,7 +1004,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         .conversation_compaction(
             CompactionConfig::builder()
                 .trigger_messages(0)
-                .trigger_tokens(ACP_CONTEXT_WINDOW_TOKENS)
+                .trigger_tokens(compaction_trigger)
                 .keep_messages(12)
                 .keep_tokens(-1)
                 .keep_tokens_min(2_000)
@@ -975,11 +1012,12 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
                 .keep_tokens_ratio(0.25)
                 .flush_before_compact(false)
                 .offload_before_compact(false)
-                .build(),
+                .build()
+                .scaled_for_window(context_window),
         )
         // 工具结果外置：超过 80k 字符的工具输出（如构建日志）写入磁盘，
         // context 只保留预览占位符，避免大输出驻留内存。
-        .tool_result_eviction(ToolResultEvictionConfig::defaults())
+        .tool_result_eviction(ToolResultEvictionConfig::defaults().scaled_for_window(context_window))
         .max_iters(9999)
         // 被中断/崩溃打断后，把悬挂的 tool_use 补成 error result 再续跑，避免
         // ToolCallPairSanitizer 静默丢弃整条 assistant 消息（对齐 Java maybePatchPendingToolCalls）。
@@ -1071,6 +1109,7 @@ fn init_logging() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
+    agentscope_core::model::catalog::ModelCatalog::global().spawn_background_refresh();
 
     // 三种 ACP 模式，分别映射到框架的权限模式（切换即时生效，作用于下一个请求）：
     // - plan (Plan)        -> PermissionMode::Explore  ：只读，写/执行类工具一律拒绝
@@ -1095,7 +1134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cfg = ModelConfig::load_or_create();
             let resolved = cfg.resolve_model(model_id)?;
             Ok(build_model(
-                model_id,
+                &resolved.model_id,
                 &resolved.base_url,
                 &resolved.api_key,
                 resolved.protocol,
@@ -1116,13 +1155,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // on the per-iteration checkpoint (`StateCheckpointMiddleware::on_reasoning`)
     // to cap the loss at the in-flight iteration.
     spawn_shutdown_handler(agent.session_registry());
+    spawn_catalog_forwarder(agent.session_registry());
 
     tracing::info!("ACP CodingAgent starting over stdio...");
     agent.run_stdio().await?;
     Ok(())
 }
 
-/// Waits for a shutdown signal: Ctrl-C on every platform, plus SIGTERM on unix.
+/// Forwards catalog content changes to live sessions as
+/// `ConfigOptionUpdate` + `UsageUpdate`.
+fn spawn_catalog_forwarder(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>) {
+    let catalog = agentscope_core::model::catalog::ModelCatalog::global();
+    let mut receiver = catalog.subscribe();
+    tokio::spawn(async move {
+        while receiver.changed().await.is_ok() {
+            let event = receiver.borrow_and_update().clone();
+            if event.changed_keys.is_empty() {
+                continue;
+            }
+            let guard = sessions.lock().unwrap();
+            for session in guard.values() {
+                let relevant = session
+                    .selected_catalog_key()
+                    .map(|key| event.changed_keys.contains(&key))
+                    .unwrap_or(true);
+                if relevant {
+                    session.push_config_update();
+                }
+            }
+        }
+    });
+}
+
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {

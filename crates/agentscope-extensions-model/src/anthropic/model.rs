@@ -12,6 +12,7 @@ use std::sync::Arc;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 
+use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
 use crate::anthropic::converter::{
@@ -36,6 +37,7 @@ pub struct AnthropicChatModel {
     stream: bool,
     cache_ttl: Option<String>,
     context_window_size: usize,
+    descriptor: Option<Arc<ModelDescriptor>>,
 }
 
 impl AnthropicChatModel {
@@ -47,8 +49,19 @@ impl AnthropicChatModel {
         base_url: Option<String>,
         transport: SharedTransport,
     ) -> Self {
+        let model_name = model_name.into();
+        let configured_base_url = base_url.clone();
+        let descriptor = descriptor_for(
+            Some("anthropic"),
+            &model_name,
+            configured_base_url.as_deref(),
+        );
+        let context_window_size = descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.context_window)
+            .unwrap_or(0);
         Self {
-            model_name: model_name.into(),
+            model_name,
             auth_mode,
             secret: secret.into(),
             base_url: base_url
@@ -58,7 +71,8 @@ impl AnthropicChatModel {
             default_options: GenerateOptions::default(),
             stream: true,
             cache_ttl: None,
-            context_window_size: 0,
+            context_window_size,
+            descriptor,
         }
     }
 
@@ -93,7 +107,9 @@ impl AnthropicChatModel {
 
     /// Sets the reported context window size in tokens.
     pub fn with_context_window_size(mut self, size: usize) -> Self {
-        self.context_window_size = size;
+        if size > 0 {
+            self.context_window_size = size;
+        }
         self
     }
 
@@ -159,6 +175,7 @@ impl Model for AnthropicChatModel {
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
     ) -> BoxStream<'_, Result<ChatResponse>> {
+        let options = crate::common::clamp_max_tokens(options, self.max_output_tokens());
         let stream_enabled = options.stream.unwrap_or(self.stream);
         Box::pin(async_stream::stream! {
             let spec = self.build_http_request(messages, tools, &options, stream_enabled);
@@ -233,6 +250,17 @@ impl Model for AnthropicChatModel {
 
     fn context_window_size(&self) -> usize {
         self.context_window_size
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.max_output)
+            .unwrap_or(0)
+    }
+
+    fn descriptor(&self) -> Option<&ModelDescriptor> {
+        self.descriptor.as_deref()
     }
 }
 

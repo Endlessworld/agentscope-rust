@@ -20,14 +20,15 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
-    CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionName,
-    FunctionObject, ReasoningEffort, ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
-    ToolChoiceOptions,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest, FinishReason,
+    FunctionCall, FunctionName, FunctionObject, ImageUrl, ReasoningEffort,
+    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema, ToolChoiceOptions,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
@@ -36,8 +37,9 @@ use futures::{StreamExt, TryStreamExt};
 use agentscope_core::error::{Error, Result};
 use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
 use agentscope_core::message::{
-    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock,
+    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock, ToolUseBlock,
 };
+use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
@@ -48,7 +50,7 @@ use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
 use crate::common::error::{ErrorKind, ModelError};
-use crate::common::{diagnostics, resolve_capabilities, usage};
+use crate::common::{diagnostics, resolve_capabilities_with, usage};
 
 /// Connection-establishment timeout for the underlying HTTP client.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -78,6 +80,7 @@ pub struct OpenAiChatModel {
     client: Client<OpenAIConfig>,
     model_name: String,
     capabilities: ModelCapabilities,
+    descriptor: Option<Arc<ModelDescriptor>>,
     /// Whether historical assistant `ThinkingBlock`s must be replayed as the
     /// `reasoning_content` request field. DeepSeek requires this whenever the
     /// request carries tools, or the API returns HTTP 400.
@@ -120,6 +123,7 @@ impl OpenAiChatModel {
         base_url: Option<String>,
     ) -> Result<Self> {
         let model_name = model_name.into();
+        let base_url_for_catalog = base_url.clone();
         let mut cfg = OpenAIConfig::new();
         if let Some(key) = api_key {
             cfg = cfg.with_api_key(key);
@@ -128,11 +132,20 @@ impl OpenAiChatModel {
             cfg = cfg.with_api_base(base);
         }
         let client = Client::with_config(cfg).with_http_client(build_http_client());
-        let context = resolve_context_window(&model_name);
+        let descriptor = descriptor_for(None, &model_name, base_url_for_catalog.as_deref());
+        let context = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.effective_context())
+            .unwrap_or_else(|| resolve_context_window(&model_name));
+        let reasoning_passback = descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.interleaved_field.is_some())
+            || Self::requires_reasoning_passback(&model_name);
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
-            reasoning_passback: Self::requires_reasoning_passback(&model_name),
+            descriptor,
+            reasoning_passback,
             strict_json_schema: None,
             model_name,
         })
@@ -159,6 +172,7 @@ impl OpenAiChatModel {
             Self::BASE_URL_ENV,
             "https://api.openai.com/v1",
         );
+        let base_url_for_catalog = base_url.clone();
         cfg = cfg.with_api_base(base_url);
         // Merge per-request additional headers into the client config.
         for (k, v) in &ctx.options.additional_headers {
@@ -169,7 +183,18 @@ impl OpenAiChatModel {
                 .map_err(|e| Error::Model(format!("failed to set header '{k}': {e}")))?;
         }
         let client = Client::with_config(cfg).with_http_client(build_http_client());
-        let context = resolve_context_window(&model_name);
+        let descriptor = ctx
+            .catalog
+            .clone()
+            .or_else(|| descriptor_for(Some(&ctx.provider_id), &model_name, Some(&base_url_for_catalog)));
+        let context = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.effective_context())
+            .unwrap_or_else(|| resolve_context_window(&model_name));
+        let reasoning_passback = descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.interleaved_field.is_some())
+            || Self::requires_reasoning_passback(&model_name);
         let strict_json_schema = ctx
             .options
             .additional_body_params
@@ -178,7 +203,8 @@ impl OpenAiChatModel {
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
-            reasoning_passback: Self::requires_reasoning_passback(&model_name),
+            descriptor,
+            reasoning_passback,
             strict_json_schema,
             model_name,
         })
@@ -203,6 +229,27 @@ impl Model for OpenAiChatModel {
             .model_name
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
+        if let Some(descriptor) = &self.descriptor {
+            if !descriptor.input_modalities.contains("image")
+                && messages.iter().any(has_image_block)
+            {
+                let message = format!(
+                    "model '{}' does not accept image input; switch to a vision-capable model",
+                    self.model_name
+                );
+                return futures::stream::once(async move { Err(Error::Model(message)) }).boxed();
+            }
+        }
+        let mut options = options;
+        if let Some(max_output) = self.descriptor.as_ref().map(|d| d.max_output) {
+            if max_output > 0 {
+                let max_output = max_output.min(u32::MAX as usize) as u32;
+                options.max_tokens = options.max_tokens.map(|value| value.min(max_output));
+                options.max_completion_tokens = options
+                    .max_completion_tokens
+                    .map(|value| value.min(max_output));
+            }
+        }
         // Vendor-specific body params (e.g. `enable_thinking`) must reach the
         // wire: `CreateChatCompletionRequest` has no extension field, so the
         // typed request is serialized to a JSON object and the extra params
@@ -211,6 +258,7 @@ impl Model for OpenAiChatModel {
         // Capture the transport mode before `options` is moved into the builder.
         // `None` keeps the historical streaming default.
         let streaming = options.stream.unwrap_or(true);
+        let capabilities = resolve_capabilities_with(&model_name, self.descriptor.as_deref());
         let (request, reasoning) = build_request(
             model_name,
             messages,
@@ -218,6 +266,7 @@ impl Model for OpenAiChatModel {
             options,
             self.reasoning_passback,
             self.strict_json_schema,
+            Some(capabilities),
         );
         // Serialize eagerly; on failure fall back to the typed request so the
         // call still proceeds (this can only fail on non-string map keys).
@@ -324,6 +373,17 @@ impl Model for OpenAiChatModel {
         self.capabilities.context_window_size
     }
 
+    fn max_output_tokens(&self) -> usize {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.max_output)
+            .unwrap_or(0)
+    }
+
+    fn descriptor(&self) -> Option<&ModelDescriptor> {
+        self.descriptor.as_deref()
+    }
+
     fn supports_native_structured_output(&self) -> bool {
         self.capabilities.native_structured_output
     }
@@ -394,6 +454,7 @@ fn build_request(
     options: GenerateOptions,
     reasoning_passback: bool,
     strict_json_schema: Option<bool>,
+    capabilities: Option<crate::common::ModelCapabilities>,
 ) -> (CreateChatCompletionRequest, Vec<Option<String>>) {
     let request_tools = to_request_tools(tools);
     let has_tools = request_tools.is_some();
@@ -426,7 +487,7 @@ fn build_request(
     // Resolve per-model capabilities so unsupported parameters are never sent
     // (reasoning models 400 on temperature/top_p/penalties/seed; several
     // gateways only accept `max_tokens`, not `max_completion_tokens`).
-    let caps = resolve_capabilities(&req.model);
+    let caps = capabilities.unwrap_or_else(|| crate::common::resolve_capabilities(&req.model));
     if !caps.supports_stream_options {
         req.stream_options = None;
     }
@@ -504,6 +565,48 @@ struct RequestMessages {
     reasoning: Vec<Option<String>>,
 }
 
+fn has_image_block(msg: &Msg) -> bool {
+    msg.content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)))
+}
+
+fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
+    let mut parts = Vec::new();
+    let mut has_image = false;
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text(text) if !text.text.is_empty() => {
+                parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText {
+                        text: text.text.clone(),
+                    },
+                ));
+            }
+            ContentBlock::Image(image) => {
+                has_image = true;
+                let url = match &image.source {
+                    Source::Url(source) => source.url.clone(),
+                    Source::Base64(source) => {
+                        format!("data:{};base64,{}", source.media_type, source.data)
+                    }
+                };
+                parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                    ChatCompletionRequestMessageContentPartImage {
+                        image_url: ImageUrl { url, detail: None },
+                    },
+                ));
+            }
+            _ => {}
+        }
+    }
+    if has_image {
+        ChatCompletionRequestUserMessageContent::Array(parts)
+    } else {
+        ChatCompletionRequestUserMessageContent::Text(extract_text_content(msg))
+    }
+}
+
 fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestMessages {
     let mut out = Vec::new();
     let mut reasoning = Vec::new();
@@ -523,9 +626,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
             MsgRole::User => {
                 out.push(ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Text(
-                            extract_text_content(&msg),
-                        ),
+                        content: user_message_content(&msg),
                         name: None,
                     },
                 ));
@@ -1049,7 +1150,10 @@ fn completion_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::message::{Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+    use agentscope_core::message::{
+        Base64Source, ContentBlock, ImageBlock, Msg, MsgRole, TextBlock, ToolResultBlock,
+        ToolUseBlock,
+    };
     use async_openai::types::chat::FunctionCallStream;
 
     fn sample_msg() -> Msg {
@@ -1076,6 +1180,34 @@ mod tests {
     }
 
     #[test]
+    fn user_image_becomes_data_url_part() {
+        let msg = Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("look")),
+            ContentBlock::Image(ImageBlock::new(
+                agentscope_core::message::Source::Base64(Base64Source::new(
+                    "image/png",
+                    "iVBORw0KGgo=",
+                )),
+            )),
+        ]);
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            vec![msg],
+            vec![],
+            GenerateOptions::default(),
+            false,
+            None,
+            None,
+        );
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "look");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn reasoning_model_drops_unsupported_sampling_params() {
         let options = GenerateOptions {
@@ -1086,7 +1218,7 @@ mod tests {
             max_tokens: Some(100),
             ..Default::default()
         };
-        let (req, _) = build_request("o3-mini".into(), vec![sample_msg()], vec![], options, false, None);
+        let (req, _) = build_request("o3-mini".into(), vec![sample_msg()], vec![], options, false, None, None);
         assert!(req.temperature.is_none(), "o3 rejects temperature");
         assert!(req.top_p.is_none(), "o3 rejects top_p");
         assert!(req.frequency_penalty.is_none(), "o3 rejects penalties");
@@ -1100,7 +1232,7 @@ mod tests {
     fn compatible_gateway_uses_legacy_max_tokens() {
         let options = GenerateOptions { max_tokens: Some(64), temperature: Some(0.2), ..Default::default() };
         let (req, _) =
-            build_request("deepseek-chat".into(), vec![sample_msg()], vec![], options, false, None);
+            build_request("deepseek-chat".into(), vec![sample_msg()], vec![], options, false, None, None);
         assert_eq!(req.max_tokens, Some(64));
         assert!(req.max_completion_tokens.is_none());
         assert_eq!(req.temperature, Some(0.2), "deepseek accepts temperature");
@@ -1550,6 +1682,7 @@ mod tests {
             options,
             false,
             None,
+            None,
         );
         let body = serde_json::to_value(&req).unwrap();
         assert_eq!(body["stream"], serde_json::json!(false));
@@ -1634,6 +1767,7 @@ mod tests {
             vec![],
             GenerateOptions::default(),
             false,
+            None,
             None,
         );
         assert_eq!(req.stream, Some(true));

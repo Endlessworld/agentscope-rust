@@ -166,6 +166,14 @@ impl ContextTracker {
 
     /// Materializes the current effective-context snapshot.
     pub fn snapshot(&self) -> ContextSnapshot {
+        let catalog = agentscope_core::model::catalog::ModelCatalog::global();
+        let resolution = catalog.resolve(
+            &agentscope_core::model::catalog::ResolveRequest::new(&self.model),
+        );
+        let catalog_key = resolution
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.key.clone());
         ContextSnapshot::builder(self.session_id.clone())
             .system_prompt(self.system_prompt.clone())
             .messages(self.messages.clone())
@@ -178,6 +186,7 @@ impl ContextTracker {
             .max_tokens(self.max_tokens)
             .framework(self.framework.clone())
             .model(self.model.clone())
+            .catalog(catalog_key, catalog.generation())
             .captured_at(chrono::Utc::now().timestamp_millis())
             .build()
     }

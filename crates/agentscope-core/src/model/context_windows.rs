@@ -1,8 +1,8 @@
 //! Context window table for well-known models, mirroring `ModelContextWindows`.
 //!
 //! Resolution is done by **longest prefix match**: a model id like
-//! `gpt-4o-2024-05-13` matches the `gpt-4o` entry; `deepseek-chat` matches the
-//! `deepseek` entry. Unknown models fall back to the default (128k).
+//! `gpt-4o-2024-05-13` matches the `gpt-4o` entry. Unknown models fall back to
+//! the default (256k).
 
 /// Longest-prefix-match table of model id prefixes to context window token counts.
 pub const CONTEXT_WINDOW_TABLE: &[(&str, usize)] = &[
@@ -19,10 +19,8 @@ pub const CONTEXT_WINDOW_TABLE: &[(&str, usize)] = &[
     ("o3-mini", 200_000),
     ("o3", 200_000),
     ("o1", 200_000),
-    // DeepSeek
-    ("deepseek-reasoner", 64_000),
-    ("deepseek-chat", 64_000),
-    ("deepseek", 64_000),
+    // DeepSeek: current models are >=200k and the catalog supersedes this table;
+    // no 64k entries here. Unknown DeepSeek ids fall back to 256k.
     // GLM / Zhipu
     ("glm-4", 128_000),
     ("glm", 128_000),
@@ -49,7 +47,7 @@ pub const CONTEXT_WINDOW_TABLE: &[(&str, usize)] = &[
 ];
 
 /// Default context window size (in tokens) used when no prefix matches.
-pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+pub const DEFAULT_CONTEXT_WINDOW: usize = 256_000;
 
 /// Resolves the context window size for the given model id using longest-prefix
 /// matching against [`CONTEXT_WINDOW_TABLE`]. Returns [`DEFAULT_CONTEXT_WINDOW`]
@@ -77,7 +75,7 @@ mod tests {
 
     #[test]
     fn exact_and_family() {
-        assert_eq!(resolve_context_window("deepseek-chat"), 64_000);
+        assert_eq!(resolve_context_window("deepseek-chat"), 256_000);
         assert_eq!(resolve_context_window("claude-3-7-sonnet-20250219"), 200_000);
         assert_eq!(resolve_context_window("grok-3"), 131_072);
     }

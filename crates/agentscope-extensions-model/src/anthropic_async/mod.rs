@@ -37,6 +37,7 @@ use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_con
 use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ToolUseBlock,
 };
+use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
@@ -55,6 +56,7 @@ pub struct AnthropicMessagesModel {
     client: Client,
     model_name: String,
     capabilities: ModelCapabilities,
+    descriptor: Option<Arc<ModelDescriptor>>,
 }
 
 impl AnthropicMessagesModel {
@@ -64,8 +66,10 @@ impl AnthropicMessagesModel {
         api_key: Option<String>,
         base_url: Option<String>,
     ) -> Result<Self> {
+        let model_name = model_name.into();
+        let descriptor = descriptor_for(None, &model_name, base_url.as_deref());
         let no_headers = std::collections::HashMap::new();
-        Self::build(model_name.into(), api_key, base_url, &no_headers)
+        Self::build(model_name, api_key, base_url, &no_headers, descriptor)
     }
 
     /// Creates a model from a [`ModelCreationContext`].
@@ -78,11 +82,19 @@ impl AnthropicMessagesModel {
         } else {
             ctx.model.clone()
         };
+        let descriptor = ctx.catalog.clone().or_else(|| {
+            descriptor_for(
+                Some(&ctx.provider_id),
+                &model_name,
+                ctx.base_url.as_deref(),
+            )
+        });
         Self::build(
             model_name,
             ctx.api_key.clone(),
             ctx.base_url.clone(),
             &ctx.options.additional_headers,
+            descriptor,
         )
     }
 
@@ -91,6 +103,7 @@ impl AnthropicMessagesModel {
         api_key: Option<String>,
         base_url: Option<String>,
         additional_headers: &std::collections::HashMap<String, String>,
+        descriptor: Option<Arc<ModelDescriptor>>,
     ) -> Result<Self> {
         // `async-anthropic` sends every request through `Client::http_client`,
         // so per-request additional headers (e.g. `x-opencode-session`) are
@@ -130,10 +143,14 @@ impl AnthropicMessagesModel {
             .build()
             .map_err(|e| Error::Model(format!("failed to build anthropic client: {e}")))?;
 
-        let context = resolve_context_window(&model_name);
+        let context = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.effective_context())
+            .unwrap_or_else(|| resolve_context_window(&model_name));
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
+            descriptor,
             model_name,
         })
     }
@@ -152,6 +169,7 @@ impl Model for AnthropicMessagesModel {
             .model_name
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
+        let options = crate::common::clamp_max_tokens(options, self.max_output_tokens());
         let request = build_request(model_name, messages, tools, options);
 
         let setup = futures::stream::once(async move {
@@ -195,6 +213,17 @@ impl Model for AnthropicMessagesModel {
 
     fn context_window_size(&self) -> usize {
         self.capabilities.context_window_size
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.max_output)
+            .unwrap_or(0)
+    }
+
+    fn descriptor(&self) -> Option<&ModelDescriptor> {
+        self.descriptor.as_deref()
     }
 
     fn supports_native_structured_output(&self) -> bool {

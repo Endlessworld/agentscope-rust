@@ -15,8 +15,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use agentscope_core::event::{AgentEvent, ConfirmResult};
-use agentscope_core::message::{ChatUsage, ToolUseBlock};
-use agentscope_core::model::GenerateOptions;
+use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
+use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
 
@@ -29,7 +29,7 @@ use super::permission_store::PermissionRuleStore;
 use super::support::ClientSupport;
 
 /// Current configuration of an ACP session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionConfig {
     pub model: String,
     pub mode: String,
@@ -71,6 +71,14 @@ impl AcpClientHandle {
     /// Wraps an agent-side connection whose counterpart is the ACP client.
     pub(crate) fn new(connection: ConnectionTo<Client>) -> Self {
         Self { connection }
+    }
+
+    /// Pushes a `session/update` notification to the client.
+    pub(crate) fn notify(
+        &self,
+        notification: agent_client_protocol::schema::v1::SessionNotification,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.connection.send_notification(notification)
     }
 
     /// Asks the client to request the user's permission for `tool_call`,
@@ -261,8 +269,10 @@ fn acp_confirm_handler(
 /// Maps a thought level to per-call generation defaults.
 ///
 /// - `auto` (default): sends nothing — the provider default applies.
-/// - Any explicit level: `reasoning_effort` (the official field), `max`
-///   clamped to `high` (no `xhigh`).
+/// - Explicit levels pass through unchanged (`max` is no longer clamped to
+///   `high`); catalog validation decides whether the selected model accepts it.
+/// - `off` / `disabled` / `none` map to `reasoning_effort: "none"` only when the
+///   catalog advertised that value (the session validates before applying).
 ///
 /// Vendor-specific body params (`enable_thinking` / `thinking_budget`) are
 /// never sent: strict OpenAI-compatible gateways (e.g. the Go/Zen gateways)
@@ -273,8 +283,7 @@ fn thought_level_params(level: &str) -> GenerateOptions {
         return GenerateOptions::default();
     }
     let effort = match level {
-        "disabled" | "none" => "minimal",
-        "max" => "high",
+        "off" | "disabled" | "none" => "none",
         other => other,
     };
     GenerateOptions::builder().reasoning_effort(effort).build()
@@ -329,9 +338,9 @@ pub struct AcpAgentSession {
     cancel: Arc<AtomicBool>,
     usage: ChatUsage,
     /// Client connection used to push `session/request_permission` requests
-    /// when a tool call needs human confirmation. Set per prompt by the
-    /// connection layer (the coding agent has the live `ConnectionTo`).
-    client: Option<Arc<AcpClientHandle>>,
+    /// when a tool call needs human confirmation. Shared across clones so a
+    /// background catalog task can also push config/usage updates.
+    client: Arc<Mutex<Option<Arc<AcpClientHandle>>>>,
     /// Shared slot the `ask_user` tool reads the live connection from. It is
     /// filled whenever [`set_client`](Self::set_client) binds a connection; the
     /// tool holds the same `Arc`, so it sees the update without being rebuilt.
@@ -357,10 +366,47 @@ pub struct AcpAgentSession {
     turn_usage: ChatUsage,
     /// Workspace roots beyond `cwd`, reported in `session/list`.
     additional_directories: Vec<PathBuf>,
+    /// Sidecar file used to restore `{model, mode, thought_level}` after a restart.
+    config_path: PathBuf,
     /// Client-visible session title, if one was set.
     title: Option<String>,
     /// ISO-8601 timestamp of the last prompt turn.
     updated_at: Option<String>,
+}
+
+fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf {
+    let safe: String = session_id
+        .to_string()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect();
+    cwd.join(".agentscope")
+        .join("acp-sessions")
+        .join(format!("{safe}.json"))
+}
+
+fn load_session_config(path: &std::path::Path) -> Option<SessionConfig> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_session_config(path: &std::path::Path, config: &SessionConfig) {
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(path = %parent.display(), %error, "failed to create ACP session config directory");
+            return;
+        }
+    }
+    match serde_json::to_vec_pretty(config) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(path, bytes) {
+                tracing::warn!(path = %path.display(), %error, "failed to persist ACP session config");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to serialize ACP session config");
+        }
+    }
 }
 
 impl AcpAgentSession {
@@ -373,6 +419,40 @@ impl AcpAgentSession {
         modes: Vec<ModeChoice>,
     ) -> Self {
         let permission_store = Arc::new(PermissionRuleStore::at_dir(&cwd));
+        let config_path = session_config_path(&cwd, &session_id);
+        let persisted = load_session_config(&config_path);
+        let actual_model = agent
+            .model()
+            .map(|model| model.model_name().to_string())
+            .unwrap_or_default();
+        let initial_model = persisted
+            .as_ref()
+            .map(|config| config.model.clone())
+            .filter(|model| models.iter().any(|choice| choice.id == *model))
+            .unwrap_or_else(|| {
+                if models.iter().any(|choice| choice.id == actual_model) {
+                    actual_model.clone()
+                } else {
+                    models
+                        .first()
+                        .map(|choice| choice.id.clone())
+                        .unwrap_or_else(|| "default".to_string())
+                }
+            });
+        let initial_mode = persisted
+            .as_ref()
+            .map(|config| config.mode.clone())
+            .filter(|mode| modes.iter().any(|choice| choice.id == *mode))
+            .unwrap_or_else(|| SessionConfig::default().mode);
+        let initial_thought = persisted
+            .as_ref()
+            .map(|config| config.thought_level.clone())
+            .filter(|level| {
+                super::config::thought_level_ids_for(&initial_model, &models)
+                    .iter()
+                    .any(|id| id == level)
+            })
+            .unwrap_or_else(|| super::config::DEFAULT_THOUGHT_LEVEL.to_string());
         let mut session = Self {
             session_id,
             cwd,
@@ -381,10 +461,10 @@ impl AcpAgentSession {
             models,
             modes,
             model_builder: None,
-            applied_model: String::new(),
+            applied_model: actual_model,
             cancel: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
-            client: None,
+            client: Arc::new(Mutex::new(None)),
             elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
@@ -393,9 +473,16 @@ impl AcpAgentSession {
             turn_usage: ChatUsage::default(),
             mcp_acp_connections: Arc::new(Mutex::new(Vec::new())),
             additional_directories: Vec::new(),
+            config_path,
             title: None,
             updated_at: None,
         };
+        {
+            let mut config = session.config.lock().unwrap();
+            config.model = initial_model;
+            config.mode = initial_mode;
+            config.thought_level = initial_thought;
+        }
         session.apply_mode();
         session
     }
@@ -524,6 +611,25 @@ impl AcpAgentSession {
     /// Sets the current model.
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.config.lock().unwrap().model = model.into();
+        self.persist_config();
+    }
+
+    fn persist_config(&self) {
+        let config = self.config.lock().unwrap().clone();
+        save_session_config(&self.config_path, &config);
+    }
+
+    /// Whether `model` is one of the advertised choices.
+    pub fn has_model(&self, model: &str) -> bool {
+        self.models.iter().any(|choice| choice.id == model)
+    }
+
+    /// Whether `level` is valid for the currently selected model.
+    pub fn has_thought_level(&self, level: &str) -> bool {
+        let model = self.config.lock().unwrap().model.clone();
+        let ids = super::config::thought_level_ids_for(&model, &self.models);
+        ids.iter().any(|id| id == level)
+            || (ids.is_empty() && level == super::config::DEFAULT_THOUGHT_LEVEL)
     }
 
     /// Installs the resolver used for dynamic model switching: a closure that
@@ -591,6 +697,7 @@ impl AcpAgentSession {
     /// / `max`). Applied on the next prompt.
     pub fn set_thought_level(&mut self, level: impl Into<String>) {
         self.config.lock().unwrap().thought_level = level.into();
+        self.persist_config();
     }
     /// Sets the current mode.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
@@ -598,6 +705,7 @@ impl AcpAgentSession {
         // Apply the mode's permission context to the live agent so the *next*
         // request already runs under the new rules.
         self.apply_mode();
+        self.persist_config();
     }
 
     /// Reconfigures the underlying agent's permission engine to match the
@@ -630,7 +738,7 @@ impl AcpAgentSession {
         // slot across prompts, so it never needs rebuilding).
         let erased: Arc<dyn ElicitationClient> = handle.clone();
         *self.elicitation_slot.lock().unwrap() = Some(erased);
-        self.client = Some(handle);
+        *self.client.lock().unwrap() = Some(handle);
     }
 
     /// The slot the `ask_user` tool reads the live connection from. Shared with
@@ -649,11 +757,11 @@ impl AcpAgentSession {
     /// Installs (or removes) the confirm handler that performs the ACP
     /// permission round-trip. Called at the start of every prompt run.
     fn install_confirm_handler(&self) {
-        match &self.client {
+        match self.client.lock().unwrap().clone() {
             Some(client) => {
                 let handler = acp_confirm_handler(
                     self.session_id.clone(),
-                    Arc::clone(client),
+                    Arc::clone(&client),
                     Arc::clone(&self.agent),
                     Arc::clone(&self.permission_store),
                 );
@@ -787,7 +895,7 @@ impl AcpAgentSession {
             }
             bridged.push(name.clone());
         }
-        let Some(client) = self.client.clone() else {
+        let Some(client) = self.client.lock().unwrap().clone() else {
             tracing::warn!(
                 session = %self.session_id,
                 server = %name,
@@ -835,7 +943,12 @@ impl AcpAgentSession {
 
     /// Returns the session config options advertised to the client.
     pub fn config_options(&self) -> Vec<SessionConfigOption> {
-        let cfg = self.config.lock().unwrap();
+        let mut cfg = self.config.lock().unwrap();
+        let valid_levels = super::config::thought_level_ids_for(&cfg.model, &self.models);
+        if !valid_levels.iter().any(|id| id == &cfg.thought_level) {
+            cfg.thought_level = super::config::DEFAULT_THOUGHT_LEVEL.to_string();
+            save_session_config(&self.config_path, &cfg);
+        }
         super::config::default_config_options_with_thought(
             &cfg.model,
             &self.models,
@@ -843,6 +956,38 @@ impl AcpAgentSession {
             &self.modes,
             &cfg.thought_level,
         )
+    }
+
+    /// Catalog descriptor for the currently selected model, when available.
+    pub fn selected_descriptor(&self) -> Option<std::sync::Arc<agentscope_core::model::catalog::ModelDescriptor>> {
+        let model = self.config.lock().unwrap().model.clone();
+        self.models
+            .iter()
+            .find(|choice| choice.id == model)
+            .and_then(super::config::resolve_choice)
+    }
+
+    /// Catalog key for the currently selected model, when available.
+    pub fn selected_catalog_key(&self) -> Option<String> {
+        self.selected_descriptor().map(|descriptor| descriptor.key.clone())
+    }
+
+    /// Pushes `ConfigOptionUpdate` + `UsageUpdate` to the bound client. Used by the
+    /// background catalog task; a no-op when the session has no live connection.
+    pub fn push_config_update(&self) {
+        let Some(client) = self.client.lock().unwrap().clone() else {
+            return;
+        };
+        let options = self.config_options();
+        let config = agent_client_protocol::schema::v1::SessionNotification::new(
+            self.session_id.clone(),
+            agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+                agent_client_protocol::schema::v1::ConfigOptionUpdate::new(options),
+            ),
+        );
+        let _ = client.notify(config);
+        let used = self.usage.input_tokens;
+        let _ = client.notify(self.usage_notification(used));
     }
 
     /// Cancels any active prompt request.
@@ -879,6 +1024,149 @@ impl AcpAgentSession {
         self.run_prompt_inner(content, emit, None).await
     }
 
+    /// Converts ACP content blocks into a core user message, rejecting unsupported media
+    /// before any model call is made.
+    fn convert_prompt_blocks(
+        content: Vec<ContentBlock>,
+        descriptor: Option<&agentscope_core::model::catalog::ModelDescriptor>,
+    ) -> std::result::Result<Msg, String> {
+        use agentscope_core::message::{
+            AudioBlock, Base64Source, DataBlock, ImageBlock, Source, TextBlock,
+        };
+
+        const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+        const MAX_IMAGES: usize = 8;
+        const MAX_TOTAL_BYTES: usize = 30 * 1024 * 1024;
+
+        let accepts_image = descriptor
+            .map(|descriptor| descriptor.input_modalities.contains("image"))
+            .unwrap_or(false);
+        let accepts_audio = descriptor
+            .map(|descriptor| descriptor.input_modalities.contains("audio"))
+            .unwrap_or(false);
+
+        let mut blocks: Vec<agentscope_core::message::ContentBlock> = Vec::new();
+        let mut image_count = 0usize;
+        let mut total_bytes = 0usize;
+
+        for block in content {
+            match block {
+                ContentBlock::Text(text) => {
+                    if !text.text.is_empty() {
+                        blocks.push(agentscope_core::message::ContentBlock::Text(
+                            TextBlock::new(text.text),
+                        ));
+                    }
+                }
+                ContentBlock::Image(image) => {
+                    if !accepts_image {
+                        return Err(
+                            "the selected model does not accept image input; switch to a vision-capable model"
+                                .to_string(),
+                        );
+                    }
+                    let bytes = image.data.len();
+                    if bytes > MAX_IMAGE_BYTES {
+                        return Err(format!("image is too large ({bytes} bytes; limit {MAX_IMAGE_BYTES})"));
+                    }
+                    image_count += 1;
+                    total_bytes += bytes;
+                    if image_count > MAX_IMAGES {
+                        return Err(format!("too many images (limit {MAX_IMAGES})"));
+                    }
+                    let mime = if image.mime_type.trim().is_empty() {
+                        "image/png".to_string()
+                    } else {
+                        image.mime_type
+                    };
+                    blocks.push(agentscope_core::message::ContentBlock::Image(
+                        ImageBlock::new(Source::Base64(Base64Source::new(mime, image.data))),
+                    ));
+                }
+                ContentBlock::Audio(audio) => {
+                    if !accepts_audio {
+                        return Err(
+                            "the selected model does not accept audio input".to_string(),
+                        );
+                    }
+                    let bytes = audio.data.len();
+                    total_bytes += bytes;
+                    let mime = if audio.mime_type.trim().is_empty() {
+                        "audio/mpeg".to_string()
+                    } else {
+                        audio.mime_type
+                    };
+                    blocks.push(agentscope_core::message::ContentBlock::Audio(
+                        AudioBlock::new(Source::Base64(Base64Source::new(mime, audio.data))),
+                    ));
+                }
+                ContentBlock::ResourceLink(link) => {
+                    blocks.push(agentscope_core::message::ContentBlock::Text(
+                        TextBlock::new(format!("[{}]({})", link.name, link.uri)),
+                    ));
+                }
+                ContentBlock::Resource(resource) => match resource.resource {                    agent_client_protocol::schema::v1::EmbeddedResourceResource::TextResourceContents(text) => {
+                        blocks.push(agentscope_core::message::ContentBlock::Text(
+                            TextBlock::new(text.text),
+                        ));
+                    }
+                    agent_client_protocol::schema::v1::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                        let mime = blob.mime_type.unwrap_or_default();
+                        if mime.starts_with("image/") {
+                            if !accepts_image {
+                                return Err(
+                                    "the selected model does not accept image input".to_string(),
+                                );
+                            }
+                            blocks.push(agentscope_core::message::ContentBlock::Image(
+                                ImageBlock::new(Source::Base64(Base64Source::new(
+                                    if mime.trim().is_empty() {
+                                        "image/png".to_string()
+                                    } else {
+                                        mime
+                                    },
+                                    blob.blob,
+                                ))),
+                            ));
+                        } else if mime == "application/pdf" {
+                            if !descriptor
+                                .map(|descriptor| descriptor.attachment)
+                                .unwrap_or(false)
+                            {
+                                return Err(
+                                    "the selected model does not accept PDF attachments".to_string(),
+                                );
+                            }
+                            blocks.push(agentscope_core::message::ContentBlock::Data(
+                                DataBlock::new(Source::Base64(Base64Source::new(mime, blob.blob))),
+                            ));
+                        } else {
+                            return Err(format!(
+                                "unsupported embedded resource type '{mime}'"
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err("unsupported embedded resource".to_string());
+                    }
+                },
+                _ => {
+                    return Err("unsupported prompt content block".to_string());
+                }
+            }
+        }
+
+        if total_bytes > MAX_TOTAL_BYTES {
+            return Err(format!(
+                "prompt attachments are too large ({total_bytes} bytes; limit {MAX_TOTAL_BYTES})"
+            ));
+        }
+        if blocks.is_empty() {
+            return Err("the prompt contains no supported content".to_string());
+        }
+        Ok(Msg::user_blocks(blocks))
+    }
+
     /// Shared implementation for [`run_prompt`](Self::run_prompt) and
     /// [`run_prompt_cancellable`](Self::run_prompt_cancellable).
     async fn run_prompt_inner<F>(
@@ -913,17 +1201,20 @@ impl AcpAgentSession {
         // shows the current `updatedAt` without a separate `session/list` call.
         self.updated_at = Some(chrono::Utc::now().to_rfc3339());
         emit(self.session_info_update());
-        // Convert ACP content blocks into one prompt string; the session runtime wraps it in
-        // the user message that becomes the turn's admitted input.
-        let mut text = String::new();
-        for block in content {
-            if let ContentBlock::Text(t) = block {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&t.text);
+        // Convert ACP content blocks into a core user message; unsupported media is
+        // rejected before any model call so the client gets a readable reason.
+        let descriptor = self.selected_descriptor();
+        let message = match Self::convert_prompt_blocks(content, descriptor.as_deref()) {
+            Ok(message) => message,
+            Err(error) => {
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Unsupported prompt content: {error}"),
+                    None,
+                ));
+                return StopReason::Refusal;
             }
-        }
+        };
         // Run the turn through the session runtime instead of driving `stream_events`
         // directly: the runtime owns the journal writer, restores the committed state from
         // the journal before the run, and admits steering/interrupts. This client only
@@ -945,7 +1236,7 @@ impl AcpAgentSession {
             // unaffected, so dropping the event here is safe.
             let _ = events_tx.send(event.clone());
         }));
-        let task = match session.submit(text).await {
+        let task = match session.submit_msg(message).await {
             Ok(task) => task,
             Err(error) => {
                 emit(super::event::message_chunk(
@@ -1196,7 +1487,7 @@ impl AcpAgentSession {
     /// Builds the ACP `UsageUpdate` notification: `used` is the tokens in
     /// context (latest model-call input tokens, falling back to the cumulative
     /// count), `size` is the live model's context window.
-    fn usage_notification(
+    pub(crate) fn usage_notification(
         &self,
         used: u64,
     ) -> agent_client_protocol::schema::v1::SessionNotification {
@@ -1205,7 +1496,7 @@ impl AcpAgentSession {
             .agent
             .agent()
             .map(|a| a.model().context_window_size() as u64)
-            .unwrap_or(128_000);
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW as u64);
         SessionNotification::new(
             self.session_id.clone(),
             SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
@@ -1250,11 +1541,13 @@ mod tests {
     #[test]
     fn explicit_levels_send_only_reasoning_effort() {
         for (level, expected) in [
-            ("disabled", Some("minimal")),
+            ("off", Some("none")),
+            ("disabled", Some("none")),
             ("low", Some("low")),
             ("medium", Some("medium")),
             ("high", Some("high")),
-            ("max", Some("high")),
+            ("xhigh", Some("xhigh")),
+            ("max", Some("max")),
         ] {
             let opts = thought_level_params(level);
             assert_eq!(opts.reasoning_effort.as_deref(), expected, "level {level}");

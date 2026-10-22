@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, ToolResultBlock};
-use agentscope_core::model::{GenerateOptions, Model, ToolSchema};
+use agentscope_core::model::catalog::{MAX_SAFETY_MARGIN, DEFAULT_RESERVED_OUTPUT};
+use agentscope_core::model::{GenerateOptions, Model, ToolSchema, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::state::TaskContextState;
 
 use super::item::{ContextItem, ContextItemPlacement, ContextPurpose};
@@ -341,9 +342,18 @@ impl ContextPipeline {
                 task_revision,
             );
             self.observe(&manifest);
+            let (window, reserved, safety, budget_limit) =
+                self.budget_breakdown(model.as_ref(), &options);
+            let catalog_key = model
+                .descriptor()
+                .map(|descriptor| descriptor.key.as_str())
+                .unwrap_or("-");
             return Err(crate::Error::Agent(format!(
-                "Prepared model input exceeds budget: estimated={}, limit={limit}",
-                estimate.tokens
+                "Prepared model input exceeds budget (local): model={}, catalogKey={catalog_key}, \
+                 estimated={}, limit={budget_limit}, window={window}, reserved_output={reserved}, \
+                 safety_margin={safety}",
+                model.model_name(),
+                estimate.tokens,
             )));
         }
 
@@ -436,6 +446,15 @@ impl ContextPipeline {
             purpose: request.purpose.as_str().to_string(),
             model: model.model_name().to_string(),
             policy_version: ContextManifest::POLICY_VERSION.to_string(),
+            context_window: model.context_window_size() as i64,
+            catalog_generation: if model.descriptor().is_some() {
+                agentscope_core::model::catalog::ModelCatalog::global().generation()
+            } else {
+                0
+            },
+            catalog_key: model
+                .descriptor()
+                .map(|descriptor| descriptor.key.clone()),
             estimated_input_tokens: estimate.tokens,
             input_limit: limit,
             counting_method: estimate.method.clone(),
@@ -507,13 +526,25 @@ impl ContextPipeline {
     /// Zero policy limits derive from the model window; an unknown window falls back to a
     /// conservative constant so the budget stays meaningful.
     fn input_limit(&self, model: &dyn Model, options: &GenerateOptions) -> i64 {
+        self.budget_breakdown(model, options).3
+    }
+
+    /// Returns `(window, reserved_output, safety_margin, final_limit)`.
+    fn budget_breakdown(
+        &self,
+        model: &dyn Model,
+        options: &GenerateOptions,
+    ) -> (i64, i64, i64, i64) {
         let window = model.context_window_size() as i64;
         let mut output = self.config.policy.reserved_output_tokens as i64;
         if output == 0 {
             output = if window > 0 {
-                std::cmp::min(4096, std::cmp::max(1, window / 8))
+                std::cmp::min(
+                    DEFAULT_RESERVED_OUTPUT as i64,
+                    std::cmp::max(1, window / 8),
+                )
             } else {
-                4096
+                DEFAULT_RESERVED_OUTPUT as i64
             };
         }
         if let Some(max_tokens) = options.max_tokens {
@@ -522,23 +553,31 @@ impl ContextPipeline {
         if let Some(max_completion) = options.max_completion_tokens {
             output = std::cmp::max(output, max_completion as i64);
         }
+        let model_max_output = model.max_output_tokens() as i64;
+        if model_max_output > 0 {
+            output = std::cmp::min(output, model_max_output);
+        }
         let safety = if self.config.policy.safety_margin_tokens > 0 {
             self.config.policy.safety_margin_tokens as i64
         } else if window > 0 {
-            std::cmp::max(1, window / 50)
+            std::cmp::min(
+                MAX_SAFETY_MARGIN as i64,
+                std::cmp::max(1, window / 50),
+            )
         } else {
             1024
         };
         let limit = if window > 0 {
             std::cmp::max(0, window - output - safety)
         } else {
-            64000
+            DEFAULT_CONTEXT_WINDOW as i64
         };
-        if self.config.policy.max_input_tokens > 0 {
+        let limit = if self.config.policy.max_input_tokens > 0 {
             std::cmp::min(limit, self.config.policy.max_input_tokens as i64)
         } else {
             limit
-        }
+        };
+        (window, output, safety, limit)
     }
 }
 
@@ -947,7 +986,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // window - min(4096, window/8) - window/50 = 100000 - 4096 - 2000.
-        assert_eq!(prepared.manifest.input_limit, 93_904);
+        // window - min(8192, window/8) - window/50 = 100000 - 8192 - 2000.
+        assert_eq!(prepared.manifest.input_limit, 89_808);
     }
 }
