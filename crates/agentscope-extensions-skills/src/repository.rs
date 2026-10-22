@@ -83,6 +83,14 @@ pub trait AgentSkillRepository: Send + Sync {
     /// Whether write operations are supported.
     fn is_writeable(&self) -> bool;
 
+    /// Enables or disables write operations at runtime.
+    ///
+    /// Mirrors Java `AgentSkillRepository#setWriteable(boolean)`. Implementations store the
+    /// flag with interior mutability so callers can toggle it through `&self`; the concrete
+    /// SQL backends honour it in `save` / `delete` / `clear_all`, while read-only backends
+    /// (git) ignore it exactly as Java's `GitSkillRepository` does.
+    fn set_writeable(&self, writeable: bool);
+
     /// Releases any resources held by the repository. Default: no-op.
     fn close(&self) -> Result<(), SkillRepositoryError> {
         Ok(())
@@ -213,6 +221,7 @@ mod tests {
         fn is_writeable(&self) -> bool {
             false
         }
+        fn set_writeable(&self, _writeable: bool) {}
     }
 
     fn skill(name: &str) -> AgentSkill {

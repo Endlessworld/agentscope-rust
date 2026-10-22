@@ -92,10 +92,18 @@ impl MysqlSkillRepositoryConfig {
 }
 
 /// MySQL-based [`AgentSkillRepository`] implementation.
+///
+/// **已废弃（仅兼容，勿扩展）**：Java 侧 `MysqlSkillRepository` 已标 `@Deprecated`，
+/// 官方替代是按 namespace 分区的 `JdbcAgentSkillRepository`。按 `EXTENSIONS_GAP_TRACKER.md`
+/// §4.5 裁定 2，Rust 侧在 `agentscope-extensions-jdbc` 实现该替代，本类型仅保留以兼容
+/// 既有调用方；**不要在此新增功能**。
 pub struct MysqlSkillRepository<D: SqlDatabase> {
     db: Arc<D>,
     cfg: MysqlSkillRepositoryConfig,
     metadata_json_supported: bool,
+    /// Runtime write flag (Java MysqlSkillRepository#writeable), toggled by
+    /// `set_writeable`.
+    writeable: std::sync::atomic::AtomicBool,
 }
 
 impl<D: SqlDatabase> MysqlSkillRepository<D> {
@@ -117,10 +125,12 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
             MAX_IDENTIFIER_LENGTH,
         )?;
 
+        let cfg_writeable = cfg.writeable;
         let mut repo = Self {
             db,
             cfg,
             metadata_json_supported: false,
+            writeable: std::sync::atomic::AtomicBool::new(cfg_writeable),
         };
         if repo.cfg.create_if_not_exist {
             repo.create_tables_if_not_exist()?;
@@ -137,6 +147,11 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
     /// The resources table name.
     pub fn resources_table_name(&self) -> &str {
         &self.cfg.resources_table_name
+    }
+
+    /// The live write flag; reflects any `AgentSkillRepository::set_writeable` call.
+    fn writeable(&self) -> bool {
+        self.writeable.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the current schema exposes a `metadata_json` column.
@@ -316,7 +331,7 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
 
     /// Clears all skills (resources cascade). Returns the number of skills deleted.
     pub fn clear_all_skills(&self) -> Result<usize, SkillRepositoryError> {
-        if !self.cfg.writeable {
+        if !self.writeable() {
             tracing::warn!("cannot clear skills: repository is read-only");
             return Ok(0);
         }
@@ -433,7 +448,7 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
         if skills.is_empty() {
             return Ok(false);
         }
-        if !self.cfg.writeable {
+        if !self.writeable() {
             tracing::warn!("cannot save skills: repository is read-only");
             return Ok(false);
         }
@@ -487,7 +502,7 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
 
     fn delete(&self, skill_name: &str) -> Result<bool, SkillRepositoryError> {
         validate_skill_name(skill_name)?;
-        if !self.cfg.writeable {
+        if !self.writeable() {
             tracing::warn!("cannot delete skill: repository is read-only");
             return Ok(false);
         }
@@ -504,7 +519,7 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
 
     fn get_repository_info(&self) -> AgentSkillRepositoryInfo {
         let location = format!("{}.{}", self.cfg.database_name, self.cfg.skills_table_name);
-        AgentSkillRepositoryInfo::new("mysql", location, self.cfg.writeable)
+        AgentSkillRepositoryInfo::new("mysql", location, self.writeable())
     }
 
     fn get_source(&self) -> String {
@@ -512,7 +527,12 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
     }
 
     fn is_writeable(&self) -> bool {
-        self.cfg.writeable
+        self.writeable()
+    }
+
+    fn set_writeable(&self, writeable: bool) {
+        self.writeable
+            .store(writeable, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -556,6 +576,20 @@ mod tests {
     #[test]
     fn empty_save_returns_false() {
         assert!(!repo().save(&[], false).unwrap());
+    }
+
+    // Java: MysqlSkillRepository#setWriteable / isWriteable (mutable flag)
+    #[test]
+    fn set_writeable_toggles_runtime_flag() {
+        let r = repo();
+        assert!(r.is_writeable(), "builder default is writeable");
+        r.set_writeable(false);
+        assert!(!r.is_writeable());
+        // Writes are refused while the flag is off.
+        assert!(!r.save(&[skill("calc", "calc skill")], false).unwrap());
+        r.set_writeable(true);
+        assert!(r.is_writeable());
+        assert!(r.save(&[skill("calc", "calc skill")], false).unwrap());
     }
 
     #[test]

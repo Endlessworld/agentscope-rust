@@ -397,6 +397,14 @@ impl AgentSkillRepository for GitSkillRepository {
         false
     }
 
+    /// Read-only backend: the flag is ignored, exactly as Java's `GitSkillRepository`
+    /// logs a warning and keeps `isWriteable()` false.
+    fn set_writeable(&self, writeable: bool) {
+        if writeable {
+            tracing::warn!("GitSkillRepository is read-only, set writeable operation ignored");
+        }
+    }
+
     fn close(&self) -> Result<(), SkillRepositoryError> {
         if self.owns_temp_dir && self.local_path.exists() {
             std::fs::remove_dir_all(&self.local_path).map_err(|e| {
