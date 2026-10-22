@@ -1,0 +1,16 @@
+[package]
+name = "agentscope-extensions-a2a-client"
+description = "AgentScope Rust - A2A client protocol extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

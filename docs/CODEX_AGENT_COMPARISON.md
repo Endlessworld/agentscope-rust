@@ -338,7 +338,7 @@
 | 沙箱 | `codex-rs/sandboxing/src/` | `crates/agentscope-harness/src/agent/sandbox/` |
 | 上下文 | `codex-rs/core/src/context/` + `context_manager/` | `crates/agentscope-harness/src/agent/middleware/` |
 | 多智能体 | `codex-rs/core/src/agent/` + `agent-graph-store/` | `crates/agentscope-harness/src/agent/{subagent,gateway,bus,team}/` |
-| 协议 | `codex-rs/app-server-protocol/` | `crates/agentscope-harness/src/acp/` |
+| 协议 | `codex-rs/app-server-protocol/` | `crates/agentscope-extensions-acp/` |
 | 持久化 | `codex-rs/{state,thread-store,rollout,history}/` | `crates/agentscope-core/src/state/` + `harness/src/agent/workspace/index.rs` |
 
 ### 16.3 一句话结论

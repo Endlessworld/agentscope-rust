@@ -6,7 +6,7 @@ rem Note: Windows MSVC always emits .pdb files; exclude them when packaging.
 
 cd /d "%~dp0"
 
-cargo build --release -p agentscope-harness --bin acp_harness_agent --bin acp_agent_cli
+cargo build --release -p agentscope-extensions-acp --bin acp_harness_agent --bin acp_agent_cli
 set "EXITCODE=%ERRORLEVEL%"
 
 if not "%EXITCODE%"=="0" (

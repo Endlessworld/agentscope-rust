@@ -83,8 +83,8 @@ agentscope-rust/
 cargo build  --workspace                 # 构建
 cargo test   --workspace                 # 单元 + 集成测试
 cargo clippy --workspace --all-targets   # 静态检查
-#构建cli 和acp_harness_agent
-cargo build --profile embedded -p agentscope-harness --no-default-features --features lite --bins
+# 构建 harness 与 ACP 二进制（cli + acp_harness_agent）
+cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp --no-default-features --features lite --bins
 # release / embedded 构建两个 ACP 二进制（Windows 便捷脚本）
 build-acp-release.bat
 build-acp-embedded.bat
@@ -93,8 +93,8 @@ build-acp-embedded.bat
 体积优化（嵌入式场景）：
 
 ```bash
-#构建cli 和acp_harness_agent
-cargo build --profile embedded -p agentscope-harness --no-default-features --features lite --bins
+# 构建 harness 与 ACP 二进制（cli + acp_harness_agent）
+cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp --no-default-features --features lite --bins
 ```
 
 - 默认 feature `rusqlite`：启用工作区 SQLite 索引；
@@ -152,10 +152,10 @@ println!("{}", reply.text_content());
 
 ```bash
 # ACP 服务端：等待 ACP 客户端（IDE/CLI）通过 stdio 接入
-cargo run -p agentscope-harness --bin acp_harness_agent
+cargo run -p agentscope-extensions-acp --bin acp_harness_agent
 
 # 交互式 REPL 客户端：自动拉起上面的 agent 子进程
-cargo run -p agentscope-harness --bin acp_agent_cli
+cargo run -p agentscope-extensions-acp --bin acp_agent_cli
 ```
 
 模型集中在 `~/.agentscope/models.json`（首次运行自动生成，含默认 provider 与模型列表；解析为宽松模式，允许 `//`、`/* */` 注释与尾随逗号，文件已存在时不会被覆写），
@@ -179,7 +179,7 @@ REPL slash 命令：`/model <id>` 切换模型、`/models` 列出模型、`/quit
 | `docs/MIGRATION_GAP_TRACKER.md` | 迁移进度与缺口清单（单一事实来源） |
 | `docs/ACP_AGENT_PLAN.md` | ACP CodingAgent 方案与架构设计 |
 | `docs/ACP_AGENT__GAP_TRACKER.md` | ACP CodingAgent 进度跟踪 |
-| `crates/agentscope-harness/src/acp/README.md` | ACP 运行说明（skills / 环境变量） |
+| `crates/agentscope-extensions-acp/README.md` | ACP 运行说明（skills / 环境变量） |
 | `.agents/context/` | 跨会话项目上下文（项目画像、当前状态、ADR、经验教训） |
 
 ## 已知限制

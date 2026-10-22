@@ -93,6 +93,87 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentscope-extensions-a2a-client"
+version = "0.1.0"
+dependencies = [
+ "agentscope-core",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "agentscope-extensions-a2a-server"
+version = "0.1.0"
+dependencies = [
+ "agentscope-core",
+ "agentscope-extensions-a2a-client",
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "agentscope-extensions-acp"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "agentscope-core",
+ "agentscope-extensions-model",
+ "agentscope-harness",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "agentscope-extensions-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "agentscope-core",
+ "agentscope-harness",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures",
+ "http 1.5.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentscope-extensions-agui"
+version = "0.1.0"
+dependencies = [
+ "agentscope-core",
+ "agentscope-harness",
+ "axum",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agentscope-extensions-aistio"
 version = "0.1.0"
 dependencies = [
@@ -141,6 +222,17 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+]
+
+[[package]]
+name = "agentscope-extensions-chat-completions-web"
+version = "0.1.0"
+dependencies = [
+ "agentscope-core",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -335,21 +427,11 @@ dependencies = [
 name = "agentscope-extensions-protocol"
 version = "0.1.0"
 dependencies = [
- "agentscope-core",
- "agentscope-harness",
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "futures",
- "http 1.5.0",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "uuid",
+ "agentscope-extensions-a2a-client",
+ "agentscope-extensions-a2a-server",
+ "agentscope-extensions-agent-protocol",
+ "agentscope-extensions-agui",
+ "agentscope-extensions-chat-completions-web",
 ]
 
 [[package]]
@@ -486,7 +568,6 @@ dependencies = [
 name = "agentscope-harness"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
  "agentscope-core",
  "agentscope-extensions-model",
  "async-trait",
@@ -507,7 +588,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

@@ -84,7 +84,7 @@ Java 该提交新增 4 个包（非测试源码约 5,640 行）：
 - **上下文编译**：`HarnessAgentBuilder::{context_source, instruction, context_policy, task_context}` 为**显式 opt-in**；注册了材料**或**开启任一 task 投影（`TaskContextOptions::is_enabled()`）才在 `build()` 里加入 `ContextMiddleware`（挂 `OnModelCall`），否则完全保持原路径。
 - **任务快照**：`react_agent.rs::reasoning_phase` 每步把共享任务袋（`core.tasks`，`todo_write` 就地修改）折叠进发布快照后才编译请求，因此投影与 manifest 的 `task_revision` 看到的是本步的实时任务状态（Java 靠可变 `AgentState` 达到同样效果）。
 - **编译器位置**：`build()` 把 `ContextMiddleware` 注册在中间件链**末尾**；`wrap_model_call` 是反向包装，因此它是最内层的 `OnModelCall` 中间件，校验与预算都作用在最终请求上。`OnReasoning` 重写（tool-pair 清洗、tool-result eviction、compaction）按扩展点顺序先于任何 `OnModelCall`，所以编译器看到的永远是修复后的视图。
-- **ACP 接线**：`acp/acp_harness_agent.rs` 与 `acp/coding_agent.rs` 的构建点均加 `.task_context(TaskContextOptions { requirements: true, verification_results: true, .. })`：只开任务投影、**不注册 source**，避免与 `WorkspaceContextMiddleware` 的 system prompt 注入重复。
+- **ACP 接线**：`acp_harness_agent.rs` 与 `coding_agent.rs` 的构建点均加 `.task_context(TaskContextOptions { requirements: true, verification_results: true, .. })`：只开任务投影、**不注册 source**，避免与 `WorkspaceContextMiddleware` 的 system prompt 注入重复。
 - **会话运行时**：`AgentSession` → `SessionInbox`（受理）→ `SessionRecorder`（事实）→ `ReActAgent`（执行）→ `SessionTurns`（投影）。
 
 ## 5. 未落地项（不是缺陷，是待办）

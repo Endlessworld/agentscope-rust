@@ -1,0 +1,14 @@
+[package]
+name = "agentscope-extensions-chat-completions-web"
+description = "AgentScope Rust - OpenAI-compatible Chat Completions web adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

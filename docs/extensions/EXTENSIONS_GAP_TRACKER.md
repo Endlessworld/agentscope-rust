@@ -193,3 +193,14 @@
 | HTTP 框架选型（CHANNEL 依赖） | **已裁定：统一用 `axum`**（与 `agentscope-extensions-protocol`、`agentscope-extensions-aistio` 一致）。4 个 `*CallbackController`（feishu/github/gitlab/wecom）已以 `axum::Router` 承载，路由/解析为薄壳，签名校验、解密、inbound 映射复用已落地纯逻辑。 | 已裁定并**已落地** |
 | harness `agent::Channel` 契约是否足够 | **已裁定：契约足够，公共层写 harness，不通用部分写各模块**。已在 harness 新增 `agent::gateway::platform_channel`（`PlatformChannel` trait + `PlatformCtx` + `Channel`/`ChannelSink` 的 blanket impl，6 个单测）；五个平台 `*Channel` 只实现 `ctx()` + `deliver_reply()`。 | 已裁定并**已落地** |
 | **core 改动登记：AISTIO P1 所需 ReActAgent getter** | **2026-10-08，经用户明确授权（原「禁改 core」硬约束被本轮覆盖）**。为使 `AgentScopeAdapter` 能读 base system prompt / 迭代上限，在 `crates/agentscope-core/src/agent/react_agent.rs` **仅新增两个只读 getter**：`ReActAgent::sys_prompt() -> &str`、`ReActAgent::max_iters() -> i32`（对应 Java `getSysPrompt()`/`getMaxIters()`）。**纯增量、未改任何行为/架构、无调用方变更**。验证：`cargo test -p agentscope-core` 全绿；`cargo build --workspace` = 0。 | **已执行（2026-10-08）**；详见 `AISTIO__GAP_TRACKER.md` §4.1.1/§4.2 |
+
+---
+
+## 2026-10-22 PROTOCOL / ACP crate 拆分登记
+
+本轮把两个「单 crate 多协议」的模块拆开，新 crate 均已在根 `Cargo.toml` 注册：
+
+- PROTOCOL → `agentscope-extensions-a2a-client` / `agentscope-extensions-a2a-server` / `agentscope-extensions-agent-protocol` / `agentscope-extensions-agui` / `agentscope-extensions-chat-completions-web`；`agentscope-extensions-protocol` 降级为 facade。
+- ACP → `agentscope-extensions-acp`（从 `agentscope-harness` 抽出；harness 不再依赖 `agent-client-protocol`，normal 依赖树 781 → 668 行）。
+- 验证：`cargo check --workspace --all-targets` 通过；protocol 5 crate 304 tests 全绿；acp 46 inline + 7 集成 tests 全绿；`-p agentscope-extensions-acp --no-default-features --features lite --bins` 通过。
+- 映射明细见 `docs/PROTOCOL_CRATE_SPLIT.md`。

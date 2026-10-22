@@ -1,0 +1,26 @@
+[package]
+name = "agentscope-extensions-agui"
+description = "AgentScope Rust - AG-UI protocol extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness", optional = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+# Enables `impl AguiStreamableAgent for agentscope_harness::agent::HarnessAgent`.
+# Java reaches the same types through reflection precisely to avoid a compile-time
+# harness dependency; Rust mirrors that intent with an opt-in feature.
+harness = ["dep:agentscope-harness"]

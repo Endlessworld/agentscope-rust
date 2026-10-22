@@ -8,7 +8,10 @@ use agentscope_core::message::{
     ToolUseBlock,
 };
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_harness::acp::ACP_CONTEXT_WINDOW_TOKENS;
+// The ACP coding agent's compaction trigger window. Historically imported from
+// `agentscope_harness::acp`; that module now lives in `agentscope-extensions-acp`,
+// so this harness-level test keeps the value local.
+const ACP_CONTEXT_WINDOW_TOKENS: usize = 256_000;
 use agentscope_harness::{
     build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
     prune_tool_results, truncate_args, CompactionConfig, ConversationCompactor,

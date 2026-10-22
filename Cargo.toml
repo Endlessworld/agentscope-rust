@@ -6,6 +6,12 @@ members = [
     # agentscope-extensions/* 迁移 crate（每个 crate 由 docs/extensions/<MODULE>__GAP_TRACKER.md 跟踪）
     "crates/agentscope-extensions-model",
     "crates/agentscope-extensions-protocol",
+    "crates/agentscope-extensions-a2a-client",
+    "crates/agentscope-extensions-a2a-server",
+    "crates/agentscope-extensions-agent-protocol",
+    "crates/agentscope-extensions-agui",
+    "crates/agentscope-extensions-chat-completions-web",
+    "crates/agentscope-extensions-acp",
     "crates/agentscope-extensions-rag",
     "crates/agentscope-extensions-sandbox",
     "crates/agentscope-extensions-channel",

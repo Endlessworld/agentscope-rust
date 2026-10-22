@@ -44,7 +44,7 @@
 
 ## 3. 架构设计
 
-### 3.1 模块划分（新增 `crates/agentscope-harness/src/acp/`）
+### 3.1 模块划分（新增 `crates/agentscope-extensions-acp/`）
 ```
 acp/
 ├── mod.rs            # 模块导出

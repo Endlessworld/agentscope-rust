@@ -1,29 +1,38 @@
 ﻿[package]
 name = "agentscope-extensions-protocol"
+description = "AgentScope Rust - protocol extensions (umbrella crate)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+# Umbrella crate mirroring the Java `agentscope-extensions-protocol` aggregator.
+# Each protocol lives in its own crate so its dependency set stays isolated:
+#
+#   agentscope-extensions-a2a-client          (reqwest, uuid)
+#   agentscope-extensions-a2a-server          (axum, depends on a2a-client)
+#   agentscope-extensions-agent-protocol      (axum, harness)
+#   agentscope-extensions-agui                (core-only; optional `harness` feature)
+#   agentscope-extensions-chat-completions-web(core-only)
+#
+# Depend on an individual crate when you only need one protocol; depend on this
+# crate (default features) for the previous `a2a` / `agui` / ... module paths.
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-async-trait = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
-tracing = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
+agentscope-extensions-a2a-client = { path = "../agentscope-extensions-a2a-client", optional = true }
+agentscope-extensions-a2a-server = { path = "../agentscope-extensions-a2a-server", optional = true }
+agentscope-extensions-agent-protocol = { path = "../agentscope-extensions-agent-protocol", optional = true }
+agentscope-extensions-agui = { path = "../agentscope-extensions-agui", optional = true }
+agentscope-extensions-chat-completions-web = { path = "../agentscope-extensions-chat-completions-web", optional = true }
 
-reqwest = { workspace = true }
-axum = { workspace = true }
-http = { workspace = true }
-bytes = { workspace = true }
+[features]
+default = ["a2a", "agent-protocol", "agui", "chat-completions-web"]
+a2a = [
+    "dep:agentscope-extensions-a2a-client",
+    "dep:agentscope-extensions-a2a-server",
+]
+agent-protocol = ["dep:agentscope-extensions-agent-protocol"]
+agui = ["dep:agentscope-extensions-agui"]
+chat-completions-web = ["dep:agentscope-extensions-chat-completions-web"]
 
 [dev-dependencies]
-tokio = { workspace = true }
-
-
+# The facade has no code of its own; tests live in the per-protocol crates.

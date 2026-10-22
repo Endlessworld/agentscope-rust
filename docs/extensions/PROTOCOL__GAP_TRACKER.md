@@ -193,3 +193,23 @@ cargo test  -p agentscope-extensions-protocol   -> 290 passed; 0 failed; 0 ignor
 - **仅在本 crate 内改动**；新增依赖写入 `crates/agentscope-extensions-protocol/Cargo.toml` 的 `[dependencies]`，不要改根 `Cargo.toml` 的 `[workspace.dependencies]`（如需请记入 §4.2 由汇总方处理）。
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
 
+
+---
+
+## 7. 2026-10-22 crate 拆分（依赖隔离）
+
+`crates/agentscope-extensions-protocol` 不再承载实现，按 Java 的 Maven 子模块拆为独立 crate：
+
+| Java 模块 | Rust crate | 依赖要点 |
+| --- | --- | --- |
+| `agentscope-extensions-a2a-client` | `agentscope-extensions-a2a-client` | core, reqwest, uuid, tokio |
+| `agentscope-extensions-a2a-server` | `agentscope-extensions-a2a-server` | 依赖 a2a-client, axum, async-trait |
+| `agentscope-extensions-agent-protocol` | `agentscope-extensions-agent-protocol` | harness, axum, http |
+| `agentscope-extensions-agui` | `agentscope-extensions-agui` | core-only（`HarnessAgent` impl 改为可选 `harness` feature） |
+| `agentscope-extensions-chat-completions-web` | `agentscope-extensions-chat-completions-web` | core, futures |
+| （父模块） | `agentscope-extensions-protocol` | 仅 facade：feature-gated re-export |
+
+- 错误类型按 crate 拆分：`A2aError`（a2a-client，a2a-server 复用）、`AgentProtocolError`（agent-protocol）；不再有共享 `ProtocolError`。
+- 服务端专属的 card 构造（`ConfigurableAgentCard` / `TransportProperties` / `AgentDescriptor` / `create_agent_card`）从 `card.rs` 移到 `agentscope-extensions-a2a-server/src/card.rs`，以解除拆分后的 orphan-rule 冲突（`impl<T: AgentRunner> AgentDescriptor for T`）。
+- 测试随文件迁移，共 304 个（原 302 + 2 个错误类型用例）；`cargo check --workspace --all-targets` 通过。
+- `agui` 的 `token_usage_events_are_opt_in_and_accumulate` 原本依赖 `serde_json/preserve_order` 被 ACP 传递开启；拆分后改为解析 JSON 断言，不再依赖 feature 统一顺序。

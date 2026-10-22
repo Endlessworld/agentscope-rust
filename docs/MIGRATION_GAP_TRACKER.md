@@ -41,7 +41,7 @@
 | harness.memory | 10 类 | 6 文件 | ≈95% | compaction+flush+consolidation+eviction+session+MemoryConfig 完整 |
 | harness.bus | 6 类 | 4 文件 | ≈90% | MessageBus（Mode A/C/D）+ WorkspaceMessageBus + AsyncToolRegistry 系完整；Mode D 降级轮询 |
 | harness.sandbox | — | sandbox/ 模块 | 高 | Sandbox/SandboxClient/SandboxManager(4 级获取策略)/Guard/Lease/StateStore 完整；Windows pwsh -EncodedCommand（UTF-16LE→Base64）+ 子进程 stdin 置空防挂起 + 进程树管道死锁修复；**docker 后端已接（docker CLI 实现）**；**snapshot/layout/helpers 已接（见 §3.6）** |
-| harness.acp | — | acp/ 6 文件 | 新增模块 | AcpCodingAgent 包装 core ReActAgent（镜像 Kotlin AgiAgent/AgiAgentSession）；AcpAgentSession 权限确认/取消/流式/动态模型切换/per-session headers 全套落地 |
+| harness.acp | — | `crates/agentscope-extensions-acp/`（2026-10-22 从 harness 抽出） | 新增模块 | AcpCodingAgent 包装 core ReActAgent（镜像 Kotlin AgiAgent/AgiAgentSession）；AcpAgentSession 权限确认/取消/流式/动态模型切换/per-session headers 全套落地 |
 | harness.middleware | 18+ | 11 文件 | 高 | 3 系统提示转换 + Inbox + AsyncTool + MemoryFlush + MemoryMaintenance + ToolResultEviction + SubagentsMiddleware + DynamicSubagentsMiddleware + **AgentTraceMiddleware（本轮）** + 配套 TaskTool/SubagentEntry/DefaultAgentManager/AgentSpecLoader；**WorkspaceContext/SandboxLifecycle 已接** |
 | harness.subagent | — | subagent/task/ 目录 | task 仓库已建 | BackgroundTask/TaskRepository/WorkspaceTaskRepository 完整；Local/Adopted 动态 spawn 已实现；**Remote（agent-protocol）任务 + 维护循环（heartbeat/sweep）已接线（见 §3.14 D6）** |
 | harness.mcp | — | mcp.rs + mcp_client_manager.rs | 高 | McpClientManager（rust-mcp-sdk v1.0.1 stdio）+ McpServerRegistrar 已实现；**SSE + Streamable HTTP 已接（WS 未做）** |
@@ -298,8 +298,8 @@
 ### 3.10 acp（优先级 P1）— 新增模块，全链路落地
 | 缺口项 | Java/Kotlin 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| AcpCodingAgent（包装 ReActAgent） | Kotlin AgiAgent / Java HarnessCodingAgent | ✅ 已完成 | acp/coding_agent.rs；lib.rs 导出 AcpAgentSession/AcpCodingAgent/AcpCodingAgentBuilder |
-| AcpAgentSession（权限确认/取消/流式） | Kotlin AgiAgentSession | ✅ 已完成 | acp/session.rs：ConfirmHandler 用户交互确认 + PermissionRuleStore 持久化 + 模式映射（plan/accept_edits/yolo）；$/cancel_request 取消（SDK Responder cancellation marker + run_with_transport 可注入 transport，进程内 Channel::duplex 取消 e2e） |
+| AcpCodingAgent（包装 ReActAgent） | Kotlin AgiAgent / Java HarnessCodingAgent | ✅ 已完成 | `crates/agentscope-extensions-acp/src/coding_agent.rs`；crate `lib.rs` 导出 AcpAgentSession/AcpCodingAgent/AcpCodingAgentBuilder |
+| AcpAgentSession（权限确认/取消/流式） | Kotlin AgiAgentSession | ✅ 已完成 | `crates/agentscope-extensions-acp/src/session.rs`：ConfirmHandler 用户交互确认 + PermissionRuleStore 持久化 + 模式映射（plan/accept_edits/yolo）；$/cancel_request 取消（SDK Responder cancellation marker + run_with_transport 可注入 transport，进程内 Channel::duplex 取消 e2e） |
 | 流式输出与工具调用流 | — | ✅ 已完成 | acp/event.rs：思考/工具调用带 message_id、逐 token 增量流式、兼容 reasoning 字段；工具参数与位置随通知推送、ToolCall 创建延迟至参数就绪（Pending→raw_input→Completed，raw_output+content） |
 | 动态模型切换 + per-session headers | — | ✅ 已完成 | session.rs：model_factory/model_builder 回调（签名含 sessionId）；模型切换失败通知客户端；x-opencode-session 由外部注入绑定 ACP sessionId（core 硬编码已移除）；思考等级映射（auto 默认不传；显式等级统一只传官方 `reasoning_effort`，不传 `enable_thinking`/`thinking_budget`——严格网关会以 `unknown field "thinking_budget"` 400 拒绝）；UsageUpdate 为当前上下文 token 计数；上下文窗口推送 |
 | 配置与日志 | — | ✅ 已完成 | acp/config.rs：会话配置 Arc<Mutex> 共享防克隆丢失；AGENTSCOPE_LOG_DIR 固定日志目录 + ACP agent 文件日志 |

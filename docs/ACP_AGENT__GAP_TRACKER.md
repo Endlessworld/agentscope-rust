@@ -26,7 +26,7 @@
 | 缺口项 | 执行状态 | 交接信息/说明 |
 |---|---|---|
 | `agent-client-protocol` 依赖 | ✅ 已完成 | 已由 path 依赖（`rust-sdk/src/agent-client-protocol` v2.0.0 + `unstable_tool_call_name`）改为 crates.io `agent-client-protocol = { version = "2.2.0" }`（无 feature），编译通过；能力盘点见 §2.7 |
-| `acp/` 模块目录 + mod.rs | ✅ 已完成 | `crates/agentscope-harness/src/acp/`（mod/coding_agent/session/config/event） |
+| `acp/` 模块目录 + mod.rs | ✅ 已完成 | `crates/agentscope-extensions-acp/`（mod/coding_agent/session/config/event） |
 | `AcpCodingAgent::builder()` + InitializeRequest 处理器 | ✅ 已完成 | 声明 loadSession/list/delete/resume/close + promptCapabilities(embeddedContext) + mcp |
 | `run_stdio()` 便捷方法 | ✅ 已完成 | `Stdio::new()` + `connect_to`；stdio 握手验证通过 |
 
@@ -61,7 +61,7 @@
 ### 2.6 入口与测试（P1）
 | 缺口项 | 执行状态 | 交接信息/说明 |
 |---|---|---|
-| `src/acp/acp_harness_agent.rs`（stdio ACP agent，`[[bin]]` 目标） | ✅ 已完成 | HarnessAgent 全装配（文件系统/shell/compaction/plan mode/skills）+ 真实 stdio 运行验证通过 |
+| `src/acp_harness_agent.rs`（stdio ACP agent，`[[bin]]` 目标） | ✅ 已完成 | HarnessAgent 全装配（文件系统/shell/compaction/plan mode/skills）+ 真实 stdio 运行验证通过 |
 | 单元测试（事件转换/配置） | ✅ 已完成 | event.rs 4 单测 + config.rs 3 单测，共 7 个通过 |
 | 协议集成（stdio 握手+prompt） | ✅ 已完成 | groovy 驱动二进制：initialize→new_session→prompt(AgentMessageChunk)→end_turn→close 全链路验证 |
 | **取消 e2e（$/cancel_request）** | ✅ 已完成 | `acp_cancel_test.rs`：进程内 `Channel::duplex` transport + never-ending 脚本化 model，client 发 prompt 后 `SentRequest::cancel()`，断言 agent 返回 `StopReason::Cancelled`（0.33s，无需真实 model） |
@@ -164,3 +164,14 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 - 改动中：保持每阶段 `cargo build`/`cargo test` 通过。
 - 完工后：把对应条目 `执行状态` 改为 `已完成`，更新 `交接信息`（验证结果）。
 - 涉及 SDK 参考时：以 `E:\local-github\agentclientprotocol\rust-sdk`（tag `v2.2.0`）源码与 cargo registry 中 `agent-client-protocol-2.2.0` / `agent-client-protocol-schema-1.9.1` 为准（旧的 `schema-1.6.0` 口径已作废）。
+
+---
+
+## 5. 2026-10-22 crate 迁移
+
+`src/acp/` 已整体迁至 `crates/agentscope-extensions-acp/`（未做 trait 抽象，仍是 `HarnessAgent` 专用）：
+
+- `agentscope-harness` 删除 `pub mod acp`、`[[bin]]` 与 `agent-client-protocol` / `tracing-subscriber` / `tokio/signal` 依赖。
+- 两个 bin：`cargo run -p agentscope-extensions-acp --bin acp_harness_agent|acp_agent_cli`。
+- 5 个 `acp_*` 集成测试与 46 个内联测试随 crate 迁移；`ACP_CONTEXT_WINDOW_TOKENS` 被 harness 测试引用，已在测试内本地化为常量，避免 dev-dependency 环。
+- feature 透传：`default = ["rusqlite"]` → `agentscope-harness/rusqlite`；`lite` 对应 harness `lite`。`cargo check -p agentscope-extensions-acp --no-default-features --features lite --bins` 通过。

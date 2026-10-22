@@ -4,7 +4,6 @@
 //! runtime with workspace context, filesystem abstraction, sandbox backends, subagent
 //! orchestration, memory management and gateway.
 
-pub mod acp;
 pub mod agent;
 pub mod filesystem;
 pub mod tool;
@@ -13,7 +12,6 @@ pub mod tool;
 // `crate::Result` / `crate::Error` paths used across harness modules stay uniform.
 pub use agentscope_core::error::{Error, Result};
 
-pub use acp::{AcpAgentSession, AcpCodingAgent, AcpCodingAgentBuilder};
 pub use agent::{
     AgentSkill, AgentSkillBuilder, AgentTraceMiddleware, ArtifactDeliveryRequest,
     ArtifactDeliveryResult, ArtifactDeliveryTarget, AsyncToolMiddleware, AsyncToolRecord,
