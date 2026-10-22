@@ -29,7 +29,7 @@
 | B | POSTGRESQL | 单模块 | 1571 / 1583 | `agentscope-extensions-postgresql` |
 | B | COS | 单模块 | 882 / 760 | `agentscope-extensions-cos` |
 | B | OSS | 单模块 | 795 / 290 | `agentscope-extensions-oss` |
-| C | AISTIO | 单模块（adapter/model/store/transport） | 9352 / 2841 | `agentscope-extensions-aistio` |
+| C | CONTROLPLANE | 单模块（adapter/model/store/transport） | 9352 / 2841 | `agentscope-extensions-controlplane` |
 | C | STUDIO | 含 core.tracing.telemetry | 3700 / 1452 | `agentscope-extensions-studio` |
 | C | SKILLS | git / mysql / postgresql repository | 3177 / 2813 | `agentscope-extensions-skills` |
 | C | SCHEDULER | common, quartz, xxl-job | 3009 / 2589 | `agentscope-extensions-scheduler` |
@@ -55,7 +55,7 @@
 | OkHttp WebSocket | 实时通道 | `tokio-tungstenite` | channel / studio |
 | opentelemetry | 遥测 | `opentelemetry` + `tracing-opentelemetry` | studio |
 | nacos-client / higress | 注册配置 | `reqwest` 直调 OpenAPI 或 SDK crate | 先构 trait |
-| grpc-java | AISTIO 控制面 | `tonic`（+ `prost`） | 可后置 |
+| grpc-java | CONTROLPLANE 控制面 | `tonic`（+ `prost`） | 可后置 |
 
 ## 4. 并行编排约束（子智能体必须遵守）
 

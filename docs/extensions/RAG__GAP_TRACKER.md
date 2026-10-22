@@ -1,9 +1,10 @@
 ﻿# RAG 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **RAG** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
-> **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-rag\`
+> **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-rag\`
 > **Java 子模块**：bailian, dify, haystack, ragflow, simple
 > **Rust 目标**：`crates/agentscope-extensions-rag/`（波次 A）
+> **统计口径**：所有行数均为**非空行**（trim 后非空），Java 与 Rust 同口径；见 §6 静态复核记录。
 
 ## 0. 如何阅读本文件
 - **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -15,12 +16,12 @@
 |---|---|
 | Java 模块 | `agentscope-extensions-rag` |
 | Java 子模块 | bailian, dify, haystack, ragflow, simple |
-| Java 规模（实测行数） | 主代码 **15438** / 测试 **16057**（bailian 1447/1479、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8068/10188） |
+| Java 规模（实测行数，非空行） | 主代码 **15946** / 测试 **16792**（bailian 1447/1493、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8576/10909） |
 | Rust crate | `crates/agentscope-extensions-rag` |
 | 迁移波次 | A |
 | 当前状态 | **部分完成** — `dify`、`ragflow`、`bailian`、`haystack`、`simple`（离线链路）子模块均已迁移，`cargo build`/`cargo test` 全绿（**265 passed / 0 failed**）；`simple` 的 HTTP embedding 提供商、外部向量库、reader 增强 **非本轮范围，尚未迁移** |
 
-### 1.1 Rust crate 文件清单（42 个源文件，10002 行，265 个内联测试）
+### 1.1 Rust crate 文件清单（42 个源文件，10002 行非空，265 个内联测试 = 192 `#[test]` + 73 `#[tokio::test]`）
 | 文件 | 职责 |
 |---|---|
 | `src/lib.rs` | crate 根：15 个模块声明（本轮新增 `bailian` / `haystack`）+ re-export；说明 Java core `rag` 包已 `@Deprecated(forRemoval)` 且 core 无对应实现 |
@@ -89,7 +90,7 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | `exception.DifyApiException` / `DifyAuthException` | API / 鉴权异常 | `RagError::Api` / `RagError::Auth`（`src/error.rs`） | 已完成 |
 | 请求体装配（`retrieve` 内联） | `query` + `retrieval_model` | `dify::request::build_retrieve_request_body` | 已完成 |
 
-### 2.3 simple 子模块（`io.agentscope.core.rag.*` / `io.agentscope.core.embedding.*`，31 类）— **离线部分已迁移**
+### 2.3 simple 子模块（`io.agentscope.core.rag.*` / `io.agentscope.core.embedding.*`，simple 子模块 **33 类**（rag 24 + embedding 9）+ Java core `io.agentscope.core.rag.*` **7 类** = 40 类）— **离线部分已迁移**
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
 | `core.rag.Knowledge`（core 接口） | 知识库抽象 | `knowledge::Knowledge` (trait) | 已完成 |
@@ -111,14 +112,18 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | `core.rag.exception.ReaderException` / `VectorStoreException` | reader / store 异常 | `RagError::Reader` / `RagError::VectorStore` | 已完成 |
 | `core.rag.KnowledgeRetrievalTools`（core） | agentic 模式工具输出文本 | `message::format_documents_for_tool` | 已完成 |
 | `core.rag.GenericRAGHook`（core） | 自动检索 hook（注入 `<retrieved_knowledge>`） | `message::{build_retrieved_knowledge_msg, extract_query_from_messages, RETRIEVED_KNOWLEDGE_OPEN/CLOSE}` | 已完成 |
-| `core.embedding.dashscope.{DashScopeTextEmbedding, DashScopeMultiModalEmbedding}` | DashScope HTTP embedding | 无（`embedding::HashEmbeddingModel` 为离线替代） | **待办 P1** |
-| `core.embedding.ollama.OllamaTextEmbedding` | Ollama HTTP embedding | 无 | **待办 P1** |
-| `core.embedding.openai.OpenAITextEmbedding` | OpenAI HTTP embedding | 无 | **待办 P1** |
-| `core.embedding.EmbeddingUtils` | 超时/重试包装 | 无（可用 `retry::RetryPolicy`） | **待办 P2** |
-| `core.rag.reader.TikaReader` / `PDFReader` / `WordReader` / `ImageReader` / `ExternalApiReader` | 多格式文档读取（Tika/PDFBox/POI/外部服务） | 无 | **待办 P2** |
-| `core.rag.reader.ReaderUtils` | MD5/SHA-256 docId + hex | 无（可基于 `hash.rs` 扩展） | **待办 P2** |
-| `core.rag.reader.TableFormat` | Word 表格格式（Markdown/JSON） | 无（仅 WordReader 使用） | **待办 P2** |
-| `core.rag.store.ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` | 外部向量库 | 无（接口为 `store::VdbStore`） | **待办 P1** |
+| `core.embedding.dashscope.{DashScopeTextEmbedding, DashScopeMultiModalEmbedding}` | DashScope HTTP embedding | 无（`embedding::HashEmbeddingModel` 为离线替代） | 待办 |
+| `core.embedding.ollama.OllamaTextEmbedding` | Ollama HTTP embedding | 无 | 待办 |
+| `core.embedding.openai.OpenAITextEmbedding` | OpenAI HTTP embedding | 无 | 待办 |
+| `core.embedding.EmbeddingUtils` | 超时/重试包装 | 无（可用 `retry::RetryPolicy`） | 待办 |
+| `core.embedding.EmbeddingResponse` / `EmbeddingUsage` | embedding 响应 / token 用量 DTO | 无（Rust `EmbeddingModel::embed` 直接返回 `Vec<f64>`，不携带 usage） | 待办 |
+| `core.rag.RAGMode`（core） | GENERIC / AGENTIC / NONE 模式枚举 | 无（core/harness 未迁移 hook 层，见 §4.2） | 待办 |
+| `core.rag.reader.TikaReader` / `PDFReader` / `WordReader` | 多格式文档读取（Tika / PDFBox / POI） | 无 | 设计决定（不迁移） |
+| `core.rag.reader.ImageReader` | 图片读取（**无第三方 JVM 依赖**，仅需 core 的 `ImageBlock`/`URLSource`，Rust core 已有） | 无 | 待办 |
+| `core.rag.reader.ExternalApiReader` | 外部解析 API 读取（可插拔 `RequestBuilder`/`ResponseParser`） | 无（可基于 `crate::transport` seam 实现） | 待办 |
+| `core.rag.reader.ReaderUtils` | MD5/SHA-256 docId + hex | 部分（`hash::md5_hex` 已有；SHA-256 待补） | 待办 |
+| `core.rag.reader.TableFormat` | Word 表格格式（Markdown/JSON） | 无（仅 WordReader 使用） | 设计决定（不迁移） |
+| `core.rag.store.ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` | 外部向量库 | 无（接口为 `store::VdbStore`） | 待办 |
 
 ### 2.4 bailian 子模块（`io.agentscope.core.rag.integration.bailian.*`，7 类）— **已完成**
 | Java 类 | 职责 | Rust 对应 | 状态 |
@@ -173,7 +178,7 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | **bailian 全链路** | bailian 子模块 7 类 | 已完成 | `src/bailian/**`；9 个源文件 2608 行 / 64 个内联测试；`reqwest` + 自建 ACS4-HMAC-SHA256 签名，不引入阿里云 SDK |
 | **haystack 全链路** | haystack 子模块 10 类 | 已完成 | `src/haystack/**`；7 个源文件 1692 行 / 49 个内联测试 |
 | **simple 离线链路** | `SimpleKnowledge` / `InMemoryStore` / `DistanceCalculator` / `TextReader` / `TextChunker` / `SplitStrategy` / `ReaderInput` / `EmbeddingModel` | 已完成 | `src/{simple,store,reader,embedding}.rs` |
-| 离线单测（265 个） | Java 测试 16057 行 | 已完成 | 见 §1.1；HTTP 走注入式 mock transport，全离线（无网络、无 accessKey） |
+| 离线单测（265 个） | Java 测试 16792 行 | 已完成 | 见 §1.1；HTTP 走注入式 mock transport，全离线（无网络、无 accessKey） |
 
 ### 3.2 缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -181,35 +186,40 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | Bailian 集成 | `bailian.*` 7 类 | **已完成** | `src/bailian/**`；`reqwest` 直连 + 自建 ACS4-HMAC-SHA256 签名（不引入阿里云 SDK）；端点/路径/API 版本/请求体(camelCase)/响应体(PascalCase)/`Authorization` 均以 SDK jar 逆向并用金标向量钉住 |
 | HayStack 集成 | `haystack.*` 10 类 | **已完成** | `src/haystack/**`；复用 `crate::transport` seam；覆盖 `documents` 与 `context_documents`（SentenceWindow）两种形态 |
 | RAGFlow 集成 | `ragflow.*` 9 类 | **已完成** | `src/ragflow/**`；`POST /api/v1/retrieval`；`data` 字段可 `false`/`null`/object 的自定义反序列化已复刻（`ResponseData`） |
-| simple 外部向量库 | `ElasticsearchStore`(526) / `MilvusStore`(899) / `PgVectorStore`(979) / `QdrantStore`(996) | 待办（**非本轮范围**） | 本轮仅做 bailian/haystack，未动此项；均以 `store::VdbStore` 为接口；各需 REST/gRPC 客户端，可离线 mock |
-| embedding HTTP 提供商 | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` | 待办（**非本轮范围**） | 本轮未动；与 MODEL 扩展边界可能重叠，待裁定（§4.2） |
+| simple 外部向量库 | `ElasticsearchStore`(526) / `MilvusStore`(919) / `PgVectorStore`(979) / `QdrantStore`(996) | 待办 | 本轮仅做 bailian/haystack，未动此项；均以 `store::VdbStore` 为接口；各需 REST/gRPC 客户端，可离线 mock |
+| embedding HTTP 提供商 | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` | 待办 | 本轮未动；与 MODEL 扩展边界可能重叠，待裁定（§4.2） |
 
 ### 3.3 增强（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| 文档读取器（Tika/PDF/Word/Image） | `TikaReader` / `PDFReader` / `WordReader` / `ImageReader` | **已完成（设计决定，不迁移）** | **依据**：这四个 reader 直接依赖 JVM 库（Apache Tika / PDFBox / POI）及其文档模型，Java 实现无法机械直译；强行引入等价 Rust 库（如 `pdf-extract`/`lopdf`/`docx-rs`）会带来新的重依赖与解析语义差异，且与本 crate 的“高内聚低耦合”定位不符。**裁定：不迁移**，保留本 crate 现有的 `Reader` trait 作为扩展点，调用方可自行实现或在本 trait 上接入外部解析服务。 |
-| `ExternalApiReader` | `ExternalApiReader` | 待办（**非本轮范围**） | 与 `dify`/`ragflow`/`haystack` 不同，它描述的是“调用外部解析 API”，无固定 wire 契约；本轮未动。若后续迁移，建议直接复用 `crate::transport` seam。 |
-| reader 辅助 | `ReaderUtils`（MD5/SHA-256 docId + hex） | **已完成（设计决定，不迁移）** | **依据**：其 MD5 部分已由 `hash::{md5, md5_hex, uuid_v3_from_name}` 覆盖（Document id 生成路径），而 SHA-256 路径**仅服务于未迁移的 Tika/PDF/Word reader**；无调用方即无迁移价值，属投机代码。**裁定：不迁移**；若未来引入 pure-Rust reader，可再基于 `hash.rs` 扩展 SHA-256。 |
-| `TableFormat` | `TableFormat`（Word 表格 Markdown/JSON） | **已完成（设计决定，不迁移）** | **依据**：`TableFormat` **仅**被未迁移的 `WordReader` 使用，无其它调用方；“不迁移”结论与 WordReader 一致。 |
-| embedding 辅助 | `EmbeddingUtils`（超时/重试包装） | 待办（**非本轮范围**） | 本轮未动；依赖未迁移的 HTTP embedding 提供商，且超时/重试能力已由 `retry::RetryPolicy` + `transport::TransportOptions` 提供，迁移时直接组合即可。 |
+| 文档读取器（Tika/PDF/Word） | `TikaReader` / `PDFReader` / `WordReader` | 设计决定（不迁移） | **依据**：这三个 reader 直接依赖 JVM 库（Apache Tika / PDFBox / POI）及其文档模型，Java 实现无法机械直译；强行引入等价 Rust 库（如 `pdf-extract`/`lopdf`/`docx-rs`）会带来新的重依赖与解析语义差异，且与本 crate 的“高内聚低耦合”定位不符。**裁定：不迁移**，保留本 crate 现有的 `Reader` trait 作为扩展点，调用方可自行实现或在本 trait 上接入外部解析服务。 |
+| `ImageReader` | `ImageReader`（图片 → `ImageBlock`/`URLSource`，`enableOCR` 占位不实现 OCR） | 待办 | **§6 复核修正**：原并入上一行的 Tika/PDF/Word 组一起裁定“不迁移”，但该 reader **无任何第三方 JVM 依赖**（仅依赖 core 的 `ImageBlock` / `URLSource`，Rust core 已有对应类型），且 `ReaderUtils.generateDocIdMD5` 的 MD5 部分已被 `hash::md5_hex` 覆盖 → 技术上可机械直译。降级为 P2 待办。 |
+| `ExternalApiReader` | `ExternalApiReader` | 待办 | 与 `dify`/`ragflow`/`haystack` 不同，它描述的是“调用外部解析 API”，无固定 wire 契约；本轮未动。若后续迁移，建议直接复用 `crate::transport` seam。 |
+| reader 辅助 | `ReaderUtils`（MD5/SHA-256 docId + hex） | 待办 | **§6 复核修正**：原文以“SHA-256 路径仅服务于未迁移的 Tika/PDF/Word reader”为由裁定不迁移，但 MD5 路径同时被**可迁移的 `ImageReader`** 使用（`generateDocIdMD5(imagePath)`），故“仅服务于未迁移 reader”的前提不成立。MD5 侧可由 `hash::md5_hex` 直接满足；SHA-256 侧待 `Tika/PDF/ExternalApiReader` 决策后再定。 |
+| `TableFormat` | `TableFormat`（Word 表格 Markdown/JSON） | 设计决定（不迁移） | **依据**：`TableFormat` **仅**被未迁移的 `WordReader` 使用，无其它调用方；“不迁移”结论与 WordReader 一致。 |
+| embedding 辅助 | `EmbeddingUtils`（超时/重试包装） | 待办 | 本轮未动；依赖未迁移的 HTTP embedding 提供商，且超时/重试能力已由 `retry::RetryPolicy` + `transport::TransportOptions` 提供，迁移时直接组合即可。 |
+| embedding 用量 DTO | `EmbeddingResponse` / `EmbeddingUsage`（token 用量 + 客户端耗时） | 待办 | **§6 新发现**：Rust `EmbeddingModel::embed` 直接返回 `Vec<f64>`，**不携带 usage**；Java `SimpleKnowledge` 有 `usageListener` 回调（每次 embed 报告 `EmbeddingUsage`）。若将来接真实 HTTP provider，token 计量与 `SimpleKnowledge` 的 usage 回调会缺失。 |
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路、**Bailian 全链路（含自建 ACS4-HMAC-SHA256 签名）**、**HayStack 全链路**；本轮新增 16 个源文件 4300 行，全 crate 共 **42 个源文件 10002 行、265 个内联测试**。
+- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路、**Bailian 全链路（含自建 ACS4-HMAC-SHA256 签名）**、**HayStack 全链路**；本轮新增 16 个源文件 4300 行，全 crate 共 **42 个源文件 10002 行（非空）、265 个内联测试**。
 - **验证命令与结果**（本轮实测，2026-09-19）：
   - `cargo build -p agentscope-extensions-rag` → **通过（0 errors，exit 0）**
   - `cargo test -p agentscope-extensions-rag` → **265 passed / 0 failed / 0 ignored**（untittests src/lib.rs）
   - 本 crate 无新增 warning（`warning:` 匹配 `extensions-rag` 计数 = 0）
 - **已知问题**：无编译/测试失败。设计上有一处显式取舍——core 侧 `RagMode`/hook 与 `io.agentscope.core.rag` 包未迁移，检索结果到消息的桥接以纯函数形式提供（`src/message.rs`），调用方需自行组装 hook/工具。
+- **2026-10-22 静态复核**：未运行 `cargo build`/`cargo test`（本轮为纯静态核对），仅校验源码与统计口径；详见 §6。
 
 ### 4.2 下一步与阻塞
 1. **simple 外部向量库（P1，非本轮范围）**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`，均实现 `store::VdbStore`。
-2. **embedding HTTP 提供商与 `ExternalApiReader`/`EmbeddingUtils`（P1/P2，非本轮范围）**：见 §3.2/§3.3。
-3. **已裁定不迁移**：`TikaReader`/`PDFReader`/`WordReader`/`ImageReader`、`ReaderUtils`、`TableFormat`（理由见 §3.3）。
+2. **embedding HTTP 提供商与 `ExternalApiReader`/`EmbeddingUtils`/`EmbeddingUsage`（P1/P2，非本轮范围）**：见 §3.2/§3.3。
+3. **已裁定不迁移**：`TikaReader`/`PDFReader`/`WordReader`、`TableFormat`（理由见 §3.3）。
 4. **待裁定事项**
    - `RagMode` / `GenericRAGHook` 落点：core 是否新增 hook 抽象，或由 harness 承接（当前 `message.rs` 纯函数过渡）。
    - embedding HTTP 提供商（dashscope/ollama/openai）归属：RAG 扩展 vs MODEL 扩展（`src/embedding.rs` 注释倾向 MODEL）。
+   - `ImageReader` 是否补迁（§6 复核新增，见 §3.3）：技术上可机械直译，优先级 P2。
+   - `EmbeddingUsage` / `SimpleKnowledge.usageListener` 是否随 embedding trait 一起补齐（§6 复核新增）。
 5. **跨模块需求**
    - 若需在 core/harness 增加 RAG hook 或 embedding 抽象，本 crate 无权修改，需汇总方裁定（记入本 §4.2，不直接改 core/harness）。
    - 若 embedding 提供商确定归 MODEL 扩展，本 crate 仅依赖其 trait，不重复实现。
@@ -226,4 +236,92 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 - 完工后：更新 §3 条目状态与 §4，并在 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` 对应行登记。
 - **仅在本 crate 内改动**；新增依赖写入 `crates/agentscope-extensions-rag/Cargo.toml` 的 `[dependencies]`，不要改根 `Cargo.toml` 的 `[workspace.dependencies]`（如需请记入 §4.2 由汇总方处理）。
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
+
+## 6. 静态复核记录（2026-10-22）
+
+### 6.1 复核方式
+- **纯静态核对**：本轮**未执行** `cargo build` / `cargo test`，**未修改任何 Rust 代码**；仅读取 Java 源码、Rust 源码并做符号级 grep / 行数统计。所有"已完成"结论沿用上一轮（2026-09-19）的编译与测试证据，本节只做**源码级保真度复核 + 数据勘误**。
+- **Java 路径更正**：原文 `D:\IdeaProjects\agentscope-java\...` 已失效，实际为 `E:\local-github\agentscope-java\...`（已在文件头修正）。
+- **统计口径**：Java 与 Rust 统一按**非空行**（trim 后非空）统计；此口径下 Java 合计与 §6.2 的实测参考值完全吻合，故沿用。
+- **逐类核对方式**：对 tracker 中"Java 类 → Rust 对应"的每一条映射，逐个在 Rust `src/**` 中 grep 符号名，并打开对应 Java 源文件比对**行为**（而非仅同名）。
+
+### 6.2 实测统计
+
+**Java 侧**（`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-rag`，共 133 个 `.java`）
+
+| 子模块 | 主文件 | 主代码（非空行） | 测文件 | 测试（非空行） |
+|---|---|---|---|---|
+| bailian | 7 | 1447 | 8 | 1493 |
+| dify | 11 | 2509 | 6 | 1136 |
+| haystack | 10 | 1565 | 5 | 1163 |
+| ragflow | 9 | 1849 | 5 | 2091 |
+| simple | 33 | 8576 | 39 | 10909 |
+| **合计** | **70** | **15946** | **63** | **16792** |
+
+- Java core 另引用 `io.agentscope.core.rag.*` **7 类**（`Knowledge` / `KnowledgeRetrievalTools` / `GenericRAGHook` / `RAGMode` / `model.Document` / `model.DocumentMetadata` / `model.RetrieveConfig`）。
+- simple 子模块拆分：`io.agentscope.core.rag.*` **24 类** + `io.agentscope.core.embedding.*` **9 类** = **33 类**。
+
+**Rust 侧**（`crates/agentscope-extensions-rag/src`，共 **42** 个 `.rs`）
+
+| 分区 | 文件数 | 非空行 | `#[test]` | `#[tokio::test]` | 合计 |
+|---|---|---|---|---|---|
+| 根（`lib.rs`/`error`/`hash`/`knowledge`/`message`/`model`/`reader`/`retry`/`simple`/`store`/`embedding`/`transport`） | 12 | 2373 | 42 | 21 | 63 |
+| `dify/` | 7 | 1683 | 32 | 13 | 45 |
+| `ragflow/` | 7 | 1646 | 31 | 13 | 44 |
+| `bailian/` | 9 | 2608 | 55 | 9 | 64 |
+| `haystack/` | 7 | 1692 | 32 | 17 | 49 |
+| **合计** | **42** | **10002** | **192** | **73** | **265** |
+
+- 原始行数（含空行/注释）为 11144；上表"非空行"= 10002，与 §1.1 的既有口径一致。
+- `lib.rs` 声明 `pub mod` **15** 个（`bailian`/`dify`/`embedding`/`error`/`hash`/`haystack`/`knowledge`/`message`/`model`/`ragflow`/`reader`/`retry`/`simple`/`store`/`transport`），与 §1.1 一致。
+
+### 6.3 逐子模块对齐结论
+
+| 子模块 | Java 类数 | Rust 覆盖 | 结论 | 备注 |
+|---|---|---|---|---|
+| `dify` | 11 | 11/11 符号存在且行为等价 | **等价** | 请求体 `search_method`/`top_k`/`score_threshold_enabled`/`reranking_enable`/`weights`/`metadata_filtering_conditions` 逐键对齐；`buildPayloadFromSegment` 的 23 个 payload 键逐一对应；401/403 → `RagError::Auth`，其余 → `RagError::Api`；`RetryInterceptor` 的 429/5xx 重试语义与 `retry::is_retryable_error` 一致。 |
+| `ragflow` | 9 | 9/9 | **等价** | 端点 `POST /api/v1/retrieval`（Java 注释写的 `retrieve-chunks` 是**注释错误**，实际代码即 `/api/v1/retrieval`，Rust 跟的是实际行为）；`data` 可 `false`/`null`/object 的多态反序列化已复刻；错误分支 401/403→Auth、404/429/5xx→Api 逐条对齐。 |
+| `bailian` | 7 | 7/7 | **等价** | `POST https://{endpoint}/{workspaceId}/index/retrieve`；`x-acs-version=2023-12-29` / `x-acs-action=Retrieve`；请求体 camelCase（`#[serde(rename_all="camelCase")]`）、响应体 PascalCase（逐字段 `rename`）；`QueryHistoryEntry` 的 role 白名单由 `QueryRole` 枚举表达；ACS4-HMAC-SHA256 有金标向量单测。 |
+| `haystack` | 10 | 10/10 | **等价** | `code != successCode` → `RagError::Api`（Java 只记日志不抛 status 错误，Rust 保留"仅 body 不可解析才是传输错"的分裂语义）；`documents` 优先、否则 `context_documents`（SentenceWindow）已覆盖；Java 保留无 score 文档且**不重排序**，Rust 同样保留顺序。 |
+| `simple`（离线部分） | 33 + core 7 | 21/40 | **部分** | 已覆盖：`Knowledge`/`Document`/`DocumentMetadata`/`RetrieveConfig`/`SimpleKnowledge`/`Reader`/`ReaderInput`/`AbstractChunkingReader`(→`validate_chunking_parameters`)/`TextReader`/`TextChunker`/`SplitStrategy`/`VDBStoreBase`(→`VdbStore`)/`InMemoryStore`/`DistanceCalculator`/`SearchDocumentDto`(→`SearchQuery`)/`EmbeddingModel`/`EmbeddingException`/`ReaderException`/`VectorStoreException`/`KnowledgeRetrievalTools`(→`message::format_documents_for_tool`)/`GenericRAGHook`(→`message::*`)。**未覆盖见 §6.4。** |
+| `simple`（HTTP embedding 提供商） | 4 | 0/4 | **缺失** | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` —— Rust 全库 grep `DashScope`/`Ollama`/`OpenAI` **仅在注释中出现**，无任何实现。 |
+| `simple`（外部向量库） | 4 | 0/4 | **缺失** | `ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` —— Rust 全库 grep `Elasticsearch`/`Milvus` **命中 0**，`PgVector`/`Qdrant` **仅命中注释**。 |
+| `simple`（reader 增强） | 5 + 2 辅助 | 0/7 | **缺失 / 已裁定不迁移** | `TikaReader`/`PDFReader`/`WordReader`/`TableFormat` → 设计决定（不迁移）；`ImageReader`/`ExternalApiReader`/`ReaderUtils` → **新增待办**（原裁定有误，见 §6.5 勘误 3/4）。 |
+
+### 6.4 新发现缺口
+
+| 优先级 | 缺口 | Java 路径 / 证据 | Rust 现状 | 说明 |
+|---|---|---|---|---|
+| **P1** | 外部向量库 4 件（`ElasticsearchStore`/`MilvusStore`/`PgVectorStore`/`QdrantStore`） | `agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/store/{ElasticsearchStore,MilvusStore,PgVectorStore,QdrantStore}.java`（非空行 526 / 919 / 979 / 996） | **缺失**（仅 `store::VdbStore` trait 存在） | Java 侧分别走 ES REST、Milvus gRPC、Postgres JDBC(+pgvector)、Qdrant gRPC；Rust 侧需各自实现 `VdbStore`（`add`/`search`/`delete`）。均可用 `crate::transport` 或 mock trait object 做离线单测。**仍是原 §3.2 的最大缺口，未被本轮缩小。** |
+| **P1** | HTTP embedding 提供商 4 件 | `.../io/agentscope/core/embedding/{dashscope/DashScopeTextEmbedding,dashscope/DashScopeMultiModalEmbedding,ollama/OllamaTextEmbedding,openai/OpenAITextEmbedding}.java` | **缺失**（仅离线 `HashEmbeddingModel`） | 归属待裁定（MODEL 扩展 vs RAG 扩展）。`src/embedding.rs` 注释已明确倾向 MODEL。 |
+| **P2** | `ImageReader`（新增，原被误判为"不迁移"） | `.../io/agentscope/core/rag/reader/ImageReader.java`（非空行 140） | **缺失，但可机械直译** | 该文件**无任何第三方 JVM import**，仅用 core 的 `ImageBlock` + `URLSource`（Rust core `agentscope-core::message::{ImageBlock, Source::URLSource}` 已有等价类型）；docId 用 `ReaderUtils.generateDocIdMD5`（Rust `hash::md5_hex` 已覆盖）；OCR 在 Java 侧本身也是**空实现占位**。迁移成本极低。 |
+| **P2** | `ReaderUtils` 的 SHA-256 侧（MD5 侧已由 `hash::md5_hex` 覆盖） | `.../io/agentscope/core/rag/reader/ReaderUtils.java` | **部分** | `sha2` 依赖已在 crate 内（`bailian/signing.rs` 使用），补 `sha256_hex` 无需新增依赖。 |
+| **P2** | `EmbeddingUsage` / `EmbeddingResponse` / `SimpleKnowledge.usageListener` | `.../io/agentscope/core/embedding/{EmbeddingUsage,EmbeddingResponse}.java`；`.../io/agentscope/core/rag/knowledge/SimpleKnowledge.java` | **缺失** | Rust `EmbeddingModel::embed` 返回 `Vec<f64>`，**不携带 token usage**；Java `SimpleKnowledge` 每次 embed 后回调 `usageListener(EmbeddingUsage)`。若接入真实 HTTP provider，token 计量与计费回调无处落地。 |
+| **P2** | `RAGMode`（core 枚举） | `agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java` | **缺失** | 已复核：`agentscope-core` 与 `agentscope-harness` 的 Rust 源码中 grep `RagMode`/`rag_mode`/`GenericRAGHook`/`retrieved_knowledge` **命中 0**，确认 core 侧 hook 层确实未迁移（§4.2 表述属实）。`message.rs` 的纯函数过渡是当前唯一路径。 |
+| **P2** | `ExternalApiReader` | `.../io/agentscope/core/rag/reader/ExternalApiReader.java`（非空行 408） | **缺失** | 依赖 OkHttp 但 wire 契约由调用方通过 `RequestBuilder`/`ResponseParser` 注入，**本身不绑定外部服务**；可直接基于 `crate::transport` seam 实现。原 §3.3 记为"无固定 wire 契约"属实。 |
+| **P2** | `EmbeddingUtils`（超时/重试包装 + `float[]`/`List<Double>` 转换） | `.../io/agentscope/core/embedding/EmbeddingUtils.java` | **部分（能力已由 `retry::RetryPolicy` 覆盖）** | 超时/重试已由 `retry.rs` + `transport` 提供；但 `convertDoubleListToArray` 等数组转换工具在 Rust 侧无对应（`Vec<f64>` 原生可用，影响可忽略）。 |
+
+### 6.5 被证伪声明的勘误列表
+
+| # | 原文（tracker 位置） | 实际 | 处置 |
+|---|---|---|---|
+| 1 | `> **Java 源码**：D:\IdeaProjects\agentscope-java\...`（文件头） | 路径已失效，实际为 `E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-rag\` | 已修正文件头 |
+| 2 | `Java 规模（实测行数）: 主代码 **15438** / 测试 **16057**`（§1） | 主 **15946** / 测 **16792**（非空行）。差值来自 simple 子模块在上轮后继续演进（simple 主 8068→**8576**、测 10188→**10909**）与 bailian 测 1479→**1493** | 已修正 §1（含 5 个子模块分项） |
+| 3 | `§3.3 文档读取器（Tika/PDF/Word/Image）… **已完成（设计决定，不迁移）**，依据：这四个 reader 直接依赖 JVM 库（Apache Tika / PDFBox / POI）` | `ImageReader.java` 的 import 只有 `ImageBlock` / `URLSource` / `ReaderException` / `Document` / `DocumentMetadata` / `List` / `Mono` —— **零第三方 JVM 依赖**；`TikaReader`/`PDFReader`/`WordReader` 才有 tika/pdfbox/poi | 已拆分：`ImageReader` 从"不迁移"改为**待办**（§2.3 / §3.3 / §4.2） |
+| 4 | `§3.3 reader 辅助（ReaderUtils）… **已完成（设计决定，不迁移）**，依据：其 SHA-256 路径仅服务于未迁移的 Tika/PDF/Word reader` | `ReaderUtils.generateDocIdMD5` 被 **`ImageReader`**（`ImageReader.java:91`）调用；`generateDocIdSHA256` 被 `TikaReader`/`PDFReader`/`ExternalApiReader` 调用。MD5 路径服务于**可迁移**的 `ImageReader` → "无调用方即无迁移价值"前提不成立 | 已由"不迁移"改为**待办**（§2.3 / §3.3） |
+| 5 | `§3.2 simple 外部向量库 … MilvusStore(899)` | `MilvusStore.java` 非空行 **919**（899 为旧值） | 已修正为 919 |
+| 6 | `§3.1 离线单测（265 个）\| Java 测试 16057 行` | Java 测试 **16792** 行 | 已修正 |
+| 7 | `§2.3 simple 子模块 … 31 类` | simple 子模块实际 **33 类**（rag 24 + embedding 9）；若含 Java core `io.agentscope.core.rag.*` 则为 **40 类** | 已修正 §2.3 标题 |
+| 8 | `§3.3 TableFormat / 文档读取器` 状态写作 `**已完成（设计决定，不迁移）**` | 状态取值不在 §0 约定的四值域内（`待办`/`进行中`/`已完成`/`设计决定（不迁移）`），"已完成"会与"未迁移"语义冲突 | 全部规范为 `设计决定（不迁移）`；其余 `待办 P1`/`待办 P2`/`待办（非本轮范围）` 一并规范为 `待办`（P 级与"非本轮范围"信息移入说明列） |
+| 9 | `§1.1 Rust crate 文件清单（42 个源文件，10002 行，265 个内联测试）` | 数字正确，但**未说明行数口径**（原始行 11144 / 非空 10002），且未拆分 `#[test]` 与 `#[tokio::test]` | 已补充口径说明与拆分（192 + 73 = 265） |
+| 10 | `§1.1 src/lib.rs … 15 个模块声明` | 复核通过：实际 `pub mod` 计数 = **15** | 属实，无需修改 |
+
+### 6.6 复核后 rollup 状态建议
+
+- **建议 rollup 状态**：`进行中`（模块整体）。
+- **理由**：
+  1. 五个子模块中 `dify` / `ragflow` / `bailian` / `haystack` 四个**已完整等价迁移**，且有源码级逐类/逐键核对支撑；
+  2. `simple` 子模块**仅离线部分完成**，其体量最大的三块（外部向量库 4 类 ≈ 3420 行、HTTP embedding 4 类 ≈ 1315 行、reader 增强 7 类 ≈ 1400 行）在 Rust 侧**确认为零实现**，且经本次复核**新发现** `ImageReader` / `ReaderUtils` / `EmbeddingUsage` / `RAGMode` 四项此前未单列的缺口；
+  3. 因此模块既不能判 `已完成`（仍有 40 类中的 19 类未迁移），也不宜判 `待办`（已有 4/5 子模块落地且质量经得起逐类复核）。
+  4. 附注：若采用**子模块级** rollup，则 `dify`/`ragflow`/`bailian`/`haystack` 各自可判 `已完成`，`simple` 判 `进行中`。
 
