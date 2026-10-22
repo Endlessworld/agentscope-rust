@@ -5,6 +5,14 @@ use std::sync::Arc;
 
 use super::{SessionEvent, SessionLog};
 
+/// Runtime-context key carrying the committed-event export sink.
+///
+/// Mirrors Java `SessionExportSink.CONTEXT_KEY`. A host that installs a
+/// [`SessionExportSinkHandle`] under this key makes every recorder the agent opens export
+/// its committed events through [`SessionLogExporter`]; without it, exporting stays off and
+/// the run behaves exactly as before.
+pub const SESSION_EXPORT_SINK_CONTEXT_KEY: &str = "agentscope.session.exportSink";
+
 /// A committed-event sink. Implementations must deduplicate by native event id.
 ///
 /// A lost acknowledgement re-delivers the same immutable event; it never re-executes it.
@@ -14,17 +22,89 @@ pub trait SessionExportSink: Send + Sync {
 
     /// Accepts one committed event.
     fn accept(&self, event: &SessionEvent) -> crate::error::Result<()>;
+
+    /// Accepts one committed event belonging to `session_id`.
+    ///
+    /// A sink shared by several sessions (the normal case when it is installed once on an
+    /// agent) uses this to key its own dedupe state per session. Sinks bound to a single
+    /// session keep the default, which delegates to [`SessionExportSink::accept`].
+    fn accept_for(&self, _session_id: &str, event: &SessionEvent) -> crate::error::Result<()> {
+        self.accept(event)
+    }
+}
+
+/// A `SessionExportSink` that can travel through the typed
+/// [`Extensions`](crate::agent::Extensions) bag.
+///
+/// `Extensions` stores sized `Any` values, so an `Arc<dyn SessionExportSink>` cannot be
+/// inserted directly. This newtype is the handle hosts put under
+/// [`SESSION_EXPORT_SINK_CONTEXT_KEY`].
+#[derive(Clone)]
+pub struct SessionExportSinkHandle {
+    sink: Arc<dyn SessionExportSink>,
+}
+
+impl std::fmt::Debug for SessionExportSinkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionExportSinkHandle")
+            .field("name", &self.sink.name())
+            .finish()
+    }
+}
+
+impl SessionExportSinkHandle {
+    /// Wraps a sink for installation in a runtime context.
+    pub fn new(sink: Arc<dyn SessionExportSink>) -> Self {
+        Self { sink }
+    }
+
+    /// The wrapped sink.
+    pub fn sink(&self) -> Arc<dyn SessionExportSink> {
+        Arc::clone(&self.sink)
+    }
+
+    /// Builds an exporter for the sink, bound to a logical session.
+    pub fn exporter_for_session(
+        &self,
+        log: Arc<dyn SessionLog>,
+        session_id: impl Into<String>,
+    ) -> SessionLogExporter {
+        SessionLogExporter::for_session(log, Arc::clone(&self.sink), session_id)
+    }
 }
 
 /// Drains committed events into a sink using a durable outbox cursor.
 pub struct SessionLogExporter {
     log: Arc<dyn SessionLog>,
     sink: Arc<dyn SessionExportSink>,
+    /// Logical session the exported facts belong to; `None` keeps the single-session
+    /// [`SessionExportSink::accept`] contract.
+    session_id: Option<String>,
 }
 
 impl SessionLogExporter {
     pub fn new(log: Arc<dyn SessionLog>, sink: Arc<dyn SessionExportSink>) -> Self {
-        Self { log, sink }
+        Self {
+            log,
+            sink,
+            session_id: None,
+        }
+    }
+
+    /// Builds an exporter whose sink is told which logical session the events belong to.
+    ///
+    /// The recorder that drains a journal knows its session; a sink installed once on an
+    /// agent does not, so this is what lets one sink deduplicate per `sourceWatermark`.
+    pub fn for_session(
+        log: Arc<dyn SessionLog>,
+        sink: Arc<dyn SessionExportSink>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            log,
+            sink,
+            session_id: Some(session_id.into()),
+        }
     }
 
     /// Delivers every committed event after the sink's cursor, advancing as it goes.
@@ -37,7 +117,10 @@ impl SessionLogExporter {
         let head = self.log.head().await?.seq;
         let mut delivered = 0;
         for event in self.log.scan(cursor, head).await? {
-            self.sink.accept(&event)?;
+            match &self.session_id {
+                Some(session_id) => self.sink.accept_for(session_id, &event)?,
+                None => self.sink.accept(&event)?,
+            }
             self.log
                 .advance_export_cursor(&name, cursor, event.seq)
                 .await?;
@@ -146,5 +229,50 @@ mod tests {
         SessionLogExporter::new(Arc::clone(&log), a.clone()).drain().await.unwrap();
         assert_eq!(log.export_cursor("sink-a").await.unwrap(), 2);
         assert_eq!(log.export_cursor("sink-c").await.unwrap(), 0);
+    }
+
+    /// A sink installed once on an agent needs the logical session to key its dedupe state.
+    #[derive(Default)]
+    struct SessionAwareSink {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl SessionExportSink for SessionAwareSink {
+        fn name(&self) -> &str {
+            "session-aware"
+        }
+
+        fn accept(&self, _event: &SessionEvent) -> crate::error::Result<()> {
+            panic!("for_session must deliver through accept_for");
+        }
+
+        fn accept_for(
+            &self,
+            session_id: &str,
+            event: &SessionEvent,
+        ) -> crate::error::Result<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), event.event_type.clone()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn for_session_delivers_the_logical_session_id() {
+        let (log, _storage) = seeded().await;
+        let sink = Arc::new(SessionAwareSink::default());
+        SessionLogExporter::for_session(Arc::clone(&log), sink.clone(), "s1")
+            .drain()
+            .await
+            .unwrap();
+        assert_eq!(
+            *sink.seen.lock().unwrap(),
+            vec![
+                ("s1".to_string(), "run/start".to_string()),
+                ("s1".to_string(), "turn/start".to_string()),
+            ]
+        );
     }
 }

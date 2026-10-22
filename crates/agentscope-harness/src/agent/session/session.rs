@@ -17,8 +17,9 @@ use agentscope_core::event::AgentEvent;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
 use agentscope_core::session::{
     outcome, pending_interactions, session_error, transcript, Command, SessionEvent,
-    SessionExecution, SessionInbox, SessionKey, SessionLog, SessionProjection, SessionRecorder,
-    SessionTurns, Transcript, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
+    SessionExecution, SessionExportSinkHandle, SessionInbox, SessionKey, SessionLog,
+    SessionProjection, SessionRecorder, SessionTurns, Transcript, EXECUTION_CONTEXT_KEY,
+    RECORDER_CONTEXT_KEY, SESSION_EXPORT_SINK_CONTEXT_KEY,
 };
 use agentscope_core::state::AgentState;
 use futures::StreamExt;
@@ -660,7 +661,24 @@ async fn launch(
         .turn_id
         .clone()
         .ok_or_else(|| session_error("Execution command requires a turn id"))?;
-    let recorder = match SessionRecorder::open(Arc::clone(log), Some(&turn_id)).await {
+    // A host opts into committed-event export by installing a sink in the session context
+    // (Java `SessionExportSink.CONTEXT_KEY`). Without one the recorder is opened exactly as
+    // before, so unrelated harness tests and hosts are unaffected.
+    let sink = context.extension::<SessionExportSinkHandle>(SESSION_EXPORT_SINK_CONTEXT_KEY);
+    let session_id = agent
+        .session_key(context)
+        .map(|key| key.session_id)
+        .unwrap_or_default();
+    let exporter = sink.map(|handle| {
+        Arc::new(handle.exporter_for_session(Arc::clone(log), session_id))
+    });
+    let recorder = match SessionRecorder::open_with_exporter(
+        Arc::clone(log),
+        Some(&turn_id),
+        exporter,
+    )
+    .await
+    {
         Ok(recorder) => Arc::new(recorder),
         Err(error) => {
             inbox.reject(&command, &error.to_string()).await?;

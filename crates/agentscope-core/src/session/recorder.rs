@@ -203,11 +203,23 @@ impl SessionRecorder {
         log: Arc<dyn SessionLog>,
         turn_id: Option<&str>,
     ) -> crate::error::Result<Self> {
+        Self::open_with_exporter(log, turn_id, None).await
+    }
+
+    /// Opens a recorder for `turn_id` with an optional committed-event exporter in one call.
+    ///
+    /// Equivalent to [`SessionRecorder::open`] when `exporter` is `None`. This is the seam
+    /// used by the agent loop: the run id stays internal while the exporter is supplied.
+    pub async fn open_with_exporter(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        exporter: Option<Arc<SessionLogExporter>>,
+    ) -> crate::error::Result<Self> {
         Self::open_with(
             log,
             turn_id,
             &uuid::Uuid::new_v4().to_string(),
-            None,
+            exporter,
         )
         .await
     }

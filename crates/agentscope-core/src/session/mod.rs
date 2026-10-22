@@ -26,7 +26,10 @@ pub use event::{
     SessionEvent, SessionEventCodec, SessionEventCodecRegistry, SessionEventTypes,
 };
 pub use execution::{SessionExecution, EXECUTION_CONTEXT_KEY};
-pub use export::{SessionExportSink, SessionLogExporter};
+pub use export::{
+    SessionExportSink, SessionExportSinkHandle, SessionLogExporter,
+    SESSION_EXPORT_SINK_CONTEXT_KEY,
+};
 pub use header::{SessionHeader, SessionHistoryMode};
 pub use inbox::{Command, InboxSnapshot, SessionInbox};
 pub use recorder::{

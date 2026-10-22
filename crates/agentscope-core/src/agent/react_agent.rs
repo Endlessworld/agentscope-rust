@@ -36,7 +36,8 @@ use crate::state::AgentState;
 use crate::state::context::TaskContextState;
 use crate::session::{
     outcome, SessionExecution, SessionHistoryMode, SessionKey, SessionLog, SessionLogStore,
-    SessionRecorder, SessionModels, RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+    SessionRecorder, SessionModels, RECORDER_CONTEXT_KEY, SESSION_EXPORT_SINK_CONTEXT_KEY,
+    SessionExportSinkHandle, TURN_ID_CONTEXT_KEY,
 };
 use crate::tool::{TodoWriteTool, ToolExecutionContext, Toolkit};
 use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
@@ -659,7 +660,21 @@ impl ReActAgent {
             None => context,
         };
         let log = store.open(&key, &context).await?;
-        let recorder = Arc::new(SessionRecorder::open(log, turn_id.as_deref()).await?);
+        // A host opts into committed-event export by installing a sink in the run's
+        // extensions (Java `SessionExportSink.CONTEXT_KEY`). Without one this is byte-for-byte
+        // the previous path: no exporter, no extra work.
+        let sink = extensions
+            .get::<SessionExportSinkHandle>(SESSION_EXPORT_SINK_CONTEXT_KEY)
+            .or_else(|| {
+                self.core
+                    .extensions
+                    .get::<SessionExportSinkHandle>(SESSION_EXPORT_SINK_CONTEXT_KEY)
+            });
+        let exporter = sink.map(|handle| {
+            Arc::new(handle.exporter_for_session(Arc::clone(&log), key.session_id.clone()))
+        });
+        let recorder =
+            Arc::new(SessionRecorder::open_with_exporter(log, turn_id.as_deref(), exporter).await?);
         extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
         Ok(Some(recorder))
     }
