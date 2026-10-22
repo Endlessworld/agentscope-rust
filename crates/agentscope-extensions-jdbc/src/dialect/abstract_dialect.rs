@@ -8,6 +8,7 @@
 use std::sync::{Arc, RwLock};
 
 use super::bound_sql::BoundSql;
+use super::skill_dialect::{SkillDialect, SkillResourcesDialect};
 use super::store_dialect::StoreDialect;
 use super::session_state_dialect::SessionStateDialect;
 use super::snapshot_dialect::SnapshotDialect;
@@ -43,6 +44,10 @@ pub struct TableNameConfig {
     pub session_state_table_name: Option<String>,
     /// Full override for the snapshots table name.
     pub snapshot_table_name: Option<String>,
+    /// Full override for the skills table name.
+    pub skill_table_name: Option<String>,
+    /// Full override for the skill-resources table name.
+    pub skill_resources_table_name: Option<String>,
 }
 
 impl Default for TableNameConfig {
@@ -52,6 +57,8 @@ impl Default for TableNameConfig {
             store_table_name: None,
             session_state_table_name: None,
             snapshot_table_name: None,
+            skill_table_name: None,
+            skill_resources_table_name: None,
         }
     }
 }
@@ -146,7 +153,14 @@ pub fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
 /// The trait methods themselves resolve the final, prefixed table names; vendors
 /// override only the DDL/UPSERT methods where their syntax diverges.
 pub trait AbstractJdbcDialect:
-    StoreDialect + SessionStateDialect + SnapshotDialect + TableNameConfigurable + Send + Sync
+    StoreDialect
+    + SessionStateDialect
+    + SnapshotDialect
+    + SkillDialect
+    + SkillResourcesDialect
+    + TableNameConfigurable
+    + Send
+    + Sync
 {
     /// The dialect kind, used for auto-detection and reporting.
     fn kind(&self) -> DialectKind;

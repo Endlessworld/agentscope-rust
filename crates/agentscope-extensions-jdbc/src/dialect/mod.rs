@@ -19,6 +19,7 @@ mod detection;
 mod lock_strategy;
 mod native_lock;
 mod session_state_dialect;
+mod skill_dialect;
 mod snapshot_dialect;
 mod store_dialect;
 mod table_schema;
@@ -38,6 +39,7 @@ pub use native_lock::{
     PG_TRY_ADVISORY_LOCK_SQL,
 };
 pub use session_state_dialect::SessionStateDialect;
+pub use skill_dialect::{SkillDialect, SkillResourcesDialect};
 pub use snapshot_dialect::SnapshotDialect;
 pub use store_dialect::StoreDialect;
 pub use table_schema::{parse_create_table_columns, validate_table_schema};

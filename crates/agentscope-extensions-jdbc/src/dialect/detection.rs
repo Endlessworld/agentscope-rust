@@ -50,6 +50,8 @@ pub struct JdbcDialectBuilder {
     store_table_name: Option<String>,
     session_state_table_name: Option<String>,
     snapshot_table_name: Option<String>,
+    skill_table_name: Option<String>,
+    skill_resources_table_name: Option<String>,
     auto_create_table: bool,
 }
 
@@ -61,6 +63,8 @@ impl std::fmt::Debug for JdbcDialectBuilder {
             .field("store_table_name", &self.store_table_name)
             .field("session_state_table_name", &self.session_state_table_name)
             .field("snapshot_table_name", &self.snapshot_table_name)
+            .field("skill_table_name", &self.skill_table_name)
+            .field("skill_resources_table_name", &self.skill_resources_table_name)
             .field("auto_create_table", &self.auto_create_table)
             .finish()
     }
@@ -75,6 +79,8 @@ impl JdbcDialectBuilder {
             store_table_name: None,
             session_state_table_name: None,
             snapshot_table_name: None,
+            skill_table_name: None,
+            skill_resources_table_name: None,
             auto_create_table: true,
         }
     }
@@ -112,6 +118,20 @@ impl JdbcDialectBuilder {
         Ok(self)
     }
 
+    /// Overrides the full skills table name.
+    pub fn skill_table_name(mut self, name: &str) -> Result<Self, String> {
+        validate_identifier(name, "skillTableName")?;
+        self.skill_table_name = Some(name.to_string());
+        Ok(self)
+    }
+
+    /// Overrides the full skill-resources table name.
+    pub fn skill_resources_table_name(mut self, name: &str) -> Result<Self, String> {
+        validate_identifier(name, "skillResourcesTableName")?;
+        self.skill_resources_table_name = Some(name.to_string());
+        Ok(self)
+    }
+
     /// Whether to auto-create tables during component construction (default true).
     pub fn auto_create_table(mut self, value: bool) -> Self {
         self.auto_create_table = value;
@@ -143,6 +163,16 @@ impl JdbcDialectBuilder {
         self.snapshot_table_name.as_deref()
     }
 
+    /// Skills table name override, if any.
+    pub fn skill_override(&self) -> Option<&str> {
+        self.skill_table_name.as_deref()
+    }
+
+    /// Skill-resources table name override, if any.
+    pub fn skill_resources_override(&self) -> Option<&str> {
+        self.skill_resources_table_name.as_deref()
+    }
+
     /// Returns the selected dialect.
     ///
     /// Chainable configuration (prefix + per-table overrides) is applied to the dialect
@@ -162,6 +192,8 @@ impl JdbcDialectBuilder {
             store_table_name: self.store_table_name.clone(),
             session_state_table_name: self.session_state_table_name.clone(),
             snapshot_table_name: self.snapshot_table_name.clone(),
+            skill_table_name: self.skill_table_name.clone(),
+            skill_resources_table_name: self.skill_resources_table_name.clone(),
         }
     }
 

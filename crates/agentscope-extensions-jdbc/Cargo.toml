@@ -8,6 +8,10 @@ rust-version.workspace = true
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
+# Skill domain types (`AgentSkill`) come from harness; the repository backend contract
+# (`AgentSkillRepository`) lives in the skills extension crate. Per §4.5 adjudication 2,
+# the JDBC implementation lives here and the skills crate does not duplicate it.
+agentscope-extensions-skills = { path = "../agentscope-extensions-skills" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

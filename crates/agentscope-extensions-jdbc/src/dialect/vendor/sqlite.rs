@@ -4,7 +4,7 @@ use crate::dialect::abstract_dialect::{
     AbstractJdbcDialect, DialectKind, TableNameConfigurable, TableNames,
 };
 use crate::dialect::bound_sql::{BoundSql, SqlParam};
-use crate::dialect::{SessionStateDialect, SnapshotDialect, StoreDialect};
+use crate::dialect::{SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect};
 
 /// SQLite dialect: `ON CONFLICT DO UPDATE`, `BLOB` snapshots, portable table lock.
 #[derive(Debug, Clone, Default)]
@@ -178,6 +178,52 @@ impl SnapshotDialect for SqliteDialect {
                 SqlParam::Blob(data.to_vec()),
             ],
         )
+    }
+}
+
+impl SkillDialect for SqliteDialect {
+    fn skill_create_table_ddls(&self) -> Vec<String> {
+        vec![format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             id            INTEGER PRIMARY KEY AUTOINCREMENT, \
+             namespace     VARCHAR(64) NOT NULL DEFAULT 'default', \
+             name          TEXT NOT NULL, \
+             description   TEXT NOT NULL, \
+             skill_content TEXT NOT NULL, \
+             source        TEXT NOT NULL, \
+             metadata_json TEXT NULL, \
+             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+             updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+             CONSTRAINT uk_namespace_name UNIQUE (namespace, name))",
+            self.resolved_skill_table_name()
+        )]
+    }
+}
+
+impl SkillResourcesDialect for SqliteDialect {
+    fn skill_resources_create_table_ddls(&self) -> Vec<String> {
+        vec![
+            format!(
+                "CREATE TABLE IF NOT EXISTS {} (\
+                 id               INTEGER NOT NULL, \
+                 namespace        VARCHAR(64) NOT NULL DEFAULT 'default', \
+                 resource_path    TEXT NOT NULL, \
+                 resource_content TEXT NOT NULL, \
+                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+                 updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+                 PRIMARY KEY (id, resource_path), \
+                 FOREIGN KEY (id) REFERENCES {}(id) ON DELETE CASCADE)",
+                self.resolved_skill_resources_table_name(),
+                self.resolved_skill_table_name()
+            ),
+            // SQLite cannot express a secondary index inside CREATE TABLE; without it the
+            // namespace-scoped bulk resource statements full-scan the shared table.
+            format!(
+                "CREATE INDEX IF NOT EXISTS {}_namespace_idx ON {} (namespace)",
+                self.resolved_skill_resources_table_name(),
+                self.resolved_skill_resources_table_name()
+            ),
+        ]
     }
 }
 

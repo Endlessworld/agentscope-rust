@@ -12,11 +12,13 @@
 //! 1. **Facade** — [`JdbcDistributedStore`] auto-detects the dialect and assembles all
 //!    four components.
 //! 2. **Component layer** (database-agnostic) — [`JdbcStore`], [`JdbcAgentStateStore`],
-//!    [`JdbcSnapshotSpec`], [`JdbcSandboxExecutionGuard`]. Zero inline SQL — all SQL
-//!    sourced from [`dialect::BoundSql`] returned by dialect methods.
+//!    [`JdbcSnapshotSpec`], [`JdbcSandboxExecutionGuard`],
+//!    [`JdbcAgentSkillRepository`]. Zero inline SQL — all SQL sourced from
+//!    [`dialect::BoundSql`] returned by dialect methods.
 //! 3. **Dialect layer** — [`dialect::AbstractJdbcDialect`] implements all table-domain
-//!    traits (`StoreDialect`, `SessionStateDialect`, `SnapshotDialect`) plus the lock
-//!    strategy. Holds a unified table prefix + per-table overrides.
+//!    traits (`StoreDialect`, `SessionStateDialect`, `SnapshotDialect`, `SkillDialect`,
+//!    `SkillResourcesDialect`) plus the lock strategy. Holds a unified table prefix +
+//!    per-table overrides.
 //! 4. **Vendor layer** — one type per database ([`dialect::vendor`]), overriding only DDL
 //!    and divergent SQL syntax.
 //!
@@ -44,13 +46,18 @@ pub mod dialect;
 mod distributed_store;
 pub mod sandbox;
 pub mod snapshot;
+pub mod skill;
 pub mod state;
 pub mod store;
 
-pub use backend::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult, RusqliteExecutor, SharedExecutor};
+pub use backend::{
+    ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor,
+    SharedExecutor,
+};
 pub use distributed_store::JdbcDistributedStore;
 pub use sandbox::{JdbcSandboxExecutionGuard, JdbcSandboxLease, TableLockStrategy};
 pub use snapshot::{JdbcRemoteSnapshotClient, JdbcSnapshotSpec};
+pub use skill::{JdbcAgentSkillRepository, SkillRepositoryError, DEFAULT_NAMESPACE};
 pub use state::{JdbcAgentStateStore, VersionedState, UNVERSIONED};
 pub use store::JdbcStore;
 // Re-export the reused harness/core traits for ergonomic use by callers.

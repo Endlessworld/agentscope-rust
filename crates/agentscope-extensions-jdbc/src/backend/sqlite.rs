@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::types::Value;
 use rusqlite::Connection;
+use rusqlite::Transaction;
 
 use crate::dialect::{BoundSql, SqlParam};
-use super::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult};
+use super::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession};
 
 /// A [`JdbcExecutor`] backed by a single `rusqlite` connection guarded by a mutex.
 ///
@@ -68,6 +69,54 @@ fn to_rusqlite_value(param: &SqlParam) -> Value {
     }
 }
 
+fn execute_bound(conn: &Connection, bound: &BoundSql) -> JdbcResult<usize> {
+    let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
+    conn.execute(&bound.sql, rusqlite::params_from_iter(params))
+        .map_err(|e| JdbcError::Database(format!("{}: {e}", bound.sql)))
+}
+
+fn query_bound(conn: &Connection, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+    let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
+    let mut stmt = conn
+        .prepare(&bound.sql)
+        .map_err(|e| JdbcError::Database(format!("prepare {}: {e}", bound.sql)))?;
+    let column_count = stmt.column_count();
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params))
+        .map_err(|e| JdbcError::Database(format!("query {}: {e}", bound.sql)))?;
+    let mut result = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| JdbcError::Database(format!("row {}: {e}", bound.sql)))?
+    {
+        let mut record = Vec::with_capacity(column_count);
+        for i in 0..column_count {
+            let value = row
+                .get_ref(i)
+                .map_err(|e| JdbcError::Database(format!("column {i}: {e}")))?;
+            record.push(rusqlite_value_to_column(value));
+        }
+        result.push(record);
+    }
+    Ok(result)
+}
+
+/// Connection-scoped view over an open transaction, handed to
+/// [`JdbcExecutor::in_transaction`] callbacks.
+struct TxSession<'a, 'conn> {
+    tx: &'a Transaction<'conn>,
+}
+
+impl JdbcSession for TxSession<'_, '_> {
+    fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
+        execute_bound(self.tx, bound)
+    }
+
+    fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+        query_bound(self.tx, bound)
+    }
+}
+
 fn rusqlite_value_to_column(value: rusqlite::types::ValueRef<'_>) -> ColumnValue {
     match value {
         rusqlite::types::ValueRef::Null => ColumnValue::Null,
@@ -82,37 +131,11 @@ fn rusqlite_value_to_column(value: rusqlite::types::ValueRef<'_>) -> ColumnValue
 
 impl JdbcExecutor for RusqliteExecutor {
     fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
-        let conn = self.lock();
-        let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
-        conn.execute(&bound.sql, rusqlite::params_from_iter(params))
-            .map_err(|e| JdbcError::Database(format!("{}: {e}", bound.sql)))
+        execute_bound(&self.lock(), bound)
     }
 
     fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
-        let conn = self.lock();
-        let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
-        let mut stmt = conn
-            .prepare(&bound.sql)
-            .map_err(|e| JdbcError::Database(format!("prepare {}: {e}", bound.sql)))?;
-        let column_count = stmt.column_count();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(params))
-            .map_err(|e| JdbcError::Database(format!("query {}: {e}", bound.sql)))?;
-        let mut result = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| JdbcError::Database(format!("row {}: {e}", bound.sql)))?
-        {
-            let mut record = Vec::with_capacity(column_count);
-            for i in 0..column_count {
-                let value = row
-                    .get_ref(i)
-                    .map_err(|e| JdbcError::Database(format!("column {i}: {e}")))?;
-                record.push(rusqlite_value_to_column(value));
-            }
-            result.push(record);
-        }
-        Ok(result)
+        query_bound(&self.lock(), bound)
     }
 
     fn execute_batch(&self, bounds: &[BoundSql]) -> JdbcResult<()> {
@@ -150,6 +173,33 @@ impl JdbcExecutor for RusqliteExecutor {
         tx.commit()
             .map_err(|e| JdbcError::Database(format!("commit batch: {e}")))?;
         Ok(total)
+    }
+
+    /// Opens a real SQLite transaction; the callback's statements commit together or all
+    /// roll back. Dropping an uncommitted `rusqlite::Transaction` rolls back, so an error
+    /// from `work` needs no explicit rollback call.
+    fn in_transaction(
+        &self,
+        work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,
+    ) -> JdbcResult<()> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| JdbcError::Database(format!("begin transaction: {e}")))?;
+        let result = {
+            let mut session = TxSession { tx: &tx };
+            work(&mut session)
+        };
+        match result {
+            Ok(()) => tx
+                .commit()
+                .map_err(|e| JdbcError::Database(format!("commit: {e}"))),
+            Err(e) => {
+                // Dropping `tx` rolls back; keep the original error as the returned one.
+                drop(tx);
+                Err(e)
+            }
+        }
     }
 }
 

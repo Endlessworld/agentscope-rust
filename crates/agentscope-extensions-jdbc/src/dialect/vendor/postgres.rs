@@ -4,7 +4,7 @@ use crate::dialect::abstract_dialect::{
     AbstractJdbcDialect, DialectKind, TableNameConfigurable, TableNames,
 };
 use crate::dialect::bound_sql::{BoundSql, SqlParam};
-use crate::dialect::{SessionStateDialect, SnapshotDialect, StoreDialect};
+use crate::dialect::{SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect};
 
 /// PostgreSQL dialect: `ON CONFLICT DO UPDATE`, `BYTEA` snapshots, native advisory locks.
 #[derive(Debug, Clone, Default)]
@@ -179,6 +179,52 @@ impl SnapshotDialect for PostgresDialect {
                 SqlParam::Blob(data.to_vec()),
             ],
         )
+    }
+}
+
+impl SkillDialect for PostgresDialect {
+    fn skill_create_table_ddls(&self) -> Vec<String> {
+        vec![format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             id            BIGSERIAL PRIMARY KEY, \
+             namespace     VARCHAR(64) NOT NULL DEFAULT 'default', \
+             name          VARCHAR(255) NOT NULL, \
+             description   TEXT NOT NULL, \
+             skill_content TEXT NOT NULL, \
+             source        VARCHAR(255) NOT NULL, \
+             metadata_json TEXT NULL, \
+             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+             updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+             CONSTRAINT uk_namespace_name UNIQUE (namespace, name))",
+            self.resolved_skill_table_name()
+        )]
+    }
+}
+
+impl SkillResourcesDialect for PostgresDialect {
+    fn skill_resources_create_table_ddls(&self) -> Vec<String> {
+        vec![
+            format!(
+                "CREATE TABLE IF NOT EXISTS {} (\
+                 id               BIGINT NOT NULL, \
+                 namespace        VARCHAR(64) NOT NULL DEFAULT 'default', \
+                 resource_path    VARCHAR(500) NOT NULL, \
+                 resource_content TEXT NOT NULL, \
+                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+                 updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+                 PRIMARY KEY (id, resource_path), \
+                 FOREIGN KEY (id) REFERENCES {}(id) ON DELETE CASCADE)",
+                self.resolved_skill_resources_table_name(),
+                self.resolved_skill_table_name()
+            ),
+            // PostgreSQL cannot express a secondary index inside CREATE TABLE; without it
+            // the namespace-scoped bulk resource statements full-scan the shared table.
+            format!(
+                "CREATE INDEX IF NOT EXISTS {}_namespace_idx ON {} (namespace)",
+                self.resolved_skill_resources_table_name(),
+                self.resolved_skill_resources_table_name()
+            ),
+        ]
     }
 }
 

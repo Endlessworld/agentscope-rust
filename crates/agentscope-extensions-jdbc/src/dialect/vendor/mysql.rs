@@ -4,7 +4,7 @@ use crate::dialect::abstract_dialect::{
     AbstractJdbcDialect, DialectKind, TableNameConfigurable, TableNames,
 };
 use crate::dialect::bound_sql::{BoundSql, SqlParam};
-use crate::dialect::{SessionStateDialect, SnapshotDialect, StoreDialect};
+use crate::dialect::{SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect};
 
 /// MySQL dialect: `ON DUPLICATE KEY UPDATE`, `LONGBLOB` snapshots, native `GET_LOCK`.
 #[derive(Debug, Clone, Default)]
@@ -166,6 +166,53 @@ impl SnapshotDialect for MysqlDialect {
                 SqlParam::Blob(data.to_vec()),
             ],
         )
+    }
+}
+
+impl SkillDialect for MysqlDialect {
+    fn skill_create_table_ddls(&self) -> Vec<String> {
+        // `namespace` pins `utf8mb4_bin` so case-only namespace differences (Team-A vs
+        // team-a) stay distinct, matching JdbcAgentSkillRepository's namespace charset.
+        vec![format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             id            BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             namespace     VARCHAR(64) COLLATE utf8mb4_bin NOT NULL DEFAULT 'default', \
+             name          VARCHAR(255) NOT NULL, \
+             description   TEXT NOT NULL, \
+             skill_content LONGTEXT NOT NULL, \
+             source        VARCHAR(255) NOT NULL, \
+             metadata_json LONGTEXT NULL, \
+             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+             updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP \
+               ON UPDATE CURRENT_TIMESTAMP, \
+             UNIQUE KEY uk_namespace_name (namespace, name)) \
+             DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            self.resolved_skill_table_name()
+        )]
+    }
+}
+
+impl SkillResourcesDialect for MysqlDialect {
+    fn skill_resources_create_table_ddls(&self) -> Vec<String> {
+        // `idx_namespace` mirrors the store table's: the bulk resource statements filter
+        // by namespace on a table shared by every namespace, and PRIMARY KEY
+        // (id, resource_path) cannot serve that predicate (namespace is not a prefix).
+        vec![format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             id               BIGINT NOT NULL, \
+             namespace        VARCHAR(64) COLLATE utf8mb4_bin NOT NULL DEFAULT 'default', \
+             resource_path    VARCHAR(500) NOT NULL, \
+             resource_content LONGTEXT NOT NULL, \
+             created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+             updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP \
+               ON UPDATE CURRENT_TIMESTAMP, \
+             PRIMARY KEY (id, resource_path), \
+             INDEX idx_namespace (namespace), \
+             FOREIGN KEY (id) REFERENCES {}(id) ON DELETE CASCADE) \
+             DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            self.resolved_skill_resources_table_name(),
+            self.resolved_skill_table_name()
+        )]
     }
 }
 

@@ -74,6 +74,35 @@ pub enum JdbcError {
     Unsupported(String),
 }
 
+/// Minimal statement-execution surface used inside a transaction.
+///
+/// A [`JdbcExecutor`] is `Send + Sync` so it can be shared across threads; a transaction
+/// is bound to one connection and therefore must not escape the closure it was opened
+/// in. This trait is that connection-scoped view: the default
+/// [`JdbcExecutor::in_transaction`] hands out a non-escaping view of the executor itself,
+/// while real backends (e.g. [`RusqliteExecutor`]) hand out a view over an open
+/// transaction.
+pub trait JdbcSession {
+    /// Runs a mutating statement on the session's connection.
+    fn execute(&self, bound: &BoundSql) -> JdbcResult<usize>;
+
+    /// Runs a SELECT on the session's connection.
+    fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>>;
+}
+
+/// Session view over an executor that has no transaction support.
+struct ExecutorSession<'a, T: ?Sized>(&'a T);
+
+impl<T: JdbcExecutor + ?Sized> JdbcSession for ExecutorSession<'_, T> {
+    fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
+        self.0.execute(bound)
+    }
+
+    fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+        self.0.query(bound)
+    }
+}
+
 /// Minimal "execute a [`BoundSql`] against a database" surface.
 ///
 /// All JDBC components (store, state store, snapshot client, lock strategy) operate on
@@ -111,6 +140,27 @@ pub trait JdbcExecutor: Send + Sync + std::fmt::Debug {
             total += self.execute(bound)?;
         }
         Ok(total)
+    }
+
+    /// Runs `work` as one transaction, rolling back on error.
+    ///
+    /// Needed by components whose statements depend on a value produced by an earlier
+    /// statement (e.g. the skill repository reads the auto-increment id before inserting
+    /// resources), which [`Self::execute_batch`] cannot express. The default
+    /// implementation is non-transactional (it simply runs `work` against `self`); real
+    /// backends override it.
+    ///
+    /// **警告**：依赖此默认实现的多语句组件（目前是 `JdbcAgentSkillRepository`：先写
+    /// `agentscope_skills`、再按回查 id 写 `agentscope_skill_resources`）在后端未覆盖此方法
+    /// 时**没有原子性**——资源插入失败会留下孤儿 skill 行。当前 crate 内只有
+    /// `RusqliteExecutor` 提供了真事务；新增 MySQL/PostgreSQL executor 时**必须**覆盖此方法，
+    /// 否则不应把该后端用于 skill 仓库写入。
+    fn in_transaction(
+        &self,
+        work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,
+    ) -> JdbcResult<()> {
+        let mut session = ExecutorSession(self);
+        work(&mut session)
     }
 }
 
