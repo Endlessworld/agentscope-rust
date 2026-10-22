@@ -43,6 +43,7 @@ use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
 use crate::common::{diagnostics, resolve_capabilities, usage};
+use crate::common::error::{ErrorKind, ModelError};
 
 /// An OpenAI Responses API model backed by `async-openai`.
 pub struct OpenAiResponsesModel {
@@ -214,11 +215,31 @@ pub fn default_responses_registry() -> ModelRegistry {
 }
 
 fn map_openai_error(e: OpenAIError) -> Error {
+    // Must match the Chat Completions mapper (`crate::openai::map_openai_error`):
+    // dropping `type`/`code` and the transport classification makes retry/fallback
+    // decisions (rate limit, timeout, network) silently misbehave.
     match e {
-        OpenAIError::ApiError(a) => Error::HttpStatus {
-            status: a.status_code.as_u16(),
-            message: a.api_error.message,
-        },
+        OpenAIError::ApiError(a) => {
+            let api = a.api_error;
+            ModelError::from_parts(
+                "openai-responses",
+                a.status_code.as_u16(),
+                api.message,
+                api.r#type,
+                api.code,
+            )
+            .to_core()
+        }
+        OpenAIError::Reqwest(e) => {
+            let mut err = ModelError::new("openai-responses", 0, e.to_string());
+            err.kind = if e.is_timeout() {
+                ErrorKind::Timeout
+            } else {
+                ErrorKind::Network
+            };
+            err.to_core()
+        }
+        OpenAIError::StreamError(e) => Error::Http(format!("stream error: {e}")),
         other => Error::Model(format!("{other}")),
     }
 }
@@ -686,6 +707,30 @@ mod tests {
                 assert_eq!(tu.input.get("city").and_then(|v| v.as_str()), Some("Beijing"));
             }
             _ => panic!("expected tool use block"),
+        }
+    }
+
+    // The Responses mapper must preserve the same structured hints as the Chat
+    // Completions mapper; dropping `type`/`code` makes retry/fallback decisions
+    // (rate limit, context length, invalid request) impossible downstream.
+    #[test]
+    fn api_error_preserves_type_code_and_status() {
+        let api = async_openai::error::ApiErrorResponse {
+            status_code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            api_error: async_openai::error::ApiError {
+                message: "slow down".to_string(),
+                r#type: Some("rate_limit_error".to_string()),
+                param: None,
+                code: Some("rate_limit_exceeded".to_string()),
+            },
+        };
+        match map_openai_error(OpenAIError::ApiError(api)) {
+            Error::HttpStatus { status, message } => {
+                assert_eq!(status, 429);
+                assert!(message.contains("type=rate_limit_error"), "{message}");
+                assert!(message.contains("code=rate_limit_exceeded"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }

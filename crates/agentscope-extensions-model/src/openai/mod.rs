@@ -208,6 +208,9 @@ impl Model for OpenAiChatModel {
         // typed request is serialized to a JSON object and the extra params
         // are merged in before the BYOT call.
         let extra_body = options.additional_body_params.clone();
+        // Capture the transport mode before `options` is moved into the builder.
+        // `None` keeps the historical streaming default.
+        let streaming = options.stream.unwrap_or(true);
         let (request, reasoning) = build_request(
             model_name,
             messages,
@@ -237,6 +240,30 @@ impl Model for OpenAiChatModel {
         // hence the parallel `reasoning` vector recorded at build time.
         if self.reasoning_passback {
             inject_reasoning_content(&mut body, &reasoning);
+        }
+
+        // Non-streaming path. `GenerateOptions::stream == Some(false)` is what
+        // OpenAI-compatible backends that do not speak SSE expect (e.g. the
+        // Trinity-RFT adapter in Java calls `.stream(false)`); sending
+        // `stream: true` there is a protocol mismatch. The whole completion
+        // arrives as a single JSON object, so it is mapped to one
+        // `ChatResponse` and wrapped in a one-element stream to keep the trait
+        // shape unchanged.
+        //
+        // `create_byot` is used instead of `create` so the response can be
+        // decoded into [`OpenAiCompletionResponse`], which (like the streaming
+        // chunk type) preserves the non-standard `reasoning_content` field that
+        // `CreateChatCompletionResponse` would silently drop.
+        if !streaming {
+            let response = futures::stream::once(async move {
+                let completion = client
+                    .chat()
+                    .create_byot::<_, OpenAiCompletionResponse>(body)
+                    .await
+                    .map_err(map_openai_error)?;
+                Ok::<_, Error>(completion_to_response(completion))
+            });
+            return Box::pin(response);
         }
 
         // create_stream_byot lets us deserialize each SSE chunk into a custom
@@ -375,14 +402,23 @@ fn build_request(
         messages: request_messages,
         reasoning,
     } = to_request_messages(messages, reasoning_passback);
+    // `None` keeps the historical streaming default (TRAINING/agent loop relies
+    // on it); `Some(false)` must reach the wire as a plain non-streaming
+    // completion, which also means `stream_options` is meaningless and must be
+    // omitted entirely.
+    let streaming = options.stream.unwrap_or(true);
     let mut req = CreateChatCompletionRequest {
         model,
         messages: request_messages,
-        stream: Some(true),
-        stream_options: Some(ChatCompletionStreamOptions {
-            include_usage: Some(true),
-            include_obfuscation: None,
-        }),
+        stream: Some(streaming),
+        stream_options: if streaming {
+            Some(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            })
+        } else {
+            None
+        },
         tools: request_tools,
         ..Default::default()
     };
@@ -745,18 +781,59 @@ impl OpenAiStreamDelta {
     /// `reasoning_content` field (DeepSeek/O1) or the `reasoning` field used by
     /// some gateways (e.g. opencode zen). Whichever is present wins.
     fn reasoning_text(&self) -> Option<&str> {
-        if let Some(r) = &self.reasoning_content {
-            if !r.is_empty() {
-                return Some(r);
-            }
-        }
-        if let Some(r) = &self.reasoning {
-            if !r.is_empty() {
-                return Some(r);
-            }
-        }
-        None
+        reasoning_text_from(self.reasoning_content.as_deref(), self.reasoning.as_deref())
     }
+}
+
+/// Shared reasoning-field resolution for both streaming deltas and
+/// non-streaming completions: prefers `reasoning_content` (DeepSeek/O1) and
+/// falls back to `reasoning` (some OpenAI-compatible gateways). Empty strings
+/// are treated as absent so a present-but-blank field does not emit an empty
+/// thinking block.
+fn reasoning_text_from<'a>(
+    reasoning_content: Option<&'a str>,
+    reasoning: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(r) = reasoning_content {
+        if !r.is_empty() {
+            return Some(r);
+        }
+    }
+    if let Some(r) = reasoning {
+        if !r.is_empty() {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Maps OpenAI completion usage onto the core [`ChatUsage`]. Shared by the
+/// streaming accumulator and the non-streaming mapper so the two paths cannot
+/// drift (`cached_tokens` is a subset of `input_tokens` when reported).
+fn usage_from_completion(usage: &CompletionUsage) -> ChatUsage {
+    ChatUsage {
+        input_tokens: usage.prompt_tokens as u64,
+        output_tokens: usage.completion_tokens as u64,
+        cached_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0) as u64,
+        ..Default::default()
+    }
+}
+
+/// Builds a [`ToolUseBlock`] from a fully-assembled tool call. When the
+/// arguments are not a JSON object (invalid JSON, or a bare string) the raw
+/// text is kept in `content` so it still reaches the event stream instead of
+/// being silently dropped.
+fn tool_use_block(id: String, name: String, arguments: &str) -> ToolUseBlock {
+    let input = parse_arguments(arguments);
+    let mut tool_use = ToolUseBlock::new(id, name, input);
+    if tool_use.input.is_empty() && !arguments.is_empty() {
+        tool_use.content = Some(arguments.to_string());
+    }
+    tool_use
 }
 
 /// Incremental stream decoder: emits one [`ChatResponse`] per SSE chunk for
@@ -819,13 +896,7 @@ impl StreamIncrementer {
             }
         }
         if let Some(usage) = &chunk.usage {
-            let incoming = ChatUsage {
-                input_tokens: usage.prompt_tokens as u64,
-                output_tokens: usage.completion_tokens as u64,
-                cached_tokens: 0,
-                time: 0.0,
-                ..Default::default()
-            };
+            let incoming = usage_from_completion(usage);
             self.usage = Some(usage::merge_non_zero(
                 &self.usage.unwrap_or_default(),
                 &incoming,
@@ -849,16 +920,11 @@ impl StreamIncrementer {
     fn into_final(self) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for frag in self.tool_calls.values() {
-            let input = parse_arguments(&frag.arguments);
-            let mut tool_use = ToolUseBlock::new(frag.id.clone(), frag.name.clone(), input);
-            if tool_use.input.is_empty() && !frag.arguments.is_empty() {
-                // The gateway streamed arguments that are not a JSON object
-                // (or not valid JSON at all): keep the raw text so the
-                // parameters still reach the event stream instead of being
-                // silently dropped.
-                tool_use.content = Some(frag.arguments.clone());
-            }
-            blocks.push(ContentBlock::ToolUse(tool_use));
+            blocks.push(ContentBlock::ToolUse(tool_use_block(
+                frag.id.clone(),
+                frag.name.clone(),
+                &frag.arguments,
+            )));
         }
         if blocks.is_empty() && self.usage.is_none() {
             return None;
@@ -888,6 +954,96 @@ fn parse_arguments(args: &str) -> JsonMap {
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
+}
+
+/// A single non-streaming chat completion (`stream: false`).
+///
+/// Decoded with the extra `reasoning_content` / `reasoning` fields that the
+/// stock `CreateChatCompletionResponse` cannot represent, so the non-streaming
+/// path surfaces thinking exactly like the streaming path does.
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionResponse {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    choices: Vec<OpenAiCompletionChoice>,
+    #[serde(default)]
+    usage: Option<CompletionUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiCompletionChoice {
+    #[serde(default)]
+    message: OpenAiCompletionMessage,
+    #[serde(default)]
+    finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiCompletionMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatCompletionMessageToolCalls>>,
+}
+
+/// Maps a non-streaming completion onto the core [`ChatResponse`].
+///
+/// Field mapping intentionally mirrors [`StreamIncrementer`]: thinking first,
+/// then text, then refusal (rendered as text, as on the streaming path), then
+/// tool calls. The first choice wins — the agent loop never requests `n > 1`.
+/// Custom (non-function) tool calls are skipped because core only models
+/// function tools; they are rare and not used by any supported backend.
+fn completion_to_response(
+    response: OpenAiCompletionResponse,
+) -> agentscope_core::model::ChatResponse {
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    for choice in &response.choices {
+        let message = &choice.message;
+        if let Some(reasoning) = reasoning_text_from(
+            message.reasoning_content.as_deref(),
+            message.reasoning.as_deref(),
+        ) {
+            blocks.push(ContentBlock::Thinking(ThinkingBlock::new(
+                reasoning.to_string(),
+            )));
+        }
+        if let Some(content) = &message.content {
+            if !content.is_empty() {
+                blocks.push(ContentBlock::Text(TextBlock::new(content.clone())));
+            }
+        }
+        if let Some(refusal) = &message.refusal {
+            if !refusal.is_empty() {
+                blocks.push(ContentBlock::Text(TextBlock::new(refusal.clone())));
+            }
+        }
+        for call in message.tool_calls.iter().flatten() {
+            if let ChatCompletionMessageToolCalls::Function(call) = call {
+                blocks.push(ContentBlock::ToolUse(tool_use_block(
+                    call.id.clone(),
+                    call.function.name.clone(),
+                    &call.function.arguments,
+                )));
+            }
+        }
+        if let Some(fr) = &choice.finish_reason {
+            finish_reason = Some(finish_reason_string(fr.clone()));
+        }
+    }
+    let usage = response
+        .usage
+        .as_ref()
+        .map(usage_from_completion)
+        .unwrap_or_default();
+    agentscope_core::model::ChatResponse::new(response.id, blocks, usage, None, finish_reason)
 }
 
 #[cfg(test)]
@@ -1376,5 +1532,114 @@ mod tests {
             }
             other => panic!("expected JsonSchema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_stream_request_sets_stream_false_and_omits_stream_options() {
+        // TRAINING §4.3 #6: a backend that requires a plain JSON completion
+        // (e.g. Trinity-RFT, Java `TrinityModelAdapter.stream(false)`) must not
+        // receive `stream: true` nor the streaming-only `stream_options`.
+        let options = GenerateOptions {
+            stream: Some(false),
+            ..Default::default()
+        };
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            vec![sample_msg()],
+            vec![],
+            options,
+            false,
+            None,
+        );
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["stream"], serde_json::json!(false));
+        assert!(
+            body.get("stream_options").is_none(),
+            "stream_options must be omitted for a non-streaming request, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn non_stream_completion_maps_text_tool_calls_usage_and_reasoning() {
+        // A pure JSON completion (the shape returned when `stream=false`) must
+        // map onto ChatResponse without any SSE machinery.
+        let raw = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1_700_000_000u64,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "checking the weather",
+                    "reasoning_content": "need to call the tool",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Beijing\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": { "cached_tokens": 4 }
+            }
+        });
+        let response: OpenAiCompletionResponse =
+            serde_json::from_value(raw).expect("completion decodes");
+        let mapped = completion_to_response(response);
+
+        assert_eq!(mapped.id, "chatcmpl-1");
+        assert_eq!(mapped.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(mapped.usage.input_tokens, 10);
+        assert_eq!(mapped.usage.output_tokens, 5);
+        assert_eq!(mapped.usage.cached_tokens, 4);
+        assert!(
+            matches!(&mapped.content[0], ContentBlock::Thinking(t) if t.thinking == "need to call the tool"),
+            "thinking block expected, got {:?}",
+            mapped.content
+        );
+        assert!(
+            matches!(&mapped.content[1], ContentBlock::Text(t) if t.text == "checking the weather"),
+            "text block expected, got {:?}",
+            mapped.content
+        );
+        let tool = match &mapped.content[2] {
+            ContentBlock::ToolUse(t) => t,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "get_weather");
+        assert_eq!(
+            tool.input.get("city").and_then(|v| v.as_str()),
+            Some("Beijing")
+        );
+    }
+
+    #[test]
+    fn default_options_keep_streaming_request() {
+        // Regression guard: `None` (the historical default) must still produce
+        // an SSE request with usage reporting, so existing callers are
+        // unaffected by the new non-streaming branch.
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            vec![sample_msg()],
+            vec![],
+            GenerateOptions::default(),
+            false,
+            None,
+        );
+        assert_eq!(req.stream, Some(true));
+        assert_eq!(
+            req.stream_options.as_ref().and_then(|o| o.include_usage),
+            Some(true)
+        );
     }
 }
