@@ -70,7 +70,7 @@ Java 该提交新增 4 个包（非测试源码约 5,640 行）：
 ## 3. 与 Java 的已知差异
 
 1. **同步 → 异步**：Java `SessionLog` 是阻塞 SPI 并调度到 `boundedElastic`；Rust 直接用 `async_trait`，不再有调度跳。
-2. **心跳**：Java `SessionRecorder` 有 1s 周期性 flush 心跳线程；Rust 改为调用方显式 `flush()`（`record()` = append+flush）。
+2. **心跳**：Java `SessionRecorder` 用一个 1s 心跳线程同时做「续租 + flush」。Rust 把两件事拆开：**租约续期**由 `LeaseHeartbeat` 后台任务负责（周期 = `lease/4`，生产值 30s），**事实发布**仍由调用方显式 `flush()`（`record()` = append+flush）。原因：后台提交会和 agent loop 自己的 flush 抢同一个 pending 缓冲，把健康运行变成粘性 `Stale committed prefix`；而只续租就能避免「长模型流 / 慢工具期间静默超过 120s 租约」导致的 `Session writer ownership expired or fenced`。
 3. **`RuntimeContext` 扩展槽**：Java 是 `put(key, value)` 字符串键 map；Rust 新增 `Extensions`（`&'static str` 键 + `Any` 值，**写时复制**语义，`extend()` 做覆盖式合并）。
 4. **观测器异常**：Java `catch RuntimeException` + warn；Rust 用 `catch_unwind` 包裹 observer，panic 不影响请求。
 5. **`ContextTokenEstimator`** 以 `EstimateInput{messages, tools}` 入参（Java 用 `ModelCallInput`），避免把 `Arc<dyn Model>` 带进估算层。

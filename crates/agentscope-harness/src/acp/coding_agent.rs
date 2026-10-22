@@ -370,13 +370,12 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: NewSessionRequest, responder, _cx| {
                     let cwd = req.cwd;
-                    let session_id = SessionId::new(format!(
-                        "session-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)
-                    ));
+                    // A session id is the journal key: two sessions created in the same
+                    // millisecond used to collide on `session-<millis>`, so the second
+                    // recorder fenced the first one's writer lease ("Session writer ownership
+                    // expired or fenced"). Java allocates a UUID here; do the same and keep the
+                    // readable prefix for logs.
+                    let session_id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
                     let mut session = a_new.create_session(session_id.clone(), cwd);
                     session.set_additional_directories(req.additional_directories.clone());
                     // Bridge any MCP servers the client declared before serving

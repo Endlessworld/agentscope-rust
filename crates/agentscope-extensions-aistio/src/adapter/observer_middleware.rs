@@ -322,10 +322,10 @@ mod tests {
         assert!(matches!(items[0], Ok(AgentEvent::AgentEnd(_))));
     }
 
-    #[test]
-    fn observer_passes_through_without_reporter() {
+    #[tokio::test]
+    async fn observer_passes_through_without_reporter() {
         let mw = AistioObserverMiddleware::new(Arc::new(AdapterShared::default()));
-        let prompt = mw.on_system_prompt(&ctx("s1"), "base".to_string());
+        let prompt = mw.on_system_prompt(&ctx("s1"), "base".to_string()).await;
         assert_eq!(prompt, "base");
         assert!(mw.reporter().is_none());
     }

@@ -243,3 +243,10 @@
 - **ACP 取消路径（`acp/session.rs::run_prompt_inner`）**：`cancel` → 直接 `self.agent.interrupt()`（`AgentSession::interrupt` 需要 journal 已有 run id，dispatch 尚未启动时拿不到）→ 轮询 `session.task()` 直到 settled → `cancel_pending(log, turn_id)` 放后台 spawn（它会等 writer lease）。实测 121s → <0.5s。
 - ACP 两个构建点**都不再有 `state_store`**：`acp_harness_agent.rs` 与 `coding_agent.rs` 只保留 `.session_id(...)`；`acp_session_resume_test` 改为纯 journal 恢复（`.cwd(root)` + `.workspace(root/.agentscope/workspace)`）。
 - 新增回归 `event_log_mode_writes_no_state_snapshot`（`InMemoryAgentStateStore::get_session_count() == 0`）。反向验证 2 项均生效：禁用恢复写回 → `acp_session_resume` FAILED；移除 Legacy 门禁 → 新测试 FAILED。
+
+## session writer 租约与 ACP 会话 ID（2026-10-22，务必记住）
+- **`Session writer ownership expired or fenced` 的根因是缺少租约心跳**：Rust 移植时把 Java `SessionRecorder` 的 1s 心跳整个去掉，只在 `flush()` 里 `renew`。一次**静默超过 120s**（`LEASE`）的运行（长模型流 / 慢工具）期间没有 flush ⇒ 租约到期 ⇒ 工具结束回写 `action/end` 时续租失败。`Error::ActionObservation` 是**不可重试**变体（工具已真实执行），所以整个 run 直接失败。修复 = `recorder.rs` 新增 `LeaseHeartbeat`（周期 `lease/4`，**只 renew 不 commit**）。**不要**改成后台 flush：会和 agent loop 自己的 `flush()` 抢同一 pending 缓冲 ⇒ 粘性 `Stale committed prefix`。
+- **`close()` 必须先 `stop_heartbeat()`（abort **并 await**）再 `release`**：只 abort 不够，一次已在等存储的 renew 仍可能落在 release 之后把租约抢回来，留下永远没人关闭的 recorder。回归测试 `a_closed_recorder_stops_renewing_the_lease`。
+- **ACP session id 曾是 `session-<epoch_millis>`（真 bug，已修）**：session id 就是 journal 键，同毫秒创建两个会话 ⇒ 同一 journal ⇒ 第二个 recorder fence 第一个。并行测试几乎必撞，生产多客户端并发新建会话同样会撞。已改 `session-<uuid v4>`（Java 侧新建会话一律 UUID）。**之前被误判成 flaky 的 `acp_elicitation_test` 就是它**。教训：flaky 先抓失败现场（打印真实错误）再下结论。
+- **trait 方法 async 化是签名破坏性变更**：aistio `observer_passes_through_without_reporter` 未跟上 `on_system_prompt` 改 async，导致 `cargo check --workspace --all-targets` 报 `E0369`/`E0277`。改实现时必须同步 grep 所有调用点（含测试）。
+

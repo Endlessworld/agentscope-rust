@@ -3,11 +3,20 @@
 //!
 //! The recorder holds the execution writer lease for the lifetime of a run. Facts are buffered
 //! in acceptance order and published by one commit; a failed commit is retained as a sticky
-//! failure so later writes never pretend to have been persisted. Rust call sites are async, so
-//! the Java heartbeat scheduler is replaced by explicit [`SessionRecorder::flush`] calls from
-//! the agent loop.
+//! failure so later writes never pretend to have been persisted.
+//!
+//! Two independent duties that Java bundles into one 1s heartbeat thread are kept apart here:
+//!
+//! * **Lease renewal** is a background tick. A run can be silent for minutes (one long model
+//!   stream, one slow tool) while it still owns the session; without renewal the lease expires
+//!   and the next fact fails with `Session writer ownership expired or fenced` — which for an
+//!   observation is fatal, because the tool already ran and must not be replayed.
+//! * **Publishing facts** stays caller-driven ([`SessionRecorder::flush`]). A background commit
+//!   could race the agent loop's own flush on the same pending buffer and turn a healthy run
+//!   into a sticky "Stale committed prefix" failure.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +36,14 @@ pub const PARENT_CONTEXT_KEY: &str = "agentscope.session.parent";
 
 /// The execution writer lease duration.
 const LEASE: Duration = Duration::from_secs(120);
+
+/// Lower bound for the renewal tick, so a deliberately short lease (tests) still renews.
+const MIN_RENEW_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Renewal cadence for a lease: a quarter of it, keeping Java's generous safety margin.
+fn renew_interval(lease: Duration) -> Duration {
+    std::cmp::max(lease / 4, MIN_RENEW_INTERVAL)
+}
 
 /// Pending buffer ceiling before acceptance refuses to grow it further.
 const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
@@ -104,6 +121,70 @@ pub struct SessionRecorder {
     initial: SessionProjection,
     state: Mutex<RecorderState>,
     exporter: Option<Arc<SessionLogExporter>>,
+    /// The lease duration this recorder acquires and renews with.
+    lease: Duration,
+    /// Background lease renewal; `None` when no Tokio runtime was available at open time.
+    heartbeat: Mutex<Option<LeaseHeartbeat>>,
+}
+
+/// Renews the execution writer lease while the recorder is open.
+///
+/// Mirrors the renewal half of Java's `SessionRecorder` heartbeat thread. It deliberately does
+/// **not** flush: a background commit would race the agent loop's own flush on the same pending
+/// buffer. Renewal alone is what keeps a long model stream or a slow tool from losing ownership.
+struct LeaseHeartbeat {
+    stop: Arc<AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LeaseHeartbeat {
+    fn start(log: Arc<dyn SessionLog>, writer: Writer, lease: Duration) -> Option<Self> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = Arc::clone(&stop);
+        let interval = renew_interval(lease);
+        let handle = runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if task_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Err(error) = log.renew(&writer, lease).await {
+                    // The lease is gone (expired, fenced, sealed or released elsewhere).
+                    // Stop renewing; the next flush surfaces the failure instead of this
+                    // task silently writing against a journal another writer now owns.
+                    tracing::warn!("session writer lease renewal failed: {error}");
+                    return;
+                }
+            }
+        });
+        Some(Self { stop, handle: Some(handle) })
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+
+    /// Aborts the task and waits until it is really gone.
+    ///
+    /// `abort` alone is not enough before releasing the lease: a renewal that is already
+    /// awaiting storage could still land afterwards and reclaim ownership.
+    async fn shutdown(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl std::fmt::Debug for SessionRecorder {
@@ -138,6 +219,20 @@ impl SessionRecorder {
         run_id: &str,
         exporter: Option<Arc<SessionLogExporter>>,
     ) -> crate::error::Result<Self> {
+        Self::open_with_lease(log, turn_id, run_id, exporter, LEASE).await
+    }
+
+    /// Opens a recorder whose writer lease (and renewal cadence) is explicit.
+    ///
+    /// Production callers use [`SessionRecorder::open_with`]; the shorter lease exists so a test
+    /// can observe renewal without waiting two minutes.
+    pub(crate) async fn open_with_lease(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        run_id: &str,
+        exporter: Option<Arc<SessionLogExporter>>,
+        lease: Duration,
+    ) -> crate::error::Result<Self> {
         let turn_id = match turn_id {
             Some(id) if id.trim().is_empty() => {
                 return Err(session_error("Run and turn IDs must not be blank"));
@@ -149,7 +244,7 @@ impl SessionRecorder {
             return Err(session_error("Run and turn IDs must not be blank"));
         }
 
-        let writer = log.acquire(run_id, LEASE).await?;
+        let writer = log.acquire(run_id, lease).await?;
         let prepared = async {
             let initial = SessionProjection::read(&*log).await?;
             let durable_seq = initial.as_of_seq;
@@ -207,6 +302,8 @@ impl SessionRecorder {
             };
 
         Ok(Self {
+            heartbeat: Mutex::new(LeaseHeartbeat::start(Arc::clone(&log), writer.clone(), lease)),
+            lease,
             log,
             writer,
             run_id: run_id.to_string(),
@@ -323,7 +420,7 @@ impl SessionRecorder {
             guard.batch_id = Some(batch_id.clone());
             (batch_id, guard.pending.clone(), guard.durable_seq)
         };
-        self.log.renew(&self.writer, LEASE).await?;
+        self.log.renew(&self.writer, self.lease).await?;
         let commit = self.log.commit(&self.writer, &batch, expected, &events).await;
         match commit {
             Ok(head) => {
@@ -693,7 +790,22 @@ impl SessionRecorder {
             }
             guard.closed = true;
         }
+        // Stop renewing *before* releasing: a tick that lands after the release would claim the
+        // lease again and leave the session owned by a recorder nobody will ever close.
+        self.stop_heartbeat().await;
         let _ = self.log.release(&self.writer).await;
+    }
+
+    /// Stops the background lease renewal and waits for its task to end.
+    async fn stop_heartbeat(&self) {
+        let heartbeat = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.shutdown().await;
+        }
     }
 
     /// Records the runtime facts not already captured at a model/tool boundary.
@@ -1130,6 +1242,62 @@ mod tests {
         let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
         recorder.close().await;
         recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_run_keeps_its_writer_lease() {
+        // Regression: the lease used to be renewed only by `flush()`. A run that stayed silent
+        // past the lease (one long model stream, one slow tool) lost ownership, so the tool's
+        // `action/end` fact failed with "Session writer ownership expired or fenced" — fatal,
+        // because the tool had already run and must not be replayed.
+        let (log, _storage) = journal().await;
+        let lease = Duration::from_millis(200);
+        let recorder = SessionRecorder::open_with_lease(
+            Arc::clone(&log),
+            Some("t1"),
+            "run-1",
+            None,
+            lease,
+        )
+        .await
+        .unwrap();
+
+        // No flush for several lease lifetimes.
+        tokio::time::sleep(lease * 3).await;
+
+        // The next acknowledged fact still succeeds because the heartbeat kept the lease alive.
+        recorder
+            .record("run/start", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(log.head().await.unwrap().owner.as_deref(), Some("run-1"));
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_recorder_stops_renewing_the_lease() {
+        // A heartbeat tick that lands after `close()` would reclaim the lease and leave the
+        // session owned by a recorder nobody will ever close again.
+        let (log, _storage) = journal().await;
+        let lease = Duration::from_millis(200);
+        let recorder = SessionRecorder::open_with_lease(
+            Arc::clone(&log),
+            Some("t1"),
+            "run-1",
+            None,
+            lease,
+        )
+        .await
+        .unwrap();
+        recorder.close().await;
+
+        tokio::time::sleep(lease * 3).await;
+
+        let head = log.head().await.unwrap();
+        assert_eq!(head.owner, None, "released lease must not be reclaimed");
+        // Another run can take the session, which is what a closed recorder promises.
+        let next = log.acquire("run-2", lease).await.unwrap();
+        log.release(&next).await.unwrap();
     }
 
     #[tokio::test]
