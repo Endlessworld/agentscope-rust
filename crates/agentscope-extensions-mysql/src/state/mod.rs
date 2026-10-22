@@ -276,6 +276,12 @@ impl AgentStateStore for MysqlAgentStateStore {
         if require_session_id(session_id).is_err() {
             return;
         }
+        // Java: `if (values.isEmpty()) return;` (MysqlAgentStateStore.java:571-573).
+        // Without this guard an empty write reaches the backend with `from_index =
+        // list_len(...)`, which trims every existing item — silently wiping the list.
+        if values.is_empty() {
+            return;
+        }
         let encoded: Vec<String> = values
             .iter()
             .filter_map(|v| serde_json::to_string(v).ok())
@@ -463,6 +469,20 @@ mod tests {
         assert_eq!(
             s.get_list(Some("u"), "sess", "msgs").await,
             vec![json!(9)]
+        );
+    }
+
+    // Java: MysqlAgentStateStore#saveList — `values.isEmpty()` returns early, so an
+    // empty write is a no-op rather than a clear.
+    #[tokio::test]
+    async fn save_list_empty_is_a_no_op() {
+        let s = store();
+        s.save_list(Some("u"), "sess", "msgs", &[json!(1), json!(2)])
+            .await;
+        s.save_list(Some("u"), "sess", "msgs", &[]).await;
+        assert_eq!(
+            s.get_list(Some("u"), "sess", "msgs").await,
+            vec![json!(1), json!(2)]
         );
     }
 
