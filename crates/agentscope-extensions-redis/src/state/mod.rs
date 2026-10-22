@@ -182,7 +182,12 @@ impl RedisAgentStateStore {
 
     /// Conditional save (compare-and-swap), mirroring Java `saveIfVersion`.
     ///
-    /// Returns the new version on success, or `UNVERSIONED` (`0`) on conflict.
+    /// `expected_version` is a real CAS version; `0` means "create if absent" (the stored
+    /// version must still be `0`). Pass [`UNCONDITIONAL_EXPECTED`] to overwrite without a
+    /// version check.
+    ///
+    /// Returns the new version (always `>= 1`) on success, or `0` on conflict. `0` is never
+    /// a valid success value because every write bumps the version.
     pub async fn save_if_version(
         &self,
         user_id: Option<&str>,
@@ -191,10 +196,7 @@ impl RedisAgentStateStore {
         value: &Value,
         expected_version: u64,
     ) -> Result<u64> {
-        if expected_version == 0 {
-            // Mirrors Java: UNVERSIONED -> unconditional bump. (Java's UNVERSIONED is a
-            // dedicated sentinel; for a freshly-created key version 0 also means
-            // "create if absent", which the SAVE_SCRIPT handles via current_version().)
+        if expected_version == UNCONDITIONAL_EXPECTED {
             return self
                 .save_versioned(user_id, session_id, key, value, UNCONDITIONAL_EXPECTED)
                 .await;
@@ -373,10 +375,12 @@ impl AgentStateStore for RedisAgentStateStore {
         value: Value,
         expected_version: i64,
     ) -> i64 {
-        // Redis versions are `u64` and use `0` as its conflict sentinel; the core contract
-        // uses `i64` and `UNVERSIONED`. `0` on the Redis side means "unconditional bump".
+        // Core contract: `UNVERSIONED` (-1) is the unconditional sentinel and `0` is a real
+        // CAS version meaning "create if absent". The u64-backed implementation uses
+        // `UNCONDITIONAL_EXPECTED` (u64::MAX) for the former, so the sentinels never collide.
+        // Successful writes always bump to >= 1, so `Ok(0)` unambiguously means "conflict".
         let expected = if expected_version == agentscope_core::state::UNVERSIONED {
-            0
+            UNCONDITIONAL_EXPECTED
         } else if expected_version < 0 {
             return agentscope_core::state::UNVERSIONED;
         } else {
@@ -385,7 +389,7 @@ impl AgentStateStore for RedisAgentStateStore {
         match RedisAgentStateStore::save_if_version(self, user_id, session_id, key, &value, expected)
             .await
         {
-            Ok(0) if expected != 0 => agentscope_core::state::UNVERSIONED,
+            Ok(0) => agentscope_core::state::UNVERSIONED,
             Ok(v) => i64::try_from(v).unwrap_or(i64::MAX),
             Err(_) => agentscope_core::state::UNVERSIONED,
         }
@@ -991,11 +995,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_if_version_zero_bumps_unconditionally() {
+    async fn save_if_version_zero_creates_only_when_absent() {
         let (store, _adapter) = store();
-        // Mirrors Java UNVERSIONED handling: 0 -> unconditional bump.
-        assert_eq!(store.save_if_version(Some("u1"), "s1", "k", &json!(1), 0).await.unwrap(), 1);
-        assert_eq!(store.save_if_version(Some("u1"), "s1", "k", &json!(2), 0).await.unwrap(), 2);
+        // Core contract: 0 == create-if-absent (mirrors Java `saveIfVersion(..., 0)`).
+        assert_eq!(
+            store.save_if_version(Some("u1"), "s1", "k", &json!(1), 0).await.unwrap(),
+            1
+        );
+        // The key now exists at version 1, so another 0-expectation is a conflict.
+        assert_eq!(
+            store.save_if_version(Some("u1"), "s1", "k", &json!(2), 0).await.unwrap(),
+            0
+        );
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn save_if_version_unconditional_sentinel_always_writes() {
+        let (store, _adapter) = store();
+        // u64::MAX is the in-crate unconditional sentinel, never a real version.
+        assert_eq!(
+            store
+                .save_if_version(Some("u1"), "s1", "k", &json!(1), UNCONDITIONAL_EXPECTED)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .save_if_version(Some("u1"), "s1", "k", &json!(2), UNCONDITIONAL_EXPECTED)
+                .await
+                .unwrap(),
+            2
+        );
         assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
     }
 
