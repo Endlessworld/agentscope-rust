@@ -315,16 +315,23 @@ impl PostgresAgentStateStore {
                 self.full_table
             );
             let params = [
-                SqlValue::text(slot),
+                SqlValue::text(&slot),
                 SqlValue::text(key),
                 SqlValue::int(SINGLE_STATE_INDEX),
-                SqlValue::text(json),
+                SqlValue::text(&json),
                 SqlValue::BigInt(now),
             ];
-            return match self.client.query(&sql, &params)? {
-                QueryOutcome::Affected(1) => Ok(1),
-                _ => Ok(UNVERSIONED),
-            };
+            match self.client.query(&sql, &params)? {
+                QueryOutcome::Affected(1) => return Ok(1),
+                // The row already exists. If its stored version is still `0` (e.g. back-filled
+                // by an older ALTER TABLE that used DEFAULT 0), that satisfies the CAS the
+                // caller asked for: fall through to the generic branch, which bumps 0 -> 1.
+                // A concurrent writer that already moved it past 0 matches nothing there and
+                // correctly reports a conflict. Mirrors Java `PostgresAgentStateStore`
+                // and its regression test
+                // `saveIfVersionZeroFallsBackToCasUpdateForBackfilledRow`.
+                _ => {}
+            }
         }
 
         let new_version = expected_version + 1;
@@ -632,10 +639,11 @@ mod tests {
         assert!(c.has_table(DEFAULT_TABLE_NAME));
         let ddl = c.ddl_statements();
         assert!(ddl.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS")));
-        // Java ensureVersionColumn(): the back-fill ALTER runs on every build.
+        // Java ensureVersionColumn(): the back-fill ALTER runs on every build, and uses
+        // DEFAULT 1 because 0 means "row absent" to the CAS path.
         assert!(ddl
             .iter()
-            .any(|s| s.contains("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0")));
+            .any(|s| s.contains("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1")));
     }
 
     // Java: PostgresAgentStateStoreTest#builderWithCustomNames
@@ -914,6 +922,29 @@ mod tests {
         // UNVERSIONED behaves as an unconditional save.
         assert_eq!(s.save_if_version(None, "s", "k", &v1, UNVERSIONED).unwrap(), 3);
         assert_eq!(s.get(None, "s", "k").await, Some(v1));
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveIfVersionZeroFallsBackToCasUpdateForBackfilledRow
+    //
+    // A row back-filled by an older `ALTER TABLE ... DEFAULT 0` migration sits at version 0.
+    // `save_if_version(..., 0)` must not report a phantom conflict; it bumps 0 -> 1.
+    #[tokio::test]
+    async fn save_if_version_zero_falls_back_to_cas_for_backfilled_row() {
+        let c = client();
+        let s = store(&c);
+        c.seed_session_row(&slot("s"), "k", SINGLE_STATE_INDEX, r#"{"n":0}"#, 0);
+
+        let written = json!({"n": 1});
+        assert_eq!(s.save_if_version(None, "s", "k", &written, 0).unwrap(), 1);
+        assert_eq!(s.version_of(None, "s", "k").unwrap(), 1);
+        assert_eq!(s.get(None, "s", "k").await, Some(written));
+
+        // Once past 0, another create-only write is a genuine conflict.
+        assert_eq!(
+            s.save_if_version(None, "s", "k", &json!({"n": 2}), 0)
+                .unwrap(),
+            UNVERSIONED
+        );
     }
 
     // ---- list hashing (`:_hash` companion row, core `list_hash`) -----------

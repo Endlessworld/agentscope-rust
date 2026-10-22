@@ -93,18 +93,19 @@ impl PostgresSandboxExecutionGuard {
 
     /// Computes the 64-bit advisory-lock key for an isolation key.
     ///
-    /// Derivation: `prefix + scope_lowercased + ":" + value`, hashed to `i64`.
+    /// Derivation: `prefix + scope_lowercased + ":" + value`, hashed with
+    /// `MurmurHash3.hash128(...)[0]` — byte-for-byte the Java
+    /// `PostgresSandboxExecutionGuard#composeLockKey`. Matching the algorithm matters:
+    /// Rust and Java processes sharing one database must contend on the same key, or both
+    /// sides acquire "the same" lock independently and mutual exclusion silently fails.
     pub fn compose_lock_key(&self, key: &SandboxIsolationKey) -> i64 {
-        use std::hash::{Hash, Hasher};
         let raw = format!(
             "{}{}:{}",
             self.key_prefix,
             key.scope.to_lowercase(),
             key.value
         );
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        raw.hash(&mut h);
-        h.finish() as i64
+        crate::murmur3::lock_key(&raw)
     }
 
     /// Tries to acquire the advisory lock, polling until the timeout expires.
@@ -213,8 +214,9 @@ mod tests {
     //! second "connection" over the same lock table, so re-entrancy, contention and release
     //! can all be asserted without a live server.
     //!
-    //! Note: the 64-bit lock key uses `DefaultHasher` where Java uses MurmurHash3, so the
-    //! two languages do not interoperate — see the gap tracker §3.3.
+    //! Note: the 64-bit lock key uses MurmurHash3 x64/128 hash[0], exactly as
+    //! `PostgresSandboxExecutionGuard#composeLockKey` does, so Rust and Java interoperate
+    //! on the same advisory-lock keys (see `crate::murmur3`).
 
     use super::*;
     use crate::memory::MemoryClient;

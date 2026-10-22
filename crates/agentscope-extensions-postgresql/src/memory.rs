@@ -82,6 +82,29 @@ impl MemoryClient {
         self.tables.lock().unwrap().sessions.len()
     }
 
+    /// Seeds a session-state row at an explicit version.
+    ///
+    /// Exists so tests can reproduce rows back-filled by an older `ALTER TABLE ... DEFAULT 0`
+    /// migration, which the normal write paths never produce (they always start at 1).
+    pub fn seed_session_row(
+        &self,
+        session_id: &str,
+        state_key: &str,
+        item_index: i32,
+        state_data: &str,
+        version: i64,
+    ) {
+        self.tables.lock().unwrap().sessions.insert(
+            (session_id.to_string(), state_key.to_string(), item_index),
+            SessionRow {
+                state_data: state_data.to_string(),
+                version,
+                created_at: 0,
+                updated_at: 0,
+            },
+        );
+    }
+
     /// Returns the number of rows in the KV store table.
     pub fn store_row_count(&self) -> usize {
         self.tables.lock().unwrap().store.len()

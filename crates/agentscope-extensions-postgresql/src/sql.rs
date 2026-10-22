@@ -128,9 +128,15 @@ pub fn snapshots_ddl(full_table: &str) -> String {
 ///
 /// Mirrors the Java `PostgresAgentStateStore.ensureVersionColumn()`, which back-fills the
 /// `version` column on databases created before versioning was introduced.
+///
+/// `DEFAULT 1` (not `0`): the ALTER back-fills pre-existing rows with the default, and `0`
+/// is the sentinel `getVersioned()` reports for "row absent". Back-filling `0` would make
+/// every pre-existing row look absent to `save_if_version(..., 0)`, which takes the INSERT
+/// branch and reports a phantom CAS conflict. Both write paths start at version 1, so 1 is
+/// the correct resting value for migrated rows.
 pub fn ensure_version_column_ddl(full_table: &str) -> String {
     format!(
-        "ALTER TABLE {full_table} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0"
+        "ALTER TABLE {full_table} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1"
     )
 }
 
@@ -184,7 +190,8 @@ mod tests {
     fn ensure_version_column_ddl_targets_full_table() {
         let ddl = ensure_version_column_ddl("\"s\".\"t\"");
         assert!(ddl.starts_with("ALTER TABLE \"s\".\"t\""));
-        assert!(ddl.contains("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0"));
+        // Back-fill default must be 1, not 0: 0 means "row absent" to the CAS path.
+        assert!(ddl.contains("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1"));
     }
 
     #[test]
@@ -324,7 +331,7 @@ mod tests {
     fn migration_and_verification_sql_are_well_formed() {
         let ddl = ensure_version_column_ddl("\"agentscope\".\"agentscope_sessions\"");
         assert!(ddl.starts_with("ALTER TABLE \"agentscope\".\"agentscope_sessions\""));
-        assert!(ddl.ends_with("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0"));
+        assert!(ddl.ends_with("ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1"));
         assert!(SCHEMA_EXISTS_QUERY.contains("WHERE SCHEMA_NAME = $1"));
         assert!(TABLE_EXISTS_QUERY.contains("WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2"));
     }

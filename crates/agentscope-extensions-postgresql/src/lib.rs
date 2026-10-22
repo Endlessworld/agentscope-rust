@@ -28,6 +28,8 @@ pub mod sql;
 pub mod state;
 pub mod store;
 
+mod murmur3;
+
 #[cfg(feature = "postgres-driver")]
 pub mod driver;
 
