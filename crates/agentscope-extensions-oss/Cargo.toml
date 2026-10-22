@@ -3,14 +3,15 @@ name = "agentscope-extensions-oss"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 
 [features]
 default = []
-# Enables the concrete Alibaba Cloud OSS backend. Off by default so the crate
-# builds without pulling the SDK; the trait-based surface (OssClient) is always
-# available and testable.
-aliyun = ["dep:aliyun-oss-rust-sdk"]
+# Enables `S3OssClient`, a generic S3-compatible backend (AWS S3, MinIO, Ceph,
+# Aliyun OSS S3-compatible endpoints, ...). Off by default so the crate still
+# builds without the HTTP/TLS dependency stack; the trait-based surface
+# (`OssClient` + `InMemoryOssClient`) is always available.
+s3 = ["dep:rust-s3"]
 
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
@@ -23,11 +24,14 @@ tokio = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-# Optional concrete backend (feature `aliyun`)，当前代码未接线（无 `cfg(feature = "aliyun")`
-# 使用点）。0.0.4 仍钉 reqwest 0.11（仅存在于 Cargo.lock，未参与构建）；升级到 0.2.2
-# 需要联网取包，本轮离线环境未做。
-aliyun-oss-rust-sdk = { version = "0.0.4", optional = true, default-features = false }
+# Generic S3 backend. `default-features = false` avoids native-tls/OpenSSL; the
+# `tokio-rustls-tls` feature pulls in rustls + tokio. `fail-on-err` makes
+# non-2xx responses surface as typed `S3Error::HttpFailWithBody(status, body)`
+# instead of raw response objects, so error mapping stays structured.
+rust-s3 = { version = "0.38", optional = true, default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Local fake S3 over real HTTP for end-to-end tests (no cloud credentials).
+httpmock = "0.7"
 

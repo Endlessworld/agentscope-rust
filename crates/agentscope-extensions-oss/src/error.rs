@@ -36,6 +36,33 @@ pub enum OssError {
     /// Underlying backend/transport failure.
     #[error("oss backend error: {0}")]
     Backend(String),
+
+    /// The generic S3 backend (`rust-s3`) failed.
+    ///
+    /// Kept as a typed variant (rather than a `String`) so callers can inspect
+    /// HTTP status codes / retryability through [`s3::error::S3Error`].
+    #[cfg(feature = "s3")]
+    #[error("s3 backend error: {0}")]
+    S3(#[from] s3::error::S3Error),
+
+    /// S3 client configuration was invalid (bad region/endpoint/runtime).
+    #[cfg(feature = "s3")]
+    #[error("s3 configuration error: {0}")]
+    S3Config(String),
+
+    /// S3 credentials were neither supplied nor found in the environment.
+    #[cfg(feature = "s3")]
+    #[error(
+        "S3 credentials are required: set access_key/secret_key or \
+         AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+    )]
+    MissingCredentials,
+
+    /// An S3 request returned an unexpected HTTP status (only reachable when
+    /// `rust-s3` does not turn the response into an error itself).
+    #[cfg(feature = "s3")]
+    #[error("s3 request failed with HTTP {status}: {body}")]
+    S3Http { status: u16, body: String },
 }
 
 impl From<OssError> for CoreError {
