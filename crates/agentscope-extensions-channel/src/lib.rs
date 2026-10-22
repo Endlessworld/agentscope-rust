@@ -20,9 +20,9 @@
 //!   any test.
 //! - Outbound clients take an [`common::HttpTransport`], which makes request construction and
 //!   response handling fully unit-testable with a recording transport.
-//! - Not yet ported (tracked in `docs/extensions/CHANNEL__GAP_TRACKER.md` §3): the DingTalk
-//!   Stream (WebSocket) client, the Feishu/WeCom callback controllers (need a web framework) and
-//!   the AES-CBC payload decryption helpers (need the `aes`/`cbc` crates).
+//! - All six platform adapters are ported, including their callback controllers (axum) and the
+//!   AES-CBC payload helpers. Remaining gaps are tracked in
+//!   `docs/extensions/CHANNEL__GAP_TRACKER.md` §3.
 
 pub mod common;
 pub mod dingtalk;

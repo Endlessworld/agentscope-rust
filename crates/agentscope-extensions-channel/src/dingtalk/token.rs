@@ -38,7 +38,10 @@ impl DingTalkAccessTokenProvider {
     /// Build the token-refresh request (pure, testable).
     pub fn build_request(&self) -> PreparedRequest {
         PreparedRequest::post_json(
-            format!("{}/v1.0/oauth2/accessToken", self.api_base.trim_end_matches('/')),
+            format!(
+                "{}/v1.0/oauth2/accessToken",
+                self.api_base.trim_end_matches('/')
+            ),
             json!({ "appKey": self.app_key, "appSecret": self.app_secret }),
         )
     }
@@ -56,8 +59,12 @@ impl DingTalkAccessTokenProvider {
                     "DingTalk accessToken response missing accessToken: {body}"
                 ))
             })?;
-        let expires_in = node.get("expireIn").and_then(|v| v.as_i64()).unwrap_or(7200);
-        self.cache.store(token.clone(), refresh_at_ms(now_ms(), expires_in));
+        let expires_in = node
+            .get("expireIn")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(7200);
+        self.cache
+            .store(token.clone(), refresh_at_ms(now_ms(), expires_in));
         Ok(token)
     }
 }
@@ -126,11 +133,15 @@ mod tests {
 
     #[tokio::test]
     async fn token_is_fetched_once_then_cached() {
-        let transport = Arc::new(RecordingTransport::with_responses(vec![PreparedResponse::new(
-            200,
-            r#"{"accessToken":"tok-9","expireIn":7200}"#,
-        )]));
-        let p = DingTalkAccessTokenProvider::new("https://api.dingtalk.com", "k", "s", transport.clone());
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, r#"{"accessToken":"tok-9","expireIn":7200}"#),
+        ]));
+        let p = DingTalkAccessTokenProvider::new(
+            "https://api.dingtalk.com",
+            "k",
+            "s",
+            transport.clone(),
+        );
         assert_eq!(p.token().await.unwrap(), "tok-9");
         assert_eq!(p.token().await.unwrap(), "tok-9");
         assert_eq!(transport.request_count(), 1);
@@ -142,7 +153,12 @@ mod tests {
             PreparedResponse::new(200, r#"{"accessToken":"tok-1","expireIn":7200}"#),
             PreparedResponse::new(200, r#"{"accessToken":"tok-2","expireIn":7200}"#),
         ]));
-        let p = DingTalkAccessTokenProvider::new("https://api.dingtalk.com", "k", "s", transport.clone());
+        let p = DingTalkAccessTokenProvider::new(
+            "https://api.dingtalk.com",
+            "k",
+            "s",
+            transport.clone(),
+        );
         assert_eq!(p.token().await.unwrap(), "tok-1");
         p.invalidate();
         assert_eq!(p.token().await.unwrap(), "tok-2");

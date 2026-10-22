@@ -66,8 +66,9 @@ impl DingTalkStreamProtocol {
     /// Parse the `open` response into an endpoint, mirroring the Java
     /// `IllegalStateException` on a missing/blank `endpoint` or `ticket`.
     pub fn parse_endpoint(body: &str) -> Result<StreamEndpoint> {
-        let node: Value = serde_json::from_str(body)
-            .map_err(|e| ChannelError::Http(format!("DingTalk gateway open returned bad JSON: {e}")))?;
+        let node: Value = serde_json::from_str(body).map_err(|e| {
+            ChannelError::Http(format!("DingTalk gateway open returned bad JSON: {e}"))
+        })?;
         let text = |key: &str| -> Option<String> {
             node.get(key)
                 .and_then(Value::as_str)
@@ -425,6 +426,9 @@ mod tests {
             Some("rc".into()),
             None,
             None,
+            None,
+            None,
+            None,
             Some("https://open.example/stream".into()),
         )
         .unwrap()
@@ -527,10 +531,9 @@ mod tests {
 
     #[test]
     fn parse_endpoint_requires_both_fields() {
-        let ok = DingTalkStreamProtocol::parse_endpoint(
-            r#"{"endpoint":"wss://x/ws","ticket":"t-1"}"#,
-        )
-        .unwrap();
+        let ok =
+            DingTalkStreamProtocol::parse_endpoint(r#"{"endpoint":"wss://x/ws","ticket":"t-1"}"#)
+                .unwrap();
         assert_eq!(ok.url, "wss://x/ws");
         assert_eq!(ok.ticket, "t-1");
 
@@ -540,14 +543,23 @@ mod tests {
             r#"{"endpoint":"  ","ticket":"t-1"}"#,
             "not json",
         ] {
-            assert!(DingTalkStreamProtocol::parse_endpoint(bad).is_err(), "{bad}");
+            assert!(
+                DingTalkStreamProtocol::parse_endpoint(bad).is_err(),
+                "{bad}"
+            );
         }
     }
 
     #[test]
     fn websocket_url_appends_ticket_with_the_right_separator() {
-        let plain = StreamEndpoint { url: "wss://x/ws".into(), ticket: "t-1".into() };
-        assert_eq!(DingTalkStreamProtocol::websocket_url(&plain), "wss://x/ws?ticket=t-1");
+        let plain = StreamEndpoint {
+            url: "wss://x/ws".into(),
+            ticket: "t-1".into(),
+        };
+        assert_eq!(
+            DingTalkStreamProtocol::websocket_url(&plain),
+            "wss://x/ws?ticket=t-1"
+        );
 
         let with_query = StreamEndpoint {
             url: "wss://x/ws?k=v".into(),
@@ -561,9 +573,15 @@ mod tests {
 
     #[test]
     fn callback_detection_is_case_insensitive_and_ignores_other_types() {
-        assert!(DingTalkStreamProtocol::is_callback(&json!({"type": "CALLBACK"})));
-        assert!(DingTalkStreamProtocol::is_callback(&json!({"type": "callback"})));
-        assert!(!DingTalkStreamProtocol::is_callback(&json!({"type": "SYSTEM"})));
+        assert!(DingTalkStreamProtocol::is_callback(
+            &json!({"type": "CALLBACK"})
+        ));
+        assert!(DingTalkStreamProtocol::is_callback(
+            &json!({"type": "callback"})
+        ));
+        assert!(!DingTalkStreamProtocol::is_callback(
+            &json!({"type": "SYSTEM"})
+        ));
         assert!(!DingTalkStreamProtocol::is_callback(&json!({})));
     }
 
@@ -595,9 +613,7 @@ mod tests {
 
         assert!(DingTalkStreamProtocol::callback_payload(&json!({"type": "CALLBACK"})).is_none());
         assert!(DingTalkStreamProtocol::callback_payload(&json!({"data": 42})).is_none());
-        assert!(
-            DingTalkStreamProtocol::callback_payload(&json!({"data": "{oops"})).is_none()
-        );
+        assert!(DingTalkStreamProtocol::callback_payload(&json!({"data": "{oops"})).is_none());
     }
 
     #[test]
@@ -606,7 +622,10 @@ mod tests {
         let mut b = DEFAULT_INITIAL_BACKOFF;
         b = DingTalkStreamProtocol::next_backoff(b, max);
         assert_eq!(b, Duration::from_secs(2));
-        assert_eq!(DingTalkStreamProtocol::next_backoff(b, max), Duration::from_secs(4));
+        assert_eq!(
+            DingTalkStreamProtocol::next_backoff(b, max),
+            Duration::from_secs(4)
+        );
         assert_eq!(
             DingTalkStreamProtocol::next_backoff(Duration::from_secs(60), max),
             max
@@ -740,7 +759,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(recorder.sent.lock().unwrap().len(), 1, "only the last is acked");
+        assert_eq!(
+            recorder.sent.lock().unwrap().len(),
+            1,
+            "only the last is acked"
+        );
         assert!(recorder.payloads.lock().unwrap().is_empty());
     }
 
@@ -790,7 +813,10 @@ mod tests {
 
         assert!(!client.is_running());
         assert_eq!(recorder.payloads.lock().unwrap().len(), 1);
-        assert!(connect_count.load(Ordering::SeqCst) >= 2, "reconnected after close");
+        assert!(
+            connect_count.load(Ordering::SeqCst) >= 2,
+            "reconnected after close"
+        );
     }
 
     #[tokio::test]

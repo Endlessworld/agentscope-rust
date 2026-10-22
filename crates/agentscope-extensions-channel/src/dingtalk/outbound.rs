@@ -155,7 +155,10 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         let req = &reqs[0];
         assert_eq!(req.method, HttpMethod::Post);
-        assert_eq!(req.url, "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend");
+        assert_eq!(
+            req.url,
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+        );
         assert_eq!(req.header_value("x-acs-dingtalk-access-token"), Some("tok"));
         let body = req.body.as_ref().unwrap();
         assert_eq!(body["robotCode"], json!("robot-1"));
@@ -174,7 +177,10 @@ mod tests {
             .prepare("tok", &address, &[Msg::user("**bold** reply")])
             .unwrap();
         let req = &reqs[0];
-        assert_eq!(req.url, "https://api.dingtalk.com/v1.0/robot/groupMessages/send");
+        assert_eq!(
+            req.url,
+            "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+        );
         let body = req.body.as_ref().unwrap();
         assert_eq!(body["msgKey"], json!("sampleMarkdown"));
         assert_eq!(body["openConversationId"], json!("conv-9"));
