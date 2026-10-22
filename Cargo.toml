@@ -23,7 +23,7 @@ members = [
     "crates/agentscope-extensions-postgresql",
     "crates/agentscope-extensions-cos",
     "crates/agentscope-extensions-oss",
-    "crates/agentscope-extensions-aistio",
+    "crates/agentscope-extensions-controlplane",
     "crates/agentscope-extensions-studio",
     "crates/agentscope-extensions-skills",
     "crates/agentscope-extensions-scheduler",
@@ -62,7 +62,7 @@ ignore = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# HTTP 服务端选型：统一 axum（protocol / aistio / channel；裁定见
+# HTTP 服务端选型：统一 axum（protocol / controlplane / channel；裁定见
 # docs/extensions/EXTENSIONS_GAP_TRACKER.md §2.1 "HTTP 框架选型"）。
 axum = { version = "0.7", default-features = false, features = ["json", "tokio", "http1", "query"] }
 http = "1"
