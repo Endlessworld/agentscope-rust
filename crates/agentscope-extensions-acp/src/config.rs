@@ -4,14 +4,12 @@
 //! `model` and `mode` select options advertised to the client.
 
 use agent_client_protocol::schema::v1::{
-    SessionConfigGroupId, SessionConfigKind, SessionConfigOption, SessionConfigSelect,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionConfigValueId,
+    SessionConfigGroupId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelect, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionConfigValueId,
 };
 use agentscope_core::model::catalog::{ModelCatalog, ModelDescriptor, ResolveRequest};
-use agentscope_core::{
-    PermissionBehavior, PermissionContextState, PermissionMode, PermissionRule,
-};
+use agentscope_core::{PermissionBehavior, PermissionContextState, PermissionMode, PermissionRule};
 
 /// Mode id for the read-only exploration/planning mode.
 pub const MODE_PLAN: &str = "plan";
@@ -82,6 +80,7 @@ pub fn thought_level_option(current: &str) -> SessionConfigOption {
         SessionConfigValueId::new(current),
         SessionConfigSelectOptions::Ungrouped(options),
     )
+    .category(SessionConfigOptionCategory::ThoughtLevel)
 }
 
 /// Derives thought-level ids from a catalog descriptor.
@@ -128,15 +127,18 @@ pub fn thought_level_ids_for(model: &str, models: &[ModelChoice]) -> Vec<String>
     thought_level_ids(descriptor.as_deref())
 }
 
-/// Builds a thought-level option from a descriptor. Returns `None` when the model is
-/// known to be non-reasoning (the option is removed instead of showing fake choices).
+/// Builds a thought-level option from a descriptor.
+///
+/// The option is always emitted so clients keep a visible selector: a model the
+/// catalog reports as non-reasoning still advertises `auto` (which sends no
+/// reasoning parameter) instead of losing the control entirely.
 pub fn thought_level_option_for(
     current: &str,
     descriptor: Option<&ModelDescriptor>,
-) -> Option<SessionConfigOption> {
-    let ids = thought_level_ids(descriptor);
+) -> SessionConfigOption {
+    let mut ids = thought_level_ids(descriptor);
     if ids.is_empty() {
-        return None;
+        ids.push(DEFAULT_THOUGHT_LEVEL.to_string());
     }
     let current = if ids.iter().any(|id| id == current) {
         current
@@ -150,12 +152,14 @@ pub fn thought_level_option_for(
             SessionConfigSelectOption::new(id, label)
         })
         .collect();
-    Some(SessionConfigOption::select(
+    SessionConfigOption::select(
         CONFIG_THOUGHT_LEVEL,
         "Thought",
         SessionConfigValueId::new(current),
         SessionConfigSelectOptions::Ungrouped(options),
-    ))
+    )
+    .category(SessionConfigOptionCategory::ThoughtLevel)
+    .description("Reasoning effort applied to the next prompt")
 }
 
 fn thought_level_label(id: &str) -> String {
@@ -177,99 +181,54 @@ fn thought_level_label(id: &str) -> String {
     }
 }
 
-/// Builds the `model` select config option, grouped by provider and enriched with
-/// catalog cards when the catalog has a matching entry.
+/// Builds the `model` select config option, enriched with catalog cards when the
+/// catalog has a matching entry.
+///
+/// The list is emitted flat by default: grouped selects render as an empty
+/// dropdown in several clients (IntelliJ IDEA 2026 among them). Callers that know
+/// the client renders groups can opt in via [`model_option_grouped`].
 pub fn model_option(current: &str, models: &[ModelChoice]) -> SessionConfigOption {
-    let mut grouped: std::collections::BTreeMap<String, Vec<SessionConfigSelectOption>> =
+    model_option_with(current, models, false)
+}
+
+/// Builds the `model` select option, grouping choices by provider when
+/// `grouped` is set and every choice carries a provider key.
+pub fn model_option_grouped(current: &str, models: &[ModelChoice]) -> SessionConfigOption {
+    model_option_with(current, models, true)
+}
+
+fn model_option_with(current: &str, models: &[ModelChoice], grouped: bool) -> SessionConfigOption {
+    let mut by_provider: std::collections::BTreeMap<String, Vec<SessionConfigSelectOption>> =
         std::collections::BTreeMap::new();
     let mut ungrouped = Vec::new();
-    let mut has_provider = false;
+    let mut can_group = grouped;
 
     for choice in models {
-        let descriptor = resolve_choice(choice);
-        let mut option = SessionConfigSelectOption::new(choice.id.clone(), choice.name.clone());
-        if let Some(descriptor) = &descriptor {
-            option = option.description(model_description(descriptor));
-            let card = serde_json::json!({
-                "schema": 1,
-                "catalogKey": descriptor.key,
-                "confidence": "catalog",
-                "provider": descriptor.provider,
-                "model": descriptor.id,
-                "contextWindow": descriptor.context_window,
-                "maxInputTokens": descriptor.input_limit(
-                    agentscope_core::model::catalog::DEFAULT_RESERVED_OUTPUT
-                ),
-                "maxOutputTokens": descriptor.max_output,
-                "inputModalities": descriptor.input_modalities,
-                "outputModalities": descriptor.output_modalities,
-                "attachment": descriptor.attachment,
-                "capabilities": {
-                    "toolCall": descriptor.tool_call,
-                    "reasoning": descriptor.reasoning,
-                    "structuredOutput": descriptor.structured_output,
-                    "temperature": descriptor.temperature,
-                    "interleavedReasoning": descriptor.interleaved_field,
-                },
-                "reasoningLevels": thought_level_ids(Some(descriptor)),
-                "useCases": descriptor.use_cases,
-                "status": descriptor.status,
-                "cost": descriptor.cost,
-            });
-            let meta = serde_json::json!({ "agentscope.dev/model": card })
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            option = option.meta(meta);
-        } else {
-            option = option.description(format!(
-                "{} · default 256k · text + text",
-                choice.name
-            ));
-            let card = serde_json::json!({
-                "schema": 1,
-                "catalogKey": null,
-                "confidence": "default",
-                "provider": choice.provider,
-                "model": choice.id,
-                "contextWindow": agentscope_core::model::catalog::DEFAULT_CONTEXT_WINDOW,
-                "maxInputTokens": agentscope_core::model::catalog::DEFAULT_CONTEXT_WINDOW
-                    .saturating_sub(agentscope_core::model::catalog::DEFAULT_RESERVED_OUTPUT)
-                    .saturating_sub(5_120),
-                "maxOutputTokens": agentscope_core::model::catalog::DEFAULT_RESERVED_OUTPUT,
-                "inputModalities": ["text"],
-                "outputModalities": ["text"],
-                "attachment": false,
-                "capabilities": {
-                    "toolCall": true,
-                    "reasoning": false,
-                    "structuredOutput": null,
-                    "temperature": true,
-                    "interleavedReasoning": null,
-                },
-                "reasoningLevels": ["auto"],
-                "useCases": [],
-                "status": "active",
-                "cost": null,
-            });
-            let meta = serde_json::json!({ "agentscope.dev/model": card })
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            option = option.meta(meta);
-        }
+        let option = model_select_option(choice);
         match choice.provider.as_deref() {
             Some(provider) if !provider.is_empty() => {
-                has_provider = true;
-                grouped.entry(provider.to_string()).or_default().push(option);
+                by_provider
+                    .entry(provider.to_string())
+                    .or_default()
+                    .push(option);
             }
-            _ => ungrouped.push(option),
+            _ => {
+                can_group = false;
+                ungrouped.push(option);
+            }
         }
     }
 
-    let options = if has_provider {
+    let options = if models.is_empty() {
+        // Never advertise a `currentValue` that is absent from the list: clients
+        // render an empty dropdown (or drop the option) in that case.
+        SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
+            current.to_string(),
+            current.to_string(),
+        )])
+    } else if can_group && !by_provider.is_empty() {
         let mut groups = Vec::new();
-        for (provider, options) in grouped {
+        for (provider, options) in by_provider {
             groups.push(SessionConfigSelectGroup::new(
                 SessionConfigGroupId::new(provider.clone()),
                 provider,
@@ -285,7 +244,9 @@ pub fn model_option(current: &str, models: &[ModelChoice]) -> SessionConfigOptio
         }
         SessionConfigSelectOptions::Grouped(groups)
     } else {
-        SessionConfigSelectOptions::Ungrouped(ungrouped)
+        // Preserve the configured order when flattening.
+        let flat: Vec<SessionConfigSelectOption> = models.iter().map(model_select_option).collect();
+        SessionConfigSelectOptions::Ungrouped(flat)
     };
 
     SessionConfigOption::select(
@@ -294,6 +255,80 @@ pub fn model_option(current: &str, models: &[ModelChoice]) -> SessionConfigOptio
         SessionConfigValueId::new(current),
         options,
     )
+    .category(SessionConfigOptionCategory::Model)
+    .description("Model capabilities, context window and input types follow the selection")
+}
+
+/// Builds one model choice, attaching the catalog card as `_meta` when known.
+fn model_select_option(choice: &ModelChoice) -> SessionConfigSelectOption {
+    let mut option = SessionConfigSelectOption::new(choice.id.clone(), choice.name.clone());
+    let descriptor = resolve_choice(choice);
+    if let Some(descriptor) = &descriptor {
+        option = option.description(model_description(descriptor));
+        let card = serde_json::json!({
+            "schema": 1,
+            "catalogKey": descriptor.key,
+            "confidence": "catalog",
+            "provider": descriptor.provider,
+            "model": descriptor.id,
+            "contextWindow": descriptor.context_window,
+            "maxInputTokens": descriptor.input_limit(
+                agentscope_core::model::catalog::DEFAULT_RESERVED_OUTPUT
+            ),
+            "maxOutputTokens": descriptor.max_output,
+            "inputModalities": descriptor.input_modalities,
+            "outputModalities": descriptor.output_modalities,
+            "attachment": descriptor.attachment,
+            "capabilities": {
+                "toolCall": descriptor.tool_call,
+                "reasoning": descriptor.reasoning,
+                "structuredOutput": descriptor.structured_output,
+                "temperature": descriptor.temperature,
+                "interleavedReasoning": descriptor.interleaved_field,
+            },
+            "reasoningLevels": thought_level_ids(Some(descriptor)),
+            "useCases": descriptor.use_cases,
+            "status": descriptor.status,
+            "cost": descriptor.cost,
+        });
+        let meta = serde_json::json!({ "agentscope.dev/model": card })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        return option.meta(meta);
+    }
+    option = option.description(format!("{} · default 256k · text + text", choice.name));
+    let card = serde_json::json!({
+        "schema": 1,
+        "catalogKey": null,
+        "confidence": "default",
+        "provider": choice.provider,
+        "model": choice.id,
+        "contextWindow": agentscope_core::model::catalog::DEFAULT_CONTEXT_WINDOW,
+        "maxInputTokens": agentscope_core::model::catalog::DEFAULT_CONTEXT_WINDOW
+            .saturating_sub(agentscope_core::model::catalog::DEFAULT_RESERVED_OUTPUT)
+            .saturating_sub(5_120),
+        "maxOutputTokens": agentscope_core::model::catalog::DEFAULT_RESERVED_OUTPUT,
+        "inputModalities": ["text"],
+        "outputModalities": ["text"],
+        "attachment": false,
+        "capabilities": {
+            "toolCall": true,
+            "reasoning": false,
+            "structuredOutput": null,
+            "temperature": true,
+            "interleavedReasoning": null,
+        },
+        "reasoningLevels": ["auto"],
+        "useCases": [],
+        "status": "active",
+        "cost": null,
+    });
+    let meta = serde_json::json!({ "agentscope.dev/model": card })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    option.meta(meta)
 }
 
 pub(crate) fn resolve_choice(choice: &ModelChoice) -> Option<std::sync::Arc<ModelDescriptor>> {
@@ -355,6 +390,7 @@ pub fn mode_option(current: &str, modes: &[ModeChoice]) -> SessionConfigOption {
         SessionConfigValueId::new(current),
         SessionConfigSelectOptions::Ungrouped(options),
     )
+    .category(SessionConfigOptionCategory::Mode)
 }
 
 /// Returns the default set of config options (model + mode).
@@ -378,17 +414,40 @@ pub fn default_config_options_with_thought(
     modes: &[ModeChoice],
     current_thought_level: &str,
 ) -> Vec<SessionConfigOption> {
-    let mut opts = default_config_options(current_model, models, current_mode, modes);
+    default_config_options_with_thought_grouped(
+        current_model,
+        models,
+        current_mode,
+        modes,
+        current_thought_level,
+        false,
+    )
+}
+
+/// Same as [`default_config_options_with_thought`], with an explicit choice
+/// between a grouped and a flat model list.
+pub fn default_config_options_with_thought_grouped(
+    current_model: &str,
+    models: &[ModelChoice],
+    current_mode: &str,
+    modes: &[ModeChoice],
+    current_thought_level: &str,
+    group_models: bool,
+) -> Vec<SessionConfigOption> {
+    let model = if group_models {
+        model_option_grouped(current_model, models)
+    } else {
+        model_option(current_model, models)
+    };
     let descriptor = models
         .iter()
-        .find(|model| model.id == current_model)
+        .find(|choice| choice.id == current_model)
         .and_then(resolve_choice);
-    if let Some(option) =
-        thought_level_option_for(current_thought_level, descriptor.as_deref())
-    {
-        opts.push(option);
-    }
-    opts
+    vec![
+        model,
+        mode_option(current_mode, modes),
+        thought_level_option_for(current_thought_level, descriptor.as_deref()),
+    ]
 }
 
 /// Reads the current value of a select config option (or returns `None`).
@@ -486,6 +545,77 @@ mod tests {
         let opt = model_option("openai:gpt-4o", &models);
         assert_eq!(opt.id.to_string(), "model");
         assert_eq!(select_current_value(&opt).as_deref(), Some("openai:gpt-4o"));
+        assert_eq!(opt.category, Some(SessionConfigOptionCategory::Model));
+    }
+
+    fn provider_models() -> Vec<ModelChoice> {
+        vec![
+            ModelChoice {
+                id: "a".into(),
+                name: "Go/a".into(),
+                provider: Some("Go".into()),
+                ..Default::default()
+            },
+            ModelChoice {
+                id: "b".into(),
+                name: "Go/b".into(),
+                provider: Some("Go".into()),
+                ..Default::default()
+            },
+            ModelChoice {
+                id: "c".into(),
+                name: "Zen/c".into(),
+                provider: Some("Zen".into()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn model_option_is_flat_by_default() {
+        // Grouped selects render as an empty dropdown in several clients, so the
+        // default form must stay flat while preserving every choice.
+        let opt = model_option("a", &provider_models());
+        match &opt.kind {
+            SessionConfigKind::Select(select) => match &select.options {
+                SessionConfigSelectOptions::Ungrouped(items) => {
+                    let ids: Vec<&str> = items.iter().map(|i| i.value.0.as_ref()).collect();
+                    assert_eq!(ids, vec!["a", "b", "c"]);
+                }
+                other => panic!("expected ungrouped options, got {other:?}"),
+            },
+            other => panic!("expected a select option, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_option_grouped_keeps_provider_groups() {
+        let opt = model_option_grouped("a", &provider_models());
+        match &opt.kind {
+            SessionConfigKind::Select(select) => match &select.options {
+                SessionConfigSelectOptions::Grouped(groups) => {
+                    let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+                    assert_eq!(names, vec!["Go", "Zen"]);
+                }
+                other => panic!("expected grouped options, got {other:?}"),
+            },
+            other => panic!("expected a select option, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thought_level_option_is_always_emitted() {
+        // An unknown model keeps the historical choices so clients still show the
+        // selector before the first catalog refresh.
+        let opts = default_config_options_with_thought("m", &[], "yolo", &[], "auto");
+        let thought = opts
+            .iter()
+            .find(|opt| opt.id.to_string() == CONFIG_THOUGHT_LEVEL)
+            .expect("thought level option present");
+        assert_eq!(
+            thought.category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        );
     }
 
     #[test]

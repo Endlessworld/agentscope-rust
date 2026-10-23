@@ -28,9 +28,9 @@ use agent_client_protocol::schema::v1::{
     ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, InitializeRequest,
     NoticeCapabilities, PermissionOptionKind, PlanCapabilities, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind, SessionConfigKind,
-    SessionConfigSelectOptions,
+    SessionConfigKind, SessionConfigSelectOptions, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;

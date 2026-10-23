@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use agent_client_protocol::schema::v1::ClientCapabilities;
+use agent_client_protocol::schema::v1::{ClientCapabilities, Implementation};
 /// Capability view of the connected ACP client.
 ///
 /// Defaults to "nothing advertised", i.e. every optional update is suppressed
@@ -16,6 +16,7 @@ use agent_client_protocol::schema::v1::ClientCapabilities;
 #[derive(Clone, Default)]
 pub struct ClientSupport {
     capabilities: Arc<RwLock<ClientCapabilities>>,
+    client_info: Arc<RwLock<Option<Implementation>>>,
 }
 
 impl ClientSupport {
@@ -27,6 +28,25 @@ impl ClientSupport {
     /// Records the capabilities advertised in the `initialize` request.
     pub fn set_capabilities(&self, capabilities: ClientCapabilities) {
         *self.capabilities.write().unwrap() = capabilities;
+    }
+
+    /// Records the client identity (`clientInfo`) advertised at `initialize`.
+    pub fn set_client_info(&self, client_info: Option<Implementation>) {
+        *self.client_info.write().unwrap() = client_info;
+    }
+
+    /// A snapshot of the advertised client identity.
+    pub fn client_info(&self) -> Option<Implementation> {
+        self.client_info.read().unwrap().clone()
+    }
+
+    /// Whether the connected client is IntelliJ IDEA 2026.
+    ///
+    /// That client renders only flat select options: grouped model lists show an
+    /// empty dropdown, so the agent must fall back to `Ungrouped`.
+    pub fn is_intellij_2026(&self) -> bool {
+        self.client_info()
+            .is_some_and(|info| info.name.contains("IntelliJ") && info.version.contains("2026"))
     }
 
     /// A snapshot of the advertised capabilities.
@@ -139,5 +159,19 @@ mod tests {
             ),
         );
         assert!(support.supports_elicitation_form());
+    }
+
+    #[test]
+    fn intellij_2026_is_detected_from_client_info() {
+        use agent_client_protocol::schema::v1::Implementation;
+
+        let support = ClientSupport::new();
+        assert!(!support.is_intellij_2026());
+
+        support.set_client_info(Some(Implementation::new("JetBrains", "2024.3")));
+        assert!(!support.is_intellij_2026());
+
+        support.set_client_info(Some(Implementation::new("IntelliJ IDEA", "2026.1")));
+        assert!(support.is_intellij_2026());
     }
 }

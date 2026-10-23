@@ -378,7 +378,13 @@ fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf
     let safe: String = session_id
         .to_string()
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
         .collect();
     cwd.join(".agentscope")
         .join("acp-sessions")
@@ -949,17 +955,28 @@ impl AcpAgentSession {
             cfg.thought_level = super::config::DEFAULT_THOUGHT_LEVEL.to_string();
             save_session_config(&self.config_path, &cfg);
         }
-        super::config::default_config_options_with_thought(
+        super::config::default_config_options_with_thought_grouped(
             &cfg.model,
             &self.models,
             &cfg.mode,
             &self.modes,
             &cfg.thought_level,
+            self.supports_grouped_model_list(),
         )
     }
 
+    /// Whether the connected client renders grouped select options.
+    ///
+    /// IntelliJ IDEA 2026 shows an empty dropdown for grouped model lists, so it
+    /// gets the flat form; other clients keep provider grouping.
+    fn supports_grouped_model_list(&self) -> bool {
+        !self.support.is_intellij_2026()
+    }
+
     /// Catalog descriptor for the currently selected model, when available.
-    pub fn selected_descriptor(&self) -> Option<std::sync::Arc<agentscope_core::model::catalog::ModelDescriptor>> {
+    pub fn selected_descriptor(
+        &self,
+    ) -> Option<std::sync::Arc<agentscope_core::model::catalog::ModelDescriptor>> {
         let model = self.config.lock().unwrap().model.clone();
         self.models
             .iter()
@@ -969,7 +986,8 @@ impl AcpAgentSession {
 
     /// Catalog key for the currently selected model, when available.
     pub fn selected_catalog_key(&self) -> Option<String> {
-        self.selected_descriptor().map(|descriptor| descriptor.key.clone())
+        self.selected_descriptor()
+            .map(|descriptor| descriptor.key.clone())
     }
 
     /// Pushes `ConfigOptionUpdate` + `UsageUpdate` to the bound client. Used by the
@@ -988,6 +1006,29 @@ impl AcpAgentSession {
         let _ = client.notify(config);
         let used = self.usage.input_tokens;
         let _ = client.notify(self.usage_notification(used));
+    }
+
+    /// Pushes a `UsageUpdate` sized for the *selected* model.
+    ///
+    /// `set_config_option` switches models lazily: the live agent keeps the old
+    /// model until the next prompt, so [`usage_notification`](Self::usage_notification)
+    /// would report the previous window. Size the gauge from the catalog
+    /// descriptor of the newly selected model instead.
+    pub fn push_usage_for_selected_model(&self) {
+        use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
+        let Some(client) = self.client.lock().unwrap().clone() else {
+            return;
+        };
+        let size = self
+            .selected_descriptor()
+            .map(|descriptor| descriptor.context_window as u64)
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW as u64);
+        let update = SessionNotification::new(
+            self.session_id.clone(),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(self.usage.input_tokens, size)),
+        );
+        let _ = client.notify(update);
     }
 
     /// Cancels any active prompt request.

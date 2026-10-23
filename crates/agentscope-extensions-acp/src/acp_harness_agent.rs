@@ -585,10 +585,13 @@ impl ModelConfig {
         keys.sort();
 
         // Count bare ids first so only genuinely ambiguous ids get a provider prefix.
-        let mut counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for provider_key in &keys {
-            for id in self.providers[*provider_key].models.iter().map(|(id, _)| id) {
+            for id in self.providers[*provider_key]
+                .models
+                .iter()
+                .map(|(id, _)| id)
+            {
                 *counts.entry(id.to_string()).or_default() += 1;
             }
         }
@@ -756,15 +759,15 @@ The current working directory is：{cwd} 所有文件操作仅限于工作目录
     先执行每一步 最后一起批量验证/修复验证
     对于rust项目 subagent不要求编译验证 由主agent验证和兜底
     ```
-    1. [步骤] →  更新todo
-    2. [步骤] →  更新todo
-    3. [步骤] →  更新todo
+    1. [步骤1] →  更新todo
+    2. [步骤2] →  更新todo
+    3. [步骤3] →  更新todo
     4. 验证：[检查] → 修复验证
     5. 更新todo
     ```
 ## 5.代码库探索与加载
     - 如果工作目录下存在 AGENTS.md 或 README.md 可以通过它们快速了解当前项目
-    - 使用codegraph加载代码仓库 : 适用于任何代码库的代码智能与知识图谱 使用codegraph -h查看用法
+    - 使用codegraph查看当前代码仓库的知识图谱，获取调用链/方法实现等等，具体使用codegraph -h查看用法
     - 使用rg命令代替grep glob工具
     - 无论何时优先使用codegraph进行代码查找与读取
 </编码指南>
@@ -1017,7 +1020,9 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         )
         // 工具结果外置：超过 80k 字符的工具输出（如构建日志）写入磁盘，
         // context 只保留预览占位符，避免大输出驻留内存。
-        .tool_result_eviction(ToolResultEvictionConfig::defaults().scaled_for_window(context_window))
+        .tool_result_eviction(
+            ToolResultEvictionConfig::defaults().scaled_for_window(context_window),
+        )
         .max_iters(9999)
         // 被中断/崩溃打断后，把悬挂的 tool_use 补成 error result 再续跑，避免
         // ToolCallPairSanitizer 静默丢弃整条 assistant 消息（对齐 Java maybePatchPendingToolCalls）。

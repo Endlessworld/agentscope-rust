@@ -359,6 +359,11 @@ impl AcpCodingAgent {
                     a_init
                         .client_support
                         .set_capabilities(initialize.client_capabilities.clone());
+                    // The client identity drives option rendering (e.g. IntelliJ
+                    // needs a flat model list instead of grouped options).
+                    a_init
+                        .client_support
+                        .set_client_info(initialize.client_info.clone());
                     let mut caps = a_init.capabilities();
                     if !a_init.providers.is_empty() {
                         caps = caps.providers(
@@ -467,6 +472,10 @@ impl AcpCodingAgent {
                                 );
                             }
                             session.set_model(value);
+                            // The live agent keeps the previous model until the
+                            // next prompt, so refresh the context-window gauge
+                            // from the newly selected model's descriptor now.
+                            session.push_usage_for_selected_model();
                         }
                         "thought_level" => {
                             if !session.has_thought_level(&value) {
