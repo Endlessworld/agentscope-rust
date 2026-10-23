@@ -40,6 +40,13 @@ impl Turn {
     ///
     /// A failed run is terminal: there is nothing to resume, so the next submit must be
     /// allowed to start instead of waiting for the failed turn forever.
+    ///
+    /// An `interrupted` turn is deliberately **not** terminal: its reconciled context can
+    /// still be continued with the session's `resume` path (Java `handleInterrupt` parity),
+    /// and the journal keeps the partial assistant message for exactly that. The cost is that
+    /// an interrupted turn blocks new submissions until someone closes it — a host that gave
+    /// up on it must call [`abandon_turn`](super::abandon_turn) (which records unknown tool
+    /// outcomes as `interrupted` and writes `turn/cancelled`) rather than wait.
     pub fn ended(&self) -> bool {
         self.status == "completed" || self.status == "cancelled" || self.status == "failed"
     }

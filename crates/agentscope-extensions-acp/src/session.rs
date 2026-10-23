@@ -1277,6 +1277,29 @@ impl AcpAgentSession {
             // unaffected, so dropping the event here is safe.
             let _ = events_tx.send(event.clone());
         }));
+        // A previous turn may still be open (the process died mid-run, the provider stalled,
+        // the host stopped waiting). Such a turn is *not* terminal — only `resume` may
+        // continue it — so submitting a new prompt would be rejected by the dispatcher and
+        // the client would wait forever on a `queued` receipt. Close it first: the caller has
+        // clearly moved on. Unknown tool outcomes become `interrupted` (never success).
+        match session.abandon_unfinished().await {
+            Ok(Some(turn_id)) => {
+                tracing::info!(
+                    session = %self.session_id,
+                    turn = %turn_id,
+                    "closed an unfinished turn before starting a new prompt"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: could not close the previous turn: {error}"),
+                    None,
+                ));
+                return StopReason::Refusal;
+            }
+        }
         let task = match session.submit_msg(message).await {
             Ok(task) => task,
             Err(error) => {
@@ -1321,6 +1344,16 @@ impl AcpAgentSession {
         // queue is drained after settlement.
         let mut settled_task: Option<agentscope_harness::agent::session::Task> = None;
         let mut cancelled = false;
+        // Watchdog state. A receipt that never leaves `queued`/`starting` means the
+        // dispatcher refused or never admitted the command; without a deadline the client
+        // would wait on an idle connection forever (no error, no timeout).
+        let started = std::time::Instant::now();
+        let mut poll_failures = 0usize;
+        // How long a submitted command may sit unadmitted before we fail the prompt.
+        const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // Consecutive receipt-read failures tolerated before failing the prompt.
+        const MAX_POLL_FAILURES: usize = 40;
+        let mut stall: Option<String> = None;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
@@ -1329,9 +1362,32 @@ impl AcpAgentSession {
                         break;
                     }
                     if settled_task.is_none() {
-                        if let Ok(current) = session.task(&task.command_id).await {
-                            if current.settled() {
-                                settled_task = Some(current);
+                        match session.task(&task.command_id).await {
+                            Ok(current) => {
+                                poll_failures = 0;
+                                if current.settled() {
+                                    settled_task = Some(current);
+                                } else if matches!(current.status.as_str(), "queued" | "starting")
+                                    && started.elapsed() > ADMISSION_TIMEOUT
+                                {
+                                    // Never admitted after the deadline: nothing will ever run
+                                    // it, so report instead of hanging.
+                                    stall = Some(format!(
+                                        "the turn was never admitted (status `{}` after {}s)",
+                                        current.status,
+                                        started.elapsed().as_secs()
+                                    ));
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                poll_failures += 1;
+                                if poll_failures >= MAX_POLL_FAILURES {
+                                    stall = Some(format!(
+                                        "the session stopped reporting task state: {error}"
+                                    ));
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1365,6 +1421,22 @@ impl AcpAgentSession {
                                 }
                             }
                             AgentEventType::AgentResult => {
+                                // An interrupted turn still produces a (reconciled) result.
+                                // Its text is usually a recovery note that duplicates nothing,
+                                // but when the answer was already streamed incrementally the
+                                // note used to be dropped entirely — the client saw output
+                                // stop mid-sentence with no explanation. Always tell the user
+                                // that the turn was interrupted.
+                                if let Some(reason) = super::event::result_generate_reason(&ev) {
+                                    if reason == agentscope_core::message::GenerateReason::Interrupted
+                                    {
+                                        emit(super::event::message_chunk(
+                                            self.session_id.clone(),
+                                            "\n\n[turn interrupted before completion]".to_string(),
+                                            message_id_opt.clone(),
+                                        ));
+                                    }
+                                }
                                 // Emit the final reply only if it wasn't already
                                 // streamed incrementally (avoids duplicate output).
                                 if !emitted_text {
@@ -1462,38 +1534,94 @@ impl AcpAgentSession {
                 }
             }
 
-            let log = session.log();
-            let turn_id = task.turn_id.clone();
-            tokio::spawn(async move {
-                // Waiting here would hold the prompt open for as long as the run's writer
-                // lease lasts; the turn must be closed either way, just not on this path.
-                let _ = agentscope_core::session::cancel_pending(log, &turn_id).await;
-            });
+            // Close the turn before returning. `cancel_pending` retries the writer lease and
+            // settles pending interactions; `abandon_turn` additionally records unknown tool
+            // outcomes as interrupted. Both are needed: the run may have been interrupted
+            // mid-tool, and a turn left open would block the next prompt. Never fire-and-forget
+            // this — a silently failed close is exactly the "stuck session" symptom.
+            if let Err(error) =
+                agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await
+            {
+                tracing::warn!(
+                    session = %self.session_id,
+                    turn = %task.turn_id,
+                    %error,
+                    "failed to close the cancelled turn; the next prompt may be rejected"
+                );
+            }
             return StopReason::Cancelled;
         }
 
+        // A watchdog fired: the command was never admitted, or the session stopped reporting.
+        // Report it instead of ending the turn silently (which looks like a hang to the client).
+        if let Some(reason) = stall {
+            // Try to release whatever the abandoned attempt left open so the next prompt can
+            // start; failures here must not hide the original problem.
+            let _ = agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+            emit(super::event::message_chunk(
+                self.session_id.clone(),
+                format!("Agent error: {reason}"),
+                message_id_opt.clone(),
+            ));
+            return StopReason::Refusal;
+        }
+
         if let Some(current) = &settled_task {
-            if current.status == "failed" {
-                // Prefer the error persisted with `run/end`; older journals (and a run
-                // that settled between the last poll and the terminal write) may only
-                // have the in-memory dispatch error.
-                let detail = current
-                    .error
-                    .clone()
-                    .or_else(|| session.execution_error())
-                    .unwrap_or_else(|| "run failed".to_string());
-                // Core errors may already carry the `Agent error:` prefix (possibly more
-                // than once through wrapping); keep exactly one.
-                let mut detail = detail.as_str();
-                while let Some(rest) = detail.strip_prefix("Agent error: ") {
-                    detail = rest;
+            match current.status.as_str() {
+                "failed" => {
+                    // Prefer the error persisted with `run/end`; older journals (and a run
+                    // that settled between the last poll and the terminal write) may only
+                    // have the in-memory dispatch error.
+                    let detail = current
+                        .error
+                        .clone()
+                        .or_else(|| session.execution_error())
+                        .unwrap_or_else(|| "run failed".to_string());
+                    // Core errors may already carry the `Agent error:` prefix (possibly more
+                    // than once through wrapping); keep exactly one.
+                    let mut detail = detail.as_str();
+                    while let Some(rest) = detail.strip_prefix("Agent error: ") {
+                        detail = rest;
+                    }
+                    emit(super::event::message_chunk(
+                        self.session_id.clone(),
+                        format!("Agent error: {detail}"),
+                        message_id_opt.clone(),
+                    ));
+                    return StopReason::Refusal;
                 }
-                emit(super::event::message_chunk(
-                    self.session_id.clone(),
-                    format!("Agent error: {detail}"),
-                    message_id_opt.clone(),
-                ));
-                return StopReason::Refusal;
+                // The dispatcher refused the command (e.g. an earlier turn is still open).
+                // Ending the turn silently would leave the client believing the prompt ran.
+                "rejected" => {
+                    let detail = current
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "the turn was rejected by the session runtime".into());
+                    emit(super::event::message_chunk(
+                        self.session_id.clone(),
+                        format!("Agent error: {detail}"),
+                        message_id_opt.clone(),
+                    ));
+                    return StopReason::Refusal;
+                }
+                // The run stopped without reaching a normal result (interrupted, suspended,
+                // or its writer lease vanished). Report it and close the turn so the next
+                // prompt is not blocked by it.
+                status if status != "completed" => {
+                    let detail = current
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("the turn ended as `{status}`"));
+                    let _ =
+                        agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                    emit(super::event::message_chunk(
+                        self.session_id.clone(),
+                        format!("Agent error: {detail}"),
+                        message_id_opt.clone(),
+                    ));
+                    return StopReason::Refusal;
+                }
+                _ => {}
             }
         }
 

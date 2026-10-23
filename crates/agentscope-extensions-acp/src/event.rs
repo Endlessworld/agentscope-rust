@@ -666,6 +666,14 @@ impl ToolEventMapper {
     }
 }
 
+/// The [`GenerateReason`](agentscope_core::message::GenerateReason) carried by an
+/// `AgentResult` event, when the reply message is decodable.
+pub fn result_generate_reason(ev: &AgentEvent) -> Option<agentscope_core::message::GenerateReason> {
+    let reply = ev.data().fields.get("reply")?;
+    let msg: agentscope_core::message::Msg = serde_json::from_value(reply.clone()).ok()?;
+    Some(msg.generate_reason())
+}
+
 /// Maps the final agent result into an ACP message chunk so that answers which
 /// are *not* streamed as incremental `TextBlockDelta`s are still surfaced to the
 /// client (otherwise the turn ends with `end_turn` and no visible output).

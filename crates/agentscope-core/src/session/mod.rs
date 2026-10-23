@@ -42,7 +42,7 @@ pub use models::{
 pub use migration::{
     export_snapshot, export_state, fork, import_baseline, ExportedState,
 };
-pub use recovery::{cancel_pending, reconcile};
+pub use recovery::{abandon_turn, cancel_pending, reconcile};
 pub use state_access::{read as read_snapshot, replace as replace_state, update as update_state, Snapshot};
 pub use in_memory::{InMemorySessionLogStore, MemorySessionStorage};
 pub use journal::JournalSessionLog;

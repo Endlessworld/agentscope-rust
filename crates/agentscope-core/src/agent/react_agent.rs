@@ -713,11 +713,32 @@ impl ReActAgent {
         // Layer the per-run services on top of the build-time ones: assigning would silently
         // drop everything the agent was configured with (recorders, observers).
         ctx.extensions.extend(&extensions);
+        // Every streamed run needs its own interrupt control, exactly like the `call` path
+        // does. Without one, `check_interrupted` falls back to the agent-level flag, which
+        // `interrupt()` sets when no run is registered and which nothing ever clears: the
+        // first cancel would make *every* later run abort immediately with `Interrupted`.
+        // That is the "output stops, then nothing runs again" symptom.
+        let run = match extensions.get::<RunControl>(RUN_CONTROL_CONTEXT_KEY) {
+            Some(run) => run,
+            None => {
+                let run = Arc::new(RunControl::new(self.id.clone(), None));
+                run.queue();
+                run.start();
+                ctx.extensions
+                    .insert_arc(RUN_CONTROL_CONTEXT_KEY, Arc::clone(&run));
+                run
+            }
+        };
+        // Drop an interrupt that arrived while nothing was running: the agent-level flag is
+        // sticky, so keeping it would abort this run on its first check. Java gives every call
+        // a fresh `InterruptControl`, and so does this path.
+        if self.core.interrupt.is_interrupted() {
+            self.core.interrupt.reset();
+        }
+        *self.core.active_run.lock().unwrap() = Some(Arc::clone(&run));
         // The run id belongs to *this* call's run, not to whatever run the agent-level slot
         // currently holds (a concurrent call may have replaced it).
-        if let Some(run) = extensions.get::<RunControl>(RUN_CONTROL_CONTEXT_KEY) {
-            ctx.run_id = Some(run.run_id().to_string());
-        }
+        ctx.run_id = Some(run.run_id().to_string());
         ctx.response_format = response_format;
         let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
         // Shared channel: the model-call loop forwards fine-grained delta events
@@ -728,6 +749,7 @@ impl ReActAgent {
         let core = Arc::clone(&self.core);
         let ctx_core = ctx.clone();
         let slot_core = Arc::clone(&slot);
+        let run_core = Arc::clone(&run);
         let agent_core: Box<dyn FnOnce(AgentInput) -> EventStream + Send> =
             Box::new(move |input: AgentInput| {
                 let fut = async move {
@@ -752,6 +774,18 @@ impl ReActAgent {
                     }
                     *slot_core.lock().unwrap() = Some(res);
                     events.push(Ok(AgentEvent::AgentEnd(EventData::default())));
+                    // The run is over: clear the agent-level slot so a later `interrupt()`
+                    // cannot land on this finished run (a no-op) instead of the next one.
+                    // Only clear it while it still points at *this* run.
+                    {
+                        let mut active = core.active_run.lock().unwrap();
+                        if active
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &run_core))
+                        {
+                            *active = None;
+                        }
+                    }
                     futures::stream::iter(events)
                 };
                 Box::pin(futures::stream::once(fut).flatten())

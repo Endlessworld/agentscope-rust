@@ -298,6 +298,70 @@ async fn resume_rejects_a_turn_that_never_started() {
 }
 
 #[tokio::test]
+async fn an_interrupted_turn_blocks_submission_until_it_is_abandoned() {
+    // Regression for the "prompt hangs with no output" report: an interrupted run leaves the
+    // turn non-terminal, so a later submit used to wait forever on a `queued` receipt.
+    let dir = temp_dir("abandon");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(ScriptedModel("after abandon")))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-abandon");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-abandon").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+
+    // Seed an interrupted turn the way a crashed run leaves one: started, never finished.
+    {
+        use agentscope_core::session::SessionRecorder;
+        use agentscope_core::state::AgentState;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("turn-stale"))
+            .await
+            .unwrap();
+        let state = AgentState::builder()
+            .session_id("conversation-abandon")
+            .build();
+        recorder.start(&[Msg::user("first")], &state).await.unwrap();
+        recorder
+            .append("run/end", &serde_json::json!({ "status": "interrupted" }))
+            .unwrap();
+        recorder.flush().await.unwrap();
+        recorder.close().await;
+    }
+
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+    assert_eq!(
+        session.open_turn().await.unwrap().as_deref(),
+        Some("turn-stale")
+    );
+
+    // The dispatcher refuses a new submit while the old turn is open — and says so instead of
+    // leaving the caller on a `queued` receipt forever.
+    let blocked = session.submit("second").await.unwrap();
+    let blocked = session.await_task(&blocked.command_id).await.unwrap();
+    assert_eq!(blocked.status, "rejected", "{blocked:?}");
+    assert_eq!(blocked.error.as_deref(), Some("turn_unfinished"));
+
+    // Closing the abandoned turn unblocks the session.
+    let closed = session.abandon_unfinished().await.unwrap();
+    assert_eq!(closed.as_deref(), Some("turn-stale"));
+    assert!(session.open_turn().await.unwrap().is_none());
+
+    let next = session.submit("second").await.unwrap();
+    let settled = session.await_task(&next.command_id).await.unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn reading_views_never_starts_inference() {
     let (session, dir) = open_session("readonly", "ok").await;
     // Views over an untouched journal: empty, and still nothing queued afterwards.

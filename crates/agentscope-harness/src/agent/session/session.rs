@@ -245,6 +245,53 @@ impl AgentSession {
         self.receipt(&accepted).await
     }
 
+    /// The latest turn id while it is still open (not `completed`/`failed`/`cancelled`).
+    ///
+    /// An `interrupted` turn is deliberately *not* terminal (it can still be resumed), so a
+    /// host that gave up on it must close it explicitly — see
+    /// [`abandon_unfinished`](Self::abandon_unfinished).
+    pub async fn open_turn(&self) -> crate::Result<Option<String>> {
+        let turns = SessionTurns::read(&*self.log).await?;
+        Ok(turns
+            .latest()
+            .filter(|turn| !turn.ended())
+            .map(|turn| turn.turn_id.clone()))
+    }
+
+    /// Closes the latest unfinished turn so a new task can be submitted.
+    ///
+    /// A run that was interrupted (the process died, the provider stalled, the host stopped
+    /// waiting) leaves its turn non-terminal: [`Turn::ended`] only accepts
+    /// `completed`/`failed`/`cancelled`. Every later `submit` then waits for a continuation
+    /// that never comes, which is exactly the "prompt hangs with no output" symptom. A host
+    /// that has given up on the turn calls this instead of waiting.
+    ///
+    /// Unknown tool outcomes are recorded as `interrupted` (never as success) and their
+    /// dispatch uncertainty is cleared, so the next turn starts from a consistent context.
+    /// Returns the id of the turn that was closed, or `None` when nothing was open.
+    pub async fn abandon_unfinished(&self) -> crate::Result<Option<String>> {
+        self.ensure_open()?;
+        // A run in flight still owns the turn; abandoning it would race the writer lease and
+        // silently drop work the caller may still be watching. Give a just-interrupted run a
+        // moment to unwind (the caller typically cancels right before asking for a new turn).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.state.lock().unwrap().active_run.is_some() {
+            if std::time::Instant::now() >= deadline {
+                return Err(session_error("Wait for the current execution to stop"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let turns = SessionTurns::read(&*self.log).await?;
+        let Some(latest) = turns.latest().cloned() else {
+            return Ok(None);
+        };
+        if latest.ended() {
+            return Ok(None);
+        }
+        agentscope_core::session::abandon_turn(Arc::clone(&self.log), &latest.turn_id).await?;
+        Ok(Some(latest.turn_id))
+    }
+
     /// Answers one pending interaction.
     pub async fn respond(
         &self,
@@ -541,7 +588,15 @@ impl AgentSession {
         let mut run: Option<String> = None;
         let mut status = "queued".to_string();
         let mut error: Option<String> = None;
+        // A turn closed by the recovery path (`abandon_turn` / `cancel_pending`) never writes
+        // a `run/end` for the original run, so the receipt must also honour `turn/cancelled`.
+        let mut turn_cancelled = false;
         for event in self.log.scan(0, head.seq).await? {
+            if event.event_type == "turn/cancelled"
+                && event.turn_id.as_deref() == command.turn_id.as_deref()
+            {
+                turn_cancelled = true;
+            }
             let records_start = event.event_type == "inbox/started"
                 && event
                     .data()
@@ -599,6 +654,12 @@ impl AgentSession {
                 status = "interrupted".into();
                 error = None;
             }
+        }
+        // An abandoned/cancelled turn is terminal for the caller even though the run itself
+        // never wrote `run/end`: report `cancelled` so the prompt stops waiting on it.
+        if turn_cancelled && !matches!(status.as_str(), "completed" | "failed") {
+            status = "cancelled".into();
+            error = None;
         }
         Ok(Task {
             command_id: command.id.clone(),
@@ -658,8 +719,13 @@ async fn dispatch_once(
         {
             continue;
         }
-        // A new submit waits until the unfinished turn is continued.
+        // A submit must not run while an earlier turn is unfinished (only `resume` may
+        // continue it). Waiting silently would deadlock the caller: an *interrupted* turn is
+        // not terminal, so nothing releases it and the host sits on a `queued` receipt
+        // forever. No live writer exists at this point (checked above), so the open turn is
+        // orphaned — reject the command so the caller learns it must continue or abandon it.
         if latest.as_ref().is_some_and(|turn| !turn.ended()) && command.kind == "submit" {
+            inbox.reject(command, "turn_unfinished").await?;
             continue;
         }
         launch(agent, log, inbox, context, state, command.clone()).await?;
