@@ -1344,19 +1344,29 @@ impl AcpAgentSession {
         // queue is drained after settlement.
         let mut settled_task: Option<agentscope_harness::agent::session::Task> = None;
         let mut cancelled = false;
-        // Watchdog state. A receipt that never leaves `queued`/`starting` means the
-        // dispatcher refused or never admitted the command; without a deadline the client
-        // would wait on an idle connection forever (no error, no timeout).
-        let started = std::time::Instant::now();
-        let mut poll_failures = 0usize;
-        // How long a submitted command may sit unadmitted before we fail the prompt.
-        const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // Watchdog state.
+        //
+        // `queued` is the only status that means "nothing picked this up yet". It is a
+        // legitimate wait while a *previous* process's writer lease is still valid (the lease
+        // is 120s), so the deadline must be comfortably longer than that or a normal restart
+        // looks like a hang. `starting` is different: the dispatcher is already inside
+        // `launch()` and will publish `inbox/started` shortly, so it must never be reported as
+        // "never admitted". `running` is a live run and has its own model/tool timeouts.
+        const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         // Consecutive receipt-read failures tolerated before failing the prompt.
         const MAX_POLL_FAILURES: usize = 40;
+        let mut admission_deadline = std::time::Instant::now() + ADMISSION_TIMEOUT;
+        let mut last_status = String::new();
+        let mut poll_failures = 0usize;
         let mut stall: Option<String> = None;
+        // A persistent ticker, not a fresh `sleep` per iteration: re-creating the timer every
+        // loop restart meant a busy event stream could starve it indefinitely (a stalled
+        // command was only noticed minutes later).
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                _ = ticker.tick() => {
                     if cancel_flag.load(Ordering::SeqCst) {
                         cancelled = true;
                         break;
@@ -1365,17 +1375,23 @@ impl AcpAgentSession {
                         match session.task(&task.command_id).await {
                             Ok(current) => {
                                 poll_failures = 0;
+                                if current.status != last_status {
+                                    // Any status change is progress: restart the admission
+                                    // clock so an earlier `queued` wait cannot accumulate.
+                                    last_status = current.status.clone();
+                                    admission_deadline =
+                                        std::time::Instant::now() + ADMISSION_TIMEOUT;
+                                }
                                 if current.settled() {
                                     settled_task = Some(current);
-                                } else if matches!(current.status.as_str(), "queued" | "starting")
-                                    && started.elapsed() > ADMISSION_TIMEOUT
+                                } else if current.status == "queued"
+                                    && std::time::Instant::now() >= admission_deadline
                                 {
-                                    // Never admitted after the deadline: nothing will ever run
-                                    // it, so report instead of hanging.
+                                    // Still unclaimed after the deadline: no dispatcher will
+                                    // ever run it, so report instead of hanging.
                                     stall = Some(format!(
-                                        "the turn was never admitted (status `{}` after {}s)",
-                                        current.status,
-                                        started.elapsed().as_secs()
+                                        "the turn was never admitted (status `queued` after {}s)",
+                                        ADMISSION_TIMEOUT.as_secs()
                                     ));
                                     break;
                                 }
@@ -1520,18 +1536,44 @@ impl AcpAgentSession {
             // close its turn: an interrupted turn stays open in the journal (only
             // `completed`/`cancelled` end one), and the next prompt must be able to submit.
             //
-            // Signal the agent directly, not only through the session: `AgentSession::interrupt`
-            // needs the journal to already carry a run id, so a prompt cancelled while the
-            // dispatcher is still admitting it would otherwise never reach the run at all.
-            self.agent.interrupt();
+            // The signal is scoped to *this* turn's run id. The loop below keeps retrying for
+            // up to 10s, and the client may already have sent its next prompt by then; an
+            // unscoped `agent.interrupt()` would kill that fresh run — the "turn ended as
+            // interrupted" report on a prompt the user just sent.
+            //
+            // The run id is not known at submit time (the dispatcher publishes it when it
+            // admits the command), so it is re-read every iteration and signalled as soon as it
+            // appears.
+            let mut signalled: Option<String> = task.run_id.clone();
+            if let Some(run_id) = signalled.as_deref() {
+                self.agent.interrupt_run(run_id);
+            }
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
-                let _ = session.interrupt().await;
-                match session.task(&task.command_id).await {
-                    Ok(current) if current.settled() => break,
-                    _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                let current = session.task(&task.command_id).await;
+                let current = match current {
+                    Ok(current) => current,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                if current.settled() {
+                    break;
                 }
+                // Adopt the run id the moment the dispatcher publishes it, then keep the signal
+                // aimed at that exact run.
+                if signalled.is_none() {
+                    if let Some(run_id) = current.run_id.clone() {
+                        self.agent.interrupt_run(&run_id);
+                        signalled = Some(run_id);
+                    }
+                }
+                if let Some(run_id) = signalled.as_deref() {
+                    let _ = session.interrupt_run(run_id).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
 
             // Close the turn before returning. `cancel_pending` retries the writer lease and
@@ -1608,10 +1650,12 @@ impl AcpAgentSession {
                 // or its writer lease vanished). Report it and close the turn so the next
                 // prompt is not blocked by it.
                 status if status != "completed" => {
-                    let detail = current
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| format!("the turn ended as `{status}`"));
+                    let detail = current.error.clone().unwrap_or_else(|| {
+                        format!(
+                            "the run was {status} before it finished; the turn has been closed, \
+                             send a new prompt to continue"
+                        )
+                    });
                     let _ =
                         agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
                     emit(super::event::message_chunk(

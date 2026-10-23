@@ -127,6 +127,45 @@ pub struct SessionRecorder {
     heartbeat: Mutex<Option<LeaseHeartbeat>>,
 }
 
+impl Drop for SessionRecorder {
+    fn drop(&mut self) {
+        // A recorder that is dropped without `close()` means its run unwound abnormally (a
+        // panic in the agent loop, a future dropped mid-run). The writer lease must not be left
+        // to expire on its own: the session would stay owned by a dead run for the whole lease
+        // duration, and the next turn would wait for it.
+        let already_closed = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed;
+        if already_closed {
+            return;
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
+        // Stop renewing first so a tick cannot reclaim the lease after the release.
+        if let Some(mut heartbeat) = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            heartbeat.stop();
+        }
+        // `release` is async and `Drop` is not, so hand it to the runtime. Without one the
+        // process is going away and the lease dies with it.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let log = Arc::clone(&self.log);
+            let writer = self.writer.clone();
+            handle.spawn(async move {
+                let _ = log.release(&writer).await;
+            });
+        }
+    }
+}
+
 /// Renews the execution writer lease while the recorder is open.
 ///
 /// Mirrors the renewal half of Java's `SessionRecorder` heartbeat thread. It deliberately does
@@ -807,7 +846,6 @@ impl SessionRecorder {
         self.stop_heartbeat().await;
         let _ = self.log.release(&self.writer).await;
     }
-
     /// Stops the background lease renewal and waits for its task to end.
     async fn stop_heartbeat(&self) {
         let heartbeat = self

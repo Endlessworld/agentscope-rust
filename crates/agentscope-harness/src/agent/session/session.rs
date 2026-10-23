@@ -475,22 +475,42 @@ impl AgentSession {
     /// A cooperative request, not a completion acknowledgement: the task keeps reporting
     /// `running` until the execution actually stops.
     pub async fn interrupt(&self) -> crate::Result<bool> {
-        self.ensure_open()?;
         let snapshot = self.inbox.snapshot().await?;
         let Some(run_id) = snapshot.run_id.clone() else {
             return Ok(false);
         };
+        self.interrupt_run(&run_id).await
+    }
+
+    /// Interrupts one specific run, if it is still the one the inbox is executing.
+    ///
+    /// A host that is racing a run it started (a cancel retry loop, a shutdown sweep) must use
+    /// this instead of [`interrupt`](Self::interrupt): the plain version reads the *current*
+    /// run id, so once the next prompt has been admitted it would stop that one instead.
+    /// Returns `false` when `run_id` is no longer the active run.
+    pub async fn interrupt_run(&self, run_id: &str) -> crate::Result<bool> {
+        self.ensure_open()?;
+        let snapshot = self.inbox.snapshot().await?;
+        // Only signal while the inbox still names this run: a stale id must not land on
+        // whatever started in the meantime.
+        if snapshot.run_id.as_deref() != Some(run_id) {
+            return Ok(false);
+        }
         let command = Command::new(
             uuid::Uuid::new_v4().to_string(),
             "interrupt",
             snapshot.turn_id.clone(),
             Vec::new(),
-            vec![run_id],
+            vec![run_id.to_string()],
         )?;
         // Signal before recording. Accepting input needs the journal writer lease, which the
         // running execution holds until it stops: recording first would make `interrupt` wait
         // for the run it is trying to stop (up to the lease timeout).
-        self.agent.interrupt();
+        //
+        // Target the run by id, not the agent's *current* run: this call may be racing the run
+        // it wants to stop (a host retry loop, a shutdown sweep). Without the id the signal
+        // would land on whatever started in the meantime — the next prompt — and kill it.
+        self.agent.interrupt_run(run_id);
         // Record the command off the caller's path. The interrupt is already delivered, so a
         // busy journal must not turn it into an error, and the host must not block on it.
         let inbox = self.inbox.clone();
@@ -584,13 +604,17 @@ impl AgentSession {
                 error: Some(reason.clone()),
             });
         }
-        let head = self.log.head().await?;
         let mut run: Option<String> = None;
         let mut status = "queued".to_string();
         let mut error: Option<String> = None;
         // A turn closed by the recovery path (`abandon_turn` / `cancel_pending`) never writes
         // a `run/end` for the original run, so the receipt must also honour `turn/cancelled`.
         let mut turn_cancelled = false;
+        // `head` is read once, before the scan, and the scan itself is a journal read. The
+        // ownership check below must NOT reuse this snapshot: the dispatcher may launch the run
+        // between this read and the `active_command` check, which would make a live run look
+        // like it lost its lease (the snapshot still says `owner: None`).
+        let head = self.log.head().await?;
         for event in self.log.scan(0, head.seq).await? {
             if event.event_type == "turn/cancelled"
                 && event.turn_id.as_deref() == command.turn_id.as_deref()
@@ -636,9 +660,13 @@ impl AgentSession {
                 }
             }
         }
-        {
+        // Whether *this* process is running the command right now. When it is, the in-memory
+        // slot is authoritative: the run is alive by definition, so the lease heuristic below
+        // (which exists to detect a run left behind by another/dead process) must not apply.
+        let owned_here = {
             let guard = self.state.lock().unwrap();
-            if guard.active_command.as_deref() == Some(command.id.as_str()) {
+            let owned = guard.active_command.as_deref() == Some(command.id.as_str());
+            if owned {
                 if let Some(active) = &guard.active_run {
                     run = Some(active.clone());
                 }
@@ -646,9 +674,13 @@ impl AgentSession {
                     status = "starting".into();
                 }
             }
-        }
-        // A `running` receipt whose writer lease is gone was interrupted, not finished.
-        if status == "running" {
+            owned
+        };
+        // A live receipt whose writer lease is gone was interrupted, not finished. Only
+        // meaningful for a run this process does not own: a locally-owned run holds the lease
+        // by construction, and reading it from a stale snapshot would race the launch.
+        if !owned_here && matches!(status.as_str(), "running" | "starting") {
+            let head = self.log.head().await?;
             let owns = run.as_deref() == head.owner.as_deref() && head.lease_until > now_millis();
             if !owns {
                 status = "interrupted".into();
@@ -839,6 +871,13 @@ async fn launch(
         guard.error = None;
     }
 
+    // Everything below runs the agent. If it panics, the bookkeeping above must still be
+    // rolled back: a stale `active_command` makes the receipt report `starting` forever, the
+    // dispatcher never launches anything again, and the host waits on a turn that is already
+    // dead. A guard is the only way to cover the panic path (`?` and `return` are handled by
+    // the explicit cleanup below).
+    let active_guard = ActiveRunGuard::new(Arc::clone(state), command.id.clone());
+
     let mut extensions = Extensions::new();
     extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
     extensions.insert(EXECUTION_CONTEXT_KEY, execution.clone());
@@ -925,6 +964,7 @@ async fn launch(
             guard.error = Some(error.clone());
         }
     }
+    active_guard.disarm();
 
     // A run that never started must not leave a phantom `queued` receipt forever.
     if let Err(error) = &result {
@@ -935,6 +975,56 @@ async fn launch(
     }
     finish?;
     Ok(())
+}
+
+/// Clears a run's `active_command`/`active_run` bookkeeping on every exit path, including a
+/// panic.
+///
+/// `launch` sets these before the agent runs and clears them afterwards. If the run panics in
+/// between (a provider SDK unwrap, an OOM in a tool, …) the state stays `starting` forever:
+/// the receipt never settles, `dispatch_once` sees an active run and refuses to start anything
+/// else, and the host waits on a turn nobody is running. Dropping the guard restores the
+/// invariant that "an active run" always means "something is actually executing".
+struct ActiveRunGuard {
+    state: Arc<Mutex<SessionState>>,
+    command_id: String,
+    armed: bool,
+}
+
+impl ActiveRunGuard {
+    fn new(state: Arc<Mutex<SessionState>>, command_id: String) -> Self {
+        Self {
+            state,
+            command_id,
+            armed: true,
+        }
+    }
+
+    /// Marks the normal cleanup as done, so `Drop` becomes a no-op.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `unwrap_or_else` on a poisoned mutex: the panic that poisoned it is exactly the case
+        // this guard exists for, so it must still run.
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.active_command.as_deref() == Some(self.command_id.as_str()) {
+            guard.active_command = None;
+            guard.active_run = None;
+            if guard.error.is_none() {
+                guard.error = Some("the run terminated unexpectedly (panic)".into());
+            }
+        }
+    }
 }
 
 /// A deterministic id derived from `seed`.

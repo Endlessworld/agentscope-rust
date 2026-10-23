@@ -436,6 +436,24 @@ impl ReActAgent {
         self.core.interrupt.trigger(None, None);
     }
 
+    /// Interrupts `run_id` only, and reports whether that run was the one in flight.
+    ///
+    /// A plain [`interrupt`](Self::interrupt) targets whatever run is active *at the moment it
+    /// is called*. A caller that wants to stop run A but reaches this point after A already
+    /// finished (and B started) would stop B instead — the cross-turn interrupt leak that made
+    /// a fresh prompt fail with `interrupted`. Passing the run id makes the signal
+    /// self-identifying: a stale request is dropped instead of landing on the next turn.
+    pub fn interrupt_run(&self, run_id: &str) -> bool {
+        let mut active = self.core.active_run.lock().unwrap();
+        match active.as_mut() {
+            Some(run) if run.run_id() == run_id => {
+                run.interrupt(None, None);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The run currently in flight, if any.
     pub fn active_run(&self) -> Option<AgentRun> {
         self.core
@@ -718,10 +736,18 @@ impl ReActAgent {
         // `interrupt()` sets when no run is registered and which nothing ever clears: the
         // first cancel would make *every* later run abort immediately with `Interrupted`.
         // That is the "output stops, then nothing runs again" symptom.
+        //
+        // When a recorder is attached, its run id is the identity the journal (and therefore
+        // the host's task receipt) publishes, so the control must adopt it: otherwise a host
+        // that asks to stop "run X" compares against an id nobody else has seen and the
+        // signal is silently dropped.
+        let recorded_run_id = extensions
+            .get::<SessionRecorder>(RECORDER_CONTEXT_KEY)
+            .map(|recorder| recorder.run_id().to_string());
         let run = match extensions.get::<RunControl>(RUN_CONTROL_CONTEXT_KEY) {
             Some(run) => run,
             None => {
-                let run = Arc::new(RunControl::new(self.id.clone(), None));
+                let run = Arc::new(RunControl::new(self.id.clone(), recorded_run_id));
                 run.queue();
                 run.start();
                 ctx.extensions

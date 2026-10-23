@@ -396,6 +396,17 @@ impl HarnessAgent {
         self.agent.as_ref().map(|a| a.interrupt_session(session_id)).unwrap_or(false)
     }
 
+    /// Interrupts one specific run, if it is still the one in flight.
+    ///
+    /// Returns `true` when the run was found and signalled. A stale request (the run already
+    /// finished and a new one started) is dropped, so a cancel cannot leak into the next turn.
+    pub fn interrupt_run(&self, run_id: &str) -> bool {
+        self.agent
+            .as_ref()
+            .map(|a| a.interrupt_run(run_id))
+            .unwrap_or(false)
+    }
+
     /// Clears the current session's model-visible conversation context without
     /// creating a new session. No-op without a configured model.
     pub fn clear_context(&self) {

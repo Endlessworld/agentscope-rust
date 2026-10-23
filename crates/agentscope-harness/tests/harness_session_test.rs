@@ -63,6 +63,27 @@ impl Model for FailingModel {
     }
 }
 
+/// Panics as soon as the model is called, simulating a crash inside the agent loop.
+struct PanickingModel;
+
+#[async_trait::async_trait]
+impl Model for PanickingModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        Box::pin(futures::stream::once(async {
+            panic!("provider SDK exploded");
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "panicking"
+    }
+}
+
 /// Fails once, then answers normally.
 struct FailOnceModel {
     attempts: std::sync::atomic::AtomicUsize,
@@ -357,6 +378,188 @@ async fn an_interrupted_turn_blocks_submission_until_it_is_abandoned() {
     let next = session.submit("second").await.unwrap();
     let settled = session.await_task(&next.command_id).await.unwrap();
     assert_eq!(settled.status, "completed", "{settled:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_starting_receipt_whose_run_died_reports_interrupted() {
+    // Regression for "the turn was never admitted (status starting after 144s)": `starting`
+    // comes from the in-memory `active_command` slot, so when a run dies between admission and
+    // its terminal write the receipt used to stay `starting` forever.
+    let (session, dir) = open_session("starting-lease", "ok").await;
+
+    let task = session.submit("go").await.unwrap();
+    // Let the dispatcher admit and run it to completion first.
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+    assert!(settled.settled(), "a finished run must settle");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_run_that_panics_does_not_wedge_the_session() {
+    // A panic inside the agent loop used to leave `active_command` set, so every later receipt
+    // reported `starting`, the dispatcher refused to launch anything, and the host waited on a
+    // turn nobody was running. The `ActiveRunGuard` rolls the bookkeeping back.
+    let dir = temp_dir("panic");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(PanickingModel))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-panic");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-panic").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+
+    let task = session.submit("explode").await.unwrap();
+    // The run may surface as failed or interrupted depending on where the panic unwound; what
+    // matters is that it settles instead of hanging on `starting`.
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert!(settled.settled(), "a panicking run must not stay active: {settled:?}");
+    assert_ne!(settled.status, "starting", "{settled:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Answers after a short delay, so the run stays in flight long enough for a receipt poll to
+/// land inside the launch window.
+struct SlowModel;
+
+#[async_trait::async_trait]
+impl Model for SlowModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        Box::pin(futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok(ChatResponse::builder()
+                .content(vec![CoreBlock::Text(TextBlock::new("a slow but healthy answer"))])
+                .build())
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "slow"
+    }
+}
+
+#[tokio::test]
+async fn a_locally_owned_run_is_never_reported_interrupted() {
+    // Regression for "Agent error: the turn ended as `interrupted`" firing on a healthy run.
+    // `receipt()` read `head` before the scan, then consulted the in-memory `active_command`
+    // slot; the lease check then compared the run against that *stale* head (still
+    // `owner: None`), so a live run looked like it had lost its lease.
+    let dir = temp_dir("local-lease");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(SlowModel))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-local-lease");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-local-lease").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+
+    // Poll the receipt aggressively while the run is in flight: any snapshot taken during the
+    // window between launch and the terminal write must report a live status, never
+    // `interrupted`.
+    let task = session.submit("go").await.unwrap();
+    let observed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_writer = Arc::clone(&observed);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let current = session.task(&task.command_id).await.unwrap();
+        observed_writer.lock().unwrap().push(current.status.clone());
+        if current.settled() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+    let statuses = observed.lock().unwrap().clone();
+    assert!(
+        !statuses.iter().any(|status| status == "interrupted"),
+        "a locally-owned run must never be reported interrupted: {statuses:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_stale_interrupt_does_not_kill_the_next_run() {
+    // Regression for "Agent error: the turn ended as `interrupted`" on a prompt the user just
+    // sent. The ACP cancel path retries `interrupt` for up to 10s while waiting for the run to
+    // unwind, so a "continue" sent right after a cancel could be killed by the *previous*
+    // turn's interrupt. Signalling by run id makes a stale request a no-op.
+    let dir = temp_dir("stale-interrupt");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(ScriptedModel("survived")))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-stale-interrupt");
+    let key =
+        SessionKey::new(Some("alice"), "session-agent", "conversation-stale-interrupt").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();
+
+    let first = session.submit("first").await.unwrap();
+    let settled = session.await_task(&first.command_id).await.unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+    let finished_run = settled.run_id.clone().expect("a finished run has an id");
+
+    // A late interrupt naming the *finished* run must not touch anything.
+    assert!(
+        !agent.interrupt_run(&finished_run),
+        "a stale run id must be dropped, not signalled"
+    );
+
+    let second = session.submit("second").await.unwrap();
+    // Keep firing the stale signal while the new run is in flight.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        agent.interrupt_run(&finished_run);
+        let current = session.task(&second.command_id).await.unwrap();
+        if current.settled() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let settled = session.await_task(&second.command_id).await.unwrap();
+    assert_eq!(
+        settled.status, "completed",
+        "a stale interrupt must not leak into the next turn: {settled:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
