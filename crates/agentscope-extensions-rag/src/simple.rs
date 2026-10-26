@@ -4,9 +4,10 @@
 //! `reader` / `store` / `embedding` building blocks it composes (those live in the crate
 //! root because they are shared with other backends).
 //!
-//! The Java submodule also ships HTTP embedding providers (`dashscope`, `ollama`, `openai`)
-//! and external vector stores (`ElasticsearchStore`, `MilvusStore`, `PgVectorStore`,
-//! `QdrantStore`); those are tracked as gaps in `RAG__GAP_TRACKER.md` §3.
+//! The Java submodule also ships HTTP embedding providers (`dashscope`, `ollama`, `openai`),
+//! now ported in [`crate::embedding`], and external vector stores (`ElasticsearchStore`,
+//! `MilvusStore`, `PgVectorStore`, `QdrantStore`), still tracked as gaps in
+//! `RAG__GAP_TRACKER.md` §3.2.
 
 use std::sync::Arc;
 

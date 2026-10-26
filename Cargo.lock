@@ -443,6 +443,7 @@ dependencies = [
  "agentscope-core",
  "agentscope-harness",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "hmac 0.12.1",

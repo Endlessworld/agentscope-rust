@@ -4,27 +4,148 @@
 //! `ContentBlock` and returns `Mono<double[]>`; here it becomes an `async_trait`
 //! returning `Vec<f64>`, so both HTTP-backed and purely local models share one surface.
 //!
-//! Note: the four Java provider models (`dashscope/*`, `ollama/*`, `openai/*`) live in the
-//! `simple` submodule but are HTTP clients; they are **not** ported here because their
-//! request/response shapes belong to the MODEL extension. Only the local, dependency-free
-//! [`HashEmbeddingModel`] is provided so the `simple` backend can be tested offline.
+//! The four Java provider models (`openai`, `dashscope`, `ollama`) are HTTP clients ported in
+//! the submodules below. They talk HTTP through the crate-wide [`crate::transport`] seam, so
+//! every provider test runs against an in-memory transport and never opens a socket. The
+//! local, dependency-free [`HashEmbeddingModel`] stays available for offline `simple` use.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
 
 use agentscope_core::message::ContentBlock;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{RagError, Result};
 
+pub mod dashscope;
+pub mod ollama;
+pub mod openai;
+#[cfg(test)]
+mod test_support;
+pub mod utils;
+
+pub use dashscope::{
+    DashScopeMultiModalEmbedding, DashScopeMultiModalEmbeddingBuilder, DashScopeTextEmbedding,
+    DashScopeTextEmbeddingBuilder,
+};
+pub use ollama::{OllamaTextEmbedding, OllamaTextEmbeddingBuilder};
+pub use openai::{OpenAiTextEmbedding, OpenAiTextEmbeddingBuilder};
+pub use utils::EmbeddingExecutionConfig;
+
 /// Default vector dimension used when none is configured (Java default: 1024).
 pub const DEFAULT_DIMENSIONS: usize = 1024;
+
+/// Callback invoked with the token usage of every completed embedding call.
+///
+/// Java's `EmbeddingModel` exposed neither a usage DTO nor a listener (the vendor SDK kept the
+/// `usage` block private), so token accounting was not observable from the RAG layer. The Rust
+/// port carries it explicitly because every provider below already parses the field.
+pub type UsageListener = Arc<dyn Fn(&EmbeddingUsage) + Send + Sync>;
+
+/// Token usage reported by an embedding provider.
+///
+/// `input_tokens` covers text tokens (and image + text tokens for the multimodal DashScope
+/// API); `output_tokens` is only non-zero for multimodal models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    /// Tokens billed as input.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Tokens billed as output (multimodal models only).
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Total tokens reported by the provider.
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+
+impl EmbeddingUsage {
+    /// Creates a usage record, deriving `total_tokens` as the sum.
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
+
+    /// Overrides `total_tokens` with the value the provider reported verbatim.
+    pub fn with_total_tokens(mut self, total_tokens: u64) -> Self {
+        self.total_tokens = total_tokens;
+        self
+    }
+
+    /// Whether no token information was reported at all.
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.total_tokens == 0
+    }
+}
+
+/// One embedding call: the vector plus provider-side bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    /// The embedding vector.
+    #[serde(default)]
+    pub embedding: Vec<f64>,
+    /// Token usage reported by the provider (`EmbeddingUsage::default()` when unreported).
+    #[serde(default)]
+    pub usage: EmbeddingUsage,
+    /// Model name echoed by the provider, or the configured name when it echoed none.
+    #[serde(default)]
+    pub model: String,
+    /// Client-side wall-clock duration of the call (never serialized).
+    #[serde(skip)]
+    pub elapsed: Option<Duration>,
+}
+
+impl EmbeddingResponse {
+    /// Creates a response without a measured duration.
+    pub fn new(
+        embedding: Vec<f64>,
+        usage: EmbeddingUsage,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            embedding,
+            usage,
+            model: model.into(),
+            elapsed: None,
+        }
+    }
+
+    /// Records the measured client-side duration.
+    pub fn with_elapsed(mut self, elapsed: Duration) -> Self {
+        self.elapsed = Some(elapsed);
+        self
+    }
+
+    /// Length of the produced vector.
+    pub fn dimensions(&self) -> usize {
+        self.embedding.len()
+    }
+}
 
 /// Generates embedding vectors from content blocks.
 #[async_trait]
 pub trait EmbeddingModel: Send + Sync {
     /// Embeds a single content block.
     async fn embed(&self, block: &ContentBlock) -> Result<Vec<f64>>;
+
+    /// Embeds a single content block and reports the provider's token usage.
+    ///
+    /// The default implementation delegates to [`Self::embed`] and reports an empty
+    /// [`EmbeddingUsage`], so purely local models need not implement it.
+    async fn embed_with_usage(&self, block: &ContentBlock) -> Result<EmbeddingResponse> {
+        let embedding = self.embed(block).await?;
+        Ok(EmbeddingResponse::new(
+            embedding,
+            EmbeddingUsage::default(),
+            self.model_name(),
+        ))
+    }
 
     /// Model name used for logging / identification.
     fn model_name(&self) -> &str;

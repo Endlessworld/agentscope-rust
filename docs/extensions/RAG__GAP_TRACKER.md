@@ -1,7 +1,7 @@
 ﻿# RAG 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **RAG** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
-> **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-rag\`
+> **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-rag\`（旧记录中的 `E:\local-github\agentscope-java\...` 在本机已不存在，见 §7.3 勘误 2）
 > **Java 子模块**：bailian, dify, haystack, ragflow, simple
 > **Rust 目标**：`crates/agentscope-extensions-rag/`（波次 A）
 > **统计口径**：所有行数均为**非空行**（trim 后非空），Java 与 Rust 同口径；见 §6 静态复核记录。
@@ -19,22 +19,35 @@
 | Java 规模（实测行数，非空行） | 主代码 **15946** / 测试 **16792**（bailian 1447/1493、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8576/10909） |
 | Rust crate | `crates/agentscope-extensions-rag` |
 | 迁移波次 | A |
-| 当前状态 | **部分完成** — `dify`、`ragflow`、`bailian`、`haystack`、`simple`（离线链路）子模块均已迁移，`cargo build`/`cargo test` 全绿（**265 passed / 0 failed**）；`simple` 的 HTTP embedding 提供商、外部向量库、reader 增强 **非本轮范围，尚未迁移** |
+| 当前状态 | **部分完成** — `dify`、`ragflow`、`bailian`、`haystack`、`simple` 子模块的离线链路与外部服务链路均已迁移；2026-10-26 补 `simple` 的 **HTTP embedding 4 件**（openai / dashscope text / dashscope multimodal / ollama）+ `ReaderUtils` + `ImageReader`（新增 60 个离线测试，待主智能体统一 `cargo build`/`cargo test` 验证）；**外部向量库 4 件（ES/Milvus/PgVector/Qdrant）与 `ExternalApiReader` 仍为待办** |
 
-### 1.1 Rust crate 文件清单（42 个源文件，10002 行非空，265 个内联测试 = 192 `#[test]` + 73 `#[tokio::test]`）
+### 1.1 Rust crate 文件清单（49 个源文件；本轮新增 7 个源文件 2437 行非空 + 60 个内联测试）
+
+> 行数口径：非空行（trim 后非空）。上一轮基线为 42 文件 / 10002 行 / 265 测试；本轮新增
+> `embedding/{utils,openai,dashscope,ollama,test_support}.rs` 与 `reader/{utils,image}.rs`，
+> 并扩充了 `embedding.rs`、`reader.rs`、`hash.rs`、`lib.rs`、`Cargo.toml`。新增测试数：
+> openai 12 / dashscope 15 / ollama 8 / embedding::utils 10 / reader::utils 6 / reader::image 8 /
+> hash 1 = **60**（待主智能体统一跑 `cargo test` 确认）。
 | 文件 | 职责 |
 |---|---|
-| `src/lib.rs` | crate 根：15 个模块声明（本轮新增 `bailian` / `haystack`）+ re-export；说明 Java core `rag` 包已 `@Deprecated(forRemoval)` 且 core 无对应实现 |
+| `src/lib.rs` | crate 根：15 个模块声明 + re-export；说明 Java core `rag` 包已 `@Deprecated(forRemoval)` 且 core 无对应实现 |
 | `src/error.rs` | `RagError`（Argument / Embedding / VectorStore / Reader / Unsupported / Http / Api / Auth / Json / Io），对应 Java 各类异常 |
-| `src/hash.rs` | 自实现 MD5 + 版本 3（名称）UUID，复刻 Java `UUID.nameUUIDFromBytes` 的 Document id |
+| `src/hash.rs` | 自实现 MD5 + 版本 3（名称）UUID，复刻 Java `UUID.nameUUIDFromBytes` 的 Document id；**新增 `sha256_hex`**（`ReaderUtils` 用，复用已有 `sha2` 依赖） |
 | `src/knowledge.rs` | `Knowledge` trait + 共享 `filter_and_rank`（阈值过滤 + 降序 + limit） |
 | `src/message.rs` | 检索结果 → core `Msg`：tool 文本格式与 `<retrieved_knowledge>` 通用 hook 注入 |
 | `src/model.rs` | `Document` / `DocumentMetadata` / `RetrieveConfig` / `content_block_text` |
-| `src/reader.rs` | `Reader` trait、`ReaderInput`、`TextReader`、`SplitStrategy`、字符/段落/token 分块 |
+| `src/reader.rs` | `Reader` trait、`ReaderInput`、`TextReader`、`SplitStrategy`、字符/段落/token 分块；声明 `reader::{image,utils}` 子模块并 re-export |
+| `src/reader/utils.rs` | `ReaderUtils`：`generate_doc_id(_md5/_sha256)`、`bytes_to_hex`、`DocIdAlgorithm`（Java 未知算法 → `InvalidArgument`） |
+| `src/reader/image.rs` | `ImageReader`：图片路径/URL → `ImageBlock(URLSource)` 的单个 `Document`；docId = MD5(path)、chunkId `"0"`、OCR 仅保留开关（与 Java 同为空实现） |
 | `src/retry.rs` | 指数退避重试（对应 Java `RetryInterceptor`：429 / 5xx / 传输错误重试，4xx 不重试） |
 | `src/simple.rs` | `SimpleKnowledge`、`in_memory_knowledge`、`EmptyKnowledge` |
 | `src/store.rs` | `VdbStore` trait、`InMemoryStore`、`SearchQuery`、余弦/欧氏距离 |
-| `src/embedding.rs` | `EmbeddingModel` trait、确定性离线的 `HashEmbeddingModel` |
+| `src/embedding.rs` | `EmbeddingModel` trait（含默认 `embed_with_usage`）、`EmbeddingUsage`/`EmbeddingResponse`/`UsageListener`、确定性离线的 `HashEmbeddingModel`；声明并 re-export 4 个 HTTP 提供商的子模块 |
+| `src/embedding/utils.rs` | `EmbeddingUtils` → `EmbeddingExecutionConfig`（超时 + 复用 `retry::RetryPolicy`）、`f32_slice_to_f64`、`join_url`、`build_transport` |
+| `src/embedding/openai.rs` | `OpenAiTextEmbedding`：`POST {base}/embeddings` + `Bearer`，`input:[text]`/`dimensions`/`encoding_format=float` |
+| `src/embedding/dashscope.rs` | `DashScopeTextEmbedding` + `DashScopeMultiModalEmbedding`：`Bearer` 鉴权；text 走 `input.texts`，multimodal 走 `input.contents[{text|image}]`；本地图片内联为 `data:` URL |
+| `src/embedding/ollama.rs` | `OllamaTextEmbedding`：`POST {base}/api/embed`，无鉴权；`embeddings[0]`（f32）→ `Vec<f64>`，`prompt_eval_count` → usage |
+| `src/embedding/test_support.rs` | `#[cfg(test)]` 脚本化内存 transport（LIFO 回放 + 请求录制），四个提供商测试共用 |
 | `src/dify/{mod,config}.rs` | Dify 配置 + `RetrievalMode` / `RerankConfig` / `MetadataFilter(Condition)` |
 | `src/dify/{client,request}.rs` | Dify HTTP 客户端 + 可注入 `DifyTransport` + 请求体构造 |
 | `src/dify/{model,converter,knowledge}.rs` | Dify 响应 DTO、`DifyDocumentConverter`、`DifyKnowledge` |
@@ -50,10 +63,18 @@
 | `src/haystack/{model,request}.rs` | `HayStackResponse` / `HayStackDocument` / `SparseEmbedding` / `ByteStream` DTO + 请求体装配 |
 | `src/haystack/{client,converter,knowledge}.rs` | `POST {baseUrl}` 客户端（`code != successCode` → API 错误）、document→`Document` 转换、`HayStackKnowledge` 适配器 |
 
-### 1.2 验证基线（本轮实测）
+### 1.2 验证基线
+
+上一轮（2026-09-19）实测基线：
 ```
 cargo build -p agentscope-extensions-rag   -> Finished `dev` profile (0 errors, exit 0)
 cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
+```
+
+本轮（2026-10-26）按约定**未在子智能体内执行 cargo**（编译/测试由主智能体统一验证）。目测需重跑：
+```
+cargo build -p agentscope-extensions-rag
+cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 ```
 
 ## 2. Java 清单与依赖映射
@@ -74,6 +95,7 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | Apache Tika / PDFBox / POI | 文档解析 | 无 | 见 §3.3，待评估 pure-Rust 替代 |
 | `hmac` / `sha2` | ACS4-HMAC-SHA256 请求签名（百炼；Java 由 SDK 传递引入） | `hmac = "0.12"` / `sha2 = "0.10"`（本 crate `[dependencies]`） | 本轮新增；`sha2` 与 workspace 同版本，`hmac`/`sha2` 已在 `Cargo.lock` 中 |
 | `uuid` | 百炼 `x-acs-signature-nonce` 随机源（对应 Java `Common.getNonce`） | `uuid = { workspace = true }` | 复用 workspace 依赖 |
+| `base64` | DashScope multimodal 将本地图片内联为 `data:` URL（Java 由 `DashScopeMediaConverter` 做同样的事） | `base64 = { workspace = true }` | 本轮新增；沿用 workspace 版本 `0.22` |
 | JUnit 5 / Mockito | 测试 | `#[test]` / `#[tokio::test]` + 内联 mock transport | 全离线，`tokio` dev-dependency 提供 `rt-multi-thread,macros` |
 
 ### 2.2 dify 子模块（`io.agentscope.core.rag.integration.dify.*`，11 类）— **已迁移**
@@ -90,7 +112,7 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | `exception.DifyApiException` / `DifyAuthException` | API / 鉴权异常 | `RagError::Api` / `RagError::Auth`（`src/error.rs`） | 已完成 |
 | 请求体装配（`retrieve` 内联） | `query` + `retrieval_model` | `dify::request::build_retrieve_request_body` | 已完成 |
 
-### 2.3 simple 子模块（`io.agentscope.core.rag.*` / `io.agentscope.core.embedding.*`，simple 子模块 **33 类**（rag 24 + embedding 9）+ Java core `io.agentscope.core.rag.*` **7 类** = 40 类）— **离线部分已迁移**
+### 2.3 simple 子模块（`io.agentscope.core.rag.*` / `io.agentscope.core.embedding.*`，simple 子模块 **33 类**（rag 24 + embedding 9）+ Java core `io.agentscope.core.rag.*` **7 类** = 40 类；实际 embedding 为 **7 类**，见 §7.3 勘误 3）— **除外部向量库 4 件与 `ExternalApiReader` 外均已完成**
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
 | `core.rag.Knowledge`（core 接口） | 知识库抽象 | `knowledge::Knowledge` (trait) | 已完成 |
@@ -107,21 +129,21 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | `core.rag.store.InMemoryStore` | 内存向量库 | `store::InMemoryStore` | 已完成 |
 | `core.rag.store.DistanceCalculator` | 余弦/欧氏距离 | `store::{cosine_similarity, euclidean_distance, squared_euclidean_distance}` | 已完成 |
 | `core.rag.store.dto.SearchDocumentDto` | 检索参数 DTO | `store::SearchQuery` | 已完成 |
-| `core.embedding.EmbeddingModel` | 向量化抽象 | `embedding::EmbeddingModel` (trait) | 已完成 |
+| `core.embedding.EmbeddingModel` | 向量化抽象 | `embedding::EmbeddingModel` (trait，含默认 `embed_with_usage`) | 已完成 |
 | `core.embedding.EmbeddingException` | embedding 异常 | `RagError::Embedding` | 已完成 |
 | `core.rag.exception.ReaderException` / `VectorStoreException` | reader / store 异常 | `RagError::Reader` / `RagError::VectorStore` | 已完成 |
 | `core.rag.KnowledgeRetrievalTools`（core） | agentic 模式工具输出文本 | `message::format_documents_for_tool` | 已完成 |
 | `core.rag.GenericRAGHook`（core） | 自动检索 hook（注入 `<retrieved_knowledge>`） | `message::{build_retrieved_knowledge_msg, extract_query_from_messages, RETRIEVED_KNOWLEDGE_OPEN/CLOSE}` | 已完成 |
-| `core.embedding.dashscope.{DashScopeTextEmbedding, DashScopeMultiModalEmbedding}` | DashScope HTTP embedding | 无（`embedding::HashEmbeddingModel` 为离线替代） | 待办 |
-| `core.embedding.ollama.OllamaTextEmbedding` | Ollama HTTP embedding | 无 | 待办 |
-| `core.embedding.openai.OpenAITextEmbedding` | OpenAI HTTP embedding | 无 | 待办 |
-| `core.embedding.EmbeddingUtils` | 超时/重试包装 | 无（可用 `retry::RetryPolicy`） | 待办 |
-| `core.embedding.EmbeddingResponse` / `EmbeddingUsage` | embedding 响应 / token 用量 DTO | 无（Rust `EmbeddingModel::embed` 直接返回 `Vec<f64>`，不携带 usage） | 待办 |
+| `core.embedding.dashscope.{DashScopeTextEmbedding, DashScopeMultiModalEmbedding}` | DashScope HTTP embedding | `embedding::dashscope::{DashScopeTextEmbedding, DashScopeMultiModalEmbedding}`（+ Builder） | 已完成 |
+| `core.embedding.ollama.OllamaTextEmbedding` | Ollama HTTP embedding | `embedding::ollama::OllamaTextEmbedding`（+ Builder，`POST /api/embed`） | 已完成 |
+| `core.embedding.openai.OpenAITextEmbedding` | OpenAI HTTP embedding | `embedding::openai::OpenAiTextEmbedding`（+ Builder，`POST /embeddings`） | 已完成 |
+| `core.embedding.EmbeddingUtils` | 超时/重试包装 | `embedding::utils::EmbeddingExecutionConfig`（超时 + `retry::RetryPolicy`）、`f32_slice_to_f64` | 已完成 |
+| `core.embedding.EmbeddingResponse` / `EmbeddingUsage` | embedding 响应 / token 用量 DTO | `embedding::{EmbeddingResponse, EmbeddingUsage, UsageListener}`（**Rust 侧新增**：Java 无这两个类，见 §7.3 勘误） | 已完成 |
 | `core.rag.RAGMode`（core） | GENERIC / AGENTIC / NONE 模式枚举 | 无（core/harness 未迁移 hook 层，见 §4.2） | 待办 |
 | `core.rag.reader.TikaReader` / `PDFReader` / `WordReader` | 多格式文档读取（Tika / PDFBox / POI） | 无 | 设计决定（不迁移） |
-| `core.rag.reader.ImageReader` | 图片读取（**无第三方 JVM 依赖**，仅需 core 的 `ImageBlock`/`URLSource`，Rust core 已有） | 无 | 待办 |
+| `core.rag.reader.ImageReader` | 图片读取（**无第三方 JVM 依赖**，仅需 core 的 `ImageBlock`/`URLSource`，Rust core 已有） | `reader::ImageReader`（+ `SUPPORTED_FORMATS`） | 已完成 |
 | `core.rag.reader.ExternalApiReader` | 外部解析 API 读取（可插拔 `RequestBuilder`/`ResponseParser`） | 无（可基于 `crate::transport` seam 实现） | 待办 |
-| `core.rag.reader.ReaderUtils` | MD5/SHA-256 docId + hex | 部分（`hash::md5_hex` 已有；SHA-256 待补） | 待办 |
+| `core.rag.reader.ReaderUtils` | MD5/SHA-256 docId + hex | `reader::utils::{generate_doc_id, generate_doc_id_md5, generate_doc_id_sha256, bytes_to_hex, DocIdAlgorithm}` + `hash::sha256_hex` | 已完成 |
 | `core.rag.reader.TableFormat` | Word 表格格式（Markdown/JSON） | 无（仅 WordReader 使用） | 设计决定（不迁移） |
 | `core.rag.store.ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` | 外部向量库 | 无（接口为 `store::VdbStore`） | 待办 |
 
@@ -178,7 +200,7 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | **bailian 全链路** | bailian 子模块 7 类 | 已完成 | `src/bailian/**`；9 个源文件 2608 行 / 64 个内联测试；`reqwest` + 自建 ACS4-HMAC-SHA256 签名，不引入阿里云 SDK |
 | **haystack 全链路** | haystack 子模块 10 类 | 已完成 | `src/haystack/**`；7 个源文件 1692 行 / 49 个内联测试 |
 | **simple 离线链路** | `SimpleKnowledge` / `InMemoryStore` / `DistanceCalculator` / `TextReader` / `TextChunker` / `SplitStrategy` / `ReaderInput` / `EmbeddingModel` | 已完成 | `src/{simple,store,reader,embedding}.rs` |
-| 离线单测（265 个） | Java 测试 16792 行 | 已完成 | 见 §1.1；HTTP 走注入式 mock transport，全离线（无网络、无 accessKey） |
+| 离线单测（265 → 325 个） | Java 测试 16792 行 | 已完成 | 上一轮 265；本轮新增 60（openai 12 / dashscope 15 / ollama 8 / embedding::utils 10 / reader::utils 6 / reader::image 8 / hash 1）；HTTP 仍走注入式 mock transport，全离线 |
 
 ### 3.2 缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -187,24 +209,25 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 | HayStack 集成 | `haystack.*` 10 类 | **已完成** | `src/haystack/**`；复用 `crate::transport` seam；覆盖 `documents` 与 `context_documents`（SentenceWindow）两种形态 |
 | RAGFlow 集成 | `ragflow.*` 9 类 | **已完成** | `src/ragflow/**`；`POST /api/v1/retrieval`；`data` 字段可 `false`/`null`/object 的自定义反序列化已复刻（`ResponseData`） |
 | simple 外部向量库 | `ElasticsearchStore`(526) / `MilvusStore`(919) / `PgVectorStore`(979) / `QdrantStore`(996) | 待办 | 本轮仅做 bailian/haystack，未动此项；均以 `store::VdbStore` 为接口；各需 REST/gRPC 客户端，可离线 mock |
-| embedding HTTP 提供商 | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` | 待办 | 本轮未动；与 MODEL 扩展边界可能重叠，待裁定（§4.2） |
+| embedding HTTP 提供商 | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` | **已完成** | `src/embedding/{dashscope,ollama,openai}.rs` + 共享 `utils.rs`；均走 `crate::transport` seam，离线 mock 覆盖（3 个提供商共 35 个测试，另 10 个共享 utils 测试）；超时/重试统一由 `EmbeddingExecutionConfig` 负责（transport 侧 `max_retries=0`，避免双重重试） |
 
 ### 3.3 增强（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | 文档读取器（Tika/PDF/Word） | `TikaReader` / `PDFReader` / `WordReader` | 设计决定（不迁移） | **依据**：这三个 reader 直接依赖 JVM 库（Apache Tika / PDFBox / POI）及其文档模型，Java 实现无法机械直译；强行引入等价 Rust 库（如 `pdf-extract`/`lopdf`/`docx-rs`）会带来新的重依赖与解析语义差异，且与本 crate 的“高内聚低耦合”定位不符。**裁定：不迁移**，保留本 crate 现有的 `Reader` trait 作为扩展点，调用方可自行实现或在本 trait 上接入外部解析服务。 |
-| `ImageReader` | `ImageReader`（图片 → `ImageBlock`/`URLSource`，`enableOCR` 占位不实现 OCR） | 待办 | **§6 复核修正**：原并入上一行的 Tika/PDF/Word 组一起裁定“不迁移”，但该 reader **无任何第三方 JVM 依赖**（仅依赖 core 的 `ImageBlock` / `URLSource`，Rust core 已有对应类型），且 `ReaderUtils.generateDocIdMD5` 的 MD5 部分已被 `hash::md5_hex` 覆盖 → 技术上可机械直译。降级为 P2 待办。 |
+| `ImageReader` | `ImageReader`（图片 → `ImageBlock`/`URLSource`，`enableOCR` 占位不实现 OCR） | 已完成 | `src/reader/image.rs`：`ImageReader::new(enable_ocr)` / `is_ocr_enabled()` / `SUPPORTED_FORMATS`（7 项，与 Java 一致）；内容为 `ContentBlock::Image(ImageBlock{ URLSource })`，URL 保持原样、本地路径添 `file://`；docId = `generate_doc_id_md5(path)`、chunkId `"0"`；**输入取路径而非文件内容**（Rust `ReaderInput::as_string` 会读文件内容，这里显式用路径，见 §7.3 差异 2）；8 个测试 |
 | `ExternalApiReader` | `ExternalApiReader` | 待办 | 与 `dify`/`ragflow`/`haystack` 不同，它描述的是“调用外部解析 API”，无固定 wire 契约；本轮未动。若后续迁移，建议直接复用 `crate::transport` seam。 |
-| reader 辅助 | `ReaderUtils`（MD5/SHA-256 docId + hex） | 待办 | **§6 复核修正**：原文以“SHA-256 路径仅服务于未迁移的 Tika/PDF/Word reader”为由裁定不迁移，但 MD5 路径同时被**可迁移的 `ImageReader`** 使用（`generateDocIdMD5(imagePath)`），故“仅服务于未迁移 reader”的前提不成立。MD5 侧可由 `hash::md5_hex` 直接满足；SHA-256 侧待 `Tika/PDF/ExternalApiReader` 决策后再定。 |
+| reader 辅助 | `ReaderUtils`（MD5/SHA-256 docId + hex） | 已完成 | `src/reader/utils.rs`：`generate_doc_id(input, "MD5" 或 "SHA-256")`、`generate_doc_id_md5`、`generate_doc_id_sha256`、`bytes_to_hex`、`DocIdAlgorithm`（未知算法 → `InvalidArgument("<algo> algorithm not available")`，与 Java 同文案）；SHA-256 新增 `hash::sha256_hex`（复用已有 `sha2`，**未新增依赖**）；6 个测试（含独立算得的 MD5/SHA-256 金标向量） |
 | `TableFormat` | `TableFormat`（Word 表格 Markdown/JSON） | 设计决定（不迁移） | **依据**：`TableFormat` **仅**被未迁移的 `WordReader` 使用，无其它调用方；“不迁移”结论与 WordReader 一致。 |
-| embedding 辅助 | `EmbeddingUtils`（超时/重试包装） | 待办 | 本轮未动；依赖未迁移的 HTTP embedding 提供商，且超时/重试能力已由 `retry::RetryPolicy` + `transport::TransportOptions` 提供，迁移时直接组合即可。 |
-| embedding 用量 DTO | `EmbeddingResponse` / `EmbeddingUsage`（token 用量 + 客户端耗时） | 待办 | **§6 新发现**：Rust `EmbeddingModel::embed` 直接返回 `Vec<f64>`，**不携带 usage**；Java `SimpleKnowledge` 有 `usageListener` 回调（每次 embed 报告 `EmbeddingUsage`）。若将来接真实 HTTP provider，token 计量与 `SimpleKnowledge` 的 usage 回调会缺失。 |
+| embedding 辅助 | `EmbeddingUtils`（超时/重试包装） | 已完成 | `src/embedding/utils.rs::EmbeddingExecutionConfig`（`timeout` + `retry: RetryPolicy`）提供 `apply(model, provider, operation_type, op)`：每次尝试套 `tokio::time::timeout`，重试复用 `retry_async`（仅 transport / 429 / 5xx）；工厂 `build_transport` 强制 `max_retries=0` 以免与 transport 自身重试叠加；10 个测试 |
+| embedding 用量 DTO | `EmbeddingResponse` / `EmbeddingUsage`（token 用量 + 客户端耗时） | 已完成 | `embedding::{EmbeddingUsage, EmbeddingResponse, UsageListener}` + trait 默认方法 `embed_with_usage`（本地模型无需改）；各提供商从 wire 的 `usage` / `prompt_eval_count` 解析，`EmbeddingResponse.elapsed` 记录客户端耗时；`usage_listener` 在 builder 上可选注册。**§7.3 勘误：Java 仓库里并无 `EmbeddingUsage`/`EmbeddingResponse` 类，亦无 `usageListener`（全仓 `rg` 零命中），此项属 Rust 侧增值，不得再写作“Java 已有”** |
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路、**Bailian 全链路（含自建 ACS4-HMAC-SHA256 签名）**、**HayStack 全链路**；本轮新增 16 个源文件 4300 行，全 crate 共 **42 个源文件 10002 行（非空）、265 个内联测试**。
-- **验证命令与结果**（本轮实测，2026-09-19）：
+- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路、**Bailian 全链路（含自建 ACS4-HMAC-SHA256 签名）**、**HayStack 全链路**；全 crate 共 **49 个源文件**。
+- **2026-10-26 本轮完成**：`simple` 的 HTTP embedding 4 件（`OpenAiTextEmbedding` / `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding`）、`EmbeddingUtils`→`EmbeddingExecutionConfig`、`EmbeddingUsage`/`EmbeddingResponse`/`UsageListener`、`ReaderUtils`（MD5+SHA-256）、`ImageReader`；新增 7 个源文件 2437 行非空 / 60 个离线测试。详见 §7。
+- **验证命令与结果**（上一轮实测，2026-09-19）：
   - `cargo build -p agentscope-extensions-rag` → **通过（0 errors，exit 0）**
   - `cargo test -p agentscope-extensions-rag` → **265 passed / 0 failed / 0 ignored**（untittests src/lib.rs）
   - 本 crate 无新增 warning（`warning:` 匹配 `extensions-rag` 计数 = 0）
@@ -212,17 +235,15 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 - **2026-10-22 静态复核**：未运行 `cargo build`/`cargo test`（本轮为纯静态核对），仅校验源码与统计口径；详见 §6。
 
 ### 4.2 下一步与阻塞
-1. **simple 外部向量库（P1，非本轮范围）**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`，均实现 `store::VdbStore`。
-2. **embedding HTTP 提供商与 `ExternalApiReader`/`EmbeddingUtils`/`EmbeddingUsage`（P1/P2，非本轮范围）**：见 §3.2/§3.3。
+1. **simple 外部向量库（P1，唯一剩余大块）**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`，均实现 `store::VdbStore`；**本轮未动，仍为待办**。
+2. **`ExternalApiReader`（P2）**：无固定 wire 契约，建议基于 `crate::transport` seam 实现（§3.3）。
 3. **已裁定不迁移**：`TikaReader`/`PDFReader`/`WordReader`、`TableFormat`（理由见 §3.3）。
 4. **待裁定事项**
    - `RagMode` / `GenericRAGHook` 落点：core 是否新增 hook 抽象，或由 harness 承接（当前 `message.rs` 纯函数过渡）。
-   - embedding HTTP 提供商（dashscope/ollama/openai）归属：RAG 扩展 vs MODEL 扩展（`src/embedding.rs` 注释倾向 MODEL）。
-   - `ImageReader` 是否补迁（§6 复核新增，见 §3.3）：技术上可机械直译，优先级 P2。
-   - `EmbeddingUsage` / `SimpleKnowledge.usageListener` 是否随 embedding trait 一起补齐（§6 复核新增）。
+   - `SimpleKnowledge` 是否接 `usage_listener`：`EmbeddingResponse`/`UsageListener` 已可用，但 `SimpleKnowledge` 目前仍调 `embed()`，未向外透传 usage（本轮未改，避免扩大改动面）。
 5. **跨模块需求**
    - 若需在 core/harness 增加 RAG hook 或 embedding 抽象，本 crate 无权修改，需汇总方裁定（记入本 §4.2，不直接改 core/harness）。
-   - 若 embedding 提供商确定归 MODEL 扩展，本 crate 仅依赖其 trait，不重复实现。
+   - 若 embedding 提供商确定归 MODEL 扩展，本 crate 仅依赖其 trait，不重复实现。**→ 2026-10-26 裁定（落地）：沿用 Java 分属——提供商留在 RAG 扩展（`src/embedding/*`），否则 `SimpleKnowledge` 无法自包含；MODEL 扩展的 `ollama` 只保留 chat/通用 `embed`，两边 wire 契约一致但不共享代码（本 crate 不依赖 `agentscope-extensions-model`）。**
 6. **Bailian 不引入阿里云 SDK（本轮裁定，已落地）**
    - **背景**：Java `BailianClient` 把检索委托给 `com.aliyun.bailian20231229` SDK（Tea/OpenAPI 体系，经 `com.aliyun.gateway.pop.Client` 以 `authType=AK` / `style=ROA` / ACS4-HMAC-SHA256 签名）。
    - **裁定**：不将阿里云 SDK（Java 生态、依赖树庞大）引入 Rust workspace；本 crate 用 `reqwest` 直连并**自建签名**（`src/bailian/signing.rs`，仅依赖已在 `Cargo.lock` 的 `hmac`/`sha2`）。
@@ -324,4 +345,68 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
   2. `simple` 子模块**仅离线部分完成**，其体量最大的三块（外部向量库 4 类 ≈ 3420 行、HTTP embedding 4 类 ≈ 1315 行、reader 增强 7 类 ≈ 1400 行）在 Rust 侧**确认为零实现**，且经本次复核**新发现** `ImageReader` / `ReaderUtils` / `EmbeddingUsage` / `RAGMode` 四项此前未单列的缺口；
   3. 因此模块既不能判 `已完成`（仍有 40 类中的 19 类未迁移），也不宜判 `待办`（已有 4/5 子模块落地且质量经得起逐类复核）。
   4. 附注：若采用**子模块级** rollup，则 `dify`/`ragflow`/`bailian`/`haystack` 各自可判 `已完成`，`simple` 判 `进行中`。
+
+> **历史快照提示（2026-10-26 注）**：本节（§6 全部）是 2026-10-22 的静态复核快照，其中“HTTP embedding 4 类零实现”“`ImageReader`/`ReaderUtils`/`EmbeddingUsage` 缺失”等结论**已被 §7 推翻**；且 `EmbeddingUsage`/`EmbeddingResponse` 在 Java 仓库中并不存在（见 §7.3）。引用计数时请以 §7.1 为准。
+
+## 7. 本轮交付记录（2026-10-26）
+
+### 7.1 交付物
+
+| 文件 | 行数（非空） | 测试 | 说明 |
+|---|---|---|---|
+| `src/embedding.rs`（扩充） | 260 | 4（原有） | 新增 `EmbeddingUsage` / `EmbeddingResponse` / `UsageListener`；trait 新增默认方法 `embed_with_usage`；声明并 re-export 4 个子模块 |
+| `src/embedding/utils.rs`（新） | 299 | 10 | `EmbeddingExecutionConfig`（`timeout` + `RetryPolicy`，`apply()` 统一套超时/重试）、`f32_slice_to_f64`、`join_url`、`block_type_name`、`build_transport` |
+| `src/embedding/openai.rs`（新） | 520 | 12 | `OpenAiTextEmbedding` + Builder；`POST {base}/embeddings`，`Bearer`，`input:[text]`+`dimensions`+`encoding_format=float` |
+| `src/embedding/dashscope.rs`（新） | 875 | 15 | `DashScopeTextEmbedding`（`input.texts`）+ `DashScopeMultiModalEmbedding`（`input.contents[{text|image}]`）；本地图片 → `data:` URL；信封 `code` → `RagError::Api` |
+| `src/embedding/ollama.rs`（新） | 381 | 8 | `OllamaTextEmbedding` + Builder；`POST {base}/api/embed`，无鉴权；`prompt_eval_count` → usage |
+| `src/embedding/test_support.rs`（新） | 48 | — | `#[cfg(test)]` 脚本化内存 transport（LIFO 回放 + 请求录制） |
+| `src/reader/utils.rs`（新） | 129 | 6 | `ReaderUtils`：`generate_doc_id(_md5/_sha256)`、`bytes_to_hex`、`DocIdAlgorithm` |
+| `src/reader/image.rs`（新） | 185 | 8 | `ImageReader` + `SUPPORTED_FORMATS` |
+| `src/hash.rs`（扩充） | 179 | 4（+1 新） | `sha256_hex`；`hex` 改为 `pub(crate)` 供 reader 复用 |
+| `src/reader.rs`（扩充） | 395 | 12（原有） | 声明 `reader::{image,utils}` + re-export |
+| `src/lib.rs` / `src/simple.rs` / `Cargo.toml`（扩充） | — | — | re-export 与文档；`Cargo.toml` 新增 `base64 = { workspace = true }`（仅本 crate） |
+
+新增测试（共 60）：
+
+- `embedding::openai::tests`：`build_embedding_request_pins_the_wire_contract` / `parses_embedding_and_usage` / `embed_returns_the_bare_vector` / `usage_listener_receives_every_call` / `rejects_non_text_blocks_with_the_java_message` / `rejects_blank_text` / `maps_401_to_auth_error` / `retries_a_500_before_failing` / `empty_data_is_an_error` / `empty_vector_is_an_error` / `blank_body_is_an_error` / `builder_validates_required_fields`
+- `embedding::dashscope::tests`：`text_request_uses_texts_input_and_dimension_parameter` / `text_embedding_parses_output_and_total_tokens` / `text_embedding_rejects_image_block` / `text_embedding_rejects_blank_text` / `multimodal_text_request_uses_contents` / `multimodal_base64_image_becomes_data_url` / `multimodal_remote_image_is_forwarded_verbatim` / `multimodal_local_file_is_inlined_as_data_url` / `multimodal_missing_local_file_is_an_error` / `multimodal_rejects_unsupported_blocks` / `multimodal_usage_carries_input_and_output_tokens` / `envelope_code_becomes_api_error` / `missing_output_is_an_error` / `empty_embeddings_list_is_an_error` / `builder_validates_required_fields`
+- `embedding::ollama::tests`：`request_targets_api_embed_without_auth` / `parses_f32_embeddings_and_prompt_eval_count` / `missing_prompt_eval_count_reports_empty_usage` / `empty_embeddings_is_an_error` / `empty_vector_is_an_error` / `blank_body_is_an_error` / `transport_error_is_surfaced` / `builder_requires_model_name`
+- `embedding::utils::tests`：`default_config_matches_java_constants` / `ensure_default_only_fills_in_none` / `timeout_is_reported_as_an_embedding_error` / `no_timeout_lets_the_operation_finish` / `retries_non_retryable_errors_only_once` / `retries_retryable_errors_until_success` / `f32_slice_widens_to_f64` / `join_url_normalizes_slashes` / `block_type_names_match_java_simple_class_names` / `usage_listener_alias_is_object_safe`
+- `reader::utils::tests`：`md5_doc_id_matches_the_java_algorithm` / `sha256_doc_id_matches_the_java_algorithm` / `generate_doc_id_dispatches_by_name` / `unknown_algorithm_is_rejected_with_the_java_message` / `algorithm_names_round_trip` / `bytes_to_hex_is_lowercase_and_padded`
+- `reader::image::tests`：`ocr_flag_defaults_to_disabled_and_round_trips` / `supported_formats_match_java` / `url_input_is_kept_verbatim` / `local_path_gets_a_file_scheme` / `file_url_is_not_prefixed_twice` / `file_input_uses_the_path_not_the_contents` / `doc_id_is_the_md5_of_the_path_and_chunk_id_is_zero` / `doc_id_is_stable_and_path_sensitive`
+- `hash::tests`：`sha256_matches_fips_vectors`
+
+### 7.2 与 Java 的显式取舍（非缺口）
+
+1. **HTTP 一律走 `crate::transport` seam**：生产用 `ReqwestTransport`（`max_retries = 0`），测试注入 `ScriptedTransport`；重试/超时只在 `EmbeddingExecutionConfig::apply` 一处发生，避免 Java「SDK 重试 + `EmbeddingUtils` 重试」两层叠加。
+2. **Java 的 `Duration`/`maxBackoff`**：`RetryPolicy` 只有 `base_delay`（无上限），默认 3 次重试最大睡眠 8s，低于 Java `DEFAULT_MAX_BACKOFF = 10s`，因此不引入额外上限参数。
+3. **Java `IllegalStateException` → `RagError::InvalidArgument`**：文案逐字对齐（`apiKey is required and cannot be null or empty` 等），错误类型随本 crate 既有惯例。
+4. **Ollama `dimensions = -1`（未指定）→ Rust `0`**：`usize` 不能为负；`dimensions()` 原样返回（`0` = 未指定），仅在 `> 0` 时校验并 warn，与 Java `dimensions > 0` 分支一致。
+5. **DashScope 端点常量**：`DEFAULT_BASE_URL = https://dashscope.aliyuncs.com/api/v1`，text 端点 `/services/embeddings/text-embedding/text-embedding`，multimodal 端点 `/services/embeddings/multimodal-embedding/multimodal-embedding`（Java 由 SDK 内部拼）；鉴权统一 `Authorization: Bearer`。
+6. **`SimpleKnowledge` 未改**：仍调 `embed()`（经默认 `embed_with_usage` 包装不丢信息），如需 usage 回调可由调用方在模型上注册 `usage_listener`。`SimpleKnowledge` 不调 `usage_listener`（待裁定，见 §4.2）。
+7. **`ImageReader` 取路径而非文件内容**：Java `ReaderInput.asString()` 返回构造时的字符串（`fromFile(path)` 即路径）；Rust `ReaderInput::as_string()` 会读文件内容，故 `image.rs` 另行用 `input_as_path()` 取路径。
+
+### 7.3 勘误（本轮新增，必须遵守）
+
+| # | 原文 | 实际 | 处置 |
+|---|---|---|---|
+| 1 | `§2.3 / §6.4`：`core.embedding.{EmbeddingUsage,EmbeddingResponse}` 存在，`SimpleKnowledge` 有 `usageListener` | 对 **`D:\IdeaProjects\agentscope-java` 全仓 `rg "usageListener\|EmbeddingUsage\|EmbeddingResponse"` 零命中**（仅测试里出现 `Embedding` 字样的无关命中）；Java 既无这两个类，也无 `usageListener` | 已改 §2.3/§3.3：Rust 侧 `EmbeddingUsage`/`EmbeddingResponse`/`UsageListener` 标为 **Rust 增值**，不得再写“Java 已有” |
+| 2 | `§6.1`：`Java 路径 ... 实际为 E:\local-github\agentscope-java` | 本机该路径不存在，实际为 `D:\IdeaProjects\agentscope-java\...` | 本轮以 D 盘路径完成核对；下文引用 Java 均指 D 盘 |
+| 3 | `§2.3` 多处： "simple 子模块 33 类（rag 24 + embedding 9）" | `io.agentscope.core.embedding` 下**主代码只有 7 个 `.java`**：`EmbeddingException`/`EmbeddingModel`/`EmbeddingUtils` + `dashscope/{Text,MultiModal}` + `ollama/OllamaTextEmbedding` + `openai/OpenAITextEmbedding`。原“9 类”里的 2 类正是不存在的 `EmbeddingUsage`/`EmbeddingResponse` | 勘误：embedding 实为 **7 类**（全部已迁移）；simple 子模块实数应为 **31 类（rag 24 + embedding 7）**，含 core `rag` 引用则为 38 类；§2.3 标题的 33/40 采用旧口径，以本行为准 |
+
+### 7.4 验证建议（交给主智能体）
+
+```powershell
+cargo build -p agentscope-extensions-rag
+cargo test  -p agentscope-extensions-rag
+```
+
+- 全部新测试**离线**：HTTP 走 `ScriptedTransport`；两个涉及临时文件的测试（`multimodal_local_file_is_inlined_as_data_url`、`file_input_uses_the_path_not_the_contents`）只写 `std::env::temp_dir()` 并在结束时删除。
+- 反向验证建议：①把 `EmbeddingExecutionConfig::apply` 的超时分支删掉 → `timeout_is_reported_as_an_embedding_error` 应 FAILED；②把 `guess_image_mime_type` 的 `png` 分支改错 → `multimodal_local_file_is_inlined_as_data_url` 应 FAILED；③把 `image_url` 的 `file://` 前缀去掉 → `local_path_gets_a_file_scheme` 应 FAILED；④把 `sha256_hex` 改成调用 `md5_hex` → `sha256_doc_id_matches_the_java_algorithm` 与 `sha256_matches_fips_vectors` 应 FAILED。
+
+### 7.5 仍待办
+
+1. **外部向量库 4 件**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`（**本轮未动**）。
+2. `ExternalApiReader`（P2）。
+3. `RagMode` / `GenericRAGHook` 落点待裁定（core/harness）。
 

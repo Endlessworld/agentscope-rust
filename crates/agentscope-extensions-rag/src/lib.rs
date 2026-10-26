@@ -14,9 +14,15 @@
 //!   filter/sort/limit helper used by every backend.
 //! * [`store`] — [`VdbStore`](store::VdbStore), [`InMemoryStore`](store::InMemoryStore) and
 //!   cosine/Euclidean distance helpers.
-//! * [`embedding`] — the [`EmbeddingModel`](embedding::EmbeddingModel) trait plus a
-//!   deterministic, offline [`HashEmbeddingModel`](embedding::HashEmbeddingModel).
-//! * [`reader`] — [`Reader`](reader::Reader), [`TextReader`](reader::TextReader) and the
+//! * [`embedding`] — the [`EmbeddingModel`](embedding::EmbeddingModel) trait, the
+//!   deterministic offline [`HashEmbeddingModel`](embedding::HashEmbeddingModel), the
+//!   `EmbeddingUsage`/`EmbeddingResponse` bookkeeping types, and the four HTTP providers
+//!   ([`OpenAiTextEmbedding`](embedding::OpenAiTextEmbedding),
+//!   [`DashScopeTextEmbedding`](embedding::DashScopeTextEmbedding),
+//!   [`DashScopeMultiModalEmbedding`](embedding::DashScopeMultiModalEmbedding),
+//!   [`OllamaTextEmbedding`](embedding::OllamaTextEmbedding)).
+//! * [`reader`] — [`Reader`](reader::Reader), [`TextReader`](reader::TextReader),
+//!   [`ImageReader`](reader::ImageReader), the `ReaderUtils` id helpers and the
 //!   character/paragraph/token chunking algorithms.
 //! * [`message`] — mapping retrieved documents onto [`agentscope_core::message::Msg`],
 //!   covering both the agentic-tool format and the generic-hook `<retrieved_knowledge>`
@@ -63,7 +69,12 @@ pub mod simple;
 pub mod store;
 pub mod transport;
 
-pub use embedding::{EmbeddingModel, HashEmbeddingModel, DEFAULT_DIMENSIONS};
+pub use embedding::{
+    DashScopeMultiModalEmbedding, DashScopeMultiModalEmbeddingBuilder, DashScopeTextEmbedding,
+    DashScopeTextEmbeddingBuilder, EmbeddingExecutionConfig, EmbeddingModel, EmbeddingResponse,
+    EmbeddingUsage, HashEmbeddingModel, OllamaTextEmbedding, OllamaTextEmbeddingBuilder,
+    OpenAiTextEmbedding, OpenAiTextEmbeddingBuilder, UsageListener, DEFAULT_DIMENSIONS,
+};
 pub use error::{RagError, Result};
 pub use knowledge::{filter_and_rank, Knowledge};
 pub use message::{
@@ -71,7 +82,7 @@ pub use message::{
     RETRIEVED_KNOWLEDGE_CLOSE, RETRIEVED_KNOWLEDGE_OPEN,
 };
 pub use model::{Document, DocumentMetadata, RetrieveConfig};
-pub use reader::{chunk_text, Reader, ReaderInput, SplitStrategy, TextReader};
+pub use reader::{chunk_text, ImageReader, Reader, ReaderInput, SplitStrategy, TextReader};
 pub use simple::{in_memory_knowledge, EmptyKnowledge, SimpleKnowledge};
 pub use store::{
     cosine_similarity, euclidean_distance, squared_euclidean_distance, InMemoryStore, SearchQuery,

@@ -3,15 +3,24 @@
 //! Ports `io.agentscope.core.rag.reader` (`Reader`, `ReaderInput`, `AbstractChunkingReader`,
 //! `TextReader`, `TextChunker`, `SplitStrategy`).
 //!
-//! The Java `TikaReader` / `PDFReader` / `WordReader` / `ImageReader` / `ExternalApiReader`
+//! The Java `TikaReader` / `PDFReader` / `WordReader` / `ExternalApiReader`
 //! depend on JVM libraries (Apache Tika, PDFBox, POI) and external services; they are left
-//! as gaps (tracker §3, P2). `TextReader` and the chunking algorithm are fully ported.
+//! as gaps (tracker §3, P2). `TextReader`, the chunking algorithm, the dependency-free
+//! [`ImageReader`] and the id helpers (`ReaderUtils`) are fully ported.
 
 use agentscope_core::message::ContentBlock;
 use async_trait::async_trait;
 
 use crate::error::{RagError, Result};
 use crate::model::{Document, DocumentMetadata};
+
+pub mod image;
+pub mod utils;
+
+pub use image::{ImageReader, SUPPORTED_FORMATS};
+pub use utils::{
+    bytes_to_hex, generate_doc_id, generate_doc_id_md5, generate_doc_id_sha256, DocIdAlgorithm,
+};
 
 /// Characters per token heuristic used by Java `TextChunker` (1 token ≈ 4 characters).
 pub const CHARS_PER_TOKEN: usize = 4;

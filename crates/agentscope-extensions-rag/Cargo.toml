@@ -21,6 +21,8 @@ reqwest = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 uuid = { workspace = true }
+# DashScope multimodal embedding inlines local image files as `data:` URLs.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

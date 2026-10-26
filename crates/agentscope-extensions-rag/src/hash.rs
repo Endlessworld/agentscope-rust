@@ -1,4 +1,4 @@
-//! Dependency-free MD5 + name-based (version 3) UUID helpers.
+//! MD5 + name-based (version 3) UUID + SHA-256 hex helpers.
 //!
 //! Java's `io.agentscope.core.rag.model.Document` derives its id with
 //! `UUID.nameUUIDFromBytes(jsonKey.getBytes(UTF_8))`, i.e. a **version 3 (MD5)**
@@ -91,7 +91,7 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
 }
 
 /// Lowercase hex encoding of a byte slice.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -104,6 +104,16 @@ fn hex(bytes: &[u8]) -> String {
 /// Computes the lowercase hex MD5 digest of `input`.
 pub fn md5_hex(input: &[u8]) -> String {
     hex(&md5(input))
+}
+
+/// Computes the lowercase hex SHA-256 digest of `input`.
+///
+/// Ports the SHA-256 half of Java `ReaderUtils.generateDocId`: `sha2` is already a dependency of
+/// this crate (the Bailian request signer uses it), so no crate was added for this.
+pub fn sha256_hex(input: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex(&Sha256::digest(input))
 }
 
 /// Builds a version-3 (MD5, name-based) UUID from `name`.
@@ -148,6 +158,22 @@ mod tests {
         assert_eq!(
             md5_hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
             "57edf4a22be3c955ac49da2e2107b67a"
+        );
+    }
+
+    #[test]
+    fn sha256_matches_fips_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"test.jpg"),
+            "0d407ee6406a1216f2366674a1a9ff71361d5bef47021f8eb8b51f95e319dd56"
         );
     }
 
