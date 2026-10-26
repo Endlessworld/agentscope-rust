@@ -95,6 +95,9 @@ fn require_session_id(session_id: &str) -> Result<(), MongoError> {
 pub struct MongodbAgentStateStore {
     client: Arc<dyn MongoClient>,
     collection: String,
+    /// Session TTL in days as configured through the builder; `None` (or a
+    /// non-positive value) disables the TTL index.
+    ttl_days: Option<i64>,
     on_delete: Option<Arc<dyn Fn(Option<&str>, &str) + Send + Sync>>,
 }
 
@@ -102,6 +105,7 @@ impl std::fmt::Debug for MongodbAgentStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MongodbAgentStateStore")
             .field("collection", &self.collection)
+            .field("ttl_days", &self.ttl_days)
             .field("has_on_delete", &self.on_delete.is_some())
             .finish()
     }
@@ -110,7 +114,17 @@ impl std::fmt::Debug for MongodbAgentStateStore {
 impl MongodbAgentStateStore {
     /// Creates a store over the given client and collection with default options.
     pub fn new(client: Arc<dyn MongoClient>, collection: impl Into<String>) -> Self {
-        Self { client, collection: collection.into(), on_delete: None }
+        Self {
+            client,
+            collection: collection.into(),
+            ttl_days: None,
+            on_delete: None,
+        }
+    }
+
+    /// The session TTL in days configured on the builder, if any.
+    pub fn ttl_days(&self) -> Option<i64> {
+        self.ttl_days
     }
 
     /// Creates a store with the default collection name
@@ -124,16 +138,21 @@ impl MongodbAgentStateStore {
         MongodbAgentStateStoreBuilder::default()
     }
 
-    /// Ensures the required indexes exist. Must be called before use (the builder
-    /// constructor does it automatically).
-    pub async fn ensure_indexes(&self, ttl_days: Option<i64>) -> MongoResult<()> {
+    /// Ensures the required indexes exist. Must be called before use (Java's
+    /// constructor does it eagerly; here it is a separate async step).
+    ///
+    /// The session TTL index is derived from the `ttl_days` configured on the
+    /// builder — mirroring Java `MongoAgentStateStore` calling
+    /// `ensureIndexes(builder.ttlDays)` — so callers never have to pass the TTL
+    /// again after building the store.
+    pub async fn ensure_indexes(&self) -> MongoResult<()> {
         create_index_with_migration(
             &self.client,
             &self.collection,
             &IndexSpec::compound_ascending(&[FIELD_USER_ID, FIELD_SESSION_ID]),
         )
         .await?;
-        if let Some(days) = ttl_days {
+        if let Some(days) = self.ttl_days {
             if days > 0 {
                 create_index_with_migration(
                     &self.client,
@@ -619,7 +638,9 @@ impl MongodbAgentStateStoreBuilder {
     }
 
     /// Optional session TTL in days. When positive, a sparse TTL index is created on
-    /// `_updated_at`. Defaults to `None` (no expiry).
+    /// `_updated_at` by [`MongodbAgentStateStore::ensure_indexes`], which reads the
+    /// value retained by [`MongodbAgentStateStoreBuilder::build`]. Defaults to `None`
+    /// (no expiry).
     pub fn ttl_days(mut self, days: i64) -> Self {
         self.ttl_days = Some(days);
         self
@@ -637,7 +658,8 @@ impl MongodbAgentStateStoreBuilder {
     }
 
     /// Builds the store. This is synchronous; call
-    /// [`MongodbAgentStateStore::ensure_indexes`] to create indexes.
+    /// [`MongodbAgentStateStore::ensure_indexes`] to create indexes — it picks up
+    /// the `ttl_days` configured here and creates the session TTL index.
     pub fn build(self) -> MongoResult<MongodbAgentStateStore> {
         let client = self
             .client
@@ -645,6 +667,7 @@ impl MongodbAgentStateStoreBuilder {
         let store = MongodbAgentStateStore {
             client,
             collection: self.collection.unwrap_or_else(|| SESSIONS_COLLECTION.to_string()),
+            ttl_days: self.ttl_days,
             on_delete: self.on_delete,
         };
         Ok(store)
@@ -858,9 +881,13 @@ mod tests {
     async fn ttl_index_is_created_only_when_positive() {
         let raw = Arc::new(InMemoryMongoClient::new());
         let client: Arc<dyn MongoClient> = raw.clone();
-        let s = MongodbAgentStateStore::with_defaults(client.clone());
+        let s = MongodbAgentStateStore::builder()
+            .client(client.clone())
+            .ttl_days(7)
+            .build()
+            .unwrap();
 
-        s.ensure_indexes(Some(7)).await.unwrap();
+        s.ensure_indexes().await.unwrap();
         let indexes = client
             .list_indexes(crate::constants::SESSIONS_COLLECTION)
             .await
@@ -875,14 +902,57 @@ mod tests {
         // A non-positive TTL is ignored: no additional TTL index is created.
         let raw2 = Arc::new(InMemoryMongoClient::new());
         let client2: Arc<dyn MongoClient> = raw2.clone();
-        let s2 = MongodbAgentStateStore::with_defaults(client2.clone());
-        s2.ensure_indexes(Some(0)).await.unwrap();
+        let s2 = MongodbAgentStateStore::builder()
+            .client(client2.clone())
+            .ttl_days(0)
+            .build()
+            .unwrap();
+        s2.ensure_indexes().await.unwrap();
         assert!(client2
             .list_indexes(crate::constants::SESSIONS_COLLECTION)
             .await
             .unwrap()
             .iter()
             .all(|i| i.expire_after_seconds.is_none()));
+    }
+
+    /// Regression test for the builder `ttl_days` being dropped on `build()`:
+    /// the value must be retained by the store and drive the TTL index created by
+    /// the no-argument `ensure_indexes()`, mirroring Java
+    /// `MongoAgentStateStore` calling `ensureIndexes(builder.ttlDays)`.
+    #[tokio::test]
+    async fn builder_ttl_days_is_retained_and_creates_ttl_index() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let client: Arc<dyn MongoClient> = raw.clone();
+        let s = MongodbAgentStateStore::builder()
+            .client(client.clone())
+            .ttl_days(3)
+            .build()
+            .unwrap();
+
+        assert_eq!(s.ttl_days(), Some(3));
+
+        s.ensure_indexes().await.unwrap();
+        let indexes = client
+            .list_indexes(crate::constants::SESSIONS_COLLECTION)
+            .await
+            .unwrap();
+        let ttl = indexes
+            .iter()
+            .find(|i| i.expire_after_seconds.is_some())
+            .expect("ttl index created from the builder's ttl_days");
+        assert_eq!(ttl.expire_after_seconds, Some(3 * 86_400));
+        assert_eq!(ttl.keys, vec![("_updated_at".to_string(), 1)]);
+        assert!(ttl.sparse);
+
+        // A store built without `ttl_days` keeps `None`.
+        let s2 = MongodbAgentStateStore::with_defaults(Arc::new(InMemoryMongoClient::new()));
+        assert_eq!(s2.ttl_days(), None);
+        let s3 = MongodbAgentStateStore::builder()
+            .client(Arc::new(InMemoryMongoClient::new()))
+            .build()
+            .unwrap();
+        assert_eq!(s3.ttl_days(), None);
     }
 
     #[tokio::test]

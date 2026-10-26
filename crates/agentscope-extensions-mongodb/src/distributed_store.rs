@@ -178,7 +178,7 @@ impl MongodbDistributedStore {
     /// Ensures all component indexes exist.
     pub async fn ensure_indexes(&self) -> Result<()> {
         self.agent_state_store
-            .ensure_indexes(None)
+            .ensure_indexes()
             .await
             .map_err(map_err)?;
         self.base_store.ensure_indexes().await.map_err(map_err)?;

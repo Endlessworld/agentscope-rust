@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22 静态复核） | 主代码 **2235 行（9 类）** / 测试 **2429 行（9 测试类 + 2 testutil，147 个 `@Test`，见 §2）** |
 | Rust crate | `crates/agentscope-extensions-mongodb` |
 | 迁移波次 | B |
-| 当前状态 | **进行中**（静态复核 2026-10-22：上一轮声明的 4 项改动**核实属实**，但复核发现 **3 项 P1 未闭环**——①builder `ttl_days` 未生效、②guard `database_name` 未生效、③级联删快照链路在 Rust harness 侧无写入方；另有 5 项 P2。测试数 76（实测 `#[test]` 21 + `#[tokio::test]` 55）✅ 与记载一致。详见 §3.3 / §4.1 复核节） |
+| 当前状态 | **进行中**（2026-10-26：静态复核留下的 3 项 P1 中 **2 项已闭环**——①builder `ttl_days` 已生效（`build()` 保留字段，无参 `ensure_indexes()` 据其建 TTL 索引）、②guard `database_name` 已生效（锁集合按库限定为 `scoped_collection(db, coll)`）；**仅剩** ③级联删快照链路在 Rust harness 侧无生产写入方（跨 crate，P1）；另有 5 项 P2。测试数由 76 增至 **79**（+3，见 §4.1「2026-10-26 会话」；本轮**未跑 cargo**，由主智能体统一验证）。详见 §3.3 / §4.1） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -29,7 +29,7 @@
 | `mongodb.MongoKeyEscaper`（147 行） | 递归转义 `.`/`$`/`\0`/`\` 键名 | `key_escaper.rs::escape/unescape/escape_key/unescape_key` | 编码对齐（`.`→`\E`、`$`→`\$`、`\0`→`\N`、`\`→`\\`） |
 | `mongodb.state.MongoAgentStateStore`（676 行） | 会话状态：单值 + 列表 + 版本 CAS + 列表哈希 + TTL | `state_store.rs::MongodbAgentStateStore`（+ builder / `UNVERSIONED` / `validate_state_key`），`impl agentscope_core::state::AgentStateStore` | 复合 `_id {user_id, session_id}`；`states`/`versions`/`hashes` 子文档；`save_if_version`/`get_version` 为固有方法 |
 | `mongodb.store.MongoBaseStore`（302 行） | 命名空间 KV + CAS + 前缀搜索 | `store.rs::MongodbStore`（+ `NS_SEPARATOR` / `NS_UPPER_BOUND`），`impl agentscope_harness::filesystem::remote::store::BaseStore` | US(0x1F) 命名空间编码 + `$gte/$lt` 范围前缀匹配；`version` 从 1 起，`put` 每次成功写 +1 |
-| `mongodb.sandbox.MongoSandboxExecutionGuard`（402 行） | 分布式锁（insert + 过期 reclaim + 租约续约） | `sandbox_guard.rs::MongodbSandboxExecutionGuard` + `Builder` + `MongodbLeaseHandle` + `MongodbGuardClient` + `compose_lock_id` | harness `SandboxExecutionGuard` 为**具体 struct 非 trait** → `MongodbGuardClient` 镜像其方法（`try_enter/release/is_held/active_count`）；`compose_lock_id` 与 Java **字节级一致**（`lock:`+hex(SHA-256(`scope:value`))，scope 小写）；**缺口**：builder 的 `database_name` 收下但未用于限定集合（见 §3.3） |
+| `mongodb.sandbox.MongoSandboxExecutionGuard`（402 行） | 分布式锁（insert + 过期 reclaim + 租约续约） | `sandbox_guard.rs::MongodbSandboxExecutionGuard` + `Builder` + `MongodbLeaseHandle` + `MongodbGuardClient` + `compose_lock_id` | harness `SandboxExecutionGuard` 为**具体 struct 非 trait** → `MongodbGuardClient` 镜像其方法（`try_enter/release/is_held/active_count`）；`compose_lock_id` 与 Java **字节级一致**（`lock:`+hex(SHA-256(`scope:value`))，scope 小写）；`database_name` **已生效**：`build()` 以 `client::scoped_collection(db, collection)` 生成数据库限定的 `collection_key`，所有读写/续约/释放/建索引均走该 key（见 §3.3、§4.1） |
 | `mongodb.snapshot.MongoRemoteSnapshotClient`（178 行） | GridFS 快照上传/下载/存在 + legacy 单文档回退 | `snapshot.rs::MongodbRemoteSnapshotClient`，`impl RemoteSnapshotClient`，`delete` 为固有方法 | GridFS 分块（255KB，`{prefix}.files`+`{prefix}.chunks`，chunk 含 `files_id`/`n`/`data`）+ `length`/`chunkSize`/`uploadDate`/`metadata.createdAt` 已落地；下载按 `n` 重组并校验连续性/长度；`exists`/`download`/`delete` 均先 GridFS 再回退 legacy 单文档。**已补齐** |
 | `mongodb.snapshot.MongoSnapshotSpec`（33 行，`extends RemoteSnapshotSpec`） | 快照 spec 便捷包装 | `snapshot.rs::MongodbSnapshotSpec`，`impl SandboxSnapshotSpec` | 内部包装 harness `RemoteSnapshotSpec`；`database_name` 已生效（数据库限定 collection key） |
 | （测试替身）Java Testcontainers / Mockito | 离线/容器测试 | `client.rs::InMemoryMongoClient` | 忠实内存后端；duplicate-key 11000、`$set/$inc/$push/$setOnInsert/$unset`、dot-path 均已对齐 |
@@ -68,14 +68,14 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | crate 骨架 + `lib.rs` 导出 10 模块 | 全部 | 已完成 | `lib.rs` 声明 `client`/`constants`/`distributed_store`/`index_utils`/`key_escaper`/`list_hash`/`sandbox_guard`/`snapshot`/`state_store`/`store` 并 re-export 公共类型 |
-| `MongodbAgentStateStore`（impl core `AgentStateStore`） | `state/MongoAgentStateStore.java` | 已完成 | 复合 `_id`、`states`/`versions`/`hashes` 子文档、TTL；`save_if_version`/`get_version`/`UNVERSIONED = -1` 固有 API。**缺口**：builder 的 `ttl_days` 未在 `build()` 中生效（见 §3.3） |
+| `MongodbAgentStateStore`（impl core `AgentStateStore`） | `state/MongoAgentStateStore.java` | 已完成 | 复合 `_id`、`states`/`versions`/`hashes` 子文档、TTL；`save_if_version`/`get_version`/`UNVERSIONED = -1` 固有 API。builder 的 `ttl_days` 由 `build()` 保留，无参 `ensure_indexes()` 据此建 TTL 索引（见 §3.3、§4.1） |
 | `MongodbStore`（impl harness `BaseStore`） | `store/MongoBaseStore.java` | 已完成 | US(0x1F) 编码 + 范围前缀搜索；`put_if_version` 对齐 harness CAS（`expected==0` = create-if-absent） |
 | `MongodbRemoteSnapshotClient`（impl `RemoteSnapshotClient`） | `snapshot/MongoRemoteSnapshotClient.java` | 已完成 | `upload/download/exists` + 固有 `delete`；无 TTL |
 | `MongodbSnapshotSpec`（impl `SandboxSnapshotSpec`） | `snapshot/MongoSnapshotSpec.java` | 已完成 | 包装 harness `RemoteSnapshotSpec`；快照 id 校验沿用 harness |
-| `MongodbSandboxExecutionGuard` + builder + lease + guard client | `sandbox/MongoSandboxExecutionGuard.java` | 已完成 | 插入 + 过期 reclaim + token 作用域释放 + `lease_ttl/3` 续约。**缺口**：builder `database_name` 未生效（见 §3.3） |
+| `MongodbSandboxExecutionGuard` + builder + lease + guard client | `sandbox/MongoSandboxExecutionGuard.java` | 已完成 | 插入 + 过期 reclaim + token 作用域释放 + `lease_ttl/3` 续约；builder 的 `database_name` **已生效**，锁集合按库隔离（见 §3.3、§4.1） |
 | `MongodbDistributedStore` 组合者 | `MongoDistributedStore.java` | 已完成（形态差异） | 五个组件访问器 + `to_harness_store()`；含 `on_delete` 级联删快照 |
 | 无真实 DB 可用的内存后端 | Java Testcontainers / Mockito | 已完成 | `client::InMemoryMongoClient` |
-| **离线单元测试** | Java 8 测试类 **147 `@Test`**（contract test 需 Docker） | **已完成（P1 收尾）** | 现状 lib **76** + doc-test **1**；crate **无 `tests/` 目录**（实测 `Test-Path` = False），全为 `#[cfg(test)]` 内联单测。本轮新增：GridFS 分块边界（`255*1024-1/-/+1`）、chunk 缺失/乱序报错、legacy 回退、`exists` 双路径、`database_name` 隔离、级联删快照、键转义 `.`/`$`/`\0`/`\` round-trip、TTL 索引、error-85 迁移（瞬态恢复 + 耗尽传播）、`delete_key` 公共路径 |
+| **离线单元测试** | Java 8 测试类 **147 `@Test`**（contract test 需 Docker） | **已完成（P1 收尾）** | 现状 lib **79**（2026-10-26 新增 3，原 76）+ doc-test **1**；crate **无 `tests/` 目录**（实测 `Test-Path` = False），全为 `#[cfg(test)]` 内联单测。本轮新增：GridFS 分块边界（`255*1024-1/-/+1`）、chunk 缺失/乱序报错、legacy 回退、`exists` 双路径、`database_name` 隔离、级联删快照、键转义 `.`/`$`/`\0`/`\` round-trip、TTL 索引、error-85 迁移（瞬态恢复 + 耗尽传播）、`delete_key` 公共路径 |
 
 ### 3.2 其它待办（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -85,7 +85,7 @@
 | `close()` / `ownsClient` / `fromConnectionString` | `MongoDistributedStore.java`；各组件 `close()` | 已完成（设计决定，不迁移） | Rust `Arc<dyn MongoClient>` 无连接所有权/关闭语义；依据：harness/core 无对应 trait，不重建平行抽象 |
 | 快照 legacy 单文档回退（`download`/`exists`） | `snapshot/MongoRemoteSnapshotClient.java` | **已完成** | `download`/`exists`/`delete` 均先查 GridFS files，未命中则回退 legacy `{_id, data}` 单文档；有 `download_and_exists_fall_back_to_legacy_document` / `gridfs_takes_precedence_over_legacy_document` / `delete_gridfs_also_cleans_up_legacy_document` 用例覆盖 |
 | GridFS 分块（255KB）/ 16GB 语义 | 同上 | **已完成** | `client.rs` 按 `GRIDFS_DEFAULT_CHUNK_SIZE = 255*1024` 分块存 `{prefix}.files`/`{prefix}.chunks`（chunk 含 `files_id`/`n`/`data`），文件文档含 `length`/`chunkSize`/`uploadDate`/`metadata.createdAt`；下载按 `n` 重组并校验连续性/总长（缺失/乱序报 `corrupt GridFS file`）。与 Java `GridFSBucket` 等价（内存后端不设 16GB 上限，属实现差异） |
-| `ensureIndexes`（TTL / 复合 / sparse） | 各组件 | 已完成 | state(`ttl_days`)、store、guard(TTL `expiresAt`) 均经 `create_index_with_migration` |
+| `ensureIndexes`（TTL / 复合 / sparse） | 各组件 | 已完成 | state(`ttl_days`，由无参 `ensure_indexes()` 消费 builder 值)、store、guard(TTL `expiresAt`，按库限定集合) 均经 `create_index_with_migration` |
 
 ### 3.3 待确认 / 后续增强（P2）
 | 缺口项 | 说明 | 状态 |
@@ -98,8 +98,8 @@
 | 组合者形态偏差 | Java `implements DistributedStore, AutoCloseable`；Rust 为组合 + `to_harness_store()`，未暴露 `close` / `ownsClient` | 已完成（设计决定，不迁移） |
 | `snapshot.rs` 无 `tracing` 埋点 | **已修正（2026-10-22 复核）**：`snapshot.rs` 实有 4 处埋点（`126/133/163/217`）；Java `MongoRemoteSnapshotClient` 的 log.info/warn 已被等价覆盖 | **已完成** |
 | `client.rs` 无 `tracing` 埋点 | Java `MongoIndexUtils`/`MongoSandboxExecutionGuard`/`MongoBaseStore`/`MongoAgentStateStore` 均有 log；Rust `client.rs`（`MongoClient` trait + `InMemoryMongoClient`）无任何 `tracing::` 调用（实测 0 处） | **待办（埋点，非阻塞）** |
-| **builder `ttl_days` 未生效** | **2026-10-22 复核新发现**：Java `MongoAgentStateStore` 构造函数末尾调 `ensureIndexes(builder.ttlDays)`（`MongoAgentStateStore.java:152`），TTL 索引随 `build()` 自动创建。Rust `MongodbAgentStateStoreBuilder::build()`（`state_store.rs:641-651`）**只取 `client`/`collection`/`on_delete`，`ttl_days` 被丢弃**——`builder().ttl_days(7).build()` **不会**创建 TTL 索引，必须另调 `ensure_indexes(Some(7))`。（字段只写不读，故 rustc `dead_code` 不告警，与「0 warning」不矛盾） | **待办（行为差异，P1）** |
-| **guard builder `database_name` 未生效** | **2026-10-22 复核新发现**：Java `MongoSandboxExecutionGuard` 构造时 `mongoClient.getDatabase(databaseName).getCollection(collectionName)`，锁文档**按库隔离**。Rust `MongodbSandboxExecutionGuardBuilder::build()`（`sandbox_guard.rs:348-357`）只把 `collection` 塞进 guard，**`database_name` 从未参与 collection key 限定**（全 crate 仅 `scoped_collection` 在 `snapshot.rs` 使用）→ 不同 `database_name` 的 guard **共用同一锁集合**，跨库互相抢锁。`MongodbDistributedStore::new` 传入的 `database_name` 对锁无效 | **待办（行为差异，P1）** |
+| **builder `ttl_days` 未生效** | **已闭环（2026-10-26）**：原缺口——`MongodbAgentStateStoreBuilder::build()`（`state_store.rs`）只取 `client`/`collection`/`on_delete`，`ttl_days` 被丢弃，`builder().ttl_days(7).build()` 静默不建 TTL 索引。现行实现：①`MongodbAgentStateStore` 新增 `ttl_days: Option<i64>` 字段，`build()` 原样带入，`new()`/`with_defaults()` 为 `None`；②`ensure_indexes()` **改为无参**，TTL 分支读 `self.ttl_days`（`days > 0` 才建 `_updated_at` sparse TTL 索引，`expireAfterSeconds = days*24*3600`），与 Java 构造函数内 `ensureIndexes(builder.ttlDays)` 等价（Rust `build()` 同步、`ensure_indexes()` 仍为独立 async 步骤，调用顺序 `build()` → `ensure_indexes()`）；③新增 getter `ttl_days()`；④调用点同步：`MongodbDistributedStore::ensure_indexes()` 改调无参版本。新增用例：`builder_ttl_days_is_retained_and_creates_ttl_index`（断言 `ttl_days()==Some(3)` + 索引 `expireAfterSeconds==3*86400` / key `_updated_at` / sparse）、`ttl_index_is_created_only_when_positive`（改为经 builder 传 7 / 0） | **已完成** |
+| **guard builder `database_name` 未生效** | **已闭环（2026-10-26）**：原缺口——`MongodbSandboxExecutionGuardBuilder::build()` 只把 `collection` 塞进 guard，`database_name` 从不参与 collection key → 不同库的 guard 共用同一锁集合、跨库互相抢锁。现行实现：①guard 新增 `database_name: String` 字段并保留在 build 后的实例上（+ `database_name()` getter）；②字段 `collection` → `collection_key`，`build()` 用 `client::scoped_collection(database_name, collection)`（与 `MongodbRemoteSnapshotClient` 同一约定，因 `MongoClient` trait 签名为 flat collection key、内存后端无库维度）生成数据库限定 key，`insert_one`/`find_one_and_update`/续约 `update_one`/`lock_held`/release `delete_one`/`ensure_indexes` **全部**走该 key（`MongodbLeaseHandle` 同步改持 `collection_key`），等效于 Java `mongoClient.getDatabase(databaseName).getCollection(collectionName)`；③`MongodbDistributedStore::new` 传入的 `database_name` 现对锁生效。新增用例：`database_name_partitions_locks`（同 client、`db_a`/`db_b` 两个 guard 对同一个 `SandboxIsolationKey` **均可获得租约**，而同库的第三个 guard 仍超时）、`default_database_is_scoped_into_collection_key` | **已完成** |
 | **级联删快照的 session id 语义** | **2026-10-22 复核新发现**：Java `MongoDistributedStore.cascadeDeleteSnapshots` 读 `sandbox/session/<sessionId>` 槽位的 `_sandbox_state`，该槽位由 harness `SessionSandboxStateStore` 写入（`sandbox/session/`+`key.getValue()`，即**沙箱 session id**）。Rust `find_session_snapshot_id` 沿用同一槽位命名，但 Rust harness **不存在 `SessionSandboxStateStore`**（`sandbox/state.rs` 只有 `SandboxStateStore` trait + `InMemorySandboxStateStore`，其 key 为 `SandboxIsolationKey::to_string()` 即 `scope:value`，且存的是 `SandboxState` 而非含 `snapshot.id` 的 JSON）→ Rust 侧**无任何生产路径写入 `states._sandbox_state.json`**，级联删除在真实链路中**恒为 no-op**（现有 2 个用例靠手工 `seed_session_snapshot` 造数据）。跨 crate 契约缺口 | **待办（跨 crate，P1）** |
 | 真实 MongoDB 驱动接入 | 未在本 crate 引入 `mongodb` crate（**勘误**：根 `Cargo.toml:69` 已有 `mongodb = "3"`，但本 crate `Cargo.toml` 未引用）；无集成测试 | **待办（设计决定，不迁移；跨模块/汇总方）** |
 
@@ -113,6 +113,19 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
+
+#### 2026-10-26 会话（P1 收尾：builder `ttl_days` / guard `database_name`）
+- **范围**：仅 `crates/agentscope-extensions-mongodb/src/{state_store.rs,sandbox_guard.rs,distributed_store.rs}`；未改根 `Cargo.toml`、`agentscope-core`、`agentscope-harness` 与其它 crate；无新增依赖（本 crate `Cargo.toml` 未改）。
+- **改动**：
+  1. `state_store.rs` — `MongodbAgentStateStore` 新增 `ttl_days: Option<i64>`（`new()` / `with_defaults()` 为 `None`，builder `build()` 原样带入）；`ensure_indexes(&self, ttl_days: Option<i64>)` → `ensure_indexes(&self)`，TTL 分支读 `self.ttl_days`；新增 `ttl_days()` getter；Debug 输出补 `ttl_days`。`ttl_days` builder 文档注明由 `ensure_indexes()` 消费。
+  2. `sandbox_guard.rs` — guard 新增 `database_name: String`；字段 `collection` 更名 `collection_key`，`build()` 中由 `client::scoped_collection(&database_name, &collection)`（与 `MongodbRemoteSnapshotClient` 同一约定）生成；`insert_one` / `find_one_and_update` / 续约 `update_one` / `lock_held` / release `delete_one` / `ensure_indexes` 与 `MongodbLeaseHandle` **全部**改用 `collection_key`；新增 `database_name()` / `collection_key()` getter；Debug 补 `database_name`。
+  3. `distributed_store.rs` — `MongodbDistributedStore::ensure_indexes()` 改调无参 `agent_state_store.ensure_indexes()`。
+- **新增用例（3 个，均离线，仅 `InMemoryMongoClient`）**：`state_store::tests::builder_ttl_days_is_retained_and_creates_ttl_index`、`sandbox_guard::tests::database_name_partitions_locks`、`sandbox_guard::tests::default_database_is_scoped_into_collection_key`；另将既有 `state_store::tests::ttl_index_is_created_only_when_positive` 改为经 builder 传 `ttl_days(7)` / `ttl_days(0)`（断言未削弱）。
+- **改前失败推理（本轮未跑 cargo，需主智能体实测确认）**：
+  - `ttl_days`：改前 `build()` 丢弃字段，旧 API 下等价写法 `builder().ttl_days(3).build()` + `ensure_indexes(None)` 不会产生任何 `expire_after_seconds.is_some()` 的索引 → 新用例在 `.expect("ttl index created from the builder's ttl_days")` 处 panic；`ttl_days()` getter 改前不存在，因此在改前代码上还表现为编译失败。
+  - `database_name`：改前两个 guard 都写同一集合 `agentscope_sandbox_locks`，第二个 `try_enter` 在 `lock_timeout(100ms)` 内拿不到锁 → 返回 `Err("Timed out waiting for MongoDB lock: ...")` → `unwrap()` panic。
+- **验证口径**：本轮**未跑 cargo**（按波次约定由主智能体统一验证）；预期 `cargo test -p agentscope-extensions-mongodb` lib **79 passed / 0 failed**（76 + 3）+ doc-test 1。
+- **未触碰**：根 `Cargo.toml`、`agentscope-core`、`agentscope-harness`、其它 crate；无删除功能/断言，无 `#[ignore]`。
 
 #### 本会话（2026-09-19，P1/P2 收尾）实测
 - **命令与结果**：
@@ -165,7 +178,7 @@
 | Java 测试代码 | **2429 行 / 11 文件（9 测试类 + 2 testutil）** | `.Count` 口径 2830 行 |
 | Java `@Test` | **147**（分属 9 个测试类） | 15/10/24/16/2/9/39/9/23；`testutil` 2 个类 **`@Test` 计数为 0** |
 | Rust src | **11 文件 / 4121 行** | `.Count` 口径 4512 行。分文件：client 1019、constants 18、distributed_store 343、index_utils 265、key_escaper 159、lib 63、list_hash 53、sandbox_guard 482、snapshot 527、state_store 835、store 357 |
-| Rust 测试 | **76**（`#[test]` 21 + `#[tokio::test]` 55） | 分文件：client 5、distributed_store 9、index_utils 6、key_escaper 6、list_hash 4、sandbox_guard 6、snapshot 18、state_store 15、store 7 = **76** ✅ 与 tracker 记载一致 |
+| Rust 测试 | **76**（`#[test]` 21 + `#[tokio::test]` 55） | 分文件：client 5、distributed_store 9、index_utils 6、key_escaper 6、list_hash 4、sandbox_guard 6、snapshot 18、state_store 15、store 7 = **76** ✅ 与 tracker 记载一致（**2026-10-26 新增 3 个 → 79，即 `#[test]` 22 + `#[tokio::test]` 57；未实测**） |
 | Rust 集成测试目录 | **不存在**（`Test-Path tests` = False） | 全部为 `#[cfg(test)]` 内联单测 ✅ 与 tracker 一致 |
 | doc-test | **1**（`lib.rs:35` `no_run` 示例） | 与 tracker 一致 |
 
@@ -176,11 +189,11 @@
 | `MongoConstants` → `constants.rs` | ✅ | 5/5 常量逐字对齐（`agentscope` / `agentscope_sessions` / `agentscope_base` / `agentscope_snapshots` / `agentscope_sandbox_locks`） | **完全对齐** |
 | `MongoKeyEscaper` → `key_escaper.rs` | ✅ | 编码逐字节一致（`.`→`\E`、`$`→`\$`、`\0`→`\N`、`\`→`\\`）；未知转义保留原样；递归遍历 map/list | **完全对齐**（6 个 Rust 用例） |
 | `MongoIndexUtils` → `index_utils.rs` | ✅ | `MAX_MIGRATION_ATTEMPTS=3`、按 key pattern 查真实索引名后 drop、容错 27/ns-not-found、重建循环一致 | **完全对齐**（含 2 个新增迁移用例） |
-| `MongoAgentStateStore` → `state_store.rs` | ✅ | 复合 `_id{user,session}`、`states`/`versions`/`hashes` 子文档、key 正则 `^[a-zA-Z_][a-zA-Z0-9_]*$`、CAS 三分支（0=create-if-absent / UNVERSIONED=无条件 / 期望版本）、`$size` 语义等价（`first_field_size`）、list 增量追加 + 全量重写 | **基本对齐**，两处偏差：① builder `ttl_days` 未生效（**P1**）；② per-key `delete` 为固有方法 `delete_key`（Java 是 core trait 的 `default void delete(u,s,key)`，Rust core trait **无**该方法）→ 属**设计差异**，但调用面收窄 |
+| `MongoAgentStateStore` → `state_store.rs` | ✅ | 复合 `_id{user,session}`、`states`/`versions`/`hashes` 子文档、key 正则 `^[a-zA-Z_][a-zA-Z0-9_]*$`、CAS 三分支（0=create-if-absent / UNVERSIONED=无条件 / 期望版本）、`$size` 语义等价（`first_field_size`）、list 增量追加 + 全量重写 | **基本对齐**，一处偏差：per-key `delete` 为固有方法 `delete_key`（Java 是 core trait 的 `default void delete(u,s,key)`，Rust core trait **无**该方法）→ 属**设计差异**，但调用面收窄。原「builder `ttl_days` 未生效」已于 2026-10-26 闭环 |
 | `MongoBaseStore` → `store.rs` | ✅ | US(0x1F) 编码 + 尾分隔符 + `$gte/$lt`（`\u{FFFF}` 上界）+ 按 key 排序 + skip/limit、`version` 从 1 起、`put` 每次 +1、`put_if_version(0)`=insert-if-absent（11000→false）、`supports_atomic_session_storage`=true | **完全对齐** |
 | `MongoRemoteSnapshotClient` → `snapshot.rs` | ✅ | GridFS 分块 255KB（`GRIDFS_DEFAULT_CHUNK_SIZE = 255*1024`）、`<bucket>.files`/`<bucket>.chunks`、chunk 字段 `files_id`/`n`/`data`、文件文档 `length`/`chunkSize`/`uploadDate`/`metadata.createdAt`、下载按 `n` 排序并要求连续 `0..n-1` 且总长 == `length`（否则 `corrupt GridFS file '<id>': ...`）、`exists`/`download`/`delete` 均 GridFS 优先 + legacy `{_id,data}` 回退、`delete` 双路径清理 | **完全对齐**（本轮 4 项改动属实，见下） |
 | `MongoSnapshotSpec` → `snapshot.rs` | ✅ | Java `extends RemoteSnapshotSpec` → Rust `impl SandboxSnapshotSpec` + 内持 harness `RemoteSnapshotSpec`；`database_name` 已生效 | **对齐**（形态差异已记录） |
-| `MongoSandboxExecutionGuard` → `sandbox_guard.rs` | ✅ | insert 抢占 → 11000 → `expiresAt<=now` reclaim → 轮询至 `lock_timeout`；UUID token 作用域续约/释放；`lease_ttl/3` 续约；`compose_lock_id` = `lock:`+hex(SHA-256(lowercase(scope)+":"+value)) 与 Java **字节级一致**；TTL 索引 `expiresAt`/`expireAfterSeconds(0)` | **基本对齐**，一处偏差：builder `database_name` 未生效（**P1**） |
+| `MongoSandboxExecutionGuard` → `sandbox_guard.rs` | ✅ | insert 抢占 → 11000 → `expiresAt<=now` reclaim → 轮询至 `lock_timeout`；UUID token 作用域续约/释放；`lease_ttl/3` 续约；`compose_lock_id` = `lock:`+hex(SHA-256(lowercase(scope)+":"+value)) 与 Java **字节级一致**；TTL 索引 `expiresAt`/`expireAfterSeconds(0)` | **完全对齐**（原唯一偏差 builder `database_name` 已于 2026-10-26 闭环：锁集合按库限定） |
 | `MongoDistributedStore` → `distributed_store.rs` | ✅ | 五组件访问器 + `to_harness_store()` 投影 + `on_delete` 级联删快照 | **形态差异（设计决定）**，但级联链路在 Rust harness 侧无生产写入方（**P1**，见 §3.3） |
 | （测试替身）Testcontainers/Mockito → `client.rs::InMemoryMongoClient` | ✅ | 11000 重复键、`$set/$inc/$push/$pushEach/$setOnInsert/$unset`、dot-path 读写、`$gte/$lt/$lte/$exists`、error-85 冲突 | **忠实**（另含 2 个测试钩子：`force_index_conflicts(n)`、`document_count`） |
 
@@ -191,15 +204,15 @@
 | GridFS 255KB 分块 | ✅ 属实 | `client.rs:34` `GRIDFS_DEFAULT_CHUNK_SIZE = 255*1024`；`client.rs:879` `data.chunks(chunk_size.max(1))`；边界用例 `snapshot.rs:470` 覆盖 255KB-1/255KB/255KB+1 → 1/1/2 块 |
 | legacy 回退 | ✅ 属实 | `snapshot.rs:106/116/141` `exists_legacy`/`download_legacy`/`delete_legacy`；`snapshot.rs:215` 回退分支；3 个用例覆盖（`download_and_exists_fall_back_to_legacy_document`、`gridfs_takes_precedence_over_legacy_document`、`delete_gridfs_also_cleans_up_legacy_document`） |
 | chunk 完整性校验 | ✅ 属实 | `client.rs:938-964`：排序后要求 `n` 连续、`reassembled length == stored length`，否则 `MongoError::Backend("corrupt GridFS file ...")`；2 个损坏用例 |
-| `database_name` 生效 | ⚠️ **部分属实** | 快照侧属实：`client.rs:72` `scoped_collection(db, coll)` + `snapshot.rs:93` `scoped_bucket()`，用例 `database_name_isolates_snapshots` ✅。**但 guard 侧不属实**：`sandbox_guard.rs:348` `build()` 丢弃 `database_name`，锁集合未按库隔离（**P1**） |
+| `database_name` 生效 | ✅ **属实（2026-10-26 补齐 guard 侧）** | 快照侧属实：`client.rs:72` `scoped_collection(db, coll)` + `snapshot.rs:93` `scoped_bucket()`，用例 `database_name_isolates_snapshots` ✅。**guard 侧原不属实**（`build()` 丢弃 `database_name`），已于 2026-10-26 修复：`build()` 用 `scoped_collection(db, collection)` 生成 `collection_key`，用例 `database_name_partitions_locks` / `default_database_is_scoped_into_collection_key` |
 | `delete_key` 接线（消除 dead code） | ✅ 属实 | `state_store.rs:438` 公共 `delete_key` → `state_store.rs:447` `delete_key_inner`；`delete_key_inner` 现被调用，rustc `dead_code` 不再触发；全 crate 0 处 `#[allow(dead_code)]` ✅ |
 
 **新发现缺口**
 
 | 级别 | 缺口 | 影响 |
 |---|---|---|
-| **P1** | builder `ttl_days` 未生效（`state_store.rs:641-651` 丢弃字段） | Java `build()` 自动建 TTL 索引；Rust `builder().ttl_days(7).build()` **静默不建**，须另调 `ensure_indexes(Some(7))` → 会话永不过期，**无报错、无日志** |
-| **P1** | guard builder `database_name` 未生效（`sandbox_guard.rs:348-357`） | 不同库共用 `agentscope_sandbox_locks` 集合 → 跨库互相抢锁 / 误 reclaim |
+| ~~P1~~ **已闭环** | builder `ttl_days` 未生效（`state_store.rs` 丢弃字段） | **2026-10-26 已修**：store 持有 `ttl_days`，无参 `ensure_indexes()` 据其建 TTL 索引（原影响：`builder().ttl_days(7).build()` 静默不建 → 会话永不过期） |
+| ~~P1~~ **已闭环** | guard builder `database_name` 未生效 | **2026-10-26 已修**：锁集合限定为 `scoped_collection(db, coll)`，不同库 guard 不再互相抢锁 / 误 reclaim |
 | **P1** | 级联删快照链路在 Rust harness 侧**无写入方** | Java 由 `SessionSandboxStateStore` 写 `sandbox/session/<id>` + `_sandbox_state`；Rust harness 无该类（`sandbox/state.rs` 只有 `SandboxStateStore` trait + `InMemorySandboxStateStore`，key 为 `SandboxIsolationKey::to_string()` 即 `scope:value`，且存的是 `SandboxState` 而非含 `snapshot.id` 的 JSON）→ `states._sandbox_state.json` **无生产写入** → 级联删除恒 no-op，快照成孤儿（跨 crate 契约缺口） |
 | **P2** | `client.rs` 无 `tracing` 埋点（实测 0 处） | 内存后端故障无诊断线索（Java 对应类均有 log） |
 | **P2** | `lib.rs:15` / `distributed_store.rs:170` rustdoc 链接指向**私有**模块 `sandbox::guard::SandboxExecutionGuard` | rustdoc 链接失效（公开路径应为 `sandbox::SandboxExecutionGuard`） |
@@ -219,7 +232,7 @@
 | 6 | `snapshot.rs / client.rs 无 tracing 埋点`（§2.1 / §3.3） | `snapshot.rs` **已有 4 处**埋点（`126/133/163/217`）；仅 `client.rs` 无（实测 0 处）→ §3.3 原行已拆分修正 |
 | 7 | 以 `sandbox::guard::SandboxExecutionGuard` 作为公开路径引用 | `harness/src/agent/sandbox/mod.rs:19` 为 `mod guard;`（**私有**）；公开路径是 `agentscope_harness::agent::sandbox::SandboxExecutionGuard`（`mod.rs:31` 重导出）。crate 内 `lib.rs:15`、`distributed_store.rs:170` 仍引用私有路径 |
 | 8 | §3.2「`supportsVersioning()` / `getVersioned()` … core `AgentStateStore` trait 无版本方法」 | **已过时**：core trait 于 2026-10-19（commit `9a8fd07`）新增 `supports_versioning` / `get_versioned` / `save_if_version` + `UNVERSIONED` 常量；本 crate `state_store.rs:558/562/577` 已实装三者 → 原「不迁移」判定应改「**已完成（已上提 trait）**」 |
-| 9 | §1「当前状态：已完成（本轮 P1/P2 收尾）」 | 应下调为「**进行中**」——静态复核发现 3 项 P1 未闭环（见上表） |
+| 9 | §1「当前状态：已完成（本轮 P1/P2 收尾）」 | 应下调为「**进行中**」——静态复核发现 3 项 P1 未闭环（见上表）；**2026-10-26 更新**：其中 ①`ttl_days`、②guard `database_name` 已闭环，仅剩 ③级联删快照跨 crate 契约 |
 
 ### 4.2 下一步与阻塞
 1. **无阻塞**。本次变更未新增对 harness/core 的改动需求；`Cargo.toml` 未改，无新增依赖。
@@ -231,7 +244,7 @@
    - **`_cache: Arc<Mutex<()>>` 占位**：对应 Java volatile double-checked 缓存的影子字段，不缓存任何值；保留以备后续 harness 扩展。
 4. **非阻塞文档/埋点项**：`lib.rs` doc 表述与 `MongodbGuardClient` 实际（镜像方法，非 trait 实现）不符，且 rustdoc 链接指向私有模块路径 `sandbox::guard::SandboxExecutionGuard`；`client.rs` 无 `tracing` 埋点（`snapshot.rs` 已有 4 处）。
 5. **后续建议**：真实驱动接入后，将 `chunkSize` 作为 `GridFSBucket` 参数（当前固定 255KB 默认值），并验证 `uploadDate`/`metadata` 在真驱动下的字节级一致。
-6. **2026-10-22 静态复核新增待办**：① builder `ttl_days` 生效（§3.3，P1）；② guard `database_name` 生效（§3.3，P1）；③ 级联删快照的跨 crate 契约（Rust harness 需提供写 `states._sandbox_state.json` 的 `SessionSandboxStateStore` 等价物，或改由本 crate 直接管理快照 id，P1）；④ `MongodbGuardClient` 与 harness `SandboxLease` 的释放闭环（§3.3，P2）。
+6. **2026-10-22 静态复核新增待办**：① builder `ttl_days` 生效（§3.3，P1）——**已于 2026-10-26 完成**；② guard `database_name` 生效（§3.3，P1）——**已于 2026-10-26 完成**；③ 级联删快照的跨 crate 契约（Rust harness 需提供写 `states._sandbox_state.json` 的 `SessionSandboxStateStore` 等价物，或改由本 crate 直接管理快照 id，P1，**仍未解决**）；④ `MongodbGuardClient` 与 harness `SandboxLease` 的释放闭环（§3.3，P2，**仍未解决**）。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-mongodb` 基线。

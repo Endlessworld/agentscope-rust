@@ -45,7 +45,12 @@ const FIELD_EXPIRES_AT: &str = "expiresAt";
 #[derive(Clone)]
 pub struct MongodbSandboxExecutionGuard {
     client: Arc<dyn MongoClient>,
-    collection: String,
+    database_name: String,
+    /// Collection key the guard actually talks to: `scoped_collection(database,
+    /// collection)`. The in-process backend keeps a flat map, so the database is
+    /// encoded into the key (the same convention `MongodbRemoteSnapshotClient`
+    /// uses); a real server scopes collections per database natively.
+    collection_key: String,
     lock_timeout: Duration,
     lease_ttl: Duration,
     retry_interval: Duration,
@@ -55,7 +60,8 @@ pub struct MongodbSandboxExecutionGuard {
 impl std::fmt::Debug for MongodbSandboxExecutionGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MongodbSandboxExecutionGuard")
-            .field("collection", &self.collection)
+            .field("database_name", &self.database_name)
+            .field("collection_key", &self.collection_key)
             .field("lock_timeout", &self.lock_timeout)
             .field("lease_ttl", &self.lease_ttl)
             .field("retry_interval", &self.retry_interval)
@@ -70,11 +76,21 @@ impl MongodbSandboxExecutionGuard {
         MongodbSandboxExecutionGuardBuilder::new(client)
     }
 
+    /// The configured database name.
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    /// The database-scoped collection key the guard reads and writes.
+    pub fn collection_key(&self) -> &str {
+        &self.collection_key
+    }
+
     /// Ensures the TTL index on `expiresAt` exists.
     pub async fn ensure_indexes(&self) -> Result<()> {
         create_index_with_migration(
             &self.client,
-            &self.collection,
+            &self.collection_key,
             &IndexSpec::ascending(&[FIELD_EXPIRES_AT]).expire_after_seconds(0),
         )
         .await
@@ -102,7 +118,7 @@ impl MongodbSandboxExecutionGuard {
             doc.insert(FIELD_OWNER.to_string(), json!(self.owner));
             doc.insert(FIELD_TOKEN.to_string(), json!(token));
             doc.insert(FIELD_EXPIRES_AT.to_string(), json!(expires_at));
-            match self.client.insert_one(&self.collection, doc).await {
+            match self.client.insert_one(&self.collection_key, doc).await {
                 Ok(()) => {
                     return Ok(self.spawn_lease(lock_id, token, expires_at));
                 }
@@ -124,7 +140,7 @@ impl MongodbSandboxExecutionGuard {
             match self
                 .client
                 .find_one_and_update(
-                    &self.collection,
+                    &self.collection_key,
                     &filter,
                     &update,
                     &FindOneAndUpdateOptions { upsert: false, return_after: true },
@@ -159,7 +175,7 @@ impl MongodbSandboxExecutionGuard {
             (self.lease_ttl.as_millis() as u64 / 3).max(1),
         );
         let client = self.client.clone();
-        let collection = self.collection.clone();
+        let collection_key = self.collection_key.clone();
         let lease_ttl_ms = self.lease_ttl.as_millis() as i64;
         let renew_id = lock_id.clone();
         let renew_token = token.clone();
@@ -176,7 +192,7 @@ impl MongodbSandboxExecutionGuard {
                 let update = Update::new().set(FIELD_EXPIRES_AT, json!(new_expires));
                 if client
                     .update_one(
-                        &collection,
+                        &collection_key,
                         &filter,
                         &update,
                         &crate::client::UpdateOptions::default(),
@@ -191,7 +207,7 @@ impl MongodbSandboxExecutionGuard {
         });
         MongodbLeaseHandle {
             client: self.client.clone(),
-            collection: self.collection.clone(),
+            collection_key: self.collection_key.clone(),
             lock_id,
             token,
             expires_at,
@@ -204,7 +220,7 @@ impl MongodbSandboxExecutionGuard {
         // backend directly when available, otherwise assume observable state via a
         // blocking read.
         let filter = FindFilter::eq(FIELD_LOCK_ID, json!(lock_id));
-        match futures::executor::block_on(self.client.find_one(&self.collection, &filter)) {
+        match futures::executor::block_on(self.client.find_one(&self.collection_key, &filter)) {
             Ok(Some(doc)) => doc
                 .get(FIELD_EXPIRES_AT)
                 .and_then(|v| v.as_i64())
@@ -220,7 +236,8 @@ impl MongodbSandboxExecutionGuard {
 /// Dropping it cancels the renewal task and releases the lock (token-scoped).
 pub struct MongodbLeaseHandle {
     client: Arc<dyn MongoClient>,
-    collection: String,
+    /// Database-scoped collection key of the lock document.
+    collection_key: String,
     lock_id: String,
     token: String,
     expires_at: i64,
@@ -260,7 +277,7 @@ impl MongodbLeaseHandle {
         }
         let filter = FindFilter::eq(FIELD_LOCK_ID, json!(self.lock_id.clone()))
             .and(FindFilter::eq(FIELD_TOKEN, json!(self.token.clone())));
-        let _ = futures::executor::block_on(self.client.delete_one(&self.collection, &filter));
+        let _ = futures::executor::block_on(self.client.delete_one(&self.collection_key, &filter));
     }
 }
 
@@ -346,9 +363,17 @@ impl MongodbSandboxExecutionGuardBuilder {
     }
 
     pub fn build(self) -> MongodbSandboxExecutionGuard {
+        // Scope the lock collection to the configured database, mirroring Java
+        // `mongoClient.getDatabase(databaseName).getCollection(collectionName)`.
+        // The in-process backend is flat, so the database is encoded into the key
+        // via `scoped_collection` (the convention `MongodbRemoteSnapshotClient`
+        // already uses); guards on different databases therefore never share a lock.
+        let collection_key =
+            crate::client::scoped_collection(&self.database_name, &self.collection);
         MongodbSandboxExecutionGuard {
             client: self.client,
-            collection: self.collection,
+            database_name: self.database_name,
+            collection_key,
             lock_timeout: self.lock_timeout,
             lease_ttl: self.lease_ttl,
             retry_interval: self.retry_interval,
@@ -479,6 +504,56 @@ mod tests {
         assert!(err.to_string().contains("Timed out"));
     }
 
+    /// Regression test for the builder `database_name` being dropped on `build()`:
+    /// two guards configured with different databases must not contend for the same
+    /// isolation key (Java scopes the lock collection to
+    /// `mongoClient.getDatabase(databaseName)`).
+    #[tokio::test]
+    async fn database_name_partitions_locks() {
+        let client: Arc<dyn MongoClient> = Arc::new(InMemoryMongoClient::new());
+        let build = |database: &str| {
+            MongodbSandboxExecutionGuard::builder(client.clone())
+                .database_name(database)
+                .lease_ttl(Duration::from_secs(60))
+                .retry_interval(Duration::from_millis(10))
+                .lock_timeout(Duration::from_millis(100))
+                .build()
+        };
+        let guard_a = build("db_a");
+        let guard_b = build("db_b");
+
+        assert_eq!(guard_a.database_name(), "db_a");
+        assert_eq!(guard_b.database_name(), "db_b");
+        assert_eq!(
+            guard_a.collection_key(),
+            crate::client::scoped_collection("db_a", SANDBOX_LOCKS_COLLECTION)
+        );
+        assert_ne!(guard_a.collection_key(), guard_b.collection_key());
+
+        let key = SandboxIsolationKey::new("user", "u1");
+        let lease_a = guard_a.try_enter(&key).await.unwrap();
+        let lease_b = guard_b.try_enter(&key).await.unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(guard_a.lock_held(lease_a.lock_id(), now));
+        assert!(guard_b.lock_held(lease_b.lock_id(), now));
+        assert_ne!(lease_a.token(), lease_b.token());
+
+        // Same database still contends: the second acquisition times out.
+        let guard_a2 = build("db_a");
+        assert!(guard_a2.try_enter(&key).await.is_err());
+    }
+
+    #[test]
+    fn default_database_is_scoped_into_collection_key() {
+        let g = guard();
+        assert_eq!(g.database_name(), DEFAULT_DATABASE);
+        assert_eq!(
+            g.collection_key(),
+            crate::client::scoped_collection(DEFAULT_DATABASE, SANDBOX_LOCKS_COLLECTION)
+        );
+    }
+
     #[tokio::test]
     async fn expired_lock_can_be_reclaimed() {
         let g = guard();
@@ -490,7 +565,7 @@ mod tests {
         doc.insert("owner".to_string(), json!("dead"));
         doc.insert("token".to_string(), json!("dead-token"));
         doc.insert("expiresAt".to_string(), json!(0));
-        g.client.insert_one(&g.collection, doc).await.unwrap();
+        g.client.insert_one(g.collection_key(), doc).await.unwrap();
         // Reclaim succeeds despite the existing document.
         let lease = g.try_enter(&key).await.unwrap();
         assert_ne!(lease.token(), "dead-token");
@@ -506,12 +581,12 @@ mod tests {
         let filter = FindFilter::eq("_id", json!(lock_id.clone()));
         let update = Update::new().set("token", json!("someone-else"));
         g.client
-            .update_one(&g.collection, &filter, &update, &Default::default())
+            .update_one(g.collection_key(), &filter, &update, &Default::default())
             .await
             .unwrap();
         lease.release();
         // The lock document must survive because the token no longer matches.
-        assert!(g.client.find_one(&g.collection, &filter).await.unwrap().is_some());
+        assert!(g.client.find_one(g.collection_key(), &filter).await.unwrap().is_some());
     }
 
     #[tokio::test]
