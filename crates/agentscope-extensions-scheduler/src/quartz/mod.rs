@@ -3,7 +3,9 @@
 //!
 //! Java uses the Quartz library (Job/Trigger). Rust has no Quartz binding, so we
 //! reproduce the same observable semantics with tokio tasks:
-//! * `CRON`        — evaluated by the crate-local cron parser, ticking every second.
+//! * `CRON`        — evaluated by the crate-local cron parser, ticking every
+//!   second and comparing against the wall clock of `ScheduleConfig::zone_id`
+//!   (UTC when unset).
 //! * `FIXED_RATE`  — `tokio::time::interval`, constant interval between starts.
 //! * `FIXED_DELAY` — `sleep(delay)` after each completion (sequential).
 //!
@@ -27,11 +29,11 @@ use tokio::sync::Notify;
 
 use agentscope_core::message::Msg;
 
-use crate::common::config::{AgentConfig, RuntimeAgentConfig, ScheduleConfig};
+use crate::common::config::{AgentConfig, RuntimeAgentConfig, ScheduleConfig, ScheduleMode};
 use crate::common::scheduler::scheduler::{AgentScheduler, SchedulerError};
 use crate::common::scheduler::task::{AgentFactory, ScheduleAgentTask};
 
-use self::job::spawn_job;
+use self::job::{spawn_job, CronPlan};
 
 /// AgentScheduler implementation backed by tokio timers (Quartz-equivalent).
 pub struct QuartzAgentScheduler {
@@ -96,6 +98,13 @@ impl QuartzAgentScheduler {
         // (`QuartzAgentScheduler.java:233-241`) and reads it back on every
         // firing (`AgentQuartzJob.java:67-101`). The Rust task owns the same
         // payload so both the job loop and manual triggers honour it.
+        //
+        // Cron + time zone are resolved *before* the task is registered so that
+        // an invalid expression/zone fails the call without side effects (Java
+        // throws `RuntimeException("CronExpression '…' is invalid.")` and never
+        // reaches `tasks.put(...)`).
+        let cron = resolve_cron(&schedule_config)?;
+
         let task = Arc::new(QuartzScheduleAgentTask::new(
             runtime,
             schedule_config.clone(),
@@ -106,7 +115,7 @@ impl QuartzAgentScheduler {
 
         self.jobs.write().unwrap().insert(name.clone(), task.clone());
 
-        let handle = spawn_job(self.context(), task.clone(), schedule_config.clone());
+        let handle = spawn_job(self.context(), task.clone(), schedule_config.clone(), cron);
         task.attach(handle);
 
         tracing::info!(task = %name, mode = schedule_config.schedule_mode().as_str(), "scheduled task");
@@ -176,6 +185,28 @@ impl QuartzAgentScheduler {
             .ok_or_else(|| SchedulerError::new("Unexpected task type"))?;
         q.execute().await.map_err(|e| SchedulerError::new(e.to_string()))
     }
+}
+
+/// Parses the cron expression and resolves its time zone, mirroring Java's
+/// `CronScheduleBuilder.cronSchedule(...)` + `csb.inTimeZone(...)`.
+///
+/// Returns `None` for non-CRON modes. Called before the task is registered so a
+/// bad expression or zone id has no side effects (Java throws before
+/// `tasks.put(...)`).
+fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<CronPlan>, SchedulerError> {
+    if schedule_config.schedule_mode() != ScheduleMode::CRON {
+        return Ok(None);
+    }
+    let expression = schedule_config.cron_expression().unwrap_or_default();
+    let parsed = CronExpression::parse(expression).map_err(|e| {
+        SchedulerError::new(format!("CronExpression '{expression}' is invalid: {e}"))
+    })?;
+    let offset = schedule_config.zone_offset().map_err(|e| {
+        SchedulerError::new(format!(
+            "CronExpression '{expression}' has an invalid time zone: {e}"
+        ))
+    })?;
+    Ok(Some(CronPlan { expression: parsed, offset }))
 }
 
 /// Context handed to a spawned job loop.
@@ -359,5 +390,64 @@ mod tests {
             ..Default::default()
         };
         assert!(sched.schedule_runtime(runtime("A"), bad, None).await.is_err());
+    }
+
+    fn expect_err<T>(result: Result<T, SchedulerError>, what: &str) -> SchedulerError {
+        match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected {what} to fail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_cron_fails_without_registering_task() {
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+
+        // Quartz rejects both day selectors (`*` counts as specified).
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 9 * * MON-FRI")
+            .build()
+            .unwrap();
+        let err = expect_err(
+            sched.schedule_runtime(runtime("A"), cfg, None).await,
+            "day-field conflict",
+        );
+        assert!(err.to_string().contains("is invalid"), "err was {err}");
+        assert!(sched.get_scheduled_agent("A").is_none());
+        assert!(sched.all_schedule_agent_tasks().is_empty());
+
+        // `0` is not a Quartz weekday.
+        let cfg = ScheduleConfig::builder().cron("0 0 8 * * 0").build().unwrap();
+        assert!(sched.schedule_runtime(runtime("A"), cfg, None).await.is_err());
+        assert!(sched.all_schedule_agent_tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_zone_id_fails_without_registering_task() {
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .zone_id("Mars/Olympus")
+            .build()
+            .unwrap();
+        let err = expect_err(
+            sched.schedule_runtime(runtime("A"), cfg, None).await,
+            "unknown zone id",
+        );
+        assert!(err.to_string().contains("Mars/Olympus"), "err was {err}");
+        assert!(sched.get_scheduled_agent("A").is_none());
+    }
+
+    #[tokio::test]
+    async fn cron_with_zone_id_is_scheduled() {
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .zone_id("Asia/Shanghai")
+            .build()
+            .unwrap();
+        let task = sched.schedule_runtime(runtime("A"), cfg, None).await.unwrap();
+        assert_eq!(task.name(), "A");
+        assert!(sched.cancel("A").await);
     }
 }

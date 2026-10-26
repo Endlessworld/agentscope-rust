@@ -3,14 +3,15 @@
 //! Spawns a tokio task that fires the scheduled task according to the
 //! [`ScheduleMode`]:
 //! * `NONE`        — never fires automatically (manual `trigger` only).
-//! * `CRON`        — ticks every second and fires when the expression matches.
+//! * `CRON`        — ticks every second and fires when the expression matches
+//!                   the wall clock of the configured time zone.
 //! * `FIXED_RATE`  — fires every `fixed_rate` ms regardless of duration.
 //! * `FIXED_DELAY` — fires, waits for completion, then sleeps `fixed_delay` ms.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, FixedOffset, Utc};
 use tokio::task::JoinHandle;
 
 use crate::common::config::{ScheduleConfig, ScheduleMode};
@@ -19,30 +20,36 @@ use crate::quartz::cron::CronExpression;
 use crate::quartz::task::QuartzScheduleAgentTask;
 use crate::quartz::JobContext;
 
+/// A validated cron schedule: the parsed expression plus the fixed offset it is
+/// evaluated in (from `ScheduleConfig::zone_id`, UTC when unset).
+///
+/// Both parts are resolved by
+/// `QuartzAgentScheduler::schedule_runtime` *before* the task is registered, so
+/// an invalid expression or zone id fails the `schedule*` call instead of
+/// leaving behind a task that silently never fires.
+#[derive(Debug, Clone)]
+pub(crate) struct CronPlan {
+    pub(crate) expression: CronExpression,
+    pub(crate) offset: FixedOffset,
+}
+
+impl CronPlan {
+    /// Whether the expression matches the wall clock in its zone at `now`.
+    pub(crate) fn matches_at(&self, now: DateTime<Utc>) -> bool {
+        self.expression.matches(now.with_timezone(&self.offset))
+    }
+}
+
 /// Spawns the job loop for `task` and returns its handle.
 pub(crate) fn spawn_job(
     ctx: JobContext,
     task: Arc<QuartzScheduleAgentTask>,
     schedule_config: ScheduleConfig,
+    cron: Option<CronPlan>,
 ) -> JoinHandle<()> {
     let _ = ctx;
     let initial_delay = schedule_config.initial_delay().unwrap_or(0);
     let mode = schedule_config.schedule_mode();
-
-    // Parse cron up-front so a bad expression surfaces as a job that never fires
-    // (schedule() already validated presence; parsing failure is logged).
-    let cron = match mode {
-        ScheduleMode::CRON => {
-            match CronExpression::parse(schedule_config.cron_expression().unwrap_or("")) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::error!(error = %e, "invalid cron expression; job will not fire");
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
 
     tokio::spawn(async move {
         if initial_delay > 0 {
@@ -58,7 +65,13 @@ pub(crate) fn spawn_job(
                 task.cancelled().await;
             }
             ScheduleMode::CRON => {
-                let Some(cron) = cron else { return };
+                // Only reachable with a plan: `schedule_runtime` parses the cron
+                // expression before registering the task.
+                let Some(plan) = cron else {
+                    tracing::error!("CRON schedule without a parsed expression");
+                    task.cancelled().await;
+                    return;
+                };
                 loop {
                     if task.is_cancelled() {
                         return;
@@ -67,8 +80,7 @@ pub(crate) fn spawn_job(
                     if task.is_cancelled() {
                         return;
                     }
-                    let now = Utc::now();
-                    if cron.matches(now) {
+                    if plan.matches_at(Utc::now()) {
                         let _ = fire(&task).await;
                     }
                     tokio::select! {
@@ -123,5 +135,43 @@ pub(crate) fn spawn_job(
 async fn fire(task: &Arc<QuartzScheduleAgentTask>) {
     if let Err(e) = task.execute().await {
         tracing::warn!(task = %task.name(), error = %e, "scheduled execution failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn plan(expr: &str, offset_hours: i32) -> CronPlan {
+        CronPlan {
+            expression: CronExpression::parse(expr).unwrap(),
+            offset: FixedOffset::east_opt(offset_hours * 3600).unwrap(),
+        }
+    }
+
+    #[test]
+    fn cron_matches_in_configured_zone() {
+        // 08:00 Asia/Shanghai == 00:00 UTC.
+        let plan = plan("0 0 8 * * ?", 8);
+        assert!(plan.matches_at(Utc.with_ymd_and_hms(2026, 9, 18, 0, 0, 0).unwrap()));
+        // 08:00 UTC is 16:00 in UTC+8: the pre-fix implementation fired here and
+        // missed the real 08:00 local slot.
+        assert!(!plan.matches_at(Utc.with_ymd_and_hms(2026, 9, 18, 8, 0, 0).unwrap()));
+    }
+
+    #[test]
+    fn cron_matches_in_utc_by_default() {
+        let plan = plan("0 0 8 * * ?", 0);
+        assert!(plan.matches_at(Utc.with_ymd_and_hms(2026, 9, 18, 8, 0, 0).unwrap()));
+        assert!(!plan.matches_at(Utc.with_ymd_and_hms(2026, 9, 18, 0, 0, 0).unwrap()));
+    }
+
+    #[test]
+    fn negative_offset_shifts_weekday_boundary() {
+        // 0 0 9 ? * 1 == Sunday 09:00 local. At UTC-5 that is Sunday 14:00 UTC.
+        let plan = plan("0 0 9 ? * 1", -5);
+        assert!(plan.matches_at(Utc.with_ymd_and_hms(2026, 9, 20, 14, 0, 0).unwrap()));
+        assert!(!plan.matches_at(Utc.with_ymd_and_hms(2026, 9, 20, 9, 0, 0).unwrap()));
     }
 }

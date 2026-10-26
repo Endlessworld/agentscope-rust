@@ -1,8 +1,11 @@
 //! `ScheduleMode` / `ScheduleConfig`, mirroring
 //! `io.agentscope.extensions.scheduler.config.ScheduleMode` and `ScheduleConfig`.
 
+use chrono::FixedOffset;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::zone::{resolve_zone, ScheduleZoneError};
 
 /// Timing strategy used to schedule agent execution.
 ///
@@ -117,6 +120,16 @@ impl ScheduleConfig {
     /// Accessor mirroring Java `getZoneId`.
     pub fn zone_id(&self) -> Option<&str> {
         self.zone_id.as_deref()
+    }
+
+    /// Resolves [`zone_id`](Self::zone_id) to the fixed UTC offset the cron
+    /// expression must be evaluated in.
+    ///
+    /// `None` (or an absent id) means UTC, matching Quartz's default trigger
+    /// time zone. Unknown ids and zones with daylight saving are rejected with
+    /// [`ScheduleZoneError`] instead of silently degrading to UTC.
+    pub fn zone_offset(&self) -> Result<FixedOffset, ScheduleZoneError> {
+        resolve_zone(self.zone_id())
     }
 
     /// Validates the config against its mode, mirroring Java `ScheduleConfig.validate`.
@@ -243,9 +256,34 @@ mod tests {
     }
 
     #[test]
+    fn zone_offset_defaults_to_utc_and_rejects_unknown() {
+        let cfg = ScheduleConfig::builder().cron("0 0 8 * * ?").build().unwrap();
+        assert_eq!(cfg.zone_offset().unwrap(), FixedOffset::east_opt(0).unwrap());
+
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .zone_id("Asia/Shanghai")
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.zone_offset().unwrap(),
+            FixedOffset::east_opt(8 * 3600).unwrap()
+        );
+
+        // Resolution happens at schedule time (Java hands the id to Quartz),
+        // so `validate()` still accepts it and `zone_offset()` reports it.
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .zone_id("Nowhere/Land")
+            .build()
+            .unwrap();
+        assert!(cfg.zone_offset().is_err());
+    }
+
+    #[test]
     fn serde_roundtrip_uses_java_enum_names() {
         let cfg = ScheduleConfig::builder()
-            .cron("0 0 9 * * MON-FRI")
+            .cron("0 0 9 ? * MON-FRI")
             .zone_id("Asia/Shanghai")
             .build()
             .unwrap();

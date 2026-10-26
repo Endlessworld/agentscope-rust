@@ -17,7 +17,7 @@ pub use common::{
     AgentConfig, AgentConfigBuilder, AgentConfigError, AgentFactory, AgentScheduler,
     BaseScheduleAgentTask, ModelConfig, RuntimeAgentConfig, RuntimeAgentConfigBuilder,
     ScheduleAgentTask, ScheduleConfig, ScheduleConfigBuilder, ScheduleConfigError, ScheduleMode,
-    SchedulerError, StaticModelConfig, TaskControl,
+    ScheduleZoneError, SchedulerError, StaticModelConfig, TaskControl,
 };
 pub use quartz::{
     CronExpression, CronParseError, QuartzAgentScheduler, QuartzScheduleAgentTask,

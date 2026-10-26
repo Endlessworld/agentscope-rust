@@ -7,9 +7,11 @@
 
 mod schedule;
 mod spec;
+mod zone;
 
 pub use schedule::{ScheduleConfig, ScheduleConfigBuilder, ScheduleConfigError, ScheduleMode};
 pub use spec::{
     AgentConfig, AgentConfigBuilder, AgentConfigError, ModelConfig, RuntimeAgentConfig,
     RuntimeAgentConfigBuilder, StaticModelConfig,
 };
+pub use zone::{resolve_zone, ScheduleZoneError};

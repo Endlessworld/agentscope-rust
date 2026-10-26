@@ -1,7 +1,7 @@
 ﻿# SCHEDULER 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **SCHEDULER** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
-> **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-scheduler\`
+> **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-scheduler\`（原先记录的 `E:\local-github\...` 已不存在，2026-10-26 更正为 D 盘）
 > **Java 子模块**：scheduler-common, scheduler-quartz, scheduler-xxl-job
 > **Rust 目标**：`crates/agentscope-extensions-scheduler/`（波次 C）
 
@@ -51,7 +51,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | jackson-databind | JSON 序列化（inputMsg 存 JobDataMap） | `serde` / `serde_json` | 已声明 |
 | slf4j | 日志 | `tracing` | 已声明 |
 | java.util.UUID | 任务 id | `uuid`（workspace v1） | 勘误：`uuid = { workspace = true }` **已在** `Cargo.toml:19` 声明，无需再补 |
-| java.time / TimeZone | zoneId | `chrono`（已声明） | **勘误：`zone_id` 当前是纯死字段** —— 全 crate 仅 `ScheduleConfig` 定义/存取它，`quartz::job` 一律用 `Utc::now()`，`zone_id` 无任何消费点（`grep zone_id` 命中 0 处使用）。见 §6 P1 |
+| java.time / TimeZone | zoneId | `chrono`（已声明） | **已修复（2026-10-26，§6.1）**：新增 `common/config/zone.rs`（`resolve_zone` → `chrono::FixedOffset`）+ `ScheduleConfig::zone_offset()`，`quartz::job::CronPlan::matches_at` 按配置时区求值。**限制**：未引入 `chrono-tz`，只支持 UTC 别名 / 固定偏移 / 免 DST 的 IANA 白名单；`Europe/London` 等 DST 区报明确错误 |
 | agentscope-core (Model/Toolkit/Hook/ReActAgent/Msg) | 核心类型 | `agentscope-core`（已声明） | `Model`/`Toolkit`/`Msg`/`ReActAgent` 直接复用 |
 | agentscope-extensions-model-dashscope | DashScopeChatModel | **无对应**（MODEL 模块未迁移该 provider） | 依赖注入 `Arc<dyn Model>`，见 §4.2；`RuntimeAgentConfig::model` 为 `Option`，缺失时 `BaseScheduleAgentTask::run_with` **只校验 name/sysPrompt，不校验 model**（Java `createAgent` 会抛 `Model cannot be null`） |
 
@@ -98,7 +98,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | QuartzAgentScheduler schedule/cancel/getAll/shutdown/getSchedulerType | QuartzAgentScheduler(26955B) | 已完成 | tokio 定时循环 + 手写 cron 解析。**缺口：无集群回读**（Java `loadTaskFromQuartz` 从 Quartz store 重建任务；Rust 仅进程内 `HashMap`，属设计决定但 §2 表格「集群回读」表述需删） |
-| CRON / FIXED_RATE / FIXED_DELAY 三模式 | 同名 | 进行中 | 三模式均已实现，但 **CRON 语义不等价**（见 §6）：无 `L`/`W`/`#`/年字段/`zoneId`；且按秒轮询 `matches(Utc::now())` 存在跳秒漏触发风险。**FIXED_RATE 用 `tokio::interval` 但消费首个 tick 后语义正确**；FIXED_DELAY 为「完成后 sleep」——与 Java 一致 |
+| CRON / FIXED_RATE / FIXED_DELAY 三模式 | 同名 | 进行中 | 三模式均已实现。**cron 4 项 P1 语义已对齐（2026-10-26，见 §6.1）**：星期基准 1-7、dom/dow 冲突报错、非法表达式快速失败且无副作用、`zoneId` 生效。**仍缺**：`L`/`W`/`LW`/`#`、年字段、按秒轮询改精确休眠（`next_after` 仍未接线）。**FIXED_RATE 用 `tokio::interval` 但消费首个 tick 后语义正确**；FIXED_DELAY 为「完成后 sleep」——与 Java 一致 |
 | pause / resume / interrupt / getStatus | 同名 | 进行中 | pause/resume/status 可用；**`interrupt()` 只 `notify_waiters()`，不中止 in-flight 执行**（Java 走 `Scheduler.interrupt()` + `InterruptableJob.interrupted` 标志）。`get_status` 返回自定义 3 值 `TaskStatus`，Java 返回 Quartz `TriggerState`（6 值，含 BLOCKED/COMPLETE/ERROR） |
 | SchedulerRegistry | QuartzAgentSchedulerRegistry | 已完成 | `OnceLock<RwLock<HashMap>>`；但登记值为 `scheduler_id` 字符串（`self_handle_hint`），**不持有 scheduler 句柄**，`JobContext::run_task` 仅做一次 `contains` 探测（结果被 `let _` 丢弃）→ 注册表实为「只为测试可见性存在」 |
 | QuartzScheduleAgentTask | 同名 | 进行中 | 包装 JoinHandle + `AtomicBool` 控制位；**`with_factory` 未被 `QuartzAgentScheduler::schedule*` 调用**（见 §6 P0） |
@@ -125,10 +125,13 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
   - `cargo test -p agentscope-extensions-scheduler` → `test result: ok. 37 passed; 0 failed`（lib）+ doc-tests 0 failed。
 - 未删除任何测试或功能；未改动根 `Cargo.toml`、core/harness 及其它 crate。
 
+- **cron 语义对齐（2026-10-26，代码已落盘、子智能体未跑 cargo）**：4 项 P1 语义分叉修复（星期基准 1-7、dom/dow 冲突报错、非法 cron 快速失败且无副作用、`zone_id` 生效）。新增文件 `src/common/config/zone.rs`；新增 `job::CronPlan` / `quartz::resolve_cron`；`cron::CronExpression::matches`/`next_after` 泛型到任意 `TimeZone`。测试名单与「改前如何失败」见 §6.1。注意：**行为变更** —— `0 0 9 * * MON-FRI` 这类两侧都指定的 6 字段表达式现在会报错（必须写 `0 0 9 ? * MON-FRI`），调用方与示例需同步。
+
 ### 4.2 下一步与阻塞
 1. ~~无阻塞~~ → **有阻塞（P0，2026-10-22 静态复核发现）**：`QuartzAgentScheduler::schedule*` 构造 `QuartzScheduleAgentTask` 后**未调用 `with_factory(self.factory)`**，任务内部残留 `NoopFactory`，任何定时/手动执行都会返回 `Err("No agent factory attached to this scheduled task")`。crate 的 6 个 quartz 测试全部只测「登记/查询/暂停/取消」，从未断言执行成功，故 37 passed 无法暴露此缺陷。另 `QuartzAgentScheduler.factory` 字段在全 crate **只写不读**（dead field，编译器未报警因被 `new` 赋值）。
 2. 建议后续：cron `next_after` 当前按秒扫描（上限 4 年 × 每分钟），若后续追求性能可优化为字段跳跃；非阻塞。另 `next_after` 在生产代码中**零调用**（仅测试用），实际触发走 `matches(Utc::now())` 秒级轮询。
 3. 未使用依赖：`futures`、`agentscope-harness`（引用数均为 0）建议裁剪；`next_seq: AtomicU64`、`interrupt_notify()`、`AsAny` trait、`TaskControl` trait 亦为未被使用的脚手架。
+4. cron 剩余增强（本轮明确不做）：`L`/`W`/`LW`/`#`、7 字段年、按秒轮询改精确休眠（`next_after` 仍未接线）、`interrupt()` 中止 in-flight、`get_status` 六值、xxl-job 回调协议、DST 时区（需 `chrono-tz`）。详见 §6 / §6.1。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-scheduler` 基线。
@@ -151,16 +154,35 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | `LW` | ✅ | ❌ | **P1** |
 | `#`（第 n 个星期几，如 `6#3`） | ✅ | ❌ 解析失败 | **P1** |
 | `?` 仅在 dom/dow 合法 | ✅ 严格（其他字段用 `?` → `ParseException("'?' can only be specified for Day-of-Month or Day-of-Week.")`） | ⚠️ 任意字段当 `*` 接受 | 宽松，低风险 |
-| dom/dow 同时被指定时的行为 | ❌ **直接拒绝**：`ParseException("Support for specifying both a day-of-week AND a day-of-month parameter is not implemented.")`（Quartz 2.3.2 `CronExpression.buildExpression`；判定条件是「dom 与 dow 均非 `?`」，与是否写成 `*` 无关） | ✅ 采用 **OR** 语义（`cron.rs:102-107`，`(false,false) => dom_ok \|\| dow_ok`） | **P1（第二轮修正）**：原表误判为「对齐」。实为**语义分叉**：Java 侧这类表达式 `schedule()` 抛 `RuntimeException`（`SchedulerException` 包装）；Rust 侧照常登记并按 OR 触发 → 同一表达式两侧行为不同（Java=失败，Rust=触发）。**注意 `0 0 9 * * MON-FRI` 在 Java 也会被拒**（dom=`*` 且 dow=具体），必须写 `0 0 9 ? * MON-FRI` |
+| dom/dow 同时被指定时的行为 | ❌ **直接拒绝**：`ParseException("Support for specifying both a day-of-week AND a day-of-month parameter is not implemented.")`（Quartz 2.3.2 `CronExpression.buildExpression`；判定条件是「dom 与 dow 均非 `?`」，与是否写成 `*` 无关） | ✅ **已修复（2026-10-26，§6.1）**：`resolve_day_selector` 在解析期直接返回 `CronParseError`；6 字段要求 dom/dow **恰有一个** `?`（`*` 也算「已指定」），5 字段扩展仅在两侧都是具体值时拒绝 | **P1 → 已修复**：`schedule_runtime` 在登记前报 `Err`，与 Java 「快速失败且不登记」一致。历史：原为 OR 语义（`(false,false) => dom_ok \|\| dow_ok`）→ 同一表达式 Java=失败 / Rust=触发 |
 | `a/step`（裸起点+步长） | ✅ 展开到字段上限（Quartz `addToSet(val, end=-1, incr)` → `stopAt=59`；**`0/1` 亦展开为 0..59**） | ⚠️ **step>1 正确，step==1 退化为单值**（`cron.rs:167-171` `if step > 1 {(v,max)} else {(v,v)}`） | **P1**：`0/1`（每分钟）只匹配第 0 分钟 |
 | `*/step` | ✅ | ✅ | — |
 | `a-b/step` | ✅ | ✅ | — |
 | 逗号枚举 `a,b,c` | ✅ | ✅ | — |
-| 月份/星期名称 `JAN-DEC`/`SUN-SAT` | ✅（大小写不敏感，`dayMap`/`monthMap`） | ✅（`to_ascii_uppercase`；`cron.rs:212-220` 名称→值，`min==1` 判月否则判星期 → SUN=0…SAT=6） | **对齐**（名称路径无错位） |
-| 星期 **数字** `1-7` = SUN-SAT（Quartz 约定） | ✅ `dayMap`: SUN=1, MON=2, TUE=3, WED=4, THU=5, FRI=6, SAT=7 | ⚠️ 数字按 cron 惯例 `0-7`（`cron.rs:79` `parse_field(dow, 0, 7, ...)`；`cron.rs:99-100` `num_days_from_sunday()` + `dow==0 && matches(7)`） | **P1**：`0 0 9 ? * 1` 在 Quartz 是**周日**，Rust 是**周一** → **静默错位一天**。逐值对照：Quartz `1`=SUN ↔ Rust `1`=MON；Quartz `7`=SAT ↔ Rust `7`=**SUN**（回绕）。另：Rust 额外接受数字 `0`（=SUN），而 Quartz `addToSet` 对 `val==0` 直接抛 `ParseException("Day-of-Week values must be between 1 and 7")` |
-| 时区 `zoneId` | ✅ `csb.inTimeZone(TimeZone.getTimeZone(zoneId))` | ❌ 恒用 `Utc::now()` | **P1**：`Asia/Shanghai` 的 `0 0 8 * * ?` 在 Rust 是北京时间 16:00 |
+| 月份/星期名称 `JAN-DEC`/`SUN-SAT` | ✅（大小写不敏感，`dayMap`/`monthMap`） | ✅（`to_ascii_uppercase`；名称→值 `min==1 ? idx+1 : idx` → 月 `JAN=1`、星期 `SUN=1…SAT=7`） | **对齐**（名称路径与数字路径共用同一套 1 基编号） |
+| 星期 **数字** `1-7` = SUN-SAT（Quartz 约定） | ✅ `dayMap`: SUN=1, MON=2, TUE=3, WED=4, THU=5, FRI=6, SAT=7 | ✅ **已修复（2026-10-26，§6.1）**：`parse_field(dow, 1, 7, &DOW_NAMES)`；`matches` 用 `weekday().num_days_from_sunday() + 1`，已删除 `dow==0 && matches(7)` 回绕分支 | **P1 → 已修复**：`0` 现报 `value 0 out of range [1,7]`（对应 Quartz `Day-of-Week values must be between 1 and 7`）。历史：原按 `0-7`（`1`=MON、`7`=SUN）静默错位一天 |
+| 时区 `zoneId` | ✅ `csb.inTimeZone(TimeZone.getTimeZone(zoneId))` | ✅ **已修复（2026-10-26，§6.1）**：`ScheduleConfig::zone_offset()` → `chrono::FixedOffset`；`job::CronPlan::matches_at` 用 `now.with_timezone(&offset)` 求值 | **P1 → 已修复**：`Asia/Shanghai` 的 `0 0 8 * * ?` 现在真的在北京时间 08:00 触发。限制：无 `chrono-tz`，DST 区（`Europe/London` 等）报明确错误（Java 静默降级 GMT，Rust 故意快速失败） |
 | 触发精度 | 毫秒级、由 Quartz 计算下次触发时刻 | ⚠️ 1 秒轮询 `matches(Utc::now())` | **P1**：若某次轮询落在秒边界抖动或执行耗时跨秒，会**漏掉整分钟**（`next_after` 未被使用，无法补偿） |
-| 表达式非法时的行为 | `CronScheduleBuilder.cronSchedule()` 捕获 `ParseException` → 抛 **未受检** `RuntimeException("CronExpression '…' is invalid.", e)`；该异常**不被** `schedule()` 的 `catch (SchedulerException e)` 捕获 → 直接逸出 `schedule()`，且 `tasks.put(jobName, task)`（Java `:307`）**永不执行 → 任务未登记** | ⚠️ 仅 `tracing::error!`，任务**已登记**（`mod.rs:117`）但**永不触发**（静默失败） | **P1**：Java=快速失败且无副作用；Rust=登记成功但静默不触发（更难排查） |
+| 表达式非法时的行为 | `CronScheduleBuilder.cronSchedule()` 捕获 `ParseException` → 抛 **未受检** `RuntimeException("CronExpression '…' is invalid.", e)`；该异常**不被** `schedule()` 的 `catch (SchedulerException e)` 捕获 → 直接逸出 `schedule()`，且 `tasks.put(jobName, task)`（Java `:307`）**永不执行 → 任务未登记** | ✅ **已修复（2026-10-26，§6.1）**：`QuartzAgentScheduler::schedule_runtime` 在 `jobs.insert` **之前**调 `resolve_cron()`（解析表达式 + 解析时区），失败返回 `SchedulerError("CronExpression '…' is invalid: …")`；`spawn_job` 改收 `Option<CronPlan>`，循环内不再有解析/静默分支 | **P1 → 已修复**：Java=快速失败且无副作用，Rust 现同。历史：原仅 `tracing::error!` 且任务已登记、永不触发 |
+
+## 6.1 本轮 cron 语义对齐（2026-10-26）
+
+> 范围：仅改 `crates/agentscope-extensions-scheduler/**`（含本 crate `Cargo.toml` 未动），未触碰 core/harness/根 `Cargo.toml`。子智能体按约定**未执行 cargo**，编译/测试由主智能体统一验证。
+
+| # | 缺陷（改前行为） | 修复 | 新增 / 更正测试 |
+|---|---|---|---|
+| 1 | 星期数字按 `0-7`（`1`=MON、`7`=SUN），`0` 静默当作周日 → 与 Quartz **静默错位一天** | `parse_field(dow, 1, 7, &DOW_NAMES)`；`matches` 改为 `weekday().num_days_from_sunday() + 1`；删除 `dow==0 && matches(7)` 回绕 | 新增 `quartz::cron::tests::weekday_numbers_follow_quartz`、`weekday_names_follow_quartz`、`rejects_zero_based_weekday_numbers`；更正 `parses_six_field_quartz` / `weekday_range` / `named_months` 为 `?` 写法 |
+| 2 | dom+dow 同时指定时按 **OR** 触发（Java 直接 `ParseException`） | 新增 `DaySelector {Any, DayOfMonth, DayOfWeek}` + `resolve_day_selector`：6 字段要求 dom/dow **恰有一个 `?`**（`*` 视为已指定，同 Quartz，故 `0 0 9 * * MON-FRI` 被拒）；5 字段扩展仅在两侧都具体时报错 | 新增 `quartz::cron::tests::rejects_both_day_of_month_and_day_of_week` |
+| 3 | 非法 cron 仅 `tracing::error!`，任务**已登记但永不触发** | `schedule_runtime` 在 `jobs.insert` 之前调 `resolve_cron()`；`spawn_job(ctx, task, schedule_config, Option<CronPlan>)`；job 循环不再解析 | 新增 `quartz::tests::invalid_cron_fails_without_registering_task`（同时断言 `is_err()`、`get_scheduled_agent` 为 `None`、`all_schedule_agent_tasks()` 为空） |
+| 4 | `zone_id` 纯死字段，一律 `Utc::now()` | 新增 `common/config/zone.rs`（`resolve_zone` / `ScheduleZoneError`）+ `ScheduleConfig::zone_offset()`；`job::CronPlan::matches_at(now) = expression.matches(now.with_timezone(&offset))`；`CronExpression::matches`/`next_after` 泛型化到任意 `TimeZone` | 新增 `common::config::zone::tests::{absent_zone_defaults_to_utc, resolves_utc_aliases, resolves_iana_aliases_and_fixed_offsets, rejects_unknown_and_dst_zones}`、`schedule::tests::zone_offset_defaults_to_utc_and_rejects_unknown`、`quartz::job::tests::{cron_matches_in_configured_zone, cron_matches_in_utc_by_default, negative_offset_shifts_weekday_boundary}`、`quartz::tests::{invalid_zone_id_fails_without_registering_task, cron_with_zone_id_is_scheduled}` |
+
+**改前为何失败（反向验证口径）**：
+- ① `weekday_numbers_follow_quartz`：`0 0 9 ? * 1` 旧实现匹配周一而非周日；`rejects_zero_based_weekday_numbers` 旧实现 `is_err()` 为 false。
+- ② `rejects_both_day_of_month_and_day_of_week`：旧实现能解析成功，`unwrap_err()` 直接 panic。
+- ③ `invalid_cron_fails_without_registering_task`：旧实现 `schedule_runtime` 返回 `Ok` 且 `get_scheduled_agent("A")` 为 `Some`。
+- ④ `cron_matches_in_configured_zone` / `negative_offset_shifts_weekday_boundary`：旧实现恒按 UTC 求值，+08:00 的 00:00Z 不命中、08:00Z 反而命中。
+
+**未做（仍为待办，未改动）**：`L`/`W`/`LW`/`#`、7 字段年、按秒轮询改精确休眠（`next_after` 仍零调用）、`interrupt()` 中止 in-flight、`get_status` 六值、xxl-job 回调协议；时区未引入 `chrono-tz`（DST 区需显式传偏移）。
 
 ## 静态复核记录（2026-10-22）
 

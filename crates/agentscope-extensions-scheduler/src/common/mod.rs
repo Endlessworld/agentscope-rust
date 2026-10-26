@@ -10,7 +10,7 @@ pub mod scheduler;
 pub use config::{
     AgentConfig, AgentConfigBuilder, AgentConfigError, ModelConfig, RuntimeAgentConfig,
     RuntimeAgentConfigBuilder, ScheduleConfig, ScheduleConfigBuilder, ScheduleConfigError,
-    ScheduleMode, StaticModelConfig,
+    ScheduleMode, ScheduleZoneError, StaticModelConfig,
 };
 pub use scheduler::{
     AgentFactory, AgentScheduler, BaseScheduleAgentTask, ScheduleAgentTask, SchedulerError,
