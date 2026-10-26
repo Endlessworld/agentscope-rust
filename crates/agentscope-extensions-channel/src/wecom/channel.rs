@@ -39,7 +39,7 @@ use super::properties::WeComChannelProperties;
 use super::token::WeComAccessTokenProvider;
 use crate::common::{
     to_core_error, xml_element_text, AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelRegistry,
-    HttpTransport, IdempotencyStore, Result,
+    ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
 };
 
 /// Typed registry of `WeComChannel` handles, keyed by `channel_id`.
@@ -77,11 +77,11 @@ impl WeComChannel {
         crypto: WeComCrypto,
         outbound: WeComOutboundClient,
         mapper: WeComInboundMapper,
-        idempotency: IdempotencyStore,
+        deduplicator: Arc<dyn InboundEventDeduplicator>,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
         Self {
-            core: ChannelCore::with_components(channel_id, config, idempotency, bot_loop_guard),
+            core: ChannelCore::with_components(channel_id, config, deduplicator, bot_loop_guard),
             properties,
             crypto,
             outbound,
@@ -89,12 +89,25 @@ impl WeComChannel {
         }
     }
 
-    /// Build from the channel property map, mirroring the Java `fromProperties` factory.
+    /// Build from the channel property map, mirroring the Java `fromProperties` factory. Uses the
+    /// process-local de-duplicator and token cache.
     pub fn from_json(
         channel_id: &str,
         routing: ChannelConfig,
         props: &Value,
         transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self> {
+        Self::from_json_with(channel_id, routing, props, transport, &ChannelSeams::new())
+    }
+
+    /// [`WeComChannel::from_json`] with injectable shared-storage seams (Java's
+    /// `fromProperties(..., InboundEventDeduplicator[, AccessTokenStore])` overloads).
+    pub fn from_json_with(
+        channel_id: &str,
+        routing: ChannelConfig,
+        props: &Value,
+        transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
     ) -> Result<Self> {
         let properties = WeComChannelProperties::from_json(channel_id, props)?;
         let crypto = WeComCrypto::new(
@@ -103,11 +116,12 @@ impl WeComChannel {
             properties.corp_id.clone(),
         )?;
         let token_provider: Arc<dyn AccessTokenProvider> =
-            Arc::new(WeComAccessTokenProvider::new(
+            Arc::new(WeComAccessTokenProvider::with_store(
                 properties.api_base.clone(),
                 properties.corp_id.clone(),
                 properties.secret.clone(),
                 transport.clone(),
+                seams.token_store(),
             ));
         let outbound = WeComOutboundClient::new(
             properties.api_base.clone(),
@@ -123,7 +137,7 @@ impl WeComChannel {
             crypto,
             outbound,
             mapper,
-            IdempotencyStore::with_defaults(),
+            seams.deduplicator(),
             BotLoopGuard::with_defaults(),
         ))
     }
@@ -256,7 +270,7 @@ mod tests {
     use agentscope_harness::agent::gateway::channel::Channel as _;
 
     use crate::common::testing::{RecordingTransport, StaticTokenProvider};
-    use crate::common::ChannelError;
+    use crate::common::{ChannelError, IdempotencyStore};
 
     const CORP: &str = "corp-1";
     const TOKEN: &str = "wecom-token";
@@ -296,7 +310,7 @@ mod tests {
                 Arc::new(RecordingTransport::new()),
             ),
             WeComInboundMapper::new(channel_id, Some(CORP.to_string())),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
     }

@@ -11,6 +11,27 @@ use std::sync::Mutex;
 use super::error::{ChannelError, Result};
 use super::token::now_ms;
 
+/// Deduplicates inbound platform events across redeliveries.
+///
+/// Rust port of `io.agentscope.extensions.channel.common.InboundEventDeduplicator`: delivery
+/// platforms (WeCom, DingTalk, GitHub, GitLab, ...) redeliver the same event when no timely
+/// acknowledgement is received, and each redelivery must execute at most once. Keys are opaque and
+/// caller-composed (typically `channelId + "|" + platformEventId`); implementations backed by
+/// shared storage should namespace them per deployment, because platform event ids are only unique
+/// within one channel deployment. Implementations must be thread-safe.
+pub trait InboundEventDeduplicator: Send + Sync {
+    /// Record `key` and report whether this is its first observation inside the implementation's
+    /// retention horizon (`true` = the caller should proceed, `false` = redelivery, drop it). A
+    /// `null`/empty key is always first-seen.
+    fn first_seen(&self, key: &str) -> bool;
+}
+
+impl InboundEventDeduplicator for IdempotencyStore {
+    fn first_seen(&self, key: &str) -> bool {
+        IdempotencyStore::first_seen(self, key)
+    }
+}
+
 /// Default TTL: 5 minutes — sufficient for any single channel's retry burst.
 pub const DEFAULT_TTL_MS: i64 = 5 * 60_000;
 /// Default capacity: 10k entries.
@@ -84,6 +105,10 @@ impl IdempotencyStore {
     }
 
     /// [`IdempotencyStore::first_seen`] with an injected clock (offline tests).
+    ///
+    /// An accepted sighting restarts the key's retention window (Java
+    /// `seen.replace(key, prior, now)`), so only the first redelivery after the TTL lapses
+    /// proceeds and the rest are still dropped.
     pub fn first_seen_at(&self, key: &str, now_ms: i64) -> bool {
         // Java returns `true` for null keys; an empty key carries no identity, so treat it the
         // same way and never let it consume capacity.
@@ -93,8 +118,12 @@ impl IdempotencyStore {
         let mut inner = self.inner.lock().expect("idempotency store mutex poisoned");
         inner.sweep(now_ms, self.ttl_ms, self.max_entries);
 
-        if let Some(existing) = inner.entries.get(key) {
-            return now_ms - existing.seen_at_ms > self.ttl_ms;
+        if let Some(existing) = inner.entries.get_mut(key) {
+            if now_ms - existing.seen_at_ms > self.ttl_ms {
+                existing.seen_at_ms = now_ms;
+                return true;
+            }
+            return false;
         }
         let seq = inner.next_seq;
         inner.next_seq += 1;
@@ -171,6 +200,19 @@ mod tests {
         assert!(!store.first_seen_at("msg-1", 1_000));
         // Strictly greater than the TTL -> the prior sighting is expired.
         assert!(store.first_seen_at("msg-1", 1_001));
+    }
+
+    #[test]
+    fn an_expired_sighting_restarts_the_retention_window() {
+        let store = IdempotencyStore::new(1_000, 100).unwrap();
+        assert!(store.first_seen_at("msg-1", 0));
+        // TTL lapsed: this redelivery is accepted and restarts the window.
+        assert!(store.first_seen_at("msg-1", 1_001));
+        // The next redelivery inside the restarted window is dropped (Java `replace` CAS).
+        assert!(!store.first_seen_at("msg-1", 1_002));
+        // ... and so is one that would have been accepted under the old stamp.
+        assert!(!store.first_seen_at("msg-1", 1_900));
+        assert!(store.first_seen_at("msg-1", 2_002));
     }
 
     #[test]

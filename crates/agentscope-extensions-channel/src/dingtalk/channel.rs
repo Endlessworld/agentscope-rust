@@ -32,7 +32,7 @@ use super::stream::{
 use super::token::DingTalkAccessTokenProvider;
 use crate::common::{
     to_core_error, AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelError, ChannelRegistry,
-    HttpTransport, IdempotencyStore, Result,
+    ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
 };
 
 /// Typed registry of `DingTalkChannel` handles, keyed by `channel_id`.
@@ -61,11 +61,11 @@ impl DingTalkChannel {
         properties: DingTalkChannelProperties,
         outbound: DingTalkOutboundClient,
         mapper: DingTalkInboundMapper,
-        idempotency: IdempotencyStore,
+        deduplicator: Arc<dyn InboundEventDeduplicator>,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
         Self {
-            core: ChannelCore::with_components(channel_id, config, idempotency, bot_loop_guard),
+            core: ChannelCore::with_components(channel_id, config, deduplicator, bot_loop_guard),
             properties,
             outbound,
             mapper,
@@ -94,12 +94,25 @@ impl DingTalkChannel {
     }
 
     /// Build from the channel property map, mirroring the Java `fromProperties` factory:
-    /// crypto (http only) -> token provider -> outbound client -> inbound mapper.
+    /// crypto (http only) -> token provider -> outbound client -> inbound mapper. Uses the
+    /// process-local de-duplicator and token cache.
     pub fn from_json(
         channel_id: &str,
         routing: ChannelConfig,
         props: &Value,
         transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self> {
+        Self::from_json_with(channel_id, routing, props, transport, &ChannelSeams::new())
+    }
+
+    /// [`DingTalkChannel::from_json`] with injectable shared-storage seams (Java's
+    /// `fromProperties(..., InboundEventDeduplicator[, AccessTokenStore])` overloads).
+    pub fn from_json_with(
+        channel_id: &str,
+        routing: ChannelConfig,
+        props: &Value,
+        transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
     ) -> Result<Self> {
         let properties = DingTalkChannelProperties::from_json(props)?;
         // Java builds `DingTalkCallbackCrypto(appSecret, aesKey)` only for http mode.
@@ -115,11 +128,12 @@ impl DingTalkChannel {
             None
         };
         let token_provider: Arc<dyn AccessTokenProvider> =
-            Arc::new(DingTalkAccessTokenProvider::new(
+            Arc::new(DingTalkAccessTokenProvider::with_store(
                 properties.api_base.clone(),
                 properties.app_key.clone(),
                 properties.app_secret.clone(),
                 transport.clone(),
+                seams.token_store(),
             ));
         let outbound = DingTalkOutboundClient::new(
             properties.api_base.clone(),
@@ -134,7 +148,7 @@ impl DingTalkChannel {
             properties,
             outbound,
             mapper,
-            IdempotencyStore::with_defaults(),
+            seams.deduplicator(),
             BotLoopGuard::with_defaults(),
         )
         .with_security(crypto, transport, Arc::new(TungsteniteConnector)))
@@ -291,7 +305,7 @@ mod tests {
     use agentscope_harness::agent::gateway::channel::Channel as _;
 
     use crate::common::testing::{RecordingTransport, StaticTokenProvider};
-    use crate::common::PreparedResponse;
+    use crate::common::{IdempotencyStore, PreparedResponse};
     use crate::dingtalk::stream::StreamSocket;
 
     const API_BASE: &str = "https://api.dingtalk.com";
@@ -311,7 +325,7 @@ mod tests {
                 Arc::new(RecordingTransport::new()),
             ),
             DingTalkInboundMapper::new("dingtalk", Some("key-1".to_string())),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
     }
@@ -334,7 +348,7 @@ mod tests {
                 Arc::new(RecordingTransport::new()),
             ),
             DingTalkInboundMapper::new("dingtalk", Some("key-1".to_string())),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
         .with_security(None, transport, connector)

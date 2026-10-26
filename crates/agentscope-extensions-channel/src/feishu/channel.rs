@@ -30,8 +30,8 @@ use super::outbound::FeishuOutboundClient;
 use super::properties::FeishuChannelProperties;
 use super::token::FeishuAccessTokenProvider;
 use crate::common::{
-    to_core_error, AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelRegistry,
-    HttpTransport, IdempotencyStore, Result,
+    constant_time_eq, to_core_error, AccessTokenProvider, BotLoopGuard, ChannelCore,
+    ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
 };
 
 /// Typed registry of `FeishuChannel` handles, keyed by `channel_id`.
@@ -69,11 +69,11 @@ impl FeishuChannel {
         crypto: Option<FeishuCrypto>,
         outbound: FeishuOutboundClient,
         mapper: FeishuInboundMapper,
-        idempotency: IdempotencyStore,
+        deduplicator: Arc<dyn InboundEventDeduplicator>,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
         Self {
-            core: ChannelCore::with_components(channel_id, config, idempotency, bot_loop_guard),
+            core: ChannelCore::with_components(channel_id, config, deduplicator, bot_loop_guard),
             properties,
             crypto,
             outbound,
@@ -81,12 +81,32 @@ impl FeishuChannel {
         }
     }
 
-    /// Build from the channel property map, mirroring the Java `fromProperties` factory.
+    /// Build from the channel property map, mirroring the Java `fromProperties` factory:
+    /// crypto -> token provider -> outbound client -> inbound mapper. Uses the process-local
+    /// de-duplicator and token cache.
     pub fn from_json(
         channel_id: &str,
         routing: ChannelConfig,
         properties: &Value,
         transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self> {
+        Self::from_json_with(
+            channel_id,
+            routing,
+            properties,
+            transport,
+            &ChannelSeams::new(),
+        )
+    }
+
+    /// [`FeishuChannel::from_json`] with injectable shared-storage seams (Java's
+    /// `fromProperties(..., InboundEventDeduplicator[, AccessTokenStore])` overloads).
+    pub fn from_json_with(
+        channel_id: &str,
+        routing: ChannelConfig,
+        properties: &Value,
+        transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
     ) -> Result<Self> {
         let props = FeishuChannelProperties::from_json(channel_id, properties)?;
         let crypto = if props.is_encrypted() {
@@ -97,11 +117,12 @@ impl FeishuChannel {
             None
         };
         let token_provider: Arc<dyn AccessTokenProvider> = Arc::new(
-            FeishuAccessTokenProvider::new(
+            FeishuAccessTokenProvider::with_store(
                 props.api_base.clone(),
                 props.app_id.clone(),
                 props.app_secret.clone(),
                 transport.clone(),
+                seams.token_store(),
             ),
         );
         let outbound = FeishuOutboundClient::new(props.api_base.clone(), token_provider, transport);
@@ -112,7 +133,7 @@ impl FeishuChannel {
             crypto,
             outbound,
             FeishuInboundMapper::new(channel_id),
-            IdempotencyStore::with_defaults(),
+            seams.deduplicator(),
             BotLoopGuard::with_defaults(),
         ))
     }
@@ -135,7 +156,7 @@ impl FeishuChannel {
     }
 
     /// Full callback pipeline, in the Java order: signature check -> decrypt -> URL handshake ->
-    /// mapping -> de-duplication -> bot-loop guard -> dispatch.
+    /// event-token authentication -> mapping -> de-duplication -> bot-loop guard -> dispatch.
     pub async fn handle_callback(
         &self,
         signature: Option<&str>,
@@ -190,18 +211,35 @@ impl FeishuChannel {
             return FeishuCallbackOutcome::Challenge(challenge);
         }
 
-        // 4. Map to an `InboundMessage`; non-text / malformed events are acknowledged silently.
+        // 4. Event authenticity: normal events carry the configured `verificationToken` in the
+        //    envelope header. A missing configuration also rejects — an unauthenticated event
+        //    cannot be attributed to a sender (mirrors the Java controller's constant-time check).
+        let configured_token = self
+            .properties
+            .verification_token
+            .as_deref()
+            .unwrap_or("")
+            .trim();
+        let event_token = envelope
+            .pointer("/header/token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if configured_token.is_empty() || !constant_time_eq(configured_token, event_token) {
+            return FeishuCallbackOutcome::Unauthorized;
+        }
+
+        // 5. Map to an `InboundMessage`; non-text / malformed events are acknowledged silently.
         let Some(inbound) = self.mapper.map(&envelope) else {
             return FeishuCallbackOutcome::Accepted;
         };
 
-        // 5. De-duplication by `event_id`, then the per-peer bot-loop guard.
+        // 6. De-duplication by `event_id`, then the per-peer bot-loop guard.
         let event_id = FeishuInboundMapper::extract_event_id(&envelope);
         if !self.core.admit(event_id.as_deref(), &inbound.peer.key()) {
             return FeishuCallbackOutcome::Accepted;
         }
 
-        // 6. Dispatch; the channel delivers the reply through its own transport. Failures are
+        // 7. Dispatch; the channel delivers the reply through its own transport. Failures are
         //    swallowed so the provider stops retrying (Java logs and still answers 200).
         let _ = PlatformChannel::dispatch(self, inbound).await;
         FeishuCallbackOutcome::Accepted
@@ -227,7 +265,7 @@ mod tests {
     use super::*;
     use agentscope_harness::agent::gateway::channel::Channel as _;
     use crate::common::testing::{RecordingTransport, StaticTokenProvider};
-    use crate::common::ChannelError;
+    use crate::common::{ChannelError, IdempotencyStore};
 
     const API_BASE: &str = "https://open.feishu.cn";
 
@@ -242,13 +280,16 @@ mod tests {
             crypto,
             FeishuOutboundClient::new(API_BASE, token, Arc::new(RecordingTransport::new())),
             FeishuInboundMapper::new("feishu"),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
     }
 
     fn plain() -> FeishuChannel {
-        build(serde_json::json!({"appId": "cli_x", "appSecret": "s"}), None)
+        build(
+            serde_json::json!({"appId": "cli_x", "appSecret": "s", "verificationToken": "vt"}),
+            None,
+        )
     }
 
     #[test]
@@ -262,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn url_verification_echoes_the_challenge() {
         let c = plain();
-        let body = r#"{"type":"url_verification","challenge":"nonce-1"}"#;
+        let body = r#"{"type":"url_verification","challenge":"nonce-1","token":"vt"}"#;
         assert_eq!(
             c.handle_callback(None, None, None, body).await,
             FeishuCallbackOutcome::Challenge("nonce-1".to_string())
@@ -337,8 +378,7 @@ mod tests {
     #[tokio::test]
     async fn non_text_events_are_acknowledged_without_admission() {
         let c = plain();
-        let body =
-            r#"{"header":{"event_id":"e1"},"event":{"message":{"message_type":"image"}}}"#;
+        let body = r#"{"header":{"event_id":"e1","token":"vt"},"event":{"message":{"message_type":"image"}}}"#;
         assert_eq!(
             c.handle_callback(None, None, None, body).await,
             FeishuCallbackOutcome::Accepted
@@ -347,9 +387,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_events_require_the_configured_header_token() {
+        let c = plain();
+        let event = |token: &str| {
+            format!(
+                r#"{{"header":{{"event_id":"e1","token":"{token}"}},"event":{{"sender":{{"sender_type":"user","sender_id":{{"open_id":"ou_1"}}}},"message":{{"message_id":"om_1","message_type":"text","content":"{{\"text\":\"hi\"}}","chat_id":"oc_1","chat_type":"p2p"}}}}}}"#
+            )
+        };
+        // A missing or mismatched header token is rejected before mapping.
+        assert_eq!(
+            c.handle_callback(None, None, None, &event("wrong")).await,
+            FeishuCallbackOutcome::Unauthorized
+        );
+        assert_eq!(
+            c.handle_callback(None, None, None, r#"{"header":{"event_id":"e1"},"event":{"message":{"message_type":"text"}}}"#)
+                .await,
+            FeishuCallbackOutcome::Unauthorized
+        );
+        assert_eq!(c.core().admitted(), 0);
+        // The configured token is admitted.
+        assert_eq!(
+            c.handle_callback(None, None, None, &event("vt")).await,
+            FeishuCallbackOutcome::Accepted
+        );
+        assert_eq!(c.core().admitted(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_are_rejected_when_no_verification_token_is_configured() {
+        // Java parity: an unconfigured token still rejects ordinary events (401).
+        let c = build(serde_json::json!({"appId": "cli_x", "appSecret": "s"}), None);
+        let body = r#"{"header":{"event_id":"e1"},"event":{"message":{"message_type":"text"}}}"#;
+        assert_eq!(
+            c.handle_callback(None, None, None, body).await,
+            FeishuCallbackOutcome::Unauthorized
+        );
+    }
+
+    #[tokio::test]
     async fn duplicate_event_ids_are_dropped_by_the_idempotency_guard() {
         let c = plain();
-        let body = r#"{"header":{"event_id":"e1"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","message_type":"text","content":"{\"text\":\"hi\"}","chat_id":"oc_1","chat_type":"p2p"}}}"#;
+        let body = r#"{"header":{"event_id":"e1","token":"vt"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","message_type":"text","content":"{\"text\":\"hi\"}","chat_id":"oc_1","chat_type":"p2p"}}}"#;
         // The first sighting is admitted; the duplicate never reaches the guards again.
         assert_eq!(
             c.handle_callback(None, None, None, body).await,

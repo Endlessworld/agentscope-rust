@@ -30,8 +30,8 @@ use super::outbound::GitLabOutboundClient;
 use super::properties::GitLabChannelProperties;
 use super::signature::verify_webhook_token;
 use crate::common::{
-    to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, HttpTransport, IdempotencyStore,
-    Result,
+    to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, ChannelSeams, HttpTransport,
+    InboundEventDeduplicator, Result,
 };
 
 /// The only webhook event this adapter maps (MVP), mirroring the Java controller.
@@ -70,11 +70,11 @@ impl GitLabChannel {
         outbound: GitLabOutboundClient,
         mapper: GitLabInboundMapper,
         bot_identity: Arc<GitLabBotIdentityResolver>,
-        idempotency: IdempotencyStore,
+        deduplicator: Arc<dyn InboundEventDeduplicator>,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
         Self {
-            core: ChannelCore::with_components(channel_id, config, idempotency, bot_loop_guard),
+            core: ChannelCore::with_components(channel_id, config, deduplicator, bot_loop_guard),
             properties,
             outbound,
             mapper,
@@ -82,12 +82,25 @@ impl GitLabChannel {
         }
     }
 
-    /// Build from the channel property map, mirroring the Java `fromProperties` factory.
+    /// Build from the channel property map, mirroring the Java `fromProperties` factory. Uses the
+    /// process-local de-duplicator.
     pub fn from_json(
         channel_id: &str,
         routing: ChannelConfig,
         props: &Value,
         transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self> {
+        Self::from_json_with(channel_id, routing, props, transport, &ChannelSeams::new())
+    }
+
+    /// [`GitLabChannel::from_json`] with an injectable [`InboundEventDeduplicator`] (Java's
+    /// `fromProperties(..., InboundEventDeduplicator)` overload).
+    pub fn from_json_with(
+        channel_id: &str,
+        routing: ChannelConfig,
+        props: &Value,
+        transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
     ) -> Result<Self> {
         let properties = GitLabChannelProperties::from_json(channel_id, props)?;
         let outbound = GitLabOutboundClient::new(
@@ -107,7 +120,7 @@ impl GitLabChannel {
             outbound,
             GitLabInboundMapper::new(channel_id),
             bot_identity,
-            IdempotencyStore::with_defaults(),
+            seams.deduplicator(),
             BotLoopGuard::with_defaults(),
         ))
     }

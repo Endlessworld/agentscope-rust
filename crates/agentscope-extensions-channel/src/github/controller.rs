@@ -103,7 +103,7 @@ mod tests {
                 transport,
             )),
             GitHubSignatureVerifier::new("s").unwrap(),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         );
         let registry = Arc::new(GitHubChannelRegistry::new());

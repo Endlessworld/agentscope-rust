@@ -103,7 +103,7 @@ mod tests {
                 Arc::new(RecordingTransport::new()),
             ),
             FeishuInboundMapper::new("feishu"),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         );
         let registry = Arc::new(FeishuChannelRegistry::new());

@@ -1,4 +1,4 @@
-//! Framework-agnostic channel lookup used by the (not-yet-ported) webhook/callback controllers.
+//! Framework-agnostic channel lookup used by the webhook/callback controllers.
 //!
 //! ## Why this is not a duplicate of the harness
 //!

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::common::{
-    now_ms, refresh_at_ms, AccessTokenProvider, ChannelError, HttpTransport, PreparedRequest,
-    Result, TokenCache,
+    now_ms, refresh_at_ms, AccessTokenProvider, AccessTokenStore, CachedAccessToken, ChannelError,
+    HttpTransport, InMemoryAccessTokenStore, PreparedRequest, Result,
 };
 
 /// Fetches/caches a Feishu tenant access token.
@@ -15,7 +15,7 @@ pub struct FeishuAccessTokenProvider {
     api_base: String,
     app_id: String,
     app_secret: String,
-    cache: TokenCache,
+    store: Arc<dyn AccessTokenStore>,
     transport: Arc<dyn HttpTransport>,
 }
 
@@ -26,11 +26,30 @@ impl FeishuAccessTokenProvider {
         app_secret: impl Into<String>,
         transport: Arc<dyn HttpTransport>,
     ) -> Self {
+        Self::with_store(
+            api_base,
+            app_id,
+            app_secret,
+            transport,
+            Arc::new(InMemoryAccessTokenStore::new()),
+        )
+    }
+
+    /// Constructor variant that lets the application choose where the token is cached — for
+    /// example a shared-storage [`AccessTokenStore`] so one refresh or invalidation serves all
+    /// instances. Mirrors the Java `FeishuAccessTokenProvider(..., AccessTokenStore)` overload.
+    pub fn with_store(
+        api_base: impl Into<String>,
+        app_id: impl Into<String>,
+        app_secret: impl Into<String>,
+        transport: Arc<dyn HttpTransport>,
+        store: Arc<dyn AccessTokenStore>,
+    ) -> Self {
         Self {
             api_base: api_base.into(),
             app_id: app_id.into(),
             app_secret: app_secret.into(),
-            cache: TokenCache::new(),
+            store,
             transport,
         }
     }
@@ -62,7 +81,10 @@ impl FeishuAccessTokenProvider {
             .unwrap_or("")
             .to_string();
         let expires_in = node.get("expire").and_then(|v| v.as_i64()).unwrap_or(7200);
-        self.cache.store(token.clone(), refresh_at_ms(now_ms(), expires_in));
+        self.store.put_if_newer(CachedAccessToken::new(
+            token.clone(),
+            refresh_at_ms(now_ms(), expires_in),
+        ));
         Ok(token)
     }
 }
@@ -70,22 +92,24 @@ impl FeishuAccessTokenProvider {
 #[async_trait]
 impl AccessTokenProvider for FeishuAccessTokenProvider {
     async fn token(&self) -> Result<String> {
-        if let Some(cached) = self.cache.get(now_ms()) {
-            return Ok(cached);
+        if let Some(cached) = self.store.get() {
+            if cached.refresh_at_ms > now_ms() {
+                return Ok(cached.value);
+            }
         }
         let response = self.transport.execute(self.build_request()).await?;
         self.parse_and_store(&response.body)
     }
 
     fn invalidate(&self) {
-        self.cache.invalidate();
+        self.store.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::testing::{RecordingTransport, StaticTokenProvider};
+    use crate::common::testing::RecordingTransport;
     use crate::common::PreparedResponse;
 
     #[test]
@@ -136,5 +160,34 @@ mod tests {
         p.invalidate();
         assert_eq!(p.token().await.unwrap(), "t-2");
         assert_eq!(transport.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_injected_store_is_shared_across_providers() {
+        let store: Arc<dyn AccessTokenStore> = Arc::new(InMemoryAccessTokenStore::new());
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, r#"{"code":0,"tenant_access_token":"t-1","expire":7200}"#),
+        ]));
+        let a = FeishuAccessTokenProvider::with_store(
+            "https://open.feishu.cn",
+            "cli",
+            "s",
+            transport.clone(),
+            store.clone(),
+        );
+        let b = FeishuAccessTokenProvider::with_store(
+            "https://open.feishu.cn",
+            "cli",
+            "s",
+            transport.clone(),
+            store.clone(),
+        );
+        assert_eq!(a.token().await.unwrap(), "t-1");
+        // The second provider reads the shared slot instead of hitting the network again.
+        assert_eq!(b.token().await.unwrap(), "t-1");
+        assert_eq!(transport.request_count(), 1);
+        // Invalidation through one provider clears the shared slot.
+        b.invalidate();
+        assert!(store.get().is_none());
     }
 }

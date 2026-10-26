@@ -3,11 +3,12 @@
 //! Rust port of `io.agentscope.extensions.channel.feishu`:
 //! - [`FeishuChannelProperties`] — provider configuration
 //! - [`FeishuInboundMapper`] — decrypted Event Subscription v2 envelope → harness `InboundMessage`
+//!   (text + image/file/folder/audio/media)
 //! - [`FeishuOutboundClient`] — `POST /open-apis/im/v1/messages` request builders
 //! - [`FeishuAccessTokenProvider`] — cached `tenant_access_token` fetcher
-//!
-//! Not yet ported (see `docs/extensions/CHANNEL__GAP_TRACKER.md` §3): `FeishuCallbackController`
-//! (axum shell over [`FeishuChannel::handle_callback`]).
+//! - [`FeishuCrypto`] — AES-256-CBC payload decryption + `X-Lark-Signature` verification
+//! - [`FeishuChannel`] — lifecycle/routing adapter (`handle_callback` pipeline)
+//! - [`controller::router`] — axum shell over `POST /api/channels/feishu/:channel_id/callback`
 
 pub mod channel;
 pub mod controller;

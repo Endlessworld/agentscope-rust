@@ -54,7 +54,10 @@ use super::listener::{NoopWeixinRuntimeListener, WeixinRuntimeListener};
 use super::outbound::{next_client_id, peer_of, WeixinOutboundClient};
 use super::properties::WeixinChannelProperties;
 use super::state_store::{WeixinInboxClaim, WeixinInboxMessage, WeixinLease, WeixinStateStore};
-use crate::common::{to_core_error as channel_to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, HttpTransport, IdempotencyStore, Result};
+use crate::common::{
+    to_core_error as channel_to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, ChannelSeams,
+    HttpTransport, Result,
+};
 
 /// Channel type name, mirroring `WeixinChannel.TYPE`.
 pub const CHANNEL_TYPE: &str = "weixin";
@@ -180,6 +183,7 @@ impl std::fmt::Debug for WeixinChannel {
 
 impl WeixinChannel {
     /// Assemble a channel from host-supplied seams.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         channel_id: impl Into<String>,
         config: ChannelConfig,
@@ -188,6 +192,7 @@ impl WeixinChannel {
         state_store: Arc<dyn WeixinStateStore>,
         listener: Arc<dyn WeixinRuntimeListener>,
         transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
     ) -> Self {
         let channel_id = channel_id.into();
         let mapper = WeixinInboundMapper::new(
@@ -206,7 +211,7 @@ impl WeixinChannel {
             core: ChannelCore::with_components(
                 channel_id,
                 config,
-                IdempotencyStore::with_defaults(),
+                seams.deduplicator(),
                 BotLoopGuard::with_defaults(),
             ),
             properties,
@@ -232,6 +237,17 @@ impl WeixinChannel {
         props: &Value,
         transport: Arc<dyn HttpTransport>,
     ) -> Result<Self> {
+        Self::from_json_with(channel_id, routing, props, transport, &ChannelSeams::new())
+    }
+
+    /// [`WeixinChannel::from_json`] with injectable shared-storage seams.
+    pub fn from_json_with(
+        channel_id: &str,
+        routing: ChannelConfig,
+        props: &Value,
+        transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
+    ) -> Result<Self> {
         let bot_token = crate::common::props::get_str(props, "botToken").unwrap_or_default();
         if bot_token.trim().is_empty() {
             return Err(crate::common::ChannelError::Config(
@@ -248,6 +264,7 @@ impl WeixinChannel {
             Arc::new(super::state_store::in_memory_store()),
             Arc::new(NoopWeixinRuntimeListener),
             transport,
+            seams,
         ))
     }
 
@@ -905,6 +922,7 @@ mod tests {
             store.clone(),
             Arc::new(RecordingWeixinRuntimeListener::new()),
             transport,
+            &ChannelSeams::new(),
         ));
         (channel, store)
     }
@@ -1175,6 +1193,7 @@ mod tests {
             store.clone(),
             listener.clone(),
             transport,
+            &ChannelSeams::new(),
         ));
         // A gateway whose agent never answers, so the dispatch budget times out.
         channel.init(Arc::new(agentscope_harness::agent::HarnessGateway::create_standalone()));

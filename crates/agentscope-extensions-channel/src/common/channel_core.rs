@@ -16,6 +16,7 @@
 //! `*Channel` classes each hold privately (`IdempotencyStore`, `BotLoopGuard`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::{Error, Result as CoreResult};
@@ -26,7 +27,8 @@ use agentscope_harness::agent::{
 
 use super::bot_loop_guard::BotLoopGuard;
 use super::error::ChannelError;
-use super::idempotency_store::IdempotencyStore;
+use super::idempotency_store::{IdempotencyStore, InboundEventDeduplicator};
+use super::token::{AccessTokenStore, InMemoryAccessTokenStore};
 
 /// Map a platform [`ChannelError`] onto the harness/core error type used by
 /// `Channel::dispatch`. Mirrors the Java behaviour of letting the platform exception propagate
@@ -35,13 +37,58 @@ pub fn to_core_error(err: ChannelError) -> Error {
     Error::Other(err.to_string())
 }
 
+/// Shared-storage seams injected through the channel factories.
+///
+/// Java exposes three-tier `fromProperties(channelId, routing, rawProperties[, deduplicator[,
+/// tokenStore]])` overloads so a multi-instance deployment can share de-duplication state and
+/// token caches (Redis, ...). This is the Rust equivalent: both fields default to the
+/// process-local implementations, so `ChannelSeams::new()` reproduces the config-driven path.
+#[derive(Clone, Default)]
+pub struct ChannelSeams {
+    deduplicator: Option<Arc<dyn InboundEventDeduplicator>>,
+    token_store: Option<Arc<dyn AccessTokenStore>>,
+}
+
+impl ChannelSeams {
+    /// Process-local de-duplication and token caching (the Java default constructors).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install an application-provided [`InboundEventDeduplicator`].
+    pub fn with_deduplicator(mut self, deduplicator: Arc<dyn InboundEventDeduplicator>) -> Self {
+        self.deduplicator = Some(deduplicator);
+        self
+    }
+
+    /// Install an application-provided [`AccessTokenStore`].
+    pub fn with_token_store(mut self, token_store: Arc<dyn AccessTokenStore>) -> Self {
+        self.token_store = Some(token_store);
+        self
+    }
+
+    /// The deduplicator to install, falling back to a process-local [`IdempotencyStore`].
+    pub fn deduplicator(&self) -> Arc<dyn InboundEventDeduplicator> {
+        self.deduplicator
+            .clone()
+            .unwrap_or_else(|| Arc::new(IdempotencyStore::with_defaults()))
+    }
+
+    /// The token store to install, falling back to a process-local [`InMemoryAccessTokenStore`].
+    pub fn token_store(&self) -> Arc<dyn AccessTokenStore> {
+        self.token_store
+            .clone()
+            .unwrap_or_else(|| Arc::new(InMemoryAccessTokenStore::new()))
+    }
+}
+
 /// Shared state + dispatch pipeline for a platform channel adapter.
 ///
 /// Routing/gateway state lives in the harness `PlatformCtx`; this type only adds the per-channel
 /// guards. The counter lets tests assert how many events the guards admitted.
 pub struct ChannelCore {
     ctx: PlatformCtx,
-    idempotency: IdempotencyStore,
+    deduplicator: Arc<dyn InboundEventDeduplicator>,
     bot_loop_guard: BotLoopGuard,
     admitted: AtomicUsize,
 }
@@ -62,21 +109,22 @@ impl ChannelCore {
         Self::with_components(
             channel_id,
             config,
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
     }
 
-    /// Build with explicit idempotency / loop-guard instances (Java tests inject fresh ones).
+    /// Build with explicit de-duplicator / loop-guard instances (Java tests inject fresh ones, and
+    /// multi-instance deployments inject a shared-storage [`InboundEventDeduplicator`]).
     pub fn with_components(
         channel_id: impl Into<String>,
         config: ChannelConfig,
-        idempotency: IdempotencyStore,
+        deduplicator: Arc<dyn InboundEventDeduplicator>,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
         Self {
             ctx: PlatformCtx::new(channel_id, config),
-            idempotency,
+            deduplicator,
             bot_loop_guard,
             admitted: AtomicUsize::new(0),
         }
@@ -132,7 +180,8 @@ impl ChannelCore {
     pub fn is_first_seen(&self, key: Option<&str>) -> bool {
         match key {
             Some(key) if !key.trim().is_empty() => {
-                self.idempotency.first_seen(&format!("{}|{key}", self.ctx.channel_id()))
+                self.deduplicator
+                    .first_seen(&format!("{}|{key}", self.ctx.channel_id()))
             }
             _ => true,
         }
@@ -158,9 +207,9 @@ impl ChannelCore {
         self.bot_loop_guard.allow(peer_key)
     }
 
-    /// Access the idempotency store (already namespaced by `is_first_seen`).
-    pub fn idempotency(&self) -> &IdempotencyStore {
-        &self.idempotency
+    /// Access the de-duplicator (already namespaced by `is_first_seen`).
+    pub fn deduplicator(&self) -> &Arc<dyn InboundEventDeduplicator> {
+        &self.deduplicator
     }
 
     /// Access the bot-loop guard.
@@ -191,6 +240,8 @@ mod tests {
 
     use agentscope_core::message::{Msg, MsgRole};
     use agentscope_harness::agent::{ChannelBinding, Peer};
+
+    use crate::common::token::{AccessTokenStore, CachedAccessToken, InMemoryAccessTokenStore};
 
     fn core() -> ChannelCore {
         ChannelCore::new("feishu", ChannelConfig::of_with_default("feishu", "agent-1"))
@@ -266,7 +317,7 @@ mod tests {
         let c = ChannelCore::with_components(
             "wecom",
             ChannelConfig::of("wecom"),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::new(2, 60_000, 60_000).unwrap(),
         );
         assert!(c.allow_peer("direct:u1"));
@@ -282,7 +333,7 @@ mod tests {
         let c = ChannelCore::with_components(
             "feishu",
             ChannelConfig::of("feishu"),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::new(1, 60_000, 60_000).unwrap(),
         );
         // First event passes both guards.
@@ -292,6 +343,57 @@ mod tests {
         // A fresh event id for the same peer still trips the per-peer budget.
         assert!(!c.admit(Some("evt-2"), "direct:u1"));
         assert_eq!(c.admitted(), 1);
+    }
+
+    #[test]
+    fn an_injected_deduplicator_replaces_the_process_local_store() {
+        /// Rejects every key, so admission must fail even for a first sighting.
+        struct RejectAll;
+        impl InboundEventDeduplicator for RejectAll {
+            fn first_seen(&self, _key: &str) -> bool {
+                false
+            }
+        }
+        let c = ChannelCore::with_components(
+            "github",
+            ChannelConfig::of("github"),
+            Arc::new(RejectAll),
+            BotLoopGuard::with_defaults(),
+        );
+        assert!(!c.is_first_seen(Some("evt-1")));
+        assert!(!c.admit(Some("evt-1"), "thread:o/r#1"));
+        assert_eq!(c.admitted(), 0);
+    }
+
+    #[test]
+    fn seams_default_to_process_local_implementations() {
+        let seams = ChannelSeams::new();
+        // Each call hands out a fresh process-local store; the channel core holds exactly one.
+        let c = ChannelCore::with_components(
+            "feishu",
+            ChannelConfig::of("feishu"),
+            seams.deduplicator(),
+            BotLoopGuard::with_defaults(),
+        );
+        assert!(c.is_first_seen(Some("k")));
+        assert!(!c.is_first_seen(Some("k")));
+        assert!(seams.token_store().get().is_none());
+    }
+
+    #[test]
+    fn seams_forward_injected_implementations() {
+        let dedup = Arc::new(IdempotencyStore::new(1_000, 10).unwrap());
+        let store: Arc<dyn AccessTokenStore> = Arc::new(InMemoryAccessTokenStore::new());
+        let seams = ChannelSeams::new()
+            .with_deduplicator(dedup)
+            .with_token_store(store.clone());
+        assert!(seams.deduplicator().first_seen("k"));
+        assert!(!seams.deduplicator().first_seen("k"));
+        store.put(CachedAccessToken::new("t", 10));
+        assert_eq!(
+            seams.token_store().get().map(|t| t.value),
+            Some("t".to_string())
+        );
     }
 
     #[test]

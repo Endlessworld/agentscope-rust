@@ -147,7 +147,7 @@ mod tests {
                 Arc::new(RecordingTransport::new()),
             ),
             WeComInboundMapper::new("wecom", Some(CORP.to_string())),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
     }

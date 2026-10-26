@@ -7,12 +7,14 @@
 //! *platform-specific adapters* that feed and consume that skeleton:
 //!
 //! - **common** — [`BotLoopGuard`] (per-peer sliding-window throttle), [`IdempotencyStore`]
-//!   (bounded TTL de-duplication), outbound-address parsing, a pluggable
-//!   [`common::HttpTransport`] (real [`common::ReqwestTransport`] + offline test doubles) and
-//!   an [`common::AccessTokenProvider`] cache abstra.
+//!   (bounded TTL de-duplication), the [`InboundEventDeduplicator`] / [`AccessTokenStore`]
+//!   pluggable seams for multi-instance deployments, the inbound media metadata contract
+//!   ([`common::media`]), outbound-address parsing, a pluggable [`common::HttpTransport`] (real
+//!   [`common::ReqwestTransport`] + offline test doubles) and an [`common::AccessTokenProvider`]
+//!   cache abstraction.
 //! - **dingtalk** / **feishu** / **github** / **gitlab** / **wecom** / **weixin** — per-platform
-//!   inbound webhook/event → `InboundMessage` mappers, outbound request builders, provider
-//!   configuration parsing and webhook signature verification.
+//!   inbound webhook/event → `InboundMessage` mappers (text + media), outbound request builders,
+//!   provider configuration parsing and webhook signature verification.
 //!
 //! Design notes:
 //! - Provider DTOs are parsed straight out of [`serde_json::Value`] / raw XML strings so the
@@ -20,8 +22,8 @@
 //!   any test.
 //! - Outbound clients take an [`common::HttpTransport`], which makes request construction and
 //!   response handling fully unit-testable with a recording transport.
-//! - All six platform adapters are ported, including their callback controllers (axum) and the
-//!   AES-CBC payload helpers. Remaining gaps are tracked in
+//! - All six platform adapters are ported, including their stream/long-poll lifecycles, callback
+//!   controllers (axum) and the AES-CBC payload helpers. Remaining gaps are tracked in
 //!   `docs/extensions/CHANNEL__GAP_TRACKER.md` §3.
 
 pub mod common;
@@ -33,8 +35,9 @@ pub mod wecom;
 pub mod weixin;
 
 pub use common::{
-    AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelError, ChannelRegistry, HttpMethod,
-    HttpTransport, IdempotencyStore, PeerTarget, PreparedRequest, PreparedResponse, ReqwestTransport,
-    Result, TokenCache,
+    AccessTokenProvider, AccessTokenStore, BotLoopGuard, CachedAccessToken, ChannelCore,
+    ChannelError, ChannelRegistry, ChannelSeams, HttpMethod, HttpTransport, IdempotencyStore,
+    InMemoryAccessTokenStore, InboundEventDeduplicator, PeerTarget, PreparedRequest,
+    PreparedResponse, ReqwestTransport, Result,
 };
 

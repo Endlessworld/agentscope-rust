@@ -31,8 +31,8 @@ use super::outbound::GitHubOutboundClient;
 use super::properties::GitHubChannelProperties;
 use super::signature::GitHubSignatureVerifier;
 use crate::common::{
-    to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, HttpTransport, IdempotencyStore,
-    Result,
+    to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, ChannelSeams, HttpTransport,
+    InboundEventDeduplicator, Result,
 };
 
 /// Typed registry of `GitHubChannel` handles, keyed by `channel_id`.
@@ -70,11 +70,11 @@ impl GitHubChannel {
         mapper: GitHubInboundMapper,
         bot_identity: Arc<GitHubBotIdentityResolver>,
         verifier: GitHubSignatureVerifier,
-        idempotency: IdempotencyStore,
+        deduplicator: Arc<dyn InboundEventDeduplicator>,
         bot_loop_guard: BotLoopGuard,
     ) -> Self {
         Self {
-            core: ChannelCore::with_components(channel_id, config, idempotency, bot_loop_guard),
+            core: ChannelCore::with_components(channel_id, config, deduplicator, bot_loop_guard),
             properties,
             outbound,
             mapper,
@@ -83,12 +83,25 @@ impl GitHubChannel {
         }
     }
 
-    /// Build from the channel property map, mirroring the Java `fromProperties` factory.
+    /// Build from the channel property map, mirroring the Java `fromProperties` factory. Uses the
+    /// process-local de-duplicator.
     pub fn from_json(
         channel_id: &str,
         routing: ChannelConfig,
         props: &Value,
         transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self> {
+        Self::from_json_with(channel_id, routing, props, transport, &ChannelSeams::new())
+    }
+
+    /// [`GitHubChannel::from_json`] with an injectable [`InboundEventDeduplicator`] (Java's
+    /// `fromProperties(..., InboundEventDeduplicator)` overload).
+    pub fn from_json_with(
+        channel_id: &str,
+        routing: ChannelConfig,
+        props: &Value,
+        transport: Arc<dyn HttpTransport>,
+        seams: &ChannelSeams,
     ) -> Result<Self> {
         let properties = GitHubChannelProperties::from_json(channel_id, props)?;
         let verifier = GitHubSignatureVerifier::new(&properties.webhook_secret)?;
@@ -111,7 +124,7 @@ impl GitHubChannel {
             GitHubInboundMapper::new(channel_id),
             bot_identity,
             verifier,
-            IdempotencyStore::with_defaults(),
+            seams.deduplicator(),
             BotLoopGuard::with_defaults(),
         ))
     }
@@ -204,6 +217,7 @@ mod tests {
     use agentscope_harness::agent::Peer;
 
     use crate::common::testing::RecordingTransport;
+    use crate::common::IdempotencyStore;
     use crate::github::bot_identity::BotIdentity;
 
     const API_BASE: &str = "https://api.github.com";
@@ -247,7 +261,7 @@ mod tests {
             GitHubInboundMapper::new("github"),
             Arc::new(GitHubBotIdentityResolver::new(API_BASE, "t", None, transport)),
             verifier(),
-            IdempotencyStore::with_defaults(),
+            Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
         )
     }

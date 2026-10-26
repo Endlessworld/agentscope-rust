@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::common::{
-    now_ms, refresh_at_ms, AccessTokenProvider, ChannelError, HttpTransport, PreparedRequest,
-    Result, TokenCache,
+    now_ms, refresh_at_ms, AccessTokenProvider, AccessTokenStore, CachedAccessToken, ChannelError,
+    HttpTransport, InMemoryAccessTokenStore, PreparedRequest, Result,
 };
 
 /// Fetches/caches a WeCom access token via `GET /cgi-bin/gettoken`.
@@ -14,7 +14,7 @@ pub struct WeComAccessTokenProvider {
     api_base: String,
     corp_id: String,
     secret: String,
-    cache: TokenCache,
+    store: Arc<dyn AccessTokenStore>,
     transport: Arc<dyn HttpTransport>,
 }
 
@@ -25,11 +25,30 @@ impl WeComAccessTokenProvider {
         secret: impl Into<String>,
         transport: Arc<dyn HttpTransport>,
     ) -> Self {
+        Self::with_store(
+            api_base,
+            corp_id,
+            secret,
+            transport,
+            Arc::new(InMemoryAccessTokenStore::new()),
+        )
+    }
+
+    /// Constructor variant that lets the application choose where the token is cached — for
+    /// example a shared-storage [`AccessTokenStore`]. Mirrors the Java
+    /// `WeComAccessTokenProvider(..., AccessTokenStore)` overload.
+    pub fn with_store(
+        api_base: impl Into<String>,
+        corp_id: impl Into<String>,
+        secret: impl Into<String>,
+        transport: Arc<dyn HttpTransport>,
+        store: Arc<dyn AccessTokenStore>,
+    ) -> Self {
         Self {
             api_base: api_base.into(),
             corp_id: corp_id.into(),
             secret: secret.into(),
-            cache: TokenCache::new(),
+            store,
             transport,
         }
     }
@@ -60,7 +79,10 @@ impl WeComAccessTokenProvider {
             .unwrap_or("")
             .to_string();
         let expires_in = node.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(7200);
-        self.cache.store(token.clone(), refresh_at_ms(now_ms(), expires_in));
+        self.store.put_if_newer(CachedAccessToken::new(
+            token.clone(),
+            refresh_at_ms(now_ms(), expires_in),
+        ));
         Ok(token)
     }
 }
@@ -68,22 +90,24 @@ impl WeComAccessTokenProvider {
 #[async_trait]
 impl AccessTokenProvider for WeComAccessTokenProvider {
     async fn token(&self) -> Result<String> {
-        if let Some(cached) = self.cache.get(now_ms()) {
-            return Ok(cached);
+        if let Some(cached) = self.store.get() {
+            if cached.refresh_at_ms > now_ms() {
+                return Ok(cached.value);
+            }
         }
         let response = self.transport.execute(self.build_request()).await?;
         self.parse_and_store(&response.body)
     }
 
     fn invalidate(&self) {
-        self.cache.invalidate();
+        self.store.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::testing::{RecordingTransport, StaticTokenProvider};
+    use crate::common::testing::RecordingTransport;
     use crate::common::{HttpMethod, PreparedResponse};
 
     #[test]
