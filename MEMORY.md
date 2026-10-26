@@ -250,3 +250,12 @@
 - **ACP session id 曾是 `session-<epoch_millis>`（真 bug，已修）**：session id 就是 journal 键，同毫秒创建两个会话 ⇒ 同一 journal ⇒ 第二个 recorder fence 第一个。并行测试几乎必撞，生产多客户端并发新建会话同样会撞。已改 `session-<uuid v4>`（Java 侧新建会话一律 UUID）。**之前被误判成 flaky 的 `acp_elicitation_test` 就是它**。教训：flaky 先抓失败现场（打印真实错误）再下结论。
 - **trait 方法 async 化是签名破坏性变更**：aistio `observer_passes_through_without_reporter` 未跟上 `on_system_prompt` 改 async，导致 `cargo check --workspace --all-targets` 报 `E0369`/`E0277`。改实现时必须同步 grep 所有调用点（含测试）。
 
+
+- 2026-10-23 CHANNEL 模块 P1/P2 全关闭：新增 `common/media.rs`（ChannelMediaMetadata 移植：9 个稀疏键 + `marker_text` + `sanitize_marker_file_name`（`[]`/Cc/显式 Cf 区间/U+2028-29→空格、折叠 ASCII 空白、截断 80 code point）+ `put_if_present`）；DingTalk(picture/audio/video/file)/Feishu(image/file/folder/audio/media)/WeCom(image/voice/video) mapper 均已映射媒体。
+- CHANNEL seam：`common::InboundEventDeduplicator`（impl for IdempotencyStore）+ `AccessTokenStore`/`CachedAccessToken`/`InMemoryAccessTokenStore`（**旧 `TokenCache` 已删除**，三个 provider 改用 `with_store(...)`）；`common::ChannelSeams{deduplicator,token_store}` 经各平台 `from_json_with(..., &ChannelSeams)` 注入（weixin 走 `create(..., &ChannelSeams)`，多一参）。`ChannelCore::with_components` 现收 `Arc<dyn InboundEventDeduplicator>`。
+- CHANNEL 语义修正：`FeishuChannel::handle_callback` 新增普通事件 `header.token` 恒定时间比对（未配置也 401，Java parity）；`BotLoopGuard` 补 `last_event_ms`/`maybe_sweep`/`evict_idle_peers[_at]`/`tracked_peers`；`IdempotencyStore::first_seen_at` TTL 过期后刷新 `seen_at_ms` 再放行（窗口重启）。基线 channel **385 passed / 0 failed**（266 `#[test]` + 119 `#[tokio::test]`；文件 71、非空 16334 行）。
+- 本机 Java checkout `D:\IdeaProjects\agentscope-java`（main d7091070）的 `agentscope-extensions-channel` **无 weixin 子模块**（只有 common/dingtalk/feishu/github/gitlab/wecom），故 CHANNEL tracker §2.7 的 weixin Java 基线无法在本机复核。
+- 镜像提醒：`Get-Content` 默认按 ANSI 解码会把 UTF-8 中文/破折号显示成 `��`，判断文件真实内容要用 read_file 或 `-Encoding utf8`；否则 edit_file 的 old_string 会不匹配。
+
+- 2026-10-23 CHANNEL tracker 归档整理：`docs/extensions/CHANNEL__GAP_TRACKER.md` 由 495 行精简为 **237 行**（仅「当前基线 + 逐类映射 + 缺口清单 + 设计决定/差异 + 已知限制 + 增量流程 + 验证基线 + 归档指针」）；历史过程记录拆到新建的 `docs/extensions/CHANNEL__MIGRATION_HISTORY.md`（**312 行，冻结**，收录原 §4 项目状态、§6 静态复核快照、§7 G1 修复、§8 G2–G8 修复，章节编号沿用原 §6/§7/§8 以便旧引用可解析）。主 tracker 内引用历史一律写作 `history §7.x / §8.x`。
+- CHANNEL 增量跟踪约定：新 Java 特性在 tracker §3 表尾追加 `G9/G10…`（状态 `待办`），完成后补关闭日期 + `history §…` 引用；过程记录只写归档文件，不写回主 tracker；基线数字在 §1 与 §7 同步。
