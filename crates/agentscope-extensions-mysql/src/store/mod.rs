@@ -19,6 +19,7 @@ use std::sync::Arc;
 use agentscope_harness::filesystem::remote::store::{BaseStore, StoreItem, StoreValue};
 
 use crate::error::{MysqlError, MysqlResult};
+use crate::identifier::validate_identifier;
 
 /// Low-level SQL execution surface used by [`MysqlStore`].
 ///
@@ -126,15 +127,18 @@ impl MysqlStore {
     }
 
     fn select_sql(&self) -> String {
-        self.dialect.render(self.dialect.select_sql(), &self.table_name)
+        self.dialect
+            .render(self.dialect.select_sql(), &self.table_name)
     }
 
     fn upsert_sql(&self) -> String {
-        self.dialect.render(self.dialect.upsert_sql(), &self.table_name)
+        self.dialect
+            .render(self.dialect.upsert_sql(), &self.table_name)
     }
 
     fn insert_sql(&self) -> String {
-        self.dialect.render(self.dialect.insert_sql(), &self.table_name)
+        self.dialect
+            .render(self.dialect.insert_sql(), &self.table_name)
     }
 
     fn cas_update_sql(&self) -> String {
@@ -143,11 +147,13 @@ impl MysqlStore {
     }
 
     fn search_sql(&self) -> String {
-        self.dialect.render(self.dialect.search_sql(), &self.table_name)
+        self.dialect
+            .render(self.dialect.search_sql(), &self.table_name)
     }
 
     fn delete_sql(&self) -> String {
-        self.dialect.render(self.dialect.delete_sql(), &self.table_name)
+        self.dialect
+            .render(self.dialect.delete_sql(), &self.table_name)
     }
 
     fn serialize(value: &StoreValue) -> MysqlResult<String> {
@@ -165,7 +171,10 @@ impl MysqlStore {
 impl BaseStore for MysqlStore {
     fn get(&self, namespace: &[String], key: &str) -> Option<StoreItem> {
         let ns_path = namespace_path(namespace).ok()?;
-        let row = self.backend.select(&self.select_sql(), &ns_path, key).ok()?;
+        let row = self
+            .backend
+            .select(&self.select_sql(), &ns_path, key)
+            .ok()?;
         let (json, version) = row?;
         let value = MysqlStore::deserialize(&json).ok()?;
         Some(StoreItem::new(key, value, version.max(0) as u64))
@@ -200,7 +209,10 @@ impl BaseStore for MysqlStore {
             Ok(p) => p,
             Err(_) => return Vec::new(),
         };
-        let rows = match self.backend.search(&self.search_sql(), &pattern, limit, offset) {
+        let rows = match self
+            .backend
+            .search(&self.search_sql(), &pattern, limit, offset)
+        {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
@@ -222,12 +234,7 @@ impl BaseStore for MysqlStore {
 
 impl MysqlStore {
     /// Result-returning `put`; mirrors `JdbcStore.put`.
-    pub fn try_put(
-        &self,
-        namespace: &[String],
-        key: &str,
-        value: StoreValue,
-    ) -> MysqlResult<()> {
+    pub fn try_put(&self, namespace: &[String], key: &str, value: StoreValue) -> MysqlResult<()> {
         validate_key(key)?;
         let ns_path = namespace_path(namespace)?;
         let json = MysqlStore::serialize(&value)?;
@@ -302,9 +309,15 @@ impl MysqlStoreBuilder {
     }
 
     /// Overrides the table name (default: [`DEFAULT_STORE_TABLE`]).
-    pub fn table_name(mut self, table: impl Into<String>) -> Self {
-        self.table_name = table.into();
-        self
+    ///
+    /// The name is spliced into DDL/DML verbatim (MySQL cannot bind identifiers), so it must
+    /// match `[A-Za-z_][A-Za-z0-9_]*` and fit within 64 characters. Anything else —
+    /// quotes, backticks, `;`, `--`, dots, whitespace — is rejected here rather than
+    /// concatenated into SQL. Mirrors Java `JdbcStore.Builder#tableName`.
+    pub fn table_name(mut self, table: impl Into<String>) -> MysqlResult<Self> {
+        let table: String = table.into();
+        self.table_name = validate_identifier(&table, "Table name")?;
+        Ok(self)
     }
 
     /// When `true`, runs the dialect's `CREATE TABLE IF NOT EXISTS` on construction.
@@ -465,5 +478,48 @@ mod tests {
     fn invalid_empty_key_is_rejected() {
         let s = store();
         assert!(s.try_put(&ns(&["a"]), "", obj()).is_err());
+    }
+
+    // ---- table-name validation (Java `JdbcStore.Builder#tableName`) ---------------
+
+    #[test]
+    fn table_name_rejects_injection_payloads() {
+        for bad in [
+            "agentscope_store; DROP TABLE x",
+            "`agentscope_store`",
+            "agentscope_store--",
+            "agent.scope",
+            "agentscope store",
+            "agentscope_store)",
+        ] {
+            let backend = Arc::new(InMemorySqlBackend::default());
+            let err = MysqlStore::builder(backend)
+                .table_name(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected rejection of {bad:?}"));
+            assert!(
+                matches!(err, MysqlError::InvalidArgument(_)),
+                "unexpected error kind for {bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_name_enforces_length_limit() {
+        let backend = Arc::new(InMemorySqlBackend::default());
+        assert!(MysqlStore::builder(backend)
+            .table_name("a".repeat(65))
+            .is_err());
+    }
+
+    #[test]
+    fn table_name_is_trimmed_and_applied() {
+        let custom = MysqlStore::builder(Arc::new(InMemorySqlBackend::default()))
+            .table_name("  custom_store  ")
+            .expect("valid identifier")
+            .build();
+        assert_eq!(custom.table_name, "custom_store");
+        assert!(custom.upsert_sql().contains("custom_store"));
+        assert!(!custom.upsert_sql().contains(';'));
     }
 }

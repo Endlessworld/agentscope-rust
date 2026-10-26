@@ -9,11 +9,14 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::snapshot::{
     RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshotSpec,
 };
+use async_trait::async_trait;
+
+use crate::error::MysqlResult;
+use crate::identifier::validate_identifier;
 
 /// Default snapshot table name, mirroring `DEFAULT_TABLE`.
 pub const DEFAULT_SNAPSHOT_TABLE: &str = "agentscope_snapshots";
@@ -48,16 +51,24 @@ impl MysqlRemoteSnapshotClient {
     }
 
     /// Creates a client with an explicit table name.
-    pub fn with_table(backend: Arc<dyn SnapshotBackend>, table_name: impl Into<String>) -> Self {
-        let table_name = table_name.into();
-        Self {
+    ///
+    /// The name is spliced into SQL verbatim, so it must match `[A-Za-z_][A-Za-z0-9_]*`
+    /// (max 64 characters). A blank name falls back to [`DEFAULT_SNAPSHOT_TABLE`]; anything
+    /// else invalid is rejected instead of reaching a statement.
+    pub fn with_table(
+        backend: Arc<dyn SnapshotBackend>,
+        table_name: impl Into<String>,
+    ) -> MysqlResult<Self> {
+        let raw: String = table_name.into();
+        let table_name = if raw.trim().is_empty() {
+            DEFAULT_SNAPSHOT_TABLE.to_string()
+        } else {
+            validate_identifier(&raw, "Snapshot table name")?
+        };
+        Ok(Self {
             backend,
-            table_name: if table_name.trim().is_empty() {
-                DEFAULT_SNAPSHOT_TABLE.to_string()
-            } else {
-                table_name
-            },
-        }
+            table_name,
+        })
     }
 
     /// Table name this client writes to.
@@ -107,11 +118,14 @@ impl MysqlSnapshotSpec {
     }
 
     /// Builds a spec over the given blob backend with an explicit table name.
-    pub fn with_table(backend: Arc<dyn SnapshotBackend>, table_name: impl Into<String>) -> Self {
-        let client = Arc::new(MysqlRemoteSnapshotClient::with_table(backend, table_name));
-        Self {
+    pub fn with_table(
+        backend: Arc<dyn SnapshotBackend>,
+        table_name: impl Into<String>,
+    ) -> MysqlResult<Self> {
+        let client = Arc::new(MysqlRemoteSnapshotClient::with_table(backend, table_name)?);
+        Ok(Self {
             inner: RemoteSnapshotSpec::new(client),
-        }
+        })
     }
 
     /// Wraps an existing [`RemoteSnapshotSpec`].
@@ -135,9 +149,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests {
     use super::testing::InMemorySnapshotBackend;
-    use super::{
-        MysqlRemoteSnapshotClient, MysqlSnapshotSpec, DEFAULT_SNAPSHOT_TABLE,
-    };
+    use super::{MysqlRemoteSnapshotClient, MysqlSnapshotSpec, DEFAULT_SNAPSHOT_TABLE};
     use agentscope_harness::agent::sandbox::snapshot::{SandboxSnapshot, SandboxSnapshotSpec};
     use std::sync::Arc;
 
@@ -177,11 +189,33 @@ mod tests {
         let client = MysqlRemoteSnapshotClient::new(backend);
         assert_eq!(client.table_name(), DEFAULT_SNAPSHOT_TABLE);
         let backend = Arc::new(InMemorySnapshotBackend::default());
-        let client = MysqlRemoteSnapshotClient::with_table(backend, "  ");
+        let client = MysqlRemoteSnapshotClient::with_table(backend, "  ")
+            .expect("blank falls back to the default table");
         assert_eq!(client.table_name(), DEFAULT_SNAPSHOT_TABLE);
         let backend = Arc::new(InMemorySnapshotBackend::default());
-        let client = MysqlRemoteSnapshotClient::with_table(backend, "custom_snaps");
+        let client = MysqlRemoteSnapshotClient::with_table(backend, "custom_snaps")
+            .expect("valid identifier");
         assert_eq!(client.table_name(), "custom_snaps");
-        let _ = Arc::new(InMemorySnapshotBackend::default());
+    }
+
+    #[test]
+    fn with_table_rejects_unsafe_identifiers() {
+        for bad in [
+            "agentscope_snapshots; DROP TABLE x",
+            "`agentscope_snapshots`",
+            "snaps--",
+            "agent.snaps",
+            "snaps table",
+        ] {
+            let backend = Arc::new(InMemorySnapshotBackend::default());
+            assert!(
+                MysqlRemoteSnapshotClient::with_table(backend, bad).is_err(),
+                "expected rejection of {bad:?}"
+            );
+        }
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        assert!(MysqlSnapshotSpec::with_table(backend, "bad name").is_err());
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        assert!(MysqlRemoteSnapshotClient::with_table(backend, "a".repeat(65)).is_err());
     }
 }

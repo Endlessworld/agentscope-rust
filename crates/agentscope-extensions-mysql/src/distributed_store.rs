@@ -23,6 +23,7 @@ use agentscope_core::state::AgentStateStore;
 use agentscope_harness::agent::distributed_store::DistributedStore;
 use agentscope_harness::agent::isolation_scope::IsolationScope;
 
+use crate::error::MysqlResult;
 use crate::guard::{LockBackend, MysqlSandboxExecutionGuard};
 use crate::snapshot::{MysqlSnapshotSpec, SnapshotBackend};
 use crate::state::{MysqlAgentStateStore, StateBackend};
@@ -180,54 +181,70 @@ impl MysqlDistributedStoreBuilder {
         self
     }
 
-    /// Builds the bundle.
+    /// Builds the bundle, panicking if construction fails.
+    ///
+    /// Prefer [`MysqlDistributedStoreBuilder::try_build`] when the configuration comes from
+    /// untrusted input: an invalid table name is an error there, not a panic.
     pub fn build(self) -> MysqlDistributedStore {
+        self.try_build()
+            .expect("MysqlDistributedStore construction failed")
+    }
+
+    /// Builds the bundle, surfacing invalid configuration as an error.
+    ///
+    /// Table names are validated here (they end up in DDL/DML verbatim), so a name that is
+    /// not a plain `[A-Za-z_][A-Za-z0-9_]*` identifier fails loudly instead of being
+    /// concatenated into SQL. Keeps the previous best-effort behaviour for schema
+    /// bootstrapping: when `initialize_schema` is set and creating the schema fails, the
+    /// state store is rebuilt without auto-creation.
+    pub fn try_build(self) -> MysqlResult<MysqlDistributedStore> {
         let agent_state_store = if self.initialize_schema {
-            MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, true)
-                .unwrap_or_else(|_| MysqlAgentStateStore::with_config(
+            match MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, true) {
+                Ok(store) => store,
+                Err(_) => MysqlAgentStateStore::with_config(
                     self.state_backend.clone(),
                     None,
                     None,
                     false,
-                ).expect("state store construction"))
+                )?,
+            }
         } else {
-            MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, false)
-                .expect("state store construction")
+            MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, false)?
         };
 
         let base_store = MysqlStore::builder(self.sql_backend.clone())
-            .table_name(self.store_table_name.clone())
+            .table_name(self.store_table_name.clone())?
             .initialize_schema(self.initialize_schema)
             .build();
 
         let snapshot_spec = MysqlSnapshotSpec::with_table(
             self.snapshot_backend.clone(),
             self.snapshot_table_name.clone(),
-        );
+        )?;
 
         let execution_guard = MysqlSandboxExecutionGuard::builder(self.lock_backend.clone())
             .key_prefix(self.lock_key_prefix.clone())
             .build();
 
-        MysqlDistributedStore {
+        Ok(MysqlDistributedStore {
             agent_state_store: Arc::new(agent_state_store),
             base_store: Arc::new(base_store),
             snapshot_spec: Arc::new(snapshot_spec),
             execution_guard: Arc::new(execution_guard),
             isolation_scope: self.isolation_scope,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_harness::filesystem::remote::store::BaseStore;
-    use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec as _;
     use crate::guard::testing::InMemoryLockBackend;
     use crate::snapshot::testing::InMemorySnapshotBackend;
     use crate::state::testing::InMemoryStateBackend;
     use crate::store::testing::InMemorySqlBackend;
+    use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec as _;
+    use agentscope_harness::filesystem::remote::store::BaseStore;
     use async_trait::async_trait;
 
     fn bundle() -> MysqlDistributedStore {
@@ -295,6 +312,48 @@ mod tests {
 
     #[allow(dead_code)]
     fn _assert_object_safe_usage(_store: Arc<dyn AgentStateStore>) {}
+
+    // Table names are spliced into DDL/DML verbatim, so an injected name must fail
+    // construction instead of reaching a statement.
+    #[test]
+    fn try_build_rejects_unsafe_table_names() {
+        let bad_store = MysqlDistributedStore::builder(
+            Arc::new(InMemoryStateBackend::default()),
+            Arc::new(InMemorySqlBackend::default()),
+            Arc::new(InMemorySnapshotBackend::default()),
+            Arc::new(InMemoryLockBackend::default()),
+        )
+        .store_table_name("agentscope_store; DROP TABLE users")
+        .try_build();
+        assert!(bad_store.is_err(), "store table name must be validated");
+
+        let bad_snapshot = MysqlDistributedStore::builder(
+            Arc::new(InMemoryStateBackend::default()),
+            Arc::new(InMemorySqlBackend::default()),
+            Arc::new(InMemorySnapshotBackend::default()),
+            Arc::new(InMemoryLockBackend::default()),
+        )
+        .snapshot_table_name("snaps`--")
+        .try_build();
+        assert!(
+            bad_snapshot.is_err(),
+            "snapshot table name must be validated"
+        );
+    }
+
+    #[test]
+    fn try_build_accepts_safe_table_names() {
+        let built = MysqlDistributedStore::builder(
+            Arc::new(InMemoryStateBackend::default()),
+            Arc::new(InMemorySqlBackend::default()),
+            Arc::new(InMemorySnapshotBackend::default()),
+            Arc::new(InMemoryLockBackend::default()),
+        )
+        .store_table_name("custom_store")
+        .snapshot_table_name("custom_snaps")
+        .try_build();
+        assert!(built.is_ok(), "safe identifiers must build: {built:?}");
+    }
 
     #[allow(dead_code)]
     #[async_trait]

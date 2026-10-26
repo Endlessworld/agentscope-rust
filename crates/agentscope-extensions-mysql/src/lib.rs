@@ -30,6 +30,7 @@
 pub mod distributed_store;
 pub mod error;
 pub mod guard;
+pub mod identifier;
 pub mod snapshot;
 pub mod state;
 pub mod store;
@@ -40,11 +41,12 @@ pub use guard::{
     LockBackend, MysqlLockLease, MysqlSandboxExecutionGuard, MysqlSandboxExecutionGuardBuilder,
     DEFAULT_KEY_PREFIX,
 };
+pub use identifier::{validate_identifier, MAX_IDENTIFIER_LENGTH};
 pub use snapshot::{
     MysqlRemoteSnapshotClient, MysqlSnapshotSpec, SnapshotBackend, DEFAULT_SNAPSHOT_TABLE,
 };
 pub use state::{
-    MysqlAgentStateStore, StateBackend, DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME,
+    CasOutcome, MysqlAgentStateStore, StateBackend, DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME,
     HASH_KEY_SUFFIX, SINGLE_STATE_INDEX,
 };
 pub use store::{
