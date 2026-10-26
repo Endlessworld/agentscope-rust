@@ -102,6 +102,7 @@ use agentscope_extensions_model::{AnthropicMessagesModel, OpenAiChatModel, OpenA
 use agentscope_harness::agent::context::TaskContextOptions;
 use agentscope_harness::agent::{
     CompactionConfig, FileSystemSkillRepository, HarnessAgent, ToolResultEvictionConfig,
+    trigger_for_window,
 };
 use serde::{Deserialize, Serialize};
 
@@ -956,10 +957,14 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
     let model: Arc<dyn Model> = build_model(&model_id, &base_url, &api_key, protocol, session_id);
     let context_window = model.context_window_size();
+    // The compactor counts conversation history only; the compiled request also carries
+    // the system prompt and tool schemas. Derive the trigger from the *input allowance*
+    // (and leave headroom for that fixed overhead), otherwise compaction fires only after
+    // the budget is already exhausted.
     let compaction_trigger = if context_window > 0 {
-        context_window.saturating_mul(9) / 10
+        trigger_for_window(context_window)
     } else {
-        ACP_CONTEXT_WINDOW_TOKENS
+        trigger_for_window(ACP_CONTEXT_WINDOW_TOKENS)
     };
     // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
     // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。

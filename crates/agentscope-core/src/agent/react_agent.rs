@@ -1817,6 +1817,9 @@ async fn reasoning_phase(
     let final_msg = match run_reasoning(core, &call_ctx, input).await {
         Ok(msg) => msg,
         Err(e) => {
+            // A budget-overflow compaction may have rewritten the shared history before the
+            // model call failed; keep that reduction instead of restoring the oversized clone.
+            adopt_shared_context_compaction(core, state);
             // Keep the assistant message the model had already produced when the
             // call was interrupted, so the interrupted turn can reconcile its
             // dangling tool_use blocks instead of losing the response entirely
@@ -1830,8 +1833,41 @@ async fn reasoning_phase(
             return Err(e);
         }
     };
+    // Context-management middleware (budget-overflow compaction) can rewrite the shared
+    // history *during* the model call. This loop runs on a private state clone, so adopt
+    // the shrink before appending the assistant message; otherwise the next iteration
+    // would publish the old oversized history back and compaction would be undone.
+    adopt_shared_context_compaction(core, state);
+    let mut final_msg = final_msg;
+    // Tag the usage with the model that reported it. Token accounting anchors on this
+    // number, and a model switch changes the tokenizer, so a mismatch must invalidate it.
+    if final_msg.usage.is_some() {
+        let model_name = core.model.lock().unwrap().model_name().to_string();
+        final_msg.metadata.insert(
+            Msg::METADATA_USAGE_MODEL.to_string(),
+            serde_json::Value::String(model_name),
+        );
+    }
     state.context_mut().push(final_msg.clone());
     Ok(final_msg)
+}
+
+/// Adopts a history reduction made by a context-management middleware during a model call.
+///
+/// Only a rewrite the loop did not make itself is adopted: the loop never shrinks its
+/// private clone and never replaces the first message, so a shorter history or a new
+/// head can only come from a middleware that compacted the shared state. Tasks, plan
+/// mode and permission state stay owned by the loop.
+fn adopt_shared_context_compaction(core: &Arc<AgentCore>, state: &mut AgentState) {
+    let shared = core.state.lock().unwrap();
+    let head_changed = shared.context().first().map(|message| &message.id)
+        != state.context().first().map(|message| &message.id);
+    if shared.context().len() < state.context().len() || head_changed {
+        state.context = shared.context().to_vec();
+        if !shared.summary().is_empty() {
+            state.set_summary(shared.summary().to_string());
+        }
+    }
 }
 
 /// Runs the reasoning phase through the middleware chain, wrapping the raw model

@@ -89,6 +89,12 @@ impl Msg {
     pub const METADATA_SYNTHETIC: &'static str = "agentscope_synthetic";
     /// Metadata key (string) describing the kind of synthetic reminder.
     pub const METADATA_REMINDER_KIND: &'static str = "agentscope_reminder_kind";
+    /// Metadata key (string) naming the model that produced [`Msg::usage`].
+    ///
+    /// The provider's `input_tokens` is tokenizer-specific, so an estimate calibrated
+    /// from it is only valid for the same model. Context accounting ignores a usage
+    /// record whose model no longer matches the live model.
+    pub const METADATA_USAGE_MODEL: &'static str = "agentscope_usage_model";
 
     /// Creates a new message with a randomly generated ID and the current timestamp.
     pub fn new(

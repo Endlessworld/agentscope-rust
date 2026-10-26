@@ -28,7 +28,7 @@ use agentscope_core::model::Model;
 use agentscope_extensions_model::OpenAiChatModel;
 
 use agentscope_harness::agent::context::TaskContextOptions;
-use agentscope_harness::agent::{CompactionConfig, HarnessAgent};
+use agentscope_harness::agent::{trigger_for_window, CompactionConfig, HarnessAgent};
 
 use super::config::{ModeChoice, ModelChoice};
 use super::elicitation::ElicitationSlot;
@@ -67,6 +67,12 @@ fn build_env_model() -> Arc<dyn Model> {
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
 fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model = build_env_model();
+    let window = model.context_window_size();
+    let trigger = trigger_for_window(if window > 0 {
+        window
+    } else {
+        ACP_CONTEXT_WINDOW_TOKENS
+    });
     let workspace = cwd.join(".agentscope").join("workspace");
     HarnessAgent::builder()
         .name("agentscope-coding-agent")
@@ -78,7 +84,7 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
         .conversation_compaction(
             CompactionConfig::builder()
                 .trigger_messages(0)
-                .trigger_tokens(ACP_CONTEXT_WINDOW_TOKENS)
+                .trigger_tokens(trigger)
                 .build(),
         )
         .max_iters(50)

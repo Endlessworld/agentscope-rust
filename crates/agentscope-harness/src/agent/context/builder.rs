@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::message::{ContentBlock, Msg, MsgRole, ToolResultBlock};
+use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock};
 use agentscope_core::model::catalog::{MAX_SAFETY_MARGIN, DEFAULT_RESERVED_OUTPUT};
 use agentscope_core::model::{GenerateOptions, Model, ToolSchema, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::state::TaskContextState;
@@ -17,12 +17,13 @@ use agentscope_core::state::TaskContextState;
 use super::item::{ContextItem, ContextItemPlacement, ContextPurpose};
 use super::policy::{
     ContextManifest, ContextManifestItem, ContextPolicy, ContextSelectionPolicy,
-    DefaultSelectionPolicy, EstimateInput,
+    DefaultSelectionPolicy, Estimate, EstimateInput,
 };
 use super::render::{
     layout_messages, material_message, remove_synthetic, render_context_blocks, MessageKind,
 };
 use super::source::{CollectedMaterials, ContextRequest, ContextSources};
+use super::usage::context_usage;
 use crate::agent::middleware::tool_result_eviction::{evict_messages, ToolResultFingerprint};
 
 /// Filesystem identity for one preparation.
@@ -104,6 +105,65 @@ pub struct PreparedRequest {
     pub tools: Vec<ToolSchema>,
     pub options: GenerateOptions,
     pub manifest: ContextManifest,
+}
+
+/// The result of compiling one request.
+///
+/// A reasoning request that cannot fit the model budget is reported as
+/// [`PrepareOutcome::BudgetExceeded`] instead of an error, so the caller can
+/// compact the conversation and retry. Callers that cannot compact keep using
+/// [`ContextPipeline::prepare`], which converts the outcome into an error.
+#[derive(Debug)]
+pub enum PrepareOutcome {
+    /// The request fits the model input budget.
+    Prepared(PreparedRequest),
+    /// The request exceeds the local input budget and must be compacted.
+    BudgetExceeded(BudgetExceeded),
+}
+
+/// The local budget failure of one prepared request.
+///
+/// The fields mirror the retired `Prepared model input exceeds budget` error and
+/// are kept for structured logging (`.log` warning) and for the compaction
+/// fallback. This is a local accounting failure, never a gateway rejection.
+#[derive(Debug, Clone)]
+pub struct BudgetExceeded {
+    pub model: String,
+    pub catalog_key: String,
+    pub estimated: i64,
+    /// The local estimator's count, retained for diagnostics.
+    pub local_estimated: i64,
+    pub limit: i64,
+    pub window: i64,
+    pub reserved_output: i64,
+    pub safety_margin: i64,
+    pub manifest: ContextManifest,
+}
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Prepared model input exceeds budget (local): model={}, catalogKey={}, \
+             estimated={}, localEstimated={}, limit={}, window={}, reserved_output={}, \
+             safety_margin={}",
+            self.model,
+            self.catalog_key,
+            self.estimated,
+            self.local_estimated,
+            self.limit,
+            self.window,
+            self.reserved_output,
+            self.safety_margin
+        )
+    }
+}
+
+impl BudgetExceeded {
+    /// Converts the failure into the error surfaced by callers that cannot compact.
+    pub fn into_error(self) -> crate::Error {
+        crate::Error::Agent(self.to_string())
+    }
 }
 
 /// The single final request compiler.
@@ -193,6 +253,31 @@ impl ContextPipeline {
         options: GenerateOptions,
         task_state: Option<&TaskContextState>,
     ) -> crate::Result<PreparedRequest> {
+        match self
+            .prepare_with_task_outcome(model, request, messages, tools, options, task_state)
+            .await?
+        {
+            PrepareOutcome::Prepared(prepared) => Ok(prepared),
+            PrepareOutcome::BudgetExceeded(overflow) => Err(overflow.into_error()),
+        }
+    }
+
+    /// Compiles one model request, reporting an over-budget reasoning request as an
+    /// outcome instead of an error.
+    ///
+    /// The caller owns the recovery policy: the real model-call path compacts the
+    /// conversation and retries, while auxiliary (summary) calls are truncated by the
+    /// compiler itself because they cannot compact.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_with_task_outcome(
+        &self,
+        model: Arc<dyn Model>,
+        request: ContextRequest,
+        messages: Vec<Msg>,
+        tools: Vec<ToolSchema>,
+        options: GenerateOptions,
+        task_state: Option<&TaskContextState>,
+    ) -> crate::Result<PrepareOutcome> {
         let purpose = request.purpose;
         let task_revision = task_state.map(|state| state.revision()).unwrap_or(0);
         let mut transforms: Vec<String> = Vec::new();
@@ -249,13 +334,17 @@ impl ContextPipeline {
             transforms.push("task_state_projection".to_string());
         }
         let limit = self.input_limit(model.as_ref(), &options);
-        let mut estimate = self
+        let mut local_estimate = self
             .config
             .policy
             .estimator
             .estimate(&EstimateInput::new(&current, &tools));
+        // Omission decisions use the same provider-anchored count as the final budget
+        // check, so optional material is dropped before a conversation is compacted.
+        let mut observed_tokens =
+            context_usage(&current, &tools, Some(model.model_name())).tokens;
 
-        if purpose == ContextPurpose::Reasoning && estimate.tokens > limit {
+        if purpose == ContextPurpose::Reasoning && observed_tokens > limit {
             let order = self.config.selection.omission_order(&selected);
             // Validate every candidate before touching the list: an eviction order that names
             // required/System material is a policy bug, not something to silently skip.
@@ -282,31 +371,62 @@ impl ContextPipeline {
                 }
             }
             for id in order {
-                if estimate.tokens <= limit {
+                if observed_tokens <= limit {
                     break;
                 }
                 selected.retain(|candidate| candidate.source_id != id);
                 transforms.push(format!("omitted_for_budget:{id}"));
                 current =
                     self.project_task(self.with_materials(messages.clone(), &selected), task_state);
-                estimate = self
+                local_estimate = self
                     .config
                     .policy
                     .estimator
                     .estimate(&EstimateInput::new(&current, &tools));
+                observed_tokens =
+                    context_usage(&current, &tools, Some(model.model_name())).tokens;
             }
         }
+
+        // Auxiliary requests cannot compact a conversation. Shrink the request itself so a
+        // summary prompt never fails on the local input budget: drop the oldest chat turns
+        // first, then trim the largest remaining text block (the prompt body).
+        let current = if purpose != ContextPurpose::Reasoning
+            && local_estimate.tokens > limit
+        {
+            let shrunk = self.shrink_auxiliary(current, &tools, limit);
+            transforms.push("auxiliary_truncated_for_budget".to_string());
+            shrunk
+        } else {
+            current
+        };
 
         // 4. Stable layout: one System message, conversation, state, references.
         let mut prepared = layout_messages(current);
         if self.config.project_plan_state && purpose == ContextPurpose::Reasoning {
             prepared = remove_synthetic(prepared, &[MessageKind::PlanState]);
         }
-        let estimate = self
+        // The provider's latest `usage.input_tokens` is the authority for everything up
+        // to the assistant message that carried it; only the suffix added afterwards is
+        // locally estimated. Without any provider usage (first call, or just after a
+        // compaction invalidated the anchor) the local estimator is the fallback.
+        let local_estimate = self
             .config
             .policy
             .estimator
             .estimate(&EstimateInput::new(&prepared, &tools));
+        let usage = context_usage(&prepared, &tools, Some(model.model_name()));
+        if usage.is_provider_anchored() {
+            tracing::debug!(
+                model = %model.model_name(),
+                provider_input_tokens = usage.provider_input_tokens.unwrap_or(0),
+                suffix_tokens = usage.suffix_tokens,
+                local_tokens = usage.local_tokens,
+                anchored_tokens = usage.tokens,
+                "context size anchored on provider usage"
+            );
+        }
+        let estimate = Estimate::new(usage.tokens, usage.method(), false)?;
 
         // 5. Validation never repairs: it reports what is wrong with the request.
         let mut validation = "passed".to_string();
@@ -328,33 +448,64 @@ impl ContextPipeline {
             return Err(crate::Error::Agent(error));
         }
         if estimate.tokens > limit {
-            validation = "budget_exceeded".to_string();
-            let manifest = self.manifest(
-                &request,
-                model.as_ref(),
-                &estimate,
+            if purpose == ContextPurpose::Reasoning {
+                validation = "budget_exceeded".to_string();
+                let manifest = self.manifest(
+                    &request,
+                    model.as_ref(),
+                    &estimate,
+                    limit,
+                    &prepared,
+                    &tools,
+                    &selected,
+                    &transforms,
+                    &validation,
+                    task_revision,
+                );
+                self.observe(&manifest);
+                let (window, reserved, safety, budget_limit) =
+                    self.budget_breakdown(model.as_ref(), &options);
+                let catalog_key = model
+                    .descriptor()
+                    .map(|descriptor| descriptor.key.as_str())
+                    .unwrap_or("-")
+                    .to_string();
+                let overflow = BudgetExceeded {
+                    model: model.model_name().to_string(),
+                    catalog_key,
+                    estimated: estimate.tokens,
+                    local_estimated: local_estimate.tokens,
+                    limit: budget_limit,
+                    window,
+                    reserved_output: reserved,
+                    safety_margin: safety,
+                    manifest,
+                };
+                // A local budget miss is a recoverable condition on the reasoning path:
+                // the caller compacts the conversation and retries. Log it as a warning
+                // (the ACP log file), never as the agent's terminal error.
+                tracing::warn!(
+                    model = %overflow.model,
+                    catalog_key = %overflow.catalog_key,
+                    estimated = overflow.estimated,
+                    local_estimated = overflow.local_estimated,
+                    limit = overflow.limit,
+                    window = overflow.window,
+                    reserved_output = overflow.reserved_output,
+                    safety_margin = overflow.safety_margin,
+                    "model input exceeds the local budget; conversation compaction is required"
+                );
+                return Ok(PrepareOutcome::BudgetExceeded(overflow));
+            }
+            // A summary call has no conversation to compact. Send the best-effort,
+            // truncated request rather than failing the compaction it is serving.
+            validation = "budget_exceeded_truncated".to_string();
+            tracing::warn!(
+                model = %model.model_name(),
+                estimated = estimate.tokens,
                 limit,
-                &prepared,
-                &tools,
-                &selected,
-                &transforms,
-                &validation,
-                task_revision,
+                "auxiliary request remains above the local budget after truncation; sending best effort"
             );
-            self.observe(&manifest);
-            let (window, reserved, safety, budget_limit) =
-                self.budget_breakdown(model.as_ref(), &options);
-            let catalog_key = model
-                .descriptor()
-                .map(|descriptor| descriptor.key.as_str())
-                .unwrap_or("-");
-            return Err(crate::Error::Agent(format!(
-                "Prepared model input exceeds budget (local): model={}, catalogKey={catalog_key}, \
-                 estimated={}, limit={budget_limit}, window={window}, reserved_output={reserved}, \
-                 safety_margin={safety}",
-                model.model_name(),
-                estimate.tokens,
-            )));
         }
 
         let manifest = self.manifest(
@@ -371,12 +522,100 @@ impl ContextPipeline {
         );
         self.observe(&manifest);
 
-        Ok(PreparedRequest {
+        Ok(PrepareOutcome::Prepared(PreparedRequest {
             messages: prepared,
             tools,
             options,
             manifest,
-        })
+        }))
+    }
+
+    /// Shrinks an auxiliary request that cannot fit the local budget.
+    ///
+    /// Auxiliary calls (conversation summarization, memory extraction) have no
+    /// conversation to compact, so the compiler trims the request itself: it drops
+    /// the oldest chat turns while keeping the last message, then truncates the
+    /// largest remaining text block (head + tail) until the estimate fits.
+    fn shrink_auxiliary(
+        &self,
+        mut messages: Vec<Msg>,
+        tools: &[ToolSchema],
+        limit: i64,
+    ) -> Vec<Msg> {
+        let estimate = |messages: &[Msg]| {
+            self.config
+                .policy
+                .estimator
+                .estimate(&EstimateInput::new(messages, tools))
+                .tokens
+        };
+
+        // Drop the oldest non-system turn, never the last message: the last message is
+        // the prompt the auxiliary call exists to send.
+        let mut guard = 0usize;
+        while estimate(&messages) > limit && guard < messages.len() {
+            guard += 1;
+            let Some(index) = messages
+                .iter()
+                .enumerate()
+                .find(|(i, message)| message.role != MsgRole::System && i + 1 < messages.len())
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            messages.remove(index);
+        }
+
+        // Trim the largest text block from both ends. The middle of a summarization
+        // prompt carries the oldest conversation, which is exactly what can be lost
+        // when the budget is exhausted.
+        const MARKER: &str = "\n\n... truncated to fit the context budget ...\n\n";
+        let mut guard = 0usize;
+        while estimate(&messages) > limit && guard < messages.len().saturating_mul(32).max(32) {
+            guard += 1;
+            let target = messages
+                .iter()
+                .enumerate()
+                .flat_map(|(mi, message)| {
+                    message
+                        .content
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(bi, block)| match block {
+                            ContentBlock::Text(text) => {
+                                Some((mi, bi, text.text.chars().count()))
+                            }
+                            _ => None,
+                        })
+                })
+                .max_by_key(|(_, _, chars)| *chars);
+            let Some((message_index, block_index, total_chars)) = target else {
+                break;
+            };
+            if total_chars == 0 {
+                break;
+            }
+            let over = (estimate(&messages) - limit).max(1);
+            let drop_chars =
+                ((over as f64 * 2.5).ceil() as usize).max(64) + MARKER.chars().count();
+            if drop_chars >= total_chars {
+                messages[message_index].content[block_index] =
+                    ContentBlock::Text(TextBlock::new(""));
+                continue;
+            }
+            let ContentBlock::Text(text) = &messages[message_index].content[block_index] else {
+                break;
+            };
+            let kept = total_chars - drop_chars;
+            let head_len = kept / 2;
+            let tail_len = kept - head_len;
+            let chars: Vec<char> = text.text.chars().collect();
+            let head: String = chars[..head_len].iter().collect();
+            let tail: String = chars[total_chars - tail_len..].iter().collect();
+            messages[message_index].content[block_index] =
+                ContentBlock::Text(TextBlock::new(format!("{head}{MARKER}{tail}")));
+        }
+        messages
     }
 
     /// Notifies the observer, swallowing a panic.
@@ -618,7 +857,7 @@ pub(crate) fn has_suspended_result(results: &[ToolResultBlock]) -> bool {
 mod tests {
     use std::sync::Mutex;
 
-    use agentscope_core::message::ToolUseBlock;
+    use agentscope_core::message::{ChatUsage, ToolUseBlock};
     use futures::stream::BoxStream;
 
     use super::*;
@@ -793,6 +1032,55 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeds budget"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_reasoning_request_is_reported_as_an_outcome() {
+        let pipeline = ContextPipeline::with_policy(ContextPolicy::default());
+        let outcome = pipeline
+            .prepare_with_task_outcome(
+                model(1000),
+                request(ContextPurpose::Reasoning),
+                vec![Msg::user("x".repeat(20_000))],
+                Vec::new(),
+                GenerateOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        match outcome {
+            PrepareOutcome::BudgetExceeded(info) => {
+                assert!(info.estimated > info.limit);
+                assert_eq!(info.window, 1_000);
+                assert!(info.to_string().contains("exceeds budget"), "{info}");
+            }
+            PrepareOutcome::Prepared(_) => panic!("must report a budget outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_auxiliary_request_is_truncated_instead_of_rejected() {
+        let pipeline = ContextPipeline::with_policy(ContextPolicy::default());
+        let prepared = pipeline
+            .prepare(
+                model(1000),
+                request(ContextPurpose::Summary),
+                vec![Msg::user("x".repeat(50_000))],
+                Vec::new(),
+                GenerateOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            prepared.manifest.estimated_input_tokens <= prepared.manifest.input_limit,
+            "{:?}",
+            prepared.manifest
+        );
+        assert!(prepared
+            .manifest
+            .transforms
+            .iter()
+            .any(|t| t == "auxiliary_truncated_for_budget"));
     }
 
     #[tokio::test]
@@ -971,6 +1259,36 @@ mod tests {
             .transforms
             .iter()
             .any(|t| t.starts_with("source_unavailable:source/biz/")));
+    }
+
+    #[tokio::test]
+    async fn the_manifest_uses_provider_usage_when_a_previous_call_reported_it() {
+        let pipeline = ContextPipeline::with_policy(ContextPolicy::default());
+        let mut assistant = Msg::assistant("previous reply");
+        assistant.usage = Some(ChatUsage {
+            input_tokens: 50_000,
+            output_tokens: 10,
+            ..ChatUsage::default()
+        });
+        let prepared = pipeline
+            .prepare(
+                model(128_000),
+                request(ContextPurpose::Reasoning),
+                vec![Msg::user("hello"), assistant],
+                Vec::new(),
+                GenerateOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.manifest.counting_method,
+            super::super::usage::PROVIDER_METHOD
+        );
+        assert!(
+            prepared.manifest.estimated_input_tokens > 50_000,
+            "{:?}",
+            prepared.manifest
+        );
     }
 
     #[tokio::test]

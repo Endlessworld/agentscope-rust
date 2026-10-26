@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::model::catalog::{DEFAULT_RESERVED_OUTPUT, MAX_SAFETY_MARGIN};
 use agentscope_core::model::Model;
 
 use crate::agent::context::auxiliary_text;
@@ -118,6 +119,33 @@ Use these sections (write \"None\" if empty):\n\
 <messages>\n\
 {messages}\n\
 </messages>";
+
+/// Compaction trigger derived from the model's input allowance.
+///
+/// The observed count is now provider-anchored (or a full local fallback), so it covers
+/// the system prompt and tool schemas. Triggering at 90% of the input allowance leaves
+/// headroom for the assistant reply and the next delta before the compiler's hard limit.
+pub fn trigger_for_input_limit(input_limit: usize) -> usize {
+    if input_limit == 0 {
+        return 0;
+    }
+    input_limit.saturating_mul(9) / 10
+}
+
+/// Compaction trigger derived from a raw model window.
+///
+/// Applies the context compiler's default output reserve and safety margin first, then
+/// [`trigger_for_input_limit`]. This keeps the ACP trigger bound to the selected model
+/// instead of a fixed 256k constant.
+pub fn trigger_for_window(window: usize) -> usize {
+    if window == 0 {
+        return 0;
+    }
+    let output = DEFAULT_RESERVED_OUTPUT.min((window / 8).max(1));
+    let safety = MAX_SAFETY_MARGIN.min((window / 50).max(1));
+    let input_limit = window.saturating_sub(output).saturating_sub(safety);
+    trigger_for_input_limit(input_limit)
+}
 
 /// Configuration for conversation compaction (summarization).
 #[derive(Debug, Clone)]
@@ -471,6 +499,11 @@ impl ConversationCompactor {
         Self { model: Some(model) }
     }
 
+    /// The model used for summarization, when one is configured.
+    pub fn model_name(&self) -> Option<&str> {
+        self.model.as_ref().map(|model| model.model_name())
+    }
+
     /// Runs compaction on the conversation messages if a trigger is met.
     ///
     /// Only non-SYSTEM messages should be passed. Returns `None` when no compaction was
@@ -501,12 +534,44 @@ impl ConversationCompactor {
         &self,
         conversation: Vec<Msg>,
         config: &CompactionConfig,
+        agent_id: &str,
+        session_id: &str,
+        recorder: Option<&std::sync::Arc<agentscope_core::session::SessionRecorder>>,
+    ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
+        self.compact_if_needed_with_metrics_observed(
+            conversation,
+            config,
+            agent_id,
+            session_id,
+            recorder,
+            None,
+        )
+        .await
+    }
+
+    /// Runs compaction with an externally observed token count.
+    ///
+    /// Context-managing callers pass the provider-anchored count here (`input_tokens` of
+    /// the previous call plus the estimated suffix). That number covers the whole request,
+    /// including the system prompt and tool schemas, so the threshold must be a full
+    /// request budget rather than a history-only count.
+    pub async fn compact_if_needed_with_metrics_observed(
+        &self,
+        conversation: Vec<Msg>,
+        config: &CompactionConfig,
         _agent_id: &str,
         _session_id: &str,
         recorder: Option<&std::sync::Arc<agentscope_core::session::SessionRecorder>>,
+        observed_tokens: Option<usize>,
     ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
         let before_msg_count = conversation.len();
-        let before_token_count = calculate_token(&conversation);
+        // Prefer the provider-anchored count for the recorded "before" size; it is the
+        // same number that drove the trigger. Without provider usage the local estimate
+        // is the only available source. The "after" size is necessarily local until the
+        // provider runs the next request.
+        let before_token_count = observed_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or_else(|| calculate_token(&conversation));
         let compaction_id = uuid::Uuid::new_v4().to_string();
         let metrics = |status: CompactionStatus, after: Option<&[Msg]>| CompactionMetrics {
             compaction_id: compaction_id.clone(),
@@ -536,7 +601,9 @@ impl ConversationCompactor {
                 .await?;
         }
 
-        let outcome = self.compact_candidate(conversation, config).await;
+        let outcome = self
+            .compact_candidate(conversation, config, observed_tokens)
+            .await;
         let metrics = match &outcome {
             Ok(replacement) => match replacement {
                 Some(compacted) => metrics(CompactionStatus::Completed, Some(compacted)),
@@ -566,17 +633,25 @@ impl ConversationCompactor {
         &self,
         conversation: Vec<Msg>,
         config: &CompactionConfig,
+        observed_tokens: Option<usize>,
     ) -> agentscope_core::error::Result<Option<Vec<Msg>>> {
         if conversation.is_empty() {
+            return Ok(None);
+        }
+        // Trigger on the caller-observed size (provider-anchored when available) before
+        // the non-LLM pre-pass. The pre-pass prunes only a local copy: if it were measured
+        // first, a conversation with large historical tool results could look small and
+        // skip compaction while the original history still reaches the provider.
+        let observed = observed_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or_else(|| calculate_token(&conversation));
+        if !should_compact(&conversation, observed, config) {
             return Ok(None);
         }
         let messages =
             prune_tool_results(&truncate_args(&conversation, config.truncate_args.as_ref()),
                 config.prune.as_ref());
         let total = calculate_token(&messages);
-        if !should_compact(&messages, total, config) {
-            return Ok(None);
-        }
         let cutoff = determine_cutoff_index(&messages, total, config);
         if cutoff == 0 {
             return Ok(None);
@@ -1022,3 +1097,102 @@ fn build_prune_preview(text: &str, max_chars: usize) -> String {
     }
     format!("{}\n\n...({} chars pruned)...\n\n{}", head, removed, tail)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn compaction_triggers_below_the_compiler_limit() {
+        // The compactor counts history only; the trigger must leave room for the system
+        // prompt and tool schemas that also travel with the request.
+        assert_eq!(trigger_for_window(256_000), 218_419);
+        assert_eq!(trigger_for_window(100_000), 80_827);
+        assert_eq!(trigger_for_window(0), 0);
+        assert!(trigger_for_window(256_000) < 242_688);
+    }
+
+    #[tokio::test]
+    async fn the_observed_provider_count_drives_the_trigger() {
+        let compactor = ConversationCompactor::new(None);
+        let config = CompactionConfig::builder()
+            .trigger_messages(0)
+            .trigger_tokens(10_000)
+            .keep_messages(1)
+            .build();
+
+        // Locally small, but the provider says the real request is over the trigger.
+        let replacement = compactor
+            .compact_if_needed_with_metrics_observed(
+                vec![Msg::user("a"), Msg::user("b")],
+                &config,
+                "agent",
+                "session",
+                None,
+                Some(20_000),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(replacement.is_some());
+
+        // Locally large, but the provider says the real request is below the trigger.
+        let conversation: Vec<Msg> = (0..6)
+            .map(|i| Msg::user(format!("turn {i}: {}", "x".repeat(5_000))))
+            .collect();
+        assert!(calculate_token(&conversation) > 10_000);
+        let replacement = compactor
+            .compact_if_needed_with_metrics_observed(
+                conversation,
+                &config,
+                "agent",
+                "session",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(replacement.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_trigger_uses_the_unpruned_conversation_size() {
+        // Large historical tool results make the real history expensive; the pre-pass
+        // prunes only its local copy. If the trigger were computed after pruning, the
+        // oversized state would never compact.
+        let mut messages = Vec::new();
+        for i in 0..8 {
+            let id = format!("call-{i}");
+            messages.push(Msg::assistant_blocks(vec![ContentBlock::ToolUse(
+                ToolUseBlock::new(id.clone(), "shell", Default::default()),
+            )]));
+            messages.push(Msg::tool_blocks(vec![ToolResultBlock::new(
+                &id,
+                "shell",
+                vec![ContentBlock::Text(TextBlock::new("x".repeat(5_000)))],
+            )]));
+        }
+        let prune = PruneConfig {
+            protect_tokens: 0,
+            minimum_tokens: 0,
+            max_output_chars: 100,
+            excluded_tools: HashSet::new(),
+        };
+        let config = CompactionConfig::builder()
+            .trigger_messages(0)
+            .trigger_tokens(1_000)
+            .keep_messages(1)
+            .prune(Some(prune))
+            .build();
+        let compactor = ConversationCompactor::new(None);
+        let replacement = compactor
+            .compact_if_needed(messages, &config, "agent", "session")
+            .await
+            .unwrap();
+        assert!(replacement.is_some(), "pruning must not hide the real size");
+    }
+}
+

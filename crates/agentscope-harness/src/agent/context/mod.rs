@@ -15,8 +15,12 @@ pub mod model_calls;
 pub mod policy;
 pub mod render;
 pub mod source;
+pub mod usage;
 
-pub use builder::{ContextEviction, ContextPipeline, ContextPipelineConfig, MANIFEST_ATTRIBUTE_PREFIX};
+pub use builder::{
+    BudgetExceeded, ContextEviction, ContextPipeline, ContextPipelineConfig, PrepareOutcome,
+    PreparedRequest, MANIFEST_ATTRIBUTE_PREFIX,
+};
 pub use context_middleware::ContextMiddleware;
 pub use item::{
     content_hash, ContextBlock, ContextItem, ContextItemPlacement, ContextPurpose,
@@ -32,4 +36,7 @@ pub use render::{
 pub use source::{
     BoxedContextSource, CollectedMaterials, ContextRequest, ContextSource, ContextSourceOptions,
     ContextSources, SourceFailurePolicy,
+};
+pub use usage::{
+    context_usage, strip_provider_usage, ContextUsage, UsageSource, LOCAL_METHOD, PROVIDER_METHOD,
 };

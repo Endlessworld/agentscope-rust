@@ -28,11 +28,12 @@ pub use bus::{
     WorkspaceMessageBus,
 };
 pub use context::{
-    ApproximateEstimator, BoxedContextSource, ContextBlock, ContextItem, ContextItemPlacement,
-    ContextManifest, ContextManifestItem, ContextMiddleware, ContextPipeline,
-    ContextPipelineConfig, ContextPolicy, ContextPurpose, ContextRequest, ContextSelectionPolicy,
-    ContextSource, ContextSourceOptions, ContextSources, DefaultSelectionPolicy, Estimate,
-    SourceFailurePolicy, TaskContextOptions, TokenEstimator,
+    context_usage, strip_provider_usage, ApproximateEstimator, BoxedContextSource, ContextBlock,
+    ContextItem, ContextItemPlacement, ContextManifest, ContextManifestItem, ContextMiddleware,
+    ContextPipeline, ContextPipelineConfig, ContextPolicy, ContextPurpose, ContextRequest,
+    ContextSelectionPolicy, ContextSource, ContextSourceOptions, ContextSources, ContextUsage,
+    DefaultSelectionPolicy, Estimate, SourceFailurePolicy, TaskContextOptions, TokenEstimator,
+    UsageSource,
 };
 pub use session::{
     AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
@@ -61,9 +62,10 @@ pub use mcp_client_manager::{McpClientManager, McpClientInstance, McpToolInfo};
 pub use memory::{
     compaction::{
         build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
-        prune_tool_results, truncate_args, CompactionConfig, CompactionConfigBuilder,
-        CompactionMetrics, CompactionStatus, ConversationCompactor, DEFAULT_SUMMARY_PROMPT,
-        PruneConfig, SUMMARY_MSG_NAME, TruncateArgsConfig, TruncateArgsConfigBuilder,
+        prune_tool_results, trigger_for_input_limit, trigger_for_window, truncate_args,
+        CompactionConfig, CompactionConfigBuilder, CompactionMetrics, CompactionStatus,
+        ConversationCompactor, DEFAULT_SUMMARY_PROMPT, PruneConfig, SUMMARY_MSG_NAME,
+        TruncateArgsConfig, TruncateArgsConfigBuilder,
     },
     session::SessionFreshnessEvaluator,
     MemoryConfig, MemoryConfigBuilder, MemoryConsolidator, MemoryFlushManager,

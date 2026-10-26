@@ -356,6 +356,10 @@ pub struct AcpAgentSession {
     /// Whether a prompt is currently being executed (guards LRU eviction).
     running: Arc<AtomicBool>,
     usage: ChatUsage,
+    /// The provider-reported input tokens of the most recent model call. This is the
+    /// real size of the live context (system prompt + tools + history), reported back
+    /// by the provider; `usage.input_tokens` is cumulative and must not drive the gauge.
+    last_input_tokens: u64,
     /// Client connection used to push `session/request_permission` requests
     /// when a tool call needs human confirmation. Shared across clones so a
     /// background catalog task can also push config/usage updates.
@@ -498,6 +502,7 @@ impl AcpAgentSession {
             closed: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
+            last_input_tokens: 0,
             client: Arc::new(Mutex::new(None)),
             elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
@@ -1039,7 +1044,7 @@ impl AcpAgentSession {
             ),
         );
         let _ = client.notify(config);
-        let used = self.usage.input_tokens;
+        let used = self.last_input_tokens;
         let _ = client.notify(self.usage_notification(used));
     }
 
@@ -1059,9 +1064,10 @@ impl AcpAgentSession {
             .map(|descriptor| descriptor.context_window as u64)
             .filter(|size| *size > 0)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW as u64);
+        let used = self.last_input_tokens;
         let update = SessionNotification::new(
             self.session_id.clone(),
-            SessionUpdate::UsageUpdate(UsageUpdate::new(self.usage.input_tokens, size)),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
         );
         let _ = client.notify(update);
     }
@@ -1437,10 +1443,10 @@ impl AcpAgentSession {
         tool_events = tool_events.with_plan_operations(self.support.supports_plan_operations());
 
         // Push the initial context-window usage so clients render the gauge
-        // before the first model call completes. Without a prior model call
-        // there is no real "in-context" count, so report zero rather than the
-        // (inflated) cumulative session usage.
-        emit(self.usage_notification(0));
+        // before the first model call completes. Before any model call there is no
+        // real in-context count, so report zero; afterwards keep showing the last
+        // provider-reported input size until the new call reports its own.
+        emit(self.usage_notification(self.last_input_tokens));
 
         // Watchdog state.
         //
@@ -1603,9 +1609,12 @@ impl AcpAgentSession {
                                     {
                                         self.accumulate_usage(u.clone());
                                         self.accumulate_turn_usage(&u);
+                                        self.last_input_tokens = u.input_tokens;
                                         emit(self.usage_notification(u.input_tokens));
                                     } else {
-                                        emit(self.usage_notification(0));
+                                        // No usage on this event: keep showing the last
+                                        // provider-reported context size instead of 0.
+                                        emit(self.usage_notification(self.last_input_tokens));
                                     }
                                 }
                                 AgentEventType::Custom => {

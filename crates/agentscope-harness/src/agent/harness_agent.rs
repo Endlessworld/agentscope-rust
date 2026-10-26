@@ -28,6 +28,7 @@ use crate::filesystem::{Filesystem, LocalFilesystem};
 use super::artifact::ArtifactDeliveryTarget;
 use super::distributed_store::DistributedStore;
 use super::isolation_scope::IsolationScope;
+use super::memory::compaction::{CompactionConfig, ConversationCompactor};
 use super::memory::{MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig};
 use super::middleware::{
     AgentTraceMiddleware, AtPathExpansionMiddleware, ConversationCompactionMiddleware,
@@ -1466,14 +1467,22 @@ impl HarnessAgentBuilder {
         // ---- Conversation compaction ----
         // Java `CompactionMiddleware` performs the real summarize-and-replace pass.
         // `disable_compaction()` must gate this path, not a prompt marker.
+        //
+        // The same compactor is handed to the context compiler as the budget-overflow
+        // fallback: if a request still exceeds the model budget (a long tool loop, a
+        // threshold drift, a model switch), the request is compacted and retried
+        // instead of surfacing a hard error.
+        let mut overflow_compaction: Option<(Arc<ConversationCompactor>, CompactionConfig)> = None;
         if !self.disable_compaction {
             if let Some(cfg) = self.conversation_compaction_config.clone() {
                 if let Some(model) = self.model.clone() {
-                    middleware.add(Box::new(ConversationCompactionMiddleware::with_model(
-                        model,
-                        cfg,
+                    let compactor = Arc::new(ConversationCompactor::with_model(model));
+                    middleware.add(Box::new(ConversationCompactionMiddleware::new(
+                        Arc::clone(&compactor),
+                        cfg.clone(),
                         name.clone(),
                     )));
+                    overflow_compaction = Some((compactor, cfg));
                 }
             }
         }
@@ -1917,9 +1926,12 @@ impl HarnessAgentBuilder {
         // registration is the innermost model-call middleware. It validates and budgets the final
         // request, after every other rewrite has been applied.
         if let Some(pipeline) = context_pipeline {
-            middleware.add(Box::new(crate::agent::context::ContextMiddleware::new(
-                pipeline,
-            )));
+            let mut context_middleware = crate::agent::context::ContextMiddleware::new(pipeline);
+            if let Some((compactor, config)) = overflow_compaction {
+                context_middleware = context_middleware
+                    .with_overflow_compaction(compactor, config);
+            }
+            middleware.add(Box::new(context_middleware));
         }
 
         // Initial state: pin a stable session/user id so restart-resume can

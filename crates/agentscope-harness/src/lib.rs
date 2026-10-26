@@ -17,7 +17,7 @@ pub use agent::{
     ArtifactDeliveryResult, ArtifactDeliveryTarget, AsyncToolMiddleware, AsyncToolRecord,
     AsyncToolRegistry,
     AtPathExpansionMiddleware, BusEntry, build_delivery_reminder, build_summary_message,
-    build_task_summary, calculate_token,
+    build_task_summary, calculate_token, context_usage, ContextUsage,
     Channel, ChannelBinding, ChannelConfig, ChannelManager, ChannelRouter, ChannelSink,
     ChatUiChannel, ChatUiRequest, create_completion_callback, CompactionConfig, CompactionConfigBuilder,
     CompactionMiddleware, CompactionMiddlewareConfig, CompactionMetrics, CompactionStatus,
