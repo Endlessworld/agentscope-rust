@@ -8,6 +8,10 @@
 //! {stateKey}.list.json   — List<State> as a JSON array
 //! {stateKey}.list.hash   — sampled hash for incremental append detection
 //! ```
+//!
+//! Per-key deletion (`delete_key`) removes all three objects for one key while
+//! keeping the rest of the session intact; session-level `delete` (the core
+//! trait method) removes every object under the session prefix.
 
 use std::sync::Arc;
 
@@ -52,6 +56,33 @@ impl OssAgentStateStore {
     /// Shuts down the underlying OSS client (mirrors Java `close()`).
     pub fn close(&self) {
         self.client.shutdown();
+    }
+
+    /// Deletes a single state key of a session, removing the value object plus
+    /// its list/hash sidecars (`.json`, `.list.json`, `.list.hash`).
+    ///
+    /// Mirrors Java `OssAgentStateStore.delete(userId, sessionId, key)`. The
+    /// core [`AgentStateStore`] trait only defines *session-level* deletion, so
+    /// this is deliberately a crate-local inherent method — the same approach as
+    /// `MongodbAgentStateStore::delete_key` in `agentscope-extensions-mongodb`;
+    /// core/harness traits are left untouched.
+    ///
+    /// Deletion is idempotent: keys that do not exist (or whose sidecars are
+    /// missing) are ignored, so repeated calls succeed. The first backend error
+    /// is returned instead of being swallowed (Java throws `RuntimeException`).
+    pub async fn delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> OssResult<()> {
+        let state_key = self.state_object_key(user_id, session_id, key)?;
+        let list_key = self.list_object_key(user_id, session_id, key)?;
+        let hash_key = self.hash_object_key(user_id, session_id, key)?;
+        self.client.delete(&state_key)?;
+        self.client.delete(&list_key)?;
+        self.client.delete(&hash_key)?;
+        Ok(())
     }
 
     // ---- internal helpers ----

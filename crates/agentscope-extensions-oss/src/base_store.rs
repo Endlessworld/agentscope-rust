@@ -12,6 +12,16 @@
 //! (`agentscope_harness::filesystem::remote::store`): version starts at 1 and
 //! increments on every successful write; `put_if_version` with expected `0`
 //! writes only when the item does not yet exist.
+//!
+//! # Search error semantics
+//!
+//! [`OssStore::search_strict`] mirrors the Java error behaviour of
+//! `OssBaseStore.search`: a listed object key that falls outside the requested
+//! namespace prefix (or malformed item JSON) is a backend inconsistency and
+//! surfaces as [`OssError`] (Java throws `RuntimeException` from its unchecked
+//! `substring`). The harness [`BaseStore::search`] signature has no error channel,
+//! so it delegates to `search_strict` and returns an empty page on error instead
+//! of fabricating item keys.
 
 use std::sync::Arc;
 
@@ -104,46 +114,11 @@ impl BaseStore for OssStore {
     }
 
     fn search(&self, namespace: &[String], limit: usize, offset: usize) -> Vec<StoreItem> {
-        let prefix = self.namespace_prefix(namespace);
-        let result = (|| -> OssResult<Vec<StoreItem>> {
-            let mut data_keys: Vec<String> = self
-                .client
-                .list_all(&prefix)?
-                .into_iter()
-                // `.version` and `.list.json` must be excluded; `.json` included.
-                .filter(|k| k.ends_with(JSON_SUFFIX) && !k.ends_with(VERSION_SUFFIX))
-                .collect();
-            data_keys.sort();
-
-            let start = offset.min(data_keys.len());
-            let end = (start + limit).min(data_keys.len());
-            let page = &data_keys[start..end];
-
-            let mut items = Vec::with_capacity(page.len());
-            for data_key in page {
-                let item_key = data_key
-                    .strip_prefix(&prefix)
-                    .unwrap_or(data_key)
-                    .strip_suffix(JSON_SUFFIX)
-                    .unwrap_or(data_key)
-                    .to_string();
-                if let Some(json) = self.get_string(data_key)? {
-                    if let Ok(value) = serde_json::from_str::<StoreValue>(&json) {
-                        let version_key = format!(
-                            "{}{}",
-                            data_key.strip_suffix(JSON_SUFFIX).unwrap_or(data_key),
-                            VERSION_SUFFIX
-                        );
-                        let version = self.read_version(&version_key);
-                        items.push(StoreItem::new(item_key, value, version));
-                    }
-                }
-            }
-            Ok(items)
-        })();
-
-        match result {
-            Ok(v) => v,
+        // `BaseStore::search` cannot report failures, so the strict variant is
+        // used and errors degrade to an empty page *with a log* — never to
+        // silently wrong item keys.
+        match self.search_strict(namespace, limit, offset) {
+            Ok(items) => items,
             Err(e) => {
                 tracing::error!(error = %e, "failed to search namespace");
                 Vec::new()
@@ -165,6 +140,64 @@ impl OssStore {
     /// Creates a builder.
     pub fn builder() -> OssStoreBuilder {
         OssStoreBuilder::default()
+    }
+
+    /// Searches `namespace` and returns a page of items, **propagating backend
+    /// errors**.
+    ///
+    /// This mirrors Java `OssBaseStore.search`, which throws `RuntimeException`
+    /// when listing/reading fails or when a listed object key does not live
+    /// under the requested namespace prefix (Java uses an unchecked
+    /// `substring(prefix.length(), …)` there). The harness [`BaseStore::search`]
+    /// signature has no error channel, so it delegates to this method and returns
+    /// an empty page on error; callers that need the failure should call this
+    /// inherent method directly.
+    pub fn search_strict(
+        &self,
+        namespace: &[String],
+        limit: usize,
+        offset: usize,
+    ) -> OssResult<Vec<StoreItem>> {
+        let prefix = self.namespace_prefix(namespace);
+        let mut data_keys: Vec<String> = self
+            .client
+            .list_all(&prefix)?
+            .into_iter()
+            // Only `.json` payloads are items; `.version` sidecars are excluded.
+            // (A `.list.json` payload can only appear under a state-store prefix,
+            // never under this store's namespace prefix.)
+            .filter(|k| k.ends_with(JSON_SUFFIX) && !k.ends_with(VERSION_SUFFIX))
+            .collect();
+        data_keys.sort();
+
+        let start = offset.min(data_keys.len());
+        let end = (start + limit).min(data_keys.len());
+        let page = &data_keys[start..end];
+
+        let mut items = Vec::with_capacity(page.len());
+        for data_key in page {
+            let item_key = data_key
+                .strip_prefix(prefix.as_str())
+                .and_then(|k| k.strip_suffix(JSON_SUFFIX))
+                .ok_or_else(|| {
+                    OssError::Backend(format!(
+                        "listed object key '{data_key}' is outside namespace prefix '{prefix}'"
+                    ))
+                })?
+                .to_string();
+            let Some(json) = self.get_string(data_key)? else {
+                continue;
+            };
+            let value = serde_json::from_str::<StoreValue>(&json)?;
+            let version_key = format!(
+                "{}{}",
+                data_key.strip_suffix(JSON_SUFFIX).unwrap_or(data_key),
+                VERSION_SUFFIX
+            );
+            let version = self.read_version(&version_key);
+            items.push(StoreItem::new(item_key, value, version));
+        }
+        Ok(items)
     }
 
     /// Returns the configured bucket name.

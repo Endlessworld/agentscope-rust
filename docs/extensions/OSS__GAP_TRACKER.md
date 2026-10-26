@@ -17,20 +17,20 @@
 | Java 子模块 | (单模块) |
 | Java 规模（2026-10-22 实测） | 主代码 **795 行 / 5 个类**（`OssAgentStateStore` 314、`OssBaseStore` 268、`OssDistributedStore` 77、`OssRemoteSnapshotClient` 81、`OssSnapshotSpec` 55；含空行/注释共 880 行）；测试 **290 行 / 2 个类 / 20 个 `@Test`**（137+153；含空行/注释共 336 行） |
 | Rust crate | `crates/agentscope-extensions-oss` |
-| Rust 规模（2026-10-22 实测） | `src/` **8 文件 1210 行 / 非空 1064 行**（base_store 265、client 224、distributed_store 131、error 53、guard 65、lib 52、snapshot 128、state_store 292）；`tests/` **5 文件 525 行 / 非空 446 行**；用例 **41 个 `#[test]`/`#[tokio::test]` + 1 个 `no_run` doc-test = 42**，`src/` 内 `cfg(test)` 命中 **0** |
+| Rust 规模（2026-10-22 实测；**§8 后用例：默认 61 + 1 doc-test / `--features s3` 72 + 2 doc-test，待实测**） | `src/` **8 文件 1210 行 / 非空 1064 行**（base_store 265、client 224、distributed_store 131、error 53、guard 65、lib 52、snapshot 128、state_store 292）；`tests/` **5 文件 525 行 / 非空 446 行**；用例 **41 个 `#[test]`/`#[tokio::test]` + 1 个 `no_run` doc-test = 42**，`src/` 内 `cfg(test)` 命中 **0** |
 | 迁移波次 | B |
-| 当前状态 | 已完成（**复核结论见 §6**：契约齐全、测试数属实，但实机后端为空壳 + per-key 删除缺失 + 错误传播弱化，建议 rollup 降级为 `进行中`，见 §6.7） |
+| 当前状态 | **进行中（P1 已全部关闭，见 §8；§6/§7 为历史快照）**。契约 5/5 齐全，默认 feature **61 test + 1 doc-test** / `--features s3` **72 test + 2 doc-test**（待主智能体跑 cargo 确认）；仍存的结构性限制只有「无法产出完整 `DistributedStore`」（受 harness struct 约束，§4.2-1） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
-| `OssAgentStateStore` | OSS 后端的 `core.state.AgentStateStore`；状态以 JSON 存于 `{prefix}{user}/{session}/{key}.json`，列表另有 `.list.json` + `.list.hash` | `OssAgentStateStore`（`state_store.rs`） | 实现 `agentscope_core::state::store::AgentStateStore`（async_trait）；复用 `core::state::list_hash` 的 `compute_hash`/`needs_full_rewrite` 做增量 append 检测。**差异**：Java 覆写了 per-key `delete(userId, sessionId, key)`（同时删 `.json`/`.list.json`/`.list.hash`），Rust 侧 core trait 无该方法 → 仅支持 session 级 `delete`（见 §6.3 P1-1） |
+| `OssAgentStateStore` | OSS 后端的 `core.state.AgentStateStore`；状态以 JSON 存于 `{prefix}{user}/{session}/{key}.json`，列表另有 `.list.json` + `.list.hash` | `OssAgentStateStore`（`state_store.rs`） | 实现 `agentscope_core::state::store::AgentStateStore`（async_trait）；复用 `core::state::list_hash` 的 `compute_hash`/`needs_full_rewrite` 做增量 append 检测。**已对齐（§8-1）**：per-key `delete_key(userId, sessionId, key)` 作为 **crate 固有方法**实现（core trait 无此方法；照 MONGODB `delete_key` 先例，不改 core/harness），删除 `.json`/`.list.json`/`.list.hash` 三个对象 |
 | `OssBaseStore` | OSS 后端的 harness `BaseStore`；`{prefix}{ns...}/{key}.json` + `.version` | `OssStore`（`base_store.rs`） | 实现 `agentscope_harness::filesystem::remote::store::BaseStore`（同步）；CAS/版本语义以 harness 为准（version 从 1 起、`put_if_version(0)`=仅当不存在时写）。`supports_atomic_session_storage` 两侧均未覆写 → 同为 `false`（行为等价） |
 | `OssRemoteSnapshotClient` | OSS 后端的 `RemoteSnapshotClient`；`{prefix}{snapshotId}.tar` | `OssRemoteSnapshotClient`（`snapshot.rs`） | 实现 `agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient`（async_trait）；入参由 Java `InputStream` 改为 `&[u8]` |
 | `OssSnapshotSpec` | 便捷 `SandboxSnapshotSpec` | `OssSnapshotSpec`（`snapshot.rs`） | 实现 `SandboxSnapshotSpec`，内部包装 harness `RemoteSnapshotSpec`（id 校验/`RemoteSandboxSnapshot` 接线复用）。**差异**：Java 另有 `(endpoint, accessKeyId, accessKeySecret, bucket, prefix)` 便捷构造器（内部 `OSSClientBuilder`）；Rust 无 SDK 故无此构造器（P2） |
 | `OssDistributedStore` | 组合者：state store + base store + snapshot spec（+ guard） | `OssDistributedStore`（`distributed_store.rs`） | 共享同一 `OssClient`，按 `state/`/`store/`/`snapshot/` 子前缀组合；另暴露 `distributed_store()` 产出 harness `DistributedStore`（字段不足见 §4.2） |
 | (harness `SandboxExecutionGuard`) | **Java OSS 模块不定义自己的 guard**：`OssDistributedStore` 未覆写 `sandboxExecutionGuard()` → 落回 `DistributedStore` 默认 `SandboxExecutionGuard.noop()` | `OssSandboxExecutionGuard`（`guard.rs`） | **不新建平行类型**（遵守 EXTENSIONS_GAP_TRACKER §2.1）：透明包装 harness `SandboxExecutionGuard`，语义完全委托。**注**：这是 Rust 侧比 Java 多出的便利类型（Java 无 `Oss*Guard`），不属于「对齐缺口」 |
-| `com.aliyun.oss.OSS` | 阿里云 OSS SDK 客户端 | `OssClient` trait（`client.rs`）+ `InMemoryOssClient` | 后端抽象（put/get/exists/delete/list_page/list_all/shutdown）；**实机后端并未接线**：`Cargo.toml` 有 optional `aliyun-oss-rust-sdk`（feature `aliyun`），但 `src/` 内 `cfg(feature = "aliyun")` 命中 **0** 处，无任何实现 → 目前只有内存后端（见 §6.3 P0-1）。**注意 `lib.rs:19-20` 的 crate 级文档仍写「a concrete Alibaba Cloud backend can be supplied by enabling the `aliyun` feature」——该说法与代码不符（feature 打开后仍无任何后端实现），属误导性文档（P1-7）** |
+| `com.aliyun.oss.OSS` | 阿里云 OSS SDK 客户端 | `OssClient` trait（`client.rs`）+ `InMemoryOssClient` + （`s3` feature）`S3OssClient` | 后端抽象（put/get/exists/delete/list_page/list_all/shutdown）。**已于裁定 8 改为通用 `s3` feature（§7）**；`lib.rs` 文档已在 §8-4 更正为「feature 只负责**编译**客户端、绝不自动选后端；默认只有 `InMemoryOssClient`；需显式配置 bucket/region/endpoint/凭证」。**仍缺**：阿里云 OSS 原生 SDK 路径（走 S3 兼容端点代替，P2） |
 | `JsonUtils` / Jackson | JSON 编解码 | `serde_json` | 直接映射 |
 | `ListHashUtil` | 列表变更检测 | `agentscope_core::state::list_hash` | 直接复用，无平行实现 |
 
@@ -47,9 +47,9 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | crate 骨架 + Cargo 依赖 | pom.xml | 已完成 | 依赖仅写入本 crate `Cargo.toml`；未改根 `[workspace.dependencies]`，未改 core/harness。**冗余依赖**：`futures`、`chrono` 在 `src/`+`tests/` 中零引用（`chrono` 仅 3 处注释误命中），建议清理（P2-1） |
-| `OssClient` 后端抽象 + `InMemoryOssClient` | `OSS` (SDK) | 已完成 | `client.rs`；put/get/exists/delete/list_page/list_all/shutdown；key 前缀归一 + snapshotId 校验辅助。**`list_page` 分页/续传令牌逻辑无测试覆盖**（`InMemoryOssClient` 的 `next_token`/`truncated` 分支零用例，见 §6.3 P1-2）。**且 `InMemoryOssClient` 无任何分页构造器（`max_keys` 固定由调用方传入，`list_all` 内部硬编码 1000），无法在测试中构造 >1 页场景**（见 §6.4 P1-2a） |
-| `OssAgentStateStore` | `OssAgentStateStore` | 已完成 | 实现 `AgentStateStore`（save/save_list/get/get_list/exists/delete/list_session_ids/close）；`__anon__` 默认用户；三后缀 `.json`/`.list.json`/`.list.hash`。**缺 Java 的 per-key `delete(userId, sessionId, key)`**（core trait 无此方法，P1-1） |
-| `OssStore`（`BaseStore`） | `OssBaseStore` | 已完成 | 实现 `BaseStore`（get/put/put_if_version/search/delete）；`search` 按 key 排序分页、排除 `.version`；key 去前导 `/` |
+| `OssClient` 后端抽象 + `InMemoryOssClient` | `OSS` (SDK) | 已完成 | `client.rs`；put/get/exists/delete/list_page/list_all/shutdown；key 前缀归一 + snapshotId 校验辅助。**分页已补齐（§8-2）**：新增 `InMemoryOssClient::with_page_size(n)` / `page_size()`，`list_page` 受页帽约束（`max_keys=0` → 空页且 `truncated=false`）；`tests/pagination.rs` 13 用例覆盖首页/续传/最后一页/精确边界/空结果/`list_all` 多页聚合 |
+| `OssAgentStateStore` | `OssAgentStateStore` | 已完成 | 实现 `AgentStateStore`（save/save_list/get/get_list/exists/delete/list_session_ids/close）；`__anon__` 默认用户；三后缀 `.json`/`.list.json`/`.list.hash`。**per-key `delete_key` 已落地（§8-1）**（crate 固有方法，仿 MONGODB 先例，不改 core trait） |
+| `OssStore`（`BaseStore`） | `OssBaseStore` | 已完成 | 实现 `BaseStore`（get/put/put_if_version/search/delete）；`search` 按 key 排序分页、排除 `.version`；key 去前导 `/`；**错误传播已对齐（§8-3）**：新增固有方法 `search_strict -> OssResult<Vec<StoreItem>>`（列表 key 不在 namespace prefix 下 / item JSON 损坏 → `OssError::Backend`/`Json`，对齐 Java 抛 `RuntimeException`），trait `search` 委托它并在错误时返回空页 + `tracing::error!`（不再静默伪造 item key） |
 | `OssRemoteSnapshotClient` + `OssSnapshotSpec` | `OssRemoteSnapshotClient`/`OssSnapshotSpec` | 已完成 | 实现 `RemoteSnapshotClient`/`SandboxSnapshotSpec`；`.tar` 布局；内部复用 harness `RemoteSnapshotSpec`。**缺 Java 的 endpoint/AK/SK 便捷构造器**（P2-2） |
 | `OssDistributedStore` | `OssDistributedStore` | 已完成 | 组合 state/base store + snapshot spec + guard；子前缀 `state/`/`store/`/`snapshot/`；`distributed_store()` 产出 harness 组合 |
 | `OssSandboxExecutionGuard` | (harness guard) | 已完成 | 透明包装 harness `SandboxExecutionGuard`（不新建平行类型，遵守 §2.1）。**注意**：Java OSS 模块**没有** guard 类也不覆写 `sandboxExecutionGuard()`，本类型属 Rust 侧便利增量，非对齐项 |
@@ -57,35 +57,37 @@
 ### 3.2 测试（P0）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| AgentStateStore 测试 | `OssAgentStateStoreTest`（137 行 / 10 `@Test`） | 已完成 | `tests/agent_state_store.rs`（174 行 / **15 用例**，实测 `#[test]`+`#[tokio::test]` 计数）：builder 校验、key 布局、`__anon__`、单值/列表往返、append 重写、exists、list_session_ids、delete、close、prefix 归一。**缺**：Java 的 per-key `delete` 用例（因 trait 无此方法） |
-| BaseStore 测试 | `OssBaseStoreTest`（153 行 / 10 `@Test`） | 已完成 | `tests/base_store.rs`（171 行 / **13 用例**）：builder 校验、put/get+version、CAS 命中/未命中/expected=0、search 分页排序、排除 `.version`、delete、去前导 `/`、命名空间隔离 |
+| AgentStateStore 测试 | `OssAgentStateStoreTest`（137 行 / 10 `@Test`） | 已完成（P1-1 已补） | `tests/agent_state_store.rs`（**18 用例**，实测 `#[test]`+`#[tokio::test]` 计数）：builder 校验、key 布局、`__anon__`、单值/列表往返、append 重写、exists、list_session_ids、delete、close、prefix 归一，以及 **per-key `delete_key` 4 用例**（§8-1） |
+| BaseStore 测试 | `OssBaseStoreTest`（153 行 / 10 `@Test`） | 已完成（P1-3 已补） | `tests/base_store.rs`（**17 用例**）：builder 校验、put/get+version、CAS 命中/未命中/expected=0、search 分页排序、排除 `.version`、delete、去前导 `/`、命名空间隔离；**新增 4 个**：多页 `search`、`search_strict` 拒绝越界 key、传播列表错误、拒纳损坏 JSON（§8-3） |
+| 分页测试 | —（Java 无对应测试类） | **已完成（P1-2）** | `tests/pagination.rs`（**13 用例**）：`page_size` 钳位、首页+续传令牌、续传、最后一页、精确边界页、无匹配空页、token 越过末 key、`max_keys=0`、调用方 `max_keys` 小于页帽、`list_all` 多页聚合/空结果、state store `list_session_ids` 与 session `delete` 跨页 |
 | Snapshot 测试 | —（Java 无对应测试类） | 已完成 | `tests/snapshot.rs`（75 行 / **7 用例**）：上传/下载/存在往返、缺失失败、空桶校验、非法 id 拒绝、spec build、persist/restore |
 | Guard + DistributedStore 测试 | —（Java 无对应测试类） | 已完成 | `tests/guard_and_distributed.rs`（88 行 / **6 用例**）：guard 委托语义/可重入、空桶校验、子前缀组合、harness `DistributedStore` 组装、`dyn BaseStore` 可用性 |
 | 文档测试 | — | 已完成 | `lib.rs` doc example（`no_run`，1 个；因 `no_run` 只编译不执行，实际断言价值为 0） |
-| **lib 内联单测** | — | **待办（P1-2）** | **`src/` 内 `#[cfg(test)]`/`mod tests` 命中 0 处**——与 `EXTENSIONS_GAP_TRACKER` 中同类 crate（如 COS/POSTGRESQL 在 `sql.rs`/`state.rs` 内联单测）不一致。**本轮复核已重新定性（见 §6.4 末条）**：属**风格差异，非功能缺口**，不构成独立阻塞项；真正需补的是 P1-2a 的**分页构造器**（`InMemoryOssClient` 当前无分页能力，多页场景不可测） |
+| **lib 内联单测** | — | **风格差异（非缺口）** | `src/` 内 `#[cfg(test)]`/`mod tests` 命中 0 处（仅 `s3` feature 下 `src/s3.rs` 有 4 个内联用例）。**§6.4 结论并维持**：不构成独立阻塞项；P1-2a 要求的**分页构造器**已于 §8-2 补齐 |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **已完成**：`agentscope-extensions-oss` 全量实现，产出契约 4 类 trait 实现 + 组合者 + 后端抽象。
-- **验证命令与结果**（原会话记录，本次静态复核未重跑）：
+- **已完成**：`agentscope-extensions-oss` 全量实现，产出契约 4 类 trait 实现 + 组合者 + 后端抽象；§8（2026-10-26）关闭 P1-1/P1-2/P1-3/P1-7。
+- **验证命令与结果**（原会话记录；§8 改动**尚未由子智能体跑 cargo**，待主智能体统一验证）：
   - `cargo build -p agentscope-extensions-oss` → Finished（本 crate 无 error/warning）
-  - `cargo test -p agentscope-extensions-oss` → **42 passed / 0 failed**
+  - `cargo test -p agentscope-extensions-oss`（基线，§8 前）→ **42 passed / 0 failed**
     - `agent_state_store` 15 ✓ / `base_store` 13 ✓ / `guard_and_distributed` 6 ✓ / `snapshot` 7 ✓ / doc-test 1 ✓
-  - **静态复核已确认用例数属实**：`#[test]`/`#[tokio::test]` 实测 41（15+13+7+6），`lib.rs` doc-test 1 → 42；`src/` 内 `cfg(test)` 为 0。
+  - **§8 后预期用例数**：默认 feature **61 test + 1 doc-test**（`agent_state_store` 18 / `base_store` 17 / `pagination` 13 / `guard_and_distributed` 6 / `snapshot` 7）；`--features s3` **72 test + 2 doc-test**（再 + 内联 `s3` 4 + `tests/s3.rs` 7）
 - **文件清单**（实测行数）：
-  - `crates/agentscope-extensions-oss/Cargo.toml`（33 行，+ feature `aliyun`、optional `aliyun-oss-rust-sdk`）
-  - `src/lib.rs`(52)、`src/error.rs`(53)、`src/client.rs`(224)、`src/state_store.rs`(292)、`src/base_store.rs`(265)、`src/snapshot.rs`(128)、`src/guard.rs`(65)、`src/distributed_store.rs`(131) → **8 文件 1210 行**
-  - `tests/common/mod.rs`(17)、`tests/agent_state_store.rs`(174)、`tests/base_store.rs`(171)、`tests/snapshot.rs`(75)、`tests/guard_and_distributed.rs`(88) → **5 文件 525 行**
-- **已知问题**（2026-10-22 静态复核新增，详见 §6）：
-  - 实机 OSS 后端**未接线**：feature `aliyun` 下无任何 `cfg(feature)` 代码，生产环境仅有 `InMemoryOssClient`（P0-1）；`lib.rs:19-20` 文档仍宣称开启 feature 即可获得实机后端（P1-7）。
-  - 缺 per-key `delete`（Java 有，Rust core trait 无；MONGODB crate 已有 `delete_key` 先例可照抄）（P1-1）。
-  - `OssClient::list_page` 分页/续传分支零覆盖，且内存后端无分页构造器；`src/` 无内联单测（P1-2）。
+  - `crates/agentscope-extensions-oss/Cargo.toml`（feature 已改为 `s3`，见 §7）
+  - `src/lib.rs`、`src/error.rs`、`src/client.rs`、`src/state_store.rs`、`src/base_store.rs`、`src/snapshot.rs`、`src/guard.rs`、`src/distributed_store.rs`、`src/s3.rs`（feature `s3`）
+  - `tests/common/mod.rs`、`tests/agent_state_store.rs`、`tests/base_store.rs`、`tests/snapshot.rs`、`tests/guard_and_distributed.rs`、`tests/s3.rs`（feature `s3`）、**`tests/pagination.rs`（§8-2 新增）**
+- **已知问题**（历史快照，§6 静态复核新增；P1 已在 §8 关闭）：
+  - ~~实机 OSS 后端未接线（P0-1）~~ → 已由裁定 8（`s3` + `S3OssClient`，§7）替代实现；`lib.rs` 文档已于 §8-4 更正。
+  - ~~缺 per-key `delete`（P1-1）~~ → §8-1 已实现 `OssAgentStateStore::delete_key`。
+  - ~~`list_page` 分页/续传分支零覆盖、无分页构造器（P1-2）~~ → §8-2 已补构造器 + 13 用例。
+  - ~~`search` prefix 不匹配静默返回错值（P1-3）~~ → §8-3 已改为 `search_strict` 返回 `OssError`。
   - `futures`/`chrono`/`serde`/`tokio`（`[dependencies]` 中的）零引用；`OssError::SnapshotNotFound`/`Backend` 未被构造（P2-1/P2-3）。
   - Java `OssBaseStore.putIfVersion` 用 `long`，Java `OssAgentStateStore` 另有 `supportsVersioning`/`getVersioned`/`saveIfVersion` 版本化 API；Rust 侧 `OssAgentStateStore` **未覆写** `supports_versioning`/`get_versioned`/`save_if_version`（默认 `false`/降级为无条件写），与 Java 一致，但意味着 OSS 状态存储**无乐观并发**（P2-7）。
 
 ### 4.2 下一步与阻塞（需汇总方裁定）
 1. **harness `DistributedStore` 字段不足**（与 EXTENSIONS_GAP_TRACKER §2.2 同项）：harness `DistributedStore` 仅 `agent_state_store` + `isolation_scope`，无 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard`。当前 `OssDistributedStore` 自行持有并暴露这些组件，`distributed_store()` 仅能产出含 `agent_state_store` 的 harness 结构。建议扩展到 harness 或明确由各扩展自行组合。
-2. **实机阿里云后端**：`aliyun-oss-rust-sdk` 为 optional（feature `aliyun`），默认关闭。**本轮复核已定性：这不是「依赖选型待裁定」，而是「实机后端代码根本不存在」**（`src/` 内 `cfg(feature = "aliyun")` 命中 0 处，见 §6.5 P0-1）。建议二选一：① 实现 `AliyunOssClient`（`impl OssClient`，置于 `cfg(feature = "aliyun")` 模块内）；② 或改用 `opendal`(oss service) / `object_store` 重写后端 trait。`OssClient` trait 已隔离后端，切换成本低。**同时须修正 `src/lib.rs:19-20` 的误导性文档（P1-7）**。
+2. **实机阿里云后端**：`aliyun-oss-rust-sdk` 为 optional（feature `aliyun`），默认关闭。**本轮复核已定性：这不是「依赖选型待裁定」，而是「实机后端代码根本不存在」**（`src/` 内 `cfg(feature = "aliyun")` 命中 0 处，见 §6.5 P0-1）。建议二选一：① 实现 `AliyunOssClient`（`impl OssClient`，置于 `cfg(feature = "aliyun")` 模块内）；② 或改用 `opendal`(oss service) / `object_store` 重写后端 trait。`OssClient` trait 已隔离后端，切换成本低。**同时须修正 `src/lib.rs:19-20` 的误导性文档（P1-7）**（已于 §8-4 定稿）。
 3. **未改根 `[workspace.dependencies]`**：本 crate 的 `aliyun-oss-rust-sdk` 为本地 `[dependencies]` optional，未登记到根；如需统一版本请汇总方处理。
 4. **实机 OSS live 验证待凭据**：端到端需真实 OSS endpoint/AK/SK（同类于 MIGRATION_GAP_TRACKER §7.3）。
 
@@ -190,6 +192,8 @@
   - **关于「lib 零内联测试」的定性（本轮结论）**：经评估，**不构成本模块的独立阻塞项**。理由：① 41 个集成用例已覆盖 5 个契约件的公开 API 主干；② 本 crate 逻辑密度低（842 有效行，其中约 40% 为 builder/派生样板），私有纯函数仅 3 个（`normalize_prefix`/`strip_leading_slashes`/`validate_snapshot_id`）且均被集成用例间接覆盖；③ `EXTENSIONS_GAP_TRACKER` 中 COS/POSTGRESQL 的内联单测惯例**并非全波次强制**（SKILLS/MEM/STUDIO 等 crate 同样以 `tests/` 为主）。真正需要补的是 **P1-2a 的分页构造器**（可测性缺口），而非机械地补 `src/` 内联用例。建议 §3.2 该行状态维持 `待办（P1-2）`，但把「与同类 crate 不一致」的表述降级为「风格差异，非功能缺口」。
 
 ### 6.5 新发现缺口（按优先级）
+
+> **2026-10-26 状态：本节 P1-1 / P1-2 / P1-3 / P1-7 已于 §8 关闭，P0-1 已由裁定 8（§7）替代实现；下文保留为历史快照。**
 
 **P0**
 1. **P0-1 实机 OSS 后端不存在（空壳 feature）**：`Cargo.toml:13` 声明 `aliyun = ["dep:aliyun-oss-rust-sdk"]`，但 `src/` 内 `cfg(feature = "aliyun")` 命中 **0** 处，`aliyun-oss-rust-sdk` 未被任何代码 `use`。后果：`--features aliyun` 编译后**仍然只能拿到 `InMemoryOssClient`**，crate 在生产环境**无法连接真实 OSS**。Java 侧 `pom.xml` 硬依赖 `aliyun-sdk-oss:3.18.5` 且 5 个类全部直接操作 `OSS`。当前 tracker 把此项写成「实机后端待接入 / 需汇总方裁定」（§4.2-2），属**低估**——这不是「待裁定」而是**未实现**。建议：要么实现 `AliyunOssClient`（`impl OssClient`，`cfg(feature = "aliyun")`），要么在 §1/§3.1 明确标注「本 crate 交付范围仅含内存后端，实机后端为后续波次」，避免下游误以为可直接投产。
@@ -313,4 +317,60 @@
 - **环境变量回退未直接测试**：测试使用 `env_credentials(false)` 保证确定性，避免并行测试修改全局环境变量；回退逻辑仅代码审阅覆盖。
 - **MSRV**：`rust-s3 0.38.0` 声明 `edition = "2024"`（需 rustc ≥ 1.85），而 workspace `rust-version = "1.80.0"`；本轮在 rustc 1.96.1 上验证通过，若需严格 1.80 MSRV 需汇总方另行裁定依赖版本。
 - **网关差异**：部分 S3 兼容网关对缺失对象 DELETE 返回 404、对 HEAD 返回 403 等行为可能不同；当前按「404/NoSuchKey = 不存在」处理，未在真实网关矩阵中验证。
+
+## 8. P1 关闭记录（2026-10-26）
+
+> 本轮只改 `crates/agentscope-extensions-oss/**`（含本 tracker），**未动**根 `Cargo.toml` / `agentscope-core` / `agentscope-harness` / 其它 crate。
+> **未跑 cargo**（编译/测试由主智能体统一验证），因此下文「用例数」为静态计数，尚未实测。
+
+### 8.1 逐项处置
+
+#### 8.1-1 P1-1 per-key `delete` → 已关闭
+- 新增 `OssAgentStateStore::delete_key(user_id, session_id, key) -> OssResult<()>`（`src/state_store.rs`，async 固有方法），一次删除 `.json` / `.list.json` / `.list.hash` 三个对象。
+- 与 MONGODB 先例一致（`agentscope-extensions-mongodb/src/state_store.rs` 的 `delete_key`）：**crate 固有方法，不改 core/harness trait**。
+- 语义：幂等（对象不存在不报错，`OssClient::delete` 本就幂等，Java 先 `doesObjectExist` 再删是等价优化）；`session_id` 空白 → `OssError::BlankIdentifier("sessionId")`；首个后端错误 `?` 上抛（Java 抛 `RuntimeException`）。
+- **改前如何失败**：`delete_key` 不存在 → `tests/agent_state_store.rs` 编译失败（`E0599 no method named delete_key`）；旧用例 `delete_key_removes_state_and_list_objects` 实际只测了 session 级 `delete`（注释自认「emulate key delete」），无任何 per-key 断言。
+- 用例（4）：`delete_key_removes_state_and_list_objects`（三对象消失 + 兄弟 key/会话存活 + 随后 session delete 仍清空）、`delete_key_is_idempotent_for_missing_objects`、`delete_key_is_scoped_to_one_user_and_session`、`delete_key_rejects_blank_session_id`。
+
+#### 8.1-2 P1-2 分页零覆盖 + 无分页能力 → 已关闭
+- `InMemoryOssClient` 新增 `page_size: Option<usize>` 字段、`with_page_size(n)`（`n` 钳位到 ≥1）与 `page_size()`；`list_page` 实际页大小 = `min(max_keys, cap)`；`max_keys == 0` 直接返回空页且 `truncated=false`（修正了旧实现「`truncated=true` 但无 token」的自相矛盾）。
+- `Client::list_all` 仍走默认实现（每次 1000），因此页帽只由替身控制——与真实 OSS/S3 的分页行为一致。
+- **改前如何失败**：多页用例写不出来——`list_page(prefix, 1000, None)` 一次返回全部 key、`truncated` 恒 `false`、续传分支不可达；`tests/pagination.rs` 引用 `with_page_size` 会 `E0599`。
+- 用例（13，`tests/pagination.rs`）：`page_size_is_exposed_and_clamped_to_at_least_one`、`list_page_returns_first_page_and_continuation_token`、`list_page_resumes_after_continuation_token`、`list_page_last_page_is_not_truncated`、`list_page_exact_boundary_last_page_is_not_truncated`、`list_page_without_matches_returns_empty_page`、`list_page_token_past_last_key_returns_empty_page`、`list_page_zero_max_keys_returns_empty_untruncated_page`、`list_page_honours_caller_max_keys_below_page_cap`、`list_all_aggregates_every_page`、`list_all_returns_empty_vec_for_missing_prefix`、`state_store_list_session_ids_spans_pages`、`state_store_session_delete_spans_pages`。
+- 配套 store 侧用例（`tests/base_store.rs`）：`search_spans_multiple_pages`。
+- 未做：session `delete` 仍逐 key 删除（未做 Java 的「1000/批 `deleteObjects`」，P2-5 保留）。
+
+#### 8.1-3 P1-3 错误传播弱化（`search` prefix 不匹配）→ 已关闭
+- 新增 `OssStore::search_strict(namespace, limit, offset) -> OssResult<Vec<StoreItem>>`（`src/base_store.rs`）：
+  - 列表 key 不以 namespace prefix 开头 → `OssError::Backend("listed object key '<key>' is outside namespace prefix '<prefix>'")`（对齐 Java 未加保护的 `substring` 抛 `RuntimeException`）；
+  - item JSON 反序列化失败 → `OssError::Json`（旧实现用 `if let Ok(..)` 静默跳过）；
+  - 读对象 / 列表本身失败 → `?` 上抛。
+- `BaseStore::search`（无错误通道）委托 `search_strict`，错误时 `tracing::error!` + 返回空页；**不再用 `unwrap_or(data_key)` 静默伪造 item key**（改前的错值：整条 object key 被当成 `item_key`）。
+- **改前如何失败**：`search_strict_errors_when_listed_key_is_outside_namespace_prefix` 中 `search_strict` 不存在（`E0599`）；即便去掉该调用，旧实现会返回 `item.key == "test/store/ns2/rogue.json"` 而不是报错。`search_strict_rejects_malformed_item_json` 在旧实现下返回空 `Vec`（静默跳过），`Err(OssError::Json(_))` 断言失败。
+- 用例（4）：`search_strict_errors_when_listed_key_is_outside_namespace_prefix`、`search_strict_propagates_listing_errors`、`search_strict_rejects_malformed_item_json`、`search_spans_multiple_pages`（后者属 P1-2，一并加在同一文件）。
+- 未做：`BaseStore::get`/`put`/`delete` 与 `AgentStateStore::save`/`get`/`get_list` 的静默降级仍未提供 strict 变体（本轮只关闭被点名的 `search`；其余保留为 P1 待办）。
+
+#### 8.1-4 P1-7 误导性 crate 文档 → 已关闭
+- 重写 `src/lib.rs` 的「Backend abstraction」段：后端**绝不自动选择**——默认 feature 只有 `InMemoryOssClient`（进程内存）；`s3` feature（默认关）只负责**编译** `S3OssClient`，开启 feature 本身不创建后端、不访问任何 bucket；必须显式构造并配置 bucket（必填）/ region（默认 `us-east-1`）/ endpoint（MinIO / Ceph / R2 / OSS-S3 必需，自定义 endpoint 自动 path-style）/ access key + secret key（可回退 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`，缺则 `OssError::MissingCredentials`），并补充分页契约与 `with_page_size` 说明。
+- 同时修正 `src/client.rs` 模块文档里残留的 `aliyun-oss-rust-sdk` / feature `aliyun` 描述（裁定 8 已删该依赖）。
+- **改前如何失败**：纯文档项，无测试可失败；判据是 `cargo doc` 无 warning 且文案与代码一致。`lib.rs` 的 `no_run` doctest 保持原样（默认 feature 编译空 `main`，`--features s3` 编译真实 builder 用法）。
+
+### 8.2 改动文件清单
+| 文件 | 改动 |
+|---|---|
+| `src/state_store.rs` | +`delete_key`（P1-1）；模块文档注明 per-key vs session 级删除 |
+| `src/client.rs` | +`InMemoryOssClient::with_page_size` / `page_size`；`list_page` 页帽与 `max_keys=0` 语义；模块文档去掉 `aliyun` 残留（P1-2/P1-7） |
+| `src/base_store.rs` | +`search_strict`；`search` 改为委托；修正 `.list.json` 注释；模块文档补「Search error semantics」（P1-3） |
+| `src/lib.rs` | 「Backend abstraction」段落重写（P1-7） |
+| `tests/agent_state_store.rs` | 旧 `delete_key_*` 用例改为真测 per-key；+3 用例（15 → 18） |
+| `tests/base_store.rs` | +4 用例（13 → 17），含 2 个测试内 fake `OssClient`（越界列表 / 列表失败） |
+| `tests/pagination.rs` | **新增**，13 用例 |
+| `docs/extensions/OSS__GAP_TRACKER.md` | §1/§2/§3.1/§3.2/§4.1 状态 + 本 §8 |
+
+### 8.3 未做 / 仍需保留的待办
+- **P1-4**：`OssDistributedStore` 无法产出完整 harness `DistributedStore`（`DistributedStore` 仅 `agent_state_store` + `isolation_scope`）——受 harness struct 限制，本轮按「不改 harness」未动，仍见 §4.2-1。
+- **P2-1** 冗余依赖（`futures`/`chrono`/`serde`/`tokio`）、**P2-3** 死错误变体、**P2-4**（注释已一并修正）、**P2-5** 批量删除、**P2-6** 死代码、**P2-7** OSS 状态存储无乐观并发（与 Java 一致）、**P2-8** 零调用访问器：未做。
+- **真实云 live 验证**：仍需 OSS/S3 凭据，参见 §7.6。
+- **`search` 之外的静默降级**：见 §8.1-3「未做」。
+
 

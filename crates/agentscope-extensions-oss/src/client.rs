@@ -4,10 +4,12 @@
 //! same object-model semantics (put/get/exists/delete/list) behind the
 //! [`OssClient`] trait so that:
 //!
-//! * the concrete crate `aliyun-oss-rust-sdk` dependency is optional (feature
-//!   `aliyun`) and never required for testing the stores;
-//! * unit tests can use an in-memory [`InMemoryOssClient`] mirroring the
-//!   Mockito-mocked `OSS` in the Java tests.
+//! * object storage backends stay swappable: the in-memory
+//!   [`InMemoryOssClient`] is always available, while the S3-compatible backend
+//!   only compiles with the opt-in `s3` feature (see the `s3` module);
+//! * tests can use [`InMemoryOssClient`] (optionally via
+//!   [`InMemoryOssClient::with_page_size`]) mirroring the Mockito-mocked `OSS`
+//!   in the Java tests, including multi-page listings.
 //!
 //! All methods are synchronous because the core/harness store traits
 //! ([`agentscope_core::state::AgentStateStore`],
@@ -56,6 +58,7 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
     /// Lists up to `max_keys` objects under `prefix`.
     ///
     /// When `continuation_token` is `Some`, listing resumes after that token.
+    /// `max_keys == 0` yields an empty, non-truncated page.
     fn list_page(
         &self,
         prefix: &str,
@@ -64,6 +67,9 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
     ) -> OssResult<OssListPage>;
 
     /// Lists every object key under `prefix`, following continuation tokens.
+    ///
+    /// Real backends cap a page (1000 keys for OSS/S3), so this helper is what
+    /// makes store-level operations pagination-correct.
     fn list_all(&self, prefix: &str) -> OssResult<Vec<String>> {
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
@@ -92,16 +98,42 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
 ///
 /// Keys are kept in a `BTreeMap` so [`OssClient::list_all`] returns sorted keys,
 /// matching OSS lexicographic ordering used by the real backend.
+///
+/// By default a single [`OssClient::list_page`] call may return every matching
+/// key, which makes multi-page behaviour untestable. Use
+/// [`InMemoryOssClient::with_page_size`] to emulate a backend page cap.
 #[derive(Debug, Default)]
 pub struct InMemoryOssClient {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
     shut_down: Mutex<bool>,
+    /// Optional per-page object cap, emulating the backend `MaxKeys` limit.
+    page_size: Option<usize>,
 }
 
 impl InMemoryOssClient {
     /// Creates an empty in-memory client.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty in-memory client that never returns more than
+    /// `page_size` objects per [`OssClient::list_page`] call.
+    ///
+    /// This emulates a real backend page cap (OSS/S3 cap a page at 1000 keys and
+    /// hand out continuation tokens), so tests can exercise multi-page listing.
+    /// `page_size` is clamped to at least `1`.
+    pub fn with_page_size(page_size: usize) -> Self {
+        Self {
+            objects: Mutex::new(BTreeMap::new()),
+            shut_down: Mutex::new(false),
+            page_size: Some(page_size.max(1)),
+        }
+    }
+
+    /// Returns the configured page cap, or `None` when a page may contain every
+    /// matching key.
+    pub fn page_size(&self) -> Option<usize> {
+        self.page_size
     }
 
     /// Returns the number of stored objects.
@@ -159,7 +191,17 @@ impl OssClient for InMemoryOssClient {
                 .unwrap_or(matched.len()),
             None => 0,
         };
-        let end = (start + max_keys).min(matched.len());
+        // Emulate the backend page cap when the client was built with one.
+        let effective_max = match self.page_size {
+            Some(cap) => max_keys.min(cap),
+            None => max_keys,
+        };
+        // `max_keys == 0` is an explicit request for an empty page (S3/OSS
+        // semantics); it must not report `truncated` without a token.
+        if effective_max == 0 {
+            return Ok(OssListPage::default());
+        }
+        let end = (start + effective_max).min(matched.len());
         let objects = matched[start..end]
             .iter()
             .map(|k| OssObjectSummary { key: (*k).clone() })

@@ -142,12 +142,64 @@ async fn delete_key_removes_state_and_list_objects() {
     s.save(Some("alice"), "s1", "k", serde_json::json!(1)).await;
     s.save_list(Some("alice"), "s1", "k", &[serde_json::json!(1)])
         .await;
+    s.save(Some("alice"), "s1", "other", serde_json::json!(2))
+        .await;
 
-    // AgentStateStore only defines session-level delete; emulate key delete by
-    // checking session delete below.
+    s.delete_key(Some("alice"), "s1", "k").await.unwrap();
+
+    // All three per-key objects are gone …
+    assert!(!client.exists("test/state/alice/s1/k.json").unwrap());
+    assert!(!client.exists("test/state/alice/s1/k.list.json").unwrap());
+    assert!(!client.exists("test/state/alice/s1/k.list.hash").unwrap());
+    assert!(s.get(Some("alice"), "s1", "k").await.is_none());
+    assert!(s.get_list(Some("alice"), "s1", "k").await.is_empty());
+    // … while the sibling key and the session itself survive (this is the Java
+    // per-key `delete`, not the session-level one).
+    assert!(client.exists("test/state/alice/s1/other.json").unwrap());
+    assert!(s.exists(Some("alice"), "s1").await);
+
+    // Session-level delete still removes everything.
     s.delete(Some("alice"), "s1").await;
     assert!(!s.exists(Some("alice"), "s1").await);
     assert!(client.is_empty());
+}
+
+#[tokio::test]
+async fn delete_key_is_idempotent_for_missing_objects() {
+    let client = common::mem_client();
+    let s = store(client.clone());
+
+    // Nothing stored yet: must succeed, not error.
+    s.delete_key(Some("alice"), "s1", "missing").await.unwrap();
+
+    s.save(Some("alice"), "s1", "k", serde_json::json!(1))
+        .await;
+    s.delete_key(Some("alice"), "s1", "k").await.unwrap();
+    s.delete_key(Some("alice"), "s1", "k").await.unwrap();
+
+    assert!(client.is_empty());
+}
+
+#[tokio::test]
+async fn delete_key_is_scoped_to_one_user_and_session() {
+    let client = common::mem_client();
+    let s = store(client.clone());
+    s.save(Some("alice"), "s1", "k", serde_json::json!(1)).await;
+    s.save(Some("alice"), "s2", "k", serde_json::json!(2)).await;
+    s.save(Some("bob"), "s1", "k", serde_json::json!(3)).await;
+
+    s.delete_key(Some("alice"), "s1", "k").await.unwrap();
+
+    assert!(!client.exists("test/state/alice/s1/k.json").unwrap());
+    assert!(client.exists("test/state/alice/s2/k.json").unwrap());
+    assert!(client.exists("test/state/bob/s1/k.json").unwrap());
+}
+
+#[tokio::test]
+async fn delete_key_rejects_blank_session_id() {
+    let s = store(common::mem_client());
+    let err = s.delete_key(Some("alice"), "   ", "k").await.unwrap_err();
+    assert!(matches!(err, OssError::BlankIdentifier("sessionId")));
 }
 
 #[tokio::test]
