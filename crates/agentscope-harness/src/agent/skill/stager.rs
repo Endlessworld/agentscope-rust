@@ -375,7 +375,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn stage_materializes_to_cache_dir() {
         let base = std::env::temp_dir().join(format!("asr_stager_{}", std::process::id()));
         let cache = base.join(CACHE_DIR).join("market").join("tool");

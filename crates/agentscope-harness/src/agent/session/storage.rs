@@ -4,7 +4,8 @@
 //! runtime state, not workspace material the model may edit. These backends therefore live
 //! under their own namespace and expose only the narrow [`AtomicSessionStorage`] capability.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::session::{
@@ -17,16 +18,45 @@ use crate::filesystem::Filesystem;
 /// Filesystem-backed atomic session storage.
 ///
 /// Each value is one file; versioning rides on a sibling `.version` object so a
-/// compare-and-set is a two-step check-then-write. That is sufficient for a single writer
-/// process (the journal supports only one execution writer anyway) and keeps the backend
-/// free of a database dependency.
+/// compare-and-set is a two-step check-then-write. A compare-and-set is serialized per path
+/// within this process: the journal's lease heartbeat renews `head.json` while a run's flush
+/// commits the same head, and without that serialization both writers passed the version
+/// check before either wrote, so the later write resurrected the older sequence number.
 pub struct WorkspaceSessionStorage {
     fs: Arc<dyn Filesystem>,
+    /// One asynchronous lock per value path, so the read-version → write-value → write-version
+    /// sequence cannot interleave with another compare-and-set on that path.
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl WorkspaceSessionStorage {
     pub fn new(fs: Arc<dyn Filesystem>) -> Self {
-        Self { fs }
+        Self {
+            fs,
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock_for(&self, path: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(path.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Whether a compare-and-set needs the per-path lock.
+    ///
+    /// Only mutable values (heads, session metadata, export cursors) race a second writer.
+    /// Commits, payload blobs and writer seals are content-addressed and written once; two
+    /// writers either write identical bytes or the immutable-conflict check rejects them.
+    /// Locking them would also retain one lock entry per event forever, so a long session grew
+    /// with its journal even after it stopped executing.
+    fn needs_cas_lock(path: &str) -> bool {
+        !path.contains("/commits/")
+            && !path.contains("/blobs/")
+            && !path.contains("/writer-seals/")
     }
 
     fn version_path(path: &str) -> String {
@@ -40,6 +70,25 @@ impl WorkspaceSessionStorage {
         }
         let data = self.fs.read(ctx, &version_path, 0, usize::MAX).await?;
         Ok(data.content.trim().parse::<u64>().unwrap_or(0))
+    }
+
+    /// Replaces a value without ever exposing a missing or half-written file.
+    ///
+    /// The filesystem `write` is create-if-absent (that guarantee keeps model-facing tools from
+    /// clobbering files), so an overwrite used to delete the old value first. A reader landing
+    /// in that window saw "no value" for a path that does exist — `head.json` in particular —
+    /// and the journal then reported seq 0 to a live run. That surfaced as a false
+    /// `interrupted` receipt while the run was still executing, and made the host try to
+    /// continue a turn that never stopped. Writing a sibling and moving it over the target
+    /// keeps the previous bytes visible until the new value is complete.
+    async fn replace(&self, ctx: &RuntimeContext, path: &str, content: &str) -> crate::Result<()> {
+        let temp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+        self.fs.write(ctx, &temp, content).await?;
+        if let Err(error) = self.fs.move_path(ctx, &temp, path).await {
+            let _ = self.fs.delete(ctx, &temp).await;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Lists only the immediate subdirectories of `prefix`, without trailing slashes.
@@ -74,7 +123,26 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
     async fn read(&self, path: &str) -> crate::Result<Option<StorageValue>> {
         let ctx = RuntimeContext::new();
         if !self.fs.exists(&ctx, path).await? {
-            return Ok(None);
+            // A value is replaced without ever disappearing (`replace`), so a missing value
+            // normally means "not written yet". A version marker without its value can only
+            // be a write that was interrupted or a writer from an older build (which deleted
+            // before writing). Wait for it briefly instead of reporting an empty journal: the
+            // journal maps "no head" to seq 0, which reads as "no history" even though its
+            // commits exist.
+            let version_path = Self::version_path(path);
+            if !self.fs.exists(&ctx, &version_path).await? {
+                return Ok(None);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if self.fs.exists(&ctx, path).await? {
+                    break;
+                }
+            }
+            if !self.fs.exists(&ctx, path).await? {
+                return Ok(None);
+            }
         }
         let version = self.read_version(&ctx, path).await?;
         let data = self.fs.read(&ctx, path, 0, usize::MAX).await?;
@@ -88,23 +156,29 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
         bytes: &[u8],
     ) -> crate::Result<bool> {
         let ctx = RuntimeContext::new();
+        // Serialize the whole check-then-write. The lease heartbeat and the run's flush
+        // both compare-and-set `head.json`; let the version check and both writes run under
+        // one lock so a stale renew cannot overwrite a newer sequence number. Immutable,
+        // content-addressed paths do not need the lock (and must not accumulate one entry
+        // per committed event).
+        let lock = Self::needs_cas_lock(path).then(|| self.lock_for(path));
+        let _guard = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let current = self.read_version(&ctx, path).await?;
         if current != expected_version {
             return Ok(false);
         }
         let content = String::from_utf8(bytes.to_vec())
             .map_err(|_| agentscope_core::Error::Agent("session values must be UTF-8".into()))?;
-        if self.fs.exists(&ctx, path).await? {
-            self.fs.delete(&ctx, path).await?;
-        }
-        self.fs.write(&ctx, path, &content).await?;
-        let version_path = Self::version_path(path);
-        if self.fs.exists(&ctx, &version_path).await? {
-            self.fs.delete(&ctx, &version_path).await?;
-        }
-        self.fs
-            .write(&ctx, &version_path, &(expected_version + 1).to_string())
-            .await?;
+        self.replace(&ctx, path, &content).await?;
+        self.replace(
+            &ctx,
+            &Self::version_path(path),
+            &(expected_version + 1).to_string(),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -118,7 +192,7 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
         let mut paths: Vec<String> = entries
             .into_iter()
             .map(|entry| entry.path)
-            .filter(|path| !path.ends_with(".version"))
+            .filter(|path| !path.ends_with(".version") && !path.contains(".tmp-"))
             .collect();
         paths.sort();
         Ok(paths)
@@ -249,6 +323,99 @@ mod tests {
         // The current version succeeds.
         assert!(storage.compare_and_set("s1/head.json", 1, b"second").await.unwrap());
         assert_eq!(storage.read("s1/head.json").await.unwrap().unwrap().bytes, b"second".to_vec());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn values_are_replaced_without_a_visible_gap() {
+        // The journal reads `head.json` on every receipt poll. Replacing a value used to
+        // delete it before writing the new bytes, so a reader in that window saw "no value"
+        // and the journal reported seq 0 — a live run looked interrupted and a restored
+        // session looked empty. Readers must always see either the old or the new value.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = temp_dir("atomic");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let storage = Arc::new(WorkspaceSessionStorage::new(fs));
+        storage
+            .compare_and_set("s1/head.json", 0, b"0")
+            .await
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let storage = Arc::clone(&storage);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut missing = 0usize;
+                let mut reads = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    if storage.read("s1/head.json").await.unwrap().is_none() {
+                        missing += 1;
+                    }
+                    reads += 1;
+                    tokio::task::yield_now().await;
+                }
+                (missing, reads)
+            })
+        };
+        for version in 1..200u64 {
+            assert!(storage
+                .compare_and_set("s1/head.json", version, version.to_string().as_bytes())
+                .await
+                .unwrap());
+        }
+        stop.store(true, Ordering::SeqCst);
+        let (missing, reads) = reader.await.unwrap();
+        assert!(reads > 0, "the reader never ran");
+        assert_eq!(
+            missing, 0,
+            "a reader observed an existing value as missing while it was replaced"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_compare_and_set_keeps_one_winner() {
+        // The lease heartbeat renews `head.json` every 30s while the run's flush may commit
+        // the same head. Both used to read the same version before either wrote it, so both
+        // reported success and the later writer overwrote the head with its older sequence
+        // number. The next commit then failed with "stale committed prefix", the run's
+        // `run/end` was lost, and the host auto-resumed a turn that had already finished.
+        let dir = temp_dir("cas_race");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let storage = Arc::new(WorkspaceSessionStorage::new(fs));
+
+        for round in 0..32u32 {
+            let path = format!("s{round}/head.json");
+            let first = {
+                let storage = Arc::clone(&storage);
+                let path = path.clone();
+                tokio::spawn(async move { storage.compare_and_set(&path, 0, b"first").await })
+            };
+            let second = {
+                let storage = Arc::clone(&storage);
+                let path = path.clone();
+                tokio::spawn(async move { storage.compare_and_set(&path, 0, b"second").await })
+            };
+            let (first, second) = tokio::join!(first, second);
+            let first = first.unwrap().unwrap();
+            let second = second.unwrap().unwrap();
+            assert!(
+                first ^ second,
+                "both writers won the same compare-and-set: first={first} second={second}"
+            );
+
+            let value = storage.read(&path).await.unwrap().unwrap();
+            assert_eq!(value.version, 1);
+            assert_eq!(
+                value.bytes,
+                if first { b"first".to_vec() } else { b"second".to_vec() },
+                "the loser's value replaced the winner's"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

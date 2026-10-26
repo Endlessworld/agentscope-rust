@@ -4,10 +4,10 @@
 //! the execution writer's lease. Both are committed through the same [`SessionLog`] seam.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{session_error, SessionEvent, SessionLog, Writer};
+use super::{session_error, Head, SessionEvent, SessionLog, Writer};
 use crate::message::Msg;
 
 /// How many times acceptance retries a busy writer before failing.
@@ -107,6 +107,12 @@ impl InboxSnapshot {
 #[derive(Clone)]
 pub struct SessionInbox {
     journal: Arc<dyn SessionLog>,
+    /// The folded snapshot and the committed head it was derived from.
+    ///
+    /// Receipt readers poll `snapshot()` every few tens of milliseconds. Re-reading the whole
+    /// inbox on every poll re-decoded every accepted command (including its input messages);
+    /// in a long session that allocated steadily without any new command being accepted.
+    cache: Arc<Mutex<Option<(u64, Option<String>, Arc<InboxSnapshot>)>>>,
 }
 
 impl std::fmt::Debug for SessionInbox {
@@ -120,12 +126,35 @@ impl SessionInbox {
     pub fn new(log: Arc<dyn SessionLog>) -> crate::error::Result<Self> {
         Ok(Self {
             journal: log.inbox()?,
+            cache: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Folds every accepted command and its outcome.
+    ///
+    /// Callers that only inspect the snapshot should prefer [`snapshot_shared`](Self::snapshot_shared):
+    /// this compatibility shape clones the accepted commands on every call.
     pub async fn snapshot(&self) -> crate::error::Result<InboxSnapshot> {
+        Ok((*self.snapshot_shared().await?).clone())
+    }
+
+    /// Folds every accepted command and its outcome, sharing the cached value.
+    pub async fn snapshot_shared(&self) -> crate::error::Result<Arc<InboxSnapshot>> {
         let head = self.journal.head().await?;
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some((seq, commit, snapshot)) = cache.as_ref() {
+                if *seq == head.seq && commit.as_deref() == head.commit_id.as_deref() {
+                    return Ok(Arc::clone(snapshot));
+                }
+            }
+        }
+        let snapshot = Arc::new(self.fold(&head).await?);
+        *self.cache.lock().unwrap() = Some((head.seq, head.commit_id.clone(), Arc::clone(&snapshot)));
+        Ok(snapshot)
+    }
+
+    async fn fold(&self, head: &Head) -> crate::error::Result<InboxSnapshot> {
         let mut commands = Vec::new();
         let mut rejected = BTreeMap::new();
         let mut handled = BTreeSet::new();

@@ -605,3 +605,131 @@ async fn the_event_sink_observes_the_whole_run() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Records the context of every call, then blocks until the test opens the gate.
+///
+/// The first run is interrupted while the model is still streaming; after the host resumes the
+/// turn the gate is open, so the second call answers immediately.
+struct GatedRecordingModel {
+    calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    gate: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Model for GatedRecordingModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(messages.iter().map(|m| m.text_content()).collect());
+        let gate = Arc::clone(&self.gate);
+        Box::pin(futures::stream::once(async move {
+            while !gate.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok(ChatResponse::builder()
+                .content(vec![CoreBlock::Text(TextBlock::new("resumed answer"))])
+                .build())
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "gated-recording"
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_turn_does_not_replay_its_original_input() {
+    // Regression for duplicated history after a resume: `launch()` used to fall back to the
+    // *restored context* as the run's input when the execution had none (a resume has no new
+    // messages), which appended the original user prompt to the model context a second time.
+    // The user saw their question replayed and the model answered it twice.
+    let dir = temp_dir("resume-dedup");
+    let calls: Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(GatedRecordingModel {
+                calls: Arc::clone(&calls),
+                gate: Arc::clone(&gate),
+            }))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-resume-dedup");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-resume-dedup").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();
+
+    let task = session.submit("only once please").await.unwrap();
+
+    // Wait until the model actually started (the run is registered by then), then interrupt it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while calls.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first run never reached the model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let run_id = session
+        .task(&task.command_id)
+        .await
+        .unwrap()
+        .run_id
+        .expect("an admitted run publishes its run id");
+    assert!(
+        agent.interrupt_run(&run_id),
+        "the active run must accept the interrupt"
+    );
+
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert_eq!(settled.status, "interrupted", "{settled:?}");
+
+    // Resume the same turn; the host has decided to continue, not to start over.
+    gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    let resumed = session.resume(&task.turn_id).await.unwrap();
+    let resumed = session.await_task(&resumed.command_id).await.unwrap();
+    assert_eq!(resumed.status, "completed", "{resumed:?}");
+
+    // The resumed model call must see the prompt exactly once, not once per run.
+    let calls = calls.lock().unwrap();
+    let last = calls
+        .last()
+        .expect("the resumed run must call the model")
+        .join("\n");
+    assert_eq!(
+        last.matches("only once please").count(),
+        1,
+        "the original input must not be replayed into the model context: {last:?}"
+    );
+
+    // The committed transcript agrees: one user message, not two.
+    let transcript = session.transcript().await.unwrap();
+    let rendered: String = transcript
+        .messages
+        .iter()
+        .map(|m| m.text_content())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        rendered.matches("only once please").count(),
+        1,
+        "the resumed turn must not duplicate the user message: {rendered:?}"
+    );
+    assert!(rendered.contains("resumed answer"), "{rendered}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

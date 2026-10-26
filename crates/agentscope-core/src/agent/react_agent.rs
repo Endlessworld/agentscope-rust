@@ -795,7 +795,18 @@ impl ReActAgent {
                             // Surface the failure into the stream so consumers
                             // (e.g. ACP `stream_events`) don't silently swallow it
                             // and report `end_turn` with no events.
-                            events.push(Err(Error::Agent(e.to_string())));
+                            //
+                            // Keep the classification of the terminal states a scheduler must
+                            // tell apart. The session runtime maps `Interrupted` to
+                            // `run/end{status:"interrupted"}` (a resumable turn) and anything
+                            // else to `failed`; flattening every error into `Agent` made an
+                            // interruption look like a provider failure. Other kinds stay
+                            // `Agent` because only their message is consumed downstream.
+                            events.push(Err(match e {
+                                Error::Interrupted(reason) => Error::Interrupted(reason.clone()),
+                                Error::Cancelled(reason) => Error::Cancelled(reason.clone()),
+                                other => Error::Agent(other.to_string()),
+                            }));
                         }
                     }
                     *slot_core.lock().unwrap() = Some(res);

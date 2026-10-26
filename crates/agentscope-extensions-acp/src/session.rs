@@ -306,6 +306,16 @@ fn turn_usage_to_response(usage: &ChatUsage) -> Option<agent_client_protocol::sc
     )
 }
 
+/// Clears the session's "prompt running" marker on every exit path, including early returns
+/// and panics, so LRU eviction never mistakes a finished prompt for a live one.
+struct RunningPrompt(Arc<AtomicBool>);
+
+impl Drop for RunningPrompt {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A single ACP session backed by a [`HarnessAgent`].
 #[derive(Clone)]
 pub struct AcpAgentSession {
@@ -336,6 +346,15 @@ pub struct AcpAgentSession {
     applied_model: String,
     /// Cancel flag for the currently active prompt request.
     cancel: Arc<AtomicBool>,
+    /// Serializes prompts for this session. ACP forbids overlapping prompt turns, but clients
+    /// do send a follow-up before the previous response arrives (or a host retries one); two
+    /// concurrent runs on the same session used to be rejected as `turn_unfinished`.
+    prompt_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this session was closed. A prompt that finishes after `session/close` must not
+    /// put the session back into the registry.
+    closed: Arc<AtomicBool>,
+    /// Whether a prompt is currently being executed (guards LRU eviction).
+    running: Arc<AtomicBool>,
     usage: ChatUsage,
     /// Client connection used to push `session/request_permission` requests
     /// when a tool call needs human confirmation. Shared across clones so a
@@ -347,6 +366,12 @@ pub struct AcpAgentSession {
     elicitation_slot: ElicitationSlot,
     /// Persistent "always allow / always reject" rule store for this workspace.
     permission_store: Arc<PermissionRuleStore>,
+    /// The long-lived runtime handle for this ACP session.
+    ///
+    /// Reusing one handle keeps the dispatcher projection and the receipt fold warm across
+    /// prompts. Opening a fresh handle per prompt re-read the whole journal (and every state
+    /// checkpoint) before each turn, which made long sessions slow and memory-hungry.
+    runtime: Arc<tokio::sync::Mutex<Option<Arc<agentscope_harness::agent::AgentSession>>>>,
     /// Manages MCP client connections for this session (stdio servers declared
     /// by the ACP client via `mcp_servers`). Shared across clones so tools keep
     /// working after `register_session` write-back.
@@ -469,11 +494,15 @@ impl AcpAgentSession {
             model_builder: None,
             applied_model: actual_model,
             cancel: Arc::new(AtomicBool::new(false)),
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
             client: Arc::new(Mutex::new(None)),
             elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
+            runtime: Arc::new(tokio::sync::Mutex::new(None)),
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
             support: ClientSupport::new(),
             turn_usage: ChatUsage::default(),
@@ -607,6 +636,12 @@ impl AcpAgentSession {
     /// Current model id.
     pub fn model(&self) -> String {
         self.config.lock().unwrap().model.clone()
+    }
+
+    /// Sort key for least-recently-used eviction: the last prompt's RFC-3339 timestamp, or an
+    /// empty string for a session that never ran one (sorting it first, i.e. oldest).
+    pub(crate) fn updated_at_sort_key(&self) -> String {
+        self.updated_at.clone().unwrap_or_default()
     }
 
     /// Current mode id.
@@ -1036,6 +1071,27 @@ impl AcpAgentSession {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    /// Closes the session: cancels the active prompt and prevents it from being re-registered.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.cancel();
+        // Release the dispatcher unless a prompt currently holds the handle; dropping the
+        // last clone stops it after that prompt unwinds.
+        if let Ok(mut runtime) = self.runtime.try_lock() {
+            runtime.take();
+        }
+    }
+
+    /// Whether the session was closed by the client.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Whether a prompt is running right now.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     /// Runs a prompt against the core agent and streams updates, honouring the
     /// SDK's per-request cancellation marker (`$/cancel_request`) in addition to
     /// the session-level [`cancel`](Self::cancel) flag.
@@ -1219,6 +1275,16 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
     {
+        // One prompt turn per session. A client may send a follow-up before the previous
+        // response arrives (a retry, a Stop followed by a new message); without this lock the
+        // second run raced the first and was rejected as `turn_unfinished`, losing the input.
+        let _prompt_guard = Arc::clone(&self.prompt_lock).lock_owned().await;
+        if self.closed.load(Ordering::SeqCst) {
+            // Closed while this prompt waited for the previous turn to finish.
+            return StopReason::Cancelled;
+        }
+        self.running.store(true, Ordering::SeqCst);
+        let _running = RunningPrompt(Arc::clone(&self.running));
         self.cancel.store(false, Ordering::SeqCst);
         let cancel_flag = self.cancel.clone();
         // Turn-level usage: reset at the start of each prompt turn, accumulate
@@ -1260,15 +1326,47 @@ impl AcpAgentSession {
         // directly: the runtime owns the journal writer, restores the committed state from
         // the journal before the run, and admits steering/interrupts. This client only
         // renders — events arrive through the sink below.
-        let session = match self.agent.session(self.session_context()).await {
-            Ok(session) => session,
-            Err(error) => {
-                emit(super::event::message_chunk(
-                    self.session_id.clone(),
-                    format!("Agent error: {error}"),
-                    None,
-                ));
-                return StopReason::Refusal;
+        //
+        // Opening and submitting touch durable storage, which can fail transiently (a
+        // competing writer, an fsync/network hiccup). Those failures are not the user's
+        // fault and must not end the turn on the first attempt; the submit keeps a stable
+        // idempotency key so a retry cannot duplicate the prompt.
+        //
+        // The handle is cached for the lifetime of the ACP session: its dispatcher keeps the
+        // journal projection and receipt fold warm, so later prompts do not re-read the whole
+        // history (and every checkpoint) before they can start.
+        let session = {
+            let mut runtime = self.runtime.lock().await;
+            match runtime.as_ref() {
+                Some(session) => Arc::clone(session),
+                None => {
+                    let mut open_attempts = 0usize;
+                    let opened = loop {
+                        open_attempts += 1;
+                        match self.agent.session(self.session_context()).await {
+                            Ok(session) => break session,
+                            Err(error) if open_attempts < 3 => {
+                                tracing::warn!(
+                                    session = %self.session_id,
+                                    %error,
+                                    "opening the session runtime failed; retrying"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                            Err(error) => {
+                                emit(super::event::message_chunk(
+                                    self.session_id.clone(),
+                                    format!("Agent error: {error}"),
+                                    None,
+                                ));
+                                return StopReason::Refusal;
+                            }
+                        }
+                    };
+                    let opened = Arc::new(opened);
+                    *runtime = Some(Arc::clone(&opened));
+                    opened
+                }
             }
         };
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1282,40 +1380,45 @@ impl AcpAgentSession {
         // continue it — so submitting a new prompt would be rejected by the dispatcher and
         // the client would wait forever on a `queued` receipt. Close it first: the caller has
         // clearly moved on. Unknown tool outcomes become `interrupted` (never success).
-        match session.abandon_unfinished().await {
-            Ok(Some(turn_id)) => {
-                tracing::info!(
-                    session = %self.session_id,
-                    turn = %turn_id,
-                    "closed an unfinished turn before starting a new prompt"
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                emit(super::event::message_chunk(
-                    self.session_id.clone(),
-                    format!("Agent error: could not close the previous turn: {error}"),
-                    None,
-                ));
-                return StopReason::Refusal;
-            }
+        //
+        // Closing is best effort: the submit below is the authority. If the close failed
+        // because the turn settled concurrently, rejecting the prompt would be wrong.
+        if let Err(error) = session.abandon_unfinished().await {
+            tracing::warn!(
+                session = %self.session_id,
+                %error,
+                "could not close the previous turn before starting a new prompt"
+            );
         }
-        let task = match session.submit_msg(message).await {
-            Ok(task) => task,
-            Err(error) => {
-                emit(super::event::message_chunk(
-                    self.session_id.clone(),
-                    format!("Agent error: {error}"),
-                    None,
-                ));
-                return StopReason::Refusal;
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let mut submit_attempts = 0usize;
+        let mut task = loop {
+            submit_attempts += 1;
+            match session
+                .submit_with_key_msg(&idempotency_key, message.clone())
+                .await
+            {
+                Ok(task) => break task,
+                Err(error) if submit_attempts < 3 => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        %error,
+                        "task submission failed; retrying with the same idempotency key"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => {
+                    emit(super::event::message_chunk(
+                        self.session_id.clone(),
+                        format!("Agent error: {error}"),
+                        None,
+                    ));
+                    return StopReason::Refusal;
+                }
             }
         };
 
         use agentscope_core::event::AgentEventType;
-        // Tracks whether any incremental text delta was already emitted, so we
-        // don't duplicate the final reply text when it was streamed token-by-token.
-        let mut emitted_text = false;
         // One stable message id per turn: every text/thinking chunk and tool call
         // emitted this turn shares it, so ACP clients group them into one
         // assistant message and render tool calls / thoughts correctly.
@@ -1339,11 +1442,6 @@ impl AcpAgentSession {
         // (inflated) cumulative session usage.
         emit(self.usage_notification(0));
 
-        // Settlement is the exit condition: the sink keeps the channel open, so "no more
-        // events" never happens on its own. Events keep rendering in this loop until the
-        // queue is drained after settlement.
-        let mut settled_task: Option<agentscope_harness::agent::session::Task> = None;
-        let mut cancelled = false;
         // Watchdog state.
         //
         // `queued` is the only status that means "nothing picked this up yet". It is a
@@ -1353,262 +1451,306 @@ impl AcpAgentSession {
         // `launch()` and will publish `inbox/started` shortly, so it must never be reported as
         // "never admitted". `running` is a live run and has its own model/tool timeouts.
         const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-        // Consecutive receipt-read failures tolerated before failing the prompt.
-        const MAX_POLL_FAILURES: usize = 40;
-        let mut admission_deadline = std::time::Instant::now() + ADMISSION_TIMEOUT;
-        let mut last_status = String::new();
-        let mut poll_failures = 0usize;
-        let mut stall: Option<String> = None;
-        // A persistent ticker, not a fresh `sleep` per iteration: re-creating the timer every
-        // loop restart meant a busy event stream could starve it indefinitely (a stalled
-        // command was only noticed minutes later).
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // How long receipt reads may keep failing before the prompt reports a stall.
+        //
+        // This is a *duration*, not a tick count: the previous "40 ignored polls" meant two
+        // seconds at a 50ms tick, so one slow fsync or a briefly contended journal aborted a
+        // perfectly healthy run. A transient storage hiccup must stay invisible; only a
+        // sustained inability to read the run's state is a real stall.
+        const POLL_FAILURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // A run stopped by something other than this client's cancel is resumed in place.
+        // Bounded so a permanently interrupted environment is reported instead of retried
+        // forever; an interruption is not a failure and must not discard the user's prompt.
+        const MAX_INTERRUPTED_RESUMES: usize = 2;
+
+        let mut resumes = 0usize;
+
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        cancelled = true;
-                        break;
-                    }
-                    if settled_task.is_none() {
-                        match session.task(&task.command_id).await {
-                            Ok(current) => {
-                                poll_failures = 0;
-                                if current.status != last_status {
-                                    // Any status change is progress: restart the admission
-                                    // clock so an earlier `queued` wait cannot accumulate.
-                                    last_status = current.status.clone();
-                                    admission_deadline =
-                                        std::time::Instant::now() + ADMISSION_TIMEOUT;
+            // ---- one dispatched attempt: stream until it settles or is cancelled ----
+            let mut settled_task: Option<agentscope_harness::agent::session::Task> = None;
+            let mut cancelled = false;
+            // Whether this attempt already streamed incremental text. Reset per attempt: a
+            // resumed run may complete without emitting deltas (the answer already exists in
+            // the restored state), and it must still reach the client. Keeping the flag from
+            // the interrupted attempt would silently drop the final reply.
+            let mut emitted_text = false;
+            // Set when the event sink is gone. The run may still be going, so the receipt
+            // keeps being polled instead of returning with the turn still open.
+            let mut events_closed = false;
+            let mut admission_deadline = std::time::Instant::now() + ADMISSION_TIMEOUT;
+            let mut last_status = String::new();
+            let mut first_poll_failure: Option<std::time::Instant> = None;
+            let mut stall: Option<String> = None;
+            // A persistent ticker, not a fresh `sleep` per iteration: re-creating the timer every
+            // loop restart meant a busy event stream could starve it indefinitely (a stalled
+            // command was only noticed minutes later).
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            cancelled = true;
+                            break;
+                        }
+                        if settled_task.is_none() {
+                            match session.task(&task.command_id).await {
+                                Ok(current) => {
+                                    first_poll_failure = None;
+                                    if current.status != last_status {
+                                        // Any status change is progress: restart the admission
+                                        // clock so an earlier `queued` wait cannot accumulate.
+                                        last_status = current.status.clone();
+                                        admission_deadline =
+                                            std::time::Instant::now() + ADMISSION_TIMEOUT;
+                                    }
+                                    if current.settled() {
+                                        settled_task = Some(current);
+                                    } else if current.status == "queued"
+                                        && std::time::Instant::now() >= admission_deadline
+                                    {
+                                        // Still unclaimed after the deadline: no dispatcher will
+                                        // ever run it, so report instead of hanging.
+                                        stall = Some(format!(
+                                            "the turn was never admitted (status `queued` after {}s)",
+                                            ADMISSION_TIMEOUT.as_secs()
+                                        ));
+                                        break;
+                                    }
                                 }
-                                if current.settled() {
-                                    settled_task = Some(current);
-                                } else if current.status == "queued"
-                                    && std::time::Instant::now() >= admission_deadline
-                                {
-                                    // Still unclaimed after the deadline: no dispatcher will
-                                    // ever run it, so report instead of hanging.
-                                    stall = Some(format!(
-                                        "the turn was never admitted (status `queued` after {}s)",
-                                        ADMISSION_TIMEOUT.as_secs()
-                                    ));
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                poll_failures += 1;
-                                if poll_failures >= MAX_POLL_FAILURES {
-                                    stall = Some(format!(
-                                        "the session stopped reporting task state: {error}"
-                                    ));
-                                    break;
+                                Err(error) => {
+                                    // A single failed read means nothing: the journal is shared
+                                    // with other processes and a transient IO error must not kill
+                                    // a live run. Only sustained failure is reported.
+                                    let since = *first_poll_failure
+                                        .get_or_insert_with(std::time::Instant::now);
+                                    if since.elapsed() >= POLL_FAILURE_TIMEOUT {
+                                        stall = Some(format!(
+                                            "the session stopped reporting task state: {error}"
+                                        ));
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        if settled_task.is_some() && (events_closed || events_rx.is_empty()) {
+                            break;
+                        }
                     }
-                    if settled_task.is_some() && events_rx.is_empty() {
+                    // The SDK sets this marker when the peer sends `$/cancel_request`
+                    // for the prompt's JSON-RPC request id.
+                    _ = async {
+                        if let Some(c) = &cancellation {
+                            c.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        cancelled = true;
                         break;
                     }
-                }
-                // The SDK sets this marker when the peer sends `$/cancel_request`
-                // for the prompt's JSON-RPC request id.
-                _ = async {
-                    if let Some(c) = &cancellation {
-                        c.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    cancelled = true;
-                    break;
-                }
-                event = events_rx.recv() => {
-                    match event {
-                        Some(ev) => match ev.event_type() {
-                            AgentEventType::TextBlockDelta => {
-                                if let Some(notif) = super::event::map_delta_event(
-                                    self.session_id.clone(),
-                                    &ev,
-                                    message_id_opt.clone(),
-                                ) {
-                                    emitted_text = true;
-                                    emit(notif);
+                    event = events_rx.recv(), if !events_closed => {
+                        match event {
+                            Some(ev) => match ev.event_type() {
+                                AgentEventType::TextBlockDelta => {
+                                    if let Some(notif) = super::event::map_delta_event(
+                                        self.session_id.clone(),
+                                        &ev,
+                                        message_id_opt.clone(),
+                                    ) {
+                                        emitted_text = true;
+                                        emit(notif);
+                                    }
                                 }
-                            }
-                            AgentEventType::AgentResult => {
-                                // An interrupted turn still produces a (reconciled) result.
-                                // Its text is usually a recovery note that duplicates nothing,
-                                // but when the answer was already streamed incrementally the
-                                // note used to be dropped entirely — the client saw output
-                                // stop mid-sentence with no explanation. Always tell the user
-                                // that the turn was interrupted.
-                                if let Some(reason) = super::event::result_generate_reason(&ev) {
-                                    if reason == agentscope_core::message::GenerateReason::Interrupted
-                                    {
+                                AgentEventType::AgentResult => {
+                                    // An interrupted turn still produces a (reconciled) result. Tell
+                                    // the user that it was interrupted, but do not render the
+                                    // runtime's recovery text ("I noticed that you have interrupted
+                                    // me..."): it is an internal control message, and the prompt loop
+                                    // below resumes the turn automatically — showing both would claim
+                                    // the turn ended immediately before continuing it.
+                                    let interrupted = super::event::result_generate_reason(&ev)
+                                        == Some(agentscope_core::message::GenerateReason::Interrupted);
+                                    if interrupted {
                                         emit(super::event::message_chunk(
                                             self.session_id.clone(),
                                             "\n\n[turn interrupted before completion]".to_string(),
                                             message_id_opt.clone(),
                                         ));
+                                    } else if !emitted_text {
+                                        // Emit the final reply only if it wasn't already
+                                        // streamed incrementally (avoids duplicate output).
+                                        if let Some(notif) = super::event::map_result_event(
+                                            self.session_id.clone(),
+                                            &ev,
+                                            message_id_opt.clone(),
+                                        ) {
+                                            emit(notif);
+                                        }
                                     }
                                 }
-                                // Emit the final reply only if it wasn't already
-                                // streamed incrementally (avoids duplicate output).
-                                if !emitted_text {
-                                    if let Some(notif) = super::event::map_result_event(
+                                AgentEventType::ModelCallEnd => {
+                                    // Accumulate usage and push a context-window
+                                    // UsageUpdate after every model call. `used`
+                                    // reflects the tokens in the current context
+                                    // (latest call's input tokens), NOT the
+                                    // cumulative session count.
+                                    if let Some(u) = ev
+                                        .data()
+                                        .fields
+                                        .get("usage")
+                                        .and_then(|v| serde_json::from_value::<ChatUsage>(v.clone()).ok())
+                                    {
+                                        self.accumulate_usage(u.clone());
+                                        self.accumulate_turn_usage(&u);
+                                        emit(self.usage_notification(u.input_tokens));
+                                    } else {
+                                        emit(self.usage_notification(0));
+                                    }
+                                }
+                                AgentEventType::Custom => {
+                                    // The compaction middleware announces a completed
+                                    // summarization in-band; translate it into the
+                                    // capability-gated `compaction_update` only when
+                                    // the client advertised `session.compaction`.
+                                    if let Some((_, summary)) =
+                                        super::event::compaction_marker(&ev)
+                                    {
+                                        if self.support.supports_compaction() {
+                                            let compaction_id = format!(
+                                                "compaction-{}",
+                                                std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_nanos())
+                                                    .unwrap_or(0)
+                                            );
+                                            for notif in super::event::compaction_notifications(
+                                                self.session_id.clone(),
+                                                &compaction_id,
+                                                &summary,
+                                            ) {
+                                                emit(notif);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if let Some(notif) = super::event::map_delta_event(
                                         self.session_id.clone(),
                                         &ev,
                                         message_id_opt.clone(),
                                     ) {
                                         emit(notif);
                                     }
-                                }
-                            }
-                            AgentEventType::ModelCallEnd => {
-                                // Accumulate usage and push a context-window
-                                // UsageUpdate after every model call. `used`
-                                // reflects the tokens in the current context
-                                // (latest call's input tokens), NOT the
-                                // cumulative session count.
-                                if let Some(u) = ev
-                                    .data()
-                                    .fields
-                                    .get("usage")
-                                    .and_then(|v| serde_json::from_value::<ChatUsage>(v.clone()).ok())
-                                {
-                                    self.accumulate_usage(u.clone());
-                                    self.accumulate_turn_usage(&u);
-                                    emit(self.usage_notification(u.input_tokens));
-                                } else {
-                                    emit(self.usage_notification(0));
-                                }
-                            }
-                            AgentEventType::Custom => {
-                                // The compaction middleware announces a completed
-                                // summarization in-band; translate it into the
-                                // capability-gated `compaction_update` only when
-                                // the client advertised `session.compaction`.
-                                if let Some((_, summary)) =
-                                    super::event::compaction_marker(&ev)
-                                {
-                                    if self.support.supports_compaction() {
-                                        let compaction_id = format!(
-                                            "compaction-{}",
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_nanos())
-                                                .unwrap_or(0)
-                                        );
-                                        for notif in super::event::compaction_notifications(
-                                            self.session_id.clone(),
-                                            &compaction_id,
-                                            &summary,
-                                        ) {
-                                            emit(notif);
-                                        }
+                                    for notif in
+                                        tool_events.map(self.session_id.clone(), &ev)
+                                    {
+                                        emit(notif);
                                     }
                                 }
-                            }
-                            _ => {
-                                if let Some(notif) = super::event::map_delta_event(
-                                    self.session_id.clone(),
-                                    &ev,
-                                    message_id_opt.clone(),
-                                ) {
-                                    emit(notif);
-                                }
-                                for notif in
-                                    tool_events.map(self.session_id.clone(), &ev)
-                                {
-                                    emit(notif);
-                                }
-                            }
-                        },
-                        None => break,
+                            },
+                            // The sink was dropped (the handle was closed) — no further events
+                            // can arrive. Keep polling the receipt: returning here would report
+                            // `end_turn` while the run is still writing its turn.
+                            None => events_closed = true,
+                        }
                     }
                 }
             }
-        }
 
-        if cancelled {
-            // The ACP cancel flag is the only client-facing cancellation, so stop the run and
-            // close its turn: an interrupted turn stays open in the journal (only
-            // `completed`/`cancelled` end one), and the next prompt must be able to submit.
-            //
-            // The signal is scoped to *this* turn's run id. The loop below keeps retrying for
-            // up to 10s, and the client may already have sent its next prompt by then; an
-            // unscoped `agent.interrupt()` would kill that fresh run — the "turn ended as
-            // interrupted" report on a prompt the user just sent.
-            //
-            // The run id is not known at submit time (the dispatcher publishes it when it
-            // admits the command), so it is re-read every iteration and signalled as soon as it
-            // appears.
-            let mut signalled: Option<String> = task.run_id.clone();
-            if let Some(run_id) = signalled.as_deref() {
-                self.agent.interrupt_run(run_id);
-            }
-
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let current = session.task(&task.command_id).await;
-                let current = match current {
-                    Ok(current) => current,
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                };
-                if current.settled() {
-                    break;
-                }
-                // Adopt the run id the moment the dispatcher publishes it, then keep the signal
-                // aimed at that exact run.
-                if signalled.is_none() {
-                    if let Some(run_id) = current.run_id.clone() {
-                        self.agent.interrupt_run(&run_id);
-                        signalled = Some(run_id);
-                    }
-                }
+            if cancelled {
+                // The ACP cancel flag is the only client-facing cancellation, so stop the run
+                // and close its turn: an interrupted turn stays open in the journal (only
+                // `completed`/`cancelled` end one), and the next prompt must be able to submit.
+                //
+                // The signal is scoped to *this* turn's run id. The loop below keeps retrying
+                // for up to 10s, and the client may already have sent its next prompt by then;
+                // an unscoped `agent.interrupt()` would kill that fresh run — the "turn ended as
+                // interrupted" report on a prompt the user just sent.
+                //
+                // The run id is not known at submit time (the dispatcher publishes it when it
+                // admits the command), so it is re-read every iteration and signalled as soon as
+                // it appears.
+                let mut signalled: Option<String> = task.run_id.clone();
                 if let Some(run_id) = signalled.as_deref() {
-                    let _ = session.interrupt_run(run_id).await;
+                    self.agent.interrupt_run(run_id);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    let current = session.task(&task.command_id).await;
+                    let current = match current {
+                        Ok(current) => current,
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
+                    if current.settled() {
+                        break;
+                    }
+                    // Adopt the run id the moment the dispatcher publishes it, then keep the
+                    // signal aimed at that exact run.
+                    if signalled.is_none() {
+                        if let Some(run_id) = current.run_id.clone() {
+                            self.agent.interrupt_run(&run_id);
+                            signalled = Some(run_id);
+                        }
+                    }
+                    if let Some(run_id) = signalled.as_deref() {
+                        let _ = session.interrupt_run(run_id).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+
+                // Close the turn before returning. `cancel_pending` retries the writer lease
+                // and settles pending interactions; `abandon_turn` additionally records unknown
+                // tool outcomes as interrupted. Both are needed: the run may have been
+                // interrupted mid-tool, and a turn left open would block the next prompt. Never
+                // fire-and-forget this — a silently failed close is exactly the "stuck session"
+                // symptom.
+                if let Err(error) =
+                    agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await
+                {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        turn = %task.turn_id,
+                        %error,
+                        "failed to close the cancelled turn; the next prompt may be rejected"
+                    );
+                }
+                return StopReason::Cancelled;
             }
 
-            // Close the turn before returning. `cancel_pending` retries the writer lease and
-            // settles pending interactions; `abandon_turn` additionally records unknown tool
-            // outcomes as interrupted. Both are needed: the run may have been interrupted
-            // mid-tool, and a turn left open would block the next prompt. Never fire-and-forget
-            // this — a silently failed close is exactly the "stuck session" symptom.
-            if let Err(error) =
-                agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await
-            {
-                tracing::warn!(
-                    session = %self.session_id,
-                    turn = %task.turn_id,
-                    %error,
-                    "failed to close the cancelled turn; the next prompt may be rejected"
-                );
+            // A watchdog fired: the command was never admitted, or the session stopped
+            // reporting. Report it instead of ending the turn silently (which looks like a hang
+            // to the client).
+            if let Some(reason) = stall {
+                // Try to release whatever the abandoned attempt left open so the next prompt can
+                // start; failures here must not hide the original problem.
+                let _ = agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: {reason}"),
+                    message_id_opt.clone(),
+                ));
+                return StopReason::Refusal;
             }
-            return StopReason::Cancelled;
-        }
 
-        // A watchdog fired: the command was never admitted, or the session stopped reporting.
-        // Report it instead of ending the turn silently (which looks like a hang to the client).
-        if let Some(reason) = stall {
-            // Try to release whatever the abandoned attempt left open so the next prompt can
-            // start; failures here must not hide the original problem.
-            let _ = agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
-            emit(super::event::message_chunk(
-                self.session_id.clone(),
-                format!("Agent error: {reason}"),
-                message_id_opt.clone(),
-            ));
-            return StopReason::Refusal;
-        }
+            // The inner loop can only exit without a receipt on cancel/stall (both handled
+            // above). Never report success for a run whose outcome is unknown.
+            let Some(current) = settled_task else {
+                let _ = agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    "Agent error: the run stopped without reporting a result; the turn was \
+                     closed, send a new prompt to continue"
+                        .to_string(),
+                    message_id_opt.clone(),
+                ));
+                return StopReason::Refusal;
+            };
 
-        if let Some(current) = &settled_task {
             match current.status.as_str() {
                 "failed" => {
                     // Prefer the error persisted with `run/end`; older journals (and a run
@@ -1639,6 +1781,13 @@ impl AcpAgentSession {
                         .error
                         .clone()
                         .unwrap_or_else(|| "the turn was rejected by the session runtime".into());
+                    let detail = if detail == "turn_unfinished" {
+                        "The previous turn is still open, so this prompt could not start. Wait \
+                         for it to finish or cancel it, then send the prompt again."
+                            .to_string()
+                    } else {
+                        detail
+                    };
                     emit(super::event::message_chunk(
                         self.session_id.clone(),
                         format!("Agent error: {detail}"),
@@ -1646,9 +1795,59 @@ impl AcpAgentSession {
                     ));
                     return StopReason::Refusal;
                 }
-                // The run stopped without reaching a normal result (interrupted, suspended,
-                // or its writer lease vanished). Report it and close the turn so the next
-                // prompt is not blocked by it.
+                // The run stopped without a normal result. Interruption is the one case this
+                // client did not ask for: the turn is still open and resumable, so continue it
+                // instead of throwing the user's prompt away. Hosts interrupt runs for
+                // transient reasons (shutdown sweeps, a raced cancel, a recovered process) and
+                // none of those are the user's problem.
+                "interrupted" if resumes < MAX_INTERRUPTED_RESUMES => {
+                    resumes += 1;
+                    emit(super::event::message_chunk(
+                        self.session_id.clone(),
+                        "\n\n[run interrupted; continuing]\n\n".to_string(),
+                        message_id_opt.clone(),
+                    ));
+                    match session.resume(&task.turn_id).await {
+                        Ok(next) => {
+                            task = next;
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = agentscope_core::session::abandon_turn(
+                                session.log(),
+                                &task.turn_id,
+                            )
+                            .await;
+                            emit(super::event::message_chunk(
+                                self.session_id.clone(),
+                                format!(
+                                    "Agent error: the interrupted run could not be continued \
+                                     automatically: {error}. The turn was closed; send a new \
+                                     prompt to continue."
+                                ),
+                                message_id_opt.clone(),
+                            ));
+                            return StopReason::EndTurn;
+                        }
+                    }
+                }
+                "interrupted" => {
+                    // Every resume was interrupted again. The environment, not the prompt, is
+                    // failing; close the turn so the session stays usable and say so without
+                    // refusing the turn at the protocol level.
+                    let _ =
+                        agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                    emit(super::event::message_chunk(
+                        self.session_id.clone(),
+                        "Agent error: the run kept being interrupted before it finished. The \
+                         turn was closed; send a new prompt to continue."
+                            .to_string(),
+                        message_id_opt.clone(),
+                    ));
+                    return StopReason::EndTurn;
+                }
+                // `suspended` (an external tool result never arrived) and any other non-terminal
+                // outcome. Report it and close the turn so the next prompt is not blocked.
                 status if status != "completed" => {
                     let detail = current.error.clone().unwrap_or_else(|| {
                         format!(
@@ -1665,11 +1864,9 @@ impl AcpAgentSession {
                     ));
                     return StopReason::Refusal;
                 }
-                _ => {}
+                _ => return StopReason::EndTurn,
             }
         }
-
-        StopReason::EndTurn
     }
 
     /// Cumulative token usage for this session.

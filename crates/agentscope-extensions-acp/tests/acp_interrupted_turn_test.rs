@@ -164,6 +164,127 @@ async fn a_cancelled_turn_does_not_block_the_next_prompt() {
     let _ = agent_task.await;
 }
 
+#[tokio::test]
+async fn a_forced_interrupt_is_continued_without_discarding_the_prompt() {
+    // A run can be stopped by the *host* (a shutdown sweep, a recovered process, a raced
+    // cancel) rather than by this client's cancel. That is not the user's fault: the prompt
+    // must not be rejected with `end_turn`/`Refusal` and the turn must not be thrown away.
+    // The prompt loop resumes the interrupted turn in place and keeps streaming the answer.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_factory = Arc::clone(&calls);
+    let (agent_channel, client_channel) = Channel::duplex();
+
+    let agent = AcpCodingAgent::builder()
+        .model_factory(move |cwd, sid| {
+            let model: Arc<dyn Model> = Arc::new(BlockingFirstModel {
+                calls: Arc::clone(&calls_for_factory),
+            });
+            HarnessAgent::builder()
+                .name("acp-forced-interrupt-test")
+                .model(model)
+                .session_id(sid)
+                .cwd(cwd.clone())
+                .workspace(cwd.join(".agentscope").join("workspace"))
+                .disable_memory_hooks()
+                .max_iters(3)
+                .build()
+        })
+        .build()
+        .expect("build AcpCodingAgent");
+    let registry = agent.session_registry();
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+
+    Client
+        .builder()
+        .connect_with(
+            client_channel,
+            move |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let text = Arc::new(std::sync::Mutex::new(String::new()));
+                let text_for_handler = Arc::clone(&text);
+                let mut session = connection
+                    .build_session(std::env::temp_dir())
+                    .block_task()
+                    .start_session()
+                    .await?;
+                // The session the SDK created above is the one this prompt runs on.
+                let session_id = session.session_id().to_string();
+                session.send_prompt("start working")?;
+
+                // Once the model has been entered, the run is live and `interrupt()` targets it.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while calls.load(Ordering::SeqCst) == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the prompt never reached the model"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                // `interrupt()` targets whatever run is active; the model call above proves the
+                // run is already registered, so the signal cannot be dropped on an idle agent.
+                let target = registry
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .cloned()
+                    .expect("the session must be registered while its prompt runs");
+                target.agent().interrupt();
+
+                let stop = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    loop {
+                        match session.read_update().await? {
+                            agent_client_protocol::SessionMessage::SessionMessage(dispatch) => {
+                                let text = Arc::clone(&text_for_handler);
+                                agent_client_protocol::util::MatchDispatch::new(dispatch)
+                                    .if_notification(async move |notif: SessionNotification| {
+                                        if let SessionUpdate::AgentMessageChunk(chunk) =
+                                            notif.update
+                                        {
+                                            if let ContentBlock::Text(t) = chunk.content {
+                                                text.lock().unwrap().push_str(&t.text);
+                                            }
+                                        }
+                                        Ok(())
+                                    })
+                                    .await
+                                    .otherwise_ignore()?;
+                            }
+                            agent_client_protocol::SessionMessage::StopReason(reason) => {
+                                break Ok::<StopReason, agent_client_protocol::Error>(reason);
+                            }
+                            _ => break Ok(StopReason::EndTurn),
+                        }
+                    }
+                })
+                .await
+                .expect("the interrupted prompt must settle instead of hanging")?;
+
+                assert_eq!(
+                    stop,
+                    StopReason::EndTurn,
+                    "a forced interrupt must continue the turn, not refuse it; chunks: {:?}",
+                    text.lock().unwrap()
+                );
+                let seen = text.lock().unwrap().clone();
+                assert!(
+                    seen.contains("resumed fine"),
+                    "the resumed run's answer must reach the client, got {seen:?}"
+                );
+                assert!(
+                    !seen.contains("[Agent refused]"),
+                    "a forced interrupt must not surface as a refusal, got {seen:?}"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .expect("client connection should succeed");
+    let _ = agent_task.await;
+}
+
 /// A model that always fails, so a `failed` turn is followed by a new prompt.
 struct AlwaysFailing;
 

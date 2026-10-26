@@ -12,12 +12,6 @@ use crate::state::TaskVerification;
 
 use super::{session_error, SessionEvent, SessionLog};
 
-/// Reads every committed event of a journal.
-async fn all_events(log: &dyn SessionLog) -> crate::error::Result<Vec<SessionEvent>> {
-    let head = log.head().await?;
-    log.scan(0, head.seq).await
-}
-
 /// Read-only task and input projection over one committed execution prefix.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionTurns {
@@ -71,7 +65,8 @@ impl SessionTurns {
         let mut started = BTreeSet::new();
         let mut applied = BTreeSet::new();
 
-        for event in all_events(log).await? {
+        let upper = log.head().await?.seq;
+        let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
             let data = event.data()?;
             if event.event_type == "state/restored" {
                 ordered.clear();
@@ -149,7 +144,9 @@ impl SessionTurns {
                 }
                 _ => {}
             }
-        }
+            Ok(())
+        };
+        log.visit(0, upper, &mut visit).await?;
 
         let turns = ordered
             .into_iter()
@@ -262,8 +259,8 @@ impl SessionProjection {
         let mut verifications: Vec<TaskVerification> = Vec::new();
         let mut extensions: Vec<SessionEvent> = Vec::new();
 
-        for event in log.scan(0, upper).await? {
-            super::SessionEventTypes::validate(&event)?;
+        let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+            super::SessionEventTypes::validate(event)?;
             let data = event.data()?;
             match event.event_type.as_str() {
                 "state/checkpoint" | "migration/baseline" | "state/restored" => {
@@ -342,7 +339,9 @@ impl SessionProjection {
                 }
             }
             cursor = event.seq;
-        }
+            Ok(())
+        };
+        log.visit(0, upper, &mut visit).await?;
 
         // Realign a recovered state with facts whose effect may be lost in an older
         // checkpoint: committed tool results, verification reports and extension events.
@@ -441,31 +440,22 @@ pub async fn pending_interactions(
     log: &dyn SessionLog,
 ) -> crate::error::Result<BTreeMap<String, SessionEvent>> {
     let upper = log.head().await?.seq;
-    let mut cursor = 0;
     let mut result = BTreeMap::new();
-    while cursor < upper {
-        let batch = log.read_after(cursor, 256).await?;
-        if batch.is_empty() {
-            return Err(session_error("Missing interaction prefix"));
+    let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+        let data = event.data()?;
+        if event.event_type == "interaction/requested" {
+            if let Some(id) = json_str(&data, "requestId") {
+                result.insert(id, event.clone());
+            }
         }
-        for event in batch {
-            if event.seq > upper {
-                break;
+        if event.event_type == "interaction/resolved" {
+            if let Some(id) = json_str(&data, "requestId") {
+                result.remove(&id);
             }
-            let data = event.data()?;
-            if event.event_type == "interaction/requested" {
-                if let Some(id) = json_str(&data, "requestId") {
-                    result.insert(id, event.clone());
-                }
-            }
-            if event.event_type == "interaction/resolved" {
-                if let Some(id) = json_str(&data, "requestId") {
-                    result.remove(&id);
-                }
-            }
-            cursor = event.seq;
         }
-    }
+        Ok(())
+    };
+    log.visit(0, upper, &mut visit).await?;
     Ok(result)
 }
 

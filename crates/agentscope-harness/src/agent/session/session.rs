@@ -8,7 +8,7 @@
 //! `ReActAgent` exposes no "between reasoning steps" hook today, so mid-run delivery is
 //! documented as unsupported rather than silently claimed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +16,8 @@ use agentscope_core::agent::{Extensions, RuntimeContext, StreamOptions};
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
 use agentscope_core::session::{
-    outcome, pending_interactions, session_error, transcript, Command, SessionEvent,
-    SessionExecution, SessionExportSinkHandle, SessionInbox, SessionKey, SessionLog,
+    outcome, pending_interactions, session_error, transcript, Command, Head, InboxSnapshot,
+    SessionEvent, SessionExecution, SessionExportSinkHandle, SessionInbox, SessionKey, SessionLog,
     SessionProjection, SessionRecorder, SessionTurns, Transcript, EXECUTION_CONTEXT_KEY,
     RECORDER_CONTEXT_KEY, SESSION_EXPORT_SINK_CONTEXT_KEY,
 };
@@ -67,6 +67,156 @@ struct SessionState {
     /// output (ACP, a CLI) installs one instead of driving `stream_events` itself, so
     /// the journal writer and the task bookkeeping stay in one place.
     sink: Option<Arc<dyn Fn(&AgentEvent) + Send + Sync>>,
+    /// The last dispatch projection and the committed head it was derived from.
+    ///
+    /// The dispatcher ticks every 50ms even while a session is idle. Re-reading
+    /// `SessionTurns` from the whole journal on every tick re-deserialized every state
+    /// checkpoint; a long session then burned CPU and churned memory without any new work.
+    dispatch_view: Option<(u64, Option<String>, DispatchView)>,
+}
+
+/// The small part of [`SessionTurns`] the dispatcher needs, without the input messages.
+#[derive(Debug, Clone, Default)]
+struct DispatchView {
+    started: BTreeSet<String>,
+    /// The latest turn id while it is still unfinished.
+    open_turn: Option<String>,
+}
+
+/// Incremental receipt state for one command.
+#[derive(Debug, Clone, Default)]
+struct ReceiptFold {
+    run: Option<String>,
+    /// `None` means no `inbox/started` has been observed yet (`queued`).
+    status: Option<String>,
+    error: Option<String>,
+}
+
+/// Folds the event-derived part of task receipts once and then advances it by only the
+/// events committed since the previous poll.
+///
+/// A receipt needs three facts: which run belongs to a command, how that run ended, and
+/// whether its turn was cancelled. They are append-only, so the whole journal prefix does
+/// not need to be re-read on every 50ms tick. Re-reading it loaded every committed state
+/// checkpoint (the full conversation state) again; on a long turn that starved the event
+/// loop, made output arrive in bursts, and grew memory with the undrained delta backlog.
+#[derive(Debug, Default)]
+struct ReceiptCache {
+    through: u64,
+    commit: Option<String>,
+    /// Whether the fold covers the journal from seq 0. A seeded cache starts at the
+    /// submit-time head and only covers events after it.
+    complete: bool,
+    /// The command whose first receipt was seeded at submit time.
+    seeded_for: Option<String>,
+    commands: HashMap<String, ReceiptFold>,
+    cancelled_turns: HashSet<String>,
+}
+
+impl ReceiptCache {
+    /// Starts the fold at the current head for a command that is about to be accepted.
+    ///
+    /// The dispatcher writes `inbox/started` only after acceptance, so starting here avoids
+    /// re-reading the whole (potentially very large) history for the first receipt.
+    fn seed(&mut self, head: &Head, command_id: &str) {
+        *self = Self {
+            through: head.seq,
+            commit: head.commit_id.clone(),
+            complete: false,
+            seeded_for: Some(command_id.to_string()),
+            ..Self::default()
+        };
+    }
+
+    async fn rebuild(&mut self, log: &dyn SessionLog, head: &Head) -> crate::Result<()> {
+        *self = Self::default();
+        self.sync(log, head).await?;
+        self.complete = true;
+        Ok(())
+    }
+
+    /// Applies the events committed since `through`, up to `head`.
+    async fn sync(&mut self, log: &dyn SessionLog, head: &Head) -> crate::Result<()> {
+        // A rewritten or rolled-back head invalidates the fold: rebuild from the start.
+        if head.seq < self.through
+            || (head.seq == self.through
+                && self.commit.as_deref() != head.commit_id.as_deref())
+        {
+            *self = Self::default();
+        }
+        if head.seq == self.through {
+            self.commit = head.commit_id.clone();
+            return Ok(());
+        }
+        let events = match log.scan(self.through, head.seq).await {
+            Ok(events) => events,
+            Err(_) => {
+                // A segment was rewritten (migration/compaction). The prefix cannot be
+                // advanced incrementally; rebuild once rather than reporting a false state.
+                *self = Self::default();
+                log.scan(0, head.seq).await?
+            }
+        };
+        for event in &events {
+            self.apply(event);
+        }
+        self.through = head.seq;
+        self.commit = head.commit_id.clone();
+        Ok(())
+    }
+
+    fn apply(&mut self, event: &SessionEvent) {
+        if event.event_type == "turn/cancelled" {
+            if let Some(turn) = &event.turn_id {
+                self.cancelled_turns.insert(turn.clone());
+            }
+        }
+        if event.event_type == "inbox/started" {
+            let command_id = event
+                .data()
+                .ok()
+                .and_then(|data| data.get("commandId").and_then(|v| v.as_str()).map(str::to_string));
+            if let Some(command_id) = command_id {
+                let fold = self.commands.entry(command_id).or_default();
+                fold.run = event.execution_run_id.clone();
+                fold.status = Some("running".into());
+                fold.error = None;
+            }
+        }
+        if event.event_type == "run/end" {
+            let run = event.execution_run_id.as_deref();
+            if let Some(run) = run {
+                let data = event.data().ok();
+                let status = data
+                    .as_ref()
+                    .and_then(|d| d.get("status").and_then(|v| v.as_str()))
+                    .unwrap_or("completed")
+                    .to_string();
+                let error = data
+                    .as_ref()
+                    .and_then(|d| d.get("error"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                for fold in self.commands.values_mut() {
+                    if fold.run.as_deref() == Some(run) {
+                        fold.status = Some(status.clone());
+                        fold.error = error.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn fold(&self, command_id: &str) -> (Option<String>, String, Option<String>) {
+        match self.commands.get(command_id) {
+            Some(fold) => (
+                fold.run.clone(),
+                fold.status.clone().unwrap_or_else(|| "queued".into()),
+                fold.error.clone(),
+            ),
+            None => (None, "queued".into(), None),
+        }
+    }
 }
 
 /// A session's durable task operations and read views.
@@ -77,6 +227,8 @@ pub struct AgentSession {
     log: Arc<dyn SessionLog>,
     inbox: SessionInbox,
     state: Arc<Mutex<SessionState>>,
+    /// Serializes receipt polls and keeps their incremental fold across ticks.
+    receipts: tokio::sync::Mutex<ReceiptCache>,
 }
 
 impl std::fmt::Debug for AgentSession {
@@ -103,6 +255,7 @@ impl AgentSession {
             log,
             inbox,
             state: Arc::new(Mutex::new(SessionState::default())),
+            receipts: tokio::sync::Mutex::new(ReceiptCache::default()),
         })
     }
 
@@ -198,7 +351,10 @@ impl AgentSession {
             freeze(idempotency_key, vec![message]),
             Vec::new(),
         )?;
-        let accepted = self.inbox.accept(&command).await?;
+        let accepted = {
+            self.seed_receipt_if_new(&command).await?;
+            self.inbox.accept(&command).await?
+        };
         self.start();
         self.receipt(&accepted).await
     }
@@ -240,7 +396,10 @@ impl AgentSession {
             Vec::new(),
             Vec::new(),
         )?;
-        let accepted = self.inbox.accept(&command).await?;
+        let accepted = {
+            self.seed_receipt_if_new(&command).await?;
+            self.inbox.accept(&command).await?
+        };
         self.start();
         self.receipt(&accepted).await
     }
@@ -251,11 +410,9 @@ impl AgentSession {
     /// host that gave up on it must close it explicitly — see
     /// [`abandon_unfinished`](Self::abandon_unfinished).
     pub async fn open_turn(&self) -> crate::Result<Option<String>> {
-        let turns = SessionTurns::read(&*self.log).await?;
-        Ok(turns
-            .latest()
-            .filter(|turn| !turn.ended())
-            .map(|turn| turn.turn_id.clone()))
+        let head = self.log.head().await?;
+        let view = dispatch_view(&*self.log, &self.state, &head).await?;
+        Ok(view.open_turn)
     }
 
     /// Closes the latest unfinished turn so a new task can be submitted.
@@ -274,22 +431,39 @@ impl AgentSession {
         // A run in flight still owns the turn; abandoning it would race the writer lease and
         // silently drop work the caller may still be watching. Give a just-interrupted run a
         // moment to unwind (the caller typically cancels right before asking for a new turn).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while self.state.lock().unwrap().active_run.is_some() {
-            if std::time::Instant::now() >= deadline {
-                return Err(session_error("Wait for the current execution to stop"));
+        //
+        // The wait is bounded but generous: a cancellation has to travel through the agent
+        // loop, reconcile the interrupted iteration, write the terminal facts and release the
+        // writer. Two seconds was shorter than a slow provider stream being drained, so a
+        // perfectly healthy cancel looked like a stuck session to the next prompt. Each
+        // `abandon_turn` already retries a busy writer for ~5s; retrying the whole attempt keeps
+        // the total budget bounded without failing on the first missed lease.
+        const ABANDON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + ABANDON_TIMEOUT;
+        loop {
+            while self.state.lock().unwrap().active_run.is_some() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(session_error("Wait for the current execution to stop"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let Some(latest) = self.open_turn().await? else {
+                return Ok(None);
+            };
+            match agentscope_core::session::abandon_turn(Arc::clone(&self.log), &latest).await {
+                Ok(closed) => {
+                    return Ok(closed.then_some(latest));
+                }
+                Err(error) => {
+                    // Another handle may still be unwinding the same run; retry until the
+                    // deadline instead of reporting a spurious "could not close" to the client.
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
-        let turns = SessionTurns::read(&*self.log).await?;
-        let Some(latest) = turns.latest().cloned() else {
-            return Ok(None);
-        };
-        if latest.ended() {
-            return Ok(None);
-        }
-        agentscope_core::session::abandon_turn(Arc::clone(&self.log), &latest.turn_id).await?;
-        Ok(Some(latest.turn_id))
     }
 
     /// Answers one pending interaction.
@@ -408,7 +582,10 @@ impl AgentSession {
             freeze("answer", messages),
             sorted,
         )?;
-        let accepted = self.inbox.accept(&command).await?;
+        let accepted = {
+            self.seed_receipt_if_new(&command).await?;
+            self.inbox.accept(&command).await?
+        };
         self.start();
         self.receipt(&accepted).await
     }
@@ -547,11 +724,11 @@ impl AgentSession {
 
     /// Every accepted execution task, keyed by turn.
     pub async fn tasks(&self) -> crate::Result<Vec<Task>> {
-        let snapshot = self.inbox.snapshot().await?;
+        let snapshot = self.inbox.snapshot_shared().await?;
         let mut seen: BTreeMap<String, Task> = BTreeMap::new();
         for command in &snapshot.commands {
             if command.execution() {
-                let task = self.receipt(command).await?;
+                let task = self.receipt_with_snapshot(command, &snapshot).await?;
                 seen.insert(task.turn_id.clone(), task);
             }
         }
@@ -560,12 +737,12 @@ impl AgentSession {
 
     /// The current receipt of one accepted command.
     pub async fn task(&self, command_id: &str) -> crate::Result<Task> {
-        let snapshot = self.inbox.snapshot().await?;
+        let snapshot = self.inbox.snapshot_shared().await?;
         let command = snapshot
             .command(command_id)
             .filter(|command| command.execution())
             .ok_or_else(|| session_error("Unknown task submission"))?;
-        self.receipt(command).await
+        self.receipt_with_snapshot(command, &snapshot).await
     }
 
     /// Polls one task until it settles. Observing never starts or cancels work.
@@ -593,8 +770,32 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Starts the receipt fold at the current head for a command that has not been accepted
+    /// before. Retries of an already-started command must keep the full history.
+    async fn seed_receipt_if_new(&self, command: &Command) -> crate::Result<()> {
+        let known = self
+            .inbox
+            .snapshot_shared()
+            .await?
+            .command(&command.id)
+            .is_some();
+        if !known {
+            let head = self.log.head().await?;
+            self.receipts.lock().await.seed(&head, &command.id);
+        }
+        Ok(())
+    }
+
     async fn receipt(&self, command: &Command) -> crate::Result<Task> {
-        let snapshot = self.inbox.snapshot().await?;
+        let snapshot = self.inbox.snapshot_shared().await?;
+        self.receipt_with_snapshot(command, &snapshot).await
+    }
+
+    async fn receipt_with_snapshot(
+        &self,
+        command: &Command,
+        snapshot: &InboxSnapshot,
+    ) -> crate::Result<Task> {
         if let Some(reason) = snapshot.rejected.get(&command.id) {
             return Ok(Task {
                 command_id: command.id.clone(),
@@ -604,101 +805,98 @@ impl AgentSession {
                 error: Some(reason.clone()),
             });
         }
-        let mut run: Option<String> = None;
-        let mut status = "queued".to_string();
-        let mut error: Option<String> = None;
-        // A turn closed by the recovery path (`abandon_turn` / `cancel_pending`) never writes
-        // a `run/end` for the original run, so the receipt must also honour `turn/cancelled`.
-        let mut turn_cancelled = false;
-        // `head` is read once, before the scan, and the scan itself is a journal read. The
-        // ownership check below must NOT reuse this snapshot: the dispatcher may launch the run
-        // between this read and the `active_command` check, which would make a live run look
-        // like it lost its lease (the snapshot still says `owner: None`).
-        let head = self.log.head().await?;
-        for event in self.log.scan(0, head.seq).await? {
-            if event.event_type == "turn/cancelled"
-                && event.turn_id.as_deref() == command.turn_id.as_deref()
-            {
-                turn_cancelled = true;
-            }
-            let records_start = event.event_type == "inbox/started"
-                && event
-                    .data()
-                    .ok()
-                    .and_then(|d| {
-                        d.get("commandId")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .as_deref()
-                    == Some(command.id.as_str());
-            if records_start {
-                run = event.execution_run_id.clone();
-                status = "running".into();
-                error = None;
-            }
-            if let Some(run_id) = &run {
-                if event.execution_run_id.as_deref() == Some(run_id.as_str())
-                    && event.event_type == "run/end"
-                {
-                    let data = event.data().ok();
-                    status = data
-                        .as_ref()
-                        .and_then(|d| {
-                            d.get("status")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "completed".into());
-                    // `run/end` carries the failure detail persisted by the runtime;
-                    // surfacing it turns "run failed" into the actual provider/tool error.
-                    error = data
-                        .as_ref()
-                        .and_then(|d| d.get("error"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                }
-            }
-        }
-        // Whether *this* process is running the command right now. When it is, the in-memory
-        // slot is authoritative: the run is alive by definition, so the lease heuristic below
-        // (which exists to detect a run left behind by another/dead process) must not apply.
-        let owned_here = {
-            let guard = self.state.lock().unwrap();
-            let owned = guard.active_command.as_deref() == Some(command.id.as_str());
-            if owned {
-                if let Some(active) = &guard.active_run {
-                    run = Some(active.clone());
-                }
-                if status == "queued" {
-                    status = "starting".into();
-                }
-            }
-            owned
-        };
-        // A live receipt whose writer lease is gone was interrupted, not finished. Only
-        // meaningful for a run this process does not own: a locally-owned run holds the lease
-        // by construction, and reading it from a stale snapshot would race the launch.
-        if !owned_here && matches!(status.as_str(), "running" | "starting") {
+        // Keep the fold across polls: a receipt only needs the command's start, its run's
+        // end and its turn's cancellation. Re-reading the whole prefix (including every
+        // state checkpoint) on each 50ms tick starved the event loop and grew memory with
+        // the undrained model-delta backlog.
+        let mut cache = self.receipts.lock().await;
+        // The fold is re-synced when the journal advanced while we were deciding. A run that
+        // committed `run/end` between the scan and the lease check used to be mis-reported as
+        // `interrupted`, which made the host try to continue a turn that had already finished.
+        for _ in 0..3 {
+            // `head` bounds the scan. The ownership check below must NOT reuse this snapshot:
+            // the dispatcher may launch the run between this read and the `active_command`
+            // check, which would make a live run look like it lost its lease (the snapshot
+            // still says `owner: None`).
             let head = self.log.head().await?;
-            let owns = run.as_deref() == head.owner.as_deref() && head.lease_until > now_millis();
-            if !owns {
-                status = "interrupted".into();
+            if !cache.complete && cache.seeded_for.as_deref() != Some(command.id.as_str()) {
+                cache.rebuild(&*self.log, &head).await?;
+            }
+            let was_seeded = cache.seeded_for.as_deref() == Some(command.id.as_str());
+            cache.sync(&*self.log, &head).await?;
+            if was_seeded && cache.seeded_for.is_none() {
+                // The head was rewritten under the seed; fall back to the full prefix.
+                cache.rebuild(&*self.log, &head).await?;
+            }
+            let (mut run, mut status, mut error) = cache.fold(&command.id);
+            // A turn closed by the recovery path (`abandon_turn` / `cancel_pending`) never
+            // writes a `run/end` for the original run, so the receipt must also honour
+            // `turn/cancelled`.
+            let turn_cancelled = command
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn| cache.cancelled_turns.contains(turn));
+            // Whether *this* process is running the command right now. When it is, the
+            // in-memory slot is authoritative: the run is alive by definition, so the lease
+            // heuristic below (which exists to detect a run left behind by another/dead
+            // process) must not apply.
+            let owned_here = {
+                let guard = self.state.lock().unwrap();
+                let owned = guard.active_command.as_deref() == Some(command.id.as_str());
+                if owned {
+                    if let Some(active) = &guard.active_run {
+                        run = Some(active.clone());
+                    }
+                    if status == "queued" {
+                        status = "starting".into();
+                    }
+                }
+                owned
+            };
+            // A live receipt whose writer lease is gone was interrupted, not finished. Only
+            // meaningful for a run this process does not own: a locally-owned run holds the
+            // lease by construction, and reading it from a stale snapshot would race the
+            // launch.
+            if !owned_here && matches!(status.as_str(), "running" | "starting") {
+                let current = self.log.head().await?;
+                let owns = run.as_deref() == current.owner.as_deref()
+                    && current.lease_until > now_millis();
+                if !owns {
+                    // A committed prefix only grows. A head that moved backwards is a torn
+                    // read (a value that is briefly absent or mid-replacement), not an
+                    // interruption: re-read instead of telling the host its live run stopped.
+                    if current.seq != head.seq {
+                        // Terminal facts landed after our snapshot (or another writer
+                        // committed): re-read before declaring an interruption.
+                        continue;
+                    }
+                    status = "interrupted".into();
+                    error = None;
+                }
+            }
+            // An abandoned/cancelled turn is terminal for the caller even though the run
+            // itself never wrote `run/end`: report `cancelled` so the prompt stops waiting.
+            if turn_cancelled && !matches!(status.as_str(), "completed" | "failed") {
+                status = "cancelled".into();
                 error = None;
             }
+            return Ok(Task {
+                command_id: command.id.clone(),
+                turn_id: command.turn_id.clone().unwrap_or_default(),
+                run_id: run,
+                status,
+                error,
+            });
         }
-        // An abandoned/cancelled turn is terminal for the caller even though the run itself
-        // never wrote `run/end`: report `cancelled` so the prompt stops waiting on it.
-        if turn_cancelled && !matches!(status.as_str(), "completed" | "failed") {
-            status = "cancelled".into();
-            error = None;
-        }
+        // The journal kept advancing while we inspected it. Report the command as still in
+        // flight rather than guessing at an interruption: the caller polls again shortly and
+        // an unsettled receipt is always safe.
         Ok(Task {
             command_id: command.id.clone(),
             turn_id: command.turn_id.clone().unwrap_or_default(),
-            run_id: run,
-            status,
-            error,
+            run_id: None,
+            status: "running".into(),
+            error: None,
         })
     }
 }
@@ -715,6 +913,39 @@ impl Drop for AgentSession {
     }
 }
 
+/// Returns the cached dispatch projection for `head`, re-reading the journal only when the
+/// committed head changed.
+async fn dispatch_view(
+    log: &dyn SessionLog,
+    state: &Arc<Mutex<SessionState>>,
+    head: &Head,
+) -> crate::Result<DispatchView> {
+    let cached = {
+        let guard = state.lock().unwrap();
+        guard
+            .dispatch_view
+            .as_ref()
+            .filter(|(seq, commit, _)| {
+                *seq == head.seq && commit.as_deref() == head.commit_id.as_deref()
+            })
+            .map(|(_, _, view)| view.clone())
+    };
+    if let Some(view) = cached {
+        return Ok(view);
+    }
+    let turns = SessionTurns::read(log).await?;
+    let open_turn = turns
+        .latest()
+        .filter(|turn| !turn.ended())
+        .map(|turn| turn.turn_id.clone());
+    let view = DispatchView {
+        started: turns.started,
+        open_turn,
+    };
+    state.lock().unwrap().dispatch_view = Some((head.seq, head.commit_id.clone(), view.clone()));
+    Ok(view)
+}
+
 /// One dispatch tick: consume interrupts, then launch the next accepted task.
 async fn dispatch_once(
     agent: &Arc<HarnessAgent>,
@@ -726,7 +957,7 @@ async fn dispatch_once(
     let active = state.lock().unwrap().active_run.is_some();
     if active {
         // Mark consumed interrupt commands so they are not replayed.
-        let snapshot = inbox.snapshot().await?;
+        let snapshot = inbox.snapshot_shared().await?;
         for command in &snapshot.commands {
             if command.kind == "interrupt" && !snapshot.handled.contains(&command.id) {
                 inbox.handled(command).await?;
@@ -741,12 +972,14 @@ async fn dispatch_once(
         return Ok(());
     }
 
-    let turns = SessionTurns::read(&**log).await?;
-    let snapshot = inbox.snapshot().await?;
-    let latest = turns.latest().cloned();
+    // The dispatcher ticks every 50ms even when idle. Reuse the projection until the
+    // committed head changes instead of re-reading every event (and every checkpoint) on
+    // each tick.
+    let view = dispatch_view(&**log, state, &head).await?;
+    let snapshot = inbox.snapshot_shared().await?;
     for command in &snapshot.commands {
         if !command.execution()
-            || turns.started.contains(&command.id)
+            || view.started.contains(&command.id)
             || snapshot.rejected.contains_key(&command.id)
         {
             continue;
@@ -756,7 +989,7 @@ async fn dispatch_once(
         // not terminal, so nothing releases it and the host sits on a `queued` receipt
         // forever. No live writer exists at this point (checked above), so the open turn is
         // orphaned — reject the command so the caller learns it must continue or abandon it.
-        if latest.as_ref().is_some_and(|turn| !turn.ended()) && command.kind == "submit" {
+        if view.open_turn.is_some() && command.kind == "submit" {
             inbox.reject(command, "turn_unfinished").await?;
             continue;
         }
@@ -787,20 +1020,27 @@ async fn launch(
         .session_key(context)
         .map(|key| key.session_id)
         .unwrap_or_default();
-    let exporter = sink.map(|handle| {
-        Arc::new(handle.exporter_for_session(Arc::clone(log), session_id))
-    });
-    let recorder = match SessionRecorder::open_with_exporter(
-        Arc::clone(log),
-        Some(&turn_id),
-        exporter,
-    )
-    .await
-    {
-        Ok(recorder) => Arc::new(recorder),
-        Err(error) => {
-            inbox.reject(&command, &error.to_string()).await?;
-            return Err(error);
+    let exporter =
+        sink.map(|handle| Arc::new(handle.exporter_for_session(Arc::clone(log), session_id)));
+    // Opening the recorder takes the journal writer lease. That can fail transiently (a
+    // previous writer still releasing, a storage hiccup); rejecting the user's prompt on the
+    // first failure made it look like the session was broken. The command stays accepted while
+    // we retry, so a later attempt runs the same turn.
+    let mut open_attempts = 0usize;
+    let recorder = loop {
+        open_attempts += 1;
+        match SessionRecorder::open_with_exporter(Arc::clone(log), Some(&turn_id), exporter.clone())
+            .await
+        {
+            Ok(recorder) => break Arc::new(recorder),
+            Err(error) if open_attempts < 3 => {
+                tracing::warn!(%error, turn = %turn_id, "opening the session recorder failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                inbox.reject(&command, &error.to_string()).await?;
+                return Err(error);
+            }
         }
     };
     let mut execution = SessionExecution::new(Arc::clone(log), command.clone());
@@ -835,10 +1075,23 @@ async fn launch(
     // Guidance accepted before this run starts is folded in by the agent loop's step boundary
     // (Java `reasoning` is the only caller of `beforeStep`), so the launch path must not apply
     // it a second time.
-    let mut inputs = execution.inputs().to_vec();
-    if inputs.is_empty() {
-        inputs = restored.context.clone();
-    }
+    //
+    // The committed projection already contains everything the turn produced, including a
+    // resumed turn's original inputs. Passing those again appended them to the model context a
+    // second time (the user prompt and every tool result duplicated), so only messages the
+    // restored state does not carry are replayed. A brand-new submit's message is new by id; a
+    // `respond` answer is new too; a `resume` replays nothing.
+    let inputs: Vec<Msg> = execution
+        .inputs()
+        .iter()
+        .filter(|message| {
+            !restored
+                .context
+                .iter()
+                .any(|existing| existing.id == message.id)
+        })
+        .cloned()
+        .collect();
     // Bookkeeping works on a copy that already carries the admitted input: `input/received`
     // is journal metadata, while `message/user` facts come from the state snapshot (Java
     // `SessionRecorder.captureState` does the same). The agent itself gets the state
@@ -870,7 +1123,6 @@ async fn launch(
         guard.active_run = Some(recorder.run_id().to_string());
         guard.error = None;
     }
-
     // Everything below runs the agent. If it panics, the bookkeeping above must still be
     // rolled back: a stale `active_command` makes the receipt report `starting` forever, the
     // dispatcher never launches anything again, and the host waits on a turn that is already
@@ -973,6 +1225,13 @@ async fn launch(
             inbox.reject(&command, &error.to_string()).await?;
         }
     }
+    if let Err(error) = &finish {
+        tracing::warn!(
+            %error,
+            turn = %turn_id,
+            "recording the run's terminal facts failed; the receipt will report it as interrupted"
+        );
+    }
     finish?;
     Ok(())
 }
@@ -1061,4 +1320,199 @@ fn freeze(command_id: &str, input: Vec<Msg>) -> Vec<Msg> {
 
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::session::{
+        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, StorageValue,
+    };
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    struct CountingStorage {
+        inner: MemorySessionStorage,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AtomicSessionStorage for CountingStorage {
+        async fn read(&self, path: &str) -> crate::Result<Option<StorageValue>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(path).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            path: &str,
+            expected_version: u64,
+            bytes: &[u8],
+        ) -> crate::Result<bool> {
+            self.inner
+                .compare_and_set(path, expected_version, bytes)
+                .await
+        }
+
+        async fn list_paths(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            self.inner.list_paths(prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn receipts_advance_incrementally_instead_of_rescanning_the_journal() {
+        // The ACP polls a task every 50ms. Re-reading the whole committed prefix on every
+        // poll loaded every state checkpoint again, starved the event loop and made memory
+        // grow with the undrained delta backlog. Only the events committed since the last
+        // poll may be read.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
+            inner: MemorySessionStorage::new(),
+            reads: Arc::clone(&reads),
+        });
+        let log = JournalSessionLog::new(storage, "s");
+        let writer = log.acquire("run", Duration::from_secs(60)).await.unwrap();
+
+        let mut seq = 0u64;
+        for i in 0..40u64 {
+            let event = SessionEvent::new(
+                format!("e{i}"),
+                seq + 1,
+                0,
+                "model/chunk",
+                Some("run-1".into()),
+                Some("t1".into()),
+                true,
+                "{\"text\":\"x\"}",
+            )
+            .unwrap();
+            log.commit(&writer, &format!("b{i}"), seq, &[event])
+                .await
+                .unwrap();
+            seq += 1;
+        }
+        let started = SessionEvent::new(
+            "started",
+            seq + 1,
+            0,
+            "inbox/started",
+            Some("run-1".into()),
+            Some("t1".into()),
+            true,
+            "{\"commandId\":\"cmd-1\",\"kind\":\"submit\"}",
+        )
+        .unwrap();
+        log.commit(&writer, "started", seq, &[started])
+            .await
+            .unwrap();
+        seq += 1;
+
+        let head = log.head().await.unwrap();
+        let mut cache = ReceiptCache::default();
+        let before = reads.load(Ordering::SeqCst);
+        cache.sync(&log, &head).await.unwrap();
+        let initial = reads.load(Ordering::SeqCst) - before;
+        assert!(
+            initial > 20,
+            "the initial sync must read the committed prefix, read {initial} values"
+        );
+        assert_eq!(
+            cache.fold("cmd-1"),
+            (Some("run-1".to_string()), "running".to_string(), None)
+        );
+
+        // An unchanged head must not read anything at all.
+        let before = reads.load(Ordering::SeqCst);
+        cache.sync(&log, &head).await.unwrap();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            before,
+            "an unchanged head re-read the journal"
+        );
+
+        // A new terminal fact reads only its own commit, not the whole prefix again.
+        let ended = SessionEvent::new(
+            "ended",
+            seq + 1,
+            0,
+            "run/end",
+            Some("run-1".into()),
+            Some("t1".into()),
+            true,
+            "{\"status\":\"completed\"}",
+        )
+        .unwrap();
+        let head = log.commit(&writer, "ended", seq, &[ended]).await.unwrap();
+        let before = reads.load(Ordering::SeqCst);
+        cache.sync(&log, &head).await.unwrap();
+        let incremental = reads.load(Ordering::SeqCst) - before;
+        assert!(
+            incremental < 10,
+            "an incremental sync read {incremental} values; it must only read the new commit"
+        );
+        assert_eq!(
+            cache.fold("cmd-1"),
+            (Some("run-1".to_string()), "completed".to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seeded_receipt_does_not_read_the_history_before_submit() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
+            inner: MemorySessionStorage::new(),
+            reads: Arc::clone(&reads),
+        });
+        let log = JournalSessionLog::new(storage, "s");
+        let writer = log.acquire("run", Duration::from_secs(60)).await.unwrap();
+
+        let mut seq = 0u64;
+        for i in 0..40u64 {
+            let event = SessionEvent::new(
+                format!("old{i}"),
+                seq + 1,
+                0,
+                "model/chunk",
+                Some("run-old".into()),
+                Some("t-old".into()),
+                true,
+                "{\"text\":\"x\"}",
+            )
+            .unwrap();
+            log.commit(&writer, &format!("old{i}"), seq, &[event])
+                .await
+                .unwrap();
+            seq += 1;
+        }
+
+        let seeded = log.head().await.unwrap();
+        let mut cache = ReceiptCache::default();
+        cache.seed(&seeded, "cmd-new");
+
+        let started = SessionEvent::new(
+            "started-new",
+            seq + 1,
+            0,
+            "inbox/started",
+            Some("run-new".into()),
+            Some("t-new".into()),
+            true,
+            "{\"commandId\":\"cmd-new\",\"kind\":\"submit\"}",
+        )
+        .unwrap();
+        let head = log.commit(&writer, "started-new", seq, &[started]).await.unwrap();
+
+        let before = reads.load(Ordering::SeqCst);
+        cache.sync(&log, &head).await.unwrap();
+        let delta = reads.load(Ordering::SeqCst) - before;
+        assert!(
+            delta < 10,
+            "a seeded receipt read {delta} values; it must not read pre-submit history"
+        );
+        assert_eq!(
+            cache.fold("cmd-new"),
+            (Some("run-new".to_string()), "running".to_string(), None)
+        );
+    }
 }

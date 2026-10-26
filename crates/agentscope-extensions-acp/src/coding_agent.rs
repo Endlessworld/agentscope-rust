@@ -10,16 +10,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentAuthCapabilities, AgentCapabilities, CloseSessionRequest, CloseSessionResponse,
-    DeleteSessionRequest, DeleteSessionResponse, DisableProviderRequest, DisableProviderResponse,
-    Implementation, InitializeRequest, InitializeResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionResumeCapabilities, SetProviderRequest,
-    SetProviderResponse, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    AgentAuthCapabilities, AgentCapabilities, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, DisableProviderRequest,
+    DisableProviderResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionResumeCapabilities, SetProviderRequest, SetProviderResponse,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason,
 };
 use agent_client_protocol::{Agent, Stdio};
 
@@ -249,21 +250,38 @@ impl AcpCodingAgent {
     /// 避免多会话同时持有完整 `HarnessAgent` 成倍放大内存。
     fn register_session(&self, session: AcpAgentSession) {
         let id = session.session_id().to_string();
+        // A prompt that finishes after `session/close` must not resurrect the session.
+        if session.is_closed() {
+            self.sessions.lock().unwrap().remove(&id);
+            return;
+        }
         let mut guard = self.sessions.lock().unwrap();
         if guard.len() >= self.max_sessions && !guard.contains_key(&id) {
-            // 淘汰最旧：session_id 形如 session-<epoch_millis>，取其时间戳最小者。
-            let mut oldest: Option<(String, i64)> = None;
-            for sid in guard.keys() {
-                let t = sid
-                    .strip_prefix("session-")
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(i64::MAX);
-                match &oldest {
-                    Some((_, ot)) if *ot <= t => {}
-                    _ => oldest = Some((sid.clone(), t)),
+            // 淘汰最久未活动的会话：`updated_at` 是提示轮次写入的 RFC-3339 时间戳，
+            // 字典序即时间序；新建而未提示过的会话排在最前（最旧）。会话 id 形如
+            // `session-<uuid>`，无法解析出时间戳，绝不能按 id 猜旧。
+            //
+            // 优先淘汰空闲会话：运行中的会话仍被其 prompt handler 使用，淘汰后客户端
+            // 对它的后续请求（例如 `session/cancel`）会变成 "unknown session"。
+            // 当所有会话都在运行时容量上限仍然优先（否则无法接纳新会话）；正在执行的
+            // 提示持有自己的 clone，不会因此中断，只是后续定向请求可能落空。
+            let mut oldest: Option<(String, String, bool)> = None;
+            for (sid, candidate) in guard.iter() {
+                let idle = !candidate.is_running();
+                let key = (sid.clone(), candidate.updated_at_sort_key(), idle);
+                let replace = match &oldest {
+                    None => true,
+                    Some((_, ot, oidle)) => {
+                        // Prefer an idle session over a running one, then the least recently
+                        // used.
+                        (idle && !*oidle) || (idle == *oidle && key.1 < *ot)
+                    }
+                };
+                if replace {
+                    oldest = Some(key);
                 }
             }
-            if let Some((oldest_id, _)) = oldest {
+            if let Some((oldest_id, _, _)) = oldest {
                 guard.remove(&oldest_id);
             }
         }
@@ -339,6 +357,7 @@ impl AcpCodingAgent {
         let a_init = agent.clone();
         let a_new = agent.clone();
         let a_prompt = agent.clone();
+        let a_cancel = agent.clone();
         let a_cfg = agent.clone();
         let a_mode = agent.clone();
         let a_close = agent.clone();
@@ -444,6 +463,19 @@ impl AcpCodingAgent {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            // ACP clients cancel an in-flight turn with `session/cancel`. Without this handler
+            // "Stop" was a no-op: the run kept streaming (and billing) while the client had
+            // already abandoned the prompt. The prompt loop watches this flag and returns
+            // `StopReason::Cancelled`.
+            .on_receive_notification(
+                async move |notif: CancelNotification, _cx| {
+                    if let Some(session) = a_cancel.get_session(&notif.session_id) {
+                        session.cancel();
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
             .on_receive_request(
                 async move |req: SetSessionConfigOptionRequest, responder, cx| {
                     let sid = req.session_id;
@@ -544,7 +576,9 @@ impl AcpCodingAgent {
                 async move |req: CloseSessionRequest, responder, _cx| {
                     let sid = req.session_id;
                     if let Some(session) = a_close.get_session(&sid) {
-                        session.cancel();
+                        // Cancel the in-flight prompt and mark the session closed, so a prompt
+                        // that finishes later cannot re-insert it into the registry.
+                        session.close();
                     }
                     a_close.remove_session(&sid);
                     responder.respond(CloseSessionResponse::new())

@@ -533,6 +533,44 @@ impl SessionLog for JournalSessionLog {
         Ok(collected)
     }
 
+    async fn visit(
+        &self,
+        after: u64,
+        through: u64,
+        visitor: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+    ) -> crate::error::Result<()> {
+        let head = self.head().await?;
+        if through < after || through > head.seq {
+            return Err(session_error("Invalid committed prefix"));
+        }
+        if after == through {
+            return Ok(());
+        }
+        let mut cursor = after;
+        for id in self.segments_through(&head, after, through).await? {
+            // One commit at a time: its payload (a state checkpoint can be large) is
+            // dropped before the next commit is read.
+            let commit = self.read_commit(&id).await?;
+            for candidate in commit.events {
+                if candidate.seq <= cursor {
+                    continue;
+                }
+                if candidate.seq != cursor + 1 {
+                    return Err(session_error("Non-contiguous event sequence"));
+                }
+                cursor = candidate.seq;
+                visitor(&candidate)?;
+                if cursor >= through {
+                    return Ok(());
+                }
+            }
+        }
+        if cursor < through {
+            return Err(session_error("Missing committed events"));
+        }
+        Ok(())
+    }
+
     async fn export_cursor(&self, sink: &str) -> crate::error::Result<u64> {
         let path = self.path(&format!("exports/{}.json", Self::hash(sink.as_bytes())));
         Ok(self.read_json::<u64>(&path).await?.unwrap_or(0))

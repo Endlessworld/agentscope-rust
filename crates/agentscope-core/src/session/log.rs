@@ -111,6 +111,23 @@ pub trait SessionLog: Send + Sync {
         Ok(collected)
     }
 
+    /// Visits committed events in `(after, through]` without materializing the range.
+    ///
+    /// Projections use this so only one commit's payload is resident at a time. A long
+    /// session can hold tens of megabytes of state checkpoints; collecting them all just to
+    /// read the latest one inflated the process's peak heap.
+    async fn visit(
+        &self,
+        after: u64,
+        through: u64,
+        visitor: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+    ) -> crate::error::Result<()> {
+        for event in self.scan(after, through).await? {
+            visitor(&event)?;
+        }
+        Ok(())
+    }
+
     /// The durable export watermark for one sink.
     async fn export_cursor(&self, _sink: &str) -> crate::error::Result<u64> {
         Ok(0)
