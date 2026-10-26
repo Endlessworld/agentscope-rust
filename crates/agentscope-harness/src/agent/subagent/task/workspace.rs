@@ -391,19 +391,34 @@ impl TaskRepository for WorkspaceTaskRepository {
         let found_local = local.is_some();
 
         let path = self.tasks_path(session_id);
-        let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
-        let snapshot = map.get(task_id).cloned();
+        let mut snapshot: Option<TaskRecord> = None;
 
         // Durable cancellation is written first so completion listeners always observe a
-        // terminal record, never a still-running one.
-        if let Some(rec) = map.get_mut(task_id) {
-            rec.cancel_requested = true;
-            if !rec.status.is_terminal() {
-                rec.status = TaskStatus::Cancelled;
+        // terminal record, never a still-running one. The write goes through an
+        // optimistic-concurrency loop: a plain read-modify-write here would race the poller's
+        // `update_record_status` and could resurrect a stale `Running` record (both sides used
+        // to stamp the same next version, so neither detected the conflict).
+        for _ in 0..RECORD_CAS_RETRIES {
+            let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
+            let base_version = match map.get(task_id) {
+                Some(rec) => rec.version,
+                None => break,
+            };
+            {
+                let rec = map.get_mut(task_id).expect("checked above");
+                rec.cancel_requested = true;
+                if !rec.status.is_terminal() {
+                    rec.status = TaskStatus::Cancelled;
+                }
+                rec.touch();
+                rec.version = base_version.wrapping_add(1);
+                snapshot = Some(rec.clone());
             }
-            rec.touch();
-            rec.version = rec.version.wrapping_add(1);
-            write_records(self.state.fs.as_ref(), ctx, &path, &map).await;
+            let current = read_records(self.state.fs.as_ref(), ctx, &path).await;
+            if current.get(task_id).map(|r| r.version) == Some(base_version) {
+                write_records(self.state.fs.as_ref(), ctx, &path, &map).await;
+                break;
+            }
         }
 
         if let Some(local) = local {
@@ -506,12 +521,24 @@ async fn write_records(
     map: &BTreeMap<String, TaskRecord>,
 ) {
     if let Ok(json) = serde_json::to_string(map) {
-        // `Filesystem::write` refuses to overwrite an existing path, so delete-then-write to
-        // implement an idempotent full-map upsert.
-        if fs.exists(ctx, path).await.unwrap_or(false) {
-            let _ = fs.delete(ctx, path).await;
+        // `Filesystem::write` refuses to overwrite an existing path, so writes go through a
+        // sidecar file that is then `rename`d over the target. `rename` is atomic within a
+        // volume, so a concurrent reader never observes a missing file (the old
+        // delete-then-write sequence opened exactly that window, and a racing writer could
+        // resurrect a map that had already dropped this record).
+        let tmp = format!("{path}.tmp");
+        if fs.exists(ctx, &tmp).await.unwrap_or(false) {
+            let _ = fs.delete(ctx, &tmp).await;
         }
-        let _ = fs.write(ctx, path, &json).await;
+        match fs.write(ctx, &tmp, &json).await {
+            Ok(()) => {
+                if let Err(e) = fs.move_path(ctx, &tmp, path).await {
+                    tracing::warn!("Failed to commit task records to {path}: {e}");
+                    let _ = fs.delete(ctx, &tmp).await;
+                }
+            }
+            Err(e) => tracing::warn!("Failed to stage task records for {path}: {e}"),
+        }
     }
 }
 
@@ -1001,6 +1028,7 @@ mod tests {
         statuses: std::sync::Mutex<Vec<RemoteTaskStatus>>,
         submitted: std::sync::Mutex<Vec<String>>,
         cancelled: std::sync::Mutex<Vec<String>>,
+        status_checks: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeTransport {
@@ -1009,6 +1037,7 @@ mod tests {
                 statuses: std::sync::Mutex::new(statuses),
                 submitted: std::sync::Mutex::new(Vec::new()),
                 cancelled: std::sync::Mutex::new(Vec::new()),
+                status_checks: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
@@ -1034,6 +1063,8 @@ mod tests {
             _target: &RemoteTarget,
             _task_id: &str,
         ) -> agentscope_core::error::Result<RemoteTaskStatus> {
+            self.status_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut st = self.statuses.lock().unwrap();
             // Keep serving the last status once the script is exhausted.
             let s = if st.len() > 1 { st.remove(0) } else { st[0].clone() };
@@ -1080,6 +1111,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         bg.is_completed()
+    }
+
+    /// Waits until `transport` has served at least `count` status checks, so tests can
+    /// synchronise on the poller's progress instead of guessing a sleep duration.
+    async fn wait_for_status_checks(
+        transport: &Arc<FakeTransport>,
+        count: usize,
+        timeout_ms: u64,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if transport
+                .status_checks
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= count
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
     }
 
     #[tokio::test]
@@ -1353,8 +1405,12 @@ mod tests {
             .with_transport(transport.clone());
 
         let bg = repo.put_task(&ctx, "t-cancel", "sub1", "sess", remote_spec()).await;
-        // Let the poller reach its first status check.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait deterministically until the poller has actually observed the remote status
+        // (a fixed sleep raced the submit → first-poll handshake and made this test flaky).
+        assert!(
+            wait_for_status_checks(&transport, 1, 10_000).await,
+            "poller never checked the remote status"
+        );
         assert!(repo.cancel_task(&ctx, "sess", "t-cancel").await);
         assert!(wait_done(&bg, 10_000).await);
 
