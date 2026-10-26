@@ -30,6 +30,11 @@ pub const DEFAULT_RESOURCES_TABLE_NAME: &str = "agentscope_skill_resources";
 /// PostgreSQL identifier length limit.
 const MAX_IDENTIFIER_LENGTH: usize = 63;
 
+/// Column types that can store the JSON metadata payload (`isSupportedMetadataJsonColumnType`).
+/// `jsonb` is deliberately absent: writing a JSON *string* into `jsonb` would fail.
+const SUPPORTED_METADATA_JSON_COLUMN_TYPES: [&str; 3] =
+    ["text", "character varying", "character"];
+
 /// Configuration for [`PostgresSkillRepository`].
 #[derive(Debug, Clone)]
 pub struct PostgresSkillRepositoryConfig {
@@ -219,7 +224,7 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         Ok(())
     }
 
-    /// Probes `INFORMATION_SCHEMA.COLUMNS` for a `metadata_json` column.
+    /// Probes `INFORMATION_SCHEMA.COLUMNS` for a `metadata_json` column and verifies its type.
     fn detect_metadata_json_column_support(&self) -> bool {
         let sql = "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'metadata_json'";
@@ -230,10 +235,30 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
             SqlParam::Text(self.cfg.schema_name.clone()),
             SqlParam::Text(self.cfg.skills_table_name.clone()),
         ];
-        match conn.query(sql, &params) {
-            Ok(rows) => !rows.is_empty(),
-            Err(_) => false,
+        let rows = match conn.query(sql, &params) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to detect metadata_json support, using the legacy schema");
+                return false;
+            }
+        };
+        let Some(data_type) = rows
+            .first()
+            .and_then(|row| row.get_text("DATA_TYPE").or_else(|| row.get_text("data_type")))
+        else {
+            return false;
+        };
+        let normalized = data_type.trim().to_ascii_lowercase();
+        if SUPPORTED_METADATA_JSON_COLUMN_TYPES.contains(&normalized.as_str()) {
+            return true;
         }
+        tracing::warn!(
+            schema = %self.cfg.schema_name,
+            table = %self.cfg.skills_table_name,
+            data_type = %data_type,
+            "metadata_json column has an unsupported type; extended metadata will not be persisted"
+        );
+        false
     }
 
     fn resource_rows(
@@ -567,7 +592,11 @@ impl<D: SqlDatabase> AgentSkillRepository for PostgresSkillRepository<D> {
     }
 
     fn get_source(&self) -> String {
-        "postgresql".to_string()
+        // Java: `"postgresql_" + schemaName + "_" + skillsTableName`.
+        format!(
+            "postgresql_{}_{}",
+            self.cfg.schema_name, self.cfg.skills_table_name
+        )
     }
 
     fn is_writeable(&self) -> bool {
@@ -653,6 +682,59 @@ mod tests {
         let info = repo().get_repository_info();
         assert_eq!(info.repo_type, "postgresql");
         assert_eq!(info.location, "agentscope.agentscope_skills");
+    }
+
+    // Java: getSource -> `postgresql_<schema>_<table>` (P1-10).
+    #[test]
+    fn get_source_includes_schema_and_table() {
+        assert_eq!(
+            repo().get_source(),
+            "postgresql_agentscope_agentscope_skills"
+        );
+    }
+
+    // Java: isSupportedMetadataJsonColumnType (P1-07).
+    #[test]
+    fn text_metadata_column_is_supported() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        db.connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE agentscope_skills (id BIGINT, name VARCHAR(255), description TEXT, \
+                 skill_content TEXT, source VARCHAR(255), metadata_json TEXT NULL)",
+                &[],
+            )
+            .unwrap();
+        let r = PostgresSkillRepository::with_config(
+            db,
+            PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
+        )
+        .unwrap();
+        assert!(r.metadata_json_column_supported());
+    }
+
+    #[test]
+    fn jsonb_metadata_column_falls_back_to_the_legacy_schema() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        db.connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE agentscope_skills (id BIGINT, name VARCHAR(255), description TEXT, \
+                 skill_content TEXT, source VARCHAR(255), metadata_json jsonb)",
+                &[],
+            )
+            .unwrap();
+        let r = PostgresSkillRepository::with_config(
+            db,
+            PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
+        )
+        .unwrap();
+        assert!(!r.metadata_json_column_supported());
+        // The legacy path still round-trips the core columns.
+        r.save(&[skill("p", "pg skill")], false).unwrap();
+        let loaded = r.get_skill("p").unwrap();
+        assert_eq!(loaded.description(), "pg skill");
+        assert_eq!(loaded.metadata().len(), 2);
     }
 
     #[test]

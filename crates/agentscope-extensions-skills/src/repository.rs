@@ -3,7 +3,10 @@
 //! Mirrors `io.agentscope.core.skill.repository.AgentSkillRepository` (+ `AgentSkillRepositoryInfo`).
 //! The storage model is the harness [`AgentSkill`] — no parallel skill type is introduced.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscope_harness::agent::skill::{AgentSkill, SkillRepo, SkillRepository};
 
@@ -80,6 +83,17 @@ pub trait AgentSkillRepository: Send + Sync {
     /// The repository's skill `source` string.
     fn get_source(&self) -> String;
 
+    /// The on-disk directory backing a skill, when the backend stores skills as directories.
+    ///
+    /// Mirrors Java `AgentSkill#getOriginDir()`: the harness `load_skill_through_path` tool reads
+    /// files from this directory, so directory-backed backends (git) must expose it. In-memory
+    /// backends (SQL) return `None`; [`RepoBackedSkillRepository`] materialises their resources
+    /// into a cache directory instead.
+    fn skill_dir(&self, skill_name: &str) -> Option<PathBuf> {
+        let _ = skill_name;
+        None
+    }
+
     /// Whether write operations are supported.
     fn is_writeable(&self) -> bool;
 
@@ -106,6 +120,10 @@ pub struct RepoBackedSkillRepository {
     inner: Arc<dyn AgentSkillRepository>,
     kind: SkillRepo,
     id: String,
+    /// Lazily created cache root used to materialise in-memory (SQL) skills on disk.
+    cache_root: OnceLock<Option<PathBuf>>,
+    /// Skill name -> materialised directory (SQL backends only).
+    materialized: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl RepoBackedSkillRepository {
@@ -126,7 +144,71 @@ impl RepoBackedSkillRepository {
                 format!("ext:{source}")
             }
         });
-        Self { inner, kind, id }
+        Self {
+            inner,
+            kind,
+            id,
+            cache_root: OnceLock::new(),
+            materialized: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Cache root for materialised in-memory skills (`None` when the temp dir is unusable).
+    fn cache_root(&self) -> Option<&Path> {
+        self.cache_root
+            .get_or_init(|| {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "agentscope-skill-cache-{}-{nanos}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => Some(dir),
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "cannot create the skill cache dir");
+                        None
+                    }
+                }
+            })
+            .as_deref()
+    }
+
+    /// Writes a backend skill's resources to a cache directory so the harness load tool can read
+    /// them (`AgentSkill` has no `originDir`, so in-memory skills need this hop).
+    fn materialize_skill(&self, name: &str) -> Option<PathBuf> {
+        if let Some(dir) = self.materialized.lock().unwrap().get(name) {
+            if dir.is_dir() {
+                return Some(dir.clone());
+            }
+        }
+        let skill = match self.inner.get_skill(name) {
+            Ok(skill) => skill,
+            Err(e) => {
+                tracing::debug!(skill = name, error = %e, "cannot materialize an unknown skill");
+                return None;
+            }
+        };
+        let root = self.cache_root()?;
+        let dir = root.join(sanitize_component(name));
+        if let Err(e) = write_resources_to_dir(&dir, &skill) {
+            tracing::warn!(skill = name, dir = %dir.display(), error = %e, "failed to materialize skill resources");
+            return None;
+        }
+        self.materialized
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), dir.clone());
+        Some(dir)
+    }
+
+    /// Drops a materialised cache entry (called after a write so the load tool re-reads).
+    fn forget_materialized(&self, name: &str) {
+        if let Some(dir) = self.materialized.lock().unwrap().remove(name) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -152,6 +234,16 @@ impl SkillRepository for RepoBackedSkillRepository {
         self.inner.get_all_skills().unwrap_or_default()
     }
 
+    /// Exposes the skill directory so `load_skill_through_path` works for extension backends.
+    ///
+    /// Directory-backed backends (git) return their real path; in-memory backends (SQL) get their
+    /// resources materialised into a cache directory on first use.
+    fn skill_dir(&self, name: &str) -> Option<PathBuf> {
+        self.inner
+            .skill_dir(name)
+            .or_else(|| self.materialize_skill(name))
+    }
+
     fn write_skill(&self, skill: &AgentSkill) -> std::io::Result<()> {
         if !self.inner.is_writeable() {
             return Err(std::io::Error::new(
@@ -162,6 +254,8 @@ impl SkillRepository for RepoBackedSkillRepository {
         self.inner
             .save(std::slice::from_ref(skill), true)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Drop the materialised copy so the load tool re-reads the fresh resources.
+        self.forget_materialized(skill.name());
         Ok(())
     }
 
@@ -175,8 +269,51 @@ impl SkillRepository for RepoBackedSkillRepository {
         self.inner
             .delete(name)
             .map(|_| ())
-            .map_err(|e| std::io::Error::other(e.to_string()))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.forget_materialized(name);
+        Ok(())
     }
+}
+
+/// Makes a skill name safe to use as a single path component.
+fn sanitize_component(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            other => other,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim().to_string();
+    if trimmed.is_empty() {
+        "skill".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Writes every resource of `skill` under `dir`, decoding `base64:` payloads.
+fn write_resources_to_dir(dir: &Path, skill: &AgentSkill) -> std::io::Result<()> {
+    use base64::Engine as _;
+    std::fs::create_dir_all(dir)?;
+    for (rel, content) in skill.resources() {
+        let rel = rel.replace('\\', "/");
+        if rel.trim().is_empty() || rel.starts_with('/') || rel.split('/').any(|s| s == "..") {
+            continue;
+        }
+        let target = dir.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = match content.strip_prefix("base64:") {
+            Some(rest) => base64::engine::general_purpose::STANDARD
+                .decode(rest)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            None => content.as_bytes().to_vec(),
+        };
+        std::fs::write(&target, bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -187,6 +324,7 @@ mod tests {
     struct DummyRepo {
         skills: Vec<AgentSkill>,
         source: String,
+        dir: Option<PathBuf>,
     }
 
     impl AgentSkillRepository for DummyRepo {
@@ -222,6 +360,9 @@ mod tests {
             false
         }
         fn set_writeable(&self, _writeable: bool) {}
+        fn skill_dir(&self, _skill_name: &str) -> Option<PathBuf> {
+            self.dir.clone()
+        }
     }
 
     fn skill(name: &str) -> AgentSkill {
@@ -237,6 +378,7 @@ mod tests {
         let repo = DummyRepo {
             skills: vec![skill("alpha"), skill("beta")],
             source: "git-demo".to_string(),
+            dir: None,
         };
         let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
         assert_eq!(adapter.source(), "git-demo");
@@ -251,9 +393,63 @@ mod tests {
         let repo = DummyRepo {
             skills: vec![],
             source: "s".to_string(),
+            dir: None,
         };
         let adapter = RepoBackedSkillRepository::new(Arc::new(repo), Some("id".into()));
         assert_eq!(adapter.repo_id(), "id");
         assert!(adapter.write_skill(&skill("x")).is_err());
+    }
+
+    /// P1-08: a directory-backed backend's path must reach the harness load tool unchanged.
+    #[test]
+    fn adapter_forwards_backend_skill_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "asr-adapter-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let repo = DummyRepo {
+            skills: vec![skill("alpha")],
+            source: "git-demo".to_string(),
+            dir: Some(dir.clone()),
+        };
+        let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
+        // Both `AgentSkillRepository` and the harness `SkillRepository` expose `skill_dir`, so
+        // disambiguate through the harness trait (the one the harness consumes).
+        assert_eq!(SkillRepository::skill_dir(&adapter, "alpha"), Some(dir));
+        // No cache directory is created when the backend already owns a directory.
+        assert!(adapter.cache_root.get().is_none());
+    }
+
+    /// P1-08: in-memory (SQL) skills have no directory, so the adapter materialises their
+    /// resources into a cache dir that `load_skill_through_path` can read.
+    #[test]
+    fn adapter_materialises_in_memory_skills() {
+        let stored = AgentSkill::builder()
+            .name("calc")
+            .source("mysql_agentscope_agentscope_skills")
+            .description("d")
+            .add_resource("SKILL.md", "---\nname: calc\n---\nbody")
+            .add_resource("refs/table.csv", "a,b\n1,2\n")
+            .build();
+        let repo = DummyRepo {
+            skills: vec![stored],
+            source: "mysql".to_string(),
+            dir: None,
+        };
+        let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
+        let dir = SkillRepository::skill_dir(&adapter, "calc").expect("materialised skill dir");
+        assert!(dir.is_dir());
+        let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(md.contains("name: calc"));
+        let csv = std::fs::read_to_string(dir.join("refs/table.csv")).unwrap();
+        assert_eq!(csv, "a,b\n1,2\n");
+        // Repeated lookups are stable and unknown skills yield no directory.
+        assert_eq!(SkillRepository::skill_dir(&adapter, "calc"), Some(dir.clone()));
+        assert_eq!(SkillRepository::skill_dir(&adapter, "missing"), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

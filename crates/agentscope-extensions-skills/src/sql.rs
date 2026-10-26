@@ -161,8 +161,10 @@ struct InMemoryTable {
 struct InMemoryState {
     /// Table name -> table.
     tables: HashMap<String, InMemoryTable>,
-    /// Table name -> whether a `metadata_json` column exists (drives compatibility probes).
-    metadata_columns: HashMap<String, bool>,
+    /// Table name -> declared `metadata_json` column type (absence = no such column).
+    metadata_columns: HashMap<String, String>,
+    /// Databases / schemas registered through `CREATE DATABASE` / `CREATE SCHEMA`.
+    schemas: std::collections::HashSet<String>,
 }
 
 /// A dependency-free [`SqlDatabase`] backed by process memory.
@@ -194,7 +196,22 @@ impl InMemorySqlDatabase {
     pub fn register_table(&self, table: &str, has_metadata: bool) {
         let mut st = self.state.lock().unwrap();
         st.tables.entry(table.to_string()).or_default();
-        st.metadata_columns.insert(table.to_string(), has_metadata);
+        if has_metadata {
+            // MySQL does not inspect the type; PostgreSQL accepts `text`.
+            st.metadata_columns
+                .insert(table.to_string(), "text".to_string());
+        }
+    }
+
+    /// Returns `true` when the database/schema was created (or a table made it implicit).
+    pub fn schema_exists(&self, schema: &str) -> bool {
+        let st = self.state.lock().unwrap();
+        st.schemas.contains(schema)
+    }
+
+    /// The declared `metadata_json` column type of a table, if the column exists.
+    pub fn metadata_column_type(&self, table: &str) -> Option<String> {
+        self.state.lock().unwrap().metadata_columns.get(table).cloned()
     }
 
     /// Returns `true` when the table exists.
@@ -214,14 +231,12 @@ impl InMemorySqlDatabase {
     }
 
     /// Whether the named table is known to expose a `metadata_json` column.
-    fn has_metadata_column(&self, table: &str) -> bool {
+    pub fn has_metadata_column(&self, table: &str) -> bool {
         self.state
             .lock()
             .unwrap()
             .metadata_columns
-            .get(table)
-            .copied()
-            .unwrap_or(false)
+            .contains_key(table)
     }
 }
 
@@ -251,38 +266,43 @@ enum StagedWrite {
 }
 
 impl InMemoryConnection {
-    fn parse_table(sql: &str) -> String {
-        // Handles `FROM "schema"."table"`, `FROM db.table`, `FROM table`, and
-        // `CREATE TABLE [IF NOT EXISTS] "schema"."table"` / `CREATE SCHEMA ...`.
+    fn parse_table_token(sql: &str) -> String {
+        // Handles `FROM "schema"."table"`, `FROM db.table`, `FROM table`,
+        // `CREATE TABLE [IF NOT EXISTS] ...`, `CREATE [DATABASE|SCHEMA] [IF NOT EXISTS] ...`
+        // and `INSERT INTO ...`. The token keeps its dotted prefix / quotes.
         let lower = sql.to_ascii_lowercase();
+        let skip_if_not_exists = |after: usize, lower: &str| {
+            let tail = &lower[after..];
+            match tail
+                .strip_prefix("if not exists ")
+                .or_else(|| tail.strip_prefix("if not exists"))
+            {
+                Some(stripped) => after + (tail.len() - stripped.len()),
+                None => after,
+            }
+        };
         let marker = if let Some(i) = lower.find(" from ") {
             i + " from ".len()
+        } else if let Some(i) = lower.find("create database ") {
+            skip_if_not_exists(i + "create database ".len(), &lower)
         } else if let Some(i) = lower.find("create table ") {
-            // Skip the optional `if not exists` clause.
-            let after = i + "create table ".len();
-            let tail = &lower[after..];
-            match tail.strip_prefix("if not exists ").or_else(|| tail.strip_prefix("if not exists")) {
-                Some(stripped) => after + (tail.len() - stripped.len()),
-                None => after,
-            }
+            skip_if_not_exists(i + "create table ".len(), &lower)
         } else if let Some(i) = lower.find("create schema ") {
-            let after = i + "create schema ".len();
-            let tail = &lower[after..];
-            match tail.strip_prefix("if not exists ").or_else(|| tail.strip_prefix("if not exists")) {
-                Some(stripped) => after + (tail.len() - stripped.len()),
-                None => after,
-            }
+            skip_if_not_exists(i + "create schema ".len(), &lower)
         } else if let Some(i) = lower.find("insert into ") {
             i + "insert into ".len()
         } else {
             0
         };
         let rest = &sql[marker..];
-        let token: String = rest
-            .chars()
+        rest.chars()
             .take_while(|c| !c.is_whitespace() && *c != '(' && *c != ';')
-            .collect();
+            .collect()
+    }
+
+    fn parse_table(sql: &str) -> String {
         // Keep only the last dotted component, stripping quotes.
+        let token = Self::parse_table_token(sql);
         token
             .rsplit('.')
             .next()
@@ -290,6 +310,36 @@ impl InMemoryConnection {
             .trim_matches('"')
             .trim_matches('`')
             .to_string()
+    }
+
+    /// The schema prefix of the target token (`db.table` -> `db`), when present.
+    fn parse_schema(token: &str) -> Option<String> {
+        let (schema, _) = token.rsplit_once('.')?;
+        let schema = schema.trim_matches('"').trim_matches('`').to_string();
+        if schema.is_empty() {
+            None
+        } else {
+            Some(schema)
+        }
+    }
+
+    /// The declared type of a `metadata_json` column in a `CREATE TABLE` statement.
+    fn declared_metadata_type(sql: &str) -> Option<String> {
+        let lower = sql.to_ascii_lowercase();
+        let idx = lower.find("metadata_json")?;
+        let after = lower[idx + "metadata_json".len()..].trim_start();
+        if after.starts_with("character varying") {
+            return Some("character varying".to_string());
+        }
+        let ty: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        if ty.is_empty() {
+            None
+        } else {
+            Some(ty)
+        }
     }
 
     fn parse_insert_table(sql: &str) -> String {
@@ -347,16 +397,24 @@ impl InMemoryConnection {
 impl SqlConnection for InMemoryConnection {
     fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<usize, SkillRepositoryError> {
         let trimmed = sql.trim_start().to_ascii_lowercase();
+        if trimmed.starts_with("create database") || trimmed.starts_with("create schema") {
+            let schema = Self::parse_table(sql);
+            self.state.lock().unwrap().schemas.insert(schema);
+            return Ok(0);
+        }
         if trimmed.starts_with("create table") {
+            let token = Self::parse_table_token(sql);
             let table = Self::parse_table(sql);
-            let maybe = sql.to_ascii_lowercase();
-            let has_meta = maybe.contains("metadata_json");
+            let data_type = Self::declared_metadata_type(sql);
             let mut st = self.state.lock().unwrap();
+            if let Some(schema) = Self::parse_schema(&token) {
+                st.schemas.insert(schema);
+            }
             st.tables.entry(table.clone()).or_default();
-            if has_meta {
-                st.metadata_columns.insert(table, true);
-            } else {
-                st.metadata_columns.entry(table).or_insert(false);
+            // Absence of `metadata_json` in the DDL means the column is absent. Record the
+            // declared type so the PostgreSQL `DATA_TYPE` probe can reject `jsonb`.
+            if let Some(data_type) = data_type {
+                st.metadata_columns.insert(table, data_type);
             }
             return Ok(0);
         }
@@ -458,14 +516,19 @@ impl SqlConnection for InMemoryConnection {
                     _ => None,
                 })
                 .nth(1);
-            let has = table
-                .as_deref()
-                .map(|t| self.state.lock().unwrap().metadata_columns.get(t).copied().unwrap_or(false))
-                .unwrap_or(false);
-            return Ok(if has {
-                vec![SqlRow::new([("DATA_TYPE", SqlValue::Text("longtext".into()))])]
-            } else {
-                Vec::new()
+            let data_type = table.and_then(|t| {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .metadata_columns
+                    .get(&t)
+                    .cloned()
+            });
+            return Ok(match data_type {
+                Some(data_type) => {
+                    vec![SqlRow::new([("DATA_TYPE", SqlValue::Text(data_type))])]
+                }
+                None => Vec::new(),
             });
         }
         // INFORMATION_SCHEMA table/schema existence probes.
@@ -482,9 +545,15 @@ impl SqlConnection for InMemoryConnection {
                 })
                 .collect();
             let st = self.state.lock().unwrap();
-            let exists = texts
-                .iter()
-                .any(|t| st.tables.contains_key(t) || st.metadata_columns.contains_key(t));
+            let exists = if lower.contains("schemata") {
+                // Schema probe. The scratch store has a single implicit default schema, so any
+                // registered table vouches for it (keeps the legacy single-schema tests valid).
+                texts.iter().any(|t| st.schemas.contains(t)) || !st.tables.is_empty()
+            } else {
+                texts
+                    .iter()
+                    .any(|t| st.tables.contains_key(t) || st.metadata_columns.contains_key(t))
+            };
             return Ok(if exists {
                 vec![SqlRow::new([("TABLE_NAME", SqlValue::Text("1".into()))])]
             } else {

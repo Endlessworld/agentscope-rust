@@ -133,10 +133,21 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
             writeable: std::sync::atomic::AtomicBool::new(cfg_writeable),
         };
         if repo.cfg.create_if_not_exist {
+            repo.create_database_if_not_exist()?;
             repo.create_tables_if_not_exist()?;
+        } else {
+            // Java: `verifyDatabaseExists()` + `verifyTablesExist()` -> IllegalStateException.
+            repo.verify_database_exists()?;
+            repo.verify_tables_exist()?;
         }
         repo.metadata_json_supported = repo.detect_metadata_json_column_support();
         Ok(repo)
+    }
+
+    /// The fully-qualified table name (`<database>.<table>`), mirroring `getFullTableName`.
+    /// Identifiers are validated in the constructor, so plain concatenation is safe here.
+    fn full_table_name(&self, table: &str) -> String {
+        format!("{}.{}", self.cfg.database_name, table)
     }
 
     /// The skills table name.
@@ -159,6 +170,55 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         self.metadata_json_supported
     }
 
+    /// Creates the database if it does not exist (`createDatabaseIfNotExist`), utf8mb4.
+    fn create_database_if_not_exist(&self) -> Result<(), SkillRepositoryError> {
+        let sql = format!(
+            "CREATE DATABASE IF NOT EXISTS {} DEFAULT CHARACTER SET utf8mb4 COLLATE \
+             utf8mb4_unicode_ci",
+            self.cfg.database_name
+        );
+        let mut conn = self.db.connection()?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    /// Verifies the database exists (`verifyDatabaseExists`), utf8mb4.
+    fn verify_database_exists(&self) -> Result<(), SkillRepositoryError> {
+        let sql = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?";
+        let mut conn = self.db.connection()?;
+        let rows = conn.query(sql, &[SqlParam::Text(self.cfg.database_name.clone())])?;
+        if rows.is_empty() {
+            return Err(SkillRepositoryError::Database(format!(
+                "database does not exist: {} (use createIfNotExist=true to auto-create)",
+                self.cfg.database_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Verifies both tables exist (`verifyTablesExist`).
+    fn verify_tables_exist(&self) -> Result<(), SkillRepositoryError> {
+        self.verify_table_exists(&self.cfg.skills_table_name)?;
+        self.verify_table_exists(&self.cfg.resources_table_name)
+    }
+
+    fn verify_table_exists(&self, table: &str) -> Result<(), SkillRepositoryError> {
+        let sql =
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+        let params = [
+            SqlParam::Text(self.cfg.database_name.clone()),
+            SqlParam::Text(table.to_string()),
+        ];
+        let mut conn = self.db.connection()?;
+        if conn.query(sql, &params)?.is_empty() {
+            return Err(SkillRepositoryError::Database(format!(
+                "table does not exist: {}.{} (use createIfNotExist=true to auto-create)",
+                self.cfg.database_name, table
+            )));
+        }
+        Ok(())
+    }
+
     /// Creates the tables if they do not exist (`createTablesIfNotExist`).
     fn create_tables_if_not_exist(&self) -> Result<(), SkillRepositoryError> {
         let skills_sql = format!(
@@ -171,8 +231,8 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
              metadata_json LONGTEXT NULL,\n\
              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n\
              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n\
-             )",
-            self.cfg.skills_table_name
+             ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            self.full_table_name(&self.cfg.skills_table_name)
         );
         let resources_sql = format!(
             "CREATE TABLE IF NOT EXISTS {} (\n\
@@ -183,8 +243,9 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n\
              PRIMARY KEY (id, resource_path),\n\
              FOREIGN KEY (id) REFERENCES {}(id) ON DELETE CASCADE\n\
-             )",
-            self.cfg.resources_table_name, self.cfg.skills_table_name
+             ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            self.full_table_name(&self.cfg.resources_table_name),
+            self.full_table_name(&self.cfg.skills_table_name)
         );
         let mut conn = self.db.connection()?;
         conn.execute(&skills_sql, &[])?;
@@ -212,7 +273,7 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
     fn resource_rows(&self, conn: &mut D::Connection, skill_id: i64) -> Result<SkillResources, SkillRepositoryError> {
         let sql = format!(
             "SELECT resource_path, resource_content FROM {} WHERE id = ?",
-            self.cfg.resources_table_name
+            self.full_table_name(&self.cfg.resources_table_name)
         );
         let rows = conn.query(&sql, &[SqlParam::Int(skill_id)])?;
         let mut resources = SkillResources::new();
@@ -232,14 +293,23 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         conn: &mut D::Connection,
         skill_name: &str,
     ) -> Result<usize, SkillRepositoryError> {
-        let find_sql = format!("SELECT id FROM {} WHERE name = ?", self.cfg.skills_table_name);
+        let find_sql = format!(
+            "SELECT id FROM {} WHERE name = ?",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let rows = conn.query(&find_sql, &[SqlParam::Text(skill_name.to_string())])?;
         let Some(id) = rows.first().and_then(|r| r.get_int("id")) else {
             return Ok(0);
         };
-        let del_res = format!("DELETE FROM {} WHERE id = ?", self.cfg.resources_table_name);
+        let del_res = format!(
+            "DELETE FROM {} WHERE id = ?",
+            self.full_table_name(&self.cfg.resources_table_name)
+        );
         conn.execute(&del_res, &[SqlParam::Int(id)])?;
-        let del_skill = format!("DELETE FROM {} WHERE name = ?", self.cfg.skills_table_name);
+        let del_skill = format!(
+            "DELETE FROM {} WHERE name = ?",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         conn.execute(&del_skill, &[SqlParam::Text(skill_name.to_string())])
     }
 
@@ -248,7 +318,10 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         conn: &mut D::Connection,
         skill_name: &str,
     ) -> Result<bool, SkillRepositoryError> {
-        let sql = format!("SELECT name FROM {} WHERE name = ?", self.cfg.skills_table_name);
+        let sql = format!(
+            "SELECT name FROM {} WHERE name = ?",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let rows = conn.query(&sql, &[SqlParam::Text(skill_name.to_string())])?;
         Ok(!rows.is_empty())
     }
@@ -264,7 +337,7 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
             let sql = format!(
                 "INSERT INTO {} (name, description, skill_content, source, metadata_json) \
                  VALUES (?, ?, ?, ?, ?)",
-                self.cfg.skills_table_name
+                self.full_table_name(&self.cfg.skills_table_name)
             );
             let params = [
                 SqlParam::Text(skill.name().to_string()),
@@ -283,7 +356,7 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
             }
             let sql = format!(
                 "INSERT INTO {} (name, description, skill_content, source) VALUES (?, ?, ?, ?)",
-                self.cfg.skills_table_name
+                self.full_table_name(&self.cfg.skills_table_name)
             );
             let params = [
                 SqlParam::Text(skill.name().to_string()),
@@ -316,7 +389,7 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
     ) -> Result<(), SkillRepositoryError> {
         let sql = format!(
             "INSERT INTO {} (id, resource_path, resource_content) VALUES (?, ?, ?)",
-            self.cfg.resources_table_name
+            self.full_table_name(&self.cfg.resources_table_name)
         );
         for (path, content) in resources {
             let params = [
@@ -335,7 +408,10 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
             tracing::warn!("cannot clear skills: repository is read-only");
             return Ok(0);
         }
-        let sql = format!("DELETE FROM {}", self.cfg.skills_table_name);
+        let sql = format!(
+            "DELETE FROM {}",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let mut conn = self.db.connection()?;
         conn.execute(&sql, &[])
     }
@@ -350,7 +426,10 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
         } else {
             "id, name, description, skill_content, source"
         };
-        let sql = format!("SELECT {cols} FROM {} WHERE name = ?", self.cfg.skills_table_name);
+        let sql = format!(
+            "SELECT {cols} FROM {} WHERE name = ?",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let rows = conn.query(&sql, &[SqlParam::Text(name.to_string())])?;
         let row = rows
             .into_iter()
@@ -380,7 +459,10 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
     }
 
     fn get_all_skill_names(&self) -> Result<Vec<String>, SkillRepositoryError> {
-        let sql = format!("SELECT name FROM {} ORDER BY name", self.cfg.skills_table_name);
+        let sql = format!(
+            "SELECT name FROM {} ORDER BY name",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let mut conn = self.db.connection()?;
         let rows = conn.query(&sql, &[])?;
         Ok(rows
@@ -395,10 +477,13 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
         } else {
             "id, name, description, skill_content, source"
         };
-        let skills_sql = format!("SELECT {cols} FROM {} ORDER BY name", self.cfg.skills_table_name);
+        let skills_sql = format!(
+            "SELECT {cols} FROM {} ORDER BY name",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let resources_sql = format!(
             "SELECT id, resource_path, resource_content FROM {}",
-            self.cfg.resources_table_name
+            self.full_table_name(&self.cfg.resources_table_name)
         );
         let mut conn = self.db.connection()?;
         let skill_rows = conn.query(&skills_sql, &[])?;
@@ -523,7 +608,11 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
     }
 
     fn get_source(&self) -> String {
-        "mysql".to_string()
+        // Java: `"mysql_" + databaseName + "_" + skillsTableName`.
+        format!(
+            "mysql_{}_{}",
+            self.cfg.database_name, self.cfg.skills_table_name
+        )
     }
 
     fn is_writeable(&self) -> bool {
@@ -658,15 +747,78 @@ mod tests {
         assert!(r.get_all_skills().unwrap().is_empty());
     }
 
+    // Java: MysqlSkillRepository#getSource -> `mysql_<db>_<table>` (P1-10).
+    #[test]
+    fn get_source_includes_database_and_table() {
+        assert_eq!(repo().get_source(), "mysql_agentscope_agentscope_skills");
+    }
+
+    // Java: createDatabaseIfNotExist + getFullTableName + utf8mb4 DDL (P1-05).
+    #[test]
+    fn creates_database_and_qualified_tables() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        assert!(db.schema_exists("agentscope"));
+        assert!(db.table_exists("agentscope_skills"));
+        assert!(db.table_exists("agentscope_skill_resources"));
+        assert_eq!(
+            db.metadata_column_type("agentscope_skills").as_deref(),
+            Some("longtext")
+        );
+        // Every statement goes through `<db>.<table>`, so a round trip proves the prefixing.
+        assert!(r.save(&[skill("a", "1")], false).unwrap());
+        assert_eq!(r.get_skill("a").unwrap().description(), "1");
+        assert_eq!(r.get_all_skill_names().unwrap(), vec!["a".to_string()]);
+        assert!(r.delete("a").unwrap());
+    }
+
+    // Java: createIfNotExist=false -> verifyDatabaseExists / verifyTablesExist (P1-06).
+    #[test]
+    fn create_if_not_exist_false_requires_the_database() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let err = match MysqlSkillRepository::with_config(
+            db,
+            MysqlSkillRepositoryConfig::new().create_if_not_exist(false),
+        ) {
+            Ok(_) => panic!("an empty database must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SkillRepositoryError::Database(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains("database does not exist"));
+    }
+
+    #[test]
+    fn create_if_not_exist_false_accepts_an_initialised_schema() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let _owner = MysqlSkillRepository::new(db.clone()).unwrap();
+        let second = MysqlSkillRepository::with_config(
+            db,
+            MysqlSkillRepositoryConfig::new().create_if_not_exist(false),
+        )
+        .expect("the schema created by the first repository must be detected");
+        assert!(second.metadata_json_column_supported());
+    }
+
     #[test]
     fn legacy_schema_without_metadata_column_still_works() {
         let db = Arc::new(InMemorySqlDatabase::new());
         // Pre-create the skills table WITHOUT metadata_json so support detection is false.
+        // Both tables are created because `createIfNotExist=false` now verifies them (Java
+        // `verifyTablesExist`).
         {
             let mut conn = db.connection().unwrap();
             conn.execute(
                 "CREATE TABLE agentscope_skills (id BIGINT, name VARCHAR(255), description TEXT, \
                  skill_content LONGTEXT, source VARCHAR(255))",
+                &[],
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE agentscope_skill_resources (id BIGINT, resource_path VARCHAR(500), \
+                 resource_content LONGTEXT)",
                 &[],
             )
             .unwrap();

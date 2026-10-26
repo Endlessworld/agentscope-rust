@@ -20,7 +20,7 @@
 | Rust crate | `crates/agentscope-extensions-skills` |
 | Rust 规模（静态实测） | 8 个 `.rs` / **3027 物理行 / 2753 非空行**（纯代码 2435；其中 `#[cfg(test)]` 456 行，实现 2571 行）/ **33 个 `#[test]`**（0 个 `#[tokio::test]`、0 doc-test，源码无 ``` 代码块） |
 | 迁移波次 | C |
-| 当前状态 | 进行中（编译与测试全绿，但静态复核发现 **P0×1 / P1×10 / P2×10** 语义缺口，见 §3.2） |
+| 当前状态 | 进行中（编译与测试全绿；**2026-10-26** 已收敛 P1-01~P1-08/P1-10，见 §8） |
 
 ## 2. Java 清单与依赖映射
 
@@ -75,11 +75,11 @@
 | crate 骨架 + 依赖 | — | 已完成 | 见 §3.2；`cargo build` 通过 |
 | `AgentSkillRepository` trait + `AgentSkillRepositoryInfo` | core `AgentSkillRepository` | 已完成 | `src/repository.rs`，复用 harness `AgentSkill` |
 | `SqlDatabase` 抽象 + 内存实现 | `DataSource` | 已完成 | `src/sql.rs`；真实驱动待办（§4.2） |
-| `GitSkillRepository` | `GitSkillRepository` | 已完成 | `src/git.rs`，`git` CLI；skills_root 校验已修复 |
+| `GitSkillRepository` | `GitSkillRepository` | 已完成 | `src/git.rs`，`git` CLI；skills_root 校验已修复；**2026-10-26** 已对齐 frontmatter name/description、`refs/heads/<branch>` 探测、远端不可达报错，见 §8.1 |
 | `MysqlSkillRepository` | `MysqlSkillRepository` | 已完成 | `src/mysql.rs`，两表 + metadata_json 兼容 |
 | `PostgresSkillRepository` | `PostgresSkillRepository` | 已完成 | `src/postgresql.rs`，schema + 两表 |
-| `RepoBackedSkillRepository`（harness 适配器） | — | 已完成 | `src/repository.rs`；**静态复核发现未覆写 `skill_dir`**（见 §3.2 P1-08） |
-| 测试 | 3 个 `*Test` | 已完成 | 33 passed / 0 failed（内存 SQL + file:// git）；**Rust 仅 5 个 git 测试，Java 有 23 个**（§3.2 P1-09） |
+| `RepoBackedSkillRepository`（harness 适配器） | — | 已完成 | `src/repository.rs`；已覆写 `skill_dir`（git 透出真实目录 / SQL 资源落盘缓存），见 §8.1 P1-08 |
+| 测试 | 3 个 `*Test` | 进行中 | 现 **54 个 `#[test]`**（git 16 / mysql 17 / pg 10 / repository 4 / sql 3 / util 4），其中 git 侧 11 个为 `file://` 真实仓用例；Java 192（见 §8.2） |
 
 ### 3.2 静态复核发现的语义缺口（2026-10-22，未编译、仅静态核对）
 > 状态取值沿用 §0：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -88,35 +88,35 @@
 | # | 缺口项 | 子模块 | 优先级 | Java 行为 | Rust 现状 | 执行状态 |
 |---|---|---|---|---|---|---|
 | P0-01 | `JdbcAgentSkillRepository`（官方替代实现）缺失 | mysql / postgresql | P0 | `agentscope-extensions-jdbc` 的 `JdbcAgentSkillRepository`（1184 物理行）+ `SkillDialect` / `SkillResourcesDialect`，带 `namespace` 列隔离 | `agentscope-extensions-jdbc` **无 skill 模块**（`rg -i skill` = 0 命中）；本 crate 只对齐**已 `@Deprecated`** 的旧实现 | 待办（需汇总方裁定归属：本 crate 内补 vs jdbc crate 内补） |
-| P1-01 | git 技能名来源不一致 | git | P1 | `SkillFileSystemHelper.getAllSkillNames` → `readSkillName` 解析 **SKILL.md frontmatter 的 `name`** | `git.rs` 委托 harness `load_skills_from_dir`，取**目录名**；目录名 ≠ frontmatter name 时 `get_skill(name)` 找不到 | 待办 |
-| P1-02 | git 技能 description 不一致 | git | P1 | `SkillUtil.createFrom` → `MarkdownSkillParser.parse` 取 frontmatter 的 `description` | harness `skill_description()` 取 SKILL.md **首个非空行**并剥 `#`；对 frontmatter 文件会返回 `---` | 待办（根因在 harness `load_skills_from_dir`，需与 harness 层协同） |
-| P1-03 | git 分支远端探测未按分支过滤 | git | P1 | `resolveRemoteHead` 用 `lsRemote.setHeads(true)` + `matchesBranch`（`refs/heads/<branch>`） | `remote_head()` 固定 `git ls-remote <url> HEAD`（远端默认分支），未按配置的 `branch` 过滤 | 待办 |
-| P1-04 | git 远端不可达时的降级行为不一致 | git | P1 | `resolveRemoteHead` 异常 → 返回 null → `hasRemoteUpdates` 返回 **true** → 执行 pull 并抛错 | `remote_head()` 返回 `None` → `has_remote_updates` 返回 **false** → **静默跳过 pull**、继续用旧数据 | 待办 |
-| P1-05 | MySQL 未建库 / 表名未带库前缀 | mysql | P1 | `createDatabaseIfNotExist`（`CREATE DATABASE IF NOT EXISTS ... utf8mb4`）+ `getFullTableName` = `<db>.<table>` | 只建表；所有 SQL 用裸表名（`<table>`） | 待办 |
-| P1-06 | MySQL `createIfNotExist=false` 不校验存在性 | mysql | P1 | `verifyDatabaseExists` + `verifyTablesExist`，缺表抛 `IllegalStateException` | **完全跳过校验**，后续查询静默返回空集 | 待办 |
-| P1-07 | PostgreSQL `metadata_json` 类型探测缺失 | postgresql | P1 | `isSupportedMetadataJsonColumnType`：`{text, character varying, character}`，`jsonb` → **false**（走 legacy 路径） | 只判列是否存在，不看 `DATA_TYPE`；`jsonb` 会被当作支持 → 写 `metadata_json` 报错 | 待办 |
-| P1-08 | 适配器未透出 `skill_dir` | 全部 | P1 | Java `AgentSkill` 带 `originDir`，`load_skill_through_path` 可定位磁盘目录 | `RepoBackedSkillRepository` 未覆写 `skill_dir` → harness `skill_middleware::load_index` 收不到目录 → **加载工具对 git/SQL 技能不可用** | 待办 |
-| P1-09 | 测试覆盖远低于 Java | 全部 | P1 | 192 个 `@Test`（git 23 / mysql 61 / pg 108） | 33 个 `#[test]`（git **5** / mysql 12 / pg 7 / sql 3 / util 4 / repository 2）；**git 侧无 file:// 真实克隆/拉取/分支用例** | 待办 |
-| P1-10 | `get_source()` 命名不含库/表/模式 | mysql / postgresql | P1 | mysql → `mysql_<db>_<table>`；pg → `postgresql_<schema>_<table>` | 固定返回 `"mysql"` / `"postgresql"`（多实例时 `source` 冲突，`RepoBackedSkillRepository` 的 `repo_id` 也随之冲突） | 待办 |
+| P1-01 | git 技能名来源不一致 | git | P1 | `SkillFileSystemHelper.getAllSkillNames` → `readSkillName` 解析 **SKILL.md frontmatter 的 `name`** | `git.rs` 委托 harness `load_skills_from_dir`，取**目录名**；目录名 ≠ frontmatter name 时 `get_skill(name)` 找不到 | 已完成（§8.1） |
+| P1-02 | git 技能 description 不一致 | git | P1 | `SkillUtil.createFrom` → `MarkdownSkillParser.parse` 取 frontmatter 的 `description` | harness `skill_description()` 取 SKILL.md **首个非空行**并剥 `#`；对 frontmatter 文件会返回 `---` | 已完成（§8.1；在 git 适配层重写身份，未改 harness） |
+| P1-03 | git 分支远端探测未按分支过滤 | git | P1 | `resolveRemoteHead` 用 `lsRemote.setHeads(true)` + `matchesBranch`（`refs/heads/<branch>`） | `remote_head()` 固定 `git ls-remote <url> HEAD`（远端默认分支），未按配置的 `branch` 过滤 | 已完成（§8.1） |
+| P1-04 | git 远端不可达时的降级行为不一致 | git | P1 | `resolveRemoteHead` 异常 → 返回 null → `hasRemoteUpdates` 返回 **true** → 执行 pull 并抛错 | `remote_head()` 返回 `None` → `has_remote_updates` 返回 **false** → **静默跳过 pull**、继续用旧数据 | 已完成（§8.1：改为报错） |
+| P1-05 | MySQL 未建库 / 表名未带库前缀 | mysql | P1 | `createDatabaseIfNotExist`（`CREATE DATABASE IF NOT EXISTS ... utf8mb4`）+ `getFullTableName` = `<db>.<table>` | 只建表；所有 SQL 用裸表名（`<table>`） | 已完成（§8.1，顺带 P2-05 utf8mb4） |
+| P1-06 | MySQL `createIfNotExist=false` 不校验存在性 | mysql | P1 | `verifyDatabaseExists` + `verifyTablesExist`，缺表抛 `IllegalStateException` | **完全跳过校验**，后续查询静默返回空集 | 已完成（§8.1） |
+| P1-07 | PostgreSQL `metadata_json` 类型探测缺失 | postgresql | P1 | `isSupportedMetadataJsonColumnType`：`{text, character varying, character}`，`jsonb` → **false**（走 legacy 路径） | 只判列是否存在，不看 `DATA_TYPE`；`jsonb` 会被当作支持 → 写 `metadata_json` 报错 | 已完成（§8.1） |
+| P1-08 | 适配器未透出 `skill_dir` | 全部 | P1 | Java `AgentSkill` 带 `originDir`，`load_skill_through_path` 可定位磁盘目录 | `RepoBackedSkillRepository` 未覆写 `skill_dir` → harness `skill_middleware::load_index` 收不到目录 → **加载工具对 git/SQL 技能不可用** | 已完成（§8.1：trait + 适配器透出/落盘） |
+| P1-09 | 测试覆盖远低于 Java | 全部 | P1 | 192 个 `@Test`（git 23 / mysql 61 / pg 108） | 33 个 `#[test]`（git **5** / mysql 12 / pg 7 / sql 3 / util 4 / repository 2）；**git 侧无 file:// 真实克隆/拉取/分支用例** | 进行中（§8.2：+20 用例） |
+| P1-10 | `get_source()` 命名不含库/表/模式 | mysql / postgresql | P1 | mysql → `mysql_<db>_<table>`；pg → `postgresql_<schema>_<table>` | 固定返回 `"mysql"` / `"postgresql"`（多实例时 `source` 冲突，`RepoBackedSkillRepository` 的 `repo_id` 也随之冲突） | 已完成（§8.1） |
 | P2-01 | 缺 `set_writeable` | 全部 | P2 | Java 接口有 `setWriteable(boolean)`，三个实现均可运行时切换 | Rust trait 无该方法，`writeable` 构造后不可变 | 设计决定（不迁移）— Rust 用配置表达，**需汇总方确认** |
 | P2-02 | 空/空白库名·表名不回退默认值 | mysql / postgresql | P2 | null/空 → 回退默认名；并 `trim()` | `validate_identifier("")` 直接报错；含空格也报错（Java `trim()` 后可用） | 待办 |
 | P2-03 | `delete()` 无事务 | mysql / postgresql | P2 | Java `delete` 开事务（`setAutoCommit(false)` → commit/rollback） | Rust `delete_skill_internal` 连发 2 条 DELETE（resources + skill）且**不开事务** → 中途失败留孤儿资源 | 待办 |
 | P2-04 | PostgreSQL 资源插入无 1000 行分批 | postgresql | P2 | `RESOURCE_BATCH_SIZE = 1000` 分块 `executeBatch`（避开绑定参数上限） | 逐条 `execute`，无分批 | 待办（真实驱动落地后处理） |
-| P2-05 | MySQL DDL 缺 utf8mb4 字符集 | mysql | P2 | `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（两张表均带） | Rust 建表 DDL 未带字符集/排序规则 | 待办 |
+| P2-05 | MySQL DDL 缺 utf8mb4 字符集 | mysql | P2 | `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（两张表均带） | Rust 建表 DDL 未带字符集/排序规则 | 已完成（§8.3） |
 | P2-06 | git `save()` 返回值不一致 | git | P2 | Java 只读仓 `save()` **返回 false** | Rust 返回 `Err(SkillRepositoryError::ReadOnly)` | 待办（`delete()` 已是 `Ok(false)`，与之不一致） |
-| P2-07 | git remote URL 未 trim | git | P2 | 构造时 `remoteUrl.trim()` 后保存 | 只用 `trim().is_empty()` 判空，**原样保存**未 trim 的 URL | 待办 |
+| P2-07 | git remote URL 未 trim | git | P2 | 构造时 `remoteUrl.trim()` 后保存 | 只用 `trim().is_empty()` 判空，**原样保存**未 trim 的 URL | 已完成（§8.3） |
 | P2-08 | `skill_exists("")` 行为不一致 | mysql / postgresql | P2 | Java `skillExists(null/空)` **返回 false**，不抛异常 | Rust `validate_skill_name` → `Err(InvalidArgument)` | 待办 |
 | P2-09 | `close()` 失败语义不一致 | git | P2 | Java `close()` 删目录失败只 `warn`，不抛 | Rust `close()` 返回 `Err(Io)` | 设计决定（不迁移）— Rust 用 Result 表达，**需汇总方确认** |
 | P2-10 | 未使用的依赖与死代码 | 全部 | P2 | — | `Cargo.toml` 的 `agentscope-core` / `async-trait` / `futures` / `chrono` / `base64` / `serde`（derive）**均未在 src 中使用**；`InMemorySqlDatabase::has_metadata_column` 为 dead code（既有 warning） | 待办（清理依赖需汇总方登记 §4.2） |
 
 **分层结论（与 harness `skill/` 存量代码核对，无重复实现）**：
 - harness `agent/skill/repository.rs` 提供**目录式** `SkillRepository`（`load()` → `Vec<AgentSkill>`）+ `FileSystemSkillRepository` / `WorkspaceSkillRepository`；本 crate 提供**后端 keyed CRUD** `AgentSkillRepository` + `RepoBackedSkillRepository` 适配器。两者是**不同抽象层次**，模型统一复用 harness `AgentSkill` / `Metadata` / `SkillResources`，**未发现重复的 skill 模型或重复的目录扫描实现**（git 侧直接调用 harness 的 `load_skills_from_dir`）。
-- 唯一需补的衔接点：`RepoBackedSkillRepository` 应覆写 `skill_dir`（P1-08），否则 harness 的 `load_skill_through_path` 对非文件系统仓库无效。
+- 唯一需补的衔接点：`RepoBackedSkillRepository` 应覆写 `skill_dir`（P1-08），否则 harness 的 `load_skill_through_path` 对非文件系统仓库无效。**2026-10-26 已完成**：trait 新增 `skill_dir`，git 透出真实目录，SQL 后端由适配器落盘缓存（§8.1）。
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 
-**状态：进行中（编译与测试全绿，但存在未收敛的语义缺口）。** 波次 C，crate `crates/agentscope-extensions-skills` 实现 3 个后端仓库 + harness 适配器。**静态复核（2026-10-22，未编译）新增 P0×1 / P1×10 / P2×10，见 §3.2**；下面「测试修复完成」记录**仅描述 2026-09-18 的那一次修复**，不代表当前语义已与 Java 对齐。
+**状态：进行中。** 波次 C，crate `crates/agentscope-extensions-skills` 实现 3 个后端仓库 + harness 适配器。**2026-10-26 已收敛 P1-01~P1-08 / P1-10 与 P2-05 / P2-07（见 §8）；P1-09 部分收敛（+20 离线用例）**；§3.2 剩余项为 P0-01（归 jdbc crate，已完成）、部分 P2 与已裁定不迁移项。
 
 **测试修复完成（2026-09-18）**：`cargo build -p agentscope-extensions-skills` 通过；`cargo test -p agentscope-extensions-skills` → **33 passed / 0 failed**（含 doc-tests）。
 
@@ -137,7 +137,7 @@ cargo test  -p agentscope-extensions-skills   # 33 passed; 0 failed
 
 ### 4.2 下一步与阻塞
 1. 真实 MySQL / PostgreSQL 驱动接入（`SqlDatabase` 的真实实现）仍为待办。**静态复核更新**：workspace 根 `Cargo.toml` **已**在 `[workspace.dependencies]` 登记 `sqlx = "0.9"` / `mysql_async = "0.37"` / `tokio-postgres = "0.7"`（注释即写明「存储/技能模块 P1」），但本 crate 的 `Cargo.toml` **仍未引用**；另 `agentscope-extensions-postgresql` 已有 `postgres-driver` feature + `PgSimpleClient`（`tokio-postgres`），可作为 `SqlDatabase` 真实实现的首选落点（避免重复引入驱动）。
-2. Git 仓库读写/同步路径需系统 `git` CLI，未纳入离线单测（与 Java 依赖系统 Git 凭据一致）。**静态复核补充**：Java 侧用 `file://` 本地仓 + JGit 即可离线测 23 个用例，Rust 侧同样可用 `git` CLI 建本地仓（`git init` + `file://` URL）离线覆盖克隆/拉取/分支，**不构成不可测的理由**（§3.2 P1-09）。
+2. Git 仓库读写/同步路径需系统 `git` CLI。**静态复核补充**：Java 侧用 `file://` 本地仓 + JGit 即可离线测 23 个用例，Rust 侧同样可用 `git` CLI 建本地仓（`git init` + `file://` URL）离线覆盖克隆/拉取/分支。**2026-10-26 已落地**：git 侧新增 11 个 `file://` 真实仓用例（无网络、无 mock 库；需要本机有 `git` 二进制）。
 3. 本 crate 仍有 1 个既有 `dead_code` warning（`InMemorySqlDatabase::has_metadata_column` 未使用）与 core/harness 既有 warning，非本次修复引入，未改动核心/harness。**静态复核补充**：`Cargo.toml` 中 `agentscope-core` / `async-trait` / `futures` / `chrono` / `base64` / `serde` 六个依赖在 `src/` 中**零引用**（§3.2 P2-10），建议一并清理（清理依赖属本 crate 范围，但需汇总方确认 workspace 依赖登记表口径）。
 4. **§3.2 缺口清单为权威待办来源**；其中 P0-01（`JdbcAgentSkillRepository`）与 P2-01 / P2-09 需汇总方裁定后再动代码。
 
@@ -241,7 +241,56 @@ cargo test  -p agentscope-extensions-skills   # 33 passed; 0 failed
 
 Java `AgentSkillRepository extends AutoCloseable`，`close()` 是 `default { }`（no-op）。Rust 侧 `fn close(&self) -> Result<(), _>` + 默认 `Ok(())` 语义等价，**保持现状不改 void**——为形式统一而牺牲错误可表达性没有收益。
 
-### 7.3 仍待办（本模块其它 P1）
+## 8. P1 收敛记录（2026-10-26）
 
-- **P0-01** `JdbcAgentSkillRepository` 归属已裁定在 **jdbc** crate 实现（§4.5 裁定 2），本 crate 待办仅是给两个 SQL 后端标注「已废弃，仅兼容，勿扩展」。
-- **P1-01~P1-10**（git 技能名/description/`ls-remote` 分支过滤/静默跳过 pull、MySQL `CREATE DATABASE`/存在性校验、PG `DATA_TYPE` 校验、`skill_dir` 透出、测试 34 vs Java 192 `@Test`、`get_source` 含库表）均未动。
+> 本轮只改 `crates/agentscope-extensions-skills/**`（含 `src/repository.rs`、`src/git.rs`、`src/sql.rs`、`src/mysql.rs`、`src/postgresql.rs`）；**未改**根 `Cargo.toml`、`agentscope-core`、`agentscope-harness`、`agentscope-extensions-jdbc` 与任何其它 crate。
+> **未执行 cargo**（按任务约定由主智能体统一编译/跑测）；下述「测试」为新增用例名，待主智能体验证后回填实测结果。
+
+### 8.1 已修复（P1，git 语义对齐 + 适配器 `skill_dir`）
+
+| # | 修法 | 文件 | 改前如何失败 | 新增/相关测试 |
+|---|---|---|---|---|
+| P1-01 | 新增 `load_skills_with_frontmatter`：先走 harness `load_skills_from_dir` 拿资源，再用 `skill_identity()` 以 frontmatter `name` 重写技能名；缺失时回落目录名；含 `/` `\` `..` 的 frontmatter name 记 warn 后回落目录名 | `src/git.rs` | 目录名 `dir-name` + frontmatter `name: calc-skill` 时 `get_skill("calc-skill")` 返回 `NotFound` | `clones_local_repository_and_uses_frontmatter_identity`、`skill_identity_prefers_frontmatter_and_falls_back` |
+| P1-02 | 同一 `skill_identity()` 从 frontmatter `description` 取描述；缺失时回落正文首个非空行（在 `split_frontmatter` 之后扫描，故不再返回 `---`）；全空时回落 `Skill: <name>` | `src/git.rs` | frontmatter 文件的 description 为 `---` | `clones_local_repository_and_uses_frontmatter_identity`（断言 `A calculator`）、`frontmatter_scalars_reads_plain_quoted_and_block_values` |
+| P1-03 | `remote_head()` 改为 `git ls-remote <url> refs/heads/<branch>`（Java `setHeads(true)` + `matchesBranch`）；无 branch 时仍用远端 `HEAD`；返回值再按 refspec 二次校验 | `src/git.rs` | 配置 `develop` 但探到的是远端 `HEAD`（main）→ 永不触发 pull／误判无更新 | `remote_head_is_filtered_by_branch`（远端 HEAD 停留 main，断言探到 develop sha） |
+| P1-04 | `remote_head()` → `Result<Option<String>>`；`has_remote_updates()` → `Result<bool>`。远端不可达：`warn!` + 返回 `Err(Git)`，读操作失败而不再用陈旧数据（Java 为 `resolveRemoteHead`=null→`true`→pull 抛错，可观察结果一致） | `src/git.rs` | 远端删掉后 `get_all_skill_names()` 仍返回旧技能（静默跳过 pull） | `unreachable_remote_fails_instead_of_serving_stale_skills` |
+| P1-08 | `AgentSkillRepository` 新增 `fn skill_dir(&self, name) -> Option<PathBuf>`（默认 `None`，对应 Java `AgentSkill#getOriginDir`）；`GitSkillRepository` 按 frontmatter name 扫描 skills 目录返回绝对路径；`RepoBackedSkillRepository` 覆写 harness `SkillRepository::skill_dir`，后端无目录（SQL）时把 resources 落盘到临时缓存目录 | `src/repository.rs`、`src/git.rs` | `load_index()` 拿不到目录 → `load_skill_through_path` 对 git/SQL 技能不可用 | `adapter_forwards_backend_skill_dir`、`adapter_materialises_in_memory_skills` |
+| P1-05 | 新增 `create_database_if_not_exist()`（`CREATE DATABASE IF NOT EXISTS <db> DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`）；新增 `full_table_name()`，**所有** SQL（建表/查询/插入/删除/清空）改用 `<db>.<table>` | `src/mysql.rs` | 数据库不存在时建表失败；跨库连接下裸表名指错库 | `creates_database_and_qualified_tables` |
+| P1-06 | `create_if_not_exist=false` 时执行 `verify_database_exists()` + `verify_tables_exist()`，缺失返回 `SkillRepositoryError::Database`（Java `IllegalStateException`） | `src/mysql.rs` | 空库上构造函数照样成功，后续查询静默空集 | `create_if_not_exist_false_requires_the_database`、`create_if_not_exist_false_accepts_an_initialised_schema`；既有 `legacy_schema_without_metadata_column_still_works` 的 setup 补建 resources 表（Java 同样要求两表存在） |
+| P1-07 | `detect_metadata_json_column_support()` 读取 `DATA_TYPE` 并校验 ∈ `{text, character varying, character}`，否则 warn + 走 legacy 路径 | `src/postgresql.rs`、`src/sql.rs` | `jsonb` 列被当成支持 → 写 `metadata_json`（JSON 字符串）报错 | `text_metadata_column_is_supported`、`jsonb_metadata_column_falls_back_to_the_legacy_schema` |
+| P1-10 | `get_source()`：mysql → `mysql_<db>_<table>`；pg → `postgresql_<schema>_<table>`（Java 逐字一致） | `src/mysql.rs`、`src/postgresql.rs` | 多实例 source/repo_id 冲突 | `get_source_includes_database_and_table`、`get_source_includes_schema_and_table` |
+
+### 8.2 部分收敛（P1-09 测试覆盖）
+
+- 新增 **20 个** `#[test]`（git 11 / repository 2 / mysql 4 / pg 3），全 crate **34 → 54**，全部离线：git 侧用 `git init` + `file://` 本地仓（`git` 二进制可用时；无 mock 库）。
+- git 用例对照 Java 的 `testGetSkill_FromLocalRepo` / `testGetSkill_FromSkillsSubdirectory` / `testPull_FromLocalRepo` / `testClone_SpecificBranch` / `testGetSkill_FromCustomSkillsRoot` / `testManualSyncRequiredWhenAutoSyncDisabled` / `testSave_ReadOnly` 等。
+- 仍缺（保留待办）：swap/force 组合、并发克隆、各类 git 2.x 错误分支（认证失败/分支不存在/路径已存在且非仓）的 outcome 级用例；SQL 侧仍为内存替身，无真实驱动用例（取决于 §4.2 第 1 条）。**总数与 Java 192 个 `@Test` 仍有差距**。
+
+### 8.3 顺带修复（P2，仅低成本项）
+
+- **P2-05**：MySQL 两张表 DDL 追加 `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（Java 逐字一致）。
+- **P2-07**：`from_config` 存 `remote_url.trim()`（Java 构造时 trim），`remote_url_is_trimmed` 校验。
+- 其它 P2（P2-02 空名回退 / P2-03 `delete` 事务 / P2-04 1000 行分批 / P2-06 `save()` 返 `false` / P2-08 `skill_exists("")` / P2-10 依赖清理）**未动**：`Mysql/PostgresSkillRepository` 已 `@Deprecated`（裁定 2：不扩展），且 P2-06/P2-08 会改变已文档化的 Rust 语义（`Result` 表达错误），需汇总方确认。
+
+### 8.4 未做 / 保留待办
+
+- **P0-01** `JdbcAgentSkillRepository` 归属 jdbc crate（已完成，`crates/agentscope-extensions-jdbc/src/skill/repository.rs`），本 crate 不再补。
+- **P2-01 / P2-09** 已裁定（§7.1 / §7.2）。
+- 本 crate **未**给 MySQL/PG 加 PG `verifySchemaExists`/`verifyTablesExist`（Java 有，但不在 §3.2 P1 清单内，且属已弃用实现的功能扩展）——如需对齐，登记为新 P2。
+- 依赖清理（P2-10）未做；本轮用到 `base64`，其余零引用依赖（`agentscope-core`/`async-trait`/`futures`/`chrono`/`serde` derive）仍在，待汇总方确认后删。
+
+### 8.5 改动文件清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/git.rs` | frontmatter 身份（`skill_identity`/`frontmatter_scalars`/`split_frontmatter`）、`remote_head` 分支过滤 + `Result`、`has_remote_updates` 可观察失败、`skill_dir`/`resolve_skill_dir`、URL trim、11 个新测试 |
+| `src/repository.rs` | trait 新增 `skill_dir`（默认 `None`）、适配器覆写 `skill_dir` + SQL 技能落盘缓存（`cache_root`/`materialized`/`write_resources_to_dir`）、2 个新测试 |
+| `src/sql.rs` | 内存替身支持 `CREATE DATABASE`/`CREATE SCHEMA` 注册、`<schema>.<table>` 前缀、`metadata_json` 列**类型**记录与回放、`schemata` 探测；新增 `schema_exists`/`metadata_column_type`/`has_metadata_column`（后两者转 pub 消除 dead_code） |
+| `src/mysql.rs` | `CREATE DATABASE` + `<db>.<table>` + utf8mb4 DDL + 存在性校验 + `get_source`；4 个新测试 |
+| `src/postgresql.rs` | `DATA_TYPE` 校验 + `get_source`；3 个新测试 |
+
+### 8.6 原 §7.3「仍待办」终态（2026-10-26）
+
+- **P0-01** `JdbcAgentSkillRepository` 归属已裁定在 **jdbc** crate 实现（§4.5 裁定 2）；现已落地于 `crates/agentscope-extensions-jdbc/src/skill/repository.rs`（`impl AgentSkillRepository for JdbcAgentSkillRepository`，直接复用本 crate 的 trait）。本 crate 只需给两个 SQL 后端标注「已废弃，仅兼容，勿扩展」（已有 doc 注释）。
+- **P1-01~P1-08 / P1-10**：已于 2026-10-26 收敛，见 §8.1（逐项修法 + 测试名）。
+- **P1-09**：部分收敛（git 侧补 11 个 `file://` 真实仓用例，含克隆/拉取/分支/自定义 skillsRoot/远端不可达），仍低于 Java 192，见 §8.2。

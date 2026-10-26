@@ -8,9 +8,17 @@
 //! documented authentication model (`~/.gitconfig` / credential helpers for HTTPS, `~/.ssh`
 //! for SSH) and avoids pulling the `git2` C dependency (not present in `Cargo.lock`).
 //!
-//! Each read triggers a lightweight remote-ref check and only pulls when the remote HEAD
-//! changed, exactly like the Java `ensureRepositorySynced` / `hasRemoteUpdates` pair.
+//! Each read triggers a lightweight remote-ref check (filtered to `refs/heads/<branch>`, like
+//! Java's `setHeads(true)` + `matchesBranch`) and only pulls when the remote ref changed, exactly
+//! like the Java `ensureRepositorySynced` / `hasRemoteUpdates` pair. An unreachable remote is a
+//! hard error rather than a silent no-update (Java assumes updates and then fails inside the
+//! pull; we surface the same observable failure one step earlier).
+//!
+//! Skill identity follows `SkillFileSystemHelper`: the skill **name** and **description** come
+//! from the `SKILL.md` YAML frontmatter (`name` / `description`), falling back to the directory
+//! name / first body line only when the frontmatter omits them.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -111,6 +119,9 @@ impl GitSkillRepository {
                 "cannot be null or empty",
             ));
         }
+        // Java stores `remoteUrl.trim()`; keep an untrimmed value out of every shell call below.
+        let mut cfg = cfg;
+        cfg.remote_url = cfg.remote_url.trim().to_string();
         let (local_path, owns_temp_dir) = match &cfg.local_path {
             Some(p) => (p.clone(), false),
             None => (create_temp_dir()?, true),
@@ -231,26 +242,71 @@ impl GitSkillRepository {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Resolves the remote HEAD ref via `git ls-remote`. Returns `None` when the remote is
-    /// unreachable, so a transient network failure degrades to "no update".
-    fn remote_head(&self) -> Option<String> {
-        let output = Self::run_git(None, &["ls-remote", &self.cfg.remote_url, "HEAD"]).ok()?;
+    /// Resolves the remote ref used for the update check, mirroring Java `resolveRemoteHead`.
+    ///
+    /// Java uses `lsRemote.setHeads(true)` plus `matchesBranch` (`refs/heads/<branch>`); with the
+    /// system `git` binary the same filter is expressed by passing the refspec to `ls-remote`.
+    /// When no branch is configured the remote `HEAD` (the ref that was cloned) is used.
+    ///
+    /// * `Ok(Some(sha))` - resolved;
+    /// * `Ok(None)` - the remote is reachable but has no matching head;
+    /// * `Err(..)` - `git` could not run, or the remote is unreachable.
+    fn remote_head(&self) -> Result<Option<String>, SkillRepositoryError> {
+        let branch = self
+            .cfg
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty());
+        let spec = branch.map(|b| format!("refs/heads/{b}"));
+        let mut args: Vec<&str> = vec!["ls-remote", self.cfg.remote_url.as_str()];
+        args.push(spec.as_deref().unwrap_or("HEAD"));
+        let output = Self::run_git(None, &args)?;
         if !output.status.success() {
-            return None;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SkillRepositoryError::Git(format!(
+                "ls-remote failed for {}: {}",
+                self.cfg.remote_url,
+                stderr.trim()
+            )));
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        text.split_whitespace().next().map(|s| s.to_string())
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let sha = parts.next()?.to_string();
+            match (parts.next(), spec.as_deref()) {
+                // Guard against a server that ignores the refspec filter.
+                (Some(reference), Some(expected)) if reference != expected => None,
+                (None, Some(_)) => None,
+                _ => Some(sha),
+            }
+        }))
     }
 
-    /// Whether the remote HEAD differs from the last synced ref.
-    fn has_remote_updates(&self) -> bool {
-        let last = self.state.lock().unwrap().last_remote_ref.clone();
-        match (self.remote_head(), last) {
-            (Some(remote), Some(last)) => remote != last,
-            (Some(_), None) => true,
-            // Unknown remote state -> do not pull (matches the conservative Java path).
-            (None, _) => false,
+    /// Whether the remote ref differs from the last synced ref.
+    ///
+    /// Mirrors Java `hasRemoteUpdates`: an unresolvable remote head means "assume there are
+    /// updates" (`resolveRemoteHead` returns null -> true -> pull -> error). Here the unreachable
+    /// case is reported directly, so reads fail instead of silently serving stale data; the
+    /// observable outcome is the same as Java's "pull then blow up", minus the pointless pull.
+    fn has_remote_updates(&self) -> Result<bool, SkillRepositoryError> {
+        let remote = match self.remote_head() {
+            Ok(Some(remote)) => remote,
+            Ok(None) => return Ok(true),
+            Err(e) => {
+                tracing::warn!(
+                    url = %self.cfg.remote_url,
+                    error = %e,
+                    "cannot resolve the remote git ref; refusing to read possibly stale skills"
+                );
+                return Err(e);
+            }
+        };
+        let mut state = self.state.lock().unwrap();
+        if state.last_remote_ref.is_none() {
+            state.last_remote_ref = Self::rev_parse(&self.local_path, "HEAD").ok();
         }
+        Ok(state.last_remote_ref.as_deref() != Some(remote.as_str()))
     }
 
     /// Pulls the latest changes into an existing clone.
@@ -264,7 +320,7 @@ impl GitSkillRepository {
                 stderr.trim()
             )));
         }
-        self.state.lock().unwrap().last_remote_ref = self.remote_head();
+        self.state.lock().unwrap().last_remote_ref = Self::rev_parse(&self.local_path, "HEAD").ok();
         Ok(())
     }
 
@@ -278,7 +334,7 @@ impl GitSkillRepository {
             }
             self.clone_repository()?;
         } else if self.local_path.join(".git").exists() {
-            if self.has_remote_updates() {
+            if self.has_remote_updates()? {
                 self.pull_repository()?;
             } else {
                 tracing::debug!("remote git repository has no updates, skipping pull");
@@ -334,7 +390,8 @@ impl GitSkillRepository {
         self.ensure_repository_synced()
     }
 
-    /// Loads all skills from the resolved skills directory.
+    /// Loads all skills from the resolved skills directory, applying the Java frontmatter
+    /// identity (`SkillFileSystemHelper`: name/description from the `SKILL.md` frontmatter).
     fn load_all(&self) -> Result<Vec<AgentSkill>, SkillRepositoryError> {
         self.ensure_auto_synced()?;
         let path = self
@@ -344,7 +401,35 @@ impl GitSkillRepository {
             .skills_path
             .clone()
             .ok_or_else(|| SkillRepositoryError::Git("skills path not initialized".into()))?;
-        Ok(load_skills_from_dir(&path, &self.get_source()))
+        Ok(load_skills_with_frontmatter(&path, &self.get_source()))
+    }
+
+    /// Resolves the on-disk directory of a skill, matching on the frontmatter `name` (the same
+    /// identity `get_skill` uses) and falling back to the directory name.
+    fn resolve_skill_dir(&self, skill_name: &str) -> Option<PathBuf> {
+        // The harness calls this once per skill while building its index, so only synchronize when
+        // the repository has never been synced (avoids one `ls-remote` per skill).
+        let mut root = self.state.lock().unwrap().skills_path.clone();
+        if root.is_none() {
+            self.ensure_auto_synced().ok()?;
+            root = self.state.lock().unwrap().skills_path.clone();
+        }
+        let root = root?;
+        for entry in std::fs::read_dir(&root).ok()?.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() || !dir.join("SKILL.md").is_file() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let name = match std::fs::read_to_string(dir.join("SKILL.md")) {
+                Ok(md) => skill_identity(&md, &dir_name).0,
+                Err(_) => dir_name,
+            };
+            if name == skill_name {
+                return Some(absolute_path(&dir));
+            }
+        }
+        None
     }
 }
 
@@ -395,6 +480,11 @@ impl AgentSkillRepository for GitSkillRepository {
 
     fn is_writeable(&self) -> bool {
         false
+    }
+
+    /// P1-08: exposes the on-disk skill directory so `load_skill_through_path` works.
+    fn skill_dir(&self, skill_name: &str) -> Option<PathBuf> {
+        self.resolve_skill_dir(skill_name)
     }
 
     /// Read-only backend: the flag is ignored, exactly as Java's `GitSkillRepository`
@@ -481,6 +571,186 @@ fn normalize_skills_root(raw: Option<&str>) -> Result<Option<String>, SkillRepos
     Ok(Some(trimmed.to_string()))
 }
 
+/// Loads every skill directory under `root`, then replaces the harness identity (directory name +
+/// first body line) with the Java `SkillFileSystemHelper` identity (frontmatter `name` /
+/// `description`). Resources and scanning come from the harness loader - no parallel directory
+/// walk is implemented here.
+fn load_skills_with_frontmatter(root: &Path, source: &str) -> Vec<AgentSkill> {
+    let mut skills: Vec<AgentSkill> = load_skills_from_dir(root, source)
+        .into_iter()
+        .map(apply_frontmatter_identity)
+        .collect();
+    skills.sort_by(|a, b| a.name().cmp(b.name()));
+    skills
+}
+
+/// Rewrites a harness-loaded skill with the frontmatter-derived name / description.
+fn apply_frontmatter_identity(skill: AgentSkill) -> AgentSkill {
+    let dir_name = skill.name().to_string();
+    let resources = skill.resources().clone();
+    let metadata = skill.metadata().clone();
+    let Some(skill_md) = resources.get("SKILL.md") else {
+        return skill;
+    };
+    let (name, description) = skill_identity(skill_md, &dir_name);
+    if name == dir_name && description == skill.description() {
+        return skill;
+    }
+    AgentSkill::builder()
+        .name(name)
+        .source(skill.source())
+        .description(description)
+        .metadata(metadata)
+        .resources(resources)
+        .build()
+}
+
+/// Derives `(name, description)` from `SKILL.md`, mirroring `SkillFileSystemHelper` (frontmatter
+/// `name` / `description`) and falling back to the directory name / first body line when the
+/// frontmatter omits them (Java skips such skills; the harness always reported them, so the
+/// fallback keeps that leniency).
+fn skill_identity(skill_md: &str, dir_name: &str) -> (String, String) {
+    let front = frontmatter_scalars(skill_md);
+    let name = match front.get("name").map(|v| v.trim()) {
+        Some(candidate) if candidate.is_empty() => dir_name.to_string(),
+        Some(candidate) if is_safe_skill_name(candidate) => candidate.to_string(),
+        Some(candidate) => {
+            tracing::warn!(
+                name = candidate,
+                dir = dir_name,
+                "ignoring unsafe frontmatter skill name (path separators / '..')"
+            );
+            dir_name.to_string()
+        }
+        None => dir_name.to_string(),
+    };
+    let description = front
+        .get("description")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            first_body_line(skill_md).unwrap_or_else(|| format!("Skill: {name}"))
+        });
+    (name, description)
+}
+
+fn is_safe_skill_name(name: &str) -> bool {
+    !name.contains("..") && !name.contains('/') && !name.contains('\\')
+}
+
+/// First non-empty body line with leading `#` stripped (harness `skill_description` semantics,
+/// applied to the body so a frontmatter file does not yield `---`).
+fn first_body_line(skill_md: &str) -> Option<String> {
+    split_frontmatter(skill_md)
+        .1
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches('#').trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+/// Splits `---`-fenced YAML frontmatter into `(frontmatter, body)`.
+fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
+    let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let rest = match text.strip_prefix("---") {
+        Some(rest) if rest.starts_with('\n') || rest.starts_with("\r\n") => {
+            rest.trim_start_matches(['\r', '\n'])
+        }
+        _ => return (None, text),
+    };
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+        if trimmed == "---" || trimmed == "..." {
+            return (Some(&rest[..offset]), &rest[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    (None, text)
+}
+
+/// Extracts the top-level scalar keys of the YAML frontmatter (the subset the skill identity
+/// needs: `name` / `description`). Mirrors the Java fallback parser: nested maps and top-level
+/// lists are skipped, `|` / `>` block scalars are folded, quoted scalars are unquoted.
+fn frontmatter_scalars(markdown: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(front) = split_frontmatter(markdown).0 else {
+        return out;
+    };
+    let lines: Vec<&str> = front.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        if line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('-') {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if key.is_empty() || key.contains(' ') || key.contains('\t') {
+            continue;
+        }
+        let value = raw_value.trim();
+        if value.starts_with('|') || value.starts_with('>') {
+            let folded = value.starts_with('>');
+            let mut parts: Vec<&str> = Vec::new();
+            while i < lines.len() {
+                let next = lines[i];
+                if !(next.starts_with(' ') || next.starts_with('\t')) {
+                    break;
+                }
+                i += 1;
+                parts.push(next.trim());
+            }
+            let joined = if folded {
+                parts.join(" ")
+            } else {
+                parts.join("\n")
+            };
+            out.insert(key.to_string(), joined.trim().to_string());
+            continue;
+        }
+        if value.is_empty() {
+            // Nested mapping or an empty value: not a usable scalar.
+            continue;
+        }
+        out.insert(key.to_string(), scalar_value(value));
+    }
+    out
+}
+
+fn scalar_value(raw: &str) -> String {
+    let raw = raw.trim();
+    let quoted = raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')));
+    if quoted {
+        return raw[1..raw.len() - 1].to_string();
+    }
+    match raw.find(" #") {
+        Some(idx) => raw[..idx].trim_end().to_string(),
+        None => raw.to_string(),
+    }
+}
+
+/// Makes a path absolute without requiring it to exist (`Path::canonicalize` would fail).
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +810,328 @@ mod tests {
             GitSkillRepositoryConfig::new("u").skills_root("a/../b")
         )
         .is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // P1-01 / P1-02: frontmatter identity (unit level)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn frontmatter_scalars_reads_plain_quoted_and_block_values() {
+        let md = "\u{feff}---\nname: \"calc\"\ndescription: Adds numbers # note\nnested:\n  child: x\nlist:\n  - a\nlong: |\n  line1\n  line2\nfolded: >-\n  one\n  two\n---\n# body\n";
+        let fm = frontmatter_scalars(md);
+        assert_eq!(fm.get("name").map(String::as_str), Some("calc"));
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("Adds numbers")
+        );
+        assert_eq!(fm.get("long").map(String::as_str), Some("line1\nline2"));
+        assert_eq!(fm.get("folded").map(String::as_str), Some("one two"));
+        assert!(!fm.contains_key("nested"));
+        assert!(!fm.contains_key("child"));
+        assert!(!fm.contains_key("list"));
+    }
+
+    #[test]
+    fn skill_identity_prefers_frontmatter_and_falls_back() {
+        let (name, desc) = skill_identity(
+            "---\nname: calc\ndescription: Adds numbers\n---\n# Calc\n",
+            "dir-name",
+        );
+        assert_eq!(name, "calc");
+        assert_eq!(desc, "Adds numbers");
+
+        // No frontmatter -> directory name + first body line.
+        let (name, desc) = skill_identity("# Calc skill\nbody\n", "dir-name");
+        assert_eq!(name, "dir-name");
+        assert_eq!(desc, "Calc skill");
+
+        // Frontmatter without a description -> first body line, not the `---` fence.
+        let (name, desc) = skill_identity("---\nname: calc\n---\n# Calc skill\n", "dir-name");
+        assert_eq!(name, "calc");
+        assert_eq!(desc, "Calc skill");
+
+        // Path traversal in the frontmatter name is ignored.
+        let (name, _) = skill_identity("---\nname: ../escape\n---\nbody\n", "dir-name");
+        assert_eq!(name, "dir-name");
+    }
+
+    #[test]
+    fn read_only_write_paths_are_ignored() {
+        let repo = GitSkillRepository::new("https://github.com/test/repo.git").unwrap();
+        assert!(matches!(
+            repo.save(&[], true),
+            Err(SkillRepositoryError::ReadOnly)
+        ));
+        assert!(!repo.delete("anything").unwrap());
+        repo.set_writeable(true);
+        assert!(!repo.is_writeable());
+    }
+
+    #[test]
+    fn remote_url_is_trimmed() {
+        let repo = GitSkillRepository::new("  https://github.com/test/repo.git \n").unwrap();
+        assert_eq!(repo.get_repository_info().location, "https://github.com/test/repo.git");
+    }
+
+    // ------------------------------------------------------------------
+    // Real `file://` repositories (Java parity: 23 offline JGit cases)
+    // ------------------------------------------------------------------
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agentscope-git-test-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "agentscope-tests")
+            .env("GIT_AUTHOR_EMAIL", "tests@example.com")
+            .env("GIT_COMMITTER_NAME", "agentscope-tests")
+            .env("GIT_COMMITTER_EMAIL", "tests@example.com")
+            .output()
+            .expect("the git binary is required by the git repository tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git_in(dir, &["init", "-q"]);
+        // Version independent `git init -b main`.
+        git_in(dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    }
+
+    fn commit_all(dir: &Path, message: &str) {
+        git_in(dir, &["add", "-A"]);
+        git_in(
+            dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", message],
+        );
+    }
+
+    fn write_skill(root: &Path, dir_name: &str, name: &str, description: &str) {
+        write_skill_body(root, dir_name, name, description, "");
+    }
+
+    /// Like [`write_skill`], but appends extra markdown to the body so the two branches can
+    /// carry files whose *content* differs while the frontmatter identity stays the same.
+    fn write_skill_body(root: &Path, dir_name: &str, name: &str, description: &str, body: &str) {
+        let dir = root.join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\n---\n\n# Heading\nbody text\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn file_url(path: &Path) -> String {
+        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+    }
+
+    fn repo_for(url: &str, local: &Path) -> GitSkillRepository {
+        GitSkillRepository::from_config(GitSkillRepositoryConfig::new(url).local_path(local))
+            .unwrap()
+    }
+
+    #[test]
+    fn clones_local_repository_and_uses_frontmatter_identity() {
+        let root = unique_dir("clone");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        // Directory name deliberately differs from the frontmatter name (P1-01).
+        write_skill(&remote, "dir-name", "calc-skill", "A calculator");
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        assert_eq!(
+            repo.get_all_skill_names().unwrap(),
+            vec!["calc-skill".to_string()]
+        );
+        let skill = repo.get_skill("calc-skill").unwrap();
+        assert_eq!(skill.name(), "calc-skill");
+        assert_eq!(skill.description(), "A calculator"); // not `---` (P1-02)
+        assert!(repo.skill_exists("calc-skill").unwrap());
+        assert!(!repo.skill_exists("dir-name").unwrap());
+
+        // P1-08: the load tool needs the real checkout directory.
+        let dir = repo.skill_dir("calc-skill").expect("skill dir");
+        assert_eq!(dir.file_name().unwrap().to_string_lossy(), "dir-name");
+        assert!(dir.join("SKILL.md").is_file());
+        assert!(repo.skill_dir("missing").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loads_skills_from_the_skills_subdirectory_convention() {
+        let root = unique_dir("subdir");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/subdir-skill", "subdir-skill", "A skill in skills/");
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        assert_eq!(
+            repo.get_skill("subdir-skill").unwrap().description(),
+            "A skill in skills/"
+        );
+        let dir = repo.skill_dir("subdir-skill").unwrap();
+        assert_eq!(dir.parent().unwrap().file_name().unwrap(), "skills");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pulls_new_remote_commits() {
+        let root = unique_dir("pull");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        assert_eq!(repo.get_all_skill_names().unwrap().len(), 1);
+
+        write_skill(&remote, "skills/two", "two", "second");
+        commit_all(&remote, "add two");
+
+        assert_eq!(
+            repo.get_all_skill_names().unwrap(),
+            vec!["one".to_string(), "two".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P1-03: the remote probe must look at `refs/heads/<branch>`, not the remote `HEAD`.
+    #[test]
+    fn remote_head_is_filtered_by_branch() {
+        let root = unique_dir("branch");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        // The same skill directory exists on both branches; only its body differs, so the
+        // branch filter is observable through the checked-out content.
+        //
+        // Regression guard: this test used to assert that `main-skill` was *absent* from the
+        // `develop` clone. That only held because `develop` was branched after `main-skill`
+        // was committed — branching copies history, so the file (and its identity) is present
+        // on `develop` by construction.
+        write_skill_body(&remote, "skills/main-skill", "main-skill", "on main", "on main");
+        commit_all(&remote, "main");
+
+        git_in(&remote, &["checkout", "-q", "-b", "develop"]);
+        write_skill_body(&remote, "skills/main-skill", "main-skill", "on develop", "on develop");
+        commit_all(&remote, "develop");
+        // Put HEAD back on `main` so a plain `ls-remote <url> HEAD` would return the wrong ref.
+        git_in(&remote, &["checkout", "-q", "main"]);
+
+        let main_head = git_in(&remote, &["rev-parse", "refs/heads/main"]);
+        let dev_head = git_in(&remote, &["rev-parse", "refs/heads/develop"]);
+        assert_ne!(main_head, dev_head);
+
+        let repo = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new(file_url(&remote))
+                .branch("develop")
+                .local_path(root.join("clone")),
+        )
+        .unwrap();
+        assert_eq!(repo.remote_head().unwrap(), Some(dev_head.clone()));
+
+        let skill = repo.get_skill("main-skill").unwrap();
+        assert_eq!(skill.description(), "on develop");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P1-04: an unreachable remote must surface an error instead of silently serving stale data.
+    #[test]
+    fn unreachable_remote_fails_instead_of_serving_stale_skills() {
+        let root = unique_dir("unreachable");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        assert_eq!(repo.get_all_skill_names().unwrap().len(), 1);
+
+        // Drop the remote: the clone still exists, but `ls-remote` now fails.
+        std::fs::remove_dir_all(&remote).unwrap();
+        let err = repo.get_all_skill_names().unwrap_err();
+        assert!(
+            matches!(err, SkillRepositoryError::Git(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(repo.skill_exists("one").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Java parity: `skillsRoot` pins a nested skills directory.
+    #[test]
+    fn custom_skills_root_loads_nested_skills() {
+        let root = unique_dir("root");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(
+            &remote,
+            "packs/marketing/greeter",
+            "greeter",
+            "A skill nested under packs/marketing",
+        );
+        commit_all(&remote, "nested");
+
+        let repo = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new(file_url(&remote))
+                .skills_root("packs/marketing")
+                .local_path(root.join("clone")),
+        )
+        .unwrap();
+        let skill = repo.get_skill("greeter").unwrap();
+        assert_eq!(skill.name(), "greeter");
+        assert_eq!(skill.description(), "A skill nested under packs/marketing");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Java parity: `autoSync=false` requires an explicit `sync()` before reads.
+    #[test]
+    fn manual_sync_is_required_when_auto_sync_is_disabled() {
+        let root = unique_dir("manual");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new(file_url(&remote))
+                .auto_sync(false)
+                .local_path(root.join("clone")),
+        )
+        .unwrap();
+        assert!(repo.get_all_skill_names().is_err());
+        repo.sync().unwrap();
+        assert_eq!(repo.get_all_skill_names().unwrap(), vec!["one".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
