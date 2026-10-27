@@ -325,6 +325,72 @@ async fn resume_rejects_a_turn_that_never_started() {
 }
 
 #[tokio::test]
+async fn an_interrupted_resumable_turn_is_continued_before_a_new_submission_runs() {
+    // A turn interrupted by a dead process is not garbage: the caller has moved on, but the
+    // work already started is still resumable. `submit` continues it (a `resume` command is
+    // queued ahead of the new prompt) instead of discarding it, so the partial turn keeps its
+    // answer and the new prompt runs right after.
+    let dir = temp_dir("continue");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(ScriptedModel("continued")))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-continue");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-continue").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+
+    {
+        use agentscope_core::session::SessionRecorder;
+        use agentscope_core::state::AgentState;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("turn-stale"))
+            .await
+            .unwrap();
+        let state = AgentState::builder()
+            .session_id("conversation-continue")
+            .build();
+        recorder.start(&[Msg::user("first")], &state).await.unwrap();
+        recorder
+            .append("run/end", &serde_json::json!({ "status": "interrupted" }))
+            .unwrap();
+        recorder.flush().await.unwrap();
+        recorder.close().await;
+    }
+
+    let session = AgentSession::open(agent, context, key, Arc::clone(&log)).unwrap();
+    assert_eq!(
+        session.open_turn().await.unwrap().as_deref(),
+        Some("turn-stale")
+    );
+
+    let next = session.submit("second").await.unwrap();
+    session.await_task(&next.command_id).await.unwrap();
+
+    let turns = agentscope_core::session::SessionTurns::read(&*log)
+        .await
+        .unwrap();
+    let stale = turns
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "turn-stale")
+        .expect("the seeded turn must still exist");
+    assert_eq!(
+        stale.status, "completed",
+        "an interrupted resumable turn must be continued, not abandoned: {turns:?}"
+    );
+    assert!(session.open_turn().await.unwrap().is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn an_interrupted_turn_is_closed_before_a_new_submission_runs() {
     // Regression for "the previous turn is still open, so this prompt could not start":
     // an interrupted run leaves the turn non-terminal, but the host has clearly moved on when

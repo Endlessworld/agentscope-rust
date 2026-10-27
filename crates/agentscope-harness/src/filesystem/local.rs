@@ -500,6 +500,22 @@ impl Filesystem for LocalFilesystem {
     async fn exists(&self, ctx: &RuntimeContext, path: &str) -> Result<bool> {
         Ok(self.resolve(ctx, path)?.exists())
     }
+
+    async fn sync(&self, ctx: &RuntimeContext, path: &str) -> Result<()> {
+        let resolved = self.resolve(ctx, path)?;
+        // A directory handle cannot be fsync'ed on Windows; the file itself is what the journal
+        // needs (_head.json_ durability), so a directory target is a no-op.
+        if !resolved.is_file() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&resolved)
+                .and_then(|file| file.sync_all())
+                .map_err(Error::Io)
+        })
+        .await
+        .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
+    }
     async fn grep(
         &self,
         ctx: &RuntimeContext,

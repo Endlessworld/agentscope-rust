@@ -82,11 +82,114 @@ impl WorkspaceSessionStorage {
     async fn replace(&self, ctx: &RuntimeContext, path: &str, content: &str) -> crate::Result<()> {
         let temp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
         self.fs.write(ctx, &temp, content).await?;
+        // Flush the new contents before the rename publishes them: otherwise a power loss can
+        // leave the moved-over file with its old (or empty) bytes while the rename itself is
+        // durable — exactly the "session looks truncated after a crash" case.
+        if let Err(error) = self.fs.sync(ctx, &temp).await {
+            tracing::debug!(path = %temp, %error, "session value sync failed; continuing");
+        }
         if let Err(error) = self.fs.move_path(ctx, &temp, path).await {
             let _ = self.fs.delete(ctx, &temp).await;
             return Err(error);
         }
+        // Best effort: not every platform can flush a directory handle.
+        let _ = self.fs.sync(ctx, path).await;
         Ok(())
+    }
+
+    /// The version check and both writes, run while every lock is held.
+    async fn compare_and_set_locked(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        expected_version: u64,
+        bytes: &[u8],
+    ) -> crate::Result<bool> {
+        let current = self.read_version(ctx, path).await?;
+        if current != expected_version {
+            return Ok(false);
+        }
+        let content = String::from_utf8(bytes.to_vec())
+            .map_err(|_| agentscope_core::Error::Agent("session values must be UTF-8".into()))?;
+        if path.contains("/commits/") || path.contains("/blobs/") {
+            // Immutable, content-addressed objects are written once. Their bytes are the
+            // checksum, so a lost acknowledgement can be resolved by re-reading; writing a
+            // sibling `.version` file for each commit doubles the journal's file count and
+            // exposes a second crash window that has no purpose. Create-if-absent is atomic
+            // for the immutable file itself.
+            if self.fs.exists(ctx, path).await? {
+                let existing = self.fs.read(ctx, path, 0, usize::MAX).await?;
+                if existing.content.as_bytes() != bytes {
+                    return Err(agentscope_core::Error::Agent(
+                        "immutable session object conflict".into(),
+                    ));
+                }
+                return Ok(false);
+            }
+            self.fs.write(ctx, path, &content).await?;
+            // A commit is acknowledged only once it is on stable storage; the head that points
+            // at it is synced by its own `replace`.
+            let _ = self.fs.sync(ctx, path).await;
+            return Ok(true);
+        }
+        self.replace(ctx, path, &content).await?;
+        self.replace(
+            ctx,
+            &Self::version_path(path),
+            &(expected_version + 1).to_string(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Path of the cross-process lock guarding a mutable value.
+    fn lock_path(path: &str) -> String {
+        format!("{path}.lock")
+    }
+
+    /// Takes a cross-process lock for `path`, so two processes cannot both pass the version
+    /// check and then write.
+    ///
+    /// The in-process `locks` map only serialises one process; a second agent process sharing
+    /// the same workspace (two IDE windows, a CLI run beside the editor) could otherwise pass
+    /// the same version check and overwrite the newer head. The lock is a create-if-absent
+    /// sibling file; a lock older than `STALE_LOCK` is assumed to belong to a dead process and
+    /// is broken.
+    async fn acquire_file_lock(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+    ) -> crate::Result<Option<String>> {
+        const STALE_LOCK_MILLIS: u128 = 30_000;
+        let lock = Self::lock_path(path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            match self.fs.write(ctx, &lock, &now.to_string()).await {
+                Ok(()) => return Ok(Some(lock)),
+                Err(_) => {
+                    // Held by someone else. Break it only when its owner is clearly gone.
+                    if let Ok(held) = self.fs.read(ctx, &lock, 0, 64).await {
+                        let held_at = held.content.trim().parse::<u128>().unwrap_or(0);
+                        if now.saturating_sub(held_at) > STALE_LOCK_MILLIS {
+                            tracing::warn!(lock = %lock, "breaking a stale session lock");
+                            let _ = self.fs.delete(ctx, &lock).await;
+                            continue;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        // Fall back to the in-process lock only: a lingering lock must not
+                        // wedge a run forever, and the version check below still holds.
+                        tracing::warn!(lock = %lock, "session lock timed out; continuing unlocked");
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
     }
 
     /// Lists only the immediate subdirectories of `prefix`, without trailing slashes.
@@ -164,38 +267,21 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let current = self.read_version(&ctx, path).await?;
-        if current != expected_version {
-            return Ok(false);
+        // A second *process* sharing the workspace is outside the in-process lock's reach, so
+        // the same check-then-write is also guarded by a lock file. Only mutable values take
+        // it; the immutable branches below never race.
+        let file_lock = if lock.is_some() {
+            self.acquire_file_lock(&ctx, path).await?
+        } else {
+            None
+        };
+        let outcome = self
+            .compare_and_set_locked(&ctx, path, expected_version, bytes)
+            .await;
+        if let Some(file_lock) = file_lock {
+            let _ = self.fs.delete(&ctx, &file_lock).await;
         }
-        let content = String::from_utf8(bytes.to_vec())
-            .map_err(|_| agentscope_core::Error::Agent("session values must be UTF-8".into()))?;
-        if path.contains("/commits/") || path.contains("/blobs/") {
-            // Immutable, content-addressed objects are written once. Their bytes are the
-            // checksum, so a lost acknowledgement can be resolved by re-reading; writing a
-            // sibling `.version` file for each commit doubles the journal's file count and
-            // exposes a second crash window that has no purpose. Create-if-absent is atomic
-            // for the immutable file itself.
-            if self.fs.exists(&ctx, path).await? {
-                let existing = self.fs.read(&ctx, path, 0, usize::MAX).await?;
-                if existing.content.as_bytes() != bytes {
-                    return Err(agentscope_core::Error::Agent(
-                        "immutable session object conflict".into(),
-                    ));
-                }
-                return Ok(false);
-            }
-            self.fs.write(&ctx, path, &content).await?;
-            return Ok(true);
-        }
-        self.replace(&ctx, path, &content).await?;
-        self.replace(
-            &ctx,
-            &Self::version_path(path),
-            &(expected_version + 1).to_string(),
-        )
-        .await?;
-        Ok(true)
+        outcome
     }
 
     async fn list_paths(&self, prefix: &str) -> crate::Result<Vec<String>> {
@@ -208,7 +294,9 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
         let mut paths: Vec<String> = entries
             .into_iter()
             .map(|entry| entry.path)
-            .filter(|path| !path.ends_with(".version") && !path.contains(".tmp-"))
+            .filter(|path| {
+                !path.ends_with(".version") && !path.ends_with(".lock") && !path.contains(".tmp-")
+            })
             .collect();
         paths.sort();
         Ok(paths)
@@ -354,6 +442,54 @@ mod tests {
             storage.read("s1/head.json").await.unwrap().unwrap().bytes,
             b"second".to_vec()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_lock_file_from_another_process_serializes_compare_and_set() {
+        // Two processes sharing a workspace (two IDE windows, a CLI run beside the editor) both
+        // pass the in-process lock, so the check-then-write is also guarded by a lock file. A
+        // second instance stands in for the other process here.
+        let dir = temp_dir("xproc");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let storage = Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
+        let ctx = RuntimeContext::new();
+
+        // The other process holds the lock.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        fs.write(&ctx, "s1/head.json.lock", &now.to_string())
+            .await
+            .unwrap();
+
+        let writer = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move { storage.compare_and_set("s1/head.json", 0, b"first").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(
+            !writer.is_finished(),
+            "the write must wait for the other process's lock"
+        );
+
+        fs.delete(&ctx, "s1/head.json.lock").await.unwrap();
+        assert!(writer.await.unwrap().unwrap());
+        assert_eq!(
+            storage.read("s1/head.json").await.unwrap().unwrap().bytes,
+            b"first".to_vec()
+        );
+        // The lock is released again, so the next writer is not blocked.
+        assert!(!fs.exists(&ctx, "s1/head.json.lock").await.unwrap());
+
+        // A lock left behind by a dead process must not wedge the journal.
+        fs.write(&ctx, "s1/head.json.lock", "0").await.unwrap();
+        assert!(storage
+            .compare_and_set("s1/head.json", 1, b"second")
+            .await
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

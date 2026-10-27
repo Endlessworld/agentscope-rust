@@ -325,7 +325,7 @@ impl AgentSession {
 
     /// The last dispatch error, if any.
     pub fn execution_error(&self) -> Option<String> {
-        self.state.lock().unwrap().error.clone()
+        lock_state(&self.state).error.clone()
     }
 
     /// Installs the subscriber that receives every event of dispatched executions.
@@ -334,7 +334,7 @@ impl AgentSession {
     /// sink while [`await_task`](Self::await_task) tracks settlement. The sink is captured
     /// once per execution, so replacing it never splits a single turn between two renderers.
     pub fn set_event_sink(&self, sink: Arc<dyn Fn(&AgentEvent) + Send + Sync>) {
-        self.state.lock().unwrap().sink = Some(sink);
+        lock_state(&self.state).sink = Some(sink);
     }
 
     /// The committed head of the journal (sequence, writer lease, commit id).
@@ -384,8 +384,8 @@ impl AgentSession {
         }
         // A previous run may have left a non-terminal turn (crash, interrupt, a finish that
         // could not commit). The caller has clearly moved on when it submits new input, so
-        // close that orphan before accepting the command instead of rejecting the prompt.
-        self.close_orphaned_turn_before_submit().await?;
+        // settle that turn before accepting the command instead of rejecting the prompt.
+        self.prepare_open_turn_before_submit().await?;
         let turn_id = turn_id_for(idempotency_key);
         let command = Command::new(
             idempotency_key,
@@ -402,21 +402,66 @@ impl AgentSession {
         self.receipt(&accepted).await
     }
 
-    /// Closes an orphaned open turn before a new submission is accepted.
+    /// Interrupts and waits for a run this handle already owns.
     ///
-    /// A submit is an explicit statement that the caller has moved on. If the latest turn is
-    /// still open but no execution owns it (a crashed process, an interrupted run, a finish
-    /// that could not commit), leaving it open makes the dispatcher reject every later prompt
-    /// with `turn_unfinished`. Close it here under the writer lease; unknown tool outcomes are
-    /// recorded as interrupted, never success.
-    async fn close_orphaned_turn_before_submit(&self) -> crate::Result<()> {
+    /// A host that is about to submit a new prompt must not sit behind a run that may never
+    /// return (a stalled provider, a tool that ignores cancellation). Unlike
+    /// [`abandon_unfinished`](Self::abandon_unfinished) this leaves an idle, merely interrupted
+    /// turn alone: [`submit`](Self::submit) decides whether to continue or close it.
+    pub async fn stop_active_run(&self) -> crate::Result<()> {
+        let Some(run_id) = lock_state(&self.state).active_run.clone() else {
+            return Ok(());
+        };
+        let _ = self.agent.interrupt_run(&run_id);
+        let _ = self.interrupt_run(&run_id).await;
+        wait_for_idle(&self.state, ABANDON_TIMEOUT).await
+    }
+
+    /// Settles the open turn left by a previous run before a new submission is accepted.
+    ///
+    /// Routing (mirrors the recovery semantics the journal supports):
+    /// - no open turn → nothing to do;
+    /// - a live run still owns it → leave it alone, the dispatcher serialises the commands;
+    /// - interrupted but resumable (no pending interaction, no uncertain tool outcome) →
+    ///   queue a continuation *ahead* of the new submission, so the work that was already
+    ///   started is finished instead of discarded;
+    /// - suspended or with uncertain tool outcomes → close it, recording unknown tool
+    ///   outcomes as interrupted (never success).
+    async fn prepare_open_turn_before_submit(&self) -> crate::Result<()> {
         let Some(open_turn) = self.open_turn().await? else {
             return Ok(());
         };
         // A live run still owns the turn: do not race it. The dispatcher will reject/queue
         // until it settles, and the caller can cancel explicitly.
-        if self.state.lock().unwrap().active_run.is_some() {
+        if lock_state(&self.state).active_run.is_some() {
             return Ok(());
+        }
+        let resumable = self.pending().await?.is_empty()
+            && self.inspect().await?.uncertain_tool_calls.is_empty();
+        if resumable {
+            match self.resume(&open_turn).await {
+                Ok(task) => {
+                    tracing::info!(
+                        turn = %open_turn,
+                        command = %task.command_id,
+                        "continuing the interrupted turn before accepting a new submission"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    // A continuation is already queued: it will settle the turn itself.
+                    if error.to_string().contains("already queued") {
+                        return Ok(());
+                    }
+                    // Otherwise fall through and close the turn: a transient writer conflict
+                    // must not lose the caller's prompt.
+                    tracing::warn!(
+                        turn = %open_turn,
+                        %error,
+                        "could not continue the open turn; closing it instead"
+                    );
+                }
+            }
         }
         match agentscope_core::session::abandon_turn(Arc::clone(&self.log), &open_turn).await {
             Ok(closed) => {
@@ -515,12 +560,12 @@ impl AgentSession {
             // A run in flight still owns the turn. Ask it to stop instead of waiting for a
             // provider/tool that may never return; the loop below then closes whatever terminal
             // facts the run could not write itself.
-            let active = self.state.lock().unwrap().active_run.clone();
+            let active = lock_state(&self.state).active_run.clone();
             if let Some(run_id) = active {
                 let _ = self.agent.interrupt_run(&run_id);
                 let _ = self.interrupt_run(&run_id).await;
             }
-            while self.state.lock().unwrap().active_run.is_some() {
+            while lock_state(&self.state).active_run.is_some() {
                 if std::time::Instant::now() >= deadline {
                     return Err(session_error("Wait for the current execution to stop"));
                 }
@@ -771,7 +816,7 @@ impl AgentSession {
 
     /// Starts dispatch; `submit`/`respond`/`resume` already call this.
     pub fn start(&self) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = lock_state(&self.state);
         if guard.closed || guard.stop.is_some() {
             return;
         }
@@ -786,8 +831,28 @@ impl AgentSession {
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             while !stop.load(Ordering::SeqCst) {
-                if let Err(error) = dispatch_once(&agent, &log, &inbox, &context, &state).await {
-                    state.lock().unwrap().error = Some(error.to_string());
+                // A panic inside one dispatch (a buggy tool, a poisoned dependency lock) must
+                // not kill the loop: `stop` would stay set, every later prompt would queue
+                // forever and the host would only see a stalled turn.
+                let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    dispatch_once(&agent, &log, &inbox, &context, &state),
+                ))
+                .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        lock_state(state.as_ref()).error = Some(error.to_string());
+                    }
+                    Err(panic) => {
+                        let detail = panic
+                            .downcast_ref::<&str>()
+                            .map(|message| message.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        tracing::error!(%detail, "session dispatch panicked; continuing");
+                        lock_state(state.as_ref()).error =
+                            Some(format!("dispatch panicked: {detail}"));
+                    }
                 }
                 tokio::time::sleep(DISPATCH_INTERVAL).await;
             }
@@ -829,14 +894,14 @@ impl AgentSession {
     }
 
     fn ensure_open(&self) -> crate::Result<()> {
-        if self.state.lock().unwrap().closed {
+        if lock_state(&self.state).closed {
             return Err(session_error("Session runtime is closed"));
         }
         Ok(())
     }
 
     fn require_idle(&self) -> crate::Result<()> {
-        if self.state.lock().unwrap().active_run.is_some() {
+        if lock_state(&self.state).active_run.is_some() {
             return Err(session_error("Wait for the current execution to stop"));
         }
         Ok(())
@@ -924,7 +989,7 @@ impl AgentSession {
             // heuristic below (which exists to detect a run left behind by another/dead
             // process) must not apply.
             let owned_here = {
-                let guard = self.state.lock().unwrap();
+                let guard = lock_state(&self.state);
                 let owned = guard.active_command.as_deref() == Some(command.id.as_str());
                 if owned {
                     if let Some(active) = &guard.active_run {
@@ -988,7 +1053,7 @@ impl Drop for AgentSession {
     fn drop(&mut self) {
         // Stopping dispatch is the only cleanup a dropped handle owns; the journal keeps the
         // accepted work so another runtime can resume it later.
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = lock_state(&self.state);
         guard.closed = true;
         if let Some(stop) = guard.stop.take() {
             stop.store(true, Ordering::SeqCst);
@@ -1004,7 +1069,7 @@ async fn dispatch_view(
     head: &Head,
 ) -> crate::Result<DispatchView> {
     let cached = {
-        let guard = state.lock().unwrap();
+        let guard = lock_state(state.as_ref());
         guard
             .dispatch_view
             .as_ref()
@@ -1034,11 +1099,23 @@ async fn dispatch_view(
         started: turns.started,
         open_turn,
     };
-    state.lock().unwrap().dispatch_view = Some((head.seq, head.commit_id.clone(), view.clone()));
+    lock_state(state.as_ref()).dispatch_view =
+        Some((head.seq, head.commit_id.clone(), view.clone()));
     Ok(view)
 }
 
 /// One dispatch tick: consume interrupts, then launch the next accepted task.
+/// Locks the runtime state, recovering from a poisoned mutex.
+///
+/// A panic while this lock was held used to poison it, so every later `.lock().unwrap()` — the
+/// dispatcher, the receipt readers and the host handlers — panicked in turn and left the session
+/// permanently wedged. The guarded value is plain bookkeeping, so taking the inner value is safe.
+fn lock_state(state: &Mutex<SessionState>) -> std::sync::MutexGuard<'_, SessionState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 async fn dispatch_once(
     agent: &Arc<HarnessAgent>,
     log: &Arc<dyn SessionLog>,
@@ -1046,7 +1123,7 @@ async fn dispatch_once(
     context: &RuntimeContext,
     state: &Arc<Mutex<SessionState>>,
 ) -> crate::Result<()> {
-    let active = state.lock().unwrap().active_run.is_some();
+    let active = lock_state(state.as_ref()).active_run.is_some();
     if active {
         // Mark consumed interrupt commands so they are not replayed.
         let snapshot = inbox.snapshot_shared().await?;
@@ -1116,7 +1193,7 @@ async fn execution_baseline(
     head: &Head,
 ) -> crate::Result<ExecutionBaseline> {
     let cached = {
-        let guard = state.lock().unwrap();
+        let guard = lock_state(state.as_ref());
         guard.execution_view.clone()
     };
     if let Some((seq, commit, mut turns, mut pending)) = cached {
@@ -1136,7 +1213,7 @@ async fn execution_baseline(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "advanced the cached execution view"
             );
-            state.lock().unwrap().execution_view = Some((
+            lock_state(state.as_ref()).execution_view = Some((
                 head.seq,
                 head.commit_id.clone(),
                 turns.clone(),
@@ -1153,7 +1230,7 @@ async fn execution_baseline(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "read the execution view from the journal"
     );
-    state.lock().unwrap().execution_view = Some((
+    lock_state(state.as_ref()).execution_view = Some((
         head.seq,
         head.commit_id.clone(),
         turns.clone(),
@@ -1192,7 +1269,7 @@ async fn launch(
     // if a writer raced us in between.
     let head = log.head().await?;
     let cached_state = {
-        let guard = state.lock().unwrap();
+        let guard = lock_state(state.as_ref());
         if guard.restored_head_matches(&head) {
             agent
                 .agent()
@@ -1376,7 +1453,7 @@ async fn launch(
     }
 
     {
-        let mut guard = state.lock().unwrap();
+        let mut guard = lock_state(state.as_ref());
         guard.active_command = Some(command.id.clone());
         guard.active_run = Some(recorder.run_id().to_string());
         guard.error = None;
@@ -1394,7 +1471,7 @@ async fn launch(
 
     // Capture the subscriber once per execution so a host that replaces it mid-run gets a
     // clean cut instead of a half-rendered turn split across two renderers.
-    let sink = state.lock().unwrap().sink.clone();
+    let sink = lock_state(state.as_ref()).sink.clone();
 
     let react = agent.agent().cloned();
     let result: crate::Result<Option<Msg>> = match react {
@@ -1483,7 +1560,7 @@ async fn launch(
         None
     };
     {
-        let mut guard = state.lock().unwrap();
+        let mut guard = lock_state(state.as_ref());
         guard.active_command = None;
         guard.active_run = None;
         guard.restored_head = committed_head
@@ -1627,7 +1704,7 @@ async fn wait_for_idle(
 ) -> crate::Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if state.lock().unwrap().active_run.is_none() {
+        if lock_state(state).active_run.is_none() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -1790,7 +1867,7 @@ mod tests {
         wait_for_idle(&state, Duration::from_secs(5))
             .await
             .expect("a run that stops unwinding must not fail the continuation");
-        assert!(state.lock().unwrap().active_run.is_none());
+        assert!(lock_state(state.as_ref()).active_run.is_none());
     }
 
     #[tokio::test]

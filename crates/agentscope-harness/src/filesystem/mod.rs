@@ -157,6 +157,15 @@ pub trait Filesystem: Send + Sync + 'static {
     async fn delete(&self, ctx: &RuntimeContext, path: &str) -> Result<()>;
     async fn move_path(&self, ctx: &RuntimeContext, from: &str, to: &str) -> Result<()>;
     async fn exists(&self, ctx: &RuntimeContext, path: &str) -> Result<bool>;
+
+    /// Flushes `path` to stable storage.
+    ///
+    /// Session journal writes use this so a committed head survives a power loss, not just a
+    /// process crash. Backends without a durable layer (in-memory, remote stores) keep the
+    /// no-op default.
+    async fn sync(&self, _ctx: &RuntimeContext, _path: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Validates that `path` is safe (non-blank, no `..` traversal).
