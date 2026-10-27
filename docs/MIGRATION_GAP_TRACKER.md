@@ -493,13 +493,13 @@
 |---|---|---|
 | S1 | 回合内 `plan_enter` / `plan_exit` 被下一轮 state 发布覆盖 | 工具持共享 `Arc<Mutex<AgentState>>` 并直接改 `plan_mode_context`，而循环跑在私有克隆上；`reasoning_phase` 每次发布 `*shared = state.clone()` 会把刚翻转的标志写回旧值 → 后续请求既拿不到 PLAN 横幅，core 的 acting 拦截也退回 BUILD（等于 `plan_enter` 只对下一次 `call` 生效，且本回合内完全无效）。修法：发布前先把共享侧 `plan_mode_context` 取回本地（该字段只由工具写，共享侧始终是权威）。测试：`harness_plan_wait_tool_test::plan_enter_mid_turn_reaches_the_next_request`（已反向验证：去掉取回后第二个请求无 PLAN 横幅） |
 
-**同批复评的 core 侧缺口（未在本轮修复，仅登记）**：
+**同批复评的 core 侧缺口（C1/C2 本轮已修复，C3 仍待办）**：
 
-| # | 缺口 | 说明 |
-|---|---|---|
-| C1 | tool-call 参数完整性语义相反 | `1ac8c8304`/`131c3bd9a`：Java 标记 malformed 并**拒绝执行**；Rust `anthropic/parser.rs::malformed_tool_arguments_degrade_to_empty_input` 把畸形参数**降级为 `{}`** 并继续执行 |
-| C2 | progressive tool events | `db0b67eb8`：Rust 已有 `ToolCallStart/Delta/End`、`ToolResultStart/TextDelta/End`，但按批聚合后才发，无「单个工具完成即发」回调 |
-| C3 | `@Tool` proc-macro / `additionalProperties` | `7976a20d7`/`1aeb863c4`：无 `@Tool` 宏（既有 P0）；tool schema 无 `additionalProperties` 落点 |
+| # | 模块 | 缺口 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|---|
+| C1 | core.agent | tool-call 参数完整性语义相反 | ✅ 已完成（本轮） | `1ac8c8304`/`131c3bd9a`。Java 侧 `ToolCallsAccumulator` 是**provider 无关**的，因此修法放在 core 统一收口而不是只改 anthropic parser：`ReasoningContext` 记录 `finish_reason`（`length`/`max_tokens`，大小写不敏感），`build_final_message` 对**所有 provider** 的 tool call 调 `finalize_tool_call_arguments`。`content`（累积原始片段）是权威来源：合法 JSON 对象只补 `input` 缺失键（已解析值优先）；非空但非 JSON 对象 → 清空 `input` + `ToolUseBlock::METADATA_MALFORMED_ARGUMENTS`（`malformedArguments`）；raw 为空 + 输出被截断 + `input` 为空 → 同样标记。截断时 assistant msg 写 `metadata_keys::OUTPUT_LIMIT_REACHED`（`_output_limit_reached`）。acting 在 `run_acting_calls` 最前面拦截 malformed：发 `ToolResultStart` → 提示文本 → ERROR 结果 → `ToolResultEnd(Error)`，**不经过** plan/permission/middleware/executor（对齐 Java `writeMalformedArgumentResults`），提示语常量 `OUTPUT_LIMIT_TOOL_ARGUMENTS` / `INVALID_TOOL_ARGUMENTS` 逐字对齐 Java。测试：`react_agent::tests::malformed_tool_arguments_are_finalized_with_the_java_rules`、`react_agent::tests::truncated_tool_call_is_rejected_without_executing_and_pairs_its_result`（含 sibling 正常执行、事件、第二请求可见错误结果、assistant 截断元数据断言）；`anthropic::parser::tests::malformed_tool_arguments_keep_raw_content_for_the_core_to_reject`（原 `..._degrade_to_empty_input` 改名并新增 raw 片段保留断言）。反向验证：去掉 acting 拦截分支 → handler 执行次数 2（期望 1）；去掉 `finalize_tool_call_arguments` 调用 → 两个用例均 FAILED |
+| C2 | core.agent | progressive tool events | ✅ 已完成（本轮） | `db0b67eb8`。**核对后修正了复评初稿的判断**：Rust acting 一直是逐工具内联发 `ToolResultStart/TextDelta/End`（模型侧 `ToolCallStart/Delta/End` 也是流式即时发），并不存在「按批聚合后才发」；真实差异是 `ToolkitConfig.parallel` 默认 `false` 且 acting 阶段**完全忽略该配置**，工具永远串行 → 快的工具不可能在慢的兄弟完成前可见。修法：`run_acting_calls` 改索引循环，`parallel` 开启时把「连续 + 并发安全 + 已批准」的调用交给 `run_parallel_batch` 并发执行，每个调用在**自身真实开始/结束时**发事件（完成序），`join_all` 后按**声明序** `bind_result` 落盘、整批统一结算（对齐 Java 的 callback + 有序聚合）；`Ask`/`Deny`/plan-denied/malformed/非并发安全工具仍走串行槽位。`ToolkitConfig` 默认值改为 `parallel: true` 对齐 Java `new Toolkit()`。测试：`react_agent::tests::a_fast_tool_is_visible_while_a_slower_earlier_tool_is_still_running`（GatedTool 门控：fast end 先于 slow end，落盘序仍为声明序）、`react_agent::tests::serial_mode_emits_start_when_execution_begins`（`parallel(false)` 下事件序 `start:slow → end:slow → start:fast → end:fast`）。反向验证：禁用并行分支 → 前者 5s 超时 FAILED |
+| C3 | core.tool | `@Tool` proc-macro / `additionalProperties` | ⏳ 待办 | `7976a20d7`/`1aeb863c4`：无 `@Tool` 宏（既有 P0）；tool schema 无 `additionalProperties` 落点 |
 
 ## 4. 项目状态与下一步
 

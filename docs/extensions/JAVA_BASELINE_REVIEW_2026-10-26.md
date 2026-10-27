@@ -105,6 +105,10 @@ $ git cat-file -e ed8073259:.../core/embedding/EmbeddingUsage.java   -> EXISTS
 >   state 发布覆盖（工具写共享 state，循环跑私有克隆），已修 + 增加
 >   `harness_plan_wait_tool_test::plan_enter_mid_turn_reaches_the_next_request`，详见
 >   `MIGRATION_GAP_TRACKER.md` §3.15 表后的「本轮顺带修复 S1」。
+> - **§5 两条 core 缺口已落地（2026-10-27，C1/C2）**：`1ac8c8304`/`131c3bd9a` 与 `db0b67eb8`
+>   已在 core 侧对齐，修法/测试/反向验证见 `MIGRATION_GAP_TRACKER.md` §3.15 的 C1/C2 行。
+>   其中 C2 的初稿判断「Rust 按批聚合后才发」**已证伪**：Rust 一直是逐工具内联发事件，
+>   真正的差异是 acting 忽略 `ToolkitConfig.parallel`、工具永远串行。
 
 ## 5. 明确「不迁移 / 无漂移」清单
 
@@ -114,8 +118,8 @@ $ git cat-file -e ed8073259:.../core/embedding/EmbeddingUsage.java   -> EXISTS
 | `d90517ab3` AG-UI SSE 断连 | 只改 `spring-boot-starter`（不迁移） |
 | `1aebcf0b2` AG-UI schema | 在 `extensions-agui`，但**旧基线内** → 属既有 P1 缺口，非新漂移 |
 | a2a 系列（`6e1ee68d7`/`dcb131a3f`/`e6f015e14`） | **新提交**。Rust a2a 侧本就未实现 `A2aAgent` 门面（只有 wire 模型 + JSON-RPC client + server），缺口已由 PROTOCOL tracker 既有 P1 覆盖。其中 `6e1ee68d7`（COMPLETED 任务优先取 artifacts）已登记为新细项 |
-| `1ac8c8304` / `131c3bd9a` tool-call 参数完整性 | **新提交**，`core`。Rust 无 `ToolCallsAccumulator`（流式累积在 provider parser 内）；`anthropic/parser.rs` 有显式测试 `malformed_tool_arguments_degrade_to_empty_input` **把畸形参数降级为 `{}`**，与 Java 新语义（标记 malformed 并拒绝执行）**正好相反** → 真实缺口，登记到 core 侧（不在今天 14 个提交的对齐面内） |
-| `db0b67eb8` progressive tool events | **新提交**，`core`。Rust 已有 `ToolCallStart/Delta/End` 与 `ToolResultStart/TextDelta/End`，但**按批聚合后才发**，无「单个工具完成即发」回调 → 与 Java 新行为有差异，登记为 core 侧后续 |
+| `1ac8c8304` / `131c3bd9a` tool-call 参数完整性 | **新提交**，`core`。初稿判断为「Rust 无对应物 + anthropic parser 语义相反」。**已落地（本轮 C1）**，但落点按实测调整：Java 的 `ToolCallsAccumulator` 是 **provider 无关**的，Rust 对应物是 core `react_agent.rs` 的 `ReasoningContext`，因此在 `build_final_message` 统一收口（`finalize_tool_call_arguments`）：`content` 为权威来源，非空非 JSON 对象 → `input={}` + `malformedArguments`；空 raw + 截断（`length`/`max_tokens`）+ 空 `input` → 同样标记；截断信息写到 assistant msg 的 `_output_limit_reached`。acting 拦截 malformed 并合成 ERROR 结果（不发往 plan/permission/executor）。原 `malformed_tool_arguments_degrade_to_empty_input` 已改名为 `malformed_tool_arguments_keep_raw_content_for_the_core_to_reject` 并断言 raw 片段被保留 |
+| `db0b67eb8` progressive tool events | **新提交**，`core`。初稿判断「Rust 按批聚合后才发」**被证伪**：Rust acting 一直是逐工具内联发 `ToolResultStart/TextDelta/End`，模型侧 `ToolCallStart/Delta/End` 也是流式即时发。**真实差异**：`ToolkitConfig.parallel` 默认 `false` 且 acting 忽略该配置，工具永远串行，快工具无法在慢兄弟完成前可见。**已落地（本轮 C2）**：acting 按 `parallel` 把连续、并发安全、已批准的调用放进 `run_parallel_batch` 并发执行，事件按各自真实开始/结束发（完成序），结果按声明序落盘并整批结算；`parallel` 默认改 `true` 对齐 Java `new Toolkit()`。测试 `a_fast_tool_is_visible_while_a_slower_earlier_tool_is_still_running` / `serial_mode_emits_start_when_execution_begins` |
 | `7976a20d7` / `1aeb863c4` tool schema | **新提交**，`core`。Rust 无 `@Tool` proc-macro（既有 P0），`additionalProperties` 无落点 |
 | `9730e8171` / `aa66abfd0` e2b | **新提交**。Rust e2b `build_create_sandbox_body` 只带 `templateID`+`timeout`，**无 volume mount**；exec 超时走 `kill_sandbox`，缺「服务端 kill + 可靠超时」。既有 SANDBOX P1 已覆盖同族问题，新增 2 细项 |
 | `31c7db8c9` / `4cdcc1785` judge openai-decisions | **新提交**。JUDGE tracker 的 P1「`openai-decisions` 整块缺失」规模已变化（新增 middleware/example/starter），结论不变 |
