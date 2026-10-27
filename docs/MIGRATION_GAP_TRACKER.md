@@ -478,7 +478,7 @@
 |---|---|---|---|---|
 | 4.2 | subagent.task | orphan sweep 不按原始隔离域写回 | ✅ 已完成（`c7ffa4f`） | `task/workspace.rs`：新增持久化 scope 注册表 `harness/task-scopes/<agentId>/<key>.json`（`namespace`/`user_id`/`session_id`，`.tmp`+`move_path` 原子写）；`scopeKey` 与 Java 一致（各段 base64url 无填充 + `.` 拼接，超长退化 SHA-256 hex，无新依赖）；默认域不注册；`sweep_once` 改遍历「默认域 + 已注册域」逐域读写的；`local_contexts` 降级为进程内快路径，写回时校验域一致 |
 | 4.3 | skills | frontmatter 闭合围栏未要求独占一行 | ✅ 已完成（`95d40f2`，见 `SKILLS__GAP_TRACKER.md` P1-11） | `git.rs::split_frontmatter` 不再 `trim()` 行首：缩进的 `  ---` 属块标量正文；行尾空白仍允许 |
-| 4.4 | context | 溢出压缩后重试未判「输入已在上下文」 | ⚠️ **部分成立**，未做 | **属实**：`context_middleware.rs::compact_overflow` 写回共享 `AgentState` 后，重试仍用同一 `messages` 重新编译，无「已在上下文则传空输入」的判定。**不属实**：报告称「输入会被重复注入」在 Rust 架构下不成立 —— `on_model_call` 内联改写消息列表，不存在 Java 那种「context 已含 + 输入再追加」的二次追加路径。剩余影响限于「重试可能重跑已完成的工具」 |
+| 4.4 | context | 溢出压缩后重试未判「输入已在上下文」 | ❌ **成立，但成因与报告不同（P0 待修）** | 报告的两条都不准确：「输入重复注入」不成立（`on_model_call` 内联改写，无二次追加路径）；「缺 isInContext 判定」也不适用（重试不单独传 input）。**真实缺陷**：一轮之内 `ctx.state` 是**上一轮快照**（`react_agent.rs:1402` 克隆本地 state，`:1509` 才 `*shared = state` 回写），而 `compact_overflow` 从 `state.context()` 取历史（`context_middleware.rs:277-296`），重试只拼「system + 压缩后的旧历史」（`:355-360`）→ **本轮输入（用户问题 + 本轮工具结果）在重试中被丢弃**；`:353` 的 `*guard.context_mut() = new_context` 随后会被 `:1509` 覆盖 → **压缩结果不落盘**。首轮溢出时 `history.is_empty()` → 直接放弃压缩并向上抛预算错误。现有测试 `a_budget_overflow_compacts_the_state_and_retries` 把 shared state 与输入设成同一份，恰好掩盖了该问题 |
 | 4.5 | middleware.inbox | 提示注入形态与 Java 相反 | ✅ 已完成（`6fbc768`） | 每条 hint → 独立 `MsgRole::User` 通知（溯源句 + `synthetic`/`reminder_kind=background_event`/`source`/`hint_id` 元数据），并写回 `AgentState.context`；锁不跨 await |
 | 4.6 | middleware.at_path | `@path` 展开形态与截断提示 | ✅ 已完成（`7223b25`） | 追加独立预览块（保留原 blocks）、`<attached_file path="...">`、中和 `</attached_file>`、按行截断 1000 行 + Java 提示语、单条消息 64k 字符预算、仅展开 user 消息；`collect_text` 按 Java `getTextContent()` 用 `\n` 连接 |
 | 4.7 | skill.prompt | `<available_skills>` 默认仍 full-metadata | ✅ 已完成（`dbc3f02`） | `expose_all_metadata` 默认 `false`；slim 视图 `name`/`description` 取自 `AgentSkill` 字段且无条件输出（对齐 Java `metadataView`）；usage 文案换 Java 精简版；full 视图仍可 `with_parts(..., true)` |
@@ -491,7 +491,7 @@
 
 | # | 缺口 | 说明 |
 |---|---|---|
-| 4.4 残余 | 压缩后重试可能重跑已完成工具 | 见上表；需在 `compact_overflow` 后按 message id 判断本轮输入是否已在 context |
+| 4.4 | 溢出压缩重试丢本轮输入、压缩不落盘（**P0，见上表**） | 根因是「中间件看到的 `ctx.state` 落后于本轮本地 state」，不是缺 isInContext 判定。修法需先裁定：把 `on_model_call` 的历史源改为实际输入 `messages`（最小改动，解决丢输入），落盘则要让 core 在回合结束时接纳中间件的改写（或把压缩结果回传给 core） |
 | C1 | tool-call 参数完整性语义相反 | `1ac8c8304`/`131c3bd9a`：Java 标记 malformed 并**拒绝执行**；Rust `anthropic/parser.rs::malformed_tool_arguments_degrade_to_empty_input` 把畸形参数**降级为 `{}`** 并继续执行 |
 | C2 | progressive tool events | `db0b67eb8`：Rust 已有 `ToolCallStart/Delta/End`、`ToolResultStart/TextDelta/End`，但按批聚合后才发，无「单个工具完成即发」回调 |
 | C3 | `@Tool` proc-macro / `additionalProperties` | `7976a20d7`/`1aeb863c4`：无 `@Tool` 宏（既有 P0）；tool schema 无 `additionalProperties` 落点 |
