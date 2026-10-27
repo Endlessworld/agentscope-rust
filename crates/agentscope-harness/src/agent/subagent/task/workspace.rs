@@ -7,17 +7,27 @@
 //!
 //! A background heartbeat/sweeper pair (started lazily on the first `put_task`) keeps
 //! `last_updated_at` fresh for live local tasks and marks dropped-node tasks as `FAILED`.
+//!
+//! Isolation domains that write task records are registered durably under
+//! `harness/task-scopes/<parentAgentId>/<scopeKey>.json` (mirroring Java
+//! `RemoteFilesystem#registerTaskScope`), so the sweeper can revisit every domain — and write its
+//! repair back into that domain's own namespace — even after a restart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::agent::coordination::{LocalPeriodicGate, PeriodicGate};
+use crate::agent::isolation_scope::IsolationScope;
 use crate::agent::subagent::protocol::RemotePendingConfirm;
-use crate::filesystem::Filesystem;
+use crate::filesystem::{
+    Filesystem, FilesystemKind, NamespaceFactory, OverlayFilesystem, SandboxBackedFilesystem,
+};
 
 use super::background::BackgroundTask;
 use super::delivery::TaskDelivery;
@@ -56,7 +66,17 @@ struct RepoState {
     local_tasks: std::sync::Mutex<BTreeMap<String, Arc<BackgroundTask>>>,
     /// `localKey → (sessionId, RuntimeContext)` captured at `put_task` time, so the heartbeat and
     /// sweeper can persist task state under the originating user's namespace.
+    ///
+    /// Only a fast path for local heartbeats: the durable registry (`register_task_scope`) is the
+    /// authority the sweeper uses, because this map is empty after a process restart.
     local_contexts: std::sync::Mutex<BTreeMap<String, (String, RuntimeContext)>>,
+    /// Namespace factory used to derive a context's isolation domain. `None` means
+    /// [`IsolationScope::User`], the Java default (`IsolationScope.USER.toNamespaceFactory()`).
+    namespace_factory: Option<Arc<dyn NamespaceFactory>>,
+    /// Scope keys already written to the registry by *this* process, so repeated task reads do not
+    /// re-hit the store. Purely an optimization: an empty set after a restart only costs one
+    /// registry read per domain, never correctness.
+    registered_scopes: std::sync::Mutex<BTreeSet<String>>,
 }
 
 /// Workspace-backed `TaskRepository` that uses the `Filesystem` trait as the authoritative
@@ -90,12 +110,32 @@ impl WorkspaceTaskRepository {
                 parent_agent_id: parent_agent_id.into(),
                 local_tasks: std::sync::Mutex::new(BTreeMap::new()),
                 local_contexts: std::sync::Mutex::new(BTreeMap::new()),
+                namespace_factory: None,
+                registered_scopes: std::sync::Mutex::new(BTreeSet::new()),
             }),
             completion_callback: tokio::sync::RwLock::new(None),
             transport: Arc::new(AgentProtocolTransport::new()),
             sweep_gate,
             maintenance: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Overrides how a [`RuntimeContext`] is mapped to an isolation namespace.
+    ///
+    /// Mirrors handing the Java `RemoteFilesystem` a `NamespaceFactory`; without this the
+    /// [`IsolationScope::User`] default is used. Task-scope registration and the orphan sweeper
+    /// both go through the same factory, so registration and lookup can never disagree.
+    pub fn with_namespace_factory(mut self, factory: Arc<dyn NamespaceFactory>) -> Self {
+        match Arc::get_mut(&mut self.state) {
+            Some(state) => state.namespace_factory = Some(factory),
+            // Only reachable if a clone escaped before the builder finished; the default factory
+            // is a correct fallback, so degrade loudly instead of panicking in a builder method.
+            None => tracing::warn!(
+                "with_namespace_factory called on a shared repository; keeping the default \
+                 IsolationScope::User namespace factory"
+            ),
+        }
+        self
     }
 
     /// Injects a transport, bypassing real HTTP calls (remote task tests).
@@ -115,6 +155,9 @@ impl WorkspaceTaskRepository {
     }
 
     async fn persist_record(&self, ctx: &RuntimeContext, session_id: &str, record: &TaskRecord) {
+        // Mirror Java `WorkspaceManager#writeTaskRecord`: register the caller's isolation domain
+        // before writing, so a sweep in any later process can find and repair this record.
+        register_task_scope(&self.state, ctx).await;
         let path = self.tasks_path(session_id);
         let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
         map.insert(record.task_id.clone(), record.clone());
@@ -225,6 +268,9 @@ impl TaskRepository for WorkspaceTaskRepository {
         if let Some(local) = self.state.local_tasks.lock().unwrap().get(&key).cloned() {
             return Some(local);
         }
+        // Java registers the scope from reads too (`WorkspaceManager#readTaskRecord`), which keeps
+        // recovery possible for a domain that only ever read an existing record.
+        register_task_scope(&self.state, ctx).await;
         let path = self.tasks_path(session_id);
         let map = read_records(self.state.fs.as_ref(), ctx, &path).await;
         map.get(task_id).map(|rec| self.synthetic_from_record(rec))
@@ -359,6 +405,8 @@ impl TaskRepository for WorkspaceTaskRepository {
         session_id: &str,
         filter: Option<TaskStatus>,
     ) -> Vec<Arc<BackgroundTask>> {
+        // Java registers the scope from `listTaskRecords` as well (WorkspaceManager:624).
+        register_task_scope(&self.state, ctx).await;
         let path = self.tasks_path(session_id);
         let map = read_records(self.state.fs.as_ref(), ctx, &path).await;
         let mut result = Vec::new();
@@ -498,6 +546,257 @@ impl TaskRepository for WorkspaceTaskRepository {
 
 fn tasks_path(parent_agent_id: &str, session_id: &str) -> String {
     format!("agents/{parent_agent_id}/tasks/{session_id}.json")
+}
+
+// ---------------------------------------------------------------------
+//  Task-scope registry (durable isolation domains)
+// ---------------------------------------------------------------------
+
+/// Durable record of one isolation domain that has written task records.
+///
+/// Mirrors the Java `RemoteFilesystem#registerTaskScope` entry (`namespace` / `userId` /
+/// `sessionId`). The registry lives outside `agents/<agentId>/…` so it is never visible to agent
+/// filesystem tools, and each domain gets its own file so concurrent registrations cannot
+/// overwrite a shared list.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct TaskScopeEntry {
+    namespace: Vec<String>,
+    user_id: String,
+    session_id: String,
+}
+
+fn task_scopes_dir(parent_agent_id: &str) -> String {
+    format!("harness/task-scopes/{parent_agent_id}")
+}
+
+fn task_scope_path(parent_agent_id: &str, key: &str) -> String {
+    format!("{}/{key}.json", task_scopes_dir(parent_agent_id))
+}
+
+/// Synthetic identity used for registry I/O.
+///
+/// The Java registry lives in its own `["harness","task-scopes",…]` store namespace, which is
+/// always non-empty; the `Filesystem` trait cannot pick a namespace directly, and a store-backed
+/// backend rejects an empty one. A reserved id therefore stands in: every id-based namespace
+/// factory maps it to a stable domain that no real user or session can occupy, identical across
+/// processes.
+const REGISTRY_SCOPE_ID: &str = "__agentscope_task_scopes__";
+
+fn registry_ctx() -> RuntimeContext {
+    RuntimeContext::default()
+        .with_user_id(REGISTRY_SCOPE_ID)
+        .with_session_id(REGISTRY_SCOPE_ID)
+}
+
+/// Longest scope key kept verbatim; longer ones are hashed (filesystem component limit).
+const SCOPE_KEY_MAX_LEN: usize = 120;
+
+/// Java `RemoteFilesystem#scopeKey`: base64url (unpadded) of each segment, joined with `.`.
+///
+/// The result is a stable, filename-safe function of the namespace tuple: two contexts that
+/// resolve to the same domain produce the same key, and distinct domains cannot collide (the join
+/// is unambiguous because base64url never emits `.`). Over-long keys fall back to a SHA-256 hex
+/// digest, which is just as deterministic but stays inside a path-component budget.
+fn scope_key(namespace: &[String]) -> String {
+    use base64::Engine as _;
+    let joined = namespace
+        .iter()
+        .map(|segment| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(segment.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(".");
+    if !joined.is_empty() && joined.len() <= SCOPE_KEY_MAX_LEN {
+        return joined;
+    }
+    // Empty (all segments empty — never produced by a real factory) or over-long: hash it, so the
+    // key is always a usable, unambiguous path component.
+    let digest = Sha256::digest(joined.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Whether `fs` applies a namespace at all.
+///
+/// Mirrors Java `WorkspaceManager#taskRemoteFilesystem`, which unwraps layered backends and only
+/// registers a scope once it reaches a store-backed (namespaced) filesystem. A plain local backend
+/// ignores the context entirely, so every context is the default domain there and registration
+/// would only produce noise.
+fn namespace_is_applied(fs: &dyn Filesystem) -> bool {
+    match fs.kind() {
+        FilesystemKind::Local => false,
+        // An overlay writes through to its upper layer, so that layer decides.
+        FilesystemKind::Overlay => match fs.as_any().downcast_ref::<OverlayFilesystem>() {
+            Some(overlay) => namespace_is_applied(overlay.upper()),
+            None => true,
+        },
+        // A sandbox backend delegates every file operation to its inner filesystem.
+        FilesystemKind::Sandbox => match fs.as_any().downcast_ref::<SandboxBackedFilesystem>() {
+            Some(sandbox) => namespace_is_applied(sandbox.inner()),
+            None => true,
+        },
+        // Remote and composite backends route to store-backed layers that this trait cannot
+        // unwrap (`CompositeFilesystem` exposes no backend accessor); assume namespaced.
+        _ => true,
+    }
+}
+
+/// Resolves the isolation domain of `ctx`.
+///
+/// Uses the injected [`NamespaceFactory`] when there is one, otherwise the Java default
+/// (`IsolationScope.USER.toNamespaceFactory()`): `[userId]`, falling back to `[sessionId]`, and
+/// empty for a context with neither (the default domain).
+///
+/// A non-namespacing backend (see [`namespace_is_applied`]) maps every context to the default
+/// domain, so no registry entry is ever written for it.
+fn namespace_for(state: &RepoState, ctx: &RuntimeContext) -> Vec<String> {
+    if !namespace_is_applied(state.fs.as_ref()) {
+        return Vec::new();
+    }
+    match state.namespace_factory.as_deref() {
+        Some(factory) => factory.get_namespace(ctx),
+        None => IsolationScope::User.namespace(ctx.user_id(), ctx.session_id()),
+    }
+}
+
+/// Persists one registry entry, replacing any previous content for the same key.
+///
+/// Returns whether the entry is now durably stored.
+async fn write_scope_entry(fs: &dyn Filesystem, path: &str, json: &str) -> bool {
+    let ctx = registry_ctx();
+    let tmp = format!("{path}.tmp");
+    if fs.exists(&ctx, &tmp).await.unwrap_or(false) {
+        let _ = fs.delete(&ctx, &tmp).await;
+    }
+    match fs.write(&ctx, &tmp, json).await {
+        Ok(()) => match fs.move_path(&ctx, &tmp, path).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Failed to commit task-scope registry entry to {path}: {e}");
+                let _ = fs.delete(&ctx, &tmp).await;
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Failed to stage task-scope registry entry for {path}: {e}");
+            false
+        }
+    }
+}
+
+/// Registers `ctx`'s isolation domain so a later sweep — possibly in another process — can route
+/// maintenance writes back to the original namespace. Best-effort: a failure only costs orphan
+/// recovery for that domain, so it must never fail the task write itself.
+///
+/// Mirrors `RemoteFilesystem#registerTaskScope`: the default domain is not registered, because the
+/// sweeper always visits it implicitly.
+async fn register_task_scope(state: &RepoState, ctx: &RuntimeContext) {
+    let namespace = namespace_for(state, ctx);
+    if namespace.is_empty() || namespace == namespace_for(state, &RuntimeContext::default()) {
+        return;
+    }
+    let entry = TaskScopeEntry {
+        namespace,
+        user_id: ctx.user_id().unwrap_or_default().to_string(),
+        session_id: ctx.session_id().unwrap_or_default().to_string(),
+    };
+    let Ok(json) = serde_json::to_string(&entry) else {
+        return;
+    };
+    let path = task_scope_path(&state.parent_agent_id, &scope_key(&entry.namespace));
+    // Registration runs on every task read *and* write (as in Java), so skip it when this process
+    // already wrote this exact entry — otherwise every read would re-hit the store. The lock is
+    // released before any await below (never hold it across a suspension point).
+    let already_registered = state.registered_scopes.lock().unwrap().contains(&path);
+    if already_registered {
+        return;
+    }
+    let registry = registry_ctx();
+    let unchanged = state
+        .fs
+        .read(&registry, &path, 0, 0)
+        .await
+        .is_ok_and(|existing| existing.content == json);
+    if unchanged {
+        state.registered_scopes.lock().unwrap().insert(path);
+        return;
+    }
+    // Only remember success: a failed write must be retried on the next task write/read.
+    if write_scope_entry(state.fs.as_ref(), &path, &json).await {
+        state.registered_scopes.lock().unwrap().insert(path);
+    }
+}
+
+/// Every isolation domain whose task records must be swept, default domain first.
+///
+/// Mirrors `RemoteFilesystem#taskMaintenanceContexts`: entries whose stored namespace no longer
+/// matches what the current namespace factory derives (incompatible configuration) are ignored,
+/// and domains are de-duplicated by scope key.
+async fn maintenance_contexts(state: &RepoState) -> Vec<RuntimeContext> {
+    let default_ctx = RuntimeContext::default();
+    // A backend that ignores namespaces keeps every record in the default domain, so there is
+    // nothing to enumerate (and any leftover registry entry would be stale configuration).
+    if !namespace_is_applied(state.fs.as_ref()) {
+        return vec![default_ctx];
+    }
+    let registry = registry_ctx();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(scope_key(&namespace_for(state, &default_ctx)));
+    let mut contexts = vec![default_ctx];
+
+    let dir = task_scopes_dir(&state.parent_agent_id);
+    let files = match state.fs.glob(&registry, "*.json", &dir).await {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::debug!("Task-scope registry unavailable at {dir}: {e}");
+            return contexts;
+        }
+    };
+    for fi in files {
+        if fi.is_directory {
+            continue;
+        }
+        let Ok(data) = state.fs.read(&registry, &fi.path, 0, 0).await else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<TaskScopeEntry>(&data.content) else {
+            continue;
+        };
+        // Java rebuilds the context from the stored ids and re-derives the namespace, dropping
+        // entries written under a different factory/configuration.
+        let ctx = RuntimeContext::default()
+            .with_user_id(entry.user_id.clone())
+            .with_session_id(entry.session_id.clone());
+        if namespace_for(state, &ctx) != entry.namespace {
+            continue;
+        }
+        if !seen.insert(scope_key(&entry.namespace)) {
+            continue;
+        }
+        contexts.push(ctx);
+    }
+    contexts
+}
+
+/// Picks the context used to write back a record found in `domain`.
+///
+/// The in-memory capture from `put_task` is preferred when it belongs to the same domain (it may
+/// carry extra metadata), but it is never allowed to redirect a write into another namespace.
+fn write_back_context(
+    state: &RepoState,
+    domain: &RuntimeContext,
+    local_key: &str,
+) -> RuntimeContext {
+    let cached = {
+        let contexts = state.local_contexts.lock().unwrap();
+        contexts.get(local_key).map(|(_, rc)| rc.clone())
+    };
+    match cached {
+        Some(rc) if namespace_for(state, &rc) == namespace_for(state, domain) => rc,
+        _ => domain.clone(),
+    }
 }
 
 async fn read_records(
@@ -846,49 +1145,53 @@ async fn heartbeat_once(state: &RepoState) {
 /// remote endpoint rather than by this node's heartbeat. Safe to run concurrently on several
 /// nodes — the write is idempotent and last-writer-wins is acceptable for an already-orphaned task.
 async fn sweep_once(state: &RepoState, orphan_timeout: Duration, sweep_time_ms: u64) {
-    let ctx = RuntimeContext::default();
-    let cutoff_ms = sweep_time_ms.saturating_sub(orphan_timeout.as_millis().min(u64::MAX as u128) as u64);
-    let records = read_all_records(state, &ctx).await;
-    for (task_id, rec) in records {
-        if rec.status.is_terminal() || rec.is_agent_protocol_transport() {
-            continue;
+    let timeout_ms = orphan_timeout.as_millis().min(u64::MAX as u128) as u64;
+    let cutoff_ms = sweep_time_ms.saturating_sub(timeout_ms);
+    // Sweep every registered isolation domain (plus the default one), each with its own context,
+    // so a record written under a user's namespace is read — and written back — in that same
+    // namespace. A single default-domain pass silently missed every isolated record.
+    for domain in maintenance_contexts(state).await {
+        let records = read_all_records(state, &domain).await;
+        for (task_id, rec) in records {
+            if rec.status.is_terminal() || rec.is_agent_protocol_transport() {
+                continue;
+            }
+            // A task is stale as soon as it reaches the timeout boundary.
+            if rec.last_updated_at > cutoff_ms {
+                continue;
+            }
+            let sid = rec.parent_session_id.clone();
+            // Skip when this node still has an active local future — the heartbeat is live.
+            let key = format!("{sid}:{task_id}");
+            let live = {
+                let tasks = state.local_tasks.lock().unwrap();
+                tasks.get(&key).map(|t| !t.is_completed()).unwrap_or(false)
+            };
+            if live {
+                continue;
+            }
+            // The write-back context must belong to the domain the record was found in; the
+            // in-memory capture is only a fast path, never a redirect into another namespace.
+            let update_ctx = write_back_context(state, &domain, &key);
+            let stale_secs = sweep_time_ms.saturating_sub(rec.last_updated_at) / 1000;
+            tracing::warn!(
+                "Orphaned task {task_id} (session {sid}) last updated {stale_secs}s ago, marking FAILED"
+            );
+            update_record_status(
+                state.fs.as_ref(),
+                &update_ctx,
+                &state.parent_agent_id,
+                &sid,
+                &task_id,
+                TaskStatus::Failed,
+                None,
+                Some(format!(
+                    "executor lost: no heartbeat for {stale_secs} seconds (last updated: {})",
+                    rec.last_updated_at
+                )),
+            )
+            .await;
         }
-        // A task is stale as soon as it reaches the timeout boundary.
-        if rec.last_updated_at > cutoff_ms {
-            continue;
-        }
-        let sid = rec.parent_session_id.clone();
-        // Skip when this node still has an active local future — the heartbeat is live.
-        let key = format!("{sid}:{task_id}");
-        let live = {
-            let tasks = state.local_tasks.lock().unwrap();
-            tasks.get(&key).map(|t| !t.is_completed()).unwrap_or(false)
-        };
-        if live {
-            continue;
-        }
-        let update_ctx = {
-            let contexts = state.local_contexts.lock().unwrap();
-            contexts.get(&key).map(|(_, rc)| rc.clone()).unwrap_or_else(RuntimeContext::default)
-        };
-        let stale_secs = sweep_time_ms.saturating_sub(rec.last_updated_at) / 1000;
-        tracing::warn!(
-            "Orphaned task {task_id} (session {sid}) last updated {stale_secs}s ago, marking FAILED"
-        );
-        update_record_status(
-            state.fs.as_ref(),
-            &update_ctx,
-            &state.parent_agent_id,
-            &sid,
-            &task_id,
-            TaskStatus::Failed,
-            None,
-            Some(format!(
-                "executor lost: no heartbeat for {stale_secs} seconds (last updated: {})",
-                rec.last_updated_at
-            )),
-        )
-        .await;
     }
 }
 
@@ -938,7 +1241,7 @@ fn fire_callback(
 mod tests {
     use super::*;
     use crate::agent::subagent::protocol::RemoteConfirmDecision;
-    use crate::filesystem::LocalFilesystem;
+    use crate::filesystem::{FileData, FileInfo, GrepMatch, LocalFilesystem};
     use super::super::protocol_client::RemoteTaskStatus;
 
     fn temp_fs(tag: &str) -> (std::path::PathBuf, Arc<dyn Filesystem>) {
@@ -1419,6 +1722,352 @@ mod tests {
         assert_eq!(rec.status, TaskStatus::Cancelled);
         assert!(rec.cancel_requested);
         assert_eq!(transport.cancelled.lock().unwrap().as_slice(), ["t-cancel"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- task-scope registry (durable isolation domains) ------------------
+
+    /// `LocalFilesystem` wrapper that prefixes every path with the isolation namespace derived
+    /// from the context, mirroring what `RemoteFilesystem` does with a `NamespaceFactory`.
+    /// Without it the local backend ignores the context, so a write-back into the wrong domain
+    /// would land in the same file and the test could not tell the difference.
+    ///
+    /// Paths in and out are namespace-relative, like the store-backed backend's.
+    struct NamespacedLocalFs {
+        inner: LocalFilesystem,
+    }
+
+    impl NamespacedLocalFs {
+        fn new(root: impl Into<std::path::PathBuf>) -> Self {
+            Self { inner: LocalFilesystem::sandboxed(root) }
+        }
+
+        fn prefix(ctx: &RuntimeContext) -> String {
+            let ns = IsolationScope::User.namespace(ctx.user_id(), ctx.session_id());
+            if ns.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", ns.join("/"))
+            }
+        }
+
+        fn scoped(ctx: &RuntimeContext, path: &str) -> String {
+            format!("{}{}", Self::prefix(ctx), path.trim_start_matches('/'))
+        }
+
+        fn unscoped(ctx: &RuntimeContext, path: &str) -> String {
+            let ns = Self::prefix(ctx);
+            let normalized = if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("/{path}")
+            };
+            if ns.is_empty() {
+                return normalized;
+            }
+            let prefix = format!("/{}", ns.trim_end_matches('/'));
+            normalized
+                .strip_prefix(&prefix)
+                .map(str::to_string)
+                .unwrap_or(normalized)
+        }
+
+        fn unscope_all(ctx: &RuntimeContext, mut infos: Vec<FileInfo>) -> Vec<FileInfo> {
+            for info in &mut infos {
+                info.path = Self::unscoped(ctx, &info.path);
+            }
+            infos
+        }
+    }
+
+    #[async_trait]
+    impl Filesystem for NamespacedLocalFs {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        /// Reported as `Remote` so the repository treats this backend as namespace-aware, the way
+        /// a real `RemoteFilesystem` is. A `Local` kind deliberately maps every context to the
+        /// default domain (local disk applies no namespace).
+        fn kind(&self) -> FilesystemKind {
+            FilesystemKind::Remote
+        }
+
+        async fn ls(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+        ) -> agentscope_core::error::Result<Vec<FileInfo>> {
+            let infos = self.inner.ls(ctx, &Self::scoped(ctx, path)).await?;
+            Ok(Self::unscope_all(ctx, infos))
+        }
+
+        async fn read(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+            offset: usize,
+            limit: usize,
+        ) -> agentscope_core::error::Result<FileData> {
+            self.inner
+                .read(ctx, &Self::scoped(ctx, path), offset, limit)
+                .await
+        }
+
+        async fn write(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+            content: &str,
+        ) -> agentscope_core::error::Result<()> {
+            self.inner.write(ctx, &Self::scoped(ctx, path), content).await
+        }
+
+        async fn edit(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+            old: &str,
+            new: &str,
+            replace_all: bool,
+        ) -> agentscope_core::error::Result<usize> {
+            self.inner
+                .edit(ctx, &Self::scoped(ctx, path), old, new, replace_all)
+                .await
+        }
+
+        async fn grep(
+            &self,
+            ctx: &RuntimeContext,
+            pattern: &str,
+            path: Option<&str>,
+            glob: Option<&str>,
+        ) -> agentscope_core::error::Result<Vec<GrepMatch>> {
+            let scoped = path.map(|p| Self::scoped(ctx, p));
+            self.inner.grep(ctx, pattern, scoped.as_deref(), glob).await
+        }
+
+        async fn glob(
+            &self,
+            ctx: &RuntimeContext,
+            pattern: &str,
+            path: &str,
+        ) -> agentscope_core::error::Result<Vec<FileInfo>> {
+            let infos = self
+                .inner
+                .glob(ctx, pattern, &Self::scoped(ctx, path))
+                .await?;
+            Ok(Self::unscope_all(ctx, infos))
+        }
+
+        async fn delete(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+        ) -> agentscope_core::error::Result<()> {
+            self.inner.delete(ctx, &Self::scoped(ctx, path)).await
+        }
+
+        async fn move_path(
+            &self,
+            ctx: &RuntimeContext,
+            from: &str,
+            to: &str,
+        ) -> agentscope_core::error::Result<()> {
+            self.inner
+                .move_path(ctx, &Self::scoped(ctx, from), &Self::scoped(ctx, to))
+                .await
+        }
+
+        async fn exists(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+        ) -> agentscope_core::error::Result<bool> {
+            self.inner.exists(ctx, &Self::scoped(ctx, path)).await
+        }
+    }
+
+    fn namespaced_fs(tag: &str) -> (std::path::PathBuf, Arc<dyn Filesystem>) {
+        let dir = std::env::temp_dir().join(format!("agentscope_ws_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs: Arc<dyn Filesystem> = Arc::new(NamespacedLocalFs::new(&dir));
+        (dir, fs)
+    }
+
+    fn user_ctx(user: &str, session: &str) -> RuntimeContext {
+        RuntimeContext::default().with_user_id(user).with_session_id(session)
+    }
+
+    /// Writes one stale `Running` record through the repository, which is what registers the
+    /// scope — the same path `put_task` uses.
+    async fn persist_stale(repo: &WorkspaceTaskRepository, ctx: &RuntimeContext, task_id: &str) {
+        let mut rec = TaskRecord::new(task_id, "sub1", "parent", "sess");
+        rec.status = TaskStatus::Running;
+        rec.last_updated_at = 1_000;
+        repo.persist_record(ctx, "sess", &rec).await;
+    }
+
+    async fn registry_entries(fs: &Arc<dyn Filesystem>) -> Vec<FileInfo> {
+        fs.glob(&registry_ctx(), "*.json", &task_scopes_dir("parent"))
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn scope_key_is_stable_filename_safe_and_namespace_distinct() {
+        // Java `scopeKey`: base64url without padding, one segment per namespace element.
+        assert_eq!(scope_key(&["alice".to_string()]), "YWxpY2U");
+        assert_eq!(
+            scope_key(&["users".to_string(), "alice".to_string()]),
+            "dXNlcnM.YWxpY2U"
+        );
+        // Deterministic across calls, and distinct namespaces never share a key.
+        assert_eq!(scope_key(&["alice".to_string()]), scope_key(&["alice".to_string()]));
+        assert_ne!(scope_key(&["alice".to_string()]), scope_key(&["bob".to_string()]));
+        // No path separators can leak out of a hostile segment.
+        for segment in ["a/b", "a\\b", "..", "x.y", "with space"] {
+            let key = scope_key(&[segment.to_string()]);
+            assert!(!key.contains('/'), "separator leaked from {segment:?}");
+            assert!(!key.contains('\\'), "separator leaked from {segment:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_registry_skips_the_default_domain() {
+        let (dir, fs) = namespaced_fs("scope_default");
+        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        persist_stale(&repo, &RuntimeContext::default(), "t1").await;
+
+        assert!(
+            registry_entries(&fs).await.is_empty(),
+            "default domain must not be registered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sweep_writes_back_to_the_original_user_domain_after_restart() {
+        let (dir, fs) = namespaced_fs("scope_restart");
+        let alice = user_ctx("alice", "sess");
+        let path = tasks_path("parent", "sess");
+
+        let first = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        persist_stale(&first, &alice, "t1").await;
+        assert_eq!(
+            read_records(fs.as_ref(), &alice, &path).await["t1"].status,
+            TaskStatus::Running
+        );
+        // Registration is durable: one entry, in the agent's own registry directory.
+        let entries = registry_entries(&fs).await;
+        assert_eq!(entries.len(), 1, "expected one registered scope: {entries:?}");
+        drop(first);
+
+        // Simulated restart: a fresh repository, so `local_contexts` is empty and the durable
+        // registry is the only way to find the record's domain.
+        let second = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        assert!(second.state.local_contexts.lock().unwrap().is_empty());
+        second
+            .sweep_orphaned_tasks_with(Duration::from_secs(300), 600_000)
+            .await;
+
+        let after = read_records(fs.as_ref(), &alice, &path).await;
+        assert_eq!(after["t1"].status, TaskStatus::Failed);
+        assert!(after["t1"]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("executor lost"));
+        // The default domain was never touched: no stray record was created there.
+        assert!(
+            read_records(fs.as_ref(), &RuntimeContext::default(), &path)
+                .await
+                .is_empty(),
+            "sweep must not write into the default domain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sweep_still_covers_the_default_domain_without_registration() {
+        let (dir, fs) = namespaced_fs("scope_default_sweep");
+        let ctx = RuntimeContext::default();
+        let path = tasks_path("parent", "sess");
+        let first = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        persist_stale(&first, &ctx, "t1").await;
+        drop(first);
+
+        let second = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        second
+            .sweep_orphaned_tasks_with(Duration::from_secs(300), 600_000)
+            .await;
+
+        assert_eq!(
+            read_records(fs.as_ref(), &ctx, &path).await["t1"].status,
+            TaskStatus::Failed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_domains_are_swept_independently() {
+        let (dir, fs) = namespaced_fs("scope_multi");
+        let alice = user_ctx("alice", "sess");
+        let bob = user_ctx("bob", "sess");
+        let path = tasks_path("parent", "sess");
+
+        let first = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        persist_stale(&first, &alice, "t-alice").await;
+        persist_stale(&first, &bob, "t-bob").await;
+        drop(first);
+
+        let entries = registry_entries(&fs).await;
+        assert_eq!(entries.len(), 2, "both domains registered: {entries:?}");
+
+        let second = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        second
+            .sweep_orphaned_tasks_with(Duration::from_secs(300), 600_000)
+            .await;
+
+        let alice_records = read_records(fs.as_ref(), &alice, &path).await;
+        let bob_records = read_records(fs.as_ref(), &bob, &path).await;
+        assert_eq!(alice_records["t-alice"].status, TaskStatus::Failed);
+        assert_eq!(bob_records["t-bob"].status, TaskStatus::Failed);
+        // Each domain only ever sees (and repairs) its own records.
+        assert!(!alice_records.contains_key("t-bob"), "alice saw bob's record");
+        assert!(!bob_records.contains_key("t-alice"), "bob saw alice's record");
+        assert!(
+            read_records(fs.as_ref(), &RuntimeContext::default(), &path)
+                .await
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn registry_entries_from_another_namespace_factory_are_ignored() {
+        let (dir, fs) = namespaced_fs("scope_stale_entry");
+        // A registry entry written under a different namespace configuration.
+        let stale = TaskScopeEntry {
+            namespace: vec!["some-other-domain".to_string()],
+            user_id: "alice".to_string(),
+            session_id: "sess".to_string(),
+        };
+        let path = task_scope_path("parent", &scope_key(&stale.namespace));
+        let json = serde_json::to_string(&stale).unwrap();
+        assert!(write_scope_entry(fs.as_ref(), &path, &json).await);
+
+        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        let contexts = maintenance_contexts(&repo.state).await;
+        // Only the default domain survives: the stored namespace no longer matches the factory.
+        assert_eq!(contexts.len(), 1, "unexpected contexts: {contexts:?}");
+        assert_eq!(
+            namespace_for(&repo.state, &contexts[0]),
+            namespace_for(&repo.state, &RuntimeContext::default())
+        );
+        // The entry itself is left in place (harmless, and a config rollback revives it).
+        assert!(fs.exists(&registry_ctx(), &path).await.unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
