@@ -185,7 +185,7 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 |---|---|---|---|
 | seam 注入形式 | `fromProperties(..., InboundEventDeduplicator[, AccessTokenStore])` 三档重载 | `from_json(...)` + `from_json_with(..., &ChannelSeams)` | 避免每平台 3 个几乎相同的函数；两字段均可选，语义等价 |
 | token 缓存类型 | `InMemoryAccessTokenStore` | `InMemoryAccessTokenStore`（取代旧 `TokenCache`） | 接口化后不需要独立 `TokenCache` 类型；本 crate 无下游依赖方 |
-| weixin 工厂 | 本机 Java checkout（`main d7091070`）**已无** weixin 子模块 | `WeixinChannel::create(..., &ChannelSeams)` / `from_json_with` | §2.7 的 weixin Java 基线无法在本机复核，沿用早期快照记录 |
+| weixin 工厂 | Java **有** weixin 子模块（HEAD `16cb024ae` 主 20 文件 / 1955 非空行，测 9 文件 / 2323 非空行） | `WeixinChannel::create(..., &ChannelSeams)` / `from_json_with` | **2026-10-26 复评更正**：原文称「本机 checkout 已无 weixin 子模块」**不成立**（`git cat-file -e HEAD:.../channel-weixin` 成功）；子模块由 `63a6f6168`（2026-09-23）引入，一直在基线内。§2.7 的早期快照数字与实测一致（20 类 / 2323 测试非空行），可继续引用 |
 | `ChannelMediaMetadata` 文件名净化 | 正则 `\p{Cf}` | 显式 Cf 区间枚举 | Rust `std` 无 Unicode general-category API，不为此新增依赖 |
 | DingTalk 回调签名 | 仅 `HmacSHA256(appSecret, ts+"\n"+appSecret)` | 同上 + 可选经典 `token+SHA1` 兼容路径 | 默认不配置 `token` 即完全等同 Java |
 | DingTalk `check_url` 首次验证 | 返回空 200 | 返回加密 `success` | 依据 DingTalk 事件订阅协议；**尚未在真实租户验证** |

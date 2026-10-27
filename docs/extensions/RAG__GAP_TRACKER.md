@@ -138,7 +138,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | `core.embedding.ollama.OllamaTextEmbedding` | Ollama HTTP embedding | `embedding::ollama::OllamaTextEmbedding`（+ Builder，`POST /api/embed`） | 已完成 |
 | `core.embedding.openai.OpenAITextEmbedding` | OpenAI HTTP embedding | `embedding::openai::OpenAiTextEmbedding`（+ Builder，`POST /embeddings`） | 已完成 |
 | `core.embedding.EmbeddingUtils` | 超时/重试包装 | `embedding::utils::EmbeddingExecutionConfig`（超时 + `retry::RetryPolicy`）、`f32_slice_to_f64` | 已完成 |
-| `core.embedding.EmbeddingResponse` / `EmbeddingUsage` | embedding 响应 / token 用量 DTO | `embedding::{EmbeddingResponse, EmbeddingUsage, UsageListener}`（**Rust 侧新增**：Java 无这两个类，见 §7.3 勘误） | 已完成 |
+| `core.embedding.EmbeddingResponse` / `EmbeddingUsage` | embedding 响应 / token 用量 DTO | `embedding::{EmbeddingResponse, EmbeddingUsage, UsageListener}` | **已完成（字段集有差异，见 §7.6）**：Java 侧由 `5bfb36b44`（2026-10-20）新增，**确为 Java 已有**（§7.3 勘误 1 已更正） |
 | `core.rag.RAGMode`（core） | GENERIC / AGENTIC / NONE 模式枚举 | 无（core/harness 未迁移 hook 层，见 §4.2） | 待办 |
 | `core.rag.reader.TikaReader` / `PDFReader` / `WordReader` | 多格式文档读取（Tika / PDFBox / POI） | 无 | 设计决定（不迁移） |
 | `core.rag.reader.ImageReader` | 图片读取（**无第三方 JVM 依赖**，仅需 core 的 `ImageBlock`/`URLSource`，Rust core 已有） | `reader::ImageReader`（+ `SUPPORTED_FORMATS`） | 已完成 |
@@ -220,7 +220,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | reader 辅助 | `ReaderUtils`（MD5/SHA-256 docId + hex） | 已完成 | `src/reader/utils.rs`：`generate_doc_id(input, "MD5" 或 "SHA-256")`、`generate_doc_id_md5`、`generate_doc_id_sha256`、`bytes_to_hex`、`DocIdAlgorithm`（未知算法 → `InvalidArgument("<algo> algorithm not available")`，与 Java 同文案）；SHA-256 新增 `hash::sha256_hex`（复用已有 `sha2`，**未新增依赖**）；6 个测试（含独立算得的 MD5/SHA-256 金标向量） |
 | `TableFormat` | `TableFormat`（Word 表格 Markdown/JSON） | 设计决定（不迁移） | **依据**：`TableFormat` **仅**被未迁移的 `WordReader` 使用，无其它调用方；“不迁移”结论与 WordReader 一致。 |
 | embedding 辅助 | `EmbeddingUtils`（超时/重试包装） | 已完成 | `src/embedding/utils.rs::EmbeddingExecutionConfig`（`timeout` + `retry: RetryPolicy`）提供 `apply(model, provider, operation_type, op)`：每次尝试套 `tokio::time::timeout`，重试复用 `retry_async`（仅 transport / 429 / 5xx）；工厂 `build_transport` 强制 `max_retries=0` 以免与 transport 自身重试叠加；10 个测试 |
-| embedding 用量 DTO | `EmbeddingResponse` / `EmbeddingUsage`（token 用量 + 客户端耗时） | 已完成 | `embedding::{EmbeddingUsage, EmbeddingResponse, UsageListener}` + trait 默认方法 `embed_with_usage`（本地模型无需改）；各提供商从 wire 的 `usage` / `prompt_eval_count` 解析，`EmbeddingResponse.elapsed` 记录客户端耗时；`usage_listener` 在 builder 上可选注册。**§7.3 勘误：Java 仓库里并无 `EmbeddingUsage`/`EmbeddingResponse` 类，亦无 `usageListener`（全仓 `rg` 零命中），此项属 Rust 侧增值，不得再写作“Java 已有”** |
+| embedding 用量 DTO | `EmbeddingResponse` / `EmbeddingUsage`（token 用量 + 客户端耗时） | 已完成（**字段集有差异，见 §7.6**） | `embedding::{EmbeddingUsage, EmbeddingResponse, UsageListener}` + trait 默认方法 `embed_with_usage`（本地模型无需改）；各提供商从 wire 的 `usage` / `prompt_eval_count` 解析，`EmbeddingResponse.elapsed` 记录客户端耗时；`usage_listener` 在 builder 上可选注册。**§7.3 勘误 1 已更正（2026-10-26）**：Java **确有** `EmbeddingUsage`/`EmbeddingResponse`/`SimpleKnowledge.usageListener`（`5bfb36b44`，2026-10-20，已在旧基线内）；原「Rust 侧增值」表述作废 |
 
 ## 4. 项目状态与下一步
 
@@ -346,7 +346,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
   3. 因此模块既不能判 `已完成`（仍有 40 类中的 19 类未迁移），也不宜判 `待办`（已有 4/5 子模块落地且质量经得起逐类复核）。
   4. 附注：若采用**子模块级** rollup，则 `dify`/`ragflow`/`bailian`/`haystack` 各自可判 `已完成`，`simple` 判 `进行中`。
 
-> **历史快照提示（2026-10-26 注）**：本节（§6 全部）是 2026-10-22 的静态复核快照，其中“HTTP embedding 4 类零实现”“`ImageReader`/`ReaderUtils`/`EmbeddingUsage` 缺失”等结论**已被 §7 推翻**；且 `EmbeddingUsage`/`EmbeddingResponse` 在 Java 仓库中并不存在（见 §7.3）。引用计数时请以 §7.1 为准。
+> **历史快照提示（2026-10-26 注）**：本节（§6 全部）是 2026-10-22 的静态复核快照，其中“HTTP embedding 4 类零实现”“`ImageReader`/`ReaderUtils` 缺失”等结论**已被 §7 推翻**。原文另称「`EmbeddingUsage`/`EmbeddingResponse` 在 Java 仓库中并不存在」——该说法已于 2026-10-26 复评**证伪**（见 §7.3 勘误 1）。引用计数时请以 §7.1 为准。
 
 ## 7. 本轮交付记录（2026-10-26）
 
@@ -390,9 +390,9 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 
 | # | 原文 | 实际 | 处置 |
 |---|---|---|---|
-| 1 | `§2.3 / §6.4`：`core.embedding.{EmbeddingUsage,EmbeddingResponse}` 存在，`SimpleKnowledge` 有 `usageListener` | 对 **`D:\IdeaProjects\agentscope-java` 全仓 `rg "usageListener\|EmbeddingUsage\|EmbeddingResponse"` 零命中**（仅测试里出现 `Embedding` 字样的无关命中）；Java 既无这两个类，也无 `usageListener` | 已改 §2.3/§3.3：Rust 侧 `EmbeddingUsage`/`EmbeddingResponse`/`UsageListener` 标为 **Rust 增值**，不得再写“Java 已有” |
+| 1 | `§2.3 / §6.4`：`core.embedding.{EmbeddingUsage,EmbeddingResponse}` 存在，`SimpleKnowledge` 有 `usageListener` | **【已推翻·2026-10-26 更正】** 原文称「全仓 `rg` 零命中，Java 既无这两个类也无 `usageListener`」——**错误**。实测 Java HEAD `16cb024ae`：`core/embedding/EmbeddingUsage.java`（145 行）、`EmbeddingResponse.java`（106 行）均存在，`SimpleKnowledge.java:79/230` 有 `usageListener` 字段与回调；引入提交为 `5bfb36b44`（2026-10-20），且 `git merge-base --is-ancestor 5bfb36b44 ed8073259` = **true**（已在旧基线内）。 | **已改回**：§2.3/§3.3 恢复为「Java 已有，Rust 已迁移」；原「Rust 增值」表述作废。成因：当时 `rg` 搜的是 Java 工作区（可能停在旧提交）而非 `git show HEAD:`。详见 `JAVA_BASELINE_REVIEW_2026-10-26.md` §3.1 |
 | 2 | `§6.1`：`Java 路径 ... 实际为 E:\local-github\agentscope-java` | 本机该路径不存在，实际为 `D:\IdeaProjects\agentscope-java\...` | 本轮以 D 盘路径完成核对；下文引用 Java 均指 D 盘 |
-| 3 | `§2.3` 多处： "simple 子模块 33 类（rag 24 + embedding 9）" | `io.agentscope.core.embedding` 下**主代码只有 7 个 `.java`**：`EmbeddingException`/`EmbeddingModel`/`EmbeddingUtils` + `dashscope/{Text,MultiModal}` + `ollama/OllamaTextEmbedding` + `openai/OpenAITextEmbedding`。原“9 类”里的 2 类正是不存在的 `EmbeddingUsage`/`EmbeddingResponse` | 勘误：embedding 实为 **7 类**（全部已迁移）；simple 子模块实数应为 **31 类（rag 24 + embedding 7）**，含 core `rag` 引用则为 38 类；§2.3 标题的 33/40 采用旧口径，以本行为准 |
+| 3 | `§2.3` 多处： "simple 子模块 33 类（rag 24 + embedding 9）" | **【已推翻·2026-10-26 更正】** 原文称 `io.agentscope.core.embedding` 主代码只有 **7** 个 `.java`，且 `EmbeddingUsage`/`EmbeddingResponse` 「不存在」。实测（HEAD `16cb024ae`）：该目录主代码为 **9 类** = `EmbeddingException`/`EmbeddingModel`/`EmbeddingUtils`/`EmbeddingUsage`/`EmbeddingResponse` + `dashscope/{Text,MultiModal}` + `ollama/OllamaTextEmbedding` + `openai/OpenAITextEmbedding` | **已改回**：embedding 为 **9 类**（全部已迁移）；simple 子模块实数应为 **33 类（rag 24 + embedding 9）**，含 core `rag` 引用则为 40 类——即 §2.3 标题原口径正确，本条勘误作废 |
 
 ### 7.4 验证建议（交给主智能体）
 
@@ -409,4 +409,19 @@ cargo test  -p agentscope-extensions-rag
 1. **外部向量库 4 件**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`（**本轮未动**）。
 2. `ExternalApiReader`（P2）。
 3. `RagMode` / `GenericRAGHook` 落点待裁定（core/harness）。
+
+### 7.6 Java 基线漂移复评（2026-10-26 晚，Java HEAD `ed8073259` → `16cb024ae`）
+
+背景：Java 仓库刚 `git pull` 到 `16cb024ae`（共 27 个新提交）。对本模块的影响：
+
+- **新增漂移：0**。`ed8073259..16cb024ae` 区间内与本 crate 相关的只有 `07c5f3078`（`fix(rag): reuse and close the OpenAI embedding client`），它改的是 Java SDK 客户端的生命周期（懒初始化单客户端 + `AutoCloseable`），而 Rust 走自建 `HttpTransport` seam（`build_transport` 每次 build 建一个 `reqwest::Client`，`OpenAiTextEmbedding` 本身长期持有）→ **无需对齐**。
+- **但既有缺口仍在**（对齐对象均在旧基线内，本次复评才发现）：
+
+| # | 缺口 | Java | Rust | 优先级 |
+|---|---|---|---|---|
+| R1 | `EmbeddingUsage` 字段集不一致 | `inputTokens` / `totalTokens` / `time`（`time` = 客户端端到端**秒数**，在 usage 内） | `input_tokens` / `output_tokens` / `total_tokens`；耗时放在 `EmbeddingResponse.elapsed`（`Option<Duration>`） | P2 |
+| R2 | `EmbeddingModel::embed` 返回类型 | `Mono<EmbeddingResponse>`（breaking change） | `embed() -> Vec<f64>` + 新增默认方法 `embed_with_usage()`（刻意兼容取舍） | 设计决定（已标注） |
+| R3 | `SimpleKnowledge` 不向外透传 usage | builder 有 `usageListener`，`addDocuments` 与 `retrieve` 每次 embed 后都回调 | `SimpleKnowledge::new(model, store)` **无 listener 形参**，内部只调 `embed()`；listener 只能挂在模型上 | P1 |
+
+- 完整复评方法与反证命令见 `docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md`。
 
