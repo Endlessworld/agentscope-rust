@@ -471,14 +471,14 @@
 
 > 来源：`docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md` §4。
 > Java 基线：`16cb024ae`（`main`，已用 `git rev-parse HEAD` 确认）；旧基线 `ed8073259`。
-> 该复评初稿的 11 条 harness 侧缺口逐条回源码核实：**10 条成立、1 条部分成立（4.4）**，
-> 另更正 1 处行号（4.8）。
+> 该复评初稿的 11 条 harness 侧缺口逐条回源码核实：**11 条成立**（4.4 的报告措辞不准确，
+> 但确有一处真实的发布时机缺陷，已按方案 B 修复）；另更正 1 处行号（4.8）。
 
 | # | 模块 | 缺口 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|---|
 | 4.2 | subagent.task | orphan sweep 不按原始隔离域写回 | ✅ 已完成（`c7ffa4f`） | `task/workspace.rs`：新增持久化 scope 注册表 `harness/task-scopes/<agentId>/<key>.json`（`namespace`/`user_id`/`session_id`，`.tmp`+`move_path` 原子写）；`scopeKey` 与 Java 一致（各段 base64url 无填充 + `.` 拼接，超长退化 SHA-256 hex，无新依赖）；默认域不注册；`sweep_once` 改遍历「默认域 + 已注册域」逐域读写的；`local_contexts` 降级为进程内快路径，写回时校验域一致 |
 | 4.3 | skills | frontmatter 闭合围栏未要求独占一行 | ✅ 已完成（`95d40f2`，见 `SKILLS__GAP_TRACKER.md` P1-11） | `git.rs::split_frontmatter` 不再 `trim()` 行首：缩进的 `  ---` 属块标量正文；行尾空白仍允许 |
-| 4.4 | context | 溢出压缩后重试未判「输入已在上下文」 | ❌ **成立，但成因与报告不同（P0 待修）** | 报告的两条都不准确：「输入重复注入」不成立（`on_model_call` 内联改写，无二次追加路径）；「缺 isInContext 判定」也不适用（重试不单独传 input）。**真实缺陷**：一轮之内 `ctx.state` 是**上一轮快照**（`react_agent.rs:1402` 克隆本地 state，`:1509` 才 `*shared = state` 回写），而 `compact_overflow` 从 `state.context()` 取历史（`context_middleware.rs:277-296`），重试只拼「system + 压缩后的旧历史」（`:355-360`）→ **本轮输入（用户问题 + 本轮工具结果）在重试中被丢弃**；`:353` 的 `*guard.context_mut() = new_context` 随后会被 `:1509` 覆盖 → **压缩结果不落盘**。首轮溢出时 `history.is_empty()` → 直接放弃压缩并向上抛预算错误。现有测试 `a_budget_overflow_compacts_the_state_and_retries` 把 shared state 与输入设成同一份，恰好掩盖了该问题 |
+| 4.4 | context | 溢出压缩后重试未判「输入已在上下文」 | ✅ 已完成（本轮，见下） | 报告的**两条都不成立**：「输入重复注入」不存在（`on_model_call` 内联改写，无二次追加路径）；「缺 isInContext 判定」也不适用（重试不单独传 input）。进一步核对还推翻了本表上一版的「P0 判定」：`reasoning_phase` 在模型调用前已把整份本地 state 发布到共享 state（`react_agent.rs:1774`），调用后又由 `adopt_shared_context_compaction` 取回压缩结果，所以「丢本轮输入 / 压缩不落盘」并不成立。**真正残留的缺陷**是发布时机：`before_step` 把本轮 steer/inject 指引折进**本地** context 是在那次发布**之后**，于是溢出压缩读到的是「缺本轮指引」的历史 → 重试请求与随后的落盘都会丢指引。修法（方案 B 定向交接）：① core 在 `before_step` 之后、模型调用之前只交接 `context` 字段（`publish_context`），调用后按「与交接时是否一致」精确取回中间件的改写（`adopt_published_context`，替换原「变短/换头」启发式）；② `compact_overflow` 的历史源从共享快照改为**本次实际请求** `messages`，避免重复注入被 `tool_result_eviction` 等 `on_reasoning` 中间件已从请求中移除的内容。测试：`session_step_boundary::guidance_folded_at_the_step_boundary_is_visible_in_the_shared_state`、`context_middleware::the_fallback_compacts_the_request_it_was_handed`、`context_middleware::the_agent_keeps_the_current_turn_and_persists_the_compaction`（三者均已做反向验证） |
 | 4.5 | middleware.inbox | 提示注入形态与 Java 相反 | ✅ 已完成（`6fbc768`） | 每条 hint → 独立 `MsgRole::User` 通知（溯源句 + `synthetic`/`reminder_kind=background_event`/`source`/`hint_id` 元数据），并写回 `AgentState.context`；锁不跨 await |
 | 4.6 | middleware.at_path | `@path` 展开形态与截断提示 | ✅ 已完成（`7223b25`） | 追加独立预览块（保留原 blocks）、`<attached_file path="...">`、中和 `</attached_file>`、按行截断 1000 行 + Java 提示语、单条消息 64k 字符预算、仅展开 user 消息；`collect_text` 按 Java `getTextContent()` 用 `\n` 连接 |
 | 4.7 | skill.prompt | `<available_skills>` 默认仍 full-metadata | ✅ 已完成（`dbc3f02`） | `expose_all_metadata` 默认 `false`；slim 视图 `name`/`description` 取自 `AgentSkill` 字段且无条件输出（对齐 Java `metadataView`）；usage 文案换 Java 精简版；full 视图仍可 `with_parts(..., true)` |
@@ -491,7 +491,6 @@
 
 | # | 缺口 | 说明 |
 |---|---|---|
-| 4.4 | 溢出压缩重试丢本轮输入、压缩不落盘（**P0，见上表**） | 根因是「中间件看到的 `ctx.state` 落后于本轮本地 state」，不是缺 isInContext 判定。修法需先裁定：把 `on_model_call` 的历史源改为实际输入 `messages`（最小改动，解决丢输入），落盘则要让 core 在回合结束时接纳中间件的改写（或把压缩结果回传给 core） |
 | C1 | tool-call 参数完整性语义相反 | `1ac8c8304`/`131c3bd9a`：Java 标记 malformed 并**拒绝执行**；Rust `anthropic/parser.rs::malformed_tool_arguments_degrade_to_empty_input` 把畸形参数**降级为 `{}`** 并继续执行 |
 | C2 | progressive tool events | `db0b67eb8`：Rust 已有 `ToolCallStart/Delta/End`、`ToolResultStart/TextDelta/End`，但按批聚合后才发，无「单个工具完成即发」回调 |
 | C3 | `@Tool` proc-macro / `additionalProperties` | `7976a20d7`/`1aeb863c4`：无 `@Tool` 宏（既有 P0）；tool schema 无 `additionalProperties` 落点 |

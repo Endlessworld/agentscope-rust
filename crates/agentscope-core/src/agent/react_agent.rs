@@ -1789,6 +1789,14 @@ async fn reasoning_phase(
         }
     }
 
+    // `before_step` folds accepted `inject`/`steer` guidance into the *local* context after
+    // the turn snapshot published above. Hand the context the request is actually built from
+    // to the shared state before the model call: context middlewares read it there, and
+    // without this handoff an overflow compaction would summarize — and then durably
+    // replace — a history that is missing this step's guidance. Only `context` is handed
+    // over; the rest of the shared state already carries the loop's snapshot.
+    let published_context = publish_context(core, state);
+
     // Java prepends a fresh copy of the frozen `CallExecution.systemMsg` to every
     // reasoning request. The conversation state itself remains system-free.
     let mut messages = Vec::new();
@@ -1829,7 +1837,7 @@ async fn reasoning_phase(
         Err(e) => {
             // A budget-overflow compaction may have rewritten the shared history before the
             // model call failed; keep that reduction instead of restoring the oversized clone.
-            adopt_shared_context_compaction(core, state);
+            adopt_published_context(core, state, &published_context);
             // Keep the assistant message the model had already produced when the
             // call was interrupted, so the interrupted turn can reconcile its
             // dangling tool_use blocks instead of losing the response entirely
@@ -1844,10 +1852,10 @@ async fn reasoning_phase(
         }
     };
     // Context-management middleware (budget-overflow compaction) can rewrite the shared
-    // history *during* the model call. This loop runs on a private state clone, so adopt
-    // the shrink before appending the assistant message; otherwise the next iteration
-    // would publish the old oversized history back and compaction would be undone.
-    adopt_shared_context_compaction(core, state);
+    // history *during* the model call. This loop runs on a private state clone, so take the
+    // middleware's rewrite back before appending the assistant message; otherwise the next
+    // iteration would publish the old oversized history back and compaction would be undone.
+    adopt_published_context(core, state, &published_context);
     let mut final_msg = final_msg;
     // Tag the usage with the model that reported it. Token accounting anchors on this
     // number, and a model switch changes the tokenizer, so a mismatch must invalidate it.
@@ -1862,17 +1870,29 @@ async fn reasoning_phase(
     Ok(final_msg)
 }
 
-/// Adopts a history reduction made by a context-management middleware during a model call.
+/// Hands the loop's conversation to the shared state and returns what was published.
 ///
-/// Only a rewrite the loop did not make itself is adopted: the loop never shrinks its
-/// private clone and never replaces the first message, so a shorter history or a new
-/// head can only come from a middleware that compacted the shared state. Tasks, plan
-/// mode and permission state stay owned by the loop.
-fn adopt_shared_context_compaction(core: &Arc<AgentCore>, state: &mut AgentState) {
+/// The shared state is the handle `RuntimeContext` exposes to middlewares. The loop runs
+/// on a private clone, so without this handoff a middleware that reads `ctx.state.context()`
+/// (overflow compaction) would see a history missing anything appended after the turn
+/// snapshot — accepted guidance, for instance. Only the conversation is handed over: task,
+/// plan-mode and permission state belong to the tools and are not overwritten here.
+fn publish_context(core: &Arc<AgentCore>, state: &AgentState) -> Vec<Msg> {
+    let context = state.context().to_vec();
+    core.state.lock().unwrap().context = context.clone();
+    context
+}
+
+/// Takes back a conversation rewrite a middleware made during the model call.
+///
+/// The loop publishes its context right before the call and compares it afterwards, so any
+/// difference is a middleware rewrite (overflow compaction, proactive compaction). Adopting
+/// it keeps the next iteration and the next turn on the compacted history instead of
+/// republishing the oversized one. `published` is exactly what the middlewares were handed;
+/// an unchanged context leaves the loop's clone untouched.
+fn adopt_published_context(core: &Arc<AgentCore>, state: &mut AgentState, published: &[Msg]) {
     let shared = core.state.lock().unwrap();
-    let head_changed = shared.context().first().map(|message| &message.id)
-        != state.context().first().map(|message| &message.id);
-    if shared.context().len() < state.context().len() || head_changed {
+    if shared.context() != published {
         state.context = shared.context().to_vec();
         if !shared.summary().is_empty() {
             state.set_summary(shared.summary().to_string());

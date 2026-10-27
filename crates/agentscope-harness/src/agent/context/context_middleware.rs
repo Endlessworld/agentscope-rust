@@ -261,10 +261,13 @@ impl Middleware for ContextMiddleware {
 
 /// Compacts the conversation after a local budget miss.
 ///
-/// The durable state is rewritten when the call runs inside an agent (ACP does), so the
-/// next iteration and the next turn start from the compacted history. Ad-hoc calls
-/// without shared state are compacted locally for the retry only. Returns the messages
-/// to compile again, or `None` when no compaction could free context.
+/// The history that is compacted is the request actually being compiled, not a snapshot of
+/// the shared state: `on_reasoning` middlewares (tool-result eviction) may already have
+/// rewritten it, and the retry must not resurrect what they removed. When the call runs
+/// inside an agent the compacted history is also written back to the shared state, so the
+/// next iteration and the next turn start from it; an ad-hoc call without shared state is
+/// compacted locally for the retry only. Returns the messages to compile again, or `None`
+/// when no compaction could free context.
 async fn compact_overflow(
     state: Option<Arc<std::sync::Mutex<agentscope_core::state::AgentState>>>,
     messages: &[Msg],
@@ -274,25 +277,16 @@ async fn compact_overflow(
     recorder: Option<&Arc<agentscope_core::session::SessionRecorder>>,
     summary_only: bool,
 ) -> Option<OverflowCompacted> {
-    let (history, effective_session): (Vec<Msg>, String) = match &state {
-        Some(state) => {
-            let guard = state.lock().unwrap();
-            let history = guard
-                .context()
-                .iter()
-                .filter(|message| message.role != MsgRole::System)
-                .cloned()
-                .collect();
-            (history, guard.session_id().to_string())
-        }
-        None => (
-            messages
-                .iter()
-                .filter(|message| message.role != MsgRole::System)
-                .cloned()
-                .collect(),
-            session_id.to_string(),
-        ),
+    let history: Vec<Msg> = messages
+        .iter()
+        .filter(|message| message.role != MsgRole::System)
+        .cloned()
+        .collect();
+    // The session id still comes from the durable state when one is attached; ad-hoc calls
+    // fall back to the runtime context.
+    let effective_session = match &state {
+        Some(state) => state.lock().unwrap().session_id().to_string(),
+        None => session_id.to_string(),
     };
     if history.is_empty() {
         return None;
@@ -477,8 +471,20 @@ mod tests {
         messages: Vec<Msg>,
         ctx: RuntimeContext,
     ) -> Vec<crate::Result<agentscope_core::event::AgentEvent>> {
+        run_chain(vec![Box::new(middleware)], model, messages, ctx).await
+    }
+
+    /// Drives a chain of middlewares (outermost first) over the final model call.
+    async fn run_chain(
+        middlewares: Vec<Box<dyn Middleware>>,
+        model: Arc<dyn Model>,
+        messages: Vec<Msg>,
+        ctx: RuntimeContext,
+    ) -> Vec<crate::Result<agentscope_core::event::AgentEvent>> {
         let mut chain = MiddlewareChain::new();
-        chain.add(Box::new(middleware));
+        for middleware in middlewares {
+            chain.add(middleware);
+        }
         let input = ModelCallInput::new(messages, Vec::new(), GenerateOptions::default(), model);
         let core: Next<ModelCallInput> = Box::new(|input: ModelCallInput| -> EventStream {
             let model = Arc::clone(&input.model);
@@ -608,5 +614,204 @@ mod tests {
         assert_eq!(middleware.active_points(), vec![ExtensionPoint::OnModelCall]);
         // The instruction is registered even without a dynamic source.
         assert!(!middleware.pipeline().sources().is_empty());
+    }
+
+    /// A model that answers with a text reply, so tests can drive the real agent loop.
+    struct AnsweringStubModel {
+        window: usize,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Model for AnsweringStubModel {
+        fn stream(
+            &self,
+            messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, crate::Result<ChatResponse>> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(messages.iter().map(|m| m.text_content()).collect());
+            let response = ChatResponse::builder()
+                .content(vec![agentscope_core::message::ContentBlock::Text(
+                    agentscope_core::message::TextBlock::new("ack"),
+                )])
+                .build();
+            Box::pin(futures::stream::once(async move { Ok(response) }))
+        }
+
+        fn model_name(&self) -> &str {
+            "answering-stub"
+        }
+
+        fn context_window_size(&self) -> usize {
+            self.window
+        }
+    }
+
+    /// An outer model-call middleware that rewrites the request without touching the shared
+    /// state — the shape `ToolResultEvictionMiddleware` produces at the reasoning boundary.
+    struct DropFromRequest(&'static str);
+
+    impl Middleware for DropFromRequest {
+        fn on_model_call(
+            &self,
+            _ctx: &RuntimeContext,
+            mut input: ModelCallInput,
+            next: Next<ModelCallInput>,
+        ) -> EventStream {
+            input
+                .messages
+                .retain(|message| !message.text_content().contains(self.0));
+            next(input)
+        }
+
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnModelCall]
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fallback_compacts_the_request_it_was_handed() {
+        // The shared state still carries every message, but an earlier middleware already
+        // dropped one from the request. Compacting the state snapshot would resurrect it in
+        // the retried request (oversized again, and reintroducing content the agent evicted).
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(StubModel {
+            window: 1_000,
+            seen: Arc::clone(&seen),
+        });
+
+        let state = Arc::new(Mutex::new(agentscope_core::state::AgentState::default()));
+        {
+            let mut guard = state.lock().unwrap();
+            for i in 0..5 {
+                guard.context_mut().push(Msg::user(format!(
+                    "turn {i}: {}",
+                    "x".repeat(1_200)
+                )));
+            }
+            guard.context_mut().push(Msg::user(format!(
+                "PRUNED-TAIL: {}",
+                "x".repeat(1_200)
+            )));
+        }
+        let messages: Vec<Msg> = state
+            .lock()
+            .unwrap()
+            .context()
+            .iter()
+            .filter(|message| !message.text_content().contains("PRUNED-TAIL"))
+            .cloned()
+            .collect();
+        let ctx = RuntimeContext {
+            state: Some(Arc::clone(&state)),
+            ..RuntimeContext::new()
+                .with_user_id("alice")
+                .with_session_id("s1")
+                .with_agent_id("agent")
+        };
+
+        let middleware = ContextMiddleware::new(pipeline(false)).with_overflow_compaction(
+            Arc::new(ConversationCompactor::new(None)),
+            CompactionConfig::builder().keep_messages(1).build(),
+        );
+        let events = run_chain(
+            vec![Box::new(DropFromRequest("PRUNED-TAIL")), Box::new(middleware)],
+            model,
+            messages,
+            ctx,
+        )
+        .await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+
+        let rendered = seen.lock().unwrap().join("\n");
+        assert!(rendered.contains("summary unavailable"), "{rendered}");
+        assert!(rendered.contains("turn 4:"), "{rendered}");
+        assert!(
+            !rendered.contains("PRUNED-TAIL"),
+            "the retry must not resurrect a message the request already dropped: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_keeps_the_current_turn_and_persists_the_compaction() {
+        use agentscope_core::agent::Agent as _;
+
+        // Reproduction of the real path: prior turns already exceed the window, and the
+        // question of *this* turn is the tail compaction must preserve. The loop runs on a
+        // private state clone, so this only holds if the loop hands the conversation over
+        // before the model call and takes the rewrite back afterwards.
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(AnsweringStubModel {
+            window: 1_000,
+            requests: Arc::clone(&requests),
+        });
+
+        let mut seeded = agentscope_core::state::AgentState::default();
+        for i in 0..6 {
+            seeded.context_mut().push(Msg::user(format!(
+                "turn {i}: {}",
+                "x".repeat(1_200)
+            )));
+        }
+
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(
+            ContextMiddleware::new(pipeline(false)).with_overflow_compaction(
+                Arc::new(ConversationCompactor::new(None)),
+                CompactionConfig::builder().keep_messages(1).build(),
+            ),
+        ));
+        let agent = agentscope_core::agent::ReActAgent::builder()
+            .name("overflow-e2e")
+            .model(model)
+            .middleware_chain(chain)
+            .state(seeded)
+            .build()
+            .unwrap();
+        let state = agent.state_handle();
+
+        agent
+            .call(vec![Msg::user("CURRENT QUESTION")])
+            .await
+            .expect("the retried request must succeed");
+
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "one compaction, one retried model call");
+            let rendered = requests[0].join("\n");
+            assert!(rendered.contains("CURRENT QUESTION"), "{rendered}");
+            assert!(rendered.contains("summary unavailable"), "{rendered}");
+            assert!(!rendered.contains("turn 0:"), "{rendered}");
+        }
+
+        // The rewrite was taken back: the customary end-of-turn commit must not restore the
+        // oversized history, and the next turn must not recompact from scratch.
+        {
+            let guard = state.lock().unwrap();
+            let persisted: String = guard
+                .context()
+                .iter()
+                .map(|message| message.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(persisted.contains("summary unavailable"), "{persisted}");
+            assert!(!persisted.contains("turn 0:"), "{persisted}");
+        }
+
+        agent
+            .call(vec![Msg::user("SECOND QUESTION")])
+            .await
+            .expect("the second turn must succeed");
+        let requests = requests.lock().unwrap();
+        let last = requests.last().unwrap().join("\n");
+        assert!(last.contains("SECOND QUESTION"), "{last}");
+        assert!(last.contains("summary unavailable"), "{last}");
+        assert!(
+            !last.contains("turn 0:"),
+            "the compacted history must be what the next turn starts from: {last}"
+        );
     }
 }

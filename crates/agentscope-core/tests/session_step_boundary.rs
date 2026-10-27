@@ -8,8 +8,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentscope_core::agent::{Extensions, ReActAgent, StreamOptions};
+use agentscope_core::agent::{Extensions, ReActAgent, RuntimeContext, StreamOptions};
 use agentscope_core::message::{ContentBlock, Msg, ToolUseBlock};
+use agentscope_core::middleware::{
+    EventStream, ExtensionPoint, Middleware, MiddlewareChain, ModelCallInput, Next,
+};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::session::{
     AtomicSessionStorage, Command, JournalSessionLog, MemorySessionStorage, SessionExecution,
@@ -179,6 +182,102 @@ async fn every_reasoning_iteration_opens_one_step_and_summarizing_opens_none() {
         count(&events, "step/end"),
         1,
         "each new step closes the previous one"
+    );
+}
+
+/// Records the conversation the shared state exposes at every model call.
+///
+/// The loop runs on a private state clone; what `RuntimeContext::state` points at is only
+/// what the loop has handed over. A context middleware (overflow compaction) reads the
+/// history there, so it must include everything the request itself carries.
+struct SharedStateProbe {
+    seen: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl Middleware for SharedStateProbe {
+    fn on_model_call(
+        &self,
+        ctx: &RuntimeContext,
+        input: ModelCallInput,
+        next: Next<ModelCallInput>,
+    ) -> EventStream {
+        if let Some(state) = ctx.state.as_ref() {
+            let texts: Vec<String> = state
+                .lock()
+                .unwrap()
+                .context()
+                .iter()
+                .map(text_of)
+                .collect();
+            self.seen.lock().unwrap().push(texts);
+        }
+        next(input)
+    }
+
+    fn active_points(&self) -> Vec<ExtensionPoint> {
+        vec![ExtensionPoint::OnModelCall]
+    }
+}
+
+#[tokio::test]
+async fn guidance_folded_at_the_step_boundary_is_visible_in_the_shared_state() {
+    let log = journal().await;
+    let inbox = submit_turn(&log).await;
+    let steer = Command::new(
+        "c2",
+        "steer",
+        Some("t1".to_string()),
+        vec![Msg::user("guidance")],
+        Vec::new(),
+    )
+    .unwrap();
+    inbox.accept(&steer).await.unwrap();
+
+    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        .await
+        .unwrap();
+    let mut execution = SessionExecution::new(
+        Arc::clone(&log),
+        inbox.snapshot().await.unwrap().commands[0].clone(),
+    );
+    execution.prepare(&recorder).await.unwrap();
+    let inputs = execution.inputs().to_vec();
+
+    let mut state = AgentState::default();
+    for message in &inputs {
+        state.context_mut().push(message.clone());
+    }
+    recorder.start(&inputs, &state).await.unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(SharedStateProbe {
+        seen: Arc::clone(&seen),
+    }));
+    let agent = ReActAgent::builder()
+        .model(Arc::new(QuietModel {
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        }))
+        .todo_tool(false)
+        .middleware_chain(chain)
+        .build()
+        .unwrap();
+
+    let mut extensions = Extensions::new();
+    extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::new(recorder));
+    extensions.insert(EXECUTION_CONTEXT_KEY, execution);
+    drain(&agent, inputs, extensions).await;
+
+    // Guidance is folded in at `before_step`, i.e. after the turn snapshot. A middleware
+    // reading `ctx.state` must still see it: the overflow-compaction retry compacts that
+    // history, and a stale snapshot would silently drop the guidance from the retry (and
+    // then from the durable state).
+    let seen = seen.lock().unwrap();
+    let first = seen.first().expect("one probe per model call");
+    assert!(
+        first.iter().any(|text| text.contains("guidance")),
+        "the shared state must carry the guidance folded in at the step boundary, got {first:?}"
     );
 }
 

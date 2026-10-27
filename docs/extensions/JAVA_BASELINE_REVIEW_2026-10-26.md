@@ -87,17 +87,16 @@ $ git cat-file -e ed8073259:.../core/embedding/EmbeddingUsage.java   -> EXISTS
 | 4.11 | harness.memory | compaction 摘要提示远简于 Java | `041ce1707`：`DEFAULT_SUMMARY_PROMPT` 7 段（含 `USER PREFERENCES AND CORRECTIONS`、`COMMANDS AND ERRORS`、`extraction_rules`、`secrecy`），并新增「保留仍生效约束原文；被撤销决定标 superseded」 | `memory/compaction.rs::DEFAULT_SUMMARY_PROMPT` 只有 4 段（`SESSION INTENT`/`SUMMARY`/`ARTIFACTS`/`NEXT STEPS`），无 extraction_rules、无 secrecy、无 superseded 规则 | P1 |
 | 4.12 | harness.memory | 后台 flush/consolidation 上下文回放 | `bb4dbc753`（旧基线内）：Reactor 需 `contextWrite(contextView)` 回放 | **非缺口**：Rust 用 `RuntimeContext` 显式传参（`memory_flush.rs` 已 `ctx.clone()`），无隐式上下文问题 | — |
 
-> **落地状态（2026-10-27）**：上表 4.1–4.3、4.5–4.11 已实现并验证，逐项修法与反向验证见
+> **落地状态（2026-10-27）**：上表 4.1–4.11 已全部实现并验证，逐项修法与反向验证见
 > `docs/MIGRATION_GAP_TRACKER.md` §3.15 与 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.1.7。
-> **4.4 未修**，且复评后深挖发现成因与本表描述不同（见下）。
 > 三处复核更正：
-> - **4.4 成因不同、影响更重（P0）**：报告的两条都不成立 —— 「输入重复注入」不存在（`on_model_call`
->   内联改写消息列表），「缺 isInContext 判定」也不适用（Rust 重试不单独传 input）。真实缺陷是
->   **中间件看到的 `ctx.state` 落后于本轮本地 state**：`react_agent.rs:1402` 克隆一份本地 state 跑循环，
->   `:1509` 才回写共享；而 `compact_overflow` 从 `state.context()` 取历史（`context_middleware.rs:277-296`），
->   重试只拼「system + 压缩后的旧历史」（`:355-360`）→ **本轮输入（用户问题 + 本轮工具结果）被丢弃**；
->   `:353` 的写回随后被 `:1509` 覆盖 → **压缩结果不落盘**。首轮溢出时 `history.is_empty()` 直接放弃。
->   现有测试把 shared state 与输入设成同一份，掩盖了该问题。
+> - **4.4 成因与报告不同（已修）**：报告的两条都不成立 —— 「输入重复注入」不存在（`on_model_call`
+>   内联改写消息列表），「缺 isInContext 判定」也不适用（Rust 重试不单独传 input）。进一步核对还
+>   推翻了本文件上一版给出的「P0」判定：`reasoning_phase` 在模型调用前已把整份本地 state 发布到共享
+>   state（`react_agent.rs:1774`），调用后又把压缩结果取回（`adopt_shared_context_compaction`），
+>   因此「丢本轮输入 / 压缩不落盘」并不成立。**真正残留的是发布时机**：`before_step` 把本轮
+>   steer/inject 指引折进本地 context 发生在发布**之后**，溢出压缩读到的历史缺本轮指引，重试与落盘
+>   都会丢它。修法与验证见 `MIGRATION_GAP_TRACKER.md` §3.15 的 4.4 行（方案 B 定向交接）。
 > - **4.8 行号更正**：`harness_agent.rs:1889-1892` → 实际为 **`:1900-1913`**（`plan: String::new()`
 >   在 `:1909`）。
 > - **4.8 措辞更正**：严格说是「模型侧提示为零」，而非「plan mode 完全缺失」——工具侧拦截
