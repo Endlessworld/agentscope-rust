@@ -2,7 +2,8 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -72,6 +73,42 @@ impl HttpTransport for RecordingTransport {
             .expect("recording transport poisoned")
             .pop_front();
         Ok(canned.unwrap_or_else(|| PreparedResponse::new(200, "{}")))
+    }
+}
+
+/// An [`HttpTransport`] that supports timeout reconfiguration (unlike [`RecordingTransport`]) and
+/// records the timeout it was last reconfigured with.
+///
+/// Reconfigured copies share the same cell, so a test can inspect the timeout through the handle it
+/// originally handed to the client. No network access happens.
+#[derive(Debug, Clone, Default)]
+pub struct TimeoutAwareTransport {
+    timeout: Arc<Mutex<Option<Duration>>>,
+}
+
+impl TimeoutAwareTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The last timeout applied via [`HttpTransport::with_response_timeout`].
+    pub fn timeout(&self) -> Option<Duration> {
+        *self.timeout.lock().expect("timeout transport poisoned")
+    }
+}
+
+#[async_trait]
+impl HttpTransport for TimeoutAwareTransport {
+    async fn execute(&self, _request: PreparedRequest) -> Result<PreparedResponse> {
+        Ok(PreparedResponse::new(200, "{}"))
+    }
+
+    fn with_response_timeout(&self, timeout: Duration) -> Option<Arc<dyn HttpTransport>> {
+        if timeout.is_zero() {
+            return None;
+        }
+        *self.timeout.lock().expect("timeout transport poisoned") = Some(timeout);
+        Some(Arc::new(self.clone()))
     }
 }
 

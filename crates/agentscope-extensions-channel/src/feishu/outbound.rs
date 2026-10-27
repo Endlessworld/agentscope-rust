@@ -1,20 +1,27 @@
 //! Feishu outbound HTTP client: `POST /open-apis/im/v1/messages` request builders.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::OutboundAddress;
 use serde_json::{json, Value};
 
+use crate::common::http::{apply_response_timeout, ensure_positive_timeout};
 use crate::common::{
     parse_peer_target, AccessTokenProvider, ChannelError, HttpTransport, PreparedRequest, Result,
 };
+
+/// Default send timeout, mirroring the Java
+/// `FeishuOutboundClient.DEFAULT_RESPONSE_TIMEOUT = Duration.ofSeconds(10)`.
+pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Feishu outbound client built on the pluggable [`HttpTransport`] seam.
 pub struct FeishuOutboundClient {
     api_base: String,
     token_provider: Arc<dyn AccessTokenProvider>,
     transport: Arc<dyn HttpTransport>,
+    response_timeout: Duration,
 }
 
 impl FeishuOutboundClient {
@@ -27,7 +34,26 @@ impl FeishuOutboundClient {
             api_base: api_base.into(),
             token_provider,
             transport,
+            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
         }
+    }
+
+    /// Override the send timeout (Java's `responseTimeout` constructor parameter).
+    ///
+    /// Returns [`ChannelError::Config`] for a zero duration, mirroring the Java
+    /// `"responseTimeout must be positive"` guard. When the injected transport supports
+    /// reconfiguration (e.g. [`crate::common::ReqwestTransport`]) the timeout is applied to it;
+    /// otherwise it is recorded and left to the caller's transport.
+    pub fn with_response_timeout(mut self, timeout: Duration) -> Result<Self> {
+        ensure_positive_timeout(timeout)?;
+        self.transport = apply_response_timeout(self.transport.clone(), timeout);
+        self.response_timeout = timeout;
+        Ok(self)
+    }
+
+    /// The configured send timeout.
+    pub fn response_timeout(&self) -> Duration {
+        self.response_timeout
     }
 
     /// The `receive_id_type` used for both DIRECT and GROUP (we address by `chat_id`).
@@ -154,7 +180,7 @@ impl FeishuOutboundClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::testing::{RecordingTransport, StaticTokenProvider};
+    use crate::common::testing::{RecordingTransport, StaticTokenProvider, TimeoutAwareTransport};
     use crate::common::PreparedResponse;
 
     fn client(
@@ -256,5 +282,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "om_42");
+    }
+
+    #[test]
+    fn default_response_timeout_is_ten_seconds() {
+        let c = client(
+            Arc::new(RecordingTransport::new()),
+            Arc::new(StaticTokenProvider::new("tok")),
+        );
+        assert_eq!(c.response_timeout(), DEFAULT_RESPONSE_TIMEOUT);
+        assert_eq!(DEFAULT_RESPONSE_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn explicit_response_timeout_is_applied_to_a_reconfigurable_transport() {
+        let transport = Arc::new(TimeoutAwareTransport::new());
+        let c = FeishuOutboundClient::new(
+            "https://open.feishu.cn",
+            Arc::new(StaticTokenProvider::new("tok")),
+            transport.clone(),
+        )
+        .with_response_timeout(Duration::from_millis(750))
+        .unwrap();
+        assert_eq!(c.response_timeout(), Duration::from_millis(750));
+        assert_eq!(transport.timeout(), Some(Duration::from_millis(750)));
+    }
+
+    #[test]
+    fn explicit_response_timeout_is_recorded_for_a_non_reconfigurable_transport() {
+        let c = client(
+            Arc::new(RecordingTransport::new()),
+            Arc::new(StaticTokenProvider::new("tok")),
+        )
+        .with_response_timeout(Duration::from_secs(5))
+        .unwrap();
+        assert_eq!(c.response_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn zero_response_timeout_is_rejected() {
+        let c = client(
+            Arc::new(RecordingTransport::new()),
+            Arc::new(StaticTokenProvider::new("tok")),
+        );
+        let err = c
+            .with_response_timeout(Duration::ZERO)
+            .err()
+            .expect("zero must be rejected");
+        assert!(
+            err.to_string().contains("responseTimeout must be positive"),
+            "unexpected message: {err}"
+        );
     }
 }

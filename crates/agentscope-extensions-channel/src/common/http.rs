@@ -6,6 +6,7 @@
 //! [`ReqwestTransport`] is the production implementation; `common::testing::RecordingTransport`
 //! is the offline double used by tests.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,6 +16,18 @@ use super::error::{ChannelError, Result};
 /// Default per-request timeout, mirroring the Java `Duration.ofSeconds(10)` used by the token
 /// providers and the WeCom/Feishu/DingTalk send calls (GitHub uses 15 s).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reject a non-positive timeout, mirroring the Java guard
+/// `IllegalArgumentException("responseTimeout must be positive")` in `FeishuAccessTokenProvider`
+/// and `FeishuOutboundClient`. Rust's [`Duration`] is unsigned, so only zero can be rejected.
+pub(crate) fn ensure_positive_timeout(timeout: Duration) -> Result<()> {
+    if timeout.is_zero() {
+        return Err(ChannelError::Config(
+            "responseTimeout must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// HTTP verb used by the outbound clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,30 +112,75 @@ impl PreparedResponse {
 pub trait HttpTransport: Send + Sync {
     /// Send `request` and return the provider's response.
     async fn execute(&self, request: PreparedRequest) -> Result<PreparedResponse>;
+
+    /// Return a transport equivalent to `self` whose per-request timeout is `timeout`.
+    ///
+    /// The default implementation returns `None`, meaning "this transport cannot be
+    /// reconfigured" (e.g. an injected fake or a client owned elsewhere). Callers then keep the
+    /// transport they were given and treat the timeout as caller-owned configuration.
+    fn with_response_timeout(&self, _timeout: Duration) -> Option<Arc<dyn HttpTransport>> {
+        None
+    }
+}
+
+/// Reconfigure `transport` with `timeout` when it supports it, otherwise return it unchanged.
+pub(crate) fn apply_response_timeout(
+    transport: Arc<dyn HttpTransport>,
+    timeout: Duration,
+) -> Arc<dyn HttpTransport> {
+    match transport.with_response_timeout(timeout) {
+        Some(reconfigured) => reconfigured,
+        None => transport,
+    }
 }
 
 /// Production [`HttpTransport`] backed by `reqwest` (the Rust analogue of Spring `WebClient`).
 #[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    /// Per-request timeout applied to every request. `None` means "defer to whatever timeout the
+    /// wrapped [`reqwest::Client`] was configured with" (the [`Self::with_client`] case).
+    timeout: Option<Duration>,
 }
 
 impl ReqwestTransport {
-    /// Build a transport with a default `reqwest` client.
+    /// Build a transport with a default `reqwest` client and [`DEFAULT_TIMEOUT`].
     ///
     /// Returns an error rather than panicking when the client cannot be constructed (e.g. a bad
     /// TLS backend in the build).
     pub fn new() -> Result<Self> {
+        Self::with_timeout(DEFAULT_TIMEOUT)
+    }
+
+    /// Build a transport whose per-request timeout is `timeout` (Java's `responseTimeout`).
+    ///
+    /// Returns [`ChannelError::Config`] when `timeout` is zero, mirroring the Java
+    /// `"responseTimeout must be positive"` constructor guard.
+    pub fn with_timeout(timeout: Duration) -> Result<Self> {
+        ensure_positive_timeout(timeout)?;
         let client = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
             .build()
             .map_err(|e| ChannelError::Http(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            timeout: Some(timeout),
+        })
     }
 
     /// Wrap an existing (already configured) `reqwest` client.
+    ///
+    /// The wrapped client keeps whatever timeout it was built with, so no per-request override is
+    /// recorded ([`Self::timeout`] returns `None`).
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            timeout: None,
+        }
+    }
+
+    /// The per-request timeout this transport applies, if one was recorded.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 }
 
@@ -133,6 +191,9 @@ impl HttpTransport for ReqwestTransport {
             HttpMethod::Get => self.client.get(&request.url),
             HttpMethod::Post => self.client.post(&request.url),
         };
+        if let Some(timeout) = self.timeout {
+            builder = builder.timeout(timeout);
+        }
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
@@ -149,6 +210,17 @@ impl HttpTransport for ReqwestTransport {
             .await
             .map_err(|e| ChannelError::Http(e.to_string()))?;
         Ok(PreparedResponse { status, body })
+    }
+
+    fn with_response_timeout(&self, timeout: Duration) -> Option<Arc<dyn HttpTransport>> {
+        if timeout.is_zero() {
+            return None;
+        }
+        // Reuse the underlying client (connection pool) and only override the per-request timeout.
+        Some(Arc::new(Self {
+            client: self.client.clone(),
+            timeout: Some(timeout),
+        }))
     }
 }
 
@@ -183,5 +255,52 @@ mod tests {
         assert!(PreparedResponse::new(299, "ok").is_success());
         assert!(!PreparedResponse::new(400, "bad").is_success());
         assert!(!PreparedResponse::new(500, "bad").is_success());
+    }
+
+    #[test]
+    fn reqwest_transport_defaults_to_ten_seconds() {
+        let transport = ReqwestTransport::new().expect("default transport builds offline");
+        assert_eq!(transport.timeout(), Some(DEFAULT_TIMEOUT));
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn reqwest_transport_accepts_explicit_timeout() {
+        let transport =
+            ReqwestTransport::with_timeout(Duration::from_millis(250)).expect("positive timeout");
+        assert_eq!(transport.timeout(), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn reqwest_transport_rejects_zero_timeout() {
+        let err = ReqwestTransport::with_timeout(Duration::ZERO).expect_err("zero is rejected");
+        assert!(
+            err.to_string().contains("responseTimeout must be positive"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn with_client_defers_to_the_wrapped_client_timeout() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("client builds offline");
+        let transport = ReqwestTransport::with_client(client);
+        assert_eq!(transport.timeout(), None);
+    }
+
+    #[test]
+    fn with_response_timeout_reconfigures_reqwest_transport() {
+        let transport = ReqwestTransport::new().unwrap();
+        assert!(transport
+            .with_response_timeout(Duration::from_secs(2))
+            .is_some());
+    }
+
+    #[test]
+    fn with_response_timeout_rejects_zero() {
+        let transport = ReqwestTransport::new().unwrap();
+        assert!(transport.with_response_timeout(Duration::ZERO).is_none());
     }
 }
