@@ -78,6 +78,7 @@ async fn middleware_transforms_system_prompt() {
     let plan = PlanModeMiddleware::new(PlanModeConfig {
         enabled: true,
         plan: "1. read files".into(),
+        ..Default::default()
     });
     let out = plan
         .on_system_prompt(&RuntimeContext::default(), "base".into())

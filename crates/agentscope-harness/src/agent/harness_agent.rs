@@ -92,7 +92,7 @@ pub struct HarnessAgent {
     /// Workspace manager bound to this agent (context loading, memory, sessions).
     workspace_manager: Option<Arc<WorkspaceManager>>,
     /// Plan-mode coordinator, when plan mode was enabled.
-    plan_mode_manager: Option<PlanModeManager>,
+    plan_mode_manager: Option<Arc<PlanModeManager>>,
     /// The memory configuration used for the flush/consolidation pipeline.
     memory_config: MemoryConfig,
     /// The path normalizer used by filesystem tools (workspace-relative projection).
@@ -279,7 +279,7 @@ impl HarnessAgent {
     }
 
     /// Returns the plan-mode coordinator, if plan mode was enabled.
-    pub fn plan_mode_manager(&self) -> Option<&PlanModeManager> {
+    pub fn plan_mode_manager(&self) -> Option<&Arc<PlanModeManager>> {
         self.plan_mode_manager.as_ref()
     }
 
@@ -1900,14 +1900,15 @@ impl HarnessAgentBuilder {
         // ---- Plan mode ----
         let mut plan_mode_manager = None;
         if self.plan_mode_enabled {
-            let pm = PlanModeManager::new(
+            let pm = Arc::new(PlanModeManager::new(
                 Arc::clone(&filesystem),
                 Some(&self.plan_file_dir),
-            );
-            let config = PlanModeConfig {
-                enabled: true,
-                plan: String::new(),
-            };
+            ));
+            // The middleware must observe runtime mode switches, so it holds the
+            // manager (and reads `AgentState`) instead of a compile-time string.
+            // Java equivalent: `PlanModeMiddleware` reads `PlanModeManager` on both
+            // `onSystemPrompt` and `onModelCall`.
+            let config = PlanModeConfig::with_manager(Arc::clone(&pm));
             middleware.add(Box::new(PlanModeMiddleware::new(config)));
             plan_mode_manager = Some(pm);
         }

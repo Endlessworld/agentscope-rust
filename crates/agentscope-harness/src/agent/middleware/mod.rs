@@ -16,6 +16,7 @@ pub mod dynamic_subagents;
 pub mod inbox;
 pub mod memory_flush;
 pub mod memory_maintenance;
+pub mod plan_mode;
 pub mod sandbox_lifecycle;
 pub mod skill_middleware;
 pub mod state_checkpoint;
@@ -79,30 +80,7 @@ impl Middleware for CompactionMiddleware {
 }
 
 /// Config for plan-mode (read-only exploration) operation.
-#[derive(Debug, Clone, Default)]
-pub struct PlanModeConfig {
-    pub enabled: bool,
-    pub plan: String,
-}
-
-/// Middleware that injects the current plan into the system prompt.
-pub struct PlanModeMiddleware {
-    pub config: PlanModeConfig,
-}
-
-impl PlanModeMiddleware {
-    pub fn new(config: PlanModeConfig) -> Self {
-        Self { config }
-    }
-}
-
-#[async_trait::async_trait]
-impl Middleware for PlanModeMiddleware {
-    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
-        if self.config.enabled && !self.config.plan.is_empty() {
-            format!("{}\n\nCurrent plan:\n{}", current_prompt, self.config.plan)
-        } else {
-            current_prompt
-        }
-    }
-}
+///
+/// Moved to [`plan_mode::PlanModeConfig`]; re-exported so existing import paths
+/// (`agentscope_harness::agent::middleware::PlanModeConfig`) keep working.
+pub use plan_mode::{PlanModeConfig, PlanModeMiddleware};
