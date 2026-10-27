@@ -25,7 +25,7 @@ pub mod views;
 pub use event::{
     SessionEvent, SessionEventCodec, SessionEventCodecRegistry, SessionEventTypes,
 };
-pub use execution::{SessionExecution, EXECUTION_CONTEXT_KEY};
+pub use execution::{ExecutionBaseline, SessionExecution, EXECUTION_CONTEXT_KEY};
 pub use export::{
     SessionExportSink, SessionExportSinkHandle, SessionLogExporter,
     SESSION_EXPORT_SINK_CONTEXT_KEY,
@@ -33,7 +33,8 @@ pub use export::{
 pub use header::{SessionHeader, SessionHistoryMode};
 pub use inbox::{Command, InboxSnapshot, SessionInbox};
 pub use recorder::{
-    outcome, SessionRecorder, PARENT_CONTEXT_KEY, RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+    outcome, RecorderBaseline, SessionRecorder, PARENT_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
+    TURN_ID_CONTEXT_KEY,
 };
 pub use models::{
     policy_from_context, wrap as wrap_model, SessionModelPolicy, SessionModelPolicyHandle,
@@ -50,8 +51,8 @@ pub use key::SessionKey;
 pub use log::{Head, SessionLog, SessionLogStore, Writer};
 pub use storage::{AtomicSessionStorage, StorageValue};
 pub use views::{
-    pending_interactions, transcript, transcript_entries, transcript_jsonl, SessionProjection,
-    SessionTurns, Transcript, TranscriptEntry, Turn,
+    apply_pending_event, pending_interactions, transcript, transcript_entries, transcript_jsonl,
+    SessionProjection, SessionTurns, Transcript, TranscriptEntry, Turn,
 };
 
 /// Error message prefix used by session persistence failures.

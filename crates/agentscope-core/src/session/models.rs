@@ -16,7 +16,9 @@ use futures::stream::{BoxStream, StreamExt};
 
 use super::SessionRecorder;
 use crate::agent::RuntimeContext;
-use crate::message::{ChatUsage, Msg};
+use crate::message::{
+    ChatUsage, ContentBlock, Msg, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock,
+};
 use crate::middleware::ModelCallInput;
 use crate::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 
@@ -98,6 +100,136 @@ pub fn wrap(
     })
 }
 
+/// Coalesces streamed deltas before journaling.
+///
+/// Providers emit text/thinking one token or one SSE event at a time. Recording every
+/// delta as its own committed event made the journal orders of magnitude larger than the
+/// conversation and turned a long stream into thousands of commits. This buffer emits one
+/// merged `model/chunk` per 4 KiB / 64 deltas / 1 second, while the consumer still
+/// receives every original delta unchanged.
+struct MergedChunk {
+    id: String,
+    text: String,
+    thinking: String,
+    tool_calls: Vec<ToolUseBlock>,
+    tool_results: Vec<ToolResultBlock>,
+    other: Vec<ContentBlock>,
+    chunks: usize,
+    bytes: usize,
+    usage: ChatUsage,
+    finish_reason: Option<String>,
+    since: std::time::Instant,
+}
+
+impl Default for MergedChunk {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            text: String::new(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            other: Vec::new(),
+            chunks: 0,
+            bytes: 0,
+            usage: ChatUsage::default(),
+            finish_reason: None,
+            since: std::time::Instant::now(),
+        }
+    }
+}
+
+impl MergedChunk {
+    fn push(&mut self, chunk: &ChatResponse) {
+        if self.id.is_empty() {
+            self.id = chunk.id.clone();
+        }
+        if chunk.usage.total_tokens() > 0 {
+            self.usage = chunk.usage;
+        }
+        if chunk.finish_reason.is_some() {
+            self.finish_reason = chunk.finish_reason.clone();
+        }
+        self.chunks += 1;
+        for block in &chunk.content {
+            self.bytes += serde_json::to_string(block)
+                .map(|json| json.len())
+                .unwrap_or(0);
+            match block {
+                ContentBlock::Text(text) => self.text.push_str(&text.text),
+                ContentBlock::Thinking(thinking) => self.thinking.push_str(&thinking.thinking),
+                ContentBlock::ToolUse(call) => self.tool_calls.push(call.clone()),
+                ContentBlock::ToolResult(result) => self.tool_results.push(result.clone()),
+                other => self.other.push(other.clone()),
+            }
+        }
+    }
+
+    fn should_flush(&self) -> bool {
+        self.chunks >= 64
+            || self.bytes >= 4 * 1024
+            || self.since.elapsed() >= std::time::Duration::from_secs(1)
+    }
+
+    fn into_response(&mut self) -> ChatResponse {
+        let mut content = Vec::new();
+        if !self.thinking.is_empty() {
+            content.push(ContentBlock::Thinking(ThinkingBlock::new(std::mem::take(
+                &mut self.thinking,
+            ))));
+        }
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text(TextBlock::new(std::mem::take(
+                &mut self.text,
+            ))));
+        }
+        for call in self.tool_calls.drain(..) {
+            content.push(ContentBlock::ToolUse(call));
+        }
+        for result in self.tool_results.drain(..) {
+            content.push(ContentBlock::ToolResult(result));
+        }
+        content.extend(self.other.drain(..));
+        let response = ChatResponse::new(
+            self.id.clone(),
+            content,
+            self.usage,
+            None,
+            self.finish_reason.take(),
+        );
+        self.chunks = 0;
+        self.bytes = 0;
+        self.usage = ChatUsage::default();
+        self.since = std::time::Instant::now();
+        response
+    }
+}
+
+async fn record_merged_chunk(
+    recorder: &SessionRecorder,
+    call_id: &str,
+    purpose: &str,
+    merged: &mut MergedChunk,
+) -> crate::error::Result<()> {
+    if merged.chunks == 0 {
+        return Ok(());
+    }
+    let merged_chunks = merged.chunks;
+    let response = merged.into_response();
+    recorder
+        .record(
+            "model/chunk",
+            &serde_json::json!({
+                "modelCallId": call_id,
+                "purpose": purpose,
+                "chunk": response,
+                "mergedChunks": merged_chunks,
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
 /// The recorded adapter boundary: journals each dispatch and forwards the chunks.
 struct Recorded {
     delegate: Arc<dyn Model>,
@@ -158,20 +290,23 @@ impl Model for Recorded {
 
             let mut last: Option<ChatResponse> = None;
             let mut failure: Option<crate::error::Error> = None;
+            let mut merged = MergedChunk::default();
             let mut inner = delegate.stream(messages, tools, options);
             while let Some(item) = inner.next().await {
                 match item {
                     Ok(chunk) => {
-                        // Journal the chunk before releasing it: a consumer that observes a
-                        // chunk must find it in the journal.
-                        let payload = serde_json::json!({
-                            "modelCallId": call_id,
-                            "purpose": purpose,
-                            "chunk": chunk,
-                        });
-                        if let Err(error) = recorder.record("model/chunk", &payload).await {
-                            failure = Some(error);
-                            break;
+                        // The consumer still receives every delta; the journal only keeps
+                        // coalesced deltas so a long stream does not become thousands of
+                        // committed events.
+                        merged.push(&chunk);
+                        if merged.should_flush() {
+                            if let Err(error) =
+                                record_merged_chunk(&recorder, &call_id, &purpose, &mut merged)
+                                    .await
+                            {
+                                failure = Some(error);
+                                break;
+                            }
                         }
                         last = Some(chunk.clone());
                         yield Ok(chunk);
@@ -179,6 +314,18 @@ impl Model for Recorded {
                     Err(error) => {
                         failure = Some(error);
                         break;
+                    }
+                }
+            }
+
+            // Flush the trailing merged delta, including a partial response before a
+            // provider failure. A persistence failure is never retried into the journal.
+            if !matches!(failure, Some(crate::error::Error::Session(_))) {
+                if let Err(error) =
+                    record_merged_chunk(&recorder, &call_id, &purpose, &mut merged).await
+                {
+                    if failure.is_none() {
+                        failure = Some(error);
                     }
                 }
             }
@@ -422,10 +569,16 @@ mod tests {
         assert!(types.contains(&"state/checkpoint"), "{types:?}");
         assert!(types.contains(&"request/prepared"), "{types:?}");
         assert!(types.contains(&"model/dispatch"), "{types:?}");
-        assert_eq!(
-            types.iter().filter(|t| **t == "model/chunk").count(),
-            2,
-            "{types:?}"
+        let chunk_events: Vec<_> = facts
+            .iter()
+            .filter(|event| event.event_type == "model/chunk")
+            .collect();
+        assert_eq!(chunk_events.len(), 1, "chunks must be coalesced: {types:?}");
+        let merged = chunk_events[0].data().unwrap();
+        assert_eq!(merged["mergedChunks"], 2);
+        assert!(
+            merged["chunk"]["content"].to_string().contains("hello"),
+            "{merged}"
         );
         assert!(types.contains(&"model/end"), "{types:?}");
 

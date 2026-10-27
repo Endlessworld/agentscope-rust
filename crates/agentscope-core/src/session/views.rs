@@ -179,6 +179,90 @@ impl SessionTurns {
             },
         );
     }
+
+    /// Folds one committed event into this projection.
+    ///
+    /// A caller that already holds the projection at an earlier head can advance it by
+    /// visiting only the events committed since then, instead of replaying the whole
+    /// journal.
+    pub fn apply_event(&mut self, event: &SessionEvent) -> crate::error::Result<()> {
+        let data = event.data()?;
+        if event.event_type == "state/restored" {
+            self.turns.clear();
+            self.inputs.clear();
+        }
+        let turn_id = event.turn_id.clone();
+        match event.event_type.as_str() {
+            "turn/cancelled" => {
+                if let Some(id) = &turn_id {
+                    self.apply_turn(id, event.execution_run_id.clone(), "cancelled");
+                }
+            }
+            "run/start" => {
+                if let Some(id) = &turn_id {
+                    self.apply_turn(id, event.execution_run_id.clone(), "running");
+                }
+            }
+            "run/end" => {
+                if let Some(id) = &turn_id {
+                    let status = json_str(&data, "status").unwrap_or_else(|| "unknown".into());
+                    self.apply_turn(id, event.execution_run_id.clone(), &status);
+                }
+            }
+            "input/received" => {
+                if let Some(id) = &turn_id {
+                    let bucket = self.inputs.entry(id.clone()).or_default();
+                    for value in data
+                        .get("messages")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        let msg: Msg = serde_json::from_value(value)?;
+                        if !bucket.iter().any(|existing| existing.id == msg.id) {
+                            bucket.push(msg);
+                        }
+                    }
+                }
+            }
+            "inbox/started" => {
+                if let Some(command_id) = json_str(&data, "commandId") {
+                    self.started.insert(command_id);
+                }
+            }
+            "inbox/applied" => {
+                for value in data
+                    .get("commandIds")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    if let Some(id) = value.as_str() {
+                        self.applied.insert(id.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_turn(&mut self, turn_id: &str, run_id: Option<String>, status: &str) {
+        if let Some(existing) = self
+            .turns
+            .iter_mut()
+            .find(|turn| turn.turn_id == turn_id)
+        {
+            existing.run_id = run_id;
+            existing.status = status.to_string();
+            return;
+        }
+        self.turns.push(Turn {
+            turn_id: turn_id.to_string(),
+            run_id,
+            status: status.to_string(),
+        });
+    }
 }
 
 /// Rebuildable human/history views. Context replacement never erases earlier messages.
@@ -442,21 +526,31 @@ pub async fn pending_interactions(
     let upper = log.head().await?.seq;
     let mut result = BTreeMap::new();
     let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
-        let data = event.data()?;
-        if event.event_type == "interaction/requested" {
-            if let Some(id) = json_str(&data, "requestId") {
-                result.insert(id, event.clone());
-            }
-        }
-        if event.event_type == "interaction/resolved" {
-            if let Some(id) = json_str(&data, "requestId") {
-                result.remove(&id);
-            }
-        }
-        Ok(())
+        apply_pending_event(&mut result, event)
     };
     log.visit(0, upper, &mut visit).await?;
     Ok(result)
+}
+
+/// Folds one `interaction/*` event into a pending-request map.
+///
+/// Callers that already hold the map at an earlier head can advance it incrementally.
+pub fn apply_pending_event(
+    pending: &mut BTreeMap<String, SessionEvent>,
+    event: &SessionEvent,
+) -> crate::error::Result<()> {
+    let data = event.data()?;
+    if event.event_type == "interaction/requested" {
+        if let Some(id) = json_str(&data, "requestId") {
+            pending.insert(id, event.clone());
+        }
+    }
+    if event.event_type == "interaction/resolved" {
+        if let Some(id) = json_str(&data, "requestId") {
+            pending.remove(&id);
+        }
+    }
+    Ok(())
 }
 
 /// A flat, client-facing transcript entry.

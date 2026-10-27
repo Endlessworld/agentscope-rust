@@ -15,7 +15,7 @@
 //!   could race the agent loop's own flush on the same pending buffer and turn a healthy run
 //!   into a sticky "Stale committed prefix" failure.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -236,6 +236,29 @@ impl std::fmt::Debug for SessionRecorder {
     }
 }
 
+/// A recovery baseline supplied by a caller that already holds the committed state.
+///
+/// Opening a recorder normally replays the whole journal to recover the state, the
+/// uncertain tool calls and the transcript. A caller that already has an `AgentState`
+/// for the current head can pass it here instead, which avoids the replay entirely.
+#[derive(Debug, Clone)]
+pub struct RecorderBaseline {
+    /// Committed head sequence the state was restored from.
+    pub seq: u64,
+    /// Commit id at `seq`, used to reject a baseline that raced a writer.
+    pub commit_id: Option<String>,
+    /// Serialized `AgentState` at that head.
+    pub state_json: String,
+    /// Tool calls whose outcome is not known. Empty only when the caller knows the
+    /// previous run settled cleanly.
+    pub uncertain_tool_calls: BTreeSet<String>,
+    /// Runs that were still active at `seq`.
+    pub active_runs: BTreeSet<String>,
+    /// Whether this run continues an existing turn (`resume`/`respond`) rather than
+    /// opening a new one (`submit`).
+    pub resumed_turn: bool,
+}
+
 impl SessionRecorder {
     /// Opens a recorder for `turn_id`, allocating a fresh run id.
     pub async fn open(
@@ -273,6 +296,29 @@ impl SessionRecorder {
         Self::open_with_lease(log, turn_id, run_id, exporter, LEASE).await
     }
 
+    /// Opens a recorder using a caller-supplied recovery baseline.
+    ///
+    /// The baseline is accepted only when its `seq`/`commit_id` still match the head
+    /// acquired under the writer lease; otherwise the recorder falls back to the full
+    /// journal replay. This is the fast path for a long-lived session whose in-memory
+    /// state already is the committed history.
+    pub async fn open_with_baseline(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        exporter: Option<Arc<SessionLogExporter>>,
+        baseline: RecorderBaseline,
+    ) -> crate::error::Result<Self> {
+        Self::open_with_lease_and_baseline(
+            log,
+            turn_id,
+            &uuid::Uuid::new_v4().to_string(),
+            exporter,
+            LEASE,
+            Some(baseline),
+        )
+        .await
+    }
+
     /// Opens a recorder whose writer lease (and renewal cadence) is explicit.
     ///
     /// Production callers use [`SessionRecorder::open_with`]; the shorter lease exists so a test
@@ -283,6 +329,17 @@ impl SessionRecorder {
         run_id: &str,
         exporter: Option<Arc<SessionLogExporter>>,
         lease: Duration,
+    ) -> crate::error::Result<Self> {
+        Self::open_with_lease_and_baseline(log, turn_id, run_id, exporter, lease, None).await
+    }
+
+    async fn open_with_lease_and_baseline(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        run_id: &str,
+        exporter: Option<Arc<SessionLogExporter>>,
+        lease: Duration,
+        baseline: Option<RecorderBaseline>,
     ) -> crate::error::Result<Self> {
         let turn_id = match turn_id {
             Some(id) if id.trim().is_empty() => {
@@ -296,7 +353,55 @@ impl SessionRecorder {
         }
 
         let writer = log.acquire(run_id, lease).await?;
+        let head = log.head().await?;
         let prepared = async {
+            if let Some(baseline) = baseline.filter(|baseline| {
+                baseline.seq == head.seq
+                    && baseline.commit_id.as_deref() == head.commit_id.as_deref()
+            }) {
+                tracing::debug!(
+                    seq = baseline.seq,
+                    "session recorder opened from a caller-supplied baseline"
+                );
+                let initial = SessionProjection {
+                    as_of_seq: baseline.seq,
+                    state_json: Some(baseline.state_json),
+                    uncertain_tool_calls: baseline.uncertain_tool_calls,
+                    active_runs: baseline.active_runs,
+                    verifications: Vec::new(),
+                };
+                if !initial.uncertain_tool_calls.is_empty() {
+                    return Err(session_error(format!(
+                        "Explicit reconciliation required for unknown tool outcomes: {:?}",
+                        initial.uncertain_tool_calls
+                    )));
+                }
+                let durable_seq = initial.as_of_seq;
+                let previous_state = initial.state_json.clone();
+                let restored = initial.restore()?;
+                let previous_messages = match &restored {
+                    Some(state) => message_json(state)?,
+                    None => Vec::new(),
+                };
+                let recorded_messages: HashSet<String> = restored
+                    .map(|state| {
+                        state
+                            .context
+                            .iter()
+                            .map(|message| message.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok((
+                    initial,
+                    durable_seq,
+                    baseline.resumed_turn,
+                    previous_state,
+                    previous_messages,
+                    recorded_messages,
+                ));
+            }
+            let started = std::time::Instant::now();
             let initial = SessionProjection::read(&*log).await?;
             let durable_seq = initial.as_of_seq;
             let mut seen_turn = false;
@@ -339,6 +444,11 @@ impl SessionRecorder {
             for message in super::transcript(&*log).await?.messages {
                 recorded_messages.insert(message.id);
             }
+            tracing::info!(
+                seq = durable_seq,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "session recorder replayed the journal"
+            );
             Ok((initial, durable_seq, seen_turn, previous_state, previous_messages, recorded_messages))
         }
         .await;

@@ -16,10 +16,11 @@ use agentscope_core::agent::{Extensions, RuntimeContext, StreamOptions};
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
 use agentscope_core::session::{
-    outcome, pending_interactions, session_error, transcript, Command, Head, InboxSnapshot,
-    SessionEvent, SessionExecution, SessionExportSinkHandle, SessionInbox, SessionKey, SessionLog,
-    SessionProjection, SessionRecorder, SessionTurns, Transcript, EXECUTION_CONTEXT_KEY,
-    RECORDER_CONTEXT_KEY, SESSION_EXPORT_SINK_CONTEXT_KEY,
+    apply_pending_event, outcome, pending_interactions, session_error, transcript, Command,
+    ExecutionBaseline, Head, InboxSnapshot, RecorderBaseline, SessionEvent, SessionExecution,
+    SessionExportSinkHandle, SessionInbox, SessionKey, SessionLog, SessionProjection,
+    SessionRecorder, SessionTurns, Transcript, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
+    SESSION_EXPORT_SINK_CONTEXT_KEY,
 };
 use agentscope_core::state::AgentState;
 use futures::StreamExt;
@@ -73,6 +74,32 @@ struct SessionState {
     /// `SessionTurns` from the whole journal on every tick re-deserialized every state
     /// checkpoint; a long session then burned CPU and churned memory without any new work.
     dispatch_view: Option<(u64, Option<String>, DispatchView)>,
+    /// The committed head the live agent state corresponds to.
+    ///
+    /// A matching head means the agent's in-memory `AgentState` *is* the committed
+    /// history, so the next turn can skip `SessionProjection::read`. That projection
+    /// walks every event and hydrates every checkpoint/request blob; after the page cache
+    /// goes cold this made the first prompt after an idle period take minutes and churn
+    /// the disk. A mismatch (another writer, a restart) falls back to the full replay.
+    restored_head: Option<(u64, Option<String>)>,
+    /// Cached admission view (turns, inputs, applied ids, pending interactions) and the
+    /// head it was derived from. Advanced incrementally per turn instead of re-reading
+    /// the whole journal for `SessionTurns`/`pending_interactions`.
+    execution_view: Option<(
+        u64,
+        Option<String>,
+        SessionTurns,
+        BTreeMap<String, SessionEvent>,
+    )>,
+}
+
+impl SessionState {
+    /// Whether the live agent state is the committed history at `head`.
+    fn restored_head_matches(&self, head: &agentscope_core::session::Head) -> bool {
+        self.restored_head.as_ref().is_some_and(|(seq, commit)| {
+            *seq == head.seq && commit.as_deref() == head.commit_id.as_deref()
+        })
+    }
 }
 
 /// The small part of [`SessionTurns`] the dispatcher needs, without the input messages.
@@ -933,7 +960,16 @@ async fn dispatch_view(
     if let Some(view) = cached {
         return Ok(view);
     }
-    let turns = SessionTurns::read(log).await?;
+    let started = std::time::Instant::now();
+    // Share the admission projection: it is advanced incrementally, so the dispatcher no
+    // longer replays the whole journal after every run.
+    let baseline = execution_baseline(log, state, head).await?;
+    tracing::debug!(
+        head_seq = head.seq,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "derived the dispatch view"
+    );
+    let turns = baseline.turns;
     let open_turn = turns
         .latest()
         .filter(|turn| !turn.ended())
@@ -999,6 +1035,63 @@ async fn dispatch_once(
     Ok(())
 }
 
+/// Returns the admission view for `head`, advancing the cached projection incrementally.
+///
+/// A cold process pays one full `SessionTurns`/`pending_interactions` read. Subsequent
+/// turns only visit the events committed since the cached head, instead of re-reading
+/// every model chunk, checkpoint and request in the session's history.
+async fn execution_baseline(
+    log: &dyn SessionLog,
+    state: &Arc<Mutex<SessionState>>,
+    head: &Head,
+) -> crate::Result<ExecutionBaseline> {
+    let cached = {
+        let guard = state.lock().unwrap();
+        guard.execution_view.clone()
+    };
+    if let Some((seq, commit, mut turns, mut pending)) = cached {
+        if seq == head.seq && commit.as_deref() == head.commit_id.as_deref() {
+            return Ok(ExecutionBaseline { turns, pending });
+        }
+        if seq <= head.seq {
+            let started = std::time::Instant::now();
+            log.visit(seq, head.seq, &mut |event| {
+                turns.apply_event(event)?;
+                apply_pending_event(&mut pending, event)
+            })
+            .await?;
+            tracing::debug!(
+                from = seq,
+                to = head.seq,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "advanced the cached execution view"
+            );
+            state.lock().unwrap().execution_view = Some((
+                head.seq,
+                head.commit_id.clone(),
+                turns.clone(),
+                pending.clone(),
+            ));
+            return Ok(ExecutionBaseline { turns, pending });
+        }
+    }
+    let started = std::time::Instant::now();
+    let turns = SessionTurns::read(log).await?;
+    let pending = pending_interactions(log).await?;
+    tracing::info!(
+        head_seq = head.seq,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "read the execution view from the journal"
+    );
+    state.lock().unwrap().execution_view = Some((
+        head.seq,
+        head.commit_id.clone(),
+        turns.clone(),
+        pending.clone(),
+    ));
+    Ok(ExecutionBaseline { turns, pending })
+}
+
 /// Opens a recorder, admits the command and runs the agent to completion.
 async fn launch(
     agent: &Arc<HarnessAgent>,
@@ -1021,7 +1114,52 @@ async fn launch(
         .map(|key| key.session_id)
         .unwrap_or_default();
     let exporter =
-        sink.map(|handle| Arc::new(handle.exporter_for_session(Arc::clone(log), session_id)));
+        sink.map(|handle| Arc::new(handle.exporter_for_session(Arc::clone(log), session_id.clone())));
+    // A long session pays for `SessionProjection::read` on every new turn: it hydrates every
+    // state checkpoint and every request/prepared blob. When the live agent state still
+    // matches the committed head, hand it to the recorder as a baseline instead. The
+    // recorder re-checks the head under the writer lease and falls back to the full replay
+    // if a writer raced us in between.
+    let head = log.head().await?;
+    let cached_state = {
+        let guard = state.lock().unwrap();
+        if guard.restored_head_matches(&head) {
+            agent
+                .agent()
+                .map(|react| react.state_handle().lock().unwrap().clone())
+        } else {
+            None
+        }
+    };
+    let baseline = match cached_state {
+        Some(state) => match state.to_json() {
+            Ok(state_json) => {
+                tracing::debug!(
+                    session = %session_id,
+                    head_seq = head.seq,
+                    "supplying the live agent state as the recorder baseline"
+                );
+                Some(RecorderBaseline {
+                    seq: head.seq,
+                    commit_id: head.commit_id.clone(),
+                    state_json,
+                    uncertain_tool_calls: BTreeSet::new(),
+                    active_runs: BTreeSet::new(),
+                    // `respond`/`resume` continue an existing turn; a submit opens one.
+                    resumed_turn: command.kind != "submit",
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session = %session_id,
+                    %error,
+                    "could not serialize the live agent state; falling back to a journal replay"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     // Opening the recorder takes the journal writer lease. That can fail transiently (a
     // previous writer still releasing, a storage hiccup); rejecting the user's prompt on the
     // first failure made it look like the session was broken. The command stays accepted while
@@ -1029,9 +1167,26 @@ async fn launch(
     let mut open_attempts = 0usize;
     let recorder = loop {
         open_attempts += 1;
-        match SessionRecorder::open_with_exporter(Arc::clone(log), Some(&turn_id), exporter.clone())
-            .await
-        {
+        let opened = match &baseline {
+            Some(baseline) => {
+                SessionRecorder::open_with_baseline(
+                    Arc::clone(log),
+                    Some(&turn_id),
+                    exporter.clone(),
+                    baseline.clone(),
+                )
+                .await
+            }
+            None => {
+                SessionRecorder::open_with_exporter(
+                    Arc::clone(log),
+                    Some(&turn_id),
+                    exporter.clone(),
+                )
+                .await
+            }
+        };
+        match opened {
             Ok(recorder) => break Arc::new(recorder),
             Err(error) if open_attempts < 3 => {
                 tracing::warn!(%error, turn = %turn_id, "opening the session recorder failed; retrying");
@@ -1045,10 +1200,9 @@ async fn launch(
     };
     let mut execution = SessionExecution::new(Arc::clone(log), command.clone());
 
-    // The committed projection is the state this run must start from: the journal is the
-    // only history authority, so an agent built fresh for this process has nothing in its
-    // in-memory state (Java `stateForCall` → `nativeWorkingCopy`).
-    let mut restored = match SessionProjection::read(&**log).await?.restore()? {
+    // The recorder already produced the committed projection (from the baseline or a full
+    // replay). Reuse it instead of reading the journal a second time in this launcher.
+    let mut restored = match recorder.initial().restore()? {
         Some(state) => state,
         None => AgentState::builder()
             .session_id(&turn_id)
@@ -1066,7 +1220,15 @@ async fn launch(
             restored.user_id = pinned.user_id().map(str::to_string);
         }
     }
-    if let Err(error) = execution.prepare(&recorder).await {
+    // Admission needs turns, inputs, applied ids and pending interactions. Use the cached
+    // projection and advance it only over events committed since the cached head; a cold
+    // process reads once.
+    let admission_head = log.head().await?;
+    let admission = execution_baseline(log.as_ref(), state, &admission_head).await?;
+    if let Err(error) = execution
+        .prepare_with_baseline(&recorder, Some(&admission))
+        .await
+    {
         inbox.reject(&command, &error.to_string()).await?;
         recorder.close().await;
         return Err(error);
@@ -1208,10 +1370,22 @@ async fn launch(
         .await;
     let _ = execution.close(&recorder).await;
 
+    // Cache the state/head pairing only when the terminal facts committed and the turn
+    // actually completed. A failed/interrupted run may carry uncertain tool outcomes or an
+    // active run; the next launch must replay the journal so admission can see them.
+    let completed_cleanly = finish.is_ok() && status == "completed";
+    let committed_head = if completed_cleanly {
+        log.head().await.ok()
+    } else {
+        None
+    };
     {
         let mut guard = state.lock().unwrap();
         guard.active_command = None;
         guard.active_run = None;
+        guard.restored_head = committed_head
+            .as_ref()
+            .map(|head| (head.seq, head.commit_id.clone()));
         if let Some(error) = &detail {
             guard.error = Some(error.clone());
         }
@@ -1454,6 +1628,102 @@ mod tests {
         assert_eq!(
             cache.fold("cmd-1"),
             (Some("run-1".to_string()), "completed".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn the_live_state_cache_matches_only_the_exact_committed_head() {
+        let mut state = SessionState::default();
+        state.restored_head = Some((7, Some("commit-a".into())));
+        let head = |seq, commit: Option<&str>| agentscope_core::session::Head {
+            seq,
+            epoch: 1,
+            owner: None,
+            lease_until: 0,
+            commit_id: commit.map(str::to_string),
+        };
+        assert!(state.restored_head_matches(&head(7, Some("commit-a"))));
+        assert!(!state.restored_head_matches(&head(8, Some("commit-a"))));
+        assert!(!state.restored_head_matches(&head(7, Some("commit-b"))));
+        assert!(!SessionState::default().restored_head_matches(&head(0, None)));
+    }
+
+    #[tokio::test]
+    async fn the_execution_view_advances_incrementally() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
+            inner: MemorySessionStorage::new(),
+            reads: Arc::clone(&reads),
+        });
+        let log = JournalSessionLog::new(storage, "s");
+        let writer = log.acquire("run", Duration::from_secs(60)).await.unwrap();
+        let mut seq = 0u64;
+        for i in 0..40u64 {
+            let event = SessionEvent::new(
+                format!("chunk-{i}"),
+                seq + 1,
+                0,
+                "model/chunk",
+                Some("run-1".into()),
+                Some("turn-1".into()),
+                true,
+                "{\"text\":\"x\"}",
+            )
+            .unwrap();
+            log.commit(&writer, &format!("cold-{i}"), seq, &[event])
+                .await
+                .unwrap();
+            seq += 1;
+        }
+        let started = SessionEvent::new(
+            "started",
+            seq + 1,
+            0,
+            "inbox/started",
+            Some("run-1".into()),
+            Some("turn-1".into()),
+            true,
+            "{\"commandId\":\"cmd-1\",\"kind\":\"submit\"}",
+        )
+        .unwrap();
+        log.commit(&writer, "started", seq, &[started])
+            .await
+            .unwrap();
+        seq += 1;
+
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        let head = log.head().await.unwrap();
+        let before = reads.load(Ordering::SeqCst);
+        let cold = execution_baseline(&log, &state, &head).await.unwrap();
+        assert!(
+            reads.load(Ordering::SeqCst) - before > 20,
+            "the first view must read the committed prefix"
+        );
+        assert!(cold.turns.started.contains("cmd-1"));
+
+        // One new terminal fact: advancing the cached view must not re-read the prefix.
+        let ended = SessionEvent::new(
+            "ended",
+            seq + 1,
+            0,
+            "run/end",
+            Some("run-1".into()),
+            Some("turn-1".into()),
+            true,
+            "{\"status\":\"completed\"}",
+        )
+        .unwrap();
+        let head = log.commit(&writer, "ended", seq, &[ended]).await.unwrap();
+        let before = reads.load(Ordering::SeqCst);
+        let warm = execution_baseline(&log, &state, &head).await.unwrap();
+        let incremental = reads.load(Ordering::SeqCst) - before;
+        assert!(
+            incremental < 10,
+            "advancing the view read {incremental} values; it must only read the new commit"
+        );
+        assert_eq!(
+            warm.turns.latest().map(|turn| turn.status.as_str()),
+            Some("completed")
         );
     }
 

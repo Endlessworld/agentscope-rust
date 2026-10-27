@@ -4,12 +4,13 @@
 //! against the committed turns and pending interactions, never against caller-supplied
 //! assumptions about what the session contains.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{
-    pending_interactions, session_error, Command, SessionInbox, SessionLog, SessionRecorder,
-    SessionTurns,
+    pending_interactions, session_error, Command, SessionEvent, SessionInbox, SessionLog,
+    SessionRecorder, SessionTurns,
 };
 use crate::agent::RuntimeContext;
 use crate::message::Msg;
@@ -17,6 +18,18 @@ use crate::state::AgentState;
 
 /// Runtime-context key carrying the [`SessionExecution`] for this run.
 pub const EXECUTION_CONTEXT_KEY: &str = "agentscope.session.execution";
+
+/// A precomputed committed view for admission.
+///
+/// `prepare` normally replays the whole journal twice (turns and pending interactions) on
+/// every turn. A long-lived session can cache this view and advance it incrementally.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionBaseline {
+    /// Committed turns, inputs and applied command ids.
+    pub turns: SessionTurns,
+    /// Interactions that were still pending at the same head.
+    pub pending: BTreeMap<String, SessionEvent>,
+}
 
 /// Execution-side inbox consumer.
 #[derive(Clone)]
@@ -27,6 +40,9 @@ pub struct SessionExecution {
     // Shared so every clone of one execution agrees on whether the inbox turn is still open:
     // the host holds one handle and the agent loop another, like Java's single object.
     opened: Arc<AtomicBool>,
+    /// Applied command ids from the committed view, advanced as this run consumes guidance.
+    /// Kept in memory so `before_step` does not rescan the whole journal on every step.
+    applied: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for SessionExecution {
@@ -46,6 +62,7 @@ impl SessionExecution {
             command,
             inputs: Vec::new(),
             opened: Arc::new(AtomicBool::new(false)),
+            applied: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -70,12 +87,30 @@ impl SessionExecution {
     /// continuation of anything other than the latest unfinished turn, and an answer to an
     /// interaction that is no longer pending.
     pub async fn prepare(&mut self, recorder: &SessionRecorder) -> crate::error::Result<()> {
-        let view = SessionTurns::read(&*self.log).await?;
+        self.prepare_with_baseline(recorder, None).await
+    }
+
+    /// Admits the command using a precomputed committed view when available.
+    ///
+    /// The baseline must describe the same committed head the recorder opened at. Callers
+    /// that cannot guarantee that should pass `None` and let this method read the journal.
+    pub async fn prepare_with_baseline(
+        &mut self,
+        recorder: &SessionRecorder,
+        baseline: Option<&ExecutionBaseline>,
+    ) -> crate::error::Result<()> {
+        let (view, pending) = match baseline {
+            Some(baseline) => (baseline.turns.clone(), baseline.pending.clone()),
+            None => (
+                SessionTurns::read(&*self.log).await?,
+                pending_interactions(&*self.log).await?,
+            ),
+        };
+        *self.applied.lock().unwrap() = view.applied.clone();
         if view.started.contains(&self.command.id) {
             return Err(session_error("Command already executed"));
         }
         let latest = view.latest().cloned();
-        let pending = pending_interactions(&*self.log).await?;
 
         match self.command.kind.as_str() {
             "submit" => {
@@ -171,7 +206,7 @@ impl SessionExecution {
         state: &mut AgentState,
     ) -> crate::error::Result<()> {
         let inbox = SessionInbox::new(Arc::clone(&self.log))?;
-        let applied = SessionTurns::read(&*self.log).await?.applied;
+        let applied = self.applied.lock().unwrap().clone();
         let mut known = recorder.accepted_message_ids();
         for message in &state.context {
             known.insert(message.id.clone());
@@ -202,9 +237,10 @@ impl SessionExecution {
             recorder
                 .record(
                     "inbox/applied",
-                    &serde_json::json!({ "commandIds": accepted }),
+                    &serde_json::json!({ "commandIds": &accepted }),
                 )
                 .await?;
+            self.applied.lock().unwrap().extend(accepted);
         }
         Ok(())
     }
@@ -215,7 +251,7 @@ impl SessionExecution {
     /// consuming instead of closing and losing the accepted guidance.
     pub async fn continue_or_close(&self, recorder: &SessionRecorder) -> crate::error::Result<bool> {
         let inbox = SessionInbox::new(Arc::clone(&self.log))?;
-        let applied = SessionTurns::read(&*self.log).await?.applied;
+        let applied = self.applied.lock().unwrap().clone();
         let snapshot = inbox.snapshot().await?;
         let pending = snapshot.commands.iter().any(|command| {
             command.kind == "steer"
@@ -241,8 +277,8 @@ impl SessionExecution {
     }
 
     /// Command ids applied so far (for callers projecting progress).
-    pub async fn applied_ids(&self) -> crate::error::Result<std::collections::BTreeSet<String>> {
-        Ok(SessionTurns::read(&*self.log).await?.applied)
+    pub async fn applied_ids(&self) -> crate::error::Result<BTreeSet<String>> {
+        Ok(self.applied.lock().unwrap().clone())
     }
 }
 
