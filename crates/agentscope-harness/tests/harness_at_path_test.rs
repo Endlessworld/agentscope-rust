@@ -33,12 +33,29 @@ async fn expands_at_path_in_user_message() {
     let _ = _stream.collect::<Vec<_>>().await;
 
     let captured = recorded.lock().unwrap().take().unwrap();
-    let text = match &captured.messages[0].content[0] {
+    // Java appends the preview as a new block and leaves the original text intact
+    // (`AtPathExpansionMiddleware.expand` → `msg.withContent(expandedContent)`), so the
+    // `@`-reference stays visible alongside the attached content.
+    let original = match &captured.messages[0].content[0] {
         ContentBlock::Text(tb) => tb.text.clone(),
         _ => String::new(),
     };
-    assert!(text.contains("secret content"), "got: {text}");
-    assert!(text.contains("note.md"), "got: {text}");
+    assert_eq!(original, "see @note.md please", "original text must be preserved");
+    let preview = captured.messages[0]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(tb) => Some(tb.text.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains("<attached_file"))
+        .unwrap_or_else(|| panic!("expected an appended preview block, got: {:?}", captured.messages[0].content));
+    assert!(preview.contains("secret content"), "got: {preview}");
+    assert!(preview.contains("note.md"), "got: {preview}");
+    assert!(
+        preview.contains("Attached file previews follow"),
+        "missing the lead-in: {preview}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
