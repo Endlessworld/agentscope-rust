@@ -83,6 +83,30 @@ const TRUNCATION_NOTICE_PLAIN: &str = "\n\n... (memory truncated) ...\n";
 
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 8000;
 
+/// Upper bound for the AGENTS.md body injected into the system prompt, mirroring the
+/// Java `composeAgentsContent` cap. Prevents one oversized file from crowding out the
+/// rest of the workspace context.
+const MAX_AGENTS_MD_BYTES: usize = 102_400;
+
+const AGENTS_TRUNCATION_NOTICE: &str = "\n\n[File truncated: AGENTS.md]";
+
+/// Truncates AGENTS.md to [`MAX_AGENTS_MD_BYTES`] on a char boundary.
+///
+/// Cutting mid-codepoint would produce invalid UTF-8, so the split point walks back to
+/// the nearest boundary. The notice is appended only when truncation actually happened.
+fn cap_agents_md(content: &str) -> String {
+    if content.len() <= MAX_AGENTS_MD_BYTES {
+        return content.to_string();
+    }
+    let mut end = MAX_AGENTS_MD_BYTES;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = content[..end].to_string();
+    capped.push_str(AGENTS_TRUNCATION_NOTICE);
+    capped
+}
+
 /// Middleware that appends workspace context to the request-scoped system prompt once
 /// per call. Mirrors Java `WorkspaceContextMiddleware`.
 pub struct WorkspaceContextMiddleware {
@@ -207,7 +231,7 @@ async fn build_workspace_section(
     // memory tools and the background hooks are off.
     let include_memory_context = !(disable_memory_tools && disable_memory_hooks);
 
-    let agents_content = wm.read_agents_md(rc).await.trim().to_string();
+    let agents_content = cap_agents_md(wm.read_agents_md(rc).await.trim());
     let memory_content = if include_memory_context {
         wm.read_memory_md(rc).await.trim().to_string()
     } else {
@@ -956,5 +980,32 @@ mod tests {
         assert!(!xml.contains("## Workspace Files"), "{xml}");
 
         std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
+    fn agents_md_is_capped_on_a_char_boundary() {
+        // A multi-byte body guarantees the cap lands mid-codepoint if implemented naively.
+        let oversized = "知".repeat(MAX_AGENTS_MD_BYTES / 3 + 10);
+        let capped = cap_agents_md(&oversized);
+        assert!(capped.ends_with(AGENTS_TRUNCATION_NOTICE), "notice must be appended");
+        let body_len = capped.len() - AGENTS_TRUNCATION_NOTICE.len();
+        assert!(body_len <= MAX_AGENTS_MD_BYTES);
+        // Truncating mid-codepoint would have produced invalid UTF-8 and panicked above.
+        assert!(capped.is_char_boundary(body_len));
+        assert!(!capped.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn agents_md_at_the_cap_is_not_truncated() {
+        let exact = "a".repeat(MAX_AGENTS_MD_BYTES);
+        let capped = cap_agents_md(&exact);
+        assert_eq!(capped.len(), MAX_AGENTS_MD_BYTES);
+        assert!(!capped.contains("File truncated"));
+    }
+
+    #[test]
+    fn agents_md_below_the_cap_is_untouched() {
+        let small = "keep me";
+        assert_eq!(cap_agents_md(small), small);
     }
 }

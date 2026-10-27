@@ -67,10 +67,27 @@ pub fn has_kind(message: &Msg, kind: MessageKind) -> bool {
     synthetic(message) && reminder_kind(message) == Some(kind.as_str())
 }
 
-/// Renders material as deterministic, escaped wrapper elements.
+/// Neutralizes only the closing tag that could terminate the surrounding wrapper element.
+///
+/// Mirrors Java `ContextRenderer.neutralizeClosingTags`: the body is deliberately kept
+/// verbatim (it may legitimately contain `&&`, `List<String>`, or quoted text) and only
+/// `</{tag}>` — plus, when the runtime envelope wraps the block, `</HARNESS_CONTEXT>` — is
+/// defused by escaping its slash.
+fn neutralize_closing(content: &str, tag: &str, outer_frame: bool) -> String {
+    let closing = format!("</{tag}>");
+    let defused = format!("<\\/{tag}>");
+    let mut neutralized = content.replace(&closing, &defused);
+    if outer_frame {
+        neutralized = neutralized.replace("</HARNESS_CONTEXT>", "<\\/HARNESS_CONTEXT>");
+    }
+    neutralized
+}
+
+/// Renders material as deterministic wrapper elements.
 ///
 /// Items are ordered by descending priority, ties broken by source id, so equal input always
-/// produces byte-identical output.
+/// produces byte-identical output. Attribute values are escaped; the body is kept verbatim
+/// except for the closing tags that would otherwise end the wrapper early.
 pub fn render_context_blocks(items: &[ContextItem]) -> String {
     let mut ordered: Vec<&ContextItem> = items.iter().collect();
     ordered.sort_by(|a, b| {
@@ -97,7 +114,11 @@ pub fn render_context_blocks(items: &[ContextItem]) -> String {
         out.push_str("\" revision=\"");
         out.push_str(&escape(&item.revision));
         out.push_str("\">\n");
-        out.push_str(&escape(&item.content));
+        out.push_str(&neutralize_closing(
+            &item.content,
+            tag,
+            item.placement != ContextItemPlacement::System,
+        ));
         out.push_str("\n</");
         out.push_str(tag);
         out.push_str(">\n");
@@ -231,12 +252,39 @@ mod tests {
         let knowledge_at = rendered.find("knowledge/b").unwrap();
         let memory_at = rendered.find("memory/a").unwrap();
         assert!(knowledge_at < memory_at);
-        // Embedded markup cannot terminate the wrapper.
-        assert!(rendered.contains("&lt;script&gt;"));
-        assert!(!rendered.contains("<script>"));
-        assert!(rendered.contains("&quot;quoted&quot;"));
+        // The body is kept verbatim (Java `455be59b7`): only closing tags are defused,
+        // so legitimate `&&` / `<String>` in prose must survive unescaped.
+        assert!(rendered.contains("<script> & \"quoted\""));
+        assert!(!rendered.contains("&lt;script&gt;"));
+        assert!(!rendered.contains("&amp;"));
         // Reference material always uses the generic wrapper tag.
         assert!(rendered.contains("<context_item kind="));
+    }
+
+    #[test]
+    fn a_closing_tag_in_the_body_is_defused() {
+        let mut it = item("knowledge", "knowledge/b", ContextItemPlacement::Reference);
+        it.content = "before </context_item> after </HARNESS_CONTEXT>".into();
+        let rendered = render_context_blocks(&[it]);
+        // The wrapper must survive: the body's closing tags are escaped, not honored.
+        assert!(rendered.contains("<\\/context_item>"), "{rendered}");
+        assert!(rendered.contains("<\\/HARNESS_CONTEXT>"), "{rendered}");
+        assert_eq!(rendered.matches("</context_item>").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn a_system_item_does_not_defuse_the_runtime_envelope() {
+        // System items are not wrapped in <HARNESS_CONTEXT>, so that tag is not theirs
+        // to neutralize; only their own closing tag is.
+        let mut it = item(
+            "business_instruction",
+            "instruction/a",
+            ContextItemPlacement::System,
+        );
+        it.content = "keep </HARNESS_CONTEXT> and </business_instruction>".into();
+        let rendered = render_context_blocks(&[it]);
+        assert!(rendered.contains("</HARNESS_CONTEXT>"), "{rendered}");
+        assert!(rendered.contains("<\\/business_instruction>"), "{rendered}");
     }
 
     #[test]
