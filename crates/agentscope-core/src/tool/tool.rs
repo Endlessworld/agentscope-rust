@@ -81,6 +81,21 @@ pub trait Tool: Send + Sync {
     fn is_concurrency_safe(&self) -> bool {
         true
     }
+    /// Whether this tool runs in **strict** schema mode, mirroring Java
+    /// `Tool.strict()`.
+    ///
+    /// When enabled, [`Tool::schema`] recursively injects
+    /// `additionalProperties: false` into every object node of the parameter
+    /// schema and marks the schema as strict. The injected keyword makes the
+    /// tool-argument validation reject parameters that are not declared in the
+    /// schema (on any model provider) and satisfies OpenAI's strict mode,
+    /// which rejects schemas without it.
+    ///
+    /// Defaults to `false`, so every existing tool keeps its current
+    /// behaviour.
+    fn is_strict(&self) -> bool {
+        false
+    }
     /// Whether this tool's result should be returned **directly to the caller as
     /// the turn's final answer**, skipping the next reasoning iteration.
     ///
@@ -128,7 +143,25 @@ pub trait Tool: Send + Sync {
         if !parameters.contains_key("type") {
             parameters.insert("type".into(), serde_json::Value::String("object".into()));
         }
+        // strict 模式：递归注入 `additionalProperties: false`（对齐 Java
+        // `ToolSchemaGenerator.generateParameterSchema(..., allowAdditionalProperties)`）。
+        // 注入后 `ToolValidator` 用的是同一份 schema，因此未声明的入参会被拒绝。
+        let strict = self.is_strict();
+        if strict {
+            let mut parameters_value = serde_json::Value::Object(parameters);
+            super::schema::apply_additional_properties_false(&mut parameters_value);
+            parameters = match parameters_value {
+                serde_json::Value::Object(map) => map,
+                other => {
+                    let mut map = serde_json::Map::new();
+                    map.insert("type".into(), serde_json::Value::String("object".into()));
+                    map.insert("properties".into(), other);
+                    map
+                }
+            };
+        }
         let schema = ToolSchema::new(self.name(), self.description()).parameters(parameters);
+        let schema = if strict { schema.strict(true) } else { schema };
         // Java only sends `defer_loading: true` for explicitly marked tools; an
         // unmarked tool carries `null` and stays eagerly loaded.
         if self.defer_loading() {
@@ -159,6 +192,8 @@ pub struct FunctionTool {
     read_only: bool,
     return_direct: bool,
     defer_loading: bool,
+    /// Strict schema mode (see [`Tool::is_strict`]).
+    strict: bool,
     handler: Box<dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync>,
     rebind: Option<Box<dyn Fn(&super::toolkit::Toolkit) -> Arc<dyn Tool> + Send + Sync>>,
 }
@@ -181,6 +216,7 @@ impl FunctionTool {
             read_only: false,
             return_direct: false,
             defer_loading: false,
+            strict: false,
             handler,
             rebind: None,
         }
@@ -203,6 +239,12 @@ impl FunctionTool {
     /// [`Tool::defer_loading`]).
     pub fn defer_loading(mut self, v: bool) -> Self {
         self.defer_loading = v;
+        self
+    }
+
+    /// Enables strict schema mode (see [`Tool::is_strict`]).
+    pub fn strict(mut self, v: bool) -> Self {
+        self.strict = v;
         self
     }
 
@@ -247,6 +289,9 @@ impl Tool for FunctionTool {
     }
     fn defer_loading(&self) -> bool {
         self.defer_loading
+    }
+    fn is_strict(&self) -> bool {
+        self.strict
     }
     fn parameters_schema(&self) -> serde_json::Value {
         self.parameters.clone()
@@ -321,5 +366,42 @@ mod tests {
         let deferred = fn_tool().defer_loading(true);
         assert!(Tool::defer_loading(&deferred));
         assert_eq!(deferred.schema().defer_loading, Some(true));
+    }
+
+    #[test]
+    fn strict_is_opt_in_and_injects_additional_properties_false() {
+        // Default: no strict flag, parameters untouched.
+        let lax = fn_tool();
+        assert!(!Tool::is_strict(&lax));
+        let lax_schema = lax.schema();
+        assert_eq!(lax_schema.strict, None);
+        assert!(lax_schema.parameters.get("additionalProperties").is_none());
+
+        let strict = FunctionTool::new(
+            "lookup",
+            "looks things up",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "nested": { "type": "object", "properties": {
+                        "x": { "type": "string" }
+                    } }
+                }
+            }),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )
+        .strict(true);
+        assert!(Tool::is_strict(&strict));
+        let schema = strict.schema();
+        assert_eq!(schema.strict, Some(true));
+        assert_eq!(
+            schema.parameters.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let nested = &schema.parameters["properties"]["nested"];
+        assert_eq!(
+            nested.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 }

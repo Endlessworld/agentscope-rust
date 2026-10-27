@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod meta;
 pub mod registration;
 pub mod result;
+pub mod schema;
 pub mod schema_only_tool;
 pub mod suspend;
 pub mod todo;
