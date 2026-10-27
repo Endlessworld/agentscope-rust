@@ -304,7 +304,7 @@
 | 动态模型切换 + per-session headers | — | ✅ 已完成 | session.rs：model_factory/model_builder 回调（签名含 sessionId）；模型切换失败通知客户端；x-opencode-session 由外部注入绑定 ACP sessionId（core 硬编码已移除）；思考等级映射（auto 默认不传；显式等级统一只传官方 `reasoning_effort`，不传 `enable_thinking`/`thinking_budget`——严格网关会以 `unknown field "thinking_budget"` 400 拒绝）；UsageUpdate 为当前上下文 token 计数；上下文窗口推送 |
 | 配置与日志 | — | ✅ 已完成 | acp/config.rs：会话配置 Arc<Mutex> 共享防克隆丢失；AGENTSCOPE_LOG_DIR 固定日志目录 + ACP agent 文件日志 |
 | **ACP 客户端 MCP 支持（mcp_servers 声明 → McpClientManager 桥接）** | ACP MCP 能力 | ✅ 已完成 | `AcpAgentSession` 新增 `apply_mcp_servers(&[McpServer])`：解析 stdio 声明（`McpServer::Stdio`，HTTP/SSE 跳过告警）、经 `McpClientManager` 连接 + `bridge_mcp_tools_to_toolkit` 注册到会话 Toolkit；`NewSessionRequest`/`LoadSessionRequest`/`ResumeSessionRequest` 的 `mcp_servers` 均已接入（幂等去重）；会话级动态注入（已存在会话再次 load/resume 补桥接） |
-| 已知 flaky | — | ⚠️ 注意 | acp_stdio_thought_test 全量跑时首轮失败/卡顿（stdio 时序），单独复跑通过 |
+| 已知 flaky | — | ✅ 已修复（本轮） | ~~acp_stdio_thought_test 全量跑时首轮失败/卡顿（stdio 时序）~~ 实为依赖真实 provider：`CODING_MODEL_ID`/`OPENAI_API_KEY` 指向的模型不保证返回 `reasoning_content`（thinking 分片缺失即断言失败）。修法：测试内置一个 **local scripted OpenAI 兼容端点**（`TcpListener` + SSE，127.0.0.1:0），子进程经 `AcpAgentConfig.env` 指向它（`CODING_PROVIDER=scripted-local` 走 env 回退 → ChatCompletions），并把 `HOME`/`USERPROFILE`/`AGENTSCOPE_LOG_DIR` 重定向到临时目录以隔离 `~/.agentscope/models.json` 与 skills、会话 cwd 也用临时目录；脚本固定吐 `reasoning_content` + `content` 两个 delta，断言仍要求 `AgentThoughtChunk` 与 `AgentMessageChunk` 到达客户端且文本匹配脚本标记（未放宽）。反向验证：删 reasoning 分片 → THOUGHT 断言 FAILED；删 content 分片 → MESSAGE 断言 FAILED；恢复后 1 passed（0.3s，无网络） |
 
 ### 3.11 coordination（优先级 P2）— 本轮新增
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -531,7 +531,7 @@
 3. **P1 已完成（本轮）**：
    - **McpTool e2e 接入 ReActAgent** ✅（McpClientManager 工具发现 + `bridge_mcp_tools_to_toolkit` → Toolkit；`harness_mcp_bridge_test` 真实 e2e 通过，见 §2.14）
    - **ACP 客户端 MCP 支持** ✅（NewSession/LoadSession/ResumeSession 的 `mcp_servers` → `apply_mcp_servers` → 会话 Toolkit，见 §3.10）
-   - ACP 稳定性：`acp_stdio_thought_test` 早前全量跑通过；工作区 `test_all.txt`（15:14）该用例因外部 provider 403 失败，属环境问题，非 flaky
+   - ACP 稳定性：`acp_stdio_thought_test` 已改为确定性（内置 scripted SSE 端点，不再依赖真实 provider 是否返回 thinking 分片，见 §3.10）
 4. **P1 剩余待办**：
    - ~~SandboxLifecycleMiddleware~~ ✅（已存在）+ **docker 后端（本轮完成，见 §3.6）**
    - ~~RemoteFilesystem 真实后端~~ ✅（本轮完成，见 §3.1）
