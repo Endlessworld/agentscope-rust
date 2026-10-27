@@ -14,6 +14,7 @@ pub mod memory;
 pub mod middleware;
 pub mod sandbox;
 pub mod session;
+pub mod shutdown;
 pub mod skill;
 pub mod subagent;
 pub mod team;
@@ -67,7 +68,7 @@ pub use middleware::{
     build_delivery_reminder, build_task_summary, prepend_to_system_message,
     render_subagent_section, AgentTraceMiddleware, AsyncToolMiddleware, AtPathExpansionMiddleware,
     CompactionMiddleware, CompactionMiddlewareConfig, ConversationCompactionMiddleware,
-    DynamicSubagentsMiddleware, InboxMiddleware, MemoryFlushMiddleware,
+    DynamicSubagentsMiddleware, GracefulShutdownMiddleware, InboxMiddleware, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SubagentsMiddleware,
     ToolResultEvictionMiddleware,
 };
@@ -81,6 +82,10 @@ pub use sandbox::{
 pub use session::{
     AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
     WorkspaceSessionLogStore, WorkspaceSessionStorage,
+};
+pub use shutdown::{
+    json_file_saver_in, GracefulShutdownController, JsonFileShutdownStateSaver,
+    StateStoreShutdownStateSaver, INTERRUPT_GRACE_PERIOD,
 };
 pub use skill::{
     build_promoter, compose_skill_repositories, default_gate, AgentSkill, AgentSkillBuilder,

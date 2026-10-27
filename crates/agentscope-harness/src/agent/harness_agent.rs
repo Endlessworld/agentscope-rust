@@ -18,6 +18,7 @@ use agentscope_core::model::Model;
 use agentscope_core::session::{
     SessionHistoryMode, SessionKey, SessionLog, SessionLogStore, SessionProjection, Transcript,
 };
+use agentscope_core::shutdown::{GracefulShutdownManager, ShutdownStateSaver};
 use agentscope_core::state::AgentState;
 use agentscope_core::state::AgentStateStore;
 use agentscope_core::state::ConflictPolicy;
@@ -35,11 +36,13 @@ use super::memory::{
 };
 use super::middleware::{
     AgentTraceMiddleware, AtPathExpansionMiddleware, ConversationCompactionMiddleware,
-    DynamicSubagentsMiddleware, HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
-    MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
-    SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware, TeamsMiddleware,
-    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
+    DynamicSubagentsMiddleware, GracefulShutdownMiddleware, HarnessSkillMiddleware,
+    InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware, PlanModeConfig,
+    PlanModeMiddleware, SkillCuratorMiddleware, SkillUsageMiddleware, StateCheckpointMiddleware,
+    SubagentsMiddleware, TeamsMiddleware, ToolCallPairSanitizerMiddleware,
+    ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
 };
+use super::shutdown::GracefulShutdownController;
 use super::skill::{
     build_promoter, compose_skill_repositories, default_gate, AuditEntry,
     FilesystemSkillUsageStore, LazyLoadSkillTool, ProposeSkillTool, SkillAuditLog, SkillCurator,
@@ -114,6 +117,8 @@ pub struct HarnessAgent {
     /// The core agent owns the recorder/persistence path; this handle is only used by read
     /// APIs (`session/list`) that need to enumerate sessions from the same backend.
     session_log_store: Option<Arc<dyn SessionLogStore>>,
+    /// 该 agent 的优雅关闭管理器（默认每个 agent 一个独立实例）。
+    shutdown_manager: Arc<GracefulShutdownManager>,
 }
 
 /// The default maximum reasoning→acting iterations used when none is configured.
@@ -475,6 +480,26 @@ impl HarnessAgent {
             agent.set_generate_options_defaults(options);
         }
     }
+
+    /// 该 agent 的优雅关闭管理器。
+    ///
+    /// 中间件与 [`HarnessAgent::shutdown`] 共用同一个实例：关闭时新请求被拒绝，
+    /// 活跃请求被等待（或超时强制中断），状态在终止前被保存。
+    pub fn shutdown_manager(&self) -> &Arc<GracefulShutdownManager> {
+        &self.shutdown_manager
+    }
+
+    /// 触发优雅关闭：拒绝新请求 → 等待活跃请求结束 → 保存状态 → 终止。
+    ///
+    /// 这是 Java `AgentScopeJvmShutdownHook` 的 Rust 等价入口：Rust 没有 JVM，
+    /// 也不引入 tokio 的 `signal` feature，宿主（例如
+    /// `agentscope-extensions-acp` 的 `spawn_shutdown_handler`）在收到 Ctrl-C /
+    /// SIGTERM 后调用本方法即可。返回 `true` 表示已经到达 `Terminated`。
+    pub async fn shutdown(&self) -> bool {
+        GracefulShutdownController::new(Arc::clone(&self.shutdown_manager))
+            .shutdown()
+            .await
+    }
 }
 
 /// `HarnessAgent` is a first-class agent: invocation and inspection delegate to the
@@ -641,6 +666,15 @@ pub struct HarnessAgentBuilder {
     /// Mirrors Java's currently inert `disableSessionPersistence` flag. It is retained
     /// and propagated to subagents so the configuration surface stays aligned.
     disable_session_persistence: bool,
+    // ---- Graceful shutdown ----
+    /// 是否挂载 `GracefulShutdownMiddleware`（请求登记 + shutdown 期间拒绝新请求）。
+    graceful_shutdown_enabled: bool,
+    /// 优雅关闭管理器（默认每个 agent 一个独立实例）。
+    shutdown_manager: Option<Arc<GracefulShutdownManager>>,
+    /// shutdown 收尾时调用的状态保存器。
+    shutdown_state_saver: Option<Arc<dyn ShutdownStateSaver>>,
+    /// shutdown 超时：超时后强制中断仍在运行的请求。
+    shutdown_timeout: Option<Duration>,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -723,6 +757,10 @@ impl Default for HarnessAgentBuilder {
             session_log_store: None,
             session_history_mode: SessionHistoryMode::EventLog,
             disable_session_persistence: false,
+            graceful_shutdown_enabled: false,
+            shutdown_manager: None,
+            shutdown_state_saver: None,
+            shutdown_timeout: None,
         }
     }
 }
@@ -1317,6 +1355,44 @@ impl HarnessAgentBuilder {
         self
     }
 
+    // ---- Graceful shutdown setters ----
+
+    /// 挂载优雅关闭中间件。
+    ///
+    /// 开启后：每一次 agent 调用都会被登记（per-request 粒度），调用结束
+    /// （成功 / 失败 / 取消）时自动注销；关闭进行中时新调用会被明确拒绝。
+    pub fn graceful_shutdown(mut self, enabled: bool) -> Self {
+        self.graceful_shutdown_enabled = enabled;
+        self
+    }
+
+    /// 指定优雅关闭管理器。
+    ///
+    /// 默认每个 agent 一个独立实例；传入全局单例
+    /// （`GracefulShutdownManager::instance_arc()`）可以让多个 agent 共享同一套
+    /// 关闭生命周期。
+    pub fn shutdown_manager(mut self, manager: Arc<GracefulShutdownManager>) -> Self {
+        self.shutdown_manager = Some(manager);
+        self
+    }
+
+    /// 指定 shutdown 收尾时调用的状态保存器。
+    ///
+    /// 保存器在"所有请求结束之后、状态切到 `Terminated` 之前"被调用一次；保存失败
+    /// 只记录日志，不会掩盖关闭流程本身的错误。
+    pub fn shutdown_state_saver(mut self, saver: Arc<dyn ShutdownStateSaver>) -> Self {
+        self.shutdown_state_saver = Some(saver);
+        self
+    }
+
+    /// 设置 shutdown 超时。
+    ///
+    /// 超时后仍在运行的请求会被强制中断，状态直接切到 `Terminated`。
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = Some(timeout);
+        self
+    }
+
     /// Enables agent-teams mode: attaches `TeamsMiddleware` and registers the
     /// role-clipped `team` tool. Mirrors Java `teamsMode(client, context)`.
     pub fn teams_mode(mut self, client: Arc<dyn TeamClient>, context: TeamContext) -> Self {
@@ -1385,6 +1461,24 @@ impl HarnessAgentBuilder {
 
         // ---- Middleware chain ----
         let mut middleware = self.middleware.unwrap_or_default();
+
+        // ---- Graceful shutdown ----
+        // 每个 agent 默认拥有独立的关闭管理器；宿主可以显式共享全局单例。
+        let shutdown_manager = self
+            .shutdown_manager
+            .clone()
+            .unwrap_or_else(|| Arc::new(GracefulShutdownManager::new()));
+        if let Some(timeout) = self.shutdown_timeout {
+            let mut config = shutdown_manager.config_snapshot();
+            config.shutdown_timeout = Some(timeout);
+            shutdown_manager.set_config_now(config);
+        }
+        if self.graceful_shutdown_enabled {
+            // 中间件的 order 最高，因此它包住整条调用链：先登记请求，最后注销。
+            middleware.add(Box::new(GracefulShutdownMiddleware::new(Arc::clone(
+                &shutdown_manager,
+            ))));
+        }
 
         // A deferred registration error must surface here rather than silently dropping the
         // caller's context source. `build()` is infallible by contract, and an invalid context
@@ -2053,6 +2147,15 @@ impl HarnessAgentBuilder {
             agent
         });
 
+        // The shutdown state saver persists the agent's shared state before the
+        // manager flips to `Terminated`. It needs the live state handle, so it is
+        // bound after the embedded agent exists.
+        if let Some(saver) = self.shutdown_state_saver.take() {
+            if let Some(agent) = &agent {
+                shutdown_manager.bind_state_saver(saver, agent.state_handle());
+            }
+        }
+
         HarnessAgent {
             name,
             agent_id,
@@ -2080,6 +2183,7 @@ impl HarnessAgentBuilder {
             skill_curator: pending_skill_curator,
             skill_audit_log: pending_skill_audit_log,
             session_log_store,
+            shutdown_manager,
         }
     }
 }

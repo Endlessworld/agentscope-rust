@@ -70,7 +70,8 @@ pub use permission::{
     PermissionEngine, PermissionMode, PermissionRule,
 };
 pub use shutdown::{
-    GracefulShutdownConfig, GracefulShutdownManager, PartialReasoningPolicy, ShutdownState,
+    ActiveRequestInfo, GracefulShutdownConfig, GracefulShutdownManager, PartialReasoningPolicy,
+    ShutdownState, ShutdownStateSaver,
 };
 pub use state::{
     compute_hash, has_changed, needs_full_rewrite, AgentState, AgentStateStore, ConflictPolicy,

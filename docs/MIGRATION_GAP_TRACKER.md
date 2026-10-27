@@ -167,11 +167,11 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | 状态机+单例+active 计数 | GracefulShutdownManager | ✅ 已完成 | shutdown/mod.rs；含 perform/await/ensure |
-| **per-request 粒度跟踪 / ActiveRequestContext** | ActiveRequestContext | 待办 | 当前仅原子计数 |
-| **GracefulShutdownMiddleware** | GracefulShutdownMiddleware | 待办 | Rust middleware 层无 shutdown 集成 |
-| **ShutdownStateSaver / bindStateSaver** | ShutdownStateSaver | 待办 | |
-| **AgentScopeJvmShutdownHook（信号处理）** | AgentScopeJvmShutdownHook | 待办 | Rust 无 JVM；可 tokio ctrl_c + CancellationToken |
-| **超时强制中断监控循环 / resetForTesting** | GracefulShutdownManager | 待办 | |
+| **per-request 粒度跟踪 / ActiveRequestContext** | ActiveRequestContext | ✅ 已完成（本轮） | `core::shutdown`：新增 `ActiveRequestInfo{request_id, started_at}` + `register_request_with_id`/`unregister_request_with_id -> bool`/`active_request_ids`/`active_requests_snapshot`/`is_request_active`；**活跃计数以登记表长度为准**，`register_request()`/`unregister_request()`（签名不变）走匿名 id FIFO 配对，注销不存在的 id 是 no-op、计数永不错乱。Java `ActiveRequestContext` 里的 RunControl 在 Rust 侧由调用方（`ExecutionGuard` + `ReActAgent::interrupt`）承担 |
+| **GracefulShutdownMiddleware** | GracefulShutdownMiddleware | ✅ 已完成（本轮） | `harness/src/agent/middleware/graceful_shutdown.rs`：挂在 `OnAgent`（`order=100` → 链最外层，登记包住整条调用链）；`ensure_accepting_requests()` 失败即拒绝新请求（`Error::ShuttingDown`，文案含 state）；注销用 RAII 守卫兜底（正常结束 / 报错 / 流被丢弃三条路径都会注销）。Java 的「安全点中断推理/执行」不移植：Rust 的中断由持 `RunControl` 的调用方负责 |
+| **ShutdownStateSaver / bindStateSaver** | ShutdownStateSaver | ✅ 已完成（本轮） | `core::shutdown::ShutdownStateSaver`（async trait，`save(&AgentState)`）+ `bind_state_saver(saver, state)`/`unbind_state_saver()`/`save_state_now()`；保存前把 `shutdown_interrupted` 置 true（对齐 Java `ActiveRequestContext.saveState`），失败只 `warn!` 不上抛。harness 提供两种实现：`JsonFileShutdownStateSaver`、`StateStoreShutdownStateSaver`（写进既有 `AgentStateStore`） |
+| **AgentScopeJvmShutdownHook（信号处理）** | AgentScopeJvmShutdownHook | ✅ 已完成（本轮，宿主接线） | Rust 无 JVM，且**未**引入 tokio `signal` feature（离线依赖约束）：`harness/src/agent/shutdown.rs` 提供 `GracefulShutdownController`（`begin_shutdown`/`shutdown`，等待上限 = `shutdown_timeout + 5s` 宽限，对齐 Java INTERRUPT_GRACE_PERIOD）+ `HarnessAgent::shutdown()`；宿主（如 ACP 的 `spawn_shutdown_handler`）收到 Ctrl-C/SIGTERM 后调用。ACP 二进制**尚未**改为调用该控制器（保留其既有 interrupt+drain 逻辑） |
+| **超时强制中断监控循环 / resetForTesting** | GracefulShutdownManager | ✅ 已完成（本轮） | `perform_graceful_shutdown()` 启动监控任务（配置了超时 50ms 精度、未配置 250ms 低频）：到点仍有活跃请求 → 尽力保存状态 → 置 `Terminated` + `notify_waiters()` 并记「强制中断」日志；正常收尾时收尾任务 `abort()` 掉监控，不泄漏 task。收尾顺序改为「请求清零 → 保存状态 → 终止」（异步落盘放进后台任务，`await_termination()` 因此能观察到保存已完成），并顺手修掉 `await_termination` 原先「终止先于等待 → 永久挂起」的隐患（`Notified::enable()` + 复查）。`reset_for_testing()` 复位状态/计数/id 集合/监控/saver |
 
 ### 2.13 tracing（优先级 P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -536,7 +536,7 @@
    - ~~SandboxLifecycleMiddleware~~ ✅（已存在）+ **docker 后端（本轮完成，见 §3.6）**
    - ~~RemoteFilesystem 真实后端~~ ✅（本轮完成，见 §3.1）
    - ~~MCP SSE/WS 传输待接~~ ✅（SSE + Streamable HTTP 已接，见 §2.14）
-   - shutdown 精细化（GracefulShutdownMiddleware / per-request 跟踪 / ctrl_c 信号）
+   - ~~shutdown 精细化（GracefulShutdownMiddleware / per-request 跟踪 / ctrl_c 信号）~~ ✅（本轮完成，见 §2.12；信号由宿主调用 `GracefulShutdownController`，未引 tokio `signal` feature）
 5. **P2 本轮完成**（§3.13 P2 清单，2026-09-17）：M2 coordination、S1–S3/S8 RemoteFilesystem+store+utils+baked、S9/S10 安全扫描+curator 过滤器、B2–B4 snapshot/layout/helpers、G2/G4/G6 gateway、R1–R3 subagent protocol+HTTP client。
 6. **P2 剩余（部分）**（2026-09-17 复核，详见 §3.14）：
    - D2 `HarnessAgent.Builder` 自动装配：**2026-09-17 已补 13 项 setter**（agentId/description/checkRunning/enablePendingToolRecovery/enableMetaTool/enableTaskList/useLegacyXmlWorkspaceContext/asyncToolTimeout/environment/taskRepository/~~transcript*~~（已随 `TranscriptMiddleware` 删除，2026-10-21）/teamsMode/disableMemoryTools+disableWebTools+webHttpClient）；剩余 `toolsConfig`+`disableToolsConfig`、`filesystem(Local/Remote/SandboxFilesystemSpec)`、`artifactDeliveryTarget`、`subagentFactory`、`modelResolver`、`externalSubagentTool`、`filesystemRoute`、`mcpServerRegistrationListener`、`registerExternalSchemas`（无对应子系统，见 §3.14 D2）
