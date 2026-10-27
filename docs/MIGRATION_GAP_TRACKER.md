@@ -492,6 +492,7 @@
 | # | 缺口 | 说明 |
 |---|---|---|
 | S1 | 回合内 `plan_enter` / `plan_exit` 被下一轮 state 发布覆盖 | 工具持共享 `Arc<Mutex<AgentState>>` 并直接改 `plan_mode_context`，而循环跑在私有克隆上；`reasoning_phase` 每次发布 `*shared = state.clone()` 会把刚翻转的标志写回旧值 → 后续请求既拿不到 PLAN 横幅，core 的 acting 拦截也退回 BUILD（等于 `plan_enter` 只对下一次 `call` 生效，且本回合内完全无效）。修法：发布前先把共享侧 `plan_mode_context` 取回本地（该字段只由工具写，共享侧始终是权威）。测试：`harness_plan_wait_tool_test::plan_enter_mid_turn_reaches_the_next_request`（已反向验证：去掉取回后第二个请求无 PLAN 横幅） |
+| S2 | 刚观察到 `interrupted` 就 `resume` 会偶发失败 | 运行的收据在 `finish_with_error` 时就写成 `interrupted`，而 `active_run` 要到随后清空 → 宿主观测到该状态立刻续跑会撞上 `require_idle`，报“Wait for the current execution to stop / could not be continued”。全量测试并发压力下可复现（`acp_interrupted_turn_test::a_forced_interrupt_is_continued_without_discarding_the_prompt`）。修法：`resume` 改为等待上一轮释放槽位（`wait_for_idle`，上限 5s，超时才报原错误）；`respond_all` 仍用即时 `require_idle`（运行中应答本就非法）。测试：`session::session::tests::a_continuation_waits_for_the_previous_run_to_release_its_slot`、`a_run_that_never_stops_still_fails_the_continuation`（已反向验证：把 helper 换回即时失败 → 前者 FAILED） |
 
 **同批复评的 core 侧缺口（C1/C2 本轮已修复，C3 仍待办）**：
 

@@ -34,6 +34,13 @@ const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 /// How long a host waits for an in-flight run to stop before it closes the turn itself.
 const ABANDON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a continuation waits for the interrupted run to finish unwinding.
+///
+/// A run's task status flips to `interrupted` while its future is still tearing down
+/// (and therefore still owns `active_run`). A host that resumes as soon as it observes
+/// that status must let the old run release the slot instead of failing spuriously.
+const RESUME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A command receipt. A queued task may not yet have a run id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
@@ -450,7 +457,7 @@ impl AgentSession {
         if !self.inspect().await?.uncertain_tool_calls.is_empty() {
             return Err(session_error("Reconcile uncertain tool outcomes first"));
         }
-        self.require_idle()?;
+        self.wait_idle().await?;
 
         let snapshot = self.inbox.snapshot().await?;
         let already_queued = snapshot.commands.iter().any(|existing| {
@@ -846,6 +853,17 @@ impl AgentSession {
             return Err(session_error("Wait for the current execution to stop"));
         }
         Ok(())
+    }
+
+    /// Waits (bounded) for the previous run to release `active_run`.
+    ///
+    /// `resume` is only reachable for an unfinished turn, and a run that was just
+    /// interrupted keeps the slot until its future finishes unwinding. Failing at once
+    /// turns that teardown race into a user-visible "could not be continued" error, so
+    /// wait for the slot instead; a run that never stops still fails after
+    /// [`RESUME_IDLE_TIMEOUT`].
+    async fn wait_idle(&self) -> crate::Result<()> {
+        wait_for_idle(&self.state, RESUME_IDLE_TIMEOUT).await
     }
 
     /// Starts the receipt fold at the current head for a command that has not been accepted
@@ -1607,6 +1625,28 @@ fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Waits (bounded) for `active_run` to be released.
+///
+/// A run's receipt flips to `interrupted` while its future is still unwinding, so a
+/// continuation requested on the strength of that receipt must wait for the slot instead
+/// of failing on a teardown race (see [`SessionRuntime::wait_idle`]). A run that never
+/// stops still fails once `timeout` elapses.
+async fn wait_for_idle(
+    state: &Mutex<SessionState>,
+    timeout: std::time::Duration,
+) -> crate::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if state.lock().unwrap().active_run.is_none() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(session_error("Wait for the current execution to stop"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1739,6 +1779,45 @@ mod tests {
         assert_eq!(
             cache.fold("cmd-1"),
             (Some("run-1".to_string()), "completed".to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continuation_waits_for_the_previous_run_to_release_its_slot() {
+        // A run publishes `interrupted` before its future has unwound, so `resume` can
+        // observe the receipt while `active_run` is still set. Waiting for the slot keeps
+        // that teardown race from surfacing as "could not be continued".
+        let state = Arc::new(Mutex::new(SessionState {
+            active_run: Some("run-1".to_string()),
+            ..Default::default()
+        }));
+        let release = Arc::clone(&state);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release.lock().unwrap().active_run = None;
+        });
+
+        wait_for_idle(&state, Duration::from_secs(5))
+            .await
+            .expect("a run that stops unwinding must not fail the continuation");
+        assert!(state.lock().unwrap().active_run.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_stops_still_fails_the_continuation() {
+        let state = Arc::new(Mutex::new(SessionState {
+            active_run: Some("run-1".to_string()),
+            ..Default::default()
+        }));
+
+        let error = wait_for_idle(&state, Duration::from_millis(30))
+            .await
+            .expect_err("a live run must keep blocking the continuation");
+        assert!(
+            error
+                .to_string()
+                .contains("Wait for the current execution to stop"),
+            "unexpected error: {error}"
         );
     }
 
