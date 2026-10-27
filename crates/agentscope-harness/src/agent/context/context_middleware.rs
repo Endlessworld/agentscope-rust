@@ -737,8 +737,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_agent_keeps_the_current_turn_and_persists_the_compaction() {
-        use agentscope_core::agent::Agent as _;
-
         // Reproduction of the real path: prior turns already exceed the window, and the
         // question of *this* turn is the tail compaction must preserve. The loop runs on a
         // private state clone, so this only holds if the loop hands the conversation over

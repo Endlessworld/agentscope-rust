@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentscope_core::agent::{CallableAgent, StreamOptions};
+use agentscope_core::agent::CallableAgent;
 use agentscope_core::message::{ContentBlock, JsonMap, Msg, TextBlock, ToolUseBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
