@@ -3,3 +3,7 @@ agents
 /target/**
 /MEMORY.md
 /large_tool_results/
+# Test artifacts: some harness tests build a default workspace rooted at the
+# crate directory, which writes MEMORY.md + memory/<date>.md there.
+/crates/*/MEMORY.md
+/crates/*/memory/
