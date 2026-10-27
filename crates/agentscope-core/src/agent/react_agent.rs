@@ -2946,6 +2946,15 @@ async fn acting_phase(
         .content(persisted)
         .build();
     state.context_mut().push(result_msg);
+    // Persist the settled tool results immediately. Waiting for the next `before_model`
+    // checkpoint leaves the whole settle window unprotected: a crash in between replays
+    // every `tool/dispatch` as uncertain even though the tools already ran and returned.
+    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+        recorder
+            .checkpoint_now(state, "after_acting")
+            .await
+            .map_err(|error| Error::ActionObservation(error.to_string()))?;
+    }
     Ok(ActingOutcome {
         suspended: snapshot.suspended,
         return_direct,
@@ -3268,10 +3277,13 @@ async fn run_acting_calls(
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
-                        // An observation failure means the *result* could not be acknowledged,
-                        // not that the tool failed. Replaying it would repeat real side effects,
-                        // so the run fails with the real error and the tool stays uncertain in
-                        // the journal (recovery must reconcile it explicitly).
+                        // A failed **end** acknowledgement means the *result* could not be
+                        // persisted, not that the tool failed. Replaying it would repeat real
+                        // side effects, so the run fails with the real error and the tool stays
+                        // uncertain in the journal (recovery must reconcile it explicitly).
+                        // A failed **start** acknowledgement ([`Error::ActionDispatch`]) is the
+                        // opposite: the tool never ran, so it falls through to the retryable
+                        // tool-error path below.
                         if matches!(e, Error::ActionObservation(_)) {
                             results.fail(err_msg.clone());
                             emit_tool_result_end(
@@ -3452,8 +3464,9 @@ async fn run_parallel_batch(
             tool_request_config(run.ctx),
             run.reply_id,
         );
-        // Same observation boundary as the serial path: an acknowledgement failure is a
-        // run-level error, never a retryable tool result.
+        // Same observation boundary as the serial path: a failed start acknowledgement is a
+        // retryable tool error (the tool never ran); only a failed end acknowledgement is a
+        // run-level error.
         match run.observe(call, tctx).await {
             Ok(rb) => {
                 emit_result_text_delta(run, call, &rb);
@@ -3502,8 +3515,9 @@ async fn run_parallel_batch(
                 results.record(bound, return_direct);
             }
             Err((call, error, message)) => {
-                // An unacknowledged result is a run-level failure: the batch is not
-                // committed and recovery must reconcile the call explicitly.
+                // An unacknowledged **end** is a run-level failure: the batch is not
+                // committed and recovery must reconcile the call explicitly. A failed start
+                // never ran the tool, so it is recorded as an ordinary tool error.
                 if matches!(error, Error::ActionObservation(_)) {
                     results.fail(message);
                     return Err(error);

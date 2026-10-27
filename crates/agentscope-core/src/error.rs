@@ -65,6 +65,14 @@ pub enum Error {
     #[error("Unable to persist action observation; do not replay the action automatically: {0}")]
     ActionObservation(String),
 
+    /// The `action/start` fact could not be acknowledged, so the action **never ran**.
+    ///
+    /// Unlike [`Error::ActionObservation`] this is safe to surface as a retryable tool
+    /// failure: no side effect happened, and the journal has no dispatch record to
+    /// reconcile. Callers downgrade it to a normal tool error result.
+    #[error("Unable to record the action start; the action did not run and may be retried: {0}")]
+    ActionDispatch(String),
+
     /// An `agent_state` save lost an optimistic-concurrency race under
     /// [`ConflictPolicy::Fail`](crate::state::ConflictPolicy::Fail).
     ///

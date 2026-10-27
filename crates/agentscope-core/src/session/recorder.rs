@@ -58,6 +58,18 @@ fn renew_interval(lease: Duration) -> Duration {
 /// safety bound, not a hard event limit.
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
+/// Whether a `bytes`-sized payload may join the pending buffer.
+///
+/// A payload that is larger than the whole budget on its own is still admitted when nothing
+/// else is buffered: the journal spills payloads above 64 KiB to immutable blobs, so the cost
+/// is one large allocation rather than an unbounded queue. Rejecting it instead failed the
+/// whole turn with `Session pending buffer exhausted` — exactly the case a long conversation
+/// checkpoints into.
+fn admits_bytes(pending: usize, inflight: usize, bytes: usize) -> bool {
+    let buffered = pending.saturating_add(inflight);
+    buffered == 0 || buffered.saturating_add(bytes) <= MAX_PENDING_BYTES
+}
+
 /// How many times a flush retries a transient persistence failure before giving up.
 const FLUSH_ATTEMPTS: usize = 6;
 
@@ -674,7 +686,7 @@ impl SessionRecorder {
             .as_ref()
             .map(|inflight| inflight.bytes)
             .unwrap_or(0);
-        if guard.pending_bytes + inflight_bytes + bytes > MAX_PENDING_BYTES {
+        if !admits_bytes(guard.pending_bytes, inflight_bytes, bytes) {
             return Err(session_error("Session pending buffer exhausted"));
         }
         let inflight_events = guard
@@ -1034,6 +1046,10 @@ impl SessionRecorder {
         state: &AgentState,
         reason: &str,
     ) -> crate::error::Result<()> {
+        // Publish whatever is already buffered first, so a large checkpoint is committed on
+        // its own (the journal spills it to a blob) instead of riding along with unrelated
+        // facts in one oversized batch.
+        self.flush().await?;
         self.capture_state(state, reason)?;
         self.flush().await
     }
@@ -1295,6 +1311,17 @@ mod tests {
     use crate::session::{
         AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, StorageValue,
     };
+
+    #[test]
+    fn an_oversized_payload_is_admitted_when_nothing_else_is_buffered() {
+        // A big checkpoint must not be rejected just because it exceeds the ceiling: the
+        // journal spills it to a blob, so it is committed alone instead of failing the turn.
+        assert!(admits_bytes(0, 0, MAX_PENDING_BYTES + 1));
+        // Anything else still respects the budget.
+        assert!(admits_bytes(1, 0, MAX_PENDING_BYTES - 1));
+        assert!(!admits_bytes(1, 0, MAX_PENDING_BYTES));
+        assert!(!admits_bytes(0, 1, MAX_PENDING_BYTES));
+    }
 
     /// Storage that can be told to fail commit writes, to exercise sticky failures.
     struct FailingStorage {

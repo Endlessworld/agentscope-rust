@@ -429,6 +429,7 @@ fn error_category(error: &crate::error::Error) -> &'static str {
         crate::error::Error::Cancelled(_) => "cancelled",
         crate::error::Error::Session(_) => "session",
         crate::error::Error::ActionObservation(_) => "action_observation",
+        crate::error::Error::ActionDispatch(_) => "action_dispatch",
         crate::error::Error::ConcurrentSessionModification { .. } => {
             "concurrent_session_modification"
         }

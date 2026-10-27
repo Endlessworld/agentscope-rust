@@ -250,7 +250,7 @@ where
     observer
         .record(&started, None)
         .await
-        .map_err(|error| crate::error::Error::ActionObservation(error.to_string()))?;
+        .map_err(|error| crate::error::Error::ActionDispatch(error.to_string()))?;
 
     match execution.await {
         Ok(result) => {
@@ -297,6 +297,7 @@ fn error_kind(error: &crate::error::Error) -> String {
         crate::error::Error::ShuttingDown(_) => "ShuttingDown".into(),
         crate::error::Error::Session(_) => "Session".into(),
         crate::error::Error::ActionObservation(_) => "ActionObservation".into(),
+        crate::error::Error::ActionDispatch(_) => "ActionDispatch".into(),
         crate::error::Error::ConcurrentSessionModification { .. } => {
             "ConcurrentSessionModification".into()
         }
@@ -351,6 +352,24 @@ mod tests {
             _observation: &ActionObservation,
             _result: Option<&ToolResultBlock>,
         ) -> Result<()> {
+            Err(crate::error::Error::Session("cannot persist".into()))
+        }
+    }
+
+    /// Fails only for the settled fact (the `action/end` acknowledgement), leaving the
+    /// start fact recordable.
+    struct FailingEndObserver;
+
+    #[async_trait::async_trait]
+    impl ActionObserver for FailingEndObserver {
+        async fn record(
+            &self,
+            observation: &ActionObservation,
+            _result: Option<&ToolResultBlock>,
+        ) -> Result<()> {
+            if observation.status == ActionStatus::Started {
+                return Ok(());
+            }
             Err(crate::error::Error::Session("cannot persist".into()))
         }
     }
@@ -452,9 +471,30 @@ mod tests {
         assert!(seen[1].1.is_none());
     }
 
+    /// An acknowledgement failure **before** the action ran is a retryable tool error: no
+    /// dispatch record exists and no side effect happened.
     #[tokio::test]
-    async fn a_failed_acknowledgement_propagates_instead_of_returning_a_result() {
+    async fn a_failed_start_acknowledgement_never_runs_and_is_retryable() {
         let ctx = ctx_with(Arc::new(FailingObserver));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let err = observe(&ctx, &call(), async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResultBlock::new("x", "y", vec![]))
+        })
+        .await
+        .unwrap_err();
+        // The tool never ran, so the caller may safely retry it as a tool error.
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            matches!(err, crate::error::Error::ActionDispatch(_)),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_end_acknowledgement_propagates_instead_of_returning_a_result() {
+        let ctx = ctx_with(Arc::new(FailingEndObserver));
         let err = observe(&ctx, &call(), async {
             Ok(ToolResultBlock::new("x", "y", vec![]))
         })
