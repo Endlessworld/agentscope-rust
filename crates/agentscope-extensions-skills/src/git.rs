@@ -662,8 +662,14 @@ fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
     };
     let mut offset = 0usize;
     for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']).trim();
-        if trimmed == "---" || trimmed == "..." {
+        // Java `MarkdownSkillParser.FRONTMATTER_PATTERN` requires the closing `---` / `...` to
+        // occupy the whole line on its own: it must directly follow a `\r` / `\n` (lookbehind),
+        // and only blank space may follow it before the next line break. So no leading
+        // indentation is allowed (an indented `  ---` is `|` / `>` block content), while
+        // trailing spaces / tabs stay permitted.
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let candidate = raw.trim_end_matches([' ', '\t']);
+        if candidate == "---" || candidate == "..." {
             return (Some(&rest[..offset]), &rest[offset + line.len()..]);
         }
         offset += line.len();
@@ -854,6 +860,75 @@ mod tests {
         // Path traversal in the frontmatter name is ignored.
         let (name, _) = skill_identity("---\nname: ../escape\n---\nbody\n", "dir-name");
         assert_eq!(name, "dir-name");
+    }
+
+    #[test]
+    fn split_frontmatter_splits_a_standard_fence() {
+        let md = "---\nname: calc\ndescription: Adds numbers\n---\n# Body\n";
+        assert_eq!(
+            split_frontmatter(md),
+            (Some("name: calc\ndescription: Adds numbers\n"), "# Body\n")
+        );
+
+        // An optional BOM and CRLF line endings behave identically.
+        let crlf = "\u{feff}---\r\nname: calc\r\n---\r\nbody\r\n";
+        assert_eq!(split_frontmatter(crlf), (Some("name: calc\r\n"), "body\r\n"));
+    }
+
+    /// Java parity: the closing fence must occupy a line of its own, so an indented `---`
+    /// (typically inside a `|` / `>` block scalar) stays body content.
+    #[test]
+    fn split_frontmatter_requires_the_closing_fence_to_be_unindented() {
+        let md = "---\nname: calc\nnote: |\n  ---\n  still body\n---\nreal body\n";
+        assert_eq!(
+            split_frontmatter(md),
+            (
+                Some("name: calc\nnote: |\n  ---\n  still body\n"),
+                "real body\n"
+            )
+        );
+
+        // Nothing but indented fences -> the frontmatter is never closed.
+        let md = "---\nname: calc\nblock: |\n  ---\n  ...\nbody\n";
+        assert_eq!(split_frontmatter(md), (None, md));
+    }
+
+    #[test]
+    fn split_frontmatter_rejects_a_fence_with_a_suffix() {
+        let md = "---\nname: calc\ndescription: d\n---suffix\nbody\n";
+        assert_eq!(split_frontmatter(md), (None, md));
+    }
+
+    #[test]
+    fn split_frontmatter_accepts_dots_and_trailing_blanks() {
+        assert_eq!(
+            split_frontmatter("---\nname: calc\n...\nbody\n"),
+            (Some("name: calc\n"), "body\n")
+        );
+        // Java allows blank space between the closing fence and the line break.
+        assert_eq!(
+            split_frontmatter("---\nname: calc\n---  \t\nbody\n"),
+            (Some("name: calc\n"), "body\n")
+        );
+    }
+
+    #[test]
+    fn split_frontmatter_returns_the_whole_text_without_a_closing_fence() {
+        let md = "---\nname: calc\nbody without a fence\n";
+        assert_eq!(split_frontmatter(md), (None, md));
+        assert_eq!(split_frontmatter("# Calc\n"), (None, "# Calc\n"));
+        // The opening fence needs a line break right behind it.
+        assert_eq!(split_frontmatter("---x\nbody\n"), (None, "---x\nbody\n"));
+    }
+
+    /// End-to-end guard: an indented fence inside a block scalar keeps the real body intact,
+    /// so the description still falls back to the first body heading (not the `---` fence).
+    #[test]
+    fn skill_identity_treats_an_indented_fence_as_body() {
+        let (name, desc) =
+            skill_identity("---\nname: calc\nnote: |\n  ---\n---\n# Heading\n", "dir-name");
+        assert_eq!(name, "calc");
+        assert_eq!(desc, "Heading");
     }
 
     #[test]
