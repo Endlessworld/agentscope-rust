@@ -15,6 +15,11 @@ pub enum SandboxErrorCode {
     WorkspaceStopError,
     /// A command execution failed on the remote side.
     CommandExecutionError,
+    /// A command execution exceeded its deadline in the remote sandbox.
+    ///
+    /// Mirrors the Java `SandboxErrorCode.EXEC_TIMEOUT`, raised by
+    /// `SandboxException.ExecTimeoutException`.
+    ExecTimeout,
     /// Failure while reading a workspace archive from the remote sandbox.
     WorkspaceArchiveReadError,
     /// Failure while writing a workspace archive to the remote sandbox.
@@ -32,6 +37,7 @@ impl SandboxErrorCode {
             SandboxErrorCode::WorkspaceStartError => "WORKSPACE_START_ERROR",
             SandboxErrorCode::WorkspaceStopError => "WORKSPACE_STOP_ERROR",
             SandboxErrorCode::CommandExecutionError => "COMMAND_EXECUTION_ERROR",
+            SandboxErrorCode::ExecTimeout => "EXEC_TIMEOUT",
             SandboxErrorCode::WorkspaceArchiveReadError => "WORKSPACE_ARCHIVE_READ_ERROR",
             SandboxErrorCode::WorkspaceArchiveWriteError => "WORKSPACE_ARCHIVE_WRITE_ERROR",
             SandboxErrorCode::RemoteTransportError => "REMOTE_TRANSPORT_ERROR",

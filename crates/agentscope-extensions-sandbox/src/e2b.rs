@@ -8,8 +8,13 @@
 //!   [`E2bSandboxClientOptions::snapshot_retention`] window described on
 //!   [`E2bBackend::prune_known_snapshots`] — note that E2B has **no snapshot listing endpoint**,
 //!   so retention only ever sees the ids this process recorded,
+//! * volume mounts attached at creation time (`volumeMounts: [{name, path}]` on
+//!   `POST /sandboxes`, mirroring the Java `E2bVolumeMount`),
 //! * command execution through envd (`process.Process/Start` over Connect, JSON codec),
 //!   including the 5-byte Connect frame envelope and base64 `stdout`/`stderr` events, and
+//! * a reliable exec deadline: the Connect `Connect-Timeout-Ms` header makes envd kill the
+//!   remote process server-side, while the client keeps a slightly later backup deadline
+//!   (Java `E2bEnvdProcessClient`, commit `aa66abfd0`), and
 //! * envd file transfer through the Filesystem REST API (`POST`/`GET /files`) — the prerequisite
 //!   for the workspace-projection work; the envd data-plane base URL can be overridden with the
 //!   [`E2B_SANDBOX_URL_ENV`] environment variable (the official SDK's `E2B_SANDBOX_URL`).
@@ -103,6 +108,122 @@ impl E2bCodec {
     }
 }
 
+/// A pre-existing E2B volume mounted into a sandbox at creation time.
+///
+/// Mirrors the Java `E2bVolumeMount` (commit `9730e8171`): `name` is the name of an
+/// **existing** E2B volume and `path` is the absolute in-sandbox mount path. The platform
+/// serializes the mount as `{"name": ..., "path": ...}` inside the `volumeMounts` array of
+/// the `POST /sandboxes` body.
+///
+/// The volume lifecycle (create / delete / list, content read/write) stays in the E2B
+/// dashboard or SDK; this type only describes *attach at create*.
+///
+/// The Java sibling `E2bCloudBucketMountStrategy` is an **empty placeholder interface**
+/// (deprecated in the same commit), so no cloud-bucket mount source is implemented here
+/// either — only the E2B volume source exists on both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2bVolumeMount {
+    /// Name of an existing E2B volume.
+    pub name: String,
+    /// Absolute in-sandbox mount path.
+    pub path: String,
+}
+
+impl E2bVolumeMount {
+    /// Creates a mount, validating the name and normalizing the path.
+    ///
+    /// The name must not be blank and the path must be absolute; both errors are
+    /// configuration errors raised before any network call (mirrors the Java setters).
+    pub fn new(name: impl Into<String>, path: impl Into<String>) -> SandboxResult<Self> {
+        let name = name.into();
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(SandboxExtensionError::Configuration(
+                "E2B volume mount name must be set (name of an existing volume)".to_string(),
+            ));
+        }
+        let path = Self::normalize_mount_path(&path.into())?;
+        Ok(Self { name, path })
+    }
+
+    /// Normalizes an in-sandbox mount path.
+    ///
+    /// Mirrors the Java `E2bVolumeMount#normalizeMountPath` (which delegates to
+    /// `WorkspaceMountSupport#normalizeVirtualPath`): trim whitespace, turn backslashes
+    /// into slashes, collapse repeated slashes and drop the trailing slash (except for the
+    /// root itself). The path must be absolute.
+    pub fn normalize_mount_path(path: &str) -> SandboxResult<String> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(SandboxExtensionError::Configuration(
+                "E2B volume mount path must be set (absolute in-sandbox path, e.g. /mnt/data)"
+                    .to_string(),
+            ));
+        }
+        let mut normalized = String::with_capacity(trimmed.len());
+        let mut previous_was_slash = false;
+        for ch in trimmed.chars() {
+            let ch = if ch == '\\' { '/' } else { ch };
+            if ch == '/' {
+                if previous_was_slash {
+                    continue;
+                }
+                previous_was_slash = true;
+            } else {
+                previous_was_slash = false;
+            }
+            normalized.push(ch);
+        }
+        while normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+        if !normalized.starts_with('/') {
+            return Err(SandboxExtensionError::Configuration(format!(
+                "E2B volume mount path must be absolute but was: {path}"
+            )));
+        }
+        Ok(normalized)
+    }
+
+    /// Returns whether `workspace_root` lives on the given mount.
+    ///
+    /// Mirrors the Java `E2bVolumeMount#coversWorkspaceRoot`: the root equals the mount
+    /// path or sits strictly beneath it. The trailing-slash guard keeps `/mnt/data-x` from
+    /// matching a `/mnt/data` mount.
+    pub fn covers_workspace_root(workspace_root: &str, mount_path: &str) -> bool {
+        if workspace_root.trim().is_empty() || mount_path.trim().is_empty() {
+            return false;
+        }
+        let Ok(root) = Self::normalize_mount_path(workspace_root) else {
+            return false;
+        };
+        let Ok(mount) = Self::normalize_mount_path(mount_path) else {
+            return false;
+        };
+        if mount == "/" {
+            return true;
+        }
+        root == mount || root.starts_with(&format!("{mount}/"))
+    }
+}
+
+/// Validates that no two mounts share the same in-sandbox path.
+///
+/// Mirrors the Java `E2bVolumeMount#requireDistinctMountPaths`.
+pub fn require_distinct_mount_paths(mounts: &[E2bVolumeMount]) -> SandboxResult<()> {
+    for (index, first) in mounts.iter().enumerate() {
+        for second in mounts.iter().skip(index + 1) {
+            if first.path == second.path {
+                return Err(SandboxExtensionError::Configuration(format!(
+                    "E2B volume mounts must use distinct paths, duplicated: {}",
+                    first.path
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Options for the E2B sandbox client (mirrors `E2bSandboxClientOptions`).
 #[derive(Debug, Clone)]
 pub struct E2bSandboxClientOptions {
@@ -137,6 +258,15 @@ pub struct E2bSandboxClientOptions {
     /// snapshots written by earlier processes cannot be discovered, counted or pruned. See
     /// [`E2bBackend::prune_known_snapshots`].
     pub snapshot_retention: Option<usize>,
+    /// Pre-existing E2B volumes mounted at sandbox creation time.
+    ///
+    /// Mirrors the Java `E2bSandboxClientOptions#volumeMounts`. Every entry is serialized as
+    /// `{"name": ..., "path": ...}` inside the `volumeMounts` array of the `POST /sandboxes`
+    /// body; the field is omitted entirely when the list is empty.
+    ///
+    /// The Java cloud-bucket mount strategy (`E2bCloudBucketMountStrategy`) is an empty
+    /// placeholder interface, so no cloud-bucket source is modelled here either.
+    pub volume_mounts: Vec<E2bVolumeMount>,
     /// envd Connect codec.
     pub codec: E2bCodec,
     /// TCP connect timeout in seconds.
@@ -160,11 +290,29 @@ impl Default for E2bSandboxClientOptions {
             run_user: "user".to_string(),
             persistence_mode: E2bPersistenceMode::Tar,
             snapshot_retention: None,
+            volume_mounts: Vec::new(),
             codec: E2bCodec::Proto,
             connect_timeout_seconds: 30,
             read_timeout_seconds: 120,
             max_retries: 3,
         }
+    }
+}
+
+impl E2bSandboxClientOptions {
+    /// Adds a volume mount, validating it and keeping the mount paths distinct.
+    ///
+    /// Mirrors the Java `E2bSandboxClientOptions#addVolumeMount` (which also runs the
+    /// distinct-path check of `setVolumeMounts`).
+    pub fn with_volume_mount(
+        mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+    ) -> SandboxResult<Self> {
+        let mount = E2bVolumeMount::new(name, path)?;
+        self.volume_mounts.push(mount);
+        require_distinct_mount_paths(&self.volume_mounts)?;
+        Ok(self)
     }
 }
 
@@ -201,14 +349,148 @@ impl E2bSnapshotRefs {
     }
 }
 
-/// Builds the `POST /sandboxes` request body.
+/// Builds the `POST /sandboxes` request body (without volume mounts).
+///
+/// Kept as the legacy two-argument shape: a sandbox created without mounts must produce
+/// exactly `{templateID, timeout}`. See [`build_create_sandbox_body_with_mounts`].
 pub fn build_create_sandbox_body(template_id: &str, timeout_seconds: u64) -> Value {
-    json!({ "templateID": template_id, "timeout": timeout_seconds })
+    build_create_sandbox_body_with_mounts(template_id, timeout_seconds, &[])
+}
+
+/// Builds the `POST /sandboxes` request body, mounting pre-existing volumes when given.
+///
+/// Mirrors the Java `E2bPlatformHttp#createSandbox` (commit `9730e8171`): the mounts are
+/// serialized as `volumeMounts: [{name, path}]` and the field is **omitted** when no mount
+/// is configured, so the legacy request body stays byte-identical.
+pub fn build_create_sandbox_body_with_mounts(
+    template_id: &str,
+    timeout_seconds: u64,
+    mounts: &[E2bVolumeMount],
+) -> Value {
+    let mut body = json!({ "templateID": template_id, "timeout": timeout_seconds });
+    if !mounts.is_empty() {
+        let entries: Vec<Value> = mounts
+            .iter()
+            .map(|mount| json!({ "name": mount.name, "path": mount.path }))
+            .collect();
+        body["volumeMounts"] = Value::Array(entries);
+    }
+    body
 }
 
 /// Builds the `POST /sandboxes/{id}/connect` request body.
 pub fn build_connect_sandbox_body(timeout_seconds: u64) -> Value {
     json!({ "timeout": timeout_seconds })
+}
+
+/// Slack between the server-side kill deadline and the client-side backup deadline.
+///
+/// Mirrors the Java `E2bEnvdProcessClient.CLIENT_TIMEOUT_SLACK_MILLIS` (5 s): the server
+/// deadline (`Connect-Timeout-Ms`) fires first and kills the remote process, the client
+/// backup only guarantees a bounded return when the server never answers (mishaved server
+/// or hung stream) and absorbs connect/setup jitter.
+pub const CLIENT_TIMEOUT_SLACK_SECONDS: u64 = 5;
+
+/// Connect error code envd returns when the server-side exec deadline fired.
+pub const CONNECT_DEADLINE_EXCEEDED: &str = "deadline_exceeded";
+
+/// Computes the Connect `Connect-Timeout-Ms` value that arms the server-side kill.
+///
+/// E2B's data plane exposes no "kill a running process" endpoint for a process started
+/// through `process.Process/Start`: the kill is requested **when the process starts**, by
+/// attaching the Connect deadline to the start request, and envd terminates the remote
+/// process once that deadline lapses (Java `E2bEnvdProcessClient`, commit `aa66abfd0`).
+/// Without the header a client-side timeout only drops the HTTP stream and leaks the
+/// process.
+///
+/// `timeout_seconds == 0` means "no deadline" and yields `None`: the header must be omitted
+/// because `Connect-Timeout-Ms: 0` means "deadline already exceeded", not "no deadline".
+pub fn connect_timeout_ms_header(timeout_seconds: u64) -> Option<String> {
+    if timeout_seconds == 0 {
+        return None;
+    }
+    Some(timeout_seconds.saturating_mul(1000).to_string())
+}
+
+/// The overall client-side deadline of an exec call.
+///
+/// `None` means "no exec deadline": the transport-level `read_timeout_seconds` stays the
+/// only bound (the legacy behaviour). Otherwise the deadline is the requested timeout plus
+/// [`CLIENT_TIMEOUT_SLACK_SECONDS`], mirroring the Java per-call `callTimeout`: the server
+/// deadline fires first (and kills the process), the slack only guarantees a bounded
+/// return when the server never answers.
+pub fn exec_client_deadline(timeout_seconds: u64) -> Option<Duration> {
+    if timeout_seconds == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(
+        timeout_seconds.saturating_add(CLIENT_TIMEOUT_SLACK_SECONDS),
+    ))
+}
+
+/// Runs `fut` under the exec deadline, mapping an expired deadline onto an exec timeout.
+///
+/// `timeout_seconds == 0` means "no deadline" and leaves `fut` untouched (the
+/// transport-level timeout remains the only bound). The error message never contains the
+/// command text: commands are model-generated and may inline secrets (same choice as the
+/// Java `SandboxException.ExecTimeoutException`).
+pub async fn with_exec_deadline<T, F>(timeout_seconds: u64, fut: F) -> SandboxResult<T>
+where
+    F: std::future::Future<Output = SandboxResult<T>>,
+{
+    let Some(deadline) = exec_client_deadline(timeout_seconds) else {
+        return fut.await;
+    };
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(exec_timeout_error(timeout_seconds)),
+    }
+}
+
+/// Builds the exec timeout error for `timeout_seconds`.
+pub fn exec_timeout_error(timeout_seconds: u64) -> SandboxExtensionError {
+    SandboxExtensionError::Runtime(
+        SandboxErrorCode::ExecTimeout,
+        format!("Command timed out after {timeout_seconds}s"),
+    )
+}
+
+/// Maps a transport failure of an exec call onto the exec error taxonomy.
+///
+/// A reqwest timeout means the transport gave up on the whole request. When an exec
+/// deadline was requested it is reported as an exec timeout (the remote process was killed
+/// server-side through the `Connect-Timeout-Ms` deadline); without a deadline it stays a
+/// plain transport error, because no deadline was ever asked for.
+fn map_exec_transport_error(err: reqwest::Error, timeout_seconds: u64) -> SandboxExtensionError {
+    if err.is_timeout() && timeout_seconds > 0 {
+        return exec_timeout_error(timeout_seconds);
+    }
+    SandboxExtensionError::Transport(err.to_string())
+}
+
+/// Server-side kill channel for an envd process.
+///
+/// The E2B data plane has no "kill a running process" endpoint: the kill is requested when
+/// the process starts (see [`connect_timeout_ms_header`]) and envd terminates the remote
+/// process once the deadline lapses. The trait isolates that request so the exec path can
+/// be exercised offline with a fake recording the requested deadline.
+pub trait E2bKillDeadline: Send + Sync + std::fmt::Debug {
+    /// Returns the `Connect-Timeout-Ms` value (in milliseconds) that arms the server-side
+    /// kill, or `None` when no kill must be armed.
+    fn deadline_ms(&self, timeout_seconds: u64) -> Option<u64>;
+}
+
+/// Production kill channel: the Connect deadline header value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnvdKillDeadline;
+
+impl E2bKillDeadline for EnvdKillDeadline {
+    fn deadline_ms(&self, timeout_seconds: u64) -> Option<u64> {
+        if timeout_seconds == 0 {
+            return None;
+        }
+        Some(timeout_seconds.saturating_mul(1000))
+    }
 }
 
 /// Extracts lifecycle fields from an E2B sandbox JSON object into stable snake_case keys.
@@ -446,7 +728,8 @@ pub struct EnvdStreamResult {
 ///
 /// * a compressed frame (`0x01`) is rejected as [`SandboxExtensionError::Unsupported`],
 /// * an end-stream trailer (`0x02`) whose `EndStreamMessage` carries a truthy `error` is rejected
-///   as [`SandboxErrorCode::WorkspaceStartError`],
+///   as [`SandboxErrorCode::WorkspaceStartError`] (a `deadline_exceeded` code is reported as
+///   [`SandboxErrorCode::ExecTimeout`]: the server killed the process on its deadline),
 /// * an unterminated stream yields `exit_code == None` so the caller can report it.
 pub fn drain_envd_stream(data: &[u8]) -> SandboxResult<EnvdStreamResult> {
     let mut result = EnvdStreamResult::default();
@@ -457,6 +740,16 @@ pub fn drain_envd_stream(data: &[u8]) -> SandboxResult<EnvdStreamResult> {
             ));
         }
         if envelope.flags & CONNECT_FLAG_END_STREAM != 0 {
+            // A server-side exec deadline kill surfaces here as `deadline_exceeded`; it is
+            // an exec timeout, not a generic stream failure (Java `ConnectStreamException`).
+            if parse_end_stream_error_code(&envelope.payload).as_deref()
+                == Some(CONNECT_DEADLINE_EXCEEDED)
+            {
+                return Err(SandboxExtensionError::Runtime(
+                    SandboxErrorCode::ExecTimeout,
+                    format!("envd process stream exceeded the server-side exec deadline ({CONNECT_DEADLINE_EXCEEDED})"),
+                ));
+            }
             // A trailer that is not valid `EndStreamMessage` JSON is tolerated here (Java throws):
             // the stream itself is complete, so a missing exit code is reported by the caller.
             if let Some(description) = parse_end_stream_error(&envelope.payload) {
@@ -499,6 +792,24 @@ pub fn parse_end_stream_error(payload: &[u8]) -> Option<String> {
     })
 }
 
+/// Parses the raw Connect error code of an `EndStreamMessage` trailer.
+///
+/// Returns `None` when the trailer carries no error, no code, or a falsy error value (the
+/// Connect truthiness rules). Unlike [`parse_end_stream_error`] the code is returned
+/// verbatim, so the caller can tell the server-side deadline kill (`deadline_exceeded`) from
+/// other stream failures.
+pub fn parse_end_stream_error_code(payload: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    let error = value.get("error")?;
+    if is_falsy(error) {
+        return None;
+    }
+    error
+        .get("code")
+        .and_then(Value::as_str)
+        .map(|code| code.to_string())
+}
+
 /// Connect / Python-SDK truthiness: missing, `null`, empty containers, `""`, `0` and `false`
 /// all mean "no error".
 fn is_falsy(value: &Value) -> bool {
@@ -518,6 +829,11 @@ pub struct E2bBackend {
     options: E2bSandboxClientOptions,
     client: Client,
     retry: RetryPolicy,
+    /// Channel asking envd to kill the remote process when the exec deadline lapses.
+    ///
+    /// Injectable so the exec timeout path can be exercised offline with a fake recording
+    /// the requested deadline (see [`E2bKillDeadline`]).
+    kill_deadline: Arc<dyn E2bKillDeadline>,
     /// Snapshot ids created through this backend instance, oldest first.
     ///
     /// E2B exposes create (`POST /sandboxes/{id}/snapshots`) and delete
@@ -530,6 +846,17 @@ pub struct E2bBackend {
 impl E2bBackend {
     /// Builds a backend, wiring up the reqwest client and retry policy.
     pub fn new(options: E2bSandboxClientOptions) -> SandboxResult<Self> {
+        Self::with_kill_deadline(options, Arc::new(EnvdKillDeadline))
+    }
+
+    /// Builds a backend with an injected server-side kill channel.
+    ///
+    /// The production channel is [`EnvdKillDeadline`]; tests inject a recording fake to
+    /// assert that the exec timeout really asks the platform to kill the process.
+    pub fn with_kill_deadline(
+        options: E2bSandboxClientOptions,
+        kill_deadline: Arc<dyn E2bKillDeadline>,
+    ) -> SandboxResult<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
             .timeout(Duration::from_secs(options.read_timeout_seconds))
@@ -542,6 +869,7 @@ impl E2bBackend {
             options,
             client,
             retry,
+            kill_deadline,
             known_snapshots: Mutex::new(Vec::new()),
         })
     }
@@ -812,7 +1140,11 @@ impl E2bBackend {
         &self,
         template_id: &str,
     ) -> SandboxResult<BTreeMap<String, String>> {
-        let body = build_create_sandbox_body(template_id, self.options.sandbox_timeout_seconds);
+        let body = build_create_sandbox_body_with_mounts(
+            template_id,
+            self.options.sandbox_timeout_seconds,
+            &self.options.volume_mounts,
+        );
         let value = self.platform_post("/sandboxes", &body).await?;
         Ok(parse_sandbox_fields(&value))
     }
@@ -1050,6 +1382,7 @@ impl RemoteBackend for E2bBackend {
                 "E2B envd PROTO codec is not implemented; set codec = E2bCodec::Json".to_string(),
             ));
         }
+        let started = std::time::Instant::now();
         let host = self.envd_base_url(handle);
         let url = join_url(&host, "process.Process/Start");
         let payload = serde_json::to_vec(&build_envd_start_json_body(command, cwd))
@@ -1060,7 +1393,15 @@ impl RemoteBackend for E2bBackend {
         let sandbox_id = handle.id.clone();
         let client = self.client.clone();
         let retry = self.retry.clone();
-        let body = with_retries(&retry, move || {
+        // 服务端 kill：把 Connect deadline 绑到 start 请求上，envd 到点终止远端进程。
+        // `timeout_seconds == 0` 表示不限时，此时连 kill 都不请求。
+        let kill_deadline_ms = match timeout_seconds {
+            0 => None,
+            seconds => self.kill_deadline.deadline_ms(seconds),
+        };
+        // 客户端整体时限：请求超时 + 备份余量（服务端 deadline 先到，先 kill 进程）。
+        let client_deadline = exec_client_deadline(timeout_seconds);
+        let call = with_retries(&retry, move || {
             let client = client.clone();
             let url = url.clone();
             let auth = auth.clone();
@@ -1077,18 +1418,27 @@ impl RemoteBackend for E2bBackend {
                     .header("E2b-Sandbox-Port", ENVD_PORT.to_string())
                     .header("Authorization", auth)
                     .body(envelope);
+                if let Some(deadline_ms) = kill_deadline_ms {
+                    // envd 读到该头就会在 deadline 到期时 kill 掉远端进程。
+                    request = request.header("Connect-Timeout-Ms", deadline_ms.to_string());
+                }
                 if let Some(token) = &access_token {
                     request = request.header("X-Access-Token", token);
+                }
+                if let Some(deadline) = client_deadline {
+                    // 覆盖客户端级的整体超时（`read_timeout_seconds`），让 exec 时限成为这次
+                    // 请求唯一的整体时限（对应 Java 的 per-call `callTimeout`）。
+                    request = request.timeout(deadline);
                 }
                 let response = request
                     .send()
                     .await
-                    .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
+                    .map_err(|e| map_exec_transport_error(e, timeout_seconds))?;
                 let status = response.status();
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
+                    .map_err(|e| map_exec_transport_error(e, timeout_seconds))?;
                 if !status.is_success() {
                     return Err(SandboxExtensionError::http(
                         status.as_u16(),
@@ -1097,16 +1447,46 @@ impl RemoteBackend for E2bBackend {
                 }
                 Ok(bytes.to_vec())
             }
-        })
-        .await?;
-        let _ = timeout_seconds;
-        let stream = drain_envd_stream(&body)?;
-        let exit_code = stream.exit_code.ok_or_else(|| {
-            SandboxExtensionError::Runtime(
-                SandboxErrorCode::CommandExecutionError,
-                "envd process stream ended before receiving an exit code".to_string(),
-            )
+        });
+        let body = with_exec_deadline(timeout_seconds, call).await.map_err(|err| {
+            if matches!(err, SandboxExtensionError::Runtime(SandboxErrorCode::ExecTimeout, _)) {
+                tracing::warn!(
+                    timeout_seconds = timeout_seconds,
+                    "e2b: exec exceeded its deadline; the remote process was killed server-side"
+                );
+            }
+            err
         })?;
+        let stream = match drain_envd_stream(&body) {
+            Ok(stream) => stream,
+            Err(err) => {
+                if matches!(err, SandboxExtensionError::Runtime(SandboxErrorCode::ExecTimeout, _)) {
+                    tracing::warn!(
+                        timeout_seconds = timeout_seconds,
+                        "e2b: exec was killed server-side after the deadline expired"
+                    );
+                    // 服务端 deadline 到期（envd 已 kill 掉远端进程），统一成 exec 超时错误。
+                    return Err(exec_timeout_error(timeout_seconds));
+                }
+                return Err(err);
+            }
+        };
+        let exit_code = match stream.exit_code {
+            Some(code) => code,
+            None => {
+                // Java：超过 deadline 却没有退出码的流，按 exec 超时处理；deadline 之前则是
+                // 普通的流异常。
+                if timeout_seconds > 0
+                    && started.elapsed() >= Duration::from_secs(timeout_seconds)
+                {
+                    return Err(exec_timeout_error(timeout_seconds));
+                }
+                return Err(SandboxExtensionError::Runtime(
+                    SandboxErrorCode::CommandExecutionError,
+                    "envd process stream ended before receiving an exit code".to_string(),
+                ));
+            }
+        };
         Ok(RemoteExecOutput {
             exit_code,
             stdout: String::from_utf8_lossy(&stream.stdout).into_owned(),
@@ -2182,5 +2562,317 @@ mod tests {
             "the newest snapshot must survive"
         );
         assert_eq!(backend.known_snapshot_ids(), vec!["snap-1".to_string()]);
+    }
+
+    // ------------------------------------------------------ volume mounts (E2B `volumeMounts`)
+
+    #[test]
+    fn volume_mount_validates_name_and_normalizes_path() {
+        let mount = E2bVolumeMount::new("vol-a", "/mnt/data/").expect("valid mount");
+        assert_eq!(mount.name, "vol-a");
+        assert_eq!(mount.path, "/mnt/data");
+        // 空白名 / 空白路径 / 相对路径都是配置错误。
+        assert!(E2bVolumeMount::new("  ", "/mnt/data").is_err());
+        assert!(E2bVolumeMount::new("vol-a", "   ").is_err());
+        assert!(E2bVolumeMount::new("vol-a", "mnt/data").is_err());
+        // 反斜杠与重复斜杠被折叠，结尾斜杠被去掉（根路径除外）。
+        assert_eq!(
+            E2bVolumeMount::normalize_mount_path("//mnt\\\\data//").unwrap(),
+            "/mnt/data"
+        );
+        assert_eq!(E2bVolumeMount::normalize_mount_path("/").unwrap(), "/");
+    }
+
+    #[test]
+    fn volume_mount_covers_workspace_root() {
+        assert!(E2bVolumeMount::covers_workspace_root(
+            "/mnt/data",
+            "/mnt/data"
+        ));
+        assert!(E2bVolumeMount::covers_workspace_root(
+            "/mnt/data/sub",
+            "/mnt/data"
+        ));
+        // `/mnt/data-x` 不在 `/mnt/data` 挂载下。
+        assert!(!E2bVolumeMount::covers_workspace_root(
+            "/mnt/data-x",
+            "/mnt/data"
+        ));
+        assert!(E2bVolumeMount::covers_workspace_root("/anything", "/"));
+        assert!(!E2bVolumeMount::covers_workspace_root("", "/mnt/data"));
+    }
+
+    #[test]
+    fn require_distinct_mount_paths_rejects_duplicates() {
+        let a = E2bVolumeMount::new("vol-a", "/mnt/data").unwrap();
+        let b = E2bVolumeMount::new("vol-b", "/mnt/data").unwrap();
+        let c = E2bVolumeMount::new("vol-c", "/mnt/other").unwrap();
+        assert!(require_distinct_mount_paths(&[a.clone(), c.clone()]).is_ok());
+        let err = require_distinct_mount_paths(&[a, b]).unwrap_err();
+        assert!(err.to_string().contains("/mnt/data"), "got {err}");
+    }
+
+    #[test]
+    fn options_with_volume_mount_validates_and_rejects_duplicates() {
+        let options = E2bSandboxClientOptions::default()
+            .with_volume_mount("vol-a", "/mnt/data")
+            .expect("valid mount");
+        assert_eq!(options.volume_mounts.len(), 1);
+        assert_eq!(options.volume_mounts[0].name, "vol-a");
+        assert_eq!(options.volume_mounts[0].path, "/mnt/data");
+        // 路径重复必须被拒绝（Java `setVolumeMounts` 的 distinct-path 检查）。
+        let err = options
+            .with_volume_mount("vol-b", "/mnt/data")
+            .unwrap_err();
+        assert!(err.to_string().contains("distinct"), "got {err}");
+        // 非法挂载直接失败，不进入配置。
+        assert!(E2bSandboxClientOptions::default()
+            .with_volume_mount("vol-a", "relative/path")
+            .is_err());
+    }
+
+    #[test]
+    fn create_body_with_volume_mounts_matches_java() {
+        let mount = E2bVolumeMount::new("vol-a", "/mnt/data").unwrap();
+        let body = build_create_sandbox_body_with_mounts("base", 300, &[mount]);
+        assert_eq!(body["templateID"], "base");
+        assert_eq!(body["timeout"], 300);
+        let mounts = body["volumeMounts"].as_array().expect("volumeMounts array");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["name"], "vol-a");
+        assert_eq!(mounts[0]["path"], "/mnt/data");
+    }
+
+    #[test]
+    fn create_body_without_volume_mounts_keeps_the_legacy_shape() {
+        // 无挂载时请求体必须和旧形状完全一致（不能塞空数组）。
+        assert_eq!(
+            build_create_sandbox_body("base", 300),
+            json!({ "templateID": "base", "timeout": 300 })
+        );
+        assert_eq!(
+            build_create_sandbox_body_with_mounts("base", 300, &[]),
+            json!({ "templateID": "base", "timeout": 300 })
+        );
+        assert!(build_create_sandbox_body("base", 300)
+            .get("volumeMounts")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn platform_create_sends_volume_mounts() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandboxes")
+                    .json_body(json!({
+                        "templateID": "base",
+                        "timeout": 300,
+                        "volumeMounts": [{"name": "vol-a", "path": "/mnt/data"}],
+                    }));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"sandboxID":"sbx-10","domain":"e2b.dev"}"#);
+            })
+            .await;
+        let backend = E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url: server.base_url(),
+            volume_mounts: vec![E2bVolumeMount::new("vol-a", "/mnt/data").unwrap()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let handle = backend.create_sandbox("sess-1").await.unwrap();
+        mock.assert_async().await;
+        assert_eq!(handle.id, "sbx-10");
+    }
+
+    // --------------------------------------------- exec deadline + server-side kill
+
+    /// Recording fake for the server-side kill channel.
+    #[derive(Debug, Default)]
+    struct RecordingKillDeadline {
+        calls: Mutex<Vec<u64>>,
+    }
+
+    impl RecordingKillDeadline {
+        /// The requested deadlines, in call order.
+        fn calls(&self) -> Vec<u64> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl E2bKillDeadline for RecordingKillDeadline {
+        fn deadline_ms(&self, timeout_seconds: u64) -> Option<u64> {
+            self.calls.lock().unwrap().push(timeout_seconds);
+            Some(timeout_seconds.saturating_mul(1000))
+        }
+    }
+
+    /// Builds a Connect response body carrying a server-side deadline kill.
+    fn envd_body_with_deadline_exceeded() -> Vec<u8> {
+        let trailer = serde_json::to_vec(&json!({
+            "error": {"code": "deadline_exceeded", "message": "deadline exceeded"}
+        }))
+        .unwrap();
+        let mut body = vec![CONNECT_FLAG_END_STREAM];
+        body.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+        body.extend_from_slice(&trailer);
+        body
+    }
+
+    /// httpmock matcher: the request must **not** carry the Connect kill deadline header.
+    fn without_connect_timeout_header(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        match &req.headers {
+            None => true,
+            Some(headers) => !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("connect-timeout-ms")),
+        }
+    }
+
+    #[test]
+    fn connect_timeout_ms_header_arms_the_server_side_kill() {
+        assert_eq!(connect_timeout_ms_header(5).as_deref(), Some("5000"));
+        assert_eq!(connect_timeout_ms_header(120).as_deref(), Some("120000"));
+        // 0 表示不限时：不能发 `Connect-Timeout-Ms: 0`（那是"deadline 已过期"）。
+        assert_eq!(connect_timeout_ms_header(0), None);
+        assert_eq!(EnvdKillDeadline.deadline_ms(0), None);
+        assert_eq!(EnvdKillDeadline.deadline_ms(3), Some(3000));
+    }
+
+    #[test]
+    fn exec_client_deadline_adds_the_backup_slack() {
+        // 不限时时不额外加限时，transport 的 read_timeout_seconds 仍是唯一上限。
+        assert_eq!(exec_client_deadline(0), None);
+        assert_eq!(
+            exec_client_deadline(5),
+            Some(Duration::from_secs(5 + CLIENT_TIMEOUT_SLACK_SECONDS))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exec_deadline_expires_and_reports_a_timeout() {
+        let result: SandboxResult<()> = with_exec_deadline(1, async {
+            std::future::pending::<()>().await;
+            Ok::<(), SandboxExtensionError>(())
+        })
+        .await;
+        let err = result.unwrap_err();
+        match err {
+            SandboxExtensionError::Runtime(code, msg) => {
+                assert_eq!(code, SandboxErrorCode::ExecTimeout);
+                assert!(msg.contains("timed out after 1s"), "got {msg}");
+                // 错误信息不能带命令文本（命令是模型生成的，可能内联密钥）。
+                assert!(!msg.contains("sleep"), "got {msg}");
+            }
+            other => panic!("expected an exec timeout error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exec_without_deadline_is_not_limited() {
+        let result: SandboxResult<u32> =
+            with_exec_deadline(0, async { Ok::<u32, SandboxExtensionError>(7) }).await;
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_arms_the_server_side_kill_and_reports_an_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/process.Process/Start")
+                    // 服务端 kill 的 deadline 必须真的发出去。
+                    .header("connect-timeout-ms", "5000");
+                then.status(200).body(envd_body_with_deadline_exceeded());
+            })
+            .await;
+        let recorder = Arc::new(RecordingKillDeadline::default());
+        let killer: Arc<dyn E2bKillDeadline> = Arc::clone(&recorder) as Arc<dyn E2bKillDeadline>;
+        let backend = E2bBackend::with_kill_deadline(
+            E2bSandboxClientOptions {
+                api_key: Some("secret".to_string()),
+                api_base_url: "http://127.0.0.1:1".to_string(),
+                envd_sandbox_url: Some(server.base_url()),
+                codec: E2bCodec::Json,
+                max_retries: 1,
+                ..Default::default()
+            },
+            killer,
+        )
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let err = backend
+            .exec_in(&handle, "sleep 100", None, 5)
+            .await
+            .unwrap_err();
+        match err {
+            SandboxExtensionError::Runtime(code, msg) => {
+                assert_eq!(code, SandboxErrorCode::ExecTimeout);
+                assert!(msg.contains("timed out after 5s"), "got {msg}");
+            }
+            other => panic!("expected an exec timeout error, got {other:?}"),
+        }
+        // kill 确实被请求过，且参数就是请求的 timeout。
+        assert_eq!(recorder.calls(), vec![5]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn exec_without_deadline_does_not_arm_the_kill() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/process.Process/Start")
+                    .matches(without_connect_timeout_header);
+                then.status(200).body(envd_body_with_exit(0, b"hi"));
+            })
+            .await;
+        let recorder = Arc::new(RecordingKillDeadline::default());
+        let killer: Arc<dyn E2bKillDeadline> = Arc::clone(&recorder) as Arc<dyn E2bKillDeadline>;
+        let backend = E2bBackend::with_kill_deadline(
+            E2bSandboxClientOptions {
+                api_key: Some("secret".to_string()),
+                api_base_url: "http://127.0.0.1:1".to_string(),
+                envd_sandbox_url: Some(server.base_url()),
+                codec: E2bCodec::Json,
+                max_retries: 1,
+                ..Default::default()
+            },
+            killer,
+        )
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let output = backend
+            .exec_in(&handle, "echo hi", None, 0)
+            .await
+            .expect("exec succeeds");
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "hi");
+        // 未限时 => 没有请求任何 kill。
+        assert!(recorder.calls().is_empty());
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn drain_envd_stream_maps_deadline_exceeded_to_an_exec_timeout() {
+        let err = drain_envd_stream(&envd_body_with_deadline_exceeded()).unwrap_err();
+        match err {
+            SandboxExtensionError::Runtime(code, msg) => {
+                assert_eq!(code, SandboxErrorCode::ExecTimeout);
+                assert!(msg.contains("deadline_exceeded"), "got {msg}");
+            }
+            other => panic!("expected an exec timeout error, got {other:?}"),
+        }
     }
 }
