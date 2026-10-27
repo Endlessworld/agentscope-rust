@@ -1177,6 +1177,8 @@ results.record(error_result(call, &err_msg), false);
 | P1-10 | suspended / external execution 在 ACP 中不可恢复 | 新增 `AcpAgentSession::respond`（API 层），复用 `AgentSession::respond_all` | `extensions-acp/src/session.rs` |
 | P1-13 | `model/chunk` 与模型流强耦合 | 前序提交 `b14a70a` 已改为 `MergedChunk`（4KiB / 64 delta / 1s 合并） | `session/models.rs` |
 
+> 其中 P0-9、P0-12、P1-1、P1-3、P1-7、P1-10 只完成了一部分，实际残留与影响见 7.5.1。
+
 ### 7.2 一并硬化的部分
 
 | 改动 | 原因 |
@@ -1219,24 +1221,108 @@ results.record(error_result(call, &err_msg), false);
 
 ### 7.5 仍未完成（明确遗留）
 
+> **本节已被 §8（第二轮修复回执）取代**：P0-7/P0-9/P0-10/P0-12/P1-1/P1-3/P1-5/P1-6/P1-7/P1-8/P1-10 已在第二轮落地，剩余项与理由见 §8.3。下表保留为第一轮的原始记录。
+>
+> 2026-10-27 复核（HEAD `487fc70`，工作区干净）：本节按源码逐项核对，并补上回执初稿漏记的条目，分「只做一半/漏做」与「初稿已列、确认仍未做」两部分。
+>
+> 复核实跑（全绿，0 failed）：`cargo test -p agentscope-core --lib -- session::` 55 passed；`cargo test -p agentscope-harness --lib -- agent::session::` 27 passed；`cargo test -p agentscope-extensions-acp --lib` 50 passed。
+
+#### 7.5.1 只做了一半 / 初稿漏记
+
+| 编号 | 项 | 现状 / 影响 | 建议 |
+|---|---|---|---|
+| P0-9 | **stdin EOF / transport close 没有 drain**（只修了信号路径） | `acp_harness_agent.rs:1167` 只注册 Ctrl-C/SIGTERM handler；`:1171` `agent.run_stdio().await?` 返回后 `main` 直接结束，runtime 析构时进行中的 recorder / tool 任务被 drop，`Drop` 里的 `spawn(release)` 跑不到。IDE 重启、关闭 stdin 仍是原始故障场景 | 监听 stdin EOF 与 transport 关闭，复用 shutdown 流程：interrupt → 等 `is_running` / `active_request_count` 归零 → `cancel` + `close` → 再退出，不直接返回 |
+| P0-12 | 只把上限从 16MiB 抬到 64MiB | `recorder.rs:59` `MAX_PENDING_BYTES = 64MiB`；`capture_state`（`recorder.rs:728-830`）仍把整个 `AgentState` 塞进 pending，超限仍然硬失败 `Session pending buffer exhausted` | 按报告原方案：大 checkpoint 走内容寻址 blob，commit 只带引用；或 checkpoint 前先 flush 再单独提交 |
+| P0-7 | 「工具结果写入后立即 checkpoint」未单独实现 | 全仓 `checkpoint_now` 只有 `before_acting`（`react_agent.rs:2849`）、`before_model`（`state_access.rs:279`）、`session_input`（`execution.rs:236`）。工具结果要等下一轮 `before_model` 才落盘，中间崩溃依赖 `tool/dispatch` / `action/end` 判 uncertain | 工具批次结束、进入下一次模型调用前显式 checkpoint，缩短不一致窗口 |
+| P1-1 | 只对齐了「end 失败不许降级」，未区分 start | `react_agent.rs:3275`、`:3494` 对所有 `Error::ActionObservation` 一律升级为 run 级错误。工具**未执行**的 action/start 失败本可安全重试，现在也会直接把这一轮判死 | 按 start/end 分级：start 失败可重试；end 失败才保留真实结果并标 uncertain |
+| P1-3 | 恢复语义仍是「重新开一轮」 | `session.rs:1455` 每次 prompt 前仍 `abandon_unfinished()`；`resume` 只在 prompt loop 存活期间可用（`:1873`）。进程重启后无法继续原 turn | 首个 prompt 检测 open turn：interrupted → resume；suspended → 等 respond；仅 orphaned 才 abandon |
+| P1-7 | `session/list` 仍读内存注册表 | `coding_agent.rs:345-368` 自注「持久化会话不可见」；`HarnessAgent::list_session_keys` 已就绪但未接入 | ACP `session/list` 改为从 `session_log_store` 读取 |
+| P1-10 | 只有 API，没有协议方法 | `session.rs:742` `respond` 无对应 ACP 请求分发；suspended turn 重启后仍无法恢复 | 增加协议级 respond/continue 方法或自定义通知 |
+
+#### 7.5.2 初稿已列、复核确认仍未做
+
 | 编号 | 项 | 现状 / 影响 |
 |---|---|---|
-| P0-2 | journal 仍是“一 commit 一文件” | `model/chunk` 合并已把量级降下来，但没有 segment/compaction；超长会话的冷启动重放仍然慢（只是不会再因为租约过期而失败） |
-| P0-10 | 文件存储 CAS 非跨进程原子 | 单进程内已用 `cas_locks` 串行化；多进程同 session 仍未加跨进程文件锁。SQLite 后端由 SQLite 自身保证 |
-| P0-11 | 默认 journal 路径仍在工程目录 `agents/` | 未改；模型工具仍可能读写该目录 |
-| P1-4 | ACP prompt 没有稳定幂等键 | 仍是每次新 UUID；客户端重试会重复用户消息 |
-| P1-5 | cancel 仍是 session 级共享 flag | 同 session 并发 prompt 已有 `prompt_lock` 串行，但 cancel 语义仍是“整会话” |
-| P1-6 | 权限/elicitation/存储等待没有统一超时 | 仅 prompt lock 与 watchdog 有超时 |
-| P1-7 | ACP `session/list` 仍读内存注册表 | `HarnessAgent::list_session_keys` 已就绪，但 ACP 未接入；进程重启后 list 看不到历史会话 |
-| P1-8 | 未做 panic 捕获 / mutex poisoning 统一处理 | dispatcher 仍可能被 panic 卡死 |
-| P1-10 | ACP 无协议级 `respond` 处理器 | `AcpAgentSession::respond` 只是 API；客户端没有对应的 ACP 方法可调用 |
-| P1-11 / P1-12 | 投影缓存无上限、事件 channel 无界 | 未改 |
+| P0-2 | journal 仍是“一 batch 一 commit 文件” | `model/chunk` 合并（`models.rs:110-176`，4KiB / 64 delta / 1s）已把量级降下来，但没有 segment / compaction / retention；超长会话冷启动重放仍然慢（只是不再因租约过期而失败） |
+| P0-10 | 文件存储 CAS 非跨进程原子，且无 fsync | `storage.rs` 只有进程内 `cas_locks`，无 advisory / file lock；value 与 `.version` 仍是两次写（immutable 已省 `.version`）；rename 前后无 fsync |
+| P0-11 | 默认 journal 路径仍在工程目录 `agents/` | `key.rs:39`；模型的文件工具可读写该目录，并污染工程 |
+| P1-4 | ACP prompt 没有稳定幂等键 | `session.rs:1462` 仍是每次新 UUID；客户端重试会重复用户消息 |
+| P1-5 | cancel 仍是 session 级共享 flag | `session.rs:348/500` 单个 `AtomicBool`；同 session 靠 `prompt_lock` 串行，取消语义仍是“整会话” |
+| P1-6 | 权限 / elicitation / 存储等待没有统一超时 | `session.rs:90/105/131` 仍是无 timeout 的 `block_task().await`；journal 操作无整体 deadline |
+| P1-8 | 未做 panic 捕获 / mutex poisoning 统一处理 | 全仓无 `catch_unwind`、无 `lock_recover`；dispatch loop 与 ACP handler 仍可能被 panic 卡死 |
+| P1-11 / P1-12 | 投影缓存无上限、事件 channel 无界 | `session.rs:1441` `unbounded_channel`、`react_agent.rs:3018/5349` `unbounded()`；`views.rs` 仍全量 fold |
 | P1-14 / P1-15 | 损坏事件不可跳过、CAS 争用无 rebase | 未改 |
-| P2 | 其余可观测性/次级风险 | 未做 |
-| — | `SessionRecorder::Drop` / `RunGuard::Drop` 只用 `spawn` release | 没有 await；进程立即退出时仍依赖租约到期 |
-| — | 未补的测试 | shutdown drain、两进程 SQLite/文件 CAS |
+| P2 | 其余 20 项可观测性 / 次级风险 | 未做（含 `save_session_config` 非原子、MCP 失败不可重试、`session_infos` 排序、metrics 缺失等） |
+| — | `SessionRecorder::Drop` / `RunGuard::Drop` 只用 `spawn` release | 没有 await；进程立即退出时仍依赖租约到期（现为 30s） |
+| — | 未补的测试 | stdin EOF drain、shutdown drain、两进程 SQLite / 文件 CAS、权限等待超时、`session/list` 重启可见 |
 
 ### 7.6 对用户报告的两个错误的结论
 
 - `Session writer ownership expired or fenced`：**直接成因已消除**（心跳覆盖 replay + 同 owner 过期可续租 + transient 重试）。大 journal 仍会慢，但不会再因此 fence。
 - `The previous turn is still open, so this prompt could not start`：**该错误路径已移除**（dispatcher 自动关闭孤儿 turn，submit 前也会主动关闭）。未知工具结果一律记为 `interrupted`，不会被当成成功。
+
+但注意：上面两条只说明“错误不再以那种文案出现”，**不等于“任意中断后可以继续”已达成**。按 7.5.1，进程重启后仍无法续跑原 turn（P1-3）、存活的 suspended turn 无协议入口恢复（P1-10）、关闭 stdin 仍不 drain（P0-9），大 journal 冷启动仍慢（P0-2）。
+
+---
+
+## 8. 第二轮修复回执（2026-10-27）
+
+本轮按 §7.5.1 / §7.5.2 的清单逐项推进，以「最小改动 + 每条都有可反向验证的测试」为约束。未删除任何断言、未新增 `#[ignore]`。
+
+### 8.1 本轮已修复
+
+| 编号 | 问题 | 落地方式 | 位置 |
+|---|---|---|---|
+| P0-9 | stdin EOF / transport close 不 drain | `run_stdio` 返回后（含错误）先 `drain_sessions("transport closed")`：interrupt → 等 `is_running` / `active_request_count` 归零（≤20s）→ `cancel` + `close`；信号路径复用同一函数，仅它负责 `exit(130)` | `extensions-acp/src/acp_harness_agent.rs` |
+| P0-7 | 工具结果写入后无 checkpoint | acting 把 tool 消息写入 context 后立即 `checkpoint_now(state, "after_acting")`，不再等下一轮 `before_model` | `core/src/agent/react_agent.rs` |
+| P0-12 | 大 checkpoint 硬失败 | ① `checkpoint_now` 先 `flush` 再 `capture_state`，让大 checkpoint 独占一个 commit（journal 已把 >64KiB payload 溢写 blob）；② 准入 `admits_bytes`：缓冲区为空时，**单个**超过上限的 payload 也接受（代价是一次大分配，而非 `Session pending buffer exhausted` 整轮丢失） | `core/src/session/recorder.rs` |
+| P1-1 | start/end 失败不分级 | 新增 `Error::ActionDispatch`：`action/start` 确认失败 = 工具**未执行**，降级为可重试工具错误；`action/end` 失败仍是 `ActionObservation`，保留 run 级失败 + journal 保持 uncertain | `core/src/error.rs`、`observation/mod.rs`、`react_agent.rs` |
+| P1-3 | 重启后不能续跑原 turn | `submit` 前按状态路由 `prepare_open_turn_before_submit`：无 open turn → 跳过；有活跃 run → 让 dispatcher 串行；**可恢复的 interrupted turn → 先排一个 `resume` 再接收新 prompt**；suspended / 有 uncertain 工具 → 仍然关闭；ACP 侧不再无条件 `abandon_unfinished`，改为 `stop_active_run`（只打断自己拥有的 run） | `harness/src/agent/session/session.rs`、`extensions-acp/src/session.rs` |
+| P1-5 | cancel 是 session 级共享 flag | `cancel: AtomicBool` → `cancel_epoch: AtomicU64`；每个 prompt 捕获自己启动时的 epoch，`cancel()` 递增 → 只停「取消时正在跑的那一轮」，后续轮次不被误杀也不被清空 | `extensions-acp/src/session.rs` |
+| P1-6 | 交互等待无超时 | `INTERACTION_TIMEOUT = 600s` 包裹 `request_permission` / `elicitation/create`；权限超时映射为 `Cancelled` 结果（→ **拒绝**，绝不落入「通道失败即自动批准」分支） | `extensions-acp/src/session.rs` |
+| P1-7 | `session/list` 只读内存注册表 | `session_infos(cwd, cursor)` 合并注册表 + `HarnessAgent::list_session_keys`（durable store）；按 cwd 缓存一个 catalog agent，避免每次 list 重建 agent | `extensions-acp/src/coding_agent.rs` |
+| P1-8 | ACP dispatcher / handler 被 panic 卡死 | ① harness dispatcher 循环 `catch_unwind`（poisoned mutex 用 `lock_state` 恢复）；② ACP prompt 任务 `catch_unwind`，panic 时回 `internal_error` 而不是让 client 永久等待 | `harness/src/agent/session/session.rs`、`extensions-acp/src/coding_agent.rs` |
+| P1-10 | 无协议级 respond | 新增私有扩展方法 `_agentscope/session/respond`（ACP 扩展方法必须以 `_` 开头），参数 `{sessionId, answers:{<requestId>:{output|approved[,reason]}}}`，接到 `AcpAgentSession::respond` → 继续原 turn | `extensions-acp/src/ext.rs`、`coding_agent.rs` |
+| P0-10 | 文件 CAS 非跨进程原子、无 fsync | ① `Filesystem::sync`（默认 no-op）+ `LocalFilesystem` `sync_all`；② `replace` 先 sync 临时文件再 rename，commit/blob 写入后 sync；③ 可变值（head/元数据/cursor）的 CAS 额外持 `{path}.lock` 文件锁（create-if-absent，30s 后视为陈旧锁可破），`list_paths` 过滤 `.lock` | `harness/src/filesystem/{mod,local}.rs`、`agent/session/storage.rs` |
+| — | strict 工具 schema 半成品 | `Tool::is_strict` + 递归注入 `additionalProperties: false` + `FunctionTool::strict(v)`；补 `tool/schema.rs` 单测与 schema 断言 | `core/src/tool/{tool,schema}.rs` |
+
+### 8.2 新增/调整的测试
+
+| 测试 | 覆盖 |
+|---|---|
+| `observation::tests::a_failed_start_acknowledgement_never_runs_and_is_retryable` | P1-1：start 失败 → `ActionDispatch`，工具确实未执行 |
+| `observation::tests::a_failed_end_acknowledgement_propagates_instead_of_returning_a_result` | P1-1 反向：end 失败仍是 run 级错误 |
+| `tests/session_acting_checkpoint.rs::settled_tool_results_are_checkpointed_before_the_next_model_step` | P0-7：`after_acting` checkpoint 已含 tool result，且早于下一次 `before_model` |
+| `recorder::tests::an_oversized_payload_is_admitted_when_nothing_else_is_buffered` | P0-12 准入规则 |
+| `harness_session_test::an_interrupted_resumable_turn_is_continued_before_a_new_submission_runs` | P1-3：种子 turn 从 `interrupted` 变 `completed`（而非 `cancelled`） |
+| `storage::tests::a_lock_file_from_another_process_serializes_compare_and_set` | P0-10：他进程持锁时写入阻塞；陈旧锁可破；锁释放 |
+| `ext::tests::*`（5 个） | P1-10：方法名必须是 `_` 前缀、参数往返、致义/空答案拒绝 |
+| `tool::tool::tests::strict_is_opt_in_and_injects_additional_properties_false` | strict schema |
+
+反向验证（逐个回退实现 → 确认 FAILED → 恢复）：
+- 把 `after_acting` 改成 `before_model` → `session_acting_checkpoint` FAILED；
+- 把 submit 前的 `resumable` 强制为 `false` → `an_interrupted_resumable_turn_is_continued...` FAILED（turn 变 `cancelled`）；
+- 把跨进程文件锁关掉 → `a_lock_file_from_another_process...` FAILED。
+
+### 8.3 仍未完成（及为什么）
+
+| 编号 | 项 | 现状 / 决策 |
+|---|---|---|
+| P0-2 | journal segment / compaction / retention | **未做**。一 batch 一 commit 文件且无段合并，冷启动仍要扫全部 commit（`model/chunk` 已合并降量）。真正的修法是「分段落盘 + 写入折叠后的 projection 快照 + 删除已被快照覆盖的 commit」，涉及 `SessionLog::commit/visit/read_after` 全链路与所有存储后端，不能在缺少崩溃点设计的前提下改 |
+| P0-11 | 默认 journal 路径在 `agents/` | **未做**。改成用户目录需要路径迁移 + 旧数据 fallback（否则老用户的会话全部“消失”），是数据面变更，需单独决策与迁移脚本 |
+| P1-4 | prompt 幂等键 | **未做（设计取舍）**。ACP 的 `PromptRequest` 不携带客户端请求 id；用内容哈希替代会让「连续两次相同提问」被去重，比重复提交更糟 |
+| P1-11 / P1-12 | 投影缓存无上限 / 事件 channel 无界 | **未做（只改 channel 会丢 delta）**。`set_event_sink` 是同步闭包，没有 await 点，改成有界 + `try_send` 会在模型快速输出时丢掉文本 delta（回退成“回答被截断”）。正确做法是给 sink 加显式背压或按事件类型分级丢弃，需先定丢弃策略；投影增长的正解是 P0-2 的快照，否则裁剪会丢 `started`/`inputs` 的去重能力 |
+| P1-14 / P1-15 | 损坏事件不可跳过 / CAS 争用无 rebase | **未做**。`stale committed prefix` 现在是 fatal 分类；rebase 需要把「重读 head → 重算 expected → 重放同一 batch」做成显式循环，并证明不会把已提交事实重复计一次 |
+| P2 | 其余 20 项 | **未做** |
+| — | 未补的测试 | 两进程 SQLite CAS（需独立进程）；`session/list` 重启可见的端到端（需真实 cwd + 持久化 store）；`_agentscope/session/respond` 端到端（需一个挂起工具的 run） |
+
+### 8.4 本轮验证
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p agentscope-core --lib` | 336 passed / 0 failed / 3 ignored |
+| `cargo test -p agentscope-core --tests` | 全部 target 通过（含新增 `session_acting_checkpoint` 1 passed） |
+| `cargo test -p agentscope-harness --lib` | 459 passed / 0 failed（连跑 3 次稳定） |
+| `cargo test -p agentscope-harness --test harness_session_test --test harness_session_journal_wiring_test --test state_checkpoint_per_iteration_test` | 19 / 4 / 1 passed |
+| `cargo test -p agentscope-extensions-acp` | 56 lib（+6）+ 全部集成 test 通过 |
+| `cargo check -p agentscope-extensions-acp --all-targets` | 通过（仅既有 warning） |
