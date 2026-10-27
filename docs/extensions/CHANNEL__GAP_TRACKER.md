@@ -162,7 +162,27 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | G6 | P2 | `BotLoopGuard` 空闲 peer 淘汰 | 已完成 | 2026-10-23 | history §8.3 |
 | G7 | P2 | 过期文档注释（5 处） | 已完成 | 2026-10-23 | history §8.6 |
 | G8 | P2 | `IdempotencyStore` TTL 窗口重启语义 | 已完成 | 2026-10-23 | history §8.4 |
+| G9 | P2 | 飞书 `responseTimeout` 不可配（`FeishuAccessTokenProvider` / `FeishuOutboundClient` 构造参数，默认 10 s，构造期校验正数） | 已完成 | 2026-10-26 | 下表 + `72bfef4` |
 | — | — | 骨架/接线/依赖/离线测试覆盖（原 §3.1 四项） | 已完成 | 2026-10-22 | history §4.1 |
+
+### 3.1 G9 关闭记录（2026-10-26）
+
+> Java 基线 `16cb024ae`；该 `responseTimeout` 参数正是此提交引入（**新漂移**）。
+> 来源：`docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md` §4.1。
+
+**缺口**：Rust 把 10 s 写死在 `common/http.rs::DEFAULT_TIMEOUT` + `ReqwestTransport::new()`，
+两个飞书客户端都没有超时形参，云端慢响应只能改代码。
+
+**修法**：
+- `common/http.rs`：`ensure_positive_timeout()`（零值 → `ChannelError::Config("responseTimeout must be positive")`，对齐 Java `IllegalArgumentException`）；`ReqwestTransport` 新增 `timeout: Option<Duration>` + `with_timeout()`，`execute()` 时按请求 `.timeout(t)` 覆盖；`with_client()` 保留外部 client 自身配置（`timeout = None`）
+- `HttpTransport` 新增**带默认实现**的 `with_response_timeout()`：默认 `None`（注入的 fake / 外部持有的 client 不可重配），`ReqwestTransport` 覆写为复用底层 client（保留连接池）只换超时
+- `feishu/token.rs` / `feishu/outbound.rs`：各加 `DEFAULT_RESPONSE_TIMEOUT = 10s`、`response_timeout` 字段、链式 `with_response_timeout()` 与读取器；**`new()` / `with_store()` 签名不变**
+
+**为何不用 builder / 平行类型**：超时在 Rust 挂在 transport 而非 client 上；用 trait 默认方法可以让「可重配」（`ReqwestTransport`）与「不可重配」（测试双、外部 client）两种情况共用一条调用路径，且不改动既有 trait 注入设计。
+
+**测试**（全离线，不真发请求）：`reqwest_transport_defaults_to_ten_seconds`、`reqwest_transport_accepts_explicit_timeout`、`reqwest_transport_rejects_zero_timeout`、`with_client_defers_to_the_wrapped_client_timeout`、`with_response_timeout`（trait 层）；`outbound` / `token` 各自：默认 10 s、显式配置对可重配 transport 生效、不可重配时仅记录、零值被拒。新增测试双 `common/testing.rs::TimeoutAwareTransport`。
+
+**验证**：`cargo test -p agentscope-extensions-channel` → **399 passed / 0 failed**。
 
 新条目一律追加在表尾（编号接 G9、G10…），状态先置 `待办`，关闭后补日期与历史引用。
 

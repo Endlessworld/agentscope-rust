@@ -201,6 +201,8 @@
 | K8s K8sHelper 细分能力 | `client/internal/K8sHelper` | 部分完成 | 以 reqwest 直连覆盖 claim/status/exec；其余（列表、watch、端口转发、模板）未迁移 |
 | Jackson 模块 | `*HarnessSandboxJacksonModule` | 设计决定（不迁移） | serde 按 enum 变体序列化 |
 | 投影哈希算法对齐 | Java `MessageDigest` | 已完成（语义等价） | Rust 用 FNV-1a；仅用于变更检测，不跨语言互操作 |
+| E2B 创建请求缺 volume mount（2026-10-26 新增） | `9730e8171`/`aa66abfd0`（`E2bPlatformHttp.createSandbox` 支持 `volumeMounts`） | 待办 | `e2b.rs::build_create_sandbox_body` 只发 `{templateID, timeout}`，**无 volume mount 字段**；`E2bSandboxClientOptions` 也无对应配置。Java 侧可把宿主目录/云桶挂进沙箱，Rust 侧只能用工作区投影（exec+base64 上传）绕开。与 §3.3「E2B 云桶挂载策略」同族，但后者 Java 是空占位接口，此项是**真实能力差** |
+| E2B exec 无服务端 kill + 可靠超时（2026-10-26 新增） | `9730e8171`/`aa66abfd0` | 待办 | `e2b.rs::exec_in` 收 `timeout_seconds` 后直接 `let _ = timeout_seconds;`（`:1079`）——**超时被忽略**，长命令只能等 transport 的 `read_timeout_seconds`（默认 120 s）中断，且中断后**不会**在服务端 `kill` 进程，可能留下挂死进程。Java 侧有服务端 kill + 可靠超时。既有 SANDBOX P1 已覆盖同族「E2B 原生传输/生命周期」问题 |
 
 ## 4. 项目状态与下一步
 

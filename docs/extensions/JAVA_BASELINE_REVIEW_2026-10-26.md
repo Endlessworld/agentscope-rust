@@ -87,6 +87,17 @@ $ git cat-file -e ed8073259:.../core/embedding/EmbeddingUsage.java   -> EXISTS
 | 4.11 | harness.memory | compaction 摘要提示远简于 Java | `041ce1707`：`DEFAULT_SUMMARY_PROMPT` 7 段（含 `USER PREFERENCES AND CORRECTIONS`、`COMMANDS AND ERRORS`、`extraction_rules`、`secrecy`），并新增「保留仍生效约束原文；被撤销决定标 superseded」 | `memory/compaction.rs::DEFAULT_SUMMARY_PROMPT` 只有 4 段（`SESSION INTENT`/`SUMMARY`/`ARTIFACTS`/`NEXT STEPS`），无 extraction_rules、无 secrecy、无 superseded 规则 | P1 |
 | 4.12 | harness.memory | 后台 flush/consolidation 上下文回放 | `bb4dbc753`（旧基线内）：Reactor 需 `contextWrite(contextView)` 回放 | **非缺口**：Rust 用 `RuntimeContext` 显式传参（`memory_flush.rs` 已 `ctx.clone()`），无隐式上下文问题 | — |
 
+> **落地状态（2026-10-27）**：上表 4.1–4.11 已全部实现并验证，逐项修法与反向验证见
+> `docs/MIGRATION_GAP_TRACKER.md` §3.15 与 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.1.7。
+> 两处复核更正：
+> - **4.4 部分成立**：真实缺口是「压缩后重试无『输入已在上下文』判定」；报告所称「输入会被
+>   重复注入」在 Rust 下不成立（`on_model_call` 内联改写消息列表，无 Java 那种二次追加路径）。
+>   该项**未修**，影响限于「重试可能重跑已完成的工具」。
+> - **4.8 行号更正**：`harness_agent.rs:1889-1892` → 实际为 **`:1900-1913`**（`plan: String::new()`
+>   在 `:1909`）。
+> - **4.8 措辞更正**：严格说是「模型侧提示为零」，而非「plan mode 完全缺失」——工具侧拦截
+>   （core `react_agent.rs`）一直是完整的，缺的是让模型知道自己在 PLAN 模式。
+
 ## 5. 明确「不迁移 / 无漂移」清单
 
 | 项 | 说明 |

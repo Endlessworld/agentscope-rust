@@ -77,6 +77,42 @@
 
 ### 3.1 子智能体回执
 
+### 3.1.7 子智能体回执（第十三批：Java 基线复评 §4 的 11 项对齐 + tracker 欠账补登）
+
+**来源**：`docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md` §4（Java 基线 `16cb024ae`）。
+**范围**：11 项全部落地（含 3 项 P2）；核心 4 项由汇总方亲自实现，其余分派 3 个并行子智能体（只改自己 crate、不跑 cargo）。
+
+| 模块 | 缺口 | 处置/产出 | 状态（汇总方独立复跑） |
+|---|---|---|---|
+| HARNESS | 4.8 **P0** plan mode 无横幅 | 新建 `middleware/plan_mode.rs`：`PLAN_BANNER_TEMPLATE`/`BUILD_MODE_PLAN_HINT`/`PLAN_EXTRA_TOOLS_HINT`、`PlanModeConfig::with_manager`（`Arc<PlanModeManager>`，支持运行中 `plan_enter`/`plan_exit`）、`on_model_call` 每模型边界重算、`active_points=OnSystemPrompt+OnModelCall`；`mod.rs` 改 re-export | ✅ `e531dd1`；反向验证 `on_system_prompt` 退回 → 1 FAILED |
+| HARNESS | 4.5 inbox 提示形态相反 | 每条 hint → 独立 user 通知（溯源句 + `synthetic`/`reminder_kind`/`source`/`hint_id`）+ 写回 `AgentState.context`；锁不跨 await | ✅ `6fbc768`；反向验证改回 Assistant → 集成测试 FAILED |
+| HARNESS | 4.10 渲染转义正文 / AGENTS.md 无上限 | 正文改 `neutralize_closing()`（只中和闭合标签 + `</HARNESS_CONTEXT>`），属性仍转义；新增 `MAX_AGENTS_MD_BYTES=102_400` + char-boundary 截断 | ✅ `37e38cd`；反向验证改回 `escape()` → 3 FAILED |
+| HARNESS | 4.6 `@path` 展开形态 | 追加独立预览块、`<attached_file>`、中和闭合标签、按行 1000 截断 + Java 提示语、64k 预算、仅 user 消息；`collect_text` 用 `\n` 连接 | ✅ `7223b25`；反向验证改回就地写入 → 1 FAILED |
+| HARNESS | 4.7 slim 视图 / 4.11 摘要提示 7 段 | `expose_all_metadata` 默认 `false`（name/description 取字段并无条件输出）；摘要提示补 2 段 + `<extraction_rules>`/`<secrecy>` | ✅ `dbc3f02` |
+| HARNESS | 4.9 子智能体 compaction | `SubagentDeclaration.compaction`/`disable_compaction`；优先级：声明级禁用 → 声明级配置 → 父级禁用 → 父级配置 | ✅ `f6f2a67` |
+| HARNESS | 4.2 orphan sweep 跨重启失域 | 持久化 scope 注册表 `harness/task-scopes/<agentId>/<key>.json`；`sweep_once` 遍历「默认域 + 注册域」逐域写回 | ✅ `c7ffa4f`；含「重建 RepoState 模拟重启」测试 |
+| SKILLS | 4.3 frontmatter 闭合围栏 | 不再剥行首缩进（缩进 `  ---` 属块标量正文），行尾空白仍允许 | ✅ `95d40f2` |
+| CHANNEL | 4.1 飞书 `responseTimeout` | `ReqwestTransport` 记录可配超时；`HttpTransport::with_response_timeout`（默认 `None`）；两个飞书客户端各加 `DEFAULT_RESPONSE_TIMEOUT` + 链式 setter，`new()` 签名不变 | ✅ `72bfef4` |
+
+**汇总方发现并修复的 4 个问题（子智能体未跑 cargo，故未自曝）**：
+1. **COMPACTION slim 视图渲染错源**：子智能体从 `metadata` 取 `name`/`description`（它们其实是 `AgentSkill` 的**字段**）→ 默认视图丢了技能名。改为取字段，并按 Java `metadataView` 语义**无条件输出**（空值也输出）。
+2. **CHANNEL 测试缺 import**：`outbound.rs` 的测试用了 `TimeoutAwareTransport` 却未 `use` → `E0433`。
+3. **`inbox.rs` 生命周期/move 错误**：`agent_name` 被 `FnMut` 闭包 move、`ctx.state` 在 `async move` 内借用 → 提前 `clone` 出 `state`。
+4. **`@path` 跨块拼接产生伪引用**：`collect_text` 直接拼接文本块，把 `"...@src/a.rs"` + `"keep me"` 变成 `src/a.rskeep`。Java 用 `\n` 连接（`Msg#getTextContent()`）→ 已对齐并加注释。
+
+**既有断言更新（均为「旧期望已被证伪」，非放宽）**：
+- `harness_middleware_test`：Inbox「一条带 Hint block 的 Assistant 消息」→「一条 user 通知 + 溯源句 + 4 个元数据键」
+- `harness_at_path_test`：`@path`「原文被就地替换」→「原文保留 + 追加预览块」
+- `harness_agent_test`：`PlanModeConfig` 字面量补 `..Default::default()`
+- `context::render`：正文「被转义」→「原样保留 + 闭合标签被中和」
+- `skill::prompt`：`nested_metadata_renders_as_xml` / `invalid_tag_keys_use_entry_wrapper` 改用 `with_parts(..., true)`（默认已不是 full 视图）
+
+**验证结果**：`cargo test -p agentscope-harness`（37 targets，lib **454 passed**）全绿；`-p agentscope-extensions-skills` **60 passed**；`-p agentscope-extensions-channel` **399 passed**；`cargo clippy --all-targets` 三 crate 无 error。
+
+**复评勘误（已同步到 `MIGRATION_GAP_TRACKER.md` §3.15）**：
+- 4.4 **部分成立**：真实缺口是「压缩后重试无『输入已在上下文』判定」，但报告所称「输入会被重复注入」在 Rust 架构下不成立（`on_model_call` 内联改写，无二次追加路径）。
+- 4.8 行号 `harness_agent.rs:1889-1892` → 实际 **`:1900-1913`**（`plan: String::new()` 在 `:1909`）。
+
 ### 3.1.6 子智能体回执（第十二批：MYSQL / SKILLS / OSS 三模块并行 + harness flaky 修复）
 
 **本批 3 个后台子智能体并行**（各只改自己 crate + tracker，不跑 cargo），汇总方统一编译/测试并修接线问题；另**汇总方亲自修复了 harness 的一个既有 flaky 测试**。

@@ -98,6 +98,7 @@
 | P1-08 | 适配器未透出 `skill_dir` | 全部 | P1 | Java `AgentSkill` 带 `originDir`，`load_skill_through_path` 可定位磁盘目录 | `RepoBackedSkillRepository` 未覆写 `skill_dir` → harness `skill_middleware::load_index` 收不到目录 → **加载工具对 git/SQL 技能不可用** | 已完成（§8.1：trait + 适配器透出/落盘） |
 | P1-09 | 测试覆盖远低于 Java | 全部 | P1 | 192 个 `@Test`（git 23 / mysql 61 / pg 108） | 33 个 `#[test]`（git **5** / mysql 12 / pg 7 / sql 3 / util 4 / repository 2）；**git 侧无 file:// 真实克隆/拉取/分支用例** | 进行中（§8.2：+20 用例） |
 | P1-10 | `get_source()` 命名不含库/表/模式 | mysql / postgresql | P1 | mysql → `mysql_<db>_<table>`；pg → `postgresql_<schema>_<table>` | 固定返回 `"mysql"` / `"postgresql"`（多实例时 `source` 冲突，`RepoBackedSkillRepository` 的 `repo_id` 也随之冲突） | 已完成（§8.1） |
+| P1-11 | frontmatter 闭合分隔符未要求「独占一行」 | git | P1 | `MarkdownSkillParser.FRONTMATTER_PATTERN` 要求闭合 `---` / `...` 紧跟换行且**行首无缩进**，行尾只允许空白 | `split_frontmatter` 用 `line.trim() == "---"` 判定 → YAML `|` / `>` 块标量里的缩进 `  ---` 会被误判为闭合围栏，YAML 被提前截断、后续正文被当成 body | 已完成（§8.7） |
 | P2-01 | 缺 `set_writeable` | 全部 | P2 | Java 接口有 `setWriteable(boolean)`，三个实现均可运行时切换 | Rust trait 无该方法，`writeable` 构造后不可变 | 设计决定（不迁移）— Rust 用配置表达，**需汇总方确认** |
 | P2-02 | 空/空白库名·表名不回退默认值 | mysql / postgresql | P2 | null/空 → 回退默认名；并 `trim()` | `validate_identifier("")` 直接报错；含空格也报错（Java `trim()` 后可用） | 待办 |
 | P2-03 | `delete()` 无事务 | mysql / postgresql | P2 | Java `delete` 开事务（`setAutoCommit(false)` → commit/rollback） | Rust `delete_skill_internal` 连发 2 条 DELETE（resources + skill）且**不开事务** → 中途失败留孤儿资源 | 待办 |
@@ -294,3 +295,44 @@ Java `AgentSkillRepository extends AutoCloseable`，`close()` 是 `default { }`�
 - **P0-01** `JdbcAgentSkillRepository` 归属已裁定在 **jdbc** crate 实现（§4.5 裁定 2）；现已落地于 `crates/agentscope-extensions-jdbc/src/skill/repository.rs`（`impl AgentSkillRepository for JdbcAgentSkillRepository`，直接复用本 crate 的 trait）。本 crate 只需给两个 SQL 后端标注「已废弃，仅兼容，勿扩展」（已有 doc 注释）。
 - **P1-01~P1-08 / P1-10**：已于 2026-10-26 收敛，见 §8.1（逐项修法 + 测试名）。
 - **P1-09**：部分收敛（git 侧补 11 个 `file://` 真实仓用例，含克隆/拉取/分支/自定义 skillsRoot/远端不可达），仍低于 Java 192，见 §8.2。
+
+### 8.7 P1-11 收敛（2026-10-26，frontmatter 闭合围栏）
+
+> 来源：`docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md` §4.3。Java 基线 `16cb024ae`。
+
+**根因**：`split_frontmatter` 先 `line.trim()` 再与 `"---"` 比较，把**行首缩进也剥掉**了。
+YAML 块标量里写：
+
+```yaml
+note: |
+  ---
+  still body
+---
+real body
+```
+
+第一处 `  ---` 被当作闭合围栏 → frontmatter 提前结束，`still body` / `real body` 全被当成正文；
+description 也随之错乱（回落到围栏本身）。
+
+**修法**（`src/git.rs::split_frontmatter`）：
+
+- 只在**行尾**剥 `' '` / `'\t'`（Java 正则允许围栏与换行之间是空白），不再剥行首缩进
+- 围栏判定改为 `candidate == "---" || candidate == "..."`，因此缩进围栏留在正文内
+- 保留既有能力：BOM、CRLF、`...` 变体、无闭合围栏时返回 `(None, 原文)`
+
+**新增 6 个测试**（全离线，不依赖 git 二进制）：
+
+| 测试 | 断言 |
+|---|---|
+| `split_frontmatter_splits_a_standard_fence` | 标准围栏正确切分；BOM + CRLF 等价 |
+| `split_frontmatter_requires_the_closing_fence_to_be_unindented` | 块标量里的 `  ---` 仍属 frontmatter；只有缩进围栏时视为**未闭合** |
+| `split_frontmatter_rejects_a_fence_with_a_suffix` | `---suffix` 不算围栏 |
+| `split_frontmatter_accepts_dots_and_trailing_blanks` | `...` 与 `---  \t` 均算闭合 |
+| `split_frontmatter_returns_the_whole_text_without_a_closing_fence` | 缺失围栏 / 开头 `---x` 时返回全文 |
+| `skill_identity_treats_an_indented_fence_as_body` | 端到端：description 正确回落到正文标题而非围栏 |
+
+**验证**：`cargo test -p agentscope-extensions-skills` → **60 passed / 0 failed**（基线 54）。
+**反向验证**：把判定改回 `raw.trim()` →
+`split_frontmatter_requires_the_closing_fence_to_be_unindented` 与
+`skill_identity_treats_an_indented_fence_as_body` **双双 FAILED**（前者 frontmatter 被截断成
+`Some("name: calc\nnote: |\n")`，后者 description 变成 `---`）。

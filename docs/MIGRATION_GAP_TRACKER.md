@@ -467,6 +467,35 @@
   - ❌ P2 `registerExternalSchemas(...)`（Rust `Toolkit` 无 `register_schemas`）
 - Rust 侧另有多项 Java 无对应（`cwd`、`session_id`/`user_id`、`conversation_compaction`、`confirm_handler`，以及 `register_filesystem_tools`/`register_shell_tool` 的 disable→enable 语义差异）。
 
+### 3.15 新漂移复评（2026-10-26，harness / core 侧）
+
+> 来源：`docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md` §4。
+> Java 基线：`16cb024ae`（`main`，已用 `git rev-parse HEAD` 确认）；旧基线 `ed8073259`。
+> 该复评初稿的 11 条 harness 侧缺口逐条回源码核实：**10 条成立、1 条部分成立（4.4）**，
+> 另更正 1 处行号（4.8）。
+
+| # | 模块 | 缺口 | 执行状态 | 交接信息/说明 |
+|---|---|---|---|---|
+| 4.2 | subagent.task | orphan sweep 不按原始隔离域写回 | ✅ 已完成（`c7ffa4f`） | `task/workspace.rs`：新增持久化 scope 注册表 `harness/task-scopes/<agentId>/<key>.json`（`namespace`/`user_id`/`session_id`，`.tmp`+`move_path` 原子写）；`scopeKey` 与 Java 一致（各段 base64url 无填充 + `.` 拼接，超长退化 SHA-256 hex，无新依赖）；默认域不注册；`sweep_once` 改遍历「默认域 + 已注册域」逐域读写的；`local_contexts` 降级为进程内快路径，写回时校验域一致 |
+| 4.3 | skills | frontmatter 闭合围栏未要求独占一行 | ✅ 已完成（`95d40f2`，见 `SKILLS__GAP_TRACKER.md` P1-11） | `git.rs::split_frontmatter` 不再 `trim()` 行首：缩进的 `  ---` 属块标量正文；行尾空白仍允许 |
+| 4.4 | context | 溢出压缩后重试未判「输入已在上下文」 | ⚠️ **部分成立**，未做 | **属实**：`context_middleware.rs::compact_overflow` 写回共享 `AgentState` 后，重试仍用同一 `messages` 重新编译，无「已在上下文则传空输入」的判定。**不属实**：报告称「输入会被重复注入」在 Rust 架构下不成立 —— `on_model_call` 内联改写消息列表，不存在 Java 那种「context 已含 + 输入再追加」的二次追加路径。剩余影响限于「重试可能重跑已完成的工具」 |
+| 4.5 | middleware.inbox | 提示注入形态与 Java 相反 | ✅ 已完成（`6fbc768`） | 每条 hint → 独立 `MsgRole::User` 通知（溯源句 + `synthetic`/`reminder_kind=background_event`/`source`/`hint_id` 元数据），并写回 `AgentState.context`；锁不跨 await |
+| 4.6 | middleware.at_path | `@path` 展开形态与截断提示 | ✅ 已完成（`7223b25`） | 追加独立预览块（保留原 blocks）、`<attached_file path="...">`、中和 `</attached_file>`、按行截断 1000 行 + Java 提示语、单条消息 64k 字符预算、仅展开 user 消息；`collect_text` 按 Java `getTextContent()` 用 `\n` 连接 |
+| 4.7 | skill.prompt | `<available_skills>` 默认仍 full-metadata | ✅ 已完成（`dbc3f02`） | `expose_all_metadata` 默认 `false`；slim 视图 `name`/`description` 取自 `AgentSkill` 字段且无条件输出（对齐 Java `metadataView`）；usage 文案换 Java 精简版；full 视图仍可 `with_parts(..., true)` |
+| 4.8 | middleware.plan_mode | 无 PLAN MODE 横幅、无 model-call 刷新 | ✅ 已完成（`e531dd1`） | 新建 `middleware/plan_mode.rs`：`PLAN_BANNER_TEMPLATE` / `BUILD_MODE_PLAN_HINT` / `PLAN_EXTRA_TOOLS_HINT`、`PlanModeConfig::with_manager`（持 `Arc<PlanModeManager>`，支持运行中 `plan_enter`/`plan_exit` 翻转）、`on_model_call` 每次模型边界重算、`active_points() = OnSystemPrompt + OnModelCall`。**行号更正**：报告写的 `harness_agent.rs:1889-1892` 实为 **`:1900-1913`**（`plan: String::new()` 在 `:1909`） |
+| 4.9 | subagent | 子智能体无法独立配置 compaction | ✅ 已完成（`f6f2a67`） | `SubagentDeclaration` 新增 `compaction: Option<CompactionConfig>` / `disable_compaction`；优先级对齐 Java：声明级禁用 → 声明级配置 → 父级禁用 → 父级配置（父级禁用时声明级仍可单独启用） |
+| 4.10 | context.render | 渲染时转义正文；AGENTS.md 无上限 | ✅ 已完成（`37e38cd`） | (a) 正文不再 `escape()`，改为 `neutralize_closing()`（只中和自身闭合标签 + 运行时外框 `</HARNESS_CONTEXT>`），属性值仍转义；(b) 新增 `MAX_AGENTS_MD_BYTES = 102_400` 与按 char boundary 回退的 `cap_agents_md()` |
+| 4.11 | memory.compaction | 摘要提示远简于 Java | ✅ 已完成（`dbc3f02`） | `DEFAULT_SUMMARY_PROMPT` 补齐至 Java 的 7 段（新增 `USER PREFERENCES AND CORRECTIONS`、`COMMANDS AND ERRORS`、`objective_information`）与 `<extraction_rules>`/`<secrecy>`（逐字保留、superseded 标注、链式合并为一份）；`{messages}` 占位符保留 |
+
+**同批复评的 core 侧缺口（未在本轮修复，仅登记）**：
+
+| # | 缺口 | 说明 |
+|---|---|---|
+| 4.4 残余 | 压缩后重试可能重跑已完成工具 | 见上表；需在 `compact_overflow` 后按 message id 判断本轮输入是否已在 context |
+| C1 | tool-call 参数完整性语义相反 | `1ac8c8304`/`131c3bd9a`：Java 标记 malformed 并**拒绝执行**；Rust `anthropic/parser.rs::malformed_tool_arguments_degrade_to_empty_input` 把畸形参数**降级为 `{}`** 并继续执行 |
+| C2 | progressive tool events | `db0b67eb8`：Rust 已有 `ToolCallStart/Delta/End`、`ToolResultStart/TextDelta/End`，但按批聚合后才发，无「单个工具完成即发」回调 |
+| C3 | `@Tool` proc-macro / `additionalProperties` | `7976a20d7`/`1aeb863c4`：无 `@Tool` 宏（既有 P0）；tool schema 无 `additionalProperties` 落点 |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

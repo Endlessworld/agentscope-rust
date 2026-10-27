@@ -416,3 +416,18 @@ cargo test -p agentscope-extensions-scheduler
 - 未发现其它同源 P0：xxl-job 后端 factory 已正确接线，其 `trigger()` 通过 `BaseScheduleAgentTask::run` 正常执行并有既有测试覆盖。
 - `schedule_with_input` 的输入在「同名任务重复调度」时仍被忽略（与 Java 返回既有任务的语义一致），未改为覆盖。
 
+### 7.5 裁定：channel 回调控制器注册（不迁移，2026-10-26 登记）
+
+**Java**（`34b209e86`，#3604）：`SchedulerApp` 的 `@ComponentScan` 原先只扫 builder 包，漏掉
+`...channel.feishu` / `...wecom` / `...github` / `...gitlab` 四个扩展包，导致 channel 回调
+控制器未注册成 bean、线上 404。修复是**把四个包加进扫描列表**，并用 `SchedulerAppContextLoadTest`
+断言四个控制器都已注册。
+
+**Rust 侧无对应工作**：Rust 没有 Spring 容器，也不存在「扫描包 → 注册 bean」的隐式装配路径。
+控制器（axum router / handler）由调用方在组装 scheduler 服务时**显式挂载**；漏挂会在编译期
+或首个请求时暴露，不会出现「编译通过但运行时 404」这类静默失败。
+
+**裁定**：`设计决定（不迁移）`。若将来引入统一的装配入口，应在该入口的初始化测试中断言
+四个 channel 路由均存在（对应 Java 的 context load test 意图），而非复刻包扫描。
+
+
