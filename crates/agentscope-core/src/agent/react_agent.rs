@@ -1,4 +1,4 @@
-﻿//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
+//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
 //!
 //! The ReAct agent runs an iterative reasoning → acting loop: it streams a model
 //! call, accumulates the reasoning result, and if the model requested tool calls
@@ -195,6 +195,10 @@ struct ReasoningContext {
     tool_calls: Vec<ToolUseBlock>,
     tool_results: Vec<ToolResultBlock>,
     usage: Option<ChatUsage>,
+    /// Last non-empty finish reason seen on a chunk. Mirrors the Java
+    /// `ReasoningContext.finishReason`, which decides whether an empty tool call
+    /// start was truncated by the output-token limit.
+    finish_reason: Option<String>,
 }
 
 impl ReasoningContext {
@@ -202,6 +206,9 @@ impl ReasoningContext {
     fn accumulate(&mut self, chunk: crate::model::ChatResponse) {
         if self.id.is_empty() {
             self.id = chunk.id.clone();
+        }
+        if chunk.finish_reason.is_some() {
+            self.finish_reason = chunk.finish_reason.clone();
         }
         for block in chunk.content {
             match block {
@@ -217,8 +224,22 @@ impl ReasoningContext {
         }
     }
 
+    /// Whether the response stopped at its output-token limit.
+    ///
+    /// OpenAI Chat Completions and DashScope report `length`; Anthropic and Gemini
+    /// report `max_tokens` / `MAX_TOKENS`. Mirrors Java `ReasoningContext#isTruncated`.
+    fn output_limit_reached(&self) -> bool {
+        self.finish_reason
+            .as_deref()
+            .is_some_and(|reason| {
+                reason.eq_ignore_ascii_case("length")
+                    || reason.eq_ignore_ascii_case("max_tokens")
+            })
+    }
+
     /// Builds the final assistant message from the accumulated content.
     fn build_final_message(self) -> Msg {
+        let output_limit_reached = self.output_limit_reached();
         let mut blocks = Vec::new();
         if !self.thinking.is_empty() {
             blocks.push(ContentBlock::Thinking(ThinkingBlock::new(self.thinking)));
@@ -226,7 +247,8 @@ impl ReasoningContext {
         if !self.text.is_empty() {
             blocks.push(ContentBlock::Text(TextBlock::new(self.text)));
         }
-        for tc in self.tool_calls {
+        for mut tc in self.tool_calls {
+            finalize_tool_call_arguments(&mut tc, output_limit_reached);
             blocks.push(ContentBlock::ToolUse(tc));
         }
         // Inline provider-side tool results (server tools) travel in the same
@@ -241,7 +263,59 @@ impl ReasoningContext {
         if let Some(u) = self.usage {
             b = b.usage(u);
         }
+        // Persisted on the assistant message so a later acting phase (and a resumed
+        // session) can tell "truncated at the output limit" from "corrupt arguments".
+        if output_limit_reached {
+            b = b.metadata_entry(
+                crate::message::metadata_keys::OUTPUT_LIMIT_REACHED,
+                serde_json::json!(true),
+            );
+        }
         b.build()
+    }
+}
+
+/// Validates the accumulated raw JSON of one tool call and marks it malformed when it
+/// never became a JSON object.
+///
+/// The accumulated `content` is the source of truth: streamed argument fragments may
+/// look complete early on, and provider parsers commonly leave `input` empty when the
+/// raw text did not parse. Non-empty but invalid content (truncated / corrupt) is
+/// preserved in `content` and flagged via [`ToolUseBlock::METADATA_MALFORMED_ARGUMENTS`]
+/// so the acting phase refuses to execute it with `{}`.
+///
+/// Mirrors Java `ToolCallsAccumulator.ToolCallBuilder#build(boolean)`.
+fn finalize_tool_call_arguments(tool: &mut ToolUseBlock, output_limit_reached: bool) {
+    let raw = tool.content.as_deref().unwrap_or("");
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        // Without a completed block or any parsed arguments, an output-limit stop
+        // cannot establish that an empty tool-call start was a complete no-arg call.
+        if output_limit_reached && tool.input.is_empty() {
+            tool.metadata.insert(
+                ToolUseBlock::METADATA_MALFORMED_ARGUMENTS.to_string(),
+                serde_json::json!(true),
+            );
+        }
+        return;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(parsed)) => {
+            // Fill only missing keys: an incremental parser may already have resolved
+            // some arguments, and its values win (Java merges the same way).
+            for (key, value) in parsed {
+                if !tool.input.contains_key(&key) {
+                    tool.input.insert(key, value);
+                }
+            }
+        }
+        _ => {
+            tool.input.clear();
+            tool.metadata.insert(
+                ToolUseBlock::METADATA_MALFORMED_ARGUMENTS.to_string(),
+                serde_json::json!(true),
+            );
+        }
     }
 }
 
@@ -2557,6 +2631,7 @@ async fn acting_phase(
 
     let reply_id = current_reply_id(state);
     let runtime = tool_runtime(ctx);
+    let output_limit_reached = last_assistant_reached_output_limit(state);
     // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`) is the only
     // acting decision that reads `AgentState`; resolve it up front so the execution
     // core runs without borrowing the state — that borrow is what would otherwise pin
@@ -2601,13 +2676,14 @@ async fn acting_phase(
             runtime: &runtime,
             plan_denied: &plan_denied,
             cancel: None,
+            output_limit_reached,
         };
         run_acting_calls(batch, &pending, &results).await?;
     } else {
         let mut stream = core.middleware_chain.wrap_acting(
             ctx.clone(),
             ActingInput::with_results(pending.clone(), results.clone()),
-            acting_stream_core(core, ctx, &reply_id, &runtime, &plan_denied),
+            acting_stream_core(core, ctx, &reply_id, &runtime, &plan_denied, output_limit_reached),
         );
         while let Some(item) = stream.next().await {
             if let Some(tx) = &ctx.delta_tx {
@@ -2723,6 +2799,7 @@ fn acting_stream_core(
     reply_id: &str,
     runtime: &JsonMap,
     plan_denied: &[(String, bool)],
+    output_limit_reached: bool,
 ) -> Box<dyn FnOnce(ActingInput) -> EventStream + Send> {
     let core = Arc::clone(core);
     let ctx = ctx.clone();
@@ -2750,6 +2827,7 @@ fn acting_stream_core(
                 runtime: &runtime,
                 plan_denied: &plan_denied,
                 cancel: Some(&task_cancel),
+                output_limit_reached,
             };
             if let Err(e) = run_acting_calls(batch, &calls, &results).await {
                 results.fail(e.to_string());
@@ -2771,6 +2849,9 @@ struct ActingBatch<'a> {
     runtime: &'a JsonMap,
     plan_denied: &'a [(String, bool)],
     cancel: Option<&'a AtomicBool>,
+    /// Whether the assistant message that requested these calls stopped at the
+    /// output-token limit (selects the rejection text for malformed calls).
+    output_limit_reached: bool,
 }
 
 impl ActingBatch<'_> {
@@ -2814,6 +2895,30 @@ async fn run_acting_calls(
             return Err(Error::Cancelled("execution cancelled by the caller".into()));
         }
         check_interrupted(run.core, Some(run.ctx))?;
+        // A call whose streamed arguments never formed a valid JSON object (typically
+        // truncated by a max-tokens stop) is not executable. Synthesize an ERROR result
+        // with the original call id so tool_use ↔ tool_result pairing stays complete,
+        // and never hand it to the permission gate, middleware chain or executor. The
+        // loop continues to the next reasoning iteration; no automatic retry is
+        // attempted this turn. Mirrors Java `ReActAgent.writeMalformedArgumentResults`.
+        if call.has_malformed_arguments() {
+            let message = if run.output_limit_reached {
+                OUTPUT_LIMIT_TOOL_ARGUMENTS
+            } else {
+                INVALID_TOOL_ARGUMENTS
+            };
+            emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
+            emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, message);
+            results.record(error_result(call, message), false);
+            emit_tool_result_end(
+                &run.ctx.delta_tx,
+                &call.id,
+                &call.name,
+                ToolResultState::Error,
+                &JsonMap::new(),
+            );
+            continue;
+        }
         // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`): while plan
         // mode is active, only read-only tools and the always-allowed orchestration/plan
         // tools may run; every other call gets a synthetic DENIED result without executing.
@@ -3010,6 +3115,7 @@ async fn run_acting_calls(
     results.finish();
     Ok(())
 }
+
 /// Produces the termination message when the maximum number of iterations is hit.
 ///
 /// Mirrors the Java `summarizing()`: handles pending tool calls that were not completed
@@ -3281,6 +3387,35 @@ const PLAN_MODE_ALWAYS_ALLOWED: &[&str] = &[
 const PLAN_MODE_DENY_MESSAGE: &str = "Blocked: you are in PLAN mode (read-only). You may \
 investigate and run read-only tools, record your plan with plan_write, and call plan_exit when \
 ready to execute. Do not modify files or run mutating commands until the plan is approved.";
+
+/// Result text for a truncated call (mirrors Java `OUTPUT_LIMIT_TOOL_ARGUMENTS`).
+const OUTPUT_LIMIT_TOOL_ARGUMENTS: &str =
+    "Tool call not executed: the response stopped at its output token limit before complete \
+     arguments could be parsed. Do not repeat the same large arguments. Split the work into \
+     smaller tool calls or provide a shorter argument payload, then reissue the call.";
+
+/// Result text for a corrupt call whose arguments were never a JSON object (mirrors Java
+/// `INVALID_TOOL_ARGUMENTS`).
+const INVALID_TOOL_ARGUMENTS: &str = "Tool call not executed: its arguments were not a valid \
+     JSON object. Reissue the call with corrected JSON object arguments.";
+
+/// Whether the last assistant message stopped at the output-token limit, which selects the
+/// more specific rejection text for a malformed tool call. Mirrors Java
+/// `MessageUtils.lastAssistantReachedOutputLimit`.
+fn last_assistant_reached_output_limit(state: &AgentState) -> bool {
+    state
+        .context()
+        .iter()
+        .rev()
+        .find(|message| message.role() == MsgRole::Assistant)
+        .and_then(|message| {
+            message
+                .metadata()
+                .get(crate::message::metadata_keys::OUTPUT_LIMIT_REACHED)
+        })
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
 
 /// Whether plan mode forbids executing `call`: active plan mode denies everything except
 /// read-only tools and [`PLAN_MODE_ALWAYS_ALLOWED`]. Mirrors Java
@@ -4343,6 +4478,194 @@ mod tests {
                 .any(|e| e.event_type() == AgentEventType::RequireExternalExecution),
             "an executed tool must not require external execution; got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_call_is_rejected_without_executing_and_pairs_its_result() {
+        // Mirrors Java `TruncatedToolCallIntegrityTest`: a call whose streamed arguments
+        // never formed a JSON object is answered with an ERROR result carrying the
+        // original id, never handed to the handler, and the loop continues so the model
+        // can reissue it. A completed sibling in the same response still runs.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+
+        let mut truncated = ToolUseBlock::new("trunc-1", "add", JsonMap::new());
+        truncated.content = Some("{\"a\": 1".to_string());
+        let mut completed = ToolUseBlock::new("ok-1", "add", JsonMap::new());
+        completed.content = Some("{\"a\":1,\"b\":2}".to_string());
+
+        let model = Arc::new(SequenceRecordingModel::new(vec![
+            ChatResponse::builder()
+                .id("reply-1")
+                .content(vec![
+                    ContentBlock::ToolUse(truncated),
+                    ContentBlock::ToolUse(completed),
+                ])
+                .finish_reason("length")
+                .build(),
+            text_response("recovered"),
+        ]));
+        let seen = Arc::clone(&model.seen);
+        let agent = ReActAgent::builder()
+            .name("t-truncated")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let events: Vec<AgentEvent> = agent
+            .stream_events(
+                vec![Msg::user("write")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the truncated call must not reach the handler; only the completed sibling runs"
+        );
+
+        let state = agent.state_handle();
+        let guard = state.lock().unwrap();
+        let result_for = |id: &str| -> Option<ToolResultBlock> {
+            guard
+                .context()
+                .iter()
+                .flat_map(|message| message.tool_result_blocks())
+                .find(|result| result.id.as_deref() == Some(id))
+                .cloned()
+        };
+        let rejected = result_for("trunc-1").expect("a result must pair the truncated call");
+        assert_eq!(rejected.state, ToolResultState::Error);
+        let rejected_text = rejected.text_content();
+        assert!(
+            rejected_text.contains("output token limit"),
+            "the rejection must explain the truncation: {rejected_text}"
+        );
+        assert!(
+            rejected_text.contains("not executed"),
+            "the rejection must say the call did not run: {rejected_text}"
+        );
+        let sibling = result_for("ok-1").expect("the completed sibling must produce a result");
+        assert_eq!(sibling.state, ToolResultState::Success);
+        assert_eq!(sibling.text_content(), "3");
+
+        // The assistant message records the output-limit stop so a resumed turn can pick
+        // the same rejection text.
+        let assistant = guard
+            .context()
+            .iter()
+            .find(|message| {
+                message
+                    .tool_use_blocks()
+                    .any(|tool| tool.id == "trunc-1")
+            })
+            .expect("assistant message with the tool calls");
+        assert_eq!(
+            assistant
+                .metadata()
+                .get(crate::message::metadata_keys::OUTPUT_LIMIT_REACHED),
+            Some(&serde_json::json!(true))
+        );
+
+        // The next model request carries the ERROR result so the model can reissue it.
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the loop must continue after rejecting the call");
+        let second_request = calls[1]
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .map(|result| result.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            second_request.contains("output token limit"),
+            "second request must see the rejection: {second_request}"
+        );
+
+        drop(guard);
+        let end = events
+            .iter()
+            .find(|event| {
+                event.event_type() == AgentEventType::ToolResultEnd
+                    && event.data().fields.get("tool_call_id")
+                        == Some(&serde_json::json!("trunc-1"))
+            })
+            .expect("lifecycle events must be published for the truncated call");
+        assert_eq!(
+            end.data().fields.get("state"),
+            Some(&serde_json::json!("ERROR"))
+        );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_are_finalized_with_the_java_rules() {
+        // Valid raw JSON fills the parsed arguments; invalid raw JSON is preserved in
+        // `content` and marked malformed; only an output-limit stop turns an empty call
+        // start into a malformed no-arg call.
+        let mut valid = ToolUseBlock::new("valid", "add", JsonMap::new());
+        valid.content = Some("{\"a\":1,\"b\":2}".to_string());
+        let mut invalid = ToolUseBlock::new("invalid", "add", JsonMap::new());
+        invalid.content = Some("{\"a\":1".to_string());
+        let mut empty_truncated = ToolUseBlock::new("empty", "add", JsonMap::new());
+        empty_truncated.content = Some(String::new());
+        // A call whose arguments completed through `input` (no raw fragments) is not
+        // ambiguous: the output-limit stop cannot invalidate it.
+        let mut input_only = JsonMap::new();
+        input_only.insert("a".to_string(), serde_json::json!(1));
+        let input_only_completed = ToolUseBlock::new("complete", "add", input_only);
+        let mut empty_complete = ToolUseBlock::new("no-args", "add", JsonMap::new());
+        empty_complete.content = Some(String::new());
+
+        let mut context = ReasoningContext {
+            finish_reason: Some("length".to_string()),
+            ..Default::default()
+        };
+        context.tool_calls = vec![
+            valid,
+            invalid,
+            empty_truncated,
+            input_only_completed,
+        ];
+        let message = context.build_final_message();
+        let tools: Vec<ToolUseBlock> = message.tool_use_blocks().cloned().collect();
+        assert_eq!(tools[0].input.get("a"), Some(&serde_json::json!(1)));
+        assert_eq!(tools[0].input.get("b"), Some(&serde_json::json!(2)));
+        assert!(!tools[0].has_malformed_arguments());
+        assert!(tools[1].has_malformed_arguments());
+        assert!(tools[1].input.is_empty());
+        assert_eq!(
+            tools[1].content.as_deref(),
+            Some("{\"a\":1"),
+            "the raw fragments must survive for diagnostics / replay"
+        );
+        assert!(tools[2].has_malformed_arguments());
+        assert!(!tools[3].has_malformed_arguments());
+        assert_eq!(
+            message
+                .metadata()
+                .get(crate::message::metadata_keys::OUTPUT_LIMIT_REACHED),
+            Some(&serde_json::json!(true))
+        );
+
+        // Without an output-limit stop a complete no-arg call stays executable.
+        let mut context = ReasoningContext {
+            finish_reason: Some("tool_calls".to_string()),
+            ..Default::default()
+        };
+        context.tool_calls = vec![empty_complete];
+        let message = context.build_final_message();
+        let tool = message.tool_use_blocks().next().unwrap();
+        assert!(!tool.has_malformed_arguments());
+        assert!(message
+            .metadata()
+            .get(crate::message::metadata_keys::OUTPUT_LIMIT_REACHED)
+            .is_none());
     }
 
     #[test]

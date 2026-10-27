@@ -37,6 +37,10 @@ pub mod metadata_keys {
     /// answer. Mirrors Java `MessageMetadataKeys.TOOL_RETURN_DIRECT`.
     pub const TOOL_RETURN_DIRECT: &str = "_tool_return_direct";
 
+    /// Metadata key (bool) marking an assistant message whose response stopped at the
+    /// output-token limit. Mirrors Java `MessageMetadataKeys.OUTPUT_LIMIT_REACHED`.
+    pub const OUTPUT_LIMIT_REACHED: &str = "_output_limit_reached";
+
     /// Metadata key (string) carrying the `GenerateReason` name behind a text
     /// projection. Attached to the `TextBlock` events synthesized for a
     /// `returnDirect` closing message so observers can distinguish "the model said

@@ -499,7 +499,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tool_arguments_degrade_to_empty_input() {
+    fn malformed_tool_arguments_keep_raw_content_for_the_core_to_reject() {
+        // The provider keeps the accumulated fragments verbatim: the core accumulator
+        // inspects `content`, refuses to execute the call, and marks it malformed
+        // (Java `ToolCallsAccumulator`). The provider must not silently turn invalid
+        // JSON into an execurable empty argument map.
         let mut inc = AnthropicStreamIncrementer::new();
         let delta = event(serde_json::json!({
             "type": "content_block_delta",
@@ -512,6 +516,11 @@ mod tests {
             ContentBlock::ToolUse(t) => {
                 assert_eq!(t.name, FRAGMENT_PLACEHOLDER);
                 assert!(t.input.is_empty());
+                assert_eq!(
+                    t.content.as_deref(),
+                    Some("{\"broken"),
+                    "malformed raw arguments must survive so the core can reject them"
+                );
             }
             other => panic!("expected tool use, got {other:?}"),
         }

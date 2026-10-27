@@ -362,6 +362,12 @@ impl ToolUseBlock {
     /// Mirrors the Java `ToolUseBlock.METADATA_SERVER_TOOL`.
     pub const METADATA_SERVER_TOOL: &'static str = "serverTool";
 
+    /// Metadata key (bool) marking a tool call whose streamed arguments never formed a
+    /// valid JSON object — typically truncated by an output-token limit. Such a call must
+    /// be rejected before execution instead of being run with `{}`.
+    /// Mirrors the Java `ToolUseBlock.METADATA_MALFORMED_ARGUMENTS`.
+    pub const METADATA_MALFORMED_ARGUMENTS: &'static str = "malformedArguments";
+
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -388,6 +394,19 @@ impl ToolUseBlock {
     pub fn is_server_tool(&self) -> bool {
         self.metadata
             .get(Self::METADATA_SERVER_TOOL)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Whether the streamed arguments of this call never formed a valid JSON object.
+    ///
+    /// Malformed calls are not executable: the acting phase answers them with an ERROR
+    /// result carrying the original call id, keeping the tool_use ↔ tool_result pairing
+    /// complete without invoking the handler. Mirrors Java
+    /// `ToolUseBlock#hasMalformedArguments`.
+    pub fn has_malformed_arguments(&self) -> bool {
+        self.metadata
+            .get(Self::METADATA_MALFORMED_ARGUMENTS)
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
