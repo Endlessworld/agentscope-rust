@@ -7,7 +7,7 @@ use std::time::Duration;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::event::{AgentEvent, AgentEventType};
-use agentscope_core::message::{ContentBlock, Msg, ToolUseBlock};
+use agentscope_core::message::{ContentBlock, Msg, MsgRole, ToolUseBlock};
 use agentscope_core::middleware::{
     ActingInput, ActingResultsHandle, EventStream, Middleware, Next, ReasoningInput,
 };
@@ -71,14 +71,37 @@ async fn inbox_middleware_drains_and_injects_hints() {
         .count();
     assert_eq!(hint_events, 1, "expected one HintBlock event, got: {:?}", events);
 
-    // The reasoning input passed downstream contains the hint as a Hint block.
+    // The reasoning input passed downstream contains one user-role notification per hint,
+    // carrying a provenance sentence and structured metadata (Java `injectHintsToContext`).
     let msgs = captured.lock().unwrap().clone().expect("next was not invoked");
+    assert_eq!(msgs.len(), 1, "one notification per hint, got: {msgs:?}");
     let last = msgs.last().expect("expected an injected hint message");
-    let has_hint = last
+    assert_eq!(last.role(), MsgRole::User, "notifications are user-role");
+    let text: String = last
         .content()
         .iter()
-        .any(|b| matches!(b, ContentBlock::Hint(h) if h.hint.as_deref() == Some("Hello from inbox")));
-    assert!(has_hint, "injected message should carry the hint");
+        .filter_map(|b| match b {
+            ContentBlock::Text(tb) => Some(tb.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("Automated background event from system"),
+        "missing provenance sentence: {text}"
+    );
+    assert!(text.contains("Hello from inbox"), "missing hint text: {text}");
+    assert_eq!(
+        last.metadata().get(Msg::METADATA_SYNTHETIC),
+        Some(&serde_json::Value::Bool(true)),
+        "notifications must be marked synthetic"
+    );
+    assert_eq!(
+        last.metadata()
+            .get(Msg::METADATA_REMINDER_KIND)
+            .and_then(|v| v.as_str()),
+        Some("background_event")
+    );
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }

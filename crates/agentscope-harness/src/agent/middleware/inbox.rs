@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::{AgentEvent, AgentEventType};
-use agentscope_core::message::{ContentBlock, HintBlock, JsonMap, Msg, MsgRole};
+use agentscope_core::message::{ContentBlock, HintBlock, JsonMap, Msg, MsgRole, TextBlock};
 use agentscope_core::middleware::{EventStream, Middleware, Next, ReasoningInput};
 use futures::StreamExt;
 use serde_json::Value;
@@ -23,6 +23,12 @@ use crate::agent::bus::{AsyncToolRegistry, MessageBus};
 fn new_hex() -> String {
     uuid::Uuid::new_v4().to_string().replace('-', "")
 }
+
+/// Metadata key carrying the originating source of a background notification.
+const METADATA_SOURCE: &str = "agentscope_source";
+
+/// Metadata key carrying the producer-assigned hint id, for deduplication.
+const METADATA_HINT_ID: &str = "agentscope_hint_id";
 
 /// Parses an inbox payload into a `HintBlock`; returns `None` when the payload
 /// carries no `hint` field.
@@ -121,6 +127,7 @@ impl Middleware for InboxMiddleware {
         let max_drain_count = self.max_drain_count;
         let stale_ttl = self.stale_ttl;
         let agent_name = ctx.agent_name.clone().unwrap_or_default();
+        let state = ctx.state.clone();
 
         let fut = async move {
             let mut input = input;
@@ -176,21 +183,148 @@ impl Middleware for InboxMiddleware {
                 events.push(Ok(AgentEvent::with_fields(AgentEventType::HintBlock, fields)));
             }
 
-            // Append a single assistant message carrying all hints to the input.
-            let hint_blocks: Vec<ContentBlock> =
-                hints.into_iter().map(ContentBlock::Hint).collect();
-            input.messages.push(
-                Msg::builder()
-                    .role(MsgRole::Assistant)
-                    .name(agent_name)
-                    .content(hint_blocks)
-                    .build(),
-            );
+            // Each hint becomes its own user-role notification carrying a provenance
+            // sentence and structured metadata, mirroring Java `injectHintsToContext`.
+            // Batching them into one assistant message (the previous behaviour) made the
+            // model read background events as its own prior output.
+            let notifications: Vec<Msg> = hints
+                .iter()
+                .map(|h| {
+                    let source = h
+                        .source
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("background");
+                    let mut blocks = vec![ContentBlock::Text(TextBlock::new(format!(
+                        "Automated background event from {source}. This is context, not a \
+                         user message or approval."
+                    )))];
+                    if let Some(text) = &h.hint {
+                        blocks.push(ContentBlock::Text(TextBlock::new(text.clone())));
+                    }
+                    let mut metadata = JsonMap::new();
+                    metadata.insert(
+                        Msg::METADATA_SYNTHETIC.to_string(),
+                        Value::Bool(true),
+                    );
+                    metadata.insert(
+                        Msg::METADATA_REMINDER_KIND.to_string(),
+                        Value::String("background_event".to_string()),
+                    );
+                    metadata.insert(
+                        METADATA_SOURCE.to_string(),
+                        Value::String(source.to_string()),
+                    );
+                    if let Some(id) = &h.id {
+                        metadata.insert(
+                            METADATA_HINT_ID.to_string(),
+                            Value::String(id.clone()),
+                        );
+                    }
+                    Msg::builder()
+                        .role(MsgRole::User)
+                        .name(agent_name.clone())
+                        .content(blocks)
+                        .metadata(metadata)
+                        .build()
+                })
+                .collect();
+
+            // The hints must also reach the accumulated context so they survive into
+            // later turns; Java writes them to `AgentState.context`.
+            if let Some(state) = state {
+                // Scoped so the std::sync::Mutex guard is never held across an await.
+                let mut guard = match state.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.context.extend(notifications.iter().cloned());
+            }
+            input.messages.extend(notifications);
 
             let chain = futures::stream::iter(events).chain(next(input));
             Box::pin(chain)
         };
 
         Box::pin(futures::stream::once(fut).flatten())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::message::MsgRole;
+
+    fn notification_for(source: Option<&str>, hint: &str, id: Option<&str>) -> Msg {
+        // Mirrors the shape produced by `on_reasoning`: one user-role notification per
+        // hint, with a provenance sentence plus structured metadata.
+        let source_label = source
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("background");
+        let mut blocks = vec![ContentBlock::Text(TextBlock::new(format!(
+            "Automated background event from {source_label}. This is context, not a user \
+             message or approval."
+        )))];
+        blocks.push(ContentBlock::Text(TextBlock::new(hint.to_string())));
+        let mut metadata = JsonMap::new();
+        metadata.insert(Msg::METADATA_SYNTHETIC.to_string(), Value::Bool(true));
+        metadata.insert(
+            Msg::METADATA_REMINDER_KIND.to_string(),
+            Value::String("background_event".to_string()),
+        );
+        metadata.insert(
+            METADATA_SOURCE.to_string(),
+            Value::String(source_label.to_string()),
+        );
+        if let Some(id) = id {
+            metadata.insert(METADATA_HINT_ID.to_string(), Value::String(id.to_string()));
+        }
+        Msg::builder()
+            .role(MsgRole::User)
+            .content(blocks)
+            .metadata(metadata)
+            .build()
+    }
+
+    #[test]
+    fn notifications_are_user_role_and_carry_provenance() {
+        let msg = notification_for(Some("system"), "do the thing", Some("h1"));
+        assert_eq!(msg.role(), MsgRole::User);
+        let text = msg.text_content();
+        assert!(text.contains("Automated background event from system"), "{text}");
+        assert!(text.contains("do the thing"), "{text}");
+        assert_eq!(
+            msg.metadata().get(Msg::METADATA_SYNTHETIC),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            msg.metadata()
+                .get(Msg::METADATA_REMINDER_KIND)
+                .and_then(Value::as_str),
+            Some("background_event")
+        );
+        assert_eq!(
+            msg.metadata().get(METADATA_SOURCE).and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            msg.metadata().get(METADATA_HINT_ID).and_then(Value::as_str),
+            Some("h1")
+        );
+    }
+
+    #[test]
+    fn a_missing_source_falls_back_to_background() {
+        let msg = notification_for(None, "anything", None);
+        assert!(msg
+            .text_content()
+            .contains("Automated background event from background"));
+        assert_eq!(
+            msg.metadata().get(METADATA_SOURCE).and_then(Value::as_str),
+            Some("background")
+        );
+        assert!(msg.metadata().get(METADATA_HINT_ID).is_none());
     }
 }
