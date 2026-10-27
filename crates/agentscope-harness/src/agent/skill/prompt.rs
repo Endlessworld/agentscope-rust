@@ -17,17 +17,10 @@ pub const DEFAULT_HEADER: &str = r#"## Available Skills
 <usage>
 Skills provide specialized capabilities and domain knowledge. Use them when they match your current task.
 
-How to use skills:
-- Load skill: load_skill_through_path(skillId="<skill-id>", path="SKILL.md")
-- The skill will be activated and its documentation loaded with detailed instructions
-- Additional resources (scripts, assets, references) can be loaded with the same tool and other paths
-
-Metadata is rendered as XML under each <skill> element:
-- scalar metadata becomes a simple child element
-- nested maps become nested XML elements
-- lists become repeated <item> elements
-- <skill-id> is always appended for tool loading
-- <files-root>, when present, gives the absolute path for shell-executing this skill's scripts
+How to use a skill:
+- Load: load_skill_through_path(skillId="<skill-id>", path="SKILL.md") loads its documentation with detailed instructions
+- Other resources (scripts, assets, references) load with the same tool and other paths
+- <files-root>, when present, gives the absolute path to that skill's files
 </usage>
 
 <available_skills>
@@ -64,7 +57,10 @@ impl Default for SkillPromptBuilder {
         Self {
             header: DEFAULT_HEADER.to_string(),
             code_execution_instruction: DEFAULT_CODE_EXECUTION_INSTRUCTION.to_string(),
-            expose_all_metadata: true,
+            // Java `SkillPromptBuilder()` delegates to `this(null, null, false)`: the
+            // slim `<available_skills>` view is the default; callers opt into the full
+            // frontmatter view explicitly.
+            expose_all_metadata: false,
         }
     }
 }
@@ -132,8 +128,23 @@ impl SkillPromptBuilder {
     fn append_skill(&self, out: &mut String, entry: &HarnessSkillEntry) {
         let skill = entry.skill();
         out.push_str("<skill>\n");
-        for (key, value) in self.metadata_view(skill.metadata()) {
-            self.append_xml_node(out, &key, value, 1);
+        if self.expose_all_metadata {
+            // Full view: every metadata key, plus the identity fields below.
+            for (key, value) in self.metadata_view(skill.metadata()) {
+                self.append_xml_node(out, &key, value, 1);
+            }
+        } else {
+            // Slim view (Java `exposeAllMetadata=false`): name / description only,
+            // always emitted even when blank — Java `metadataView` puts both keys
+            // unconditionally. They are first-class fields on `AgentSkill`, not
+            // metadata entries.
+            self.append_xml_node(out, "name", &Value::String(skill.name().to_string()), 1);
+            self.append_xml_node(
+                out,
+                "description",
+                &Value::String(skill.description().to_string()),
+                1,
+            );
         }
         self.append_xml_node(out, "skill-id", &Value::String(skill.skill_id()), 1);
         if let Some(root) = entry.files_root() {
@@ -144,20 +155,11 @@ impl SkillPromptBuilder {
         out.push_str("</skill>\n\n");
     }
 
+    /// Full-frontmatter view: every metadata key. The slim view is handled in
+    /// [`Self::append_skill`] because `name` / `description` are fields, not
+    /// metadata entries.
     fn metadata_view<'a>(&self, metadata: &'a Metadata) -> Vec<(String, &'a Value)> {
-        let mut view: Vec<(String, &Value)> = Vec::new();
-        if self.expose_all_metadata {
-            for (k, v) in metadata {
-                view.push((k.clone(), v));
-            }
-        } else {
-            for key in ["name", "description"] {
-                if let Some(v) = metadata.get(key) {
-                    view.push((key.to_string(), v));
-                }
-            }
-        }
-        view
+        metadata.iter().map(|(k, v)| (k.clone(), v)).collect()
     }
 
     fn append_xml_node(&self, out: &mut String, key: &str, value: &Value, indent_level: usize) {
@@ -300,7 +302,8 @@ mod tests {
 
     #[test]
     fn nested_metadata_renders_as_xml() {
-        let b = SkillPromptBuilder::new();
+        // Full frontmatter view is opt-in (Java `exposeAllMetadata=true`).
+        let b = SkillPromptBuilder::with_parts(None, None, true);
         let mut metadata = serde_json::Map::new();
         metadata.insert("author".into(), json!("alice"));
         metadata.insert("tags".into(), json!(["a", "b"]));
@@ -319,7 +322,8 @@ mod tests {
 
     #[test]
     fn invalid_tag_keys_use_entry_wrapper() {
-        let b = SkillPromptBuilder::new();
+        // Full frontmatter view is opt-in (Java `exposeAllMetadata=true`).
+        let b = SkillPromptBuilder::with_parts(None, None, true);
         let mut metadata = serde_json::Map::new();
         metadata.insert("not valid key!".into(), json!(1));
         let s = AgentSkill::builder()
@@ -330,5 +334,50 @@ mod tests {
             .build();
         let out = b.render_all(&catalog(vec![HarnessSkillEntry::new(s)]));
         assert!(out.contains("<entry key=\"not valid key!\">"));
+    }
+
+    fn rich_skill() -> AgentSkill {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("author".into(), json!("alice"));
+        metadata.insert("tags".into(), json!(["a", "b"]));
+        AgentSkill::builder()
+            .name("m")
+            .source("ws")
+            .description("d")
+            .metadata(metadata)
+            .build()
+    }
+
+    #[test]
+    fn default_view_is_slim_and_uses_the_short_usage() {
+        let out = SkillPromptBuilder::new()
+            .render_all(&catalog(vec![HarnessSkillEntry::new(rich_skill())]));
+        // The slim view keeps only <name> / <description> plus the always-present ids.
+        assert!(!out.contains("<author>alice</author>"), "{out}");
+        assert!(!out.contains("<tags>"), "{out}");
+        assert!(!out.contains("<item>a</item>"), "{out}");
+        assert!(out.contains("<name>m</name>"), "{out}");
+        assert!(out.contains("<description>d</description>"), "{out}");
+        assert!(out.contains("<skill-id>m_ws</skill-id>"), "{out}");
+        // Java's slim usage copy.
+        assert!(out.contains("How to use a skill:"), "{out}");
+        assert!(
+            out.contains(
+                "- Load: load_skill_through_path(skillId=\"<skill-id>\", path=\"SKILL.md\") loads \
+                 its documentation with detailed instructions"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("- Other resources (scripts, assets, references) load with the same tool and other paths"), "{out}");
+        assert!(!out.contains("Metadata is rendered as XML under each <skill> element:"), "{out}");
+    }
+
+    #[test]
+    fn explicit_full_view_still_exposes_every_metadata_field() {
+        let out = SkillPromptBuilder::with_parts(None, None, true)
+            .render_all(&catalog(vec![HarnessSkillEntry::new(rich_skill())]));
+        assert!(out.contains("<author>alice</author>"), "{out}");
+        assert!(out.contains("<item>a</item>"), "{out}");
+        assert!(out.contains("<item>b</item>"), "{out}");
     }
 }

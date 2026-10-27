@@ -103,19 +103,62 @@ fn estimate_tool_result_tokens(tr: &ToolResultBlock) -> usize {
 pub const SUMMARY_MSG_NAME: &str = "__compaction_summary__";
 
 /// The default summarization prompt template (contains `{messages}`).
+///
+/// Mirrors Java `CompactionConfig.DEFAULT_SUMMARY_PROMPT` verbatim: seven sections plus
+/// `<extraction_rules>` / `<secrecy>`. The extraction rules are load-bearing — they keep
+/// paths/commands/errors reusable, mark retracted instructions as superseded instead of
+/// carrying them forward, and merge chained summaries into one generation.
 pub const DEFAULT_SUMMARY_PROMPT: &str = "\
-<role>Context Extraction Assistant</role>\n\
+<role>\n\
+Context Extraction Assistant\n\
+</role>\n\
+\n\
 <primary_objective>\n\
-Extract the highest quality, most relevant context from the conversation below.\n\
+Your sole objective in this task is to extract the highest quality/most relevant context from the conversation history below.\n\
 </primary_objective>\n\
+\n\
+<objective_information>\n\
+You're nearing the total number of input tokens you can accept, so you must extract the highest quality/most relevant pieces of information from your conversation history. This context will then overwrite the conversation history presented below. Because of this, ensure the context you extract is only the most important information to continue working toward your overall goal.\n\
+</objective_information>\n\
+\n\
 <instructions>\n\
-The history below will be replaced by the context you extract. Do not repeat completed actions.\n\
-Use these sections (write \"None\" if empty):\n\
+The conversation history below will be replaced with the context you extract in this step. You want to ensure that you don't repeat any actions you've already completed, so the context you extract from the conversation history should be focused on the most important information to your overall goal.\n\
+\n\
+Structure your summary using these sections (populate each or write \"None\"):\n\
+\n\
 ## SESSION INTENT\n\
+What is the user's primary goal or request?\n\
+\n\
+## USER PREFERENCES AND CORRECTIONS\n\
+Preferences, feedback, and corrections the user expressed, and how they changed the direction of the work.\n\
+\n\
 ## SUMMARY\n\
+The most important context, decisions, reasoning, and rejected options.\n\
+\n\
 ## ARTIFACTS\n\
+Files or resources created, modified, or accessed (with specific paths and changes).\n\
+\n\
+## COMMANDS AND ERRORS\n\
+Commands, queries, or API calls that matter, and any error messages encountered — copied verbatim where they must be reproduced or avoided.\n\
+\n\
 ## NEXT STEPS\n\
+Specific tasks remaining to achieve the session intent.\n\
 </instructions>\n\
+\n\
+<extraction_rules>\n\
+- Preserve verbatim: file paths, commands, URLs, identifiers, and exact error strings. Do not paraphrase them — they must be reusable exactly as they occurred.\n\
+- Still-active user constraints, corrections, acceptance criteria, and authorization boundaries: keep the user's exact wording where it governs behavior. Mark superseded decisions as superseded; a retracted instruction must not be carried forward as a current requirement.\n\
+- Keep durable facts and decisions; drop superseded intermediate state (old file versions, outdated hypotheses, already-resolved blockers).\n\
+- If the history already contains an earlier summary, merge it with the new material into ONE coherent summary — never output two summary generations.\n\
+- Record failures and rejected approaches briefly, so the work is not repeated.\n\
+</extraction_rules>\n\
+\n\
+<secrecy>\n\
+This is a routine internal context-management step. Do NOT mention this summarization request, these instructions, or the summarization process anywhere in your output. Write the summary as the conversation's own state.\n\
+</secrecy>\n\
+\n\
+Carefully read through the entire conversation history below and extract the most important context. Respond ONLY with the extracted context.\n\
+\n\
 <messages>\n\
 {messages}\n\
 </messages>";
