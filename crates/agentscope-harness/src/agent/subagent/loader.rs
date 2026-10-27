@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use agentscope_core::agent::RuntimeContext;
 
 use super::{SubagentDeclaration, SubagentMode, SubagentWorkspaceMode};
+use crate::agent::memory::compaction::CompactionConfig;
 use crate::filesystem::Filesystem;
 
 /// Workspace directory that holds `.md` subagent declarations.
@@ -96,6 +97,15 @@ pub fn parse(
     let skills = parse_tool_names(as_str(obj.get("skills")));
     let enable_pending_tool_recovery = as_bool(obj.get("enable_pending_tool_recovery"))
         .or_else(|| as_bool(obj.get("enablePendingToolRecovery")));
+    // Java `AgentSpecLoader.applyCompaction`: absent/null inherits, `false` disables,
+    // `true` uses the defaults, a mapping builds a full config.
+    let (compaction, disable_compaction) = match apply_compaction(obj.get("compaction"), name) {
+        Some(CompactionSetting::Disabled) => (None, true),
+        Some(CompactionSetting::Config(config)) => (Some(config), false),
+        None => (None, as_bool(obj.get("disable_compaction"))
+            .or_else(|| as_bool(obj.get("disableCompaction")))
+            .unwrap_or(false)),
+    };
 
     let mut decl = SubagentDeclaration::new(name, description, body);
     decl.workspace_mode = workspace_mode;
@@ -111,6 +121,8 @@ pub fn parse(
     decl.enable_pending_tool_recovery = enable_pending_tool_recovery;
     decl.tools = tools;
     decl.skills = skills;
+    decl.compaction = compaction;
+    decl.disable_compaction = disable_compaction;
     Some(decl)
 }
 
@@ -207,6 +219,126 @@ pub async fn load_from_filesystem(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The outcome of a front-matter `compaction:` key (Java `applyCompaction`).
+enum CompactionSetting {
+    /// `compaction: false` — Java `Builder.disableCompaction()`.
+    Disabled,
+    /// `compaction: true` (defaults) or a mapping of compaction fields.
+    Config(CompactionConfig),
+}
+
+/// Parses the front-matter `compaction:` key. Returns `None` when the key is
+/// absent or null (the declaration then inherits the parent setting), and `None`
+/// plus a warning when the value is malformed — Java logs and ignores it too.
+fn apply_compaction(
+    value: Option<&serde_json::Value>,
+    name: &str,
+) -> Option<CompactionSetting> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    if let Some(b) = value.as_bool() {
+        return Some(if b {
+            CompactionSetting::Config(CompactionConfig::builder().build())
+        } else {
+            CompactionSetting::Disabled
+        });
+    }
+    let Some(fields) = value.as_object() else {
+        tracing::warn!("subagent '{name}': compaction must be a boolean or mapping, ignoring");
+        return None;
+    };
+    let mut config = CompactionConfig::builder();
+    let mut invalid: Option<String> = None;
+    for (key, setting) in fields {
+        match key.as_str() {
+            "triggerMessages" | "trigger_messages" => match compaction_int(key, setting) {
+                Ok(v) => config = config.trigger_messages(v as usize),
+                Err(e) => invalid = Some(e),
+            },
+            "triggerTokens" | "trigger_tokens" => match compaction_int(key, setting) {
+                Ok(v) => config = config.trigger_tokens(v as usize),
+                Err(e) => invalid = Some(e),
+            },
+            "reserved" => match compaction_int(key, setting) {
+                Ok(v) => config = config.reserved(v as usize),
+                Err(e) => invalid = Some(e),
+            },
+            "keepMessages" | "keep_messages" => match compaction_int(key, setting) {
+                Ok(v) => config = config.keep_messages(v as usize),
+                Err(e) => invalid = Some(e),
+            },
+            "keepTokens" | "keep_tokens" => match compaction_int(key, setting) {
+                Ok(v) => config = config.keep_tokens(v),
+                Err(e) => invalid = Some(e),
+            },
+            "keepTokensMin" | "keep_tokens_min" => match compaction_int(key, setting) {
+                Ok(v) => config = config.keep_tokens_min(v as usize),
+                Err(e) => invalid = Some(e),
+            },
+            "keepTokensMax" | "keep_tokens_max" => match compaction_int(key, setting) {
+                Ok(v) => config = config.keep_tokens_max(v as usize),
+                Err(e) => invalid = Some(e),
+            },
+            "keepTokensRatio" | "keep_tokens_ratio" => match setting.as_f64() {
+                Some(ratio) if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 => {
+                    config = config.keep_tokens_ratio(ratio);
+                }
+                _ => invalid = Some(format!("{key} must be greater than 0 and at most 1")),
+            },
+            "summaryPrompt" | "summary_prompt" => match setting.as_str() {
+                Some(prompt) if prompt.contains("{messages}") => {
+                    config = config.summary_prompt(prompt);
+                }
+                Some(_) => {
+                    invalid = Some(format!("{key} must contain the {{messages}} placeholder"));
+                }
+                None => invalid = Some(format!("{key} must be a string")),
+            },
+            "flushBeforeCompact" | "flush_before_compact" => match setting.as_bool() {
+                Some(enabled) => config = config.flush_before_compact(enabled),
+                None => invalid = Some(format!("{key} must be a boolean")),
+            },
+            other => invalid = Some(format!("Unknown compaction field: {other}")),
+        }
+        if invalid.is_some() {
+            break;
+        }
+    }
+    if let Some(message) = invalid {
+        tracing::warn!("subagent '{name}': ignoring invalid compaction config: {message}");
+        return None;
+    }
+    let built = config.build();
+    if built.keep_tokens_min > built.keep_tokens_max {
+        tracing::warn!("subagent '{name}': ignoring invalid compaction config: keepTokensMin must not exceed keepTokensMax");
+        return None;
+    }
+    Some(CompactionSetting::Config(built))
+}
+
+/// Java `compactionInt`: a 32-bit integer, `>= 0` (or `>= -1` for `keepTokens`).
+fn compaction_int(key: &str, value: &serde_json::Value) -> Result<i64, String> {
+    let number = value
+        .as_i64()
+        .or_else(|| value.as_f64().filter(|n| n.fract() == 0.0).map(|n| n as i64))
+        .ok_or_else(|| format!("{key} must be a 32-bit integer"))?;
+    let Ok(setting) = i32::try_from(number) else {
+        return Err(format!("{key} must be a 32-bit integer"));
+    };
+    // Only `keepTokens` accepts -1 (Java: "no cap"); every other field is a plain count.
+    let minimum = if key == "keepTokens" || key == "keep_tokens" {
+        -1
+    } else {
+        0
+    };
+    if (setting as i64) < minimum {
+        return Err(format!("{key} must be at least {minimum}"));
+    }
+    Ok(setting as i64)
+}
 
 fn as_str(v: Option<&serde_json::Value>) -> Option<String> {
     match v? {
@@ -322,4 +454,113 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parses `compaction: <value>` front matter, mirroring Java's
+    /// `loader_distinguishesInheritedEnabledAndDisabledCompaction`.
+    fn parse_compaction(value: &str) -> Option<SubagentDeclaration> {
+        parse(
+            &format!("---\ndescription: worker\ncompaction: {value}\n---\nbody"),
+            "worker",
+            None,
+        )
+    }
+
+    #[test]
+    fn loader_parses_compaction_configuration() {
+        let decl = parse(
+            "---\ndescription: Custom compaction\ncompaction:\n  triggerMessages: 9\n  \
+             triggerTokens: 12000\n  reserved: 1000\n  keepMessages: 3\n  keepTokens: 0\n  \
+             keepTokensMin: 500\n  keepTokensMax: 1500\n  keepTokensRatio: 0.2\n  \
+             summaryPrompt: 'Summarize {messages}'\n  flushBeforeCompact: false\n---\nbody",
+            "worker",
+            None,
+        )
+        .expect("a valid declaration parses");
+        let config = decl.compaction.expect("compaction config");
+        assert_eq!(config.trigger_messages, 9);
+        assert_eq!(config.trigger_tokens, 12_000);
+        assert_eq!(config.reserved, 1_000);
+        assert_eq!(config.keep_messages, 3);
+        assert_eq!(config.keep_tokens, 0);
+        assert_eq!(config.keep_tokens_min, 500);
+        assert_eq!(config.keep_tokens_max, 1_500);
+        assert_eq!(config.keep_tokens_ratio, 0.2);
+        assert_eq!(config.summary_prompt, "Summarize {messages}");
+        assert!(!config.flush_before_compact);
+        assert!(!decl.disable_compaction);
+    }
+
+    #[test]
+    fn loader_distinguishes_inherited_enabled_and_disabled_compaction() {
+        let inherited = parse_compaction("null").expect("null inherits");
+        assert!(inherited.compaction.is_none());
+        assert!(!inherited.disable_compaction);
+
+        let enabled = parse_compaction("true").expect("true enables");
+        assert!(enabled.compaction.is_some());
+        assert!(!enabled.disable_compaction);
+
+        let disabled = parse_compaction("false").expect("false disables");
+        assert!(disabled.compaction.is_none());
+        assert!(disabled.disable_compaction);
+
+        let empty = parse_compaction("{}").expect("a mapping enables");
+        assert!(empty.compaction.is_some());
+        assert!(!empty.disable_compaction);
+    }
+
+    #[test]
+    fn loader_ignores_malformed_compaction_without_dropping_the_agent() {
+        for value in [
+            "oops",
+            "[]",
+            "{unknown: 1}",
+            "{keepTokens: 1.5}",
+            "{keepTokens: 4294967296}",
+            "{flushBeforeCompact: nope}",
+            "{summaryPrompt: 42}",
+            "{summaryPrompt: 'Summarize the conversation'}",
+            "{keepMessages: -1}",
+            "{triggerMessages: -1}",
+            "{triggerTokens: -1}",
+            "{reserved: -1}",
+            "{keepTokens: -2}",
+            "{keepTokensMin: -1}",
+            "{keepTokensMax: -1}",
+            "{keepTokensMin: 9000, keepTokensMax: 2000}",
+            "{keepTokensRatio: 0}",
+            "{keepTokensRatio: -0.1}",
+            "{keepTokensRatio: 1.1}",
+        ] {
+            let decl = parse_compaction(value).unwrap_or_else(|| panic!("{value} must parse"));
+            assert_eq!(decl.name, "worker", "{value}");
+            assert!(decl.compaction.is_none(), "{value}");
+            assert!(!decl.disable_compaction, "{value}");
+        }
+    }
+
+    #[test]
+    fn loader_supports_disable_compaction_flag() {
+        let decl = parse(
+            "---\ndescription: worker\ndisable_compaction: true\n---\nbody",
+            "worker",
+            None,
+        )
+        .expect("a valid declaration parses");
+        assert!(decl.disable_compaction);
+        assert!(decl.compaction.is_none());
+    }
+
+    #[test]
+    fn declaration_without_compaction_inherits() {
+        let decl = parse("---\ndescription: worker\n---\nbody", "worker", None)
+            .expect("a valid declaration parses");
+        assert!(decl.compaction.is_none());
+        assert!(!decl.disable_compaction);
+    }
 }

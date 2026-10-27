@@ -424,6 +424,18 @@ impl LeafFactory {
             builder = builder.disable_session_persistence();
         }
 
+        // Java `HarnessAgentBuilderSupport` (declared subagents): the declaration's own
+        // compaction setting outranks the inherited parent setting, so a declaration can
+        // override — and even re-enable — compaction when the parent disabled it.
+        if let Some(decl) = &self.decl {
+            match declared_compaction(decl, &self.blueprint) {
+                Some(Ok(config)) => builder = builder.compaction(config),
+                Some(Err(CompactionDisabled)) => builder = builder.disable_compaction(),
+                // Nothing configured on either side: leave the builder untouched.
+                None => {}
+            }
+        }
+
         // The following were captured only by Java's `buildGeneralPurposeFactory`.
         // Declared children keep the parent defaults, matching Java's current
         // asymmetry.
@@ -441,16 +453,18 @@ impl LeafFactory {
                 .max_context_tokens(self.blueprint.max_context_tokens)
                 .enable_agent_tracing_log(self.blueprint.agent_tracing_log_enabled);
 
-            if self.blueprint.disable_compaction {
-                builder = builder.disable_compaction();
-            } else if let Some(config) = &self.blueprint.compaction_config {
-                builder = builder.compaction(config.clone());
-            }
-
             if self.blueprint.disable_tool_result_eviction {
                 builder = builder.disable_tool_result_eviction();
             } else if let Some(config) = &self.blueprint.tool_result_eviction_config {
                 builder = builder.tool_result_eviction(config.clone());
+            }
+
+            // General-purpose children have no declaration, so the parent setting applies
+            // unchanged (Java `buildGeneralPurposeFactory`).
+            if self.blueprint.disable_compaction {
+                builder = builder.disable_compaction();
+            } else if let Some(config) = &self.blueprint.compaction_config {
+                builder = builder.compaction(config.clone());
             }
         }
 
@@ -466,6 +480,34 @@ impl LeafFactory {
         builder.build()
     }
 }
+
+
+/// Resolves a child agent's compaction setting.
+///
+/// The declaration's own setting outranks the inherited parent setting — a declaration can
+/// override, and even re-enable, compaction when the parent disabled it. This mirrors Java
+/// `HarnessAgentBuilderSupport` (declared subagents), which checks `decl.isCompactionDisabled()`
+/// then `decl.getCompactionConfig()` before `capturedDisableCompaction` /
+/// `capturedCompactionConfig`. `None` means "leave the builder alone".
+fn declared_compaction(
+    decl: &SubagentDeclaration,
+    blueprint: &SubagentBlueprint,
+) -> Option<Result<CompactionConfig, CompactionDisabled>> {
+    if decl.disable_compaction {
+        return Some(Err(CompactionDisabled));
+    }
+    if let Some(config) = &decl.compaction {
+        return Some(Ok(config.clone()));
+    }
+    if blueprint.disable_compaction {
+        return Some(Err(CompactionDisabled));
+    }
+    blueprint.compaction_config.clone().map(Ok)
+}
+
+/// Marker returned by [`declared_compaction`] for the "explicitly disabled" case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionDisabled;
 
 impl SubagentFactory for LeafFactory {
     fn create(&self, parent_rc: &RuntimeContext) -> Arc<dyn CallableAgent> {
@@ -643,5 +685,88 @@ mod tests {
                 "general-purpose must inherit the parent flag ({flag})"
             );
         }
+    }
+
+    // ---- declaration-level compaction priority (Java `HarnessAgentBuilderSupport`) ----
+
+    /// The resolved outcome the builder would apply, flattened for assertions.
+    #[derive(Debug, PartialEq, Eq)]
+    enum CompactionOutcome {
+        Disabled,
+        Trigger(usize),
+        Unset,
+    }
+
+    fn outcome(
+        declaration: Option<(bool, Option<usize>)>,
+        parent_disabled: bool,
+        parent_trigger: Option<usize>,
+    ) -> CompactionOutcome {
+        let mut blueprint = (*blueprint(false)).clone();
+        blueprint.disable_compaction = parent_disabled;
+        blueprint.compaction_config =
+            parent_trigger.map(|t| CompactionConfig::builder().trigger_messages(t).build());
+        let mut decl = SubagentDeclaration::new("worker", "does work", "You work.");
+        if let Some((disabled, trigger)) = declaration {
+            decl.disable_compaction = disabled;
+            decl.compaction =
+                trigger.map(|t| CompactionConfig::builder().trigger_messages(t).build());
+        }
+        match declared_compaction(&decl, &blueprint) {
+            Some(Ok(config)) => CompactionOutcome::Trigger(config.trigger_messages),
+            Some(Err(CompactionDisabled)) => CompactionOutcome::Disabled,
+            None => CompactionOutcome::Unset,
+        }
+    }
+
+    #[test]
+    fn declaration_compaction_beats_the_parent_config() {
+        assert_eq!(
+            outcome(Some((false, Some(20))), false, Some(50)),
+            CompactionOutcome::Trigger(20),
+            "the declaration's config must win over the parent's"
+        );
+    }
+
+    #[test]
+    fn declaration_compaction_re_enables_when_the_parent_disabled_it() {
+        assert_eq!(
+            outcome(Some((false, Some(15))), true, None),
+            CompactionOutcome::Trigger(15),
+            "a declaration-level config re-enables compaction the parent disabled"
+        );
+    }
+
+    #[test]
+    fn declaration_disable_beats_every_inherited_setting() {
+        assert_eq!(
+            outcome(Some((true, None)), false, Some(50)),
+            CompactionOutcome::Disabled,
+            "disable_compaction beats the parent's config"
+        );
+        assert_eq!(
+            outcome(Some((true, Some(20))), false, Some(50)),
+            CompactionOutcome::Disabled,
+            "disable_compaction also beats its own declaration-level config"
+        );
+    }
+
+    #[test]
+    fn declaration_without_compaction_inherits_the_parent() {
+        assert_eq!(
+            outcome(None, false, Some(30)),
+            CompactionOutcome::Trigger(30),
+            "no declaration setting inherits the parent config"
+        );
+        assert_eq!(
+            outcome(None, true, None),
+            CompactionOutcome::Disabled,
+            "no declaration setting inherits the parent's disable"
+        );
+        assert_eq!(
+            outcome(None, false, None),
+            CompactionOutcome::Unset,
+            "neither side configures compaction: the builder is untouched"
+        );
     }
 }
