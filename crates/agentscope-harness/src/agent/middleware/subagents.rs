@@ -94,10 +94,7 @@ pub struct SubagentsMiddleware {
 }
 
 impl SubagentsMiddleware {
-    pub fn new(
-        entries: Vec<SubagentEntry>,
-        task_repository: Arc<dyn TaskRepository>,
-    ) -> Self {
+    pub fn new(entries: Vec<SubagentEntry>, task_repository: Arc<dyn TaskRepository>) -> Self {
         Self {
             entries: Mutex::new(entries),
             task_tool: TaskTool::new(Arc::clone(&task_repository)),
@@ -169,8 +166,7 @@ impl Middleware for SubagentsMiddleware {
                 rebuilt.push(dm);
             }
 
-            let downstream =
-                next(ReasoningInput::new(rebuilt, input.tools, input.options));
+            let downstream = next(ReasoningInput::new(rebuilt, input.tools, input.options));
             if pending.is_empty() {
                 return downstream;
             }
@@ -235,9 +231,14 @@ pub fn build_delivery_reminder(deliveries: &[TaskDelivery]) -> Msg {
         sb.push_str("</task>\n");
     }
     if total > shown {
-        sb.push_str(&format!("\n... and {} more — call task_list() to inspect.\n", total - shown));
+        sb.push_str(&format!(
+            "\n... and {} more — call task_list() to inspect.\n",
+            total - shown
+        ));
     }
-    sb.push_str("\nIf you need a single task's full output, call task_output(task_id=..., block=false).\n");
+    sb.push_str(
+        "\nIf you need a single task's full output, call task_output(task_id=..., block=false).\n",
+    );
     sb.push_str("</system-reminder>");
     let mut metadata = serde_json::Map::new();
     metadata.insert("synthetic".to_string(), serde_json::Value::Bool(true));
@@ -269,8 +270,10 @@ pub fn prepend_to_system_message(messages: Vec<Msg>, extra: &str) -> Vec<Msg> {
         return messages;
     }
     let mut out = Vec::with_capacity(messages.len() + 1);
-    let is_first_system =
-        messages.first().map(|m| m.role == MsgRole::System).unwrap_or(false);
+    let is_first_system = messages
+        .first()
+        .map(|m| m.role == MsgRole::System)
+        .unwrap_or(false);
     if !is_first_system {
         out.push(
             Msg::builder()
@@ -312,9 +315,21 @@ pub fn render_subagent_section(entries: &[SubagentEntry], is_session_mode: bool)
         .map(|e| format!("- `{}`: {}", e.name, e.description))
         .collect::<Vec<_>>()
         .join("\n");
-    let spawn = if is_session_mode { "sessions_spawn" } else { "agent_spawn" };
-    let send = if is_session_mode { "sessions_send" } else { "agent_send" };
-    let list = if is_session_mode { "sessions_list" } else { "agent_list" };
+    let spawn = if is_session_mode {
+        "sessions_spawn"
+    } else {
+        "agent_spawn"
+    };
+    let send = if is_session_mode {
+        "sessions_send"
+    } else {
+        "agent_send"
+    };
+    let list = if is_session_mode {
+        "sessions_list"
+    } else {
+        "agent_list"
+    };
     SUBAGENT_SECTION_TEMPLATE
         .replacen("%s", spawn, 1)
         .replacen("%s", send, 1)

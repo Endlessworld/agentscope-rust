@@ -19,7 +19,9 @@ pub const MAX_IDENTIFIER_LENGTH: usize = 63;
 pub fn validate_identifier(value: &str, name: &str) -> PgResult<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(PostgresError::InvalidIdentifier(format!("{name} must not be blank")));
+        return Err(PostgresError::InvalidIdentifier(format!(
+            "{name} must not be blank"
+        )));
     }
     if trimmed.len() > MAX_IDENTIFIER_LENGTH {
         return Err(PostgresError::InvalidIdentifier(format!(
@@ -135,9 +137,7 @@ pub fn snapshots_ddl(full_table: &str) -> String {
 /// branch and reports a phantom CAS conflict. Both write paths start at version 1, so 1 is
 /// the correct resting value for migrated rows.
 pub fn ensure_version_column_ddl(full_table: &str) -> String {
-    format!(
-        "ALTER TABLE {full_table} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1"
-    )
+    format!("ALTER TABLE {full_table} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1")
 }
 
 /// Query used to verify a schema exists (mirrors Java `verifySchemaExists`).
@@ -292,8 +292,14 @@ mod tests {
     /// Java: `PostgresBaseStoreTest#builderWithCustomSchemaNameUsesQualifiedTableName`
     #[test]
     fn qualified_table_quotes_each_component() {
-        assert_eq!(qualified_table(Some("public"), "agentscope_store"), "\"public\".\"agentscope_store\"");
-        assert_eq!(qualified_table(None, "agentscope_store"), "agentscope_store");
+        assert_eq!(
+            qualified_table(Some("public"), "agentscope_store"),
+            "\"public\".\"agentscope_store\""
+        );
+        assert_eq!(
+            qualified_table(None, "agentscope_store"),
+            "agentscope_store"
+        );
     }
 
     /// Java: the three shipped `CREATE TABLE IF NOT EXISTS` templates.

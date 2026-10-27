@@ -51,21 +51,32 @@ impl std::fmt::Debug for Toolkit {
 
 impl Toolkit {
     /// Creates a new empty toolkit.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Creates a new empty toolkit with the given configuration.
     pub fn with_config(config: ToolkitConfig) -> Self {
-        Self { config, ..Self::default() }
+        Self {
+            config,
+            ..Self::default()
+        }
     }
 
     /// Returns the current configuration.
-    pub fn config(&self) -> &ToolkitConfig { &self.config }
+    pub fn config(&self) -> &ToolkitConfig {
+        &self.config
+    }
 
     /// Returns the current configuration as a value.
-    pub fn get_config(&self) -> ToolkitConfig { self.config.clone() }
+    pub fn get_config(&self) -> ToolkitConfig {
+        self.config.clone()
+    }
 
     /// Replaces the toolkit configuration.
-    pub fn set_config(&mut self, config: ToolkitConfig) { self.config = config; }
+    pub fn set_config(&mut self, config: ToolkitConfig) {
+        self.config = config;
+    }
 
     /// Returns a copy of this toolkit (shared tool instances, independent
     /// grouping and configuration).
@@ -92,9 +103,7 @@ impl Toolkit {
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(name, tool)| {
-                tool.rebind_toolkit(&copied).map(|t| (name.clone(), t))
-            })
+            .filter_map(|(name, tool)| tool.rebind_toolkit(&copied).map(|t| (name.clone(), t)))
             .collect();
         for (name, tool) in rebinds {
             copied.tools.lock().unwrap().insert(name, tool);
@@ -173,7 +182,12 @@ impl Toolkit {
 
     /// Whether a tool is registered as external.
     pub fn is_external_tool(&self, name: &str) -> bool {
-        self.tools.lock().unwrap().get(name).map(|t| t.is_external()).unwrap_or(false)
+        self.tools
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|t| t.is_external())
+            .unwrap_or(false)
     }
 
     /// Whether `name` resolves to an external tool under a per-call
@@ -247,7 +261,9 @@ impl Toolkit {
         call: &ToolUseBlock,
         ctx: crate::tool::ToolExecutionContext,
     ) -> Result<ToolResultBlock> {
-        self.executor.execute(self, call, ctx, self.config.execution_config.as_ref()).await
+        self.executor
+            .execute(self, call, ctx, self.config.execution_config.as_ref())
+            .await
     }
 
     /// Executes a single tool call with an explicit config.
@@ -267,7 +283,13 @@ impl Toolkit {
         ctx: crate::tool::ToolExecutionContext,
     ) -> Vec<Result<ToolResultBlock>> {
         self.executor
-            .execute_all(self, calls, ctx, self.config.execution_config.as_ref(), self.config.parallel)
+            .execute_all(
+                self,
+                calls,
+                ctx,
+                self.config.execution_config.as_ref(),
+                self.config.parallel,
+            )
             .await
     }
 
@@ -279,7 +301,9 @@ impl Toolkit {
         config: Option<&ExecutionConfig>,
         parallel: bool,
     ) -> Vec<Result<ToolResultBlock>> {
-        self.executor.execute_all(self, calls, ctx, config, parallel).await
+        self.executor
+            .execute_all(self, calls, ctx, config, parallel)
+            .await
     }
 
     // ------------------------------------------------------------------
@@ -288,12 +312,20 @@ impl Toolkit {
 
     /// Sets preset parameters for a tool (LLM input cannot override these).
     pub fn set_preset_parameters(&self, name: &str, presets: JsonMap) {
-        self.presets.lock().unwrap().insert(name.to_string(), presets);
+        self.presets
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), presets);
     }
 
     /// Returns a copy of the preset parameters for a tool.
     pub fn preset_parameters(&self, name: &str) -> JsonMap {
-        self.presets.lock().unwrap().get(name).cloned().unwrap_or_default()
+        self.presets
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Merges preset parameters over the given input (presets take precedence).
@@ -317,7 +349,10 @@ impl Toolkit {
 
     /// Tags a tool with its originating MCP client name.
     pub fn set_mcp_client_name(&self, tool: &str, client: String) {
-        self.mcp_client_names.lock().unwrap().insert(tool.to_string(), client);
+        self.mcp_client_names
+            .lock()
+            .unwrap()
+            .insert(tool.to_string(), client);
     }
 
     /// Returns the MCP client a tool originates from, if any.
@@ -327,7 +362,10 @@ impl Toolkit {
 
     /// Tags a tool as a sub-agent entry point.
     pub fn set_sub_agent_name(&self, tool: &str, agent: String) {
-        self.sub_agent_names.lock().unwrap().insert(tool.to_string(), agent);
+        self.sub_agent_names
+            .lock()
+            .unwrap()
+            .insert(tool.to_string(), agent);
     }
 
     /// Returns the sub-agent behind a tool, if any.
@@ -343,8 +381,15 @@ impl Toolkit {
         self.groups.create_tool_group(name, description, active);
     }
 
-    pub fn create_tool_group_with_scope(&self, name: &str, description: &str, active: bool, scope: ToolGroupScope) {
-        self.groups.create_tool_group_with_scope(name, description, active, scope);
+    pub fn create_tool_group_with_scope(
+        &self,
+        name: &str,
+        description: &str,
+        active: bool,
+        scope: ToolGroupScope,
+    ) {
+        self.groups
+            .create_tool_group_with_scope(name, description, active, scope);
     }
 
     pub fn register_tool_group(&self, group: ToolGroup) {
@@ -404,8 +449,7 @@ impl Toolkit {
         }
 
         let group_names = to_activate.join(", ");
-        let mut result =
-            format!("The currently activated tool group(s): {}.\n", group_names);
+        let mut result = format!("The currently activated tool group(s): {}.\n", group_names);
 
         let has_instructions = to_activate.iter().any(|g| {
             self.groups
@@ -433,8 +477,7 @@ impl Toolkit {
 
     /// Registers the built-in `reset_equipped_tools` meta tool onto this toolkit.
     pub fn register_meta_tools(&self) {
-        let tool =
-            super::meta::MetaToolFactory::new(self).create_reset_equipped_tools();
+        let tool = super::meta::MetaToolFactory::new(self).create_reset_equipped_tools();
         self.register_tool(Arc::new(tool));
     }
 

@@ -34,7 +34,6 @@ pub mod model;
 pub mod tracing;
 
 pub use aggregator::StreamChatResponseAggregator;
-pub use tracing::{TelemetryTracing, DEFAULT_PROVIDER_NAME};
 pub use extractors::{
     get_agent_request_attributes, get_agent_response_attributes, get_common_attributes,
     get_format_request_attributes, get_format_response_attributes, get_function_name,
@@ -43,5 +42,7 @@ pub use extractors::{
 };
 pub use model::{
     BlobPart, FilePart, InputMessage, MessagePart, OutputMessage, ReasoningPart, Role,
-    SystemInstructions, TextPart, ToolCallRequestPart, ToolCallResponsePart, ToolDefinition, UriPart,
+    SystemInstructions, TextPart, ToolCallRequestPart, ToolCallResponsePart, ToolDefinition,
+    UriPart,
 };
+pub use tracing::{TelemetryTracing, DEFAULT_PROVIDER_NAME};

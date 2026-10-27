@@ -49,7 +49,9 @@ pub enum GenerateReason {
 /// Timestamp format `yyyy-MM-dd HH:mm:ss.SSS` in the system's default time zone,
 /// mirroring the Java SDK.
 pub fn current_timestamp() -> String {
-    Local::now().to_rfc3339_opts(SecondsFormat::Millis, false).replace('T', " ")
+    Local::now()
+        .to_rfc3339_opts(SecondsFormat::Millis, false)
+        .replace('T', " ")
 }
 
 fn generate_id() -> String {
@@ -129,10 +131,7 @@ impl Msg {
 
     /// Creates a `Msg` with the given role from a text string.
     pub fn text(role: MsgRole, text: impl Into<String>) -> Self {
-        Self::builder()
-            .role(role)
-            .text_content(text)
-            .build()
+        Self::builder().role(role).text_content(text).build()
     }
 
     /// Creates a user message from a text string.
@@ -256,7 +255,8 @@ impl Msg {
 
     /// Whether this message contains structured data in its metadata.
     pub fn has_structured_data(&self) -> bool {
-        self.metadata.contains_key(super::keys::metadata_keys::STRUCTURED_OUTPUT)
+        self.metadata
+            .contains_key(super::keys::metadata_keys::STRUCTURED_OUTPUT)
     }
 
     /// Returns the structured output value as a raw JSON value.

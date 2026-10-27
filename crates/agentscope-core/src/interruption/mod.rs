@@ -40,7 +40,12 @@ impl InterruptContext {
         user_message: Option<Msg>,
         pending_tool_calls: Vec<ToolUseBlock>,
     ) -> Self {
-        Self { source, timestamp, user_message, pending_tool_calls }
+        Self {
+            source,
+            timestamp,
+            user_message,
+            pending_tool_calls,
+        }
     }
 
     pub fn source(&self) -> InterruptSource {
@@ -59,7 +64,6 @@ impl InterruptContext {
         InterruptContextBuilder::new()
     }
 }
-
 
 /// Builder for [`InterruptContext`].
 #[derive(Debug, Clone)]
@@ -102,7 +106,12 @@ impl InterruptContextBuilder {
         self
     }
     pub fn build(self) -> InterruptContext {
-        InterruptContext::new(self.source, self.timestamp, self.user_message, self.pending_tool_calls)
+        InterruptContext::new(
+            self.source,
+            self.timestamp,
+            self.user_message,
+            self.pending_tool_calls,
+        )
     }
 }
 

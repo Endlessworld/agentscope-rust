@@ -70,7 +70,11 @@ impl SkillPromptBuilder {
         Self::default()
     }
 
-    pub fn with_parts(header: Option<&str>, code_instruction: Option<&str>, expose_all: bool) -> Self {
+    pub fn with_parts(
+        header: Option<&str>,
+        code_instruction: Option<&str>,
+        expose_all: bool,
+    ) -> Self {
         Self {
             header: header
                 .filter(|h| !h.trim().is_empty())
@@ -171,7 +175,10 @@ impl SkillPromptBuilder {
         let (open_tag, close_tag) = if valid_tag {
             (format!("<{key}>"), format!("</{key}>"))
         } else {
-            (format!("<entry key=\"{}\">", escape_xml(key)), "</entry>".to_string())
+            (
+                format!("<entry key=\"{}\">", escape_xml(key)),
+                "</entry>".to_string(),
+            )
         };
 
         if is_scalar_value(value) {
@@ -369,7 +376,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("- Other resources (scripts, assets, references) load with the same tool and other paths"), "{out}");
-        assert!(!out.contains("Metadata is rendered as XML under each <skill> element:"), "{out}");
+        assert!(
+            !out.contains("Metadata is rendered as XML under each <skill> element:"),
+            "{out}"
+        );
     }
 
     #[test]

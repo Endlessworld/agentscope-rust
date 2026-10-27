@@ -21,8 +21,7 @@ use futures::StreamExt;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = default_registry();
-    let model_id =
-        std::env::var("AGENTSCOPE_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
+    let model_id = std::env::var("AGENTSCOPE_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
 
     // Programmatic credentials: set API key and base URL directly in code.
     // For example, point to a local or third-party OpenAI-compatible endpoint.

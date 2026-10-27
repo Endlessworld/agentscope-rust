@@ -26,7 +26,9 @@ impl Default for ToolkitConfig {
 }
 
 impl ToolkitConfig {
-    pub fn builder() -> ToolkitConfigBuilder { ToolkitConfigBuilder::default() }
+    pub fn builder() -> ToolkitConfigBuilder {
+        ToolkitConfigBuilder::default()
+    }
 }
 
 /// Builder for [`ToolkitConfig`].
@@ -38,14 +40,27 @@ pub struct ToolkitConfigBuilder {
 
 impl Default for ToolkitConfigBuilder {
     fn default() -> Self {
-        Self { parallel: true, execution_config: Some(ExecutionConfig::tool_defaults()), allow_tool_deletion: true }
+        Self {
+            parallel: true,
+            execution_config: Some(ExecutionConfig::tool_defaults()),
+            allow_tool_deletion: true,
+        }
     }
 }
 
 impl ToolkitConfigBuilder {
-    pub fn parallel(mut self, v: bool) -> Self { self.parallel = v; self }
-    pub fn execution_config(mut self, v: ExecutionConfig) -> Self { self.execution_config = Some(v); self }
-    pub fn allow_tool_deletion(mut self, v: bool) -> Self { self.allow_tool_deletion = v; self }
+    pub fn parallel(mut self, v: bool) -> Self {
+        self.parallel = v;
+        self
+    }
+    pub fn execution_config(mut self, v: ExecutionConfig) -> Self {
+        self.execution_config = Some(v);
+        self
+    }
+    pub fn allow_tool_deletion(mut self, v: bool) -> Self {
+        self.allow_tool_deletion = v;
+        self
+    }
     pub fn build(self) -> ToolkitConfig {
         ToolkitConfig {
             parallel: self.parallel,

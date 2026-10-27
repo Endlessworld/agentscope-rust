@@ -64,7 +64,11 @@ impl DashScopeCredential {
         let base_url = base_url
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(default_base_url);
-        Self { id: None, api_key, base_url }
+        Self {
+            id: None,
+            api_key,
+            base_url,
+        }
     }
 
     /// Sets the credential id.
@@ -114,7 +118,10 @@ mod tests {
 
     #[test]
     fn endpoint_type_parsing() {
-        assert_eq!(EndpointType::parse("multimodal"), Some(EndpointType::Multimodal));
+        assert_eq!(
+            EndpointType::parse("multimodal"),
+            Some(EndpointType::Multimodal)
+        );
         assert_eq!(EndpointType::parse(" TEXT "), Some(EndpointType::Text));
         assert_eq!(EndpointType::parse("auto"), Some(EndpointType::Auto));
         assert_eq!(EndpointType::parse("nope"), None);

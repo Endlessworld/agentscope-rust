@@ -93,7 +93,9 @@ impl PostgresStore {
     /// Creates a store with schema initialization enabled (mirrors
     /// `PostgresBaseStore.builder(ds).initializeSchema(true).build()`).
     pub fn with_schema_init(client: Arc<dyn PostgresClient>) -> PgResult<Self> {
-        PostgresStore::builder(client).initialize_schema(true).build()
+        PostgresStore::builder(client)
+            .initialize_schema(true)
+            .build()
     }
 
     pub fn schema_name(&self) -> Option<&str> {
@@ -377,7 +379,10 @@ mod tests {
         let c2 = client();
         let _ = PostgresStore::with_schema_init(c2.clone()).unwrap();
         assert!(c2.has_table(DEFAULT_TABLE_NAME));
-        assert!(c2.ddl_statements().iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS")));
+        assert!(c2
+            .ddl_statements()
+            .iter()
+            .any(|s| s.contains("CREATE TABLE IF NOT EXISTS")));
 
         let c3 = client();
         let _ = PostgresStore::builder(c3.clone())
@@ -517,7 +522,10 @@ mod tests {
         s.put(&n, "b", val(json!({"i": 2})));
         s.put(&n, "a", val(json!({"i": 1})));
         let hits = s.search(&n, 10, 0);
-        assert_eq!(hits.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            hits.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
         // Pagination.
         let page = s.search(&n, 1, 1);
         assert_eq!(page.len(), 1);
@@ -610,7 +618,11 @@ mod tests {
         assert!(is_duplicate_key(&PostgresError::Query(
             "duplicate key value violates unique constraint \"x_pkey\"".into()
         )));
-        assert!(is_duplicate_key(&PostgresError::Query("SQLSTATE 23505".into())));
-        assert!(!is_duplicate_key(&PostgresError::Query("connection reset".into())));
+        assert!(is_duplicate_key(&PostgresError::Query(
+            "SQLSTATE 23505".into()
+        )));
+        assert!(!is_duplicate_key(&PostgresError::Query(
+            "connection reset".into()
+        )));
     }
 }

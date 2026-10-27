@@ -84,24 +84,34 @@ impl CronExpression {
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         let (sec, min, hour, dom, month, dow, six_field) = match parts.len() {
             5 => ("0", parts[0], parts[1], parts[2], parts[3], parts[4], false),
-            6 => (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], true),
-            n => {
-                return Err(CronParseError(format!(
-                    "expected 5 or 6 fields, got {n}"
-                )))
-            }
+            6 => (
+                parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], true,
+            ),
+            n => return Err(CronParseError(format!("expected 5 or 6 fields, got {n}"))),
         };
 
         // Field values are parsed first so that range/step errors (which Quartz
         // reports while walking the fields) take precedence over the day-field
         // conflict check below.
-        let seconds = Field { values: parse_field(sec, 0, 59, &[])? };
-        let minutes = Field { values: parse_field(min, 0, 59, &[])? };
-        let hours = Field { values: parse_field(hour, 0, 23, &[])? };
-        let days_of_month = Field { values: parse_field(dom, 1, 31, &[])? };
-        let months = Field { values: parse_field(month, 1, 12, &MONTH_NAMES)? };
+        let seconds = Field {
+            values: parse_field(sec, 0, 59, &[])?,
+        };
+        let minutes = Field {
+            values: parse_field(min, 0, 59, &[])?,
+        };
+        let hours = Field {
+            values: parse_field(hour, 0, 23, &[])?,
+        };
+        let days_of_month = Field {
+            values: parse_field(dom, 1, 31, &[])?,
+        };
+        let months = Field {
+            values: parse_field(month, 1, 12, &MONTH_NAMES)?,
+        };
         // Quartz weekday numbering: 1 = SUN … 7 = SAT (0 is out of range).
-        let days_of_week = Field { values: parse_field(dow, 1, 7, &DOW_NAMES)? };
+        let days_of_week = Field {
+            values: parse_field(dow, 1, 7, &DOW_NAMES)?,
+        };
         let day_selector = resolve_day_selector(dom, dow, six_field)?;
 
         Ok(Self {
@@ -261,9 +271,7 @@ fn parse_field(
         };
 
         if start > end {
-            return Err(CronParseError(format!(
-                "range start {start} > end {end}"
-            )));
+            return Err(CronParseError(format!("range start {start} > end {end}")));
         }
 
         let mut v = start;
@@ -301,12 +309,7 @@ fn resolve(token: &str, names: &[&str], min: u32, max: u32) -> Result<u32, CronP
 fn names_index_to_value(idx: usize, _names: &[&str], min: u32) -> u32 {
     // Quartz numbers months and weekdays from 1 (`SUN`=1, `JAN`=1); the
     // 0-based branch only applies to a future 0-based field.
-    if min == 1 {
-        idx as u32 + 1
-    } else {
-        idx as u32
-    }
-    .min(u32::MAX)
+    if min == 1 { idx as u32 + 1 } else { idx as u32 }.min(u32::MAX)
 }
 
 #[cfg(test)]
@@ -417,7 +420,10 @@ mod tests {
         // Quartz: `*` counts as specified, so exactly one of the two day fields
         // must be `?`. Previously Rust fired on the union of both.
         let err = CronExpression::parse("0 0 9 * * MON-FRI").unwrap_err();
-        assert!(err.to_string().contains("both a day-of-week"), "err was {err}");
+        assert!(
+            err.to_string().contains("both a day-of-week"),
+            "err was {err}"
+        );
         assert!(CronExpression::parse("0 0 0 1 * MON").is_err());
         assert!(CronExpression::parse("0 0 0 * * *").is_err());
 

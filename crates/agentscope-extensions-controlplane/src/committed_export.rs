@@ -14,15 +14,13 @@
 
 use std::sync::Arc;
 
-use agentscope_core::session::{
-    SessionEvent as NativeSessionEvent, SessionExportSink,
-};
 use agentscope_core::message::{Msg, MsgRole};
+use agentscope_core::session::{SessionEvent as NativeSessionEvent, SessionExportSink};
 
 use crate::bridge::BridgeReporter;
 use crate::model::session_event::{
-    SessionEvent, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, TYPE_COMPACTION,
-    TYPE_MESSAGE, TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
+    SessionEvent, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, TYPE_COMPACTION, TYPE_MESSAGE,
+    TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
 };
 
 /// Sink name. Java uses `controlplane-native-v1`; the Rust extension keeps its own stable
@@ -41,7 +39,8 @@ pub struct ControlPlaneCommittedEventSink {
 
 impl std::fmt::Debug for ControlPlaneCommittedEventSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlPlaneCommittedEventSink").finish_non_exhaustive()
+        f.debug_struct("ControlPlaneCommittedEventSink")
+            .finish_non_exhaustive()
     }
 }
 
@@ -133,9 +132,7 @@ fn translate(source: &str, fact: &NativeSessionEvent) -> Option<SessionEvent> {
     if event_type == TYPE_MESSAGE {
         if let Some(message) = data.get("message") {
             if let Ok(msg) = serde_json::from_value::<Msg>(message.clone()) {
-                builder = builder
-                    .role(role_of(&msg))
-                    .content(msg.text_content());
+                builder = builder.role(role_of(&msg)).content(msg.text_content());
                 metadata.insert("message".into(), message.clone());
                 builder = builder.framework_meta(serde_json::Value::Object(metadata));
             }
@@ -217,7 +214,10 @@ mod tests {
         assert_eq!(mapped.tool_input.as_ref().unwrap()["q"], "rust");
 
         let replaced = fact("context/replaced", 9, serde_json::json!({}));
-        assert_eq!(translate("s1", &replaced).unwrap().event_type, TYPE_COMPACTION);
+        assert_eq!(
+            translate("s1", &replaced).unwrap().event_type,
+            TYPE_COMPACTION
+        );
     }
 
     #[test]

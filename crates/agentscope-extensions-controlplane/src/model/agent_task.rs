@@ -38,8 +38,7 @@ pub struct AgentTaskAssignment {
 mod base64_opt {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     fn encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);

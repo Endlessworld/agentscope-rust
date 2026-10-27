@@ -148,7 +148,11 @@ impl MemoryMaintenanceMiddleware {
 
     /// Deletes session log files (`*.log.jsonl`) older than the retention window.
     async fn prune_old_sessions(&self, ctx: &RuntimeContext) {
-        let Ok(files) = self.fs.glob(ctx, &format!("{AGENTS_DIR}/**/*.log.jsonl"), "/").await else {
+        let Ok(files) = self
+            .fs
+            .glob(ctx, &format!("{AGENTS_DIR}/**/*.log.jsonl"), "/")
+            .await
+        else {
             return;
         };
         let cutoff = chrono::Utc::now() - chrono::Duration::days(self.session_retention_days);
@@ -237,10 +241,14 @@ mod tests {
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir));
         let ctx = RuntimeContext::new();
         // An old daily file that must be archived.
-        fs.write(&ctx, &format!("{MEMORY_DIR}/2020-01-01.md"), "old").await.unwrap();
+        fs.write(&ctx, &format!("{MEMORY_DIR}/2020-01-01.md"), "old")
+            .await
+            .unwrap();
         // A fresh daily file that must be kept.
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        fs.write(&ctx, &format!("{MEMORY_DIR}/{today}.md"), "fresh").await.unwrap();
+        fs.write(&ctx, &format!("{MEMORY_DIR}/{today}.md"), "fresh")
+            .await
+            .unwrap();
 
         let mw = MemoryMaintenanceMiddleware {
             fs: fs.clone(),
@@ -253,9 +261,18 @@ mod tests {
         mw.expire_daily_files(&ctx).await;
 
         // Old file moved to archive, fresh file stays.
-        assert!(fs.exists(&ctx, &format!("{MEMORY_DIR}/archive/2020-01-01.md")).await.unwrap());
-        assert!(!fs.exists(&ctx, &format!("{MEMORY_DIR}/2020-01-01.md")).await.unwrap());
-        assert!(fs.exists(&ctx, &format!("{MEMORY_DIR}/{today}.md")).await.unwrap());
+        assert!(fs
+            .exists(&ctx, &format!("{MEMORY_DIR}/archive/2020-01-01.md"))
+            .await
+            .unwrap());
+        assert!(!fs
+            .exists(&ctx, &format!("{MEMORY_DIR}/2020-01-01.md"))
+            .await
+            .unwrap());
+        assert!(fs
+            .exists(&ctx, &format!("{MEMORY_DIR}/{today}.md"))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

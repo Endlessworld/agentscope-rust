@@ -135,7 +135,10 @@ pub(crate) struct ExtendedSchemaTool {
 
 impl ExtendedSchemaTool {
     fn new(inner: Arc<dyn Tool>, merged_schema: serde_json::Value) -> Self {
-        Self { inner, merged_schema }
+        Self {
+            inner,
+            merged_schema,
+        }
     }
 }
 
@@ -159,7 +162,11 @@ impl Tool for ExtendedSchemaTool {
     fn parameters_schema(&self) -> serde_json::Value {
         self.merged_schema.clone()
     }
-    async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<crate::message::ToolResultBlock> {
+    async fn call(
+        &self,
+        args: JsonMap,
+        ctx: ToolExecutionContext,
+    ) -> Result<crate::message::ToolResultBlock> {
         self.inner.call(args, ctx).await
     }
 }

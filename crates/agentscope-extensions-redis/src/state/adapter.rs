@@ -82,7 +82,12 @@ pub trait RedisClientAdapter: Send + Sync + std::fmt::Debug {
     /// * `args` maps to `ARGV[1..]`.
     ///
     /// Returns the integer reply, or `None` when the script returns a non-integer / nil.
-    async fn eval_script(&self, script: &str, keys: &[String], args: &[String]) -> Result<Option<i64>>;
+    async fn eval_script(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<Option<i64>>;
 
     /// Releases any resources held by the adapter (no-op for pooled/cloned clients).
     async fn close(&self) -> Result<()> {

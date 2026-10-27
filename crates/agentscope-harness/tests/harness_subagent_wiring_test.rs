@@ -3,8 +3,8 @@
 //! subagents (mirrors Java `buildSubagentEntries` + `SubagentsMiddleware.getTools()`).
 use std::sync::Arc;
 
-use agentscope_core::message::{ContentBlock as CoreBlock, JsonMap, Msg, TextBlock};
 use agentscope_core::agent::StreamOptions;
+use agentscope_core::message::{ContentBlock as CoreBlock, JsonMap, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::tool::ToolExecutionContext;
 use agentscope_harness::agent::subagent::SubagentDeclaration;
@@ -35,8 +35,7 @@ impl Model for ScriptedModel {
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let base =
-        std::env::temp_dir().join(format!("agentscope_wiring_{tag}_{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("agentscope_wiring_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     base
@@ -174,7 +173,10 @@ async fn background_spawn_output_is_collectable_via_task_output() {
         .await
         .expect("spawn ok")
         .text_content();
-    assert!(started.contains("started in background as task"), "out: {started}");
+    assert!(
+        started.contains("started in background as task"),
+        "out: {started}"
+    );
     let task_id = started
         .split("as task '")
         .nth(1)
@@ -213,7 +215,10 @@ async fn built_in_general_purpose_subagent_is_spawnable() {
         ]),
     )
     .await;
-    assert!(out.contains("agent_key: agent:general-purpose:"), "out: {out}");
+    assert!(
+        out.contains("agent_key: agent:general-purpose:"),
+        "out: {out}"
+    );
     assert!(out.ends_with("child reply"), "out: {out}");
 }
 
@@ -232,7 +237,10 @@ async fn declared_subagent_runs_as_leaf_and_accepts_follow_up_send() {
         ]),
     )
     .await;
-    assert!(spawned.contains("agent_key: agent:worker:"), "out: {spawned}");
+    assert!(
+        spawned.contains("agent_key: agent:worker:"),
+        "out: {spawned}"
+    );
     assert!(spawned.ends_with("child reply"), "out: {spawned}");
 
     // Address the live child through its label (Java `agent_send`).

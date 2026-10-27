@@ -30,7 +30,8 @@ use crate::wecom::signature::WeComSignatureVerifier;
 const JAVA_BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::GeneralPurpose::new(
         &base64::alphabet::STANDARD,
-        base64::engine::general_purpose::GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true),
     );
 
 /// WeCom callback signing + payload decryption.
@@ -81,7 +82,9 @@ impl WeComCrypto {
 
         // Java: `Base64.getDecoder().decode(encodingAesKey + "=")`.
         let decoded = base64::Engine::decode(&JAVA_BASE64, format!("{encoding_aes_key}="))
-        .map_err(|e| ChannelError::Config(format!("wecom.encodingAesKey is not base64: {e}")))?;
+            .map_err(|e| {
+                ChannelError::Config(format!("wecom.encodingAesKey is not base64: {e}"))
+            })?;
         if decoded.len() != AES_KEY_SIZE {
             return Err(ChannelError::Config(format!(
                 "Decoded AES key must be {AES_KEY_SIZE} bytes (got {})",
@@ -136,11 +139,11 @@ impl WeComCrypto {
     /// Rejects (with the same messages as Java): too-short plaintext, an out-of-range `msg_len`,
     /// and a trailing receive-id that does not match the configured one.
     pub fn decrypt(&self, encrypt_base64: &str) -> Result<String> {
-        let cipher_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            encrypt_base64,
-        )
-        .map_err(|e| ChannelError::Crypto(format!("WeCom decrypt failed: bad base64: {e}")))?;
+        let cipher_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypt_base64)
+                .map_err(|e| {
+                    ChannelError::Crypto(format!("WeCom decrypt failed: bad base64: {e}"))
+                })?;
 
         let iv = self.iv();
         let plain = aes_256_cbc_decrypt(&self.aes_key, &iv, &cipher_bytes)
@@ -152,12 +155,8 @@ impl WeComCrypto {
             ));
         }
 
-        let msg_len = u32::from_be_bytes([
-            unpadded[16],
-            unpadded[17],
-            unpadded[18],
-            unpadded[19],
-        ]) as usize;
+        let msg_len =
+            u32::from_be_bytes([unpadded[16], unpadded[17], unpadded[18], unpadded[19]]) as usize;
         if 20 + msg_len > unpadded.len() {
             return Err(ChannelError::Crypto(format!(
                 "WeCom decrypt failed: Invalid msg_len in decrypted payload: {msg_len}"
@@ -168,7 +167,9 @@ impl WeComCrypto {
             ChannelError::Crypto(format!("WeCom decrypt failed: message is not UTF-8: {e}"))
         })?;
         let trailing = std::str::from_utf8(&unpadded[20 + msg_len..]).map_err(|e| {
-            ChannelError::Crypto(format!("WeCom decrypt failed: receive_id is not UTF-8: {e}"))
+            ChannelError::Crypto(format!(
+                "WeCom decrypt failed: receive_id is not UTF-8: {e}"
+            ))
         })?;
         if trailing != self.receive_id {
             return Err(ChannelError::Crypto(format!(
@@ -277,7 +278,9 @@ mod tests {
             // Exactly one AES block of payload prefix padding exercise.
             "<xml/>",
         ] {
-            let encrypted = c.encrypt_with_random(xml, RECEIVE_ID, b"RANDOM_16_BYTES!").unwrap();
+            let encrypted = c
+                .encrypt_with_random(xml, RECEIVE_ID, b"RANDOM_16_BYTES!")
+                .unwrap();
             assert_eq!(c.decrypt(&encrypted).unwrap(), xml);
         }
         // The fixed-`encrypt` wrapper must also round-trip.
@@ -296,7 +299,9 @@ mod tests {
     fn decrypt_rejects_receive_id_mismatch() {
         let c = crypto();
         // Encrypt with a different receive id, then try to decrypt with the configured one.
-        let encrypted = c.encrypt_with_random(MSG_XML, "other-corp", b"RANDOM_16_BYTES!").unwrap();
+        let encrypted = c
+            .encrypt_with_random(MSG_XML, "other-corp", b"RANDOM_16_BYTES!")
+            .unwrap();
         let err = c.decrypt(&encrypted).unwrap_err();
         assert!(err.to_string().contains("receive_id mismatch"), "{err}");
     }
@@ -319,18 +324,8 @@ mod tests {
         let c = crypto();
         let sig = c.sign("1700000000", "nonce-2", KNOWN_CIPHERTEXT_B64);
         assert_eq!(sig, "c4b452f51436f842e545324d34ca081a3751653a");
-        assert!(c.verify_signature(
-            Some(&sig),
-            "1700000000",
-            "nonce-2",
-            KNOWN_CIPHERTEXT_B64
-        ));
-        assert!(!c.verify_signature(
-            Some(&sig),
-            "1700000001",
-            "nonce-2",
-            KNOWN_CIPHERTEXT_B64
-        ));
+        assert!(c.verify_signature(Some(&sig), "1700000000", "nonce-2", KNOWN_CIPHERTEXT_B64));
+        assert!(!c.verify_signature(Some(&sig), "1700000001", "nonce-2", KNOWN_CIPHERTEXT_B64));
         assert!(!c.verify_signature(None, "1700000000", "nonce-2", KNOWN_CIPHERTEXT_B64));
     }
 

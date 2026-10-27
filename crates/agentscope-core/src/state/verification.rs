@@ -316,7 +316,10 @@ mod tests {
     #[test]
     fn negative_contract_version_is_rejected() {
         let error = EvidenceBinding::new("task-1", -1, "v7").unwrap_err();
-        assert!(error.to_string().contains("Negative contract version"), "{error}");
+        assert!(
+            error.to_string().contains("Negative contract version"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -327,7 +330,10 @@ mod tests {
             VerificationOutcome::Unknown,
             VerificationOutcome::Error,
         ] {
-            assert_eq!(VerificationOutcome::from_wire(outcome.as_str()), Some(outcome));
+            assert_eq!(
+                VerificationOutcome::from_wire(outcome.as_str()),
+                Some(outcome)
+            );
         }
         assert_eq!(
             VerificationOutcome::from_wire("passed"),

@@ -43,7 +43,10 @@ impl std::fmt::Debug for ToolExecutionContext {
             .field("tool_call", &self.tool_call)
             .field("runtime", &self.runtime)
             .field("has_emitter", &self.emitter.is_some())
-            .field("has_tool_request_config", &self.tool_request_config.is_some())
+            .field(
+                "has_tool_request_config",
+                &self.tool_request_config.is_some(),
+            )
             .finish()
     }
 }
@@ -138,7 +141,10 @@ pub trait Tool: Send + Sync {
     /// When a [`Toolkit`](super::toolkit::Toolkit) is copied, aware tools are
     /// asked to rebind themselves to the new copy. Returns `None` by default,
     /// meaning the tool is not toolkit-aware and is shared as-is.
-    fn rebind_toolkit(&self, _toolkit: &super::toolkit::Toolkit) -> Option<std::sync::Arc<dyn Tool>> {
+    fn rebind_toolkit(
+        &self,
+        _toolkit: &super::toolkit::Toolkit,
+    ) -> Option<std::sync::Arc<dyn Tool>> {
         None
     }
 }
@@ -163,7 +169,9 @@ impl FunctionTool {
         name: impl Into<String>,
         description: impl Into<String>,
         parameters: serde_json::Value,
-        handler: Box<dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync>,
+        handler: Box<
+            dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync,
+        >,
     ) -> Self {
         Self {
             name: name.into(),
@@ -246,10 +254,7 @@ impl Tool for FunctionTool {
     async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         (self.handler)(args, ctx)
     }
-    fn rebind_toolkit(
-        &self,
-        toolkit: &super::toolkit::Toolkit,
-    ) -> Option<Arc<dyn Tool>> {
+    fn rebind_toolkit(&self, toolkit: &super::toolkit::Toolkit) -> Option<Arc<dyn Tool>> {
         self.rebind.as_ref().map(|f| f(toolkit))
     }
 }
@@ -294,7 +299,11 @@ mod tests {
             fn parameters_schema(&self) -> serde_json::Value {
                 serde_json::json!({"type": "object"})
             }
-            async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+            async fn call(
+                &self,
+                _args: JsonMap,
+                _ctx: ToolExecutionContext,
+            ) -> Result<ToolResultBlock> {
                 Ok(ToolResultBlock::text("ok"))
             }
         }

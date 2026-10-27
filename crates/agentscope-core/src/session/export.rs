@@ -187,10 +187,28 @@ mod tests {
         let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
         let writer: Writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
         let events = vec![
-            SessionEvent::new("e1", 1, 0, "run/start", Some("run-1".into()), None, true, "{}")
-                .unwrap(),
-            SessionEvent::new("e2", 2, 0, "turn/start", Some("run-1".into()), None, true, "{}")
-                .unwrap(),
+            SessionEvent::new(
+                "e1",
+                1,
+                0,
+                "run/start",
+                Some("run-1".into()),
+                None,
+                true,
+                "{}",
+            )
+            .unwrap(),
+            SessionEvent::new(
+                "e2",
+                2,
+                0,
+                "turn/start",
+                Some("run-1".into()),
+                None,
+                true,
+                "{}",
+            )
+            .unwrap(),
         ];
         log.commit(&writer, "b1", 0, &events).await.unwrap();
         log.release(&writer).await.unwrap();
@@ -226,7 +244,10 @@ mod tests {
     async fn sinks_keep_independent_cursors() {
         let (log, _storage) = seeded().await;
         let a = Arc::new(RecordingSink::new("sink-a", None));
-        SessionLogExporter::new(Arc::clone(&log), a.clone()).drain().await.unwrap();
+        SessionLogExporter::new(Arc::clone(&log), a.clone())
+            .drain()
+            .await
+            .unwrap();
         assert_eq!(log.export_cursor("sink-a").await.unwrap(), 2);
         assert_eq!(log.export_cursor("sink-c").await.unwrap(), 0);
     }
@@ -246,11 +267,7 @@ mod tests {
             panic!("for_session must deliver through accept_for");
         }
 
-        fn accept_for(
-            &self,
-            session_id: &str,
-            event: &SessionEvent,
-        ) -> crate::error::Result<()> {
+        fn accept_for(&self, session_id: &str, event: &SessionEvent) -> crate::error::Result<()> {
             self.seen
                 .lock()
                 .unwrap()

@@ -36,7 +36,10 @@ impl GeminiModelProvider {
     /// Strips an optional `gemini:` prefix, returning the bare model id.
     pub fn strip_prefix(model: &str) -> &str {
         let trimmed = model.trim();
-        trimmed.strip_prefix("gemini:").map(str::trim).unwrap_or(trimmed)
+        trimmed
+            .strip_prefix("gemini:")
+            .map(str::trim)
+            .unwrap_or(trimmed)
     }
 }
 
@@ -85,12 +88,13 @@ impl ModelProvider for GeminiModelProvider {
             ));
         }
 
-        let api_key = GeminiCredential::resolve_api_key(ctx.api_key.as_deref()).ok_or_else(|| {
-            Error::Model(format!(
-                "GEMINI_API_KEY is required to create Gemini model: {}",
-                ctx.model
-            ))
-        })?;
+        let api_key =
+            GeminiCredential::resolve_api_key(ctx.api_key.as_deref()).ok_or_else(|| {
+                Error::Model(format!(
+                    "GEMINI_API_KEY is required to create Gemini model: {}",
+                    ctx.model
+                ))
+            })?;
 
         let context_window_size = ctx
             .options
@@ -193,9 +197,10 @@ mod tests {
     fn context_window_size_option_is_applied() {
         let provider = GeminiModelProvider::new();
         let mut options = GenerateOptions::default();
-        options
-            .additional_body_params
-            .insert("contextWindowSize".to_string(), serde_json::json!(1_048_576));
+        options.additional_body_params.insert(
+            "contextWindowSize".to_string(),
+            serde_json::json!(1_048_576),
+        );
         let ctx = ModelCreationContext::new("gemini", "gemini:gemini-2.5-flash")
             .api_key("k")
             .options(options);

@@ -284,7 +284,9 @@ pub fn like_prefix_pattern(namespace: &[String], escape: char) -> Result<String,
 /// Validates that a key is non-empty. Mirrors `JdbcStore.validateKey`.
 pub fn validate_key(key: &str) -> Result<(), MysqlError> {
     if key.is_empty() {
-        return Err(MysqlError::InvalidArgument("key must not be null or empty".into()));
+        return Err(MysqlError::InvalidArgument(
+            "key must not be null or empty".into(),
+        ));
     }
     Ok(())
 }
@@ -330,9 +332,18 @@ mod tests {
             &SqliteStoreDialect,
             &H2StoreDialect,
         ] {
-            for tmpl in [d.create_table_sql(), d.upsert_sql(), d.insert_sql(), d.cas_update_sql()] {
+            for tmpl in [
+                d.create_table_sql(),
+                d.upsert_sql(),
+                d.insert_sql(),
+                d.cas_update_sql(),
+            ] {
                 let rendered = d.render(tmpl, "t");
-                assert!(!rendered.contains("{table}"), "dialect {} left placeholder", d.name());
+                assert!(
+                    !rendered.contains("{table}"),
+                    "dialect {} left placeholder",
+                    d.name()
+                );
             }
         }
     }

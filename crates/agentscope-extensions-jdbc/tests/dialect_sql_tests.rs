@@ -141,7 +141,10 @@ fn column_def<'a>(ddl: &'a str, column: &str) -> &'a str {
         .find(&needle)
         .unwrap_or_else(|| panic!("missing column `{column}` in DDL: {ddl}"));
     let rest = &ddl[start..];
-    let end = rest.find(',').or_else(|| rest.find(')')).unwrap_or(rest.len());
+    let end = rest
+        .find(',')
+        .or_else(|| rest.find(')'))
+        .unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -178,7 +181,9 @@ fn mysql_session_state_key_columns_use_binary_collation() {
     // `DEFAULT ... COLLATE utf8mb4_unicode_ci`, so without a column-level override both key
     // columns inherit a case-insensitive collation and two sessions/keys differing only in
     // letter case overwrite each other.
-    let session = MysqlDialect::new().session_state_create_table_ddls().remove(0);
+    let session = MysqlDialect::new()
+        .session_state_create_table_ddls()
+        .remove(0);
     assert_binary_key_column(&session, "session_id");
     assert_binary_key_column(&session, "state_key");
     assert!(
@@ -318,7 +323,9 @@ fn session_state_update_if_version_writes_expected_plus_one() {
 fn session_state_insert_if_absent_pins_version_one() {
     // Java: SessionStateDialect.sessionStateInsertIfAbsent
     let bs = SqliteDialect::new().session_state_insert_if_absent("sid", "key", 0, "json");
-    assert!(bs.sql.contains("(session_id, state_key, item_index, state_data, version)"));
+    assert!(bs
+        .sql
+        .contains("(session_id, state_key, item_index, state_data, version)"));
     assert!(bs.sql.contains("VALUES (?, ?, ?, ?, 1)"));
     assert_eq!(bs.params.len(), 4);
 }
@@ -332,7 +339,9 @@ fn session_state_insert_if_absent_pins_version_one() {
 #[test]
 fn postgres_snapshot_ddl_uses_bytea() {
     // Java: DialectSqlTests.postgresSnapshotDdlUsesBytea
-    let ddl = PostgresDialect::new().snapshot_create_table_ddls().remove(0);
+    let ddl = PostgresDialect::new()
+        .snapshot_create_table_ddls()
+        .remove(0);
     assert!(ddl.contains("BYTEA"));
 }
 
@@ -370,10 +379,22 @@ fn sqlite_snapshot_upsert_uses_on_conflict() {
 fn all_dialects_inherit_identical_store_insert() {
     // Java: DialectSqlTests.allInheritStoreInsert
     let expected = "INSERT INTO agentscope_store (namespace_path, item_key, value_json, version, updated_at) VALUES (?, ?, ?, 1, ?)";
-    assert_eq!(PostgresDialect::new().store_insert("a", "b", "c", 1).sql, expected);
-    assert_eq!(MysqlDialect::new().store_insert("a", "b", "c", 1).sql, expected);
-    assert_eq!(AnsiDialect::new().store_insert("a", "b", "c", 1).sql, expected);
-    assert_eq!(SqliteDialect::new().store_insert("a", "b", "c", 1).sql, expected);
+    assert_eq!(
+        PostgresDialect::new().store_insert("a", "b", "c", 1).sql,
+        expected
+    );
+    assert_eq!(
+        MysqlDialect::new().store_insert("a", "b", "c", 1).sql,
+        expected
+    );
+    assert_eq!(
+        AnsiDialect::new().store_insert("a", "b", "c", 1).sql,
+        expected
+    );
+    assert_eq!(
+        SqliteDialect::new().store_insert("a", "b", "c", 1).sql,
+        expected
+    );
 }
 
 #[test]
@@ -381,8 +402,7 @@ fn all_dialects_inherit_identical_store_select_and_delete() {
     // Java: StoreDialect default storeSelect / storeDelete
     let expected_select =
         "SELECT value_json, version FROM agentscope_store WHERE namespace_path = ? AND item_key = ?";
-    let expected_delete =
-        "DELETE FROM agentscope_store WHERE namespace_path = ? AND item_key = ?";
+    let expected_delete = "DELETE FROM agentscope_store WHERE namespace_path = ? AND item_key = ?";
     for d in [
         Arc::new(PostgresDialect::new()) as Arc<dyn AbstractJdbcDialect>,
         Arc::new(MysqlDialect::new()),
@@ -447,8 +467,7 @@ fn mysql_store_pk_fits_innodb_utf8mb4_limit() {
     let ddl = MysqlDialect::new().store_create_table_ddls().remove(0);
     let namespace_path_len = varchar_length(&ddl, "namespace_path");
     let item_key_len = varchar_length(&ddl, "item_key");
-    let composite_pk_bytes =
-        (namespace_path_len + item_key_len) * UTF8MB4_MAX_BYTES_PER_CHAR;
+    let composite_pk_bytes = (namespace_path_len + item_key_len) * UTF8MB4_MAX_BYTES_PER_CHAR;
     assert!(
         composite_pk_bytes <= INNODB_UTF8MB4_INDEX_LIMIT_BYTES,
         "Composite PK is {composite_pk_bytes} bytes, over the InnoDB utf8mb4 limit of {INNODB_UTF8MB4_INDEX_LIMIT_BYTES}"

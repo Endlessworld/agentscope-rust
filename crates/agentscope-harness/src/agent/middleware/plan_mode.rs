@@ -17,9 +17,7 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock};
-use agentscope_core::middleware::{
-    EventStream, ExtensionPoint, Middleware, ModelCallInput, Next,
-};
+use agentscope_core::middleware::{EventStream, ExtensionPoint, Middleware, ModelCallInput, Next};
 use agentscope_core::state::AgentState;
 
 use crate::agent::workspace::PlanModeManager;
@@ -149,7 +147,8 @@ impl PlanModeMiddleware {
             let mut banner = PLAN_BANNER_TEMPLATE.replace("{}", &path);
             if !self.config.additional_allowed.is_empty() {
                 banner.push_str(
-                    &PLAN_EXTRA_TOOLS_HINT.replace("{}", &self.config.additional_allowed.join(", ")),
+                    &PLAN_EXTRA_TOOLS_HINT
+                        .replace("{}", &self.config.additional_allowed.join(", ")),
                 );
             }
             return banner;
@@ -209,10 +208,7 @@ impl Middleware for PlanModeMiddleware {
 
     /// Narrow declaration, mirroring Java `PlanModeMiddleware.activePoints()`.
     fn active_points(&self) -> Vec<ExtensionPoint> {
-        vec![
-            ExtensionPoint::OnSystemPrompt,
-            ExtensionPoint::OnModelCall,
-        ]
+        vec![ExtensionPoint::OnSystemPrompt, ExtensionPoint::OnModelCall]
     }
 }
 
@@ -230,9 +226,7 @@ mod tests {
 
     fn manager() -> Arc<PlanModeManager> {
         Arc::new(PlanModeManager::new(
-            Arc::new(crate::filesystem::LocalFilesystem::new(
-                std::env::temp_dir(),
-            )),
+            Arc::new(crate::filesystem::LocalFilesystem::new(std::env::temp_dir())),
             Some("plans"),
         ))
     }
@@ -254,7 +248,10 @@ mod tests {
             prompt.contains("PLAN MODE is active (read-only). Plan file:"),
             "expected the PLAN banner, got: {prompt}"
         );
-        assert!(prompt.contains("plans/PLAN.md"), "banner must carry the plan path");
+        assert!(
+            prompt.contains("plans/PLAN.md"),
+            "banner must carry the plan path"
+        );
     }
 
     #[test]

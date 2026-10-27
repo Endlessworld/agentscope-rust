@@ -33,10 +33,10 @@
 
 use std::sync::{Arc, RwLock};
 
-use async_trait::async_trait;
 use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
+use async_trait::async_trait;
 
 use super::channel::channel::Channel;
 use super::channel::config::ChannelConfig;
@@ -112,7 +112,10 @@ impl PlatformCtx {
 
     /// Whether a gateway has been injected.
     pub fn has_gateway(&self) -> bool {
-        self.gateway.read().expect("gateway lock poisoned").is_some()
+        self.gateway
+            .read()
+            .expect("gateway lock poisoned")
+            .is_some()
     }
 
     /// Swap the routing config in place, mirroring the Java `applyRoutingConfig` live swap.
@@ -230,9 +233,16 @@ mod tests {
 
     #[async_trait]
     impl GatewayAgent for EchoAgent {
-        async fn call(&self, messages: Vec<Msg>, _ctx: &super::super::harness_gateway::GatewayTurnContext) -> Result<Msg> {
+        async fn call(
+            &self,
+            messages: Vec<Msg>,
+            _ctx: &super::super::harness_gateway::GatewayTurnContext,
+        ) -> Result<Msg> {
             self.seen.lock().unwrap().push(messages);
-            Ok(Msg::builder().role(MsgRole::Assistant).text_content("pong").build())
+            Ok(Msg::builder()
+                .role(MsgRole::Assistant)
+                .text_content("pong")
+                .build())
         }
     }
 
@@ -267,7 +277,10 @@ mod tests {
     }
 
     fn inbound(peer: Peer) -> InboundMessage {
-        let msg = Msg::builder().role(MsgRole::User).text_content("ping").build();
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .text_content("ping")
+            .build();
         InboundMessage::builder("feishu", peer, vec![msg]).build()
     }
 
@@ -317,19 +330,25 @@ mod tests {
     #[tokio::test]
     async fn dispatch_requires_a_gateway() {
         let c = RecordingChannel::new("feishu", ChannelConfig::of("feishu"));
-        assert!(PlatformChannel::dispatch(&c, inbound(Peer::direct("u1"))).await.is_err());
+        assert!(PlatformChannel::dispatch(&c, inbound(Peer::direct("u1")))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn dispatch_runs_the_turn_and_delivers_the_reply() {
-        let agent = Arc::new(EchoAgent { seen: Mutex::new(Vec::new()) });
+        let agent = Arc::new(EchoAgent {
+            seen: Mutex::new(Vec::new()),
+        });
         let gateway = Arc::new(HarnessGateway::create_standalone());
         gateway.bind_main_agent(agent.clone()).await;
 
         let c = RecordingChannel::new("feishu", ChannelConfig::of_with_default("feishu", "main"));
         c.init(gateway);
 
-        let reply = PlatformChannel::dispatch(&c, inbound(Peer::direct("u1"))).await.unwrap();
+        let reply = PlatformChannel::dispatch(&c, inbound(Peer::direct("u1")))
+            .await
+            .unwrap();
         assert_eq!(reply.text_content(), "pong");
         assert_eq!(agent.seen.lock().unwrap().len(), 1);
 

@@ -75,13 +75,18 @@ impl DocumentMetadata {
     }
 
     /// Creates metadata from a plain text chunk.
-    pub fn text(text: impl Into<String>, doc_id: impl Into<String>, chunk_id: impl Into<String>) -> Self {
+    pub fn text(
+        text: impl Into<String>,
+        doc_id: impl Into<String>,
+        chunk_id: impl Into<String>,
+    ) -> Self {
         Self::new(ContentBlock::Text(TextBlock::new(text)), doc_id, chunk_id)
     }
 
     /// Payload as an object map, or an empty map when absent / not an object.
     pub fn payload_map(&self) -> &serde_json::Map<String, Value> {
-        static EMPTY: std::sync::OnceLock<serde_json::Map<String, Value>> = std::sync::OnceLock::new();
+        static EMPTY: std::sync::OnceLock<serde_json::Map<String, Value>> =
+            std::sync::OnceLock::new();
         match &self.payload {
             Value::Object(m) => m,
             _ => EMPTY.get_or_init(serde_json::Map::new),
@@ -200,10 +205,7 @@ fn generate_document_id(metadata: &DocumentMetadata) -> String {
         Ok(json) => json,
         // `ContentBlock` serialization cannot realistically fail; fall back to a
         // debug-free representation rather than panicking.
-        Err(_) => format!(
-            "\"{}\"\"{}\"",
-            metadata.doc_id, metadata.chunk_id
-        ),
+        Err(_) => format!("\"{}\"\"{}\"", metadata.doc_id, metadata.chunk_id),
     };
 
     uuid_v3_from_name(json.as_bytes())

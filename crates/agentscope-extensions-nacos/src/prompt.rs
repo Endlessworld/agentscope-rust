@@ -32,7 +32,8 @@ impl NacosPromptListener {
 
     /// Returns the rendered prompt with no args and no default.
     pub async fn get_prompt(&self, prompt_key: &str) -> AiServiceResult<String> {
-        self.get_prompt_full(prompt_key, None, None, None, None).await
+        self.get_prompt_full(prompt_key, None, None, None, None)
+            .await
     }
 
     /// Returns the rendered prompt with args and no default.
@@ -41,7 +42,8 @@ impl NacosPromptListener {
         prompt_key: &str,
         args: Option<&HashMap<String, String>>,
     ) -> AiServiceResult<String> {
-        self.get_prompt_full(prompt_key, None, None, args, None).await
+        self.get_prompt_full(prompt_key, None, None, args, None)
+            .await
     }
 
     /// Returns the rendered prompt, falling back to `default_value` when the prompt is
@@ -150,7 +152,10 @@ mod tests {
     #[tokio::test]
     async fn returns_rendered_prompt() {
         let svc = Arc::new(InMemoryNacosAiService::new());
-        svc.set_prompt("greet", NacosPrompt::new("Hello {{name}}, welcome to ${place}"));
+        svc.set_prompt(
+            "greet",
+            NacosPrompt::new("Hello {{name}}, welcome to ${place}"),
+        );
         let listener = NacosPromptListener::new(svc);
         let out = listener
             .get_prompt_with_args("greet", Some(&args(&[("name", "Ada"), ("place", "Nacos")])))
@@ -219,7 +224,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             svc.prompt_subscriptions(),
-            vec![("p".to_string(), Some("1.0".to_string()), Some("prod".to_string()))]
+            vec![(
+                "p".to_string(),
+                Some("1.0".to_string()),
+                Some("prod".to_string())
+            )]
         );
     }
 

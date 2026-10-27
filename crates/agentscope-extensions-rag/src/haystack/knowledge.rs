@@ -188,7 +188,10 @@ mod tests {
             error.to_string().contains("HayStackConfig is required"),
             "{error}"
         );
-        assert!(HayStackKnowledge::builder().config(config()).build().is_ok());
+        assert!(HayStackKnowledge::builder()
+            .config(config())
+            .build()
+            .is_ok());
     }
 
     #[test]
@@ -284,10 +287,8 @@ mod tests {
 
     #[tokio::test]
     async fn zero_limit_and_threshold_fall_back_to_the_config() {
-        let (knowledge, transport) = knowledge(vec![HttpResponse::new(
-            200,
-            r#"{"code":0,"documents":[]}"#,
-        )]);
+        let (knowledge, transport) =
+            knowledge(vec![HttpResponse::new(200, r#"{"code":0,"documents":[]}"#)]);
         // limit = 0 and threshold = 0.0 are treated as "unset" by the adapter.
         let documents = knowledge
             .retrieve("q", &RetrieveConfig::new(0, 0.0))

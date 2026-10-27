@@ -70,11 +70,8 @@ impl MongodbDistributedStore {
             // scope is eligible because a SESSION-scoped sandbox is tied 1:1 to the
             // session; USER/AGENT/GLOBAL share sandboxes across sessions. This is
             // best-effort: a failure is logged and the session is still removed.
-            let cascade_snapshot_client = MongodbRemoteSnapshotClient::new(
-                client.clone(),
-                Some(&database_name),
-                None,
-            );
+            let cascade_snapshot_client =
+                MongodbRemoteSnapshotClient::new(client.clone(), Some(&database_name), None);
             let cascade_state_client = client.clone();
             let cascade_db = database_name.clone();
             MongodbAgentStateStore::builder()
@@ -169,9 +166,7 @@ impl MongodbDistributedStore {
 
     /// A harness-trait [`SandboxExecutionGuard`](agentscope_harness::agent::sandbox::guard::SandboxExecutionGuard)
     /// view of the MongoDB guard.
-    pub fn sandbox_execution_guard(
-        &self,
-    ) -> Arc<MongodbGuardClient> {
+    pub fn sandbox_execution_guard(&self) -> Arc<MongodbGuardClient> {
         self.guard_client.clone()
     }
 
@@ -269,12 +264,10 @@ mod tests {
 
     /// Seeds the harness sandbox-state slot so the cascade lookup finds a remote
     /// snapshot id, mirroring what `SessionSandboxStateStore` writes.
-    async fn seed_session_snapshot(
-        raw: &InMemoryMongoClient,
-        session_id: &str,
-        snapshot_id: &str,
-    ) {
-        use crate::client::{FindFilter, InMemoryMongoClient as _, MongoClient as _, Update, UpdateOptions};
+    async fn seed_session_snapshot(raw: &InMemoryMongoClient, session_id: &str, snapshot_id: &str) {
+        use crate::client::{
+            FindFilter, InMemoryMongoClient as _, MongoClient as _, Update, UpdateOptions,
+        };
         let filter = FindFilter::eq(
             "_id",
             json!({ "user": "__anon__", "session": format!("sandbox/session/{session_id}") }),
@@ -304,8 +297,13 @@ mod tests {
     async fn state_store_component_round_trips() {
         let s = store();
         use agentscope_core::state::AgentStateStore;
-        s.agent_state_store().save(Some("u"), "sess", "k", json!(1)).await;
-        assert_eq!(s.agent_state_store().get(Some("u"), "sess", "k").await, Some(json!(1)));
+        s.agent_state_store()
+            .save(Some("u"), "sess", "k", json!(1))
+            .await;
+        assert_eq!(
+            s.agent_state_store().get(Some("u"), "sess", "k").await,
+            Some(json!(1))
+        );
     }
 
     #[tokio::test]
@@ -365,7 +363,9 @@ mod tests {
 
         // Deleting the session triggers the on_delete cascade, which reclaims the
         // snapshot because its id is discoverable from the session slot.
-        s.agent_state_store().delete(Some("__anon__"), "sess-1").await;
+        s.agent_state_store()
+            .delete(Some("__anon__"), "sess-1")
+            .await;
         assert!(!s.snapshot_client().exists("snap-42").await.unwrap());
     }
 
@@ -374,7 +374,9 @@ mod tests {
         let raw = Arc::new(InMemoryMongoClient::new());
         let s = MongodbDistributedStore::new(raw.clone(), Some("agentscope"));
         use agentscope_core::state::AgentStateStore;
-        s.agent_state_store().save(Some("u"), "sess-2", "k", json!(1)).await;
+        s.agent_state_store()
+            .save(Some("u"), "sess-2", "k", json!(1))
+            .await;
         // No sandbox-state slot → cascade lookup finds nothing; deletion still succeeds.
         s.agent_state_store().delete(Some("u"), "sess-2").await;
         assert!(!s.agent_state_store().exists(Some("u"), "sess-2").await);

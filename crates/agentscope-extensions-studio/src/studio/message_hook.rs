@@ -46,9 +46,7 @@ impl Middleware for StudioMessageHook {
     ) -> EventStream {
         let stream = next(input);
         let Some(client) = self.client.clone() else {
-            tracing::warn!(
-                "StudioMessageHook has no Studio client; skipping message forwarding"
-            );
+            tracing::warn!("StudioMessageHook has no Studio client; skipping message forwarding");
             return stream;
         };
 

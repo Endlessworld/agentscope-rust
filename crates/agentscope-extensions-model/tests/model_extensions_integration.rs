@@ -21,7 +21,11 @@ use agentscope_extensions_model::{
 struct StaticResolver;
 
 impl MediaResolver for StaticResolver {
-    fn resolve(&self, source: &Source, _purpose: &str) -> Result<ResolvedMedia, agentscope_core::Error> {
+    fn resolve(
+        &self,
+        source: &Source,
+        _purpose: &str,
+    ) -> Result<ResolvedMedia, agentscope_core::Error> {
         match source {
             Source::Url(_) => Ok(ResolvedMedia {
                 base64: "cmVtb3Rl".to_string(),
@@ -79,20 +83,32 @@ fn reverse_encoder_covers_all_client_protocols() {
             ContentBlock::Text(TextBlock::new("answer")),
             ContentBlock::ToolUse(ToolUseBlock::new("call_1", "search", input)),
         ],
-        ChatUsage { input_tokens: 3, output_tokens: 2, cached_tokens: 0, time: 0.0, ..Default::default() },
+        ChatUsage {
+            input_tokens: 3,
+            output_tokens: 2,
+            cached_tokens: 0,
+            time: 0.0,
+            ..Default::default()
+        },
         None,
         Some("tool_calls".to_string()),
     );
 
     let openai = encode_response(RelayFormat::OpenAiChat, &response, "gpt-4o");
-    assert_eq!(openai["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "search");
+    assert_eq!(
+        openai["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "search"
+    );
 
     let claude = encode_response(RelayFormat::ClaudeMessages, &response, "claude");
     assert_eq!(claude["content"][1]["type"], "tool_use");
     assert_eq!(claude["stop_reason"], "tool_use");
 
     let gemini = encode_response(RelayFormat::Gemini, &response, "gemini");
-    assert_eq!(gemini["candidates"][0]["content"]["parts"][1]["functionCall"]["name"], "search");
+    assert_eq!(
+        gemini["candidates"][0]["content"]["parts"][1]["functionCall"]["name"],
+        "search"
+    );
 
     let responses = encode_response(RelayFormat::OpenAiResponses, &response, "gpt-5");
     assert_eq!(responses["output"][1]["type"], "function_call");
@@ -122,8 +138,14 @@ fn capability_and_usage_and_naming_helpers_are_consistent() {
 
     // Usage merges without a zero frame clobbering a positive value.
     let merged = merge_non_zero(
-        &ChatUsage { input_tokens: 10, ..Default::default() },
-        &ChatUsage { output_tokens: 5, ..Default::default() },
+        &ChatUsage {
+            input_tokens: 10,
+            ..Default::default()
+        },
+        &ChatUsage {
+            output_tokens: 5,
+            ..Default::default()
+        },
     );
     assert_eq!(merged.input_tokens, 10);
     assert_eq!(merged.output_tokens, 5);

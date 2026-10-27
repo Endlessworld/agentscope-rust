@@ -368,11 +368,7 @@ impl ToolUseBlock {
     /// Mirrors the Java `ToolUseBlock.METADATA_MALFORMED_ARGUMENTS`.
     pub const METADATA_MALFORMED_ARGUMENTS: &'static str = "malformedArguments";
 
-    pub fn new(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        input: super::JsonMap,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, input: super::JsonMap) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -900,8 +896,14 @@ mod tests {
     fn final_state_resolves_running_default_to_success() {
         // `of`/`text` leave the `Running` default; a finished call must report
         // Success rather than staying RUNNING forever (Java #2745).
-        assert_eq!(ToolResultBlock::text("42").final_state(), ToolResultState::Success);
-        assert_eq!(ToolResultBlock::of_blocks(vec![]).final_state(), ToolResultState::Success);
+        assert_eq!(
+            ToolResultBlock::text("42").final_state(),
+            ToolResultState::Success
+        );
+        assert_eq!(
+            ToolResultBlock::of_blocks(vec![]).final_state(),
+            ToolResultState::Success
+        );
     }
 
     #[test]

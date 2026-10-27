@@ -21,7 +21,8 @@ use crate::filesystem::Filesystem;
 /// Process-wide per-isolation-key flush timestamps (millis since epoch). Static so the
 /// throttle window survives across rebuilds of the middleware, mirroring the Java
 /// `SHARED_LAST_FLUSH_AT` map.
-static SHARED_LAST_FLUSH_AT: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+static SHARED_LAST_FLUSH_AT: std::sync::Mutex<Vec<(String, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Returns the current time in millis for throttle bookkeeping.
 fn now_millis() -> u64 {
@@ -58,7 +59,13 @@ impl MemoryFlushMiddleware {
         flush_trigger: FlushTrigger,
         isolation_scope: IsolationScope,
     ) -> Self {
-        Self { fs, model, flush_prompt, flush_trigger, isolation_scope }
+        Self {
+            fs,
+            model,
+            flush_prompt,
+            flush_trigger,
+            isolation_scope,
+        }
     }
 }
 
@@ -144,7 +151,8 @@ impl Middleware for MemoryFlushMiddleware {
                 let _ = manager.flush_memories(&ctx, &messages).await;
             }
             // Message offload runs on every call regardless of the flush trigger.
-            let manager = MemoryFlushManager::new_with_prompt(fs.clone(), model, Some(flush_prompt));
+            let manager =
+                MemoryFlushManager::new_with_prompt(fs.clone(), model, Some(flush_prompt));
             let _ = offload_messages(&fs, &manager, &ctx, &messages, &agent_id, &session_id).await;
             Vec::new()
         };
@@ -171,7 +179,11 @@ async fn offload_messages(
     let path = manager.resolve_offload_path(agent_id, session_id);
     let mut existing = String::new();
     if fs.exists(ctx, &path).await.unwrap_or(false) {
-        existing = fs.read(ctx, &path, 0, 0).await.map(|d| d.content).unwrap_or_default();
+        existing = fs
+            .read(ctx, &path, 0, 0)
+            .await
+            .map(|d| d.content)
+            .unwrap_or_default();
     }
     // Idempotency: skip messages whose id already appears in the JSONL.
     let mut seen: std::collections::HashSet<String> = existing
@@ -218,7 +230,10 @@ mod tests {
             _messages: Vec<Msg>,
             _tools: Vec<agentscope_core::model::ToolSchema>,
             _options: agentscope_core::model::GenerateOptions,
-        ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<agentscope_core::model::ChatResponse>> {
+        ) -> futures::stream::BoxStream<
+            '_,
+            agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+        > {
             Box::pin(futures::stream::empty())
         }
         fn model_name(&self) -> &str {
@@ -229,8 +244,7 @@ mod tests {
     #[test]
     fn flush_trigger_always_and_never() {
         let ctx = RuntimeContext::new();
-        let fs: Arc<dyn Filesystem> =
-            Arc::new(LocalFilesystem::sandboxed(std::env::temp_dir()));
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(std::env::temp_dir()));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let mw = MemoryFlushMiddleware::new(fs, model);
         assert!(mw.should_flush_now(&ctx)); // ALWAYS
@@ -255,8 +269,12 @@ mod tests {
         let manager = MemoryFlushManager::new(fs.clone(), model);
         let ctx = RuntimeContext::new();
         let msgs = vec![Msg::user("hello"), Msg::assistant("hi")];
-        offload_messages(&fs, &manager, &ctx, &msgs, "agent", "sess").await.unwrap();
-        offload_messages(&fs, &manager, &ctx, &msgs, "agent", "sess").await.unwrap();
+        offload_messages(&fs, &manager, &ctx, &msgs, "agent", "sess")
+            .await
+            .unwrap();
+        offload_messages(&fs, &manager, &ctx, &msgs, "agent", "sess")
+            .await
+            .unwrap();
         let path = manager.resolve_offload_path("agent", "sess");
         let content = fs.read(&ctx, &path, 0, 0).await.unwrap().content;
         assert_eq!(content.lines().count(), 2);

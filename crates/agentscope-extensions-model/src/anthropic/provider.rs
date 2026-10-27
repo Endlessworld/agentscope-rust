@@ -34,7 +34,10 @@ impl AnthropicModelProvider {
     /// Strips an optional `anthropic:` prefix, returning the bare model id.
     pub fn strip_prefix(model: &str) -> &str {
         let trimmed = model.trim();
-        trimmed.strip_prefix("anthropic:").map(str::trim).unwrap_or(trimmed)
+        trimmed
+            .strip_prefix("anthropic:")
+            .map(str::trim)
+            .unwrap_or(trimmed)
     }
 }
 

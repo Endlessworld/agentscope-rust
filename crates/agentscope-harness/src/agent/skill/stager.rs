@@ -52,7 +52,10 @@ pub enum StageResult {
     /// Skill comes from `WorkspaceSkillRepository` (already in `workspace/skills/`).
     WorkspaceNative,
     /// Skill staged under `.skills-cache/<sourceNs>/<skillName>/`.
-    Cached { source_namespace: String, skill_name: String },
+    Cached {
+        source_namespace: String,
+        skill_name: String,
+    },
 }
 
 /// Pairs a skill with the repository that produced it.
@@ -153,7 +156,11 @@ pub fn stage(
                     .filter(|s| !s.is_empty())
                     .cloned()
                     .unwrap_or_else(|| bound.repo.source());
-                let ns = if ns.is_empty() { GLOBAL_NAMESPACE.to_string() } else { ns };
+                let ns = if ns.is_empty() {
+                    GLOBAL_NAMESPACE.to_string()
+                } else {
+                    ns
+                };
                 let staged_dir = cache_root.join(&ns).join(&name);
                 if !materialize_if_changed(&staged_dir, bound.skill.resources())? {
                     // Nothing was materialised — exactly what a lazy repository produces, since it
@@ -237,13 +244,17 @@ fn garbage_collect_orphans(cache_root: &Path, retained: &[PathBuf]) {
     if !cache_root.is_dir() {
         return;
     }
-    let Ok(ns_dirs) = std::fs::read_dir(cache_root) else { return };
+    let Ok(ns_dirs) = std::fs::read_dir(cache_root) else {
+        return;
+    };
     for ns in ns_dirs.flatten() {
         let ns_path = ns.path();
         if !ns_path.is_dir() {
             continue;
         }
-        let Ok(skill_dirs) = std::fs::read_dir(&ns_path) else { continue };
+        let Ok(skill_dirs) = std::fs::read_dir(&ns_path) else {
+            continue;
+        };
         for skill in skill_dirs.flatten() {
             let skill_path = skill.path();
             if skill_path.is_dir() && !retained.iter().any(|r| r == &skill_path) {
@@ -251,7 +262,10 @@ fn garbage_collect_orphans(cache_root: &Path, retained: &[PathBuf]) {
             }
         }
         // Clean up empty namespace dir.
-        if std::fs::read_dir(&ns_path).map(|mut d| d.next().is_none()).unwrap_or(false) {
+        if std::fs::read_dir(&ns_path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+        {
             let _ = std::fs::remove_dir(&ns_path);
         }
     }
@@ -259,7 +273,9 @@ fn garbage_collect_orphans(cache_root: &Path, retained: &[PathBuf]) {
 
 fn decode(content: &str) -> Vec<u8> {
     if let Some(rest) = content.strip_prefix("base64:") {
-        base64::engine::general_purpose::STANDARD.decode(rest).unwrap_or_default()
+        base64::engine::general_purpose::STANDARD
+            .decode(rest)
+            .unwrap_or_default()
     } else {
         content.as_bytes().to_vec()
     }
@@ -273,16 +289,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Known interpreter / script suffixes. Conservative — we only mark "obvious" scripts.
-const SCRIPT_SUFFIXES: [&str; 9] = [".sh", ".bash", ".zsh", ".ksh", ".py", ".rb", ".pl", ".js", ".mjs"];
+const SCRIPT_SUFFIXES: [&str; 9] = [
+    ".sh", ".bash", ".zsh", ".ksh", ".py", ".rb", ".pl", ".js", ".mjs",
+];
 
 /// Script-detection heuristic: shebang at byte 0/1 OR a known-script suffix.
 pub fn should_be_executable(target: &Path, bytes: &[u8]) -> bool {
     if bytes.len() >= 2 && bytes[0] == b'#' && bytes[1] == b'!' {
         return true;
     }
-    let file_name = target.file_name().map(|f| f.to_string_lossy().to_lowercase());
-    let Some(file_name) = file_name else { return false };
-    let Some(dot) = file_name.rfind('.') else { return false };
+    let file_name = target
+        .file_name()
+        .map(|f| f.to_string_lossy().to_lowercase());
+    let Some(file_name) = file_name else {
+        return false;
+    };
+    let Some(dot) = file_name.rfind('.') else {
+        return false;
+    };
     let ext: &str = &file_name[dot..];
     SCRIPT_SUFFIXES.contains(&ext)
 }
@@ -317,8 +341,14 @@ mod tests {
 
     fn ext_skill(name: &str) -> RepoBound {
         RepoBound::new(
-            AgentSkill::builder().name(name).source("market").description("d").build(),
-            SkillRepo::External { source: "market".to_string() },
+            AgentSkill::builder()
+                .name(name)
+                .source("market")
+                .description("d")
+                .build(),
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
         )
     }
 
@@ -348,9 +378,15 @@ mod tests {
     #[test]
     fn resolve_namespaces_disambiguates_collisions() {
         let repos = vec![
-            SkillRepo::External { source: "market".to_string() },
-            SkillRepo::External { source: "market".to_string() },
-            SkillRepo::External { source: "other".to_string() },
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
+            SkillRepo::External {
+                source: "other".to_string(),
+            },
             SkillRepo::Workspace,
         ];
         let ns = resolve_source_namespaces(&repos);
@@ -388,11 +424,21 @@ mod tests {
             .add_resource("SKILL.md", "# tool")
             .add_resource("scripts/run.py", "print(1)")
             .build();
-        let visible = vec![RepoBound::new(skill, SkillRepo::External { source: "market".to_string() })];
-        let ns = resolve_source_namespaces(&[SkillRepo::External { source: "market".to_string() }]);
+        let visible = vec![RepoBound::new(
+            skill,
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
+        )];
+        let ns = resolve_source_namespaces(&[SkillRepo::External {
+            source: "market".to_string(),
+        }]);
 
         let roots = stage(Some(&base), &visible, &ns).unwrap();
-        assert!(matches!(roots.get("tool"), Some(StageResult::Cached { .. })));
+        assert!(matches!(
+            roots.get("tool"),
+            Some(StageResult::Cached { .. })
+        ));
         assert!(cache.join("SKILL.md").exists());
         assert!(cache.join("scripts/run.py").exists());
         assert!(cache.join("scripts").join("run.py").is_file());
@@ -416,9 +462,13 @@ mod tests {
             .build();
         let visible = vec![RepoBound::new(
             skill,
-            SkillRepo::External { source: "market".to_string() },
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
         )];
-        let ns = resolve_source_namespaces(&[SkillRepo::External { source: "market".to_string() }]);
+        let ns = resolve_source_namespaces(&[SkillRepo::External {
+            source: "market".to_string(),
+        }]);
 
         let roots = stage(Some(&base), &visible, &ns).unwrap();
         assert_eq!(roots.get("lazy"), Some(&StageResult::None));
@@ -448,14 +498,21 @@ mod tests {
             .build();
         let visible = vec![RepoBound::new(
             skill,
-            SkillRepo::External { source: "market".to_string() },
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
         )];
-        let ns = resolve_source_namespaces(&[SkillRepo::External { source: "market".to_string() }]);
+        let ns = resolve_source_namespaces(&[SkillRepo::External {
+            source: "market".to_string(),
+        }]);
 
         let roots = stage(Some(&base), &visible, &ns).unwrap();
         assert_eq!(roots.get("unsafe"), Some(&StageResult::None));
         let staged_dir = base.join(CACHE_DIR).join("market").join("unsafe");
-        assert!(!staged_dir.exists(), "no file survived the filter, so no directory may remain");
+        assert!(
+            !staged_dir.exists(),
+            "no file survived the filter, so no directory may remain"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

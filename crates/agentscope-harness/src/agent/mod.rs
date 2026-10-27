@@ -20,9 +20,7 @@ pub mod team;
 pub mod verification;
 pub mod workspace;
 
-pub use artifact::{
-    ArtifactDeliveryRequest, ArtifactDeliveryResult, ArtifactDeliveryTarget,
-};
+pub use artifact::{ArtifactDeliveryRequest, ArtifactDeliveryResult, ArtifactDeliveryTarget};
 pub use bus::{
     AsyncToolRecord, AsyncToolRegistry, BusEntry, MessageBus, WorkspaceAsyncToolRegistry,
     WorkspaceMessageBus,
@@ -35,75 +33,70 @@ pub use context::{
     DefaultSelectionPolicy, Estimate, SourceFailurePolicy, TaskContextOptions, TokenEstimator,
     UsageSource,
 };
-pub use session::{
-    AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
-    WorkspaceSessionLogStore, WorkspaceSessionStorage,
-};
 pub use distributed_store::{DistributedStore, DistributedStoreBuilder};
 pub use gateway::{
-    Channel, ChannelBinding, ChannelConfig, ChannelManager, ChannelRouter, ChannelSink,
-    ChatUiChannel, ChatUiRequest, create_completion_callback, deterministic_hash, DmScope,
-    DefaultSubagentMaterializer, Gateway, GatewayAgent, GatewayBootstrap,
-    GatewayBootstrapBuilder, GatewayTurnContext, HarnessGateway, InboundMessage,
-    InMemorySubagentRegistry, MsgContext, OutboundAddress, OutboundEnvelope, Peer, PeerKind,
-    PlatformChannel, PlatformCtx,
-    RouteResult, SendOptions, SessionTurnGate, SubagentMaterializer, SubagentRecord,
-    SubagentRegistry, TaskCompletionBridge, wire_task_completion,
-    WakeupDispatcher, WakeupTarget,
+    create_completion_callback, deterministic_hash, wire_task_completion, Channel, ChannelBinding,
+    ChannelConfig, ChannelManager, ChannelRouter, ChannelSink, ChatUiChannel, ChatUiRequest,
+    DefaultSubagentMaterializer, DmScope, Gateway, GatewayAgent, GatewayBootstrap,
+    GatewayBootstrapBuilder, GatewayTurnContext, HarnessGateway, InMemorySubagentRegistry,
+    InboundMessage, MsgContext, OutboundAddress, OutboundEnvelope, Peer, PeerKind, PlatformChannel,
+    PlatformCtx, RouteResult, SendOptions, SessionTurnGate, SubagentMaterializer, SubagentRecord,
+    SubagentRegistry, TaskCompletionBridge, WakeupDispatcher, WakeupTarget,
 };
 pub use harness_agent::{HarnessAgent, HarnessAgentBuilder};
 pub use isolation_scope::IsolationScope;
 pub use mcp::{
     bridge_mcp_tools_to_toolkit, try_bridge_mcp_tools_to_toolkit, McpMetaPropagationOptions,
-    McpServerConfig, McpServerRegistrationListener, McpServerRegistrationResult,
-    McpServerRegistrationStatus, McpServerRegistrar, Registrar,
+    McpServerConfig, McpServerRegistrar, McpServerRegistrationListener,
+    McpServerRegistrationResult, McpServerRegistrationStatus, Registrar,
 };
-pub use mcp_client_manager::{McpClientManager, McpClientInstance, McpToolInfo};
+pub use mcp_client_manager::{McpClientInstance, McpClientManager, McpToolInfo};
 pub use memory::{
     compaction::{
-        build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
-        prune_tool_results, trigger_for_input_limit, trigger_for_window, truncate_args,
-        CompactionConfig, CompactionConfigBuilder, CompactionMetrics, CompactionStatus,
-        ConversationCompactor, DEFAULT_SUMMARY_PROMPT, PruneConfig, SUMMARY_MSG_NAME,
-        TruncateArgsConfig, TruncateArgsConfigBuilder,
+        build_summary_message, calculate_token, filter_summary_messages,
+        format_messages_for_summary, prune_tool_results, trigger_for_input_limit,
+        trigger_for_window, truncate_args, CompactionConfig, CompactionConfigBuilder,
+        CompactionMetrics, CompactionStatus, ConversationCompactor, PruneConfig,
+        TruncateArgsConfig, TruncateArgsConfigBuilder, DEFAULT_SUMMARY_PROMPT, SUMMARY_MSG_NAME,
     },
     session::SessionFreshnessEvaluator,
     MemoryConfig, MemoryConfigBuilder, MemoryConsolidator, MemoryFlushManager,
     ToolResultEvictionConfig,
 };
 pub use middleware::{
-    AgentTraceMiddleware, AsyncToolMiddleware, AtPathExpansionMiddleware, build_delivery_reminder,
-    build_task_summary,
+    build_delivery_reminder, build_task_summary, prepend_to_system_message,
+    render_subagent_section, AgentTraceMiddleware, AsyncToolMiddleware, AtPathExpansionMiddleware,
     CompactionMiddleware, CompactionMiddlewareConfig, ConversationCompactionMiddleware,
-    DynamicSubagentsMiddleware, InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware,
-    PlanModeConfig, PlanModeMiddleware, prepend_to_system_message, render_subagent_section,
-    SubagentsMiddleware, ToolResultEvictionMiddleware,
+    DynamicSubagentsMiddleware, InboxMiddleware, MemoryFlushMiddleware,
+    MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SubagentsMiddleware,
+    ToolResultEvictionMiddleware,
 };
 pub use sandbox::{
     DefaultWorkspaceSpecApplier, DockerSandbox, DockerSandboxClient, ExecResult,
     InMemorySandboxStateStore, LocalSandboxState, Sandbox, SandboxClient, SandboxClientOptions,
     SandboxContext, SandboxError, SandboxExecutionGuard, SandboxIsolationKey, SandboxLease,
-    SandboxManager, SandboxSnapshotSpec, SandboxState, SandboxStateStore, VolumeMount, WorkspaceSpec,
-    WorkspaceSpecApplier,
+    SandboxManager, SandboxSnapshotSpec, SandboxState, SandboxStateStore, VolumeMount,
+    WorkspaceSpec, WorkspaceSpecApplier,
+};
+pub use session::{
+    AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
+    WorkspaceSessionLogStore, WorkspaceSessionStorage,
 };
 pub use skill::{
-    AgentSkill, AgentSkillBuilder, AllowListFilter, AllowListGate, AuditEntry, DenyListFilter,
-    FilesystemSkillUsageStore, FileSystemSkillRepository, HarnessSkillEntry, LoadSkillTool,
-    ProposeSkillTool, PromotionDecision,
-    PromotionResult, RejectAllGate, ShellPathPolicy, SkillAuditLog, SkillCatalog, SkillCurator,
-    SkillCuratorConfig, SkillCuratorState, SkillFilter, SkillManageConfig, SkillManageTool,
-    SkillPromoter, SkillPromotionGate, SkillPromptBuilder, SkillRepository, SkillRuntime,
-    SkillState, SkillUsageStore, SkillVisibilityFilter, StageResult, WorkspaceSkillRepository,
-    build_promoter,
-    compose_skill_repositories, default_gate,
+    build_promoter, compose_skill_repositories, default_gate, AgentSkill, AgentSkillBuilder,
+    AllowListFilter, AllowListGate, AuditEntry, DenyListFilter, FileSystemSkillRepository,
+    FilesystemSkillUsageStore, HarnessSkillEntry, LoadSkillTool, PromotionDecision,
+    PromotionResult, ProposeSkillTool, RejectAllGate, ShellPathPolicy, SkillAuditLog, SkillCatalog,
+    SkillCurator, SkillCuratorConfig, SkillCuratorState, SkillFilter, SkillManageConfig,
+    SkillManageTool, SkillPromoter, SkillPromotionGate, SkillPromptBuilder, SkillRepository,
+    SkillRuntime, SkillState, SkillUsageStore, SkillVisibilityFilter, StageResult,
+    WorkspaceSkillRepository,
 };
 pub use subagent::{
     load_from_directory, load_from_file, load_from_filesystem, parse, BackgroundTask,
-    DefaultAgentManager,
-    RemoteAskPolicy, SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode,
-    SubagentWorkspaceMode, SUBAGENTS_DIR, SUBAGENT_GLOB, TaskCompletionCallback, TaskDelivery,
-    TaskRecord,
-    TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository,
+    DefaultAgentManager, RemoteAskPolicy, SubagentDeclaration, SubagentEntry, SubagentFactory,
+    SubagentMode, SubagentWorkspaceMode, TaskCompletionCallback, TaskDelivery, TaskRecord,
+    TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository, SUBAGENTS_DIR, SUBAGENT_GLOB,
     SUPPRESS_COMPLETION_CALLBACK,
 };
 pub use verification::{verify, DeterministicVerifier, SettledAction, Verdict};

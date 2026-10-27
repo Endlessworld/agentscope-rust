@@ -91,8 +91,8 @@ pub fn parse(
     let variant = as_str(obj.get("variant"));
     let mode = parse_mode(as_str(obj.get("mode")));
     let hidden = as_bool(obj.get("hidden")).unwrap_or(false);
-    let expose_to_user = as_bool(obj.get("expose_to_user"))
-        .or_else(|| as_bool(obj.get("exposeToUser")));
+    let expose_to_user =
+        as_bool(obj.get("expose_to_user")).or_else(|| as_bool(obj.get("exposeToUser")));
     let tools = parse_tool_names(as_str(obj.get("tools")));
     let skills = parse_tool_names(as_str(obj.get("skills")));
     let enable_pending_tool_recovery = as_bool(obj.get("enable_pending_tool_recovery"))
@@ -102,9 +102,12 @@ pub fn parse(
     let (compaction, disable_compaction) = match apply_compaction(obj.get("compaction"), name) {
         Some(CompactionSetting::Disabled) => (None, true),
         Some(CompactionSetting::Config(config)) => (Some(config), false),
-        None => (None, as_bool(obj.get("disable_compaction"))
-            .or_else(|| as_bool(obj.get("disableCompaction")))
-            .unwrap_or(false)),
+        None => (
+            None,
+            as_bool(obj.get("disable_compaction"))
+                .or_else(|| as_bool(obj.get("disableCompaction")))
+                .unwrap_or(false),
+        ),
     };
 
     let mut decl = SubagentDeclaration::new(name, description, body);
@@ -231,10 +234,7 @@ enum CompactionSetting {
 /// Parses the front-matter `compaction:` key. Returns `None` when the key is
 /// absent or null (the declaration then inherits the parent setting), and `None`
 /// plus a warning when the value is malformed — Java logs and ignores it too.
-fn apply_compaction(
-    value: Option<&serde_json::Value>,
-    name: &str,
-) -> Option<CompactionSetting> {
+fn apply_compaction(value: Option<&serde_json::Value>, name: &str) -> Option<CompactionSetting> {
     let value = value?;
     if value.is_null() {
         return None;
@@ -323,7 +323,12 @@ fn apply_compaction(
 fn compaction_int(key: &str, value: &serde_json::Value) -> Result<i64, String> {
     let number = value
         .as_i64()
-        .or_else(|| value.as_f64().filter(|n| n.fract() == 0.0).map(|n| n as i64))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|n| n.fract() == 0.0)
+                .map(|n| n as i64)
+        })
         .ok_or_else(|| format!("{key} must be a 32-bit integer"))?;
     let Ok(setting) = i32::try_from(number) else {
         return Err(format!("{key} must be a 32-bit integer"));

@@ -172,18 +172,23 @@ mod tests {
                 .unwrap(),
             "t-1"
         );
-        assert!(p
-            .parse_and_store(r#"{"code":10003,"msg":"bad"}"#)
-            .is_err());
+        assert!(p.parse_and_store(r#"{"code":10003,"msg":"bad"}"#).is_err());
     }
 
     #[tokio::test]
     async fn token_is_cached_until_invalidated() {
         let transport = Arc::new(RecordingTransport::with_responses(vec![
-            PreparedResponse::new(200, r#"{"code":0,"tenant_access_token":"t-1","expire":7200}"#),
-            PreparedResponse::new(200, r#"{"code":0,"tenant_access_token":"t-2","expire":7200}"#),
+            PreparedResponse::new(
+                200,
+                r#"{"code":0,"tenant_access_token":"t-1","expire":7200}"#,
+            ),
+            PreparedResponse::new(
+                200,
+                r#"{"code":0,"tenant_access_token":"t-2","expire":7200}"#,
+            ),
         ]));
-        let p = FeishuAccessTokenProvider::new("https://open.feishu.cn", "cli", "s", transport.clone());
+        let p =
+            FeishuAccessTokenProvider::new("https://open.feishu.cn", "cli", "s", transport.clone());
         assert_eq!(p.token().await.unwrap(), "t-1");
         assert_eq!(p.token().await.unwrap(), "t-1");
         p.invalidate();
@@ -195,7 +200,10 @@ mod tests {
     async fn an_injected_store_is_shared_across_providers() {
         let store: Arc<dyn AccessTokenStore> = Arc::new(InMemoryAccessTokenStore::new());
         let transport = Arc::new(RecordingTransport::with_responses(vec![
-            PreparedResponse::new(200, r#"{"code":0,"tenant_access_token":"t-1","expire":7200}"#),
+            PreparedResponse::new(
+                200,
+                r#"{"code":0,"tenant_access_token":"t-1","expire":7200}"#,
+            ),
         ]));
         let a = FeishuAccessTokenProvider::with_store(
             "https://open.feishu.cn",

@@ -87,26 +87,39 @@ impl AgentScopeAdapter {
 
     /// Optional full-history reader (e.g. a harness transcript).
     pub fn set_history_source(&self, source: Arc<dyn SessionHistorySource>) {
-        *self.history_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+        *self
+            .history_source
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(source);
     }
 
     /// Optional harness-/app hooks for inventory, plan files and subagent tasks.
     pub fn set_runtime_source(&self, source: Arc<dyn AgentRuntimeSource>) {
-        *self.runtime_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+        *self
+            .runtime_source
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(source);
     }
 
     /// Installs the host hook that materializes ASDP AgentTask deliveries.
     pub fn set_agent_task_starter(&self, starter: Arc<dyn AgentTaskStarter>) {
-        *self.agent_task_starter.lock().unwrap_or_else(|p| p.into_inner()) = Some(starter);
+        *self
+            .agent_task_starter
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(starter);
     }
 
     fn target(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        self.target.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.target
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn require_target(&self) -> ControlPlaneResult<Arc<dyn Any + Send + Sync>> {
-        self.target()
-            .ok_or_else(|| ControlPlaneError::Config("agentscope-rust: adapter is not attached".into()))
+        self.target().ok_or_else(|| {
+            ControlPlaneError::Config("agentscope-rust: adapter is not attached".into())
+        })
     }
 
     fn runtime_source(&self) -> Option<Arc<dyn AgentRuntimeSource>> {
@@ -170,7 +183,9 @@ impl AgentScopeAdapter {
         if let Some(react) = target.downcast_ref::<ReActAgent>() {
             return Some(react);
         }
-        target.downcast_ref::<HarnessAgent>().and_then(|h| h.agent())
+        target
+            .downcast_ref::<HarnessAgent>()
+            .and_then(|h| h.agent())
     }
 
     /// Tools exposed to the model, from the agent's toolkit.
@@ -257,13 +272,20 @@ impl FrameworkAdapter for AgentScopeAdapter {
     /// existed) and [`extract_context`](Self::extract_context) can reach the journal.
     /// Mirrors `AgentScopeAdapter.onBridgeAttached`.
     fn on_bridge_attached(&mut self, reporter: crate::bridge::BridgeReporter) {
-        *self.shared.reporter.lock().unwrap_or_else(|p| p.into_inner()) = Some(reporter);
+        *self
+            .shared
+            .reporter
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(reporter);
     }
 
     async fn extract_context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
         let target = self.require_target()?;
         let state = self.resolve_state(&target, session_id).await;
-        let context = state.as_ref().map(|s| s.context.clone()).unwrap_or_default();
+        let context = state
+            .as_ref()
+            .map(|s| s.context.clone())
+            .unwrap_or_default();
 
         let mut messages = Vec::with_capacity(context.len());
         let mut compaction_summary = String::new();
@@ -282,14 +304,20 @@ impl FrameworkAdapter for AgentScopeAdapter {
             .map(|h| h.toolkit().get_active_groups())
             .unwrap_or_default();
 
-        let base_prompt = react.map(|r| r.sys_prompt().to_string()).unwrap_or_default();
+        let base_prompt = react
+            .map(|r| r.sys_prompt().to_string())
+            .unwrap_or_default();
         let sampled = self
             .shared
             .reporter()
             .map(|r| r.effective_system_prompt(session_id))
             .unwrap_or_default();
         let has_effective = !sampled.is_empty();
-        let effective_prompt = if has_effective { sampled } else { base_prompt.clone() };
+        let effective_prompt = if has_effective {
+            sampled
+        } else {
+            base_prompt.clone()
+        };
 
         let framework_state = serde_json::json!({
             "baseSystemPrompt": base_prompt,
@@ -365,7 +393,9 @@ impl FrameworkAdapter for AgentScopeAdapter {
 
     async fn list_subagents(&self) -> ControlPlaneResult<Inventory> {
         let src = self.runtime_source().ok_or_else(|| {
-            ControlPlaneError::Unsupported("subagent-inventory is not supported by this adapter".into())
+            ControlPlaneError::Unsupported(
+                "subagent-inventory is not supported by this adapter".into(),
+            )
         })?;
         let mut inventory = Inventory::default();
         inventory.subagents = src.list_subagents().await?;
@@ -390,7 +420,11 @@ impl FrameworkAdapter for AgentScopeAdapter {
                 };
                 Ok(CommandOutcome {
                     ok,
-                    message: if ok { String::new() } else { "session not active".into() },
+                    message: if ok {
+                        String::new()
+                    } else {
+                        "session not active".into()
+                    },
                 })
             }
             COMMAND_COMPRESS => {

@@ -47,7 +47,9 @@ impl SqlBackend for InMemorySqlBackend {
         now_ms: i64,
     ) -> MysqlResult<()> {
         let mut rows = self.rows.lock().unwrap();
-        let entry = rows.entry(Self::row_key(ns_path, key)).or_insert_with(Row::default);
+        let entry = rows
+            .entry(Self::row_key(ns_path, key))
+            .or_insert_with(Row::default);
         if entry.version == 0 {
             entry.version = 1;
         } else {
@@ -135,7 +137,10 @@ impl SqlBackend for InMemorySqlBackend {
     }
 
     fn delete(&self, _sql: &str, ns_path: &str, key: &str) -> MysqlResult<()> {
-        self.rows.lock().unwrap().remove(&Self::row_key(ns_path, key));
+        self.rows
+            .lock()
+            .unwrap()
+            .remove(&Self::row_key(ns_path, key));
         Ok(())
     }
 }
@@ -164,7 +169,10 @@ mod tests {
 
     #[test]
     fn decode_strips_escapes_and_wildcard() {
-        assert_eq!(decode_like_prefix("a!%b\u{1F}%", '!'), format!("a%b{}", '\u{1F}'));
+        assert_eq!(
+            decode_like_prefix("a!%b\u{1F}%", '!'),
+            format!("a%b{}", '\u{1F}')
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 
 use agentscope_core::error::{Error, Result};
 
@@ -125,7 +125,9 @@ impl RedisClientAdapter for RedisConnection {
 
     async fn get_list_length(&self, key: &str) -> Result<i64> {
         let mut conn = self.manager.clone();
-        conn.llen::<_, i64>(key).await.map_err(|e| map_err("LLEN", e))
+        conn.llen::<_, i64>(key)
+            .await
+            .map_err(|e| map_err("LLEN", e))
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
@@ -133,9 +135,7 @@ impl RedisClientAdapter for RedisConnection {
             return Ok(());
         }
         let mut conn = self.manager.clone();
-        conn.del::<_, ()>(keys)
-            .await
-            .map_err(|e| map_err("DEL", e))
+        conn.del::<_, ()>(keys).await.map_err(|e| map_err("DEL", e))
     }
 
     async fn add_to_set(&self, key: &str, member: &str) -> Result<()> {

@@ -141,7 +141,9 @@ mod tests {
 
     #[test]
     fn blank_or_missing_text_is_skipped() {
-        assert!(BailianDocumentConverter::from_bailian_node(&node("", None, Value::Null)).is_none());
+        assert!(
+            BailianDocumentConverter::from_bailian_node(&node("", None, Value::Null)).is_none()
+        );
         assert!(
             BailianDocumentConverter::from_bailian_node(&node("   ", None, Value::Null)).is_none()
         );
@@ -182,7 +184,10 @@ mod tests {
         let document = BailianDocumentConverter::from_bailian_node(&node).unwrap();
         assert_eq!(document.metadata.doc_id, "42");
         assert_eq!(document.metadata.chunk_id, "7");
-        assert_eq!(document.payload_value("page").unwrap(), &serde_json::json!(3));
+        assert_eq!(
+            document.payload_value("page").unwrap(),
+            &serde_json::json!(3)
+        );
     }
 
     #[test]
@@ -200,7 +205,9 @@ mod tests {
 
     #[test]
     fn from_response_handles_null_and_empty_data() {
-        assert!(BailianDocumentConverter::from_response(&RetrieveResponseBody::default()).is_empty());
+        assert!(
+            BailianDocumentConverter::from_response(&RetrieveResponseBody::default()).is_empty()
+        );
 
         let with_empty_nodes = RetrieveResponseBody {
             code: Some("0".to_string()),

@@ -100,12 +100,16 @@ pub trait FrameworkAdapter: Send + Sync {
         limit: i64,
     ) -> ControlPlaneResult<MessagePage> {
         let _ = (session_id, offset, limit);
-        Err(ControlPlaneError::Unsupported(CAP_MESSAGE_QUERY.to_string()))
+        Err(ControlPlaneError::Unsupported(
+            CAP_MESSAGE_QUERY.to_string(),
+        ))
     }
 
     /// Instance inventory: subagents, workspaces, health.
     async fn list_subagents(&self) -> ControlPlaneResult<Inventory> {
-        Err(ControlPlaneError::Unsupported(CAP_SUBAGENT_INVENTORY.to_string()))
+        Err(ControlPlaneError::Unsupported(
+            CAP_SUBAGENT_INVENTORY.to_string(),
+        ))
     }
 
     /// All session ids this adapter can report on.
@@ -155,7 +159,9 @@ mod tests {
             Ok(())
         }
         async fn extract_context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
-            Ok(ContextSnapshot::builder(session_id).framework("noop").build())
+            Ok(ContextSnapshot::builder(session_id)
+                .framework("noop")
+                .build())
         }
     }
 

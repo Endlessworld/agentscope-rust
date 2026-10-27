@@ -310,7 +310,10 @@ mod tests {
             .with_header("X-Trace", "1")
             .with_bearer_token("k");
         assert_eq!(req.method, HttpMethod::Post);
-        assert_eq!(req.header("content-type"), Some("application/json; charset=utf-8"));
+        assert_eq!(
+            req.header("content-type"),
+            Some("application/json; charset=utf-8")
+        );
         assert_eq!(req.header("x-trace"), Some("1"));
         assert_eq!(req.header("Authorization"), Some("Bearer k"));
         assert_eq!(req.body.as_deref(), Some("{}"));
@@ -349,7 +352,13 @@ mod tests {
     #[test]
     fn map_http_error_splits_auth_from_api() {
         let auth = map_http_error(401, "nope");
-        assert!(matches!(auth, RagError::Auth { status_code: 401, .. }));
+        assert!(matches!(
+            auth,
+            RagError::Auth {
+                status_code: 401,
+                ..
+            }
+        ));
         let api = map_http_error(500, r#"{"code": 500, "message": "boom"}"#);
         match api {
             RagError::Api {

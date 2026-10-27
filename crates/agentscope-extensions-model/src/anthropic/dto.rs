@@ -68,7 +68,10 @@ pub struct AnthropicThinking {
 impl AnthropicThinking {
     /// Builds an `enabled` thinking config with the given budget.
     pub fn enabled(budget_tokens: u32) -> Self {
-        Self { kind: "enabled".to_string(), budget_tokens }
+        Self {
+            kind: "enabled".to_string(),
+            budget_tokens,
+        }
     }
 }
 
@@ -142,7 +145,10 @@ pub struct AnthropicTextBlock {
 impl AnthropicTextBlock {
     /// Creates a plain text block without cache control.
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), cache_control: None }
+        Self {
+            text: text.into(),
+            cache_control: None,
+        }
     }
 }
 
@@ -363,11 +369,17 @@ mod tests {
             thinking: None,
         };
         let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["model"], serde_json::json!("claude-sonnet-4-5-20250929"));
+        assert_eq!(
+            value["model"],
+            serde_json::json!("claude-sonnet-4-5-20250929")
+        );
         assert_eq!(value["max_tokens"], serde_json::json!(4096));
         assert!(!value.as_object().unwrap().contains_key("stream"));
         assert!(!value.as_object().unwrap().contains_key("thinking"));
-        assert_eq!(value["messages"][0]["content"][0]["type"], serde_json::json!("text"));
+        assert_eq!(
+            value["messages"][0]["content"][0]["type"],
+            serde_json::json!("text")
+        );
     }
 
     #[test]
@@ -382,7 +394,10 @@ mod tests {
         match blocks {
             SystemPrompt::Blocks(b) => {
                 assert_eq!(b[0].text, "be nice");
-                assert_eq!(b[0].cache_control.as_ref().unwrap().ttl.as_deref(), Some("1h"));
+                assert_eq!(
+                    b[0].cache_control.as_ref().unwrap().ttl.as_deref(),
+                    Some("1h")
+                );
             }
             other => panic!("expected blocks, got {other:?}"),
         }
@@ -410,8 +425,10 @@ mod tests {
         let none = serde_json::to_value(AnthropicToolChoice::None).unwrap();
         assert_eq!(none, serde_json::json!({ "type": "none" }));
 
-        let auto = serde_json::to_value(AnthropicToolChoice::Auto { disable_parallel_tool_use: Some(true) })
-            .unwrap();
+        let auto = serde_json::to_value(AnthropicToolChoice::Auto {
+            disable_parallel_tool_use: Some(true),
+        })
+        .unwrap();
         assert_eq!(auto["type"], serde_json::json!("auto"));
         assert_eq!(auto["disable_parallel_tool_use"], serde_json::json!(true));
 
@@ -420,7 +437,10 @@ mod tests {
             disable_parallel_tool_use: None,
         })
         .unwrap();
-        assert!(!specific.as_object().unwrap().contains_key("disable_parallel_tool_use"));
+        assert!(!specific
+            .as_object()
+            .unwrap()
+            .contains_key("disable_parallel_tool_use"));
     }
 
     #[test]

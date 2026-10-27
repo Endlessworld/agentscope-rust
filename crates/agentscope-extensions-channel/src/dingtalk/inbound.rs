@@ -293,17 +293,26 @@ mod tests {
         let inbound = mapper().map(&payload).expect("mapped");
         assert_eq!(inbound.messages[0].text_content(), "[image]");
         let metadata = inbound.messages[0].metadata();
-        assert_eq!(metadata.get("channelMediaKind"), Some(&serde_json::json!("image")));
+        assert_eq!(
+            metadata.get("channelMediaKind"),
+            Some(&serde_json::json!("image"))
+        );
         assert_eq!(
             metadata.get("channelMediaProviderType"),
             Some(&serde_json::json!("picture"))
         );
-        assert_eq!(metadata.get("channelMediaId"), Some(&serde_json::json!("dc-1")));
+        assert_eq!(
+            metadata.get("channelMediaId"),
+            Some(&serde_json::json!("dc-1"))
+        );
         assert_eq!(
             metadata.get("channelMediaSecondaryId"),
             Some(&serde_json::json!("pic-dc"))
         );
-        assert_eq!(metadata.get("channelMessageId"), Some(&serde_json::json!("msg-9")));
+        assert_eq!(
+            metadata.get("channelMessageId"),
+            Some(&serde_json::json!("msg-9"))
+        );
     }
 
     #[test]
@@ -339,7 +348,10 @@ mod tests {
         let inbound = mapper().map(&video).expect("mapped");
         assert_eq!(inbound.messages[0].text_content(), "[video]");
         let metadata = inbound.messages[0].metadata();
-        assert_eq!(metadata.get("channelMediaFormat"), Some(&serde_json::json!("mp4")));
+        assert_eq!(
+            metadata.get("channelMediaFormat"),
+            Some(&serde_json::json!("mp4"))
+        );
         assert_eq!(
             metadata.get("channelMediaDurationMs"),
             Some(&serde_json::json!("9000"))

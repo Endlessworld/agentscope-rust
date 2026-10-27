@@ -23,7 +23,11 @@ pub struct TeamsMiddleware {
 }
 
 impl TeamsMiddleware {
-    pub fn new(client: Arc<dyn TeamClient>, team_id: impl Into<String>, member: impl Into<String>) -> Self {
+    pub fn new(
+        client: Arc<dyn TeamClient>,
+        team_id: impl Into<String>,
+        member: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             team_id: team_id.into(),
@@ -64,7 +68,14 @@ impl TeamsMiddleware {
         let mut members: Vec<String> = info
             .members
             .iter()
-            .map(|m| format!("- {} [{}]{}", m.name, m.role.as_str(), if m.active { "" } else { " (inactive)" }))
+            .map(|m| {
+                format!(
+                    "- {} [{}]{}",
+                    m.name,
+                    m.role.as_str(),
+                    if m.active { "" } else { " (inactive)" }
+                )
+            })
             .collect();
         members.sort();
         let ctx = TeamContext::for_role(&self.team_id, self.role);

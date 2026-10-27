@@ -9,14 +9,12 @@
 //! is short-lived credential material rather than something safe to record. Nothing here logs it or
 //! copies it into an error message: failures are reported by status code and parse position only.
 
-use super::dto::{
-    required_field, WeixinLoginSession, WeixinLoginStatusResponse, WeixinLoginStep,
-};
+use super::dto::{required_field, WeixinLoginSession, WeixinLoginStatusResponse, WeixinLoginStep};
 use super::endpoint::{normalize_base_url, validate_provider_endpoint, DEFAULT_BASE_URL};
 use super::error::{WeixinError, WeixinResult};
 use super::outbound::WeixinOutboundClient;
-use super::protocol::PATH_GET_QRCODE;
 use super::properties::WeixinChannelProperties;
+use super::protocol::PATH_GET_QRCODE;
 use serde_json::Value;
 
 /// Default QR-login timeout in milliseconds (Java: `Duration.ofSeconds(45)`).
@@ -31,7 +29,11 @@ pub struct WeixinLoginClient {
 
 impl WeixinLoginClient {
     /// Build around an outbound client (which supplies the transport and the protocol headers).
-    pub fn new(base_url: &str, timeout_ms: i64, outbound: WeixinOutboundClient) -> WeixinResult<Self> {
+    pub fn new(
+        base_url: &str,
+        timeout_ms: i64,
+        outbound: WeixinOutboundClient,
+    ) -> WeixinResult<Self> {
         Ok(Self {
             // The endpoint policy's own message is kept (it is built from constants only), so a
             // host can tell "Invalid iLink base URL" from "not an approved provider endpoint".
@@ -60,11 +62,17 @@ impl WeixinLoginClient {
 
     /// Request a QR challenge. `bot_type` defaults to `"3"` and must be numeric.
     pub async fn start(&self, bot_type: Option<&str>) -> WeixinResult<WeixinLoginChallengeResult> {
-        let bot_type = bot_type.map(str::trim).filter(|t| !t.is_empty()).unwrap_or("3");
+        let bot_type = bot_type
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("3");
         if !bot_type.chars().all(|c| c.is_ascii_digit()) {
             return Err(WeixinError::operation("botType must be numeric"));
         }
-        let (challenge, session) = self.outbound.qrcode_challenge_on(&self.base_url, bot_type).await?;
+        let (challenge, session) = self
+            .outbound
+            .qrcode_challenge_on(&self.base_url, bot_type)
+            .await?;
         Ok(WeixinLoginChallengeResult {
             session,
             image_content: challenge.image_content,
@@ -120,7 +128,11 @@ impl WeixinLoginClient {
 
         let mut updated = session.clone();
         if status.eq_ignore_ascii_case("scaned_but_redirect") {
-            if let Some(redirect) = body.redirect_host.as_deref().map(str::trim).filter(|h| !h.is_empty())
+            if let Some(redirect) = body
+                .redirect_host
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
             {
                 let next = self.authorize(&session.polling_base_url, redirect)?;
                 updated = session.with_polling_base_url(next);
@@ -135,7 +147,12 @@ impl WeixinLoginClient {
             _ => None,
         };
 
-        let base_url = match body.baseurl.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        let base_url = match body
+            .baseurl
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             Some(candidate) => Some(self.authorize(&updated.polling_base_url, candidate)?),
             None => None,
         };
@@ -191,7 +208,11 @@ impl std::fmt::Debug for WeixinLoginChallengeResult {
 
 impl std::fmt::Display for WeixinLoginChallengeResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WeixinLoginChallengeResult[session={}, imageContent=***]", self.session)
+        write!(
+            f,
+            "WeixinLoginChallengeResult[session={}, imageContent=***]",
+            self.session
+        )
     }
 }
 
@@ -202,11 +223,15 @@ pub fn challenge_path() -> &'static str {
 
 /// A required-field helper exposed for hosts that parse the raw login bodies themselves.
 pub fn login_required(field: &str, value: Option<&str>) -> WeixinResult<String> {
-    required_field(field, value).map_err(|_| WeixinError::operation(format!("iLink response missing {field}")))
+    required_field(field, value)
+        .map_err(|_| WeixinError::operation(format!("iLink response missing {field}")))
 }
 
 /// The provider properties a login client needs (its base URL and timeouts).
-pub fn login_properties(base_url: &str, request_timeout_ms: i64) -> WeixinResult<WeixinChannelProperties> {
+pub fn login_properties(
+    base_url: &str,
+    request_timeout_ms: i64,
+) -> WeixinResult<WeixinChannelProperties> {
     WeixinChannelProperties::from_json(
         "weixin-login",
         &serde_json::json!({

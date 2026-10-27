@@ -100,7 +100,11 @@ impl OssSnapshotSpec {
         bucket_name: impl Into<String>,
         key_prefix: Option<&str>,
     ) -> std::result::Result<Self, OssError> {
-        let client = Arc::new(OssRemoteSnapshotClient::new(client, bucket_name, key_prefix)?);
+        let client = Arc::new(OssRemoteSnapshotClient::new(
+            client,
+            bucket_name,
+            key_prefix,
+        )?);
         Ok(Self {
             inner: RemoteSnapshotSpec::new(client.clone()),
             client,

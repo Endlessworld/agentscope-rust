@@ -11,7 +11,10 @@ use super::event::{RemoteAgentEvent, RemoteEventType, RemotePendingConfirm, Remo
 pub const METADATA_TASK_ID: &str = "taskId";
 
 fn field_str(data: &EventData, key: &str) -> Option<String> {
-    data.fields.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    data.fields
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// Maps an internal agent event to a protocol DTO (without seq/taskId — those are
@@ -85,8 +88,16 @@ fn extract_pending_confirms(data: &EventData) -> Vec<RemotePendingConfirm> {
     blocks
         .iter()
         .map(|b| {
-            let id = b.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let name = b.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let id = b
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let name = b
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             let input = b
                 .get("input")
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
@@ -112,34 +123,56 @@ pub fn to_agent_event(remote: &RemoteAgentEvent) -> Option<AgentEvent> {
     let kind = remote.kind?;
     let mapped = match kind {
         RemoteEventType::RunStarted => {
-            let name = remote.agent_id.clone().unwrap_or_else(|| "remote".to_string());
+            let name = remote
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "remote".to_string());
             Some(AgentEvent::AgentStart(EventData::default()).with_source(name))
         }
         RemoteEventType::RunFinished => Some(AgentEvent::AgentEnd(EventData::default())),
         RemoteEventType::RunError | RemoteEventType::Status | RemoteEventType::AgentEvent => None,
         RemoteEventType::TextDelta => {
             let mut fields = JsonMap::new();
-            fields.insert("delta".into(), serde_json::Value::String(remote.text.clone().unwrap_or_default()));
-            Some(AgentEvent::with_fields(AgentEventType::TextBlockDelta, fields))
+            fields.insert(
+                "delta".into(),
+                serde_json::Value::String(remote.text.clone().unwrap_or_default()),
+            );
+            Some(AgentEvent::with_fields(
+                AgentEventType::TextBlockDelta,
+                fields,
+            ))
         }
         RemoteEventType::ThinkingDelta => {
             let mut fields = JsonMap::new();
-            fields.insert("delta".into(), serde_json::Value::String(remote.text.clone().unwrap_or_default()));
-            Some(AgentEvent::with_fields(AgentEventType::ThinkingBlockDelta, fields))
+            fields.insert(
+                "delta".into(),
+                serde_json::Value::String(remote.text.clone().unwrap_or_default()),
+            );
+            Some(AgentEvent::with_fields(
+                AgentEventType::ThinkingBlockDelta,
+                fields,
+            ))
         }
-        RemoteEventType::ToolCallStart => {
-            Some(AgentEvent::with_fields(AgentEventType::ToolCallStart, tool_fields(remote)))
-        }
-        RemoteEventType::ToolCallEnd => {
-            Some(AgentEvent::with_fields(AgentEventType::ToolCallEnd, tool_fields(remote)))
-        }
+        RemoteEventType::ToolCallStart => Some(AgentEvent::with_fields(
+            AgentEventType::ToolCallStart,
+            tool_fields(remote),
+        )),
+        RemoteEventType::ToolCallEnd => Some(AgentEvent::with_fields(
+            AgentEventType::ToolCallEnd,
+            tool_fields(remote),
+        )),
         RemoteEventType::ToolResult => {
             let mut fields = tool_fields(remote);
             fields.insert(
                 "state".into(),
-                serde_json::Value::String(remote.status.clone().unwrap_or_else(|| "SUCCESS".into())),
+                serde_json::Value::String(
+                    remote.status.clone().unwrap_or_else(|| "SUCCESS".into()),
+                ),
             );
-            Some(AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields))
+            Some(AgentEvent::with_fields(
+                AgentEventType::ToolResultEnd,
+                fields,
+            ))
         }
         RemoteEventType::RequireConfirm => Some(to_require_confirm(remote)),
     };
@@ -184,7 +217,10 @@ fn to_require_confirm(remote: &RemoteAgentEvent) -> AgentEvent {
 
 fn stamp_task_id(event: AgentEvent, remote: &RemoteAgentEvent) -> AgentEvent {
     match remote.task_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some(task_id) => event.with_metadata(METADATA_TASK_ID, serde_json::Value::String(task_id.to_string())),
+        Some(task_id) => event.with_metadata(
+            METADATA_TASK_ID,
+            serde_json::Value::String(task_id.to_string()),
+        ),
         None => event,
     }
 }
@@ -203,7 +239,10 @@ pub fn matches_detail(kind: RemoteEventType, detail: Option<&str>) -> bool {
 
 /// Detail check for a whole DTO.
 pub fn matches_detail_event(event: &RemoteAgentEvent, detail: Option<&str>) -> bool {
-    event.kind.map(|k| matches_detail(k, detail)).unwrap_or(false)
+    event
+        .kind
+        .map(|k| matches_detail(k, detail))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -236,8 +275,14 @@ mod tests {
     #[test]
     fn tool_result_carries_id_name_and_state() {
         let mut fields = JsonMap::new();
-        fields.insert("tool_call_id".into(), serde_json::Value::String("c1".into()));
-        fields.insert("tool_name".into(), serde_json::Value::String("read_file".into()));
+        fields.insert(
+            "tool_call_id".into(),
+            serde_json::Value::String("c1".into()),
+        );
+        fields.insert(
+            "tool_name".into(),
+            serde_json::Value::String("read_file".into()),
+        );
         fields.insert("state".into(), serde_json::Value::String("ERROR".into()));
         let event = AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields);
         let dto = from_agent_event(&event).unwrap();
@@ -256,7 +301,10 @@ mod tests {
         };
         let event = to_agent_event(&dto).unwrap();
         assert_eq!(event.event_type(), AgentEventType::TextBlockDelta);
-        assert_eq!(event.data().fields.get("delta").unwrap(), &serde_json::json!("hi"));
+        assert_eq!(
+            event.data().fields.get("delta").unwrap(),
+            &serde_json::json!("hi")
+        );
     }
 
     #[test]

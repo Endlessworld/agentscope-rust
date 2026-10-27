@@ -194,7 +194,9 @@ impl SkillRepository for NacosSkillRepository {
     }
 
     fn repo_kind(&self) -> SkillRepo {
-        SkillRepo::External { source: self.source.clone() }
+        SkillRepo::External {
+            source: self.source.clone(),
+        }
     }
 
     /// Loads every skill named in `known_skill_names`, fetching each in turn
@@ -286,7 +288,9 @@ mod tests {
         assert!(!repo.is_writeable());
         assert_eq!(
             repo.repo_kind(),
-            SkillRepo::External { source: "nacos@public".to_string() }
+            SkillRepo::External {
+                source: "nacos@public".to_string()
+            }
         );
     }
 
@@ -394,4 +398,3 @@ mod tests {
         assert!(!repo.skill_exists("   ").await);
     }
 }
-

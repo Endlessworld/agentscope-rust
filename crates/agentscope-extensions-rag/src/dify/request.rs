@@ -13,17 +13,18 @@ use crate::dify::config::DifyRAGConfig;
 ///
 /// `limit` overrides the configured `top_k` when supplied, matching Java's
 /// `int topK = limit != null ? limit : config.getTopK()`.
-pub fn build_retrieve_request_body(config: &DifyRAGConfig, query: &str, limit: Option<i32>) -> Value {
+pub fn build_retrieve_request_body(
+    config: &DifyRAGConfig,
+    query: &str,
+    limit: Option<i32>,
+) -> Value {
     let mut retrieval_model = Map::new();
 
     retrieval_model.insert(
         "search_method".to_string(),
         Value::String(config.retrieval_mode.value().to_string()),
     );
-    retrieval_model.insert(
-        "top_k".to_string(),
-        json!(limit.unwrap_or(config.top_k)),
-    );
+    retrieval_model.insert("top_k".to_string(), json!(limit.unwrap_or(config.top_k)));
 
     // score_threshold is emitted only when a positive threshold is configured.
     if config.score_threshold > 0.0 {
@@ -45,8 +46,10 @@ pub fn build_retrieve_request_body(config: &DifyRAGConfig, query: &str, limit: O
                     );
                 }
                 if let Some(model) = &rerank.model_name {
-                    reranking_model
-                        .insert("reranking_model_name".to_string(), Value::String(model.clone()));
+                    reranking_model.insert(
+                        "reranking_model_name".to_string(),
+                        Value::String(model.clone()),
+                    );
                 }
                 retrieval_model.insert(
                     "reranking_model".to_string(),
@@ -93,7 +96,9 @@ pub fn build_retrieve_request_body(config: &DifyRAGConfig, query: &str, limit: O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dify::config::{MetadataFilter, MetadataFilterCondition, RerankConfig, RetrievalMode};
+    use crate::dify::config::{
+        MetadataFilter, MetadataFilterCondition, RerankConfig, RetrievalMode,
+    };
 
     fn base_config() -> DifyRAGConfig {
         DifyRAGConfig::builder()
@@ -156,7 +161,11 @@ mod tests {
             .api_key("k")
             .dataset_id("ds")
             .enable_rerank(true)
-            .rerank_config(RerankConfig::new().with_provider_name("cohere").with_model_name("rerank-v2"))
+            .rerank_config(
+                RerankConfig::new()
+                    .with_provider_name("cohere")
+                    .with_model_name("rerank-v2"),
+            )
             .build_or_panic();
         let body = build_retrieve_request_body(&cfg, "q", None);
         let rm = &body["retrieval_model"];
@@ -195,7 +204,11 @@ mod tests {
             .metadata_filter(
                 MetadataFilter::new()
                     .with_logical_operator("or")
-                    .add_condition(MetadataFilterCondition::new("category", "equals", "technical"))
+                    .add_condition(MetadataFilterCondition::new(
+                        "category",
+                        "equals",
+                        "technical",
+                    ))
                     .add_condition(MetadataFilterCondition::new("language", "contains", "en")),
             )
             .build_or_panic();

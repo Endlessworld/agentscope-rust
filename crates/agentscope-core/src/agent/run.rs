@@ -282,7 +282,9 @@ impl AgentRun {
     /// Creates a handle for `agent_id` that adopts `run_id` (typically
     /// `RuntimeContext::run_id`) so both identify the same execution. Blank generates one.
     pub fn with_run_id(agent_id: impl Into<String>, run_id: Option<String>) -> Self {
-        Self { control: Arc::new(RunControl::new(agent_id, run_id)) }
+        Self {
+            control: Arc::new(RunControl::new(agent_id, run_id)),
+        }
     }
 
     /// Wraps an existing control (used by the agent when it creates the run itself).
@@ -360,12 +362,19 @@ mod tests {
         assert!(!control.queue(), "queueing twice must fail");
         assert!(control.start());
         assert_eq!(control.status(), RunStatus::Running);
-        assert!(control.start(), "restarting a running run reports the move as a no-op success");
+        assert!(
+            control.start(),
+            "restarting a running run reports the move as a no-op success"
+        );
         control.finish(RunStatus::Completed);
         assert_eq!(control.status(), RunStatus::Completed);
         assert!(!control.start(), "a terminal run cannot restart");
         control.finish(RunStatus::Failed);
-        assert_eq!(control.status(), RunStatus::Completed, "terminal status is sticky");
+        assert_eq!(
+            control.status(),
+            RunStatus::Completed,
+            "terminal status is sticky"
+        );
     }
 
     #[test]
@@ -375,14 +384,21 @@ mod tests {
         assert!(running.start());
         assert!(running.interrupt(Some(InterruptSource::User), Some(Msg::user("stop"))));
         assert!(running.interruption().is_interrupted());
-        assert_eq!(running.status(), RunStatus::Running, "an interrupt is cooperative");
+        assert_eq!(
+            running.status(),
+            RunStatus::Running,
+            "an interrupt is cooperative"
+        );
 
         let queued = RunControl::new("a", None);
         assert!(queued.queue());
         assert!(queued.interrupt(None, None));
         assert_eq!(queued.status(), RunStatus::Cancelled);
         assert!(queued.is_cancelled());
-        assert!(!queued.interrupt(None, None), "a cancelled run ignores further interrupts");
+        assert!(
+            !queued.interrupt(None, None),
+            "a cancelled run ignores further interrupts"
+        );
     }
 
     #[test]
@@ -406,7 +422,11 @@ mod tests {
         let adopted = AgentRun::with_run_id("a", Some("run-42".to_string()));
         assert_eq!(adopted.run_id(), "run-42");
         let blank = AgentRun::with_run_id("a", Some("   ".to_string()));
-        assert_eq!(blank.run_id().len(), 32, "blank ids fall back to a generated 32-hex id");
+        assert_eq!(
+            blank.run_id().len(),
+            32,
+            "blank ids fall back to a generated 32-hex id"
+        );
         assert!(blank.run_id().chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -419,7 +439,10 @@ mod tests {
         // The waiter is registered before the request, so it must observe it.
         tokio::task::yield_now().await;
         assert!(signal.cancel());
-        assert!(!signal.cancel(), "a second request must not report a new cancellation");
+        assert!(
+            !signal.cancel(),
+            "a second request must not report a new cancellation"
+        );
         assert!(signal.is_cancelled());
         handle.await.expect("the waiter must be released");
     }

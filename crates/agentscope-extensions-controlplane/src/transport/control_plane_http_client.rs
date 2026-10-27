@@ -45,7 +45,10 @@ impl ControlPlaneHttpClient {
     /// Creates a client against the given control-plane base URL.
     ///
     /// The trailing slash is trimmed; a missing token is allowed (empty header).
-    pub fn new(base_url: impl Into<String>, internal_token: impl Into<String>) -> ControlPlaneResult<Self> {
+    pub fn new(
+        base_url: impl Into<String>,
+        internal_token: impl Into<String>,
+    ) -> ControlPlaneResult<Self> {
         let http = Client::builder()
             .connect_timeout(HTTP_TIMEOUT)
             .timeout(HTTP_TIMEOUT)
@@ -85,7 +88,10 @@ impl ControlPlaneHttpClient {
             .send_for_bytes(method, path, json_body, extra_headers)
             .await?;
         let body = String::from_utf8_lossy(&bytes.body).to_string();
-        Ok(Response { status: bytes.status, body })
+        Ok(Response {
+            status: bytes.status,
+            body,
+        })
     }
 
     /// Sends a request and returns the raw byte body.
@@ -211,9 +217,15 @@ mod tests {
 
     #[test]
     fn require_ok_flags_non_2xx() {
-        let ok = Response { status: 201, body: String::new() };
+        let ok = Response {
+            status: 201,
+            body: String::new(),
+        };
         assert!(require_ok(&ok, "op").is_ok());
-        let bad = Response { status: 500, body: "boom".into() };
+        let bad = Response {
+            status: 500,
+            body: "boom".into(),
+        };
         assert!(require_ok(&bad, "op").is_err());
     }
 }

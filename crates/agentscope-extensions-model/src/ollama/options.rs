@@ -70,7 +70,8 @@ impl OllamaOptions {
             frequency_penalty: options.frequency_penalty,
             presence_penalty: options.presence_penalty,
             model: options.model_name.clone(),
-            format: native_format(options).or_else(|| options.additional_body_params.get("format").cloned()),
+            format: native_format(options)
+                .or_else(|| options.additional_body_params.get("format").cloned()),
             ..Default::default()
         }
     }
@@ -167,7 +168,11 @@ pub fn function_from_parts(
 ) -> OllamaFunction {
     OllamaFunction {
         name: name.into(),
-        arguments: if arguments.is_empty() { None } else { Some(arguments) },
+        arguments: if arguments.is_empty() {
+            None
+        } else {
+            Some(arguments)
+        },
     }
 }
 

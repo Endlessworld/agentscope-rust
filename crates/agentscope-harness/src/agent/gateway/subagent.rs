@@ -65,9 +65,7 @@ impl SubagentRecord {
     }
 
     /// Deserializes a record from a store value map.
-    pub fn from_store_value(
-        value: &crate::filesystem::remote::store::StoreValue,
-    ) -> Option<Self> {
+    pub fn from_store_value(value: &crate::filesystem::remote::store::StoreValue) -> Option<Self> {
         serde_json::from_value(serde_json::Value::Object(value.clone())).ok()
     }
 }
@@ -107,7 +105,10 @@ impl Default for InMemorySubagentRegistry {
 impl SubagentRegistry for InMemorySubagentRegistry {
     fn register(&self, record: SubagentRecord) {
         if !record.subagent_id.is_empty() {
-            self.records.lock().unwrap().insert(record.subagent_id.clone(), record);
+            self.records
+                .lock()
+                .unwrap()
+                .insert(record.subagent_id.clone(), record);
         }
     }
 
@@ -163,8 +164,11 @@ impl SubagentRegistry for StoreBackedSubagentRegistry {
         if record.subagent_id.is_empty() {
             return;
         }
-        self.store
-            .put(&Self::namespace(), &record.subagent_id, record.to_store_value());
+        self.store.put(
+            &Self::namespace(),
+            &record.subagent_id,
+            record.to_store_value(),
+        );
     }
 
     fn find(&self, subagent_id: &str) -> Option<SubagentRecord> {
@@ -239,8 +243,22 @@ mod tests {
     #[test]
     fn revoke_by_parent_session_removes_group() {
         let reg = InMemorySubagentRegistry::new();
-        reg.register(SubagentRecord::new("a", "x", "s1", None, Some("p1".into()), None));
-        reg.register(SubagentRecord::new("b", "x", "s2", None, Some("p1".into()), None));
+        reg.register(SubagentRecord::new(
+            "a",
+            "x",
+            "s1",
+            None,
+            Some("p1".into()),
+            None,
+        ));
+        reg.register(SubagentRecord::new(
+            "b",
+            "x",
+            "s2",
+            None,
+            Some("p1".into()),
+            None,
+        ));
         reg.register(SubagentRecord::new("c", "x", "s3", None, None, None));
         reg.revoke_by_parent_session("p1");
         assert!(reg.find("a").is_none());
@@ -272,8 +290,22 @@ mod tests {
         let store: Arc<dyn BaseStore> =
             Arc::new(crate::filesystem::remote::store::InMemoryStore::new());
         let reg = StoreBackedSubagentRegistry::new(store);
-        reg.register(SubagentRecord::new("a", "x", "s1", None, Some("p1".into()), None));
-        reg.register(SubagentRecord::new("b", "x", "s2", None, Some("p1".into()), None));
+        reg.register(SubagentRecord::new(
+            "a",
+            "x",
+            "s1",
+            None,
+            Some("p1".into()),
+            None,
+        ));
+        reg.register(SubagentRecord::new(
+            "b",
+            "x",
+            "s2",
+            None,
+            Some("p1".into()),
+            None,
+        ));
         reg.register(SubagentRecord::new(
             "exp",
             "x",

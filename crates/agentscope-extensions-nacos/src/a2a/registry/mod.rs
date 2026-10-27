@@ -12,7 +12,7 @@ use crate::service::{AiServiceError, AiServiceResult, NacosAiService};
 use super::converter::convert_to_nacos_agent_card;
 use super::model::{A2aAgentCard, NacosAgentCard, NacosAgentEndpoint};
 use constants::{
-    PROTOCOL_TYPE_HTTP, PROTOCOL_TYPE_HTTPS, PROPERTIES_ENV_PREFIX, TRANSPORT_DEFAULT_PROTOCOL,
+    PROPERTIES_ENV_PREFIX, PROTOCOL_TYPE_HTTP, PROTOCOL_TYPE_HTTPS, TRANSPORT_DEFAULT_PROTOCOL,
 };
 
 pub use constants::TransportPropertiesAttribute;
@@ -162,7 +162,9 @@ impl NacosA2aRegistryProperties {
 
     /// Starts a builder pre-filled from an existing instance (transports excluded),
     /// mirroring `builder(prototype)`.
-    pub fn builder_from(prototype: &NacosA2aRegistryProperties) -> NacosA2aRegistryPropertiesBuilder {
+    pub fn builder_from(
+        prototype: &NacosA2aRegistryProperties,
+    ) -> NacosA2aRegistryPropertiesBuilder {
         NacosA2aRegistryPropertiesBuilder {
             set_as_latest: prototype.is_set_as_latest,
             enabled_register_endpoint: prototype.enabled_register_endpoint,
@@ -341,8 +343,7 @@ impl NacosA2aRegistry {
         properties: &NacosA2aRegistryProperties,
     ) -> Result<(), String> {
         let nacos_card = convert_to_nacos_agent_card(agent_card);
-        self.try_release_agent_card(&nacos_card, properties)
-            .await?;
+        self.try_release_agent_card(&nacos_card, properties).await?;
         self.register_endpoints(&nacos_card, properties).await?;
         Ok(())
     }
@@ -531,8 +532,8 @@ impl NacosAgentRegistry {
             .map(|p| (p.transport.to_uppercase(), p))
             .collect();
 
-        for (transport, from_env) in NacosA2aTransportPropertiesEnvParser::from_env()
-            .map_err(|e| e.to_string())?
+        for (transport, from_env) in
+            NacosA2aTransportPropertiesEnvParser::from_env().map_err(|e| e.to_string())?
         {
             let key = transport.to_uppercase();
             match result.remove(&key) {
@@ -630,7 +631,10 @@ fn overwrite_attributes(
 
 /// Rewrites `preferredTransport` / `url` on the card and appends the new
 /// interface, mirroring `NacosAgentRegistry#doOverwrite`.
-fn do_overwrite(agent_card: &A2aAgentCard, transport: &NacosA2aTransportProperties) -> A2aAgentCard {
+fn do_overwrite(
+    agent_card: &A2aAgentCard,
+    transport: &NacosA2aTransportProperties,
+) -> A2aAgentCard {
     let new_url = generate_new_url(transport);
     let transport_name = transport.transport.clone();
     let mut card = agent_card.clone();
@@ -806,11 +810,7 @@ mod tests {
 
         let released = svc.released_cards();
         assert_eq!(released.len(), 1);
-        let card = svc
-            .get_agent_card("agent", None)
-            .await
-            .unwrap()
-            .unwrap();
+        let card = svc.get_agent_card("agent", None).await.unwrap().unwrap();
         assert_eq!(card.url, "https://newhost:8443/a2a");
         assert_eq!(card.preferred_transport.as_deref(), Some("HTTP"));
 
@@ -824,4 +824,3 @@ mod tests {
         let _ = NacosAgentCard::new("x", "y");
     }
 }
-

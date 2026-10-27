@@ -1,11 +1,11 @@
 //! Shell execution tool backed by a `SandboxFilesystem`, mirroring `ShellExecuteTool`.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{is_dangerous_command, Tool, ToolExecutionContext, Toolkit};
+use async_trait::async_trait;
 
 use crate::filesystem::SandboxFilesystem;
 
@@ -26,7 +26,9 @@ impl ShellExecuteTool {
     }
 }
 fn opt_str_arg(args: &JsonMap, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn int_arg(args: &JsonMap, key: &str) -> Option<u32> {
@@ -45,7 +47,11 @@ pub fn command_with_working_directory(working_directory: &str, command: &str) ->
             command
         )
     } else {
-        format!("cd '{}' && {}", working_directory.replace('\'', "'\\\\''"), command)
+        format!(
+            "cd '{}' && {}",
+            working_directory.replace('\'', "'\\\\''"),
+            command
+        )
     }
 }
 
@@ -86,7 +92,9 @@ impl Tool for ShellExecuteTool {
             .get("command")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| agentscope_core::Error::Tool("Missing string argument: command".into()))?;
+            .ok_or_else(|| {
+                agentscope_core::Error::Tool("Missing string argument: command".into())
+            })?;
         if is_dangerous_command(&command) {
             return Ok(ToolResultBlock::error(
                 "Command contains a dangerous fragment (e.g. 'rm -rf', 'dd', 'mkfs', 'chmod 777', 'kill -9'). Refuse to execute without explicit approval.",
@@ -116,10 +124,7 @@ impl Tool for ShellExecuteTool {
             timeout_s = timeout,
             "shell execute start"
         );
-        let result = self
-            .sandbox
-            .execute(&rt, &effective_command, timeout)
-            .await;
+        let result = self.sandbox.execute(&rt, &effective_command, timeout).await;
         tracing::info!(
             command = %effective_command,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -167,4 +172,3 @@ mod tests {
         }
     }
 }
-

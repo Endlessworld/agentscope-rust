@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
+use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::bus::{AsyncToolRecord, AsyncToolRegistry};
 use async_trait::async_trait;
-use agentscope_core::error::{Error, Result};
 use chrono::Duration as ChronoDuration;
 use reqwest::Method;
 use serde_json::Value;
@@ -60,11 +60,31 @@ impl ControlPlaneAsyncToolRegistry {
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(chrono::Utc::now);
         AsyncToolRecord {
-            id: v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-            session_id: v.get("sessionId").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-            tool_name: v.get("toolName").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-            tool_call_id: v.get("toolCallId").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-            status: v.get("status").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+            id: v
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            session_id: v
+                .get("sessionId")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            tool_name: v
+                .get("toolName")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            tool_call_id: v
+                .get("toolCallId")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            status: v
+                .get("status")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
             created_at: created,
         }
     }
@@ -88,7 +108,10 @@ impl AsyncToolRegistry for ControlPlaneAsyncToolRegistry {
     async fn complete(&self, id: &str, result: &str) -> Result<()> {
         let mut body = self.body();
         body.insert("result".into(), result.into());
-        let path = format!("/api/v1/dp/async-tools/{}/complete", encode_path_segment(id));
+        let path = format!(
+            "/api/v1/dp/async-tools/{}/complete",
+            encode_path_segment(id)
+        );
         self.post(&path, Value::Object(body), "complete").await?;
         Ok(())
     }

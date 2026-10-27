@@ -11,8 +11,8 @@ use agentscope_core::tool::Toolkit;
 use crate::telemetry::agent_scope_attributes as as_attrs;
 use crate::telemetry::gen_ai_attributes as gen_ai;
 use crate::telemetry::model::{
-    InputMessage, MessagePart, OutputMessage, ReasoningPart, Role, TextPart,
-    ToolCallRequestPart, ToolCallResponsePart, ToolDefinition,
+    InputMessage, MessagePart, OutputMessage, ReasoningPart, Role, TextPart, ToolCallRequestPart,
+    ToolCallResponsePart, ToolDefinition,
 };
 
 /// A single extracted attribute (key, JSON-ish value).
@@ -113,7 +113,10 @@ pub fn get_llm_request_attributes(
             ));
         }
         if let Some(v) = options.top_p {
-            attrs.push((gen_ai::GEN_AI_REQUEST_TOP_P.to_string(), serde_json::json!(v)));
+            attrs.push((
+                gen_ai::GEN_AI_REQUEST_TOP_P.to_string(),
+                serde_json::json!(v),
+            ));
         }
         if let Some(v) = options.top_k {
             attrs.push((
@@ -140,7 +143,10 @@ pub fn get_llm_request_attributes(
             ));
         }
         if let Some(v) = options.seed {
-            attrs.push((gen_ai::GEN_AI_REQUEST_SEED.to_string(), serde_json::json!(v)));
+            attrs.push((
+                gen_ai::GEN_AI_REQUEST_SEED.to_string(),
+                serde_json::json!(v),
+            ));
         }
     }
 
@@ -232,10 +238,15 @@ pub fn get_tool_request_attributes(
         string_attr(&mut attrs, gen_ai::GEN_AI_TOOL_CALL_ARGUMENTS, v);
     }
     if let Some(tool) = toolkit.and_then(|t| t.get_tool(tool_name)) {
-        string_attr(&mut attrs, gen_ai::GEN_AI_TOOL_DESCRIPTION, tool.description());
+        string_attr(
+            &mut attrs,
+            gen_ai::GEN_AI_TOOL_DESCRIPTION,
+            tool.description(),
+        );
     }
 
-    let params = serde_json::json!({ "param": { "id": tool_id, "name": tool_name, "input": tool_input } });
+    let params =
+        serde_json::json!({ "param": { "id": tool_id, "name": tool_name, "input": tool_input } });
     string_attr(
         &mut attrs,
         as_attrs::AGENTSCOPE_FUNCTION_INPUT,
@@ -266,7 +277,11 @@ pub fn get_format_request_attributes(format_target: &str, msgs: &[Msg]) -> Attri
         gen_ai::GEN_AI_OPERATION_NAME,
         as_attrs::operation_name::FORMAT,
     );
-    string_attr(&mut attrs, as_attrs::AGENTSCOPE_FORMAT_TARGET, format_target);
+    string_attr(
+        &mut attrs,
+        as_attrs::AGENTSCOPE_FORMAT_TARGET,
+        format_target,
+    );
     if let Ok(v) = serde_json::to_string(msgs) {
         string_attr(&mut attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT, v);
     }
@@ -292,11 +307,7 @@ pub fn get_common_attributes() -> Attributes {
     let mut attrs = Vec::new();
     if crate::studio::StudioManager::is_initialized() {
         if let Some(config) = crate::studio::StudioManager::config() {
-            string_attr(
-                &mut attrs,
-                gen_ai::GEN_AI_CONVERSATION_ID,
-                config.run_id(),
-            );
+            string_attr(&mut attrs, gen_ai::GEN_AI_CONVERSATION_ID, config.run_id());
         }
     }
     attrs
@@ -333,12 +344,12 @@ fn get_input_messages(messages: &[Msg]) -> Option<String> {
     let input_messages: Vec<InputMessage> = messages
         .iter()
         .map(|msg| {
-            let parts: Vec<MessagePart> = msg
-                .content()
-                .iter()
-                .filter_map(block_to_part)
-                .collect();
-            InputMessage::from_role(role_of(msg.role()), parts, msg.name().map(|s| s.to_string()))
+            let parts: Vec<MessagePart> = msg.content().iter().filter_map(block_to_part).collect();
+            InputMessage::from_role(
+                role_of(msg.role()),
+                parts,
+                msg.name().map(|s| s.to_string()),
+            )
         })
         .collect();
     serde_json::to_string(&input_messages).ok()
@@ -360,11 +371,7 @@ fn get_output_messages_msg(output_message: &Msg) -> Option<String> {
 }
 
 fn get_output_messages_response(response: &ChatResponse) -> Option<String> {
-    let parts: Vec<MessagePart> = response
-        .content
-        .iter()
-        .filter_map(block_to_part)
-        .collect();
+    let parts: Vec<MessagePart> = response.content.iter().filter_map(block_to_part).collect();
     let output_messages = vec![OutputMessage::from_role(
         Role::Assistant,
         parts,
@@ -497,8 +504,7 @@ mod tests {
             .build();
         let msgs = vec![Msg::user("hello")];
         let tools = vec![ToolSchema::new("calc", "calculator")];
-        let attrs =
-            get_llm_request_attributes("openai", "gpt-4o", &msgs, &tools, Some(&options));
+        let attrs = get_llm_request_attributes("openai", "gpt-4o", &msgs, &tools, Some(&options));
 
         assert_eq!(attr_str(&attrs, gen_ai::GEN_AI_PROVIDER_NAME), "openai");
         assert_eq!(attr_str(&attrs, gen_ai::GEN_AI_REQUEST_MODEL), "gpt-4o");
@@ -557,7 +563,10 @@ mod tests {
         let response = ChatResponse::new(
             "resp-1",
             vec![ContentBlock::Text(TextBlock::new("ok"))],
-            ChatUsage::builder().input_tokens(10).output_tokens(5).build(),
+            ChatUsage::builder()
+                .input_tokens(10)
+                .output_tokens(5)
+                .build(),
             None,
             Some("stop".to_string()),
         );
@@ -611,6 +620,9 @@ mod tests {
             ProviderNameConverter::get_provider_name("com.x.OpenAIChatModel"),
             "openai"
         );
-        assert_eq!(ProviderNameConverter::get_provider_name("mystery"), "unknown");
+        assert_eq!(
+            ProviderNameConverter::get_provider_name("mystery"),
+            "unknown"
+        );
     }
 }

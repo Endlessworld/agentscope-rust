@@ -9,10 +9,12 @@
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::StreamOptions;
-use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::message::{
+    ContentBlock as CoreBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock,
+};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::state::{AgentState, AgentStateStore, JsonFileAgentStateStore};
 use agentscope_core::session::SessionHistoryMode;
+use agentscope_core::state::{AgentState, AgentStateStore, JsonFileAgentStateStore};
 use agentscope_harness::agent::HarnessAgent;
 use futures::StreamExt;
 
@@ -67,10 +69,8 @@ fn tool_answer(id: &str) -> Msg {
 
 #[tokio::test]
 async fn resume_prunes_duplicated_tool_result_before_model_call() {
-    let root = std::env::temp_dir().join(format!(
-        "agentscope_resume_dangling_{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("agentscope_resume_dangling_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let store: Arc<dyn AgentStateStore> = Arc::new(JsonFileAgentStateStore::new(&root));

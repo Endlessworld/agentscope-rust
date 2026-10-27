@@ -62,8 +62,12 @@ impl WeComInboundMapper {
             .text_content(content)
             .metadata(metadata)
             .build();
-        let mut builder = InboundMessage::builder(self.channel_id.clone(), Peer::direct(from_user.clone()), vec![msg])
-            .sender_id(from_user);
+        let mut builder = InboundMessage::builder(
+            self.channel_id.clone(),
+            Peer::direct(from_user.clone()),
+            vec![msg],
+        )
+        .sender_id(from_user);
         if let Some(account_id) = &self.account_id {
             builder = builder.account_id(account_id.clone());
         }
@@ -166,17 +170,26 @@ mod tests {
         let inbound = mapper().map(xml).expect("mapped");
         assert_eq!(inbound.messages[0].text_content(), "[image]");
         let metadata = inbound.messages[0].metadata();
-        assert_eq!(metadata.get("channelMediaKind"), Some(&serde_json::json!("image")));
+        assert_eq!(
+            metadata.get("channelMediaKind"),
+            Some(&serde_json::json!("image"))
+        );
         assert_eq!(
             metadata.get("channelMediaProviderType"),
             Some(&serde_json::json!("image"))
         );
-        assert_eq!(metadata.get("channelMediaId"), Some(&serde_json::json!("media-1")));
+        assert_eq!(
+            metadata.get("channelMediaId"),
+            Some(&serde_json::json!("media-1"))
+        );
         assert_eq!(
             metadata.get("channelMediaUrl"),
             Some(&serde_json::json!("https://example.test/p.jpg"))
         );
-        assert_eq!(metadata.get("channelMessageId"), Some(&serde_json::json!("9001")));
+        assert_eq!(
+            metadata.get("channelMessageId"),
+            Some(&serde_json::json!("9001"))
+        );
     }
 
     #[test]
@@ -195,7 +208,9 @@ mod tests {
         let inbound = mapper().map(video).expect("mapped");
         assert_eq!(inbound.messages[0].text_content(), "[video]");
         assert_eq!(
-            inbound.messages[0].metadata().get("channelMediaSecondaryId"),
+            inbound.messages[0]
+                .metadata()
+                .get("channelMediaSecondaryId"),
             Some(&serde_json::json!("thumb-1"))
         );
     }

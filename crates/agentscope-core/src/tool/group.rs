@@ -29,19 +29,41 @@ pub struct ToolGroup {
 }
 
 impl ToolGroup {
-    pub fn name(&self) -> &str { &self.name }
-    pub fn description(&self) -> &str { &self.description }
-    pub fn is_active(&self) -> bool { self.active }
-    pub fn set_active(&mut self, active: bool) { self.active = active; }
-    pub fn scope(&self) -> ToolGroupScope { self.scope }
-    pub fn tools(&self) -> &HashSet<String> { &self.tools }
-    pub fn add_tool(&mut self, tool: impl Into<String>) { self.tools.insert(tool.into()); }
-    pub fn remove_tool(&mut self, tool: &str) { self.tools.remove(tool); }
-    pub fn contains_tool(&self, tool: &str) -> bool { self.tools.contains(tool) }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+    pub fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
+    pub fn scope(&self) -> ToolGroupScope {
+        self.scope
+    }
+    pub fn tools(&self) -> &HashSet<String> {
+        &self.tools
+    }
+    pub fn add_tool(&mut self, tool: impl Into<String>) {
+        self.tools.insert(tool.into());
+    }
+    pub fn remove_tool(&mut self, tool: &str) {
+        self.tools.remove(tool);
+    }
+    pub fn contains_tool(&self, tool: &str) -> bool {
+        self.tools.contains(tool)
+    }
     /// Returns a deep copy of this group.
-    pub fn copy(&self) -> ToolGroup { self.clone() }
+    pub fn copy(&self) -> ToolGroup {
+        self.clone()
+    }
 
-    pub fn builder() -> ToolGroupBuilder { ToolGroupBuilder::default() }
+    pub fn builder() -> ToolGroupBuilder {
+        ToolGroupBuilder::default()
+    }
 }
 
 /// Builder for [`ToolGroup`].
@@ -55,12 +77,30 @@ pub struct ToolGroupBuilder {
 }
 
 impl ToolGroupBuilder {
-    pub fn name(mut self, name: impl Into<String>) -> Self { self.name = Some(name.into()); self }
-    pub fn description(mut self, description: impl Into<String>) -> Self { self.description = description.into(); self }
-    pub fn active(mut self, active: bool) -> Self { self.active = active; self }
-    pub fn scope(mut self, scope: ToolGroupScope) -> Self { self.scope = scope; self }
-    pub fn tools(mut self, tools: HashSet<String>) -> Self { self.tools = tools; self }
-    pub fn add_tool(mut self, tool: impl Into<String>) -> Self { self.tools.insert(tool.into()); self }
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+    pub fn scope(mut self, scope: ToolGroupScope) -> Self {
+        self.scope = scope;
+        self
+    }
+    pub fn tools(mut self, tools: HashSet<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+    pub fn add_tool(mut self, tool: impl Into<String>) -> Self {
+        self.tools.insert(tool.into());
+        self
+    }
     pub fn build(self) -> ToolGroup {
         ToolGroup {
             name: self.name.expect("ToolGroup requires a name"),
@@ -88,13 +128,17 @@ struct Inner {
 }
 
 impl ToolGroupManager {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Returns an independent deep copy (Java `copy` semantics): mutations on
     /// the copy never affect the original. `Clone` deliberately shares state.
     pub fn copy(&self) -> ToolGroupManager {
         let inner = self.inner.lock().unwrap().clone();
-        ToolGroupManager { inner: Arc::new(Mutex::new(inner)) }
+        ToolGroupManager {
+            inner: Arc::new(Mutex::new(inner)),
+        }
     }
 
     /// Creates a group and registers it as active/inactive.
@@ -102,8 +146,19 @@ impl ToolGroupManager {
         self.create_tool_group_with_scope(name, description, active, ToolGroupScope::Meta);
     }
 
-    pub fn create_tool_group_with_scope(&self, name: &str, description: &str, active: bool, scope: ToolGroupScope) {
-        let group = ToolGroup::builder().name(name).description(description).active(active).scope(scope).build();
+    pub fn create_tool_group_with_scope(
+        &self,
+        name: &str,
+        description: &str,
+        active: bool,
+        scope: ToolGroupScope,
+    ) {
+        let group = ToolGroup::builder()
+            .name(name)
+            .description(description)
+            .active(active)
+            .scope(scope)
+            .build();
         self.register_tool_group(group);
     }
 
@@ -114,7 +169,11 @@ impl ToolGroupManager {
             return;
         }
         for t in group.tools().iter() {
-            inner.tools_to_groups.entry(t.clone()).or_default().insert(group.name().to_string());
+            inner
+                .tools_to_groups
+                .entry(t.clone())
+                .or_default()
+                .insert(group.name().to_string());
         }
         let name = group.name().to_string();
         if group.is_active() && !inner.active_groups.contains(&name) {
@@ -130,7 +189,9 @@ impl ToolGroupManager {
             if let Some(grp) = inner.tool_groups.get_mut(g) {
                 grp.set_active(active);
                 if active {
-                    if !inner.active_groups.contains(g) { inner.active_groups.push(g.clone()); }
+                    if !inner.active_groups.contains(g) {
+                        inner.active_groups.push(g.clone());
+                    }
                 } else {
                     inner.active_groups.retain(|a| a != g);
                 }
@@ -164,7 +225,11 @@ impl ToolGroupManager {
         if let Some(grp) = inner.tool_groups.get_mut(group) {
             grp.add_tool(tool);
         }
-        inner.tools_to_groups.entry(tool.to_string()).or_default().insert(group.to_string());
+        inner
+            .tools_to_groups
+            .entry(tool.to_string())
+            .or_default()
+            .insert(group.to_string());
     }
 
     pub fn remove_tool_from_group(&self, group: &str, tool: &str) {
@@ -174,7 +239,9 @@ impl ToolGroupManager {
         }
         if let Some(gs) = inner.tools_to_groups.get_mut(tool) {
             gs.remove(group);
-            if gs.is_empty() { inner.tools_to_groups.remove(tool); }
+            if gs.is_empty() {
+                inner.tools_to_groups.remove(tool);
+            }
         }
     }
 
@@ -213,7 +280,13 @@ impl ToolGroupManager {
     }
 
     pub fn get_tool_group_names(&self) -> Vec<String> {
-        self.inner.lock().unwrap().tool_groups.keys().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .tool_groups
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn get_active_groups(&self) -> Vec<String> {

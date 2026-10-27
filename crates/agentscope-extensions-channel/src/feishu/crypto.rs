@@ -96,11 +96,11 @@ impl FeishuCrypto {
     /// `encrypt_base64` is base64-decoded, the leading 16 bytes are the CBC IV and the remainder
     /// is `AES-256-CBC` + PKCS#7 padded plaintext.
     pub fn decrypt(&self, encrypt_base64: &str) -> Result<String> {
-        let cipher_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            encrypt_base64,
-        )
-        .map_err(|e| ChannelError::Crypto(format!("Feishu decrypt failed: bad base64: {e}")))?;
+        let cipher_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypt_base64)
+                .map_err(|e| {
+                    ChannelError::Crypto(format!("Feishu decrypt failed: bad base64: {e}"))
+                })?;
 
         // Java: `cipherBytes.length < 16 + 16` -> "Encrypted payload too short".
         if cipher_bytes.len() < AES_BLOCK_SIZE * 2 {
@@ -231,10 +231,30 @@ mod tests {
         let body = "{\"encrypt\":\"x\"}";
         let sig = crypto.sign("1700000000", "nonce-1", body);
         // Wrong timestamp / nonce / body / signature.
-        assert!(!crypto.verify_signature(Some(&sig), Some("1700000001"), Some("nonce-1"), Some(body)));
-        assert!(!crypto.verify_signature(Some(&sig), Some("1700000000"), Some("nonce-2"), Some(body)));
-        assert!(!crypto.verify_signature(Some(&sig), Some("1700000000"), Some("nonce-1"), Some("other")));
-        assert!(!crypto.verify_signature(Some("deadbeef"), Some("1700000000"), Some("nonce-1"), Some(body)));
+        assert!(!crypto.verify_signature(
+            Some(&sig),
+            Some("1700000001"),
+            Some("nonce-1"),
+            Some(body)
+        ));
+        assert!(!crypto.verify_signature(
+            Some(&sig),
+            Some("1700000000"),
+            Some("nonce-2"),
+            Some(body)
+        ));
+        assert!(!crypto.verify_signature(
+            Some(&sig),
+            Some("1700000000"),
+            Some("nonce-1"),
+            Some("other")
+        ));
+        assert!(!crypto.verify_signature(
+            Some("deadbeef"),
+            Some("1700000000"),
+            Some("nonce-1"),
+            Some(body)
+        ));
         // Any missing argument -> false (Java null guard).
         assert!(!crypto.verify_signature(None, Some("1700000000"), Some("nonce-1"), Some(body)));
         assert!(!crypto.verify_signature(Some(&sig), None, Some("nonce-1"), Some(body)));

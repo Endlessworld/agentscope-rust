@@ -226,7 +226,9 @@ mod tests {
 
     #[test]
     fn reference_blocks_default_to_the_reference_placement() {
-        let item = ContextBlock::reference("format", "columns").unwrap().material();
+        let item = ContextBlock::reference("format", "columns")
+            .unwrap()
+            .material();
         assert_eq!(item.placement, ContextItemPlacement::Reference);
         assert!(!item.required);
         assert_eq!(item.revision, content_hash("columns"));
@@ -234,7 +236,9 @@ mod tests {
 
     #[test]
     fn runtime_blocks_can_never_become_system_instructions() {
-        let item = ContextBlock::runtime("status", "Change 42").unwrap().material();
+        let item = ContextBlock::runtime("status", "Change 42")
+            .unwrap()
+            .material();
         assert_eq!(item.placement, ContextItemPlacement::Runtime);
         assert_ne!(item.placement, ContextItemPlacement::System);
     }

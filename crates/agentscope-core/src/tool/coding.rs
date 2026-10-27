@@ -32,11 +32,17 @@ pub struct CommandCheck {
 
 impl CommandCheck {
     pub fn allow() -> Self {
-        Self { allowed: true, reason: None }
+        Self {
+            allowed: true,
+            reason: None,
+        }
     }
 
     pub fn deny(reason: impl Into<String>) -> Self {
-        Self { allowed: false, reason: Some(reason.into()) }
+        Self {
+            allowed: false,
+            reason: Some(reason.into()),
+        }
     }
 }
 
@@ -47,13 +53,18 @@ pub fn validate_command(command: &str) -> Result<CommandCheck> {
     }
     for pattern in DENYLIST {
         if command.contains(pattern) {
-            return Ok(CommandCheck::deny(format!("command contains forbidden pattern '{}'", pattern)));
+            return Ok(CommandCheck::deny(format!(
+                "command contains forbidden pattern '{}'",
+                pattern
+            )));
         }
     }
     // A naive metacharacter scan: commands run through this validator should
     // be single commands (no chaining/redirection).
     if command.chars().any(|c| FORBIDDEN_META.contains(&c)) {
-        return Ok(CommandCheck::deny("command contains shell metacharacters; use a single command"));
+        return Ok(CommandCheck::deny(
+            "command contains shell metacharacters; use a single command",
+        ));
     }
     Ok(CommandCheck::allow())
 }

@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
+use async_trait::async_trait;
 
 use super::{FileData, FileInfo, Filesystem, GrepMatch};
 
@@ -67,7 +67,9 @@ impl Filesystem for BakedContextFilesystem {
         offset: usize,
         limit: usize,
     ) -> Result<FileData> {
-        self.delegate.read(&self.baked_rc, path, offset, limit).await
+        self.delegate
+            .read(&self.baked_rc, path, offset, limit)
+            .await
     }
 
     async fn write(&self, _ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
@@ -94,10 +96,17 @@ impl Filesystem for BakedContextFilesystem {
         path: Option<&str>,
         glob: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
-        self.delegate.grep(&self.baked_rc, pattern, path, glob).await
+        self.delegate
+            .grep(&self.baked_rc, pattern, path, glob)
+            .await
     }
 
-    async fn glob(&self, _ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
+    async fn glob(
+        &self,
+        _ctx: &RuntimeContext,
+        pattern: &str,
+        path: &str,
+    ) -> Result<Vec<FileInfo>> {
         self.delegate.glob(&self.baked_rc, pattern, path).await
     }
 
@@ -158,18 +167,36 @@ mod tests {
     async fn baked_context_delegates_all_operations() {
         let store: Arc<dyn BaseStore> = Arc::new(InMemoryStore::new());
         let remote = Arc::new(RemoteFilesystem::new(store, Arc::new(UserNs)));
-        let baked = BakedContextFilesystem::new(
-            remote,
-            RuntimeContext::new().with_user_id("alice"),
-        );
+        let baked =
+            BakedContextFilesystem::new(remote, RuntimeContext::new().with_user_id("alice"));
         let empty = RuntimeContext::new();
         baked.write(&empty, "/notes/a.md", "one").await.unwrap();
         assert!(baked.exists(&empty, "/notes/a.md").await.unwrap());
         assert_eq!(baked.ls(&empty, "/notes").await.unwrap().len(), 1);
-        assert_eq!(baked.read(&empty, "/notes/a.md", 0, 0).await.unwrap().content, "one");
-        baked.edit(&empty, "/notes/a.md", "one", "two", false).await.unwrap();
-        assert_eq!(baked.read(&empty, "/notes/a.md", 0, 0).await.unwrap().content, "two");
-        baked.move_path(&empty, "/notes/a.md", "/notes/b.md").await.unwrap();
+        assert_eq!(
+            baked
+                .read(&empty, "/notes/a.md", 0, 0)
+                .await
+                .unwrap()
+                .content,
+            "one"
+        );
+        baked
+            .edit(&empty, "/notes/a.md", "one", "two", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            baked
+                .read(&empty, "/notes/a.md", 0, 0)
+                .await
+                .unwrap()
+                .content,
+            "two"
+        );
+        baked
+            .move_path(&empty, "/notes/a.md", "/notes/b.md")
+            .await
+            .unwrap();
         assert!(!baked.exists(&empty, "/notes/a.md").await.unwrap());
         assert!(baked.exists(&empty, "/notes/b.md").await.unwrap());
         baked.delete(&empty, "/notes").await.unwrap();

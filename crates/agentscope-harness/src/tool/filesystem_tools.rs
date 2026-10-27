@@ -2,12 +2,12 @@
 //! Registers `read_file`, `write_file`, `edit_file`, `grep_files`, `glob_files`, `list_files`.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::message::JsonMap;
-use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
 use agentscope_core::error::Result;
+use agentscope_core::message::JsonMap;
 use agentscope_core::message::ToolResultBlock;
+use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
+use async_trait::async_trait;
 
 use crate::filesystem::Filesystem;
 
@@ -19,7 +19,10 @@ pub const METADATA_ACP_DIFFS: &str = "acp_diffs";
 /// Builds one ACP diff entry as JSON (`path`, optional `old_text`, `new_text`).
 fn diff_entry(path: &str, old_text: Option<String>, new_text: String) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
-    entry.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+    entry.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
     if let Some(old) = old_text {
         entry.insert("old_text".to_string(), serde_json::Value::String(old));
     }
@@ -321,13 +324,19 @@ fn str_arg(args: &JsonMap, key: &str) -> Result<String> {
 }
 
 fn opt_str_arg(args: &JsonMap, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
-
 
 /// Resolves a search-tool `limit` argument: missing → `default_limit`, present →
 /// clamped to `max_limit`. Returns an error when the caller passes a value < 1.
-fn search_limit(args: &JsonMap, key: &str, default_limit: usize, max_limit: usize) -> Result<usize> {
+fn search_limit(
+    args: &JsonMap,
+    key: &str,
+    default_limit: usize,
+    max_limit: usize,
+) -> Result<usize> {
     match args.get(key).and_then(|v| v.as_u64()) {
         None => Ok(default_limit),
         Some(0) => Err(agentscope_core::Error::Tool(format!(
@@ -339,7 +348,12 @@ fn search_limit(args: &JsonMap, key: &str, default_limit: usize, max_limit: usiz
 
 /// Appends a truncation notice when `total` exceeds `limit`, mirroring the Java
 /// `FilesystemTool#appendTruncationNotice`.
-pub(super) fn append_truncation_notice(output: String, total: usize, limit: usize, result_label: &str) -> String {
+pub(super) fn append_truncation_notice(
+    output: String,
+    total: usize,
+    limit: usize,
+    result_label: &str,
+) -> String {
     if total <= limit {
         return output;
     }
@@ -373,10 +387,9 @@ impl Tool for FilesystemTool {
         let output = match self.name.as_str() {
             "read_file" => {
                 let params: ReadFileParams =
-                    serde_json::from_value(serde_json::Value::Object(args.clone()))
-                        .map_err(|e| {
-                            agentscope_core::Error::Tool(format!("Invalid read_file params: {e}"))
-                        })?;
+                    serde_json::from_value(serde_json::Value::Object(args.clone())).map_err(
+                        |e| agentscope_core::Error::Tool(format!("Invalid read_file params: {e}")),
+                    )?;
                 let offset = params.offset;
                 let limit = params.limit;
                 let mut outputs = Vec::new();
@@ -394,10 +407,9 @@ impl Tool for FilesystemTool {
             }
             "write_file" => {
                 let params: WriteFileParams =
-                    serde_json::from_value(serde_json::Value::Object(args.clone()))
-                        .map_err(|e| {
-                            agentscope_core::Error::Tool(format!("Invalid write_file params: {e}"))
-                        })?;
+                    serde_json::from_value(serde_json::Value::Object(args.clone())).map_err(
+                        |e| agentscope_core::Error::Tool(format!("Invalid write_file params: {e}")),
+                    )?;
                 let mut outputs = Vec::new();
                 let mut diffs = Vec::new();
                 for op in &params.operations {
@@ -426,10 +438,9 @@ impl Tool for FilesystemTool {
             }
             "edit_file" => {
                 let params: EditFileParams =
-                    serde_json::from_value(serde_json::Value::Object(args.clone()))
-                        .map_err(|e| {
-                            agentscope_core::Error::Tool(format!("Invalid edit_file params: {e}"))
-                        })?;
+                    serde_json::from_value(serde_json::Value::Object(args.clone())).map_err(
+                        |e| agentscope_core::Error::Tool(format!("Invalid edit_file params: {e}")),
+                    )?;
                 let operations = params.into_operations();
                 if operations.is_empty() {
                     return Ok(ToolResultBlock::text(
@@ -450,7 +461,13 @@ impl Tool for FilesystemTool {
                         .map(|d| d.content);
                     match self
                         .fs
-                        .edit(&rt, &op.path, &op.old_string, &op.new_string, op.replace_all)
+                        .edit(
+                            &rt,
+                            &op.path,
+                            &op.old_string,
+                            &op.new_string,
+                            op.replace_all,
+                        )
                         .await
                     {
                         Ok(n) => {
@@ -467,8 +484,9 @@ impl Tool for FilesystemTool {
                                 diffs.push(diff_entry(&op.path, Some(old), new));
                             }
                         }
-                        Err(e) => outputs
-                            .push(format!("{}\nERROR (operation #{}): {e}", op.path, i + 1)),
+                        Err(e) => {
+                            outputs.push(format!("{}\nERROR (operation #{}): {e}", op.path, i + 1))
+                        }
                     }
                 }
                 let text = format!(
@@ -543,7 +561,11 @@ impl Tool for FilesystemTool {
                     Err(e) => return Ok(ToolResultBlock::error(e.to_string())),
                 }
             }
-            other => return Err(agentscope_core::Error::Tool(format!("unknown operation: {other}"))),
+            other => {
+                return Err(agentscope_core::Error::Tool(format!(
+                    "unknown operation: {other}"
+                )))
+            }
         };
         Ok(ToolResultBlock::text(output))
     }

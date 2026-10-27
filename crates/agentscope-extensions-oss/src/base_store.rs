@@ -293,6 +293,10 @@ impl OssStoreBuilder {
             return Err(OssError::BlankBucket);
         }
         let key_prefix = normalize_prefix(self.key_prefix.as_deref(), DEFAULT_KEY_PREFIX);
-        Ok(OssStore { client, bucket_name, key_prefix })
+        Ok(OssStore {
+            client,
+            bucket_name,
+            key_prefix,
+        })
     }
 }

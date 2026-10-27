@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
-use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::message::{
+    ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock,
+};
 use agentscope_core::model::Model;
 
 use crate::agent::context::auxiliary_text;
@@ -43,7 +45,6 @@ restate facts already covered by MEMORY.md or by today's earlier entries.
 
 const SESSION_CONTEXT_TAG: &str = "<session_context>";
 
-
 /// Shared filesystem helpers used by both the flush and consolidation managers.
 pub(crate) mod fileio {
     use std::sync::Arc;
@@ -54,7 +55,11 @@ pub(crate) mod fileio {
     use crate::filesystem::Filesystem;
 
     /// Reads a UTF-8 file, treating a missing/erroring file as empty.
-    pub(crate) async fn read_text(fs: &Arc<dyn Filesystem>, ctx: &RuntimeContext, path: &str) -> String {
+    pub(crate) async fn read_text(
+        fs: &Arc<dyn Filesystem>,
+        ctx: &RuntimeContext,
+        path: &str,
+    ) -> String {
         match fs.read(ctx, path, 0, 0).await {
             Ok(d) => d.content,
             Err(_) => String::new(),
@@ -138,16 +143,22 @@ impl MemoryFlushManager {
                 &format!("Today's daily ledger so far (your output will be appended after):\n{existing_daily}\n\n"),
             );
         }
-        user_prompt.push_str(
-            &format!(
-                "Extract NEW memories from this conversation window (skip anything already \
+        user_prompt.push_str(&format!(
+            "Extract NEW memories from this conversation window (skip anything already \
                  covered above):\n\n{conversation}"
-            ),
-        );
+        ));
 
         let input = vec![
-            Msg::builder().role(MsgRole::System).content(vec![ContentBlock::Text(TextBlock::new(self.flush_prompt.clone()))]).build(),
-            Msg::builder().role(MsgRole::User).content(vec![ContentBlock::Text(TextBlock::new(user_prompt))]).build(),
+            Msg::builder()
+                .role(MsgRole::System)
+                .content(vec![ContentBlock::Text(TextBlock::new(
+                    self.flush_prompt.clone(),
+                ))])
+                .build(),
+            Msg::builder()
+                .role(MsgRole::User)
+                .content(vec![ContentBlock::Text(TextBlock::new(user_prompt))])
+                .build(),
         ];
         let extracted = self.collect_text(ctx, input).await;
         let extracted = extracted.trim();
@@ -177,7 +188,6 @@ impl MemoryFlushManager {
             .unwrap_or_default()
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Message serialization
@@ -282,11 +292,11 @@ fn render_tool_result(tr: &ToolResultBlock) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use agentscope_core::message::{ChatUsage, TextBlock};
+    use agentscope_core::model::{ChatResponse, GenerateOptions};
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
-    use agentscope_core::message::{ChatUsage, TextBlock};
-    use agentscope_core::model::{ChatResponse, GenerateOptions};
 
     use crate::filesystem::LocalFilesystem;
 
@@ -322,10 +332,8 @@ mod tests {
     }
 
     fn temp_fs(tag: &str) -> Arc<dyn Filesystem> {
-        let dir = std::env::temp_dir().join(format!(
-            "agentscope_mem_flush_{tag}_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_mem_flush_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(LocalFilesystem::sandboxed(dir))
@@ -334,7 +342,10 @@ mod tests {
     #[test]
     fn serialize_skips_system_and_internal_context() {
         let msgs = vec![
-            Msg::builder().role(MsgRole::System).content(vec![ContentBlock::Text(TextBlock::new("sys"))]).build(),
+            Msg::builder()
+                .role(MsgRole::System)
+                .content(vec![ContentBlock::Text(TextBlock::new("sys"))])
+                .build(),
             Msg::user("hello"),
             Msg::builder()
                 .role(MsgRole::User)
@@ -343,7 +354,9 @@ mod tests {
                 .build(),
             Msg::builder()
                 .role(MsgRole::User)
-                .content(vec![ContentBlock::Text(TextBlock::new("<session_context>x</session_context>"))])
+                .content(vec![ContentBlock::Text(TextBlock::new(
+                    "<session_context>x</session_context>",
+                ))])
                 .build(),
         ];
         let out = serialize_messages(&msgs);
@@ -356,7 +369,9 @@ mod tests {
     #[tokio::test]
     async fn flush_writes_to_daily_ledger() {
         let fs = temp_fs("daily");
-        let model: Arc<dyn Model> = Arc::new(FakeModel { text: "- user prefers Rust\n".into() });
+        let model: Arc<dyn Model> = Arc::new(FakeModel {
+            text: "- user prefers Rust\n".into(),
+        });
         let manager = MemoryFlushManager::new(fs.clone(), model);
         let ctx = RuntimeContext::new();
         manager
@@ -373,10 +388,15 @@ mod tests {
     #[tokio::test]
     async fn flush_no_reply_is_noop() {
         let fs = temp_fs("noreply");
-        let model: Arc<dyn Model> = Arc::new(FakeModel { text: "NO_REPLY".into() });
+        let model: Arc<dyn Model> = Arc::new(FakeModel {
+            text: "NO_REPLY".into(),
+        });
         let manager = MemoryFlushManager::new(fs.clone(), model);
         let ctx = RuntimeContext::new();
-        manager.flush_memories(&ctx, &[Msg::user("hi")]).await.unwrap();
+        manager
+            .flush_memories(&ctx, &[Msg::user("hi")])
+            .await
+            .unwrap();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let rel = format!("memory/{today}.md");
         let content = fileio::read_text(&fs, &ctx, &rel).await;
@@ -386,11 +406,16 @@ mod tests {
     #[tokio::test]
     async fn flush_empty_conversation_is_noop() {
         let fs = temp_fs("empty");
-        let model: Arc<dyn Model> = Arc::new(FakeModel { text: "- memory".into() });
+        let model: Arc<dyn Model> = Arc::new(FakeModel {
+            text: "- memory".into(),
+        });
         let manager = MemoryFlushManager::new(fs.clone(), model);
         let ctx = RuntimeContext::new();
         // Only SYSTEM messages -> empty serialization.
-        let msgs = vec![Msg::builder().role(MsgRole::System).content(vec![ContentBlock::Text(TextBlock::new("sys"))]).build()];
+        let msgs = vec![Msg::builder()
+            .role(MsgRole::System)
+            .content(vec![ContentBlock::Text(TextBlock::new("sys"))])
+            .build()];
         manager.flush_memories(&ctx, &msgs).await.unwrap();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let rel = format!("memory/{today}.md");

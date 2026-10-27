@@ -403,9 +403,7 @@ impl Default for ExplicitMarkingStrategy {
 impl ExplicitMarkingStrategy {
     /// Creates a strategy with the default one-minute TTL.
     pub fn create() -> Self {
-        Self {
-            ttl_ms: 60_000,
-        }
+        Self { ttl_ms: 60_000 }
     }
 
     /// Creates a strategy with a custom TTL in milliseconds.

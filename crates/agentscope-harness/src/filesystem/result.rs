@@ -19,7 +19,11 @@ pub struct EditResult {
 
 impl EditResult {
     pub fn new(replacements: usize, file_modified: bool, occurrences_found: usize) -> Self {
-        Self { replacements, file_modified, occurrences_found }
+        Self {
+            replacements,
+            file_modified,
+            occurrences_found,
+        }
     }
 }
 
@@ -34,7 +38,10 @@ pub struct WriteResult {
 
 impl WriteResult {
     pub fn new(bytes_written: usize, created: bool) -> Self {
-        Self { bytes_written, created }
+        Self {
+            bytes_written,
+            created,
+        }
     }
 }
 

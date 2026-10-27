@@ -123,9 +123,7 @@ mod tests {
     use crate::transport::ControlPlaneHttpClient;
 
     fn tool(name: &str) -> AgentTaskCollaborationTool {
-        let http = Arc::new(
-            ControlPlaneHttpClient::new("http://127.0.0.1:1", "tok").unwrap(),
-        );
+        let http = Arc::new(ControlPlaneHttpClient::new("http://127.0.0.1:1", "tok").unwrap());
         AgentTaskCollaborationTool::new(
             CollaborationClient::new(http),
             AgentTaskToolContext::new("task-1", "secret"),
@@ -164,7 +162,9 @@ mod tests {
     async fn unreachable_control_plane_is_reported_not_panicked() {
         // Bypass principle: a failed report must not panic the agent path.
         let t = tool("issue.get");
-        let block = t.call(JsonMap::new(), ToolExecutionContext::default()).await;
+        let block = t
+            .call(JsonMap::new(), ToolExecutionContext::default())
+            .await;
         assert!(block.is_ok());
     }
 }

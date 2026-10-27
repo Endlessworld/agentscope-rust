@@ -8,7 +8,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::message::{
+    ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock,
+};
 use agentscope_core::model::catalog::{DEFAULT_RESERVED_OUTPUT, MAX_SAFETY_MARGIN};
 use agentscope_core::model::Model;
 
@@ -307,19 +309,58 @@ impl Default for CompactionConfigBuilder {
 }
 
 impl CompactionConfigBuilder {
-    pub fn trigger_messages(mut self, v: usize) -> Self { self.trigger_messages = v; self }
-    pub fn trigger_tokens(mut self, v: usize) -> Self { self.trigger_tokens = v; self }
-    pub fn reserved(mut self, v: usize) -> Self { self.reserved = v; self }
-    pub fn keep_messages(mut self, v: usize) -> Self { self.keep_messages = v; self }
-    pub fn keep_tokens(mut self, v: i64) -> Self { self.keep_tokens = v; self }
-    pub fn keep_tokens_min(mut self, v: usize) -> Self { self.keep_tokens_min = v; self }
-    pub fn keep_tokens_max(mut self, v: usize) -> Self { self.keep_tokens_max = v; self }
-    pub fn keep_tokens_ratio(mut self, v: f64) -> Self { self.keep_tokens_ratio = v; self }
-    pub fn summary_prompt(mut self, v: impl Into<String>) -> Self { self.summary_prompt = v.into(); self }
-    pub fn flush_before_compact(mut self, v: bool) -> Self { self.flush_before_compact = v; self }
-    pub fn offload_before_compact(mut self, v: bool) -> Self { self.offload_before_compact = v; self }
-    pub fn truncate_args(mut self, v: Option<TruncateArgsConfig>) -> Self { self.truncate_args = v; self }
-    pub fn prune(mut self, v: Option<PruneConfig>) -> Self { self.prune = v; self }
+    pub fn trigger_messages(mut self, v: usize) -> Self {
+        self.trigger_messages = v;
+        self
+    }
+    pub fn trigger_tokens(mut self, v: usize) -> Self {
+        self.trigger_tokens = v;
+        self
+    }
+    pub fn reserved(mut self, v: usize) -> Self {
+        self.reserved = v;
+        self
+    }
+    pub fn keep_messages(mut self, v: usize) -> Self {
+        self.keep_messages = v;
+        self
+    }
+    pub fn keep_tokens(mut self, v: i64) -> Self {
+        self.keep_tokens = v;
+        self
+    }
+    pub fn keep_tokens_min(mut self, v: usize) -> Self {
+        self.keep_tokens_min = v;
+        self
+    }
+    pub fn keep_tokens_max(mut self, v: usize) -> Self {
+        self.keep_tokens_max = v;
+        self
+    }
+    pub fn keep_tokens_ratio(mut self, v: f64) -> Self {
+        self.keep_tokens_ratio = v;
+        self
+    }
+    pub fn summary_prompt(mut self, v: impl Into<String>) -> Self {
+        self.summary_prompt = v.into();
+        self
+    }
+    pub fn flush_before_compact(mut self, v: bool) -> Self {
+        self.flush_before_compact = v;
+        self
+    }
+    pub fn offload_before_compact(mut self, v: bool) -> Self {
+        self.offload_before_compact = v;
+        self
+    }
+    pub fn truncate_args(mut self, v: Option<TruncateArgsConfig>) -> Self {
+        self.truncate_args = v;
+        self
+    }
+    pub fn prune(mut self, v: Option<PruneConfig>) -> Self {
+        self.prune = v;
+        self
+    }
     pub fn build(self) -> CompactionConfig {
         CompactionConfig {
             trigger_messages: self.trigger_messages,
@@ -397,12 +438,30 @@ impl Default for TruncateArgsConfigBuilder {
 }
 
 impl TruncateArgsConfigBuilder {
-    pub fn trigger_messages(mut self, v: usize) -> Self { self.trigger_messages = v; self }
-    pub fn trigger_tokens(mut self, v: usize) -> Self { self.trigger_tokens = v; self }
-    pub fn keep_messages(mut self, v: usize) -> Self { self.keep_messages = v; self }
-    pub fn keep_tokens(mut self, v: usize) -> Self { self.keep_tokens = v; self }
-    pub fn max_arg_length(mut self, v: usize) -> Self { self.max_arg_length = v; self }
-    pub fn truncation_text(mut self, v: impl Into<String>) -> Self { self.truncation_text = v.into(); self }
+    pub fn trigger_messages(mut self, v: usize) -> Self {
+        self.trigger_messages = v;
+        self
+    }
+    pub fn trigger_tokens(mut self, v: usize) -> Self {
+        self.trigger_tokens = v;
+        self
+    }
+    pub fn keep_messages(mut self, v: usize) -> Self {
+        self.keep_messages = v;
+        self
+    }
+    pub fn keep_tokens(mut self, v: usize) -> Self {
+        self.keep_tokens = v;
+        self
+    }
+    pub fn max_arg_length(mut self, v: usize) -> Self {
+        self.max_arg_length = v;
+        self
+    }
+    pub fn truncation_text(mut self, v: impl Into<String>) -> Self {
+        self.truncation_text = v.into();
+        self
+    }
     pub fn build(self) -> TruncateArgsConfig {
         TruncateArgsConfig {
             trigger_messages: self.trigger_messages,
@@ -691,9 +750,10 @@ impl ConversationCompactor {
         if !should_compact(&conversation, observed, config) {
             return Ok(None);
         }
-        let messages =
-            prune_tool_results(&truncate_args(&conversation, config.truncate_args.as_ref()),
-                config.prune.as_ref());
+        let messages = prune_tool_results(
+            &truncate_args(&conversation, config.truncate_args.as_ref()),
+            config.prune.as_ref(),
+        );
         let total = calculate_token(&messages);
         let cutoff = determine_cutoff_index(&messages, total, config);
         if cutoff == 0 {
@@ -896,7 +956,10 @@ pub fn build_summary_message(summary: &str, file_path: Option<&str>) -> Msg {
              to it for details.\n\nA condensed summary follows:\n\n<summary>\n{}\n</summary>",
             path, summary
         ),
-        None => format!("Here is a summary of the conversation to date:\n\n{}", summary),
+        None => format!(
+            "Here is a summary of the conversation to date:\n\n{}",
+            summary
+        ),
     };
     Msg::builder()
         .id(build_summary_message_id(&content))
@@ -1238,4 +1301,3 @@ mod tests {
         assert!(replacement.is_some(), "pruning must not hide the real size");
     }
 }
-

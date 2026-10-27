@@ -129,7 +129,10 @@ pub struct RequirementDecision {
 impl RequirementDecision {
     /// Creates a decision, validating the source reference.
     pub fn new(authority: RequirementAuthority, source_ref: impl Into<String>) -> Result<Self> {
-        let decision = Self { authority, source_ref: source_ref.into() };
+        let decision = Self {
+            authority,
+            source_ref: source_ref.into(),
+        };
         decision.validate()?;
         Ok(decision)
     }
@@ -326,7 +329,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("Only decided requirements must have a decision source"),
+            error
+                .to_string()
+                .contains("Only decided requirements must have a decision source"),
             "{error}"
         );
     }
@@ -337,7 +342,9 @@ mod tests {
         value["decision"] = serde_json::Value::Null;
         let error = serde_json::from_value::<TaskRequirement>(value).unwrap_err();
         assert!(
-            error.to_string().contains("Only decided requirements must have a decision source"),
+            error
+                .to_string()
+                .contains("Only decided requirements must have a decision source"),
             "{error}"
         );
     }
@@ -367,7 +374,10 @@ mod tests {
         assert!(oversized.to_string().contains("requirement"), "{oversized}");
 
         let blank_source = RequirementDecision::new(RequirementAuthority::User, "  ").unwrap_err();
-        assert!(blank_source.to_string().contains("decision source"), "{blank_source}");
+        assert!(
+            blank_source.to_string().contains("decision source"),
+            "{blank_source}"
+        );
     }
 
     #[test]

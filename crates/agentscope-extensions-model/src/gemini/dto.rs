@@ -78,7 +78,10 @@ pub struct GeminiPart {
 impl GeminiPart {
     /// Creates a plain text part.
     pub fn text(text: impl Into<String>) -> Self {
-        Self { text: Some(text.into()), ..Default::default() }
+        Self {
+            text: Some(text.into()),
+            ..Default::default()
+        }
     }
 
     /// Creates an inline-data part from an already base64-encoded payload.
@@ -342,7 +345,10 @@ mod tests {
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["contents"][0]["role"], serde_json::json!("user"));
-        assert_eq!(value["contents"][0]["parts"][0]["text"], serde_json::json!("hi"));
+        assert_eq!(
+            value["contents"][0]["parts"][0]["text"],
+            serde_json::json!("hi")
+        );
         assert!(!value.as_object().unwrap().contains_key("tools"));
         assert!(!value.as_object().unwrap().contains_key("generationConfig"));
     }
@@ -366,8 +372,14 @@ mod tests {
         assert_eq!(value["topP"], serde_json::json!(0.9));
         assert_eq!(value["topK"], serde_json::json!(40.0));
         assert_eq!(value["maxOutputTokens"], serde_json::json!(1024));
-        assert_eq!(value["thinkingConfig"]["includeThoughts"], serde_json::json!(true));
-        assert_eq!(value["thinkingConfig"]["thinkingBudget"], serde_json::json!(512));
+        assert_eq!(
+            value["thinkingConfig"]["includeThoughts"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            value["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(512)
+        );
         assert!(!config.is_empty());
         assert!(GeminiGenerationConfig::default().is_empty());
     }
@@ -390,7 +402,10 @@ mod tests {
             thought: None,
         };
         let value = serde_json::to_value(&part).unwrap();
-        assert_eq!(value["inlineData"]["mimeType"], serde_json::json!("image/png"));
+        assert_eq!(
+            value["inlineData"]["mimeType"],
+            serde_json::json!("image/png")
+        );
         assert_eq!(value["thoughtSignature"], serde_json::json!("sig"));
     }
 
@@ -421,7 +436,10 @@ mod tests {
             },
         };
         let value = serde_json::to_value(&config).unwrap();
-        assert_eq!(value["functionCallingConfig"]["mode"], serde_json::json!("ANY"));
+        assert_eq!(
+            value["functionCallingConfig"]["mode"],
+            serde_json::json!("ANY")
+        );
         assert_eq!(
             value["functionCallingConfig"]["allowedFunctionNames"][0],
             serde_json::json!("f")
@@ -464,7 +482,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.response_id.as_deref(), Some("resp_1"));
-        assert_eq!(response.candidates[0].finish_reason.as_deref(), Some("STOP"));
+        assert_eq!(
+            response.candidates[0].finish_reason.as_deref(),
+            Some("STOP")
+        );
         let parts = &response.candidates[0].content.as_ref().unwrap().parts;
         assert_eq!(parts[0].thought, Some(true));
         assert_eq!(parts[2].function_call.as_ref().unwrap().name, "get_weather");

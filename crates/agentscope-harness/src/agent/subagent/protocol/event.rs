@@ -60,7 +60,11 @@ pub struct RemoteConfirmDecision {
 
 impl RemoteConfirmDecision {
     pub fn new(tool_call_id: impl Into<String>, approved: bool) -> Self {
-        Self { tool_call_id: Some(tool_call_id.into()), approved, reason: None }
+        Self {
+            tool_call_id: Some(tool_call_id.into()),
+            approved,
+            reason: None,
+        }
     }
 
     /// Attaches a reason for the decision (e.g. why the user denied the call).
@@ -120,15 +124,7 @@ fn is_zero(v: &i64) -> bool {
 /// `context.detail`. Each level is a superset of the previous one. The wire value is
 /// the lower-case enum name, matching Java `RemoteStreamDetail#wireValue`.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum RemoteStreamDetail {
@@ -217,8 +213,14 @@ mod tests {
     #[test]
     fn stream_detail_parse_and_includes() {
         assert_eq!(RemoteStreamDetail::parse(None), RemoteStreamDetail::Status);
-        assert_eq!(RemoteStreamDetail::parse(Some("  FULL ")), RemoteStreamDetail::Full);
-        assert_eq!(RemoteStreamDetail::parse(Some("bogus")), RemoteStreamDetail::Status);
+        assert_eq!(
+            RemoteStreamDetail::parse(Some("  FULL ")),
+            RemoteStreamDetail::Full
+        );
+        assert_eq!(
+            RemoteStreamDetail::parse(Some("bogus")),
+            RemoteStreamDetail::Status
+        );
         assert!(RemoteStreamDetail::Verbose.includes(RemoteStreamDetail::Full));
         assert!(!RemoteStreamDetail::Status.includes(RemoteStreamDetail::Full));
         assert_eq!(RemoteStreamDetail::Verbose.wire_value(), "verbose");
@@ -226,7 +228,10 @@ mod tests {
 
     #[test]
     fn stream_detail_serializes_as_lowercase_wire_value() {
-        assert_eq!(serde_json::to_string(&RemoteStreamDetail::Full).unwrap(), "\"full\"");
+        assert_eq!(
+            serde_json::to_string(&RemoteStreamDetail::Full).unwrap(),
+            "\"full\""
+        );
         assert_eq!(
             serde_json::from_str::<RemoteStreamDetail>("\"verbose\"").unwrap(),
             RemoteStreamDetail::Verbose
@@ -274,8 +279,7 @@ mod tests {
 
         // And a payload that does carry the reason round-trips it.
         let with_reason: RemoteConfirmDecision =
-            serde_json::from_str(r#"{"toolCallId":"c2","approved":false,"reason":"no"}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"toolCallId":"c2","approved":false,"reason":"no"}"#).unwrap();
         assert_eq!(with_reason.reason.as_deref(), Some("no"));
     }
 }

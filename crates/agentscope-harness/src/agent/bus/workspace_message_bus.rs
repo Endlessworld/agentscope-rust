@@ -19,9 +19,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::filesystem::Filesystem;
@@ -70,7 +70,9 @@ impl WorkspaceMessageBus {
 
     async fn ensure_dir(&self, dir: &str) -> Result<()> {
         if !self.fs.exists(&self.ctx, dir).await? {
-            self.fs.write(&self.ctx, &format!("{dir}/.keep"), "").await?;
+            self.fs
+                .write(&self.ctx, &format!("{dir}/.keep"), "")
+                .await?;
         }
         Ok(())
     }
@@ -113,7 +115,13 @@ impl WorkspaceMessageBus {
 pub(crate) fn hash_key(key: &str) -> String {
     let sanitized: String = key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
@@ -129,7 +137,9 @@ impl MessageBus for WorkspaceMessageBus {
         let dir = self.queue_dir(key);
         self.ensure_dir(&dir).await?;
         let path = format!("{dir}/{entry_id}.json");
-        self.fs.write(&self.ctx, &path, &serde_json::to_string(&payload)?).await?;
+        self.fs
+            .write(&self.ctx, &path, &serde_json::to_string(&payload)?)
+            .await?;
         Ok(entry_id)
     }
 
@@ -172,7 +182,9 @@ impl MessageBus for WorkspaceMessageBus {
         let dir = self.log_dir(key);
         self.ensure_dir(&dir).await?;
         let path = format!("{dir}/{entry_id}.json");
-        self.fs.write(&self.ctx, &path, &serde_json::to_string(&payload)?).await?;
+        self.fs
+            .write(&self.ctx, &path, &serde_json::to_string(&payload)?)
+            .await?;
 
         if max_len > 0 {
             let files = self.list_sorted(&dir).await?;

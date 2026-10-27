@@ -30,7 +30,9 @@ pub struct DashScopeInput {
 impl DashScopeInput {
     /// Wraps a message list.
     pub fn of(messages: Vec<DashScopeMessage>) -> Self {
-        Self { messages: Some(messages) }
+        Self {
+            messages: Some(messages),
+        }
     }
 }
 
@@ -61,13 +63,19 @@ pub struct DashScopeParameters {
     pub enable_search: Option<bool>,
     #[serde(rename = "search_options", skip_serializing_if = "Option::is_none")]
     pub search_options: Option<DashScopeSearchOptions>,
-    #[serde(rename = "enable_code_interpreter", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "enable_code_interpreter",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub enable_code_interpreter: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<DashScopeTool>>,
     #[serde(rename = "tool_choice", skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
-    #[serde(rename = "parallel_tool_calls", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "parallel_tool_calls",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
@@ -126,9 +134,15 @@ pub struct DashScopeSearchOptions {
     pub forced_search: Option<bool>,
     #[serde(rename = "search_strategy", skip_serializing_if = "Option::is_none")]
     pub search_strategy: Option<String>,
-    #[serde(rename = "enable_search_extension", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "enable_search_extension",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub enable_search_extension: Option<bool>,
-    #[serde(rename = "prepend_search_result", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "prepend_search_result",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub prepend_search_result: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turbo: Option<bool>,
@@ -223,29 +237,44 @@ pub struct DashScopeContentPart {
     pub total_pixels: Option<u32>,
     /// Prompt-cache hint; omitted when `None` or empty. Lives on the content
     /// block (not the message) so DashScope caches the prefix up to that part.
-    #[serde(rename = "cache_control", skip_serializing_if = "cache_control_is_empty")]
+    #[serde(
+        rename = "cache_control",
+        skip_serializing_if = "cache_control_is_empty"
+    )]
     pub cache_control: Option<CacheControl>,
 }
 
 impl DashScopeContentPart {
     /// Creates a `text` part.
     pub fn text(text: impl Into<String>) -> Self {
-        Self { text: Some(text.into()), ..Default::default() }
+        Self {
+            text: Some(text.into()),
+            ..Default::default()
+        }
     }
 
     /// Creates an `image` part.
     pub fn image(url: impl Into<String>) -> Self {
-        Self { image: Some(url.into()), ..Default::default() }
+        Self {
+            image: Some(url.into()),
+            ..Default::default()
+        }
     }
 
     /// Creates an `audio` part.
     pub fn audio(url: impl Into<String>) -> Self {
-        Self { audio: Some(url.into()), ..Default::default() }
+        Self {
+            audio: Some(url.into()),
+            ..Default::default()
+        }
     }
 
     /// Creates a `video` part.
     pub fn video(url: impl Into<String>) -> Self {
-        Self { video: Some(serde_json::Value::String(url.into())), ..Default::default() }
+        Self {
+            video: Some(serde_json::Value::String(url.into())),
+            ..Default::default()
+        }
     }
 
     /// Whether this part carries any content.
@@ -272,7 +301,10 @@ fn default_tool_type() -> String {
 impl DashScopeTool {
     /// Wraps a function definition.
     pub fn function(function: DashScopeToolFunction) -> Self {
-        Self { tool_type: "function".to_string(), function }
+        Self {
+            tool_type: "function".to_string(),
+            function,
+        }
     }
 }
 
@@ -310,7 +342,10 @@ pub struct DashScopeFunction {
 impl DashScopeFunction {
     /// Creates a function payload from a name and raw argument JSON string.
     pub fn of(name: impl Into<String>, arguments: impl Into<String>) -> Self {
-        Self { name: name.into(), arguments: Some(arguments.into()) }
+        Self {
+            name: name.into(),
+            arguments: Some(arguments.into()),
+        }
     }
 }
 

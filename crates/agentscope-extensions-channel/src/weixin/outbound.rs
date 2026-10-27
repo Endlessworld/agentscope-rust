@@ -18,7 +18,7 @@ use agentscope_harness::agent::OutboundAddress;
 use serde_json::Value;
 
 use super::credentials::{WeixinCredentialProvider, WeixinCredentials};
-use super::dto::{WeixinUpdatesResponse, WeixinQrCodeResponse, required_field};
+use super::dto::{required_field, WeixinQrCodeResponse, WeixinUpdatesResponse};
 use super::error::{WeixinError, WeixinResult};
 use super::properties::WeixinChannelProperties;
 use super::protocol::{
@@ -26,7 +26,7 @@ use super::protocol::{
     qrcode_challenge_request, qrcode_status_path, send_message_request_body, updates_request_body,
     LONG_POLL_GRACE_MS, PATH_NOTIFY_START, PATH_NOTIFY_STOP, PATH_SEND_MESSAGE, PATH_UPDATES,
 };
-use crate::common::{Result, HttpTransport, PreparedRequest};
+use crate::common::{HttpTransport, PreparedRequest, Result};
 
 /// Client id sent with every outbound message. Only provider-side de-duplication uses it, so a
 /// monotonic counter derived from the clock is sufficient and keeps this module dependency-free.
@@ -34,11 +34,7 @@ pub fn next_client_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "{}-{}",
-        crate::common::now_ms(),
-        sequence
-    )
+    format!("{}-{}", crate::common::now_ms(), sequence)
 }
 
 /// The peer id from a routed outbound address, mirroring the Java `peer(...)` helper: everything
@@ -165,10 +161,7 @@ impl WeixinOutboundClient {
     }
 
     /// Build the QR-login challenge request (application headers only — no bot token yet).
-    pub fn prepare_qrcode_challenge(
-        &self,
-        bot_type: &str,
-    ) -> WeixinResult<PreparedRequest> {
+    pub fn prepare_qrcode_challenge(&self, bot_type: &str) -> WeixinResult<PreparedRequest> {
         if bot_type.is_empty() || !bot_type.chars().all(|c| c.is_ascii_digit()) {
             return Err(WeixinError::operation("botType must be numeric"));
         }
@@ -204,7 +197,8 @@ impl WeixinOutboundClient {
         message: &Msg,
         context_token: Option<&str>,
     ) -> WeixinResult<Option<String>> {
-        let Some(request) = self.prepare_send(address, message, context_token, &next_client_id())?
+        let Some(request) =
+            self.prepare_send(address, message, context_token, &next_client_id())?
         else {
             return Ok(None);
         };
@@ -228,7 +222,10 @@ impl WeixinOutboundClient {
     ) -> WeixinResult<Vec<String>> {
         let mut receipts = Vec::new();
         for message in messages {
-            if let Some(receipt) = self.send_with_receipt(address, message, context_token).await? {
+            if let Some(receipt) = self
+                .send_with_receipt(address, message, context_token)
+                .await?
+            {
                 receipts.push(receipt);
             }
         }
@@ -240,9 +237,8 @@ impl WeixinOutboundClient {
         let request = self.prepare_updates(cursor)?;
         let response = self.transport.execute(request).await?;
         let node = self.assert_success("getupdates", &response, &["msgs", "get_updates_buf"])?;
-        Ok(serde_json::from_value(node).map_err(|_| {
-            WeixinError::operation("iLink returned an unparseable response")
-        })?)
+        Ok(serde_json::from_value(node)
+            .map_err(|_| WeixinError::operation("iLink returned an unparseable response"))?)
     }
 
     /// Announce the consumer to the provider.
@@ -290,9 +286,8 @@ impl WeixinOutboundClient {
             .filter(|url| !url.is_empty())
             .unwrap_or(base_url)
             .to_string();
-        let body: WeixinQrCodeResponse = serde_json::from_value(node).map_err(|_| {
-            WeixinError::operation("iLink returned an unparseable response")
-        })?;
+        let body: WeixinQrCodeResponse = serde_json::from_value(node)
+            .map_err(|_| WeixinError::operation("iLink returned an unparseable response"))?;
         let qrcode = required_field("qrcode", body.qrcode.as_deref())?;
         let image = required_field("qrcode_img_content", body.qrcode_img_content.as_deref())?;
         let session = super::dto::WeixinLoginSession::new(qrcode, start)
@@ -371,11 +366,18 @@ impl std::fmt::Display for WeixinChallenge {
 /// A body with `ret`/`errcode` states it explicitly. `getupdates` is the one call that reports
 /// success with neither, so it must instead carry one of its batch fields — the relaxation must
 /// not turn an unrelated 2xx body into an empty batch.
-fn require_provider_result(operation: &str, node: &Value, outcome_fields: &[&str]) -> WeixinResult<()> {
+fn require_provider_result(
+    operation: &str,
+    node: &Value,
+    outcome_fields: &[&str],
+) -> WeixinResult<()> {
     if node.get("ret").is_some() || node.get("errcode").is_some() {
         return Ok(());
     }
-    if outcome_fields.iter().any(|field| node.get(*field).is_some()) {
+    if outcome_fields
+        .iter()
+        .any(|field| node.get(*field).is_some())
+    {
         return Ok(());
     }
     Err(WeixinError::operation(format!(
@@ -493,7 +495,10 @@ mod tests {
         assert_eq!(request.method, crate::common::HttpMethod::Post);
         assert_eq!(request.header_value("Authorization"), Some("Bearer tok"));
         assert_eq!(request.header_value("iLink-App-Id"), Some("bot"));
-        assert_eq!(request.header_value("AuthorizationType"), Some("ilink_bot_token"));
+        assert_eq!(
+            request.header_value("AuthorizationType"),
+            Some("ilink_bot_token")
+        );
         assert_eq!(request.header_value("X-WECHAT-UIN"), Some("NDI="));
         let body = request.body.unwrap();
         assert_eq!(body["msg"]["to_user_id"], serde_json::json!("peer-a"));
@@ -502,7 +507,10 @@ mod tests {
             body["msg"]["item_list"][0]["text_item"]["text"],
             serde_json::json!("hello")
         );
-        assert_eq!(body["base_info"]["channel_version"], serde_json::json!("agentscope-weixin/1.0"));
+        assert_eq!(
+            body["base_info"]["channel_version"],
+            serde_json::json!("agentscope-weixin/1.0")
+        );
     }
 
     #[tokio::test]
@@ -636,7 +644,11 @@ mod tests {
             request.body.unwrap()["base_info"]["bot_agent"],
             serde_json::json!("AgentScope")
         );
-        assert!(outbound.notify_start().await.unwrap_err().is_credential_rejected());
+        assert!(outbound
+            .notify_start()
+            .await
+            .unwrap_err()
+            .is_credential_rejected());
         outbound.notify_stop().await.unwrap();
         assert_eq!(
             transport.last_request().unwrap().url,

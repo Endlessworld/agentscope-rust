@@ -197,7 +197,10 @@ mod tests {
 
         let data = response.data.as_ref().unwrap();
         assert_eq!(data.total, Some(1));
-        assert_eq!(data.doc_aggs.as_ref().unwrap()[0].doc_name.as_deref(), Some("1.txt"));
+        assert_eq!(
+            data.doc_aggs.as_ref().unwrap()[0].doc_name.as_deref(),
+            Some("1.txt")
+        );
     }
 
     #[test]

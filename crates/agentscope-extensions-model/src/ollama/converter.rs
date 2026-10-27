@@ -68,7 +68,11 @@ fn block_text(block: &ContentBlock) -> Option<String> {
 }
 
 fn collect_text(blocks: &[ContentBlock]) -> String {
-    blocks.iter().filter_map(block_text).collect::<Vec<_>>().join("\n")
+    blocks
+        .iter()
+        .filter_map(block_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Maps an AgentScope role to Ollama's role string.
@@ -179,7 +183,10 @@ pub fn to_ollama_messages_with(
         }
 
         let text = collect_text(
-            &text_blocks.into_iter().cloned().collect::<Vec<ContentBlock>>(),
+            &text_blocks
+                .into_iter()
+                .cloned()
+                .collect::<Vec<ContentBlock>>(),
         );
 
         let mut main = OllamaMessage {
@@ -202,7 +209,12 @@ pub fn to_ollama_messages_with(
                             arguments: if t.input.is_empty() {
                                 None
                             } else {
-                                Some(t.input.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                                Some(
+                                    t.input
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                        .collect(),
+                                )
                             },
                         },
                     }),
@@ -291,7 +303,11 @@ pub fn build_request(
         tools: to_ollama_tools(tools),
         tool_choice: tools_choice(tool_choice),
         think: merged.think.as_ref().map(|t| t.to_json_value()),
-        options: if options_map.is_empty() { None } else { Some(options_map) },
+        options: if options_map.is_empty() {
+            None
+        } else {
+            Some(options_map)
+        },
     }
 }
 
@@ -364,9 +380,9 @@ mod tests {
         let out = to_ollama_messages(vec![base64_msg]).unwrap();
         assert_eq!(out[0].images.as_ref().unwrap()[0], "QUJD");
 
-        let remote_msg = Msg::user_blocks(vec![ContentBlock::Image(ImageBlock::new(
-            Source::Url(URLSource::new("https://example.com/a.png")),
-        ))]);
+        let remote_msg = Msg::user_blocks(vec![ContentBlock::Image(ImageBlock::new(Source::Url(
+            URLSource::new("https://example.com/a.png"),
+        )))]);
         assert!(to_ollama_messages(vec![remote_msg]).is_err());
         // Structural check: the error path is exercised by a resolver stub too.
         let _ = resolver_that_errors();
@@ -376,9 +392,14 @@ mod tests {
     fn tool_choice_mapping_matches_java() {
         assert_eq!(to_tool_choice(&ToolChoice::Auto), serde_json::json!("auto"));
         assert_eq!(to_tool_choice(&ToolChoice::None), serde_json::json!("none"));
-        assert_eq!(to_tool_choice(&ToolChoice::Required), serde_json::json!("auto"));
         assert_eq!(
-            to_tool_choice(&ToolChoice::Specific { tool_name: "f".into() }),
+            to_tool_choice(&ToolChoice::Required),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            to_tool_choice(&ToolChoice::Specific {
+                tool_name: "f".into()
+            }),
             serde_json::json!({"type": "function", "function": {"name": "f"}})
         );
     }

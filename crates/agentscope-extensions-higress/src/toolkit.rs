@@ -28,7 +28,10 @@ impl std::fmt::Debug for HigressToolkit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HigressToolkit")
             .field("tools", &self.toolkit.tool_names())
-            .field("has_higress_client", &self.get_higress_mcp_client().is_some())
+            .field(
+                "has_higress_client",
+                &self.get_higress_mcp_client().is_some(),
+            )
             .finish()
     }
 }
@@ -145,9 +148,7 @@ impl McpGatewayTool {
                 );
                 serde_json::Value::Object(schema)
             })
-            .unwrap_or_else(|| {
-                serde_json::json!({ "type": "object", "properties": {} })
-            });
+            .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
         Self {
             client,
             name: tool.name,

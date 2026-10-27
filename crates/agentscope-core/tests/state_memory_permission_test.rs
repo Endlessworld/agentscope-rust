@@ -8,8 +8,8 @@ use agentscope_core::shutdown::{GracefulShutdownManager, ShutdownState};
 use agentscope_core::state::{
     AgentState, AgentStateStore, InMemoryAgentStateStore, JsonFileAgentStateStore, Task, TaskState,
 };
-use agentscope_core::Memory;
 use agentscope_core::InMemoryMemory;
+use agentscope_core::Memory;
 
 fn sample_msg(role: MsgRole, text: &str) -> Msg {
     Msg::new(
@@ -48,7 +48,12 @@ async fn in_memory_store_round_trip() {
         .save(None, "s1", "k", serde_json::json!({"v": 1}))
         .await;
     store
-        .save_list(None, "s1", "lst", &[serde_json::json!(1), serde_json::json!(2)])
+        .save_list(
+            None,
+            "s1",
+            "lst",
+            &[serde_json::json!(1), serde_json::json!(2)],
+        )
         .await;
 
     assert!(store.exists(None, "s1").await);
@@ -69,7 +74,12 @@ async fn json_file_store_round_trip() {
     let state = AgentState::builder().session_id("s2").build();
 
     store
-        .save(None, "s2", "agent_state", serde_json::to_value(&state).unwrap())
+        .save(
+            None,
+            "s2",
+            "agent_state",
+            serde_json::to_value(&state).unwrap(),
+        )
         .await;
     let loaded: AgentState =
         serde_json::from_value(store.get(None, "s2", "agent_state").await.unwrap()).unwrap();
@@ -95,10 +105,20 @@ async fn json_file_store_survives_restart() {
             .add_message(sample_msg(MsgRole::User, "hello from run 1"))
             .build();
         store
-            .save(Some("bob"), "persist-sess", "agent_state", serde_json::to_value(&state).unwrap())
+            .save(
+                Some("bob"),
+                "persist-sess",
+                "agent_state",
+                serde_json::to_value(&state).unwrap(),
+            )
             .await;
         store
-            .save_list(Some("bob"), "persist-sess", "history", &[serde_json::json!("a"), serde_json::json!("b")])
+            .save_list(
+                Some("bob"),
+                "persist-sess",
+                "history",
+                &[serde_json::json!("a"), serde_json::json!("b")],
+            )
             .await;
     }
 
@@ -108,7 +128,10 @@ async fn json_file_store_survives_restart() {
         assert!(store.exists(Some("bob"), "persist-sess").await);
 
         let loaded: AgentState = serde_json::from_value(
-            store.get(Some("bob"), "persist-sess", "agent_state").await.unwrap(),
+            store
+                .get(Some("bob"), "persist-sess", "agent_state")
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(loaded.session_id(), "persist-sess");
@@ -152,7 +175,9 @@ fn permission_explore_denies_write() {
 #[test]
 fn permission_deny_rule_wins() {
     let rule = PermissionRule::new("rm", None, PermissionBehavior::Deny, "test");
-    let ctx = PermissionContextState::builder().add_deny_rule("rm", rule).build();
+    let ctx = PermissionContextState::builder()
+        .add_deny_rule("rm", rule)
+        .build();
     let engine = PermissionEngine::new(ctx);
     let decision = engine.check_permission("rm", false, &serde_json::Map::new(), |_c, _i| true);
     assert_eq!(decision.behavior, PermissionBehavior::Deny);

@@ -23,9 +23,7 @@ impl NacosAgentCardConverter {
             protocol_version: card.protocol_version.clone(),
             provider: card.provider.as_ref().map(convert_provider_to_a2a),
             preferred_transport: card.preferred_transport.clone(),
-            additional_interfaces: convert_interfaces_to_a2a(
-                card.additional_interfaces.as_deref(),
-            ),
+            additional_interfaces: convert_interfaces_to_a2a(card.additional_interfaces.as_deref()),
             icon_url: card.icon_url.clone(),
             capabilities: convert_capabilities_to_a2a(&card.capabilities),
             default_input_modes: card.default_input_modes.clone(),
@@ -81,11 +79,17 @@ fn convert_capabilities_to_nacos(c: &A2aAgentCapabilities) -> NacosAgentCapabili
 }
 
 fn convert_provider_to_a2a(p: &NacosAgentProvider) -> A2aAgentProvider {
-    A2aAgentProvider { organization: p.organization.clone(), url: p.url.clone() }
+    A2aAgentProvider {
+        organization: p.organization.clone(),
+        url: p.url.clone(),
+    }
 }
 
 fn convert_provider_to_nacos(p: &A2aAgentProvider) -> NacosAgentProvider {
-    NacosAgentProvider { organization: p.organization.clone(), url: p.url.clone() }
+    NacosAgentProvider {
+        organization: p.organization.clone(),
+        url: p.url.clone(),
+    }
 }
 
 fn convert_interfaces_to_a2a(
@@ -95,7 +99,10 @@ fn convert_interfaces_to_a2a(
     Some(
         ifaces
             .iter()
-            .map(|i| A2aAgentInterface { url: i.url.clone(), transport: i.transport.clone() })
+            .map(|i| A2aAgentInterface {
+                url: i.url.clone(),
+                transport: i.transport.clone(),
+            })
             .collect(),
     )
 }
@@ -107,7 +114,10 @@ fn convert_interfaces_to_nacos(
     Some(
         ifaces
             .iter()
-            .map(|i| NacosAgentInterface { url: i.url.clone(), transport: i.transport.clone() })
+            .map(|i| NacosAgentInterface {
+                url: i.url.clone(),
+                transport: i.transport.clone(),
+            })
             .collect(),
     )
 }

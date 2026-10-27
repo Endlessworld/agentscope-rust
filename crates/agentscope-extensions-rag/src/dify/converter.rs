@@ -16,16 +16,11 @@ impl DifyDocumentConverter {
     /// Mirrors Java `fromDifyResponse`: a `null` response or an empty record list yields an
     /// empty vector; exceptions during a single record are swallowed (the Java version logs a
     /// warning). Here invalid records simply return `None`.
-    pub fn from_dify_response(
-        response: &crate::dify::model::DifyResponse,
-    ) -> Vec<Document> {
+    pub fn from_dify_response(response: &crate::dify::model::DifyResponse) -> Vec<Document> {
         let Some(records) = response.records.as_ref() else {
             return Vec::new();
         };
-        records
-            .iter()
-            .filter_map(Self::from_dify_record)
-            .collect()
+        records.iter().filter_map(Self::from_dify_record).collect()
     }
 
     /// Converts one record, returning `None` when required data is missing.
@@ -58,9 +53,9 @@ impl DifyDocumentConverter {
 
         let payload = Self::build_payload_from_segment(segment);
         let mut document = Document::new(DocumentMetadata::with_payload(
-            agentscope_core::message::ContentBlock::Text(
-                agentscope_core::message::TextBlock::new(content),
-            ),
+            agentscope_core::message::ContentBlock::Text(agentscope_core::message::TextBlock::new(
+                content,
+            )),
             doc_id,
             chunk_id,
             Value::Object(payload),
@@ -162,7 +157,12 @@ mod tests {
     use super::*;
     use crate::dify::model::{DifyResponse, DocumentInfo, Query, Record, Segment};
 
-    fn record(content: Option<&str>, doc_id: Option<&str>, segment_id: Option<&str>, score: Option<f64>) -> Record {
+    fn record(
+        content: Option<&str>,
+        doc_id: Option<&str>,
+        segment_id: Option<&str>,
+        score: Option<f64>,
+    ) -> Record {
         Record {
             segment: Some(Segment {
                 id: segment_id.map(str::to_string),
@@ -186,8 +186,17 @@ mod tests {
 
     #[test]
     fn blank_content_is_skipped() {
-        assert!(DifyDocumentConverter::from_dify_record(&record(Some("   "), Some("d"), Some("s"), None)).is_none());
-        assert!(DifyDocumentConverter::from_dify_record(&record(None, Some("d"), Some("s"), None)).is_none());
+        assert!(DifyDocumentConverter::from_dify_record(&record(
+            Some("   "),
+            Some("d"),
+            Some("s"),
+            None
+        ))
+        .is_none());
+        assert!(
+            DifyDocumentConverter::from_dify_record(&record(None, Some("d"), Some("s"), None))
+                .is_none()
+        );
     }
 
     #[test]
@@ -201,24 +210,41 @@ mod tests {
 
     #[test]
     fn document_id_prefers_document_id_then_segment_id_the_unknown() {
-        let d = DifyDocumentConverter::from_dify_record(&record(Some("x"), Some("doc-1"), Some("seg-1"), None)).unwrap();
+        let d = DifyDocumentConverter::from_dify_record(&record(
+            Some("x"),
+            Some("doc-1"),
+            Some("seg-1"),
+            None,
+        ))
+        .unwrap();
         assert_eq!(d.metadata.doc_id, "doc-1");
         assert_eq!(d.metadata.chunk_id, "seg-1");
 
-        let d = DifyDocumentConverter::from_dify_record(&record(Some("x"), None, Some("seg-1"), None)).unwrap();
+        let d =
+            DifyDocumentConverter::from_dify_record(&record(Some("x"), None, Some("seg-1"), None))
+                .unwrap();
         assert_eq!(d.metadata.doc_id, "seg-1");
 
-        let d = DifyDocumentConverter::from_dify_record(&record(Some("x"), None, None, None)).unwrap();
+        let d =
+            DifyDocumentConverter::from_dify_record(&record(Some("x"), None, None, None)).unwrap();
         assert_eq!(d.metadata.doc_id, "unknown");
         assert_eq!(d.metadata.chunk_id, "0");
     }
 
     #[test]
     fn score_is_taken_from_the_record() {
-        let d = DifyDocumentConverter::from_dify_record(&record(Some("x"), Some("d"), Some("s"), Some(0.87))).unwrap();
+        let d = DifyDocumentConverter::from_dify_record(&record(
+            Some("x"),
+            Some("d"),
+            Some("s"),
+            Some(0.87),
+        ))
+        .unwrap();
         assert_eq!(d.score, Some(0.87));
 
-        let d = DifyDocumentConverter::from_dify_record(&record(Some("x"), Some("d"), Some("s"), None)).unwrap();
+        let d =
+            DifyDocumentConverter::from_dify_record(&record(Some("x"), Some("d"), Some("s"), None))
+                .unwrap();
         assert_eq!(d.score, None);
     }
 
@@ -279,7 +305,9 @@ mod tests {
 
     #[test]
     fn absent_payload_keys_are_omitted() {
-        let d = DifyDocumentConverter::from_dify_record(&record(Some("x"), Some("d"), Some("s"), None)).unwrap();
+        let d =
+            DifyDocumentConverter::from_dify_record(&record(Some("x"), Some("d"), Some("s"), None))
+                .unwrap();
         assert!(d.payload().is_empty());
     }
 
@@ -303,8 +331,20 @@ mod tests {
 
     #[test]
     fn deterministic_ids_are_derived_from_doc_chunk_and_content() {
-        let a = DifyDocumentConverter::from_dify_record(&record(Some("same"), Some("d"), Some("s"), Some(0.1))).unwrap();
-        let b = DifyDocumentConverter::from_dify_record(&record(Some("same"), Some("d"), Some("s"), Some(0.9))).unwrap();
+        let a = DifyDocumentConverter::from_dify_record(&record(
+            Some("same"),
+            Some("d"),
+            Some("s"),
+            Some(0.1),
+        ))
+        .unwrap();
+        let b = DifyDocumentConverter::from_dify_record(&record(
+            Some("same"),
+            Some("d"),
+            Some("s"),
+            Some(0.9),
+        ))
+        .unwrap();
         assert_eq!(a.id, b.id);
     }
 }

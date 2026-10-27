@@ -1,4 +1,4 @@
-﻿//! # agentscope-extensions-mem
+//! # agentscope-extensions-mem
 //!
 //! Rust port of the AgentScope Java `agentscope-extensions-mem` aggregate module,
 //! covering three vendor long-term-memory backends:
@@ -44,9 +44,9 @@ pub use error::{MemError, Result};
 pub use http::{HttpTransport, ReqwestTransport};
 pub use mem0::{
     Mem0AddRequest, Mem0AddResponse, Mem0ApiType, Mem0Client, Mem0LongTermMemory,
-    Mem0LongTermMemoryConfig, Mem0Message, Mem0SearchRequest, Mem0SearchResponse,
-    Mem0SearchResult, PLATFORM_MEMORIES_ENDPOINT, PLATFORM_SEARCH_ENDPOINT,
-    SELF_HOSTED_MEMORIES_ENDPOINT, SELF_HOSTED_SEARCH_ENDPOINT,
+    Mem0LongTermMemoryConfig, Mem0Message, Mem0SearchRequest, Mem0SearchResponse, Mem0SearchResult,
+    PLATFORM_MEMORIES_ENDPOINT, PLATFORM_SEARCH_ENDPOINT, SELF_HOSTED_MEMORIES_ENDPOINT,
+    SELF_HOSTED_SEARCH_ENDPOINT,
 };
 pub use reme::{
     ReMeAddRequest, ReMeAddResponse, ReMeClient, ReMeLongTermMemory, ReMeMemoryItem, ReMeMessage,

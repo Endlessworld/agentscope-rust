@@ -55,7 +55,10 @@ async fn inactive_group_blocks_call() {
     tk.update_tool_groups(&["g2".to_string()], false);
 
     let call = ToolUseBlock::new("call-1", "c", JsonMap::new());
-    let err = tk.call_tool(&call, ToolExecutionContext::default()).await.unwrap_err();
+    let err = tk
+        .call_tool(&call, ToolExecutionContext::default())
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("not available"), "got: {err}");
 }
 
@@ -69,8 +72,14 @@ async fn validation_rejects_missing_required() {
         Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
     )));
     let call = ToolUseBlock::new("call-1", "need", JsonMap::new());
-    let err = tk.call_tool(&call, ToolExecutionContext::default()).await.unwrap_err();
-    assert!(err.to_string().contains("Parameter validation failed"), "got: {err}");
+    let err = tk
+        .call_tool(&call, ToolExecutionContext::default())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Parameter validation failed"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -87,7 +96,10 @@ async fn preset_parameters_override_input() {
     )));
     tk.set_preset_parameters("greet", parse_args(r#"{"name": "preset"}"#));
     let call = ToolUseBlock::new("call-1", "greet", parse_args(r#"{"name": "llm"}"#));
-    let res = tk.call_tool(&call, ToolExecutionContext::default()).await.unwrap();
+    let res = tk
+        .call_tool(&call, ToolExecutionContext::default())
+        .await
+        .unwrap();
     assert_eq!(res.text_content(), "name=preset");
 }
 
@@ -96,7 +108,10 @@ async fn deletion_protection_disabled() {
     let tk = Toolkit::with_config(ToolkitConfig::builder().allow_tool_deletion(false).build());
     tk.register_tool(text_tool("x"));
     tk.remove_tool("x");
-    assert!(tk.get_tool("x").is_some(), "tool must survive when deletion is disabled");
+    assert!(
+        tk.get_tool("x").is_some(),
+        "tool must survive when deletion is disabled"
+    );
 }
 
 /// A tool whose call sleeps, used to exercise the timeout path.
@@ -104,9 +119,15 @@ struct SleepyTool;
 
 #[async_trait]
 impl Tool for SleepyTool {
-    fn name(&self) -> &str { "sleepy" }
-    fn description(&self) -> &str { "sleeps" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+    fn name(&self) -> &str {
+        "sleepy"
+    }
+    fn description(&self) -> &str {
+        "sleeps"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
     async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         tokio::time::sleep(Duration::from_millis(300)).await;
         Ok(ToolResultBlock::text("done"))
@@ -122,7 +143,10 @@ async fn timeout_aborts_slow_tool() {
     let tk = Toolkit::with_config(ToolkitConfig::builder().execution_config(cfg).build());
     tk.register_tool(Arc::new(SleepyTool));
     let call = ToolUseBlock::new("call-1", "sleepy", JsonMap::new());
-    let err = tk.call_tool(&call, ToolExecutionContext::default()).await.unwrap_err();
+    let err = tk
+        .call_tool(&call, ToolExecutionContext::default())
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("timeout"), "got: {err}");
 }
 
@@ -133,9 +157,15 @@ struct FlakyTool {
 
 #[async_trait]
 impl Tool for FlakyTool {
-    fn name(&self) -> &str { "flaky" }
-    fn description(&self) -> &str { "flaky" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+    fn name(&self) -> &str {
+        "flaky"
+    }
+    fn description(&self) -> &str {
+        "flaky"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
     async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
@@ -155,9 +185,14 @@ async fn retry_succeeds_after_transient_error() {
         .build();
     let tk = Toolkit::with_config(ToolkitConfig::builder().execution_config(cfg).build());
     let calls = Arc::new(AtomicU32::new(0));
-    tk.register_tool(Arc::new(FlakyTool { calls: Arc::clone(&calls) }));
+    tk.register_tool(Arc::new(FlakyTool {
+        calls: Arc::clone(&calls),
+    }));
     let call = ToolUseBlock::new("call-1", "flaky", JsonMap::new());
-    let res = tk.call_tool(&call, ToolExecutionContext::default()).await.unwrap();
+    let res = tk
+        .call_tool(&call, ToolExecutionContext::default())
+        .await
+        .unwrap();
     assert_eq!(res.text_content(), "ok");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
@@ -171,14 +206,27 @@ struct UnsafeTool {
 
 #[async_trait]
 impl Tool for UnsafeTool {
-    fn name(&self) -> &str { "unsafe" }
-    fn description(&self) -> &str { "unsafe" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-    fn is_concurrency_safe(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "unsafe"
+    }
+    fn description(&self) -> &str {
+        "unsafe"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
     async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         let mut peak = self.peak.load(Ordering::SeqCst);
-        while cur > peak && self.peak.compare_exchange(peak, cur, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        while cur > peak
+            && self
+                .peak
+                .compare_exchange(peak, cur, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
             peak = self.peak.load(Ordering::SeqCst);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -196,14 +244,27 @@ struct SafeTool {
 
 #[async_trait]
 impl Tool for SafeTool {
-    fn name(&self) -> &str { "safe" }
-    fn description(&self) -> &str { "safe" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-    fn is_concurrency_safe(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "safe"
+    }
+    fn description(&self) -> &str {
+        "safe"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
     async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         let mut peak = self.peak.load(Ordering::SeqCst);
-        while cur > peak && self.peak.compare_exchange(peak, cur, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        while cur > peak
+            && self
+                .peak
+                .compare_exchange(peak, cur, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
             peak = self.peak.load(Ordering::SeqCst);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -221,7 +282,10 @@ async fn parallel_partitions_unsafe_tools_into_serial_slots() {
     let in_flight = Arc::new(AtomicU32::new(0));
     let peak = Arc::new(AtomicU32::new(0));
     let tk = Toolkit::new();
-    tk.register_tool(Arc::new(UnsafeTool { in_flight: Arc::clone(&in_flight), peak: Arc::clone(&peak) }));
+    tk.register_tool(Arc::new(UnsafeTool {
+        in_flight: Arc::clone(&in_flight),
+        peak: Arc::clone(&peak),
+    }));
 
     let calls = vec![call("unsafe", 1), call("unsafe", 2), call("unsafe", 3)];
     let results = tk
@@ -229,7 +293,11 @@ async fn parallel_partitions_unsafe_tools_into_serial_slots() {
         .await;
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|r| r.is_ok()), "got: {results:?}");
-    assert_eq!(peak.load(Ordering::SeqCst), 1, "unsafe tools must be serialized");
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "unsafe tools must be serialized"
+    );
 }
 
 #[tokio::test]
@@ -237,7 +305,10 @@ async fn parallel_safe_tools_overlap_but_keep_order() {
     let in_flight = Arc::new(AtomicU32::new(0));
     let peak = Arc::new(AtomicU32::new(0));
     let tk = Toolkit::new();
-    tk.register_tool(Arc::new(SafeTool { in_flight: Arc::clone(&in_flight), peak: Arc::clone(&peak) }));
+    tk.register_tool(Arc::new(SafeTool {
+        in_flight: Arc::clone(&in_flight),
+        peak: Arc::clone(&peak),
+    }));
 
     let calls = vec![call("safe", 1), call("safe", 2), call("safe", 3)];
     let results = tk
@@ -245,7 +316,10 @@ async fn parallel_safe_tools_overlap_but_keep_order() {
         .await;
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|r| r.is_ok()), "got: {results:?}");
-    assert!(peak.load(Ordering::SeqCst) >= 2, "safe tools should overlap");
+    assert!(
+        peak.load(Ordering::SeqCst) >= 2,
+        "safe tools should overlap"
+    );
     let texts: Vec<String> = results
         .iter()
         .map(|r| r.as_ref().unwrap().text_content())
@@ -256,7 +330,10 @@ async fn parallel_safe_tools_overlap_but_keep_order() {
 #[tokio::test]
 async fn parallel_mixed_partitions_respect_declared_order() {
     let tk = Toolkit::new();
-    tk.register_tool(Arc::new(UnsafeTool { in_flight: Arc::new(AtomicU32::new(0)), peak: Arc::new(AtomicU32::new(0)) }));
+    tk.register_tool(Arc::new(UnsafeTool {
+        in_flight: Arc::new(AtomicU32::new(0)),
+        peak: Arc::new(AtomicU32::new(0)),
+    }));
     let safe = FunctionTool::new(
         "safe",
         "safe",
@@ -292,7 +369,10 @@ async fn parallel_mixed_partitions_respect_declared_order() {
 #[tokio::test]
 async fn sequential_mode_runs_in_order() {
     let tk = Toolkit::new();
-    tk.register_tool(Arc::new(UnsafeTool { in_flight: Arc::new(AtomicU32::new(0)), peak: Arc::new(AtomicU32::new(0)) }));
+    tk.register_tool(Arc::new(UnsafeTool {
+        in_flight: Arc::new(AtomicU32::new(0)),
+        peak: Arc::new(AtomicU32::new(0)),
+    }));
     let calls = vec![call("unsafe", 1), call("unsafe", 2)];
     let results = tk
         .call_tools_with_config(&calls, ToolExecutionContext::default(), None, false)

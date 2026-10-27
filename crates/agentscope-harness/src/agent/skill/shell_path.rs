@@ -30,7 +30,11 @@ pub struct ShellPathPolicy {
 
 impl ShellPathPolicy {
     pub fn no_shell() -> Self {
-        Self { mode: Mode::NoShell, workspace_root: None, sandbox_prefix: SANDBOX_WORKSPACE_PREFIX.to_string() }
+        Self {
+            mode: Mode::NoShell,
+            workspace_root: None,
+            sandbox_prefix: SANDBOX_WORKSPACE_PREFIX.to_string(),
+        }
     }
 
     pub fn sandbox() -> Self {
@@ -43,11 +47,19 @@ impl ShellPathPolicy {
         } else {
             workspace_prefix.to_string()
         };
-        Self { mode: Mode::Sandbox, workspace_root: None, sandbox_prefix: prefix }
+        Self {
+            mode: Mode::Sandbox,
+            workspace_root: None,
+            sandbox_prefix: prefix,
+        }
     }
 
     pub fn local_with_shell(workspace_root: PathBuf) -> Self {
-        Self { mode: Mode::LocalWithShell, workspace_root: Some(workspace_root), sandbox_prefix: SANDBOX_WORKSPACE_PREFIX.to_string() }
+        Self {
+            mode: Mode::LocalWithShell,
+            workspace_root: Some(workspace_root),
+            sandbox_prefix: SANDBOX_WORKSPACE_PREFIX.to_string(),
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -64,18 +76,28 @@ impl ShellPathPolicy {
         match stage {
             StageResult::None => None,
             StageResult::WorkspaceNative => self.join_skills(skill_name),
-            StageResult::Cached { source_namespace, skill_name: cached_name } => {
-                self.join_cache(source_namespace, cached_name)
-            }
+            StageResult::Cached {
+                source_namespace,
+                skill_name: cached_name,
+            } => self.join_cache(source_namespace, cached_name),
         }
     }
 
     fn join_skills(&self, skill_name: &str) -> Option<String> {
         match self.mode {
-            Mode::Sandbox => Some(escape_spaces(&format!("{}/skills/{skill_name}", self.sandbox_prefix))),
+            Mode::Sandbox => Some(escape_spaces(&format!(
+                "{}/skills/{skill_name}",
+                self.sandbox_prefix
+            ))),
             Mode::LocalWithShell => {
                 let root = self.workspace_root.as_ref()?;
-                Some(escape_spaces(&root.join("skills").join(skill_name).to_string_lossy().replace('\\', "/")))
+                Some(escape_spaces(
+                    &root
+                        .join("skills")
+                        .join(skill_name)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                ))
             }
             Mode::NoShell => None,
         }
@@ -90,12 +112,14 @@ impl ShellPathPolicy {
             ))),
             Mode::LocalWithShell => {
                 let root = self.workspace_root.as_ref()?;
-                Some(escape_spaces(&root
-                    .join(super::stager::CACHE_DIR)
-                    .join(source_ns)
-                    .join(skill_name)
-                    .to_string_lossy()
-                    .replace('\\', "/")))
+                Some(escape_spaces(
+                    &root
+                        .join(super::stager::CACHE_DIR)
+                        .join(source_ns)
+                        .join(skill_name)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                ))
             }
             Mode::NoShell => None,
         }
@@ -113,7 +137,10 @@ mod tests {
     use super::*;
 
     fn cached(ns: &str, name: &str) -> StageResult {
-        StageResult::Cached { source_namespace: ns.to_string(), skill_name: name.to_string() }
+        StageResult::Cached {
+            source_namespace: ns.to_string(),
+            skill_name: name.to_string(),
+        }
     }
 
     #[test]
@@ -143,7 +170,9 @@ mod tests {
     fn local_with_shell_uses_abs_path() {
         let root = PathBuf::from("/home/user/ws");
         let p = ShellPathPolicy::local_with_shell(root);
-        let out = p.resolve("data", Some(&StageResult::WorkspaceNative)).unwrap();
+        let out = p
+            .resolve("data", Some(&StageResult::WorkspaceNative))
+            .unwrap();
         assert_eq!(out, "/home/user/ws/skills/data");
     }
 

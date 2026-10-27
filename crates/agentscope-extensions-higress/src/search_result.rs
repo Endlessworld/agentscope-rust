@@ -53,7 +53,11 @@ pub struct HigressToolSearchResult {
 
 impl HigressToolSearchResult {
     fn new(tools: Vec<HigressToolInfo>, success: bool, error_message: Option<String>) -> Self {
-        Self { tools, success, error_message }
+        Self {
+            tools,
+            success,
+            error_message,
+        }
     }
 
     fn success(tools: Vec<HigressToolInfo>) -> Self {
@@ -79,10 +83,7 @@ impl HigressToolSearchResult {
             match Self::parse_from_structured_content(structured) {
                 Ok(result) => return result,
                 Err(err) => {
-                    tracing::debug!(
-                        "Failed to parse structuredContent, trying content: {}",
-                        err
-                    );
+                    tracing::debug!("Failed to parse structuredContent, trying content: {}", err);
                 }
             }
         }
@@ -121,14 +122,12 @@ impl HigressToolSearchResult {
     }
 
     /// Parses from the list of MCP content blocks (text JSON).
-    fn parse_from_content(
-        content: &[ContentBlock],
-    ) -> std::result::Result<Self, String> {
+    fn parse_from_content(content: &[ContentBlock]) -> std::result::Result<Self, String> {
         for block in content {
             if let ContentBlock::TextContent(text) = block {
                 if !text.text.is_empty() {
-                    let response: ToolSearchResponse = serde_json::from_str(&text.text)
-                        .map_err(|e| e.to_string())?;
+                    let response: ToolSearchResponse =
+                        serde_json::from_str(&text.text).map_err(|e| e.to_string())?;
                     if let Some(tools) = response.tools {
                         let infos = tools
                             .into_iter()
@@ -150,7 +149,10 @@ impl HigressToolSearchResult {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            description: map.get("description").and_then(|v| v.as_str()).map(String::from),
+            description: map
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             title: map.get("title").and_then(|v| v.as_str()).map(String::from),
             input_schema: map.get("inputSchema").filter(|v| !v.is_null()).cloned(),
             output_schema: map.get("outputSchema").filter(|v| !v.is_null()).cloned(),
@@ -187,7 +189,11 @@ impl std::fmt::Display for HigressToolSearchResult {
                 self.error_message.as_deref().unwrap_or_default()
             )
         } else {
-            write!(f, "HigressToolSearchResult{{tools={:?}}}", self.tool_names())
+            write!(
+                f,
+                "HigressToolSearchResult{{tools={:?}}}",
+                self.tool_names()
+            )
         }
     }
 }
@@ -286,7 +292,10 @@ mod tests {
 
         let parsed = HigressToolSearchResult::parse(&result);
         assert!(!parsed.is_success());
-        assert_eq!(parsed.error_message(), Some("No content in tool search result"));
+        assert_eq!(
+            parsed.error_message(),
+            Some("No content in tool search result")
+        );
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub struct OssSandboxExecutionGuard {
 impl OssSandboxExecutionGuard {
     /// Creates a new guard.
     pub fn new() -> Self {
-        Self { inner: Arc::new(SandboxExecutionGuard::new()) }
+        Self {
+            inner: Arc::new(SandboxExecutionGuard::new()),
+        }
     }
 
     /// Creates a guard from an existing harness guard (shared handle).

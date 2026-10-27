@@ -41,7 +41,6 @@ pub enum FlushMode {
     Throttled,
 }
 
-
 /// Trigger policy for the per-call flush hook.
 ///
 /// `throttled(Duration::zero())` normalizes to `always()` so callers do not need a
@@ -55,12 +54,18 @@ pub struct FlushTrigger {
 impl FlushTrigger {
     /// Flush after every agent call.
     pub fn always() -> Self {
-        Self { mode: FlushMode::Always, min_gap: ChronoDuration::zero() }
+        Self {
+            mode: FlushMode::Always,
+            min_gap: ChronoDuration::zero(),
+        }
     }
 
     /// Disable per-call flush entirely (offload still runs).
     pub fn never() -> Self {
-        Self { mode: FlushMode::Never, min_gap: ChronoDuration::zero() }
+        Self {
+            mode: FlushMode::Never,
+            min_gap: ChronoDuration::zero(),
+        }
     }
 
     /// Flush at most once per `min_gap`. A zero gap normalizes to [`Self::always`].
@@ -68,7 +73,10 @@ impl FlushTrigger {
         if min_gap.is_zero() {
             return Self::always();
         }
-        Self { mode: FlushMode::Throttled, min_gap }
+        Self {
+            mode: FlushMode::Throttled,
+            min_gap,
+        }
     }
 
     pub fn mode(&self) -> FlushMode {
@@ -181,7 +189,10 @@ impl MemoryConfigBuilder {
         self
     }
     pub fn consolidation_min_gap(mut self, v: ChronoDuration) -> Self {
-        assert!(v >= ChronoDuration::zero(), "consolidation_min_gap must not be negative");
+        assert!(
+            v >= ChronoDuration::zero(),
+            "consolidation_min_gap must not be negative"
+        );
         self.consolidation_min_gap = v;
         self
     }
@@ -261,12 +272,17 @@ mod tests {
         let ok = MemoryConfig::builder()
             .consolidation_prompt("budget %d tokens (~%d chars)")
             .build();
-        assert_eq!(ok.consolidation_prompt.as_deref(), Some("budget %d tokens (~%d chars)"));
+        assert_eq!(
+            ok.consolidation_prompt.as_deref(),
+            Some("budget %d tokens (~%d chars)")
+        );
     }
 
     #[test]
     #[should_panic]
     fn builder_rejects_wrong_placeholder_count() {
-        MemoryConfig::builder().consolidation_prompt("only one %d").build();
+        MemoryConfig::builder()
+            .consolidation_prompt("only one %d")
+            .build();
     }
 }

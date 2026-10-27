@@ -26,26 +26,29 @@ use agentscope_core::tool::{Tool, Toolkit};
 use crate::filesystem::{Filesystem, LocalFilesystem};
 
 use super::artifact::ArtifactDeliveryTarget;
+use super::bus::{AsyncToolRegistry, MessageBus, WorkspaceAsyncToolRegistry, WorkspaceMessageBus};
 use super::distributed_store::DistributedStore;
 use super::isolation_scope::IsolationScope;
 use super::memory::compaction::{CompactionConfig, ConversationCompactor};
-use super::memory::{MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig};
+use super::memory::{
+    MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig,
+};
 use super::middleware::{
     AgentTraceMiddleware, AtPathExpansionMiddleware, ConversationCompactionMiddleware,
     DynamicSubagentsMiddleware, HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware,
     MemoryMaintenanceMiddleware, PlanModeConfig, PlanModeMiddleware, SkillCuratorMiddleware,
     SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware, TeamsMiddleware,
-    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware,
-    WorkspaceContextMiddleware,
+    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
 };
 use super::skill::{
-    build_promoter, compose_skill_repositories, AuditEntry, default_gate, FilesystemSkillUsageStore,
-    LazyLoadSkillTool, ProposeSkillTool, SkillAuditLog, SkillCurator, SkillCuratorConfig, SkillFilter,
-    SkillManageConfig, SkillManageTool, SkillPromoter, SkillPromotionGate, SkillRepository,
-    SkillUsageStore, SkillVisibilityFilter, WorkspaceSkillRepository,
+    build_promoter, compose_skill_repositories, default_gate, AuditEntry,
+    FilesystemSkillUsageStore, LazyLoadSkillTool, ProposeSkillTool, SkillAuditLog, SkillCurator,
+    SkillCuratorConfig, SkillFilter, SkillManageConfig, SkillManageTool, SkillPromoter,
+    SkillPromotionGate, SkillRepository, SkillUsageStore, SkillVisibilityFilter,
+    WorkspaceSkillRepository,
 };
-use super::subagent::task::WorkspaceTaskRepository;
 use super::subagent::task::repository::TaskRepository;
+use super::subagent::task::WorkspaceTaskRepository;
 use super::subagent::{
     CustomSubagentFactory, DefaultAgentManager, SubagentBlueprint, SubagentDeclaration,
     SubagentEntry,
@@ -54,7 +57,6 @@ use super::team::{TeamClient, TeamContext};
 use super::workspace::{
     PlanModeManager, WorkspaceIndex, WorkspaceManager, WorkspacePathNormalizer,
 };
-use super::bus::{MessageBus, WorkspaceMessageBus, WorkspaceAsyncToolRegistry, AsyncToolRegistry};
 use crate::tool::{
     AgentListTool, AgentSendTool, AgentSpawnTool, ArtifactDeliveryTool, FilesystemTool,
     MemoryGetTool, MemorySaveTool, MemorySearchTool, PlanModeHandle, SessionSearchTool,
@@ -215,7 +217,10 @@ impl HarnessAgent {
     ///
     /// Opening a reader never acquires a writer or repairs history, so this is safe to call
     /// while another call is running.
-    pub async fn session_log(&self, context: &RuntimeContext) -> crate::Result<Arc<dyn SessionLog>> {
+    pub async fn session_log(
+        &self,
+        context: &RuntimeContext,
+    ) -> crate::Result<Arc<dyn SessionLog>> {
         match self.agent.as_ref() {
             Some(agent) if agent.session_log_enabled() => agent.session_log(context).await,
             _ => Err(crate::Error::Session(
@@ -239,7 +244,10 @@ impl HarnessAgent {
     /// The journal is the durable authority for native sessions; the in-memory registry only
     /// knows sessions this process created. A client that restarts must still see its history,
     /// so this reads the store's session index instead of the registry.
-    pub async fn list_session_keys(&self, context: &RuntimeContext) -> crate::Result<Vec<SessionKey>> {
+    pub async fn list_session_keys(
+        &self,
+        context: &RuntimeContext,
+    ) -> crate::Result<Vec<SessionKey>> {
         let store = self
             .session_log_store
             .as_ref()
@@ -249,10 +257,7 @@ impl HarnessAgent {
 
     /// Reads the replayable transcript of the session bound to `context`. Mirrors Java
     /// `HarnessAgent.sessionTranscript(RuntimeContext)`.
-    pub async fn session_transcript(
-        &self,
-        context: &RuntimeContext,
-    ) -> crate::Result<Transcript> {
+    pub async fn session_transcript(&self, context: &RuntimeContext) -> crate::Result<Transcript> {
         let log = self.session_log(context).await?;
         agentscope_core::session::transcript(&*log).await
     }
@@ -333,12 +338,20 @@ impl HarnessAgent {
     /// Runs the skill curator once (no-op when the curator is not enabled).
     pub fn run_curator_once(&self) -> Option<super::skill::CuratorRunReport> {
         let curator = self.skill_curator.as_ref()?;
-        Some(futures::executor::block_on(curator.run_once(chrono::Utc::now())))
+        Some(futures::executor::block_on(
+            curator.run_once(chrono::Utc::now()),
+        ))
     }
 
     /// Promotes a draft skill (invalid result when no promotion loop is configured).
-    pub fn promote_skill(&self, name: &str, reviewer_id: &str) -> Option<super::skill::PromotionResult> {
-        self.skill_promoter.as_ref().map(|p| p.promote(name, reviewer_id))
+    pub fn promote_skill(
+        &self,
+        name: &str,
+        reviewer_id: &str,
+    ) -> Option<super::skill::PromotionResult> {
+        self.skill_promoter
+            .as_ref()
+            .map(|p| p.promote(name, reviewer_id))
     }
 
     /// Streams agent events for the given messages through the embedded ReAct agent.
@@ -412,7 +425,10 @@ impl HarnessAgent {
     /// Interrupts execution only when the current session matches `session_id`.
     /// Returns `true` if the interrupt was triggered for that session.
     pub fn interrupt_session(&self, session_id: &str) -> bool {
-        self.agent.as_ref().map(|a| a.interrupt_session(session_id)).unwrap_or(false)
+        self.agent
+            .as_ref()
+            .map(|a| a.interrupt_session(session_id))
+            .unwrap_or(false)
     }
 
     /// Interrupts one specific run, if it is still the one in flight.
@@ -437,7 +453,10 @@ impl HarnessAgent {
     /// Clears the model-visible context for the session identified by `session_id`.
     /// Returns `true` when that session's context was cleared.
     pub fn clear_context_for(&self, session_id: &str) -> bool {
-        self.agent.as_ref().map(|a| a.clear_context_for(session_id)).unwrap_or(false)
+        self.agent
+            .as_ref()
+            .map(|a| a.clear_context_for(session_id))
+            .unwrap_or(false)
     }
 
     /// Replaces the model bound to the embedded ReAct agent. The next reasoning
@@ -513,9 +532,7 @@ impl CallableAgent for HarnessAgent {
 
 /// Error returned when a `HarnessAgent` was built without a model.
 fn no_model_error() -> agentscope_core::error::Error {
-    agentscope_core::error::Error::Agent(
-        "HarnessAgent has no model configured; cannot run".into(),
-    )
+    agentscope_core::error::Error::Agent("HarnessAgent has no model configured; cannot run".into())
 }
 
 /// Builder for `HarnessAgent`.
@@ -835,11 +852,7 @@ impl HarnessAgentBuilder {
     }
 
     /// Registers a stable instruction (trusted System material) for the context compiler.
-    pub fn instruction(
-        mut self,
-        id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
+    pub fn instruction(mut self, id: impl Into<String>, content: impl Into<String>) -> Self {
         match self.context_sources.clone().with_instruction(id, content) {
             Ok(next) => self.context_sources = next,
             Err(error) => self.context_source_error = Some(error.to_string()),
@@ -900,10 +913,7 @@ impl HarnessAgentBuilder {
     /// This is the Java `HarnessAgent.Builder.compaction(CompactionConfig)` equivalent:
     /// at the start of each agent call the accumulated history is summarized (LLM)
     /// and replaced with `[summary] + preserved tail` once it exceeds the trigger.
-    pub fn compaction(
-        mut self,
-        config: super::memory::compaction::CompactionConfig,
-    ) -> Self {
+    pub fn compaction(mut self, config: super::memory::compaction::CompactionConfig) -> Self {
         self.conversation_compaction_config = Some(config);
         self
     }
@@ -1114,7 +1124,8 @@ impl HarnessAgentBuilder {
     /// Enables the self-learning tools with the given auto-promote flag.
     pub fn enable_skill_manage_tool_auto_promote(mut self, auto_promote: bool) -> Self {
         self.skill_manage_enabled = true;
-        self.skill_manage_config = Some(SkillManageConfig::defaults().with_auto_promote(auto_promote));
+        self.skill_manage_config =
+            Some(SkillManageConfig::defaults().with_auto_promote(auto_promote));
         self
     }
 
@@ -1263,10 +1274,7 @@ impl HarnessAgentBuilder {
     /// Mirrors Java `HarnessAgent.Builder.artifactDeliveryTarget`: when set, the
     /// tool is registered and the sandbox workspace prompt receives the File
     /// Isolation Notice.
-    pub fn artifact_delivery_target(
-        mut self,
-        target: Arc<dyn ArtifactDeliveryTarget>,
-    ) -> Self {
+    pub fn artifact_delivery_target(mut self, target: Arc<dyn ArtifactDeliveryTarget>) -> Self {
         self.artifact_delivery_target = Some(target);
         self
     }
@@ -1341,7 +1349,10 @@ impl HarnessAgentBuilder {
         let name = self.name.clone().unwrap_or_else(|| "agent".to_string());
         let agent_id = self.agent_id.clone().unwrap_or_else(|| name.clone());
         let description = self.description.clone();
-        let environment = self.environment.clone().unwrap_or_else(|| "prod".to_string());
+        let environment = self
+            .environment
+            .clone()
+            .unwrap_or_else(|| "prod".to_string());
 
         // Toolkit deep-copy: each agent gets its own toolkit so harness-registered tools
         // never bleed across builds. A caller-supplied base toolkit is copied in first so
@@ -1448,10 +1459,7 @@ impl HarnessAgentBuilder {
 
         // ---- Memory pipeline (flush + consolidation + maintenance) ----
         let memory_config = self.memory_config.clone().unwrap_or_default();
-        let memory_model = memory_config
-            .model
-            .clone()
-            .or_else(|| self.model.clone());
+        let memory_model = memory_config.model.clone().or_else(|| self.model.clone());
         if !self.disable_memory_hooks {
             if let Some(memory_model) = memory_model {
                 let flush_prompt = memory_config
@@ -1537,7 +1545,8 @@ impl HarnessAgentBuilder {
         }
 
         // ---- Agent teams (teamsMode) ----
-        if let (Some(client), Some(context)) = (self.teams_client.clone(), self.teams_context.clone())
+        if let (Some(client), Some(context)) =
+            (self.teams_client.clone(), self.teams_context.clone())
         {
             toolkit.register_tool(Arc::new(TeamTool::new(Arc::clone(&client))));
             middleware.add(Box::new(TeamsMiddleware::from_context(
@@ -1670,7 +1679,8 @@ impl HarnessAgentBuilder {
                 let curator = Arc::new(SkillCurator::new(
                     Arc::clone(&filesystem),
                     Arc::clone(&usage_store),
-                    self.skill_curator_config.unwrap_or_else(SkillCuratorConfig::defaults),
+                    self.skill_curator_config
+                        .unwrap_or_else(SkillCuratorConfig::defaults),
                     archive,
                 ));
                 pending_skill_curator = Some(Arc::clone(&curator));
@@ -1749,9 +1759,12 @@ impl HarnessAgentBuilder {
         if !self.disable_web_tools {
             match &self.web_http_client {
                 Some(client) => {
-                    toolkit.register_tool(Arc::new(WebFetchTool::from_env().with_client(client.clone())));
-                    toolkit
-                        .register_tool(Arc::new(WebSearchTool::from_env().with_client(client.clone())));
+                    toolkit.register_tool(Arc::new(
+                        WebFetchTool::from_env().with_client(client.clone()),
+                    ));
+                    toolkit.register_tool(Arc::new(
+                        WebSearchTool::from_env().with_client(client.clone()),
+                    ));
                 }
                 None => crate::tool::register_web_tools(&toolkit),
             }
@@ -1759,8 +1772,8 @@ impl HarnessAgentBuilder {
 
         // ---- Meta tool (reset_equipped_tools) ----
         if self.enable_meta_tool.unwrap_or(false) {
-            let meta = agentscope_core::tool::MetaToolFactory::new(&toolkit)
-                .create_reset_equipped_tools();
+            let meta =
+                agentscope_core::tool::MetaToolFactory::new(&toolkit).create_reset_equipped_tools();
             toolkit.register_tool(Arc::new(meta));
         }
 
@@ -1849,11 +1862,16 @@ impl HarnessAgentBuilder {
                 // `workspace/subagents/*.md` scan happens here (Java `buildSubagentEntries`).
                 let ws = resolved_workspace.to_string_lossy().to_string();
                 let dir = resolved_workspace.join(super::subagent::SUBAGENTS_DIR);
-                for decl in super::subagent::load_from_directory(&dir.to_string_lossy(), Some(&ws)) {
+                for decl in super::subagent::load_from_directory(&dir.to_string_lossy(), Some(&ws))
+                {
                     if let Some(factory) = blueprint.declared_factory(&decl) {
                         entries.push(
-                            SubagentEntry::new(decl.name.clone(), decl.description.clone(), factory)
-                                .with_declaration(decl),
+                            SubagentEntry::new(
+                                decl.name.clone(),
+                                decl.description.clone(),
+                                factory,
+                            )
+                            .with_declaration(decl),
                         );
                     }
                 }
@@ -1947,8 +1965,7 @@ impl HarnessAgentBuilder {
         if let Some(pipeline) = context_pipeline {
             let mut context_middleware = crate::agent::context::ContextMiddleware::new(pipeline);
             if let Some((compactor, config)) = overflow_compaction {
-                context_middleware = context_middleware
-                    .with_overflow_compaction(compactor, config);
+                context_middleware = context_middleware.with_overflow_compaction(compactor, config);
             }
             middleware.add(Box::new(context_middleware));
         }
@@ -1991,7 +2008,11 @@ impl HarnessAgentBuilder {
             if !self.sys_prompt.is_empty() {
                 agent_builder = agent_builder.sys_prompt(self.sys_prompt.clone());
             }
-            let max_iters = if self.max_iters > 0 { self.max_iters } else { DEFAULT_MAX_ITERS };
+            let max_iters = if self.max_iters > 0 {
+                self.max_iters
+            } else {
+                DEFAULT_MAX_ITERS
+            };
             agent_builder = agent_builder.max_iters(max_iters);
             if let Some(recovery) = self.enable_pending_tool_recovery {
                 agent_builder = agent_builder.enable_pending_tool_recovery(recovery);

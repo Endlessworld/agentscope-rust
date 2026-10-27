@@ -9,9 +9,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
-use agentscope_core::{
-    ChatResponse, Error, GenerateOptions, Model, Result, ToolSchema, Msg,
-};
+use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
 use crate::common::{HttpRequestSpec, SharedTransport};
 use crate::ollama::converter::{build_request, to_ollama_messages};
@@ -52,11 +50,8 @@ impl OllamaChatModel {
             .clone()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let descriptor = descriptor_for(
-            Some("ollama"),
-            &model_name,
-            configured_base_url.as_deref(),
-        );
+        let descriptor =
+            descriptor_for(Some("ollama"), &model_name, configured_base_url.as_deref());
         let context_window_size = descriptor
             .as_ref()
             .map(|descriptor| descriptor.context_window)
@@ -274,7 +269,10 @@ mod tests {
         assert_eq!(req.provider, "ollama");
     }
 
-    async fn collect(model: &OllamaChatModel, options: GenerateOptions) -> Vec<Result<ChatResponse>> {
+    async fn collect(
+        model: &OllamaChatModel,
+        options: GenerateOptions,
+    ) -> Vec<Result<ChatResponse>> {
         model
             .stream(vec![Msg::user("hi")], Vec::new(), options)
             .collect()
@@ -292,7 +290,10 @@ mod tests {
             "eval_count": 7
         }));
         let model = model_with(transport.clone());
-        let options = GenerateOptions { stream: Some(false), ..Default::default() };
+        let options = GenerateOptions {
+            stream: Some(false),
+            ..Default::default()
+        };
         let out = collect(&model, options).await;
 
         assert_eq!(out.len(), 1);
@@ -325,19 +326,25 @@ mod tests {
 
         // two text deltas + one terminal flush
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         assert_eq!(out[2].as_ref().unwrap().usage.output_tokens, 3);
         assert!(transport.last_request().unwrap().stream);
     }
 
     #[tokio::test]
     async fn error_frame_surfaces_as_model_error() {
-        let transport = MemoryTransport::with_response(
-            serde_json::json!({ "error": "model not found" }),
-        );
+        let transport =
+            MemoryTransport::with_response(serde_json::json!({ "error": "model not found" }));
         let model = model_with(transport);
-        let options = GenerateOptions { stream: Some(false), ..Default::default() };
+        let options = GenerateOptions {
+            stream: Some(false),
+            ..Default::default()
+        };
         let out = collect(&model, options).await;
         assert!(out[0].is_err());
     }

@@ -52,9 +52,7 @@ pub(crate) fn glob(args: &JsonMap) -> Result<Option<String>> {
     let glob = args.get("glob").and_then(|v| v.as_str());
     let ty = args.get("type").and_then(|v| v.as_str());
     match (glob, ty) {
-        (Some(_), Some(_)) => Err(Error::Tool(
-            "Specify either glob or type, not both".into(),
-        )),
+        (Some(_), Some(_)) => Err(Error::Tool("Specify either glob or type, not both".into())),
         (Some(g), None) => Ok(Some(g.to_string())),
         (None, Some(t)) => {
             let exts = TYPES

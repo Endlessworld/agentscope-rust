@@ -22,8 +22,9 @@ pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] =
 /// Supported audio extensions.
 pub const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3"];
 /// Supported video extensions.
-pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] =
-    &["mp4", "mpeg", "mpg", "mov", "avi", "webm", "wmv", "flv", "3gp", "3gpp"];
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mpeg", "mpg", "mov", "avi", "webm", "wmv", "flv", "3gp", "3gpp",
+];
 
 /// Returns `true` when `url` is a local file path (no recognized protocol scheme).
 pub fn is_local_file(url: &str) -> bool {
@@ -313,7 +314,10 @@ mod tests {
         assert_eq!(determine_media_type("a.mp3"), "audio/mp3");
         assert_eq!(determine_media_type("a.wav"), "audio/wav");
         assert_eq!(determine_media_type("a.mp4"), "video/mp4");
-        assert_eq!(determine_media_type("a.unknown"), "application/octet-stream");
+        assert_eq!(
+            determine_media_type("a.unknown"),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -357,8 +361,14 @@ mod tests {
         assert_eq!(determine_audio_format("a.ogg"), "mp3");
         assert_eq!(infer_audio_format_from_media_type(None), "mp3");
         assert_eq!(infer_audio_format_from_media_type(Some("audio/wav")), "wav");
-        assert_eq!(infer_audio_format_from_media_type(Some("audio/opus")), "opus");
-        assert_eq!(infer_audio_format_from_media_type(Some("audio/flac")), "flac");
+        assert_eq!(
+            infer_audio_format_from_media_type(Some("audio/opus")),
+            "opus"
+        );
+        assert_eq!(
+            infer_audio_format_from_media_type(Some("audio/flac")),
+            "flac"
+        );
     }
 
     #[test]
@@ -394,7 +404,9 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("agentscope_media_{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"hi").unwrap();
-        let data_url = url_to_base64_data_url(path.to_str().unwrap()).await.unwrap();
+        let data_url = url_to_base64_data_url(path.to_str().unwrap())
+            .await
+            .unwrap();
         assert!(data_url.starts_with("data:image/png;base64,"));
         std::fs::remove_file(&path).unwrap();
     }

@@ -65,11 +65,7 @@ impl ContextUsage {
 /// the caller has one). `tools` are the tool schemas that will be sent. `model` is the
 /// live model name; a usage record produced by a different model is ignored because its
 /// tokenizer does not apply.
-pub fn context_usage(
-    messages: &[Msg],
-    tools: &[ToolSchema],
-    model: Option<&str>,
-) -> ContextUsage {
+pub fn context_usage(messages: &[Msg], tools: &[ToolSchema], model: Option<&str>) -> ContextUsage {
     let estimator = ApproximateEstimator;
     let local_tokens = estimator
         .estimate(&EstimateInput::new(messages, tools))
@@ -186,10 +182,7 @@ mod tests {
 
     #[test]
     fn a_usage_from_another_model_is_ignored() {
-        let messages = vec![
-            Msg::user("hello"),
-            assistant_with_usage("model-a"),
-        ];
+        let messages = vec![Msg::user("hello"), assistant_with_usage("model-a")];
         let usage = context_usage(&messages, &[], Some("model-b"));
         assert!(!usage.is_provider_anchored());
         assert_eq!(usage.provider_input_tokens, None);

@@ -53,11 +53,17 @@ async fn memory_save_writes_memory_md_and_daily_ledger() {
     assert_eq!(out, "Saved 2 memories to MEMORY.md");
 
     let memory_md = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
-    assert!(memory_md.contains("User prefers dark mode"), "got: {memory_md}");
+    assert!(
+        memory_md.contains("User prefers dark mode"),
+        "got: {memory_md}"
+    );
     assert!(memory_md.contains("Project deadline is 2026-07-01"));
 
     // Daily ledger: memory/YYYY-MM-DD.md
-    let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
     let daily_path = dir.join("memory").join(format!("{today}.md"));
     let daily = std::fs::read_to_string(&daily_path).unwrap();
     assert!(daily.contains("## Memory Save"), "got: {daily}");
@@ -80,7 +86,11 @@ async fn memory_get_reads_line_range() {
     let save = MemorySaveTool::new(Arc::clone(&wm));
     let get = MemoryGetTool::new(Arc::clone(&wm));
 
-    run(&save, tool_args(&[("content", str_arg("- alpha\n- beta\n- gamma"))])).await;
+    run(
+        &save,
+        tool_args(&[("content", str_arg("- alpha\n- beta\n- gamma"))]),
+    )
+    .await;
 
     // MEMORY.md content is "\n- alpha\n- beta\n- gamma\n" → lines: ["", "- alpha", "- beta", "- gamma", ""]
     let out = run(
@@ -122,7 +132,10 @@ async fn memory_get_reports_missing_file_and_traversal() {
         ]),
     )
     .await;
-    assert!(traversal.contains("path traversal not allowed"), "got: {traversal}");
+    assert!(
+        traversal.contains("path traversal not allowed"),
+        "got: {traversal}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -134,13 +147,24 @@ async fn memory_search_finds_across_memory_files() {
     let save = MemorySaveTool::new(Arc::clone(&wm));
     let search = MemorySearchTool::new(Arc::clone(&wm));
 
-    run(&save, tool_args(&[("content", str_arg("- alpha\n- beta\n- gamma"))])).await;
+    run(
+        &save,
+        tool_args(&[("content", str_arg("- alpha\n- beta\n- gamma"))]),
+    )
+    .await;
 
     let found = run(&search, tool_args(&[("query", str_arg("BETA"))])).await;
-    assert!(found.contains("Source: MEMORY.md#3: - beta"), "got: {found}");
+    assert!(
+        found.contains("Source: MEMORY.md#3: - beta"),
+        "got: {found}"
+    );
     assert!(found.starts_with("Found "), "got: {found}");
 
-    let none = run(&search, tool_args(&[("query", str_arg("zzz-no-such-term"))])).await;
+    let none = run(
+        &search,
+        tool_args(&[("query", str_arg("zzz-no-such-term"))]),
+    )
+    .await;
     assert_eq!(none, "No matching memories found for: zzz-no-such-term");
 
     let empty = run(&search, tool_args(&[("query", str_arg("  "))])).await;

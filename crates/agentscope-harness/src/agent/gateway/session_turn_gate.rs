@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{OwnedMutexGuard, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 
 /// Thrown when a session turn gate cannot be acquired because another turn holds it.
 ///
@@ -17,7 +17,9 @@ pub struct TurnBusyException {
 
 impl TurnBusyException {
     pub fn new(gate_key: impl Into<String>) -> Self {
-        Self { gate_key: gate_key.into() }
+        Self {
+            gate_key: gate_key.into(),
+        }
     }
 
     /// The canonical session gate key that is busy.
@@ -62,10 +64,7 @@ impl SessionTurnGate {
 
     /// Non-blocking acquire: returns [`TurnBusyException`] when another turn holds
     /// the gate for `key`.
-    pub fn try_acquire(
-        &self,
-        key: &str,
-    ) -> Result<OwnedMutexGuard<()>, TurnBusyException> {
+    pub fn try_acquire(&self, key: &str) -> Result<OwnedMutexGuard<()>, TurnBusyException> {
         let m = self
             .gates
             .lock()
@@ -73,8 +72,7 @@ impl SessionTurnGate {
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone();
-        m.try_lock_owned()
-            .map_err(|_| TurnBusyException::new(key))
+        m.try_lock_owned().map_err(|_| TurnBusyException::new(key))
     }
 
     /// Non-blocking check: `true` when a turn is currently held for `key` (i.e. a

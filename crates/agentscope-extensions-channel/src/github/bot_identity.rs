@@ -101,7 +101,10 @@ impl GitHubBotIdentityResolver {
     /// exactly like the Java `if (id > 0 && login != null)` guard.
     pub fn parse_identity(body: &str) -> Option<BotIdentity> {
         let node: serde_json::Value = serde_json::from_str(body).ok()?;
-        let user_id = node.get("id").and_then(|v| v.as_i64()).unwrap_or(UNRESOLVED_USER_ID);
+        let user_id = node
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(UNRESOLVED_USER_ID);
         let login = node
             .get("login")
             .and_then(|v| v.as_str())
@@ -189,12 +192,7 @@ mod tests {
     use crate::common::PreparedResponse;
 
     fn resolver(transport: Arc<dyn HttpTransport>) -> GitHubBotIdentityResolver {
-        GitHubBotIdentityResolver::new(
-            "https://api.github.com",
-            "ghp_token",
-            None,
-            transport,
-        )
+        GitHubBotIdentityResolver::new("https://api.github.com", "ghp_token", None, transport)
     }
 
     #[test]
@@ -204,7 +202,10 @@ mod tests {
         assert_eq!(req.method, crate::common::HttpMethod::Get);
         assert_eq!(req.url, "https://api.github.com/user");
         assert_eq!(req.header_value("Authorization"), Some("Bearer ghp_token"));
-        assert_eq!(req.header_value("Accept"), Some("application/vnd.github+json"));
+        assert_eq!(
+            req.header_value("Accept"),
+            Some("application/vnd.github+json")
+        );
         assert_eq!(req.header_value("X-GitHub-Api-Version"), Some("2022-11-28"));
         assert_eq!(req.header_value("User-Agent"), Some("agentscope-builder"));
     }

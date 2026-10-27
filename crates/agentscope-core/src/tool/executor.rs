@@ -15,7 +15,9 @@ use super::validator::ToolValidator;
 pub struct ToolExecutor;
 
 impl ToolExecutor {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Executes a single tool call with the given config.
     ///
@@ -32,9 +34,9 @@ impl ToolExecutor {
         //    priority; EXTERNAL_ONLY hides the backend).
         let request_config = ctx.tool_request_config.clone();
         let view = request_config.as_deref();
-        let tool = toolkit.get_tool_with(&call.name, view).ok_or_else(|| {
-            Error::Tool(format!("Tool not found: {}", call.name))
-        })?;
+        let tool = toolkit
+            .get_tool_with(&call.name, view)
+            .ok_or_else(|| Error::Tool(format!("Tool not found: {}", call.name)))?;
         // 2. External short-circuit (suspended semantics).
         if tool.is_external() {
             return Err(Error::Tool(format!(
@@ -109,7 +111,6 @@ impl ToolExecutor {
     }
 }
 
-
 /// Executes a contiguous batch of concurrency-safe calls concurrently, appending
 /// the results (in declared order) to `out`.
 async fn run_safe_batch(
@@ -138,7 +139,9 @@ async fn execute_with_policy(
     input: JsonMap,
     config: Option<&ExecutionConfig>,
 ) -> Result<ToolResultBlock> {
-    let cfg = config.cloned().unwrap_or_else(ExecutionConfig::tool_defaults);
+    let cfg = config
+        .cloned()
+        .unwrap_or_else(ExecutionConfig::tool_defaults);
     let timeout = cfg.timeout;
     let max_attempts = cfg.max_attempts.unwrap_or(1);
     let mut attempt: u32 = 0;
@@ -146,7 +149,10 @@ async fn execute_with_policy(
         let fut = tool.call(input.clone(), ctx.clone());
         let result = match timeout {
             Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
-                Error::Tool(format!("Tool execution timeout after {:?} for '{}'", d, call.name))
+                Error::Tool(format!(
+                    "Tool execution timeout after {:?} for '{}'",
+                    d, call.name
+                ))
             })?,
             None => fut.await,
         };

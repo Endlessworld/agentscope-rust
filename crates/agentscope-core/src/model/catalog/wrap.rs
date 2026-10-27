@@ -10,9 +10,7 @@ use futures::stream::BoxStream;
 
 use crate::message::Msg;
 use crate::model::catalog::{ModelCatalog, ResolveRequest};
-use crate::model::{
-    ChatResponse, GenerateOptions, Model, ModelDescriptor, ToolSchema,
-};
+use crate::model::{ChatResponse, GenerateOptions, Model, ModelDescriptor, ToolSchema};
 
 /// Model wrapper carrying a resolved descriptor.
 pub struct CatalogAwareModel {
@@ -74,10 +72,9 @@ impl Model for CatalogAwareModel {
     }
 
     fn supports_native_structured_output_with_tools(&self) -> bool {
-        self.descriptor.structured_output.unwrap_or_else(|| {
-            self.inner
-                .supports_native_structured_output_with_tools()
-        })
+        self.descriptor
+            .structured_output
+            .unwrap_or_else(|| self.inner.supports_native_structured_output_with_tools())
     }
 
     fn supports_tool_choice_specific(&self) -> bool {

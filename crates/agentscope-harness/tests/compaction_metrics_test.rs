@@ -16,7 +16,9 @@ use agentscope_harness::{
 };
 
 fn messages(count: usize) -> Vec<Msg> {
-    (0..count).map(|i| Msg::user(format!("message number {i}"))).collect()
+    (0..count)
+        .map(|i| Msg::user(format!("message number {i}")))
+        .collect()
 }
 
 /// A compactor whose summarization fails, to exercise the failed path.
@@ -29,10 +31,14 @@ impl agentscope_core::model::Model for FailingModel {
         _messages: Vec<Msg>,
         _tools: Vec<agentscope_core::model::ToolSchema>,
         _options: agentscope_core::model::GenerateOptions,
-    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<agentscope_core::model::ChatResponse>>
-    {
+    ) -> futures::stream::BoxStream<
+        '_,
+        agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+    > {
         Box::pin(futures::stream::once(async {
-            Err(agentscope_core::error::Error::Model("summary failed".into()))
+            Err(agentscope_core::error::Error::Model(
+                "summary failed".into(),
+            ))
         }))
     }
 
@@ -47,7 +53,11 @@ async fn recorder() -> (Arc<SessionRecorder>, Arc<dyn SessionLog>) {
     let context = RuntimeContext::new().with_user_id("u");
     let key = SessionKey::new(Some("u"), "agent", "s1").unwrap();
     let log = store.open(&key, &context).await.unwrap();
-    let recorder = Arc::new(SessionRecorder::open(Arc::clone(&log), Some("turn")).await.unwrap());
+    let recorder = Arc::new(
+        SessionRecorder::open(Arc::clone(&log), Some("turn"))
+            .await
+            .unwrap(),
+    );
     (recorder, log)
 }
 
@@ -87,7 +97,10 @@ async fn completed_compaction_records_before_and_after_counts() {
         .find(|(kind, _)| kind == "compaction/start")
         .map(|(_, data)| data)
         .expect("compaction/start must be a durable fact");
-    assert_eq!(start["compactionId"], serde_json::json!(metrics.compaction_id));
+    assert_eq!(
+        start["compactionId"],
+        serde_json::json!(metrics.compaction_id)
+    );
     assert_eq!(
         start["inputMessages"].as_array().map(|a| a.len()),
         Some(input.len()),
@@ -100,7 +113,10 @@ async fn completed_compaction_records_before_and_after_counts() {
         .map(|(_, data)| data)
         .expect("compaction/end must be a durable fact");
     assert_eq!(end["status"], serde_json::json!("completed"));
-    assert_eq!(end["compactionId"], serde_json::json!(metrics.compaction_id));
+    assert_eq!(
+        end["compactionId"],
+        serde_json::json!(metrics.compaction_id)
+    );
     assert_eq!(end["beforeMsgCount"], serde_json::json!(input.len()));
     assert_eq!(
         end["beforeTokenCount"],
@@ -156,7 +172,10 @@ async fn below_trigger_records_the_input_counts_and_no_compaction() {
         .compact_if_needed_with_metrics(input.clone(), &cfg, "agent", "s1", Some(&recorder))
         .await
         .unwrap();
-    assert!(replacement.is_none(), "below the trigger nothing is rewritten");
+    assert!(
+        replacement.is_none(),
+        "below the trigger nothing is rewritten"
+    );
     // The effective history is still the input, so before == after.
     assert_eq!(metrics.after_msg_count, Some(input.len()));
     assert_eq!(metrics.after_token_count, Some(calculate_token(&input)));

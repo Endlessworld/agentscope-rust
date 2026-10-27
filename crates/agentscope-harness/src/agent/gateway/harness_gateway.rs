@@ -5,10 +5,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
+use async_trait::async_trait;
 
 use crate::agent::bus::MessageBus;
 
@@ -116,7 +116,10 @@ impl ChannelManager {
     }
 
     pub async fn register(&self, sink: Arc<dyn ChannelSink>) {
-        self.sinks.write().await.insert(sink.channel_id().to_string(), sink);
+        self.sinks
+            .write()
+            .await
+            .insert(sink.channel_id().to_string(), sink);
     }
 
     pub async fn get_channel(&self, channel_id: &str) -> Option<Arc<dyn ChannelSink>> {
@@ -141,7 +144,10 @@ impl ChannelManager {
                 }
             }
             None => {
-                tracing::warn!("no channel registered for '{}', dropping outbound", address.channel_id);
+                tracing::warn!(
+                    "no channel registered for '{}', dropping outbound",
+                    address.channel_id
+                );
             }
         }
     }
@@ -186,7 +192,10 @@ pub struct HarnessGateway {
 
 impl HarnessGateway {
     /// Creates a gateway with a channel manager and an optional message bus.
-    pub fn create(channel_manager: Option<Arc<ChannelManager>>, message_bus: Option<Arc<dyn MessageBus>>) -> Self {
+    pub fn create(
+        channel_manager: Option<Arc<ChannelManager>>,
+        message_bus: Option<Arc<dyn MessageBus>>,
+    ) -> Self {
         Self {
             channel_manager,
             message_bus,
@@ -254,13 +263,19 @@ impl HarnessGateway {
         let gate_key = ctx.canonical_key();
 
         let requested_agent_id = ctx.extra.get("agentId").cloned();
-        let agent = self.resolve_agent(requested_agent_id.as_deref()).await.ok_or_else(|| {
-            Error::Other("HarnessGateway.bind_main_agent must be called before run(...)".into())
-        })?;
+        let agent = self
+            .resolve_agent(requested_agent_id.as_deref())
+            .await
+            .ok_or_else(|| {
+                Error::Other("HarnessGateway.bind_main_agent must be called before run(...)".into())
+            })?;
 
         let session_id = self.resolve_session_id(&gate_key).await;
         if let Some(addr) = &outbound {
-            self.last_route_by_session.write().await.insert(session_id.clone(), addr.clone());
+            self.last_route_by_session
+                .write()
+                .await
+                .insert(session_id.clone(), addr.clone());
         }
 
         let turn_ctx = GatewayTurnContext {
@@ -277,7 +292,6 @@ impl HarnessGateway {
     }
 }
 
-
 impl HarnessGateway {
     /// Delivers proactive outbound messages via the session's last recorded route.
     /// Returns false when no route or no channel manager is available.
@@ -288,7 +302,12 @@ impl HarnessGateway {
         let Some(cm) = &self.channel_manager else {
             return false;
         };
-        let target = self.last_route_by_session.read().await.get(session_id).cloned();
+        let target = self
+            .last_route_by_session
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
         match target {
             Some(addr) => {
                 cm.deliver(&addr, messages).await;
@@ -318,14 +337,17 @@ impl HarnessGateway {
                 reply_to,
             },
         );
-        self.subagent_registry.read().await.register(SubagentRecord::new(
-            subagent_id.clone(),
-            agent_id,
-            session_id,
-            None,
-            None,
-            None,
-        ));
+        self.subagent_registry
+            .read()
+            .await
+            .register(SubagentRecord::new(
+                subagent_id.clone(),
+                agent_id,
+                session_id,
+                None,
+                None,
+                None,
+            ));
         subagent_id
     }
 
@@ -352,9 +374,10 @@ impl HarnessGateway {
     /// Routes messages directly to an exposed subagent session, bypassing normal
     /// binding-based routing. Returns the subagent's reply.
     pub async fn run_subagent(&self, subagent_id: &str, messages: Vec<Msg>) -> Result<Msg> {
-        let session = self.resolve_exposed(subagent_id).await.ok_or_else(|| {
-            Error::Other(format!("Unknown subagentId: {subagent_id}"))
-        })?;
+        let session = self
+            .resolve_exposed(subagent_id)
+            .await
+            .ok_or_else(|| Error::Other(format!("Unknown subagentId: {subagent_id}")))?;
         let gate_key = format!("subagent:{subagent_id}");
         let turn_ctx = GatewayTurnContext {
             session_id: session.session_id.clone(),
@@ -374,7 +397,12 @@ impl HarnessGateway {
 
     /// Whether the given session is currently inside a gated turn.
     pub async fn is_session_running(&self, session_id: &str) -> bool {
-        let gate_key = self.session_to_gate_key.read().await.get(session_id).cloned();
+        let gate_key = self
+            .session_to_gate_key
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
         match gate_key {
             Some(k) => self.session_turn_gate.is_running(&k).await,
             None => false,
@@ -384,19 +412,31 @@ impl HarnessGateway {
     /// Triggers a wakeup-driven run for an idle session (no user input); the agent's
     /// inbox middleware drains pending results. Returns `Ok(None)` for an unknown session.
     pub async fn run_wakeup(&self, user_id: Option<&str>, session_id: &str) -> Result<Option<Msg>> {
-        let gate_key = self.session_to_gate_key.read().await.get(session_id).cloned();
+        let gate_key = self
+            .session_to_gate_key
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
         let Some(gate_key) = gate_key else {
             return Ok(None);
         };
         let agent = self.resolve_agent(None).await.ok_or_else(|| {
-            Error::Other("HarnessGateway.bind_main_agent must be called before run_wakeup(...)".into())
+            Error::Other(
+                "HarnessGateway.bind_main_agent must be called before run_wakeup(...)".into(),
+            )
         })?;
         let turn_ctx = GatewayTurnContext {
             session_id: session_id.to_string(),
             gate_key: gate_key.clone(),
             msg_context: MsgContext::default_context(),
             user_id: user_id.map(str::to_string),
-            outbound: self.last_route_by_session.read().await.get(session_id).cloned(),
+            outbound: self
+                .last_route_by_session
+                .read()
+                .await
+                .get(session_id)
+                .cloned(),
             cancel: None,
         };
         let _guard = self.session_turn_gate.acquire(&gate_key).await;
@@ -447,7 +487,10 @@ impl HarnessGateway {
             .entry(gate_key.to_string())
             .or_insert_with(|| Self::generate_session_id(gate_key))
             .clone();
-        self.session_to_gate_key.write().await.insert(session_id.clone(), gate_key.to_string());
+        self.session_to_gate_key
+            .write()
+            .await
+            .insert(session_id.clone(), gate_key.to_string());
         session_id
     }
 
@@ -457,7 +500,9 @@ impl HarnessGateway {
         }
         let materializer = self.subagent_materializer.read().await.clone()?;
         let record = self.subagent_registry.read().await.find(subagent_id)?;
-        let agent = materializer.materialize(&record.agent_id, &record.session_id).await?;
+        let agent = materializer
+            .materialize(&record.agent_id, &record.session_id)
+            .await?;
         let rebuilt = ExposedSession {
             subagent_id: record.subagent_id.clone(),
             agent_id: record.agent_id,
@@ -466,7 +511,8 @@ impl HarnessGateway {
             reply_to: None,
         };
         let mut map = self.exposed_sessions.write().await;
-        map.entry(subagent_id.to_string()).or_insert(rebuilt.clone());
+        map.entry(subagent_id.to_string())
+            .or_insert(rebuilt.clone());
         map.get(subagent_id).cloned()
     }
 }

@@ -75,7 +75,10 @@ impl GitLabBotIdentityResolver {
     }
 
     pub fn identity(&self) -> BotIdentity {
-        self.identity.read().expect("identity lock poisoned").clone()
+        self.identity
+            .read()
+            .expect("identity lock poisoned")
+            .clone()
     }
 
     /// The bot's numeric user id, or `-1` when unresolved.
@@ -145,7 +148,10 @@ mod tests {
                 login: Some("glab-bot".to_string())
             })
         );
-        assert_eq!(GitLabBotIdentityResolver::parse_identity(r#"{"id":9}"#), None);
+        assert_eq!(
+            GitLabBotIdentityResolver::parse_identity(r#"{"id":9}"#),
+            None
+        );
         assert_eq!(
             GitLabBotIdentityResolver::parse_identity(r#"{"id":-3,"username":"b"}"#),
             None

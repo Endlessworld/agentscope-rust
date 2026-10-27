@@ -1,4 +1,4 @@
-﻿//! agentscope-extensions-higress — Higress AI Gateway tool-selection extension.
+//! agentscope-extensions-higress — Higress AI Gateway tool-selection extension.
 //!
 //! Ports `io.agentscope.extensions.higress` from AgentScope Java. Higress's
 //! unified MCP endpoint (`union-tools-search`) exposes a special
@@ -19,4 +19,3 @@ pub use client::{
 };
 pub use search_result::{HigressToolInfo, HigressToolSearchResult};
 pub use toolkit::HigressToolkit;
-

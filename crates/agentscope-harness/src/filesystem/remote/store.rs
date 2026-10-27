@@ -26,7 +26,11 @@ pub struct StoreItem {
 
 impl StoreItem {
     pub fn new(key: impl Into<String>, value: StoreValue, version: u64) -> Self {
-        Self { key: key.into(), value, version }
+        Self {
+            key: key.into(),
+            value,
+            version,
+        }
     }
 }
 
@@ -139,7 +143,11 @@ fn compound_key(namespace: &[String], key: &str) -> String {
 
 impl BaseStore for InMemoryStore {
     fn get(&self, namespace: &[String], key: &str) -> Option<StoreItem> {
-        self.store.lock().unwrap().get(&compound_key(namespace, key)).cloned()
+        self.store
+            .lock()
+            .unwrap()
+            .get(&compound_key(namespace, key))
+            .cloned()
     }
 
     fn put(&self, namespace: &[String], key: &str, value: StoreValue) {
@@ -187,7 +195,10 @@ impl BaseStore for InMemoryStore {
     }
 
     fn delete(&self, namespace: &[String], key: &str) {
-        self.store.lock().unwrap().remove(&compound_key(namespace, key));
+        self.store
+            .lock()
+            .unwrap()
+            .remove(&compound_key(namespace, key));
     }
 }
 
@@ -196,12 +207,19 @@ mod tests {
     use super::*;
 
     fn ns() -> Vec<String> {
-        vec!["sessions".to_string(), "s1".to_string(), "filesystem".to_string()]
+        vec![
+            "sessions".to_string(),
+            "s1".to_string(),
+            "filesystem".to_string(),
+        ]
     }
 
     fn value(content: &str) -> StoreValue {
         let mut m = StoreValue::new();
-        m.insert("content".to_string(), serde_json::Value::String(content.to_string()));
+        m.insert(
+            "content".to_string(),
+            serde_json::Value::String(content.to_string()),
+        );
         m
     }
 
@@ -213,7 +231,10 @@ mod tests {
         store.put(&ns(), "a.txt", value("two"));
         let item = store.get(&ns(), "a.txt").unwrap();
         assert_eq!(item.version, 2);
-        assert_eq!(item.value.get("content").unwrap(), &serde_json::json!("two"));
+        assert_eq!(
+            item.value.get("content").unwrap(),
+            &serde_json::json!("two")
+        );
     }
 
     #[test]
@@ -222,7 +243,12 @@ mod tests {
         assert!(store.put_if_version(&ns(), "a.txt", value("one"), 0));
         assert!(!store.put_if_version(&ns(), "a.txt", value("two"), 0));
         assert_eq!(
-            store.get(&ns(), "a.txt").unwrap().value.get("content").unwrap(),
+            store
+                .get(&ns(), "a.txt")
+                .unwrap()
+                .value
+                .get("content")
+                .unwrap(),
             &serde_json::json!("one")
         );
         assert!(store.put_if_version(&ns(), "a.txt", value("three"), 1));

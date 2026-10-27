@@ -3,11 +3,11 @@
 //! id carried in `ToolExecutionContext.runtime` under the `"sessionId"` key.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
+use async_trait::async_trait;
 
 use crate::agent::subagent::task::{BackgroundTask, TaskRepository, TaskStatus};
 
@@ -155,8 +155,8 @@ impl Tool for TaskOutputTool {
                 // blocking pool so this async tool does not starve a runtime worker (and, on a
                 // current-thread runtime, does not deadlock against the task it is waiting for).
                 let waiter = Arc::clone(&bg);
-                let _ = tokio::task::spawn_blocking(move || waiter.wait_for_completion(timeout))
-                    .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || waiter.wait_for_completion(timeout)).await;
             }
         }
         if bg.is_completed() && bg.get_task_status().is_terminal() {
@@ -193,7 +193,9 @@ impl Tool for TaskCancelTool {
         let session = session_from_ctx(&ctx);
         let rc = runtime_for(&session);
         let Some(bg) = self.tool.repo.get_task(&rc, &session, &task_id).await else {
-            return Ok(ToolResultBlock::error(format!("Error: No background task found with ID: {task_id}")));
+            return Ok(ToolResultBlock::error(format!(
+                "Error: No background task found with ID: {task_id}"
+            )));
         };
         let current = bg.get_task_status();
         if current.is_terminal() {
@@ -240,7 +242,9 @@ impl Tool for TaskListTool {
             let filter_desc = filter
                 .map(|f| format!(" with status '{}'", f.as_str().to_lowercase()))
                 .unwrap_or_default();
-            return Ok(ToolResultBlock::text(format!("No background tasks tracked{filter_desc}.")));
+            return Ok(ToolResultBlock::text(format!(
+                "No background tasks tracked{filter_desc}."
+            )));
         }
         let mut sb = format!("{} tracked task(s):\n", tasks.len());
         for t in &tasks {
@@ -248,7 +252,10 @@ impl Tool for TaskListTool {
             if !t.agent_id().is_empty() {
                 sb.push_str(&format!("  agent: {}", t.agent_id()));
             }
-            sb.push_str(&format!("  status: {}", t.get_task_status().as_str().to_lowercase()));
+            sb.push_str(&format!(
+                "  status: {}",
+                t.get_task_status().as_str().to_lowercase()
+            ));
             sb.push_str(&format!("  created: {}\n", format_iso(t.created_at())));
         }
         Ok(ToolResultBlock::text(sb.trim().to_string()))

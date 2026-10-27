@@ -81,7 +81,11 @@ impl RAGFlowConfig {
 
     /// The full retrieval URL (`baseUrl` + `/api/v1/retrieval`).
     pub fn retrieval_url(&self) -> String {
-        format!("{}{}", self.base_url.trim_end_matches('/'), super::RETRIEVAL_PATH)
+        format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            super::RETRIEVAL_PATH
+        )
     }
 }
 
@@ -326,7 +330,9 @@ impl RAGFlowConfigBuilder {
         }
         if let Some(page_size) = self.page_size {
             if page_size < 1 {
-                return Err(RagError::InvalidArgument("pageSize must be >= 1".to_string()));
+                return Err(RagError::InvalidArgument(
+                    "pageSize must be >= 1".to_string(),
+                ));
             }
         }
 
@@ -398,7 +404,10 @@ mod tests {
             .base_url("http://localhost:9380/")
             .build()
             .unwrap();
-        assert_eq!(cfg.retrieval_url(), "http://localhost:9380/api/v1/retrieval");
+        assert_eq!(
+            cfg.retrieval_url(),
+            "http://localhost:9380/api/v1/retrieval"
+        );
     }
 
     #[test]
@@ -440,7 +449,10 @@ mod tests {
         assert!(base_builder().top_k(0).build().is_err());
         assert!(base_builder().similarity_threshold(1.5).build().is_err());
         assert!(base_builder().similarity_threshold(-0.1).build().is_err());
-        assert!(base_builder().vector_similarity_weight(2.0).build().is_err());
+        assert!(base_builder()
+            .vector_similarity_weight(2.0)
+            .build()
+            .is_err());
         assert!(base_builder().page(0).build().is_err());
         assert!(base_builder().page_size(0).build().is_err());
         assert!(base_builder().similarity_threshold(1.0).build().is_ok());
@@ -462,9 +474,18 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(cfg.use_kg, Some(true));
-        assert_eq!(cfg.rerank_id.as_deref(), Some("BAAI/bge-reranker-v2-m3@BAAI"));
-        assert_eq!(cfg.cross_languages.as_deref(), Some(&["Chinese".to_string()][..]));
+        assert_eq!(
+            cfg.rerank_id.as_deref(),
+            Some("BAAI/bge-reranker-v2-m3@BAAI")
+        );
+        assert_eq!(
+            cfg.cross_languages.as_deref(),
+            Some(&["Chinese".to_string()][..])
+        );
         assert_eq!(cfg.max_retries, 5);
-        assert_eq!(cfg.custom_headers.get("X-Trace").map(String::as_str), Some("1"));
+        assert_eq!(
+            cfg.custom_headers.get("X-Trace").map(String::as_str),
+            Some("1")
+        );
     }
 }

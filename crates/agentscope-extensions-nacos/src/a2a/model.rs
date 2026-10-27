@@ -19,7 +19,10 @@ pub struct A2aAgentCapabilities {
     pub streaming: Option<bool>,
     #[serde(rename = "pushNotifications", skip_serializing_if = "Option::is_none")]
     pub push_notifications: Option<bool>,
-    #[serde(rename = "stateTransitionHistory", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "stateTransitionHistory",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub state_transition_history: Option<bool>,
 }
 
@@ -70,7 +73,10 @@ pub struct A2aAgentCard {
     pub provider: Option<A2aAgentProvider>,
     #[serde(rename = "preferredTransport", skip_serializing_if = "Option::is_none")]
     pub preferred_transport: Option<String>,
-    #[serde(rename = "additionalInterfaces", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "additionalInterfaces",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub additional_interfaces: Option<Vec<A2aAgentInterface>>,
     #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
@@ -129,7 +135,10 @@ pub struct NacosAgentCapabilities {
     pub streaming: Option<bool>,
     #[serde(rename = "pushNotifications", skip_serializing_if = "Option::is_none")]
     pub push_notifications: Option<bool>,
-    #[serde(rename = "stateTransitionHistory", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "stateTransitionHistory",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub state_transition_history: Option<bool>,
 }
 
@@ -183,7 +192,10 @@ pub struct NacosAgentCard {
     pub provider: Option<NacosAgentProvider>,
     #[serde(rename = "preferredTransport", skip_serializing_if = "Option::is_none")]
     pub preferred_transport: Option<String>,
-    #[serde(rename = "additionalInterfaces", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "additionalInterfaces",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub additional_interfaces: Option<Vec<NacosAgentInterface>>,
     #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,

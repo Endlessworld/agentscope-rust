@@ -31,7 +31,11 @@ pub struct BackgroundTask {
 }
 
 impl BackgroundTask {
-    fn new(task_id: String, agent_id: String, handle: Option<tokio::task::JoinHandle<()>>) -> Arc<Self> {
+    fn new(
+        task_id: String,
+        agent_id: String,
+        handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> Arc<Self> {
         let now = now_millis();
         Arc::new(Self {
             task_id,
@@ -78,7 +82,11 @@ impl BackgroundTask {
     }
 
     /// Spawns a blocking local execution and tracks it (self-contained).
-    pub fn spawn_local<F>(task_id: impl Into<String>, agent_id: impl Into<String>, execution: F) -> Arc<Self>
+    pub fn spawn_local<F>(
+        task_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        execution: F,
+    ) -> Arc<Self>
     where
         F: Fn() -> agentscope_core::error::Result<String> + Send + Sync + 'static,
     {
@@ -237,7 +245,11 @@ impl BackgroundTask {
             if elapsed >= timeout {
                 return false;
             }
-            let (guard, _) = self.state.condvar.wait_timeout(st, timeout - elapsed).unwrap();
+            let (guard, _) = self
+                .state
+                .condvar
+                .wait_timeout(st, timeout - elapsed)
+                .unwrap();
             st = guard;
         }
         true

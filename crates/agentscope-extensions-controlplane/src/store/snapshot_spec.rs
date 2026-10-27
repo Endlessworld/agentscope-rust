@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use agentscope_harness::agent::sandbox::snapshot::{SandboxSnapshot, SandboxSnapshotSpec};
 use agentscope_core::error::{Error, Result};
+use agentscope_harness::agent::sandbox::snapshot::{SandboxSnapshot, SandboxSnapshotSpec};
 use async_trait::async_trait;
 use reqwest::Method;
 
@@ -62,7 +62,9 @@ pub struct ControlPlaneSandboxSnapshot {
 
 impl std::fmt::Debug for ControlPlaneSandboxSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlPlaneSandboxSnapshot").field("id", &self.id).finish()
+        f.debug_struct("ControlPlaneSandboxSnapshot")
+            .field("id", &self.id)
+            .finish()
     }
 }
 
@@ -82,7 +84,12 @@ impl SandboxSnapshot for ControlPlaneSandboxSnapshot {
         let path = self.base_path();
         let resp = self
             .http
-            .send_bytes(Method::PUT, &path, "application/octet-stream", workspace_archive.to_vec())
+            .send_bytes(
+                Method::PUT,
+                &path,
+                "application/octet-stream",
+                workspace_archive.to_vec(),
+            )
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
         if resp.status == 404 {

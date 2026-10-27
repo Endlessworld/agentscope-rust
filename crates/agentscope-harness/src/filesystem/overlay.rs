@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use async_trait::async_trait;
 
 use super::{FileData, FileInfo, Filesystem, GrepMatch};
 
@@ -118,8 +118,16 @@ impl Filesystem for OverlayFilesystem {
     }
 
     async fn glob(&self, ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
-        let upper = self.upper.glob(ctx, pattern, path).await.unwrap_or_default();
-        let lower = self.lower.glob(ctx, pattern, path).await.unwrap_or_default();
+        let upper = self
+            .upper
+            .glob(ctx, pattern, path)
+            .await
+            .unwrap_or_default();
+        let lower = self
+            .lower
+            .glob(ctx, pattern, path)
+            .await
+            .unwrap_or_default();
         let mut merged: BTreeMap<String, FileInfo> = BTreeMap::new();
         for fi in lower {
             merged.insert(fi.path.clone(), fi);

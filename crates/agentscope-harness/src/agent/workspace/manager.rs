@@ -245,7 +245,10 @@ impl WorkspaceManager {
             }
         }
 
-        relative_paths.iter().map(|rel| self.workspace.join(rel)).collect()
+        relative_paths
+            .iter()
+            .map(|rel| self.workspace.join(rel))
+            .collect()
     }
 
     pub fn get_session_dir(&self, ctx: &RuntimeContext, agent_id: &str) -> PathBuf {
@@ -332,7 +335,8 @@ impl WorkspaceManager {
     /// Persists a task record map to the given relative path.
     async fn persist_task_map(&self, ctx: &RuntimeContext, rel: &str, map: &serde_json::Value) {
         if let Ok(serialized) = serde_json::to_string_pretty(map) {
-            self.write_utf8_workspace_relative(ctx, rel, &serialized).await;
+            self.write_utf8_workspace_relative(ctx, rel, &serialized)
+                .await;
         }
     }
 
@@ -345,10 +349,7 @@ impl WorkspaceManager {
         task_id: &str,
         record: &serde_json::Value,
     ) {
-        if agent_id.trim().is_empty()
-            || session_id.trim().is_empty()
-            || task_id.trim().is_empty()
-        {
+        if agent_id.trim().is_empty() || session_id.trim().is_empty() || task_id.trim().is_empty() {
             return;
         }
         let rel = self.task_record_path(agent_id, session_id);
@@ -358,7 +359,9 @@ impl WorkspaceManager {
         if !map.is_object() {
             map = serde_json::json!({});
         }
-        map.as_object_mut().unwrap().insert(task_id.to_string(), record.clone());
+        map.as_object_mut()
+            .unwrap()
+            .insert(task_id.to_string(), record.clone());
         self.persist_task_map(ctx, &rel, &map).await;
     }
 
@@ -370,8 +373,7 @@ impl WorkspaceManager {
         session_id: &str,
         task_id: &str,
     ) -> Option<serde_json::Value> {
-        if agent_id.trim().is_empty() || session_id.trim().is_empty() || task_id.trim().is_empty()
-        {
+        if agent_id.trim().is_empty() || session_id.trim().is_empty() || task_id.trim().is_empty() {
             return None;
         }
         let rel = self.task_record_path(agent_id, session_id);
@@ -391,7 +393,9 @@ impl WorkspaceManager {
         }
         let rel = self.task_record_path(agent_id, session_id);
         let map = self.read_task_map(ctx, &rel).await;
-        map.as_object().map(|o| o.values().cloned().collect()).unwrap_or_default()
+        map.as_object()
+            .map(|o| o.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Reads the orphan-sweep marker timestamp for this agent (plain ISO-8601 string).
@@ -415,7 +419,8 @@ impl WorkspaceManager {
             return;
         }
         let rel = self.sweep_marker_path(agent_id);
-        self.write_utf8_workspace_relative(ctx, &rel, &now_rfc3339()).await;
+        self.write_utf8_workspace_relative(ctx, &rel, &now_rfc3339())
+            .await;
     }
 
     fn sweep_marker_path(&self, agent_id: &str) -> String {
@@ -441,7 +446,8 @@ impl WorkspaceManager {
         if normalized.is_empty() {
             return;
         }
-        self.write_utf8_workspace_relative(ctx, &normalized, content).await;
+        self.write_utf8_workspace_relative(ctx, &normalized, content)
+            .await;
     }
 
     /// Moves a directory inside the workspace (used by promotion:
@@ -499,7 +505,11 @@ impl WorkspaceManager {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_file() && p.extension().map(|e| e == "md").unwrap_or(false) {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let name = p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
                         paths.insert(format!("{MEMORY_DIR}/{name}"));
                     }
                 }
@@ -639,7 +649,10 @@ async fn write_through_fs(
 
 /// Normalizes a path to workspace-relative form (strip leading slashes, unify separators).
 fn normalize_relative_path(relative_path: &str) -> String {
-    relative_path.replace('\\', "/").trim_start_matches('/').to_string()
+    relative_path
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
 }
 
 /// Validates and normalizes a relative path, rejecting `..` traversal.
@@ -702,7 +715,8 @@ mod tests {
         let agents_md = mgr.read_agents_md(&ctx).await;
         assert_eq!(agents_md, "# Agent");
 
-        mgr.write_utf8_workspace_relative(&ctx, "memory/2024-01-01.md", "# Day").await;
+        mgr.write_utf8_workspace_relative(&ctx, "memory/2024-01-01.md", "# Day")
+            .await;
         let content = mgr
             .read_managed_workspace_file_utf8(&ctx, "memory/2024-01-01.md")
             .await;
@@ -716,8 +730,10 @@ mod tests {
         let mgr = WorkspaceManager::new(root.clone());
         let ctx = RuntimeContext::new();
         let rel = "agents/a1/sessions/s1.log.jsonl";
-        mgr.append_utf8_workspace_relative(&ctx, rel, "line1\n").await;
-        mgr.append_utf8_workspace_relative(&ctx, rel, "line2\n").await;
+        mgr.append_utf8_workspace_relative(&ctx, rel, "line1\n")
+            .await;
+        mgr.append_utf8_workspace_relative(&ctx, rel, "line2\n")
+            .await;
         let content = mgr.read_managed_workspace_file_utf8(&ctx, rel).await;
         assert_eq!(content, "line1\nline2\n");
         let _ = std::fs::remove_dir_all(&root);
@@ -729,10 +745,15 @@ mod tests {
         let mgr = WorkspaceManager::new(root.clone());
         let ctx = RuntimeContext::new();
         let record = serde_json::json!({ "taskId": "t1", "status": "RUNNING" });
-        mgr.write_task_record_json(&ctx, "agent-a", "session-1", "t1", &record).await;
-        let read = mgr.read_task_record_json(&ctx, "agent-a", "session-1", "t1").await;
+        mgr.write_task_record_json(&ctx, "agent-a", "session-1", "t1", &record)
+            .await;
+        let read = mgr
+            .read_task_record_json(&ctx, "agent-a", "session-1", "t1")
+            .await;
         assert_eq!(read, Some(record.clone()));
-        let list = mgr.list_task_records_json(&ctx, "agent-a", "session-1").await;
+        let list = mgr
+            .list_task_records_json(&ctx, "agent-a", "session-1")
+            .await;
         assert_eq!(list.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -753,12 +774,7 @@ mod tests {
         let root = temp_dir("ns");
         use super::super::namespace::UserSessionNamespace;
         let factory: Arc<dyn NamespaceFactory> = Arc::new(UserSessionNamespace);
-        let mgr = WorkspaceManager::with_namespace(
-            root.clone(),
-            None,
-            None,
-            Some(factory.clone()),
-        );
+        let mgr = WorkspaceManager::with_namespace(root.clone(), None, None, Some(factory.clone()));
         let ctx = RuntimeContext::new()
             .with_user_id("u1")
             .with_session_id("s1");

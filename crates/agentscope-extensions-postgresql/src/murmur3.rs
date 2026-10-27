@@ -215,11 +215,24 @@ mod tests {
             ("123456789012", -6_350_179_390_026_660_262),
             ("123456789012345", -5_907_740_662_398_844_928),
             ("1234567890123456", 9_145_637_354_579_578_008),
-            ("12345678901234567890123456789012", 8_334_282_961_331_573_876),
+            (
+                "12345678901234567890123456789012",
+                8_334_282_961_331_573_876,
+            ),
         ];
         for (input, expected) in cases {
-            eprintln!("len={} got={} expected={}", input.len(), lock_key(input), expected);
-            assert_eq!(lock_key(input), *expected, "mismatch for len={}", input.len());
+            eprintln!(
+                "len={} got={} expected={}",
+                input.len(),
+                lock_key(input),
+                expected
+            );
+            assert_eq!(
+                lock_key(input),
+                *expected,
+                "mismatch for len={}",
+                input.len()
+            );
         }
     }
 

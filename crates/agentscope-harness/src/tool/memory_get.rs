@@ -2,11 +2,11 @@
 //! `io.agentscope.harness.agent.tool.MemoryGetTool`.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::workspace::WorkspaceManager;
 use crate::filesystem::validate_path;
@@ -75,15 +75,28 @@ impl Tool for MemoryGetTool {
         }
 
         let rc = RuntimeContext::default();
-        let text = self.workspace.read_managed_workspace_file_utf8(&rc, &path).await;
+        let text = self
+            .workspace
+            .read_managed_workspace_file_utf8(&rc, &path)
+            .await;
         if text.trim().is_empty() {
-            return Ok(ToolResultBlock::text(format!("Error: file not found: {path}")));
+            return Ok(ToolResultBlock::text(format!(
+                "Error: file not found: {path}"
+            )));
         }
 
         let lines: Vec<&str> = text.split('\n').collect();
         // Java: start = Math.max(0, startLine - 1); end = Math.min(lines.size(), endLine)
-        let start = if start_line > 1 { (start_line - 1) as usize } else { 0 };
-        let end = if end_line < 0 { 0 } else { (end_line as usize).min(lines.len()) };
+        let start = if start_line > 1 {
+            (start_line - 1) as usize
+        } else {
+            0
+        };
+        let end = if end_line < 0 {
+            0
+        } else {
+            (end_line as usize).min(lines.len())
+        };
 
         if start >= lines.len() {
             return Ok(ToolResultBlock::text(format!(

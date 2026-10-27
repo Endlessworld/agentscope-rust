@@ -22,9 +22,7 @@ pub use builder::{
     PreparedRequest, MANIFEST_ATTRIBUTE_PREFIX,
 };
 pub use context_middleware::ContextMiddleware;
-pub use item::{
-    content_hash, ContextBlock, ContextItem, ContextItemPlacement, ContextPurpose,
-};
+pub use item::{content_hash, ContextBlock, ContextItem, ContextItemPlacement, ContextPurpose};
 pub use model_calls::{auxiliary, auxiliary_text};
 pub use policy::{
     ApproximateEstimator, ContextManifest, ContextManifestItem, ContextPolicy,

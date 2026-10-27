@@ -89,25 +89,30 @@ impl Tool for FilesystemTool {
 
         let output = match op {
             "read" => {
-                let content = tokio::fs::read_to_string(&resolved).await.map_err(|e| Error::Io(e))?;
+                let content = tokio::fs::read_to_string(&resolved)
+                    .await
+                    .map_err(|e| Error::Io(e))?;
                 content
             }
             "write" => {
                 if self.read_only {
                     return Err(Error::Tool("filesystem tool is read-only".into()));
                 }
-                let content = args
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 if let Some(parent) = resolved.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| Error::Io(e))?;
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| Error::Io(e))?;
                 }
-                tokio::fs::write(&resolved, content).await.map_err(|e| Error::Io(e))?;
+                tokio::fs::write(&resolved, content)
+                    .await
+                    .map_err(|e| Error::Io(e))?;
                 format!("Wrote {} bytes to {}", content.len(), resolved.display())
             }
             "list" => {
-                let mut entries = tokio::fs::read_dir(&resolved).await.map_err(|e| Error::Io(e))?;
+                let mut entries = tokio::fs::read_dir(&resolved)
+                    .await
+                    .map_err(|e| Error::Io(e))?;
                 let mut names = Vec::new();
                 while let Some(entry) = entries.next_entry().await.map_err(|e| Error::Io(e))? {
                     names.push(entry.file_name().to_string_lossy().to_string());

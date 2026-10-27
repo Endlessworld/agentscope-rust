@@ -85,7 +85,9 @@ pub fn encode_binary(data: &[u8]) -> String {
 /// Decodes base64-encoded binary data; `None` for malformed input.
 pub fn decode_binary(encoded: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.decode(encoded).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
 }
 
 /// MongoDB error codes we act on.
@@ -295,7 +297,9 @@ impl Update {
                 }
                 UpdateOp::SetOnInsert(_, _) => {}
                 UpdateOp::Inc(field, amount) => {
-                    let current = resolve_field(doc, field).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let current = resolve_field(doc, field)
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
                     set_field(doc, field, Value::from(current + amount));
                 }
                 UpdateOp::Push(field, value) => {
@@ -577,12 +581,7 @@ impl MongoClient for InMemoryMongoClient {
     async fn insert_one(&self, collection: &str, doc: Map<String, Value>) -> MongoResult<()> {
         self.with_collection(collection, |state| {
             let id = doc.get("_id").cloned();
-            if id.is_some()
-                && state
-                    .docs
-                    .iter()
-                    .any(|d| d.get("_id") == id.as_ref())
-            {
+            if id.is_some() && state.docs.iter().any(|d| d.get("_id") == id.as_ref()) {
                 return Err(MongoError::DuplicateKey);
             }
             state.docs.push(doc);
@@ -698,8 +697,7 @@ impl MongoClient for InMemoryMongoClient {
                     // Reject an upsert insert that collides with an existing `_id`,
                     // mirroring MongoDB's duplicate-key (11000) behaviour.
                     let id = doc.get("_id").cloned();
-                    if id.is_some() && state.docs.iter().any(|d| d.get("_id") == id.as_ref())
-                    {
+                    if id.is_some() && state.docs.iter().any(|d| d.get("_id") == id.as_ref()) {
                         return Err(MongoError::DuplicateKey);
                     }
                     state.docs.push(doc);
@@ -922,13 +920,18 @@ impl MongoClient for InMemoryMongoClient {
                     let n = d
                         .get(GRIDFS_FIELD_CHUNK_N)
                         .and_then(|v| v.as_i64())
-                        .ok_or_else(|| corrupt_chunk(filename, "chunk document has no integer 'n'"))?;
+                        .ok_or_else(|| {
+                            corrupt_chunk(filename, "chunk document has no integer 'n'")
+                        })?;
                     let raw = d
                         .get(LEGACY_FIELD_DATA)
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| corrupt_chunk(filename, "chunk document has no 'data' field"))?;
-                    let bytes = decode_binary(raw)
-                        .ok_or_else(|| corrupt_chunk(filename, "chunk 'data' is not valid base64"))?;
+                        .ok_or_else(|| {
+                            corrupt_chunk(filename, "chunk document has no 'data' field")
+                        })?;
+                    let bytes = decode_binary(raw).ok_or_else(|| {
+                        corrupt_chunk(filename, "chunk 'data' is not valid base64")
+                    })?;
                     chunks.push((n, bytes));
                 }
             }
@@ -941,9 +944,7 @@ impl MongoClient for InMemoryMongoClient {
                 if *n != expected as i64 {
                     return Err(corrupt_chunk(
                         filename,
-                        &format!(
-                            "non-contiguous chunks: expected n={expected}, found n={n} ",
-                        ),
+                        &format!("non-contiguous chunks: expected n={expected}, found n={n} ",),
                     ));
                 }
                 data.extend_from_slice(chunk);
@@ -998,7 +999,9 @@ impl MongoClient for InMemoryMongoClient {
             let file_id = files.docs.remove(pos).get("_id").cloned();
             if let Some(file_id) = file_id {
                 if let Some(chunks) = map.get_mut(chunks_name.as_str()) {
-                    chunks.docs.retain(|c| c.get(GRIDFS_FIELD_FILES_ID) != Some(&file_id));
+                    chunks
+                        .docs
+                        .retain(|c| c.get(GRIDFS_FIELD_FILES_ID) != Some(&file_id));
                 }
             }
             Ok(true)
@@ -1050,7 +1053,10 @@ mod tests {
     async fn insert_and_find_roundtrip() {
         let c = InMemoryMongoClient::new();
         c.insert_one("s", doc("a", json!({"x": 1}))).await.unwrap();
-        let found = c.find_one("s", &FindFilter::eq("_id", json!("a"))).await.unwrap();
+        let found = c
+            .find_one("s", &FindFilter::eq("_id", json!("a")))
+            .await
+            .unwrap();
         assert_eq!(found.unwrap().get("x"), Some(&json!(1)));
     }
 
@@ -1067,14 +1073,19 @@ mod tests {
     #[tokio::test]
     async fn atomic_find_one_and_update_matches_only_expired() {
         let c = InMemoryMongoClient::new();
-        c.insert_one("locks", doc("k", json!({"expiresAt": 100}))).await.unwrap();
+        c.insert_one("locks", doc("k", json!({"expiresAt": 100})))
+            .await
+            .unwrap();
         let filter = FindFilter::eq("_id", json!("k")).lte("expiresAt", json!(50));
         assert!(c
             .find_one_and_update(
                 "locks",
                 &filter,
                 &Update::new().set("owner", json!("me")),
-                &FindOneAndUpdateOptions { upsert: false, return_after: true }
+                &FindOneAndUpdateOptions {
+                    upsert: false,
+                    return_after: true
+                }
             )
             .await
             .unwrap()
@@ -1085,7 +1096,10 @@ mod tests {
                 "locks",
                 &filter,
                 &Update::new().set("owner", json!("me")),
-                &FindOneAndUpdateOptions { upsert: false, return_after: true },
+                &FindOneAndUpdateOptions {
+                    upsert: false,
+                    return_after: true,
+                },
             )
             .await
             .unwrap();
@@ -1104,20 +1118,33 @@ mod tests {
         )
         .await
         .unwrap();
-        let found = c.find_one("s", &FindFilter::eq("_id", json!("a"))).await.unwrap().unwrap();
+        let found = c
+            .find_one("s", &FindFilter::eq("_id", json!("a")))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.get("states"), Some(&json!({"foo": {"v": 1}})));
     }
 
     #[tokio::test]
     async fn range_query_on_namespace() {
         let c = InMemoryMongoClient::new();
-        c.insert_one("b", doc("1", json!({"namespace": "ns\u{1f}"}))).await.unwrap();
-        c.insert_one("b", doc("2", json!({"namespace": "ns\u{1f}child\u{1f}"}))).await.unwrap();
-        c.insert_one("b", doc("3", json!({"namespace": "other\u{1f}"}))).await.unwrap();
+        c.insert_one("b", doc("1", json!({"namespace": "ns\u{1f}"})))
+            .await
+            .unwrap();
+        c.insert_one("b", doc("2", json!({"namespace": "ns\u{1f}child\u{1f}"})))
+            .await
+            .unwrap();
+        c.insert_one("b", doc("3", json!({"namespace": "other\u{1f}"})))
+            .await
+            .unwrap();
         let filter = FindFilter::default()
             .gte("namespace", json!("ns\u{1f}"))
             .lt("namespace", json!("ns\u{1f}\u{ffff}"));
-        let found = c.find_many("b", &filter, &FindOptions::default()).await.unwrap();
+        let found = c
+            .find_many("b", &filter, &FindOptions::default())
+            .await
+            .unwrap();
         assert_eq!(found.len(), 2);
     }
 }

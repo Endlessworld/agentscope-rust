@@ -100,7 +100,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn document(id: Option<&str>, content: Option<&str>, meta: Option<Vec<(&str, Value)>>) -> HayStackDocument {
+    fn document(
+        id: Option<&str>,
+        content: Option<&str>,
+        meta: Option<Vec<(&str, Value)>>,
+    ) -> HayStackDocument {
         HayStackDocument {
             id: id.map(|id| id.to_string()),
             content: content.map(|content| content.to_string()),
@@ -172,26 +176,23 @@ mod tests {
 
     #[test]
     fn chunk_id_defaults_to_zero_when_the_id_is_absent() {
-        let converted = HayStackDocumentConverter::convert_to_document(&document(
-            None,
-            Some("x"),
-            None,
-        ))
-        .unwrap();
+        let converted =
+            HayStackDocumentConverter::convert_to_document(&document(None, Some("x"), None))
+                .unwrap();
         assert_eq!(converted.metadata.chunk_id, "0");
     }
 
     #[test]
     fn blank_or_missing_content_is_skipped() {
-        assert!(HayStackDocumentConverter::convert_to_document(&document(None, None, None)).is_none());
         assert!(
-            HayStackDocumentConverter::convert_to_document(&document(
-                Some("a"),
-                Some("  "),
-                None
-            ))
-            .is_none()
+            HayStackDocumentConverter::convert_to_document(&document(None, None, None)).is_none()
         );
+        assert!(HayStackDocumentConverter::convert_to_document(&document(
+            Some("a"),
+            Some("  "),
+            None
+        ))
+        .is_none());
         assert!(HayStackDocumentConverter::convert_to_document(&document(
             Some("a"),
             Some("valid content"),

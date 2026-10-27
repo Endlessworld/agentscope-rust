@@ -54,9 +54,7 @@ impl WorkspaceSessionStorage {
     /// Locking them would also retain one lock entry per event forever, so a long session grew
     /// with its journal even after it stopped executing.
     fn needs_cas_lock(path: &str) -> bool {
-        !path.contains("/commits/")
-            && !path.contains("/blobs/")
-            && !path.contains("/writer-seals/")
+        !path.contains("/commits/") && !path.contains("/blobs/") && !path.contains("/writer-seals/")
     }
 
     fn version_path(path: &str) -> String {
@@ -256,7 +254,8 @@ impl SessionLogStore for WorkspaceSessionLogStore {
         let agents = self.storage.list_dirs("agents").await?;
         let mut keys = Vec::new();
         for agent_path in agents {
-            let Some(agent_id) = decode_component(agent_path.rsplit('/').next().unwrap_or("")) else {
+            let Some(agent_id) = decode_component(agent_path.rsplit('/').next().unwrap_or(""))
+            else {
                 continue;
             };
             let users = self
@@ -264,7 +263,8 @@ impl SessionLogStore for WorkspaceSessionLogStore {
                 .list_dirs(&format!("{agent_path}/sessions"))
                 .await?;
             for user_path in users {
-                let Some(decoded_user) = decode_component(user_path.rsplit('/').next().unwrap_or(""))
+                let Some(decoded_user) =
+                    decode_component(user_path.rsplit('/').next().unwrap_or(""))
                 else {
                     continue;
                 };
@@ -283,11 +283,9 @@ impl SessionLogStore for WorkspaceSessionLogStore {
                     else {
                         continue;
                     };
-                    if let Ok(key) = SessionKey::new(
-                        decoded_user.clone(),
-                        agent_id.clone(),
-                        session_id,
-                    ) {
+                    if let Ok(key) =
+                        SessionKey::new(decoded_user.clone(), agent_id.clone(), session_id)
+                    {
                         keys.push(key);
                     }
                 }
@@ -310,8 +308,8 @@ fn decode_component(component: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::session::JournalSessionLog;
     use crate::filesystem::LocalFilesystem;
+    use agentscope_core::session::JournalSessionLog;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let base =
@@ -329,18 +327,33 @@ mod tests {
 
         assert!(storage.read("s1/head.json").await.unwrap().is_none());
         // Create-if-absent succeeds, then reports version 1.
-        assert!(storage.compare_and_set("s1/head.json", 0, b"first").await.unwrap());
+        assert!(storage
+            .compare_and_set("s1/head.json", 0, b"first")
+            .await
+            .unwrap());
         let value = storage.read("s1/head.json").await.unwrap().unwrap();
         assert_eq!(value.bytes, b"first".to_vec());
         assert_eq!(value.version, 1);
 
         // A stale expectation fails without writing.
-        assert!(!storage.compare_and_set("s1/head.json", 0, b"stale").await.unwrap());
-        assert_eq!(storage.read("s1/head.json").await.unwrap().unwrap().bytes, b"first".to_vec());
+        assert!(!storage
+            .compare_and_set("s1/head.json", 0, b"stale")
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.read("s1/head.json").await.unwrap().unwrap().bytes,
+            b"first".to_vec()
+        );
 
         // The current version succeeds.
-        assert!(storage.compare_and_set("s1/head.json", 1, b"second").await.unwrap());
-        assert_eq!(storage.read("s1/head.json").await.unwrap().unwrap().bytes, b"second".to_vec());
+        assert!(storage
+            .compare_and_set("s1/head.json", 1, b"second")
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.read("s1/head.json").await.unwrap().unwrap().bytes,
+            b"second".to_vec()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -430,7 +443,11 @@ mod tests {
             assert_eq!(value.version, 1);
             assert_eq!(
                 value.bytes,
-                if first { b"first".to_vec() } else { b"second".to_vec() },
+                if first {
+                    b"first".to_vec()
+                } else {
+                    b"second".to_vec()
+                },
                 "the loser's value replaced the winner's"
             );
         }
@@ -517,7 +534,10 @@ mod tests {
         let key = SessionKey::new(Some("alice"), "agent/x", "s 1").unwrap();
         let path = key.storage_path();
         let agent_component = path.split('/').nth(1).unwrap();
-        assert_eq!(decode_component(agent_component).as_deref(), Some("agent/x"));
+        assert_eq!(
+            decode_component(agent_component).as_deref(),
+            Some("agent/x")
+        );
         // A non-encoded component is rejected rather than guessed.
         assert!(decode_component("raw").is_none());
     }
@@ -527,8 +547,7 @@ mod tests {
         // Compile-time guard: the store must expose the core journal implementation.
         let dir = temp_dir("type");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage: Arc<dyn AtomicSessionStorage> =
-            Arc::new(WorkspaceSessionStorage::new(fs));
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(WorkspaceSessionStorage::new(fs));
         let _journal = JournalSessionLog::new(storage, "agents/x");
         let _ = std::fs::remove_dir_all(&dir);
     }

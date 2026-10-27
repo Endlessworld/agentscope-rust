@@ -1,4 +1,4 @@
-﻿//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
+//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
 //!
 //! The ReAct agent runs an iterative reasoning → acting loop: it streams a model
 //! call, accumulates the reasoning result, and if the model requested tool calls
@@ -14,14 +14,17 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use crate::error::{Error, Result};
-use crate::event::{AgentEvent, AgentEventType, ConfirmResult, EventData};
-use crate::formatter::{JsonSchema, ResponseFormat};
-use crate::interruption::InterruptControl;
+use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
+use super::lifecycle::{CallGate, ExecutionGuard};
+use super::stream_options::StreamOptions;
 use crate::agent::run::{
     AgentRun, CancelSignal, RunControl, RunStatus, CANCEL_SIGNAL_CONTEXT_KEY,
     RUN_CONTROL_CONTEXT_KEY,
 };
+use crate::error::{Error, Result};
+use crate::event::{AgentEvent, AgentEventType, ConfirmResult, EventData};
+use crate::formatter::{JsonSchema, ResponseFormat};
+use crate::interruption::InterruptControl;
 use crate::message::{
     ChatUsage, ContentBlock, GenerateReason, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock,
     ToolResultBlock, ToolResultState, ToolUseBlock,
@@ -30,21 +33,19 @@ use crate::middleware::{
     ActingInput, ActingResultsHandle, AgentInput, EventStream, ExtensionPoint, MiddlewareChain,
     ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware,
 };
-use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};use crate::permission::{
+use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};
+use crate::permission::{
     PermissionBehavior, PermissionContextState, PermissionDecision, PermissionEngine,
     PermissionRule,
 };
-use crate::state::AgentState;
-use crate::state::context::TaskContextState;
 use crate::session::{
-    outcome, SessionExecution, SessionHistoryMode, SessionKey, SessionLog, SessionLogStore,
-    SessionRecorder, SessionModels, RECORDER_CONTEXT_KEY, SESSION_EXPORT_SINK_CONTEXT_KEY,
-    SessionExportSinkHandle, TURN_ID_CONTEXT_KEY,
+    outcome, SessionExecution, SessionExportSinkHandle, SessionHistoryMode, SessionKey, SessionLog,
+    SessionLogStore, SessionModels, SessionRecorder, RECORDER_CONTEXT_KEY,
+    SESSION_EXPORT_SINK_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
 };
+use crate::state::context::TaskContextState;
+use crate::state::AgentState;
 use crate::tool::{TodoWriteTool, ToolExecutionContext, Toolkit};
-use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
-use super::lifecycle::{CallGate, ExecutionGuard};
-use super::stream_options::StreamOptions;
 
 /// A boxed event sink registered via [`ObservableAgent::subscribe`].
 type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -58,8 +59,8 @@ type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 /// `RequestPermissionRequest`), and return the decision.
 ///
 /// If no handler is set, `Ask` results in an error (backward-compatible default).
-pub type ConfirmHandler = Arc<dyn Fn(ToolUseBlock) -> Pin<Box<dyn Future<Output = ConfirmResult> + Send>> + Send + Sync>;
-
+pub type ConfirmHandler =
+    Arc<dyn Fn(ToolUseBlock) -> Pin<Box<dyn Future<Output = ConfirmResult> + Send>> + Send + Sync>;
 
 /// Default maximum number of reasoning→acting iterations per call.
 pub const DEFAULT_MAX_ITERS: i32 = 10;
@@ -229,12 +230,9 @@ impl ReasoningContext {
     /// OpenAI Chat Completions and DashScope report `length`; Anthropic and Gemini
     /// report `max_tokens` / `MAX_TOKENS`. Mirrors Java `ReasoningContext#isTruncated`.
     fn output_limit_reached(&self) -> bool {
-        self.finish_reason
-            .as_deref()
-            .is_some_and(|reason| {
-                reason.eq_ignore_ascii_case("length")
-                    || reason.eq_ignore_ascii_case("max_tokens")
-            })
+        self.finish_reason.as_deref().is_some_and(|reason| {
+            reason.eq_ignore_ascii_case("length") || reason.eq_ignore_ascii_case("max_tokens")
+        })
     }
 
     /// Builds the final assistant message from the accumulated content.
@@ -397,17 +395,14 @@ impl ReActAgent {
     pub fn session_key(&self, context: &crate::agent::RuntimeContext) -> Option<SessionKey> {
         self.core.session_log_store.as_ref()?;
         let state = self.core.state.lock().unwrap();
-        let session_id = context
-            .session_id()
-            .map(str::to_string)
-            .or_else(|| {
-                let sid = state.session_id().to_string();
-                if sid.is_empty() {
-                    None
-                } else {
-                    Some(sid)
-                }
-            })?;
+        let session_id = context.session_id().map(str::to_string).or_else(|| {
+            let sid = state.session_id().to_string();
+            if sid.is_empty() {
+                None
+            } else {
+                Some(sid)
+            }
+        })?;
         let user_id = context
             .user_id()
             .map(str::to_string)
@@ -571,11 +566,7 @@ impl ReActAgent {
     /// The signal lets the caller stop this execution from another task: the agent observes
     /// it at its next checkpoint and ends the run as cancelled (the reply is never produced).
     /// Mirrors Java's `RunControl` being handed to the call through the runtime context.
-    pub async fn call_with_cancel(
-        &self,
-        messages: Vec<Msg>,
-        signal: CancelSignal,
-    ) -> Result<Msg> {
+    pub async fn call_with_cancel(&self, messages: Vec<Msg>, signal: CancelSignal) -> Result<Msg> {
         let mut extensions = crate::agent::Extensions::new();
         extensions.insert(CANCEL_SIGNAL_CONTEXT_KEY, signal);
         self.call_with_format_and_extensions(messages, None, extensions)
@@ -911,7 +902,10 @@ impl ReActAgent {
                 };
                 Box::pin(futures::stream::once(fut).flatten())
             });
-        let stream = self.core.middleware_chain.wrap_agent(ctx, input, agent_core);
+        let stream = self
+            .core
+            .middleware_chain
+            .wrap_agent(ctx, input, agent_core);
         // Merge the forwarded delta events into the agent-level stream.
         let stream = Box::pin(futures::stream::select(stream, delta_rx));
         (stream, slot)
@@ -958,13 +952,18 @@ impl ReActAgent {
             model.supports_native_structured_output()
         };
         if use_native {
-            match self.call_native_structured(messages.clone(), schema.clone()).await {
+            match self
+                .call_native_structured(messages.clone(), schema.clone())
+                .await
+            {
                 Ok(reply) => Ok(reply),
                 Err(e) => {
                     // A rejected native response (transport error, empty/invalid JSON or
                     // schema-invalid) falls back to the synthetic tool path; the rejected
                     // native reply never entered the context (Java `onErrorResume`).
-                    tracing::warn!("native structured output rejected, falling back to tool path: {e}");
+                    tracing::warn!(
+                        "native structured output rejected, falling back to tool path: {e}"
+                    );
                     self.call_fallback_structured(messages, schema).await
                 }
             }
@@ -1005,7 +1004,11 @@ impl ReActAgent {
     /// Structured-output fallback path: injects a synthetic `generate_response` tool so the
     /// model produces the response via a tool call. Used when the model does not support
     /// native `response_format`. Mirrors the Java `doFallbackStructuredCall`.
-    async fn call_fallback_structured(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
+    async fn call_fallback_structured(
+        &self,
+        messages: Vec<Msg>,
+        schema: JsonSchema,
+    ) -> Result<Msg> {
         let _guard = ExecutionGuard::acquire()?;
         let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
 
@@ -1299,7 +1302,11 @@ impl ReActAgentBuilder {
     }
     /// Attaches an execution-scoped service to every call context, e.g. a session
     /// recorder or a caller-supplied action observer.
-    pub fn extension<T: std::any::Any + Send + Sync>(mut self, key: &'static str, value: T) -> Self {
+    pub fn extension<T: std::any::Any + Send + Sync>(
+        mut self,
+        key: &'static str,
+        value: T,
+    ) -> Self {
         self.extensions.insert(key, value);
         self
     }
@@ -1390,16 +1397,24 @@ impl ReActAgentBuilder {
 
     /// Builds the [`ReActAgent`].
     pub fn build(self) -> Result<ReActAgent> {
-        let model = self.model.ok_or_else(|| {
-            Error::Agent("ReActAgent requires a model".into())
-        })?;
+        let model = self
+            .model
+            .ok_or_else(|| Error::Agent("ReActAgent requires a model".into()))?;
         let id = if self.id.is_empty() {
             uuid::Uuid::new_v4().to_string().replace('-', "")
         } else {
             self.id
         };
-        let name = if self.name.is_empty() { id.clone() } else { self.name };
-        let max_iters = if self.max_iters <= 0 { DEFAULT_MAX_ITERS } else { self.max_iters };
+        let name = if self.name.is_empty() {
+            id.clone()
+        } else {
+            self.name
+        };
+        let max_iters = if self.max_iters <= 0 {
+            DEFAULT_MAX_ITERS
+        } else {
+            self.max_iters
+        };
         let initial_state = self.state.unwrap_or_default();
         let tasks: Arc<Mutex<TaskContextState>> =
             Arc::new(Mutex::new(initial_state.tasks_context.clone()));
@@ -1437,7 +1452,12 @@ impl ReActAgentBuilder {
             session_log_agent_id: self.session_log_agent_id.unwrap_or_else(|| name.clone()),
             session_history_mode: self.session_history_mode,
         });
-        Ok(ReActAgent { id, name, description: self.description, core })
+        Ok(ReActAgent {
+            id,
+            name,
+            description: self.description,
+            core,
+        })
     }
 }
 
@@ -1453,7 +1473,10 @@ async fn run_agent_loop(
     ctx: &crate::agent::RuntimeContext,
     input: AgentInput,
 ) -> Result<Msg> {
-    let AgentInput { mut messages, mut system_prompt } = input;
+    let AgentInput {
+        mut messages,
+        mut system_prompt,
+    } = input;
 
     // Legacy compatibility: middlewares used to attach a SYSTEM message directly to
     // `AgentInput.messages`. Fold that material into the request-scoped system
@@ -1477,7 +1500,9 @@ async fn run_agent_loop(
     // Java's `AgentState.context` never stores the system message: it is frozen
     // per call in `CallExecution.systemMsg`. Drop any SYSTEM material persisted by
     // older builds before this request enters the loop.
-    state.context_mut().retain(|message| message.role != MsgRole::System);
+    state
+        .context_mut()
+        .retain(|message| message.role != MsgRole::System);
 
     // The call-scoped state is now bound: notify the middlewares that participate in
     // `OnAgentStateReady` before the input enters the pipeline. This is the only seam
@@ -1538,8 +1563,7 @@ async fn run_agent_loop(
     core.middleware_chain
         .notify_pre_call(ctx, &mut state, &messages, &mut frozen_prompt)
         .await;
-    let system_msg =
-        (!frozen_prompt.trim().is_empty()).then(|| Msg::system(frozen_prompt));
+    let system_msg = (!frozen_prompt.trim().is_empty()).then(|| Msg::system(frozen_prompt));
 
     for message in messages {
         state.context_mut().push(message);
@@ -1743,8 +1767,14 @@ fn publish_return_direct_text_events(ctx: &crate::agent::RuntimeContext, closing
         };
         let block_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let mut start = JsonMap::new();
-        start.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-        start.insert("block_id".to_string(), serde_json::Value::String(block_id.clone()));
+        start.insert(
+            "reply_id".to_string(),
+            serde_json::Value::String(reply_id.clone()),
+        );
+        start.insert(
+            "block_id".to_string(),
+            serde_json::Value::String(block_id.clone()),
+        );
         start.insert(
             "block_type".to_string(),
             serde_json::Value::String("text".to_string()),
@@ -1755,13 +1785,22 @@ fn publish_return_direct_text_events(ctx: &crate::agent::RuntimeContext, closing
         );
 
         let mut delta = JsonMap::new();
-        delta.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-        delta.insert("block_id".to_string(), serde_json::Value::String(block_id.clone()));
+        delta.insert(
+            "reply_id".to_string(),
+            serde_json::Value::String(reply_id.clone()),
+        );
+        delta.insert(
+            "block_id".to_string(),
+            serde_json::Value::String(block_id.clone()),
+        );
         delta.insert(
             "block_type".to_string(),
             serde_json::Value::String("text".to_string()),
         );
-        delta.insert("delta".to_string(), serde_json::Value::String(t.text.clone()));
+        delta.insert(
+            "delta".to_string(),
+            serde_json::Value::String(t.text.clone()),
+        );
         emit_delta(
             &ctx.delta_tx,
             AgentEvent::with_fields(AgentEventType::TextBlockDelta, delta).with_metadata(
@@ -1771,7 +1810,10 @@ fn publish_return_direct_text_events(ctx: &crate::agent::RuntimeContext, closing
         );
 
         let mut end = JsonMap::new();
-        end.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+        end.insert(
+            "reply_id".to_string(),
+            serde_json::Value::String(reply_id.clone()),
+        );
         end.insert("block_id".to_string(), serde_json::Value::String(block_id));
         end.insert(
             "block_type".to_string(),
@@ -1891,7 +1933,9 @@ async fn reasoning_phase(
     let tool_request_config = ctx.extension::<crate::tool::ToolRequestConfig>(
         crate::tool::tool_request_config::TOOL_REQUEST_CONFIG_CONTEXT_KEY,
     );
-    let tools = core.toolkit.tool_schemas_with(tool_request_config.as_deref());
+    let tools = core
+        .toolkit
+        .tool_schemas_with(tool_request_config.as_deref());
     let model = core.model.lock().unwrap().clone();
     let mut ob = GenerateOptions::builder().model_name(model.model_name());
     if let Some(rf) = &ctx.response_format {
@@ -2052,14 +2096,21 @@ async fn run_reasoning(
     // stream item; discarding it here would turn every such failure into the
     // indistinguishable "model produced no message" error.
     let stream_error = events.into_iter().find_map(|event| event.err());
-    let result = slot.lock().unwrap().take().unwrap_or_else(|| match stream_error {
-        Some(error) => Err(error),
-        None => Err(Error::Agent("model produced no message".into())),
-    });
+    let result = slot
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_else(|| match stream_error {
+            Some(error) => Err(error),
+            None => Err(Error::Agent("model produced no message".into())),
+        });
     result
 }
 /// Helper: emit an agent event through the delta_tx channel if available.
-fn emit_delta(delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>, ev: AgentEvent) {
+fn emit_delta(
+    delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
+    ev: AgentEvent,
+) {
     if let Some(tx) = delta_tx {
         let _ = tx.unbounded_send(Ok(ev));
     }
@@ -2068,11 +2119,16 @@ fn emit_delta(delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::e
 /// Builds an agent event carrying tool-call metadata fields.
 fn tool_event(event_type: AgentEventType, tool_call_id: &str, tool_name: &str) -> AgentEvent {
     let mut fields = JsonMap::new();
-    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
-    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+    fields.insert(
+        "tool_call_id".to_string(),
+        serde_json::Value::String(tool_call_id.to_string()),
+    );
+    fields.insert(
+        "tool_name".to_string(),
+        serde_json::Value::String(tool_name.to_string()),
+    );
     AgentEvent::with_fields(event_type, fields)
 }
-
 
 /// Emits a ToolResultStart event through the delta_tx channel.
 fn emit_tool_result_start(
@@ -2081,9 +2137,18 @@ fn emit_tool_result_start(
     tool_name: &str,
 ) {
     let mut fields = JsonMap::new();
-    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
-    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
-    emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultStart, fields));
+    fields.insert(
+        "tool_call_id".to_string(),
+        serde_json::Value::String(tool_call_id.to_string()),
+    );
+    fields.insert(
+        "tool_name".to_string(),
+        serde_json::Value::String(tool_name.to_string()),
+    );
+    emit_delta(
+        delta_tx,
+        AgentEvent::with_fields(AgentEventType::ToolResultStart, fields),
+    );
 }
 
 /// Emits a ToolResultTextDelta event through the delta_tx channel.
@@ -2094,10 +2159,22 @@ fn emit_tool_result_text_delta(
     delta: &str,
 ) {
     let mut fields = JsonMap::new();
-    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
-    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
-    fields.insert("delta".to_string(), serde_json::Value::String(delta.to_string()));
-    emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultTextDelta, fields));
+    fields.insert(
+        "tool_call_id".to_string(),
+        serde_json::Value::String(tool_call_id.to_string()),
+    );
+    fields.insert(
+        "tool_name".to_string(),
+        serde_json::Value::String(tool_name.to_string()),
+    );
+    fields.insert(
+        "delta".to_string(),
+        serde_json::Value::String(delta.to_string()),
+    );
+    emit_delta(
+        delta_tx,
+        AgentEvent::with_fields(AgentEventType::ToolResultTextDelta, fields),
+    );
 }
 
 /// The wire name of a tool-result state, as carried by `TOOL_RESULT_END`'s `state`
@@ -2130,8 +2207,14 @@ fn emit_tool_result_end(
     metadata: &JsonMap,
 ) {
     let mut fields = JsonMap::new();
-    fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.to_string()));
-    fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
+    fields.insert(
+        "tool_call_id".to_string(),
+        serde_json::Value::String(tool_call_id.to_string()),
+    );
+    fields.insert(
+        "tool_name".to_string(),
+        serde_json::Value::String(tool_name.to_string()),
+    );
     fields.insert(
         "state".to_string(),
         serde_json::Value::String(tool_result_state_str(state).to_string()),
@@ -2142,7 +2225,10 @@ fn emit_tool_result_end(
             serde_json::to_value(metadata).unwrap_or(serde_json::Value::Null),
         );
     }
-    emit_delta(delta_tx, AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields));
+    emit_delta(
+        delta_tx,
+        AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields),
+    );
 }
 
 /// Emits a `RequireExternalExecution` event through the delta_tx channel for a tool
@@ -2161,15 +2247,28 @@ fn emit_require_external_execution(
     reason: Option<&str>,
 ) {
     let mut fields = JsonMap::new();
-    fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.to_string()));
-    fields.insert("tool_call_id".to_string(), serde_json::Value::String(call.id.clone()));
-    fields.insert("tool_name".to_string(), serde_json::Value::String(call.name.clone()));
+    fields.insert(
+        "reply_id".to_string(),
+        serde_json::Value::String(reply_id.to_string()),
+    );
+    fields.insert(
+        "tool_call_id".to_string(),
+        serde_json::Value::String(call.id.clone()),
+    );
+    fields.insert(
+        "tool_name".to_string(),
+        serde_json::Value::String(call.name.clone()),
+    );
     if let Some(reason) = reason.filter(|r| !r.is_empty()) {
-        fields.insert("reason".to_string(), serde_json::Value::String(reason.to_string()));
+        fields.insert(
+            "reason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
     }
     fields.insert(
         "tool_calls".to_string(),
-        serde_json::to_value(std::slice::from_ref(call)).unwrap_or(serde_json::Value::Array(Vec::new())),
+        serde_json::to_value(std::slice::from_ref(call))
+            .unwrap_or(serde_json::Value::Array(Vec::new())),
     );
     emit_delta(
         delta_tx,
@@ -2195,7 +2294,10 @@ fn current_reply_id(state: &AgentState) -> String {
 /// Builds a text/thinking delta event carrying the given incremental text.
 fn delta_event(event_type: AgentEventType, delta: &str) -> AgentEvent {
     let mut fields = JsonMap::new();
-    fields.insert("delta".to_string(), serde_json::Value::String(delta.to_string()));
+    fields.insert(
+        "delta".to_string(),
+        serde_json::Value::String(delta.to_string()),
+    );
     AgentEvent::with_fields(event_type, fields)
 }
 
@@ -2230,9 +2332,15 @@ impl BlockLifecycle {
         if !self.text_started {
             self.text_started = true;
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(self.reply_id.clone()),
+            );
             fields.insert("block_type".to_string(), Self::block_field("text"));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::TextBlockStart, fields)));
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::TextBlockStart,
+                fields,
+            )));
         }
     }
 
@@ -2240,13 +2348,24 @@ impl BlockLifecycle {
         if !self.thinking_started {
             self.thinking_started = true;
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(self.reply_id.clone()),
+            );
             fields.insert("block_type".to_string(), Self::block_field("thinking"));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::ThinkingBlockStart, fields)));
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::ThinkingBlockStart,
+                fields,
+            )));
         }
     }
 
-    fn start_tool_call(&mut self, tool_id: &str, tool_name: &str, emit: &mut impl FnMut(Result<AgentEvent>)) {
+    fn start_tool_call(
+        &mut self,
+        tool_id: &str,
+        tool_name: &str,
+        emit: &mut impl FnMut(Result<AgentEvent>),
+    ) {
         if tool_id.is_empty() || self.started_tool_calls.contains_key(tool_id) {
             return;
         }
@@ -2255,12 +2374,25 @@ impl BlockLifecycle {
         self.flush_all_tool_calls(emit);
         let visible = !tool_name.starts_with("__");
         if visible && !self.started_tool_calls.contains_key(tool_id) {
-            self.started_tool_calls.insert(tool_id.to_string(), tool_name.to_string());
+            self.started_tool_calls
+                .insert(tool_id.to_string(), tool_name.to_string());
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
-            fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_id.to_string()));
-            fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name.to_string()));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallStart, fields)));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(self.reply_id.clone()),
+            );
+            fields.insert(
+                "tool_call_id".to_string(),
+                serde_json::Value::String(tool_id.to_string()),
+            );
+            fields.insert(
+                "tool_name".to_string(),
+                serde_json::Value::String(tool_name.to_string()),
+            );
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::ToolCallStart,
+                fields,
+            )));
         }
     }
 
@@ -2268,9 +2400,15 @@ impl BlockLifecycle {
         if self.text_started {
             self.text_started = false;
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(self.reply_id.clone()),
+            );
             fields.insert("block_type".to_string(), Self::block_field("text"));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::TextBlockEnd, fields)));
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::TextBlockEnd,
+                fields,
+            )));
         }
     }
 
@@ -2278,19 +2416,37 @@ impl BlockLifecycle {
         if self.thinking_started {
             self.thinking_started = false;
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(self.reply_id.clone()),
+            );
             fields.insert("block_type".to_string(), Self::block_field("thinking"));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::ThinkingBlockEnd, fields)));
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::ThinkingBlockEnd,
+                fields,
+            )));
         }
     }
 
     fn flush_all_tool_calls(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
         for (tool_id, tool_name) in self.started_tool_calls.drain() {
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(self.reply_id.clone()));
-            fields.insert("tool_call_id".to_string(), serde_json::Value::String(tool_id));
-            fields.insert("tool_name".to_string(), serde_json::Value::String(tool_name));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallEnd, fields)));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(self.reply_id.clone()),
+            );
+            fields.insert(
+                "tool_call_id".to_string(),
+                serde_json::Value::String(tool_id),
+            );
+            fields.insert(
+                "tool_name".to_string(),
+                serde_json::Value::String(tool_name),
+            );
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::ToolCallEnd,
+                fields,
+            )));
         }
     }
 
@@ -2357,8 +2513,14 @@ async fn model_call_impl(
         // Emit ModelCallStart at the beginning of each attempt.
         {
             let mut fields = JsonMap::new();
-            fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-            emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallStart, fields)));
+            fields.insert(
+                "reply_id".to_string(),
+                serde_json::Value::String(reply_id.clone()),
+            );
+            emit(Ok(AgentEvent::with_fields(
+                AgentEventType::ModelCallStart,
+                fields,
+            )));
         }
 
         let mut stream = model.stream(messages.clone(), tools.clone(), options.clone());
@@ -2393,24 +2555,38 @@ async fn model_call_impl(
                         ContentBlock::Thinking(t) => {
                             block_lifecycle.start_thinking(&mut emit);
                             if !t.thinking.is_empty() {
-                                emit(Ok(delta_event(AgentEventType::ThinkingBlockDelta, &t.thinking)));
+                                emit(Ok(delta_event(
+                                    AgentEventType::ThinkingBlockDelta,
+                                    &t.thinking,
+                                )));
                             }
                         }
                         ContentBlock::ToolUse(tu) => {
                             block_lifecycle.start_tool_call(&tu.id, &tu.name, &mut emit);
                             let delta = match tu.content.as_deref().filter(|c| !c.is_empty()) {
                                 Some(content) => Some(content.to_string()),
-                                None => serde_json::to_string(&tu.input)
-                                    .ok()
-                                    .filter(|s| s != "{}"),
+                                None => serde_json::to_string(&tu.input).ok().filter(|s| s != "{}"),
                             };
                             if let Some(delta) = delta {
                                 let mut fields = JsonMap::new();
-                                fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
-                                fields.insert("tool_call_id".to_string(), serde_json::Value::String(tu.id.clone()));
-                                fields.insert("tool_name".to_string(), serde_json::Value::String(tu.name.clone()));
-                                fields.insert("delta".to_string(), serde_json::Value::String(delta));
-                                emit(Ok(AgentEvent::with_fields(AgentEventType::ToolCallDelta, fields)));
+                                fields.insert(
+                                    "reply_id".to_string(),
+                                    serde_json::Value::String(reply_id.clone()),
+                                );
+                                fields.insert(
+                                    "tool_call_id".to_string(),
+                                    serde_json::Value::String(tu.id.clone()),
+                                );
+                                fields.insert(
+                                    "tool_name".to_string(),
+                                    serde_json::Value::String(tu.name.clone()),
+                                );
+                                fields
+                                    .insert("delta".to_string(), serde_json::Value::String(delta));
+                                emit(Ok(AgentEvent::with_fields(
+                                    AgentEventType::ToolCallDelta,
+                                    fields,
+                                )));
                             }
                         }
                         _ => {}
@@ -2431,10 +2607,19 @@ async fn model_call_impl(
                 block_lifecycle.flush_all(&mut emit);
                 {
                     let mut fields = JsonMap::new();
-                    fields.insert("reply_id".to_string(), serde_json::Value::String(reply_id.clone()));
+                    fields.insert(
+                        "reply_id".to_string(),
+                        serde_json::Value::String(reply_id.clone()),
+                    );
                     let usage = acc.usage.clone().unwrap_or_default();
-                    fields.insert("usage".to_string(), serde_json::to_value(&usage).unwrap_or_default());
-                    emit(Ok(AgentEvent::with_fields(AgentEventType::ModelCallEnd, fields)));
+                    fields.insert(
+                        "usage".to_string(),
+                        serde_json::to_value(&usage).unwrap_or_default(),
+                    );
+                    emit(Ok(AgentEvent::with_fields(
+                        AgentEventType::ModelCallEnd,
+                        fields,
+                    )));
                 }
                 return Ok(acc.build_final_message());
             }
@@ -2504,10 +2689,7 @@ fn retry_suppressed_error(e: Error) -> Error {
             message: format!("{message} ({NOTE})"),
         },
         Error::Http(message) => Error::Http(format!("{message} ({NOTE})")),
-        Error::Io(err) => Error::Io(std::io::Error::new(
-            err.kind(),
-            format!("{err} ({NOTE})"),
-        )),
+        Error::Io(err) => Error::Io(std::io::Error::new(err.kind(), format!("{err} ({NOTE})"))),
         other => Error::Agent(format!("{other} ({NOTE})")),
     }
 }
@@ -2543,8 +2725,14 @@ fn tool_chunk_callback(
                 "reply_id".to_string(),
                 serde_json::Value::String(reply_id.clone()),
             );
-            fields.insert("tool_call_id".to_string(), serde_json::Value::String(id.clone()));
-            fields.insert("tool_name".to_string(), serde_json::Value::String(name.clone()));
+            fields.insert(
+                "tool_call_id".to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+            fields.insert(
+                "tool_name".to_string(),
+                serde_json::Value::String(name.clone()),
+            );
             // Java carries the whole `ContentBlock`, not just its text, so non-text
             // progress (images, data blocks) survives the trip.
             fields.insert(
@@ -2597,13 +2785,22 @@ fn tool_request_config(
 fn tool_runtime(ctx: &crate::agent::RuntimeContext) -> JsonMap {
     let mut rt = ctx.metadata.clone();
     if let Some(sid) = ctx.session_id() {
-        rt.insert("sessionId".to_string(), serde_json::Value::String(sid.to_string()));
+        rt.insert(
+            "sessionId".to_string(),
+            serde_json::Value::String(sid.to_string()),
+        );
     }
     if let Some(uid) = ctx.user_id() {
-        rt.insert("userId".to_string(), serde_json::Value::String(uid.to_string()));
+        rt.insert(
+            "userId".to_string(),
+            serde_json::Value::String(uid.to_string()),
+        );
     }
     if let Some(aid) = ctx.agent_id() {
-        rt.insert("agentId".to_string(), serde_json::Value::String(aid.to_string()));
+        rt.insert(
+            "agentId".to_string(),
+            serde_json::Value::String(aid.to_string()),
+        );
     }
     rt
 }
@@ -2666,7 +2863,11 @@ async fn acting_phase(
         }
     }
 
-    if core.middleware_chain.participants(ExtensionPoint::OnActing).is_empty() {
+    if core
+        .middleware_chain
+        .participants(ExtensionPoint::OnActing)
+        .is_empty()
+    {
         // No middleware participates: keep the single-pass path — events go straight to
         // `delta_tx`, with no channel hop and no spawned task.
         let batch = ActingBatch {
@@ -2683,7 +2884,14 @@ async fn acting_phase(
         let mut stream = core.middleware_chain.wrap_acting(
             ctx.clone(),
             ActingInput::with_results(pending.clone(), results.clone()),
-            acting_stream_core(core, ctx, &reply_id, &runtime, &plan_denied, output_limit_reached),
+            acting_stream_core(
+                core,
+                ctx,
+                &reply_id,
+                &runtime,
+                &plan_denied,
+                output_limit_reached,
+            ),
         );
         while let Some(item) = stream.next().await {
             if let Some(tx) = &ctx.delta_tx {
@@ -2864,12 +3072,7 @@ impl ActingBatch<'_> {
         call: &ToolUseBlock,
         tctx: ToolExecutionContext,
     ) -> Result<ToolResultBlock> {
-        crate::observation::observe(
-            self.ctx,
-            call,
-            self.core.toolkit.call_tool(call, tctx),
-        )
-        .await
+        crate::observation::observe(self.ctx, call, self.core.toolkit.call_tool(call, tctx)).await
     }
 
     /// Whether `call` may join a concurrent batch: it must be executable (not
@@ -2960,8 +3163,7 @@ async fn run_acting_calls(
                 &call.name,
                 PLAN_MODE_DENY_MESSAGE,
             );
-            results
-                .record(denied_result(call, PLAN_MODE_DENY_MESSAGE), false);
+            results.record(denied_result(call, PLAN_MODE_DENY_MESSAGE), false);
             emit_tool_result_end(
                 &run.ctx.delta_tx,
                 &call.id,
@@ -2979,9 +3181,14 @@ async fn run_acting_calls(
                 emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
                 let denied_text = "Permission denied by rules";
                 emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, denied_text);
-                results
-                    .record(denied_result(call, &decision.message), false);
-                emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+                results.record(denied_result(call, &decision.message), false);
+                emit_tool_result_end(
+                    &run.ctx.delta_tx,
+                    &call.id,
+                    &call.name,
+                    ToolResultState::Denied,
+                    &JsonMap::new(),
+                );
                 index += 1;
             }
             PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
@@ -3025,7 +3232,12 @@ async fn run_acting_calls(
                             }
                         }
                         if !result_text.trim().is_empty() {
-                            emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &result_text);
+                            emit_tool_result_text_delta(
+                                &run.ctx.delta_tx,
+                                &call.id,
+                                &call.name,
+                                &result_text,
+                            );
                         }
                         // Java #3435: a suspended call must not fabricate a result — no
                         // ToolResultEnd event is emitted (the external-execution requirement
@@ -3045,7 +3257,13 @@ async fn run_acting_calls(
                                 suspend_reason.as_deref(),
                             );
                         } else {
-                            emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
+                            emit_tool_result_end(
+                                &run.ctx.delta_tx,
+                                &call.id,
+                                &call.name,
+                                final_state,
+                                &metadata,
+                            );
                         }
                     }
                     Err(e) => {
@@ -3065,10 +3283,20 @@ async fn run_acting_calls(
                             );
                             return Err(e);
                         }
-                        results
-                            .record(error_result(call, &err_msg), false);
-                        emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &err_msg);
-                        emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
+                        results.record(error_result(call, &err_msg), false);
+                        emit_tool_result_text_delta(
+                            &run.ctx.delta_tx,
+                            &call.id,
+                            &call.name,
+                            &err_msg,
+                        );
+                        emit_tool_result_end(
+                            &run.ctx.delta_tx,
+                            &call.id,
+                            &call.name,
+                            ToolResultState::Error,
+                            &JsonMap::new(),
+                        );
                     }
                 }
                 index += 1;
@@ -3083,7 +3311,11 @@ async fn run_acting_calls(
                     if confirm_result.is_confirmed() {
                         // Use the (possibly modified) tool call if the user tweaked input.
                         let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
-                        emit_tool_result_start(&run.ctx.delta_tx, &effective_call.id, &effective_call.name);
+                        emit_tool_result_start(
+                            &run.ctx.delta_tx,
+                            &effective_call.id,
+                            &effective_call.name,
+                        );
                         let tctx = tool_execution_context(
                             effective_call,
                             run.runtime.clone(),
@@ -3102,7 +3334,12 @@ async fn run_acting_calls(
                                     }
                                 }
                                 if !result_text.trim().is_empty() {
-                                    emit_tool_result_text_delta(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
+                                    emit_tool_result_text_delta(
+                                        &run.ctx.delta_tx,
+                                        &effective_call.id,
+                                        &effective_call.name,
+                                        &result_text,
+                                    );
                                 }
                                 let was_suspended = rb.is_suspended();
                                 let suspend_reason = rb.suspend_reason().map(str::to_string);
@@ -3119,7 +3356,13 @@ async fn run_acting_calls(
                                         suspend_reason.as_deref(),
                                     );
                                 } else {
-                                    emit_tool_result_end(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
+                                    emit_tool_result_end(
+                                        &run.ctx.delta_tx,
+                                        &effective_call.id,
+                                        &effective_call.name,
+                                        final_state,
+                                        &metadata,
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -3135,19 +3378,39 @@ async fn run_acting_calls(
                                     );
                                     return Err(e);
                                 }
-                                emit_tool_result_text_delta(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
-                                results
-                                    .record(error_result(effective_call, &err_msg), false);
-                                emit_tool_result_end(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
+                                emit_tool_result_text_delta(
+                                    &run.ctx.delta_tx,
+                                    &effective_call.id,
+                                    &effective_call.name,
+                                    &err_msg,
+                                );
+                                results.record(error_result(effective_call, &err_msg), false);
+                                emit_tool_result_end(
+                                    &run.ctx.delta_tx,
+                                    &effective_call.id,
+                                    &effective_call.name,
+                                    ToolResultState::Error,
+                                    &JsonMap::new(),
+                                );
                             }
                         }
                     } else {
                         // User denied the tool call.
                         let denied_text = &confirm_result.message;
-                        emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, denied_text);
-                        results
-                            .record(denied_result(call, denied_text), false);
-                        emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+                        emit_tool_result_text_delta(
+                            &run.ctx.delta_tx,
+                            &call.id,
+                            &call.name,
+                            denied_text,
+                        );
+                        results.record(denied_result(call, denied_text), false);
+                        emit_tool_result_end(
+                            &run.ctx.delta_tx,
+                            &call.id,
+                            &call.name,
+                            ToolResultState::Denied,
+                            &JsonMap::new(),
+                        );
                     }
                 } else {
                     return Err(Error::Agent(format!(
@@ -3217,12 +3480,7 @@ async fn run_parallel_batch(
             Err(error) => {
                 let message = error.to_string();
                 if !matches!(error, Error::ActionObservation(_)) {
-                    emit_tool_result_text_delta(
-                        &run.ctx.delta_tx,
-                        &call.id,
-                        &call.name,
-                        &message,
-                    );
+                    emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &message);
                 }
                 emit_tool_result_end(
                     &run.ctx.delta_tx,
@@ -3359,7 +3617,10 @@ fn normalize_system_messages(mut messages: Vec<Msg>) -> Vec<Msg> {
 /// schema under a single `response` property.
 fn generate_response_parameters(schema: &JsonSchema) -> serde_json::Value {
     let mut props = serde_json::Map::new();
-    props.insert("response".to_string(), serde_json::Value::Object(schema.schema.clone()));
+    props.insert(
+        "response".to_string(),
+        serde_json::Value::Object(schema.schema.clone()),
+    );
     let mut params = serde_json::Map::new();
     params.insert("type".to_string(), serde_json::json!("object"));
     params.insert("properties".to_string(), serde_json::Value::Object(props));
@@ -3397,7 +3658,10 @@ fn structured_output_reminder(schema: &JsonSchema) -> Msg {
 /// now", so it also marks the run cancelled (the outcome must not be reported as a failure).
 /// The interrupt check then reads the run that belongs to *this* call — carried in the call's
 /// context — instead of the agent-level slot, which a concurrent call may have replaced.
-fn check_interrupted(core: &Arc<AgentCore>, ctx: Option<&crate::agent::RuntimeContext>) -> Result<()> {
+fn check_interrupted(
+    core: &Arc<AgentCore>,
+    ctx: Option<&crate::agent::RuntimeContext>,
+) -> Result<()> {
     let run = ctx.and_then(|c| c.extension::<RunControl>(RUN_CONTROL_CONTEXT_KEY));
     if let Some(signal) = ctx.and_then(|c| c.extension::<CancelSignal>(CANCEL_SIGNAL_CONTEXT_KEY)) {
         if signal.is_cancelled() {
@@ -3480,7 +3744,10 @@ fn patch_pending_tool_calls(state: &mut AgentState, messages: &[Msg]) {
         return;
     }
     // The caller provided tool results itself: let the normal path validate them.
-    if messages.iter().any(|m| m.tool_result_blocks().next().is_some()) {
+    if messages
+        .iter()
+        .any(|m| m.tool_result_blocks().next().is_some())
+    {
         return;
     }
     for call in pending {
@@ -3730,7 +3997,10 @@ mod tests {
             _tools: Vec<crate::model::ToolSchema>,
             options: GenerateOptions,
         ) -> BoxStream<'_, Result<ChatResponse>> {
-            self.seen_choices.lock().unwrap().push(options.tool_choice.clone());
+            self.seen_choices
+                .lock()
+                .unwrap()
+                .push(options.tool_choice.clone());
             let responses = Arc::clone(&self.responses);
             Box::pin(futures::stream::once(async move {
                 let mut g = responses.lock().unwrap();
@@ -3790,7 +4060,9 @@ mod tests {
 
     fn tool_use_response(id: &str, name: &str, input: JsonMap) -> ChatResponse {
         ChatResponse::builder()
-            .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(id, name, input))])
+            .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                id, name, input,
+            ))])
             .build()
     }
 
@@ -4159,11 +4431,7 @@ mod tests {
         let ctx = crate::agent::RuntimeContext::new();
         let key = agent.state_session_key().expect("journal key");
         let log = store.open(&key, &ctx).await.unwrap();
-        let recorder = Arc::new(
-            SessionRecorder::open(log, Some("turn-host"))
-                .await
-                .unwrap(),
-        );
+        let recorder = Arc::new(SessionRecorder::open(log, Some("turn-host")).await.unwrap());
         let mut extensions = crate::agent::Extensions::new();
         extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
 
@@ -4215,10 +4483,7 @@ mod tests {
         input.insert("b".to_string(), serde_json::json!(2));
         let model = Arc::new(MockModel::new(
             "mock",
-            vec![
-                tool_use_response("c1", "add", input),
-                text_response("done"),
-            ],
+            vec![tool_use_response("c1", "add", input), text_response("done")],
         ));
         let agent = ReActAgent::builder()
             .name("t2-state")
@@ -4239,7 +4504,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failing_tool_result_state_is_error_in_persisted_context() {        let toolkit = Toolkit::new();
+    async fn failing_tool_result_state_is_error_in_persisted_context() {
+        let toolkit = Toolkit::new();
         // Java #2745: a tool that reports failure via its output text must surface
         // as ERROR, not SUCCESS.
         toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
@@ -4347,8 +4613,7 @@ mod tests {
         let model = Arc::new(MockModel::new(
             "mock",
             vec![
-                tool_use_response("call-stream-1", "streamer", JsonMap::new())
-                    .with_id("reply-1"),
+                tool_use_response("call-stream-1", "streamer", JsonMap::new()).with_id("reply-1"),
                 text_response("done"),
             ],
         ));
@@ -4391,7 +4656,10 @@ mod tests {
                 fields.get("tool_call_id"),
                 Some(&serde_json::json!("call-stream-1"))
             );
-            assert_eq!(fields.get("tool_name"), Some(&serde_json::json!("streamer")));
+            assert_eq!(
+                fields.get("tool_name"),
+                Some(&serde_json::json!("streamer"))
+            );
             // `content` is the whole block, not just its text (Java `ContentBlock content`).
             let content = fields.get("content").expect("progress carries its block");
             assert_eq!(
@@ -4571,10 +4839,17 @@ mod tests {
             .iter()
             .filter(|e| e.event_type() == AgentEventType::RequireExternalExecution)
             .collect();
-        assert_eq!(require.len(), 1, "expected exactly one require event; got {events:?}");
+        assert_eq!(
+            require.len(),
+            1,
+            "expected exactly one require event; got {events:?}"
+        );
         let fields = &require[0].data().fields;
         assert_eq!(fields.get("tool_call_id"), Some(&serde_json::json!("ext1")));
-        assert_eq!(fields.get("tool_name"), Some(&serde_json::json!("external")));
+        assert_eq!(
+            fields.get("tool_name"),
+            Some(&serde_json::json!("external"))
+        );
         assert_eq!(
             fields.get("reason"),
             Some(&serde_json::json!("waiting for input"))
@@ -4596,7 +4871,14 @@ mod tests {
     }
 
     impl GatedTool {
-        fn new(name: &'static str, result: &'static str) -> (Self, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        fn new(
+            name: &'static str,
+            result: &'static str,
+        ) -> (
+            Self,
+            Arc<tokio::sync::Semaphore>,
+            Arc<tokio::sync::Semaphore>,
+        ) {
             let started = Arc::new(tokio::sync::Semaphore::new(0));
             let release = Arc::new(tokio::sync::Semaphore::new(0));
             (
@@ -4638,11 +4920,7 @@ mod tests {
         ChatResponse::builder()
             .content(vec![
                 ContentBlock::ToolUse(ToolUseBlock::new("slow-call", "slow", JsonMap::new())),
-                ContentBlock::ToolUse(ToolUseBlock::new(
-                    "fast-call",
-                    second_name,
-                    JsonMap::new(),
-                )),
+                ContentBlock::ToolUse(ToolUseBlock::new("fast-call", second_name, JsonMap::new())),
             ])
             .build()
     }
@@ -4750,7 +5028,11 @@ mod tests {
         let (fast, _fast_started, fast_release) = GatedTool::new("fast", "fast result");
         fast_release.add_permits(1);
 
-        let toolkit = Toolkit::with_config(crate::tool::ToolkitConfig::builder().parallel(false).build());
+        let toolkit = Toolkit::with_config(
+            crate::tool::ToolkitConfig::builder()
+                .parallel(false)
+                .build(),
+        );
         toolkit.register_tool(Arc::new(slow));
         toolkit.register_tool(Arc::new(fast));
         let model = Arc::new(MockModel::new(
@@ -4819,10 +5101,7 @@ mod tests {
         input.insert("b".to_string(), serde_json::json!(2));
         let model = Arc::new(MockModel::new(
             "mock",
-            vec![
-                tool_use_response("c1", "add", input),
-                text_response("done"),
-            ],
+            vec![tool_use_response("c1", "add", input), text_response("done")],
         ));
         let agent = ReActAgent::builder()
             .name("t-ok-events")
@@ -4937,11 +5216,7 @@ mod tests {
         let assistant = guard
             .context()
             .iter()
-            .find(|message| {
-                message
-                    .tool_use_blocks()
-                    .any(|tool| tool.id == "trunc-1")
-            })
+            .find(|message| message.tool_use_blocks().any(|tool| tool.id == "trunc-1"))
             .expect("assistant message with the tool calls");
         assert_eq!(
             assistant
@@ -4952,7 +5227,11 @@ mod tests {
 
         // The next model request carries the ERROR result so the model can reissue it.
         let calls = seen.lock().unwrap();
-        assert_eq!(calls.len(), 2, "the loop must continue after rejecting the call");
+        assert_eq!(
+            calls.len(),
+            2,
+            "the loop must continue after rejecting the call"
+        );
         let second_request = calls[1]
             .iter()
             .flat_map(|message| message.tool_result_blocks())
@@ -5002,12 +5281,7 @@ mod tests {
             finish_reason: Some("length".to_string()),
             ..Default::default()
         };
-        context.tool_calls = vec![
-            valid,
-            invalid,
-            empty_truncated,
-            input_only_completed,
-        ];
+        context.tool_calls = vec![valid, invalid, empty_truncated, input_only_completed];
         let message = context.build_final_message();
         let tools: Vec<ToolUseBlock> = message.tool_use_blocks().cloned().collect();
         assert_eq!(tools[0].input.get("a"), Some(&serde_json::json!(1)));
@@ -5081,7 +5355,11 @@ mod tests {
             ToolResultState::Interrupted,
             &JsonMap::new(),
         );
-        let event = rx.try_next().unwrap().expect("a ToolResultEnd event").unwrap();
+        let event = rx
+            .try_next()
+            .unwrap()
+            .expect("a ToolResultEnd event")
+            .unwrap();
         assert_eq!(event.event_type(), AgentEventType::ToolResultEnd);
         assert_eq!(
             event.data().fields.get("state"),
@@ -5187,7 +5465,11 @@ mod tests {
             .collect();
         let error = items.into_iter().find_map(|item| item.err());
 
-        assert_eq!(deltas.join(""), "partial answer", "the prefix reached the consumer once");
+        assert_eq!(
+            deltas.join(""),
+            "partial answer",
+            "the prefix reached the consumer once"
+        );
         let error = error.expect("the failure must be surfaced, not retried");
         assert!(
             error.to_string().contains("retry suppressed"),
@@ -5304,7 +5586,6 @@ mod tests {
         assert_eq!(reply.generate_reason(), GenerateReason::MaxIterations);
     }
 
-
     /// A model that records every message list it is called with.
     struct RecordingModel {
         seen: Arc<Mutex<Vec<Vec<Msg>>>>,
@@ -5312,7 +5593,9 @@ mod tests {
 
     impl RecordingModel {
         fn new() -> Self {
-            Self { seen: Arc::new(Mutex::new(Vec::new())) }
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
         }
     }
 
@@ -5505,7 +5788,11 @@ mod tests {
             let session = state.session_id().to_string();
             self.calls.lock().unwrap().push((
                 input_messages.len(),
-                if session.is_empty() { None } else { Some(session) },
+                if session.is_empty() {
+                    None
+                } else {
+                    Some(session)
+                },
             ));
         }
 
@@ -5530,7 +5817,10 @@ mod tests {
             _state: &mut crate::state::AgentState,
             _input_messages: &[Msg],
         ) {
-            self.seen.lock().unwrap().push(ctx.run_id().map(str::to_string));
+            self.seen
+                .lock()
+                .unwrap()
+                .push(ctx.run_id().map(str::to_string));
         }
     }
 
@@ -5555,7 +5845,11 @@ mod tests {
         agent.call(vec![Msg::user("hi")]).await.unwrap();
 
         let recorded = calls.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 1, "on_agent_state_ready must fire once per call");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "on_agent_state_ready must fire once per call"
+        );
         assert_eq!(
             recorded[0].0, 1,
             "the callback must receive this call's input messages"
@@ -5591,7 +5885,9 @@ mod tests {
         // once the call returns.
         let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let mut chain = MiddlewareChain::new();
-        chain.add(Box::new(RunIdRecordingMiddleware { seen: Arc::clone(&seen) }));
+        chain.add(Box::new(RunIdRecordingMiddleware {
+            seen: Arc::clone(&seen),
+        }));
         let model = Arc::new(MockModel::new("mock", vec![text_response("ok")]));
         let agent = ReActAgent::builder()
             .name("t-run-id")
@@ -5602,15 +5898,23 @@ mod tests {
         agent.call(vec![Msg::user("hi")]).await.unwrap();
 
         let recorded = seen.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 1, "the run id must be visible to the pipeline");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the run id must be visible to the pipeline"
+        );
         let run_id = recorded[0].clone().expect("a run id must be assigned");
         assert_eq!(run_id.len(), 32);
         assert!(run_id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(agent.active_run().is_none(), "the run must be cleared after the call");
+        assert!(
+            agent.active_run().is_none(),
+            "the run must be cleared after the call"
+        );
     }
 
     #[tokio::test]
-    async fn reasoning_middleware_rewrites_reach_the_model() {        let model = Arc::new(RecordingModel::new());
+    async fn reasoning_middleware_rewrites_reach_the_model() {
+        let model = Arc::new(RecordingModel::new());
         let seen = Arc::clone(&model.seen);
         let mut chain = MiddlewareChain::new();
         chain.add(Box::new(RewriteReasoningMiddleware));
@@ -5693,7 +5997,9 @@ mod tests {
         {
             let state = agent.state_handle();
             let mut guard = state.lock().unwrap();
-            guard.context_mut().insert(0, Msg::system("STALE WORKSPACE PROMPT"));
+            guard
+                .context_mut()
+                .insert(0, Msg::system("STALE WORKSPACE PROMPT"));
         }
         agent.call(vec![Msg::user("second")]).await.unwrap();
 
@@ -5759,7 +6065,11 @@ mod tests {
         );
 
         let calls = seen.lock().unwrap();
-        assert_eq!(calls.len(), 2, "the tool call must force a second reasoning step");
+        assert_eq!(
+            calls.len(),
+            2,
+            "the tool call must force a second reasoning step"
+        );
         for call in calls.iter() {
             let systems: Vec<_> = call
                 .iter()
@@ -5809,8 +6119,15 @@ mod tests {
 
         let snapshots = snapshots.lock().unwrap();
         assert_eq!(snapshots.len(), 2);
-        assert_eq!(snapshots[0], (0, 1), "first call sees an empty restored history");
-        assert!(snapshots[1].0 > 0, "second call sees the previous turn in state");
+        assert_eq!(
+            snapshots[0],
+            (0, 1),
+            "first call sees an empty restored history"
+        );
+        assert!(
+            snapshots[1].0 > 0,
+            "second call sees the previous turn in state"
+        );
 
         let calls = seen.lock().unwrap();
         for call in calls.iter() {
@@ -5843,7 +6160,11 @@ mod tests {
             .iter()
             .filter(|message| message.role == MsgRole::System)
             .collect();
-        assert_eq!(systems.len(), 1, "the provider must see exactly one system message");
+        assert_eq!(
+            systems.len(),
+            1,
+            "the provider must see exactly one system message"
+        );
         assert!(systems[0].text_content().contains("BASE SYSTEM"));
         assert!(systems[0].text_content().contains("EXTRA SYSTEM"));
     }
@@ -5902,7 +6223,10 @@ mod tests {
             .flat_map(|m| m.tool_result_blocks())
             .filter(|tr| tr.id.as_deref() == Some("c1"))
             .count();
-        assert_eq!(answers, 1, "an answered tool call must not be reported twice");
+        assert_eq!(
+            answers, 1,
+            "an answered tool call must not be reported twice"
+        );
     }
 
     #[tokio::test]
@@ -5921,10 +6245,7 @@ mod tests {
         input.insert("b".to_string(), serde_json::json!(2));
         let model = Arc::new(MockModel::new(
             "mock",
-            vec![
-                tool_use_response("c1", "add", input),
-                text_response("done"),
-            ],
+            vec![tool_use_response("c1", "add", input), text_response("done")],
         ));
         let agent = ReActAgent::builder()
             .name("t4")
@@ -6000,9 +6321,17 @@ mod tests {
         let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
 
         assert_eq!(reply.text_content(), "done");
-        assert_eq!(*calls.lock().unwrap(), 1, "on_acting must be invoked once per acting phase");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "on_acting must be invoked once per acting phase"
+        );
         assert_eq!(*seen.lock().unwrap(), vec!["c-acting".to_string()]);
-        assert_eq!(*counter.lock().unwrap(), 1, "the wrapped core must execute the tool exactly once");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the wrapped core must execute the tool exactly once"
+        );
     }
 
     #[tokio::test]
@@ -6172,7 +6501,11 @@ mod tests {
             .plan_mode_context
             .set_plan_active(true);
         let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
-        assert_eq!(*counter.lock().unwrap(), 0, "mutating tool must be denied in plan mode");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "mutating tool must be denied in plan mode"
+        );
         assert_eq!(reply.text_content(), "done");
         // The denied call is recorded as a DENIED tool result, not silently dropped.
         let context = agent.core.state.lock().unwrap().context().to_vec();
@@ -6187,11 +6520,17 @@ mod tests {
     #[tokio::test]
     async fn subscriber_receives_events() {
         let model = Arc::new(MockModel::new("mock", vec![text_response("hi")]));
-        let agent = ReActAgent::builder().name("t5").model(model).build().unwrap();
+        let agent = ReActAgent::builder()
+            .name("t5")
+            .model(model)
+            .build()
+            .unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let s = Arc::clone(&seen);
         agent.subscribe(Box::new(move |ev| {
-            s.lock().unwrap().push(ev.event_type().wire_name().to_string());
+            s.lock()
+                .unwrap()
+                .push(ev.event_type().wire_name().to_string());
         }));
         agent.call(vec![Msg::user("hi")]).await.unwrap();
         let names = seen.lock().unwrap().clone();
@@ -6203,11 +6542,18 @@ mod tests {
     #[tokio::test]
     async fn stream_events_filters_by_category() {
         let model = Arc::new(MockModel::new("mock", vec![text_response("hi")]));
-        let agent = ReActAgent::builder().name("t-stream").model(model).build().unwrap();
+        let agent = ReActAgent::builder()
+            .name("t-stream")
+            .model(model)
+            .build()
+            .unwrap();
 
         // Defaults stream everything, including AGENT_START.
         let events: Vec<String> = agent
-            .stream_events(vec![Msg::user("hi")], crate::agent::stream_options::StreamOptions::defaults())
+            .stream_events(
+                vec![Msg::user("hi")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -6235,7 +6581,11 @@ mod tests {
         // incremental text, so callers can render token-by-token while the model
         // generates (边生成边打印).
         let model = Arc::new(MockModel::new("mock", vec![text_response("hello world")]));
-        let agent = ReActAgent::builder().name("t-delta").model(model).build().unwrap();
+        let agent = ReActAgent::builder()
+            .name("t-delta")
+            .model(model)
+            .build()
+            .unwrap();
 
         let events: Vec<AgentEvent> = agent
             .stream_events(
@@ -6252,10 +6602,17 @@ mod tests {
             .iter()
             .filter(|ev| ev.event_type() == AgentEventType::TextBlockDelta)
             .filter_map(|ev| {
-                ev.data().fields.get("delta").and_then(|v| v.as_str()).map(|s| s.to_string())
+                ev.data()
+                    .fields
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
             })
             .collect();
-        assert!(!deltas.is_empty(), "expected at least one TEXT_BLOCK_DELTA; got {events:?}");
+        assert!(
+            !deltas.is_empty(),
+            "expected at least one TEXT_BLOCK_DELTA; got {events:?}"
+        );
         assert_eq!(deltas.join(""), "hello world");
     }
 
@@ -6300,10 +6657,18 @@ mod tests {
             .iter()
             .filter(|ev| ev.event_type() == AgentEventType::ToolCallDelta)
             .filter_map(|ev| {
-                ev.data().fields.get("delta").and_then(|v| v.as_str()).map(|s| s.to_string())
+                ev.data()
+                    .fields
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
             })
             .collect();
-        assert_eq!(args.len(), 1, "expected exactly one ToolCallDelta; got {args:?}");
+        assert_eq!(
+            args.len(),
+            1,
+            "expected exactly one ToolCallDelta; got {args:?}"
+        );
         let parsed: serde_json::Value = serde_json::from_str(&args[0]).unwrap();
         assert_eq!(parsed["a"], serde_json::json!(1));
         assert_eq!(parsed["b"], serde_json::json!(2));
@@ -6321,7 +6686,13 @@ mod tests {
         let session_id = agent.core.state.lock().unwrap().session_id().to_string();
 
         // seed some context
-        agent.core.state.lock().unwrap().context_mut().push(Msg::user("hello"));
+        agent
+            .core
+            .state
+            .lock()
+            .unwrap()
+            .context_mut()
+            .push(Msg::user("hello"));
         assert_eq!(agent.core.state.lock().unwrap().context().len(), 1);
 
         // clear_context_for with a wrong session is a no-op
@@ -6459,8 +6830,15 @@ mod tests {
             .await
             .unwrap();
         assert!(reply.has_structured_data());
-        assert_eq!(reply.structured_data().unwrap()["age"], serde_json::json!("seven"));
-        assert_eq!(model.seen_choices.lock().unwrap().len(), 1, "no fallback round trip");
+        assert_eq!(
+            reply.structured_data().unwrap()["age"],
+            serde_json::json!("seven")
+        );
+        assert_eq!(
+            model.seen_choices.lock().unwrap().len(),
+            1,
+            "no fallback round trip"
+        );
     }
 
     #[tokio::test]
@@ -6468,7 +6846,10 @@ mod tests {
         // The model returns plain text twice (never calling `generate_response`), then
         // finally calls it. The retries must carry a forced `ToolChoice::Specific`.
         let mut resp_input = JsonMap::new();
-        resp_input.insert("response".to_string(), serde_json::json!({"name": "z", "age": 1}));
+        resp_input.insert(
+            "response".to_string(),
+            serde_json::json!({"name": "z", "age": 1}),
+        );
         let model = Arc::new(OptionsRecordingModel::new(vec![
             text_response("no tool"),
             text_response("still no tool"),
@@ -6493,7 +6874,9 @@ mod tests {
         assert_eq!(choices[1], None);
         assert_eq!(
             choices[2],
-            Some(crate::model::ToolChoice::Specific { tool_name: STRUCTURED_OUTPUT_TOOL_NAME.into() })
+            Some(crate::model::ToolChoice::Specific {
+                tool_name: STRUCTURED_OUTPUT_TOOL_NAME.into()
+            })
         );
     }
 
@@ -6508,7 +6891,10 @@ mod tests {
         );
         let model = Arc::new(MockModel::new(
             "mock",
-            vec![tool_use_response("t1", "todo_write", input), text_response("done")],
+            vec![
+                tool_use_response("t1", "todo_write", input),
+                text_response("done"),
+            ],
         ));
         let agent = ReActAgent::builder()
             .name("t-todo")
@@ -6738,7 +7124,11 @@ mod tests {
             .build()
             .unwrap();
         let reply = agent.call(vec![Msg::user("search the web")]).await.unwrap();
-        assert_eq!(*counter.lock().unwrap(), 0, "server tool must not hit the local toolkit");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "server tool must not hit the local toolkit"
+        );
         // The turn ends on the provider's assistant message, not a fabricated error result.
         assert!(reply
             .tool_use_blocks()
@@ -6750,9 +7140,10 @@ mod tests {
     #[test]
     fn pending_tool_calls_skip_server_tools_without_inline_results() {
         let mut server_call = ToolUseBlock::new("s1", "google_search", JsonMap::new());
-        server_call
-            .metadata
-            .insert(ToolUseBlock::METADATA_SERVER_TOOL.to_string(), serde_json::json!(true));
+        server_call.metadata.insert(
+            ToolUseBlock::METADATA_SERVER_TOOL.to_string(),
+            serde_json::json!(true),
+        );
         let mut local_call = ToolUseBlock::new("c1", "add", JsonMap::new());
         local_call.id = "c1".to_string();
         let mut state = AgentState::default();
@@ -6804,7 +7195,11 @@ mod tests {
                     a.interrupt();
                 }
                 let mut g = responses.lock().unwrap();
-                let r = if g.is_empty() { text_response("done") } else { g.remove(0) };
+                let r = if g.is_empty() {
+                    text_response("done")
+                } else {
+                    g.remove(0)
+                };
                 Ok(r)
             }))
         }
@@ -6862,8 +7257,15 @@ mod tests {
             .filter(|m| m.role() == MsgRole::Tool)
             .flat_map(|m| m.tool_result_blocks())
             .any(|t| t.id.as_deref() == Some("c1"));
-        assert!(answered, "the dangling c1 tool_use must be answered; got {ctx:?}");
-        assert_eq!(*counter.lock().unwrap(), 0, "the interrupted tool must not run");
+        assert!(
+            answered,
+            "the dangling c1 tool_use must be answered; got {ctx:?}"
+        );
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "the interrupted tool must not run"
+        );
     }
 
     #[tokio::test]
@@ -6872,7 +7274,11 @@ mod tests {
         // a fresh InterruptControl, so the next call has to run normally rather
         // than immediately failing on the stale signal.
         let model = Arc::new(MockModel::new("mock", vec![text_response("hello")]));
-        let agent = ReActAgent::builder().name("t-reset").model(model).build().unwrap();
+        let agent = ReActAgent::builder()
+            .name("t-reset")
+            .model(model)
+            .build()
+            .unwrap();
 
         agent.interrupt();
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
@@ -6920,8 +7326,15 @@ mod tests {
             .filter(|m| m.role() == MsgRole::Tool)
             .flat_map(|m| m.tool_result_blocks())
             .any(|t| t.id.as_deref() == Some("c9"));
-        assert!(answered, "orphaned c9 tool_use must be patched; got {ctx:?}");
-        assert_eq!(*counter.lock().unwrap(), 0, "the orphaned tool must not execute");
+        assert!(
+            answered,
+            "orphaned c9 tool_use must be patched; got {ctx:?}"
+        );
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "the orphaned tool must not execute"
+        );
     }
 
     #[tokio::test]
@@ -7035,7 +7448,9 @@ mod tests {
         let signal = CancelSignal::new();
         let call_signal = signal.clone();
         let handle = tokio::spawn(async move {
-            agent.call_with_cancel(vec![Msg::user("hi")], call_signal).await
+            agent
+                .call_with_cancel(vec![Msg::user("hi")], call_signal)
+                .await
         });
         // Let the call start, then ask it to stop.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

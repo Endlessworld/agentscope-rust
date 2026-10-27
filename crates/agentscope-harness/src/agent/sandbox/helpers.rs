@@ -28,7 +28,10 @@ impl WorkspaceMountSupport {
     /// Absolute mount path inside the sandbox for a top-level entry key.
     pub fn container_mount_path(workspace_root: &str, entry_key: &str) -> String {
         let root = workspace_root.strip_suffix('/').unwrap_or(workspace_root);
-        let key = entry_key.strip_prefix('/').unwrap_or(entry_key).replace('\\', "/");
+        let key = entry_key
+            .strip_prefix('/')
+            .unwrap_or(entry_key)
+            .replace('\\', "/");
         format!("{root}/{key}")
     }
 
@@ -63,7 +66,9 @@ impl WorkspaceMountSupport {
         } else {
             std::env::current_dir().unwrap_or_default().join(path)
         };
-        normalize_lexical(&absolute).to_string_lossy().replace('\\', "/")
+        normalize_lexical(&absolute)
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 }
 
@@ -233,7 +238,10 @@ impl WorkspaceProjectionApplier {
                     continue;
                 }
                 if resolved.is_file() {
-                    files.insert(normalize_path(root), std::fs::read(&resolved).map_err(Error::Io)?);
+                    files.insert(
+                        normalize_path(root),
+                        std::fs::read(&resolved).map_err(Error::Io)?,
+                    );
                 } else if resolved.is_dir() {
                     collect_dir_files(&source_root, &resolved, &mut files)?;
                 }
@@ -260,7 +268,11 @@ impl WorkspaceProjectionApplier {
         tar_bytes.extend_from_slice(&[0u8; 1024]);
 
         let file_count = files.len();
-        Ok(Some(ProjectionPayload { hash, tar_bytes, file_count }))
+        Ok(Some(ProjectionPayload {
+            hash,
+            tar_bytes,
+            file_count,
+        }))
     }
 }
 
@@ -279,11 +291,7 @@ fn collect_projection_entries(
     }
 }
 
-fn collect_dir_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<()> {
+fn collect_dir_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
     let entries = std::fs::read_dir(dir).map_err(Error::Io)?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -291,7 +299,10 @@ fn collect_dir_files(
             collect_dir_files(root, &path, out)?;
         } else if path.is_file() {
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            out.insert(normalize_path(&rel.to_string_lossy()), std::fs::read(&path).map_err(Error::Io)?);
+            out.insert(
+                normalize_path(&rel.to_string_lossy()),
+                std::fs::read(&path).map_err(Error::Io)?,
+            );
         }
     }
     Ok(())

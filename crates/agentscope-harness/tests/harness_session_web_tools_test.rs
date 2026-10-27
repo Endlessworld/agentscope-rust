@@ -120,7 +120,10 @@ async fn session_tools_do_not_leak_across_users() {
     let key = SessionKey::new(Some("bob"), "researcher", "s1").unwrap();
     let log = store.open(&key, &other).await.unwrap();
     let recorder = SessionRecorder::open(log, None).await.unwrap();
-    let mut state = AgentState::builder().session_id("s1").user_id("bob").build();
+    let mut state = AgentState::builder()
+        .session_id("s1")
+        .user_id("bob")
+        .build();
     state.context.push(Msg::user("qubits are fun"));
     recorder.start(&[], &state).await.unwrap();
     recorder.finish(&state, "completed").await.unwrap();

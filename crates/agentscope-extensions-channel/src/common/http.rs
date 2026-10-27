@@ -230,10 +230,8 @@ mod tests {
 
     #[test]
     fn post_json_sets_content_type_and_body() {
-        let req = PreparedRequest::post_json(
-            "https://example.test/x",
-            serde_json::json!({ "a": 1 }),
-        );
+        let req =
+            PreparedRequest::post_json("https://example.test/x", serde_json::json!({ "a": 1 }));
         assert_eq!(req.method, HttpMethod::Post);
         assert_eq!(req.header_value("Content-Type"), Some("application/json"));
         assert_eq!(req.body, Some(serde_json::json!({ "a": 1 })));

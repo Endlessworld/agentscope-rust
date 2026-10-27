@@ -12,8 +12,8 @@
 //! Domain helpers (`inbox*`, `enqueue_wakeup`, `session*`) map higher-level
 //! concepts onto these primitives with a fixed key-naming convention.
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 
 /// A single transport entry: the bus-assigned id plus the JSON payload.
@@ -25,7 +25,10 @@ pub struct BusEntry {
 
 impl BusEntry {
     pub fn new(id: impl Into<String>, payload: Value) -> Self {
-        Self { id: id.into(), payload }
+        Self {
+            id: id.into(),
+            payload,
+        }
     }
 }
 
@@ -95,7 +98,8 @@ pub trait MessageBus: Send + Sync {
     /// Check whether a session's inbox has pending messages without consuming
     /// them.
     async fn inbox_has_messages(&self, session_id: &str) -> Result<bool> {
-        self.queue_peek(&format!("{INBOX_KEY_PREFIX}{session_id}")).await
+        self.queue_peek(&format!("{INBOX_KEY_PREFIX}{session_id}"))
+            .await
     }
 
     /// Push a message into a session's inbox queue.
@@ -136,7 +140,9 @@ pub trait MessageBus: Send + Sync {
     /// subscribers can replay from the log; returns the replay-log entry id.
     async fn session_publish_event(&self, session_id: &str, event: Value) -> Result<String> {
         let key = format!("{SESSION_EVENTS_KEY_PREFIX}{session_id}");
-        let entry_id = self.log_append(&key, event.clone(), SESSION_REPLAY_MAX_LEN).await?;
+        let entry_id = self
+            .log_append(&key, event.clone(), SESSION_REPLAY_MAX_LEN)
+            .await?;
         let mut live = event;
         if let Some(obj) = live.as_object_mut() {
             obj.insert("_entry_id".to_string(), Value::String(entry_id.clone()));
@@ -152,18 +158,26 @@ pub trait MessageBus: Send + Sync {
         since: Option<&str>,
         max_count: usize,
     ) -> Result<Vec<BusEntry>> {
-        self.log_read(&format!("{SESSION_EVENTS_KEY_PREFIX}{session_id}"), since, max_count)
-            .await
+        self.log_read(
+            &format!("{SESSION_EVENTS_KEY_PREFIX}{session_id}"),
+            since,
+            max_count,
+        )
+        .await
     }
 
     /// Live-subscribe to a session's published events.
-    fn session_subscribe_events(&self, session_id: &str) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+    fn session_subscribe_events(
+        &self,
+        session_id: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
         self.subscribe(&format!("{SESSION_EVENTS_KEY_PREFIX}{session_id}"))
     }
 
     /// Trim the session's event replay log so late subscribers don't replay stale
     /// events from a previous run.
     async fn session_trim_events(&self, session_id: &str) -> Result<()> {
-        self.log_trim(&format!("{SESSION_EVENTS_KEY_PREFIX}{session_id}")).await
+        self.log_trim(&format!("{SESSION_EVENTS_KEY_PREFIX}{session_id}"))
+            .await
     }
 }

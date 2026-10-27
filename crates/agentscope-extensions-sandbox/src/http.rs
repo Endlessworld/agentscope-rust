@@ -166,9 +166,18 @@ mod tests {
 
     #[test]
     fn join_url_handles_slashes() {
-        assert_eq!(join_url("https://api.test", "/sandboxes"), "https://api.test/sandboxes");
-        assert_eq!(join_url("https://api.test/", "sandboxes"), "https://api.test/sandboxes");
-        assert_eq!(join_url("https://api.test/", "/sandboxes/"), "https://api.test/sandboxes/");
+        assert_eq!(
+            join_url("https://api.test", "/sandboxes"),
+            "https://api.test/sandboxes"
+        );
+        assert_eq!(
+            join_url("https://api.test/", "sandboxes"),
+            "https://api.test/sandboxes"
+        );
+        assert_eq!(
+            join_url("https://api.test/", "/sandboxes/"),
+            "https://api.test/sandboxes/"
+        );
     }
 
     #[test]

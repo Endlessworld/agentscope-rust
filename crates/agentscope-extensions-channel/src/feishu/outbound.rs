@@ -102,10 +102,8 @@ impl FeishuOutboundClient {
                 Self::receive_id_type()
             ),
         };
-        Ok(
-            PreparedRequest::post_json(url, Value::Object(body))
-                .header("Authorization", format!("Bearer {token}")),
-        )
+        Ok(PreparedRequest::post_json(url, Value::Object(body))
+            .header("Authorization", format!("Bearer {token}")))
     }
 
     /// Build one request per message (no delivery id).
@@ -146,9 +144,7 @@ impl FeishuOutboundClient {
         let response = self.transport.execute(request).await?;
         let message_id = self.parse_send_response(&response.body)?;
         if message_id.trim().is_empty() {
-            return Err(ChannelError::Parse(
-                "Feishu message ID missing".to_string(),
-            ));
+            return Err(ChannelError::Parse("Feishu message ID missing".to_string()));
         }
         Ok(message_id)
     }
@@ -271,10 +267,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_with_receipt_returns_message_id() {
-        let transport = Arc::new(RecordingTransport::with_responses(vec![PreparedResponse::new(
-            200,
-            r#"{"code":0,"data":{"message_id":"om_42"}}"#,
-        )]));
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, r#"{"code":0,"data":{"message_id":"om_42"}}"#),
+        ]));
         let c = client(transport, Arc::new(StaticTokenProvider::new("tok")));
         let address = OutboundAddress::direct("feishu", "feishu:DIRECT:oc_1");
         let id = c

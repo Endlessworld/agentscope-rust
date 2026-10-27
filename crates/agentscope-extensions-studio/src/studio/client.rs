@@ -8,9 +8,7 @@ use agentscope_core::message::{Msg, MsgRole};
 
 use crate::error::{StudioError, StudioResult};
 use crate::studio::config::StudioConfig;
-use crate::studio::pojo::{
-    PushMessageRequest, RegisterRunRequest, RequestUserInputRequest,
-};
+use crate::studio::pojo::{PushMessageRequest, RegisterRunRequest, RequestUserInputRequest};
 
 /// Timestamp format used by Studio (`yyyy-MM-dd HH:mm:ss.SSS`), UTC.
 fn format_timestamp(ts: DateTime<Utc>) -> String {
@@ -46,7 +44,11 @@ impl StudioClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let base_url = config.studio_url().to_string();
-        Self { http, config, base_url }
+        Self {
+            http,
+            config,
+            base_url,
+        }
     }
 
     /// Returns the configuration backing this client.
@@ -158,7 +160,10 @@ impl StudioClient {
         let response = self
             .http
             .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            )
             .json(payload)
             .send()
             .await
@@ -166,10 +171,7 @@ impl StudioClient {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| String::new());
+            let message = response.text().await.unwrap_or_else(|_| String::new());
             return Err(StudioError::Http {
                 status: status.as_u16(),
                 message,

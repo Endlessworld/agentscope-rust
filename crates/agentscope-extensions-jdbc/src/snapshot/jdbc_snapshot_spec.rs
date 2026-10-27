@@ -33,7 +33,10 @@ impl Clone for JdbcSnapshotSpec {
 
 impl JdbcSnapshotSpec {
     /// Creates a spec with auto table creation.
-    pub fn new(executor: SharedExecutor, dialect: Arc<dyn AbstractJdbcDialect>) -> JdbcResult<Self> {
+    pub fn new(
+        executor: SharedExecutor,
+        dialect: Arc<dyn AbstractJdbcDialect>,
+    ) -> JdbcResult<Self> {
         Self::with_schema_control(executor, dialect, true)
     }
 
@@ -50,7 +53,9 @@ impl JdbcSnapshotSpec {
     }
 
     /// The underlying [`RemoteSnapshotClient`], mirroring the Java `getClient()`.
-    pub fn client(&self) -> &Arc<dyn agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient> {
+    pub fn client(
+        &self,
+    ) -> &Arc<dyn agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient> {
         self.inner.client()
     }
 }

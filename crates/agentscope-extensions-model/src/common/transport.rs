@@ -218,7 +218,10 @@ impl ReqwestTransport {
     /// The supplied client's own timeout settings win; the retry policy still
     /// comes from the default config.
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client, config: TransportConfig::default() }
+        Self {
+            client,
+            config: TransportConfig::default(),
+        }
     }
 
     /// Replaces the retry/timeout policy of an existing transport.
@@ -255,9 +258,8 @@ impl ReqwestTransport {
         if !status.is_success() {
             return Err(ModelError::parse(&req.provider, status.as_u16(), &text));
         }
-        serde_json::from_str(&text).map_err(|e| {
-            ModelError::new(&req.provider, 200, format!("invalid JSON response: {e}"))
-        })
+        serde_json::from_str(&text)
+            .map_err(|e| ModelError::new(&req.provider, 200, format!("invalid JSON response: {e}")))
     }
 }
 
@@ -346,12 +348,18 @@ pub struct MemoryTransport {
 impl MemoryTransport {
     /// Creates a transport that yields the given non-streaming response.
     pub fn with_response(response: serde_json::Value) -> Self {
-        Self { response: Some(response), ..Default::default() }
+        Self {
+            response: Some(response),
+            ..Default::default()
+        }
     }
 
     /// Creates a transport that yields the given streaming chunks.
     pub fn with_stream(items: Vec<serde_json::Value>) -> Self {
-        Self { stream_items: items, ..Default::default() }
+        Self {
+            stream_items: items,
+            ..Default::default()
+        }
     }
 
     /// Returns the last captured request spec, if any.

@@ -43,13 +43,8 @@ pub trait StoreDialect: TableNameConfigurable + Send + Sync {
     fn store_create_table_ddls(&self) -> Vec<String>;
 
     /// UPSERT: insert a new row with `version = 1` or update an existing row `version + 1`.
-    fn store_upsert(
-        &self,
-        namespace_path: &str,
-        key: &str,
-        json: &str,
-        timestamp: i64,
-    ) -> BoundSql;
+    fn store_upsert(&self, namespace_path: &str, key: &str, json: &str, timestamp: i64)
+        -> BoundSql;
 
     /// INSERT for create-only writes (`version` starts at 1). PK violation means the row
     /// already exists — the CAS path uses this to detect "key already present".

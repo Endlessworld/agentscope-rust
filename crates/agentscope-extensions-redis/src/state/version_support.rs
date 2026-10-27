@@ -84,7 +84,10 @@ mod tests {
 
     #[test]
     fn version_key_appends_suffix() {
-        assert_eq!(version_key("agentscope:session:u/s:k"), "agentscope:session:u/s:k:ver");
+        assert_eq!(
+            version_key("agentscope:session:u/s:k"),
+            "agentscope:session:u/s:k:ver"
+        );
     }
 
     #[test]

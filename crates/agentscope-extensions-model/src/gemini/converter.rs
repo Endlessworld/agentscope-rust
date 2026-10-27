@@ -25,8 +25,8 @@ use agentscope_core::{
 
 use super::dto::{
     GeminiContent, GeminiFunctionCall, GeminiFunctionCallingConfig, GeminiFunctionDeclaration,
-    GeminiFunctionResponse, GeminiGenerationConfig, GeminiPart, GeminiRequest, GeminiThinkingConfig,
-    GeminiTool, GeminiToolConfig,
+    GeminiFunctionResponse, GeminiGenerationConfig, GeminiPart, GeminiRequest,
+    GeminiThinkingConfig, GeminiTool, GeminiToolConfig,
 };
 
 /// Marks the start of the merged history block (shared by merger + formatter).
@@ -86,21 +86,30 @@ fn media_fallback(text: &str, path: &str) -> GeminiPart {
 fn image_part(block: &ImageBlock) -> GeminiPart {
     match media_part(&block.source, "image") {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Image - processing failed: {e}]"), "content.image"),
+        Err(e) => media_fallback(
+            &format!("[Image - processing failed: {e}]"),
+            "content.image",
+        ),
     }
 }
 
 fn audio_part(block: &AudioBlock) -> GeminiPart {
     match media_part(&block.source, "audio") {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Audio - processing failed: {e}]"), "content.audio"),
+        Err(e) => media_fallback(
+            &format!("[Audio - processing failed: {e}]"),
+            "content.audio",
+        ),
     }
 }
 
 fn video_part(block: &VideoBlock) -> GeminiPart {
     match media_part(&block.source, "video") {
         Ok(part) => part,
-        Err(e) => media_fallback(&format!("[Video - processing failed: {e}]"), "content.video"),
+        Err(e) => media_fallback(
+            &format!("[Video - processing failed: {e}]"),
+            "content.video",
+        ),
     }
 }
 
@@ -149,7 +158,9 @@ pub fn tool_result_content(block: &ToolUseBlockResult) -> GeminiContent {
     let mut response = serde_json::Map::new();
     response.insert(
         "output".to_string(),
-        serde_json::Value::String(agentscope_core::convert_tool_result_to_string(&block.output)),
+        serde_json::Value::String(agentscope_core::convert_tool_result_to_string(
+            &block.output,
+        )),
     );
     let function_response = GeminiFunctionResponse {
         id: block.id.map(str::to_string),
@@ -191,11 +202,13 @@ pub fn to_gemini_contents(messages: &[Msg]) -> Vec<GeminiContent> {
                     parts.push(GeminiPart::text(hint.clone().unwrap_or_default()))
                 }
                 ContentBlock::ToolUse(t) => parts.push(tool_call_part(t)),
-                ContentBlock::ToolResult(tr) => tool_results.push(tool_result_content(&ToolUseBlockResult {
-                    id: tr.id.as_deref(),
-                    name: tr.name.as_deref(),
-                    output: &tr.output,
-                })),
+                ContentBlock::ToolResult(tr) => {
+                    tool_results.push(tool_result_content(&ToolUseBlockResult {
+                        id: tr.id.as_deref(),
+                        name: tr.name.as_deref(),
+                        output: &tr.output,
+                    }))
+                }
                 ContentBlock::Image(i) => parts.push(image_part(i)),
                 ContentBlock::Audio(a) => parts.push(audio_part(a)),
                 ContentBlock::Video(v) => parts.push(video_part(v)),
@@ -230,7 +243,10 @@ pub fn to_gemini_tools(tools: &[ToolSchema]) -> Option<GeminiTool> {
                 .then(|| serde_json::Value::Object(schema.parameters.clone())),
         })
         .collect();
-    Some(GeminiTool { function_declarations: declarations, ..Default::default() })
+    Some(GeminiTool {
+        function_declarations: declarations,
+        ..Default::default()
+    })
 }
 
 /// A provider-executed (server) tool declaration.
@@ -281,7 +297,9 @@ pub fn merge_server_tools(
             include_server_side_tool_invocations: None,
         },
     });
-    config.function_calling_config.include_server_side_tool_invocations = Some(true);
+    config
+        .function_calling_config
+        .include_server_side_tool_invocations = Some(true);
 }
 
 /// Builds the Gemini `toolConfig`, or `None` for the default `AUTO` mode.
@@ -311,8 +329,10 @@ pub fn apply_options(
     default_options: &GenerateOptions,
 ) -> GeminiGenerationConfig {
     let pick = |f: fn(&GenerateOptions) -> Option<f64>| f(options).or_else(|| f(default_options));
-    let pick_u32 = |f: fn(&GenerateOptions) -> Option<u32>| f(options).or_else(|| f(default_options));
-    let pick_i64 = |f: fn(&GenerateOptions) -> Option<i64>| f(options).or_else(|| f(default_options));
+    let pick_u32 =
+        |f: fn(&GenerateOptions) -> Option<u32>| f(options).or_else(|| f(default_options));
+    let pick_i64 =
+        |f: fn(&GenerateOptions) -> Option<i64>| f(options).or_else(|| f(default_options));
 
     let thinking_budget = pick_u32(|o| o.thinking_budget);
     GeminiGenerationConfig {
@@ -377,10 +397,7 @@ pub fn build_request_with_server_tools(
 /// `"Tool: <name>\n<output>"`; thinking blocks are skipped. Media flushes the
 /// pending text and appears as its own part; the prompt and open/close tags are
 /// attached to the first/last part (inserting text parts when those are media).
-pub fn merge_to_content(
-    messages: &[Msg],
-    history_prompt: &str,
-) -> GeminiContent {
+pub fn merge_to_content(messages: &[Msg], history_prompt: &str) -> GeminiContent {
     let mut parts: Vec<GeminiPart> = Vec::new();
     let mut text: Vec<String> = Vec::new();
 
@@ -435,7 +452,10 @@ pub fn merge_to_content(
             let first = parts[0].text.take().unwrap_or_default();
             parts[0].text = Some(format!("{history_prompt}{HISTORY_START_TAG}{first}"));
         } else {
-            parts.insert(0, GeminiPart::text(format!("{history_prompt}{HISTORY_START_TAG}")));
+            parts.insert(
+                0,
+                GeminiPart::text(format!("{history_prompt}{HISTORY_START_TAG}")),
+            );
         }
 
         let last = parts.len() - 1;
@@ -446,7 +466,10 @@ pub fn merge_to_content(
         }
     }
 
-    GeminiContent { role: "user".to_string(), parts }
+    GeminiContent {
+        role: "user".to_string(),
+        parts,
+    }
 }
 
 /// Message group kind used by the multi-agent formatter.
@@ -486,7 +509,11 @@ pub fn to_multi_agent_contents(
                  is_first: &mut bool,
                  out: &mut Vec<GeminiContent>| match group_type {
         GroupType::AgentMessage => {
-            let prompt = if *is_first { conversation_history_prompt } else { "" };
+            let prompt = if *is_first {
+                conversation_history_prompt
+            } else {
+                ""
+            };
             *is_first = false;
             out.push(merge_to_content(group, prompt));
         }
@@ -495,8 +522,14 @@ pub fn to_multi_agent_contents(
 
     for msg in messages.iter().skip(start) {
         let msg_type = if msg.role == MsgRole::Tool
-            || msg.content.iter().any(|b| matches!(b, ContentBlock::ToolUse(_)))
-            || msg.content.iter().any(|b| matches!(b, ContentBlock::ToolResult(_)))
+            || msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_)))
+            || msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult(_)))
         {
             GroupType::ToolSequence
         } else {
@@ -537,7 +570,10 @@ mod tests {
         ToolSchema {
             name: name.to_string(),
             description: format!("{name} desc"),
-            parameters: serde_json::json!({"type": "object"}).as_object().unwrap().clone(),
+            parameters: serde_json::json!({"type": "object"})
+                .as_object()
+                .unwrap()
+                .clone(),
             output_schema: None,
             strict: None,
             defer_loading: None,
@@ -603,9 +639,9 @@ mod tests {
 
     #[test]
     fn thinking_blocks_are_not_sent_back() {
-        let contents = to_gemini_contents(&[Msg::assistant_blocks(vec![
-            ContentBlock::Thinking(ThinkingBlock::new("reasoning")),
-        ])]);
+        let contents = to_gemini_contents(&[Msg::assistant_blocks(vec![ContentBlock::Thinking(
+            ThinkingBlock::new("reasoning"),
+        )])]);
         assert!(contents.is_empty());
     }
 
@@ -625,7 +661,10 @@ mod tests {
             ImageBlock::new(Source::Url(URLSource::new("https://x/a.png"))),
         )])]);
         let text = contents[0].parts[0].text.as_deref().unwrap();
-        assert!(text.starts_with("[Image - processing failed:"), "got {text}");
+        assert!(
+            text.starts_with("[Image - processing failed:"),
+            "got {text}"
+        );
         assert!(text.contains("requires a registered MediaResolver"));
     }
 
@@ -635,7 +674,9 @@ mod tests {
         let path = dir.join(format!("agentscope_gemini_{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"hello").unwrap();
         let contents = to_gemini_contents(&[Msg::user_blocks(vec![ContentBlock::Image(
-            ImageBlock::new(Source::Url(URLSource::new(path.to_string_lossy().to_string()))),
+            ImageBlock::new(Source::Url(URLSource::new(
+                path.to_string_lossy().to_string(),
+            ))),
         )])]);
         let inline = contents[0].parts[0].inline_data.as_ref().unwrap();
         assert_eq!(inline.mime_type, "image/png");
@@ -659,14 +700,23 @@ mod tests {
     fn tool_choice_mapping_matches_java() {
         assert!(to_tool_choice(&ToolChoice::Auto).is_none());
         assert_eq!(
-            to_tool_choice(&ToolChoice::None).unwrap().function_calling_config.mode,
+            to_tool_choice(&ToolChoice::None)
+                .unwrap()
+                .function_calling_config
+                .mode,
             "NONE"
         );
         assert_eq!(
-            to_tool_choice(&ToolChoice::Required).unwrap().function_calling_config.mode,
+            to_tool_choice(&ToolChoice::Required)
+                .unwrap()
+                .function_calling_config
+                .mode,
             "ANY"
         );
-        let specific = to_tool_choice(&ToolChoice::Specific { tool_name: "f".into() }).unwrap();
+        let specific = to_tool_choice(&ToolChoice::Specific {
+            tool_name: "f".into(),
+        })
+        .unwrap();
         assert_eq!(specific.function_calling_config.mode, "ANY");
         assert_eq!(
             specific.function_calling_config.allowed_function_names,
@@ -713,13 +763,24 @@ mod tests {
     #[test]
     fn build_request_wires_tools_and_tool_choice() {
         let options = GenerateOptions {
-            tool_choice: Some(ToolChoice::Specific { tool_name: "f".into() }),
+            tool_choice: Some(ToolChoice::Specific {
+                tool_name: "f".into(),
+            }),
             ..Default::default()
         };
-        let request = build_request(&[Msg::user("hi")], &[tool_schema("f")], &options, &GenerateOptions::default());
+        let request = build_request(
+            &[Msg::user("hi")],
+            &[tool_schema("f")],
+            &options,
+            &GenerateOptions::default(),
+        );
         assert!(request.tools.is_some());
         assert_eq!(
-            request.tool_config.unwrap().function_calling_config.allowed_function_names,
+            request
+                .tool_config
+                .unwrap()
+                .function_calling_config
+                .allowed_function_names,
             Some(vec!["f".to_string()])
         );
     }
@@ -764,8 +825,16 @@ mod tests {
     #[test]
     fn merge_to_content_wraps_history_tags_and_names() {
         let messages = vec![
-            Msg::builder().role(MsgRole::User).name("Alice").text_content("hi").build(),
-            Msg::builder().role(MsgRole::Assistant).name("Bob").text_content("hello").build(),
+            Msg::builder()
+                .role(MsgRole::User)
+                .name("Alice")
+                .text_content("hi")
+                .build(),
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .name("Bob")
+                .text_content("hello")
+                .build(),
         ];
         let content = merge_to_content(&messages, "PROMPT\n");
         assert_eq!(content.role, "user");
@@ -776,9 +845,9 @@ mod tests {
 
     #[test]
     fn merge_to_content_inserts_tag_parts_around_media() {
-        let messages = vec![Msg::user_blocks(vec![ContentBlock::Image(ImageBlock::new(
-            Source::Base64(Base64Source::new("image/png", "AAAA")),
-        ))])];
+        let messages = vec![Msg::user_blocks(vec![ContentBlock::Image(
+            ImageBlock::new(Source::Base64(Base64Source::new("image/png", "AAAA"))),
+        )])];
         let content = merge_to_content(&messages, "");
         // Opening tag text part, inline image, closing tag text part.
         assert_eq!(content.parts.len(), 3);
@@ -791,8 +860,16 @@ mod tests {
     fn multi_agent_groups_tool_sequences_separately() {
         let messages = vec![
             Msg::system("be brief"),
-            Msg::builder().role(MsgRole::User).name("Alice").text_content("hi").build(),
-            Msg::builder().role(MsgRole::Assistant).name("Bob").text_content("hello").build(),
+            Msg::builder()
+                .role(MsgRole::User)
+                .name("Alice")
+                .text_content("hi")
+                .build(),
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .name("Bob")
+                .text_content("hello")
+                .build(),
             Msg::assistant_blocks(vec![ContentBlock::ToolUse(ToolUseBlock::new(
                 "call_1",
                 "f",

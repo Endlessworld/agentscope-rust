@@ -18,7 +18,8 @@ use crate::model::{AgentTaskAssignment, MessageItem, SubagentInfo, ToolInfo};
 #[async_trait::async_trait]
 pub trait SessionCompactor: Send + Sync {
     /// Compacts `state` for `session_id`, returning the summary that was injected.
-    async fn compact(&self, session_id: &str, state: &mut AgentState) -> ControlPlaneResult<String>;
+    async fn compact(&self, session_id: &str, state: &mut AgentState)
+        -> ControlPlaneResult<String>;
 }
 
 /// Reads full session history including messages already compacted away, mirroring
@@ -62,7 +63,11 @@ pub trait AgentRuntimeSource: Send + Sync {
     }
 
     /// Cancels a subagent task; returns whether it was found and cancelled.
-    async fn cancel_subagent_task(&self, _session_id: &str, _task_id: &str) -> ControlPlaneResult<bool> {
+    async fn cancel_subagent_task(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+    ) -> ControlPlaneResult<bool> {
         Err(crate::error::ControlPlaneError::Unsupported(
             crate::adapter::CAP_SUBAGENT_TASK_COMMAND.to_string(),
         ))

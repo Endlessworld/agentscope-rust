@@ -25,7 +25,9 @@ impl Default for CallGate {
 impl CallGate {
     /// Creates a new empty gate.
     pub fn new() -> Self {
-        Self { tails: Mutex::new(HashMap::new()) }
+        Self {
+            tails: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Runs `fut`, serializing against other calls sharing the same `key`.
@@ -41,7 +43,11 @@ impl CallGate {
         if let Some(prev) = prev {
             prev.notified().await;
         }
-        let _guard = ReleaseGuard { gate: self, key, release: Arc::clone(&release) };
+        let _guard = ReleaseGuard {
+            gate: self,
+            key,
+            release: Arc::clone(&release),
+        };
         fut.await
     }
 }
@@ -115,11 +121,17 @@ mod tests {
         }
         let order = order.lock().unwrap().clone();
         for i in 0..3usize {
-            let si = order.iter().position(|x| x == &format!("start{i}")).unwrap();
+            let si = order
+                .iter()
+                .position(|x| x == &format!("start{i}"))
+                .unwrap();
             let ei = order.iter().position(|x| x == &format!("end{i}")).unwrap();
             assert!(si < ei, "start must precede end");
             if i > 0 {
-                let prev_e = order.iter().position(|x| x == &format!("end{}", i - 1)).unwrap();
+                let prev_e = order
+                    .iter()
+                    .position(|x| x == &format!("end{}", i - 1))
+                    .unwrap();
                 assert!(prev_e < si, "previous call must finish before next starts");
             }
         }
@@ -148,7 +160,10 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        assert!(max_active.load(Ordering::SeqCst) >= 2, "different keys must overlap");
+        assert!(
+            max_active.load(Ordering::SeqCst) >= 2,
+            "different keys must overlap"
+        );
     }
 
     #[tokio::test]

@@ -3,9 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::{RuntimeContext, StreamOptions};
-use agentscope_core::message::{
-    ContentBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock,
-};
+use agentscope_core::message::{ContentBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::permission::{PermissionBehavior, PermissionContextState, PermissionRule};
 use agentscope_core::tool::Toolkit;
@@ -48,19 +46,49 @@ async fn filesystem_tools_registered_and_dispatch() {
     let toolkit = Toolkit::new();
     FilesystemTool::register(&toolkit, fs.clone());
 
-    for name in ["read_file", "write_file", "edit_file", "grep_files", "glob_files", "list_files"] {
-        assert!(toolkit.tool_names().contains(&name.to_string()), "missing {name}");
+    for name in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "grep_files",
+        "glob_files",
+        "list_files",
+    ] {
+        assert!(
+            toolkit.tool_names().contains(&name.to_string()),
+            "missing {name}"
+        );
     }
 
     // write_file then read_file roundtrip
-    let write_call = ToolUseBlock::new("1", "write_file", serde_json::json!({ "operations": [{ "path": "/a.txt", "content": "hello world" }] }).as_object().cloned().unwrap());
-    let r = toolkit.call_tool(&write_call, Default::default()).await.unwrap();
+    let write_call = ToolUseBlock::new(
+        "1",
+        "write_file",
+        serde_json::json!({ "operations": [{ "path": "/a.txt", "content": "hello world" }] })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let r = toolkit
+        .call_tool(&write_call, Default::default())
+        .await
+        .unwrap();
     // The batch tools dropped the historical `### ` header on purpose (580691b).
     assert!(result_text(&r).contains("/a.txt"));
     assert!(result_text(&r).contains("Written"));
 
-    let read_call = ToolUseBlock::new("2", "read_file", serde_json::json!({ "filePath": ["/a.txt"] }).as_object().cloned().unwrap());
-    let r = toolkit.call_tool(&read_call, Default::default()).await.unwrap();
+    let read_call = ToolUseBlock::new(
+        "2",
+        "read_file",
+        serde_json::json!({ "filePath": ["/a.txt"] })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let r = toolkit
+        .call_tool(&read_call, Default::default())
+        .await
+        .unwrap();
     assert!(result_text(&r).contains("hello world"));
 }
 
@@ -101,7 +129,10 @@ async fn edit_file_accepts_flat_single_operation_form() {
     let text = result_text(&r);
     assert!(text.contains("1 replacement"), "got: {text}");
     assert!(text.contains("Applied 1/1"), "got: {text}");
-    assert_eq!(fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap().content, "one three");
+    assert_eq!(
+        fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap().content,
+        "one three"
+    );
 }
 
 #[tokio::test]
@@ -114,7 +145,10 @@ async fn edit_file_reports_empty_operations_distinctly() {
     let call = ToolUseBlock::new(
         "1",
         "edit_file",
-        serde_json::json!({ "operations": [] }).as_object().cloned().unwrap(),
+        serde_json::json!({ "operations": [] })
+            .as_object()
+            .cloned()
+            .unwrap(),
     );
     let r = toolkit.call_tool(&call, Default::default()).await.unwrap();
     let text = result_text(&r);
@@ -172,12 +206,20 @@ async fn edit_file_normalises_crlf_in_the_replacement() {
 async fn shell_execute_tool() {
     let dir = temp_dir("shell_tool").await;
     let inner = Arc::new(LocalFilesystem::sandboxed(&dir));
-    let sandbox: Arc<dyn SandboxFilesystem> = Arc::new(SandboxBackedFilesystem::new(inner, dir.clone()));
+    let sandbox: Arc<dyn SandboxFilesystem> =
+        Arc::new(SandboxBackedFilesystem::new(inner, dir.clone()));
     let toolkit = Toolkit::new();
     ShellExecuteTool::register(&toolkit, sandbox);
     assert!(toolkit.tool_names().contains(&"execute".to_string()));
 
-    let call = ToolUseBlock::new("1", "execute", serde_json::json!({ "command": "echo tool-hello" }).as_object().cloned().unwrap());
+    let call = ToolUseBlock::new(
+        "1",
+        "execute",
+        serde_json::json!({ "command": "echo tool-hello" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
     let r = toolkit.call_tool(&call, Default::default()).await.unwrap();
     let text = result_text(&r);
     assert!(text.contains("tool-hello"));
@@ -210,7 +252,9 @@ impl Model for ExecuteThenAnswer {
                 "command".to_string(),
                 serde_json::Value::String(self.command.clone()),
             );
-            vec![ContentBlock::ToolUse(ToolUseBlock::new("call-1", "execute", input))]
+            vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                "call-1", "execute", input,
+            ))]
         } else {
             vec![ContentBlock::Text(TextBlock::new("done"))]
         };

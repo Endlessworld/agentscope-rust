@@ -27,10 +27,7 @@ pub const TOKEN_HEADER: &str = "x-gitlab-token";
 /// Build the GitLab webhook router, sharing the typed channel registry as state.
 pub fn router(registry: Arc<GitLabChannelRegistry>) -> Router {
     Router::new()
-        .route(
-            "/api/channels/gitlab/:channel_id/webhook",
-            post(webhook),
-        )
+        .route("/api/channels/gitlab/:channel_id/webhook", post(webhook))
         .with_state(registry)
 }
 

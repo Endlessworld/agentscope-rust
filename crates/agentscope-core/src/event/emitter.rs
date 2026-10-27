@@ -19,7 +19,6 @@ pub struct AgentEventEmitter {
     source: Option<String>,
 }
 
-
 impl AgentEventEmitter {
     /// Creates an emitter backed by the given sink callback.
     pub fn new(sink: Arc<dyn Fn(AgentEvent) + Send + Sync>) -> Self {
@@ -60,23 +59,47 @@ pub struct ConfirmResult {
 
 impl ConfirmResult {
     /// Creates a new confirmation result.
-    pub fn new(confirmed: bool, tool_call: Option<ToolUseBlock>, rules: Vec<PermissionRule>) -> Self {
-        Self { confirmed, tool_call, rules, message: String::new() }
+    pub fn new(
+        confirmed: bool,
+        tool_call: Option<ToolUseBlock>,
+        rules: Vec<PermissionRule>,
+    ) -> Self {
+        Self {
+            confirmed,
+            tool_call,
+            rules,
+            message: String::new(),
+        }
     }
 
     /// Creates a denied result with a message.
     pub fn denied(message: impl Into<String>) -> Self {
-        Self { confirmed: false, tool_call: None, rules: Vec::new(), message: message.into() }
+        Self {
+            confirmed: false,
+            tool_call: None,
+            rules: Vec::new(),
+            message: message.into(),
+        }
     }
 
     /// Creates an allowed result.
     pub fn allowed() -> Self {
-        Self { confirmed: true, tool_call: None, rules: Vec::new(), message: String::new() }
+        Self {
+            confirmed: true,
+            tool_call: None,
+            rules: Vec::new(),
+            message: String::new(),
+        }
     }
 
     /// Creates an allowed result with a modified tool call.
     pub fn allowed_with(tool_call: ToolUseBlock) -> Self {
-        Self { confirmed: true, tool_call: Some(tool_call), rules: Vec::new(), message: String::new() }
+        Self {
+            confirmed: true,
+            tool_call: Some(tool_call),
+            rules: Vec::new(),
+            message: String::new(),
+        }
     }
 
     /// Whether the tool call was confirmed.

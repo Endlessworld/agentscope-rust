@@ -85,7 +85,12 @@ pub struct MessagePage {
 
 impl MessagePage {
     /// Slices `all` into a page and reports the untruncated total.
-    pub fn of(session_id: impl Into<String>, all: Vec<MessageItem>, offset: i64, limit: i64) -> Self {
+    pub fn of(
+        session_id: impl Into<String>,
+        all: Vec<MessageItem>,
+        offset: i64,
+        limit: i64,
+    ) -> Self {
         let total = all.len();
         let from = offset.max(0) as usize;
         let to = if limit <= 0 {

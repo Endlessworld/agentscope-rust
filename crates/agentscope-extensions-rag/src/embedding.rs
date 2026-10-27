@@ -103,11 +103,7 @@ pub struct EmbeddingResponse {
 
 impl EmbeddingResponse {
     /// Creates a response without a measured duration.
-    pub fn new(
-        embedding: Vec<f64>,
-        usage: EmbeddingUsage,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn new(embedding: Vec<f64>, usage: EmbeddingUsage, model: impl Into<String>) -> Self {
         Self {
             embedding,
             usage,

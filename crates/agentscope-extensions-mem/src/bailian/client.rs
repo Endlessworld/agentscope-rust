@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::{MemError, Result};
-use crate::http::{HttpTransport, ReqwestTransport};
 use crate::bailian::dto::{
     BailianAddRequest, BailianAddResponse, BailianSearchRequest, BailianSearchResponse,
 };
+use crate::error::{MemError, Result};
+use crate::http::{HttpTransport, ReqwestTransport};
 
 /// Default base URL (`https://dashscope.aliyuncs.com`).
 pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com";
@@ -66,10 +66,19 @@ impl BailianMemoryClient {
         let api_base_url = api_base_url.into();
         // Java `BailianMemoryClient` builder rejects a null / blank base URL.
         if api_base_url.trim().is_empty() {
-            return Err(MemError::Config("apiBaseUrl cannot be null or blank".into()));
+            return Err(MemError::Config(
+                "apiBaseUrl cannot be null or blank".into(),
+            ));
         }
-        let api_base_url = api_base_url.strip_suffix('/').unwrap_or(&api_base_url).to_string();
-        Ok(Self { transport, api_base_url, api_key })
+        let api_base_url = api_base_url
+            .strip_suffix('/')
+            .unwrap_or(&api_base_url)
+            .to_string();
+        Ok(Self {
+            transport,
+            api_base_url,
+            api_key,
+        })
     }
 
     /// The configured base URL.
@@ -79,14 +88,20 @@ impl BailianMemoryClient {
 
     fn headers(&self) -> Vec<(String, String)> {
         vec![
-            ("Authorization".to_string(), format!("Bearer {}", self.api_key)),
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
             ("Content-Type".to_string(), "application/json".to_string()),
         ]
     }
 
     async fn post(&self, endpoint: &str, body: &str) -> Result<String> {
         let url = format!("{}{}", self.api_base_url, endpoint);
-        let raw = self.transport.post_json(&url, &self.headers(), body).await?;
+        let raw = self
+            .transport
+            .post_json(&url, &self.headers(), body)
+            .await?;
         if raw.trim().is_empty() {
             return Err(MemError::Transport(
                 "Bailian API returned empty response".into(),

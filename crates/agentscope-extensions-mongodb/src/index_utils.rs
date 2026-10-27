@@ -206,7 +206,9 @@ mod tests {
     async fn creates_index_when_absent() {
         let client: Arc<dyn MongoClient> = Arc::new(InMemoryMongoClient::new());
         let spec = IndexSpec::compound_ascending(&["user_id", "session_id"]);
-        create_index_with_migration(&client, "sessions", &spec).await.unwrap();
+        create_index_with_migration(&client, "sessions", &spec)
+            .await
+            .unwrap();
         let indexes = client.list_indexes("sessions").await.unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].keys, spec.keys);
@@ -216,8 +218,12 @@ mod tests {
     async fn idempotent_create_is_noop() {
         let client: Arc<dyn MongoClient> = Arc::new(InMemoryMongoClient::new());
         let spec = IndexSpec::compound_ascending(&["user_id", "session_id"]);
-        create_index_with_migration(&client, "sessions", &spec).await.unwrap();
-        create_index_with_migration(&client, "sessions", &spec).await.unwrap();
+        create_index_with_migration(&client, "sessions", &spec)
+            .await
+            .unwrap();
+        create_index_with_migration(&client, "sessions", &spec)
+            .await
+            .unwrap();
         assert_eq!(client.list_indexes("sessions").await.unwrap().len(), 1);
     }
 
@@ -242,7 +248,9 @@ mod tests {
         let spec = IndexSpec::ascending(&["_updated_at"])
             .sparse()
             .expire_after_seconds(86_400);
-        create_index_with_migration(&client, "sessions", &spec).await.unwrap();
+        create_index_with_migration(&client, "sessions", &spec)
+            .await
+            .unwrap();
         let indexes = client.list_indexes("sessions").await.unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].expire_after_seconds, Some(86_400));

@@ -5,9 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use agentscope_core::{
-    ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ToolUseBlock,
-};
+use agentscope_core::{ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ToolUseBlock};
 use uuid::Uuid;
 
 use super::dto::{OllamaFunction, OllamaResponse};
@@ -39,7 +37,11 @@ pub fn parse_response(response: &OllamaResponse) -> ChatResponse {
                 };
                 // Ollama does not return a tool-call id, so we synthesise one
                 // (same behaviour as the Java parser).
-                let mut block = ToolUseBlock::new(Uuid::new_v4().to_string(), call.function.name.clone(), input);
+                let mut block = ToolUseBlock::new(
+                    Uuid::new_v4().to_string(),
+                    call.function.name.clone(),
+                    input,
+                );
                 block.content = Some(raw);
                 content.push(ContentBlock::ToolUse(block));
             }
@@ -47,7 +49,10 @@ pub fn parse_response(response: &OllamaResponse) -> ChatResponse {
     }
 
     // Ollama reports durations in nanoseconds.
-    let time = response.total_duration.map(|d| d as f64 / 1e9).unwrap_or(0.0);
+    let time = response
+        .total_duration
+        .map(|d| d as f64 / 1e9)
+        .unwrap_or(0.0);
     let usage = ChatUsage {
         input_tokens: response.prompt_eval_count.unwrap_or(0).max(0) as u64,
         output_tokens: response.eval_count.unwrap_or(0).max(0) as u64,
@@ -96,7 +101,13 @@ pub fn parse_response(response: &OllamaResponse) -> ChatResponse {
         }
     });
 
-    ChatResponse::new(Uuid::new_v4().to_string(), content, usage, Some(metadata), finish_reason)
+    ChatResponse::new(
+        Uuid::new_v4().to_string(),
+        content,
+        usage,
+        Some(metadata),
+        finish_reason,
+    )
 }
 
 /// Accumulates streamed Ollama frames.
@@ -150,7 +161,10 @@ impl OllamaStreamIncrementer {
                 input_tokens: response.prompt_eval_count.unwrap_or(0).max(0) as u64,
                 output_tokens: response.eval_count.unwrap_or(0).max(0) as u64,
                 cached_tokens: 0,
-                time: response.total_duration.map(|d| d as f64 / 1e9).unwrap_or(0.0),
+                time: response
+                    .total_duration
+                    .map(|d| d as f64 / 1e9)
+                    .unwrap_or(0.0),
                 ..Default::default()
             };
             self.usage = Some(crate::common::usage::merge_non_zero(
@@ -224,7 +238,10 @@ mod tests {
         assert_eq!(parsed.usage.output_tokens, 20);
         assert_eq!(parsed.usage.time, 2.0);
         assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
-        assert_eq!(parsed.metadata.get("model"), Some(&serde_json::json!("llama3")));
+        assert_eq!(
+            parsed.metadata.get("model"),
+            Some(&serde_json::json!("llama3"))
+        );
         assert_eq!(parsed.metadata.get("done"), Some(&serde_json::json!(true)));
     }
 
@@ -254,7 +271,10 @@ mod tests {
     #[test]
     fn done_true_without_reason_falls_back_to_stop() {
         let response = resp_json(serde_json::json!({ "done": true }));
-        assert_eq!(parse_response(&response).finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            parse_response(&response).finish_reason.as_deref(),
+            Some("stop")
+        );
     }
 
     #[test]
@@ -272,8 +292,12 @@ mod tests {
             "eval_count": 5
         }));
 
-        assert!(matches!(&inc.accumulate(&a).unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&inc.accumulate(&a).unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         // The final frame carries no incremental text.
         assert!(inc.accumulate(&c).is_none());
 

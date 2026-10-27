@@ -4,7 +4,9 @@ use crate::dialect::abstract_dialect::{
     AbstractJdbcDialect, DialectKind, TableNameConfigurable, TableNames,
 };
 use crate::dialect::bound_sql::{BoundSql, SqlParam};
-use crate::dialect::{SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect};
+use crate::dialect::{
+    SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect,
+};
 
 /// MySQL dialect: `ON DUPLICATE KEY UPDATE`, `LONGBLOB` snapshots, native `GET_LOCK`.
 #[derive(Debug, Clone, Default)]
@@ -112,13 +114,7 @@ impl SessionStateDialect for MysqlDialect {
         )
     }
 
-    fn session_state_upsert(
-        &self,
-        slot_id: &str,
-        key: &str,
-        index: i32,
-        json: &str,
-    ) -> BoundSql {
+    fn session_state_upsert(&self, slot_id: &str, key: &str, index: i32, json: &str) -> BoundSql {
         BoundSql::new(
             format!(
                 "INSERT INTO {} (session_id, state_key, item_index, state_data, version) \

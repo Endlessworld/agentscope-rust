@@ -77,8 +77,9 @@ impl ReaderInput {
                         path.display()
                     )));
                 }
-                std::fs::read_to_string(path)
-                    .map_err(|e| RagError::Reader(format!("Failed to read {}: {e}", path.display())))
+                std::fs::read_to_string(path).map_err(|e| {
+                    RagError::Reader(format!("Failed to read {}: {e}", path.display()))
+                })
             }
         }
     }
@@ -176,8 +177,7 @@ fn chunk_by_paragraph(text: &str, chunk_size: usize, overlap_size: usize) -> Vec
             continue;
         }
 
-        if !current.is_empty()
-            && current.chars().count() + trimmed.chars().count() + 2 > chunk_size
+        if !current.is_empty() && current.chars().count() + trimmed.chars().count() + 2 > chunk_size
         {
             chunks.push(current.trim().to_string());
             current = String::new();

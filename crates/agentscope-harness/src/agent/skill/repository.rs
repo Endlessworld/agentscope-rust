@@ -72,7 +72,13 @@ struct DirSkillRepository {
 
 impl DirSkillRepository {
     fn new(root: PathBuf, source: String, writeable: bool, kind: SkillRepo, id: String) -> Self {
-        Self { root, source, writeable, kind, id }
+        Self {
+            root,
+            source,
+            writeable,
+            kind,
+            id,
+        }
     }
 }
 
@@ -143,7 +149,10 @@ pub fn load_skills_from_dir(root: &Path, source: &str) -> Vec<AgentSkill> {
         }
         let resources = collect_resources(&dir);
         let description = skill_description(&resources).unwrap_or_else(|| format!("Skill: {name}"));
-        let mut builder = AgentSkill::builder().name(&name).source(source).description(description);
+        let mut builder = AgentSkill::builder()
+            .name(&name)
+            .source(source)
+            .description(description);
         for (rel, content) in &resources {
             builder = builder.add_resource(rel.clone(), content.clone());
         }
@@ -242,7 +251,9 @@ impl FileSystemSkillRepository {
                 root,
                 source,
                 false,
-                SkillRepo::External { source: kind_source },
+                SkillRepo::External {
+                    source: kind_source,
+                },
                 id,
             )),
         }
@@ -361,7 +372,10 @@ pub fn compose_skill_repositories(
 
     if let Some(dir) = project_global_skills_dir {
         if dir.is_dir() {
-            ordered.push(Arc::new(FileSystemSkillRepository::new(dir, "project-global")));
+            ordered.push(Arc::new(FileSystemSkillRepository::new(
+                dir,
+                "project-global",
+            )));
         }
     }
 
@@ -371,12 +385,17 @@ pub fn compose_skill_repositories(
 
     if let Some(dir) = workspace_skills_dir {
         if dir.is_dir() {
-            ordered.push(Arc::new(FileSystemSkillRepository::new(dir, "workspace-shared")));
+            ordered.push(Arc::new(FileSystemSkillRepository::new(
+                dir,
+                "workspace-shared",
+            )));
         }
     }
 
     if !disable_default_workspace_skills {
-        ordered.push(Arc::new(WorkspaceSkillRepository::new_read_only(workspace_namespace_dir)));
+        ordered.push(Arc::new(WorkspaceSkillRepository::new_read_only(
+            workspace_namespace_dir,
+        )));
     }
 
     ordered
@@ -408,7 +427,9 @@ mod tests {
         let skills = repo.load();
         assert_eq!(skills.len(), 2);
         assert!(skills.iter().all(|s| s.source() == "market"));
-        assert!(skills.iter().any(|s| s.name() == "alpha" && s.description().starts_with("Alpha")));
+        assert!(skills
+            .iter()
+            .any(|s| s.name() == "alpha" && s.description().starts_with("Alpha")));
     }
 
     #[test]

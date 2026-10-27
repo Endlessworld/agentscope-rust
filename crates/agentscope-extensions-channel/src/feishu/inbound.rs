@@ -87,7 +87,9 @@ impl FeishuInboundMapper {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.trim().is_empty())?;
-        let sender_type = event.pointer("/sender/sender_type").and_then(|v| v.as_str());
+        let sender_type = event
+            .pointer("/sender/sender_type")
+            .and_then(|v| v.as_str());
         if sender_type != Some("user") {
             return None;
         }
@@ -165,8 +167,9 @@ impl FeishuInboundMapper {
             .metadata(metadata)
             .build();
 
-        let mut builder = InboundMessage::builder(self.channel_id.clone(), Peer::new(kind, chat_id), vec![msg])
-            .sender_id(sender_name);
+        let mut builder =
+            InboundMessage::builder(self.channel_id.clone(), Peer::new(kind, chat_id), vec![msg])
+                .sender_id(sender_name);
         if let Some(tenant) = Self::extract_tenant_key(envelope) {
             builder = builder.account_id(tenant);
         }
@@ -277,7 +280,9 @@ mod tests {
         env["event"]["message"]["mentions"] = serde_json::json!([
             {"key": "@_user_1", "id": {"open_id": "ou_bot"}}
         ]);
-        let inbound = FeishuInboundMapper::new("feishu").map(&env).expect("mapped");
+        let inbound = FeishuInboundMapper::new("feishu")
+            .map(&env)
+            .expect("mapped");
         assert_eq!(inbound.peer.kind, PeerKind::Group);
         assert_eq!(inbound.messages[0].text_content(), "run the tests");
     }
@@ -325,7 +330,10 @@ mod tests {
             FeishuInboundMapper::extract_url_challenge(&env),
             Some("c-1".to_string())
         );
-        assert_eq!(FeishuInboundMapper::extract_url_challenge(&serde_json::json!({})), None);
+        assert_eq!(
+            FeishuInboundMapper::extract_url_challenge(&serde_json::json!({})),
+            None
+        );
     }
 
     fn media_envelope(message_type: &str, content: &str) -> Value {
@@ -352,13 +360,22 @@ mod tests {
             .expect("mapped");
         assert_eq!(inbound.messages[0].text_content(), "[image]");
         let metadata = inbound.messages[0].metadata();
-        assert_eq!(metadata.get("channelMediaKind"), Some(&serde_json::json!("image")));
-        assert_eq!(metadata.get("channelMediaId"), Some(&serde_json::json!("img-1")));
+        assert_eq!(
+            metadata.get("channelMediaKind"),
+            Some(&serde_json::json!("image"))
+        );
+        assert_eq!(
+            metadata.get("channelMediaId"),
+            Some(&serde_json::json!("img-1"))
+        );
         assert_eq!(
             metadata.get("channelMediaProviderType"),
             Some(&serde_json::json!("image"))
         );
-        assert_eq!(metadata.get("channelMessageId"), Some(&serde_json::json!("om_2")));
+        assert_eq!(
+            metadata.get("channelMessageId"),
+            Some(&serde_json::json!("om_2"))
+        );
     }
 
     #[test]
@@ -371,8 +388,14 @@ mod tests {
             .expect("mapped");
         assert_eq!(inbound.messages[0].text_content(), "[video: clip.mp4]");
         let metadata = inbound.messages[0].metadata();
-        assert_eq!(metadata.get("channelMediaKind"), Some(&serde_json::json!("video")));
-        assert_eq!(metadata.get("channelMediaId"), Some(&serde_json::json!("v-1")));
+        assert_eq!(
+            metadata.get("channelMediaKind"),
+            Some(&serde_json::json!("video"))
+        );
+        assert_eq!(
+            metadata.get("channelMediaId"),
+            Some(&serde_json::json!("v-1"))
+        );
         assert_eq!(
             metadata.get("channelMediaSecondaryId"),
             Some(&serde_json::json!("cover"))
@@ -414,9 +437,15 @@ mod tests {
     #[test]
     fn media_without_a_material_id_is_dropped() {
         let m = FeishuInboundMapper::new("feishu");
-        assert!(m.map(&media_envelope("image", r#"{"file_key":"x"}"#)).is_none());
-        assert!(m.map(&media_envelope("file", r#"{"file_key":" "}"#)).is_none());
-        assert!(m.map(&media_envelope("sticker", r#"{"file_key":"x"}"#)).is_none());
+        assert!(m
+            .map(&media_envelope("image", r#"{"file_key":"x"}"#))
+            .is_none());
+        assert!(m
+            .map(&media_envelope("file", r#"{"file_key":" "}"#))
+            .is_none());
+        assert!(m
+            .map(&media_envelope("sticker", r#"{"file_key":"x"}"#))
+            .is_none());
         assert!(m.map(&media_envelope("image", "not-json")).is_none());
     }
 }

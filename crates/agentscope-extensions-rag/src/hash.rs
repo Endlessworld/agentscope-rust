@@ -68,10 +68,7 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
             let tmp = d;
             d = c;
             c = b;
-            let sum = a
-                .wrapping_add(f)
-                .wrapping_add(K[i])
-                .wrapping_add(m[g]);
+            let sum = a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]);
             b = b.wrapping_add(sum.rotate_left(S[i]));
             a = tmp;
         }
@@ -156,7 +153,9 @@ mod tests {
             "c3fcd3d76192e4007dfb496cca67e13b"
         );
         assert_eq!(
-            md5_hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+            md5_hex(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            ),
             "57edf4a22be3c955ac49da2e2107b67a"
         );
     }

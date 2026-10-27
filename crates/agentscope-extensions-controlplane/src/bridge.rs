@@ -19,7 +19,9 @@ use crate::committed_export::committed_event_sink;
 use crate::config::ControlPlaneConfig;
 use crate::error::ControlPlaneResult;
 use crate::event_journal::EventJournal;
-use crate::model::{ContextSnapshot, ContextTracker, Inventory, MessagePage, SessionEvent, ToolInfo};
+use crate::model::{
+    ContextSnapshot, ContextTracker, Inventory, MessagePage, SessionEvent, ToolInfo,
+};
 use crate::transport::ContractProvider;
 
 /// Session metadata seeded by the adapter on the session's first turn.
@@ -120,7 +122,8 @@ impl BridgeState {
             context_window,
             model_name,
         };
-        self.descriptions.insert(session_id.to_string(), desc.clone());
+        self.descriptions
+            .insert(session_id.to_string(), desc.clone());
         let tracker = self
             .trackers
             .entry(session_id.to_string())
@@ -133,7 +136,8 @@ impl BridgeState {
 
     /// Sets tokens currently occupying the effective context window.
     fn set_context_used(&mut self, agent_key: &str, session_id: &str, tokens: i64) {
-        self.context_used.insert(session_id.to_string(), tokens.max(0));
+        self.context_used
+            .insert(session_id.to_string(), tokens.max(0));
         self.trackers
             .entry(session_id.to_string())
             .or_insert_with(|| ContextTracker::new(session_id, agent_key))
@@ -165,12 +169,7 @@ impl BridgeReporter {
     /// `source` is the native session the fact belongs to and `native_seq` its committed
     /// sequence. The durable watermark makes re-delivery idempotent. Returns `true` when the
     /// fact was newly journaled; `false` when it was a duplicate or no journal is open.
-    pub fn publish_committed(
-        &self,
-        source: &str,
-        native_seq: i64,
-        event: SessionEvent,
-    ) -> bool {
+    pub fn publish_committed(&self, source: &str, native_seq: i64, event: SessionEvent) -> bool {
         self.lock_state()
             .publish_committed(&self.agent_key, source, native_seq, event)
     }
@@ -224,7 +223,8 @@ impl BridgeReporter {
     /// Sets tokens occupying the effective context window (mirrors
     /// `SessionBridge.setContextUsedTokens`).
     pub fn set_context_used_tokens(&self, session_id: &str, tokens: i64) {
-        self.lock_state().set_context_used(&self.agent_key, session_id, tokens);
+        self.lock_state()
+            .set_context_used(&self.agent_key, session_id, tokens);
     }
 }
 
@@ -300,10 +300,9 @@ impl ControlPlaneBridge {
         // closure never panics and swallows journal errors.
         let reporter = self.reporter();
         let emit_reporter = reporter.clone();
-        let emit: Arc<dyn Fn(SessionEvent) + Send + Sync> =
-            Arc::new(move |event: SessionEvent| {
-                emit_reporter.publish(event);
-            });
+        let emit: Arc<dyn Fn(SessionEvent) + Send + Sync> = Arc::new(move |event: SessionEvent| {
+            emit_reporter.publish(event);
+        });
         adapter.attach(target, emit)?;
         adapter.on_bridge_attached(reporter);
         self.adapter = Some(adapter);
@@ -434,7 +433,8 @@ impl ControlPlaneBridge {
     /// Sets tokens currently occupying the effective context window for `session_id`.
     pub fn set_context_used_tokens(&self, session_id: &str, tokens: i64) {
         let agent_key = self.config.agent_key.clone();
-        self.lock_state().set_context_used(&agent_key, session_id, tokens);
+        self.lock_state()
+            .set_context_used(&agent_key, session_id, tokens);
     }
 
     /// Whether `session_id` has been seen by this bridge.
@@ -470,7 +470,9 @@ impl ControlPlaneBridge {
 #[async_trait]
 impl ContractProvider for ControlPlaneBridge {
     async fn inventory(&self) -> ControlPlaneResult<Inventory> {
-        Ok(Inventory::health_only(self.lock_state().trackers.len() as i64))
+        Ok(Inventory::health_only(
+            self.lock_state().trackers.len() as i64
+        ))
     }
 
     async fn context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
@@ -553,8 +555,16 @@ mod tests {
     #[test]
     fn record_event_assigns_monotonic_seq() {
         let bridge = temp_bridge();
-        let s1 = bridge.record_event(SessionEvent::builder("s1", TYPE_MESSAGE).content("a").build());
-        let s2 = bridge.record_event(SessionEvent::builder("s1", TYPE_MESSAGE).content("b").build());
+        let s1 = bridge.record_event(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("a")
+                .build(),
+        );
+        let s2 = bridge.record_event(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("b")
+                .build(),
+        );
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
         assert_eq!(bridge.tracker("s1").effective_message_count(), 2);
@@ -602,7 +612,10 @@ mod tests {
 
     #[tokio::test]
     async fn contract_provider_reports_empty_inventory() {
-        let cfg = ControlPlaneConfig::builder("friday").instance_key("rep-1").build().unwrap();
+        let cfg = ControlPlaneConfig::builder("friday")
+            .instance_key("rep-1")
+            .build()
+            .unwrap();
         let bridge = ControlPlaneBridge::new(cfg);
         let inv = bridge.inventory().await.unwrap();
         assert!(inv.subagents.is_empty());

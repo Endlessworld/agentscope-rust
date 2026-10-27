@@ -39,8 +39,13 @@ fn builder_rejects_blank_bucket() {
 async fn save_single_state_uses_expected_object_key() {
     let client = common::mem_client();
     let s = store(client.clone());
-    s.save(Some("alice"), "s1", "agent_state", serde_json::json!({"hello": 1}))
-        .await;
+    s.save(
+        Some("alice"),
+        "s1",
+        "agent_state",
+        serde_json::json!({"hello": 1}),
+    )
+    .await;
 
     assert!(client
         .exists("test/state/alice/s1/agent_state.json")
@@ -51,7 +56,8 @@ async fn save_single_state_uses_expected_object_key() {
 async fn null_user_uses_anon() {
     let client = common::mem_client();
     let s = store(client.clone());
-    s.save(None, "s1", "agent_state", serde_json::json!("data")).await;
+    s.save(None, "s1", "agent_state", serde_json::json!("data"))
+        .await;
     assert!(client
         .exists("test/state/__anon__/s1/agent_state.json")
         .unwrap());
@@ -61,7 +67,8 @@ async fn null_user_uses_anon() {
 async fn get_single_state_roundtrip() {
     let client = common::mem_client();
     let s = store(client.clone());
-    s.save(Some("alice"), "s1", "k", serde_json::json!({"a": 1})).await;
+    s.save(Some("alice"), "s1", "k", serde_json::json!({"a": 1}))
+        .await;
     let got = s.get(Some("alice"), "s1", "k").await;
     assert_eq!(got, Some(serde_json::json!({"a": 1})));
 }
@@ -128,8 +135,10 @@ async fn exists_true_when_objects_present() {
 async fn list_session_ids_extracts_ids() {
     let client = common::mem_client();
     let s = store(client);
-    s.save(Some("alice"), "sess-a", "k", serde_json::json!(1)).await;
-    s.save(Some("alice"), "sess-b", "k", serde_json::json!(1)).await;
+    s.save(Some("alice"), "sess-a", "k", serde_json::json!(1))
+        .await;
+    s.save(Some("alice"), "sess-b", "k", serde_json::json!(1))
+        .await;
     let mut ids = s.list_session_ids(Some("alice")).await;
     ids.sort();
     assert_eq!(ids, vec!["sess-a".to_string(), "sess-b".to_string()]);
@@ -172,8 +181,7 @@ async fn delete_key_is_idempotent_for_missing_objects() {
     // Nothing stored yet: must succeed, not error.
     s.delete_key(Some("alice"), "s1", "missing").await.unwrap();
 
-    s.save(Some("alice"), "s1", "k", serde_json::json!(1))
-        .await;
+    s.save(Some("alice"), "s1", "k", serde_json::json!(1)).await;
     s.delete_key(Some("alice"), "s1", "k").await.unwrap();
     s.delete_key(Some("alice"), "s1", "k").await.unwrap();
 

@@ -8,12 +8,12 @@
 //! state is owned by the tool set, which is sufficient for single-agent usage.
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::workspace::PlanModeManager;
 use crate::filesystem::Filesystem;
@@ -41,7 +41,10 @@ impl PlanModeHandle {
         plan_dir: Option<&str>,
         state: Arc<Mutex<AgentState>>,
     ) -> Self {
-        Self { manager: Arc::new(PlanModeManager::new(fs, plan_dir)), state }
+        Self {
+            manager: Arc::new(PlanModeManager::new(fs, plan_dir)),
+            state,
+        }
     }
 
     pub fn manager(&self) -> &PlanModeManager {
@@ -151,7 +154,12 @@ impl Tool for PlanWriteTool {
             state.plan_mode_context.current_plan_file = Some(path.clone());
             path
         };
-        match self.handle.manager.write_plan_file(&rt, &path, content).await {
+        match self
+            .handle
+            .manager
+            .write_plan_file(&rt, &path, content)
+            .await
+        {
             Ok(()) => Ok(ToolResultBlock::text(format!("Plan written to {path}"))),
             Err(e) => Ok(ToolResultBlock::error(e.to_string())),
         }

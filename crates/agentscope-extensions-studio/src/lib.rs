@@ -1,4 +1,4 @@
-﻿//! # agentscope-extensions-studio
+//! # agentscope-extensions-studio
 //!
 //! Rust port of the Java `agentscope-extensions-studio` module, which bundles two
 //! sub-domains under one aggregation module:
@@ -32,4 +32,3 @@ pub use studio::{
     StudioManager, StudioMessageHook, StudioTransport, StudioUserAgent, StudioWebSocketClient,
     UserInputData,
 };
-

@@ -141,14 +141,16 @@ mod tests {
 
     #[test]
     fn default_emitter_exposes_the_tool_call_id() {
-        let emitter = DefaultToolEmitter::new(Arc::new(|_| {}))
-            .with_tool_call_id("call-42");
+        let emitter = DefaultToolEmitter::new(Arc::new(|_| {})).with_tool_call_id("call-42");
         assert_eq!(emitter.tool_call_id(), Some("call-42"));
     }
 
     #[test]
     fn default_emitter_defaults_to_no_id_and_ignores_blank_ids() {
-        assert_eq!(DefaultToolEmitter::new(Arc::new(|_| {})).tool_call_id(), None);
+        assert_eq!(
+            DefaultToolEmitter::new(Arc::new(|_| {})).tool_call_id(),
+            None
+        );
         assert_eq!(
             DefaultToolEmitter::new(Arc::new(|_| {}))
                 .with_tool_call_id("")

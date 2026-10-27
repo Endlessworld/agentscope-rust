@@ -164,7 +164,9 @@ impl Default for MiddlewareChain {
 impl MiddlewareChain {
     /// Creates an empty middleware chain.
     pub fn new() -> Self {
-        Self { middlewares: Vec::new() }
+        Self {
+            middlewares: Vec::new(),
+        }
     }
 
     /// Adds a middleware to the chain, keeping the chain sorted by descending

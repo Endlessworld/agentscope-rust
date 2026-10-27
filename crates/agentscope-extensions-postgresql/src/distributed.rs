@@ -29,7 +29,8 @@ pub struct PostgresDistributedStore {
 
 impl std::fmt::Debug for PostgresDistributedStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresDistributedStore").finish_non_exhaustive()
+        f.debug_struct("PostgresDistributedStore")
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,9 +82,7 @@ impl PostgresDistributedStore {
     pub fn distributed_store(&self) -> PgResult<DistributedStore> {
         let state: Arc<dyn agentscope_core::state::AgentStateStore> =
             Arc::new(self.agent_state_store()?);
-        Ok(DistributedStore::builder()
-            .agent_state_store(state)
-            .build())
+        Ok(DistributedStore::builder().agent_state_store(state).build())
     }
 }
 
@@ -94,11 +93,11 @@ mod tests {
     //! `assertInstanceOf` assertions become Rust type checks on the returned components.
 
     use super::*;
+    use crate::memory::MemoryClient;
     use agentscope_core::state::AgentStateStore;
     use agentscope_harness::agent::isolation_scope::IsolationScope;
     use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec;
     use agentscope_harness::filesystem::BaseStore;
-    use crate::memory::MemoryClient;
     use serde_json::json;
 
     fn composer() -> (Arc<MemoryClient>, PostgresDistributedStore) {
@@ -191,7 +190,11 @@ mod tests {
         let state = store.agent_state_store().unwrap();
         let base = store.base_store().unwrap();
         state.save(None, "s1", "k", json!(1)).await;
-        base.put(&["filesystem".to_string()], "kv", json!({"a": 1}).as_object().unwrap().clone());
+        base.put(
+            &["filesystem".to_string()],
+            "kv",
+            json!({"a": 1}).as_object().unwrap().clone(),
+        );
         assert_eq!(c.session_row_count(), 1);
         assert_eq!(c.store_row_count(), 1);
         assert!(base.get(&["filesystem".to_string()], "kv").is_some());

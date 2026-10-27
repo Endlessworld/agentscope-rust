@@ -73,10 +73,7 @@ pub fn parse_response(
     if !summary.is_empty() || encrypted_content.is_some() || !reasoning_text.is_empty() {
         let mut metadata = JsonMap::new();
         if let Some(encrypted) = &encrypted_content {
-            metadata.insert(
-                MD_REASONING_ENCRYPTED_CONTENT.to_string(),
-                json!(encrypted),
-            );
+            metadata.insert(MD_REASONING_ENCRYPTED_CONTENT.to_string(), json!(encrypted));
         }
         if !reasoning_text.is_empty() {
             metadata.insert(MD_REASONING_TEXT.to_string(), json!(reasoning_text));
@@ -146,10 +143,7 @@ pub fn extract_response_metadata(response: &Value) -> JsonMap {
         if let Some(code) = error.get("code").and_then(Value::as_str) {
             error_map.insert("code".to_string(), json!(code));
         }
-        metadata.insert(
-            MD_RESPONSE_ERROR.to_string(),
-            Value::Object(error_map),
-        );
+        metadata.insert(MD_RESPONSE_ERROR.to_string(), Value::Object(error_map));
     }
 
     let citations = extract_citations(response);
@@ -165,13 +159,17 @@ pub fn extract_usage(response: &Value, start_time: Instant) -> Option<ChatUsage>
     let input_details = usage.get("input_tokens_details");
     let output_details = usage.get("output_tokens_details");
     let field = |details: Option<&Value>, key: &str| -> Option<u64> {
-        details
-            .and_then(|d| d.get(key))
-            .and_then(Value::as_u64)
+        details.and_then(|d| d.get(key)).and_then(Value::as_u64)
     };
     Some(ChatUsage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         cached_tokens: field(input_details, "cached_tokens").unwrap_or(0),
         cache_creation_tokens: field(input_details, "cache_write_tokens").unwrap_or(0),
         reasoning_tokens: field(output_details, "reasoning_tokens").unwrap_or(0),
@@ -375,21 +373,14 @@ impl ResponsesStreamingAssembler {
         if encrypted_content.is_some() || !self.reasoning_text.is_empty() {
             let mut thinking_metadata = JsonMap::new();
             if let Some(encrypted) = &encrypted_content {
-                thinking_metadata.insert(
-                    MD_REASONING_ENCRYPTED_CONTENT.to_string(),
-                    json!(encrypted),
-                );
+                thinking_metadata
+                    .insert(MD_REASONING_ENCRYPTED_CONTENT.to_string(), json!(encrypted));
             }
             if !self.reasoning_text.is_empty() {
-                thinking_metadata.insert(
-                    MD_REASONING_TEXT.to_string(),
-                    json!(self.reasoning_text),
-                );
+                thinking_metadata.insert(MD_REASONING_TEXT.to_string(), json!(self.reasoning_text));
             }
             content.push(ContentBlock::Thinking(
-                ThinkingBlock::builder()
-                    .metadata(thinking_metadata)
-                    .build(),
+                ThinkingBlock::builder().metadata(thinking_metadata).build(),
             ));
         }
 
@@ -409,13 +400,8 @@ impl ResponsesStreamingAssembler {
 
     fn handle_failed(&self, response: &Value) -> Error {
         let Some(error) = response.get("error").filter(|e| !e.is_null()) else {
-            return translate_optional_status(
-                None,
-                Some("OpenAI API stream failed"),
-                None,
-                None,
-            )
-            .to_core();
+            return translate_optional_status(None, Some("OpenAI API stream failed"), None, None)
+                .to_core();
         };
         let mut message = error
             .get("message")
@@ -450,13 +436,7 @@ fn handle_error_event(event: &Value) -> Error {
 }
 
 fn block_response(block: ContentBlock) -> ChatResponse {
-    ChatResponse::new(
-        String::new(),
-        vec![block],
-        ChatUsage::default(),
-        None,
-        None,
-    )
+    ChatResponse::new(String::new(), vec![block], ChatUsage::default(), None, None)
 }
 
 fn output_items(response: &Value) -> impl Iterator<Item = &Value> {
@@ -674,7 +654,10 @@ mod tests {
         assert_eq!(parsed.usage.cache_creation_tokens, 2);
         assert_eq!(parsed.usage.reasoning_tokens, 1);
         assert_eq!(parsed.metadata[MD_RESPONSE_STATUS], json!("completed"));
-        assert_eq!(parsed.metadata[MD_RESPONSE_CREATED_AT], json!(1_700_000_000));
+        assert_eq!(
+            parsed.metadata[MD_RESPONSE_CREATED_AT],
+            json!(1_700_000_000)
+        );
         assert_eq!(
             parsed.metadata[MD_RESPONSE_CITATIONS][0]["type"],
             json!("url_citation")

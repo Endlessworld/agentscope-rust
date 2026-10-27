@@ -182,19 +182,11 @@ fn search_spans_multiple_pages() {
         s.put(&ns(), key, value());
     }
 
-    let keys: Vec<String> = s
-        .search(&ns(), 10, 0)
-        .into_iter()
-        .map(|i| i.key)
-        .collect();
+    let keys: Vec<String> = s.search(&ns(), 10, 0).into_iter().map(|i| i.key).collect();
     assert_eq!(keys, vec!["a", "b", "c", "d", "e"]);
 
     // Offset paging still applies on top of the aggregated list.
-    let page: Vec<String> = s
-        .search(&ns(), 2, 3)
-        .into_iter()
-        .map(|i| i.key)
-        .collect();
+    let page: Vec<String> = s.search(&ns(), 2, 3).into_iter().map(|i| i.key).collect();
     assert_eq!(page, vec!["d", "e"]);
 }
 

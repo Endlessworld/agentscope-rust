@@ -14,9 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agentscope_core::model::Model;
-use agentscope_core::permission::{
-    PermissionBehavior, PermissionContextState, PermissionRule,
-};
+use agentscope_core::permission::{PermissionBehavior, PermissionContextState, PermissionRule};
 use agentscope_harness::agent::{HarnessAgent, HarnessAgentBuilder};
 use agentscope_harness::SkillFilter;
 use serde_json::Value;
@@ -115,10 +113,7 @@ pub fn tools(definition: &Value) -> Result<ToolsSelection, String> {
             if !valid_mcp_name(&name) || selection.mcp_servers.contains_key(&name) {
                 return Err("Invalid or duplicate MCP name".to_string());
             }
-            let command = server
-                .get("command")
-                .filter(|v| !v.is_null())
-                .map(as_text);
+            let command = server.get("command").filter(|v| !v.is_null()).map(as_text);
             let transport = server
                 .get("transport")
                 .map(as_text)
@@ -225,7 +220,9 @@ fn configs(toolset: &Value) -> &[Value] {
 
 /// A tool config's `enabled` flag, defaulting to the toolset's default.
 fn tool_enabled(tool: &Value, default: bool) -> bool {
-    tool.get("enabled").and_then(Value::as_bool).unwrap_or(default)
+    tool.get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
 }
 
 /// Builds the permission context from a definition, mirroring
@@ -240,7 +237,13 @@ pub fn permissions(definition: &Value) -> Result<PermissionContextState, String>
     {
         let mcp = toolset.get("type").map(as_text).unwrap_or_default() == "mcp_toolset";
         let prefix = if mcp {
-            format!("{}__", toolset.get("mcpServerName").map(as_text).unwrap_or_default())
+            format!(
+                "{}__",
+                toolset
+                    .get("mcpServerName")
+                    .map(as_text)
+                    .unwrap_or_default()
+            )
         } else {
             String::new()
         };

@@ -110,10 +110,7 @@ mod tests {
             .build()
             .unwrap();
         (
-            RAGFlowKnowledge::new(RAGFlowClient::with_transport(
-                config,
-                transport.clone(),
-            )),
+            RAGFlowKnowledge::new(RAGFlowClient::with_transport(config, transport.clone())),
             transport,
         )
     }

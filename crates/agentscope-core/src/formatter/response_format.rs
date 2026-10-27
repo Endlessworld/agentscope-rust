@@ -18,17 +18,26 @@ pub struct ResponseFormat {
 impl ResponseFormat {
     /// Plain text response format.
     pub fn text() -> Self {
-        Self { format_type: "text".into(), json_schema: None }
+        Self {
+            format_type: "text".into(),
+            json_schema: None,
+        }
     }
 
     /// JSON object response format.
     pub fn json_object() -> Self {
-        Self { format_type: "json_object".into(), json_schema: None }
+        Self {
+            format_type: "json_object".into(),
+            json_schema: None,
+        }
     }
 
     /// JSON Schema response format with structured output validation.
     pub fn json_schema(schema: JsonSchema) -> Self {
-        Self { format_type: "json_schema".into(), json_schema: Some(schema) }
+        Self {
+            format_type: "json_schema".into(),
+            json_schema: Some(schema),
+        }
     }
 
     pub fn builder() -> ResponseFormatBuilder {

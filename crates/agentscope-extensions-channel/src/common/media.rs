@@ -160,7 +160,10 @@ mod tests {
 
     #[test]
     fn marker_text_embeds_the_sanitized_file_name() {
-        assert_eq!(marker_text(KIND_FILE, Some("report.pdf")), "[file: report.pdf]");
+        assert_eq!(
+            marker_text(KIND_FILE, Some("report.pdf")),
+            "[file: report.pdf]"
+        );
         // A `]` cannot close the marker early and invisible characters are dropped.
         assert_eq!(
             marker_text(KIND_FILE, Some("ev]il\u{200B}.pdf")),
@@ -195,6 +198,9 @@ mod tests {
         put_if_present(&mut metadata, FILE_NAME, Some("  "));
         put_if_present(&mut metadata, ID, None);
         assert_eq!(metadata.len(), 1);
-        assert_eq!(metadata.get(FORMAT), Some(&Value::String("amr".to_string())));
+        assert_eq!(
+            metadata.get(FORMAT),
+            Some(&Value::String("amr".to_string()))
+        );
     }
 }

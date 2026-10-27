@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::bot_identity::GitHubBotIdentityResolver;
@@ -259,7 +259,9 @@ mod tests {
             props,
             GitHubOutboundClient::new(API_BASE, "t", transport.clone()),
             GitHubInboundMapper::new("github"),
-            Arc::new(GitHubBotIdentityResolver::new(API_BASE, "t", None, transport)),
+            Arc::new(GitHubBotIdentityResolver::new(
+                API_BASE, "t", None, transport,
+            )),
             verifier(),
             Arc::new(IdempotencyStore::with_defaults()),
             BotLoopGuard::with_defaults(),
@@ -323,14 +325,16 @@ mod tests {
         let body = payload(1);
         let sig = signed(&body);
         assert_eq!(
-            c.handle_webhook("issue_comment", sig.as_deref(), &body).await,
+            c.handle_webhook("issue_comment", sig.as_deref(), &body)
+                .await,
             GitHubCallbackOutcome::Accepted
         );
         assert_eq!(c.core().admitted(), 1);
 
         // Duplicate delivery of the same `comment.id` is dropped by idempotency.
         assert_eq!(
-            c.handle_webhook("issue_comment", sig.as_deref(), &body).await,
+            c.handle_webhook("issue_comment", sig.as_deref(), &body)
+                .await,
             GitHubCallbackOutcome::Accepted
         );
         assert_eq!(c.core().admitted(), 1);

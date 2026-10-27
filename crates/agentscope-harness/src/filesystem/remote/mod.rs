@@ -9,14 +9,16 @@ pub mod store;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use async_trait::async_trait;
 
 use super::local::{build_glob_matcher, GrepGlob, PatternMatcher};
 use super::util;
 use super::{validate_path, FileData, FileInfo, Filesystem, GrepMatch};
-use store::{BaseStore, DefaultNamespace, NamespaceFactory, StaticNamespace, StoreItem, StoreValue};
+use store::{
+    BaseStore, DefaultNamespace, NamespaceFactory, StaticNamespace, StoreItem, StoreValue,
+};
 
 /// Maximum CAS retry attempts for `edit` under concurrent writers.
 const EDIT_MAX_RETRIES: usize = 5;
@@ -32,11 +34,11 @@ pub struct RemoteFilesystem {
 
 impl RemoteFilesystem {
     /// Creates a `RemoteFilesystem` whose namespace is resolved per operation.
-    pub fn new(
-        store: Arc<dyn BaseStore>,
-        namespace_factory: Arc<dyn NamespaceFactory>,
-    ) -> Self {
-        Self { store, namespace_factory }
+    pub fn new(store: Arc<dyn BaseStore>, namespace_factory: Arc<dyn NamespaceFactory>) -> Self {
+        Self {
+            store,
+            namespace_factory,
+        }
     }
 
     /// Creates a `RemoteFilesystem` with a fixed namespace tuple.
@@ -136,8 +138,14 @@ fn convert_item_to_file_data(item: &StoreItem) -> Option<FileData> {
 
 fn file_data_to_store_value(fd: &FileData) -> StoreValue {
     let mut result = StoreValue::new();
-    result.insert("content".to_string(), serde_json::Value::String(fd.content.clone()));
-    result.insert("encoding".to_string(), serde_json::Value::String(fd.encoding.clone()));
+    result.insert(
+        "content".to_string(),
+        serde_json::Value::String(fd.content.clone()),
+    );
+    result.insert(
+        "encoding".to_string(),
+        serde_json::Value::String(fd.encoding.clone()),
+    );
     result
 }
 
@@ -261,9 +269,9 @@ impl Filesystem for RemoteFilesystem {
         let ns = self.ctx_namespace(ctx)?;
         let fd = FileData::text(content);
         // CAS create-if-absent: atomic under concurrent writers across nodes.
-        let written =
-            self.store
-                .put_if_version(&ns, path, file_data_to_store_value(&fd), 0);
+        let written = self
+            .store
+            .put_if_version(&ns, path, file_data_to_store_value(&fd), 0);
         if !written {
             return Err(Error::Tool(format!(
                 "Cannot write to {path} because it already exists. \
@@ -292,7 +300,10 @@ impl Filesystem for RemoteFilesystem {
             let (new_content, occurrences) =
                 util::perform_string_replacement(&file_data.content, old, new, replace_all)
                     .map_err(Error::Tool)?;
-            let updated = FileData { content: new_content, encoding: file_data.encoding };
+            let updated = FileData {
+                content: new_content,
+                encoding: file_data.encoding,
+            };
             let stored_key = item.key.clone();
             if self.store.put_if_version(
                 &ns,
@@ -318,7 +329,9 @@ impl Filesystem for RemoteFilesystem {
         glob: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
         let normalized_path = normalize_path(path.unwrap_or("/"));
-        let glob = glob.filter(|g| !g.trim().is_empty()).and_then(GrepGlob::build);
+        let glob = glob
+            .filter(|g| !g.trim().is_empty())
+            .and_then(GrepGlob::build);
         let matcher = PatternMatcher::new(pattern);
 
         let items = self.search_all_items(ctx)?;
@@ -382,7 +395,9 @@ impl Filesystem for RemoteFilesystem {
             let relative = relative_to(&key, &normalized_path);
             let rel_path = std::path::Path::new(&relative);
             let matched = matcher.as_ref().is_some_and(|m| m.is_match(rel_path))
-                || direct_matcher.as_ref().is_some_and(|m| m.is_match(rel_path));
+                || direct_matcher
+                    .as_ref()
+                    .is_some_and(|m| m.is_match(rel_path));
             if matched {
                 let size = convert_item_to_file_data(&item)
                     .map(|fd| fd.content.chars().count() as u64)
@@ -462,7 +477,9 @@ mod tests {
     async fn write_then_read_roundtrip() {
         let fs = fs();
         let ctx = RuntimeContext::new();
-        fs.write(&ctx, "/notes/a.md", "line1\nline2\nline3").await.unwrap();
+        fs.write(&ctx, "/notes/a.md", "line1\nline2\nline3")
+            .await
+            .unwrap();
         let data = fs.read(&ctx, "/notes/a.md", 0, 0).await.unwrap();
         assert_eq!(data.content, "line1\nline2\nline3");
         // offset/limit slice
@@ -485,7 +502,10 @@ mod tests {
         fs.write(&ctx, "/a.md", "foo bar foo").await.unwrap();
         let n = fs.edit(&ctx, "/a.md", "foo", "baz", true).await.unwrap();
         assert_eq!(n, 2);
-        assert_eq!(fs.read(&ctx, "/a.md", 0, 0).await.unwrap().content, "baz bar baz");
+        assert_eq!(
+            fs.read(&ctx, "/a.md", 0, 0).await.unwrap().content,
+            "baz bar baz"
+        );
     }
 
     #[tokio::test]
@@ -498,7 +518,9 @@ mod tests {
         let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
         assert!(paths.contains(&"/root/a.md".to_string()));
         assert!(paths.contains(&"/root/sub/".to_string()));
-        assert!(entries.iter().any(|e| e.is_directory && e.path == "/root/sub/"));
+        assert!(entries
+            .iter()
+            .any(|e| e.is_directory && e.path == "/root/sub/"));
     }
 
     #[tokio::test]
@@ -516,14 +538,19 @@ mod tests {
             .map(|f| f.path)
             .collect();
         matches.sort();
-        assert_eq!(matches, vec!["/root/a.md".to_string(), "/root/deep/b.md".to_string()]);
+        assert_eq!(
+            matches,
+            vec!["/root/a.md".to_string(), "/root/deep/b.md".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn grep_finds_matching_lines() {
         let fs = fs();
         let ctx = RuntimeContext::new();
-        fs.write(&ctx, "/root/a.md", "alpha\nbeta\nalpha2").await.unwrap();
+        fs.write(&ctx, "/root/a.md", "alpha\nbeta\nalpha2")
+            .await
+            .unwrap();
         let matches = fs.grep(&ctx, "alpha", Some("/root"), None).await.unwrap();
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].line, 1);
@@ -589,7 +616,13 @@ mod tests {
         let ctx_b = RuntimeContext::new().with_user_id("bob");
         fs.write(&ctx_a, "/a.md", "alice-data").await.unwrap();
         fs.write(&ctx_b, "/a.md", "bob-data").await.unwrap();
-        assert_eq!(fs.read(&ctx_a, "/a.md", 0, 0).await.unwrap().content, "alice-data");
-        assert_eq!(fs.read(&ctx_b, "/a.md", 0, 0).await.unwrap().content, "bob-data");
+        assert_eq!(
+            fs.read(&ctx_a, "/a.md", 0, 0).await.unwrap().content,
+            "alice-data"
+        );
+        assert_eq!(
+            fs.read(&ctx_b, "/a.md", 0, 0).await.unwrap().content,
+            "bob-data"
+        );
     }
 }

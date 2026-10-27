@@ -181,10 +181,7 @@ fn prefix_candidates(
     candidates
 }
 
-fn provider_candidates(
-    snapshot: &CatalogSnapshot,
-    request: &ResolveRequest<'_>,
-) -> Vec<String> {
+fn provider_candidates(snapshot: &CatalogSnapshot, request: &ResolveRequest<'_>) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(hint) = request.provider_key {
         let hint = hint.trim();
@@ -219,7 +216,11 @@ fn provider_candidates(
                 ((overlap, path), provider.clone())
             })
             .collect();
-        let max = scored.iter().map(|(score, _)| *score).max().unwrap_or((0, 0));
+        let max = scored
+            .iter()
+            .map(|(score, _)| *score)
+            .max()
+            .unwrap_or((0, 0));
         if max > (0, 0) {
             scored.retain(|(score, _)| *score == max);
             scored.sort_by(|a, b| a.1.cmp(&b.1));
@@ -404,10 +405,7 @@ mod tests {
 
     #[test]
     fn stripped_free_never_borrows_a_large_window() {
-        let snapshot = snapshot_from(
-            r#"{"paid/model": {"limit": {"context": 1000000}}}"#,
-            None,
-        );
+        let snapshot = snapshot_from(r#"{"paid/model": {"limit": {"context": 1000000}}}"#, None);
         let result = resolve(&snapshot, &ResolveRequest::new("model-free"));
         assert_eq!(result.kind, MatchKind::Default);
         assert!(result.descriptor.is_none());
@@ -415,10 +413,7 @@ mod tests {
 
     #[test]
     fn canonical_matches_after_exact_misses() {
-        let snapshot = snapshot_from(
-            r#"{"p/m": {"canonical_model_id": "upstream/m"}}"#,
-            None,
-        );
+        let snapshot = snapshot_from(r#"{"p/m": {"canonical_model_id": "upstream/m"}}"#, None);
         let result = resolve(&snapshot, &ResolveRequest::new("upstream/m"));
         assert_eq!(result.kind, MatchKind::Canonical);
         assert_eq!(result.descriptor.unwrap().key, "p/m");

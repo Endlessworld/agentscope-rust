@@ -51,9 +51,9 @@ impl RewardCalculator for ZeroRewardCalculator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-    use agentscope_core::message::{ChatUsage, Msg};
     use agentscope_core::error::Result;
+    use agentscope_core::message::{ChatUsage, Msg};
+    use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
     use futures::stream;
     use std::sync::Arc;
 
@@ -66,7 +66,13 @@ mod tests {
             _o: GenerateOptions,
         ) -> futures::stream::BoxStream<'_, Result<ChatResponse>> {
             Box::pin(stream::once(async {
-                Ok(ChatResponse::new("id", vec![], ChatUsage::default(), None, None))
+                Ok(ChatResponse::new(
+                    "id",
+                    vec![],
+                    ChatUsage::default(),
+                    None,
+                    None,
+                ))
             }))
         }
         fn model_name(&self) -> &str {
@@ -95,13 +101,8 @@ mod tests {
 
     #[test]
     fn fn_calculator_can_inspect_agent() {
-        let calc = FnRewardCalculator::new(|a: &ReActAgent| {
-            if a.name() == "a" {
-                1.0
-            } else {
-                -1.0
-            }
-        });
+        let calc =
+            FnRewardCalculator::new(|a: &ReActAgent| if a.name() == "a" { 1.0 } else { -1.0 });
         assert_eq!(calc.calculate(&agent()), 1.0);
     }
 }

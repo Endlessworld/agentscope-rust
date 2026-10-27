@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use base64::Engine;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use async_trait::async_trait;
+use base64::Engine;
 use tokio::io::AsyncReadExt;
 
 use super::{ExecuteResponse, FileData, FileInfo, Filesystem, GrepMatch};
@@ -32,7 +32,10 @@ pub struct SandboxBackedFilesystem {
 
 impl SandboxBackedFilesystem {
     pub fn new(inner: Arc<dyn Filesystem>, cwd: impl Into<PathBuf>) -> Self {
-        Self { inner, cwd: cwd.into() }
+        Self {
+            inner,
+            cwd: cwd.into(),
+        }
     }
 
     pub fn inner(&self) -> &dyn Filesystem {
@@ -58,16 +61,35 @@ impl Filesystem for SandboxBackedFilesystem {
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         self.inner.ls(ctx, path).await
     }
-    async fn read(&self, ctx: &RuntimeContext, path: &str, offset: usize, limit: usize) -> Result<FileData> {
+    async fn read(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<FileData> {
         self.inner.read(ctx, path, offset, limit).await
     }
     async fn write(&self, ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
         self.inner.write(ctx, path, content).await
     }
-    async fn edit(&self, ctx: &RuntimeContext, path: &str, old: &str, new: &str, replace_all: bool) -> Result<usize> {
+    async fn edit(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<usize> {
         self.inner.edit(ctx, path, old, new, replace_all).await
     }
-    async fn grep(&self, ctx: &RuntimeContext, pattern: &str, path: Option<&str>, glob: Option<&str>) -> Result<Vec<GrepMatch>> {
+    async fn grep(
+        &self,
+        ctx: &RuntimeContext,
+        pattern: &str,
+        path: Option<&str>,
+        glob: Option<&str>,
+    ) -> Result<Vec<GrepMatch>> {
         self.inner.grep(ctx, pattern, path, glob).await
     }
     async fn glob(&self, ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
@@ -97,7 +119,12 @@ fn build_windows_command(command: &str) -> Vec<String> {
     let utf16 = command.encode_utf16().collect::<Vec<u16>>();
     let byte_vec: Vec<u8> = utf16.iter().flat_map(|w| w.to_le_bytes()).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&byte_vec);
-    vec!["pwsh".into(), "-NoProfile".into(), "-EncodedCommand".into(), encoded]
+    vec![
+        "pwsh".into(),
+        "-NoProfile".into(),
+        "-EncodedCommand".into(),
+        encoded,
+    ]
 }
 
 /// Kills an entire process tree on Windows using `taskkill /F /T`.
@@ -168,12 +195,12 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         // By spawning first, the Child handle stays in scope and we can:
         // 1. Take stdout/stderr BEFORE waiting (prevents pipe-full deadlock).
         // 2. On timeout, kill the ENTIRE process tree via `taskkill /T`.
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::Io(std::io::Error::new(
+        let mut child = cmd.spawn().map_err(|e| {
+            Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to spawn command: {}", e),
-            )))?;
+            ))
+        })?;
 
         let pid = child.id().unwrap_or(0);
 
@@ -225,12 +252,14 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         };
 
         // Collect drained output.
-        let stdout_bytes = stdout_handle
-            .await
-            .unwrap_or_else(|e| { tracing::warn!("stdout task join error: {}", e); Vec::new() });
-        let stderr_bytes = stderr_handle
-            .await
-            .unwrap_or_else(|e| { tracing::warn!("stderr task join error: {}", e); Vec::new() });
+        let stdout_bytes = stdout_handle.await.unwrap_or_else(|e| {
+            tracing::warn!("stdout task join error: {}", e);
+            Vec::new()
+        });
+        let stderr_bytes = stderr_handle.await.unwrap_or_else(|e| {
+            tracing::warn!("stderr task join error: {}", e);
+            Vec::new()
+        });
 
         let mut output = String::from_utf8_lossy(&stdout_bytes).into_owned();
         if !stderr_bytes.is_empty() {

@@ -8,10 +8,10 @@
 use std::sync::{Arc, RwLock};
 
 use super::bound_sql::BoundSql;
-use super::skill_dialect::{SkillDialect, SkillResourcesDialect};
-use super::store_dialect::StoreDialect;
 use super::session_state_dialect::SessionStateDialect;
+use super::skill_dialect::{SkillDialect, SkillResourcesDialect};
 use super::snapshot_dialect::SnapshotDialect;
+use super::store_dialect::StoreDialect;
 
 /// Default table prefix applied to every table name.
 pub const DEFAULT_TABLE_PREFIX: &str = "agentscope_";

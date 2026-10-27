@@ -77,7 +77,10 @@ fn default_tool_type() -> String {
 impl OllamaTool {
     /// Wraps a function definition as a tool.
     pub fn function(function: OllamaToolFunction) -> Self {
-        Self { tool_type: "function".to_string(), function }
+        Self {
+            tool_type: "function".to_string(),
+            function,
+        }
     }
 }
 
@@ -122,7 +125,10 @@ pub struct OllamaResponse {
     pub load_duration: Option<i64>,
     #[serde(rename = "prompt_eval_count", skip_serializing_if = "Option::is_none")]
     pub prompt_eval_count: Option<i64>,
-    #[serde(rename = "prompt_eval_duration", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "prompt_eval_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub prompt_eval_duration: Option<i64>,
     #[serde(rename = "eval_count", skip_serializing_if = "Option::is_none")]
     pub eval_count: Option<i64>,
@@ -150,7 +156,13 @@ pub struct OllamaEmbeddingRequest {
 impl OllamaEmbeddingRequest {
     /// Creates a minimal embedding request.
     pub fn new(model: impl Into<String>, input: Vec<String>) -> Self {
-        Self { model: model.into(), input, keep_alive: None, truncate: None, options: None }
+        Self {
+            model: model.into(),
+            input,
+            keep_alive: None,
+            truncate: None,
+            options: None,
+        }
     }
 }
 

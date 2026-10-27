@@ -80,7 +80,10 @@ impl RemoteSnapshotClient for PostgresRemoteSnapshotClient {
     }
 
     async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
-        let sql = format!("SELECT data FROM {} WHERE snapshot_id = $1", self.full_table);
+        let sql = format!(
+            "SELECT data FROM {} WHERE snapshot_id = $1",
+            self.full_table
+        );
         let params = vec![SqlValue::text(snapshot_id)];
         let outcome = query_async(Arc::clone(&self.client), sql, params)
             .await
@@ -146,7 +149,9 @@ impl PostgresSnapshotSpec {
 
     /// Creates a spec over a named table (schema auto-created).
     pub fn with_table(client: Arc<dyn PostgresClient>, table: &str) -> Result<Self> {
-        Ok(Self(postgres_snapshot_spec_with_table(client, table, true)?))
+        Ok(Self(postgres_snapshot_spec_with_table(
+            client, table, true,
+        )?))
     }
 
     /// Access the inner [`RemoteSnapshotSpec`].
@@ -202,8 +207,8 @@ mod tests {
     #[test]
     fn constructor_initializes_custom_table() {
         let c = client();
-        let r = PostgresRemoteSnapshotClient::with_table(c.clone(), "custom_snapshots", true)
-            .unwrap();
+        let r =
+            PostgresRemoteSnapshotClient::with_table(c.clone(), "custom_snapshots", true).unwrap();
         assert_eq!(r.table_name(), "custom_snapshots");
         assert!(c.has_table("custom_snapshots"));
     }
@@ -286,8 +291,12 @@ mod tests {
         let c = client();
         let handle = tokio::runtime::Runtime::new().unwrap();
         handle.block_on(async {
-            initialize_snapshot_table(c.clone(), DEFAULT_TABLE).await.unwrap();
-            initialize_snapshot_table(c.clone(), DEFAULT_TABLE).await.unwrap();
+            initialize_snapshot_table(c.clone(), DEFAULT_TABLE)
+                .await
+                .unwrap();
+            initialize_snapshot_table(c.clone(), DEFAULT_TABLE)
+                .await
+                .unwrap();
         });
         assert!(c.has_table(DEFAULT_TABLE));
     }

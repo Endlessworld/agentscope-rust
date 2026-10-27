@@ -52,7 +52,10 @@ impl AgentCardResolver for NacosAgentCardResolver {
         let listener_caches = self.caches.clone();
         let listener: AgentCardListener = Arc::new(move |name, nacos_card| {
             let card = convert_to_a2a_agent_card(nacos_card);
-            listener_caches.lock().unwrap().insert(name.to_string(), card);
+            listener_caches
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), card);
         });
 
         let fetched = self
@@ -96,14 +99,22 @@ mod tests {
         let svc = Arc::new(InMemoryNacosAiService::new());
         svc.set_agent_card("remote", NacosAgentCard::new("remote", "http://r:9000"));
         let first = NacosAgentCardResolver::new(svc.clone());
-        assert_eq!(first.get_agent_card("remote").await.unwrap().url, "http://r:9000");
+        assert_eq!(
+            first.get_agent_card("remote").await.unwrap().url,
+            "http://r:9000"
+        );
 
         // Nacos push updates the subscribed resolver's cache.
         let mut updated = NacosAgentCard::new("remote", "http://r:9000");
         updated.description = Some("updated".into());
         svc.fire_agent_card_update("remote", updated);
         assert_eq!(
-            first.get_agent_card("remote").await.unwrap().description.as_deref(),
+            first
+                .get_agent_card("remote")
+                .await
+                .unwrap()
+                .description
+                .as_deref(),
             Some("updated")
         );
     }

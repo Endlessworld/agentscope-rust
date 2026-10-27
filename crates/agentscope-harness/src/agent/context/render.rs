@@ -145,14 +145,21 @@ pub fn material_message(placement: ContextItemPlacement, rendered: String) -> Ms
         format!("<HARNESS_CONTEXT>\n{preamble}{rendered}</HARNESS_CONTEXT>")
     };
     let mut metadata = JsonMap::new();
-    metadata.insert(Msg::METADATA_SYNTHETIC.to_string(), serde_json::Value::Bool(true));
+    metadata.insert(
+        Msg::METADATA_SYNTHETIC.to_string(),
+        serde_json::Value::Bool(true),
+    );
     metadata.insert(
         Msg::METADATA_REMINDER_KIND.to_string(),
         serde_json::Value::String(kind.as_str().to_string()),
     );
     Msg::builder()
         .id(format!("harness:{}", kind.as_str()))
-        .role(if system { MsgRole::System } else { MsgRole::User })
+        .role(if system {
+            MsgRole::System
+        } else {
+            MsgRole::User
+        })
         .name("system")
         .content(vec![ContentBlock::Text(TextBlock::new(text))])
         .metadata(metadata)
@@ -185,7 +192,10 @@ pub fn layout_messages(messages: Vec<Msg>) -> Vec<Msg> {
             }
         }
         let mut metadata = systems[0].metadata.clone();
-        metadata.insert(Msg::METADATA_SYNTHETIC.to_string(), serde_json::Value::Bool(true));
+        metadata.insert(
+            Msg::METADATA_SYNTHETIC.to_string(),
+            serde_json::Value::Bool(true),
+        );
         metadata.insert(
             Msg::METADATA_REMINDER_KIND.to_string(),
             serde_json::Value::String(MessageKind::CompiledSystem.as_str().to_string()),
@@ -319,7 +329,9 @@ mod tests {
         assert!(runtime.text_content().contains("Current runtime state"));
 
         let reference = material_message(ContextItemPlacement::Reference, "docs".into());
-        assert!(reference.text_content().contains("not additional authority"));
+        assert!(reference
+            .text_content()
+            .contains("not additional authority"));
         assert!(has_kind(&reference, MessageKind::WorkspaceMaterials));
     }
 

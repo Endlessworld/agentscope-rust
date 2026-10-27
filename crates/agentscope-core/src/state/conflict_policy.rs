@@ -59,7 +59,10 @@ mod tests {
         ] {
             assert_eq!(ConflictPolicy::from_wire(policy.as_str()), Some(policy));
         }
-        assert_eq!(ConflictPolicy::from_wire("append_merge"), Some(ConflictPolicy::AppendMerge));
+        assert_eq!(
+            ConflictPolicy::from_wire("append_merge"),
+            Some(ConflictPolicy::AppendMerge)
+        );
         assert_eq!(ConflictPolicy::from_wire("NOPE"), None);
     }
 }

@@ -128,7 +128,12 @@ impl RedisSandboxExecutionGuard {
 
     /// Composes the Redis lock key: `<keyPrefix><scope_lower>:<value>`.
     pub(crate) fn compose_key(&self, key: &SandboxIsolationKey) -> String {
-        format!("{}{}:{}", self.key_prefix, key.scope.to_lowercase(), key.value)
+        format!(
+            "{}{}:{}",
+            self.key_prefix,
+            key.scope.to_lowercase(),
+            key.value
+        )
     }
 
     /// Acquires the Redis-backed lease for `key`, spinning at `retry_interval` until the
@@ -328,7 +333,10 @@ mod tests {
     use super::*;
     use crate::test_support::MemoryRedisCommands;
 
-    fn guard(prefix: &str, retry: Duration) -> (RedisSandboxExecutionGuard, Arc<MemoryRedisCommands>) {
+    fn guard(
+        prefix: &str,
+        retry: Duration,
+    ) -> (RedisSandboxExecutionGuard, Arc<MemoryRedisCommands>) {
         let commands = Arc::new(MemoryRedisCommands::new());
         let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
             .key_prefix(prefix)
@@ -378,7 +386,10 @@ mod tests {
         assert!(!lease.token().is_empty());
         assert!(!lease.is_released());
         assert_eq!(commands.set_nx_calls(), 1, "acquired on the first attempt");
-        assert_eq!(commands.stored_bytes("lock:agent:a"), Some(lease.token().as_bytes().to_vec()));
+        assert_eq!(
+            commands.stored_bytes("lock:agent:a"),
+            Some(lease.token().as_bytes().to_vec())
+        );
         // lease_ttl default is 30min -> milliseconds, converted to seconds by the double
         assert_eq!(commands.expiration_of("lock:agent:a"), Some(1800));
         assert!(guard.is_held(&key).await);
@@ -398,7 +409,11 @@ mod tests {
         let evals_after_first = commands.release_eval_calls();
 
         assert!(!lease.release().await, "second release is a no-op");
-        assert_eq!(commands.release_eval_calls(), evals_after_first, "script not run twice");
+        assert_eq!(
+            commands.release_eval_calls(),
+            evals_after_first,
+            "script not run twice"
+        );
 
         // drop must not run the script a third time either
         drop(lease);
@@ -416,7 +431,11 @@ mod tests {
         }
         // Drop scheduled the CAS release on the ambient runtime
         tokio::task::yield_now().await;
-        assert_eq!(commands.release_eval_calls(), 1, "Drop ran the release script once");
+        assert_eq!(
+            commands.release_eval_calls(),
+            1,
+            "Drop ran the release script once"
+        );
         assert!(!guard.is_held(&key).await, "slot freed by Drop");
     }
 
@@ -428,7 +447,8 @@ mod tests {
 
         // Simulate a different holder overwriting the slot with its own token.
         commands.configure(|d| {
-            d.strings.insert("lock:agent:a".into(), b"someone-else".to_vec());
+            d.strings
+                .insert("lock:agent:a".into(), b"someone-else".to_vec());
         });
         assert!(!lease.release().await, "CAS must not delete a foreign lock");
         assert_eq!(
@@ -449,13 +469,15 @@ mod tests {
         let holder = guard.try_enter(&key).await.unwrap();
 
         // A second acquisition cannot succeed while the first is held: the loop retries.
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(50),
-            guard.try_enter(&key),
-        )
-        .await;
-        assert!(blocked.is_err(), "second acquisition must spin while the lease is held");
-        assert!(commands.set_nx_calls() > 1, "retry loop actually re-attempted SET NX");
+        let blocked = tokio::time::timeout(Duration::from_millis(50), guard.try_enter(&key)).await;
+        assert!(
+            blocked.is_err(),
+            "second acquisition must spin while the lease is held"
+        );
+        assert!(
+            commands.set_nx_calls() > 1,
+            "retry loop actually re-attempted SET NX"
+        );
 
         // Releasing the holder frees the slot for the waiter.
         drop(holder);
@@ -474,7 +496,10 @@ mod tests {
         commands.configure(|d| d.fail_set_nx = true);
         let key = SandboxIsolationKey::new("Agent", "a");
         let err = guard.try_enter(&key).await.unwrap_err();
-        assert!(format!("{err}").contains("Redis sandbox guard SET NX failed"), "{err}");
+        assert!(
+            format!("{err}").contains("Redis sandbox guard SET NX failed"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -520,10 +545,15 @@ mod tests {
             released: AtomicBool::new(false),
         };
         commands.configure(|d| {
-            d.strings.insert("lock:agent:bare".into(), b"tok-1".to_vec());
+            d.strings
+                .insert("lock:agent:bare".into(), b"tok-1".to_vec());
         });
         drop(lease);
-        assert_eq!(commands.release_eval_calls(), 1, "blocking fallback ran the script");
+        assert_eq!(
+            commands.release_eval_calls(),
+            1,
+            "blocking fallback ran the script"
+        );
         assert!(commands.stored_bytes("lock:agent:bare").is_none());
         let _ = guard;
     }

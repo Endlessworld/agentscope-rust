@@ -48,8 +48,13 @@ impl AgentTaskOutcome {
         pending_task_ids: Vec<String>,
     ) -> std::result::Result<Self, String> {
         let outcome = outcome.into();
-        if ![OUTCOME_SUCCEEDED, OUTCOME_WAITING, OUTCOME_BLOCKED, OUTCOME_FAILED]
-            .contains(&outcome.as_str())
+        if ![
+            OUTCOME_SUCCEEDED,
+            OUTCOME_WAITING,
+            OUTCOME_BLOCKED,
+            OUTCOME_FAILED,
+        ]
+        .contains(&outcome.as_str())
         {
             return Err("outcome must be succeeded, waiting, blocked or failed".into());
         }
@@ -95,10 +100,7 @@ impl AgentTaskOutcomeState {
 
     /// Takes the pending outcome, leaving the slot empty.
     pub fn take(&self) -> Option<AgentTaskOutcome> {
-        self.value
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
+        self.value.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
     /// Marks that a terminal run-node tool has committed the lifecycle.
@@ -289,7 +291,10 @@ mod tests {
         .as_object()
         .cloned()
         .unwrap();
-        let block = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let block = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         assert!(!block.output.is_empty());
         assert_eq!(state.take().unwrap().result, "done");
     }
@@ -302,7 +307,10 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap();
-        let _ = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let _ = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         assert!(state.take().is_none());
     }
 

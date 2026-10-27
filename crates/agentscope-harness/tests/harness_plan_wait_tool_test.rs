@@ -8,7 +8,9 @@ use agentscope_core::message::{ContentBlock, JsonMap, Msg, TextBlock, ToolUseBlo
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
-use agentscope_harness::agent::bus::async_tool::{AsyncToolRecord, AsyncToolRegistry, WorkspaceAsyncToolRegistry};
+use agentscope_harness::agent::bus::async_tool::{
+    AsyncToolRecord, AsyncToolRegistry, WorkspaceAsyncToolRegistry,
+};
 use agentscope_harness::agent::HarnessAgent;
 use agentscope_harness::filesystem::{Filesystem, LocalFilesystem};
 use agentscope_harness::tool::{PlanModeHandle, WaitAsyncResultsTool};
@@ -60,7 +62,12 @@ async fn plan_mode_tools_enter_write_exit_roundtrip() {
 
     // The plan file landed on the filesystem at the reported path.
     let content = fs
-        .read(&agentscope_core::agent::RuntimeContext::default(), "plans/PLAN.md", 0, usize::MAX)
+        .read(
+            &agentscope_core::agent::RuntimeContext::default(),
+            "plans/PLAN.md",
+            0,
+            usize::MAX,
+        )
         .await
         .expect("plan file readable");
     assert!(content.content.contains("Step one"));
@@ -180,10 +187,7 @@ async fn plan_enter_mid_turn_reaches_the_next_request() {
     );
     drop(requests);
 
-    let state = agent
-        .agent()
-        .expect("built with a model")
-        .state_handle();
+    let state = agent.agent().expect("built with a model").state_handle();
     assert!(
         state.lock().unwrap().plan_mode_context.plan_active,
         "plan_enter must keep plan_active set on the session state"
@@ -196,10 +200,19 @@ async fn plan_enter_mid_turn_reaches_the_next_request() {
 async fn wait_async_results_reports_settled_and_missing_tasks() {
     let dir = temp_dir("wait");
     let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
-    let registry = Arc::new(WorkspaceAsyncToolRegistry::new(Arc::clone(&fs), "/bus/async"));
+    let registry = Arc::new(WorkspaceAsyncToolRegistry::new(
+        Arc::clone(&fs),
+        "/bus/async",
+    ));
 
     registry
-        .register(AsyncToolRecord::new("t1", "sess1", "shell", "call-1", chrono::Utc::now()))
+        .register(AsyncToolRecord::new(
+            "t1",
+            "sess1",
+            "shell",
+            "call-1",
+            chrono::Utc::now(),
+        ))
         .await
         .unwrap();
 
@@ -210,23 +223,20 @@ async fn wait_async_results_reports_settled_and_missing_tasks() {
     assert!(out.contains("No async tasks"), "empty output: {out}");
 
     // Specific unknown task id in an existing session still reports nothing matched.
-    let out = run(
-        &tool,
-        args(&[(
-            "task_ids",
-            serde_json::json!(["nope"]),
-        )])
-        ,
-    )
-    .await;
+    let out = run(&tool, args(&[("task_ids", serde_json::json!(["nope"]))])).await;
     // ctx has no runtime session_id 鈫?"default" session; t1 is under sess1.
-    assert!(out.contains("No async tasks") || out.contains("nope"), "output: {out}");
+    assert!(
+        out.contains("No async tasks") || out.contains("nope"),
+        "output: {out}"
+    );
 
     // Complete t1 and wait for it explicitly by targeting its session via runtime map.
     registry.complete("t1", "done").await.unwrap();
     let mut ctx = ToolExecutionContext::default();
-    ctx.runtime
-        .insert("session_id".to_string(), serde_json::Value::String("sess1".into()));
+    ctx.runtime.insert(
+        "session_id".to_string(),
+        serde_json::Value::String("sess1".into()),
+    );
     let block = tool
         .call(args(&[("task_ids", serde_json::json!(["t1"]))]), ctx)
         .await
@@ -242,16 +252,27 @@ async fn wait_async_results_reports_settled_and_missing_tasks() {
 async fn wait_async_results_times_out_when_pending() {
     let dir = temp_dir("timeout");
     let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
-    let registry = Arc::new(WorkspaceAsyncToolRegistry::new(Arc::clone(&fs), "/bus/async"));
+    let registry = Arc::new(WorkspaceAsyncToolRegistry::new(
+        Arc::clone(&fs),
+        "/bus/async",
+    ));
     registry
-        .register(AsyncToolRecord::new("t2", "s", "web", "call-2", chrono::Utc::now()))
+        .register(AsyncToolRecord::new(
+            "t2",
+            "s",
+            "web",
+            "call-2",
+            chrono::Utc::now(),
+        ))
         .await
         .unwrap();
 
     let tool = WaitAsyncResultsTool::new(registry.clone());
     let mut ctx = ToolExecutionContext::default();
-    ctx.runtime
-        .insert("session_id".to_string(), serde_json::Value::String("s".into()));
+    ctx.runtime.insert(
+        "session_id".to_string(),
+        serde_json::Value::String("s".into()),
+    );
 
     let block = tool
         .call(args(&[("timeout_ms", serde_json::json!(600))]), ctx)

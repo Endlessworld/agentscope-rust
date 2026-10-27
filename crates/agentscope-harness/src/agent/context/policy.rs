@@ -136,9 +136,7 @@ impl ContextSelectionPolicy for DefaultSelectionPolicy {
     fn omission_order(&self, materials: &[ContextItem]) -> Vec<String> {
         let mut candidates: Vec<&ContextItem> = materials
             .iter()
-            .filter(|item| {
-                !item.required && item.placement != ContextItemPlacement::System
-            })
+            .filter(|item| !item.required && item.placement != ContextItemPlacement::System)
             .collect();
         candidates.sort_by(|a, b| {
             category(a.kind.as_str())
@@ -383,10 +381,7 @@ impl ContextPolicy {
     }
 }
 
-fn limit(
-    values: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> crate::Result<u32> {
+fn limit(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> crate::Result<u32> {
     match values.get(key) {
         None | Some(serde_json::Value::Null) => Ok(0),
         Some(value) => match value.as_u64() {
@@ -400,9 +395,9 @@ fn limit(
 
 #[cfg(test)]
 mod tests {
+    use super::super::item::ContextBlock;
     use super::*;
     use agentscope_core::message::{Msg, TextBlock};
-    use super::super::item::ContextBlock;
 
     #[test]
     fn approximate_estimator_counts_text_by_characters() {
@@ -450,10 +445,15 @@ mod tests {
         let policy = DefaultSelectionPolicy;
         let items = vec![
             ContextItem::instruction("policy", "instruction/a", "x").unwrap(),
-            ContextItem::new("memory", "memory/req", "x").unwrap().required(),
+            ContextItem::new("memory", "memory/req", "x")
+                .unwrap()
+                .required(),
             ContextItem::new("memory", "memory/opt", "x").unwrap(),
         ];
-        assert_eq!(policy.omission_order(&items), vec!["memory/opt".to_string()]);
+        assert_eq!(
+            policy.omission_order(&items),
+            vec!["memory/opt".to_string()]
+        );
     }
 
     #[test]

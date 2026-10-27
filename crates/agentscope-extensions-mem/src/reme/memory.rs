@@ -40,7 +40,10 @@ pub fn is_recordable(msg: &Msg) -> bool {
 /// Converts a single [`Msg`] to a [`ReMeMessage`], or `None` when unsupported.
 pub fn convert_to_reme_message(msg: &Msg) -> Option<ReMeMessage> {
     let role = role_to_reme_role(msg.role())?;
-    Some(ReMeMessage { role: role.to_string(), content: msg.text_content() })
+    Some(ReMeMessage {
+        role: role.to_string(),
+        content: msg.text_content(),
+    })
 }
 
 /// Converts a slice of messages into ReMe messages, applying the Java filters.
@@ -124,7 +127,10 @@ impl ReMeLongTermMemory {
         if query.is_empty() {
             return Ok(String::new());
         }
-        let response = self.client.search(&self.build_search_request(query)).await?;
+        let response = self
+            .client
+            .search(&self.build_search_request(query))
+            .await?;
         Ok(render_search_response(&response))
     }
 
@@ -215,9 +221,18 @@ mod tests {
             answer: Some(String::new()),
             metadata: Some(ReMeSearchMetadata {
                 memory_list: Some(vec![
-                    ReMeMemoryItem { content: Some("m1".into()), ..Default::default() },
-                    ReMeMemoryItem { content: None, ..Default::default() },
-                    ReMeMemoryItem { content: Some("m2".into()), ..Default::default() },
+                    ReMeMemoryItem {
+                        content: Some("m1".into()),
+                        ..Default::default()
+                    },
+                    ReMeMemoryItem {
+                        content: None,
+                        ..Default::default()
+                    },
+                    ReMeMemoryItem {
+                        content: Some("m2".into()),
+                        ..Default::default()
+                    },
                 ]),
             }),
             ..Default::default()
@@ -232,7 +247,10 @@ mod tests {
             Arc::new(MockTransport::new()),
             "https://reme.test",
         ));
-        assert!(matches!(ReMeLongTermMemory::new(client, "   "), Err(MemError::Config(_))));
+        assert!(matches!(
+            ReMeLongTermMemory::new(client, "   "),
+            Err(MemError::Config(_))
+        ));
     }
 
     #[test]
@@ -240,7 +258,14 @@ mod tests {
         let (_mock, adapter) = adapter("alice");
         let add = adapter.build_add_request(vec![ReMeMessage::new("user", "hi")]);
         assert_eq!(add.workspace_id.as_deref(), Some("alice"));
-        assert_eq!(add.trajectories.as_ref().unwrap()[0].messages.as_ref().unwrap()[0].content, "hi");
+        assert_eq!(
+            add.trajectories.as_ref().unwrap()[0]
+                .messages
+                .as_ref()
+                .unwrap()[0]
+                .content,
+            "hi"
+        );
         let search = adapter.build_search_request("q");
         assert_eq!(search.workspace_id.as_deref(), Some("alice"));
         assert_eq!(search.query.as_deref(), Some("q"));
@@ -279,7 +304,10 @@ mod tests {
     async fn retrieve_renders_answer_from_service() {
         let (mock, adapter) = adapter("alice");
         mock.push_body(r#"{"answer":"memory answer"}"#);
-        assert_eq!(adapter.retrieve(&Msg::user("q")).await.unwrap(), "memory answer");
+        assert_eq!(
+            adapter.retrieve(&Msg::user("q")).await.unwrap(),
+            "memory answer"
+        );
         assert!(mock.requests()[0].0.ends_with(RETRIEVE_ENDPOINT));
     }
 
@@ -302,9 +330,7 @@ mod tests {
     #[tokio::test]
     async fn retrieve_lossy_passes_through_memory_list() {
         let (mock, adapter) = adapter("alice");
-        mock.push_body(
-            r#"{"metadata":{"memory_list":[{"content":"m1"},{"content":"m2"}]}}"#,
-        );
+        mock.push_body(r#"{"metadata":{"memory_list":[{"content":"m1"},{"content":"m2"}]}}"#);
         assert_eq!(adapter.retrieve_lossy(&Msg::user("q")).await, "m1\nm2");
     }
 }

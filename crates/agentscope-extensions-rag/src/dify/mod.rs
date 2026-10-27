@@ -14,7 +14,10 @@ mod model;
 mod request;
 
 pub use client::{DifyRAGClient, DifyTransport, HttpDifyTransport};
-pub use config::{DifyRAGConfig, DifyRAGConfigBuilder, MetadataFilter, MetadataFilterCondition, RerankConfig, RetrievalMode};
+pub use config::{
+    DifyRAGConfig, DifyRAGConfigBuilder, MetadataFilter, MetadataFilterCondition, RerankConfig,
+    RetrievalMode,
+};
 pub use converter::DifyDocumentConverter;
 pub use knowledge::DifyKnowledge;
 pub use model::{DifyResponse, DocumentInfo, Query, Record, Segment};

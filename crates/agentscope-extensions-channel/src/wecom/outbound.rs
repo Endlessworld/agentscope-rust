@@ -119,9 +119,7 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new());
         let c = client(transport, Arc::new(StaticTokenProvider::new("tok")));
         let address = OutboundAddress::direct("wecom", "wecom:DIRECT:user-1");
-        let reqs = c
-            .prepare("tok", &address, &[Msg::user("plain")])
-            .unwrap();
+        let reqs = c.prepare("tok", &address, &[Msg::user("plain")]).unwrap();
         let req = &reqs[0];
         assert_eq!(
             req.url,
@@ -154,7 +152,10 @@ mod tests {
         let address = OutboundAddress::direct("wecom", "wecom:GROUP:chat-9");
         let reqs = c.prepare("tok", &address, &[Msg::user("hi")]).unwrap();
         let req = &reqs[0];
-        assert_eq!(req.url, "https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token=tok");
+        assert_eq!(
+            req.url,
+            "https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token=tok"
+        );
         let body = req.body.as_ref().unwrap();
         assert_eq!(body["chatid"], json!("chat-9"));
     }

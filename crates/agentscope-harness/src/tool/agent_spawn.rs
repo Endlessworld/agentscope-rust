@@ -7,11 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::subagent::manager::DefaultAgentManager;
 use crate::agent::subagent::task::background::BackgroundTask;
@@ -116,7 +116,11 @@ impl AgentSpawnTool {
     }
 
     /// Resolves an `agent_key` from either the explicit key or a `label`.
-    fn resolve_key(&self, agent_key: Option<&str>, label: Option<&str>) -> std::result::Result<String, String> {
+    fn resolve_key(
+        &self,
+        agent_key: Option<&str>,
+        label: Option<&str>,
+    ) -> std::result::Result<String, String> {
         match (agent_key, label) {
             (Some(_), Some(_)) => Err("Error: Provide either agent_key or label, not both.".into()),
             (None, None) => Err("Error: Either agent_key or label is required.".into()),
@@ -138,19 +142,33 @@ impl AgentSpawnTool {
             .lock()
             .unwrap()
             .iter()
-            .map(|(k, v)| (k.clone(), v.agent_id.clone(), v.session_id.clone(), v.label.clone()))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.agent_id.clone(),
+                    v.session_id.clone(),
+                    v.label.clone(),
+                )
+            })
             .collect();
         out.sort();
         out
     }
 
     fn live_agent(&self, key: &str) -> Option<Arc<dyn CallableAgent>> {
-        self.live.lock().unwrap().get(key).map(|s| Arc::clone(&s.agent))
+        self.live
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|s| Arc::clone(&s.agent))
     }
 
     /// A label must be unique across the subagents this tool owns.
     fn label_in_use(&self, label: &str) -> bool {
-        self.labels.lock().unwrap().contains_key(&label.to_lowercase())
+        self.labels
+            .lock()
+            .unwrap()
+            .contains_key(&label.to_lowercase())
     }
 
     /// Cancels a locally spawned background task (`end` semantics). Returns
@@ -216,7 +234,10 @@ impl Tool for AgentSpawnTool {
         let Some(prompt) = opt_str(&args, "prompt").map(str::to_string) else {
             return Ok(ToolResultBlock::error("Missing string argument: prompt"));
         };
-        let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let label = opt_str(&args, "label")
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -230,7 +251,9 @@ impl Tool for AgentSpawnTool {
         }
         if let Some(l) = &label {
             if self.label_in_use(l) {
-                return Ok(ToolResultBlock::error(format!("Error: Label already in use: {l}")));
+                return Ok(ToolResultBlock::error(format!(
+                    "Error: Label already in use: {l}"
+                )));
             }
         }
 
@@ -265,7 +288,10 @@ impl Tool for AgentSpawnTool {
         // Local targets are instantiated eagerly so the spawned instance stays
         // addressable via `agent_key`/`label` even while it runs in the background.
         let local_agent = if remote.is_none() {
-            match self.manager.create_agent_if_present(&agent_id, &ctx_runtime(&ctx)) {
+            match self
+                .manager
+                .create_agent_if_present(&agent_id, &ctx_runtime(&ctx))
+            {
                 Some(a) => Some(a),
                 None => {
                     return Ok(ToolResultBlock::error(format!(
@@ -284,8 +310,13 @@ impl Tool for AgentSpawnTool {
                 self.register_live(&agent_id, label.as_deref(), Arc::clone(&agent));
             let header = spawn_header(&key, &agent_id, &child_session);
             return match self.manager.invoke_agent(&agent, &effective_prompt).await {
-                Ok(msg) => Ok(ToolResultBlock::text(format!("{header}\n{}", msg.text_content()))),
-                Err(e) => Ok(ToolResultBlock::error(format!("Subagent '{agent_id}' failed: {e}"))),
+                Ok(msg) => Ok(ToolResultBlock::text(format!(
+                    "{header}\n{}",
+                    msg.text_content()
+                ))),
+                Err(e) => Ok(ToolResultBlock::error(format!(
+                    "Subagent '{agent_id}' failed: {e}"
+                ))),
             };
         }
 
@@ -293,9 +324,7 @@ impl Tool for AgentSpawnTool {
         let repo = self.tasks.as_ref().unwrap().clone();
         let task_id = opt_str(&args, "task_id")
             .map(str::to_string)
-            .unwrap_or_else(|| {
-                format!("spawn-{}", self.counter.fetch_add(1, Ordering::Relaxed))
-            });
+            .unwrap_or_else(|| format!("spawn-{}", self.counter.fetch_add(1, Ordering::Relaxed)));
 
         let mut header = String::new();
         let spec = if let Some(decl) = remote {
@@ -309,17 +338,19 @@ impl Tool for AgentSpawnTool {
             TaskRunSpec::Local {
                 execution: Box::new(move || {
                     let handle = tokio::runtime::Handle::current();
-                    let msg = handle.block_on(
-                        exec_agent.call(vec![agentscope_core::message::Msg::user(
-                            &execution_prompt,
-                        )]),
-                    )?;
+                    let msg =
+                        handle
+                            .block_on(exec_agent.call(vec![
+                                agentscope_core::message::Msg::user(&execution_prompt),
+                            ]))?;
                     Ok(msg.text_content())
                 }),
             }
         };
 
-        let bg = repo.put_task(&ctx_runtime(&ctx), &task_id, &agent_id, &session_id, spec).await;
+        let bg = repo
+            .put_task(&ctx_runtime(&ctx), &task_id, &agent_id, &session_id, spec)
+            .await;
         self.active_local
             .lock()
             .unwrap()
@@ -417,7 +448,9 @@ impl Tool for AgentSendTool {
         };
         match self.spawn.manager.invoke_agent(&agent, &message).await {
             Ok(msg) => Ok(ToolResultBlock::text(msg.text_content())),
-            Err(e) => Ok(ToolResultBlock::error(format!("Subagent '{key}' failed: {e}"))),
+            Err(e) => Ok(ToolResultBlock::error(format!(
+                "Subagent '{key}' failed: {e}"
+            ))),
         }
     }
 }
@@ -485,7 +518,13 @@ mod tests {
 
         let spec = remote_spec(&decl, "coder", "do it");
         match spec {
-            TaskRunSpec::Remote { base_url, headers, agent_id, input, context } => {
+            TaskRunSpec::Remote {
+                base_url,
+                headers,
+                agent_id,
+                input,
+                context,
+            } => {
                 assert_eq!(base_url, "http://remote:8080");
                 assert_eq!(headers.get("X-Auth").map(String::as_str), Some("tok"));
                 assert_eq!(agent_id, "coder");
@@ -493,7 +532,10 @@ mod tests {
                 let ctx = context.expect("context");
                 assert!(!ctx.stream);
                 assert_eq!(ctx.detail, "full");
-                assert_eq!(ctx.attributes.get("workspace"), Some(&serde_json::json!("proj")));
+                assert_eq!(
+                    ctx.attributes.get("workspace"),
+                    Some(&serde_json::json!("proj"))
+                );
             }
             _ => panic!("expected remote spec"),
         }

@@ -239,7 +239,10 @@ impl MongodbAgentStateStore {
                         &self.collection,
                         &filter,
                         &set_fields.clone().combine(set_on_insert.clone()),
-                        &FindOneAndUpdateOptions { upsert: true, return_after: true },
+                        &FindOneAndUpdateOptions {
+                            upsert: true,
+                            return_after: true,
+                        },
                     )
                     .await
                 {
@@ -277,7 +280,10 @@ impl MongodbAgentStateStore {
                     &self.collection,
                     &filter,
                     &update,
-                    &FindOneAndUpdateOptions { upsert: true, return_after: true },
+                    &FindOneAndUpdateOptions {
+                        upsert: true,
+                        return_after: true,
+                    },
                 )
                 .await
             {
@@ -295,7 +301,10 @@ impl MongodbAgentStateStore {
                 Err(e) => Err(e),
             }
         } else {
-            let filter = filter.and(FindFilter::eq(version_field.clone(), json!(expected_version)));
+            let filter = filter.and(FindFilter::eq(
+                version_field.clone(),
+                json!(expected_version),
+            ));
             let update = Update::new()
                 .set(state_field, value_doc)
                 .inc(version_field, 1)
@@ -306,7 +315,10 @@ impl MongodbAgentStateStore {
                     &self.collection,
                     &filter,
                     &update,
-                    &FindOneAndUpdateOptions { upsert: false, return_after: true },
+                    &FindOneAndUpdateOptions {
+                        upsert: false,
+                        return_after: true,
+                    },
                 )
                 .await
             {
@@ -431,17 +443,25 @@ impl MongodbAgentStateStore {
         }
     }
 
-    async fn get_field(&self, user_id: Option<&str>, session_id: &str, key: &str, list: bool) -> Option<Value> {
+    async fn get_field(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        list: bool,
+    ) -> Option<Value> {
         let filter = slot_filter(user_id, session_id);
-        let doc = self.client.find_one(&self.collection, &filter).await.ok().flatten()?;
+        let doc = self
+            .client
+            .find_one(&self.collection, &filter)
+            .await
+            .ok()
+            .flatten()?;
         let states = doc.get(FIELD_STATES).and_then(|v| v.as_object())?;
         let raw = states.get(key)?;
         if list {
             Some(Value::Array(
-                raw.as_array()?
-                    .iter()
-                    .map(key_escaper::unescape)
-                    .collect(),
+                raw.as_array()?.iter().map(key_escaper::unescape).collect(),
             ))
         } else {
             Some(key_escaper::unescape(raw))
@@ -475,7 +495,10 @@ impl MongodbAgentStateStore {
             .unset(format!("{FIELD_STATES}.{key}"))
             .unset(format!("{FIELD_VERSIONS}.{key}"))
             .unset(format!("{FIELD_HASHES}.{key}"))
-            .set(FIELD_UPDATED_AT, json!(chrono::Utc::now().timestamp_millis()));
+            .set(
+                FIELD_UPDATED_AT,
+                json!(chrono::Utc::now().timestamp_millis()),
+            );
         self.client
             .update_one(
                 &self.collection,
@@ -496,7 +519,10 @@ impl AgentStateStore for MongodbAgentStateStore {
         key: &str,
         value: serde_json::Value,
     ) {
-        if let Err(e) = self.save_value_inner(user_id, session_id, key, &value).await {
+        if let Err(e) = self
+            .save_value_inner(user_id, session_id, key, &value)
+            .await
+        {
             tracing::warn!(key, error = %e, "[mongo-state] save failed");
         }
     }
@@ -649,10 +675,7 @@ impl MongodbAgentStateStoreBuilder {
     /// Optional callback invoked before a session document is deleted, receiving
     /// `(user_id, session_id)`. Used by [`crate::MongodbDistributedStore`] to
     /// cascade-delete associated snapshots.
-    pub fn on_delete(
-        mut self,
-        cb: Arc<dyn Fn(Option<&str>, &str) + Send + Sync>,
-    ) -> Self {
+    pub fn on_delete(mut self, cb: Arc<dyn Fn(Option<&str>, &str) + Send + Sync>) -> Self {
         self.on_delete = Some(cb);
         self
     }
@@ -666,7 +689,9 @@ impl MongodbAgentStateStoreBuilder {
             .ok_or_else(|| MongoError::InvalidArgument("client must be provided".into()))?;
         let store = MongodbAgentStateStore {
             client,
-            collection: self.collection.unwrap_or_else(|| SESSIONS_COLLECTION.to_string()),
+            collection: self
+                .collection
+                .unwrap_or_else(|| SESSIONS_COLLECTION.to_string()),
             ttl_days: self.ttl_days,
             on_delete: self.on_delete,
         };
@@ -697,7 +722,10 @@ mod tests {
     async fn save_and_get_single_value() {
         let s = store();
         s.save(Some("u1"), "sess", "foo", json!({"a": 1})).await;
-        assert_eq!(s.get(Some("u1"), "sess", "foo").await, Some(json!({"a": 1})));
+        assert_eq!(
+            s.get(Some("u1"), "sess", "foo").await,
+            Some(json!({"a": 1}))
+        );
         assert_eq!(s.get(Some("u1"), "sess", "missing").await, None);
     }
 
@@ -721,7 +749,8 @@ mod tests {
     #[tokio::test]
     async fn dotted_and_dollar_keys_are_escaped() {
         let s = store();
-        s.save(Some("u"), "sess", "foo", json!({"a.b": {"$c": 1}})).await;
+        s.save(Some("u"), "sess", "foo", json!({"a.b": {"$c": 1}}))
+            .await;
         assert_eq!(
             s.get(Some("u"), "sess", "foo").await,
             Some(json!({"a.b": {"$c": 1}}))
@@ -742,20 +771,36 @@ mod tests {
     #[tokio::test]
     async fn list_append_and_full_rewrite() {
         let s = store();
-        s.save_list(Some("u"), "sess", "history", &[json!(1), json!(2)]).await;
-        assert_eq!(s.get_list(Some("u"), "sess", "history").await, vec![json!(1), json!(2)]);
+        s.save_list(Some("u"), "sess", "history", &[json!(1), json!(2)])
+            .await;
+        assert_eq!(
+            s.get_list(Some("u"), "sess", "history").await,
+            vec![json!(1), json!(2)]
+        );
         // Append.
-        s.save_list(Some("u"), "sess", "history", &[json!(1), json!(2), json!(3)]).await;
+        s.save_list(
+            Some("u"),
+            "sess",
+            "history",
+            &[json!(1), json!(2), json!(3)],
+        )
+        .await;
         assert_eq!(
             s.get_list(Some("u"), "sess", "history").await,
             vec![json!(1), json!(2), json!(3)]
         );
         // Rewrite (removal).
         s.save_list(Some("u"), "sess", "history", &[json!(9)]).await;
-        assert_eq!(s.get_list(Some("u"), "sess", "history").await, vec![json!(9)]);
+        assert_eq!(
+            s.get_list(Some("u"), "sess", "history").await,
+            vec![json!(9)]
+        );
         // Shrink to empty.
         s.save_list(Some("u"), "sess", "history", &[]).await;
-        assert_eq!(s.get_list(Some("u"), "sess", "history").await, Vec::<Value>::new());
+        assert_eq!(
+            s.get_list(Some("u"), "sess", "history").await,
+            Vec::<Value>::new()
+        );
     }
 
     #[tokio::test]
@@ -763,22 +808,30 @@ mod tests {
         let s = store();
         // Create with expected version 0.
         assert_eq!(
-            s.save_if_version(Some("u"), "sess", "k", &json!(1), 0).await.unwrap(),
+            s.save_if_version(Some("u"), "sess", "k", &json!(1), 0)
+                .await
+                .unwrap(),
             1
         );
         // Second create-if-absent fails (version exists).
         assert_eq!(
-            s.save_if_version(Some("u"), "sess", "k", &json!(2), 0).await.unwrap(),
+            s.save_if_version(Some("u"), "sess", "k", &json!(2), 0)
+                .await
+                .unwrap(),
             UNVERSIONED
         );
         // CAS on the right version succeeds and bumps to 2.
         assert_eq!(
-            s.save_if_version(Some("u"), "sess", "k", &json!(3), 1).await.unwrap(),
+            s.save_if_version(Some("u"), "sess", "k", &json!(3), 1)
+                .await
+                .unwrap(),
             2
         );
         // Stale CAS fails.
         assert_eq!(
-            s.save_if_version(Some("u"), "sess", "k", &json!(4), 1).await.unwrap(),
+            s.save_if_version(Some("u"), "sess", "k", &json!(4), 1)
+                .await
+                .unwrap(),
             UNVERSIONED
         );
         let (value, version) = s.get_version(Some("u"), "sess", "k").await.unwrap();
@@ -832,12 +885,21 @@ mod tests {
         s.save(Some("u"), "sess", "value_key", json!(1)).await;
         s.save_list(Some("u"), "sess", "list_key", &[json!(1), json!(2)])
             .await;
-        assert_eq!(s.get_version(Some("u"), "sess", "value_key").await.unwrap().1, 1);
+        assert_eq!(
+            s.get_version(Some("u"), "sess", "value_key")
+                .await
+                .unwrap()
+                .1,
+            1
+        );
 
         s.delete_key(Some("u"), "sess", "value_key").await.unwrap();
         assert_eq!(s.get(Some("u"), "sess", "value_key").await, None);
         // The whole `(states, versions, hashes)` entry is gone; re-saving starts fresh.
-        assert_eq!(s.get_version(Some("u"), "sess", "value_key").await.unwrap(), (None, 0));
+        assert_eq!(
+            s.get_version(Some("u"), "sess", "value_key").await.unwrap(),
+            (None, 0)
+        );
         assert_eq!(
             s.save_if_version(Some("u"), "sess", "value_key", &json!(9), 0)
                 .await
@@ -850,7 +912,9 @@ mod tests {
             vec![json!(1), json!(2)]
         );
         // Deleting a missing key is a no-op, not an error.
-        s.delete_key(Some("u"), "sess", "never_existed").await.unwrap();
+        s.delete_key(Some("u"), "sess", "never_existed")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

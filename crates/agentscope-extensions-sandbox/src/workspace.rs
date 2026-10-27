@@ -21,7 +21,11 @@ pub fn resolve_remote_path(root: &str, relative: &str) -> String {
     if rel.starts_with('/') {
         return rel.to_string();
     }
-    format!("{}/{}", root.trim_end_matches('/'), rel.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        rel.trim_start_matches('/')
+    )
 }
 
 /// Quotes a path for safe interpolation into a POSIX shell command.
@@ -129,8 +133,14 @@ mod tests {
 
     #[test]
     fn resolve_relative_paths() {
-        assert_eq!(resolve_remote_path("/workspace", "src/main.rs"), "/workspace/src/main.rs");
-        assert_eq!(resolve_remote_path("/workspace/", "./file.txt"), "/workspace/./file.txt");
+        assert_eq!(
+            resolve_remote_path("/workspace", "src/main.rs"),
+            "/workspace/src/main.rs"
+        );
+        assert_eq!(
+            resolve_remote_path("/workspace/", "./file.txt"),
+            "/workspace/./file.txt"
+        );
         assert_eq!(resolve_remote_path("/workspace", "."), "/workspace");
         assert_eq!(resolve_remote_path("/workspace", "/abs/path"), "/abs/path");
     }
@@ -144,7 +154,10 @@ mod tests {
 
     #[test]
     fn parent_dir_extraction() {
-        assert_eq!(parent_dir("/workspace/a/b.txt"), Some("/workspace/a".to_string()));
+        assert_eq!(
+            parent_dir("/workspace/a/b.txt"),
+            Some("/workspace/a".to_string())
+        );
         assert_eq!(parent_dir("/file.txt"), None);
         assert_eq!(parent_dir("file.txt"), None);
     }

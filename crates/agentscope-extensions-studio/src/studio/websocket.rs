@@ -87,7 +87,10 @@ impl PendingInputRegistry {
     ///
     /// If an entry for `request_id` already exists it is replaced (the old
     /// sender is dropped, causing its receiver to observe a closed channel).
-    pub async fn register(&self, request_id: impl Into<String>) -> oneshot::Receiver<UserInputData> {
+    pub async fn register(
+        &self,
+        request_id: impl Into<String>,
+    ) -> oneshot::Receiver<UserInputData> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id.into(), tx);
         rx
@@ -139,10 +142,7 @@ impl std::fmt::Debug for StudioWebSocketClient {
 
 impl StudioWebSocketClient {
     /// Creates a client using the given transport.
-    pub fn with_transport(
-        config: StudioConfig,
-        transport: Arc<dyn StudioTransport>,
-    ) -> Self {
+    pub fn with_transport(config: StudioConfig, transport: Arc<dyn StudioTransport>) -> Self {
         Self::with_transport_and_registry(config, transport, Arc::new(PendingInputRegistry::new()))
     }
 
@@ -280,7 +280,10 @@ pub fn preprocess_tool_result_block(mut block: serde_json::Value) -> serde_json:
         if let Some(text) = output.as_str() {
             let text_block = serde_json::json!({ "type": "text", "text": text });
             if let Some(obj) = block.as_object_mut() {
-                obj.insert("output".to_string(), serde_json::Value::Array(vec![text_block]));
+                obj.insert(
+                    "output".to_string(),
+                    serde_json::Value::Array(vec![text_block]),
+                );
             }
         }
     }
@@ -404,9 +407,7 @@ mod tests {
         ));
         let waiter = {
             let c = client.clone();
-            tokio::spawn(async move {
-                c.wait_for_input("req-7", Duration::from_secs(1)).await
-            })
+            tokio::spawn(async move { c.wait_for_input("req-7", Duration::from_secs(1)).await })
         };
         // Let the spawned task register its pending request.
         tokio::time::sleep(Duration::from_millis(50)).await;

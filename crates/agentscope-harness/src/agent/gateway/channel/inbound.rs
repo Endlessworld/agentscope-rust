@@ -50,7 +50,11 @@ impl InboundMessage {
     }
 
     /// Single-turn DM with no guild/team/role metadata (typical for direct chat UI use).
-    pub fn dm(channel_id: impl Into<String>, peer_id: impl Into<String>, messages: Vec<Msg>) -> Self {
+    pub fn dm(
+        channel_id: impl Into<String>,
+        peer_id: impl Into<String>,
+        messages: Vec<Msg>,
+    ) -> Self {
         let peer_id = peer_id.into();
         Self {
             channel_id: channel_id.into(),
@@ -142,7 +146,11 @@ impl InboundMessage {
     }
 
     /// Returns a builder for constructing messages with all optional fields.
-    pub fn builder(channel_id: impl Into<String>, peer: Peer, messages: Vec<Msg>) -> InboundMessageBuilder {
+    pub fn builder(
+        channel_id: impl Into<String>,
+        peer: Peer,
+        messages: Vec<Msg>,
+    ) -> InboundMessageBuilder {
         InboundMessageBuilder {
             channel_id: channel_id.into(),
             account_id: None,

@@ -14,8 +14,8 @@ use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 const ACP_CONTEXT_WINDOW_TOKENS: usize = 256_000;
 use agentscope_harness::{
     build_summary_message, calculate_token, filter_summary_messages, format_messages_for_summary,
-    prune_tool_results, truncate_args, CompactionConfig, ConversationCompactor,
-    PruneConfig, SUMMARY_MSG_NAME, SessionFreshnessEvaluator, TruncateArgsConfig,
+    prune_tool_results, truncate_args, CompactionConfig, ConversationCompactor, PruneConfig,
+    SessionFreshnessEvaluator, TruncateArgsConfig, SUMMARY_MSG_NAME,
 };
 use chrono::{Duration as ChronoDuration, Local, Timelike};
 
@@ -30,8 +30,9 @@ impl Model for FailingModel {
         _tools: Vec<ToolSchema>,
         _options: GenerateOptions,
     ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        let items: Vec<agentscope_core::error::Result<ChatResponse>> =
-            vec![Err(agentscope_core::error::Error::Agent("model down".into()))];
+        let items: Vec<agentscope_core::error::Result<ChatResponse>> = vec![Err(
+            agentscope_core::error::Error::Agent("model down".into()),
+        )];
         Box::pin(futures::stream::iter(items))
     }
     fn model_name(&self) -> &str {
@@ -44,7 +45,9 @@ fn assistant_with_tool_use(name: &str, id: &str, arg_key: &str, arg_value: Strin
     input.insert(arg_key.to_string(), serde_json::Value::String(arg_value));
     Msg::builder()
         .role(MsgRole::Assistant)
-        .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(id, name, input))])
+        .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+            id, name, input,
+        ))])
         .build()
 }
 
@@ -76,7 +79,6 @@ fn token_counter_handles_empty_and_tool_blocks() {
     assert!(total > 30, "expected structural overhead, got {}", total);
 }
 
-
 #[test]
 fn token_counter_counts_thinking_content() {
     use agentscope_core::message::ThinkingBlock;
@@ -85,7 +87,9 @@ fn token_counter_counts_thinking_content() {
     let thinking = "x".repeat(1_000);
     let msg = Msg::builder()
         .role(MsgRole::Assistant)
-        .content(vec![ContentBlock::Thinking(ThinkingBlock::new(thinking.clone()))])
+        .content(vec![ContentBlock::Thinking(ThinkingBlock::new(
+            thinking.clone(),
+        ))])
         .build();
     let direct = calculate_token(&[msg]);
     // 1000 chars / 2.5 = 400, plus role + message overhead
@@ -116,7 +120,10 @@ fn compaction_config_defaults_and_builder() {
     assert!(cfg.prune.is_some());
     assert!(cfg.truncate_args.is_none());
 
-    let built = CompactionConfig::builder().trigger_tokens(10_000).keep_tokens(2_000).build();
+    let built = CompactionConfig::builder()
+        .trigger_tokens(10_000)
+        .keep_tokens(2_000)
+        .build();
     assert_eq!(built.trigger_tokens, 10_000);
     assert_eq!(built.keep_tokens, 2_000);
 
@@ -149,7 +156,10 @@ fn filter_summary_messages_removes_summaries() {
 
 #[test]
 fn format_messages_for_summary_renders_roles_and_blocks() {
-    let msgs = vec![Msg::user("hi there"), assistant_with_tool_use("ls", "c1", "path", "/tmp".into())];
+    let msgs = vec![
+        Msg::user("hi there"),
+        assistant_with_tool_use("ls", "c1", "path", "/tmp".into()),
+    ];
     let out = format_messages_for_summary(&msgs);
     assert!(out.contains("Human: hi there"));
     assert!(out.contains("[tool_call: ls]"));
@@ -168,7 +178,11 @@ fn truncate_args_clips_oversized_tool_arguments() {
     assert_eq!(out.len(), 2);
     if let ContentBlock::ToolUse(tu) = &out[0].content[0] {
         let val = tu.input.get("content").and_then(|v| v.as_str()).unwrap();
-        assert!(val.len() < 100, "expected truncated arg, got len {}", val.len());
+        assert!(
+            val.len() < 100,
+            "expected truncated arg, got len {}",
+            val.len()
+        );
         assert!(val.ends_with("...(argument truncated)"));
     } else {
         panic!("expected tool_use block");
@@ -228,12 +242,18 @@ fn block_text(tr: &ToolResultBlock) -> String {
 #[test]
 fn prune_tool_results_preserves_metadata_state_and_usage() {
     let mut metadata = JsonMap::new();
-    metadata.insert("agentscope.tool_result_evicted".into(), serde_json::Value::Bool(true));
+    metadata.insert(
+        "agentscope.tool_result_evicted".into(),
+        serde_json::Value::Bool(true),
+    );
     metadata.insert(
         ToolResultBlock::METADATA_SUSPENDED.into(),
         serde_json::Value::Bool(true),
     );
-    metadata.insert("custom_key".into(), serde_json::Value::String("custom_value".into()));
+    metadata.insert(
+        "custom_key".into(),
+        serde_json::Value::String("custom_value".into()),
+    );
     let original = ToolResultBlock::builder()
         .id("call-1")
         .name("execute")
@@ -249,7 +269,12 @@ fn prune_tool_results_preserves_metadata_state_and_usage() {
         .content(vec![ContentBlock::ToolResult(original)])
         .metadata(msg_meta)
         .timestamp("2026-09-28T10:00:00Z")
-        .usage(ChatUsage::builder().input_tokens(10).output_tokens(5).build())
+        .usage(
+            ChatUsage::builder()
+                .input_tokens(10)
+                .output_tokens(5)
+                .build(),
+        )
         .build();
 
     let out = prune_tool_results(&[tool_msg], Some(&prune_cfg(100, 1, 0, &[])));
@@ -319,7 +344,10 @@ fn prune_tool_results_multi_block_prunes_only_oversized_block() {
     };
     assert!(block_text(pruned_large).contains("chars pruned"));
     assert_eq!(
-        pruned_large.metadata.get("large_meta").and_then(|v| v.as_str()),
+        pruned_large
+            .metadata
+            .get("large_meta")
+            .and_then(|v| v.as_str()),
         Some("v")
     );
     assert_eq!(pruned_large.state, ToolResultState::Error);
@@ -375,10 +403,7 @@ fn prune_budget_is_charged_per_tool_result_not_per_message() {
             ))
         })
         .collect();
-    let batched = Msg::builder()
-        .role(MsgRole::Tool)
-        .content(blocks)
-        .build();
+    let batched = Msg::builder().role(MsgRole::Tool).content(blocks).build();
     let messages = [batched.clone()];
 
     let out = prune_tool_results(&messages, Some(&prune_cfg(100, 3_000, 100, &[])));
@@ -420,7 +445,10 @@ async fn compact_if_needed_is_noop_below_trigger() {
     let messages = vec![Msg::user("a"), Msg::user("b")];
     let compactor = ConversationCompactor::new(None);
     let cfg = CompactionConfig::default(); // trigger 50
-    let result = compactor.compact_if_needed(messages, &cfg, "a", "s").await.unwrap();
+    let result = compactor
+        .compact_if_needed(messages, &cfg, "a", "s")
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -437,13 +465,22 @@ async fn compact_if_needed_triggers_only_at_acp_token_window() {
 
     let under: Vec<Msg> = vec![chunk.clone(); below];
     assert!(calculate_token(&under) < ACP_CONTEXT_WINDOW_TOKENS);
-    let result = compactor.compact_if_needed(under, &cfg, "a", "s").await.unwrap();
+    let result = compactor
+        .compact_if_needed(under, &cfg, "a", "s")
+        .await
+        .unwrap();
     assert!(result.is_none(), "must not compact below the 256k window");
 
     let over: Vec<Msg> = vec![chunk; below + 2];
     assert!(calculate_token(&over) >= ACP_CONTEXT_WINDOW_TOKENS);
-    let result = compactor.compact_if_needed(over, &cfg, "a", "s").await.unwrap();
-    assert!(result.is_some(), "must compact once the context reaches 256k");
+    let result = compactor
+        .compact_if_needed(over, &cfg, "a", "s")
+        .await
+        .unwrap();
+    assert!(
+        result.is_some(),
+        "must compact once the context reaches 256k"
+    );
 }
 
 #[tokio::test]
@@ -456,8 +493,13 @@ async fn compaction_failure_keeps_full_history() {
         .trigger_messages(50)
         .trigger_tokens(0)
         .build();
-    let result = compactor.compact_if_needed(messages, &cfg, "agent", "session").await;
-    assert!(result.is_err(), "a failed summary must surface as an error, not a placeholder");
+    let result = compactor
+        .compact_if_needed(messages, &cfg, "agent", "session")
+        .await;
+    assert!(
+        result.is_err(),
+        "a failed summary must surface as an error, not a placeholder"
+    );
 }
 
 #[test]

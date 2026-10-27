@@ -39,7 +39,10 @@ impl ContextSourceOptions {
                 "Positive source timeout required".into(),
             ));
         }
-        Ok(Self { timeout, on_failure })
+        Ok(Self {
+            timeout,
+            on_failure,
+        })
     }
 }
 
@@ -159,9 +162,7 @@ impl ContextSources {
         valid_id(&id)?;
         let source_id = format!("instruction/{id}");
         if self.instructions.iter().any(|i| i.source_id == source_id) {
-            return Err(crate::Error::Agent(format!(
-                "Duplicate instruction: {id}"
-            )));
+            return Err(crate::Error::Agent(format!("Duplicate instruction: {id}")));
         }
         self.instructions.push(ContextItem::instruction(
             "business_instruction",
@@ -337,13 +338,17 @@ mod tests {
             .unwrap()
             .with_source(
                 "biz",
-                Arc::new(FixedSource(vec![
-                    ContextBlock::runtime("status", "running").unwrap(),
-                ])),
+                Arc::new(FixedSource(vec![ContextBlock::runtime(
+                    "status", "running",
+                )
+                .unwrap()])),
                 ContextSourceOptions::default(),
             )
             .unwrap();
-        let collected = sources.collect(&request(ContextPurpose::Reasoning)).await.unwrap();
+        let collected = sources
+            .collect(&request(ContextPurpose::Reasoning))
+            .await
+            .unwrap();
         assert_eq!(collected.items.len(), 2);
         assert_eq!(collected.items[0].source_id, "instruction/policy");
         assert_eq!(collected.items[1].source_id, "source/biz/status");
@@ -356,13 +361,17 @@ mod tests {
             .unwrap()
             .with_source(
                 "biz",
-                Arc::new(FixedSource(vec![
-                    ContextBlock::runtime("status", "running").unwrap(),
-                ])),
+                Arc::new(FixedSource(vec![ContextBlock::runtime(
+                    "status", "running",
+                )
+                .unwrap()])),
                 ContextSourceOptions::default(),
             )
             .unwrap();
-        let collected = sources.collect(&request(ContextPurpose::Summary)).await.unwrap();
+        let collected = sources
+            .collect(&request(ContextPurpose::Summary))
+            .await
+            .unwrap();
         assert_eq!(collected.items.len(), 1);
         assert_eq!(collected.items[0].source_id, "instruction/policy");
     }
@@ -392,7 +401,10 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let collected = sources.collect(&request(ContextPurpose::Reasoning)).await.unwrap();
+        let collected = sources
+            .collect(&request(ContextPurpose::Reasoning))
+            .await
+            .unwrap();
         assert!(collected.items.is_empty());
         assert_eq!(collected.transforms.len(), 1);
         assert!(collected.transforms[0].starts_with("source_unavailable:source/biz/:"));
@@ -404,9 +416,9 @@ mod tests {
         let sources = ContextSources::empty()
             .with_source(
                 "biz",
-                Arc::new(FixedSource(vec![
-                    ContextBlock::runtime("status", "x").unwrap().required(),
-                ])),
+                Arc::new(FixedSource(vec![ContextBlock::runtime("status", "x")
+                    .unwrap()
+                    .required()])),
                 ContextSourceOptions::new(Duration::from_secs(1), SourceFailurePolicy::Omit)
                     .unwrap(),
             )
@@ -455,16 +467,25 @@ mod tests {
 
     #[test]
     fn ids_are_validated() {
-        assert!(ContextSources::empty().with_instruction("bad id", "x").is_err());
-        assert!(ContextSources::empty().with_instruction("ok.id-1", "x").is_ok());
-        let sources = ContextSources::empty().with_instruction("dup", "x").unwrap();
+        assert!(ContextSources::empty()
+            .with_instruction("bad id", "x")
+            .is_err());
+        assert!(ContextSources::empty()
+            .with_instruction("ok.id-1", "x")
+            .is_ok());
+        let sources = ContextSources::empty()
+            .with_instruction("dup", "x")
+            .unwrap();
         assert!(sources.with_instruction("dup", "y").is_err());
     }
 
     #[test]
     fn options_reject_a_zero_timeout() {
         assert!(ContextSourceOptions::new(Duration::ZERO, SourceFailurePolicy::Fail).is_err());
-        assert_eq!(ContextSourceOptions::default().timeout, Duration::from_secs(5));
+        assert_eq!(
+            ContextSourceOptions::default().timeout,
+            Duration::from_secs(5)
+        );
         assert_eq!(
             ContextSourceOptions::default().on_failure,
             SourceFailurePolicy::Fail

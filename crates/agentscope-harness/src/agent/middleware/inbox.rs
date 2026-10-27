@@ -35,9 +35,15 @@ const METADATA_HINT_ID: &str = "agentscope_hint_id";
 fn deserialize_hint_block(payload: &Value) -> Option<HintBlock> {
     let hint = payload.get("hint")?.as_str()?.to_string();
     Some(HintBlock {
-        id: payload.get("id").and_then(Value::as_str).map(str::to_string),
+        id: payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         hint: Some(hint),
-        source: payload.get("source").and_then(Value::as_str).map(str::to_string),
+        source: payload
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -180,7 +186,10 @@ impl Middleware for InboxMiddleware {
                 if let Some(src) = &h.source {
                     fields.insert("source".to_string(), Value::String(src.clone()));
                 }
-                events.push(Ok(AgentEvent::with_fields(AgentEventType::HintBlock, fields)));
+                events.push(Ok(AgentEvent::with_fields(
+                    AgentEventType::HintBlock,
+                    fields,
+                )));
             }
 
             // Each hint becomes its own user-role notification carrying a provenance
@@ -204,10 +213,7 @@ impl Middleware for InboxMiddleware {
                         blocks.push(ContentBlock::Text(TextBlock::new(text.clone())));
                     }
                     let mut metadata = JsonMap::new();
-                    metadata.insert(
-                        Msg::METADATA_SYNTHETIC.to_string(),
-                        Value::Bool(true),
-                    );
+                    metadata.insert(Msg::METADATA_SYNTHETIC.to_string(), Value::Bool(true));
                     metadata.insert(
                         Msg::METADATA_REMINDER_KIND.to_string(),
                         Value::String("background_event".to_string()),
@@ -217,10 +223,7 @@ impl Middleware for InboxMiddleware {
                         Value::String(source.to_string()),
                     );
                     if let Some(id) = &h.id {
-                        metadata.insert(
-                            METADATA_HINT_ID.to_string(),
-                            Value::String(id.clone()),
-                        );
+                        metadata.insert(METADATA_HINT_ID.to_string(), Value::String(id.clone()));
                     }
                     Msg::builder()
                         .role(MsgRole::User)
@@ -293,7 +296,10 @@ mod tests {
         let msg = notification_for(Some("system"), "do the thing", Some("h1"));
         assert_eq!(msg.role(), MsgRole::User);
         let text = msg.text_content();
-        assert!(text.contains("Automated background event from system"), "{text}");
+        assert!(
+            text.contains("Automated background event from system"),
+            "{text}"
+        );
         assert!(text.contains("do the thing"), "{text}");
         assert_eq!(
             msg.metadata().get(Msg::METADATA_SYNTHETIC),

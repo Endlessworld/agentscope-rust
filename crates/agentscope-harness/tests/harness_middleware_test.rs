@@ -47,9 +47,12 @@ async fn inbox_middleware_drains_and_injects_hints() {
     let session = "sess-1";
 
     // Push a hint payload into the per-session inbox.
-    bus.inbox_push(session, json!({ "id": "h1", "hint": "Hello from inbox", "source": "system" }))
-        .await
-        .unwrap();
+    bus.inbox_push(
+        session,
+        json!({ "id": "h1", "hint": "Hello from inbox", "source": "system" }),
+    )
+    .await
+    .unwrap();
 
     let mw = InboxMiddleware::new(bus.clone());
     let ctx = RuntimeContext::new().with_session_id(session);
@@ -69,11 +72,19 @@ async fn inbox_middleware_drains_and_injects_hints() {
         .iter()
         .filter(|r| r.as_ref().ok().map(|e| e.event_type()) == Some(AgentEventType::HintBlock))
         .count();
-    assert_eq!(hint_events, 1, "expected one HintBlock event, got: {:?}", events);
+    assert_eq!(
+        hint_events, 1,
+        "expected one HintBlock event, got: {:?}",
+        events
+    );
 
     // The reasoning input passed downstream contains one user-role notification per hint,
     // carrying a provenance sentence and structured metadata (Java `injectHintsToContext`).
-    let msgs = captured.lock().unwrap().clone().expect("next was not invoked");
+    let msgs = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("next was not invoked");
     assert_eq!(msgs.len(), 1, "one notification per hint, got: {msgs:?}");
     let last = msgs.last().expect("expected an injected hint message");
     assert_eq!(last.role(), MsgRole::User, "notifications are user-role");
@@ -90,7 +101,10 @@ async fn inbox_middleware_drains_and_injects_hints() {
         text.contains("Automated background event from system"),
         "missing provenance sentence: {text}"
     );
-    assert!(text.contains("Hello from inbox"), "missing hint text: {text}");
+    assert!(
+        text.contains("Hello from inbox"),
+        "missing hint text: {text}"
+    );
     assert_eq!(
         last.metadata().get(Msg::METADATA_SYNTHETIC),
         Some(&serde_json::Value::Bool(true)),
@@ -122,7 +136,10 @@ async fn inbox_middleware_no_session_passes_through() {
     });
     let input = ReasoningInput::new(vec![], vec![], GenerateOptions::default());
     mw.on_reasoning(&ctx, input, next).collect::<Vec<_>>().await;
-    assert!(invoked.load(Ordering::SeqCst), "next should be invoked directly");
+    assert!(
+        invoked.load(Ordering::SeqCst),
+        "next should be invoked directly"
+    );
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
@@ -164,17 +181,33 @@ async fn async_tool_offloads_slow_tool_to_background() {
     // Placeholder ToolResult events were emitted (offload path).
     let starts = events
         .iter()
-        .filter(|r| r.as_ref().ok().map(|e| e.event_type()) == Some(AgentEventType::ToolResultStart))
+        .filter(|r| {
+            r.as_ref().ok().map(|e| e.event_type()) == Some(AgentEventType::ToolResultStart)
+        })
         .count();
-    assert_eq!(starts, 1, "expected placeholder ToolResultStart, got {:?}", events);
+    assert_eq!(
+        starts, 1,
+        "expected placeholder ToolResultStart, got {:?}",
+        events
+    );
 
     // The placeholder is persisted through the acting results handle — that is the
     // Rust equivalent of Java writing the placeholder into the mutable AgentState
     // (`on_acting` only receives `&RuntimeContext`).
     let snapshot = results.snapshot();
-    assert_eq!(snapshot.executed, 0, "a placeholder must not count as an execution");
-    assert!(!snapshot.finished, "the core did not finish before the offload");
-    assert_eq!(snapshot.results.len(), 1, "one placeholder result per tool call");
+    assert_eq!(
+        snapshot.executed, 0,
+        "a placeholder must not count as an execution"
+    );
+    assert!(
+        !snapshot.finished,
+        "the core did not finish before the offload"
+    );
+    assert_eq!(
+        snapshot.results.len(),
+        1,
+        "one placeholder result per tool call"
+    );
     let placeholder = format!("{:?}", snapshot.results[0].output);
     assert!(
         placeholder.contains("running in background"),
@@ -228,8 +261,16 @@ async fn async_tool_passes_through_fast_tool() {
     let events: Vec<Result<AgentEvent>> = mw.on_acting(&ctx, input, next).collect().await;
 
     // Passthrough: exactly the one real event, no placeholder deltas.
-    assert_eq!(events.len(), 1, "expected passthrough of a single event, got {:?}", events);
-    assert_eq!(events[0].as_ref().unwrap().event_type(), AgentEventType::ToolResultStart);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected passthrough of a single event, got {:?}",
+        events
+    );
+    assert_eq!(
+        events[0].as_ref().unwrap().event_type(),
+        AgentEventType::ToolResultStart
+    );
     assert!(
         results.snapshot().results.is_empty(),
         "a passthrough must not record a placeholder"

@@ -295,7 +295,10 @@ impl LeaseHeartbeat {
                 }
             }
         });
-        Some(Self { stop, handle: Some(handle) })
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
     }
 
     fn stop(&mut self) {
@@ -375,13 +378,7 @@ impl SessionRecorder {
         turn_id: Option<&str>,
         exporter: Option<Arc<SessionLogExporter>>,
     ) -> crate::error::Result<Self> {
-        Self::open_with(
-            log,
-            turn_id,
-            &uuid::Uuid::new_v4().to_string(),
-            exporter,
-        )
-        .await
+        Self::open_with(log, turn_id, &uuid::Uuid::new_v4().to_string(), exporter).await
     }
 
     /// Opens a recorder with an explicit run id, optionally exporting committed events.
@@ -531,13 +528,13 @@ impl SessionRecorder {
                         && event
                             .data()
                             .ok()
-                            .and_then(|d| d.get("status").and_then(|s| s.as_str()).map(str::to_string))
+                            .and_then(|d| {
+                                d.get("status").and_then(|s| s.as_str()).map(str::to_string)
+                            })
                             .as_deref()
                             == Some("completed"));
                 if completed {
-                    return Err(session_error(
-                        "Turn already completed; use a new turn ID",
-                    ));
+                    return Err(session_error("Turn already completed; use a new turn ID"));
                 }
             }
             if !initial.uncertain_tool_calls.is_empty() {
@@ -560,7 +557,14 @@ impl SessionRecorder {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "session recorder replayed the journal"
             );
-            Ok((initial, durable_seq, seen_turn, previous_state, previous_messages, recorded_messages))
+            Ok((
+                initial,
+                durable_seq,
+                seen_turn,
+                previous_state,
+                previous_messages,
+                recorded_messages,
+            ))
         }
         .await;
 
@@ -628,7 +632,9 @@ impl SessionRecorder {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RecorderState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn check(state: &RecorderState) -> crate::error::Result<()> {
@@ -636,7 +642,9 @@ impl SessionRecorder {
             return Err(session_error("Session recorder closed"));
         }
         if let Some(failure) = &state.failure {
-            return Err(session_error(format!("Session persistence failed: {failure}")));
+            return Err(session_error(format!(
+                "Session persistence failed: {failure}"
+            )));
         }
         Ok(())
     }
@@ -742,7 +750,11 @@ impl SessionRecorder {
                 (inflight.events.clone(), inflight.bytes)
             };
             let commit = match self.log.renew(&self.writer, self.lease).await {
-                Ok(()) => self.log.commit(&self.writer, &batch, expected, &events).await,
+                Ok(()) => {
+                    self.log
+                        .commit(&self.writer, &batch, expected, &events)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             match commit {
@@ -947,12 +959,7 @@ impl SessionRecorder {
                     fresh.push((message.clone(), applied));
                 }
             }
-            (
-                replaced,
-                durable_seq,
-                fresh,
-                guard.previous_state.clone(),
-            )
+            (replaced, durable_seq, fresh, guard.previous_state.clone())
         };
 
         if replaced {
@@ -973,7 +980,10 @@ impl SessionRecorder {
                     &serde_json::json!({ "inputId": message.id }),
                 )?;
             }
-            self.append(message_event_type(&message), &serde_json::json!({ "message": &message }))?;
+            self.append(
+                message_event_type(&message),
+                &serde_json::json!({ "message": &message }),
+            )?;
             for call in message.tool_use_blocks() {
                 self.append(
                     "tool/requested",
@@ -1324,8 +1334,7 @@ mod tests {
 
     async fn journal() -> (Arc<dyn SessionLog>, Arc<dyn AtomicSessionStorage>) {
         let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> =
-            Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
         (log, storage)
     }
 
@@ -1335,7 +1344,13 @@ mod tests {
         log.release(&writer).await.unwrap();
     }
 
-    fn raw(seq: u64, kind: &str, run: Option<&str>, turn: Option<&str>, payload: &str) -> SessionEvent {
+    fn raw(
+        seq: u64,
+        kind: &str,
+        run: Option<&str>,
+        turn: Option<&str>,
+        payload: &str,
+    ) -> SessionEvent {
         SessionEvent::new(
             format!("e{seq}"),
             seq,
@@ -1380,7 +1395,9 @@ mod tests {
     #[tokio::test]
     async fn start_records_baseline_run_and_input() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let input = vec![Msg::user("hello")];
         let state = crate::state::AgentState::builder().session_id("s1").build();
         recorder.start(&input, &state).await.unwrap();
@@ -1397,9 +1414,7 @@ mod tests {
         );
         assert!(recorder.durable_seq() >= 4);
         // The input message id is remembered so `capture_state` records it as applied.
-        assert!(recorder
-            .accepted_message_ids()
-            .is_empty());
+        assert!(recorder.accepted_message_ids().is_empty());
         recorder.close().await;
     }
 
@@ -1412,7 +1427,9 @@ mod tests {
             vec![raw(1, "run/start", Some("run-0"), Some("t1"), "{}")],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let state = crate::state::AgentState::builder().session_id("s1").build();
         recorder.start(&[], &state).await.unwrap();
         let types = event_types(&*log).await;
@@ -1457,7 +1474,10 @@ mod tests {
                     "state/checkpoint",
                     Some("run-0"),
                     Some("t1"),
-                    &format!("{{\"stateJson\":{}}}", serde_json::to_string(&state.to_json().unwrap()).unwrap()),
+                    &format!(
+                        "{{\"stateJson\":{}}}",
+                        serde_json::to_string(&state.to_json().unwrap()).unwrap()
+                    ),
                 ),
                 raw(
                     2,
@@ -1478,7 +1498,9 @@ mod tests {
     #[tokio::test]
     async fn stats_are_recorded_once_per_message() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let user = Msg::user("hello");
         let state = state_with(user.clone());
 
@@ -1505,7 +1527,9 @@ mod tests {
     #[tokio::test]
     async fn a_shrinking_history_records_context_replacement() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let first = Msg::user("first");
         let second = Msg::assistant("second");
         let mut state = crate::state::AgentState::builder()
@@ -1536,7 +1560,9 @@ mod tests {
     #[tokio::test]
     async fn finish_writes_terminal_facts_and_releases_the_lease() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let state = state_with(Msg::user("hello"));
         recorder.start(&[], &state).await.unwrap();
         recorder.step(0).unwrap();
@@ -1557,7 +1583,9 @@ mod tests {
     #[tokio::test]
     async fn interruption_finishes_the_turn_as_interrupted() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let state = state_with(Msg::user("hello"));
         recorder.finish(&state, "interrupted").await.unwrap();
         let types = event_types(&*log).await;
@@ -1567,9 +1595,13 @@ mod tests {
     #[tokio::test]
     async fn a_failed_commit_is_sticky_and_never_reports_success() {
         let storage = Arc::new(FailingStorage::new());
-        let log: Arc<dyn SessionLog> =
-            Arc::new(JournalSessionLog::new(Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>, "s1"));
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
+            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+            "s1",
+        ));
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         storage.fail_commits.store(true, Ordering::SeqCst);
 
         let err = recorder
@@ -1613,7 +1645,9 @@ mod tests {
                         })
                         .is_ok()
                 {
-                    return Err(crate::error::Error::Other("temporary storage outage".into()));
+                    return Err(crate::error::Error::Other(
+                        "temporary storage outage".into(),
+                    ));
                 }
                 self.inner
                     .compare_and_set(path, expected_version, bytes)
@@ -1629,7 +1663,9 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
             "s1",
         ));
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
 
         recorder
             .record("run/start", &serde_json::json!({}))
@@ -1702,8 +1738,7 @@ mod tests {
                 expected_version: u64,
                 bytes: &[u8],
             ) -> crate::error::Result<bool> {
-                if path.contains("/commits/")
-                    && self.gate_next_commit.swap(false, Ordering::SeqCst)
+                if path.contains("/commits/") && self.gate_next_commit.swap(false, Ordering::SeqCst)
                 {
                     self.entered.notify_one();
                     self.release.notified().await;
@@ -1724,7 +1759,11 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
             "s1",
         ));
-        let recorder = Arc::new(SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap());
+        let recorder = Arc::new(
+            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
         recorder
             .append("run/start", &serde_json::json!({}))
             .unwrap();
@@ -1738,7 +1777,10 @@ mod tests {
         let appended = recorder
             .append("turn/start", &serde_json::json!({}))
             .expect("appending while a commit is in flight must succeed");
-        assert_eq!(appended, 2, "the in-flight batch must keep its reserved slot");
+        assert_eq!(
+            appended, 2,
+            "the in-flight batch must keep its reserved slot"
+        );
         storage.release.notify_one();
         flushing.await.unwrap().unwrap();
 
@@ -1757,7 +1799,10 @@ mod tests {
     #[tokio::test]
     async fn a_lease_held_by_writer_a_still_fences_writer_b() {
         let (log, _storage) = journal().await;
-        let writer = log.acquire("run-1", Duration::from_millis(100)).await.unwrap();
+        let writer = log
+            .acquire("run-1", Duration::from_millis(100))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         // A new owner can take over an expired lease; after that the old writer is fenced.
         let next = log.acquire("run-2", Duration::from_secs(30)).await.unwrap();
@@ -1787,7 +1832,9 @@ mod tests {
     #[tokio::test]
     async fn closing_twice_is_idempotent() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         recorder.close().await;
         recorder.close().await;
     }
@@ -1800,15 +1847,10 @@ mod tests {
         // because the tool had already run and must not be replayed.
         let (log, _storage) = journal().await;
         let lease = Duration::from_millis(200);
-        let recorder = SessionRecorder::open_with_lease(
-            Arc::clone(&log),
-            Some("t1"),
-            "run-1",
-            None,
-            lease,
-        )
-        .await
-        .unwrap();
+        let recorder =
+            SessionRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, lease)
+                .await
+                .unwrap();
 
         // No flush for several lease lifetimes.
         tokio::time::sleep(lease * 3).await;
@@ -1828,15 +1870,10 @@ mod tests {
         // session owned by a recorder nobody will ever close again.
         let (log, _storage) = journal().await;
         let lease = Duration::from_millis(200);
-        let recorder = SessionRecorder::open_with_lease(
-            Arc::clone(&log),
-            Some("t1"),
-            "run-1",
-            None,
-            lease,
-        )
-        .await
-        .unwrap();
+        let recorder =
+            SessionRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, lease)
+                .await
+                .unwrap();
         recorder.close().await;
 
         tokio::time::sleep(lease * 3).await;
@@ -1851,7 +1888,11 @@ mod tests {
     #[tokio::test]
     async fn recorder_is_reachable_through_the_runtime_context() {
         let (log, _storage) = journal().await;
-        let recorder = Arc::new(SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap());
+        let recorder = Arc::new(
+            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
         let context = crate::agent::RuntimeContext::new()
             .with_extension_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
         let found = SessionRecorder::from_context(&context).expect("recorder attached");
@@ -1863,7 +1904,9 @@ mod tests {
     #[tokio::test]
     async fn observe_records_interaction_requests_and_resolutions() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let call = crate::message::ToolUseBlock::new("call-1", "create_order", Default::default());
         let mut data = crate::event::EventData::default();
         data.fields
@@ -1890,7 +1933,10 @@ mod tests {
             .observe(&crate::event::AgentEvent::ExternalExecutionResult(resolved))
             .unwrap();
         recorder.flush().await.unwrap();
-        assert!(super::super::pending_interactions(&*log).await.unwrap().is_empty());
+        assert!(super::super::pending_interactions(&*log)
+            .await
+            .unwrap()
+            .is_empty());
         recorder.close().await;
     }
 }

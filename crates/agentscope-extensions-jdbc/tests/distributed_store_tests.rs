@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use agentscope_extensions_jdbc::dialect::vendor::SqliteDialect;
 use agentscope_extensions_jdbc::dialect::{detect_dialect, AbstractJdbcDialect, DialectKind};
-use agentscope_extensions_jdbc::{AgentStateStore, BaseStore, JdbcDistributedStore, RusqliteExecutor};
+use agentscope_extensions_jdbc::{
+    AgentStateStore, BaseStore, JdbcDistributedStore, RusqliteExecutor,
+};
 use agentscope_harness::agent::sandbox::snapshot::{RemoteSnapshotClient, SandboxSnapshotSpec};
 use agentscope_harness::agent::sandbox::SandboxIsolationKey;
 use agentscope_harness::agent::IsolationScope;
@@ -141,7 +143,10 @@ fn component_accessors_return_shared_handles() {
     // Java: volatile lazy accessors return the same instance every call.
     // Rust builds them once in the constructor and hands out Arc clones.
     let (store, _) = new_store();
-    assert!(Arc::ptr_eq(&store.agent_state_store(), &store.agent_state_store()));
+    assert!(Arc::ptr_eq(
+        &store.agent_state_store(),
+        &store.agent_state_store()
+    ));
     assert!(Arc::ptr_eq(&store.base_store(), &store.base_store()));
     assert!(Arc::ptr_eq(
         &store.sandbox_snapshot_spec(),

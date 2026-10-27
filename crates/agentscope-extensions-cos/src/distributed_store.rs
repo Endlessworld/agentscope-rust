@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use agentscope_core::state::AgentStateStore;
-use agentscope_harness::agent::DistributedStore as HarnessDistributedStore;
 use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec;
+use agentscope_harness::agent::DistributedStore as HarnessDistributedStore;
 use agentscope_harness::filesystem::remote::store::BaseStore;
 
 use crate::agent_state_store::CosAgentStateStore;
@@ -54,7 +54,9 @@ impl CosDistributedStore {
     /// `key_prefix` defaults to `"agentscope/"` when `None`/blank.
     pub fn create(object_store: SharedObjectStore, key_prefix: Option<&str>) -> Result<Self> {
         let prefix = match key_prefix {
-            Some(p) if !p.trim().is_empty() => crate::layout::normalize_prefix(Some(p), DEFAULT_DISTRIBUTED_PREFIX),
+            Some(p) if !p.trim().is_empty() => {
+                crate::layout::normalize_prefix(Some(p), DEFAULT_DISTRIBUTED_PREFIX)
+            }
             _ => DEFAULT_DISTRIBUTED_PREFIX.to_string(),
         };
 
@@ -183,7 +185,10 @@ mod tests {
         assert_eq!(d.key_prefix(), "agentscope/");
         assert_eq!(d.agent_state_store().key_prefix(), "agentscope/state/");
         assert_eq!(d.base_store().key_prefix(), "agentscope/store/");
-        assert_eq!(d.sandbox_snapshot_spec().key_prefix(), "agentscope/snapshot/");
+        assert_eq!(
+            d.sandbox_snapshot_spec().key_prefix(),
+            "agentscope/snapshot/"
+        );
     }
 
     #[test]
@@ -199,7 +204,10 @@ mod tests {
             .save(Some("u"), "s", "k", serde_json::json!(1))
             .await;
         assert_eq!(
-            d.shared_agent_state_store().get(Some("u"), "s", "k").await.unwrap(),
+            d.shared_agent_state_store()
+                .get(Some("u"), "s", "k")
+                .await
+                .unwrap(),
             serde_json::json!(1)
         );
         // base store + snapshot client share the same backing store

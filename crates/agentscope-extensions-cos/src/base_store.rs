@@ -20,8 +20,8 @@ use agentscope_harness::filesystem::remote::store::{BaseStore, StoreItem, StoreV
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::layout::{
-    namespace_prefix, normalize_prefix, strip_leading_slashes, DEFAULT_STORE_PREFIX,
-    JSON_SUFFIX, VERSION_SUFFIX,
+    namespace_prefix, normalize_prefix, strip_leading_slashes, DEFAULT_STORE_PREFIX, JSON_SUFFIX,
+    VERSION_SUFFIX,
 };
 use crate::object_store::SharedObjectStore;
 use crate::{CosError, Result};
@@ -190,7 +190,12 @@ impl BaseStore for CosStore {
             }
             match serde_json::to_string(&value) {
                 Ok(json) => {
-                    if self.object_store.put_string(&data_key, &json).await.is_err() {
+                    if self
+                        .object_store
+                        .put_string(&data_key, &json)
+                        .await
+                        .is_err()
+                    {
                         return false;
                     }
                     let _ = self
@@ -223,7 +228,8 @@ impl BaseStore for CosStore {
 
             let mut items = Vec::with_capacity(page.len());
             for data_key in page {
-                let item_key = data_key[prefix.len()..data_key.len() - JSON_SUFFIX.len()].to_string();
+                let item_key =
+                    data_key[prefix.len()..data_key.len() - JSON_SUFFIX.len()].to_string();
                 if let Ok(Some(json)) = self.object_store.get_string(data_key).await {
                     if let Ok(value) = serde_json::from_str::<StoreValue>(&json) {
                         let vk = format!(
@@ -246,7 +252,12 @@ impl BaseStore for CosStore {
         self.block_on(async move {
             let _guard = self.write_lock.lock().await;
             let _ = self.object_store.delete(&data_key).await;
-            if self.object_store.exists(&version_key).await.unwrap_or(false) {
+            if self
+                .object_store
+                .exists(&version_key)
+                .await
+                .unwrap_or(false)
+            {
                 let _ = self.object_store.delete(&version_key).await;
             }
         });
@@ -287,7 +298,10 @@ mod tests {
         s.put(&ns(), "a.txt", value("two"));
         let item = s.get(&ns(), "a.txt").unwrap();
         assert_eq!(item.version, 2);
-        assert_eq!(item.value.get("content").unwrap(), &serde_json::json!("two"));
+        assert_eq!(
+            item.value.get("content").unwrap(),
+            &serde_json::json!("two")
+        );
     }
 
     #[test]

@@ -25,11 +25,7 @@ pub struct AgentSkillRepositoryInfo {
 
 impl AgentSkillRepositoryInfo {
     /// Creates a new repository info descriptor.
-    pub fn new(
-        repo_type: impl Into<String>,
-        location: impl Into<String>,
-        writable: bool,
-    ) -> Self {
+    pub fn new(repo_type: impl Into<String>, location: impl Into<String>, writable: bool) -> Self {
         Self {
             repo_type: repo_type.into(),
             location: location.into(),
@@ -448,7 +444,10 @@ mod tests {
         let csv = std::fs::read_to_string(dir.join("refs/table.csv")).unwrap();
         assert_eq!(csv, "a,b\n1,2\n");
         // Repeated lookups are stable and unknown skills yield no directory.
-        assert_eq!(SkillRepository::skill_dir(&adapter, "calc"), Some(dir.clone()));
+        assert_eq!(
+            SkillRepository::skill_dir(&adapter, "calc"),
+            Some(dir.clone())
+        );
         assert_eq!(SkillRepository::skill_dir(&adapter, "missing"), None);
         let _ = std::fs::remove_dir_all(dir);
     }

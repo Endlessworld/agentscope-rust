@@ -78,7 +78,10 @@ impl WeComAccessTokenProvider {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let expires_in = node.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(7200);
+        let expires_in = node
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(7200);
         self.store.put_if_newer(CachedAccessToken::new(
             token.clone(),
             refresh_at_ms(now_ms(), expires_in),
@@ -147,10 +150,21 @@ mod tests {
     #[tokio::test]
     async fn token_is_cached_until_invalidated() {
         let transport = Arc::new(RecordingTransport::with_responses(vec![
-            PreparedResponse::new(200, r#"{"errcode":0,"access_token":"t-1","expires_in":7200}"#),
-            PreparedResponse::new(200, r#"{"errcode":0,"access_token":"t-2","expires_in":7200}"#),
+            PreparedResponse::new(
+                200,
+                r#"{"errcode":0,"access_token":"t-1","expires_in":7200}"#,
+            ),
+            PreparedResponse::new(
+                200,
+                r#"{"errcode":0,"access_token":"t-2","expires_in":7200}"#,
+            ),
         ]));
-        let p = WeComAccessTokenProvider::new("https://qyapi.weixin.qq.com", "corp", "sec", transport.clone());
+        let p = WeComAccessTokenProvider::new(
+            "https://qyapi.weixin.qq.com",
+            "corp",
+            "sec",
+            transport.clone(),
+        );
         assert_eq!(p.token().await.unwrap(), "t-1");
         assert_eq!(p.token().await.unwrap(), "t-1");
         p.invalidate();

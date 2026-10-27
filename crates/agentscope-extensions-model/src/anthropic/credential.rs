@@ -89,7 +89,10 @@ impl AnthropicCredential {
         if let Some(token) = trim_to_option(auth_token) {
             return Some((AnthropicAuthMode::AuthToken, token));
         }
-        if let Some(key) = std::env::var("ANTHROPIC_API_KEY").ok().and_then(|v| trim_to_option(Some(&v))) {
+        if let Some(key) = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .and_then(|v| trim_to_option(Some(&v)))
+        {
             return Some((AnthropicAuthMode::ApiKey, key));
         }
         std::env::var("ANTHROPIC_AUTH_TOKEN")
@@ -101,7 +104,10 @@ impl AnthropicCredential {
 
 /// Trims a string and maps an empty result to `None`.
 pub fn trim_to_option(value: Option<&str>) -> Option<String> {
-    value.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

@@ -39,15 +39,15 @@ impl AtomicSessionStorage for MemorySessionStorage {
         expected_version: u64,
         bytes: &[u8],
     ) -> crate::error::Result<bool> {
-        let mut guard = self
-            .values
-            .lock()
-            .expect("memory session storage poisoned");
+        let mut guard = self.values.lock().expect("memory session storage poisoned");
         let current = guard.get(path).map(|v| v.version).unwrap_or(0);
         if current != expected_version {
             return Ok(false);
         }
-        guard.insert(path.to_string(), StorageValue::new(expected_version + 1, bytes));
+        guard.insert(
+            path.to_string(),
+            StorageValue::new(expected_version + 1, bytes),
+        );
         Ok(true)
     }
 
@@ -92,14 +92,20 @@ impl SessionLogStore for InMemorySessionLogStore {
                     .or_insert_with(|| Arc::new(MemorySessionStorage::new())),
             )
         };
-        Ok(Arc::new(JournalSessionLog::new(storage, key.storage_path())))
+        Ok(Arc::new(JournalSessionLog::new(
+            storage,
+            key.storage_path(),
+        )))
     }
 
     async fn list(&self, context: &RuntimeContext) -> crate::error::Result<Vec<SessionKey>> {
         let user_id = context.user_id().map(str::to_string);
         let entries: Vec<(SessionKey, Arc<MemorySessionStorage>)> = {
             let guard = self.stores.lock().expect("session store poisoned");
-            guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+            guard
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
         };
         let mut discovered = Vec::new();
         for (key, storage) in entries {
@@ -142,9 +148,24 @@ mod tests {
         // Opening a reader never creates durable state.
         assert!(store.list(&ctx).await.unwrap().is_empty());
 
-        let writer = log.acquire("run-1", std::time::Duration::from_secs(60)).await.unwrap();
-        let event = SessionEvent::new("e1", 1, 0, "run/start", Some("run-1".into()), Some("t1".into()), true, "{}").unwrap();
-        log.commit(&writer, "b1", 0, std::slice::from_ref(&event)).await.unwrap();
+        let writer = log
+            .acquire("run-1", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        let event = SessionEvent::new(
+            "e1",
+            1,
+            0,
+            "run/start",
+            Some("run-1".into()),
+            Some("t1".into()),
+            true,
+            "{}",
+        )
+        .unwrap();
+        log.commit(&writer, "b1", 0, std::slice::from_ref(&event))
+            .await
+            .unwrap();
         log.release(&writer).await.unwrap();
 
         let listed = store.list(&ctx).await.unwrap();

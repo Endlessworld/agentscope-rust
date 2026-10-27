@@ -33,7 +33,15 @@ pub struct ChannelRouter {
 }
 
 /// Binding evaluation tiers, highest to lowest priority.
-const TIERS: [&str; 7] = ["peer", "parentPeer", "guildRoles", "guild", "team", "account", "channel"];
+const TIERS: [&str; 7] = [
+    "peer",
+    "parentPeer",
+    "guildRoles",
+    "guild",
+    "team",
+    "account",
+    "channel",
+];
 
 impl ChannelRouter {
     /// `global_default_agent_id` is the fallback agent id when no binding and no
@@ -58,11 +66,17 @@ impl ChannelRouter {
         let (agent_id, matched_by) = if let Some(e) = explicit {
             (e.to_string(), "explicit".to_string())
         } else if let Some(b) = &matched_binding {
-            (b.agent_id.clone(), self.detect_matched_tier(&config.bindings, msg))
+            (
+                b.agent_id.clone(),
+                self.detect_matched_tier(&config.bindings, msg),
+            )
         } else if let Some(def) = &config.default_agent_id {
             (def.clone(), "channel-default".to_string())
         } else {
-            (self.global_default_agent_id.clone(), "global-default".to_string())
+            (
+                self.global_default_agent_id.clone(),
+                "global-default".to_string(),
+            )
         };
 
         let effective_scope = match &matched_binding {
@@ -147,7 +161,11 @@ impl ChannelRouter {
                     && b.guild.as_deref() == msg.guild.as_deref()
                     && msg.roles.iter().any(|r| b.roles.contains(r))
             }
-            "guild" => b.guild.is_some() && b.roles.is_empty() && b.guild.as_deref() == msg.guild.as_deref(),
+            "guild" => {
+                b.guild.is_some()
+                    && b.roles.is_empty()
+                    && b.guild.as_deref() == msg.guild.as_deref()
+            }
             "team" => b.team.is_some() && b.team.as_deref() == msg.team.as_deref(),
             "account" => b.account.is_some() && b.account.as_deref() == msg.account_id.as_deref(),
             "channel" => b.channel.is_some() && b.channel.as_deref() == Some(&msg.channel_id),
@@ -183,7 +201,13 @@ impl ChannelRouter {
                 user_id: None,
             }
         } else if peer.kind.is_direct() {
-            Self::build_dm_context(channel, &peer.id, msg.account_id.as_deref(), dm_scope, extra)
+            Self::build_dm_context(
+                channel,
+                &peer.id,
+                msg.account_id.as_deref(),
+                dm_scope,
+                extra,
+            )
         } else {
             MsgContext {
                 channel: Some(channel),
@@ -242,7 +266,12 @@ impl ChannelRouter {
 }
 
 fn build_outbound_address(msg: &InboundMessage) -> OutboundAddress {
-    let to = format!("{}:{}:{}", msg.channel_id, msg.peer.kind.name(), msg.peer.id);
+    let to = format!(
+        "{}:{}:{}",
+        msg.channel_id,
+        msg.peer.kind.name(),
+        msg.peer.id
+    );
     let thread_id = if msg.peer.kind.is_thread() {
         Some(msg.peer.id.clone())
     } else {
@@ -292,7 +321,11 @@ mod tests {
     fn guild_roles_binding_takes_precedence_over_guild() {
         let config = ChannelConfig::builder("chatui")
             .binding(ChannelBinding::for_guild("g1", "guild-agent"))
-            .binding(ChannelBinding::for_guild_roles("g1", ["admin"], "role-agent"))
+            .binding(ChannelBinding::for_guild_roles(
+                "g1",
+                ["admin"],
+                "role-agent",
+            ))
             .build();
         let router = ChannelRouter::new(Some("main"));
         // sender has "admin" role -> guild+roles tier wins over plain guild tier
@@ -333,7 +366,9 @@ mod tests {
 
     #[test]
     fn per_peer_dm_scope_separates_sessions() {
-        let config = ChannelConfig::builder("chatui").dm_scope(DmScope::PerPeer).build();
+        let config = ChannelConfig::builder("chatui")
+            .dm_scope(DmScope::PerPeer)
+            .build();
         let router = ChannelRouter::new(Some("main"));
         let a = router.resolve_route(&config, &InboundMessage::dm("chatui", "u_1", msg("a")));
         let b = router.resolve_route(&config, &InboundMessage::dm("chatui", "u_2", msg("b")));
@@ -370,6 +405,9 @@ mod tests {
         assert_eq!(r.context.user_id.as_deref(), Some("alice"));
         assert_eq!(r.context.room.as_deref(), Some("c1"));
         assert_eq!(r.context.group.as_deref(), Some("g1"));
-        assert_eq!(r.context.extra.get("agentId").map(String::as_str), Some("main"));
+        assert_eq!(
+            r.context.extra.get("agentId").map(String::as_str),
+            Some("main")
+        );
     }
 }

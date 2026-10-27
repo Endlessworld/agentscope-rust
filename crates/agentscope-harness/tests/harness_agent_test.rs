@@ -36,7 +36,9 @@ fn isolation_scope_namespace() {
     );
     assert!(IsolationScope::Session.namespace(None, None).is_empty());
     // Agent / Global produce no prefix.
-    assert!(IsolationScope::Agent.namespace(Some("alice"), Some("s1")).is_empty());
+    assert!(IsolationScope::Agent
+        .namespace(Some("alice"), Some("s1"))
+        .is_empty());
     assert!(IsolationScope::Global.namespace(None, None).is_empty());
 }
 
@@ -92,12 +94,13 @@ async fn workspace_spec_applier_projects_layout() {
     let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
     let mut spec = WorkspaceSpec::default();
     spec.root = dir;
-    spec.files.insert("AGENTS.md".to_string(), "# agent guide".to_string());
-    DefaultWorkspaceSpecApplier
-        .apply(&spec)
+    spec.files
+        .insert("AGENTS.md".to_string(), "# agent guide".to_string());
+    DefaultWorkspaceSpecApplier.apply(&spec).await.unwrap();
+    let data = fs
+        .read(&RuntimeContext::default(), "AGENTS.md", 0, 0)
         .await
         .unwrap();
-    let data = fs.read(&RuntimeContext::default(), "AGENTS.md", 0, 0).await.unwrap();
     assert_eq!(data.content, "# agent guide");
 }
 
@@ -105,11 +108,13 @@ async fn workspace_spec_applier_projects_layout() {
 async fn gateway_emits_to_channel() {
     let (channel, mut rx) = Channel::new(4);
     let gateway = Gateway::new(channel);
-    gateway.emit(serde_json::json!({ "type": "hello" })).await.unwrap();
+    gateway
+        .emit(serde_json::json!({ "type": "hello" }))
+        .await
+        .unwrap();
     let value = rx.recv().await.unwrap();
     assert_eq!(value["type"], "hello");
 }
-
 
 #[test]
 fn harness_agent_builder_memory_and_plan_mode() {
@@ -155,7 +160,10 @@ fn builder_java_parity_setters_round_trip() {
     assert_eq!(agent.description(), "a dev agent");
     assert!(!agent.check_running());
     assert_eq!(agent.environment(), "staging");
-    assert_eq!(agent.async_tool_timeout(), Some(std::time::Duration::from_secs(5)));
+    assert_eq!(
+        agent.async_tool_timeout(),
+        Some(std::time::Duration::from_secs(5))
+    );
     assert!(agent.use_legacy_xml_workspace_context());
 }
 
@@ -232,12 +240,11 @@ fn teams_mode_registers_team_tool() {
 
 #[test]
 fn task_repository_override_is_used() {
-    let repo: Arc<dyn agentscope_harness::TaskRepository> = Arc::new(
-        agentscope_harness::WorkspaceTaskRepository::new(
+    let repo: Arc<dyn agentscope_harness::TaskRepository> =
+        Arc::new(agentscope_harness::WorkspaceTaskRepository::new(
             Arc::new(LocalFilesystem::new(std::env::temp_dir())),
             "custom-parent",
-        ),
-    );
+        ));
     let agent = HarnessAgent::builder()
         .name("dev")
         .task_repository(Arc::clone(&repo))

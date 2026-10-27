@@ -46,10 +46,15 @@ impl GracefulShutdownConfig {
     ) -> Result<Self> {
         if let Some(t) = shutdown_timeout {
             if t.is_zero() {
-                return Err(crate::Error::Other("shutdownTimeout must be > 0 or None".into()));
+                return Err(crate::Error::Other(
+                    "shutdownTimeout must be > 0 or None".into(),
+                ));
             }
         }
-        Ok(Self { shutdown_timeout, partial_reasoning_policy })
+        Ok(Self {
+            shutdown_timeout,
+            partial_reasoning_policy,
+        })
     }
 }
 
@@ -136,7 +141,11 @@ impl GracefulShutdownManager {
             if cur == STATE_TERMINATED {
                 return false;
             }
-            if self.state.compare_exchange(cur, STATE_SHUTTING_DOWN, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if self
+                .state
+                .compare_exchange(cur, STATE_SHUTTING_DOWN, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 if cur == STATE_RUNNING {
                     *self.shutdown_started.lock().await = Some(std::time::Instant::now());
                 }

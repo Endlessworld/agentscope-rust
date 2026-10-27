@@ -26,10 +26,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::crypto::WeComCrypto;
@@ -38,8 +38,8 @@ use super::outbound::WeComOutboundClient;
 use super::properties::WeComChannelProperties;
 use super::token::WeComAccessTokenProvider;
 use crate::common::{
-    to_core_error, xml_element_text, AccessTokenProvider, BotLoopGuard, ChannelCore, ChannelRegistry,
-    ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
+    to_core_error, xml_element_text, AccessTokenProvider, BotLoopGuard, ChannelCore,
+    ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
 };
 
 /// Typed registry of `WeComChannel` handles, keyed by `channel_id`.
@@ -276,7 +276,8 @@ mod tests {
     const TOKEN: &str = "wecom-token";
     /// 43-character fixture key (clone of the one in `crypto.rs`).
     const ENCODING_AES_KEY: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
-    const TEXT_XML: &str = "<xml><ToUserName>corp-1</ToUserName><FromUserName>user-1</FromUserName>\
+    const TEXT_XML: &str =
+        "<xml><ToUserName>corp-1</ToUserName><FromUserName>user-1</FromUserName>\
 <MsgType>text</MsgType><Content>hello</Content><MsgId>9988776655443322</MsgId></xml>";
     const EVENT_XML: &str = "<xml><FromUserName>user-1</FromUserName><MsgType>event</MsgType>\
 <Event>subscribe</Event></xml>";
@@ -321,7 +322,8 @@ mod tests {
         let nonce = "nonce-1";
         let encrypt = c.encrypt(xml, CORP).unwrap();
         let signature = c.sign(timestamp, nonce, &encrypt);
-        let body = format!("<xml><ToUserName>{CORP}</ToUserName><Encrypt>{encrypt}</Encrypt></xml>");
+        let body =
+            format!("<xml><ToUserName>{CORP}</ToUserName><Encrypt>{encrypt}</Encrypt></xml>");
         (signature, timestamp.to_string(), nonce.to_string(), body)
     }
 
@@ -388,7 +390,9 @@ mod tests {
             WeComCallbackOutcome::Unauthorized
         );
         assert_eq!(
-            channel.verify_url(Some(&signature), None, None, &encrypt).await,
+            channel
+                .verify_url(Some(&signature), None, None, &encrypt)
+                .await,
             WeComCallbackOutcome::Unauthorized
         );
     }
@@ -416,8 +420,13 @@ mod tests {
             WeComCallbackOutcome::BadRequest
         );
         assert_eq!(
-            c.handle_callback(Some("s"), Some("1"), Some("n"), "<xml><Encrypt> </Encrypt></xml>")
-                .await,
+            c.handle_callback(
+                Some("s"),
+                Some("1"),
+                Some("n"),
+                "<xml><Encrypt> </Encrypt></xml>"
+            )
+            .await,
             WeComCallbackOutcome::BadRequest
         );
     }

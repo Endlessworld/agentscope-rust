@@ -21,15 +21,13 @@
 
 use std::sync::Arc;
 
+use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::{
     RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshot, SandboxSnapshotSpec,
 };
-use agentscope_core::error::{Error, Result};
 use async_trait::async_trait;
 
-use crate::client::{
-    decode_binary, encode_binary, FindFilter, MongoClient, MongoError,
-};
+use crate::client::{decode_binary, encode_binary, FindFilter, MongoClient, MongoError};
 use crate::constants::{DEFAULT_DATABASE, SNAPSHOTS_COLLECTION};
 
 /// Log target for this module's diagnostics.
@@ -122,16 +120,25 @@ impl MongodbRemoteSnapshotClient {
         let Some(doc) = doc else {
             return Ok(None);
         };
-        let Some(raw) = doc.get(crate::client::LEGACY_FIELD_DATA).and_then(|v| v.as_str()) else {
-            tracing::warn!(target = LOG_TARGET, snapshot_id,
-                "legacy snapshot document has no data field");
+        let Some(raw) = doc
+            .get(crate::client::LEGACY_FIELD_DATA)
+            .and_then(|v| v.as_str())
+        else {
+            tracing::warn!(
+                target = LOG_TARGET,
+                snapshot_id,
+                "legacy snapshot document has no data field"
+            );
             return Ok(None);
         };
         match decode_binary(raw) {
             Some(data) => Ok(Some(data)),
             None => {
-                tracing::warn!(target = LOG_TARGET, snapshot_id,
-                    "legacy snapshot data is not valid base64");
+                tracing::warn!(
+                    target = LOG_TARGET,
+                    snapshot_id,
+                    "legacy snapshot data is not valid base64"
+                );
                 Ok(None)
             }
         }
@@ -160,8 +167,11 @@ impl MongodbRemoteSnapshotClient {
             .await
             .map_err(map_err)?;
         if deleted_gridfs {
-            tracing::info!(target = LOG_TARGET, snapshot_id,
-                "deleted snapshot from GridFS");
+            tracing::info!(
+                target = LOG_TARGET,
+                snapshot_id,
+                "deleted snapshot from GridFS"
+            );
             // Also clean up a legacy document if it exists (migration scenario).
             let _ = self.delete_legacy(snapshot_id).await;
             return Ok(true);
@@ -210,12 +220,19 @@ impl RemoteSnapshotClient for MongodbRemoteSnapshotClient {
     }
 
     async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
-        match self.client.gridfs_download(&self.scoped_bucket(), snapshot_id).await {
+        match self
+            .client
+            .gridfs_download(&self.scoped_bucket(), snapshot_id)
+            .await
+        {
             Ok(Some(data)) => Ok(data),
             Ok(None) => match self.download_legacy(snapshot_id).await? {
                 Some(data) => {
-                    tracing::debug!(target = LOG_TARGET, snapshot_id,
-                        "downloaded snapshot from legacy collection");
+                    tracing::debug!(
+                        target = LOG_TARGET,
+                        snapshot_id,
+                        "downloaded snapshot from legacy collection"
+                    );
                     Ok(data)
                 }
                 None => Err(Error::Tool(format!(
@@ -373,10 +390,15 @@ mod tests {
     #[tokio::test]
     async fn download_and_exists_fall_back_to_legacy_document() {
         let c = MongodbRemoteSnapshotClient::new(client(), Some("db"), None);
-        c.insert_legacy("legacy-1", b"legacy-workspace-tar").await.unwrap();
+        c.insert_legacy("legacy-1", b"legacy-workspace-tar")
+            .await
+            .unwrap();
 
         assert!(c.exists("legacy-1").await.unwrap());
-        assert_eq!(c.download("legacy-1").await.unwrap(), b"legacy-workspace-tar");
+        assert_eq!(
+            c.download("legacy-1").await.unwrap(),
+            b"legacy-workspace-tar"
+        );
         // Deleting falls back to the legacy document.
         assert!(c.delete("legacy-1").await.unwrap());
         assert!(!c.exists("legacy-1").await.unwrap());
@@ -523,7 +545,10 @@ mod tests {
             .unwrap();
         assert!(removed);
         let err = c.download("gap").await.unwrap_err().to_string();
-        assert!(err.contains("corrupt GridFS file"), "unexpected error: {err}");
+        assert!(
+            err.contains("corrupt GridFS file"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

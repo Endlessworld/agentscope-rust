@@ -265,7 +265,10 @@ async fn an_empty_submission_is_rejected() {
 #[tokio::test]
 async fn inject_persists_input_without_starting_execution() {
     let (session, dir) = open_session("inject", "ok").await;
-    let receipt = session.inject("Additional material: plan A is weekly").await.unwrap();
+    let receipt = session
+        .inject("Additional material: plan A is weekly")
+        .await
+        .unwrap();
     assert!(receipt.turn_id.is_none());
     // No execution was launched, so nothing is running and no task exists.
     assert!(session.tasks().await.unwrap().is_empty());
@@ -277,7 +280,10 @@ async fn inject_persists_input_without_starting_execution() {
 async fn steer_requires_a_running_task() {
     let (session, dir) = open_session("steer", "ok").await;
     // Nothing is running yet: steering must be refused rather than silently queued.
-    let err = session.steer(None, "prioritize staffing cost").await.unwrap_err();
+    let err = session
+        .steer(None, "prioritize staffing cost")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("No running task"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -417,7 +423,10 @@ async fn a_run_that_panics_does_not_wedge_the_session() {
     // The run may surface as failed or interrupted depending on where the panic unwound; what
     // matters is that it settles instead of hanging on `starting`.
     let settled = session.await_task(&task.command_id).await.unwrap();
-    assert!(settled.settled(), "a panicking run must not stay active: {settled:?}");
+    assert!(
+        settled.settled(),
+        "a panicking run must not stay active: {settled:?}"
+    );
     assert_ne!(settled.status, "starting", "{settled:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -438,7 +447,9 @@ impl Model for SlowModel {
         Box::pin(futures::stream::once(async {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             Ok(ChatResponse::builder()
-                .content(vec![CoreBlock::Text(TextBlock::new("a slow but healthy answer"))])
+                .content(vec![CoreBlock::Text(TextBlock::new(
+                    "a slow but healthy answer",
+                ))])
                 .build())
         }))
     }
@@ -518,8 +529,12 @@ async fn a_stale_interrupt_does_not_kill_the_next_run() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-stale-interrupt");
-    let key =
-        SessionKey::new(Some("alice"), "session-agent", "conversation-stale-interrupt").unwrap();
+    let key = SessionKey::new(
+        Some("alice"),
+        "session-agent",
+        "conversation-stale-interrupt",
+    )
+    .unwrap();
     let store = InMemorySessionLogStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();

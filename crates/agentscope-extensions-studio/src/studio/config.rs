@@ -168,7 +168,9 @@ impl StudioConfigBuilder {
     /// Builds the [`StudioConfig`], deriving `tracing_url` when unset.
     pub fn build(self) -> StudioConfig {
         let base = self.studio_url.trim_end_matches('/').to_string();
-        let tracing_url = self.tracing_url.unwrap_or_else(|| format!("{base}/v1/traces"));
+        let tracing_url = self
+            .tracing_url
+            .unwrap_or_else(|| format!("{base}/v1/traces"));
         StudioConfig {
             studio_url: base,
             tracing_url,

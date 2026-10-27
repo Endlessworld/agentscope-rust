@@ -6,9 +6,9 @@ use std::sync::Arc;
 use agentscope_core::agent::StreamOptions;
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+use agentscope_core::session::SessionHistoryMode;
 use agentscope_core::state::{AgentStateStore, JsonFileAgentStateStore};
 use agentscope_core::Agent;
-use agentscope_core::session::SessionHistoryMode;
 use agentscope_harness::agent::HarnessAgent;
 
 /// A scripted model that always answers "done".

@@ -120,12 +120,18 @@ impl BlockingRedisCommands {
         // Validate the URL shape without touching the network.
         redis::Client::open(normalized.clone())
             .map_err(|e| Error::Other(format!("Invalid Redis URL: {e}")))?;
-        Ok(Self { url: normalized, conn: Mutex::new(None) })
+        Ok(Self {
+            url: normalized,
+            conn: Mutex::new(None),
+        })
     }
 
     /// Wraps an already-open blocking connection.
     pub fn new(conn: redis::Connection) -> Self {
-        Self { url: String::new(), conn: Mutex::new(Some(conn)) }
+        Self {
+            url: String::new(),
+            conn: Mutex::new(Some(conn)),
+        }
     }
 
     /// Runs `f` against a live connection, opening one on first use.
@@ -186,7 +192,9 @@ impl StoreCommands for BlockingRedisCommands {
     }
 
     fn ping(&self) -> Result<()> {
-        self.with_conn("PING", |conn| redis::cmd("PING").query::<String>(conn).map(|_| ()))
+        self.with_conn("PING", |conn| {
+            redis::cmd("PING").query::<String>(conn).map(|_| ())
+        })
     }
 }
 
@@ -247,7 +255,10 @@ impl RedisStore {
     /// Builds a store over an arbitrary command backend (the production blocking
     /// connection, or in tests an in-memory double).
     pub(crate) fn from_commands(commands: Arc<dyn StoreCommands>, key_prefix: &str) -> Self {
-        Self { commands, key_prefix: normalize_prefix(key_prefix) }
+        Self {
+            commands,
+            key_prefix: normalize_prefix(key_prefix),
+        }
     }
 
     /// The configured, normalized key prefix.
@@ -304,7 +315,9 @@ fn validate_key(key: &str) -> Result<()> {
         return Err(Error::Other("key must not be null or empty".into()));
     }
     if key.contains('\0') {
-        return Err(Error::Other("key must not contain the NUL character".into()));
+        return Err(Error::Other(
+            "key must not contain the NUL character".into(),
+        ));
     }
     Ok(())
 }
@@ -344,9 +357,9 @@ impl BaseStore for RedisStore {
         };
         let item_key = self.item_key(namespace, key);
         let idx_key = self.index_key(namespace);
-        let _ = self
-            .commands
-            .eval_two_keys(PUT_SCRIPT, &item_key, &idx_key, &[json, key.to_string()]);
+        let _ =
+            self.commands
+                .eval_two_keys(PUT_SCRIPT, &item_key, &idx_key, &[json, key.to_string()]);
     }
 
     fn put_if_version(
@@ -481,7 +494,10 @@ mod tests {
             format!("{}item:{}{NS_SEPARATOR}key", "p:", namespace_path(&ns)),
             format!("p:item:{}\0key", namespace_path(&ns)),
         );
-        assert_eq!(format!("{}idx:{}", "p:", namespace_path(&ns)), "p:idx:ns1\0ns2",);
+        assert_eq!(
+            format!("{}idx:{}", "p:", namespace_path(&ns)),
+            "p:idx:ns1\0ns2",
+        );
     }
 
     #[test]
@@ -491,7 +507,10 @@ mod tests {
             eval_reply_to_version(redis::Value::BulkString(b"3".to_vec())),
             Some("3".into())
         );
-        assert_eq!(eval_reply_to_version(redis::Value::Int(4)), Some("4".into()));
+        assert_eq!(
+            eval_reply_to_version(redis::Value::Int(4)),
+            Some("4".into())
+        );
         assert_eq!(eval_reply_to_version(redis::Value::Nil), None);
     }
 
@@ -507,9 +526,15 @@ mod tests {
         assert_eq!(item.key, "a.txt");
         assert_eq!(item.value.get("size"), Some(&json!(1)));
         assert_eq!(item.version, 1, "version starts at 1 on first write");
-        assert_eq!(commands.index_members("t:idx:files"), vec!["a.txt".to_string()]);
         assert_eq!(
-            commands.hash_of("t:item:files\0a.txt").get("version").map(String::as_str),
+            commands.index_members("t:idx:files"),
+            vec!["a.txt".to_string()]
+        );
+        assert_eq!(
+            commands
+                .hash_of("t:item:files\0a.txt")
+                .get("version")
+                .map(String::as_str),
             Some("1")
         );
     }
@@ -535,7 +560,10 @@ mod tests {
         let (store, commands) = store();
         let ns = ns(&["files"]);
         assert!(store.get(&ns, "nope").is_none());
-        assert!(store.get(&ns, "").is_none(), "empty key is rejected before I/O");
+        assert!(
+            store.get(&ns, "").is_none(),
+            "empty key is rejected before I/O"
+        );
         assert!(store.get(&ns, "a\0b").is_none(), "NUL in key is rejected");
         assert_eq!(commands.eval_calls(), 0);
     }
@@ -589,7 +617,11 @@ mod tests {
         let page1: Vec<String> = store.search(&ns, 2, 0).into_iter().map(|i| i.key).collect();
         let page2: Vec<String> = store.search(&ns, 2, 2).into_iter().map(|i| i.key).collect();
         let page3: Vec<String> = store.search(&ns, 2, 4).into_iter().map(|i| i.key).collect();
-        assert_eq!(page1, vec!["d", "a"], "index preserves insertion order (all scores 0)");
+        assert_eq!(
+            page1,
+            vec!["d", "a"],
+            "index preserves insertion order (all scores 0)"
+        );
         assert_eq!(page2, vec!["c", "b"]);
         assert!(page3.is_empty(), "offset past the end yields nothing");
     }
@@ -599,7 +631,10 @@ mod tests {
         let (store, _commands) = store();
         let files = ns(&["ns"]);
         store.put(&files, "a", value("n", 1));
-        assert!(store.search(&files, 0, 0).is_empty(), "limit 0 performs no query");
+        assert!(
+            store.search(&files, 0, 0).is_empty(),
+            "limit 0 performs no query"
+        );
         assert!(store.search(&ns(&["other"]), 10, 0).is_empty());
     }
 
@@ -610,7 +645,11 @@ mod tests {
         // Index entry with no backing hash simulates an externally deleted item.
         commands.seed_index("t:idx:ns", "ghost");
         store.put(&ns, "real", value("n", 1));
-        let found: Vec<String> = store.search(&ns, 10, 0).into_iter().map(|i| i.key).collect();
+        let found: Vec<String> = store
+            .search(&ns, 10, 0)
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
         assert_eq!(found, vec!["real"]);
     }
 

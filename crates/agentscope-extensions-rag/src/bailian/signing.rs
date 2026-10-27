@@ -164,9 +164,7 @@ fn signed_headers(headers: &[(String, String)]) -> Vec<String> {
     let mut names: Vec<String> = headers
         .iter()
         .map(|(name, _)| name.to_ascii_lowercase())
-        .filter(|name| {
-            name.starts_with("x-acs-") || name == "host" || name == "content-type"
-        })
+        .filter(|name| name.starts_with("x-acs-") || name == "host" || name == "content-type")
         .collect();
     names.sort();
     names.dedup();
@@ -283,11 +281,17 @@ mod tests {
     /// every value below is verbatim what the Java SDK produced for the same inputs.
     fn golden_headers(hashed: &str) -> Vec<(String, String)> {
         vec![
-            ("host".to_string(), "bailian.cn-beijing.aliyuncs.com".to_string()),
+            (
+                "host".to_string(),
+                "bailian.cn-beijing.aliyuncs.com".to_string(),
+            ),
             ("x-acs-version".to_string(), "2023-12-29".to_string()),
             ("x-acs-action".to_string(), "Retrieve".to_string()),
             ("x-acs-date".to_string(), "2026-09-19T00:00:00Z".to_string()),
-            ("x-acs-signature-nonce".to_string(), "abcdef0123456789".to_string()),
+            (
+                "x-acs-signature-nonce".to_string(),
+                "abcdef0123456789".to_string(),
+            ),
             ("accept".to_string(), "application/json".to_string()),
             (
                 "content-type".to_string(),
@@ -387,7 +391,10 @@ mod tests {
         );
         // A single component (no region part) and the blank inputs fall back to `center`.
         assert_eq!(resolve_region("bailian", "localhost"), "center");
-        assert_eq!(resolve_region("", "bailian.cn-beijing.aliyuncs.com"), "center");
+        assert_eq!(
+            resolve_region("", "bailian.cn-beijing.aliyuncs.com"),
+            "center"
+        );
         assert_eq!(resolve_region("bailian", ""), "center");
     }
 

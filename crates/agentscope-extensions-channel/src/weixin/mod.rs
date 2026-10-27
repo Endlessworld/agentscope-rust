@@ -48,15 +48,13 @@ pub mod protocol;
 pub mod state_store;
 
 pub use channel::{
-    digest, inbox_messages, weixin_to_core_error, LeaseSession, WeixinChannel, WeixinChannelRegistry,
-    CHANNEL_TYPE, MAX_DISPATCH_ATTEMPTS,
+    digest, inbox_messages, weixin_to_core_error, LeaseSession, WeixinChannel,
+    WeixinChannelRegistry, CHANNEL_TYPE, MAX_DISPATCH_ATTEMPTS,
 };
-pub use credentials::{
-    FixedCredentialProvider, WeixinCredentialProvider, WeixinCredentials,
-};
+pub use credentials::{FixedCredentialProvider, WeixinCredentialProvider, WeixinCredentials};
 pub use dto::{
-    WeixinItem, WeixinLoginChallenge, WeixinLoginSession, WeixinLoginStatusResponse, WeixinLoginStep,
-    WeixinMessage, WeixinQrCodeResponse, WeixinTextItem, WeixinUpdatesResponse,
+    WeixinItem, WeixinLoginChallenge, WeixinLoginSession, WeixinLoginStatusResponse,
+    WeixinLoginStep, WeixinMessage, WeixinQrCodeResponse, WeixinTextItem, WeixinUpdatesResponse,
 };
 /// Alias for the provider inbound message DTO (see [`dto::WeixinMessage`]).
 pub type WeixinInboundMessage = dto::WeixinMessage;
@@ -64,18 +62,14 @@ pub use endpoint::{
     is_loopback, is_official_host, normalize_base_url, validate_provider_endpoint, DEFAULT_BASE_URL,
 };
 pub use error::{sanitize, to_core_error, WeixinError, WeixinResult, MAX_SAFE_MESSAGE_LENGTH};
-pub use inbound::{
-    context_token_of, WeixinInboundMapper, META_CONTEXT_TOKEN, META_MESSAGE_ID,
-};
+pub use inbound::{context_token_of, WeixinInboundMapper, META_CONTEXT_TOKEN, META_MESSAGE_ID};
 pub use listener::{
     NoopWeixinRuntimeListener, RecordingWeixinRuntimeListener, WeixinRuntimeListener,
 };
 pub use login::{WeixinLoginChallengeResult, WeixinLoginClient, DEFAULT_LOGIN_TIMEOUT_MS};
 pub use outbound::{next_client_id, peer_of, timeout_for, WeixinChallenge, WeixinOutboundClient};
 pub use properties::{WeixinChannelProperties, DEFAULT_BOT_AGENT, DEFAULT_CHANNEL_VERSION};
-pub use protocol::{
-    form_urlencode, APP_CLIENT_VERSION, APP_ID, PATH_SEND_MESSAGE, PATH_UPDATES,
-};
+pub use protocol::{form_urlencode, APP_CLIENT_VERSION, APP_ID, PATH_SEND_MESSAGE, PATH_UPDATES};
 pub use state_store::{
     in_memory_store, InMemoryWeixinStateStore, WeixinInboxClaim, WeixinInboxMessage, WeixinLease,
     WeixinStateStore,

@@ -109,10 +109,8 @@ impl RAGFlowClient {
             return Err(map_status_error(status_code, &response.body));
         }
 
-        let parsed: RAGFlowResponse = crate::transport::parse_json_or_default(
-            &response.body,
-            "RAGFlow",
-        )?;
+        let parsed: RAGFlowResponse =
+            crate::transport::parse_json_or_default(&response.body, "RAGFlow")?;
 
         // A non-zero API code is an error even on HTTP 200 (Java does the same).
         if parsed.is_api_error() {
@@ -226,9 +224,7 @@ mod tests {
             .unwrap()
     }
 
-    fn client(
-        responses: Vec<crate::transport::HttpResponse>,
-    ) -> (RAGFlowClient, SharedMock) {
+    fn client(responses: Vec<crate::transport::HttpResponse>) -> (RAGFlowClient, SharedMock) {
         let shared = SharedMock(Arc::new(MockTransport::with_responses(responses)));
         (
             RAGFlowClient::with_transport(config(0), Arc::new(shared.clone())),
@@ -289,7 +285,11 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_maps_404_429_and_5xx() {
-        let cases = [(404, "Dataset not found"), (429, "Rate limit exceeded"), (503, "server error")];
+        let cases = [
+            (404, "Dataset not found"),
+            (429, "Rate limit exceeded"),
+            (503, "server error"),
+        ];
         for (status, expected) in cases {
             let (client, _) = client(vec![crate::transport::HttpResponse::new(status, "body")]);
             let err = client.retrieve("q", None, None, None).await.unwrap_err();

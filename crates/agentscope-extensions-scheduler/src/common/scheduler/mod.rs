@@ -8,4 +8,4 @@ pub mod scheduler;
 pub mod task;
 
 pub use scheduler::{AgentScheduler, SchedulerError};
-pub use task::{BaseScheduleAgentTask, AgentFactory, ScheduleAgentTask, TaskControl};
+pub use task::{AgentFactory, BaseScheduleAgentTask, ScheduleAgentTask, TaskControl};

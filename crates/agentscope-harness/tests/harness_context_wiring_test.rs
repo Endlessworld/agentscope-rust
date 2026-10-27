@@ -61,8 +61,7 @@ impl ContextSource for FixedSource {
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let base =
-        std::env::temp_dir().join(format!("agentscope_ctx_{tag}_{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("agentscope_ctx_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     base
@@ -83,9 +82,11 @@ async fn registered_material_reaches_the_model_through_the_real_build_path() {
         .instruction("change-policy", "Preserve public API behavior")
         .context_source(
             "change-record",
-            Arc::new(FixedSource(vec![
-                ContextBlock::runtime("status", "Change 42: export fix").unwrap(),
-            ])),
+            Arc::new(FixedSource(vec![ContextBlock::runtime(
+                "status",
+                "Change 42: export fix",
+            )
+            .unwrap()])),
             ContextSourceOptions::default(),
         )
         .build();

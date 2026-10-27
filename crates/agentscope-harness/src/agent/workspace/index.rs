@@ -9,11 +9,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(feature = "rusqlite")]
+use rusqlite::{Connection, OptionalExtension};
+#[cfg(feature = "rusqlite")]
 use std::path::PathBuf;
 #[cfg(feature = "rusqlite")]
 use std::sync::Mutex;
-#[cfg(feature = "rusqlite")]
-use rusqlite::{Connection, OptionalExtension};
 
 #[cfg(feature = "rusqlite")]
 use super::constants::{AGENTS_DIR, MEMORY_DIR};
@@ -60,7 +60,9 @@ impl WorkspaceIndex {
         {
             let index_dir = workspace_root.join(INDEX_DIR);
             if std::fs::create_dir_all(&index_dir).is_err() {
-                tracing::warn!("WorkspaceIndex unavailable (non-fatal): cannot create {index_dir:?}");
+                tracing::warn!(
+                    "WorkspaceIndex unavailable (non-fatal): cannot create {index_dir:?}"
+                );
                 return None;
             }
             let db_file = index_dir.join(INDEX_DB);
@@ -114,9 +116,9 @@ impl WorkspaceIndex {
         if !Self::is_indexable(path) {
             return;
         }
-        let ts = modified_at.map(str::to_string).unwrap_or_else(|| {
-            chrono::Utc::now().to_rfc3339()
-        });
+        let ts = modified_at
+            .map(str::to_string)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         if !self.ensure_open() {
             return;
         }
@@ -143,18 +145,16 @@ impl WorkspaceIndex {
         let (size, mtime) = match std::fs::metadata(local_file) {
             Ok(md) => (
                 md.len() as i64,
-                md.modified()
-                    .ok()
-                    .and_then(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(
-                                d.as_secs() as i64,
-                                d.subsec_nanos(),
-                            )
-                            .unwrap_or_default()
-                            .to_rfc3339()
-                        })
-                    }),
+                md.modified().ok().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            d.as_secs() as i64,
+                            d.subsec_nanos(),
+                        )
+                        .unwrap_or_default()
+                        .to_rfc3339()
+                    })
+                }),
             ),
             Err(_) => (-1, None),
         };
@@ -195,9 +195,7 @@ impl WorkspaceIndex {
             "UPDATE files SET path=?2 WHERE path=?1",
             rusqlite::params![from_path, to_path],
         ) {
-            tracing::debug!(
-                "Index rename failed '{from_path}' -> '{to_path}' (non-fatal): {e}"
-            );
+            tracing::debug!("Index rename failed '{from_path}' -> '{to_path}' (non-fatal): {e}");
         }
     }
 
@@ -234,14 +232,14 @@ impl WorkspaceIndex {
         }
         let guard = self.conn.lock().unwrap();
         let conn = guard.as_ref().unwrap();
-        let mut stmt = match conn.prepare("SELECT path FROM files WHERE path LIKE ?1 AND present_local=1")
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!("Index listByPrefix prepare failed (non-fatal): {e}");
-                return Vec::new();
-            }
-        };
+        let mut stmt =
+            match conn.prepare("SELECT path FROM files WHERE path LIKE ?1 AND present_local=1") {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("Index listByPrefix prepare failed (non-fatal): {e}");
+                    return Vec::new();
+                }
+            };
         let pattern = format!("{prefix}%");
         let mut out = Vec::new();
         match stmt.query_map(rusqlite::params![pattern], |row| row.get::<_, String>(0)) {
@@ -286,7 +284,13 @@ impl WorkspaceIndex {
         if !self.ensure_open() {
             return;
         }
-        let _ = self.conn.lock().unwrap().as_ref().unwrap().execute("DELETE FROM files", []);
+        let _ = self
+            .conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("DELETE FROM files", []);
         for prefix in indexed_prefixes() {
             let dir = workspace_root.join(&prefix);
             if !dir.is_dir() {
@@ -377,87 +381,90 @@ fn walk_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         for entry in std::fs::read_dir(dir)? {
             let p = entry?.path();
             if p.is_dir() {
+                #[cfg(all(test, feature = "rusqlite"))]
+                mod tests {
+                    use super::*;
 
-#[cfg(all(test, feature = "rusqlite"))]
-mod tests {
-    use super::*;
+                    fn temp_dir(name: &str) -> std::path::PathBuf {
+                        let dir = std::env::temp_dir()
+                            .join(format!("as_ws_idx_{name}_{}", uuid::Uuid::new_v4()));
+                        std::fs::create_dir_all(&dir).unwrap();
+                        dir
+                    }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("as_ws_idx_{name}_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+                    #[test]
+                    fn open_creates_db_and_schema() {
+                        let root = temp_dir("open");
+                        let idx = WorkspaceIndex::open(&root).expect("index opens");
+                        // 惰性语义：open 只记录路径，首次读写才建立 db 文件。
+                        assert!(root.join(".index").exists());
+                        idx.upsert("memory/2024-01-01.md", 10, None);
+                        assert!(root.join(".index/workspace.db").exists());
+                        assert!(idx.exists("memory/2024-01-01.md"));
+                        let _ = std::fs::remove_dir_all(&root);
+                    }
 
-    #[test]
-    fn open_creates_db_and_schema() {
-        let root = temp_dir("open");
-        let idx = WorkspaceIndex::open(&root).expect("index opens");
-        // 惰性语义：open 只记录路径，首次读写才建立 db 文件。
-        assert!(root.join(".index").exists());
-        idx.upsert("memory/2024-01-01.md", 10, None);
-        assert!(root.join(".index/workspace.db").exists());
-        assert!(idx.exists("memory/2024-01-01.md"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
+                    #[test]
+                    fn non_indexable_paths_are_ignored() {
+                        let root = temp_dir("nonindex");
+                        let idx = WorkspaceIndex::open(&root).unwrap();
+                        idx.upsert("skills/foo.md", 5, None);
+                        assert!(!idx.exists("skills/foo.md"));
+                        assert!(!WorkspaceIndex::is_indexable("skills/foo.md"));
+                        assert!(WorkspaceIndex::is_indexable("agents/a1/sessions/s.jsonl"));
+                        let _ = std::fs::remove_dir_all(&root);
+                    }
 
-    #[test]
-    fn non_indexable_paths_are_ignored() {
-        let root = temp_dir("nonindex");
-        let idx = WorkspaceIndex::open(&root).unwrap();
-        idx.upsert("skills/foo.md", 5, None);
-        assert!(!idx.exists("skills/foo.md"));
-        assert!(!WorkspaceIndex::is_indexable("skills/foo.md"));
-        assert!(WorkspaceIndex::is_indexable("agents/a1/sessions/s.jsonl"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
+                    #[test]
+                    fn upsert_exists_remove_roundtrip() {
+                        let root = temp_dir("roundtrip");
+                        let idx = WorkspaceIndex::open(&root).unwrap();
+                        let path = "agents/a1/sessions/s1.log.jsonl";
+                        idx.upsert(path, 42, Some("2024-01-01T00:00:00Z"));
+                        assert!(idx.exists(path));
+                        assert!(idx.has_prefix("agents/a1/"));
+                        assert_eq!(
+                            idx.list_by_prefix("agents/a1/sessions/"),
+                            vec![path.to_string()]
+                        );
+                        idx.remove(path);
+                        assert!(!idx.exists(path));
+                        assert!(!idx.has_prefix("agents/a1/"));
+                        let _ = std::fs::remove_dir_all(&root);
+                    }
 
-    #[test]
-    fn upsert_exists_remove_roundtrip() {
-        let root = temp_dir("roundtrip");
-        let idx = WorkspaceIndex::open(&root).unwrap();
-        let path = "agents/a1/sessions/s1.log.jsonl";
-        idx.upsert(path, 42, Some("2024-01-01T00:00:00Z"));
-        assert!(idx.exists(path));
-        assert!(idx.has_prefix("agents/a1/"));
-        assert_eq!(idx.list_by_prefix("agents/a1/sessions/"), vec![path.to_string()]);
-        idx.remove(path);
-        assert!(!idx.exists(path));
-        assert!(!idx.has_prefix("agents/a1/"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
+                    #[test]
+                    fn rename_moves_entry() {
+                        let root = temp_dir("rename");
+                        let idx = WorkspaceIndex::open(&root).unwrap();
+                        let from = "agents/a1/sessions/s1.jsonl";
+                        let to = "agents/a1/sessions/s2.jsonl";
+                        idx.upsert(from, 7, None);
+                        idx.rename(from, to);
+                        assert!(!idx.exists(from));
+                        assert!(idx.exists(to));
+                        let _ = std::fs::remove_dir_all(&root);
+                    }
 
-    #[test]
-    fn rename_moves_entry() {
-        let root = temp_dir("rename");
-        let idx = WorkspaceIndex::open(&root).unwrap();
-        let from = "agents/a1/sessions/s1.jsonl";
-        let to = "agents/a1/sessions/s2.jsonl";
-        idx.upsert(from, 7, None);
-        idx.rename(from, to);
-        assert!(!idx.exists(from));
-        assert!(idx.exists(to));
-        let _ = std::fs::remove_dir_all(&root);
-    }
+                    #[test]
+                    fn rebuild_from_disk_walks_indexed_dirs() {
+                        let root = temp_dir("rebuild");
+                        std::fs::create_dir_all(root.join("memory")).unwrap();
+                        std::fs::write(root.join("memory/2024-01-01.md"), "hello").unwrap();
+                        std::fs::create_dir_all(root.join("agents/a1/sessions")).unwrap();
+                        std::fs::write(root.join("agents/a1/sessions/s1.log.jsonl"), "{}").unwrap();
+                        // Non-indexed file should be skipped.
+                        std::fs::create_dir_all(root.join("skills")).unwrap();
+                        std::fs::write(root.join("skills/foo.md"), "x").unwrap();
 
-    #[test]
-    fn rebuild_from_disk_walks_indexed_dirs() {
-        let root = temp_dir("rebuild");
-        std::fs::create_dir_all(root.join("memory")).unwrap();
-        std::fs::write(root.join("memory/2024-01-01.md"), "hello").unwrap();
-        std::fs::create_dir_all(root.join("agents/a1/sessions")).unwrap();
-        std::fs::write(root.join("agents/a1/sessions/s1.log.jsonl"), "{}").unwrap();
-        // Non-indexed file should be skipped.
-        std::fs::create_dir_all(root.join("skills")).unwrap();
-        std::fs::write(root.join("skills/foo.md"), "x").unwrap();
-
-        let idx = WorkspaceIndex::open(&root).unwrap();
-        idx.rebuild_from_disk(&root);
-        assert!(idx.exists("memory/2024-01-01.md"));
-        assert!(idx.exists("agents/a1/sessions/s1.log.jsonl"));
-        assert!(!idx.exists("skills/foo.md"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
+                        let idx = WorkspaceIndex::open(&root).unwrap();
+                        idx.rebuild_from_disk(&root);
+                        assert!(idx.exists("memory/2024-01-01.md"));
+                        assert!(idx.exists("agents/a1/sessions/s1.log.jsonl"));
+                        assert!(!idx.exists("skills/foo.md"));
+                        let _ = std::fs::remove_dir_all(&root);
+                    }
+                }
                 rec(&p, out)?;
             } else if p.is_file() {
                 out.push(p);

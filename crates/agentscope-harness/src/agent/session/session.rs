@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::{Extensions, RuntimeContext, StreamOptions};
 use agentscope_core::event::AgentEvent;
-use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::message::{
+    ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock,
+};
 use agentscope_core::session::{
     apply_pending_event, outcome, pending_interactions, session_error, transcript, Command,
     ExecutionBaseline, Head, InboxSnapshot, RecorderBaseline, SessionEvent, SessionExecution,
@@ -176,8 +178,7 @@ impl ReceiptCache {
     async fn sync(&mut self, log: &dyn SessionLog, head: &Head) -> crate::Result<()> {
         // A rewritten or rolled-back head invalidates the fold: rebuild from the start.
         if head.seq < self.through
-            || (head.seq == self.through
-                && self.commit.as_deref() != head.commit_id.as_deref())
+            || (head.seq == self.through && self.commit.as_deref() != head.commit_id.as_deref())
         {
             *self = Self::default();
         }
@@ -209,10 +210,11 @@ impl ReceiptCache {
             }
         }
         if event.event_type == "inbox/started" {
-            let command_id = event
-                .data()
-                .ok()
-                .and_then(|data| data.get("commandId").and_then(|v| v.as_str()).map(str::to_string));
+            let command_id = event.data().ok().and_then(|data| {
+                data.get("commandId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
             if let Some(command_id) = command_id {
                 let fold = self.commands.entry(command_id).or_default();
                 fold.run = event.execution_run_id.clone();
@@ -552,11 +554,7 @@ impl AgentSession {
     }
 
     /// Answers one pending interaction.
-    pub async fn respond(
-        &self,
-        request_id: &str,
-        answer: SessionAnswer,
-    ) -> crate::Result<Task> {
+    pub async fn respond(&self, request_id: &str, answer: SessionAnswer) -> crate::Result<Task> {
         let mut answers = BTreeMap::new();
         answers.insert(request_id.to_string(), answer);
         self.respond_all(answers).await
@@ -605,13 +603,9 @@ impl AgentSession {
             };
             match kind.as_str() {
                 "external_execution" => {
-                    let result = answer
-                        .to_tool_result(&call.id, &call.name)
-                        .ok_or_else(|| {
-                            session_error(format!(
-                                "Answer type does not match interaction: {id}"
-                            ))
-                        })?;
+                    let result = answer.to_tool_result(&call.id, &call.name).ok_or_else(|| {
+                        session_error(format!("Answer type does not match interaction: {id}"))
+                    })?;
                     results.push(result);
                 }
                 "confirmation" => {
@@ -634,16 +628,9 @@ impl AgentSession {
 
         let mut messages: Vec<Msg> = Vec::new();
         if !results.is_empty() {
-            let blocks: Vec<ContentBlock> = results
-                .into_iter()
-                .map(ContentBlock::ToolResult)
-                .collect();
-            messages.push(
-                Msg::builder()
-                    .role(MsgRole::Tool)
-                    .content(blocks)
-                    .build(),
-            );
+            let blocks: Vec<ContentBlock> =
+                results.into_iter().map(ContentBlock::ToolResult).collect();
+            messages.push(Msg::builder().role(MsgRole::Tool).content(blocks).build());
         }
         if !confirmations.is_empty() {
             let mut msg = Msg::builder()
@@ -1196,8 +1183,8 @@ async fn launch(
         .session_key(context)
         .map(|key| key.session_id)
         .unwrap_or_default();
-    let exporter =
-        sink.map(|handle| Arc::new(handle.exporter_for_session(Arc::clone(log), session_id.clone())));
+    let exporter = sink
+        .map(|handle| Arc::new(handle.exporter_for_session(Arc::clone(log), session_id.clone())));
     // A long session pays for `SessionProjection::read` on every new turn: it hydrates every
     // state checkpoint and every request/prepared blob. When the live agent state still
     // matches the committed head, hand it to the recorder as a baseline instead. The
@@ -1358,7 +1345,11 @@ async fn launch(
     // would put every admitted message into the context twice.
     let mut working = restored.clone();
     for message in &inputs {
-        if !working.context.iter().any(|existing| existing.id == message.id) {
+        if !working
+            .context
+            .iter()
+            .any(|existing| existing.id == message.id)
+        {
             working.context.push(message.clone());
         }
     }
@@ -1408,11 +1399,8 @@ async fn launch(
     let react = agent.agent().cloned();
     let result: crate::Result<Option<Msg>> = match react {
         Some(react) => {
-            let mut stream = react.stream_events_with_extensions(
-                inputs,
-                StreamOptions::defaults(),
-                extensions,
-            );
+            let mut stream =
+                react.stream_events_with_extensions(inputs, StreamOptions::defaults(), extensions);
             let mut reply = None;
             let mut failure = None;
             // A run that never emits a terminal event (its task panicked, the stream was cut)
@@ -1509,7 +1497,10 @@ async fn launch(
 
     // A run that never started must not leave a phantom `queued` receipt forever.
     if let Err(error) = &result {
-        let started = SessionTurns::read(&**log).await?.started.contains(&command.id);
+        let started = SessionTurns::read(&**log)
+            .await?
+            .started
+            .contains(&command.id);
         if !started {
             inbox.reject(&command, &error.to_string()).await?;
         }
@@ -1518,8 +1509,7 @@ async fn launch(
     // terminal facts through the recovery path (which also settles unknown tool outcomes).
     // Without this the next prompt sees an open turn and is rejected as `turn_unfinished`.
     if finish.is_err() {
-        if let Err(error) =
-            agentscope_core::session::abandon_turn(Arc::clone(log), &turn_id).await
+        if let Err(error) = agentscope_core::session::abandon_turn(Arc::clone(log), &turn_id).await
         {
             tracing::warn!(
                 %error,
@@ -1961,7 +1951,10 @@ mod tests {
             "{\"commandId\":\"cmd-new\",\"kind\":\"submit\"}",
         )
         .unwrap();
-        let head = log.commit(&writer, "started-new", seq, &[started]).await.unwrap();
+        let head = log
+            .commit(&writer, "started-new", seq, &[started])
+            .await
+            .unwrap();
 
         let before = reads.load(Ordering::SeqCst);
         cache.sync(&log, &head).await.unwrap();

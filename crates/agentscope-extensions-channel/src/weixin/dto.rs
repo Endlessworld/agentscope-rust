@@ -124,10 +124,10 @@ impl WeixinLoginSession {
         let qrcode = qrcode.into();
         let polling_base_url = polling_base_url.into();
         if qrcode.trim().is_empty() || polling_base_url.trim().is_empty() {
-            return Err(WeixinError::operation(
-                "Weixin login session fields must not be blank",
-            )
-            .into_channel());
+            return Err(
+                WeixinError::operation("Weixin login session fields must not be blank")
+                    .into_channel(),
+            );
         }
         Ok(Self {
             qrcode,
@@ -188,7 +188,11 @@ impl WeixinLoginChallenge {
 
 impl std::fmt::Display for WeixinLoginChallenge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WeixinLoginChallenge[session={}, imageContent=***]", self.session)
+        write!(
+            f,
+            "WeixinLoginChallenge[session={}, imageContent=***]",
+            self.session
+        )
     }
 }
 
@@ -269,7 +273,9 @@ pub struct WeixinQrCodeResponse {
 pub fn required_field(field: &str, value: Option<&str>) -> Result<String> {
     match value.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => Ok(value.to_string()),
-        None => Err(WeixinError::operation(format!("iLink response missing {field}")).into_channel()),
+        None => {
+            Err(WeixinError::operation(format!("iLink response missing {field}")).into_channel())
+        }
     }
 }
 
@@ -363,7 +369,8 @@ mod tests {
         assert!(step("binded_redirect").already_connected());
         assert!(step("need_verifycode").requires_verification());
         let mut with_token = step("wait");
-        with_token.credentials = Some(super::super::credentials::WeixinCredentials::new("t").unwrap());
+        with_token.credentials =
+            Some(super::super::credentials::WeixinCredentials::new("t").unwrap());
         assert!(with_token.connected());
     }
 

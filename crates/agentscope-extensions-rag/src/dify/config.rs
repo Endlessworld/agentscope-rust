@@ -392,8 +392,16 @@ mod tests {
     fn builder_requires_api_key_and_dataset_id() {
         assert!(DifyRAGConfig::builder().build().is_err());
         assert!(DifyRAGConfig::builder().api_key("k").build().is_err());
-        assert!(DifyRAGConfig::builder().api_key("  ").dataset_id("d").build().is_err());
-        assert!(DifyRAGConfig::builder().api_key("k").dataset_id("").build().is_err());
+        assert!(DifyRAGConfig::builder()
+            .api_key("  ")
+            .dataset_id("d")
+            .build()
+            .is_err());
+        assert!(DifyRAGConfig::builder()
+            .api_key("k")
+            .dataset_id("")
+            .build()
+            .is_err());
     }
 
     #[test]
@@ -434,7 +442,10 @@ mod tests {
             .api_base_url("https://self.hosted/v1")
             .build()
             .unwrap();
-        assert_eq!(cfg.retrieve_url(), "https://self.hosted/v1/datasets/ds-1/retrieve");
+        assert_eq!(
+            cfg.retrieve_url(),
+            "https://self.hosted/v1/datasets/ds-1/retrieve"
+        );
     }
 
     #[test]

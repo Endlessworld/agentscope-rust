@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
+use async_trait::async_trait;
 
 use super::background::BackgroundTask;
 use super::delivery::TaskDelivery;
@@ -65,7 +65,11 @@ pub trait TaskRepository: Send + Sync {
     // ---------------------------------------------------------------------
 
     /// Returns terminal-state tasks whose completions have not yet been pushed back.
-    async fn find_pending_deliveries(&self, ctx: &RuntimeContext, _session_id: &str) -> Vec<TaskDelivery> {
+    async fn find_pending_deliveries(
+        &self,
+        ctx: &RuntimeContext,
+        _session_id: &str,
+    ) -> Vec<TaskDelivery> {
         let _ = ctx;
         Vec::new()
     }

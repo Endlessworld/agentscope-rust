@@ -118,7 +118,10 @@ async fn same_id_committed_twice_keeps_one_latest_record() {
 
     let projection = SessionProjection::read(&*log).await.expect("projection");
     assert_eq!(projection.verifications.len(), 1, "deduplicated by id");
-    assert_eq!(projection.verifications[0].outcome, VerificationOutcome::Passed);
+    assert_eq!(
+        projection.verifications[0].outcome,
+        VerificationOutcome::Passed
+    );
     assert_eq!(projection.verifications[0], second);
 }
 
@@ -142,7 +145,10 @@ async fn checkpoint_clears_verifications_recorded_before_it() {
     let projection = SessionProjection::read(&*log).await.expect("projection");
     assert_eq!(projection.verifications.len(), 1);
     assert_eq!(projection.verifications[0].id, "ver-new");
-    assert_eq!(projection.restore().expect("restore").unwrap().summary, "first");
+    assert_eq!(
+        projection.restore().expect("restore").unwrap().summary,
+        "first"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -158,7 +164,11 @@ async fn malformed_verification_payload_fails_the_projection() {
         &*log,
         &writer,
         "b1",
-        &[event(1, "verification/result", json!({ "verification": value }))],
+        &[event(
+            1,
+            "verification/result",
+            json!({ "verification": value }),
+        )],
     )
     .await;
 
@@ -177,7 +187,11 @@ async fn verification_event_without_a_payload_is_skipped() {
         &*log,
         &writer,
         "b1",
-        &[event(1, "verification/result", json!({ "criterion": "unused" }))],
+        &[event(
+            1,
+            "verification/result",
+            json!({ "criterion": "unused" }),
+        )],
     )
     .await;
 
@@ -240,7 +254,10 @@ fn at_the_limit_reason_and_id_are_accepted() {
 fn negative_contract_version_is_rejected() {
     let error = EvidenceBinding::new("task-1", -1, "workspace@v7")
         .expect_err("negative contract version must be rejected");
-    assert!(error.to_string().contains("Negative contract version"), "{error}");
+    assert!(
+        error.to_string().contains("Negative contract version"),
+        "{error}"
+    );
 }
 
 #[test]

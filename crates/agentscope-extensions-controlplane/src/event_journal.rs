@@ -43,8 +43,9 @@ impl EventJournal {
         } else {
             PathBuf::from(&config.event_journal_dir)
         };
-        std::fs::create_dir_all(&root)
-            .map_err(|e| ControlPlaneError::Config(format!("create journal dir {:?}: {e}", root)))?;
+        std::fs::create_dir_all(&root).map_err(|e| {
+            ControlPlaneError::Config(format!("create journal dir {:?}: {e}", root))
+        })?;
         let identity = format!(
             "{}\u{0}{}\u{0}{}\u{0}{}",
             config.tenant, config.namespace, config.agent_key, config.instance_key
@@ -91,7 +92,8 @@ impl EventJournal {
 
     /// Appends an event: length-prefixed JSON, fsync'd, then tracked as pending.
     pub fn append(&mut self, event: SessionEvent) -> ControlPlaneResult<()> {
-        let payload = serde_json::to_vec(&event).map_err(|e| ControlPlaneError::Http(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(&event).map_err(|e| ControlPlaneError::Http(e.to_string()))?;
         if payload.len() > MAX_RECORD_BYTES {
             return Err(ControlPlaneError::Config(format!(
                 "event record exceeds {MAX_RECORD_BYTES} bytes"
@@ -111,7 +113,8 @@ impl EventJournal {
             .map_err(|e| ControlPlaneError::Http(format!("fsync journal: {e}")))?;
         let mut checkpoint_dirty = false;
         if event.seq > 0 {
-            self.latest_sequences.insert(event.session_id.clone(), event.seq);
+            self.latest_sequences
+                .insert(event.session_id.clone(), event.seq);
             checkpoint_dirty = true;
         }
         if track_source(&event, &mut self.source_watermarks) {
@@ -160,7 +163,8 @@ impl EventJournal {
                 if cursor + len > bytes.len() || len > MAX_RECORD_BYTES {
                     break;
                 }
-                if let Ok(ev) = serde_json::from_slice::<SessionEvent>(&bytes[cursor..cursor + len]) {
+                if let Ok(ev) = serde_json::from_slice::<SessionEvent>(&bytes[cursor..cursor + len])
+                {
                     if ev.seq > 0 {
                         self.latest_sequences.insert(ev.session_id.clone(), ev.seq);
                     }
@@ -234,7 +238,10 @@ fn default_journal_dir() -> PathBuf {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentscope").join("service-controlplane").join("event-journal")
+    PathBuf::from(home)
+        .join(".agentscope")
+        .join("service-controlplane")
+        .join("event-journal")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -261,11 +268,14 @@ mod tests {
 
     #[test]
     fn append_and_reload_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("controlplane-journal-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("controlplane-journal-{}", uuid::Uuid::new_v4()));
         let cfg = temp_config(dir.to_str().unwrap());
         {
             let mut j = EventJournal::new(&cfg).unwrap();
-            let mut ev = SessionEvent::builder("s1", TYPE_MESSAGE).content("hi").build();
+            let mut ev = SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("hi")
+                .build();
             ev.set_seq(7);
             j.append(ev).unwrap();
             assert_eq!(j.pending_len(), 1);
@@ -281,11 +291,16 @@ mod tests {
 
     #[test]
     fn ack_all_clears_pending() {
-        let dir = std::env::temp_dir().join(format!("controlplane-journal-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("controlplane-journal-{}", uuid::Uuid::new_v4()));
         let cfg = temp_config(dir.to_str().unwrap());
         let mut j = EventJournal::new(&cfg).unwrap();
-        j.append(SessionEvent::builder("s1", TYPE_MESSAGE).content("a").build())
-            .unwrap();
+        j.append(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("a")
+                .build(),
+        )
+        .unwrap();
         j.ack_all();
         assert_eq!(j.pending_len(), 0);
         let _ = std::fs::remove_dir_all(&dir);

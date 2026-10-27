@@ -64,7 +64,10 @@ impl std::fmt::Debug for JdbcDialectBuilder {
             .field("session_state_table_name", &self.session_state_table_name)
             .field("snapshot_table_name", &self.snapshot_table_name)
             .field("skill_table_name", &self.skill_table_name)
-            .field("skill_resources_table_name", &self.skill_resources_table_name)
+            .field(
+                "skill_resources_table_name",
+                &self.skill_resources_table_name,
+            )
             .field("auto_create_table", &self.auto_create_table)
             .finish()
     }

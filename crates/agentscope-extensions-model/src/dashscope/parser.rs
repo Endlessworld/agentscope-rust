@@ -20,7 +20,11 @@ fn synthetic_id(prefix: &str, index: usize) -> String {
 
 /// Extracts text from a `DashScopeMessage` (string content or joined text parts).
 fn message_text(message: &DashScopeMessage) -> Option<String> {
-    message.content.as_ref().map(|c| c.text_joined()).filter(|s| !s.is_empty())
+    message
+        .content
+        .as_ref()
+        .map(|c| c.text_joined())
+        .filter(|s| !s.is_empty())
 }
 
 /// Appends tool-use blocks derived from `message.tool_calls`.
@@ -72,9 +76,10 @@ fn add_tool_calls(message: &DashScopeMessage, blocks: &mut Vec<ContentBlock>) {
 fn merge_tool_block(calls: &mut Vec<ToolUseBlock>, block: ToolUseBlock) {
     let is_fragment = block.name == FRAGMENT_PLACEHOLDER;
     let target = if is_fragment {
-        calls.iter_mut().rev().find(|c| {
-            c.name != FRAGMENT_PLACEHOLDER && (block.id.is_empty() || c.id == block.id)
-        })
+        calls
+            .iter_mut()
+            .rev()
+            .find(|c| c.name != FRAGMENT_PLACEHOLDER && (block.id.is_empty() || c.id == block.id))
     } else {
         calls.iter_mut().find(|c| c.id == block.id)
     };
@@ -116,7 +121,9 @@ pub fn parse_response(response: &DashScopeResponse) -> ChatResponse {
             if let Some(message) = &choice.message {
                 if let Some(reasoning) = &message.reasoning_content {
                     if !reasoning.is_empty() {
-                        blocks.push(ContentBlock::Thinking(ThinkingBlock::new(reasoning.clone())));
+                        blocks.push(ContentBlock::Thinking(ThinkingBlock::new(
+                            reasoning.clone(),
+                        )));
                     }
                 }
                 if let Some(text) = message_text(message) {
@@ -165,10 +172,7 @@ impl DashScopeStreamIncrementer {
     /// thinking content.
     pub fn accumulate(&mut self, response: &DashScopeResponse) -> Option<ChatResponse> {
         if self.id.is_none() {
-            self.id = response
-                .request_id
-                .clone()
-                .filter(|s| !s.trim().is_empty());
+            self.id = response.request_id.clone().filter(|s| !s.trim().is_empty());
         }
         if response.usage.is_some() {
             let incoming = usage_of(response);
@@ -269,7 +273,9 @@ mod tests {
         }));
         let parsed = parse_response(&response);
         assert_eq!(parsed.id, "req-1");
-        assert!(matches!(&parsed.content[0], ContentBlock::Thinking(t) if t.thinking == "let me think"));
+        assert!(
+            matches!(&parsed.content[0], ContentBlock::Thinking(t) if t.thinking == "let me think")
+        );
         assert!(matches!(&parsed.content[1], ContentBlock::Text(t) if t.text == "Hello!"));
         assert_eq!(parsed.usage.input_tokens, 7);
         assert_eq!(parsed.usage.output_tokens, 3);
@@ -314,7 +320,10 @@ mod tests {
                 "choices": [{ "message": { "content": "x" } }]
             }
         }));
-        assert_eq!(parse_response(&response).finish_reason.as_deref(), Some("length"));
+        assert_eq!(
+            parse_response(&response).finish_reason.as_deref(),
+            Some("length")
+        );
     }
 
     #[test]
@@ -330,7 +339,9 @@ mod tests {
             }
         }));
         let parsed = parse_response(&response);
-        assert!(matches!(&parsed.content[0], ContentBlock::Text(t) if t.text == "part one\npart two"));
+        assert!(
+            matches!(&parsed.content[0], ContentBlock::Text(t) if t.text == "part one\npart two")
+        );
     }
 
     #[test]
@@ -363,8 +374,12 @@ mod tests {
             "usage": { "input_tokens": 1, "output_tokens": 2 }
         }));
 
-        assert!(matches!(&inc.accumulate(&a).unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&inc.accumulate(&a).unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         assert!(inc.accumulate(&c).is_none());
 
         let final_response = inc.into_final().unwrap();
@@ -412,7 +427,11 @@ mod tests {
         match &parsed.content[0] {
             ContentBlock::ToolUse(t) => {
                 assert_eq!(t.name, FRAGMENT_PLACEHOLDER);
-                assert!(t.id.is_empty(), "fragment id must stay empty, got {:?}", t.id);
+                assert!(
+                    t.id.is_empty(),
+                    "fragment id must stay empty, got {:?}",
+                    t.id
+                );
             }
             other => panic!("expected tool use, got {other:?}"),
         }
@@ -458,7 +477,11 @@ mod tests {
         assert!(inc.accumulate(&c3).is_none());
 
         let final_response = inc.into_final().unwrap();
-        assert_eq!(final_response.content.len(), 1, "one merged tool call expected");
+        assert_eq!(
+            final_response.content.len(),
+            1,
+            "one merged tool call expected"
+        );
         match &final_response.content[0] {
             ContentBlock::ToolUse(t) => {
                 assert_eq!(t.id, "call_abc");

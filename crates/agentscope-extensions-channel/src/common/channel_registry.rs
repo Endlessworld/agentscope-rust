@@ -142,10 +142,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use agentscope_core::error::Result as CoreResult;
     use agentscope_core::message::Msg;
     use agentscope_harness::agent::{ChannelConfig, InboundMessage, OutboundAddress};
+    use async_trait::async_trait;
 
     /// Minimal `Channel + ChannelSink` double so the registry can be tested without a platform.
     #[derive(Debug)]
@@ -195,8 +195,12 @@ mod tests {
         assert!(registry.is_empty());
         assert!(registry.get("feishu").is_none());
 
-        registry.register(Arc::new(StubChannel::new("feishu"))).await;
-        registry.register(Arc::new(StubChannel::new("github"))).await;
+        registry
+            .register(Arc::new(StubChannel::new("feishu")))
+            .await;
+        registry
+            .register(Arc::new(StubChannel::new("github")))
+            .await;
         assert_eq!(registry.len(), 2);
         assert_eq!(registry.channel_ids(), vec!["feishu", "github"]);
         assert!(registry.get("feishu").is_some());
@@ -220,9 +224,10 @@ mod tests {
     #[tokio::test]
     async fn mirrors_registration_into_the_harness_channel_manager() {
         let manager = Arc::new(ChannelManager::new());
-        let registry: ChannelRegistry<StubChannel> =
-            ChannelRegistry::with_manager(manager.clone());
-        registry.register(Arc::new(StubChannel::new("gitlab"))).await;
+        let registry: ChannelRegistry<StubChannel> = ChannelRegistry::with_manager(manager.clone());
+        registry
+            .register(Arc::new(StubChannel::new("gitlab")))
+            .await;
 
         // The harness manager now owns the outbound sink for this channel id.
         assert_eq!(manager.channel_ids().await, vec!["gitlab".to_string()]);

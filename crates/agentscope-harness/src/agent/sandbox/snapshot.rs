@@ -41,7 +41,9 @@ pub trait SandboxSnapshot: Send + Sync + std::fmt::Debug {
 /// Validates a snapshot id is a safe single path segment.
 fn validate_snapshot_id(id: &str) -> Result<()> {
     if id.trim().is_empty() {
-        return Err(Error::Tool("Snapshot id must not be null or blank".to_string()));
+        return Err(Error::Tool(
+            "Snapshot id must not be null or blank".to_string(),
+        ));
     }
     if id.contains('/') || id.contains('\\') || id.contains("..") || id.contains('\0') {
         return Err(Error::Tool(format!(
@@ -66,7 +68,10 @@ impl LocalSandboxSnapshot {
     pub fn new(base_path: impl Into<String>, id: impl Into<String>) -> Result<Self> {
         let id = id.into();
         validate_snapshot_id(&id)?;
-        Ok(Self { base_path: base_path.into(), id })
+        Ok(Self {
+            base_path: base_path.into(),
+            id,
+        })
     }
 
     pub fn base_path(&self) -> &str {
@@ -146,13 +151,19 @@ pub struct RemoteSandboxSnapshot {
 
 impl RemoteSandboxSnapshot {
     pub fn new(client: Arc<dyn RemoteSnapshotClient>, id: impl Into<String>) -> Self {
-        Self { client: Some(client), id: id.into() }
+        Self {
+            client: Some(client),
+            id: id.into(),
+        }
     }
 
     /// Creates a snapshot bound to an id only; the client must be re-injected at
     /// resume time (mirrors Java's JSON round-trip where the client is `@JsonIgnore`).
     pub fn with_id(id: impl Into<String>) -> Self {
-        Self { client: None, id: id.into() }
+        Self {
+            client: None,
+            id: id.into(),
+        }
     }
 
     pub fn id_value(&self) -> &str {
@@ -254,7 +265,9 @@ pub struct LocalSnapshotSpec {
 
 impl LocalSnapshotSpec {
     pub fn new(base_path: impl Into<String>) -> Self {
-        Self { base_path: base_path.into() }
+        Self {
+            base_path: base_path.into(),
+        }
     }
 
     pub fn base_path(&self) -> &str {
@@ -264,7 +277,10 @@ impl LocalSnapshotSpec {
 
 impl SandboxSnapshotSpec for LocalSnapshotSpec {
     fn build(&self, snapshot_id: &str) -> Result<Arc<dyn SandboxSnapshot>> {
-        Ok(Arc::new(LocalSandboxSnapshot::new(&self.base_path, snapshot_id)?))
+        Ok(Arc::new(LocalSandboxSnapshot::new(
+            &self.base_path,
+            snapshot_id,
+        )?))
     }
 }
 
@@ -288,7 +304,10 @@ impl RemoteSnapshotSpec {
 impl SandboxSnapshotSpec for RemoteSnapshotSpec {
     fn build(&self, snapshot_id: &str) -> Result<Arc<dyn SandboxSnapshot>> {
         validate_snapshot_id(snapshot_id)?;
-        Ok(Arc::new(RemoteSandboxSnapshot::new(self.client.clone(), snapshot_id)))
+        Ok(Arc::new(RemoteSandboxSnapshot::new(
+            self.client.clone(),
+            snapshot_id,
+        )))
     }
 }
 
@@ -315,7 +334,8 @@ mod tests {
     use std::sync::Mutex;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("harness-snapshot-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("harness-snapshot-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -379,7 +399,10 @@ mod tests {
     #[async_trait::async_trait]
     impl RemoteSnapshotClient for MockRemote {
         async fn upload(&self, id: &str, data: &[u8]) -> Result<()> {
-            self.blobs.lock().unwrap().insert(id.to_string(), data.to_vec());
+            self.blobs
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), data.to_vec());
             Ok(())
         }
         async fn download(&self, id: &str) -> Result<Vec<u8>> {
@@ -397,7 +420,9 @@ mod tests {
 
     #[tokio::test]
     async fn remote_snapshot_delegates_to_client() {
-        let client = Arc::new(MockRemote { blobs: Mutex::new(HashMap::new()) });
+        let client = Arc::new(MockRemote {
+            blobs: Mutex::new(HashMap::new()),
+        });
         let spec = RemoteSnapshotSpec::new(client);
         let snap = spec.build("s1").unwrap();
         assert_eq!(snap.snapshot_type(), "remote");

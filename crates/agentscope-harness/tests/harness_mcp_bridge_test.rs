@@ -39,10 +39,7 @@ async fn bridge_mcp_server_tool_and_call() {
     }
 
     let manager = Arc::new(McpClientManager::new());
-    let config = McpServerConfig::new("echo-server").command(format!(
-        "node {}",
-        script.display()
-    ));
+    let config = McpServerConfig::new("echo-server").command(format!("node {}", script.display()));
 
     // Connect and discover tools.
     let client_id = manager.create_client(config).await.expect("create client");
@@ -58,10 +55,7 @@ async fn bridge_mcp_server_tool_and_call() {
     // Invoke the tool with a message argument.
     let args = serde_json::json!({ "message": "hello from agentscope" });
     let result = tool
-        .call(
-            args.as_object().unwrap().clone(),
-            Default::default(),
-        )
+        .call(args.as_object().unwrap().clone(), Default::default())
         .await
         .expect("tool call");
 
@@ -70,7 +64,9 @@ async fn bridge_mcp_server_tool_and_call() {
         .output
         .iter()
         .filter_map(|b| match b {
-            agentscope_core::message::ContentBlock::Text(TextBlock { text, .. }) => Some(text.clone()),
+            agentscope_core::message::ContentBlock::Text(TextBlock { text, .. }) => {
+                Some(text.clone())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()

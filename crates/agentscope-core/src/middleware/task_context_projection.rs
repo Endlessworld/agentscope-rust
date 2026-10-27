@@ -91,7 +91,11 @@ pub fn project(
             }
             position += 1;
         }
-        messages.push(if changed { message.with_content(blocks) } else { message });
+        messages.push(if changed {
+            message.with_content(blocks)
+        } else {
+            message
+        });
     }
 
     let render_scope_section = requirements || verification_results;
@@ -145,7 +149,10 @@ pub fn project(
 /// Whether the block is a receipt of the session task context.
 fn tracked(result: &ToolResultBlock) -> bool {
     result.name.as_deref() == Some("todo_write")
-        && result.metadata.get(METADATA_STATE_KEY).and_then(|v| v.as_str())
+        && result
+            .metadata
+            .get(METADATA_STATE_KEY)
+            .and_then(|v| v.as_str())
             == Some(STATE_KEY_TASKS_CONTEXT)
 }
 
@@ -307,7 +314,10 @@ mod tests {
     use serde_json::json;
 
     fn task(subject: &str) -> Task {
-        Task::builder().subject(subject).description(subject).build()
+        Task::builder()
+            .subject(subject)
+            .description(subject)
+            .build()
     }
 
     fn receipt(tool_call_id: &str, revision: u64, rendered: &str) -> ToolResultBlock {
@@ -358,11 +368,7 @@ mod tests {
 
         let input = vec![
             Msg::user("plan"),
-            Msg::tool_blocks(vec![receipt(
-                "t1",
-                1,
-                "1 open todo(s):\n- [ ] step two",
-            )]),
+            Msg::tool_blocks(vec![receipt("t1", 1, "1 open todo(s):\n- [ ] step two")]),
             Msg::tool_blocks(vec![receipt("t2", state.revision(), &rendered)]),
         ];
         let out = project_all(input, &state);
@@ -371,7 +377,10 @@ mod tests {
         let stale = tool_results(&out[1]);
         assert_eq!(stale.len(), 1);
         assert_eq!(
-            stale[0].metadata.get(METADATA_REPRESENTATION).and_then(|v| v.as_str()),
+            stale[0]
+                .metadata
+                .get(METADATA_REPRESENTATION)
+                .and_then(|v| v.as_str()),
             Some(REPRESENTATION_RECEIPT)
         );
         assert_eq!(
@@ -383,7 +392,10 @@ mod tests {
 
         let live = tool_results(&out[2]);
         assert_eq!(
-            live[0].metadata.get(METADATA_REPRESENTATION).and_then(|v| v.as_str()),
+            live[0]
+                .metadata
+                .get(METADATA_REPRESENTATION)
+                .and_then(|v| v.as_str()),
             Some(REPRESENTATION_FULL)
         );
         assert_eq!(live[0].text_content(), rendered);
@@ -508,7 +520,10 @@ mod tests {
     fn evidence_from_another_subject_renders_as_stale() {
         let mut state = TaskContextState::new();
         state
-            .begin_task(TaskScope::new("task-1", "ship it", "user message 1").unwrap(), 0)
+            .begin_task(
+                TaskScope::new("task-1", "ship it", "user message 1").unwrap(),
+                0,
+            )
             .unwrap();
         let revision = state.revision();
         state.set_subject_version("v1", revision).unwrap();
@@ -582,7 +597,9 @@ mod tests {
         ];
         let out = project_all(input, &state);
         assert_eq!(out.len(), 1);
-        assert!(out.iter().all(|message| message.id() != TASK_STATE_MESSAGE_ID));
+        assert!(out
+            .iter()
+            .all(|message| message.id() != TASK_STATE_MESSAGE_ID));
         assert_eq!(tool_results(&out[0]).len(), 1);
     }
 

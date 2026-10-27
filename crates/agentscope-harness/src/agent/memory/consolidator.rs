@@ -50,7 +50,6 @@ Output the COMPLETE new MEMORY.md content (not just a diff). Use markdown.";
 /// Workspace-relative path to the consolidation watermark state file.
 pub const STATE_REL_PATH: &str = "memory/.consolidation_state";
 
-
 /// Consolidates daily memory ledgers into the curated `MEMORY.md` via an LLM.
 pub struct MemoryConsolidator {
     fs: Arc<dyn Filesystem>,
@@ -101,7 +100,11 @@ impl MemoryConsolidator {
         let mut user_content = String::new();
         user_content.push_str(&format!(
             "Current MEMORY.md:\n{}\n\nNew daily ledger entries to merge:\n{daily_entries}",
-            if current_memory.trim().is_empty() { "(empty)" } else { &current_memory }
+            if current_memory.trim().is_empty() {
+                "(empty)"
+            } else {
+                &current_memory
+            }
         ));
 
         let input = vec![
@@ -125,7 +128,11 @@ impl MemoryConsolidator {
     }
 
     /// Reads daily memory files in `memory/`, excluding the state file and directories.
-    async fn read_daily_entries(&self, ctx: &RuntimeContext, watermark: chrono::DateTime<chrono::Utc>) -> String {
+    async fn read_daily_entries(
+        &self,
+        ctx: &RuntimeContext,
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> String {
         let mut eligible: Vec<FileInfo> = match self.fs.ls(ctx, "memory").await {
             Ok(files) => files
                 .into_iter()
@@ -146,7 +153,11 @@ impl MemoryConsolidator {
             let rel = to_relative(&fi.path);
             let content = fileio::read_text(&self.fs, ctx, &rel).await;
             if !content.trim().is_empty() {
-                sb.push_str(&format!("### {}\n{}\n\n", file_name(&fi.path), content.trim()));
+                sb.push_str(&format!(
+                    "### {}\n{}\n\n",
+                    file_name(&fi.path),
+                    content.trim()
+                ));
             }
         }
         sb
@@ -155,7 +166,9 @@ impl MemoryConsolidator {
     async fn collect_text(&self, messages: Vec<Msg>) -> String {
         use futures::StreamExt;
         let mut out = String::new();
-        let mut stream = self.model.stream(messages, Vec::new(), GenerateOptions::default());
+        let mut stream = self
+            .model
+            .stream(messages, Vec::new(), GenerateOptions::default());
         while let Some(resp) = stream.next().await {
             if let Ok(r) = resp {
                 for block in &r.content {
@@ -218,11 +231,11 @@ fn to_relative(path: &str) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use agentscope_core::message::{ChatUsage, TextBlock};
+    use agentscope_core::model::{ChatResponse, ToolSchema};
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
-    use agentscope_core::message::{ChatUsage, TextBlock};
-    use agentscope_core::model::{ChatResponse, ToolSchema};
 
     use crate::filesystem::LocalFilesystem;
 
@@ -271,10 +284,13 @@ mod tests {
         let fs = temp_fs("merge");
         let ctx = RuntimeContext::new();
         // Seed a daily ledger file.
-        fileio::write_overwrite(&fs, &ctx, "memory/2025-01-01.md", "- team uses Rust\n").await.unwrap();
+        fileio::write_overwrite(&fs, &ctx, "memory/2025-01-01.md", "- team uses Rust\n")
+            .await
+            .unwrap();
 
-        let model: Arc<dyn Model> =
-            Arc::new(FakeModel { text: "# Long-term memory\n\n- We use Rust everywhere.\n".into() });
+        let model: Arc<dyn Model> = Arc::new(FakeModel {
+            text: "# Long-term memory\n\n- We use Rust everywhere.\n".into(),
+        });
         let consolidator = MemoryConsolidator::new(fs.clone(), model);
         consolidator.consolidate(&ctx).await.unwrap();
 
@@ -289,7 +305,9 @@ mod tests {
     async fn consolidate_is_noop_without_daily_entries() {
         let fs = temp_fs("noop");
         let ctx = RuntimeContext::new();
-        let model: Arc<dyn Model> = Arc::new(FakeModel { text: "# memory\n".into() });
+        let model: Arc<dyn Model> = Arc::new(FakeModel {
+            text: "# memory\n".into(),
+        });
         let consolidator = MemoryConsolidator::new(fs.clone(), model);
         consolidator.consolidate(&ctx).await.unwrap();
         let memory = fileio::read_text(&fs, &ctx, "MEMORY.md").await;

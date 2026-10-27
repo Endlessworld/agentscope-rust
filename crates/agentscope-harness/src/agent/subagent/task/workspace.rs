@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -178,7 +178,10 @@ impl WorkspaceTaskRepository {
         let interval = Duration::from_secs(SWEEP_INTERVAL_MINUTES * 60);
         let key = format!("task-sweep:{}", self.state.parent_agent_id);
         if !self.sweep_gate.try_claim(&key, interval) {
-            tracing::debug!("Skipping orphan sweep for {} — periodic gate denied claim", key);
+            tracing::debug!(
+                "Skipping orphan sweep for {} — periodic gate denied claim",
+                key
+            );
             return;
         }
         self.sweep_orphaned_tasks_with(
@@ -222,8 +225,10 @@ impl WorkspaceTaskRepository {
             let orphan_timeout = Duration::from_secs(ORPHAN_TIMEOUT_MINUTES * 60);
             // Jitter the first sweep across the interval to spread load when several nodes
             // start simultaneously.
-            tokio::time::sleep(Duration::from_millis(now_millis() % interval.as_millis() as u64))
-                .await;
+            tokio::time::sleep(Duration::from_millis(
+                now_millis() % interval.as_millis() as u64,
+            ))
+            .await;
             loop {
                 let key = format!("task-sweep:{}", sweeper_state.parent_agent_id);
                 if gate.try_claim(&key, interval) {
@@ -250,7 +255,10 @@ impl WorkspaceTaskRepository {
     fn synthetic_from_record(&self, rec: &TaskRecord) -> Arc<BackgroundTask> {
         let result = match rec.status {
             TaskStatus::Completed => Ok(rec.result.clone().unwrap_or_default()),
-            _ => Err(rec.error_message.clone().unwrap_or_else(|| rec.status.as_str().to_string())),
+            _ => Err(rec
+                .error_message
+                .clone()
+                .unwrap_or_else(|| rec.status.as_str().to_string())),
         };
         BackgroundTask::from_result(rec.task_id.clone(), rec.sub_agent_id.clone(), result)
     }
@@ -284,9 +292,17 @@ impl TaskRepository for WorkspaceTaskRepository {
         session_id: &str,
         spec: TaskRunSpec,
     ) -> Arc<BackgroundTask> {
-        let mut record = TaskRecord::new(task_id, sub_agent_id, &self.state.parent_agent_id, session_id);
+        let mut record = TaskRecord::new(
+            task_id,
+            sub_agent_id,
+            &self.state.parent_agent_id,
+            session_id,
+        );
         record.status = TaskStatus::Pending;
-        if let TaskRunSpec::Remote { base_url, headers, .. } = &spec {
+        if let TaskRunSpec::Remote {
+            base_url, headers, ..
+        } = &spec
+        {
             record.transport_type = Some(TRANSPORT_AGENT_PROTOCOL.to_string());
             record.remote_base_url = Some(base_url.clone());
             if !headers.is_empty() {
@@ -310,8 +326,14 @@ impl TaskRepository for WorkspaceTaskRepository {
         let handle = tokio::task::spawn(async move {
             let session_id = session_for_task;
             update_record_status(
-                state.fs.as_ref(), &task_ctx, &state.parent_agent_id, &session_id, &task_id,
-                TaskStatus::Running, None, None,
+                state.fs.as_ref(),
+                &task_ctx,
+                &state.parent_agent_id,
+                &session_id,
+                &task_id,
+                TaskStatus::Running,
+                None,
+                None,
             )
             .await;
 
@@ -324,7 +346,13 @@ impl TaskRepository for WorkspaceTaskRepository {
                         Err(je) => Err(format!("task execution panicked: {je}")),
                     }
                 }
-                TaskRunSpec::Remote { base_url, headers, agent_id, input, context } => {
+                TaskRunSpec::Remote {
+                    base_url,
+                    headers,
+                    agent_id,
+                    input,
+                    context,
+                } => {
                     run_remote_task(
                         &state,
                         transport.as_ref(),
@@ -349,8 +377,14 @@ impl TaskRepository for WorkspaceTaskRepository {
             let terminal = match &outcome {
                 Ok(r) => {
                     update_record_status(
-                        state.fs.as_ref(), &task_ctx, &state.parent_agent_id, &session_id, &task_id,
-                        TaskStatus::Completed, Some(r.clone()), None,
+                        state.fs.as_ref(),
+                        &task_ctx,
+                        &state.parent_agent_id,
+                        &session_id,
+                        &task_id,
+                        TaskStatus::Completed,
+                        Some(r.clone()),
+                        None,
                     )
                     .await;
                     Some(Some(r.clone()))
@@ -360,8 +394,14 @@ impl TaskRepository for WorkspaceTaskRepository {
                 Err(e) if e.as_str() == CANCELLED_SENTINEL => None,
                 Err(e) => {
                     update_record_status(
-                        state.fs.as_ref(), &task_ctx, &state.parent_agent_id, &session_id, &task_id,
-                        TaskStatus::Failed, None, Some(e.clone()),
+                        state.fs.as_ref(),
+                        &task_ctx,
+                        &state.parent_agent_id,
+                        &session_id,
+                        &task_id,
+                        TaskStatus::Failed,
+                        None,
+                        Some(e.clone()),
                     )
                     .await;
                     Some(None)
@@ -374,7 +414,11 @@ impl TaskRepository for WorkspaceTaskRepository {
         });
         bg.attach_handle(handle);
 
-        self.state.local_tasks.lock().unwrap().insert(local_key.clone(), bg.clone());
+        self.state
+            .local_tasks
+            .lock()
+            .unwrap()
+            .insert(local_key.clone(), bg.clone());
         self.state
             .local_contexts
             .lock()
@@ -491,7 +535,11 @@ impl TaskRepository for WorkspaceTaskRepository {
         found_local
     }
 
-    async fn find_pending_deliveries(&self, ctx: &RuntimeContext, session_id: &str) -> Vec<TaskDelivery> {
+    async fn find_pending_deliveries(
+        &self,
+        ctx: &RuntimeContext,
+        session_id: &str,
+    ) -> Vec<TaskDelivery> {
         let path = self.tasks_path(session_id);
         let map = read_records(self.state.fs.as_ref(), ctx, &path).await;
         let mut deliveries: Vec<TaskDelivery> = map
@@ -928,14 +976,20 @@ async fn run_remote_task(
     input: &str,
     context: Option<RemoteSubmitContext>,
 ) -> Result<String, String> {
-    let target = RemoteTarget { base_url: base_url.to_string(), headers: headers.clone() };
+    let target = RemoteTarget {
+        base_url: base_url.to_string(),
+        headers: headers.clone(),
+    };
 
     if task_cancelled(state, ctx, session_id, task_id).await {
         return Err(CANCELLED_SENTINEL.to_string());
     }
 
     let owned = context.unwrap_or_default();
-    if let Err(e) = transport.submit(&target, task_id, agent_id, input, Some(&owned)).await {
+    if let Err(e) = transport
+        .submit(&target, task_id, agent_id, input, Some(&owned))
+        .await
+    {
         return Err(e.to_string());
     }
     update_record_status(
@@ -974,7 +1028,10 @@ async fn poll_remote_until_done(
             return Err(CANCELLED_SENTINEL.to_string());
         }
 
-        let status = transport.get_status(target, task_id).await.map_err(|e| e.to_string())?;
+        let status = transport
+            .get_status(target, task_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
         if status.is_awaiting_confirm() {
             was_awaiting_confirm = true;
@@ -1014,7 +1071,9 @@ async fn poll_remote_until_done(
             return Ok(result);
         }
         if status.is_terminal_failure() {
-            let err = status.error.unwrap_or_else(|| "remote task error".to_string());
+            let err = status
+                .error
+                .unwrap_or_else(|| "remote task error".to_string());
             update_record_status(
                 state.fs.as_ref(),
                 ctx,
@@ -1199,10 +1258,7 @@ async fn sweep_once(state: &RepoState, orphan_timeout: Duration, sweep_time_ms: 
 ///
 /// The Rust repository keeps one file per session with no cross-session index, so the sweeper
 /// resolves the set via a glob over `agents/<parentAgentId>/tasks/*.json`.
-async fn read_all_records(
-    state: &RepoState,
-    ctx: &RuntimeContext,
-) -> BTreeMap<String, TaskRecord> {
+async fn read_all_records(state: &RepoState, ctx: &RuntimeContext) -> BTreeMap<String, TaskRecord> {
     let dir = format!("agents/{}/tasks", state.parent_agent_id);
     let Ok(files) = state.fs.glob(ctx, "*.json", &dir).await else {
         return BTreeMap::new();
@@ -1219,7 +1275,6 @@ async fn read_all_records(
     out
 }
 
-
 /// Fires the completion callback, honouring the [`SUPPRESS_COMPLETION_CALLBACK`] runtime flag set
 /// by callers that retain execution ownership and collect results themselves.
 fn fire_callback(
@@ -1229,7 +1284,12 @@ fn fire_callback(
     session_id: String,
     result: Option<String>,
 ) {
-    if ctx.metadata.get(SUPPRESS_COMPLETION_CALLBACK).and_then(|v| v.as_bool()) == Some(true) {
+    if ctx
+        .metadata
+        .get(SUPPRESS_COMPLETION_CALLBACK)
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         return;
     }
     if let Some(cb) = cb {
@@ -1239,10 +1299,10 @@ fn fire_callback(
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol_client::RemoteTaskStatus;
     use super::*;
     use crate::agent::subagent::protocol::RemoteConfirmDecision;
     use crate::filesystem::{FileData, FileInfo, GrepMatch, LocalFilesystem};
-    use super::super::protocol_client::RemoteTaskStatus;
 
     fn temp_fs(tag: &str) -> (std::path::PathBuf, Arc<dyn Filesystem>) {
         let dir = std::env::temp_dir().join(format!("agentscope_ws_{tag}_{}", std::process::id()));
@@ -1275,7 +1335,13 @@ mod tests {
         let path = seed(&fs, &ctx, TaskStatus::Cancelled, true).await;
 
         update_record_status(
-            fs.as_ref(), &ctx, "parent", "sess", "t1", TaskStatus::Failed, None,
+            fs.as_ref(),
+            &ctx,
+            "parent",
+            "sess",
+            "t1",
+            TaskStatus::Failed,
+            None,
             Some("late failure".to_string()),
         )
         .await;
@@ -1294,7 +1360,14 @@ mod tests {
         let path = seed(&fs, &ctx, TaskStatus::Pending, true).await;
 
         update_record_status(
-            fs.as_ref(), &ctx, "parent", "sess", "t1", TaskStatus::Running, None, None,
+            fs.as_ref(),
+            &ctx,
+            "parent",
+            "sess",
+            "t1",
+            TaskStatus::Running,
+            None,
+            None,
         )
         .await;
 
@@ -1370,7 +1443,11 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut st = self.statuses.lock().unwrap();
             // Keep serving the last status once the script is exhausted.
-            let s = if st.len() > 1 { st.remove(0) } else { st[0].clone() };
+            let s = if st.len() > 1 {
+                st.remove(0)
+            } else {
+                st[0].clone()
+            };
             Ok(s)
         }
         async fn wait_for_result(
@@ -1446,8 +1523,8 @@ mod tests {
             RemoteTaskStatus::new("running", None),
             RemoteTaskStatus::new("success", None),
         ]);
-        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent")
-            .with_transport(transport.clone());
+        let repo =
+            WorkspaceTaskRepository::new(fs.clone(), "parent").with_transport(transport.clone());
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen2 = seen.clone();
@@ -1456,7 +1533,9 @@ mod tests {
         }))
         .await;
 
-        let bg = repo.put_task(&ctx, "t-remote", "sub1", "sess", remote_spec()).await;
+        let bg = repo
+            .put_task(&ctx, "t-remote", "sub1", "sess", remote_spec())
+            .await;
         assert!(wait_done(&bg, 5_000).await);
 
         let rec = read_records(fs.as_ref(), &ctx, &tasks_path("parent", "sess")).await;
@@ -1475,12 +1554,13 @@ mod tests {
         let ctx = RuntimeContext::default();
         let mut awaiting = RemoteTaskStatus::new("awaiting_confirm", None);
         awaiting.pending_confirms = vec![RemotePendingConfirm::new("c1", "read_file", None)];
-        let transport =
-            FakeTransport::new(vec![awaiting, RemoteTaskStatus::new("success", None)]);
-        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent")
-            .with_transport(transport.clone());
+        let transport = FakeTransport::new(vec![awaiting, RemoteTaskStatus::new("success", None)]);
+        let repo =
+            WorkspaceTaskRepository::new(fs.clone(), "parent").with_transport(transport.clone());
 
-        let bg = repo.put_task(&ctx, "t-ac", "sub1", "sess", remote_spec()).await;
+        let bg = repo
+            .put_task(&ctx, "t-ac", "sub1", "sess", remote_spec())
+            .await;
         assert!(wait_done(&bg, 10_000).await);
 
         let rec = read_records(fs.as_ref(), &ctx, &tasks_path("parent", "sess")).await;
@@ -1498,12 +1578,22 @@ mod tests {
         let ctx = RuntimeContext::default();
         let path = tasks_path("parent", "sess");
         let mut map = BTreeMap::new();
-        map.insert("t1".to_string(), TaskRecord::new("t1", "sub1", "parent", "sess"));
+        map.insert(
+            "t1".to_string(),
+            TaskRecord::new("t1", "sub1", "parent", "sess"),
+        );
         write_records(fs.as_ref(), &ctx, &path, &map).await;
 
         // Pending -> Running bumps the version once.
         update_record_status(
-            fs.as_ref(), &ctx, "parent", "sess", "t1", TaskStatus::Running, None, None,
+            fs.as_ref(),
+            &ctx,
+            "parent",
+            "sess",
+            "t1",
+            TaskStatus::Running,
+            None,
+            None,
         )
         .await;
         let map = read_records(fs.as_ref(), &ctx, &path).await;
@@ -1511,8 +1601,14 @@ mod tests {
 
         // Running -> Completed bumps again.
         update_record_status(
-            fs.as_ref(), &ctx, "parent", "sess", "t1", TaskStatus::Completed,
-            Some("ok".into()), None,
+            fs.as_ref(),
+            &ctx,
+            "parent",
+            "sess",
+            "t1",
+            TaskStatus::Completed,
+            Some("ok".into()),
+            None,
         )
         .await;
         let map = read_records(fs.as_ref(), &ctx, &path).await;
@@ -1522,8 +1618,14 @@ mod tests {
 
         // Terminal record refuses further status writes; version stays put.
         update_record_status(
-            fs.as_ref(), &ctx, "parent", "sess", "t1", TaskStatus::Failed,
-            None, Some("late".into()),
+            fs.as_ref(),
+            &ctx,
+            "parent",
+            "sess",
+            "t1",
+            TaskStatus::Failed,
+            None,
+            Some("late".into()),
         )
         .await;
         let map = read_records(fs.as_ref(), &ctx, &path).await;
@@ -1541,10 +1643,12 @@ mod tests {
             "error",
             Some("boom".to_string()),
         )]);
-        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent")
-            .with_transport(transport.clone());
+        let repo =
+            WorkspaceTaskRepository::new(fs.clone(), "parent").with_transport(transport.clone());
 
-        let bg = repo.put_task(&ctx, "t-bad", "sub1", "sess", remote_spec()).await;
+        let bg = repo
+            .put_task(&ctx, "t-bad", "sub1", "sess", remote_spec())
+            .await;
         assert!(wait_done(&bg, 5_000).await);
 
         let rec = read_records(fs.as_ref(), &ctx, &tasks_path("parent", "sess")).await;
@@ -1558,10 +1662,11 @@ mod tests {
     async fn suppress_completion_callback_flag_skips_the_callback() {
         let (dir, fs) = temp_fs("suppress");
         let mut ctx = RuntimeContext::default();
-        ctx.metadata.insert(SUPPRESS_COMPLETION_CALLBACK.into(), serde_json::json!(true));
+        ctx.metadata
+            .insert(SUPPRESS_COMPLETION_CALLBACK.into(), serde_json::json!(true));
         let transport = FakeTransport::new(vec![RemoteTaskStatus::new("success", None)]);
-        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent")
-            .with_transport(transport.clone());
+        let repo =
+            WorkspaceTaskRepository::new(fs.clone(), "parent").with_transport(transport.clone());
 
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hits2 = hits.clone();
@@ -1570,7 +1675,9 @@ mod tests {
         }))
         .await;
 
-        let bg = repo.put_task(&ctx, "t-sup", "sub1", "sess", remote_spec()).await;
+        let bg = repo
+            .put_task(&ctx, "t-sup", "sub1", "sess", remote_spec())
+            .await;
         assert!(wait_done(&bg, 5_000).await);
 
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1596,11 +1703,18 @@ mod tests {
         let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
         // No local handle → nothing is live, so the heartbeat must not touch the record.
         repo.heartbeat().await;
-        assert_eq!(read_records(fs.as_ref(), &ctx, &path).await["t1"].last_updated_at, 1);
+        assert_eq!(
+            read_records(fs.as_ref(), &ctx, &path).await["t1"].last_updated_at,
+            1
+        );
 
         // Register a live local handle + captured context, then heartbeat again.
         let bg = BackgroundTask::controlled("t1", "sub1");
-        repo.state.local_tasks.lock().unwrap().insert("sess:t1".into(), bg);
+        repo.state
+            .local_tasks
+            .lock()
+            .unwrap()
+            .insert("sess:t1".into(), bg);
         repo.state
             .local_contexts
             .lock()
@@ -1641,14 +1755,14 @@ mod tests {
         write_records(fs.as_ref(), &ctx, &path, &map).await;
 
         let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
-        repo.state
-            .local_tasks
-            .lock()
-            .unwrap()
-            .insert("sess:live".into(), BackgroundTask::controlled("live", "sub1"));
+        repo.state.local_tasks.lock().unwrap().insert(
+            "sess:live".into(),
+            BackgroundTask::controlled("live", "sub1"),
+        );
 
         // Sweep at t=600s with a 300s orphan timeout window.
-        repo.sweep_orphaned_tasks_with(Duration::from_secs(300), 600_000).await;
+        repo.sweep_orphaned_tasks_with(Duration::from_secs(300), 600_000)
+            .await;
 
         let after = read_records(fs.as_ref(), &ctx, &path).await;
         assert_eq!(after["orphan"].status, TaskStatus::Failed);
@@ -1676,8 +1790,10 @@ mod tests {
         write_records(fs.as_ref(), &ctx, &path, &map).await;
 
         let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
-        repo.sweep_orphaned_tasks_with(Duration::from_secs(1), 600_000).await;
-        repo.sweep_orphaned_tasks_with(Duration::from_secs(1), 600_000).await;
+        repo.sweep_orphaned_tasks_with(Duration::from_secs(1), 600_000)
+            .await;
+        repo.sweep_orphaned_tasks_with(Duration::from_secs(1), 600_000)
+            .await;
 
         let after = read_records(fs.as_ref(), &ctx, &path).await;
         assert_eq!(after["done"].status, TaskStatus::Completed);
@@ -1704,10 +1820,12 @@ mod tests {
         let ctx = RuntimeContext::default();
         // Always `running` so the poller keeps looping until cancelled.
         let transport = FakeTransport::new(vec![RemoteTaskStatus::new("running", None)]);
-        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent")
-            .with_transport(transport.clone());
+        let repo =
+            WorkspaceTaskRepository::new(fs.clone(), "parent").with_transport(transport.clone());
 
-        let bg = repo.put_task(&ctx, "t-cancel", "sub1", "sess", remote_spec()).await;
+        let bg = repo
+            .put_task(&ctx, "t-cancel", "sub1", "sess", remote_spec())
+            .await;
         // Wait deterministically until the poller has actually observed the remote status
         // (a fixed sleep raced the submit → first-poll handshake and made this test flaky).
         assert!(
@@ -1739,7 +1857,9 @@ mod tests {
 
     impl NamespacedLocalFs {
         fn new(root: impl Into<std::path::PathBuf>) -> Self {
-            Self { inner: LocalFilesystem::sandboxed(root) }
+            Self {
+                inner: LocalFilesystem::sandboxed(root),
+            }
         }
 
         fn prefix(ctx: &RuntimeContext) -> String {
@@ -1820,7 +1940,9 @@ mod tests {
             path: &str,
             content: &str,
         ) -> agentscope_core::error::Result<()> {
-            self.inner.write(ctx, &Self::scoped(ctx, path), content).await
+            self.inner
+                .write(ctx, &Self::scoped(ctx, path), content)
+                .await
         }
 
         async fn edit(
@@ -1897,7 +2019,9 @@ mod tests {
     }
 
     fn user_ctx(user: &str, session: &str) -> RuntimeContext {
-        RuntimeContext::default().with_user_id(user).with_session_id(session)
+        RuntimeContext::default()
+            .with_user_id(user)
+            .with_session_id(session)
     }
 
     /// Writes one stale `Running` record through the repository, which is what registers the
@@ -1924,8 +2048,14 @@ mod tests {
             "dXNlcnM.YWxpY2U"
         );
         // Deterministic across calls, and distinct namespaces never share a key.
-        assert_eq!(scope_key(&["alice".to_string()]), scope_key(&["alice".to_string()]));
-        assert_ne!(scope_key(&["alice".to_string()]), scope_key(&["bob".to_string()]));
+        assert_eq!(
+            scope_key(&["alice".to_string()]),
+            scope_key(&["alice".to_string()])
+        );
+        assert_ne!(
+            scope_key(&["alice".to_string()]),
+            scope_key(&["bob".to_string()])
+        );
         // No path separators can leak out of a hostile segment.
         for segment in ["a/b", "a\\b", "..", "x.y", "with space"] {
             let key = scope_key(&[segment.to_string()]);
@@ -1961,7 +2091,11 @@ mod tests {
         );
         // Registration is durable: one entry, in the agent's own registry directory.
         let entries = registry_entries(&fs).await;
-        assert_eq!(entries.len(), 1, "expected one registered scope: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected one registered scope: {entries:?}"
+        );
         drop(first);
 
         // Simulated restart: a fresh repository, so `local_contexts` is empty and the durable
@@ -2035,13 +2169,17 @@ mod tests {
         assert_eq!(alice_records["t-alice"].status, TaskStatus::Failed);
         assert_eq!(bob_records["t-bob"].status, TaskStatus::Failed);
         // Each domain only ever sees (and repairs) its own records.
-        assert!(!alice_records.contains_key("t-bob"), "alice saw bob's record");
-        assert!(!bob_records.contains_key("t-alice"), "bob saw alice's record");
         assert!(
-            read_records(fs.as_ref(), &RuntimeContext::default(), &path)
-                .await
-                .is_empty()
+            !alice_records.contains_key("t-bob"),
+            "alice saw bob's record"
         );
+        assert!(
+            !bob_records.contains_key("t-alice"),
+            "bob saw alice's record"
+        );
+        assert!(read_records(fs.as_ref(), &RuntimeContext::default(), &path)
+            .await
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -64,7 +64,10 @@ impl ExecutionConfig {
     }
 
     /// Merges two configs, with `primary` taking precedence over `fallback`.
-    pub fn merge_configs(primary: Option<&ExecutionConfig>, fallback: Option<&ExecutionConfig>) -> Option<ExecutionConfig> {
+    pub fn merge_configs(
+        primary: Option<&ExecutionConfig>,
+        fallback: Option<&ExecutionConfig>,
+    ) -> Option<ExecutionConfig> {
         match (primary, fallback) {
             (None, None) => None,
             (Some(p), None) => Some(*p),
@@ -118,11 +121,26 @@ pub struct ExecutionConfigBuilder {
 }
 
 impl ExecutionConfigBuilder {
-    pub fn timeout(mut self, v: Duration) -> Self { self.timeout = Some(v); self }
-    pub fn max_attempts(mut self, v: u32) -> Self { self.max_attempts = Some(v); self }
-    pub fn initial_backoff(mut self, v: Duration) -> Self { self.initial_backoff = Some(v); self }
-    pub fn max_backoff(mut self, v: Duration) -> Self { self.max_backoff = Some(v); self }
-    pub fn backoff_multiplier(mut self, v: f64) -> Self { self.backoff_multiplier = Some(v); self }
+    pub fn timeout(mut self, v: Duration) -> Self {
+        self.timeout = Some(v);
+        self
+    }
+    pub fn max_attempts(mut self, v: u32) -> Self {
+        self.max_attempts = Some(v);
+        self
+    }
+    pub fn initial_backoff(mut self, v: Duration) -> Self {
+        self.initial_backoff = Some(v);
+        self
+    }
+    pub fn max_backoff(mut self, v: Duration) -> Self {
+        self.max_backoff = Some(v);
+        self
+    }
+    pub fn backoff_multiplier(mut self, v: f64) -> Self {
+        self.backoff_multiplier = Some(v);
+        self
+    }
     pub fn build(self) -> ExecutionConfig {
         ExecutionConfig {
             timeout: self.timeout,

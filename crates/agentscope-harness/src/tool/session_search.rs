@@ -6,12 +6,12 @@
 //! `.log.jsonl` mirror — those belonged to the retired design.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
 use agentscope_core::session::{SessionKey, SessionLogStore, Transcript};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::tool::{int_arg, opt_str_arg};
 
@@ -66,7 +66,10 @@ impl MatchMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeywordMatcher {
     Phrase(String),
-    Terms { terms: Vec<String>, require_all: bool },
+    Terms {
+        terms: Vec<String>,
+        require_all: bool,
+    },
 }
 
 impl KeywordMatcher {
@@ -86,7 +89,10 @@ impl KeywordMatcher {
                 if terms.is_empty() {
                     return Err("query must contain at least one keyword".to_string());
                 }
-                Ok(KeywordMatcher::Terms { terms, require_all: mode == MatchMode::All })
+                Ok(KeywordMatcher::Terms {
+                    terms,
+                    require_all: mode == MatchMode::All,
+                })
             }
         }
     }
@@ -165,7 +171,10 @@ pub struct SessionSearchTool {
 
 impl SessionSearchTool {
     pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
-        Self { store, context: RuntimeContext::default() }
+        Self {
+            store,
+            context: RuntimeContext::default(),
+        }
     }
 
     /// Binds the caller identity used for journal discovery.
@@ -264,7 +273,9 @@ impl Tool for SessionSearchTool {
         }
 
         if results.is_empty() {
-            return Ok(ToolResultBlock::text(format!("No matches found for: {query}")));
+            return Ok(ToolResultBlock::text(format!(
+                "No matches found for: {query}"
+            )));
         }
         let mut sb = format!("Found {} matches for '{query}':\n\n", results.len());
         for r in &results {
@@ -283,7 +294,10 @@ pub struct SessionListTool {
 
 impl SessionListTool {
     pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
-        Self { store, context: RuntimeContext::default() }
+        Self {
+            store,
+            context: RuntimeContext::default(),
+        }
     }
 
     /// Binds the caller identity used for journal discovery.
@@ -348,7 +362,10 @@ pub struct SessionHistoryTool {
 
 impl SessionHistoryTool {
     pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
-        Self { store, context: RuntimeContext::default() }
+        Self {
+            store,
+            context: RuntimeContext::default(),
+        }
     }
 
     /// Binds the caller identity used for journal discovery.
@@ -482,7 +499,10 @@ mod tests {
         let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
-            .call(args(&[("query", serde_json::json!("quantum"))]), Default::default())
+            .call(
+                args(&[("query", serde_json::json!("quantum"))]),
+                Default::default(),
+            )
             .await
             .unwrap();
         let text = out.text_content();
@@ -493,11 +513,21 @@ mod tests {
     #[tokio::test]
     async fn search_does_not_leak_other_users_sessions() {
         let store = Arc::new(InMemorySessionLogStore::new());
-        seed(&store, Some("bob"), "a1", "b1", vec![Msg::user("quantum notes")]).await;
+        seed(
+            &store,
+            Some("bob"),
+            "a1",
+            "b1",
+            vec![Msg::user("quantum notes")],
+        )
+        .await;
         let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
-            .call(args(&[("query", serde_json::json!("quantum"))]), Default::default())
+            .call(
+                args(&[("query", serde_json::json!("quantum"))]),
+                Default::default(),
+            )
             .await
             .unwrap();
         assert!(out.text_content().contains("No matches found"));
@@ -510,7 +540,10 @@ mod tests {
         let tool = SessionListTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
-            .call(args(&[("agentId", serde_json::json!("a1"))]), Default::default())
+            .call(
+                args(&[("agentId", serde_json::json!("a1"))]),
+                Default::default(),
+            )
             .await
             .unwrap();
         let text = out.text_content();

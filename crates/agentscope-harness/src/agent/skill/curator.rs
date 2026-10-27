@@ -25,9 +25,9 @@ pub use super::filters::{
 /// Security scanner lives in `security.rs`; re-exported here for parity with the
 /// Java `skill.curator` package layout.
 pub use super::security::{
-    scan, scan_single_file, should_allow, Category as SecurityCategory,
-    Finding as SecurityFinding, ScanResult as SecurityScanResult, Severity as SecuritySeverity,
-    TrustLevel as SkillTrustLevel, Verdict as SecurityVerdict,
+    scan, scan_single_file, should_allow, Category as SecurityCategory, Finding as SecurityFinding,
+    ScanResult as SecurityScanResult, Severity as SecuritySeverity, TrustLevel as SkillTrustLevel,
+    Verdict as SecurityVerdict,
 };
 
 /// State sidecar path (workspace-relative).
@@ -315,7 +315,12 @@ impl SkillCurator {
         config: SkillCuratorConfig,
         archive: Arc<dyn Fn(&str) + Send + Sync>,
     ) -> Self {
-        Self { filesystem, usage_store, config, archive }
+        Self {
+            filesystem,
+            usage_store,
+            config,
+            archive,
+        }
     }
 
     pub fn config(&self) -> SkillCuratorConfig {
@@ -393,20 +398,32 @@ impl SkillCurator {
                 SkillState::Active => {
                     if anchor < archive_cutoff {
                         (self.archive)(&name);
-                        self.usage_store.lock().unwrap().set_state(&name, SkillState::Archived);
+                        self.usage_store
+                            .lock()
+                            .unwrap()
+                            .set_state(&name, SkillState::Archived);
                         counts.archived += 1;
                     } else if anchor < stale_cutoff {
-                        self.usage_store.lock().unwrap().set_state(&name, SkillState::Stale);
+                        self.usage_store
+                            .lock()
+                            .unwrap()
+                            .set_state(&name, SkillState::Stale);
                         counts.marked_stale += 1;
                     }
                 }
                 SkillState::Stale => {
                     if anchor < archive_cutoff {
                         (self.archive)(&name);
-                        self.usage_store.lock().unwrap().set_state(&name, SkillState::Archived);
+                        self.usage_store
+                            .lock()
+                            .unwrap()
+                            .set_state(&name, SkillState::Archived);
                         counts.archived += 1;
                     } else if anchor >= stale_cutoff {
-                        self.usage_store.lock().unwrap().set_state(&name, SkillState::Active);
+                        self.usage_store
+                            .lock()
+                            .unwrap()
+                            .set_state(&name, SkillState::Active);
                         counts.reactivated += 1;
                     }
                 }
@@ -432,7 +449,11 @@ impl SkillCurator {
                 if rec.created_by != "agent" || rec.pinned {
                     continue;
                 }
-                let prefix = name.split(['-', '_', '.']).next().unwrap_or(&name).to_string();
+                let prefix = name
+                    .split(['-', '_', '.'])
+                    .next()
+                    .unwrap_or(&name)
+                    .to_string();
                 clusters.entry(prefix).or_default().push(name);
             }
         }
@@ -477,7 +498,10 @@ impl SkillCurator {
         let mut s = self.load_state().await;
         let summary = format!(
             "checked={} markedStale={} archived={} reactivated={}",
-            transitions.checked, transitions.marked_stale, transitions.archived, transitions.reactivated
+            transitions.checked,
+            transitions.marked_stale,
+            transitions.archived,
+            transitions.reactivated
         );
         s.last_run_at = Some(now.to_rfc3339());
         s.run_count += 1;
@@ -496,7 +520,9 @@ impl SkillCurator {
 }
 
 fn parse_utc(s: Option<&str>) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s?).ok().map(|dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s?)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// A skill candidate plus its support resources and script previews.
@@ -516,7 +542,11 @@ pub fn build_candidate(
         support.push(rel.clone());
         let preview = ScriptFilePreview {
             rel_path: rel.clone(),
-            head_preview: content.lines().take(head_lines).collect::<Vec<_>>().join("\n"),
+            head_preview: content
+                .lines()
+                .take(head_lines)
+                .collect::<Vec<_>>()
+                .join("\n"),
             total_lines: content.lines().count(),
             sha256: super::stager::sha256_hex(content.as_bytes()),
         };

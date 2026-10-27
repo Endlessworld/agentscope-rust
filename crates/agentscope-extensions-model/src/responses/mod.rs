@@ -43,8 +43,8 @@ use agentscope_core::model::provider::{
 use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
-use crate::common::{clamp_max_tokens, diagnostics, resolve_capabilities_with, usage};
 use crate::common::error::{ErrorKind, ModelError};
+use crate::common::{clamp_max_tokens, diagnostics, resolve_capabilities_with, usage};
 
 /// An OpenAI Responses API model backed by `async-openai`.
 pub struct OpenAiResponsesModel {
@@ -106,17 +106,13 @@ impl OpenAiResponsesModel {
         for (k, v) in &ctx.options.additional_headers {
             let name = reqwest::header::HeaderName::from_str(k)
                 .map_err(|e| Error::Model(format!("invalid header name '{k}': {e}")))?;
-            cfg = cfg.with_header(name.clone(), v.as_str()).map_err(|e| {
-                Error::Model(format!("failed to set header '{k}': {e}"))
-            })?;
+            cfg = cfg
+                .with_header(name.clone(), v.as_str())
+                .map_err(|e| Error::Model(format!("failed to set header '{k}': {e}")))?;
         }
         let client = Client::with_config(cfg);
         let descriptor = ctx.catalog.clone().or_else(|| {
-            descriptor_for(
-                Some(&ctx.provider_id),
-                &model_name,
-                ctx.base_url.as_deref(),
-            )
+            descriptor_for(Some(&ctx.provider_id), &model_name, ctx.base_url.as_deref())
         });
         let context = descriptor
             .as_ref()
@@ -456,7 +452,10 @@ struct ResponsesIncrementer {
 }
 
 impl ResponsesIncrementer {
-    fn accumulate(&mut self, event: &ResponseStreamEvent) -> Option<agentscope_core::model::ChatResponse> {
+    fn accumulate(
+        &mut self,
+        event: &ResponseStreamEvent,
+    ) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         match event {
             ResponseStreamEvent::ResponseOutputTextDelta(e) => {
@@ -741,7 +740,10 @@ mod tests {
             ContentBlock::ToolUse(tu) => {
                 assert_eq!(tu.id, "call_1");
                 assert_eq!(tu.name, "get_weather");
-                assert_eq!(tu.input.get("city").and_then(|v| v.as_str()), Some("Beijing"));
+                assert_eq!(
+                    tu.input.get("city").and_then(|v| v.as_str()),
+                    Some("Beijing")
+                );
             }
             _ => panic!("expected tool use block"),
         }

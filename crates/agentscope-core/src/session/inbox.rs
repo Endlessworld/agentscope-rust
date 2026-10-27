@@ -150,7 +150,8 @@ impl SessionInbox {
             }
         }
         let snapshot = Arc::new(self.fold(&head).await?);
-        *self.cache.lock().unwrap() = Some((head.seq, head.commit_id.clone(), Arc::clone(&snapshot)));
+        *self.cache.lock().unwrap() =
+            Some((head.seq, head.commit_id.clone(), Arc::clone(&snapshot)));
         Ok(snapshot)
     }
 
@@ -349,7 +350,12 @@ impl SessionInbox {
             payload,
         )?;
         self.journal
-            .commit(writer, &uuid::Uuid::new_v4().to_string(), head.seq, &[event])
+            .commit(
+                writer,
+                &uuid::Uuid::new_v4().to_string(),
+                head.seq,
+                &[event],
+            )
             .await?;
         Ok(seq)
     }
@@ -384,15 +390,15 @@ mod tests {
     #[tokio::test]
     async fn accept_rejects_reused_key_with_different_input() {
         let (inbox, _log) = inbox();
-        inbox.accept(&command("c1", "submit", "hello")).await.unwrap();
+        inbox
+            .accept(&command("c1", "submit", "hello"))
+            .await
+            .unwrap();
         let err = inbox
             .accept(&command("c1", "submit", "different"))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("different input"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("different input"), "{err}");
     }
 
     #[tokio::test]
@@ -414,7 +420,10 @@ mod tests {
         let (inbox, _log) = inbox();
         inbox.open("t1", "run-1").await.unwrap();
         inbox.close("t2", "run-2").await.unwrap();
-        assert_eq!(inbox.snapshot().await.unwrap().run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            inbox.snapshot().await.unwrap().run_id.as_deref(),
+            Some("run-1")
+        );
     }
 
     #[tokio::test]
@@ -465,7 +474,10 @@ mod tests {
         let (inbox, log) = inbox();
         let execution = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
         // Acceptance still succeeds while an execution writer holds the main journal lease.
-        inbox.accept(&command("c1", "submit", "hello")).await.unwrap();
+        inbox
+            .accept(&command("c1", "submit", "hello"))
+            .await
+            .unwrap();
         assert!(!inbox.snapshot().await.unwrap().commands.is_empty());
         log.release(&execution).await.unwrap();
     }

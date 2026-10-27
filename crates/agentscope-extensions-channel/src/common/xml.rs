@@ -147,7 +147,10 @@ mod tests {
     #[test]
     fn returns_none_for_missing_tag_and_empty_element() {
         assert!(xml_element_text(WECOM, "Nope").is_none());
-        assert_eq!(xml_element_text("<xml><A/></xml>", "A").as_deref(), Some(""));
+        assert_eq!(
+            xml_element_text("<xml><A/></xml>", "A").as_deref(),
+            Some("")
+        );
     }
 
     #[test]

@@ -36,7 +36,10 @@ pub struct StaticModelConfig {
 impl StaticModelConfig {
     /// Wraps a pre-built model with an explicit name.
     pub fn new(name: impl Into<String>, model: Arc<dyn Model>) -> Self {
-        Self { name: name.into(), model }
+        Self {
+            name: name.into(),
+            model,
+        }
     }
 }
 
@@ -124,7 +127,11 @@ impl AgentConfigBuilder {
         if model_name.trim().is_empty() {
             return Err(AgentConfigError::MissingModelConfig);
         }
-        Ok(AgentConfig { name, sys_prompt: self.sys_prompt, model_name })
+        Ok(AgentConfig {
+            name,
+            sys_prompt: self.sys_prompt,
+            model_name,
+        })
     }
 }
 
@@ -196,7 +203,12 @@ impl RuntimeAgentConfig {
 
 impl From<AgentConfig> for RuntimeAgentConfig {
     fn from(meta: AgentConfig) -> Self {
-        Self { meta, model: None, toolkit: None, middleware: Vec::new() }
+        Self {
+            meta,
+            model: None,
+            toolkit: None,
+            middleware: Vec::new(),
+        }
     }
 }
 
@@ -327,7 +339,11 @@ mod tests {
 
     #[test]
     fn runtime_config_from_agent_config() {
-        let cfg = AgentConfig::builder().name("A").model_name("m").build().unwrap();
+        let cfg = AgentConfig::builder()
+            .name("A")
+            .model_name("m")
+            .build()
+            .unwrap();
         let rt = RuntimeAgentConfig::from(cfg);
         assert_eq!(rt.name(), "A");
     }

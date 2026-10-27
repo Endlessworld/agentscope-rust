@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 
-use async_trait::async_trait;
-use serde_json::json;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
+use serde_json::json;
 
 use super::model::SkillCatalogSnapshot;
 
@@ -77,7 +77,9 @@ impl Tool for LoadSkillTool {
             .get("skillId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| agentscope_core::Error::Tool("Missing string argument: skillId".into()))?;
+            .ok_or_else(|| {
+                agentscope_core::Error::Tool("Missing string argument: skillId".into())
+            })?;
         let rel = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -106,7 +108,11 @@ impl Tool for LoadSkillTool {
             if let Ok(entries) = std::fs::read_dir(&target) {
                 for e in entries.flatten() {
                     let n = e.file_name().to_string_lossy().to_string();
-                    listing.push(if e.path().is_dir() { format!("{n}/") } else { n });
+                    listing.push(if e.path().is_dir() {
+                        format!("{n}/")
+                    } else {
+                        n
+                    });
                 }
             }
             listing.sort();

@@ -23,7 +23,8 @@ struct CountingSandbox {
 #[async_trait::async_trait]
 impl Sandbox for CountingSandbox {
     async fn start(&mut self) -> Result<()> {
-        self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     async fn stop(&mut self) -> Result<()> {

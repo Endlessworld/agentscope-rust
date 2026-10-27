@@ -18,7 +18,10 @@ pub struct ReMeMessage {
 impl ReMeMessage {
     /// Creates a message.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into() }
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -33,7 +36,9 @@ pub struct ReMeTrajectory {
 impl ReMeTrajectory {
     /// Creates a trajectory from messages.
     pub fn new(messages: Vec<ReMeMessage>) -> Self {
-        Self { messages: Some(messages) }
+        Self {
+            messages: Some(messages),
+        }
     }
 }
 
@@ -51,7 +56,10 @@ pub struct ReMeAddRequest {
 impl ReMeAddRequest {
     /// Creates a request with the workspace id and trajectories (Java convenience ctor).
     pub fn new(workspace_id: impl Into<String>, trajectories: Vec<ReMeTrajectory>) -> Self {
-        Self { workspace_id: Some(workspace_id.into()), trajectories: Some(trajectories) }
+        Self {
+            workspace_id: Some(workspace_id.into()),
+            trajectories: Some(trajectories),
+        }
     }
 }
 
@@ -71,7 +79,11 @@ pub struct ReMeSearchRequest {
 
 impl Default for ReMeSearchRequest {
     fn default() -> Self {
-        Self { workspace_id: None, query: None, top_k: Some(5) }
+        Self {
+            workspace_id: None,
+            query: None,
+            top_k: Some(5),
+        }
     }
 }
 
@@ -117,16 +129,28 @@ impl ReMeSearchRequest {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReMeMemoryItem {
     /// Workspace identifier.
-    #[serde(rename = "workspace_id", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "workspace_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub workspace_id: Option<String>,
     /// Memory identifier.
     #[serde(rename = "memory_id", default, skip_serializing_if = "Option::is_none")]
     pub memory_id: Option<String>,
     /// Memory type.
-    #[serde(rename = "memory_type", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memory_type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_type: Option<String>,
     /// When the memory should be used.
-    #[serde(rename = "when_to_use", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "when_to_use",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub when_to_use: Option<String>,
     /// Memory content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,10 +159,18 @@ pub struct ReMeMemoryItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     /// Creation timestamp (string, as returned by ReMe).
-    #[serde(rename = "time_created", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "time_created",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub time_created: Option<String>,
     /// Modification timestamp (string, as returned by ReMe).
-    #[serde(rename = "time_modified", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "time_modified",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub time_modified: Option<String>,
     /// Author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,7 +182,11 @@ pub struct ReMeMemoryItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Reflection subject.
-    #[serde(rename = "reflection_subject", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "reflection_subject",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reflection_subject: Option<String>,
 }
 
@@ -158,10 +194,18 @@ pub struct ReMeMemoryItem {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReMeUpdateResult {
     /// Number of deleted memories.
-    #[serde(rename = "deleted_count", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "deleted_count",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub deleted_count: Option<i64>,
     /// Number of inserted memories.
-    #[serde(rename = "inserted_count", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "inserted_count",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inserted_count: Option<i64>,
 }
 
@@ -169,13 +213,25 @@ pub struct ReMeUpdateResult {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReMeAddMetadata {
     /// Memory list.
-    #[serde(rename = "memory_list", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memory_list",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_list: Option<Vec<ReMeMemoryItem>>,
     /// Deleted memory ids.
-    #[serde(rename = "deleted_memory_ids", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "deleted_memory_ids",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub deleted_memory_ids: Option<Vec<String>>,
     /// Update result counters.
-    #[serde(rename = "update_result", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "update_result",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub update_result: Option<ReMeUpdateResult>,
 }
 
@@ -197,7 +253,11 @@ pub struct ReMeAddResponse {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReMeSearchMetadata {
     /// Memory list.
-    #[serde(rename = "memory_list", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memory_list",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_list: Option<Vec<ReMeMemoryItem>>,
 }
 

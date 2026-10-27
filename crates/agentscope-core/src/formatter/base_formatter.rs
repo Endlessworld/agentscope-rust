@@ -87,10 +87,18 @@ pub fn convert_tool_result_to_string(output: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text(tb) => Some(tb.text.clone()),
-            ContentBlock::Image(ib) => Some(convert_media_block_to_text_reference(&ib.source, "image")),
-            ContentBlock::Audio(ab) => Some(convert_media_block_to_text_reference(&ab.source, "audio")),
-            ContentBlock::Video(vb) => Some(convert_media_block_to_text_reference(&vb.source, "video")),
-            ContentBlock::Data(db) => Some(convert_media_block_to_text_reference(&db.source, "data")),
+            ContentBlock::Image(ib) => {
+                Some(convert_media_block_to_text_reference(&ib.source, "image"))
+            }
+            ContentBlock::Audio(ab) => {
+                Some(convert_media_block_to_text_reference(&ab.source, "audio"))
+            }
+            ContentBlock::Video(vb) => {
+                Some(convert_media_block_to_text_reference(&vb.source, "video"))
+            }
+            ContentBlock::Data(db) => {
+                Some(convert_media_block_to_text_reference(&db.source, "data"))
+            }
             // Other block types (e.g. ThinkingBlock) are ignored.
             _ => None,
         })
@@ -112,14 +120,15 @@ pub fn convert_tool_result_to_string(output: &[ContentBlock]) -> String {
 fn convert_media_block_to_text_reference(source: &Source, media_type: &str) -> String {
     match source {
         Source::Url(url_source) => {
-            format!("The returned {media_type} can be found at: {}", url_source.url)
+            format!(
+                "The returned {media_type} can be found at: {}",
+                url_source.url
+            )
         }
-        Source::Base64(b64) => {
-            match save_base64_data_to_temp_file(&b64.media_type, &b64.data) {
-                Ok(file_path) => format!("The returned {media_type} can be found at: {file_path}"),
-                Err(e) => format!("[{media_type} - failed to save file: {e}]"),
-            }
-        }
+        Source::Base64(b64) => match save_base64_data_to_temp_file(&b64.media_type, &b64.data) {
+            Ok(file_path) => format!("The returned {media_type} can be found at: {file_path}"),
+            Err(e) => format!("[{media_type} - failed to save file: {e}]"),
+        },
     }
 }
 
@@ -233,9 +242,9 @@ mod tests {
         assert_eq!(convert_tool_result_to_string(&multi), "- a\n- b");
 
         // URL image -> textual reference
-        let img = vec![ContentBlock::Image(ImageBlock::new(Source::Url(URLSource::new(
-            "https://x/a.png",
-        ))))];
+        let img = vec![ContentBlock::Image(ImageBlock::new(Source::Url(
+            URLSource::new("https://x/a.png"),
+        )))];
         assert_eq!(
             convert_tool_result_to_string(&img),
             "The returned image can be found at: https://x/a.png"

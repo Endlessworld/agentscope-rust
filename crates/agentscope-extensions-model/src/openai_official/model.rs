@@ -197,7 +197,12 @@ impl OpenAIResponsesChatModel {
     }
 
     fn validate_connection_fields(&self, options: &GenerateOptions) -> Result<()> {
-        if let Some(api_key) = options.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(api_key) = options
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if api_key != self.api_key {
                 return Err(Error::Model(
                     "apiKey override per request is not supported by the openai-official provider. \
@@ -206,7 +211,12 @@ impl OpenAIResponsesChatModel {
                 ));
             }
         }
-        if let Some(base_url) = options.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(base_url) = options
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if base_url != self.base_url {
                 return Err(Error::Model(
                     "baseUrl override per request is not supported by the openai-official provider. \
@@ -314,8 +324,14 @@ impl Model for OpenAIResponsesChatModel {
 
 fn api_error_from_body(error: &Value) -> Error {
     let message = error.get("message").and_then(Value::as_str);
-    let error_type = error.get("type").and_then(Value::as_str).map(str::to_string);
-    let code = error.get("code").and_then(Value::as_str).map(str::to_string);
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let status = error
         .get("status")
         .and_then(Value::as_u64)
@@ -343,7 +359,12 @@ mod tests {
     use serde_json::json;
 
     fn model_with(transport: MemoryTransport, name: &str) -> OpenAIResponsesChatModel {
-        OpenAIResponsesChatModel::new(name, "sk-test", Some("https://api.test/v1".into()), Arc::new(transport))
+        OpenAIResponsesChatModel::new(
+            name,
+            "sk-test",
+            Some("https://api.test/v1".into()),
+            Arc::new(transport),
+        )
     }
 
     async fn collect(
@@ -366,7 +387,14 @@ mod tests {
             "usage": { "input_tokens": 4, "output_tokens": 7 }
         }));
         let model = model_with(transport.clone(), "gpt-5");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
 
         assert_eq!(out.len(), 1);
         let response = out[0].as_ref().unwrap();
@@ -405,8 +433,12 @@ mod tests {
         let out = collect(&model, GenerateOptions::default()).await;
 
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         assert_eq!(out[2].as_ref().unwrap().usage.output_tokens, 3);
 
         let spec = transport.last_request().unwrap();
@@ -436,10 +468,7 @@ mod tests {
         assert_eq!(spec.body["tools"][0]["type"], json!("web_search"));
         assert_eq!(
             spec.body["include"],
-            json!([
-                "web_search_call.results",
-                "web_search_call.action.sources"
-            ])
+            json!(["web_search_call.results", "web_search_call.action.sources"])
         );
         // Formatter merges the user+assistant turns into one `<history>` user message.
         let input = spec.body["input"].as_array().unwrap();
@@ -479,7 +508,14 @@ mod tests {
             }
         }));
         let model = model_with(transport, "gpt-5");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
         let rendered = out[0].as_ref().unwrap_err().to_string();
         assert!(rendered.contains("rate_limit_error"), "{rendered}");
         assert!(rendered.contains("rate_limit_exceeded"), "{rendered}");
@@ -498,7 +534,9 @@ mod tests {
             ContentBlock::ToolUse(ToolUseBlock::new(
                 "call_1",
                 "get_weather",
-                [("city".to_string(), json!("Beijing"))].into_iter().collect(),
+                [("city".to_string(), json!("Beijing"))]
+                    .into_iter()
+                    .collect(),
             )),
         ]);
         let tool = Msg::tool_blocks(vec![ToolResultBlock::new(

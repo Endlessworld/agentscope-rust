@@ -82,11 +82,7 @@ impl SkillRow {
     }
 }
 
-fn column_text(
-    row: &[ColumnValue],
-    index: usize,
-    name: &str,
-) -> JdbcResult<Option<String>> {
+fn column_text(row: &[ColumnValue], index: usize, name: &str) -> JdbcResult<Option<String>> {
     match row.get(index) {
         Some(ColumnValue::Text(text)) => Ok(Some(text.clone())),
         Some(ColumnValue::Null) | None => Ok(None),
@@ -235,9 +231,7 @@ impl JdbcAgentSkillRepository {
             names.push(name);
         }
         if omitted > 0 {
-            tracing::warn!(
-                "[jdbc-skill] skill name listing is partial: {omitted} name(s) omitted"
-            );
+            tracing::warn!("[jdbc-skill] skill name listing is partial: {omitted} name(s) omitted");
         }
         Ok(names)
     }
@@ -377,10 +371,12 @@ impl JdbcAgentSkillRepository {
         let result = self.executor.in_transaction(&mut |session| {
             for skill in skills {
                 if force {
-                    if let Some(id) = select_skill_id(session, &self.dialect, namespace, skill.name())?
+                    if let Some(id) =
+                        select_skill_id(session, &self.dialect, namespace, skill.name())?
                     {
                         session.execute(&self.dialect.skill_resources_delete_by_skill_id(id))?;
-                        session.execute(&self.dialect.skill_delete_by_name(namespace, skill.name()))?;
+                        session
+                            .execute(&self.dialect.skill_delete_by_name(namespace, skill.name()))?;
                     }
                 }
                 let metadata_json = serialize_metadata(skill.metadata());
@@ -401,9 +397,11 @@ impl JdbcAgentSkillRepository {
                     )));
                 };
                 for (path, content) in skill.resources() {
-                    session.execute(&self.dialect.skill_resources_insert(
-                        namespace, skill_id, path, content,
-                    ))?;
+                    session.execute(
+                        &self
+                            .dialect
+                            .skill_resources_insert(namespace, skill_id, path, content),
+                    )?;
                 }
             }
             Ok(())
@@ -441,23 +439,21 @@ impl JdbcAgentSkillRepository {
             tracing::warn!("[jdbc-skill] skill does not exist: {skill_name}");
             return Ok(false);
         }
-        self.executor.in_transaction(&mut |session| {
-            if let Some(id) = select_skill_id(session, &self.dialect, namespace, skill_name)? {
-                session.execute(&self.dialect.skill_resources_delete_by_skill_id(id))?;
-            }
-            session.execute(&self.dialect.skill_delete_by_name(namespace, skill_name))?;
-            Ok(())
-        })
-        .map_err(db_error)?;
+        self.executor
+            .in_transaction(&mut |session| {
+                if let Some(id) = select_skill_id(session, &self.dialect, namespace, skill_name)? {
+                    session.execute(&self.dialect.skill_resources_delete_by_skill_id(id))?;
+                }
+                session.execute(&self.dialect.skill_delete_by_name(namespace, skill_name))?;
+                Ok(())
+            })
+            .map_err(db_error)?;
         Ok(true)
     }
 
     /// Deletes every skill and resource row of the given namespace, returning the number
     /// of deleted skill rows.
-    pub fn clear_all_skills_in(
-        &self,
-        namespace: &str,
-    ) -> Result<usize, SkillRepositoryError> {
+    pub fn clear_all_skills_in(&self, namespace: &str) -> Result<usize, SkillRepositoryError> {
         validate_namespace(namespace)?;
         if !self.is_writeable_internal() {
             tracing::warn!("[jdbc-skill] cannot clear skills: repository is read-only");

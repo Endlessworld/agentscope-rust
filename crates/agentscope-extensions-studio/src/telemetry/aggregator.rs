@@ -170,7 +170,10 @@ mod tests {
         agg.append(&ChatResponse::new(
             "resp-1",
             vec![text_block("lo")],
-            ChatUsage::builder().input_tokens(3).output_tokens(2).build(),
+            ChatUsage::builder()
+                .input_tokens(3)
+                .output_tokens(2)
+                .build(),
             None,
             Some("stop".to_string()),
         ));

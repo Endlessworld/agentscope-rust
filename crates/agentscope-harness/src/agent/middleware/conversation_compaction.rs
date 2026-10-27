@@ -50,7 +50,11 @@ impl ConversationCompactionMiddleware {
         config: CompactionConfig,
         agent_id: impl Into<String>,
     ) -> Self {
-        Self::new(Arc::new(ConversationCompactor::with_model(model)), config, agent_id)
+        Self::new(
+            Arc::new(ConversationCompactor::with_model(model)),
+            config,
+            agent_id,
+        )
     }
 }
 
@@ -175,11 +179,8 @@ impl Middleware for ConversationCompactionMiddleware {
                     .filter(|message| message.role != MsgRole::System)
                     .cloned()
                     .collect();
-                let usage = crate::agent::context::context_usage(
-                    &history,
-                    &[],
-                    model_name.as_deref(),
-                );
+                let usage =
+                    crate::agent::context::context_usage(&history, &[], model_name.as_deref());
                 (history, (usage.tokens > 0).then_some(usage.tokens as usize))
             };
             match compact_conversation(
@@ -196,11 +197,8 @@ impl Middleware for ConversationCompactionMiddleware {
                 Some(compacted) => {
                     // Announce the compaction in-band so the ACP layer can translate it
                     // into a capability-gated `compaction_update` session notification.
-                    let event = compaction_event(
-                        &agent_id,
-                        &compacted.summary,
-                        Some(&compacted.metrics),
-                    );
+                    let event =
+                        compaction_event(&agent_id, &compacted.summary, Some(&compacted.metrics));
                     futures::stream::once(async move { Ok(event) })
                         .chain(next(input))
                         .boxed()
@@ -311,7 +309,10 @@ pub(crate) fn compaction_event(
             "compaction_id".to_string(),
             serde_json::json!(metrics.compaction_id),
         );
-        fields.insert("status".to_string(), serde_json::json!(metrics.status.as_str()));
+        fields.insert(
+            "status".to_string(),
+            serde_json::json!(metrics.status.as_str()),
+        );
         fields.insert(
             "before_msg_count".to_string(),
             serde_json::json!(metrics.before_msg_count),

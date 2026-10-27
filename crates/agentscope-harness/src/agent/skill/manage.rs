@@ -12,7 +12,7 @@ use agentscope_core::tool::{Tool, ToolExecutionContext};
 
 use super::curator::{SkillState, SkillUsageRecord, SkillUsageStore};
 use super::model::AgentSkill;
-use super::promoter::{SkillAuditLog, SkillPromoter, SkillPromotionGate, AllowListGate};
+use super::promoter::{AllowListGate, SkillAuditLog, SkillPromoter, SkillPromotionGate};
 use super::repository::SkillRepository;
 use crate::tool::fuzzy_text_matcher;
 
@@ -225,8 +225,15 @@ impl SkillManageTool {
     }
 
     /// Creates (or overwrites) a draft skill in the drafts repository.
-    pub fn create_draft(&self, name: &str, skill_md: &str, resources: Vec<(String, String)>) -> std::io::Result<()> {
-        let mut builder = AgentSkill::builder().name(name).description(first_line(skill_md));
+    pub fn create_draft(
+        &self,
+        name: &str,
+        skill_md: &str,
+        resources: Vec<(String, String)>,
+    ) -> std::io::Result<()> {
+        let mut builder = AgentSkill::builder()
+            .name(name)
+            .description(first_line(skill_md));
         builder = builder.add_resource("SKILL.md".to_string(), skill_md.to_string());
         for (rel, content) in resources {
             builder = builder.add_resource(rel, content);
@@ -269,7 +276,12 @@ impl SkillManageTool {
         if !self.config.auto_promote {
             return format!("'{name}' staged as draft; promotion requires a promotion gate (auto_promote=false)");
         }
-        if let Some(draft) = self.drafts_repo.load().into_iter().find(|s| s.name() == name) {
+        if let Some(draft) = self
+            .drafts_repo
+            .load()
+            .into_iter()
+            .find(|s| s.name() == name)
+        {
             if let Err(e) = self.main_repo.write_skill(&draft) {
                 return format!("promotion failed: {e}");
             }
@@ -461,12 +473,17 @@ impl Tool for ProposeSkillTool {
             .to_string();
         match self.manage.create_draft(name, &skill_md, vec![]) {
             Ok(()) => {
-                let auto = args.get("auto_promote").and_then(|v| v.as_bool()).unwrap_or(false);
+                let auto = args
+                    .get("auto_promote")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if auto {
                     let msg = self.manage.promote(name, "agent");
                     Ok(ToolResultBlock::text(format!("proposed '{name}'; {msg}")))
                 } else {
-                    Ok(ToolResultBlock::text(format!("proposed draft skill '{name}'")))
+                    Ok(ToolResultBlock::text(format!(
+                        "proposed draft skill '{name}'"
+                    )))
                 }
             }
             Err(e) => Ok(ToolResultBlock::error(format!("proposal failed: {e}"))),
@@ -475,9 +492,9 @@ impl Tool for ProposeSkillTool {
 }
 
 fn required_str<'a>(args: &'a JsonMap, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| agentscope_core::Error::Tool(format!("missing string argument: {key}").into()))
+    args.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+        agentscope_core::Error::Tool(format!("missing string argument: {key}").into())
+    })
 }
 
 /// Builds a `SkillPromoter` from the writable drafts/main repositories, gate and
@@ -529,7 +546,10 @@ mod tests {
         assert_eq!(tool.drafts_repo.load().len(), 1);
 
         let args = json!({"action": "list"}).as_object().unwrap().clone();
-        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let out = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         let text = out.text_content();
         assert!(text.contains("demo"));
     }
@@ -544,8 +564,14 @@ mod tests {
             SkillManageConfig::new(main, drafts),
         ));
         let propose = ProposeSkillTool::new(Arc::clone(&manage));
-        let args = json!({"name": "probe", "skill_md": "# Probe\n"}).as_object().unwrap().clone();
-        let out = propose.call(args, ToolExecutionContext::default()).await.unwrap();
+        let args = json!({"name": "probe", "skill_md": "# Probe\n"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let out = propose
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         assert!(out.text_content().contains("probe"));
         assert_eq!(manage.drafts_repo.load().len(), 1);
     }
@@ -559,15 +585,27 @@ mod tests {
             Arc::new(WorkspaceSkillRepository::new_writable(&drafts, "drafts")),
             SkillManageConfig::new(main, drafts),
         );
-        tool.create_draft("demo", "# Demo\n\nold body\n", vec![]).unwrap();
+        tool.create_draft("demo", "# Demo\n\nold body\n", vec![])
+            .unwrap();
         let args = json!({"action": "edit", "name": "demo", "content": "# Demo\n\nnew body\n"})
             .as_object()
             .unwrap()
             .clone();
-        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let out = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         assert!(out.text_content().contains("SKILL.md replaced"));
-        let skill = tool.drafts_repo.load().into_iter().find(|s| s.name() == "demo").unwrap();
-        assert_eq!(skill.resources().get("SKILL.md").unwrap(), "# Demo\n\nnew body\n");
+        let skill = tool
+            .drafts_repo
+            .load()
+            .into_iter()
+            .find(|s| s.name() == "demo")
+            .unwrap();
+        assert_eq!(
+            skill.resources().get("SKILL.md").unwrap(),
+            "# Demo\n\nnew body\n"
+        );
     }
 
     #[tokio::test]
@@ -581,7 +619,8 @@ mod tests {
         );
         // Trailing-whitespace-normalised match: the old_string carries different
         // trailing spaces than the stored file.
-        tool.create_draft("demo", "# Demo\ntarget line   \nend\n", vec![]).unwrap();
+        tool.create_draft("demo", "# Demo\ntarget line   \nend\n", vec![])
+            .unwrap();
         let args = json!({
             "action": "patch",
             "name": "demo",
@@ -591,12 +630,27 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let out = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         let text = out.text_content();
         assert!(text.contains("Patched SKILL.md"), "got: {text}");
-        assert!(text.contains("fuzzy"), "expected fuzzy level suffix, got: {text}");
-        let skill = tool.drafts_repo.load().into_iter().find(|s| s.name() == "demo").unwrap();
-        assert!(skill.resources().get("SKILL.md").unwrap().contains("replaced"));
+        assert!(
+            text.contains("fuzzy"),
+            "expected fuzzy level suffix, got: {text}"
+        );
+        let skill = tool
+            .drafts_repo
+            .load()
+            .into_iter()
+            .find(|s| s.name() == "demo")
+            .unwrap();
+        assert!(skill
+            .resources()
+            .get("SKILL.md")
+            .unwrap()
+            .contains("replaced"));
     }
 
     #[tokio::test]
@@ -618,8 +672,15 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let out = tool.call(args, ToolExecutionContext::default()).await.unwrap();
-        assert!(out.text_content().contains("not unique"), "got: {}", out.text_content());
+        let out = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
+        assert!(
+            out.text_content().contains("not unique"),
+            "got: {}",
+            out.text_content()
+        );
     }
 
     #[tokio::test]
@@ -642,7 +703,9 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        tool.call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

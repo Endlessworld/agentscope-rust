@@ -26,8 +26,8 @@ use agentscope_core::{
 
 use super::dto::{
     AnthropicCacheControl, AnthropicContentBlock, AnthropicImageBlock, AnthropicImageSource,
-    AnthropicMessage, AnthropicRequest, AnthropicTextBlock, AnthropicTool, AnthropicToolChoice,
-    AnthropicToolResultBlock, AnthropicToolResultContent, AnthropicServerToolUseBlock,
+    AnthropicMessage, AnthropicRequest, AnthropicServerToolUseBlock, AnthropicTextBlock,
+    AnthropicTool, AnthropicToolChoice, AnthropicToolResultBlock, AnthropicToolResultContent,
     AnthropicToolUseBlock, SystemPrompt,
 };
 use super::parser::METADATA_SERVER_TOOL_RESULT;
@@ -165,17 +165,15 @@ pub fn data_content_block(block: &DataBlock, fmt: &ChatFormatOptions) -> Anthrop
     // Anthropic only exposes an image content block; non-image MIME types are
     // reported as a text fallback instead of failing the whole request.
     match resolve_mime_type(&block.source) {
-        Ok(mime) if mime.starts_with("image/") => {
-            match image_source(&block.source) {
-                Ok(source) => AnthropicContentBlock::Image(AnthropicImageBlock {
-                    source,
-                    cache_control: fmt.cache_control.then(|| fmt.marker()),
-                }),
-                Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
-                    "[Media - processing failed: {e}]"
-                ))),
-            }
-        }
+        Ok(mime) if mime.starts_with("image/") => match image_source(&block.source) {
+            Ok(source) => AnthropicContentBlock::Image(AnthropicImageBlock {
+                source,
+                cache_control: fmt.cache_control.then(|| fmt.marker()),
+            }),
+            Err(e) => AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+                "[Media - processing failed: {e}]"
+            ))),
+        },
         Ok(mime) => {
             crate::common::diagnostics::warn(
                 "unsupported_media_type",
@@ -260,7 +258,10 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
     if block.is_server_tool() {
         if let Some(raw) = block.metadata.get(METADATA_SERVER_TOOL_RESULT) {
             if let Ok(restored) = serde_json::from_value::<AnthropicContentBlock>(raw.clone()) {
-                return AnthropicMessage { role: "user".to_string(), content: vec![restored] };
+                return AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![restored],
+                };
             }
         }
     }
@@ -268,7 +269,9 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
     for output in &block.output {
         match output {
             ContentBlock::Text(t) => {
-                content.push(AnthropicToolResultContent::Text { text: t.text.clone() });
+                content.push(AnthropicToolResultContent::Text {
+                    text: t.text.clone(),
+                });
             }
             ContentBlock::Image(i) => match image_source(&i.source) {
                 Ok(source) => content.push(AnthropicToolResultContent::Image { source }),
@@ -291,12 +294,14 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
     }
     AnthropicMessage {
         role: "user".to_string(),
-        content: vec![AnthropicContentBlock::ToolResult(AnthropicToolResultBlock {
-            tool_use_id: block.id.clone().unwrap_or_default(),
-            content,
-            is_error: None,
-            cache_control: fmt.cache_control.then(|| fmt.marker()),
-        })],
+        content: vec![AnthropicContentBlock::ToolResult(
+            AnthropicToolResultBlock {
+                tool_use_id: block.id.clone().unwrap_or_default(),
+                content,
+                is_error: None,
+                cache_control: fmt.cache_control.then(|| fmt.marker()),
+            },
+        )],
     }
 }
 
@@ -320,7 +325,10 @@ pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<A
         if !regular.is_empty() {
             let blocks = message_content_blocks(&regular, fmt);
             if !blocks.is_empty() {
-                out.push(AnthropicMessage { role: role_str(msg.role).to_string(), content: blocks });
+                out.push(AnthropicMessage {
+                    role: role_str(msg.role).to_string(),
+                    content: blocks,
+                });
             }
         }
 
@@ -367,10 +375,14 @@ pub fn to_tool_choice(
 ) -> AnthropicToolChoice {
     let disable = parallel_tool_calls.map(|v| !v);
     match choice {
-        ToolChoice::Auto => AnthropicToolChoice::Auto { disable_parallel_tool_use: disable },
+        ToolChoice::Auto => AnthropicToolChoice::Auto {
+            disable_parallel_tool_use: disable,
+        },
         ToolChoice::None => AnthropicToolChoice::None,
         // Anthropic has no "required"; `any` forces a tool call.
-        ToolChoice::Required => AnthropicToolChoice::Any { disable_parallel_tool_use: disable },
+        ToolChoice::Required => AnthropicToolChoice::Any {
+            disable_parallel_tool_use: disable,
+        },
         ToolChoice::Specific { tool_name } => AnthropicToolChoice::Tool {
             name: tool_name.clone(),
             disable_parallel_tool_use: disable,
@@ -417,8 +429,10 @@ pub fn build_request(
     fmt: &ChatFormatOptions,
     stream: bool,
 ) -> AnthropicRequest {
-    let pick_f64 = |f: fn(&GenerateOptions) -> Option<f64>| f(options).or_else(|| f(default_options));
-    let pick_u32 = |f: fn(&GenerateOptions) -> Option<u32>| f(options).or_else(|| f(default_options));
+    let pick_f64 =
+        |f: fn(&GenerateOptions) -> Option<f64>| f(options).or_else(|| f(default_options));
+    let pick_u32 =
+        |f: fn(&GenerateOptions) -> Option<u32>| f(options).or_else(|| f(default_options));
 
     // The leading system prompt is sent via the top-level `system` field, so it
     // is excluded from the conversation body (mirrors the Java model, which
@@ -441,13 +455,17 @@ pub fn build_request(
         .as_ref()
         .or(default_options.tool_choice.as_ref())
         .map(|c| {
-            let parallel = options.parallel_tool_calls.or(default_options.parallel_tool_calls);
+            let parallel = options
+                .parallel_tool_calls
+                .or(default_options.parallel_tool_calls);
             to_tool_choice(c, parallel)
         })
         .or_else(|| {
             // No explicit choice but a parallel-tool-calls override: Anthropic
             // requires an implicit `auto` choice to carry the flag.
-            let parallel = options.parallel_tool_calls.or(default_options.parallel_tool_calls);
+            let parallel = options
+                .parallel_tool_calls
+                .or(default_options.parallel_tool_calls);
             parallel.map(|p| AnthropicToolChoice::Auto {
                 disable_parallel_tool_use: Some(!p),
             })
@@ -536,7 +554,10 @@ pub enum ConversationBlock {
 /// Text and hint blocks accumulate into `"<name>: <content>"` lines; images and
 /// data blocks flush the accumulated text and appear in place as their own
 /// elements. Thinking blocks are in-memory only and are not merged.
-pub fn merge_conversation(messages: &[Msg], conversation_history_prompt: &str) -> Vec<ConversationBlock> {
+pub fn merge_conversation(
+    messages: &[Msg],
+    conversation_history_prompt: &str,
+) -> Vec<ConversationBlock> {
     let mut blocks: Vec<ConversationBlock> = Vec::new();
     let mut text: Vec<String> = Vec::new();
 
@@ -577,7 +598,10 @@ pub fn merge_conversation(messages: &[Msg], conversation_history_prompt: &str) -
         Some(ConversationBlock::Text(first)) => {
             *first = format!("{conversation_history_prompt}<history>\n{first}");
         }
-        _ => blocks.insert(0, ConversationBlock::Text(format!("{conversation_history_prompt}<history>\n"))),
+        _ => blocks.insert(
+            0,
+            ConversationBlock::Text(format!("{conversation_history_prompt}<history>\n")),
+        ),
     }
     match blocks.last_mut() {
         Some(ConversationBlock::Text(last)) => last.push_str("\n</history>"),
@@ -642,7 +666,11 @@ pub fn to_multi_agent_messages(
                 out.extend(to_anthropic_messages(group, fmt));
             }
             GroupType::AgentConversation => {
-                let prompt = if *is_first { conversation_history_prompt } else { "" };
+                let prompt = if *is_first {
+                    conversation_history_prompt
+                } else {
+                    ""
+                };
                 *is_first = false;
                 if let Some(message) = merged_agent_message(group, prompt, fmt) {
                     out.push(message);
@@ -655,13 +683,28 @@ pub fn to_multi_agent_messages(
         let msg_type = determine_group_type(msg);
         if msg_type == GroupType::System {
             if !current.is_empty() {
-                flush(current_type.unwrap_or(GroupType::AgentConversation), &current, &mut is_first_agent_group, &mut result);
+                flush(
+                    current_type.unwrap_or(GroupType::AgentConversation),
+                    &current,
+                    &mut is_first_agent_group,
+                    &mut result,
+                );
                 current.clear();
             }
-            flush(GroupType::System, std::slice::from_ref(msg), &mut is_first_agent_group, &mut result);
+            flush(
+                GroupType::System,
+                std::slice::from_ref(msg),
+                &mut is_first_agent_group,
+                &mut result,
+            );
             current_type = None;
         } else if Some(msg_type) != current_type && !current.is_empty() {
-            flush(current_type.unwrap_or(GroupType::AgentConversation), &current, &mut is_first_agent_group, &mut result);
+            flush(
+                current_type.unwrap_or(GroupType::AgentConversation),
+                &current,
+                &mut is_first_agent_group,
+                &mut result,
+            );
             current.clear();
             current_type = Some(msg_type);
             current.push(msg.clone());
@@ -671,7 +714,12 @@ pub fn to_multi_agent_messages(
         }
     }
     if !current.is_empty() {
-        flush(current_type.unwrap_or(GroupType::AgentConversation), &current, &mut is_first_agent_group, &mut result);
+        flush(
+            current_type.unwrap_or(GroupType::AgentConversation),
+            &current,
+            &mut is_first_agent_group,
+            &mut result,
+        );
     }
     result
 }
@@ -683,8 +731,14 @@ fn determine_group_type(msg: &Msg) -> GroupType {
     {
         return GroupType::System;
     }
-    let has_tool_use = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolUse(_)));
-    let has_tool_result = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolResult(_)));
+    let has_tool_use = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse(_)));
+    let has_tool_result = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolResult(_)));
     if has_tool_use || has_tool_result {
         GroupType::ToolSequence
     } else {
@@ -712,7 +766,10 @@ fn merged_agent_message(
     if blocks.is_empty() {
         return None;
     }
-    Some(AnthropicMessage { role: "user".to_string(), content: blocks })
+    Some(AnthropicMessage {
+        role: "user".to_string(),
+        content: blocks,
+    })
 }
 
 /// Text-only view of a message (used by `extract_text_content` consumers).
@@ -781,7 +838,10 @@ mod tests {
     #[test]
     fn cached_system_prompt_uses_text_blocks() {
         let messages = vec![Msg::system("be brief")];
-        let fmt = ChatFormatOptions { cache_control: true, cache_ttl: Some("1h".into()) };
+        let fmt = ChatFormatOptions {
+            cache_control: true,
+            cache_ttl: Some("1h".into()),
+        };
         let request = build_request(
             "m",
             &messages,
@@ -820,7 +880,9 @@ mod tests {
                 assert_eq!(tr.tool_use_id, "toolu_1");
                 assert_eq!(
                     tr.content,
-                    vec![AnthropicToolResultContent::Text { text: "sunny".into() }]
+                    vec![AnthropicToolResultContent::Text {
+                        text: "sunny".into()
+                    }]
                 );
             }
             other => panic!("expected tool result, got {other:?}"),
@@ -839,7 +901,9 @@ mod tests {
     fn image_falls_back_to_text_on_unsupported_extension() {
         let block = ImageBlock::new(Source::Url(URLSource::new("https://x/a.txt")));
         match image_content_block(&block, &plain()) {
-            AnthropicContentBlock::Text(t) => assert!(t.text.starts_with("[Image - processing failed:")),
+            AnthropicContentBlock::Text(t) => {
+                assert!(t.text.starts_with("[Image - processing failed:"))
+            }
             other => panic!("expected text fallback, got {other:?}"),
         }
     }
@@ -851,7 +915,10 @@ mod tests {
             AnthropicContentBlock::Image(i) => {
                 assert_eq!(
                     i.source,
-                    AnthropicImageSource::Base64 { media_type: "image/png".into(), data: "AAAA".into() }
+                    AnthropicImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into()
+                    }
                 );
             }
             other => panic!("expected image, got {other:?}"),
@@ -873,9 +940,18 @@ mod tests {
         let plain_tools = to_anthropic_tools(&tools, &plain());
         assert_eq!(plain_tools.len(), 2);
         assert!(plain_tools.iter().all(|t| t.cache_control.is_none()));
-        assert_eq!(plain_tools[0].input_schema["type"], serde_json::json!("object"));
+        assert_eq!(
+            plain_tools[0].input_schema["type"],
+            serde_json::json!("object")
+        );
 
-        let cached = to_anthropic_tools(&tools, &ChatFormatOptions { cache_control: true, cache_ttl: None });
+        let cached = to_anthropic_tools(
+            &tools,
+            &ChatFormatOptions {
+                cache_control: true,
+                cache_ttl: None,
+            },
+        );
         assert!(cached[0].cache_control.is_none());
         assert_eq!(cached[1].cache_control.as_ref().unwrap().kind, "ephemeral");
     }
@@ -888,21 +964,36 @@ mod tests {
         );
         assert_eq!(
             to_tool_choice(&ToolChoice::Required, Some(false)),
-            AnthropicToolChoice::Any { disable_parallel_tool_use: Some(true) }
+            AnthropicToolChoice::Any {
+                disable_parallel_tool_use: Some(true)
+            }
         );
         assert_eq!(
-            to_tool_choice(&ToolChoice::Specific { tool_name: "f".into() }, None),
-            AnthropicToolChoice::Tool { name: "f".into(), disable_parallel_tool_use: None }
+            to_tool_choice(
+                &ToolChoice::Specific {
+                    tool_name: "f".into()
+                },
+                None
+            ),
+            AnthropicToolChoice::Tool {
+                name: "f".into(),
+                disable_parallel_tool_use: None
+            }
         );
         assert_eq!(
             to_tool_choice(&ToolChoice::Auto, Some(true)),
-            AnthropicToolChoice::Auto { disable_parallel_tool_use: Some(false) }
+            AnthropicToolChoice::Auto {
+                disable_parallel_tool_use: Some(false)
+            }
         );
     }
 
     #[test]
     fn implicit_auto_choice_when_only_parallel_flag_set() {
-        let options = GenerateOptions { parallel_tool_calls: Some(false), ..Default::default() };
+        let options = GenerateOptions {
+            parallel_tool_calls: Some(false),
+            ..Default::default()
+        };
         let request = build_request(
             "m",
             &[Msg::user("hi")],
@@ -914,7 +1005,9 @@ mod tests {
         );
         assert_eq!(
             request.tool_choice,
-            Some(AnthropicToolChoice::Auto { disable_parallel_tool_use: Some(true) })
+            Some(AnthropicToolChoice::Auto {
+                disable_parallel_tool_use: Some(true)
+            })
         );
     }
 
@@ -926,15 +1019,37 @@ mod tests {
             max_tokens: Some(2048),
             ..Default::default()
         };
-        let options = GenerateOptions { temperature: Some(0.9), ..Default::default() };
-        let request = build_request("m", &[Msg::user("hi")], &[], &options, &defaults, &plain(), true);
+        let options = GenerateOptions {
+            temperature: Some(0.9),
+            ..Default::default()
+        };
+        let request = build_request(
+            "m",
+            &[Msg::user("hi")],
+            &[],
+            &options,
+            &defaults,
+            &plain(),
+            true,
+        );
         assert_eq!(request.temperature, Some(0.9));
         assert_eq!(request.top_k, Some(7));
         assert_eq!(request.max_tokens, 2048);
         assert!(request.stream.is_some());
 
-        let thinking = GenerateOptions { thinking_budget: Some(1024), ..Default::default() };
-        let request = build_request("m", &[Msg::user("hi")], &[], &thinking, &defaults, &plain(), false);
+        let thinking = GenerateOptions {
+            thinking_budget: Some(1024),
+            ..Default::default()
+        };
+        let request = build_request(
+            "m",
+            &[Msg::user("hi")],
+            &[],
+            &thinking,
+            &defaults,
+            &plain(),
+            false,
+        );
         assert_eq!(request.thinking.unwrap().budget_tokens, 1024);
     }
 
@@ -949,7 +1064,10 @@ mod tests {
             &plain(),
             false,
         );
-        assert_eq!(request.max_tokens, super::super::credential::DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            request.max_tokens,
+            super::super::credential::DEFAULT_MAX_TOKENS
+        );
     }
 
     #[test]
@@ -982,7 +1100,13 @@ mod tests {
     fn apply_cache_control_marks_last_cacheable_block() {
         let messages = vec![Msg::user("first"), Msg::user("second")];
         let mut converted = to_anthropic_messages(&messages, &plain());
-        apply_cache_control(&mut converted, &ChatFormatOptions { cache_control: true, cache_ttl: None });
+        apply_cache_control(
+            &mut converted,
+            &ChatFormatOptions {
+                cache_control: true,
+                cache_ttl: None,
+            },
+        );
         match &converted[1].content[0] {
             AnthropicContentBlock::Text(t) => {
                 assert_eq!(t.cache_control.as_ref().unwrap().kind, "ephemeral")
@@ -999,8 +1123,16 @@ mod tests {
     #[test]
     fn conversation_merge_wraps_history_tags() {
         let messages = vec![
-            Msg::builder().role(MsgRole::User).name("Alice").text_content("hi").build(),
-            Msg::builder().role(MsgRole::Assistant).name("Bob").text_content("hello").build(),
+            Msg::builder()
+                .role(MsgRole::User)
+                .name("Alice")
+                .text_content("hi")
+                .build(),
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .name("Bob")
+                .text_content("hello")
+                .build(),
         ];
         let blocks = merge_conversation(&messages, "PROMPT\n");
         assert_eq!(blocks.len(), 1);
@@ -1018,7 +1150,8 @@ mod tests {
         let messages = vec![Msg::user_blocks(vec![
             ContentBlock::Text(TextBlock::new("look")),
             ContentBlock::Image(ImageBlock::new(Source::Base64(Base64Source::new(
-                "image/png", "AAAA",
+                "image/png",
+                "AAAA",
             )))),
         ])];
         let blocks = merge_conversation(&messages, "");
@@ -1034,11 +1167,21 @@ mod tests {
     fn multi_agent_groups_tool_sequences_separately() {
         let messages = vec![
             Msg::system("be brief"),
-            Msg::builder().role(MsgRole::User).name("Alice").text_content("hi").build(),
-            Msg::builder().role(MsgRole::Assistant).name("Bob").text_content("hello").build(),
-            Msg::assistant_blocks(vec![
-                ContentBlock::ToolUse(ToolUseBlock::new("toolu_1", "f", JsonMap::new())),
-            ]),
+            Msg::builder()
+                .role(MsgRole::User)
+                .name("Alice")
+                .text_content("hi")
+                .build(),
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .name("Bob")
+                .text_content("hello")
+                .build(),
+            Msg::assistant_blocks(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                "toolu_1",
+                "f",
+                JsonMap::new(),
+            ))]),
             Msg::tool("toolu_1", "f", "done"),
         ];
         let out = to_multi_agent_messages(&messages, DEFAULT_CONVERSATION_HISTORY_PROMPT, &plain());
@@ -1054,7 +1197,10 @@ mod tests {
         }
         assert_eq!(out[2].role, "assistant");
         assert_eq!(out[3].role, "user");
-        assert!(matches!(&out[3].content[0], AnthropicContentBlock::ToolResult(_)));
+        assert!(matches!(
+            &out[3].content[0],
+            AnthropicContentBlock::ToolResult(_)
+        ));
     }
 
     #[test]
@@ -1094,7 +1240,10 @@ mod tests {
             other => panic!("expected server_tool_use, got {other:?}"),
         }
         // The tool result travels as its own user message and is restored verbatim.
-        let user = out.iter().find(|m| m.role == "user").expect("result message");
+        let user = out
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("result message");
         match &user.content[0] {
             AnthropicContentBlock::WebSearchToolResult(r) => {
                 assert_eq!(r.tool_use_id, "srvtoolu_1");
@@ -1110,7 +1259,10 @@ mod tests {
         tool_use.state = ToolCallState::Finished;
         let messages = vec![Msg::assistant_blocks(vec![ContentBlock::ToolUse(tool_use)])];
         let out = to_anthropic_messages(&messages, &plain());
-        assert!(matches!(&out[0].content[0], AnthropicContentBlock::ToolUse(_)));
+        assert!(matches!(
+            &out[0].content[0],
+            AnthropicContentBlock::ToolUse(_)
+        ));
 
         let hint = Msg::builder()
             .role(MsgRole::Tool)

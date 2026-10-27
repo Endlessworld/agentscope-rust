@@ -69,7 +69,11 @@ impl GitHubOutboundClient {
                 "unparseable peerId '{to}'"
             )));
         }
-        Ok(ThreadTarget { owner, repo, number })
+        Ok(ThreadTarget {
+            owner,
+            repo,
+            number,
+        })
     }
 
     /// Build one request per message (blank texts are skipped, mirroring Java `Mono.empty()`).
@@ -155,7 +159,10 @@ mod tests {
             "https://api.github.com/repos/octo/repo/issues/7/comments"
         );
         assert_eq!(req.header_value("Authorization"), Some("Bearer pat"));
-        assert_eq!(req.header_value("Accept"), Some("application/vnd.github+json"));
+        assert_eq!(
+            req.header_value("Accept"),
+            Some("application/vnd.github+json")
+        );
         assert_eq!(req.header_value("X-GitHub-Api-Version"), Some("2022-11-28"));
         assert_eq!(req.header_value("User-Agent"), Some("agentscope-builder"));
         assert_eq!(req.body.as_ref().unwrap()["body"], json!("hello"));

@@ -35,7 +35,6 @@ pub fn default_excluded_tools() -> HashSet<String> {
     .collect()
 }
 
-
 /// Configuration for per-tool-result eviction of oversized outputs.
 #[derive(Debug, Clone)]
 pub struct ToolResultEvictionConfig {

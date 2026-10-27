@@ -40,7 +40,11 @@ pub struct XxlJobAgentScheduler {
 impl XxlJobAgentScheduler {
     /// Creates a new scheduler with the given agent factory.
     pub fn new(factory: Arc<dyn AgentFactory>) -> Self {
-        Self { factory, handlers: RwLock::new(HashMap::new()), shutdown: AtomicBool::new(false) }
+        Self {
+            factory,
+            handlers: RwLock::new(HashMap::new()),
+            shutdown: AtomicBool::new(false),
+        }
     }
 
     /// Registers using a runtime config (carries model/toolkit for execution).
@@ -182,22 +186,31 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_none_mode() {
         let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
-        let cfg = ScheduleConfig::builder().cron("0 0 8 * * ?").build().unwrap();
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .build()
+            .unwrap();
         assert!(sched.schedule_runtime(runtime("A"), cfg).is_err());
     }
 
     #[tokio::test]
     async fn duplicate_registration_returns_existing() {
         let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
-        let a = sched.schedule_runtime(runtime("A"), ScheduleConfig::none()).unwrap();
-        let b = sched.schedule_runtime(runtime("A"), ScheduleConfig::none()).unwrap();
+        let a = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
+        let b = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
         assert_eq!(a.id(), b.id());
     }
 
     #[tokio::test]
     async fn cancel_is_unsupported_shutdown_clears() {
         let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
-        sched.schedule_runtime(runtime("A"), ScheduleConfig::none()).unwrap();
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
         assert!(!sched.cancel("A").await);
         assert!(sched.get_scheduled_agent("A").is_some());
         sched.shutdown().await;

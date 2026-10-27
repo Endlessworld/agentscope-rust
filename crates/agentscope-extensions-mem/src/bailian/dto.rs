@@ -20,7 +20,10 @@ pub struct BailianMessage {
 impl BailianMessage {
     /// Creates a message.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into() }
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -190,7 +193,11 @@ impl BailianSearchRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BailianMemoryNode {
     /// Unique node identifier.
-    #[serde(rename = "memory_node_id", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memory_node_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_node_id: Option<String>,
     /// Memory content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,13 +206,25 @@ pub struct BailianMemoryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     /// Previous content (only for `UPDATE` events).
-    #[serde(rename = "old_content", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "old_content",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub old_content: Option<String>,
     /// Creation timestamp (Unix seconds).
-    #[serde(rename = "created_at", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "created_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_at: Option<i64>,
     /// Update timestamp (Unix seconds).
-    #[serde(rename = "updated_at", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updated_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_at: Option<i64>,
 }
 
@@ -213,10 +232,18 @@ pub struct BailianMemoryNode {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct BailianAddResponse {
     /// Request ID for tracing.
-    #[serde(rename = "request_id", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "request_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub request_id: Option<String>,
     /// Nodes created or updated.
-    #[serde(rename = "memory_nodes", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memory_nodes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_nodes: Option<Vec<BailianMemoryNode>>,
 }
 
@@ -224,9 +251,17 @@ pub struct BailianAddResponse {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct BailianSearchResponse {
     /// Request ID for tracing.
-    #[serde(rename = "request_id", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "request_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub request_id: Option<String>,
     /// Nodes ordered by relevance.
-    #[serde(rename = "memory_nodes", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memory_nodes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_nodes: Option<Vec<BailianMemoryNode>>,
 }

@@ -212,7 +212,11 @@ impl OssClient for InMemoryOssClient {
         } else {
             None
         };
-        Ok(OssListPage { objects, truncated, next_token })
+        Ok(OssListPage {
+            objects,
+            truncated,
+            next_token,
+        })
     }
 
     fn shutdown(&self) {

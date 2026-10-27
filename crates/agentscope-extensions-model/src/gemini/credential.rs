@@ -51,7 +51,11 @@ pub struct GeminiCredential {
 impl GeminiCredential {
     /// Builds a credential from an API key.
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { id: String::new(), api_key: api_key.into(), base_url: None }
+        Self {
+            id: String::new(),
+            api_key: api_key.into(),
+            base_url: None,
+        }
     }
 
     /// Resolves the API key from an explicit override, then `GEMINI_API_KEY`
@@ -88,7 +92,10 @@ mod tests {
 
     #[test]
     fn resolve_api_key_prefers_the_explicit_value() {
-        assert_eq!(GeminiCredential::resolve_api_key(Some(" k ")), Some("k".to_string()));
+        assert_eq!(
+            GeminiCredential::resolve_api_key(Some(" k ")),
+            Some("k".to_string())
+        );
         assert_eq!(GeminiCredential::resolve_api_key(Some("   ")), None);
     }
 
@@ -102,7 +109,10 @@ mod tests {
 
     #[test]
     fn default_base_url_and_version() {
-        assert_eq!(DEFAULT_BASE_URL, "https://generativelanguage.googleapis.com");
+        assert_eq!(
+            DEFAULT_BASE_URL,
+            "https://generativelanguage.googleapis.com"
+        );
         assert_eq!(API_VERSION, "v1beta");
     }
 }

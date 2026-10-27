@@ -9,12 +9,13 @@ use agentscope_core::middleware::ReasoningInput;
 use agentscope_core::model::GenerateOptions;
 use agentscope_core::tool::ToolExecutionContext;
 use agentscope_core::{Middleware, Tool};
-use futures::StreamExt;
 use agentscope_harness::{
     build_delivery_reminder, prepend_to_system_message, render_subagent_section, Filesystem,
     LocalFilesystem, SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode,
-    SubagentsMiddleware, TaskRepository, TaskRunSpec, TaskStatus, TaskTool, WorkspaceTaskRepository,
+    SubagentsMiddleware, TaskRepository, TaskRunSpec, TaskStatus, TaskTool,
+    WorkspaceTaskRepository,
 };
+use futures::StreamExt;
 
 fn ctx() -> RuntimeContext {
     RuntimeContext::default()
@@ -189,7 +190,9 @@ async fn middleware_injects_section_summary_and_delivery_and_marks_delivered() {
         input,
         Box::new(move |inp| {
             *captured2.lock().unwrap() = Some(inp.messages);
-            Box::pin(futures::stream::empty::<agentscope_core::error::Result<AgentEvent>>())
+            Box::pin(futures::stream::empty::<
+                agentscope_core::error::Result<AgentEvent>,
+            >())
         }),
     );
     let _events: Vec<_> = stream.collect().await;
@@ -216,11 +219,7 @@ async fn middleware_passthrough_when_no_entries() {
     let dir = temp_dir("passthrough").await;
     let repo = Arc::new(new_repo(&dir));
     let mw = SubagentsMiddleware::new(vec![], repo.clone());
-    let input = ReasoningInput::new(
-        vec![Msg::user("hi")],
-        vec![],
-        GenerateOptions::default(),
-    );
+    let input = ReasoningInput::new(vec![Msg::user("hi")], vec![], GenerateOptions::default());
     let stream = mw.on_reasoning(
         &RuntimeContext::default(),
         input,
@@ -275,11 +274,7 @@ async fn task_tool_output_list_cancel() {
         .unwrap();
     assert!(list.text_content().contains("1 tracked task"));
 
-    let cancel = tool
-        .cancel_tool()
-        .call(args, tctx("sess"))
-        .await
-        .unwrap();
+    let cancel = tool.cancel_tool().call(args, tctx("sess")).await.unwrap();
     assert!(cancel.text_content().contains("terminal"));
 
     let _ = tokio::fs::remove_dir_all(&dir).await;

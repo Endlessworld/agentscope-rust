@@ -26,8 +26,8 @@ pub fn create_from_zip(
     source: &str,
     fallback_name: &str,
 ) -> Result<AgentSkill, String> {
-    let mut archive = ZipArchive::new(Cursor::new(zip_bytes))
-        .map_err(|e| format!("invalid skill zip: {e}"))?;
+    let mut archive =
+        ZipArchive::new(Cursor::new(zip_bytes)).map_err(|e| format!("invalid skill zip: {e}"))?;
 
     let mut resources: Vec<(String, Vec<u8>)> = Vec::new();
     let mut skill_md: Option<String> = None;
@@ -50,9 +50,8 @@ pub fn create_from_zip(
         resources.push((name, data));
     }
 
-    let skill_md = skill_md.ok_or_else(|| {
-        format!("skill package must contain a {SKILL_MD} entry")
-    })?;
+    let skill_md =
+        skill_md.ok_or_else(|| format!("skill package must contain a {SKILL_MD} entry"))?;
 
     let (metadata, name, description) = parse_frontmatter(&skill_md, fallback_name)?;
 
@@ -240,7 +239,11 @@ fn split_lines_preserve_trailing(text: &str) -> Vec<&str> {
             }
             b'\r' => {
                 out.push(&text[start..i]);
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 start = i;
             }
             _ => i += 1,
@@ -421,7 +424,8 @@ mod tests {
 
     #[test]
     fn folds_indented_yaml_continuations() {
-        let md = "---\nname: multi\ndescription: first\n  second line\n  third\nversion: 1\n---\nbody";
+        let md =
+            "---\nname: multi\ndescription: first\n  second line\n  third\nversion: 1\n---\nbody";
         let zip = make_zip(&[("multi/SKILL.md", md)]);
         let adapted = adapt_nacos_skill_zip(&zip);
         let mut archive = ZipArchive::new(Cursor::new(&adapted)).unwrap();
@@ -459,7 +463,10 @@ mod tests {
             .unwrap()
             .read_to_string(&mut content)
             .unwrap();
-        assert!(content.contains("description: \"see: http://x\""), "ACTUAL:\n{content}");
+        assert!(
+            content.contains("description: \"see: http://x\""),
+            "ACTUAL:\n{content}"
+        );
     }
 
     #[test]

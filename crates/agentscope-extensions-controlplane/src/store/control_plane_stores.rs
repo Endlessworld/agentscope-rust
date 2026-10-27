@@ -57,17 +57,22 @@ impl ControlPlaneStores {
         let http_base = require_env("CONTROL_PLANE_HTTP")?;
         let token = require_env("BUILDER_INTERNAL_TOKEN")?;
         let agent_name = require_env("CONTROL_PLANE_AGENT_NAME")?;
-        let namespace = std::env::var("CONTROL_PLANE_NAMESPACE").unwrap_or_else(|_| "default".into());
+        let namespace =
+            std::env::var("CONTROL_PLANE_NAMESPACE").unwrap_or_else(|_| "default".into());
         Self::create(http_base, token, agent_name, namespace)
     }
 
     /// Creates a factory reusing connection settings from an [`ControlPlaneConfig`].
     pub fn from_config(config: &ControlPlaneConfig) -> ControlPlaneResult<Self> {
         if config.control_plane_http.trim().is_empty() {
-            return Err(ControlPlaneError::Config("controlPlaneHttp is required".into()));
+            return Err(ControlPlaneError::Config(
+                "controlPlaneHttp is required".into(),
+            ));
         }
         if config.internal_token.trim().is_empty() {
-            return Err(ControlPlaneError::Config("internalToken is required".into()));
+            return Err(ControlPlaneError::Config(
+                "internalToken is required".into(),
+            ));
         }
         let mut s = Self::create(
             config.control_plane_http.clone(),

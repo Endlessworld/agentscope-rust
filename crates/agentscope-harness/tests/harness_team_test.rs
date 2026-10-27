@@ -1,8 +1,8 @@
 //! Tests for the `agent/team` module: LocalTeamClient task board, mailboxes,
 //! wakeups, CAS conflicts and role clipping.
 use agentscope_harness::agent::team::{
-    LocalTeamClient, TeamClient, TeamContext, TeamCreateSpec, TeamError, TeamMemberSpec,
-    TeamRole, TeamTaskStatus,
+    LocalTeamClient, TeamClient, TeamContext, TeamCreateSpec, TeamError, TeamMemberSpec, TeamRole,
+    TeamTaskStatus,
 };
 
 fn team() -> (LocalTeamClient, &'static str) {
@@ -56,7 +56,13 @@ fn claim_respects_blocked_by_dependencies() {
     }
 
     // Complete the dependency → claim succeeds.
-    let v = c.list_tasks(t).unwrap().iter().find(|x| x.id == dep.id).unwrap().version;
+    let v = c
+        .list_tasks(t)
+        .unwrap()
+        .iter()
+        .find(|x| x.id == dep.id)
+        .unwrap()
+        .version;
     let _ = c.complete_task(t, &dep.id, "lead").unwrap();
     drop(v);
     let claimed = c.claim_task(t, &child.id, "qa").unwrap();
@@ -126,7 +132,8 @@ fn member_lifecycle_and_role_contexts() {
     assert!(member_ctx.allows("claim_task"));
 
     // Runtime spawn then shutdown.
-    c.spawn_member(t, TeamMemberSpec::new("helper", TeamRole::Member)).unwrap();
+    c.spawn_member(t, TeamMemberSpec::new("helper", TeamRole::Member))
+        .unwrap();
     let info = c.team_info(t).unwrap();
     assert!(info.members.iter().any(|m| m.name == "helper"));
 

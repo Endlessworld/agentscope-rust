@@ -46,25 +46,48 @@ impl GenerateOptions {
     pub fn merge_options(primary: &GenerateOptions, fallback: &GenerateOptions) -> GenerateOptions {
         let mut b = GenerateOptions::builder();
         b.api_key = primary.api_key.clone().or_else(|| fallback.api_key.clone());
-        b.base_url = primary.base_url.clone().or_else(|| fallback.base_url.clone());
-        b.endpoint_path = primary.endpoint_path.clone().or_else(|| fallback.endpoint_path.clone());
-        b.model_name = primary.model_name.clone().or_else(|| fallback.model_name.clone());
+        b.base_url = primary
+            .base_url
+            .clone()
+            .or_else(|| fallback.base_url.clone());
+        b.endpoint_path = primary
+            .endpoint_path
+            .clone()
+            .or_else(|| fallback.endpoint_path.clone());
+        b.model_name = primary
+            .model_name
+            .clone()
+            .or_else(|| fallback.model_name.clone());
         b.stream = primary.stream.or(fallback.stream);
         b.temperature = primary.temperature.or(fallback.temperature);
         b.top_p = primary.top_p.or(fallback.top_p);
         b.max_tokens = primary.max_tokens.or(fallback.max_tokens);
-        b.max_completion_tokens = primary.max_completion_tokens.or(fallback.max_completion_tokens);
+        b.max_completion_tokens = primary
+            .max_completion_tokens
+            .or(fallback.max_completion_tokens);
         b.frequency_penalty = primary.frequency_penalty.or(fallback.frequency_penalty);
         b.presence_penalty = primary.presence_penalty.or(fallback.presence_penalty);
         b.thinking_budget = primary.thinking_budget.or(fallback.thinking_budget);
-        b.reasoning_effort = primary.reasoning_effort.clone().or_else(|| fallback.reasoning_effort.clone());
-        b.execution_config = ExecutionConfig::merge_configs(primary.execution_config.as_ref(), fallback.execution_config.as_ref());
-        b.tool_choice = primary.tool_choice.clone().or_else(|| fallback.tool_choice.clone());
+        b.reasoning_effort = primary
+            .reasoning_effort
+            .clone()
+            .or_else(|| fallback.reasoning_effort.clone());
+        b.execution_config = ExecutionConfig::merge_configs(
+            primary.execution_config.as_ref(),
+            fallback.execution_config.as_ref(),
+        );
+        b.tool_choice = primary
+            .tool_choice
+            .clone()
+            .or_else(|| fallback.tool_choice.clone());
         b.top_k = primary.top_k.or(fallback.top_k);
         b.seed = primary.seed.or(fallback.seed);
         b.cache_control = primary.cache_control.or(fallback.cache_control);
         b.parallel_tool_calls = primary.parallel_tool_calls.or(fallback.parallel_tool_calls);
-        b.response_format = primary.response_format.clone().or_else(|| fallback.response_format.clone());
+        b.response_format = primary
+            .response_format
+            .clone()
+            .or_else(|| fallback.response_format.clone());
         let mut headers = fallback.additional_headers.clone();
         headers.extend(primary.additional_headers.clone());
         b.additional_headers = headers;
@@ -107,29 +130,98 @@ pub struct GenerateOptionsBuilder {
 }
 
 impl GenerateOptionsBuilder {
-    pub fn api_key(mut self, v: impl Into<String>) -> Self { self.api_key = Some(v.into()); self }
-    pub fn base_url(mut self, v: impl Into<String>) -> Self { self.base_url = Some(v.into()); self }
-    pub fn endpoint_path(mut self, v: impl Into<String>) -> Self { self.endpoint_path = Some(v.into()); self }
-    pub fn model_name(mut self, v: impl Into<String>) -> Self { self.model_name = Some(v.into()); self }
-    pub fn stream(mut self, v: bool) -> Self { self.stream = Some(v); self }
-    pub fn temperature(mut self, v: f64) -> Self { self.temperature = Some(v); self }
-    pub fn top_p(mut self, v: f64) -> Self { self.top_p = Some(v); self }
-    pub fn max_tokens(mut self, v: u32) -> Self { self.max_tokens = Some(v); self }
-    pub fn max_completion_tokens(mut self, v: u32) -> Self { self.max_completion_tokens = Some(v); self }
-    pub fn frequency_penalty(mut self, v: f64) -> Self { self.frequency_penalty = Some(v); self }
-    pub fn presence_penalty(mut self, v: f64) -> Self { self.presence_penalty = Some(v); self }
-    pub fn thinking_budget(mut self, v: u32) -> Self { self.thinking_budget = Some(v); self }
-    pub fn reasoning_effort(mut self, v: impl Into<String>) -> Self { self.reasoning_effort = Some(v.into()); self }
-    pub fn execution_config(mut self, v: ExecutionConfig) -> Self { self.execution_config = Some(v); self }
-    pub fn tool_choice(mut self, v: ToolChoice) -> Self { self.tool_choice = Some(v); self }
-    pub fn top_k(mut self, v: u32) -> Self { self.top_k = Some(v); self }
-    pub fn seed(mut self, v: i64) -> Self { self.seed = Some(v); self }
-    pub fn cache_control(mut self, v: bool) -> Self { self.cache_control = Some(v); self }
-    pub fn parallel_tool_calls(mut self, v: bool) -> Self { self.parallel_tool_calls = Some(v); self }
-    pub fn response_format(mut self, v: ResponseFormat) -> Self { self.response_format = Some(v); self }
-    pub fn additional_header(mut self, k: impl Into<String>, v: impl Into<String>) -> Self { self.additional_headers.insert(k.into(), v.into()); self }
-    pub fn additional_body_param(mut self, k: impl Into<String>, v: serde_json::Value) -> Self { self.additional_body_params.insert(k.into(), v); self }
-    pub fn additional_query_param(mut self, k: impl Into<String>, v: impl Into<String>) -> Self { self.additional_query_params.insert(k.into(), v.into()); self }
+    pub fn api_key(mut self, v: impl Into<String>) -> Self {
+        self.api_key = Some(v.into());
+        self
+    }
+    pub fn base_url(mut self, v: impl Into<String>) -> Self {
+        self.base_url = Some(v.into());
+        self
+    }
+    pub fn endpoint_path(mut self, v: impl Into<String>) -> Self {
+        self.endpoint_path = Some(v.into());
+        self
+    }
+    pub fn model_name(mut self, v: impl Into<String>) -> Self {
+        self.model_name = Some(v.into());
+        self
+    }
+    pub fn stream(mut self, v: bool) -> Self {
+        self.stream = Some(v);
+        self
+    }
+    pub fn temperature(mut self, v: f64) -> Self {
+        self.temperature = Some(v);
+        self
+    }
+    pub fn top_p(mut self, v: f64) -> Self {
+        self.top_p = Some(v);
+        self
+    }
+    pub fn max_tokens(mut self, v: u32) -> Self {
+        self.max_tokens = Some(v);
+        self
+    }
+    pub fn max_completion_tokens(mut self, v: u32) -> Self {
+        self.max_completion_tokens = Some(v);
+        self
+    }
+    pub fn frequency_penalty(mut self, v: f64) -> Self {
+        self.frequency_penalty = Some(v);
+        self
+    }
+    pub fn presence_penalty(mut self, v: f64) -> Self {
+        self.presence_penalty = Some(v);
+        self
+    }
+    pub fn thinking_budget(mut self, v: u32) -> Self {
+        self.thinking_budget = Some(v);
+        self
+    }
+    pub fn reasoning_effort(mut self, v: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(v.into());
+        self
+    }
+    pub fn execution_config(mut self, v: ExecutionConfig) -> Self {
+        self.execution_config = Some(v);
+        self
+    }
+    pub fn tool_choice(mut self, v: ToolChoice) -> Self {
+        self.tool_choice = Some(v);
+        self
+    }
+    pub fn top_k(mut self, v: u32) -> Self {
+        self.top_k = Some(v);
+        self
+    }
+    pub fn seed(mut self, v: i64) -> Self {
+        self.seed = Some(v);
+        self
+    }
+    pub fn cache_control(mut self, v: bool) -> Self {
+        self.cache_control = Some(v);
+        self
+    }
+    pub fn parallel_tool_calls(mut self, v: bool) -> Self {
+        self.parallel_tool_calls = Some(v);
+        self
+    }
+    pub fn response_format(mut self, v: ResponseFormat) -> Self {
+        self.response_format = Some(v);
+        self
+    }
+    pub fn additional_header(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
+        self.additional_headers.insert(k.into(), v.into());
+        self
+    }
+    pub fn additional_body_param(mut self, k: impl Into<String>, v: serde_json::Value) -> Self {
+        self.additional_body_params.insert(k.into(), v);
+        self
+    }
+    pub fn additional_query_param(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
+        self.additional_query_params.insert(k.into(), v.into());
+        self
+    }
 
     pub fn build(self) -> GenerateOptions {
         GenerateOptions {

@@ -202,10 +202,14 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_posts_to_the_configured_base_url() {
-        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
+        let transport =
+            ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
         let client = client(transport.clone());
 
-        let response = client.retrieve("What is Haystack?", None, None).await.unwrap();
+        let response = client
+            .retrieve("What is Haystack?", None, None)
+            .await
+            .unwrap();
         assert_eq!(response.code, Some(0));
         assert_eq!(response.effective_documents().len(), 2);
 
@@ -217,7 +221,8 @@ mod tests {
 
     #[tokio::test]
     async fn request_body_contains_query_and_configured_top_k() {
-        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
+        let transport =
+            ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
         let client = client(transport.clone());
         client.retrieve("test query", None, None).await.unwrap();
 
@@ -229,7 +234,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_site_top_k_overrides_the_config() {
-        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
+        let transport =
+            ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
         let client = client(transport.clone());
         client.retrieve("test query", Some(10), None).await.unwrap();
 

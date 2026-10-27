@@ -104,16 +104,46 @@ impl OssAgentStateStore {
         ))
     }
 
-    fn state_object_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> OssResult<String> {
-        Ok(format!("{}{}{}", self.session_prefix(user_id, session_id)?, key, JSON_SUFFIX))
+    fn state_object_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> OssResult<String> {
+        Ok(format!(
+            "{}{}{}",
+            self.session_prefix(user_id, session_id)?,
+            key,
+            JSON_SUFFIX
+        ))
     }
 
-    fn list_object_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> OssResult<String> {
-        Ok(format!("{}{}{}", self.session_prefix(user_id, session_id)?, key, LIST_SUFFIX))
+    fn list_object_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> OssResult<String> {
+        Ok(format!(
+            "{}{}{}",
+            self.session_prefix(user_id, session_id)?,
+            key,
+            LIST_SUFFIX
+        ))
     }
 
-    fn hash_object_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> OssResult<String> {
-        Ok(format!("{}{}{}", self.session_prefix(user_id, session_id)?, key, HASH_SUFFIX))
+    fn hash_object_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> OssResult<String> {
+        Ok(format!(
+            "{}{}{}",
+            self.session_prefix(user_id, session_id)?,
+            key,
+            HASH_SUFFIX
+        ))
     }
 
     fn put_string(&self, object_key: &str, content: &str) -> OssResult<()> {
@@ -181,18 +211,19 @@ impl AgentStateStore for OssAgentStateStore {
 
             let existing_count = if stored_hash.is_some() {
                 match self.get_string(&list_key)? {
-                    Some(existing_json) => serde_json::from_str::<Vec<serde_json::Value>>(&existing_json)
-                        .map(|v| v.len())
-                        .unwrap_or(0),
+                    Some(existing_json) => {
+                        serde_json::from_str::<Vec<serde_json::Value>>(&existing_json)
+                            .map(|v| v.len())
+                            .unwrap_or(0)
+                    }
                     None => 0,
                 }
             } else {
                 0
             };
 
-            let rewrite =
-                needs_full_rewrite(values, stored_hash.as_deref(), existing_count)
-                    || values.len() != existing_count;
+            let rewrite = needs_full_rewrite(values, stored_hash.as_deref(), existing_count)
+                || values.len() != existing_count;
 
             if rewrite {
                 let json = serde_json::to_string(values)?;
@@ -318,6 +349,10 @@ impl OssAgentStateStoreBuilder {
             return Err(OssError::BlankBucket);
         }
         let key_prefix = normalize_prefix(self.key_prefix.as_deref(), DEFAULT_KEY_PREFIX);
-        Ok(OssAgentStateStore { client, bucket_name, key_prefix })
+        Ok(OssAgentStateStore {
+            client,
+            bucket_name,
+            key_prefix,
+        })
     }
 }

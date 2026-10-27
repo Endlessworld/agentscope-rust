@@ -79,11 +79,10 @@ mod tests {
     #[test]
     fn requires_token_and_webhook_token() {
         assert!(GitLabChannelProperties::from_json("gitlab", &serde_json::json!({})).is_err());
-        assert!(GitLabChannelProperties::from_json(
-            "gitlab",
-            &serde_json::json!({"token": "t"})
-        )
-        .is_err());
+        assert!(
+            GitLabChannelProperties::from_json("gitlab", &serde_json::json!({"token": "t"}))
+                .is_err()
+        );
     }
 
     #[test]

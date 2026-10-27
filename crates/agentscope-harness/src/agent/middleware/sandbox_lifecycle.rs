@@ -22,7 +22,10 @@ pub struct SandboxLifecycleMiddleware {
 
 impl SandboxLifecycleMiddleware {
     pub fn new(manager: Arc<SandboxManager>, context: SandboxContext) -> Self {
-        Self { manager, context: Arc::new(context) }
+        Self {
+            manager,
+            context: Arc::new(context),
+        }
     }
 
     /// Replaces the sandbox context used for acquisition decisions.

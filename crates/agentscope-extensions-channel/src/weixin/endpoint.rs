@@ -37,9 +37,7 @@ pub fn normalize_base_url(raw: &str) -> Result<String> {
     }
     let parsed = parse_absolute_url(&value)?;
     if !parsed.path.is_empty() {
-        return Err(ChannelError::Config(
-            "Invalid iLink base URL".to_string(),
-        ));
+        return Err(ChannelError::Config("Invalid iLink base URL".to_string()));
     }
     if !is_secure_or_loopback(&parsed) || !is_allowed_host(&parsed.host, parsed.port) {
         return Err(ChannelError::Config(
@@ -74,9 +72,7 @@ pub fn validate_provider_endpoint(current: &str, candidate: &str) -> Result<Stri
 /// Whether `host` is one of the official provider hosts (or a sub-domain of it).
 pub fn is_official_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
-    lower == OFFICIAL_HOST
-        || lower == OFFICIAL_WEIXIN_HOST
-        || lower.ends_with(OFFICIAL_HOST_SUFFIX)
+    lower == OFFICIAL_HOST || lower == OFFICIAL_WEIXIN_HOST || lower.ends_with(OFFICIAL_HOST_SUFFIX)
 }
 
 /// Whether `host` is the literal loopback host (`localhost`, `127.0.0.1`, `::1`).
@@ -89,8 +85,7 @@ fn is_secure_or_loopback(url: &Url) -> bool {
 }
 
 fn is_allowed_host(host: &str, port: Option<u16>) -> bool {
-    is_loopback(host)
-        || (is_official_host(host) && (port.is_none() || port == Some(443)))
+    is_loopback(host) || (is_official_host(host) && (port.is_none() || port == Some(443)))
 }
 
 /// The subset of a URL the policy needs. Written by hand (no `url` crate dependency) because the
@@ -225,14 +220,16 @@ mod tests {
             "http://127.0.0.1:9999"
         );
         // Loopback -> official provider and official -> third party are both refused.
-        assert!(
-            validate_provider_endpoint("http://127.0.0.1:8089", "https://ilinkai.weixin.qq.com")
-                .is_err()
-        );
-        assert!(
-            validate_provider_endpoint("https://ilinkai.weixin.qq.com", "https://evil.example.com")
-                .is_err()
-        );
+        assert!(validate_provider_endpoint(
+            "http://127.0.0.1:8089",
+            "https://ilinkai.weixin.qq.com"
+        )
+        .is_err());
+        assert!(validate_provider_endpoint(
+            "https://ilinkai.weixin.qq.com",
+            "https://evil.example.com"
+        )
+        .is_err());
     }
 
     #[test]

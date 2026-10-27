@@ -183,7 +183,10 @@ mod tests {
             json!({}),
         ));
         assert_eq!(request.header_value("iLink-App-Id"), Some("bot"));
-        assert_eq!(request.header_value("iLink-App-ClientVersion"), Some("132105"));
+        assert_eq!(
+            request.header_value("iLink-App-ClientVersion"),
+            Some("132105")
+        );
 
         // The Java `jsonPost` layers on `application(...)`, so an authenticated POST carries the
         // app headers *and* the bot-token scheme.
@@ -192,7 +195,10 @@ mod tests {
             "  secret ",
             "uin",
         );
-        assert_eq!(authenticated.header_value("Authorization"), Some("Bearer secret"));
+        assert_eq!(
+            authenticated.header_value("Authorization"),
+            Some("Bearer secret")
+        );
         assert_eq!(
             authenticated.header_value("AuthorizationType"),
             Some("ilink_bot_token")
@@ -266,7 +272,10 @@ mod tests {
         assert_eq!(body["get_updates_buf"], json!("cursor-1"));
         assert_eq!(body["base_info"]["channel_version"], json!("v/1"));
         assert_eq!(body["base_info"]["bot_agent"], json!("AgentScope"));
-        assert_eq!(notify_request_body("v/1", "AgentScope")["base_info"], body["base_info"]);
+        assert_eq!(
+            notify_request_body("v/1", "AgentScope")["base_info"],
+            body["base_info"]
+        );
     }
 
     #[test]

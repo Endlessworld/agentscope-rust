@@ -51,7 +51,10 @@ pub struct Peer {
 
 impl Peer {
     pub fn new(kind: PeerKind, id: impl Into<String>) -> Self {
-        Self { kind, id: id.into() }
+        Self {
+            kind,
+            id: id.into(),
+        }
     }
 
     /// Composite key `"<kind>:<id>"` used in binding matching.

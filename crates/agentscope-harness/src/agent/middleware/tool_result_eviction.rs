@@ -191,7 +191,10 @@ fn fingerprint(tr: &ToolResultBlock) -> ToolResultFingerprint {
 
 fn with_placeholder(tr: ToolResultBlock, placeholder: String) -> ToolResultBlock {
     let mut metadata = tr.metadata.clone();
-    metadata.insert(EVICTED_METADATA_KEY.to_string(), serde_json::Value::Bool(true));
+    metadata.insert(
+        EVICTED_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
     ToolResultBlock {
         id: tr.id,
         name: tr.name,
@@ -201,27 +204,60 @@ fn with_placeholder(tr: ToolResultBlock, placeholder: String) -> ToolResultBlock
     }
 }
 
-fn build_eviction_path(config: &ToolResultEvictionConfig, agent_name: &str, tool_call_id: &str, full_text: &str) -> String {
+fn build_eviction_path(
+    config: &ToolResultEvictionConfig,
+    agent_name: &str,
+    tool_call_id: &str,
+    full_text: &str,
+) -> String {
     let mut base = config.eviction_path.trim_end_matches('/').to_string();
-    let safe_agent: String = agent_name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    let safe_id: String = tool_call_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let safe_agent: String = agent_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_id: String = tool_call_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     let hash_full = sha256_hex(full_text.as_bytes());
     let hash = &hash_full[..8];
     base.push_str(&format!("/{safe_agent}/{safe_id}-{hash}"));
     base
 }
 
-fn build_placeholder(config: &ToolResultEvictionConfig, full_text: &str, eviction_path: &str) -> String {
+fn build_placeholder(
+    config: &ToolResultEvictionConfig,
+    full_text: &str,
+    eviction_path: &str,
+) -> String {
     let len = full_text.chars().count();
     let p_len = config.preview_chars.min(len / 2);
     let head: String = full_text.chars().take(p_len).collect();
-    let tail: String = full_text.chars().skip(len.saturating_sub(p_len)).take(p_len).collect();
+    let tail: String = full_text
+        .chars()
+        .skip(len.saturating_sub(p_len))
+        .take(p_len)
+        .collect();
     let mut sb = String::new();
     sb.push_str(&format!(
         "Tool output was too large ({len} chars) and has been saved to `{eviction_path}`.\n\n"
     ));
     if p_len > 0 {
-        sb.push_str(&format!("Preview (first {p_len} chars):\n{head}\n\n... and last {p_len} chars:\n{tail}\n"));
+        sb.push_str(&format!(
+            "Preview (first {p_len} chars):\n{head}\n\n... and last {p_len} chars:\n{tail}\n"
+        ));
     }
     sb
 }
@@ -229,8 +265,8 @@ fn build_placeholder(config: &ToolResultEvictionConfig, full_text: &str, evictio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::message::{MsgRole, TextBlock};
     use crate::filesystem::LocalFilesystem;
+    use agentscope_core::message::{MsgRole, TextBlock};
 
     fn big_tool_result(text: &str) -> ToolResultBlock {
         ToolResultBlock::new(
@@ -259,14 +295,15 @@ mod tests {
         let p = placeholder.unwrap();
         assert!(p.contains("blobs"));
         assert!(p.contains("0123")); // head preview
-        // file written to disk
+                                     // file written to disk
         let path = build_eviction_path(&config, "agent", "call_1", "0123456789ABCDEF");
         assert!(fs.exists(&ctx, &path).await.unwrap());
     }
 
     #[tokio::test]
     async fn small_tool_result_is_not_evicted() {
-        let dir = std::env::temp_dir().join(format!("agentscope_evict_small_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_evict_small_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir));
@@ -277,7 +314,9 @@ mod tests {
             .build();
         let ctx = RuntimeContext::new();
         let tr = big_tool_result("small");
-        assert!(maybe_evict(&fs, &config, "agent", &ctx, &tr).await.is_none());
+        assert!(maybe_evict(&fs, &config, "agent", &ctx, &tr)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -294,7 +333,9 @@ mod tests {
             .build();
         let ctx = RuntimeContext::new();
         let big = Msg::builder_for_role(Some(MsgRole::Tool))
-            .content(vec![ContentBlock::ToolResult(big_tool_result("0123456789ABCDEF"))])
+            .content(vec![ContentBlock::ToolResult(big_tool_result(
+                "0123456789ABCDEF",
+            ))])
             .build();
         let small = Msg::tool("call_2", "execute", "tiny");
         let messages = vec![big, small];

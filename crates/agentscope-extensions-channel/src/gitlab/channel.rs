@@ -18,10 +18,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::bot_identity::GitLabBotIdentityResolver;
@@ -182,8 +182,7 @@ impl GitLabChannel {
         }
 
         // 6. De-duplication by `object_attributes.id`, then the per-peer bot-loop guard.
-        let dedupe_key =
-            GitLabInboundMapper::extract_note_id(&payload).map(|id| id.to_string());
+        let dedupe_key = GitLabInboundMapper::extract_note_id(&payload).map(|id| id.to_string());
         if !self.core.admit(dedupe_key.as_deref(), &inbound.peer.key()) {
             return GitLabCallbackOutcome::Accepted;
         }
@@ -278,7 +277,8 @@ mod tests {
         let c = channel();
         let body = payload(1, "hello");
         assert_eq!(
-            c.handle_webhook(NOTE_HOOK_EVENT, Some("wrong"), &body).await,
+            c.handle_webhook(NOTE_HOOK_EVENT, Some("wrong"), &body)
+                .await,
             GitLabCallbackOutcome::Unauthorized
         );
         assert_eq!(
@@ -379,7 +379,10 @@ mod tests {
     fn mapped_peer_id_round_trips_into_the_outbound_address() {
         // Guards the peer id the mapper produces (`path/with/namespace#iid:Type`): the harness
         // router turns it into `<channelId>:THREAD:<peerId>`, which the outbound client parses.
-        let peer = Peer::new(agentscope_harness::agent::PeerKind::Thread, "grp/proj#9:Issue");
+        let peer = Peer::new(
+            agentscope_harness::agent::PeerKind::Thread,
+            "grp/proj#9:Issue",
+        );
         assert_eq!(peer.key(), "thread:grp/proj#9:Issue");
         let target = GitLabOutboundClient::parse_address("gitlab:THREAD:grp/proj#9:Issue").unwrap();
         assert_eq!(target.path, "grp/proj");

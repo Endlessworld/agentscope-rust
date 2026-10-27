@@ -95,10 +95,7 @@ async fn a_bare_harness_agent_call_journals_by_default() {
     assert!(*calls.lock().unwrap() >= 1, "the model never ran");
 
     // The call wrote committed history: the facade views read it back.
-    let transcript = agent
-        .session_transcript(&ctx())
-        .await
-        .expect("transcript");
+    let transcript = agent.session_transcript(&ctx()).await.expect("transcript");
     let text: Vec<String> = transcript
         .messages
         .iter()

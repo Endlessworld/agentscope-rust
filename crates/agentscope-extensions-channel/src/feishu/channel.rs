@@ -18,10 +18,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::crypto::FeishuCrypto;
@@ -116,15 +116,14 @@ impl FeishuChannel {
         } else {
             None
         };
-        let token_provider: Arc<dyn AccessTokenProvider> = Arc::new(
-            FeishuAccessTokenProvider::with_store(
+        let token_provider: Arc<dyn AccessTokenProvider> =
+            Arc::new(FeishuAccessTokenProvider::with_store(
                 props.api_base.clone(),
                 props.app_id.clone(),
                 props.app_secret.clone(),
                 transport.clone(),
                 seams.token_store(),
-            ),
-        );
+            ));
         let outbound = FeishuOutboundClient::new(props.api_base.clone(), token_provider, transport);
         Ok(Self::new(
             channel_id,
@@ -263,9 +262,9 @@ impl PlatformChannel for FeishuChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_harness::agent::gateway::channel::Channel as _;
     use crate::common::testing::{RecordingTransport, StaticTokenProvider};
     use crate::common::{ChannelError, IdempotencyStore};
+    use agentscope_harness::agent::gateway::channel::Channel as _;
 
     const API_BASE: &str = "https://open.feishu.cn";
 
@@ -342,7 +341,8 @@ mod tests {
         );
         assert!(c.crypto().is_some());
         assert_eq!(
-            c.handle_callback(Some("bad"), Some("1"), Some("n"), "{}").await,
+            c.handle_callback(Some("bad"), Some("1"), Some("n"), "{}")
+                .await,
             FeishuCallbackOutcome::Unauthorized
         );
     }
@@ -400,8 +400,13 @@ mod tests {
             FeishuCallbackOutcome::Unauthorized
         );
         assert_eq!(
-            c.handle_callback(None, None, None, r#"{"header":{"event_id":"e1"},"event":{"message":{"message_type":"text"}}}"#)
-                .await,
+            c.handle_callback(
+                None,
+                None,
+                None,
+                r#"{"header":{"event_id":"e1"},"event":{"message":{"message_type":"text"}}}"#
+            )
+            .await,
             FeishuCallbackOutcome::Unauthorized
         );
         assert_eq!(c.core().admitted(), 0);
@@ -416,7 +421,10 @@ mod tests {
     #[tokio::test]
     async fn events_are_rejected_when_no_verification_token_is_configured() {
         // Java parity: an unconfigured token still rejects ordinary events (401).
-        let c = build(serde_json::json!({"appId": "cli_x", "appSecret": "s"}), None);
+        let c = build(
+            serde_json::json!({"appId": "cli_x", "appSecret": "s"}),
+            None,
+        );
         let body = r#"{"header":{"event_id":"e1"},"event":{"message":{"message_type":"text"}}}"#;
         assert_eq!(
             c.handle_callback(None, None, None, body).await,

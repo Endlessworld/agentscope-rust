@@ -57,10 +57,12 @@ impl AtomicSessionStorage for SqliteSessionStorage {
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
                 )
                 .optional()
-                .map_err(|error| session_error(format!(
-                    "Journal read failed: {}: {error}",
-                    database.display()
-                )))?;
+                .map_err(|error| {
+                    session_error(format!(
+                        "Journal read failed: {}: {error}",
+                        database.display()
+                    ))
+                })?;
             let Some((version, payload)) = row else {
                 return Ok(None);
             };

@@ -31,7 +31,10 @@ pub struct SimpleKnowledge {
 
 impl SimpleKnowledge {
     /// Creates a knowledge base from an embedding model and a vector store.
-    pub fn new(embedding_model: Arc<dyn EmbeddingModel>, embedding_store: Arc<dyn VdbStore>) -> Self {
+    pub fn new(
+        embedding_model: Arc<dyn EmbeddingModel>,
+        embedding_store: Arc<dyn VdbStore>,
+    ) -> Self {
         Self {
             embedding_model,
             embedding_store,
@@ -58,7 +61,10 @@ impl Knowledge for SimpleKnowledge {
 
         let mut embedded = Vec::with_capacity(documents.len());
         for mut document in documents {
-            let embedding = self.embedding_model.embed(&document.metadata.content).await?;
+            let embedding = self
+                .embedding_model
+                .embed(&document.metadata.content)
+                .await?;
             document.set_embedding(embedding);
             embedded.push(document);
         }
@@ -167,7 +173,11 @@ mod tests {
 
         // A threshold above 1.0 can never be met by cosine similarity.
         let strict = RetrieveConfig::new(5, 1.5);
-        assert!(knowledge.retrieve("alpha beta", &strict).await.unwrap().is_empty());
+        assert!(knowledge
+            .retrieve("alpha beta", &strict)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

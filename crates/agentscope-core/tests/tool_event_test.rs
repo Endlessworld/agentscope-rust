@@ -2,8 +2,8 @@
 use std::sync::Arc;
 
 use agentscope_core::{
-    AgentEvent, AgentEventType, FunctionTool, JsonMap, Tool, ToolExecutionContext, Toolkit,
-    ToolResultBlock, ToolSchema, ToolUseBlock,
+    AgentEvent, AgentEventType, FunctionTool, JsonMap, Tool, ToolExecutionContext, ToolResultBlock,
+    ToolSchema, ToolUseBlock, Toolkit,
 };
 
 fn parse_args(json: &str) -> JsonMap {
@@ -71,20 +71,30 @@ async fn toolkit_register_and_call() {
 #[tokio::test]
 async fn toolkit_external_schema_tool() {
     let tk = Toolkit::new();
-    let schema = ToolSchema::new("query_db", "Query external DB")
-        .parameters(parse_args(r#"{"type": "object", "properties": {"sql": {"type": "string"}}}"#));
+    let schema = ToolSchema::new("query_db", "Query external DB").parameters(parse_args(
+        r#"{"type": "object", "properties": {"sql": {"type": "string"}}}"#,
+    ));
     tk.register_schema(schema);
     assert!(tk.is_external_tool("query_db"));
     let call = ToolUseBlock::new("call-1", "query_db", parse_args(r#"{"sql": "select 1"}"#));
-    let err = tk.call_tool(&call, ToolExecutionContext::default()).await.unwrap_err();
+    let err = tk
+        .call_tool(&call, ToolExecutionContext::default())
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("external"));
 }
 
 #[test]
 fn event_type_wire_names() {
     assert_eq!(AgentEventType::AgentStart.wire_name(), "AGENT_START");
-    assert_eq!(AgentEventType::ToolResultDataDelta.wire_name(), "TOOL_RESULT_DATA_DELTA");
-    assert_eq!(AgentEventType::from_wire_name("RUN_STARTED").unwrap(), AgentEventType::AgentStart);
+    assert_eq!(
+        AgentEventType::ToolResultDataDelta.wire_name(),
+        "TOOL_RESULT_DATA_DELTA"
+    );
+    assert_eq!(
+        AgentEventType::from_wire_name("RUN_STARTED").unwrap(),
+        AgentEventType::AgentStart
+    );
     assert_eq!(
         AgentEventType::from_wire_name("BINARY_BLOCK_START").unwrap(),
         AgentEventType::DataBlockStart
@@ -120,9 +130,12 @@ fn tool_progress_wire_name_round_trips() {
 
 #[test]
 fn agent_event_creation_and_metadata() {
-    let ev = AgentEvent::with_fields(AgentEventType::TextBlockDelta, parse_args(r#"{"text": "hi"}"#))
-        .with_source("main/researcher")
-        .with_metadata("k", serde_json::Value::from(1));
+    let ev = AgentEvent::with_fields(
+        AgentEventType::TextBlockDelta,
+        parse_args(r#"{"text": "hi"}"#),
+    )
+    .with_source("main/researcher")
+    .with_metadata("k", serde_json::Value::from(1));
     assert_eq!(ev.event_type(), AgentEventType::TextBlockDelta);
     assert_eq!(ev.source(), Some("main/researcher"));
     assert_eq!(ev.data().fields.get("text").unwrap(), "hi");

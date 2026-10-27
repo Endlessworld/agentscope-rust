@@ -58,9 +58,7 @@ fn set_cache_control_on_content(message: &mut DashScopeMessage) {
 /// Whether `message` already carries at least one content-level cache marker.
 fn has_cache_marker(message: &DashScopeMessage) -> bool {
     match &message.content {
-        Some(DashScopeContent::Parts(parts)) => {
-            parts.iter().any(|p| p.cache_control.is_some())
-        }
+        Some(DashScopeContent::Parts(parts)) => parts.iter().any(|p| p.cache_control.is_some()),
         _ => false,
     }
 }
@@ -107,8 +105,7 @@ fn metadata_cache_directive(msg: &Msg) -> Option<bool> {
 }
 
 /// DashScope native text-generation endpoint.
-pub const TEXT_GENERATION_ENDPOINT: &str =
-    "/api/v1/services/aigc/text-generation/generation";
+pub const TEXT_GENERATION_ENDPOINT: &str = "/api/v1/services/aigc/text-generation/generation";
 /// DashScope native multimodal-generation endpoint.
 pub const MULTIMODAL_GENERATION_ENDPOINT: &str =
     "/api/v1/services/aigc/multimodal-generation/generation";
@@ -274,9 +271,9 @@ fn multimodal_parts(blocks: &[ContentBlock]) -> Vec<DashScopeContentPart> {
     for block in blocks {
         match block {
             ContentBlock::Text(t) => parts.push(DashScopeContentPart::text(t.text.clone())),
-            ContentBlock::Hint(h) => {
-                parts.push(DashScopeContentPart::text(h.hint.clone().unwrap_or_default()))
-            }
+            ContentBlock::Hint(h) => parts.push(DashScopeContentPart::text(
+                h.hint.clone().unwrap_or_default(),
+            )),
             ContentBlock::Image(i) => parts.push(image_part(i)),
             ContentBlock::Audio(a) => parts.push(audio_part(a)),
             ContentBlock::Video(v) => parts.push(video_part(v)),
@@ -394,10 +391,7 @@ fn multimodal_message(msg: &Msg) -> DashScopeMessage {
 /// `force_multimodal` mirrors "this model only speaks the multimodal API"; when
 /// set, every message uses the content-part list shape regardless of whether it
 /// carries media.
-pub fn to_dashscope_messages(
-    messages: Vec<Msg>,
-    force_multimodal: bool,
-) -> Vec<DashScopeMessage> {
+pub fn to_dashscope_messages(messages: Vec<Msg>, force_multimodal: bool) -> Vec<DashScopeMessage> {
     messages
         .into_iter()
         .map(|msg| {
@@ -622,11 +616,13 @@ mod tests {
             "id",
             None,
             MsgRole::Tool,
-            vec![ContentBlock::ToolResult(agentscope_core::ToolResultBlock::new(
-                "call_1",
-                "get_weather",
-                vec![ContentBlock::Text(TextBlock::new("sunny"))],
-            ))],
+            vec![ContentBlock::ToolResult(
+                agentscope_core::ToolResultBlock::new(
+                    "call_1",
+                    "get_weather",
+                    vec![ContentBlock::Text(TextBlock::new("sunny"))],
+                ),
+            )],
             None,
             None,
             None,
@@ -645,15 +641,19 @@ mod tests {
     #[test]
     fn base64_image_becomes_data_url_part_in_multimodal_mode() {
         let mut msg = Msg::user("look");
-        msg.content.push(ContentBlock::Image(ImageBlock::new(
-            Source::Base64(agentscope_core::Base64Source::new("image/png", "AAAA")),
-        )));
+        msg.content
+            .push(ContentBlock::Image(ImageBlock::new(Source::Base64(
+                agentscope_core::Base64Source::new("image/png", "AAAA"),
+            ))));
         let msgs = to_dashscope_messages(vec![msg], false);
         match msgs[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
                 assert_eq!(parts[0].text.as_deref(), Some("look"));
-                assert_eq!(parts[1].image.as_deref(), Some("data:image/png;base64,AAAA"));
+                assert_eq!(
+                    parts[1].image.as_deref(),
+                    Some("data:image/png;base64,AAAA")
+                );
             }
             other => panic!("expected parts, got {other:?}"),
         }
@@ -675,23 +675,38 @@ mod tests {
     fn thinking_blocks_are_dropped() {
         let mut msg = Msg::user("x");
         msg.content
-            .push(ContentBlock::Thinking(agentscope_core::ThinkingBlock::new("secret")));
+            .push(ContentBlock::Thinking(agentscope_core::ThinkingBlock::new(
+                "secret",
+            )));
         let msgs = to_dashscope_messages(vec![msg], false);
-        assert_eq!(msgs[0].content.as_ref().and_then(|c| c.as_text()), Some("x"));
+        assert_eq!(
+            msgs[0].content.as_ref().and_then(|c| c.as_text()),
+            Some("x")
+        );
         assert!(!serde_json::to_string(&msgs[0]).unwrap().contains("secret"));
     }
 
     #[test]
     fn tools_and_tool_choice_conversion() {
-        let schema = ToolSchema::new("search", "search the web")
-            .parameters(serde_json::json!({"type": "object"}).as_object().unwrap().clone());
+        let schema = ToolSchema::new("search", "search the web").parameters(
+            serde_json::json!({"type": "object"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
         let tools = to_dashscope_tools(vec![schema]);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].tool_type, "function");
         assert_eq!(tools[0].function.name, "search");
 
-        assert_eq!(to_tool_choice_value(&ToolChoice::Auto), serde_json::json!("auto"));
-        assert_eq!(to_tool_choice_value(&ToolChoice::None), serde_json::json!("none"));
+        assert_eq!(
+            to_tool_choice_value(&ToolChoice::Auto),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            to_tool_choice_value(&ToolChoice::None),
+            serde_json::json!("none")
+        );
         assert_eq!(
             to_tool_choice_value(&ToolChoice::Required),
             serde_json::json!("auto")
@@ -728,11 +743,20 @@ mod tests {
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["model"], serde_json::json!("qwen-plus"));
-        assert_eq!(value["parameters"]["result_format"], serde_json::json!("message"));
-        assert_eq!(value["parameters"]["incremental_output"], serde_json::json!(true));
+        assert_eq!(
+            value["parameters"]["result_format"],
+            serde_json::json!("message")
+        );
+        assert_eq!(
+            value["parameters"]["incremental_output"],
+            serde_json::json!(true)
+        );
         assert_eq!(value["parameters"]["temperature"], serde_json::json!(0.2));
         assert_eq!(value["parameters"]["max_tokens"], serde_json::json!(256));
-        assert_eq!(value["input"]["messages"][0]["content"], serde_json::json!("hi"));
+        assert_eq!(
+            value["input"]["messages"][0]["content"],
+            serde_json::json!("hi")
+        );
     }
 
     #[test]
@@ -752,7 +776,10 @@ mod tests {
             false,
         );
         let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value["parameters"]["reasoning_effort"], serde_json::json!("high"));
+        assert_eq!(
+            value["parameters"]["reasoning_effort"],
+            serde_json::json!("high")
+        );
 
         // Absent by default.
         let req = build_request(
@@ -796,7 +823,10 @@ mod tests {
                 .build(),
             user("hello"),
         ];
-        let options = GenerateOptions { cache_control: Some(true), ..Default::default() };
+        let options = GenerateOptions {
+            cache_control: Some(true),
+            ..Default::default()
+        };
         let converted = to_dashscope_messages_with_options(msgs, false, &options);
         let value = serde_json::to_value(&converted).unwrap();
         assert_eq!(
@@ -812,7 +842,8 @@ mod tests {
     #[test]
     fn automatic_cache_control_disabled_by_default() {
         let msgs = vec![user("hello")];
-        let converted = to_dashscope_messages_with_options(msgs, false, &GenerateOptions::default());
+        let converted =
+            to_dashscope_messages_with_options(msgs, false, &GenerateOptions::default());
         let value = serde_json::to_value(&converted).unwrap();
         assert!(value[0]["content"][0].get("cache_control").is_none());
     }

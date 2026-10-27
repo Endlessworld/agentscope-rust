@@ -2,9 +2,9 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
 
@@ -55,7 +55,10 @@ impl PatternMatcher {
             Some(rest) => (true, rest),
             None => (false, pattern),
         };
-        match RegexBuilder::new(body).case_insensitive(ignore_case).build() {
+        match RegexBuilder::new(body)
+            .case_insensitive(ignore_case)
+            .build()
+        {
             Ok(r) => PatternMatcher::Regex(r),
             Err(_) => PatternMatcher::Literal {
                 text: body.to_string(),
@@ -208,11 +211,7 @@ impl LocalFilesystem {
         Self::with_mode(root, LocalFsMode::Sandboxed, 10)
     }
 
-    pub fn with_mode(
-        root: impl Into<PathBuf>,
-        mode: LocalFsMode,
-        max_file_size_mb: usize,
-    ) -> Self {
+    pub fn with_mode(root: impl Into<PathBuf>, mode: LocalFsMode, max_file_size_mb: usize) -> Self {
         let root = root.into();
         let root = if root.is_absolute() {
             root
@@ -237,10 +236,7 @@ impl LocalFilesystem {
     }
 
     /// Adds absolute allow-list roots accepted in [`LocalFsMode::Rooted`].
-    pub fn with_additional_roots(
-        mut self,
-        roots: impl IntoIterator<Item = PathBuf>,
-    ) -> Self {
+    pub fn with_additional_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
         self.additional_roots = roots
             .into_iter()
             .map(|root| {
@@ -325,12 +321,9 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 fn modified_to_string(t: Option<std::time::SystemTime>) -> String {
     t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(
-                d.as_secs() as i64,
-                d.subsec_nanos(),
-            )
-            .unwrap_or_default()
-            .to_rfc3339()
+            chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                .unwrap_or_default()
+                .to_rfc3339()
         })
         .unwrap_or_default()
 }
@@ -397,8 +390,7 @@ impl Filesystem for LocalFilesystem {
         let bytes = tokio::fs::read(&resolved).await.map_err(Error::Io)?;
         if looks_binary(&bytes) {
             use base64::Engine as _;
-            let encoded =
-                base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return Ok(FileData::binary(encoded));
         }
         let content = String::from_utf8_lossy(&bytes).into_owned();
@@ -428,7 +420,9 @@ impl Filesystem for LocalFilesystem {
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
         }
-        tokio::fs::write(&resolved, content).await.map_err(Error::Io)?;
+        tokio::fs::write(&resolved, content)
+            .await
+            .map_err(Error::Io)?;
         Ok(())
     }
     async fn edit(
@@ -443,7 +437,9 @@ impl Filesystem for LocalFilesystem {
         if !resolved.is_file() {
             return Err(Error::Tool(format!("File '{path}' not found")));
         }
-        let content = tokio::fs::read_to_string(&resolved).await.map_err(Error::Io)?;
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .map_err(Error::Io)?;
         let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
         let old_norm = old.replace("\r\n", "\n").replace('\r', "\n");
         // Normalise the replacement too: the file was matched and rewritten in
@@ -467,7 +463,9 @@ impl Filesystem for LocalFilesystem {
         } else {
             normalized.replacen(&old_norm, &new_norm, 1)
         };
-        tokio::fs::write(&resolved, new_content).await.map_err(Error::Io)?;
+        tokio::fs::write(&resolved, new_content)
+            .await
+            .map_err(Error::Io)?;
         Ok(count)
     }
 
@@ -477,7 +475,9 @@ impl Filesystem for LocalFilesystem {
             return Ok(());
         }
         if resolved.is_dir() {
-            tokio::fs::remove_dir_all(&resolved).await.map_err(Error::Io)?;
+            tokio::fs::remove_dir_all(&resolved)
+                .await
+                .map_err(Error::Io)?;
         } else {
             tokio::fs::remove_file(&resolved).await.map_err(Error::Io)?;
         }
@@ -512,7 +512,9 @@ impl Filesystem for LocalFilesystem {
             return Ok(Vec::new());
         }
         let matcher = PatternMatcher::new(pattern);
-        let glob = glob.filter(|g| !g.trim().is_empty()).and_then(GrepGlob::build);
+        let glob = glob
+            .filter(|g| !g.trim().is_empty())
+            .and_then(GrepGlob::build);
         let mut matches = Vec::new();
         if base.is_file() {
             // Linux grep semantics: a single-file path searches that file.

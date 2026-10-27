@@ -23,9 +23,13 @@ use super::tool::Tool;
 /// `None` — not an empty map — when propagation is off, so the transport omits the
 /// `_meta` field entirely.
 pub type McpAsyncHandler = Box<
-    dyn Fn(&McpTool, JsonMap, Option<JsonMap>) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResultBlock>> + Send>,
-    > + Send
+    dyn Fn(
+            &McpTool,
+            JsonMap,
+            Option<JsonMap>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResultBlock>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -37,8 +41,7 @@ pub struct McpTool {
     parameters: serde_json::Value,
     /// Server name this tool belongs to (used in error messages).
     server: String,
-    handler:
-        Box<dyn Fn(&McpTool, JsonMap) -> Result<ToolResultBlock> + Send + Sync>,
+    handler: Box<dyn Fn(&McpTool, JsonMap) -> Result<ToolResultBlock> + Send + Sync>,
     /// Optional async handler, preferred over [`handler`](Self::handler) when
     /// present. Lets MCP tool calls await a real client round-trip without
     /// blocking the tokio runtime.
@@ -92,9 +95,8 @@ impl McpTool {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
-        non_blank(definition.get("title")).or_else(|| {
-            non_blank(definition.get("annotations").and_then(|a| a.get("title")))
-        })
+        non_blank(definition.get("title"))
+            .or_else(|| non_blank(definition.get("annotations").and_then(|a| a.get("title"))))
     }
 
     /// Sets the human-readable display title (see [`Tool::title`]). Blank values
@@ -188,7 +190,11 @@ impl Tool for McpTool {
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         // Request metadata is propagated only when this tool allows it; `None` omits
         // the MCP `_meta` field entirely so no metadata leaves the process.
-        let meta = if self.propagate_meta { Some(self.build_meta(&_ctx)) } else { None };
+        let meta = if self.propagate_meta {
+            Some(self.build_meta(&_ctx))
+        } else {
+            None
+        };
         let outcome = if let Some(async_handler) = &self.async_handler {
             async_handler(self, args, meta).await
         } else {
@@ -223,9 +229,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Builds a tool whose async handler records the propagated metadata.
-    fn meta_recording_tool(
-        propagate: bool,
-    ) -> (McpTool, Arc<Mutex<Option<Option<JsonMap>>>>) {
+    fn meta_recording_tool(propagate: bool) -> (McpTool, Arc<Mutex<Option<Option<JsonMap>>>>) {
         let seen: Arc<Mutex<Option<Option<JsonMap>>>> = Arc::new(Mutex::new(None));
         let seen_handler = Arc::clone(&seen);
         let tool = McpTool::new(
@@ -262,7 +266,11 @@ mod tests {
             .await
             .unwrap();
 
-        let meta = seen.lock().unwrap().clone().expect("handler must be called");
+        let meta = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handler must be called");
         let meta = meta.expect("propagation on -> Some(meta)");
         assert_eq!(
             meta.get("io.agentscope/toolCallId"),
@@ -280,7 +288,11 @@ mod tests {
             .await
             .unwrap();
 
-        let meta = seen.lock().unwrap().clone().expect("handler must be called");
+        let meta = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handler must be called");
         assert!(meta.is_none(), "propagation off -> None, got {meta:?}");
     }
 

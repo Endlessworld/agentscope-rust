@@ -118,7 +118,11 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         cfg: MysqlSkillRepositoryConfig,
     ) -> Result<Self, SkillRepositoryError> {
         validate_identifier(&cfg.database_name, "database name", MAX_IDENTIFIER_LENGTH)?;
-        validate_identifier(&cfg.skills_table_name, "skills table name", MAX_IDENTIFIER_LENGTH)?;
+        validate_identifier(
+            &cfg.skills_table_name,
+            "skills table name",
+            MAX_IDENTIFIER_LENGTH,
+        )?;
         validate_identifier(
             &cfg.resources_table_name,
             "resources table name",
@@ -270,7 +274,11 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         }
     }
 
-    fn resource_rows(&self, conn: &mut D::Connection, skill_id: i64) -> Result<SkillResources, SkillRepositoryError> {
+    fn resource_rows(
+        &self,
+        conn: &mut D::Connection,
+        skill_id: i64,
+    ) -> Result<SkillResources, SkillRepositoryError> {
         let sql = format!(
             "SELECT resource_path, resource_content FROM {} WHERE id = ?",
             self.full_table_name(&self.cfg.resources_table_name)
@@ -278,9 +286,10 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         let rows = conn.query(&sql, &[SqlParam::Int(skill_id)])?;
         let mut resources = SkillResources::new();
         for row in rows {
-            if let (Some(path), Some(content)) =
-                (row.get_text("resource_path"), row.get_text("resource_content"))
-            {
+            if let (Some(path), Some(content)) = (
+                row.get_text("resource_path"),
+                row.get_text("resource_content"),
+            ) {
                 resources.insert(path, content);
             }
         }
@@ -490,7 +499,8 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
         let resource_rows = conn.query(&resources_sql, &[])?;
 
         // Group resources by skill id.
-        let mut by_id: std::collections::HashMap<i64, SkillResources> = std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<i64, SkillResources> =
+            std::collections::HashMap::new();
         for row in resource_rows {
             if let (Some(id), Some(path), Some(content)) = (
                 row.get_int("id"),
@@ -658,7 +668,10 @@ mod tests {
         let loaded = r.get_skill("calc").unwrap();
         assert_eq!(loaded.name(), "calc");
         assert_eq!(loaded.description(), "calc skill");
-        assert_eq!(loaded.resources().get("a.txt").map(|s| s.as_str()), Some("data"));
+        assert_eq!(
+            loaded.resources().get("a.txt").map(|s| s.as_str()),
+            Some("data")
+        );
         assert!(loaded.metadata().contains_key("name"));
     }
 
@@ -735,7 +748,11 @@ mod tests {
     #[test]
     fn rejects_path_traversal_skill_names() {
         let r = repo();
-        let bad = AgentSkill::builder().name("../x").source("s").description("d").build();
+        let bad = AgentSkill::builder()
+            .name("../x")
+            .source("s")
+            .description("d")
+            .build();
         assert!(r.save(&[bad], false).is_err());
     }
 

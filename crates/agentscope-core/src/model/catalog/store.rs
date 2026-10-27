@@ -133,10 +133,8 @@ mod tests {
     use super::*;
 
     fn temp_storage() -> (CatalogStorage, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "agentscope-catalog-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agentscope-catalog-test-{}", uuid::Uuid::new_v4()));
         (CatalogStorage::new(&root), root)
     }
 
@@ -149,7 +147,9 @@ mod tests {
         .unwrap();
         let mut snapshot = CatalogSnapshot::empty();
         for entry in parsed.entries {
-            snapshot.entries.insert(entry.key.clone(), std::sync::Arc::new(entry));
+            snapshot
+                .entries
+                .insert(entry.key.clone(), std::sync::Arc::new(entry));
         }
         snapshot.rebuild_indices();
         storage.write_snapshot(&snapshot).unwrap();
@@ -186,7 +186,10 @@ mod tests {
             sha256: Some(sha256_hex(b"{}")),
         };
         storage.write_meta("models", &meta).unwrap();
-        assert_eq!(storage.read_meta("models").unwrap().etag.as_deref(), Some("W/\"1\""));
+        assert_eq!(
+            storage.read_meta("models").unwrap().etag.as_deref(),
+            Some("W/\"1\"")
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

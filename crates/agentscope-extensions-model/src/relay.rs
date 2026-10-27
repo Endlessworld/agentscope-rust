@@ -13,8 +13,8 @@
 //! declarative route registry ([`BUILTIN_CONVERTERS`]) with quality grades and
 //! explicit multi-hop paths, mirroring new-api's converter registry.
 
-use agentscope_core::model::ChatResponse;
 use agentscope_core::message::ContentBlock;
+use agentscope_core::model::ChatResponse;
 
 /// A client-facing protocol the gateway can encode a response into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,7 +75,13 @@ const fn spec(
     quality: ConverterQuality,
     steps: &'static [RelayFormat],
 ) -> ConverterSpec {
-    ConverterSpec { id, from, to, quality, steps }
+    ConverterSpec {
+        id,
+        from,
+        to,
+        quality,
+        steps,
+    }
 }
 
 /// The built-in route table. Because the internal IR is the pivot, Claude↔Gemini
@@ -129,20 +135,30 @@ pub const BUILTIN_CONVERTERS: &[ConverterSpec] = &[
         RelayFormat::ClaudeMessages,
         RelayFormat::Gemini,
         ConverterQuality::Discouraged,
-        &[RelayFormat::ClaudeMessages, RelayFormat::OpenAiChat, RelayFormat::Gemini],
+        &[
+            RelayFormat::ClaudeMessages,
+            RelayFormat::OpenAiChat,
+            RelayFormat::Gemini,
+        ],
     ),
     spec(
         "gemini_to_claude_messages",
         RelayFormat::Gemini,
         RelayFormat::ClaudeMessages,
         ConverterQuality::Discouraged,
-        &[RelayFormat::Gemini, RelayFormat::OpenAiChat, RelayFormat::ClaudeMessages],
+        &[
+            RelayFormat::Gemini,
+            RelayFormat::OpenAiChat,
+            RelayFormat::ClaudeMessages,
+        ],
     ),
 ];
 
 /// Looks up the route (if any) from `from` to `to`.
 pub fn find_route(from: RelayFormat, to: RelayFormat) -> Option<&'static ConverterSpec> {
-    BUILTIN_CONVERTERS.iter().find(|s| s.from == from && s.to == to)
+    BUILTIN_CONVERTERS
+        .iter()
+        .find(|s| s.from == from && s.to == to)
 }
 
 /// Encodes an IR [`ChatResponse`] into `format`'s **non-streaming** response body.
@@ -172,11 +188,7 @@ pub fn stream_terminator(format: RelayFormat) -> Option<&'static str> {
 }
 
 /// Encodes an error into the client protocol's error envelope.
-pub fn encode_error(
-    format: RelayFormat,
-    message: &str,
-    error_type: &str,
-) -> serde_json::Value {
+pub fn encode_error(format: RelayFormat, message: &str, error_type: &str) -> serde_json::Value {
     match format {
         RelayFormat::ClaudeMessages => serde_json::json!({
             "type": "error",
@@ -370,7 +382,13 @@ mod tests {
                 ContentBlock::Text(TextBlock::new("hello")),
                 ContentBlock::ToolUse(ToolUseBlock::new("call_1", "get_weather", input)),
             ],
-            ChatUsage { input_tokens: 11, output_tokens: 4, cached_tokens: 0, time: 0.0, ..Default::default() },
+            ChatUsage {
+                input_tokens: 11,
+                output_tokens: 4,
+                cached_tokens: 0,
+                time: 0.0,
+                ..Default::default()
+            },
             None,
             Some("tool_calls".to_string()),
         )
@@ -402,7 +420,10 @@ mod tests {
     #[test]
     fn gemini_encoding_uses_parts_and_finish_reason() {
         let body = encode_response(RelayFormat::Gemini, &sample_response(), "gemini");
-        assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "hello");
+        assert_eq!(
+            body["candidates"][0]["content"]["parts"][0]["text"],
+            "hello"
+        );
         assert_eq!(
             body["candidates"][0]["content"]["parts"][1]["functionCall"]["name"],
             "get_weather"

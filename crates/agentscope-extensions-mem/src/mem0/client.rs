@@ -46,7 +46,12 @@ impl std::fmt::Debug for Mem0Client {
 impl Mem0Client {
     /// Builds a client with the Java default timeout (60s) and [`Mem0ApiType::Platform`].
     pub fn new(api_base_url: impl Into<String>, api_key: Option<String>) -> Result<Self> {
-        Self::with_api_type(api_base_url, api_key, Mem0ApiType::Platform, Duration::from_secs(60))
+        Self::with_api_type(
+            api_base_url,
+            api_key,
+            Mem0ApiType::Platform,
+            Duration::from_secs(60),
+        )
     }
 
     /// Builds a client with an explicit deployment type and timeout.
@@ -57,7 +62,12 @@ impl Mem0Client {
         timeout: Duration,
     ) -> Result<Self> {
         let transport = Arc::new(ReqwestTransport::new(timeout)?);
-        Ok(Self::assemble(transport, api_base_url.into(), api_key, api_type))
+        Ok(Self::assemble(
+            transport,
+            api_base_url.into(),
+            api_key,
+            api_type,
+        ))
     }
 
     /// Builds a client on top of an injected transport (used by tests).
@@ -77,16 +87,28 @@ impl Mem0Client {
         api_type: Mem0ApiType,
     ) -> Self {
         // Java strips a single trailing slash from the base URL.
-        let api_base_url = api_base_url.strip_suffix('/').unwrap_or(&api_base_url).to_string();
+        let api_base_url = api_base_url
+            .strip_suffix('/')
+            .unwrap_or(&api_base_url)
+            .to_string();
         let (add_endpoint, search_endpoint) = match api_type {
-            Mem0ApiType::Platform => {
-                (PLATFORM_MEMORIES_ENDPOINT.to_string(), PLATFORM_SEARCH_ENDPOINT.to_string())
-            }
-            Mem0ApiType::SelfHosted => {
-                (SELF_HOSTED_MEMORIES_ENDPOINT.to_string(), SELF_HOSTED_SEARCH_ENDPOINT.to_string())
-            }
+            Mem0ApiType::Platform => (
+                PLATFORM_MEMORIES_ENDPOINT.to_string(),
+                PLATFORM_SEARCH_ENDPOINT.to_string(),
+            ),
+            Mem0ApiType::SelfHosted => (
+                SELF_HOSTED_MEMORIES_ENDPOINT.to_string(),
+                SELF_HOSTED_SEARCH_ENDPOINT.to_string(),
+            ),
         };
-        Self { transport, api_base_url, api_key, api_type, add_endpoint, search_endpoint }
+        Self {
+            transport,
+            api_base_url,
+            api_key,
+            api_type,
+            add_endpoint,
+            search_endpoint,
+        }
     }
 
     /// The configured API type.
@@ -107,8 +129,7 @@ impl Mem0Client {
     /// Builds the authentication headers, mirroring `Mem0Client.executePostRaw`:
     /// self-hosted uses `X-API-Key`, platform uses `Authorization: Token <key>`.
     fn headers(&self) -> Vec<(String, String)> {
-        let mut headers =
-            vec![("Content-Type".to_string(), "application/json".to_string())];
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         if let Some(key) = self.api_key.as_ref().filter(|k| !k.is_empty()) {
             match self.api_type {
                 Mem0ApiType::SelfHosted => {
@@ -144,10 +165,14 @@ impl Mem0Client {
         let trimmed = raw.trim();
         if trimmed.starts_with('[') {
             let results: Vec<Mem0SearchResult> = serde_json::from_str(trimmed)?;
-            return Ok(Mem0SearchResponse { results: Some(results) });
+            return Ok(Mem0SearchResponse {
+                results: Some(results),
+            });
         }
         if trimmed.is_empty() {
-            return Err(MemError::Transport("Mem0 API returned empty response".into()));
+            return Err(MemError::Transport(
+                "Mem0 API returned empty response".into(),
+            ));
         }
         Ok(serde_json::from_str(trimmed)?)
     }
@@ -163,7 +188,12 @@ mod tests {
         api_key: Option<&str>,
         api_type: Mem0ApiType,
     ) -> Mem0Client {
-        Mem0Client::with_transport(transport, "https://mem0.test/", api_key.map(str::to_string), api_type)
+        Mem0Client::with_transport(
+            transport,
+            "https://mem0.test/",
+            api_key.map(str::to_string),
+            api_type,
+        )
     }
 
     #[test]
@@ -187,14 +217,15 @@ mod tests {
     async fn platform_auth_uses_token_scheme() {
         let mock = MockTransport::new();
         mock.push_body("{}");
-        let client = client(Arc::new(mock.clone()), Some("secret"), Mem0ApiType::Platform);
+        let client = client(
+            Arc::new(mock.clone()),
+            Some("secret"),
+            Mem0ApiType::Platform,
+        );
         let req = Mem0AddRequest::new().with_user_id("u");
         client.add(&req).await.unwrap();
         let headers = &mock.requests()[0].1;
-        assert!(headers.contains(&(
-            "Authorization".to_string(),
-            "Token secret".to_string()
-        )));
+        assert!(headers.contains(&("Authorization".to_string(), "Token secret".to_string())));
         assert!(mock.requests()[0].0.ends_with(PLATFORM_MEMORIES_ENDPOINT));
     }
 
@@ -202,7 +233,11 @@ mod tests {
     async fn self_hosted_auth_uses_x_api_key() {
         let mock = MockTransport::new();
         mock.push_body("{}");
-        let client = client(Arc::new(mock.clone()), Some("secret"), Mem0ApiType::SelfHosted);
+        let client = client(
+            Arc::new(mock.clone()),
+            Some("secret"),
+            Mem0ApiType::SelfHosted,
+        );
         client.search(&Mem0SearchRequest::new()).await.unwrap();
         let headers = &mock.requests()[0].1;
         assert!(headers.contains(&("X-API-Key".to_string(), "secret".to_string())));

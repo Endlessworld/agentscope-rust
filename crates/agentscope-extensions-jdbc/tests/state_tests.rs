@@ -132,7 +132,10 @@ impl InstrumentedExecutor {
             .session_statements
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        if self.interpose_after.load(std::sync::atomic::Ordering::SeqCst) == n
+        if self
+            .interpose_after
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == n
             && !self
                 .interposed
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -155,7 +158,8 @@ impl JdbcExecutor for InstrumentedExecutor {
     fn query(
         &self,
         bound: &agentscope_extensions_jdbc::dialect::BoundSql,
-    ) -> agentscope_extensions_jdbc::JdbcResult<Vec<Vec<agentscope_extensions_jdbc::ColumnValue>>> {
+    ) -> agentscope_extensions_jdbc::JdbcResult<Vec<Vec<agentscope_extensions_jdbc::ColumnValue>>>
+    {
         let rows = self.inner.query(bound)?;
         self.observe(&bound.sql);
         Ok(rows)
@@ -213,7 +217,10 @@ async fn save_and_get_single_state() {
 async fn get_returns_empty_for_missing() {
     // Java: JdbcAgentStateStoreH2Test.getReturnsEmptyForMissing
     let store = new_store();
-    assert!(store.get(Some("user1"), "session1", "missing").await.is_none());
+    assert!(store
+        .get(Some("user1"), "session1", "missing")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -223,7 +230,10 @@ async fn save_overwrites_single() {
     store.save(Some("user1"), "s1", "k", text("v1")).await;
     store.save(Some("user1"), "s1", "k", text("v2")).await;
     assert_eq!(
-        store.get(Some("user1"), "s1", "k").await.map(|v| text_of(&v)),
+        store
+            .get(Some("user1"), "s1", "k")
+            .await
+            .map(|v| text_of(&v)),
         Some("v2".to_string())
     );
 }
@@ -315,7 +325,10 @@ async fn list_hash_companion_row_is_written() {
 
     let hash = raw_state_data(&executor, &dialect, "user1:s1", "list:_hash");
     let hash = hash.expect("the list hash companion row must exist");
-    assert_eq!(hash, agentscope_core::state::list_hash::compute_hash(&[text("a"), text("b")]));
+    assert_eq!(
+        hash,
+        agentscope_core::state::list_hash::compute_hash(&[text("a"), text("b")])
+    );
 
     // The hash row must not leak into the list projection.
     let list = store.get_list(Some("user1"), "s1", "list").await;
@@ -424,11 +437,17 @@ async fn sessions_are_isolated_between_users() {
     store.save(Some("user2"), "s1", "k", text("two")).await;
 
     assert_eq!(
-        store.get(Some("user1"), "s1", "k").await.map(|v| text_of(&v)),
+        store
+            .get(Some("user1"), "s1", "k")
+            .await
+            .map(|v| text_of(&v)),
         Some("one".to_string())
     );
     assert_eq!(
-        store.get(Some("user2"), "s1", "k").await.map(|v| text_of(&v)),
+        store
+            .get(Some("user2"), "s1", "k")
+            .await
+            .map(|v| text_of(&v)),
         Some("two".to_string())
     );
 }
@@ -457,7 +476,12 @@ async fn incremental_append_preserves_prior_items_and_hash() {
     let hash_before = raw_state_data(&executor, &dialect, "u:s", "l:_hash").unwrap();
 
     store
-        .save_list(Some("u"), "s", "l", &[text("a"), text("b"), text("c"), text("d")])
+        .save_list(
+            Some("u"),
+            "s",
+            "l",
+            &[text("a"), text("b"), text("c"), text("d")],
+        )
         .await;
 
     let list = store.get_list(Some("u"), "s", "l").await;
@@ -576,7 +600,10 @@ async fn save_if_version_unversioned_overwrites_unconditionally() {
     let returned = store
         .save_if_version(Some("u"), "s", "k", text("b"), UNVERSIONED)
         .unwrap();
-    assert_ne!(returned, UNVERSIONED, "unconditional overwrite always succeeds");
+    assert_ne!(
+        returned, UNVERSIONED,
+        "unconditional overwrite always succeeds"
+    );
     assert_eq!(returned, store.read_version(Some("u"), "s", "k").unwrap());
     assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "b");
 }
@@ -588,7 +615,10 @@ async fn versioned_reads_are_scoped_per_user() {
         .save_if_version(Some("alice"), "s", "k", text("a"), 0)
         .unwrap();
     assert_eq!(store.read_version(Some("bob"), "s", "k").unwrap(), 0);
-    assert!(!store.get_versioned(Some("bob"), "s", "k").unwrap().is_present());
+    assert!(!store
+        .get_versioned(Some("bob"), "s", "k")
+        .unwrap()
+        .is_present());
 }
 
 #[tokio::test]
@@ -642,7 +672,10 @@ async fn consecutive_unversioned_writes_increase_the_version() {
         .unwrap();
 
     assert_eq!((first, second, third), (1, 2, 3));
-    assert!(second > first && third > second, "versions must increase monotonically");
+    assert!(
+        second > first && third > second,
+        "versions must increase monotonically"
+    );
     assert_eq!(third, store.read_version(Some("u"), "s", "k").unwrap());
     assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "c");
 }
@@ -721,7 +754,11 @@ async fn save_if_version_zero_self_heals_a_stale_version_zero_row() {
     // (a) A row sitting on the DDL default must be writable by create-if-absent.
     let (store, executor) = new_store_with_executor();
     seed_version_zero_row(&executor, "u:s", "k", &text("stale"));
-    assert_eq!(raw_version(&executor, "u:s", "k"), 0, "fixture must be version 0");
+    assert_eq!(
+        raw_version(&executor, "u:s", "k"),
+        0,
+        "fixture must be version 0"
+    );
 
     assert_eq!(
         store
@@ -731,7 +768,10 @@ async fn save_if_version_zero_self_heals_a_stale_version_zero_row() {
         "a version-0 row must be accepted as create-if-absent, not reported as a conflict"
     );
 
-    assert_eq!(text_of(&store.get(Some("u"), "s", "k").await.unwrap()), "fresh");
+    assert_eq!(
+        text_of(&store.get(Some("u"), "s", "k").await.unwrap()),
+        "fresh"
+    );
     assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 1);
 }
 

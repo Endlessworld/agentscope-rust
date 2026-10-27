@@ -5,10 +5,10 @@
 //! present; otherwise returns a clear configuration error. `web_fetch` uses the
 //! DeepSeek Fetch API when `DEEPSEEK_API_KEY` is present, otherwise falls back
 //! to a plain `GET` whose HTML body is reduced to readable text.
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 use std::time::Duration;
 
 const USER_AGENT: &str = "AgentScope-Harness-WebFetch/1.0";
@@ -37,14 +37,19 @@ pub struct WebFetchTool {
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        Self { client: None, api_key: None }
+        Self {
+            client: None,
+            api_key: None,
+        }
     }
 
     /// Reads the API key from the `DEEPSEEK_API_KEY` environment variable.
     pub fn from_env() -> Self {
         Self {
             client: None,
-            api_key: std::env::var("DEEPSEEK_API_KEY").ok().filter(|k| !k.trim().is_empty()),
+            api_key: std::env::var("DEEPSEEK_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
         }
     }
 
@@ -102,7 +107,9 @@ impl WebFetchTool {
                 let content = truncate(content, max_chars);
                 Ok(ToolResultBlock::text(format!("{title}\n\n{content}")))
             }
-            Err(e) => Ok(ToolResultBlock::error(format!("Error: web_fetch failed: {e}"))),
+            Err(e) => Ok(ToolResultBlock::error(format!(
+                "Error: web_fetch failed: {e}"
+            ))),
         }
     }
 }
@@ -142,7 +149,9 @@ impl Tool for WebFetchTool {
             return Ok(ToolResultBlock::error("Error: url is required"));
         }
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Ok(ToolResultBlock::error("Error: only http/https URLs are allowed"));
+            return Ok(ToolResultBlock::error(
+                "Error: only http/https URLs are allowed",
+            ));
         }
         let max_chars = args
             .get("max_chars")
@@ -172,7 +181,9 @@ impl Tool for WebFetchTool {
                 let text = truncate(&text, max_chars);
                 Ok(ToolResultBlock::text(format!("status={status}\n\n{text}")))
             }
-            Err(e) => Ok(ToolResultBlock::error(format!("Error: web_fetch failed: {e}"))),
+            Err(e) => Ok(ToolResultBlock::error(format!(
+                "Error: web_fetch failed: {e}"
+            ))),
         }
     }
 }
@@ -197,7 +208,9 @@ fn body_of(html: &str) -> &str {
         return html;
     };
     let begin = start + gt + 1;
-    let end = lower[begin..].find("</body").map_or(html.len(), |e| begin + e);
+    let end = lower[begin..]
+        .find("</body")
+        .map_or(html.len(), |e| begin + e);
     &html[begin..end]
 }
 
@@ -323,7 +336,9 @@ impl WebSearchTool {
     /// Reads the API key from the `DEEPSEEK_API_KEY` environment variable.
     pub fn from_env() -> Self {
         Self {
-            api_key: std::env::var("DEEPSEEK_API_KEY").ok().filter(|k| !k.trim().is_empty()),
+            api_key: std::env::var("DEEPSEEK_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
             client: None,
         }
     }
@@ -417,8 +432,9 @@ impl Tool for WebSearchTool {
                         "Error: DeepSeek search API returned {status}"
                     )));
                 }
-                let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap_or_default())
-                    .unwrap_or(serde_json::Value::Null);
+                let body: serde_json::Value =
+                    serde_json::from_str(&resp.text().await.unwrap_or_default())
+                        .unwrap_or(serde_json::Value::Null);
                 let Some(results) = body.get("results").and_then(|r| r.as_array()) else {
                     return Ok(ToolResultBlock::text("No results."));
                 };
@@ -446,7 +462,9 @@ impl Tool for WebSearchTool {
                 }
                 Ok(ToolResultBlock::text(sb.trim_end().to_string()))
             }
-            Err(e) => Ok(ToolResultBlock::error(format!("Error: web_search failed: {e}"))),
+            Err(e) => Ok(ToolResultBlock::error(format!(
+                "Error: web_search failed: {e}"
+            ))),
         }
     }
 }
@@ -476,7 +494,10 @@ mod tests {
 
     #[test]
     fn html_to_text_decodes_named_and_numeric_entities() {
-        assert_eq!(html_to_text("a &lt;b&gt; c &#39;q&#39; &#x41;"), "a <b> c 'q' A");
+        assert_eq!(
+            html_to_text("a &lt;b&gt; c &#39;q&#39; &#x41;"),
+            "a <b> c 'q' A"
+        );
         // An unknown entity is left as-is rather than swallowed.
         assert_eq!(html_to_text("x &bogus; y"), "x &bogus; y");
     }
@@ -505,13 +526,19 @@ mod tests {
         assert_eq!(truncate("abc", 5), "abc");
         assert_eq!(truncate("abcdef", 3), "abc\n...[truncated]");
         // Multi-byte characters are not split mid-codepoint.
-        assert_eq!(truncate("\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}", 2), "\u{4e2d}\u{6587}\n...[truncated]");
+        assert_eq!(
+            truncate("\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}", 2),
+            "\u{4e2d}\u{6587}\n...[truncated]"
+        );
     }
 
     #[test]
     fn fetch_defaults_to_no_key_so_the_free_path_is_used() {
         assert!(WebFetchTool::new().api_key.is_none());
         assert!(WebFetchTool::with_api_key("  ").api_key.is_none());
-        assert_eq!(WebFetchTool::with_api_key("k").api_key.as_deref(), Some("k"));
+        assert_eq!(
+            WebFetchTool::with_api_key("k").api_key.as_deref(),
+            Some("k")
+        );
     }
 }

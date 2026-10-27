@@ -747,9 +747,11 @@ impl AcpAgentSession {
             let runtime = self.runtime.lock().await;
             match runtime.as_ref() {
                 Some(session) => Arc::clone(session),
-                None => return Err(agentscope_core::Error::Session(
-                    "the session runtime is not open".into(),
-                )),
+                None => {
+                    return Err(agentscope_core::Error::Session(
+                        "the session runtime is not open".into(),
+                    ))
+                }
             }
         };
         session.respond_all(answers).await

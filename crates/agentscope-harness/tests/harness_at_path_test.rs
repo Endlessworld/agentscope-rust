@@ -25,8 +25,10 @@ async fn expands_at_path_in_user_message() {
         let recorded = std::sync::Arc::clone(&recorded);
         Box::new(move |in2| {
             *recorded.lock().unwrap() = Some(in2);
-            futures::stream::iter::<Vec<agentscope_core::error::Result<agentscope_core::event::AgentEvent>>>(vec![])
-                .boxed()
+            futures::stream::iter::<
+                Vec<agentscope_core::error::Result<agentscope_core::event::AgentEvent>>,
+            >(vec![])
+            .boxed()
         })
     };
     let _stream = mw.on_agent(&RuntimeContext::default(), input, next);
@@ -40,7 +42,10 @@ async fn expands_at_path_in_user_message() {
         ContentBlock::Text(tb) => tb.text.clone(),
         _ => String::new(),
     };
-    assert_eq!(original, "see @note.md please", "original text must be preserved");
+    assert_eq!(
+        original, "see @note.md please",
+        "original text must be preserved"
+    );
     let preview = captured.messages[0]
         .content
         .iter()
@@ -49,7 +54,12 @@ async fn expands_at_path_in_user_message() {
             _ => None,
         })
         .find(|t| t.contains("<attached_file"))
-        .unwrap_or_else(|| panic!("expected an appended preview block, got: {:?}", captured.messages[0].content));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an appended preview block, got: {:?}",
+                captured.messages[0].content
+            )
+        });
     assert!(preview.contains("secret content"), "got: {preview}");
     assert!(preview.contains("note.md"), "got: {preview}");
     assert!(
@@ -75,11 +85,16 @@ async fn leaves_unresolved_token_untouched() {
         let recorded = std::sync::Arc::clone(&recorded);
         Box::new(move |in2| {
             *recorded.lock().unwrap() = Some(in2);
-            futures::stream::iter::<Vec<agentscope_core::error::Result<agentscope_core::event::AgentEvent>>>(vec![])
-                .boxed()
+            futures::stream::iter::<
+                Vec<agentscope_core::error::Result<agentscope_core::event::AgentEvent>>,
+            >(vec![])
+            .boxed()
         })
     };
-    let _ = mw.on_agent(&RuntimeContext::default(), input, next).collect::<Vec<_>>().await;
+    let _ = mw
+        .on_agent(&RuntimeContext::default(), input, next)
+        .collect::<Vec<_>>()
+        .await;
     let captured = recorded.lock().unwrap().take().unwrap();
     let text = match &captured.messages[0].content[0] {
         ContentBlock::Text(tb) => tb.text.clone(),

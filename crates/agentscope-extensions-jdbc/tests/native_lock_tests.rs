@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 
 use agentscope_extensions_jdbc::dialect::{
     normalize_lock_name, postgres_lock_key, MysqlNativeLockStrategy, NativeLockError,
-    NativeLockSession, PostgresNativeLockStrategy, SandboxLockStrategy,
-    MYSQL_GET_LOCK_SQL, MYSQL_MAX_LOCK_NAME_LENGTH, MYSQL_RELEASE_LOCK_SQL,
-    NATIVE_LOCK_POLL_INTERVAL, PG_ADVISORY_UNLOCK_SQL, PG_TRY_ADVISORY_LOCK_SQL,
+    NativeLockSession, PostgresNativeLockStrategy, SandboxLockStrategy, MYSQL_GET_LOCK_SQL,
+    MYSQL_MAX_LOCK_NAME_LENGTH, MYSQL_RELEASE_LOCK_SQL, NATIVE_LOCK_POLL_INTERVAL,
+    PG_ADVISORY_UNLOCK_SQL, PG_TRY_ADVISORY_LOCK_SQL,
 };
 use agentscope_extensions_jdbc::sandbox::JdbcSandboxExecutionGuard;
 use agentscope_harness::agent::sandbox::SandboxIsolationKey;
@@ -126,7 +126,10 @@ fn sql_probes_match_java() {
 
 #[test]
 fn mysql_short_lock_name_is_unchanged() {
-    assert_eq!(normalize_lock_name("agentscope:sandbox:lock:agent:a"), "agentscope:sandbox:lock:agent:a");
+    assert_eq!(
+        normalize_lock_name("agentscope:sandbox:lock:agent:a"),
+        "agentscope:sandbox:lock:agent:a"
+    );
 }
 
 #[test]
@@ -161,8 +164,14 @@ fn mysql_normalization_distinguishes_distinct_long_names() {
     let a = "x".repeat(100);
     let b = format!("{}y", "x".repeat(99));
     assert_ne!(normalize_lock_name(&a), normalize_lock_name(&b));
-    assert_eq!(normalize_lock_name(&a).chars().count(), MYSQL_MAX_LOCK_NAME_LENGTH);
-    assert_eq!(normalize_lock_name(&b).chars().count(), MYSQL_MAX_LOCK_NAME_LENGTH);
+    assert_eq!(
+        normalize_lock_name(&a).chars().count(),
+        MYSQL_MAX_LOCK_NAME_LENGTH
+    );
+    assert_eq!(
+        normalize_lock_name(&b).chars().count(),
+        MYSQL_MAX_LOCK_NAME_LENGTH
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +196,10 @@ fn postgres_lock_key_matches_independently_computed_digest() {
 #[test]
 fn postgres_lock_key_distinguishes_distinct_names() {
     assert_eq!(postgres_lock_key("agentscope-2"), 6_739_745_666_128_362_534);
-    assert_ne!(postgres_lock_key("agentscope"), postgres_lock_key("agentscope-2"));
+    assert_ne!(
+        postgres_lock_key("agentscope"),
+        postgres_lock_key("agentscope-2")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +237,10 @@ fn postgres_strategy_acquires_the_decimal_advisory_key() {
     let strategy = PostgresNativeLockStrategy::new(session.clone());
 
     let _lease = strategy.try_enter("agentscope", 5).expect("acquire");
-    assert_eq!(session.acquired_keys(), vec!["2761187194516106426".to_string()]);
+    assert_eq!(
+        session.acquired_keys(),
+        vec!["2761187194516106426".to_string()]
+    );
     assert!(strategy.is_held("agentscope"));
 }
 
@@ -236,7 +251,10 @@ fn postgres_strategy_releases_the_decimal_advisory_key() {
 
     let mut lease = strategy.try_enter("agentscope", 5).expect("acquire");
     lease.release();
-    assert_eq!(session.released_keys(), vec!["2761187194516106426".to_string()]);
+    assert_eq!(
+        session.released_keys(),
+        vec!["2761187194516106426".to_string()]
+    );
     assert!(!strategy.is_held("agentscope"));
 }
 
@@ -246,7 +264,10 @@ fn unavailable_lock_is_reported_as_timed_out() {
     let strategy = MysqlNativeLockStrategy::new(session.clone());
 
     let outcome = strategy.try_enter("busy", 1).unwrap_err();
-    assert_eq!(outcome, agentscope_extensions_jdbc::dialect::LockOutcome::TimedOut);
+    assert_eq!(
+        outcome,
+        agentscope_extensions_jdbc::dialect::LockOutcome::TimedOut
+    );
     assert!(session.released_keys().is_empty());
 }
 

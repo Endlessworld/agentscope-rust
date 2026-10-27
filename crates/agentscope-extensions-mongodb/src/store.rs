@@ -51,7 +51,10 @@ impl std::fmt::Debug for MongodbStore {
 impl MongodbStore {
     /// Creates a store over the given client and collection.
     pub fn new(client: Arc<dyn MongoClient>, collection: impl Into<String>) -> Self {
-        Self { client, collection: collection.into() }
+        Self {
+            client,
+            collection: collection.into(),
+        }
     }
 
     /// Creates a store with the default collection name ([`BASE_STORE_COLLECTION`]).
@@ -220,7 +223,10 @@ impl BaseStore for MongodbStore {
                 &self.collection,
                 &filter,
                 &update,
-                &FindOneAndUpdateOptions { upsert: false, return_after: true },
+                &FindOneAndUpdateOptions {
+                    upsert: false,
+                    return_after: true,
+                },
             )) {
                 Ok(result) => result.is_some(),
                 Err(e) => {
@@ -255,11 +261,9 @@ impl BaseStore for MongodbStore {
             skip: Some(offset),
             limit: Some(limit),
         };
-        let Ok(docs) = futures::executor::block_on(self.client.find_many(
-            &self.collection,
-            &filter,
-            &options,
-        )) else {
+        let Ok(docs) =
+            futures::executor::block_on(self.client.find_many(&self.collection, &filter, &options))
+        else {
             return Vec::new();
         };
         docs.into_iter()
@@ -293,7 +297,11 @@ mod tests {
     }
 
     fn ns() -> Vec<String> {
-        vec!["sessions".to_string(), "s1".to_string(), "filesystem".to_string()]
+        vec![
+            "sessions".to_string(),
+            "s1".to_string(),
+            "filesystem".to_string(),
+        ]
     }
 
     fn value(content: &str) -> StoreValue {

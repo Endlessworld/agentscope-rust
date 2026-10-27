@@ -77,7 +77,11 @@ pub fn validate_snapshot_id(id: &str) -> crate::Result<()> {
 }
 
 /// Builds the `{prefix}{user}/{session}/` prefix for a session's state objects.
-pub fn session_prefix(prefix: &str, user_id: Option<&str>, session_id: &str) -> crate::Result<String> {
+pub fn session_prefix(
+    prefix: &str,
+    user_id: Option<&str>,
+    session_id: &str,
+) -> crate::Result<String> {
     if session_id.trim().is_empty() {
         return Err(crate::CosError::Config(
             "sessionId must not be blank".to_string(),

@@ -64,11 +64,7 @@ impl RedisAgentStateKeyLayout {
     /// Returns an error when the prefix, user id or session id cannot be represented
     /// unambiguously inside the hash tag (a `{`, `}` or `/` in the wrong segment), or when the
     /// session id is blank.
-    pub(crate) fn v1(
-        key_prefix: &str,
-        user_id: Option<&str>,
-        session_id: &str,
-    ) -> Result<Self> {
+    pub(crate) fn v1(key_prefix: &str, user_id: Option<&str>, session_id: &str) -> Result<Self> {
         validate_v1_key_prefix(key_prefix)?;
         validate_v1_user_id(&normalize_user(user_id))?;
         validate_v1_session_id(session_id)?;
@@ -84,11 +80,7 @@ impl RedisAgentStateKeyLayout {
     ///
     /// # Errors
     /// Returns an error when the session id is blank.
-    pub(crate) fn v0(
-        key_prefix: &str,
-        user_id: Option<&str>,
-        session_id: &str,
-    ) -> Result<Self> {
+    pub(crate) fn v0(key_prefix: &str, user_id: Option<&str>, session_id: &str) -> Result<Self> {
         Ok(Self {
             key_prefix: key_prefix.to_string(),
             slot_id: session_segment(user_id, session_id)?,
@@ -251,8 +243,14 @@ mod tests {
         let layout =
             RedisAgentStateKeyLayout::v0("agentscope:session:", Some("alice"), "s1").unwrap();
         assert_eq!(layout.slot_id(), "alice/s1");
-        assert_eq!(layout.state_key("agent_state"), "agentscope:session:alice/s1:agent_state");
-        assert_eq!(layout.list_key("messages"), "agentscope:session:alice/s1:messages:list");
+        assert_eq!(
+            layout.state_key("agent_state"),
+            "agentscope:session:alice/s1:agent_state"
+        );
+        assert_eq!(
+            layout.list_key("messages"),
+            "agentscope:session:alice/s1:messages:list"
+        );
         assert_eq!(layout.keys_key(), "agentscope:session:alice/s1:_keys");
         assert_eq!(hash_tag(&layout.state_key("k")), None, "V0 has no hash tag");
     }
@@ -268,7 +266,10 @@ mod tests {
     fn v1_wraps_the_session_segment_in_a_hash_tag() {
         let layout = RedisAgentStateKeyLayout::v1("custom:session:", None, "s1").unwrap();
         assert_eq!(layout.slot_id(), "{__anon__/s1}");
-        assert_eq!(layout.state_key("agent_state"), "custom:session:{__anon__/s1}:agent_state");
+        assert_eq!(
+            layout.state_key("agent_state"),
+            "custom:session:{__anon__/s1}:agent_state"
+        );
         assert_eq!(layout.keys_key(), "custom:session:{__anon__/s1}:_keys");
     }
 
@@ -285,9 +286,21 @@ mod tests {
         let version = version_key(&state);
 
         assert_eq!(hash_tag(&state), Some("alice/s1"));
-        assert_eq!(hash_tag(&list), hash_tag(&state), "list key shares the session slot");
-        assert_eq!(hash_tag(&index), hash_tag(&state), "session index shares the slot");
-        assert_eq!(hash_tag(&version), hash_tag(&state), "version key shares the slot");
+        assert_eq!(
+            hash_tag(&list),
+            hash_tag(&state),
+            "list key shares the session slot"
+        );
+        assert_eq!(
+            hash_tag(&index),
+            hash_tag(&state),
+            "session index shares the slot"
+        );
+        assert_eq!(
+            hash_tag(&version),
+            hash_tag(&state),
+            "version key shares the slot"
+        );
         assert_eq!(version, "agentscope:session:{alice/s1}:agent_state:ver");
     }
 
@@ -372,7 +385,13 @@ mod tests {
         );
 
         // V0 and V1 are disjoint namespaces: neither parser accepts the other's keys.
-        assert_eq!(parse_v1_session_id_from_keys_key(&v0.keys_key(), "tenant:", "u"), None);
-        assert_eq!(parse_v0_session_id_from_keys_key(&v1.keys_key(), "tenant:", "u"), None);
+        assert_eq!(
+            parse_v1_session_id_from_keys_key(&v0.keys_key(), "tenant:", "u"),
+            None
+        );
+        assert_eq!(
+            parse_v0_session_id_from_keys_key(&v1.keys_key(), "tenant:", "u"),
+            None
+        );
     }
 }

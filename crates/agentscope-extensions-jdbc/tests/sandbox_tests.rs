@@ -84,7 +84,10 @@ fn second_acquire_after_release() {
     lease1.release();
 
     let mut lease2 = guard.try_enter(isolation_key);
-    assert!(lease2.is_acquired(), "the lock must be re-acquirable after release");
+    assert!(
+        lease2.is_acquired(),
+        "the lock must be re-acquirable after release"
+    );
     lease2.release();
 }
 
@@ -96,9 +99,15 @@ fn lock_is_held_until_released() {
 
     assert!(!guard.is_held(&isolation_key));
     let mut lease = guard.try_enter(isolation_key.clone());
-    assert!(guard.is_held(&isolation_key), "the lock must be visible while held");
+    assert!(
+        guard.is_held(&isolation_key),
+        "the lock must be visible while held"
+    );
     lease.release();
-    assert!(!guard.is_held(&isolation_key), "the lock must vanish after release");
+    assert!(
+        !guard.is_held(&isolation_key),
+        "the lock must vanish after release"
+    );
 }
 
 #[test]

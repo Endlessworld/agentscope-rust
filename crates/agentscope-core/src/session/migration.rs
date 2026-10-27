@@ -45,7 +45,11 @@ pub async fn import_baseline(
                     && event
                         .data()
                         .ok()
-                        .and_then(|data| data.get("sourceHash").and_then(|v| v.as_str()).map(str::to_string))
+                        .and_then(|data| {
+                            data.get("sourceHash")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
                         .as_deref()
                         == Some(hash.as_str())
             });
@@ -130,7 +134,10 @@ pub async fn fork(
     let snapshot = export_snapshot(source).await?;
     let mut value: serde_json::Value = serde_json::from_str(&snapshot.state.to_json()?)?;
     if let Some(object) = value.as_object_mut() {
-        object.insert("session_id".into(), serde_json::json!(destination_key.session_id));
+        object.insert(
+            "session_id".into(),
+            serde_json::json!(destination_key.session_id),
+        );
         object.insert("user_id".into(), serde_json::json!(destination_key.user_id));
     }
     let forked = AgentState::from_json_str(&serde_json::to_string(&value)?)?;
@@ -167,9 +174,14 @@ mod tests {
 
     async fn paused_source() -> Arc<dyn SessionLog> {
         let log = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         recorder.start(&[], &state()).await.unwrap();
-        recorder.checkpoint_now(&state(), "before_model").await.unwrap();
+        recorder
+            .checkpoint_now(&state(), "before_model")
+            .await
+            .unwrap();
         recorder.finish(&state(), "completed").await.unwrap();
         log
     }
@@ -199,7 +211,9 @@ mod tests {
     #[tokio::test]
     async fn import_into_a_non_empty_destination_is_rejected() {
         let target = journal();
-        import_baseline(Arc::clone(&target), &state(), "a", 1).await.unwrap();
+        import_baseline(Arc::clone(&target), &state(), "a", 1)
+            .await
+            .unwrap();
         let mut different = state();
         different.summary = "other baseline".into();
         let err = import_baseline(Arc::clone(&target), &different, "b", 2)
@@ -239,7 +253,10 @@ mod tests {
             .await
             .unwrap();
         recorder.start(&[], &state()).await.unwrap();
-        recorder.checkpoint_now(&state(), "before_model").await.unwrap();
+        recorder
+            .checkpoint_now(&state(), "before_model")
+            .await
+            .unwrap();
         let mut data = crate::event::EventData::default();
         data.fields.insert(
             "toolCalls".into(),

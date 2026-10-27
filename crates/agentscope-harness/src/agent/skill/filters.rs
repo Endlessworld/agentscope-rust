@@ -53,7 +53,10 @@ pub struct FilesystemSkillUsageBackend {
 
 impl FilesystemSkillUsageBackend {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), lock: std::sync::Mutex::new(()) }
+        Self {
+            path: path.into(),
+            lock: std::sync::Mutex::new(()),
+        }
     }
 
     /// Creates a backend rooted at a workspace, using [`DEFAULT_USAGE_RELATIVE_PATH`].
@@ -100,10 +103,9 @@ impl SkillUsageBackend for FilesystemSkillUsageBackend {
         let _guard = self.lock.lock().unwrap();
         let mut all = self.load_all();
         let existed = all.contains_key(name);
-        let current = all
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| SkillUsageRecord::agent_created(super::curator::SkillState::Active, chrono::Utc::now()));
+        let current = all.get(name).cloned().unwrap_or_else(|| {
+            SkillUsageRecord::agent_created(super::curator::SkillState::Active, chrono::Utc::now())
+        });
         match mutator(current) {
             Some(updated) => {
                 all.insert(name.to_string(), updated);
@@ -219,7 +221,11 @@ impl EnvironmentFilter {
     pub fn new(env: impl Into<String>, store: Option<Arc<dyn SkillUsageBackend>>) -> Self {
         let env = env.into();
         Self {
-            env: if env.trim().is_empty() { "prod".to_string() } else { env },
+            env: if env.trim().is_empty() {
+                "prod".to_string()
+            } else {
+                env
+            },
             store,
         }
     }
@@ -396,7 +402,10 @@ mod tests {
 
     #[test]
     fn canary_bucket_is_stable_and_in_range() {
-        assert_eq!(CanaryFilter::stable_bucket("alice|skill", 100), CanaryFilter::stable_bucket("alice|skill", 100));
+        assert_eq!(
+            CanaryFilter::stable_bucket("alice|skill", 100),
+            CanaryFilter::stable_bucket("alice|skill", 100)
+        );
         let b = CanaryFilter::stable_bucket("bob|skill", 100);
         assert!(b < 100);
     }
@@ -430,7 +439,12 @@ mod tests {
         fn load_all(&self) -> BTreeMap<String, SkillUsageRecord> {
             self.records.clone()
         }
-        fn mutate(&self, _name: &str, _m: &mut dyn FnMut(SkillUsageRecord) -> Option<SkillUsageRecord>) {}
+        fn mutate(
+            &self,
+            _name: &str,
+            _m: &mut dyn FnMut(SkillUsageRecord) -> Option<SkillUsageRecord>,
+        ) {
+        }
         fn replace_all(&self, _data: BTreeMap<String, SkillUsageRecord>) {}
     }
 
@@ -457,10 +471,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("asr_gate_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let gate = NotifyAndWaitGate::new(
-            vec![Arc::new(NoopNotificationSink), Arc::new(LoggingNotificationSink)],
+            vec![
+                Arc::new(NoopNotificationSink),
+                Arc::new(LoggingNotificationSink),
+            ],
             &dir,
         );
-        assert_eq!(gate.review(&candidate("tool")), PromotionDecision::NeedsReview);
+        assert_eq!(
+            gate.review(&candidate("tool")),
+            PromotionDecision::NeedsReview
+        );
         assert!(dir.join("tool").join(".review_request.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

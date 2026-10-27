@@ -15,11 +15,11 @@ use futures::StreamExt;
 
 use crate::agent::skill::curator::{SkillCurator, SkillUsageStore};
 use crate::agent::skill::model::{HarnessSkillEntry, SkillCatalog, SkillFilter};
+use crate::agent::skill::promoter::SkillVisibilityFilter;
 use crate::agent::skill::prompt::SkillPromptBuilder;
 use crate::agent::skill::repository::SkillRepository;
-use crate::agent::skill::stager::{self, RepoBound, SkillRepo};
 use crate::agent::skill::shell_path::ShellPathPolicy;
-use crate::agent::skill::promoter::SkillVisibilityFilter;
+use crate::agent::skill::stager::{self, RepoBound, SkillRepo};
 
 /// Builds the visible skill entries from an ordered repository list, applying the
 /// base [`SkillFilter`] and optional [`SkillVisibilityFilter`]. Higher-priority
@@ -40,7 +40,11 @@ pub fn build_skill_entries(
                 let candidate = crate::agent::skill::curator::build_candidate(
                     &name,
                     &skill.description(),
-                    skill.resources().get("SKILL.md").map(|s| s.as_str()).unwrap_or(""),
+                    skill
+                        .resources()
+                        .get("SKILL.md")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
                     skill.resources(),
                     5,
                 );
@@ -121,7 +125,11 @@ impl HarnessSkillMiddleware {
 
     /// Returns the current catalog (used by the builder to wire the load tool).
     pub fn catalog(&self) -> SkillCatalog {
-        SkillCatalog::of(build_skill_entries(&self.repos, &self.filter, self.visibility.as_ref()))
+        SkillCatalog::of(build_skill_entries(
+            &self.repos,
+            &self.filter,
+            self.visibility.as_ref(),
+        ))
     }
 
     /// Builds the `skillId -> on-disk dir` index for `LoadSkillTool`.
@@ -183,7 +191,8 @@ impl HarnessSkillMiddleware {
             .collect();
         let kinds: Vec<SkillRepo> = bound.iter().map(|b| b.repo.clone()).collect();
         let ns = stager::resolve_source_namespaces(&kinds);
-        let stage_map = stager::stage(self.workspace_root.as_deref(), &bound, &ns).unwrap_or_default();
+        let stage_map =
+            stager::stage(self.workspace_root.as_deref(), &bound, &ns).unwrap_or_default();
 
         let mut out = Vec::new();
         for e in &entries {
@@ -243,7 +252,12 @@ impl Middleware for SkillUsageMiddleware {
         let names = self.skill_names.clone();
         let store = Arc::clone(&self.usage_store);
         let fut = async move {
-            let text: String = input.messages.iter().map(|m| m.text_content()).collect::<Vec<_>>().join("\n");
+            let text: String = input
+                .messages
+                .iter()
+                .map(|m| m.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
             let mut guard = store.lock().unwrap();
             for n in &names {
                 if text.contains(n) {

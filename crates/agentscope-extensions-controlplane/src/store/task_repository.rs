@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_harness::agent::subagent::task::{
-    AgentProtocolTaskClient, BackgroundTask, RemoteSubmitContext, SUPPRESS_COMPLETION_CALLBACK,
-    TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec, TaskStatus,
+    AgentProtocolTaskClient, BackgroundTask, RemoteSubmitContext, TaskCompletionCallback,
+    TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec, TaskStatus,
+    SUPPRESS_COMPLETION_CALLBACK,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -116,7 +117,11 @@ impl ControlPlaneTaskRepository {
     }
 
     async fn post_json(&self, path: &str, body: Value, op: &str) -> ControlPlaneResult<u16> {
-        let resp = self.shared.http.send(Method::POST, path, Some(body)).await?;
+        let resp = self
+            .shared
+            .http
+            .send(Method::POST, path, Some(body))
+            .await?;
         if (200..300).contains(&resp.status) {
             Ok(resp.status)
         } else {
@@ -145,14 +150,25 @@ impl ControlPlaneTaskRepository {
                 .map(Value::String)
                 .unwrap_or(Value::Null),
         );
-        body.insert("status".into(), record.status.as_str().to_uppercase().into());
+        body.insert(
+            "status".into(),
+            record.status.as_str().to_uppercase().into(),
+        );
         body.insert(
             "result".into(),
-            record.result.clone().map(Value::String).unwrap_or(Value::Null),
+            record
+                .result
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
         body.insert(
             "errorMessage".into(),
-            record.error_message.clone().map(Value::String).unwrap_or(Value::Null),
+            record
+                .error_message
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
         body.insert("cancelRequested".into(), record.cancel_requested.into());
         body.insert(
@@ -165,7 +181,11 @@ impl ControlPlaneTaskRepository {
         );
         body.insert(
             "remoteBaseUrl".into(),
-            record.remote_base_url.clone().map(Value::String).unwrap_or(Value::Null),
+            record
+                .remote_base_url
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
         if let Some(headers) = &record.remote_headers {
             body.insert("remoteHeaders".into(), json!(headers));
@@ -175,12 +195,10 @@ impl ControlPlaneTaskRepository {
         }
         body.insert(
             "lastCheckedAt".into(),
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-                record.last_checked_at as i64,
-            )
-            .map(|d| d.to_rfc3339())
-            .unwrap_or_default()
-            .into(),
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(record.last_checked_at as i64)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default()
+                .into(),
         );
         Value::Object(body)
     }
@@ -221,11 +239,7 @@ impl ControlPlaneTaskRepository {
         record
     }
 
-    async fn read_record(
-        &self,
-        session_id: &str,
-        task_id: &str,
-    ) -> Option<TaskRecord> {
+    async fn read_record(&self, session_id: &str, task_id: &str) -> Option<TaskRecord> {
         let path = format!(
             "/api/v1/dp/tasks/{}?{}&parentSessionId={}",
             encode_path_segment(task_id),
@@ -244,18 +258,17 @@ impl ControlPlaneTaskRepository {
         Some(Self::parse_record(&value))
     }
 
-    async fn list_records(
-        &self,
-        session_id: &str,
-        filter: Option<TaskStatus>,
-    ) -> Vec<TaskRecord> {
+    async fn list_records(&self, session_id: &str, filter: Option<TaskStatus>) -> Vec<TaskRecord> {
         let mut path = format!(
             "/api/v1/dp/tasks?{}&parentSessionId={}",
             self.tenant_query(),
             encode_query(session_id)
         );
         if let Some(f) = filter {
-            path.push_str(&format!("&status={}", encode_query(&f.as_str().to_uppercase())));
+            path.push_str(&format!(
+                "&status={}",
+                encode_query(&f.as_str().to_uppercase())
+            ));
         }
         let resp = match self.shared.http.send(Method::GET, &path, None).await {
             Ok(r) => r,
@@ -313,7 +326,12 @@ impl ControlPlaneTaskRepository {
             }
         }
         let mut record = existing.unwrap_or_else(|| {
-            TaskRecord::new(task_id, sub_agent_id, &self.shared.parent_agent_id, session_id)
+            TaskRecord::new(
+                task_id,
+                sub_agent_id,
+                &self.shared.parent_agent_id,
+                session_id,
+            )
         });
         record.status = status;
         if let Some(r) = result {
@@ -355,7 +373,15 @@ impl ControlPlaneTaskRepository {
     }
 
     fn local_key(session_id: &str, task_id: &str) -> String {
-        format!("{}:{}", if session_id.is_empty() { "_" } else { session_id }, task_id)
+        format!(
+            "{}:{}",
+            if session_id.is_empty() {
+                "_"
+            } else {
+                session_id
+            },
+            task_id
+        )
     }
 
     fn store_local(&self, session_id: &str, task: Arc<BackgroundTask>) {
@@ -389,10 +415,8 @@ impl ControlPlaneTaskRepository {
                     .unwrap_or_else(|| "Task failed".to_string())),
             ),
             TaskStatus::Cancelled => {
-                let task = BackgroundTask::controlled(
-                    record.task_id.clone(),
-                    record.sub_agent_id.clone(),
-                );
+                let task =
+                    BackgroundTask::controlled(record.task_id.clone(), record.sub_agent_id.clone());
                 task.cancel();
                 task
             }
@@ -532,22 +556,45 @@ impl ControlPlaneTaskRepository {
                 .await
             {
                 task_ref.set_done(Err(e.to_string()));
-                this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Failed, None, Some(e.to_string()))
-                    .await;
+                this.update_status(
+                    &session,
+                    &task_id_owned,
+                    &sub_agent_owned,
+                    TaskStatus::Failed,
+                    None,
+                    Some(e.to_string()),
+                )
+                .await;
                 this.fire_completion_callback(&ctx, &task_id_owned, &session, None);
                 return;
             }
-            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Running, None, None)
-                .await;
+            this.update_status(
+                &session,
+                &task_id_owned,
+                &sub_agent_owned,
+                TaskStatus::Running,
+                None,
+                None,
+            )
+            .await;
             let mut attempt: u32 = 0;
             loop {
                 // Respect a local cancel before each poll.
                 if let Some(rec) = this.read_record(&session, &task_id_owned).await {
                     if rec.cancel_requested {
-                        let _ = client.cancel_task(&base_url, &headers, &task_id_owned).await;
-                        task_ref.cancel();
-                        this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Cancelled, None, None)
+                        let _ = client
+                            .cancel_task(&base_url, &headers, &task_id_owned)
                             .await;
+                        task_ref.cancel();
+                        this.update_status(
+                            &session,
+                            &task_id_owned,
+                            &sub_agent_owned,
+                            TaskStatus::Cancelled,
+                            None,
+                            None,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -559,23 +606,49 @@ impl ControlPlaneTaskRepository {
                                 .await
                                 .unwrap_or_default();
                             task_ref.set_done(Ok(result.clone()));
-                            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Completed, Some(result.clone()), None)
-                                .await;
-                            this.fire_completion_callback(&ctx, &task_id_owned, &session, Some(result));
+                            this.update_status(
+                                &session,
+                                &task_id_owned,
+                                &sub_agent_owned,
+                                TaskStatus::Completed,
+                                Some(result.clone()),
+                                None,
+                            )
+                            .await;
+                            this.fire_completion_callback(
+                                &ctx,
+                                &task_id_owned,
+                                &session,
+                                Some(result),
+                            );
                             return;
                         }
                         if status.is_terminal_failure() {
                             let err = status.error.unwrap_or_else(|| "remote task error".into());
                             task_ref.set_done(Err(err.clone()));
-                            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Failed, None, Some(err))
-                                .await;
+                            this.update_status(
+                                &session,
+                                &task_id_owned,
+                                &sub_agent_owned,
+                                TaskStatus::Failed,
+                                None,
+                                Some(err),
+                            )
+                            .await;
                             this.fire_completion_callback(&ctx, &task_id_owned, &session, None);
                             return;
                         }
                         if status.is_cancelled() {
                             task_ref.cancel();
-                            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Cancelled, None, None)
-                                .await;
+                            this.update_status(
+                                &session,
+                                &task_id_owned,
+                                &sub_agent_owned,
+                                TaskStatus::Cancelled,
+                                None,
+                                None,
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -626,7 +699,11 @@ impl ControlPlaneTaskRepository {
         let mut body = self.tenant_body();
         body.insert("tasks".into(), Value::Array(refs));
         if let Err(e) = self
-            .post_json("/api/v1/dp/tasks/heartbeat", Value::Object(body), "heartbeat")
+            .post_json(
+                "/api/v1/dp/tasks/heartbeat",
+                Value::Object(body),
+                "heartbeat",
+            )
             .await
         {
             tracing::debug!(error = %e, "controlplane task heartbeat failed");
@@ -672,12 +749,16 @@ impl TaskRepository for ControlPlaneTaskRepository {
             &self.shared.parent_agent_id,
             session_id,
         );
-        if let TaskRunSpec::Remote { base_url, headers, .. } = &spec {
+        if let TaskRunSpec::Remote {
+            base_url, headers, ..
+        } = &spec
+        {
             record.transport_type = Some(TRANSPORT_AGENT_PROTOCOL.to_string());
             record.remote_base_url = Some(base_url.clone());
             record.remote_headers = Some(headers.clone());
         }
-        self.persist_record(session_id, &record, ctx.user_id()).await;
+        self.persist_record(session_id, &record, ctx.user_id())
+            .await;
 
         // `self` is `&ControlPlaneTaskRepository` here, but the watchers need an `Arc`.
         // The repository is only ever driven through an `Arc` by callers; recover it via
@@ -704,11 +785,19 @@ impl TaskRepository for ControlPlaneTaskRepository {
                     maintenance: Mutex::new(None),
                 });
                 repo.spawn_remote(
-                    ctx, session_id, task_id, sub_agent_id, base_url, headers, input, context,
+                    ctx,
+                    session_id,
+                    task_id,
+                    sub_agent_id,
+                    base_url,
+                    headers,
+                    input,
+                    context,
                 )
             }
             TaskRunSpec::Adopted { future } => {
-                let task = BackgroundTask::adopt(task_id.to_string(), sub_agent_id.to_string(), future);
+                let task =
+                    BackgroundTask::adopt(task_id.to_string(), sub_agent_id.to_string(), future);
                 let this = Arc::new(ControlPlaneTaskRepository {
                     shared: Arc::clone(&self.shared),
                     maintenance: Mutex::new(None),
@@ -719,8 +808,15 @@ impl TaskRepository for ControlPlaneTaskRepository {
                 let ctx = ctx.clone();
                 let watcher = Arc::clone(&task);
                 tokio::spawn(async move {
-                    this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Running, None, None)
-                        .await;
+                    this.update_status(
+                        &session,
+                        &task_id_owned,
+                        &sub_agent_owned,
+                        TaskStatus::Running,
+                        None,
+                        None,
+                    )
+                    .await;
                     loop {
                         if watcher.is_completed() {
                             break;
@@ -730,18 +826,39 @@ impl TaskRepository for ControlPlaneTaskRepository {
                     match watcher.get_task_status() {
                         TaskStatus::Completed => {
                             let result = watcher.get_result();
-                            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Completed, result.clone(), None)
-                                .await;
+                            this.update_status(
+                                &session,
+                                &task_id_owned,
+                                &sub_agent_owned,
+                                TaskStatus::Completed,
+                                result.clone(),
+                                None,
+                            )
+                            .await;
                             this.fire_completion_callback(&ctx, &task_id_owned, &session, result);
                         }
                         TaskStatus::Cancelled => {
-                            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Cancelled, None, None)
-                                .await;
+                            this.update_status(
+                                &session,
+                                &task_id_owned,
+                                &sub_agent_owned,
+                                TaskStatus::Cancelled,
+                                None,
+                                None,
+                            )
+                            .await;
                         }
                         _ => {
                             let err = watcher.get_error();
-                            this.update_status(&session, &task_id_owned, &sub_agent_owned, TaskStatus::Failed, None, err)
-                                .await;
+                            this.update_status(
+                                &session,
+                                &task_id_owned,
+                                &sub_agent_owned,
+                                TaskStatus::Failed,
+                                None,
+                                err,
+                            )
+                            .await;
                             this.fire_completion_callback(&ctx, &task_id_owned, &session, None);
                         }
                     }
@@ -835,16 +952,12 @@ impl TaskRepository for ControlPlaneTaskRepository {
         if let Some(record) = self.read_record(session_id, task_id).await {
             let mut body = self.tenant_body();
             body.insert("parentSessionId".into(), session_id.into());
-            let path = format!(
-                "/api/v1/dp/tasks/{}/cancel",
-                encode_path_segment(task_id)
-            );
-            match self
-                .post_json(&path, Value::Object(body), "cancel")
-                .await
-            {
+            let path = format!("/api/v1/dp/tasks/{}/cancel", encode_path_segment(task_id));
+            match self.post_json(&path, Value::Object(body), "cancel").await {
                 Ok(_) => {}
-                Err(crate::error::ControlPlaneError::ControlPlane { status: 404, .. }) => return found,
+                Err(crate::error::ControlPlaneError::ControlPlane { status: 404, .. }) => {
+                    return found
+                }
                 Err(e) => tracing::warn!(error = %e, "controlplane task cancel failed"),
             }
             if record.transport_type.as_deref() == Some(TRANSPORT_AGENT_PROTOCOL) {
@@ -915,8 +1028,14 @@ impl TaskRepository for ControlPlaneTaskRepository {
         }
         let mut body = self.tenant_body();
         body.insert("parentSessionId".into(), session_id.into());
-        let path = format!("/api/v1/dp/tasks/{}/delivered", encode_path_segment(task_id));
-        match self.post_json(&path, Value::Object(body), "delivered").await {
+        let path = format!(
+            "/api/v1/dp/tasks/{}/delivered",
+            encode_path_segment(task_id)
+        );
+        match self
+            .post_json(&path, Value::Object(body), "delivered")
+            .await
+        {
             Ok(_) => {}
             Err(crate::error::ControlPlaneError::ControlPlane { status: 404, .. }) => {}
             Err(e) => tracing::warn!(error = %e, "controlplane task markDelivered failed"),
@@ -1027,9 +1146,15 @@ mod tests {
         assert_eq!(record.sub_agent_id, "researcher");
         assert_eq!(record.status, TaskStatus::Running);
         assert!(record.cancel_requested);
-        assert_eq!(record.transport_type.as_deref(), Some(TRANSPORT_AGENT_PROTOCOL));
+        assert_eq!(
+            record.transport_type.as_deref(),
+            Some(TRANSPORT_AGENT_PROTOCOL)
+        );
         assert_eq!(record.remote_base_url.as_deref(), Some("http://remote"));
-        assert_eq!(record.remote_headers.unwrap().get("Authorization").unwrap(), "Bearer x");
+        assert_eq!(
+            record.remote_headers.unwrap().get("Authorization").unwrap(),
+            "Bearer x"
+        );
         assert!(record.created_at > 0);
         assert!(record.last_updated_at > record.created_at);
     }
@@ -1127,7 +1252,13 @@ mod tests {
 
         let ctx = RuntimeContext::new();
         let task = repo
-            .put_task(&ctx, "t2", "researcher", "s1", TaskRunSpec::local(|| Ok("ok".into())))
+            .put_task(
+                &ctx,
+                "t2",
+                "researcher",
+                "s1",
+                TaskRunSpec::local(|| Ok("ok".into())),
+            )
             .await;
         for _ in 0..100 {
             if task.is_completed() {
@@ -1139,12 +1270,17 @@ mod tests {
         assert_eq!(seen.lock().unwrap().as_slice(), ["t2"]);
 
         let mut suppressed = RuntimeContext::new();
-        suppressed.metadata.insert(
-            SUPPRESS_COMPLETION_CALLBACK.to_string(),
-            Value::Bool(true),
-        );
+        suppressed
+            .metadata
+            .insert(SUPPRESS_COMPLETION_CALLBACK.to_string(), Value::Bool(true));
         let task = repo
-            .put_task(&suppressed, "t3", "researcher", "s1", TaskRunSpec::local(|| Ok("ok".into())))
+            .put_task(
+                &suppressed,
+                "t3",
+                "researcher",
+                "s1",
+                TaskRunSpec::local(|| Ok("ok".into())),
+            )
             .await;
         for _ in 0..100 {
             if task.is_completed() {

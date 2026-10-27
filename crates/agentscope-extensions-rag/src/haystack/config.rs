@@ -364,7 +364,10 @@ mod tests {
             .add_custom_header("X-Test", "test")
             .build()
             .unwrap();
-        assert_eq!(config.custom_headers.get("X-Request-ID").unwrap(), "req-123");
+        assert_eq!(
+            config.custom_headers.get("X-Request-ID").unwrap(),
+            "req-123"
+        );
         assert_eq!(config.custom_headers.get("X-Test").unwrap(), "test");
     }
 
@@ -373,7 +376,10 @@ mod tests {
         assert_eq!(FilterPolicy::Replace.policy(), "replace");
         assert_eq!(FilterPolicy::Merge.policy(), "merge");
         assert_eq!(FilterPolicy::default(), FilterPolicy::Replace);
-        assert_eq!(FilterPolicy::from_policy("merge").unwrap(), FilterPolicy::Merge);
+        assert_eq!(
+            FilterPolicy::from_policy("merge").unwrap(),
+            FilterPolicy::Merge
+        );
         assert!(FilterPolicy::from_policy("unknown").is_err());
     }
 }

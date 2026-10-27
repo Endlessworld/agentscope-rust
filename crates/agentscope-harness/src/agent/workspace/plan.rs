@@ -48,8 +48,15 @@ impl PlanModeManager {
         while dir.ends_with('/') {
             dir = &dir[..dir.len() - 1];
         }
-        let plan_dir = if dir.is_empty() { DEFAULT_PLAN_DIR.to_string() } else { dir.to_string() };
-        Self { filesystem, plan_dir }
+        let plan_dir = if dir.is_empty() {
+            DEFAULT_PLAN_DIR.to_string()
+        } else {
+            dir.to_string()
+        };
+        Self {
+            filesystem,
+            plan_dir,
+        }
     }
 
     pub fn plan_dir(&self) -> &str {
@@ -64,7 +71,10 @@ impl PlanModeManager {
     /// (default if none set). Returns the workspace-relative plan file path.
     pub fn enter(&self, state: &mut AgentState) -> String {
         state.plan_mode_context.set_plan_active(true);
-        let file = state.plan_mode_context.current_plan_file().map(str::to_string);
+        let file = state
+            .plan_mode_context
+            .current_plan_file()
+            .map(str::to_string);
         if file.as_deref().map(str::trim).unwrap_or("").is_empty() {
             let default = self.default_plan_file();
             state.plan_mode_context.current_plan_file = Some(default.clone());

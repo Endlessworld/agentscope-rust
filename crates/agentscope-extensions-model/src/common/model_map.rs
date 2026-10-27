@@ -124,13 +124,19 @@ pub fn strip_reasoning_suffix(model: &str) -> (String, Option<ReasoningHint>) {
             if !base.is_empty() {
                 return (
                     base,
-                    Some(ReasoningHint { budget_tokens: Some(budget), effort: None }),
+                    Some(ReasoningHint {
+                        budget_tokens: Some(budget),
+                        effort: None,
+                    }),
                 );
             }
         } else if rest.is_empty() {
             return (
                 model[..idx].to_string(),
-                Some(ReasoningHint { budget_tokens: None, effort: None }),
+                Some(ReasoningHint {
+                    budget_tokens: None,
+                    effort: None,
+                }),
             );
         }
     }
@@ -139,7 +145,10 @@ pub fn strip_reasoning_suffix(model: &str) -> (String, Option<ReasoningHint>) {
         if EFFORTS.contains(&suffix.to_ascii_lowercase().as_str()) && idx > 0 {
             return (
                 model[..idx].to_string(),
-                Some(ReasoningHint { budget_tokens: None, effort: Some(suffix.to_ascii_lowercase()) }),
+                Some(ReasoningHint {
+                    budget_tokens: None,
+                    effort: Some(suffix.to_ascii_lowercase()),
+                }),
             );
         }
     }
@@ -165,7 +174,10 @@ mod tests {
         let mut map = ModelMap::default();
         map.insert("a", "b");
         map.insert("b", "a");
-        assert_eq!(map.resolve("a"), Err(ModelMapError::Cycle { model: "a".into() }));
+        assert_eq!(
+            map.resolve("a"),
+            Err(ModelMapError::Cycle { model: "a".into() })
+        );
     }
 
     #[test]

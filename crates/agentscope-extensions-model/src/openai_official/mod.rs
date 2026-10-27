@@ -31,8 +31,8 @@ pub mod request;
 pub mod server_tool;
 
 pub use constants::{
-    ADDITIONAL_BODY_PARAMS_WHITELIST, API_KEY_ENV, BASE_URL_ENV, DEFAULT_BASE_URL,
-    MODEL_ID_PREFIX, PROVIDER_ID,
+    ADDITIONAL_BODY_PARAMS_WHITELIST, API_KEY_ENV, BASE_URL_ENV, DEFAULT_BASE_URL, MODEL_ID_PREFIX,
+    PROVIDER_ID,
 };
 pub use credential::{OpenAIOfficialCredential, CREDENTIAL_TYPE};
 pub use error::{
@@ -41,11 +41,11 @@ pub use error::{
 };
 pub use formatter::ResponsesMultiAgentFormatter;
 pub use model::{default_transport, OpenAIResponsesChatModel};
-pub use parser::{extract_response_metadata, extract_usage, parse_response, ResponsesStreamingAssembler};
-pub use provider::{default_openai_official_registry, OpenAIOfficialModelProvider};
-pub use request::{
-    map_history, map_request, resolve_data_block_image_url, resolve_image_url,
+pub use parser::{
+    extract_response_metadata, extract_usage, parse_response, ResponsesStreamingAssembler,
 };
+pub use provider::{default_openai_official_registry, OpenAIOfficialModelProvider};
+pub use request::{map_history, map_request, resolve_data_block_image_url, resolve_image_url};
 pub use server_tool::{
     HostedToolSearchPairing, OpenAIServerTool, OpenAIServerToolKind, ResponsesServerToolHelper,
     CODE_INTERPRETER, IMAGE_GENERATION, TOOL_SEARCH, WEB_SEARCH,

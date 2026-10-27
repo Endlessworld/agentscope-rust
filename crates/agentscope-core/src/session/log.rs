@@ -82,7 +82,8 @@ pub trait SessionLog: Send + Sync {
     ) -> crate::error::Result<Head>;
 
     /// Reads up to `limit` committed events strictly after `after`.
-    async fn read_after(&self, after: u64, limit: usize) -> crate::error::Result<Vec<SessionEvent>>;
+    async fn read_after(&self, after: u64, limit: usize)
+        -> crate::error::Result<Vec<SessionEvent>>;
 
     /// Stable-prefix scan of `(after, through]`.
     async fn scan(&self, after: u64, through: u64) -> crate::error::Result<Vec<SessionEvent>> {
@@ -140,9 +141,7 @@ pub trait SessionLog: Send + Sync {
         _expected: u64,
         _next: u64,
     ) -> crate::error::Result<()> {
-        Err(session_error(
-            "Export cursor persistence not implemented",
-        ))
+        Err(session_error("Export cursor persistence not implemented"))
     }
 }
 

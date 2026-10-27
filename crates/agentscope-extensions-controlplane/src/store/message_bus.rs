@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::bus::{BusEntry, MessageBus, SESSION_REPLAY_MAX_LEN};
+use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -100,7 +100,11 @@ impl MessageBus for ControlPlaneMessageBus {
                 "queuePush",
             )
             .await?;
-        Ok(out.get("entryId").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+        Ok(out
+            .get("entryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     async fn queue_drain(&self, key: &str, max_count: usize) -> Result<Vec<BusEntry>> {
@@ -109,7 +113,11 @@ impl MessageBus for ControlPlaneMessageBus {
         body.insert("maxCount".into(), (max_count as i64).into());
         let resp = self
             .http
-            .send(Method::POST, "/api/v1/dp/bus/queue/drain", Some(Value::Object(body)))
+            .send(
+                Method::POST,
+                "/api/v1/dp/bus/queue/drain",
+                Some(Value::Object(body)),
+            )
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
         require_ok(&resp, "queueDrain").map_err(|e| Error::Other(e.to_string()))?;
@@ -121,7 +129,11 @@ impl MessageBus for ControlPlaneMessageBus {
         body.insert("key".into(), key.into());
         let resp = self
             .http
-            .send(Method::POST, "/api/v1/dp/bus/queue/delete", Some(Value::Object(body)))
+            .send(
+                Method::POST,
+                "/api/v1/dp/bus/queue/delete",
+                Some(Value::Object(body)),
+            )
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
         require_ok(&resp, "queueDelete").map_err(|e| Error::Other(e.to_string()))
@@ -132,7 +144,11 @@ impl MessageBus for ControlPlaneMessageBus {
         body.insert("key".into(), key.into());
         let resp = self
             .http
-            .send(Method::POST, "/api/v1/dp/bus/queue/peek", Some(Value::Object(body)))
+            .send(
+                Method::POST,
+                "/api/v1/dp/bus/queue/peek",
+                Some(Value::Object(body)),
+            )
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
         require_ok(&resp, "queuePeek").map_err(|e| Error::Other(e.to_string()))?;
@@ -144,12 +160,24 @@ impl MessageBus for ControlPlaneMessageBus {
         let mut body = self.tenant_body();
         body.insert("key".into(), key.into());
         body.insert("payload".into(), payload);
-        let effective = if max_len <= 0 { SESSION_REPLAY_MAX_LEN } else { max_len };
+        let effective = if max_len <= 0 {
+            SESSION_REPLAY_MAX_LEN
+        } else {
+            max_len
+        };
         body.insert("maxLen".into(), (effective as i64).into());
         let out = self
-            .post_json("/api/v1/dp/bus/log/append", Value::Object(body), "logAppend")
+            .post_json(
+                "/api/v1/dp/bus/log/append",
+                Value::Object(body),
+                "logAppend",
+            )
             .await?;
-        Ok(out.get("entryId").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+        Ok(out
+            .get("entryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     async fn log_read(
@@ -166,7 +194,11 @@ impl MessageBus for ControlPlaneMessageBus {
         }
         let resp = self
             .http
-            .send(Method::POST, "/api/v1/dp/bus/log/read", Some(Value::Object(body)))
+            .send(
+                Method::POST,
+                "/api/v1/dp/bus/log/read",
+                Some(Value::Object(body)),
+            )
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
         require_ok(&resp, "logRead").map_err(|e| Error::Other(e.to_string()))?;
@@ -178,7 +210,11 @@ impl MessageBus for ControlPlaneMessageBus {
         body.insert("key".into(), key.into());
         let resp = self
             .http
-            .send(Method::POST, "/api/v1/dp/bus/log/trim", Some(Value::Object(body)))
+            .send(
+                Method::POST,
+                "/api/v1/dp/bus/log/trim",
+                Some(Value::Object(body)),
+            )
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
         require_ok(&resp, "logTrim").map_err(|e| Error::Other(e.to_string()))

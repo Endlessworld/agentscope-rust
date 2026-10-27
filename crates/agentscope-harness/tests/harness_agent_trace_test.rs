@@ -31,7 +31,10 @@ async fn reasoning_stream_passes_through_unchanged() {
         &ctx(),
         input,
         Box::new(|_inp| {
-            Box::pin(futures::stream::iter(vec![text_delta("hel"), text_delta("lo")]))
+            Box::pin(futures::stream::iter(vec![
+                text_delta("hel"),
+                text_delta("lo"),
+            ]))
         }),
     );
     let events: Vec<_> = stream.collect().await;

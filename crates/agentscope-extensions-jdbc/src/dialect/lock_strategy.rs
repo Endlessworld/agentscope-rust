@@ -70,18 +70,10 @@ pub trait SandboxLockStrategy: Send + Sync {
     ///
     /// Returns `Ok(lease)` when acquired, or `Err(LockOutcome::TimedOut)` when the
     /// timeout expired. Backends that cannot block (e.g. a lock table) poll internally.
-    fn try_enter(
-        &self,
-        lock_name: &str,
-        timeout_seconds: u64,
-    ) -> Result<LockLease, LockOutcome>;
+    fn try_enter(&self, lock_name: &str, timeout_seconds: u64) -> Result<LockLease, LockOutcome>;
 
     /// Convenience wrapper accepting a [`Duration`] timeout.
-    fn try_enter_for(
-        &self,
-        lock_name: &str,
-        timeout: Duration,
-    ) -> Result<LockLease, LockOutcome> {
+    fn try_enter_for(&self, lock_name: &str, timeout: Duration) -> Result<LockLease, LockOutcome> {
         self.try_enter(lock_name, timeout.as_secs())
     }
 

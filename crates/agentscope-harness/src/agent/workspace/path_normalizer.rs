@@ -52,7 +52,11 @@ fn try_strip(path: &str, prefix: &str) -> Option<String> {
     let normalized_prefix = prefix.replace('\\', "/");
     if normalized_path.starts_with(&format!("{normalized_prefix}/")) {
         let rest = normalized_path[normalized_prefix.len() + 1..].to_string();
-        return Some(if rest.is_empty() { ".".to_string() } else { rest });
+        return Some(if rest.is_empty() {
+            ".".to_string()
+        } else {
+            rest
+        });
     }
     if normalized_path == normalized_prefix {
         return Some(".".to_string());
@@ -75,7 +79,10 @@ mod tests {
     #[test]
     fn strips_sandbox_prefix() {
         let n = WorkspacePathNormalizer::of("/workspace");
-        assert_eq!(n.normalize("/workspace/skills/data/run.py"), "skills/data/run.py");
+        assert_eq!(
+            n.normalize("/workspace/skills/data/run.py"),
+            "skills/data/run.py"
+        );
     }
 
     #[test]

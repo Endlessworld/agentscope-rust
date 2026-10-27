@@ -40,20 +40,29 @@ mod tests {
 
     #[test]
     fn http_status_error_display_includes_status_and_body() {
-        let err = MemError::HttpStatus { status: 401, body: "nope".into() };
-        assert_eq!(err.to_string(), "memory API request failed with status 401: nope");
+        let err = MemError::HttpStatus {
+            status: 401,
+            body: "nope".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "memory API request failed with status 401: nope"
+        );
     }
 
     #[test]
     fn config_and_transport_errors_display() {
         assert!(MemError::Config("bad".into()).to_string().contains("bad"));
-        assert!(MemError::Transport("down".into()).to_string().contains("down"));
+        assert!(MemError::Transport("down".into())
+            .to_string()
+            .contains("down"));
     }
 
     #[test]
     fn serde_json_errors_convert_into_mem_error() {
-        let err: MemError =
-            serde_json::from_str::<serde_json::Value>("{").unwrap_err().into();
+        let err: MemError = serde_json::from_str::<serde_json::Value>("{")
+            .unwrap_err()
+            .into();
         assert!(matches!(err, MemError::Json(_)));
     }
 }

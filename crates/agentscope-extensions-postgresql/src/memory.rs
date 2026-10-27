@@ -281,7 +281,12 @@ impl PostgresClient for MemoryClient {
                 }
                 t.sessions.insert(
                     slot,
-                    SessionRow { state_data: data, version: 1, created_at: now, updated_at: now },
+                    SessionRow {
+                        state_data: data,
+                        version: 1,
+                        created_at: now,
+                        updated_at: now,
+                    },
                 );
                 return Ok(QueryOutcome::Affected(1));
             }
@@ -295,7 +300,12 @@ impl PostgresClient for MemoryClient {
                 None => {
                     t.sessions.insert(
                         slot,
-                        SessionRow { state_data: data, version: 1, created_at: now, updated_at: now },
+                        SessionRow {
+                            state_data: data,
+                            version: 1,
+                            created_at: now,
+                            updated_at: now,
+                        },
                     );
                 }
             }
@@ -339,8 +349,8 @@ impl PostgresClient for MemoryClient {
         if n.starts_with("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES") {
             let schema = Self::text_of(params, 0);
             let table = Self::text_of(params, 1);
-            let found = t.schemas.contains(&schema)
-                && t.created_tables.contains(&table.to_lowercase());
+            let found =
+                t.schemas.contains(&schema) && t.created_tables.contains(&table.to_lowercase());
             return Ok(if found {
                 QueryOutcome::Rows(vec![vec![Cell::Text(table)]])
             } else {
@@ -390,8 +400,16 @@ impl PostgresClient for MemoryClient {
 
             // Point lookup: session_id = ?, [state_key = ?, item_index = ?]
             let session_id = Self::text_of(params, 0);
-            let key = if params.len() > 1 { Some(Self::text_of(params, 1)) } else { None };
-            let index = if params.len() > 2 { Some(Self::i32_of(params, 2)) } else { None };
+            let key = if params.len() > 1 {
+                Some(Self::text_of(params, 1))
+            } else {
+                None
+            };
+            let index = if params.len() > 2 {
+                Some(Self::i32_of(params, 2))
+            } else {
+                None
+            };
             let want_version = n.contains("VERSION") && !n.contains("STATE_DATA");
             let want_data_only = n.contains("STATE_DATA") && !n.contains("VERSION");
             let mut rows: Vec<Row> = Vec::new();
@@ -411,7 +429,10 @@ impl PostgresClient for MemoryClient {
                 } else if want_data_only {
                     rows.push(vec![Cell::Text(row.state_data.clone())]);
                 } else {
-                    rows.push(vec![Cell::Text(row.state_data.clone()), Cell::BigInt(row.version)]);
+                    rows.push(vec![
+                        Cell::Text(row.state_data.clone()),
+                        Cell::BigInt(row.version),
+                    ]);
                 }
             }
             return Ok(QueryOutcome::Rows(rows));
@@ -423,7 +444,8 @@ impl PostgresClient for MemoryClient {
             if n.contains("STATE_KEY") {
                 let key = Self::text_of(params, 1);
                 let before = t.sessions.len();
-                t.sessions.retain(|(s, k, _), _| !(s == &session_id && k == &key));
+                t.sessions
+                    .retain(|(s, k, _), _| !(s == &session_id && k == &key));
                 return Ok(QueryOutcome::Affected((before - t.sessions.len()) as u64));
             }
             let before = t.sessions.len();
@@ -474,7 +496,9 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- KV store: upsert / insert ----
-        if n.starts_with("INSERT INTO") && (n.contains("AGENTSCOPE_STORE") || n.contains("NAMESPACE_PATH")) {
+        if n.starts_with("INSERT INTO")
+            && (n.contains("AGENTSCOPE_STORE") || n.contains("NAMESPACE_PATH"))
+        {
             let ns = Self::text_of(params, 0);
             let key = Self::text_of(params, 1);
             let value = Self::text_of(params, 2);
@@ -484,7 +508,14 @@ impl PostgresClient for MemoryClient {
                 if t.store.contains_key(&slot) {
                     return Ok(QueryOutcome::Affected(0));
                 }
-                t.store.insert(slot, StoreRow { value_json: value, version: 1, updated_at: now });
+                t.store.insert(
+                    slot,
+                    StoreRow {
+                        value_json: value,
+                        version: 1,
+                        updated_at: now,
+                    },
+                );
                 return Ok(QueryOutcome::Affected(1));
             }
             if n.contains("ON CONFLICT") {
@@ -495,7 +526,14 @@ impl PostgresClient for MemoryClient {
                         row.updated_at = now;
                     }
                     None => {
-                        t.store.insert(slot, StoreRow { value_json: value, version: 1, updated_at: now });
+                        t.store.insert(
+                            slot,
+                            StoreRow {
+                                value_json: value,
+                                version: 1,
+                                updated_at: now,
+                            },
+                        );
                     }
                 }
                 return Ok(QueryOutcome::Affected(1));
@@ -506,12 +544,21 @@ impl PostgresClient for MemoryClient {
                     "duplicate key value violates unique constraint (SQLSTATE 23505)".into(),
                 ));
             }
-            t.store.insert(slot, StoreRow { value_json: value, version: 1, updated_at: now });
+            t.store.insert(
+                slot,
+                StoreRow {
+                    value_json: value,
+                    version: 1,
+                    updated_at: now,
+                },
+            );
             return Ok(QueryOutcome::Affected(1));
         }
 
         // ---- KV store: CAS update ----
-        if n.starts_with("UPDATE") && (n.contains("AGENTSCOPE_STORE") || n.contains("NAMESPACE_PATH")) {
+        if n.starts_with("UPDATE")
+            && (n.contains("AGENTSCOPE_STORE") || n.contains("NAMESPACE_PATH"))
+        {
             // UPDATE <t> SET value_json = ?, version = version + 1, updated_at = ?
             //   WHERE namespace_path = ? AND item_key = ? AND version = ?
             let value = Self::text_of(params, 0);
@@ -531,7 +578,9 @@ impl PostgresClient for MemoryClient {
         }
 
         // ---- KV store: delete ----
-        if n.starts_with("DELETE FROM") && (n.contains("AGENTSCOPE_STORE") || n.contains("NAMESPACE_PATH")) {
+        if n.starts_with("DELETE FROM")
+            && (n.contains("AGENTSCOPE_STORE") || n.contains("NAMESPACE_PATH"))
+        {
             let ns = Self::text_of(params, 0);
             let key = Self::text_of(params, 1);
             let before = t.store.len();
@@ -571,7 +620,9 @@ impl PostgresClient for MemoryClient {
             }));
         }
 
-        Err(PostgresError::Query(format!("MemoryClient: unrecognised SQL: {sql}")))
+        Err(PostgresError::Query(format!(
+            "MemoryClient: unrecognised SQL: {sql}"
+        )))
     }
 
     fn execute_batch(&self, sql: &str) -> PgResult<()> {
@@ -631,7 +682,9 @@ impl MemoryClient {
         let upper = statement.to_uppercase();
         let idx = upper.find("IF NOT EXISTS")? + "IF NOT EXISTS".len();
         let rest = statement[idx..].trim_start();
-        let end = rest.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(rest.len());
         let target = rest[..end].trim();
         if target.is_empty() {
             None

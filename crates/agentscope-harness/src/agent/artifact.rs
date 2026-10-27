@@ -37,7 +37,12 @@ pub struct ArtifactDeliveryResult {
 
 impl ArtifactDeliveryResult {
     pub fn success() -> Self {
-        Self { successful: true, conflict: false, error: None, message: None }
+        Self {
+            successful: true,
+            conflict: false,
+            error: None,
+            message: None,
+        }
     }
 
     pub fn success_with_message(message: impl Into<String>) -> Self {

@@ -259,7 +259,11 @@ impl RedisDistributedStore {
     ///
     /// Prefix: `{root}snapshot:`.
     pub fn sandbox_snapshot_spec(&self) -> RedisSnapshotSpec {
-        RedisSnapshotSpec::new(&self.connection, &format!("{}snapshot:", self.key_prefix), None)
+        RedisSnapshotSpec::new(
+            &self.connection,
+            &format!("{}snapshot:", self.key_prefix),
+            None,
+        )
     }
 
     /// Snapshot spec as a trait object for direct harness wiring.
@@ -351,7 +355,10 @@ mod tests {
         .with_url("redis://localhost:6379");
 
         assert_eq!(store.url(), Some("redis://localhost:6379"));
-        assert!(store.base_store().is_ok(), "auto-wires without contacting the server");
+        assert!(
+            store.base_store().is_ok(),
+            "auto-wires without contacting the server"
+        );
     }
 
     #[tokio::test]
@@ -363,16 +370,27 @@ mod tests {
             Err(e) => format!("{e}"),
         };
         assert!(msg.contains("no Redis URL retained"), "{msg}");
-        assert!(msg.contains("base_store_with_url"), "degradation path is documented: {msg}");
+        assert!(
+            msg.contains("base_store_with_url"),
+            "degradation path is documented: {msg}"
+        );
     }
 
     #[tokio::test]
     async fn agent_state_store_uses_session_prefix_and_memory_adapter() {
         let (store, adapter) = offline_bundle();
         let state = store.agent_state_store().expect("state store builds");
-        state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
-        assert_eq!(state.get(Some("u1"), "s1", "k").await, Some(serde_json::json!(1)));
-        assert!(adapter.string_of("app:session:u1/s1:k").is_some(), "prefix honoured");
+        state
+            .save(Some("u1"), "s1", "k", serde_json::json!(1))
+            .await;
+        assert_eq!(
+            state.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!(1))
+        );
+        assert!(
+            adapter.string_of("app:session:u1/s1:k").is_some(),
+            "prefix honoured"
+        );
     }
 
     #[tokio::test]
@@ -383,14 +401,19 @@ mod tests {
         assert_eq!(store.key_layout_version(), KeyLayoutVersion::V1);
 
         let state = store.agent_state_store().expect("state store builds");
-        state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        state
+            .save(Some("u1"), "s1", "k", serde_json::json!(1))
+            .await;
 
         assert!(
             adapter.string_of("app:session:{u1/s1}:k").is_some(),
             "V1 hash tag is applied through the combiner: {:?}",
             adapter.all_keys()
         );
-        assert!(adapter.all_keys().iter().all(|k| k.starts_with("app:session:{u1/s1}")));
+        assert!(adapter
+            .all_keys()
+            .iter()
+            .all(|k| k.starts_with("app:session:{u1/s1}")));
     }
 
     #[tokio::test]
@@ -398,7 +421,9 @@ mod tests {
         let (store, adapter) = offline_bundle();
         assert_eq!(store.key_layout_version(), KeyLayoutVersion::V0);
         let state = store.agent_state_store().expect("state store builds");
-        state.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        state
+            .save(Some("u1"), "s1", "k", serde_json::json!(1))
+            .await;
         assert!(adapter.string_of("app:session:u1/s1:k").is_some());
         assert!(adapter.all_keys().iter().all(|k| !k.contains('{')));
     }
@@ -420,6 +445,9 @@ mod tests {
         let _client = store.snapshot_client();
         let guard = store.sandbox_execution_guard();
         assert_eq!(guard.key_prefix(), "app:guard:");
-        assert!(Arc::ptr_eq(store.adapter(), store.adapter()), "adapter is stable");
+        assert!(
+            Arc::ptr_eq(store.adapter(), store.adapter()),
+            "adapter is stable"
+        );
     }
 }

@@ -95,7 +95,9 @@ mod tests {
             room: Some("r1".into()),
             thread_id: Some("t1".into()),
             thread_ts: Some("123".into()),
-            extra: [("k2".into(), "v2".into()), ("k1".into(), "v1".into())].into_iter().collect(),
+            extra: [("k2".into(), "v2".into()), ("k1".into(), "v1".into())]
+                .into_iter()
+                .collect(),
             user_id: Some("alice".into()),
         };
         let key = ctx.canonical_key();

@@ -91,7 +91,10 @@ impl GatewayBootstrapBuilder {
             )));
         }
 
-        let gateway = Arc::new(HarnessGateway::create(self.channel_manager, self.message_bus));
+        let gateway = Arc::new(HarnessGateway::create(
+            self.channel_manager,
+            self.message_bus,
+        ));
 
         // Register all agents, bind the main one.
         let main_agent = self

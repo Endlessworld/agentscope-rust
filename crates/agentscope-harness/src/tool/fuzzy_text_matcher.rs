@@ -46,25 +46,40 @@ impl SearchResult {
 /// ladders until at least one match is found.
 pub fn search(existing: &str, needle: &str) -> SearchResult {
     if existing.is_empty() || needle.is_empty() {
-        return SearchResult { matches: Vec::new(), level: Level::Exact };
+        return SearchResult {
+            matches: Vec::new(),
+            level: Level::Exact,
+        };
     }
     let exact = find_all(existing, needle, Level::Exact);
     if !exact.is_empty() {
-        return SearchResult { matches: exact, level: Level::Exact };
+        return SearchResult {
+            matches: exact,
+            level: Level::Exact,
+        };
     }
     let existing_tws = strip_trailing_whitespace(existing);
     let needle_tws = strip_trailing_whitespace(needle);
     let tws = find_all_normalized(&existing_tws, &needle_tws, Level::TrailingWsStripped);
     if !tws.is_empty() {
-        return SearchResult { matches: tws, level: Level::TrailingWsStripped };
+        return SearchResult {
+            matches: tws,
+            level: Level::TrailingWsStripped,
+        };
     }
     let existing_wsc = collapse_whitespace(existing);
     let needle_wsc = collapse_whitespace(needle);
     let wsc = find_all_normalized(&existing_wsc, &needle_wsc, Level::WhitespaceCollapsed);
     if !wsc.is_empty() {
-        return SearchResult { matches: wsc, level: Level::WhitespaceCollapsed };
+        return SearchResult {
+            matches: wsc,
+            level: Level::WhitespaceCollapsed,
+        };
     }
-    SearchResult { matches: Vec::new(), level: Level::Exact }
+    SearchResult {
+        matches: Vec::new(),
+        level: Level::Exact,
+    }
 }
 
 fn find_all(haystack: &str, needle: &str, level: Level) -> Vec<MatchRange> {
@@ -85,7 +100,11 @@ struct Normalized {
     original_len: usize,
 }
 
-fn find_all_normalized(haystack: &Normalized, needle: &Normalized, level: Level) -> Vec<MatchRange> {
+fn find_all_normalized(
+    haystack: &Normalized,
+    needle: &Normalized,
+    level: Level,
+) -> Vec<MatchRange> {
     let mut out = Vec::new();
     if needle.text.is_empty() {
         return out;
@@ -100,7 +119,11 @@ fn find_all_normalized(haystack: &Normalized, needle: &Normalized, level: Level)
         } else {
             haystack.original_len
         };
-        out.push(MatchRange { start: orig_start, end: orig_end, level });
+        out.push(MatchRange {
+            start: orig_start,
+            end: orig_end,
+            level,
+        });
         idx = needle_end_excl;
     }
     out
@@ -139,9 +162,7 @@ fn strip_trailing_whitespace(s: &str) -> Normalized {
         // CRLF: the carriage return is part of the terminator, not the line body.
         let body_end = line_body_end(&chars, line_start, line_end);
         let mut trim_end = body_end;
-        while trim_end > line_start
-            && (chars[trim_end - 1] == ' ' || chars[trim_end - 1] == '\t')
-        {
+        while trim_end > line_start && (chars[trim_end - 1] == ' ' || chars[trim_end - 1] == '\t') {
             trim_end -= 1;
         }
         for j in line_start..trim_end {
@@ -154,7 +175,11 @@ fn strip_trailing_whitespace(s: &str) -> Normalized {
         }
         i = line_end + 1;
     }
-    Normalized { text: out, original_index: map, original_len: len }
+    Normalized {
+        text: out,
+        original_index: map,
+        original_len: len,
+    }
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -203,7 +228,11 @@ fn collapse_whitespace(s: &str) -> Normalized {
         }
         i = line_end + 1;
     }
-    Normalized { text: out, original_index: map, original_len: len }
+    Normalized {
+        text: out,
+        original_index: map,
+        original_len: len,
+    }
 }
 #[cfg(test)]
 mod tests {

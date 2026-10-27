@@ -194,10 +194,7 @@ impl GitSkillRepository {
             cmd.current_dir(dir);
         }
         let output = cmd.output().map_err(|e| {
-            SkillRepositoryError::Git(format!(
-                "failed to run `git {}`: {e}",
-                args.join(" ")
-            ))
+            SkillRepositoryError::Git(format!("failed to run `git {}`: {e}", args.join(" ")))
         })?;
         Ok(output)
     }
@@ -235,9 +232,7 @@ impl GitSkillRepository {
     fn rev_parse(dir: &Path, rev: &str) -> Result<String, SkillRepositoryError> {
         let output = Self::run_git(Some(dir), &["rev-parse", rev])?;
         if !output.status.success() {
-            return Err(SkillRepositoryError::Git(format!(
-                "rev-parse {rev} failed"
-            )));
+            return Err(SkillRepositoryError::Git(format!("rev-parse {rev} failed")));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -443,7 +438,11 @@ impl AgentSkillRepository for GitSkillRepository {
     }
 
     fn get_all_skill_names(&self) -> Result<Vec<String>, SkillRepositoryError> {
-        let mut names: Vec<String> = self.load_all()?.into_iter().map(|s| s.name().to_string()).collect();
+        let mut names: Vec<String> = self
+            .load_all()?
+            .into_iter()
+            .map(|s| s.name().to_string())
+            .collect();
         names.sort();
         Ok(names)
     }
@@ -629,9 +628,7 @@ fn skill_identity(skill_md: &str, dir_name: &str) -> (String, String) {
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| {
-            first_body_line(skill_md).unwrap_or_else(|| format!("Skill: {name}"))
-        });
+        .unwrap_or_else(|| first_body_line(skill_md).unwrap_or_else(|| format!("Skill: {name}")));
     (name, description)
 }
 
@@ -779,9 +776,7 @@ mod tests {
     #[test]
     fn extracts_identifier_for_https_and_ssh() {
         assert_eq!(
-            GitSkillRepository::extract_repository_identifier(
-                "https://github.com/owner/repo.git"
-            ),
+            GitSkillRepository::extract_repository_identifier("https://github.com/owner/repo.git"),
             "owner/repo"
         );
         assert_eq!(
@@ -799,8 +794,7 @@ mod tests {
     #[test]
     fn default_source_includes_branch_and_sanitises() {
         let repo = GitSkillRepository::from_config(
-            GitSkillRepositoryConfig::new("https://github.com/owner/repo.git")
-                .branch("feature/x"),
+            GitSkillRepositoryConfig::new("https://github.com/owner/repo.git").branch("feature/x"),
         )
         .unwrap();
         assert_eq!(repo.get_source(), "git-owner/repo@feature/x");
@@ -872,7 +866,10 @@ mod tests {
 
         // An optional BOM and CRLF line endings behave identically.
         let crlf = "\u{feff}---\r\nname: calc\r\n---\r\nbody\r\n";
-        assert_eq!(split_frontmatter(crlf), (Some("name: calc\r\n"), "body\r\n"));
+        assert_eq!(
+            split_frontmatter(crlf),
+            (Some("name: calc\r\n"), "body\r\n")
+        );
     }
 
     /// Java parity: the closing fence must occupy a line of its own, so an indented `---`
@@ -925,8 +922,10 @@ mod tests {
     /// so the description still falls back to the first body heading (not the `---` fence).
     #[test]
     fn skill_identity_treats_an_indented_fence_as_body() {
-        let (name, desc) =
-            skill_identity("---\nname: calc\nnote: |\n  ---\n---\n# Heading\n", "dir-name");
+        let (name, desc) = skill_identity(
+            "---\nname: calc\nnote: |\n  ---\n---\n# Heading\n",
+            "dir-name",
+        );
         assert_eq!(name, "calc");
         assert_eq!(desc, "Heading");
     }
@@ -946,7 +945,10 @@ mod tests {
     #[test]
     fn remote_url_is_trimmed() {
         let repo = GitSkillRepository::new("  https://github.com/test/repo.git \n").unwrap();
-        assert_eq!(repo.get_repository_info().location, "https://github.com/test/repo.git");
+        assert_eq!(
+            repo.get_repository_info().location,
+            "https://github.com/test/repo.git"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1061,7 +1063,12 @@ mod tests {
         let root = unique_dir("subdir");
         let remote = root.join("remote");
         init_repo(&remote);
-        write_skill(&remote, "skills/subdir-skill", "subdir-skill", "A skill in skills/");
+        write_skill(
+            &remote,
+            "skills/subdir-skill",
+            "subdir-skill",
+            "A skill in skills/",
+        );
         commit_all(&remote, "initial");
 
         let repo = repo_for(&file_url(&remote), &root.join("clone"));
@@ -1110,11 +1117,23 @@ mod tests {
         // `develop` clone. That only held because `develop` was branched after `main-skill`
         // was committed — branching copies history, so the file (and its identity) is present
         // on `develop` by construction.
-        write_skill_body(&remote, "skills/main-skill", "main-skill", "on main", "on main");
+        write_skill_body(
+            &remote,
+            "skills/main-skill",
+            "main-skill",
+            "on main",
+            "on main",
+        );
         commit_all(&remote, "main");
 
         git_in(&remote, &["checkout", "-q", "-b", "develop"]);
-        write_skill_body(&remote, "skills/main-skill", "main-skill", "on develop", "on develop");
+        write_skill_body(
+            &remote,
+            "skills/main-skill",
+            "main-skill",
+            "on develop",
+            "on develop",
+        );
         commit_all(&remote, "develop");
         // Put HEAD back on `main` so a plain `ls-remote <url> HEAD` would return the wrong ref.
         git_in(&remote, &["checkout", "-q", "main"]);

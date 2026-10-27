@@ -237,7 +237,10 @@ mod tests {
         let c = client();
         let guard = PostgresSandboxExecutionGuard::new(c);
         assert_eq!(guard.key_prefix, DEFAULT_KEY_PREFIX);
-        assert_eq!(guard.lock_timeout, Duration::from_secs(DEFAULT_LOCK_TIMEOUT_SECONDS));
+        assert_eq!(
+            guard.lock_timeout,
+            Duration::from_secs(DEFAULT_LOCK_TIMEOUT_SECONDS)
+        );
     }
 
     // Java: PostgresSandboxExecutionGuardTest#builderWithCustomKeyPrefix,
@@ -257,7 +260,9 @@ mod tests {
         assert_eq!(g2.key_prefix, "custom:");
 
         // Java: #builderRejectsBlankKeyPrefix
-        assert!(PostgresSandboxExecutionGuard::builder(c).key_prefix("  ").is_err());
+        assert!(PostgresSandboxExecutionGuard::builder(c)
+            .key_prefix("  ")
+            .is_err());
     }
 
     // Java: PostgresSandboxExecutionGuardTest#builderWithCustomTimeout,

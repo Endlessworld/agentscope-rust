@@ -9,9 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
 
-use super::types::{
-    Cost, ModelDescriptor, ModelKind, ModelStatus, ReasoningOption,
-};
+use super::types::{Cost, ModelDescriptor, ModelKind, ModelStatus, ReasoningOption};
 use crate::Result;
 
 /// One parsed source payload.
@@ -82,7 +80,10 @@ pub(crate) fn parse_api_json(bytes: &[u8]) -> Result<ParsedSource> {
 ///
 /// Identity fields always come from `base` (which is keyed by `provider/model`); detail
 /// fields prefer `enhanced` but never lose a known value from `base`.
-pub(crate) fn merge_descriptors(base: ModelDescriptor, enhanced: ModelDescriptor) -> ModelDescriptor {
+pub(crate) fn merge_descriptors(
+    base: ModelDescriptor,
+    enhanced: ModelDescriptor,
+) -> ModelDescriptor {
     let mut merged = base;
     if !enhanced.name.is_empty() && enhanced.name != enhanced.id {
         merged.name = enhanced.name;
@@ -339,11 +340,7 @@ fn reasoning_option(value: &Value) -> Option<ReasoningOption> {
                 .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty())
                 .collect();
-            values.sort_by(|a, b| {
-                effort_rank(a)
-                    .cmp(&effort_rank(b))
-                    .then_with(|| a.cmp(b))
-            });
+            values.sort_by(|a, b| effort_rank(a).cmp(&effort_rank(b)).then_with(|| a.cmp(b)));
             values.dedup();
             (!values.is_empty()).then_some(ReasoningOption::Effort { values })
         }
@@ -456,7 +453,10 @@ mod tests {
             }
         }"#;
         let parsed = parse_api_json(payload).unwrap();
-        assert_eq!(parsed.provider_api["openrouter"], "https://openrouter.ai/api/v1");
+        assert_eq!(
+            parsed.provider_api["openrouter"],
+            "https://openrouter.ai/api/v1"
+        );
         let a = parsed
             .entries
             .iter()
@@ -469,7 +469,10 @@ mod tests {
             ReasoningOption::Effort { values }
                 if values == &["none", "medium", "xhigh"]
         ));
-        assert!(matches!(a.reasoning_options[1], ReasoningOption::BudgetTokens));
+        assert!(matches!(
+            a.reasoning_options[1],
+            ReasoningOption::BudgetTokens
+        ));
         let b = parsed
             .entries
             .iter()
@@ -509,7 +512,11 @@ mod tests {
         let api = std::fs::read(&api_path).expect("models-api.json in temp");
 
         let flat = parse_models_json(&models).unwrap();
-        assert!(flat.entries.len() > 500, "flat entries: {}", flat.entries.len());
+        assert!(
+            flat.entries.len() > 500,
+            "flat entries: {}",
+            flat.entries.len()
+        );
         let detailed = parse_api_json(&api).unwrap();
         assert!(
             detailed.entries.len() > 8_000,

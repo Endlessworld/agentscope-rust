@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 
 /// Sentinel version for backends that do not support optimistic concurrency, and the
 /// value returned by [`AgentStateStore::save_if_version`] when a CAS write conflicts
@@ -34,7 +34,13 @@ impl VersionedState {
 #[async_trait]
 pub trait AgentStateStore: Send + Sync {
     /// Save a single value (full replacement).
-    async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: serde_json::Value);
+    async fn save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    );
 
     /// Save a list of values.
     async fn save_list(
@@ -46,10 +52,20 @@ pub trait AgentStateStore: Send + Sync {
     );
 
     /// Get a single value, or `None` if not present.
-    async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<serde_json::Value>;
+    async fn get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Option<serde_json::Value>;
 
     /// Get a list of values (empty when not present).
-    async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<serde_json::Value>;
+    async fn get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Vec<serde_json::Value>;
 
     /// Whether a session has any persisted state.
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool;
@@ -155,7 +171,13 @@ impl InMemoryAgentStateStore {
 
 #[async_trait]
 impl AgentStateStore for InMemoryAgentStateStore {
-    async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: serde_json::Value) {
+    async fn save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) {
         let _ = require_session_id(session_id);
         let mut g = self.inner.write().unwrap();
         let session = g
@@ -168,20 +190,43 @@ impl AgentStateStore for InMemoryAgentStateStore {
         session.versions.insert(key.to_string(), next);
     }
 
-    async fn save_list(&self, user_id: Option<&str>, session_id: &str, key: &str, values: &[serde_json::Value]) {
+    async fn save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+    ) {
         let _ = require_session_id(session_id);
         let mut g = self.inner.write().unwrap();
-        g.entry(normalize_user(user_id)).or_default()
-            .entry(session_id.to_string()).or_insert_with(SessionData::default)
-            .list.insert(key.to_string(), values.to_vec());
+        g.entry(normalize_user(user_id))
+            .or_default()
+            .entry(session_id.to_string())
+            .or_insert_with(SessionData::default)
+            .list
+            .insert(key.to_string(), values.to_vec());
     }
 
-    async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<serde_json::Value> {
+    async fn get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Option<serde_json::Value> {
         let g = self.inner.read().unwrap();
-        g.get(&normalize_user(user_id))?.get(session_id)?.single.get(key).cloned()
+        g.get(&normalize_user(user_id))?
+            .get(session_id)?
+            .single
+            .get(key)
+            .cloned()
     }
 
-    async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<serde_json::Value> {
+    async fn get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Vec<serde_json::Value> {
         let g = self.inner.read().unwrap();
         match g.get(&normalize_user(user_id)) {
             Some(bucket) => bucket
@@ -194,17 +239,32 @@ impl AgentStateStore for InMemoryAgentStateStore {
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        self.inner.read().unwrap().get(&normalize_user(user_id)).map(|m| m.contains_key(session_id)).unwrap_or(false)
+        self.inner
+            .read()
+            .unwrap()
+            .get(&normalize_user(user_id))
+            .map(|m| m.contains_key(session_id))
+            .unwrap_or(false)
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
-        if let Some(bucket) = self.inner.write().unwrap().get_mut(&normalize_user(user_id)) {
+        if let Some(bucket) = self
+            .inner
+            .write()
+            .unwrap()
+            .get_mut(&normalize_user(user_id))
+        {
             bucket.remove(session_id);
         }
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
-        self.inner.read().unwrap().get(&normalize_user(user_id)).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        self.inner
+            .read()
+            .unwrap()
+            .get(&normalize_user(user_id))
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn supports_versioning(&self) -> bool {
@@ -320,11 +380,13 @@ impl JsonFileAgentStateStore {
     }
 
     fn state_path(&self, user_id: Option<&str>, session_id: &str, key: &str) -> PathBuf {
-        self.session_dir(user_id, session_id).join(format!("{}.json", key))
+        self.session_dir(user_id, session_id)
+            .join(format!("{}.json", key))
     }
 
     fn list_path(&self, user_id: Option<&str>, session_id: &str, key: &str) -> PathBuf {
-        self.session_dir(user_id, session_id).join(format!("{}.jsonl", key))
+        self.session_dir(user_id, session_id)
+            .join(format!("{}.jsonl", key))
     }
 
     async fn atomic_write(&self, path: &Path, content: &str) -> Result<()> {
@@ -340,7 +402,13 @@ impl JsonFileAgentStateStore {
 
 #[async_trait]
 impl AgentStateStore for JsonFileAgentStateStore {
-    async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: serde_json::Value) {
+    async fn save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) {
         let session = require_session_id(session_id).unwrap_or_default();
         let path = self.state_path(user_id, &session, key);
         if let Ok(json) = serde_json::to_string_pretty(&value) {
@@ -348,7 +416,13 @@ impl AgentStateStore for JsonFileAgentStateStore {
         }
     }
 
-    async fn save_list(&self, user_id: Option<&str>, session_id: &str, key: &str, values: &[serde_json::Value]) {
+    async fn save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+    ) {
         let session = require_session_id(session_id).unwrap_or_default();
         let path = self.list_path(user_id, &session, key);
         let mut content = String::new();
@@ -361,13 +435,23 @@ impl AgentStateStore for JsonFileAgentStateStore {
         let _ = self.atomic_write(&path, &content).await;
     }
 
-    async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<serde_json::Value> {
+    async fn get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Option<serde_json::Value> {
         let path = self.state_path(user_id, session_id, key);
         let text = tokio::fs::read_to_string(path).await.ok()?;
         serde_json::from_str(&text).ok()
     }
 
-    async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<serde_json::Value> {
+    async fn get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Vec<serde_json::Value> {
         let path = self.list_path(user_id, session_id, key);
         let text = match tokio::fs::read_to_string(path).await {
             Ok(t) => t,
@@ -380,7 +464,9 @@ impl AgentStateStore for JsonFileAgentStateStore {
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        tokio::fs::metadata(self.session_dir(user_id, session_id)).await.is_ok()
+        tokio::fs::metadata(self.session_dir(user_id, session_id))
+            .await
+            .is_ok()
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {

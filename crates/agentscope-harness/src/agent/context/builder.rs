@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock};
-use agentscope_core::model::catalog::{MAX_SAFETY_MARGIN, DEFAULT_RESERVED_OUTPUT};
+use agentscope_core::model::catalog::{DEFAULT_RESERVED_OUTPUT, MAX_SAFETY_MARGIN};
 use agentscope_core::model::{GenerateOptions, Model, ToolSchema, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::state::TaskContextState;
 
@@ -341,8 +341,7 @@ impl ContextPipeline {
             .estimate(&EstimateInput::new(&current, &tools));
         // Omission decisions use the same provider-anchored count as the final budget
         // check, so optional material is dropped before a conversation is compacted.
-        let mut observed_tokens =
-            context_usage(&current, &tools, Some(model.model_name())).tokens;
+        let mut observed_tokens = context_usage(&current, &tools, Some(model.model_name())).tokens;
 
         if purpose == ContextPurpose::Reasoning && observed_tokens > limit {
             let order = self.config.selection.omission_order(&selected);
@@ -356,9 +355,7 @@ impl ContextPipeline {
                 let mut seen: HashSet<&str> = HashSet::new();
                 for id in &order {
                     let item = by_id.get(id.as_str()).ok_or_else(|| {
-                        crate::Error::Agent(format!(
-                            "Invalid context omission candidate: {id}"
-                        ))
+                        crate::Error::Agent(format!("Invalid context omission candidate: {id}"))
                     })?;
                     if item.required
                         || item.placement == ContextItemPlacement::System
@@ -383,17 +380,14 @@ impl ContextPipeline {
                     .policy
                     .estimator
                     .estimate(&EstimateInput::new(&current, &tools));
-                observed_tokens =
-                    context_usage(&current, &tools, Some(model.model_name())).tokens;
+                observed_tokens = context_usage(&current, &tools, Some(model.model_name())).tokens;
             }
         }
 
         // Auxiliary requests cannot compact a conversation. Shrink the request itself so a
         // summary prompt never fails on the local input budget: drop the oldest chat turns
         // first, then trim the largest remaining text block (the prompt body).
-        let current = if purpose != ContextPurpose::Reasoning
-            && local_estimate.tokens > limit
-        {
+        let current = if purpose != ContextPurpose::Reasoning && local_estimate.tokens > limit {
             let shrunk = self.shrink_auxiliary(current, &tools, limit);
             transforms.push("auxiliary_truncated_for_budget".to_string());
             shrunk
@@ -582,9 +576,7 @@ impl ContextPipeline {
                         .iter()
                         .enumerate()
                         .filter_map(move |(bi, block)| match block {
-                            ContentBlock::Text(text) => {
-                                Some((mi, bi, text.text.chars().count()))
-                            }
+                            ContentBlock::Text(text) => Some((mi, bi, text.text.chars().count())),
                             _ => None,
                         })
                 })
@@ -596,8 +588,7 @@ impl ContextPipeline {
                 break;
             }
             let over = (estimate(&messages) - limit).max(1);
-            let drop_chars =
-                ((over as f64 * 2.5).ceil() as usize).max(64) + MARKER.chars().count();
+            let drop_chars = ((over as f64 * 2.5).ceil() as usize).max(64) + MARKER.chars().count();
             if drop_chars >= total_chars {
                 messages[message_index].content[block_index] =
                     ContentBlock::Text(TextBlock::new(""));
@@ -625,9 +616,8 @@ impl ContextPipeline {
     fn observe(&self, manifest: &ContextManifest) {
         let observer = Arc::clone(&self.config.policy.observer);
         let payload = manifest.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            observer(&payload)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || observer(&payload)));
         if result.is_err() {
             tracing::warn!(
                 call_id = %manifest.call_id,
@@ -691,9 +681,7 @@ impl ContextPipeline {
             } else {
                 0
             },
-            catalog_key: model
-                .descriptor()
-                .map(|descriptor| descriptor.key.clone()),
+            catalog_key: model.descriptor().map(|descriptor| descriptor.key.clone()),
             estimated_input_tokens: estimate.tokens,
             input_limit: limit,
             counting_method: estimate.method.clone(),
@@ -778,10 +766,7 @@ impl ContextPipeline {
         let mut output = self.config.policy.reserved_output_tokens as i64;
         if output == 0 {
             output = if window > 0 {
-                std::cmp::min(
-                    DEFAULT_RESERVED_OUTPUT as i64,
-                    std::cmp::max(1, window / 8),
-                )
+                std::cmp::min(DEFAULT_RESERVED_OUTPUT as i64, std::cmp::max(1, window / 8))
             } else {
                 DEFAULT_RESERVED_OUTPUT as i64
             };
@@ -799,10 +784,7 @@ impl ContextPipeline {
         let safety = if self.config.policy.safety_margin_tokens > 0 {
             self.config.policy.safety_margin_tokens as i64
         } else if window > 0 {
-            std::cmp::min(
-                MAX_SAFETY_MARGIN as i64,
-                std::cmp::max(1, window / 50),
-            )
+            std::cmp::min(MAX_SAFETY_MARGIN as i64, std::cmp::max(1, window / 50))
         } else {
             1024
         };
@@ -891,10 +873,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl super::super::source::ContextSource for FixedSource {
-        async fn load(
-            &self,
-            _request: &ContextRequest,
-        ) -> crate::Result<Vec<ContextBlock>> {
+        async fn load(&self, _request: &ContextRequest) -> crate::Result<Vec<ContextBlock>> {
             Ok(self.0.clone())
         }
     }
@@ -942,7 +921,9 @@ mod tests {
 
         // System first, then conversation, then runtime state, then references.
         assert_eq!(prepared.messages[0].role, MsgRole::System);
-        assert!(prepared.messages[0].text_content().contains("preserve the public API"));
+        assert!(prepared.messages[0]
+            .text_content()
+            .contains("preserve the public API"));
         assert_eq!(prepared.messages[1].text_content(), "investigate");
         let runtime_index = prepared
             .messages
@@ -1009,7 +990,10 @@ mod tests {
             .map(|m| m.text_content())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("keep me"), "required instruction survives");
+        assert!(
+            rendered.contains("keep me"),
+            "required instruction survives"
+        );
     }
 
     #[tokio::test]
@@ -1091,7 +1075,7 @@ mod tests {
             .with_source(
                 "biz",
                 Arc::new(FixedSource(vec![
-                    ContextBlock::runtime("status", "live").unwrap(),
+                    ContextBlock::runtime("status", "live").unwrap()
                 ])),
                 ContextSourceOptions::default(),
             )
@@ -1222,10 +1206,7 @@ mod tests {
         struct Failing;
         #[async_trait::async_trait]
         impl super::super::source::ContextSource for Failing {
-            async fn load(
-                &self,
-                _request: &ContextRequest,
-            ) -> crate::Result<Vec<ContextBlock>> {
+            async fn load(&self, _request: &ContextRequest) -> crate::Result<Vec<ContextBlock>> {
                 Err(crate::Error::Agent("boom".into()))
             }
         }

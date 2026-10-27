@@ -55,7 +55,6 @@ impl TodoWriteTool {
     }
 }
 
-
 #[async_trait]
 impl Tool for TodoWriteTool {
     fn name(&self) -> &str {
@@ -121,7 +120,9 @@ impl Tool for TodoWriteTool {
         let snapshot = ctx.snapshot();
         let mut by_content: HashMap<String, Task> = HashMap::new();
         for existing in snapshot.tasks() {
-            by_content.entry(existing.subject.clone()).or_insert_with(|| existing.clone());
+            by_content
+                .entry(existing.subject.clone())
+                .or_insert_with(|| existing.clone());
         }
 
         let mut rebuilt = Vec::with_capacity(items.len());
@@ -206,7 +207,10 @@ pub fn render(tasks: &[Task]) -> String {
     if tasks.is_empty() {
         return "Todo list cleared (0 items).".to_string();
     }
-    let open = tasks.iter().filter(|t| t.state != TaskState::Completed).count();
+    let open = tasks
+        .iter()
+        .filter(|t| t.state != TaskState::Completed)
+        .count();
     let mut s = format!("{} open todo(s):\n", open);
     for t in tasks {
         let priority = t.metadata.get("priority").cloned();
@@ -249,9 +253,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.state, ToolResultState::Success);
-        assert_eq!(metadata_str(&result, METADATA_STATE_KEY), Some(STATE_KEY_TASKS_CONTEXT));
         assert_eq!(
-            result.metadata.get(METADATA_STATE_REVISION).and_then(|v| v.as_u64()),
+            metadata_str(&result, METADATA_STATE_KEY),
+            Some(STATE_KEY_TASKS_CONTEXT)
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get(METADATA_STATE_REVISION)
+                .and_then(|v| v.as_u64()),
             Some(1)
         );
         assert_eq!(
@@ -280,7 +290,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            first.metadata.get(METADATA_STATE_REVISION).and_then(|v| v.as_u64()),
+            first
+                .metadata
+                .get(METADATA_STATE_REVISION)
+                .and_then(|v| v.as_u64()),
             Some(1)
         );
 
@@ -292,7 +305,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            second.metadata.get(METADATA_STATE_REVISION).and_then(|v| v.as_u64()),
+            second
+                .metadata
+                .get(METADATA_STATE_REVISION)
+                .and_then(|v| v.as_u64()),
             Some(2)
         );
 

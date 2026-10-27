@@ -85,7 +85,9 @@ impl Memory for InMemoryMemory {
             .iter()
             .map(serde_json::to_value)
             .collect::<serde_json::Result<_>>()?;
-        store.save_list(user_id, session_id, MEMORY_MESSAGES_KEY, &values).await;
+        store
+            .save_list(user_id, session_id, MEMORY_MESSAGES_KEY, &values)
+            .await;
         Ok(())
     }
 
@@ -95,7 +97,9 @@ impl Memory for InMemoryMemory {
         user_id: Option<&str>,
         session_id: &str,
     ) -> Result<()> {
-        let values = store.get_list(user_id, session_id, MEMORY_MESSAGES_KEY).await;
+        let values = store
+            .get_list(user_id, session_id, MEMORY_MESSAGES_KEY)
+            .await;
         let msgs: Vec<Msg> = values
             .iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
@@ -114,7 +118,9 @@ pub struct StateBackedMemory {
 
 impl StateBackedMemory {
     pub fn new(state: AgentState) -> Self {
-        Self { state: std::sync::Arc::new(std::sync::RwLock::new(state)) }
+        Self {
+            state: std::sync::Arc::new(std::sync::RwLock::new(state)),
+        }
     }
 
     pub fn state(&self) -> AgentState {
@@ -157,7 +163,9 @@ impl Memory for StateBackedMemory {
                 .map(serde_json::to_value)
                 .collect::<serde_json::Result<Vec<_>>>()?
         };
-        store.save_list(user_id, session_id, MEMORY_MESSAGES_KEY, &values).await;
+        store
+            .save_list(user_id, session_id, MEMORY_MESSAGES_KEY, &values)
+            .await;
         Ok(())
     }
 
@@ -167,7 +175,9 @@ impl Memory for StateBackedMemory {
         user_id: Option<&str>,
         session_id: &str,
     ) -> Result<()> {
-        let values = store.get_list(user_id, session_id, MEMORY_MESSAGES_KEY).await;
+        let values = store
+            .get_list(user_id, session_id, MEMORY_MESSAGES_KEY)
+            .await;
         let msgs: Vec<Msg> = values
             .iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())

@@ -107,7 +107,9 @@ pub enum PromotionResult {
 
 impl PromotionResult {
     pub fn invalid(reason: impl Into<String>) -> Self {
-        PromotionResult::Invalid { reason: reason.into() }
+        PromotionResult::Invalid {
+            reason: reason.into(),
+        }
     }
 }
 
@@ -159,11 +161,7 @@ impl SkillAuditLog {
     }
 
     /// Queries audit entries for the given UTC day, filtered by `predicate`.
-    pub fn query(
-        &self,
-        day_utc: &str,
-        predicate: impl Fn(&AuditEntry) -> bool,
-    ) -> Vec<AuditEntry> {
+    pub fn query(&self, day_utc: &str, predicate: impl Fn(&AuditEntry) -> bool) -> Vec<AuditEntry> {
         let Ok(content) = std::fs::read_to_string(&self.path) else {
             return Vec::new();
         };
@@ -180,7 +178,10 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(f, "{line}")?;
     Ok(())
 }
@@ -233,7 +234,11 @@ impl SkillPromoter {
         let candidate = super::curator::build_candidate(
             &draft.name(),
             &draft.description(),
-            draft.resources().get("SKILL.md").map(|s| s.as_str()).unwrap_or(""),
+            draft
+                .resources()
+                .get("SKILL.md")
+                .map(|s| s.as_str())
+                .unwrap_or(""),
             draft.resources(),
             5,
         );
@@ -309,8 +314,14 @@ mod tests {
     #[test]
     fn allow_list_gate_approves_named() {
         let gate = AllowListGate::new(vec!["good".to_string()]);
-        assert!(matches!(gate.review(&candidate("good")), PromotionDecision::Approve));
-        assert!(matches!(gate.review(&candidate("bad")), PromotionDecision::Reject(_)));
+        assert!(matches!(
+            gate.review(&candidate("good")),
+            PromotionDecision::Approve
+        ));
+        assert!(matches!(
+            gate.review(&candidate("bad")),
+            PromotionDecision::Reject(_)
+        ));
     }
 
     #[test]
@@ -355,8 +366,12 @@ mod tests {
             },
         );
         let store = Arc::new(std::sync::Mutex::new(store));
-        let promoter = SkillPromoter::new(Arc::new(drafts.clone()), Arc::new(main.clone()), Arc::new(AllowListGate::new(vec!["tool".to_string()])))
-            .with_usage_store(store);
+        let promoter = SkillPromoter::new(
+            Arc::new(drafts.clone()),
+            Arc::new(main.clone()),
+            Arc::new(AllowListGate::new(vec!["tool".to_string()])),
+        )
+        .with_usage_store(store);
         let result = promoter.promote("tool", "rev");
         assert!(matches!(result, PromotionResult::Approved { .. }));
         assert_eq!(main.load().len(), 1);

@@ -249,7 +249,10 @@ impl SessionExecution {
     ///
     /// Returns `true` when unapplied steering for this turn still exists, so the caller keeps
     /// consuming instead of closing and losing the accepted guidance.
-    pub async fn continue_or_close(&self, recorder: &SessionRecorder) -> crate::error::Result<bool> {
+    pub async fn continue_or_close(
+        &self,
+        recorder: &SessionRecorder,
+    ) -> crate::error::Result<bool> {
         let inbox = SessionInbox::new(Arc::clone(&self.log))?;
         let applied = self.applied.lock().unwrap().clone();
         let snapshot = inbox.snapshot().await?;
@@ -303,7 +306,13 @@ mod tests {
         log.release(&writer).await.unwrap();
     }
 
-    fn raw(seq: u64, kind: &str, run: Option<&str>, turn: Option<&str>, payload: String) -> SessionEvent {
+    fn raw(
+        seq: u64,
+        kind: &str,
+        run: Option<&str>,
+        turn: Option<&str>,
+        payload: String,
+    ) -> SessionEvent {
         SessionEvent::new(
             format!("e{seq}"),
             seq,
@@ -318,13 +327,22 @@ mod tests {
     }
 
     fn submit(id: &str, turn: &str) -> Command {
-        Command::new(id, "submit", Some(turn.into()), vec![Msg::user("hi")], vec![]).unwrap()
+        Command::new(
+            id,
+            "submit",
+            Some(turn.into()),
+            vec![Msg::user("hi")],
+            vec![],
+        )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn submit_is_admitted_and_opens_the_turn() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
         execution.prepare(&recorder).await.unwrap();
         assert_eq!(execution.inputs().len(), 1);
@@ -344,7 +362,9 @@ mod tests {
             vec![raw(1, "run/start", Some("run-0"), Some("t1"), "{}".into())],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c2", "t2"));
         let err = execution.prepare(&recorder).await.unwrap_err();
         assert!(
@@ -369,10 +389,16 @@ mod tests {
             )],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c2", "t2"));
         let err = execution.prepare(&recorder).await.unwrap_err();
-        assert!(err.to_string().contains("Answer pending interactions first"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("Answer pending interactions first"),
+            "{err}"
+        );
         recorder.close().await;
     }
 
@@ -394,12 +420,21 @@ mod tests {
                     Some("t1"),
                     serde_json::json!({ "messages": [Msg::user("original"), confirm] }).to_string(),
                 ),
-                raw(3, "run/end", Some("run-0"), Some("t1"), serde_json::json!({ "status": "interrupted" }).to_string()),
+                raw(
+                    3,
+                    "run/end",
+                    Some("run-0"),
+                    Some("t1"),
+                    serde_json::json!({ "status": "interrupted" }).to_string(),
+                ),
             ],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
-        let command = Command::new("c-resume", "resume", Some("t1".into()), vec![], vec![]).unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        let command =
+            Command::new("c-resume", "resume", Some("t1".into()), vec![], vec![]).unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), command);
         execution.prepare(&recorder).await.unwrap();
         // The original user input is replayed; the confirmation answer is not.
@@ -434,8 +469,11 @@ mod tests {
             ],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2")).await.unwrap();
-        let command = Command::new("c-resume", "resume", Some("t1".into()), vec![], vec![]).unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+            .await
+            .unwrap();
+        let command =
+            Command::new("c-resume", "resume", Some("t1".into()), vec![], vec![]).unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), command);
         let err = execution.prepare(&recorder).await.unwrap_err();
         assert!(
@@ -452,7 +490,13 @@ mod tests {
             &*log,
             vec![
                 raw(1, "run/start", Some("run-0"), Some("t1"), "{}".into()),
-                raw(2, "run/end", Some("run-0"), Some("t1"), serde_json::json!({ "status": "suspended" }).to_string()),
+                raw(
+                    2,
+                    "run/end",
+                    Some("run-0"),
+                    Some("t1"),
+                    serde_json::json!({ "status": "suspended" }).to_string(),
+                ),
                 raw(
                     3,
                     "interaction/requested",
@@ -463,15 +507,31 @@ mod tests {
             ],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
 
-        let ok = Command::new("c1", "respond", Some("t1".into()), vec![Msg::user("")], vec!["r1".into()]).unwrap();
+        let ok = Command::new(
+            "c1",
+            "respond",
+            Some("t1".into()),
+            vec![Msg::user("")],
+            vec!["r1".into()],
+        )
+        .unwrap();
         SessionExecution::new(Arc::clone(&log), ok)
             .prepare(&recorder)
             .await
             .unwrap();
 
-        let stale = Command::new("c2", "respond", Some("t1".into()), vec![], vec!["gone".into()]).unwrap();
+        let stale = Command::new(
+            "c2",
+            "respond",
+            Some("t1".into()),
+            vec![],
+            vec!["gone".into()],
+        )
+        .unwrap();
         let err = SessionExecution::new(Arc::clone(&log), stale)
             .prepare(&recorder)
             .await
@@ -483,13 +543,24 @@ mod tests {
     #[tokio::test]
     async fn steer_and_inject_are_applied_once_before_a_step() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
         execution.prepare(&recorder).await.unwrap();
 
         let inbox = SessionInbox::new(Arc::clone(&log)).unwrap();
         inbox
-            .accept(&Command::new("s1", "steer", Some("t1".into()), vec![Msg::user("steer")], vec![]).unwrap())
+            .accept(
+                &Command::new(
+                    "s1",
+                    "steer",
+                    Some("t1".into()),
+                    vec![Msg::user("steer")],
+                    vec![],
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         inbox
@@ -511,12 +582,23 @@ mod tests {
     #[tokio::test]
     async fn steering_for_another_turn_is_not_applied() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
         execution.prepare(&recorder).await.unwrap();
         let inbox = SessionInbox::new(Arc::clone(&log)).unwrap();
         inbox
-            .accept(&Command::new("s9", "steer", Some("other".into()), vec![Msg::user("x")], vec![]).unwrap())
+            .accept(
+                &Command::new(
+                    "s9",
+                    "steer",
+                    Some("other".into()),
+                    vec![Msg::user("x")],
+                    vec![],
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         let mut state = crate::state::AgentState::builder().session_id("s1").build();
@@ -528,12 +610,23 @@ mod tests {
     #[tokio::test]
     async fn continue_or_close_keeps_the_turn_open_for_unapplied_steering() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
         execution.prepare(&recorder).await.unwrap();
         let inbox = SessionInbox::new(Arc::clone(&log)).unwrap();
         inbox
-            .accept(&Command::new("s1", "steer", Some("t1".into()), vec![Msg::user("more")], vec![]).unwrap())
+            .accept(
+                &Command::new(
+                    "s1",
+                    "steer",
+                    Some("t1".into()),
+                    vec![Msg::user("more")],
+                    vec![],
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -549,7 +642,9 @@ mod tests {
     #[tokio::test]
     async fn close_is_idempotent_and_clears_the_active_run() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
         execution.prepare(&recorder).await.unwrap();
         assert!(!execution.continue_or_close(&recorder).await.unwrap());

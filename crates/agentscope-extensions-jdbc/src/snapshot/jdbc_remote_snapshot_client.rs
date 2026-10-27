@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient;
+use async_trait::async_trait;
 
 use crate::backend::{JdbcResult, SharedExecutor};
 use crate::dialect::{validate_table_schema, AbstractJdbcDialect, BoundSql, SnapshotDialect};
@@ -42,7 +42,10 @@ impl JdbcRemoteSnapshotClient {
     }
 
     /// Creates a client with schema initialization enabled.
-    pub fn with_schema(executor: SharedExecutor, dialect: Arc<dyn AbstractJdbcDialect>) -> JdbcResult<Self> {
+    pub fn with_schema(
+        executor: SharedExecutor,
+        dialect: Arc<dyn AbstractJdbcDialect>,
+    ) -> JdbcResult<Self> {
         Self::new(executor, dialect, true)
     }
 
@@ -75,10 +78,9 @@ impl RemoteSnapshotClient for JdbcRemoteSnapshotClient {
 
     async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
         let bound = self.dialect.snapshot_select(snapshot_id);
-        let rows = self
-            .executor
-            .query(&bound)
-            .map_err(|e| Error::Tool(format!("snapshot download failed for '{snapshot_id}': {e}")))?;
+        let rows = self.executor.query(&bound).map_err(|e| {
+            Error::Tool(format!("snapshot download failed for '{snapshot_id}': {e}"))
+        })?;
         let data = rows
             .into_iter()
             .next()
@@ -93,6 +95,10 @@ impl RemoteSnapshotClient for JdbcRemoteSnapshotClient {
         self.executor
             .query(&bound)
             .map(|rows| !rows.is_empty())
-            .map_err(|e| Error::Tool(format!("snapshot exists check failed for '{snapshot_id}': {e}")))
+            .map_err(|e| {
+                Error::Tool(format!(
+                    "snapshot exists check failed for '{snapshot_id}': {e}"
+                ))
+            })
     }
 }

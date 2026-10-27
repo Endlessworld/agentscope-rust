@@ -18,8 +18,8 @@ pub mod inbound;
 pub mod peer;
 pub mod router;
 
-pub use channel::Channel;
 pub use binding::ChannelBinding;
+pub use channel::Channel;
 pub use chatui::{ChatUiChannel, ChatUiRequest, OutboundEnvelope, SendOptions};
 pub use config::ChannelConfig;
 pub use dm_scope::DmScope;

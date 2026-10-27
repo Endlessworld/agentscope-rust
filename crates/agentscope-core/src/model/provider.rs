@@ -190,7 +190,10 @@ impl ModelRegistry {
 
     /// Resolves the model id to a concrete model instance.
     pub fn resolve(&self, model_id: &str) -> Result<Arc<dyn Model>> {
-        self.resolve_with(model_id, ModelCreationContext::new(DEFAULT_PROVIDER_ID, model_id))
+        self.resolve_with(
+            model_id,
+            ModelCreationContext::new(DEFAULT_PROVIDER_ID, model_id),
+        )
     }
 
     /// Resolves the model id to a concrete instance, using `base` as the
@@ -272,7 +275,10 @@ impl ModelRegistry {
                 });
             }
         }
-        Err(Error::Model(format!("no model provider registered for '{}'", model_id)))
+        Err(Error::Model(format!(
+            "no model provider registered for '{}'",
+            model_id
+        )))
     }
 
     fn find_provider(&self, provider_id: &str) -> Option<&Arc<dyn ModelProvider>> {
@@ -296,7 +302,9 @@ pub struct ModelProviderSupport;
 
 impl ModelProviderSupport {
     /// Returns the first non-blank value among the candidates (in order).
-    pub fn first_non_blank<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    pub fn first_non_blank<'a>(
+        candidates: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Option<String> {
         candidates
             .into_iter()
             .flatten()
@@ -369,13 +377,19 @@ mod tests {
             model.starts_with("dummy-")
         }
         fn create(&self, ctx: ModelCreationContext) -> Result<Arc<dyn Model>> {
-            Err(Error::Model(format!("dummy provider cannot instantiate '{}'", ctx.model)))
+            Err(Error::Model(format!(
+                "dummy provider cannot instantiate '{}'",
+                ctx.model
+            )))
         }
     }
 
     #[test]
     fn split_id_handles_colon_and_bare() {
-        assert_eq!(ModelRegistry::split_id("openai:gpt-4o"), ("openai", "gpt-4o"));
+        assert_eq!(
+            ModelRegistry::split_id("openai:gpt-4o"),
+            ("openai", "gpt-4o")
+        );
         assert_eq!(ModelRegistry::split_id("gpt-4o"), ("", "gpt-4o"));
     }
 

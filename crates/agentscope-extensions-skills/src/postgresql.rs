@@ -32,8 +32,7 @@ const MAX_IDENTIFIER_LENGTH: usize = 63;
 
 /// Column types that can store the JSON metadata payload (`isSupportedMetadataJsonColumnType`).
 /// `jsonb` is deliberately absent: writing a JSON *string* into `jsonb` would fail.
-const SUPPORTED_METADATA_JSON_COLUMN_TYPES: [&str; 3] =
-    ["text", "character varying", "character"];
+const SUPPORTED_METADATA_JSON_COLUMN_TYPES: [&str; 3] = ["text", "character varying", "character"];
 
 /// Configuration for [`PostgresSkillRepository`].
 #[derive(Debug, Clone)]
@@ -126,7 +125,11 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         cfg: PostgresSkillRepositoryConfig,
     ) -> Result<Self, SkillRepositoryError> {
         validate_identifier(&cfg.schema_name, "schema name", MAX_IDENTIFIER_LENGTH)?;
-        validate_identifier(&cfg.skills_table_name, "skills table name", MAX_IDENTIFIER_LENGTH)?;
+        validate_identifier(
+            &cfg.skills_table_name,
+            "skills table name",
+            MAX_IDENTIFIER_LENGTH,
+        )?;
         validate_identifier(
             &cfg.resources_table_name,
             "resources table name",
@@ -242,10 +245,10 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
                 return false;
             }
         };
-        let Some(data_type) = rows
-            .first()
-            .and_then(|row| row.get_text("DATA_TYPE").or_else(|| row.get_text("data_type")))
-        else {
+        let Some(data_type) = rows.first().and_then(|row| {
+            row.get_text("DATA_TYPE")
+                .or_else(|| row.get_text("data_type"))
+        }) else {
             return false;
         };
         let normalized = data_type.trim().to_ascii_lowercase();
@@ -273,9 +276,10 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         let rows = conn.query(&sql, &[SqlParam::Int(skill_id)])?;
         let mut resources = SkillResources::new();
         for row in rows {
-            if let (Some(path), Some(content)) =
-                (row.get_text("resource_path"), row.get_text("resource_content"))
-            {
+            if let (Some(path), Some(content)) = (
+                row.get_text("resource_path"),
+                row.get_text("resource_content"),
+            ) {
                 resources.insert(path, content);
             }
         }
@@ -396,7 +400,10 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
             tracing::warn!("cannot clear skills: repository is read-only");
             return Ok(0);
         }
-        let sql = format!("DELETE FROM {}", self.full_table_name(&self.cfg.skills_table_name));
+        let sql = format!(
+            "DELETE FROM {}",
+            self.full_table_name(&self.cfg.skills_table_name)
+        );
         let mut conn = self.db.connection()?;
         conn.execute(&sql, &[])
     }
@@ -473,7 +480,8 @@ impl<D: SqlDatabase> AgentSkillRepository for PostgresSkillRepository<D> {
         let skill_rows = conn.query(&skills_sql, &[])?;
         let resource_rows = conn.query(&resources_sql, &[])?;
 
-        let mut by_id: std::collections::HashMap<i64, SkillResources> = std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<i64, SkillResources> =
+            std::collections::HashMap::new();
         for row in resource_rows {
             if let (Some(id), Some(path), Some(content)) = (
                 row.get_int("id"),
@@ -584,10 +592,7 @@ impl<D: SqlDatabase> AgentSkillRepository for PostgresSkillRepository<D> {
     }
 
     fn get_repository_info(&self) -> AgentSkillRepositoryInfo {
-        let location = format!(
-            "{}.{}",
-            self.cfg.schema_name, self.cfg.skills_table_name
-        );
+        let location = format!("{}.{}", self.cfg.schema_name, self.cfg.skills_table_name);
         AgentSkillRepositoryInfo::new("postgresql", location, self.writeable())
     }
 

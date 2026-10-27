@@ -84,16 +84,16 @@ pub fn blocks_of(content: &[AnthropicContentBlock]) -> Vec<ContentBlock> {
             AnthropicContentBlock::BashCodeExecutionToolResult(r) => blocks.push(
                 ContentBlock::ToolResult(server_tool_result_block(r, "bash_code_execution", block)),
             ),
-            AnthropicContentBlock::TextEditorCodeExecutionToolResult(r) => blocks.push(
-                ContentBlock::ToolResult(server_tool_result_block(
+            AnthropicContentBlock::TextEditorCodeExecutionToolResult(r) => {
+                blocks.push(ContentBlock::ToolResult(server_tool_result_block(
                     r,
                     "text_editor_code_execution",
                     block,
-                )),
+                )))
+            }
+            AnthropicContentBlock::ToolSearchToolResult(r) => blocks.push(
+                ContentBlock::ToolResult(server_tool_result_block(r, "tool_search", block)),
             ),
-            AnthropicContentBlock::ToolSearchToolResult(r) => blocks.push(ContentBlock::ToolResult(
-                server_tool_result_block(r, "tool_search", block),
-            )),
         }
     }
     blocks
@@ -129,7 +129,9 @@ fn server_tool_result_block(
                 for item in items {
                     let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
                     let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    output.push(ContentBlock::Text(TextBlock::new(format!("{title} ({url})"))));
+                    output.push(ContentBlock::Text(TextBlock::new(format!(
+                        "{title} ({url})"
+                    ))));
                 }
             }
         }
@@ -434,7 +436,9 @@ mod tests {
         let first = inc.accumulate(&a).unwrap();
         assert_eq!(first.id, "msg_9");
         assert!(matches!(&first.content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
 
         let final_response = inc.into_final().unwrap();
         assert_eq!(final_response.usage.input_tokens, 6);

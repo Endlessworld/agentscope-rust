@@ -86,7 +86,11 @@ impl HigressClientConfig {
         if self.query_params.is_empty() {
             return self.endpoint.clone();
         }
-        let separator = if self.endpoint.contains('?') { '&' } else { '?' };
+        let separator = if self.endpoint.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let query = self
             .query_params
             .iter()
@@ -166,7 +170,11 @@ impl McpConnection for McpClientManager {
             "Connecting Higress MCP server"
         );
         // Another wrapper may already own a connection for this server.
-        if self.find_client_id_by_server(&request.server.name).await.is_some() {
+        if self
+            .find_client_id_by_server(&request.server.name)
+            .await
+            .is_some()
+        {
             return Ok(());
         }
         let client_id = self.create_client(request.server).await?;
@@ -409,10 +417,7 @@ impl HigressMcpClientBuilder {
     ///
     /// Mirrors the Java `buildSync`, which validates, builds the delegate and
     /// initializes before returning.
-    pub async fn build(
-        &self,
-        manager: Arc<McpClientManager>,
-    ) -> Result<HigressMcpClientWrapper> {
+    pub async fn build(&self, manager: Arc<McpClientManager>) -> Result<HigressMcpClientWrapper> {
         let config = self.build_config()?;
         let wrapper = HigressMcpClientWrapper::new(config, manager);
         wrapper.initialize().await?;
@@ -466,10 +471,7 @@ impl HigressMcpClientWrapper {
     }
 
     /// Creates a wrapper backed by an arbitrary [`McpConnection`].
-    fn with_connection(
-        config: HigressClientConfig,
-        connection: Arc<dyn McpConnection>,
-    ) -> Self {
+    fn with_connection(config: HigressClientConfig, connection: Arc<dyn McpConnection>) -> Self {
         let server_config = config.to_server_config();
         Self {
             name: config.client_name,
@@ -672,7 +674,10 @@ impl HigressMcpClientWrapper {
                 .search_tools_with_top_k(&query, self.tool_search_top_k)
                 .await?;
             if !result.is_success() {
-                let msg = result.error_message().unwrap_or("unknown error").to_string();
+                let msg = result
+                    .error_message()
+                    .unwrap_or("unknown error")
+                    .to_string();
                 tracing::error!("Tool search failed: {}", msg);
                 return Err(Error::Other(format!("Tool search failed: {}", msg)));
             }
@@ -715,11 +720,7 @@ impl HigressMcpClientWrapper {
     /// Invokes a tool on the gateway.
     ///
     /// `arguments` may be any JSON value; object values are passed through as-is.
-    pub async fn call_tool(
-        &self,
-        tool_name: &str,
-        arguments: Value,
-    ) -> Result<CallToolResult> {
+    pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult> {
         tracing::debug!(
             "Calling tool '{}' on Higress MCP client '{}' with arguments: {}",
             tool_name,
@@ -752,7 +753,8 @@ impl HigressMcpClientWrapper {
     /// Mirrors the Java single-argument overload `searchTools(String query)`,
     /// which omits `topK` and defaults to the configured `tool_search_top_k`.
     pub async fn search_tools(&self, query: &str) -> Result<HigressToolSearchResult> {
-        self.search_tools_with_top_k(query, self.tool_search_top_k).await
+        self.search_tools_with_top_k(query, self.tool_search_top_k)
+            .await
     }
 
     /// Calls `x_higress_tool_search` with `query` and explicit `top_k`.
@@ -766,7 +768,9 @@ impl HigressMcpClientWrapper {
         let mut args = Map::new();
         args.insert("query".to_string(), Value::String(query.to_string()));
         args.insert("topK".to_string(), Value::Number(top_k.into()));
-        let result = self.call_tool(TOOL_SEARCH_NAME, Value::Object(args)).await?;
+        let result = self
+            .call_tool(TOOL_SEARCH_NAME, Value::Object(args))
+            .await?;
         Ok(HigressToolSearchResult::parse(&result))
     }
 
@@ -834,11 +838,14 @@ pub fn convert_to_mcp_tool(tool_info: &HigressToolInfo) -> Tool {
 /// Builds a [`ToolInputSchema`] from a raw JSON schema value.
 fn build_input_schema(schema: &Value) -> Option<ToolInputSchema> {
     let object = schema.as_object()?;
-    let properties = object.get("properties").and_then(|p| p.as_object()).map(|p| {
-        p.iter()
-            .filter_map(|(k, v)| v.as_object().map(|m| (k.clone(), m.clone())))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    });
+    let properties = object
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p| {
+            p.iter()
+                .filter_map(|(k, v)| v.as_object().map(|m| (k.clone(), m.clone())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
     let required = object
         .get("required")
         .and_then(|r| r.as_array())
@@ -1080,8 +1087,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_tools_after_initialize_does_not_report_missing_client() {
-        let recording =
-            Arc::new(RecordingConnection::with_tools(vec![test_tool("echo"), test_tool("add")]));
+        let recording = Arc::new(RecordingConnection::with_tools(vec![
+            test_tool("echo"),
+            test_tool("add"),
+        ]));
         let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording);
 
         wrapper.initialize().await.unwrap();
@@ -1125,7 +1134,10 @@ mod tests {
         assert_eq!(config.transport_type.as_str(), "sse");
         assert_eq!(config.endpoint, "https://gw.example.com/sse");
         assert_eq!(config.timeout, DEFAULT_TIMEOUT);
-        assert_eq!(config.initialization_timeout, DEFAULT_INITIALIZATION_TIMEOUT);
+        assert_eq!(
+            config.initialization_timeout,
+            DEFAULT_INITIALIZATION_TIMEOUT
+        );
         assert_eq!(config.tool_search_top_k, DEFAULT_TOOL_SEARCH_TOP_K);
     }
 
@@ -1190,11 +1202,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             config.headers,
-            vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]
         );
         assert_eq!(
             config.query_params,
-            vec![("x".to_string(), "1".to_string()), ("y".to_string(), "2".to_string())]
+            vec![
+                ("x".to_string(), "1".to_string()),
+                ("y".to_string(), "2".to_string())
+            ]
         );
     }
 

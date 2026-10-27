@@ -211,7 +211,10 @@ impl TrinityClient {
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(Error::http_status(status.as_u16(), format!("Trinity API failed: {status}")));
+            return Err(Error::http_status(
+                status.as_u16(),
+                format!("Trinity API failed: {status}"),
+            ));
         }
 
         let status_response: StatusResponse = resp
@@ -510,13 +513,7 @@ mod tests {
             _tools: Vec<ToolSchema>,
             _options: GenerateOptions,
         ) -> futures::stream::BoxStream<'_, Result<ChatResponse>> {
-            let r = ChatResponse::new(
-                "resp-42",
-                vec![],
-                ChatUsage::default(),
-                None,
-                None,
-            );
+            let r = ChatResponse::new("resp-42", vec![], ChatUsage::default(), None, None);
             Box::pin(stream::once(async move { Ok(r) }))
         }
         fn model_name(&self) -> &str {
@@ -629,10 +626,7 @@ mod tests {
     #[test]
     fn adapter_requires_delegate_or_base_url() {
         assert!(TrinityModelAdapter::builder().build().is_err());
-        assert!(TrinityModelAdapter::builder()
-            .base_url("")
-            .build()
-            .is_err());
+        assert!(TrinityModelAdapter::builder().base_url("").build().is_err());
     }
 
     #[test]

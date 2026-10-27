@@ -41,7 +41,10 @@ fn guard_reentrant_access_increments_then_releases() {
 #[test]
 fn distributed_store_rejects_blank_bucket() {
     let err = OssDistributedStore::create(common::mem_client(), "  ", None).unwrap_err();
-    assert!(matches!(err, agentscope_extensions_oss::OssError::BlankBucket));
+    assert!(matches!(
+        err,
+        agentscope_extensions_oss::OssError::BlankBucket
+    ));
 }
 
 #[tokio::test]

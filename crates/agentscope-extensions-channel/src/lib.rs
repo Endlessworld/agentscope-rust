@@ -1,4 +1,4 @@
-﻿//! Platform channel adapters for AgentScope (Rust port of
+//! Platform channel adapters for AgentScope (Rust port of
 //! `agentscope-extensions-channel`).
 //!
 //! The harness owns the *routing skeleton* (`agentscope_harness::agent::gateway`):
@@ -40,4 +40,3 @@ pub use common::{
     InMemoryAccessTokenStore, InboundEventDeduplicator, PeerTarget, PreparedRequest,
     PreparedResponse, ReqwestTransport, Result,
 };
-

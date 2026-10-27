@@ -22,7 +22,10 @@ pub struct RemoteTarget {
 
 impl RemoteTarget {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into(), headers: BTreeMap::new() }
+        Self {
+            base_url: base_url.into(),
+            headers: BTreeMap::new(),
+        }
     }
 
     pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
@@ -41,7 +44,11 @@ pub struct RemoteTaskStatus {
 
 impl RemoteTaskStatus {
     pub fn new(status: impl Into<String>, error: Option<String>) -> Self {
-        Self { status: status.into(), error, pending_confirms: Vec::new() }
+        Self {
+            status: status.into(),
+            error,
+            pending_confirms: Vec::new(),
+        }
     }
 
     pub fn is_awaiting_confirm(&self) -> bool {
@@ -57,7 +64,8 @@ impl RemoteTaskStatus {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.status.eq_ignore_ascii_case("cancelled") || self.status.eq_ignore_ascii_case("canceled")
+        self.status.eq_ignore_ascii_case("cancelled")
+            || self.status.eq_ignore_ascii_case("canceled")
     }
 }
 
@@ -102,10 +110,16 @@ impl RemoteSubmitContext {
             m.insert("user_id".into(), serde_json::Value::String(uid.clone()));
         }
         if let Some(pid) = &self.parent_session_id {
-            m.insert("parent_session_id".into(), serde_json::Value::String(pid.clone()));
+            m.insert(
+                "parent_session_id".into(),
+                serde_json::Value::String(pid.clone()),
+            );
         }
         m.insert("stream".into(), serde_json::Value::Bool(self.stream));
-        m.insert("detail".into(), serde_json::Value::String(self.detail.clone()));
+        m.insert(
+            "detail".into(),
+            serde_json::Value::String(self.detail.clone()),
+        );
         if !self.deny_rules.is_empty() {
             m.insert(
                 "deny_rules".into(),
@@ -173,7 +187,10 @@ pub struct EventStreamHandle {
 impl EventStreamHandle {
     /// Creates a no-op handle (server without streaming support).
     pub fn noop() -> Self {
-        Self { stop: Arc::new(AtomicBool::new(true)), task: None }
+        Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            task: None,
+        }
     }
 
     /// Signals the reader loop to stop.
@@ -262,7 +279,10 @@ impl AgentProtocolTaskClient {
         let resp = req.send().await.map_err(http_err)?;
         let status = resp.status();
         if status.as_u16() == 404 {
-            return Ok(RemoteTaskStatus::new("error", Some("task not found".to_string())));
+            return Ok(RemoteTaskStatus::new(
+                "error",
+                Some("task not found".to_string()),
+            ));
         }
         let body = resp.text().await.unwrap_or_default();
         if status.as_u16() >= 400 {
@@ -271,11 +291,23 @@ impl AgentProtocolTaskClient {
                 Some(format!("HTTP {}: {body}", status.as_u16())),
             ));
         }
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        let st = value.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let err = value.get("error").and_then(|v| v.as_str()).map(str::to_string);
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        let st = value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let err = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let pending = parse_pending_confirms(value.get("pending_confirms"));
-        Ok(RemoteTaskStatus { status: st, error: err, pending_confirms: pending })
+        Ok(RemoteTaskStatus {
+            status: st,
+            error: err,
+            pending_confirms: pending,
+        })
     }
 
     /// `GET /tasks/{taskId}/wait?timeout_seconds=<n>`.
@@ -287,7 +319,11 @@ impl AgentProtocolTaskClient {
         timeout_seconds: u64,
     ) -> Result<String> {
         let timeout = timeout_seconds.max(1);
-        let path = format!("/tasks/{}/wait?timeout_seconds={}", encode(task_id), timeout);
+        let path = format!(
+            "/tasks/{}/wait?timeout_seconds={}",
+            encode(task_id),
+            timeout
+        );
         let req = apply_headers(
             self.http
                 .get(join(base_url, &path))
@@ -303,7 +339,8 @@ impl AgentProtocolTaskClient {
                 message: format!("waitForResult: {body}"),
             });
         }
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
         Ok(value
             .get("result")
             .and_then(|v| v.as_str())
@@ -320,7 +357,10 @@ impl AgentProtocolTaskClient {
     ) -> Result<()> {
         let req = apply_headers(
             self.http
-                .post(join(base_url, &format!("/tasks/{}/cancel", encode(task_id))))
+                .post(join(
+                    base_url,
+                    &format!("/tasks/{}/cancel", encode(task_id)),
+                ))
                 .timeout(Duration::from_secs(120)),
             headers,
         );
@@ -339,7 +379,10 @@ impl AgentProtocolTaskClient {
         let body = resume_body(decisions);
         let req = apply_headers(
             self.http
-                .post(join(base_url, &format!("/tasks/{}/resume", encode(task_id))))
+                .post(join(
+                    base_url,
+                    &format!("/tasks/{}/resume", encode(task_id)),
+                ))
                 .timeout(Duration::from_secs(120))
                 .header("Content-Type", "application/json")
                 .json(&body),
@@ -405,7 +448,10 @@ impl AgentProtocolTaskClient {
                 }
             }
         });
-        EventStreamHandle { stop, task: Some(task) }
+        EventStreamHandle {
+            stop,
+            task: Some(task),
+        }
     }
 }
 
@@ -464,7 +510,9 @@ impl AgentProtocolTransport {
     pub const TYPE: &'static str = "agent-protocol";
 
     pub fn new() -> Self {
-        Self { client: AgentProtocolTaskClient::new() }
+        Self {
+            client: AgentProtocolTaskClient::new(),
+        }
     }
 
     pub fn with_client(client: AgentProtocolTaskClient) -> Self {
@@ -487,12 +535,21 @@ impl RemoteSubagentTransport for AgentProtocolTransport {
         context: Option<&RemoteSubmitContext>,
     ) -> Result<()> {
         self.client
-            .submit_task(&target.base_url, &target.headers, task_id, agent_id, input, context)
+            .submit_task(
+                &target.base_url,
+                &target.headers,
+                task_id,
+                agent_id,
+                input,
+                context,
+            )
             .await
     }
 
     async fn get_status(&self, target: &RemoteTarget, task_id: &str) -> Result<RemoteTaskStatus> {
-        self.client.get_status(&target.base_url, &target.headers, task_id).await
+        self.client
+            .get_status(&target.base_url, &target.headers, task_id)
+            .await
     }
 
     async fn wait_for_result(
@@ -507,7 +564,9 @@ impl RemoteSubagentTransport for AgentProtocolTransport {
     }
 
     async fn cancel(&self, target: &RemoteTarget, task_id: &str) -> Result<()> {
-        self.client.cancel_task(&target.base_url, &target.headers, task_id).await
+        self.client
+            .cancel_task(&target.base_url, &target.headers, task_id)
+            .await
     }
 
     async fn resume(
@@ -528,8 +587,13 @@ impl RemoteSubagentTransport for AgentProtocolTransport {
         from_seq: i64,
         consumer: Arc<dyn Fn(RemoteAgentEvent) + Send + Sync>,
     ) -> EventStreamHandle {
-        self.client
-            .open_event_stream(&target.base_url, &target.headers, task_id, from_seq, consumer)
+        self.client.open_event_stream(
+            &target.base_url,
+            &target.headers,
+            task_id,
+            from_seq,
+            consumer,
+        )
     }
 }
 
@@ -551,7 +615,10 @@ fn resume_body(decisions: &[RemoteConfirmDecision]) -> serde_json::Value {
             });
             if let Some(reason) = &d.reason {
                 if let Some(obj) = value.as_object_mut() {
-                    obj.insert("reason".to_string(), serde_json::Value::String(reason.clone()));
+                    obj.insert(
+                        "reason".to_string(),
+                        serde_json::Value::String(reason.clone()),
+                    );
                 }
             }
             value

@@ -76,7 +76,11 @@ impl ContractHttpServer {
         provider: Arc<dyn ContractProvider>,
         internal_token: &str,
     ) -> ControlPlaneResult<Self> {
-        let bind_host = if host.trim().is_empty() { "0.0.0.0" } else { host };
+        let bind_host = if host.trim().is_empty() {
+            "0.0.0.0"
+        } else {
+            host
+        };
         let listener = TcpListener::bind((bind_host, port))
             .await
             .map_err(|e| ControlPlaneError::Http(format!("bind {bind_host}:{port}: {e}")))?;
@@ -156,9 +160,15 @@ fn build_router(provider: Arc<dyn ContractProvider>, internal_token: &str) -> Ro
         .route("/agentscope/workspaces", get(workspaces))
         .route("/agentscope/sessions/:id/state", get(session_state))
         .route("/agentscope/sessions/:id/context", get(context))
-        .route("/agentscope/sessions/:id/messages", get(messages).post(post_message))
+        .route(
+            "/agentscope/sessions/:id/messages",
+            get(messages).post(post_message),
+        )
         .route("/agentscope/sessions/:id/tasks", get(tasks))
-        .route("/agentscope/sessions/:id/subagent-tasks", get(subagent_tasks))
+        .route(
+            "/agentscope/sessions/:id/subagent-tasks",
+            get(subagent_tasks),
+        )
         .route(
             "/agentscope/sessions/:id/subagent-tasks/:task_id",
             delete(cancel_subagent_task),

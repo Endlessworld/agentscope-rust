@@ -1,4 +1,4 @@
-﻿//! `agentscope-extensions-nacos` — Nacos-backed configuration / registry-center
+//! `agentscope-extensions-nacos` — Nacos-backed configuration / registry-center
 //! extensions, mirroring `agentscope-extensions-nacos` (sub-modules
 //! `nacos-a2a`, `nacos-prompt`, `nacos-skill`).
 //!
@@ -23,4 +23,3 @@ pub mod service;
 pub mod skill;
 
 pub use service::{AiServiceError, AiServiceResult, InMemoryNacosAiService, NacosAiService};
-

@@ -72,7 +72,12 @@ pub fn build_retrieval_request_body(
     // Java prefers the call-site condition over the configured one, and skips empty maps.
     let condition = metadata_condition
         .filter(|v| is_non_empty_object(v))
-        .or_else(|| config.metadata_condition.as_ref().filter(|v| is_non_empty_object(v)));
+        .or_else(|| {
+            config
+                .metadata_condition
+                .as_ref()
+                .filter(|v| is_non_empty_object(v))
+        });
     if let Some(condition) = condition {
         body.insert("metadata_condition".to_string(), condition.clone());
     }
@@ -117,8 +122,7 @@ mod tests {
 
     #[test]
     fn call_site_overrides_config() {
-        let body =
-            build_retrieval_request_body(&config(), "q", Some(5), Some(0.75), None);
+        let body = build_retrieval_request_body(&config(), "q", Some(5), Some(0.75), None);
         assert_eq!(body["top_k"], json!(5));
         assert_eq!(body["similarity_threshold"], json!(0.75));
     }
@@ -162,8 +166,7 @@ mod tests {
         assert_eq!(from_config["metadata_condition"], json!({"author": "Toby"}));
 
         let call_site = json!({"logic": "and", "conditions": []});
-        let from_call =
-            build_retrieval_request_body(&cfg, "q", None, None, Some(&call_site));
+        let from_call = build_retrieval_request_body(&cfg, "q", None, None, Some(&call_site));
         assert_eq!(from_call["metadata_condition"], call_site);
     }
 

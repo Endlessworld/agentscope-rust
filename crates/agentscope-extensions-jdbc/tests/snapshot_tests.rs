@@ -114,8 +114,14 @@ async fn snapshot_spec_rejects_blank_and_unsafe_ids() {
 
     assert!(spec.build("").is_err(), "blank id must be rejected");
     assert!(spec.build("  ").is_err(), "whitespace id must be rejected");
-    assert!(spec.build("../escape").is_err(), "path traversal must be rejected");
-    assert!(spec.build("a/b").is_err(), "path separator must be rejected");
+    assert!(
+        spec.build("../escape").is_err(),
+        "path traversal must be rejected"
+    );
+    assert!(
+        spec.build("a/b").is_err(),
+        "path separator must be rejected"
+    );
     assert!(spec.build("a\\b").is_err(), "backslash must be rejected");
     assert!(spec.build("valid-id_1").is_ok());
 }

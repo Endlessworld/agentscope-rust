@@ -134,7 +134,10 @@ impl WorkspaceContextMiddleware {
     }
 
     /// Creates a middleware with a custom context token budget.
-    pub fn with_max_tokens(workspace_manager: Arc<WorkspaceManager>, max_context_tokens: usize) -> Self {
+    pub fn with_max_tokens(
+        workspace_manager: Arc<WorkspaceManager>,
+        max_context_tokens: usize,
+    ) -> Self {
         Self::new_with_config(workspace_manager, "HarnessAgent", None, max_context_tokens)
     }
 
@@ -283,7 +286,12 @@ async fn build_workspace_section(
         &additional_block,
         include_memory_context,
     );
-    assemble_section(&session_context, &guidance, &workspace_paragraph, &loaded_context)
+    assemble_section(
+        &session_context,
+        &guidance,
+        &workspace_paragraph,
+        &loaded_context,
+    )
 }
 
 fn escape_xml(text: &str) -> String {
@@ -418,7 +426,11 @@ fn effective_workspace(wm: &WorkspaceManager, rc: &RuntimeContext, raw: &Path) -
     raw.to_path_buf()
 }
 
-fn local_overlay(workspace: &Path, effective: &Path, fs: Option<&dyn Filesystem>) -> Option<String> {
+fn local_overlay(
+    workspace: &Path,
+    effective: &Path,
+    fs: Option<&dyn Filesystem>,
+) -> Option<String> {
     let overlay = fs?.as_any().downcast_ref::<OverlayFilesystem>()?;
     let local = overlay.upper().as_any().downcast_ref::<LocalFilesystem>()?;
     let mut sb = String::from("## Workspace\n");
@@ -456,8 +468,10 @@ fn local_overlay(workspace: &Path, effective: &Path, fs: Option<&dyn Filesystem>
         "Relative paths resolve under the workspace and read-fall-back to the project \
 (overlay copy-on-write).\n",
     );
-    sb.push_str("Treat this directory as the single global workspace for file operations \
-unless explicitly instructed otherwise.\n");
+    sb.push_str(
+        "Treat this directory as the single global workspace for file operations \
+unless explicitly instructed otherwise.\n",
+    );
     let _ = workspace;
     Some(sb)
 }
@@ -528,8 +542,9 @@ fn build_workspace_paragraph(
 ) -> String {
     let kind = fs.map(Filesystem::kind);
     let mut sb = match kind {
-        Some(FilesystemKind::Overlay) => local_overlay(workspace, effective, fs)
-            .unwrap_or_else(|| legacy_paragraph(workspace)),
+        Some(FilesystemKind::Overlay) => {
+            local_overlay(workspace, effective, fs).unwrap_or_else(|| legacy_paragraph(workspace))
+        }
         Some(FilesystemKind::Sandbox) => fs
             .map(|fs| sandbox_paragraph(effective, fs, artifact_delivery_enabled))
             .unwrap_or_else(|| legacy_paragraph(workspace)),
@@ -654,7 +669,10 @@ fn build_loaded_context_section(
     if include_memory_context {
         sb.push_str(&build_xml_context("memory_context", memory_content));
     }
-    sb.push_str(&build_xml_context("domain_knowledge_context", knowledge_block));
+    sb.push_str(&build_xml_context(
+        "domain_knowledge_context",
+        knowledge_block,
+    ));
     if !additional_block.trim().is_empty() {
         sb.push_str(additional_block);
     }
@@ -666,11 +684,17 @@ fn build_xml_context(tag_name: &str, content: &str) -> String {
     if content.trim().is_empty() {
         return format!("  <{tag_name}></{tag_name}>\n");
     }
-    format!("  <{tag_name}>\n{}\n  </{tag_name}>\n", indent_by_two(content.trim()))
+    format!(
+        "  <{tag_name}>\n{}\n  </{tag_name}>\n",
+        indent_by_two(content.trim())
+    )
 }
 
 fn indent_by_two(text: &str) -> String {
-    text.lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n")
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn build_additional_context_block(
@@ -687,10 +711,7 @@ async fn build_additional_context_block(
         if content.trim().is_empty() {
             continue;
         }
-        let tag = rel_path
-            .replace('/', "_")
-            .replace('.', "_")
-            .to_lowercase();
+        let tag = rel_path.replace('/', "_").replace('.', "_").to_lowercase();
         sb.push_str(&format!("  <{tag}>\n"));
         sb.push_str(&indent_by_two(content.trim()));
         sb.push_str("\n");
@@ -707,11 +728,7 @@ fn estimate_tokens(text: &str) -> usize {
     }
 }
 
-fn truncate_to_token_budget(
-    text: &str,
-    max_tokens: usize,
-    disable_memory_tools: bool,
-) -> String {
+fn truncate_to_token_budget(text: &str, max_tokens: usize, disable_memory_tools: bool) -> String {
     let max_chars = max_tokens * 4;
     if text.len() <= max_chars {
         return text.to_string();
@@ -795,7 +812,10 @@ mod tests {
 
     #[test]
     fn xml_context_empty_is_self_closing() {
-        assert_eq!(build_xml_context("agents_context", "   "), "  <agents_context></agents_context>\n");
+        assert_eq!(
+            build_xml_context("agents_context", "   "),
+            "  <agents_context></agents_context>\n"
+        );
     }
 
     #[test]
@@ -821,7 +841,10 @@ mod tests {
     #[test]
     fn session_dynamic_part_includes_id() {
         let rc = RuntimeContext::new().with_session_id("sess-1");
-        assert_eq!(build_session_dynamic_part(&rc, None), "AgentStateStore ID: sess-1");
+        assert_eq!(
+            build_session_dynamic_part(&rc, None),
+            "AgentStateStore ID: sess-1"
+        );
     }
 
     #[test]
@@ -859,9 +882,8 @@ mod tests {
         let extra = std::env::temp_dir().join(format!("wctx-extra-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::create_dir_all(&extra).unwrap();
-        let upper: Arc<dyn Filesystem> = Arc::new(
-            LocalFilesystem::new(ws.clone()).with_additional_roots(vec![extra.clone()]),
-        );
+        let upper: Arc<dyn Filesystem> =
+            Arc::new(LocalFilesystem::new(ws.clone()).with_additional_roots(vec![extra.clone()]));
         let lower: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(ws.clone()));
         let fs: Arc<dyn Filesystem> = Arc::new(OverlayFilesystem::new(upper, lower));
 
@@ -901,9 +923,19 @@ mod tests {
         std::fs::write(ws.join("AGENTS.md"), "# Persona\nFriendly.").unwrap();
         let wm = WorkspaceManager::new(ws.clone());
         let rc = RuntimeContext::new().with_session_id("s1");
-        let section =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false, false)
-                .await;
+        let section = build_workspace_section(
+            &wm,
+            &rc,
+            "HarnessAgent",
+            None,
+            8000,
+            &[],
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
         assert!(section.contains("AgentStateStore Context"));
         assert!(section.contains("Persona"));
         assert!(section.contains("<loaded_context>"));
@@ -921,18 +953,38 @@ mod tests {
         let wm = WorkspaceManager::new(ws.clone());
         let rc = RuntimeContext::new().with_session_id("s1");
 
-        let both_enabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false, false)
-                .await;
+        let both_enabled = build_workspace_section(
+            &wm,
+            &rc,
+            "HarnessAgent",
+            None,
+            8000,
+            &[],
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
         assert!(both_enabled.contains("## Memory Recall"));
         assert!(both_enabled.contains("memory_save"));
         assert!(both_enabled.contains("automatically extracted"));
         assert!(both_enabled.contains("<memory_context>"));
         assert!(both_enabled.contains("remember the project conventions"));
 
-        let tools_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, false, false, false)
-                .await;
+        let tools_disabled = build_workspace_section(
+            &wm,
+            &rc,
+            "HarnessAgent",
+            None,
+            8000,
+            &[],
+            true,
+            false,
+            false,
+            false,
+        )
+        .await;
         assert!(!tools_disabled.contains("## Memory Recall"));
         assert!(!tools_disabled.contains("memory_save"));
         assert!(tools_disabled.contains("harness maintains automatically"));
@@ -940,17 +992,37 @@ mod tests {
         assert!(tools_disabled.contains("automatically extracted"));
         assert!(tools_disabled.contains("<memory_context>"));
 
-        let hooks_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], false, true, false, false)
-                .await;
+        let hooks_disabled = build_workspace_section(
+            &wm,
+            &rc,
+            "HarnessAgent",
+            None,
+            8000,
+            &[],
+            false,
+            true,
+            false,
+            false,
+        )
+        .await;
         assert!(hooks_disabled.contains("## Memory Recall"));
         assert!(hooks_disabled.contains("memory_save"));
         assert!(!hooks_disabled.contains("automatically extracted"));
         assert!(hooks_disabled.contains("<memory_context>"));
 
-        let both_disabled =
-            build_workspace_section(&wm, &rc, "HarnessAgent", None, 8000, &[], true, true, false, false)
-                .await;
+        let both_disabled = build_workspace_section(
+            &wm,
+            &rc,
+            "HarnessAgent",
+            None,
+            8000,
+            &[],
+            true,
+            true,
+            false,
+            false,
+        )
+        .await;
         assert!(!both_disabled.contains("## Memory Recall"));
         assert!(!both_disabled.contains("memory_save"));
         assert!(!both_disabled.contains("automatically extracted"));
@@ -970,7 +1042,16 @@ mod tests {
         let rc = RuntimeContext::new().with_session_id("s1");
 
         let xml = build_workspace_section(
-            &wm, &rc, "HarnessAgent", None, 8000, &[], false, false, false, true,
+            &wm,
+            &rc,
+            "HarnessAgent",
+            None,
+            8000,
+            &[],
+            false,
+            false,
+            false,
+            true,
         )
         .await;
         assert!(xml.starts_with("<workspace_context>"), "{xml}");
@@ -987,7 +1068,10 @@ mod tests {
         // A multi-byte body guarantees the cap lands mid-codepoint if implemented naively.
         let oversized = "知".repeat(MAX_AGENTS_MD_BYTES / 3 + 10);
         let capped = cap_agents_md(&oversized);
-        assert!(capped.ends_with(AGENTS_TRUNCATION_NOTICE), "notice must be appended");
+        assert!(
+            capped.ends_with(AGENTS_TRUNCATION_NOTICE),
+            "notice must be appended"
+        );
         let body_len = capped.len() - AGENTS_TRUNCATION_NOTICE.len();
         assert!(body_len <= MAX_AGENTS_MD_BYTES);
         // Truncating mid-codepoint would have produced invalid UTF-8 and panicked above.

@@ -15,8 +15,7 @@ use agentscope_core::model::{GenerateOptions, ToolChoice, ToolSchema};
 use serde_json::{json, Map, Value};
 
 use super::constants::{
-    is_whitelisted_body_param, MD_FUNCTION_CALL_NAMESPACE,
-    MD_REASONING_ENCRYPTED_CONTENT,
+    is_whitelisted_body_param, MD_FUNCTION_CALL_NAMESPACE, MD_REASONING_ENCRYPTED_CONTENT,
 };
 use super::formatter::ResponsesMultiAgentFormatter;
 use super::server_tool::{OpenAIServerTool, ResponsesServerToolHelper};
@@ -136,19 +135,20 @@ fn map_response_format(
                         .to_string(),
                 )
             })?;
-            let name = schema.name.as_deref().filter(|n| !n.trim().is_empty()).ok_or_else(|| {
-                Error::Model(
-                    "json_schema response format requires a non-null schema or schema name."
-                        .to_string(),
-                )
-            })?;
+            let name = schema
+                .name
+                .as_deref()
+                .filter(|n| !n.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Model(
+                        "json_schema response format requires a non-null schema or schema name."
+                            .to_string(),
+                    )
+                })?;
             let mut wire = Map::new();
             wire.insert("type".to_string(), json!("json_schema"));
             wire.insert("name".to_string(), json!(name));
-            wire.insert(
-                "schema".to_string(),
-                Value::Object(schema.schema.clone()),
-            );
+            wire.insert("schema".to_string(), Value::Object(schema.schema.clone()));
             let strict = schema.strict.or(strict_json_schema);
             if let Some(strict) = strict {
                 wire.insert("strict".to_string(), json!(strict));
@@ -241,7 +241,11 @@ fn validate_rejected_fields(options: &GenerateOptions) -> Result<()> {
             "{field} is not supported by the openai-official provider."
         )))
     };
-    if options.endpoint_path.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+    if options
+        .endpoint_path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
         return reject("endpointPath");
     }
     if options.frequency_penalty.is_some() {
@@ -301,7 +305,10 @@ pub fn map_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
 
 /// Maps a system message to a `system` easy-input message.
 pub fn map_system_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
-    items.push(easy_message("system", Value::String(collect_text(msg).unwrap_or_default())));
+    items.push(easy_message(
+        "system",
+        Value::String(collect_text(msg).unwrap_or_default()),
+    ));
     Ok(())
 }
 
@@ -363,7 +370,9 @@ pub fn map_assistant_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
         match block {
             ContentBlock::ToolUse(tool) => map_tool_use_block(tool, items)?,
             ContentBlock::ToolResult(result) if result.is_server_tool() => {
-                if let Some(item) = ResponsesServerToolHelper::restore_server_tool_item(&result.metadata) {
+                if let Some(item) =
+                    ResponsesServerToolHelper::restore_server_tool_item(&result.metadata)
+                {
                     items.push(item);
                 }
             }
@@ -601,10 +610,7 @@ pub(crate) fn input_image(url: &str) -> Value {
 pub fn resolve_image_url(source: &Source) -> Result<String> {
     match source {
         Source::Url(url) => Ok(url.url.clone()),
-        Source::Base64(base64) => Ok(format!(
-            "data:{};base64,{}",
-            base64.media_type, base64.data
-        )),
+        Source::Base64(base64) => Ok(format!("data:{};base64,{}", base64.media_type, base64.data)),
     }
 }
 
@@ -619,10 +625,7 @@ pub fn resolve_data_block_image_url(block: &DataBlock) -> Result<String> {
                         .to_string(),
                 ));
             }
-            Ok(format!(
-                "data:{};base64,{}",
-                base64.media_type, base64.data
-            ))
+            Ok(format!("data:{};base64,{}", base64.media_type, base64.data))
         }
     }
 }
@@ -657,9 +660,7 @@ fn join_output_text(result: &ToolResultBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::message::{
-        ChatUsage, ImageBlock, JsonMap, TextBlock, ToolResultState,
-    };
+    use agentscope_core::message::{ChatUsage, ImageBlock, JsonMap, TextBlock, ToolResultState};
 
     fn options(model: &str) -> GenerateOptions {
         GenerateOptions {
@@ -671,16 +672,7 @@ mod tests {
     #[test]
     fn system_and_user_messages_map_to_easy_messages() {
         let messages = vec![Msg::system("be nice"), Msg::user("hi")];
-        let body = map_request(
-            &messages,
-            &[],
-            &[],
-            &options("gpt-5"),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let body = map_request(&messages, &[], &[], &options("gpt-5"), None, None, None).unwrap();
         assert_eq!(body["store"], json!(false));
         assert_eq!(body["model"], json!("gpt-5"));
         assert_eq!(body["input"][0]["role"], json!("system"));
@@ -695,19 +687,14 @@ mod tests {
             ToolSchema::new("get_weather", "Look up the weather"),
             ToolSchema::new("noop", "no params").strict(true),
         ];
-        let body = map_request(
-            &[],
-            &tools,
-            &[],
-            &options("gpt-5"),
-            Some(true),
-            None,
-            None,
-        )
-        .unwrap();
+        let body =
+            map_request(&[], &tools, &[], &options("gpt-5"), Some(true), None, None).unwrap();
         assert_eq!(body["tools"][0]["type"], json!("function"));
         assert_eq!(body["tools"][0]["name"], json!("get_weather"));
-        assert_eq!(body["tools"][0]["description"], json!("Look up the weather"));
+        assert_eq!(
+            body["tools"][0]["description"],
+            json!("Look up the weather")
+        );
         assert_eq!(body["tools"][0]["strict"], json!(true));
         assert_eq!(body["tools"][0]["parameters"]["type"], json!("object"));
         assert_eq!(body["tools"][0]["parameters"]["required"], json!([]));
@@ -813,12 +800,9 @@ mod tests {
         let thinking = ThinkingBlock::builder()
             .thinking("step")
             .metadata(
-                [(
-                    MD_REASONING_ENCRYPTED_CONTENT.to_string(),
-                    json!("enc-1"),
-                )]
-                .into_iter()
-                .collect(),
+                [(MD_REASONING_ENCRYPTED_CONTENT.to_string(), json!("enc-1"))]
+                    .into_iter()
+                    .collect(),
             )
             .build();
         let msg = Msg::assistant_blocks(vec![
@@ -901,9 +885,10 @@ mod tests {
 
     #[test]
     fn multimodal_user_message_maps_image_parts() {
-        let image = ImageBlock::new(Source::Base64(
-            agentscope_core::Base64Source::new("image/png", "AAAA"),
-        ));
+        let image = ImageBlock::new(Source::Base64(agentscope_core::Base64Source::new(
+            "image/png",
+            "AAAA",
+        )));
         let msg = Msg::user_blocks(vec![
             ContentBlock::Text(TextBlock::new("look")),
             ContentBlock::Image(image),
@@ -924,7 +909,10 @@ mod tests {
             super::super::constants::MD_RESPONSES_SERVER_TOOL_ITEM.to_string(),
             json!(raw.to_string()),
         );
-        metadata.insert(ToolResultBlock::METADATA_SERVER_TOOL.to_string(), json!(true));
+        metadata.insert(
+            ToolResultBlock::METADATA_SERVER_TOOL.to_string(),
+            json!(true),
+        );
         let result = ToolResultBlock {
             id: Some("ws_1".to_string()),
             name: Some("web_search".to_string()),

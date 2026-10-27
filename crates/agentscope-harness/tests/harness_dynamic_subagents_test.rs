@@ -12,12 +12,12 @@ use agentscope_core::model::GenerateOptions;
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::Toolkit;
 use agentscope_core::Middleware;
-use futures::StreamExt;
 use agentscope_harness::{
     load_from_directory, load_from_filesystem, parse as parse_decl, DefaultAgentManager,
     DynamicSubagentsMiddleware, Filesystem, LocalFilesystem, RemoteAskPolicy, SubagentDeclaration,
     SubagentEntry, SubagentFactory, SubagentMode, SubagentWorkspaceMode, WorkspaceTaskRepository,
 };
+use futures::StreamExt;
 
 fn ctx() -> RuntimeContext {
     RuntimeContext::default()
@@ -119,7 +119,10 @@ You are a code reviewer.
 fn loader_parse_full_front_matter() {
     let decl = parse_decl(FULL_MD, "reviewer", None).expect("parses");
     assert_eq!(decl.name, "reviewer");
-    assert_eq!(decl.description, "Reviews code for security and performance issues.");
+    assert_eq!(
+        decl.description,
+        "Reviews code for security and performance issues."
+    );
     assert_eq!(decl.prompt, "You are a code reviewer.");
     assert_eq!(decl.workspace_mode, SubagentWorkspaceMode::Isolated);
     assert_eq!(decl.model.as_deref(), Some("qwen3-max"));
@@ -156,7 +159,10 @@ Should be ignored.
         resolved.replace('\\', "/").ends_with("ws/defs/reviewer"),
         "unexpected workspace path: {resolved}"
     );
-    assert!(decl.prompt.is_empty(), "body cleared when workspace.path set");
+    assert!(
+        decl.prompt.is_empty(),
+        "body cleared when workspace.path set"
+    );
     assert_eq!(decl.mode, SubagentMode::Subagent);
     assert_eq!(decl.top_p, Some(0.5)); // topP camelCase alias
     assert_eq!(decl.steps, Some(10)); // default steps
@@ -221,10 +227,14 @@ async fn loader_load_from_directory_scans_md_only() {
     .await
     .unwrap();
     // Non-.md and nested files must be skipped.
-    tokio::fs::write(sub.join("notes.txt"), "nope").await.unwrap();
+    tokio::fs::write(sub.join("notes.txt"), "nope")
+        .await
+        .unwrap();
     let nested = sub.join("nested");
     tokio::fs::create_dir_all(&nested).await.unwrap();
-    tokio::fs::write(nested.join("inner.md"), "---\ndescription: x\n---\n").await.unwrap();
+    tokio::fs::write(nested.join("inner.md"), "---\ndescription: x\n---\n")
+        .await
+        .unwrap();
 
     let decls = load_from_directory(sub.to_str().unwrap(), None);
     assert_eq!(decls.len(), 1);
@@ -244,7 +254,9 @@ async fn loader_load_from_filesystem_globs_subagents() {
     )
     .await
     .unwrap();
-    tokio::fs::write(sub.join("writer.md"), "---\ndescription: Docs.\n---\n").await.unwrap();
+    tokio::fs::write(sub.join("writer.md"), "---\ndescription: Docs.\n---\n")
+        .await
+        .unwrap();
 
     let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
     let decls = load_from_filesystem(fs.as_ref(), &ctx(), None).await;
@@ -282,13 +294,19 @@ async fn dynamic_middleware_merges_static_and_dynamic_and_refreshes_manager() {
 
     let captured = Arc::new(std::sync::Mutex::new(None::<Vec<Msg>>));
     let captured2 = captured.clone();
-    let input = ReasoningInput::new(vec![Msg::system("base")], vec![], GenerateOptions::default());
+    let input = ReasoningInput::new(
+        vec![Msg::system("base")],
+        vec![],
+        GenerateOptions::default(),
+    );
     let stream = mw.on_reasoning(
         &ctx(),
         input,
         Box::new(move |inp| {
             *captured2.lock().unwrap() = Some(inp.messages);
-            Box::pin(futures::stream::empty::<agentscope_core::error::Result<AgentEvent>>())
+            Box::pin(futures::stream::empty::<
+                agentscope_core::error::Result<AgentEvent>,
+            >())
         }),
     );
     let _events: Vec<_> = stream.collect().await;
@@ -303,7 +321,9 @@ async fn dynamic_middleware_merges_static_and_dynamic_and_refreshes_manager() {
     // Manager was refreshed with the merged set.
     assert!(mgr.has_agent("static_agent"));
     assert!(mgr.has_agent("dynamic_agent"));
-    assert!(mgr.create_agent_if_present("dynamic_agent", &ctx()).is_some());
+    assert!(mgr
+        .create_agent_if_present("dynamic_agent", &ctx())
+        .is_some());
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
@@ -329,12 +349,18 @@ async fn dynamic_middleware_dynamic_overrides_static_on_name_conflict() {
         .with_factory_builder(builder())
         .with_agent_manager(mgr.clone());
 
-    let input = ReasoningInput::new(vec![Msg::system("base")], vec![], GenerateOptions::default());
+    let input = ReasoningInput::new(
+        vec![Msg::system("base")],
+        vec![],
+        GenerateOptions::default(),
+    );
     let stream = mw.on_reasoning(
         &ctx(),
         input,
         Box::new(|_inp| {
-            Box::pin(futures::stream::empty::<agentscope_core::error::Result<AgentEvent>>())
+            Box::pin(futures::stream::empty::<
+                agentscope_core::error::Result<AgentEvent>,
+            >())
         }),
     );
     let _events: Vec<_> = stream.collect().await;

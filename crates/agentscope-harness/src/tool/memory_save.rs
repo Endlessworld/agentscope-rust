@@ -6,11 +6,11 @@
 //! `MemoryConsolidator`.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::workspace::constants::{MEMORY_DIR, MEMORY_MD};
 use crate::agent::workspace::WorkspaceManager;
@@ -70,7 +70,10 @@ impl Tool for MemorySaveTool {
             .append_utf8_workspace_relative(&rc, MEMORY_MD, &section)
             .await;
 
-        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
         let daily_path = format!("{MEMORY_DIR}/{today}.md");
         let daily_entry = format!(
             "\n## Memory Save — {}\n{content}\n",

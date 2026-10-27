@@ -248,11 +248,7 @@ impl SessionTurns {
     }
 
     fn apply_turn(&mut self, turn_id: &str, run_id: Option<String>, status: &str) {
-        if let Some(existing) = self
-            .turns
-            .iter_mut()
-            .find(|turn| turn.turn_id == turn_id)
-        {
+        if let Some(existing) = self.turns.iter_mut().find(|turn| turn.turn_id == turn_id) {
             existing.run_id = run_id;
             existing.status = status.to_string();
             return;
@@ -380,7 +376,9 @@ impl SessionProjection {
                     // plan-rejected call never runs one). It must clear dispatch uncertainty;
                     // otherwise every later open demands reconciliation for a settled call.
                     if let Some(value) = data.get("message") {
-                        if let Ok(message) = serde_json::from_value::<crate::message::Msg>(value.clone()) {
+                        if let Ok(message) =
+                            serde_json::from_value::<crate::message::Msg>(value.clone())
+                        {
                             for result in message.tool_result_blocks() {
                                 if let Some(id) = result.id.as_deref() {
                                     uncertain.remove(id);
@@ -424,10 +422,7 @@ impl SessionProjection {
                             runs.remove(id);
                         }
                     }
-                    if let Some(ids) = data
-                        .get("resolvedToolCallIds")
-                        .and_then(|v| v.as_array())
-                    {
+                    if let Some(ids) = data.get("resolvedToolCallIds").and_then(|v| v.as_array()) {
                         for id in ids.iter().filter_map(|v| v.as_str()) {
                             uncertain.remove(id);
                         }
@@ -533,9 +528,7 @@ pub async fn continuation_turn(
             .turn_id
             .as_deref()
             .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| {
-                session_error(format!("Pending request has no logical turn: {id}"))
-            })?;
+            .ok_or_else(|| session_error(format!("Pending request has no logical turn: {id}")))?;
         if let Some(existing) = &turn {
             if existing != request_turn {
                 return Err(session_error("Tool results belong to different turns"));
@@ -751,8 +744,7 @@ mod tests {
 
     async fn journal() -> (Arc<dyn AtomicSessionStorage>, Arc<dyn SessionLog>, Writer) {
         let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> =
-            Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
         let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
         (storage, log, writer)
     }
@@ -770,7 +762,13 @@ mod tests {
             &writer,
             "b1",
             &[
-                event(1, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
+                event(
+                    1,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
                 event(
                     2,
                     "input/received",
@@ -818,7 +816,13 @@ mod tests {
             &writer,
             "b1",
             &[
-                event(1, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
+                event(
+                    1,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
                 event(2, "turn/cancelled", None, Some("t1"), serde_json::json!({})),
             ],
         )
@@ -835,7 +839,13 @@ mod tests {
             &writer,
             "b1",
             &[
-                event(1, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
+                event(
+                    1,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
                 event(
                     2,
                     "run/end",
@@ -858,9 +868,21 @@ mod tests {
             &writer,
             "b1",
             &[
-                event(1, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
+                event(
+                    1,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
                 event(2, "state/restored", None, None, serde_json::json!({})),
-                event(3, "run/start", Some("run-2"), Some("t2"), serde_json::json!({})),
+                event(
+                    3,
+                    "run/start",
+                    Some("run-2"),
+                    Some("t2"),
+                    serde_json::json!({}),
+                ),
             ],
         )
         .await;
@@ -938,7 +960,13 @@ mod tests {
                     Some("t1"),
                     serde_json::json!({ "toolCallId": "call-1" }),
                 ),
-                event(3, "run/start", Some("run-1"), Some("t1"), serde_json::json!({})),
+                event(
+                    3,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
             ],
         )
         .await;
@@ -1227,9 +1255,11 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("external execution"), "{err}");
         assert!(continuation_turn(&*log, &BTreeSet::new()).await.is_err());
-        assert!(continuation_turn(&*log, &BTreeSet::from(["nope".to_string()]))
-            .await
-            .is_err());
+        assert!(
+            continuation_turn(&*log, &BTreeSet::from(["nope".to_string()]))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

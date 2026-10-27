@@ -19,7 +19,7 @@ pub mod tool_schema;
 pub use cache_policy::CachePolicy;
 pub use catalog::{
     CatalogConfig, CatalogEvent, CatalogSnapshot, ModelCatalog, ModelDescriptor, ModelKind,
-    ModelStatus, ReasoningOption, ResolveRequest, Resolution,
+    ModelStatus, ReasoningOption, Resolution, ResolveRequest,
 };
 pub use chat_response::{ChatResponse, ChatResponseBuilder};
 pub use context_windows::{resolve_context_window, DEFAULT_CONTEXT_WINDOW};

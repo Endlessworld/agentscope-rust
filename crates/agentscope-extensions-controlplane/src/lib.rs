@@ -1,4 +1,4 @@
-﻿//! agentscope-extensions-controlplane — bypass-observation data plane SDK that reports a
+//! agentscope-extensions-controlplane — bypass-observation data plane SDK that reports a
 //! self-deployed AgentScope agent (session snapshots, event stream, effective context) to
 //! an controlplane control plane, and serves the `/agentscope/*` HTTP contract in-process.
 //!
@@ -72,7 +72,10 @@ mod tests {
                 Ok(model::ContextSnapshot::builder(s).build())
             }
         }
-        let cfg = ControlPlaneConfig::builder("friday").instance_key("rep-1").build().unwrap();
+        let cfg = ControlPlaneConfig::builder("friday")
+            .instance_key("rep-1")
+            .build()
+            .unwrap();
         let target: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(42u32);
         assert!(instrument(target, cfg, Box::new(RejectAdapter)).is_err());
     }

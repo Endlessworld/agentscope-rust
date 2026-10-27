@@ -67,7 +67,9 @@ mod tests {
     #[test]
     fn anonymous_user_encodes_empty_string() {
         let key = SessionKey::new(None::<String>, "agent", "s1").unwrap();
-        assert!(key.storage_path().starts_with("agents/s_YWdlbnQ/sessions/s_/s_"));
+        assert!(key
+            .storage_path()
+            .starts_with("agents/s_YWdlbnQ/sessions/s_/s_"));
     }
 
     #[test]

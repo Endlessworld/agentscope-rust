@@ -54,7 +54,10 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Reads a string field from an event payload.
 fn field_str(data: &EventData, key: &str) -> Option<String> {
-    data.fields.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    data.fields
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// Accumulates text deltas and tool-call starts observed during reasoning.
@@ -123,7 +126,9 @@ impl ActingTrace {
 
     /// Finalizes one completed tool result, returning its trace line.
     fn finish(&mut self, ev: &AgentEvent) -> Option<String> {
-        let AgentEvent::ToolResultEnd(d) = ev else { return None };
+        let AgentEvent::ToolResultEnd(d) = ev else {
+            return None;
+        };
         let id = field_str(d, "toolCallId").unwrap_or_default();
         let state = field_str(d, "state").unwrap_or_default();
         let (name, text) = self.results.remove(&id).unwrap_or_default();
@@ -165,7 +170,9 @@ impl AgentTraceMiddleware {
     }
 
     fn agent_name(ctx: &RuntimeContext) -> String {
-        ctx.agent_name.clone().unwrap_or_else(|| "unknown".to_string())
+        ctx.agent_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
     }
 }
 
@@ -211,7 +218,10 @@ impl Middleware for AgentTraceMiddleware {
             let text = text2.lock().unwrap().clone();
             tracing::info!("POST_CALL | response: {}", truncate(&text, 120));
         });
-        Box::pin(WithDone { inner, done: Some(done) })
+        Box::pin(WithDone {
+            inner,
+            done: Some(done),
+        })
     }
 
     fn on_reasoning(
@@ -238,7 +248,10 @@ impl Middleware for AgentTraceMiddleware {
             let summary = t2.lock().unwrap().format();
             tracing::info!("{summary}");
         });
-        Box::pin(WithDone { inner, done: Some(done) })
+        Box::pin(WithDone {
+            inner,
+            done: Some(done),
+        })
     }
 
     fn on_acting(
@@ -273,15 +286,18 @@ impl Middleware for AgentTraceMiddleware {
                 tracing::info!("{line}");
             }
         });
-        Box::pin(WithDone { inner, done: Some(done) })
+        Box::pin(WithDone {
+            inner,
+            done: Some(done),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::event::AgentEventType;
     use agentscope_core::error::Result;
+    use agentscope_core::event::AgentEventType;
     use serde_json::{Map, Value};
 
     fn ev(ty: AgentEventType, fields: &[(&str, &str)]) -> Result<AgentEvent> {
@@ -313,9 +329,7 @@ mod tests {
                 *ran2.lock().unwrap() = true;
             })),
         };
-        futures::executor::block_on(async {
-            while wd.next().await.is_some() {}
-        });
+        futures::executor::block_on(async { while wd.next().await.is_some() {} });
         assert!(*ran.lock().unwrap(), "completion callback should fire");
     }
 
@@ -324,11 +338,13 @@ mod tests {
         let mut t = ReasoningTrace::default();
         t.on_event(&text_delta("hel").unwrap());
         t.on_event(&text_delta("lo").unwrap());
-        t.on_event(&ev(
-            AgentEventType::ToolCallStart,
-            &[("toolCallId", "c1"), ("toolCallName", "add")],
-        )
-        .unwrap());
+        t.on_event(
+            &ev(
+                AgentEventType::ToolCallStart,
+                &[("toolCallId", "c1"), ("toolCallName", "add")],
+            )
+            .unwrap(),
+        );
         let out = t.format();
         assert!(out.contains("text: hello"), "got: {out}");
         assert!(out.contains("id=c1"), "got: {out}");
@@ -344,22 +360,28 @@ mod tests {
     #[test]
     fn acting_trace_finishes_tool_result() {
         let mut t = ActingTrace::default();
-        t.on_event(&ev(
-            AgentEventType::ToolResultStart,
-            &[("toolCallId", "c1"), ("toolCallName", "add")],
-        )
-        .unwrap());
-        t.on_event(&ev(
-            AgentEventType::ToolResultTextDelta,
-            &[("toolCallId", "c1"), ("delta", "42")],
-        )
-        .unwrap());
-        let line = t
-            .finish(&ev(
-                AgentEventType::ToolResultEnd,
-                &[("toolCallId", "c1"), ("state", "SUCCESS")],
+        t.on_event(
+            &ev(
+                AgentEventType::ToolResultStart,
+                &[("toolCallId", "c1"), ("toolCallName", "add")],
             )
-            .unwrap())
+            .unwrap(),
+        );
+        t.on_event(
+            &ev(
+                AgentEventType::ToolResultTextDelta,
+                &[("toolCallId", "c1"), ("delta", "42")],
+            )
+            .unwrap(),
+        );
+        let line = t
+            .finish(
+                &ev(
+                    AgentEventType::ToolResultEnd,
+                    &[("toolCallId", "c1"), ("state", "SUCCESS")],
+                )
+                .unwrap(),
+            )
             .expect("finish returns a line");
         assert!(line.contains("id=c1"), "got: {line}");
         assert!(line.contains("name=add"), "got: {line}");
@@ -371,11 +393,13 @@ mod tests {
     #[test]
     fn acting_trace_pending_when_no_end_event() {
         let mut t = ActingTrace::default();
-        t.on_event(&ev(
-            AgentEventType::ToolResultStart,
-            &[("toolCallId", "c1"), ("toolCallName", "grep")],
-        )
-        .unwrap());
+        t.on_event(
+            &ev(
+                AgentEventType::ToolResultStart,
+                &[("toolCallId", "c1"), ("toolCallName", "grep")],
+            )
+            .unwrap(),
+        );
         let pending = t.pending();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("no end event"));

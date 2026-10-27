@@ -16,7 +16,9 @@ pub use context::{
     PlanModeContextState, ReadCacheEntry, Task, TaskContextState, TaskScope, TaskState,
     ToolContextState,
 };
-pub use list_hash::{compute_hash, has_changed, needs_full_rewrite, EMPTY_HASH, SAMPLING_THRESHOLD};
+pub use list_hash::{
+    compute_hash, has_changed, needs_full_rewrite, EMPTY_HASH, SAMPLING_THRESHOLD,
+};
 pub use requirement::{
     RequirementAuthority, RequirementDecision, RequirementKind, RequirementStatus, TaskRequirement,
 };

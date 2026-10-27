@@ -190,7 +190,11 @@ impl QuartzScheduleAgentTask {
         }
         self.running.store(true, Ordering::SeqCst);
         // Mirror `AgentQuartzJob`: replay the stored input on each firing.
-        let messages = self.initial_input.clone().map(|msg| vec![msg]).unwrap_or_default();
+        let messages = self
+            .initial_input
+            .clone()
+            .map(|msg| vec![msg])
+            .unwrap_or_default();
         let result = self.inner.run_with(messages).await;
         self.running.store(false, Ordering::SeqCst);
         result

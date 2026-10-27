@@ -3,7 +3,9 @@
 //! Ports the private helpers of `MysqlSkillRepository` / `PostgresSkillRepository` so both
 //! backends share one implementation instead of duplicating them.
 
-use agentscope_harness::agent::skill::model::{AgentSkill, AgentSkillBuilder, Metadata, SkillResources};
+use agentscope_harness::agent::skill::model::{
+    AgentSkill, AgentSkillBuilder, Metadata, SkillResources,
+};
 use serde_json::Value;
 
 use crate::error::SkillRepositoryError;
@@ -100,7 +102,11 @@ pub fn serialize_metadata(metadata: &Metadata) -> String {
 
 /// Deserializes `metadata_json`, then overlays the authoritative `name` / `description`
 /// columns, mirroring `deserializeMetadata`.
-pub fn deserialize_metadata(metadata_json: Option<&str>, name: &str, description: &str) -> Metadata {
+pub fn deserialize_metadata(
+    metadata_json: Option<&str>,
+    name: &str,
+    description: &str,
+) -> Metadata {
     let mut metadata = Metadata::new();
     if let Some(json) = metadata_json.filter(|j| !j.trim().is_empty()) {
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json) {

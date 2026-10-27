@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use agentscope_core::middleware::{Middleware, Next, ReasoningInput};
 use agentscope_core::message::{ContentBlock, Msg, MsgRole};
+use agentscope_core::middleware::{Middleware, Next, ReasoningInput};
 
 use agentscope_harness::agent::middleware::TeamsMiddleware;
 use agentscope_harness::agent::team::{
@@ -29,9 +29,9 @@ fn reasoning_input() -> ReasoningInput {
     ReasoningInput::new(
         vec![Msg::builder()
             .role(MsgRole::System)
-            .content(vec![ContentBlock::Text(agentscope_core::message::TextBlock::new(
-                "base prompt",
-            ))])
+            .content(vec![ContentBlock::Text(
+                agentscope_core::message::TextBlock::new("base prompt"),
+            )])
             .build()],
         Vec::new(),
         agentscope_core::model::GenerateOptions::default(),
@@ -89,7 +89,9 @@ async fn injects_team_context_into_system_prompt() {
 #[tokio::test]
 async fn drains_mailbox_into_team_messages() {
     let (client, mw, t) = setup(TeamRole::Member);
-    client.send_message(t, "lead", "dev", "please check the board").unwrap();
+    client
+        .send_message(t, "lead", "dev", "please check the board")
+        .unwrap();
 
     let (slot, next) = capture_pair();
     let out = run_turn(&mw, slot, next).await;

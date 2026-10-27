@@ -2,9 +2,9 @@
 //! `CompositeFilesystem` (unified non-sandbox view blending local + remote stores).
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use async_trait::async_trait;
 
 use super::{FileData, FileInfo, Filesystem, GrepMatch};
 
@@ -24,10 +24,16 @@ fn strip_leading_slash(s: &str) -> &str {
     s.trim_start_matches('/')
 }
 impl CompositeFilesystem {
-    pub fn new(default_backend: Arc<dyn Filesystem>, routes: Vec<(String, Arc<dyn Filesystem>)>) -> Self {
+    pub fn new(
+        default_backend: Arc<dyn Filesystem>,
+        routes: Vec<(String, Arc<dyn Filesystem>)>,
+    ) -> Self {
         let mut routes = routes;
         routes.sort_by_key(|r| std::cmp::Reverse(r.0.len()));
-        Self { default_backend, routes }
+        Self {
+            default_backend,
+            routes,
+        }
     }
 
     fn route_for_path(&self, path: &str) -> Route {
@@ -127,7 +133,10 @@ impl Filesystem for CompositeFilesystem {
         limit: usize,
     ) -> Result<FileData> {
         let route = self.route_for_path(path);
-        route.backend.read(ctx, &route.backend_path, offset, limit).await
+        route
+            .backend
+            .read(ctx, &route.backend_path, offset, limit)
+            .await
     }
 
     async fn write(&self, ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
@@ -161,12 +170,18 @@ impl Filesystem for CompositeFilesystem {
         if let Some(p) = path {
             let route = self.route_for_path(p);
             if let Some(prefix) = &route.prefix {
-                let matches = route.backend.grep(ctx, pattern, Some(&route.backend_path), glob).await?;
-                return Ok(matches.into_iter().map(|m| GrepMatch {
-                    path: self.remap(prefix, &m.path),
-                    line: m.line,
-                    text: m.text,
-                }).collect());
+                let matches = route
+                    .backend
+                    .grep(ctx, pattern, Some(&route.backend_path), glob)
+                    .await?;
+                return Ok(matches
+                    .into_iter()
+                    .map(|m| GrepMatch {
+                        path: self.remap(prefix, &m.path),
+                        line: m.line,
+                        text: m.text,
+                    })
+                    .collect());
             }
         }
         results.extend(self.default_backend.grep(ctx, pattern, path, glob).await?);
@@ -176,7 +191,10 @@ impl Filesystem for CompositeFilesystem {
     async fn glob(&self, ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
         let route = self.route_for_path(path);
         if let Some(prefix) = &route.prefix {
-            let entries = route.backend.glob(ctx, pattern, &route.backend_path).await?;
+            let entries = route
+                .backend
+                .glob(ctx, pattern, &route.backend_path)
+                .await?;
             return Ok(entries
                 .into_iter()
                 .map(|mut fi| {
@@ -197,12 +215,21 @@ impl Filesystem for CompositeFilesystem {
         let src = self.route_for_path(from);
         let dst = self.route_for_path(to);
         if Arc::ptr_eq(&src.backend, &dst.backend) {
-            return src.backend.move_path(ctx, &src.backend_path, &dst.backend_path).await;
+            return src
+                .backend
+                .move_path(ctx, &src.backend_path, &dst.backend_path)
+                .await;
         }
-        let data = src.backend.read(ctx, &src.backend_path, 0, 0).await.map_err(|_| {
-            Error::Tool(format!("Cannot read source for cross-backend move: {from}"))
-        })?;
-        dst.backend.write(ctx, &dst.backend_path, &data.content).await?;
+        let data = src
+            .backend
+            .read(ctx, &src.backend_path, 0, 0)
+            .await
+            .map_err(|_| {
+                Error::Tool(format!("Cannot read source for cross-backend move: {from}"))
+            })?;
+        dst.backend
+            .write(ctx, &dst.backend_path, &data.content)
+            .await?;
         let _ = src.backend.delete(ctx, &src.backend_path).await;
         Ok(())
     }

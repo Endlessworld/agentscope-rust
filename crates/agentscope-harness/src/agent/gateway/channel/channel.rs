@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::Msg;
+use async_trait::async_trait;
 
 use crate::agent::gateway::harness_gateway::HarnessGateway;
 

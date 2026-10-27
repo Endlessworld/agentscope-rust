@@ -23,7 +23,10 @@ impl RAGFlowDocumentConverter {
 
     /// Converts a chunk list, skipping `None` (blank content) results.
     pub fn convert_to_documents(chunks: &[RAGFlowChunk]) -> Vec<Document> {
-        chunks.iter().filter_map(Self::convert_to_document).collect()
+        chunks
+            .iter()
+            .filter_map(Self::convert_to_document)
+            .collect()
     }
 
     /// Converts a single chunk, returning `None` when the content is missing or blank.
@@ -41,15 +44,17 @@ impl RAGFlowDocumentConverter {
 
         let doc_id = match non_empty(chunk.document_id.as_deref()) {
             Some(id) => id.to_string(),
-            None => non_empty(chunk.id.as_deref()).unwrap_or("unknown").to_string(),
+            None => non_empty(chunk.id.as_deref())
+                .unwrap_or("unknown")
+                .to_string(),
         };
         let chunk_id = non_empty(chunk.id.as_deref()).unwrap_or("0").to_string();
 
         let payload = Self::build_payload_from_chunk(chunk);
         let mut document = Document::new(DocumentMetadata::with_payload(
-            agentscope_core::message::ContentBlock::Text(
-                agentscope_core::message::TextBlock::new(text),
-            ),
+            agentscope_core::message::ContentBlock::Text(agentscope_core::message::TextBlock::new(
+                text,
+            )),
             doc_id,
             chunk_id.clone(),
             Value::Object(payload),
@@ -95,11 +100,7 @@ impl RAGFlowDocumentConverter {
         if let Some(value) = non_empty(chunk.image_id.as_deref()) {
             payload.insert("image_id".to_string(), json!(value));
         }
-        if let Some(keywords) = chunk
-            .important_keywords
-            .as_ref()
-            .filter(|k| !k.is_empty())
-        {
+        if let Some(keywords) = chunk.important_keywords.as_ref().filter(|k| !k.is_empty()) {
             payload.insert("important_keywords".to_string(), json!(keywords));
         }
         if let Some(metadata) = chunk.metadata.as_ref().filter(|v| is_non_empty_object(v)) {

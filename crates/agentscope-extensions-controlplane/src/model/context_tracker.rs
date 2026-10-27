@@ -9,8 +9,10 @@
 //! memory, so Level-1 snapshots and change detection cost nothing.
 
 use super::context_snapshot::{ContextMessage, ContextSnapshot, ToolInfo};
-use super::session_event::{SessionEvent, ROLE_ASSISTANT, ROLE_TOOL, ROLE_USER, TYPE_COMPACTION,
-    TYPE_MESSAGE, TYPE_TOOL_CALL, TYPE_TOOL_RESULT};
+use super::session_event::{
+    SessionEvent, ROLE_ASSISTANT, ROLE_TOOL, ROLE_USER, TYPE_COMPACTION, TYPE_MESSAGE,
+    TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
+};
 
 /// Incremental effective-context view for one session.
 #[derive(Debug, Clone)]
@@ -132,8 +134,13 @@ impl ContextTracker {
         }
         match event.event_type.as_str() {
             TYPE_MESSAGE => {
-                let role = if event.role.is_empty() { ROLE_USER } else { &event.role };
-                self.messages.push(ContextMessage::new(role, event.content.clone()));
+                let role = if event.role.is_empty() {
+                    ROLE_USER
+                } else {
+                    &event.role
+                };
+                self.messages
+                    .push(ContextMessage::new(role, event.content.clone()));
             }
             TYPE_TOOL_CALL => {
                 self.messages.push(ContextMessage::new(
@@ -167,9 +174,9 @@ impl ContextTracker {
     /// Materializes the current effective-context snapshot.
     pub fn snapshot(&self) -> ContextSnapshot {
         let catalog = agentscope_core::model::catalog::ModelCatalog::global();
-        let resolution = catalog.resolve(
-            &agentscope_core::model::catalog::ResolveRequest::new(&self.model),
-        );
+        let resolution = catalog.resolve(&agentscope_core::model::catalog::ResolveRequest::new(
+            &self.model,
+        ));
         let catalog_key = resolution
             .descriptor
             .as_ref()

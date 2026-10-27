@@ -123,9 +123,11 @@ async fn request_config_hides_backend_schemas_without_unregistering() {
         .build()
         .unwrap();
 
-    let config =
-        ToolRequestConfig::new(vec![external_tool("frontend_tool")], ToolMergeMode::ExternalOnly)
-            .unwrap();
+    let config = ToolRequestConfig::new(
+        vec![external_tool("frontend_tool")],
+        ToolMergeMode::ExternalOnly,
+    )
+    .unwrap();
     drain(&agent, extensions_with(config)).await;
 
     let shown = seen.lock().unwrap().first().cloned().unwrap_or_default();
@@ -212,9 +214,11 @@ fn a_cloned_context_does_not_inherit_a_config_inserted_afterwards() {
     // tool surface.
     let ctx = RuntimeContext::new();
     let mut forked = ctx.clone();
-    let config =
-        ToolRequestConfig::new(vec![external_tool("frontend_tool")], ToolMergeMode::ExternalOnly)
-            .unwrap();
+    let config = ToolRequestConfig::new(
+        vec![external_tool("frontend_tool")],
+        ToolMergeMode::ExternalOnly,
+    )
+    .unwrap();
     forked.set_extension_arc(TOOL_REQUEST_CONFIG_CONTEXT_KEY, Arc::new(config));
     assert!(forked
         .extension::<ToolRequestConfig>(TOOL_REQUEST_CONFIG_CONTEXT_KEY)

@@ -201,7 +201,9 @@ pub fn encode_attribute_value(value: &Value) -> Value {
         Value::Null => json!({ "stringValue": "" }),
         // OTLP `AnyValue` supports arrays (`arrayValue`) and maps (`kvlistValue`); only
         // `null` — which OTLP has no type for — degrades to an empty string.
-        Value::Array(items) => json!({ "arrayValue": { "values": items.iter().map(encode_attribute_value).collect::<Vec<_>>() } }),
+        Value::Array(items) => {
+            json!({ "arrayValue": { "values": items.iter().map(encode_attribute_value).collect::<Vec<_>>() } })
+        }
         Value::Object(map) => json!({
             "kvlistValue": {
                 "values": map
@@ -255,10 +257,7 @@ impl OtlpEncoder {
         let mut encoded = Vec::with_capacity(spans.len());
         for span in spans {
             span.validate().map_err(|err| {
-                StudioError::Serialization(format!(
-                    "cannot export span '{}': {err}",
-                    span.name
-                ))
+                StudioError::Serialization(format!("cannot export span '{}': {err}", span.name))
             })?;
             encoded.push(json!({
                 "traceId": span.trace_id,
@@ -447,11 +446,10 @@ mod tests {
     use super::*;
 
     fn span(name: &str) -> Span {
-        Span::new(name, "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
-            .with_time_range(
-                DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
-                DateTime::<Utc>::from_timestamp(1_700_000_001, 500_000_000).unwrap(),
-            )
+        Span::new(name, "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7").with_time_range(
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            DateTime::<Utc>::from_timestamp(1_700_000_001, 500_000_000).unwrap(),
+        )
     }
 
     #[test]
@@ -466,9 +464,15 @@ mod tests {
     fn validate_rejects_bad_identifiers_and_time_ranges() {
         assert!(span("ok").validate().is_ok());
         let bad_trace = Span::new("x", "deadbeef", "00f067aa0ba902b7");
-        assert!(bad_trace.validate().unwrap_err().contains("invalid traceId"));
+        assert!(bad_trace
+            .validate()
+            .unwrap_err()
+            .contains("invalid traceId"));
         let bad_parent = span("x").with_parent("zz");
-        assert!(bad_parent.validate().unwrap_err().contains("invalid parentSpanId"));
+        assert!(bad_parent
+            .validate()
+            .unwrap_err()
+            .contains("invalid parentSpanId"));
         let mut reversed = span("x");
         reversed.end_time_unix_nano = 0;
         reversed.start_time_unix_nano = 5;
@@ -485,11 +489,23 @@ mod tests {
 
     #[test]
     fn attribute_values_map_to_the_otlp_any_value_shape() {
-        assert_eq!(encode_attribute_value(&json!("text")), json!({"stringValue": "text"}));
-        assert_eq!(encode_attribute_value(&json!(true)), json!({"boolValue": true}));
+        assert_eq!(
+            encode_attribute_value(&json!("text")),
+            json!({"stringValue": "text"})
+        );
+        assert_eq!(
+            encode_attribute_value(&json!(true)),
+            json!({"boolValue": true})
+        );
         assert_eq!(encode_attribute_value(&json!(7)), json!({"intValue": "7"}));
-        assert_eq!(encode_attribute_value(&json!(1.5)), json!({"doubleValue": 1.5}));
-        assert_eq!(encode_attribute_value(&Value::Null), json!({"stringValue": ""}));
+        assert_eq!(
+            encode_attribute_value(&json!(1.5)),
+            json!({"doubleValue": 1.5})
+        );
+        assert_eq!(
+            encode_attribute_value(&Value::Null),
+            json!({"stringValue": ""})
+        );
         assert_eq!(
             encode_attribute_value(&json!([1, "a"])),
             json!({"arrayValue": {"values": [{"intValue": "1"}, {"stringValue": "a"}]}})
@@ -507,7 +523,9 @@ mod tests {
         let payload = encoder
             .encode(
                 &resource,
-                &[span("chat").with_kind(SpanKind::Client).with_status(SpanStatus::Ok)],
+                &[span("chat")
+                    .with_kind(SpanKind::Client)
+                    .with_status(SpanStatus::Ok)],
             )
             .unwrap();
 
@@ -515,7 +533,10 @@ mod tests {
         assert_eq!(scope["scope"]["name"], json!("agentscope"));
         assert_eq!(scope["scope"]["version"], json!("0.1.0"));
         let encoded = &scope["spans"][0];
-        assert_eq!(encoded["traceId"], json!("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(
+            encoded["traceId"],
+            json!("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
         assert_eq!(encoded["spanId"], json!("00f067aa0ba902b7"));
         assert_eq!(encoded["parentSpanId"], json!(""));
         assert_eq!(encoded["name"], json!("chat"));
@@ -529,7 +550,10 @@ mod tests {
             .iter()
             .map(|a| a["key"].as_str().unwrap())
             .collect();
-        assert_eq!(resource_keys, vec!["service.name", "agentscope.project", "agentscope.run_id"]);
+        assert_eq!(
+            resource_keys,
+            vec!["service.name", "agentscope.project", "agentscope.run_id"]
+        );
     }
 
     #[test]
@@ -538,7 +562,10 @@ mod tests {
         let err = encoder
             .encode(&[], &[span("bad").with_parent("nope")])
             .unwrap_err();
-        assert!(err.to_string().contains("cannot export span 'bad'"), "{err}");
+        assert!(
+            err.to_string().contains("cannot export span 'bad'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -586,7 +613,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|a| a["value"]["stringValue"].as_str().unwrap_or_default().to_string())
+            .map(|a| {
+                a["value"]["stringValue"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         assert_eq!(keys, vec!["agentscope", "proj", "run-9"]);
     }

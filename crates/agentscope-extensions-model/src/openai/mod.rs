@@ -26,16 +26,18 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest, FinishReason,
-    FunctionCall, FunctionName, FunctionObject, ImageUrl, ReasoningEffort,
-    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema, ToolChoiceOptions,
+    ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest, FinishReason, FunctionCall,
+    FunctionName, FunctionObject, ImageUrl, ReasoningEffort, ResponseFormat as OaiResponseFormat,
+    ResponseFormatJsonSchema, ToolChoiceOptions,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use agentscope_core::error::{Error, Result};
-use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
+use agentscope_core::formatter::{
+    convert_tool_result_to_string, extract_text_content, ResponseFormat,
+};
 use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock, ToolUseBlock,
 };
@@ -183,10 +185,13 @@ impl OpenAiChatModel {
                 .map_err(|e| Error::Model(format!("failed to set header '{k}': {e}")))?;
         }
         let client = Client::with_config(cfg).with_http_client(build_http_client());
-        let descriptor = ctx
-            .catalog
-            .clone()
-            .or_else(|| descriptor_for(Some(&ctx.provider_id), &model_name, Some(&base_url_for_catalog)));
+        let descriptor = ctx.catalog.clone().or_else(|| {
+            descriptor_for(
+                Some(&ctx.provider_id),
+                &model_name,
+                Some(&base_url_for_catalog),
+            )
+        });
         let context = descriptor
             .as_ref()
             .and_then(|descriptor| descriptor.effective_context())
@@ -426,8 +431,14 @@ fn map_openai_error(e: OpenAIError) -> Error {
     match e {
         OpenAIError::ApiError(a) => {
             let api = a.api_error;
-            ModelError::from_parts("openai", a.status_code.as_u16(), api.message, api.r#type, api.code)
-                .to_core()
+            ModelError::from_parts(
+                "openai",
+                a.status_code.as_u16(),
+                api.message,
+                api.r#type,
+                api.code,
+            )
+            .to_core()
         }
         // Transport failures (connection reset, a dropped Wi-Fi link, a read
         // timeout) must be retryable so the model call is re-established once
@@ -510,7 +521,10 @@ fn build_request(
             diagnostics::info(
                 "sampling_unsupported",
                 "temperature",
-                format!("model '{}' does not accept temperature; parameter dropped", req.model),
+                format!(
+                    "model '{}' does not accept temperature; parameter dropped",
+                    req.model
+                ),
             );
         }
     }
@@ -809,7 +823,10 @@ fn to_reasoning_effort(s: &str) -> Option<ReasoningEffort> {
     }
 }
 
-fn to_response_format(rf: &ResponseFormat, strict_default: Option<bool>) -> Option<OaiResponseFormat> {
+fn to_response_format(
+    rf: &ResponseFormat,
+    strict_default: Option<bool>,
+) -> Option<OaiResponseFormat> {
     match rf.format_type.as_str() {
         "json_object" => Some(OaiResponseFormat::JsonObject),
         "json_schema" => {
@@ -954,7 +971,10 @@ impl StreamIncrementer {
     /// Consumes one chunk, returning a `ChatResponse` carrying only the
     /// incremental text/thinking content of this chunk (or `None` when the chunk
     /// carries no incremental content, e.g. an empty usage-only chunk).
-    fn accumulate(&mut self, chunk: &OpenAiStreamChunk) -> Option<agentscope_core::model::ChatResponse> {
+    fn accumulate(
+        &mut self,
+        chunk: &OpenAiStreamChunk,
+    ) -> Option<agentscope_core::model::ChatResponse> {
         if self.id.is_empty() && !chunk.id.is_empty() {
             self.id = chunk.id.clone();
         }
@@ -1183,12 +1203,9 @@ mod tests {
     fn user_image_becomes_data_url_part() {
         let msg = Msg::user_blocks(vec![
             ContentBlock::Text(TextBlock::new("look")),
-            ContentBlock::Image(ImageBlock::new(
-                agentscope_core::message::Source::Base64(Base64Source::new(
-                    "image/png",
-                    "iVBORw0KGgo=",
-                )),
-            )),
+            ContentBlock::Image(ImageBlock::new(agentscope_core::message::Source::Base64(
+                Base64Source::new("image/png", "iVBORw0KGgo="),
+            ))),
         ]);
         let (req, _) = build_request(
             "gpt-4o".into(),
@@ -1218,7 +1235,15 @@ mod tests {
             max_tokens: Some(100),
             ..Default::default()
         };
-        let (req, _) = build_request("o3-mini".into(), vec![sample_msg()], vec![], options, false, None, None);
+        let (req, _) = build_request(
+            "o3-mini".into(),
+            vec![sample_msg()],
+            vec![],
+            options,
+            false,
+            None,
+            None,
+        );
         assert!(req.temperature.is_none(), "o3 rejects temperature");
         assert!(req.top_p.is_none(), "o3 rejects top_p");
         assert!(req.frequency_penalty.is_none(), "o3 rejects penalties");
@@ -1230,9 +1255,20 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn compatible_gateway_uses_legacy_max_tokens() {
-        let options = GenerateOptions { max_tokens: Some(64), temperature: Some(0.2), ..Default::default() };
-        let (req, _) =
-            build_request("deepseek-chat".into(), vec![sample_msg()], vec![], options, false, None, None);
+        let options = GenerateOptions {
+            max_tokens: Some(64),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let (req, _) = build_request(
+            "deepseek-chat".into(),
+            vec![sample_msg()],
+            vec![],
+            options,
+            false,
+            None,
+            None,
+        );
         assert_eq!(req.max_tokens, Some(64));
         assert!(req.max_completion_tokens.is_none());
         assert_eq!(req.temperature, Some(0.2), "deepseek accepts temperature");
@@ -1240,9 +1276,8 @@ mod tests {
 
     #[test]
     fn usage_merges_across_chunks_without_zero_clobber() {
-        let chunk = |json: serde_json::Value| {
-            serde_json::from_value::<OpenAiStreamChunk>(json).unwrap()
-        };
+        let chunk =
+            |json: serde_json::Value| serde_json::from_value::<OpenAiStreamChunk>(json).unwrap();
         let mut inc = StreamIncrementer::default();
         inc.accumulate(&chunk(serde_json::json!({
             "id": "x", "choices": [],

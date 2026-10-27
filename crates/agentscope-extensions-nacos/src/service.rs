@@ -27,7 +27,10 @@ impl AiServiceError {
     pub const INVALID_PARAM: i64 = 400;
 
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
@@ -53,7 +56,11 @@ pub struct NacosPrompt {
 
 impl NacosPrompt {
     pub fn new(template: impl Into<String>) -> Self {
-        Self { template: template.into(), version: None, label: None }
+        Self {
+            template: template.into(),
+            version: None,
+            label: None,
+        }
     }
 
     /// Renders the template, replacing `{{key}}` and `${key}` placeholders with
@@ -217,7 +224,10 @@ impl InMemoryNacosAiService {
     /// Pushes an updated AgentCard to the registered subscriber, mirroring a Nacos
     /// config/registry push. Returns whether a subscription existed.
     pub fn fire_agent_card_update(&self, name: &str, card: NacosAgentCard) -> bool {
-        self.cards.lock().unwrap().insert(name.to_string(), card.clone());
+        self.cards
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), card.clone());
         let listener = self.card_listeners.lock().unwrap().get(name).cloned();
         match listener {
             Some(listener) => {
@@ -231,7 +241,10 @@ impl InMemoryNacosAiService {
     /// Pushes an updated prompt to the registered subscriber, mirroring a Nacos
     /// config change push. Returns whether a subscription existed.
     pub fn fire_prompt_update(&self, key: &str, prompt: NacosPrompt) -> bool {
-        self.prompts.lock().unwrap().insert(key.to_string(), prompt.clone());
+        self.prompts
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), prompt.clone());
         let listener = self.prompt_listeners.lock().unwrap().get(key).cloned();
         match listener {
             Some(listener) => {
@@ -292,7 +305,9 @@ impl NacosAiService for InMemoryNacosAiService {
             .unwrap()
             .get(agent_name)
             .cloned()
-            .ok_or_else(|| AiServiceError::not_found(format!("agent card not found: {agent_name}")))?;
+            .ok_or_else(|| {
+                AiServiceError::not_found(format!("agent card not found: {agent_name}"))
+            })?;
         self.card_listeners
             .lock()
             .unwrap()

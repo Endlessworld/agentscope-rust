@@ -1,4 +1,4 @@
-﻿//! # agentscope-extensions-rag
+//! # agentscope-extensions-rag
 //!
 //! Rust port of the Java `agentscope-extensions-rag` module (submodules `bailian`, `dify`,
 //! `haystack`, `ragflow`, `simple`) plus the small `io.agentscope.core.rag` / `embedding`
@@ -88,4 +88,3 @@ pub use store::{
     cosine_similarity, euclidean_distance, squared_euclidean_distance, InMemoryStore, SearchQuery,
     VdbStore,
 };
-

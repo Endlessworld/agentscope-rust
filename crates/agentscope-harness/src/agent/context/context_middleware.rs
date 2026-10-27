@@ -172,8 +172,7 @@ impl Middleware for ContextMiddleware {
                     "no compaction fallback is configured; surfacing the local budget failure"
                 );
                 let error = overflow_info.into_error();
-                return Box::pin(futures::stream::once(async move { Err(error) }))
-                    as EventStream;
+                return Box::pin(futures::stream::once(async move { Err(error) })) as EventStream;
             };
 
             let mut last_info = overflow_info;
@@ -301,20 +300,12 @@ async fn compact_overflow(
         config.keep_messages = 0;
         config.keep_tokens = 0;
     } else {
-        config.keep_messages = config
-            .keep_messages
-            .min(history.len().saturating_sub(1));
+        config.keep_messages = config.keep_messages.min(history.len().saturating_sub(1));
     }
 
     match overflow
         .compactor
-        .compact_if_needed_with_metrics(
-            history,
-            &config,
-            agent_id,
-            &effective_session,
-            recorder,
-        )
+        .compact_if_needed_with_metrics(history, &config, agent_id, &effective_session, recorder)
         .await
     {
         Ok((Some(compacted), metrics)) => {
@@ -431,22 +422,18 @@ mod tests {
             sources = sources
                 .with_source(
                     "biz",
-                    Arc::new(FixedSource(vec![
-                        ContextBlock::runtime("status", "Change 42 under review").unwrap(),
-                    ])),
+                    Arc::new(FixedSource(vec![ContextBlock::runtime(
+                        "status",
+                        "Change 42 under review",
+                    )
+                    .unwrap()])),
                     ContextSourceOptions::default(),
                 )
                 .unwrap();
         }
         Arc::new(ContextPipeline::new(ContextPipelineConfig {
             sources,
-            policy: ContextPolicy::new(
-                0,
-                0,
-                0,
-                Arc::new(ApproximateEstimator),
-                Arc::new(|_| {}),
-            ),
+            policy: ContextPolicy::new(0, 0, 0, Arc::new(ApproximateEstimator), Arc::new(|_| {})),
             ..ContextPipelineConfig::default()
         }))
     }
@@ -557,10 +544,9 @@ mod tests {
         {
             let mut guard = state.lock().unwrap();
             for i in 0..6 {
-                guard.context_mut().push(Msg::user(format!(
-                    "turn {i}: {}",
-                    "x".repeat(1_200)
-                )));
+                guard
+                    .context_mut()
+                    .push(Msg::user(format!("turn {i}: {}", "x".repeat(1_200))));
             }
         }
         // The reasoning request carries the accumulated state history (as `ReActAgent`
@@ -611,7 +597,10 @@ mod tests {
     #[test]
     fn the_middleware_only_participates_at_the_model_call_point() {
         let middleware = ContextMiddleware::new(pipeline(false));
-        assert_eq!(middleware.active_points(), vec![ExtensionPoint::OnModelCall]);
+        assert_eq!(
+            middleware.active_points(),
+            vec![ExtensionPoint::OnModelCall]
+        );
         // The instruction is registered even without a dynamic source.
         assert!(!middleware.pipeline().sources().is_empty());
     }
@@ -687,15 +676,13 @@ mod tests {
         {
             let mut guard = state.lock().unwrap();
             for i in 0..5 {
-                guard.context_mut().push(Msg::user(format!(
-                    "turn {i}: {}",
-                    "x".repeat(1_200)
-                )));
+                guard
+                    .context_mut()
+                    .push(Msg::user(format!("turn {i}: {}", "x".repeat(1_200))));
             }
-            guard.context_mut().push(Msg::user(format!(
-                "PRUNED-TAIL: {}",
-                "x".repeat(1_200)
-            )));
+            guard
+                .context_mut()
+                .push(Msg::user(format!("PRUNED-TAIL: {}", "x".repeat(1_200))));
         }
         let messages: Vec<Msg> = state
             .lock()
@@ -718,7 +705,10 @@ mod tests {
             CompactionConfig::builder().keep_messages(1).build(),
         );
         let events = run_chain(
-            vec![Box::new(DropFromRequest("PRUNED-TAIL")), Box::new(middleware)],
+            vec![
+                Box::new(DropFromRequest("PRUNED-TAIL")),
+                Box::new(middleware),
+            ],
             model,
             messages,
             ctx,
@@ -749,10 +739,9 @@ mod tests {
 
         let mut seeded = agentscope_core::state::AgentState::default();
         for i in 0..6 {
-            seeded.context_mut().push(Msg::user(format!(
-                "turn {i}: {}",
-                "x".repeat(1_200)
-            )));
+            seeded
+                .context_mut()
+                .push(Msg::user(format!("turn {i}: {}", "x".repeat(1_200))));
         }
 
         let mut chain = MiddlewareChain::new();

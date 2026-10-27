@@ -60,7 +60,8 @@ pub struct FileEntry {
 impl FileEntry {
     /// Returns whether this entry is a directory (Java `type == "directory"`).
     pub fn is_directory(&self) -> bool {
-        self.entry_type.eq_ignore_ascii_case("directory") || self.entry_type.eq_ignore_ascii_case("dir")
+        self.entry_type.eq_ignore_ascii_case("directory")
+            || self.entry_type.eq_ignore_ascii_case("dir")
     }
 
     /// Returns whether this entry is a regular file (Java `type == "file"`).
@@ -132,7 +133,11 @@ fn normalize_posix(path: &str) -> String {
         }
     }
     if stack.is_empty() {
-        return if absolute { "/".to_string() } else { ".".to_string() };
+        return if absolute {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        };
     }
     let joined = stack.join("/");
     if absolute {
@@ -227,7 +232,11 @@ impl FileApiResponse {
 #[async_trait]
 pub trait FileApiTransport: Send + Sync + Debug {
     /// Performs a `GET`.
-    async fn get(&self, url: String, headers: Vec<(String, String)>) -> SandboxResult<FileApiResponse>;
+    async fn get(
+        &self,
+        url: String,
+        headers: Vec<(String, String)>,
+    ) -> SandboxResult<FileApiResponse>;
 
     /// Performs a `POST` with a raw body and `Content-Type`.
     async fn post_bytes(
@@ -280,7 +289,10 @@ impl FileApiTransport for ReqwestFileApiTransport {
         body: Vec<u8>,
         headers: Vec<(String, String)>,
     ) -> SandboxResult<FileApiResponse> {
-        let mut request = self.client.post(&url).header(reqwest::header::CONTENT_TYPE, content_type);
+        let mut request = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, content_type);
         for (key, value) in headers {
             request = request.header(key, value);
         }
@@ -381,7 +393,10 @@ impl KubernetesFileApi {
     /// Downloads the file at `path`.
     pub async fn read(&self, path: &str) -> SandboxResult<Vec<u8>> {
         let safe = safe_upload_path(path)?;
-        let url = self.url(&format!("{FILE_API_DOWNLOAD_PREFIX}/{}", percent_encode(&safe)));
+        let url = self.url(&format!(
+            "{FILE_API_DOWNLOAD_PREFIX}/{}",
+            percent_encode(&safe)
+        ));
         let response = self.transport.get(url, self.headers.clone()).await?;
         if !response.is_success() {
             return Err(SandboxExtensionError::http(
@@ -407,7 +422,10 @@ impl KubernetesFileApi {
 
     /// Checks whether `path` exists.
     pub async fn exists(&self, path: &str) -> SandboxResult<bool> {
-        let url = self.url(&format!("{FILE_API_EXISTS_PREFIX}/{}", percent_encode(path)));
+        let url = self.url(&format!(
+            "{FILE_API_EXISTS_PREFIX}/{}",
+            percent_encode(path)
+        ));
         let response = self.transport.get(url, self.headers.clone()).await?;
         if !response.is_success() {
             return Err(SandboxExtensionError::http(
@@ -499,7 +517,10 @@ pub struct KubernetesFileTransfer {
 impl KubernetesFileTransfer {
     /// Creates a transfer adapter for the given file API and base dir.
     pub fn new(api: KubernetesFileApi, file_api_base_dir: impl Into<String>) -> Self {
-        Self { api, file_api_base_dir: file_api_base_dir.into() }
+        Self {
+            api,
+            file_api_base_dir: file_api_base_dir.into(),
+        }
     }
 
     /// Returns the configured file-API base dir.
@@ -633,11 +654,17 @@ mod tests {
             to_file_api_relative("/workspace", "/workspace/a/b.txt").as_deref(),
             Some("a/b.txt")
         );
-        assert_eq!(to_file_api_relative("/workspace/", "/workspace/a").as_deref(), Some("a"));
+        assert_eq!(
+            to_file_api_relative("/workspace/", "/workspace/a").as_deref(),
+            Some("a")
+        );
         assert_eq!(to_file_api_relative("", "/workspace/a"), None);
         assert_eq!(to_file_api_relative("/workspace", "/etc/hosts"), None);
         assert_eq!(to_file_api_relative("/workspace", "/workspace"), None);
-        assert_eq!(to_file_api_relative("/workspace", "/workspace/a/../b"), None);
+        assert_eq!(
+            to_file_api_relative("/workspace", "/workspace/a/../b"),
+            None
+        );
         assert_eq!(to_file_api_relative("/workspace", "/workspace/a//b"), None);
     }
 
@@ -669,11 +696,20 @@ mod tests {
                     body: br#"[{"name":"a.txt","size":1,"type":"file"}]"#.to_vec(),
                 })
             } else if url.contains("download/") {
-                Ok(FileApiResponse { status: 200, body: b"file content".to_vec() })
+                Ok(FileApiResponse {
+                    status: 200,
+                    body: b"file content".to_vec(),
+                })
             } else if url.contains("exists/") {
-                Ok(FileApiResponse { status: 200, body: br#"{"exists":true}"#.to_vec() })
+                Ok(FileApiResponse {
+                    status: 200,
+                    body: br#"{"exists":true}"#.to_vec(),
+                })
             } else {
-                Ok(FileApiResponse { status: 404, body: b"missing".to_vec() })
+                Ok(FileApiResponse {
+                    status: 404,
+                    body: b"missing".to_vec(),
+                })
             }
         }
 
@@ -685,7 +721,10 @@ mod tests {
             _headers: Vec<(String, String)>,
         ) -> SandboxResult<FileApiResponse> {
             self.posts.lock().unwrap().push((url, content_type, body));
-            Ok(FileApiResponse { status: 200, body: Vec::new() })
+            Ok(FileApiResponse {
+                status: 200,
+                body: Vec::new(),
+            })
         }
     }
 
@@ -699,7 +738,11 @@ mod tests {
     impl ExecTransport for FakeExec {
         async fn exec(&self, command: &str, _timeout: u64) -> SandboxResult<RemoteExecOutput> {
             self.commands.lock().unwrap().push(command.to_string());
-            Ok(RemoteExecOutput::new(self.exit_code, String::new(), String::new()))
+            Ok(RemoteExecOutput::new(
+                self.exit_code,
+                String::new(),
+                String::new(),
+            ))
         }
     }
 
@@ -711,7 +754,10 @@ mod tests {
     #[tokio::test]
     async fn write_posts_multipart_to_upload() {
         let transport = Arc::new(FakeTransport::default());
-        api(transport.clone()).write_text("foo.txt", "hi").await.unwrap();
+        api(transport.clone())
+            .write_text("foo.txt", "hi")
+            .await
+            .unwrap();
         let posts = transport.posts.lock().unwrap().clone();
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].0, "http://127.0.0.1:8888/upload");
@@ -724,7 +770,10 @@ mod tests {
     #[tokio::test]
     async fn read_downloads_percent_encoded() {
         let transport = Arc::new(FakeTransport::default());
-        let body = api(transport.clone()).read("workspace/file.txt").await.unwrap();
+        let body = api(transport.clone())
+            .read("workspace/file.txt")
+            .await
+            .unwrap();
         assert_eq!(body, b"file content");
         let gets = transport.gets.lock().unwrap().clone();
         assert_eq!(
@@ -739,13 +788,19 @@ mod tests {
         let entries = api(transport.clone()).list("workspace").await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a.txt");
-        assert_eq!(transport.gets.lock().unwrap()[0], "http://127.0.0.1:8888/list/workspace");
+        assert_eq!(
+            transport.gets.lock().unwrap()[0],
+            "http://127.0.0.1:8888/list/workspace"
+        );
     }
 
     #[tokio::test]
     async fn exists_returns_true() {
         let transport = Arc::new(FakeTransport::default());
-        assert!(api(transport.clone()).exists("workspace/file.txt").await.unwrap());
+        assert!(api(transport.clone())
+            .exists("workspace/file.txt")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -754,8 +809,15 @@ mod tests {
         struct ErrTransport;
         #[async_trait]
         impl FileApiTransport for ErrTransport {
-            async fn get(&self, _u: String, _h: Vec<(String, String)>) -> SandboxResult<FileApiResponse> {
-                Ok(FileApiResponse { status: 500, body: b"boom".to_vec() })
+            async fn get(
+                &self,
+                _u: String,
+                _h: Vec<(String, String)>,
+            ) -> SandboxResult<FileApiResponse> {
+                Ok(FileApiResponse {
+                    status: 500,
+                    body: b"boom".to_vec(),
+                })
             }
             async fn post_bytes(
                 &self,
@@ -764,7 +826,10 @@ mod tests {
                 _b: Vec<u8>,
                 _h: Vec<(String, String)>,
             ) -> SandboxResult<FileApiResponse> {
-                Ok(FileApiResponse { status: 500, body: b"boom".to_vec() })
+                Ok(FileApiResponse {
+                    status: 500,
+                    body: b"boom".to_vec(),
+                })
             }
         }
         let api = KubernetesFileApi::new("http://x", Arc::new(ErrTransport));
@@ -785,7 +850,9 @@ mod tests {
         let transport = Arc::new(FakeTransport::default());
         let exec = Arc::new(FakeExec::default());
         let api = api(transport).with_exec(exec.clone());
-        api.move_path("/workspace/a.txt", "/workspace/b.txt").await.unwrap();
+        api.move_path("/workspace/a.txt", "/workspace/b.txt")
+            .await
+            .unwrap();
         let commands = exec.commands.lock().unwrap().clone();
         assert_eq!(commands.len(), 1);
         assert!(commands[0].contains("mv /workspace/a.txt /workspace/b.txt"));
@@ -793,10 +860,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_transfer_gates_on_base_dir() {
-        let transfer = KubernetesFileTransfer::new(
-            api(Arc::new(FakeTransport::default())),
-            "/workspace",
-        );
+        let transfer =
+            KubernetesFileTransfer::new(api(Arc::new(FakeTransport::default())), "/workspace");
         assert!(transfer.supports_file_transfer("/workspace/a.txt"));
         assert!(!transfer.supports_file_transfer("/etc/hosts"));
         let bytes = transfer.download_file("/workspace/a.txt").await.unwrap();
@@ -810,7 +875,10 @@ mod tests {
         let exec = Arc::new(FakeExec::default());
         let file_api = api(transport.clone()).with_exec(exec.clone());
         let transfer = KubernetesFileTransfer::new(file_api, "/workspace");
-        transfer.upload_file("/workspace/sub/a.txt", b"data").await.unwrap();
+        transfer
+            .upload_file("/workspace/sub/a.txt", b"data")
+            .await
+            .unwrap();
         let commands = exec.commands.lock().unwrap().clone();
         assert_eq!(commands, vec!["mkdir -p /workspace/sub".to_string()]);
         let posts = transport.posts.lock().unwrap().clone();

@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use agentscope_core::{
-    DefaultToolResultConverter, Error, FunctionTool, JsonMap, MsgRole, ToolExecutionContext,
-    ToolRegistration, ToolResultBlock, ToolResultConverter, ToolResultMessageBuilder, ToolResultState,
-    ToolSuspendException, ToolUseBlock, Toolkit, is_dangerous_command, is_dangerous_path,
+    is_dangerous_command, is_dangerous_path, DefaultToolResultConverter, Error, FunctionTool,
+    JsonMap, MsgRole, ToolExecutionContext, ToolRegistration, ToolResultBlock, ToolResultConverter,
+    ToolResultMessageBuilder, ToolResultState, ToolSuspendException, ToolUseBlock, Toolkit,
 };
 
 #[test]
@@ -109,7 +109,10 @@ fn registration_builder_registers_with_group_and_presets() {
 
     assert!(tk.tool_names().contains(&"calc".to_string()));
     assert!(tk.get_tool_group("math").is_some());
-    assert_eq!(tk.preset_parameters("calc").get("precision").unwrap(), &serde_json::json!(2));
+    assert_eq!(
+        tk.preset_parameters("calc").get("precision").unwrap(),
+        &serde_json::json!(2)
+    );
 }
 
 #[test]

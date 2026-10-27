@@ -16,10 +16,10 @@ pub mod memory_search;
 pub mod plan_mode;
 pub mod session_search;
 pub mod shell_execute_tool;
-pub mod web_tools;
 pub mod task_tool;
 pub mod team;
 pub mod wait_async;
+pub mod web_tools;
 
 pub use agent_generate::AgentGenerateTool;
 pub use agent_spawn::{AgentListTool, AgentSendTool, AgentSpawnTool};
@@ -31,11 +31,11 @@ pub use memory_save::MemorySaveTool;
 pub use memory_search::MemorySearchTool;
 pub use plan_mode::{PlanEnterTool, PlanExitTool, PlanModeHandle, PlanWriteTool};
 pub use session_search::{SessionHistoryTool, SessionListTool, SessionSearchTool};
-pub use web_tools::{register_web_tools, WebFetchTool, WebSearchTool};
 pub use shell_execute_tool::{command_with_working_directory, ShellExecuteTool};
 pub use task_tool::{TaskCancelTool, TaskListTool, TaskOutputTool, TaskTool};
 pub use team::TeamTool;
 pub use wait_async::WaitAsyncResultsTool;
+pub use web_tools::{register_web_tools, WebFetchTool, WebSearchTool};
 
 /// Extracts a required string argument.
 pub(crate) fn str_arg(args: &JsonMap, key: &str) -> Result<String> {
@@ -47,7 +47,9 @@ pub(crate) fn str_arg(args: &JsonMap, key: &str) -> Result<String> {
 
 /// Extracts an optional string argument.
 pub(crate) fn opt_str_arg(args: &JsonMap, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extracts an optional unsigned integer argument.

@@ -1,7 +1,9 @@
 //! Input types for middleware interception points.
 use std::sync::{Arc, Mutex};
 
-use crate::message::{ContentBlock, Msg, TextBlock, ToolResultBlock, ToolResultState, ToolUseBlock};
+use crate::message::{
+    ContentBlock, Msg, TextBlock, ToolResultBlock, ToolResultState, ToolUseBlock,
+};
 use crate::model::{GenerateOptions, Model, ToolSchema};
 
 /// Input for the agent invocation interception point.
@@ -25,7 +27,10 @@ pub struct AgentInput {
 
 impl AgentInput {
     pub fn new(messages: Vec<Msg>) -> Self {
-        Self { messages, system_prompt: None }
+        Self {
+            messages,
+            system_prompt: None,
+        }
     }
 
     /// Appends request-scoped system prompt material, separating it from existing
@@ -37,7 +42,11 @@ impl AgentInput {
     /// Replaces the request-scoped system prompt material.
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         let prompt = prompt.into();
-        self.system_prompt = if prompt.trim().is_empty() { None } else { Some(prompt) };
+        self.system_prompt = if prompt.trim().is_empty() {
+            None
+        } else {
+            Some(prompt)
+        };
     }
 }
 
@@ -79,7 +88,11 @@ pub struct ReasoningInput {
 
 impl ReasoningInput {
     pub fn new(messages: Vec<Msg>, tools: Vec<ToolSchema>, options: GenerateOptions) -> Self {
-        Self { messages, tools, options }
+        Self {
+            messages,
+            tools,
+            options,
+        }
     }
 }
 
@@ -101,12 +114,18 @@ pub struct ActingInput {
 
 impl ActingInput {
     pub fn new(tool_calls: Vec<ToolUseBlock>) -> Self {
-        Self { tool_calls, results: ActingResultsHandle::new() }
+        Self {
+            tool_calls,
+            results: ActingResultsHandle::new(),
+        }
     }
 
     /// Creates an input bound to an existing results handle.
     pub fn with_results(tool_calls: Vec<ToolUseBlock>, results: ActingResultsHandle) -> Self {
-        Self { tool_calls, results }
+        Self {
+            tool_calls,
+            results,
+        }
     }
 }
 
@@ -258,9 +277,15 @@ impl ModelCallInput {
         options: GenerateOptions,
         model: Arc<dyn Model>,
     ) -> Self {
-        Self { messages, tools, options, model }
+        Self {
+            messages,
+            tools,
+            options,
+            model,
+        }
     }
 }
 
 /// A boxed event stream produced by a middleware chain step.
-pub type EventStream = futures::stream::BoxStream<'static, crate::error::Result<crate::event::AgentEvent>>;
+pub type EventStream =
+    futures::stream::BoxStream<'static, crate::error::Result<crate::event::AgentEvent>>;

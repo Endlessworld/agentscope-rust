@@ -18,9 +18,7 @@ use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::join_url;
-use crate::remote::{
-    RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle,
-};
+use crate::remote::{RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle};
 use crate::retry::{with_retries, RetryPolicy};
 
 /// Default workspace root inside an AgentRun sandbox container.
@@ -133,13 +131,31 @@ pub fn validate_options(options: &AgentRunSandboxClientOptions) -> SandboxResult
             "AgentRun {field} is required (AgentRunSandboxClientOptions)"
         ))
     };
-    if options.api_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if options
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(missing("API key"));
     }
-    if options.template_name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if options
+        .template_name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(missing("template name"));
     }
-    if options.mcp_server_url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if options
+        .mcp_server_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(missing("MCP server URL"));
     }
     if let Some(nas) = &options.nas_config {
@@ -181,12 +197,15 @@ pub fn resolve_data_plane_base_url(
         return Ok(url.trim_end_matches('/').to_string());
     }
     match (
-        options.account_id.as_deref().filter(|v| !v.trim().is_empty()),
+        options
+            .account_id
+            .as_deref()
+            .filter(|v| !v.trim().is_empty()),
         options.region.as_deref().filter(|v| !v.trim().is_empty()),
     ) {
-        (Some(account), Some(region)) => {
-            Ok(format!("https://{account}.agentrun-data.{region}.aliyuncs.com"))
-        }
+        (Some(account), Some(region)) => Ok(format!(
+            "https://{account}.agentrun-data.{region}.aliyuncs.com"
+        )),
         _ => Err(SandboxExtensionError::Configuration(
             "AgentRun requires accountId+region or an explicit dataPlaneBaseUrl".to_string(),
         )),
@@ -249,7 +268,11 @@ pub struct AgentRunExecResult {
 
 impl Default for AgentRunExecResult {
     fn default() -> Self {
-        Self { exit_code: 0, stdout: String::new(), stderr: String::new() }
+        Self {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
     }
 }
 
@@ -305,7 +328,10 @@ pub fn parse_exec_payload(text: &str) -> AgentRunExecResult {
     if let Some(brace) = trimmed.find('{') {
         let json_text = &trimmed[brace..];
         if let Ok(node) = serde_json::from_str::<Value>(json_text) {
-            let result = node.get("result").filter(|r| r.is_object()).unwrap_or(&node);
+            let result = node
+                .get("result")
+                .filter(|r| r.is_object())
+                .unwrap_or(&node);
             let exit_code = result
                 .get("exitCode")
                 .or_else(|| result.get("exit_code"))
@@ -328,7 +354,11 @@ pub fn parse_exec_payload(text: &str) -> AgentRunExecResult {
             }
         }
     }
-    AgentRunExecResult { exit_code: 0, stdout: trimmed.to_string(), stderr: String::new() }
+    AgentRunExecResult {
+        exit_code: 0,
+        stdout: trimmed.to_string(),
+        stderr: String::new(),
+    }
 }
 
 /// Extracts the sandbox status from a `GET /sandboxes/{id}` response.
@@ -358,9 +388,16 @@ impl AgentRunBackend {
             .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
             .timeout(Duration::from_secs(options.read_timeout_seconds))
             .build()
-            .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
+            .map_err(|e| {
+                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
+            })?;
         let retry = RetryPolicy::agentrun(options.max_retries);
-        Ok(Self { options, client, retry, base_url })
+        Ok(Self {
+            options,
+            client,
+            retry,
+            base_url,
+        })
     }
 
     /// Returns the configured options.
@@ -464,7 +501,9 @@ impl AgentRunBackend {
                     if upper.contains("FAILED") || upper.contains("TERMINATED") {
                         return Err(SandboxExtensionError::Runtime(
                             SandboxErrorCode::WorkspaceStartError,
-                            format!("AgentRun sandbox entered terminal state {status}: {sandbox_id}"),
+                            format!(
+                                "AgentRun sandbox entered terminal state {status}: {sandbox_id}"
+                            ),
                         ));
                     }
                     last = Some(status);
@@ -512,7 +551,8 @@ impl RemoteBackend for AgentRunBackend {
     async fn create_sandbox(&self, session_id: &str) -> SandboxResult<RemoteSandboxHandle> {
         let url = join_url(&self.base_url, "/sandboxes");
         let body = build_create_sandbox_body(&self.options, session_id)?;
-        self.request_json(reqwest::Method::POST, url, Some(body)).await?;
+        self.request_json(reqwest::Method::POST, url, Some(body))
+            .await?;
         self.wait_until_ready(session_id).await?;
         Ok(self.handle_for(session_id))
     }
@@ -613,7 +653,9 @@ pub type AgentRunSandboxClient = RemoteSandboxClient;
 pub fn agentrun_client(
     options: AgentRunSandboxClientOptions,
 ) -> SandboxResult<AgentRunSandboxClient> {
-    Ok(RemoteSandboxClient::new(Arc::new(AgentRunBackend::new(options)?)))
+    Ok(RemoteSandboxClient::new(Arc::new(AgentRunBackend::new(
+        options,
+    )?)))
 }
 
 #[cfg(test)]
@@ -708,9 +750,15 @@ mod tests {
         assert_eq!(body["sandboxId"], "sbx-1");
         assert_eq!(body["templateName"], "tpl");
         assert_eq!(body["sandboxIdleTimeoutSeconds"], 1800);
-        assert_eq!(body["nasMountConfig"]["mountPoints"][0]["serverAddr"], "nas.local");
+        assert_eq!(
+            body["nasMountConfig"]["mountPoints"][0]["serverAddr"],
+            "nas.local"
+        );
         assert_eq!(body["nasMountConfig"]["mountPoints"][0]["enableTLS"], true);
-        assert_eq!(body["ossMountConfig"]["mountPoints"][0]["bucketName"], "bucket");
+        assert_eq!(
+            body["ossMountConfig"]["mountPoints"][0]["bucketName"],
+            "bucket"
+        );
         assert_eq!(body["ossMountConfig"]["mountPoints"][0]["readOnly"], true);
     }
 
@@ -755,7 +803,8 @@ mod tests {
         assert_eq!(json_payload.stdout, "out");
         assert_eq!(json_payload.stderr, "err");
 
-        let nested = parse_exec_payload("banner\n{\"result\":{\"exit_code\":3,\"output\":\"nested\"}}");
+        let nested =
+            parse_exec_payload("banner\n{\"result\":{\"exit_code\":3,\"output\":\"nested\"}}");
         assert_eq!(nested.exit_code, 3);
         assert_eq!(nested.stdout, "nested");
 
@@ -766,8 +815,14 @@ mod tests {
 
     #[test]
     fn parse_sandbox_status_reads_status_or_state() {
-        assert_eq!(parse_sandbox_status(&json!({"status": "READY"})).as_deref(), Some("READY"));
-        assert_eq!(parse_sandbox_status(&json!({"state": "RUNNING"})).as_deref(), Some("RUNNING"));
+        assert_eq!(
+            parse_sandbox_status(&json!({"status": "READY"})).as_deref(),
+            Some("READY")
+        );
+        assert_eq!(
+            parse_sandbox_status(&json!({"state": "RUNNING"})).as_deref(),
+            Some("RUNNING")
+        );
         assert_eq!(parse_sandbox_status(&json!({})), None);
     }
 

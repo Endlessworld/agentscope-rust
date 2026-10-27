@@ -38,11 +38,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use async_trait::async_trait;
 use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
 use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -55,8 +55,8 @@ use super::outbound::{next_client_id, peer_of, WeixinOutboundClient};
 use super::properties::WeixinChannelProperties;
 use super::state_store::{WeixinInboxClaim, WeixinInboxMessage, WeixinLease, WeixinStateStore};
 use crate::common::{
-    to_core_error as channel_to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry, ChannelSeams,
-    HttpTransport, Result,
+    to_core_error as channel_to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry,
+    ChannelSeams, HttpTransport, Result,
 };
 
 /// Channel type name, mirroring `WeixinChannel.TYPE`.
@@ -426,13 +426,14 @@ impl WeixinChannel {
             }
             Err(error) => {
                 self.notify("transient failure", |listener| {
-                    listener.on_transient_failure(&self.properties.account_id, &error.safe_message())
+                    listener
+                        .on_transient_failure(&self.properties.account_id, &error.safe_message())
                 });
                 // The provider session never started: leave the lease so the outer loop backs off,
                 // reacquires and retries startup.
-                return ConsumeOutcome::Transient(
-                    WeixinError::operation("Weixin provider session did not start"),
-                );
+                return ConsumeOutcome::Transient(WeixinError::operation(
+                    "Weixin provider session did not start",
+                ));
             }
         }
         self.notify("running", |listener| {
@@ -624,7 +625,8 @@ impl WeixinChannel {
                 return Err(WeixinError::operation("Weixin context update fenced"));
             }
         }
-        let dispatch_timeout = std::time::Duration::from_millis(self.properties.dispatch_timeout_ms as u64);
+        let dispatch_timeout =
+            std::time::Duration::from_millis(self.properties.dispatch_timeout_ms as u64);
         // The turn runs under the session's cancel signal: a lease lost (or a stopped channel)
         // ends the execution instead of only suppressing the reply.
         let cancel = session.cancel_signal();
@@ -661,7 +663,8 @@ impl WeixinChannel {
         // Fencing point: a lease lost while the turn was running must not send the late reply.
         self.require_lease(session)?;
         let token = inbound.messages.first().and_then(context_token_of);
-        self.send_reply(&address, &[reply], token.as_deref()).await?;
+        self.send_reply(&address, &[reply], token.as_deref())
+            .await?;
         Ok(())
     }
 
@@ -683,10 +686,8 @@ impl WeixinChannel {
             Err(error) => {
                 if !error.is_credential_rejected() {
                     self.notify("delivery failed", |listener| {
-                        listener.on_delivery_failed(
-                            &self.properties.account_id,
-                            &error.safe_message(),
-                        )
+                        listener
+                            .on_delivery_failed(&self.properties.account_id, &error.safe_message())
                     });
                 }
                 Err(error)
@@ -767,9 +768,11 @@ impl WeixinChannel {
             return Err(WeixinError::operation("Weixin consumer is not active"));
         }
         if !Arc::ptr_eq(
-            &self.active_session().unwrap_or_else(|| Arc::new(LeaseSession::new(
-                WeixinLease::new("none", 1).expect("literal lease is valid"),
-            ))),
+            &self.active_session().unwrap_or_else(|| {
+                Arc::new(LeaseSession::new(
+                    WeixinLease::new("none", 1).expect("literal lease is valid"),
+                ))
+            }),
             session,
         ) {
             session.invalidate();
@@ -928,7 +931,10 @@ mod tests {
     }
 
     fn assistant(text: &str) -> Msg {
-        Msg::builder().role(MsgRole::Assistant).text_content(text).build()
+        Msg::builder()
+            .role(MsgRole::Assistant)
+            .text_content(text)
+            .build()
     }
 
     fn address() -> OutboundAddress {
@@ -971,9 +977,11 @@ mod tests {
         assert!(error.to_string().contains("not active"));
         assert_eq!(transport.request_count(), 0);
         // `PlatformChannel::deliver_reply` reports the same refusal through the core error type.
-        assert!(PlatformChannel::deliver_reply(&*channel, &address(), vec![assistant("hello")])
-            .await
-            .is_err());
+        assert!(
+            PlatformChannel::deliver_reply(&*channel, &address(), vec![assistant("hello")])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1014,7 +1022,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("lease lost"));
-        assert_eq!(transport.request_count(), 0, "a stale consumer must not send");
+        assert_eq!(
+            transport.request_count(),
+            0,
+            "a stale consumer must not send"
+        );
         assert!(!session.is_valid());
     }
 
@@ -1035,10 +1047,9 @@ mod tests {
 
     #[tokio::test]
     async fn stop_fences_the_session_and_a_stopped_channel_cannot_restart() {
-        let transport = Arc::new(RecordingTransport::with_responses(vec![PreparedResponse::new(
-            200,
-            "{\"ret\":0}",
-        )]));
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, "{\"ret\":0}"),
+        ]));
         let (channel, _store) = channel(transport);
         let session = channel.begin_consuming().unwrap().unwrap();
         assert!(channel.is_running());
@@ -1069,7 +1080,10 @@ mod tests {
         assert_eq!(replay[0].message_id, inbox[0].message_id);
         assert_eq!(replay[1].message_id, inbox[1].message_id);
         // The id embeds the payload digest, so a changed payload gets a different id.
-        assert_eq!(inbox[0].message_id, format!("payload-0-{}", digest(&inbox[0].payload)));
+        assert_eq!(
+            inbox[0].message_id,
+            format!("payload-0-{}", digest(&inbox[0].payload))
+        );
     }
 
     #[test]
@@ -1196,7 +1210,9 @@ mod tests {
             &ChannelSeams::new(),
         ));
         // A gateway whose agent never answers, so the dispatch budget times out.
-        channel.init(Arc::new(agentscope_harness::agent::HarnessGateway::create_standalone()));
+        channel.init(Arc::new(
+            agentscope_harness::agent::HarnessGateway::create_standalone(),
+        ));
         let session = channel.begin_consuming().unwrap().unwrap();
         let payload = serde_json::json!({
             "message_type": 1,
@@ -1214,14 +1230,20 @@ mod tests {
         let error = channel.drain_inbox(&session).await.unwrap_err();
         // The reason is a module constant or a variant name — never a payload or a URI.
         let reason = error.safe_message();
-        assert!(!reason.contains("hi"), "reason leaked the payload: {reason}");
+        assert!(
+            !reason.contains("hi"),
+            "reason leaked the payload: {reason}"
+        );
         assert!(reason.starts_with("WeixinOperationException"), "{reason}");
     }
 
     #[test]
-    fn begin_consuming_returns_none_while_another_holder_owns_the_account() {        let transport = Arc::new(RecordingTransport::new());
+    fn begin_consuming_returns_none_while_another_holder_owns_the_account() {
+        let transport = Arc::new(RecordingTransport::new());
         let (channel, store) = channel(transport);
-        let other = store.acquire_lease(ACCOUNT, "other-holder", 60_000).unwrap();
+        let other = store
+            .acquire_lease(ACCOUNT, "other-holder", 60_000)
+            .unwrap();
         assert!(channel.begin_consuming().unwrap().is_none());
         // Once the other holder releases, this instance takes over with a new generation.
         store.release_lease(ACCOUNT, &other);

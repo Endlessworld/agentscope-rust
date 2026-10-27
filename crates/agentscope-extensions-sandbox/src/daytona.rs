@@ -15,9 +15,7 @@ use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::join_url;
-use crate::remote::{
-    RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle,
-};
+use crate::remote::{RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle};
 use crate::retry::{with_retries, RetryPolicy};
 
 /// Default image used when no snapshot is supplied.
@@ -81,7 +79,11 @@ impl Default for DaytonaSandboxClientOptions {
 /// Builds the `POST /sandbox` request body.
 pub fn build_create_sandbox_body(options: &DaytonaSandboxClientOptions) -> Value {
     let mut body = serde_json::Map::new();
-    match options.snapshot_id.as_ref().filter(|s| !s.trim().is_empty()) {
+    match options
+        .snapshot_id
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(snapshot) => {
             body.insert("snapshot".to_string(), Value::String(snapshot.clone()));
         }
@@ -174,9 +176,15 @@ impl DaytonaBackend {
             .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
             .timeout(Duration::from_secs(options.read_timeout_seconds))
             .build()
-            .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
+            .map_err(|e| {
+                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
+            })?;
         let retry = RetryPolicy::daytona(options.max_retries);
-        Ok(Self { options, client, retry })
+        Ok(Self {
+            options,
+            client,
+            retry,
+        })
     }
 
     /// Returns the configured options.
@@ -215,7 +223,12 @@ impl DaytonaBackend {
         })
     }
 
-    async fn request_json(&self, method: reqwest::Method, url: String, body: Option<Value>) -> SandboxResult<Value> {
+    async fn request_json(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        body: Option<Value>,
+    ) -> SandboxResult<Value> {
         let bearer = self.bearer()?;
         let client = self.client.clone();
         let retry = self.retry.clone();
@@ -252,7 +265,9 @@ impl DaytonaBackend {
             &format!("/toolbox/{sandbox_id}/process/execute"),
         );
         let body = build_execute_body(command, cwd, timeout_seconds);
-        let value = self.request_json(reqwest::Method::POST, url, Some(body)).await?;
+        let value = self
+            .request_json(reqwest::Method::POST, url, Some(body))
+            .await?;
         Ok(parse_execute_result(&value))
     }
 
@@ -286,16 +301,14 @@ impl DaytonaBackend {
             &self.options.control_plane_base_url,
             &format!("/sandbox/{sandbox_id}/start"),
         );
-        self.request_json(reqwest::Method::POST, url, Some(json!({}))).await?;
+        self.request_json(reqwest::Method::POST, url, Some(json!({})))
+            .await?;
         Ok(())
     }
 
     fn handle_for(&self, sandbox_id: &str) -> RemoteSandboxHandle {
         let mut extra = BTreeMap::new();
-        extra.insert(
-            "image".to_string(),
-            self.options.image.clone(),
-        );
+        extra.insert("image".to_string(), self.options.image.clone());
         if let Some(snapshot) = &self.options.snapshot_id {
             extra.insert("snapshot_id".to_string(), snapshot.clone());
         }
@@ -320,7 +333,9 @@ impl RemoteBackend for DaytonaBackend {
     async fn create_sandbox(&self, _session_id: &str) -> SandboxResult<RemoteSandboxHandle> {
         let url = join_url(&self.options.control_plane_base_url, "/sandbox");
         let body = build_create_sandbox_body(&self.options);
-        let value = self.request_json(reqwest::Method::POST, url, Some(body)).await?;
+        let value = self
+            .request_json(reqwest::Method::POST, url, Some(body))
+            .await?;
         let id = parse_create_sandbox_id(&value).ok_or_else(|| {
             SandboxExtensionError::Runtime(
                 SandboxErrorCode::WorkspaceStartError,
@@ -401,7 +416,9 @@ pub type DaytonaSandboxClient = RemoteSandboxClient;
 
 /// Creates the harness [`agentscope_harness::agent::sandbox::SandboxClient`] for Daytona.
 pub fn daytona_client(options: DaytonaSandboxClientOptions) -> SandboxResult<DaytonaSandboxClient> {
-    Ok(RemoteSandboxClient::new(Arc::new(DaytonaBackend::new(options)?)))
+    Ok(RemoteSandboxClient::new(Arc::new(DaytonaBackend::new(
+        options,
+    )?)))
 }
 
 #[cfg(test)]
@@ -451,11 +468,23 @@ mod tests {
 
     #[test]
     fn parse_helpers() {
-        assert_eq!(parse_create_sandbox_id(&json!({"id": "a"})).as_deref(), Some("a"));
-        assert_eq!(parse_create_sandbox_id(&json!({"sandboxId": "b"})).as_deref(), Some("b"));
+        assert_eq!(
+            parse_create_sandbox_id(&json!({"id": "a"})).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            parse_create_sandbox_id(&json!({"sandboxId": "b"})).as_deref(),
+            Some("b")
+        );
         assert_eq!(parse_create_sandbox_id(&json!({"id": ""})), None);
-        assert_eq!(parse_sandbox_state(&json!({"state": "started"})).as_deref(), Some("started"));
-        assert_eq!(parse_sandbox_state(&json!({"status": "STARTING"})).as_deref(), Some("STARTING"));
+        assert_eq!(
+            parse_sandbox_state(&json!({"state": "started"})).as_deref(),
+            Some("started")
+        );
+        assert_eq!(
+            parse_sandbox_state(&json!({"status": "STARTING"})).as_deref(),
+            Some("STARTING")
+        );
         let result = parse_execute_result(&json!({"exitCode": 0, "result": "ok"}));
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.result, "ok");
@@ -464,7 +493,10 @@ mod tests {
 
     #[test]
     fn relative_cwd_strips_leading_slash() {
-        assert_eq!(relative_cwd("/home/daytona/workspace"), "home/daytona/workspace");
+        assert_eq!(
+            relative_cwd("/home/daytona/workspace"),
+            "home/daytona/workspace"
+        );
         assert_eq!(relative_cwd("home"), "home");
         assert_eq!(relative_cwd(""), "");
     }
@@ -476,7 +508,9 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
         let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
-            base64::engine::general_purpose::STANDARD.decode(cleaned).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(cleaned)
+                .unwrap(),
             raw
         );
     }

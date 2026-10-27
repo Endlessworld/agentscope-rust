@@ -49,7 +49,10 @@ pub struct AtPathExpansionMiddleware {
 
 impl AtPathExpansionMiddleware {
     pub fn new(fs: Arc<dyn Filesystem>) -> Self {
-        Self { fs, max_total_chars: DEFAULT_MAX_TOTAL_CHARS }
+        Self {
+            fs,
+            max_total_chars: DEFAULT_MAX_TOTAL_CHARS,
+        }
     }
 
     /// Caps the total number of characters attached per message.
@@ -139,7 +142,8 @@ async fn expand_message(msg: &mut Msg, fs: &Arc<dyn Filesystem>, max_total_chars
     }
 
     // Append as a new block: image and other non-text blocks must survive expansion.
-    msg.content.push(ContentBlock::Text(TextBlock::new(preview)));
+    msg.content
+        .push(ContentBlock::Text(TextBlock::new(preview)));
 }
 
 /// Concatenates the message's text blocks with `\n`, mirroring Java
@@ -207,7 +211,11 @@ fn scan_references(text: &str) -> Vec<String> {
         let token = &text[start..j];
         if !token.is_empty() && looks_like_path(token) {
             let normalized = token.trim_start_matches("./").to_string();
-            let key = if normalized.is_empty() { token.to_string() } else { normalized };
+            let key = if normalized.is_empty() {
+                token.to_string()
+            } else {
+                normalized
+            };
             if !out.contains(&key) {
                 out.push(key);
             }
@@ -218,10 +226,7 @@ fn scan_references(text: &str) -> Vec<String> {
 }
 
 fn looks_like_path(token: &str) -> bool {
-    token.contains('/')
-        || token.contains('\\')
-        || token.contains('.')
-        || token.starts_with('~')
+    token.contains('/') || token.contains('\\') || token.contains('.') || token.starts_with('~')
 }
 
 /// Reads at most [`MAX_ATTACHED_LINES`] lines, skipping binary attachments.
@@ -264,7 +269,11 @@ mod tests {
         assert!(neutralized.contains("a && b"), "{neutralized}");
         assert!(neutralized.contains("<T>"), "{neutralized}");
         assert!(neutralized.contains("<\\/attached_file>"), "{neutralized}");
-        assert_eq!(neutralized.matches("</attached_file>").count(), 0, "{neutralized}");
+        assert_eq!(
+            neutralized.matches("</attached_file>").count(),
+            0,
+            "{neutralized}"
+        );
     }
 
     #[test]
@@ -292,16 +301,24 @@ mod tests {
         let mw = middleware(&dir);
         let mut msg = user_msg("look at @src/a.rs");
         // A pre-existing non-text block must survive expansion.
-        msg.content.push(ContentBlock::Text(TextBlock::new("keep me")));
+        msg.content
+            .push(ContentBlock::Text(TextBlock::new("keep me")));
         expand_message(&mut msg, &mw.fs, DEFAULT_MAX_TOTAL_CHARS).await;
 
-        assert_eq!(msg.content.len(), 3, "preview must be appended, not replace");
+        assert_eq!(
+            msg.content.len(),
+            3,
+            "preview must be appended, not replace"
+        );
         let preview = match msg.content.last() {
             Some(ContentBlock::Text(tb)) => tb.text.clone(),
             other => panic!("expected the appended text block, got {other:?}"),
         };
         assert!(preview.starts_with(ATTACHMENT_LEAD_IN), "{preview}");
-        assert!(preview.contains("<attached_file path=\"src/a.rs\">"), "{preview}");
+        assert!(
+            preview.contains("<attached_file path=\"src/a.rs\">"),
+            "{preview}"
+        );
         assert!(preview.contains("fn main() {}"), "{preview}");
         assert!(preview.contains("</attached_file>"), "{preview}");
 
@@ -320,7 +337,11 @@ mod tests {
             .content(vec![ContentBlock::Text(TextBlock::new("@src/a.rs"))])
             .build();
         expand_message(&mut msg, &mw.fs, DEFAULT_MAX_TOTAL_CHARS).await;
-        assert_eq!(msg.content.len(), 1, "assistant messages must be left alone");
+        assert_eq!(
+            msg.content.len(),
+            1,
+            "assistant messages must be left alone"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -329,7 +350,11 @@ mod tests {
     async fn oversized_files_are_truncated_with_a_notice() {
         let dir = std::env::temp_dir().join(format!("atpath-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/big.rs"), "line\n".repeat(MAX_ATTACHED_LINES + 50)).unwrap();
+        std::fs::write(
+            dir.join("src/big.rs"),
+            "line\n".repeat(MAX_ATTACHED_LINES + 50),
+        )
+        .unwrap();
 
         let mw = middleware(&dir);
         let mut msg = user_msg("@src/big.rs");

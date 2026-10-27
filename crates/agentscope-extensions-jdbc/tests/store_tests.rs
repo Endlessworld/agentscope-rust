@@ -76,12 +76,7 @@ fn put_updates_version_on_overwrite() {
 fn put_if_version_create_new() {
     // Java: JdbcStoreH2Test.putIfVersionCreateNew
     let store = new_store();
-    assert!(store.put_if_version(
-        &ns(&["ns"]),
-        "k",
-        value(&[("v", serde_json::json!(1))]),
-        0
-    ));
+    assert!(store.put_if_version(&ns(&["ns"]), "k", value(&[("v", serde_json::json!(1))]), 0));
     assert_eq!(store.get(&ns(&["ns"]), "k").unwrap().version, 1);
 }
 
@@ -89,18 +84,8 @@ fn put_if_version_create_new() {
 fn put_if_version_create_fails_on_existing() {
     // Java: JdbcStoreH2Test.putIfVersionCreateFailsOnExisting
     let store = new_store();
-    assert!(store.put_if_version(
-        &ns(&["ns"]),
-        "k",
-        value(&[("v", serde_json::json!(1))]),
-        0
-    ));
-    assert!(!store.put_if_version(
-        &ns(&["ns"]),
-        "k",
-        value(&[("v", serde_json::json!(2))]),
-        0
-    ));
+    assert!(store.put_if_version(&ns(&["ns"]), "k", value(&[("v", serde_json::json!(1))]), 0));
+    assert!(!store.put_if_version(&ns(&["ns"]), "k", value(&[("v", serde_json::json!(2))]), 0));
 }
 
 #[test]
@@ -128,12 +113,7 @@ fn put_if_version_stale_fails() {
     store.put(&namespace, "k", value(&[("v", serde_json::json!(1))]));
     store.put(&namespace, "k", value(&[("v", serde_json::json!(2))])); // version now 2
 
-    assert!(!store.put_if_version(
-        &namespace,
-        "k",
-        value(&[("v", serde_json::json!(3))]),
-        1
-    ));
+    assert!(!store.put_if_version(&namespace, "k", value(&[("v", serde_json::json!(3))]), 1));
 }
 
 #[test]
@@ -195,19 +175,9 @@ fn put_if_version_requires_exact_row_count_for_update() {
     let store = new_store();
     let namespace = ns(&["ns"]);
     store.put(&namespace, "k", value(&[("v", serde_json::json!(1))]));
-    assert!(store.put_if_version(
-        &namespace,
-        "k",
-        value(&[("v", serde_json::json!(2))]),
-        1
-    ));
+    assert!(store.put_if_version(&namespace, "k", value(&[("v", serde_json::json!(2))]), 1));
     // The next CAS against version 1 must now fail (row is at version 2).
-    assert!(!store.put_if_version(
-        &namespace,
-        "k",
-        value(&[("v", serde_json::json!(3))]),
-        1
-    ));
+    assert!(!store.put_if_version(&namespace, "k", value(&[("v", serde_json::json!(3))]), 1));
     assert_eq!(
         store.get(&namespace, "k").unwrap().value.get("v"),
         Some(&serde_json::json!(2))
@@ -240,22 +210,13 @@ fn blank_key_is_rejected() {
     // Java: JdbcStore.validateKey rejects null/empty keys.
     let store = new_store();
     assert!(store.get(&ns(&["ns"]), "").is_none());
-    assert!(!store.put_if_version(
-        &ns(&["ns"]),
-        "",
-        value(&[("v", serde_json::json!(1))]),
-        0
-    ));
+    assert!(!store.put_if_version(&ns(&["ns"]), "", value(&[("v", serde_json::json!(1))]), 0));
 }
 
 #[test]
 fn search_with_zero_limit_returns_empty() {
     // Java: JdbcStore.search returns List.of() when limit <= 0.
     let store = new_store();
-    store.put(
-        &ns(&["ns"]),
-        "k",
-        value(&[("v", serde_json::json!(1))]),
-    );
+    store.put(&ns(&["ns"]), "k", value(&[("v", serde_json::json!(1))]));
     assert!(store.search(&ns(&["ns"]), 0, 0).is_empty());
 }

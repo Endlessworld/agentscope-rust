@@ -157,13 +157,21 @@ impl std::fmt::Debug for RedisSnapshotSpec {
 impl RedisSnapshotSpec {
     /// Creates a Redis snapshot spec.
     pub fn new(connection: &RedisConnection, key_prefix: &str, ttl_seconds: Option<i64>) -> Self {
-        let client = Arc::new(RedisRemoteSnapshotClient::new(connection, key_prefix, ttl_seconds));
-        Self { inner: RemoteSnapshotSpec::new(client) }
+        let client = Arc::new(RedisRemoteSnapshotClient::new(
+            connection,
+            key_prefix,
+            ttl_seconds,
+        ));
+        Self {
+            inner: RemoteSnapshotSpec::new(client),
+        }
     }
 
     /// Creates a spec from an already-built [`RedisRemoteSnapshotClient`].
     pub fn from_client(client: Arc<RedisRemoteSnapshotClient>) -> Self {
-        Self { inner: RemoteSnapshotSpec::new(client) }
+        Self {
+            inner: RemoteSnapshotSpec::new(client),
+        }
     }
 }
 
@@ -216,8 +224,15 @@ mod tests {
 
         assert_eq!(client.download("s1").await.unwrap(), payload);
         assert!(client.exists("s1").await.unwrap());
-        assert_eq!(commands.stored_bytes("snap:s1.tar").as_deref(), Some(payload.as_slice()));
-        assert_eq!(commands.expiration_of("snap:s1.tar"), None, "no TTL configured");
+        assert_eq!(
+            commands.stored_bytes("snap:s1.tar").as_deref(),
+            Some(payload.as_slice())
+        );
+        assert_eq!(
+            commands.expiration_of("snap:s1.tar"),
+            None,
+            "no TTL configured"
+        );
     }
 
     #[tokio::test]
@@ -256,7 +271,10 @@ mod tests {
         let (c1, commands) = client(Some(5), "snap:");
         commands.configure(|d| d.fail_set_bytes = true);
         let err = c1.upload("s", b"x").await.unwrap_err();
-        assert!(format!("{err}").contains("Redis snapshot upload failed"), "{err}");
+        assert!(
+            format!("{err}").contains("Redis snapshot upload failed"),
+            "{err}"
+        );
 
         let (c2, commands) = client(Some(5), "snap:");
         commands.configure(|d| {
@@ -264,16 +282,17 @@ mod tests {
             d.fail_expire = true;
         });
         let err = c2.upload("s", b"x").await.unwrap_err();
-        assert!(format!("{err}").contains("Redis snapshot EXPIRE failed"), "{err}");
+        assert!(
+            format!("{err}").contains("Redis snapshot EXPIRE failed"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn spec_builds_snapshots_and_rejects_unsafe_ids() {
         let commands = Arc::new(MemoryRedisCommands::new());
         let client = Arc::new(RedisRemoteSnapshotClient::from_commands(
-            commands,
-            "snap:",
-            None,
+            commands, "snap:", None,
         ));
         let spec = RedisSnapshotSpec::from_client(client);
 
@@ -299,7 +318,10 @@ mod tests {
         let spec = RedisSnapshotSpec::from_client(client);
         let snapshot = spec.build("s9").unwrap();
         snapshot.persist(b"payload").await.unwrap();
-        assert_eq!(commands.stored_bytes("snap:s9.tar").as_deref(), Some(b"payload".as_ref()));
+        assert_eq!(
+            commands.stored_bytes("snap:s9.tar").as_deref(),
+            Some(b"payload".as_ref())
+        );
         assert!(snapshot.is_restorable().await.unwrap());
         assert_eq!(snapshot.restore().await.unwrap(), b"payload");
     }

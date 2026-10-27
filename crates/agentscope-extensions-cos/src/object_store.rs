@@ -88,7 +88,10 @@ impl CosObjectStore for InMemoryCosObjectStore {
     }
 
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.objects.write().await.insert(key.to_string(), data.to_vec());
+        self.objects
+            .write()
+            .await
+            .insert(key.to_string(), data.to_vec());
         Ok(())
     }
 
@@ -130,7 +133,10 @@ mod tests {
         assert_eq!(store.get_string("a/1.txt").await.unwrap().unwrap(), "hello");
         store.put_string("a/2.txt", "world").await.unwrap();
         store.put_string("b/3.txt", "x").await.unwrap();
-        assert_eq!(store.list_prefix("a/").await.unwrap(), vec!["a/1.txt", "a/2.txt"]);
+        assert_eq!(
+            store.list_prefix("a/").await.unwrap(),
+            vec!["a/1.txt", "a/2.txt"]
+        );
         store.delete("a/1.txt").await.unwrap();
         assert!(!store.exists("a/1.txt").await.unwrap());
         assert_eq!(store.len().await, 2);

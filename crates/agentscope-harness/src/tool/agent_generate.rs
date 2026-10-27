@@ -6,11 +6,11 @@
 //! `subagents/` loader picks it up on the next session.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::filesystem::Filesystem;
 use crate::tool::str_arg;
@@ -27,7 +27,10 @@ pub struct AgentGenerateTool {
 
 impl AgentGenerateTool {
     pub fn new(fs: Arc<dyn Filesystem>) -> Self {
-        Self { fs, subagents_dir: SUBAGENTS_DIR.into() }
+        Self {
+            fs,
+            subagents_dir: SUBAGENTS_DIR.into(),
+        }
     }
 
     /// Overrides the directory declarations are written to.
@@ -41,7 +44,13 @@ impl AgentGenerateTool {
             .trim()
             .to_lowercase()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
         let cleaned = cleaned.trim_matches('-').to_string();
         if cleaned.is_empty() {

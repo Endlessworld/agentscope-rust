@@ -59,7 +59,11 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Owning document id (`document_id`).
-    #[serde(default, rename = "document_id", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "document_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub document_id: Option<String>,
     /// Chunk text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,7 +75,11 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<i64>,
     /// Word count (`word_count`).
-    #[serde(default, rename = "word_count", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "word_count",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub word_count: Option<i64>,
     /// Token count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,10 +88,18 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keywords: Option<Vec<String>>,
     /// Index node id (`index_node_id`).
-    #[serde(default, rename = "index_node_id", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "index_node_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub index_node_id: Option<String>,
     /// Index node hash (`index_node_hash`).
-    #[serde(default, rename = "index_node_hash", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "index_node_hash",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub index_node_hash: Option<String>,
     /// Hit count (`hit_count`).
     #[serde(default, rename = "hit_count", skip_serializing_if = "Option::is_none")]
@@ -92,31 +108,59 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Disable timestamp (`disabled_at`).
-    #[serde(default, rename = "disabled_at", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "disabled_at",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disabled_at: Option<i64>,
     /// Who disabled it (`disabled_by`).
-    #[serde(default, rename = "disabled_by", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "disabled_by",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disabled_by: Option<String>,
     /// Indexing status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Creator (`created_by`).
-    #[serde(default, rename = "created_by", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "created_by",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_by: Option<String>,
     /// Creation timestamp (`created_at`).
-    #[serde(default, rename = "created_at", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "created_at",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_at: Option<i64>,
     /// Indexing timestamp (`indexing_at`).
-    #[serde(default, rename = "indexing_at", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "indexing_at",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub indexing_at: Option<i64>,
     /// Completion timestamp (`completed_at`).
-    #[serde(default, rename = "completed_at", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "completed_at",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub completed_at: Option<i64>,
     /// Indexing error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Stop timestamp (`stopped_at`).
-    #[serde(default, rename = "stopped_at", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "stopped_at",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stopped_at: Option<i64>,
     /// Nested document information.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,7 +174,11 @@ pub struct DocumentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Data source type (`data_source_type`).
-    #[serde(default, rename = "data_source_type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "data_source_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub data_source_type: Option<String>,
     /// Document name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,14 +219,20 @@ mod tests {
     fn deserializes_java_shaped_payload_and_ignores_unknowns() {
         let parsed: DifyResponse = serde_json::from_str(SAMPLE).unwrap();
         assert_eq!(parsed.record_count(), 1);
-        assert_eq!(parsed.query.as_ref().unwrap().content.as_deref(), Some("what is rust"));
+        assert_eq!(
+            parsed.query.as_ref().unwrap().content.as_deref(),
+            Some("what is rust")
+        );
 
         let record = &parsed.records.as_ref().unwrap()[0];
         assert_eq!(record.score, Some(0.95));
         let segment = record.segment.as_ref().unwrap();
         assert_eq!(segment.id.as_deref(), Some("seg-1"));
         assert_eq!(segment.document_id.as_deref(), Some("doc-1"));
-        assert_eq!(segment.content.as_deref(), Some("Rust is a systems language."));
+        assert_eq!(
+            segment.content.as_deref(),
+            Some("Rust is a systems language.")
+        );
         assert_eq!(segment.position, Some(1));
         assert_eq!(segment.word_count, Some(42));
         assert_eq!(segment.tokens, Some(7));

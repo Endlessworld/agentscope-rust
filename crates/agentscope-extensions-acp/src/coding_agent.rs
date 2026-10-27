@@ -326,8 +326,8 @@ impl AcpCodingAgent {
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
-        let context = agentscope_core::agent::RuntimeContext::new()
-            .with_session_id(session_id.to_string());
+        let context =
+            agentscope_core::agent::RuntimeContext::new().with_session_id(session_id.to_string());
         match agent.session_log(&context).await {
             Ok(log) => match log.head().await {
                 Ok(head) => head.seq > 0 || head.commit_id.is_some(),

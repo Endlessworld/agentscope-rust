@@ -29,10 +29,7 @@ pub const NONCE_HEADER: &str = "x-lark-request-nonce";
 /// Build the Feishu callback router, sharing the typed channel registry as state.
 pub fn router(registry: Arc<FeishuChannelRegistry>) -> Router {
     Router::new()
-        .route(
-            "/api/channels/feishu/:channel_id/callback",
-            post(callback),
-        )
+        .route("/api/channels/feishu/:channel_id/callback", post(callback))
         .with_state(registry)
 }
 
@@ -78,12 +75,12 @@ mod tests {
     use super::*;
     use agentscope_harness::agent::ChannelConfig;
 
+    use crate::common::testing::{RecordingTransport, StaticTokenProvider};
+    use crate::common::{AccessTokenProvider, BotLoopGuard, IdempotencyStore};
     use crate::feishu::channel::FeishuChannel;
     use crate::feishu::inbound::FeishuInboundMapper;
     use crate::feishu::outbound::FeishuOutboundClient;
     use crate::feishu::properties::FeishuChannelProperties;
-    use crate::common::testing::{RecordingTransport, StaticTokenProvider};
-    use crate::common::{AccessTokenProvider, BotLoopGuard, IdempotencyStore};
 
     async fn registry_with_channel() -> Arc<FeishuChannelRegistry> {
         let props = FeishuChannelProperties::from_json(

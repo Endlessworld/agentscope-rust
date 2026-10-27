@@ -32,8 +32,7 @@ mod tests {
         assert_eq!(eager.schema().defer_loading, None);
 
         // Explicitly deferred schema → reported and preserved by `schema()`.
-        let deferred =
-            SchemaOnlyTool::new(ToolSchema::new("t", "d").defer_loading(Some(true)));
+        let deferred = SchemaOnlyTool::new(ToolSchema::new("t", "d").defer_loading(Some(true)));
         assert!(Tool::defer_loading(&deferred));
         assert_eq!(deferred.schema().defer_loading, Some(true));
 
@@ -64,7 +63,11 @@ impl Tool for SchemaOnlyTool {
         serde_json::to_value(&self.schema.parameters)
             .unwrap_or(serde_json::Value::Object(Default::default()))
     }
-    async fn call(&self, _args: JsonMap, _ctx: super::tool::ToolExecutionContext) -> Result<ToolResultBlock> {
+    async fn call(
+        &self,
+        _args: JsonMap,
+        _ctx: super::tool::ToolExecutionContext,
+    ) -> Result<ToolResultBlock> {
         Err(Error::Tool(format!(
             "Tool '{}' is external and cannot be executed by the framework",
             self.name()

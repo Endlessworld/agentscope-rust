@@ -34,17 +34,28 @@ pub struct FileEntry {
 
 impl Default for FileEntry {
     fn default() -> Self {
-        Self { ephemeral: false, content: String::new(), encoding: default_encoding() }
+        Self {
+            ephemeral: false,
+            content: String::new(),
+            encoding: default_encoding(),
+        }
     }
 }
 
 impl FileEntry {
     pub fn new(content: impl Into<String>) -> Self {
-        Self { content: content.into(), ..Default::default() }
+        Self {
+            content: content.into(),
+            ..Default::default()
+        }
     }
 
     pub fn with_encoding(content: impl Into<String>, encoding: impl Into<String>) -> Self {
-        Self { ephemeral: false, content: content.into(), encoding: encoding.into() }
+        Self {
+            ephemeral: false,
+            content: content.into(),
+            encoding: encoding.into(),
+        }
     }
 
     pub fn ephemeral(mut self) -> Self {
@@ -68,7 +79,10 @@ impl DirEntry {
     }
 
     pub fn with_children(children: BTreeMap<String, WorkspaceEntry>) -> Self {
-        Self { ephemeral: false, children }
+        Self {
+            ephemeral: false,
+            children,
+        }
     }
 
     /// Adds a child entry, returning `self` for chaining.
@@ -89,7 +103,10 @@ pub struct LocalFileEntry {
 
 impl LocalFileEntry {
     pub fn new(source_path: impl Into<String>) -> Self {
-        Self { ephemeral: false, source_path: source_path.into() }
+        Self {
+            ephemeral: false,
+            source_path: source_path.into(),
+        }
     }
 }
 
@@ -104,7 +121,10 @@ pub struct LocalDirEntry {
 
 impl LocalDirEntry {
     pub fn new(source_path: impl Into<String>) -> Self {
-        Self { ephemeral: false, source_path: source_path.into() }
+        Self {
+            ephemeral: false,
+            source_path: source_path.into(),
+        }
     }
 }
 
@@ -127,13 +147,21 @@ fn default_git_ref() -> String {
 
 impl Default for GitRepoEntry {
     fn default() -> Self {
-        Self { ephemeral: false, url: String::new(), reference: default_git_ref() }
+        Self {
+            ephemeral: false,
+            url: String::new(),
+            reference: default_git_ref(),
+        }
     }
 }
 
 impl GitRepoEntry {
     pub fn new(url: impl Into<String>, reference: impl Into<String>) -> Self {
-        Self { ephemeral: false, url: url.into(), reference: reference.into() }
+        Self {
+            ephemeral: false,
+            url: url.into(),
+            reference: reference.into(),
+        }
     }
 }
 
@@ -165,7 +193,11 @@ pub struct BindMountEntry {
 
 impl BindMountEntry {
     pub fn new(host_path: impl Into<String>) -> Self {
-        Self { ephemeral: false, host_path: host_path.into(), read_only: false }
+        Self {
+            ephemeral: false,
+            host_path: host_path.into(),
+            read_only: false,
+        }
     }
 
     pub fn read_only(mut self) -> Self {
@@ -277,7 +309,11 @@ fn default_root() -> String {
 
 impl Default for LayoutSpec {
     fn default() -> Self {
-        Self { root: default_root(), entries: BTreeMap::new(), environment: BTreeMap::new() }
+        Self {
+            root: default_root(),
+            entries: BTreeMap::new(),
+            environment: BTreeMap::new(),
+        }
     }
 }
 
@@ -355,9 +391,17 @@ mod tests {
     fn dir_entry_nests_children() {
         let dir = DirEntry::new()
             .child("a.md", FileEntry::new("a").into())
-            .child("sub", DirEntry::new().child("b.md", FileEntry::new("b").into()).into());
+            .child(
+                "sub",
+                DirEntry::new()
+                    .child("b.md", FileEntry::new("b").into())
+                    .into(),
+            );
         assert_eq!(dir.children.len(), 2);
-        assert!(matches!(dir.children.get("sub"), Some(WorkspaceEntry::Dir(_))));
+        assert!(matches!(
+            dir.children.get("sub"),
+            Some(WorkspaceEntry::Dir(_))
+        ));
     }
 
     #[test]
@@ -404,7 +448,10 @@ mod tests {
         match entry {
             WorkspaceEntry::Dir(d) => {
                 assert_eq!(d.children.len(), 2);
-                assert!(matches!(d.children.get("README.md"), Some(WorkspaceEntry::File(_))));
+                assert!(matches!(
+                    d.children.get("README.md"),
+                    Some(WorkspaceEntry::File(_))
+                ));
             }
             other => panic!("unexpected entry: {other:?}"),
         }

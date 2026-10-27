@@ -90,11 +90,7 @@ mod tests {
             "github",
             ChannelConfig::of("github"),
             props,
-            GitHubOutboundClient::new(
-                "https://api.github.com",
-                "t",
-                transport.clone(),
-            ),
+            GitHubOutboundClient::new("https://api.github.com", "t", transport.clone()),
             GitHubInboundMapper::new("github"),
             Arc::new(GitHubBotIdentityResolver::new(
                 "https://api.github.com",

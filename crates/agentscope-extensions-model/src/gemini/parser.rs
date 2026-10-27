@@ -129,7 +129,9 @@ pub fn blocks_of(response: &GeminiResponse) -> Vec<ContentBlock> {
                 .or_else(|| pending_code_execution_id.clone())
                 .unwrap_or_else(|| format!("code_execution_{}", uuid::Uuid::new_v4().simple()));
             let state = match exec.outcome.as_deref() {
-                Some("OUTCOME_FAILED") | Some("OUTCOME_DEADLINE_EXCEEDED") => ToolResultState::Error,
+                Some("OUTCOME_FAILED") | Some("OUTCOME_DEADLINE_EXCEEDED") => {
+                    ToolResultState::Error
+                }
                 _ => ToolResultState::Success,
             };
             let mut metadata = JsonMap::new();
@@ -138,7 +140,11 @@ pub fn blocks_of(response: &GeminiResponse) -> Vec<ContentBlock> {
                 ToolResultBlock::METADATA_SERVER_TOOL,
                 serde_json::json!(true),
             );
-            insert_metadata(&mut metadata, METADATA_CODE_EXECUTION, serde_json::json!(true));
+            insert_metadata(
+                &mut metadata,
+                METADATA_CODE_EXECUTION,
+                serde_json::json!(true),
+            );
             if let Ok(raw) = serde_json::to_value(exec) {
                 insert_metadata(&mut metadata, METADATA_CODE_EXECUTION_RESULT, raw);
             }
@@ -358,7 +364,11 @@ impl GeminiStreamIncrementer {
         if self.tool_calls.is_empty() && self.usage.is_none() && self.finish_reason.is_none() {
             return None;
         }
-        let content = self.tool_calls.into_iter().map(ContentBlock::ToolUse).collect();
+        let content = self
+            .tool_calls
+            .into_iter()
+            .map(ContentBlock::ToolUse)
+            .collect();
         Some(ChatResponse::new(
             self.id.unwrap_or_default(),
             content,
@@ -406,7 +416,9 @@ mod tests {
         assert_eq!(parsed.usage.output_tokens, 6);
         assert_eq!(parsed.usage.cached_tokens, 3);
         assert_eq!(parsed.finish_reason.as_deref(), Some("STOP"));
-        assert!(matches!(&parsed.content[0], ContentBlock::Thinking(t) if t.thinking == "reasoning"));
+        assert!(
+            matches!(&parsed.content[0], ContentBlock::Thinking(t) if t.thinking == "reasoning")
+        );
         assert!(matches!(&parsed.content[1], ContentBlock::Text(t) if t.text == "answer"));
         match &parsed.content[2] {
             ContentBlock::ToolUse(t) => {
@@ -416,7 +428,10 @@ mod tests {
             }
             other => panic!("expected tool use, got {other:?}"),
         }
-        assert_eq!(parsed.metadata.get("modelVersion"), Some(&serde_json::json!("gemini-2.5-flash")));
+        assert_eq!(
+            parsed.metadata.get("modelVersion"),
+            Some(&serde_json::json!("gemini-2.5-flash"))
+        );
     }
 
     #[test]
@@ -569,7 +584,9 @@ mod tests {
         let first = inc.accumulate(&a).unwrap();
         assert_eq!(first.id, "resp_9");
         assert!(matches!(&first.content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&inc.accumulate(&b).unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         // The tool-call chunk carries no incremental text.
         assert!(inc.accumulate(&c).is_none());
 

@@ -155,7 +155,9 @@ impl RedisAgentStateStore {
 
         match result {
             Some(v) if v >= 0 => Ok(v as u64),
-            _ => Err(Error::Other(format!("Version conflict saving state: {key}"))),
+            _ => Err(Error::Other(format!(
+                "Version conflict saving state: {key}"
+            ))),
         }
     }
 
@@ -172,12 +174,18 @@ impl RedisAgentStateStore {
 
         let json = self.client.get(&redis_key).await?;
         let Some(json) = json else {
-            return Ok(VersionedState { value: None, version: 0 });
+            return Ok(VersionedState {
+                value: None,
+                version: 0,
+            });
         };
         let version_str = self.client.get(&version_key).await?;
         let version = version_support::parse_version(true, version_str.as_deref());
         let value = serde_json::from_str(&json)?;
-        Ok(VersionedState { value: Some(value), version })
+        Ok(VersionedState {
+            value: Some(value),
+            version,
+        })
     }
 
     /// Conditional save (compare-and-swap), mirroring Java `saveIfVersion`.
@@ -233,13 +241,7 @@ impl RedisAgentStateStore {
 
 #[async_trait]
 impl AgentStateStore for RedisAgentStateStore {
-    async fn save(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-        key: &str,
-        value: Value,
-    ) {
+    async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: Value) {
         if let Err(e) = self
             .save_versioned(user_id, session_id, key, &value, UNCONDITIONAL_EXPECTED)
             .await
@@ -296,7 +298,12 @@ impl AgentStateStore for RedisAgentStateStore {
         };
         let keys_key = layout.keys_key();
         match self.client.key_exists(&keys_key).await {
-            Ok(true) => self.client.get_set_size(&keys_key).await.map(|n| n > 0).unwrap_or(false),
+            Ok(true) => self
+                .client
+                .get_set_size(&keys_key)
+                .await
+                .map(|n| n > 0)
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -386,8 +393,10 @@ impl AgentStateStore for RedisAgentStateStore {
         } else {
             expected_version as u64
         };
-        match RedisAgentStateStore::save_if_version(self, user_id, session_id, key, &value, expected)
-            .await
+        match RedisAgentStateStore::save_if_version(
+            self, user_id, session_id, key, &value, expected,
+        )
+        .await
         {
             Ok(0) => agentscope_core::state::UNVERSIONED,
             Ok(v) => i64::try_from(v).unwrap_or(i64::MAX),
@@ -427,7 +436,9 @@ impl RedisAgentStateStore {
         }
 
         self.client.set(&hash_key, &current_hash).await?;
-        self.client.add_to_set(&keys_key, &layout.list_track_key(key)).await?;
+        self.client
+            .add_to_set(&keys_key, &layout.list_track_key(key))
+            .await?;
         Ok(())
     }
 
@@ -581,7 +592,10 @@ mod tests {
     #[test]
     fn builder_uses_default_prefix_and_reports_versioning() {
         let adapter = Arc::new(MemoryRedisAdapter::new());
-        let store = RedisAgentStateStore::builder().client(adapter).build().unwrap();
+        let store = RedisAgentStateStore::builder()
+            .client(adapter)
+            .build()
+            .unwrap();
         assert_eq!(store.key_prefix(), DEFAULT_KEY_PREFIX);
         assert!(store.supports_versioning());
         assert_eq!(DEFAULT_KEY_PREFIX, "agentscope:session:");
@@ -606,10 +620,22 @@ mod tests {
         let (store, adapter) = store();
         store.save(Some("u1"), "s1", "k", json!({"n": 1})).await;
 
-        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!({"n": 1})));
-        assert_eq!(adapter.string_of("t:session:u1/s1:k"), Some(r#"{"n":1}"#.to_string()));
-        assert_eq!(adapter.string_of("t:session:u1/s1:k:ver"), Some("1".to_string()));
-        assert_eq!(adapter.set_members("t:session:u1/s1:_keys"), vec!["k".to_string()]);
+        assert_eq!(
+            store.get(Some("u1"), "s1", "k").await,
+            Some(json!({"n": 1}))
+        );
+        assert_eq!(
+            adapter.string_of("t:session:u1/s1:k"),
+            Some(r#"{"n":1}"#.to_string())
+        );
+        assert_eq!(
+            adapter.string_of("t:session:u1/s1:k:ver"),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            adapter.set_members("t:session:u1/s1:_keys"),
+            vec!["k".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -618,7 +644,10 @@ mod tests {
         store.save(Some("u1"), "s1", "k", json!(1)).await;
         store.save(Some("u1"), "s1", "k", json!(2)).await;
         assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
-        assert_eq!(adapter.string_of("t:session:u1/s1:k:ver"), Some("2".to_string()));
+        assert_eq!(
+            adapter.string_of("t:session:u1/s1:k:ver"),
+            Some("2".to_string())
+        );
         assert_eq!(adapter.eval_calls(), 2);
     }
 
@@ -647,7 +676,11 @@ mod tests {
     #[test]
     fn builder_records_the_configured_layout_version() {
         let (v0, _) = store();
-        assert_eq!(v0.key_layout_version(), KeyLayoutVersion::V0, "V0 is the default");
+        assert_eq!(
+            v0.key_layout_version(),
+            KeyLayoutVersion::V0,
+            "V0 is the default"
+        );
         let (v1, _) = v1_store();
         assert_eq!(v1.key_layout_version(), KeyLayoutVersion::V1);
     }
@@ -669,23 +702,42 @@ mod tests {
     #[tokio::test]
     async fn v1_save_writes_every_key_under_the_same_hash_tag() {
         let (store, adapter) = v1_store();
-        store.save(Some("u1"), "s1", "agent_state", json!({"n": 1})).await;
-        store.save_list(Some("u1"), "s1", "messages", &[json!("m")]).await;
+        store
+            .save(Some("u1"), "s1", "agent_state", json!({"n": 1}))
+            .await;
+        store
+            .save_list(Some("u1"), "s1", "messages", &[json!("m")])
+            .await;
 
-        assert_eq!(store.get(Some("u1"), "s1", "agent_state").await, Some(json!({"n": 1})));
-        assert_eq!(adapter.string_of("t:session:{u1/s1}:agent_state"), Some(r#"{"n":1}"#.to_string()));
-        assert_eq!(adapter.string_of("t:session:{u1/s1}:agent_state:ver"), Some("1".to_string()));
+        assert_eq!(
+            store.get(Some("u1"), "s1", "agent_state").await,
+            Some(json!({"n": 1}))
+        );
+        assert_eq!(
+            adapter.string_of("t:session:{u1/s1}:agent_state"),
+            Some(r#"{"n":1}"#.to_string())
+        );
+        assert_eq!(
+            adapter.string_of("t:session:{u1/s1}:agent_state:ver"),
+            Some("1".to_string())
+        );
         assert_eq!(
             adapter.string_of("t:session:{u1/s1}:messages:list:_hash"),
             Some(compute_hash(&[json!("m")]))
         );
-        assert_eq!(adapter.list("t:session:{u1/s1}:messages:list"), vec![r#""m""#.to_string()]);
+        assert_eq!(
+            adapter.list("t:session:{u1/s1}:messages:list"),
+            vec![r#""m""#.to_string()]
+        );
         assert_eq!(
             adapter.set_members("t:session:{u1/s1}:_keys"),
             vec!["agent_state".to_string(), "messages:list".to_string()]
         );
         assert!(
-            adapter.all_keys().iter().all(|k| k.starts_with("t:session:{u1/s1}")),
+            adapter
+                .all_keys()
+                .iter()
+                .all(|k| k.starts_with("t:session:{u1/s1}")),
             "every key of one session shares the hash tag: {:?}",
             adapter.all_keys()
         );
@@ -698,7 +750,10 @@ mod tests {
         let version = store.get_versioned(Some("u1"), "s1", "k").await.unwrap();
         assert_eq!(version.version, 1);
         assert_eq!(
-            store.save_if_version(Some("u1"), "s1", "k", &json!(2), version.version).await.unwrap(),
+            store
+                .save_if_version(Some("u1"), "s1", "k", &json!(2), version.version)
+                .await
+                .unwrap(),
             2
         );
         assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(2)));
@@ -715,7 +770,9 @@ mod tests {
             "t:session:{u1/s1}:k:ver",
             "t:session:{u1/s1}:_keys",
         ];
-        assert!(keys.iter().all(|k| adapter.string_of(k).is_some() || adapter.set_members(k).len() == 1));
+        assert!(keys
+            .iter()
+            .all(|k| adapter.string_of(k).is_some() || adapter.set_members(k).len() == 1));
         assert!(keys.iter().all(|k| tag(k) == "u1/s1"), "{keys:?}");
     }
 
@@ -738,7 +795,10 @@ mod tests {
         store.save(Some("u1"), "alpha", "k", json!(1)).await;
         store.save(Some("u2"), "gamma", "k", json!(1)).await;
 
-        assert_eq!(store.list_session_ids(Some("u1")).await, vec!["alpha", "beta"]);
+        assert_eq!(
+            store.list_session_ids(Some("u1")).await,
+            vec!["alpha", "beta"]
+        );
         assert_eq!(store.list_session_ids(Some("u2")).await, vec!["gamma"]);
         assert!(store.list_session_ids(Some("u3")).await.is_empty());
     }
@@ -765,11 +825,18 @@ mod tests {
     async fn v1_rejects_unsafe_identifiers_before_redis_io() {
         let (store, adapter) = v1_store();
 
-        assert!(store.get_versioned(Some("bad/user"), "s1", "k").await.is_err());
+        assert!(store
+            .get_versioned(Some("bad/user"), "s1", "k")
+            .await
+            .is_err());
         store.get(Some("bad{user"), "s1", "k").await;
         store.save(Some("bad}user"), "s1", "k", json!(1)).await;
-        store.save_list(Some("u1"), "bad/session", "k", &[json!(1)]).await;
-        store.save_list(Some("u1"), "bad{session", "k", &[json!(1)]).await;
+        store
+            .save_list(Some("u1"), "bad/session", "k", &[json!(1)])
+            .await;
+        store
+            .save_list(Some("u1"), "bad{session", "k", &[json!(1)])
+            .await;
         store.delete(Some("bad/user"), "s1").await;
         assert!(store.list_session_ids(Some("bad/user")).await.is_empty());
 
@@ -788,7 +855,10 @@ mod tests {
 
         store.delete(Some("u1"), "s1").await;
 
-        assert!(adapter.delete_calls() >= 4, "each tracked key is deleted on its own");
+        assert!(
+            adapter.delete_calls() >= 4,
+            "each tracked key is deleted on its own"
+        );
         assert_eq!(adapter.max_delete_batch(), 1, "never a multi-key DEL");
         assert!(adapter.all_keys().is_empty());
     }
@@ -818,7 +888,10 @@ mod tests {
         assert!(!store.exists(Some("u1"), "s1").await);
         store.save(Some("u1"), "s1", "k", json!(1)).await;
         assert!(store.exists(Some("u1"), "s1").await);
-        assert!(!store.exists(Some("u1"), "other").await, "per-slot tracking");
+        assert!(
+            !store.exists(Some("u1"), "other").await,
+            "per-slot tracking"
+        );
         assert!(!store.exists(Some("u1"), "  ").await, "blank session");
     }
 
@@ -826,7 +899,9 @@ mod tests {
     async fn delete_removes_payload_version_and_tracking() {
         let (store, adapter) = store();
         store.save(Some("u1"), "s1", "k", json!(1)).await;
-        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
 
         store.delete(Some("u1"), "s1").await;
 
@@ -853,13 +928,27 @@ mod tests {
     #[tokio::test]
     async fn save_list_writes_items_hash_and_tracking() {
         let (store, adapter) = store();
-        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
 
-        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(1), json!(2)]);
-        assert_eq!(adapter.list("t:session:u1/s1:l:list"), vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(
+            store.get_list(Some("u1"), "s1", "l").await,
+            vec![json!(1), json!(2)]
+        );
+        assert_eq!(
+            adapter.list("t:session:u1/s1:l:list"),
+            vec!["1".to_string(), "2".to_string()]
+        );
         let expected_hash = compute_hash(&[json!(1), json!(2)]);
-        assert_eq!(adapter.string_of("t:session:u1/s1:l:list:_hash"), Some(expected_hash));
-        assert_eq!(adapter.set_members("t:session:u1/s1:_keys"), vec!["l:list".to_string()]);
+        assert_eq!(
+            adapter.string_of("t:session:u1/s1:l:list:_hash"),
+            Some(expected_hash)
+        );
+        assert_eq!(
+            adapter.set_members("t:session:u1/s1:_keys"),
+            vec!["l:list".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -867,7 +956,9 @@ mod tests {
         // core Case 3: an absent hash with no existing data means "no rewrite", so the
         // very first write is a pure append (no DEL + full re-push).
         let (store, adapter) = store();
-        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
         assert_eq!(adapter.delete_calls(), 0, "no full rewrite on a fresh slot");
         assert_eq!(adapter.push_calls(), 2, "exactly one RPUSH per item");
     }
@@ -889,7 +980,9 @@ mod tests {
     #[tokio::test]
     async fn save_list_append_only_pushes_the_suffix() {
         let (store, adapter) = store();
-        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
         store
             .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2), json!(3)])
             .await;
@@ -905,15 +998,30 @@ mod tests {
     #[tokio::test]
     async fn save_list_prefix_rewrite_triggers_full_rewrite() {
         let (store, adapter) = store();
-        store.save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
         let pushes_before = adapter.push_calls();
 
         // Same length, different first element: the prefix hash changes -> full rewrite.
-        store.save_list(Some("u1"), "s1", "l", &[json!(9), json!(2)]).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(9), json!(2)])
+            .await;
 
-        assert_eq!(adapter.delete_calls(), 1, "list key deleted before rewriting");
-        assert_eq!(adapter.push_calls(), pushes_before + 2, "whole list re-pushed");
-        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(9), json!(2)]);
+        assert_eq!(
+            adapter.delete_calls(),
+            1,
+            "list key deleted before rewriting"
+        );
+        assert_eq!(
+            adapter.push_calls(),
+            pushes_before + 2,
+            "whole list re-pushed"
+        );
+        assert_eq!(
+            store.get_list(Some("u1"), "s1", "l").await,
+            vec![json!(9), json!(2)]
+        );
     }
 
     #[tokio::test]
@@ -927,7 +1035,11 @@ mod tests {
         store.save_list(Some("u1"), "s1", "l", &[json!(1)]).await;
 
         assert_eq!(adapter.delete_calls(), 1);
-        assert_eq!(adapter.push_calls(), pushes_before + 1, "only the surviving item");
+        assert_eq!(
+            adapter.push_calls(),
+            pushes_before + 1,
+            "only the surviving item"
+        );
         assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(1)]);
     }
 
@@ -939,7 +1051,11 @@ mod tests {
 
         store.save_list(Some("u1"), "s1", "l", &[json!(7)]).await;
 
-        assert_eq!(adapter.delete_calls(), 1, "legacy data is replaced wholesale");
+        assert_eq!(
+            adapter.delete_calls(),
+            1,
+            "legacy data is replaced wholesale"
+        );
         assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(7)]);
     }
 
@@ -947,7 +1063,10 @@ mod tests {
     async fn save_list_empty_values_writes_empty_hash_constant() {
         let (store, adapter) = store();
         store.save_list(Some("u1"), "s1", "l", &[]).await;
-        assert_eq!(adapter.string_of("t:session:u1/s1:l:list:_hash"), Some(EMPTY_HASH.to_string()));
+        assert_eq!(
+            adapter.string_of("t:session:u1/s1:l:list:_hash"),
+            Some(EMPTY_HASH.to_string())
+        );
         assert!(store.get_list(Some("u1"), "s1", "l").await.is_empty());
     }
 
@@ -955,7 +1074,10 @@ mod tests {
     async fn get_list_skips_corrupt_items() {
         let (store, adapter) = store();
         adapter.seed_list("t:session:u1/s1:l:list", &["1", "{bad", "2"]);
-        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(1), json!(2)]);
+        assert_eq!(
+            store.get_list(Some("u1"), "s1", "l").await,
+            vec![json!(1), json!(2)]
+        );
         assert!(store.get_list(Some("u1"), "  ", "l").await.is_empty());
     }
 
@@ -980,7 +1102,13 @@ mod tests {
     async fn get_versioned_missing_key_is_zero() {
         let (store, _adapter) = store();
         let versioned = store.get_versioned(Some("u1"), "s1", "k").await.unwrap();
-        assert_eq!(versioned, VersionedState { value: None, version: 0 });
+        assert_eq!(
+            versioned,
+            VersionedState {
+                value: None,
+                version: 0
+            }
+        );
     }
 
     #[tokio::test]
@@ -999,12 +1127,18 @@ mod tests {
         let (store, _adapter) = store();
         // Core contract: 0 == create-if-absent (mirrors Java `saveIfVersion(..., 0)`).
         assert_eq!(
-            store.save_if_version(Some("u1"), "s1", "k", &json!(1), 0).await.unwrap(),
+            store
+                .save_if_version(Some("u1"), "s1", "k", &json!(1), 0)
+                .await
+                .unwrap(),
             1
         );
         // The key now exists at version 1, so another 0-expectation is a conflict.
         assert_eq!(
-            store.save_if_version(Some("u1"), "s1", "k", &json!(2), 0).await.unwrap(),
+            store
+                .save_if_version(Some("u1"), "s1", "k", &json!(2), 0)
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(1)));
@@ -1064,7 +1198,10 @@ mod tests {
         store.save(Some("u1"), "alpha", "k", json!(1)).await;
         store.save(Some("u2"), "gamma", "k", json!(1)).await;
 
-        assert_eq!(store.list_session_ids(Some("u1")).await, vec!["alpha", "beta"]);
+        assert_eq!(
+            store.list_session_ids(Some("u1")).await,
+            vec!["alpha", "beta"]
+        );
         assert_eq!(store.list_session_ids(Some("u2")).await, vec!["gamma"]);
         assert!(store.list_session_ids(Some("u3")).await.is_empty());
     }
@@ -1074,7 +1211,10 @@ mod tests {
         let (store, _adapter) = store();
         store.save(None, "anon-session", "k", json!(1)).await;
         assert_eq!(store.list_session_ids(None).await, vec!["anon-session"]);
-        assert_eq!(store.list_session_ids(Some("  ")).await, vec!["anon-session"]);
+        assert_eq!(
+            store.list_session_ids(Some("  ")).await,
+            vec!["anon-session"]
+        );
     }
 
     #[tokio::test]

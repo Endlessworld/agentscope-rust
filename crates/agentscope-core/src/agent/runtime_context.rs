@@ -42,11 +42,7 @@ impl Extensions {
     }
 
     /// Inserts an already-shared value, so callers that hold an `Arc` keep ownership.
-    pub fn insert_arc<T: Any + Send + Sync>(
-        &mut self,
-        key: &'static str,
-        value: Arc<T>,
-    ) {
+    pub fn insert_arc<T: Any + Send + Sync>(&mut self, key: &'static str, value: Arc<T>) {
         Arc::make_mut(&mut self.values).insert(key, value as Arc<dyn Any + Send + Sync>);
     }
 
@@ -181,7 +177,9 @@ pub struct RuntimeContext {
     /// Optional sender used to forward fine-grained delta events (text/thinking)
     /// from deep inside the model call up to the agent-level event stream, enabling
     /// incremental (token-by-token) rendering.
-    pub delta_tx: Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<crate::event::AgentEvent>>>,
+    pub delta_tx: Option<
+        futures::channel::mpsc::UnboundedSender<crate::error::Result<crate::event::AgentEvent>>,
+    >,
     /// Shared per-agent state handle, exposed so context-managing middlewares
     /// (e.g. conversation compaction) can read and rewrite the accumulated
     /// history across calls. `None` for ad-hoc contexts (tool calls, tests).
@@ -266,11 +264,7 @@ impl RuntimeContext {
     }
 
     /// Inserts an already-shared execution-scoped service.
-    pub fn set_extension_arc<T: Any + Send + Sync>(
-        &mut self,
-        key: &'static str,
-        value: Arc<T>,
-    ) {
+    pub fn set_extension_arc<T: Any + Send + Sync>(&mut self, key: &'static str, value: Arc<T>) {
         self.extensions.insert_arc(key, value);
     }
 
@@ -368,7 +362,10 @@ mod tests {
         for input in ["", "   ", "\t\n", "///", "\\\\", "\0", "...", "..../...."] {
             let normalized = normalize_agent_id(input);
             assert!(!normalized.is_empty(), "empty result for {input:?}");
-            assert_eq!(normalized, DEFAULT_AGENT_ID, "expected fallback for {input:?}");
+            assert_eq!(
+                normalized, DEFAULT_AGENT_ID,
+                "expected fallback for {input:?}"
+            );
             assert!(!normalized.contains('/'), "separator leaked for {input:?}");
         }
         // A dot-only id would be a traversal segment, so it falls back as well.

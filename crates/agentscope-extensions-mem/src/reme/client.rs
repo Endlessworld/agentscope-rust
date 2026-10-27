@@ -46,8 +46,14 @@ impl ReMeClient {
         api_base_url: impl Into<String>,
     ) -> Self {
         let api_base_url = api_base_url.into();
-        let api_base_url = api_base_url.strip_suffix('/').unwrap_or(&api_base_url).to_string();
-        Self { transport, api_base_url }
+        let api_base_url = api_base_url
+            .strip_suffix('/')
+            .unwrap_or(&api_base_url)
+            .to_string();
+        Self {
+            transport,
+            api_base_url,
+        }
     }
 
     /// The configured base URL.
@@ -61,7 +67,10 @@ impl ReMeClient {
 
     async fn post(&self, endpoint: &str, body: &str) -> Result<String> {
         let url = format!("{}{}", self.api_base_url, endpoint);
-        let raw = self.transport.post_json(&url, &Self::headers(), body).await?;
+        let raw = self
+            .transport
+            .post_json(&url, &Self::headers(), body)
+            .await?;
         // Java returns an empty response object for null/blank bodies.
         if raw.trim().is_empty() {
             return Ok("{}".to_string());

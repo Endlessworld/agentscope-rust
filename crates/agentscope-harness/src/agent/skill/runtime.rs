@@ -114,8 +114,9 @@ mod tests {
             .source("workspace")
             .description("d")
             .build();
-        SkillCatalog::of(vec![HarnessSkillEntry::new(skill)
-            .with_files_root("/workspace/skills/data")])
+        SkillCatalog::of(vec![
+            HarnessSkillEntry::new(skill).with_files_root("/workspace/skills/data")
+        ])
     }
 
     #[test]
@@ -132,7 +133,10 @@ mod tests {
     fn snapshot_captures_ids_and_files_roots() {
         let snapshot = SkillCatalogSnapshot::from_catalog(&catalog());
         assert_eq!(snapshot.ids, vec!["data_workspace".to_string()]);
-        assert_eq!(snapshot.files_root("data_workspace"), Some("/workspace/skills/data"));
+        assert_eq!(
+            snapshot.files_root("data_workspace"),
+            Some("/workspace/skills/data")
+        );
         assert!(snapshot.contains("data_workspace"));
         assert!(!snapshot.contains("other"));
     }
@@ -169,7 +173,10 @@ mod tests {
         rt.prepare_toolkit(&toolkit, &snapshot);
         let names = toolkit.tool_names();
         assert_eq!(
-            names.iter().filter(|n| n.as_str() == LoadSkillTool::TOOL_NAME).count(),
+            names
+                .iter()
+                .filter(|n| n.as_str() == LoadSkillTool::TOOL_NAME)
+                .count(),
             1
         );
     }

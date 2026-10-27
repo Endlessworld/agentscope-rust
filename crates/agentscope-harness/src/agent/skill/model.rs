@@ -94,7 +94,9 @@ impl AgentSkillBuilder {
         self
     }
     pub fn add_metadata(mut self, k: impl Into<String>, v: Value) -> Self {
-        self.metadata.get_or_insert_with(Metadata::new).insert(k.into(), v);
+        self.metadata
+            .get_or_insert_with(Metadata::new)
+            .insert(k.into(), v);
         self
     }
     pub fn resources(mut self, v: SkillResources) -> Self {
@@ -102,7 +104,9 @@ impl AgentSkillBuilder {
         self
     }
     pub fn add_resource(mut self, path: impl Into<String>, content: impl Into<String>) -> Self {
-        self.resources.get_or_insert_with(SkillResources::new).insert(path.into(), content.into());
+        self.resources
+            .get_or_insert_with(SkillResources::new)
+            .insert(path.into(), content.into());
         self
     }
     pub fn build(self) -> AgentSkill {
@@ -181,7 +185,9 @@ impl SkillFilter {
     pub fn is_overlay(&self) -> bool {
         matches!(
             self,
-            SkillFilter::OverlayEnable(_) | SkillFilter::OverlayDisable(_) | SkillFilter::Merged { .. }
+            SkillFilter::OverlayEnable(_)
+                | SkillFilter::OverlayDisable(_)
+                | SkillFilter::Merged { .. }
         )
     }
 
@@ -211,7 +217,10 @@ pub struct HarnessSkillEntry {
 
 impl HarnessSkillEntry {
     pub fn new(skill: AgentSkill) -> Self {
-        Self { skill, files_root: None }
+        Self {
+            skill,
+            files_root: None,
+        }
     }
 
     pub fn with_files_root(mut self, root: impl Into<String>) -> Self {
@@ -240,12 +249,16 @@ impl SkillCatalog {
     }
 
     pub fn of(ordered_entries: Vec<HarnessSkillEntry>) -> Self {
-        Self { entries: ordered_entries }
+        Self {
+            entries: ordered_entries,
+        }
     }
 
     /// Lookup by `skillId` (`name_source`).
     pub fn get(&self, skill_id: &str) -> Option<&HarnessSkillEntry> {
-        self.entries.iter().find(|e| e.skill().skill_id() == skill_id)
+        self.entries
+            .iter()
+            .find(|e| e.skill().skill_id() == skill_id)
     }
 
     pub fn all(&self) -> &[HarnessSkillEntry] {
@@ -287,7 +300,8 @@ impl SkillCatalogSnapshot {
             .all()
             .iter()
             .filter_map(|e| {
-                e.files_root().map(|root| (e.skill().skill_id(), root.to_string()))
+                e.files_root()
+                    .map(|root| (e.skill().skill_id(), root.to_string()))
             })
             .collect();
         Self { ids, files_roots }
@@ -319,7 +333,11 @@ mod tests {
     use super::*;
 
     fn skill(name: &str) -> AgentSkill {
-        AgentSkill::builder().name(name).source("workspace").description("d").build()
+        AgentSkill::builder()
+            .name(name)
+            .source("workspace")
+            .description("d")
+            .build()
     }
 
     #[test]

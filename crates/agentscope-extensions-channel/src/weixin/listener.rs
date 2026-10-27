@@ -57,10 +57,7 @@ impl RecordingWeixinRuntimeListener {
 
     /// The recorded `"<event>:<account>"` strings, in order.
     pub fn events(&self) -> Vec<String> {
-        self.events
-            .lock()
-            .expect("listener mutex poisoned")
-            .clone()
+        self.events.lock().expect("listener mutex poisoned").clone()
     }
 
     fn record(&self, event: &str, account_id: &str) {

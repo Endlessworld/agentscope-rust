@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 
 use crate::bailian::config::BailianConfig;
 use crate::bailian::model::{RetrieveRequest, RetrieveResponseBody};
-use crate::bailian::request::build_retrieve_request;
 use crate::bailian::query_history::QueryHistoryEntry;
+use crate::bailian::request::build_retrieve_request;
 use crate::bailian::signing::{
     api_date, build_authorization, hashed_payload, resolve_region, short_date, SignInput,
     API_ACTION, API_VERSION,
@@ -83,11 +83,12 @@ impl BailianClient {
         let hashed = hashed_payload(&body);
         let date = api_date(now);
         let compact_date = short_date(&date);
-        let region = resolve_region(
-            crate::bailian::signing::PRODUCT,
-            &self.config.endpoint,
+        let region = resolve_region(crate::bailian::signing::PRODUCT, &self.config.endpoint);
+        let path = format!(
+            "/{}{}",
+            request_path_segment(&self.config.workspace_id),
+            super::RETRIEVE_PATH
         );
-        let path = format!("/{}{}", request_path_segment(&self.config.workspace_id), super::RETRIEVE_PATH);
 
         // Lowercase names so the signed material and the emitted headers cannot diverge.
         let headers: Vec<(String, String)> = vec![
@@ -151,14 +152,10 @@ impl BailianClient {
             ));
         }
 
-        let body = build_retrieve_request(
-            &self.config,
-            index_id,
-            query,
-            limit,
-            conversation_history,
-        );
-        let http_request = self.build_retrieve_http_request(&body, Utc::now(), &generate_nonce())?;
+        let body =
+            build_retrieve_request(&self.config, index_id, query, limit, conversation_history);
+        let http_request =
+            self.build_retrieve_http_request(&body, Utc::now(), &generate_nonce())?;
 
         let response = self.transport.execute(http_request).await?;
         if !response.is_success() {
@@ -170,10 +167,8 @@ impl BailianClient {
 
         // The SDK reacted to a null body by logging a warning; an empty body is treated as an
         // empty envelope here, matching `parse_json_or_default` used by the sibling backends.
-        let parsed: RetrieveResponseBody = crate::transport::parse_json_or_default(
-            &response.body,
-            "Bailian retrieve",
-        )?;
+        let parsed: RetrieveResponseBody =
+            crate::transport::parse_json_or_default(&response.body, "Bailian retrieve")?;
 
         if parsed.data.is_none() {
             tracing::warn!(
@@ -194,10 +189,10 @@ impl BailianClient {
     }
 }
 
-    /// Percent-encoded workspace-id path segment (SDK `getEncodeParam`).
-    fn request_path_segment(workspace_id: &str) -> String {
-        crate::bailian::signing::percent_encode(workspace_id)
-    }
+/// Percent-encoded workspace-id path segment (SDK `getEncodeParam`).
+fn request_path_segment(workspace_id: &str) -> String {
+    crate::bailian::signing::percent_encode(workspace_id)
+}
 
 /// Generates a fresh `x-acs-signature-nonce`.
 ///
@@ -310,7 +305,10 @@ mod tests {
             .unwrap();
 
         // Body is serialized with the SDK's camelCase keys.
-        assert_eq!(request.body.as_deref(), Some(r#"{"indexId":"idx-1","query":"hello"}"#));
+        assert_eq!(
+            request.body.as_deref(),
+            Some(r#"{"indexId":"idx-1","query":"hello"}"#)
+        );
         assert_eq!(
             request.header("x-acs-content-sha256"),
             Some("9586b1cc0697f446ec91d6e171c8fde14dd3f0b194ae571d11f17ca6e2086d13")
@@ -431,13 +429,25 @@ mod tests {
 
         let auth = client.retrieve("idx-1", "q", None, None).await.unwrap_err();
         assert!(
-            matches!(auth, RagError::Auth { status_code: 403, .. }),
+            matches!(
+                auth,
+                RagError::Auth {
+                    status_code: 403,
+                    ..
+                }
+            ),
             "{auth:?}"
         );
 
         let api = client.retrieve("idx-1", "q", None, None).await.unwrap_err();
         assert!(
-            matches!(api, RagError::Api { status_code: 500, .. }),
+            matches!(
+                api,
+                RagError::Api {
+                    status_code: 500,
+                    ..
+                }
+            ),
             "{api:?}"
         );
     }
@@ -456,7 +466,9 @@ mod tests {
         let a = super::generate_nonce();
         let b = super::generate_nonce();
         assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b, "nonces must differ between requests");
     }
 }

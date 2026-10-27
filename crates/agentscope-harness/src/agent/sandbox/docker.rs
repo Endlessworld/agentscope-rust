@@ -4,7 +4,6 @@
 //! Commands run through the `docker` CLI, like the Java reference: comparable line by
 //! line and dependency-free (see `history/adr.md`, B1).
 
-
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -187,7 +186,11 @@ impl DockerSandbox {
             .filter(|dir| !dir.trim().is_empty())
             .map(|dir| workspace_path(&root, dir))
             .collect();
-        if let Some(cwd) = spec.working_directory.as_deref().filter(|d| !d.trim().is_empty()) {
+        if let Some(cwd) = spec
+            .working_directory
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+        {
             dirs.push(workspace_path(&root, cwd));
         }
         if !dirs.is_empty() {
@@ -257,7 +260,11 @@ impl DockerSandbox {
     /// a stopped one is restarted, and a missing/unknown one is replaced by a new container
     /// that forces a full workspace re-initialization.
     async fn ensure_container_running(&mut self) -> Result<()> {
-        let container_id = self.docker().container_id.clone().filter(|id| !id.is_empty());
+        let container_id = self
+            .docker()
+            .container_id
+            .clone()
+            .filter(|id| !id.is_empty());
         if let Some(container_id) = container_id {
             match inspect_container_state(&container_id).await {
                 ContainerState::Running => {
@@ -273,7 +280,9 @@ impl DockerSandbox {
                     .await;
                 }
                 ContainerState::Unknown => {
-                    warn!("[sandbox-docker] Container {container_id} not found, creating a new one");
+                    warn!(
+                        "[sandbox-docker] Container {container_id} not found, creating a new one"
+                    );
                     self.docker_mut().workspace_root_ready = false;
                 }
             }
@@ -293,7 +302,8 @@ impl DockerSandbox {
 
         let mut command = docker_command();
         command.args(&args);
-        let outcome = run_command(command, CONTAINER_START_TIMEOUT_SECONDS, CLI_OUTPUT_BYTES).await?;
+        let outcome =
+            run_command(command, CONTAINER_START_TIMEOUT_SECONDS, CLI_OUTPUT_BYTES).await?;
         let stdout = String::from_utf8_lossy(&outcome.stdout).trim().to_string();
         let stderr = outcome.stderr.trim();
         match outcome.exit_code {
@@ -526,8 +536,11 @@ impl Sandbox for DockerSandbox {
             }
         }
 
-        let status = match tokio::time::timeout(Duration::from_secs(TAR_TIMEOUT_SECONDS), child.wait())
-            .await
+        let status = match tokio::time::timeout(
+            Duration::from_secs(TAR_TIMEOUT_SECONDS),
+            child.wait(),
+        )
+        .await
         {
             Ok(status) => status.map_err(Error::Io)?,
             Err(_) => {
@@ -813,7 +826,10 @@ mod tests {
                 assert_eq!(state.cpu_count, Some(2));
                 assert!(state.container_owned);
                 assert!(!state.workspace_root_ready);
-                assert_eq!(state.workspace_spec.as_ref().unwrap().directories, vec!["src"]);
+                assert_eq!(
+                    state.workspace_spec.as_ref().unwrap().directories,
+                    vec!["src"]
+                );
             }
             other => panic!("expected Docker state, got {other:?}"),
         }
@@ -822,7 +838,10 @@ mod tests {
     #[tokio::test]
     async fn client_defaults_image_and_workspace_root() {
         let client = DockerSandboxClient::new();
-        let sandbox = client.create(&WorkspaceSpec::default(), None, None).await.unwrap();
+        let sandbox = client
+            .create(&WorkspaceSpec::default(), None, None)
+            .await
+            .unwrap();
         match sandbox.state() {
             SandboxState::Docker(state) => {
                 assert_eq!(state.image, DEFAULT_IMAGE);
@@ -844,7 +863,10 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         });
         assert!(client.resume(&state).await.is_err());
-        assert!(client.resume(&SandboxState::Docker(sample_state())).await.is_ok());
+        assert!(client
+            .resume(&SandboxState::Docker(sample_state()))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -869,7 +891,10 @@ mod tests {
     #[test]
     fn run_command_defaults_network_and_keepalive() {
         let args = build_docker_run_command(&sample_state(), "agentscope-sandbox-session-1");
-        assert_eq!(&args[..4], ["run", "-d", "--name", "agentscope-sandbox-session-1"]);
+        assert_eq!(
+            &args[..4],
+            ["run", "-d", "--name", "agentscope-sandbox-session-1"]
+        );
         assert!(args.contains(&"--network=none".to_string()));
         assert_eq!(args[args.len() - 4], DEFAULT_IMAGE);
         assert_eq!(&args[args.len() - 3..], ["sh", "-c", KEEP_ALIVE_COMMAND]);
@@ -889,8 +914,11 @@ mod tests {
             container_path: "/workspace/data".to_string(),
             read_only: true,
         }];
-        state.workspace_spec =
-            Some(WorkspaceSpec::new("/workspace").with_env("B", "2").with_env("A", "1"));
+        state.workspace_spec = Some(
+            WorkspaceSpec::new("/workspace")
+                .with_env("B", "2")
+                .with_env("A", "1"),
+        );
 
         let args = build_docker_run_command(&state, "name");
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "-e").count(), 2);
@@ -944,8 +972,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_binds_snapshot_spec_and_restore_degrades_without_archive() {
-        use std::sync::Arc;
         use super::super::snapshot::{LocalSnapshotSpec, NoopSandboxSnapshot};
+        use std::sync::Arc;
 
         // No snapshot bound.
         let bare = DockerSandbox::new(SandboxState::Docker(sample_state()));
@@ -968,8 +996,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_skips_archive_for_noop_snapshot_without_container() {
-        use std::sync::Arc;
         use super::super::snapshot::NoopSandboxSnapshot;
+        use std::sync::Arc;
         // Persistence disabled → stop must not attempt `persist_workspace` (which would fail
         // without a container), so it completes cleanly.
         let mut sandbox = DockerSandbox::new(SandboxState::Docker(sample_state()))

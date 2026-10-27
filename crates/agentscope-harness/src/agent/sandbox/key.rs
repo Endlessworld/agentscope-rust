@@ -1,20 +1,20 @@
 //! Sandbox isolation keys.
-use serde::{Deserialize, Serialize};
-use agentscope_core::agent::RuntimeContext;
 use super::super::isolation_scope::IsolationScope;
+use agentscope_core::agent::RuntimeContext;
+use serde::{Deserialize, Serialize};
 
 /// Key for sandbox isolation.
-/// 
+///
 /// Used by `SandboxExecutionGuard` to prevent concurrent execution
 /// for the same isolation key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxIsolationKey {
     /// The scope type (e.g., "user", "session", "agent").
     pub scope: String,
-    
+
     /// The scope value (e.g., user ID, session ID, agent ID).
     pub value: String,
-    
+
     /// Optional sub-key for finer isolation.
     pub sub_key: Option<String>,
 }
@@ -28,7 +28,7 @@ impl SandboxIsolationKey {
             sub_key: None,
         }
     }
-    
+
     /// Creates a new isolation key with sub-key.
     pub fn with_sub_key(
         scope: impl Into<String>,
@@ -41,7 +41,7 @@ impl SandboxIsolationKey {
             sub_key: Some(sub_key.into()),
         }
     }
-    
+
     /// Resolves an isolation key from scope, runtime context, and agent ID.
     pub fn resolve(
         isolation_scope: Option<&IsolationScope>,
@@ -61,16 +61,12 @@ impl SandboxIsolationKey {
                     .unwrap_or("anonymous");
                 Some(Self::new("session", session_id))
             }
-            Some(IsolationScope::Agent) => {
-                Some(Self::new("agent", agent_id))
-            }
-            Some(IsolationScope::Global) => {
-                Some(Self::new("global", "global"))
-            }
+            Some(IsolationScope::Agent) => Some(Self::new("agent", agent_id)),
+            Some(IsolationScope::Global) => Some(Self::new("global", "global")),
             None => None,
         }
     }
-    
+
     /// Returns a string representation suitable for use as a file/directory name.
     pub fn to_path_component(&self) -> String {
         let base = format!("{}_{}", self.scope, self.value);
@@ -94,7 +90,7 @@ impl std::fmt::Display for SandboxIsolationKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_sandbox_isolation_key_creation() {
         let key = SandboxIsolationKey::new("user", "user123");
@@ -102,7 +98,7 @@ mod tests {
         assert_eq!(key.value, "user123");
         assert!(key.sub_key.is_none());
     }
-    
+
     #[test]
     fn test_sandbox_isolation_key_with_sub_key() {
         let key = SandboxIsolationKey::with_sub_key("user_agent", "user123", "agent456");
@@ -110,21 +106,21 @@ mod tests {
         assert_eq!(key.value, "user123");
         assert_eq!(key.sub_key.as_deref(), Some("agent456"));
     }
-    
+
     #[test]
     fn test_sandbox_isolation_key_display() {
         let key = SandboxIsolationKey::new("user", "user123");
         assert_eq!(key.to_string(), "user:user123");
-        
+
         let key = SandboxIsolationKey::with_sub_key("user_agent", "user123", "agent456");
         assert_eq!(key.to_string(), "user_agent:user123:agent456");
     }
-    
+
     #[test]
     fn test_sandbox_isolation_key_path_component() {
         let key = SandboxIsolationKey::new("user", "user123");
         assert_eq!(key.to_path_component(), "user_user123");
-        
+
         let key = SandboxIsolationKey::with_sub_key("user_agent", "user123", "agent456");
         assert_eq!(key.to_path_component(), "user_agent_user123_agent456");
     }

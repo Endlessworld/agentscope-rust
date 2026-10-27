@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+use agentscope_core::session::SessionHistoryMode;
 use agentscope_core::state::AgentStateStore;
 use agentscope_core::tool::Toolkit;
-use agentscope_core::session::SessionHistoryMode;
 use agentscope_harness::agent::HarnessAgent;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -117,10 +117,12 @@ fn noop_toolkit() -> Toolkit {
         "noop",
         "does nothing",
         serde_json::json!({"type": "object"}),
-        Box::new(|_args: serde_json::Map<String, serde_json::Value>,
-                  _ctx: agentscope_core::tool::ToolExecutionContext| {
-            Ok(agentscope_core::message::ToolResultBlock::text("ok"))
-        }),
+        Box::new(
+            |_args: serde_json::Map<String, serde_json::Value>,
+             _ctx: agentscope_core::tool::ToolExecutionContext| {
+                Ok(agentscope_core::message::ToolResultBlock::text("ok"))
+            },
+        ),
     )));
     toolkit
 }

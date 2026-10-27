@@ -11,10 +11,10 @@
 //!   `_bypass_multiagent_history_merge` are emitted individually as user
 //!   messages.
 
+use agentscope_core::message::keys::metadata_keys::BYPASS_MULTIAGENT_HISTORY_MERGE;
 use agentscope_core::message::{
     ContentBlock, HintBlock, Msg, MsgRole, ThinkingBlock, ToolResultBlock, ToolUseBlock,
 };
-use agentscope_core::message::keys::metadata_keys::BYPASS_MULTIAGENT_HISTORY_MERGE;
 use serde_json::Value;
 
 use super::constants::MD_REASONING_ENCRYPTED_CONTENT;
@@ -75,10 +75,9 @@ impl ResponsesMultiAgentFormatter {
                     }
                 }
                 GroupType::AgentConversation => {
-                    result.push(self.merge_agent_conversation(
-                        &group.messages,
-                        is_first_agent_group,
-                    )?);
+                    result.push(
+                        self.merge_agent_conversation(&group.messages, is_first_agent_group)?,
+                    );
                     is_first_agent_group = false;
                 }
                 GroupType::Bypass => {
@@ -256,10 +255,13 @@ fn determine_group_type(msg: &Msg) -> GroupType {
         MsgRole::System => GroupType::System,
         MsgRole::Tool => GroupType::ToolSequence,
         MsgRole::User | MsgRole::Assistant => {
-            let has_tool = msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse(ToolUseBlock { .. }) | ContentBlock::ToolResult(ToolResultBlock { .. })));
+            let has_tool = msg.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse(ToolUseBlock { .. })
+                        | ContentBlock::ToolResult(ToolResultBlock { .. })
+                )
+            });
             if has_tool {
                 return GroupType::ToolSequence;
             }
@@ -405,14 +407,12 @@ mod tests {
         let assistant = Msg::assistant_blocks(vec![ContentBlock::ToolUse(ToolUseBlock::new(
             "call_1",
             "get_weather",
-            [("city".to_string(), json!("Beijing"))].into_iter().collect(),
+            [("city".to_string(), json!("Beijing"))]
+                .into_iter()
+                .collect(),
         ))]);
         let tool = Msg::tool("call_1", "get_weather", "sunny");
-        let messages = vec![
-            named(MsgRole::User, "alice", "weather?"),
-            assistant,
-            tool,
-        ];
+        let messages = vec![named(MsgRole::User, "alice", "weather?"), assistant, tool];
         let items = formatter.format_history(&messages).unwrap();
 
         // user (agent conversation) + function_call + function_call_output.
@@ -456,7 +456,8 @@ mod tests {
         let formatter = ResponsesMultiAgentFormatter::new();
         let image = ContentBlock::Image(agentscope_core::ImageBlock::new(
             agentscope_core::Source::Base64(agentscope_core::Base64Source::new(
-                "image/png", "AAAA",
+                "image/png",
+                "AAAA",
             )),
         ));
         let msg = Msg::user_blocks(vec![ContentBlock::Text(TextBlock::new("before")), image]);
@@ -468,10 +469,7 @@ mod tests {
         assert_eq!(content[0]["type"], json!("input_text"));
         assert!(content[0]["text"].as_str().unwrap().contains("before"));
         assert_eq!(content[1]["type"], json!("input_image"));
-        assert_eq!(
-            content[1]["image_url"],
-            json!("data:image/png;base64,AAAA")
-        );
+        assert_eq!(content[1]["image_url"], json!("data:image/png;base64,AAAA"));
         assert!(content[2]["text"].as_str().unwrap().contains("</history>"));
     }
 
@@ -481,12 +479,9 @@ mod tests {
         let thinking = ThinkingBlock::builder()
             .thinking("reasoning")
             .metadata(
-                [(
-                    MD_REASONING_ENCRYPTED_CONTENT.to_string(),
-                    json!("enc"),
-                )]
-                .into_iter()
-                .collect(),
+                [(MD_REASONING_ENCRYPTED_CONTENT.to_string(), json!("enc"))]
+                    .into_iter()
+                    .collect(),
             )
             .build();
         let msg = Msg::assistant_blocks(vec![

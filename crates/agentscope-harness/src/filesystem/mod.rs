@@ -13,9 +13,9 @@ pub mod util;
 
 use std::any::Any;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
+use async_trait::async_trait;
 
 pub use baked::BakedContextFilesystem;
 pub use composite::CompositeFilesystem;
@@ -42,10 +42,20 @@ pub struct FileInfo {
 }
 impl FileInfo {
     pub fn file(path: impl Into<String>, size: u64) -> Self {
-        Self { path: path.into(), is_directory: false, size, modified_at: String::new() }
+        Self {
+            path: path.into(),
+            is_directory: false,
+            size,
+            modified_at: String::new(),
+        }
     }
     pub fn dir(path: impl Into<String>) -> Self {
-        Self { path: path.into(), is_directory: true, size: 0, modified_at: String::new() }
+        Self {
+            path: path.into(),
+            is_directory: true,
+            size: 0,
+            modified_at: String::new(),
+        }
     }
 }
 
@@ -58,10 +68,16 @@ pub struct FileData {
 
 impl FileData {
     pub fn text(content: impl Into<String>) -> Self {
-        Self { content: content.into(), encoding: "utf-8".into() }
+        Self {
+            content: content.into(),
+            encoding: "utf-8".into(),
+        }
     }
     pub fn binary(content: impl Into<String>) -> Self {
-        Self { content: content.into(), encoding: "base64".into() }
+        Self {
+            content: content.into(),
+            encoding: "base64".into(),
+        }
     }
 }
 
@@ -146,7 +162,9 @@ pub trait Filesystem: Send + Sync + 'static {
 /// Validates that `path` is safe (non-blank, no `..` traversal).
 pub fn validate_path(path: &str) -> Result<()> {
     if path.trim().is_empty() {
-        return Err(agentscope_core::Error::Tool("Path must not be blank".into()));
+        return Err(agentscope_core::Error::Tool(
+            "Path must not be blank".into(),
+        ));
     }
     for seg in path.replace('\\', "/").split('/') {
         if seg == ".." {

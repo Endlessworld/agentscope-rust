@@ -10,9 +10,7 @@ use reqwest::header::{ACCEPT, ETAG, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::StatusCode;
 
 use super::config::CatalogConfig;
-use super::source::{
-    merge_descriptors, parse_api_json, parse_models_json, ParsedSource,
-};
+use super::source::{merge_descriptors, parse_api_json, parse_models_json, ParsedSource};
 use super::store::{sha256_hex, CatalogStorage};
 use super::types::{CatalogSnapshot, ModelDescriptor, SourceInfo};
 use crate::Result;
@@ -39,12 +37,8 @@ pub struct FetchResponse {
 /// Abstraction that lets tests run the full refresh without network access.
 #[async_trait]
 pub trait CatalogFetcher: Send + Sync {
-    async fn fetch(
-        &self,
-        url: &str,
-        etag: Option<&str>,
-        max_bytes: usize,
-    ) -> Result<FetchResponse>;
+    async fn fetch(&self, url: &str, etag: Option<&str>, max_bytes: usize)
+        -> Result<FetchResponse>;
 }
 
 /// Reqwest-backed fetcher. The client is shared across refreshes.
@@ -71,10 +65,7 @@ impl CatalogFetcher for HttpFetcher {
         etag: Option<&str>,
         max_bytes: usize,
     ) -> Result<FetchResponse> {
-        let mut request = self
-            .client
-            .get(url)
-            .header(ACCEPT, "application/json");
+        let mut request = self.client.get(url).header(ACCEPT, "application/json");
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -104,7 +95,10 @@ impl CatalogFetcher for HttpFetcher {
                 "catalog: GET {url} returned content-type '{content_type}'"
             )));
         }
-        if response.content_length().is_some_and(|len| len > max_bytes as u64) {
+        if response
+            .content_length()
+            .is_some_and(|len| len > max_bytes as u64)
+        {
             return Err(crate::Error::Http(format!(
                 "catalog: GET {url} exceeds {max_bytes} bytes"
             )));
@@ -185,15 +179,13 @@ pub(crate) async fn refresh(
             Ok(source) => Some(source),
             Err(error) => {
                 tracing::warn!(error = %error, "model catalog: detailed source unavailable; using flat source");
-                storage
-                    .read_raw(API_SOURCE)
-                    .map(|bytes| FetchedSource {
-                        meta: storage.read_meta(API_SOURCE).unwrap_or_else(|| {
-                            source_info(API_SOURCE, &config.api_url, None, None, &bytes)
-                        }),
-                        bytes,
-                        not_modified: true,
-                    })
+                storage.read_raw(API_SOURCE).map(|bytes| FetchedSource {
+                    meta: storage.read_meta(API_SOURCE).unwrap_or_else(|| {
+                        source_info(API_SOURCE, &config.api_url, None, None, &bytes)
+                    }),
+                    bytes,
+                    not_modified: true,
+                })
             }
         }
     } else {
@@ -290,7 +282,13 @@ async fn fetch_source(
             })
         }
         FetchStatus::Ok => {
-            let meta = source_info(name, url, response.etag, response.last_modified, &response.body);
+            let meta = source_info(
+                name,
+                url,
+                response.etag,
+                response.last_modified,
+                &response.body,
+            );
             storage.write_raw(name, &response.body)?;
             storage.write_meta(name, &meta)?;
             Ok(FetchedSource {
@@ -396,10 +394,10 @@ mod tests {
         }
 
         fn fail(&self, url: &str) {
-            self.responses.lock().unwrap().insert(
-                url.to_string(),
-                Err("offline".to_string()),
-            );
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), Err("offline".to_string()));
         }
     }
 
@@ -436,10 +434,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_builds_snapshot_and_increments_generation() {
-        let storage = CatalogStorage::new(std::env::temp_dir().join(format!(
-            "agentscope-refresh-test-{}",
-            uuid::Uuid::new_v4()
-        )));
+        let storage = CatalogStorage::new(
+            std::env::temp_dir().join(format!("agentscope-refresh-test-{}", uuid::Uuid::new_v4())),
+        );
         let fetcher = MemoryFetcher::new();
         fetcher.insert(
             "mem://models",
@@ -465,10 +462,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detailed_failure_degrades_to_flat_source() {        let storage = CatalogStorage::new(std::env::temp_dir().join(format!(
-            "agentscope-refresh-test-{}",
-            uuid::Uuid::new_v4()
-        )));
+    async fn detailed_failure_degrades_to_flat_source() {
+        let storage = CatalogStorage::new(
+            std::env::temp_dir().join(format!("agentscope-refresh-test-{}", uuid::Uuid::new_v4())),
+        );
         let fetcher = MemoryFetcher::new();
         fetcher.insert(
             "mem://models",
@@ -480,10 +477,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.snapshot.entries.len(), 1);
-        assert_eq!(
-            result.snapshot.entries["p/m"].context_window,
-            100_000
-        );
+        assert_eq!(result.snapshot.entries["p/m"].context_window, 100_000);
         let _ = std::fs::remove_dir_all(storage.root());
     }
 
@@ -501,6 +495,10 @@ mod tests {
             .expect("models.dev fetch");
         assert_eq!(response.status, FetchStatus::Ok);
         let parsed = super::super::source::parse_models_json(&response.body).unwrap();
-        assert!(parsed.entries.len() > 500, "entries={}", parsed.entries.len());
+        assert!(
+            parsed.entries.len() > 500,
+            "entries={}",
+            parsed.entries.len()
+        );
     }
 }

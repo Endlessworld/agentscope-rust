@@ -198,8 +198,8 @@ impl DifyRAGClient {
         }
 
         // A JSON `null` body deserializes to `None`; Java returns an empty response there.
-        let parsed: Option<DifyResponse> = serde_json::from_str(&response.body)
-            .map_err(|e| RagError::Api {
+        let parsed: Option<DifyResponse> =
+            serde_json::from_str(&response.body).map_err(|e| RagError::Api {
                 status_code,
                 error_code: None,
                 message: format!("failed to parse Dify response: {e}"),
@@ -343,10 +343,7 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "Authorization" && v == "Bearer secret-key"));
-        assert!(seen
-            .headers
-            .iter()
-            .any(|(k, _)| k == "Content-Type"));
+        assert!(seen.headers.iter().any(|(k, _)| k == "Content-Type"));
 
         let body: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
         assert_eq!(body["query"], "q");
@@ -377,7 +374,13 @@ mod tests {
         }]);
         let client = client(transport);
         let err = client.retrieve("q", None).await.unwrap_err();
-        assert!(matches!(err, RagError::Auth { status_code: 401, .. }));
+        assert!(matches!(
+            err,
+            RagError::Auth {
+                status_code: 401,
+                ..
+            }
+        ));
         assert!(err.is_client_error());
     }
 
@@ -397,7 +400,13 @@ mod tests {
     #[test]
     fn error_mapping_handles_non_json_bodies() {
         let err = map_error_response(500, "<html>oops</html>");
-        assert!(matches!(err, RagError::Api { status_code: 500, .. }));
+        assert!(matches!(
+            err,
+            RagError::Api {
+                status_code: 500,
+                ..
+            }
+        ));
         assert!(err.to_string().contains("<html>oops</html>"));
         assert!(err.is_server_error());
     }
@@ -405,7 +414,13 @@ mod tests {
     #[test]
     fn error_mapping_handles_forbidden_as_auth() {
         let err = map_error_response(403, "{}");
-        assert!(matches!(err, RagError::Auth { status_code: 403, .. }));
+        assert!(matches!(
+            err,
+            RagError::Auth {
+                status_code: 403,
+                ..
+            }
+        ));
         // Falls back to the default message when no `message` key exists.
         assert!(err.to_string().contains("Dify API error"));
     }

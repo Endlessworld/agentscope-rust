@@ -67,7 +67,8 @@ impl OpenAIOfficialCredential {
     ///
     /// Blank values are treated as absent (Java `firstNonBlank`).
     pub fn resolve_api_key(explicit: Option<&str>) -> Option<String> {
-        first_non_blank(explicit).or_else(|| first_non_blank(std::env::var(API_KEY_ENV).ok().as_deref()))
+        first_non_blank(explicit)
+            .or_else(|| first_non_blank(std::env::var(API_KEY_ENV).ok().as_deref()))
     }
 
     /// Resolves the base URL: explicit value first, then `OPENAI_BASE_URL`.
@@ -104,7 +105,10 @@ mod tests {
 
         let value = serde_json::to_value(&cred).unwrap();
         assert_eq!(value["api_key"], serde_json::json!("sk-test"));
-        assert_eq!(value["base_url"], serde_json::json!("https://proxy.test/v1"));
+        assert_eq!(
+            value["base_url"],
+            serde_json::json!("https://proxy.test/v1")
+        );
     }
 
     #[test]

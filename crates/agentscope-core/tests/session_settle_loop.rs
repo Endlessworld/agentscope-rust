@@ -25,9 +25,9 @@ async fn journal() -> Arc<dyn SessionLog> {
 
 fn text_reply(text: &str) -> ChatResponse {
     ChatResponse::builder()
-        .content(vec![ContentBlock::Text(agentscope_core::message::TextBlock::new(
-            text,
-        ))])
+        .content(vec![ContentBlock::Text(
+            agentscope_core::message::TextBlock::new(text),
+        )])
         .build()
 }
 
@@ -134,11 +134,8 @@ async fn a_completed_turn_continues_while_steering_is_unconsumed() {
     extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::new(recorder));
     extensions.insert(EXECUTION_CONTEXT_KEY, execution);
 
-    let mut stream = agent.stream_events_with_extensions(
-        inputs,
-        StreamOptions::defaults(),
-        extensions,
-    );
+    let mut stream =
+        agent.stream_events_with_extensions(inputs, StreamOptions::defaults(), extensions);
     while let Some(event) = stream.next().await {
         event.expect("the settle loop must not fail the run");
     }
@@ -152,7 +149,9 @@ async fn a_completed_turn_continues_while_steering_is_unconsumed() {
     let seen = model.seen.lock().unwrap();
     let second = seen.get(1).expect("second model call");
     assert!(
-        second.iter().any(|message| text_of(message).contains("guidance")),
+        second
+            .iter()
+            .any(|message| text_of(message).contains("guidance")),
         "the steered message must reach the continued step"
     );
 
@@ -209,11 +208,8 @@ async fn a_completed_turn_closes_when_no_guidance_is_pending() {
     extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::new(recorder));
     extensions.insert(EXECUTION_CONTEXT_KEY, execution);
 
-    let mut stream = agent.stream_events_with_extensions(
-        inputs,
-        StreamOptions::defaults(),
-        extensions,
-    );
+    let mut stream =
+        agent.stream_events_with_extensions(inputs, StreamOptions::defaults(), extensions);
     while let Some(event) = stream.next().await {
         event.expect("no guidance, no failure");
     }
@@ -246,9 +242,7 @@ impl Model for QuietModel {
         _options: GenerateOptions,
     ) -> futures::stream::BoxStream<'_, agentscope_core::Result<ChatResponse>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(futures::stream::once(async {
-            Ok(text_reply("done"))
-        }))
+        Box::pin(futures::stream::once(async { Ok(text_reply("done")) }))
     }
 
     fn model_name(&self) -> &str {

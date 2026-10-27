@@ -185,11 +185,7 @@ pub trait SessionEventCodec: Send + Sync {
     fn validate(&self, data: &serde_json::Value) -> crate::error::Result<()>;
 
     /// Applies the payload to recovered state.
-    fn apply(
-        &self,
-        state: &mut AgentState,
-        data: &serde_json::Value,
-    ) -> crate::error::Result<()>;
+    fn apply(&self, state: &mut AgentState, data: &serde_json::Value) -> crate::error::Result<()>;
 }
 
 /// Registry of extension codecs. Required unknown versions/types always stop recovery.
@@ -221,9 +217,7 @@ impl SessionEventCodecRegistry {
         codec: Arc<dyn SessionEventCodec>,
     ) -> crate::error::Result<()> {
         if !event_type.contains('/') || SessionEventTypes::is_builtin(event_type) {
-            return Err(session_error(
-                "Use a non-reserved namespaced event type",
-            ));
+            return Err(session_error("Use a non-reserved namespaced event type"));
         }
         let mut guard = self
             .extensions
@@ -285,17 +279,7 @@ mod tests {
     use super::*;
 
     fn event(event_type: &str, required: bool) -> SessionEvent {
-        SessionEvent::new(
-            "e1",
-            1,
-            0,
-            event_type,
-            None,
-            None,
-            required,
-            "{}",
-        )
-        .unwrap()
+        SessionEvent::new("e1", 1, 0, event_type, None, None, required, "{}").unwrap()
     }
 
     #[test]
@@ -325,7 +309,12 @@ mod tests {
 
     #[test]
     fn builtin_types_include_identity_and_inbox_facts() {
-        for name in ["run/start", "turn/completed", "inbox/accepted", "state/checkpoint"] {
+        for name in [
+            "run/start",
+            "turn/completed",
+            "inbox/accepted",
+            "state/checkpoint",
+        ] {
             assert!(SessionEventTypes::is_builtin(name), "{name}");
         }
         assert!(!SessionEventTypes::is_builtin("extension/custom"));
@@ -378,17 +367,7 @@ mod tests {
         .unwrap();
         registry.validate(&good).unwrap();
 
-        let bad = SessionEvent::new(
-            "e3",
-            1,
-            0,
-            "extension/echo",
-            None,
-            None,
-            true,
-            "{}",
-        )
-        .unwrap();
+        let bad = SessionEvent::new("e3", 1, 0, "extension/echo", None, None, true, "{}").unwrap();
         assert!(registry.validate(&bad).is_err());
 
         let mut state = AgentState::builder().session_id("s").build();

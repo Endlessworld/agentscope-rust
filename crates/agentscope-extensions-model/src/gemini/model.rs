@@ -62,11 +62,8 @@ impl GeminiChatModel {
             .clone()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let descriptor = descriptor_for(
-            Some("gemini"),
-            &model_name,
-            configured_base_url.as_deref(),
-        );
+        let descriptor =
+            descriptor_for(Some("gemini"), &model_name, configured_base_url.as_deref());
         let context_window_size = descriptor
             .as_ref()
             .map(|descriptor| descriptor.context_window)
@@ -266,7 +263,10 @@ mod tests {
         GeminiChatModel::new(name, "gm-test", None, Arc::new(transport))
     }
 
-    async fn collect(model: &GeminiChatModel, options: GenerateOptions) -> Vec<Result<ChatResponse>> {
+    async fn collect(
+        model: &GeminiChatModel,
+        options: GenerateOptions,
+    ) -> Vec<Result<ChatResponse>> {
         model
             .stream(vec![Msg::user("hi")], Vec::new(), options)
             .collect()
@@ -281,7 +281,14 @@ mod tests {
             "responseId": "resp_1"
         }));
         let model = model_with(transport.clone(), "gemini-2.5-flash");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
 
         assert_eq!(out.len(), 1);
         let response = out[0].as_ref().unwrap();
@@ -311,7 +318,14 @@ mod tests {
             Some("https://proxy.test".into()),
             Arc::new(transport.clone()),
         );
-        let _ = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let _ = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
         assert_eq!(
             transport.last_request().unwrap().url,
             "https://proxy.test/v1beta/models/gemini-2.5-flash:generateContent"
@@ -332,8 +346,12 @@ mod tests {
         let out = collect(&model, GenerateOptions::default()).await;
 
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         let tail = out[2].as_ref().unwrap();
         assert_eq!(tail.usage.output_tokens, 3);
         assert_eq!(tail.finish_reason.as_deref(), Some("STOP"));
@@ -353,7 +371,14 @@ mod tests {
             "error": { "code": 400, "message": "bad key", "status": "INVALID_ARGUMENT" }
         }));
         let model = model_with(transport, "gemini-2.5-flash");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
         let err = out[0].as_ref().unwrap_err().to_string();
         assert!(err.contains("INVALID_ARGUMENT"), "unexpected error: {err}");
         assert!(err.contains("bad key"), "unexpected error: {err}");
@@ -369,20 +394,33 @@ mod tests {
             Arc::new(MemoryTransport::default()),
         );
         let options = GenerateOptions {
-            tool_choice: Some(ToolChoice::Specific { tool_name: "f".into() }),
+            tool_choice: Some(ToolChoice::Specific {
+                tool_name: "f".into(),
+            }),
             thinking_budget: Some(256),
             ..Default::default()
         };
         let messages = vec![Msg::user_blocks(vec![
             ContentBlock::Text(agentscope_core::TextBlock::new("look")),
             ContentBlock::Image(ImageBlock::new(Source::Base64(Base64Source::new(
-                "image/png", "AAAA",
+                "image/png",
+                "AAAA",
             )))),
         ])];
-        let spec = model.build_http_request(messages, vec![ToolSchema::new("f", "d")], &options, false);
-        assert_eq!(spec.body["contents"][0]["parts"][1]["inlineData"]["mimeType"], serde_json::json!("image/png"));
-        assert_eq!(spec.body["tools"][0]["functionDeclarations"][0]["name"], serde_json::json!("f"));
-        assert_eq!(spec.body["toolConfig"]["functionCallingConfig"]["mode"], serde_json::json!("ANY"));
+        let spec =
+            model.build_http_request(messages, vec![ToolSchema::new("f", "d")], &options, false);
+        assert_eq!(
+            spec.body["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+            serde_json::json!("image/png")
+        );
+        assert_eq!(
+            spec.body["tools"][0]["functionDeclarations"][0]["name"],
+            serde_json::json!("f")
+        );
+        assert_eq!(
+            spec.body["toolConfig"]["functionCallingConfig"]["mode"],
+            serde_json::json!("ANY")
+        );
         assert_eq!(
             spec.body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             serde_json::json!(256)
@@ -421,7 +459,13 @@ mod tests {
         assert_eq!(model.model_name(), "gemini-2.5-flash");
         assert_eq!(model.context_window_size(), 1_048_576);
         assert!(model.supports_native_structured_output());
-        assert_eq!(model.base_url(), "https://generativelanguage.googleapis.com");
-        assert_eq!(model.endpoint_path(false), "/v1beta/models/gemini-2.5-flash:generateContent");
+        assert_eq!(
+            model.base_url(),
+            "https://generativelanguage.googleapis.com"
+        );
+        assert_eq!(
+            model.endpoint_path(false),
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        );
     }
 }

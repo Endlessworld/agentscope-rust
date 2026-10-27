@@ -146,7 +146,9 @@ impl JdbcDistributedStore {
     /// corresponding fields.
     pub fn to_harness_store(&self) -> HarnessDistributedStore {
         HarnessDistributedStore {
-            agent_state_store: Some(self.agent_state_store.clone() as Arc<dyn agentscope_core::state::AgentStateStore>),
+            agent_state_store: Some(
+                self.agent_state_store.clone() as Arc<dyn agentscope_core::state::AgentStateStore>
+            ),
             isolation_scope: self.isolation_scope.clone(),
         }
     }

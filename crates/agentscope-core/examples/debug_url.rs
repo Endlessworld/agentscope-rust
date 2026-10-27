@@ -1,5 +1,5 @@
-use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::message::{ContentBlock as CB, Msg, TextBlock};
+use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
@@ -32,17 +32,20 @@ impl Model for ReqwestModel {
         _options: GenerateOptions,
     ) -> BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
         // Build request body
-        let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
-            serde_json::json!({
-                "role": match m.role {
-                    agentscope_core::message::MsgRole::System => "system",
-                    agentscope_core::message::MsgRole::User => "user",
-                    agentscope_core::message::MsgRole::Assistant => "assistant",
-                    _ => "user",
-                },
-                "content": m.text_content(),
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": match m.role {
+                        agentscope_core::message::MsgRole::System => "system",
+                        agentscope_core::message::MsgRole::User => "user",
+                        agentscope_core::message::MsgRole::Assistant => "assistant",
+                        _ => "user",
+                    },
+                    "content": m.text_content(),
+                })
             })
-        }).collect();
+            .collect();
 
         let body = serde_json::json!({
             "model": self.model_name,
@@ -73,8 +76,9 @@ impl Model for ReqwestModel {
                 });
             }
 
-            let json: serde_json::Value = resp.json().await
-                .map_err(|e| agentscope_core::error::Error::Other(format!("JSON parse error: {e}")))?;
+            let json: serde_json::Value = resp.json().await.map_err(|e| {
+                agentscope_core::error::Error::Other(format!("JSON parse error: {e}"))
+            })?;
 
             // Extract the reply text
             let text = json["choices"][0]["message"]["content"]
@@ -118,7 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_iters(1)
         .build()?;
 
-    let reply = agent.call(vec![Msg::user("Say hello in one sentence.")]).await?;
+    let reply = agent
+        .call(vec![Msg::user("Say hello in one sentence.")])
+        .await?;
     println!("reply: {}", reply.text_content());
     Ok(())
 }

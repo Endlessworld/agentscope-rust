@@ -102,17 +102,13 @@ impl ModelProvider for OpenAIOfficialModelProvider {
         let formatter = take_formatter(&mut options);
         let server_tools = take_server_tools(&mut options)?;
 
-        let mut model = OpenAIResponsesChatModel::new(
-            model_name,
-            api_key,
-            Some(base_url),
-            default_transport(),
-        )
-        .with_default_options(options)
-        .with_stream(ctx.stream.unwrap_or(true))
-        .with_strict_tools(strict_tools)
-        .with_strict_json_schema(strict_json_schema)
-        .with_server_tools(server_tools);
+        let mut model =
+            OpenAIResponsesChatModel::new(model_name, api_key, Some(base_url), default_transport())
+                .with_default_options(options)
+                .with_stream(ctx.stream.unwrap_or(true))
+                .with_strict_tools(strict_tools)
+                .with_strict_json_schema(strict_json_schema)
+                .with_server_tools(server_tools);
         if let Some(formatter) = formatter {
             model = model.with_formatter(formatter);
         }
@@ -198,10 +194,7 @@ mod tests {
             OpenAIOfficialModelProvider::strip_prefix("openai-official:gpt-5"),
             "gpt-5"
         );
-        assert_eq!(
-            OpenAIOfficialModelProvider::strip_prefix("gpt-5"),
-            "gpt-5"
-        );
+        assert_eq!(OpenAIOfficialModelProvider::strip_prefix("gpt-5"), "gpt-5");
     }
 
     #[test]
@@ -262,9 +255,11 @@ mod tests {
     #[test]
     fn registry_resolution_creates_a_model() {
         let registry = default_openai_official_registry();
-        let base = ModelCreationContext::new("openai-official", "openai-official:gpt-5")
-            .api_key("sk");
-        let model = registry.resolve_with("openai-official:gpt-5", base).unwrap();
+        let base =
+            ModelCreationContext::new("openai-official", "openai-official:gpt-5").api_key("sk");
+        let model = registry
+            .resolve_with("openai-official:gpt-5", base)
+            .unwrap();
         assert_eq!(model.model_name(), "gpt-5");
     }
 

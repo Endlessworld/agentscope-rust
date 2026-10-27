@@ -68,7 +68,6 @@ async fn local_spec_failure_yields_failed() {
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_task_marks_cancelled() {
     let dir = temp_dir("cancel").await;
@@ -122,10 +121,14 @@ async fn list_tasks_filters_by_status() {
 
     let all = repo.list_tasks(&ctx(), "sess", None).await;
     assert_eq!(all.len(), 2);
-    let completed = repo.list_tasks(&ctx(), "sess", Some(TaskStatus::Completed)).await;
+    let completed = repo
+        .list_tasks(&ctx(), "sess", Some(TaskStatus::Completed))
+        .await;
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].task_id(), "t-ok");
-    let failed = repo.list_tasks(&ctx(), "sess", Some(TaskStatus::Failed)).await;
+    let failed = repo
+        .list_tasks(&ctx(), "sess", Some(TaskStatus::Failed))
+        .await;
     assert_eq!(failed.len(), 1);
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
@@ -152,6 +155,9 @@ async fn pending_deliveries_and_mark_delivered() {
 
     repo.mark_delivered(&ctx(), "sess", "t1").await;
     assert!(repo.is_delivered(&ctx(), "sess", "t1").await);
-    assert!(repo.find_pending_deliveries(&ctx(), "sess").await.is_empty());
+    assert!(repo
+        .find_pending_deliveries(&ctx(), "sess")
+        .await
+        .is_empty());
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }

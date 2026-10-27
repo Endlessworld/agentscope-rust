@@ -269,6 +269,9 @@ mod tests {
     #[test]
     fn test_workspace_spec_resolve() {
         let spec = WorkspaceSpec::new("/workspace");
-        assert_eq!(spec.resolve("src/main.rs"), PathBuf::from("/workspace/src/main.rs"));
+        assert_eq!(
+            spec.resolve("src/main.rs"),
+            PathBuf::from("/workspace/src/main.rs")
+        );
     }
 }

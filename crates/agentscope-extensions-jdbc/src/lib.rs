@@ -45,19 +45,18 @@ pub mod backend;
 pub mod dialect;
 mod distributed_store;
 pub mod sandbox;
-pub mod snapshot;
 pub mod skill;
+pub mod snapshot;
 pub mod state;
 pub mod store;
 
 pub use backend::{
-    ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor,
-    SharedExecutor,
+    ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor, SharedExecutor,
 };
 pub use distributed_store::JdbcDistributedStore;
 pub use sandbox::{JdbcSandboxExecutionGuard, JdbcSandboxLease, TableLockStrategy};
-pub use snapshot::{JdbcRemoteSnapshotClient, JdbcSnapshotSpec};
 pub use skill::{JdbcAgentSkillRepository, SkillRepositoryError, DEFAULT_NAMESPACE};
+pub use snapshot::{JdbcRemoteSnapshotClient, JdbcSnapshotSpec};
 pub use state::{JdbcAgentStateStore, VersionedState, UNVERSIONED};
 pub use store::JdbcStore;
 // Re-export the reused harness/core traits for ergonomic use by callers.

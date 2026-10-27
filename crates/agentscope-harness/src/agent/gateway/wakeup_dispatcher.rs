@@ -2,9 +2,9 @@
 //! mirroring `WakeupDispatcher`.
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::Msg;
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::agent::bus::{MessageBus, WAKEUPS_KEY};
@@ -36,7 +36,11 @@ impl DispatcherCore {
     }
 
     async fn drain_and_dispatch(&self) {
-        let Ok(entries) = self.message_bus.queue_drain(WAKEUPS_KEY, MAX_DRAIN_COUNT).await else {
+        let Ok(entries) = self
+            .message_bus
+            .queue_drain(WAKEUPS_KEY, MAX_DRAIN_COUNT)
+            .await
+        else {
             return;
         };
         if entries.is_empty() {
@@ -48,7 +52,10 @@ impl DispatcherCore {
     }
 
     async fn dispatch(&self, payload: &Value) {
-        let user_id = payload.get("userId").and_then(Value::as_str).map(str::to_string);
+        let user_id = payload
+            .get("userId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let session_id = payload.get("sessionId").and_then(Value::as_str);
         let Some(session_id) = session_id else {
             return;
@@ -75,7 +82,10 @@ pub struct WakeupDispatcher {
 impl WakeupDispatcher {
     pub fn new(message_bus: Arc<dyn MessageBus>, target: Arc<dyn WakeupTarget>) -> Self {
         Self {
-            core: Arc::new(DispatcherCore { message_bus, target }),
+            core: Arc::new(DispatcherCore {
+                message_bus,
+                target,
+            }),
             handle: Mutex::new(None),
         }
     }
@@ -116,7 +126,11 @@ mod tests {
         async fn is_session_running(&self, session_id: &str) -> bool {
             self.running.contains(&session_id.to_string())
         }
-        async fn run_wakeup(&self, _user_id: Option<&str>, _session_id: &str) -> Result<Option<Msg>> {
+        async fn run_wakeup(
+            &self,
+            _user_id: Option<&str>,
+            _session_id: &str,
+        ) -> Result<Option<Msg>> {
             self.wakes.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
@@ -134,7 +148,9 @@ mod tests {
         });
 
         bus.enqueue_wakeup("alice", "sess-1", "main").await.unwrap();
-        bus.enqueue_wakeup("bob", "running-sess", "main").await.unwrap();
+        bus.enqueue_wakeup("bob", "running-sess", "main")
+            .await
+            .unwrap();
 
         let dispatcher = WakeupDispatcher::new(bus, target.clone());
         // Initial drain runs synchronously; invoke the core directly (not the spawned task).

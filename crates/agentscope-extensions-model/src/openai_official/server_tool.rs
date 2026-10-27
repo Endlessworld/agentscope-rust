@@ -23,8 +23,7 @@ use agentscope_core::message::{
 use serde_json::{json, Value};
 
 use super::constants::{
-    MD_CODE_INTERPRETER_CONTAINER_ID, MD_FUNCTION_CALL_NAMESPACE,
-    MD_RESPONSES_SERVER_TOOL_ITEM,
+    MD_CODE_INTERPRETER_CONTAINER_ID, MD_FUNCTION_CALL_NAMESPACE, MD_RESPONSES_SERVER_TOOL_ITEM,
 };
 
 /// Stable tool type for the current web search tool.
@@ -529,7 +528,10 @@ fn decode_code_interpreter_result(item: &Value) -> Option<ToolResultBlock> {
     for (index, entry) in outputs.iter().enumerate() {
         match entry.get("type").and_then(Value::as_str) {
             Some("logs") => {
-                let logs = entry.get("logs").and_then(Value::as_str).unwrap_or_default();
+                let logs = entry
+                    .get("logs")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 output.push(ContentBlock::Text(TextBlock::new(logs)));
             }
             Some("image") => {
@@ -657,13 +659,19 @@ mod tests {
         assert!(OpenAIServerTool::from_json(json!({ "type": "function" })).is_err());
         assert!(OpenAIServerTool::from_json(json!({ "type": "mcp" })).is_err());
         assert!(OpenAIServerTool::from_json(json!({ "type": "computer_use" })).is_err());
-        assert!(OpenAIServerTool::from_json(json!({ "type": "tool_search", "execution": "client" })).is_err());
+        assert!(OpenAIServerTool::from_json(
+            json!({ "type": "tool_search", "execution": "client" })
+        )
+        .is_err());
     }
 
     #[test]
     fn merge_tools_keeps_client_first_then_server() {
         let client = vec![fn_tool("local")];
-        let server = vec![OpenAIServerTool::web_search(), OpenAIServerTool::code_interpreter()];
+        let server = vec![
+            OpenAIServerTool::web_search(),
+            OpenAIServerTool::code_interpreter(),
+        ];
         let merged = ResponsesServerToolHelper::merge_tools(client, &server);
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0]["name"], json!("local"));
@@ -676,7 +684,10 @@ mod tests {
         let mut body = json!({ "model": "gpt-5" });
         ResponsesServerToolHelper::apply_includes(
             &mut body,
-            &[OpenAIServerTool::web_search(), OpenAIServerTool::code_interpreter()],
+            &[
+                OpenAIServerTool::web_search(),
+                OpenAIServerTool::code_interpreter(),
+            ],
         );
         assert_eq!(
             body["include"],

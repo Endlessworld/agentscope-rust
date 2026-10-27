@@ -53,7 +53,12 @@ impl PermissionRule {
         behavior: PermissionBehavior,
         source: impl Into<String>,
     ) -> Self {
-        Self { tool_name: tool_name.into(), rule_content, behavior, source: source.into() }
+        Self {
+            tool_name: tool_name.into(),
+            rule_content,
+            behavior,
+            source: source.into(),
+        }
     }
 }
 
@@ -66,7 +71,10 @@ pub struct AdditionalWorkingDirectory {
 
 impl AdditionalWorkingDirectory {
     pub fn new(path: impl Into<String>, source: impl Into<String>) -> Self {
-        Self { path: path.into(), source: source.into() }
+        Self {
+            path: path.into(),
+            source: source.into(),
+        }
     }
 }
 
@@ -97,7 +105,13 @@ impl PermissionDecision {
         Self::from_behavior(PermissionBehavior::Passthrough, message.into())
     }
     fn from_behavior(behavior: PermissionBehavior, message: String) -> Self {
-        Self { behavior, message, decision_reason: None, updated_input: None, suggested_rules: None }
+        Self {
+            behavior,
+            message,
+            decision_reason: None,
+            updated_input: None,
+            suggested_rules: None,
+        }
     }
 
     pub fn with_suggested_rules(mut self, rules: Option<Vec<PermissionRule>>) -> Self {
@@ -166,7 +180,11 @@ impl PermissionContextBuilder {
         self.mode = mode;
         self
     }
-    pub fn add_working_directory(mut self, key: impl Into<String>, dir: AdditionalWorkingDirectory) -> Self {
+    pub fn add_working_directory(
+        mut self,
+        key: impl Into<String>,
+        dir: AdditionalWorkingDirectory,
+    ) -> Self {
         self.working_directories.insert(key.into(), dir);
         self
     }
@@ -221,9 +239,21 @@ impl PermissionEngine {
     /// Adds a rule to the engine's internal rule set.
     pub fn add_rule(&mut self, rule: PermissionRule) {
         match rule.behavior {
-            PermissionBehavior::Allow => self.allow_rules.entry(rule.tool_name.clone()).or_default().push(rule),
-            PermissionBehavior::Deny => self.deny_rules.entry(rule.tool_name.clone()).or_default().push(rule),
-            PermissionBehavior::Ask => self.ask_rules.entry(rule.tool_name.clone()).or_default().push(rule),
+            PermissionBehavior::Allow => self
+                .allow_rules
+                .entry(rule.tool_name.clone())
+                .or_default()
+                .push(rule),
+            PermissionBehavior::Deny => self
+                .deny_rules
+                .entry(rule.tool_name.clone())
+                .or_default()
+                .push(rule),
+            PermissionBehavior::Ask => self
+                .ask_rules
+                .entry(rule.tool_name.clone())
+                .or_default()
+                .push(rule),
             PermissionBehavior::Passthrough => {}
         }
     }
@@ -254,12 +284,18 @@ impl PermissionEngine {
             return d;
         }
         if self.context.mode == PermissionMode::Bypass {
-            return PermissionDecision::allow(format!("Permission granted for {} (bypass mode)", tool_name))
-                .with_decision_reason("Bypass mode allows all operations");
+            return PermissionDecision::allow(format!(
+                "Permission granted for {} (bypass mode)",
+                tool_name
+            ))
+            .with_decision_reason("Bypass mode allows all operations");
         }
         if self.context.mode == PermissionMode::DontAsk {
-            return PermissionDecision::deny(format!("Permission denied for {} (dont_ask mode)", tool_name))
-                .with_decision_reason("User is not available to answer permission prompts");
+            return PermissionDecision::deny(format!(
+                "Permission denied for {} (dont_ask mode)",
+                tool_name
+            ))
+            .with_decision_reason("User is not available to answer permission prompts");
         }
         PermissionDecision::ask(format!("Permission required for {}", tool_name))
             .with_decision_reason(format!("Mode: {:?}", self.context.mode))
@@ -270,21 +306,30 @@ impl PermissionEngine {
             PermissionMode::Explore => {
                 if is_read_only {
                     Some(
-                        PermissionDecision::allow(format!("Permission granted for {} (explore mode - read-only tool)", tool_name))
-                            .with_decision_reason("Explore mode allows read-only operations"),
+                        PermissionDecision::allow(format!(
+                            "Permission granted for {} (explore mode - read-only tool)",
+                            tool_name
+                        ))
+                        .with_decision_reason("Explore mode allows read-only operations"),
                     )
                 } else {
                     Some(
-                        PermissionDecision::deny(format!("Permission denied for {} (explore mode is read-only)", tool_name))
-                            .with_decision_reason("Explore mode does not allow modifications"),
+                        PermissionDecision::deny(format!(
+                            "Permission denied for {} (explore mode is read-only)",
+                            tool_name
+                        ))
+                        .with_decision_reason("Explore mode does not allow modifications"),
                     )
                 }
             }
             PermissionMode::AcceptEdits => {
                 if is_read_only {
                     Some(
-                        PermissionDecision::allow(format!("Permission granted for {} (accept edits mode - read-only tool)", tool_name))
-                            .with_decision_reason("Accept edits mode allows read-only operations"),
+                        PermissionDecision::allow(format!(
+                            "Permission granted for {} (accept edits mode - read-only tool)",
+                            tool_name
+                        ))
+                        .with_decision_reason("Accept edits mode allows read-only operations"),
                     )
                 } else {
                     None
@@ -294,34 +339,61 @@ impl PermissionEngine {
         }
     }
 
-    fn check_deny_rules<F>(&self, tool: &str, input: &JsonMap, matcher: &F) -> Option<PermissionDecision>
-    where F: Fn(&str, &JsonMap) -> bool {
+    fn check_deny_rules<F>(
+        &self,
+        tool: &str,
+        input: &JsonMap,
+        matcher: &F,
+    ) -> Option<PermissionDecision>
+    where
+        F: Fn(&str, &JsonMap) -> bool,
+    {
         for rule in rules_for(&self.deny_rules, tool) {
             if rule_matches(rule, input, matcher) {
                 return Some(
                     PermissionDecision::deny(format!("Permission to use {} has been denied", tool))
-                        .with_decision_reason(format!("Rule: {}", rule.rule_content.as_deref().unwrap_or(""))),
+                        .with_decision_reason(format!(
+                            "Rule: {}",
+                            rule.rule_content.as_deref().unwrap_or("")
+                        )),
                 );
             }
         }
         None
     }
 
-    fn check_ask_rules<F>(&self, tool: &str, input: &JsonMap, matcher: &F) -> Option<PermissionDecision>
-    where F: Fn(&str, &JsonMap) -> bool {
+    fn check_ask_rules<F>(
+        &self,
+        tool: &str,
+        input: &JsonMap,
+        matcher: &F,
+    ) -> Option<PermissionDecision>
+    where
+        F: Fn(&str, &JsonMap) -> bool,
+    {
         for rule in rules_for(&self.ask_rules, tool) {
             if rule_matches(rule, input, matcher) {
                 return Some(
                     PermissionDecision::ask(format!("Permission required for {}", tool))
-                        .with_decision_reason(format!("Rule: {}", rule.rule_content.as_deref().unwrap_or(""))),
+                        .with_decision_reason(format!(
+                            "Rule: {}",
+                            rule.rule_content.as_deref().unwrap_or("")
+                        )),
                 );
             }
         }
         None
     }
 
-    fn check_allow_rules<F>(&self, tool: &str, input: &JsonMap, matcher: &F) -> Option<PermissionDecision>
-    where F: Fn(&str, &JsonMap) -> bool {
+    fn check_allow_rules<F>(
+        &self,
+        tool: &str,
+        input: &JsonMap,
+        matcher: &F,
+    ) -> Option<PermissionDecision>
+    where
+        F: Fn(&str, &JsonMap) -> bool,
+    {
         for rule in rules_for(&self.allow_rules, tool) {
             if rule_matches(rule, input, matcher) {
                 return Some(
@@ -334,12 +406,17 @@ impl PermissionEngine {
     }
 }
 
-fn rules_for<'a>(table: &'a HashMap<String, Vec<PermissionRule>>, tool: &str) -> &'a [PermissionRule] {
+fn rules_for<'a>(
+    table: &'a HashMap<String, Vec<PermissionRule>>,
+    tool: &str,
+) -> &'a [PermissionRule] {
     table.get(tool).map(|v| v.as_slice()).unwrap_or(&[])
 }
 
 fn rule_matches<F>(rule: &PermissionRule, input: &JsonMap, matcher: &F) -> bool
-where F: Fn(&str, &JsonMap) -> bool {
+where
+    F: Fn(&str, &JsonMap) -> bool,
+{
     match &rule.rule_content {
         Some(c) if !c.is_empty() => matcher(c, input),
         _ => true,

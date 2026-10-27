@@ -76,13 +76,19 @@ mod tests {
     #[test]
     fn exact_and_family() {
         assert_eq!(resolve_context_window("deepseek-chat"), 256_000);
-        assert_eq!(resolve_context_window("claude-3-7-sonnet-20250219"), 200_000);
+        assert_eq!(
+            resolve_context_window("claude-3-7-sonnet-20250219"),
+            200_000
+        );
         assert_eq!(resolve_context_window("grok-3"), 131_072);
     }
 
     #[test]
     fn unknown_falls_back_to_default() {
-        assert_eq!(resolve_context_window("some-custom-model"), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(
+            resolve_context_window("some-custom-model"),
+            DEFAULT_CONTEXT_WINDOW
+        );
         assert_eq!(resolve_context_window(""), DEFAULT_CONTEXT_WINDOW);
     }
 }

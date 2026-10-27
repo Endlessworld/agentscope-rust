@@ -19,12 +19,18 @@ pub struct BoundSql {
 impl BoundSql {
     /// Creates a new `BoundSql` with the given SQL and params.
     pub fn new(sql: impl Into<String>, params: Vec<SqlParam>) -> Self {
-        Self { sql: sql.into(), params }
+        Self {
+            sql: sql.into(),
+            params,
+        }
     }
 
     /// Creates a `BoundSql` with no parameters.
     pub fn no_params(sql: impl Into<String>) -> Self {
-        Self { sql: sql.into(), params: Vec::new() }
+        Self {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
     }
 
     /// Creates a `BoundSql` from a list of text parameters.

@@ -79,12 +79,22 @@ pub fn emit(diagnostic: &ConversionDiagnostic) {
 
 /// Convenience: builds and emits a `warning` diagnostic.
 pub fn warn(code: impl Into<String>, path: impl Into<String>, message: impl Into<String>) {
-    emit(&ConversionDiagnostic::new(Severity::Warning, code, path, message));
+    emit(&ConversionDiagnostic::new(
+        Severity::Warning,
+        code,
+        path,
+        message,
+    ));
 }
 
 /// Convenience: builds and emits an `info` diagnostic.
 pub fn info(code: impl Into<String>, path: impl Into<String>, message: impl Into<String>) {
-    emit(&ConversionDiagnostic::new(Severity::Info, code, path, message));
+    emit(&ConversionDiagnostic::new(
+        Severity::Info,
+        code,
+        path,
+        message,
+    ));
 }
 
 /// Accumulates diagnostics for callers that want to inspect them.

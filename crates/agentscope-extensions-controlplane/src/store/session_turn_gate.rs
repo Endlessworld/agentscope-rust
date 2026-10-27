@@ -99,7 +99,11 @@ pub fn lease_body(agent_name: &str, namespace: &str, name: &str, owner_token: &s
 pub fn parse_owner_token(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| v.get("ownerToken").and_then(|t| t.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("ownerToken")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default()
 }
 
@@ -203,7 +207,10 @@ impl ControlPlaneSessionTurnGate {
     /// Falls back to the process-local gate once the control plane has been unreachable
     /// for [`LockTiming::unreachable_fallback`]; reports [`TurnBusyException`] when the
     /// remote lock is held beyond [`LockTiming::acquire_timeout`].
-    pub async fn acquire(&self, gate_key: &str) -> Result<ControlPlaneTurnLease, TurnBusyException> {
+    pub async fn acquire(
+        &self,
+        gate_key: &str,
+    ) -> Result<ControlPlaneTurnLease, TurnBusyException> {
         let lock_name = compose_lock_name(gate_key);
         let acquire_deadline = tokio::time::Instant::now() + self.timing.acquire_timeout;
         let mut unreachable_deadline: Option<tokio::time::Instant> = None;
@@ -226,8 +233,9 @@ impl ControlPlaneSessionTurnGate {
                     tokio::time::sleep(self.timing.retry_interval).await;
                 }
                 Err(_) => {
-                    let deadline = *unreachable_deadline
-                        .get_or_insert(tokio::time::Instant::now() + self.timing.unreachable_fallback);
+                    let deadline = *unreachable_deadline.get_or_insert(
+                        tokio::time::Instant::now() + self.timing.unreachable_fallback,
+                    );
                     if tokio::time::Instant::now() >= deadline {
                         tracing::warn!(lock = %lock_name, "controlplane: control plane unreachable; using process-local turn gate");
                         let guard = self.local_fallback.acquire(gate_key).await;

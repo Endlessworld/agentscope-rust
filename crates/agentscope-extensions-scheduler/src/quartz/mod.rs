@@ -17,7 +17,7 @@ mod registry;
 mod task;
 
 pub use cron::{CronExpression, CronParseError};
-pub use registry::{SchedulerRegistry, scheduler_registry};
+pub use registry::{scheduler_registry, SchedulerRegistry};
 pub use task::{QuartzScheduleAgentTask, TaskStatus};
 
 use std::collections::HashMap;
@@ -113,7 +113,10 @@ impl QuartzAgentScheduler {
             input,
         ));
 
-        self.jobs.write().unwrap().insert(name.clone(), task.clone());
+        self.jobs
+            .write()
+            .unwrap()
+            .insert(name.clone(), task.clone());
 
         let handle = spawn_job(self.context(), task.clone(), schedule_config.clone(), cron);
         task.attach(handle);
@@ -123,7 +126,9 @@ impl QuartzAgentScheduler {
     }
 
     fn context(&self) -> JobContext {
-        JobContext { scheduler_id: self.scheduler_id.clone() }
+        JobContext {
+            scheduler_id: self.scheduler_id.clone(),
+        }
     }
 
     /// Pauses a task, if present.
@@ -170,8 +175,11 @@ impl QuartzAgentScheduler {
 
     /// Returns the current status of a task, if present.
     pub fn get_status(&self, name: &str) -> Option<TaskStatus> {
-        self.get_scheduled_agent(name)
-            .and_then(|t| t.as_any().downcast_ref::<QuartzScheduleAgentTask>().map(|q| q.status()))
+        self.get_scheduled_agent(name).and_then(|t| {
+            t.as_any()
+                .downcast_ref::<QuartzScheduleAgentTask>()
+                .map(|q| q.status())
+        })
     }
 
     /// Triggers one execution of a task by name (manual run).
@@ -183,7 +191,9 @@ impl QuartzAgentScheduler {
             .as_any()
             .downcast_ref::<QuartzScheduleAgentTask>()
             .ok_or_else(|| SchedulerError::new("Unexpected task type"))?;
-        q.execute().await.map_err(|e| SchedulerError::new(e.to_string()))
+        q.execute()
+            .await
+            .map_err(|e| SchedulerError::new(e.to_string()))
     }
 }
 
@@ -206,7 +216,10 @@ fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<CronPlan>, Sc
             "CronExpression '{expression}' has an invalid time zone: {e}"
         ))
     })?;
-    Ok(Some(CronPlan { expression: parsed, offset }))
+    Ok(Some(CronPlan {
+        expression: parsed,
+        offset,
+    }))
 }
 
 /// Context handed to a spawned job loop.
@@ -217,7 +230,10 @@ pub(crate) struct JobContext {
 
 impl JobContext {
     /// Runs a single execution of the task located via the registry.
-    pub(crate) async fn run_task(&self, task: &Arc<QuartzScheduleAgentTask>) -> agentscope_core::error::Result<Msg> {
+    pub(crate) async fn run_task(
+        &self,
+        task: &Arc<QuartzScheduleAgentTask>,
+    ) -> agentscope_core::error::Result<Msg> {
         // The registry is consulted to mirror the Java job's indirection; the
         // task itself already holds its runtime config + factory.
         let _ = scheduler_registry().contains(self.scheduler_id.as_str());
@@ -341,8 +357,14 @@ mod tests {
     #[tokio::test]
     async fn duplicate_schedule_returns_existing() {
         let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
-        let a = sched.schedule_runtime(runtime("A"), ScheduleConfig::none(), None).await.unwrap();
-        let b = sched.schedule_runtime(runtime("A"), ScheduleConfig::none(), None).await.unwrap();
+        let a = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+        let b = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
         assert_eq!(a.id(), b.id());
         assert_eq!(sched.all_schedule_agent_tasks().len(), 1);
     }
@@ -350,7 +372,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_removes_task() {
         let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
-        sched.schedule_runtime(runtime("A"), ScheduleConfig::none(), None).await.unwrap();
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
         assert!(sched.cancel("A").await);
         assert!(sched.get_scheduled_agent("A").is_none());
         assert!(!sched.cancel("A").await);
@@ -360,7 +385,14 @@ mod tests {
     async fn pause_resume_and_status() {
         let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
         sched
-            .schedule_runtime(runtime("A"), ScheduleConfig::builder().fixed_rate(100_000).build().unwrap(), None)
+            .schedule_runtime(
+                runtime("A"),
+                ScheduleConfig::builder()
+                    .fixed_rate(100_000)
+                    .build()
+                    .unwrap(),
+                None,
+            )
             .await
             .unwrap();
         assert!(sched.pause("A"));
@@ -372,7 +404,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_clears_registry_and_tasks() {
         let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
-        sched.schedule_runtime(runtime("A"), ScheduleConfig::none(), None).await.unwrap();
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
         sched.shutdown().await;
         assert!(sched.all_schedule_agent_tasks().is_empty());
         assert!(sched
@@ -389,7 +424,10 @@ mod tests {
             fixed_rate: Some(0),
             ..Default::default()
         };
-        assert!(sched.schedule_runtime(runtime("A"), bad, None).await.is_err());
+        assert!(sched
+            .schedule_runtime(runtime("A"), bad, None)
+            .await
+            .is_err());
     }
 
     fn expect_err<T>(result: Result<T, SchedulerError>, what: &str) -> SchedulerError {
@@ -417,8 +455,14 @@ mod tests {
         assert!(sched.all_schedule_agent_tasks().is_empty());
 
         // `0` is not a Quartz weekday.
-        let cfg = ScheduleConfig::builder().cron("0 0 8 * * 0").build().unwrap();
-        assert!(sched.schedule_runtime(runtime("A"), cfg, None).await.is_err());
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * 0")
+            .build()
+            .unwrap();
+        assert!(sched
+            .schedule_runtime(runtime("A"), cfg, None)
+            .await
+            .is_err());
         assert!(sched.all_schedule_agent_tasks().is_empty());
     }
 
@@ -446,7 +490,10 @@ mod tests {
             .zone_id("Asia/Shanghai")
             .build()
             .unwrap();
-        let task = sched.schedule_runtime(runtime("A"), cfg, None).await.unwrap();
+        let task = sched
+            .schedule_runtime(runtime("A"), cfg, None)
+            .await
+            .unwrap();
         assert_eq!(task.name(), "A");
         assert!(sched.cancel("A").await);
     }

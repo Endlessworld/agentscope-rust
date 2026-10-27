@@ -179,10 +179,9 @@ impl ChannelCore {
     /// Java `msgId.ifPresent(...)` pattern where an absent id skips the check entirely.
     pub fn is_first_seen(&self, key: Option<&str>) -> bool {
         match key {
-            Some(key) if !key.trim().is_empty() => {
-                self.deduplicator
-                    .first_seen(&format!("{}|{key}", self.ctx.channel_id()))
-            }
+            Some(key) if !key.trim().is_empty() => self
+                .deduplicator
+                .first_seen(&format!("{}|{key}", self.ctx.channel_id())),
             _ => true,
         }
     }
@@ -244,11 +243,17 @@ mod tests {
     use crate::common::token::{AccessTokenStore, CachedAccessToken, InMemoryAccessTokenStore};
 
     fn core() -> ChannelCore {
-        ChannelCore::new("feishu", ChannelConfig::of_with_default("feishu", "agent-1"))
+        ChannelCore::new(
+            "feishu",
+            ChannelConfig::of_with_default("feishu", "agent-1"),
+        )
     }
 
     fn inbound(peer: Peer) -> InboundMessage {
-        let msg = Msg::builder().role(MsgRole::User).text_content("hi").build();
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .text_content("hi")
+            .build();
         InboundMessage::builder("feishu", peer, vec![msg]).build()
     }
 
@@ -406,11 +411,17 @@ mod tests {
     async fn run_turn_requires_a_gateway_and_reports_a_missing_agent() {
         let c = core();
         // No gateway injected yet.
-        assert!(c.run_turn(&inbound(Peer::direct("u1")), None).await.is_err());
+        assert!(c
+            .run_turn(&inbound(Peer::direct("u1")), None)
+            .await
+            .is_err());
 
         // Gateway present but no agent bound -> the harness gateway reports the missing agent.
         c.init(Arc::new(HarnessGateway::create_standalone()));
-        let err = c.run_turn(&inbound(Peer::direct("u1")), None).await.unwrap_err();
+        let err = c
+            .run_turn(&inbound(Peer::direct("u1")), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("bind_main_agent"), "{err}");
     }
 }

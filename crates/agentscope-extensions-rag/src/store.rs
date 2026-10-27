@@ -283,7 +283,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.len(), 2);
 
-        let hits = store.search(&SearchQuery::new(vec![1.0, 0.0], 5)).await.unwrap();
+        let hits = store
+            .search(&SearchQuery::new(vec![1.0, 0.0], 5))
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].metadata.content_text(), "A");
         assert!((hits[0].score.unwrap() - 1.0).abs() < 1e-9);
@@ -323,7 +326,10 @@ mod tests {
     async fn default_delete_is_unsupported_but_in_memory_overrides_it() {
         let store = InMemoryStore::new(2).unwrap();
         store.add(vec![doc("A", vec![1.0, 0.0])]).await.unwrap();
-        let id = store.search(&SearchQuery::new(vec![1.0, 0.0], 1)).await.unwrap()[0]
+        let id = store
+            .search(&SearchQuery::new(vec![1.0, 0.0], 1))
+            .await
+            .unwrap()[0]
             .id
             .clone();
         assert!(store.delete(&id).await.unwrap());

@@ -49,7 +49,10 @@ impl JdbcStore {
     }
 
     /// Creates a store with schema auto-creation enabled.
-    pub fn with_schema(executor: SharedExecutor, dialect: Arc<dyn AbstractJdbcDialect>) -> JdbcResult<Self> {
+    pub fn with_schema(
+        executor: SharedExecutor,
+        dialect: Arc<dyn AbstractJdbcDialect>,
+    ) -> JdbcResult<Self> {
         Self::new(executor, dialect, true)
     }
 
@@ -58,8 +61,7 @@ impl JdbcStore {
     pub fn initialize_schema(&self) -> JdbcResult<()> {
         let ddls = self.dialect.store_create_table_ddls();
         for ddl in &ddls {
-            self.executor
-                .execute(&BoundSql::no_params(ddl.clone()))?;
+            self.executor.execute(&BoundSql::no_params(ddl.clone()))?;
         }
         validate_table_schema(
             &*self.executor,
@@ -135,7 +137,11 @@ impl BaseStore for JdbcStore {
         }
         let path = Self::namespace_path(namespace);
         let (json, version) = self.read_raw(&path, key).ok()??;
-        Some(StoreItem::new(key, Self::parse_value(&json), version as u64))
+        Some(StoreItem::new(
+            key,
+            Self::parse_value(&json),
+            version as u64,
+        ))
     }
 
     fn put(&self, namespace: &[String], key: &str, value: StoreValue) {
@@ -146,7 +152,9 @@ impl BaseStore for JdbcStore {
         let Ok(json) = Self::serialize_value(&value) else {
             return;
         };
-        let bound = self.dialect.store_upsert(&path, key, &json, crate::now_millis());
+        let bound = self
+            .dialect
+            .store_upsert(&path, key, &json, crate::now_millis());
         let _ = self.executor.execute(&bound);
     }
 
@@ -179,13 +187,9 @@ impl BaseStore for JdbcStore {
             };
         }
 
-        let bound = self.dialect.store_cas_update(
-            &json,
-            timestamp,
-            &path,
-            key,
-            expected_version as i64,
-        );
+        let bound =
+            self.dialect
+                .store_cas_update(&json, timestamp, &path, key, expected_version as i64);
         match self.executor.execute(&bound) {
             Ok(affected) => affected == 1,
             Err(e) => {

@@ -8,9 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    pending_interactions, session_error, SessionEvent, SessionLog, SessionProjection,
-};
+use super::{pending_interactions, session_error, SessionEvent, SessionLog, SessionProjection};
 use crate::message::{ContentBlock, Msg, MsgRole};
 use crate::state::AgentState;
 
@@ -25,10 +23,7 @@ pub struct Snapshot {
 }
 
 /// Reads one committed prefix without acquiring a writer or changing session history.
-pub async fn read<F>(
-    log: &dyn SessionLog,
-    initial_state: F,
-) -> crate::error::Result<Snapshot>
+pub async fn read<F>(log: &dyn SessionLog, initial_state: F) -> crate::error::Result<Snapshot>
 where
     F: FnOnce() -> AgentState,
 {
@@ -98,7 +93,15 @@ where
     let writer = log
         .acquire(&uuid::Uuid::new_v4().to_string(), LEASE)
         .await?;
-    let result = change_locked(log, writer.clone(), initial_state, reason, replacement, mutation).await;
+    let result = change_locked(
+        log,
+        writer.clone(),
+        initial_state,
+        reason,
+        replacement,
+        mutation,
+    )
+    .await;
     let _ = log.release(&writer).await;
     result
 }
@@ -188,7 +191,10 @@ where
         if previous_ids.contains(&message.id) {
             continue;
         }
-        push(message_event_type(message), serde_json::json!({ "message": message }))?;
+        push(
+            message_event_type(message),
+            serde_json::json!({ "message": message }),
+        )?;
     }
     for (field, event_type) in [
         ("tasks_context", "task/changed"),
@@ -264,10 +270,15 @@ mod tests {
 
     async fn seeded() -> Arc<dyn SessionLog> {
         let log = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let state = initial();
         recorder.start(&[], &state).await.unwrap();
-        recorder.checkpoint_now(&state, "before_model").await.unwrap();
+        recorder
+            .checkpoint_now(&state, "before_model")
+            .await
+            .unwrap();
         recorder.close().await;
         log
     }
@@ -281,10 +292,7 @@ mod tests {
         assert_eq!(snapshot.state.user_id.as_deref(), Some("alice"));
         assert!(snapshot.as_of_seq > 0);
         // Reading never acquires the writer lease.
-        let writer = log
-            .acquire("probe", Duration::from_secs(10))
-            .await
-            .unwrap();
+        let writer = log.acquire("probe", Duration::from_secs(10)).await.unwrap();
         log.release(&writer).await.unwrap();
     }
 
@@ -313,7 +321,10 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("preserve session identity"), "{err}");
+        assert!(
+            err.to_string().contains("preserve session identity"),
+            "{err}"
+        );
 
         let err = update(Arc::clone(&log), initial, "   ", |state| {
             state.summary = "x".into();
@@ -361,13 +372,18 @@ mod tests {
         let err = replace(Arc::clone(&log), initial, "manual_edit", stale)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("changed since inspection"), "{err}");
+        assert!(
+            err.to_string().contains("changed since inspection"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn context_replacement_is_blocked_while_an_interaction_is_pending() {
         let log = seeded().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
         let mut data = crate::event::EventData::default();
         data.fields.insert(
             "toolCalls".into(),

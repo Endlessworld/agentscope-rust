@@ -90,10 +90,7 @@ impl SqlRow {
 
     /// Fetches a column value, or [`SqlValue::Null`] when absent.
     pub fn get(&self, column: &str) -> SqlValue {
-        self.columns
-            .get(column)
-            .cloned()
-            .unwrap_or(SqlValue::Null)
+        self.columns.get(column).cloned().unwrap_or(SqlValue::Null)
     }
 
     /// Fetches a text column, or `None` when `NULL`/absent.
@@ -117,7 +114,11 @@ pub trait SqlConnection: Send {
     fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<usize, SkillRepositoryError>;
 
     /// Runs a query and returns all rows.
-    fn query(&mut self, sql: &str, params: &[SqlParam]) -> Result<Vec<SqlRow>, SkillRepositoryError>;
+    fn query(
+        &mut self,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> Result<Vec<SqlRow>, SkillRepositoryError>;
 
     /// Runs an insert and returns the generated primary key.
     fn insert_returning_id(
@@ -211,7 +212,12 @@ impl InMemorySqlDatabase {
 
     /// The declared `metadata_json` column type of a table, if the column exists.
     pub fn metadata_column_type(&self, table: &str) -> Option<String> {
-        self.state.lock().unwrap().metadata_columns.get(table).cloned()
+        self.state
+            .lock()
+            .unwrap()
+            .metadata_columns
+            .get(table)
+            .cloned()
     }
 
     /// Returns `true` when the table exists.
@@ -261,8 +267,16 @@ pub struct InMemoryConnection {
 }
 
 enum StagedWrite {
-    Insert { table: String, row: HashMap<String, SqlValue>, id: i64 },
-    Delete { table: String, column: String, value: SqlValue },
+    Insert {
+        table: String,
+        row: HashMap<String, SqlValue>,
+        id: i64,
+    },
+    Delete {
+        table: String,
+        column: String,
+        value: SqlValue,
+    },
 }
 
 impl InMemoryConnection {
@@ -487,11 +501,7 @@ impl SqlConnection for InMemoryConnection {
                 }
             };
             row.entry("id".to_string()).or_insert(SqlValue::Int(id));
-            let write = StagedWrite::Insert {
-                table,
-                row,
-                id,
-            };
+            let write = StagedWrite::Insert { table, row, id };
             if self.auto_commit {
                 self.apply_write(write);
             } else {
@@ -502,7 +512,11 @@ impl SqlConnection for InMemoryConnection {
         Ok(0)
     }
 
-    fn query(&mut self, sql: &str, params: &[SqlParam]) -> Result<Vec<SqlRow>, SkillRepositoryError> {
+    fn query(
+        &mut self,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> Result<Vec<SqlRow>, SkillRepositoryError> {
         let lower = sql.to_ascii_lowercase();
         // Column probe for metadata_json support. Must be matched before the generic
         // table-existence probe because the SQL also contains `INFORMATION_SCHEMA`.
@@ -516,14 +530,8 @@ impl SqlConnection for InMemoryConnection {
                     _ => None,
                 })
                 .nth(1);
-            let data_type = table.and_then(|t| {
-                self.state
-                    .lock()
-                    .unwrap()
-                    .metadata_columns
-                    .get(&t)
-                    .cloned()
-            });
+            let data_type =
+                table.and_then(|t| self.state.lock().unwrap().metadata_columns.get(&t).cloned());
             return Ok(match data_type {
                 Some(data_type) => {
                     vec![SqlRow::new([("DATA_TYPE", SqlValue::Text(data_type))])]
@@ -616,11 +624,7 @@ impl SqlConnection for InMemoryConnection {
             entry.next_id
         };
         row.insert("id".to_string(), SqlValue::Int(id));
-        let write = StagedWrite::Insert {
-            table,
-            row,
-            id,
-        };
+        let write = StagedWrite::Insert { table, row, id };
         if self.auto_commit {
             self.apply_write(write);
         } else {

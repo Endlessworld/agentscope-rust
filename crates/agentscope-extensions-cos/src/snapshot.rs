@@ -84,7 +84,9 @@ pub struct CosSnapshotSpec {
 impl CosSnapshotSpec {
     pub fn new(object_store: SharedObjectStore, key_prefix: Option<&str>) -> Self {
         let key_prefix = normalize_optional_prefix(key_prefix);
-        let client = Arc::new(CosRemoteSnapshotClient::new(object_store, key_prefix.as_str().into()).clone());
+        let client = Arc::new(
+            CosRemoteSnapshotClient::new(object_store, key_prefix.as_str().into()).clone(),
+        );
         Self {
             inner: RemoteSnapshotSpec::new(client),
             key_prefix,
@@ -126,7 +128,8 @@ mod tests {
 
     #[tokio::test]
     async fn upload_download_exists_roundtrip() {
-        let client = CosRemoteSnapshotClient::new(InMemoryCosObjectStore::new().shared(), Some("snap/"));
+        let client =
+            CosRemoteSnapshotClient::new(InMemoryCosObjectStore::new().shared(), Some("snap/"));
         assert!(!client.exists("s1").await.unwrap());
         client.upload("s1", b"archive").await.unwrap();
         assert!(client.exists("s1").await.unwrap());

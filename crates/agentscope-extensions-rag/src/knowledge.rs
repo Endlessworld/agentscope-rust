@@ -74,7 +74,11 @@ mod tests {
     fn filter_sorts_descending_and_truncates() {
         let cfg = RetrieveConfig::new(2, 0.0);
         let out = filter_and_rank(
-            vec![doc("a", Some(0.1)), doc("b", Some(0.9)), doc("c", Some(0.5))],
+            vec![
+                doc("a", Some(0.1)),
+                doc("b", Some(0.9)),
+                doc("c", Some(0.5)),
+            ],
             &cfg,
         );
         assert_eq!(out.len(), 2);

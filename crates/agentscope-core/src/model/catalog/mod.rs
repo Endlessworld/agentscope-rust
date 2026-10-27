@@ -26,8 +26,8 @@ pub use refresh::{CatalogFetcher, FetchResponse, FetchStatus, HttpFetcher};
 pub use resolve::{resolve, ResolveRequest};
 pub use store::CatalogStorage;
 pub use types::{
-    CatalogConfidence, CatalogEvent, CatalogSnapshot, Cost, MatchKind, ModelDescriptor, ModelKind,
-    ModelStatus, ModalitySet, ReasoningOption, Resolution, SourceInfo, UseCaseSet,
+    CatalogConfidence, CatalogEvent, CatalogSnapshot, Cost, MatchKind, ModalitySet,
+    ModelDescriptor, ModelKind, ModelStatus, ReasoningOption, Resolution, SourceInfo, UseCaseSet,
     CATALOG_SCHEMA_VERSION, DEFAULT_CONTEXT_WINDOW, DEFAULT_RESERVED_OUTPUT, MAX_SAFETY_MARGIN,
 };
 pub use wrap::{descriptor_for, CatalogAwareModel};
@@ -94,10 +94,7 @@ impl ModelCatalog {
     }
 
     /// Builds a catalog with an injected fetcher (tests, enterprise mirrors, fixtures).
-    pub fn with_fetcher(
-        config: CatalogConfig,
-        fetcher: Arc<dyn CatalogFetcher>,
-    ) -> Self {
+    pub fn with_fetcher(config: CatalogConfig, fetcher: Arc<dyn CatalogFetcher>) -> Self {
         let storage = CatalogStorage::new(config.cache_dir.clone());
         let snapshot = if config.enabled {
             storage.read_snapshot()
@@ -203,14 +200,7 @@ impl ModelCatalog {
             model_id: request.model_id.to_string(),
             base_url: request.base_url.map(ToString::to_string),
         };
-        if let Some(cached) = self
-            .inner
-            .resolve_cache
-            .read()
-            .unwrap()
-            .get(&key)
-            .cloned()
-        {
+        if let Some(cached) = self.inner.resolve_cache.read().unwrap().get(&key).cloned() {
             return cached;
         }
         let resolution = resolve::resolve(&snapshot, request);
@@ -292,17 +282,11 @@ impl ModelCatalog {
         if !self.inner.config.enabled {
             return;
         }
-        if self
-            .inner
-            .background_started
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.inner.background_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.inner
-                .background_started
-                .store(false, Ordering::SeqCst);
+            self.inner.background_started.store(false, Ordering::SeqCst);
             return;
         };
         let catalog = self.clone();
@@ -375,10 +359,8 @@ mod tests {
         CatalogConfig {
             models_url: "mem://models".into(),
             api_url: "mem://api".into(),
-            cache_dir: std::env::temp_dir().join(format!(
-                "agentscope-catalog-unit-{}",
-                uuid::Uuid::new_v4()
-            )),
+            cache_dir: std::env::temp_dir()
+                .join(format!("agentscope-catalog-unit-{}", uuid::Uuid::new_v4())),
             ..CatalogConfig::default()
         }
     }
@@ -404,7 +386,10 @@ mod tests {
         });
         let catalog = ModelCatalog::with_fetcher(config(), fetcher);
         let outcome = catalog.refresh().await.unwrap();
-        assert!(matches!(outcome, RefreshOutcome::Updated { generation: 1, .. }));
+        assert!(matches!(
+            outcome,
+            RefreshOutcome::Updated { generation: 1, .. }
+        ));
         assert_eq!(catalog.generation(), 1);
         let result = catalog.resolve(&ResolveRequest::new("m"));
         assert_eq!(result.kind, MatchKind::ExactBare);

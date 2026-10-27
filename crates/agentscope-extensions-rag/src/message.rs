@@ -70,7 +70,9 @@ pub fn build_retrieved_knowledge_msg(documents: &[Document]) -> Msg {
         blocks.push(doc.metadata.content.clone());
     }
 
-    blocks.push(ContentBlock::Text(TextBlock::new(RETRIEVED_KNOWLEDGE_CLOSE)));
+    blocks.push(ContentBlock::Text(TextBlock::new(
+        RETRIEVED_KNOWLEDGE_CLOSE,
+    )));
 
     Msg::builder()
         .name("user")

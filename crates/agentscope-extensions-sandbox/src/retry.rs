@@ -95,9 +95,7 @@ where
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        SandboxExtensionError::Transport("retry exhausted".to_string())
-    }))
+    Err(last_err.unwrap_or_else(|| SandboxExtensionError::Transport("retry exhausted".to_string())))
 }
 
 #[cfg(test)]

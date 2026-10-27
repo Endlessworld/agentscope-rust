@@ -204,8 +204,14 @@ mod tests {
                 "item_list": [{ "type": 1, "text_item": { "text": "hi" } }],
             })))
             .expect("mapped");
-        assert!(inbound.messages[0].metadata().get(META_MESSAGE_ID).is_none());
-        assert!(inbound.messages[0].metadata().get(META_CONTEXT_TOKEN).is_none());
+        assert!(inbound.messages[0]
+            .metadata()
+            .get(META_MESSAGE_ID)
+            .is_none());
+        assert!(inbound.messages[0]
+            .metadata()
+            .get(META_CONTEXT_TOKEN)
+            .is_none());
         assert_eq!(context_token_of(&inbound.messages[0]), None);
     }
 }

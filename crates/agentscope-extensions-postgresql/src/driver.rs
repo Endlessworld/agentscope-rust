@@ -71,8 +71,10 @@ impl PostgresClient for PgSimpleClient {
     fn query(&self, sql: &str, params: &[SqlValue]) -> PgResult<QueryOutcome> {
         let owned: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
             params.iter().map(boxed).collect();
-        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            owned.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = owned
+            .iter()
+            .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.runtime.block_on(async {
             let upper = sql.trim_start().to_uppercase();
@@ -124,7 +126,10 @@ fn decode_row(row: &tokio_postgres::Row) -> Row {
 }
 
 fn try_text(row: &tokio_postgres::Row, i: usize) -> Option<Cell> {
-    row.try_get::<_, Option<String>>(i).ok().flatten().map(Cell::Text)
+    row.try_get::<_, Option<String>>(i)
+        .ok()
+        .flatten()
+        .map(Cell::Text)
 }
 fn try_i64(row: &tokio_postgres::Row, i: usize) -> Option<i64> {
     row.try_get::<_, Option<i64>>(i).ok().flatten()

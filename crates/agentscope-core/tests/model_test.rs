@@ -7,12 +7,19 @@ use agentscope_core::{
 #[test]
 fn tool_choice_specific_validation() {
     let c = ToolChoice::specific("generate_response");
-    assert_eq!(c, ToolChoice::Specific { tool_name: "generate_response".into() });
+    assert_eq!(
+        c,
+        ToolChoice::Specific {
+            tool_name: "generate_response".into()
+        }
+    );
 }
 
 #[test]
 fn tool_choice_serialize_roundtrip() {
-    let c = ToolChoice::Specific { tool_name: "foo".into() };
+    let c = ToolChoice::Specific {
+        tool_name: "foo".into(),
+    };
     let json = serde_json::to_string(&c).unwrap();
     assert_eq!(json, r#"{"type":"specific","tool_name":"foo"}"#);
     let back: ToolChoice = serde_json::from_str(&json).unwrap();
@@ -22,7 +29,12 @@ fn tool_choice_serialize_roundtrip() {
 #[test]
 fn tool_schema_builder() {
     let schema = ToolSchema::new("add", "Add two numbers")
-        .parameters(serde_json::json!({"type": "object", "properties": {"a": {"type": "number"}}}).as_object().unwrap().clone())
+        .parameters(
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "number"}}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
         .strict(true);
     assert_eq!(schema.name, "add");
     assert_eq!(schema.strict, Some(true));
@@ -57,7 +69,10 @@ fn chat_response_serialize_roundtrip() {
 #[test]
 fn generate_options_merge_precedence() {
     let primary = GenerateOptions::builder().temperature(0.1).build();
-    let fallback = GenerateOptions::builder().temperature(0.7).top_p(0.9).build();
+    let fallback = GenerateOptions::builder()
+        .temperature(0.7)
+        .top_p(0.9)
+        .build();
     let merged = GenerateOptions::merge_options(&primary, &fallback);
     assert_eq!(merged.temperature, Some(0.1));
     assert_eq!(merged.top_p, Some(0.9));
@@ -65,7 +80,9 @@ fn generate_options_merge_precedence() {
 
 #[test]
 fn execution_config_merge() {
-    let primary = ExecutionConfig::builder().timeout(std::time::Duration::from_secs(30)).build();
+    let primary = ExecutionConfig::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
     let fallback = ExecutionConfig::model_defaults();
     let merged = ExecutionConfig::merge_configs(Some(&primary), Some(&fallback)).unwrap();
     assert_eq!(merged.timeout, Some(std::time::Duration::from_secs(30)));
@@ -96,7 +113,11 @@ fn execution_config_backoff() {
 
 #[test]
 fn response_format_serialize() {
-    let schema = JsonSchema::builder().name("MathResponse").schema(Default::default()).strict(true).build();
+    let schema = JsonSchema::builder()
+        .name("MathResponse")
+        .schema(Default::default())
+        .strict(true)
+        .build();
     let fmt = ResponseFormat::json_schema(schema);
     let json = serde_json::to_string(&fmt).unwrap();
     assert!(json.contains("\"type\":\"json_schema\""));

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use agentscope_core::{
-    ExtendedModel, FunctionTool, JsonMap, SimpleExtendedModel, ToolCallParam,
-    ToolExecutionContext, ToolGroupScope, ToolResultBlock, ToolUseBlock, Toolkit,
+    ExtendedModel, FunctionTool, JsonMap, SimpleExtendedModel, ToolCallParam, ToolExecutionContext,
+    ToolGroupScope, ToolResultBlock, ToolUseBlock, Toolkit,
 };
 
 #[test]
@@ -18,7 +18,10 @@ fn tool_call_param_builder_and_accessors() {
         .agent_id("agent-42")
         .build();
     assert_eq!(param.tool_use_block().unwrap().id, "call-1");
-    assert_eq!(param.input().get("query").unwrap(), &serde_json::json!("rust"));
+    assert_eq!(
+        param.input().get("query").unwrap(),
+        &serde_json::json!("rust")
+    );
     assert_eq!(param.agent_id(), Some("agent-42"));
     assert!(param.emitter().is_none());
     // Convenience constructor.
@@ -29,12 +32,18 @@ fn tool_call_param_builder_and_accessors() {
 #[test]
 fn simple_extended_model_merges_properties_and_required() {
     let mut props = JsonMap::new();
-    props.insert("timeout".to_string(), serde_json::json!({"type": "integer"}));
+    props.insert(
+        "timeout".to_string(),
+        serde_json::json!({"type": "integer"}),
+    );
     let model = SimpleExtendedModel::new(props, vec!["timeout".to_string()]);
     let mut base = JsonMap::new();
     let mut base_props = JsonMap::new();
     base_props.insert("cmd".to_string(), serde_json::json!({"type": "string"}));
-    base.insert("properties".to_string(), serde_json::Value::Object(base_props));
+    base.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(base_props),
+    );
     let merged = model.merge_with_base_schema(base).expect("merge succeeds");
     let props = merged["properties"].as_object().unwrap();
     assert!(props.contains_key("cmd"));
@@ -51,7 +60,10 @@ fn simple_extended_model_detects_conflicts() {
     let mut base = JsonMap::new();
     let mut base_props = JsonMap::new();
     base_props.insert("cmd".to_string(), serde_json::json!({"type": "string"}));
-    base.insert("properties".to_string(), serde_json::Value::Object(base_props));
+    base.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(base_props),
+    );
     let err = model.merge_with_base_schema(base).unwrap_err();
     assert!(err.to_string().contains("conflicting"));
 }
@@ -61,12 +73,7 @@ async fn reset_equipped_tools_replaces_meta_active_groups() {
     let tk = Toolkit::new();
     tk.create_tool_group_with_scope("coding", "code tools", true, ToolGroupScope::Meta);
     tk.create_tool_group_with_scope("web", "web tools", false, ToolGroupScope::Meta);
-    tk.create_tool_group_with_scope(
-        "ext",
-        "external",
-        true,
-        ToolGroupScope::External,
-    );
+    tk.create_tool_group_with_scope("ext", "external", true, ToolGroupScope::External);
     // A grouped tool to observe activation through schema filtering.
     tk.register_tool(Arc::new(FunctionTool::new(
         "fmt",
@@ -77,7 +84,9 @@ async fn reset_equipped_tools_replaces_meta_active_groups() {
     tk.add_tool_to_group("coding", "fmt");
 
     tk.register_meta_tools();
-    assert!(tk.tool_names().contains(&"reset_equipped_tools".to_string()));
+    assert!(tk
+        .tool_names()
+        .contains(&"reset_equipped_tools".to_string()));
 
     let mut input = JsonMap::new();
     input.insert("to_activate".to_string(), serde_json::json!(["coding"]));
@@ -89,9 +98,18 @@ async fn reset_equipped_tools_replaces_meta_active_groups() {
     assert!(rb.text_content().contains("coding"));
 
     let active = tk.get_active_groups();
-    assert!(active.contains(&"coding".to_string()), "coding activated: {active:?}");
-    assert!(!active.contains(&"web".to_string()), "web deactivated: {active:?}");
-    assert!(active.contains(&"ext".to_string()), "external unaffected: {active:?}");
+    assert!(
+        active.contains(&"coding".to_string()),
+        "coding activated: {active:?}"
+    );
+    assert!(
+        !active.contains(&"web".to_string()),
+        "web deactivated: {active:?}"
+    );
+    assert!(
+        active.contains(&"ext".to_string()),
+        "external unaffected: {active:?}"
+    );
     // The grouped tool becomes active again once its group is on.
     assert!(tk.is_tool_active("fmt"));
 }
@@ -99,12 +117,7 @@ async fn reset_equipped_tools_replaces_meta_active_groups() {
 #[tokio::test]
 async fn reset_equipped_tools_rejects_external_group() {
     let tk = Toolkit::new();
-    tk.create_tool_group_with_scope(
-        "ext",
-        "external",
-        true,
-        ToolGroupScope::External,
-    );
+    tk.create_tool_group_with_scope("ext", "external", true, ToolGroupScope::External);
     tk.register_meta_tools();
     let mut input = JsonMap::new();
     input.insert("to_activate".to_string(), serde_json::json!(["ext"]));
@@ -120,12 +133,7 @@ async fn reset_equipped_tools_rejects_external_group() {
 fn reset_tool_schema_lists_meta_groups() {
     let tk = Toolkit::new();
     tk.create_tool_group_with_scope("coding", "code", false, ToolGroupScope::Meta);
-    tk.create_tool_group_with_scope(
-        "ext",
-        "external",
-        false,
-        ToolGroupScope::External,
-    );
+    tk.create_tool_group_with_scope("ext", "external", false, ToolGroupScope::External);
     tk.register_meta_tools();
     let schema = tk
         .get_tool("reset_equipped_tools")
@@ -134,7 +142,10 @@ fn reset_tool_schema_lists_meta_groups() {
     let items = &schema.parameters["properties"]["to_activate"]["items"];
     let enum_list = items["enum"].as_array().expect("meta groups in enum");
     assert!(enum_list.iter().any(|v| v == "coding"));
-    assert!(!enum_list.iter().any(|v| v == "ext"), "external groups not in enum");
+    assert!(
+        !enum_list.iter().any(|v| v == "ext"),
+        "external groups not in enum"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +169,7 @@ fn toolkit_copy_rebinds_meta_tool_to_new_snapshot() {
 
     // The rebound tool's schema enum reflects only groups present at rebind time.
     let rebound_schema = copy.get_tool("reset_equipped_tools").unwrap().schema();
-    let enum_list =
-        &rebound_schema.parameters["properties"]["to_activate"]["items"]["enum"];
+    let enum_list = &rebound_schema.parameters["properties"]["to_activate"]["items"]["enum"];
     assert!(enum_list.as_array().unwrap().iter().any(|v| v == "coding"));
 
     // Original toolkit still has coding deactivated.
@@ -182,11 +192,12 @@ fn rb_block(r: agentscope_core::Result<ToolResultBlock>) -> ToolResultBlock {
 fn registration_extended_model_and_mcp_client_metadata() {
     let tk = Toolkit::new();
     let mut props = JsonMap::new();
-    props.insert("timeout".to_string(), serde_json::json!({"type": "integer"}));
-    let model: Arc<dyn ExtendedModel> = Arc::new(SimpleExtendedModel::new(
-        props,
-        vec!["timeout".to_string()],
-    ));
+    props.insert(
+        "timeout".to_string(),
+        serde_json::json!({"type": "integer"}),
+    );
+    let model: Arc<dyn ExtendedModel> =
+        Arc::new(SimpleExtendedModel::new(props, vec!["timeout".to_string()]));
 
     tk.register()
         .tool(Arc::new(FunctionTool::new(
@@ -204,7 +215,10 @@ fn registration_extended_model_and_mcp_client_metadata() {
     let schema = tk.get_tool("deploy").unwrap().schema();
     let merged_props = schema.parameters["properties"].as_object().unwrap();
     assert!(merged_props.contains_key("env"));
-    assert!(merged_props.contains_key("timeout"), "extended property merged");
+    assert!(
+        merged_props.contains_key("timeout"),
+        "extended property merged"
+    );
     assert!(
         schema.parameters["required"]
             .as_array()

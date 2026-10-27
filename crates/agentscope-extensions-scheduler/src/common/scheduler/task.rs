@@ -132,11 +132,14 @@ impl BaseScheduleAgentTask {
         }
         // Validate before creating an agent, mirroring Java `createAgent`.
         if self.agent_config.name().trim().is_empty()
-            || self.agent_config.sys_prompt().unwrap_or("").trim().is_empty()
+            || self
+                .agent_config
+                .sys_prompt()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
         {
-            return Err(Error::Agent(
-                AgentConfigError::MissingSysPrompt.to_string(),
-            ));
+            return Err(Error::Agent(AgentConfigError::MissingSysPrompt.to_string()));
         }
         let result = self.factory.run(&self.agent_config, messages).await;
         self.increment_execution_count();
@@ -208,7 +211,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_increments_count_and_delegates() {
-        let factory = Arc::new(CountingFactory { calls: AtomicUsize::new(0), fail: false });
+        let factory = Arc::new(CountingFactory {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        });
         let task = BaseScheduleAgentTask::new(
             Arc::new(runtime_config()),
             ScheduleConfig::none(),
@@ -222,12 +228,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_task_cannot_run() {
-        let factory = Arc::new(CountingFactory { calls: AtomicUsize::new(0), fail: false });
-        let task = BaseScheduleAgentTask::new(
-            Arc::new(runtime_config()),
-            ScheduleConfig::none(),
-            factory,
-        );
+        let factory = Arc::new(CountingFactory {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        });
+        let task =
+            BaseScheduleAgentTask::new(Arc::new(runtime_config()), ScheduleConfig::none(), factory);
         task.cancel();
         assert!(task.is_cancelled());
         let err = task.run_empty().await.unwrap_err();
@@ -236,17 +242,17 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_is_idempotent_and_invokes_callback_once() {
-        let factory = Arc::new(CountingFactory { calls: AtomicUsize::new(0), fail: false });
+        let factory = Arc::new(CountingFactory {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        });
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
-        let task = BaseScheduleAgentTask::new(
-            Arc::new(runtime_config()),
-            ScheduleConfig::none(),
-            factory,
-        )
-        .with_on_cancel(Arc::new(move |_name| {
-            hits_clone.fetch_add(1, Ordering::SeqCst);
-        }));
+        let task =
+            BaseScheduleAgentTask::new(Arc::new(runtime_config()), ScheduleConfig::none(), factory)
+                .with_on_cancel(Arc::new(move |_name| {
+                    hits_clone.fetch_add(1, Ordering::SeqCst);
+                }));
         task.cancel();
         task.cancel();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -254,17 +260,17 @@ mod tests {
 
     #[tokio::test]
     async fn missing_sys_prompt_fails_without_calling_factory() {
-        let factory = Arc::new(CountingFactory { calls: AtomicUsize::new(0), fail: false });
+        let factory = Arc::new(CountingFactory {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        });
         let cfg = RuntimeAgentConfig::builder()
             .name("A")
             .model_name("m")
             .build()
             .unwrap();
-        let task = BaseScheduleAgentTask::new(
-            Arc::new(cfg),
-            ScheduleConfig::none(),
-            factory.clone(),
-        );
+        let task =
+            BaseScheduleAgentTask::new(Arc::new(cfg), ScheduleConfig::none(), factory.clone());
         assert!(task.run_empty().await.is_err());
         assert_eq!(factory.calls.load(Ordering::SeqCst), 0);
         assert_eq!(task.execution_count(), 0);

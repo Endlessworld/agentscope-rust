@@ -10,10 +10,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::bus::async_tool::{AsyncToolRecord, AsyncToolRegistry};
 
@@ -34,7 +34,10 @@ impl WaitAsyncResultsTool {
     }
 
     /// Registers the tool into a toolkit.
-    pub fn register(toolkit: &agentscope_core::tool::Toolkit, registry: Arc<dyn AsyncToolRegistry>) {
+    pub fn register(
+        toolkit: &agentscope_core::tool::Toolkit,
+        registry: Arc<dyn AsyncToolRegistry>,
+    ) {
         toolkit.register_tool(Arc::new(Self::new(registry)));
     }
 }

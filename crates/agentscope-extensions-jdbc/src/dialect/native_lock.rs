@@ -69,10 +69,7 @@ pub fn normalize_lock_name(lock_name: &str) -> String {
     let hash = sha256_hex(lock_name);
     let prefix_length = MYSQL_MAX_LOCK_NAME_LENGTH - 1 - MYSQL_LOCK_NAME_HASH_HEX_LENGTH;
     let prefix: String = chars[..prefix_length].iter().collect();
-    format!(
-        "{prefix}:{}",
-        &hash[..MYSQL_LOCK_NAME_HASH_HEX_LENGTH]
-    )
+    format!("{prefix}:{}", &hash[..MYSQL_LOCK_NAME_HASH_HEX_LENGTH])
 }
 
 /// Maps a lock name to a 64-bit PostgreSQL advisory-lock key by folding the first 8 bytes
@@ -154,7 +151,8 @@ pub struct MysqlNativeLockStrategy {
 
 impl std::fmt::Debug for MysqlNativeLockStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MysqlNativeLockStrategy").finish_non_exhaustive()
+        f.debug_struct("MysqlNativeLockStrategy")
+            .finish_non_exhaustive()
     }
 }
 
@@ -193,7 +191,8 @@ pub struct PostgresNativeLockStrategy {
 
 impl std::fmt::Debug for PostgresNativeLockStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresNativeLockStrategy").finish_non_exhaustive()
+        f.debug_struct("PostgresNativeLockStrategy")
+            .finish_non_exhaustive()
     }
 }
 

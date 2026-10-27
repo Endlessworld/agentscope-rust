@@ -297,7 +297,9 @@ mod tests {
 
     #[test]
     fn grpc_requires_control_plane() {
-        let err = ControlPlaneConfig::builder("friday").start_grpc(true).build();
+        let err = ControlPlaneConfig::builder("friday")
+            .start_grpc(true)
+            .build();
         assert!(err.is_err());
     }
 

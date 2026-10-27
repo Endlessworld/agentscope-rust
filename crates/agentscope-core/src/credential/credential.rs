@@ -16,7 +16,9 @@ pub trait Credential: Send + Sync {
     fn base_url(&self) -> &str;
     /// Enumerates candidate models, if supported by the provider.
     fn list_models(&self) -> Result<Vec<ModelCard>, crate::Error> {
-        Err(crate::Error::Other("listModels is not supported for this credential".into()))
+        Err(crate::Error::Other(
+            "listModels is not supported for this credential".into(),
+        ))
     }
 }
 
@@ -52,10 +54,18 @@ impl DeepSeekCredential {
 }
 
 impl Credential for DeepSeekCredential {
-    fn id(&self) -> &str { &self.id }
-    fn credential_type(&self) -> &'static str { Self::TYPE }
-    fn api_key(&self) -> &str { &self.api_key }
-    fn base_url(&self) -> &str { &self.base_url }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn credential_type(&self) -> &'static str {
+        Self::TYPE
+    }
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
 
 #[derive(Debug, Default)]
@@ -66,15 +76,26 @@ pub struct DeepSeekCredentialBuilder {
 }
 
 impl DeepSeekCredentialBuilder {
-    pub fn id(mut self, v: impl Into<String>) -> Self { self.id = Some(v.into()); self }
-    pub fn api_key(mut self, v: impl Into<String>) -> Self { self.api_key = Some(v.into()); self }
-    pub fn base_url(mut self, v: impl Into<String>) -> Self { self.base_url = Some(v.into()); self }
+    pub fn id(mut self, v: impl Into<String>) -> Self {
+        self.id = Some(v.into());
+        self
+    }
+    pub fn api_key(mut self, v: impl Into<String>) -> Self {
+        self.api_key = Some(v.into());
+        self
+    }
+    pub fn base_url(mut self, v: impl Into<String>) -> Self {
+        self.base_url = Some(v.into());
+        self
+    }
     pub fn build(self) -> DeepSeekCredential {
         let api_key = self.api_key.expect("apiKey must not be null");
         DeepSeekCredential {
             id: self.id.unwrap_or_else(new_id),
             api_key,
-            base_url: self.base_url.unwrap_or_else(|| DeepSeekCredential::DEFAULT_BASE_URL.into()),
+            base_url: self
+                .base_url
+                .unwrap_or_else(|| DeepSeekCredential::DEFAULT_BASE_URL.into()),
         }
     }
 }
@@ -107,10 +128,18 @@ impl KimiCredential {
 }
 
 impl Credential for KimiCredential {
-    fn id(&self) -> &str { &self.id }
-    fn credential_type(&self) -> &'static str { Self::TYPE }
-    fn api_key(&self) -> &str { &self.api_key }
-    fn base_url(&self) -> &str { &self.base_url }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn credential_type(&self) -> &'static str {
+        Self::TYPE
+    }
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
 
 #[derive(Debug, Default)]
@@ -121,15 +150,26 @@ pub struct KimiCredentialBuilder {
 }
 
 impl KimiCredentialBuilder {
-    pub fn id(mut self, v: impl Into<String>) -> Self { self.id = Some(v.into()); self }
-    pub fn api_key(mut self, v: impl Into<String>) -> Self { self.api_key = Some(v.into()); self }
-    pub fn base_url(mut self, v: impl Into<String>) -> Self { self.base_url = Some(v.into()); self }
+    pub fn id(mut self, v: impl Into<String>) -> Self {
+        self.id = Some(v.into());
+        self
+    }
+    pub fn api_key(mut self, v: impl Into<String>) -> Self {
+        self.api_key = Some(v.into());
+        self
+    }
+    pub fn base_url(mut self, v: impl Into<String>) -> Self {
+        self.base_url = Some(v.into());
+        self
+    }
     pub fn build(self) -> KimiCredential {
         let api_key = self.api_key.expect("apiKey must not be null");
         KimiCredential {
             id: self.id.unwrap_or_else(new_id),
             api_key,
-            base_url: self.base_url.unwrap_or_else(|| KimiCredential::DEFAULT_BASE_URL.into()),
+            base_url: self
+                .base_url
+                .unwrap_or_else(|| KimiCredential::DEFAULT_BASE_URL.into()),
         }
     }
 }
@@ -146,7 +186,10 @@ impl XAICredential {
     pub const TYPE: &'static str = "xai_credential";
 
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { id: new_id(), api_key: api_key.into() }
+        Self {
+            id: new_id(),
+            api_key: api_key.into(),
+        }
     }
 
     pub fn builder() -> XAICredentialBuilder {
@@ -155,10 +198,18 @@ impl XAICredential {
 }
 
 impl Credential for XAICredential {
-    fn id(&self) -> &str { &self.id }
-    fn credential_type(&self) -> &'static str { Self::TYPE }
-    fn api_key(&self) -> &str { &self.api_key }
-    fn base_url(&self) -> &str { "https://api.x.ai" }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn credential_type(&self) -> &'static str {
+        Self::TYPE
+    }
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+    fn base_url(&self) -> &str {
+        "https://api.x.ai"
+    }
 }
 
 #[derive(Debug, Default)]
@@ -168,8 +219,14 @@ pub struct XAICredentialBuilder {
 }
 
 impl XAICredentialBuilder {
-    pub fn id(mut self, v: impl Into<String>) -> Self { self.id = Some(v.into()); self }
-    pub fn api_key(mut self, v: impl Into<String>) -> Self { self.api_key = Some(v.into()); self }
+    pub fn id(mut self, v: impl Into<String>) -> Self {
+        self.id = Some(v.into());
+        self
+    }
+    pub fn api_key(mut self, v: impl Into<String>) -> Self {
+        self.api_key = Some(v.into());
+        self
+    }
     pub fn build(self) -> XAICredential {
         XAICredential {
             id: self.id.unwrap_or_else(new_id),

@@ -35,7 +35,9 @@ pub fn build_retrieve_request(
 
     // Dense top-K: config wins, otherwise fall back to a positive per-call limit.
     request.dense_similarity_top_k = config.dense_similarity_top_k.or_else(|| {
-        limit.and_then(|limit| i32::try_from(limit).ok()).filter(|limit| *limit > 0)
+        limit
+            .and_then(|limit| i32::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
     });
 
     request.sparse_similarity_top_k = config.sparse_similarity_top_k;
@@ -187,7 +189,12 @@ mod tests {
             .access_key_id("ak")
             .access_key_secret("sk")
             .workspace_id("w")
-            .rerank_config(crate::bailian::config::RerankConfig::builder().model_name("").build().unwrap())
+            .rerank_config(
+                crate::bailian::config::RerankConfig::builder()
+                    .model_name("")
+                    .build()
+                    .unwrap(),
+            )
             .build()
             .unwrap();
         let request = build_retrieve_request(&cfg, "idx", "q", None, None);

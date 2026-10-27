@@ -101,8 +101,8 @@ use agentscope_extensions_acp::{AskUserTool, SessionBuild};
 use agentscope_extensions_model::{AnthropicMessagesModel, OpenAiChatModel, OpenAiResponsesModel};
 use agentscope_harness::agent::context::TaskContextOptions;
 use agentscope_harness::agent::{
-    CompactionConfig, FileSystemSkillRepository, HarnessAgent, ToolResultEvictionConfig,
-    trigger_for_window,
+    trigger_for_window, CompactionConfig, FileSystemSkillRepository, HarnessAgent,
+    ToolResultEvictionConfig,
 };
 use serde::{Deserialize, Serialize};
 

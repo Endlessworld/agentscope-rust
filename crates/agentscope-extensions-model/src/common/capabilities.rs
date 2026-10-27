@@ -134,7 +134,10 @@ const OVERRIDE_TABLE: &[(&str, Overrides)] = &[
 ];
 
 const fn max_tokens_only() -> Overrides {
-    Overrides { use_max_completion_tokens: Some(false), ..Overrides::NONE }
+    Overrides {
+        use_max_completion_tokens: Some(false),
+        ..Overrides::NONE
+    }
 }
 
 impl Overrides {
@@ -149,7 +152,10 @@ impl Overrides {
 }
 
 /// Clamps `max_tokens` / `max_completion_tokens` to the model's output limit.
-pub fn clamp_max_tokens(mut options: agentscope_core::GenerateOptions, max_output: usize) -> agentscope_core::GenerateOptions {
+pub fn clamp_max_tokens(
+    mut options: agentscope_core::GenerateOptions,
+    max_output: usize,
+) -> agentscope_core::GenerateOptions {
     if max_output == 0 {
         return options;
     }
@@ -215,7 +221,14 @@ mod tests {
 
     #[test]
     fn third_party_gateways_use_max_tokens() {
-        for model in ["deepseek-chat", "glm-4", "kimi-k2", "qwen-max", "grok-2", "llama3"] {
+        for model in [
+            "deepseek-chat",
+            "glm-4",
+            "kimi-k2",
+            "qwen-max",
+            "grok-2",
+            "llama3",
+        ] {
             let caps = resolve_capabilities(model);
             assert!(!caps.use_max_completion_tokens, "{model}");
             assert!(caps.supports_sampling, "{model}");

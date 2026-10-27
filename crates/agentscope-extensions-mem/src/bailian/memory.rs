@@ -44,7 +44,10 @@ pub fn is_recordable(msg: &Msg) -> bool {
 /// Converts a single [`Msg`] to a [`BailianMessage`], or `None` when unsupported.
 pub fn convert_to_bailian_message(msg: &Msg) -> Option<BailianMessage> {
     let role = role_to_bailian_role(msg.role())?;
-    Some(BailianMessage { role: role.to_string(), content: msg.text_content() })
+    Some(BailianMessage {
+        role: role.to_string(),
+        content: msg.text_content(),
+    })
 }
 
 /// Converts a slice of messages into Bailian messages, applying the Java filters.
@@ -144,7 +147,10 @@ pub struct BailianLongTermMemory {
 
 impl BailianLongTermMemory {
     /// Creates an adapter, validating the key and user identifier like Java.
-    pub fn new(client: Arc<BailianMemoryClient>, config: BailianLongTermMemoryConfig) -> Result<Self> {
+    pub fn new(
+        client: Arc<BailianMemoryClient>,
+        config: BailianLongTermMemoryConfig,
+    ) -> Result<Self> {
         if config.user_id.trim().is_empty() {
             return Err(MemError::Config("userId cannot be null or blank".into()));
         }
@@ -163,8 +169,9 @@ impl BailianLongTermMemory {
 
     /// Builds the add request used by [`Self::record`].
     pub fn build_add_request(&self, messages: Vec<BailianMessage>) -> BailianAddRequest {
-        let mut request =
-            BailianAddRequest::new().with_user_id(self.config.user_id.clone()).with_messages(messages);
+        let mut request = BailianAddRequest::new()
+            .with_user_id(self.config.user_id.clone())
+            .with_messages(messages);
         if let Some(id) = non_blank(&self.config.memory_library_id) {
             request = request.with_memory_library_id(id.to_string());
         }
@@ -221,7 +228,10 @@ impl BailianLongTermMemory {
         if query.trim().is_empty() {
             return Ok(String::new());
         }
-        let response = self.client.search(&self.build_search_request(query)).await?;
+        let response = self
+            .client
+            .search(&self.build_search_request(query))
+            .await?;
         Ok(match response.memory_nodes {
             Some(nodes) => join_memory_nodes(&nodes),
             None => String::new(),
@@ -325,10 +335,22 @@ mod tests {
     #[test]
     fn join_memory_nodes_skips_blank_and_none() {
         let nodes = vec![
-            BailianMemoryNode { content: Some("a".into()), ..Default::default() },
-            BailianMemoryNode { content: None, ..Default::default() },
-            BailianMemoryNode { content: Some("   ".into()), ..Default::default() },
-            BailianMemoryNode { content: Some("b".into()), ..Default::default() },
+            BailianMemoryNode {
+                content: Some("a".into()),
+                ..Default::default()
+            },
+            BailianMemoryNode {
+                content: None,
+                ..Default::default()
+            },
+            BailianMemoryNode {
+                content: Some("   ".into()),
+                ..Default::default()
+            },
+            BailianMemoryNode {
+                content: Some("b".into()),
+                ..Default::default()
+            },
         ];
         assert_eq!(join_memory_nodes(&nodes), "a\nb");
     }
@@ -359,12 +381,8 @@ mod tests {
     #[test]
     fn client_rejects_blank_base_url() {
         // Mirrors Java `BailianMemoryClient` builder validation.
-        let err = BailianMemoryClient::with_transport(
-            Arc::new(MockTransport::new()),
-            "key",
-            "   ",
-        )
-        .unwrap_err();
+        let err = BailianMemoryClient::with_transport(Arc::new(MockTransport::new()), "key", "   ")
+            .unwrap_err();
         assert!(matches!(err, MemError::Config(_)));
     }
 
@@ -445,9 +463,7 @@ mod tests {
     #[tokio::test]
     async fn retrieve_joins_memory_node_contents() {
         let (mock, adapter) = adapter(BailianLongTermMemoryConfig::new("key", "user"));
-        mock.push_body(
-            r#"{"memory_nodes":[{"content":"one"},{"content":"two"},{}]}"#,
-        );
+        mock.push_body(r#"{"memory_nodes":[{"content":"one"},{"content":"two"},{}]}"#);
         assert_eq!(adapter.retrieve(&Msg::user("q")).await.unwrap(), "one\ntwo");
         assert!(mock.requests()[0].0.ends_with(SEARCH_MEMORY_ENDPOINT));
     }

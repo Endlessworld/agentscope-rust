@@ -108,15 +108,18 @@ pub struct ModelError {
 
 impl ModelError {
     /// Builds an error from already-known parts.
-    pub fn new(
-        provider: impl Into<String>,
-        status: u16,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn new(provider: impl Into<String>, status: u16, message: impl Into<String>) -> Self {
         let provider = provider.into();
         let message = message.into();
         let kind = classify(status, &message, None, None);
-        Self { provider, status, kind, code: None, error_type: None, message }
+        Self {
+            provider,
+            status,
+            kind,
+            code: None,
+            error_type: None,
+            message,
+        }
     }
 
     /// Builds an error from explicitly supplied provider fields (no JSON body).
@@ -130,7 +133,14 @@ impl ModelError {
         let provider = provider.into();
         let message = message.into();
         let kind = classify(status, &message, code.as_deref(), error_type.as_deref());
-        let err = Self { provider, status, kind, code, error_type, message };
+        let err = Self {
+            provider,
+            status,
+            kind,
+            code,
+            error_type,
+            message,
+        };
         err.log();
         err
     }
@@ -192,7 +202,12 @@ impl ModelError {
         if let Some(c) = &self.code {
             suffix.push(format!("code={c}"));
         }
-        format!("[{}] {} ({})", self.provider, self.message, suffix.join(", "))
+        format!(
+            "[{}] {} ({})",
+            self.provider,
+            self.message,
+            suffix.join(", ")
+        )
     }
 
     /// Converts into the core error type, preserving both the status code and
@@ -358,12 +373,7 @@ fn value_to_text(v: &Value) -> Option<String> {
 }
 
 /// Classifies an error from its status plus any provider-provided hints.
-fn classify(
-    status: u16,
-    message: &str,
-    code: Option<&str>,
-    error_type: Option<&str>,
-) -> ErrorKind {
+fn classify(status: u16, message: &str, code: Option<&str>, error_type: Option<&str>) -> ErrorKind {
     // Provider-supplied type/status strings are authoritative when recognised,
     // because they disambiguate `status == 0` (mid-stream) frames and let a
     // "server_error"/"UNAVAILABLE" be retried even when the HTTP status is 200.
@@ -396,8 +406,12 @@ fn classify(
     );
     let contains = |needles: &[&str]| needles.iter().any(|n| haystack.contains(n));
 
-    if contains(&["insufficient_quota", "exceeded your current quota", "billing", "quota"])
-        && (status == 429 || status == 402 || status == 403)
+    if contains(&[
+        "insufficient_quota",
+        "exceeded your current quota",
+        "billing",
+        "quota",
+    ]) && (status == 429 || status == 402 || status == 403)
     {
         return ErrorKind::Quota;
     }

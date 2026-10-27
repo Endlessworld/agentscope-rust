@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use agentscope_harness::agent::sandbox::{SandboxIsolationKey, SandboxLease};
 
 use crate::backend::{JdbcResult, SharedExecutor};
-use crate::dialect::{AbstractJdbcDialect, BoundSql, LockLease, LockOutcome, SandboxLockStrategy, SqlParam};
+use crate::dialect::{
+    AbstractJdbcDialect, BoundSql, LockLease, LockOutcome, SandboxLockStrategy, SqlParam,
+};
 
 /// Default prefix applied to composed lock names.
 pub const DEFAULT_KEY_PREFIX: &str = "agentscope:sandbox:lock:";
@@ -42,7 +44,10 @@ impl std::fmt::Debug for TableLockStrategy {
 
 impl TableLockStrategy {
     /// Creates a portable table lock strategy, ensuring the lock table exists.
-    pub fn new(executor: SharedExecutor, dialect: Arc<dyn AbstractJdbcDialect>) -> JdbcResult<Self> {
+    pub fn new(
+        executor: SharedExecutor,
+        dialect: Arc<dyn AbstractJdbcDialect>,
+    ) -> JdbcResult<Self> {
         let strategy = Self {
             executor,
             dialect,
@@ -181,7 +186,10 @@ impl JdbcSandboxExecutionGuard {
     }
 
     /// Creates a guard backed by the portable table-lock strategy.
-    pub fn table_lock(executor: SharedExecutor, dialect: Arc<dyn AbstractJdbcDialect>) -> JdbcResult<Self> {
+    pub fn table_lock(
+        executor: SharedExecutor,
+        dialect: Arc<dyn AbstractJdbcDialect>,
+    ) -> JdbcResult<Self> {
         let strategy = TableLockStrategy::new(executor, dialect)?;
         Ok(Self::new(Arc::new(strategy)))
     }
@@ -225,7 +233,10 @@ impl JdbcSandboxExecutionGuard {
     /// returned (mirroring the Java fallback).
     pub fn try_enter(&self, key: SandboxIsolationKey) -> JdbcSandboxLease {
         let lock_name = self.compose_lock_name(&key);
-        match self.strategy.try_enter(&lock_name, self.lock_timeout_seconds) {
+        match self
+            .strategy
+            .try_enter(&lock_name, self.lock_timeout_seconds)
+        {
             Ok(lease) => JdbcSandboxLease::acquired(key, lease),
             Err(LockOutcome::TimedOut) | Err(LockOutcome::Acquired) => {
                 tracing::warn!("[jdbc-guard] lock not acquired: {lock_name}");

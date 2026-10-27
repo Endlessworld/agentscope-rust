@@ -52,7 +52,10 @@ impl ControlPlaneBaseStore {
         let value: Value = serde_json::from_str(body).ok()?;
         let key = value.get("key")?.as_str()?.to_string();
         let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-        let raw = value.get("value").cloned().unwrap_or(Value::Object(Default::default()));
+        let raw = value
+            .get("value")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
         let value = match raw {
             Value::Object(map) => map,
             other => {
@@ -124,7 +127,10 @@ impl BaseStore for ControlPlaneBaseStore {
             "key": key,
             "value": value,
         });
-        let resp = block_on(self.http.send(Method::PUT, "/api/v1/dp/kv/item", Some(body)));
+        let resp = block_on(
+            self.http
+                .send(Method::PUT, "/api/v1/dp/kv/item", Some(body)),
+        );
         if let Ok(resp) = resp {
             let _ = require_ok(&resp, "put");
         }
@@ -145,7 +151,10 @@ impl BaseStore for ControlPlaneBaseStore {
             "value": value,
             "expectedVersion": expected_version,
         });
-        match block_on(self.http.send(Method::PUT, "/api/v1/dp/kv/item", Some(body))) {
+        match block_on(
+            self.http
+                .send(Method::PUT, "/api/v1/dp/kv/item", Some(body)),
+        ) {
             Ok(resp) => resp.status != 409 && (200..300).contains(&resp.status),
             Err(_) => false,
         }

@@ -199,9 +199,11 @@ impl PostgresAgentStateStore {
             SqlValue::int(item_index),
         ];
         match self.client.query(&sql, &params)? {
-            QueryOutcome::Rows(rows) => {
-                Ok(rows.first().and_then(|r| r.first()).and_then(Cell::as_str).map(str::to_string))
-            }
+            QueryOutcome::Rows(rows) => Ok(rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(Cell::as_str)
+                .map(str::to_string)),
             QueryOutcome::Affected(_) => Ok(None),
         }
     }
@@ -233,9 +235,11 @@ impl PostgresAgentStateStore {
             SqlValue::int(SINGLE_STATE_INDEX),
         ];
         match self.client.query(&sql, &params)? {
-            QueryOutcome::Rows(rows) => {
-                Ok(rows.first().and_then(|r| r.first()).and_then(Cell::as_i64).unwrap_or(0))
-            }
+            QueryOutcome::Rows(rows) => Ok(rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(Cell::as_i64)
+                .unwrap_or(0)),
             QueryOutcome::Affected(_) => Ok(0),
         }
     }
@@ -693,10 +697,10 @@ mod tests {
         let c = client();
         let ok = "a".repeat(MAX_IDENTIFIER_LENGTH);
         let too_long = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
-        assert!(PostgresAgentStateStore::builder(c.clone()).table(ok).is_ok());
-        assert!(PostgresAgentStateStore::builder(c)
-            .table(too_long)
-            .is_err());
+        assert!(PostgresAgentStateStore::builder(c.clone())
+            .table(ok)
+            .is_ok());
+        assert!(PostgresAgentStateStore::builder(c).table(too_long).is_err());
     }
 
     // Java: PostgresAgentStateStoreTest#constructorDefaultsDoNotAutoCreate,
@@ -768,7 +772,10 @@ mod tests {
 
         s.save(None, nested, "k", json!(2)).await;
         assert_eq!(s.get(None, nested, "k").await, Some(json!(2)));
-        assert_eq!(s.list_session_ids(None).await, vec![flat.to_string(), nested.to_string()]);
+        assert_eq!(
+            s.list_session_ids(None).await,
+            vec![flat.to_string(), nested.to_string()]
+        );
 
         s.delete(None, flat).await;
         assert!(s.get(None, flat, "k").await.is_none());
@@ -866,8 +873,13 @@ mod tests {
     fn state_key_validation_boundaries() {
         assert!(PostgresAgentStateStore::validate_state_key("").is_err());
         assert!(PostgresAgentStateStore::validate_state_key("   ").is_err());
-        assert!(PostgresAgentStateStore::validate_state_key(&"k".repeat(MAX_SESSION_ID_LENGTH)).is_ok());
-        assert!(PostgresAgentStateStore::validate_state_key(&"k".repeat(MAX_SESSION_ID_LENGTH + 1)).is_err());
+        assert!(
+            PostgresAgentStateStore::validate_state_key(&"k".repeat(MAX_SESSION_ID_LENGTH)).is_ok()
+        );
+        assert!(PostgresAgentStateStore::validate_state_key(
+            &"k".repeat(MAX_SESSION_ID_LENGTH + 1)
+        )
+        .is_err());
     }
 
     // Java: PostgresAgentStateStoreTest#saveSingleStateThrowsWhenSqlFails (Rust: the
@@ -907,7 +919,10 @@ mod tests {
         assert_eq!(s.version_of(None, "s", "k").unwrap(), 1);
 
         // create-only insert against an existing key: duplicate -> CAS failure.
-        assert_eq!(s.save_if_version(None, "s", "k", &v2, 0).unwrap(), UNVERSIONED);
+        assert_eq!(
+            s.save_if_version(None, "s", "k", &v2, 0).unwrap(),
+            UNVERSIONED
+        );
         assert_eq!(s.get(None, "s", "k").await, Some(v1.clone()));
 
         // matching version succeeds and bumps to version 2.
@@ -915,12 +930,21 @@ mod tests {
         assert_eq!(s.version_of(None, "s", "k").unwrap(), 2);
 
         // stale versions fail without mutating the row.
-        assert_eq!(s.save_if_version(None, "s", "k", &v1, 1).unwrap(), UNVERSIONED);
-        assert_eq!(s.save_if_version(None, "s", "k", &v1, 99).unwrap(), UNVERSIONED);
+        assert_eq!(
+            s.save_if_version(None, "s", "k", &v1, 1).unwrap(),
+            UNVERSIONED
+        );
+        assert_eq!(
+            s.save_if_version(None, "s", "k", &v1, 99).unwrap(),
+            UNVERSIONED
+        );
         assert_eq!(s.get(None, "s", "k").await, Some(v2.clone()));
 
         // UNVERSIONED behaves as an unconditional save.
-        assert_eq!(s.save_if_version(None, "s", "k", &v1, UNVERSIONED).unwrap(), 3);
+        assert_eq!(
+            s.save_if_version(None, "s", "k", &v1, UNVERSIONED).unwrap(),
+            3
+        );
         assert_eq!(s.get(None, "s", "k").await, Some(v1));
     }
 
@@ -1066,7 +1090,10 @@ mod tests {
         s.save_list(None, "s1", "items", &[json!(1), json!(2)])
             .await;
         assert_eq!(c.session_row_count(), 3);
-        assert_eq!(s.get_list(None, "s1", "items").await, vec![json!(1), json!(2)]);
+        assert_eq!(
+            s.get_list(None, "s1", "items").await,
+            vec![json!(1), json!(2)]
+        );
     }
 
     // Java: PostgresAgentStateStoreTest#saveListEmptyDoesNothing
@@ -1171,9 +1198,7 @@ mod tests {
             .unwrap();
         assert!(s.save_versioned(None, "s1", "k", &json!(1)).is_err());
         assert!(s.get_sync(&slot("s1"), "k", SINGLE_STATE_INDEX).is_err());
-        assert!(s
-            .get_list_rows_sync(&slot("s1"), "k")
-            .is_err());
+        assert!(s.get_list_rows_sync(&slot("s1"), "k").is_err());
         assert!(s.version_of(None, "s1", "k").is_err());
         assert!(s.save_if_version(None, "s1", "k", &json!(1), 0).is_err());
     }

@@ -22,7 +22,11 @@ pub struct OrchestrationClient {
 
 impl OrchestrationClient {
     /// Creates a client scoped to `tenant`/`namespace`.
-    pub fn new(http: Arc<ControlPlaneHttpClient>, tenant: impl Into<String>, namespace: impl Into<String>) -> Self {
+    pub fn new(
+        http: Arc<ControlPlaneHttpClient>,
+        tenant: impl Into<String>,
+        namespace: impl Into<String>,
+    ) -> Self {
         Self {
             http,
             tenant: tenant.into(),
@@ -32,7 +36,8 @@ impl OrchestrationClient {
 
     /// `GET /api/v1/orchestration-definitions`.
     pub async fn definitions(&self) -> ControlPlaneResult<Value> {
-        self.get(&self.scope("/api/v1/orchestration-definitions")).await
+        self.get(&self.scope("/api/v1/orchestration-definitions"))
+            .await
     }
 
     /// `GET /api/v1/orchestration-definitions/{id}`.
@@ -43,8 +48,12 @@ impl OrchestrationClient {
 
     /// `POST /api/v1/orchestration-definitions`.
     pub async fn create_definition(&self, body: Value) -> ControlPlaneResult<Value> {
-        self.send(Method::POST, "/api/v1/orchestration-definitions", Some(body))
-            .await
+        self.send(
+            Method::POST,
+            "/api/v1/orchestration-definitions",
+            Some(body),
+        )
+        .await
     }
 
     /// `PATCH /api/v1/orchestration-definitions/{id}`.
@@ -130,7 +139,12 @@ impl OrchestrationClient {
     }
 
     /// `POST /api/v1/orchestration-runs/{id}/rerun`.
-    pub async fn rerun(&self, id: &str, idempotency_key: &str, input: Value) -> ControlPlaneResult<Value> {
+    pub async fn rerun(
+        &self,
+        id: &str,
+        idempotency_key: &str,
+        input: Value,
+    ) -> ControlPlaneResult<Value> {
         let body = serde_json::json!({ "idempotencyKey": idempotency_key, "input": input });
         self.send(
             Method::POST,
@@ -182,7 +196,11 @@ impl OrchestrationClient {
     }
 
     /// `PUT /api/v1/agent-runtime-policies/{agentRef}`.
-    pub async fn put_runtime_policy(&self, agent_ref: &str, policy: Value) -> ControlPlaneResult<Value> {
+    pub async fn put_runtime_policy(
+        &self,
+        agent_ref: &str,
+        policy: Value,
+    ) -> ControlPlaneResult<Value> {
         self.send(
             Method::PUT,
             &format!("/api/v1/agent-runtime-policies/{}", seg(agent_ref)),
@@ -204,7 +222,12 @@ impl OrchestrationClient {
         self.send(Method::GET, path, None).await
     }
 
-    async fn send(&self, method: Method, path: &str, body: Option<Value>) -> ControlPlaneResult<Value> {
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> ControlPlaneResult<Value> {
         let response = self.http.send(method, path, body).await?;
         if !(200..300).contains(&response.status) {
             return Err(ControlPlaneError::Http(format!(
@@ -215,8 +238,9 @@ impl OrchestrationClient {
         if response.body.trim().is_empty() {
             return Ok(serde_json::json!({}));
         }
-        serde_json::from_str(&response.body)
-            .map_err(|e| ControlPlaneError::Http(format!("orchestration returned invalid JSON: {e}")))
+        serde_json::from_str(&response.body).map_err(|e| {
+            ControlPlaneError::Http(format!("orchestration returned invalid JSON: {e}"))
+        })
     }
 }
 
@@ -247,10 +271,7 @@ mod tests {
     fn scope_encodes_reserved_characters() {
         let http = Arc::new(ControlPlaneHttpClient::new("http://localhost:9", "tok").unwrap());
         let c = OrchestrationClient::new(http, "a/b c", "ns&x");
-        assert_eq!(
-            c.scope("/p"),
-            "/p?tenant=a%2Fb%20c&namespace=ns%26x"
-        );
+        assert_eq!(c.scope("/p"), "/p?tenant=a%2Fb%20c&namespace=ns%26x");
     }
 
     #[test]

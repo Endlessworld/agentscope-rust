@@ -25,10 +25,7 @@ pub struct ArtifactDeliveryTool {
 }
 
 impl ArtifactDeliveryTool {
-    pub fn new(
-        filesystem: Arc<dyn Filesystem>,
-        target: Arc<dyn ArtifactDeliveryTarget>,
-    ) -> Self {
+    pub fn new(filesystem: Arc<dyn Filesystem>, target: Arc<dyn ArtifactDeliveryTarget>) -> Self {
         Self { filesystem, target }
     }
 }
@@ -140,10 +137,7 @@ impl Tool for ArtifactDeliveryTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let force = args
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let rc = runtime_from_ctx(&ctx);
 
         let data = match self.filesystem.read(&rc, &file_path, 0, 0).await {
@@ -175,11 +169,13 @@ impl Tool for ArtifactDeliveryTool {
             force,
         };
         match self.target.deliver(&rc, request).await {
-            Ok(ArtifactDeliveryResult { conflict: true, .. }) => Ok(ToolResultBlock::text(format!(
-                "The artifact '{file_path}' was not delivered: a file named \
+            Ok(ArtifactDeliveryResult { conflict: true, .. }) => {
+                Ok(ToolResultBlock::text(format!(
+                    "The artifact '{file_path}' was not delivered: a file named \
                  '{effective_file_name}' already exists at the destination. Retry \
                  deliver_artifact with a new fileName, or set force=true to overwrite it."
-            ))),
+                )))
+            }
             Ok(result) if !result.successful => Ok(ToolResultBlock::error(format!(
                 "Error: artifact delivery failed: {}",
                 result.error.unwrap_or_else(|| "unknown error".to_string())
@@ -224,25 +220,24 @@ mod tests {
 
     #[tokio::test]
     async fn reads_the_file_and_delegates_to_the_target() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentscope_artifact_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_artifact_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("outputs")).unwrap();
         std::fs::write(dir.join("outputs/report.txt"), b"artifact bytes").unwrap();
 
         let target = Arc::new(RecordingTarget {
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let tool = ArtifactDeliveryTool::new(
-            Arc::new(LocalFilesystem::new(dir.clone())),
-            target.clone(),
-        );
+        let tool =
+            ArtifactDeliveryTool::new(Arc::new(LocalFilesystem::new(dir.clone())), target.clone());
         let mut args = JsonMap::new();
         args.insert("filePath".into(), serde_json::json!("outputs/report.txt"));
         args.insert("description".into(), serde_json::json!("quarterly report"));
 
-        let result = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let result = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
         assert!(result.text_content().contains("Delivered"));
         assert!(result.text_content().contains("stored"));
 

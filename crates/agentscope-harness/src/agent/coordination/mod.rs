@@ -23,7 +23,9 @@ pub trait PeriodicGate: Send + Sync {
 }
 
 fn millis_now(now: SystemTime) -> i64 {
-    now.duration_since(EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    now.duration_since(EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Shared process-wide claim map, mirroring the Java static map so the throttle
@@ -55,7 +57,9 @@ impl LocalPeriodicGate {
 
     /// Creates a gate backed by an isolated map (useful for tests).
     pub fn new_isolated() -> Self {
-        Self { claims: Some(Arc::new(Mutex::new(HashMap::new()))) }
+        Self {
+            claims: Some(Arc::new(Mutex::new(HashMap::new()))),
+        }
     }
 
     fn with_map<T>(&self, f: impl FnOnce(&mut HashMap<String, SystemTime>) -> T) -> T {
@@ -159,7 +163,10 @@ impl PeriodicGate for StoreBackedPeriodicGate {
                 "lastClaimAt".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(millis_now(now))),
             );
-            if self.store.put_if_version(&ns, name, value, expected_version) {
+            if self
+                .store
+                .put_if_version(&ns, name, value, expected_version)
+            {
                 return true;
             }
         }
@@ -197,7 +204,10 @@ mod tests {
     #[test]
     fn local_gate_cleanup_removes_stale_entries() {
         let gate = LocalPeriodicGate::new_isolated();
-        gate.seed_last_claim_at_for_tests("old", Some(SystemTime::now() - Duration::from_secs(600)));
+        gate.seed_last_claim_at_for_tests(
+            "old",
+            Some(SystemTime::now() - Duration::from_secs(600)),
+        );
         gate.seed_last_claim_at_for_tests("new", Some(SystemTime::now()));
         assert!(gate.has_claim_for_tests("old"));
         gate.cleanup_stale_entries(Duration::from_secs(300));

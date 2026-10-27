@@ -136,7 +136,10 @@ mod tests {
     #[test]
     fn role_rejects_unknown_values_like_java() {
         let err = QueryRole::try_from("system").unwrap_err();
-        assert!(err.to_string().contains("must be 'user' or 'assistant'"), "{err}");
+        assert!(
+            err.to_string().contains("must be 'user' or 'assistant'"),
+            "{err}"
+        );
         assert!(QueryRole::try_from("User").is_err());
     }
 

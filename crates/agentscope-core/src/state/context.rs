@@ -125,9 +125,13 @@ impl TaskBuilder {
         let subject = self.subject.unwrap_or_default();
         let description = self.description.unwrap_or_default();
         let metadata = self.metadata.unwrap_or_default();
-        let created_at = self.created_at.unwrap_or_else(crate::message::current_timestamp);
+        let created_at = self
+            .created_at
+            .unwrap_or_else(crate::message::current_timestamp);
         let state = self.state.unwrap_or(TaskState::Pending);
-        let id = self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let id = self
+            .id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
         Task {
             subject,
             description,
@@ -155,7 +159,12 @@ pub struct ReadCacheEntry {
 
 impl ReadCacheEntry {
     pub fn new(lines: Vec<String>, updated_at: f64, bytes: f64, file_path: String) -> Self {
-        Self { lines, updated_at, bytes, file_path }
+        Self {
+            lines,
+            updated_at,
+            bytes,
+            file_path,
+        }
     }
 }
 
@@ -202,8 +211,7 @@ impl TryFrom<TaskScopeWire> for TaskScope {
     type Error = String;
 
     fn try_from(wire: TaskScopeWire) -> std::result::Result<Self, Self::Error> {
-        Self::new(wire.task_id, wire.objective, wire.source_ref)
-            .map_err(|error| error.to_string())
+        Self::new(wire.task_id, wire.objective, wire.source_ref).map_err(|error| error.to_string())
     }
 }
 
@@ -285,7 +293,9 @@ impl TaskContextState {
 
     /// One requirement by identifier.
     pub fn requirement(&self, id: &str) -> Option<&TaskRequirement> {
-        self.requirements.iter().find(|requirement| requirement.id == id)
+        self.requirements
+            .iter()
+            .find(|requirement| requirement.id == id)
     }
 
     /// Detached copy, used when a caller must mutate without touching the live state.
@@ -634,14 +644,13 @@ mod tests {
     }
 
     fn todo(subject: &str) -> Task {
-        Task::builder().subject(subject).description(subject).build()
+        Task::builder()
+            .subject(subject)
+            .description(subject)
+            .build()
     }
 
-    fn report(
-        state: &TaskContextState,
-        requirement_id: &str,
-        id: &str,
-    ) -> TaskVerification {
+    fn report(state: &TaskContextState, requirement_id: &str, id: &str) -> TaskVerification {
         TaskVerification::new(
             id,
             requirement_id,
@@ -665,7 +674,10 @@ mod tests {
 
         // A writer still holding revision 0 must not clobber revision 1.
         let error = state.replace_tasks(vec![todo("stale")], 0).unwrap_err();
-        assert!(error.to_string().contains("Task revision changed"), "{error}");
+        assert!(
+            error.to_string().contains("Task revision changed"),
+            "{error}"
+        );
         assert_eq!(state.tasks()[0].subject, "step one");
         assert_eq!(state.revision(), 1);
     }
@@ -729,9 +741,15 @@ mod tests {
         assert!(candidate.is_candidate());
         assert!(candidate.decision.is_none());
 
-        let decision = RequirementDecision::new(RequirementAuthority::User, "user message 3").unwrap();
+        let decision =
+            RequirementDecision::new(RequirementAuthority::User, "user message 3").unwrap();
         state
-            .decide(&id, RequirementStatus::Confirmed, decision.clone(), revision)
+            .decide(
+                &id,
+                RequirementStatus::Confirmed,
+                decision.clone(),
+                revision,
+            )
             .unwrap();
         assert_eq!(state.contract_version(), 1);
         let confirmed = state.requirement(&id).unwrap();
@@ -740,7 +758,9 @@ mod tests {
 
         // Re-applying the same decision is a no-op.
         let revision = state.revision();
-        state.decide(&id, RequirementStatus::Confirmed, decision, revision).unwrap();
+        state
+            .decide(&id, RequirementStatus::Confirmed, decision, revision)
+            .unwrap();
         assert_eq!(state.revision(), revision);
         assert_eq!(state.contract_version(), 1);
 
@@ -753,7 +773,12 @@ mod tests {
                 revision,
             )
             .unwrap_err();
-        assert!(error.to_string().contains("Decision must confirm or reject"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Decision must confirm or reject"),
+            "{error}"
+        );
 
         // Unknown identifiers are refused.
         let error = state
@@ -773,7 +798,12 @@ mod tests {
         // No scope means no evidence binding, so nothing may be pinned.
         let mut bare = TaskContextState::new();
         let error = bare.set_subject_version("v1", 0).unwrap_err();
-        assert!(error.to_string().contains("Task scope required for evidence"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Task scope required for evidence"),
+            "{error}"
+        );
 
         let mut state = TaskContextState::new();
         state.begin_task(scope("task-1"), 0).unwrap();
@@ -828,13 +858,19 @@ mod tests {
         .unwrap();
         let error = state.record_verification(stale, revision).unwrap_err();
         assert!(
-            error.to_string().contains("Verification subject or contract changed"),
+            error
+                .to_string()
+                .contains("Verification subject or contract changed"),
             "{error}"
         );
 
         // Only a confirmed acceptance criterion may carry evidence.
         let constraint = state
-            .propose(RequirementKind::Constraint, "keep tests offline", "user message 4")
+            .propose(
+                RequirementKind::Constraint,
+                "keep tests offline",
+                "user message 4",
+            )
             .unwrap();
         let revision = state.revision();
         state
@@ -849,7 +885,9 @@ mod tests {
         let wrong_kind = report(&state, &constraint, "ver-4");
         let error = state.record_verification(wrong_kind, revision).unwrap_err();
         assert!(
-            error.to_string().contains("Confirmed acceptance criterion required"),
+            error
+                .to_string()
+                .contains("Confirmed acceptance criterion required"),
             "{error}"
         );
         state.validate().unwrap();

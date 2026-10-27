@@ -1,4 +1,4 @@
-﻿//! # agentscope-extensions-model
+//! # agentscope-extensions-model
 //!
 //! Provider adapters for [`agentscope_core::model::Model`], mirroring
 //! `io.agentscope.extensions.model.*` from the Java SDK.
@@ -47,8 +47,8 @@ pub use ollama::{OllamaChatModel, OllamaModelProvider, OllamaOptions};
 pub use openai::{default_registry, OpenAiChatModel, OpenAiProvider};
 pub use openai_official::{
     default_openai_official_registry, OpenAIOfficialCredential, OpenAIOfficialModelProvider,
-    OpenAIResponsesChatModel, ResponsesMultiAgentFormatter, ResponsesServerToolHelper,
-    OpenAIServerTool, OpenAIServerToolKind,
+    OpenAIResponsesChatModel, OpenAIServerTool, OpenAIServerToolKind, ResponsesMultiAgentFormatter,
+    ResponsesServerToolHelper,
 };
 pub use relay::{
     encode_error, encode_response, find_route, stream_terminator, ConverterQuality, ConverterSpec,

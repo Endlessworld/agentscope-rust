@@ -117,8 +117,12 @@ pub trait WeixinStateStore: Send + Sync {
 
     /// Acquire or extend the account lease. Returns `None` while a different holder has a live
     /// lease; a released or expired lease always bumps the generation.
-    fn acquire_lease(&self, account_id: &str, holder_id: &str, lease_ms: i64)
-        -> Option<WeixinLease>;
+    fn acquire_lease(
+        &self,
+        account_id: &str,
+        holder_id: &str,
+        lease_ms: i64,
+    ) -> Option<WeixinLease>;
 
     /// Extend the lease when it is still current.
     fn renew_lease(&self, account_id: &str, lease: &WeixinLease, lease_ms: i64) -> bool;
@@ -148,17 +152,26 @@ pub trait WeixinStateStore: Send + Sync {
     ) -> Vec<WeixinInboxClaim>;
 
     /// Only the exact, unexpired claim may finish. Completed payloads must be removed.
-    fn complete_message(&self, account_id: &str, lease: &WeixinLease, claim: &WeixinInboxClaim)
-        -> bool;
+    fn complete_message(
+        &self,
+        account_id: &str,
+        lease: &WeixinLease,
+        claim: &WeixinInboxClaim,
+    ) -> bool;
 
     /// Return a claim to the inbox so it can be retried.
-    fn fail_message(&self, account_id: &str, lease: &WeixinLease, claim: &WeixinInboxClaim) -> bool;
+    fn fail_message(&self, account_id: &str, lease: &WeixinLease, claim: &WeixinInboxClaim)
+        -> bool;
 
     /// Drop a claimed message the consumer will not retry again — the dispatch kept failing, or
     /// the provider kept refusing the reply. The message is tombstoned so a re-delivered batch
     /// cannot resurrect it, but it is not reported as completed.
-    fn abandon_message(&self, account_id: &str, lease: &WeixinLease, claim: &WeixinInboxClaim)
-        -> bool;
+    fn abandon_message(
+        &self,
+        account_id: &str,
+        lease: &WeixinLease,
+        claim: &WeixinInboxClaim,
+    ) -> bool;
 
     /// Forget everything held for `account_id`: cursor, peer context tokens and inbox.
     ///
@@ -257,15 +270,15 @@ impl InMemoryWeixinStateStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Account>> {
-        self.accounts.lock().expect("weixin state store mutex poisoned")
+        self.accounts
+            .lock()
+            .expect("weixin state store mutex poisoned")
     }
 
     /// Whether the account id is usable, mirroring the Java blank check.
     fn require_account(account_id: &str) -> Result<()> {
         if account_id.trim().is_empty() {
-            return Err(ChannelError::Config(
-                "accountId is required".to_string(),
-            ));
+            return Err(ChannelError::Config("accountId is required".to_string()));
         }
         Ok(())
     }
@@ -352,7 +365,9 @@ impl WeixinStateStore for InMemoryWeixinStateStore {
             return false;
         }
         if !peer_id.trim().is_empty() && !token.trim().is_empty() {
-            account.contexts.insert(peer_id.to_string(), token.to_string());
+            account
+                .contexts
+                .insert(peer_id.to_string(), token.to_string());
         }
         true
     }
@@ -524,7 +539,12 @@ impl WeixinStateStore for InMemoryWeixinStateStore {
         })
     }
 
-    fn fail_message(&self, account_id: &str, lease: &WeixinLease, claim: &WeixinInboxClaim) -> bool {
+    fn fail_message(
+        &self,
+        account_id: &str,
+        lease: &WeixinLease,
+        claim: &WeixinInboxClaim,
+    ) -> bool {
         self.finish_claim(account_id, lease, claim, |entry, _| {
             entry.claim_until = 0;
             entry.claim_id = None;
@@ -595,9 +615,9 @@ impl InMemoryWeixinStateStore {
 /// cursor would make the consumer replay the provider backlog from the beginning.
 fn prune(accounts: &mut HashMap<String, Account>, active_account_id: &str, now: i64) {
     for account in accounts.values_mut() {
-        account
-            .inbox
-            .retain(|(_, entry)| !(entry.completed || entry.abandoned) || entry.completed_at >= now - RETENTION_MS);
+        account.inbox.retain(|(_, entry)| {
+            !(entry.completed || entry.abandoned) || entry.completed_at >= now - RETENTION_MS
+        });
     }
     accounts.retain(|id, account| {
         id == active_account_id
@@ -677,7 +697,11 @@ mod tests {
         assert_eq!(store.load_context_token("ghost", "peer"), None);
         assert!(!store.is_lease_current("ghost", &WeixinLease::new("h", 1).unwrap()));
         store.remove_account("ghost");
-        assert_eq!(store.retained_accounts(), 0, "lookups must not materialise accounts");
+        assert_eq!(
+            store.retained_accounts(),
+            0,
+            "lookups must not materialise accounts"
+        );
     }
 
     #[test]
@@ -696,7 +720,9 @@ mod tests {
         let next = store.claim_messages("account", &lease, 1, 60_000).remove(0);
         assert_eq!(next.message_id, "done");
         assert!(store.complete_message("account", &lease, &next));
-        assert!(store.claim_messages("account", &lease, 1, 60_000).is_empty());
+        assert!(store
+            .claim_messages("account", &lease, 1, 60_000)
+            .is_empty());
 
         // A re-delivered batch cannot resurrect either message.
         assert!(store.accept_batch(
@@ -705,7 +731,9 @@ mod tests {
             "cursor-2",
             &batch(&[("gone", "payload"), ("done", "payload")])
         ));
-        assert!(store.claim_messages("account", &lease, 1, 60_000).is_empty());
+        assert!(store
+            .claim_messages("account", &lease, 1, 60_000)
+            .is_empty());
     }
 
     #[test]

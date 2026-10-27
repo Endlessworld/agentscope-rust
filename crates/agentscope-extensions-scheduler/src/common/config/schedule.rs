@@ -229,7 +229,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, ScheduleConfigError::EmptyCronExpression);
 
-        let cfg = ScheduleConfig::builder().cron("0 0 8 * * ?").build().unwrap();
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .build()
+            .unwrap();
         assert_eq!(cfg.schedule_mode(), ScheduleMode::CRON);
         assert_eq!(cfg.cron_expression(), Some("0 0 8 * * ?"));
     }
@@ -240,7 +243,11 @@ mod tests {
             ScheduleConfig::builder().fixed_rate(0).build().unwrap_err(),
             ScheduleConfigError::InvalidFixedRate
         );
-        let cfg = ScheduleConfig::builder().fixed_rate(300_000).initial_delay(10).build().unwrap();
+        let cfg = ScheduleConfig::builder()
+            .fixed_rate(300_000)
+            .initial_delay(10)
+            .build()
+            .unwrap();
         assert_eq!(cfg.fixed_rate(), Some(300_000));
         assert_eq!(cfg.initial_delay(), Some(10));
     }
@@ -248,7 +255,10 @@ mod tests {
     #[test]
     fn fixed_delay_requires_positive() {
         assert_eq!(
-            ScheduleConfig::builder().fixed_delay(0).build().unwrap_err(),
+            ScheduleConfig::builder()
+                .fixed_delay(0)
+                .build()
+                .unwrap_err(),
             ScheduleConfigError::InvalidFixedDelay
         );
         let cfg = ScheduleConfig::builder().fixed_delay(5).build().unwrap();
@@ -257,8 +267,14 @@ mod tests {
 
     #[test]
     fn zone_offset_defaults_to_utc_and_rejects_unknown() {
-        let cfg = ScheduleConfig::builder().cron("0 0 8 * * ?").build().unwrap();
-        assert_eq!(cfg.zone_offset().unwrap(), FixedOffset::east_opt(0).unwrap());
+        let cfg = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.zone_offset().unwrap(),
+            FixedOffset::east_opt(0).unwrap()
+        );
 
         let cfg = ScheduleConfig::builder()
             .cron("0 0 8 * * ?")

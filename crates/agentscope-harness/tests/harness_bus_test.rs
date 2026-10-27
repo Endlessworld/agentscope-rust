@@ -208,19 +208,32 @@ async fn session_publish_and_read_events() {
     assert_eq!(events[1].payload["type"], "finish");
 
     // Cursor-based replay.
-    let tail = bus.session_read_events("sess-9", Some(&e1), 100).await.unwrap();
+    let tail = bus
+        .session_read_events("sess-9", Some(&e1), 100)
+        .await
+        .unwrap();
     assert_eq!(tail.len(), 1);
     assert_eq!(tail[0].id, e2);
 
     // Trimming clears the log for late subscribers.
     bus.session_trim_events("sess-9").await.unwrap();
-    assert!(bus.session_read_events("sess-9", None, 100).await.unwrap().is_empty());
+    assert!(bus
+        .session_read_events("sess-9", None, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Events are isolated per session.
-    bus.session_publish_event("other", json!({"type": "x"})).await.unwrap();
+    bus.session_publish_event("other", json!({"type": "x"}))
+        .await
+        .unwrap();
     let other = bus.session_read_events("other", None, 100).await.unwrap();
     assert_eq!(other.len(), 1);
-    assert!(bus.session_read_events("sess-9", None, 100).await.unwrap().is_empty());
+    assert!(bus
+        .session_read_events("sess-9", None, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
@@ -233,7 +246,9 @@ async fn enqueue_wakeup_writes_wakeups_queue() {
     let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
     let bus = WorkspaceMessageBus::new(fs, "/bus");
 
-    bus.enqueue_wakeup("user-1", "sess-1", "agent-1").await.unwrap();
+    bus.enqueue_wakeup("user-1", "sess-1", "agent-1")
+        .await
+        .unwrap();
 
     let drained = bus.queue_drain("agentscope:wakeups", 10).await.unwrap();
     assert_eq!(drained.len(), 1);
@@ -275,11 +290,17 @@ async fn async_tool_registry_register_and_complete() {
     reg.register(rec).await.unwrap();
 
     // A fresh RUNNING record is not stale.
-    let stale = reg.find_stale("sess-1", ChronoDuration::minutes(30)).await.unwrap();
+    let stale = reg
+        .find_stale("sess-1", ChronoDuration::minutes(30))
+        .await
+        .unwrap();
     assert!(stale.is_empty());
 
     reg.complete("rec-1", "ok").await.unwrap();
-    let stale = reg.find_stale("sess-1", ChronoDuration::seconds(0)).await.unwrap();
+    let stale = reg
+        .find_stale("sess-1", ChronoDuration::seconds(0))
+        .await
+        .unwrap();
     assert!(stale.is_empty(), "completed records are not stale");
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -300,13 +321,19 @@ async fn async_tool_registry_find_stale_and_mark_timeout() {
     let fresh = AsyncToolRecord::new("rec-new", "sess-1", "shell_execute", "call-new", Utc::now());
     reg.register(fresh).await.unwrap();
 
-    let stale = reg.find_stale("sess-1", ChronoDuration::minutes(30)).await.unwrap();
+    let stale = reg
+        .find_stale("sess-1", ChronoDuration::minutes(30))
+        .await
+        .unwrap();
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].id, "rec-old");
 
     // markTimeout flips the status so the record is no longer returned.
     reg.mark_timeout("rec-old").await.unwrap();
-    let stale = reg.find_stale("sess-1", ChronoDuration::minutes(30)).await.unwrap();
+    let stale = reg
+        .find_stale("sess-1", ChronoDuration::minutes(30))
+        .await
+        .unwrap();
     assert!(stale.is_empty());
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -323,7 +350,10 @@ async fn async_tool_registry_fail_sets_status() {
     reg.fail("rec-f", "boom").await.unwrap();
 
     // Even with a zero TTL, a FAILED record is never stale.
-    let stale = reg.find_stale("sess-1", ChronoDuration::seconds(0)).await.unwrap();
+    let stale = reg
+        .find_stale("sess-1", ChronoDuration::seconds(0))
+        .await
+        .unwrap();
     assert!(stale.is_empty());
 
     let _ = tokio::fs::remove_dir_all(&dir).await;

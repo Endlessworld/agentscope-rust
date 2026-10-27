@@ -1,7 +1,7 @@
 //! Sandbox manager for lifecycle management.
-use std::sync::Arc;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::context::SandboxContext;
@@ -16,10 +16,10 @@ use super::{Sandbox, SandboxClient, WorkspaceSpec};
 pub struct SandboxAcquireResult {
     /// The acquired sandbox.
     sandbox: Option<Box<dyn Sandbox>>,
-    
+
     /// Whether this is a self-managed sandbox (SDK owns lifecycle).
     self_managed: bool,
-    
+
     /// Guard lease (if configured).
     lease: SandboxLease,
 }
@@ -33,7 +33,7 @@ impl SandboxAcquireResult {
             lease,
         }
     }
-    
+
     /// Creates a self-managed result with no guard.
     pub fn self_managed_no_guard(sandbox: Box<dyn Sandbox>) -> Self {
         Self {
@@ -42,7 +42,7 @@ impl SandboxAcquireResult {
             lease: SandboxLease::noop(),
         }
     }
-    
+
     /// Creates a user-managed result (caller owns lifecycle).
     pub fn user_managed(sandbox: Box<dyn Sandbox>) -> Self {
         Self {
@@ -51,22 +51,22 @@ impl SandboxAcquireResult {
             lease: SandboxLease::noop(),
         }
     }
-    
+
     /// Returns the sandbox.
     pub fn sandbox(&self) -> Option<&dyn Sandbox> {
         self.sandbox.as_deref()
     }
-    
+
     /// Returns the sandbox, consuming the result.
     pub fn into_sandbox(self) -> Option<Box<dyn Sandbox>> {
         self.sandbox
     }
-    
+
     /// Returns true if this is a self-managed sandbox.
     pub fn is_self_managed(&self) -> bool {
         self.self_managed
     }
-    
+
     /// Returns the guard lease.
     pub fn lease(&self) -> &SandboxLease {
         &self.lease
@@ -74,7 +74,7 @@ impl SandboxAcquireResult {
 }
 
 /// Manages the lifecycle of `Sandbox` instances for the current call.
-/// 
+///
 /// Acquire priority:
 /// 1. `SandboxContext::external_sandbox` — user-supplied sandbox
 /// 2. `SandboxContext::external_sandbox_state` — user-supplied state
@@ -83,13 +83,13 @@ impl SandboxAcquireResult {
 pub struct SandboxManager {
     /// Sandbox client for creating/resuming sandboxes.
     client: Arc<dyn SandboxClient>,
-    
+
     /// State store for persisting sandbox state.
     state_store: Arc<dyn SandboxStateStore>,
-    
+
     /// Agent ID.
     agent_id: String,
-    
+
     /// Execution guard for isolation.
     execution_guard: SandboxExecutionGuard,
 }
@@ -117,7 +117,7 @@ impl SandboxManager {
             execution_guard: SandboxExecutionGuard::noop(),
         }
     }
-    
+
     /// Creates a new sandbox manager with execution guard.
     pub fn with_guard(
         client: Arc<dyn SandboxClient>,
@@ -132,7 +132,7 @@ impl SandboxManager {
             execution_guard,
         }
     }
-    
+
     /// Acquires a sandbox based on the context.
     pub async fn acquire(
         &self,
@@ -151,7 +151,7 @@ impl SandboxManager {
                 "User-managed sandboxes are not supported in this implementation".to_string(),
             ));
         }
-        
+
         // Priority 2: user-supplied state — guard does not apply
         if let Some(external_state) = sandbox_context.external_sandbox_state() {
             debug!(
@@ -161,20 +161,20 @@ impl SandboxManager {
             let sandbox = self.client.resume(external_state).await?;
             return Ok(SandboxAcquireResult::self_managed_no_guard(sandbox));
         }
-        
+
         // Priority 3 / 4: harness-managed — apply guard when a scope key is present
         let scope_key = SandboxIsolationKey::resolve(
             sandbox_context.isolation_scope(),
             runtime_context,
             &self.agent_id,
         );
-        
+
         let mut lease = SandboxLease::noop();
         if let Some(key) = &scope_key {
             debug!("[sandbox] Acquiring execution guard for scope {}", key);
             lease = self.execution_guard.try_enter(key.clone());
         }
-        
+
         // Try to load persisted state (Priority 3)
         if let Some(key) = &scope_key {
             match self.state_store.load(&key.to_string()).await {
@@ -208,46 +208,53 @@ impl SandboxManager {
                 }
             }
         }
-        
+
         // Priority 4: create new sandbox
         debug!("[sandbox] Priority 4: creating new sandbox");
         let workspace_spec = sandbox_context
             .workspace_spec()
             .cloned()
             .unwrap_or_default();
-        
+
         let snapshot_spec = sandbox_context.snapshot_spec().cloned();
         let client_options = sandbox_context.client_options().cloned();
-        
+
         let sandbox = self
             .client
-            .create(&workspace_spec, snapshot_spec.as_deref(), client_options.as_ref())
+            .create(
+                &workspace_spec,
+                snapshot_spec.as_deref(),
+                client_options.as_ref(),
+            )
             .await?;
-        
+
         Ok(SandboxAcquireResult::self_managed(sandbox, lease))
     }
-    
+
     /// Releases a sandbox (stop + shutdown if self-managed).
     pub async fn release(&self, result: &SandboxAcquireResult) {
         let sandbox = match result.sandbox() {
             Some(s) => s,
             None => return,
         };
-        
+
         // User-managed sandboxes are owned by the caller
         if !result.is_self_managed() {
             return;
         }
-        
+
         // Stop the sandbox
         // Note: We can't call mutable methods on &dyn Sandbox, so we need to handle this differently
         // In a real implementation, we'd need to take ownership or use interior mutability
-        debug!("[sandbox] Releasing self-managed sandbox: {}", sandbox.state().session_id());
-        
+        debug!(
+            "[sandbox] Releasing self-managed sandbox: {}",
+            sandbox.state().session_id()
+        );
+
         // For now, we'll just log. The actual stop/shutdown would need to be handled
         // by the caller or through a different mechanism.
     }
-    
+
     /// Persists sandbox state.
     pub async fn persist_state(
         &self,
@@ -259,20 +266,20 @@ impl SandboxManager {
             Some(s) => s,
             None => return,
         };
-        
+
         // User-managed sandboxes carry their own persistence story
         if !result.is_self_managed() {
             return;
         }
-        
+
         let state = sandbox.state();
-        
+
         let scope_key = SandboxIsolationKey::resolve(
             sandbox_context.isolation_scope(),
             runtime_context,
             &self.agent_id,
         );
-        
+
         let key = match scope_key {
             Some(k) => k,
             None => {
@@ -280,7 +287,7 @@ impl SandboxManager {
                 return;
             }
         };
-        
+
         match self.state_store.save(&key.to_string(), state).await {
             Ok(()) => {
                 debug!(
@@ -294,7 +301,7 @@ impl SandboxManager {
             }
         }
     }
-    
+
     /// Clears persisted sandbox state.
     pub async fn clear_state(
         &self,
@@ -306,38 +313,34 @@ impl SandboxManager {
             runtime_context,
             &self.agent_id,
         );
-        
+
         let key = match scope_key {
             Some(k) => k,
             None => return,
         };
-        
+
         if let Err(e) = self.state_store.delete(&key.to_string()).await {
             warn!("[sandbox] Failed to clear sandbox state: {}", e);
         }
     }
 }
 
-
-
-
-
 use super::ExecResult;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::state::InMemorySandboxStateStore;
-    use super::super::{SandboxSnapshotSpec, SandboxClientOptions};
+    use super::super::{SandboxClientOptions, SandboxSnapshotSpec};
+    use super::*;
     use std::sync::Arc;
-    
+
     // Mock sandbox for testing
     #[derive(Debug)]
     struct MockSandbox {
         state: SandboxState,
         running: bool,
     }
-    
+
     impl MockSandbox {
         fn new() -> Self {
             Self {
@@ -352,27 +355,27 @@ mod tests {
             }
         }
     }
-    
+
     #[async_trait::async_trait]
     impl Sandbox for MockSandbox {
         async fn start(&mut self) -> Result<()> {
             self.running = true;
             Ok(())
         }
-        
+
         async fn stop(&mut self) -> Result<()> {
             self.running = false;
             Ok(())
         }
-        
+
         fn is_running(&self) -> bool {
             self.running
         }
-        
+
         fn state(&self) -> &SandboxState {
             &self.state
         }
-        
+
         async fn exec(
             &self,
             _runtime_context: Option<&RuntimeContext>,
@@ -386,19 +389,19 @@ mod tests {
                 truncated: false,
             })
         }
-        
+
         async fn persist_workspace(&self) -> Result<Vec<u8>> {
             Ok(vec![])
         }
-        
+
         async fn hydrate_workspace(&self, _archive: &[u8]) -> Result<()> {
             Ok(())
         }
     }
-    
+
     // Mock client for testing
     struct MockSandboxClient;
-    
+
     #[async_trait::async_trait]
     impl SandboxClient for MockSandboxClient {
         async fn create(
@@ -409,23 +412,25 @@ mod tests {
         ) -> Result<Box<dyn Sandbox>> {
             Ok(Box::new(MockSandbox::new()))
         }
-        
+
         async fn resume(&self, _state: &SandboxState) -> Result<Box<dyn Sandbox>> {
             Ok(Box::new(MockSandbox::new()))
         }
-        
+
         async fn delete(&self, _sandbox: &dyn Sandbox) -> Result<()> {
             Ok(())
         }
-        
+
         fn serialize_state(&self, state: &SandboxState) -> Result<String> {
-            serde_json::to_string(state).map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+            serde_json::to_string(state)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
         }
-        
+
         fn deserialize_state(&self, json: &str) -> Result<SandboxState> {
-            serde_json::from_str(json).map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+            serde_json::from_str(json)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
         }
-        
+
         fn deserialize_state_with_spec(
             &self,
             json: &str,
@@ -434,34 +439,34 @@ mod tests {
             self.deserialize_state(json)
         }
     }
-    
+
     #[tokio::test]
     async fn test_sandbox_manager_acquire_priority_4() {
         let client = Arc::new(MockSandboxClient);
         let state_store = Arc::new(InMemorySandboxStateStore::new());
         let manager = SandboxManager::new(client, state_store, "test-agent");
-        
+
         let context = SandboxContext::builder().build();
-        
+
         let result = manager.acquire(&context, None).await.unwrap();
-        
+
         assert!(result.is_self_managed());
         assert!(result.sandbox().is_some());
         assert!(result.lease().is_noop());
     }
-    
+
     #[tokio::test]
     async fn test_sandbox_manager_persist_state() {
         let client = Arc::new(MockSandboxClient);
         let state_store = Arc::new(InMemorySandboxStateStore::new());
         let manager = SandboxManager::new(client, state_store.clone(), "test-agent");
-        
+
         let context = SandboxContext::builder().build();
         let result = manager.acquire(&context, None).await.unwrap();
-        
+
         // Persist state
         manager.persist_state(&result, &context, None).await;
-        
+
         // Note: This test doesn't verify persistence because the mock sandbox
         // doesn't have a proper isolation key resolution. In a real test,
         // we'd need to set up the runtime context properly.

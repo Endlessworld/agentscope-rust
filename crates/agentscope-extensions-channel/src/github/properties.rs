@@ -72,11 +72,10 @@ mod tests {
     #[test]
     fn requires_token_and_webhook_secret() {
         assert!(GitHubChannelProperties::from_json("github", &serde_json::json!({})).is_err());
-        assert!(GitHubChannelProperties::from_json(
-            "github",
-            &serde_json::json!({"token": "t"})
-        )
-        .is_err());
+        assert!(
+            GitHubChannelProperties::from_json("github", &serde_json::json!({"token": "t"}))
+                .is_err()
+        );
     }
 
     #[test]

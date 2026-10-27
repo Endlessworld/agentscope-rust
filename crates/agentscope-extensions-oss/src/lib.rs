@@ -83,11 +83,11 @@ pub mod state_store;
 
 pub use base_store::{OssStore, OssStoreBuilder};
 pub use client::{InMemoryOssClient, OssClient, OssListPage, OssObjectSummary};
-#[cfg(feature = "s3")]
-pub use s3::{S3OssClient, S3OssClientBuilder};
 pub use distributed_store::OssDistributedStore;
 pub use error::{OssError, OssResult};
 pub use guard::OssSandboxExecutionGuard;
+#[cfg(feature = "s3")]
+pub use s3::{S3OssClient, S3OssClientBuilder};
 pub use snapshot::{OssRemoteSnapshotClient, OssSnapshotSpec};
 pub use state_store::{OssAgentStateStore, OssAgentStateStoreBuilder};
 

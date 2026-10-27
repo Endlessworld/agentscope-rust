@@ -58,7 +58,12 @@ pub struct RemoteExecOutput {
 impl RemoteExecOutput {
     /// Creates an output with the given exit code and captured streams.
     pub fn new(exit_code: i32, stdout: String, stderr: String) -> Self {
-        Self { exit_code, stdout, stderr, truncated: false }
+        Self {
+            exit_code,
+            stdout,
+            stderr,
+            truncated: false,
+        }
     }
 
     /// Projects onto the harness [`ExecResult`].
@@ -84,7 +89,10 @@ pub struct RemoteSandboxHandle {
 impl RemoteSandboxHandle {
     /// Creates a handle from an id and backend-specific extras.
     pub fn new(id: impl Into<String>, extra: BTreeMap<String, String>) -> Self {
-        Self { id: id.into(), extra }
+        Self {
+            id: id.into(),
+            extra,
+        }
     }
 }
 
@@ -130,7 +138,10 @@ impl RemoteSandboxStateData {
             WORKSPACE_ROOT_METADATA_KEY.to_string(),
             self.workspace_root.clone(),
         );
-        metadata.insert(OWNED_METADATA_KEY.to_string(), self.sandbox_owned.to_string());
+        metadata.insert(
+            OWNED_METADATA_KEY.to_string(),
+            self.sandbox_owned.to_string(),
+        );
         if !self.extra.is_empty() {
             match serde_json::to_string(&self.extra) {
                 Ok(json) => {
@@ -245,7 +256,11 @@ impl RemoteSandboxCore {
     /// Wraps typed data and initializes the harness state cache.
     pub fn new(data: RemoteSandboxStateData) -> Self {
         let state_cache = data.to_harness_state();
-        Self { data, running: false, state_cache }
+        Self {
+            data,
+            running: false,
+            state_cache,
+        }
     }
 
     /// Returns the cached harness state.
@@ -319,10 +334,7 @@ pub trait RemoteBackend: Send + Sync + std::fmt::Debug {
 }
 
 /// Converts an exec output into an error when it exited non-zero.
-pub fn ensure_output_success(
-    context: &str,
-    output: &RemoteExecOutput,
-) -> SandboxResult<()> {
+pub fn ensure_output_success(context: &str, output: &RemoteExecOutput) -> SandboxResult<()> {
     crate::workspace::ensure_success(context, &output.to_exec_result())
 }
 
@@ -352,9 +364,7 @@ pub fn chunk_base64(encoded: &str, chunk_size: usize) -> Vec<String> {
 pub fn build_b64_append_script(path: &str, chunk: &str) -> String {
     let path_lit = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".to_string());
     let chunk_lit = serde_json::to_string(chunk).unwrap_or_else(|_| "\"\"".to_string());
-    let py = format!(
-        "import pathlib; pathlib.Path({path_lit}).open('a').write({chunk_lit})"
-    );
+    let py = format!("import pathlib; pathlib.Path({path_lit}).open('a').write({chunk_lit})");
     format!("python3 -c {}", shell_quote(&py))
 }
 
@@ -382,10 +392,19 @@ pub async fn persist_tar<B: RemoteBackend + ?Sized>(
 ) -> SandboxResult<Vec<u8>> {
     use base64::Engine as _;
     let output = backend
-        .exec_in(handle, &build_tar_base64_command(root), None, TAR_TIMEOUT_SECONDS)
+        .exec_in(
+            handle,
+            &build_tar_base64_command(root),
+            None,
+            TAR_TIMEOUT_SECONDS,
+        )
         .await?;
     ensure_output_success("workspace archive", &output)?;
-    let compact: String = output.stdout.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact: String = output
+        .stdout
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     base64::engine::general_purpose::STANDARD
         .decode(compact.as_bytes())
         .map_err(|e| {
@@ -444,7 +463,12 @@ impl RemoteSandbox {
             .sandbox_id
             .as_ref()
             .map(|id| RemoteSandboxHandle::new(id.clone(), data.extra.clone()));
-        Self { backend, core: RemoteSandboxCore::new(data), handle, snapshot }
+        Self {
+            backend,
+            core: RemoteSandboxCore::new(data),
+            handle,
+            snapshot,
+        }
     }
 
     /// Returns the backend name.
@@ -453,9 +477,11 @@ impl RemoteSandbox {
     }
 
     fn workspace_spec(&self) -> WorkspaceSpec {
-        self.core.data.workspace_spec.clone().unwrap_or_else(|| {
-            WorkspaceSpec::new(self.core.data.workspace_root.clone())
-        })
+        self.core
+            .data
+            .workspace_spec
+            .clone()
+            .unwrap_or_else(|| WorkspaceSpec::new(self.core.data.workspace_root.clone()))
     }
 
     async fn ensure_handle(&mut self) -> Result<&RemoteSandboxHandle> {
@@ -629,7 +655,10 @@ pub struct RemoteSandboxClient {
 impl RemoteSandboxClient {
     /// Creates a client for the given backend.
     pub fn new(backend: Arc<dyn RemoteBackend>) -> Self {
-        Self { backend, snapshot_spec: None }
+        Self {
+            backend,
+            snapshot_spec: None,
+        }
     }
 
     /// Attaches a default snapshot spec applied when `create` receives none.
@@ -671,12 +700,20 @@ impl SandboxClient for RemoteSandboxClient {
             extra: BTreeMap::new(),
             workspace_spec: Some(workspace_spec.clone()),
         };
-        Ok(Box::new(RemoteSandbox::new(self.backend.clone(), data, snapshot)))
+        Ok(Box::new(RemoteSandbox::new(
+            self.backend.clone(),
+            data,
+            snapshot,
+        )))
     }
 
     async fn resume(&self, state: &SandboxState) -> Result<Box<dyn Sandbox>> {
         let data = RemoteSandboxStateData::from_harness_state(state)?;
-        Ok(Box::new(RemoteSandbox::new(self.backend.clone(), data, None)))
+        Ok(Box::new(RemoteSandbox::new(
+            self.backend.clone(),
+            data,
+            None,
+        )))
     }
 
     async fn delete(&self, _sandbox: &dyn Sandbox) -> Result<()> {
@@ -727,7 +764,10 @@ mod tests {
                 assert_eq!(remote.token.as_deref(), Some("tok"));
                 assert!(remote.workspace_root_ready);
                 assert_eq!(
-                    remote.metadata.get(BACKEND_METADATA_KEY).map(String::as_str),
+                    remote
+                        .metadata
+                        .get(BACKEND_METADATA_KEY)
+                        .map(String::as_str),
                     Some("e2b")
                 );
             }
@@ -742,7 +782,10 @@ mod tests {
         let restored = RemoteSandboxStateData::from_harness_state(&state).unwrap();
         assert_eq!(restored.backend, "e2b");
         assert_eq!(restored.workspace_root, "/home/user");
-        assert_eq!(restored.extra.get("template_id").map(String::as_str), Some("base"));
+        assert_eq!(
+            restored.extra.get("template_id").map(String::as_str),
+            Some("base")
+        );
         assert!(restored.workspace_spec.is_some());
         assert_eq!(restored.session_id, "sess-1");
     }
@@ -779,16 +822,25 @@ mod tests {
 
     #[test]
     fn tar_command_quotes_root() {
-        assert_eq!(build_tar_base64_command("/home/user"), "tar -cf - -C /home/user . | base64 -w0");
+        assert_eq!(
+            build_tar_base64_command("/home/user"),
+            "tar -cf - -C /home/user . | base64 -w0"
+        );
         assert!(build_tar_command("/with space").contains("'/with space'"));
     }
 
     #[test]
     fn projection_hash_is_stable() {
         let spec = WorkspaceSpec::new("/workspace").with_file("a", "b");
-        assert_eq!(workspace_projection_hash(&spec), workspace_projection_hash(&spec));
+        assert_eq!(
+            workspace_projection_hash(&spec),
+            workspace_projection_hash(&spec)
+        );
         let other = WorkspaceSpec::new("/workspace").with_file("a", "c");
-        assert_ne!(workspace_projection_hash(&spec), workspace_projection_hash(&other));
+        assert_ne!(
+            workspace_projection_hash(&spec),
+            workspace_projection_hash(&other)
+        );
     }
 
     #[test]
@@ -895,7 +947,9 @@ mod tests {
             alive: Mutex::new(false),
         });
         let client = RemoteSandboxClient::new(backend);
-        let json = client.serialize_state(&sample_data().to_harness_state()).unwrap();
+        let json = client
+            .serialize_state(&sample_data().to_harness_state())
+            .unwrap();
         let parsed = client.deserialize_state(&json).unwrap();
         assert_eq!(parsed.session_id(), "sess-1");
     }

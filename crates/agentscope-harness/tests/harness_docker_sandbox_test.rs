@@ -56,10 +56,7 @@ async fn docker_sandbox_lifecycle_roundtrip() {
     assert_eq!(listing.exit_code, 0, "stderr: {}", listing.stderr);
     assert_eq!(listing.stdout.trim(), "# hello");
 
-    let echo = sandbox
-        .exec(None, "echo hi", Some(30))
-        .await
-        .expect("echo");
+    let echo = sandbox.exec(None, "echo hi", Some(30)).await.expect("echo");
     assert_eq!(echo.exit_code, 0);
     assert_eq!(echo.stdout.trim(), "hi");
 
@@ -69,7 +66,10 @@ async fn docker_sandbox_lifecycle_roundtrip() {
         .expect("failing command still returns a result");
     assert_eq!(failure.exit_code, 3);
 
-    let archive = sandbox.persist_workspace().await.expect("persist workspace");
+    let archive = sandbox
+        .persist_workspace()
+        .await
+        .expect("persist workspace");
     assert!(!archive.is_empty(), "workspace archive should not be empty");
 
     // stop + start reuses the live container: branch A keeps the workspace as-is.

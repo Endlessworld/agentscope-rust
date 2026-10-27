@@ -61,13 +61,7 @@ pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
     /// Insert semantics: every vendor override binds `version = 1` explicitly, so a fresh
     /// row starts at `1` — the DDL's `version ... DEFAULT 0` never applies to this
     /// statement (only [`Self::session_state_insert`], which omits the column, gets `0`).
-    fn session_state_upsert(
-        &self,
-        slot_id: &str,
-        key: &str,
-        index: i32,
-        json: &str,
-    ) -> BoundSql;
+    fn session_state_upsert(&self, slot_id: &str, key: &str, index: i32, json: &str) -> BoundSql;
 
     /// UPSERT a single state row and return the resulting version in the same round trip.
     ///
@@ -114,13 +108,7 @@ pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
 
     /// INSERT one list item at a given index (used in batched appends). Mirrors the Java
     /// `sessionStateInsert` — four params, `version` defaults to 1 in the schema.
-    fn session_state_insert(
-        &self,
-        slot_id: &str,
-        key: &str,
-        index: i32,
-        json: &str,
-    ) -> BoundSql {
+    fn session_state_insert(&self, slot_id: &str, key: &str, index: i32, json: &str) -> BoundSql {
         BoundSql::new(
             format!(
                 "INSERT INTO {} (session_id, state_key, item_index, state_data) VALUES (?, ?, ?, ?)",

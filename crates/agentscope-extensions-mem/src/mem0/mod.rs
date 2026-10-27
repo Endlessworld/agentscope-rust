@@ -14,6 +14,5 @@ pub use dto::{
 };
 pub use memory::{
     convert_messages, convert_to_mem0_message, join_search_results, role_to_mem0_role,
-    Mem0LongTermMemory, Mem0LongTermMemoryConfig, COMPRESSED_HISTORY_MARKER,
-    DEFAULT_SEARCH_TOP_K,
+    Mem0LongTermMemory, Mem0LongTermMemoryConfig, COMPRESSED_HISTORY_MARKER, DEFAULT_SEARCH_TOP_K,
 };

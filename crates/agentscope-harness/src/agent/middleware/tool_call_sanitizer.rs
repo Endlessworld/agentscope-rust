@@ -159,7 +159,10 @@ mod tests {
             Msg::user("hi"),
             assistant_with_call("t1", "ls"),
             tool_result("t1", "ls"),
-            Msg::builder().role(MsgRole::Assistant).text_content("done").build(),
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .text_content("done")
+                .build(),
         ];
         assert!(ToolCallPairSanitizerMiddleware::sanitize(&msgs).is_none());
     }
@@ -187,7 +190,9 @@ mod tests {
         ];
         let out = ToolCallPairSanitizerMiddleware::sanitize(&msgs).expect("sanitized");
         assert_eq!(out.len(), 3);
-        assert!(out.iter().all(|m| m.tool_result_blocks().all(|tr| tr.id.as_deref() != Some("ghost"))));
+        assert!(out.iter().all(|m| m
+            .tool_result_blocks()
+            .all(|tr| tr.id.as_deref() != Some("ghost"))));
     }
 
     #[test]
@@ -202,16 +207,8 @@ mod tests {
         let assistant_two = Msg::builder()
             .role(MsgRole::Assistant)
             .content(vec![
-                ContentBlock::ToolUse(ToolUseBlock::new(
-                    "a",
-                    "x",
-                    serde_json::Map::new(),
-                )),
-                ContentBlock::ToolUse(ToolUseBlock::new(
-                    "b",
-                    "y",
-                    serde_json::Map::new(),
-                )),
+                ContentBlock::ToolUse(ToolUseBlock::new("a", "x", serde_json::Map::new())),
+                ContentBlock::ToolUse(ToolUseBlock::new("b", "y", serde_json::Map::new())),
             ])
             .build();
         let mut msgs = msgs;

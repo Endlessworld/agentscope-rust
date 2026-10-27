@@ -88,11 +88,7 @@ impl DefaultAgentManager {
     }
 
     /// Invokes an agent with a user prompt, returning the reply.
-    pub async fn invoke_agent(
-        &self,
-        agent: &Arc<dyn CallableAgent>,
-        prompt: &str,
-    ) -> Result<Msg> {
+    pub async fn invoke_agent(&self, agent: &Arc<dyn CallableAgent>, prompt: &str) -> Result<Msg> {
         agent.call(vec![Msg::user(prompt)]).await
     }
 }

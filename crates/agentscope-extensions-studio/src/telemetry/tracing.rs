@@ -340,10 +340,7 @@ impl SpanStream {
 impl Stream for SpanStream {
     type Item = agentscope_core::error::Result<AgentEvent>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(None) => {
@@ -468,9 +465,7 @@ mod tests {
     }
 
     /// A `next` continuation that yields `events` and completes.
-    fn next_with(
-        events: Vec<agentscope_core::error::Result<AgentEvent>>,
-    ) -> Next<AgentInput> {
+    fn next_with(events: Vec<agentscope_core::error::Result<AgentEvent>>) -> Next<AgentInput> {
         Box::new(move |_input: AgentInput| Box::pin(futures::stream::iter(events)))
     }
 
@@ -508,7 +503,9 @@ mod tests {
         let stream = tracing.on_agent(
             &ctx(Some("run-2")),
             agent_input(),
-            next_with(vec![Err(agentscope_core::error::Error::Agent("boom".into()))]),
+            next_with(vec![Err(agentscope_core::error::Error::Agent(
+                "boom".into(),
+            ))]),
         );
         let _ = drain(stream).await;
 

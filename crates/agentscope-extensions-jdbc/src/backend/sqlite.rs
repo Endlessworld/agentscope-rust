@@ -10,8 +10,8 @@ use rusqlite::types::Value;
 use rusqlite::Connection;
 use rusqlite::Transaction;
 
-use crate::dialect::{BoundSql, SqlParam};
 use super::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession};
+use crate::dialect::{BoundSql, SqlParam};
 
 /// A [`JdbcExecutor`] backed by a single `rusqlite` connection guarded by a mutex.
 ///
@@ -33,14 +33,18 @@ impl RusqliteExecutor {
     pub fn in_memory() -> JdbcResult<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| JdbcError::Database(format!("open in-memory sqlite: {e}")))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Opens a file-backed SQLite database.
     pub fn open(path: &str) -> JdbcResult<Self> {
         let conn = Connection::open(path)
             .map_err(|e| JdbcError::Database(format!("open sqlite '{path}': {e}")))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Runs idempotent DDL statements (e.g. `CREATE TABLE IF NOT EXISTS`).

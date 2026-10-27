@@ -60,10 +60,7 @@ impl StateCheckpointMiddleware {
     }
 
     /// Creates a checkpoint middleware with an explicit conflict policy.
-    pub fn with_conflict_policy(
-        store: Arc<dyn AgentStateStore>,
-        policy: ConflictPolicy,
-    ) -> Self {
+    pub fn with_conflict_policy(store: Arc<dyn AgentStateStore>, policy: ConflictPolicy) -> Self {
         Self {
             store,
             restored: Arc::new(AtomicBool::new(false)),
@@ -114,7 +111,11 @@ async fn save_state_snapshot(
 ) -> Option<Error> {
     let (uid, sid, local) = {
         let g = state.lock().unwrap();
-        (g.user_id().map(str::to_string), g.session_id().to_string(), g.clone())
+        (
+            g.user_id().map(str::to_string),
+            g.session_id().to_string(),
+            g.clone(),
+        )
     };
     let slot = slot_key(uid.as_deref(), &sid);
     let (expected, loaded_context) = {
@@ -126,7 +127,13 @@ async fn save_state_snapshot(
     };
     let value = serde_json::to_value(&local).unwrap_or_default();
     let written = store
-        .save_if_version(uid.as_deref(), &sid, AGENT_STATE_KEY, value.clone(), expected)
+        .save_if_version(
+            uid.as_deref(),
+            &sid,
+            AGENT_STATE_KEY,
+            value.clone(),
+            expected,
+        )
         .await;
     if written != UNVERSIONED {
         record_write(&slots, &slot, written, local.context().len());
@@ -146,12 +153,20 @@ async fn save_state_snapshot(
     match policy {
         ConflictPolicy::Overwrite => {
             let overwritten = store
-                .save_if_version(uid.as_deref(), &sid, AGENT_STATE_KEY, value.clone(), UNVERSIONED)
+                .save_if_version(
+                    uid.as_deref(),
+                    &sid,
+                    AGENT_STATE_KEY,
+                    value.clone(),
+                    UNVERSIONED,
+                )
                 .await;
             if overwritten != UNVERSIONED {
                 record_write(&slots, &slot, overwritten, local.context().len());
             } else {
-                store.save(uid.as_deref(), &sid, AGENT_STATE_KEY, value).await;
+                store
+                    .save(uid.as_deref(), &sid, AGENT_STATE_KEY, value)
+                    .await;
             }
             tracing::warn!(session_id = %sid, "agent_state CAS conflict — OVERWRITE applied");
             None
@@ -188,7 +203,9 @@ async fn append_merge(
     local: AgentState,
     loaded_context: usize,
 ) -> Option<Error> {
-    let latest = store.get_versioned(uid.as_deref(), &sid, AGENT_STATE_KEY).await;
+    let latest = store
+        .get_versioned(uid.as_deref(), &sid, AGENT_STATE_KEY)
+        .await;
     let mut baseline = latest
         .value
         .as_ref()
@@ -280,7 +297,11 @@ impl Middleware for StateCheckpointMiddleware {
                 let loaded = store
                     .get_versioned(uid.as_deref(), &sid, AGENT_STATE_KEY)
                     .await;
-                if let Some(saved) = loaded.value.clone().and_then(|v| serde_json::from_value::<AgentState>(v).ok()) {
+                if let Some(saved) = loaded
+                    .value
+                    .clone()
+                    .and_then(|v| serde_json::from_value::<AgentState>(v).ok())
+                {
                     let mut g = state.lock().unwrap();
                     *g = saved;
                 }

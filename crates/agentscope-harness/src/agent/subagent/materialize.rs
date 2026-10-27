@@ -16,7 +16,6 @@ use crate::agent::memory::{MemoryConfig, ToolResultEvictionConfig};
 use crate::agent::skill::SkillFilter;
 use crate::agent::HarnessAgent;
 
-
 /// Subagent context section injected into every subagent's system prompt.
 /// Establishes identity, rules, output format and prohibited behaviours for a leaf
 /// worker (mirrors Java `HarnessAgentBuilderSupport.SUBAGENT_CONTEXT_SECTION`).
@@ -154,7 +153,10 @@ pub fn resolve_declared_workspace(decl: &SubagentDeclaration, main_workspace: &P
     if decl.workspace_mode == SubagentWorkspaceMode::Shared {
         return main_workspace.to_path_buf();
     }
-    let isolated = main_workspace.join("agents").join(&decl.name).join("workspace");
+    let isolated = main_workspace
+        .join("agents")
+        .join(&decl.name)
+        .join("workspace");
     let _ = std::fs::create_dir_all(&isolated);
     isolated
 }
@@ -191,10 +193,7 @@ pub fn resolve_declared_model(
 
 /// Skill filter for a declared subagent (mirrors Java `buildDeclaredFactory`): the declaration's
 /// allowlist narrowed by the parent filter, or the parent filter itself when it names none.
-pub fn declared_skill_filter(
-    parent: &SkillFilter,
-    decl: &SubagentDeclaration,
-) -> SkillFilter {
+pub fn declared_skill_filter(parent: &SkillFilter, decl: &SubagentDeclaration) -> SkillFilter {
     if decl.skills.is_empty() {
         return parent.clone();
     }
@@ -317,10 +316,7 @@ impl SubagentBlueprint {
 
     /// Leaf configuration for a declaration, split out of [`Self::declared_factory`] so a
     /// test can inspect the resulting `HarnessAgent` (the factory trait erases the type).
-    fn declared_leaf(
-        self: &Arc<Self>,
-        decl: &SubagentDeclaration,
-    ) -> Option<LeafFactory> {
+    fn declared_leaf(self: &Arc<Self>, decl: &SubagentDeclaration) -> Option<LeafFactory> {
         if decl.is_remote() {
             return None;
         }
@@ -481,7 +477,6 @@ impl LeafFactory {
     }
 }
 
-
 /// Resolves a child agent's compaction setting.
 ///
 /// The declaration's own setting outranks the inherited parent setting — a declaration can
@@ -627,7 +622,10 @@ mod tests {
             .declared_leaf(&decl)
             .expect("a local declaration yields a leaf")
             .build(&RuntimeContext::new());
-        let prompt = child.agent().expect("the child is built with a model").sys_prompt();
+        let prompt = child
+            .agent()
+            .expect("the child is built with a model")
+            .sys_prompt();
         assert!(prompt.contains("Workspace Persona"), "{prompt}");
         assert!(prompt.contains("Use the project conventions."), "{prompt}");
         assert!(prompt.contains("Subagent Context"), "{prompt}");
@@ -641,7 +639,10 @@ mod tests {
             .declared_leaf(&decl)
             .expect("a local declaration yields a leaf")
             .build(&RuntimeContext::new());
-        let prompt = child.agent().expect("the child is built with a model").sys_prompt();
+        let prompt = child
+            .agent()
+            .expect("the child is built with a model")
+            .sys_prompt();
         assert!(prompt.contains("Inline Persona"), "{prompt}");
         assert!(prompt.contains("Subagent Context"), "{prompt}");
     }

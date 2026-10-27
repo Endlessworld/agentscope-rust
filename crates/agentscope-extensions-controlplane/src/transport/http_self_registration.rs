@@ -200,10 +200,22 @@ pub fn parse_registered_identity(
 ) -> ControlPlaneResult<RegisteredIdentity> {
     let doc: Value = serde_json::from_str(body)
         .map_err(|e| ControlPlaneError::Http(format!("registration response is not JSON: {e}")))?;
-    let agent_id = doc.pointer("/agent/id").and_then(|v| v.as_str()).unwrap_or("");
-    let binding_id = doc.pointer("/binding/id").and_then(|v| v.as_str()).unwrap_or("");
-    let instance_id = doc.pointer("/instance/id").and_then(|v| v.as_str()).unwrap_or("");
-    let generation = doc.pointer("/instance/generation").and_then(|v| v.as_i64()).unwrap_or(0);
+    let agent_id = doc
+        .pointer("/agent/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let binding_id = doc
+        .pointer("/binding/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let instance_id = doc
+        .pointer("/instance/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let generation = doc
+        .pointer("/instance/generation")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let issued = doc
         .get("registrationCredential")
         .and_then(|v| v.as_str())
@@ -253,7 +265,10 @@ impl HttpSelfRegistration {
     ) -> ControlPlaneResult<Self> {
         let options = options.validate()?;
         Ok(Self {
-            http: Arc::new(ControlPlaneHttpClient::new(control_plane_http, internal_token)?),
+            http: Arc::new(ControlPlaneHttpClient::new(
+                control_plane_http,
+                internal_token,
+            )?),
             options,
             registered: AtomicBool::new(false),
             registered_instance_id: RwLock::new(None),
@@ -275,7 +290,10 @@ impl HttpSelfRegistration {
 
     /// The last successfully registered identity, if any.
     pub fn identity(&self) -> Option<RegisteredIdentity> {
-        self.identity.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.identity
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Receives every successfully refreshed identity, including generation changes.
@@ -438,7 +456,10 @@ impl HttpSelfRegistration {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let interval = self.options.heartbeat_interval.max(Duration::from_millis(1));
+        let interval = self
+            .options
+            .heartbeat_interval
+            .max(Duration::from_millis(1));
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);

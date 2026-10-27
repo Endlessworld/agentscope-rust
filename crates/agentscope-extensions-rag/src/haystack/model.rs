@@ -258,7 +258,10 @@ mod tests {
             }]),
             ..Default::default()
         };
-        assert_eq!(response.effective_documents()[0].id.as_deref(), Some("plain"));
+        assert_eq!(
+            response.effective_documents()[0].id.as_deref(),
+            Some("plain")
+        );
         assert!(!response.is_empty_payload());
     }
 
@@ -316,10 +319,8 @@ mod tests {
         assert!(document.sparse_embedding.is_none());
         assert!(document.blob.is_none());
 
-        let document: HayStackDocument = serde_json::from_str(
-            r#"{"sparse_embedding":{"indices":[1],"values":[0.5]}}"#,
-        )
-        .unwrap();
+        let document: HayStackDocument =
+            serde_json::from_str(r#"{"sparse_embedding":{"indices":[1],"values":[0.5]}}"#).unwrap();
         let sparse = document.sparse_embedding.unwrap();
         assert_eq!(sparse.indices.unwrap(), vec![1]);
         assert_eq!(sparse.values.unwrap(), vec![0.5]);

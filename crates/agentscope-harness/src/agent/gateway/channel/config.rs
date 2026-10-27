@@ -25,7 +25,10 @@ impl ChannelConfig {
     }
 
     /// Config with an explicit default agent (no binding rules).
-    pub fn of_with_default(channel_id: impl Into<String>, default_agent_id: impl Into<String>) -> Self {
+    pub fn of_with_default(
+        channel_id: impl Into<String>,
+        default_agent_id: impl Into<String>,
+    ) -> Self {
         Self {
             channel_id: channel_id.into(),
             default_agent_id: Some(default_agent_id.into()),

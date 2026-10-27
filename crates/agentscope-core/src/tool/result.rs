@@ -1,8 +1,6 @@
 //! Tool result conversion and tool-result message building.
 //! Mirrors `io.agentscope.core.tool.{ToolResultConverter, DefaultToolResultConverter, ToolResultMessageBuilder}`.
-use crate::message::{
-    ContentBlock, Msg, MsgBuilder, MsgRole, ToolResultBlock, ToolUseBlock,
-};
+use crate::message::{ContentBlock, Msg, MsgBuilder, MsgRole, ToolResultBlock, ToolUseBlock};
 
 /// Converts a raw tool return value into a [`ToolResultBlock`].
 ///
@@ -18,15 +16,13 @@ pub trait ToolResultConverter: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultToolResultConverter;
 
-
 impl ToolResultConverter for DefaultToolResultConverter {
     fn convert(&self, result: Option<&serde_json::Value>) -> ToolResultBlock {
         match result {
             None | Some(serde_json::Value::Null) => ToolResultBlock::text("null"),
             Some(serde_json::Value::String(s)) => ToolResultBlock::text(s.clone()),
             Some(v) => {
-                let text = serde_json::to_string(v)
-                    .unwrap_or_else(|_| v.to_string());
+                let text = serde_json::to_string(v).unwrap_or_else(|_| v.to_string());
                 ToolResultBlock::text(text)
             }
         }

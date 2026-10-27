@@ -7,9 +7,7 @@ use agentscope_core::agent::{CallableAgent, RuntimeContext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use self::protocol::RemoteStreamDetail;
-use crate::agent::memory::compaction::{
-    CompactionConfig, PruneConfig, TruncateArgsConfig,
-};
+use crate::agent::memory::compaction::{CompactionConfig, PruneConfig, TruncateArgsConfig};
 
 pub mod entry;
 pub mod loader;
@@ -19,18 +17,18 @@ pub mod protocol;
 pub mod task;
 
 pub use entry::{SubagentEntry, SubagentFactory};
+pub use loader::{
+    load_from_directory, load_from_file, load_from_filesystem, parse, SUBAGENTS_DIR, SUBAGENT_GLOB,
+};
+pub use manager::DefaultAgentManager;
 pub use materialize::{
     allowlisted_inherited_toolkit, build_subagent_sys_prompt, declared_generate_options,
     declared_skill_filter, derive_child_session_id, resolve_declared_model, SubagentBlueprint,
     SUBAGENT_CONTEXT_SECTION,
 };
-pub use loader::{
-    load_from_directory, load_from_file, load_from_filesystem, parse, SUBAGENTS_DIR, SUBAGENT_GLOB,
-};
-pub use manager::DefaultAgentManager;
 pub use task::{
-    BackgroundTask, TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository,
-    TaskRunSpec, TaskStatus, WorkspaceTaskRepository, SUPPRESS_COMPLETION_CALLBACK,
+    BackgroundTask, TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec,
+    TaskStatus, WorkspaceTaskRepository, SUPPRESS_COMPLETION_CALLBACK,
 };
 
 /// How a declared subagent may be used: as a top-level primary agent, only as a
@@ -200,12 +198,16 @@ impl SubagentDeclaration {
 
     /// Requested remote stream detail, defaulting to [`RemoteStreamDetail::Full`].
     pub fn remote_stream_detail_or_default(&self) -> RemoteStreamDetail {
-        self.remote_stream_detail.unwrap_or(RemoteStreamDetail::Full)
+        self.remote_stream_detail
+            .unwrap_or(RemoteStreamDetail::Full)
     }
 
     /// Whether this declaration targets a remote task HTTP server.
     pub fn is_remote(&self) -> bool {
-        self.url.as_deref().map(|u| !u.trim().is_empty()).unwrap_or(false)
+        self.url
+            .as_deref()
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false)
     }
 
     /// Whether this entry should appear in the LLM-facing available-subagent list.
@@ -305,7 +307,10 @@ impl From<&CompactionConfig> for CompactionConfigRepr {
             summary_prompt: value.summary_prompt.clone(),
             flush_before_compact: value.flush_before_compact,
             offload_before_compact: value.offload_before_compact,
-            truncate_args: value.truncate_args.as_ref().map(TruncateArgsConfigRepr::from),
+            truncate_args: value
+                .truncate_args
+                .as_ref()
+                .map(TruncateArgsConfigRepr::from),
             prune: value.prune.as_ref().map(PruneConfigRepr::from),
         }
     }

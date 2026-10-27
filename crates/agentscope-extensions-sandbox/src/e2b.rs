@@ -231,7 +231,11 @@ pub fn parse_sandbox_fields(value: &Value) -> BTreeMap<String, String> {
 
 /// Derives the envd base URL from a sandbox id and domain.
 pub fn envd_host(sandbox_id: &str, domain: &str) -> String {
-    let dom = if domain.trim().is_empty() { "e2b.app" } else { domain };
+    let dom = if domain.trim().is_empty() {
+        "e2b.app"
+    } else {
+        domain
+    };
     format!("https://{ENVD_PORT}-{sandbox_id}.{dom}")
 }
 
@@ -376,7 +380,8 @@ pub struct EnvdEvent {
 }
 
 /// Parses one JSON-coded envd `StartResponse` frame.
-pub fn parse_envd_event(payload: &[u8]) -> SandboxResult<EnvdEvent> {    let value: Value = serde_json::from_slice(payload).map_err(|e| {
+pub fn parse_envd_event(payload: &[u8]) -> SandboxResult<EnvdEvent> {
+    let value: Value = serde_json::from_slice(payload).map_err(|e| {
         SandboxExtensionError::Serialization(format!("invalid envd event JSON: {e}"))
     })?;
     let event = value.get("event").cloned().unwrap_or(Value::Null);
@@ -395,7 +400,11 @@ pub fn parse_envd_event(payload: &[u8]) -> SandboxResult<EnvdEvent> {    let val
         // `EndEvent.error` is populated when the process was signalled or exited non-zero
         // (`signal: killed`, `exit status N`); surface it on stderr, visually separated from
         // stderr output that may not end with a newline.
-        if let Some(error) = end.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+        if let Some(error) = end
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|e| !e.is_empty())
+        {
             append_separated_line(&mut out.stderr, error.as_bytes());
         }
     }
@@ -525,7 +534,9 @@ impl E2bBackend {
             .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
             .timeout(Duration::from_secs(options.read_timeout_seconds))
             .build()
-            .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
+            .map_err(|e| {
+                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
+            })?;
         let retry = RetryPolicy::e2b(options.max_retries);
         Ok(Self {
             options,
@@ -663,7 +674,11 @@ impl E2bBackend {
     /// that remain known (surviving prune window plus any id whose delete failed).
     ///
     /// `retention == 0` disables pruning and returns the normalized input untouched.
-    pub async fn prune_snapshot_ids(&self, snapshot_ids: &[String], retention: usize) -> Vec<String> {
+    pub async fn prune_snapshot_ids(
+        &self,
+        snapshot_ids: &[String],
+        retention: usize,
+    ) -> Vec<String> {
         let ids = dedupe_snapshot_ids(snapshot_ids);
         if retention == 0 || ids.len() <= retention {
             return ids;
@@ -793,7 +808,10 @@ impl E2bBackend {
         .await
     }
 
-    async fn create_from_template(&self, template_id: &str) -> SandboxResult<BTreeMap<String, String>> {
+    async fn create_from_template(
+        &self,
+        template_id: &str,
+    ) -> SandboxResult<BTreeMap<String, String>> {
         let body = build_create_sandbox_body(template_id, self.options.sandbox_timeout_seconds);
         let value = self.platform_post("/sandboxes", &body).await?;
         Ok(parse_sandbox_fields(&value))
@@ -830,13 +848,9 @@ impl E2bBackend {
             self.envd_request(reqwest::Method::POST, &build_url, handle)
                 .multipart(form)
         };
-        self.execute_envd(
-            &url,
-            SandboxErrorCode::WorkspaceArchiveWriteError,
-            build,
-        )
-        .await
-        .map(|_| ())
+        self.execute_envd(&url, SandboxErrorCode::WorkspaceArchiveWriteError, build)
+            .await
+            .map(|_| ())
     }
 
     /// Downloads a file from the sandbox via the envd `/files` REST API (GET).
@@ -967,7 +981,10 @@ impl RemoteBackend for E2bBackend {
                 )
             })?;
         fields.insert("template_id".to_string(), self.options.template_id.clone());
-        fields.insert("persistence_mode".to_string(), self.options.persistence_mode.as_str().to_string());
+        fields.insert(
+            "persistence_mode".to_string(),
+            self.options.persistence_mode.as_str().to_string(),
+        );
         fields.insert("codec".to_string(), self.options.codec.as_str().to_string());
         fields.insert("workspace_projection_hash".to_string(), String::new());
         Ok(RemoteSandboxHandle::new(id, fields))
@@ -982,13 +999,19 @@ impl RemoteBackend for E2bBackend {
             .entry("sandbox_id".to_string())
             .or_insert_with(|| sandbox_id.to_string());
         fields.insert("template_id".to_string(), self.options.template_id.clone());
-        fields.insert("persistence_mode".to_string(), self.options.persistence_mode.as_str().to_string());
+        fields.insert(
+            "persistence_mode".to_string(),
+            self.options.persistence_mode.as_str().to_string(),
+        );
         fields.insert("codec".to_string(), self.options.codec.as_str().to_string());
         Ok(RemoteSandboxHandle::new(sandbox_id.to_string(), fields))
     }
 
     async fn kill_sandbox(&self, sandbox_id: &str) -> SandboxResult<()> {
-        let url = join_url(&self.options.api_base_url, &format!("/sandboxes/{sandbox_id}"));
+        let url = join_url(
+            &self.options.api_base_url,
+            &format!("/sandboxes/{sandbox_id}"),
+        );
         let api_key = self.api_key()?;
         let client = self.client.clone();
         let retry = self.retry.clone();
@@ -1137,15 +1160,12 @@ impl RemoteBackend for E2bBackend {
         if let Some(snapshot_id) = E2bSnapshotRefs::decode_snapshot_id_if_present(archive) {
             if !snapshot_id.trim().is_empty() {
                 let mut fields = self.create_from_template(&snapshot_id).await?;
-                let id = fields
-                    .get("sandbox_id")
-                    .cloned()
-                    .ok_or_else(|| {
-                        SandboxExtensionError::Runtime(
-                            SandboxErrorCode::WorkspaceStartError,
-                            "E2B snapshot restore response missing sandboxID".to_string(),
-                        )
-                    })?;
+                let id = fields.get("sandbox_id").cloned().ok_or_else(|| {
+                    SandboxExtensionError::Runtime(
+                        SandboxErrorCode::WorkspaceStartError,
+                        "E2B snapshot restore response missing sandboxID".to_string(),
+                    )
+                })?;
                 fields.insert("template_id".to_string(), snapshot_id);
                 fields.insert(
                     "persistence_mode".to_string(),
@@ -1212,7 +1232,11 @@ pub fn encode_path_segment(value: &str) -> String {
 
 /// Builds the envd `Authorization: Basic` header for the run user.
 pub fn basic_auth_header(run_user: &str) -> String {
-    let user = if run_user.trim().is_empty() { "user" } else { run_user };
+    let user = if run_user.trim().is_empty() {
+        "user"
+    } else {
+        run_user
+    };
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:"));
     format!("Basic {encoded}")
 }
@@ -1248,7 +1272,9 @@ pub type E2bSandboxClient = RemoteSandboxClient;
 
 /// Creates the harness [`agentscope_harness::agent::sandbox::SandboxClient`] for E2B.
 pub fn e2b_client(options: E2bSandboxClientOptions) -> SandboxResult<E2bSandboxClient> {
-    Ok(RemoteSandboxClient::new(Arc::new(E2bBackend::new(options)?)))
+    Ok(RemoteSandboxClient::new(Arc::new(E2bBackend::new(
+        options,
+    )?)))
 }
 
 /// Builds the shell command that materializes the workspace on E2B (used by tests/docs).
@@ -1288,9 +1314,18 @@ mod tests {
         });
         let fields = parse_sandbox_fields(&value);
         assert_eq!(fields.get("sandbox_id").map(String::as_str), Some("sbx-1"));
-        assert_eq!(fields.get("sandbox_domain").map(String::as_str), Some("e2b.dev"));
-        assert_eq!(fields.get("envd_access_token").map(String::as_str), Some("tok"));
-        assert_eq!(fields.get("envd_version").map(String::as_str), Some("0.1.5"));
+        assert_eq!(
+            fields.get("sandbox_domain").map(String::as_str),
+            Some("e2b.dev")
+        );
+        assert_eq!(
+            fields.get("envd_access_token").map(String::as_str),
+            Some("tok")
+        );
+        assert_eq!(
+            fields.get("envd_version").map(String::as_str),
+            Some("0.1.5")
+        );
     }
 
     #[test]
@@ -1371,7 +1406,9 @@ mod tests {
         // Frames arriving across a chunk boundary: stdout then a truncated trailing frame.
         let stdout_b64 = base64::engine::general_purpose::STANDARD.encode(b"partial output");
         let mut body = encode_connect_envelope(
-            serde_json::to_vec(&json!({"event":{"data":{"stdout":stdout_b64}}})).unwrap().as_slice(),
+            serde_json::to_vec(&json!({"event":{"data":{"stdout":stdout_b64}}}))
+                .unwrap()
+                .as_slice(),
         );
         body.extend_from_slice(&[0x00, 0, 0, 0, 30, b'{']); // truncated end frame
         let result = drain_envd_stream(&body).expect("fragmented stream must not fail");
@@ -1385,7 +1422,9 @@ mod tests {
         // A corrupt data frame must not abort the stream; the end frame still yields an exit code.
         let mut body = encode_connect_envelope(b"not json at all");
         body.extend_from_slice(&encode_connect_envelope(
-            serde_json::to_vec(&json!({"event":{"end":{"exitCode":1}}})).unwrap().as_slice(),
+            serde_json::to_vec(&json!({"event":{"end":{"exitCode":1}}}))
+                .unwrap()
+                .as_slice(),
         ));
         let result = drain_envd_stream(&body).unwrap();
         assert_eq!(result.exit_code, Some(1));
@@ -1396,7 +1435,10 @@ mod tests {
         let mut body = encode_connect_envelope(b"whatever");
         body[0] = CONNECT_FLAG_COMPRESSED;
         let err = drain_envd_stream(&body).unwrap_err();
-        assert!(matches!(err, SandboxExtensionError::Unsupported(_)), "got {err:?}");
+        assert!(
+            matches!(err, SandboxExtensionError::Unsupported(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1458,13 +1500,17 @@ mod tests {
         let snake = parse_envd_event(br#"{"event":{"end":{"exit_code":7}}}"#).unwrap();
         assert_eq!(snake.exit_code, Some(7));
         // exit code 0 must not be misreported as "absent".
-        assert_eq!(parse_envd_event(br#"{"event":{"end":{"exitCode":0}}}"#).unwrap().exit_code, Some(0));
+        assert_eq!(
+            parse_envd_event(br#"{"event":{"end":{"exitCode":0}}}"#)
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
 
         // EndEvent.error is forwarded to stderr, separated from unterminated stderr output.
-        let with_error = parse_envd_event(
-            br#"{"event":{"end":{"exitCode":137,"error":"signal: killed"}}}"#,
-        )
-        .unwrap();
+        let with_error =
+            parse_envd_event(br#"{"event":{"end":{"exitCode":137,"error":"signal: killed"}}}"#)
+                .unwrap();
         assert_eq!(with_error.stderr, b"signal: killed".to_vec());
         assert_eq!(with_error.exit_code, Some(137));
 
@@ -1480,7 +1526,12 @@ mod tests {
     #[test]
     fn resolve_envd_base_url_prefers_option_then_env_then_host() {
         assert_eq!(
-            resolve_envd_base_url(Some("http://10.0.0.1:8080"), Some("http://env:1"), "sbx", "e2b.app"),
+            resolve_envd_base_url(
+                Some("http://10.0.0.1:8080"),
+                Some("http://env:1"),
+                "sbx",
+                "e2b.app"
+            ),
             "http://10.0.0.1:8080"
         );
         assert_eq!(
@@ -1541,13 +1592,17 @@ mod tests {
         let stderr_b64 = base64::engine::general_purpose::STANDARD.encode(b"warn");
         let mut body = Vec::new();
         body.extend_from_slice(&encode_connect_envelope(
-            serde_json::to_vec(&json!({"event":{"data":{"stdout":stdout_b64}}})).unwrap().as_slice(),
+            serde_json::to_vec(&json!({"event":{"data":{"stdout":stdout_b64}}}))
+                .unwrap()
+                .as_slice(),
         ));
         body.extend_from_slice(&encode_connect_envelope(
             serde_json::to_vec(&json!({"event":{"data":{"stdout":base64::engine::general_purpose::STANDARD.encode(b"world"),"stderr":stderr_b64}}})).unwrap().as_slice(),
         ));
         body.extend_from_slice(&encode_connect_envelope(
-            serde_json::to_vec(&json!({"event":{"end":{"exitCode":0}}})).unwrap().as_slice(),
+            serde_json::to_vec(&json!({"event":{"end":{"exitCode":0}}}))
+                .unwrap()
+                .as_slice(),
         ));
         let result = drain_envd_stream(&body).unwrap();
         assert_eq!(result.stdout, b"hello world");
@@ -1563,13 +1618,22 @@ mod tests {
             E2bSnapshotRefs::decode_snapshot_id_if_present(&encoded).as_deref(),
             Some("snap-42")
         );
-        assert_eq!(E2bSnapshotRefs::decode_snapshot_id_if_present(b"plain tar bytes"), None);
-        assert_eq!(E2bSnapshotRefs::decode_snapshot_id_if_present(b"E2B_SANDBOX_SNAPSHOT_V1\n"), None);
+        assert_eq!(
+            E2bSnapshotRefs::decode_snapshot_id_if_present(b"plain tar bytes"),
+            None
+        );
+        assert_eq!(
+            E2bSnapshotRefs::decode_snapshot_id_if_present(b"E2B_SANDBOX_SNAPSHOT_V1\n"),
+            None
+        );
     }
 
     #[test]
     fn persistence_mode_and_codec_parse() {
-        assert_eq!(E2bPersistenceMode::parse("NATIVE_SNAPSHOT"), E2bPersistenceMode::NativeSnapshot);
+        assert_eq!(
+            E2bPersistenceMode::parse("NATIVE_SNAPSHOT"),
+            E2bPersistenceMode::NativeSnapshot
+        );
         assert_eq!(E2bPersistenceMode::parse("bogus"), E2bPersistenceMode::Tar);
         assert_eq!(E2bCodec::parse("JSON"), E2bCodec::Json);
         assert_eq!(E2bCodec::parse("bogus"), E2bCodec::Proto);
@@ -1600,7 +1664,10 @@ mod tests {
         })
         .unwrap();
         let handle = RemoteSandboxHandle::new("sbx", BTreeMap::new());
-        let err = backend.exec_in(&handle, "echo hi", None, 5).await.unwrap_err();
+        let err = backend
+            .exec_in(&handle, "echo hi", None, 5)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SandboxExtensionError::Unsupported(_)));
     }
 
@@ -1615,15 +1682,17 @@ mod tests {
     async fn platform_create_against_mock_server() {
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
-        let mock = server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/sandboxes")
-                .header("x-api-key", "secret")
-                .json_body(json!({"templateID":"base","timeout":300}));
-            then.status(200)
-                .header("content-type", "application/json")
-                .body(r#"{"sandboxID":"sbx-9","domain":"e2b.dev","envdAccessToken":"tok"}"#);
-        }).await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandboxes")
+                    .header("x-api-key", "secret")
+                    .json_body(json!({"templateID":"base","timeout":300}));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"sandboxID":"sbx-9","domain":"e2b.dev","envdAccessToken":"tok"}"#);
+            })
+            .await;
         let backend = E2bBackend::new(E2bSandboxClientOptions {
             api_key: Some("secret".to_string()),
             api_base_url: server.base_url(),
@@ -1633,8 +1702,14 @@ mod tests {
         let handle = backend.create_sandbox("sess-1").await.unwrap();
         mock.assert_async().await;
         assert_eq!(handle.id, "sbx-9");
-        assert_eq!(handle.extra.get("sandbox_domain").map(String::as_str), Some("e2b.dev"));
-        assert_eq!(handle.extra.get("persistence_mode").map(String::as_str), Some("TAR"));
+        assert_eq!(
+            handle.extra.get("sandbox_domain").map(String::as_str),
+            Some("e2b.dev")
+        );
+        assert_eq!(
+            handle.extra.get("persistence_mode").map(String::as_str),
+            Some("TAR")
+        );
         // Sanity: state projection carries the backend discriminator.
         let data = RemoteSandboxStateData {
             session_id: "sess-1".to_string(),
@@ -1701,7 +1776,10 @@ mod tests {
             .upload_file(&handle, "/tmp/dir/", b"x")
             .await
             .unwrap_err();
-        assert!(matches!(err, SandboxExtensionError::Configuration(_)), "got {err:?}");
+        assert!(
+            matches!(err, SandboxExtensionError::Configuration(_)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1786,10 +1864,14 @@ mod tests {
     fn envd_body_with_exit(exit_code: i32, stdout: &[u8]) -> Vec<u8> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(stdout);
         let mut body = encode_connect_envelope(
-            serde_json::to_vec(&json!({"event":{"data":{"stdout":encoded}}})).unwrap().as_slice(),
+            serde_json::to_vec(&json!({"event":{"data":{"stdout":encoded}}}))
+                .unwrap()
+                .as_slice(),
         );
         body.extend_from_slice(&encode_connect_envelope(
-            serde_json::to_vec(&json!({"event":{"end":{"exitCode":exit_code}}})).unwrap().as_slice(),
+            serde_json::to_vec(&json!({"event":{"end":{"exitCode":exit_code}}}))
+                .unwrap()
+                .as_slice(),
         ));
         body
     }
@@ -1828,7 +1910,11 @@ mod tests {
         ];
         assert_eq!(
             dedupe_snapshot_ids(&input),
-            vec!["snap-1".to_string(), "snap-2".to_string(), "snap-3".to_string()]
+            vec![
+                "snap-1".to_string(),
+                "snap-2".to_string(),
+                "snap-3".to_string()
+            ]
         );
         assert!(dedupe_snapshot_ids(&[]).is_empty());
     }
@@ -1910,7 +1996,10 @@ mod tests {
         let backend = retention_backend(&server, None);
 
         let err = backend.delete_snapshot("   ").await.unwrap_err();
-        assert!(matches!(err, SandboxExtensionError::Configuration(_)), "got {err:?}");
+        assert!(
+            matches!(err, SandboxExtensionError::Configuration(_)),
+            "got {err:?}"
+        );
         assert_eq!(mock.hits_async().await, 0);
     }
 
@@ -1942,9 +2031,16 @@ mod tests {
         backend.note_snapshot("snap-2");
         backend.note_snapshot("snap-3");
 
-        backend.prune_known_snapshots().await.expect("prune succeeds");
+        backend
+            .prune_known_snapshots()
+            .await
+            .expect("prune succeeds");
 
-        assert_eq!(oldest.hits_async().await, 1, "oldest snapshot must be deleted once");
+        assert_eq!(
+            oldest.hits_async().await,
+            1,
+            "oldest snapshot must be deleted once"
+        );
         assert_eq!(newer.hits_async().await, 0, "snap-2 is inside the window");
         assert_eq!(newest.hits_async().await, 0, "snap-3 is inside the window");
         assert_eq!(
@@ -1970,14 +2066,25 @@ mod tests {
             backend.note_snapshot("snap-1");
             backend.note_snapshot("snap-2");
             backend.note_snapshot("snap-3");
-            backend.prune_known_snapshots().await.expect("no-op succeeds");
+            backend
+                .prune_known_snapshots()
+                .await
+                .expect("no-op succeeds");
             assert_eq!(
                 backend.known_snapshot_ids(),
-                vec!["snap-1".to_string(), "snap-2".to_string(), "snap-3".to_string()],
+                vec![
+                    "snap-1".to_string(),
+                    "snap-2".to_string(),
+                    "snap-3".to_string()
+                ],
                 "retention {retention:?} must retain every id"
             );
         }
-        assert_eq!(mock.hits_async().await, 0, "disabled retention must stay offline");
+        assert_eq!(
+            mock.hits_async().await,
+            0,
+            "disabled retention must stay offline"
+        );
     }
 
     #[tokio::test]
@@ -1997,7 +2104,11 @@ mod tests {
         let kept = backend
             .prune_snapshot_ids(&backend.known_snapshot_ids(), 1)
             .await;
-        assert_eq!(kept, vec!["snap-2".to_string()], "a 404 must not be retried forever");
+        assert_eq!(
+            kept,
+            vec!["snap-2".to_string()],
+            "a 404 must not be retried forever"
+        );
     }
 
     #[tokio::test]
@@ -2014,7 +2125,10 @@ mod tests {
         backend.note_snapshot("snap-1");
         backend.note_snapshot("snap-2");
 
-        backend.prune_known_snapshots().await.expect("prune is best effort");
+        backend
+            .prune_known_snapshots()
+            .await
+            .expect("prune is best effort");
         assert_eq!(
             backend.known_snapshot_ids(),
             vec!["snap-1".to_string(), "snap-2".to_string()],
@@ -2062,7 +2176,11 @@ mod tests {
 
         create.assert_async().await;
         prune.assert_async().await;
-        assert_eq!(keep.hits_async().await, 0, "the newest snapshot must survive");
+        assert_eq!(
+            keep.hits_async().await,
+            0,
+            "the newest snapshot must survive"
+        );
         assert_eq!(backend.known_snapshot_ids(), vec!["snap-1".to_string()]);
     }
 }

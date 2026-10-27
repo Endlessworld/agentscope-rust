@@ -11,9 +11,7 @@ use agentscope_extensions_jdbc::dialect::{
     parse_create_table_columns, AbstractJdbcDialect, AnsiDialect, BoundSql, JdbcDialectBuilder,
     MysqlDialect, PostgresDialect, SqlParam, SqliteDialect,
 };
-use agentscope_extensions_jdbc::skill::{
-    JdbcAgentSkillRepository, SkillRepositoryError,
-};
+use agentscope_extensions_jdbc::skill::{JdbcAgentSkillRepository, SkillRepositoryError};
 use agentscope_extensions_jdbc::{JdbcExecutor, SharedExecutor};
 use agentscope_extensions_skills::AgentSkillRepository;
 use agentscope_harness::agent::skill::AgentSkill;
@@ -89,8 +87,14 @@ fn save_then_get_round_trips_metadata_and_resources() {
         Some(&json!("https://example.com/demo")),
         loaded.metadata().get("homepage")
     );
-    assert_eq!(Some("hello"), loaded.resources().get("docs/readme.md").map(String::as_str));
-    assert_eq!(Some("world"), loaded.resources().get("docs/guide.md").map(String::as_str));
+    assert_eq!(
+        Some("hello"),
+        loaded.resources().get("docs/readme.md").map(String::as_str)
+    );
+    assert_eq!(
+        Some("world"),
+        loaded.resources().get("docs/guide.md").map(String::as_str)
+    );
 }
 
 #[test]
@@ -103,13 +107,19 @@ fn list_operations_are_ordered_and_empty_when_no_rows() {
     repo.save(&[sample_skill("beta"), sample_skill("alpha")], false)
         .unwrap();
 
-    assert_eq!(vec!["alpha".to_string(), "beta".to_string()], repo.get_all_skill_names().unwrap());
+    assert_eq!(
+        vec!["alpha".to_string(), "beta".to_string()],
+        repo.get_all_skill_names().unwrap()
+    );
     let skills = repo.get_all_skills().unwrap();
     assert_eq!(2, skills.len());
     assert_eq!("alpha", skills[0].name());
     assert_eq!(
         Some("hello"),
-        skills[1].resources().get("docs/readme.md").map(String::as_str)
+        skills[1]
+            .resources()
+            .get("docs/readme.md")
+            .map(String::as_str)
     );
 }
 
@@ -140,7 +150,10 @@ fn force_false_conflicts_and_force_true_replaces_row_and_resources() {
 
     let loaded = repo.get_skill("conflict").unwrap();
     assert_eq!("replaced", loaded.description());
-    assert_eq!(Some("new"), loaded.resources().get("docs/new.md").map(String::as_str));
+    assert_eq!(
+        Some("new"),
+        loaded.resources().get("docs/new.md").map(String::as_str)
+    );
     assert!(
         loaded.resources().get("docs/readme.md").is_none(),
         "old resources must be replaced"
@@ -182,7 +195,10 @@ fn duplicate_inside_one_save_is_a_conflict_and_rolls_back() {
         .save(&[sample_skill("dup"), sample_skill("dup")], false)
         .unwrap_err();
     assert!(is_conflict(&err), "{err}");
-    assert!(!repo.skill_exists("dup").unwrap(), "the first row must be rolled back");
+    assert!(
+        !repo.skill_exists("dup").unwrap(),
+        "the first row must be rolled back"
+    );
 }
 
 #[test]
@@ -230,15 +246,25 @@ fn same_name_coexists_across_namespaces() {
     assert!(repo.save_in("team-a", &[team_a], false).unwrap());
     assert!(repo.save_in("team-b", &[team_b], false).unwrap());
 
-    assert_eq!(vec!["code-review".to_string()], repo.get_all_skill_names_in("team-a").unwrap());
-    assert_eq!(vec!["code-review".to_string()], repo.get_all_skill_names_in("team-b").unwrap());
+    assert_eq!(
+        vec!["code-review".to_string()],
+        repo.get_all_skill_names_in("team-a").unwrap()
+    );
+    assert_eq!(
+        vec!["code-review".to_string()],
+        repo.get_all_skill_names_in("team-b").unwrap()
+    );
     assert_eq!(
         "Description of code-review",
-        repo.get_skill_in("team-a", "code-review").unwrap().description()
+        repo.get_skill_in("team-a", "code-review")
+            .unwrap()
+            .description()
     );
     assert_eq!(
         "team-b flavor",
-        repo.get_skill_in("team-b", "code-review").unwrap().description()
+        repo.get_skill_in("team-b", "code-review")
+            .unwrap()
+            .description()
     );
     assert_eq!(
         Some("b"),
@@ -252,7 +278,10 @@ fn same_name_coexists_across_namespaces() {
 
     assert!(repo.skill_exists_in("team-a", "code-review").unwrap());
     assert!(!repo.skill_exists_in("team-a", "never-saved").unwrap());
-    assert!(repo.get_all_skill_names().unwrap().is_empty(), "default namespace stays empty");
+    assert!(
+        repo.get_all_skill_names().unwrap().is_empty(),
+        "default namespace stays empty"
+    );
 }
 
 #[test]
@@ -274,8 +303,20 @@ fn get_all_skills_is_namespaced_and_resources_are_stitched() {
     .unwrap();
 
     let team_a = repo.get_all_skills_in("team-a").unwrap();
-    assert_eq!(vec!["alpha".to_string()], team_a.iter().map(|s| s.name().to_string()).collect::<Vec<_>>());
-    assert_eq!(Some("hello"), team_a[0].resources().get("docs/readme.md").map(String::as_str));
+    assert_eq!(
+        vec!["alpha".to_string()],
+        team_a
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        Some("hello"),
+        team_a[0]
+            .resources()
+            .get("docs/readme.md")
+            .map(String::as_str)
+    );
     assert!(repo.get_all_skills_in("ghost").unwrap().is_empty());
 }
 
@@ -324,15 +365,22 @@ fn duplicate_within_one_namespace_is_rejected() {
 fn delete_and_clear_stay_within_the_namespace() {
     // Java: deleteAndClearAreNamespaced
     let (exec, _dialect, repo) = setup();
-    repo.save_in("team-a", &[sample_skill("gone"), sample_skill("kept")], false)
-        .unwrap();
+    repo.save_in(
+        "team-a",
+        &[sample_skill("gone"), sample_skill("kept")],
+        false,
+    )
+    .unwrap();
     repo.save_in("team-b", &[sample_skill("gone")], false)
         .unwrap();
 
     assert!(repo.delete_in("team-a", "gone").unwrap());
     assert!(!repo.skill_exists_in("team-a", "gone").unwrap());
     assert!(repo.skill_exists_in("team-b", "gone").unwrap());
-    assert_eq!(vec!["kept".to_string()], repo.get_all_skill_names_in("team-a").unwrap());
+    assert_eq!(
+        vec!["kept".to_string()],
+        repo.get_all_skill_names_in("team-a").unwrap()
+    );
 
     assert_eq!(1, repo.clear_all_skills_in("team-a").unwrap());
     assert!(repo.get_all_skill_names_in("team-a").unwrap().is_empty());
@@ -371,7 +419,10 @@ fn bound_namespace_constructor_binds_the_scope() {
     assert!(repo.skill_exists("bound").unwrap());
     assert!(repo.skill_exists_in("team-a", "bound").unwrap());
     assert!(!repo.skill_exists_in("team-b", "bound").unwrap());
-    assert_eq!(vec!["bound".to_string()], repo.get_all_skill_names().unwrap());
+    assert_eq!(
+        vec!["bound".to_string()],
+        repo.get_all_skill_names().unwrap()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +444,15 @@ fn save_input_validation_rejects_bad_paths_before_writing() {
     let (_exec, _dialect, repo) = setup();
     assert!(!repo.save(&[], false).unwrap());
 
-    for bad_path in ["", "   ", "/etc/passwd", "..\\secrets.txt", "../x", "a/../b", "C:/temp/x"] {
+    for bad_path in [
+        "",
+        "   ",
+        "/etc/passwd",
+        "..\\secrets.txt",
+        "../x",
+        "a/../b",
+        "C:/temp/x",
+    ] {
         let skill = AgentSkill::builder()
             .name("paths")
             .description("d")
@@ -412,7 +471,10 @@ fn save_input_validation_rejects_bad_paths_before_writing() {
         .add_resource("a".repeat(501), "x")
         .build();
     assert!(repo.save(&[too_long], false).is_err());
-    assert!(!repo.skill_exists("paths").unwrap(), "no rejected save may persist anything");
+    assert!(
+        !repo.skill_exists("paths").unwrap(),
+        "no rejected save may persist anything"
+    );
 }
 
 #[test]
@@ -449,7 +511,10 @@ fn info_and_source_carry_the_bound_namespace() {
     let (exec, dialect, _repo) = setup();
     let team_a = Repo::new(exec, dialect, "team-a", true, false).unwrap();
     assert_eq!("jdbc_agentscope_skills@team-a", team_a.get_source());
-    assert_eq!("agentscope_skills@team-a", team_a.get_repository_info().location);
+    assert_eq!(
+        "agentscope_skills@team-a",
+        team_a.get_repository_info().location
+    );
 }
 
 #[test]
@@ -483,7 +548,10 @@ fn create_if_not_exist_false_rejects_a_missing_schema() {
     let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
 
     let err = Repo::new(executor.clone(), dialect.clone(), "default", true, false).unwrap_err();
-    assert!(err.to_string().contains("missing") || err.to_string().contains("does not exist"), "{err}");
+    assert!(
+        err.to_string().contains("missing") || err.to_string().contains("does not exist"),
+        "{err}"
+    );
 
     let repo = Repo::with_schema(executor.clone(), dialect.clone()).unwrap();
     assert!(repo.get_all_skill_names().unwrap().is_empty());
@@ -510,7 +578,10 @@ fn legacy_table_without_metadata_json_fails_schema_validation() {
 
     let err = Repo::with_schema(executor, dialect).unwrap_err();
     assert!(err.to_string().contains("metadata_json"), "{err}");
-    assert!(err.to_string().to_uppercase().contains("CREATE TABLE"), "{err}");
+    assert!(
+        err.to_string().to_uppercase().contains("CREATE TABLE"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -533,7 +604,10 @@ fn malformed_metadata_json_degrades_and_columns_are_authoritative() {
     .unwrap();
 
     let skills = repo.get_all_skills().unwrap();
-    assert_eq!(vec!["badjson", "valid"], skills.iter().map(|s| s.name()).collect::<Vec<_>>());
+    assert_eq!(
+        vec!["badjson", "valid"],
+        skills.iter().map(|s| s.name()).collect::<Vec<_>>()
+    );
     let mut degraded_keys: Vec<String> = skills[0].metadata().keys().cloned().collect();
     degraded_keys.sort();
     assert_eq!(
@@ -542,7 +616,11 @@ fn malformed_metadata_json_degrades_and_columns_are_authoritative() {
         "malformed metadata_json must degrade to core metadata"
     );
     let valid = &skills[1];
-    assert_eq!("valid", valid.name(), "SQL columns must win over metadata_json");
+    assert_eq!(
+        "valid",
+        valid.name(),
+        "SQL columns must win over metadata_json"
+    );
     assert_eq!("d", valid.description());
     assert_eq!(Some(&json!("h")), valid.metadata().get("homepage"));
 }
@@ -566,7 +644,10 @@ fn orphaned_resources_are_tolerated_on_catalog_reads() {
         .unwrap();
 
     let skills = repo.get_all_skills().unwrap();
-    assert_eq!(vec!["kept"], skills.iter().map(|s| s.name()).collect::<Vec<_>>());
+    assert_eq!(
+        vec!["kept"],
+        skills.iter().map(|s| s.name()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -596,14 +677,18 @@ fn legacy_traversal_rows_are_refused_on_read() {
     let err = repo.get_skill("legacy").unwrap_err();
     assert!(err.to_string().contains("../../escape.txt"), "{err}");
 
-    assert!(repo.get_all_skills().unwrap().is_empty(), "the guard must extend to reads");
+    assert!(
+        repo.get_all_skills().unwrap().is_empty(),
+        "the guard must extend to reads"
+    );
     let names = repo.get_all_skill_names().unwrap();
     assert!(names.contains(&"legacy".to_string()));
     assert!(!names.contains(&"../evil".to_string()));
 }
 
 #[test]
-fn not_null_failure_is_not_reported_as_a_conflict() {    // Java: batch-failure test / narrow classifier: a non-duplicate constraint failure
+fn not_null_failure_is_not_reported_as_a_conflict() {
+    // Java: batch-failure test / narrow classifier: a non-duplicate constraint failure
     // must surface as a database error, never as the "use force=true" conflict.
     let (exec, _dialect, repo) = setup();
     // Force a non-unique constraint failure on the resources table.
@@ -622,8 +707,14 @@ fn not_null_failure_is_not_reported_as_a_conflict() {    // Java: batch-failure 
         .build();
 
     let err = repo.save(&[skill], false).unwrap_err();
-    assert!(!is_conflict(&err), "a CHECK violation is not a duplicate conflict: {err}");
-    assert!(!repo.skill_exists("batch").unwrap(), "the skill row must be rolled back");
+    assert!(
+        !is_conflict(&err),
+        "a CHECK violation is not a duplicate conflict: {err}"
+    );
+    assert!(
+        !repo.skill_exists("batch").unwrap(),
+        "the skill row must be rolled back"
+    );
     assert!(!exists_by_name(&exec, "agentscope_skills", "batch"));
 }
 
@@ -699,23 +790,45 @@ fn vendors() -> Vec<Arc<dyn AbstractJdbcDialect>> {
 fn every_vendor_skill_ddl_parses_to_the_declared_columns() {
     // Java: allVendorDdlsParse
     let expected_skills = vec![
-        "id", "namespace", "name", "description", "skill_content", "source", "metadata_json",
-        "created_at", "updated_at",
+        "id",
+        "namespace",
+        "name",
+        "description",
+        "skill_content",
+        "source",
+        "metadata_json",
+        "created_at",
+        "updated_at",
     ];
     let expected_resources = vec![
-        "id", "namespace", "resource_path", "resource_content", "created_at", "updated_at",
+        "id",
+        "namespace",
+        "resource_path",
+        "resource_content",
+        "created_at",
+        "updated_at",
     ];
     for dialect in vendors() {
         let skill_ddl = &dialect.skill_create_table_ddls()[0];
         assert_eq!(
-            Some(expected_skills.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            Some(
+                expected_skills
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            ),
             parse_create_table_columns(skill_ddl),
             "{:?} skill DDL must parse",
             dialect.kind()
         );
         let resource_ddl = &dialect.skill_resources_create_table_ddls()[0];
         assert_eq!(
-            Some(expected_resources.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            Some(
+                expected_resources
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            ),
             parse_create_table_columns(resource_ddl),
             "{:?} resource DDL must parse",
             dialect.kind()
@@ -758,7 +871,10 @@ fn builder_prefix_and_per_table_overrides_apply_to_skill_tables() {
         .unwrap()
         .build();
     assert_eq!("app_skills", dialect.resolved_skill_table_name());
-    assert_eq!("app_skill_resources", dialect.resolved_skill_resources_table_name());
+    assert_eq!(
+        "app_skill_resources",
+        dialect.resolved_skill_resources_table_name()
+    );
     let repo = Repo::with_schema(executor.clone(), dialect).unwrap();
     repo.save(&[sample_skill("prefixed")], false).unwrap();
     assert_eq!(1, count_rows(&executor, "app_skills"));
@@ -776,6 +892,3 @@ fn builder_prefix_and_per_table_overrides_apply_to_skill_tables() {
         override_dialect.resolved_skill_resources_table_name()
     );
 }
-
-
-

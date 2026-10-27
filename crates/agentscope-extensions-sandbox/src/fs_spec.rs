@@ -20,11 +20,11 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
-use agentscope_harness::agent::IsolationScope;
 use agentscope_harness::agent::sandbox::{
     NoopSnapshotSpec, Sandbox, SandboxClient, SandboxClientOptions, SandboxContext,
     SandboxSnapshotSpec, SandboxState, WorkspaceSpec,
 };
+use agentscope_harness::agent::IsolationScope;
 use agentscope_harness::filesystem::{
     ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch, SandboxFilesystem,
 };
@@ -40,8 +40,13 @@ use crate::workspace::shell_quote;
 /// Default workspace-projection entries copied into the sandbox workspace.
 ///
 /// Mirrors the Java `SandboxFilesystemSpec.DEFAULT_WORKSPACE_PROJECTION_ROOTS`.
-pub const DEFAULT_WORKSPACE_PROJECTION_ROOTS: [&str; 5] =
-    ["AGENTS.md", "skills", "subagents", "knowledge", ".skills-cache"];
+pub const DEFAULT_WORKSPACE_PROJECTION_ROOTS: [&str; 5] = [
+    "AGENTS.md",
+    "skills",
+    "subagents",
+    "knowledge",
+    ".skills-cache",
+];
 
 /// Projection roots that are directories (created eagerly in the default workspace spec).
 pub const DEFAULT_WORKSPACE_PROJECTION_DIRS: [&str; 4] =
@@ -151,7 +156,11 @@ pub trait SandboxFilesystemSpec: Debug + Send + Sync {
             .root
             .to_string_lossy()
             .replace('\\', "/");
-        Arc::new(SandboxFilesystemAdapter::new(sandbox, root, cwd.to_string()))
+        Arc::new(SandboxFilesystemAdapter::new(
+            sandbox,
+            root,
+            cwd.to_string(),
+        ))
     }
 }
 
@@ -185,7 +194,9 @@ impl SandboxClient for ClientHandle {
         snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
         options: Option<&SandboxClientOptions>,
     ) -> Result<Box<dyn Sandbox>> {
-        self.inner.create(workspace_spec, snapshot_spec, options).await
+        self.inner
+            .create(workspace_spec, snapshot_spec, options)
+            .await
     }
 
     async fn resume(&self, state: &SandboxState) -> Result<Box<dyn Sandbox>> {
@@ -226,7 +237,11 @@ impl SandboxFilesystemAdapter {
         workspace_root: impl Into<String>,
         cwd: impl Into<String>,
     ) -> Self {
-        Self { sandbox, workspace_root: workspace_root.into(), cwd: cwd.into() }
+        Self {
+            sandbox,
+            workspace_root: workspace_root.into(),
+            cwd: cwd.into(),
+        }
     }
 
     /// Returns the wrapped sandbox.
@@ -262,7 +277,10 @@ impl SandboxFilesystemAdapter {
     }
 
     async fn run(&self, command: &str, timeout_seconds: u64) -> Result<ExecuteResponse> {
-        let result = self.sandbox.exec(None, command, Some(timeout_seconds)).await?;
+        let result = self
+            .sandbox
+            .exec(None, command, Some(timeout_seconds))
+            .await?;
         Ok(ExecuteResponse {
             output: result.combined_output(),
             exit_code: result.exit_code,
@@ -352,7 +370,11 @@ pub fn parse_grep_output(output: &str) -> Vec<GrepMatch> {
         let Ok(line_number) = lineno.parse::<usize>() else {
             continue;
         };
-        matches.push(GrepMatch { path: path.to_string(), line: line_number, text });
+        matches.push(GrepMatch {
+            path: path.to_string(),
+            line: line_number,
+            text,
+        });
     }
     matches
 }
@@ -397,7 +419,9 @@ impl Filesystem for SandboxFilesystemAdapter {
 
     async fn ls(&self, _ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
         let absolute = self.resolve_path(path);
-        let output = self.run_checked(&build_ls_command(&absolute), "ls", 60).await?;
+        let output = self
+            .run_checked(&build_ls_command(&absolute), "ls", 60)
+            .await?;
         Ok(parse_ls_output(&output, &self.workspace_root))
     }
 
@@ -545,7 +569,9 @@ impl Filesystem for SandboxFilesystemAdapter {
 
     async fn exists(&self, _ctx: &RuntimeContext, path: &str) -> Result<bool> {
         let absolute = self.resolve_path(path);
-        let response = self.run(&format!("test -e {}", shell_quote(&absolute)), 30).await?;
+        let response = self
+            .run(&format!("test -e {}", shell_quote(&absolute)), 30)
+            .await?;
         Ok(response.exit_code == 0)
     }
 }
@@ -789,8 +815,14 @@ mod tests {
 
     #[test]
     fn read_command_uses_line_window() {
-        assert_eq!(build_read_command("/w/f.txt", 0, 10), "sed -n '1,10p' /w/f.txt");
-        assert_eq!(build_read_command("/w/f.txt", 5, 5), "sed -n '6,10p' /w/f.txt");
+        assert_eq!(
+            build_read_command("/w/f.txt", 0, 10),
+            "sed -n '1,10p' /w/f.txt"
+        );
+        assert_eq!(
+            build_read_command("/w/f.txt", 5, 5),
+            "sed -n '6,10p' /w/f.txt"
+        );
         assert_eq!(build_read_command("/w/f.txt", 2, 0), "tail -n +3 /w/f.txt");
     }
 
@@ -802,10 +834,16 @@ mod tests {
     #[test]
     fn platform_specs_report_distinct_names() {
         let specs: Vec<Box<dyn SandboxFilesystemSpec>> = vec![
-            Box::new(AgentRunFilesystemSpec::new(AgentRunSandboxClientOptions::default())),
-            Box::new(DaytonaFilesystemSpec::new(DaytonaSandboxClientOptions::default())),
+            Box::new(AgentRunFilesystemSpec::new(
+                AgentRunSandboxClientOptions::default(),
+            )),
+            Box::new(DaytonaFilesystemSpec::new(
+                DaytonaSandboxClientOptions::default(),
+            )),
             Box::new(E2bFilesystemSpec::new(E2bSandboxClientOptions::default())),
-            Box::new(KubernetesFilesystemSpec::new(KubernetesSandboxClientOptions::default())),
+            Box::new(KubernetesFilesystemSpec::new(
+                KubernetesSandboxClientOptions::default(),
+            )),
         ];
         let names: Vec<_> = specs.iter().map(|s| s.platform()).collect();
         assert_eq!(names, vec!["agentrun", "daytona", "e2b", "kubernetes"]);
@@ -818,15 +856,20 @@ mod tests {
         spec.options_mut().template_name = Some("tpl".to_string());
         assert_eq!(spec.options().api_key.as_deref(), Some("k"));
         assert_eq!(spec.options().template_name.as_deref(), Some("tpl"));
-        assert!(spec.client_options_debug().contains("AgentRunSandboxClientOptions"));
+        assert!(spec
+            .client_options_debug()
+            .contains("AgentRunSandboxClientOptions"));
     }
 
     #[test]
     fn workspace_override_wins_over_default() {
         let custom = WorkspaceSpec::new("/custom");
-        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
-            .with_workspace_spec(custom);
-        assert_eq!(spec.effective_workspace_spec().root, PathBuf::from("/custom"));
+        let spec =
+            E2bFilesystemSpec::new(E2bSandboxClientOptions::default()).with_workspace_spec(custom);
+        assert_eq!(
+            spec.effective_workspace_spec().root,
+            PathBuf::from("/custom")
+        );
         assert!(spec.effective_workspace_spec().directories.is_empty());
     }
 

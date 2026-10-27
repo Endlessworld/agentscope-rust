@@ -27,4 +27,6 @@ pub use session_turn_gate::{
     UNREACHABLE_FALLBACK,
 };
 pub use snapshot_spec::{ControlPlaneSandboxSnapshot, ControlPlaneSnapshotSpec};
-pub use task_repository::{ControlPlaneTaskRepository, HEARTBEAT_INTERVAL, TRANSPORT_AGENT_PROTOCOL};
+pub use task_repository::{
+    ControlPlaneTaskRepository, HEARTBEAT_INTERVAL, TRANSPORT_AGENT_PROTOCOL,
+};

@@ -10,9 +10,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
-use agentscope_core::{
-    ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema,
-};
+use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
 use crate::common::{HttpRequestSpec, SharedTransport};
 use crate::dashscope::converter::{
@@ -154,14 +152,12 @@ impl DashScopeChatModel {
         );
         let body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
 
-        let mut spec = HttpRequestSpec::new(
-            format!("{}{}", self.base_url, self.endpoint_path()),
-            body,
-        )
-        .streaming(stream)
-        .provider("dashscope")
-        .header("Authorization", format!("Bearer {}", self.api_key))
-        .header("Content-Type", "application/json");
+        let mut spec =
+            HttpRequestSpec::new(format!("{}{}", self.base_url, self.endpoint_path()), body)
+                .streaming(stream)
+                .provider("dashscope")
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json");
         if stream {
             spec = spec.header("X-DashScope-SSE", "enable");
         }
@@ -306,7 +302,14 @@ mod tests {
             "usage": { "input_tokens": 4, "output_tokens": 7 }
         }));
         let model = model_with(transport.clone(), "qwen-plus");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
 
         assert_eq!(out.len(), 1);
         let response = out[0].as_ref().unwrap();
@@ -320,7 +323,10 @@ mod tests {
         );
         assert!(!spec.stream);
         assert_eq!(spec.body["model"], serde_json::json!("qwen-plus"));
-        assert_eq!(spec.body["input"]["messages"][0]["role"], serde_json::json!("user"));
+        assert_eq!(
+            spec.body["input"]["messages"][0]["role"],
+            serde_json::json!("user")
+        );
         assert!(spec
             .headers
             .iter()
@@ -334,7 +340,14 @@ mod tests {
             "output": { "choices": [{ "message": { "content": "seen" } }] }
         }));
         let model = model_with(transport.clone(), "qwen-vl-plus");
-        let _ = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let _ = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let spec = transport.last_request().unwrap();
         assert_eq!(
@@ -357,12 +370,19 @@ mod tests {
         let out = collect(&model, GenerateOptions::default()).await;
 
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         assert_eq!(out[2].as_ref().unwrap().usage.output_tokens, 3);
         let spec = transport.last_request().unwrap();
         assert!(spec.stream);
-        assert!(spec.headers.iter().any(|(k, v)| k == "X-DashScope-SSE" && v == "enable"));
+        assert!(spec
+            .headers
+            .iter()
+            .any(|(k, v)| k == "X-DashScope-SSE" && v == "enable"));
     }
 
     #[tokio::test]
@@ -372,7 +392,14 @@ mod tests {
             "message": "bad key"
         }));
         let model = model_with(transport, "qwen-plus");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
         let err = out[0].as_ref().unwrap_err().to_string();
         assert!(err.contains("InvalidApiKey"), "unexpected error: {err}");
     }

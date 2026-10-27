@@ -30,12 +30,19 @@ pub struct ContextMessage {
 impl ContextMessage {
     /// Creates a plain role/content message.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), tool_name: None }
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_name: None,
+        }
     }
 
     fn canonical(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        map.insert("content".into(), serde_json::Value::String(self.content.clone()));
+        map.insert(
+            "content".into(),
+            serde_json::Value::String(self.content.clone()),
+        );
         map.insert("role".into(), serde_json::Value::String(self.role.clone()));
         if let Some(t) = &self.tool_name {
             map.insert("toolName".into(), serde_json::Value::String(t.clone()));
@@ -58,7 +65,10 @@ pub struct ToolInfo {
 impl ToolInfo {
     /// Creates a tool info entry.
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        Self { name: name.into(), description: description.into() }
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
     }
 
     fn canonical(&self) -> serde_json::Value {

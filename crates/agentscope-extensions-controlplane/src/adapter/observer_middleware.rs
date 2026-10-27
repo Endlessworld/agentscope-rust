@@ -262,8 +262,8 @@ fn role_of(msg: &Msg) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ControlPlaneConfig;
     use crate::bridge::ControlPlaneBridge;
+    use crate::config::ControlPlaneConfig;
     use agentscope_core::message::Msg;
 
     fn shared_with_reporter() -> (Arc<AdapterShared>, ControlPlaneBridge) {
@@ -301,9 +301,12 @@ mod tests {
         // Drain; the tap side effects have already run.
         while stream.next().await.is_some() {}
         // session_start + 1 user message
-        assert_eq!(mw.reporter().unwrap().publish(
-            SessionEvent::builder("probe", TYPE_MESSAGE).build()
-        ), 1);
+        assert_eq!(
+            mw.reporter()
+                .unwrap()
+                .publish(SessionEvent::builder("probe", TYPE_MESSAGE).build()),
+            1
+        );
     }
 
     #[tokio::test]

@@ -56,7 +56,9 @@ impl Model for ScriptedModel {
         let has_tool_result = messages.iter().any(|m| m.role == MsgRole::Tool);
         let resp = if has_tool_result {
             ChatResponse::builder()
-                .content(vec![ContentBlock::Text(TextBlock::new(self.final_text.clone()))])
+                .content(vec![ContentBlock::Text(TextBlock::new(
+                    self.final_text.clone(),
+                ))])
                 .build()
         } else {
             ChatResponse::builder()

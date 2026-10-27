@@ -235,7 +235,11 @@ impl ActionObserver for ObserverHandle {
 /// The start fact is acknowledged **before** the tool runs. A failure to record never becomes
 /// a tool result: the caller sees the observation error, because automatically replaying an
 /// action whose outcome could not be acknowledged is unsafe.
-pub async fn observe<F>(ctx: &RuntimeContext, call: &ToolUseBlock, execution: F) -> Result<ToolResultBlock>
+pub async fn observe<F>(
+    ctx: &RuntimeContext,
+    call: &ToolUseBlock,
+    execution: F,
+) -> Result<ToolResultBlock>
 where
     F: std::future::Future<Output = Result<ToolResultBlock>>,
 {
@@ -383,8 +387,8 @@ mod tests {
             .with_user_id("alice")
             .with_session_id("s1")
             .with_agent_id("agent");
-        let observation = ActionObservation::start(&ctx, &call())
-            .settled(ActionStatus::Returned, None);
+        let observation =
+            ActionObservation::start(&ctx, &call()).settled(ActionStatus::Returned, None);
         let payload = observation.event_payload();
         assert_eq!(payload["tool_name"], "read_file");
         assert_eq!(payload["tool_call_id"], "call-1");
@@ -400,7 +404,11 @@ mod tests {
     async fn an_unobserved_execution_is_returned_unchanged() {
         let ctx = RuntimeContext::new();
         let result = observe(&ctx, &call(), async {
-            Ok(ToolResultBlock::new("", "", vec![ContentBlock::Text(TextBlock::new("ok"))]))
+            Ok(ToolResultBlock::new(
+                "",
+                "",
+                vec![ContentBlock::Text(TextBlock::new("ok"))],
+            ))
         })
         .await
         .unwrap();
@@ -469,10 +477,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let ctx = RuntimeContext::new().with_extension_arc(
-            crate::session::RECORDER_CONTEXT_KEY,
-            Arc::clone(&recorder),
-        );
+        let ctx = RuntimeContext::new()
+            .with_extension_arc(crate::session::RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
 
         observe(&ctx, &call(), async {
             Ok(ToolResultBlock::new("x", "y", vec![]).with_state(ToolResultState::Denied))

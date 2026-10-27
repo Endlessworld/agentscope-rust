@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
 
@@ -66,7 +66,11 @@ pub trait AsyncToolRegistry: Send + Sync {
 
     /// Find async tool records for `session_id` that have been in RUNNING status
     /// longer than `ttl`. These are likely orphaned due to a process crash.
-    async fn find_stale(&self, session_id: &str, ttl: ChronoDuration) -> Result<Vec<AsyncToolRecord>>;
+    async fn find_stale(
+        &self,
+        session_id: &str,
+        ttl: ChronoDuration,
+    ) -> Result<Vec<AsyncToolRecord>>;
 
     /// Mark a stale async tool record as timed out, so it is no longer returned by
     /// subsequent `find_stale` calls.
@@ -115,7 +119,9 @@ impl WorkspaceAsyncToolRegistry {
 
     async fn ensure_dir(&self, dir: &str) -> Result<()> {
         if !self.fs.exists(&self.ctx, dir).await? {
-            self.fs.write(&self.ctx, &format!("{dir}/.keep"), "").await?;
+            self.fs
+                .write(&self.ctx, &format!("{dir}/.keep"), "")
+                .await?;
         }
         Ok(())
     }
@@ -174,7 +180,13 @@ fn sanitize(s: &str) -> String {
         return "default".to_string();
     }
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -212,7 +224,11 @@ impl AsyncToolRegistry for WorkspaceAsyncToolRegistry {
         self.update_status(id, AsyncToolRecord::FAILED).await
     }
 
-    async fn find_stale(&self, session_id: &str, ttl: ChronoDuration) -> Result<Vec<AsyncToolRecord>> {
+    async fn find_stale(
+        &self,
+        session_id: &str,
+        ttl: ChronoDuration,
+    ) -> Result<Vec<AsyncToolRecord>> {
         let dir = self.session_dir(session_id);
         if !self.fs.exists(&self.ctx, &dir).await? {
             return Ok(Vec::new());

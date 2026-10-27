@@ -15,7 +15,9 @@ use agentscope_core::session::{
 use agentscope_core::state::AgentState;
 use futures::stream::BoxStream;
 
-use agentscope_extensions_controlplane::model::session_event::{ROLE_ASSISTANT, ROLE_USER, TYPE_MESSAGE};
+use agentscope_extensions_controlplane::model::session_event::{
+    ROLE_ASSISTANT, ROLE_USER, TYPE_MESSAGE,
+};
 use agentscope_extensions_controlplane::{ControlPlaneBridge, ControlPlaneConfig};
 
 /// An offline model that always answers with one text block.
@@ -164,7 +166,8 @@ async fn duplicate_native_watermark_exports_once() {
 /// The watermark survives a bridge restart, so a redelivery after crash is still a no-op.
 #[tokio::test]
 async fn source_watermark_is_durable_across_bridge_reopen() {
-    let dir = std::env::temp_dir().join(format!("controlplane-p013-reopen-{}", uuid::Uuid::new_v4()));
+    let dir =
+        std::env::temp_dir().join(format!("controlplane-p013-reopen-{}", uuid::Uuid::new_v4()));
     let cfg = ControlPlaneConfig::builder("friday")
         .instance_key("p0-13")
         .enable_events(true)
@@ -175,13 +178,19 @@ async fn source_watermark_is_durable_across_bridge_reopen() {
 
     {
         let bridge = ControlPlaneBridge::new(cfg.clone()).start().unwrap();
-        bridge.committed_event_sink().accept_for("s1", &fact).unwrap();
+        bridge
+            .committed_event_sink()
+            .accept_for("s1", &fact)
+            .unwrap();
         assert_eq!(bridge.pending_event_count(), 1);
     }
 
     let reopened = ControlPlaneBridge::new(cfg).start().unwrap();
     assert_eq!(reopened.source_watermark("s1"), 9);
-    reopened.committed_event_sink().accept_for("s1", &fact).unwrap();
+    reopened
+        .committed_event_sink()
+        .accept_for("s1", &fact)
+        .unwrap();
     assert_eq!(
         reopened.pending_event_count(),
         1,

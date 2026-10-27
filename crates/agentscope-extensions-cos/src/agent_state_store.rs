@@ -16,9 +16,7 @@ use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite};
 use agentscope_core::state::AgentStateStore;
 use async_trait::async_trait;
 
-use crate::layout::{
-    session_prefix, DEFAULT_STATE_PREFIX, HASH_SUFFIX, JSON_SUFFIX, LIST_SUFFIX,
-};
+use crate::layout::{session_prefix, DEFAULT_STATE_PREFIX, HASH_SUFFIX, JSON_SUFFIX, LIST_SUFFIX};
 use crate::object_store::SharedObjectStore;
 use crate::{CosError, Result};
 
@@ -63,15 +61,24 @@ impl CosAgentStateStore {
     }
 
     fn state_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<String> {
-        Ok(format!("{}{key}{JSON_SUFFIX}", session_prefix(&self.key_prefix, user, session)?))
+        Ok(format!(
+            "{}{key}{JSON_SUFFIX}",
+            session_prefix(&self.key_prefix, user, session)?
+        ))
     }
 
     fn list_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<String> {
-        Ok(format!("{}{key}{LIST_SUFFIX}", session_prefix(&self.key_prefix, user, session)?))
+        Ok(format!(
+            "{}{key}{LIST_SUFFIX}",
+            session_prefix(&self.key_prefix, user, session)?
+        ))
     }
 
     fn hash_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<String> {
-        Ok(format!("{}{key}{HASH_SUFFIX}", session_prefix(&self.key_prefix, user, session)?))
+        Ok(format!(
+            "{}{key}{HASH_SUFFIX}",
+            session_prefix(&self.key_prefix, user, session)?
+        ))
     }
 }
 
@@ -155,13 +162,22 @@ impl AgentStateStore for CosAgentStateStore {
         // currently stored, independent of whether a hash object exists. Keeping
         // these decoupled is what makes `needs_full_rewrite` Case 2 (missing hash
         // but existing data) reachable.
-        let existing_count = match self.object_store.get_string(&list_key).await.unwrap_or(None) {
+        let existing_count = match self
+            .object_store
+            .get_string(&list_key)
+            .await
+            .unwrap_or(None)
+        {
             Some(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
                 .map(|v| v.len())
                 .unwrap_or(0),
             None => 0,
         };
-        let stored_hash = self.object_store.get_string(&hash_key).await.unwrap_or(None);
+        let stored_hash = self
+            .object_store
+            .get_string(&hash_key)
+            .await
+            .unwrap_or(None);
 
         let current_hash = compute_hash(values);
         let full_rewrite = needs_full_rewrite(values, stored_hash.as_deref(), existing_count);
@@ -337,7 +353,8 @@ mod tests {
     #[tokio::test]
     async fn save_get_roundtrip() {
         let s = store();
-        s.save(Some("u1"), "s1", "k", serde_json::json!({"a": 1})).await;
+        s.save(Some("u1"), "s1", "k", serde_json::json!({"a": 1}))
+            .await;
         let got = s.get(Some("u1"), "s1", "k").await.unwrap();
         assert_eq!(got, serde_json::json!({"a": 1}));
         assert!(s.get(Some("u1"), "s1", "missing").await.is_none());
@@ -409,7 +426,8 @@ mod tests {
             .build()
             .unwrap();
 
-        s.save_list(Some("u1"), "s1", "items", &[serde_json::json!("a")]).await;
+        s.save_list(Some("u1"), "s1", "items", &[serde_json::json!("a")])
+            .await;
         let hash_key = s.hash_key(Some("u1"), "s1", "items").unwrap();
         let stored_hash = backend.get_string(&hash_key).await.unwrap().unwrap();
 
@@ -434,7 +452,10 @@ mod tests {
         s.save_list(Some("u1"), "s1", "items", &appended).await;
 
         // The appended data is persisted and the hash tracks the new full list.
-        assert_eq!(s.get_list(Some("u1"), "s1", "items").await, appended.to_vec());
+        assert_eq!(
+            s.get_list(Some("u1"), "s1", "items").await,
+            appended.to_vec()
+        );
         assert_eq!(backend.get_string(&hash_key).await.unwrap().unwrap(), whole);
     }
 
@@ -463,7 +484,11 @@ mod tests {
     #[test]
     fn appended_prefix_hash_stays_valid() {
         let prefix = vec![serde_json::json!("a"), serde_json::json!("b")];
-        let full = vec![serde_json::json!("a"), serde_json::json!("b"), serde_json::json!("c")];
+        let full = vec![
+            serde_json::json!("a"),
+            serde_json::json!("b"),
+            serde_json::json!("c"),
+        ];
         let stored = compute_hash(&prefix);
         assert!(!needs_full_rewrite(&full, Some(&stored), prefix.len()));
     }
@@ -484,7 +509,11 @@ mod tests {
     #[test]
     fn shrink_triggers_full_rewrite() {
         let stored = compute_hash(&[serde_json::json!(1), serde_json::json!(2)]);
-        assert!(needs_full_rewrite(&[serde_json::json!(1)], Some(&stored), 2));
+        assert!(needs_full_rewrite(
+            &[serde_json::json!(1)],
+            Some(&stored),
+            2
+        ));
     }
 
     /// With no pre-existing data a missing hash must not force a rewrite.

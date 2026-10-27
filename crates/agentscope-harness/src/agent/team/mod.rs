@@ -21,7 +21,11 @@ use thiserror::Error;
 pub enum TeamError {
     /// Optimistic-concurrency loss: the record changed under us.
     #[error("team conflict on `{key}`: expected version {expected}, actual {actual}")]
-    Conflict { key: String, expected: u64, actual: u64 },
+    Conflict {
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("team `{0}` not found")]
     TeamNotFound(String),
     #[error("task `{0}` not found")]
@@ -141,7 +145,10 @@ pub struct TeamMemberSpec {
 
 impl TeamMemberSpec {
     pub fn new(name: impl Into<String>, role: TeamRole) -> Self {
-        Self { name: name.into(), role }
+        Self {
+            name: name.into(),
+            role,
+        }
     }
 }
 
@@ -250,8 +257,13 @@ pub trait TeamClient: Send + Sync {
     fn list_tasks(&self, team_id: &str) -> TeamResult<Vec<TeamTask>>;
 
     /// Sends a direct message to a member (delivers a wakeup).
-    fn send_message(&self, team_id: &str, from: &str, to: &str, content: &str)
-        -> TeamResult<TeamMessage>;
+    fn send_message(
+        &self,
+        team_id: &str,
+        from: &str,
+        to: &str,
+        content: &str,
+    ) -> TeamResult<TeamMessage>;
 
     /// Broadcasts to every active member except `from`.
     fn broadcast_message(
@@ -329,7 +341,13 @@ impl LocalTeamClient {
     }
 
     /// CAS update of a task under the board lock; bumps version + timestamp.
-    fn cas_update<F>(&self, team_id: &str, task_id: &str, expected_version: u64, mutate: F) -> TeamResult<TeamTask>
+    fn cas_update<F>(
+        &self,
+        team_id: &str,
+        task_id: &str,
+        expected_version: u64,
+        mutate: F,
+    ) -> TeamResult<TeamTask>
     where
         F: FnOnce(&mut TeamTask),
     {
@@ -354,7 +372,11 @@ impl LocalTeamClient {
 
     fn deliver(board: &mut TeamBoard, msg: TeamMessage) {
         if let Some(to) = &msg.to {
-            board.mailboxes.entry(to.clone()).or_default().push(msg.clone());
+            board
+                .mailboxes
+                .entry(to.clone())
+                .or_default()
+                .push(msg.clone());
             if let Some(tx) = board.wakeups.get(to) {
                 let _ = tx.send(msg);
             }
@@ -379,13 +401,24 @@ impl TeamClient for LocalTeamClient {
         let members: Vec<TeamMemberInfo> = spec
             .members
             .iter()
-            .map(|m| TeamMemberInfo { name: m.name.clone(), role: m.role, active: true })
+            .map(|m| TeamMemberInfo {
+                name: m.name.clone(),
+                role: m.role,
+                active: true,
+            })
             .collect();
         for m in &members {
             board.members.insert(m.name.clone(), m.clone());
         }
-        let info = TeamInfo { id: spec.id.clone(), name: spec.name.clone(), members };
-        self.names.lock().unwrap().insert(spec.id.clone(), spec.name);
+        let info = TeamInfo {
+            id: spec.id.clone(),
+            name: spec.name.clone(),
+            members,
+        };
+        self.names
+            .lock()
+            .unwrap()
+            .insert(spec.id.clone(), spec.name);
         self.boards
             .lock()
             .unwrap()
@@ -404,7 +437,11 @@ impl TeamClient for LocalTeamClient {
         self.with_board(team_id, |board| {
             let mut members: Vec<TeamMemberInfo> = board.members.values().cloned().collect();
             members.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(TeamInfo { id: team_id.to_string(), name, members })
+            Ok(TeamInfo {
+                id: team_id.to_string(),
+                name,
+                members,
+            })
         })
     }
 
@@ -578,12 +615,18 @@ impl TeamClient for LocalTeamClient {
             board.wakeups.insert(member.to_string(), tx);
             Ok(())
         });
-        TeamWakeups { rx: Arc::new(tokio::sync::Mutex::new(Some(rx))) }
+        TeamWakeups {
+            rx: Arc::new(tokio::sync::Mutex::new(Some(rx))),
+        }
     }
 
     fn spawn_member(&self, team_id: &str, spec: TeamMemberSpec) -> TeamResult<TeamMemberInfo> {
         self.with_board(team_id, |board| {
-            let info = TeamMemberInfo { name: spec.name.clone(), role: spec.role, active: true };
+            let info = TeamMemberInfo {
+                name: spec.name.clone(),
+                role: spec.role,
+                active: true,
+            };
             board.members.insert(spec.name, info.clone());
             Ok(info)
         })

@@ -24,10 +24,8 @@ fn tool_ctx() -> ToolExecutionContext {
 }
 
 async fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "agentscope_harness_{tag}_{}",
-        std::process::id()
-    ));
+    let base =
+        std::env::temp_dir().join(format!("agentscope_harness_{tag}_{}", std::process::id()));
     let _ = tokio::fs::remove_dir_all(&base).await;
     tokio::fs::create_dir_all(&base).await.unwrap();
     base
@@ -43,7 +41,10 @@ async fn local_write_read_edit_delete() {
     let data = fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap();
     assert_eq!(data.content, "hello\nworld");
 
-    let n = fs.edit(&ctx(), "/a.txt", "world", "rust", false).await.unwrap();
+    let n = fs
+        .edit(&ctx(), "/a.txt", "world", "rust", false)
+        .await
+        .unwrap();
     assert_eq!(n, 1);
     let data = fs.read(&ctx(), "/a.txt", 0, 0).await.unwrap();
     assert_eq!(data.content, "hello\nrust");
@@ -67,8 +68,12 @@ async fn local_sandboxed_blocks_traversal() {
 async fn local_glob_and_grep() {
     let dir = temp_dir("glob").await;
     let fs = LocalFilesystem::sandboxed(&dir);
-    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
-    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()").await.unwrap();
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()")
+        .await
+        .unwrap();
     fs.write(&ctx(), "/README.md", "docs").await.unwrap();
 
     let files = fs.glob(&ctx(), "**/*.rs", "/").await.unwrap();
@@ -85,18 +90,30 @@ async fn local_glob_and_grep() {
 async fn grep_single_file_and_regex() {
     let dir = temp_dir("grep_single").await;
     let fs = LocalFilesystem::sandboxed(&dir);
-    fs.write(&ctx(), "/src/main.rs", "fn main() {\n    println!(\"hi\");\n}")
+    fs.write(
+        &ctx(),
+        "/src/main.rs",
+        "fn main() {\n    println!(\"hi\");\n}",
+    )
+    .await
+    .unwrap();
+    fs.write(&ctx(), "/README.md", "fn docs only")
         .await
         .unwrap();
-    fs.write(&ctx(), "/README.md", "fn docs only").await.unwrap();
 
     // grep on a single file path works (Linux `grep pattern file`)
-    let matches = fs.grep(&ctx(), "println", Some("/src/main.rs"), None).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), "println", Some("/src/main.rs"), None)
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].line, 2);
 
     // pattern is a regex: `fn\s+main` matches "fn main("
-    let matches = fs.grep(&ctx(), r"fn\s+main", Some("/src"), None).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), r"fn\s+main", Some("/src"), None)
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].path, "/src/main.rs");
 
@@ -105,7 +122,10 @@ async fn grep_single_file_and_regex() {
     assert_eq!(matches.len(), 0);
 
     // inline (?i) flag is honored
-    let matches = fs.grep(&ctx(), "(?i)PRINTLN", Some("/src/main.rs"), None).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), "(?i)PRINTLN", Some("/src/main.rs"), None)
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 1);
 }
 
@@ -113,12 +133,19 @@ async fn grep_single_file_and_regex() {
 async fn grep_glob_filter_matches_basename() {
     let dir = temp_dir("grep_glob").await;
     let fs = LocalFilesystem::sandboxed(&dir);
-    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
-    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()").await.unwrap();
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()")
+        .await
+        .unwrap();
     fs.write(&ctx(), "/README.md", "fn docs").await.unwrap();
 
     // glob filter is matched against the file name (like grep --include=*.rs)
-    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("*.rs")).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), "fn", Some("/"), Some("*.rs"))
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 2);
     assert!(matches.iter().all(|m| m.path.ends_with(".rs")));
 }
@@ -127,9 +154,15 @@ async fn grep_glob_filter_matches_basename() {
 async fn glob_pattern_is_relative_to_base() {
     let dir = temp_dir("glob_base").await;
     let fs = LocalFilesystem::sandboxed(&dir);
-    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
-    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()").await.unwrap();
-    fs.write(&ctx(), "/src/nested/extra.rs", "fn extra()").await.unwrap();
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/src/lib.rs", "pub fn lib()")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/src/nested/extra.rs", "fn extra()")
+        .await
+        .unwrap();
     fs.write(&ctx(), "/README.md", "docs").await.unwrap();
 
     // `*.rs` matches files directly under /src (like `cd /src && ls *.rs`)
@@ -151,9 +184,19 @@ async fn glob_pattern_is_relative_to_base() {
 async fn grep_and_glob_skip_generated_dirs() {
     let dir = temp_dir("skip_generated").await;
     let fs = LocalFilesystem::sandboxed(&dir);
-    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
-    fs.write(&ctx(), "/target/gen.rs", "fn main() in target").await.unwrap();
-    fs.write(&ctx(), "/node_modules/pkg/index.rs", "fn main() in node_modules").await.unwrap();
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/target/gen.rs", "fn main() in target")
+        .await
+        .unwrap();
+    fs.write(
+        &ctx(),
+        "/node_modules/pkg/index.rs",
+        "fn main() in node_modules",
+    )
+    .await
+    .unwrap();
 
     // glob does not descend into generated dirs
     let files = fs.glob(&ctx(), "**/*.rs", "/").await.unwrap();
@@ -179,7 +222,10 @@ async fn overlay_copy_on_write() {
     let lower = Arc::new(LocalFilesystem::sandboxed(&lower_dir));
 
     // shared file in the lower layer
-    lower.write(&ctx(), "/shared.md", "shared original").await.unwrap();
+    lower
+        .write(&ctx(), "/shared.md", "shared original")
+        .await
+        .unwrap();
     let overlay = OverlayFilesystem::new(upper.clone(), lower.clone());
 
     // read falls through to lower
@@ -187,7 +233,10 @@ async fn overlay_copy_on_write() {
     assert_eq!(data.content, "shared original");
 
     // editing a shared file triggers copy-on-write into upper; lower stays intact
-    let n = overlay.edit(&ctx(), "/shared.md", "original", "edited", false).await.unwrap();
+    let n = overlay
+        .edit(&ctx(), "/shared.md", "original", "edited", false)
+        .await
+        .unwrap();
     assert_eq!(n, 1);
     let upper_data = upper.read(&ctx(), "/shared.md", 0, 0).await.unwrap();
     assert_eq!(upper_data.content, "shared edited");
@@ -215,11 +264,17 @@ async fn composite_routes_by_prefix() {
         .write(&ctx(), "/memories/notes.md", "note")
         .await
         .unwrap();
-    let data = composite.read(&ctx(), "/memories/notes.md", 0, 0).await.unwrap();
+    let data = composite
+        .read(&ctx(), "/memories/notes.md", 0, 0)
+        .await
+        .unwrap();
     assert_eq!(data.content, "note");
 
     // default backend handles unmatched paths
-    composite.write(&ctx(), "/main.rs", "fn main() {}").await.unwrap();
+    composite
+        .write(&ctx(), "/main.rs", "fn main() {}")
+        .await
+        .unwrap();
     let data = composite.read(&ctx(), "/main.rs", 0, 0).await.unwrap();
     assert_eq!(data.content, "fn main() {}");
 }
@@ -229,7 +284,10 @@ async fn sandbox_executes_shell() {
     let dir = temp_dir("sandbox_exec").await;
     let inner = LocalFilesystem::sandboxed(&dir);
     let sandbox = SandboxBackedFilesystem::new(Arc::new(inner), dir);
-    let result = sandbox.execute(&ctx(), "echo hello-from-shell", 10).await.unwrap();
+    let result = sandbox
+        .execute(&ctx(), "echo hello-from-shell", 10)
+        .await
+        .unwrap();
     assert!(result.is_success());
     assert!(result.output.contains("hello-from-shell"));
 }
@@ -256,25 +314,36 @@ async fn search_tools_bound_output_by_limit() {
     let dir = temp_dir("search_limit").await;
     let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
     for i in 0..50 {
-        fs.write(&ctx(), &format!("/f{i}.rs"), "pub fn f()").await.unwrap();
+        fs.write(&ctx(), &format!("/f{i}.rs"), "pub fn f()")
+            .await
+            .unwrap();
     }
 
     let glob = FilesystemTool::glob_files(Arc::clone(&fs));
     let out = glob
         .call(
-            json!({ "pattern": "**/*.rs", "path": "/", "limit": 10 }).as_object().unwrap().clone(),
+            json!({ "pattern": "**/*.rs", "path": "/", "limit": 10 })
+                .as_object()
+                .unwrap()
+                .clone(),
             tool_ctx(),
         )
         .await
         .unwrap();
     let text = tool_text(&out);
-    assert!(text.contains("Truncated"), "expected truncation notice, got: {text}");
+    assert!(
+        text.contains("Truncated"),
+        "expected truncation notice, got: {text}"
+    );
     assert_eq!(text.lines().count(), 12, "10 entries + 2 notice lines");
 
     // limit < 1 is rejected as an Err
     let err = glob
         .call(
-            json!({ "pattern": "**/*.rs", "path": "/", "limit": 0 }).as_object().unwrap().clone(),
+            json!({ "pattern": "**/*.rs", "path": "/", "limit": 0 })
+                .as_object()
+                .unwrap()
+                .clone(),
             tool_ctx(),
         )
         .await
@@ -298,20 +367,35 @@ fn tool_text(block: &ToolResultBlock) -> String {
 async fn grep_glob_with_slash_matches_relative_path() {
     let dir = temp_dir("grep_glob_path").await;
     let fs = LocalFilesystem::sandboxed(&dir);
-    fs.write(&ctx(), "/src/main.rs", "fn main() {}").await.unwrap();
-    fs.write(&ctx(), "/src/nested/extra.rs", "fn extra() {}").await.unwrap();
-    fs.write(&ctx(), "/other/keep.rs", "fn keep() {}").await.unwrap();
+    fs.write(&ctx(), "/src/main.rs", "fn main() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/src/nested/extra.rs", "fn extra() {}")
+        .await
+        .unwrap();
+    fs.write(&ctx(), "/other/keep.rs", "fn keep() {}")
+        .await
+        .unwrap();
 
     // No slash: matched against the file name, so it stays recursive.
-    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("*.rs")).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), "fn", Some("/"), Some("*.rs"))
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 3);
 
     // A slash makes the pattern relative to the search base.
-    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("src/*.rs")).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), "fn", Some("/"), Some("src/*.rs"))
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].path, "/src/main.rs");
 
-    let matches = fs.grep(&ctx(), "fn", Some("/"), Some("src/**/*.rs")).await.unwrap();
+    let matches = fs
+        .grep(&ctx(), "fn", Some("/"), Some("src/**/*.rs"))
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 2);
 
     let matches = fs
@@ -357,9 +441,12 @@ async fn grep_skips_binary_and_keeps_non_utf8_text() {
         .await
         .unwrap();
     // Latin-1 bytes: not valid UTF-8, but still text -> searched lossily.
-    tokio::fs::write(dir.join("latin1.txt"), [b'c', b'a', b'f', 0xe9, b' ', b'f', b'n'])
-        .await
-        .unwrap();
+    tokio::fs::write(
+        dir.join("latin1.txt"),
+        [b'c', b'a', b'f', 0xe9, b' ', b'f', b'n'],
+    )
+    .await
+    .unwrap();
 
     let matches = fs.grep(&ctx(), "fn", Some("/"), None).await.unwrap();
     assert_eq!(
@@ -429,7 +516,10 @@ async fn grep_tool_flags_and_output_modes() {
     let err = call(json!({"pattern": "fn", "glob": "*.rs", "type": "rust"}))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("either glob or type"), "got: {err}");
+    assert!(
+        err.to_string().contains("either glob or type"),
+        "got: {err}"
+    );
 
     // Unknown type names are reported with the known set.
     let err = call(json!({"pattern": "fn", "type": "cobol"}))
@@ -464,7 +554,9 @@ async fn generated_dir_names_do_not_prune_regular_files() {
     let fs = LocalFilesystem::sandboxed(&dir);
     // `build` is a generated *directory* name; a regular file of that name must
     // still be searched.
-    fs.write(&ctx(), "/build", "fn in_plain_file").await.unwrap();
+    fs.write(&ctx(), "/build", "fn in_plain_file")
+        .await
+        .unwrap();
     fs.write(&ctx(), "/node_modules/skip.rs", "fn in_build_dir")
         .await
         .unwrap();
@@ -487,7 +579,9 @@ async fn read_treats_nul_after_sniff_window_as_text() {
     let mut bytes = b"first line\n".repeat(1000); // 11 000 bytes: past the 8 KiB window
     bytes.push(0);
     bytes.extend_from_slice(b"\ntail line\n");
-    tokio::fs::write(dir.join("late_nul.txt"), &bytes).await.unwrap();
+    tokio::fs::write(dir.join("late_nul.txt"), &bytes)
+        .await
+        .unwrap();
 
     let data = fs.read(&ctx(), "/late_nul.txt", 0, 0).await.unwrap();
     assert_eq!(

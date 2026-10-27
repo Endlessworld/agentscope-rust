@@ -184,7 +184,10 @@ pub trait ExtendedModel: Send + Sync {
             merged.insert(
                 "required".to_string(),
                 serde_json::Value::Array(
-                    required.into_iter().map(serde_json::Value::String).collect(),
+                    required
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }
@@ -291,13 +294,19 @@ deactivate groups as soon as they are no longer needed to conserve context space
 fn reset_equipped_tools_schema(toolkit: &Toolkit) -> serde_json::Value {
     let mut properties = JsonMap::new();
     let mut items = serde_json::Map::new();
-    items.insert("type".to_string(), serde_json::Value::String("string".into()));
+    items.insert(
+        "type".to_string(),
+        serde_json::Value::String("string".into()),
+    );
     let meta_groups = toolkit.meta_group_names();
     if !meta_groups.is_empty() {
         items.insert(
             "enum".to_string(),
             serde_json::Value::Array(
-                meta_groups.into_iter().map(serde_json::Value::String).collect(),
+                meta_groups
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
             ),
         );
     }
@@ -307,7 +316,7 @@ fn reset_equipped_tools_schema(toolkit: &Toolkit) -> serde_json::Value {
             "type": "array",
             "items": serde_json::Value::Object(items),
             "description": "The FINAL list of tool group names to keep active. Groups NOT in \
-this list will be deactivated. Pass an empty list to deactivate all groups.",
+        this list will be deactivated. Pass an empty list to deactivate all groups.",
         }),
     );
     serde_json::json!({

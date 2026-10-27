@@ -164,7 +164,12 @@ impl Knowledge for BailianKnowledge {
 
         let response = self
             .client
-            .retrieve(&self.index_id, query, Some(config.limit), history.as_deref())
+            .retrieve(
+                &self.index_id,
+                query,
+                Some(config.limit),
+                history.as_deref(),
+            )
             .await?;
         let documents = BailianDocumentConverter::from_response(&response);
         Ok(filter_and_rank(documents, config))
@@ -231,15 +236,16 @@ mod tests {
 
     #[test]
     fn builder_rejects_both_config_and_client_and_missing_index() {
-        let client = BailianClient::with_transport(
-            config(),
-            Arc::new(ScriptedTransport::default()),
-        );
+        let client =
+            BailianClient::with_transport(config(), Arc::new(ScriptedTransport::default()));
         let both = BailianKnowledge::builder()
             .config(config())
             .client(client)
             .build();
-        assert!(matches!(both, Err(RagError::InvalidArgument(_))), "{both:?}");
+        assert!(
+            matches!(both, Err(RagError::InvalidArgument(_))),
+            "{both:?}"
+        );
 
         assert!(BailianKnowledge::builder().build().is_err());
         assert!(BailianKnowledge::builder()
@@ -258,16 +264,17 @@ mod tests {
             .unwrap();
         assert_eq!(knowledge.index_id(), "explicit");
 
-        let knowledge = BailianKnowledge::builder().config(config()).build().unwrap();
+        let knowledge = BailianKnowledge::builder()
+            .config(config())
+            .build()
+            .unwrap();
         assert_eq!(knowledge.index_id(), "idx-1");
     }
 
     #[test]
     fn index_id_requires_a_non_blank_value() {
-        let client = BailianClient::with_transport(
-            config(),
-            Arc::new(ScriptedTransport::default()),
-        );
+        let client =
+            BailianClient::with_transport(config(), Arc::new(ScriptedTransport::default()));
         assert!(BailianKnowledge::from_client(client, "  ").is_err());
     }
 

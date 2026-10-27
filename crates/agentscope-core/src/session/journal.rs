@@ -104,7 +104,10 @@ impl JournalSessionLog {
     }
 
     fn seal_path(&self, owner: &str) -> String {
-        self.path(&format!("writer-seals/{}.json", Self::hash(owner.as_bytes())))
+        self.path(&format!(
+            "writer-seals/{}.json",
+            Self::hash(owner.as_bytes())
+        ))
     }
 
     async fn is_sealed(&self, owner: &str) -> crate::error::Result<bool> {
@@ -148,9 +151,7 @@ impl JournalSessionLog {
                                 session_error("Missing or corrupt committed payload blob")
                             })?;
                         if Self::hash(&payload.bytes) != *blob {
-                            return Err(session_error(
-                                "Missing or corrupt committed payload blob",
-                            ));
+                            return Err(session_error("Missing or corrupt committed payload blob"));
                         }
                         let json = String::from_utf8(payload.bytes)
                             .map_err(|_| session_error("Committed payload is not UTF-8"))?;
@@ -395,9 +396,7 @@ impl SessionLog for JournalSessionLog {
                     let existing = self.read_commit(&id).await?;
                     if existing.batch_id == batch_id {
                         if existing.hash != hash || existing.first_seq != expected_seq + 1 {
-                            return Err(session_error(
-                                "Batch ID reused with different content",
-                            ));
+                            return Err(session_error("Batch ID reused with different content"));
                         }
                         self.ensure_owned(&head, writer).await?;
                         return Ok(head);
@@ -493,7 +492,11 @@ impl SessionLog for JournalSessionLog {
         Err(session_error("Commit contention"))
     }
 
-    async fn read_after(&self, after: u64, limit: usize) -> crate::error::Result<Vec<SessionEvent>> {
+    async fn read_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> crate::error::Result<Vec<SessionEvent>> {
         if limit < 1 {
             return Err(session_error("Invalid limit"));
         }
@@ -687,7 +690,12 @@ mod tests {
         let writer = acquired(&log, "run-1").await;
 
         let head = log
-            .commit(&writer, "b1", 0, &[event(1, "run/start"), event(2, "turn/start")])
+            .commit(
+                &writer,
+                "b1",
+                0,
+                &[event(1, "run/start"), event(2, "turn/start")],
+            )
             .await
             .unwrap();
         assert_eq!(head.seq, 2);
@@ -719,7 +727,11 @@ mod tests {
             .commit(&writer, "b1", 0, &[event(1, "turn/start")])
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Batch ID reused with different content"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("Batch ID reused with different content"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -731,7 +743,12 @@ mod tests {
             .unwrap();
         // The batch itself is contiguous from 0, but the committed prefix already advanced.
         let err = log
-            .commit(&writer, "b2", 0, &[event(1, "run/start"), event(2, "run/end")])
+            .commit(
+                &writer,
+                "b2",
+                0,
+                &[event(1, "run/start"), event(2, "run/end")],
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Stale committed prefix"), "{err}");
@@ -741,7 +758,10 @@ mod tests {
             .commit(&writer, "b3", 1, &[event(3, "run/end")])
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Non-contiguous event batch"), "{err}");
+        assert!(
+            err.to_string().contains("Non-contiguous event batch"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

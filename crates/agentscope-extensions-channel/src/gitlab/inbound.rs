@@ -48,7 +48,11 @@ impl GitLabInboundMapper {
         if !attrs.is_object() {
             return None;
         }
-        if attrs.get("system").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if attrs
+            .get("system")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return None;
         }
         let noteable_type = attrs.get("noteable_type").and_then(|v| v.as_str())?;
@@ -87,9 +91,12 @@ impl GitLabInboundMapper {
             .name(username.clone())
             .text_content(note)
             .build();
-        let mut builder =
-            InboundMessage::builder(self.channel_id.clone(), Peer::new(PeerKind::Thread, peer_id), vec![msg])
-                .sender_id(username);
+        let mut builder = InboundMessage::builder(
+            self.channel_id.clone(),
+            Peer::new(PeerKind::Thread, peer_id),
+            vec![msg],
+        )
+        .sender_id(username);
         if let Some(namespace) = namespace {
             builder = builder.account_id(namespace);
         }

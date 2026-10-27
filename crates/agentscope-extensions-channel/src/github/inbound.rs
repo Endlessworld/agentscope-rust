@@ -60,9 +60,9 @@ impl GitHubInboundMapper {
 
         let number = match event_type {
             "issue_comment" => payload.pointer("/issue/number").and_then(|v| v.as_i64()),
-            "pull_request_review_comment" => {
-                payload.pointer("/pull_request/number").and_then(|v| v.as_i64())
-            }
+            "pull_request_review_comment" => payload
+                .pointer("/pull_request/number")
+                .and_then(|v| v.as_i64()),
             _ => return None,
         }
         .filter(|n| *n > 0)?;
@@ -82,9 +82,12 @@ impl GitHubInboundMapper {
             .name(author_login.clone())
             .text_content(body)
             .build();
-        let mut builder =
-            InboundMessage::builder(self.channel_id.clone(), Peer::new(PeerKind::Thread, peer_id), vec![msg])
-                .sender_id(author_login);
+        let mut builder = InboundMessage::builder(
+            self.channel_id.clone(),
+            Peer::new(PeerKind::Thread, peer_id),
+            vec![msg],
+        )
+        .sender_id(author_login);
         if let Some(owner) = owner_login {
             builder = builder.account_id(owner);
         }
@@ -115,7 +118,10 @@ mod tests {
         assert_eq!(inbound.account_id.as_deref(), Some("octo"));
         assert_eq!(inbound.sender_id.as_deref(), Some("alice"));
         assert_eq!(inbound.messages[0].text_content(), "please fix");
-        assert_eq!(GitHubInboundMapper::extract_comment_id(&issue_comment()), Some(555));
+        assert_eq!(
+            GitHubInboundMapper::extract_comment_id(&issue_comment()),
+            Some(555)
+        );
         assert_eq!(
             GitHubInboundMapper::extract_commenter_id(&issue_comment()),
             Some(42)

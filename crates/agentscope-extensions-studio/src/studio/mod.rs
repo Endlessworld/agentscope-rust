@@ -65,11 +65,7 @@ impl StudioManager {
 
     /// Gets the Studio configuration, or `None` if not initialized.
     pub fn config() -> Option<StudioConfig> {
-        slot()
-            .read()
-            .ok()?
-            .as_ref()
-            .map(|i| i.config.clone())
+        slot().read().ok()?.as_ref().map(|i| i.config.clone())
     }
 
     /// Whether Studio integration is initialized.
@@ -108,7 +104,10 @@ impl StudioManager {
         transport: Arc<dyn StudioTransport>,
     ) -> StudioResult<()> {
         let client = Arc::new(StudioClient::new(config.clone()));
-        let ws_client = Arc::new(StudioWebSocketClient::with_transport(config.clone(), transport));
+        let ws_client = Arc::new(StudioWebSocketClient::with_transport(
+            config.clone(),
+            transport,
+        ));
 
         // Register the run and (best-effort) connect the socket.
         client.register_run().await?;
@@ -116,9 +115,7 @@ impl StudioManager {
             tracing::warn!(error = %err, "studio websocket connect failed (continuing)");
         }
 
-        let mut guard = slot()
-            .write()
-            .map_err(|_| StudioError::NotInitialized)?;
+        let mut guard = slot().write().map_err(|_| StudioError::NotInitialized)?;
         *guard = Some(Installed {
             config,
             client,

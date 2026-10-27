@@ -4,7 +4,9 @@ use crate::dialect::abstract_dialect::{
     AbstractJdbcDialect, DialectKind, TableNameConfigurable, TableNames,
 };
 use crate::dialect::bound_sql::{BoundSql, SqlParam};
-use crate::dialect::{SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect};
+use crate::dialect::{
+    SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect, StoreDialect,
+};
 
 /// SQLite dialect: `ON CONFLICT DO UPDATE`, `BLOB` snapshots, portable table lock.
 #[derive(Debug, Clone, Default)]
@@ -100,13 +102,7 @@ impl SessionStateDialect for SqliteDialect {
         )
     }
 
-    fn session_state_upsert(
-        &self,
-        slot_id: &str,
-        key: &str,
-        index: i32,
-        json: &str,
-    ) -> BoundSql {
+    fn session_state_upsert(&self, slot_id: &str, key: &str, index: i32, json: &str) -> BoundSql {
         BoundSql::new(
             format!(
                 "INSERT INTO {} (session_id, state_key, item_index, state_data, version) \

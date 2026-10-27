@@ -30,7 +30,11 @@ async fn plan_mode_manager_enter_write_exit() {
     assert!(mgr.is_plan_active(&state));
 
     let written = mgr
-        .write_plan(&RuntimeContext::default(), &mut state, "# Plan\n1. do things")
+        .write_plan(
+            &RuntimeContext::default(),
+            &mut state,
+            "# Plan\n1. do things",
+        )
         .await
         .unwrap();
     assert_eq!(written, "plans/PLAN.md");
@@ -60,10 +64,7 @@ fn plan_mode_manager_custom_plan_dir_normalized() {
 #[test]
 fn skill_runtime_renders_catalog_with_filter() {
     let rt = SkillRuntime::new();
-    let cat = SkillCatalog::of(vec![
-        harness_entry("data"),
-        harness_entry("secret"),
-    ]);
+    let cat = SkillCatalog::of(vec![harness_entry("data"), harness_entry("secret")]);
     let out = rt.render_prompt(&cat, &SkillFilter::only(&["data"]));
     assert!(out.contains("data_workspace"));
     assert!(!out.contains("secret_workspace"));
@@ -85,17 +86,22 @@ fn skill_prompt_code_execution_only_when_files_root_present() {
 fn shell_path_policy_resolves_sandbox_roots() {
     let p = ShellPathPolicy::sandbox();
     let roots = p
-        .resolve("data", Some(&agentscope_harness::StageResult::WorkspaceNative))
+        .resolve(
+            "data",
+            Some(&agentscope_harness::StageResult::WorkspaceNative),
+        )
         .unwrap();
     assert_eq!(roots, "/workspace/skills/data");
 }
 
 fn harness_entry(name: &str) -> agentscope_harness::HarnessSkillEntry {
-    agentscope_harness::HarnessSkillEntry::new(AgentSkill::builder()
-        .name(name)
-        .source("workspace")
-        .description(format!("desc {name}"))
-        .build())
+    agentscope_harness::HarnessSkillEntry::new(
+        AgentSkill::builder()
+            .name(name)
+            .source("workspace")
+            .description(format!("desc {name}"))
+            .build(),
+    )
 }
 
 fn harness_entry_with_root(name: &str, root: &str) -> agentscope_harness::HarnessSkillEntry {

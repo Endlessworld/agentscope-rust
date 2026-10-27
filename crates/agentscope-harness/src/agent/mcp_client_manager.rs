@@ -7,13 +7,12 @@ use agentscope_core::error::{Error, Result};
 use rust_mcp_sdk::error::SdkResult;
 use rust_mcp_sdk::mcp_client::{client_runtime, ClientHandler, McpClientOptions};
 use rust_mcp_sdk::schema::{
-    ClientCapabilities, Implementation, InitializeRequestParams,
-    LATEST_PROTOCOL_VERSION,
+    ClientCapabilities, Implementation, InitializeRequestParams, LATEST_PROTOCOL_VERSION,
 };
 use rust_mcp_sdk::{McpClient, StdioTransport, ToMcpClientHandler, TransportOptions};
 use rust_mcp_transport::{
-    ClientSseTransport, ClientSseTransportOptions, ClientStreamableTransport,
-    RequestOptions, StreamableTransportOptions,
+    ClientSseTransport, ClientSseTransportOptions, ClientStreamableTransport, RequestOptions,
+    StreamableTransportOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -289,10 +288,7 @@ impl McpClientManager {
                 })
                 .collect::<Vec<_>>(),
             Err(e) => {
-                tracing::warn!(
-                    "Failed to list tools for MCP client '{}': {}",
-                    client_id, e
-                );
+                tracing::warn!("Failed to list tools for MCP client '{}': {}", client_id, e);
                 Vec::new()
             }
         };
@@ -476,12 +472,9 @@ impl McpClientManager {
         arguments: serde_json::Value,
         meta: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<serde_json::Value> {
-        let client_id = self
-            .find_client_id_by_server(server)
-            .await
-            .ok_or_else(|| {
-                Error::Other(format!("No connected MCP client for server '{server}'"))
-            })?;
+        let client_id = self.find_client_id_by_server(server).await.ok_or_else(|| {
+            Error::Other(format!("No connected MCP client for server '{server}'"))
+        })?;
         self.call_tool_with_meta(&client_id, tool_name, arguments, meta)
             .await
     }
@@ -555,11 +548,14 @@ mod tests {
 
     #[test]
     fn config_builder_sets_url_and_headers() {
-        let cfg = McpServerConfig::new("s").url("http://x/sse").headers(vec![
-            ("Authorization".into(), "Bearer t".into()),
-        ]);
+        let cfg = McpServerConfig::new("s")
+            .url("http://x/sse")
+            .headers(vec![("Authorization".into(), "Bearer t".into())]);
         assert_eq!(cfg.url.as_deref(), Some("http://x/sse"));
         assert_eq!(cfg.headers.len(), 1);
-        assert_eq!(cfg.headers[0], ("Authorization".to_string(), "Bearer t".to_string()));
+        assert_eq!(
+            cfg.headers[0],
+            ("Authorization".to_string(), "Bearer t".to_string())
+        );
     }
 }

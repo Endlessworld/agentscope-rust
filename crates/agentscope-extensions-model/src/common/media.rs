@@ -50,7 +50,10 @@ impl MediaResolver for DefaultMediaResolver {
                 } else {
                     b.media_type.clone()
                 };
-                Ok(ResolvedMedia { base64: b.data.clone(), mime_type })
+                Ok(ResolvedMedia {
+                    base64: b.data.clone(),
+                    mime_type,
+                })
             }
             Source::Url(u) => {
                 if is_local_file(&u.url) {
@@ -95,7 +98,10 @@ pub fn ensure_media_resolver(resolver: Arc<dyn MediaResolver>) {
 
 /// The active resolver, or [`DefaultMediaResolver`] when none was registered.
 pub fn media_resolver() -> Arc<dyn MediaResolver> {
-    RESOLVER.get().cloned().unwrap_or_else(|| Arc::new(DefaultMediaResolver))
+    RESOLVER
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(DefaultMediaResolver))
 }
 
 /// Resolves `source` through the active resolver.
@@ -120,6 +126,8 @@ mod tests {
     fn default_resolver_rejects_remote_url() {
         let source = Source::Url(URLSource::new("https://example.com/a.png"));
         let err = DefaultMediaResolver.resolve(&source, "test").unwrap_err();
-        assert!(err.to_string().contains("requires a registered MediaResolver"));
+        assert!(err
+            .to_string()
+            .contains("requires a registered MediaResolver"));
     }
 }

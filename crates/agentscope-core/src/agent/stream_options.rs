@@ -26,10 +26,12 @@ impl EventCategory {
     /// Maps a fine-grained event to its coarse category.
     pub fn of(event: &AgentEvent) -> EventCategory {
         match event.event_type() {
-            AgentEventType::AgentStart
-            | AgentEventType::AgentEnd
-            | AgentEventType::AgentResult => EventCategory::Agent,
-            AgentEventType::ModelCallStart | AgentEventType::ModelCallEnd => EventCategory::ModelCall,
+            AgentEventType::AgentStart | AgentEventType::AgentEnd | AgentEventType::AgentResult => {
+                EventCategory::Agent
+            }
+            AgentEventType::ModelCallStart | AgentEventType::ModelCallEnd => {
+                EventCategory::ModelCall
+            }
             AgentEventType::TextBlockStart
             | AgentEventType::TextBlockDelta
             | AgentEventType::TextBlockEnd => EventCategory::Text,
@@ -54,9 +56,9 @@ impl EventCategory {
             | AgentEventType::ExternalExecutionResult
             | AgentEventType::RequestStop => EventCategory::Interrupt,
             AgentEventType::SubagentExposed => EventCategory::Subagent,
-            AgentEventType::HintBlock
-            | AgentEventType::Custom
-            | AgentEventType::AllToolsDenied => EventCategory::Custom,
+            AgentEventType::HintBlock | AgentEventType::Custom | AgentEventType::AllToolsDenied => {
+                EventCategory::Custom
+            }
         }
     }
 }
@@ -113,14 +115,13 @@ impl StreamOptions {
     /// Whether this event should be emitted given the configured options.
     pub fn should_stream(&self, event: &AgentEvent) -> bool {
         let cat = EventCategory::of(event);
-        if !(self.event_types.contains(&EventCategory::All)
-            || self.event_types.contains(&cat))
-        {
+        if !(self.event_types.contains(&EventCategory::All) || self.event_types.contains(&cat)) {
             return false;
         }
         match event.event_type() {
-            AgentEventType::ThinkingBlockStart
-            | AgentEventType::ThinkingBlockDelta => self.include_reasoning_chunk,
+            AgentEventType::ThinkingBlockStart | AgentEventType::ThinkingBlockDelta => {
+                self.include_reasoning_chunk
+            }
             AgentEventType::ThinkingBlockEnd => self.include_reasoning_result,
             AgentEventType::ToolResultStart
             | AgentEventType::ToolProgress
@@ -179,11 +180,19 @@ impl StreamOptionsBuilder {
         StreamOptions {
             event_types: self.event_types.unwrap_or(d.event_types),
             incremental: self.incremental.unwrap_or(d.incremental),
-            include_reasoning_chunk: self.include_reasoning_chunk.unwrap_or(d.include_reasoning_chunk),
-            include_reasoning_result: self.include_reasoning_result.unwrap_or(d.include_reasoning_result),
+            include_reasoning_chunk: self
+                .include_reasoning_chunk
+                .unwrap_or(d.include_reasoning_chunk),
+            include_reasoning_result: self
+                .include_reasoning_result
+                .unwrap_or(d.include_reasoning_result),
             include_acting_chunk: self.include_acting_chunk.unwrap_or(d.include_acting_chunk),
-            include_summary_chunk: self.include_summary_chunk.unwrap_or(d.include_summary_chunk),
-            include_summary_result: self.include_summary_result.unwrap_or(d.include_summary_result),
+            include_summary_chunk: self
+                .include_summary_chunk
+                .unwrap_or(d.include_summary_chunk),
+            include_summary_result: self
+                .include_summary_result
+                .unwrap_or(d.include_summary_result),
         }
     }
 }

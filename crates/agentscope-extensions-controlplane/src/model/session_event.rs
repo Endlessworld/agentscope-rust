@@ -73,7 +73,10 @@ pub struct SessionEvent {
 
 impl SessionEvent {
     /// Starts building an event for `session_id` / `event_type`.
-    pub fn builder(session_id: impl Into<String>, event_type: impl Into<String>) -> SessionEventBuilder {
+    pub fn builder(
+        session_id: impl Into<String>,
+        event_type: impl Into<String>,
+    ) -> SessionEventBuilder {
         SessionEventBuilder {
             event: SessionEvent {
                 session_id: session_id.into(),

@@ -29,7 +29,10 @@ impl DashScopeModelProvider {
 
     /// Strips an optional `dashscope:` prefix from a model id.
     pub fn strip_prefix(model: &str) -> &str {
-        model.trim().strip_prefix("dashscope:").unwrap_or(model.trim())
+        model
+            .trim()
+            .strip_prefix("dashscope:")
+            .unwrap_or(model.trim())
     }
 }
 
@@ -93,12 +96,13 @@ impl ModelProvider for DashScopeModelProvider {
             crate::dashscope::converter::DEFAULT_BASE_URL,
         );
 
-        let model = DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
-            .with_default_options(ctx.options.clone())
-            .with_stream(ctx.stream.unwrap_or(true))
-            .with_endpoint_type(endpoint_type)
-            .with_enable_thinking(ctx.enable_thinking)
-            .with_context_window_size(context_window_size);
+        let model =
+            DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
+                .with_default_options(ctx.options.clone())
+                .with_stream(ctx.stream.unwrap_or(true))
+                .with_endpoint_type(endpoint_type)
+                .with_enable_thinking(ctx.enable_thinking)
+                .with_context_window_size(context_window_size);
         Ok(Arc::new(model))
     }
 }
@@ -150,10 +154,9 @@ mod tests {
     fn endpoint_type_option_is_applied() {
         let provider = DashScopeModelProvider::new();
         let mut options = agentscope_core::GenerateOptions::default();
-        options.additional_body_params.insert(
-            "endpointType".to_string(),
-            serde_json::json!("MULTIMODAL"),
-        );
+        options
+            .additional_body_params
+            .insert("endpointType".to_string(), serde_json::json!("MULTIMODAL"));
         let ctx = ModelCreationContext::new("dashscope", "qwen-plus")
             .api_key("sk")
             .options(options);

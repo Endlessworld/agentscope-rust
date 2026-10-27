@@ -8,9 +8,7 @@
 use std::sync::Arc;
 
 use agentscope_core::state::AgentStateStore;
-use agentscope_extensions_oss::{
-    InMemoryOssClient, OssAgentStateStore, OssClient, OssListPage,
-};
+use agentscope_extensions_oss::{InMemoryOssClient, OssAgentStateStore, OssClient, OssListPage};
 
 fn page_keys(page: &OssListPage) -> Vec<String> {
     page.objects.iter().map(|o| o.key.clone()).collect()
@@ -176,10 +174,7 @@ async fn state_store_session_delete_spans_pages() {
     store.delete(Some("alice"), "s1").await;
 
     assert!(!store.exists(Some("alice"), "s1").await);
-    assert!(client
-        .list_all("test/state/alice/s1/")
-        .unwrap()
-        .is_empty());
+    assert!(client.list_all("test/state/alice/s1/").unwrap().is_empty());
     assert_eq!(
         client.list_all("test/state/alice/s2/").unwrap(),
         vec!["test/state/alice/s2/a.json"]

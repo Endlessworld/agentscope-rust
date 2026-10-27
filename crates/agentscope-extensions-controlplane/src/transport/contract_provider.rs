@@ -87,12 +87,18 @@ pub trait ContractProvider: Send + Sync {
 
     /// `GET /agentscope/sessions/{id}/subagent-tasks` (capability `subagent-task-query`).
     async fn subagent_tasks(&self, _session_id: &str) -> ControlPlaneResult<Value> {
-        Err(ControlPlaneError::Unsupported("subagent-task-query".to_string()))
+        Err(ControlPlaneError::Unsupported(
+            "subagent-task-query".to_string(),
+        ))
     }
 
     /// `DELETE /agentscope/sessions/{id}/subagent-tasks/{taskId}` (capability
     /// `subagent-task-command`).
-    async fn cancel_subagent_task(&self, _session_id: &str, _task_id: &str) -> ControlPlaneResult<()> {
+    async fn cancel_subagent_task(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+    ) -> ControlPlaneResult<()> {
         Err(ControlPlaneError::Unsupported(
             "subagent-task-command".to_string(),
         ))
@@ -129,7 +135,9 @@ pub trait ContractProvider: Send + Sync {
 
     /// `GET /agentscope/sessions/{id}/export-transcript` (capability `export-transcript`).
     async fn export_transcript(&self, _session_id: &str) -> ControlPlaneResult<Value> {
-        Err(ControlPlaneError::Unsupported("export-transcript".to_string()))
+        Err(ControlPlaneError::Unsupported(
+            "export-transcript".to_string(),
+        ))
     }
 }
 

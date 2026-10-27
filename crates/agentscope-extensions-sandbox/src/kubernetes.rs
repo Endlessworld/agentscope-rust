@@ -17,9 +17,7 @@ use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::join_url;
-use crate::remote::{
-    RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle,
-};
+use crate::remote::{RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle};
 use crate::retry::{with_retries, RetryPolicy};
 
 /// CRD group for `SandboxClaim`.
@@ -94,11 +92,7 @@ impl Default for KubernetesSandboxClientOptions {
 }
 
 /// Builds the `SandboxClaim` CRD body for a deterministic claim name.
-pub fn build_claim_body(
-    namespace: &str,
-    claim_name: &str,
-    warm_pool_name: &str,
-) -> Value {
+pub fn build_claim_body(namespace: &str, claim_name: &str, warm_pool_name: &str) -> Value {
     json!({
         "apiVersion": format!("{CLAIM_API_GROUP}/{CLAIM_API_VERSION}"),
         "kind": "SandboxClaim",
@@ -183,7 +177,10 @@ pub fn parse_claim_status(value: &Value) -> KubernetesClaimStatus {
     if let Some(conditions) = status.get("conditions").and_then(Value::as_array) {
         for condition in conditions {
             let ctype = condition.get("type").and_then(Value::as_str).unwrap_or("");
-            let cstatus = condition.get("status").and_then(Value::as_str).unwrap_or("");
+            let cstatus = condition
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if ctype.eq_ignore_ascii_case("ready") && cstatus.eq_ignore_ascii_case("true") {
                 ready = true;
             }
@@ -196,7 +193,12 @@ pub fn parse_claim_status(value: &Value) -> KubernetesClaimStatus {
             }
         }
     }
-    KubernetesClaimStatus { sandbox_name, pod_ips, ready, reason }
+    KubernetesClaimStatus {
+        sandbox_name,
+        pod_ips,
+        ready,
+        reason,
+    }
 }
 
 /// Resolves the sandbox server base URL from a pod IP (direct strategy) or the gateway.
@@ -237,12 +239,20 @@ impl KubernetesBackend {
     /// Builds a backend, wiring up the reqwest client and retry policy.
     pub fn new(options: KubernetesSandboxClientOptions) -> SandboxResult<Self> {
         let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(options.connect_timeout_seconds))
+            .connect_timeout(std::time::Duration::from_secs(
+                options.connect_timeout_seconds,
+            ))
             .timeout(std::time::Duration::from_secs(options.read_timeout_seconds))
             .build()
-            .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
+            .map_err(|e| {
+                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
+            })?;
         let retry = RetryPolicy::kubernetes(options.max_retries);
-        Ok(Self { options, client, retry })
+        Ok(Self {
+            options,
+            client,
+            retry,
+        })
     }
 
     /// Returns the configured options.
@@ -354,7 +364,11 @@ impl KubernetesBackend {
         }
     }
 
-    fn handle_from_status(&self, claim: &str, status: &KubernetesClaimStatus) -> RemoteSandboxHandle {
+    fn handle_from_status(
+        &self,
+        claim: &str,
+        status: &KubernetesClaimStatus,
+    ) -> RemoteSandboxHandle {
         let mut extra = BTreeMap::new();
         extra.insert("claim_name".to_string(), claim.to_string());
         extra.insert("namespace".to_string(), self.options.namespace.clone());
@@ -397,7 +411,8 @@ impl RemoteBackend for KubernetesBackend {
         let claim_name = format!("agentscope-{session_id}");
         let collection = self.claims_collection_path();
         let body = build_claim_body(&self.options.namespace, &claim_name, &warm_pool);
-        self.k8s_request(reqwest::Method::POST, &collection, Some(body)).await?;
+        self.k8s_request(reqwest::Method::POST, &collection, Some(body))
+            .await?;
         let status = self.wait_until_ready(&claim_name).await?;
         Ok(self.handle_from_status(&claim_name, &status))
     }
@@ -411,10 +426,7 @@ impl RemoteBackend for KubernetesBackend {
 
     async fn kill_sandbox(&self, sandbox_id: &str) -> SandboxResult<()> {
         let path = self.claim_path(sandbox_id);
-        match self
-            .k8s_request(reqwest::Method::DELETE, &path, None)
-            .await
-        {
+        match self.k8s_request(reqwest::Method::DELETE, &path, None).await {
             Ok(_) => Ok(()),
             Err(SandboxExtensionError::Http { status: 404, .. }) => Ok(()),
             Err(err) => Err(err),
@@ -469,7 +481,9 @@ pub type KubernetesSandboxClient = RemoteSandboxClient;
 pub fn kubernetes_client(
     options: KubernetesSandboxClientOptions,
 ) -> SandboxResult<KubernetesSandboxClient> {
-    Ok(RemoteSandboxClient::new(Arc::new(KubernetesBackend::new(options)?)))
+    Ok(RemoteSandboxClient::new(Arc::new(KubernetesBackend::new(
+        options,
+    )?)))
 }
 
 #[cfg(test)]
@@ -483,7 +497,10 @@ mod tests {
         assert_eq!(body["kind"], "SandboxClaim");
         assert_eq!(body["metadata"]["name"], "agentscope-s1");
         assert_eq!(body["metadata"]["namespace"], "ns");
-        assert_eq!(body["metadata"]["labels"][CREATED_BY_LABEL], CREATED_BY_VALUE);
+        assert_eq!(
+            body["metadata"]["labels"][CREATED_BY_LABEL],
+            CREATED_BY_VALUE
+        );
         assert_eq!(body["spec"]["warmPoolRef"]["name"], "pool-a");
     }
 

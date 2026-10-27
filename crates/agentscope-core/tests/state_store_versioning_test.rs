@@ -16,7 +16,9 @@ async fn in_memory_supports_versioning_and_tracks_versions() {
     assert_eq!(absent.version, 0);
 
     assert_eq!(
-        store.save_if_version(Some("u"), "s", "k", json!(1), 0).await,
+        store
+            .save_if_version(Some("u"), "s", "k", json!(1), 0)
+            .await,
         1
     );
     let loaded = store.get_versioned(Some("u"), "s", "k").await;

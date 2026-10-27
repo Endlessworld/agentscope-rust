@@ -55,7 +55,9 @@ pub fn resolve_zone(zone_id: Option<&str>) -> Result<FixedOffset, ScheduleZoneEr
         None => return Ok(utc()),
         Some(raw) => raw,
     };
-    parse_zone_id(raw).ok_or_else(|| ScheduleZoneError { zone_id: raw.to_string() })
+    parse_zone_id(raw).ok_or_else(|| ScheduleZoneError {
+        zone_id: raw.to_string(),
+    })
 }
 
 fn utc() -> FixedOffset {
@@ -109,12 +111,17 @@ mod tests {
 
     #[test]
     fn absent_zone_defaults_to_utc() {
-        assert_eq!(resolve_zone(None).unwrap(), FixedOffset::east_opt(0).unwrap());
+        assert_eq!(
+            resolve_zone(None).unwrap(),
+            FixedOffset::east_opt(0).unwrap()
+        );
     }
 
     #[test]
     fn resolves_utc_aliases() {
-        for id in ["UTC", "utc", "Z", "UT", "GMT", "Etc/UTC", "Etc/GMT", "+00:00", "UTC+0"] {
+        for id in [
+            "UTC", "utc", "Z", "UT", "GMT", "Etc/UTC", "Etc/GMT", "+00:00", "UTC+0",
+        ] {
             assert_eq!(
                 resolve_zone(Some(id)).unwrap(),
                 FixedOffset::east_opt(0).unwrap(),
@@ -126,7 +133,14 @@ mod tests {
     #[test]
     fn resolves_iana_aliases_and_fixed_offsets() {
         let eight = 8 * 3600;
-        for id in ["+08:00", "+0800", "UTC+8", "GMT+08:00", "Asia/Shanghai", "asia/shanghai"] {
+        for id in [
+            "+08:00",
+            "+0800",
+            "UTC+8",
+            "GMT+08:00",
+            "Asia/Shanghai",
+            "asia/shanghai",
+        ] {
             assert_eq!(
                 resolve_zone(Some(id)).unwrap(),
                 FixedOffset::east_opt(eight).unwrap(),
@@ -145,10 +159,22 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_dst_zones() {
-        for id in ["", "   ", "Mars/Olympus", "Europe/London", "America/New_York", "+19:00", "+08:99", "8"] {
+        for id in [
+            "",
+            "   ",
+            "Mars/Olympus",
+            "Europe/London",
+            "America/New_York",
+            "+19:00",
+            "+08:99",
+            "8",
+        ] {
             let err = resolve_zone(Some(id)).unwrap_err();
             assert_eq!(err.zone_id, id);
-            assert!(err.to_string().contains("unsupported time zone id"), "err was {err}");
+            assert!(
+                err.to_string().contains("unsupported time zone id"),
+                "err was {err}"
+            );
         }
     }
 }

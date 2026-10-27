@@ -10,13 +10,13 @@
 //! pending until the plan-mode bridge lands.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::team::{
-    TeamClient, TeamContext, TeamError, TeamMemberSpec, TeamRole, TeamResult,
+    TeamClient, TeamContext, TeamError, TeamMemberSpec, TeamResult, TeamRole,
 };
 
 /// Unified team coordination tool.
@@ -98,8 +98,15 @@ impl TeamTool {
                             .collect()
                     })
                     .unwrap_or_default();
-                let t = self.client.create_task(team_id, subject, description, blocked_by)?;
-                Ok(format!("Created task `{}` [{}] {}", t.id, t.status.as_str(), t.subject))
+                let t = self
+                    .client
+                    .create_task(team_id, subject, description, blocked_by)?;
+                Ok(format!(
+                    "Created task `{}` [{}] {}",
+                    t.id,
+                    t.status.as_str(),
+                    t.subject
+                ))
             }
             "assign_task" => {
                 ctx.allows_or_err(op)?;
@@ -109,7 +116,10 @@ impl TeamTool {
                 let t = self
                     .client
                     .assign_task(team_id, task_id, assignee, version)?;
-                Ok(format!("Assigned `{}` to {} (v{})", t.id, assignee, t.version))
+                Ok(format!(
+                    "Assigned `{}` to {} (v{})",
+                    t.id, assignee, t.version
+                ))
             }
             "claim_task" => {
                 let task_id = Self::require(args, "task_id")?;
@@ -145,8 +155,9 @@ impl TeamTool {
             "spawn_member" => {
                 ctx.allows_or_err(op)?;
                 let name = Self::require(args, "name")?;
-                let m =
-                    self.client.spawn_member(team_id, TeamMemberSpec::new(name, TeamRole::Member))?;
+                let m = self
+                    .client
+                    .spawn_member(team_id, TeamMemberSpec::new(name, TeamRole::Member))?;
                 Ok(format!("Member `{}` spawned", m.name))
             }
             "shutdown_member" => {
@@ -221,4 +232,3 @@ impl Tool for TeamTool {
         }
     }
 }
-

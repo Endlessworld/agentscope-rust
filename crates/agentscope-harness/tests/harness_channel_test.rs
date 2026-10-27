@@ -1,13 +1,13 @@
 //! Integration tests for the gateway channel routing and Chat UI adapter.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::Msg;
 use agentscope_harness::{
     ChannelManager, ChannelSink, ChatUiChannel, GatewayAgent, GatewayTurnContext, HarnessGateway,
     InboundMessage, OutboundAddress, SendOptions,
 };
+use async_trait::async_trait;
 
 /// Echo agent: replies with a fixed assistant message, counting input messages.
 struct EchoAgent;
@@ -30,7 +30,10 @@ fn send_options_session_key_resolution() {
     assert_eq!(SendOptions::user_id("u1").effective_session_key(), "u1");
     assert_eq!(SendOptions::of("u1", "s1").effective_session_key(), "s1");
     assert_eq!(
-        SendOptions::user_id("u1").with_agent_id("support").agent_id.as_deref(),
+        SendOptions::user_id("u1")
+            .with_agent_id("support")
+            .agent_id
+            .as_deref(),
         Some("support")
     );
 }
@@ -85,8 +88,8 @@ async fn chatui_dispatch_via_channel_trait() {
     use agentscope_harness::Peer;
     let gw = gateway_with_echo().await;
     let chat = ChatUiChannel::with_gateway(gw);
-    let inbound = InboundMessage::builder("chatui", Peer::direct("u_5"), vec![Msg::user("hey")])
-        .build();
+    let inbound =
+        InboundMessage::builder("chatui", Peer::direct("u_5"), vec![Msg::user("hey")]).build();
     let reply = chat.dispatch(inbound).await.unwrap();
     assert!(reply.text_content().contains("echo 1 messages"));
 }

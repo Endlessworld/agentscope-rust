@@ -11,18 +11,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
-use futures::StreamExt;
 use agentscope_core::middleware::{Middleware, Next, ReasoningInput};
 use agentscope_core::tool::Tool;
+use futures::StreamExt;
 
-use crate::agent::subagent::{
-    load_from_directory, load_from_filesystem, DefaultAgentManager, SubagentDeclaration,
-    SubagentEntry, SubagentFactory, SUBAGENTS_DIR,
-};
 use crate::agent::middleware::{
     build_task_summary, prepend_to_system_message, render_subagent_section,
 };
 use crate::agent::subagent::task::TaskRepository;
+use crate::agent::subagent::{
+    load_from_directory, load_from_filesystem, DefaultAgentManager, SubagentDeclaration,
+    SubagentEntry, SubagentFactory, SUBAGENTS_DIR,
+};
 use crate::filesystem::Filesystem;
 use crate::tool::TaskTool;
 

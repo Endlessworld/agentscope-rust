@@ -25,9 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant};
 
-use crate::client::{
-    FindFilter, FindOneAndUpdateOptions, MongoClient, MongoError, Update,
-};
+use crate::client::{FindFilter, FindOneAndUpdateOptions, MongoClient, MongoError, Update};
 use crate::constants::{DEFAULT_DATABASE, SANDBOX_LOCKS_COLLECTION};
 use crate::index_utils::{create_index_with_migration, IndexSpec};
 
@@ -101,10 +99,7 @@ impl MongodbSandboxExecutionGuard {
     ///
     /// Polls until acquired or `lock_timeout` elapses. Mirrors Java
     /// `MongoSandboxExecutionGuard.tryEnter`.
-    pub async fn try_enter(
-        &self,
-        key: &SandboxIsolationKey,
-    ) -> Result<MongodbLeaseHandle> {
+    pub async fn try_enter(&self, key: &SandboxIsolationKey) -> Result<MongodbLeaseHandle> {
         let lock_id = compose_lock_id(key);
         let deadline = Instant::now() + self.lock_timeout;
         loop {
@@ -131,8 +126,8 @@ impl MongodbSandboxExecutionGuard {
             }
 
             // Step 2: reclaim only if expired.
-            let filter = FindFilter::eq(FIELD_LOCK_ID, json!(lock_id))
-                .lte(FIELD_EXPIRES_AT, json!(now));
+            let filter =
+                FindFilter::eq(FIELD_LOCK_ID, json!(lock_id)).lte(FIELD_EXPIRES_AT, json!(now));
             let update = Update::new()
                 .set(FIELD_OWNER, json!(self.owner))
                 .set(FIELD_TOKEN, json!(token))
@@ -143,7 +138,10 @@ impl MongodbSandboxExecutionGuard {
                     &self.collection_key,
                     &filter,
                     &update,
-                    &FindOneAndUpdateOptions { upsert: false, return_after: true },
+                    &FindOneAndUpdateOptions {
+                        upsert: false,
+                        return_after: true,
+                    },
                 )
                 .await
             {
@@ -165,15 +163,8 @@ impl MongodbSandboxExecutionGuard {
         }
     }
 
-    fn spawn_lease(
-        &self,
-        lock_id: String,
-        token: String,
-        expires_at: i64,
-    ) -> MongodbLeaseHandle {
-        let interval = Duration::from_millis(
-            (self.lease_ttl.as_millis() as u64 / 3).max(1),
-        );
+    fn spawn_lease(&self, lock_id: String, token: String, expires_at: i64) -> MongodbLeaseHandle {
+        let interval = Duration::from_millis((self.lease_ttl.as_millis() as u64 / 3).max(1));
         let client = self.client.clone();
         let collection_key = self.collection_key.clone();
         let lease_ttl_ms = self.lease_ttl.as_millis() as i64;
@@ -289,11 +280,7 @@ impl Drop for MongodbLeaseHandle {
 
 /// Hash of an isolation key → lock document id.
 pub fn compose_lock_id(key: &SandboxIsolationKey) -> String {
-    let raw = format!(
-        "{}:{}",
-        key.scope.to_lowercase(),
-        key.value
-    );
+    let raw = format!("{}:{}", key.scope.to_lowercase(), key.value);
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     let digest = hasher.finalize();
@@ -396,7 +383,9 @@ fn default_owner() -> String {
 #[derive(Clone)]
 pub struct MongodbGuardClient {
     inner: Arc<MongodbSandboxExecutionGuard>,
-    leases: Arc<std::sync::Mutex<std::collections::HashMap<SandboxIsolationKey, Vec<MongodbLeaseHandle>>>>,
+    leases: Arc<
+        std::sync::Mutex<std::collections::HashMap<SandboxIsolationKey, Vec<MongodbLeaseHandle>>>,
+    >,
 }
 
 impl std::fmt::Debug for MongodbGuardClient {
@@ -420,7 +409,8 @@ impl MongodbGuardClient {
     pub fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
         let guard = self.inner.clone();
         let acquire_key = key.clone();
-        let handle = futures::executor::block_on(async move { guard.try_enter(&acquire_key).await });
+        let handle =
+            futures::executor::block_on(async move { guard.try_enter(&acquire_key).await });
         match handle {
             Ok(lease) => {
                 if let Ok(mut leases) = self.leases.lock() {
@@ -458,7 +448,10 @@ impl MongodbGuardClient {
 
     /// Returns the number of active leases (test helper).
     pub fn active_count(&self) -> usize {
-        self.leases.lock().map(|g| g.values().map(|v| v.len()).sum()).unwrap_or(0)
+        self.leases
+            .lock()
+            .map(|g| g.values().map(|v| v.len()).sum())
+            .unwrap_or(0)
     }
 }
 
@@ -490,9 +483,15 @@ mod tests {
         let g = guard();
         let key = SandboxIsolationKey::new("user", "u1");
         let mut lease = g.try_enter(&key).await.unwrap();
-        assert!(g.lock_held(&lease.lock_id().to_string(), chrono::Utc::now().timestamp_millis()));
+        assert!(g.lock_held(
+            &lease.lock_id().to_string(),
+            chrono::Utc::now().timestamp_millis()
+        ));
         lease.release();
-        assert!(!g.lock_held(&lease.lock_id().to_string(), chrono::Utc::now().timestamp_millis()));
+        assert!(!g.lock_held(
+            &lease.lock_id().to_string(),
+            chrono::Utc::now().timestamp_millis()
+        ));
     }
 
     #[tokio::test]
@@ -586,7 +585,12 @@ mod tests {
             .unwrap();
         lease.release();
         // The lock document must survive because the token no longer matches.
-        assert!(g.client.find_one(g.collection_key(), &filter).await.unwrap().is_some());
+        assert!(g
+            .client
+            .find_one(g.collection_key(), &filter)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

@@ -33,7 +33,10 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
             Some(c) => t.first() == Some(c) && helper(&p[1..], &t[1..]),
         }
     }
-    helper(&pattern.chars().collect::<Vec<char>>(), &text.chars().collect::<Vec<char>>())
+    helper(
+        &pattern.chars().collect::<Vec<char>>(),
+        &text.chars().collect::<Vec<char>>(),
+    )
 }
 
 fn as_string(bytes: &[u8]) -> Option<String> {
@@ -88,7 +91,9 @@ impl MemoryRedisData {
     }
 
     fn int_of(&self, key: &str) -> i64 {
-        self.string_of(key).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0)
+        self.string_of(key)
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
     }
 
     fn int_of_hash(&self, key: &str, field: &str) -> i64 {
@@ -107,7 +112,9 @@ impl MemoryRedisData {
 /// `KEYS = [payload, version, session-keys]`, `ARGV = [json, expected, stateKey]`.
 fn run_save_script(data: &mut MemoryRedisData, keys: &[String], args: &[String]) -> Result<i64> {
     if keys.len() != 3 || args.len() != 3 {
-        return Err(Error::Other("bad SAVE_SCRIPT arity (memory double)".to_string()));
+        return Err(Error::Other(
+            "bad SAVE_SCRIPT arity (memory double)".to_string(),
+        ));
     }
     let expected: i64 = args[1]
         .trim()
@@ -118,8 +125,10 @@ fn run_save_script(data: &mut MemoryRedisData, keys: &[String], args: &[String])
         return Ok(-1);
     }
     let new_version = current + 1;
-    data.strings.insert(keys[0].clone(), args[0].as_bytes().to_vec());
-    data.strings.insert(keys[1].clone(), new_version.to_string().into_bytes());
+    data.strings
+        .insert(keys[0].clone(), args[0].as_bytes().to_vec());
+    data.strings
+        .insert(keys[1].clone(), new_version.to_string().into_bytes());
     Ok(new_version)
 }
 
@@ -184,13 +193,17 @@ impl MemoryRedisAdapter {
 
     /// Seeds a raw string value (simulates legacy / externally written data).
     pub fn seed_string(&self, key: &str, value: &str) {
-        self.data_guard().strings.insert(key.to_string(), value.as_bytes().to_vec());
+        self.data_guard()
+            .strings
+            .insert(key.to_string(), value.as_bytes().to_vec());
     }
 
     /// Seeds a list value directly (simulates pre-existing `:list` data).
     pub fn seed_list(&self, key: &str, items: &[&str]) {
-        self.lists_guard()
-            .insert(key.to_string(), items.iter().map(|s| s.to_string()).collect());
+        self.lists_guard().insert(
+            key.to_string(),
+            items.iter().map(|s| s.to_string()).collect(),
+        );
     }
 
     /// Members of a simulated set key, sorted.
@@ -232,7 +245,9 @@ impl MemoryRedisAdapter {
 #[async_trait::async_trait]
 impl RedisClientAdapter for MemoryRedisAdapter {
     async fn set(&self, key: &str, value: &str) -> Result<()> {
-        self.data_guard().strings.insert(key.to_string(), value.as_bytes().to_vec());
+        self.data_guard()
+            .strings
+            .insert(key.to_string(), value.as_bytes().to_vec());
         Ok(())
     }
 
@@ -242,7 +257,10 @@ impl RedisClientAdapter for MemoryRedisAdapter {
 
     async fn right_push_list(&self, key: &str, value: &str) -> Result<()> {
         self.data_guard().adapter_push_calls += 1;
-        self.lists_guard().entry(key.to_string()).or_default().push(value.to_string());
+        self.lists_guard()
+            .entry(key.to_string())
+            .or_default()
+            .push(value.to_string());
         Ok(())
     }
 
@@ -256,7 +274,11 @@ impl RedisClientAdapter for MemoryRedisAdapter {
             return Ok(Vec::new());
         }
         let len = list.len() as i64;
-        let start = if start < 0 { (len + start).max(0) } else { start.min(len) };
+        let start = if start < 0 {
+            (len + start).max(0)
+        } else {
+            start.min(len)
+        };
         let end = if end < 0 { len + end } else { end.min(len - 1) };
         if end < start {
             return Ok(Vec::new());
@@ -265,7 +287,11 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn get_list_length(&self, key: &str) -> Result<i64> {
-        Ok(self.lists_guard().get(key).map(|l| l.len() as i64).unwrap_or(0))
+        Ok(self
+            .lists_guard()
+            .get(key)
+            .map(|l| l.len() as i64)
+            .unwrap_or(0))
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
@@ -282,7 +308,10 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn add_to_set(&self, key: &str, member: &str) -> Result<()> {
-        self.sets_guard().entry(key.to_string()).or_default().insert(member.to_string());
+        self.sets_guard()
+            .entry(key.to_string())
+            .or_default()
+            .insert(member.to_string());
         Ok(())
     }
 
@@ -297,7 +326,11 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn get_set_size(&self, key: &str) -> Result<i64> {
-        Ok(self.sets_guard().get(key).map(|s| s.len() as i64).unwrap_or(0))
+        Ok(self
+            .sets_guard()
+            .get(key)
+            .map(|s| s.len() as i64)
+            .unwrap_or(0))
     }
 
     async fn key_exists(&self, key: &str) -> Result<bool> {
@@ -309,8 +342,11 @@ impl RedisClientAdapter for MemoryRedisAdapter {
 
     /// `SCAN`-equivalent: match every existing key against the glob, deduplicated.
     async fn find_keys_by_pattern(&self, pattern: &str) -> Result<Vec<String>> {
-        let mut out: Vec<String> =
-            self.all_keys().into_iter().filter(|k| glob_match(pattern, k)).collect();
+        let mut out: Vec<String> = self
+            .all_keys()
+            .into_iter()
+            .filter(|k| glob_match(pattern, k))
+            .collect();
         out.sort();
         out.dedup();
         Ok(out)
@@ -323,7 +359,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
         args: &[String],
     ) -> Result<Option<i64>> {
         if script != crate::state::version_support::SAVE_SCRIPT {
-            return Err(Error::Other("unsupported Lua script (memory double)".to_string()));
+            return Err(Error::Other(
+                "unsupported Lua script (memory double)".to_string(),
+            ));
         }
         let mut data = self.data_guard();
         data.adapter_eval_calls += 1;
@@ -426,8 +464,10 @@ impl RedisCommands for MemoryRedisCommands {
         if data.strings.contains_key(key) {
             return Ok(false);
         }
-        data.strings.insert(key.to_string(), value.as_bytes().to_vec());
-        data.expirations.insert(key.to_string(), (ttl_ms / 1000) as i64);
+        data.strings
+            .insert(key.to_string(), value.as_bytes().to_vec());
+        data.expirations
+            .insert(key.to_string(), (ttl_ms / 1000) as i64);
         Ok(true)
     }
 
@@ -438,7 +478,9 @@ impl RedisCommands for MemoryRedisCommands {
             return Err(Error::Other("injected EVAL failure".to_string()));
         }
         if script != crate::sandbox::RELEASE_SCRIPT {
-            return Err(Error::Other("unsupported Lua script (memory double)".to_string()));
+            return Err(Error::Other(
+                "unsupported Lua script (memory double)".to_string(),
+            ));
         }
         let owned = data.string_of(key).map(|v| v == arg).unwrap_or(false);
         if owned {
@@ -452,7 +494,11 @@ impl RedisCommands for MemoryRedisCommands {
 
     async fn del(&self, key: &str) -> Result<i64> {
         let mut data = self.guard();
-        Ok(if data.strings.remove(key).is_some() { 1 } else { 0 })
+        Ok(if data.strings.remove(key).is_some() {
+            1
+        } else {
+            0
+        })
     }
 }
 
@@ -470,12 +516,18 @@ pub(crate) struct MemoryStoreCommands {
 
 impl MemoryStoreCommands {
     pub fn new() -> Self {
-        Self { data: Mutex::new(MemoryRedisData::default()), reachable: true }
+        Self {
+            data: Mutex::new(MemoryRedisData::default()),
+            reachable: true,
+        }
     }
 
     /// A store whose Redis endpoint is unreachable: every command errors.
     pub fn unreachable() -> Self {
-        Self { data: Mutex::new(MemoryRedisData::default()), reachable: false }
+        Self {
+            data: Mutex::new(MemoryRedisData::default()),
+            reachable: false,
+        }
     }
 
     fn guard(&self) -> MutexGuard<'_, MemoryRedisData> {
@@ -486,7 +538,9 @@ impl MemoryStoreCommands {
         if self.reachable {
             Ok(())
         } else {
-            Err(Error::Other("REDIS_UNREACHABLE (memory double)".to_string()))
+            Err(Error::Other(
+                "REDIS_UNREACHABLE (memory double)".to_string(),
+            ))
         }
     }
 
@@ -512,12 +566,20 @@ impl MemoryStoreCommands {
 
     /// Seeds a raw string key (used to simulate external writes).
     pub fn seed_string(&self, key: &str, value: &str) {
-        self.guard().strings.insert(key.to_string(), value.as_bytes().to_vec());
+        self.guard()
+            .strings
+            .insert(key.to_string(), value.as_bytes().to_vec());
     }
 
     /// Simulates an externally written index entry that has no backing item hash.
     pub fn seed_index(&self, index_key: &str, member: &str) {
-        push_unique(self.guard().indexes.entry(index_key.to_string()).or_default(), member);
+        push_unique(
+            self.guard()
+                .indexes
+                .entry(index_key.to_string())
+                .or_default(),
+            member,
+        );
     }
 
     /// Simulates an externally written item (bypassing the store API).
@@ -574,7 +636,9 @@ impl StoreCommands for MemoryStoreCommands {
             }
             return Ok(Value::Int(1));
         }
-        Err(Error::Other("unsupported script (memory double)".to_string()))
+        Err(Error::Other(
+            "unsupported script (memory double)".to_string(),
+        ))
     }
 
     fn zrangebylex(&self, key: &str, offset: usize, limit: usize) -> Result<Vec<String>> {

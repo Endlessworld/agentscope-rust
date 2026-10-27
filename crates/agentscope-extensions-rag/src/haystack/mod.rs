@@ -30,7 +30,5 @@ pub use config::{
 };
 pub use converter::HayStackDocumentConverter;
 pub use knowledge::{HayStackKnowledge, HayStackKnowledgeBuilder};
-pub use model::{
-    ByteStream, HayStackDocument, HayStackRequest, HayStackResponse, SparseEmbedding,
-};
+pub use model::{ByteStream, HayStackDocument, HayStackRequest, HayStackResponse, SparseEmbedding};
 pub use request::build_retrieve_request_body;

@@ -147,8 +147,14 @@ impl CollaborationClient {
 
     /// `GET /api/v1/issues/{id}` (`issue.get`).
     pub async fn issue(&self, issue_id: &str, token: &str) -> ControlPlaneResult<Value> {
-        self.send(Method::GET, &format!("/api/v1/issues/{}", seg(issue_id)), None, token, "issue.get")
-            .await
+        self.send(
+            Method::GET,
+            &format!("/api/v1/issues/{}", seg(issue_id)),
+            None,
+            token,
+            "issue.get",
+        )
+        .await
     }
 
     /// `GET /api/v1/issues/{id}/comments` (`issue.comment.list`).
@@ -189,14 +195,26 @@ impl CollaborationClient {
 
     /// `GET /api/v1/teams/{id}` (`team.get`).
     pub async fn team(&self, team_id: &str, token: &str) -> ControlPlaneResult<Value> {
-        self.send(Method::GET, &format!("/api/v1/teams/{}", seg(team_id)), None, token, "team.get")
-            .await
+        self.send(
+            Method::GET,
+            &format!("/api/v1/teams/{}", seg(team_id)),
+            None,
+            token,
+            "team.get",
+        )
+        .await
     }
 
     /// `POST /api/v1/approvals` (`approval.request`).
     pub async fn request_approval(&self, token: &str, request: Value) -> ControlPlaneResult<Value> {
-        self.send(Method::POST, "/api/v1/approvals", Some(request), token, "approval.request")
-            .await
+        self.send(
+            Method::POST,
+            "/api/v1/approvals",
+            Some(request),
+            token,
+            "approval.request",
+        )
+        .await
     }
 
     /// Requests a fenced runtime tool decision and waits for it, mirroring
@@ -230,7 +248,11 @@ impl CollaborationClient {
     /// Lists the canonical task-scoped collaboration tools (`tools/list`).
     pub async fn tools(&self, task_id: &str, token: &str) -> ControlPlaneResult<Value> {
         let response = self
-            .mcp(token, "tools/list", serde_json::json!({ "taskId": task_id }))
+            .mcp(
+                token,
+                "tools/list",
+                serde_json::json!({ "taskId": task_id }),
+            )
             .await?;
         Ok(response.get("tools").cloned().unwrap_or(Value::Null))
     }
@@ -303,12 +325,24 @@ impl CollaborationClient {
         expected_version: i64,
     ) -> ControlPlaneResult<Value> {
         let body = serde_json::json!({ "expectedVersion": expected_version });
-        self.task_send(Method::POST, task_id, "start", token, Some(body), "task.start")
-            .await
+        self.task_send(
+            Method::POST,
+            task_id,
+            "start",
+            token,
+            Some(body),
+            "task.start",
+        )
+        .await
     }
 
     /// `POST /api/v1/agent-tasks/{id}/progress` (`task.progress`).
-    pub async fn progress(&self, task_id: &str, token: &str, content: &str) -> ControlPlaneResult<Value> {
+    pub async fn progress(
+        &self,
+        task_id: &str,
+        token: &str,
+        content: &str,
+    ) -> ControlPlaneResult<Value> {
         let body = serde_json::json!({ "content": content });
         self.task_send(
             Method::POST,
@@ -322,7 +356,12 @@ impl CollaborationClient {
     }
 
     /// `POST /api/v1/agent-tasks/{id}/respond` (`task.respond`).
-    pub async fn respond(&self, task_id: &str, token: &str, content: &str) -> ControlPlaneResult<Value> {
+    pub async fn respond(
+        &self,
+        task_id: &str,
+        token: &str,
+        content: &str,
+    ) -> ControlPlaneResult<Value> {
         let body = serde_json::json!({ "content": content, "type": "result" });
         self.task_send(
             Method::POST,
@@ -373,8 +412,15 @@ impl CollaborationClient {
             "processedInputIds": processed_input_ids,
             "deferredInputIds": deferred_input_ids,
         });
-        self.task_send(Method::POST, task_id, "complete", token, Some(body), "task.complete")
-            .await
+        self.task_send(
+            Method::POST,
+            task_id,
+            "complete",
+            token,
+            Some(body),
+            "task.complete",
+        )
+        .await
     }
 
     /// `POST /api/v1/agent-tasks/{id}/complete` carrying an explicit business outcome.
@@ -400,8 +446,15 @@ impl CollaborationClient {
             "processedInputIds": processed_input_ids,
             "deferredInputIds": deferred_input_ids,
         });
-        self.task_send(Method::POST, task_id, "complete", token, Some(body), "task.complete")
-            .await
+        self.task_send(
+            Method::POST,
+            task_id,
+            "complete",
+            token,
+            Some(body),
+            "task.complete",
+        )
+        .await
     }
 
     /// `POST /api/v1/agent-tasks/{id}/fail` (`task.fail`).
@@ -418,8 +471,15 @@ impl CollaborationClient {
             "code": if code.is_empty() { "agent_failed" } else { code },
             "message": message,
         });
-        self.task_send(Method::POST, task_id, "fail", token, Some(body), "task.fail")
-            .await
+        self.task_send(
+            Method::POST,
+            task_id,
+            "fail",
+            token,
+            Some(body),
+            "task.fail",
+        )
+        .await
     }
 
     /// `GET /api/v1/agent-tasks/{id}/run` (`run.get`).
@@ -474,8 +534,15 @@ impl CollaborationClient {
 
     /// `GET /api/v1/agent-tasks/{id}/run/artifacts` (`run.artifacts`).
     pub async fn run_artifacts(&self, task_id: &str, token: &str) -> ControlPlaneResult<Value> {
-        self.task_send(Method::GET, task_id, "run/artifacts", token, None, "run.artifacts")
-            .await
+        self.task_send(
+            Method::GET,
+            task_id,
+            "run/artifacts",
+            token,
+            None,
+            "run.artifacts",
+        )
+        .await
     }
 
     /// Sends a task-scoped request.
@@ -704,7 +771,9 @@ mod tests {
     async fn runtime_approval_surfaces_deny_message() {
         let source = FakeApprovalSource::new(
             serde_json::json!({ "approval": { "id": "appr-2" } }),
-            vec![serde_json::json!({ "decisionVersion": 1, "allow": false, "denyMessage": "nope" })],
+            vec![
+                serde_json::json!({ "decisionVersion": 1, "allow": false, "denyMessage": "nope" }),
+            ],
         );
         let decision = await_runtime_tool_approval(
             &source,

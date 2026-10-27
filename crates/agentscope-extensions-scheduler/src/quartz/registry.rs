@@ -22,7 +22,9 @@ pub struct SchedulerRegistry {
 
 impl SchedulerRegistry {
     fn new() -> Self {
-        Self { inner: RwLock::new(HashMap::new()) }
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Registers (or replaces) the entry for `id`.
@@ -30,7 +32,10 @@ impl SchedulerRegistry {
         let id = id.into();
         self.inner.write().unwrap().insert(
             id.clone(),
-            RegistryEntry { id, scheduler_type: scheduler_type.into() },
+            RegistryEntry {
+                id,
+                scheduler_type: scheduler_type.into(),
+            },
         );
     }
 

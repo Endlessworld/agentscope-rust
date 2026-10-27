@@ -5,12 +5,15 @@ use agentscope_core::message::JsonMap;
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
 use agentscope_harness::filesystem::LocalFilesystem;
-use agentscope_harness::{AgentGenerateTool, load_from_directory};
+use agentscope_harness::{load_from_directory, AgentGenerateTool};
 
 fn tool_args(pairs: &[(&str, &str)]) -> JsonMap {
     let mut m = JsonMap::new();
     for (k, v) in pairs {
-        m.insert((*k).to_string(), serde_json::Value::String((*v).to_string()));
+        m.insert(
+            (*k).to_string(),
+            serde_json::Value::String((*v).to_string()),
+        );
     }
     m
 }

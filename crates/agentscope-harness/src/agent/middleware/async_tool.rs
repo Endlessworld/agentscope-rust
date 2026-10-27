@@ -114,7 +114,12 @@ impl AsyncToolMiddlewareBuilder {
 }
 
 impl Middleware for AsyncToolMiddleware {
-    fn on_acting(&self, ctx: &RuntimeContext, input: ActingInput, next: Next<ActingInput>) -> EventStream {
+    fn on_acting(
+        &self,
+        ctx: &RuntimeContext,
+        input: ActingInput,
+        next: Next<ActingInput>,
+    ) -> EventStream {
         let Some(session_id) = ctx.session_id().map(str::to_string) else {
             return next(input);
         };
@@ -176,7 +181,11 @@ impl Middleware for AsyncToolMiddleware {
             // If offloaded, deliver the final result to the inbox + wakeup.
             if offloaded_bg.load(Ordering::SeqCst) {
                 let result = result_bg.lock().unwrap().clone();
-                let result_str = if result.is_empty() { "(no output)".to_string() } else { result };
+                let result_str = if result.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    result
+                };
 
                 if let Some(registry) = &async_registry_bg {
                     for tc in &tool_calls_bg {

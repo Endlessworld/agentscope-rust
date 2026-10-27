@@ -70,9 +70,6 @@ mod tests {
     #[test]
     fn signature_is_order_independent_of_argument_order() {
         let v = WeComSignatureVerifier::new("tok").unwrap();
-        assert_eq!(
-            v.sign("b", "a", "ENC"),
-            v.sign("a", "b", "ENC")
-        );
+        assert_eq!(v.sign("b", "a", "ENC"), v.sign("a", "b", "ENC"));
     }
 }

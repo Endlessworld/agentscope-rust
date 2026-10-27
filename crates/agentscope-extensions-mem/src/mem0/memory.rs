@@ -101,7 +101,9 @@ impl Mem0LongTermMemory {
 
     /// Builds the add request used by [`Self::record`].
     pub fn build_add_request(&self, messages: Vec<Mem0Message>) -> Mem0AddRequest {
-        let mut request = Mem0AddRequest::new().with_messages(messages).with_infer(true);
+        let mut request = Mem0AddRequest::new()
+            .with_messages(messages)
+            .with_infer(true);
         if let Some(agent_id) = &self.config.agent_id {
             request = request.with_agent_id(agent_id.clone());
         }
@@ -132,9 +134,12 @@ impl Mem0LongTermMemory {
         if let Some(run_id) = &self.config.run_id {
             request = request.with_run_id(run_id.clone());
         }
-        if let Some(Value::Object(metadata)) = self.config.metadata.as_ref().map(|
-            m| serde_json::to_value(m).unwrap_or(Value::Null)
-        ) {
+        if let Some(Value::Object(metadata)) = self
+            .config
+            .metadata
+            .as_ref()
+            .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+        {
             for (key, value) in metadata {
                 request.filters.insert(key, value);
             }
@@ -164,7 +169,10 @@ impl Mem0LongTermMemory {
         if query.is_empty() {
             return Ok(String::new());
         }
-        let response = self.client.search(&self.build_search_request(query)).await?;
+        let response = self
+            .client
+            .search(&self.build_search_request(query))
+            .await?;
         Ok(match response.results {
             Some(results) => join_search_results(&results),
             None => String::new(),
@@ -193,7 +201,10 @@ impl Mem0LongTermMemory {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let response = self.client.search(&self.build_search_request(query)).await?;
+        let response = self
+            .client
+            .search(&self.build_search_request(query))
+            .await?;
         Ok(response
             .results
             .unwrap_or_default()
@@ -221,8 +232,7 @@ mod tests {
     fn adapter(config: Mem0LongTermMemoryConfig) -> (MockTransport, Mem0LongTermMemory) {
         let transport = MockTransport::new();
         let transport_for_client: Arc<MockTransport> = Arc::new(transport.clone());
-        let adapter =
-            Mem0LongTermMemory::new(client(transport_for_client), config).unwrap();
+        let adapter = Mem0LongTermMemory::new(client(transport_for_client), config).unwrap();
         (transport, adapter)
     }
 
@@ -236,7 +246,11 @@ mod tests {
 
     #[test]
     fn convert_message_preserves_name() {
-        let msg = Msg::builder().role(MsgRole::User).name("alice").text_content("hi").build();
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .name("alice")
+            .text_content("hi")
+            .build();
         let converted = convert_to_mem0_message(&msg);
         assert_eq!(converted.role, "user");
         assert_eq!(converted.content, "hi");
@@ -260,9 +274,15 @@ mod tests {
     #[test]
     fn join_search_results_filters_none_and_joins() {
         let results = vec![
-            Mem0SearchResult { memory: Some("a".into()), ..Default::default() },
+            Mem0SearchResult {
+                memory: Some("a".into()),
+                ..Default::default()
+            },
             Mem0SearchResult::default(),
-            Mem0SearchResult { memory: Some("b".into()), ..Default::default() },
+            Mem0SearchResult {
+                memory: Some("b".into()),
+                ..Default::default()
+            },
         ];
         assert_eq!(join_search_results(&results), "a\nb");
         assert_eq!(join_search_results(&[]), "");
@@ -305,7 +325,10 @@ mod tests {
             ..Default::default()
         });
         adapter.record(&[]).await.unwrap();
-        adapter.record(&[Msg::user(format!("{COMPRESSED_HISTORY_MARKER}"))]).await.unwrap();
+        adapter
+            .record(&[Msg::user(format!("{COMPRESSED_HISTORY_MARKER}"))])
+            .await
+            .unwrap();
         assert!(mock.requests().is_empty());
     }
 
@@ -332,7 +355,11 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(adapter.retrieve(&Msg::user("")).await.unwrap(), "");
-        assert!(adapter.retrieve_msgs(&Msg::user("")).await.unwrap().is_empty());
+        assert!(adapter
+            .retrieve_msgs(&Msg::user(""))
+            .await
+            .unwrap()
+            .is_empty());
         assert!(mock.requests().is_empty());
     }
 

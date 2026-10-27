@@ -6,13 +6,11 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
+use async_trait::async_trait;
 
-use crate::agent::gateway::harness_gateway::{
-    ChannelSink, HarnessGateway, OutboundAddress,
-};
+use crate::agent::gateway::harness_gateway::{ChannelSink, HarnessGateway, OutboundAddress};
 use crate::agent::gateway::msg_context::MsgContext;
 
 use super::channel::Channel;
@@ -41,7 +39,11 @@ impl OutboundEnvelope {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        Self { address, messages, timestamp_ms }
+        Self {
+            address,
+            messages,
+            timestamp_ms,
+        }
     }
 }
 
@@ -56,12 +58,20 @@ pub struct SendOptions {
 impl SendOptions {
     /// One session per user — the most common case.
     pub fn user_id(user_id: impl Into<String>) -> Self {
-        Self { user_id: user_id.into(), session_id: None, agent_id: None }
+        Self {
+            user_id: user_id.into(),
+            session_id: None,
+            agent_id: None,
+        }
     }
 
     /// Explicit user + session — multiple conversations for the same user.
     pub fn of(user_id: impl Into<String>, session_id: impl Into<String>) -> Self {
-        Self { user_id: user_id.into(), session_id: Some(session_id.into()), agent_id: None }
+        Self {
+            user_id: user_id.into(),
+            session_id: Some(session_id.into()),
+            agent_id: None,
+        }
     }
 
     /// Returns a copy with the given agent id override.
@@ -91,7 +101,12 @@ pub struct ChatUiRequest {
 impl ChatUiRequest {
     /// Single user-text message in single-session mode (no peer).
     pub fn of(text: impl Into<String>) -> Self {
-        Self { peer_id: None, agent_id: None, subagent_id: None, messages: vec![Msg::user(text)] }
+        Self {
+            peer_id: None,
+            agent_id: None,
+            subagent_id: None,
+            messages: vec![Msg::user(text)],
+        }
     }
 
     /// Single user-text message associated with a specific peer id.
@@ -105,7 +120,11 @@ impl ChatUiRequest {
     }
 
     /// Single user-text message targeted at a specific agent.
-    pub fn for_agent(peer_id: impl Into<String>, agent_id: impl Into<String>, text: impl Into<String>) -> Self {
+    pub fn for_agent(
+        peer_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
         Self {
             peer_id: Some(peer_id.into()),
             agent_id: Some(agent_id.into()),
@@ -126,12 +145,22 @@ impl ChatUiRequest {
 
     /// Multi-message request without a peer (single-session mode).
     pub fn of_messages(messages: Vec<Msg>) -> Self {
-        Self { peer_id: None, agent_id: None, subagent_id: None, messages }
+        Self {
+            peer_id: None,
+            agent_id: None,
+            subagent_id: None,
+            messages,
+        }
     }
 
     /// Multi-message request for a specific peer.
     pub fn with_peer_messages(peer_id: impl Into<String>, messages: Vec<Msg>) -> Self {
-        Self { peer_id: Some(peer_id.into()), agent_id: None, subagent_id: None, messages }
+        Self {
+            peer_id: Some(peer_id.into()),
+            agent_id: None,
+            subagent_id: None,
+            messages,
+        }
     }
 }
 
@@ -161,7 +190,9 @@ impl ChatUiChannel {
 
     /// Creates a per-peer Chat UI channel. Each distinct peer id gets its own session.
     pub fn per_peer() -> Self {
-        let cfg = ChannelConfig::builder(CHANNEL_ID).dm_scope(DmScope::PerPeer).build();
+        let cfg = ChannelConfig::builder(CHANNEL_ID)
+            .dm_scope(DmScope::PerPeer)
+            .build();
         Self::with_config(cfg)
     }
 
@@ -203,32 +234,56 @@ impl ChatUiChannel {
     }
 
     /// Sends a plain-text message from a specific peer.
-    pub async fn send_peer(&self, peer_id: impl Into<String>, text: impl Into<String>) -> Result<Msg> {
-        self.send_request(ChatUiRequest::with_peer(peer_id, text)).await
+    pub async fn send_peer(
+        &self,
+        peer_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<Msg> {
+        self.send_request(ChatUiRequest::with_peer(peer_id, text))
+            .await
     }
 
     /// Sends a plain-text message with explicit routing identity.
-    pub async fn send_with_options(&self, options: &SendOptions, text: impl Into<String>) -> Result<Msg> {
+    pub async fn send_with_options(
+        &self,
+        options: &SendOptions,
+        text: impl Into<String>,
+    ) -> Result<Msg> {
         let msg = Msg::user(text);
         self.dispatch_with_options(options, vec![msg]).await
     }
 
     /// Sends a message directly to an exposed subagent, bypassing normal routing.
-    pub async fn send_to_subagent(&self, subagent_id: impl Into<String>, text: impl Into<String>) -> Result<Msg> {
+    pub async fn send_to_subagent(
+        &self,
+        subagent_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<Msg> {
         let msg = Msg::user(text);
-        self.resolve_gateway().await?.run_subagent(&subagent_id.into(), vec![msg]).await
+        self.resolve_gateway()
+            .await?
+            .run_subagent(&subagent_id.into(), vec![msg])
+            .await
     }
 
     /// Sends a structured `ChatUiRequest` and returns the agent reply.
     pub async fn send_request(&self, request: ChatUiRequest) -> Result<Msg> {
         if let Some(subagent_id) = &request.subagent_id {
-            return self.resolve_gateway().await?.run_subagent(subagent_id, request.messages).await;
+            return self
+                .resolve_gateway()
+                .await?
+                .run_subagent(subagent_id, request.messages)
+                .await;
         }
         let inbound = self.build_inbound(&request);
         self.dispatch(inbound).await
     }
 
-    async fn dispatch_with_options(&self, options: &SendOptions, messages: Vec<Msg>) -> Result<Msg> {
+    async fn dispatch_with_options(
+        &self,
+        options: &SendOptions,
+        messages: Vec<Msg>,
+    ) -> Result<Msg> {
         let config = self.config.read().unwrap().clone();
         let ctx = self.build_context_from_options(options, &config);
         let outbound = self.build_outbound_from_options(options);
@@ -238,9 +293,16 @@ impl ChatUiChannel {
             .await
     }
 
-    fn build_context_from_options(&self, options: &SendOptions, config: &ChannelConfig) -> MsgContext {
+    fn build_context_from_options(
+        &self,
+        options: &SendOptions,
+        config: &ChannelConfig,
+    ) -> MsgContext {
         let room = options.effective_session_key();
-        let agent_id = options.agent_id.clone().or_else(|| config.default_agent_id.clone());
+        let agent_id = options
+            .agent_id
+            .clone()
+            .or_else(|| config.default_agent_id.clone());
         let mut extra = std::collections::BTreeMap::new();
         if let Some(a) = &agent_id {
             extra.insert("agentId".to_string(), a.clone());
@@ -258,12 +320,23 @@ impl ChatUiChannel {
     }
 
     fn build_outbound_from_options(&self, options: &SendOptions) -> OutboundAddress {
-        OutboundAddress::direct(CHANNEL_ID, format!("{}:{}", CHANNEL_ID, options.effective_session_key()))
+        OutboundAddress::direct(
+            CHANNEL_ID,
+            format!("{}:{}", CHANNEL_ID, options.effective_session_key()),
+        )
     }
 
     fn build_inbound(&self, request: &ChatUiRequest) -> InboundMessage {
-        let peer_id = request.peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let agent_id = request.agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let peer_id = request
+            .peer_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let agent_id = request
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let messages = request.messages.clone();
         match peer_id {
             Some(pid) if agent_id.is_some() => {
@@ -310,7 +383,12 @@ impl Channel for ChatUiChannel {
         let route = self.router.resolve_route(&config, &message);
         let gateway = self.resolve_gateway().await?;
         gateway
-            .run_with_outbound(Some(route.context), message.messages, Some(route.outbound_address), None)
+            .run_with_outbound(
+                Some(route.context),
+                message.messages,
+                Some(route.outbound_address),
+                None,
+            )
             .await
     }
 

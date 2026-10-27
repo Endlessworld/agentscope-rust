@@ -47,13 +47,25 @@ pub struct McpServerRegistrationResult {
 
 impl McpServerRegistrationResult {
     pub fn success(server_name: impl Into<String>) -> Self {
-        Self { server_name: server_name.into(), status: McpServerRegistrationStatus::Success, error: None }
+        Self {
+            server_name: server_name.into(),
+            status: McpServerRegistrationStatus::Success,
+            error: None,
+        }
     }
     pub fn failed(server_name: impl Into<String>, error: impl Into<String>) -> Self {
-        Self { server_name: server_name.into(), status: McpServerRegistrationStatus::Failed, error: Some(error.into()) }
+        Self {
+            server_name: server_name.into(),
+            status: McpServerRegistrationStatus::Failed,
+            error: Some(error.into()),
+        }
     }
     pub fn skipped(server_name: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self { server_name: server_name.into(), status: McpServerRegistrationStatus::Skipped, error: Some(reason.into()) }
+        Self {
+            server_name: server_name.into(),
+            status: McpServerRegistrationStatus::Skipped,
+            error: Some(reason.into()),
+        }
     }
 }
 
@@ -71,8 +83,13 @@ pub struct McpServerRegistrar {
 
 impl McpServerRegistrar {
     /// Creates a new registrar with the given client manager.
-    pub fn new(client_manager: std::sync::Arc<super::mcp_client_manager::McpClientManager>) -> Self {
-        Self { client_manager, listener: None }
+    pub fn new(
+        client_manager: std::sync::Arc<super::mcp_client_manager::McpClientManager>,
+    ) -> Self {
+        Self {
+            client_manager,
+            listener: None,
+        }
     }
 
     /// Installs a listener that receives each registration's terminal result.
@@ -123,7 +140,11 @@ impl Registrar for McpServerRegistrar {
         tokio::spawn(async move {
             match client_manager.create_client(config.clone()).await {
                 Ok(client_id) => {
-                    tracing::info!("Created MCP client '{}' for server '{}'", client_id, config.name);
+                    tracing::info!(
+                        "Created MCP client '{}' for server '{}'",
+                        client_id,
+                        config.name
+                    );
                     match client_manager.connect(&client_id).await {
                         Ok(()) => {
                             if let Some(l) = &listener {
@@ -144,7 +165,11 @@ impl Registrar for McpServerRegistrar {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to create MCP client for server '{}': {}", config.name, e);
+                    tracing::error!(
+                        "Failed to create MCP client for server '{}': {}",
+                        config.name,
+                        e
+                    );
                     if let Some(l) = &listener {
                         l.on_registration_result(McpServerRegistrationResult::failed(
                             config.name.clone(),
@@ -158,7 +183,6 @@ impl Registrar for McpServerRegistrar {
         Ok(())
     }
 }
-
 
 /// Per-registration metadata-propagation options, mirroring Java
 /// `Toolkit.ToolRegistration#propagateMeta`.
@@ -267,9 +291,17 @@ pub async fn try_bridge_mcp_tools_to_toolkit(
             let h_tool_name = tool_name.clone();
             let h_manager = std::sync::Arc::clone(&manager);
             let async_handler: Box<
-                dyn Fn(&agentscope_core::tool::McpTool, serde_json::Map<String, serde_json::Value>, Option<serde_json::Map<String, serde_json::Value>>) -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<agentscope_core::message::ToolResultBlock>> + Send>,
-                > + Send
+                dyn Fn(
+                        &agentscope_core::tool::McpTool,
+                        serde_json::Map<String, serde_json::Value>,
+                        Option<serde_json::Map<String, serde_json::Value>>,
+                    ) -> std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<agentscope_core::message::ToolResultBlock>,
+                                > + Send,
+                        >,
+                    > + Send
                     + Sync,
             > = Box::new(move |_tool, args, meta| {
                 let manager = std::sync::Arc::clone(&h_manager);

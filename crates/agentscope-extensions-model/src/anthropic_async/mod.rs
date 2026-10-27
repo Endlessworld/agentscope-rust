@@ -83,11 +83,7 @@ impl AnthropicMessagesModel {
             ctx.model.clone()
         };
         let descriptor = ctx.catalog.clone().or_else(|| {
-            descriptor_for(
-                Some(&ctx.provider_id),
-                &model_name,
-                ctx.base_url.as_deref(),
-            )
+            descriptor_for(Some(&ctx.provider_id), &model_name, ctx.base_url.as_deref())
         });
         Self::build(
             model_name,
@@ -292,10 +288,7 @@ fn build_request(
                     system_parts.push(text);
                 }
             }
-            MsgRole::User => out.push(text_message(
-                MessageRole::User,
-                extract_text_content(&msg),
-            )),
+            MsgRole::User => out.push(text_message(MessageRole::User, extract_text_content(&msg))),
             MsgRole::Assistant => {
                 let mut content: Vec<MessageContent> = Vec::new();
                 let text = extract_text_content(&msg);
@@ -322,13 +315,11 @@ fn build_request(
                 for tr in msg.tool_result_blocks() {
                     out.push(Message {
                         role: MessageRole::User,
-                        content: MessageContentList(vec![MessageContent::ToolResult(
-                            ToolResult {
-                                tool_use_id: tr.id.clone().unwrap_or_default(),
-                                content: Some(convert_tool_result_to_string(&tr.output)),
-                                is_error: false,
-                            },
-                        )]),
+                        content: MessageContentList(vec![MessageContent::ToolResult(ToolResult {
+                            tool_use_id: tr.id.clone().unwrap_or_default(),
+                            content: Some(convert_tool_result_to_string(&tr.output)),
+                            is_error: false,
+                        })]),
                     });
                 }
             }
@@ -376,7 +367,9 @@ fn text_message(role: MessageRole, text: String) -> Message {
     }
 }
 
-fn to_request_tools(tools: Vec<ToolSchema>) -> Option<Vec<serde_json::Map<String, serde_json::Value>>> {
+fn to_request_tools(
+    tools: Vec<ToolSchema>,
+) -> Option<Vec<serde_json::Map<String, serde_json::Value>>> {
     if tools.is_empty() {
         return None;
     }
@@ -443,7 +436,10 @@ struct AnthropicIncrementer {
 }
 
 impl AnthropicIncrementer {
-    fn accumulate(&mut self, event: &MessagesStreamEvent) -> Option<agentscope_core::model::ChatResponse> {
+    fn accumulate(
+        &mut self,
+        event: &MessagesStreamEvent,
+    ) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         match event {
             MessagesStreamEvent::MessageStart { message, usage } => {
@@ -542,7 +538,7 @@ fn parse_arguments(args: &str) -> JsonMap {
 mod tests {
     use super::*;
     use agentscope_core::message::{TextBlock, ToolResultBlock};
-    use async_anthropic::types::{MessageStart, MessageDelta, Usage};
+    use async_anthropic::types::{MessageDelta, MessageStart, Usage};
 
     fn user_msg(text: &str) -> Msg {
         Msg::builder()
@@ -606,7 +602,10 @@ mod tests {
             MessageContent::ToolUse(tu) => {
                 assert_eq!(tu.id, "call_1");
                 assert_eq!(tu.name, "get_weather");
-                assert_eq!(tu.input.get("city").and_then(|v| v.as_str()), Some("Beijing"));
+                assert_eq!(
+                    tu.input.get("city").and_then(|v| v.as_str()),
+                    Some("Beijing")
+                );
             }
             _ => panic!("expected tool use"),
         }
@@ -654,7 +653,10 @@ mod tests {
         );
         let tools = req.tools.expect("expected tools");
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].get("name").and_then(|v| v.as_str()), Some("get_weather"));
+        assert_eq!(
+            tools[0].get("name").and_then(|v| v.as_str()),
+            Some("get_weather")
+        );
         assert!(tools[0].contains_key("input_schema"));
         assert!(!tools[0].contains_key("parameters"));
     }
@@ -698,7 +700,10 @@ mod tests {
             ContentBlock::ToolUse(tu) => {
                 assert_eq!(tu.id, "call_1");
                 assert_eq!(tu.name, "get_weather");
-                assert_eq!(tu.input.get("city").and_then(|v| v.as_str()), Some("Beijing"));
+                assert_eq!(
+                    tu.input.get("city").and_then(|v| v.as_str()),
+                    Some("Beijing")
+                );
             }
             _ => panic!("expected tool use block"),
         }

@@ -11,11 +11,11 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use agentscope_core::state::AgentStateStore;
 use agentscope_core::state::list_hash::{
     compute_hash as core_compute_hash, needs_full_rewrite as core_needs_full_rewrite,
 };
+use agentscope_core::state::AgentStateStore;
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::backend::{JdbcError, JdbcResult, SharedExecutor};
@@ -85,7 +85,10 @@ impl JdbcAgentStateStore {
     }
 
     /// Creates a store with automatic schema creation.
-    pub fn with_schema(executor: SharedExecutor, dialect: Arc<dyn AbstractJdbcDialect>) -> JdbcResult<Self> {
+    pub fn with_schema(
+        executor: SharedExecutor,
+        dialect: Arc<dyn AbstractJdbcDialect>,
+    ) -> JdbcResult<Self> {
         Self::new(executor, dialect, true)
     }
 
@@ -242,9 +245,7 @@ impl JdbcAgentStateStore {
             });
         };
         let mut columns = row.into_iter();
-        let json = columns
-            .next()
-            .and_then(|c| c.as_text().map(str::to_string));
+        let json = columns.next().and_then(|c| c.as_text().map(str::to_string));
         let version = columns.next().and_then(|c| c.as_int()).unwrap_or(0);
         let value = match json {
             Some(j) => Some(
@@ -341,9 +342,9 @@ impl JdbcAgentStateStore {
     }
 
     fn save_single(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<()> {
-        let bound = self
-            .dialect
-            .session_state_upsert(slot_id, key, SINGLE_STATE_INDEX as i32, json);
+        let bound =
+            self.dialect
+                .session_state_upsert(slot_id, key, SINGLE_STATE_INDEX as i32, json);
         self.executor.execute(&bound)?;
         Ok(())
     }
@@ -360,12 +361,7 @@ impl JdbcAgentStateStore {
     /// monotonic (never lower than our own write's version) and always reflects committed
     /// data, so callers can use it as a CAS token — they just cannot assume it identifies
     /// *their* payload.
-    fn upsert_returning_version(
-        &self,
-        slot_id: &str,
-        key: &str,
-        json: &str,
-    ) -> JdbcResult<i64> {
+    fn upsert_returning_version(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<i64> {
         let Some(bound) = self.dialect.session_state_upsert_returning_version(
             slot_id,
             key,
@@ -390,12 +386,7 @@ impl JdbcAgentStateStore {
     }
 
     /// Saves a list using hash-based change detection, mirroring Java semantics.
-    fn save_list_impl(
-        &self,
-        slot_id: &str,
-        key: &str,
-        values: &[Value],
-    ) -> JdbcResult<()> {
+    fn save_list_impl(&self, slot_id: &str, key: &str, values: &[Value]) -> JdbcResult<()> {
         if values.is_empty() {
             return Ok(());
         }
@@ -462,13 +453,21 @@ impl AgentStateStore for JdbcAgentStateStore {
             return;
         }
         let slot = Self::slot_id(user_id, session_id);
-        let Ok(json) = Self::json_of(&value) else { return };
+        let Ok(json) = Self::json_of(&value) else {
+            return;
+        };
         if let Err(e) = self.save_single(&slot, key, &json) {
             tracing::warn!("[jdbc-state] save failed for {key}: {e}");
         }
     }
 
-    async fn save_list(&self, user_id: Option<&str>, session_id: &str, key: &str, values: &[Value]) {
+    async fn save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[Value],
+    ) {
         if Self::validate_session(session_id).is_err() || Self::validate_key(key).is_err() {
             return;
         }

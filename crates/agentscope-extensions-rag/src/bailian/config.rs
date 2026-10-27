@@ -329,7 +329,9 @@ impl BailianConfigBuilder {
 
     /// Appends one search filter entry.
     pub fn add_search_filter(mut self, filter: HashMap<String, String>) -> Self {
-        self.search_filters.get_or_insert_with(Vec::new).push(filter);
+        self.search_filters
+            .get_or_insert_with(Vec::new)
+            .push(filter);
         self
     }
 
@@ -391,7 +393,9 @@ impl BailianConfigBuilder {
             access_key_secret,
             workspace_id,
             index_id: self.index_id,
-            endpoint: self.endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
+            endpoint: self
+                .endpoint
+                .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
             dense_similarity_top_k: self.dense_similarity_top_k,
             sparse_similarity_top_k: self.sparse_similarity_top_k,
             enable_reranking: self.enable_reranking,
@@ -442,7 +446,10 @@ mod tests {
     #[test]
     fn rerank_and_rewrite_defaults_match_java() {
         assert_eq!(RerankConfig::default().model_name, "gte-rerank-hybrid");
-        assert_eq!(RewriteConfig::default().model_name, "conv-rewrite-qwen-1.8b");
+        assert_eq!(
+            RewriteConfig::default().model_name,
+            "conv-rewrite-qwen-1.8b"
+        );
         assert_eq!(RerankConfig::builder().build().unwrap().rerank_top_n, None);
         assert_eq!(
             RewriteConfig::builder().build().unwrap().model_name,
@@ -519,9 +526,18 @@ mod tests {
 
     #[test]
     fn rerank_ranges_are_enforced() {
-        assert!(RerankConfig::builder().rerank_min_score(0.001).build().is_err());
-        assert!(RerankConfig::builder().rerank_min_score(1.5).build().is_err());
-        assert!(RerankConfig::builder().rerank_min_score(0.01).build().is_ok());
+        assert!(RerankConfig::builder()
+            .rerank_min_score(0.001)
+            .build()
+            .is_err());
+        assert!(RerankConfig::builder()
+            .rerank_min_score(1.5)
+            .build()
+            .is_err());
+        assert!(RerankConfig::builder()
+            .rerank_min_score(0.01)
+            .build()
+            .is_ok());
         assert!(RerankConfig::builder().rerank_top_n(0).build().is_err());
         assert!(RerankConfig::builder().rerank_top_n(21).build().is_err());
         assert!(RerankConfig::builder().rerank_top_n(20).build().is_ok());

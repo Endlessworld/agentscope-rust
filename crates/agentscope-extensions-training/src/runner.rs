@@ -202,7 +202,9 @@ impl RunRegistry {
     pub fn allocate_run_id(task_id: &str) -> String {
         assert!(!task_id.is_empty(), "Task ID cannot be null");
         let mut map = run_registry().lock().unwrap();
-        let counter = map.entry(task_id.to_string()).or_insert_with(|| AtomicUsize::new(0));
+        let counter = map
+            .entry(task_id.to_string())
+            .or_insert_with(|| AtomicUsize::new(0));
         let run_id = counter.fetch_add(1, Ordering::SeqCst);
         run_id.to_string()
     }
@@ -288,7 +290,12 @@ impl TaskExecutionRegistry {
 
     /// All known task ids.
     pub fn get_all_task_ids() -> Vec<String> {
-        task_execution_registry().lock().unwrap().keys().cloned().collect()
+        task_execution_registry()
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Number of runs registered for `task_id`.
@@ -526,7 +533,9 @@ impl TrainingConfigBuilder {
             (0.0..=1.0).contains(&sample_rate),
             "sampleRate must be between 0 and 1"
         );
-        self.selection_strategy(Arc::new(crate::strategy::SamplingRateStrategy::of(sample_rate)))
+        self.selection_strategy(Arc::new(crate::strategy::SamplingRateStrategy::of(
+            sample_rate,
+        )))
     }
     pub fn reward_calculator(mut self, calculator: Arc<dyn RewardCalculator>) -> Self {
         self.reward_calculator = Some(calculator);
@@ -568,9 +577,9 @@ impl TrainingConfigBuilder {
         let reward_calculator = self
             .reward_calculator
             .ok_or_else(|| Error::Agent("RewardCalculator must be specified".to_string()))?;
-        let selection_strategy = self.selection_strategy.unwrap_or_else(|| {
-            Arc::new(crate::strategy::SamplingRateStrategy::of(0.1))
-        });
+        let selection_strategy = self
+            .selection_strategy
+            .unwrap_or_else(|| Arc::new(crate::strategy::SamplingRateStrategy::of(0.1)));
         Ok(TrainingConfig {
             trinity_endpoint,
             trinity_api_key: self.trinity_api_key,
@@ -632,9 +641,10 @@ impl AgentCloner {
         if let Some(max_iters) = spec.max_iters {
             builder = builder.max_iters(max_iters);
         }
-        builder
-            .build()
-            .map_err(|e| Error::Agent(format!("Failed to clone ReActAgent: {}", original.name()).into()).with_source_boxed(e))
+        builder.build().map_err(|e| {
+            Error::Agent(format!("Failed to clone ReActAgent: {}", original.name()).into())
+                .with_source_boxed(e)
+        })
     }
 }
 
@@ -738,7 +748,12 @@ impl TrainingRouter {
             let context = Arc::new(RunExecutionContext::create(task_id.clone(), run_id.clone()));
 
             let report = self
-                .run_single_shadow(production_agent, inputs.clone(), context.clone(), spec.clone())
+                .run_single_shadow(
+                    production_agent,
+                    inputs.clone(),
+                    context.clone(),
+                    spec.clone(),
+                )
                 .await;
             reports.push(report);
 
@@ -890,7 +905,11 @@ impl TrainingRunner {
 
     /// Triggers a commit, mirroring `commit`.
     pub async fn commit(&self) -> Result<()> {
-        match self.trinity_client.commit(&CommitRequest::builder().build()).await {
+        match self
+            .trinity_client
+            .commit(&CommitRequest::builder().build())
+            .await
+        {
             Ok(()) => {
                 tracing::info!("Training commit successful");
                 Ok(())
@@ -946,7 +965,9 @@ impl TrainingRunnerBuilder {
                 "Cannot use builder methods when config is already set".to_string(),
             ));
         }
-        Ok(self.config_builder.get_or_insert_with(TrainingConfigBuilder::default))
+        Ok(self
+            .config_builder
+            .get_or_insert_with(TrainingConfigBuilder::default))
     }
 
     pub fn trinity_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -1144,9 +1165,7 @@ mod tests {
         let config = TrainingConfig::builder()
             .trinity_endpoint("http://x")
             .reward_calculator(Arc::new(ZeroRewardCalculator))
-            .selection_strategy(Arc::new(
-                crate::strategy::ExplicitMarkingStrategy::create(),
-            ))
+            .selection_strategy(Arc::new(crate::strategy::ExplicitMarkingStrategy::create()))
             .build()
             .unwrap();
         assert_eq!(config.get_sample_rate(), -1.0);
@@ -1212,7 +1231,10 @@ mod tests {
             .reward_calculator(Arc::new(ZeroRewardCalculator))
             .build()
             .unwrap();
-        let client = TrinityClient::builder().endpoint("http://x").build().unwrap();
+        let client = TrinityClient::builder()
+            .endpoint("http://x")
+            .build()
+            .unwrap();
         let router = TrainingRouter::new(config, client);
         let decision = router.decide("agent-shadow", &[], &Msg::assistant("x"), None);
         assert!(!decision.should_train());
@@ -1227,7 +1249,10 @@ mod tests {
             .reward_calculator(Arc::new(ZeroRewardCalculator))
             .build()
             .unwrap();
-        let client = TrinityClient::builder().endpoint("http://x").build().unwrap();
+        let client = TrinityClient::builder()
+            .endpoint("http://x")
+            .build()
+            .unwrap();
         let router = TrainingRouter::new(config, client);
         let decision = router.decide("agent", &[], &Msg::assistant("x"), None);
         assert!(decision.should_train());
@@ -1237,13 +1262,14 @@ mod tests {
     fn router_decide_with_explicit_marking() {
         let config = TrainingConfig::builder()
             .trinity_endpoint("http://x")
-            .selection_strategy(Arc::new(
-                crate::strategy::ExplicitMarkingStrategy::create(),
-            ))
+            .selection_strategy(Arc::new(crate::strategy::ExplicitMarkingStrategy::create()))
             .reward_calculator(Arc::new(ZeroRewardCalculator))
             .build()
             .unwrap();
-        let client = TrinityClient::builder().endpoint("http://x").build().unwrap();
+        let client = TrinityClient::builder()
+            .endpoint("http://x")
+            .build()
+            .unwrap();
         let router = TrainingRouter::new(config, client);
         let annotation = TrainingAnnotation::builder()
             .enabled(true)
@@ -1251,10 +1277,7 @@ mod tests {
             .build();
         let decision = router.decide("agent", &[], &Msg::assistant("x"), Some(&annotation));
         assert!(decision.should_train());
-        assert_eq!(
-            decision.metadata().get("taskId").unwrap(),
-            "explicit-task"
-        );
+        assert_eq!(decision.metadata().get("taskId").unwrap(), "explicit-task");
     }
 
     // --- Additional offline coverage -------------------------------------------------
@@ -1288,7 +1311,7 @@ mod tests {
         RunRegistry::clear_all();
         assert_eq!(RunRegistry::get_current_run_count(""), 0);
         RunRegistry::cleanup(""); // no-op
-        // Reserved interface mirrors Java's no-op TODO.
+                                  // Reserved interface mirrors Java's no-op TODO.
         RunRegistry::cleanup_old_tasks(Duration::from_secs(60));
         assert_eq!(RunRegistry::size(), 0);
     }
@@ -1427,7 +1450,13 @@ mod tests {
                 _o: GenerateOptions,
             ) -> futures::stream::BoxStream<'_, CoreResult<ChatResponse>> {
                 Box::pin(stream::once(async {
-                    Ok(ChatResponse::new("id", vec![], ChatUsage::default(), None, None))
+                    Ok(ChatResponse::new(
+                        "id",
+                        vec![],
+                        ChatUsage::default(),
+                        None,
+                        None,
+                    ))
                 }))
             }
             fn model_name(&self) -> &str {

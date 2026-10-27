@@ -78,7 +78,10 @@ impl Default for ToolRequestConfig {
 impl std::fmt::Debug for ToolRequestConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolRequestConfig")
-            .field("external_tools", &self.external_tools.keys().collect::<Vec<_>>())
+            .field(
+                "external_tools",
+                &self.external_tools.keys().collect::<Vec<_>>(),
+            )
             .field("merge_mode", &self.merge_mode)
             .finish()
     }
@@ -129,9 +132,9 @@ impl ToolRequestConfig {
         merge_mode: ToolMergeMode,
     ) -> Result<Self> {
         Self::new(
-            schemas
-                .into_iter()
-                .map(|s| Arc::new(super::schema_only_tool::SchemaOnlyTool::new(s)) as Arc<dyn Tool>),
+            schemas.into_iter().map(|s| {
+                Arc::new(super::schema_only_tool::SchemaOnlyTool::new(s)) as Arc<dyn Tool>
+            }),
             merge_mode,
         )
     }
@@ -207,8 +210,8 @@ mod tests {
     fn external_only_hides_the_backend_without_unregistering() {
         let toolkit = Toolkit::new();
         toolkit.register_schema(ToolSchema::new("agent_tool", "agent tool"));
-        let cfg = ToolRequestConfig::new(vec![external("search")], ToolMergeMode::ExternalOnly)
-            .unwrap();
+        let cfg =
+            ToolRequestConfig::new(vec![external("search")], ToolMergeMode::ExternalOnly).unwrap();
         assert!(cfg.hides_backend());
         assert!(cfg.resolve_tool("agent_tool", &toolkit).is_none());
         assert!(cfg.resolve_tool("search", &toolkit).is_some());
@@ -218,8 +221,8 @@ mod tests {
 
     #[test]
     fn agent_only_with_external_tools_is_rejected() {
-        let err = ToolRequestConfig::new(vec![external("search")], ToolMergeMode::AgentOnly)
-            .unwrap_err();
+        let err =
+            ToolRequestConfig::new(vec![external("search")], ToolMergeMode::AgentOnly).unwrap_err();
         assert!(err.to_string().contains("AGENT_ONLY"), "got {err}");
     }
 
@@ -231,8 +234,8 @@ mod tests {
             serde_json::json!({"type": "object"}),
             Box::new(|_, _| Ok(crate::message::ToolResultBlock::text("ok"))),
         )) as Arc<dyn Tool>;
-        let err = ToolRequestConfig::new(vec![tool], ToolMergeMode::MergeExternalPriority)
-            .unwrap_err();
+        let err =
+            ToolRequestConfig::new(vec![tool], ToolMergeMode::MergeExternalPriority).unwrap_err();
         assert!(err.to_string().contains("must be external"), "got {err}");
     }
 
@@ -245,8 +248,14 @@ mod tests {
         ] {
             assert_eq!(ToolMergeMode::from_wire(mode.as_str()), Some(mode));
         }
-        assert_eq!(ToolMergeMode::from_wire("external_only"), Some(ToolMergeMode::ExternalOnly));
+        assert_eq!(
+            ToolMergeMode::from_wire("external_only"),
+            Some(ToolMergeMode::ExternalOnly)
+        );
         assert_eq!(ToolMergeMode::from_wire("NOPE"), None);
-        assert_eq!(ToolMergeMode::default(), ToolMergeMode::MergeExternalPriority);
+        assert_eq!(
+            ToolMergeMode::default(),
+            ToolMergeMode::MergeExternalPriority
+        );
     }
 }

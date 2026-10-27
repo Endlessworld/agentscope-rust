@@ -83,7 +83,13 @@ impl AnthropicChatModel {
         base_url: Option<String>,
         transport: SharedTransport,
     ) -> Self {
-        Self::new(model_name, AnthropicAuthMode::ApiKey, api_key, base_url, transport)
+        Self::new(
+            model_name,
+            AnthropicAuthMode::ApiKey,
+            api_key,
+            base_url,
+            transport,
+        )
     }
 
     /// Sets the default options merged under every request.
@@ -101,7 +107,11 @@ impl AnthropicChatModel {
     /// Sets the TTL applied to prompt-caching markers (e.g. `"1h"`).
     pub fn with_cache_ttl(mut self, ttl: impl Into<String>) -> Self {
         let ttl = ttl.into();
-        self.cache_ttl = if ttl.trim().is_empty() { None } else { Some(ttl) };
+        self.cache_ttl = if ttl.trim().is_empty() {
+            None
+        } else {
+            Some(ttl)
+        };
         self
     }
 
@@ -299,7 +309,14 @@ mod tests {
             "stop_reason": "end_turn"
         }));
         let model = model_with(transport.clone(), "claude-sonnet-4-5-20250929");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
 
         assert_eq!(out.len(), 1);
         let response = out[0].as_ref().unwrap();
@@ -310,7 +327,10 @@ mod tests {
         let spec = transport.last_request().unwrap();
         assert_eq!(spec.url, "https://api.anthropic.com/v1/messages");
         assert!(!spec.stream);
-        assert_eq!(spec.body["model"], serde_json::json!("claude-sonnet-4-5-20250929"));
+        assert_eq!(
+            spec.body["model"],
+            serde_json::json!("claude-sonnet-4-5-20250929")
+        );
         assert_eq!(spec.body["max_tokens"], serde_json::json!(4096));
         assert!(spec
             .headers
@@ -324,7 +344,8 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_token_uses_authorization_header() {
-        let transport = MemoryTransport::with_response(serde_json::json!({ "id": "m", "content": [] }));
+        let transport =
+            MemoryTransport::with_response(serde_json::json!({ "id": "m", "content": [] }));
         let model = AnthropicChatModel::new(
             "claude",
             AnthropicAuthMode::AuthToken,
@@ -332,7 +353,14 @@ mod tests {
             Some("https://gateway.test".into()),
             Arc::new(transport.clone()),
         );
-        let _ = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let _ = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let spec = transport.last_request().unwrap();
         assert_eq!(spec.url, "https://gateway.test/v1/messages");
@@ -370,8 +398,12 @@ mod tests {
         let out = collect(&model, GenerateOptions::default()).await;
 
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel"));
-        assert!(matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo"));
+        assert!(
+            matches!(&out[0].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "Hel")
+        );
+        assert!(
+            matches!(&out[1].as_ref().unwrap().content[0], ContentBlock::Text(t) if t.text == "lo")
+        );
         let tail = out[2].as_ref().unwrap();
         assert_eq!(tail.usage.output_tokens, 5);
         assert_eq!(tail.usage.input_tokens, 4);
@@ -386,9 +418,19 @@ mod tests {
             "error": { "type": "authentication_error", "message": "bad key" }
         }));
         let model = model_with(transport, "claude");
-        let out = collect(&model, GenerateOptions { stream: Some(false), ..Default::default() }).await;
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
         let err = out[0].as_ref().unwrap_err().to_string();
-        assert!(err.contains("authentication_error"), "unexpected error: {err}");
+        assert!(
+            err.contains("authentication_error"),
+            "unexpected error: {err}"
+        );
         assert!(err.contains("bad key"), "unexpected error: {err}");
     }
 
@@ -405,14 +447,18 @@ mod tests {
             thinking_budget: Some(2048),
             ..Default::default()
         };
-        let tools = vec![
-            ToolSchema::new("f", "desc").parameters(
-                serde_json::json!({"type": "object"}).as_object().unwrap().clone(),
-            ),
-        ];
+        let tools = vec![ToolSchema::new("f", "desc").parameters(
+            serde_json::json!({"type": "object"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )];
         let spec = model.build_http_request(vec![Msg::user("hi")], tools, &options, true);
         assert_eq!(spec.body["thinking"]["type"], serde_json::json!("enabled"));
-        assert_eq!(spec.body["thinking"]["budget_tokens"], serde_json::json!(2048));
+        assert_eq!(
+            spec.body["thinking"]["budget_tokens"],
+            serde_json::json!(2048)
+        );
         assert_eq!(spec.body["tool_choice"]["type"], serde_json::json!("any"));
         assert_eq!(spec.body["tools"][0]["name"], serde_json::json!("f"));
         assert_eq!(
@@ -431,10 +477,16 @@ mod tests {
             Arc::new(MemoryTransport::default()),
         )
         .with_cache_ttl("1h");
-        let options = GenerateOptions { cache_control: Some(true), ..Default::default() };
+        let options = GenerateOptions {
+            cache_control: Some(true),
+            ..Default::default()
+        };
         let messages = vec![Msg::system("be brief"), Msg::user("hi")];
         let spec = model.build_http_request(messages, Vec::new(), &options, false);
-        assert_eq!(spec.body["system"][0]["cache_control"]["ttl"], serde_json::json!("1h"));
+        assert_eq!(
+            spec.body["system"][0]["cache_control"]["ttl"],
+            serde_json::json!("1h")
+        );
         assert_eq!(
             spec.body["messages"][0]["content"][0]["cache_control"]["type"],
             serde_json::json!("ephemeral")

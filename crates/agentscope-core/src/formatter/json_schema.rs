@@ -19,7 +19,11 @@ pub struct JsonSchema {
 
 impl JsonSchema {
     pub fn new(name: impl Into<String>, schema: Map<String, serde_json::Value>) -> Self {
-        Self { name: Some(name.into()), schema, strict: None }
+        Self {
+            name: Some(name.into()),
+            schema,
+            strict: None,
+        }
     }
 
     pub fn builder() -> JsonSchemaBuilder {

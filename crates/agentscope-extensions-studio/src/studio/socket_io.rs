@@ -66,9 +66,9 @@ pub struct EngineIoHandshake {
 
 /// Parses the `0{...}` Engine.IO open packet.
 pub fn parse_engine_io_open(frame: &str) -> StudioResult<EngineIoHandshake> {
-    let payload = frame.strip_prefix('0').ok_or_else(|| {
-        StudioError::WebSocket(format!("not an Engine.IO open packet: {frame}"))
-    })?;
+    let payload = frame
+        .strip_prefix('0')
+        .ok_or_else(|| StudioError::WebSocket(format!("not an Engine.IO open packet: {frame}")))?;
     let json: Value = serde_json::from_str(payload)
         .map_err(|e| StudioError::WebSocket(format!("invalid Engine.IO handshake: {e}")))?;
     let sid = json
@@ -485,7 +485,10 @@ mod tests {
     fn handshake_rejects_malformed_packets() {
         assert!(parse_engine_io_open("42[\"x\"]").is_err());
         assert!(parse_engine_io_open("0not-json").is_err());
-        assert!(parse_engine_io_open("0{}").unwrap_err().to_string().contains("no sid"));
+        assert!(parse_engine_io_open("0{}")
+            .unwrap_err()
+            .to_string()
+            .contains("no sid"));
     }
 
     #[test]
@@ -544,10 +547,8 @@ mod tests {
 
     #[test]
     fn protocol_joins_the_namespace_after_the_handshake() {
-        let mut protocol = SocketIoProtocol::new(
-            DEFAULT_NAMESPACE,
-            serde_json::json!({ "runId": "run-1" }),
-        );
+        let mut protocol =
+            SocketIoProtocol::new(DEFAULT_NAMESPACE, serde_json::json!({ "runId": "run-1" }));
         let actions = protocol.on_text("0{\"sid\":\"s-1\"}");
         assert_eq!(
             actions,
@@ -557,7 +558,10 @@ mod tests {
         );
         assert_eq!(protocol.sid(), Some("s-1"));
         assert!(!protocol.is_connected());
-        assert_eq!(protocol.on_text("40/python,{\"sid\":\"s-1\"}"), vec![ProtocolAction::Connected]);
+        assert_eq!(
+            protocol.on_text("40/python,{\"sid\":\"s-1\"}"),
+            vec![ProtocolAction::Connected]
+        );
         assert!(protocol.is_connected());
     }
 

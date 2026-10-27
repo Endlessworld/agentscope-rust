@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::error::Result;
 use agentscope_core::message::Msg;
+use async_trait::async_trait;
 
 use crate::agent::bus::MessageBus;
 use crate::agent::subagent::DefaultAgentManager;
@@ -100,18 +100,20 @@ impl TaskCompletionBridge {
     /// bus. Suitable for passing to `WorkspaceTaskRepository::set_completion_callback`.
     pub fn callback(&self) -> TaskCompletionCallback {
         let bus = Arc::clone(&self.message_bus);
-        Arc::new(move |task_id: String, session_id: String, _result: Option<String>| {
-            let bus = bus.clone();
-            tokio::spawn(async move {
-                // Enqueue wakeup with session_id so the dispatcher can route to the
-                // correct session. The agent_id is empty (main agent handles delivery).
-                if let Err(e) = bus.enqueue_wakeup("", &session_id, "").await {
-                    tracing::warn!(
+        Arc::new(
+            move |task_id: String, session_id: String, _result: Option<String>| {
+                let bus = bus.clone();
+                tokio::spawn(async move {
+                    // Enqueue wakeup with session_id so the dispatcher can route to the
+                    // correct session. The agent_id is empty (main agent handles delivery).
+                    if let Err(e) = bus.enqueue_wakeup("", &session_id, "").await {
+                        tracing::warn!(
                         "TaskCompletionBridge: failed to enqueue wakeup for task {task_id}: {e}"
                     );
-                }
-            });
-        })
+                    }
+                });
+            },
+        )
     }
 }
 
@@ -153,11 +155,7 @@ mod tests {
         async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
             Ok(Msg::assistant(format!("dummy reply from {}", self.id)))
         }
-        async fn call_with_schema(
-            &self,
-            _messages: Vec<Msg>,
-            _schema: JsonSchema,
-        ) -> Result<Msg> {
+        async fn call_with_schema(&self, _messages: Vec<Msg>, _schema: JsonSchema) -> Result<Msg> {
             Ok(Msg::assistant("{}"))
         }
     }
@@ -203,7 +201,11 @@ mod tests {
             "A coding agent",
             Arc::new(DummyFactory) as Arc<dyn SubagentFactory>,
         )
-        .with_declaration(SubagentDeclaration::new("coder", "A coding agent", "Do coding"))];
+        .with_declaration(SubagentDeclaration::new(
+            "coder",
+            "A coding agent",
+            "Do coding",
+        ))];
         let manager = Arc::new(DefaultAgentManager::new(&entries));
         let mat = DefaultSubagentMaterializer::new(manager);
 
@@ -213,14 +215,17 @@ mod tests {
 
         let agent = agent.unwrap();
         let reply = agent
-            .call(vec![Msg::user("hello")], &GatewayTurnContext {
-                session_id: "sess-1".into(),
-                gate_key: "k".into(),
-                msg_context: super::super::msg_context::MsgContext::default_context(),
-                user_id: None,
-                outbound: None,
-                cancel: None,
-            })
+            .call(
+                vec![Msg::user("hello")],
+                &GatewayTurnContext {
+                    session_id: "sess-1".into(),
+                    gate_key: "k".into(),
+                    msg_context: super::super::msg_context::MsgContext::default_context(),
+                    user_id: None,
+                    outbound: None,
+                    cancel: None,
+                },
+            )
             .await
             .unwrap();
         assert!(reply.text_content().contains("dummy reply from coder"));
@@ -230,17 +235,12 @@ mod tests {
     async fn materializer_returns_none_for_unknown_agent() {
         let manager = Arc::new(DefaultAgentManager::new(&[]));
         let mat = DefaultSubagentMaterializer::new(manager);
-        assert!(
-            mat.materialize("nonexistent", "sess-1").await.is_none()
-        );
+        assert!(mat.materialize("nonexistent", "sess-1").await.is_none());
     }
 
     #[tokio::test]
     async fn task_completion_bridge_enqueues_wakeup() {
-        let dir = std::env::temp_dir().join(format!(
-            "task_bridge_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("task_bridge_test_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
         let bus: Arc<dyn MessageBus> = Arc::new(WorkspaceMessageBus::new(fs.clone(), "/bus"));
@@ -260,8 +260,14 @@ mod tests {
         // publish() is a no-op (subscribe is polling-based), so we cannot directly
         // observe the signal on the channel. Instead, use queue_drain to check the
         // wakeup was enqueued into the filesystem-backed queue.
-        let entries = bus.queue_drain(crate::agent::bus::WAKEUPS_KEY, 10).await.unwrap();
-        assert!(!entries.is_empty(), "Expected at least one wakeup entry in the queue");
+        let entries = bus
+            .queue_drain(crate::agent::bus::WAKEUPS_KEY, 10)
+            .await
+            .unwrap();
+        assert!(
+            !entries.is_empty(),
+            "Expected at least one wakeup entry in the queue"
+        );
         // Verify the payload structure
         let payload = &entries[0].payload;
         assert_eq!(payload["sessionId"].as_str(), Some("sess-99"));

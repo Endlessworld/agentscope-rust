@@ -52,7 +52,11 @@ pub struct Mem0Message {
 impl Mem0Message {
     /// Creates a message from a role and content.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), name: None }
+        Self {
+            role: role.into(),
+            content: content.into(),
+            name: None,
+        }
     }
 
     /// Creates a message with an explicit sender name.
@@ -61,7 +65,11 @@ impl Mem0Message {
         content: impl Into<String>,
         name: impl Into<String>,
     ) -> Self {
-        Self { role: role.into(), content: content.into(), name: Some(name.into()) }
+        Self {
+            role: role.into(),
+            content: content.into(),
+            name: Some(name.into()),
+        }
     }
 }
 
@@ -102,7 +110,10 @@ pub struct Mem0AddRequest {
     #[serde(rename = "custom_categories", skip_serializing_if = "Option::is_none")]
     pub custom_categories: Option<JsonMap>,
     /// Custom instructions for organising memories.
-    #[serde(rename = "custom_instructions", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "custom_instructions",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub custom_instructions: Option<String>,
     /// Whether the memory is immutable (Java default `false`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,30 +287,38 @@ impl Mem0SearchRequest {
     /// `Builder.userId` / `setUserId`.
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
         let user_id = user_id.into();
-        self.filters
-            .insert("user_id".to_string(), serde_json::Value::String(user_id.clone()));
+        self.filters.insert(
+            "user_id".to_string(),
+            serde_json::Value::String(user_id.clone()),
+        );
         self.user_id = Some(user_id);
         self
     }
 
     /// Adds `agent_id` to `filters`, matching Java `Builder.agentId`.
     pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
-        self.filters
-            .insert("agent_id".to_string(), serde_json::Value::String(agent_id.into()));
+        self.filters.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(agent_id.into()),
+        );
         self
     }
 
     /// Adds `run_id` to `filters`, matching Java `Builder.runId`.
     pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
-        self.filters
-            .insert("run_id".to_string(), serde_json::Value::String(run_id.into()));
+        self.filters.insert(
+            "run_id".to_string(),
+            serde_json::Value::String(run_id.into()),
+        );
         self
     }
 
     /// Adds `app_id` to `filters`, matching Java `Builder.appId`.
     pub fn with_app_id(mut self, app_id: impl Into<String>) -> Self {
-        self.filters
-            .insert("app_id".to_string(), serde_json::Value::String(app_id.into()));
+        self.filters.insert(
+            "app_id".to_string(),
+            serde_json::Value::String(app_id.into()),
+        );
         self
     }
 }
@@ -334,19 +353,35 @@ pub struct Mem0SearchResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub immutable: Option<bool>,
     /// Expiration timestamp (Java `OffsetDateTime`).
-    #[serde(rename = "expiration_date", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "expiration_date",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expiration_date: Option<DateTime<FixedOffset>>,
     /// Creation timestamp (Java `OffsetDateTime`).
-    #[serde(rename = "created_at", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "created_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_at: Option<DateTime<FixedOffset>>,
     /// Update timestamp (Java `OffsetDateTime`).
-    #[serde(rename = "updated_at", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updated_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_at: Option<DateTime<FixedOffset>>,
     /// Relevance score returned by the v2 search API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     /// Structured temporal attributes extracted from the memory.
-    #[serde(rename = "structured_attributes", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "structured_attributes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub structured_attributes: Option<JsonMap>,
 }
 
@@ -360,7 +395,10 @@ impl Mem0SearchResult {
         let text = self.memory.clone().unwrap_or_default();
         let mut metadata = JsonMap::new();
         if let Some(id) = &self.id {
-            metadata.insert("memory_id".to_string(), serde_json::Value::String(id.clone()));
+            metadata.insert(
+                "memory_id".to_string(),
+                serde_json::Value::String(id.clone()),
+            );
         }
         if let Some(score) = self.score {
             metadata.insert(
@@ -375,7 +413,10 @@ impl Mem0SearchResult {
                 metadata.insert("categories".to_string(), value);
             }
         }
-        metadata.insert("memory_source".to_string(), serde_json::Value::String("mem0".into()));
+        metadata.insert(
+            "memory_source".to_string(),
+            serde_json::Value::String("mem0".into()),
+        );
         Msg::builder()
             .role(MsgRole::Assistant)
             .content(vec![ContentBlock::Text(TextBlock::new(text))])
@@ -436,7 +477,9 @@ mod tests {
             serde_json::from_str(r#"{"results":[{"id":"m1"}],"message":"ok"}"#).unwrap();
         assert_eq!(resp.results.as_ref().unwrap().len(), 1);
         assert_eq!(resp.message.as_deref(), Some("ok"));
-        assert!(serde_json::to_value(&Mem0AddResponse::default()).unwrap().is_object());
+        assert!(serde_json::to_value(&Mem0AddResponse::default())
+            .unwrap()
+            .is_object());
     }
 
     #[test]
@@ -473,11 +516,26 @@ mod tests {
     fn api_type_from_string_is_case_insensitive_and_defaults_to_platform() {
         assert_eq!(Mem0ApiType::from_string(None), Mem0ApiType::Platform);
         assert_eq!(Mem0ApiType::from_string(Some("")), Mem0ApiType::Platform);
-        assert_eq!(Mem0ApiType::from_string(Some("SELF-HOSTED")), Mem0ApiType::SelfHosted);
-        assert_eq!(Mem0ApiType::from_string(Some("self_hosted")), Mem0ApiType::SelfHosted);
-        assert_eq!(Mem0ApiType::from_string(Some("selfhosted")), Mem0ApiType::SelfHosted);
-        assert_eq!(Mem0ApiType::from_string(Some("platform")), Mem0ApiType::Platform);
-        assert_eq!(Mem0ApiType::from_string(Some("unknown")), Mem0ApiType::Platform);
+        assert_eq!(
+            Mem0ApiType::from_string(Some("SELF-HOSTED")),
+            Mem0ApiType::SelfHosted
+        );
+        assert_eq!(
+            Mem0ApiType::from_string(Some("self_hosted")),
+            Mem0ApiType::SelfHosted
+        );
+        assert_eq!(
+            Mem0ApiType::from_string(Some("selfhosted")),
+            Mem0ApiType::SelfHosted
+        );
+        assert_eq!(
+            Mem0ApiType::from_string(Some("platform")),
+            Mem0ApiType::Platform
+        );
+        assert_eq!(
+            Mem0ApiType::from_string(Some("unknown")),
+            Mem0ApiType::Platform
+        );
         assert_eq!(Mem0ApiType::default(), Mem0ApiType::Platform);
     }
 

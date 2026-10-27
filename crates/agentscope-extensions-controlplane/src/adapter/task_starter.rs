@@ -103,7 +103,10 @@ pub trait TurnRunner: Send + Sync {
 
 /// Turns plain text into a user message.
 fn message(text: impl Into<String>) -> Msg {
-    Msg::builder().role(MsgRole::User).text_content(text).build()
+    Msg::builder()
+        .role(MsgRole::User)
+        .text_content(text)
+        .build()
 }
 
 /// Runs the continuation loop, mirroring `HarnessAgentTaskStarter.runToOutcome`.
@@ -130,7 +133,10 @@ pub async fn run_to_outcome(
         }
         let outcome = runner.take_outcome().await;
         let reason = response.generate_reason();
-        if !matches!(reason, GenerateReason::ModelStop | GenerateReason::StructuredOutput) {
+        if !matches!(
+            reason,
+            GenerateReason::ModelStop | GenerateReason::StructuredOutput
+        ) {
             let result = match &outcome {
                 Some(o) => o.result.clone(),
                 None => partial.clone(),
@@ -286,7 +292,9 @@ pub async fn cancel_unfinished(runner: &dyn TurnRunner) -> Result<(), String> {
 /// Fails when a required delivery field is missing.
 fn require(value: &str, name: &str) -> ControlPlaneResult<()> {
     if value.trim().is_empty() {
-        return Err(ControlPlaneError::Unsupported(format!("{name} is required")));
+        return Err(ControlPlaneError::Unsupported(format!(
+            "{name} is required"
+        )));
     }
     Ok(())
 }
@@ -712,9 +720,9 @@ impl AgentTaskStarter for HarnessAgentTaskStarter {
         let event_key = format!("{}:{}", assignment.attempt_id, assignment.generation);
         {
             let mut accepted = self
-            .accepted_events
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+                .accepted_events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if !accepted.insert(event_key.clone()) {
                 return Ok(());
             }
@@ -734,7 +742,13 @@ impl AgentTaskStarter for HarnessAgentTaskStarter {
                     .unwrap_or(0);
                 let _ = self
                     .collaboration
-                    .fail(&task_id, &token, version, "agent_failed", &error.to_string())
+                    .fail(
+                        &task_id,
+                        &token,
+                        version,
+                        "agent_failed",
+                        &error.to_string(),
+                    )
                     .await;
                 self.accepted_events
                     .lock()
@@ -941,9 +955,7 @@ mod tests {
     }
 
     impl FakeRunner {
-        fn new(
-            on_turn: impl Fn(usize, &Msg, &FakeRunner) -> Msg + Send + Sync + 'static,
-        ) -> Self {
+        fn new(on_turn: impl Fn(usize, &Msg, &FakeRunner) -> Msg + Send + Sync + 'static) -> Self {
             Self {
                 state: Arc::new(AgentTaskOutcomeState::new()),
                 tasks: Mutex::new(Vec::new()),
@@ -1054,17 +1066,17 @@ mod tests {
     #[tokio::test]
     async fn plain_waiting_promise_cannot_become_successful_completion() {
         let runner = FakeRunner::new(|_, _, _| reply("I will keep checking my subagent"));
-        let result = run_to_outcome(
-            &runner,
-            message("kickoff"),
-            StarterLimits::default(),
-        )
-        .await
-        .unwrap()
-        .expect("an outcome must be reported");
+        let result = run_to_outcome(&runner, message("kickoff"), StarterLimits::default())
+            .await
+            .unwrap()
+            .expect("an outcome must be reported");
         assert_eq!(runner.turn_count(), 2);
         assert_eq!(result.outcome, OUTCOME_BLOCKED);
-        assert!(result.reason.contains("missing_outcome"), "{}", result.reason);
+        assert!(
+            result.reason.contains("missing_outcome"),
+            "{}",
+            result.reason
+        );
         assert_eq!(result.result, "");
     }
 
@@ -1077,9 +1089,12 @@ mod tests {
                     terminal: true,
                     result: Some("EV research with evidence".to_string()),
                 }]);
-                runner
-                    .state
-                    .submit(outcome(OUTCOME_WAITING, "", "collect EV evidence", &["child"]));
+                runner.state.submit(outcome(
+                    OUTCOME_WAITING,
+                    "",
+                    "collect EV evidence",
+                    &["child"],
+                ));
             } else {
                 assert!(
                     input.text_content().contains("EV research with evidence"),
@@ -1104,9 +1119,12 @@ mod tests {
     #[tokio::test]
     async fn nonexistent_dependency_blocks_instead_of_polling_forever() {
         let runner = FakeRunner::new(|_, _, runner| {
-            runner
-                .state
-                .submit(outcome(OUTCOME_WAITING, "partial", "await child", &["missing"]));
+            runner.state.submit(outcome(
+                OUTCOME_WAITING,
+                "partial",
+                "await child",
+                &["missing"],
+            ));
             reply("waiting")
         });
         let result = run_to_outcome(&runner, message("kickoff"), StarterLimits::default())
@@ -1171,7 +1189,11 @@ mod tests {
             .expect("an outcome must be reported");
         assert_eq!(runner.turn_count(), 1);
         assert_eq!(result.outcome, OUTCOME_BLOCKED);
-        assert!(result.reason.contains("MAX_ITERATIONS"), "{}", result.reason);
+        assert!(
+            result.reason.contains("MAX_ITERATIONS"),
+            "{}",
+            result.reason
+        );
         assert_eq!(result.result, "partial report");
     }
 
@@ -1181,10 +1203,12 @@ mod tests {
             runner.state.mark_terminal_committed();
             reply("committed")
         });
-        assert!(run_to_outcome(&runner, message("kickoff"), StarterLimits::default())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            run_to_outcome(&runner, message("kickoff"), StarterLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1303,7 +1327,7 @@ mod tests {
     async fn approval_handler_allows_when_the_control_plane_approves() {
         let source = Arc::new(FakeApprovalSource {
             decisions: Mutex::new(vec![
-                serde_json::json!({ "decisionVersion": 2, "allow": true })
+                serde_json::json!({ "decisionVersion": 2, "allow": true }),
             ]),
         });
         let handler = runtime_approval_confirm_handler(source, "task-1".into(), "tok".into());
@@ -1356,13 +1380,7 @@ mod tests {
         let envelope = serde_json::json!({
             "task": {"status": "running", "version": 4, "teamId": "", "taskToken": "t"}
         });
-        let prompt = kickoff_prompt(
-            &assignment,
-            &envelope,
-            &[],
-            "",
-            &["read_file".to_string()],
-        );
+        let prompt = kickoff_prompt(&assignment, &envelope, &[], "", &["read_file".to_string()]);
         assert!(prompt.contains("AgentTask task is ready"));
         assert!(prompt.contains("contextUrl=http://control/task"));
         assert!(prompt.contains("read_file"));

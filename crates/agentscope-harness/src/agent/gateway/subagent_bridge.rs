@@ -19,7 +19,9 @@ pub struct ExposeResult {
 
 impl ExposeResult {
     pub fn new(subagent_id: impl Into<String>) -> Self {
-        Self { subagent_id: subagent_id.into() }
+        Self {
+            subagent_id: subagent_id.into(),
+        }
     }
 }
 
@@ -73,17 +75,20 @@ impl SubagentGatewayBridge for GatewaySubagentBridge {
 
 #[cfg(test)]
 mod tests {
+    use super::super::harness_gateway::GatewayTurnContext;
     use super::*;
     use agentscope_core::error::Result;
     use agentscope_core::message::Msg;
-    use super::super::harness_gateway::GatewayTurnContext;
 
     struct EchoAgent;
 
     #[async_trait]
     impl GatewayAgent for EchoAgent {
         async fn call(&self, messages: Vec<Msg>, _ctx: &GatewayTurnContext) -> Result<Msg> {
-            Ok(messages.into_iter().next().unwrap_or_else(|| Msg::assistant("empty")))
+            Ok(messages
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Msg::assistant("empty")))
         }
     }
 

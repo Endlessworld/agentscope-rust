@@ -5,11 +5,11 @@
 //! through the configured filesystem (`MEMORY.md` and `memory/*.md`).
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
+use async_trait::async_trait;
 
 use crate::agent::workspace::WorkspaceManager;
 
@@ -68,7 +68,10 @@ impl Tool for MemorySearchTool {
         let mut match_count = 0usize;
 
         for rel in self.workspace.list_memory_file_paths(&rc).await {
-            let content = self.workspace.read_managed_workspace_file_utf8(&rc, &rel).await;
+            let content = self
+                .workspace
+                .read_managed_workspace_file_utf8(&rc, &rel)
+                .await;
             if content.is_empty() {
                 continue;
             }

@@ -59,7 +59,9 @@ pub async fn auxiliary(
     // Journal the auxiliary boundary exactly like a reasoning dispatch: the wrapper only
     // records when the caller supplied a context that carries a session recorder.
     let model = match ctx {
-        Some(ctx) => agentscope_core::session::SessionModels::wrap(Arc::clone(&model), ctx, "SUMMARY"),
+        Some(ctx) => {
+            agentscope_core::session::SessionModels::wrap(Arc::clone(&model), ctx, "SUMMARY")
+        }
         None => model,
     };
     let mut stream = model.stream(prepared.messages, prepared.tools, prepared.options);
@@ -222,9 +224,11 @@ mod tests {
             .unwrap()
             .with_source(
                 "biz",
-                Arc::new(FixedSource(vec![
-                    ContextBlock::runtime("status", "Change 42 under review").unwrap(),
-                ])),
+                Arc::new(FixedSource(vec![ContextBlock::runtime(
+                    "status",
+                    "Change 42 under review",
+                )
+                .unwrap()])),
                 ContextSourceOptions::default(),
             )
             .unwrap();
