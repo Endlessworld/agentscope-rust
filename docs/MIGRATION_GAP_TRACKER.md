@@ -482,10 +482,16 @@
 | 4.5 | middleware.inbox | 提示注入形态与 Java 相反 | ✅ 已完成（`6fbc768`） | 每条 hint → 独立 `MsgRole::User` 通知（溯源句 + `synthetic`/`reminder_kind=background_event`/`source`/`hint_id` 元数据），并写回 `AgentState.context`；锁不跨 await |
 | 4.6 | middleware.at_path | `@path` 展开形态与截断提示 | ✅ 已完成（`7223b25`） | 追加独立预览块（保留原 blocks）、`<attached_file path="...">`、中和 `</attached_file>`、按行截断 1000 行 + Java 提示语、单条消息 64k 字符预算、仅展开 user 消息；`collect_text` 按 Java `getTextContent()` 用 `\n` 连接 |
 | 4.7 | skill.prompt | `<available_skills>` 默认仍 full-metadata | ✅ 已完成（`dbc3f02`） | `expose_all_metadata` 默认 `false`；slim 视图 `name`/`description` 取自 `AgentSkill` 字段且无条件输出（对齐 Java `metadataView`）；usage 文案换 Java 精简版；full 视图仍可 `with_parts(..., true)` |
-| 4.8 | middleware.plan_mode | 无 PLAN MODE 横幅、无 model-call 刷新 | ✅ 已完成（`e531dd1`） | 新建 `middleware/plan_mode.rs`：`PLAN_BANNER_TEMPLATE` / `BUILD_MODE_PLAN_HINT` / `PLAN_EXTRA_TOOLS_HINT`、`PlanModeConfig::with_manager`（持 `Arc<PlanModeManager>`，支持运行中 `plan_enter`/`plan_exit` 翻转）、`on_model_call` 每次模型边界重算、`active_points() = OnSystemPrompt + OnModelCall`。**行号更正**：报告写的 `harness_agent.rs:1889-1892` 实为 **`:1900-1913`**（`plan: String::new()` 在 `:1909`） |
+| 4.8 | middleware.plan_mode | 无 PLAN MODE 横幅、无 model-call 刷新 | ✅ 已完成（`e531dd1`） | 新建 `middleware/plan_mode.rs`：`PLAN_BANNER_TEMPLATE` / `BUILD_MODE_PLAN_HINT` / `PLAN_EXTRA_TOOLS_HINT`、`PlanModeConfig::with_manager`（持 `Arc<PlanModeManager>`，支持运行中 `plan_enter`/`plan_exit` 翻转）、`on_model_call` 每次模型边界重算、`active_points() = OnSystemPrompt + OnModelCall`。**行号更正**：报告写的 `harness_agent.rs:1889-1892` 实为 **`:1900-1913`**（`plan: String::new()` 在 `:1909`）。**后续修复**：见下表后的「本轮顺带修复」——`plan_enter` 中途翻转此前会被下一轮 state 发布覆盖 |
 | 4.9 | subagent | 子智能体无法独立配置 compaction | ✅ 已完成（`f6f2a67`） | `SubagentDeclaration` 新增 `compaction: Option<CompactionConfig>` / `disable_compaction`；优先级对齐 Java：声明级禁用 → 声明级配置 → 父级禁用 → 父级配置（父级禁用时声明级仍可单独启用） |
 | 4.10 | context.render | 渲染时转义正文；AGENTS.md 无上限 | ✅ 已完成（`37e38cd`） | (a) 正文不再 `escape()`，改为 `neutralize_closing()`（只中和自身闭合标签 + 运行时外框 `</HARNESS_CONTEXT>`），属性值仍转义；(b) 新增 `MAX_AGENTS_MD_BYTES = 102_400` 与按 char boundary 回退的 `cap_agents_md()` |
 | 4.11 | memory.compaction | 摘要提示远简于 Java | ✅ 已完成（`dbc3f02`） | `DEFAULT_SUMMARY_PROMPT` 补齐至 Java 的 7 段（新增 `USER PREFERENCES AND CORRECTIONS`、`COMMANDS AND ERRORS`、`objective_information`）与 `<extraction_rules>`/`<secrecy>`（逐字保留、superseded 标注、链式合并为一份）；`{messages}` 占位符保留 |
+
+**本轮顺带修复（复评外，验证 4.4 时发现）**：
+
+| # | 缺口 | 说明 |
+|---|---|---|
+| S1 | 回合内 `plan_enter` / `plan_exit` 被下一轮 state 发布覆盖 | 工具持共享 `Arc<Mutex<AgentState>>` 并直接改 `plan_mode_context`，而循环跑在私有克隆上；`reasoning_phase` 每次发布 `*shared = state.clone()` 会把刚翻转的标志写回旧值 → 后续请求既拿不到 PLAN 横幅，core 的 acting 拦截也退回 BUILD（等于 `plan_enter` 只对下一次 `call` 生效，且本回合内完全无效）。修法：发布前先把共享侧 `plan_mode_context` 取回本地（该字段只由工具写，共享侧始终是权威）。测试：`harness_plan_wait_tool_test::plan_enter_mid_turn_reaches_the_next_request`（已反向验证：去掉取回后第二个请求无 PLAN 横幅） |
 
 **同批复评的 core 侧缺口（未在本轮修复，仅登记）**：
 

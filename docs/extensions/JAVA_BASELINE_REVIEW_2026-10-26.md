@@ -101,6 +101,10 @@ $ git cat-file -e ed8073259:.../core/embedding/EmbeddingUsage.java   -> EXISTS
 >   在 `:1909`）。
 > - **4.8 措辞更正**：严格说是「模型侧提示为零」，而非「plan mode 完全缺失」——工具侧拦截
 >   （core `react_agent.rs`）一直是完整的，缺的是让模型知道自己在 PLAN 模式。
+> - **4.8 后续修复（复评外）**：验证 4.4 时发现回合内 `plan_enter` / `plan_exit` 会被下一轮
+>   state 发布覆盖（工具写共享 state，循环跑私有克隆），已修 + 增加
+>   `harness_plan_wait_tool_test::plan_enter_mid_turn_reaches_the_next_request`，详见
+>   `MIGRATION_GAP_TRACKER.md` §3.15 表后的「本轮顺带修复 S1」。
 
 ## 5. 明确「不迁移 / 无漂移」清单
 

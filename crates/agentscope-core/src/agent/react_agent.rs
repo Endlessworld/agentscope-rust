@@ -1771,7 +1771,16 @@ async fn reasoning_phase(
     // previous turn boundary for the whole turn, so a per-iteration checkpoint
     // middleware would have nothing to persist and an abrupt process death
     // (kill -9 / OOM / power loss) would lose the entire turn.
-    *core.state.lock().unwrap() = state.clone();
+    {
+        let mut shared = core.state.lock().unwrap();
+        // Plan mode is owned by the tools, which hold this same handle: `plan_enter` /
+        // `plan_exit` issued in the previous acting phase wrote the shared state, not this
+        // clone. Carry the tool-written value over instead of republishing the stale one,
+        // otherwise the flip is undone before the next request (no PLAN banner, and core's
+        // acting-phase interception reverts to BUILD).
+        state.plan_mode_context = shared.plan_mode_context.clone();
+        *shared = state.clone();
+    }
     // The summarizing path is not a step: Java checks `maxIters` before `step(iter)`, so an
     // over-budget iteration never opens a step boundary nor folds in guidance.
     if iter >= core.max_iters {

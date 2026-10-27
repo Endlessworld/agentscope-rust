@@ -1,11 +1,15 @@
 //! Tests for PlanModeTools (plan_enter / plan_write / plan_exit) and
 //! WaitAsyncResultsTool.
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use agentscope_core::message::JsonMap;
+use agentscope_core::agent::{CallableAgent, StreamOptions};
+use agentscope_core::message::{ContentBlock, JsonMap, Msg, TextBlock, ToolUseBlock};
+use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
 use agentscope_harness::agent::bus::async_tool::{AsyncToolRecord, AsyncToolRegistry, WorkspaceAsyncToolRegistry};
+use agentscope_harness::agent::HarnessAgent;
 use agentscope_harness::filesystem::{Filesystem, LocalFilesystem};
 use agentscope_harness::tool::{PlanModeHandle, WaitAsyncResultsTool};
 
@@ -92,6 +96,98 @@ async fn plan_mode_handle_binds_shared_state() {
 
     run(&exit, JsonMap::new()).await;
     assert!(!state.lock().unwrap().plan_mode_context.plan_active);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs one `plan_enter` tool call, then answers. Records every request.
+struct EnterPlanThenAnswer {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<Vec<Msg>>>,
+}
+
+impl Model for EnterPlanThenAnswer {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        self.requests.lock().unwrap().push(messages);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = if call == 0 {
+            ChatResponse::builder()
+                .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                    "plan-1",
+                    "plan_enter",
+                    JsonMap::new(),
+                ))])
+                .build()
+        } else {
+            ChatResponse::builder()
+                .content(vec![ContentBlock::Text(TextBlock::new("planned"))])
+                .build()
+        };
+        Box::pin(futures::stream::once(async move { Ok(response) }))
+    }
+
+    fn model_name(&self) -> &str {
+        "enter-plan"
+    }
+
+    fn context_window_size(&self) -> usize {
+        128_000
+    }
+}
+
+#[tokio::test]
+async fn plan_enter_mid_turn_reaches_the_next_request() {
+    // `plan_enter` mutates the *shared* state handle the tool set was bound to, while the
+    // reasoning loop runs on a private clone. The flip must survive the next iteration's
+    // state publish, or the model never learns it is in PLAN mode (and the acting phase
+    // keeps allowing mutations).
+    let dir = temp_dir("plan_mid_turn");
+    let model = Arc::new(EnterPlanThenAnswer {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = HarnessAgent::builder()
+        .name("plan-mid-turn")
+        .model(model.clone())
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
+        .enable_plan_mode()
+        .build();
+
+    agent
+        .call(vec![Msg::user("draft a plan")])
+        .await
+        .expect("the run must complete");
+
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "the plan_enter tool result must drive another reasoning iteration"
+    );
+    let second = requests[1]
+        .iter()
+        .map(|message| message.text_content())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        second.contains("PLAN MODE is active"),
+        "the request after plan_enter must carry the PLAN banner: {second}"
+    );
+    drop(requests);
+
+    let state = agent
+        .agent()
+        .expect("built with a model")
+        .state_handle();
+    assert!(
+        state.lock().unwrap().plan_mode_context.plan_active,
+        "plan_enter must keep plan_active set on the session state"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
