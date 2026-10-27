@@ -1,4 +1,4 @@
-//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
+﻿//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
 //!
 //! The ReAct agent runs an iterative reasoning → acting loop: it streams a model
 //! call, accumulates the reasoning result, and if the model requested tool calls
@@ -2871,6 +2871,29 @@ impl ActingBatch<'_> {
         )
         .await
     }
+
+    /// Whether `call` may join a concurrent batch: it must be executable (not
+    /// malformed), not denied by plan mode, approved by the permission engine, and the
+    /// tool itself must declare concurrent invocations safe.
+    fn is_parallel_eligible(&self, call: &ToolUseBlock) -> bool {
+        if call.has_malformed_arguments() {
+            return false;
+        }
+        if self
+            .plan_denied
+            .iter()
+            .any(|(id, denied)| id == &call.id && *denied)
+        {
+            return false;
+        }
+        if !self.core.toolkit.is_concurrency_safe_tool(&call.name) {
+            return false;
+        }
+        matches!(
+            evaluate_permission(self.core, call).behavior,
+            PermissionBehavior::Allow | PermissionBehavior::Passthrough
+        )
+    }
 }
 
 /// Executes the pending tool calls and records every result into `results`.
@@ -2885,7 +2908,9 @@ async fn run_acting_calls(
     pending: &[ToolUseBlock],
     results: &ActingResultsHandle,
 ) -> Result<()> {
-    for call in pending {
+    let mut index = 0;
+    while index < pending.len() {
+        let call = &pending[index];
         // A cancelled run must not start the next tool: the first one may have completed, but
         // continuing the batch would perform side effects after the user asked to stop.
         if run
@@ -2917,6 +2942,7 @@ async fn run_acting_calls(
                 ToolResultState::Error,
                 &JsonMap::new(),
             );
+            index += 1;
             continue;
         }
         // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`): while plan
@@ -2943,6 +2969,7 @@ async fn run_acting_calls(
                 ToolResultState::Denied,
                 &JsonMap::new(),
             );
+            index += 1;
             continue;
         }
         let decision = evaluate_permission(run.core, call);
@@ -2955,8 +2982,27 @@ async fn run_acting_calls(
                 results
                     .record(denied_result(call, &decision.message), false);
                 emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+                index += 1;
             }
             PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
+                // Parallel mode (Java `ToolkitConfig.parallel`, default true) runs a
+                // contiguous run of concurrency-safe, approved calls concurrently. Each
+                // tool's events are emitted at its own actual start/finish, so a fast
+                // call is visible while a slower sibling is still running; results are
+                // still recorded in declaration order and the batch settles as a unit.
+                // Non-concurrency-safe calls, asks and denials fall through to the
+                // serial path below (matching Java's serial slots).
+                if run.core.toolkit.config().parallel {
+                    let mut end = index + 1;
+                    while end < pending.len() && run.is_parallel_eligible(&pending[end]) {
+                        end += 1;
+                    }
+                    if end > index + 1 {
+                        run_parallel_batch(&run, &pending[index..end], results).await?;
+                        index = end;
+                        continue;
+                    }
+                }
                 // Emit ToolResultStart for this tool execution.
                 emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
                 let tctx = tool_execution_context(
@@ -3025,6 +3071,7 @@ async fn run_acting_calls(
                         emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
                     }
                 }
+                index += 1;
             }
             PermissionBehavior::Ask => {
                 let handler = run.core.confirm_handler.lock().unwrap().clone();
@@ -3108,12 +3155,120 @@ async fn run_acting_calls(
                         call.name
                     )));
                 }
+                index += 1;
             }
         }
     }
 
     results.finish();
     Ok(())
+}
+
+/// Runs a contiguous batch of approved, concurrency-safe calls concurrently.
+///
+/// Every invocation emits its own `ToolResultStart` when it actually begins and its
+/// text delta / `ToolResultEnd` (or `RequireExternalExecution` when suspended) when it
+/// actually finishes, so events arrive in completion order and a fast call is visible
+/// while a slow earlier call is still running. Results are recorded in declaration
+/// order afterwards: middleware, the persisted tool message and the next reasoning
+/// iteration still observe one settled batch, exactly like Java's
+/// `ToolExecutionCallback` + ordered aggregation.
+async fn run_parallel_batch(
+    run: &ActingBatch<'_>,
+    calls: &[ToolUseBlock],
+    results: &ActingResultsHandle,
+) -> Result<()> {
+    let futures = calls.iter().map(|call| async move {
+        // Start is emitted immediately before the invocation itself (Java
+        // `ToolExecutionCallback.onStart`), never at batch admission.
+        emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
+        let tctx = tool_execution_context(
+            call,
+            run.runtime.clone(),
+            &run.ctx.delta_tx,
+            tool_request_config(run.ctx),
+            run.reply_id,
+        );
+        // Same observation boundary as the serial path: an acknowledgement failure is a
+        // run-level error, never a retryable tool result.
+        match run.observe(call, tctx).await {
+            Ok(rb) => {
+                emit_result_text_delta(run, call, &rb);
+                // Java #3435: a suspended call emits neither a text delta for its result
+                // nor `ToolResultEnd`; the external-execution requirement is the signal.
+                if rb.is_suspended() {
+                    emit_require_external_execution(
+                        &run.ctx.delta_tx,
+                        run.reply_id,
+                        call,
+                        rb.suspend_reason(),
+                    );
+                } else {
+                    emit_tool_result_end(
+                        &run.ctx.delta_tx,
+                        &call.id,
+                        &call.name,
+                        rb.final_state(),
+                        &rb.metadata,
+                    );
+                }
+                Ok((call, rb))
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !matches!(error, Error::ActionObservation(_)) {
+                    emit_tool_result_text_delta(
+                        &run.ctx.delta_tx,
+                        &call.id,
+                        &call.name,
+                        &message,
+                    );
+                }
+                emit_tool_result_end(
+                    &run.ctx.delta_tx,
+                    &call.id,
+                    &call.name,
+                    ToolResultState::Error,
+                    &JsonMap::new(),
+                );
+                Err((call, error, message))
+            }
+        }
+    });
+    let outcomes = futures::future::join_all(futures).await;
+    for outcome in outcomes {
+        match outcome {
+            Ok((call, rb)) => {
+                let bound = bind_result(call, rb);
+                let return_direct = is_return_direct_result(run.core, &bound);
+                results.record(bound, return_direct);
+            }
+            Err((call, error, message)) => {
+                // An unacknowledged result is a run-level failure: the batch is not
+                // committed and recovery must reconcile the call explicitly.
+                if matches!(error, Error::ActionObservation(_)) {
+                    results.fail(message);
+                    return Err(error);
+                }
+                results.record(error_result(call, &message), false);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emits the text delta for a completed non-streaming tool result. Streaming tools
+/// emit their own deltas through the execution emitter callback.
+fn emit_result_text_delta(run: &ActingBatch<'_>, call: &ToolUseBlock, rb: &ToolResultBlock) {
+    let mut result_text = String::new();
+    for block in &rb.output {
+        if let ContentBlock::Text(text) = block {
+            result_text.push_str(&text.text);
+        }
+    }
+    if !result_text.trim().is_empty() {
+        emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &result_text);
+    }
 }
 
 /// Produces the termination message when the maximum number of iterations is hit.
@@ -4429,6 +4584,227 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].get("id"), Some(&serde_json::json!("ext1")));
         assert_eq!(calls[0].get("name"), Some(&serde_json::json!("external")));
+    }
+
+    /// A concurrency-safe tool that signals when its invocation starts and then blocks
+    /// until the test releases it. A pre-filled release permit makes it return at once.
+    struct GatedTool {
+        name: &'static str,
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+        result: &'static str,
+    }
+
+    impl GatedTool {
+        fn new(name: &'static str, result: &'static str) -> (Self, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+            let started = Arc::new(tokio::sync::Semaphore::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            (
+                Self {
+                    name,
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                    result,
+                },
+                started,
+                release,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for GatedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "gated test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _args: JsonMap,
+            _ctx: ToolExecutionContext,
+        ) -> Result<ToolResultBlock> {
+            self.started.add_permits(1);
+            let _ = self.release.acquire().await;
+            Ok(ToolResultBlock::text(self.result))
+        }
+    }
+
+    fn two_calls(second_name: &str) -> ChatResponse {
+        ChatResponse::builder()
+            .content(vec![
+                ContentBlock::ToolUse(ToolUseBlock::new("slow-call", "slow", JsonMap::new())),
+                ContentBlock::ToolUse(ToolUseBlock::new(
+                    "fast-call",
+                    second_name,
+                    JsonMap::new(),
+                )),
+            ])
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_fast_tool_is_visible_while_a_slower_earlier_tool_is_still_running() {
+        // Mirrors Java `ProgressiveToolResultTest.completedToolIsVisibleBeforeSlowEarlierTool`:
+        // in parallel mode a completed call's events must not wait for the whole batch,
+        // while the persisted results keep declaration order and the next reasoning
+        // iteration still waits for every call.
+        let (slow, _slow_started, slow_release) = GatedTool::new("slow", "slow result");
+        let (fast, _fast_started, fast_release) = GatedTool::new("fast", "fast result");
+        // The fast tool has nothing to wait for.
+        fast_release.add_permits(1);
+
+        let toolkit = Toolkit::new();
+        assert!(
+            toolkit.config().parallel,
+            "the Java default is parallel tool execution"
+        );
+        toolkit.register_tool(Arc::new(slow));
+        toolkit.register_tool(Arc::new(fast));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![two_calls("fast"), text_response("done")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-progressive")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let mut stream = agent.stream_events(
+            vec![Msg::user("go")],
+            crate::agent::stream_options::StreamOptions::defaults(),
+        );
+        let mut ends: Vec<String> = Vec::new();
+        let mut saw_slow_start = false;
+        let mut fast_finished_before_release = false;
+        loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("the fast tool's result never became visible while slow was pending");
+            let Some(event) = next else { break };
+            let event = event.unwrap();
+            match event.event_type() {
+                AgentEventType::ToolResultStart => {
+                    if event.data().fields.get("tool_call_id")
+                        == Some(&serde_json::json!("slow-call"))
+                    {
+                        saw_slow_start = true;
+                    }
+                }
+                AgentEventType::ToolResultEnd => {
+                    let id = event
+                        .data()
+                        .fields
+                        .get("tool_call_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if id == "fast-call" && !fast_finished_before_release {
+                        assert!(saw_slow_start, "the slow tool must already be running");
+                        fast_finished_before_release = true;
+                        slow_release.add_permits(1);
+                    }
+                    ends.push(id);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            fast_finished_before_release,
+            "the fast result must arrive while the slow call is still pending"
+        );
+        assert_eq!(
+            ends,
+            vec!["fast-call".to_string(), "slow-call".to_string()],
+            "events follow completion order in parallel mode"
+        );
+
+        let state = agent.state_handle();
+        let guard = state.lock().unwrap();
+        let result_ids: Vec<String> = guard
+            .context()
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .filter_map(|result| result.id.clone())
+            .collect();
+        assert_eq!(
+            result_ids,
+            vec!["slow-call".to_string(), "fast-call".to_string()],
+            "the persisted batch keeps declaration order"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_mode_emits_start_when_execution_begins() {
+        // Mirrors Java `ProgressiveToolResultTest.serialToolsEmitStartWhenExecutionBegins`:
+        // with parallel off, the second call's Start must not be emitted while the first
+        // is still running, so Start→End spans the actual execution.
+        let (slow, _slow_started, slow_release) = GatedTool::new("slow", "slow result");
+        let (fast, _fast_started, fast_release) = GatedTool::new("fast", "fast result");
+        fast_release.add_permits(1);
+
+        let toolkit = Toolkit::with_config(crate::tool::ToolkitConfig::builder().parallel(false).build());
+        toolkit.register_tool(Arc::new(slow));
+        toolkit.register_tool(Arc::new(fast));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![two_calls("fast"), text_response("done")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-serial-progress")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let mut stream = agent.stream_events(
+            vec![Msg::user("go")],
+            crate::agent::stream_options::StreamOptions::defaults(),
+        );
+        let mut sequence: Vec<String> = Vec::new();
+        let mut released = false;
+        loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("serial execution stalled");
+            let Some(event) = next else { break };
+            let event = event.unwrap();
+            let id = event
+                .data()
+                .fields
+                .get("tool_call_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            match event.event_type() {
+                AgentEventType::ToolResultStart => {
+                    sequence.push(format!("start:{id}"));
+                    if id == "slow-call" && !released {
+                        released = true;
+                        slow_release.add_permits(1);
+                    }
+                }
+                AgentEventType::ToolResultEnd => sequence.push(format!("end:{id}")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            sequence,
+            vec![
+                "start:slow-call",
+                "end:slow-call",
+                "start:fast-call",
+                "end:fast-call",
+            ],
+            "serial mode must not admit the next call before the previous one finished"
+        );
     }
 
     #[tokio::test]

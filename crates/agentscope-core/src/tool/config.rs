@@ -16,7 +16,9 @@ pub struct ToolkitConfig {
 impl Default for ToolkitConfig {
     fn default() -> Self {
         Self {
-            parallel: false,
+            // Java `new Toolkit()` defaults to parallel execution; individual
+            // concurrency-unsafe tools still run in their own serial slot.
+            parallel: true,
             execution_config: Some(ExecutionConfig::tool_defaults()),
             allow_tool_deletion: true,
         }
@@ -36,7 +38,7 @@ pub struct ToolkitConfigBuilder {
 
 impl Default for ToolkitConfigBuilder {
     fn default() -> Self {
-        Self { parallel: false, execution_config: Some(ExecutionConfig::tool_defaults()), allow_tool_deletion: true }
+        Self { parallel: true, execution_config: Some(ExecutionConfig::tool_defaults()), allow_tool_deletion: true }
     }
 }
 
