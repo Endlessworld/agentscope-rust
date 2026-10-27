@@ -172,6 +172,24 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
         }
         let content = String::from_utf8(bytes.to_vec())
             .map_err(|_| agentscope_core::Error::Agent("session values must be UTF-8".into()))?;
+        if path.contains("/commits/") || path.contains("/blobs/") {
+            // Immutable, content-addressed objects are written once. Their bytes are the
+            // checksum, so a lost acknowledgement can be resolved by re-reading; writing a
+            // sibling `.version` file for each commit doubles the journal's file count and
+            // exposes a second crash window that has no purpose. Create-if-absent is atomic
+            // for the immutable file itself.
+            if self.fs.exists(&ctx, path).await? {
+                let existing = self.fs.read(&ctx, path, 0, usize::MAX).await?;
+                if existing.content.as_bytes() != bytes {
+                    return Err(agentscope_core::Error::Agent(
+                        "immutable session object conflict".into(),
+                    ));
+                }
+                return Ok(false);
+            }
+            self.fs.write(&ctx, path, &content).await?;
+            return Ok(true);
+        }
         self.replace(&ctx, path, &content).await?;
         self.replace(
             &ctx,
@@ -416,6 +434,37 @@ mod tests {
                 "the loser's value replaced the winner's"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn immutable_commits_do_not_get_a_version_file() {
+        // A commit's bytes are its checksum, so a sibling `.version` doubles the file count
+        // (one per event) and adds a second crash window with no benefit. A replayed write
+        // must still be idempotent when the bytes match.
+        let dir = temp_dir("immutable");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let storage = WorkspaceSessionStorage::new(Arc::clone(&fs));
+        let ctx = RuntimeContext::new();
+
+        assert!(storage
+            .compare_and_set("s1/commits/abc.json", 0, b"payload")
+            .await
+            .unwrap());
+        assert!(!storage
+            .compare_and_set("s1/commits/abc.json", 0, b"payload")
+            .await
+            .unwrap());
+        assert!(!fs
+            .exists(&ctx, "s1/commits/abc.json.version")
+            .await
+            .unwrap());
+        let err = storage
+            .compare_and_set("s1/commits/abc.json", 0, b"different")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("conflict"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

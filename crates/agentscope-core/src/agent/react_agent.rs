@@ -1,4 +1,4 @@
-//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
+﻿//! ReAct agent execution loop, mirroring `io.agentscope.core.agent.ReActAgent`.
 //!
 //! The ReAct agent runs an iterative reasoning → acting loop: it streams a model
 //! call, accumulates the reasoning result, and if the model requested tool calls
@@ -7,7 +7,9 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -726,6 +728,11 @@ impl ReActAgent {
         response_format: Option<ResponseFormat>,
         extensions: crate::agent::Extensions,
     ) -> (EventStream, Arc<Mutex<Option<Result<Msg>>>>) {
+        // Register the execution with the graceful-shutdown manager for *this* path too. The
+        // ACP host drives sessions through `stream_events_with_extensions`, not `call`, so
+        // without this the shutdown drain sees zero active requests, exits immediately, and
+        // leaves a writer lease and an open turn behind.
+        let shutdown_guard = ExecutionGuard::acquire().ok();
         let input = AgentInput::new(messages);
         let mut ctx = self.new_context(&input);
         // Layer the per-run services on top of the build-time ones: assigning would silently
@@ -776,9 +783,12 @@ impl ReActAgent {
         let ctx_core = ctx.clone();
         let slot_core = Arc::clone(&slot);
         let run_core = Arc::clone(&run);
+        let shutdown_guard_core = shutdown_guard;
         let agent_core: Box<dyn FnOnce(AgentInput) -> EventStream + Send> =
             Box::new(move |input: AgentInput| {
                 let fut = async move {
+                    // Kept alive for the whole run so the shutdown manager sees this execution.
+                    let _shutdown_guard = shutdown_guard_core;
                     let mut events = Vec::new();
                     events.push(Ok(AgentEvent::AgentStart(EventData::default())));
                     let res = run_agent_loop(&core, &ctx_core, input).await;
@@ -2528,10 +2538,42 @@ async fn acting_phase(
         .collect();
     let results = ActingResultsHandle::new();
 
+    // A tool execution is the one boundary where a crash must never be recovered by replaying
+    // the tool: the side effects may already have happened. Checkpoint the assistant message
+    // that carries the tool calls *before* running them, and record every dispatch as an
+    // uncertain outcome. A later recovery then reconciles them as interrupted instead of
+    // re-executing or silently dropping the call.
+    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+        recorder
+            .checkpoint_now(state, "before_acting")
+            .await
+            .map_err(|error| Error::ActionObservation(error.to_string()))?;
+        for call in &pending {
+            recorder
+                .record(
+                    "tool/dispatch",
+                    &serde_json::json!({
+                        "toolCallId": call.id,
+                        "toolName": call.name,
+                    }),
+                )
+                .await
+                .map_err(|error| Error::ActionObservation(error.to_string()))?;
+        }
+    }
+
     if core.middleware_chain.participants(ExtensionPoint::OnActing).is_empty() {
         // No middleware participates: keep the single-pass path — events go straight to
         // `delta_tx`, with no channel hop and no spawned task.
-        run_acting_calls(core, ctx, &pending, &reply_id, &runtime, &plan_denied, &results).await?;
+        let batch = ActingBatch {
+            core,
+            ctx,
+            reply_id: &reply_id,
+            runtime: &runtime,
+            plan_denied: &plan_denied,
+            cancel: None,
+        };
+        run_acting_calls(batch, &pending, &results).await?;
     } else {
         let mut stream = core.middleware_chain.wrap_acting(
             ctx.clone(),
@@ -2598,6 +2640,48 @@ async fn acting_phase(
     })
 }
 
+/// Guard that aborts an acting task when the consuming stream goes away.
+///
+/// The acting core runs on its own task so a middleware can wrap the event stream. Without
+/// this guard, dropping the stream (a cancelled run, a dropped prompt future) leaves the tool
+/// task running and writing against a recorder that is closing.
+struct ActingTaskGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ActingTaskGuard {
+    fn new(handle: tokio::task::JoinHandle<()>, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            handle: Some(handle),
+            cancel,
+        }
+    }
+}
+
+impl Drop for ActingTaskGuard {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Wraps an event stream so the acting task is aborted when the stream is dropped.
+struct ActingStream {
+    inner: EventStream,
+    _guard: ActingTaskGuard,
+}
+
+impl futures::Stream for ActingStream {
+    type Item = crate::error::Result<AgentEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
 /// Builds the acting core handed to [`MiddlewareChain::wrap_acting`].
 ///
 /// The core runs the tool calls on a spawned task and streams their events through an
@@ -2622,23 +2706,61 @@ fn acting_stream_core(
         inner_ctx.delta_tx = Some(tx);
         let results = input.results.clone();
         let calls = input.tool_calls;
-        tokio::spawn(async move {
-            if let Err(e) = run_acting_calls(
-                &core,
-                &inner_ctx,
-                &calls,
-                &reply_id,
-                &runtime,
-                &plan_denied,
-                &results,
-            )
-            .await
-            {
+        // The task must die with the stream: a cancelled run drops the stream but the tool
+        // would otherwise keep writing against a recorder that is closing.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task_cancel = Arc::clone(&cancel);
+        let handle = tokio::spawn(async move {
+            if task_cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let batch = ActingBatch {
+                core: &core,
+                ctx: &inner_ctx,
+                reply_id: &reply_id,
+                runtime: &runtime,
+                plan_denied: &plan_denied,
+                cancel: Some(&task_cancel),
+            };
+            if let Err(e) = run_acting_calls(batch, &calls, &results).await {
                 results.fail(e.to_string());
             }
         });
-        Box::pin(rx)
+        let guard = ActingTaskGuard::new(handle, cancel);
+        Box::pin(ActingStream {
+            inner: Box::pin(rx),
+            _guard: guard,
+        })
     })
+}
+
+/// One acting batch's per-run context, bundled so the entry points stay readable.
+struct ActingBatch<'a> {
+    core: &'a Arc<AgentCore>,
+    ctx: &'a crate::agent::RuntimeContext,
+    reply_id: &'a str,
+    runtime: &'a JsonMap,
+    plan_denied: &'a [(String, bool)],
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl ActingBatch<'_> {
+    /// Runs one tool under the observation boundary and returns its result block.
+    ///
+    /// An acknowledgement failure is returned as-is: the caller turns it into a run-level
+    /// error instead of a retryable tool result.
+    async fn observe(
+        &self,
+        call: &ToolUseBlock,
+        tctx: ToolExecutionContext,
+    ) -> Result<ToolResultBlock> {
+        crate::observation::observe(
+            self.ctx,
+            call,
+            self.core.toolkit.call_tool(call, tctx),
+        )
+        .await
+    }
 }
 
 /// Executes the pending tool calls and records every result into `results`.
@@ -2646,31 +2768,42 @@ fn acting_stream_core(
 /// Split out of [`acting_phase`] so the work can run on a spawned task: it takes no
 /// `&mut AgentState` (plan-mode denials are pre-computed by the caller) and reports
 /// through `results` instead of returning them.
+///
+/// The batch parameters travel as one [`ActingBatch`] so the entry point stays readable.
 async fn run_acting_calls(
-    core: &Arc<AgentCore>,
-    ctx: &crate::agent::RuntimeContext,
+    run: ActingBatch<'_>,
     pending: &[ToolUseBlock],
-    reply_id: &str,
-    runtime: &JsonMap,
-    plan_denied: &[(String, bool)],
     results: &ActingResultsHandle,
 ) -> Result<()> {
     for call in pending {
+        // A cancelled run must not start the next tool: the first one may have completed, but
+        // continuing the batch would perform side effects after the user asked to stop.
+        if run
+            .cancel
+            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+        {
+            return Err(Error::Cancelled("execution cancelled by the caller".into()));
+        }
+        check_interrupted(run.core, Some(run.ctx))?;
         // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`): while plan
         // mode is active, only read-only tools and the always-allowed orchestration/plan
         // tools may run; every other call gets a synthetic DENIED result without executing.
-        let denied_by_plan = plan_denied.iter().any(|(id, denied)| id == &call.id && *denied);
+        let denied_by_plan = run
+            .plan_denied
+            .iter()
+            .any(|(id, denied)| id == &call.id && *denied);
         if denied_by_plan {
-            emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+            emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
             emit_tool_result_text_delta(
-                &ctx.delta_tx,
+                &run.ctx.delta_tx,
                 &call.id,
                 &call.name,
                 PLAN_MODE_DENY_MESSAGE,
             );
-            results.record(denied_result(call, PLAN_MODE_DENY_MESSAGE), false);
+            results
+                .record(denied_result(call, PLAN_MODE_DENY_MESSAGE), false);
             emit_tool_result_end(
-                &ctx.delta_tx,
+                &run.ctx.delta_tx,
                 &call.id,
                 &call.name,
                 ToolResultState::Denied,
@@ -2678,35 +2811,30 @@ async fn run_acting_calls(
             );
             continue;
         }
-        let decision = evaluate_permission(core, call);
+        let decision = evaluate_permission(run.core, call);
         match decision.behavior {
             PermissionBehavior::Deny => {
                 // Emit ToolResultStart → TextDelta → End for denied calls.
-                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
                 let denied_text = "Permission denied by rules";
-                emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
-                results.record(denied_result(call, &decision.message), false);
-                emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+                emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, denied_text);
+                results
+                    .record(denied_result(call, &decision.message), false);
+                emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
             }
             PermissionBehavior::Allow | PermissionBehavior::Passthrough => {
                 // Emit ToolResultStart for this tool execution.
-                emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
                 let tctx = tool_execution_context(
                     call,
-                    runtime.clone(),
-                    &ctx.delta_tx,
-                    tool_request_config(ctx),
-                    &reply_id,
+                    run.runtime.clone(),
+                    &run.ctx.delta_tx,
+                    tool_request_config(run.ctx),
+                    run.reply_id,
                 );
                 // Record the action lifecycle around the real tool call. An acknowledgement
                 // failure is a run-level error: it must never become a retryable tool result.
-                let observed = crate::observation::observe(
-                    ctx,
-                    call,
-                    core.toolkit.call_tool(call, tctx),
-                )
-                .await;
-                match observed {
+                match run.observe(call, tctx).await {
                     Ok(rb) => {
                         // Emit text delta for non-streaming results (streaming tools
                         // emit their own deltas via the emitter callback).
@@ -2717,7 +2845,7 @@ async fn run_acting_calls(
                             }
                         }
                         if !result_text.trim().is_empty() {
-                            emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &result_text);
+                            emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &result_text);
                         }
                         // Java #3435: a suspended call must not fabricate a result — no
                         // ToolResultEnd event is emitted (the external-execution requirement
@@ -2727,54 +2855,64 @@ async fn run_acting_calls(
                         let final_state = rb.final_state();
                         let metadata = rb.metadata.clone();
                         let bound = bind_result(call, rb);
-                        let rd = is_return_direct_result(core, &bound);
+                        let rd = is_return_direct_result(run.core, &bound);
                         results.record(bound, rd);
                         if was_suspended {
                             emit_require_external_execution(
-                                &ctx.delta_tx,
-                                &reply_id,
+                                &run.ctx.delta_tx,
+                                run.reply_id,
                                 call,
                                 suspend_reason.as_deref(),
                             );
                         } else {
-                            emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
+                            emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, final_state, &metadata);
                         }
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
-                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, &err_msg);
-                        results.record(error_result(call, &err_msg), false);
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
+                        // An observation failure means the *result* could not be acknowledged,
+                        // not that the tool failed. Replaying it would repeat real side effects,
+                        // so the run fails with the real error and the tool stays uncertain in
+                        // the journal (recovery must reconcile it explicitly).
+                        if matches!(e, Error::ActionObservation(_)) {
+                            results.fail(err_msg.clone());
+                            emit_tool_result_end(
+                                &run.ctx.delta_tx,
+                                &call.id,
+                                &call.name,
+                                ToolResultState::Error,
+                                &JsonMap::new(),
+                            );
+                            return Err(e);
+                        }
+                        results
+                            .record(error_result(call, &err_msg), false);
+                        emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &err_msg);
+                        emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Error, &JsonMap::new());
                     }
                 }
             }
             PermissionBehavior::Ask => {
-                let handler = core.confirm_handler.lock().unwrap().clone();
+                let handler = run.core.confirm_handler.lock().unwrap().clone();
                 if let Some(handler) = handler {
                     // Emit ToolResultStart so ACP clients know this tool is being
                     // processed (even though it's waiting for user confirmation).
-                    emit_tool_result_start(&ctx.delta_tx, &call.id, &call.name);
+                    emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
                     let confirm_result = handler(call.clone()).await;
                     if confirm_result.is_confirmed() {
                         // Use the (possibly modified) tool call if the user tweaked input.
                         let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
-                        emit_tool_result_start(&ctx.delta_tx, &effective_call.id, &effective_call.name);
+                        emit_tool_result_start(&run.ctx.delta_tx, &effective_call.id, &effective_call.name);
                         let tctx = tool_execution_context(
                             effective_call,
-                            runtime.clone(),
-                            &ctx.delta_tx,
-                            tool_request_config(ctx),
-                            &reply_id,
+                            run.runtime.clone(),
+                            &run.ctx.delta_tx,
+                            tool_request_config(run.ctx),
+                            run.reply_id,
                         );
                         // Same observation boundary as the allow path: a failed
                         // acknowledgement is a run-level error, never a tool result.
-                        let observed = crate::observation::observe(
-                            ctx,
-                            effective_call,
-                            core.toolkit.call_tool(effective_call, tctx),
-                        )
-                        .await;
-                        match observed {
+                        match run.observe(effective_call, tctx).await {
                             Ok(rb) => {
                                 let mut result_text = String::new();
                                 for block in &rb.output {
@@ -2783,39 +2921,52 @@ async fn run_acting_calls(
                                     }
                                 }
                                 if !result_text.trim().is_empty() {
-                                    emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
+                                    emit_tool_result_text_delta(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, &result_text);
                                 }
                                 let was_suspended = rb.is_suspended();
                                 let suspend_reason = rb.suspend_reason().map(str::to_string);
                                 let final_state = rb.final_state();
                                 let metadata = rb.metadata.clone();
                                 let bound = bind_result(effective_call, rb);
-                                let rd = is_return_direct_result(core, &bound);
+                                let rd = is_return_direct_result(run.core, &bound);
                                 results.record(bound, rd);
                                 if was_suspended {
                                     emit_require_external_execution(
-                                        &ctx.delta_tx,
-                                        &reply_id,
+                                        &run.ctx.delta_tx,
+                                        run.reply_id,
                                         effective_call,
                                         suspend_reason.as_deref(),
                                     );
                                 } else {
-                                    emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
+                                    emit_tool_result_end(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, final_state, &metadata);
                                 }
                             }
                             Err(e) => {
                                 let err_msg = e.to_string();
-                                emit_tool_result_text_delta(&ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
-                                results.record(error_result(effective_call, &err_msg), false);
-                                emit_tool_result_end(&ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
+                                if matches!(e, Error::ActionObservation(_)) {
+                                    results.fail(err_msg.clone());
+                                    emit_tool_result_end(
+                                        &run.ctx.delta_tx,
+                                        &effective_call.id,
+                                        &effective_call.name,
+                                        ToolResultState::Error,
+                                        &JsonMap::new(),
+                                    );
+                                    return Err(e);
+                                }
+                                emit_tool_result_text_delta(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, &err_msg);
+                                results
+                                    .record(error_result(effective_call, &err_msg), false);
+                                emit_tool_result_end(&run.ctx.delta_tx, &effective_call.id, &effective_call.name, ToolResultState::Error, &JsonMap::new());
                             }
                         }
                     } else {
                         // User denied the tool call.
                         let denied_text = &confirm_result.message;
-                        emit_tool_result_text_delta(&ctx.delta_tx, &call.id, &call.name, denied_text);
-                        results.record(denied_result(call, denied_text), false);
-                        emit_tool_result_end(&ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
+                        emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, denied_text);
+                        results
+                            .record(denied_result(call, denied_text), false);
+                        emit_tool_result_end(&run.ctx.delta_tx, &call.id, &call.name, ToolResultState::Denied, &JsonMap::new());
                     }
                 } else {
                     return Err(Error::Agent(format!(
@@ -2830,7 +2981,6 @@ async fn run_acting_calls(
     results.finish();
     Ok(())
 }
-
 /// Produces the termination message when the maximum number of iterations is hit.
 ///
 /// Mirrors the Java `summarizing()`: handles pending tool calls that were not completed
@@ -5168,6 +5318,103 @@ mod tests {
             err.to_string().contains("produced no result"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_acting_stream_aborts_the_tool_task() {
+        // Regression for detached tools: a cancelled run drops the event stream, but the
+        // tool used to keep running (and writing against a recorder that is closing). The
+        // acting task must be aborted when its stream is dropped.
+        struct BlockingTool {
+            started: Arc<AtomicBool>,
+            aborted: Arc<AtomicBool>,
+        }
+
+        struct AbortGuard(Arc<AtomicBool>);
+        impl Drop for AbortGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait]
+        impl Tool for BlockingTool {
+            fn name(&self) -> &str {
+                "block"
+            }
+            fn description(&self) -> &str {
+                "blocks until the task is aborted"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn call(
+                &self,
+                _args: JsonMap,
+                _ctx: ToolExecutionContext,
+            ) -> Result<ToolResultBlock> {
+                self.started.store(true, Ordering::SeqCst);
+                let _guard = AbortGuard(Arc::clone(&self.aborted));
+                futures::future::pending::<()>().await;
+                unreachable!("pending never resolves")
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(BlockingTool {
+            started: Arc::clone(&started),
+            aborted: Arc::clone(&aborted),
+        }));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c-block", "block", JsonMap::new())],
+        ));
+        // A participating middleware is what routes the phase through the spawned acting
+        // task; without it the single-pass path has no detached task to cancel.
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ActingProbeMiddleware {
+            calls: Arc::new(Mutex::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-acting-cancel")
+            .model(model)
+            .toolkit(toolkit)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let mut stream = agent.stream_events_with_extensions(
+            vec![Msg::user("block")],
+            StreamOptions::defaults(),
+            Default::default(),
+        );
+        // Drain until the tool is actually running, then drop the stream as a cancelled run
+        // (or a dropped prompt future) would.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the tool never started"
+            );
+            tokio::select! {
+                _ = stream.next() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
+        drop(stream);
+
+        // Aborting is asynchronous: the task is dropped at its next yield point.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !aborted.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the tool task kept running after its stream was dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

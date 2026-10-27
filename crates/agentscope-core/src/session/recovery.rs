@@ -17,14 +17,17 @@ use crate::message::{
 };
 
 /// The reconciliation writer lease.
-const LEASE: Duration = Duration::from_secs(120);
+///
+/// Closing a turn is a short operation. A long lease would keep a crashed close blocking the
+/// next writer for two minutes even though its heartbeat is already gone.
+const LEASE: Duration = Duration::from_secs(15);
 
 /// How many times a reconciliation waits for the execution writer to go away.
 ///
 /// A run holds the writer lease for its whole lifetime (renewed by its heartbeat), so a
 /// cancellation that races the run's own shutdown used to fail on the first attempt and
 /// leave the turn open forever. Retrying turns that race into a bounded wait.
-const ACQUIRE_ATTEMPTS: usize = 200;
+const ACQUIRE_ATTEMPTS: usize = 1_200;
 
 /// Delay between writer-acquisition attempts.
 const ACQUIRE_RETRY_DELAY: Duration = Duration::from_millis(25);

@@ -10,11 +10,11 @@ use std::time::Duration;
 use super::{session_error, Head, SessionEvent, SessionLog, Writer};
 use crate::message::Msg;
 
-/// How many times acceptance retries a busy writer before failing.
-const ACCEPT_ATTEMPTS: usize = 100;
-
 /// The inbox lease is short: acceptance never blocks on execution progress.
-const INBOX_LEASE: Duration = Duration::from_secs(120);
+const INBOX_LEASE: Duration = Duration::from_secs(10);
+
+/// How many times acceptance retries a busy writer before failing.
+const ACCEPT_ATTEMPTS: usize = 400;
 
 /// A durably accepted command.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -299,8 +299,13 @@ impl SessionInbox {
     }
 
     /// Acquires the inbox writer lease, retrying while an execution writer holds it.
+    ///
+    /// The wait is generous (up to ~18s, growing from 10ms to 80ms per attempt) because the
+    /// lease can be held for a whole run and only released by a commit that is finishing. A
+    /// caller that gives up on the first second would turn a normal in-flight commit into a
+    /// rejected user prompt.
     async fn acquire(&self) -> crate::error::Result<Writer> {
-        for _ in 0..ACCEPT_ATTEMPTS {
+        for attempt in 0..ACCEPT_ATTEMPTS {
             match self
                 .journal
                 .acquire(&uuid::Uuid::new_v4().to_string(), INBOX_LEASE)
@@ -312,7 +317,10 @@ impl SessionInbox {
                     if !error.to_string().contains("active writer") {
                         return Err(error);
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let backoff = Duration::from_millis(10)
+                        .saturating_mul(1 + (attempt / 50) as u32)
+                        .min(Duration::from_millis(100));
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }

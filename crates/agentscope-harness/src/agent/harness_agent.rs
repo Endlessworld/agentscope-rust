@@ -107,6 +107,11 @@ pub struct HarnessAgent {
     skill_curator: Option<Arc<SkillCurator>>,
     /// Skill audit log, when the self-learning loop is enabled.
     skill_audit_log: Option<Arc<SkillAuditLog>>,
+    /// The journal store the embedded agent resolves its sessions through.
+    ///
+    /// The core agent owns the recorder/persistence path; this handle is only used by read
+    /// APIs (`session/list`) that need to enumerate sessions from the same backend.
+    session_log_store: Option<Arc<dyn SessionLogStore>>,
 }
 
 /// The default maximum reasoning→acting iterations used when none is configured.
@@ -227,6 +232,19 @@ impl HarnessAgent {
     ) -> crate::Result<SessionProjection> {
         let log = self.session_log(context).await?;
         SessionProjection::read(&*log).await
+    }
+
+    /// Lists every persisted session for the caller's user, newest first.
+    ///
+    /// The journal is the durable authority for native sessions; the in-memory registry only
+    /// knows sessions this process created. A client that restarts must still see its history,
+    /// so this reads the store's session index instead of the registry.
+    pub async fn list_session_keys(&self, context: &RuntimeContext) -> crate::Result<Vec<SessionKey>> {
+        let store = self
+            .session_log_store
+            .as_ref()
+            .ok_or_else(|| crate::Error::Session("native session history is not enabled".into()))?;
+        store.list(context).await
     }
 
     /// Reads the replayable transcript of the session bound to `context`. Mirrors Java
@@ -2039,6 +2057,7 @@ impl HarnessAgentBuilder {
             skill_usage_store: pending_skill_usage_store,
             skill_curator: pending_skill_curator,
             skill_audit_log: pending_skill_audit_log,
+            session_log_store,
         }
     }
 }

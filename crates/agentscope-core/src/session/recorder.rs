@@ -35,7 +35,12 @@ pub const TURN_ID_CONTEXT_KEY: &str = "agentscope.session.turnId";
 pub const PARENT_CONTEXT_KEY: &str = "agentscope.session.parent";
 
 /// The execution writer lease duration.
-const LEASE: Duration = Duration::from_secs(120);
+///
+/// A short lease bounds how long a crashed process blocks the next writer; the heartbeat
+/// renews it well before expiry, so even a slow model stream or a long tool stays owned.
+/// The previous 120s made a lost process look alive for two minutes, which is long enough
+/// for a host to give up and send another prompt into an open turn.
+const LEASE: Duration = Duration::from_secs(30);
 
 /// Lower bound for the renewal tick, so a deliberately short lease (tests) still renews.
 const MIN_RENEW_INTERVAL: Duration = Duration::from_millis(50);
@@ -46,7 +51,59 @@ fn renew_interval(lease: Duration) -> Duration {
 }
 
 /// Pending buffer ceiling before acceptance refuses to grow it further.
-const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+///
+/// A single state checkpoint of a long conversation can legitimately exceed the old 16 MiB
+/// bound; failing the terminal write turned a healthy turn into an `interrupted` receipt. The
+/// journal spills payloads above 64 KiB to blobs, so the in-memory ceiling only needs to be a
+/// safety bound, not a hard event limit.
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many times a flush retries a transient persistence failure before giving up.
+const FLUSH_ATTEMPTS: usize = 6;
+
+/// Initial backoff between flush attempts.
+const FLUSH_RETRY_BASE: Duration = Duration::from_millis(100);
+
+/// Whether a persistence failure is transient enough to retry the same batch.
+///
+/// Fencing, sealing, corrupted history and non-contiguous prefixes are ownership/data
+/// failures: retrying them would either duplicate work or hide a real inconsistency.
+fn is_retryable_session_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    const FATAL: &[&str] = &[
+        "fenced",
+        "sealed",
+        "stale committed prefix",
+        "non-contiguous",
+        "batch id reused",
+        "checksum mismatch",
+        "missing committed",
+        "broken committed",
+        "incomplete committed",
+        "immutable commit conflict",
+        "immutable payload blob conflict",
+        "invalid committed",
+        "commit chain cycle",
+    ];
+    if FATAL.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    const RETRYABLE: &[&str] = &[
+        "contention",
+        "busy",
+        "timeout",
+        "timed out",
+        "i/o",
+        "io error",
+        "connection",
+        "temporar",
+        "unavailable",
+        "failed to commit",
+        "storage",
+        "database is locked",
+    ];
+    RETRYABLE.iter().any(|needle| lower.contains(needle))
+}
 
 /// The logical outcome of a normally returned result, independent of the caller's handle.
 ///
@@ -91,15 +148,27 @@ fn options_payload(options: &crate::model::GenerateOptions) -> serde_json::Value
     })
 }
 
+/// One reserved batch whose commit is in flight (or awaiting a retry).
+///
+/// Sequence numbers are reserved when the batch is drained from `pending`, so events appended
+/// while storage is awaiting must continue after it instead of reusing its slots.
+#[derive(Clone)]
+struct InflightBatch {
+    batch_id: String,
+    events: Vec<SessionEvent>,
+    bytes: usize,
+}
+
 /// Mutable recording state guarded by one mutex.
 #[derive(Default)]
 struct RecorderState {
     pending: Vec<SessionEvent>,
     pending_bytes: usize,
+    /// Events handed to an in-flight commit but not acknowledged yet.
+    inflight: Option<InflightBatch>,
     durable_seq: u64,
     failure: Option<String>,
     closed: bool,
-    batch_id: Option<String>,
     result_status: Option<String>,
     result_reason: Option<String>,
     result_json: Option<String>,
@@ -125,6 +194,8 @@ pub struct SessionRecorder {
     lease: Duration,
     /// Background lease renewal; `None` when no Tokio runtime was available at open time.
     heartbeat: Mutex<Option<LeaseHeartbeat>>,
+    /// Serializes flush: a second flush must not commit the same reserved prefix.
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl Drop for SessionRecorder {
@@ -183,17 +254,44 @@ impl LeaseHeartbeat {
         let task_stop = Arc::clone(&stop);
         let interval = renew_interval(lease);
         let handle = runtime.spawn(async move {
+            let mut transient_failures = 0u32;
             loop {
                 tokio::time::sleep(interval).await;
                 if task_stop.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Err(error) = log.renew(&writer, lease).await {
-                    // The lease is gone (expired, fenced, sealed or released elsewhere).
-                    // Stop renewing; the next flush surfaces the failure instead of this
-                    // task silently writing against a journal another writer now owns.
-                    tracing::warn!("session writer lease renewal failed: {error}");
-                    return;
+                match log.renew(&writer, lease).await {
+                    Ok(()) => transient_failures = 0,
+                    Err(error) => {
+                        let message = error.to_string();
+                        // A fenced/sealed writer has genuinely lost ownership: stop renewing
+                        // instead of writing against a journal another writer may own.
+                        if !is_retryable_session_error(&message) {
+                            tracing::warn!(
+                                run = %writer.owner,
+                                epoch = writer.epoch,
+                                %error,
+                                "session writer lease renewal stopped: ownership lost or journal unusable"
+                            );
+                            return;
+                        }
+                        // A transient storage failure must not silently kill the heartbeat:
+                        // retry until the lease would expire, then surface the real failure on
+                        // the next flush.
+                        transient_failures = transient_failures.saturating_add(1);
+                        let backoff = interval
+                            .min(Duration::from_millis(100) * 2u32.saturating_pow(transient_failures.min(5)))
+                            .max(Duration::from_millis(50));
+                        tracing::warn!(
+                            run = %writer.owner,
+                            epoch = writer.epoch,
+                            attempt = transient_failures,
+                            backoff_ms = backoff.as_millis() as u64,
+                            %error,
+                            "session writer lease renewal failed transiently; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
                 }
             }
         });
@@ -353,7 +451,20 @@ impl SessionRecorder {
         }
 
         let writer = log.acquire(run_id, lease).await?;
-        let head = log.head().await?;
+        // Renew from the moment the lease is held: the replay below can take longer than the
+        // lease on a large journal, and starting the heartbeat only after the recorder is
+        // constructed lets the writer expire during recovery.
+        let heartbeat = LeaseHeartbeat::start(Arc::clone(&log), writer.clone(), lease);
+        let head = match log.head().await {
+            Ok(head) => head,
+            Err(error) => {
+                if let Some(heartbeat) = heartbeat {
+                    heartbeat.shutdown().await;
+                }
+                let _ = log.release(&writer).await;
+                return Err(error);
+            }
+        };
         let prepared = async {
             if let Some(baseline) = baseline.filter(|baseline| {
                 baseline.seq == head.seq
@@ -457,13 +568,16 @@ impl SessionRecorder {
             match prepared {
                 Ok(values) => values,
                 Err(error) => {
+                    if let Some(heartbeat) = heartbeat {
+                        heartbeat.shutdown().await;
+                    }
                     let _ = log.release(&writer).await;
                     return Err(error);
                 }
             };
 
         Ok(Self {
-            heartbeat: Mutex::new(LeaseHeartbeat::start(Arc::clone(&log), writer.clone(), lease)),
+            heartbeat: Mutex::new(heartbeat),
             lease,
             log,
             writer,
@@ -479,6 +593,7 @@ impl SessionRecorder {
                 ..RecorderState::default()
             }),
             exporter,
+            flush_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -546,10 +661,20 @@ impl SessionRecorder {
         Self::check(&guard)?;
         let payload_json = serde_json::to_string(payload)?;
         let bytes = payload_json.len();
-        if guard.pending_bytes + bytes > MAX_PENDING_BYTES {
+        let inflight_bytes = guard
+            .inflight
+            .as_ref()
+            .map(|inflight| inflight.bytes)
+            .unwrap_or(0);
+        if guard.pending_bytes + inflight_bytes + bytes > MAX_PENDING_BYTES {
             return Err(session_error("Session pending buffer exhausted"));
         }
-        let seq = guard.durable_seq + guard.pending.len() as u64 + 1;
+        let inflight_events = guard
+            .inflight
+            .as_ref()
+            .map(|inflight| inflight.events.len() as u64)
+            .unwrap_or(0);
+        let seq = guard.durable_seq + inflight_events + guard.pending.len() as u64 + 1;
         let event = SessionEvent::new(
             uuid::Uuid::new_v4().to_string(),
             seq,
@@ -567,49 +692,113 @@ impl SessionRecorder {
     }
 
     /// Publishes the pending buffer as one commit.
+    ///
+    /// Only one flush may be in flight. Events appended while a commit is awaiting storage are
+    /// kept in `pending` and their sequence numbers follow the reserved in-flight batch; a
+    /// successful commit acknowledges exactly the reserved events instead of clearing whatever
+    /// happens to be pending at that moment.
     pub async fn flush(&self) -> crate::error::Result<()> {
-        let (batch, events, expected) = {
+        // Serializes commits on this recorder. `append` remains synchronous and lock-scoped.
+        let _flush_guard = self.flush_lock.lock().await;
+        let (batch, expected) = {
             let mut guard = self.lock();
             Self::check(&guard)?;
+            // A flush that reached the fatal path restores its events and clears `inflight`, so
+            // a leftover in-flight batch only exists if a caller dropped the future mid-commit.
+            // Recover it before admitting new events.
+            if guard.inflight.is_some() {
+                let inflight = guard.inflight.take().expect("inflight checked");
+                let mut restored = inflight.events;
+                restored.extend(guard.pending.drain(..));
+                guard.pending = restored;
+                guard.pending_bytes += inflight.bytes;
+            }
             if guard.pending.is_empty() {
                 return Ok(());
             }
-            let batch_id = guard
-                .batch_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            guard.batch_id = Some(batch_id.clone());
-            (batch_id, guard.pending.clone(), guard.durable_seq)
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let events: Vec<SessionEvent> = guard.pending.drain(..).collect();
+            let bytes = guard.pending_bytes;
+            guard.pending_bytes = 0;
+            let expected = guard.durable_seq;
+            guard.inflight = Some(InflightBatch {
+                batch_id: batch_id.clone(),
+                events,
+                bytes,
+            });
+            (batch_id, expected)
         };
-        self.log.renew(&self.writer, self.lease).await?;
-        let commit = self.log.commit(&self.writer, &batch, expected, &events).await;
-        match commit {
-            Ok(head) => {
-                // Keep the guard inside its own block: a `MutexGuard` held across the export
-                // await would make every recorder future non-`Send`.
-                {
-                    let mut guard = self.lock();
-                    guard.durable_seq = head.seq;
-                    guard.pending.clear();
-                    guard.pending_bytes = 0;
-                    guard.batch_id = None;
-                }
-                if let Some(exporter) = &self.exporter {
-                    // Export is best effort: a failed drain is retried by the next flush and
-                    // never fails the execution that produced the facts.
-                    let _ = exporter.drain().await;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                let message = error.to_string();
-                {
-                    let mut guard = self.lock();
-                    if guard.failure.is_none() {
-                        guard.failure = Some(message.clone());
+
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let (events, bytes) = {
+                let guard = self.lock();
+                let inflight = guard
+                    .inflight
+                    .as_ref()
+                    .filter(|inflight| inflight.batch_id == batch)
+                    .ok_or_else(|| session_error("Session commit batch disappeared"))?;
+                (inflight.events.clone(), inflight.bytes)
+            };
+            let commit = match self.log.renew(&self.writer, self.lease).await {
+                Ok(()) => self.log.commit(&self.writer, &batch, expected, &events).await,
+                Err(error) => Err(error),
+            };
+            match commit {
+                Ok(head) => {
+                    {
+                        let mut guard = self.lock();
+                        guard.durable_seq = head.seq;
+                        guard.inflight = None;
                     }
+                    if let Some(exporter) = &self.exporter {
+                        // Export is best effort: a failed drain is retried by the next flush and
+                        // never fails the execution that produced the facts.
+                        let _ = exporter.drain().await;
+                    }
+                    return Ok(());
                 }
-                Err(session_error(format!("Failed to commit session prefix: {message}")))
+                Err(error) => {
+                    let message = error.to_string();
+                    // A transient storage/CAS failure must not poison the whole run. Retry the
+                    // identical batch: the journal resolves a replayed batch id idempotently.
+                    if is_retryable_session_error(&message) && attempt < FLUSH_ATTEMPTS {
+                        let backoff = FLUSH_RETRY_BASE
+                            .saturating_mul(1u32 << (attempt - 1).min(4))
+                            .min(Duration::from_secs(2));
+                        tracing::warn!(
+                            run = %self.run_id,
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            %error,
+                            "session commit failed transiently; retrying the same batch"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    // Fatal (or retries exhausted): keep the events for diagnostics and make
+                    // the failure sticky, so no later write can pretend to have persisted.
+                    {
+                        let mut guard = self.lock();
+                        let mut restored = match guard.inflight.take() {
+                            Some(inflight) if inflight.batch_id == batch => inflight.events,
+                            // Defensive: the in-flight slot is ours (flush is serialized), so
+                            // this only happens if the state was reset underneath us. Restore
+                            // the batch we committed instead of dropping its events.
+                            _ => events,
+                        };
+                        restored.extend(guard.pending.drain(..));
+                        guard.pending = restored;
+                        guard.pending_bytes += bytes;
+                        if guard.failure.is_none() {
+                            guard.failure = Some(message.clone());
+                        }
+                    }
+                    return Err(session_error(format!(
+                        "Failed to commit session prefix: {message}"
+                    )));
+                }
             }
         }
     }
@@ -956,6 +1145,7 @@ impl SessionRecorder {
         self.stop_heartbeat().await;
         let _ = self.log.release(&self.writer).await;
     }
+
     /// Stops the background lease renewal and waits for its task to end.
     async fn stop_heartbeat(&self) {
         let heartbeat = self
@@ -1394,6 +1584,204 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("persistence failed"), "{err}");
         recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_transient_commit_failure_is_retried_and_does_not_poison_the_recorder() {
+        struct FlakyStorage {
+            inner: MemorySessionStorage,
+            failures_left: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl AtomicSessionStorage for FlakyStorage {
+            async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
+                self.inner.read(path).await
+            }
+
+            async fn compare_and_set(
+                &self,
+                path: &str,
+                expected_version: u64,
+                bytes: &[u8],
+            ) -> crate::error::Result<bool> {
+                if path.contains("/commits/")
+                    && self
+                        .failures_left
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok()
+                {
+                    return Err(crate::error::Error::Other("temporary storage outage".into()));
+                }
+                self.inner
+                    .compare_and_set(path, expected_version, bytes)
+                    .await
+            }
+        }
+
+        let storage = Arc::new(FlakyStorage {
+            inner: MemorySessionStorage::new(),
+            failures_left: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
+            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+            "s1",
+        ));
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap();
+
+        recorder
+            .record("run/start", &serde_json::json!({}))
+            .await
+            .expect("a transient commit failure must be retried");
+
+        // The recorder stays usable: no sticky failure, and the next fact lands too.
+        recorder
+            .record("turn/start", &serde_json::json!({}))
+            .await
+            .expect("the recorder must remain usable after a retry");
+        assert_eq!(log.head().await.unwrap().seq, 2);
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_can_be_renewed_by_the_same_owner() {
+        // Regression for suspend/clock-jump/replay-longer-than-lease: the same owner/epoch
+        // must be able to reclaim its own lease instead of being treated as fenced.
+        let (log, _storage) = journal().await;
+        let lease = Duration::from_millis(100);
+        let writer = log.acquire("run-1", lease).await.unwrap();
+        tokio::time::sleep(lease * 3).await;
+        log.renew(&writer, lease)
+            .await
+            .expect("the owner must be able to renew after its lease expired");
+        log.commit(
+            &writer,
+            "batch",
+            0,
+            &[SessionEvent::new(
+                "e1",
+                1,
+                0,
+                "run/start",
+                Some("run-1".into()),
+                None,
+                true,
+                "{}",
+            )
+            .unwrap()],
+        )
+        .await
+        .expect("the owner must be able to commit after renewing");
+        log.release(&writer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_event_appended_during_a_flush_is_not_dropped() {
+        // Regression for clone-then-clear: the old flush cleared whatever was pending when the
+        // commit returned, so an event appended while storage was awaiting was silently lost
+        // (its sequence number was also reused by the next append).
+        struct GatedStorage {
+            inner: MemorySessionStorage,
+            /// Whether the next commit write should pause inside storage.
+            gate_next_commit: AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl AtomicSessionStorage for GatedStorage {
+            async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
+                self.inner.read(path).await
+            }
+
+            async fn compare_and_set(
+                &self,
+                path: &str,
+                expected_version: u64,
+                bytes: &[u8],
+            ) -> crate::error::Result<bool> {
+                if path.contains("/commits/")
+                    && self.gate_next_commit.swap(false, Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner
+                    .compare_and_set(path, expected_version, bytes)
+                    .await
+            }
+        }
+
+        let storage = Arc::new(GatedStorage {
+            inner: MemorySessionStorage::new(),
+            gate_next_commit: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
+            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+            "s1",
+        ));
+        let recorder = Arc::new(SessionRecorder::open(Arc::clone(&log), Some("t1")).await.unwrap());
+        recorder
+            .append("run/start", &serde_json::json!({}))
+            .unwrap();
+
+        let flushing = tokio::spawn({
+            let recorder = Arc::clone(&recorder);
+            async move { recorder.flush().await }
+        });
+        // Wait until the first batch is inside storage, then append a second fact.
+        storage.entered.notified().await;
+        let appended = recorder
+            .append("turn/start", &serde_json::json!({}))
+            .expect("appending while a commit is in flight must succeed");
+        assert_eq!(appended, 2, "the in-flight batch must keep its reserved slot");
+        storage.release.notify_one();
+        flushing.await.unwrap().unwrap();
+
+        // The second fact was not part of the acknowledged batch: the next flush publishes it.
+        recorder.flush().await.unwrap();
+
+        let head = log.head().await.unwrap();
+        assert_eq!(head.seq, 2, "both facts must be durable");
+        let events = log.scan(0, head.seq).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[1].seq, 2);
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_lease_held_by_writer_a_still_fences_writer_b() {
+        let (log, _storage) = journal().await;
+        let writer = log.acquire("run-1", Duration::from_millis(100)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A new owner can take over an expired lease; after that the old writer is fenced.
+        let next = log.acquire("run-2", Duration::from_secs(30)).await.unwrap();
+        let err = log
+            .commit(
+                &writer,
+                "b1",
+                0,
+                &[SessionEvent::new(
+                    "e1",
+                    1,
+                    0,
+                    "run/start",
+                    Some("run-1".into()),
+                    None,
+                    true,
+                    "{}",
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fenced"), "{err}");
+        log.release(&next).await.unwrap();
     }
 
     #[tokio::test]

@@ -374,13 +374,40 @@ impl SessionProjection {
                         uncertain.insert(id);
                     }
                 }
+                "tool/result" => {
+                    // A persisted tool result is the authoritative outcome, regardless of
+                    // whether the action observer managed to write `action/end` (a denied or
+                    // plan-rejected call never runs one). It must clear dispatch uncertainty;
+                    // otherwise every later open demands reconciliation for a settled call.
+                    if let Some(value) = data.get("message") {
+                        if let Ok(message) = serde_json::from_value::<crate::message::Msg>(value.clone()) {
+                            for result in message.tool_result_blocks() {
+                                if let Some(id) = result.id.as_deref() {
+                                    uncertain.remove(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                // `action/start` is the first durable fact of a tool execution. Treating it as
+                // uncertain means a crash between "tool started" and "action/end" is recoverable
+                // even when the writer never got to record `tool/dispatch`.
+                "action/start" => {
+                    if let Some(id) = json_str(&data, "toolCallId") {
+                        uncertain.insert(id);
+                    }
+                }
                 "action/end" => {
+                    // The attempt ended, so it is no longer *uncertain* — even when the tool
+                    // failed before producing a result (`result: null`). Leaving it uncertain
+                    // would make every later open of the session demand a reconciliation for a
+                    // failure the run already recorded.
+                    let id = json_str(&data, "toolCallId").unwrap_or_default();
+                    uncertain.remove(&id);
                     // An explicit null is a missing result, not a result to decode: earlier
                     // writers recorded the field unconditionally, and trying to parse it fails
                     // the whole projection (and with it every resume of that session).
                     if let Some(value) = data.get("result").filter(|value| !value.is_null()) {
-                        let id = json_str(&data, "toolCallId").unwrap_or_default();
-                        uncertain.remove(&id);
                         // Early native action payloads omitted the polymorphic discriminator.
                         let mut value = value.clone();
                         if let Some(object) = value.as_object_mut() {
@@ -692,6 +719,7 @@ mod tests {
 
     use super::*;
     use crate::message::TextBlock;
+    use crate::message::ToolResultState;
     use crate::session::{
         AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog, Writer,
     };
@@ -1008,6 +1036,97 @@ mod tests {
         let projection = SessionProjection::read(&*log).await.unwrap();
         assert_eq!(projection.as_of_seq, 2);
         assert!(projection.uncertain_tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_action_start_alone_marks_the_tool_uncertain() {
+        // A crash between "tool started" and its result must be recoverable even when the
+        // writer never recorded `tool/dispatch`: the side effect may already have happened.
+        let (_storage, log, writer) = journal().await;
+        let state = crate::state::AgentState::builder().session_id("s1").build();
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "state/checkpoint",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+                ),
+                event(
+                    2,
+                    "action/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-crash" }),
+                ),
+            ],
+        )
+        .await;
+
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert!(
+            projection.uncertain_tool_calls.contains("call-crash"),
+            "{:?}",
+            projection.uncertain_tool_calls
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persisted_tool_result_clears_dispatch_uncertainty() {
+        // A denied or plan-rejected call writes `tool/result` without a matching `action/end`.
+        // It is settled, so a later open must not demand a reconciliation.
+        let (_storage, log, writer) = journal().await;
+        let state = crate::state::AgentState::builder().session_id("s1").build();
+        let result = ToolResultBlock::new(
+            "call-denied",
+            "write_file",
+            text_blocks("Permission denied by rules"),
+        )
+        .with_state(ToolResultState::Denied);
+        let msg = Msg::builder()
+            .role(MsgRole::Tool)
+            .content(vec![ContentBlock::ToolResult(result)])
+            .build();
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "state/checkpoint",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+                ),
+                event(
+                    2,
+                    "tool/dispatch",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-denied" }),
+                ),
+                event(
+                    3,
+                    "tool/result",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "message": msg }),
+                ),
+            ],
+        )
+        .await;
+
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert!(
+            projection.uncertain_tool_calls.is_empty(),
+            "{:?}",
+            projection.uncertain_tool_calls
+        );
     }
 
     #[tokio::test]

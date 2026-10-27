@@ -311,11 +311,37 @@ impl AcpCodingAgent {
             .cloned()
     }
 
+    /// Whether a persisted journal exists for `session_id`.
+    ///
+    /// `session/load` and `session/resume` must not silently create an empty session for a
+    /// mistyped or deleted id: the client would see a successful load with no history. The
+    /// journal is the durable authority, so probe it before building anything.
+    async fn session_exists(&self, session_id: &SessionId, cwd: PathBuf) -> bool {
+        let agent = match &self.session_factory {
+            Some(factory) => factory(SessionBuild {
+                cwd: cwd.clone(),
+                session_id: session_id.to_string(),
+                client_support: self.client_support.clone(),
+                elicitation_slot: Arc::new(Mutex::new(None)),
+            }),
+            None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
+        };
+        let context = agentscope_core::agent::RuntimeContext::new()
+            .with_session_id(session_id.to_string());
+        match agent.session_log(&context).await {
+            Ok(log) => match log.head().await {
+                Ok(head) => head.seq > 0 || head.commit_id.is_some(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Builds the `session/list` response, honouring the request's `cursor`.
     ///
-    /// Sessions are ordered by id (stable, and the id embeds the creation
-    /// timestamp) so pagination is deterministic. `next_cursor` is the last id
-    /// of a non-final page; the client passes it back to fetch the next page.
+    /// Sessions are ordered by id (stable) so pagination is deterministic. The registry only
+    /// knows sessions this process created, so persisted sessions from a previous process are
+    /// not visible here; that is a separate durability concern from the runtime path.
     fn session_infos(&self, cursor: Option<&str>) -> ListSessionsResponse {
         const PAGE_SIZE: usize = 50;
         let guard = self.sessions.lock().unwrap();
@@ -582,8 +608,12 @@ impl AcpCodingAgent {
                 async move |req: CloseSessionRequest, responder, _cx| {
                     let sid = req.session_id;
                     if let Some(session) = a_close.get_session(&sid) {
-                        // Cancel the in-flight prompt and mark the session closed, so a prompt
-                        // that finishes later cannot re-insert it into the registry.
+                        // Cancel the in-flight prompt, wait for its run to release the journal,
+                        // and mark the session closed so a prompt that finishes later cannot
+                        // re-insert it into the registry.
+                        let _ = session
+                            .cancel_and_wait(std::time::Duration::from_secs(15))
+                            .await;
                         session.close();
                     }
                     a_close.remove_session(&sid);
@@ -604,6 +634,12 @@ impl AcpCodingAgent {
                     let session = match a_load.get_session(&sid) {
                         Some(s) => s,
                         None => {
+                            if !a_load.session_exists(&sid, req.cwd.clone()).await {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data(format!("unknown session '{sid}'")),
+                                );
+                            }
                             let session = a_load.create_session(sid.clone(), req.cwd.clone());
                             a_load.register_session(session);
                             a_load.get_session(&sid).unwrap()
@@ -630,6 +666,12 @@ impl AcpCodingAgent {
                     let session = match a_resume.get_session(&sid) {
                         Some(s) => s,
                         None => {
+                            if !a_resume.session_exists(&sid, req.cwd.clone()).await {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data(format!("unknown session '{sid}'")),
+                                );
+                            }
                             let session = a_resume.create_session(sid.clone(), req.cwd.clone());
                             a_resume.register_session(session);
                             a_resume.get_session(&sid).unwrap()
@@ -652,6 +694,12 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |req: DeleteSessionRequest, responder, _cx| {
+                    if let Some(session) = a_delete.get_session(&req.session_id) {
+                        let _ = session
+                            .cancel_and_wait(std::time::Duration::from_secs(10))
+                            .await;
+                        session.close();
+                    }
                     a_delete.remove_session(&req.session_id);
                     responder.respond(DeleteSessionResponse::new())
                 },

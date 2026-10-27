@@ -111,15 +111,16 @@ impl JournalSessionLog {
         Ok(self.storage.read(&self.seal_path(owner)).await?.is_some())
     }
 
-    /// Rejects a writer whose ownership expired or was fenced.
+    /// Rejects a writer whose ownership was fenced or sealed.
+    ///
+    /// An expired lease is **not** by itself a loss of ownership: the same owner/epoch may
+    /// renew or release after a suspend, a clock jump, a long replay or a transient storage
+    /// stall. Ownership is only lost when the epoch/owner changed, or the writer was sealed.
     async fn ensure_owned(&self, head: &Head, writer: &Writer) -> crate::error::Result<()> {
         if self.is_sealed(&writer.owner).await? {
             return Err(session_error("Session writer is permanently sealed"));
         }
-        if head.epoch != writer.epoch
-            || head.owner.as_deref() != Some(writer.owner.as_str())
-            || head.lease_until <= Self::now_ms()
-        {
+        if head.epoch != writer.epoch || head.owner.as_deref() != Some(writer.owner.as_str()) {
             return Err(session_error("Session writer ownership expired or fenced"));
         }
         Ok(())

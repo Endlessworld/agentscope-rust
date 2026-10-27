@@ -37,38 +37,6 @@ impl SqliteSessionStorage {
     pub fn database_path(&self) -> &Path {
         &self.database
     }
-
-    /// Opens a connection with the journal pragmas and schema applied.
-    fn connect(&self) -> crate::Result<Connection> {
-        if let Some(parent) = self.database.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| self.failure("Journal open failed", error))?;
-        }
-        let connection = Connection::open(&self.database)
-            .map_err(|error| self.failure("Journal open failed", error))?;
-        // Wait for competing writers instead of failing with SQLITE_BUSY.
-        connection
-            .pragma_update(None, "busy_timeout", BUSY_TIMEOUT.as_millis() as i64)
-            .map_err(|error| self.failure("Journal open failed", error))?;
-        // Rollback journal + full sync: an acknowledged commit survives a crash.
-        connection
-            .pragma_update(None, "journal_mode", "DELETE")
-            .map_err(|error| self.failure("Journal open failed", error))?;
-        connection
-            .pragma_update(None, "synchronous", "FULL")
-            .map_err(|error| self.failure("Journal open failed", error))?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS session_objects (\n                    path    TEXT PRIMARY KEY,\n                    version INTEGER NOT NULL CHECK(version > 0),\n                    payload BLOB NOT NULL\n                )",
-            )
-            .map_err(|error| self.failure("Journal open failed", error))?;
-        Ok(connection)
-    }
-
-    /// Builds a session error naming the database and the underlying failure.
-    fn failure(&self, context: &str, error: impl std::fmt::Display) -> crate::Error {
-        session_error(format!("{context}: {}: {error}", self.database.display()))
-    }
 }
 
 #[async_trait]
@@ -78,25 +46,34 @@ impl AtomicSessionStorage for SqliteSessionStorage {
         if !self.database.exists() {
             return Ok(None);
         }
-        let connection = self.connect()?;
-        let row = connection
-            .query_row(
-                "SELECT version, payload FROM session_objects WHERE path = ?1",
-                rusqlite::params![path],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .map_err(|error| self.failure("Journal read failed", error))?;
-        let Some((version, payload)) = row else {
-            return Ok(None);
-        };
-        // `version > 0` is a column constraint; re-check after conversion so a tampered
-        // database can never surface a version the journal would treat as "unversioned".
-        let version = match u64::try_from(version) {
-            Ok(version) if version > 0 => version,
-            _ => return Err(session_error("Journal object has an invalid version")),
-        };
-        Ok(Some(StorageValue::new(version, payload)))
+        let database = self.database.clone();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&database)?;
+            let row = connection
+                .query_row(
+                    "SELECT version, payload FROM session_objects WHERE path = ?1",
+                    rusqlite::params![path],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()
+                .map_err(|error| session_error(format!(
+                    "Journal read failed: {}: {error}",
+                    database.display()
+                )))?;
+            let Some((version, payload)) = row else {
+                return Ok(None);
+            };
+            // `version > 0` is a column constraint; re-check after conversion so a tampered
+            // database can never surface a version the journal would treat as "unversioned".
+            let version = match u64::try_from(version) {
+                Ok(version) if version > 0 => version,
+                _ => return Err(session_error("Journal object has an invalid version")),
+            };
+            Ok(Some(StorageValue::new(version, payload)))
+        })
+        .await
+        .map_err(|error| session_error(format!("Journal read task failed: {error}")))?
     }
 
     async fn compare_and_set(
@@ -109,46 +86,133 @@ impl AtomicSessionStorage for SqliteSessionStorage {
         if expected_version == u64::MAX {
             return Err(session_error("Invalid journal object version"));
         }
-        let connection = self.connect()?;
-        // One statement is the whole transaction: readers never see a partial write, and
-        // SQLite serializes competing writers.
-        let affected = if expected_version == 0 {
-            connection.execute(
-                "INSERT INTO session_objects(path, version, payload) VALUES (?1, 1, ?2)\n                 ON CONFLICT(path) DO NOTHING",
-                rusqlite::params![path, bytes],
-            )
-        } else {
-            let expected = i64::try_from(expected_version)
-                .map_err(|_| session_error("Invalid journal object version"))?;
-            connection.execute(
-                "UPDATE session_objects SET version = version + 1, payload = ?1\n                 WHERE path = ?2 AND version = ?3",
-                rusqlite::params![bytes, path, expected],
-            )
-        }
-        .map_err(|error| self.failure("Journal CAS failed", error))?;
-        // Fewer rows means the expectation lost the race, which is not an error.
-        Ok(affected == 1)
+        // `rusqlite` is synchronous and a write can wait on SQLite's busy timeout. Running it
+        // inline would block the async runtime's worker (and therefore every other task on that
+        // thread, including the lease heartbeat), so hop to the blocking pool.
+        let database = self.database.clone();
+        let path = path.to_string();
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&database)?;
+            // One statement is the whole transaction: readers never see a partial write, and
+            // SQLite serializes competing writers.
+            let affected = if expected_version == 0 {
+                connection.execute(
+                    "INSERT INTO session_objects(path, version, payload) VALUES (?1, 1, ?2)\n                     ON CONFLICT(path) DO NOTHING",
+                    rusqlite::params![path, bytes],
+                )
+            } else {
+                let expected = i64::try_from(expected_version)
+                    .map_err(|_| session_error("Invalid journal object version"))?;
+                connection.execute(
+                    "UPDATE session_objects SET version = version + 1, payload = ?1\n                     WHERE path = ?2 AND version = ?3",
+                    rusqlite::params![bytes, path, expected],
+                )
+            }
+            .map_err(|error| session_error(format!(
+                "Journal CAS failed: {}: {error}",
+                database.display()
+            )))?;
+            // Fewer rows means the expectation lost the race, which is not an error.
+            Ok::<bool, crate::Error>(affected == 1)
+        })
+        .await
+        .map_err(|error| session_error(format!("Journal CAS task failed: {error}")))?
     }
 
     async fn list_paths(&self, prefix: &str) -> crate::Result<Vec<String>> {
         if !self.database.exists() {
             return Ok(Vec::new());
         }
-        let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT path FROM session_objects WHERE substr(path, 1, length(?1)) = ?1\n                 ORDER BY path",
-            )
-            .map_err(|error| self.failure("Journal discovery failed", error))?;
-        let rows = statement
-            .query_map(rusqlite::params![prefix], |row| row.get::<_, String>(0))
-            .map_err(|error| self.failure("Journal discovery failed", error))?;
-        let mut paths = Vec::new();
-        for row in rows {
-            paths.push(row.map_err(|error| self.failure("Journal discovery failed", error))?);
-        }
-        Ok(paths)
+        let database = self.database.clone();
+        let prefix = prefix.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&database)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT path FROM session_objects WHERE substr(path, 1, length(?1)) = ?1\n                 ORDER BY path",
+                )
+                .map_err(|error| session_error(format!(
+                    "Journal discovery failed: {}: {error}",
+                    database.display()
+                )))?;
+            let rows = statement
+                .query_map(rusqlite::params![prefix], |row| row.get::<_, String>(0))
+                .map_err(|error| session_error(format!(
+                    "Journal discovery failed: {}: {error}",
+                    database.display()
+                )))?;
+            let mut paths = Vec::new();
+            for row in rows {
+                paths.push(row.map_err(|error| {
+                    session_error(format!(
+                        "Journal discovery failed: {}: {error}",
+                        database.display()
+                    ))
+                })?);
+            }
+            Ok(paths)
+        })
+        .await
+        .map_err(|error| session_error(format!("Journal discovery task failed: {error}")))?
     }
+}
+
+/// Opens a connection with the journal pragmas and schema applied.
+///
+/// Free function so blocking-pool closures do not need to borrow the storage value.
+fn open_connection(database: &Path) -> crate::Result<Connection> {
+    if let Some(parent) = database.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            session_error(format!(
+                "Journal open failed: {}: {error}",
+                database.display()
+            ))
+        })?;
+    }
+    let connection = Connection::open(database).map_err(|error| {
+        session_error(format!(
+            "Journal open failed: {}: {error}",
+            database.display()
+        ))
+    })?;
+    // Wait for competing writers instead of failing with SQLITE_BUSY.
+    connection
+        .pragma_update(None, "busy_timeout", BUSY_TIMEOUT.as_millis() as i64)
+        .map_err(|error| {
+            session_error(format!(
+                "Journal open failed: {}: {error}",
+                database.display()
+            ))
+        })?;
+    // Rollback journal + full sync: an acknowledged commit survives a crash.
+    connection
+        .pragma_update(None, "journal_mode", "DELETE")
+        .map_err(|error| {
+            session_error(format!(
+                "Journal open failed: {}: {error}",
+                database.display()
+            ))
+        })?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| {
+            session_error(format!(
+                "Journal open failed: {}: {error}",
+                database.display()
+            ))
+        })?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_objects (\n                path    TEXT PRIMARY KEY,\n                version INTEGER NOT NULL CHECK(version > 0),\n                payload BLOB NOT NULL\n            )",
+        )
+        .map_err(|error| {
+            session_error(format!(
+                "Journal open failed: {}: {error}",
+                database.display()
+            ))
+        })?;
+    Ok(connection)
 }
 
 #[cfg(test)]

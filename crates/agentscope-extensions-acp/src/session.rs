@@ -734,6 +734,27 @@ impl AcpAgentSession {
         errors
     }
 
+    /// Answers an outstanding interaction and continues the turn without a new user prompt.
+    ///
+    /// A suspended tool (external execution) leaves the turn non-terminal. Without this path
+    /// the only way out was `submit`, which necessarily starts a new prompt and discards the
+    /// suspended turn. Answers are validated against the committed pending requests.
+    pub async fn respond(
+        &self,
+        answers: std::collections::BTreeMap<String, agentscope_harness::agent::SessionAnswer>,
+    ) -> agentscope_core::error::Result<agentscope_harness::agent::SessionTask> {
+        let session = {
+            let runtime = self.runtime.lock().await;
+            match runtime.as_ref() {
+                Some(session) => Arc::clone(session),
+                None => return Err(agentscope_core::Error::Session(
+                    "the session runtime is not open".into(),
+                )),
+            }
+        };
+        session.respond_all(answers).await
+    }
+
     /// Current thought level.
     pub fn thought_level(&self) -> String {
         self.config.lock().unwrap().thought_level.clone()
@@ -1088,6 +1109,22 @@ impl AcpAgentSession {
         }
     }
 
+    /// Cancels the active prompt and waits for its run to settle, so the next prompt cannot
+    /// start while the previous execution still owns the journal.
+    pub async fn cancel_and_wait(&self, timeout: std::time::Duration) -> bool {
+        self.cancel();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !self.is_running() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// Whether the session was closed by the client.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
@@ -1284,7 +1321,31 @@ impl AcpAgentSession {
         // One prompt turn per session. A client may send a follow-up before the previous
         // response arrives (a retry, a Stop followed by a new message); without this lock the
         // second run raced the first and was rejected as `turn_unfinished`, losing the input.
-        let _prompt_guard = Arc::clone(&self.prompt_lock).lock_owned().await;
+        //
+        // The wait is cancellable and bounded: a stuck previous turn must not make every later
+        // prompt hang forever behind an un-cancellable lock.
+        let _prompt_guard = tokio::select! {
+            guard = Arc::clone(&self.prompt_lock).lock_owned() => guard,
+            _ = async {
+                if let Some(c) = &cancellation {
+                    c.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return StopReason::Cancelled;
+            }
+            _ = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if self.closed.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+            } => {
+                return StopReason::Cancelled;
+            }
+        };
         if self.closed.load(Ordering::SeqCst) {
             // Closed while this prompt waited for the previous turn to finish.
             return StopReason::Cancelled;
@@ -1452,10 +1513,8 @@ impl AcpAgentSession {
         //
         // `queued` is the only status that means "nothing picked this up yet". It is a
         // legitimate wait while a *previous* process's writer lease is still valid (the lease
-        // is 120s), so the deadline must be comfortably longer than that or a normal restart
-        // looks like a hang. `starting` is different: the dispatcher is already inside
-        // `launch()` and will publish `inbox/started` shortly, so it must never be reported as
-        // "never admitted". `running` is a live run and has its own model/tool timeouts.
+        // is 30s), so the deadline must be comfortably longer than that or a normal restart
+        // looks like a hang.
         const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         // How long receipt reads may keep failing before the prompt reports a stall.
         //

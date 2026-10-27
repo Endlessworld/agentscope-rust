@@ -31,6 +31,9 @@ use crate::agent::HarnessAgent;
 /// How often the dispatcher looks for accepted work.
 const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long a host waits for an in-flight run to stop before it closes the turn itself.
+const ABANDON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A command receipt. A queued task may not yet have a run id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
@@ -370,6 +373,10 @@ impl AgentSession {
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 200 {
             return Err(session_error("Invalid idempotency key"));
         }
+        // A previous run may have left a non-terminal turn (crash, interrupt, a finish that
+        // could not commit). The caller has clearly moved on when it submits new input, so
+        // close that orphan before accepting the command instead of rejecting the prompt.
+        self.close_orphaned_turn_before_submit().await?;
         let turn_id = turn_id_for(idempotency_key);
         let command = Command::new(
             idempotency_key,
@@ -384,6 +391,45 @@ impl AgentSession {
         };
         self.start();
         self.receipt(&accepted).await
+    }
+
+    /// Closes an orphaned open turn before a new submission is accepted.
+    ///
+    /// A submit is an explicit statement that the caller has moved on. If the latest turn is
+    /// still open but no execution owns it (a crashed process, an interrupted run, a finish
+    /// that could not commit), leaving it open makes the dispatcher reject every later prompt
+    /// with `turn_unfinished`. Close it here under the writer lease; unknown tool outcomes are
+    /// recorded as interrupted, never success.
+    async fn close_orphaned_turn_before_submit(&self) -> crate::Result<()> {
+        let Some(open_turn) = self.open_turn().await? else {
+            return Ok(());
+        };
+        // A live run still owns the turn: do not race it. The dispatcher will reject/queue
+        // until it settles, and the caller can cancel explicitly.
+        if self.state.lock().unwrap().active_run.is_some() {
+            return Ok(());
+        }
+        match agentscope_core::session::abandon_turn(Arc::clone(&self.log), &open_turn).await {
+            Ok(closed) => {
+                if closed {
+                    tracing::info!(
+                        turn = %open_turn,
+                        "closed an orphaned open turn before accepting a new submission"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // The dispatcher retries on its next tick; surfacing this as a rejection would
+                // lose the caller's prompt for a transient writer conflict.
+                tracing::warn!(
+                    turn = %open_turn,
+                    %error,
+                    "could not close the orphaned turn before accepting a new submission"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Continues the latest unfinished task with a new run.
@@ -455,19 +501,16 @@ impl AgentSession {
     /// Returns the id of the turn that was closed, or `None` when nothing was open.
     pub async fn abandon_unfinished(&self) -> crate::Result<Option<String>> {
         self.ensure_open()?;
-        // A run in flight still owns the turn; abandoning it would race the writer lease and
-        // silently drop work the caller may still be watching. Give a just-interrupted run a
-        // moment to unwind (the caller typically cancels right before asking for a new turn).
-        //
-        // The wait is bounded but generous: a cancellation has to travel through the agent
-        // loop, reconcile the interrupted iteration, write the terminal facts and release the
-        // writer. Two seconds was shorter than a slow provider stream being drained, so a
-        // perfectly healthy cancel looked like a stuck session to the next prompt. Each
-        // `abandon_turn` already retries a busy writer for ~5s; retrying the whole attempt keeps
-        // the total budget bounded without failing on the first missed lease.
-        const ABANDON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
         let deadline = std::time::Instant::now() + ABANDON_TIMEOUT;
         loop {
+            // A run in flight still owns the turn. Ask it to stop instead of waiting for a
+            // provider/tool that may never return; the loop below then closes whatever terminal
+            // facts the run could not write itself.
+            let active = self.state.lock().unwrap().active_run.clone();
+            if let Some(run_id) = active {
+                let _ = self.agent.interrupt_run(&run_id);
+                let _ = self.interrupt_run(&run_id).await;
+            }
             while self.state.lock().unwrap().active_run.is_some() {
                 if std::time::Instant::now() >= deadline {
                     return Err(session_error("Wait for the current execution to stop"));
@@ -479,7 +522,15 @@ impl AgentSession {
             };
             match agentscope_core::session::abandon_turn(Arc::clone(&self.log), &latest).await {
                 Ok(closed) => {
-                    return Ok(closed.then_some(latest));
+                    if closed {
+                        return Ok(Some(latest));
+                    }
+                    // The turn settled concurrently (a finish that raced us). Re-check rather
+                    // than returning "nothing closed" while the dispatcher may still see it.
+                    if self.open_turn().await?.is_none() {
+                        return Ok(None);
+                    }
+                    continue;
                 }
                 Err(error) => {
                     // Another handle may still be unwinding the same run; retry until the
@@ -1021,12 +1072,26 @@ async fn dispatch_once(
             continue;
         }
         // A submit must not run while an earlier turn is unfinished (only `resume` may
-        // continue it). Waiting silently would deadlock the caller: an *interrupted* turn is
-        // not terminal, so nothing releases it and the host sits on a `queued` receipt
-        // forever. No live writer exists at this point (checked above), so the open turn is
-        // orphaned — reject the command so the caller learns it must continue or abandon it.
+        // continue it). No live writer exists at this point (checked above), so the open turn
+        // is orphaned: the host has clearly moved on and there is nobody left to finish it.
+        // Close it (unknown tool outcomes become `interrupted`, never success) and let the
+        // submit run on the next tick instead of rejecting the user's message outright.
         if view.open_turn.is_some() && command.kind == "submit" {
-            inbox.reject(command, "turn_unfinished").await?;
+            if let Some(turn_id) = view.open_turn.as_deref() {
+                match agentscope_core::session::abandon_turn(Arc::clone(log), turn_id).await {
+                    Ok(_) => return Ok(()),
+                    Err(error) => {
+                        // A transient busy writer: leave the command queued and retry on a
+                        // later tick. The host's admission deadline reports a real stall.
+                        tracing::warn!(
+                            turn = %turn_id,
+                            %error,
+                            "could not close the orphaned turn before starting a new submission"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             continue;
         }
         launch(agent, log, inbox, context, state, command.clone()).await?;
@@ -1190,11 +1255,18 @@ async fn launch(
             Ok(recorder) => break Arc::new(recorder),
             Err(error) if open_attempts < 3 => {
                 tracing::warn!(%error, turn = %turn_id, "opening the session recorder failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(error) => {
-                inbox.reject(&command, &error.to_string()).await?;
-                return Err(error);
+                // A busy/expired writer or a transient storage failure is not a verdict on the
+                // command. Leave it accepted so the dispatch loop retries; the host admission
+                // deadline still reports a real stall.
+                tracing::warn!(
+                    %error,
+                    turn = %turn_id,
+                    "could not open the session recorder; leaving the command queued"
+                );
+                return Ok(());
             }
         }
     };
@@ -1229,9 +1301,16 @@ async fn launch(
         .prepare_with_baseline(&recorder, Some(&admission))
         .await
     {
-        inbox.reject(&command, &error.to_string()).await?;
+        // An admission failure is not a durable verdict on the command: a writer race, a
+        // transient read error or a just-settled turn must not permanently reject the user's
+        // message. Release and let the dispatcher retry the same accepted command.
         recorder.close().await;
-        return Err(error);
+        tracing::warn!(
+            turn = %turn_id,
+            %error,
+            "session admission failed; leaving the command queued for a retry"
+        );
+        return Ok(());
     }
 
     // Guidance accepted before this run starts is folded in by the agent loop's step boundary
@@ -1269,14 +1348,22 @@ async fn launch(
         *react.state_handle().lock().unwrap() = restored;
     }
     if let Err(error) = recorder.start(&inputs, &working).await {
-        inbox.reject(&command, &error.to_string()).await?;
         recorder.close().await;
-        return Err(error);
+        tracing::warn!(
+            turn = %turn_id,
+            %error,
+            "could not record the session start; leaving the command queued for a retry"
+        );
+        return Ok(());
     }
     if let Err(error) = recorder.checkpoint_now(&working, "session_input").await {
-        inbox.reject(&command, &error.to_string()).await?;
         recorder.close().await;
-        return Err(error);
+        tracing::warn!(
+            turn = %turn_id,
+            %error,
+            "could not checkpoint the admitted input; leaving the command queued for a retry"
+        );
+        return Ok(());
     }
 
     {
@@ -1310,6 +1397,9 @@ async fn launch(
             );
             let mut reply = None;
             let mut failure = None;
+            // A run that never emits a terminal event (its task panicked, the stream was cut)
+            // must not be reported as completed. Track whether the loop observed one.
+            let mut saw_terminal = false;
             while let Some(event) = stream.next().await {
                 // Forward before interpreting: the host renders the same events the runtime
                 // uses for bookkeeping, including the terminal `AgentResult`.
@@ -1320,6 +1410,9 @@ async fn launch(
                     &event,
                     Ok(AgentEvent::AgentResult(_)) | Ok(AgentEvent::AgentEnd(_))
                 );
+                if terminal {
+                    saw_terminal = true;
+                }
                 match event {
                     Ok(AgentEvent::AgentResult(data)) => {
                         if let Some(value) = data.fields.get("reply") {
@@ -1338,6 +1431,9 @@ async fn launch(
             }
             match failure {
                 Some(error) => Err(error),
+                None if !saw_terminal => Err(agentscope_core::Error::Agent(
+                    "the run ended without reporting a terminal event".into(),
+                )),
                 None => Ok(reply),
             }
         }
@@ -1350,6 +1446,7 @@ async fn launch(
         Ok(Some(message)) => outcome(message.generate_reason()),
         Ok(None) => "completed",
         Err(agentscope_core::Error::Interrupted(_)) => "interrupted",
+        Err(agentscope_core::Error::Cancelled(_)) => "cancelled",
         Err(_) => "failed",
     };
     // Keep the failure detail with the terminal facts so receipts (ACP, host views)
@@ -1399,11 +1496,25 @@ async fn launch(
             inbox.reject(&command, &error.to_string()).await?;
         }
     }
+    // A finish failure must never leave the turn non-terminal: the run is over, so publish the
+    // terminal facts through the recovery path (which also settles unknown tool outcomes).
+    // Without this the next prompt sees an open turn and is rejected as `turn_unfinished`.
+    if finish.is_err() {
+        if let Err(error) =
+            agentscope_core::session::abandon_turn(Arc::clone(log), &turn_id).await
+        {
+            tracing::warn!(
+                %error,
+                turn = %turn_id,
+                "could not close the turn after a failed terminal write"
+            );
+        }
+    }
     if let Err(error) = &finish {
         tracing::warn!(
             %error,
             turn = %turn_id,
-            "recording the run's terminal facts failed; the receipt will report it as interrupted"
+            "recording the run's terminal facts failed; the turn was closed as interrupted"
         );
     }
     finish?;

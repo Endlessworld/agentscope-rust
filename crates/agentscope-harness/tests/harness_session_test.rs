@@ -319,9 +319,11 @@ async fn resume_rejects_a_turn_that_never_started() {
 }
 
 #[tokio::test]
-async fn an_interrupted_turn_blocks_submission_until_it_is_abandoned() {
-    // Regression for the "prompt hangs with no output" report: an interrupted run leaves the
-    // turn non-terminal, so a later submit used to wait forever on a `queued` receipt.
+async fn an_interrupted_turn_is_closed_before_a_new_submission_runs() {
+    // Regression for "the previous turn is still open, so this prompt could not start":
+    // an interrupted run leaves the turn non-terminal, but the host has clearly moved on when
+    // it submits a new prompt. The dispatcher must close the orphaned turn (recording unknown
+    // tool outcomes as interrupted) and run the new submission instead of rejecting it.
     let dir = temp_dir("abandon");
     let agent = Arc::new(
         HarnessAgent::builder()
@@ -363,21 +365,11 @@ async fn an_interrupted_turn_blocks_submission_until_it_is_abandoned() {
         Some("turn-stale")
     );
 
-    // The dispatcher refuses a new submit while the old turn is open — and says so instead of
-    // leaving the caller on a `queued` receipt forever.
-    let blocked = session.submit("second").await.unwrap();
-    let blocked = session.await_task(&blocked.command_id).await.unwrap();
-    assert_eq!(blocked.status, "rejected", "{blocked:?}");
-    assert_eq!(blocked.error.as_deref(), Some("turn_unfinished"));
-
-    // Closing the abandoned turn unblocks the session.
-    let closed = session.abandon_unfinished().await.unwrap();
-    assert_eq!(closed.as_deref(), Some("turn-stale"));
-    assert!(session.open_turn().await.unwrap().is_none());
-
+    // A submit closes the orphaned turn and runs, instead of rejecting the user's message.
     let next = session.submit("second").await.unwrap();
     let settled = session.await_task(&next.command_id).await.unwrap();
     assert_eq!(settled.status, "completed", "{settled:?}");
+    assert!(session.open_turn().await.unwrap().is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

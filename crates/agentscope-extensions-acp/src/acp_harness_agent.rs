@@ -1228,20 +1228,39 @@ fn spawn_shutdown_handler(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         eprintln!("\n[shutdown] interrupt received; saving session state...");
-        {
+        // Interrupt each session by id, then wait for its prompt to unwind. `is_running` is
+        // set by the prompt itself, so it is authoritative even when the shutdown count is
+        // zero (the ACP path must also register with `ExecutionGuard`).
+        let live: Vec<AcpAgentSession> = {
             let guard = sessions.lock().unwrap();
-            for session in guard.values() {
-                session.agent().interrupt();
-            }
+            guard.values().cloned().collect()
+        };
+        for session in &live {
+            session.agent().interrupt();
         }
-        // `ExecutionGuard` tracks live calls, so poll that rather than guessing a
-        // fixed delay: exit only after the interrupted turns have unwound and their
-        // state has been checkpointed.
         let manager = agentscope_core::GracefulShutdownManager::instance();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while manager.get_active_request_count() > 0 && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let still_running = live.iter().any(AcpAgentSession::is_running);
+            if !still_running && manager.get_active_request_count() == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    sessions = live.len(),
+                    active_requests = manager.get_active_request_count(),
+                    "shutdown drain timed out; closing remaining turns"
+                );
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Give each runtime a chance to publish its terminal facts before the process exits.
+        for session in &live {
+            session.cancel();
+            session.close();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
         eprintln!("[shutdown] state saved; exiting");
         std::process::exit(130);
     });
