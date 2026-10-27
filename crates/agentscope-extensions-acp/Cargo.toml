@@ -31,6 +31,9 @@ agent-client-protocol = { version = "2.2.0", features = [
 ] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+# `catch_unwind` for the prompt future: a panic in the agent loop must not leave the
+# client waiting for a response that never comes.
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -48,7 +51,6 @@ name = "acp_harness_agent"
 path = "src/acp_harness_agent.rs"
 
 [dev-dependencies]
-futures = { workspace = true }
 
 [features]
 default = ["rusqlite"]

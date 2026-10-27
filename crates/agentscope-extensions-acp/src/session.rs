@@ -67,6 +67,14 @@ pub struct AcpClientHandle {
     connection: ConnectionTo<Client>,
 }
 
+/// How long an interactive request may stay unanswered.
+///
+/// The user genuinely needs time to read a permission prompt or fill in an elicitation form,
+/// so this is generous rather than tight. The point is that the wait is *bounded*: a client
+/// that never answers (a disconnected IDE, a dropped response) used to block the tool, the
+/// run and the prompt forever, with `session/cancel` unable to reach it.
+const INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 impl AcpClientHandle {
     /// Wraps an agent-side connection whose counterpart is the ACP client.
     pub(crate) fn new(connection: ConnectionTo<Client>) -> Self {
@@ -94,7 +102,23 @@ impl AcpClientHandle {
     ) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
         let request =
             RequestPermissionRequest::new(session_id.clone(), tool_call, permission_options());
-        self.connection.send_request(request).block_task().await
+        // Bounded: an unresponsive client must not pin the tool call forever. A timeout is a
+        // **rejection**, not a channel failure: the `Err` path auto-approves (Java parity for a
+        // missing client), which must never turn a dropped answer into a granted tool call.
+        match tokio::time::timeout(
+            INTERACTION_TIMEOUT,
+            self.connection.send_request(request).block_task(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("permission request timed out; rejecting the tool call");
+                Ok(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            }
+        }
     }
 
     /// Pushes an `elicitation/create` form to the user and awaits their answer.
@@ -106,13 +130,16 @@ impl AcpClientHandle {
         &self,
         request: CreateElicitationRequest,
     ) -> std::result::Result<CreateElicitationResponse, String> {
-        self.connection
-            .send_request(request)
-            .block_task()
-            .await
-            .map_err(|error| error.to_string())
+        match tokio::time::timeout(
+            INTERACTION_TIMEOUT,
+            self.connection.send_request(request).block_task(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("elicitation timed out: the client did not answer".to_string()),
+        }
     }
-
     /// Opens an MCP-over-ACP connection to a client-declared MCP server
     /// (`mcp/connect`) and returns a handle that can list/call its tools.
     pub(crate) async fn connect_mcp_acp(
@@ -344,8 +371,13 @@ pub struct AcpAgentSession {
     >,
     /// The model id currently applied to the live agent (for change detection).
     applied_model: String,
-    /// Cancel flag for the currently active prompt request.
-    cancel: Arc<AtomicBool>,
+    /// Cancellation generation for the prompt turn.
+    ///
+    /// A single session-wide flag leaked across turns: a cancel that arrived while the next
+    /// prompt was already waiting behind `prompt_lock` either stopped the wrong turn or was
+    /// silently cleared by that turn's start. Each prompt captures the generation it started
+    /// under, and `cancel` advances it — so only the turn running at cancel time stops.
+    cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes prompts for this session. ACP forbids overlapping prompt turns, but clients
     /// do send a follow-up before the previous response arrives (or a host retries one); two
     /// concurrent runs on the same session used to be rejected as `turn_unfinished`.
@@ -497,7 +529,7 @@ impl AcpAgentSession {
             modes,
             model_builder: None,
             applied_model: actual_model,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
@@ -1097,7 +1129,9 @@ impl AcpAgentSession {
 
     /// Cancels any active prompt request.
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        // Cancels exactly the turn that owns the session now: a prompt that starts later reads
+        // the new generation and keeps running.
+        self.cancel_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Closes the session: cancels the active prompt and prevents it from being re-registered.
@@ -1354,8 +1388,10 @@ impl AcpAgentSession {
         }
         self.running.store(true, Ordering::SeqCst);
         let _running = RunningPrompt(Arc::clone(&self.running));
-        self.cancel.store(false, Ordering::SeqCst);
-        let cancel_flag = self.cancel.clone();
+        // The turn's own cancellation generation. A cancel that already happened before this
+        // prompt started does not apply to it.
+        let cancel_epoch = Arc::clone(&self.cancel_epoch);
+        let my_epoch = cancel_epoch.load(Ordering::SeqCst);
         // Turn-level usage: reset at the start of each prompt turn, accumulate
         // from every model call, and report back as `PromptResponse.usage`.
         self.turn_usage = ChatUsage::default();
@@ -1445,18 +1481,16 @@ impl AcpAgentSession {
             let _ = events_tx.send(event.clone());
         }));
         // A previous turn may still be open (the process died mid-run, the provider stalled,
-        // the host stopped waiting). Such a turn is *not* terminal — only `resume` may
-        // continue it — so submitting a new prompt would be rejected by the dispatcher and
-        // the client would wait forever on a `queued` receipt. Close it first: the caller has
-        // clearly moved on. Unknown tool outcomes become `interrupted` (never success).
-        //
-        // Closing is best effort: the submit below is the authority. If the close failed
-        // because the turn settled concurrently, rejecting the prompt would be wrong.
-        if let Err(error) = session.abandon_unfinished().await {
+        // the host stopped waiting). `submit` is now the authority on how to settle it: it
+        // continues a resumable interrupted turn and closes a suspended/unrecoverable one, so
+        // the prompt is never rejected with "the previous turn is still open". All this path
+        // still owes the client is stopping a run this process already owns, so the new
+        // prompt is not queued behind a stalled one.
+        if let Err(error) = session.stop_active_run().await {
             tracing::warn!(
                 session = %self.session_id,
                 %error,
-                "could not close the previous turn before starting a new prompt"
+                "could not stop the active run before starting a new prompt"
             );
         }
         let idempotency_key = uuid::Uuid::new_v4().to_string();
@@ -1556,7 +1590,7 @@ impl AcpAgentSession {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        if cancel_flag.load(Ordering::SeqCst) {
+                        if cancel_epoch.load(Ordering::SeqCst) != my_epoch {
                             cancelled = true;
                             break;
                         }

@@ -142,6 +142,9 @@ pub struct AcpCodingAgent {
     /// Provider descriptors advertised through `providers/list`, keyed by
     /// provider id. Empty when the client did not negotiate `providers`.
     providers: ProviderRegistry,
+    /// Agents built only to read the durable session index per `cwd`, so
+    /// `session/list` does not rebuild one on every call.
+    catalog_agents: Mutex<HashMap<PathBuf, Arc<HarnessAgent>>>,
 }
 
 impl AcpCodingAgent {
@@ -162,6 +165,7 @@ impl AcpCodingAgent {
             max_sessions: 1,
             client_support: ClientSupport::new(),
             providers: ProviderRegistry::default(),
+            catalog_agents: Mutex::new(HashMap::new()),
         }
     }
 
@@ -339,33 +343,97 @@ impl AcpCodingAgent {
 
     /// Builds the `session/list` response, honouring the request's `cursor`.
     ///
-    /// Sessions are ordered by id (stable) so pagination is deterministic. The registry only
-    /// knows sessions this process created, so persisted sessions from a previous process are
-    /// not visible here; that is a separate durability concern from the runtime path.
-    fn session_infos(&self, cursor: Option<&str>) -> ListSessionsResponse {
+    /// The in-memory registry only knows sessions this process created. The journal is the
+    /// durable authority, so when the client names a `cwd` the list also includes sessions a
+    /// previous process persisted there — otherwise a restart showed an empty history and the
+    /// client could not offer `session/load`.
+    ///
+    /// Sessions are ordered by id (stable) so pagination is deterministic.
+    async fn session_infos(
+        &self,
+        cwd: Option<&std::path::Path>,
+        cursor: Option<&str>,
+    ) -> ListSessionsResponse {
         const PAGE_SIZE: usize = 50;
-        let guard = self.sessions.lock().unwrap();
-        let mut entries: Vec<&AcpAgentSession> = guard.values().collect();
-        entries.sort_by(|a, b| a.session_id().to_string().cmp(&b.session_id().to_string()));
+        let mut infos: Vec<SessionInfo> = {
+            let guard = self.sessions.lock().unwrap();
+            guard
+                .values()
+                .filter(|session| cwd.is_none_or(|cwd| session.cwd() == cwd))
+                .map(AcpAgentSession::session_info)
+                .collect()
+        };
+        let known: std::collections::HashSet<String> = infos
+            .iter()
+            .map(|info| info.session_id.to_string())
+            .collect();
+        if let Some(cwd) = cwd {
+            let agent = self.catalog_agent(cwd);
+            let context = agentscope_core::agent::RuntimeContext::new();
+            match agent.list_session_keys(&context).await {
+                Ok(keys) => {
+                    for key in keys {
+                        if known.contains(&key.session_id) {
+                            continue;
+                        }
+                        infos.push(SessionInfo::new(
+                            SessionId::new(key.session_id),
+                            cwd.to_path_buf(),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the persisted session index")
+                }
+            }
+        }
+        infos.sort_by(|a, b| a.session_id.to_string().cmp(&b.session_id.to_string()));
+        infos.dedup_by(|a, b| a.session_id == b.session_id);
 
         // The cursor is the exclusive lower bound (last id of the prior page).
         let start = match cursor {
-            Some(c) => entries
+            Some(c) => infos
                 .iter()
-                .position(|s| s.session_id().to_string() == c)
+                .position(|info| info.session_id.to_string() == c)
                 .map(|i| i + 1)
                 .unwrap_or(0),
             None => 0,
         };
-        let page: Vec<&AcpAgentSession> = entries.into_iter().skip(start).take(PAGE_SIZE).collect();
-        let has_more = start + page.len() < guard.len();
+        let total = infos.len();
+        let page: Vec<SessionInfo> = infos.into_iter().skip(start).take(PAGE_SIZE).collect();
+        let has_more = start + page.len() < total;
         let next_cursor = if has_more {
-            page.last().map(|s| s.session_id().to_string())
+            page.last().map(|info| info.session_id.to_string())
         } else {
             None
         };
-        let infos: Vec<SessionInfo> = page.into_iter().map(|s| s.session_info()).collect();
-        ListSessionsResponse::new(infos).next_cursor(next_cursor)
+        ListSessionsResponse::new(page).next_cursor(next_cursor)
+    }
+
+    /// Builds (and caches) the agent used only to read the durable session index for `cwd`.
+    ///
+    /// `HarnessAgent::list_session_keys` reaches the session store through a built agent, so a
+    /// process that has not created a session yet still needs one to enumerate history. The
+    /// synthetic session id never reaches the journal: only the store's index is read.
+    fn catalog_agent(&self, cwd: &std::path::Path) -> Arc<HarnessAgent> {
+        const CATALOG_SESSION_ID: &str = "session-catalog";
+        if let Some(agent) = self.catalog_agents.lock().unwrap().get(cwd) {
+            return Arc::clone(agent);
+        }
+        let agent = Arc::new(match &self.session_factory {
+            Some(factory) => factory(SessionBuild {
+                cwd: cwd.to_path_buf(),
+                session_id: CATALOG_SESSION_ID.to_string(),
+                client_support: self.client_support.clone(),
+                elicitation_slot: Arc::new(Mutex::new(None)),
+            }),
+            None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
+        });
+        self.catalog_agents
+            .lock()
+            .unwrap()
+            .insert(cwd.to_path_buf(), Arc::clone(&agent));
+        agent
     }
 
     /// Assembles and runs the ACP agent over stdio until the connection closes.
@@ -397,6 +465,7 @@ impl AcpCodingAgent {
         let a_load = agent.clone();
         let a_resume = agent.clone();
         let a_delete = agent.clone();
+        let a_respond = agent.clone();
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
@@ -476,20 +545,38 @@ impl AcpCodingAgent {
                     // otherwise block the dispatch loop, so the SDK could never
                     // process the incoming `$/cancel_request` and update the marker.
                     cx.spawn(async move {
-                        let stop = session
-                            .run_prompt_cancellable(
+                        // A panic inside the agent loop must not leave the client waiting for a
+                        // response that will never come: the SDK sends nothing when a responder
+                        // is dropped, so the prompt would hang until the client gave up.
+                        let outcome = futures::FutureExt::catch_unwind(
+                            std::panic::AssertUnwindSafe(session.run_prompt_cancellable(
                                 req.prompt,
                                 move |notif| {
                                     let _ = emit_cx.send_notification(notif);
                                 },
                                 Some(cancellation),
-                            )
-                            .await;
+                            )),
+                        )
+                        .await;
                         // Turn-level token usage must be read before the session
                         // is moved back into the registry.
                         let usage = session.turn_usage_response();
                         registrar.register_session(session);
-                        responder.respond(PromptResponse::new(stop).usage(usage))
+                        match outcome {
+                            Ok(stop) => responder.respond(PromptResponse::new(stop).usage(usage)),
+                            Err(panic) => {
+                                let detail = panic
+                                    .downcast_ref::<&str>()
+                                    .map(|message| message.to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "unknown panic".to_string());
+                                tracing::error!(%detail, "prompt panicked; reporting to the client");
+                                responder.respond_with_error(
+                                    agent_client_protocol::Error::internal_error()
+                                        .data(format!("prompt panicked: {detail}")),
+                                )
+                            }
+                        }
                     })?;
                     Ok(())
                 },
@@ -577,6 +664,12 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
+                async move |req: crate::ext::ExtRespondRequest, responder, _cx| {
+                    handle_ext_respond(a_respond.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
                 async move |req: SetSessionModeRequest, responder, cx| {
                     let sid = req.session_id;
                     let mut session = match a_mode.get_session(&sid) {
@@ -623,7 +716,9 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |req: ListSessionsRequest, responder, _cx| {
-                    let infos = a_list.session_infos(req.cursor.as_deref());
+                    let infos = a_list
+                        .session_infos(req.cwd.as_deref(), req.cursor.as_deref())
+                        .await;
                     responder.respond(infos)
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -750,6 +845,37 @@ impl AcpCodingAgent {
             )
             .connect_to(transport)
             .await
+    }
+}
+
+/// Handles `_agentscope/session/respond`: converts the wire answers and hands them to the
+/// session runtime, which continues the suspended turn.
+async fn handle_ext_respond(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtRespondRequest,
+    responder: agent_client_protocol::Responder<serde_json::Value>,
+) -> Result<(), agent_client_protocol::Error> {
+    let params = req.params;
+    let answers = match params.to_answers() {
+        Ok(answers) => answers,
+        Err(error) => {
+            return responder
+                .respond_with_error(agent_client_protocol::Error::invalid_params().data(error));
+        }
+    };
+    let session = match agent.get_session(&SessionId::new(params.session_id)) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::Error::invalid_params().data("unknown session"),
+            );
+        }
+    };
+    match session.respond(answers).await {
+        Ok(_) => responder.respond(serde_json::Value::Object(serde_json::Map::new())),
+        Err(error) => responder.respond_with_error(
+            agent_client_protocol::Error::internal_error().data(error.to_string()),
+        ),
     }
 }
 

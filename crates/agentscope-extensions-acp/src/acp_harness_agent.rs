@@ -1168,7 +1168,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_catalog_forwarder(agent.session_registry());
 
     tracing::info!("ACP CodingAgent starting over stdio...");
-    agent.run_stdio().await?;
+    let sessions = agent.session_registry();
+    let result = agent.run_stdio().await;
+    // stdin EOF (the IDE closed the pipe) or a transport error ends the stdio loop just like
+    // a signal does: without draining here the runtime is dropped while a turn is still in
+    // flight, so the recorder's `Drop` release and the tool abort paths never run and the
+    // journal keeps a half-written turn. Always drain, then surface the loop's outcome.
+    drain_sessions(&sessions, "transport closed").await;
+    result?;
     Ok(())
 }
 
@@ -1228,40 +1235,57 @@ fn spawn_shutdown_handler(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         eprintln!("\n[shutdown] interrupt received; saving session state...");
-        // Interrupt each session by id, then wait for its prompt to unwind. `is_running` is
-        // set by the prompt itself, so it is authoritative even when the shutdown count is
-        // zero (the ACP path must also register with `ExecutionGuard`).
-        let live: Vec<AcpAgentSession> = {
-            let guard = sessions.lock().unwrap();
-            guard.values().cloned().collect()
-        };
-        for session in &live {
-            session.agent().interrupt();
-        }
-        let manager = agentscope_core::GracefulShutdownManager::instance();
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let still_running = live.iter().any(AcpAgentSession::is_running);
-            if !still_running && manager.get_active_request_count() == 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    sessions = live.len(),
-                    active_requests = manager.get_active_request_count(),
-                    "shutdown drain timed out; closing remaining turns"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        // Give each runtime a chance to publish its terminal facts before the process exits.
-        for session in &live {
-            session.cancel();
-            session.close();
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        drain_sessions(&sessions, "shutdown signal").await;
         eprintln!("[shutdown] state saved; exiting");
         std::process::exit(130);
     });
+}
+
+/// Interrupts every live session and waits for in-flight turns to publish their terminal
+/// facts before returning.
+///
+/// Used by both the signal path and the stdin-EOF/transport-close path; neither may let the
+/// process exit while a turn is still running.
+async fn drain_sessions(sessions: &Arc<Mutex<HashMap<String, AcpAgentSession>>>, reason: &str) {
+    // Interrupt each session by id, then wait for its prompt to unwind. `is_running` is
+    // set by the prompt itself, so it is authoritative even when the shutdown count is
+    // zero (the ACP path must also register with `ExecutionGuard`).
+    let live: Vec<AcpAgentSession> = {
+        let guard = sessions.lock().unwrap();
+        guard.values().cloned().collect()
+    };
+    if live.is_empty() {
+        return;
+    }
+    let manager = agentscope_core::GracefulShutdownManager::instance();
+    if !live.iter().any(AcpAgentSession::is_running) && manager.get_active_request_count() == 0 {
+        return;
+    }
+    tracing::info!(sessions = live.len(), reason, "draining live ACP sessions");
+    for session in &live {
+        session.agent().interrupt();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let still_running = live.iter().any(AcpAgentSession::is_running);
+        if !still_running && manager.get_active_request_count() == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                sessions = live.len(),
+                active_requests = manager.get_active_request_count(),
+                reason,
+                "shutdown drain timed out; closing remaining turns"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Give each runtime a chance to publish its terminal facts before the process exits.
+    for session in &live {
+        session.cancel();
+        session.close();
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
 }
