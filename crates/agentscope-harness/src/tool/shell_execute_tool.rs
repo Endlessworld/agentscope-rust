@@ -7,18 +7,32 @@ use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{is_dangerous_command, Tool, ToolExecutionContext, Toolkit};
 use async_trait::async_trait;
 
+use super::output_compact::{compact_grep_like, CompactConfig};
 use crate::filesystem::SandboxFilesystem;
 
 /// Executes a shell command in the sandbox and returns combined output + exit code.
 pub struct ShellExecuteTool {
     sandbox: Arc<dyn SandboxFilesystem>,
+    compact: CompactConfig,
 }
 
 impl ShellExecuteTool {
     pub const NAME: &'static str = "execute";
 
+    /// Creates the tool with shell-output compaction enabled (see [`CompactConfig`]).
     pub fn new(sandbox: Arc<dyn SandboxFilesystem>) -> Self {
-        Self { sandbox }
+        Self {
+            sandbox,
+            compact: CompactConfig::from_env(),
+        }
+    }
+
+    /// Creates the tool with an explicit compaction configuration.
+    pub fn with_output_compaction(
+        sandbox: Arc<dyn SandboxFilesystem>,
+        compact: CompactConfig,
+    ) -> Self {
+        Self { sandbox, compact }
     }
 
     pub fn register(toolkit: &Toolkit, sandbox: Arc<dyn SandboxFilesystem>) {
@@ -29,6 +43,51 @@ fn opt_str_arg(args: &JsonMap, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Renders a finished command into the tool result the model sees.
+///
+/// Kept separate from [`Tool::call`] so the output shaping (exit-code header,
+/// compaction, truncation notice, metadata counters) is testable without a sandbox.
+pub(crate) fn format_execute_output(
+    exit_code: i32,
+    output: &str,
+    truncated: bool,
+    compact: &CompactConfig,
+) -> ToolResultBlock {
+    let mut text = format!("Exit code: {exit_code}\n");
+    let mut metadata = JsonMap::new();
+    if !output.trim().is_empty() {
+        text.push('\n');
+        let report = compact_grep_like(output, compact);
+        if report.compacted {
+            tracing::debug!(
+                saved_chars = report.saved_chars,
+                hoisted_files = report.hoisted_files,
+                hoisted_lines = report.hoisted_lines,
+                "shell output compacted"
+            );
+            metadata.insert(
+                "agentscope.output_compact.savedChars".to_string(),
+                serde_json::Value::from(report.saved_chars as u64),
+            );
+            metadata.insert(
+                "agentscope.output_compact.hoistedFiles".to_string(),
+                serde_json::Value::from(report.hoisted_files as u64),
+            );
+            metadata.insert(
+                "agentscope.output_compact.hoistedLines".to_string(),
+                serde_json::Value::from(report.hoisted_lines as u64),
+            );
+        }
+        text.push_str(&report.text);
+    }
+    if truncated {
+        text.push_str("\n(output was truncated)");
+    }
+    let mut block = ToolResultBlock::text(text);
+    block.metadata = metadata;
+    block
 }
 
 fn int_arg(args: &JsonMap, key: &str) -> Option<u32> {
@@ -132,21 +191,19 @@ impl Tool for ShellExecuteTool {
             "shell execute done"
         );
         let result = result?;
-        let mut sb = format!("Exit code: {}\n", result.exit_code);
-        if !result.output.trim().is_empty() {
-            sb.push('\n');
-            sb.push_str(&result.output);
-        }
-        if result.truncated {
-            sb.push_str("\n(output was truncated)");
-        }
-        Ok(ToolResultBlock::text(sb))
+        Ok(format_execute_output(
+            result.exit_code,
+            &result.output,
+            result.truncated,
+            &self.compact,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::command_with_working_directory;
+    use super::{command_with_working_directory, format_execute_output};
+    use crate::tool::CompactConfig;
 
     #[test]
     fn windows_uses_pwsh_syntax() {
@@ -170,5 +227,84 @@ mod tests {
         } else {
             assert!(s.contains("a'\\''b"));
         }
+    }
+
+    fn grep_like_output() -> String {
+        let mut out = String::new();
+        for line in [25usize, 65, 122, 298, 310, 402, 455] {
+            out.push_str(&format!(
+                "crates/agentscope-harness/src/agent/session/storage.rs:{line}:    fn temp_dir(tag: &str) -> std::path::PathBuf {{\n"
+            ));
+        }
+        out.trim_end().to_string()
+    }
+
+    #[test]
+    fn execute_output_is_compacted_and_counted() {
+        let block = format_execute_output(0, &grep_like_output(), false, &CompactConfig::default());
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.starts_with("Exit code: 0\n\n[paths grouped"));
+        assert!(text.contains("\ncrates/agentscope-harness/src/agent/session/storage.rs\n25:"));
+        assert_eq!(
+            block.metadata.get("agentscope.output_compact.hoistedFiles"),
+            Some(&serde_json::Value::from(1u64))
+        );
+        assert_eq!(
+            block.metadata.get("agentscope.output_compact.hoistedLines"),
+            Some(&serde_json::Value::from(7u64))
+        );
+    }
+
+    #[test]
+    fn execute_output_compaction_can_be_switched_off() {
+        let raw = grep_like_output();
+        let block = format_execute_output(0, &raw, false, &CompactConfig::disabled());
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, format!("Exit code: 0\n\n{raw}"));
+        assert!(block.metadata.is_empty());
+    }
+
+    #[test]
+    fn plain_command_output_is_untouched() {
+        let block = format_execute_output(0, "hello\nworld", false, &CompactConfig::default());
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Exit code: 0\n\nhello\nworld");
+        assert!(block.metadata.is_empty());
+    }
+
+    #[test]
+    fn truncation_notice_lands_after_the_compacted_body() {
+        let block = format_execute_output(1, &grep_like_output(), true, &CompactConfig::default());
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.starts_with("Exit code: 1\n\n[paths grouped"));
+        assert!(text.ends_with("\n(output was truncated)"));
     }
 }

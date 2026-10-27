@@ -25,6 +25,7 @@ use agentscope_core::state::ConflictPolicy;
 use agentscope_core::tool::{Tool, Toolkit};
 
 use crate::filesystem::{Filesystem, LocalFilesystem};
+use crate::tool::CompactConfig;
 
 use super::artifact::ArtifactDeliveryTarget;
 use super::bus::{AsyncToolRegistry, MessageBus, WorkspaceAsyncToolRegistry, WorkspaceMessageBus};
@@ -603,6 +604,8 @@ pub struct HarnessAgentBuilder {
     disable_subagents: bool,
     disable_dynamic_subagents: bool,
     disable_shell_tool: bool,
+    /// Compaction of grep-like `execute` output (see [`crate::tool::CompactConfig`]).
+    shell_output_compaction: CompactConfig,
     agent_tracing_log_enabled: bool,
     with_shell_tool: bool,
     message_bus: Option<Arc<dyn MessageBus>>,
@@ -712,6 +715,7 @@ impl Default for HarnessAgentBuilder {
             disable_subagents: false,
             disable_dynamic_subagents: false,
             disable_shell_tool: false,
+            shell_output_compaction: CompactConfig::from_env(),
             agent_tracing_log_enabled: true,
             with_shell_tool: false,
             message_bus: None,
@@ -1027,6 +1031,16 @@ impl HarnessAgentBuilder {
     /// Skips registration of the shell tool (only relevant when shell is supported).
     pub fn disable_shell_tool(mut self) -> Self {
         self.disable_shell_tool = true;
+        self
+    }
+
+    /// Overrides how `execute` output is compacted before it reaches the model.
+    ///
+    /// Compaction collapses repeated `path:line:text` prefixes of search-like output
+    /// into per-path headings. It is on by default; [`CompactConfig::disabled`] turns
+    /// it off, and `AGENTSCOPE_OUTPUT_COMPACT=0` does the same for the environment.
+    pub fn shell_output_compaction(mut self, config: CompactConfig) -> Self {
+        self.shell_output_compaction = config;
         self
     }
 
@@ -1825,7 +1839,10 @@ impl HarnessAgentBuilder {
         }
         if self.with_shell_tool && !self.disable_shell_tool {
             if let Some(sandbox) = sandbox_filesystem(&filesystem, &cwd) {
-                ShellExecuteTool::register(&toolkit, sandbox);
+                toolkit.register_tool(Arc::new(ShellExecuteTool::with_output_compaction(
+                    sandbox,
+                    self.shell_output_compaction.clone(),
+                )));
             }
         }
         if let Some(target) = &self.artifact_delivery_target {

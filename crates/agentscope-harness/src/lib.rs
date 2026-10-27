@@ -53,8 +53,9 @@ pub use filesystem::{
     SandboxFilesystem,
 };
 pub use tool::{
-    command_with_working_directory, AgentGenerateTool, ArtifactDeliveryTool, FilesystemTool, Level,
-    MatchRange, MemoryGetTool, MemorySaveTool, MemorySearchTool, SearchResult, SessionHistoryTool,
-    SessionListTool, SessionSearchTool, ShellExecuteTool, TaskCancelTool, TaskListTool,
-    TaskOutputTool, TaskTool, WebFetchTool, WebSearchTool,
+    command_with_working_directory, compact_grep_like, AgentGenerateTool, ArtifactDeliveryTool,
+    CompactConfig, CompactReport, FilesystemTool, Level, MatchRange, MemoryGetTool, MemorySaveTool,
+    MemorySearchTool, SearchResult, SessionHistoryTool, SessionListTool, SessionSearchTool,
+    ShellExecuteTool, TaskCancelTool, TaskListTool, TaskOutputTool, TaskTool, WebFetchTool,
+    WebSearchTool, OUTPUT_COMPACT_ENV,
 };
