@@ -33,6 +33,13 @@ use crate::agent::HarnessAgent;
 /// How often the dispatcher looks for accepted work.
 const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// The longest the dispatcher sleeps while a session has nothing to do.
+///
+/// An idle session used to re-read the journal twenty times a second forever. Accepted
+/// commands now wake the loop, and the timeout only covers facts written by another handle
+/// or process, so it can back off to this ceiling.
+const IDLE_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// How long a host waits for an in-flight run to stop before it closes the turn itself.
 const ABANDON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -268,6 +275,12 @@ pub struct AgentSession {
     state: Arc<Mutex<SessionState>>,
     /// Serializes receipt polls and keeps their incremental fold across ticks.
     receipts: tokio::sync::Mutex<ReceiptCache>,
+    /// Wakes the dispatcher as soon as a command is accepted.
+    ///
+    /// The loop used to sleep a fixed 50ms and re-read the journal on every tick, even when
+    /// nothing had been submitted for hours. Accepting a command now wakes it immediately, so
+    /// the periodic timeout only has to cover facts written by another handle or process.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for AgentSession {
@@ -295,6 +308,7 @@ impl AgentSession {
             inbox,
             state: Arc::new(Mutex::new(SessionState::default())),
             receipts: tokio::sync::Mutex::new(ReceiptCache::default()),
+            wake: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -817,7 +831,15 @@ impl AgentSession {
     /// Starts dispatch; `submit`/`respond`/`resume` already call this.
     pub fn start(&self) {
         let mut guard = lock_state(&self.state);
-        if guard.closed || guard.stop.is_some() {
+        if guard.closed {
+            return;
+        }
+        if guard.stop.is_some() {
+            // The dispatcher is already running: wake it instead of starting a second loop.
+            // It may be sleeping on the idle backoff, and the caller wants this command
+            // picked up now rather than at the next tick.
+            drop(guard);
+            self.wake.notify_one();
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -829,7 +851,9 @@ impl AgentSession {
         let inbox = self.inbox.clone();
         let context = self.context.clone();
         let state = Arc::clone(&self.state);
+        let wake = Arc::clone(&self.wake);
         tokio::spawn(async move {
+            let mut backoff = DISPATCH_INTERVAL;
             while !stop.load(Ordering::SeqCst) {
                 // A panic inside one dispatch (a buggy tool, a poisoned dependency lock) must
                 // not kill the loop: `stop` would stay set, every later prompt would queue
@@ -854,7 +878,14 @@ impl AgentSession {
                             Some(format!("dispatch panicked: {detail}"));
                     }
                 }
-                tokio::time::sleep(DISPATCH_INTERVAL).await;
+                // A live run must be observed at the fast cadence (that is how interrupt
+                // commands get consumed); only a genuinely idle session backs off.
+                backoff =
+                    next_idle_backoff(backoff, lock_state(state.as_ref()).active_run.is_some());
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = wake.notified() => backoff = DISPATCH_INTERVAL,
+                }
             }
         });
     }
@@ -1116,6 +1147,18 @@ fn lock_state(state: &Mutex<SessionState>) -> std::sync::MutexGuard<'_, SessionS
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The next sleep before the dispatcher looks for work again.
+///
+/// Busy (a live run) keeps the fast cadence; an idle session doubles the interval up to
+/// [`IDLE_POLL_MAX`]. Split out so the progression is testable without a wall-clock wait.
+fn next_idle_backoff(current: std::time::Duration, busy: bool) -> std::time::Duration {
+    if busy {
+        DISPATCH_INTERVAL
+    } else {
+        (current * 2).min(IDLE_POLL_MAX)
+    }
+}
+
 async fn dispatch_once(
     agent: &Arc<HarnessAgent>,
     log: &Arc<dyn SessionLog>,
@@ -1271,9 +1314,13 @@ async fn launch(
     let cached_state = {
         let guard = lock_state(state.as_ref());
         if guard.restored_head_matches(&head) {
-            agent
-                .agent()
-                .map(|react| react.state_handle().lock().unwrap().clone())
+            agent.agent().map(|react| {
+                react
+                    .state_handle()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
         } else {
             None
         }
@@ -1368,7 +1415,9 @@ async fn launch(
     // the next facts under the wrong key.
     if let Some(react) = agent.agent() {
         let pinned = react.state_handle();
-        let pinned = pinned.lock().unwrap();
+        let pinned = pinned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         restored.session_id = pinned.session_id().to_string();
         if restored.user_id.is_none() {
             restored.user_id = pinned.user_id().map(str::to_string);
@@ -1431,7 +1480,10 @@ async fn launch(
         }
     }
     if let Some(react) = agent.agent() {
-        *react.state_handle().lock().unwrap() = restored;
+        *react
+            .state_handle()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = restored;
     }
     if let Err(error) = recorder.start(&inputs, &working).await {
         recorder.close().await;
@@ -1542,7 +1594,11 @@ async fn launch(
     // tool results, tasks, plan mode), not the pre-run copy this launcher built. Java
     // `finishSession` reads the live call state for exactly this reason.
     let final_state = match agent.agent() {
-        Some(react) => react.state_handle().lock().unwrap().clone(),
+        Some(react) => react
+            .state_handle()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
         None => working.clone(),
     };
     let finish = recorder
@@ -2044,5 +2100,19 @@ mod tests {
             cache.fold("cmd-new"),
             (Some("run-new".to_string()), "running".to_string(), None)
         );
+    }
+
+    #[test]
+    fn an_idle_dispatcher_backs_off_and_a_busy_one_does_not() {
+        // The loop used to re-read the journal every 50ms forever, even with nothing
+        // submitted for hours. Idle ticks now double up to the ceiling; a live run keeps
+        // the fast cadence so interrupt commands are consumed promptly.
+        let mut backoff = DISPATCH_INTERVAL;
+        for _ in 0..10 {
+            backoff = next_idle_backoff(backoff, false);
+        }
+        assert_eq!(backoff, IDLE_POLL_MAX);
+        assert_eq!(next_idle_backoff(IDLE_POLL_MAX, false), IDLE_POLL_MAX);
+        assert_eq!(next_idle_backoff(IDLE_POLL_MAX, true), DISPATCH_INTERVAL);
     }
 }

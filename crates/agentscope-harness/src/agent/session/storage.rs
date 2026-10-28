@@ -38,7 +38,10 @@ impl WorkspaceSessionStorage {
     }
 
     fn lock_for(&self, path: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.locks.lock().unwrap();
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(
             locks
                 .entry(path.to_string())
