@@ -3,13 +3,11 @@
 //!
 //! # Cross-module note
 //!
-//! The harness `DistributedStore` currently only carries `agent_state_store` +
-//! `isolation_scope` (see EXTENSIONS_GAP_TRACKER §2.2), while the Java version
-//! additionally exposes `base_store`, `sandbox_snapshot_spec` and
-//! `sandbox_execution_guard`. Until the harness struct is extended (tracker
-//! §4.2), the OSS crate still constructs and owns all of those components, and
-//! exposes them alongside a harness [`DistributedStore`] via [`OssDistributedStore`]
-//! so callers can wire the extra pieces onto `HarnessAgent` manually.
+//! The harness `DistributedStore` carries `agent_state_store` + `isolation_scope` plus the
+//! composite slots `base_store`, `sandbox_snapshot_spec` and `sandbox_execution_guard`
+//! (EXTENSIONS_GAP_TRACKER §2.2, resolved 2026-10-28). `OssDistributedStore` builds all
+//! four OSS components and projects them into the harness bundle via
+//! [`OssDistributedStore::distributed_store`].
 
 use std::sync::Arc;
 
@@ -107,15 +105,30 @@ impl OssDistributedStore {
     }
 
     /// Returns the sandbox execution guard (harness guard, shared handle).
+    ///
+    /// The guard is **process-local**: `SandboxGuard::is_distributed()` returns `false`
+    /// because OSS offers no server-side lock primitive, so the guard only serialises
+    /// inside one process.
     pub fn sandbox_execution_guard(&self) -> OssSandboxExecutionGuard {
         self.guard.clone()
     }
 
-    /// Composes the harness [`DistributedStore`] with the OSS agent-state store.
+    /// Composes the harness [`DistributedStore`] with every OSS component.
+    ///
+    /// The agent-state store, KV base store, snapshot spec and execution guard are all
+    /// projected (tracker §4.2, resolved 2026-10-28).
+    ///
+    /// The projected `sandbox_execution_guard` slot holds [`OssSandboxExecutionGuard`],
+    /// whose `is_distributed()` is `false` (see [`Self::sandbox_execution_guard`]).
     pub fn distributed_store(&self) -> OssResult<DistributedStore> {
         let ns = self.oss_agent_state_store()?;
+        let base = self.oss_base_store()?;
+        let snapshots = self.oss_snapshot_spec()?;
         Ok(DistributedStore::builder()
             .agent_state_store(Arc::new(ns))
+            .base_store(Arc::new(base))
+            .sandbox_snapshot_spec(Arc::new(snapshots))
+            .sandbox_execution_guard(Arc::new(self.guard.clone()))
             .build())
     }
 }

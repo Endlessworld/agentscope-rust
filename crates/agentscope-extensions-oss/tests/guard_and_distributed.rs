@@ -76,6 +76,47 @@ async fn distributed_store_builds_harness_distributed_store() {
     assert!(harness_ds.agent_state_store.is_some());
 }
 
+/// Tracker §4.2 resolved 2026-10-28: the OSS composition projects its base store, snapshot
+/// spec and execution guard, and the guard is usable through the object-safe `SandboxGuard`.
+#[tokio::test]
+async fn distributed_store_fills_every_composite_slot() {
+    use agentscope_harness::agent::sandbox::SandboxGuard;
+
+    let client = common::mem_client();
+    let ds = OssDistributedStore::create(client, "bucket", None).unwrap();
+    let harness_ds = ds.distributed_store().unwrap();
+
+    let base = harness_ds
+        .base_store
+        .as_ref()
+        .expect("base_store projected");
+    let mut value = serde_json::Map::new();
+    value.insert("projected".to_string(), serde_json::json!(true));
+    base.put(&["ns".to_string()], "k", value);
+    assert!(base.get(&["ns".to_string()], "k").is_some());
+
+    let spec = harness_ds
+        .sandbox_snapshot_spec
+        .as_ref()
+        .expect("sandbox_snapshot_spec projected");
+    assert_eq!(spec.build("projected").expect("build").id(), "projected");
+
+    let guard = harness_ds
+        .sandbox_execution_guard
+        .as_ref()
+        .expect("sandbox_execution_guard projected");
+    let key = SandboxIsolationKey::new("user", "u1");
+    let lease = guard.try_enter(key.clone()).await;
+    assert!(!lease.is_noop());
+    assert!(guard.is_held(&key));
+    guard.release(&key).await;
+    assert!(!guard.is_held(&key));
+    assert!(
+        !guard.is_distributed(),
+        "the OSS guard is process-local: it must not claim cross-process locking"
+    );
+}
+
 #[tokio::test]
 async fn distributed_store_base_store_is_usable_as_dyn() {
     let client = common::mem_client();

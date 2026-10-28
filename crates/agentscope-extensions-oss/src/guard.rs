@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use agentscope_harness::agent::sandbox::{
-    SandboxExecutionGuard, SandboxIsolationKey, SandboxLease,
+    SandboxExecutionGuard, SandboxGuard, SandboxIsolationKey, SandboxLease,
 };
 
 /// OSS module alias for the harness [`SandboxExecutionGuard`].
@@ -63,5 +63,55 @@ impl OssSandboxExecutionGuard {
     /// Returns the number of distinct active leases.
     pub fn active_count(&self) -> usize {
         self.inner.active_count()
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxGuard for OssSandboxExecutionGuard {
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        OssSandboxExecutionGuard::try_enter(self, key)
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        OssSandboxExecutionGuard::release(self, key)
+    }
+
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        OssSandboxExecutionGuard::is_held(self, key)
+    }
+
+    fn active_count(&self) -> usize {
+        OssSandboxExecutionGuard::active_count(self)
+    }
+
+    // `is_distributed()` keeps the trait default (`false`): this wrapper delegates to the
+    // process-local harness `SandboxExecutionGuard`. OSS offers no server-side lock, so the
+    // guard cannot serialise across processes.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_delegates_to_the_harness_guard() {
+        let guard = OssSandboxExecutionGuard::new();
+        let key = SandboxIsolationKey::new("user", "u1");
+        assert!(!guard.is_held(&key));
+        let lease = guard.try_enter(key.clone());
+        assert!(!lease.is_noop());
+        assert!(guard.is_held(&key));
+        guard.release(&key);
+        assert!(!guard.is_held(&key));
+    }
+
+    /// OSS delegates to the in-process harness guard: `is_distributed()` must stay `false`
+    /// so a host does not assume cross-process sandbox serialisation.
+    #[test]
+    fn guard_is_not_distributed() {
+        let guard = OssSandboxExecutionGuard::new();
+        assert!(!SandboxGuard::is_distributed(&guard));
+        let object: Arc<dyn SandboxGuard> = Arc::new(OssSandboxExecutionGuard::new());
+        assert!(!object.is_distributed());
     }
 }

@@ -86,7 +86,7 @@
   - Java `OssBaseStore.putIfVersion` 用 `long`，Java `OssAgentStateStore` 另有 `supportsVersioning`/`getVersioned`/`saveIfVersion` 版本化 API；Rust 侧 `OssAgentStateStore` **未覆写** `supports_versioning`/`get_versioned`/`save_if_version`（默认 `false`/降级为无条件写），与 Java 一致，但意味着 OSS 状态存储**无乐观并发**（P2-7）。
 
 ### 4.2 下一步与阻塞（需汇总方裁定）
-1. **harness `DistributedStore` 字段不足**（与 EXTENSIONS_GAP_TRACKER §2.2 同项）：harness `DistributedStore` 仅 `agent_state_store` + `isolation_scope`，无 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard`。当前 `OssDistributedStore` 自行持有并暴露这些组件，`distributed_store()` 仅能产出含 `agent_state_store` 的 harness 结构。建议扩展到 harness 或明确由各扩展自行组合。
+1. **harness `DistributedStore` 字段不足**（与 EXTENSIONS_GAP_TRACKER §2.2 同项）——**已解决（2026-10-28）**：harness `DistributedStore` 已增 `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard` 三槽 + `SandboxGuard` trait；`OssDistributedStore::distributed_store()` 已用 builder 填满 5 槽（`OssStore` / `OssSnapshotSpec` / `OssSandboxExecutionGuard`），且 `OssSandboxExecutionGuard` 已 `impl SandboxGuard`。详见文末执行记录。
 2. **实机阿里云后端**：`aliyun-oss-rust-sdk` 为 optional（feature `aliyun`），默认关闭。**本轮复核已定性：这不是「依赖选型待裁定」，而是「实机后端代码根本不存在」**（`src/` 内 `cfg(feature = "aliyun")` 命中 0 处，见 §6.5 P0-1）。建议二选一：① 实现 `AliyunOssClient`（`impl OssClient`，置于 `cfg(feature = "aliyun")` 模块内）；② 或改用 `opendal`(oss service) / `object_store` 重写后端 trait。`OssClient` trait 已隔离后端，切换成本低。**同时须修正 `src/lib.rs:19-20` 的误导性文档（P1-7）**（已于 §8-4 定稿）。
 3. **未改根 `[workspace.dependencies]`**：本 crate 的 `aliyun-oss-rust-sdk` 为本地 `[dependencies]` optional，未登记到根；如需统一版本请汇总方处理。
 4. **实机 OSS live 验证待凭据**：端到端需真实 OSS endpoint/AK/SK（同类于 MIGRATION_GAP_TRACKER §7.3）。
@@ -368,9 +368,40 @@
 | `docs/extensions/OSS__GAP_TRACKER.md` | §1/§2/§3.1/§3.2/§4.1 状态 + 本 §8 |
 
 ### 8.3 未做 / 仍需保留的待办
-- **P1-4**：`OssDistributedStore` 无法产出完整 harness `DistributedStore`（`DistributedStore` 仅 `agent_state_store` + `isolation_scope`）——受 harness struct 限制，本轮按「不改 harness」未动，仍见 §4.2-1。
+- **P1-4（已解决，2026-10-28）**：`OssDistributedStore` 现已产出完整 harness `DistributedStore`（5 槽），见文末执行记录；原「受 harness struct 限制」不再成立。
 - **P2-1** 冗余依赖（`futures`/`chrono`/`serde`/`tokio`）、**P2-3** 死错误变体、**P2-4**（注释已一并修正）、**P2-5** 批量删除、**P2-6** 死代码、**P2-7** OSS 状态存储无乐观并发（与 Java 一致）、**P2-8** 零调用访问器：未做。
 - **真实云 live 验证**：仍需 OSS/S3 凭据，参见 §7.6。
 - **`search` 之外的静默降级**：见 §8.1-3「未做」。
+
+## 2026-10-28 执行记录：`DistributedStore` 复合槽位投影（P1-4 / §4.2-1 已解决）
+
+### 背景
+
+harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`）与 `SandboxGuard` trait。本 crate 的 `distributed_store()` 改为 builder 写法并接线全部槽位。
+
+### 投影映射表
+
+| harness 槽位 | 类型 | 来源 | 说明 |
+|---|---|---|---|
+| `agent_state_store` | `Arc<dyn AgentStateStore>` | `self.oss_agent_state_store()?` | 前缀 `{keyPrefix}state/` |
+| `isolation_scope` | `IsolationScope` | 未设置（builder 默认） | 由调用方在 `HarnessAgent` 侧覆盖 |
+| `base_store` | `Arc<dyn BaseStore>` | `self.oss_base_store()?`（`OssStore`） | 前缀 `{keyPrefix}store/` |
+| `sandbox_snapshot_spec` | `Arc<dyn SandboxSnapshotSpec>` | `self.oss_snapshot_spec()?`（`OssSnapshotSpec`） | 前缀 `{keyPrefix}snapshot/` |
+| `sandbox_execution_guard` | `Arc<dyn SandboxGuard>` | `Arc::new(self.guard.clone())`（`OssSandboxExecutionGuard`） | 透明包装 harness guard；新增 `impl SandboxGuard` |
+
+### 代码改动
+
+- `src/distributed_store.rs::distributed_store()`：填满 5 槽（builder，不用 `..Default::default()`）。
+- `src/guard.rs`：`impl SandboxGuard for OssSandboxExecutionGuard`，四方法委托固有方法（语义仍是 harness 进程内计数，未改行为）。
+- 测试：`tests/guard_and_distributed.rs::distributed_store_fills_every_composite_slot`。
+
+### 验证
+
+- `cargo test -p agentscope-extensions-oss`（默认 feature）→ **62 passed / 0 failed**。
+- `cargo test -p agentscope-extensions-oss --features s3` → **71 passed / 0 failed**。
+
+### 未完成 / 语义差异
+
+- 无留空槽位；guard 仍是进程内语义（OSS 无分布式锁后端，与 Java 一致：Java OSS 模块根本没有 guard）。
 
 
