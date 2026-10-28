@@ -6,7 +6,7 @@
 //! tracker §4.2); the in-process contract surface is exposed via [`ContractProvider`] so
 //! the HTTP server can be layered on later.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -368,6 +368,21 @@ impl ControlPlaneBridge {
             .as_ref()
             .map(|journal| journal.pending().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Drops the pending events the control plane has committed, per session.
+    ///
+    /// `committed` maps `sessionId -> last committed seq` (Java `EventReportAck.committed`,
+    /// folded with `Math::max` per session). Mirrors `SessionBridge.onEventAck` →
+    /// `EventJournal.acknowledge`, including its “keep the batch and replay” failure mode:
+    /// an empty map is a no-op and a missing journal (reporting disabled) acknowledges
+    /// nothing. The control plane is idempotent on `(session, seq)`, so a replay after a
+    /// failed checkpoint is always safe.
+    pub fn acknowledge(&self, committed: &BTreeMap<String, i64>) -> ControlPlaneResult<()> {
+        match self.lock_state().journal.as_mut() {
+            Some(journal) => journal.acknowledge(committed),
+            None => Ok(()),
+        }
     }
 
     /// Durable native watermark for `source` (0 when none).

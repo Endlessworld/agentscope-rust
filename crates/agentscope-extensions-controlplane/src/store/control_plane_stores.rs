@@ -15,6 +15,15 @@ use crate::store::message_bus::ControlPlaneMessageBus;
 use crate::store::snapshot_spec::ControlPlaneSnapshotSpec;
 use crate::transport::ControlPlaneHttpClient;
 
+/// Environment key carrying the control-plane REST base URL.
+pub const ENV_CONTROL_PLANE_HTTP: &str = "CONTROL_PLANE_HTTP";
+/// Environment key carrying the trusted bootstrap token.
+pub const ENV_BUILDER_INTERNAL_TOKEN: &str = "BUILDER_INTERNAL_TOKEN";
+/// Environment key carrying the logical agent name.
+pub const ENV_CONTROL_PLANE_AGENT_NAME: &str = "CONTROL_PLANE_AGENT_NAME";
+/// Environment key carrying the tenant / Kubernetes namespace.
+pub const ENV_CONTROL_PLANE_NAMESPACE: &str = "CONTROL_PLANE_NAMESPACE";
+
 /// Factory for control-plane hosted store components (`/api/v1/dp/*`).
 #[derive(Clone)]
 pub struct ControlPlaneStores {
@@ -50,15 +59,27 @@ impl ControlPlaneStores {
         })
     }
 
-    /// Creates a factory from environment variables:
-    /// `CONTROL_PLANE_HTTP`, `BUILDER_INTERNAL_TOKEN`, `CONTROL_PLANE_AGENT_NAME`,
-    /// `CONTROL_PLANE_NAMESPACE`.
+    /// Creates a factory from environment variables, mirroring
+    /// `ControlPlaneStores.fromEnv`:
+    /// `CONTROL_PLANE_HTTP`, `BUILDER_INTERNAL_TOKEN`, `CONTROL_PLANE_AGENT_NAME` (all
+    /// required) and `CONTROL_PLANE_NAMESPACE` (defaults to `default`).
+    ///
+    /// The keys are the renamed control-plane deployment contract. Java exposes no legacy
+    /// `CONTROLPLANE_*` alias, so this port deliberately does not either — reading a legacy
+    /// key would silently diverge from the control plane it talks to.
     pub fn from_env() -> ControlPlaneResult<Self> {
-        let http_base = require_env("CONTROL_PLANE_HTTP")?;
-        let token = require_env("BUILDER_INTERNAL_TOKEN")?;
-        let agent_name = require_env("CONTROL_PLANE_AGENT_NAME")?;
-        let namespace =
-            std::env::var("CONTROL_PLANE_NAMESPACE").unwrap_or_else(|_| "default".into());
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Environment-independent core of [`from_env`](Self::from_env).
+    ///
+    /// `lookup` receives the keys in evaluation order, so the env contract can be asserted
+    /// offline without mutating the process environment.
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> ControlPlaneResult<Self> {
+        let http_base = require_key(&mut lookup, ENV_CONTROL_PLANE_HTTP)?;
+        let token = require_key(&mut lookup, ENV_BUILDER_INTERNAL_TOKEN)?;
+        let agent_name = require_key(&mut lookup, ENV_CONTROL_PLANE_AGENT_NAME)?;
+        let namespace = lookup(ENV_CONTROL_PLANE_NAMESPACE).unwrap_or_else(|| "default".into());
         Self::create(http_base, token, agent_name, namespace)
     }
 
@@ -147,8 +168,12 @@ impl ControlPlaneStores {
     }
 }
 
-fn require_env(name: &str) -> ControlPlaneResult<String> {
-    std::env::var(name).map_err(|_| ControlPlaneError::Config(format!("{name} is required")))
+/// Reads a required environment value, reporting the key that is missing.
+fn require_key(
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    name: &str,
+) -> ControlPlaneResult<String> {
+    lookup(name).ok_or_else(|| ControlPlaneError::Config(format!("{name} is required")))
 }
 
 /// Standard tenant query string appended to every `/api/v1/dp/*` call.
@@ -179,5 +204,60 @@ mod tests {
             .build()
             .unwrap();
         assert!(ControlPlaneStores::from_config(&cfg).is_ok());
+    }
+
+    /// The env contract must match `ControlPlaneStores.fromEnv` key-for-key, in order, and
+    /// must not fall back to the legacy `CONTROLPLANE_*` names.
+    #[test]
+    fn from_lookup_reads_the_renamed_control_plane_env_keys() {
+        let mut seen = Vec::new();
+        let stores = ControlPlaneStores::from_lookup(|key| {
+            seen.push(key.to_string());
+            match key {
+                "CONTROL_PLANE_HTTP" => Some("http://cp:8080".to_string()),
+                "BUILDER_INTERNAL_TOKEN" => Some("tok".to_string()),
+                "CONTROL_PLANE_AGENT_NAME" => Some("friday".to_string()),
+                "CONTROL_PLANE_NAMESPACE" => Some("team-a".to_string()),
+                _ => None,
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ENV_CONTROL_PLANE_HTTP,
+                ENV_BUILDER_INTERNAL_TOKEN,
+                ENV_CONTROL_PLANE_AGENT_NAME,
+                ENV_CONTROL_PLANE_NAMESPACE,
+            ]
+        );
+        assert_eq!(stores.agent_name(), "friday");
+        assert_eq!(stores.namespace(), "team-a");
+        assert_eq!(stores.http().base_url(), "http://cp:8080");
+    }
+
+    /// A blank namespace falls back to `default`, exactly like Java `envOr(..., "default")`.
+    #[test]
+    fn from_lookup_defaults_the_namespace_and_reports_missing_keys() {
+        let stores = ControlPlaneStores::from_lookup(|key| match key {
+            "CONTROL_PLANE_HTTP" => Some("http://cp".to_string()),
+            "BUILDER_INTERNAL_TOKEN" => Some("tok".to_string()),
+            "CONTROL_PLANE_AGENT_NAME" => Some("friday".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(stores.namespace(), "default");
+
+        let err = ControlPlaneStores::from_lookup(|key| match key {
+            "CONTROL_PLANE_HTTP" => Some("http://cp".to_string()),
+            _ => None,
+        })
+        .err()
+        .expect("missing token must fail");
+        assert!(
+            err.to_string()
+                .contains("BUILDER_INTERNAL_TOKEN is required"),
+            "{err}"
+        );
     }
 }

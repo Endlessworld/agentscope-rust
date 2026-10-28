@@ -17,6 +17,9 @@ use crate::transport::control_plane_http_client::{encode_path_segment, ControlPl
 /// Task-scoped token header.
 pub const TASK_TOKEN_HEADER: &str = "X-Agent-Task-Token";
 
+/// Fallback media type for artifact transfers (Java uses the same literal).
+pub const DEFAULT_ARTIFACT_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// Default interval between runtime-approval decision polls (Java uses 1000ms).
 pub const RUNTIME_APPROVAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -32,6 +35,19 @@ pub struct RuntimeApprovalDecision {
     pub allow: bool,
     /// Reason surfaced to the model when `allow` is `false`.
     pub deny_message: String,
+}
+
+/// A downloaded shared artifact: raw bytes plus the media type the control plane reported.
+///
+/// Java's `downloadArtifact` returns a bare `byte[]`; the Rust port keeps the `Content-Type`
+/// alongside it so callers never have to guess (and never round-trip binary through a
+/// `String`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactContent {
+    /// `Content-Type` of the payload, defaulting to [`DEFAULT_ARTIFACT_CONTENT_TYPE`].
+    pub content_type: String,
+    /// Raw payload bytes, not decoded as text.
+    pub bytes: Vec<u8>,
 }
 
 /// Transport seam for the fenced runtime tool-approval handshake.
@@ -545,6 +561,135 @@ impl CollaborationClient {
         .await
     }
 
+    /// `POST /api/v1/agent-tasks/{id}/run/replan` (`run.replan`).
+    ///
+    /// `node` is the replanned run-graph node, forwarded verbatim.
+    pub async fn replan_run(
+        &self,
+        task_id: &str,
+        token: &str,
+        node: Value,
+    ) -> ControlPlaneResult<Value> {
+        self.task_send(
+            Method::POST,
+            task_id,
+            "run/replan",
+            token,
+            Some(node),
+            "run.replan",
+        )
+        .await
+    }
+
+    /// `POST /api/v1/agent-tasks/{id}/run/signals/{name}` (`run.signal`).
+    ///
+    /// A missing payload is sent as `{}`, mirroring Java `payload == null ? Map.of() : payload`.
+    pub async fn signal_run(
+        &self,
+        task_id: &str,
+        token: &str,
+        name: &str,
+        idempotency_key: &str,
+        payload: Option<Value>,
+    ) -> ControlPlaneResult<Value> {
+        let body = serde_json::json!({
+            "idempotencyKey": idempotency_key,
+            "payload": match payload {
+                Some(value) if !value.is_null() => value,
+                _ => serde_json::json!({}),
+            },
+        });
+        self.task_send(
+            Method::POST,
+            task_id,
+            &format!("run/signals/{}", seg(name)),
+            token,
+            Some(body),
+            "run.signal",
+        )
+        .await
+    }
+
+    /// `POST /api/v1/artifacts/uploads` (`artifact.upload`) as `multipart/form-data`.
+    ///
+    /// Shared bytes only — local runtime paths never cross the collaboration boundary.
+    /// `target_type` defaults to `agent-task`, `target_ref` to `task_id`, and a missing
+    /// `content_type` to [`DEFAULT_ARTIFACT_CONTENT_TYPE`], all matching Java.
+    pub async fn upload_artifact(
+        &self,
+        task_id: &str,
+        token: &str,
+        filename: &str,
+        content_type: Option<&str>,
+        content: &[u8],
+        target_type: Option<&str>,
+        target_ref: Option<&str>,
+    ) -> ControlPlaneResult<Value> {
+        let boundary = format!("controlplane-{}", uuid::Uuid::new_v4());
+        let body = multipart_artifact_body(
+            &boundary,
+            task_id,
+            filename,
+            content_type,
+            content,
+            target_type,
+            target_ref,
+        );
+        let headers = [(TASK_TOKEN_HEADER, token)];
+        let response = self
+            .http
+            .send_bytes_with_headers(
+                Method::POST,
+                "/api/v1/artifacts/uploads",
+                &format!("multipart/form-data; boundary={boundary}"),
+                body,
+                &headers,
+            )
+            .await?;
+        if !(200..300).contains(&response.status) {
+            return Err(ControlPlaneError::Http(format!(
+                "artifact.upload failed: HTTP {} {}",
+                response.status, response.body
+            )));
+        }
+        parse_json_body(&response.body, "artifact.upload")
+    }
+
+    /// `POST /api/v1/artifacts/{id}/download?taskId={taskId}` (`artifact.download`).
+    ///
+    /// The only binary response on this client: the payload is returned as raw bytes and
+    /// is never converted through a `String`.
+    pub async fn download_artifact(
+        &self,
+        artifact_id: &str,
+        task_id: &str,
+        token: &str,
+    ) -> ControlPlaneResult<ArtifactContent> {
+        let path = format!(
+            "/api/v1/artifacts/{}/download?taskId={}",
+            seg(artifact_id),
+            crate::transport::encode_query(task_id)
+        );
+        let headers = [(TASK_TOKEN_HEADER, token)];
+        let response = self
+            .http
+            .send_for_bytes(Method::POST, &path, None, &headers)
+            .await?;
+        if !(200..300).contains(&response.status) {
+            let detail = String::from_utf8_lossy(&response.body).to_string();
+            return Err(ControlPlaneError::Http(format!(
+                "artifact.download failed: HTTP {} {detail}",
+                response.status
+            )));
+        }
+        Ok(ArtifactContent {
+            content_type: response
+                .content_type
+                .unwrap_or_else(|| DEFAULT_ARTIFACT_CONTENT_TYPE.to_string()),
+            bytes: response.body,
+        })
+    }
+
     /// Sends a task-scoped request.
     async fn task_send(
         &self,
@@ -598,12 +743,64 @@ impl CollaborationClient {
                 response.status, response.body
             )));
         }
-        if response.body.trim().is_empty() {
-            return Ok(serde_json::json!({}));
-        }
-        serde_json::from_str(&response.body)
-            .map_err(|e| ControlPlaneError::Http(format!("{operation} returned invalid JSON: {e}")))
+        parse_json_body(&response.body, operation)
     }
+}
+
+/// Parses a collaboration response body, treating an empty body as `{}`.
+fn parse_json_body(body: &str, operation: &str) -> ControlPlaneResult<Value> {
+    if body.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(body)
+        .map_err(|e| ControlPlaneError::Http(format!("{operation} returned invalid JSON: {e}")))
+}
+
+/// Builds the artifact-upload body, mirroring Java `CollaborationClient.uploadArtifact`.
+///
+/// Form fields come first (`sourceTaskId`, `targetType`, `targetRef`), then a single `file`
+/// part whose filename is stripped of quote / CR / LF, then the closing boundary.
+fn multipart_artifact_body(
+    boundary: &str,
+    task_id: &str,
+    filename: &str,
+    content_type: Option<&str>,
+    content: &[u8],
+    target_type: Option<&str>,
+    target_ref: Option<&str>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_form_field(&mut body, boundary, "sourceTaskId", task_id);
+    write_form_field(
+        &mut body,
+        boundary,
+        "targetType",
+        target_type.unwrap_or("agent-task"),
+    );
+    write_form_field(
+        &mut body,
+        boundary,
+        "targetRef",
+        target_ref.unwrap_or(task_id),
+    );
+    let safe_name = filename.replace(|c: char| c == '"' || c == '\r' || c == '\n', "_");
+    let header = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: {}\r\n\r\n",
+        content_type.unwrap_or(DEFAULT_ARTIFACT_CONTENT_TYPE)
+    );
+    body.extend_from_slice(header.as_bytes());
+    body.extend_from_slice(content);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn write_form_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
 }
 
 #[async_trait::async_trait]
@@ -814,5 +1011,304 @@ mod tests {
         // Cloning must share the same underlying handle.
         let _clone = client.clone();
         assert_eq!(client.http.base_url(), "http://localhost:8080");
+    }
+
+    // ---- offline loopback harness for the artifact / run-control endpoints ----
+
+    /// One request as the loopback control plane observed it.
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl RecordedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn json(&self) -> Value {
+            serde_json::from_slice(&self.body).expect("json body")
+        }
+    }
+
+    struct ControlPlaneStub {
+        requests: Mutex<Vec<RecordedRequest>>,
+        response: Mutex<(u16, Option<String>, Vec<u8>)>,
+    }
+
+    impl ControlPlaneStub {
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn only_request(&self) -> RecordedRequest {
+            let requests = self.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "expected exactly one request: {requests:?}"
+            );
+            requests[0].clone()
+        }
+    }
+
+    async fn control_plane_stub(
+        status: u16,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> (Arc<ControlPlaneStub>, CollaborationClient) {
+        use axum::extract::{Request, State};
+
+        async fn handle(
+            State(stub): State<Arc<ControlPlaneStub>>,
+            request: Request,
+        ) -> axum::response::Response {
+            let method = request.method().to_string();
+            let path = request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default();
+            let headers = request
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            stub.requests.lock().unwrap().push(RecordedRequest {
+                method,
+                path,
+                headers,
+                body,
+            });
+            let (status, content_type, body) = stub.response.lock().unwrap().clone();
+            let mut builder = axum::response::Response::builder().status(status);
+            if let Some(content_type) = content_type {
+                builder = builder.header("content-type", content_type);
+            }
+            builder.body(axum::body::Body::from(body)).unwrap()
+        }
+
+        let stub = Arc::new(ControlPlaneStub {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new((status, content_type.map(str::to_string), body)),
+        });
+        let app = axum::Router::new()
+            .fallback(handle)
+            .with_state(Arc::clone(&stub));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let http = Arc::new(
+            ControlPlaneHttpClient::new(format!("http://{addr}"), "internal-token").unwrap(),
+        );
+        (stub, CollaborationClient::new(http))
+    }
+
+    #[tokio::test]
+    async fn replan_run_posts_the_node_to_run_replan() {
+        let (stub, client) = control_plane_stub(
+            200,
+            Some("application/json"),
+            br#"{"accepted":true}"#.to_vec(),
+        )
+        .await;
+        let node = serde_json::json!({ "nodeId": "n-2", "kind": "agent" });
+        let value = client
+            .replan_run("task 1", "task-token", node.clone())
+            .await
+            .unwrap();
+        assert_eq!(value, serde_json::json!({ "accepted": true }));
+
+        let request = stub.only_request();
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.path, "/api/v1/agent-tasks/task%201/run/replan",
+            "task ids must be percent-encoded"
+        );
+        assert_eq!(request.header(TASK_TOKEN_HEADER), Some("task-token"));
+        assert_eq!(
+            request.header(crate::transport::INTERNAL_TOKEN_HEADER),
+            Some("internal-token")
+        );
+        assert_eq!(request.json(), node);
+    }
+
+    #[tokio::test]
+    async fn signal_run_posts_the_idempotency_key_and_defaults_a_missing_payload() {
+        let (stub, client) =
+            control_plane_stub(202, Some("application/json"), b"{}".to_vec()).await;
+        client
+            .signal_run(
+                "t-1",
+                "task-token",
+                "pause now",
+                "idem-7",
+                Some(serde_json::json!({ "at": 3 })),
+            )
+            .await
+            .unwrap();
+        let first = stub.requests()[0].clone();
+        assert_eq!(first.method, "POST");
+        assert_eq!(
+            first.path,
+            "/api/v1/agent-tasks/t-1/run/signals/pause%20now"
+        );
+        assert_eq!(
+            first.json(),
+            serde_json::json!({ "idempotencyKey": "idem-7", "payload": { "at": 3 } })
+        );
+
+        // A missing payload must be sent as `{}` (Java `payload == null ? Map.of() : payload`).
+        let (_stub, client) =
+            control_plane_stub(202, Some("application/json"), b"{}".to_vec()).await;
+        client
+            .signal_run("t-1", "task-token", "pause", "idem-8", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            _stub.only_request().json(),
+            serde_json::json!({ "idempotencyKey": "idem-8", "payload": {} })
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_artifact_posts_a_multipart_form_with_binary_content() {
+        let (stub, client) = control_plane_stub(
+            201,
+            Some("application/json"),
+            br#"{"artifactId":"art-1"}"#.to_vec(),
+        )
+        .await;
+        // 0xFF / 0xFE are not valid UTF-8: the body must survive byte-for-byte.
+        let content = vec![0xFFu8, 0x00, 0xFE, 0x01];
+        let value = client
+            .upload_artifact(
+                "t-1",
+                "task-token",
+                "re\"port\n.bin",
+                Some("application/pdf"),
+                &content,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, serde_json::json!({ "artifactId": "art-1" }));
+
+        let request = stub.only_request();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/api/v1/artifacts/uploads");
+        assert_eq!(request.header(TASK_TOKEN_HEADER), Some("task-token"));
+        let content_type = request.header("content-type").expect("content-type");
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .expect("multipart content type");
+        assert!(boundary.starts_with("controlplane-"), "{boundary}");
+
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        assert!(body.contains(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"sourceTaskId\"\r\n\r\nt-1\r\n"
+        )));
+        // Java defaults: targetType=agent-task, targetRef=taskId.
+        assert!(body.contains("name=\"targetType\"\r\n\r\nagent-task\r\n"));
+        assert!(body.contains("name=\"targetRef\"\r\n\r\nt-1\r\n"));
+        // Quote / CR / LF in the filename are neutralised.
+        assert!(body.contains("filename=\"re_port_.bin\""), "{body}");
+        assert!(body.contains("Content-Type: application/pdf"));
+        assert!(body.ends_with(&format!("\r\n--{boundary}--\r\n")));
+        // Binary content is intact, not lossily decoded.
+        assert!(
+            request
+                .body
+                .windows(content.len())
+                .any(|w| w == content.as_slice()),
+            "binary payload must be copied verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_artifact_maps_error_statuses() {
+        let (_stub, client) = control_plane_stub(
+            409,
+            Some("application/json"),
+            br#"{"error":"conflict"}"#.to_vec(),
+        )
+        .await;
+        let err = client
+            .upload_artifact("t-1", "tok", "a.bin", None, b"x", None, None)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("artifact.upload failed"), "{message}");
+        assert!(message.contains("409"), "{message}");
+        assert!(message.contains("conflict"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn download_artifact_round_trips_non_utf8_bytes_with_the_content_type() {
+        let payload = vec![0xFFu8, 0xFE, 0x00, 0x80, 0x7F];
+        let (stub, client) =
+            control_plane_stub(200, Some("application/octet-stream"), payload.clone()).await;
+        let artifact = client
+            .download_artifact("art-1", "t 1", "task-token")
+            .await
+            .unwrap();
+        assert_eq!(artifact.bytes, payload);
+        assert_eq!(artifact.content_type, "application/octet-stream");
+
+        let request = stub.only_request();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/api/v1/artifacts/art-1/download?taskId=t+1");
+        assert_eq!(request.header(TASK_TOKEN_HEADER), Some("task-token"));
+        assert!(request.body.is_empty(), "download must not send a body");
+        assert_eq!(request.header("content-type"), None);
+    }
+
+    #[tokio::test]
+    async fn download_artifact_defaults_the_content_type_and_surfaces_errors() {
+        let (_stub, client) = control_plane_stub(200, None, vec![1, 2, 3]).await;
+        let artifact = client.download_artifact("a", "t", "tok").await.unwrap();
+        assert_eq!(artifact.content_type, DEFAULT_ARTIFACT_CONTENT_TYPE);
+        assert_eq!(artifact.bytes, vec![1, 2, 3]);
+
+        let (_stub, client) =
+            control_plane_stub(404, Some("text/plain"), b"artifact missing".to_vec()).await;
+        let err = client.download_artifact("a", "t", "tok").await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("artifact.download failed"), "{message}");
+        assert!(message.contains("404"), "{message}");
+        assert!(message.contains("artifact missing"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn download_artifact_percent_encodes_the_artifact_id() {
+        let (_stub, client) = control_plane_stub(200, None, vec![]).await;
+        client
+            .download_artifact("a/b c", "t-1", "tok")
+            .await
+            .unwrap();
+        assert_eq!(
+            _stub.only_request().path,
+            "/api/v1/artifacts/a%2Fb%20c/download?taskId=t-1"
+        );
     }
 }

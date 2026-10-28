@@ -5,9 +5,9 @@
 //! the Rust port stores [`SessionEvent`] JSON, which is the same wire-agnostic payload.
 //! Callers serialize access.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -132,18 +132,47 @@ impl EventJournal {
         self.pending.clear();
     }
 
+    /// Drops the pending events the control plane has committed, per session.
+    ///
+    /// `committed` maps a session id to the last sequence the control plane persisted;
+    /// only records whose `seq` is **at or below** that floor are dropped. Everything else
+    /// — later records of an acknowledged session, records of sessions absent from the map,
+    /// and every record when the map is empty — stays pending. Mirrors
+    /// `EventJournal.acknowledge(Map<String, Integer>)`:
+    ///
+    /// * an empty map is a no-op (it does not even touch the checkpoint),
+    /// * the sequence checkpoint is persisted **before** any record is dropped, so a crash
+    ///   in between can only cause a safe, idempotent replay,
+    /// * the rewrite goes through [`write_atomic`], so the journal on disk is either the old
+    ///   or the trimmed record set, never a torn prefix.
+    ///
+    /// Unlike Java, the in-memory backlog is only updated once the rewrite succeeded, so a
+    /// failed rewrite keeps the batch replayable instead of dropping it in memory.
+    pub fn acknowledge(&mut self, committed: &BTreeMap<String, i64>) -> ControlPlaneResult<()> {
+        if committed.is_empty() {
+            return Ok(());
+        }
+        let survivors: Vec<SessionEvent> = self
+            .pending
+            .iter()
+            .filter(|event| match committed.get(&event.session_id) {
+                Some(floor) => event.seq > *floor,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        let records = encode_records(&survivors)?;
+        self.persist_sequences()?;
+        write_atomic(&self.path, &records)
+            .map_err(|e| ControlPlaneError::Http(format!("acknowledge journal: {e}")))?;
+        self.pending = survivors;
+        Ok(())
+    }
+
     /// Rewrites the journal with only the still-pending events (compaction).
     pub fn rewrite_pending(&mut self) -> ControlPlaneResult<()> {
-        let mut buf = Vec::new();
-        for ev in &self.pending {
-            let payload =
-                serde_json::to_vec(ev).map_err(|e| ControlPlaneError::Http(e.to_string()))?;
-            buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&payload);
-        }
-        std::fs::write(&self.path, &buf)
-            .map_err(|e| ControlPlaneError::Http(format!("rewrite journal: {e}")))?;
-        Ok(())
+        let records = encode_records(&self.pending)?;
+        write_atomic(&self.path, &records)
     }
 
     fn load(&mut self) -> ControlPlaneResult<()> {
@@ -199,10 +228,58 @@ impl EventJournal {
         for (source, seq) in &self.source_watermarks {
             out.push_str(&format!("{NATIVE_WATERMARK_PREFIX}{source}\t{seq}\n"));
         }
-        std::fs::write(&self.sequence_path, out)
-            .map_err(|e| ControlPlaneError::Http(format!("write sequences: {e}")))?;
-        Ok(())
+        write_atomic(&self.sequence_path, out.as_bytes())
+            .map_err(|e| ControlPlaneError::Http(format!("write sequences: {e}")))
     }
+}
+
+/// Encodes events as the on-disk length-prefixed JSON record stream.
+fn encode_records(events: &[SessionEvent]) -> ControlPlaneResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    for event in events {
+        let payload =
+            serde_json::to_vec(event).map_err(|e| ControlPlaneError::Http(e.to_string()))?;
+        if payload.len() > MAX_RECORD_BYTES {
+            return Err(ControlPlaneError::Config(format!(
+                "event record exceeds {MAX_RECORD_BYTES} bytes"
+            )));
+        }
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&payload);
+    }
+    Ok(buf)
+}
+
+/// Writes `bytes` to `path` through a sibling `.tmp` file, fsync, then an atomic rename.
+///
+/// Mirrors Java `EventJournal.rewrite()` / `persistSequences()`, so a crash mid-write never
+/// leaves a torn journal behind.
+fn write_atomic(path: &Path, bytes: &[u8]) -> ControlPlaneResult<()> {
+    let temp = temp_sibling(path);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(|e| ControlPlaneError::Http(format!("open {:?}: {e}", temp)))?;
+        file.write_all(bytes)
+            .map_err(|e| ControlPlaneError::Http(format!("write {:?}: {e}", temp)))?;
+        file.sync_all()
+            .map_err(|e| ControlPlaneError::Http(format!("fsync {:?}: {e}", temp)))?;
+    }
+    std::fs::rename(&temp, path)
+        .map_err(|e| ControlPlaneError::Http(format!("rename {:?}: {e}", path)))?;
+    Ok(())
+}
+
+/// `dir/name` → `dir/name.tmp`, matching Java `resolveSibling(getFileName() + ".tmp")`.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.tmp"))
 }
 
 /// Merges one native source watermark, keeping the maximum.
@@ -304,5 +381,163 @@ mod tests {
         j.ack_all();
         assert_eq!(j.pending_len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn event(session: &str, seq: i64) -> SessionEvent {
+        let mut ev = SessionEvent::builder(session, TYPE_MESSAGE)
+            .content(format!("{session}-{seq}"))
+            .build();
+        ev.set_seq(seq);
+        ev
+    }
+
+    fn temp_journal() -> (PathBuf, ControlPlaneConfig) {
+        let dir =
+            std::env::temp_dir().join(format!("controlplane-journal-{}", uuid::Uuid::new_v4()));
+        let cfg = temp_config(dir.to_str().unwrap());
+        (dir, cfg)
+    }
+
+    fn pending_seqs(journal: &EventJournal) -> Vec<(String, i64)> {
+        journal
+            .pending()
+            .iter()
+            .map(|ev| (ev.session_id.clone(), ev.seq))
+            .collect()
+    }
+
+    /// Interleaved sessions: only the acknowledged session loses records up to its floor;
+    /// the later records of that same session and every other session stay pending.
+    #[test]
+    fn acknowledge_drops_only_records_at_or_below_the_session_floor() {
+        let (dir, cfg) = temp_journal();
+        let mut j = EventJournal::new(&cfg).unwrap();
+        for (session, seq) in [("s1", 1), ("s2", 1), ("s1", 2), ("s2", 2), ("s1", 3)] {
+            j.append(event(session, seq)).unwrap();
+        }
+        let committed = BTreeMap::from([("s1".to_string(), 2i64)]);
+        j.acknowledge(&committed).unwrap();
+        assert_eq!(
+            pending_seqs(&j),
+            vec![
+                ("s2".to_string(), 1),
+                ("s2".to_string(), 2),
+                ("s1".to_string(), 3),
+            ]
+        );
+        // The sequence checkpoint is unaffected by trimming the outbox.
+        assert_eq!(j.latest_sequence("s1"), 3);
+        assert_eq!(j.latest_sequence("s2"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session that is absent from the committed map must never be dropped.
+    #[test]
+    fn acknowledge_ignores_sessions_absent_from_the_committed_map() {
+        let (dir, cfg) = temp_journal();
+        let mut j = EventJournal::new(&cfg).unwrap();
+        j.append(event("s1", 1)).unwrap();
+        j.append(event("s2", 1)).unwrap();
+        j.acknowledge(&BTreeMap::from([("ghost".to_string(), 99i64)]))
+            .unwrap();
+        assert_eq!(j.pending_len(), 2);
+        assert_eq!(
+            pending_seqs(&j),
+            vec![("s1".to_string(), 1), ("s2".to_string(), 1)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty committed map is a no-op: same backlog, same bytes on disk.
+    #[test]
+    fn acknowledge_with_an_empty_map_is_a_noop() {
+        let (dir, cfg) = temp_journal();
+        let mut j = EventJournal::new(&cfg).unwrap();
+        j.append(event("s1", 1)).unwrap();
+        let before = std::fs::read(&j.path).unwrap();
+        j.acknowledge(&BTreeMap::new()).unwrap();
+        assert_eq!(j.pending_len(), 1);
+        assert_eq!(std::fs::read(&j.path).unwrap(), before);
+        // A no-op must not rewrite files either (Java returns before persisting).
+        assert!(!temp_sibling(&j.path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Partially acknowledged journals replay exactly the un-acknowledged tail after restart.
+    #[test]
+    fn acknowledged_records_do_not_replay_after_reopen() {
+        let (dir, cfg) = temp_journal();
+        {
+            let mut j = EventJournal::new(&cfg).unwrap();
+            j.append(event("s1", 1)).unwrap();
+            j.append(event("s1", 2)).unwrap();
+            j.append(event("s1", 3)).unwrap();
+            j.append(event("s2", 1)).unwrap();
+            j.acknowledge(&BTreeMap::from([("s1".to_string(), 2i64)]))
+                .unwrap();
+        }
+        let reopened = EventJournal::new(&cfg).unwrap();
+        assert_eq!(
+            pending_seqs(&reopened),
+            vec![("s1".to_string(), 3), ("s2".to_string(), 1)]
+        );
+        assert_eq!(reopened.latest_sequence("s1"), 3);
+        // A second ack of the same floor leaves the surviving tail alone.
+        let mut reopened = reopened;
+        reopened
+            .acknowledge(&BTreeMap::from([("s1".to_string(), 2i64)]))
+            .unwrap();
+        assert_eq!(reopened.pending_len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rewrite is atomic: the temp file is renamed, never left behind, and the on-disk
+    /// record stream still decodes to exactly the survivors.
+    #[test]
+    fn acknowledge_rewrites_the_journal_atomically() {
+        let (dir, cfg) = temp_journal();
+        let mut j = EventJournal::new(&cfg).unwrap();
+        j.append(event("s1", 1)).unwrap();
+        j.append(event("s1", 2)).unwrap();
+        j.append(event("s2", 1)).unwrap();
+        j.acknowledge(&BTreeMap::from([("s1".to_string(), 1i64)]))
+            .unwrap();
+        assert!(!temp_sibling(&j.path).exists());
+        let encoded = encode_records(j.pending()).unwrap();
+        assert_eq!(std::fs::read(&j.path).unwrap(), encoded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed rewrite must not drop the backlog from memory: the batch stays replayable.
+    #[test]
+    fn acknowledge_keeps_the_backlog_when_the_rewrite_fails() {
+        let (dir, cfg) = temp_journal();
+        let mut j = EventJournal::new(&cfg).unwrap();
+        j.append(event("s1", 1)).unwrap();
+        j.append(event("s1", 2)).unwrap();
+        // Block the temp sibling with a directory so the atomic rewrite cannot open it.
+        std::fs::create_dir_all(temp_sibling(&j.path)).unwrap();
+        let err = j
+            .acknowledge(&BTreeMap::from([("s1".to_string(), 2i64)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("acknowledge journal"), "{err}");
+        assert_eq!(j.pending_len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default outbox lives under the renamed service-controlplane directory.
+    #[test]
+    fn default_journal_dir_matches_the_control_plane_layout() {
+        let dir = default_journal_dir();
+        let tail: Vec<String> = dir
+            .components()
+            .rev()
+            .take(3)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["event-journal", "service-controlplane", ".agentscope"]
+        );
     }
 }

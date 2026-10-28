@@ -31,6 +31,11 @@ pub struct BytesResponse {
     pub status: u16,
     /// Response body bytes.
     pub body: Vec<u8>,
+    /// `Content-Type` of the response, when the server sent one.
+    ///
+    /// Java's `BytesResponse` drops the header; the artifact download path needs it to hand
+    /// the payload back without guessing the media type.
+    pub content_type: Option<String>,
 }
 
 /// Shared HTTP client for control plane REST calls.
@@ -118,12 +123,21 @@ impl ControlPlaneHttpClient {
             .await
             .map_err(|e| ControlPlaneError::Http(format!("{url}: {e}")))?;
         let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
         let body = resp
             .bytes()
             .await
             .map_err(|e| ControlPlaneError::Http(format!("{url}: {e}")))?
             .to_vec();
-        Ok(BytesResponse { status, body })
+        Ok(BytesResponse {
+            status,
+            body,
+            content_type,
+        })
     }
 
     /// Sends raw bytes (e.g. `PUT application/octet-stream`).
@@ -134,12 +148,29 @@ impl ControlPlaneHttpClient {
         content_type: &str,
         body: Vec<u8>,
     ) -> ControlPlaneResult<Response> {
+        self.send_bytes_with_headers(method, path, content_type, body, &[])
+            .await
+    }
+
+    /// Sends raw bytes with extra headers (mirrors Java's 5-arg `sendBytes`).
+    pub async fn send_bytes_with_headers(
+        &self,
+        method: Method,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        extra_headers: &[(&str, &str)],
+    ) -> ControlPlaneResult<Response> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self
+        let mut req = self
             .http
             .request(method, &url)
             .header(INTERNAL_TOKEN_HEADER, &self.internal_token)
-            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_TYPE, content_type);
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req
             .body(body)
             .send()
             .await

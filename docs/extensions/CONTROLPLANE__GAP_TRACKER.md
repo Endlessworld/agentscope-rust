@@ -17,7 +17,7 @@
 | Java 规模（2026-10-22 实测） | controlplane：主 39 文件 **9518** 行 / 测 14 文件 **3017** 行（共 53 .java）。旧 controlplane（`a2cbea5c3~1`）：主 39 文件 9360 行 / 测 14 文件 2898 行 |
 | Rust crate | `crates/agentscope-extensions-controlplane`（**未改名**，Rust 侧无 controlplane crate） |
 | 迁移波次 | C |
-| 当前状态 | 进行中（P0 链路 + **P1 主干 + P2 主体**已落地：模型 + HTTP transport + 7 个 ControlPlane* store + HttpSelfRegistration + `ContractHttpServer` + `AgentScopeAdapter` + `ControlPlaneObserverMiddleware` + `ControlPlaneBridge` 事件真接线 + **`AgentTask*` 工具族 + `CollaborationClient`/`OrchestrationClient`**；2026-10-08 `cargo build` 通过、`cargo test` **106/106 全绿** → 后续会话 **125 passed**） |
+| 当前状态 | 进行中（P0 链路 + **P1 主干 + P2 主体**已落地：模型 + HTTP transport + 7 个 ControlPlane* store + HttpSelfRegistration + `ContractHttpServer` + `AgentScopeAdapter` + `ControlPlaneObserverMiddleware` + `ControlPlaneBridge` 事件真接线 + **`AgentTask*` 工具族 + `CollaborationClient`/`OrchestrationClient`**；2026-10-08 `cargo build` 通过、`cargo test` **106/106 全绿** → 后续会话 **125 passed** → P0-1 后 **128 lib + 4 e2e** → **2026-10-28：144 lib + 4 e2e 全绿（P1-1/P1-2/P1-3/P2-2 关闭，§8）**） |
 
 ## 2. Java 清单与依赖映射
 
@@ -31,7 +31,7 @@
 | `ControlPlaneConfig`（旧 `ControlPlaneConfig`） | 连接/上报设置 record（**20 字段**，校验 agentKey/tenant/namespace/instanceKey） | `config::ControlPlaneConfig`（builder + 同校验，**20 字段一一对应**） | ✅ |
 | `SessionBridge` (1207L) | 核心桥：挂载 adapter、事件序列化、Level-1/2/4 上报、命令处理、start/close | `bridge::ControlPlaneBridge`（async/tokio） | ✅ 已完成（P1 主干）；**缺 `onCommittedEvent` 原生事件提交入口**（§6.3 P0-1） |
 | `FrameworkAdapter` (156L) | 框架适配 SPI（13 capability 常量 + attach/detach + extractContext/listMessages...） | `adapter::FrameworkAdapter`（async_trait，**13 capability 常量逐一对应**） | ✅ trait |
-| `EventJournal` (250L) | Level-2 事件崩溃安全本地 outbox（长度前缀记录 + 序列号 + sha256 身份） | `event_journal::EventJournal` | ✅；**缺 source watermark / 按会话选择性 ack**（§6.3 P1-2） |
+| `EventJournal` (250L) | Level-2 事件崩溃安全本地 outbox（长度前缀记录 + 序列号 + sha256 身份） | `event_journal::EventJournal` | ✅ 已完成（含 `source_watermark`/`track_source`/`acknowledge` + 临时文件 rename 原子重写，§6.3 P1-2 已完成） |
 
 子包 `model`：
 | Java 类 | 职责 | Rust 对应 | 状态 |
@@ -46,7 +46,7 @@
 子包 `store`（ControlPlane 托管存储，实现 harness 既有 trait，不重建平行类型）：
 | Java 类 | 职责 | Rust 对应（实现既有 trait） | 状态 |
 |---|---|---|---|
-| `ControlPlaneStores` (189L) | 工厂：`fromEnv`/`create`/`from(config)` + `withAgentStateStore` | `store::ControlPlaneStores` | ✅；**env 变量名仍为旧 `CONTROLPLANE_*`**（§6.3 P1-1） |
+| `ControlPlaneStores` (189L) | 工厂：`fromEnv`/`create`/`from(config)` + `withAgentStateStore` | `store::ControlPlaneStores` | ✅ env 键已对齐 `CONTROL_PLANE_HTTP` / `BUILDER_INTERNAL_TOKEN` / `CONTROL_PLANE_AGENT_NAME` / `CONTROL_PLANE_NAMESPACE`（§6.3 P1-1 已完成；`from_lookup` 可离线断言键名与顺序） |
 | `ControlPlaneBaseStore` (194L) | `/api/v1/dp/kv/*` → harness `BaseStore` | `store::ControlPlaneBaseStore` impl `BaseStore` | ✅；含 `supports_atomic_session_storage() = true`（与 Java 新增一致） |
 | `ControlPlaneMessageBus` (267L) | `/api/v1/dp/bus/*` → harness `MessageBus`（Mode D 轮询降级） | `store::ControlPlaneMessageBus` impl `MessageBus` | ✅ |
 | `ControlPlaneAsyncToolRegistry` (216L) | `/api/v1/dp/async-tools/*` → harness `AsyncToolRegistry` | `store::ControlPlaneAsyncToolRegistry` impl `AsyncToolRegistry` | ✅ |
@@ -58,12 +58,12 @@
 子包 `transport`：
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
-| `ControlPlaneHttpClient` (184L) | JDK HttpClient 包装，加 `X-Builder-Internal-Token`，10s 超时；`send`/`sendBytes`/`sendForBytes` | `transport::ControlPlaneHttpClient`（reqwest；`send`/`send_bytes`/`send_for_bytes`） | ✅ |
+| `ControlPlaneHttpClient` (184L) | JDK HttpClient 包装，加 `X-Builder-Internal-Token`，10s 超时；`send`/`sendBytes`/`sendForBytes` | `transport::ControlPlaneHttpClient`（reqwest；`send`/`send_bytes`/`send_bytes_with_headers`/`send_for_bytes`；`BytesResponse.content_type`） | ✅ |
 | `ContractProvider` (89L) | 契约服务数据提供者 SPI（17 方法，全部有 default） | `transport::ContractProvider`（trait，**17 方法逐一对应**） | ✅ |
 | `HttpSelfRegistration` (273L) | `POST /api/v1/agent-registrations` + 周期心跳 + 身份回调 | `transport::HttpSelfRegistration`（+ `RegisteredIdentity`/`RegistrationOptions`/`parse_registered_identity`） | ✅ 已完成 |
 | `ContractHttpServer` (333L) | 进程内 `/agentscope/*` HTTP 契约服务 | ✅ 已完成（axum） | `src/transport/contract_http_server.rs` + `transport/mod.rs` re-export；**16 条 route path / 17 个端点与 Java 逐一对应**（GET info/health/sessions/subagents/workspaces、GET state/context/messages/tasks/subagent-tasks/export-transcript、POST compress/terminate/abort/plan-mode/messages、DELETE subagent-tasks/{taskId}） |
 | `GrpcTransport` (404L) | ASDP gRPC 上游通道（protobuf） | 设计决定（P2 暂缓：需 ASDP proto toolchain） | 设计决定 |
-| `CollaborationClient` (502L) | 协作/编排客户端 | ✅ 已完成 | `src/transport/collaboration_client.rs`（issue/team/approval + task-scoped + MCP `tools/call`；`X-Agent-Task-Token`）；**缺 4 端点**：`replanRun`/`signalRun`/`uploadArtifact`/`downloadArtifact`（§6.3 P1-3） |
+| `CollaborationClient` (502L) | 协作/编排客户端 | ✅ 已完成 | `src/transport/collaboration_client.rs`（issue/team/approval + task-scoped + MCP `tools/call`；`X-Agent-Task-Token`）；**4 端点已补齐**：`replan_run`/`signal_run`/`upload_artifact`/`download_artifact`（§6.3 P1-3 已完成，下载走 `send_for_bytes` 二进制通道） |
 | `OrchestrationClient` (137L) | 编排客户端（definition/run/attempt/runtime-policy） | `src/transport/orchestration_client.rs`（`?tenant=&namespace=` 作用域） | ✅ **19 方法与 Java 逐一对应** |
 
 子包 `adapter`：
@@ -138,6 +138,8 @@
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 **状态：部分完成（P0 + P1 主干已落地并通过构建/测试；剩余 P2 与架构级语义差异）**
+
+**最新验证（2026-10-28）**：`cargo test -p agentscope-extensions-controlplane` → **144 lib + 4 e2e passed / 0 failed / 0 ignored（EXIT=0）**（基线 128 + 4，本轮 **+16**）；`cargo build -p agentscope-extensions-controlplane` 成功。§6.3 的 **P1-1 / P1-2 / P1-3 / P2-2 均已关闭**，明细与反向验证见 **§8**。
 
 本次会话（2026-10-08）交付：`ControlPlaneObserverMiddleware`（Level-2 事件源）、`AgentScopeAdapter`（框架适配）、适配器辅助 SPI、**`AgentTask*` 工具族（`AgentTaskOutcome`/`State`/`ToolContext`/`AgentTaskOutcomeTool`/`AgentTaskCollaborationTool`）**、**`CollaborationClient`/`OrchestrationClient`**、**harness 侧 `HarnessAgentTaskStarter`/`HarnessWorkspaceAgentFactory`**、**运行时工具审批回环（`RuntimeApprovalSource` + `ConfirmHandler`）**，以及 **`ControlPlaneBridge` 事件 emit 的真接线**（原为 no-op 闭包 → 事件全被吞掉）。
 
@@ -289,14 +291,14 @@
 | `ControlPlaneConfig` | 247 | `config::ControlPlaneConfig` | ✅ 已对齐 | 20 字段逐一对应，校验一致 |
 | `SessionBridge` | 1207 | `bridge::ControlPlaneBridge` | ⚠️ 部分 | **缺 `onCommittedEvent(source, nativeSeq, event)`**（原生事件提交入口，§6.3 P0-1） |
 | `FrameworkAdapter` | 156 | `adapter::FrameworkAdapter` | ✅ 已对齐 | 13 capability 常量逐一对应 |
-| `EventJournal` | 250 | `event_journal::EventJournal` | ⚠️ 部分 | **缺 source watermark（去重）** 与 **按会话选择性 ack**（§6.3 P1-2） |
+| `EventJournal` | 250 | `event_journal::EventJournal` | ✅ 已对齐 | `source_watermark`/`track_source`/`acknowledge` + 原子 rewrite（2026-10-28） |
 | `model::SessionEvent` | 200 | `model::SessionEvent` | ✅ 已对齐 | 6 type + 4 role 常量一致 |
 | `model::ContextSnapshot` | 364 | `model::ContextSnapshot` | ✅ 已对齐 | `hash()` 一致 |
 | `model::ContextTracker` | 186 | `model::ContextTracker` | ✅ 已对齐 | 增量视图 + contextHash 一致 |
 | `model::Inventory` | 116 | `model::Inventory` | ✅ 已对齐 | subagents/workspaces/health 一致 |
 | `model::MessagePage` | 83 | `model::MessagePage` | ✅ 已对齐 | 分页一致 |
 | `model::AgentTaskAssignment` | 42 | `model::AgentTaskAssignment` | ✅ 已对齐 | 13 字段一致（payload base64 编解码一致） |
-| `store::ControlPlaneStores` | 189 | `store::ControlPlaneStores` | ⚠️ 部分 | **env 变量名仍为旧 `CONTROLPLANE_*`**（§6.3 P1-1） |
+| `store::ControlPlaneStores` | 189 | `store::ControlPlaneStores` | ✅ 已对齐 | env 键 `CONTROL_PLANE_*` 与 Java `fromEnv` 逐字一致（2026-10-28） |
 | `store::ControlPlaneBaseStore` | 194 | `store::ControlPlaneBaseStore` | ✅ 已对齐 | 含 `supports_atomic_session_storage() = true`（Java 新增已对齐） |
 | `store::ControlPlaneMessageBus` | 267 | `store::ControlPlaneMessageBus` | ✅ 已对齐 | |
 | `store::ControlPlaneAsyncToolRegistry` | 216 | `store::ControlPlaneAsyncToolRegistry` | ✅ 已对齐 | |
@@ -304,12 +306,12 @@
 | `store::ControlPlaneSessionTurnGate` | 237 | `store::ControlPlaneSessionTurnGate` | ✅ 已对齐 | 20s 续租/60s TTL/30s 本地回退均已实现 |
 | `store::ControlPlaneSandboxExecutionGuard` | 206 | `store::ControlPlaneSandboxExecutionGuard` | ✅ 已对齐 | |
 | `store::ControlPlaneSnapshotSpec` | 135 | `store::ControlPlaneSnapshotSpec` | ✅ 已对齐 | |
-| `transport::ControlPlaneHttpClient` | 184 | `transport::ControlPlaneHttpClient` | ✅ 已对齐 | `send`/`send_bytes`/`send_for_bytes` 一致 |
+| `transport::ControlPlaneHttpClient` | 184 | `transport::ControlPlaneHttpClient` | ✅ 已对齐 | `send`/`send_bytes`/`send_bytes_with_headers`/`send_for_bytes`（后者带回 `content_type`） |
 | `transport::ContractProvider` | 89 | `transport::ContractProvider` | ✅ 已对齐 | 17 方法逐一对应 |
 | `transport::HttpSelfRegistration` | 273 | `transport::HttpSelfRegistration` | ✅ 已对齐 | 注册+心跳+身份回调一致 |
 | `transport::ContractHttpServer` | 333 | `transport::ContractHttpServer` | ✅ 已对齐 | 16 route path / 17 端点逐一对应 |
 | `transport::GrpcTransport` | 404 | — | ❌ 缺 | 设计决定（不迁移）：需 ASDP proto 工具链，P2 |
-| `transport::CollaborationClient` | 502 | `transport::CollaborationClient` | ⚠️ 部分 | **缺 `replanRun` / `signalRun` / `uploadArtifact` / `downloadArtifact` 4 端点**（§6.3 P1-3） |
+| `transport::CollaborationClient` | 502 | `transport::CollaborationClient` | ✅ 已对齐 | 29 个端点全部落地（含 `replanRun`/`signalRun`/`uploadArtifact`/`downloadArtifact`，2026-10-28） |
 | `transport::OrchestrationClient` | 137 | `transport::OrchestrationClient` | ✅ 已对齐 | 19 方法逐一对应 |
 | `adapter::AgentScopeAdapter` | 936 | `adapter::AgentScopeAdapter` | ⚠️ 部分 | **缺 `publishCommitted` 转发到 bridge**（§6.3 P0-1） |
 | `adapter::ControlPlaneObserverMiddleware` | 267 | `adapter::ControlPlaneObserverMiddleware` | ⚠️ 部分 | **缺 native session-log 分支**（`SessionExportSink` 注入 + `publishNative` 映射，§6.3 P0-1） |
@@ -325,18 +327,18 @@
 | `adapter::SessionHistorySource` | 35 | `adapter::support::SessionHistorySource` | ⚠️ 部分 | 同上 |
 | `adapter::WorkspaceAgentFactory` | 29 | `adapter::support::WorkspaceAgentFactory` | ✅ 已对齐 | 由 `HarnessWorkspaceAgentFactory` 实现 |
 
-**统计**：39 个 Java 类 → **✅ 已对齐 29 / ⚠️ 部分 9 / ❌ 缺 1**（❌ 缺的 `GrpcTransport` 为已判定的「设计决定（不迁移）」；9 项 ⚠️ 中有 3 项是「仅 trait 层、宿主实现待定」的既有 P2 判定，其余 6 项为本轮新发现，见 §6.3）。
+**统计（2026-10-28 更新）**：39 个 Java 类 → **✅ 已对齐 32 / ⚠️ 部分 6 / ❌ 缺 1**（❌ 缺的 `GrpcTransport` 为已判定的「设计决定（不迁移）」；6 项 ⚠️ 中 3 项是「仅 trait 层、宿主实现待定」的既有 P2 判定，其余 3 项为 P0-1 native session-log 链路的尾部（`SessionBridge` / `AgentScopeAdapter` / `ControlPlaneObserverMiddleware`））。
 
 ### 6.3 新发现缺口清单
 
 | 编号 | 缺口项 | Java 参考 | 优先级 | 状态 | 说明 |
 |---|---|---|---|---|---|
 | P0-1 | **native session-log 提交链路未迁移** | `SessionBridge.onCommittedEvent` / `EventJournal.sourceWatermark` / `ControlPlaneObserverMiddleware` 的 `SessionExportSink` 分支 / `AgentScopeAdapter.publishCommitted` | P0 | 待办 | Java 在 `ReActAgent.sessionLogEnabled()` 时改走「核心 session log → 原生导出 sink → journal 强制落盘 → 按 source watermark 去重」的提交链路；Rust 侧 `agentscope-core` 已有 `SessionExportSink` / `SessionLogExporter`（`crates/agentscope-core/src/session/export.rs`），但**本 crate 完全没有引用**（`rg SessionExportSink crates/agentscope-extensions-controlplane` 无命中），且 `SessionLogExporter::new` 在 core 内**除测试外无生产调用方**（`rg SessionLogExporter::new crates/` 仅命中 `export.rs` 自身测试）。**已核实的 Rust 接入点**：`ReActAgent::session_log_enabled()`（`react_agent.rs:308`）、`HarnessAgent::session_log(context)`（`harness_agent.rs:214`）、`RuntimeContext::extension::<T>(key)` / `Extensions::insert_arc`（`runtime_context.rs:45/258`）、`SessionRecorder::open_with(log, turn_id, run_id, Option<Arc<SessionLogExporter>>)`（`recorder.rs:213`）——**后者是现成的 exporter 注入位**。后果：Rust 侧 Level-2 事件仍只来自 `on_agent`/`on_acting` 旁路 tap，无法消费核心已提交事件的原生流；与 Java 新基准不等价 |
-| P1-1 | env 变量名未随重命名迁移 | `ControlPlaneStores.fromEnv` 用 `CONTROL_PLANE_HTTP` / `CONTROL_PLANE_AGENT_NAME` / `CONTROL_PLANE_NAMESPACE` | P1 | 待办 | Rust `store/control_plane_stores.rs:57-60` 仍读 `CONTROLPLANE_CONTROL_PLANE_HTTP` / `CONTROLPLANE_AGENT_NAME` / `CONTROLPLANE_NAMESPACE`；与现行 control plane 部署约定不一致，跨端互操作会取不到配置 |
-| P1-2 | EventJournal 缺 source watermark + 选择性 ack | `EventJournal.sourceWatermark(String)` / `trackSource` / `acknowledge(Map<String,Integer>)` | P1 | 待办 | Rust `event_journal.rs` 只有 `ack_all()`（全量丢弃 pending）；缺按 source 的水位去重与按会话的选择性 ack（Java 按 `committed` map 逐会话裁剪 pending 并 rewrite） |
-| P1-3 | `CollaborationClient` 缺 4 个端点 | `replanRun` / `signalRun` / `uploadArtifact` / `downloadArtifact` | P1 | 待办 | Rust `transport/collaboration_client.rs` 未实现（`rg replan|signal_run|upload_artifact|download_artifact` 无命中）；`downloadArtifact` 是**唯一的二进制响应**路径，Rust 侧需 `send_for_bytes` |
+| P1-1 | env 变量名未随重命名迁移 | `ControlPlaneStores.fromEnv` 用 `CONTROL_PLANE_HTTP` / `CONTROL_PLANE_AGENT_NAME` / `CONTROL_PLANE_NAMESPACE` | P1 | 已完成（2026-10-28） | 核对结论：Rust `from_env` 已使用同名键（无 `CONTROLPLANE_*` 遗留），本轮补 `from_lookup` 健壮点 + 2 个离线键名断言测试。依据：Java `ControlPlaneStores.java:65-70`（`requireEnv("CONTROL_PLANE_HTTP")` / `BUILDER_INTERNAL_TOKEN` / `CONTROL_PLANE_AGENT_NAME` + `envOr("CONTROL_PLANE_NAMESPACE","default")`） |
+| P1-2 | EventJournal 缺 source watermark + 选择性 ack | `EventJournal.sourceWatermark(String)` / `trackSource` / `acknowledge(Map<String,Integer>)` | P1 | 已完成（2026-10-28） | watermark/trackSource 已在 P0-1 落地（本次核对语义与 Java `sourceWatermarks.merge(..., Math::max)` + `__native__` 检查点一致）；本轮补 `acknowledge(&BTreeMap<String,i64>)`（空 map = no-op、先落序列检查点、只丢 `seq <= floor`、未知会话不误丢、临时文件 + rename 原子重写、失败时内存 backlog 不丢）+ `ControlPlaneBridge::acknowledge`。依据：Java `EventJournal.java:138-148`（acknowledge）、`:200-256`（persistSequences/rewrite 原子写）、`SessionBridge.java:611-639`（onEventAck） |
+| P1-3 | `CollaborationClient` 缺 4 个端点 | `replanRun` / `signalRun` / `uploadArtifact` / `downloadArtifact` | P1 | 已完成（2026-10-28） | 4 端点逐一对照：`POST run/replan`、`POST run/signals/{name}`（`idempotencyKey` + `payload` 缺省 `{}`）、`POST /api/v1/artifacts/uploads`（multipart，`sourceTaskId`/`targetType`/`targetRef` + `file`）、`POST /api/v1/artifacts/{id}/download?taskId=`（二进制）。新增 `send_bytes_with_headers` 与 `BytesResponse.content_type`，下载返回 `ArtifactContent { content_type, bytes }`，不经 `String`。依据：Java `CollaborationClient.java:323-421` |
 | P2-1 | crate 名与类型名未随 Java 重命名 | Java → `controlplane` | P2 | 设计决定（不迁移） | 建议**保留 Rust 侧 `controlplane` 命名**（crate 名、类型名），仅在文档/注释标注「对应 Java `agentscope-extensions-controlplane`」；理由：Rust 侧改名会波及 crate 名、import 路径与全部下游引用，收益仅是对齐命名，且本模块 Rust 无 controlplane crate 的对外依赖方需求 |
-| P2-2 | 默认 journal 目录名未迁移 | Java `~/.agentscope/service-controlplane/event-journal` | P2 | 待办 | Rust `event_journal.rs:175` 仍为 `~/.agentscope/controlplane/event-journal`；与 §6.3 P1-1 同批处理即可 |
+| P2-2 | 默认 journal 目录名未迁移 | Java `~/.agentscope/service-controlplane/event-journal` | P2 | 已完成（2026-10-28，已核） | Rust `event_journal.rs::default_journal_dir()` 已是 `~/.agentscope/service-controlplane/event-journal`（P0-1 时已改），本轮补断言测试。**Java 侧不一致已记录**：`ControlPlaneConfig.java:43` javadoc 写 `service-controlplane`，但 `EventJournal.java:80-88` 代码实际拼 `~/.agentscope/controlplane/event-journal`——属本地 outbox，不跨语言共享，按文档化约定（= 任务口径）保留 `service-controlplane`，是否回改为 Java 字面值待汇总方裁定 |
 
 ## 7. 静态复核记录（2026-10-22）
 
@@ -457,7 +459,77 @@ cargo test -p agentscope-core --lib               # 291 passed，全部通过
 
 - **宿主接线仍显式**：`instrument(target, cfg, adapter)` 接收已构建好的 agent，无法再改其 builder extensions。宿主需先 `ControlPlaneBridge::new(cfg).start()`，把 `bridge.export_sink_handle()` 装进 builder/session context，再 `bridge.attach(...)`；或使用 `stream_events_with_extensions` 的 per-run extensions。未做 core agent 的可变注入 API（避免扩大 core 改动面）。
 - harness 路径已接线，但本轮只做 `cargo check` 编译验证；端到端用例走 core `ReActAgent`（离线 fake model）。
-- §6.3 的 P1-1（env 变量名）、P1-2 选择性 ACK（本轮只补 source watermark，`ack_all` 仍为全量）、P1-3、P2-2 未在本轮处理。
+- ~~§6.3 的 P1-1（env 变量名）、P1-2 选择性 ACK（本轮只补 source watermark，`ack_all` 仍为全量）、P1-3、P2-2 未在本轮处理。~~ → **已于 2026-10-28 全部关闭，见 §8**（P1-2 的选择性 `acknowledge` 也在 §8 补齐）。
 - crate/类型命名仍为 `controlplane`（按 §6.3 P2-1 的设计决定）。
+
+## 8. 2026-10-28 执行记录：P1-1 / P1-2 / P1-3 / P2-2
+
+> 本轮只改 `crates/agentscope-extensions-controlplane/**` 与本 tracker；未触根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 crate；未加依赖；未删测试、未 `#[ignore]`。
+
+### 8.1 Java 依据（HEAD `16cb024ae`，逐行核对）
+
+| 项 | Java 位置 | 内容（实测） |
+|---|---|---|
+| P1-1 | `store/ControlPlaneStores.java:65-70` | `requireEnv("CONTROL_PLANE_HTTP")` → `BUILDER_INTERNAL_TOKEN` → `CONTROL_PLANE_AGENT_NAME`，`envOr("CONTROL_PLANE_NAMESPACE", "default")`；**无 `CONTROLPLANE_*` 旧键兼容分支** |
+| P1-2 | `EventJournal.java:61-63` / `:65-78` / `:138-148` / `:200-256` | `sourceWatermark` 默认 0；`trackSource` 取 `native_source`/`native_seq` 并 `merge(..., Math::max)`；`acknowledge` 空 map 直接 return → 落检查点 → 删 `seq <= committed.getOrDefault(sid, Integer.MIN_VALUE)` → `rewrite()`；`persistSequences`/`rewrite` 均为 `.tmp` + `ATOMIC_MOVE` |
+| P1-2（调用方） | `SessionBridge.java:611-639` | `onEventAck` 按 session `merge(..., Math::max)` 折叠 committed，失败则保留批次重放（控制面对 `(session, seq)` 幂等） |
+| P1-3 | `transport/CollaborationClient.java:323-325`（replan）、`:327-340`（signal）、`:347-395`（upload）、`:397-421`（download） | `POST run/replan`；`POST run/signals/{path(name)}` body `{idempotencyKey, payload: payload==null?{}:payload}`；`POST /api/v1/artifacts/uploads` multipart（`sourceTaskId` / `targetType` 缺省 `agent-task` / `targetRef` 缺省 taskId / `file` 文件名去引号换行 + 缺省 `application/octet-stream`）；`POST /api/v1/artifacts/{path(id)}/download?taskId={path(taskId)}` 走 `sendForBytes` |
+| P2-2 | `EventJournal.java:80-88` vs `ControlPlaneConfig.java:43` | **Java 自身不一致**：代码拼 `~/.agentscope/controlplane/event-journal`，javadoc 写 `~/.agentscope/service-controlplane/event-journal`；Rust 取后者（文档化约定 + 任务口径），已在 §6.3 P2-2 标注待裁定 |
+
+### 8.2 改动清单
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `src/event_journal.rs` | 改 | 新增 `acknowledge(&BTreeMap<String, i64>) -> ControlPlaneResult<()>`：空 map 立即 no-op；**先** `persist_sequences()` 再写盘；`retain` 仅保留 `seq > floor` 与 map 中不存在的会话；`encode_records` + `write_atomic`（`<name>.tmp` → fsync → rename）替换原 `std::fs::write`，`rewrite_pending`/`persist_sequences` 一并原子化；**失败时内存 backlog 不变**（先写盘成功才 `self.pending = survivors`，比 Java 的「先改内存再 rewrite」更保守）；+7 测试 |
+| `src/bridge.rs` | 改 | 新增 `ControlPlaneBridge::acknowledge(&BTreeMap<String, i64>)`（无 journal → no-op），对应 `SessionBridge.onEventAck` 的 ack 落盘入口 |
+| `src/store/control_plane_stores.rs` | 改 | 新增 `ENV_CONTROL_PLANE_HTTP` / `ENV_BUILDER_INTERNAL_TOKEN` / `ENV_CONTROL_PLANE_AGENT_NAME` / `ENV_CONTROL_PLANE_NAMESPACE` 常量与 `from_lookup(FnMut(&str) -> Option<String>)` 健壮点（`from_env` 委托给它），删掉原 `require_env`；+2 测试（键名+顺序、缺省 namespace / 缺键报错） |
+| `src/transport/control_plane_http_client.rs` | 改 | `BytesResponse.content_type: Option<String>`（`send_for_bytes` 读取 `Content-Type`）；新增 `send_bytes_with_headers`（对应 Java 5 参 `sendBytes`），`send_bytes` 委托之 |
+| `src/transport/collaboration_client.rs` | 改 | 新增 `ArtifactContent { content_type, bytes }` + `replan_run` / `signal_run` / `upload_artifact` / `download_artifact`；`multipart_artifact_body` + `write_form_field`（边界 `controlplane-{uuid}`，文件名去 `"`/CR/LF）；`parse_json_body` 抽出并给 `send` 复用；`DEFAULT_ARTIFACT_CONTENT_TYPE`；+7 测试（含 loopback axum stub） |
+| `src/transport/mod.rs` | 改 | re-export `ArtifactContent` / `DEFAULT_ARTIFACT_CONTENT_TYPE` |
+| `docs/extensions/CONTROLPLANE__GAP_TRACKER.md` | 改 | §2.0 / §6.2 / §6.3 状态 + §7.4 收尾 + 本 §8 |
+
+### 8.3 与 Java 的显式差异（非缺口）
+
+1. **序列号类型统一 `i64`**：Java `Map<String,Integer>`（session seq）/ `long`（source watermark）双类型，Rust 统一 `i64`，因此 `acknowledge` 入参为 `BTreeMap<String, i64>`（任务文本写的是 `u64`；取 `i64` 以与 `SessionEvent.seq` / `latest_sequences` / `source_watermark` 保持一致，无需在有符号/无符号间转换）。
+2. **`source_watermark` 返回 `i64`（0 = 无）而非 `Option<u64>`**：这是 P0-1 已落地的实现，语义与 Java `sourceWatermarks.getOrDefault(source, 0L)` 逐字等价（`bridge.source_watermark` 亦为 `i64`），本轮核对后保留未改。
+3. **下载带回 `Content-Type`**：Java `BytesResponse(status, byte[])` 丢弃该头，Rust 额外返回 `content_type`（缺省 `application/octet-stream`），避免调用方猜媒体类型；Java 的 `downloadArtifact` 只返 `byte[]`，故这是**超集**。
+4. **`signal_run` 的 `payload`**：`None` 与 `Some(Null)` 都发 `{}`（Java `Map.of` 本身不接受 null，等价）。
+5. **`acknowledge` 失败语义**：Java 先改内存再 `rewrite`（失败则内存已丢、仅靠重启从旧文件回放）；Rust 先写盘成功再换内存，失败时本进程内也可继续重放。
+
+### 8.4 测试与验证
+
+```
+cargo build -p agentscope-extensions-controlplane                 # EXIT=0（仅既有 3 条告警）
+cargo test  -p agentscope-extensions-controlplane                 # EXIT=0  144 lib + 4 e2e passed / 0 failed / 0 ignored
+cargo fmt   -p agentscope-extensions-controlplane -- --check      # 已 fmt（仅本 crate 6 个文件变更）
+```
+
+新增 16 个用例（128 → 144）：
+
+| 模块 | 用例 |
+|---|---|
+| `event_journal` | `acknowledge_drops_only_records_at_or_below_the_session_floor`（多会话交错 + 部分 ack）、`acknowledged_records_do_not_replay_after_reopen`（部分 ack 后重启重放，再 ack 同一水位不误删）、`acknowledge_ignores_sessions_absent_from_the_committed_map`（未知 source/session 不丢）、`acknowledge_with_an_empty_map_is_a_noop`（空 map 不改 backlog、不改文件、不落 `.tmp`）、`acknowledge_rewrites_the_journal_atomically`（无残留 `.tmp`，落盘字节 = 存活记录编码）、`acknowledge_keeps_the_backlog_when_the_rewrite_fails`（`<name>.tmp` 被目录占位 → Err 且 pending 不变）、`default_journal_dir_matches_the_control_plane_layout` |
+| `store::control_plane_stores` | `from_lookup_reads_the_renamed_control_plane_env_keys`（键名与求值顺序逐字断言）、`from_lookup_defaults_the_namespace_and_reports_missing_keys` |
+| `transport::collaboration_client` | `replan_run_posts_the_node_to_run_replan`（方法/路径含 `%20`/两个头/体）、`signal_run_posts_the_idempotency_key_and_defaults_a_missing_payload`（`run/signals/pause%20now`）、`upload_artifact_posts_a_multipart_form_with_binary_content`（boundary 前缀、3 个 form 字段、文件名去引号换行、`0xFF/0xFE` 字节原样）、`upload_artifact_maps_error_statuses`（409 → `artifact.upload failed: HTTP 409 ...`）、`download_artifact_round_trips_non_utf8_bytes_with_the_content_type`（`[0xFF,0xFE,0x00,0x80,0x7F]` 完整往返 + `?taskId=t+1` + 无 body）、`download_artifact_defaults_the_content_type_and_surfaces_errors`（404 + body 透传）、`download_artifact_percent_encodes_the_artifact_id` |
+
+全部离线：用 `axum` + `TcpListener::bind((127.0.0.1, 0))` 起 loopback stub（与 `ContractHttpServer` 测试同法），不触真实控制面。
+
+### 8.5 反向验证（回退实现 → 必须 FAILED → 恢复）
+
+| # | 回退 | 结果 |
+|---|---|---|
+| 1 | `acknowledge` 的 `None => true` 改为 `None => false`（把未提交会话也丢） | `acknowledge` 过滤后 **3 failed / 3 passed**：`acknowledge_ignores_sessions_absent_from_the_committed_map`、`acknowledge_drops_only_records_at_or_below_the_session_floor`、`acknowledged_records_do_not_replay_after_reopen` |
+| 2 | `download_artifact` 改用 `String::from_utf8_lossy(...).into_bytes()` | `download_artifact_round_trips_non_utf8_bytes_with_the_content_type` **FAILED**（`left: [239,191,189,...]` vs `right: [255,254,0,128,127]`） |
+| 3 | `ENV_CONTROL_PLANE_HTTP` 改回 `"CONTROLPLANE_CONTROL_PLANE_HTTP"` | 2 个 `from_lookup_*` **FAILED** |
+
+恢复后重跑全量：**144 + 4 passed / 0 failed / EXIT=0**。
+
+### 8.6 需裁定 / 遗留
+
+1. **P2-2 路径字面值**：Java `EventJournal.java:80-88` 代码为 `~/.agentscope/controlplane/...`，javadoc（`ControlPlaneConfig.java:43`）为 `service-controlplane`；Rust 采用后者。若要与 Java 字节级路径一致，需回改并同步本 tracker §6.1/§6.3。
+2. **`acknowledge` 类型**：任务文本为 `BTreeMap<String, u64>`，实现取 `i64`（理由见 §8.3）。如需 `u64` 公开 API，需同时改 `SessionEvent.seq` 与 `source_watermark` 的符号类型。
+3. §6.3 **P0-1 的尾部**（`SessionBridge`/`AgentScopeAdapter`/`ControlPlaneObserverMiddleware` ⚠️）与 `GrpcTransport` 不变，仍按原判定。
+4. 本轮工作区中其它 crate 的改动（core/jdbc/higress/judge/mem/rag/redis/sandbox/studio 等）**非本会话产生**（并发会话），未触碰。
+
 
 
