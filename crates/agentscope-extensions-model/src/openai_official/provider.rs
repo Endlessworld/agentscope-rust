@@ -101,6 +101,7 @@ impl ModelProvider for OpenAIOfficialModelProvider {
         let context_window_size = take_u64(&mut options, "contextWindowSize").map(|v| v as usize);
         let formatter = take_formatter(&mut options);
         let server_tools = take_server_tools(&mut options)?;
+        let proxy = take_proxy(&mut options)?;
 
         let mut model =
             OpenAIResponsesChatModel::new(model_name, api_key, Some(base_url), default_transport())
@@ -111,6 +112,9 @@ impl ModelProvider for OpenAIOfficialModelProvider {
                 .with_server_tools(server_tools);
         if let Some(formatter) = formatter {
             model = model.with_formatter(formatter);
+        }
+        if let Some(proxy) = proxy {
+            model = model.with_proxy_config(proxy)?;
         }
         if let Some(size) = context_window_size {
             model = model.with_context_window_size(size);
@@ -168,6 +172,15 @@ fn take_server_tools(options: &mut GenerateOptions) -> Result<Vec<OpenAIServerTo
         .cloned()
         .map(|tool| OpenAIServerTool::from_json(tool).map_err(Error::Model))
         .collect()
+}
+
+/// Reads the `proxy` option object (`{type, host, port, username, password,
+/// nonProxyHosts}`) and turns it into a [`super::proxy::ProxyConfig`].
+fn take_proxy(options: &mut GenerateOptions) -> Result<Option<super::proxy::ProxyConfig>> {
+    let Some(value) = take_option(options, "proxy") else {
+        return Ok(None);
+    };
+    super::proxy::ProxyConfig::from_json(&value).map(Some)
 }
 
 // Keep the env name referenced by public docs/tests.
@@ -240,6 +253,45 @@ mod tests {
         let model = provider.create(ctx).unwrap();
         assert_eq!(model.context_window_size(), 123_456);
         assert!(model.supports_native_structured_output());
+    }
+
+    #[test]
+    fn proxy_option_is_consumed_and_not_rejected_by_the_whitelist() {
+        let provider = OpenAIOfficialModelProvider::new();
+        let mut options = GenerateOptions::default();
+        options.additional_body_params.insert(
+            "proxy".to_string(),
+            serde_json::json!({
+                "type": "http",
+                "host": "127.0.0.1",
+                "port": 3128,
+                "nonProxyHosts": ["api.openai.com"]
+            }),
+        );
+        let ctx = ModelCreationContext::new("openai-official", "openai-official:gpt-5")
+            .api_key("sk")
+            .options(options);
+        // `proxy` is consumed before the additionalBodyParams whitelist runs, so
+        // creation succeeds (a leftover key would be rejected as non-whitelisted).
+        assert!(provider.create(ctx).is_ok());
+    }
+
+    #[test]
+    fn unsupported_proxy_fails_fast_at_creation() {
+        let provider = OpenAIOfficialModelProvider::new();
+        let mut options = GenerateOptions::default();
+        options.additional_body_params.insert(
+            "proxy".to_string(),
+            serde_json::json!({"type": "socks5", "host": "127.0.0.1", "port": 1080}),
+        );
+        let ctx = ModelCreationContext::new("openai-official", "openai-official:gpt-5")
+            .api_key("sk")
+            .options(options);
+        let err = match provider.create(ctx) {
+            Ok(_) => panic!("SOCKS proxies must fail fast"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("socks"), "{err}");
     }
 
     #[test]

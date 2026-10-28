@@ -18,6 +18,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod media;
 pub mod model_map;
+pub mod multi_agent;
 pub mod transport;
 pub mod usage;
 
@@ -32,6 +33,11 @@ pub use media::{
     ResolvedMedia,
 };
 pub use model_map::{strip_reasoning_suffix, ModelMap, ModelMapError, ReasoningHint};
+pub use multi_agent::{
+    agent_name, group_messages, is_tool_related, take_bool_option, take_multi_agent_prompt,
+    take_option, text_only, GroupType, DEFAULT_CONVERSATION_HISTORY_PROMPT, HISTORY_END_TAG,
+    HISTORY_START_TAG,
+};
 pub use transport::{
     decode_stream_line, HttpRequestSpec, HttpTransport, JsonStream, MemoryTransport,
     ReqwestTransport, SharedTransport, TransportConfig,

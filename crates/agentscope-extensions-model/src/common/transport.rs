@@ -126,6 +126,24 @@ pub trait HttpTransport: Send + Sync {
 
     /// Performs a streaming request, yielding decoded JSON values as they arrive.
     fn post_json_stream<'a>(&'a self, req: HttpRequestSpec) -> JsonStream<'a>;
+
+    /// Performs a `GET` returning JSON — used for provider metadata endpoints
+    /// (e.g. the DashScope public-key endpoint consumed by request encryption).
+    ///
+    /// The default implementation reports that this transport cannot issue
+    /// `GET`: transports that only implement the chat POST path (or test
+    /// doubles) then fail loudly instead of silently returning an empty body.
+    async fn get_json(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        provider: &str,
+    ) -> Result<serde_json::Value> {
+        let _ = (headers, provider);
+        Err(Error::Model(format!(
+            "HTTP transport does not support GET {url}"
+        )))
+    }
 }
 
 fn map_reqwest(provider: &str, err: reqwest::Error) -> ModelError {
@@ -137,6 +155,21 @@ fn map_reqwest(provider: &str, err: reqwest::Error) -> ModelError {
     let mut model_error = ModelError::new(provider, 0, err.to_string());
     model_error.kind = kind;
     model_error
+}
+
+/// Parses an upstream `x-should-retry` header value.
+///
+/// Mirrors `OpenAIResponsesChatModel#checkXShouldRetry`: only `true` / `false`
+/// (case-insensitive) are honoured; anything else leaves retryability to the
+/// status classification.
+pub fn parse_should_retry(value: &str) -> Option<bool> {
+    if value.trim().eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.trim().eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn apply_headers(
@@ -251,12 +284,20 @@ impl ReqwestTransport {
             .await
             .map_err(|e| map_reqwest(&req.provider, e))?;
         let status = response.status();
+        // Read the retry hint before the body is consumed: an explicit
+        // `x-should-retry` overrides the status-based classification.
+        let should_retry = response
+            .headers()
+            .get("x-should-retry")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_should_retry);
         let text = response
             .text()
             .await
             .map_err(|e| map_reqwest(&req.provider, e))?;
         if !status.is_success() {
-            return Err(ModelError::parse(&req.provider, status.as_u16(), &text));
+            return Err(ModelError::parse(&req.provider, status.as_u16(), &text)
+                .with_retry_override(should_retry));
         }
         serde_json::from_str(&text)
             .map_err(|e| ModelError::new(&req.provider, 200, format!("invalid JSON response: {e}")))
@@ -329,6 +370,31 @@ impl HttpTransport for ReqwestTransport {
             }
         })
     }
+
+    /// Issues a real `GET` and decodes the JSON body.
+    ///
+    /// Non-success statuses are normalised through the same [`ModelError`] path as
+    /// `post_json`, so a metadata endpoint failure carries the provider/status
+    /// information instead of a bare "invalid JSON".
+    async fn get_json(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        provider: &str,
+    ) -> Result<serde_json::Value> {
+        let builder = apply_headers(self.client.get(url), headers);
+        let response = builder.send().await.map_err(|e| map_reqwest(provider, e))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| map_reqwest(provider, e))?;
+        if !status.is_success() {
+            return Err(ModelError::parse(provider, status.as_u16(), &text).to_core());
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| Error::Model(format!("{provider}: invalid JSON response from {url}: {e}")))
+    }
 }
 
 /// An in-memory transport used by the offline unit tests.
@@ -341,8 +407,13 @@ pub struct MemoryTransport {
     pub response: Option<serde_json::Value>,
     /// Chunks yielded by [`HttpTransport::post_json_stream`].
     pub stream_items: Vec<serde_json::Value>,
+    /// Response returned by [`HttpTransport::get_json`] (e.g. the DashScope public-key
+    /// endpoint used by request encryption). `None` fails the `GET`.
+    pub get_response: Option<serde_json::Value>,
     /// Records the last request spec received (for assertions).
     pub captured: Arc<std::sync::Mutex<Option<HttpRequestSpec>>>,
+    /// Records the last `GET` URL received (for assertions).
+    pub captured_get_url: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MemoryTransport {
@@ -352,6 +423,19 @@ impl MemoryTransport {
             response: Some(response),
             ..Default::default()
         }
+    }
+
+    /// Creates a transport that answers `GET` with `response` (metadata endpoints).
+    pub fn with_get_response(response: serde_json::Value) -> Self {
+        Self {
+            get_response: Some(response),
+            ..Default::default()
+        }
+    }
+
+    /// The URL of the last `GET` issued through this transport.
+    pub fn last_get_url(&self) -> Option<String> {
+        self.captured_get_url.lock().ok().and_then(|g| g.clone())
     }
 
     /// Creates a transport that yields the given streaming chunks.
@@ -388,6 +472,22 @@ impl HttpTransport for MemoryTransport {
         let items: Vec<Result<serde_json::Value>> =
             self.stream_items.iter().cloned().map(Ok).collect();
         Box::pin(futures::stream::iter(items))
+    }
+
+    async fn get_json(
+        &self,
+        url: &str,
+        _headers: &[(String, String)],
+        _provider: &str,
+    ) -> Result<serde_json::Value> {
+        if let Ok(mut guard) = self.captured_get_url.lock() {
+            *guard = Some(url.to_string());
+        }
+        self.get_response.clone().ok_or_else(|| {
+            Error::Model(format!(
+                "MemoryTransport: no GET response configured for {url}"
+            ))
+        })
     }
 }
 
@@ -450,6 +550,17 @@ mod tests {
         let value = transport.post_json(spec).await.unwrap();
         assert_eq!(value, serde_json::json!({"ok": true}));
         assert_eq!(transport.last_request().unwrap().url, "http://x/y");
+    }
+
+    #[test]
+    fn should_retry_header_parsing() {
+        assert_eq!(parse_should_retry("true"), Some(true));
+        assert_eq!(parse_should_retry(" TRUE "), Some(true));
+        assert_eq!(parse_should_retry("False"), Some(false));
+        // Anything else leaves retryability to the status classification.
+        assert_eq!(parse_should_retry(""), None);
+        assert_eq!(parse_should_retry("1"), None);
+        assert_eq!(parse_should_retry("yes"), None);
     }
 
     #[tokio::test]

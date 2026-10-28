@@ -90,6 +90,19 @@ impl ModelProvider for DashScopeModelProvider {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
+        // Formatter selector (mirrors Java's `DashScopeMultiAgentFormatter` usage).
+        // Consumed here so it never reaches the request body.
+        let mut options = ctx.options.clone();
+        let multi_agent_prompt = crate::common::take_multi_agent_prompt(&mut options);
+
+        // `enableEncrypt` (Java `DashScopeModelProvider.OPTION_ENABLE_ENCRYPT`): when set,
+        // the model fetches the RSA public key and encrypts every request input.
+        let enable_encrypt = options
+            .additional_body_params
+            .remove("enableEncrypt")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
         let base_url = crate::common::resolve_base_url(
             ctx.base_url.clone(),
             BASE_URL_ENV,
@@ -98,11 +111,13 @@ impl ModelProvider for DashScopeModelProvider {
 
         let model =
             DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
-                .with_default_options(ctx.options.clone())
+                .with_default_options(options)
                 .with_stream(ctx.stream.unwrap_or(true))
                 .with_endpoint_type(endpoint_type)
                 .with_enable_thinking(ctx.enable_thinking)
-                .with_context_window_size(context_window_size);
+                .with_context_window_size(context_window_size)
+                .with_multi_agent_formatter(multi_agent_prompt)
+                .with_encryption_enabled(enable_encrypt);
         Ok(Arc::new(model))
     }
 }

@@ -27,6 +27,7 @@ pub mod formatter;
 pub mod model;
 pub mod parser;
 pub mod provider;
+pub mod proxy;
 pub mod request;
 pub mod server_tool;
 
@@ -45,7 +46,12 @@ pub use parser::{
     extract_response_metadata, extract_usage, parse_response, ResponsesStreamingAssembler,
 };
 pub use provider::{default_openai_official_registry, OpenAIOfficialModelProvider};
-pub use request::{map_history, map_request, resolve_data_block_image_url, resolve_image_url};
+pub use proxy::{build_client as build_proxied_client, ProxyConfig, ProxyType};
+pub use request::{
+    map_history, map_request, resolve_data_block_image_url, resolve_image_url, PROMPT_CACHE_MODES,
+    PROMPT_CACHE_TTLS, REASONING_CONTEXTS, REASONING_EFFORTS, REASONING_MODES, REASONING_SUMMARIES,
+    SERVICE_TIERS,
+};
 pub use server_tool::{
     HostedToolSearchPairing, OpenAIServerTool, OpenAIServerToolKind, ResponsesServerToolHelper,
     CODE_INTERPRETER, IMAGE_GENERATION, TOOL_SEARCH, WEB_SEARCH,

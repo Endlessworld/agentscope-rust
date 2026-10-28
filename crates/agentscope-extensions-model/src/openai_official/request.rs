@@ -72,6 +72,62 @@ pub fn map_request(
     Ok(body)
 }
 
+// ── Option enums (fail-fast validation) ─────────────────────────────
+
+/// Legal `reasoning.effort` values, mirroring openai-java `ReasoningEffort.Known`.
+pub const REASONING_EFFORTS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Legal `reasoning.summary` values (`Reasoning.Summary`).
+pub const REASONING_SUMMARIES: &[&str] = &["auto", "concise", "detailed"];
+/// Legal `reasoning.context` values (`Reasoning.Context`).
+pub const REASONING_CONTEXTS: &[&str] = &["auto", "current_turn", "all_turns"];
+/// Legal `reasoning.mode` values (`Reasoning.Mode`).
+pub const REASONING_MODES: &[&str] = &["standard", "pro"];
+/// Legal `service_tier` values (`ResponseCreateParams.ServiceTier`).
+pub const SERVICE_TIERS: &[&str] = &[
+    "auto",
+    "default",
+    "flex",
+    "scale",
+    "priority",
+    "fast",
+    "ultrafast",
+];
+/// Legal `prompt_cache_options.mode` values.
+pub const PROMPT_CACHE_MODES: &[&str] = &["implicit", "explicit"];
+/// Legal `prompt_cache_options.ttl` values.
+pub const PROMPT_CACHE_TTLS: &[&str] = &["30m"];
+
+/// Rejects a value outside `allowed`, naming the field and the legal set.
+fn validate_enum(field: &str, value: &str, allowed: &[&str]) -> Result<()> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(Error::Model(format!(
+        "Invalid {field} value '{value}'; expected one of: {}",
+        allowed.join(", ")
+    )))
+}
+
+/// Reads an optional string-valued option and validates it against `allowed`.
+fn validated_str<'a>(
+    field: &str,
+    value: Option<&'a Value>,
+    allowed: &[&str],
+) -> Result<Option<&'a str>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            validate_enum(field, text, allowed)?;
+            Ok(Some(text))
+        }
+        Some(other) => Err(Error::Model(format!(
+            "Invalid {field} value '{other}': expected a string, one of: {}",
+            allowed.join(", ")
+        ))),
+    }
+}
+
 // ── Options mapping ─────────────────────────────────────────────────
 
 fn map_options(
@@ -99,14 +155,17 @@ fn map_options(
     if options.reasoning_effort.is_some() || has_reasoning_param {
         let mut reasoning = Map::new();
         if let Some(effort) = &options.reasoning_effort {
+            // Mirrors `ReasoningEffort.of(x).validate()`: unknown values fail
+            // fast instead of being forwarded to the API.
+            validate_enum("reasoning.effort", effort, REASONING_EFFORTS)?;
             reasoning.insert("effort".to_string(), json!(effort));
         }
-        for (key, field) in [
-            ("reasoning.summary", "summary"),
-            ("reasoning.context", "context"),
-            ("reasoning.mode", "mode"),
+        for (key, field, allowed) in [
+            ("reasoning.summary", "summary", REASONING_SUMMARIES),
+            ("reasoning.context", "context", REASONING_CONTEXTS),
+            ("reasoning.mode", "mode", REASONING_MODES),
         ] {
-            if let Some(value) = reasoning_params.get(key).and_then(Value::as_str) {
+            if let Some(value) = validated_str(key, reasoning_params.get(key), allowed)? {
                 reasoning.insert(field.to_string(), json!(value));
             }
         }
@@ -204,19 +263,39 @@ fn map_additional_body_params(body: &mut Value, options: &GenerateOptions) -> Re
             })?;
         body["max_tool_calls"] = json!(number);
     }
-    if let Some(value) = params.get("service_tier").and_then(Value::as_str) {
+    if let Some(value) = validated_str("service_tier", params.get("service_tier"), SERVICE_TIERS)? {
         body["service_tier"] = json!(value);
     }
     if let Some(value) = params.get("prompt_cache_key").and_then(Value::as_str) {
         body["prompt_cache_key"] = json!(value);
     }
     if let Some(value) = params.get("prompt_cache_options") {
-        if !value.is_object() {
-            return Err(Error::Model(format!(
-                "prompt_cache_options must be a Map, got: {value}"
-            )));
+        let map = value.as_object().ok_or_else(|| {
+            Error::Model(format!("prompt_cache_options must be a Map, got: {value}"))
+        })?;
+        let mut options_body = Map::new();
+        if let Some(mode) = validated_str(
+            "prompt_cache_options.mode",
+            map.get("mode"),
+            PROMPT_CACHE_MODES,
+        )? {
+            options_body.insert("mode".to_string(), json!(mode));
         }
-        body["prompt_cache_options"] = value.clone();
+        if let Some(ttl) = validated_str(
+            "prompt_cache_options.ttl",
+            map.get("ttl"),
+            PROMPT_CACHE_TTLS,
+        )? {
+            options_body.insert("ttl".to_string(), json!(ttl));
+        }
+        for key in map.keys() {
+            if key != "mode" && key != "ttl" {
+                return Err(Error::Model(format!(
+                    "prompt_cache_options key '{key}' is not supported; expected 'mode' and/or 'ttl'"
+                )));
+            }
+        }
+        body["prompt_cache_options"] = Value::Object(options_body);
     }
     if let Some(value) = params.get("safety_identifier").and_then(Value::as_str) {
         body["safety_identifier"] = json!(value);
@@ -845,6 +924,84 @@ mod tests {
             .insert("unknown".to_string(), json!(1));
         let err = map_request(&[], &[], &[], &bad, None, None, None).unwrap_err();
         assert!(err.to_string().contains("whitelist"));
+    }
+
+    #[test]
+    fn option_enums_are_validated_against_the_java_whitelists() {
+        // Valid values pass through.
+        let mut good = options("gpt-5");
+        good.reasoning_effort = Some("xhigh".to_string());
+        good.additional_body_params
+            .insert("reasoning.summary".to_string(), json!("concise"));
+        good.additional_body_params
+            .insert("reasoning.context".to_string(), json!("current_turn"));
+        good.additional_body_params
+            .insert("reasoning.mode".to_string(), json!("pro"));
+        good.additional_body_params.insert(
+            "prompt_cache_options".to_string(),
+            json!({"mode": "explicit", "ttl": "30m"}),
+        );
+        let body = map_request(&[], &[], &[], &good, None, None, None).unwrap();
+        assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
+        assert_eq!(body["reasoning"]["summary"], json!("concise"));
+        assert_eq!(body["reasoning"]["context"], json!("current_turn"));
+        assert_eq!(body["reasoning"]["mode"], json!("pro"));
+        assert_eq!(body["prompt_cache_options"]["mode"], json!("explicit"));
+        assert_eq!(body["prompt_cache_options"]["ttl"], json!("30m"));
+
+        // Unknown values fail fast instead of hitting the API.
+        let mut bad_effort = options("gpt-5");
+        bad_effort.reasoning_effort = Some("turbo".to_string());
+        let err = map_request(&[], &[], &[], &bad_effort, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("reasoning.effort"), "{err}");
+        assert!(err.to_string().contains("xhigh"), "{err}");
+
+        let mut bad_summary = options("gpt-5");
+        bad_summary
+            .additional_body_params
+            .insert("reasoning.summary".to_string(), json!("verbose"));
+        assert!(map_request(&[], &[], &[], &bad_summary, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("reasoning.summary"));
+
+        let mut bad_tier = options("gpt-5");
+        bad_tier
+            .additional_body_params
+            .insert("service_tier".to_string(), json!("turbo"));
+        assert!(map_request(&[], &[], &[], &bad_tier, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("service_tier"));
+
+        let mut bad_cache = options("gpt-5");
+        bad_cache.additional_body_params.insert(
+            "prompt_cache_options".to_string(),
+            json!({"mode": "always"}),
+        );
+        assert!(map_request(&[], &[], &[], &bad_cache, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("prompt_cache_options.mode"));
+
+        let mut bad_ttl = options("gpt-5");
+        bad_ttl
+            .additional_body_params
+            .insert("prompt_cache_options".to_string(), json!({"ttl": "1h"}));
+        assert!(map_request(&[], &[], &[], &bad_ttl, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("prompt_cache_options.ttl"));
+
+        let mut bad_key = options("gpt-5");
+        bad_key.additional_body_params.insert(
+            "prompt_cache_options".to_string(),
+            json!({"mode": "implicit", "scope": "all"}),
+        );
+        assert!(map_request(&[], &[], &[], &bad_key, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not supported"));
     }
 
     #[test]

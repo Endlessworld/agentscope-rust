@@ -104,6 +104,12 @@ pub struct ModelError {
     pub error_type: Option<String>,
     /// Human-readable message, extracted from whichever field carried it.
     pub message: String,
+    /// Explicit retryability taken from an upstream `x-should-retry` header.
+    ///
+    /// When set it overrides the classification-derived answer, mirroring the
+    /// official OpenAI SDK (`checkXShouldRetry`), where the server can force or
+    /// forbid a retry regardless of the status code.
+    pub retry_override: Option<bool>,
 }
 
 impl ModelError {
@@ -119,6 +125,7 @@ impl ModelError {
             code: None,
             error_type: None,
             message,
+            retry_override: None,
         }
     }
 
@@ -140,14 +147,24 @@ impl ModelError {
             code,
             error_type,
             message,
+            retry_override: None,
         };
         err.log();
         err
     }
 
     /// Whether this error is worth retrying.
+    ///
+    /// An upstream `x-should-retry` header wins over the classification (the
+    /// official OpenAI SDK behaves the same way).
     pub fn retryable(&self) -> bool {
-        self.kind.retryable()
+        self.retry_override.unwrap_or_else(|| self.kind.retryable())
+    }
+
+    /// Attaches an `x-should-retry` override (`None` keeps the classification).
+    pub fn with_retry_override(mut self, retry_override: Option<bool>) -> Self {
+        self.retry_override = retry_override;
+        self
     }
 
     /// Parses an upstream HTTP error body into a [`ModelError`].
@@ -167,6 +184,7 @@ impl ModelError {
                 code,
                 error_type,
                 message,
+                retry_override: None,
             };
             err.log();
             return err;
@@ -187,6 +205,7 @@ impl ModelError {
             code,
             error_type,
             message,
+            retry_override: None,
         };
         err.log();
         err
@@ -196,6 +215,9 @@ impl ModelError {
     pub fn display_message(&self) -> String {
         let mut suffix: Vec<String> = Vec::new();
         suffix.push(format!("kind={}", self.kind.as_str()));
+        if let Some(should_retry) = self.retry_override {
+            suffix.push(format!("x-should-retry={should_retry}"));
+        }
         if let Some(t) = &self.error_type {
             suffix.push(format!("type={t}"));
         }
@@ -219,6 +241,12 @@ impl ModelError {
     /// is surfaced as [`Error::Http`] — always retryable. Without this the
     /// agent's model retry loop never fires for those failures.
     pub fn to_core(&self) -> Error {
+        if self.retry_override == Some(false) {
+            // The upstream explicitly forbade a retry. `Error::HttpStatus`
+            // would be retried again by the agent loop, so surface a
+            // non-retryable error that still carries the status in its message.
+            return Error::Model(format!("{} (HTTP {})", self.display_message(), self.status));
+        }
         if self.retryable() && !matches!(self.status, 429 | 500..=599) {
             return Error::Http(self.display_message());
         }
@@ -238,6 +266,7 @@ impl ModelError {
                 code: None,
                 error_type: None,
                 message: message.clone(),
+                retry_override: None,
             }),
             _ => None,
         }
@@ -612,5 +641,29 @@ mod tests {
         assert!(rendered.contains("kind=rate_limit_error"));
         assert!(rendered.contains("type=rate_limit_error"));
         assert!(rendered.contains("code=x"));
+    }
+
+    #[test]
+    fn x_should_retry_override_wins_over_the_classification() {
+        // A 400 with `x-should-retry: true` must be retried…
+        let forced = ModelError::parse("openai", 400, r#"{"error":{"message":"bad"}}"#)
+            .with_retry_override(Some(true));
+        assert!(forced.retryable());
+        assert!(forced.to_core().is_retryable());
+        assert!(forced.display_message().contains("x-should-retry=true"));
+
+        // …and a 500 with `x-should-retry: false` must not be.
+        let refused = ModelError::parse("openai", 500, r#"{"error":{"message":"boom"}}"#)
+            .with_retry_override(Some(false));
+        assert!(!refused.retryable());
+        let core = refused.to_core();
+        assert!(!core.is_retryable(), "{core:?}");
+        // The status is still visible to operators.
+        assert!(core.to_string().contains("500"), "{core}");
+
+        // Without a header the classification decides (500 stays retryable).
+        let plain = ModelError::parse("openai", 500, r#"{"error":{"message":"boom"}}"#);
+        assert!(plain.retryable());
+        assert!(plain.to_core().is_retryable());
     }
 }

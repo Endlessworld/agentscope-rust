@@ -16,11 +16,13 @@ use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
 use crate::anthropic::converter::{
-    apply_cache_control, apply_extra_body_params, build_request, extra_headers, ChatFormatOptions,
+    apply_cache_control, apply_extra_body_params, build_request_with_server_tools, extra_headers,
+    ChatFormatOptions,
 };
 use crate::anthropic::credential::{AnthropicAuthMode, DEFAULT_BASE_URL, MESSAGES_ENDPOINT};
 use crate::anthropic::dto::{AnthropicMessageResponse, AnthropicStreamEvent};
 use crate::anthropic::parser::{parse_message, AnthropicStreamIncrementer};
+use crate::anthropic::server_tool::AnthropicServerTool;
 use crate::common::{HttpRequestSpec, SharedTransport};
 
 /// Anthropic API version header name.
@@ -38,6 +40,8 @@ pub struct AnthropicChatModel {
     cache_ttl: Option<String>,
     context_window_size: usize,
     descriptor: Option<Arc<ModelDescriptor>>,
+    /// Built-in Anthropic server tools declared alongside the client tools.
+    server_tools: Vec<AnthropicServerTool>,
 }
 
 impl AnthropicChatModel {
@@ -73,6 +77,7 @@ impl AnthropicChatModel {
             cache_ttl: None,
             context_window_size,
             descriptor,
+            server_tools: Vec::new(),
         }
     }
 
@@ -128,30 +133,48 @@ impl AnthropicChatModel {
         &self.base_url
     }
 
+    /// Declares Anthropic built-in server tools (web search, code execution, ...).
+    ///
+    /// Mirrors Java's `AnthropicChatModel.Builder#serverTools(...)`: the tools are
+    /// merged into the request `tools` array ahead of the client tools.
+    pub fn with_server_tools(mut self, server_tools: Vec<AnthropicServerTool>) -> Self {
+        self.server_tools = server_tools;
+        self
+    }
+
+    /// The declared server tools.
+    pub fn server_tools(&self) -> &[AnthropicServerTool] {
+        &self.server_tools
+    }
+
     /// The resolved messages endpoint URL.
     pub fn endpoint_url(&self) -> String {
         format!("{}{}", self.base_url, MESSAGES_ENDPOINT)
     }
 
     /// Builds the URL + body for a single request.
+    ///
+    /// Fails when the merged tool set is invalid (duplicate tool names across
+    /// client tools and server tools), mirroring Java's fail-fast validation.
     pub fn build_http_request(
         &self,
         messages: Vec<Msg>,
         tools: Vec<ToolSchema>,
         options: &GenerateOptions,
         stream: bool,
-    ) -> HttpRequestSpec {
+    ) -> Result<HttpRequestSpec> {
         let effective = GenerateOptions::merge_options(options, &self.default_options);
         let fmt = ChatFormatOptions::from_options(&effective, self.cache_ttl.as_deref());
-        let mut request = build_request(
+        let mut request = build_request_with_server_tools(
             &self.model_name,
             &messages,
             &tools,
+            &self.server_tools,
             options,
             &self.default_options,
             &fmt,
             stream,
-        );
+        )?;
         apply_cache_control(&mut request.messages, &fmt);
 
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
@@ -174,7 +197,7 @@ impl AnthropicChatModel {
         for (name, value) in extra_headers(&[&self.default_options, options]) {
             spec = spec.header(name, value);
         }
-        spec
+        Ok(spec)
     }
 }
 
@@ -188,7 +211,13 @@ impl Model for AnthropicChatModel {
         let options = crate::common::clamp_max_tokens(options, self.max_output_tokens());
         let stream_enabled = options.stream.unwrap_or(self.stream);
         Box::pin(async_stream::stream! {
-            let spec = self.build_http_request(messages, tools, &options, stream_enabled);
+            let spec = match self.build_http_request(messages, tools, &options, stream_enabled) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
             if stream_enabled {
                 let mut frames = self.transport.post_json_stream(spec);
                 let mut incrementer = AnthropicStreamIncrementer::new();
@@ -453,7 +482,9 @@ mod tests {
                 .unwrap()
                 .clone(),
         )];
-        let spec = model.build_http_request(vec![Msg::user("hi")], tools, &options, true);
+        let spec = model
+            .build_http_request(vec![Msg::user("hi")], tools, &options, true)
+            .unwrap();
         assert_eq!(spec.body["thinking"]["type"], serde_json::json!("enabled"));
         assert_eq!(
             spec.body["thinking"]["budget_tokens"],
@@ -482,7 +513,9 @@ mod tests {
             ..Default::default()
         };
         let messages = vec![Msg::system("be brief"), Msg::user("hi")];
-        let spec = model.build_http_request(messages, Vec::new(), &options, false);
+        let spec = model
+            .build_http_request(messages, Vec::new(), &options, false)
+            .unwrap();
         assert_eq!(
             spec.body["system"][0]["cache_control"]["ttl"],
             serde_json::json!("1h")
@@ -506,5 +539,56 @@ mod tests {
         assert_eq!(model.context_window_size(), 200_000);
         assert!(!model.supports_native_structured_output());
         assert_eq!(model.base_url(), "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn server_tools_are_merged_into_the_request_body() {
+        let model = AnthropicChatModel::from_api_key(
+            "claude",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_server_tools(vec![AnthropicServerTool::web_search(
+            Some(3),
+            Some(vec!["docs.anthropic.com".to_string()]),
+            None,
+        )]);
+        assert_eq!(model.server_tools().len(), 1);
+
+        let spec = model
+            .build_http_request(
+                vec![Msg::user("hi")],
+                Vec::new(),
+                &GenerateOptions::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            spec.body["tools"][0]["type"],
+            serde_json::json!("web_search_20250305")
+        );
+        assert_eq!(spec.body["tools"][0]["max_uses"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn duplicate_server_and_client_tool_names_fail_fast() {
+        let model = AnthropicChatModel::from_api_key(
+            "claude",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_server_tools(vec![AnthropicServerTool::web_search(None, None, None)]);
+        let tools = vec![ToolSchema::new("web_search", "conflict")];
+        let err = model
+            .build_http_request(
+                vec![Msg::user("hi")],
+                tools,
+                &GenerateOptions::default(),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate tool name"), "{err}");
     }
 }

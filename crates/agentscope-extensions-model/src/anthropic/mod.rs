@@ -27,10 +27,12 @@ pub mod dto;
 pub mod model;
 pub mod parser;
 pub mod provider;
+pub mod server_tool;
 
 pub use converter::{
-    build_request, to_anthropic_messages, to_anthropic_tools, to_multi_agent_messages,
-    to_tool_choice, ChatFormatOptions, DEFAULT_CONVERSATION_HISTORY_PROMPT,
+    build_request, build_request_with_server_tools, to_anthropic_messages, to_anthropic_tools,
+    to_anthropic_tools_with_server, to_multi_agent_messages, to_tool_choice, ChatFormatOptions,
+    DEFAULT_CONVERSATION_HISTORY_PROMPT,
 };
 pub use credential::{
     AnthropicAuthMode, AnthropicCredential, ANTHROPIC_VERSION, CREDENTIAL_TYPE, DEFAULT_BASE_URL,
@@ -38,8 +40,9 @@ pub use credential::{
 };
 pub use dto::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessageResponse, AnthropicRequest,
-    AnthropicStreamEvent, AnthropicTool, AnthropicToolChoice, AnthropicUsage,
+    AnthropicStreamEvent, AnthropicTool, AnthropicToolChoice, AnthropicToolEntry, AnthropicUsage,
 };
 pub use model::AnthropicChatModel;
 pub use parser::{parse_message, AnthropicStreamIncrementer, FRAGMENT_PLACEHOLDER};
 pub use provider::AnthropicModelProvider;
+pub use server_tool::{AnthropicServerTool, SERVER_TOOL_TYPE_PREFIXES};

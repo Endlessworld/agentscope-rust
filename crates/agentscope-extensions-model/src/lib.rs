@@ -29,6 +29,7 @@ pub mod openai_official;
 pub mod relay;
 pub mod responses;
 
+pub use anthropic::AnthropicServerTool;
 pub use anthropic::{AnthropicChatModel, AnthropicModelProvider};
 pub use anthropic_async::{
     default_anthropic_registry, AnthropicMessagesModel, AnthropicMessagesProvider,
@@ -40,15 +41,16 @@ pub use common::{
     ModelError, ModelMap, ReqwestTransport, ResolvedMedia, SharedTransport, TransportConfig,
 };
 pub use dashscope::{
-    DashScopeChatModel, DashScopeCredential, DashScopeModelProvider, EndpointType,
+    DashScopeChatModel, DashScopeCredential, DashScopeCryptoProvider, DashScopeModelProvider,
+    EncryptionConfig, EncryptionContext, EndpointType, UnavailableCryptoProvider,
 };
 pub use gemini::{GeminiChatModel, GeminiModelProvider};
 pub use ollama::{OllamaChatModel, OllamaModelProvider, OllamaOptions};
 pub use openai::{default_registry, OpenAiChatModel, OpenAiProvider};
 pub use openai_official::{
     default_openai_official_registry, OpenAIOfficialCredential, OpenAIOfficialModelProvider,
-    OpenAIResponsesChatModel, OpenAIServerTool, OpenAIServerToolKind, ResponsesMultiAgentFormatter,
-    ResponsesServerToolHelper,
+    OpenAIResponsesChatModel, OpenAIServerTool, OpenAIServerToolKind, ProxyConfig, ProxyType,
+    ResponsesMultiAgentFormatter, ResponsesServerToolHelper,
 };
 pub use relay::{
     encode_error, encode_response, find_route, stream_terminator, ConverterQuality, ConverterSpec,

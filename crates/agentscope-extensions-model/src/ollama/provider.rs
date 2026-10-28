@@ -70,9 +70,20 @@ impl ModelProvider for OllamaModelProvider {
             default_options.model = Some(model_name.to_string());
         }
 
+        // Provider-level formatter selectors (mirrors Java's
+        // `OllamaModelProvider` + `OllamaMultiAgentFormatter` wiring). Consumed
+        // here so they never leak into the request body.
+        let mut selector_options = ctx.options.clone();
+        let multi_agent_prompt = crate::common::take_multi_agent_prompt(&mut selector_options);
+        let promote_tool_result_images =
+            crate::common::take_bool_option(&mut selector_options, "promoteToolResultImages")
+                .unwrap_or(false);
+
         let model = OllamaChatModel::new(model_name, Some(base_url), default_transport())
             .with_default_options(default_options)
-            .with_stream(ctx.stream.unwrap_or(true));
+            .with_stream(ctx.stream.unwrap_or(true))
+            .with_multi_agent_formatter(multi_agent_prompt)
+            .with_promote_tool_result_images(promote_tool_result_images);
         Ok(Arc::new(model))
     }
 }

@@ -27,4 +27,9 @@ async-stream = "0.3"
 reqwest12 = { package = "reqwest", version = "0.12", default-features = false, features = ["json"] }
 async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "chat-completion-types", "byot", "middleware", "rustls", "responses", "response-types"] }
 async-anthropic = { version = "0.6", default-features = false, features = ["rustls"] }
+# DashScope 请求加密（对齐 Java JCE：AES-256/GCM/NoPadding + RSA/ECB/PKCS1Padding）。
+# `rand` 0.8 是 `rsa` 0.9 与 `aes-gcm` 0.10 共用的 `rand_core` 0.6 生态，仅用于 CSPRNG。
+aes-gcm = "0.10"
+rsa = "0.9"
+rand = "0.8"
 

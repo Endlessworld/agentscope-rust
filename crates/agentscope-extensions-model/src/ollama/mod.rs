@@ -11,7 +11,15 @@ pub mod options;
 pub mod parser;
 pub mod provider;
 
-pub use converter::{build_request, to_ollama_messages, to_ollama_tools};
+/// Default conversation-history prompt for the multi-agent formatter.
+///
+/// Re-exported from the shared [`crate::common::multi_agent`] module so the
+/// Ollama/DashScope adapters provably use the same string as the Java formatters.
+pub use crate::common::multi_agent::DEFAULT_CONVERSATION_HISTORY_PROMPT;
+
+pub use converter::{
+    build_request, merge_conversation, to_multi_agent_messages, to_ollama_messages, to_ollama_tools,
+};
 pub use dto::{
     OllamaFunction, OllamaMessage, OllamaRequest, OllamaResponse, OllamaTool, OllamaToolCall,
     OllamaToolFunction,

@@ -279,6 +279,15 @@ fn build_request(
     options: GenerateOptions,
     capabilities: Option<crate::common::ModelCapabilities>,
 ) -> CreateResponse {
+    // Multi-agent formatter: opt-in via `additional_body_params["multiAgentFormatter"]`
+    // (`true` = default prompt, string = custom prompt). The selector is stripped
+    // here so it never reaches the wire.
+    let mut options = options;
+    let messages = match crate::common::take_multi_agent_prompt(&mut options) {
+        Some(prompt) => merge_multi_agent_history(messages, &prompt),
+        None => messages,
+    };
+
     let mut instructions: Vec<String> = Vec::new();
     let mut items: Vec<InputItem> = Vec::new();
 
@@ -370,6 +379,83 @@ fn build_request(
         req.max_output_tokens = Some(n);
     }
     req
+}
+
+// ── Multi-agent formatter ───────────────────────────────────────────────
+
+/// Merges one run of plain agent messages into a single `<history>` user message.
+///
+/// Mirrors the merge half of `ResponsesMultiAgentFormatter` /
+/// `OpenAIMultiAgentFormatter`: `"<name>: <text>"` per text/hint/thinking block,
+/// `"<name>: [Image]"` for media (media is textually referenced because the
+/// merged message is emitted through the plain-text Responses mapping; the
+/// `openai-official` adapter keeps real image parts there instead).
+fn merge_agent_group(group: &[Msg], history_prompt: &str) -> Msg {
+    let mut text = String::new();
+    if !history_prompt.is_empty() {
+        text.push_str(history_prompt);
+    }
+    text.push_str(crate::common::HISTORY_START_TAG);
+    text.push('\n');
+
+    for msg in group {
+        let name = crate::common::agent_name(msg);
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(t) => text.push_str(&format!("{name}: {}\n", t.text)),
+                ContentBlock::Hint(h) => {
+                    text.push_str(&format!("{name}: {}\n", h.hint.clone().unwrap_or_default()))
+                }
+                ContentBlock::Thinking(t) => text.push_str(&format!("{name}: {}\n", t.thinking)),
+                ContentBlock::Image(_) => text.push_str(&format!("{name}: [Image]\n")),
+                ContentBlock::Audio(_) => text.push_str(&format!("{name}: [Audio]\n")),
+                ContentBlock::Video(_) => text.push_str(&format!("{name}: [Video]\n")),
+                ContentBlock::Data(_) => text.push_str(&format!("{name}: [Data]\n")),
+                // Tool blocks always live in a tool sequence, never in an agent group.
+                ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_) => {}
+            }
+        }
+    }
+    text.push_str(crate::common::HISTORY_END_TAG);
+    Msg::user(text)
+}
+
+/// Applies the multi-agent grouping: system messages stay individual (they
+/// become `instructions`), tool sequences keep their normal mapping, and each
+/// run of plain agent messages collapses into one `<history>` message. Only the
+/// first agent group carries the conversation-history prompt.
+fn merge_multi_agent_history(messages: Vec<Msg>, history_prompt: &str) -> Vec<Msg> {
+    let mut out: Vec<Msg> = Vec::with_capacity(messages.len());
+    let mut pending: Vec<Msg> = Vec::new();
+    let mut is_first_agent_group = true;
+
+    for msg in messages {
+        let flush = |pending: &mut Vec<Msg>, out: &mut Vec<Msg>, is_first: &mut bool| {
+            if pending.is_empty() {
+                return;
+            }
+            let prompt = if *is_first { history_prompt } else { "" };
+            *is_first = false;
+            out.push(merge_agent_group(pending, prompt));
+            pending.clear();
+        };
+
+        if msg.role == MsgRole::System || crate::common::is_tool_related(&msg) {
+            flush(&mut pending, &mut out, &mut is_first_agent_group);
+            out.push(msg);
+        } else {
+            pending.push(msg);
+        }
+    }
+    let prompt = if is_first_agent_group {
+        history_prompt
+    } else {
+        ""
+    };
+    if !pending.is_empty() {
+        out.push(merge_agent_group(&pending, prompt));
+    }
+    out
 }
 
 fn easy_message(role: Role, text: String) -> InputItem {
@@ -771,5 +857,90 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    // ── Multi-agent grouping ───────────────────────────────────────────────
+
+    fn named(text: &str, name: &str) -> Msg {
+        Msg::builder()
+            .role(MsgRole::Assistant)
+            .name(name)
+            .text_content(text)
+            .build()
+    }
+
+    /// Extracts the user `EasyMessage` texts from a request body.
+    fn user_texts(req: &CreateResponse) -> Vec<String> {
+        let InputParam::Items(items) = &req.input else {
+            panic!("expected item input");
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::EasyMessage(m) if m.role == Role::User => match &m.content {
+                    EasyInputContent::Text(text) => Some(text.clone()),
+                    other => panic!("unexpected content: {other:?}"),
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multi_agent_merges_agent_turns_and_keeps_system_and_tool_sequences() {
+        let messages = vec![
+            Msg::system("be brief"),
+            named("first", "Alice"),
+            named("second", "Alice"),
+            Msg::tool("call-1", "search", "42"),
+            named("third", "Bob"),
+        ];
+        let mut options = GenerateOptions::default();
+        options
+            .additional_body_params
+            .insert("multiAgentFormatter".to_string(), serde_json::json!(true));
+        let req = build_request("gpt-5".to_string(), messages, Vec::new(), options, None);
+        // system -> instructions, not an input item
+        assert_eq!(req.instructions.as_deref(), Some("be brief"));
+        let texts = user_texts(&req);
+        assert_eq!(texts.len(), 2);
+        assert!(
+            texts[0].starts_with("# Conversation History"),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            texts[0].contains("Alice: first\nAlice: second"),
+            "{}",
+            texts[0]
+        );
+        // The second agent group does not repeat the prompt.
+        assert!(texts[1].starts_with("<history>"), "{}", texts[1]);
+        assert!(texts[1].contains("Bob: third"));
+        // The tool result survived as a function_call_output item.
+        let InputParam::Items(items) = &req.input else {
+            panic!("expected item input");
+        };
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, InputItem::Item(Item::FunctionCallOutput(_)))));
+    }
+
+    #[test]
+    fn multi_agent_is_off_by_default() {
+        let req = build_request(
+            "gpt-5".to_string(),
+            vec![Msg::user("hi")],
+            Vec::new(),
+            GenerateOptions::default(),
+            None,
+        );
+        let texts = user_texts(&req);
+        assert_eq!(texts, vec!["hi".to_string()]);
+        // The selector never leaks into the body.
+        assert!(serde_json::to_value(&req)
+            .unwrap()
+            .get("multiAgentFormatter")
+            .is_none());
     }
 }

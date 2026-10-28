@@ -28,9 +28,10 @@ pub struct AnthropicRequest {
     /// `cache_control` markers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemPrompt>,
-    /// Tool declarations.
+    /// Tool declarations: client tools (with `input_schema`) and built-in
+    /// server tools (versioned `type`), in declaration order.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<AnthropicTool>>,
+    pub tools: Option<Vec<AnthropicToolEntry>>,
     /// Tool-choice configuration (Anthropic nests `disable_parallel_tool_use`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<AnthropicToolChoice>,
@@ -229,6 +230,20 @@ pub struct AnthropicTool {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<AnthropicCacheControl>,
+}
+
+/// One entry of the request `tools` array: a client tool or a built-in server
+/// tool. Mirrors Java's `ToolUnion` (client tool vs. versioned server tool).
+///
+/// Untagged: a server-tool definition has no `input_schema`, so it cannot be
+/// mistaken for [`AnthropicTool`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicToolEntry {
+    /// Client-declared tool (name/description/input_schema).
+    Client(AnthropicTool),
+    /// Anthropic-hosted server tool (versioned `type` + `name`).
+    Server(Value),
 }
 
 /// Tool-choice configuration. Anthropic nests `disable_parallel_tool_use`.

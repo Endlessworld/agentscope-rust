@@ -27,6 +27,7 @@ use super::constants::{API_KEY_ENV, BASE_URL_ENV, DEFAULT_BASE_URL, PROVIDER_ID}
 use super::error::translate_optional_status;
 use super::formatter::ResponsesMultiAgentFormatter;
 use super::parser::{parse_response, ResponsesStreamingAssembler};
+use super::proxy::ProxyConfig;
 use super::request::map_request;
 use super::server_tool::OpenAIServerTool;
 
@@ -44,6 +45,8 @@ pub struct OpenAIResponsesChatModel {
     server_tools: Vec<OpenAIServerTool>,
     context_window_size: usize,
     descriptor: Option<Arc<ModelDescriptor>>,
+    /// Installed proxy configuration (mirrors Java's `Builder#proxyConfig`).
+    proxy: Option<ProxyConfig>,
 }
 
 impl OpenAIResponsesChatModel {
@@ -80,6 +83,7 @@ impl OpenAIResponsesChatModel {
             formatter: None,
             server_tools: Vec::new(),
             descriptor,
+            proxy: None,
         }
     }
 
@@ -125,6 +129,23 @@ impl OpenAIResponsesChatModel {
             self.context_window_size = size;
         }
         self
+    }
+
+    /// Applies a proxy configuration by rebuilding the transport's HTTP client.
+    ///
+    /// Mirrors `OpenAISdkClientFactory#applyProxy`: `nonProxyHosts` is resolved
+    /// against this model's base URL host, unsupported configurations (SOCKS in
+    /// this build, authenticated SOCKS) fail fast with an explanatory error.
+    pub fn with_proxy_config(mut self, config: ProxyConfig) -> Result<Self> {
+        let client = super::proxy::build_client(&config, &self.base_url)?;
+        self.transport = Arc::new(crate::common::ReqwestTransport::with_client(client));
+        self.proxy = Some(config);
+        Ok(self)
+    }
+
+    /// The installed proxy configuration, if any.
+    pub fn proxy_config(&self) -> Option<&ProxyConfig> {
+        self.proxy.as_ref()
     }
 
     /// The resolved base URL.
@@ -581,5 +602,35 @@ mod tests {
         assert!(model.supports_native_structured_output_with_tools());
         assert!(model.supports_tool_choice_specific());
         assert_eq!(model.api_key(), "sk");
+    }
+
+    #[test]
+    fn proxy_config_is_installed_on_the_model() {
+        let model = OpenAIResponsesChatModel::new(
+            "gpt-5",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_proxy_config(ProxyConfig::http("127.0.0.1", 3128))
+        .unwrap();
+        assert_eq!(
+            model.proxy_config(),
+            Some(&ProxyConfig::http("127.0.0.1", 3128))
+        );
+
+        // Unsupported proxies are rejected at configuration time, not at call time.
+        let err = match OpenAIResponsesChatModel::new(
+            "gpt-5",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_proxy_config(ProxyConfig::socks5("127.0.0.1", 1080))
+        {
+            Ok(_) => panic!("SOCKS proxies must fail fast"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("socks"), "{err}");
     }
 }

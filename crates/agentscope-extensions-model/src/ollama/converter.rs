@@ -8,6 +8,8 @@ use agentscope_core::{
     ToolChoice, ToolSchema,
 };
 
+use crate::common::{agent_name, HISTORY_END_TAG, HISTORY_START_TAG};
+
 use super::dto::{
     OllamaFunction, OllamaMessage, OllamaRequest, OllamaTool, OllamaToolCall, OllamaToolFunction,
 };
@@ -151,15 +153,28 @@ pub fn to_ollama_messages_with(
                             "<system-info>The following are the image contents from the tool result of '{}':",
                             tr.name.clone().unwrap_or_default()
                         );
+                        let mut promoted_images: Vec<String> = Vec::new();
                         for img in &promoted {
                             banner.push_str(&format!(
                                 "\n- The image from '{}': ",
                                 url_of(&img.source)
                             ));
+                            // Java's `createImagePromotionMessage` attaches the image
+                            // itself to the follow-up user message. Without this the
+                            // model would only see the textual reference.
+                            match resolver.resolve(img) {
+                                Ok(data) => promoted_images.push(data),
+                                Err(e) => crate::common::diagnostics::warn(
+                                    "unsupported_media_type",
+                                    "tool_result.image",
+                                    &format!("cannot promote tool-result image: {e}"),
+                                ),
+                            }
                         }
                         out.push(OllamaMessage {
                             role: Some("user".to_string()),
                             content: Some(banner),
+                            images: (!promoted_images.is_empty()).then_some(promoted_images),
                             ..Default::default()
                         });
                     }
@@ -320,6 +335,148 @@ pub fn hint_text(hint: &HintBlock) -> String {
     hint.hint.clone().unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Multi-agent formatting
+// ---------------------------------------------------------------------------
+
+/// Merges a run of agent messages into one `user` message wrapped in
+/// `<history>` tags, mirroring `OllamaConversationMerger#mergeToMessage`.
+///
+/// Text and hint blocks render as `"<name>: <content>"`, tool results as
+/// `"<name> (<tool>): <output>"`. Base64 images are collected on the message and
+/// referenced as `[Image]`; remote images are not downloaded here (they render
+/// as `[Image - processing failed]`, the Java fallback for unsupported sources).
+pub fn merge_conversation(messages: &[Msg], history_prompt: &str) -> OllamaMessage {
+    let mut text = String::new();
+    if !history_prompt.is_empty() {
+        text.push_str(history_prompt);
+    }
+    text.push_str(HISTORY_START_TAG);
+    text.push('\n');
+
+    let mut images: Vec<String> = Vec::new();
+    for msg in messages {
+        let name = agent_name(msg);
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(t) => {
+                    text.push_str(&format!("{name}: {}\n", t.text));
+                }
+                ContentBlock::Hint(h) => {
+                    text.push_str(&format!("{name}: {}\n", h.hint.clone().unwrap_or_default()));
+                }
+                ContentBlock::Image(img) => match &img.source {
+                    Source::Base64(b) => {
+                        images.push(b.data.clone());
+                        text.push_str(&format!("{name}: [Image]\n"));
+                    }
+                    _ => {
+                        crate::common::diagnostics::warn(
+                            "unsupported_media_type",
+                            "conversation.image",
+                            "URL image source is not supported for Ollama; skipping image block in merger",
+                        );
+                        text.push_str(&format!("{name}: [Image - processing failed]\n"));
+                    }
+                },
+                ContentBlock::ToolResult(tr) => {
+                    let output = collect_text(&tr.output);
+                    text.push_str(&format!(
+                        "{name} ({}): {output}\n",
+                        tr.name.clone().unwrap_or_default()
+                    ));
+                }
+                // Thinking blocks are never sent back to the model.
+                ContentBlock::Thinking(_) => {}
+                _ => {}
+            }
+        }
+    }
+    text.push_str(HISTORY_END_TAG);
+
+    OllamaMessage {
+        role: Some("user".to_string()),
+        content: Some(text),
+        images: (!images.is_empty()).then_some(images),
+        ..Default::default()
+    }
+}
+
+/// Converts messages with multi-agent support, mirroring
+/// `OllamaMultiAgentFormatter#doFormat`: the leading system message stays
+/// separate, runs of tool messages keep normal conversion, and runs of plain
+/// agent messages merge into a single `<history>` user message.
+///
+/// `promote_tool_result_images` mirrors the Java formatter flag of the same name:
+/// images found in tool results are additionally promoted into a follow-up user
+/// message so the model can actually see them.
+pub fn to_multi_agent_messages(
+    messages: Vec<Msg>,
+    history_prompt: &str,
+    promote_tool_result_images: bool,
+) -> Result<Vec<OllamaMessage>> {
+    to_multi_agent_messages_with(
+        messages,
+        &DefaultImageResolver,
+        history_prompt,
+        promote_tool_result_images,
+    )
+}
+
+/// [`to_multi_agent_messages`] with an explicit image resolver.
+pub fn to_multi_agent_messages_with(
+    messages: Vec<Msg>,
+    resolver: &dyn ImageResolver,
+    history_prompt: &str,
+    promote_tool_result_images: bool,
+) -> Result<Vec<OllamaMessage>> {
+    let mut result: Vec<OllamaMessage> = Vec::new();
+    let mut start = 0;
+
+    if let Some(first) = messages.first() {
+        if first.role == MsgRole::System {
+            result.push(OllamaMessage {
+                role: Some("system".to_string()),
+                content: Some(extract_text_content(first)),
+                ..Default::default()
+            });
+            start = 1;
+        }
+    }
+
+    let remaining = &messages[start..];
+    // A single non-tool message needs no history wrapper.
+    if remaining.len() == 1 && !crate::common::is_tool_related(&remaining[0]) {
+        result.extend(to_ollama_messages_with(
+            vec![remaining[0].clone()],
+            resolver,
+            false,
+        )?);
+        return Ok(result);
+    }
+
+    let mut is_first_agent_group = true;
+    for (kind, group) in crate::common::group_messages(remaining) {
+        match kind {
+            crate::common::GroupType::AgentMessage => {
+                let prompt = if is_first_agent_group {
+                    history_prompt
+                } else {
+                    ""
+                };
+                result.push(merge_conversation(&group, prompt));
+                is_first_agent_group = false;
+            }
+            crate::common::GroupType::ToolSequence => result.extend(to_ollama_messages_with(
+                group,
+                resolver,
+                promote_tool_result_images,
+            )?),
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +631,117 @@ mod tests {
             serde_json::json!("object")
         );
         assert!(to_ollama_tools(Vec::new()).is_none());
+    }
+
+    // ── Multi-agent formatting ──────────────────────────────────────────────
+
+    fn named(text: &str, name: &str) -> Msg {
+        Msg::builder()
+            .role(MsgRole::Assistant)
+            .name(name)
+            .text_content(text)
+            .build()
+    }
+
+    #[test]
+    fn multi_agent_merges_agent_turns_and_keeps_tool_sequences() {
+        let messages = vec![
+            Msg::system("be nice"),
+            named("thinking", "Alice"),
+            named("more", "Alice"),
+            Msg::tool("call-1", "search", "42"),
+        ];
+        let out = to_multi_agent_messages(messages, "PROMPT", false).unwrap();
+        // system stays separate, the two agent turns merge, the tool message passes through.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role.as_deref(), Some("system"));
+        assert_eq!(out[0].content.as_deref(), Some("be nice"));
+        assert_eq!(out[1].role.as_deref(), Some("user"));
+        let body = out[1].content.as_deref().unwrap();
+        assert_eq!(
+            body,
+            "PROMPT<history>\nAlice: thinking\nAlice: more\n</history>"
+        );
+        assert_eq!(out[2].role.as_deref(), Some("tool"));
+        assert_eq!(out[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(out[2].content.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn multi_agent_prompt_only_on_the_first_agent_group() {
+        let messages = vec![
+            named("first", "Alice"),
+            Msg::tool("call-1", "search", "42"),
+            named("second", "Bob"),
+        ];
+        let out = to_multi_agent_messages(messages, "PROMPT", false).unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with("PROMPT<history>"));
+        let second = out[2].content.as_deref().unwrap();
+        assert!(second.starts_with("<history>"), "{second}");
+        assert!(!second.contains("PROMPT"));
+    }
+
+    #[test]
+    fn multi_agent_single_plain_message_is_not_wrapped() {
+        let out = to_multi_agent_messages(vec![named("hi", "Alice")], "PROMPT", false).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.as_deref(), Some("hi"));
+        assert_eq!(out[0].role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn multi_agent_merge_keeps_base64_images_and_flags_remote_ones() {
+        let messages = vec![
+            Msg::user_blocks(vec![
+                ContentBlock::Text(agentscope_core::TextBlock::new("look")),
+                ContentBlock::Image(ImageBlock::new(Source::Base64(Base64Source::new(
+                    "image/png",
+                    "QUJD",
+                )))),
+                ContentBlock::Image(ImageBlock::new(Source::Url(URLSource::new(
+                    "https://example.com/a.png",
+                )))),
+            ]),
+            Msg::tool("call-1", "search", "42"),
+        ];
+        let merged = merge_conversation(&messages[..1], "");
+        assert_eq!(merged.images.as_ref().unwrap(), &vec!["QUJD".to_string()]);
+        let text = merged.content.unwrap();
+        assert!(text.contains("Unknown: [Image]"), "{text}");
+        assert!(text.contains("[Image - processing failed]"), "{text}");
+    }
+
+    #[test]
+    fn multi_agent_promotes_tool_result_images_into_a_user_message() {
+        let tool_msg = Msg::builder()
+            .role(MsgRole::Tool)
+            .content(vec![ContentBlock::ToolResult(
+                agentscope_core::ToolResultBlock::new(
+                    "call-1",
+                    "screenshot",
+                    vec![
+                        ContentBlock::Text(agentscope_core::TextBlock::new("captured")),
+                        ContentBlock::Image(ImageBlock::new(Source::Base64(Base64Source::new(
+                            "image/png",
+                            "QUJD",
+                        )))),
+                    ],
+                ),
+            )])
+            .build();
+        let out =
+            to_multi_agent_messages(vec![named("hi", "Alice"), tool_msg], "PROMPT", true).unwrap();
+        // agent group, tool message, promoted image message
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].role.as_deref(), Some("tool"));
+        assert_eq!(out[2].role.as_deref(), Some("user"));
+        let banner = out[2].content.as_deref().unwrap();
+        assert!(banner.starts_with("<system-info>"), "{banner}");
+        assert_eq!(out[2].images.as_ref().unwrap(), &vec!["QUJD".to_string()]);
     }
 }

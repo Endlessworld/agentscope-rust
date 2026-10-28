@@ -7,7 +7,8 @@
 //! |---|---|
 //! | `AnthropicChatFormatter` / `AnthropicBaseFormatter` | [`build_request`] / [`ChatFormatOptions`] |
 //! | `AnthropicMessageConverter` | [`to_anthropic_messages`] |
-//! | `AnthropicToolsHelper` | [`to_anthropic_tools`], [`to_tool_choice`], [`apply_extra_body_params`] |
+//! | `AnthropicToolsHelper` | [`to_anthropic_tools`], [`to_anthropic_tools_with_server`], [`to_tool_choice`], [`apply_extra_body_params`] |
+//! | `AnthropicServerToolHelper` (declaration side) | [`crate::anthropic::server_tool`] |
 //! | `AnthropicMediaConverter` | [`image_content_block`] |
 //! | `AnthropicConversationMerger` | [`merge_conversation`] (used by the multi-agent formatter) |
 //!
@@ -19,7 +20,7 @@
 
 use agentscope_core::{
     convert_tool_result_to_string, determine_media_type, extract_text_content, file_to_base64,
-    is_local_file, resolve_mime_type, validate_image_extension, ContentBlock, DataBlock,
+    is_local_file, resolve_mime_type, validate_image_extension, ContentBlock, DataBlock, Error,
     GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole, Result, Source, ToolChoice,
     ToolResultBlock, ToolSchema, ToolUseBlock,
 };
@@ -27,10 +28,11 @@ use agentscope_core::{
 use super::dto::{
     AnthropicCacheControl, AnthropicContentBlock, AnthropicImageBlock, AnthropicImageSource,
     AnthropicMessage, AnthropicRequest, AnthropicServerToolUseBlock, AnthropicTextBlock,
-    AnthropicTool, AnthropicToolChoice, AnthropicToolResultBlock, AnthropicToolResultContent,
-    AnthropicToolUseBlock, SystemPrompt,
+    AnthropicTool, AnthropicToolChoice, AnthropicToolEntry, AnthropicToolResultBlock,
+    AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
 };
 use super::parser::METADATA_SERVER_TOOL_RESULT;
+use super::server_tool::AnthropicServerTool;
 
 /// Per-request formatting switches derived from [`GenerateOptions`].
 #[derive(Debug, Clone, Default)]
@@ -415,6 +417,50 @@ pub fn apply_extra_body_params(body: &mut serde_json::Value, options: &[&Generat
     }
 }
 
+/// Merges client tools and Anthropic server tools into one `tools` array,
+/// mirroring `AnthropicToolsHelper#applyTools(builder, tools, serverTools, ...)`.
+///
+/// Server tools are declared first (Java adds them before converting client
+/// tools); when prompt caching is on, the **last client tool** carries the cache
+/// marker so the whole tool prefix is cached. Tool names must be unique across
+/// both sets, because Anthropic selects tools by name.
+pub fn to_anthropic_tools_with_server(
+    tools: &[ToolSchema],
+    server_tools: &[AnthropicServerTool],
+    fmt: &ChatFormatOptions,
+) -> Result<Vec<AnthropicToolEntry>> {
+    let mut names: Vec<&str> = Vec::with_capacity(tools.len() + server_tools.len());
+    for tool in tools {
+        if names.contains(&tool.name.as_str()) {
+            return Err(duplicate_tool_name(&tool.name));
+        }
+        names.push(&tool.name);
+    }
+    for tool in server_tools {
+        if names.contains(&tool.name()) {
+            return Err(duplicate_tool_name(tool.name()));
+        }
+        names.push(tool.name());
+    }
+
+    let mut entries: Vec<AnthropicToolEntry> = server_tools
+        .iter()
+        .map(|tool| AnthropicToolEntry::Server(tool.definition().clone()))
+        .collect();
+    entries.extend(
+        to_anthropic_tools(tools, fmt)
+            .into_iter()
+            .map(AnthropicToolEntry::Client),
+    );
+    Ok(entries)
+}
+
+fn duplicate_tool_name(name: &str) -> Error {
+    Error::Model(format!(
+        "Anthropic tool names must be unique; duplicate tool name: {name}"
+    ))
+}
+
 /// Assembles the full Anthropic request body.
 ///
 /// `options` overrides `default_options`, which in turn supplies the fallbacks
@@ -424,6 +470,59 @@ pub fn build_request(
     model: &str,
     messages: &[Msg],
     tools: &[ToolSchema],
+    options: &GenerateOptions,
+    default_options: &GenerateOptions,
+    fmt: &ChatFormatOptions,
+    stream: bool,
+) -> AnthropicRequest {
+    let tools_field = (!tools.is_empty()).then(|| {
+        to_anthropic_tools(tools, fmt)
+            .into_iter()
+            .map(AnthropicToolEntry::Client)
+            .collect()
+    });
+    assemble_request(
+        model,
+        messages,
+        tools_field,
+        options,
+        default_options,
+        fmt,
+        stream,
+    )
+}
+
+/// [`build_request`] variant that also declares Anthropic built-in server tools.
+pub fn build_request_with_server_tools(
+    model: &str,
+    messages: &[Msg],
+    tools: &[ToolSchema],
+    server_tools: &[AnthropicServerTool],
+    options: &GenerateOptions,
+    default_options: &GenerateOptions,
+    fmt: &ChatFormatOptions,
+    stream: bool,
+) -> Result<AnthropicRequest> {
+    let tools_field = if tools.is_empty() && server_tools.is_empty() {
+        None
+    } else {
+        Some(to_anthropic_tools_with_server(tools, server_tools, fmt)?)
+    };
+    Ok(assemble_request(
+        model,
+        messages,
+        tools_field,
+        options,
+        default_options,
+        fmt,
+        stream,
+    ))
+}
+
+fn assemble_request(
+    model: &str,
+    messages: &[Msg],
+    tools_field: Option<Vec<AnthropicToolEntry>>,
     options: &GenerateOptions,
     default_options: &GenerateOptions,
     fmt: &ChatFormatOptions,
@@ -443,12 +542,6 @@ pub fn build_request(
         _ => messages,
     };
     let anthropic_messages = to_anthropic_messages(conversation, fmt);
-
-    let tools_field = if tools.is_empty() {
-        None
-    } else {
-        Some(to_anthropic_tools(tools, fmt))
-    };
 
     let tool_choice = options
         .tool_choice
@@ -1295,5 +1388,75 @@ mod tests {
         };
         let headers = extra_headers(&[&a, &b]);
         assert_eq!(headers, vec![("x-a".to_string(), "2".to_string())]);
+    }
+
+    // ── Server tools ───────────────────────────────────────────────────────
+
+    #[test]
+    fn server_tools_are_declared_before_client_tools() {
+        let tools = vec![tool_schema("get_weather")];
+        let server = vec![
+            AnthropicServerTool::web_search(Some(2), None, None),
+            AnthropicServerTool::code_execution(),
+        ];
+        let entries = to_anthropic_tools_with_server(&tools, &server, &plain()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[0], AnthropicToolEntry::Server(v)
+            if v["type"] == serde_json::json!("web_search_20250305")));
+        assert!(matches!(&entries[1], AnthropicToolEntry::Server(v)
+            if v["name"] == serde_json::json!("code_execution")));
+        assert!(matches!(&entries[2], AnthropicToolEntry::Client(t) if t.name == "get_weather"));
+
+        // Serialized shape keeps both variants side by side in `tools`.
+        let request = build_request_with_server_tools(
+            "claude",
+            &[Msg::user("hi")],
+            &tools,
+            &server,
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &plain(),
+            false,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["tools"][0]["type"],
+            serde_json::json!("web_search_20250305")
+        );
+        assert_eq!(
+            value["tools"][2]["input_schema"]["type"],
+            serde_json::json!("object")
+        );
+    }
+
+    #[test]
+    fn duplicate_tool_names_across_client_and_server_tools_are_rejected() {
+        let tools = vec![tool_schema("web_search")];
+        let server = vec![AnthropicServerTool::web_search(None, None, None)];
+        let err = to_anthropic_tools_with_server(&tools, &server, &plain()).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate tool name: web_search"),
+            "{err}"
+        );
+
+        let duplicated_client = vec![tool_schema("f"), tool_schema("f")];
+        assert!(to_anthropic_tools_with_server(&duplicated_client, &[], &plain()).is_err());
+    }
+
+    #[test]
+    fn server_tools_alone_produce_a_tools_array() {
+        let request = build_request_with_server_tools(
+            "claude",
+            &[Msg::user("hi")],
+            &[],
+            &[AnthropicServerTool::web_fetch(None, None, None)],
+            &GenerateOptions::default(),
+            &GenerateOptions::default(),
+            &plain(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(request.tools.as_ref().unwrap().len(), 1);
     }
 }

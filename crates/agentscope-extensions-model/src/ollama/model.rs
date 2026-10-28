@@ -12,7 +12,7 @@ use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
 use crate::common::{HttpRequestSpec, SharedTransport};
-use crate::ollama::converter::{build_request, to_ollama_messages};
+use crate::ollama::converter::{build_request, to_multi_agent_messages, to_ollama_messages};
 use crate::ollama::dto::{OllamaMessage, OllamaResponse};
 use crate::ollama::options::OllamaOptions;
 use crate::ollama::parser::{parse_response, OllamaStreamIncrementer};
@@ -33,6 +33,13 @@ pub struct OllamaChatModel {
     stream: bool,
     context_window_size: usize,
     descriptor: Option<Arc<ModelDescriptor>>,
+    /// `Some(prompt)` switches the request to the multi-agent formatter
+    /// (`OllamaMultiAgentFormatter`): agent turns collapse into one `<history>`
+    /// user message while tool sequences stay intact.
+    multi_agent_prompt: Option<String>,
+    /// Whether images returned by tools are promoted into a follow-up user
+    /// message (`OllamaMultiAgentFormatter(promoteToolResultImages)`).
+    promote_tool_result_images: bool,
 }
 
 impl OllamaChatModel {
@@ -64,7 +71,29 @@ impl OllamaChatModel {
             stream: true,
             context_window_size,
             descriptor,
+            multi_agent_prompt: None,
+            promote_tool_result_images: false,
         }
+    }
+
+    /// Switches the adapter to the multi-agent formatter, mirroring Java's
+    /// `OllamaChatModel.Builder#formatter(new OllamaMultiAgentFormatter(...))`.
+    ///
+    /// `prompt == None` keeps the plain chat formatter.
+    pub fn with_multi_agent_formatter(mut self, prompt: Option<String>) -> Self {
+        self.multi_agent_prompt = prompt;
+        self
+    }
+
+    /// Enables promotion of images found in tool results (multi-agent formatter).
+    pub fn with_promote_tool_result_images(mut self, promote: bool) -> Self {
+        self.promote_tool_result_images = promote;
+        self
+    }
+
+    /// Whether the multi-agent formatter is active.
+    pub fn is_multi_agent(&self) -> bool {
+        self.multi_agent_prompt.is_some()
     }
 
     /// Sets the default options merged under every request.
@@ -132,7 +161,12 @@ impl OllamaChatModel {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let runtime = OllamaOptions::from_generate_options(options);
-        let ollama_messages: Vec<OllamaMessage> = to_ollama_messages(messages)?;
+        let ollama_messages: Vec<OllamaMessage> = match &self.multi_agent_prompt {
+            Some(prompt) => {
+                to_multi_agent_messages(messages, prompt, self.promote_tool_result_images)?
+            }
+            None => to_ollama_messages(messages)?,
+        };
         let request = build_request(
             &self.model_name,
             ollama_messages,

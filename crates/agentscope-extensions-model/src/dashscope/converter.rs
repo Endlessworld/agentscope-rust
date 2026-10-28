@@ -20,6 +20,9 @@ use super::dto::{
     DashScopeMessage, DashScopeParameters, DashScopeRequest, DashScopeTool, DashScopeToolCall,
     DashScopeToolFunction,
 };
+use crate::common::multi_agent::{
+    agent_name, group_messages, GroupType, HISTORY_END_TAG, HISTORY_START_TAG,
+};
 
 /// Maximum number of `cache_control` markers DashScope accepts per request.
 pub const MAX_CACHE_MARKERS: usize = 4;
@@ -524,6 +527,262 @@ pub fn build_request(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-agent formatting
+// ---------------------------------------------------------------------------
+
+/// Merges a run of agent messages into one `user` message wrapped in
+/// `<history>` tags, mirroring `DashScopeConversationMerger#mergeToMessage`
+/// (string-content mode).
+///
+/// Text/hint blocks render as `"<name>: <content>"`, tool results as
+/// `"<name> (<tool>): <output>"` (empty outputs become `[Empty tool result]`).
+/// Images/data blocks are preserved as extra content parts and referenced in the
+/// text; videos only contribute their URL as text, matching Java.
+fn merge_history_text_and_parts(messages: &[Msg]) -> (String, Vec<DashScopeContentPart>) {
+    let mut text = String::new();
+    let mut parts: Vec<DashScopeContentPart> = Vec::new();
+
+    for msg in messages {
+        let name = agent_name(msg);
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(t) => text.push_str(&format!("{name}: {}\n", t.text)),
+                ContentBlock::Hint(h) => {
+                    text.push_str(&format!("{name}: {}\n", h.hint.clone().unwrap_or_default()));
+                }
+                ContentBlock::Image(img) => {
+                    parts.push(image_part(img));
+                    text.push_str(&format!("{name}: [Image]\n"));
+                }
+                ContentBlock::Video(v) => {
+                    let rendered = match source_url(&v.source, validate_video_extension) {
+                        Ok(url) => format!("{name}: [Video: {url}]\n"),
+                        Err(e) => {
+                            crate::common::diagnostics::warn(
+                                "unsupported_media_type",
+                                "conversation.video",
+                                &format!("failed to process VideoBlock: {e}"),
+                            );
+                            format!("{name}: [Video - processing failed]\n")
+                        }
+                    };
+                    text.push_str(&rendered);
+                }
+                ContentBlock::Data(d) => {
+                    parts.push(data_part(d));
+                    text.push_str(&format!("{name}: [Data]\n"));
+                }
+                // Audio has no textual rendering in the Java text-mode merger.
+                ContentBlock::Audio(_) => {}
+                // Thinking blocks are never sent back to the model.
+                ContentBlock::Thinking(_) => {}
+                ContentBlock::ToolResult(tr) => {
+                    let result = crate::common::text_only(&tr.output);
+                    let rendered = if result.is_empty() {
+                        "[Empty tool result]".to_string()
+                    } else {
+                        result
+                    };
+                    text.push_str(&format!(
+                        "{name} ({}): {rendered}\n",
+                        tr.name.clone().unwrap_or_default()
+                    ));
+                }
+                ContentBlock::ToolUse(_) => {}
+            }
+        }
+    }
+    (text, parts)
+}
+
+/// Merges agent messages into one `user` message (`<history>`-wrapped),
+/// mirroring `DashScopeConversationMerger#mergeToMessage`.
+pub fn merge_conversation(messages: &[Msg], history_prompt: &str) -> DashScopeMessage {
+    let (mut text, parts) = merge_history_text_and_parts(messages);
+    text = format!("{history_prompt}{HISTORY_START_TAG}\n{text}{HISTORY_END_TAG}");
+
+    if parts.is_empty() {
+        DashScopeMessage {
+            role: Some("user".to_string()),
+            content: Some(DashScopeContent::Text(text)),
+            ..Default::default()
+        }
+    } else {
+        let mut content = Vec::with_capacity(parts.len() + 1);
+        content.push(DashScopeContentPart::text(text));
+        content.extend(parts);
+        DashScopeMessage {
+            role: Some("user".to_string()),
+            content: Some(DashScopeContent::Parts(content)),
+            ..Default::default()
+        }
+    }
+}
+
+/// Merges agent messages into one multimodal `user` message, mirroring
+/// `DashScopeConversationMerger#mergeToMultiModalMessage`.
+///
+/// Unlike the text merger, every media block becomes its own content part and
+/// flushes the accumulated text first; tool results are not expected inside an
+/// agent group and are skipped with a diagnostic (Java logs a warning).
+pub fn merge_multimodal_conversation(
+    messages: &[Msg],
+    history_prompt: &str,
+    is_first: bool,
+) -> DashScopeMessage {
+    let mut content: Vec<DashScopeContentPart> = Vec::new();
+    let mut text: Vec<String> = Vec::new();
+
+    let opening = if is_first {
+        format!("{history_prompt}{HISTORY_START_TAG}")
+    } else {
+        HISTORY_START_TAG.to_string()
+    };
+    text.push(opening);
+
+    fn flush(text: &mut Vec<String>, content: &mut Vec<DashScopeContentPart>) {
+        if !text.is_empty() {
+            content.push(DashScopeContentPart::text(text.join("\n")));
+            text.clear();
+        }
+    }
+
+    for msg in messages {
+        let name = agent_name(msg);
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(t) => text.push(format!("{name}: {}", t.text)),
+                ContentBlock::Hint(h) => {
+                    text.push(format!("{name}: {}", h.hint.clone().unwrap_or_default()))
+                }
+                ContentBlock::Image(img) => {
+                    flush(&mut text, &mut content);
+                    content.push(image_part(img));
+                }
+                ContentBlock::Audio(a) => {
+                    flush(&mut text, &mut content);
+                    content.push(audio_part(a));
+                }
+                ContentBlock::Video(v) => {
+                    flush(&mut text, &mut content);
+                    content.push(video_part(v));
+                }
+                ContentBlock::Data(d) => {
+                    flush(&mut text, &mut content);
+                    content.push(data_part(d));
+                }
+                ContentBlock::Thinking(_) => {}
+                ContentBlock::ToolResult(tr) => {
+                    crate::common::diagnostics::warn(
+                        "tool_result_in_agent_group",
+                        "conversation.tool_result",
+                        &format!(
+                            "Unexpected ToolResultBlock for '{}' in an agent message group; skipping",
+                            tr.name.clone().unwrap_or_default()
+                        ),
+                    );
+                }
+                ContentBlock::ToolUse(_) => {}
+            }
+        }
+    }
+
+    text.push(HISTORY_END_TAG.to_string());
+    flush(&mut text, &mut content);
+    if content.is_empty() {
+        content.push(DashScopeContentPart::text(""));
+    }
+
+    DashScopeMessage {
+        role: Some("user".to_string()),
+        content: Some(DashScopeContent::Parts(content)),
+        ..Default::default()
+    }
+}
+
+/// Applies the cache directive carried by the last message of a merged group
+/// (mirrors `DashScopeMultiAgentFormatter#applyMergedCacheControlMetadata`).
+fn apply_merged_cache_directive(messages: &[Msg], merged: &mut DashScopeMessage) {
+    for msg in messages.iter().rev() {
+        if let Some(true) = metadata_cache_directive(msg) {
+            set_cache_control_on_content(merged);
+            return;
+        }
+    }
+}
+
+/// Converts messages with multi-agent support, mirroring
+/// `DashScopeMultiAgentFormatter#doFormat` / `#formatMultiModal`.
+///
+/// The leading system message stays separate, runs of tool messages keep normal
+/// conversion, and runs of plain agent messages merge into a single
+/// `<history>`-wrapped user message. Automatic cache control is applied last.
+pub fn to_multi_agent_messages(
+    messages: Vec<Msg>,
+    force_multimodal: bool,
+    history_prompt: &str,
+    options: &GenerateOptions,
+) -> Vec<DashScopeMessage> {
+    let mut result: Vec<DashScopeMessage> = Vec::new();
+    let mut start = 0;
+
+    // Java picks the merger from the endpoint type, not from media presence:
+    // `doFormat` for the text endpoint, `formatMultiModal` for the multimodal one.
+    let multimodal = force_multimodal;
+
+    if let Some(first) = messages.first() {
+        if first.role == MsgRole::System {
+            let mut system = DashScopeMessage {
+                role: Some("system".to_string()),
+                content: Some(if multimodal {
+                    DashScopeContent::Parts(vec![DashScopeContentPart::text(extract_text_content(
+                        first,
+                    ))])
+                } else {
+                    DashScopeContent::Text(extract_text_content(first))
+                }),
+                ..Default::default()
+            };
+            if let Some(true) = metadata_cache_directive(first) {
+                set_cache_control_on_content(&mut system);
+            }
+            result.push(system);
+            start = 1;
+        }
+    }
+
+    let remaining = &messages[start..];
+    let mut is_first_agent_group = true;
+    for (kind, group) in group_messages(remaining) {
+        match kind {
+            GroupType::AgentMessage => {
+                let mut merged = if multimodal {
+                    merge_multimodal_conversation(&group, history_prompt, is_first_agent_group)
+                } else {
+                    merge_conversation(
+                        &group,
+                        if is_first_agent_group {
+                            history_prompt
+                        } else {
+                            ""
+                        },
+                    )
+                };
+                apply_merged_cache_directive(&group, &mut merged);
+                result.push(merged);
+                is_first_agent_group = false;
+            }
+            GroupType::ToolSequence => {
+                result.extend(to_dashscope_messages(group, multimodal));
+            }
+        }
+    }
+
+    apply_automatic_cache_control(&mut result, options);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,5 +1105,120 @@ mod tests {
             to_dashscope_messages_with_options(msgs, false, &GenerateOptions::default());
         let value = serde_json::to_value(&converted).unwrap();
         assert!(value[0]["content"][0].get("cache_control").is_none());
+    }
+
+    // ── Multi-agent formatting ──────────────────────────────────────────────
+
+    fn named(text: &str, name: &str) -> Msg {
+        Msg::builder()
+            .role(agentscope_core::MsgRole::Assistant)
+            .name(name)
+            .text_content(text)
+            .build()
+    }
+
+    #[test]
+    fn multi_agent_text_mode_merges_groups_with_history_tags() {
+        let messages = vec![
+            Msg::system("be nice"),
+            named("thinking", "Alice"),
+            named("more", "Alice"),
+            Msg::tool("call-1", "search", "42"),
+        ];
+        let out = to_multi_agent_messages(messages, false, "PROMPT", &GenerateOptions::default());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role.as_deref(), Some("system"));
+        assert_eq!(
+            out[0].content.as_ref().and_then(|c| c.as_text()),
+            Some("be nice")
+        );
+        assert_eq!(out[1].role.as_deref(), Some("user"));
+        let merged = out[1].content.as_ref().and_then(|c| c.as_text()).unwrap();
+        assert_eq!(
+            merged,
+            "PROMPT<history>\nAlice: thinking\nAlice: more\n</history>"
+        );
+        assert_eq!(out[2].role.as_deref(), Some("tool"));
+        assert_eq!(out[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            out[2].content.as_ref().and_then(|c| c.as_text()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn multi_agent_text_mode_keeps_images_as_extra_parts() {
+        let messages = vec![Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("look")),
+            ContentBlock::Image(ImageBlock::new(Source::Base64(
+                agentscope_core::Base64Source::new("image/png", "QUJD"),
+            ))),
+        ])];
+        let out = to_multi_agent_messages(messages, false, "", &GenerateOptions::default());
+        let parts = match out[0].content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => parts,
+            other => panic!("expected parts, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0]
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("Unknown: [Image]"));
+        assert!(parts[1]
+            .image
+            .as_deref()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn multi_agent_multimodal_mode_flushes_text_around_media() {
+        let messages = vec![Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("look")),
+            ContentBlock::Image(ImageBlock::new(Source::Base64(
+                agentscope_core::Base64Source::new("image/png", "QUJD"),
+            ))),
+            ContentBlock::Text(TextBlock::new("done")),
+        ])];
+        let out = to_multi_agent_messages(messages, true, "PROMPT", &GenerateOptions::default());
+        let parts = match out[0].content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => parts,
+            other => panic!("expected parts, got {other:?}"),
+        };
+        // text(prompt+tag+first line) | image | text(second line + closing tag)
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0].text.as_deref(),
+            Some("PROMPT<history>\nUnknown: look")
+        );
+        assert!(parts[1].image.is_some());
+        assert_eq!(parts[2].text.as_deref(), Some("Unknown: done\n</history>"));
+    }
+
+    #[test]
+    fn multi_agent_tool_group_keeps_assistant_tool_calls_and_results() {
+        let assistant = Msg::assistant_blocks(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+            "call-1",
+            "search",
+            agentscope_core::JsonMap::new(),
+        ))]);
+        let out = to_multi_agent_messages(
+            vec![assistant, Msg::tool("call-1", "search", "42")],
+            false,
+            "PROMPT",
+            &GenerateOptions::default(),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role.as_deref(), Some("assistant"));
+        assert_eq!(
+            out[0].tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name,
+            "search"
+        );
+        assert_eq!(out[1].role.as_deref(), Some("tool"));
     }
 }
