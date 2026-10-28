@@ -259,3 +259,29 @@
 
 - 2026-10-23 CHANNEL tracker 归档整理：`docs/extensions/CHANNEL__GAP_TRACKER.md` 由 495 行精简为 **237 行**（仅「当前基线 + 逐类映射 + 缺口清单 + 设计决定/差异 + 已知限制 + 增量流程 + 验证基线 + 归档指针」）；历史过程记录拆到新建的 `docs/extensions/CHANNEL__MIGRATION_HISTORY.md`（**312 行，冻结**，收录原 §4 项目状态、§6 静态复核快照、§7 G1 修复、§8 G2–G8 修复，章节编号沿用原 §6/§7/§8 以便旧引用可解析）。主 tracker 内引用历史一律写作 `history §7.x / §8.x`。
 - CHANNEL 增量跟踪约定：新 Java 特性在 tracker §3 表尾追加 `G9/G10…`（状态 `待办`），完成后补关闭日期 + `history §…` 引用；过程记录只写归档文件，不写回主 tracker；基线数字在 §1 与 §7 同步。
+
+- 2026-10-28 完成 ACP 稳定性第二轮（提交 `c714c38`/`74f66ce`/`6d5ef89`/`523472e`/`dfcd4db`，分支 `dev` 未 push）：P0-7/P0-9/P0-10/P0-12/P1-1/P1-3/P1-5/P1-6/P1-7/P1-8/P1-10 已落地，另补完 strict schema（`Tool::is_strict` + `tool/schema.rs`）。
+- 关键实现约定：`Error::ActionDispatch` = action/start 确认失败（工具未执行、可重试）；`Error::ActionObservation` 仍是 end 失败（run 级）。`checkpoint_now` 现在先 flush 再提交，reason `after_acting` 在工具结果写入 context 后立即落盘。
+- harness `AgentSession::prepare_open_turn_before_submit`：submit 前若 open turn 可恢复（无 pending 交互、无 uncertain 工具）先排 `resume` 再接收新 prompt；`stop_active_run()` 只打断自己拥有的 run。ACP 不再调用 `abandon_unfinished`。
+- ACP cancel 已从 `AtomicBool` 改为 `cancel_epoch: AtomicU64`（per-turn）；交互等待 600s 超时且权限超时=拒绝（不可落入「通道失败自动批准」分支）。
+- ACP 私有扩展方法必须 `_` 前缀：`_agentscope/session/respond`（`ext.rs`，自实现 `JsonRpcMessage`/`JsonRpcRequest`，Response = `serde_json::Value`）；ACP 无标准 respond 通道。
+- `WorkspaceSessionStorage` CAS 现持 `{path}.lock` 文件锁（create-if-absent，30s 陈旧锁可破），`list_paths` 需过滤 `.version`/`.lock`/`.tmp-`；`Filesystem::sync` 为 trait 默认 no-op，`LocalFilesystem` 实现 `sync_all`。
+- 仍未做（文档 §8.3 已写明原因）：P0-2 journal segment/compaction、P0-11 默认路径迁移、P1-4 幂等键、P1-11/12 有界 channel（会丢 delta）、P1-14/15、P2。
+
+- 2026-10-28：`execute` 输出压缩已合入 dev（提交 d1f60ec，原提交 e132ae0 在 `rescue` 分支，通过 cherry-pick -n 应用；唯一冲突是 `harness/src/lib.rs` 的 `pub use tool::{..}` 列表，已合并为「dev 原有全部导出 + compact_grep_like/CompactConfig/CompactReport/OUTPUT_COMPACT_ENV」）。
+- 新模块 `crates/agentscope-harness/src/tool/output_compact.rs`：`compact_grep_like(text, &CompactConfig) -> CompactReport` 把连续同路径的 `path:line:text` 改写成 heading 布局（路径独占一行 + `N:text`），保守策略（仅严格变短才生效、不重排、不改写命中文本、含 `[paths grouped` 前缀则视为已压缩幂等返回）。开关 `AGENTSCOPE_OUTPUT_COMPACT=0/false/off/no`。`ShellExecuteTool` 新增 `with_output_compaction`，输出整形抽到 `pub(crate) format_execute_output(exit_code, output, truncated, &CompactConfig)` 以便无 sandbox 测试，压缩时写 metadata `agentscope.output_compact.{savedChars,hoistedFiles,hoistedLines}`；`HarnessAgentBuilder::shell_output_compaction(config)` 默认 `CompactConfig::from_env()`。
+- 注意：本仓库 rustfmt 会展开短结构体字面量/链式调用，与补丁作者本地格式不同 → 应用外来补丁后必须 `cargo fmt -p <crate>` 再提交；但 `cargo fmt -p` 会连带重排该 crate 既有未格式化文件（本次 `tests/harness_shutdown_test.rs` 属既有偏差），应 `git checkout --` 还原非本补丁文件。
+- 本次验证：`cargo check -p agentscope-harness --all-targets` EXIT=0；`--lib` 482 passed / 0 failed；`tool::output_compact` 19、`tool::shell_execute_tool` 6、`--test harness_tool_test` 8 全绿；反向验证（把 `saved_chars <= 0` 守卫短路）→ 3 测试 FAILED，恢复后全绿。
+
+- ACP 稳定性第三轮（2026-10-28，未提交）：P1-4/P1-14/P1-15 已落地并全部测试通过。
+- P1-4：`extensions-acp/src/session.rs::prompt_idempotency_key(message, accepted_at_ms)` = `prompt-<sha256前16hex>-<ts_ms>`，取代 `Uuid::new_v4()`；acp crate 新增 `sha2 = { workspace = true }`。**跨进程幂等仍未解决**（ACP PromptRequest 无客户端 request id，重启后重试=新 turn）。
+- P1-14：`JournalSessionLog::visit` 改为「重放可读后缀」（`segments_through(.., tolerant=true)`，只容忍 `Error::Session`/`Error::Json`，IO 仍上报）；`scan`/`read_after` 保持严格；`SessionProjection::as_of_seq` 改为 `head.seq`；`views.rs::fold_tolerantly`（required=false 跳过、required=true 中止）；transcript/turns/pending/recorder.open 改走 visit；inbox 未知事件忽略+warn。
+- P1-15：`SessionRecorder::flush` 新增 `rebase_onto_head`（先 renew 确认所有权，再按新 head 重编号 in-flight+pending 事件并换新 batch id，`FLUSH_REBASES=3`）；`is_stale_prefix` 与 transient 重试、fatal 三分。
+- 反向验证 4 项全部 FAILED 通过；core lib 340、harness lib 482、acp 58 全绿。坑：`cargo fmt -p agentscope-core` 会顺手重排 `shutdown/mod.rs`（既有格式漂移），需 `git restore` 掉无关文件。
+
+- ACP 稳定性 P2 全部推进（2026-10-28 第四轮，未提交）：P2-1/2/4/5/6/7/8/9/11/12/14/17/18/19 已修；P2-3（Drop 不能 await）/P2-10（其他 crate 仍有 unwrap）/P2-13（blob 懒加载需改 visit 签名）/P2-15（大对象独立 segment）/P2-16（chunk 采样）为部分；P2-20 随 P1-12 未做。
+- P2 关键落地：`SessionRecorder::metrics()` + `SessionMetrics`（durable_seq/pending/replay_ms/heartbeat_age_ms/lease_ms）；`LeaseHeartbeat` 记录 `last_renew_ms`；`SessionExecution` 用 `OnceLock<SessionInbox>` 复用 fold 缓存；`replay_views` 单次 visit 折叠多视图（`open_views`/`admission_views`/`recovery_views`）；`SessionLogExporter::drain` 批量 256 + 每批一次游标推进。
+- ACP：`save_session_config` 临时文件+fsync+rename；`MCP_CONNECT_TIMEOUT=60s`；MCP server 连接成功后才写入 `bridged_servers`（失败可重试）；`sort_session_infos` 按 `updated_at` 倒序 + id 兜底（先按 id 去重再排序）；`last_input_tokens`→`Arc<AtomicU64>`、`updated_at`→`Arc<Mutex<_>>`（clone 间共享）；acp 全 crate `lock().unwrap()` 改 poison 容忍。
+- harness：dispatcher 改 `Notify` 唤醒 + idle 指数退避至 `IDLE_POLL_MAX=500ms`（`next_idle_backoff` 纯函数可测），有 active_run 保持 50ms。
+- 教训补充：仓库内 `docs/*.md` 与部分源码为 **LF** 行尾，PowerShell 脚本拼接多行模式必须用 `` "`n" `` 而非 `[Environment]::NewLine`（CRLF），否则 `Contains` 恒 false。`cargo fmt --all` 会改动仓库既有未格式化文件（`core/src/shutdown/mod.rs`、`extensions-sandbox/src/e2b.rs`、`harness/tests/harness_shutdown_test.rs`），只应 `rustfmt --check` 改动文件，勿全仓 fmt。
+- 反向验证脚本：`.agentscope/workspace/reverse_p2.ps1`（回退实现→跑指定测试→恢复），14 项全部如预期 FAILED。
