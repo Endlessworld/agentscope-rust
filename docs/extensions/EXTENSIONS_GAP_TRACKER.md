@@ -33,7 +33,7 @@
 | 17 | C | SCHEDULER | `agentscope-extensions-scheduler` | 3234 / 3178 | **进行中（cron 语义已对齐，2026-10-26）**（**2026-10-22 静态复核**：14 文件 / 2416 行 / 37 test；180 个 Java `@Test`；**✅ P0×2 已修（2026-10-22）**：#2 `with_factory` 接线 + #3 初始消息重放；**✅ P1 cron 4 项已修（2026-10-26）**：① 星期基准改 **Quartz `1=SUN…7=SAT`**，`0` 现报错（旧码静默接受且整体错位一天）；② dom/dow 同时指定**解析期拒绝**（6 字段要求恰有一个 `?`；5 字段按 `*` 为通配，`0 8 * * *` 仍合法）——旧码按 OR 触发；③ 非法 cron **快速失败**：`schedule_runtime` 在 `jobs.insert` **之前** `resolve_cron()`，`spawn_job` 收 `Option<CronPlan>`，删除循环内静默解析 → 不再留下已登记的半成品任务；④ `zone_id` 死字段接线：新增 `common/config/zone.rs`（UTC 别名 / 固定偏移 / 免 DST IANA 白名单，非法 id **报错**而非静默回落 GMT）+ `CronPlan::matches_at` 按配置时区取墙钟；Rust **52 + 3 passed / 0 failed**（基线 37+3）；反向验证：星期基准回退 `+1` → 4 用例 FAILED；**剩余 P1（未做）**：cron `L`/`W`/`LW`/`#`/年字段、按秒轮询 `next_after` 生产零调用、`interrupt()` 不中止 in-flight、`get_status` 3 值 vs Java 6 值、xxl-job 缺 `XxlJobHelper`/`handleSuccess`/`XxlJobContext` 协议、`cancel` 语义；`QuartzScheduleAgentTask::execution_count()` 仍未暴露） | `SCHEDULER__GAP_TRACKER.md` |
 | 18 | C | TRAINING | `agentscope-extensions-training` | 2890 / 2924 | **进行中**（**2026-10-22 静态复核下调**：5 文件 / 2767 行 / **64 test**（57 `#[test]`+7 `#[tokio::test]`）；21 个 Java 类映射无虚假条目、规模声明可复现；**✅ P0×1 已闭环（2026-10-22，见 §4.8 #6）**：`TrinityModelAdapter` —— Java `TrinityModelAdapter.java:177` 在 builder 内**强制 `.stream(false)`**（`// Trinity doesn't support streaming, force disable`）。**定位更正**：`stream: Some(true)` 实际位于 `crates/agentscope-extensions-model/src/openai/mod.rs:381`（training crate **从无 `src/model/`**，`git log --all` 为空），本 crate 的真实问题是**委托任意 `Model` 时原样透传 options**。**✅ 已修**：② `msg_ids` 重复——adapter 对每个 `Ok(resp)` 都 `add_msg_id`（`backend.rs:296-312`），流式 delegate 会把同一 id 记 N 次；现改为**连续去重**，并向下传 `options.stream = Some(false)`（用例 `adapter_records_duplicate_chunk_ids_once` / `adapter_forces_stream_off`）；**⚠️ 未闭环**：① 协议层 `stream:true`——`OpenAiChatModel` 仅实现 SSE 路径、不读 `options.stream`，需先给 MODEL 补非流式请求/响应路径（见 MODEL 行），否则 `base_url` 模式仍会向 Trinity 发 `stream:true`；**P0-1 经核实为「非缺口」**：全仓 Java 检索 `sharegpt`/`toTrainingData`/`sft`/`rft` **0 命中**（50 处 `conversations` 全在 node_modules）——Java 侧**不存在**训练数据格式转换器，格式化由外部 Trinity-RFT（Python）承担 → 属新增需求须单独立项；**P1×4**：`AgentCloner` 丢 `sys_prompt`/`max_iters`（静默数据失真）、`start()` 无 `addSystemHook` 等价物、3 个 ExecutionConfig 字段未迁移、`enable_auto_commit` 语义不一致（Java 从不读该字段）；**推翻旧结论**：「`sysPrompt`/`maxIters` core 无 getter」**不成立**（`react_agent.rs:283/288` 已有）、「core 无 PreCallEvent」**部分不准确**（`middleware::Middleware::on_pre_call` 注释明写 Mirrors Java `PreCallEvent`，只缺 post-call）；P2：`shadow_pool_size`/`shadow_pool_capacity` **零消费点**、4 个零引用依赖；测试明细原记 strategy12/backend9/reward2/runner21 → 实为 **18/15/3/28**） | `TRAINING__GAP_TRACKER.md` |
 | 19 | C | NACOS | `agentscope-extensions-nacos` | 2095 / 2452 | **进行中**（**2026-10-22 静态复核下调**：11 文件 / 2750 行 / **43 test**；三子域主体已迁移；**P0×0**；**推翻一条关键前提**：原「protocol crate 的 `a2a` **不可编译**故本 crate 自建平行类型」**已证伪**——`protocol/src/a2a/{card,client,message,model,server}.rs` 均存在且 `lib.rs` 已 `pub mod a2a`，`card.rs` 已有 `AgentCardResolver` trait、`model.rs` 已有 `AgentCard`/`AgentSkill`/`AgentCapabilities`/`AgentProvider`/`AgentInterface`/`TransportProperties`；**唯一真缺位的是 `AgentRegistry`** → 本 crate 的 `A2aAgentCard` 等属**重复实现债务**，应改为复用；**P1**：`SecuritySchemeConverterUtil`（209 行）无对应实现（Rust 仅 opaque JSON 透传，未按 `type` 分派 apiKey/http/oauth2/openIdConnect/mutualTLS）、`supportedInterfaces` 列表↔三元组组装/拆分缺失 + `capabilities.extendedAgentCard`/`stateTransitionHistory=false` 强制语义缺失、**prompt 推送回调语义相反**（Java 对**空串模板照写**、只丢 `null`；Rust 把空串也丢弃且未判 key 为空）、skill 资源 key 语义/必填字段校验/zip 结构校验三处不一致；P2：`do_overwrite` 缺 `removeIf(equals)` 去重 + `add(0, ..)` 前插、endpoint 无 `Set` 去重） | `NACOS__GAP_TRACKER.md` |
-| 20 | C | HIGRESS | `agentscope-extensions-higress` | 1050 / 1016 | **已完成（遗留 P0×1 / P1×4）**（**2026-10-22 静态复核维持**：4 文件 / 1353 行 / **30 test**；4/4 主类均有真实对应、`x_higress_tool_search` 协议契约 1:1、`search_tools` 编译阻塞缺陷确已修复；**✅ P0×1 已修（2026-10-22，见 §4.8 #4）**：**`build()` 不建连**——`client.rs:401-409` 的 `initialize()` **仅把 `initialized` 置 true，不做任何连接动作**，`build()` 因此返回"自称已初始化"的 wrapper，`list_tools()` 必报 `No connected MCP client`；`transport_type`/`timeout`/`initialization_timeout` **三个配置项全部无效**；**P1×4**：`call_tool` 无 meta 形参（Java 三参重载）、`convert_to_mcp_tool` 丢 `outputSchema`、`HigressToolkit` 只能接 Higress 类型且无 `enableTools`/`group`/`prefix`/`preset`/`propagateMeta`、wrapper 硬依赖具体 `McpClientManager` 无 trait 抽象 → tool-search 成功路径/缓存/`topK` 请求体**均不可测**；另：Java 74 `@Test` vs Rust 30；WASM/插件契约 Java 侧不存在，无需对齐） | `HIGRESS__GAP_TRACKER.md` |
+| 20 | C | HIGRESS | `agentscope-extensions-higress` | 1050 / 1016 | **已完成（P0/P1 已清零，2026-10-28）**（**2026-10-22 静态复核基线**：4 文件 / 1353 行 / **30 test**；4/4 主类均有真实对应、`x_higress_tool_search` 协议契约 1:1、`search_tools` 编译阻塞缺陷确已修复；**✅ P0-1 已修（2026-10-28）**：`build()` 经 `initialize()` **真建连**（`HigressMcpTransport::connect_server` → harness `McpClientManager` create+connect，受 `initialization_timeout` 约束，失败向上返回且 `initialized=false`；`transport_type`/`timeout`/`initialization_timeout` 全部投影进 `McpConnectRequest`；测试 `initialize_connects_and_records_full_config` 等 5 条）；**✅ P1×4 已修（2026-10-28）**：`call_tool_with_meta`（meta 原样透传）、`convert_to_mcp_tool` 保留 `outputSchema`、`HigressToolkit::registration()`（enableTools/group/prefix/preset/propagateMeta）、`HigressMcpTransport` trait 使 tool-search 成功路径/缓存/`topK` 请求体均可离线测试；现 **57 lib test + 1 doc test**；遗留 P2×5（`build_input_schema` 键裁剪、`toString` 格式、newtype 而非子类、wrapper 级 `propagate_meta`、`close()` 不释放连接）；WASM/插件契约 Java 侧不存在，无需对齐） | `HIGRESS__GAP_TRACKER.md` |
 | 21 | — | **JUDGE**（**本轮新增登记**） | `agentscope-extensions-judge` | 12469 / 4035 | 进行中（**此前完全未在 rollup 与 `EXTENSIONS_MIGRATION_PLAN.md` 登记**；**已裁定纳入迁移范围**（§4.5 裁定 4），**tracker 已建**：`JUDGE__GAP_TRACKER.md`；Java 76 类（jev 68 + openai-decisions 8）/ **140 个 `@Test`**；Rust 9 文件 / 3181 行 / **57 test**，覆盖按行 ≈ **26%**；**P0×2**：HTTP 客户端缺失（`JevClient`/`OpenAIDecisionsClient`，crate 无任何网络能力）、System One DTO 待逐字段核对；**P1×8**：`openai-decisions`（795 行）整块缺失 + jev 的 `application`/`context`/`evaluation`/`evidence`/`routing`/`supervision`/`integration` 零实现；P2：`browser`（Playwright，建议「设计决定（不迁移）」）、`example`（不迁移）） | `JUDGE__GAP_TRACKER.md`（**已创建**） |
 | 22 | — | **CONTROLPLANE**（**改名已落地**） | `agentscope-extensions-controlplane` | 9518 / 3017 | **✅ 已并入第 14 行**（2026-10-22）：改名、类型前缀、env、journal 目录、sink 名均已对齐；后续进度统一跟踪于第 14 行，本行不再单独维护 | `CONTROLPLANE__GAP_TRACKER.md` |
 
@@ -62,7 +62,7 @@
 
 | 项 | 说明 | 状态 |
 |---|---|---|
-| `DistributedStore` 字段不足 | **已裁定：不改 harness**。harness `DistributedStore` 保持 `agent_state_store` + `isolation_scope` 两字段不动，避免 7 个存储模块阻塞于一次共享编辑。
+| `DistributedStore` 字段不足 | **✅ 已解决（2026-10-28）**：harness `DistributedStore` 仍保留原两字段作为必需项，另**新增三个可选复合槽位** `base_store: Option<Arc<dyn BaseStore>>` / `sandbox_snapshot_spec: Option<Arc<dyn SandboxSnapshotSpec>>` / `sandbox_execution_guard: Option<Arc<dyn SandboxGuard>>`（builder 对应 `base_store()` / `sandbox_snapshot_spec()` / `sandbox_execution_guard()`）。⚠️ **属结构性变更**：harness `DistributedStore` 字段全为 `pub`，新增字段会让 7 个存储 crate 的**字面量构造点**（`to_harness_store()` 等）报 `E0063` —— 已同步改为 `DistributedStore::builder()` 写法，并顺手把各 crate 的 `base_store` / `snapshot_spec` / `guard` 投影进新槽位。各 crate 的 `XxxDistributedStore` 因此不再需要自建平行组合者。 |
 
 各存储 crate 提供自己的组合者 `XxxDistributedStore`，在原两字段基础上追加 `base_store: Option<Arc<dyn BaseStore>>` / `sandbox_snapshot_spec: Option<Arc<dyn SandboxSnapshotSpec>>` / `sandbox_execution_guard: Option<Arc<SandboxExecutionGuard>>`（用 `Arc` 包裹，`BaseStore`/`SandboxSnapshotSpec` 本为 `Send+Sync` trait 对象）。各 crate 的 `XxxDistributedStore` 自建 builder，不依赖 harness builder。
 
@@ -263,7 +263,7 @@
 |---|---|---|
 | 根 `Cargo.toml` workspace 依赖 | **已执行**。统一加入 `[workspace.dependencies]`：`sqlx`/`mysql_async`/`tokio-postgres`（MYSQL/POSTGRESQL/SKILLS）、`redis`（REDIS）、`mongodb`（MONGODB）、`object_store`（COS/OSS）、`axum`/`http`/`bytes`（HTTP 统一）。已验证 `cargo metadata` 与 `cargo build --workspace` 通过；`protocol`/`aistio`/`channel` 均改引 workspace。 | 已完成 |
 | harness `DistributedStore` 组合 | 已裁定不改 harness；各存储 crate 自建 `XxxDistributedStore`（见 §2.2）。若后续要在 harness 内置该组合，另立任务。 | 已裁定 |
-| harness `SandboxExecutionGuard` 为具体 struct | **已裁定（依 Java 源码）：确认 harness 存在缺口，维持「不改 harness」直到另立任务**。Java 侧 `io.agentscope.harness.agent.sandbox.SandboxExecutionGuard` 是 `@FunctionalInterface` **接口**（唯一方法 `SandboxLease tryEnter(SandboxIsolationKey) throws InterruptedException`，语义为**阻塞直到获得槽位**，并提供 `noop()`）；Rust `harness/src/agent/sandbox/guard.rs` 却是**具体 struct**（`leases: HashMap<key,usize>`），其 `try_enter` **只做可重入计数、不阻塞也不跨进程**。故 JDBC/Redis/Mongo 等的分布式锁**无法驱动沙箱隔离**（各 crate 只能自带 guard 类型，形成平行类型）。修复需 harness 把该 struct 改为 trait + 默认 `NoopGuard`（同 Java），属 harness 公共层变更。**影响面（实测）**：aistio/cos/jdbc/mongodb/mysql/oss/postgresql/redis 共 8 个 crate 均已有各自的 guard 类型。 | **已裁定**：缺口确认；改 harness 列为独立任务（本批不动） |
+| harness `SandboxExecutionGuard` 为具体 struct | **✅ 已解决（2026-10-28）**：新增 `pub trait SandboxGuard: Send + Sync + Debug`（`try_enter` / `release` / `is_held` / `active_count` / `is_distributed`），并让既有具体 struct `SandboxExecutionGuard` 实现它（**名字与构造点全部保留**，零破坏）；`SandboxManager` 的 `execution_guard` 字段改为 `Arc<dyn SandboxGuard>`，新增 `with_shared_guard(...)` 注入分布式实现，`with_guard<G: SandboxGuard + 'static>` 保持旧调用可用。各存储 crate 的 `XxxSandboxExecutionGuard` 现在只需 `impl SandboxGuard` 即可驱动真正的跨进程沙箱隔离。**2026-10-28 二次修复（M1/M4/M6）**：① `try_enter`/`release` 改为 `async`，消除存储后端只能用 `futures::executor::block_on` 驱动含 `tokio::time::sleep` 轮询（在 async 调用点空转/死锁）的问题；② `SandboxManager::release` 现在真正 `await execution_guard.release(key)`（含 acquire 失败路径），不再依赖空 `Drop`；`SandboxLease` 新增 `mark_released()` 保证重复释放幂等；③ 新增 `is_distributed()`（harness 默认 / COS / OSS = `false`；JDBC/MySQL/PG/Redis/MongoDB = `true`）。验证：`cargo test -p agentscope-harness --lib sandbox::` 60 passed（1 个既有 flaky `promoter::audit_log_roundtrips_query` 单跑必过）。 | **✅ 已落地** |
 | Skills↔harness `skill/` 关系 | **已裁定：维持原结论，分层与 Java 一致**。Java 源码核实（2026-09-19）：`agentscope-extensions-skills` **只含 repository 实现**（`GitSkillRepository` / `MysqlSkillRepository` / `PostgresSkillRepository`），模块根 `src/` 下**无任何 `.java`**；接口 `AgentSkillRepository` 位于 **core**（`io.agentscope.core.skill.repository`，由 core 的 `ReActAgent` / `DynamicSkillMiddleware` 消费）⇒ Java 分层 =【core：接口+模型】【extensions-skills：后端实现】。Rust 侧分工一致，唯一差异是接口**落在 harness 而非 core**（因 `agentscope-core` 无 `skill` 模块），属**归属位移而非层次错位**。残留观察：若将来 core 的 agent 也需挂载 skill 仓库，需重议是否上提 trait 到 core。 | **已裁定**（见 `SKILLS__GAP_TRACKER.md` §2.0） |
 | `list_hash` 算法并存 | **已裁定并已落地（依 Java 源码 + Rust 实测）：以 core 为正解；MONGODB / COS / REDIS 三处平行实现已于 2026-09-19 全部收敛到 `agentscope_core::state::list_hash`**。Java `io.agentscope.core.state.ListHashUtil` 采用**采样**策略：`"size:N;"` + 采样位 `"i:itemHashCode,"`，末了 `Integer.toHexString(sb.hashCode())`；常量 `EMPTY_HASH="empty:0"`、`SAMPLING_THRESHOLD=5`、采样位 `[0,n/4,n/2,3n/4,n-1]`；`needsFullRewrite` 也是拿 `existingCount` 前缀哈希与存储哈希比。`agentscope-core/src/state/list_hash.rs` **忠实移植**了该策略，且**已经在 `state/mod.rs` `pub use`**。**Rust 实测分布（2026-09-19）**：① **JDBC** `state/jdbc_agent_state_store.rs` 与 ② **PostgreSQL** `state.rs` **已调用 core**（`agentscope_core::state::list_hash`，共 2 个 crate 落地）；③ **REDIS** `state/list_hash.rs` 策略忠实（采样，仅 per-element 输入改为 JSON 文本），属**重复实现但语义一致**；④ **MONGODB** 与 ⑤ **COS** 均为全量 SHA-256；⑥ MySQL 未涉及该逻辑。**两处真实行为偏离（已修）**：(a) ④MONGODB 与 ⑤COS 的 `needs_full_rewrite` 在 `stored_hash == None && existing_count == 0` 时返 `true`，**与 Java 相反**——Java 经 Case 3 得空前缀 → `computeHash(空)="empty:0"` → `hasChanged(·, null) == false` ⇒ 返 **false**（MONGODB 的测试断言本身即错，已按 Java 语义更正）；(b) ⑤COS 另用 `!whole_hash.starts_with(stored)` 判追加，**实测全量 SHA-256 无前缀性质**（`hash([a,b,c])` 不以 `hash([a,b])` 开头），致**纯追加恒判需全量重写**（增量优化失效；数据无损）。**收敛结果**：三 crate 弃本地实现 → 委托 core（MONGODB 保留 `list_hash.rs` 作薄 re-export 以不动公开路径；REDIS 删除 `state/list_hash.rs`；COS 删除两个 private 函数并移除已无用的 `sha2` 依赖，另解耦 `existing_count` 使 core Case 2 可达）。存量数据自愈：hash 值不可比 → 首次写入走全量重写，数据无损、无需迁移脚本。 | **已裁定并已落地**（见 `MONGODB__GAP_TRACKER.md` §3.3、`COS__GAP_TRACKER.md` §3.1、`REDIS__GAP_TRACKER.md` §4.1.1） |
 | 各模块 tracker §2/§3 回填 | **全部完成**。MODEL / RAG / SANDBOX / POSTGRESQL / CHANNEL 已由主会话与后台子智能体回填（`docs/extensions/` 下已无空模板，各 tracker 8.9K–31K）；CHANNEL 本轮再次回填（§1.2 公共层归属、§2.6 逐类映射、§3.2 P1 状态、§4.1-§4.3 验收与遗留）。MEM / STUDIO / NACOS / TRAINING / AISTIO / PROTOCOL / SKILLS / SCHEDULER / HIGRESS / 7 个存储模块均已回填。 | 已完成 |
@@ -303,9 +303,9 @@
 | SCHEDULER | 已完成 | **进行中** | ↓ |
 | TRAINING | 已完成 | **进行中** | ↓ |
 | NACOS | 已完成 | **进行中** | ↓ |
-| HIGRESS | 已完成 | 已完成（P0×1） | 保持（限定） |
+| HIGRESS | 已完成 | 已完成 | 保持 |
 
-> **唯一真正无 P0 且无功能缺口的模块是 MEM**；COS/OSS/HIGRESS/STUDIO/SANDBOX 的"保持"均附带 P0 或未接线 P1。
+> **唯一真正无 P0 且无功能缺口的模块是 MEM**；COS/OSS/HIGRESS/STUDIO/SANDBOX 的"保持"均附带未接线 P1（HIGRESS 的 P0-1「builder 不建连」已于 2026-10-28 修复，不再是 P0）。
 
 ### 4.3 本轮发现的 13 个 P0（按严重度排序）
 
@@ -314,7 +314,7 @@
 | 1 | MYSQL | **空列表语义与 Java 相反** | `state/mod.rs:269-290` vs `MysqlAgentStateStore.java:571-573` | `save_list([])` 会**清空**原有数据（Java 直接 return） |
 | 2 | SCHEDULER | `schedule*` 未 `with_factory` | `quartz/mod.rs:119-120`、`task.rs:55` | 定时/手动/trait run **100% 失败** |
 | 3 | SCHEDULER | `schedule_with_input` 丢初始消息 | `runtimes` 无读取点 | 带输入的任务丢上下文 |
-| 4 | HIGRESS | `build()` 不建连 | `client.rs:401-409`（仅翻 bool） | `list_tools()` 必失败；3 个配置项全部无效 |
+| 4 | HIGRESS | ~~`build()` 不建连~~ **已修（2026-10-28）** | `client.rs` `initialize()` 经 `HigressMcpTransport::connect_server` 真 `create_client` + `connect`，`initialization_timeout` 包装 | ~~`list_tools()` 必失败；3 个配置项全部无效~~ → 现 `list_tools()` 可用，`transport_type`/`timeout`/`initialization_timeout` 全部投影进 `McpConnectRequest` |
 | 5 | STUDIO | 键名 `message` vs `reply` | `message_hook.rs:93` vs `react_agent.rs:725` | Studio 消息转发**恒不触发** |
 | 6 | TRAINING | `stream:true` 违反 Trinity 协议 | `model/openai/mod.rs:381` vs `TrinityModelAdapter.java:177` | 协议相反 + `msg_ids` 重复 N 次 |
 | 7 | CHANNEL | DingTalk HTTP 回调模式整块缺失 | 无 `crypto.rs`/`controller.rs` | Java 已发布能力（228 行测试）不可用 |
@@ -336,7 +336,7 @@
 | MONGODB | `ttl_days` | `state_store.rs:641-651` `build()` 未带入 |
 | MONGODB | guard `database_name` | `sandbox_guard.rs:348-357` `build()` 未带入 |
 | TRAINING | `shadow_pool_size`/`shadow_pool_capacity` | **零消费点** |
-| HIGRESS | `transport_type`/`timeout`/`initialization_timeout` | `initialize()` 不建连，全部无效 |
+| HIGRESS | ~~`transport_type`/`timeout`/`initialization_timeout`~~ **已修（2026-10-28）** | 三者均投影进 `McpConnectRequest` 并由 `initialize()` 使用 |
 | SANDBOX | `file_api_base_dir` | `KubernetesFileApi` 存在但**无消费者** |
 | CHANNEL | `DingTalkStreamClient` | 存在但未接入 `DingTalkChannel`（无 `start()`/`stop()`） |
 | AISTIO | `SessionExportSink`/`SessionLogExporter` | core 已有、本 crate 零引用 |
@@ -538,3 +538,67 @@
 - **Phase 2 遗留（记录，不阻塞验收）**：① `ProxyConfig`（HTTP/SOCKS/认证/nonProxyHosts）未接入；② 未处理 `x-should-retry` 响应头；③ `reasoning.*` / `service_tier` / `prompt_cache_options` 的枚举白名单**未做 fail-fast 校验**（当前透传，Java 会拒绝）——属行为差异，已在 §4.8 #11 登记；④ 无真实 OpenAI 端点 e2e。
 - **验收中发现的核心层既有问题（P1，非本次引入）**：core 存在**两个同名 BYPASS 常量且取值不同**——`formatter/base_formatter.rs:12` 为 `"bypassMultiagentHistoryMerge"`，`message/keys.rs:5` 为 `"_bypass_multiagent_history_merge"`（后者与 Java 一致）。`base_formatter` 的 bypass 判定因此看不到 Java 写入的标记；官方 formatter 用的是正确那个。需后续统一（让 `base_formatter` 引用 `keys.rs` 常量）。
 - **维护债（P1，已登记）**：`openai_official` 自行实现了 request/parser/model，与既有 `responses`（690 行）形成**两套 Responses 实现**，属「平行实现」模式。Phase 2 已验收，但后续维护应评估合并，避免复制扩散。
+
+---
+
+## 4.10 2026-10-28 loop 批次总览（缺口收口）
+
+> 本批由主会话编排、多个子智能体并行执行；**所有数字均为主会话独立复跑 `cargo test -p <crate>` 的结果（0 failed）**，不采信子智能体自报。各模块细节见其独立 tracker 的「2026-10-28 执行记录」。
+
+| 模块 | 本轮关闭的缺口 | 实测（passed，0 failed） |
+|---|---|---|
+| MEM | `api_base_url` 空校验（`apiBaseUrl is required`）、connect 30s 超时、bailian/reme DTO 零单测 | 96（基线 66） |
+| POSTGRESQL | builder `create_if_not_exist` 默认改 `true`；快照 `initSchema` 失败仅 warn（未一刀切，逐点对照 Java） | 115（基线 111） |
+| STUDIO | Socket.IO 鉴权键 `runId`→`run_id`；`agentscope.function.name`；三个响应侧抽取器 + `StreamChatResponseAggregator` 接入；`callFormat` span | 70（基线 62） |
+| REDIS | SCAN 游标循环 12 条离线用例（多页/游标链/去重/失败传播）；cluster 扇出层（真实拓扑发现待 driver feature） | 126 + 2 doc（基线 114） |
+| HIGRESS | meta 透传 `call_tool_with_meta`；`outputSchema`；`registration()`（enableTools/group/prefix/preset/propagateMeta）；`HigressMcpTransport` 使 tool-search 成功路径/缓存/topK 可测 | 57（基线 36） |
+| SANDBOX | K8s 文件 API **真接线**（`file_api_base_dir` 不再是死配置）；E2B 原生 `SandboxFileTransfer` + `workspaceTransferPath` 校验；连接策略 Direct/InCluster/Gateway + `X-Sandbox-*` 头；codec 默认改 `Json` | 176（基线 151） |
+| JDBC | 原生 advisory lock **真接线**（`NativeLockSessionProvider` + 100ms 轮询上移，关闭 P1+P2）；`VersionedState` 双份定义消除 | 217（基线 198） |
+| CONTROLPLANE | EventJournal 按会话选择性 ack（原子重写 + 检查点）；`replanRun`/`signalRun`/`uploadArtifact`/`downloadArtifact`（含二进制 `send_for_bytes`）；env 键核对 | 144 + 4（基线 128+4） |
+| JUDGE | **P0 清零**：`JudgeHttpTransport` seam + `JevClient`（重试/退避/超时/脱敏）+ `OpenAIDecisionsClient`；System One 契约逐字段核对（修 2 处）；`openai_decisions` 8 类 | 126（基线 57） |
+| RAG | **外部向量库 4/4 落地**：Qdrant（REST）/ PgVector（SQL + `PgExecutor` 缝）/ Milvus（REST v2）/ Elasticsearch（`_bulk` + kNN） | 436（基线 325） |
+| NACOS | `SecuritySchemeConverterUtil` 五种 type；`supportedInterfaces` 组装/拆分 + 两个强制语义；prompt 空串照写；skill 资源 key/必填/zip 校验；**A2A 平行类型改为复用 protocol 类型** | 70（基线 43） |
+| COS | **真实 COS HTTP 适配器**（COS v5 `q-sign-algorithm=sha1` 完整签名，官方金标向量钉住）；`put/get/exists/delete/list_page/list_prefix/delete_many`；403 与 404 区分；依赖清理 | 73（基线 31） |
+| MODEL | dashscope 加密 + 会话合并；ollama 多智能体（修「提升消息未附图片」真 bug）；`AnthropicServerTool`；responses 多智能体分组；openai-official 三项遗留（ProxyConfig / `x-should-retry` / 枚举白名单 fail-fast） | 374（基线 332） |
+| PROTOCOL（5 子 crate + facade） | A2A 引导层 `AgentScopeA2aServer`；`AgentExecuteProperties`；`AgentRegistry`/`AgentRegistryService`；`TransportWrapper*`/`DeploymentProperties`；**`message/stream` 改真 SSE 增量**；`WorkspaceProtocolTaskRepository`；`ProcessResult::interrupt` | 39/47/29/191/35/73（合计 414，基线 304） |
+| SCHEDULER | cron `L`/`W`/`LW`/`n#k`/年字段 + `/1` 展开；`next_fire_time` 驱动精确休眠 + 查询 API；`interrupt` 中止 in-flight；6 值状态；xxl-job `XxlJobContext`/`XxlJobHelper`；cancel 语义；`execution_count()` 等 getter | 88 + 3（基线 55） |
+| SKILLS | 空/空白库名表名回退 + trim；`delete` 事务；PG 资源 1000 分行分批；git `save()` 返 `Ok(false)`；`skill_exists("")` 返 false；依赖 10→5；+33 用例（含 8 个 `file://` 真实仓） | 93（基线 60） |
+| TRAINING | `AgentCloner` 默认回读 `sys_prompt`/`max_iters`；`enable_auto_commit` 对齐 Java 死配置语义；`TrainingHook` + `TrainingRunner::attach`（≈`addSystemHook` 的显式装配）；`shadow_pool_size` 接 Semaphore；依赖清理 | 74（基线 66） |
+| core | `BYPASS_MULTIAGENT_HISTORY_MERGE` 双常量统一（`base_formatter` 引用 `message::keys`，Java 写入的 `_bypass_multiagent_history_merge` 现可见）+ 回归用例 | formatter 9 |
+| harness | `SandboxGuard` trait（`SandboxManager` 改持 `Arc<dyn SandboxGuard>` + `with_shared_guard`）；`DistributedStore` 新增 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` 三个复合槽位（⚠️ 字段是 `pub`，新增后 7 个存储 crate 的字面量构造点需改 builder，已在同批同步）；**M1/M4/M6 修复（2026-10-28）**：`try_enter`/`release` 改 `async` + `is_distributed()` + `SandboxManager::release` 真正释放护栏租约（新增 `release_frees_the_isolation_key_exactly_once` / `failed_acquisition_releases_the_guard_lease`） | 492（1 个既有 flaky 单跑必过；sandbox 子集 60） |
+| MODEL（第 2 轮） | **dashscope 加密原语落地**：AES-256/GCM（nonce=12B IV，tag 128bit 尾追）+ RSA PKCS#1 v1.5 包装 `base64(AES key)`；header `{public_key_id,encrypt_key,iv}`；默认 provider `AesRsaCryptoProvider`（原 `UnavailableCryptoProvider` 降为显式 opt-out）；JCE 金标向量钉住 | 382（基线 374） |
+| COS（第 2 轮） | **分段上传**（initiate/part/complete/abort + 阈值 5 MiB 自动切换 + 并发分片 + ETag 升序拼接 + 失败回滚）、**预签名 URL**（`presign_get`/`presign_put`，复用签名纯函数）、**STS 凭证**（header/query 双形态，刷新由调用方负责） | 105（基线 73） |
+| REDIS（第 2 轮） | **用 `CLUSTER SLOTS` 自建拓扑发现**（不依赖未公开 primaries API、不改 Cargo feature）+ 逐 primary 扇出 SCAN；`parse_cluster_slots` 纯函数 11 例（去重/空 host 回退/IPv6/非法结构） | 148 + 2 doc（基线 137） |
+| JUDGE（第 2 轮） | jev **42 类（完整 32 / 部分 8 / 骨架 2）**：`evaluation` 12 类、`context` 5 类、`application` 10 类、`evidence`/`routing`/`supervision`/`integration`/`review` 主要类型 + 根包 `JevJudge`；无 `todo!()`，未实现项一律 fail-closed | 286（基线 126） |
+
+**跨模块裁定变更**：§2.2「`DistributedStore` 字段不足」与 §3.3「`SandboxExecutionGuard` 为具体 struct」两条**均已由『不改 harness』改为『已落地』**（见对应行）。7 个存储 crate 已将各自的 `base_store` / `snapshot_spec` / `guard` 投影进新槽位，并为各自的 `XxxSandboxExecutionGuard` 补 `impl SandboxGuard`（jdbc 217 / mysql 71 / postgresql 115 / redis 137 / mongodb 80 / oss 62～71 / cos 74）。
+
+**全量回归（2026-10-28，本轮末 · 最终）**：`cargo test --workspace -j 2 --no-fail-fast` → **EXIT=0 / 133 targets / 4776 passed / 0 failed / 4 ignored**。上轮基线为 3800 passed，本轮 **+976**。4 个 ignored 为：`platform_channel.rs` 的 ```ignore 文档示例（1）+ COS 的 3 个 `no_run` doctest。`cargo check --workspace --all-targets` 同样 EXIT=0。
+
+> 本轮中途曾有一次全量 4558 passed（第一版 harness 改动后）；第二轮（MODEL 加密 / COS 分段上传与预签名 / REDIS 拓扑发现 / JUDGE jev 42 类）落地后复跑为 **4776**。
+
+> 已知 flaky（非本轮缺陷，已多次复现）：`agentscope-harness::agent::skill::promoter::tests::audit_log_roundtrips_query` 在 `--lib` 并行下偶发（assert left 2 right 1），单跑必过。
+
+> fmt 说明：本轮新/改文件已 `rustfmt` 干净；`cargo fmt --all -- --check` 仍会报 3 个**既有**未格式化文件（`core/src/shutdown/mod.rs`、`extensions-acp/src/acp_harness_agent.rs`、`harness/tests/harness_shutdown_test.rs`），与本轮无关，未动。
+
+---
+
+## 4.11 2026-10-29 审核后修复（M1–M7）
+
+> 来源：一轮**只读全量审核**（按 crate 逐 diff、抽样 8 crate 跑测）给出「需修复后接受」+ 7 项必修复。本节记录修复结果。
+
+| # | 问题 | 修复 |
+|---|---|---|
+| **M1** | `SandboxManager::release()` 从不调 `execution_guard.release`，`SandboxLease::drop` 是空壳 → 带 isolation key 的 acquire **永久持锁**（分布式后端第二个请求阻塞到 1800s 后静默 noop） | `manager.rs` 的 `release` 与 **acquire 失败路径**都 `await execution_guard.release(key)`；`SandboxLease` 新增 `mark_released()`/`is_released()`（`Arc<AtomicBool>` 幂等，删空 `Drop`）；`lease_key()` 暴露 key |
+| **M4** | redis/mongodb 用 `futures::executor::block_on` 驱动含 `tokio::sleep` 的轮询（async 调用点空转/死锁） | `SandboxGuard` 改 `#[async_trait]`（`try_enter`/`release` async，`is_held` 同步）；redis/mongodb 删除轮询路径的 `block_on`，直接 `await tokio::time::sleep` |
+| **M2** | `jdbc/.../native_lock.rs` 的 `std::thread::sleep` 落在 async 路径（阻塞 worker 最长 1800s） | 拆为 `try_enter_once`（单次）+ `try_enter_async`（`tokio::time::sleep` 轮询），删除同步 `poll_acquire`/`enter` |
+| **M3** | `NativeLockError::Failed` 被归并为 `TimedOut` → 数据库故障时静默放弃隔离 | 新增 `LockOutcome::Failed(String)`；只有 deadline 到期才降级 noop，后端故障向上返回错误 |
+| **M5** | tracker 陈旧/自相矛盾（HIGRESS P0-1；§4.10 REDIS 同段既「已落地」又「仍阻塞」） | HIGRESS P0-1 改「已修」并引 `initialize()` 与 5 条用例；§4.10 REDIS 阻塞段只保留「不做 MOVED/ASK 路由、无真实集群集成测试」；全仓陈旧措辞已清 |
+| **M6** | COS/OSS 的进程内 guard 占「分布式」槽位 | `SandboxGuard` 新增 `is_distributed()`（默认 false；jdbc/mysql/pg/redis/mongo 为 true），并在 `DistributedStore.sandbox_execution_guard` 与 COS/OSS 投影 rustdoc 写明「宿主必须用 `is_distributed()` 判断」 |
+| **M7** | dashscope `enableEncrypt` 配置链缺失、`PUBLIC_KEYS_ENDPOINT` 零消费者 | `enable_encrypt` 串通；`HttpTransport::get_json` 新增，`model.rs` 拉取公钥并 `OnceCell` 缓存；`enable_encrypt=true` 缺公钥 → **fail-fast 报错**（绝不静默明文） |
+
+**验证（主会话独立复跑）**：10 个受影响 crate → **74 targets / 2085 passed / 0 failed / 1 ignored**；全 workspace → **133 targets / 4798 passed / 0 failed / 4 ignored / EXITCODE=0**（较修复前 +22）。反向验证由执行体逐项完成（回退关键实现 → 对应用例 FAILED → 恢复）。
+
+**已知残留（有意保留，非遗漏）**：① `SandboxGuard` trait 无错误通道，后端故障在 trait 层只能 `error!` + noop，`Err` 由 crate 级 `try_enter_async`/`try_enter_checked` 提供；② `is_held()` 同步签名下，redis/mongodb 仍用一次 `block_on` 单命令探测（无轮询/`sleep`）；③ mysql/pg 的 tracker 未改（其「四方法委托」描述仍成立）。
+
+**仍存在的显式阻塞/差异**（不是本轮遗漏，已写入各 tracker）：REDIS **不做 MOVED/ASK 重定向路由**、也**无真实 Redis Cluster 集成测试**（拓扑发现已落地：`CLUSTER SLOTS` 自建解析 + 逐 primary 扇出 SCAN，见上表「REDIS（第 2 轮）」）；SANDBOX `PortForwardStrategy`（fabric8 无对应）与 Gateway watch（改为一次性读取）；CONTROLPLANE journal 路径取 Java 代码字面值 vs javadoc 的口径分歧；RAG `ExternalApiReader`（无固定 wire 契约）；JUDGE 8 个 jev 子包（~7600 行）与 `browser`（Playwright，设计决定不迁移）。
