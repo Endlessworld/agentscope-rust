@@ -69,7 +69,9 @@ async fn per_request_registration_keeps_count_and_ids_consistent() {
     // The snapshot carries the registration timestamp.
     let snapshot = mgr.active_requests_snapshot();
     assert_eq!(snapshot.len(), 2);
-    assert!(snapshot.iter().all(|info| info.started_at <= std::time::Instant::now()));
+    assert!(snapshot
+        .iter()
+        .all(|info| info.started_at <= std::time::Instant::now()));
 
     // Unregistering a known id drops both the id and the count.
     assert!(mgr.unregister_request_with_id("req-1"));
@@ -128,8 +130,16 @@ async fn shutdown_middleware_registers_and_unregisters_the_request() {
         .await;
 
     assert!(events.is_empty(), "the inner stream is forwarded unchanged");
-    assert_eq!(observed.load(Ordering::SeqCst), 1, "one active request in flight");
-    assert_eq!(mgr.get_active_request_count(), 0, "the request is unregistered");
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        1,
+        "one active request in flight"
+    );
+    assert_eq!(
+        mgr.get_active_request_count(),
+        0,
+        "the request is unregistered"
+    );
     assert!(mgr.active_request_ids().is_empty());
 }
 
@@ -156,9 +166,8 @@ async fn shutdown_middleware_rejects_new_requests_during_shutdown() {
 
     let mw = GracefulShutdownMiddleware::new(Arc::clone(&mgr));
     let ctx = RuntimeContext::new();
-    let next: Next<AgentInput> = Box::new(|_input: AgentInput| {
-        panic!("the inner chain must not run while shutting down")
-    });
+    let next: Next<AgentInput> =
+        Box::new(|_input: AgentInput| panic!("the inner chain must not run while shutting down"));
 
     let events = mw
         .on_agent(&ctx, AgentInput::new(vec![]), next)
@@ -166,7 +175,10 @@ async fn shutdown_middleware_rejects_new_requests_during_shutdown() {
         .await;
 
     assert_eq!(events.len(), 1, "exactly one error is surfaced");
-    let err = events[0].as_ref().err().expect("expected a rejection error");
+    let err = events[0]
+        .as_ref()
+        .err()
+        .expect("expected a rejection error");
     assert!(matches!(err, Error::ShuttingDown(_)), "got: {err:?}");
     assert!(
         err.to_string().contains("shutting down"),
@@ -237,7 +249,10 @@ async fn json_file_state_saver_writes_the_snapshot() {
     let mut state = AgentState::default();
     state.session_id = "sess-shutdown".to_string();
     state.shutdown_interrupted = true;
-    saver.save(&state).await.expect("the snapshot must be written");
+    saver
+        .save(&state)
+        .await
+        .expect("the snapshot must be written");
 
     let text = tokio::fs::read_to_string(&path).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -259,7 +274,10 @@ async fn state_store_state_saver_writes_into_the_store() {
     let mut state = AgentState::default();
     state.session_id = "sess-store".to_string();
     state.user_id = Some("alice".to_string());
-    saver.save(&state).await.expect("the snapshot must be written");
+    saver
+        .save(&state)
+        .await
+        .expect("the snapshot must be written");
 
     let stored = store
         .get(Some("alice"), "sess-store", "agent_state")

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::context::SandboxContext;
-use super::guard::SandboxExecutionGuard;
+use super::guard::{SandboxExecutionGuard, SandboxGuard};
 use super::key::SandboxIsolationKey;
 use super::lease::SandboxLease;
 use super::state::{SandboxState, SandboxStateStore};
@@ -71,6 +71,15 @@ impl SandboxAcquireResult {
     pub fn lease(&self) -> &SandboxLease {
         &self.lease
     }
+
+    /// The isolation key the guard lease is held for (`None` when no guard applies).
+    pub fn lease_key(&self) -> Option<&SandboxIsolationKey> {
+        if self.lease.is_noop() {
+            None
+        } else {
+            Some(self.lease.key())
+        }
+    }
 }
 
 /// Manages the lifecycle of `Sandbox` instances for the current call.
@@ -91,7 +100,7 @@ pub struct SandboxManager {
     agent_id: String,
 
     /// Execution guard for isolation.
-    execution_guard: SandboxExecutionGuard,
+    execution_guard: Arc<dyn SandboxGuard>,
 }
 
 impl std::fmt::Debug for SandboxManager {
@@ -114,16 +123,37 @@ impl SandboxManager {
             client,
             state_store,
             agent_id: agent_id.into(),
-            execution_guard: SandboxExecutionGuard::noop(),
+            execution_guard: Arc::new(SandboxExecutionGuard::noop()),
         }
     }
 
     /// Creates a new sandbox manager with execution guard.
-    pub fn with_guard(
+    ///
+    /// Accepts any [`SandboxGuard`] implementation; the in-process
+    /// [`SandboxExecutionGuard`] keeps working unchanged.
+    pub fn with_guard<G>(
         client: Arc<dyn SandboxClient>,
         state_store: Arc<dyn SandboxStateStore>,
         agent_id: impl Into<String>,
-        execution_guard: SandboxExecutionGuard,
+        execution_guard: G,
+    ) -> Self
+    where
+        G: SandboxGuard + 'static,
+    {
+        Self {
+            client,
+            state_store,
+            agent_id: agent_id.into(),
+            execution_guard: Arc::new(execution_guard),
+        }
+    }
+
+    /// Creates a new sandbox manager with a shared (e.g. distributed) guard.
+    pub fn with_shared_guard(
+        client: Arc<dyn SandboxClient>,
+        state_store: Arc<dyn SandboxStateStore>,
+        agent_id: impl Into<String>,
+        execution_guard: Arc<dyn SandboxGuard>,
     ) -> Self {
         Self {
             client,
@@ -172,7 +202,7 @@ impl SandboxManager {
         let mut lease = SandboxLease::noop();
         if let Some(key) = &scope_key {
             debug!("[sandbox] Acquiring execution guard for scope {}", key);
-            lease = self.execution_guard.try_enter(key.clone());
+            lease = self.execution_guard.try_enter(key.clone()).await;
         }
 
         // Try to load persisted state (Priority 3)
@@ -219,40 +249,62 @@ impl SandboxManager {
         let snapshot_spec = sandbox_context.snapshot_spec().cloned();
         let client_options = sandbox_context.client_options().cloned();
 
-        let sandbox = self
+        let sandbox = match self
             .client
             .create(
                 &workspace_spec,
                 snapshot_spec.as_deref(),
                 client_options.as_ref(),
             )
-            .await?;
+            .await
+        {
+            Ok(sandbox) => sandbox,
+            Err(e) => {
+                // The lease was already taken for this scope: release it before bubbling
+                // the error up, otherwise the isolation key stays locked forever.
+                self.release_lease(&lease).await;
+                return Err(e);
+            }
+        };
 
         Ok(SandboxAcquireResult::self_managed(sandbox, lease))
     }
 
-    /// Releases a sandbox (stop + shutdown if self-managed).
+    /// Releases a sandbox (stop + shutdown if self-managed) and closes its guard lease.
+    ///
+    /// The guard release is **awaited here and nowhere else**: dropping a `SandboxLease`
+    /// never releases (see [`SandboxLease`]), so a caller that skips this method leaves an
+    /// isolation key held until the backend's lease TTL expires.
     pub async fn release(&self, result: &SandboxAcquireResult) {
-        let sandbox = match result.sandbox() {
-            Some(s) => s,
-            None => return,
-        };
+        // User-managed sandboxes are owned by the caller; their lease is a no-op.
+        if result.is_self_managed() {
+            if let Some(sandbox) = result.sandbox() {
+                // Stop the sandbox
+                // Note: We can't call mutable methods on &dyn Sandbox, so we need to handle this differently
+                // In a real implementation, we'd need to take ownership or use interior mutability
+                debug!(
+                    "[sandbox] Releasing self-managed sandbox: {}",
+                    sandbox.state().session_id()
+                );
+            }
 
-        // User-managed sandboxes are owned by the caller
-        if !result.is_self_managed() {
-            return;
+            // For now, we'll just log. The actual stop/shutdown would need to be handled
+            // by the caller or through a different mechanism.
         }
 
-        // Stop the sandbox
-        // Note: We can't call mutable methods on &dyn Sandbox, so we need to handle this differently
-        // In a real implementation, we'd need to take ownership or use interior mutability
-        debug!(
-            "[sandbox] Releasing self-managed sandbox: {}",
-            sandbox.state().session_id()
-        );
+        self.release_lease(result.lease()).await;
+    }
 
-        // For now, we'll just log. The actual stop/shutdown would need to be handled
-        // by the caller or through a different mechanism.
+    /// Releases the guard lease exactly once (no-op leases are ignored).
+    async fn release_lease(&self, lease: &SandboxLease) {
+        if lease.is_noop() || !lease.mark_released() {
+            return;
+        }
+        debug!(
+            "[sandbox] Releasing execution guard for scope {}",
+            lease.key()
+        );
+        self.execution_guard.release(lease.key()).await;
     }
 
     /// Persists sandbox state.
@@ -470,5 +522,179 @@ mod tests {
         // Note: This test doesn't verify persistence because the mock sandbox
         // doesn't have a proper isolation key resolution. In a real test,
         // we'd need to set up the runtime context properly.
+    }
+
+    // -----------------------------------------------------------------------
+    //  Guard lease lifecycle (M4: `SandboxManager::release` must close the lease)
+    // -----------------------------------------------------------------------
+
+    use crate::agent::isolation_scope::IsolationScope;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct RecordingGuardState {
+        enters: AtomicUsize,
+        releases: AtomicUsize,
+        held: std::sync::Mutex<std::collections::HashMap<SandboxIsolationKey, usize>>,
+    }
+
+    /// A fake distributed guard: records enter/release calls and tracks held keys so the
+    /// manager's acquire/release pairing can be observed from the outside.
+    #[derive(Debug, Clone, Default)]
+    struct RecordingGuard {
+        state: Arc<RecordingGuardState>,
+    }
+
+    impl RecordingGuard {
+        fn enters(&self) -> usize {
+            self.state.enters.load(Ordering::SeqCst)
+        }
+
+        fn releases(&self) -> usize {
+            self.state.releases.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxGuard for RecordingGuard {
+        async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+            self.state.enters.fetch_add(1, Ordering::SeqCst);
+            *self
+                .state
+                .held
+                .lock()
+                .expect("guard state")
+                .entry(key.clone())
+                .or_insert(0) += 1;
+            SandboxLease::new(key)
+        }
+
+        async fn release(&self, key: &SandboxIsolationKey) {
+            self.state.releases.fetch_add(1, Ordering::SeqCst);
+            let mut held = self.state.held.lock().expect("guard state");
+            if let Some(count) = held.get_mut(key) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    held.remove(key);
+                }
+            }
+        }
+
+        fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+            self.state
+                .held
+                .lock()
+                .expect("guard state")
+                .contains_key(key)
+        }
+    }
+
+    /// A client whose `create` always fails (state store empty, so priority 3 is skipped).
+    struct FailingSandboxClient;
+
+    #[async_trait::async_trait]
+    impl SandboxClient for FailingSandboxClient {
+        async fn create(
+            &self,
+            _workspace_spec: &WorkspaceSpec,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
+            _options: Option<&SandboxClientOptions>,
+        ) -> Result<Box<dyn Sandbox>> {
+            Err(agentscope_core::error::Error::Other("boom".to_string()))
+        }
+
+        async fn resume(&self, _state: &SandboxState) -> Result<Box<dyn Sandbox>> {
+            Err(agentscope_core::error::Error::Other("boom".to_string()))
+        }
+
+        async fn delete(&self, _sandbox: &dyn Sandbox) -> Result<()> {
+            Ok(())
+        }
+
+        fn serialize_state(&self, state: &SandboxState) -> Result<String> {
+            serde_json::to_string(state)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+        }
+
+        fn deserialize_state(&self, json: &str) -> Result<SandboxState> {
+            serde_json::from_str(json)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+        }
+
+        fn deserialize_state_with_spec(
+            &self,
+            json: &str,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
+        ) -> Result<SandboxState> {
+            self.deserialize_state(json)
+        }
+    }
+
+    fn agent_scoped_context() -> SandboxContext {
+        SandboxContext::builder()
+            .isolation_scope(IsolationScope::Agent)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn release_frees_the_isolation_key_exactly_once() {
+        let guard = RecordingGuard::default();
+        let observed = guard.clone();
+        let manager = SandboxManager::with_guard(
+            Arc::new(MockSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+            guard,
+        );
+        let context = agent_scoped_context();
+        let key = SandboxIsolationKey::new("agent", "test-agent");
+
+        let result = manager.acquire(&context, None).await.unwrap();
+        assert!(!result.lease().is_noop(), "guard lease must be taken");
+        assert_eq!(result.lease_key(), Some(&key));
+        assert!(
+            observed.is_held(&key),
+            "the key is held while the call runs"
+        );
+        assert_eq!(observed.enters(), 1);
+
+        manager.release(&result).await;
+        assert!(
+            !observed.is_held(&key),
+            "release must free the isolation key"
+        );
+        assert!(result.lease().is_released());
+        assert_eq!(
+            (observed.enters(), observed.releases()),
+            (1, 1),
+            "fake guard must see exactly one enter and one release"
+        );
+
+        // A second release is a no-op: it must not release another caller's hold.
+        manager.release(&result).await;
+        assert_eq!(observed.releases(), 1, "repeated release is idempotent");
+    }
+
+    #[tokio::test]
+    async fn failed_acquisition_releases_the_guard_lease() {
+        let guard = RecordingGuard::default();
+        let observed = guard.clone();
+        let manager = SandboxManager::with_guard(
+            Arc::new(FailingSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+            guard,
+        );
+        let context = agent_scoped_context();
+        let key = SandboxIsolationKey::new("agent", "test-agent");
+
+        let error = manager.acquire(&context, None).await.unwrap_err();
+        assert!(format!("{error}").contains("boom"), "{error}");
+        assert!(
+            !observed.is_held(&key),
+            "a failed acquisition must not leak the isolation key"
+        );
+        assert_eq!((observed.enters(), observed.releases()), (1, 1));
     }
 }

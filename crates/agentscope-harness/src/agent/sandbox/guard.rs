@@ -4,6 +4,77 @@ use super::lease::SandboxLease;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Pluggable execution-guard contract, mirroring the Java `SandboxExecutionGuard`
+/// `@FunctionalInterface`.
+///
+/// The concrete [`SandboxExecutionGuard`] below is the in-process default (re-entrant
+/// counting only). Distributed backends (JDBC / Redis / Mongo / COS / ...) implement this
+/// trait so `SandboxManager` can serialise sandbox acquisition across processes instead of
+/// being limited to the local process.
+///
+/// ## Why `try_enter` / `release` are async
+///
+/// A distributed guard has to poll an external lock store (`SET NX PX`, `GET_LOCK`,
+/// `pg_try_advisory_lock`, ...), and that poll sleeps between attempts. When the contract
+/// was synchronous, implementations had to bridge with `futures::executor::block_on` —
+/// which spins or deadlocks when the acquisition is itself driven from a Tokio task
+/// (the only production call site is `SandboxManager::acquire`). Making both the acquire
+/// and the release `async` lets every backend just `await tokio::time::sleep`.
+///
+/// [`SandboxGuard::is_held`] stays synchronous: it is a diagnostics probe (single
+/// round-trip, no polling) and is never part of the acquire/release path.
+#[async_trait::async_trait]
+pub trait SandboxGuard: Send + Sync + std::fmt::Debug {
+    /// Tries to acquire a lease for the given isolation key.
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease;
+
+    /// Releases a lease for the given isolation key.
+    ///
+    /// This must be awaited by [`SandboxManager::release`](super::SandboxManager::release):
+    /// dropping a [`SandboxLease`] never releases the guard.
+    async fn release(&self, key: &SandboxIsolationKey);
+
+    /// Returns true if the given key is currently held.
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool;
+
+    /// Number of active leases (diagnostics; distributed guards may return 0).
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    /// Whether this guard serialises across processes.
+    ///
+    /// `false` (the default) means the guard is process-local: the harness default
+    /// [`SandboxExecutionGuard`], and the object-store guards that delegate to it. Storage
+    /// backends that take a real distributed lock (JDBC / MySQL / PostgreSQL / Redis /
+    /// MongoDB) override this to `true`. Hosts that project a
+    /// [`DistributedStore`](crate::agent::DistributedStore) must consult this flag: the
+    /// `sandbox_execution_guard` slot is typed `Arc<dyn SandboxGuard>` and may hold either
+    /// flavour.
+    fn is_distributed(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxGuard for SandboxExecutionGuard {
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        SandboxExecutionGuard::try_enter(self, key)
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        SandboxExecutionGuard::release(self, key)
+    }
+
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        SandboxExecutionGuard::is_held(self, key)
+    }
+
+    fn active_count(&self) -> usize {
+        SandboxExecutionGuard::active_count(self)
+    }
+}
+
 /// Prevents concurrent execution for isolation keys.
 ///
 /// When configured, the manager acquires an execution `SandboxLease` before sandbox
@@ -112,6 +183,52 @@ mod tests {
     fn test_execution_guard_creation() {
         let guard = SandboxExecutionGuard::new();
         assert_eq!(guard.active_count(), 0);
+    }
+
+    /// A distributed guard is a plain `Arc<dyn SandboxGuard>`; the trait must be object safe
+    /// and dispatch to the injected implementation rather than the in-process default.
+    #[tokio::test]
+    async fn injected_guard_drives_the_trait_object_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct CountingGuard {
+            enters: AtomicUsize,
+            releases: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl SandboxGuard for CountingGuard {
+            async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+                self.enters.fetch_add(1, Ordering::SeqCst);
+                SandboxLease::new(key)
+            }
+            async fn release(&self, _key: &SandboxIsolationKey) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+            fn is_held(&self, _key: &SandboxIsolationKey) -> bool {
+                false
+            }
+        }
+
+        let inner = Arc::new(CountingGuard::default());
+        let guard: Arc<dyn SandboxGuard> = inner.clone();
+        let key = SandboxIsolationKey::new("user", "u1");
+        let _lease = guard.try_enter(key.clone()).await;
+        guard.release(&key).await;
+
+        assert_eq!(inner.enters.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.releases.load(Ordering::SeqCst), 1);
+    }
+
+    /// The in-process default is not a distributed guard; storage backends override this so
+    /// hosts can tell the two apart through the `Arc<dyn SandboxGuard>` slot.
+    #[tokio::test]
+    async fn in_process_guard_is_not_distributed() {
+        let guard = SandboxExecutionGuard::new();
+        assert!(!guard.is_distributed());
+        let object: Arc<dyn SandboxGuard> = Arc::new(SandboxExecutionGuard::new());
+        assert!(!object.is_distributed());
     }
 
     #[test]

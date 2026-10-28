@@ -28,7 +28,7 @@ mod workspace_spec;
 
 pub use context::SandboxContext;
 pub use docker::{DockerSandbox, DockerSandboxClient};
-pub use guard::SandboxExecutionGuard;
+pub use guard::{SandboxExecutionGuard, SandboxGuard};
 pub use helpers::{
     ProjectionPayload, WorkspaceArchiveExtractor, WorkspaceMountSupport, WorkspaceProjectionApplier,
 };
