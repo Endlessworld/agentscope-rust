@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use agentscope_harness::agent::sandbox::{
-    SandboxExecutionGuard as HarnessExecutionGuard, SandboxIsolationKey, SandboxLease,
+    SandboxExecutionGuard as HarnessExecutionGuard, SandboxGuard, SandboxIsolationKey, SandboxLease,
 };
 
 use crate::object_store::SharedObjectStore;
@@ -87,6 +87,29 @@ impl CosSandboxExecutionGuard {
     }
 }
 
+#[async_trait::async_trait]
+impl SandboxGuard for CosSandboxExecutionGuard {
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        CosSandboxExecutionGuard::try_enter(self, key)
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        CosSandboxExecutionGuard::release(self, key)
+    }
+
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        CosSandboxExecutionGuard::is_held(self, key)
+    }
+
+    fn active_count(&self) -> usize {
+        CosSandboxExecutionGuard::active_count(self)
+    }
+
+    // `is_distributed()` keeps the trait default (`false`): this guard wraps the
+    // process-local harness `SandboxExecutionGuard`, so it serialises only inside one
+    // process. COS has no server-side lock primitive to build a distributed guard on.
+}
+
 impl Default for CosSandboxExecutionGuard {
     fn default() -> Self {
         Self::new(Arc::new(crate::object_store::InMemoryCosObjectStore::new()))
@@ -135,5 +158,15 @@ mod tests {
         let key = SandboxIsolationKey::new("session", "s1");
         let _l = g.try_enter(key.clone());
         assert!(g2.is_held(&key));
+    }
+
+    /// COS delegates to the in-process harness guard: the trait object must report
+    /// `is_distributed() == false` so a host does not assume cross-process locking.
+    #[tokio::test]
+    async fn guard_is_not_distributed() {
+        let g = guard();
+        assert!(!SandboxGuard::is_distributed(&g));
+        let object: Arc<dyn SandboxGuard> = Arc::new(guard());
+        assert!(!object.is_distributed());
     }
 }

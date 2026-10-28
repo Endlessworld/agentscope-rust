@@ -268,6 +268,7 @@ impl BaseStore for CosStore {
 mod tests {
     use super::*;
     use crate::object_store::InMemoryCosObjectStore;
+    use crate::CosObjectStore;
 
     fn ns() -> Vec<String> {
         vec!["sessions".to_string(), "s1".to_string(), "fs".to_string()]
@@ -349,5 +350,72 @@ mod tests {
         s.put(&a, "k", value("in-a"));
         assert!(s.get(&b, "k").is_none());
         assert_eq!(s.get(&a, "k").unwrap().version, 1);
+    }
+
+    /// A key with leading slashes addresses the same object as its normalized form,
+    /// and the object key is the literal Java layout (`{ns}/{key}.json`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn key_with_leading_slash_is_normalized() {
+        let backend = Arc::new(InMemoryCosObjectStore::new());
+        let shared: SharedObjectStore = backend.clone();
+        let s = CosStore::builder().object_store(shared).build().unwrap();
+
+        s.put(&ns(), "/nested/item", value("v"));
+
+        assert_eq!(
+            backend.list_prefix("").await.unwrap(),
+            vec![
+                "agentscope/store/sessions/s1/fs/nested/item.json".to_string(),
+                "agentscope/store/sessions/s1/fs/nested/item.version".to_string(),
+            ]
+        );
+        // Both spellings resolve to the same object.
+        assert_eq!(s.get(&ns(), "nested/item").unwrap().version, 1);
+        assert!(s.get(&ns(), "/nested/item").is_some());
+    }
+
+    /// An empty namespace addresses objects directly under the key prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_namespace_uses_the_prefix_only() {
+        let backend = Arc::new(InMemoryCosObjectStore::new());
+        let shared: SharedObjectStore = backend.clone();
+        let s = CosStore::builder()
+            .object_store(shared)
+            .key_prefix("/agentscope\\store")
+            .build()
+            .unwrap();
+        assert_eq!(s.key_prefix(), "agentscope/store/");
+
+        s.put(&[], "k.txt", value("v"));
+
+        assert_eq!(
+            backend.list_prefix("").await.unwrap(),
+            vec![
+                "agentscope/store/k.txt.json".to_string(),
+                "agentscope/store/k.txt.version".to_string(),
+            ]
+        );
+        assert_eq!(s.get(&[], "k.txt").unwrap().version, 1);
+        assert_eq!(s.search(&[], 10, 0).len(), 1);
+    }
+
+    /// Blank prefixes fall back to the base-store default, and `search` still pages.
+    #[test]
+    fn blank_prefix_falls_back_to_default() {
+        for prefix in ["", "   ", "/"] {
+            let s = CosStore::builder()
+                .object_store(InMemoryCosObjectStore::new().shared())
+                .key_prefix(prefix)
+                .build()
+                .unwrap();
+            assert_eq!(s.key_prefix(), "agentscope/store/", "prefix {prefix:?}");
+        }
+    }
+
+    /// The builder rejects a missing object store rather than deferring the failure.
+    #[test]
+    fn builder_rejects_missing_object_store() {
+        let err = CosStore::builder().build().unwrap_err();
+        assert!(err.to_string().contains("object_store must not be null"));
     }
 }

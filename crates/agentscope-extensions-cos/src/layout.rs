@@ -99,3 +99,92 @@ pub fn namespace_prefix(key_prefix: &str, namespace: &[String]) -> String {
     }
     sb
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_prefixes_use_the_default() {
+        assert_eq!(
+            normalize_prefix(None, DEFAULT_STATE_PREFIX),
+            DEFAULT_STATE_PREFIX
+        );
+        assert_eq!(
+            normalize_prefix(Some(""), DEFAULT_STATE_PREFIX),
+            DEFAULT_STATE_PREFIX
+        );
+        assert_eq!(
+            normalize_prefix(Some("   "), DEFAULT_STATE_PREFIX),
+            DEFAULT_STATE_PREFIX
+        );
+        // A prefix that is nothing but separators normalizes to empty and therefore
+        // also falls back to the default.
+        assert_eq!(
+            normalize_prefix(Some("/"), DEFAULT_STATE_PREFIX),
+            DEFAULT_STATE_PREFIX
+        );
+        assert_eq!(
+            normalize_prefix(Some("\\"), DEFAULT_STATE_PREFIX),
+            DEFAULT_STATE_PREFIX
+        );
+    }
+
+    #[test]
+    fn prefixes_strip_leading_slashes_and_gain_a_trailing_one() {
+        assert_eq!(normalize_prefix(Some("a/b"), "d"), "a/b/");
+        assert_eq!(normalize_prefix(Some("/a/b"), "d"), "a/b/");
+        assert_eq!(normalize_prefix(Some("///a/b/"), "d"), "a/b/");
+        assert_eq!(normalize_prefix(Some("a\\b"), "d"), "a/b/");
+        // Java only validates `isBlank()`; surrounding spaces inside a non-blank
+        // prefix are preserved verbatim.
+        assert_eq!(normalize_prefix(Some(" agentscope "), "d"), " agentscope /");
+        // The empty default keeps the prefix empty (snapshot layout).
+        assert_eq!(normalize_optional_prefix(None), "");
+        assert_eq!(normalize_optional_prefix(Some("/snap/")), "snap/");
+    }
+
+    #[test]
+    fn keys_and_users_normalize_like_java() {
+        assert_eq!(strip_leading_slashes("/a/b"), "a/b");
+        assert_eq!(strip_leading_slashes("///a"), "a");
+        assert_eq!(strip_leading_slashes("a/b"), "a/b");
+        assert_eq!(strip_leading_slashes(""), "");
+
+        assert_eq!(normalize_user(None), ANON_USER);
+        assert_eq!(normalize_user(Some("")), ANON_USER);
+        assert_eq!(normalize_user(Some("  ")), ANON_USER);
+        assert_eq!(normalize_user(Some("u1")), "u1");
+    }
+
+    #[test]
+    fn session_and_namespace_prefixes() {
+        assert_eq!(
+            session_prefix("agentscope/state/", Some("u1"), "s1").unwrap(),
+            "agentscope/state/u1/s1/"
+        );
+        assert_eq!(
+            session_prefix("agentscope/state/", None, "s1").unwrap(),
+            "agentscope/state/__anon__/s1/"
+        );
+        assert!(session_prefix("p/", Some("u"), "").is_err());
+        assert!(session_prefix("p/", Some("u"), "   ").is_err());
+
+        assert_eq!(
+            namespace_prefix("agentscope/store/", &[]),
+            "agentscope/store/"
+        );
+        assert_eq!(
+            namespace_prefix("agentscope/store/", &[String::from("a"), String::from("b")]),
+            "agentscope/store/a/b/"
+        );
+    }
+
+    #[test]
+    fn snapshot_ids_reject_unsafe_segments() {
+        assert!(validate_snapshot_id("snap-1").is_ok());
+        for id in ["", "   ", "a/b", "a\\b", "..", "a/../b", "a\0b"] {
+            assert!(validate_snapshot_id(id).is_err(), "should reject {id:?}");
+        }
+    }
+}

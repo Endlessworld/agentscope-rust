@@ -60,6 +60,15 @@ impl CosAgentStateStore {
         &self.key_prefix
     }
 
+    /// Releases the underlying object store, mirroring Java's
+    /// `CosAgentStateStore.close()` (which shuts the `COSClient` down).
+    ///
+    /// Idempotent. The backend is typically shared with the other COS components of a
+    /// [`crate::CosDistributedStore`], so closing it closes them too.
+    pub fn close(&self) {
+        self.object_store.close();
+    }
+
     fn state_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<String> {
         Ok(format!(
             "{}{key}{JSON_SUFFIX}",
@@ -239,8 +248,9 @@ impl AgentStateStore for CosAgentStateStore {
             Err(_) => return,
         };
         if let Ok(keys) = self.object_store.list_prefix(&prefix).await {
-            for key in keys {
-                let _ = self.object_store.delete(&key).await;
+            // Batch delete (Java `deleteKeys`: 1000 keys per `deleteObjects` call).
+            if !keys.is_empty() {
+                let _ = self.object_store.delete_many(&keys).await;
             }
         }
     }
@@ -556,6 +566,197 @@ mod tests {
         assert_eq!(
             backend.get_string(&hash_key).await.unwrap().unwrap(),
             compute_hash(&updated)
+        );
+    }
+
+    /// Object keys match the Java layout literally, including the anonymous user
+    /// segment and the `.json` / `.list.json` / `.list.hash` suffixes.
+    #[tokio::test]
+    async fn object_keys_follow_the_java_layout() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        s.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        s.save(None, "s2", "k", serde_json::json!(2)).await;
+        s.save_list(Some("u1"), "s1", "items", &[serde_json::json!("a")])
+            .await;
+
+        let mut keys = backend.list_prefix("").await.unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "agentscope/state/__anon__/s2/k.json".to_string(),
+                "agentscope/state/u1/s1/items.list.hash".to_string(),
+                "agentscope/state/u1/s1/items.list.json".to_string(),
+                "agentscope/state/u1/s1/k.json".to_string(),
+            ]
+        );
+    }
+
+    /// Blank / `/`-only / backslash / leading-slash prefixes all normalize the Java
+    /// way; a blank prefix falls back to `agentscope/state/`.
+    #[test]
+    fn prefix_edge_cases_normalize_like_java() {
+        let build = |prefix: Option<&str>| {
+            let mut builder =
+                CosAgentStateStore::builder().object_store(InMemoryCosObjectStore::new().shared());
+            if let Some(prefix) = prefix {
+                builder = builder.key_prefix(prefix);
+            }
+            builder.build().unwrap()
+        };
+
+        assert_eq!(build(None).key_prefix(), DEFAULT_STATE_PREFIX);
+        assert_eq!(build(Some("")).key_prefix(), DEFAULT_STATE_PREFIX);
+        assert_eq!(build(Some("   ")).key_prefix(), DEFAULT_STATE_PREFIX);
+        assert_eq!(build(Some("/")).key_prefix(), DEFAULT_STATE_PREFIX);
+        assert_eq!(
+            build(Some("/agentscope\\state")).key_prefix(),
+            "agentscope/state/"
+        );
+        // A non-blank prefix keeps its surrounding whitespace (Java parity).
+        assert_eq!(
+            build(Some(" agentscope/state ")).key_prefix(),
+            " agentscope/state /"
+        );
+        assert_eq!(
+            build(Some("agentscope/state/")).key_prefix(),
+            "agentscope/state/"
+        );
+    }
+
+    /// The builder rejects a missing object store instead of panicking later.
+    #[test]
+    fn builder_rejects_missing_object_store() {
+        let err = CosAgentStateStore::builder().build().unwrap_err();
+        assert!(err.to_string().contains("object_store must not be null"));
+
+        let err = CosAgentStateStore::builder()
+            .key_prefix("custom/")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("object_store must not be null"));
+    }
+
+    /// Session deletion goes through one batch call (Java `deleteObjects`), not one
+    /// `deleteObject` per key, and clears the whole session prefix.
+    #[tokio::test]
+    async fn delete_session_uses_a_single_batch_call() {
+        #[derive(Debug, Default)]
+        struct BatchStore {
+            inner: InMemoryCosObjectStore,
+            deletes: std::sync::atomic::AtomicUsize,
+            batches: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl crate::CosObjectStore for BatchStore {
+            async fn get(&self, key: &str) -> crate::Result<Option<Vec<u8>>> {
+                self.inner.get(key).await
+            }
+            async fn put(&self, key: &str, data: &[u8]) -> crate::Result<()> {
+                self.inner.put(key, data).await
+            }
+            async fn delete(&self, key: &str) -> crate::Result<()> {
+                self.deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.delete(key).await
+            }
+            async fn delete_many(&self, keys: &[String]) -> crate::Result<()> {
+                self.batches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                for key in keys {
+                    self.inner.delete(key).await?;
+                }
+                Ok(())
+            }
+            async fn exists(&self, key: &str) -> crate::Result<bool> {
+                self.inner.exists(key).await
+            }
+            async fn len(&self) -> usize {
+                self.inner.len().await
+            }
+            async fn list_prefix(&self, prefix: &str) -> crate::Result<Vec<String>> {
+                self.inner.list_prefix(prefix).await
+            }
+        }
+
+        let backend = Arc::new(BatchStore::default());
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+        s.save(Some("u1"), "s1", "a", serde_json::json!(1)).await;
+        s.save(Some("u1"), "s1", "b", serde_json::json!(2)).await;
+        s.save(Some("u1"), "s2", "c", serde_json::json!(3)).await;
+
+        s.delete(Some("u1"), "s1").await;
+
+        assert_eq!(backend.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(backend.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!s.exists(Some("u1"), "s1").await);
+        assert!(s.exists(Some("u1"), "s2").await);
+
+        // An empty session prefix must not issue a batch call at all.
+        s.delete(Some("u1"), "s1").await;
+        assert_eq!(backend.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// `close()` delegates to the object store and is idempotent (Java
+    /// `CosAgentStateStore.close()` shuts the `COSClient` down).
+    #[tokio::test]
+    async fn close_delegates_and_is_idempotent() {
+        #[derive(Debug, Default)]
+        struct ClosingStore {
+            inner: InMemoryCosObjectStore,
+            closes: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl crate::CosObjectStore for ClosingStore {
+            async fn get(&self, key: &str) -> crate::Result<Option<Vec<u8>>> {
+                self.inner.get(key).await
+            }
+            async fn put(&self, key: &str, data: &[u8]) -> crate::Result<()> {
+                self.inner.put(key, data).await
+            }
+            async fn delete(&self, key: &str) -> crate::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn exists(&self, key: &str) -> crate::Result<bool> {
+                self.inner.exists(key).await
+            }
+            async fn len(&self) -> usize {
+                self.inner.len().await
+            }
+            async fn list_prefix(&self, prefix: &str) -> crate::Result<Vec<String>> {
+                self.inner.list_prefix(prefix).await
+            }
+            fn close(&self) {
+                self.closes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let backend = Arc::new(ClosingStore::default());
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+        s.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+
+        s.close();
+        s.close();
+        assert_eq!(backend.closes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Closing an in-memory backend does not lose data; only a real client stops
+        // accepting requests (covered by the HTTP adapter tests).
+        assert_eq!(
+            s.get(Some("u1"), "s1", "k").await.unwrap(),
+            serde_json::json!(1)
         );
     }
 }

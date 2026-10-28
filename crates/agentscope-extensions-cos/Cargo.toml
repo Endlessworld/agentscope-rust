@@ -8,11 +8,24 @@ rust-version.workspace = true
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-futures = { workspace = true }
 tracing = { workspace = true }
-chrono = { workspace = true }
+# --- Real COS backend (Java: `com.qcloud:cos_api` -> hand-written REST client) ---
+# The official Java SDK bundles the HTTP layer and the v5 signature algorithm; the
+# Rust port signs requests itself (`src/signature.rs`) and speaks the COS XML API
+# over `reqwest` (`src/http_object_store.rs`).
+reqwest = { workspace = true }
+hmac = "0.12" # HMAC-SHA1 for the q-sign-algorithm=sha1 derivation chain
+sha1 = "0.10"
+quick-xml = "0.39" # ListBucketResult / DeleteResult / Error responses
+md5 = "0.8" # Content-MD5 required by POST ?delete (batch delete)
+base64 = { workspace = true }
+
+[dev-dependencies]
+# Local fake COS endpoint for offline HTTP-level assertions (request shape +
+# Authorization header), no cloud credentials required.
+httpmock = "0.7"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

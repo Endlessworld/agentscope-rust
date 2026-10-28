@@ -1,13 +1,12 @@
 //! Tencent Cloud COS backed distributed store composition, mirroring
 //! `io.agentscope.extensions.cos.CosDistributedStore`.
 //!
-//! **§2.1 constraint honoured**: the harness [`DistributedStore`] currently only
-//! exposes `agent_state_store` + `isolation_scope`. This crate therefore provides a
-//! COS-specific composition type ([`CosDistributedStore`]) that carries all the
-//! COS components (`agent_state_store` / `base_store` / `sandbox_snapshot_spec` /
-//! `sandbox_execution_guard`), and can project onto the harness `DistributedStore`
-//! via [`CosDistributedStore::to_harness_distributed_store`]. Extending the harness
-//! struct itself is tracked in `EXTENSIONS_GAP_TRACKER.md` §2.2.
+//! **§2.1 constraint honoured**: the harness `DistributedStore` carries
+//! `agent_state_store` + `isolation_scope` plus the composite slots `base_store`,
+//! `sandbox_snapshot_spec` and `sandbox_execution_guard` (resolved 2026-10-28). This crate
+//! provides a COS-specific composition type ([`CosDistributedStore`]) that builds all the
+//! COS components and projects them onto the harness `DistributedStore` via
+//! [`CosDistributedStore::to_harness_distributed_store`].
 
 use std::sync::Arc;
 
@@ -114,19 +113,29 @@ impl CosDistributedStore {
     }
 
     /// The COS-backed sandbox execution guard.
+    ///
+    /// Note the guard is **process-local** (`SandboxGuard::is_distributed() == false`): COS
+    /// exposes no server-side lock, so this delegates to the harness in-process guard.
     pub fn sandbox_execution_guard(&self) -> CosSandboxExecutionGuard {
         self.execution_guard.clone()
     }
 
     /// Projects onto the harness [`HarnessDistributedStore`].
     ///
-    /// Only `agent_state_store` is carried over today; other COS components are
-    /// *not* representable in the harness struct (see tracker §2.2). The default
-    /// isolation scope is used.
+    /// Every COS component is carried over: the agent-state store, the KV base store, the
+    /// snapshot spec, and the execution guard (through the harness `SandboxGuard` trait).
+    /// The default isolation scope is used.
+    ///
+    /// The projected `sandbox_execution_guard` slot is **not** a distributed lock: hosts
+    /// must check `SandboxGuard::is_distributed()` (it returns `false` here) before
+    /// assuming cross-process sandbox serialisation.
     pub fn to_harness_distributed_store(&self) -> HarnessDistributedStore {
         let store: Arc<dyn AgentStateStore> = self.agent_state_store.clone();
         HarnessDistributedStore::builder()
             .agent_state_store(store)
+            .base_store(self.base_store.clone())
+            .sandbox_snapshot_spec(self.snapshot_spec.clone())
+            .sandbox_execution_guard(Arc::new(self.execution_guard.clone()))
             .build()
     }
 
@@ -219,6 +228,37 @@ mod tests {
         let d = distributed();
         let hs = d.to_harness_distributed_store();
         assert!(hs.agent_state_store.is_some());
+    }
+
+    /// Tracker §2.2 resolved 2026-10-28: base store, snapshot spec and guard are projected,
+    /// and the guard is usable through the object-safe `SandboxGuard` trait.
+    #[tokio::test]
+    async fn harness_projection_fills_every_composite_slot() {
+        let d = distributed();
+        let hs = d.to_harness_distributed_store();
+
+        let base: &Arc<dyn BaseStore> = hs.base_store.as_ref().expect("base_store projected");
+        let mut value = serde_json::Map::new();
+        value.insert("projected".to_string(), serde_json::json!(true));
+        base.put(&["ns".to_string()], "k", value);
+        assert!(base.get(&["ns".to_string()], "k").is_some());
+
+        let spec = hs
+            .sandbox_snapshot_spec
+            .as_ref()
+            .expect("sandbox_snapshot_spec projected");
+        assert_eq!(spec.build("projected").expect("build").id(), "projected");
+
+        let guard = hs
+            .sandbox_execution_guard
+            .as_ref()
+            .expect("sandbox_execution_guard projected");
+        let key = SandboxIsolationKey::new("user", "u1");
+        let lease = guard.try_enter(key.clone()).await;
+        assert!(!lease.is_noop());
+        assert!(guard.is_held(&key));
+        guard.release(&key).await;
+        assert!(!guard.is_held(&key));
     }
 
     #[test]

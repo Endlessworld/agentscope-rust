@@ -16,10 +16,10 @@
 | Java 模块 | `agentscope-extensions-cos` |
 | Java 子模块 | 单模块 |
 | Java 规模（实测 2026-10-22） | 主代码 **882 非空行**（5 个类 / 971 总行 / 709 去空去注释行）；测试 **760 非空行**（4 个测试类 / 898 总行 / 62 个 `@Test`） |
-| Rust 规模（实测 2026-10-22） | 9 个 `src/*.rs` / **1517 非空行**（1719 总行 / 1266 去空去注释行）；无 `tests/` 目录；**31** 内联 test（19 个 `#[test]` + 12 个 `#[tokio::test]`）+ 2 个 `no_run` doctest（**只编译、不执行**） |
+| Rust 规模（实测 2026-10-28 第二轮） | 13 个 `src/*.rs` / **5241 非空行**（5823 总行）；无 `tests/` 目录；**105** 内联 test（58 个 `#[test]` + 47 个 `#[tokio::test]`，其中 2 个为 multi-thread flavor）+ 3 个 `no_run` doctest（**只编译、不执行**） |
 | Rust crate | `crates/agentscope-extensions-cos` |
 | 迁移波次 | B |
-| 当前状态 | 已完成（后端为内存实现 + async 抽象；真实 COS SDK 适配见 §4.2；**2026-10-22 静态复核确认**） |
+| 当前状态 | 已完成（**真实 COS HTTP 适配器已落地**：`CosHttpObjectStore` + 自建 `q-sign-algorithm=sha1` 签名（金标向量钉住）+ **分段上传 / 预签名 URL / STS token**（2026-10-28 第二轮）） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -30,12 +30,15 @@
 | `CosRemoteSnapshotClient` | COS 上的 `RemoteSnapshotClient` | `CosRemoteSnapshotClient`（implements `...snapshot::RemoteSnapshotClient`） | 对象 key：`{prefix}{snapshotId}.tar`；snapshot id 安全校验复用 harness `validate_snapshot_id` 语义。**差异（Rust 更严）**：Java 仅拒绝 blank/null `snapshotId`，Rust 额外拒绝 `/`、`\`、`..`、`\0`；Java `RemoteSnapshotSpec.build` 不校验，Rust 经 harness `RemoteSnapshotSpec::build` 校验 → Rust 是**安全加固**，非缺失（见 §6 P2-④） |
 | `CosSnapshotSpec` | 便捷 `SandboxSnapshotSpec` | `CosSnapshotSpec`（implements `...snapshot::SandboxSnapshotSpec`） | 复用 harness `RemoteSnapshotSpec` 包装，与 Java 继承 `RemoteSnapshotSpec` 等价 |
 | （Java 无独立类） | 沙箱执行互斥 | `CosSandboxExecutionGuard` | 包装 harness `SandboxExecutionGuard`，保留共享 object store 作为（未来）分布式协调接缝 |
-| （Java 依赖 `com.qcloud.cos.COSClient`） | 对象存储后端 | `CosObjectStore`（async trait）+ `InMemoryCosObjectStore` | 见 §2.1、§4.2 |
+| （Java 依赖 `com.qcloud.cos.COSClient`） | 对象存储后端 | `CosObjectStore`（async trait）+ `CosHttpObjectStore`（**真实后端**）+ `InMemoryCosObjectStore`（测试） | 见 §2.1、§3.2、§4.3 |
+| `com.qcloud.cos.transfer.TransferManager`（SDK；Java 模块本身**未使用**，只用 `COSClient.putObject`） | 大对象分块上传 | `CosHttpObjectStore::put_multipart` + `put` 阈值自动切换；分片规划在 `multipart.rs` | 规则**逐条对齐 SDK 5.6.245**（`TransferManagerUtils.shouldUseMultipartUpload` / `calculateOptimalPartSize` / `createDefaultExecutorService`）+ COS 服务端限制；见 §3.3、§4.4 |
+| `COSClient.generatePresignedUrl`（SDK；Java 模块**未使用**） | 预签名 URL | `presign_get` / `presign_put`（`presign.rs`，复用 `signature::sign_request`） | 同一签名算法，`q-sign-time` 控制有效期；只签 `host`；见 §3.3 |
+| STS 临时密钥（`x-cos-security-token`） | 临时凭证 | `CosCredentials::with_security_token` / builder `.security_token()` / `with_credentials()` | header 与预签名 query 双通道；**token 刷新由调用方负责**（不自动刷新），见 §3.3 |
 
 ### 2.1 依赖映射（Java → Rust）
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
 |---|---|---|---|
-| `com.qcloud.cos:COSClient`（腾讯云 COS SDK） | `getObjectMetadata`/`getObject`/`putObject`/`deleteObject`/`listObjects` | 自有 async trait `CosObjectStore`（`get/put/delete/exists/len/list_prefix` + UTF-8 便捷方法）；测试用 `InMemoryCosObjectStore` | 未引入第三方 Rust COS SDK；真实适配器待办（§4.2）。**2026-10-22 静态复核确认**：全 crate `rg 'q-sign-algorithm\|Hmac\|Sha1\|sha1\|secretId'` → **零命中**，即**既无自建签名、也无 SDK 签名**，`q-sign-algorithm` **完全未实现**（§4.2） |
+| `com.qcloud.cos:COSClient`（腾讯云 COS SDK） | `getObjectMetadata`/`getObject`/`putObject`/`deleteObject`/`deleteObjects`/`listObjects` | `CosHttpObjectStore`：`reqwest` + 自建 COS v5 签名（`signature.rs`） | **Java 用官方 SDK、Rust 手写签名**（差异已记录 §4.3）。`get`=GET、`put`=PUT（**超过阈值转 multipart**）、`exists`=HEAD、`delete`=DELETE、`list_page`=`GET /?list-type=2&prefix=&continuation-token=&max-keys=`、`delete_many`=`POST /?delete`（1000/批 + `Content-MD5`）。测试用 `InMemoryCosObjectStore`，HTTP 层用 `httpmock` 离线断言。**2026-10-22 的「`q-sign-algorithm` 零命中」结论已失效**（当时属实，现已实现）。**Rust 额外（Java 模块未用）**：`POST ?uploads`/`PUT ?partNumber&uploadId`/`POST ?uploadId`/`DELETE ?uploadId` 分段上传、预签名 URL —— 参考 Java **SDK** 的 `TransferManager`/`generatePresignedUrl`，不引新依赖 |
 | `io.agentscope.core.state.AgentStateStore` | 状态存储 trait | `agentscope_core::state::AgentStateStore` | §2.1 裁定：实现它，不重建 |
 | `io.agentscope.core.state.ListHashUtil` | list 增量 hash | `agentscope_core::state::{compute_hash, needs_full_rewrite}`（`state::list_hash`） | **已收敛（2026-09-19，2026-10-22 静态复核确认）**：删除本 crate 平行实现，`save_list` 直接委托 core；`sha2` 依赖已从 `Cargo.toml` 移除。详见 §2.2 / §3.2 / §4.1。**注意**：core 的 `compute_hash` 用 `std::collections::hash_map::DefaultHasher`（SipHash-1-3）而非 Java `String.hashCode()`，故与 Java 侧 hash 值**永不相等**（见 §2.2 新增行） |
 | `io.agentscope.core.util.JsonUtils` | JSON 编解码 | `serde_json` | |
@@ -65,30 +68,76 @@
 | list 增量哈希收敛到 core | `ListHashUtil.needsFullRewrite` | 已完成 | **2026-09-19**：删除本地 `compute_list_hash`（全量 SHA-256）+ 本地 `needs_full_rewrite`，改 `use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite}`；`save_list` 调用点同步收敛；`existing_count` 改为「已存列表实体长度」，与 hash 对象解耦；`sha2` 依赖移除（grep 确认无其他用途）。验证：**31 unit test passed / 0 failed**（19 × `#[test]` + 12 × `#[tokio::test]`）+ 2 个 `no_run` doctest（只编译不执行）。**2026-10-22 静态复核确认**：`rg 'fn compute_list_hash\|fn needs_full_rewrite'` 全 crate → 零命中；`Cargo.toml` 无 `sha2`（`git log -S "sha2"` → 提交 `daa700d`）→ 收敛属实 |
 | 修复：纯追加不再恒判全量重写 | `ListHashUtil.needsFullRewrite` Case 3 | 已完成 | 旧条件 `!compute_list_hash(values).starts_with(stored_hash)` 依赖「全量 SHA-256 具有前缀性质」——**实测该假设错误**（`sha256([a])` 与 `sha256([a,b])` 互不为前缀），故条件恒 `true`，纯追加永远判需全量重写（数据无损，追加优化失效）。已实测旧实现 `old_needs_full_rewrite([a,b], old_hash([a]), 1) == true`；新实现 `needs_full_rewrite == false`（core 取 `existing_count` 前缀哈希比较）。**2026-10-22 静态复核确认**：该回归断言现以 `agent_state_store.rs::pure_append_does_not_trigger_full_rewrite` 内联形式保留（同时断言旧 `!whole.starts_with(stored_hash)` 恒为 `true`）。**注意**：core 只修到「单次追加不判重写」，**连续第二次追加**仍会因「存整表哈希 vs 比前缀哈希」而判全量重写（与 Java 同款，见 §2.2 P1-①） |
 | 修复：`stored_hash == None` 误判 | `ListHashUtil.needsFullRewrite` Case 2 | 已完成 | 旧实现 `None => true`；core 语义为 `stored_hash.is_none() && existing_count > 0` 才 `true`，即无既有数据（`existing_count == 0`）时**不**重写 |
-| 对象存储后端抽象 | `COSClient` | 已完成 | `CosObjectStore` async trait + `InMemoryCosObjectStore`；真实 COS SDK 适配待办（§4.2） |
+| 对象存储后端抽象 | `COSClient` | 已完成 | `CosObjectStore` async trait（`get/put/delete/exists/len/list_prefix/list_page/delete_many/close` + UTF-8 便捷方法）；`InMemoryCosObjectStore`（测试）+ **`CosHttpObjectStore`（真实，2026-10-28）** |
 | key 布局 / 前缀归一化 | `CosAgentStateStore`/`CosBaseStore` 私有方法 | 已完成 | `layout.rs`：`normalize_prefix` / `session_prefix` / `namespace_prefix` / `normalize_user` / `validate_snapshot_id` |
 | `AgentStateStore` 实现 | `CosAgentStateStore` | 已完成 | `CosAgentStateStore`（builder + `Arc<dyn>` 便捷函数）；`exists`/`delete`/`list_session_ids` 基于 prefix list |
 | `BaseStore` 实现（CAS/版本） | `CosBaseStore` | 已完成 | `CosStore`；version 从 0 起、成功写入 +1；`put_if_version(ns,key,v,0)`=仅当不存在时写入；写路径 async mutex 串行化 |
 | 快照 client + spec | `CosRemoteSnapshotClient`/`CosSnapshotSpec` | 已完成 | 实现 `RemoteSnapshotClient`；spec 包裹 harness `RemoteSnapshotSpec` |
 | 沙箱执行 guard | （Java 无） | 已完成 | `CosSandboxExecutionGuard` 包装 harness guard |
 | 组合者 | `CosDistributedStore` | 已完成 | `CosDistributedStore::create` + 子前缀 `state/`/`store/`/`snapshot/` + `to_harness_distributed_store()` |
-| · 单元测试 | 760 行测试 | 已完成 | **31** lib unit tests（19 × `#[test]` + 12 × `#[tokio::test]`）+ 2 个 `no_run` doctest（只编译不执行）。分布：`agent_state_store` 12（7 tokio + 5 test）、`base_store` 5、`distributed_store` 5（1 tokio + 4 test）、`guard` 3、`snapshot` 5（3 tokio + 2 test）、`object_store` 1（tokio）。**对照 Java 62 个 `@Test` → 覆盖度约 50%**（Java 用 Mockito 精确断言 COS 请求；Rust 走 `InMemoryCosObjectStore` 抽象层，无法断言 HTTP 细节），差异清单见 §6 P1-② |
+| · 单元测试 | 760 行测试 | 已完成 | **105** lib unit tests（58 × `#[test]` + 47 × `#[tokio::test]`）+ 3 个 `no_run` doctest（只编译不执行）。分布：`agent_state_store` 17、`base_store` 9、`http_object_store` 33、`distributed_store` 6、`snapshot` 5、`guard` 3、`object_store` 4、`layout` 5、`signature` 9、`multipart` 8、`presign` 6。**对照 Java 62 个 `@Test` → 数量已超（105 vs 62）**，且新增了 Java 测试里没有的 HTTP/签名/分段/预签名层断言 |
 
 ### 3.2 后续（P1/P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| 真实 COS SDK 适配器 | `COSClient` 构造 | 待办 | 需 bucket/region/credential + HTTP 签名（自实现或接第三方）；实现 `CosObjectStore` 即可接入。**2026-10-22 静态复核**：全 crate 检索 `q-sign-algorithm` / `Hmac` / `Sha1` / `sha1` / `secretId` → **零命中**（仅 3 处注释提到 `com.qcloud.cos.COSClient` 与「HTTP signing」为待办）。→ **既无 SDK 也无自建签名**，签名工作量**完全未开始**。腾讯云 COS v5 签名需 `q-sign-algorithm=sha1` + HMAC-SHA1 派生链（依赖 `hmac`/`sha1` crate，workspace 根 `Cargo.toml` **当前无** `sha1`/`hmac`） |
+| 真实 COS 适配器 | `COSClient` 构造 | **已完成（2026-10-28）** | `CosHttpObjectStore`（`src/http_object_store.rs`）+ `src/signature.rs`（纯函数签名）。**Java 用官方 SDK `com.qcloud:cos_api:5.6.245`、Rust 手写 COS v5 签名**（见 §4.3）。依赖：`reqwest`（workspace）、`hmac 0.12`、`sha1 0.10`、`quick-xml 0.39`、`md5 0.8`、`base64`（workspace）；dev-dep `httpmock 0.7`。**能力边界**：`get`/`put`/`exists`/`delete`/`list_page`（`list-type=2` + `continuation-token` + `max-keys`，1000 上限）/`list_prefix`（自动翻页）/`delete_many`（`POST /?delete`，1000/批 + `Content-MD5`）/`close`；404→`Ok(None)`（`get`）/`false`（`exists`）/`Ok(())`（`delete`），403→`CosError::Service{status:403}` 可经 `is_signature_error()` 与 404 区分。**分段上传 / 预签名 URL / STS 已于 2026-10-28 第二轮落地**（§3.3 / §4.4）。**仍未实现**：`select`/`inventory` 等高级 API；断点续传（`ListParts` 恢复）、上传进度回调、跨进程分布式锁 |
 | ~~`ListHashUtil` 精确对齐~~ | `ListHashUtil` | **已完成（2026-09-19）** | 已收敛到 `agentscope_core::state::list_hash`，本地平行实现删除，详细见 §2.2 / §3.1 / §4.1。**残留 PS2**：`.list.hash` 不再与 Java 旧值二进制兼容（core 采样策略 vs 旧 SHA-256；且 core 用 `DefaultHasher`（SipHash-1-3）而 Java 用 `String.hashCode()` → 两侧值**永不相等**，见 §2.2「跨语言 hash 值」行）；跨语言共读同一 bucket 时首次写入会自愈（见 §4.2 第 5 条） |
 | 分布式跨进程执行互斥 | （Java 亦为进程内） | 设计决定（不迁移） | harness guard 为进程内；跨进程协调未在 Java 实现，Rust 亦不做 |
+
+### 3.3 2026-10-28 第二轮：分段上传 / 预签名 URL / STS
+
+> Java 模块本身**只用** `COSClient.putObject`/`getObject`/…（单次 PUT 上限 5 GiB），既无分段也无预签名代码。下列规则取自 **Java 侧依赖的官方 SDK 5.6.245**（`~/.m2/.../cos_api-5.6.245.jar` 字节码）与 COS 官方 API 文档，不引新依赖。
+
+#### 3.3.1 常量与规则来源
+
+| 常量（`multipart.rs`） | 值 | 来源 |
+|---|---|---|
+| `DEFAULT_MULTIPART_THRESHOLD` | **5 MiB**（5 242 880） | `TransferManagerConfiguration.<init>` → `multipartUploadThreshold = 5242880l` |
+| `DEFAULT_MULTIPART_PART_SIZE` | **5 MiB** | 同上 → `minimumUploadPartSize = 5242880l` |
+| `MIN_MULTIPART_PART_SIZE` | **1 MiB** | COS《Upload Part》：“每个分块大小为 1MB - 5GB，最后一个分块可以小于 1MB” |
+| `MAX_MULTIPART_PART_SIZE` | **5 GiB** | 同上 |
+| `MAX_MULTIPART_PARTS` | **10 000** | 同上（“最多支持 10000 分块”） |
+| `DEFAULT_MULTIPART_CONCURRENCY` | **1** | `TransferManagerUtils.createDefaultExecutorService` → `newFixedThreadPool(1, ThreadFactory)` |
+| `MAX_PRESIGN_EXPIRE_SECS` | **604 800**（7 天） | COS 签名有效期上限；客户端默认仍为 `DEFAULT_SIGN_EXPIRE_SECS = 900` |
+
+| 行为规则 | Java SDK 参考 | Rust 实现 |
+|---|---|---|
+| 何时走分片 | `TransferManagerUtils.shouldUseMultipartUpload`：`len >= threshold`（`lcmp; iflt`） | `put`：`len as u64 >= multipart_threshold` |
+| 分片大小 | `TransferManagerUtils.calculateOptimalPartSize`：`max(ceil(len / 10000), minimumUploadPartSize)` | `multipart::plan_parts`：`configured.max(len.div_ceil(10000))` |
+| 分片编号 / 乱序 | COS《Upload Part》：`partNumber ∈ 1..=10000`，可乱序上传 | `MultipartPlan::range` 按 1-based 编号切 `[start, end)` |
+| 完成顺序 | COS《Complete》：乱序报 `400 InvalidPartOrder` | 上传完成后 `etags.sort_by_key(part_number)` 再拼 XML |
+| 失败回滚 | COS《Complete》：“建议及时完成或舍弃” | 任一分片/完成失败 → `DELETE ?uploadId=..`；仅记录 abort 失败不掩盖原错误 |
+| 发号失败不回滚 | —（无 `UploadId` 可发号） | `initiate` 失败直接返回，不发 abort |
+
+#### 3.3.2 API 清单
+
+| 项 | 签名 | 说明 |
+|---|---|---|
+| `put_multipart` | `async fn(&self, key: &str, data: &[u8]) -> Result<()>` | 显式分片（绕过阈值）；空体 / 分片尺寸非法 → `CosError::Config`，不发起任何请求 |
+| `put` | trait 方法（`CosObjectStore`，HTTP 后端覆写） | 大于等于阈值转 `put_multipart`；空体 / 小于阈值走单次 `PUT` |
+| `presign_get` / `presign_put` | `fn(&self, key: &str, expire_secs: Option<u64>) -> Result<String>` | **不发网络请求**；`None` 用 `sign_expire_secs`；只签 `host` |
+| `with_credentials` | `fn(&self, CosCredentials) -> Self` | STS 轮换：共享 `reqwest::Client` 与 `closed` 标志 |
+| builder | `multipart_threshold` / `multipart_part_size` / `multipart_concurrency` / `security_token` | 构建时校验（分片尺寸区间、并发 ≥ 1） |
+
+#### 3.3.3 URL 形态与签名复用
+
+- 分段上传四步：`POST /{key}?uploads` → `PUT /{key}?partNumber=N&uploadId=..`（响应头 `ETag`，去引号后重引用写回完成 XML）→ `POST /{key}?uploadId=..`（`<CompleteMultipartUpload><Part><PartNumber>n</PartNumber><ETag>".."</ETag></Part>…`）→ 失败时 `DELETE /{key}?uploadId=..`（`404 NoSuchUpload` 视为已舍弃）。
+- 预签名：`{base}/{encoded key}?[业务参数&]q-sign-algorithm=sha1&q-ak=..&q-sign-time=..&q-key-time=..&q-header-list=host&q-url-param-list=..&q-signature=..`；**直接复用** `signature::sign_request` 返回的 `authorization`（不复制算法），`presign.rs` 只拼 URL。路径“签原文 / 发编码”，与请求签名一致。
+- STS：普通请求 `x-cos-security-token` 进签名头列表；预签名把它当 **query 参数**并进入 `q-url-param-list`（接收方无需额外 header）；token 空串/全空白视为无 token。
+- **能力边界**：分片上传的 `Content-MD5` 未发送（COS 文档标可选）；不支持 `ListParts` 断点续传、上传进度回调、分片级重试（失败即整体回滚）、流式上传（内存峰值约 2× 对象大小：整体 `Arc<Vec<u8>>` + 单片副本；单次 `PUT` 路径为 1×）；预签名不支持 `response-*` 以外的自定义头签名（只签 `host`）。快照 `.tar` 上传走 `CosObjectStore::put`，因此自动获得阈值切换。
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 **已完成**：COS 模块全部产出契约落地并复用既有 trait；list 增量哈希已收敛到 core（无平行实现）。
-- 文件（**9 个**，与 §1 规模行一致）：`src/{lib,error,layout,object_store,agent_state_store,base_store,snapshot,guard,distributed_store}.rs`
-  - 非空行分布：`agent_state_store` 474、`base_store` 308、`distributed_store` 197、`snapshot` 147、`guard` 120、`object_store` 114、`layout` 85、`lib` 52、`error` 20 → **合计 1517**
-- 验证命令与结果（2026-09-19 重跑）：
-  - `cargo build -p agentscope-extensions-cos` → **通过**（exit 0；无本 crate 错误）
-  - `cargo test -p agentscope-extensions-cos` → **通过**：**31 lib unit tests + 2 doctests = 33 passed / 0 failed / 0 ignored**
+- 文件（**13 个**，与 §1 规模行一致）：`src/{lib,error,layout,object_store,http_object_store,signature,multipart,presign,agent_state_store,base_store,snapshot,guard,distributed_store}.rs`
+  - 非空行分布（2026-10-28 第二轮）：`http_object_store` 2166、`agent_state_store` 686、`signature` 479、`base_store` 382、`object_store` 257、`distributed_store` 234、`multipart` 230、`presign` 217、`layout` 170、`snapshot` 150、`guard` 134、`lib` 76、`error` 60 → **合计 5241**（总行 5823）
+- 验证命令与结果（**2026-10-28 第二轮重跑**）：
+  - `cargo test -p agentscope-extensions-cos --no-run` → **通过**（exit 0；本 crate 无错误/无告警）
+  - `cargo test -p agentscope-extensions-cos` → **通过**：**105 lib unit tests + 3 doctests / 0 failed / 0 ignored**
+    - 105 = **58 个 `#[test]` + 47 个 `#[tokio::test]`**（逐文件 `plain+tokio`：`agent_state_store` 7+10、`base_store` 7+2、`http_object_store` 5+28、`object_store` 1+3、`distributed_store` 5+1、`snapshot` 2+3、`signature` 9+0、`layout` 5+0、`guard` 3+0、`multipart` 8+0、`presign` 6+0）；`base_store` 的 2 个为 `#[tokio::test(flavor = "multi_thread")]`；3 个 doctest 均为 **`no_run`**（只编译不执行）
+  - `cargo clippy -p agentscope-extensions-cos --all-targets` → 本 crate **零告警**（仅 core/model/harness 既有告警）；`cargo fmt -p agentscope-extensions-cos -- --check` → **通过**（exit 0）
+    - 顺带清掉一处本轮之前遗留的 test 模块 unused import（`distributed_store.rs` 的 `SandboxGuard`；`dyn SandboxGuard` 上的方法无需导入 trait 即可调用）
+  - `rg "fn compute_list_hash|fn needs_full_rewrite|starts_with\\(h\\)" crates/agentscope-extensions-cos` → **无结果**（exit 1，平行实现已清空）——**2026-10-22 复核重跑仍为 exit 1，确认属实**
     - **2026-10-22 静态复核修正**：31 个 unit test 中 **19 个 `#[test]` + 12 个 `#[tokio::test]`**（按 `#[test]` / `#[tokio::test]` 逐文件统计：`agent_state_store` 5+7、`base_store` 5+0、`distributed_store` 4+1、`guard` 3+0、`snapshot` 2+3、`object_store` 0+1 → 19+12=31）；2 个 doctest 均为 **`no_run`**（`lib.rs:27`、`agent_state_store.rs:32`）→ **只编译不执行**，故「33 passed」的表述应为「31 实际执行 + 2 仅编译」
   - `rg "fn compute_list_hash|fn needs_full_rewrite|starts_with\(h\)" crates/agentscope-extensions-cos` → **无结果**（exit 1，平行实现已清空）——**2026-10-22 复核重跑仍为 exit 1，确认属实**
 - 本次新增的回归测试（`agent_state_store::tests`）：
@@ -102,23 +151,73 @@
   | `empty_existing_state_does_not_force_rewrite` | 无既有数据 + 无 hash → 不重写；有既有数据 + 无 hash → 重写（Case 2） |
   | `legacy_state_without_hash_self_heals` | 旧 SHA-256 hash 遗留 + 新写入 → 列表重写、hash 被 core 值覆盖，数据无损 |
 - 旧行为实测（一次性探针，已删除）：旧 `needs_full_rewrite([a,b], old_hash([a]), 1) == true`（纯追加被误判为全量重写）；新实现同输入为 `false`。
-- 已知问题：无编译错误；真实 COS SDK 未接入（后端抽象 + 内存实现）。
-- **2026-10-22 静态复核新增已知问题**：
-  - `Cargo.toml` 声明 `serde` / `futures` / `chrono` 三个依赖，但 crate 内 `rg '\bserde\b'` → **零命中**（仅用 `serde_json`，未用 `serde` derive）、`rg 'futures'` → **零命中**、`rg 'chrono'` → 2 处命中但均为 `base_store.rs:80/85` 英文注释中的 "**synchronous**" 子串（非 `chrono` crate 调用）→ 三个依赖为**冗余声明**，可在真实适配器落地时清理（P2）
-  - `CosError::Backend` / `CosError::NotFound` 两个变体**从未被构造**（全 crate 仅 `Config` / `Serialization` 有构造点）→ 预留变体（P2）
-  - `object_store`（根 `[workspace.dependencies]`，`0.14`）已声明但**全 workspace 无 crate 引用**，且不在 `Cargo.lock` 中 → 根依赖声明与实际不符（P2，需汇总方处理）
+- 已知问题：无编译错误。**2026-10-28 更新**：真实 COS 后端已落地（`CosHttpObjectStore`），下列 2026-10-22 记录的 3 项静态缺口均已处理：
+  - ~~`serde` / `futures` / `chrono` 冗余依赖~~ → **已删除**（`rg` 复核仍零使用点；`chrono` 的 2 处命中确为注释里的 "synchronous" 子串）
+  - ~~`CosError::Backend` / `NotFound` 从未被构造~~ → `Backend` 现由 HTTP 传输/响应体读取路径构造；新增 `Service{status,code,message}`（403/404 区分）与 `Closed`（close 后请求），`NotFound` 仍未被构造（保留：语义前缀 + `From<CosError> for core Error` 走 `to_string()`，删除会改变公开 API；标注为预留变体）
+  - `object_store`（根 `[workspace.dependencies]`，`0.14`）仍**全 workspace 无引用且不在 `Cargo.lock`** → 属汇总方 P2，本 crate 未动根 `Cargo.toml`
 
 ### 4.2 下一步与阻塞
-1. **真实 COS SDK 适配器**：实现 `CosObjectStore`（bucket/region/secretId/secretKey + 请求签名 + 分页 list）。当前所有组件已按该 trait 编写，接入后无需改动上层。
-   - **2026-10-22 静态复核结论**：**签名未实现**（全 crate `rg 'q-sign-algorithm|Hmac|Sha1|sha1|secretId'` → 零命中，仅注释提及「HTTP signing」为待办）。COS v5 签名算法为 `q-sign-algorithm=sha1`，需 HMAC-SHA1 多级派生 + `q-sign-time` 有效期 + Canonical 请求串拼接；**当前既无第三方 SDK（workspace 无 `sha1`/`hmac` 依赖）也无自建实现** → 该项实为**从零开始**
-   - 另需覆盖：分页 `list`（Java `listAllKeys` 用 marker 循环，Rust `list_prefix` 一次返回全量 → 真实适配器需在 trait 内实现 marker 循环）、批量删除（Java `deleteObjects` 1000/批，Rust `delete` 为逐键删除）
+1. ~~**真实 COS SDK 适配器**~~ → **已完成（2026-10-28）**：`CosHttpObjectStore` + `signature`；能力边界见 §3.2，执行记录见 §4.3。
+2. ~~**分段上传 / 预签名 URL / STS token**~~ → **已完成（2026-10-28 第二轮）**：见 §3.3 与 §4.4。剩余非阻塞增强：`ListParts` 断点续传、分片级重试、上传进度回调、预签名自定义头（`response-content-disposition` 等以参数形式已可扩展）、STS **自动刷新**（按任务要求不做，由调用方重建）。
 2. ~~`ListHashUtil` 精确对齐~~ → **已完成（2026-09-19）**，见 §2.2 / §3.1。
 3. **跨模块依赖（需汇总方处理）**：
-   - harness `DistributedStore` 字段不足（仅 `agent_state_store`+`isolation_scope`），COS 的 `base_store`/`snapshot_spec`/`execution_guard` 无法装入 → 本 crate 用自有组合 + 投影规避；建议扩展 harness（与汇总 tracker §2.2 一致）。**2026-10-22 复核确认**：Java `DistributedStore` 是 **interface**，`HarnessAgent` 会用 `distributedStore.baseStore()` 自动注入 `RemoteFilesystemSpec`/`StoreBackedPeriodicGate`/`SkillUsageStore`；Rust harness 侧 `DistributedStore` 仅 2 字段 → **COS 的 `base_store` 目前无法经 `HarnessAgent::builder().distributed_store(...)` 自动接线**，只能由调用方手动 `RemoteFilesystem::new(store, ...)`（**P1，汇总方**）
+   - harness `DistributedStore` 字段不足（仅 `agent_state_store`+`isolation_scope`）——**已解决（2026-10-28）**：harness 已增 `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard` 三槽 + `SandboxGuard` trait，`CosDistributedStore::to_harness_distributed_store()` 已填满 5 槽，COS 的 `base_store` 可经 `HarnessAgent::builder().distributed_store(...)` 自动接线（详见文末执行记录）。**2026-10-22 复核留存**：Java `DistributedStore` 是 **interface**，`HarnessAgent` 会用 `distributedStore.baseStore()` 自动注入 `RemoteFilesystemSpec`/`StoreBackedPeriodicGate`/`SkillUsageStore`
    - 根 `Cargo.toml` 无需新增 workspace 依赖；本次反而**移除了**本 crate 的 `sha2` 声明（根 `[workspace.dependencies]` 的 `sha2` 未动，也无其他 crate 受影响）。**2026-10-22 复核**：根 `[workspace.dependencies]` 中的 `object_store = "0.14"` **全 workspace 无任何 crate 引用**且不在 `Cargo.lock` → 建议汇总方清理
    - **无需汇总方回填的跨模块拆分**：COS 本次仅删除本 crate 内部平行实现，与 MONGODB/REDIS/JDBC/OSS 各自的 list_hash 收敛互不影响（各自 crate 自洽）。
 4. `CosSandboxExecutionGuard` 目前仅进程内语义；如需跨进程分布式互斥，需汇总方评估存储层协调方案。**2026-10-22 复核补充**：Java `CosDistributedStore` **未**覆写 `sandboxExecutionGuard()`（用 harness 默认 `noop()`），故 Rust 提供真实 guard 属**增强**；但 Java `SandboxExecutionGuard` 是 `@FunctionalInterface`（`tryEnter` **阻塞**至获得槽位），Rust harness 是**具体 struct**（仅可重入计数、不阻塞、不跨进程）→ 即便接上 Rust guard 也**达不到 Java 的阻塞语义**（汇总 tracker 已裁定「harness guard 缺口确认」，此处仅作 COS 侧记录）
 5. **存量数据自愈性说明（无数据迁移脚本）**：存量 COS bucket 中 `.list.hash` 为旧 SHA-256 值。收敛后首次 `save_list` 时，core `needs_full_rewrite` 的 Case 3 会拿「新列表 `existing_count` 前缀的 core 哈希」与「旧 SHA-256 值」比较 → 必然不等 → 判定需全量重写 → 列表实体被当前 `values` 覆盖（数据以调用方传入为准，**无损**），`.list.hash` 随即被 core 值覆盖，后续写入恢复正常增量语义。若 `.list.json` 存在但 `.list.hash` 丢失：新代码读到 `existing_count > 0` 且 `stored_hash == None` → Case 2 命中（需重写），同样一步自愈。
+
+### 4.3 2026-10-28 执行记录（真实 COS HTTP 适配器）
+
+**新增文件**
+| 文件 | 内容 |
+|---|---|
+| `src/signature.rs`（479 非空行 / 9 test） | COS v5 签名纯函数：`sha1_hex` / `hmac_sha1_hex` / `sign_key` / `uri_encode(_path)` / `canonical_pairs` / `http_string` / `string_to_sign` / `sign_request` → `CosSignature`（含 `authorization`）；`CosCredentials` 的 `Debug` 对 SecretKey / SessionToken 打码 |
+| `src/http_object_store.rs`（1209 非空行 / 16 test） | `CosHttpObjectStore`（`reqwest`）+ `CosHttpConfig` + builder；`get`/`put`/`exists`/`delete`/`list_page`/`list_prefix`/`delete_many`/`close` + 状态码映射 |
+
+**trait 扩展（`object_store.rs`，全部带默认实现，不破坏既有后端）**：`ObjectListPage{keys, next_continuation_token}`、`list_page`（默认基于 `list_prefix` 分页）、`delete_many`（默认逐键删除；HTTP 后端覆盖为 `POST /?delete`）、`len`（默认全量列表）、`close`（默认 no-op）。`CosAgentStateStore::close()` 对齐 Java `close()`（Java 关 `COSClient`），其 `delete()` 改走 `delete_many`（对齐 Java `deleteKeys` 1000/批）。
+
+**签名实现要点**
+- `SignKey = hex(HMAC-SHA1(SecretKey, KeyTime))`；`StringToSign = "sha1\n{KeyTime}\n{hex(SHA1(HttpString))}\n"`；`Signature = hex(HMAC-SHA1(SignKey, StringToSign))`——SignKey 以**十六进制字符串**作为 HMAC key（不是原始字节）。
+- `HttpString = lower(method)\n<raw path>\n<canonical params>\n<canonical headers>\n`；params / headers 的 key 转小写、value 全量 percent-encode（`A-Za-z0-9-._~` 以外全部编码，大写十六进制），按编码后 key 升序；列表用 `;` 连接，键值串用 `&`。
+- **path 用未编码原文**（`uri_encode_path` 仅用于请求行）：文档 `HttpString` 里是 `/exampleobject(腾讯云)`，实测其 SHA1 与文档 `8b2751e7…` 一致；若对 path 再编码则对不上。
+- `q-sign-time = q-key-time = "<start>;<end>"`（默认 900s，与 COS SDK 一致），时钟可注入（`ClockFn`，测试固定 `1_700_000_000`）。
+- 临时密钥：`x-cos-security-token` 同时进入签名 header 列表与实际请求头。
+
+**金标向量来源（离线钉住，无网络/无凭证）**
+来源：腾讯云 COS 官方文档《请求签名》 <https://cloud.tencent.com/document/product/436/7778>（中文版「示例一 上传对象」/「示例二 下载对象」，2025-07-03 版；国际版同值）。
+
+| 断言 | 文档值 | 测试 |
+|---|---|---|
+| PUT `SHA1(HttpString)` | `8b2751e77f43a0995d6e9eb9477f4b685cca4172` | `official_put_example_golden_vector` |
+| PUT `Signature` | `3b8851a11a569213c17ba8fa7dcf2abe…1234`（文档把后 6 位打码为 `1234`）→ 实测 `3b8851a11a569213c17ba8fa7dcf2abec6935172` | 同上（同时断言与文档公开的 34 位前缀一致） |
+| GET `SHA1(HttpString)` | `54ecfe22f59d3514fdc764b87a32d8133ea611e6` | `official_get_example_golden_vector` |
+| GET `Signature` | `01681b8c9d798a678e43b685a9f1bba0f6c0…1234` → 实测 `01681b8c9d798a678e43b685a9f1bba0f6c0e012` | 同上 |
+| `HeaderList` / `HttpHeaders`（步骤 4） | `date;host;x-cos-acl;x-cos-grant-read` / `date=Thu%2C%2016%20May…&x-cos-grant-read=uin%3D%22100000000011%22` | `header_canonicalization_sorts_and_lowercases` |
+| `UrlParamList` / `HttpParameters`（步骤 3） | `delimiter;max-keys;prefix` / `delimiter=%2F&max-keys=10&prefix=example-folder%2F` | `parameter_canonicalization_is_sorted_and_encoded_once` |
+| HMAC-SHA1 / SHA1 原语 | RFC 2202（`Jefe`）/ RFC 3174（`abc`） | `hmac_sha1_matches_rfc2202_vectors`、`sha1_matches_rfc3174_vectors` |
+
+> 说明：文档对两条示例的 `Signature` 尾部统一打码为 `…1234`，故测试既断言完整重算值，又断言与文档公开的 34 位前缀一致；`SignKey` 由文档给出（`eb2519b4…` / `937914bf…`），SecretKey 未公开，因此 `SignKey` 派生链靠「RFC 2202 钉 HMAC 原语 + 文档 SignKey 钉 Signature」两端闭合。
+
+**逐条对照 Java（`COSClient` → COS REST）**
+| Java | Rust |
+|---|---|
+| `getObjectMetadata` → 404 判不存在 | `exists` = `HEAD`，404→`false`；`get` = `GET`，404→`Ok(None)` |
+| `getObject` + `readAllBytes` | `get` → `resp.bytes()` |
+| `putObject(PutObjectRequest)` | `PUT`（签名含 `content-type`） |
+| `deleteObject` / `deleteObjects`（1000/批） | `delete`（404→`Ok(())`）/ `delete_many`（`POST /?delete` + `Content-MD5`，1000/批） |
+| `listObjects` marker 循环（`maxKeys=1000`） | `GET /?list-type=2&continuation-token=` + `list_prefix` 自动翻页 |
+| `CosServiceException.statusCode` | `CosError::Service{status,code,message}` + `status()` / `is_not_found()` / `is_signature_error()` |
+| `cosClient.shutdown()` | `close()`（幂等；close 后请求返回 `CosError::Closed`；内存后端默认 no-op） |
+
+**反向验证（逐个回退实现 → 观察 FAILED → 恢复）**
+1. 注释 `canonical_pairs` 的 `sort_by` → `cargo test -p agentscope-extensions-cos signature::` → **5 passed / 4 failed**（`official_put_example_golden_vector`、`official_get_example_golden_vector`、`header_canonicalization_sorts_and_lowercases`、`parameter_canonicalization_is_sorted_and_encoded_once`）→ 已恢复。
+2. `get` 的 `status == 404` 改为 `status.is_client_error()` → `cargo test -p agentscope-extensions-cos forbidden` → **0 passed / 1 failed**（`forbidden_is_an_error_not_a_missing_object`：403 被误判为「对象不存在」）→ 已恢复并重跑全量 73 passed。（首次尝试时被并发会话打断：`agentscope-extensions-model` 正被另一会话改写导致编译失败，恢复后重试成功。）
+
+**依赖与文件层面的副作用**
+- `crates/agentscope-extensions-cos/Cargo.toml` 新增：`reqwest`（workspace）、`hmac 0.12`、`sha1 0.10`、`quick-xml 0.39`、`md5 0.8`、`base64`（workspace）；dev-dep `httpmock 0.7`。**未改根 `Cargo.toml`**（workspace 无 `hmac`/`sha1`/`quick-xml`/`md5` 条目，参照 `agentscope-extensions-channel` 先例写具体版本）。
+- `Cargo.lock` 由 cargo 自动更新（新增上述条目），属依赖引入的必然结果。
+- 新增 2 个源文件 + 3 个 doctest（均 `no_run`）。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-cos` 基线。
@@ -169,16 +268,16 @@
 | 编号 | 优先级 | 缺口 | 归属 |
 |---|---|---|---|
 | P1-① | P1 | **core `needs_full_rewrite` 连续第二次追加仍判全量重写**：存的是整表哈希、比的是 `existing_count` 前缀哈希 → 追加一次后 `stored_hash`=旧整表哈希，下次比前缀（较短）必不等。**Java `ListHashUtil` 同款问题**，故本 crate 与 Java 一致、非本 crate 缺陷 | core（汇总方） |
-| P1-② | P1 | **测试覆盖缺口**：31 test vs Java 62 `@Test`（≈50%）。Java 用 Mockito 精确断言 COS 请求（`putObject` 次数、key 字面量、`deleteObjects` 批量）；Rust 走 `InMemoryCosObjectStore` 抽象层，**无法断言 HTTP/签名层细节**。Java 独有的 `deleteSingleKey_removesStateListAndHash`、`builderRejectsNullClient/BlankBucket`、`close_shutsDownClient`、`putStripsLeadingSlashFromKey`、`emptyNamespace_usesPrefixOnly`、`nullPrefix_treatedAsEmpty`、`prefixWithLeadingSlash_isStripped` 等**在 Rust 侧无对应断言** | 本 crate（P1：可在内存后端上补 key 字面量级断言） |
+| P1-② | P1 | ~~**测试覆盖缺口**：31 test vs Java 62 `@Test`（≈50%）~~ → **已补齐（2026-10-28，第二轮后 105）**：现 **105** test（`httpmock` HTTP 层 + 官方签名金标向量 + key 字面量断言 + 分段/预签名）。Java 独有用例（`putStripsLeadingSlashFromKey`、`deleteSingleKey_removesStateListAndHash`、`builderRejectsNullClient/BlankBucket`、`close_shutsDownClient`、`emptyNamespace_usesPrefixOnly`、`nullPrefix_treatedAsEmpty`、`prefixWithLeadingSlash_isStripped`、批量删除）均有对应：`key_with_leading_slash_is_normalized`、`builder_rejects_missing_object_store`、`builder_rejects_invalid_configuration`、`close_is_idempotent_and_blocks_further_requests`、`empty_namespace_uses_the_prefix_only`、`prefix_edge_cases_normalize_like_java`、`delete_many_*` | 本 crate（**已完成**） |
 | P1-③ | P1 | **`base_store` 无法经 `HarnessAgent::builder().distributed_store(...)` 自动接线**：harness `DistributedStore` 仅 2 字段，而 Java `HarnessAgent` 会用 `distributedStore.baseStore()` 自动注入 `RemoteFilesystemSpec`/`StoreBackedPeriodicGate`/`SkillUsageStore` | harness（汇总方，汇总 tracker §2.2 已裁定） |
 | P0 | — | **无新增 P0**。核心链路（state / base store / snapshot / guard / 组合者）产出契约齐全且行为对齐 | — |
 | P2-① | P2 | Java `AgentStateStore.delete(user,session,key)`（删 3 类对象）与 `close()` 在 Rust core trait 中**不存在** → 本 crate 无法实现 | core（汇总方） |
-| P2-② | P2 | `Cargo.toml` 冗余依赖：`serde` / `futures` / `chrono` 声明但**零使用**（`rg` 确认） | 本 crate |
-| P2-③ | P2 | `CosError::Backend` / `CosError::NotFound` 变体从未被构造（仅 `Config`/`Serialization` 有构造点） | 本 crate |
+| P2-② | P2 | ~~`Cargo.toml` 冗余依赖：`serde` / `futures` / `chrono` 声明但**零使用**~~ → **已删除（2026-10-28）**：三者均从本 crate `Cargo.toml` 移除，复核 `rg '\bserde\b|futures|chrono'` 仅余 `synchronous` 注释子串 | 本 crate（**已完成**） |
+| P2-③ | P2 | ~~`CosError::Backend` / `NotFound` 变体从未被构造~~ → `Backend` 现由 HTTP 传输层构造；新增 `Service{status,code,message}`（403/404 区分）与 `Closed`；`NotFound` 仍无构造点，**保留为预留变体**（`From<CosError> for core Error` 走 `to_string()`，删除会动公开 API） | 本 crate（**部分完成**） |
 | P2-④ | P2 | snapshot id 校验 Rust 比 Java **更严**（Java 仅拒 blank）→ 加固，非缺失，仅需在文档中明示 | 已在本文件 §2 明示 |
 | P2-⑤ | P2 | 根 `[workspace.dependencies]` 的 `object_store = "0.14"` **全 workspace 无 crate 引用**且不在 `Cargo.lock` | 汇总方 |
 | P2-⑥ | P2 | 错误传播语义差异：Java `save`/`get`/`getList` 失败抛 `RuntimeException`；Rust `AgentStateStore` trait 返回 `()` → Rust 侧 `tracing::error!` 吞掉错误（`agent_state_store.rs:134/172/178`） | core trait 签名决定 |
-| P2-⑦ | P2 | 真实适配器还需覆盖 Java 的分页 `listObjects`（marker 循环）与批量 `deleteObjects`（1000/批），Rust `CosObjectStore` 契约（单次 `list_prefix` 全量、逐键 `delete`）与之不等价 | 本 crate trait 设计（§4.2 已登记） |
+| P2-⑦ | P2 | ~~真实适配器还需覆盖分页 `listObjects`（marker 循环）与批量 `deleteObjects`（1000/批）~~ → **已覆盖（2026-10-28）**：trait 新增 `list_page`（`continuation-token`/`max-keys`）与 `delete_many`（HTTP 后端 `POST /?delete` 1000/批 + `Content-MD5`），`list_prefix` 自动翻页、`CosAgentStateStore::delete` 改走批量删除 | 本 crate（**已完成**） |
 
 ### 6.5 勘误列表（原文 → 实际）
 
@@ -198,7 +297,9 @@
 
 ### 6.6 复核结论
 
-- **§4.2「真实 SDK 适配」现状判定**：Rust 侧为**自建抽象 trait**（`CosObjectStore`），**非**自建签名、**非**第三方 SDK；`q-sign-algorithm` 签名**完全未实现**（静态可判定：`rg 'q-sign-algorithm|Hmac|Sha1|sha1|secretId'` 全 crate 零命中）。
+> **本节为 2026-10-22 静态复核快照**（当时零编译、零测试）。其中「真实 SDK 适配」条目已被 §4.3（v5 签名 + HTTP 后端）与 §4.4（分段/预签名/STS）取代，保留作历史对照。
+
+- **§4.2「真实 SDK 适配」现状判定**：Rust 侧为**自建抽象 trait**（`CosObjectStore`），**非**自建签名、**非**第三方 SDK；`q-sign-algorithm` 签名**完全未实现**（静态可判定：`rg 'q-sign-algorithm|Hmac|Sha1|sha1|secretId'` 全 crate 零命中）。**→ 已于 2026-10-28 推翻：`signature.rs` + `http_object_store.rs` 已落地，见 §4.3。**
 - **`list_hash` 收敛到 core**：**属实**。本 crate 无平行实现（`rg 'fn compute_list_hash|fn needs_full_rewrite'` → 零命中），`sha2` 已从 `Cargo.toml` 移除（`git log -S "sha2"` 确认提交 `daa700d`）。
 - **「追加恒全量重写」偏离修复**：**属实**。历史实现经 `git show e01809d:.../agent_state_store.rs` 确认为 `!compute_list_hash(values).starts_with(h)`，全量 SHA-256 无前缀性质 → 恒 `true`；现委托 core 后单次纯追加返回 `false`（回归测试内联保留）。
 - **B 波次统一产出契约**：**5/5 齐全**（`CosDistributedStore` / `CosAgentStateStore` / `CosStore` / `CosSnapshotSpec` / `CosSandboxExecutionGuard`），且均可从 `CosDistributedStore` 访问（`agent_state_store()`/`base_store()`/`sandbox_snapshot_spec()`/`sandbox_execution_guard()` + `shared_*` trait-object 便捷方法）。
@@ -213,3 +314,89 @@
 - **约束 2（禁止）**：**不得让 Java 与 Rust 混部共享同一份带 list 的状态**。否则每次写入都退化为全量重写：功能正确，但增量优化完全失效（性能退化）。
 - **触发条件**：若未来确需混部，再实现 Java `String.hashCode()` 的 32 位截断语义，并在两侧加交叉校验用例。
 - **红线**：不要为了让两侧相等而改 `compute_hash` 的算法——那会让**已落库**的 hash 全部失配，触发一次性全量重写风暴。
+
+## 2026-10-28 执行记录：`DistributedStore` 复合槽位投影（§2.2 / P1-ⓐ 已解决）
+
+### 背景
+
+harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`）与 `SandboxGuard` trait。本 crate 的 `to_harness_distributed_store()` 从「只投 agent_state_store」改为全量投影。
+
+### 投影映射表
+
+| harness 槽位 | 类型 | 来源 | 说明 |
+|---|---|---|---|
+| `agent_state_store` | `Arc<dyn AgentStateStore>` | `self.agent_state_store.clone()` | `CosAgentStateStore`，前缀 `{prefix}state/` |
+| `isolation_scope` | `IsolationScope` | 未设置（builder 默认） | 由调用方在 `HarnessAgent` 侧覆盖 |
+| `base_store` | `Arc<dyn BaseStore>` | `self.base_store.clone()` | `CosStore`，前缀 `{prefix}store/` |
+| `sandbox_snapshot_spec` | `Arc<dyn SandboxSnapshotSpec>` | `self.snapshot_spec.clone()` | `CosSnapshotSpec`，前缀 `{prefix}snapshot/` |
+| `sandbox_execution_guard` | `Arc<dyn SandboxGuard>` | `Arc::new(self.execution_guard.clone())` | `CosSandboxExecutionGuard`；新增 `impl SandboxGuard` |
+
+### 代码改动
+
+- `src/distributed_store.rs::to_harness_distributed_store()`：填满 5 槽（builder，不用 `..Default::default()`）。
+- `src/guard.rs`：`impl SandboxGuard for CosSandboxExecutionGuard`，四方法委托固有方法（仍委托 harness `SandboxExecutionGuard`，未改行为）。
+- 测试：`src/distributed_store.rs::harness_projection_fills_every_composite_slot`。
+
+### 验证
+
+`cargo test -p agentscope-extensions-cos` → **74 passed / 0 failed**（第一轮基线；第二轮后为 **105 passed**，见 §4.4）。
+
+### 未完成 / 语义差异
+
+- 无留空槽位。
+- 分布式协调仍是 strategy-deferred（guard 只是 harness 进程内计数 + 保留 object store），与 Java COS `noop()` 默认相比属**增强**，语义未变。
+
+## 2026-10-28 第二轮执行记录：分段上传 / 预签名 URL / STS
+
+### 新增文件
+
+| 文件 | 规模 | 内容 |
+|---|---|---|
+| `src/multipart.rs`（新） | 230 非空行 / 8 test | 常量（阈值/分片尺寸上下限/最大分片数/默认并发）、`MultipartPlan::range`、`plan_parts`、`normalize_etag`、`complete_multipart_body` |
+| `src/presign.rs`（新） | 217 非空行 / 6 test | `presign_url`（复用 `signature::sign_request` 的 `authorization`）、`resolve_expire_secs`、`MAX_PRESIGN_EXPIRE_SECS` |
+
+### 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/http_object_store.rs` | `CosHttpConfig`/builder 新增 `multipart_threshold`/`multipart_part_size`/`multipart_concurrency` + 校验；`put` 阈值切换；`put_multipart` + `initiate/upload_part/complete/abort`；`presign_get`/`presign_put`；`with_credentials`；`query_string`/`escape_xml` 改 `pub(crate)`；+17 test |
+| `src/lib.rs` | `pub mod multipart; pub mod presign;` + 常量/`MAX_PRESIGN_EXPIRE_SECS` 导出；文档段重写 |
+| `src/distributed_store.rs` | 删除 test 模块内无用的 `SandboxGuard` 导入（清 clippy 告警，与本轮功能无关） |
+| `Cargo.toml` | **未改**（无新依赖：`tokio` 的 `JoinSet` 已在 `rt-multi-thread` 内） |
+
+### 请求序列与断言维度
+
+| 步骤 | 请求 | 签名 `q-url-param-list` | 断言 |
+|---|---|---|---|
+| initiate | `POST /{key}?uploads`（`Content-Type: application/octet-stream`） | `uploads` | 响应 XML `<UploadId>`；缺失/空 → `CosError::Backend("… no UploadId")` |
+| part | `PUT /{key}?partNumber=N&uploadId=..` | `partnumber;uploadid` | 请求体逐字节相等；响应头 `ETag` 去引号（`normalize_etag`）；缺失 ETag → Backend 错误 |
+| complete | `POST /{key}?uploadId=..`（`application/xml`） | `uploadid` | 完成 XML 按 partNumber 升序、`<ETag>"…"</ETag>` 引号化并 XML 转义 |
+| abort | `DELETE /{key}?uploadId=..` | `uploadid` | 分片/完成失败后必发；`404 NoSuchUpload` 视为成功；abort 自身失败仅 `tracing::warn!`，不掩盖原错误 |
+
+### 测试清单（新增 31 = 8 + 6 + 17）
+
+- `multipart::tests`（8）：`defaults_match_the_java_transfer_manager`、`configured_part_size_is_used_when_it_covers_the_object`、`part_size_grows_to_stay_within_the_part_count_cap`、`plan_rejects_illegal_part_sizes_and_bodies`、`plan_accepts_boundary_sizes`、`etags_are_unquoted`、`complete_body_lists_parts_in_order`、`complete_body_escapes_etags`。
+- `presign::tests`（6）：`url_reuses_the_authorization_chain`、`only_host_is_signed`、`method_changes_the_signature`、`extra_parameters_are_signed_and_encoded`、`object_paths_are_encoded_for_the_url`、`expiry_is_validated_and_defaults_to_the_client_setting`。
+- `http_object_store::tests`（17）：`put_below_threshold_uses_a_single_put`、`put_at_threshold_switches_to_multipart`、`multipart_uploads_sorted_parts_and_completes`（2.5 MiB / 3 片 / 并发 2，逐片字节相等）、`multipart_aborts_when_a_part_fails`、`multipart_aborts_when_complete_is_rejected`、`multipart_abort_tolerates_a_missing_upload`、`multipart_initiate_failure_does_not_abort`、`multipart_initiate_requires_an_upload_id`、`multipart_rejects_an_empty_body`、`multipart_settings_are_validated_and_exposed`、`with_credentials_swaps_the_session_token`、`presign_get_builds_a_complete_signed_url`、`presign_get_signature_is_pinned`（**固定时钟 + 公网域名，整条 URL 字面量钉位**：`…&q-signature=78d1df6ab1f8351625eab6f5f0ea072d382e4dc7`，已用 PowerShell/.NET HMACSHA1/SHA1 **独立重算交叉验证**）、`presign_expiry_is_honoured_and_validated`、`presign_put_signs_the_put_method`、`presign_includes_the_session_token_as_a_query_parameter`、`presign_is_rejected_after_close`。
+
+### 反向验证（逐个回退实现 → 观察 FAILED → 恢复）
+
+| # | 回退 | 结果 |
+|---|---|---|
+| 1 | `put_multipart` 失败路径删掉 `abort_multipart` | `cargo test -p agentscope-extensions-cos multipart_` → **6 passed / 2 failed**（`multipart_aborts_when_a_part_fails`、`multipart_aborts_when_complete_is_rejected`）→ 已恢复 |
+| 2 | `should_use_multipart` 的 `>=` 改 `>` | `put_at_threshold_switches_to_multipart` → **0 passed / 1 failed** → 已恢复（Java `shouldUseMultipartUpload` 也是 `>=`） |
+| 3 | `etags.sort_by_key(part_number)` 改 `Reverse` | `multipart_uploads_sorted_parts_and_completes` → **0 passed / 1 failed** → 已恢复 |
+| 4 | 预签名 STS token 不再进 query 参数 | `cargo test -p agentscope-extensions-cos presign_` → **5 passed / 1 failed**（`presign_includes_the_session_token_as_a_query_parameter`）→ 已恢复 |
+
+### 验证结果
+
+- `cargo test -p agentscope-extensions-cos` → **105 passed / 0 failed / 0 ignored**（+3 个 `no_run` doctest，0 failed）
+- `cargo clippy -p agentscope-extensions-cos --all-targets` → 本 crate **零告警**；`cargo fmt -p agentscope-extensions-cos -- --check` → **通过**
+
+### 语义差异 / 未做（如实记录）
+
+- **Java 模块自身没有 multipart / presign 代码**（只用 `COSClient` 单次 `putObject`，单对象上限 5 GiB）。因此本次不是“照搬 Java 实现”，而是**对齐 Java 侧所依赖的 SDK 默认行为**（`TransferManagerConfiguration` / `TransferManagerUtils` 字节码证据见 §3.3.1）+ COS 服务端限制。
+- 并发默认 1（对齐 `createDefaultExecutorService` 的单线程池）；需要并行时显式 `multipart_concurrency(n)`（`JoinSet` 按 chunk 限并发）。
+- 只签 `host`（预签名），因此不支持需要客户端发送自定义头的场景；`response-*` 类参数可经 `presign_url` 的 `params` 扩展（`presign_get/put` 目前不暴露——保持 API 最小）。
+- STS **不做自动刷新**：token 过期后调用方需 `with_credentials(...)` 换新（共享连接池与 `closed` 标志）。
+- 无 `ListParts` 断点续传、无分片级重试（失败即 abort 回滚）、无上传进度回调、`Upload Part`/`Complete` 不发送 `Content-MD5`（COS 文档标可选）；内存峰值约 2× 对象大小（整体副本 + 单片副本），未做真正流式上传。
