@@ -7,11 +7,11 @@
 //! * [`MongodbSandboxExecutionGuard`] — sandbox execution locking,
 //! * [`MongodbSnapshotSpec`] — sandbox workspace snapshots.
 //!
-//! The harness [`DistributedStore`] currently exposes only `agent_state_store` and
-//! `isolation_scope` (see `EXTENSIONS_GAP_TRACKER.md` §2.2), so this type stores the
-//! full component set and projects the sub-set the harness understands via
-//! [`MongodbDistributedStore::to_harness_store`], while keeping the remaining
-//! components accessible through typed accessors for direct wiring.
+//! The harness [`DistributedStore`] carries `agent_state_store` + `isolation_scope` plus the
+//! composite slots `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`
+//! (`EXTENSIONS_GAP_TRACKER.md` §2.2, resolved 2026-10-28). This type stores the full
+//! component set and projects all of it via
+//! [`MongodbDistributedStore::to_harness_store`].
 
 use std::sync::{Arc, Mutex};
 
@@ -184,17 +184,26 @@ impl MongodbDistributedStore {
         Ok(())
     }
 
-    /// Projects the sub-set of components the harness [`DistributedStore`] currently
-    /// models (`agent_state_store` + `isolation_scope`).
+    /// Projects the MongoDB components into the harness [`DistributedStore`].
     ///
-    /// The full component set remains on this type; when the harness `DistributedStore`
-    /// grows the additional fields (tracker §2.2), this projection will be extended.
+    /// The execution-guard slot carries [`MongodbGuardClient`] (the harness
+    /// `SandboxGuard` view of [`MongodbSandboxExecutionGuard`]).
     pub fn to_harness_store(&self) -> DistributedStore {
-        let mut builder = DistributedStore::builder()
-            .agent_state_store(Arc::new(self.agent_state_store.clone()))
-            .isolation_scope(self.isolation_scope);
-        let _ = &mut builder;
-        builder.build()
+        let state: Arc<dyn agentscope_core::state::AgentStateStore> =
+            Arc::new(self.agent_state_store.clone());
+        let base: Arc<dyn agentscope_harness::filesystem::remote::store::BaseStore> =
+            Arc::new(self.base_store.clone());
+        let snapshots: Arc<dyn agentscope_harness::agent::sandbox::SandboxSnapshotSpec> =
+            Arc::new(self.snapshot_spec.clone());
+        let guard: Arc<dyn agentscope_harness::agent::sandbox::SandboxGuard> =
+            self.guard_client.clone();
+        DistributedStore::builder()
+            .agent_state_store(state)
+            .isolation_scope(self.isolation_scope)
+            .base_store(base)
+            .sandbox_snapshot_spec(snapshots)
+            .sandbox_execution_guard(guard)
+            .build()
     }
 }
 
@@ -329,9 +338,9 @@ mod tests {
         let guard = s.sandbox_execution_guard();
         use agentscope_harness::agent::sandbox::SandboxIsolationKey;
         let key = SandboxIsolationKey::new("user", "u");
-        let lease = guard.try_enter(key.clone());
+        let lease = guard.try_enter(key.clone()).await;
         assert!(!lease.is_noop());
-        guard.release(&key);
+        guard.release(&key).await;
     }
 
     #[test]
@@ -339,6 +348,39 @@ mod tests {
         let s = store();
         let harness = s.to_harness_store();
         assert!(harness.agent_state_store.is_some());
+    }
+
+    /// Tracker §2.2 resolved 2026-10-28: base store, snapshot spec and guard are projected;
+    /// the guard is reachable through the object-safe `SandboxGuard` trait.
+    #[tokio::test]
+    async fn harness_projection_fills_every_composite_slot() {
+        use agentscope_harness::agent::sandbox::SandboxGuard as _;
+        use agentscope_harness::filesystem::remote::store::BaseStore as _;
+
+        let s = store();
+        let harness = s.to_harness_store();
+
+        let base = harness.base_store.as_ref().expect("base_store projected");
+        let mut v = serde_json::Map::new();
+        v.insert("projected".to_string(), json!(true));
+        base.put(&["ns".to_string()], "k", v);
+        assert!(base.get(&["ns".to_string()], "k").is_some());
+
+        let spec = harness
+            .sandbox_snapshot_spec
+            .as_ref()
+            .expect("sandbox_snapshot_spec projected");
+        assert_eq!(spec.build("projected").expect("build").id(), "projected");
+
+        let guard = harness
+            .sandbox_execution_guard
+            .as_ref()
+            .expect("sandbox_execution_guard projected");
+        let key = agentscope_harness::agent::sandbox::SandboxIsolationKey::new("user", "u");
+        let lease = guard.try_enter(key.clone()).await;
+        assert!(!lease.is_noop());
+        assert!(guard.is_held(&key));
+        guard.release(&key).await;
     }
 
     #[test]

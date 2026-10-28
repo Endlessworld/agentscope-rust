@@ -59,8 +59,8 @@
 - `impl agentscope_harness::filesystem::remote::store::BaseStore`（`store.rs:122`）—— `get/put/put_if_version/search/delete`；`StoreItem{key,value,version}`（`harness/src/filesystem/remote/store.rs:21`），`version` 从 1 起、0=未知。
 - `impl agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient`（`snapshot.rs:86`）—— `upload/download/exists`。
 - `impl agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec`（`snapshot.rs:148`）—— `build(snapshot_id)`。
-- `agentscope_harness::agent::sandbox::SandboxExecutionGuard` 是**具体 struct**（`harness/src/agent/sandbox/guard.rs:13`），非 trait → 通过 `MongodbGuardClient`（`sandbox_guard.rs:372`）镜像其方法供 harness 直接使用。**勘误**：`harness/src/agent/sandbox/mod.rs:19` 中 `mod guard;` 为**私有**，`sandbox::guard::SandboxExecutionGuard` 路径**不可公开引用**；公开路径是 `agentscope_harness::agent::sandbox::SandboxExecutionGuard`（`mod.rs:31` 重导出）。本 crate `lib.rs:15` / `distributed_store.rs:170` 的 rustdoc 链接仍指向私有路径 `sandbox::guard::SandboxExecutionGuard`（rustdoc 会解析失败，属文档瑕疵）。
-- `agentscope_harness::agent::distributed_store::DistributedStore` 是**具体 struct**（`harness/src/agent/distributed_store.rs:14`，仅 `agent_state_store` + `isolation_scope`）→ `MongodbDistributedStore::to_harness_store()` 投影子集，其余组件经类型化访问器直连。
+- `agentscope_harness::agent::sandbox::SandboxExecutionGuard` 是**具体 struct**（`harness/src/agent/sandbox/guard.rs:13`），但 harness 另有 `SandboxGuard` trait（`guard.rs:14`，方法 `try_enter`/`release`/`is_held`/`active_count`）→ **已解决（2026-10-28）**：`MongodbGuardClient`（`sandbox_guard.rs`）已 `impl SandboxGuard`（四方法委托固有方法），并经 `to_harness_store()` 投进 `sandbox_execution_guard` 槽。**勘误**：`harness/src/agent/sandbox/mod.rs:19` 中 `mod guard;` 为**私有**，`sandbox::guard::SandboxExecutionGuard` 路径**不可公开引用**；公开路径是 `agentscope_harness::agent::sandbox::SandboxExecutionGuard`（`mod.rs:31` 重导出）。
+- `agentscope_harness::agent::distributed_store::DistributedStore` 是**具体 struct**（`harness/src/agent/distributed_store.rs:14`），**2026-10-28 起含 5 槽**：`agent_state_store` / `isolation_scope` / `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard` → `MongodbDistributedStore::to_harness_store()` 已**全量投影**（详见文末执行记录）。
 - `SandboxIsolationKey` 公开路径 `agentscope_harness::agent::sandbox::SandboxIsolationKey`（`harness/src/agent/sandbox/key.rs:11`）。
 
 ## 3. 详细缺口清单
@@ -242,6 +242,37 @@
    - **`close()` / 连接所有权 / `objectMapper` 注入**：harness/core 无对应语义，不迁移。
    - **`supportsVersioning` / `getVersioned`**：**已上提为 core trait 方法**（commit `9a8fd07`，2026-10-19），本 crate `state_store.rs` 已实装 → 见 §4.1 复核节勘误 #8。
    - **`_cache: Arc<Mutex<()>>` 占位**：对应 Java volatile double-checked 缓存的影子字段，不缓存任何值；保留以备后续 harness 扩展。
+
+## 2026-10-28 执行记录：`DistributedStore` 复合槽位投影（§4.2 已解决）
+
+### 背景
+
+harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`）与 `SandboxGuard` trait。本 crate 的 `to_harness_store()` 从「投影子集」改为全量投影。
+
+### 投影映射表
+
+| harness 槽位 | 类型 | 来源 | 说明 |
+|---|---|---|---|
+| `agent_state_store` | `Arc<dyn AgentStateStore>` | `Arc::new(self.agent_state_store.clone())` | `MongodbAgentStateStore`（含 SESSION 级联删快照回调） |
+| `isolation_scope` | `IsolationScope` | 字段 `isolation_scope` | 默认 `Session`，`with_isolation_scope` 可覆盖 |
+| `base_store` | `Arc<dyn BaseStore>` | `Arc::new(self.base_store.clone())` | `MongodbStore` |
+| `sandbox_snapshot_spec` | `Arc<dyn SandboxSnapshotSpec>` | `Arc::new(self.snapshot_spec.clone())` | `MongodbSnapshotSpec` |
+| `sandbox_execution_guard` | `Arc<dyn SandboxGuard>` | `self.guard_client.clone()`（`Arc<MongodbGuardClient>`） | MongoDB 锁；新增 `impl SandboxGuard for MongodbGuardClient` |
+
+### 代码改动
+
+- `src/distributed_store.rs::to_harness_store()`：填满 5 槽（builder，不用 `..Default::default()`；同时删除原先无意义的 `let _ = &mut builder;`）。
+- `src/sandbox_guard.rs`：`impl SandboxGuard for MongodbGuardClient`，四方法委托固有方法（**不改行为**；`try_enter` 失败仍降级 `SandboxLease::noop()`，租约仍由 `leases` 表持有）。同步更新该类型文档（原写「无法 impl」）。
+- 测试：`src/distributed_store.rs::harness_projection_fills_every_composite_slot`。
+
+### 验证
+
+`cargo test -p agentscope-extensions-mongodb` → **80 passed / 0 failed**。
+
+### 未完成 / 语义差异
+
+- 无留空槽位。
+- 已知既有语义：`MongodbGuardClient::try_enter` 用 `futures::executor::block_on` 驱动 async 锁，**不得在 current-thread runtime 内调用**（既有设计，本次未改）。
 4. **非阻塞文档/埋点项**：`lib.rs` doc 表述与 `MongodbGuardClient` 实际（镜像方法，非 trait 实现）不符，且 rustdoc 链接指向私有模块路径 `sandbox::guard::SandboxExecutionGuard`；`client.rs` 无 `tracing` 埋点（`snapshot.rs` 已有 4 处）。
 5. **后续建议**：真实驱动接入后，将 `chunkSize` 作为 `GridFSBucket` 参数（当前固定 255KB 默认值），并验证 `uploadDate`/`metadata` 在真驱动下的字节级一致。
 6. **2026-10-22 静态复核新增待办**：① builder `ttl_days` 生效（§3.3，P1）——**已于 2026-10-26 完成**；② guard `database_name` 生效（§3.3，P1）——**已于 2026-10-26 完成**；③ 级联删快照的跨 crate 契约（Rust harness 需提供写 `states._sandbox_state.json` 的 `SessionSandboxStateStore` 等价物，或改由本 crate 直接管理快照 id，P1，**仍未解决**）；④ `MongodbGuardClient` 与 harness `SandboxLease` 的释放闭环（§3.3，P2，**仍未解决**）。

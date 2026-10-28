@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentscope_core::error::{Error, Result};
-use agentscope_harness::agent::sandbox::{SandboxIsolationKey, SandboxLease};
+use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey, SandboxLease};
 use serde_json::{json, Map};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
@@ -207,9 +207,8 @@ impl MongodbSandboxExecutionGuard {
     }
 
     fn lock_held(&self, lock_id: &str, now: i64) -> bool {
-        // `is_held` is synchronous in the harness trait; consult the in-process
-        // backend directly when available, otherwise assume observable state via a
-        // blocking read.
+        // `is_held` is synchronous in the harness trait; consult the backend with a single
+        // (non-polling) read. This probe is diagnostics-only — acquire/release are async.
         let filter = FindFilter::eq(FIELD_LOCK_ID, json!(lock_id));
         match futures::executor::block_on(self.client.find_one(&self.collection_key, &filter)) {
             Ok(Some(doc)) => doc
@@ -262,19 +261,63 @@ impl MongodbLeaseHandle {
     }
 
     /// Releases the lock, deleting the document only when the token still matches.
-    pub fn release(&mut self) {
+    ///
+    /// Async on purpose: the delete goes through the MongoDB client seam, so it must be
+    /// awaited instead of bridged with `futures::executor::block_on` (which stalls a
+    /// runtime worker and deadlocks a current-thread runtime).
+    pub async fn release_async(&mut self) {
+        self.stop_renewal();
+        let Some((client, collection_key, lock_id, token)) = self.release_parts() else {
+            return;
+        };
+        let filter = FindFilter::eq(FIELD_LOCK_ID, json!(lock_id))
+            .and(FindFilter::eq(FIELD_TOKEN, json!(token)));
+        if let Err(e) = client.delete_one(&collection_key, &filter).await {
+            tracing::warn!("[sandbox-guard] failed to release MongoDB lock {lock_id}: {e}");
+        }
+    }
+
+    fn stop_renewal(&mut self) {
         if let Some(handle) = self.renewal.take() {
             handle.abort();
         }
-        let filter = FindFilter::eq(FIELD_LOCK_ID, json!(self.lock_id.clone()))
-            .and(FindFilter::eq(FIELD_TOKEN, json!(self.token.clone())));
-        let _ = futures::executor::block_on(self.client.delete_one(&self.collection_key, &filter));
+    }
+
+    /// Takes the connection details out of the lease so the release runs exactly once
+    /// (the fields are emptied, so a later `Drop` finds nothing to do).
+    fn release_parts(&mut self) -> Option<(Arc<dyn MongoClient>, String, String, String)> {
+        let lock_id = std::mem::take(&mut self.lock_id);
+        if lock_id.is_empty() {
+            return None;
+        }
+        let token = std::mem::take(&mut self.token);
+        let collection_key = std::mem::take(&mut self.collection_key);
+        Some((self.client.clone(), collection_key, lock_id, token))
     }
 }
 
 impl Drop for MongodbLeaseHandle {
     fn drop(&mut self) {
-        self.release();
+        self.stop_renewal();
+        let Some((client, collection_key, lock_id, token)) = self.release_parts() else {
+            return;
+        };
+        let filter = FindFilter::eq(FIELD_LOCK_ID, json!(lock_id.clone()))
+            .and(FindFilter::eq(FIELD_TOKEN, json!(token)));
+        // `Drop` cannot await: schedule the token-scoped delete on the ambient runtime. If
+        // there is none, the lease TTL (and its TTL index) is the safety valve — never block
+        // the current thread on a driver future.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = client.delete_one(&collection_key, &filter).await;
+                });
+            }
+            Err(_) => tracing::warn!(
+                "[sandbox-guard] dropping MongoDB lease {lock_id} outside a Tokio runtime; \
+                 the lock will expire with its TTL"
+            ),
+        }
     }
 }
 
@@ -375,11 +418,11 @@ fn default_owner() -> String {
 
 /// A per-isolation-key view of a [`MongodbSandboxExecutionGuard`].
 ///
-/// The harness [`agentscope_harness::agent::sandbox::SandboxExecutionGuard`] is a
-/// concrete in-process struct (not a trait), so the MongoDB guard cannot `impl` it.
-/// This adapter instead mirrors the harness guard's method surface
-/// (`try_enter` / `release` / `is_held` / `active_count`) over the distributed
-/// MongoDB lock, so callers can substitute it wherever the local guard would be used.
+/// The harness `SandboxExecutionGuard` is a concrete in-process struct, but the harness also
+/// exposes the pluggable `SandboxGuard` trait. This adapter mirrors the harness guard's
+/// method surface (`try_enter` / `release` / `is_held` / `active_count`) over the
+/// distributed MongoDB lock **and** implements `SandboxGuard`, so it can be handed to
+/// `DistributedStore::sandbox_execution_guard(...)` or used wherever the local guard would.
 #[derive(Clone)]
 pub struct MongodbGuardClient {
     inner: Arc<MongodbSandboxExecutionGuard>,
@@ -404,14 +447,12 @@ impl MongodbGuardClient {
 
     /// Tries to acquire a lease for the given isolation key.
     ///
-    /// Mirrors the harness guard: on acquisition failure it degrades to a no-op
-    /// lease rather than deadlocking the caller.
-    pub fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
-        let guard = self.inner.clone();
-        let acquire_key = key.clone();
-        let handle =
-            futures::executor::block_on(async move { guard.try_enter(&acquire_key).await });
-        match handle {
+    /// Awaits the distributed lock acquisition (which polls with `tokio::time::sleep`). On
+    /// acquisition failure it degrades to a no-op lease rather than deadlocking the caller
+    /// (the harness trait has no error channel; the underlying
+    /// [`MongodbSandboxExecutionGuard::try_enter`] reports the error).
+    pub async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        match self.inner.try_enter(&key).await {
             Ok(lease) => {
                 if let Ok(mut leases) = self.leases.lock() {
                     leases.entry(key.clone()).or_default().push(lease);
@@ -426,16 +467,24 @@ impl MongodbGuardClient {
     }
 
     /// Releases a lease for the given isolation key.
-    pub fn release(&self, key: &SandboxIsolationKey) {
-        if let Ok(mut leases) = self.leases.lock() {
-            if let Some(stack) = leases.get_mut(key) {
-                if let Some(mut lease) = stack.pop() {
-                    lease.release();
+    pub async fn release(&self, key: &SandboxIsolationKey) {
+        let dropped = self
+            .leases
+            .lock()
+            .ok()
+            .and_then(|mut leases| match leases.get_mut(key) {
+                Some(stack) => {
+                    let lease = stack.pop();
+                    if stack.is_empty() {
+                        leases.remove(key);
+                    }
+                    lease
                 }
-                if stack.is_empty() {
-                    leases.remove(key);
-                }
-            }
+                None => None,
+            });
+        if let Some(mut lease) = dropped {
+            // Token-scoped delete, awaited on this task (no blocking bridge).
+            lease.release_async().await;
         }
     }
 
@@ -452,6 +501,30 @@ impl MongodbGuardClient {
             .lock()
             .map(|g| g.values().map(|v| v.len()).sum())
             .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxGuard for MongodbGuardClient {
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        MongodbGuardClient::try_enter(self, key).await
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        MongodbGuardClient::release(self, key).await
+    }
+
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        MongodbGuardClient::is_held(self, key)
+    }
+
+    fn active_count(&self) -> usize {
+        MongodbGuardClient::active_count(self)
+    }
+
+    /// MongoDB lock documents serialise across processes.
+    fn is_distributed(&self) -> bool {
+        true
     }
 }
 
@@ -487,7 +560,7 @@ mod tests {
             &lease.lock_id().to_string(),
             chrono::Utc::now().timestamp_millis()
         ));
-        lease.release();
+        lease.release_async().await;
         assert!(!g.lock_held(
             &lease.lock_id().to_string(),
             chrono::Utc::now().timestamp_millis()
@@ -583,7 +656,7 @@ mod tests {
             .update_one(g.collection_key(), &filter, &update, &Default::default())
             .await
             .unwrap();
-        lease.release();
+        lease.release_async().await;
         // The lock document must survive because the token no longer matches.
         assert!(g
             .client
@@ -597,12 +670,40 @@ mod tests {
     async fn adapter_mirrors_harness_guard_surface() {
         let client = MongodbGuardClient::new(Arc::new(guard()));
         let key = SandboxIsolationKey::new("user", "u1");
-        let lease = client.try_enter(key.clone());
+        let lease = client.try_enter(key.clone()).await;
         assert!(!lease.is_noop());
         assert_eq!(client.active_count(), 1);
         assert!(client.is_held(&key));
-        client.release(&key);
+        client.release(&key).await;
         assert_eq!(client.active_count(), 0);
         assert!(!client.is_held(&key));
+
+        // A MongoDB lock document serialises across processes.
+        assert!(SandboxGuard::is_distributed(&client));
+    }
+
+    /// The harness trait methods are genuinely async: awaiting a trait acquisition and
+    /// release inside a timeout must complete (no `futures::executor::block_on` bridge).
+    #[tokio::test]
+    async fn trait_acquisition_and_release_are_awaitable() {
+        let client = MongodbGuardClient::new(Arc::new(guard()));
+        let key = SandboxIsolationKey::new("session", "awaitable");
+
+        let lease = tokio::time::timeout(
+            Duration::from_millis(500),
+            SandboxGuard::try_enter(&client, key.clone()),
+        )
+        .await
+        .expect("trait acquisition must not deadlock the runtime");
+        assert!(!lease.is_noop());
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            SandboxGuard::release(&client, &key),
+        )
+        .await
+        .expect("trait release must not deadlock the runtime");
+        assert!(!client.is_held(&key));
+        assert_eq!(client.active_count(), 0);
     }
 }
