@@ -19,7 +19,7 @@
 | 编号 | 问题（一句话） | 状态 | 落地方式 / 原因 |
 |---|---|---|---|
 | P0-1 | 租约在重放期间过期：心跳启动时机错误 | ✅ 已修 | `acquire` 后立即启动心跳；replay 失败先停心跳再 release |
-| P0-2 | 每 chunk 一 commit，journal 爆炸 | ◐ 部分 | `model/chunk` 已合并（4KiB / 64 delta / 1s，且 1s 定时落盘）；**快照/segment/retention 未做**，方案见 `docs/session-journal-compaction-design.md` |
+| P0-2 | 每 chunk 一 commit，journal 爆炸 | ✅ 已修 | `model/chunk` 已合并（4KiB / 64 delta / 1s，且 1s 定时落盘）；新增不可变快照 + 指针 CAS 发布 + 尾段重放 + 快照边界回收（S1-S4），见 `docs/session-journal-compaction-design.md` |
 | P0-3 | 租约过期 = 永久 fence | ✅ 已修 | `ensure_owned` 只在 owner/epoch 变化或 sealed 时失败；同 owner 过期可续租 |
 | P0-4 | 心跳一次失败就永久停止 | ✅ 已修 | transient 失败指数退避重试；只有 fenced/sealed 才停止 |
 | P0-5 | `flush` 的 clone-then-clear 丢并发 append | ✅ 已修 | `flush_lock` 串行化 + `InflightBatch` 预留 seq，成功后只确认该 batch |
@@ -41,21 +41,20 @@
 | P1-8 | panic / mutex poisoning 卡死 dispatcher | ✅ 已修 | dispatcher 循环与 ACP prompt 任务 `catch_unwind`；poisoned mutex 用 `lock_state` 恢复 |
 | P1-9 | inbox 租约过长 + 重试过短 | ✅ 已修 | `INBOX_LEASE` 120s → 10s，`ACCEPT_ATTEMPTS` 100 → 400（80ms 退避）；`launch` 失败保留 queued |
 | P1-10 | suspended / external execution 不可恢复 | ✅ 已修 | 私有扩展方法 `_agentscope/session/respond`（ACP 扩展方法须 `_` 前缀）→ `AcpAgentSession::respond` |
-| P1-11 | 投影/缓存无限增长 | ⬜ 未做 | 正解是 P0-2 的快照；直接裁剪会丢 `started`/`inputs` 的去重能力 |
+| P1-11 | 投影/缓存无限增长 | ◐ 部分 | 冷启动不再重放全链（P0-2 快照），但快照里仍带着完整 transcript/`inputs`，进程内内存依旧随会话线性增长；真正封顶需要 transcript 压缩/裁剪策略（会丢内容，需产品决定） |
 | P1-12 | 事件 channel 无界 | ✅ 已修 | 新增 `event_queue::EventQueue`（容量 4096，`Mutex` + `Notify`）：满则丢弃新事件并计数，`AGENT_RESULT` 永不丢；丢弃过 delta 时在 turn 结束前告知客户端 |
 | P1-13 | `model/chunk` 与模型流强耦合 | ✅ 已修 | `MergedChunk` 合并（4KiB / 64 delta / 1s），单次 commit 失败不再逐 token 截断 |
 | P1-14 | 损坏/未知事件让 session 永久打不开 | ✅ 已修 | `visit` 改为「重放可读后缀」；`required=false` 的坏事件跳过；inbox 未知事件忽略；只容忍数据类错误，IO 仍上报 |
 | P1-15 | `Stale committed prefix` 无重基策略 | ✅ 已修 | `flush` 判定 stale 后先 `renew`，再按新 head 重编号未提交事件 + 换新 batch id（最多 3 次） |
 | P2-1…P2-20 | 可观测性/次级风险（20 项） | ◐ 大部分已修 | 15 项已修、5 项部分（P2-3/P2-10/P2-13/P2-16/P2-20），见 §2.3 |
 
-**统计：** P0 13/13 已修（P0-2 部分，待快照/回收）；P1 14/15 已修（P1-11 未做）；P2 15 已修 / 5 部分 / 0 未做。
+**统计：** P0 13/13 已修；P1 14/15 已修（P1-11 部分）；P2 15 已修 / 5 部分 / 0 未做。
 
 ### 0.3 仍未完成（及原因）
 
 | 项 | 为什么还没做 |
 |---|---|
-| **P0-2** journal segment / compaction / retention | 方案已出（`docs/session-journal-compaction-design.md`）：不可变快照 + 指针 CAS 发布 + 尾段重放 + 快照边界回收。分 S1-S4 四阶段，尚未开始实现 |
-| **P1-11** 投影缓存上限 | 正解是 P0-2 的快照，否则裁剪会丢 `started`/`inputs` 的去重能力 |
+| **P1-11** 投影缓存上限 | 冷启动重放已经由 P0-2 吸收，但“内存里的一份 transcript” 仍然随会话增长：封顶必须压缩/丢弃历史内容（丢信息），属于产品策略而非纯性能优化，需单独决定保留多少、如何摘要 |
 | **P1-4** 跨进程幂等 | ACP 的 `PromptRequest` 不携带客户端请求 id，进程重启后的重试仍会产生新 turn。要真正去重需要协议层 request id 或自定义 metadata + journal 持久化 `requestId -> turnId` |
 | **P1-14** repair / quarantine 工具 | 现在坏段只是不再阻断打开，没有显式的「截断到指定 seq / 隔离坏 commit」命令；隔离需要写侧 API 与目录清单（`list_paths` 目前约定 recovery 不使用） |
 | **P2** 其余项 | P2-3（`Drop` 不能 await）、P2-13（blob 懒加载要改 `visit` 签名）、P2-16（chunk 采样）为需先定设计的部分项；P2-10 仅剩其它 crate 的 `lock().unwrap()`；P2-20 的 core `delta_tx` 未改 |

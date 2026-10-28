@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::snapshot::{SessionRetention, SNAPSHOT_EVERY, SNAPSHOT_EVERY_EVENTS};
 use super::{
     session_error, SessionEvent, SessionLog, SessionLogExporter, SessionProjection, Writer,
 };
@@ -202,6 +203,10 @@ struct RecorderState {
     /// Events handed to an in-flight commit but not acknowledged yet.
     inflight: Option<InflightBatch>,
     durable_seq: u64,
+    /// Sequence number of the latest published view snapshot.
+    snapshot_seq: u64,
+    /// Wall-clock millis of the last snapshot attempt (successful or not).
+    snapshot_at_ms: i64,
     failure: Option<String>,
     closed: bool,
     result_status: Option<String>,
@@ -300,6 +305,10 @@ pub struct SessionMetrics {
     pub pending_bytes: usize,
     /// How long the last replay took when this recorder opened.
     pub replay_ms: u64,
+    /// Sequence number of the latest published view snapshot (0 when none).
+    pub snapshot_seq: u64,
+    /// Milliseconds since the last snapshot attempt, `None` when none was made.
+    pub snapshot_age_ms: Option<u64>,
     /// Milliseconds since the lease heartbeat last renewed, `None` when there is no heartbeat.
     pub heartbeat_age_ms: Option<u64>,
     /// The lease duration the heartbeat renews.
@@ -621,6 +630,35 @@ impl SessionRecorder {
                 }
                 Ok(())
             };
+            // The replay below starts from the published snapshot, so events older than it are
+            // not visited. Guard the same two mistakes against the snapshot's own record,
+            // otherwise a reused run/turn id would be accepted just because it is old.
+            if let Ok(Some(snapshot)) = super::snapshot::load_verified(&*log).await {
+                if snapshot.as_of_seq <= head.seq
+                    && log
+                        .commit_at(snapshot.as_of_seq)
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(snapshot.as_of_commit_id.as_str())
+                {
+                    if snapshot.runs.iter().any(|run| run == run_id) {
+                        return Err(session_error(
+                            "Run ID already used; prepare a new execution to resume",
+                        ));
+                    }
+                    if snapshot
+                        .turns
+                        .turns
+                        .iter()
+                        .any(|turn| turn.turn_id == turn_id && turn.status == "completed")
+                    {
+                        return Err(session_error("Turn already completed; use a new turn ID"));
+                    }
+                }
+            }
+
             let (initial, transcript) = super::views::open_views(&*log, &mut inspect).await?;
             let durable_seq = initial.as_of_seq;
             if !initial.uncertain_tool_calls.is_empty() {
@@ -679,6 +717,8 @@ impl SessionRecorder {
             initial,
             state: Mutex::new(RecorderState {
                 durable_seq,
+                snapshot_seq: durable_seq,
+                snapshot_at_ms: now_ms(),
                 previous_state,
                 previous_messages,
                 recorded_messages: recorded,
@@ -890,6 +930,9 @@ impl SessionRecorder {
                         // never fails the execution that produced the facts.
                         let _ = exporter.drain().await;
                     }
+                    // Keep the read path short: a cold start folds the tail after the snapshot
+                    // instead of the whole chain.
+                    self.publish_snapshot_if_due().await;
                     return Ok(());
                 }
                 Err(error) => {
@@ -971,6 +1014,40 @@ impl SessionRecorder {
         }
     }
 
+    /// Publishes a snapshot when enough new facts have been committed since the last one.
+    ///
+    /// Snapshots are the only thing that keeps a long session's *cold start* bounded, but they
+    /// are pure housekeeping: a failure here is logged and retried by a later flush, never
+    /// propagated to the run that produced the facts.
+    async fn publish_snapshot_if_due(&self) {
+        let due = {
+            let state = self.lock();
+            let behind = state.durable_seq.saturating_sub(state.snapshot_seq);
+            let elapsed = now_ms().saturating_sub(state.snapshot_at_ms);
+            behind > 0
+                && (behind >= SNAPSHOT_EVERY_EVENTS || elapsed >= SNAPSHOT_EVERY.as_millis() as i64)
+        };
+        if !due {
+            return;
+        }
+        let outcome = self
+            .log
+            .publish_snapshot(&self.writer, SessionRetention::from_env())
+            .await;
+        let mut state = self.lock();
+        state.snapshot_at_ms = now_ms();
+        match outcome {
+            Ok(Some(seq)) => state.snapshot_seq = seq,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                run = %self.run_id,
+                turn = %self.turn_id,
+                %error,
+                "publishing a session snapshot failed; the journal is still correct"
+            ),
+        }
+    }
+
     /// A point-in-time health snapshot of this recorder.
     ///
     /// Lets a host alert on a lease whose heartbeat stopped (the run would otherwise lose
@@ -992,6 +1069,9 @@ impl SessionRecorder {
             pending_events: state.pending.len(),
             pending_bytes: state.pending_bytes,
             replay_ms: self.replay_ms,
+            snapshot_seq: state.snapshot_seq,
+            snapshot_age_ms: (state.snapshot_at_ms > 0)
+                .then(|| (now_ms().saturating_sub(state.snapshot_at_ms)).max(0) as u64),
             heartbeat_age_ms,
             lease_ms: self.lease.as_millis() as u64,
         }
@@ -2160,6 +2240,62 @@ mod tests {
         // Another run can take the session, which is what a closed recorder promises.
         let next = log.acquire("run-2", lease).await.unwrap();
         log.release(&next).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_long_run_publishes_a_snapshot_and_reports_it() {
+        // Without a snapshot, every cold start replays the whole chain. The recorder publishes
+        // one on its own once enough facts are committed, and reports where it landed.
+        let (log, _storage) = journal().await;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        assert_eq!(recorder.metrics().snapshot_seq, 0);
+
+        for index in 0..SNAPSHOT_EVERY_EVENTS {
+            recorder
+                .append("step/start", &serde_json::json!({ "iteration": index }))
+                .unwrap();
+        }
+        recorder.flush().await.unwrap();
+
+        let metrics = recorder.metrics();
+        assert_eq!(metrics.durable_seq, SNAPSHOT_EVERY_EVENTS);
+        assert_eq!(metrics.snapshot_seq, SNAPSHOT_EVERY_EVENTS);
+        assert!(metrics.snapshot_age_ms.is_some());
+
+        let snapshot = log
+            .snapshot()
+            .await
+            .unwrap()
+            .expect("a snapshot is published");
+        assert_eq!(snapshot.as_of_seq, SNAPSHOT_EVERY_EVENTS);
+        assert!(snapshot.turns.turns.is_empty());
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_keeps_the_duplicate_run_guard_working() {
+        // The replay starts at the snapshot, so a reused run id from before it is only visible
+        // in the snapshot's own record.
+        let (log, _storage) = journal().await;
+        let writer = log.acquire("run-1", LEASE).await.unwrap();
+        let events: Vec<SessionEvent> = (1..=2)
+            .map(|seq| raw(seq, "run/start", Some("run-1"), Some("t1"), "{}"))
+            .collect();
+        log.commit(&writer, "seed", 0, &events).await.unwrap();
+        log.publish_snapshot(&writer, SessionRetention::OFF)
+            .await
+            .unwrap();
+        // The recorder has to take the lease, so the seeding writer releases it first.
+        log.release(&writer).await.unwrap();
+
+        let err =
+            SessionRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, LEASE)
+                .await
+                .err()
+                .expect("a reused run id must still be rejected");
+        assert!(err.to_string().contains("Run ID already used"), "{err}");
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ pub mod migration;
 pub mod models;
 pub mod recorder;
 pub mod recovery;
+pub mod snapshot;
 pub mod state_access;
 pub mod storage;
 pub mod views;
@@ -43,6 +44,10 @@ pub use recorder::{
     RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
 };
 pub use recovery::{abandon_turn, cancel_pending, reconcile};
+pub use snapshot::{
+    SessionRetention, SessionSnapshot, SnapshotPointer, SNAPSHOT_EVERY, SNAPSHOT_EVERY_EVENTS,
+    SNAPSHOT_FORMAT, SNAPSHOT_TRACKED_RUNS,
+};
 pub use state_access::{
     read as read_snapshot, replace as replace_state, update as update_state, Snapshot,
 };

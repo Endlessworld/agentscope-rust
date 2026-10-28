@@ -47,4 +47,14 @@ pub trait AtomicSessionStorage: Send + Sync {
             "This session storage does not support discovery",
         ))
     }
+
+    /// Deletes a value; `Ok(false)` when it was already gone.
+    ///
+    /// Only reclaimed history uses this. A backend without deletion reports an error, and the
+    /// journal then keeps the commits a snapshot already covers.
+    async fn remove(&self, _path: &str) -> crate::error::Result<bool> {
+        Err(session_error(
+            "This session storage does not support deletion",
+        ))
+    }
 }

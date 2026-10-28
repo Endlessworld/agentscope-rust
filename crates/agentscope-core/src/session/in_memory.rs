@@ -63,6 +63,15 @@ impl AtomicSessionStorage for MemorySessionStorage {
         paths.sort();
         Ok(paths)
     }
+
+    async fn remove(&self, path: &str) -> crate::error::Result<bool> {
+        Ok(self
+            .values
+            .lock()
+            .expect("memory session storage poisoned")
+            .remove(path)
+            .is_some())
+    }
 }
 
 /// In-memory session log store keyed by logical identity.

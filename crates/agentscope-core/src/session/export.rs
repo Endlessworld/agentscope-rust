@@ -118,6 +118,23 @@ impl SessionLogExporter {
         const BATCH: usize = 256;
         let name = self.sink.name().to_string();
         let mut cursor = self.log.export_cursor(&name).await?;
+        // History below the floor was reclaimed after a snapshot covered it, so it can no longer
+        // be exported. Skipping it is the only way to keep exporting what came after; the loss
+        // is logged because it is permanent.
+        if let Some(floor) = self.log.reclaimed_floor().await? {
+            if cursor < floor {
+                tracing::warn!(
+                    sink = %name,
+                    cursor,
+                    floor,
+                    "session history below the reclaim floor can no longer be exported"
+                );
+                let head = self.log.head().await?;
+                let next = floor.min(head.seq);
+                self.log.advance_export_cursor(&name, cursor, next).await?;
+                cursor = next;
+            }
+        }
         let mut delivered = 0;
         loop {
             let batch = self.log.read_after(cursor, BATCH).await?;
@@ -372,5 +389,56 @@ mod tests {
                 ("s1".to_string(), "turn/start".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_reclaimed_prefix_is_skipped_instead_of_stalling_the_export() {
+        // Reclaimed events can never be exported again, but that must not wedge the sink: the
+        // cursor jumps to the floor and everything after it is still delivered.
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
+        let log = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let as_log: Arc<dyn SessionLog> = log.clone();
+        let writer = as_log
+            .acquire("run-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let retention = crate::session::SessionRetention {
+            prune: true,
+            min_age: Duration::ZERO,
+        };
+        for batch in 0..6 {
+            let start = as_log.head().await.unwrap().seq;
+            let events: Vec<SessionEvent> = (1..=400u64)
+                .map(|offset| {
+                    let seq = start + offset;
+                    SessionEvent::new(
+                        format!("e{seq}"),
+                        seq,
+                        0,
+                        "turn/start",
+                        Some("run-1".into()),
+                        None,
+                        true,
+                        "{}",
+                    )
+                    .unwrap()
+                })
+                .collect();
+            as_log
+                .commit(&writer, &format!("b{batch}"), start, &events)
+                .await
+                .unwrap();
+            if batch == 2 {
+                as_log.publish_snapshot(&writer, retention).await.unwrap();
+            }
+        }
+        as_log.publish_snapshot(&writer, retention).await.unwrap();
+        assert_eq!(as_log.reclaimed_floor().await.unwrap(), Some(1200));
+
+        let sink = Arc::new(RecordingSink::new("sink-a", None));
+        let exporter = SessionLogExporter::new(as_log.clone(), sink.clone());
+        assert_eq!(exporter.drain().await.unwrap(), 1200);
+        assert_eq!(as_log.export_cursor("sink-a").await.unwrap(), 2400);
+        assert_eq!(exporter.drain().await.unwrap(), 0);
     }
 }

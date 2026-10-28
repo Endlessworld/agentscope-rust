@@ -51,6 +51,8 @@ struct Snapshot {
     projection: SessionProjection,   // stateJson / uncertainToolCalls / activeRuns / verifications
     turns: SessionTurns,             // 含 inputs（去重所需）
     transcript: Transcript,          // 会话可见内容
+    pending: BTreeMap<String, SessionEvent>, // 未决交互（准入/恢复热路径都要）
+    runs: Vec<String>,               // 见过的执行 run id（上限 4096，去重守卫用）
 }
 ```
 
@@ -106,6 +108,42 @@ struct Snapshot {
 
 **建议先做 S1+S2**：立刻拿到「冷启动 O(尾段) + 内存只折叠尾段」，磁盘不变但可观测；
 S3 单独一个提交，带 `AGENTSCOPE_SESSION_RETENTION` 开关，便于回退。
+
+### 4.1 实施结果（S1–S4 已完成）
+
+落地位置：
+
+```text
+crates/agentscope-core/src/session/snapshot.rs    SessionSnapshot / SnapshotPointer / SessionRetention
+crates/agentscope-core/src/session/journal.rs     发布、校验、回收、reclaimed 标记、floor 感知的链游走
+crates/agentscope-core/src/session/views.rs       replay_views 从快照起步；四个单视图读接口都走同一入口
+crates/agentscope-core/src/session/recorder.rs    定量/定时发布 + snapshot_seq/snapshot_age_ms 指标 + 跨快照的去重守卫
+crates/agentscope-core/src/session/export.rs      已回收前缀不再卡死导出
+crates/agentscope-core/src/session/storage.rs     AtomicSessionStorage::remove（默认不支持 = 不回收）
+```
+
+与设计稿的差异（都是实现时发现必须这么做）：
+
+1. **快照额外存 `pending`**：`admission_views`/`recovery_views` 都要 pending 交互表；只存 projection/turns/transcript 会让这两条热路径继续全量重放，快照等于白做。
+2. **快照额外存 `runs`（最近的执行 id，上限 4096）**：recorder 的「Run ID already used」守卫原本看全量事件；从快照起步后就看不到旧事件了，必须把这份名单随快照带走，否则重放旧 run id 会被放过。
+3. **存储需要 `remove` 能力**：`AtomicSessionStorage` 原本只有 read/CAS/list_paths。默认实现返回不支持 → 该后端 `reclaim` 直接跳过（快照仍生效，只不删历史）。已实现：内存、workspace 文件、SQLite；`BaseStore` 后端无删除 API，保留不回收。
+4. **`reclaimed.json` 标记**：删除后写一个单调递增的 floor，链游走据此停住，不再要求链回溯到 seq 0。
+5. **阈值**：`PRUNE_MIN_EVENTS = 1024`（floor 与 head 差不够就不扫）、`PRUNE_MAX_SCAN = 4096`（一轮最多看这么多 commit）、`PRUNE_BATCH = 512`（一轮最多删这么多）；`SNAPSHOT_EVERY_EVENTS = 512` / `SNAPSHOT_EVERY = 60s`。
+
+语义约定（必须知道的行为）：
+
+| 场景 | 行为 |
+|---|---|
+| 快照与链不匹配 / 快照损坏 | 忽略快照，退回全量重放（日志 warn） |
+| 历史已回收且快照不可用 | **报错**`Session history before seq N was reclaimed and its snapshot is unusable`——宁可失败，不能返回缺头部的视图 |
+| `scan(after, through)` 且 `after < floor` | 报错`Session events at or before seq N were reclaimed and cannot be read`（export/fork/迁移靠它说真话） |
+| `visit(0, head)`（重放） | 返回仍可读的后缀（含跨越 floor 的锚点 batch） |
+| exporter 的 cursor 落在 floor 之下 | 告警一次、cursor 跳到 floor 后继续导出（已删事件无法再导出） |
+| `AGENTSCOPE_SESSION_RETENTION` | `off`/`0`/`false`/`no` 关闭删除；数字 = 最小保留天数；默认 30 天 |
+
+**S4 只做了一半**：transcript 的 tool result 摘要化**未实现**——它会丢内容，属于产品决策，不是性能开关；已做的 S4 部分是 export/fork 对快照边界的适配（fork/export_state 走投影，天然兼容；exporter 跳 floor）。
+
+**已验证**：core 360 passed（新增 10 个用例：快照等价性、跨链指针、损坏对象、回收只删旧段、无快照时响亮失败、recorder 发布与指标、跨快照 run 去重、exporter 跳 floor；harness 侧 2 个：快照不写 `.version`/删除、快照跨进程重开）；harness lib 487 passed。
 
 ## 5. 需要留意的兼容点
 

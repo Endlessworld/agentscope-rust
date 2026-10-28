@@ -7,38 +7,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::message::{ContentBlock, Msg, MsgRole, ToolResultBlock};
 use crate::state::TaskVerification;
 
 use super::{session_error, SessionEvent, SessionLog};
 
-/// Folds one committed fact into a view, dropping facts the view cannot decode.
-///
-/// A payload written by a newer version — or a row left by an older one — must not make the
-/// whole session unopenable: inspection and recovery have to work on a history that is merely
-/// *partly* readable. `required` facts still stop recovery, because their loss would change the
-/// meaning of the history rather than just hide a detail.
-fn fold_tolerantly(
-    event: &SessionEvent,
-    fold: &mut impl FnMut(&SessionEvent) -> crate::error::Result<()>,
-) -> crate::error::Result<()> {
-    match fold(event) {
-        Ok(()) => Ok(()),
-        Err(error) if !event.required => {
-            tracing::warn!(
-                seq = event.seq,
-                kind = %event.event_type,
-                %error,
-                "skipping an unreadable session event"
-            );
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
 /// Read-only task and input projection over one committed execution prefix.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTurns {
     pub turns: Vec<Turn>,
     pub inputs: HashMap<String, Vec<Msg>>,
@@ -47,7 +25,8 @@ pub struct SessionTurns {
 }
 
 /// One logical request and its execution status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Turn {
     pub turn_id: String,
     pub run_id: Option<String>,
@@ -84,126 +63,16 @@ impl SessionTurns {
 
     /// Projects turns, inputs and inbox state from a committed prefix.
     pub async fn read(log: &dyn SessionLog) -> crate::error::Result<Self> {
-        let mut ordered: Vec<String> = Vec::new();
-        let mut turns: BTreeMap<String, Turn> = BTreeMap::new();
-        let mut inputs: HashMap<String, Vec<Msg>> = HashMap::new();
-        let mut started = BTreeSet::new();
-        let mut applied = BTreeSet::new();
-
-        let upper = log.head().await?.seq;
-        let mut fold = |event: &SessionEvent| -> crate::error::Result<()> {
-            let data = event.data()?;
-            if event.event_type == "state/restored" {
-                ordered.clear();
-                turns.clear();
-                inputs.clear();
-            }
-            let turn_id = event.turn_id.clone();
-            match event.event_type.as_str() {
-                "turn/cancelled" => {
-                    if let Some(id) = &turn_id {
-                        Self::record_turn(
-                            &mut ordered,
-                            &mut turns,
-                            id,
-                            event.execution_run_id.clone(),
-                            "cancelled",
-                        );
-                    }
-                }
-                "run/start" => {
-                    if let Some(id) = &turn_id {
-                        Self::record_turn(
-                            &mut ordered,
-                            &mut turns,
-                            id,
-                            event.execution_run_id.clone(),
-                            "running",
-                        );
-                    }
-                }
-                "run/end" => {
-                    if let Some(id) = &turn_id {
-                        let status = json_str(&data, "status").unwrap_or_else(|| "unknown".into());
-                        Self::record_turn(
-                            &mut ordered,
-                            &mut turns,
-                            id,
-                            event.execution_run_id.clone(),
-                            &status,
-                        );
-                    }
-                }
-                "input/received" => {
-                    if let Some(id) = &turn_id {
-                        let bucket = inputs.entry(id.clone()).or_default();
-                        for value in data
-                            .get("messages")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default()
-                        {
-                            let msg: Msg = serde_json::from_value(value)?;
-                            if !bucket.iter().any(|existing| existing.id == msg.id) {
-                                bucket.push(msg);
-                            }
-                        }
-                    }
-                }
-                "inbox/started" => {
-                    if let Some(command_id) = json_str(&data, "commandId") {
-                        started.insert(command_id);
-                    }
-                }
-                "inbox/applied" => {
-                    for value in data
-                        .get("commandIds")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default()
-                    {
-                        if let Some(id) = value.as_str() {
-                            applied.insert(id.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
-        };
-        let mut visit = |event: &SessionEvent| fold_tolerantly(event, &mut fold);
-        log.visit(0, upper, &mut visit).await?;
-
-        let turns = ordered
-            .into_iter()
-            .filter_map(|id| turns.remove(&id))
-            .collect();
-        Ok(Self {
-            turns,
-            inputs,
-            started,
-            applied,
-        })
-    }
-
-    fn record_turn(
-        ordered: &mut Vec<String>,
-        turns: &mut BTreeMap<String, Turn>,
-        turn_id: &str,
-        run_id: Option<String>,
-        status: &str,
-    ) {
-        if !turns.contains_key(turn_id) {
-            ordered.push(turn_id.to_string());
-        }
-        turns.insert(
-            turn_id.to_string(),
-            Turn {
-                turn_id: turn_id.to_string(),
-                run_id,
-                status: status.to_string(),
+        let views = replay_views(
+            log,
+            ViewSelection {
+                turns: true,
+                ..ViewSelection::default()
             },
-        );
+            &mut |_| Ok(()),
+        )
+        .await?;
+        Ok(views.turns.unwrap_or_default())
     }
 
     /// Folds one committed event into this projection.
@@ -288,7 +157,8 @@ impl SessionTurns {
 }
 
 /// Rebuildable human/history views. Context replacement never erases earlier messages.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Transcript {
     pub as_of_seq: u64,
     pub messages: Vec<Msg>,
@@ -300,6 +170,21 @@ pub struct Transcript {
 pub(crate) struct TranscriptFold {
     ordered: Vec<String>,
     messages: HashMap<String, Msg>,
+}
+
+impl TranscriptFold {
+    /// Seeds a replay from a snapshot: the message order is the transcript's.
+    pub(crate) fn from_messages(messages: &[Msg]) -> Self {
+        let mut fold = Self::default();
+        for message in messages {
+            if fold.messages.contains_key(&message.id) {
+                continue;
+            }
+            fold.ordered.push(message.id.clone());
+            fold.messages.insert(message.id.clone(), message.clone());
+        }
+        fold
+    }
 }
 
 pub(crate) fn apply_transcript_event(
@@ -351,13 +236,16 @@ pub(crate) fn finish_transcript(fold: TranscriptFold, as_of_seq: u64) -> Transcr
 
 /// Rebuilds the committed transcript up to the current head.
 pub async fn transcript(log: &dyn SessionLog) -> crate::error::Result<Transcript> {
-    let target = log.head().await?.seq;
-    let mut fold = TranscriptFold::default();
-    let mut visit = |event: &SessionEvent| {
-        fold_tolerantly(event, &mut |event| apply_transcript_event(&mut fold, event))
-    };
-    log.visit(0, target, &mut visit).await?;
-    Ok(finish_transcript(fold, target))
+    let views = replay_views(
+        log,
+        ViewSelection {
+            transcript: true,
+            ..ViewSelection::default()
+        },
+        &mut |_| Ok(()),
+    )
+    .await?;
+    Ok(views.transcript.unwrap_or_default())
 }
 
 /// Which views a single replay should build.
@@ -385,16 +273,74 @@ pub(crate) struct SelectedViews {
 ///
 /// `hook` sees each event too, which is how a caller adds its own check (the recorder's
 /// duplicate run/turn guard) without paying for another replay.
+/// Folds the committed prefix into every selected view, starting from the published snapshot
+/// when there is one.
+///
+/// The snapshot is only a cache: it must name a commit that is still on this chain, otherwise a
+/// replay seeded from it would merge facts from two different histories. When the journal has
+/// already reclaimed the history below the snapshot, there is no safe way back, so the read
+/// fails loudly instead of returning views that are silently missing their beginning.
 pub(crate) async fn replay_views(
     log: &dyn SessionLog,
     selection: ViewSelection,
     hook: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
 ) -> crate::error::Result<SelectedViews> {
-    let upper = log.head().await?.seq;
-    let mut turns = selection.turns.then(SessionTurns::default);
-    let mut projection = selection.projection.then(ProjectionFold::default);
-    let mut pending = selection.pending.then(BTreeMap::new);
-    let mut transcript = selection.transcript.then(TranscriptFold::default);
+    let head = log.head().await?;
+    let upper = head.seq;
+    let seed = super::snapshot::load_verified(log).await?;
+    let seed = match seed {
+        Some(snapshot)
+            if snapshot.as_of_seq <= upper
+                && log.commit_at(snapshot.as_of_seq).await?
+                    == Some(snapshot.as_of_commit_id.clone()) =>
+        {
+            Some(snapshot)
+        }
+        Some(snapshot) => {
+            tracing::warn!(
+                as_of_seq = snapshot.as_of_seq,
+                head_seq = upper,
+                "ignoring a session snapshot that does not match the committed chain"
+            );
+            None
+        }
+        None => None,
+    };
+    let start = match &seed {
+        Some(snapshot) => snapshot.as_of_seq,
+        None => {
+            if let Some(floor) = log.reclaimed_floor().await? {
+                if floor > 0 {
+                    return Err(session_error(format!(
+                        "Session history before seq {floor} was reclaimed and its snapshot is unusable"
+                    )));
+                }
+            }
+            0
+        }
+    };
+
+    let mut turns = selection
+        .turns
+        .then(|| seed.as_ref().map(|s| s.turns.clone()).unwrap_or_default());
+    let mut projection = selection.projection.then(|| match &seed {
+        Some(snapshot) => ProjectionFold {
+            state: snapshot.projection.state_json.clone(),
+            uncertain: snapshot.projection.uncertain_tool_calls.clone(),
+            runs: snapshot.projection.active_runs.clone(),
+            results: BTreeMap::new(),
+            verifications: snapshot.projection.verifications.clone(),
+            extensions: Vec::new(),
+        },
+        None => ProjectionFold::default(),
+    });
+    let mut pending = selection
+        .pending
+        .then(|| seed.as_ref().map(|s| s.pending.clone()).unwrap_or_default());
+    let mut transcript = selection.transcript.then(|| match &seed {
+        Some(snapshot) => TranscriptFold::from_messages(&snapshot.transcript.messages),
+        None => TranscriptFold::default(),
+    });
     let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
         let folded = (|| -> crate::error::Result<()> {
             if let Some(turns) = turns.as_mut() {
@@ -425,7 +371,9 @@ pub(crate) async fn replay_views(
             Err(error) => Err(error),
         }
     };
-    log.visit(0, upper, &mut visit).await?;
+    if start < upper {
+        log.visit(start, upper, &mut visit).await?;
+    }
     Ok(SelectedViews {
         turns,
         projection: projection
@@ -507,7 +455,8 @@ pub(crate) async fn open_views(
 }
 
 /// Read-only recovery view. Inspection never repairs records or invokes models/tools.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionProjection {
     pub as_of_seq: u64,
     pub state_json: Option<String>,
@@ -716,13 +665,16 @@ pub(crate) fn finish_projection(
 impl SessionProjection {
     /// Walks a committed prefix and folds state, tool outcomes and live runs.
     pub async fn read(log: &dyn SessionLog) -> crate::error::Result<Self> {
-        let upper = log.head().await?.seq;
-        let mut fold = ProjectionFold::default();
-        let mut visit = |event: &SessionEvent| {
-            fold_tolerantly(event, &mut |event| apply_projection_event(&mut fold, event))
-        };
-        log.visit(0, upper, &mut visit).await?;
-        finish_projection(fold, upper)
+        let views = replay_views(
+            log,
+            ViewSelection {
+                projection: true,
+                ..ViewSelection::default()
+            },
+            &mut |_| Ok(()),
+        )
+        .await?;
+        Ok(views.projection.unwrap_or_default())
     }
 
     /// Restores the projected state, if a checkpoint exists.
@@ -775,14 +727,16 @@ pub async fn continuation_turn(
 pub async fn pending_interactions(
     log: &dyn SessionLog,
 ) -> crate::error::Result<BTreeMap<String, SessionEvent>> {
-    let upper = log.head().await?.seq;
-    let mut result = BTreeMap::new();
-    let mut fold = |event: &SessionEvent| -> crate::error::Result<()> {
-        apply_pending_event(&mut result, event)
-    };
-    let mut visit = |event: &SessionEvent| fold_tolerantly(event, &mut fold);
-    log.visit(0, upper, &mut visit).await?;
-    Ok(result)
+    let views = replay_views(
+        log,
+        ViewSelection {
+            pending: true,
+            ..ViewSelection::default()
+        },
+        &mut |_| Ok(()),
+    )
+    .await?;
+    Ok(views.pending.unwrap_or_default())
 }
 
 /// Folds one `interaction/*` event into a pending-request map.

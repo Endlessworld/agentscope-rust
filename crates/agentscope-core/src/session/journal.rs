@@ -8,11 +8,15 @@
 //! head.json                 Head   (seq, epoch, owner, lease, commit id)
 //! commits/<hash>.json       Commit (immutable, checksummed event batch)
 //! blobs/<hash>              Payload spilled for very large events
+//! snapshots/<hash>.json     SessionSnapshot (immutable fold of a prefix)
+//! snapshot.json             SnapshotPointer (latest published snapshot)
+//! snapshot.previous.json    SnapshotPointer (previous one: retention floor)
+//! reclaimed.json            Lowest sequence number still readable, once history was deleted
 //! writer-seals/<hash>.json  Permanent fence for a writer identity
 //! exports/<hash>.json       Per-sink export watermark
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +24,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::snapshot::{
+    hash_hex, object_path, SessionRetention, SessionSnapshot, SnapshotPointer, SNAPSHOT_FORMAT,
+    SNAPSHOT_POINTER, SNAPSHOT_PREVIOUS,
+};
 use super::{
     session_error, AtomicSessionStorage, Head, SessionEvent, SessionHeader, SessionLog, Writer,
 };
@@ -29,6 +37,19 @@ const MAX_INLINE_PAYLOAD_BYTES: usize = 65_536;
 
 /// How many CAS attempts a contended operation makes before giving up.
 const CAS_ATTEMPTS: usize = 32;
+
+/// Name of the marker recording how far history was reclaimed.
+const RECLAIMED: &str = "reclaimed.json";
+
+/// Commits this far behind the last snapshot are eligible for reclaiming.
+const PRUNE_MIN_EVENTS: u64 = 1024;
+
+/// Upper bound on commit files one reclaim pass examines, so a huge journal never turns a
+/// flush into an unbounded scan.
+const PRUNE_MAX_SCAN: usize = 4096;
+
+/// Deleted commits per reclaim pass; the rest waits for the next snapshot.
+const PRUNE_BATCH: usize = 512;
 
 /// One immutable, checksummed batch of events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,17 +204,23 @@ impl JournalSessionLog {
     /// newest commits — the ones that carry the latest checkpoint — are the ones worth keeping.
     /// Only data failures are tolerated; a transient storage error still surfaces, otherwise a
     /// network hiccup would look like history loss.
+    ///
+    /// `floor` is where reclaiming stopped: everything at or below it was deleted once a
+    /// snapshot covered it, so the walk ends there instead of demanding a chain back to seq 0.
+    /// The third return value is that floor whenever it actually cut the walk short.
     async fn segments_through(
         &self,
         head: &Head,
         after: u64,
         through: u64,
         tolerant: bool,
-    ) -> crate::error::Result<(Vec<String>, bool)> {
+    ) -> crate::error::Result<(Vec<String>, bool, Option<u64>)> {
+        let floor = self.reclaimed_floor().await?;
         let mut ids = VecDeque::new();
         let mut seen = BTreeSet::new();
         let mut expected = head.seq;
         let mut truncated = false;
+        let mut reclaimed = None;
         let mut cursor = head.commit_id.clone();
         while let Some(id) = cursor {
             if !seen.insert(id.clone()) {
@@ -247,20 +274,431 @@ impl JournalSessionLog {
                 ids.push_front(id.clone());
             }
             expected = commit.first_seq.saturating_sub(1);
+            if let Some(floor) = floor {
+                if commit.last_seq <= floor {
+                    // This is the oldest commit left on chain: everything below it was reclaimed
+                    // once the previous snapshot covered it.
+                    reclaimed = Some(floor);
+                    break;
+                }
+            }
             if expected <= after {
                 break;
             }
             cursor = commit.parent;
         }
         if expected > after {
-            if tolerant {
+            if reclaimed.is_some() {
+                if !tolerant {
+                    return Err(session_error(format!(
+                        "Session history at or before seq {} was reclaimed",
+                        reclaimed.unwrap_or_default()
+                    )));
+                }
+                truncated = true;
+            } else if tolerant {
                 truncated = true;
             } else {
                 return Err(session_error("Incomplete committed chain"));
             }
         }
-        Ok((ids.into_iter().collect(), truncated))
+        Ok((ids.into_iter().collect(), truncated, reclaimed))
     }
+
+    // ---------------------------------------------------------------- snapshots (P0-2)
+
+    async fn read_pointer(&self, name: &str) -> crate::error::Result<Option<SnapshotPointer>> {
+        let Some(stored) = self.storage.read(&self.path(name)).await? else {
+            return Ok(None);
+        };
+        let pointer: SnapshotPointer = serde_json::from_slice(&stored.bytes)?;
+        if pointer.format != SNAPSHOT_FORMAT {
+            return Ok(None);
+        }
+        Ok(Some(pointer))
+    }
+
+    /// Reads and verifies the immutable object a pointer names.
+    ///
+    /// Both the checksum and the sequence number are checked: a pointer that survived into a
+    /// copied or forked journal must not seed a replay of a different history.
+    async fn read_snapshot_object(
+        &self,
+        pointer: &SnapshotPointer,
+    ) -> crate::error::Result<SessionSnapshot> {
+        let path = object_path(&self.prefix, &pointer.hash);
+        let stored = self
+            .storage
+            .read(&path)
+            .await?
+            .ok_or_else(|| session_error("Missing published session snapshot"))?;
+        if hash_hex(&stored.bytes) != pointer.hash {
+            return Err(session_error(
+                "Published session snapshot checksum mismatch",
+            ));
+        }
+        let snapshot: SessionSnapshot = serde_json::from_slice(&stored.bytes)?;
+        if snapshot.format != SNAPSHOT_FORMAT || snapshot.as_of_seq != pointer.seq {
+            return Err(session_error(
+                "Published session snapshot does not match its pointer",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    /// The commit id that ends exactly at `seq`, walking back from the head.
+    ///
+    /// Only the commit headers are read, so this stays cheap even for a large journal.
+    async fn commit_id_ending_at(&self, seq: u64) -> crate::error::Result<Option<String>> {
+        let head = self.head().await?;
+        if seq == 0 || seq > head.seq {
+            return Ok(None);
+        }
+        let mut seen = BTreeSet::new();
+        let mut cursor = head.commit_id.clone();
+        while let Some(id) = cursor {
+            if !seen.insert(id.clone()) {
+                return Ok(None);
+            }
+            let path = self.path(&format!("commits/{id}.json"));
+            let Some(stored) = self.storage.read(&path).await? else {
+                return Ok(None);
+            };
+            let header: CommitHeader = serde_json::from_slice(&stored.bytes)?;
+            if header.last_seq == seq {
+                return Ok(Some(id));
+            }
+            if header.last_seq < seq {
+                return Ok(None);
+            }
+            cursor = header.parent;
+        }
+        Ok(None)
+    }
+
+    /// Publishes a snapshot of the current head, then reclaims what the previous one covers.
+    async fn publish_snapshot_locked(
+        &self,
+        writer: &Writer,
+        retention: &SessionRetention,
+    ) -> crate::error::Result<Option<u64>> {
+        let head = self.head().await?;
+        self.ensure_owned(&head, writer).await?;
+        let Some(commit_id) = head.commit_id.clone() else {
+            return Ok(None);
+        };
+        if head.seq == 0 {
+            return Ok(None);
+        }
+        let latest = self.read_pointer(SNAPSHOT_POINTER).await?;
+        if let Some(pointer) = &latest {
+            if pointer.seq == head.seq {
+                return Ok(Some(pointer.seq));
+            }
+        }
+
+        // Fold the head. The replay starts from the previous snapshot, so this only walks the
+        // commits published since — the whole point of keeping one.
+        let previous = match &latest {
+            Some(pointer) => match self.read_snapshot_object(pointer).await {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::warn!(
+                        session = %self.prefix,
+                        %error,
+                        "the previous session snapshot is unreadable; rebuilding from the chain"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut runs = previous
+            .as_ref()
+            .map(|snapshot| snapshot.runs.clone())
+            .unwrap_or_default();
+        let mut seen_runs: HashSet<String> = runs.iter().cloned().collect();
+        let mut collect = |event: &SessionEvent| -> crate::error::Result<()> {
+            if let Some(run) = &event.execution_run_id {
+                if seen_runs.insert(run.clone()) {
+                    runs.push(run.clone());
+                }
+            }
+            Ok(())
+        };
+        let views = super::views::replay_views(
+            self as &dyn SessionLog,
+            super::views::ViewSelection {
+                turns: true,
+                projection: true,
+                pending: true,
+                transcript: true,
+            },
+            &mut collect,
+        )
+        .await?;
+        drop(collect);
+        SessionSnapshot::trim_runs(&mut runs);
+
+        let snapshot = SessionSnapshot {
+            format: SNAPSHOT_FORMAT,
+            as_of_seq: head.seq,
+            as_of_commit_id: commit_id.clone(),
+            turns: views.turns.unwrap_or_default(),
+            projection: views.projection.unwrap_or_default(),
+            pending: views.pending.unwrap_or_default(),
+            transcript: views.transcript.unwrap_or_default(),
+            runs,
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
+        let hash = hash_hex(&bytes);
+        let object = object_path(&self.prefix, &hash);
+        // Immutable and idempotent: a retried publish rewrites identical bytes.
+        if !self.storage.compare_and_set(&object, 0, &bytes).await? {
+            let existing = self.storage.read(&object).await?;
+            match existing {
+                Some(value) if value.bytes == bytes => {}
+                _ => return Err(session_error("Immutable session snapshot conflict")),
+            }
+        }
+
+        // Rotate first: the previous pointer is what reclaiming trusts, and a crash between the
+        // two writes only leaves both pointing at the same (valid) snapshot.
+        if let Some(current) = &latest {
+            let body = serde_json::to_vec(current)?;
+            let path = self.path(SNAPSHOT_PREVIOUS);
+            for _ in 0..CAS_ATTEMPTS {
+                let value = self.storage.read(&path).await?;
+                if let Some(stored) = &value {
+                    let existing: SnapshotPointer = serde_json::from_slice(&stored.bytes)?;
+                    if existing.seq >= current.seq {
+                        break;
+                    }
+                }
+                let expected = value.map(|value| value.version).unwrap_or(0);
+                if self.storage.compare_and_set(&path, expected, &body).await? {
+                    break;
+                }
+            }
+        }
+
+        let pointer = SnapshotPointer {
+            format: SNAPSHOT_FORMAT,
+            seq: head.seq,
+            commit_id,
+            hash,
+            published_at: Self::now_ms(),
+        };
+        let pointer_bytes = serde_json::to_vec(&pointer)?;
+        let pointer_path = self.path(SNAPSHOT_POINTER);
+        for _ in 0..CAS_ATTEMPTS {
+            let value = self.storage.read(&pointer_path).await?;
+            if let Some(stored) = &value {
+                let existing: SnapshotPointer = serde_json::from_slice(&stored.bytes)?;
+                if existing.seq >= head.seq {
+                    return Ok(Some(existing.seq));
+                }
+            }
+            let expected = value.map(|value| value.version).unwrap_or(0);
+            if self
+                .storage
+                .compare_and_set(&pointer_path, expected, &pointer_bytes)
+                .await?
+            {
+                tracing::debug!(
+                    session = %self.prefix,
+                    seq = head.seq,
+                    hash = %pointer.hash,
+                    "published a session snapshot"
+                );
+                break;
+            }
+        }
+
+        if let Some(previous) = &latest {
+            if let Err(error) = self.reclaim(previous.seq, retention).await {
+                // Reclaiming is housekeeping: a failed pass must never fail the run that
+                // produced the facts, and the next snapshot tries again.
+                tracing::warn!(session = %self.prefix, %error, "reclaiming session history failed");
+            }
+        }
+        Ok(Some(head.seq))
+    }
+
+    /// Deletes commits (and their blobs) that an older published snapshot already covers.
+    async fn reclaim(&self, floor: u64, retention: &SessionRetention) -> crate::error::Result<()> {
+        if !retention.prune || floor == 0 {
+            return Ok(());
+        }
+        let head = self.head().await?;
+        if head.seq.saturating_sub(floor) < PRUNE_MIN_EVENTS {
+            return Ok(());
+        }
+        let directory = self.path("commits");
+        let paths = match self.storage.list_paths(&directory).await {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::debug!(
+                    session = %self.prefix,
+                    %error,
+                    "session storage cannot list commits; skipping reclaim"
+                );
+                return Ok(());
+            }
+        };
+        let prefix = format!("{directory}/");
+        let enumerated: Vec<&String> = paths
+            .iter()
+            .filter(|path| path.starts_with(&prefix))
+            .collect();
+        // Blob collection is only safe when every remaining commit was examined.
+        let complete = enumerated.len() <= PRUNE_MAX_SCAN;
+        let oldest = Self::now_ms() - retention.min_age.as_millis() as i64;
+
+        let mut candidates: Vec<(u64, String, BTreeMap<String, String>)> = Vec::new();
+        let mut referenced: HashSet<String> = HashSet::new();
+        for path in &enumerated {
+            let Some(id) = path.rsplit('/').next().map(str::to_string) else {
+                continue;
+            };
+            let commit = match self.read_commit_lite(path).await {
+                Ok(commit) => commit,
+                Err(error) => {
+                    tracing::debug!(path = %path, %error, "skipping an unreadable commit while reclaiming");
+                    continue;
+                }
+            };
+            let batch_newest = commit
+                .events
+                .iter()
+                .map(|event| event.occurred_at)
+                .max()
+                .unwrap_or(0);
+            if commit.last_seq < floor && batch_newest <= oldest {
+                candidates.push((commit.last_seq, id, commit.payload_blobs));
+            } else {
+                referenced.extend(commit.payload_blobs.into_values());
+            }
+        }
+        candidates.sort_by_key(|(seq, _, _)| *seq);
+
+        let mut deleted = 0usize;
+        let mut freed_blobs: Vec<String> = Vec::new();
+        for (seq, id, blobs) in candidates.into_iter().take(PRUNE_BATCH) {
+            let path = format!("{prefix}{id}");
+            match self.storage.remove(&path).await {
+                Ok(_) => {
+                    deleted += 1;
+                    for blob in blobs.into_values() {
+                        if !referenced.contains(&blob) {
+                            freed_blobs.push(blob);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(path = %path, seq, %error, "session commit could not be reclaimed");
+                    break;
+                }
+            }
+        }
+        if deleted == 0 {
+            return Ok(());
+        }
+        self.mark_reclaimed(floor).await?;
+        if complete {
+            self.reclaim_blobs(&freed_blobs).await?;
+        }
+        tracing::info!(
+            session = %self.prefix,
+            deleted,
+            floor,
+            "reclaimed session history covered by a snapshot"
+        );
+        Ok(())
+    }
+
+    async fn reclaim_blobs(&self, candidates: &[String]) -> crate::error::Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let unique: BTreeSet<&String> = candidates.iter().collect();
+        for blob in unique.into_iter().take(PRUNE_BATCH) {
+            let path = self.path(&format!("blobs/{blob}"));
+            if let Err(error) = self.storage.remove(&path).await {
+                tracing::debug!(path = %path, %error, "session payload blob could not be reclaimed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Records how far history was reclaimed; the marker only moves forward.
+    async fn mark_reclaimed(&self, floor: u64) -> crate::error::Result<()> {
+        let path = self.path(RECLAIMED);
+        for _ in 0..CAS_ATTEMPTS {
+            let value = self.storage.read(&path).await?;
+            if let Some(stored) = &value {
+                let marker: ReclaimedMarker = serde_json::from_slice(&stored.bytes)?;
+                if marker.floor >= floor {
+                    return Ok(());
+                }
+            }
+            let bytes = serde_json::to_vec(&ReclaimedMarker { floor })?;
+            let expected = value.map(|value| value.version).unwrap_or(0);
+            if self
+                .storage
+                .compare_and_set(&path, expected, &bytes)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a commit without hydrating payload blobs.
+    async fn read_commit_lite(&self, path: &str) -> crate::error::Result<CommitLite> {
+        let stored = self
+            .storage
+            .read(path)
+            .await?
+            .ok_or_else(|| session_error("Missing committed segment"))?;
+        Ok(serde_json::from_slice(&stored.bytes)?)
+    }
+}
+
+/// The fields a reclaim pass needs; the event payloads stay unparsed.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitHeader {
+    last_seq: u64,
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+/// Reclaim bookkeeping for one commit.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitLite {
+    last_seq: u64,
+    #[serde(default)]
+    events: Vec<CommitLiteEvent>,
+    #[serde(default)]
+    payload_blobs: BTreeMap<String, String>,
+}
+
+/// Only the timestamp is needed to decide whether a batch is old enough to reclaim.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitLiteEvent {
+    #[serde(default)]
+    occurred_at: i64,
+}
+
+/// How far history was reclaimed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReclaimedMarker {
+    floor: u64,
 }
 
 /// Whether a read failure means the bytes are unusable rather than temporarily unreachable.
@@ -569,7 +1007,19 @@ impl SessionLog for JournalSessionLog {
         if after == through {
             return Ok(collected);
         }
-        for id in self.segments_through(&head, after, through, true).await?.0 {
+        let (ids, _truncated, reclaimed) =
+            self.segments_through(&head, after, through, true).await?;
+        if let Some(floor) = reclaimed {
+            if after < floor {
+                // Reclaiming deletes events; a caller that wants them cannot be served from the
+                // journal any more. Saying so beats returning a prefix that silently starts
+                // halfway through the history.
+                return Err(session_error(format!(
+                    "Session events at or before seq {floor} were reclaimed and cannot be read"
+                )));
+            }
+        }
+        for id in ids {
             let commit = self.read_commit(&id).await?;
             for candidate in commit.events {
                 if candidate.seq <= cursor {
@@ -690,6 +1140,47 @@ impl SessionLog for JournalSessionLog {
             }
         }
         Err(session_error("Export cursor contention"))
+    }
+
+    /// Reads the published snapshot, degrading to a full replay when it is unusable.
+    ///
+    /// Corrupt bytes must not brick a session; a storage failure still surfaces.
+    async fn snapshot(&self) -> crate::error::Result<Option<SessionSnapshot>> {
+        let Some(pointer) = self.read_pointer(SNAPSHOT_POINTER).await? else {
+            return Ok(None);
+        };
+        match self.read_snapshot_object(&pointer).await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(error) => {
+                tracing::warn!(
+                    session = %self.prefix,
+                    seq = pointer.seq,
+                    %error,
+                    "ignoring an unreadable published session snapshot"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn commit_at(&self, seq: u64) -> crate::error::Result<Option<String>> {
+        self.commit_id_ending_at(seq).await
+    }
+
+    async fn reclaimed_floor(&self) -> crate::error::Result<Option<u64>> {
+        let Some(stored) = self.storage.read(&self.path(RECLAIMED)).await? else {
+            return Ok(None);
+        };
+        let marker: ReclaimedMarker = serde_json::from_slice(&stored.bytes)?;
+        Ok(Some(marker.floor))
+    }
+
+    async fn publish_snapshot(
+        &self,
+        writer: &Writer,
+        retention: SessionRetention,
+    ) -> crate::error::Result<Option<u64>> {
+        self.publish_snapshot_locked(writer, &retention).await
     }
 }
 
@@ -1006,5 +1497,228 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("authority"), "{err}");
+    }
+
+    // ------------------------------------------------------------ snapshots / reclaiming
+
+    /// A batch of assistant messages: they show up in the transcript, the turns view folds the
+    /// rest, and each one is a separate committed fact.
+    fn history_batch(start_seq: u64, count: u64) -> Vec<SessionEvent> {
+        (1..=count)
+            .map(|offset| {
+                let seq = start_seq + offset;
+                let mut message = crate::message::Msg::assistant(format!("m{seq}"));
+                message.id = format!("m{seq}");
+                SessionEvent::new(
+                    format!("e{seq}"),
+                    seq,
+                    0,
+                    "message/assistant",
+                    Some("run-1".into()),
+                    Some("t1".into()),
+                    true,
+                    serde_json::json!({ "message": message }).to_string(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    async fn commit_history(log: &JournalSessionLog, writer: &Writer, batches: usize, size: u64) {
+        for index in 0..batches {
+            let start = log.head().await.unwrap().seq;
+            log.commit(
+                writer,
+                &format!("batch-{start}"),
+                start,
+                &history_batch(start, size),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn views_of(
+        log: &JournalSessionLog,
+    ) -> (
+        crate::session::SessionProjection,
+        crate::session::Transcript,
+        crate::session::SessionTurns,
+    ) {
+        (
+            crate::session::SessionProjection::read(log).await.unwrap(),
+            crate::session::transcript(log).await.unwrap(),
+            crate::session::SessionTurns::read(log).await.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reads_the_same_views_as_a_full_replay() {
+        let (_storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        commit_history(&log, &writer, 3, 40).await;
+        let before = views_of(&log).await;
+
+        let published = log
+            .publish_snapshot(&writer, SessionRetention::OFF)
+            .await
+            .unwrap();
+        assert_eq!(published, Some(120));
+        let snapshot = log.snapshot().await.unwrap().expect("snapshot published");
+        assert_eq!(snapshot.as_of_seq, 120);
+        assert_eq!(snapshot.transcript.messages.len(), 120);
+
+        // The tail is what a reader walks; the head of the history comes from the snapshot.
+        commit_history(&log, &writer, 1, 10).await;
+        let after = views_of(&log).await;
+        assert_eq!(after.0.as_of_seq, 130);
+        assert_eq!(
+            &after.0.uncertain_tool_calls,
+            &before.0.uncertain_tool_calls
+        );
+        assert_eq!(after.1.messages.len(), 130);
+        assert_eq!(after.2.turns.len(), before.2.turns.len());
+        assert_eq!(after.1.messages[0].text_content(), "m1");
+        assert_eq!(after.1.messages[129].text_content(), "m130");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_from_another_chain_is_ignored() {
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        commit_history(&log, &writer, 2, 20).await;
+        let before = views_of(&log).await;
+        log.publish_snapshot(&writer, SessionRetention::OFF)
+            .await
+            .unwrap();
+
+        // A pointer that names a commit which is not on this chain must not seed a replay.
+        let pointer_path = "agents/a/sessions/u/s1/snapshot.json";
+        let stored = storage.read(pointer_path).await.unwrap().unwrap();
+        let mut pointer: SnapshotPointer = serde_json::from_slice(&stored.bytes).unwrap();
+        pointer.commit_id =
+            "0000000000000000000000000000000000000000000000000000000000000000".into();
+        assert!(storage
+            .compare_and_set(
+                pointer_path,
+                stored.version,
+                &serde_json::to_vec(&pointer).unwrap()
+            )
+            .await
+            .unwrap());
+
+        assert_eq!(views_of(&log).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_snapshot_object_falls_back_to_a_full_replay() {
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        commit_history(&log, &writer, 2, 20).await;
+        let before = views_of(&log).await;
+        let published = log
+            .publish_snapshot(&writer, SessionRetention::OFF)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published, 40);
+
+        let pointer: SnapshotPointer = serde_json::from_slice(
+            &storage
+                .read("agents/a/sessions/u/s1/snapshot.json")
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        let object = object_path("agents/a/sessions/u/s1", &pointer.hash);
+        let stored = storage.read(&object).await.unwrap().unwrap();
+        assert!(storage
+            .compare_and_set(&object, stored.version, b"{\"format\":1,\"asOfSeq\":40}")
+            .await
+            .unwrap());
+
+        assert!(log.snapshot().await.unwrap().is_none());
+        assert_eq!(views_of(&log).await, before);
+    }
+
+    #[tokio::test]
+    async fn reclaiming_deletes_only_history_an_older_snapshot_covers() {
+        let (_storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        commit_history(&log, &writer, 6, 200).await;
+        let before = views_of(&log).await;
+        let retention = SessionRetention {
+            prune: true,
+            min_age: Duration::ZERO,
+        };
+        // First snapshot: no predecessor, so nothing may be deleted yet.
+        log.publish_snapshot(&writer, retention).await.unwrap();
+        let commits = "agents/a/sessions/u/s1/commits";
+        assert_eq!(log.reclaimed_floor().await.unwrap(), None);
+
+        commit_history(&log, &writer, 6, 200).await;
+        assert_eq!(log.head().await.unwrap().seq, 2400);
+        // Second snapshot: the first one becomes the reclaim floor.
+        log.publish_snapshot(&writer, retention).await.unwrap();
+
+        assert_eq!(log.reclaimed_floor().await.unwrap(), Some(1200));
+        let mut remaining = log.storage.list_paths(commits).await.unwrap();
+        remaining.retain(|path| path.starts_with(&format!("{commits}/")));
+        // The 5 commits below 1200 are gone; the one ending at the floor is the anchor.
+        assert_eq!(remaining.len(), 7, "{remaining:?}");
+
+        // Reading still reproduces the same views: the snapshot covers what was deleted.
+        let after = views_of(&log).await;
+        assert_eq!(after.0.uncertain_tool_calls, before.0.uncertain_tool_calls);
+        assert_eq!(after.1.messages.len(), 2400);
+        assert_eq!(after.1.messages[0].text_content(), "m1");
+        assert_eq!(after.2, before.2);
+
+        // A replay from seq 0 keeps what is still readable instead of failing. The anchor batch
+        // ends exactly at the floor, so its events are still on disk and still visited; the gap
+        // below it is reported by `scan` (below) and covered by the snapshot.
+        let mut visited: Vec<u64> = Vec::new();
+        log.visit(0, 2400, &mut |event| {
+            visited.push(event.seq);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(visited.first(), Some(&1001));
+        assert_eq!(visited.last(), Some(&2400));
+
+        // An event-level read of reclaimed history says so instead of returning a short prefix.
+        let err = log.scan(0, 2400).await.unwrap_err();
+        assert!(err.to_string().contains("were reclaimed"), "{err}");
+        assert_eq!(log.scan(1200, 2400).await.unwrap().len(), 1200);
+    }
+
+    #[tokio::test]
+    async fn reclaimed_history_without_a_usable_snapshot_fails_loudly() {
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        commit_history(&log, &writer, 6, 200).await;
+        let retention = SessionRetention {
+            prune: true,
+            min_age: Duration::ZERO,
+        };
+        log.publish_snapshot(&writer, retention).await.unwrap();
+        commit_history(&log, &writer, 6, 200).await;
+        log.publish_snapshot(&writer, retention).await.unwrap();
+        assert_eq!(log.reclaimed_floor().await.unwrap(), Some(1200));
+
+        // Losing the snapshot after the history was deleted must not silently return views that
+        // are missing their first 1200 events.
+        let pointer_path = "agents/a/sessions/u/s1/snapshot.json";
+        let stored = storage.read(pointer_path).await.unwrap().unwrap();
+        storage.remove(pointer_path).await.unwrap();
+        assert!(stored.version > 0);
+
+        let err = crate::session::SessionProjection::read(&log)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reclaimed"), "{err}");
     }
 }

@@ -158,6 +158,31 @@ impl AtomicSessionStorage for SqliteSessionStorage {
         .await
         .map_err(|error| session_error(format!("Journal discovery task failed: {error}")))?
     }
+
+    async fn remove(&self, path: &str) -> crate::Result<bool> {
+        if !self.database.exists() {
+            return Ok(false);
+        }
+        let database = self.database.clone();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&database)?;
+            let affected = connection
+                .execute(
+                    "DELETE FROM session_objects WHERE path = ?1",
+                    rusqlite::params![path],
+                )
+                .map_err(|error| {
+                    session_error(format!(
+                        "Journal delete failed: {}: {error}",
+                        database.display()
+                    ))
+                })?;
+            Ok::<bool, crate::Error>(affected > 0)
+        })
+        .await
+        .map_err(|error| session_error(format!("Journal delete task failed: {error}")))?
+    }
 }
 
 /// Opens a connection with the journal pragmas and schema applied.

@@ -57,7 +57,10 @@ impl WorkspaceSessionStorage {
     /// Locking them would also retain one lock entry per event forever, so a long session grew
     /// with its journal even after it stopped executing.
     fn needs_cas_lock(path: &str) -> bool {
-        !path.contains("/commits/") && !path.contains("/blobs/") && !path.contains("/writer-seals/")
+        !path.contains("/commits/")
+            && !path.contains("/blobs/")
+            && !path.contains("/snapshots/")
+            && !path.contains("/writer-seals/")
     }
 
     fn version_path(path: &str) -> String {
@@ -114,7 +117,7 @@ impl WorkspaceSessionStorage {
         }
         let content = String::from_utf8(bytes.to_vec())
             .map_err(|_| agentscope_core::Error::Agent("session values must be UTF-8".into()))?;
-        if path.contains("/commits/") || path.contains("/blobs/") {
+        if path.contains("/commits/") || path.contains("/blobs/") || path.contains("/snapshots/") {
             // Immutable, content-addressed objects are written once. Their bytes are the
             // checksum, so a lost acknowledgement can be resolved by re-reading; writing a
             // sibling `.version` file for each commit doubles the journal's file count and
@@ -303,6 +306,21 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
             .collect();
         paths.sort();
         Ok(paths)
+    }
+
+    async fn remove(&self, path: &str) -> crate::Result<bool> {
+        let ctx = RuntimeContext::new();
+        let existed = self.fs.exists(&ctx, path).await?;
+        if existed {
+            let _ = self.fs.delete(&ctx, path).await;
+        }
+        // A stale version marker would make the next write of the same path look newer than it
+        // is, so it goes with the value.
+        let version_path = Self::version_path(path);
+        if self.fs.exists(&ctx, &version_path).await? {
+            let _ = self.fs.delete(&ctx, &version_path).await;
+        }
+        Ok(existed)
     }
 }
 
@@ -725,6 +743,95 @@ mod tests {
         assert!(!storage.compare_and_set(path, 0, b"payload").await.unwrap());
         assert!(storage.compare_and_set(path, 0, b"other").await.is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_objects_and_marker_files_behave_like_the_rest_of_the_journal() {
+        // Snapshot objects are content-addressed like commits, so they must not grow a sibling
+        // `.version`; the pointers and the reclaim marker are mutable and reclaiming has to be
+        // able to delete them again.
+        let dir = temp_dir("snapshot_objects");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let storage = WorkspaceSessionStorage::new(Arc::clone(&fs));
+        let ctx = RuntimeContext::new();
+
+        let object = "s1/snapshots/deadbeef.json";
+        assert!(storage.compare_and_set(object, 0, b"{}").await.unwrap());
+        assert!(!fs
+            .exists(&ctx, "s1/snapshots/deadbeef.json.version")
+            .await
+            .unwrap());
+
+        let pointer = "s1/snapshot.json";
+        assert!(storage.compare_and_set(pointer, 0, b"{}").await.unwrap());
+        assert!(fs.exists(&ctx, "s1/snapshot.json.version").await.unwrap());
+
+        assert!(storage.remove(pointer).await.unwrap());
+        assert!(!fs.exists(&ctx, pointer).await.unwrap());
+        assert!(!fs.exists(&ctx, "s1/snapshot.json.version").await.unwrap());
+        // Removing a reclaimed commit also drops nothing that never existed.
+        assert!(!storage.remove("s1/commits/gone.json").await.unwrap());
+        // A fresh write after a delete starts from version 0 again.
+        assert!(storage
+            .compare_and_set(pointer, 0, b"{\"seq\":1}")
+            .await
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_published_snapshot_survives_a_reopen() {
+        // The whole point of a snapshot is that the *next* process finds it: publish through one
+        // store instance, read it back through a fresh one.
+        let dir = temp_dir("snapshot_reopen");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let ctx = RuntimeContext::new().with_user_id("alice");
+        let retention = agentscope_core::session::SessionRetention::OFF;
+        {
+            let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+            let log = store.open(&key, &ctx).await.unwrap();
+            let writer = log
+                .acquire("run-1", std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            let mut message = agentscope_core::message::Msg::assistant("hello");
+            message.id = "a1".into();
+            let event = agentscope_core::session::SessionEvent::new(
+                "e1",
+                1,
+                0,
+                "message/assistant",
+                Some("run-1".into()),
+                Some("t1".into()),
+                true,
+                serde_json::json!({ "message": message }).to_string(),
+            )
+            .unwrap();
+            log.commit(&writer, "b1", 0, &[event]).await.unwrap();
+            assert_eq!(
+                log.publish_snapshot(&writer, retention).await.unwrap(),
+                Some(1)
+            );
+            log.release(&writer).await.unwrap();
+        }
+        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let reopened = store.open(&key, &ctx).await.unwrap();
+        let snapshot = reopened
+            .snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot survives");
+        assert_eq!(snapshot.as_of_seq, 1);
+        assert_eq!(snapshot.transcript.messages.len(), 1);
+        assert_eq!(snapshot.transcript.messages[0].text_content(), "hello");
+        // The same views come out of a cold read, which now starts at the snapshot.
+        let transcript = agentscope_core::session::transcript(&*reopened)
+            .await
+            .unwrap();
+        assert_eq!(transcript.messages.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

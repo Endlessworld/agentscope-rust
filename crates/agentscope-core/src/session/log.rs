@@ -133,7 +133,6 @@ pub trait SessionLog: Send + Sync {
     async fn export_cursor(&self, _sink: &str) -> crate::error::Result<u64> {
         Ok(0)
     }
-
     /// Advances the export watermark, never regressing it.
     async fn advance_export_cursor(
         &self,
@@ -142,6 +141,40 @@ pub trait SessionLog: Send + Sync {
         _next: u64,
     ) -> crate::error::Result<()> {
         Err(session_error("Export cursor persistence not implemented"))
+    }
+
+    /// The published view snapshot of this journal, if the backend keeps one.
+    ///
+    /// Readers may start from it instead of replaying the whole chain; the returned snapshot is
+    /// only a *candidate* — callers must still check it against the chain (see
+    /// [`commit_at`](SessionLog::commit_at)).
+    async fn snapshot(&self) -> crate::error::Result<Option<super::SessionSnapshot>> {
+        Ok(None)
+    }
+
+    /// The commit id that ends at `seq`, or `None` when this backend cannot tell.
+    ///
+    /// A snapshot is only usable when it was taken on this very chain: a pointer left behind by
+    /// a forked or replaced journal must not seed a replay.
+    async fn commit_at(&self, _seq: u64) -> crate::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The lowest sequence number still readable, when history below it was reclaimed.
+    async fn reclaimed_floor(&self) -> crate::error::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Publishes a snapshot of the current head and reclaims the history it covers.
+    ///
+    /// Only a writer holding the lease may call this: publishing from a fenced writer would race
+    /// the owner. Returns the published sequence number.
+    async fn publish_snapshot(
+        &self,
+        _writer: &Writer,
+        _retention: super::SessionRetention,
+    ) -> crate::error::Result<Option<u64>> {
+        Ok(None)
     }
 }
 
