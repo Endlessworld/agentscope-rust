@@ -1,4 +1,4 @@
-﻿# RAG 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# RAG 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **RAG** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-rag\`（旧记录中的 `E:\local-github\agentscope-java\...` 在本机已不存在，见 §7.3 勘误 2）
@@ -19,9 +19,9 @@
 | Java 规模（实测行数，非空行） | 主代码 **15946** / 测试 **16792**（bailian 1447/1493、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8576/10909） |
 | Rust crate | `crates/agentscope-extensions-rag` |
 | 迁移波次 | A |
-| 当前状态 | **部分完成** — `dify`、`ragflow`、`bailian`、`haystack`、`simple` 子模块的离线链路与外部服务链路均已迁移；2026-10-26 补 `simple` 的 **HTTP embedding 4 件**（openai / dashscope text / dashscope multimodal / ollama）+ `ReaderUtils` + `ImageReader`（新增 60 个离线测试，待主智能体统一 `cargo build`/`cargo test` 验证）；**外部向量库 4 件（ES/Milvus/PgVector/Qdrant）与 `ExternalApiReader` 仍为待办** |
+| 当前状态 | **已完成（Java 侧 RAG 类均已覆盖）** — `dify`、`ragflow`、`bailian`、`haystack`、`simple` 子模块的离线链路与外部服务链路均已迁移；2026-10-26 补 `simple` 的 **HTTP embedding 4 件**（openai / dashscope text / dashscope multimodal / ollama）+ `ReaderUtils` + `ImageReader`（新增 60 个离线测试）；**2026-10-28 两批补齐外部向量库 4 件（`QdrantStore` / `PgVectorStore` 51 测试；`MilvusStore` / `ElasticsearchStore` 60 测试），实测 `436 passed / 0 failed`**；**剩余：`ExternalApiReader`（P2）** |
 
-### 1.1 Rust crate 文件清单（49 个源文件；本轮新增 7 个源文件 2437 行非空 + 60 个内联测试）
+### 1.1 Rust crate 文件清单（53 个源文件；2026-10-28 两批新增 `store/{qdrant,pgvector,milvus,elasticsearch}.rs` 4 个源文件 5587 行非空 + 111 个内联测试）
 
 > 行数口径：非空行（trim 后非空）。上一轮基线为 42 文件 / 10002 行 / 265 测试；本轮新增
 > `embedding/{utils,openai,dashscope,ollama,test_support}.rs` 与 `reader/{utils,image}.rs`，
@@ -41,7 +41,11 @@
 | `src/reader/image.rs` | `ImageReader`：图片路径/URL → `ImageBlock(URLSource)` 的单个 `Document`；docId = MD5(path)、chunkId `"0"`、OCR 仅保留开关（与 Java 同为空实现） |
 | `src/retry.rs` | 指数退避重试（对应 Java `RetryInterceptor`：429 / 5xx / 传输错误重试，4xx 不重试） |
 | `src/simple.rs` | `SimpleKnowledge`、`in_memory_knowledge`、`EmptyKnowledge` |
-| `src/store.rs` | `VdbStore` trait、`InMemoryStore`、`SearchQuery`、余弦/欧氏距离 |
+| `src/store.rs` | `VdbStore` trait、`InMemoryStore`、`SearchQuery`、余弦/欧氏距离；声明并 re-export `store::{qdrant,pgvector,milvus,elasticsearch}` |
+| `src/store/qdrant.rs` | **`QdrantStore`**（Java `QdrantStore` 996 行）：Qdrant **REST** API（collection 探测/创建、`points?wait=true` upsert、`points/query`、`points/delete`）+ `QdrantConfig`/builder + 纯函数 `parse_rest_base_url`/`create_collection_body`/`build_search_request_body`/`parse_search_response`/`parse_delete_response`/`metadata_to_payload`；1180 行非空 / 25 测试 |
+| `src/store/pgvector.rs` | **`PgVectorStore`**（Java `PgVectorStore` 979 行）：pgvector SQL 纯函数（DDL/upsert/search/delete/table probe）、`PgExecutor` seam + `TokioPostgresExecutor` 薄适配、`PgVectorConfig`/builder + 标识符校验、距离→相似度换算；1562 行非空 / 26 测试 |
+| `src/store/milvus.rs` | **`MilvusStore`**（Java `MilvusStore` 919 行）：Milvus **REST v2**（`/v2/vectordb/*`：`collections/has`、`collections/create`、`entities/{insert,upsert,search,delete}`、`databases/{list,create}`）+ `MilvusConfig`/builder/`MilvusMetricType` + 纯函数 `parse_milvus_uri`/`create_collection_body`/`document_row`/`insert_body`/`search_body`/`delete_body`/`parse_envelope`/`parse_search_response`；1590 行非空 / 32 测试 |
+| `src/store/elasticsearch.rs` | **`ElasticsearchStore`**（Java `ElasticsearchStore` 526 行）：ES REST（索引探测 `GET /{index}`、`PUT /{index}` 的 dense_vector 映射、`POST /_bulk` NDJSON、`POST /{index}/_search` kNN、`DELETE /{index}/_doc/{id}`）+ `ElasticsearchConfig`/builder + 纯函数 `create_index_body`/`bulk_body`/`parse_bulk_response`/`search_body`/`parse_search_response`/`parse_delete_response`；1255 行非空 / 28 测试 |
 | `src/embedding.rs` | `EmbeddingModel` trait（含默认 `embed_with_usage`）、`EmbeddingUsage`/`EmbeddingResponse`/`UsageListener`、确定性离线的 `HashEmbeddingModel`；声明并 re-export 4 个 HTTP 提供商的子模块 |
 | `src/embedding/utils.rs` | `EmbeddingUtils` → `EmbeddingExecutionConfig`（超时 + 复用 `retry::RetryPolicy`）、`f32_slice_to_f64`、`join_url`、`build_transport` |
 | `src/embedding/openai.rs` | `OpenAiTextEmbedding`：`POST {base}/embeddings` + `Bearer`，`input:[text]`/`dimensions`/`encoding_format=float` |
@@ -75,6 +79,14 @@ cargo test  -p agentscope-extensions-rag   -> 265 passed; 0 failed; 0 ignored
 ```
 cargo build -p agentscope-extensions-rag
 cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
+```
+
+**最新（2026-10-28 本轮实测）**：
+```
+cargo build -p agentscope-extensions-rag            -> exit 0（0 errors）
+cargo test  -p agentscope-extensions-rag --lib      -> 376 passed; 0 failed; 0 ignored
+cargo clippy -p agentscope-extensions-rag --lib --all-targets -> exit 0（新增文件无告警）
+rustfmt --edition 2021 --check (4 个改动/新增文件)   -> 无 diff
 ```
 
 ## 2. Java 清单与依赖映射
@@ -112,7 +124,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | `exception.DifyApiException` / `DifyAuthException` | API / 鉴权异常 | `RagError::Api` / `RagError::Auth`（`src/error.rs`） | 已完成 |
 | 请求体装配（`retrieve` 内联） | `query` + `retrieval_model` | `dify::request::build_retrieve_request_body` | 已完成 |
 
-### 2.3 simple 子模块（`io.agentscope.core.rag.*` / `io.agentscope.core.embedding.*`，simple 子模块 **33 类**（rag 24 + embedding 9）+ Java core `io.agentscope.core.rag.*` **7 类** = 40 类；实际 embedding 为 **7 类**，见 §7.3 勘误 3）— **除外部向量库 4 件与 `ExternalApiReader` 外均已完成**
+### 2.3 simple 子模块（`io.agentscope.core.rag.*` / `io.agentscope.core.embedding.*`，simple 子模块 **33 类**（rag 24 + embedding 9）+ Java core `io.agentscope.core.rag.*` **7 类** = 40 类；实际 embedding 为 **7 类**，见 §7.3 勘误 3）— **除 `ExternalApiReader`（P2）外均已完成**
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
 | `core.rag.Knowledge`（core 接口） | 知识库抽象 | `knowledge::Knowledge` (trait) | 已完成 |
@@ -145,7 +157,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | `core.rag.reader.ExternalApiReader` | 外部解析 API 读取（可插拔 `RequestBuilder`/`ResponseParser`） | 无（可基于 `crate::transport` seam 实现） | 待办 |
 | `core.rag.reader.ReaderUtils` | MD5/SHA-256 docId + hex | `reader::utils::{generate_doc_id, generate_doc_id_md5, generate_doc_id_sha256, bytes_to_hex, DocIdAlgorithm}` + `hash::sha256_hex` | 已完成 |
 | `core.rag.reader.TableFormat` | Word 表格格式（Markdown/JSON） | 无（仅 WordReader 使用） | 设计决定（不迁移） |
-| `core.rag.store.ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` | 外部向量库 | 无（接口为 `store::VdbStore`） | 待办 |
+| `core.rag.store.ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` | 外部向量库 | `store::{PgVectorStore, QdrantStore, MilvusStore, ElasticsearchStore}`（均实现 `store::VdbStore`） | **4/4 已完成**（2026-10-28 两批，见 §8 / §9） |
 
 ### 2.4 bailian 子模块（`io.agentscope.core.rag.integration.bailian.*`，7 类）— **已完成**
 | Java 类 | 职责 | Rust 对应 | 状态 |
@@ -200,7 +212,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | **bailian 全链路** | bailian 子模块 7 类 | 已完成 | `src/bailian/**`；9 个源文件 2608 行 / 64 个内联测试；`reqwest` + 自建 ACS4-HMAC-SHA256 签名，不引入阿里云 SDK |
 | **haystack 全链路** | haystack 子模块 10 类 | 已完成 | `src/haystack/**`；7 个源文件 1692 行 / 49 个内联测试 |
 | **simple 离线链路** | `SimpleKnowledge` / `InMemoryStore` / `DistanceCalculator` / `TextReader` / `TextChunker` / `SplitStrategy` / `ReaderInput` / `EmbeddingModel` | 已完成 | `src/{simple,store,reader,embedding}.rs` |
-| 离线单测（265 → 325 个） | Java 测试 16792 行 | 已完成 | 上一轮 265；本轮新增 60（openai 12 / dashscope 15 / ollama 8 / embedding::utils 10 / reader::utils 6 / reader::image 8 / hash 1）；HTTP 仍走注入式 mock transport，全离线 |
+| 离线单测（265 → 325 → 376 → **436** 个） | Java 测试 16792 行 | 已完成 | 265（2026-09 基线）→ 325（2026-10-26，+60）→ 376（2026-10-28 第一批，+51：`store::qdrant` 25 / `store::pgvector` 26）→ **436（2026-10-28 第二批，+60：`store::milvus` 32 / `store::elasticsearch` 28）**；HTTP 仍走注入式 mock transport，PgVector 走 `PgExecutor` 假实现，全离线 |
 
 ### 3.2 缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -208,7 +220,7 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | Bailian 集成 | `bailian.*` 7 类 | **已完成** | `src/bailian/**`；`reqwest` 直连 + 自建 ACS4-HMAC-SHA256 签名（不引入阿里云 SDK）；端点/路径/API 版本/请求体(camelCase)/响应体(PascalCase)/`Authorization` 均以 SDK jar 逆向并用金标向量钉住 |
 | HayStack 集成 | `haystack.*` 10 类 | **已完成** | `src/haystack/**`；复用 `crate::transport` seam；覆盖 `documents` 与 `context_documents`（SentenceWindow）两种形态 |
 | RAGFlow 集成 | `ragflow.*` 9 类 | **已完成** | `src/ragflow/**`；`POST /api/v1/retrieval`；`data` 字段可 `false`/`null`/object 的自定义反序列化已复刻（`ResponseData`） |
-| simple 外部向量库 | `ElasticsearchStore`(526) / `MilvusStore`(919) / `PgVectorStore`(979) / `QdrantStore`(996) | 待办 | 本轮仅做 bailian/haystack，未动此项；均以 `store::VdbStore` 为接口；各需 REST/gRPC 客户端，可离线 mock |
+| simple 外部向量库 | `ElasticsearchStore`(526) / `MilvusStore`(919) / `PgVectorStore`(979) / `QdrantStore`(996) | **已完成（4/4）** | `src/store/qdrant.rs`（REST over `crate::transport`，25 测试）+ `src/store/pgvector.rs`（SQL 纯函数 + `PgExecutor` seam + `tokio-postgres` 薄适配，26 测试）+ `src/store/milvus.rs`（Milvus REST v2 over `crate::transport`，32 测试）+ `src/store/elasticsearch.rs`（ES REST：`_bulk`/kNN `_search`/`_doc` 删除/索引映射，28 测试）；均实现 `store::VdbStore`（`add`/`search`/`delete`），全离线 mock。详见 §8 / §9 |
 | embedding HTTP 提供商 | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` | **已完成** | `src/embedding/{dashscope,ollama,openai}.rs` + 共享 `utils.rs`；均走 `crate::transport` seam，离线 mock 覆盖（3 个提供商共 35 个测试，另 10 个共享 utils 测试）；超时/重试统一由 `EmbeddingExecutionConfig` 负责（transport 侧 `max_retries=0`，避免双重重试） |
 
 ### 3.3 增强（P2）
@@ -225,17 +237,20 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路、**Bailian 全链路（含自建 ACS4-HMAC-SHA256 签名）**、**HayStack 全链路**；全 crate 共 **49 个源文件**。
+- **已完成**：crate 骨架、公共 RAG 模型/trait、消息桥接、Dify 全链路、simple 离线链路（`SimpleKnowledge` + `InMemoryStore` + `TextReader`/`TextChunker` + `HashEmbeddingModel` + 距离计算）、RAGFlow 全链路、**Bailian 全链路（含自建 ACS4-HMAC-SHA256 签名）**、**HayStack 全链路**、**外部向量库 4/4（Qdrant/PgVector/Milvus/Elasticsearch）**；全 crate 共 **53 个源文件**。
 - **2026-10-26 本轮完成**：`simple` 的 HTTP embedding 4 件（`OpenAiTextEmbedding` / `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding`）、`EmbeddingUtils`→`EmbeddingExecutionConfig`、`EmbeddingUsage`/`EmbeddingResponse`/`UsageListener`、`ReaderUtils`（MD5+SHA-256）、`ImageReader`；新增 7 个源文件 2437 行非空 / 60 个离线测试。详见 §7。
-- **验证命令与结果**（上一轮实测，2026-09-19）：
+- **2026-10-28 第一批完成**：外部向量库 2 件——`QdrantStore`（REST over `crate::transport`）与 `PgVectorStore`（pgvector SQL 纯函数 + `PgExecutor` seam + `tokio-postgres` 薄适配）；新增 2 个源文件 2742 行非空 / **51 个离线测试**（qdrant 25 / pgvector 26）；总源文件 49 → **51**。详见 §8。
+- **2026-10-28 第二批完成**：外部向量库剩下 2 件——`MilvusStore`（Milvus **REST v2** over `crate::transport`）与 `ElasticsearchStore`（ES REST：`_bulk` / kNN `_search` / `_doc` 删除 / 索引映射）；新增 2 个源文件 2845 行非空 / **60 个离线测试**（milvus 32 / elasticsearch 28）；总源文件 51 → **53**，外部向量库 **4/4 完成**。详见 §9。
+- **验证命令与结果**（2026-10-28 第二批实测）：
   - `cargo build -p agentscope-extensions-rag` → **通过（0 errors，exit 0）**
-  - `cargo test -p agentscope-extensions-rag` → **265 passed / 0 failed / 0 ignored**（untittests src/lib.rs）
-  - 本 crate 无新增 warning（`warning:` 匹配 `extensions-rag` 计数 = 0）
+  - `cargo test -p agentscope-extensions-rag --lib` → **436 passed / 0 failed / 0 ignored**（基线 376 → +60）
+  - `cargo clippy -p agentscope-extensions-rag --lib --all-targets` → **exit 0**，新增文件无告警（仅剩 `ragflow` 的 2 条旧告警）
+  - `rustfmt --edition 2021 --check`（`store/{milvus,elasticsearch}.rs`、`store.rs`、`lib.rs`）→ 无 diff
 - **已知问题**：无编译/测试失败。设计上有一处显式取舍——core 侧 `RagMode`/hook 与 `io.agentscope.core.rag` 包未迁移，检索结果到消息的桥接以纯函数形式提供（`src/message.rs`），调用方需自行组装 hook/工具。
 - **2026-10-22 静态复核**：未运行 `cargo build`/`cargo test`（本轮为纯静态核对），仅校验源码与统计口径；详见 §6。
 
 ### 4.2 下一步与阻塞
-1. **simple 外部向量库（P1，唯一剩余大块）**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`，均实现 `store::VdbStore`；**本轮未动，仍为待办**。
+1. **simple 外部向量库（P1）**：**4/4 已完成**（`QdrantStore` / `PgVectorStore` 2026-10-28 第一批；`MilvusStore` / `ElasticsearchStore` 2026-10-28 第二批）——均实现 `store::VdbStore`，HTTP 走 `crate::transport` seam + 离线 mock（见 §8 / §9）。**本项已关闭。**
 2. **`ExternalApiReader`（P2）**：无固定 wire 契约，建议基于 `crate::transport` seam 实现（§3.3）。
 3. **已裁定不迁移**：`TikaReader`/`PDFReader`/`WordReader`、`TableFormat`（理由见 §3.3）。
 4. **待裁定事项**
@@ -259,6 +274,8 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
 
 ## 6. 静态复核记录（2026-10-22）
+
+> **已过时（外部向量库 / HTTP embedding 部分）**：本节 §6.3 / §6.4 中「外部向量库 4 件全部缺失」与「HTTP embedding 4 件全部缺失」的结论均为 2026-10-22 快照。`QdrantStore` / `PgVectorStore` / `MilvusStore` / `ElasticsearchStore` 已于 **2026-10-28** 全部落地（`src/store/{qdrant,pgvector,milvus,elasticsearch}.rs`，共 111 个离线测试），以 **§8 / §9** 为准；HTTP embedding 4 件已于 **2026-10-26** 落地（`src/embedding/{openai,dashscope,ollama}.rs`），以 **§7** 为准。
 
 ### 6.1 复核方式
 - **纯静态核对**：本轮**未执行** `cargo build` / `cargo test`，**未修改任何 Rust 代码**；仅读取 Java 源码、Rust 源码并做符号级 grep / 行数统计。所有"已完成"结论沿用上一轮（2026-09-19）的编译与测试证据，本节只做**源码级保真度复核 + 数据勘误**。
@@ -306,14 +323,14 @@ cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 | `haystack` | 10 | 10/10 | **等价** | `code != successCode` → `RagError::Api`（Java 只记日志不抛 status 错误，Rust 保留"仅 body 不可解析才是传输错"的分裂语义）；`documents` 优先、否则 `context_documents`（SentenceWindow）已覆盖；Java 保留无 score 文档且**不重排序**，Rust 同样保留顺序。 |
 | `simple`（离线部分） | 33 + core 7 | 21/40 | **部分** | 已覆盖：`Knowledge`/`Document`/`DocumentMetadata`/`RetrieveConfig`/`SimpleKnowledge`/`Reader`/`ReaderInput`/`AbstractChunkingReader`(→`validate_chunking_parameters`)/`TextReader`/`TextChunker`/`SplitStrategy`/`VDBStoreBase`(→`VdbStore`)/`InMemoryStore`/`DistanceCalculator`/`SearchDocumentDto`(→`SearchQuery`)/`EmbeddingModel`/`EmbeddingException`/`ReaderException`/`VectorStoreException`/`KnowledgeRetrievalTools`(→`message::format_documents_for_tool`)/`GenericRAGHook`(→`message::*`)。**未覆盖见 §6.4。** |
 | `simple`（HTTP embedding 提供商） | 4 | 0/4 | **缺失** | `DashScopeTextEmbedding` / `DashScopeMultiModalEmbedding` / `OllamaTextEmbedding` / `OpenAITextEmbedding` —— Rust 全库 grep `DashScope`/`Ollama`/`OpenAI` **仅在注释中出现**，无任何实现。 |
-| `simple`（外部向量库） | 4 | 0/4 | **缺失** | `ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` —— Rust 全库 grep `Elasticsearch`/`Milvus` **命中 0**，`PgVector`/`Qdrant` **仅命中注释**。 |
+| `simple`（外部向量库） | 4 | 4/4 | **已完成**（2026-10-28 补记；本节快照时为 0/4） | `ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore` → `src/store/{elasticsearch,milvus,pgvector,qdrant}.rs`，均实现 `store::VdbStore`，见 §8 / §9 |
 | `simple`（reader 增强） | 5 + 2 辅助 | 0/7 | **缺失 / 已裁定不迁移** | `TikaReader`/`PDFReader`/`WordReader`/`TableFormat` → 设计决定（不迁移）；`ImageReader`/`ExternalApiReader`/`ReaderUtils` → **新增待办**（原裁定有误，见 §6.5 勘误 3/4）。 |
 
 ### 6.4 新发现缺口
 
 | 优先级 | 缺口 | Java 路径 / 证据 | Rust 现状 | 说明 |
 |---|---|---|---|---|
-| **P1** | 外部向量库 4 件（`ElasticsearchStore`/`MilvusStore`/`PgVectorStore`/`QdrantStore`） | `agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/store/{ElasticsearchStore,MilvusStore,PgVectorStore,QdrantStore}.java`（非空行 526 / 919 / 979 / 996） | **缺失**（仅 `store::VdbStore` trait 存在） | Java 侧分别走 ES REST、Milvus gRPC、Postgres JDBC(+pgvector)、Qdrant gRPC；Rust 侧需各自实现 `VdbStore`（`add`/`search`/`delete`）。均可用 `crate::transport` 或 mock trait object 做离线单测。**仍是原 §3.2 的最大缺口，未被本轮缩小。** |
+| **P1** | 外部向量库 4 件（`ElasticsearchStore`/`MilvusStore`/`PgVectorStore`/`QdrantStore`） | `agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/store/{ElasticsearchStore,MilvusStore,PgVectorStore,QdrantStore}.java`（非空行 526 / 919 / 979 / 996） | **已完成**（2026-10-28 两批） | Java 侧分别走 ES REST、Milvus gRPC、Postgres JDBC(+pgvector)、Qdrant gRPC；Rust 侧均实现 `VdbStore`（`add`/`search`/`delete`），HTTP 走 `crate::transport` seam + 离线 mock。详见 §8 / §9。 |
 | **P1** | HTTP embedding 提供商 4 件 | `.../io/agentscope/core/embedding/{dashscope/DashScopeTextEmbedding,dashscope/DashScopeMultiModalEmbedding,ollama/OllamaTextEmbedding,openai/OpenAITextEmbedding}.java` | **缺失**（仅离线 `HashEmbeddingModel`） | 归属待裁定（MODEL 扩展 vs RAG 扩展）。`src/embedding.rs` 注释已明确倾向 MODEL。 |
 | **P2** | `ImageReader`（新增，原被误判为"不迁移"） | `.../io/agentscope/core/rag/reader/ImageReader.java`（非空行 140） | **缺失，但可机械直译** | 该文件**无任何第三方 JVM import**，仅用 core 的 `ImageBlock` + `URLSource`（Rust core `agentscope-core::message::{ImageBlock, Source::URLSource}` 已有等价类型）；docId 用 `ReaderUtils.generateDocIdMD5`（Rust `hash::md5_hex` 已覆盖）；OCR 在 Java 侧本身也是**空实现占位**。迁移成本极低。 |
 | **P2** | `ReaderUtils` 的 SHA-256 侧（MD5 侧已由 `hash::md5_hex` 覆盖） | `.../io/agentscope/core/rag/reader/ReaderUtils.java` | **部分** | `sha2` 依赖已在 crate 内（`bailian/signing.rs` 使用），补 `sha256_hex` 无需新增依赖。 |
@@ -406,7 +423,7 @@ cargo test  -p agentscope-extensions-rag
 
 ### 7.5 仍待办
 
-1. **外部向量库 4 件**：`ElasticsearchStore` / `MilvusStore` / `PgVectorStore` / `QdrantStore`（**本轮未动**）。
+1. **外部向量库**：`QdrantStore` / `PgVectorStore` 已完成（2026-10-28 第一批，见 §8），`ElasticsearchStore` / `MilvusStore` 已完成（2026-10-28 第二批，见 §9）—— **4/4 已关闭**。
 2. `ExternalApiReader`（P2）。
 3. `RagMode` / `GenericRAGHook` 落点待裁定（core/harness）。
 
@@ -425,3 +442,121 @@ cargo test  -p agentscope-extensions-rag
 
 - 完整复评方法与反证命令见 `docs/extensions/JAVA_BASELINE_REVIEW_2026-10-26.md`。
 
+## 8. 执行记录（2026-10-28）：QdrantStore + PgVectorStore
+
+**范围**：`simple` 子模块外部向量库 4 件中的 2 件（`QdrantStore.java` 996 行 / `PgVectorStore.java` 979 行）。`MilvusStore` / `ElasticsearchStore` **本轮未动**。
+
+### 8.1 接口与映射
+
+| Java 方法 | Rust | 语义 |
+|---|---|---|
+| `VDBStoreBase.add(List<Document>)` | `VdbStore::add(Vec<Document>)` | 空列表 no-op；逐条校验 embedding 存在 + 维度；Qdrant `PUT /collections/{c}/points?wait=true` upsert；PgVector `INSERT ... ON CONFLICT (id) DO UPDATE SET` 批量 |
+| `search(SearchDocumentDto)` | `VdbStore::search(&SearchQuery)` | 维度 + `limit > 0` 校验；`vector_name` → Qdrant `using`（PgVector 与 Java 一样忽略）；`score_threshold` → Qdrant 服务端 `score_threshold` / PgVector 客户端 `score < threshold` 跳过 |
+| `delete(String id)` | `VdbStore::delete(&str)` | Qdrant 按 point UUID 删除，返回 `result.status == "completed"`；PgVector **按 `doc_id` 列**删除（与 Java 一致，即删该文档全部 chunk），返回 `affected > 0` |
+| `ensureCollection` / `ensureTable` | `QdrantStore::connect_with` / `PgVectorStore::connect_with`（也公开 `ensure_collection` / `initialize`） | Java 在构造函数内建；Rust 的 `QdrantStore::new(config, transport)` / `PgVectorStore::new(config, executor)` 明确不做 I/O（可离线构造与断言） |
+
+### 8.2 显式差异（有意为之，非缺口）
+
+1. **Qdrant 走 REST 而非 gRPC**：Java 用 `io.qdrant:client` gRPC SDK；Rust 用 `crate::transport::{HttpTransport, HttpRequest, HttpResponse}`（生产 `ReqwestTransport`，测试注入 mock），因此以 `?wait=true` 代替 `future.get()`；`:memory:` / `file://` 这类 gRPC/本地模式被拒（`RagError::Unsupported`）；裸 `host` 默认 REST 端口 **6333**（Java gRPC 6334）。
+2. **Qdrant 错误不包装**：Java 把所有失败包成 `VectorStoreException("Failed to add documents to Qdrant")`（保留 cause 链）；Rust 直接返回状态码可判的 `RagError::Api{status_code}` / `RagError::Auth`（只有 `ensure_collection` 的建 collection 步骤按 Java 文案包装）。
+3. **`check_compatibility` 仅保留字段**：REST 端口没有 gRPC 兼容性探测，字段接受但不产生请求。
+4. **距离度量**：Java `createCollection` 硬编码 `Distance.Cosine`；Rust `QdrantConfig::distance` 默认 `Cosine`，可切 `Euclid` / `Dot`（体现在建 collection 体）。
+5. **PgVector 不注册 `vector` 类型**：搜索投影为 `embedding::text` / `payload::text`，写入绑定 pgvector 文本字面量 + `::vector` 显式 cast，因此无需 `pgvector` crate（Java 需 `PGvector.addVectorType`）；存进去的字节仍是同一向量格式。
+6. **PgVector 空 schema**：Java `schema("")` 会拼出 `".table"` 并在 JDBC 层失败；Rust 回退为 `public`。
+7. **PgVector 连接**：Java 用 JDBC URL + `Properties`；Rust 由 JDBC URL 推导 libpq 连接串（`host/port/dbname/user/password/connect_timeout`，超时毫秒 → 秒，同 Java `connectionTimeoutMs / 1000`），也可 `connection_string(...)` 直接覆盖；连接用 `NoTls`（Java 走 JDBC 默认 SSL 协商）。
+8. **PgVector 错误文案**：`Failed to add documents to PostgreSQL` / `Failed to search documents in PostgreSQL` / `Failed to delete document from PostgreSQL` / `Failed to ensure table exists: schema.table` 与 Java 一致，但把 cause 以 `: {error}` 拼在消息尾部（`RagError` 无 source 链）。
+9. **空值参数**：Java 的 `documents == null` / `document == null` / `queryEmbedding == null` 在 Rust 类型系统上不可达，对应校验只保留 `Document must have embedding set` 与维度/limit 检查。
+
+### 8.3 新增依赖
+
+- 本 crate `Cargo.toml`：`tokio-postgres = { workspace = true }`（根 `[workspace.dependencies]` 已有 `tokio-postgres = "0.7"`，**未改根 Cargo.toml**，`Cargo.lock` 无需新增包）。
+- 无其它新增依赖：不引 `pgvector` crate、不引 Qdrant SDK。
+
+### 8.4 测试（全离线，51 个）
+
+```
+cargo build -p agentscope-extensions-rag                     -> exit 0 (0 errors)
+cargo test  -p agentscope-extensions-rag --lib               -> 376 passed; 0 failed; 0 ignored   (基线 325，+51)
+cargo clippy -p agentscope-extensions-rag --lib --all-targets -> exit 0（新增文件无告警）
+```
+
+- `store::qdrant::tests`（25）：base URL 归一化/拒绝 `:memory:`/`file://`、builder 三条 Java 文案、建 collection 请求体（`{"vectors":{"size":N,"distance":"Cosine"}}`）、`connect_with` 404→建 collection + `api-key` 头、已存在仅 GET、探测 403→`Auth`、upsert 请求体（payload `content`/`doc_id`/`chunk_id`/`payload`）、命名向量、无 embedding/维度/UUID 校验（均不触网）、空列表 no-op、query 体（`query`/`limit`/`with_payload`/`with_vector`/`using`/`score_threshold`）+ 响应映射（分数/内容/自定义 payload/embedding/vector_name）、legacy `result[]` + 命名向量响应、缺 payload 的点被跳过、维度与 limit 校验、delete `completed`→true / `acknowledged`→false、delete 参数校验、500→`Api{500}` / 401→`Auth{401}`、closed 后拒绝、payload 往返与缺字段报错、非 JSON content 回退 `TextBlock`。
+- `store::pgvector::tests`（26）：builder 三条 Java 文案、标识符注入/长度/首字符校验、空 schema 回退、JDBC URL 解析（query 参数/无端口/错前缀）、libpq 连接串（超时秒 + override 优先）、三句 DDL 精确比对 + `information_schema` 小写探测、三种距离算子与索引类、upsert/delete SQL、向量字面量往返、距离→相似度三种类型、`initialize` 建 extension/schema/table/索引、表已存在时跳过、DDL 失败包装、add 参数表（id/向量/doc_id/chunk_id/content JSON/payload JSON）、空 payload→`{}`、无 embedding/维度校验 + 空批次、SQL 错误包装、search 参数与行映射（分数/embedding/payload）、阈值过滤、维度/limit 校验、delete 按 `doc_id` + 计数、blank id 校验、closed 拒绝、行回退（非 JSON content / 非 JSON payload / 空 payload）、document id 稳定性。
+
+### 8.5 反向验证（回退实现 → FAILED → 恢复）
+
+| # | 回退点 | 结果 |
+|---|---|---|
+| 1 | `QdrantStore` 的 query 体去掉 `score_threshold` 字段 | `store::qdrant::tests::search_builds_query_body_and_maps_results` **FAILED**（0 passed / 1 failed）；恢复后全绿 |
+| 2 | `distance_to_score` 的 `Cosine => 1.0 - distance` 改为 `Cosine => distance` | `store::pgvector::tests` **4 failed**（`distance_to_score_matches_java` / `row_to_document_falls_back_on_non_json_content_and_payload` / `search_applies_the_score_threshold` / `search_maps_rows_to_scored_documents`）；恢复后全绿 |
+
+### 8.6 未完成（第一批口径；已被第二批关闭）
+
+- ~~`ElasticsearchStore`（Java 526 行，ES REST `_bulk` / `_search` / `_delete_by_query` + `dense_vector` 映射）~~ → **2026-10-28 第二批已完成**（见 §9）。实际 Java 删除走 `DELETE /{index}/_doc/{id}`（不是 `_delete_by_query`），§8.6 原表述有误，已按源码更正。
+- ~~`MilvusStore`（Java 919 行，gRPC + `io.milvus` SDK）~~ → **2026-10-28 第二批已完成**（按 Milvus REST v2 `/v2/vectordb/...` 实现，协议差异见 §9.2）。
+
+## 9. 执行记录（2026-10-28 第二批）：MilvusStore + ElasticsearchStore
+
+**范围**：`simple` 子模块外部向量库 4 件中剩余的 2 件（`MilvusStore.java` 919 行 / `ElasticsearchStore.java` 526 行）。至此外部向量库 **4/4 完成**。
+
+### 9.1 接口与映射
+
+| Java 方法 | Rust | 语义 |
+|---|---|---|
+| `VDBStoreBase.add(List<Document>)` | `VdbStore::add(Vec<Document>)` | 空列表 no-op；逐条校验 embedding 存在 + 维度；Milvus `POST /v2/vectordb/entities/insert`（另加 REST-only `MilvusStore::upsert` → `entities/upsert`）；ES `POST /_bulk`（NDJSON，action 行 + `_source` 行） |
+| `search(SearchDocumentDto)` | `VdbStore::search(&SearchQuery)` | Milvus：维度 + `limit > 0` 校验，`data` 单查询向量、`annsField`（`vector_name` 覆盖）、`limit`、`outputFields`、`searchParams.metricType`；`score_threshold` **客户端**过滤（先 `normalizeScore`，L2 → `1/(1+d)`，同 Java）。ES：维度 + `limit > 0`，`knn.{field,query_vector,k,num_candidates}` + `size` + `min_score`（无阈值时 `0.0`，同 Java） |
+| `delete(String id)` | `VdbStore::delete(&str)` | Milvus：按 `doc_id in ["…"]` 过滤删除，返回 `deleteCount > 0`；ES：`DELETE /{index}/_doc/{id}`，只有 `result == deleted` 返回 `true`（`not_found` → `false`） |
+| `hasCollection` / `createCollection` | `MilvusStore::{has_collection, ensure_collection}` + `connect_with`/`initialize` | Java 构造函数内建库 + 建集合；Rust `MilvusStore::new` 明确不做 I/O |
+| `listDatabases` / `createDatabase` | `MilvusStore::{list_databases, ensure_database}` | 仅 `databaseName != "default"` 时探测/建库（同 Java），`databaseProperties` 透传到 `databases/create` |
+| `indices().exists` / `indices().create` | `ElasticsearchStore::{index_exists, ensure_index}` + `connect_with` | `GET /{index}` 200 存在 / 404 则 `PUT /{index}` 建索引；`ElasticsearchStore::new` 不做 I/O |
+
+### 9.2 Milvus 显式差异（有意为之，非缺口）
+
+1. **REST v2 而非 gRPC**：Java 用 `io.milvus:milvus-sdk-java` v2 SDK；Rust 走 `crate::transport::{HttpTransport, HttpRequest, HttpResponse}`（测试注入 mock），因此 `ConnectConfig` 的 `account`/`hash`/`consistency` 等 gRPC 专有旋钮无对应项。
+2. **URI 强校验**：Java `ConnectConfig.uri` 接受任意字符串、到连接时才失败；Rust `parse_milvus_uri` 在建配置时即要求 `http://` / `https://` 前缀（可诊断错误），并去掉尾部 `/`。
+3. **超时映射**：`connectTimeoutMs` 在 Java 是 gRPC channel 超时；REST 端口把它映射为 `TransportOptions` 的 connect + read 超时（`MilvusConfig::transport_options`），`0` 表示沿用 transport 默认。
+4. **错误分层**：Milvus 的 API 级失败是 HTTP 200 + `code != 0` → `RagError::VectorStore("Milvus error {code}: {message}")`；HTTP 级失败保留状态码可判的 `RagError::Api` / `RagError::Auth`（与 §8 Qdrant 口径一致）。
+5. **delete 计数缺失**：REST 删除是异步的，响应可能不含 `deleteCount` → 视为“已受理”返回 `true`；Java 读 `DeleteResp.getDeleteCnt() > 0`。
+6. **filter 转义**：Java 直接字符串拼接 `doc_id in ["…"]`；Rust `escape_filter_string` 转义 `\` 与 `"`（防注入，正常 id 字节相同）。
+7. **schema 表达**：Java SDK 的 `AddFieldReq.maxLength/dimension` 在 REST v2 写作 `elementTypeParams.{max_length,dim}`（字符串值），字段顺序/长度（64/256/65535）与 `AUTOINDEX` + metric、`enableDynamicField=true` 一一对应。
+8. **upsert 为新增能力**：Java 只有 `insert`；`MilvusStore::upsert` 走 REST `entities/upsert`，供幂等重建索引使用。
+
+### 9.3 Elasticsearch 显式差异（有意为之，非缺口）
+
+1. **错误不包装**：Java 把失败包成 `VectorStoreException("Failed to add documents")` / `"Vector search failed"` / `"Failed to delete document from Elasticsearch"`；Rust 直接返回带状态码的 `RagError::Api` / `RagError::Auth`，仅 `ensure_index` 的建索引步骤按 Java 文案包装（`Failed to ensure index exists: {index}: …`）。bulk `errors: true` 仍保留 Java 文案 `Elasticsearch bulk indexing failed`，并追加 Java 只会打日志的逐条 `id: reason`。
+2. **存在性探测用 GET**：Java `indices().exists` 走 `HEAD /{index}`；本 crate 的 `HttpMethod` 只有 GET/POST/PUT/DELETE，因此用 `GET /{index}`（200 / 404 语义等价，仅多返回 body），未改公共 transport。
+3. **`disableSslVerification` 仅为字段**：TLS 归注入的 transport（`ReqwestTransport`），本 crate 不会静默关闭校验；字段保留用于对齐 Java builder。
+4. **basic auth 条件同 Java**：只有 `username` 与 `password` **都**非空才发 `Authorization: Basic …`（Java 仅在这种情况下装 `CredentialsProvider`）。
+5. **不设 `_source`**：Java `SearchRequest` 未显式设置 `_source`，ES 默认返回，Rust 同样不发该键（保持 body 与 Java 一致）。
+6. **路径段转义**：`DELETE /{index}/_doc/{id}` 与索引名做 RFC 3986 百分号编码（Java 客户端内部转义）；UUID 形态的 id 字节不变。
+7. **`vector_name` 覆盖 `knn.field`**：Java 固定 `vector`；Rust 在 `SearchQuery::vector_name` 提供时改用该字段名（单字段默认仍为 `vector`）。
+
+### 9.4 新增依赖
+
+- **无**。Milvus 复用 `crate::transport`（`reqwest` 已在依赖中）；ES basic auth 复用已有 `base64`，转义/NDJSON 均为手写纯函数。未改根 `Cargo.toml`。
+
+### 9.5 测试（全离线，60 个）
+
+```
+cargo build -p agentscope-extensions-rag                      -> exit 0 (0 errors)
+cargo test  -p agentscope-extensions-rag --lib                -> 436 passed; 0 failed; 0 ignored   (基线 376，+60)
+cargo clippy -p agentscope-extensions-rag --lib --all-targets  -> exit 0（新增文件无告警；仅剩 ragflow 旧告警）
+rustfmt --edition 2021 --check <4 文件>                        -> 无 diff
+```
+
+- `store::milvus::tests`（32）：URI 归一化/拒绝裸 `host:port`、builder 四条 Java 文案、默认值（`default` 库 / `COSINE` / 30000ms）、token 优先于用户名密码（其余 `root:` 无密码）、`transport_options` 超时映射、建集合请求体（6 字段 + `elementTypeParams` + `AUTOINDEX`/metric）、`connect_with` 建库+建集合（URL/方法/`Bearer` 头/Content-Type 逐项断言）、库与集合已存在则跳过、`default` 库不探测、insert 行（id/vector float32/doc_id/chunk_id/content JSON/payload）、空 payload → `{}`、空列表 no-op、无 embedding/维度校验（不触网）、`upsert` 端点、search 体（`data`/`annsField`/`limit`/`outputFields`/`metricType`）+ 结果映射（分数/内容/payload/确定性 id）、`vector_name` → `annsField`、阈值客户端过滤（体里无阈值）、L2 归一化（3.0 → 0.25）、嵌套查询结果集、无法重建的条目被跳过、维度/limit 校验、delete filter、`deleteCount=0` → false、缺计数 → true、filter 转义、空 id 校验、`code!=0` → VectorStore、500→Api / 401→Auth、关闭后拒绝、content/payload 容错回退、envelope 缺字段、`normalize_score` 三度量。
+- `store::elasticsearch::tests`（28）：base URL 归一化/拒绝裸 `host:port`、builder 三条 Java 文案、默认值、basic auth（仅单凭据不发头 + base64 字面量）、索引 mapping（keyword/text-non-indexed/dense_vector dims+cosine）、404 → 建索引（请求体/头）、已存在仅 1 次请求、建索引失败包装（400 文案）、`index_exists` 三态、`_bulk` NDJSON（2 行 + 结尾换行 + `application/x-ndjson` + source 各字段 + payload JSON 字符串）、空 payload 不写该字段、空列表 no-op、embedding/维度校验（不触网）、bulk 逐条错误信息、kNN 体（field/vector/k=3/num_candidates=50/size/min_score=0.0）+ hit 映射（score/content/payload/embedding）、`vector_name` + 阈值（num_candidates=80 / min_score=0.75）、`num_candidates` 公式、部分 hit 容错（缺 `_source`/缺 `doc_id` 被跳过、无 `_score` 则无分）、坏 payload → 空 map、空响应体/无 hits、维度/limit 校验、500→Api / 401→Auth、`_doc` 删除（deleted→true / not_found→false）、空 id 校验、路径段转义、`result` 大小写不敏感、bulk `errors=true` 无 items 用 Java 文案、关闭后拒绝。
+
+### 9.6 反向验证（回退实现 → FAILED → 恢复）
+
+| # | 回退点 | 结果 |
+|---|---|---|
+| 1 | `MilvusMetricType::normalize_score` 的 `L2 => 1.0 / (1.0 + raw)` 改为 `L2 => raw` | `store::milvus::tests` **2 failed**（`normalize_score_only_touches_l2` / `search_normalizes_l2_distances`，30 passed / 2 failed）；恢复后全绿 |
+| 2 | `elasticsearch::num_candidates` 的 `.max(50)` 改为 `.max(10)` | `store::elasticsearch::tests` **2 failed**（`num_candidates_matches_java` / `search_builds_the_knn_request_and_maps_hits`，26 passed / 2 failed）；恢复后全绿 |
+
+恢复后 `cargo test -p agentscope-extensions-rag --lib` = **436 passed / 0 failed**，`rustfmt --check` 无 diff。
+
+### 9.7 后续/已知取舍
+
+- 无遗留缺口：外部向量库 4/4 完成。真实服务集成测试（Milvus/ES 容器）未纳入离线套件，如需 CI 集成需另加 `#[ignore]` 之外的独立测试任务（本轮按“全离线”约束未做）。
+- 仍待办（非本批范围）：`ExternalApiReader`（P2，§3.3）；`RagMode`/`GenericRAGHook` 落点待裁定。

@@ -12,6 +12,21 @@ use async_trait::async_trait;
 use crate::error::{RagError, Result};
 use crate::model::Document;
 
+pub mod elasticsearch;
+pub mod milvus;
+pub mod pgvector;
+pub mod qdrant;
+
+pub use elasticsearch::{ElasticsearchConfig, ElasticsearchConfigBuilder, ElasticsearchStore};
+pub use milvus::{MilvusConfig, MilvusConfigBuilder, MilvusMetricType, MilvusStore};
+pub use pgvector::{
+    PgExecutor, PgParam, PgRow, PgVectorConfig, PgVectorConfigBuilder, PgVectorDistanceType,
+    PgVectorStore, TokioPostgresExecutor,
+};
+pub use qdrant::{
+    QdrantConfig, QdrantConfigBuilder, QdrantDistance, QdrantScoredPoint, QdrantStore,
+};
+
 /// Parameters for a similarity search.
 ///
 /// Mirrors Java `SearchDocumentDto` (`vectorName`, `queryEmbedding`, `limit`,

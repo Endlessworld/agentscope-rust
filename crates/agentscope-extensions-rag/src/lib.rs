@@ -85,6 +85,9 @@ pub use model::{Document, DocumentMetadata, RetrieveConfig};
 pub use reader::{chunk_text, ImageReader, Reader, ReaderInput, SplitStrategy, TextReader};
 pub use simple::{in_memory_knowledge, EmptyKnowledge, SimpleKnowledge};
 pub use store::{
-    cosine_similarity, euclidean_distance, squared_euclidean_distance, InMemoryStore, SearchQuery,
-    VdbStore,
+    cosine_similarity, euclidean_distance, squared_euclidean_distance, ElasticsearchConfig,
+    ElasticsearchConfigBuilder, ElasticsearchStore, InMemoryStore, MilvusConfig,
+    MilvusConfigBuilder, MilvusMetricType, MilvusStore, PgExecutor, PgParam, PgRow, PgVectorConfig,
+    PgVectorConfigBuilder, PgVectorDistanceType, PgVectorStore, QdrantConfig, QdrantConfigBuilder,
+    QdrantDistance, QdrantScoredPoint, QdrantStore, SearchQuery, TokioPostgresExecutor, VdbStore,
 };

@@ -17,6 +17,8 @@ futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+# PgVectorStore 的轻薄真实驱动适配层（SQL 构造/解析已抽为纯函数，测试不连库）。
+tokio-postgres = { workspace = true }
 # Bailian signs its requests with ACS4-HMAC-SHA256; the Java SDK pulled these in transitively.
 hmac = "0.12"
 sha2 = "0.10"
