@@ -5,55 +5,118 @@
 //! (no `key:` prefix). AgentScope's frontmatter parser only accepts flat
 //! `key: value` lines, so this module folds continuations into the previous key
 //! and rewrites the ZIP before it is turned into an [`AgentSkill`].
+//!
+//! Package layout follows Java `SkillUtil#createFromZip` exactly:
+//! * every entry must live under one shared root directory;
+//! * `SKILL.md` must sit directly under that root;
+//! * resource keys are the **paths relative to the root** (`scripts/run.sh`), and
+//!   `SKILL.md` itself is not a resource;
+//! * `name` / `description` / the markdown body after the frontmatter are required.
 
 use std::io::{Cursor, Read, Write};
 
 use agentscope_harness::agent::skill::model::AgentSkill;
+use serde_json::{Map, Value};
 use zip::read::ZipArchive;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const SKILL_MD: &str = "SKILL.md";
 
+/// Java `SkillUtil` required-metadata message.
+const MISSING_METADATA_MESSAGE: &str =
+    "The SKILL.md must have a YAML Front Matter including `name` and `description` fields.";
+/// Java `SkillUtil` empty-body message.
+const EMPTY_CONTENT_MESSAGE: &str =
+    "The SKILL.md must have content except for the YAML Front Matter.";
+
 /// Creates an [`AgentSkill`] from a skill ZIP, mirroring
 /// `SkillUtil.createFromZip(bytes, source)`.
 ///
-/// The package must contain a `SKILL.md` entry (at the root or one directory
-/// deep). When `fallback_name` is given, it is used if the parsed frontmatter
-/// omits `name`.
-pub fn create_from_zip(
-    zip_bytes: &[u8],
-    source: &str,
-    fallback_name: &str,
-) -> Result<AgentSkill, String> {
-    let mut archive =
-        ZipArchive::new(Cursor::new(zip_bytes)).map_err(|e| format!("invalid skill zip: {e}"))?;
+/// The package must contain a `SKILL.md` entry directly under a single root
+/// directory, a non-blank `name` / `description` in its YAML frontmatter and a
+/// non-empty body. Any other entry becomes a resource keyed by its path relative
+/// to that root directory.
+pub fn create_from_zip(zip_bytes: &[u8], source: &str) -> Result<AgentSkill, String> {
+    if zip_bytes.is_empty() {
+        return Err("Zip content cannot be null or empty.".to_string());
+    }
+    let mut archive = ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|e| format!("Failed to read skill zip content: {e}"))?;
 
-    let mut resources: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut root_dir: Option<String> = None;
     let mut skill_md: Option<String> = None;
+    let mut resources: Vec<(String, Vec<u8>)> = Vec::new();
 
-    for i in 0..archive.len() {
+    for index in 0..archive.len() {
         let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("failed to read zip entry: {e}"))?;
+            .by_index(index)
+            .map_err(|e| format!("Failed to read skill zip content: {e}"))?;
         if entry.is_dir() {
             continue;
         }
-        let name = normalize_entry_name(entry.name());
+        let entry_name = normalize_entry_name(entry.name())?;
         let mut data = Vec::new();
         entry
             .read_to_end(&mut data)
-            .map_err(|e| format!("failed to read zip entry data: {e}"))?;
-        if is_root_skill_md(&name) && skill_md.is_none() {
-            skill_md = String::from_utf8(data.clone()).ok();
+            .map_err(|e| format!("Failed to read skill zip content: {e}"))?;
+
+        // Java: `int separatorIndex = entryName.indexOf('/')`, `<= 0` is invalid.
+        let Some(separator_index) = entry_name.find('/').filter(|index| *index > 0) else {
+            return Err("Zip entries must be under a single root directory.".to_string());
+        };
+        let entry_root = &entry_name[..separator_index];
+        match root_dir.as_deref() {
+            None => root_dir = Some(entry_root.to_string()),
+            Some(root) if root != entry_root => {
+                return Err("Zip entries must share the same root directory.".to_string());
+            }
+            Some(_) => {}
         }
-        resources.push((name, data));
+
+        let expected_skill_entry = format!("{entry_root}/{SKILL_MD}");
+        if entry_name.ends_with(&format!("/{SKILL_MD}")) && entry_name != expected_skill_entry {
+            return Err("SKILL.md must be located directly under the root directory.".to_string());
+        }
+        if entry_name == expected_skill_entry {
+            if skill_md.is_some() {
+                return Err("Multiple SKILL.md entries found in zip content.".to_string());
+            }
+            // Java decodes every entry with the zip charset (lossy); mirror that.
+            skill_md = Some(String::from_utf8_lossy(&data).into_owned());
+            continue;
+        }
+
+        // Resource keys are relative to the root directory.
+        let resource_name = entry_name[entry_root.len() + 1..].to_string();
+        resources.push((resource_name, data));
     }
 
-    let skill_md =
-        skill_md.ok_or_else(|| format!("skill package must contain a {SKILL_MD} entry"))?;
+    let skill_md = skill_md.ok_or_else(|| "SKILL.md not found in zip content.".to_string())?;
+    build_skill(&skill_md, resources, source)
+}
 
-    let (metadata, name, description) = parse_frontmatter(&skill_md, fallback_name)?;
+/// Builds the [`AgentSkill`], mirroring `SkillUtil.createFrom(skillMd, resources, source)`.
+fn build_skill(
+    skill_md: &str,
+    resources: Vec<(String, Vec<u8>)>,
+    source: &str,
+) -> Result<AgentSkill, String> {
+    let parsed = parse_skill_md(skill_md);
+
+    // Java `stringifyRequiredMetadata`: the value must be a non-blank string.
+    let name = required_metadata(&parsed.metadata, "name")?;
+    let description = required_metadata(&parsed.metadata, "description")?;
+    if parsed.content.is_empty() {
+        return Err(EMPTY_CONTENT_MESSAGE.to_string());
+    }
+
+    let mut metadata = parsed.metadata;
+    metadata.insert("name".to_string(), Value::String(name.clone()));
+    metadata.insert(
+        "description".to_string(),
+        Value::String(description.clone()),
+    );
 
     let mut builder = AgentSkill::builder()
         .name(name)
@@ -61,13 +124,15 @@ pub fn create_from_zip(
         .description(description)
         .metadata(metadata);
 
-    for (rel, data) in resources {
-        match String::from_utf8(data.clone()) {
-            Ok(text) => builder = builder.add_resource(rel, text),
-            Err(_) => {
+    for (path, data) in resources {
+        match String::from_utf8(data) {
+            Ok(text) => builder = builder.add_resource(path, text),
+            Err(error) => {
+                // Binary resource: Java decodes it lossily; keeping the bytes
+                // base64-encoded is lossless and understood by the harness.
                 use base64::Engine as _;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                builder = builder.add_resource(rel, format!("base64:{b64}"));
+                let encoded = base64::engine::general_purpose::STANDARD.encode(error.into_bytes());
+                builder = builder.add_resource(path, format!("base64:{encoded}"));
             }
         }
     }
@@ -75,49 +140,121 @@ pub fn create_from_zip(
     Ok(builder.build())
 }
 
-/// Parses `name` / `description` / metadata from `SKILL.md` frontmatter.
-///
-/// Returns `(metadata, name, description)`. `fallback_name` supplies `name`
-/// when the frontmatter omits it.
-fn parse_frontmatter(
-    markdown: &str,
-    fallback_name: &str,
-) -> Result<(serde_json::Map<String, serde_json::Value>, String, String), String> {
-    let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
-    let mut metadata = serde_json::Map::new();
+/// Java `stringifyRequiredMetadata`: a missing, non-string or blank value fails.
+fn required_metadata(metadata: &Map<String, Value>, key: &str) -> Result<String, String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| MISSING_METADATA_MESSAGE.to_string())
+}
 
-    if let Some(rest) = text.strip_prefix("---") {
-        let rest = rest.strip_prefix('\n').unwrap_or(rest);
-        if let Some(end) = rest.find("\n---") {
-            for line in rest[..end].lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once(':') {
-                    let key = k.trim().to_string();
-                    let value = unquote(v.trim());
-                    metadata.insert(key, serde_json::Value::String(value));
-                }
+/// `MarkdownSkillParser.parse` result: frontmatter metadata plus the body.
+struct ParsedSkillMd {
+    metadata: Map<String, Value>,
+    content: String,
+}
+
+/// Parses `name` / `description` / metadata from `SKILL.md` frontmatter.
+fn parse_skill_md(markdown: &str) -> ParsedSkillMd {
+    let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+
+    let Some(after_open) = text.strip_prefix("---") else {
+        return ParsedSkillMd {
+            metadata: Map::new(),
+            content: text.to_string(),
+        };
+    };
+    // The opening delimiter must be alone on its line.
+    let Some(after_open) = strip_first_line_break(after_open) else {
+        return ParsedSkillMd {
+            metadata: Map::new(),
+            content: text.to_string(),
+        };
+    };
+    let Some(yaml_end) = find_frontmatter_end(after_open) else {
+        return ParsedSkillMd {
+            metadata: Map::new(),
+            content: text.to_string(),
+        };
+    };
+
+    let yaml = &after_open[..yaml_end];
+    let mut metadata = Map::new();
+    if !yaml.trim().is_empty() {
+        for line in yaml.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                metadata.insert(key.trim().to_string(), Value::String(unquote(value.trim())));
             }
         }
     }
 
-    let name = metadata
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| fallback_name.to_string());
-    let description = metadata
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("Skill: {name}"));
-
-    Ok((metadata, name, description))
+    let body_start = yaml_end + "---".len();
+    ParsedSkillMd {
+        metadata,
+        content: strip_leading_blank_lines(&after_open[body_start..]).to_string(),
+    }
 }
+
+/// Strips the rest of the opening delimiter's line, returning everything after the
+/// line break (`None` when the delimiter is not followed by a line break).
+fn strip_first_line_break(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start_matches([' ', '\t']);
+    let rest = trimmed
+        .strip_prefix("\r\n")
+        .or_else(|| trimmed.strip_prefix('\n'))?;
+    Some(rest)
+}
+
+/// Byte offset of the closing `---` line of the frontmatter.
+fn find_frontmatter_end(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim() == "---" {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Drops leading blank lines from the markdown body, mirroring the Java regex's
+/// `(?:\s*[\r\n]+)?` after the closing delimiter.
+fn strip_leading_blank_lines(text: &str) -> &str {
+    let mut rest = text;
+    while let Some((line, tail)) = split_first_line(rest) {
+        if !line.trim().is_empty() {
+            return rest;
+        }
+        rest = tail;
+    }
+    rest
+}
+
+fn split_first_line(text: &str) -> Option<(&str, &str)> {
+    let index = text.find('\n')?;
+    Some((&text[..index], &text[index + 1..]))
+}
+
+fn unquote(value: &str) -> String {
+    let v = value.trim();
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        v[1..v.len() - 1].replace("\\\"", "\"")
+    } else if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
+        v[1..v.len() - 1].to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nacos YAML frontmatter adaptation
+// ---------------------------------------------------------------------------
 
 /// Normalizes Nacos-exported skill ZIPs whose `SKILL.md` uses folded YAML
 /// frontmatter, mirroring `adaptNacosSkillZipForYamlFrontmatter`.
@@ -133,14 +270,16 @@ pub fn adapt_nacos_skill_zip(zip_bytes: &[u8]) -> Vec<u8> {
     let mut skill_path: Option<String> = None;
     let mut skill_md: Option<String> = None;
 
-    for i in 0..archive.len() {
-        let Ok(mut entry) = archive.by_index(i) else {
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
             return zip_bytes.to_vec();
         };
         if entry.is_dir() {
             continue;
         }
-        let name = normalize_entry_name(entry.name());
+        let Ok(name) = normalize_entry_name(entry.name()) else {
+            return zip_bytes.to_vec();
+        };
         let mut data = Vec::new();
         if entry.read_to_end(&mut data).is_err() {
             return zip_bytes.to_vec();
@@ -372,19 +511,19 @@ fn is_root_skill_md(name: &str) -> bool {
     }
 }
 
-fn normalize_entry_name(name: &str) -> String {
-    name.replace('\\', "/")
-}
-
-fn unquote(value: &str) -> String {
-    let v = value.trim();
-    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        v[1..v.len() - 1].replace("\\\"", "\"")
-    } else if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
-        v[1..v.len() - 1].to_string()
-    } else {
-        v.to_string()
+/// Normalizes a zip entry name, mirroring `SkillUtil#normalizeZipEntryName`.
+fn normalize_entry_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("Zip entry name cannot be null or empty.".to_string());
     }
+    let normalized = name.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return Err("Zip entry name must be a relative path.".to_string());
+    }
+    if normalized.split('/').any(|segment| segment == "..") {
+        return Err("Zip entry name must not contain parent directory segments.".to_string());
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -405,21 +544,109 @@ mod tests {
         buf
     }
 
+    fn make_binary_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = FileOptions::default().compression_method(CompressionMethod::Deflated);
+            for (name, content) in entries {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(content).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf
+    }
+
     #[test]
     fn parses_skill_from_zip() {
         let md = "---\nname: demo_skill\ndescription: A demo\n---\n# Body\nUse it.";
         let zip = make_zip(&[("demo_skill/SKILL.md", md), ("demo_skill/extra.txt", "hi")]);
-        let skill = create_from_zip(&zip, "nacos@public", "demo_skill").unwrap();
+        let skill = create_from_zip(&zip, "nacos@public").unwrap();
         assert_eq!(skill.name(), "demo_skill");
         assert_eq!(skill.description(), "A demo");
         assert_eq!(skill.source(), "nacos@public");
-        assert!(skill.resources().contains_key("demo_skill/extra.txt"));
+        // Resource keys are relative to the root directory (Java `createFromZip`).
+        assert!(skill.resources().contains_key("extra.txt"));
+        // SKILL.md itself is not a resource.
+        assert!(!skill.resources().contains_key("SKILL.md"));
+        assert!(skill.metadata().contains_key("name"));
+        assert!(skill.metadata().contains_key("description"));
     }
 
     #[test]
     fn missing_skill_md_errors() {
         let zip = make_zip(&[("demo/readme.txt", "x")]);
-        assert!(create_from_zip(&zip, "s", "demo").is_err());
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(err, "SKILL.md not found in zip content.");
+    }
+
+    #[test]
+    fn entries_without_a_single_root_are_rejected() {
+        // Top-level file: Java `separatorIndex <= 0`.
+        let md = "---\nname: n\ndescription: d\n---\nbody";
+        let err = create_from_zip(&make_zip(&[("SKILL.md", md)]), "s").unwrap_err();
+        assert_eq!(err, "Zip entries must be under a single root directory.");
+
+        // Two different roots.
+        let zip = make_zip(&[("a/SKILL.md", md), ("b/extra.txt", "x")]);
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(err, "Zip entries must share the same root directory.");
+    }
+
+    #[test]
+    fn nested_skill_md_is_rejected() {
+        let md = "---\nname: n\ndescription: d\n---\nbody";
+        let zip = make_zip(&[("root/sub/SKILL.md", md)]);
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(
+            err,
+            "SKILL.md must be located directly under the root directory."
+        );
+    }
+
+    #[test]
+    fn parent_directory_segments_are_rejected() {
+        let md = "---\nname: n\ndescription: d\n---\nbody";
+        let zip = make_zip(&[("root/SKILL.md", md), ("root/../evil.txt", "x")]);
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(
+            err,
+            "Zip entry name must not contain parent directory segments."
+        );
+    }
+
+    #[test]
+    fn missing_name_is_rejected() {
+        // Mirrors Java `SkillUtil.createFrom`: name/description are required.
+        let md = "---\ndescription: only desc\n---\nbody";
+        let zip = make_zip(&[("f/SKILL.md", md)]);
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(err, MISSING_METADATA_MESSAGE);
+    }
+
+    #[test]
+    fn missing_description_is_rejected() {
+        let md = "---\nname: n\ndescription: \"   \"\n---\nbody";
+        let zip = make_zip(&[("f/SKILL.md", md)]);
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(err, MISSING_METADATA_MESSAGE);
+    }
+
+    #[test]
+    fn empty_body_is_rejected() {
+        let md = "---\nname: n\ndescription: d\n---\n\n";
+        let zip = make_zip(&[("f/SKILL.md", md)]);
+        let err = create_from_zip(&zip, "s").unwrap_err();
+        assert_eq!(err, EMPTY_CONTENT_MESSAGE);
+    }
+
+    #[test]
+    fn empty_zip_is_rejected() {
+        assert_eq!(
+            create_from_zip(&[], "s").unwrap_err(),
+            "Zip content cannot be null or empty."
+        );
     }
 
     #[test]
@@ -477,19 +704,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_frontmatter_uses_fallback_name() {
-        let md = "---\ndescription: only desc\n---\nbody";
-        let zip = make_zip(&[("f/SKILL.md", md)]);
-        let skill = create_from_zip(&zip, "nacos@public", "fallback").unwrap();
-        assert_eq!(skill.name(), "fallback");
-        assert_eq!(skill.description(), "only desc");
+    fn resource_paths_are_relative_to_the_root() {
+        let md = "---\nname: r\ndescription: d\n---\nbody";
+        let zip = make_zip(&[("r/SKILL.md", md), ("r/scripts/run.sh", "echo hi")]);
+        let skill = create_from_zip(&zip, "s").unwrap();
+        assert_eq!(
+            skill.resources().get("scripts/run.sh").map(String::as_str),
+            Some("echo hi")
+        );
     }
 
     #[test]
-    fn resource_paths_are_normalized_to_forward_slashes() {
-        let md = "---\nname: r\n---\nbody";
-        let zip = make_zip(&[("r/SKILL.md", md), ("r/scripts/run.sh", "echo hi")]);
-        let skill = create_from_zip(&zip, "s", "r").unwrap();
-        assert!(skill.resources().contains_key("r/scripts/run.sh"));
+    fn backslash_entry_names_are_normalized() {
+        let md = "---\nname: b\ndescription: d\n---\nbody";
+        let zip = make_zip(&[("b\\SKILL.md", md), ("b\\docs\\a.txt", "x")]);
+        let skill = create_from_zip(&zip, "s").unwrap();
+        assert_eq!(
+            skill.resources().get("docs/a.txt").map(String::as_str),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn binary_resources_are_base64_encoded() {
+        let md = "---\nname: bn\ndescription: d\n---\nbody";
+        let zip = make_binary_zip(&[("bn/SKILL.md", md.as_bytes()), ("bn/logo.bin", &[0xff])]);
+        let skill = create_from_zip(&zip, "s").unwrap();
+        assert_eq!(
+            skill.resources().get("logo.bin").map(String::as_str),
+            Some("base64:/w==")
+        );
     }
 }

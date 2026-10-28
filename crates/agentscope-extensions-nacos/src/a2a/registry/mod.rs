@@ -9,8 +9,10 @@ use tracing::{info, warn};
 
 use crate::service::{AiServiceError, AiServiceResult, NacosAiService};
 
-use super::converter::convert_to_nacos_agent_card;
-use super::model::{A2aAgentCard, NacosAgentCard, NacosAgentEndpoint};
+use super::converter::{
+    apply_supported_interfaces, convert_to_nacos_agent_card, supported_interfaces,
+};
+use super::model::{A2aAgentCard, A2aAgentInterface, NacosAgentCard, NacosAgentEndpoint};
 use constants::{
     PROPERTIES_ENV_PREFIX, PROTOCOL_TYPE_HTTP, PROTOCOL_TYPE_HTTPS, TRANSPORT_DEFAULT_PROTOCOL,
 };
@@ -404,10 +406,18 @@ impl NacosA2aRegistry {
             count = properties.transport_properties.len(),
             "Register endpoint(s) to Nacos"
         );
+        // Java collects the endpoints into a `Set` when more than one transport is
+        // configured, so identical endpoints are registered exactly once.
+        let mut endpoints: Vec<NacosAgentEndpoint> = Vec::new();
         for transport in properties.transport_properties.values() {
             let endpoint = NacosAgentEndpoint::from_transport(transport, card.version.as_deref());
+            if !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
+            }
+        }
+        for endpoint in &endpoints {
             self.service
-                .register_agent_endpoint(&card.name, &endpoint)
+                .register_agent_endpoint(&card.name, endpoint)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -421,6 +431,12 @@ impl NacosA2aRegistry {
 
 /// Registration strategy for A2A transports, mirroring
 /// `io.agentscope.core.a2a.server.transport.TransportProperties`.
+///
+/// The protocol side ships an equivalent
+/// `agentscope_extensions_a2a_server::card::TransportProperties`, but that crate
+/// pulls in `axum` and models `host`/`port` as `Option`s with an `extra` map — this
+/// crate only feeds `AgentRegistry::register`, so the minimal shape is kept here
+/// (see tracker §4.2 for the dedup request).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransportProperties {
     pub transport_type: String,
@@ -629,22 +645,29 @@ fn overwrite_attributes(
     builder.build().unwrap_or_default()
 }
 
-/// Rewrites `preferredTransport` / `url` on the card and appends the new
-/// interface, mirroring `NacosAgentRegistry#doOverwrite`.
+/// Rewrites the preferred interface on the card, mirroring
+/// `NacosAgentRegistry#doOverwrite`.
+///
+/// Java rewrites `supportedInterfaces`: the new interface is removed when already
+/// present (`removeIf(agentInterface::equals)`) and then inserted at index 0, so
+/// the preferred interface is listed exactly once and comes first. In the A2A 0.3
+/// shape used here that is `url` / `preferredTransport` (first entry) plus
+/// `additionalInterfaces` (the rest).
 fn do_overwrite(
     agent_card: &A2aAgentCard,
     transport: &NacosA2aTransportProperties,
 ) -> A2aAgentCard {
     let new_url = generate_new_url(transport);
-    let transport_name = transport.transport.clone();
+    let new_interface = A2aAgentInterface {
+        url: new_url,
+        transport: transport.transport.clone(),
+    };
+    let mut interfaces = supported_interfaces(agent_card);
+    interfaces.retain(|each| each != &new_interface);
+    interfaces.insert(0, new_interface);
+
     let mut card = agent_card.clone();
-    card.url = new_url.clone();
-    card.preferred_transport = Some(transport_name.clone());
-    let ifaces = card.additional_interfaces.get_or_insert_with(Vec::new);
-    ifaces.push(super::model::A2aAgentInterface {
-        url: new_url.clone(),
-        transport: transport_name,
-    });
+    apply_supported_interfaces(&mut card, &interfaces);
     card
 }
 
@@ -811,7 +834,7 @@ mod tests {
         let released = svc.released_cards();
         assert_eq!(released.len(), 1);
         let card = svc.get_agent_card("agent", None).await.unwrap().unwrap();
-        assert_eq!(card.url, "https://newhost:8443/a2a");
+        assert_eq!(card.url.as_deref(), Some("https://newhost:8443/a2a"));
         assert_eq!(card.preferred_transport.as_deref(), Some("HTTP"));
 
         // The registered endpoint carries the rewritten transport/address/port.
@@ -822,5 +845,74 @@ mod tests {
         assert_eq!(endpoints[0].1.port, 8443);
         assert!(endpoints[0].1.support_tls);
         let _ = NacosAgentCard::new("x", "y");
+    }
+
+    #[test]
+    fn do_overwrite_dedups_and_prepends_the_interface() {
+        // Mirrors Java `doOverwrite`: `removeIf(agentInterface::equals)` + `add(0, ..)`.
+        let mut card = A2aAgentCard::new("agent", "http://orig:1");
+        card.preferred_transport = Some("JSONRPC".into());
+        card.additional_interfaces = Some(vec![A2aAgentInterface {
+            url: "http://orig:1/grpc".into(),
+            transport: "GRPC".into(),
+        }]);
+        let transport = NacosA2aTransportProperties::builder()
+            .transport("HTTP")
+            .host("newhost")
+            .port(8443)
+            .support_tls(true)
+            .build()
+            .unwrap();
+
+        let overwritten = do_overwrite(&card, &transport);
+        assert_eq!(overwritten.url, "https://newhost:8443");
+        assert_eq!(overwritten.preferred_transport.as_deref(), Some("HTTP"));
+        assert_eq!(
+            supported_interfaces(&overwritten),
+            vec![
+                A2aAgentInterface {
+                    url: "https://newhost:8443".into(),
+                    transport: "HTTP".into(),
+                },
+                A2aAgentInterface {
+                    url: "http://orig:1".into(),
+                    transport: "JSONRPC".into(),
+                },
+                A2aAgentInterface {
+                    url: "http://orig:1/grpc".into(),
+                    transport: "GRPC".into(),
+                },
+            ]
+        );
+
+        // Overwriting again with the same transport must not add a duplicate.
+        let again = do_overwrite(&overwritten, &transport);
+        assert_eq!(supported_interfaces(&again).len(), 3);
+        assert_eq!(again.url, "https://newhost:8443");
+    }
+
+    #[tokio::test]
+    async fn duplicate_endpoints_are_registered_once() {
+        // Java collects the endpoints into a `Set`; two transport entries that
+        // resolve to the same endpoint must only be registered once.
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let registry = NacosA2aRegistry::new(svc.clone());
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+        let transport = NacosA2aTransportProperties::builder()
+            .transport("JSONRPC")
+            .host("localhost")
+            .port(8080)
+            .build()
+            .unwrap();
+        let mut props = NacosA2aRegistryProperties::default();
+        props
+            .transport_properties
+            .insert("JSONRPC".into(), transport.clone());
+        props
+            .transport_properties
+            .insert("JSON-RPC-ALIAS".into(), transport);
+
+        registry.register_agent(&card, &props).await.unwrap();
+        assert_eq!(svc.registered_endpoints().len(), 1);
     }
 }

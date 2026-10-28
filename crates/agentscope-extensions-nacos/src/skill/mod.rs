@@ -164,7 +164,7 @@ impl NacosSkillRepository {
             return Err(format!("Skill not found: {name}"));
         }
         let adapted = frontmatter::adapt_nacos_skill_zip(&zip_bytes);
-        frontmatter::create_from_zip(&adapted, &self.source, name.trim())
+        frontmatter::create_from_zip(&adapted, &self.source)
     }
 
     /// Whether a skill exists in Nacos, mirroring `skillExists(String)`.

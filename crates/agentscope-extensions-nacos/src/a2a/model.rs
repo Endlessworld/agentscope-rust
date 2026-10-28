@@ -1,125 +1,81 @@
 //! Data model for the Nacos A2A extension.
 //!
 //! Two card shapes are involved:
-//! * [`A2aAgentCard`] — the crate-local A2A-specification card (mirrors
-//!   `io.a2a.spec.AgentCard`). Kept here because the `agentscope-extensions-protocol`
-//!   A2A model is not yet dependency-ready (see tracker §4.2); when it lands, this
-//!   type should be replaced by a re-export.
+//! * [`A2aAgentCard`] — the A2A-specification card. Its payload is the protocol
+//!   crate's [`AgentCard`](agentscope_extensions_a2a_client::model::AgentCard);
+//!   the wrapper only adds `documentationUrl`, which the protocol model does not
+//!   declare yet (tracker §4.2).
 //! * [`NacosAgentCard`] — the Nacos-side card (mirrors
 //!   `com.alibaba.nacos.api.ai.model.a2a.AgentCard`).
+//!
+//! The A2A sub-types (`AgentCapabilities` / `AgentProvider` / `AgentInterface` /
+//! `AgentSkill`) are **re-exported from `agentscope-extensions-a2a-client`** —
+//! this crate no longer declares parallel copies. The historical names are kept
+//! as aliases so the public API of this crate stays source-compatible.
 
+use agentscope_extensions_a2a_client::model::AgentCard;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A2A-spec capabilities, mirroring `io.a2a.spec.AgentCapabilities`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct A2aAgentCapabilities {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub streaming: Option<bool>,
-    #[serde(rename = "pushNotifications", skip_serializing_if = "Option::is_none")]
-    pub push_notifications: Option<bool>,
-    #[serde(
-        rename = "stateTransitionHistory",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub state_transition_history: Option<bool>,
-}
+// ---------------------------------------------------------------------------
+// Reused A2A-spec model (protocol crate)
+// ---------------------------------------------------------------------------
 
-/// A2A-spec agent provider, mirroring `io.a2a.spec.AgentProvider`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct A2aAgentProvider {
-    pub organization: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-}
+pub use agentscope_extensions_a2a_client::model::{
+    AgentCapabilities as A2aAgentCapabilities, AgentInterface as A2aAgentInterface,
+    AgentProvider as A2aAgentProvider, AgentSkill as A2aAgentSkill,
+};
 
-/// A2A-spec transport interface, mirroring `io.a2a.spec.AgentInterface`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct A2aAgentInterface {
-    pub url: String,
-    pub transport: String,
-}
-
-/// A2A-spec skill, mirroring `io.a2a.spec.AgentSkill`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct A2aAgentSkill {
-    pub id: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub examples: Option<Vec<String>>,
-    #[serde(rename = "inputModes", skip_serializing_if = "Option::is_none")]
-    pub input_modes: Option<Vec<String>>,
-    #[serde(rename = "outputModes", skip_serializing_if = "Option::is_none")]
-    pub output_modes: Option<Vec<String>>,
-}
-
-/// A2A-spec agent card, mirroring `io.a2a.spec.AgentCard` (the subset Nacos round-trips).
+/// A2A-specification agent card, mirroring `io.a2a.spec.AgentCard`.
+///
+/// The card payload is the protocol [`AgentCard`] (reused, not re-declared);
+/// field access is forwarded through `Deref`/`DerefMut`, so `card.url`,
+/// `card.capabilities`, `card.skills`, … keep working.
+///
+/// Only `documentationUrl` is added locally: the protocol `AgentCard` has no such
+/// field yet, and dropping it would lose data that Java
+/// `AgentCardConverterUtil` preserves in both directions. Once the protocol model
+/// carries `documentation_url`, this wrapper collapses into a plain `pub use`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct A2aAgentCard {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(rename = "protocolVersion", skip_serializing_if = "Option::is_none")]
-    pub protocol_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<A2aAgentProvider>,
-    #[serde(rename = "preferredTransport", skip_serializing_if = "Option::is_none")]
-    pub preferred_transport: Option<String>,
-    #[serde(
-        rename = "additionalInterfaces",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub additional_interfaces: Option<Vec<A2aAgentInterface>>,
-    #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
-    pub icon_url: Option<String>,
-    pub capabilities: A2aAgentCapabilities,
-    #[serde(rename = "defaultInputModes")]
-    pub default_input_modes: Vec<String>,
-    #[serde(rename = "defaultOutputModes")]
-    pub default_output_modes: Vec<String>,
-    pub skills: Vec<A2aAgentSkill>,
-    #[serde(rename = "securitySchemes", skip_serializing_if = "Option::is_none")]
-    pub security_schemes: Option<serde_json::Map<String, Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security: Option<Vec<serde_json::Map<String, Value>>>,
-    #[serde(
-        rename = "supportsAuthenticatedExtendedCard",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub supports_authenticated_extended_card: Option<bool>,
+    #[serde(flatten)]
+    pub inner: AgentCard,
     #[serde(rename = "documentationUrl", skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
 }
 
+impl std::ops::Deref for A2aAgentCard {
+    type Target = AgentCard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for A2aAgentCard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl A2aAgentCard {
+    /// A minimal card with the protocol defaults (`preferredTransport: JSONRPC`,
+    /// `text/plain` input/output modes).
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            description: None,
-            url: url.into(),
-            version: None,
-            protocol_version: None,
-            provider: None,
-            preferred_transport: Some("JSONRPC".to_string()),
-            additional_interfaces: None,
-            icon_url: None,
-            capabilities: A2aAgentCapabilities::default(),
-            default_input_modes: vec!["text/plain".to_string()],
-            default_output_modes: vec!["text/plain".to_string()],
-            skills: Vec::new(),
-            security_schemes: None,
-            security: None,
-            supports_authenticated_extended_card: None,
+            inner: AgentCard::new(name, url),
             documentation_url: None,
         }
+    }
+
+    /// The `documentationUrl` property.
+    pub fn documentation_url(&self) -> Option<&str> {
+        self.documentation_url.as_deref()
+    }
+
+    /// Sets the `documentationUrl` property.
+    pub fn set_documentation_url(&mut self, url: impl Into<String>) {
+        self.documentation_url = Some(url.into());
     }
 }
 
@@ -143,6 +99,8 @@ pub struct NacosAgentCapabilities {
 }
 
 /// Nacos agent provider.
+///
+/// Unlike the A2A model, the Nacos `url` is optional (`AgentProvider#setUrl(null)`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NacosAgentProvider {
     pub organization: String,
@@ -176,14 +134,15 @@ pub struct NacosAgentSkill {
 
 /// Nacos-side agent card, mirroring `com.alibaba.nacos.api.ai.model.a2a.AgentCard`.
 ///
-/// `securitySchemes` is kept as opaque JSON (Nacos does not retain the concrete
-/// A2A subtype — see Java `AgentCardConverterUtil`).
+/// `securitySchemes` is stored as JSON maps in the A2A 0.3 shape (see
+/// [`super::security_scheme`]); typed A2A schemes are their `type`-dispatched view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NacosAgentCard {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(rename = "protocolVersion", skip_serializing_if = "Option::is_none")]
@@ -216,6 +175,30 @@ pub struct NacosAgentCard {
     pub supports_authenticated_extended_card: Option<bool>,
     #[serde(rename = "documentationUrl", skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
+}
+
+impl NacosAgentCard {
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            url: Some(url.into()),
+            version: None,
+            protocol_version: None,
+            provider: None,
+            preferred_transport: Some("JSONRPC".to_string()),
+            additional_interfaces: None,
+            icon_url: None,
+            capabilities: NacosAgentCapabilities::default(),
+            default_input_modes: vec!["text/plain".to_string()],
+            default_output_modes: vec!["text/plain".to_string()],
+            skills: Vec::new(),
+            security_schemes: None,
+            security: None,
+            supports_authenticated_extended_card: None,
+            documentation_url: None,
+        }
+    }
 }
 
 /// A registered Nacos A2A endpoint, mirroring
@@ -259,30 +242,6 @@ impl NacosAgentEndpoint {
             version: version.map(|v| v.to_string()),
             protocol: transport.protocol.clone(),
             query: transport.query.clone(),
-        }
-    }
-}
-
-impl NacosAgentCard {
-    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: None,
-            url: url.into(),
-            version: None,
-            protocol_version: None,
-            provider: None,
-            preferred_transport: Some("JSONRPC".to_string()),
-            additional_interfaces: None,
-            icon_url: None,
-            capabilities: NacosAgentCapabilities::default(),
-            default_input_modes: vec!["text/plain".to_string()],
-            default_output_modes: vec!["text/plain".to_string()],
-            skills: Vec::new(),
-            security_schemes: None,
-            security: None,
-            supports_authenticated_extended_card: None,
-            documentation_url: None,
         }
     }
 }

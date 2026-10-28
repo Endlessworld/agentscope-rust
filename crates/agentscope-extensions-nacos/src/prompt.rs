@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::service::{
     render_template, AiServiceError, AiServiceResult, NacosAiService, NacosPrompt, PromptListener,
 };
+use tracing::warn;
 
 /// Sentinel for "prompt not found in Nacos", mirroring Java's `EMPTY_SENTINEL`.
 fn empty_sentinel() -> NacosPrompt {
@@ -103,13 +104,10 @@ impl NacosPromptListener {
         // Listener keeps the local cache current on Nacos push updates.
         let cache = self.prompts.clone();
         let listener: PromptListener = Arc::new(move |key, prompt| {
-            if prompt.template.is_empty() {
-                return;
-            }
-            cache
+            let mut guard = cache
                 .lock()
-                .unwrap()
-                .insert(key.to_string(), prompt.clone());
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            apply_prompt_push(&mut guard, key, prompt);
         });
 
         let loaded = self
@@ -123,6 +121,29 @@ impl NacosPromptListener {
         guard.insert(prompt_key.to_string(), chosen.clone());
         Ok(chosen)
     }
+}
+
+/// Applies a Nacos prompt push event to the local cache, mirroring
+/// `AbstractNacosPromptListener#onEvent` as used by `NacosPromptListener`.
+///
+/// Java only drops the event when `promptKey` is null/empty; a payload whose
+/// template is the **empty string** is written to the cache as-is (the empty
+/// template is a legitimate "clear" value, and `getPrompt` is what substitutes the
+/// default/empty result later). A `null` payload cannot be expressed by the Rust
+/// callback type, so only the key check remains.
+///
+/// Returns whether the cache was updated.
+pub fn apply_prompt_push(
+    cache: &mut HashMap<String, NacosPrompt>,
+    key: &str,
+    prompt: &NacosPrompt,
+) -> bool {
+    if key.is_empty() {
+        warn!("Received prompt event with null or empty promptKey");
+        return false;
+    }
+    cache.insert(key.to_string(), prompt.clone());
+    true
 }
 
 /// Renders a default value with args, mirroring `renderDefault`.
@@ -253,5 +274,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "fallback");
+    }
+
+    #[tokio::test]
+    async fn empty_template_push_is_stored_as_is() {
+        // Java `onEvent`: `prompt != null && getTemplate() != null` -> put, even for
+        // the empty template. Only `null` payloads are dropped.
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        svc.set_prompt("p", NacosPrompt::new("v1"));
+        let listener = NacosPromptListener::new(svc.clone());
+        assert_eq!(listener.get_prompt("p").await.unwrap(), "v1");
+
+        svc.fire_prompt_update("p", NacosPrompt::new(""));
+        assert_eq!(listener.get_prompt("p").await.unwrap(), "");
+    }
+
+    #[test]
+    fn push_with_empty_key_is_dropped() {
+        let mut cache = HashMap::new();
+        cache.insert("kept".to_string(), NacosPrompt::new("v1"));
+
+        assert!(!apply_prompt_push(&mut cache, "", &NacosPrompt::new("v2")));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache["kept"].template, "v1");
+
+        assert!(apply_prompt_push(&mut cache, "new", &NacosPrompt::new("")));
+        assert_eq!(cache["new"].template, "");
     }
 }
