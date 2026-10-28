@@ -18,9 +18,9 @@
 | Java 规模（2026-10-22 静态实测） | 主代码 **3529 物理行 / 3197 非空行**；测试 **3432 物理行 / 2813 非空行**（原记「~3177 / ~2813」是**非空行口径**，与实测一致，非「偏低」，见 §静态复核记录 → §3.2） |
 | Java 类数（静态实测） | 主代码 3 文件 / 3 顶层类 + 6 嵌套类 = **9 个类型**；测试 3 文件 / 12 个嵌套测试类 / **192 个 `@Test`**（git 23 + mysql 61 + pg 108） |
 | Rust crate | `crates/agentscope-extensions-skills` |
-| Rust 规模（静态实测） | 8 个 `.rs` / **3027 物理行 / 2753 非空行**（纯代码 2435；其中 `#[cfg(test)]` 456 行，实现 2571 行）/ **33 个 `#[test]`**（0 个 `#[tokio::test]`、0 doc-test，源码无 ``` 代码块） |
+| Rust 规模（2026-10-28 实测） | 8 个 `.rs` / **5304 物理行** / **93 个 `#[test]`**（git 35 / mysql 26 / postgresql 18 / repository 4 / sql 5 / util 5；0 个 `#[tokio::test]`、0 doc-test）；依赖收敛到 5 个（见 §9.7） |
 | 迁移波次 | C |
-| 当前状态 | 进行中（编译与测试全绿；**2026-10-26** 已收敛 P1-01~P1-08/P1-10，见 §8） |
+| 当前状态 | **§3.2 的 P1/P2 已全部收敛**（2026-10-28，见 §9）；P2-01 已落为 trait 方法（§7.1）、P2-09 保持 `Result`（§7.2）、P0-01 已落 jdbc crate；唯一「进行中」项为 P1-09 测试覆盖（93 vs Java 192，§9.5） |
 
 ## 2. Java 清单与依赖映射
 
@@ -52,10 +52,10 @@
 |---|---|---|---|
 | `io.agentscope.core.skill.repository.AgentSkillRepository`（core 接口） | skill 仓库契约：`getSkill/getAllSkillNames/getAllSkills/save/delete/skillExists/getRepositoryInfo/getSource/isWriteable/close` | `AgentSkillRepository`（本 crate，`src/repository.rs`） | 复用 harness `AgentSkill`；用 `Result` 表达错误，不再靠返回 bool + 抛异常混用 |
 | `AgentSkillRepositoryInfo`（core） | 仓库元信息：type/location/writable | `AgentSkillRepositoryInfo`（本 crate） | 字段一一对应（`repo_type`/`location`/`writable`），`Display` 格式与 Java `toString` 一致 |
-| `setWriteable(boolean)`（core 接口方法） | 运行时切换只读/可写 | **无对应** | Rust trait 无 `set_writeable`，`writeable` 在构造后不可变（`is_writeable()` 只读）。Java 三个实现均有该方法，属接口级缺口（§3.2 P2-01） |
-| `GitSkillRepository` | 只读；把远程 Git 仓库 clone 到临时目录，按 `skills/` 约定或 `skillsRoot` 加载；读操作触发同步 | `git::GitSkillRepository` | 走系统 `git` CLI（对齐 Java「依赖系统 Git 凭据」），无需 `git2` C 依赖。**语义差异**（§静态复核记录）：技能名取自**目录名**（Java 取 SKILL.md frontmatter 的 `name`）；**description 取 SKILL.md 首个非空行**（Java 取 frontmatter 的 `description`，Rust 对 frontmatter 文件会返回 `---`）；`ls-remote` 未按 `refs/heads/<branch>` 过滤；remote 不可达时 Java 会 pull、Rust 跳过；`save()` Rust 返回 `Err(ReadOnly)`（Java 返回 `false`） |
-| `MysqlSkillRepository` | MySQL 两张表（`agentscope_skills` / `agentscope_skill_resources`）CRUD；`createIfNotExist`；`metadata_json` 兼容探测 | `mysql::MysqlSkillRepository` | 通过 `SqlDatabase` 抽象（见 2.1），默认内存实现可测。**语义差异**：未 `CREATE DATABASE`、表名不带 `<db>.` 前缀、`createIfNotExist=false` 时不做存在性校验、`get_source()` 返回 `"mysql"`（Java 为 `mysql_<db>_<table>`）、DDL 缺 `utf8mb4` 字符集、空/空白表名不回退默认值（Java 回退）、`delete()` 无事务（§静态复核记录） |
-| `PostgresSkillRepository` | PostgreSQL schema+两张表 CRUD；`metadata_json` 兼容探测；identifier 双引号转义 | `postgresql::PostgresSkillRepository` | 同上；identifier 最大长度 63（Java）/ schema 概念。**语义差异**：探测不校验 `DATA_TYPE ∈ {text, character varying, character}`（Java 对 `jsonb` 返回 false）；`get_source()` 返回 `"postgresql"`（Java 为 `postgresql_<schema>_<table>`）；资源无 1000 行分批；空/空白表名不回退默认值；`delete()` 无事务（§静态复核记录） |
+| `setWriteable(boolean)`（core 接口方法） | 运行时切换只读/可写 | `AgentSkillRepository::set_writeable(&self, bool)` | **已对齐**（§7.1）：SQL 后端用 `AtomicBool` 实时生效，git 按 Java 语义忽略并 warn；harness `SkillRepository` 不含该方法（保持只读语义） |
+| `GitSkillRepository` | 只读；把远程 Git 仓库 clone 到临时目录，按 `skills/` 约定或 `skillsRoot` 加载；读操作触发同步 | `git::GitSkillRepository` | 走系统 `git` CLI（对齐 Java「依赖系统 Git 凭据」），无需 `git2` C 依赖。**语义差异**（§静态复核记录，P1/P2 已收敛于 §8/§9）：`save()` 返回 `Ok(false)`（P2-06 已对齐）、`skill_exists("")` 返回 `Ok(false)`（P2-08 已对齐）；其余 5 项已在 §8.1 收敛 |
+| `MysqlSkillRepository` | MySQL 两张表（`agentscope_skills` / `agentscope_skill_resources`）CRUD；`createIfNotExist`；`metadata_json` 兼容探测 | `mysql::MysqlSkillRepository` | 通过 `SqlDatabase` 抽象（见 2.1），默认内存实现可测。**语义差异**：已无（P1-05/06/10、P2-02/03/05 均已收敛，见 §8.1 / §9）。本类型已 deprecated，**勿扩展** |
+| `PostgresSkillRepository` | PostgreSQL schema+两张表 CRUD；`metadata_json` 兼容探测；identifier 双引号转义 | `postgresql::PostgresSkillRepository` | 同上；identifier 最大长度 63（Java）/ schema 概念。**语义差异**：已无（P1-07/10、P2-02/03/04 均已收敛，见 §8.1 / §9）；资源插入按 `RESOURCE_BATCH_SIZE = 1000` 分块。本类型已 deprecated，**勿扩展** |
 
 > **上游状态提醒（2026-10-22 静态核对）**：Java `MysqlSkillRepository` / `PostgresSkillRepository` 均标注 `@Deprecated`，官方替代是 `agentscope-extensions-jdbc` 的 `JdbcAgentSkillRepository`（**1184 物理行 / 1099 非空行**，namespace 列 + 方言抽象，配套 `dialect/table/SkillDialect.java` / `SkillResourcesDialect.java`）。本 crate 对齐的是**已弃用的 Java 实现**；Rust `agentscope-extensions-jdbc` 目前**无 skill 模块**（`rg -i skill` = 0 命中）。是否补 `JdbcAgentSkillRepository` 需汇总方裁定（§3.2 P0-01）。
 
@@ -79,7 +79,7 @@
 | `MysqlSkillRepository` | `MysqlSkillRepository` | 已完成 | `src/mysql.rs`，两表 + metadata_json 兼容 |
 | `PostgresSkillRepository` | `PostgresSkillRepository` | 已完成 | `src/postgresql.rs`，schema + 两表 |
 | `RepoBackedSkillRepository`（harness 适配器） | — | 已完成 | `src/repository.rs`；已覆写 `skill_dir`（git 透出真实目录 / SQL 资源落盘缓存），见 §8.1 P1-08 |
-| 测试 | 3 个 `*Test` | 进行中 | 现 **54 个 `#[test]`**（git 16 / mysql 17 / pg 10 / repository 4 / sql 3 / util 4），其中 git 侧 11 个为 `file://` 真实仓用例；Java 192（见 §8.2） |
+| 测试 | 3 个 `*Test` | 进行中 | 现 **93 个 `#[test]`**（git 35 / mysql 26 / pg 18 / repository 4 / sql 5 / util 5），git 侧 20 个为 `file://` 真实仓用例；Java 192（见 §8.2 / §9.5） |
 
 ### 3.2 静态复核发现的语义缺口（2026-10-22，未编译、仅静态核对）
 > 状态取值沿用 §0：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -96,19 +96,19 @@
 | P1-06 | MySQL `createIfNotExist=false` 不校验存在性 | mysql | P1 | `verifyDatabaseExists` + `verifyTablesExist`，缺表抛 `IllegalStateException` | **完全跳过校验**，后续查询静默返回空集 | 已完成（§8.1） |
 | P1-07 | PostgreSQL `metadata_json` 类型探测缺失 | postgresql | P1 | `isSupportedMetadataJsonColumnType`：`{text, character varying, character}`，`jsonb` → **false**（走 legacy 路径） | 只判列是否存在，不看 `DATA_TYPE`；`jsonb` 会被当作支持 → 写 `metadata_json` 报错 | 已完成（§8.1） |
 | P1-08 | 适配器未透出 `skill_dir` | 全部 | P1 | Java `AgentSkill` 带 `originDir`，`load_skill_through_path` 可定位磁盘目录 | `RepoBackedSkillRepository` 未覆写 `skill_dir` → harness `skill_middleware::load_index` 收不到目录 → **加载工具对 git/SQL 技能不可用** | 已完成（§8.1：trait + 适配器透出/落盘） |
-| P1-09 | 测试覆盖远低于 Java | 全部 | P1 | 192 个 `@Test`（git 23 / mysql 61 / pg 108） | 33 个 `#[test]`（git **5** / mysql 12 / pg 7 / sql 3 / util 4 / repository 2）；**git 侧无 file:// 真实克隆/拉取/分支用例** | 进行中（§8.2：+20 用例） |
+| P1-09 | 测试覆盖远低于 Java | 全部 | P1 | 192 个 `@Test`（git 23 / mysql 61 / pg 108） | 93 个 `#[test]`（git 35 / mysql 26 / pg 18 / sql 5 / util 5 / repository 4）；git 侧 20 个 `file://` 真实仓用例 | 进行中（§8.2 +20、§9.5 +33；仍低于 Java 192，未覆盖清单见 §9.5） |
 | P1-10 | `get_source()` 命名不含库/表/模式 | mysql / postgresql | P1 | mysql → `mysql_<db>_<table>`；pg → `postgresql_<schema>_<table>` | 固定返回 `"mysql"` / `"postgresql"`（多实例时 `source` 冲突，`RepoBackedSkillRepository` 的 `repo_id` 也随之冲突） | 已完成（§8.1） |
-| P1-11 | frontmatter 闭合分隔符未要求「独占一行」 | git | P1 | `MarkdownSkillParser.FRONTMATTER_PATTERN` 要求闭合 `---` / `...` 紧跟换行且**行首无缩进**，行尾只允许空白 | `split_frontmatter` 用 `line.trim() == "---"` 判定 → YAML `|` / `>` 块标量里的缩进 `  ---` 会被误判为闭合围栏，YAML 被提前截断、后续正文被当成 body | 已完成（§8.7） |
-| P2-01 | 缺 `set_writeable` | 全部 | P2 | Java 接口有 `setWriteable(boolean)`，三个实现均可运行时切换 | Rust trait 无该方法，`writeable` 构造后不可变 | 设计决定（不迁移）— Rust 用配置表达，**需汇总方确认** |
-| P2-02 | 空/空白库名·表名不回退默认值 | mysql / postgresql | P2 | null/空 → 回退默认名；并 `trim()` | `validate_identifier("")` 直接报错；含空格也报错（Java `trim()` 后可用） | 待办 |
-| P2-03 | `delete()` 无事务 | mysql / postgresql | P2 | Java `delete` 开事务（`setAutoCommit(false)` → commit/rollback） | Rust `delete_skill_internal` 连发 2 条 DELETE（resources + skill）且**不开事务** → 中途失败留孤儿资源 | 待办 |
-| P2-04 | PostgreSQL 资源插入无 1000 行分批 | postgresql | P2 | `RESOURCE_BATCH_SIZE = 1000` 分块 `executeBatch`（避开绑定参数上限） | 逐条 `execute`，无分批 | 待办（真实驱动落地后处理） |
+| P1-11 | frontmatter 闭合分隔符未要求「独占一行」 | git | P1 | `MarkdownSkillParser.FRONTMATTER_PATTERN` 要求闭合 `---` / `...` 紧跟换行且**行首无缩进**，行尾只允许空白 | `split_frontmatter` 用 `line.trim() == "---"` 判定 → YAML 块标量（竖线 / 折行两类）里的缩进 `  ---` 会被误判为闭合围栏，YAML 被提前截断、后续正文被当成 body | 已完成（§8.7） |
+| P2-01 | 缺 `set_writeable` | 全部 | P2 | Java 接口有 `setWriteable(boolean)`，三个实现均可运行时切换 | `AgentSkillRepository::set_writeable(&self, bool)`（§7.1）；SQL 后端 `AtomicBool` 实时生效、git 忽略并 warn | 已完成（§7.1，按裁定 5 落地为 trait 方法） |
+| P2-02 | 空/空白库名·表名不回退默认值 | mysql / postgresql | P2 | null/空 → 回退默认名；并 `trim()` | `validate_identifier("")` 直接报错；含空格也报错（Java `trim()` 后可用） | 已完成（§9.1：`util::resolve_identifier`，构造函数先 trim/回退再校验） |
+| P2-03 | `delete()` 无事务 | mysql / postgresql | P2 | Java `delete` 开事务（`setAutoCommit(false)` → commit/rollback） | Rust `delete_skill_internal` 连发 2 条 DELETE（resources + skill）且**不开事务** → 中途失败留孤儿资源 | 已完成（§9.2：`SqlConnection::in_transaction` + 存在性预检） |
+| P2-04 | PostgreSQL 资源插入无 1000 行分批 | postgresql | P2 | `RESOURCE_BATCH_SIZE = 1000` 分块 `executeBatch`（避开绑定参数上限） | 逐条 `execute`，无分批 | 已完成（§9.3：`SqlConnection::execute_batch` + `RESOURCE_BATCH_SIZE` 分块） |
 | P2-05 | MySQL DDL 缺 utf8mb4 字符集 | mysql | P2 | `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（两张表均带） | Rust 建表 DDL 未带字符集/排序规则 | 已完成（§8.3） |
-| P2-06 | git `save()` 返回值不一致 | git | P2 | Java 只读仓 `save()` **返回 false** | Rust 返回 `Err(SkillRepositoryError::ReadOnly)` | 待办（`delete()` 已是 `Ok(false)`，与之不一致） |
+| P2-06 | git `save()` 返回值不一致 | git | P2 | Java 只读仓 `save()` **返回 false** | Rust 返回 `Err(SkillRepositoryError::ReadOnly)` | 已完成（§9.4：改为 `Ok(false)`，与 `delete()` 一致） |
 | P2-07 | git remote URL 未 trim | git | P2 | 构造时 `remoteUrl.trim()` 后保存 | 只用 `trim().is_empty()` 判空，**原样保存**未 trim 的 URL | 已完成（§8.3） |
-| P2-08 | `skill_exists("")` 行为不一致 | mysql / postgresql | P2 | Java `skillExists(null/空)` **返回 false**，不抛异常 | Rust `validate_skill_name` → `Err(InvalidArgument)` | 待办 |
+| P2-08 | `skill_exists("")` 行为不一致 | mysql / postgresql | P2 | Java `skillExists(null/空)` **返回 false**，不抛异常 | Rust `validate_skill_name` → `Err(InvalidArgument)` | 已完成（§9.6：mysql / postgresql / git 三后端均返回 `Ok(false)`，git 侧不触发同步） |
 | P2-09 | `close()` 失败语义不一致 | git | P2 | Java `close()` 删目录失败只 `warn`，不抛 | Rust `close()` 返回 `Err(Io)` | 设计决定（不迁移）— Rust 用 Result 表达，**需汇总方确认** |
-| P2-10 | 未使用的依赖与死代码 | 全部 | P2 | — | `Cargo.toml` 的 `agentscope-core` / `async-trait` / `futures` / `chrono` / `base64` / `serde`（derive）**均未在 src 中使用**；`InMemorySqlDatabase::has_metadata_column` 为 dead code（既有 warning） | 待办（清理依赖需汇总方登记 §4.2） |
+| P2-10 | 未使用的依赖与死代码 | 全部 | P2 | — | `Cargo.toml` 的 `agentscope-core` / `async-trait` / `futures` / `chrono` / `serde`（derive）在 src 中零引用（`base64` 实际在用）；`InMemorySqlDatabase::has_metadata_column` 无任何调用者（与 `metadata_column_type().is_some()` 重复） | 已完成（§9.7：`agentscope-core`/`async-trait`/`futures`/`chrono`/`serde` 与未用 dev-dep `tokio` 已删；`base64` 实为在用以保留；`has_metadata_column` 已删） |
 
 **分层结论（与 harness `skill/` 存量代码核对，无重复实现）**：
 - harness `agent/skill/repository.rs` 提供**目录式** `SkillRepository`（`load()` → `Vec<AgentSkill>`）+ `FileSystemSkillRepository` / `WorkspaceSkillRepository`；本 crate 提供**后端 keyed CRUD** `AgentSkillRepository` + `RepoBackedSkillRepository` 适配器。两者是**不同抽象层次**，模型统一复用 harness `AgentSkill` / `Metadata` / `SkillResources`，**未发现重复的 skill 模型或重复的目录扫描实现**（git 侧直接调用 harness 的 `load_skills_from_dir`）。
@@ -117,9 +117,11 @@
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 
-**状态：进行中。** 波次 C，crate `crates/agentscope-extensions-skills` 实现 3 个后端仓库 + harness 适配器。**2026-10-26 已收敛 P1-01~P1-08 / P1-10 与 P2-05 / P2-07（见 §8）；P1-09 部分收敛（+20 离线用例）**；§3.2 剩余项为 P0-01（归 jdbc crate，已完成）、部分 P2 与已裁定不迁移项。
+**状态：§3.2 的 P1/P2 已全部收敛（2026-10-28）。** 波次 C，crate `crates/agentscope-extensions-skills` 实现 3 个后端仓库 + harness 适配器。§3.2 逐项终态：P1-01~P1-11 全部已完成；P2-02/03/04/05/06/07/08/10 已完成；P2-01 / P2-09 为已裁定「设计决定（不迁移）」（§7）；P0-01 归 jdbc crate 且已落地。**P1-09（测试覆盖）仍为进行中**——93 vs Java 192，见 §9.5。
 
-**测试修复完成（2026-09-18）**：`cargo build -p agentscope-extensions-skills` 通过；`cargo test -p agentscope-extensions-skills` → **33 passed / 0 failed**（含 doc-tests）。
+**最近一次实测（2026-10-28）**：`cargo build -p agentscope-extensions-skills` 0 error 0 warning（本 crate）；`cargo test -p agentscope-extensions-skills` → **93 passed / 0 failed / 0 ignored**（2 个 `test result:` 行，第二个为 0 passed 的 doctest 汇总）。`cargo fmt -p agentscope-extensions-skills -- --check` 干净。
+
+**测试修复完成（2026-09-18，历史快照；当时 33 passed）**：`cargo build -p agentscope-extensions-skills` 通过；`cargo test -p agentscope-extensions-skills` → **33 passed / 0 failed**（含 doc-tests）。
 
 修复的 6 个失败用例（均为**实现 bug**，非测试期望错误；已对照 Java `skill-git-repository` / `skill-mysql-repository` / `skill-postgresql-repository` 源码确认语义）：
 
@@ -139,7 +141,7 @@ cargo test  -p agentscope-extensions-skills   # 33 passed; 0 failed
 ### 4.2 下一步与阻塞
 1. 真实 MySQL / PostgreSQL 驱动接入（`SqlDatabase` 的真实实现）仍为待办。**静态复核更新**：workspace 根 `Cargo.toml` **已**在 `[workspace.dependencies]` 登记 `sqlx = "0.9"` / `mysql_async = "0.37"` / `tokio-postgres = "0.7"`（注释即写明「存储/技能模块 P1」），但本 crate 的 `Cargo.toml` **仍未引用**；另 `agentscope-extensions-postgresql` 已有 `postgres-driver` feature + `PgSimpleClient`（`tokio-postgres`），可作为 `SqlDatabase` 真实实现的首选落点（避免重复引入驱动）。
 2. Git 仓库读写/同步路径需系统 `git` CLI。**静态复核补充**：Java 侧用 `file://` 本地仓 + JGit 即可离线测 23 个用例，Rust 侧同样可用 `git` CLI 建本地仓（`git init` + `file://` URL）离线覆盖克隆/拉取/分支。**2026-10-26 已落地**：git 侧新增 11 个 `file://` 真实仓用例（无网络、无 mock 库；需要本机有 `git` 二进制）。
-3. 本 crate 仍有 1 个既有 `dead_code` warning（`InMemorySqlDatabase::has_metadata_column` 未使用）与 core/harness 既有 warning，非本次修复引入，未改动核心/harness。**静态复核补充**：`Cargo.toml` 中 `agentscope-core` / `async-trait` / `futures` / `chrono` / `base64` / `serde` 六个依赖在 `src/` 中**零引用**（§3.2 P2-10），建议一并清理（清理依赖属本 crate 范围，但需汇总方确认 workspace 依赖登记表口径）。
+3. ~~`has_metadata_column` dead_code warning + 6 个零引用依赖~~ **2026-10-28 已清理（§9.7）**：删除 `has_metadata_column`（全仓零调用者，与 `metadata_column_type().is_some()` 重复），`Cargo.toml` 依赖 10 → 5（`agentscope-core` / `async-trait` / `futures` / `chrono` / `serde` 与未用 dev-dep `tokio` 已删；`base64` 实际在用 → 保留）。本 crate 当前 **0 warning**；core/harness 的既有 warning 未触碰。
 4. **§3.2 缺口清单为权威待办来源**；其中 P0-01（`JdbcAgentSkillRepository`）与 P2-01 / P2-09 需汇总方裁定后再动代码。
 
 ## 5. 执行约定（所有会话必须遵守）
@@ -152,6 +154,8 @@ cargo test  -p agentscope-extensions-skills   # 33 passed; 0 failed
 ---
 
 ## 静态复核记录（2026-10-22）
+
+> **历史快照（保留以追溯判断依据）**：本节写于 P1/P2 收敛之前，行内「⚠️ 缺 xxx / Rust 5 用例 / 无 file:// 覆盖」等描述**已被后续修复推翻**。当前真相以 **§3.2 状态列 + §9** 为准：P1-01~P1-11 全部已完成，P2-02/03/04/05/06/07/08/10 已完成，P2-01 已落为 trait 方法（§7.1），P2-09 保持 `Result`（§7.2），P1-09 为 93 vs Java 192（§9.5）。
 
 ### 复核方式
 - **纯静态核对**：未执行 `cargo build` / `cargo test`，未修改任何 Rust 代码；仅本文件被编辑。
@@ -336,3 +340,111 @@ description 也随之错乱（回落到围栏本身）。
 `split_frontmatter_requires_the_closing_fence_to_be_unindented` 与
 `skill_identity_treats_an_indented_fence_as_body` **双双 FAILED**（前者 frontmatter 被截断成
 `Some("name: calc\nnote: |\n")`，后者 description 变成 `---`）。
+
+## 9. P2 收口 + P1-09 补测执行记录（2026-10-28）
+
+> 基线：Java `16cb024ae`。本轮只改 `crates/agentscope-extensions-skills/**` 与本 tracker；未改根 `Cargo.toml`、`agentscope-core`、`agentscope-harness`、其它 crate。
+> 基线测试数 **60** → **93**（+33），全绿。
+
+### 9.1 P2-02 空/空白库名·表名（已完成）
+
+Java 构造函数两步：先 `(name == null || name.trim().isEmpty()) ? DEFAULT : name.trim()`，再 `validateIdentifier`。
+
+- 新增 `util::resolve_identifier(raw, default)`（trim 后为空 → 默认名；否则返回 trim 后的值）。
+- `MysqlSkillRepository::with_config` / `PostgresSkillRepository::with_config` 在 **任何校验之前** 解析 `database_name` / `schema_name` / 两张表名，再走原 `validate_identifier`。
+- 新增 `MysqlSkillRepository::database_name()` 读取器（pg 侧 `schema_name()` 原本已有）。
+- 测试：`util::resolves_blank_and_padded_identifiers`、`mysql::blank_names_fall_back_to_the_defaults` / `names_are_trimmed_before_validation` / `padded_invalid_names_are_still_rejected`，`postgresql::` 同名 3 个（`padded_invalid_*` 防止 trim 把非法名洗白）。
+
+### 9.2 P2-03 `delete()` 补事务（已完成）
+
+- 缝上新增默认方法 `SqlConnection::in_transaction(work)`：`set_auto_commit(false)` → 成功 `commit` / 失败 `rollback`，两条路径都恢复 auto-commit。
+- `Mysql/PostgresSkillRepository::delete`：先 Java 同构的 `skill_exists_internal` 预检（不存在 → warn + `Ok(false)`），再用 `in_transaction` 包住「删 resources + 删 skill」两条 DELETE。
+- `save` 也改用 `in_transaction`（原手写 `set_auto_commit` / match 逻辑删除，行为不变）。
+- 测试：`mysql::delete_rolls_back_the_resource_rows_when_the_skill_delete_fails`、`postgresql::` 同名用例（注入「第 2 条 DELETE 失败」→ 断言 resource 行仍在、`get_skill` 仍能取回资源）、`mysql::delete_of_a_missing_skill_is_false_without_touching_the_transaction`。
+- 失败注入器：`sql::test_support::InterceptingSqlDatabase`（`#[cfg(test)]`，按「SQL 含 needle 且匹配次数 > skip」报错），同时记录 `execute_batch` 的批次大小。
+
+### 9.3 P2-04 PG 资源插入 1000 行分批（已完成）
+
+- 新增 `postgresql::RESOURCE_BATCH_SIZE = 1000`（Java 同名常量）。
+- 缝上新增默认方法 `SqlConnection::execute_batch(sql, params)`（等价 JDBC `addBatch`/`executeBatch`；默认逐条执行，真实驱动可覆写为一次往返）。
+- `insert_resources` 按 1000 分块调用 `execute_batch`；插入数不足时返回 `Database` 错误（对齐 Java「insertedCount != size 抛 SQLException」）。
+- 测试：`postgresql::resource_inserts_are_batched_by_resource_batch_size`（2501 个资源 → 批次 `[1000, 1000, 501]`）、`a_small_skill_is_inserted_in_one_batch`（2 个资源 → 一个批次）。
+
+### 9.4 P2-06 git `save()` 返回值（已完成）
+
+- `GitSkillRepository::save` 改为 warn + `Ok(false)`（Java `return false`），与 `delete()` 一致；不再返回 `Err(ReadOnly)`。
+- 既有测试 `git::read_only_write_paths_are_ignored` 的断言随之对齐（原断言 `Err(ReadOnly)`），并补「非空 skill + force=true 也返回 false」。
+
+### 9.5 P1-09 补测（进行中：+33，累计 93 vs Java 192）
+
+新增 **33** 个测试（git +13 / mysql +9 / postgresql +8 / sql +2 / util +1），全部离线、无 mock 库：
+
+| 子模块 | 新增用例 |
+|---|---|
+| git（`file://` 真实仓） | `an_unchanged_remote_does_not_reclone_or_pull`（远端未变 → 不 pull，本地改动存活）、`loads_skill_resources_from_the_checkout`、`skill_names_are_sorted`、`an_unknown_branch_is_reported`、`a_missing_skills_root_is_reported`、`a_local_path_that_is_not_a_repository_is_rejected`、`close_keeps_an_explicit_local_path`、`sync_is_idempotent` |
+| git（parser/边界，纯函数） | `split_frontmatter_handles_extra_separators`、`split_frontmatter_handles_crlf_without_frontmatter`、`frontmatter_scalars_ignores_malformed_lines`、`skill_identity_with_empty_frontmatter`、`skill_exists_is_false_for_a_blank_name_without_syncing` |
+| mysql | `blank_names_fall_back_to_the_defaults`、`names_are_trimmed_before_validation`、`padded_invalid_names_are_still_rejected`、`delete_rolls_back_the_resource_rows_when_the_skill_delete_fails`、`delete_of_a_missing_skill_is_false_without_touching_the_transaction`、`skill_exists_returns_false_for_blank_names`、`two_repositories_with_different_tables_are_isolated`（namespace 隔离）、`get_all_skills_groups_resources_per_skill`（资源按 id 归组）、`metadata_json_roundtrip_preserves_extended_metadata` |
+| postgresql | `blank_names_fall_back_to_the_defaults`、`names_are_trimmed_before_validation`、`padded_invalid_names_are_still_rejected`、`delete_rolls_back_the_resource_rows_when_the_skill_delete_fails`、`resource_inserts_are_batched_by_resource_batch_size`、`a_small_skill_is_inserted_in_one_batch`、`skill_exists_returns_false_for_blank_names`、`two_repositories_with_different_tables_are_isolated` |
+| sql / util | `in_transaction_rolls_back_when_the_work_fails`、`execute_batch_default_runs_every_parameter_set`、`resolves_blank_and_padded_identifiers` |
+
+仍缺（保留待办）：
+
+- SQL 侧全部用例仍跑在 `InMemorySqlDatabase` 替身上（真实 MySQL/PG 驱动尚未接入，见 §4.2 第 1 条）；该替身以**裸表名**为键（`<schema>.<table>` 会剥离前缀），因此**无法验证「同名表、不同 schema 前缀」的隔离**，隔离用例改用不同表名表达。
+- git：并发克隆、认证失败、`swap`/`force` 组合、Windows 路径大小写、`git` 二进制缺失时的降级（测试辅助函数 `git_in` 当前直接 panic）。
+- parser：多文档 YAML（`---` 分段的多文件）、超长 frontmatter、非法 UTF-8 输入。
+
+### 9.6 P2-08 `skill_exists("")`（已完成）
+
+- mysql / postgresql / git 三个后端在 `validate_skill_name` 之前先判 `trim().is_empty()` → `Ok(false)`。Java 只判 `isEmpty()`；Rust 取「更宽但同样不报错」的口径（`"   "` 在 Java 侧会被 `validateSkillName` 拒）。
+- git 侧提前返回意味着**不触发 `ls-remote`**（测试用不可达 URL 证明无 I/O）。
+- 测试：`mysql::skill_exists_returns_false_for_blank_names`、`postgresql::skill_exists_returns_false_for_blank_names`、`git::skill_exists_is_false_for_a_blank_name_without_syncing`（均同时断言 `../escape` 仍然报错）。
+
+### 9.7 P2-10 依赖与死代码清理（已完成）
+
+`rg` 逐项核对（`agentscope_core` / `async_trait` / `futures` / `chrono` / `serde::` / `base64`，以及 `Serialize`/`Deserialize` 派生宏）：
+
+| 依赖 | 结论 | 处置 |
+|---|---|---|
+| `agentscope-core` | 0 命中 | 删 |
+| `async-trait` | 0 命中 | 删 |
+| `futures` | 0 命中 | 删 |
+| `chrono` | 0 命中（此前 3 处命中实为单词 `synchronous`） | 删 |
+| `serde` | 仅 `serde_json` 命中；本 crate 无 `#[derive(Serialize)]` | 删 |
+| `base64` | **在用**（`repository.rs::write_resources_to_dir` 解 `base64:` 载荷） | **保留**（原 tracker 记「未使用」有误，已更正） |
+| `tokio`（含 dev-dep） | 仅文档注释提名 | 删；doc 注释改为 `tokio::task::spawn_blocking` 纯代码（避免断链） |
+| `InMemorySqlDatabase::has_metadata_column` | 全仓 0 调用者，等价于 `metadata_column_type(t).is_some()` | 删除（`sql.rs` 留注释） |
+
+依赖 10 → **5**（`agentscope-harness` / `serde_json` / `thiserror` / `tracing` / `base64`），`[dev-dependencies]` 整节移除。本 crate `cargo build` / `cargo test` **0 warning**。
+
+### 9.8 反向验证（逐项回退 → FAILED → 恢复）
+
+| 回退内容 | 预期失败用例 | 实测 |
+|---|---|---|
+| **第 1 轮**（4 处同时回退） | — | `85 passed / 8 failed` |
+| `util::resolve_identifier` → 原样返回（不 trim / 不回退） | `mysql/pg::blank_names_fall_back_to_the_defaults`、`mysql/pg::names_are_trimmed_before_validation`、`util::resolves_blank_and_padded_identifiers` | ✅ 5 个全部 FAILED |
+| `git::save` → `Err(ReadOnly)` | `git::read_only_write_paths_are_ignored` | ✅ FAILED |
+| mysql / pg `skill_exists` 去掉空白短路 | `mysql/pg::skill_exists_returns_false_for_blank_names` | ✅ 双双 FAILED |
+| **第 2 轮**（4 处同时回退） | — | `88 passed / 5 failed` |
+| mysql / pg `delete` 改回直调（无事务） | `mysql/pg::delete_rolls_back_the_resource_rows_when_the_skill_delete_fails` | ✅ 双双 FAILED |
+| `insert_resources` 改回逐条 `execute` | `pg::resource_inserts_are_batched_by_resource_batch_size`、`pg::a_small_skill_is_inserted_in_one_batch` | ✅ 双双 FAILED |
+| `git::skill_exists` 去掉空白短路 | `git::skill_exists_is_false_for_a_blank_name_without_syncing` | ✅ FAILED |
+
+恢复后复跑：**93 passed / 0 failed**。
+
+### 9.9 改动文件与实测命令
+
+| 文件 | 改动 |
+|---|---|
+| `src/util.rs` | 新增 `resolve_identifier`，+1 测试 |
+| `src/sql.rs` | `SqlConnection::execute_batch` / `in_transaction` 默认方法、`#[cfg(test)] test_support::InterceptingSqlDatabase`、删 `has_metadata_column`，+2 测试 |
+| `src/mysql.rs` | P2-02 标识符解析、P2-03 `delete` 事务、P2-08 空白名、`database_name()`，+9 测试 |
+| `src/postgresql.rs` | P2-02、P2-03、P2-04（`RESOURCE_BATCH_SIZE` + 分批）、P2-08，+8 测试 |
+| `src/git.rs` | P2-06 `save()` 返回 `Ok(false)`、P2-08 空白名，+13 测试（含 8 个 `file://` 真实仓） |
+| `src/repository.rs` | doc 注释去掉 `tokio` 断链（仅文档） |
+| `Cargo.toml` | 依赖 10 → 5，移除 `[dev-dependencies]` |
+
+```
+cargo build -p agentscope-extensions-skills   # Finished，0 error / 0 warning（本 crate）
+cargo test  -p agentscope-extensions-skills   # 93 passed; 0 failed; 0 ignored（另有 0 passed 的 doctest 汇总行）
+cargo fmt -p agentscope-extensions-skills -- --check   # 干净
+```

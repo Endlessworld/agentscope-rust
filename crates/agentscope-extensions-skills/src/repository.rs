@@ -48,7 +48,7 @@ impl std::fmt::Display for AgentSkillRepositoryInfo {
 ///
 /// Implementations are synchronous because the underlying backends (filesystem, git,
 /// blocking SQL drivers) are synchronous; callers on an async runtime can wrap them in
-/// [`tokio::task::spawn_blocking`]. This matches the harness [`SkillRepository`], which
+/// `tokio::task::spawn_blocking`. This matches the harness [`SkillRepository`], which
 /// is likewise synchronous.
 pub trait AgentSkillRepository: Send + Sync {
     /// Gets a skill by name, or [`SkillRepositoryError::NotFound`].

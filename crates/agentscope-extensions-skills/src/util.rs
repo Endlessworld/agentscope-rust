@@ -57,6 +57,26 @@ pub fn validate_resource_path(path: &str) -> Result<(), SkillRepositoryError> {
     Ok(())
 }
 
+/// Resolves a user-supplied database / schema / table name exactly like the Java constructor:
+///
+/// ```java
+/// this.databaseName = (databaseName == null || databaseName.trim().isEmpty())
+///         ? DEFAULT_DATABASE_NAME
+///         : databaseName.trim();
+/// ```
+///
+/// A blank (or all-whitespace) name falls back to `default`; otherwise the **trimmed** value is
+/// returned. Callers still run [`validate_identifier`] on the result, so `"  skills "` becomes
+/// `skills` while `"bad-name"` keeps failing (Java does the same two-step).
+pub fn resolve_identifier(raw: &str, default: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Validates a database/table/schema identifier, rejecting SQL-injection vectors.
 ///
 /// Identifiers cannot be parameterized in prepared statements, so they must match
@@ -165,6 +185,20 @@ mod tests {
         assert!(validate_skill_name("").is_err());
         assert!(validate_skill_name("a/b").is_err());
         assert!(validate_skill_name("..").is_err());
+    }
+
+    // Java parity (P2-02): null / blank falls back to the default, everything else is trimmed.
+    #[test]
+    fn resolves_blank_and_padded_identifiers() {
+        assert_eq!(resolve_identifier("", "fallback"), "fallback");
+        assert_eq!(resolve_identifier("   \t\n", "fallback"), "fallback");
+        assert_eq!(
+            resolve_identifier("  custom_skills  ", "fallback"),
+            "custom_skills"
+        );
+        // The trimmed value is what gets validated, so padding no longer trips the pattern.
+        assert!(validate_identifier(&resolve_identifier(" skills ", "d"), "table", 64).is_ok());
+        assert!(validate_identifier(&resolve_identifier(" 9bad ", "d"), "table", 64).is_err());
     }
 
     #[test]

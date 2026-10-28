@@ -127,6 +127,26 @@ pub trait SqlConnection: Send {
         params: &[SqlParam],
     ) -> Result<i64, SkillRepositoryError>;
 
+    /// Runs the same statement once per parameter set and returns the total affected rows.
+    ///
+    /// Mirrors JDBC `addBatch` / `executeBatch`: drivers that support batching override this to
+    /// send the whole slice in one round trip. The default implementation (used by
+    /// [`InMemoryConnection`]) just loops over [`Self::execute`], so behaviour is identical and
+    /// only the number of round trips differs. The PostgreSQL repository chunks resource rows by
+    /// `RESOURCE_BATCH_SIZE` so a skill with thousands of files never exceeds the driver's
+    /// bind-parameter limit.
+    fn execute_batch(
+        &mut self,
+        sql: &str,
+        params: &[Vec<SqlParam>],
+    ) -> Result<usize, SkillRepositoryError> {
+        let mut affected = 0;
+        for row in params {
+            affected += self.execute(sql, row)?;
+        }
+        Ok(affected)
+    }
+
     /// Toggles auto-commit (transaction boundaries).
     fn set_auto_commit(&mut self, enabled: bool) -> Result<(), SkillRepositoryError>;
 
@@ -135,6 +155,41 @@ pub trait SqlConnection: Send {
 
     /// Rolls back the current transaction.
     fn rollback(&mut self) -> Result<(), SkillRepositoryError>;
+
+    /// Runs `work` inside a transaction: auto-commit off, `commit` on success, `rollback` on
+    /// failure, auto-commit restored either way.
+    ///
+    /// This is the seam-level equivalent of the Java `setAutoCommit(false)` + `commit` /
+    /// `rollback` pattern (`executeInWriteTransaction`) that both SQL repositories wrap around
+    /// multi-statement writes. Without it a failure halfway through a write leaves orphaned rows
+    /// behind - e.g. the resource rows survive when the skill row delete fails.
+    fn in_transaction<T>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> Result<T, SkillRepositoryError>,
+    ) -> Result<T, SkillRepositoryError>
+    where
+        Self: Sized,
+    {
+        self.set_auto_commit(false)?;
+        match work(self) {
+            Ok(value) => match self.commit() {
+                Ok(()) => {
+                    self.set_auto_commit(true)?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = self.rollback();
+                    let _ = self.set_auto_commit(true);
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let _ = self.rollback();
+                let _ = self.set_auto_commit(true);
+                Err(e)
+            }
+        }
+    }
 }
 
 /// A source of connections, mirroring `javax.sql.DataSource`.
@@ -236,14 +291,8 @@ impl InMemorySqlDatabase {
             .unwrap_or_default()
     }
 
-    /// Whether the named table is known to expose a `metadata_json` column.
-    pub fn has_metadata_column(&self, table: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .metadata_columns
-            .contains_key(table)
-    }
+    // P2-10: `has_metadata_column()` was removed - it had no callers anywhere in the workspace and
+    // is exactly `metadata_column_type(table).is_some()`; keeping both invites drift.
 }
 
 impl SqlDatabase for InMemorySqlDatabase {
@@ -714,5 +763,202 @@ mod tests {
         conn.commit().unwrap();
         conn.set_auto_commit(true).unwrap();
         assert_eq!(db.rows("t").len(), 1);
+    }
+
+    #[test]
+    fn in_transaction_rolls_back_when_the_work_fails() {
+        let db = InMemorySqlDatabase::new();
+        let mut conn = db.connection().unwrap();
+        conn.execute("CREATE TABLE t (id BIGINT, name VARCHAR(255))", &[])
+            .unwrap();
+        let err = conn
+            .in_transaction(|conn| -> Result<(), SkillRepositoryError> {
+                conn.insert_returning_id(
+                    "INSERT INTO t (name) VALUES (?)",
+                    &[SqlParam::Text("x".into())],
+                )?;
+                Err(SkillRepositoryError::Database("boom".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(err, SkillRepositoryError::Database(_)));
+        // The staged insert was rolled back and auto-commit is back on.
+        assert!(db.rows("t").is_empty());
+        conn.insert_returning_id(
+            "INSERT INTO t (name) VALUES (?)",
+            &[SqlParam::Text("y".into())],
+        )
+        .unwrap();
+        assert_eq!(db.rows("t").len(), 1);
+    }
+
+    #[test]
+    fn execute_batch_default_runs_every_parameter_set() {
+        let db = InMemorySqlDatabase::new();
+        let mut conn = db.connection().unwrap();
+        conn.execute("CREATE TABLE t (id BIGINT, name VARCHAR(255))", &[])
+            .unwrap();
+        let affected = conn
+            .execute_batch(
+                "INSERT INTO t (name) VALUES (?)",
+                &[
+                    vec![SqlParam::Text("a".into())],
+                    vec![SqlParam::Text("b".into())],
+                ],
+            )
+            .unwrap();
+        assert_eq!(affected, 2);
+        assert_eq!(db.rows("t").len(), 2);
+    }
+}
+
+/// Fault-injection / traffic-recording wrappers over [`InMemorySqlDatabase`], used by the
+/// repository tests to exercise the failure and batching paths of the SQL seam.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Delegates to [`InMemorySqlDatabase`] while recording / failing statements.
+    ///
+    /// * `needle` + `skip`: fails every executed statement whose SQL contains `needle`, after
+    ///   letting the first `skip` matches through (counted per connection);
+    /// * `batches`: the size of every [`SqlConnection::execute_batch`] call.
+    pub(crate) struct InterceptingSqlDatabase {
+        inner: InMemorySqlDatabase,
+        needle: Option<String>,
+        skip: usize,
+        failures: Arc<AtomicUsize>,
+        batches: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl InterceptingSqlDatabase {
+        /// A pass-through database that only records batch sizes.
+        pub(crate) fn recording() -> Self {
+            Self::with_fault(None, 0)
+        }
+
+        /// A database that fails the statement matching `needle` after `skip` matches.
+        pub(crate) fn failing(needle: &str, skip: usize) -> Self {
+            Self::with_fault(Some(needle.to_string()), skip)
+        }
+
+        fn with_fault(needle: Option<String>, skip: usize) -> Self {
+            Self {
+                inner: InMemorySqlDatabase::new(),
+                needle,
+                skip,
+                failures: Arc::new(AtomicUsize::new(0)),
+                batches: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// The wrapped store, for row-level assertions.
+        pub(crate) fn inner(&self) -> &InMemorySqlDatabase {
+            &self.inner
+        }
+
+        /// How many statements the injected fault rejected.
+        pub(crate) fn failures(&self) -> usize {
+            self.failures.load(Ordering::Relaxed)
+        }
+
+        /// The size of every batch handed to `execute_batch`, in call order.
+        pub(crate) fn batch_sizes(&self) -> Vec<usize> {
+            self.batches.lock().unwrap().clone()
+        }
+    }
+
+    impl SqlDatabase for InterceptingSqlDatabase {
+        type Connection = InterceptingConnection;
+
+        fn connection(&self) -> Result<Self::Connection, SkillRepositoryError> {
+            Ok(InterceptingConnection {
+                inner: self.inner.connection()?,
+                needle: self.needle.clone(),
+                skip: self.skip,
+                matched: 0,
+                failures: self.failures.clone(),
+                batches: self.batches.clone(),
+            })
+        }
+    }
+
+    /// Connection handed out by [`InterceptingSqlDatabase`].
+    pub(crate) struct InterceptingConnection {
+        inner: InMemoryConnection,
+        needle: Option<String>,
+        skip: usize,
+        matched: usize,
+        failures: Arc<AtomicUsize>,
+        batches: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl InterceptingConnection {
+        fn guard(&mut self, sql: &str) -> Result<(), SkillRepositoryError> {
+            let Some(needle) = self.needle.as_deref() else {
+                return Ok(());
+            };
+            if !sql.contains(needle) {
+                return Ok(());
+            }
+            self.matched += 1;
+            if self.matched > self.skip {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                return Err(SkillRepositoryError::Database(format!(
+                    "injected failure on: {needle}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    impl SqlConnection for InterceptingConnection {
+        fn execute(
+            &mut self,
+            sql: &str,
+            params: &[SqlParam],
+        ) -> Result<usize, SkillRepositoryError> {
+            self.guard(sql)?;
+            self.inner.execute(sql, params)
+        }
+
+        fn query(
+            &mut self,
+            sql: &str,
+            params: &[SqlParam],
+        ) -> Result<Vec<SqlRow>, SkillRepositoryError> {
+            self.inner.query(sql, params)
+        }
+
+        fn insert_returning_id(
+            &mut self,
+            sql: &str,
+            params: &[SqlParam],
+        ) -> Result<i64, SkillRepositoryError> {
+            self.guard(sql)?;
+            self.inner.insert_returning_id(sql, params)
+        }
+
+        fn execute_batch(
+            &mut self,
+            sql: &str,
+            params: &[Vec<SqlParam>],
+        ) -> Result<usize, SkillRepositoryError> {
+            self.batches.lock().unwrap().push(params.len());
+            self.guard(sql)?;
+            self.inner.execute_batch(sql, params)
+        }
+
+        fn set_auto_commit(&mut self, enabled: bool) -> Result<(), SkillRepositoryError> {
+            self.inner.set_auto_commit(enabled)
+        }
+
+        fn commit(&mut self) -> Result<(), SkillRepositoryError> {
+            self.inner.commit()
+        }
+
+        fn rollback(&mut self) -> Result<(), SkillRepositoryError> {
+            self.inner.rollback()
+        }
     }
 }

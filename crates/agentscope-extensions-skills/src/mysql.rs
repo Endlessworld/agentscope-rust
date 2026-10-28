@@ -14,8 +14,8 @@ use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam};
 use crate::util::{
-    build_skill, has_extended_metadata, serialize_metadata, validate_identifier,
-    validate_resource_path, validate_skill_name,
+    build_skill, has_extended_metadata, resolve_identifier, serialize_metadata,
+    validate_identifier, validate_resource_path, validate_skill_name,
 };
 
 /// Default database name.
@@ -117,6 +117,15 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         db: Arc<D>,
         cfg: MysqlSkillRepositoryConfig,
     ) -> Result<Self, SkillRepositoryError> {
+        // Java: null / blank names fall back to the defaults, everything else is `trim()`ed
+        // *before* validation (so `"  skills "` is accepted, `"bad-name"` is not). P2-02.
+        let mut cfg = cfg;
+        cfg.database_name = resolve_identifier(&cfg.database_name, DEFAULT_DATABASE_NAME);
+        cfg.skills_table_name =
+            resolve_identifier(&cfg.skills_table_name, DEFAULT_SKILLS_TABLE_NAME);
+        cfg.resources_table_name =
+            resolve_identifier(&cfg.resources_table_name, DEFAULT_RESOURCES_TABLE_NAME);
+
         validate_identifier(&cfg.database_name, "database name", MAX_IDENTIFIER_LENGTH)?;
         validate_identifier(
             &cfg.skills_table_name,
@@ -157,6 +166,11 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
     /// The skills table name.
     pub fn skills_table_name(&self) -> &str {
         &self.cfg.skills_table_name
+    }
+
+    /// The resolved database name (default applied, trimmed).
+    pub fn database_name(&self) -> &str {
+        &self.cfg.database_name
     }
 
     /// The resources table name.
@@ -569,30 +583,18 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
             }
         }
 
-        conn.set_auto_commit(false)?;
-        let result = (|| -> Result<(), SkillRepositoryError> {
+        // Java: `setAutoCommit(false)` ... `commit` / `rollback` around the whole write.
+        conn.in_transaction(|conn| {
             for skill in skills {
-                if self.skill_exists_internal(&mut conn, skill.name())? {
-                    self.delete_skill_internal(&mut conn, skill.name())?;
+                if self.skill_exists_internal(conn, skill.name())? {
+                    self.delete_skill_internal(conn, skill.name())?;
                 }
-                let id = self.insert_skill(&mut conn, skill)?;
-                self.insert_resources(&mut conn, id, skill.resources())?;
+                let id = self.insert_skill(conn, skill)?;
+                self.insert_resources(conn, id, skill.resources())?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.commit()?;
-                conn.set_auto_commit(true)?;
-                Ok(true)
-            }
-            Err(e) => {
-                let _ = conn.rollback();
-                let _ = conn.set_auto_commit(true);
-                Err(e)
-            }
-        }
+        })?;
+        Ok(true)
     }
 
     fn delete(&self, skill_name: &str) -> Result<bool, SkillRepositoryError> {
@@ -602,11 +604,21 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
             return Ok(false);
         }
         let mut conn = self.db.connection()?;
-        let deleted = self.delete_skill_internal(&mut conn, skill_name)?;
+        // Java: `skillExistsInternal` pre-check, then the delete inside a write transaction.
+        if !self.skill_exists_internal(&mut conn, skill_name)? {
+            tracing::warn!(skill = skill_name, "skill does not exist");
+            return Ok(false);
+        }
+        let deleted = conn.in_transaction(|conn| self.delete_skill_internal(conn, skill_name))?;
         Ok(deleted > 0)
     }
 
     fn skill_exists(&self, skill_name: &str) -> Result<bool, SkillRepositoryError> {
+        // Java `skillExists`: a null / empty name is simply "not present", never an error (P2-08).
+        // Java `skillExists`: a null / empty name is simply "not present", never an error (P2-08).
+        if skill_name.trim().is_empty() {
+            return Ok(false);
+        }
         validate_skill_name(skill_name)?;
         let mut conn = self.db.connection()?;
         self.skill_exists_internal(&mut conn, skill_name)
@@ -638,6 +650,9 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentscope_harness::agent::skill::model::Metadata;
+
+    use crate::sql::test_support::InterceptingSqlDatabase;
     use crate::sql::InMemorySqlDatabase;
 
     fn skill(name: &str, desc: &str) -> AgentSkill {
@@ -850,5 +865,225 @@ mod tests {
         let loaded = r.get_skill("a").unwrap();
         assert_eq!(loaded.description(), "legacy");
         assert_eq!(loaded.metadata().len(), 2); // name + description only
+    }
+
+    // ------------------------------------------------------------------
+    // P2-02: blank / padded identifiers
+    // ------------------------------------------------------------------
+
+    /// Java: `(name == null || name.trim().isEmpty()) ? DEFAULT : name.trim()`.
+    #[test]
+    fn blank_names_fall_back_to_the_defaults() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = MysqlSkillRepository::with_config(
+            db.clone(),
+            MysqlSkillRepositoryConfig::new()
+                .database_name("   ")
+                .skills_table_name("")
+                .resources_table_name(" \t\n"),
+        )
+        .unwrap();
+        assert_eq!(r.database_name(), DEFAULT_DATABASE_NAME);
+        assert_eq!(r.skills_table_name(), DEFAULT_SKILLS_TABLE_NAME);
+        assert_eq!(r.resources_table_name(), DEFAULT_RESOURCES_TABLE_NAME);
+        assert!(db.table_exists(DEFAULT_SKILLS_TABLE_NAME));
+        // And the fallback config is fully usable.
+        r.save(&[skill("a", "1")], false).unwrap();
+        assert_eq!(r.get_skill("a").unwrap().description(), "1");
+    }
+
+    /// Java trims before validating, so padded-but-valid names are accepted.
+    #[test]
+    fn names_are_trimmed_before_validation() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = MysqlSkillRepository::with_config(
+            db.clone(),
+            MysqlSkillRepositoryConfig::new()
+                .database_name("  shop  ")
+                .skills_table_name(" skills_x ")
+                .resources_table_name("\tresources_x\n"),
+        )
+        .unwrap();
+        assert_eq!(r.database_name(), "shop");
+        assert_eq!(r.skills_table_name(), "skills_x");
+        assert_eq!(r.resources_table_name(), "resources_x");
+        assert!(db.schema_exists("shop"));
+        assert!(db.table_exists("skills_x"));
+        r.save(&[skill("a", "padded")], false).unwrap();
+        assert_eq!(r.get_skill("a").unwrap().description(), "padded");
+    }
+
+    /// Trimming must not turn an invalid identifier into a valid one.
+    #[test]
+    fn padded_invalid_names_are_still_rejected() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let err = match MysqlSkillRepository::with_config(
+            db,
+            MysqlSkillRepositoryConfig::new().skills_table_name("  bad-name  "),
+        ) {
+            Ok(_) => panic!("an identifier with a dash must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SkillRepositoryError::InvalidArgument { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // P2-03: delete() runs in a transaction
+    // ------------------------------------------------------------------
+
+    /// Java wraps `deleteSkillInternal` in `setAutoCommit(false)` / `commit` / `rollback`.
+    /// Second DELETE (the skill row) fails -> the resource rows must be rolled back, not orphaned.
+    #[test]
+    fn delete_rolls_back_the_resource_rows_when_the_skill_delete_fails() {
+        let db = Arc::new(InterceptingSqlDatabase::failing("DELETE FROM", 1));
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        r.save(&[skill("a", "1")], false).unwrap();
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+
+        let err = r.delete("a").unwrap_err();
+        assert!(
+            matches!(err, SkillRepositoryError::Database(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(db.failures(), 1, "only the skill-row DELETE may fail");
+
+        // Rolled back: the resource rows survived the failed DELETE.
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        assert!(r.skill_exists("a").unwrap());
+        let loaded = r.get_skill("a").unwrap();
+        assert_eq!(
+            loaded.resources().get("a.txt").map(String::as_str),
+            Some("data")
+        );
+    }
+
+    #[test]
+    fn delete_of_a_missing_skill_is_false_without_touching_the_transaction() {
+        let db = Arc::new(InterceptingSqlDatabase::failing("DELETE FROM", 0));
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        // The existence pre-check short-circuits, so the injected fault never fires.
+        assert!(!r.delete("absent").unwrap());
+        assert_eq!(db.failures(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // P2-08: skill_exists on blank names
+    // ------------------------------------------------------------------
+
+    /// Java `skillExists(null / "")` returns `false` instead of raising.
+    #[test]
+    fn skill_exists_returns_false_for_blank_names() {
+        let r = repo();
+        assert!(!r.skill_exists("").unwrap());
+        assert!(!r.skill_exists("   ").unwrap());
+        // Validation still applies to the real lookups.
+        assert!(r.skill_exists("../escape").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // P1-09: isolation / grouping / metadata round trip
+    // ------------------------------------------------------------------
+
+    /// Two repositories on the same database must not see each other's rows.
+    #[test]
+    fn two_repositories_with_different_tables_are_isolated() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let alpha = MysqlSkillRepository::with_config(
+            db.clone(),
+            MysqlSkillRepositoryConfig::new()
+                .skills_table_name("skills_alpha")
+                .resources_table_name("resources_alpha"),
+        )
+        .unwrap();
+        let beta = MysqlSkillRepository::with_config(
+            db,
+            MysqlSkillRepositoryConfig::new()
+                .skills_table_name("skills_beta")
+                .resources_table_name("resources_beta"),
+        )
+        .unwrap();
+
+        alpha.save(&[skill("alpha-one", "a")], false).unwrap();
+        beta.save(&[skill("beta-one", "b")], false).unwrap();
+
+        assert_eq!(
+            alpha.get_all_skill_names().unwrap(),
+            vec!["alpha-one".to_string()]
+        );
+        assert_eq!(
+            beta.get_all_skill_names().unwrap(),
+            vec!["beta-one".to_string()]
+        );
+        assert!(!beta.skill_exists("alpha-one").unwrap());
+        // `source` embeds the table so the two repositories stay distinguishable.
+        assert_ne!(alpha.get_source(), beta.get_source());
+    }
+
+    /// `get_all_skills` joins the resources table by skill id; each skill must keep its own rows.
+    #[test]
+    fn get_all_skills_groups_resources_per_skill() {
+        let r = repo();
+        let one = AgentSkill::builder()
+            .name("one")
+            .source("s")
+            .description("first")
+            .add_resource("SKILL.md", "# one")
+            .add_resource("a.txt", "one-a")
+            .build();
+        let two = AgentSkill::builder()
+            .name("two")
+            .source("s")
+            .description("second")
+            .add_resource("SKILL.md", "# two")
+            .add_resource("a.txt", "two-a")
+            .build();
+        r.save(&[one, two], false).unwrap();
+
+        let all = r.get_all_skills().unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        assert_eq!(all[0].resources().len(), 2);
+        assert_eq!(all[1].resources().len(), 2);
+        assert_eq!(
+            all[0].resources().get("a.txt").map(String::as_str),
+            Some("one-a")
+        );
+        assert_eq!(
+            all[1].resources().get("a.txt").map(String::as_str),
+            Some("two-a")
+        );
+    }
+
+    /// `metadata_json` survives a save/get round trip (the harness `Metadata` map is opaque).
+    #[test]
+    fn metadata_json_roundtrip_preserves_extended_metadata() {
+        let r = repo();
+        let mut metadata = Metadata::new();
+        metadata.insert("priority".into(), serde_json::json!(7));
+        metadata.insert("tags".into(), serde_json::json!(["x", "y"]));
+        let s = AgentSkill::builder()
+            .name("meta")
+            .source("s")
+            .description("d")
+            .metadata(metadata)
+            .add_resource("SKILL.md", "# meta")
+            .build();
+        r.save(&[s], false).unwrap();
+
+        let loaded = r.get_skill("meta").unwrap();
+        assert_eq!(
+            loaded.metadata().get("priority"),
+            Some(&serde_json::json!(7))
+        );
+        assert_eq!(
+            loaded.metadata().get("tags"),
+            Some(&serde_json::json!(["x", "y"]))
+        );
+        assert_eq!(
+            loaded.metadata().get("name"),
+            Some(&serde_json::json!("meta"))
+        );
     }
 }

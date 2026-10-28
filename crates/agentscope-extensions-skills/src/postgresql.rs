@@ -16,8 +16,8 @@ use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam};
 use crate::util::{
-    build_skill, has_extended_metadata, serialize_metadata, validate_identifier,
-    validate_resource_path, validate_skill_name,
+    build_skill, has_extended_metadata, resolve_identifier, serialize_metadata,
+    validate_identifier, validate_resource_path, validate_skill_name,
 };
 
 /// Default schema name.
@@ -29,6 +29,13 @@ pub const DEFAULT_RESOURCES_TABLE_NAME: &str = "agentscope_skill_resources";
 
 /// PostgreSQL identifier length limit.
 const MAX_IDENTIFIER_LENGTH: usize = 63;
+
+/// Maximum number of resource rows sent in one batch (`RESOURCE_BATCH_SIZE` in Java).
+///
+/// Java chunks `executeBatch` by this size to stay below the PostgreSQL bind-parameter limit
+/// (65535 parameters / 3 parameters per row); the same chunking applies to the [`SqlConnection`]
+/// batch seam.
+pub const RESOURCE_BATCH_SIZE: usize = 1000;
 
 /// Column types that can store the JSON metadata payload (`isSupportedMetadataJsonColumnType`).
 /// `jsonb` is deliberately absent: writing a JSON *string* into `jsonb` would fail.
@@ -124,6 +131,15 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         db: Arc<D>,
         cfg: PostgresSkillRepositoryConfig,
     ) -> Result<Self, SkillRepositoryError> {
+        // Java: null / blank names fall back to the defaults, everything else is `trim()`ed
+        // *before* validation (so `"  skills "` is accepted, `"bad-name"` is not). P2-02.
+        let mut cfg = cfg;
+        cfg.schema_name = resolve_identifier(&cfg.schema_name, DEFAULT_SCHEMA_NAME);
+        cfg.skills_table_name =
+            resolve_identifier(&cfg.skills_table_name, DEFAULT_SKILLS_TABLE_NAME);
+        cfg.resources_table_name =
+            resolve_identifier(&cfg.resources_table_name, DEFAULT_RESOURCES_TABLE_NAME);
+
         validate_identifier(&cfg.schema_name, "schema name", MAX_IDENTIFIER_LENGTH)?;
         validate_identifier(
             &cfg.skills_table_name,
@@ -373,23 +389,46 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
             .unwrap_or_default()
     }
 
+    /// Inserts the resource rows, chunked by [`RESOURCE_BATCH_SIZE`] (`insertResources`).
+    ///
+    /// Java builds one `PreparedStatement` and calls `executeBatch` every 1000 paths so a skill
+    /// with thousands of files never exceeds the bind-parameter limit; the same chunking is
+    /// applied here on top of [`SqlConnection::execute_batch`].
     fn insert_resources(
         &self,
         conn: &mut D::Connection,
         skill_id: i64,
         resources: &SkillResources,
     ) -> Result<(), SkillRepositoryError> {
+        if resources.is_empty() {
+            return Ok(());
+        }
         let sql = format!(
             "INSERT INTO {} (id, resource_path, resource_content) VALUES (?, ?, ?)",
             self.full_table_name(&self.cfg.resources_table_name)
         );
+        let mut batch: Vec<Vec<SqlParam>> = Vec::with_capacity(RESOURCE_BATCH_SIZE);
+        let mut inserted = 0usize;
         for (path, content) in resources {
-            let params = [
+            batch.push(vec![
                 SqlParam::Int(skill_id),
                 SqlParam::Text(path.clone()),
                 SqlParam::Text(content.clone()),
-            ];
-            conn.execute(&sql, &params)?;
+            ]);
+            if batch.len() == RESOURCE_BATCH_SIZE {
+                inserted += conn.execute_batch(&sql, &batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            inserted += conn.execute_batch(&sql, &batch)?;
+        }
+        if inserted < resources.len() {
+            // Java throws when `executeBatch` reports fewer rows than the batch held.
+            return Err(SkillRepositoryError::Database(format!(
+                "failed to insert all resources for id '{skill_id}': expected {}, inserted {inserted}",
+                resources.len()
+            )));
         }
         Ok(())
     }
@@ -548,30 +587,18 @@ impl<D: SqlDatabase> AgentSkillRepository for PostgresSkillRepository<D> {
             }
         }
 
-        conn.set_auto_commit(false)?;
-        let result = (|| -> Result<(), SkillRepositoryError> {
+        // Java: `executeInWriteTransaction` around the whole write.
+        conn.in_transaction(|conn| {
             for skill in skills {
-                if self.skill_exists_internal(&mut conn, skill.name())? {
-                    self.delete_skill_internal(&mut conn, skill.name())?;
+                if self.skill_exists_internal(conn, skill.name())? {
+                    self.delete_skill_internal(conn, skill.name())?;
                 }
-                let id = self.insert_skill(&mut conn, skill)?;
-                self.insert_resources(&mut conn, id, skill.resources())?;
+                let id = self.insert_skill(conn, skill)?;
+                self.insert_resources(conn, id, skill.resources())?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.commit()?;
-                conn.set_auto_commit(true)?;
-                Ok(true)
-            }
-            Err(e) => {
-                let _ = conn.rollback();
-                let _ = conn.set_auto_commit(true);
-                Err(e)
-            }
-        }
+        })?;
+        Ok(true)
     }
 
     fn delete(&self, skill_name: &str) -> Result<bool, SkillRepositoryError> {
@@ -581,11 +608,21 @@ impl<D: SqlDatabase> AgentSkillRepository for PostgresSkillRepository<D> {
             return Ok(false);
         }
         let mut conn = self.db.connection()?;
-        let deleted = self.delete_skill_internal(&mut conn, skill_name)?;
+        // Java: `skillExistsInternal` pre-check, then `executeInWriteTransaction(deleteSkillInternal)`.
+        if !self.skill_exists_internal(&mut conn, skill_name)? {
+            tracing::warn!(skill = skill_name, "skill does not exist");
+            return Ok(false);
+        }
+        let deleted = conn.in_transaction(|conn| self.delete_skill_internal(conn, skill_name))?;
         Ok(deleted > 0)
     }
 
     fn skill_exists(&self, skill_name: &str) -> Result<bool, SkillRepositoryError> {
+        // Java `skillExists`: a null / empty name is simply "not present", never an error (P2-08).
+        // Java `skillExists`: a null / empty name is simply "not present", never an error (P2-08).
+        if skill_name.trim().is_empty() {
+            return Ok(false);
+        }
         validate_skill_name(skill_name)?;
         let mut conn = self.db.connection()?;
         self.skill_exists_internal(&mut conn, skill_name)
@@ -617,6 +654,7 @@ impl<D: SqlDatabase> AgentSkillRepository for PostgresSkillRepository<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::test_support::InterceptingSqlDatabase;
     use crate::sql::InMemorySqlDatabase;
 
     fn skill(name: &str, desc: &str) -> AgentSkill {
@@ -752,5 +790,180 @@ mod tests {
         .unwrap();
         assert!(!r.save(&[skill("a", "1")], true).unwrap());
         assert!(!r.delete("a").unwrap());
+    }
+
+    // ------------------------------------------------------------------
+    // P2-02: blank / padded identifiers
+    // ------------------------------------------------------------------
+
+    /// Java: `(name == null || name.trim().isEmpty()) ? DEFAULT : name.trim()`.
+    #[test]
+    fn blank_names_fall_back_to_the_defaults() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = PostgresSkillRepository::with_config(
+            db.clone(),
+            PostgresSkillRepositoryConfig::new()
+                .schema_name(" \t")
+                .skills_table_name("")
+                .resources_table_name("   "),
+        )
+        .unwrap();
+        assert_eq!(r.schema_name(), DEFAULT_SCHEMA_NAME);
+        assert_eq!(r.skills_table_name(), DEFAULT_SKILLS_TABLE_NAME);
+        assert_eq!(r.resources_table_name(), DEFAULT_RESOURCES_TABLE_NAME);
+        assert!(db.schema_exists(DEFAULT_SCHEMA_NAME));
+        r.save(&[skill("a", "1")], false).unwrap();
+        assert_eq!(r.get_skill("a").unwrap().description(), "1");
+    }
+
+    /// Java trims before validating, so padded-but-valid names are accepted.
+    #[test]
+    fn names_are_trimmed_before_validation() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = PostgresSkillRepository::with_config(
+            db.clone(),
+            PostgresSkillRepositoryConfig::new()
+                .schema_name("  reporting  ")
+                .skills_table_name(" skills_pg ")
+                .resources_table_name("\tresources_pg\n"),
+        )
+        .unwrap();
+        assert_eq!(r.schema_name(), "reporting");
+        assert_eq!(r.skills_table_name(), "skills_pg");
+        assert_eq!(r.resources_table_name(), "resources_pg");
+        assert!(db.schema_exists("reporting"));
+        assert!(db.table_exists("skills_pg"));
+        r.save(&[skill("a", "padded")], false).unwrap();
+        assert_eq!(r.get_skill("a").unwrap().description(), "padded");
+    }
+
+    /// Trimming must not turn an invalid identifier into a valid one.
+    #[test]
+    fn padded_invalid_names_are_still_rejected() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let err = match PostgresSkillRepository::with_config(
+            db,
+            PostgresSkillRepositoryConfig::new().schema_name("  bad-schema  "),
+        ) {
+            Ok(_) => panic!("an identifier with a dash must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SkillRepositoryError::InvalidArgument { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // P2-03: delete() runs in a transaction
+    // ------------------------------------------------------------------
+
+    /// Java `executeInWriteTransaction`: the resource DELETE must be rolled back when the skill
+    /// DELETE fails, so no orphaned resource rows are left behind.
+    #[test]
+    fn delete_rolls_back_the_resource_rows_when_the_skill_delete_fails() {
+        let db = Arc::new(InterceptingSqlDatabase::failing("DELETE FROM", 1));
+        let r = PostgresSkillRepository::new(db.clone()).unwrap();
+        r.save(&[skill("a", "1")], false).unwrap();
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+
+        let err = r.delete("a").unwrap_err();
+        assert!(
+            matches!(err, SkillRepositoryError::Database(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(db.failures(), 1, "only the skill-row DELETE may fail");
+
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        assert!(r.skill_exists("a").unwrap());
+        let loaded = r.get_skill("a").unwrap();
+        assert_eq!(
+            loaded.resources().get("r/data.json").map(String::as_str),
+            Some("{}")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // P2-04: RESOURCE_BATCH_SIZE chunking
+    // ------------------------------------------------------------------
+
+    /// Java `RESOURCE_BATCH_SIZE = 1000`: resources are sent in chunked batches, never one
+    /// statement per row and never one oversized batch.
+    #[test]
+    fn resource_inserts_are_batched_by_resource_batch_size() {
+        assert_eq!(RESOURCE_BATCH_SIZE, 1000);
+        let db = Arc::new(InterceptingSqlDatabase::recording());
+        let r = PostgresSkillRepository::new(db.clone()).unwrap();
+
+        let mut builder = AgentSkill::builder()
+            .name("big")
+            .source("s")
+            .description("many resources")
+            .add_resource("SKILL.md", "# big");
+        for i in 0..2500 {
+            builder = builder.add_resource(format!("r/{i}.txt"), "x");
+        }
+        r.save(&[builder.build()], false).unwrap();
+
+        // 2501 rows -> 1000 + 1000 + 501.
+        assert_eq!(db.batch_sizes(), vec![1000, 1000, 501]);
+        assert_eq!(r.get_skill("big").unwrap().resources().len(), 2501);
+    }
+
+    /// A single small skill still goes through one batch (not one statement per row).
+    #[test]
+    fn a_small_skill_is_inserted_in_one_batch() {
+        let db = Arc::new(InterceptingSqlDatabase::recording());
+        let r = PostgresSkillRepository::new(db.clone()).unwrap();
+        r.save(&[skill("a", "1")], false).unwrap();
+        assert_eq!(db.batch_sizes(), vec![2]);
+    }
+
+    // ------------------------------------------------------------------
+    // P2-08: skill_exists on blank names
+    // ------------------------------------------------------------------
+
+    /// Java `skillExists(null / "")` returns `false` instead of raising.
+    #[test]
+    fn skill_exists_returns_false_for_blank_names() {
+        let r = repo();
+        assert!(!r.skill_exists("").unwrap());
+        assert!(!r.skill_exists("   ").unwrap());
+        assert!(r.skill_exists("../escape").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // P1-09: namespace isolation
+    // ------------------------------------------------------------------
+
+    /// Two repositories on the same schema must not see each other's rows.
+    #[test]
+    fn two_repositories_with_different_tables_are_isolated() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let alpha = PostgresSkillRepository::with_config(
+            db.clone(),
+            PostgresSkillRepositoryConfig::new()
+                .skills_table_name("skills_alpha")
+                .resources_table_name("resources_alpha"),
+        )
+        .unwrap();
+        let beta = PostgresSkillRepository::with_config(
+            db,
+            PostgresSkillRepositoryConfig::new()
+                .skills_table_name("skills_beta")
+                .resources_table_name("resources_beta"),
+        )
+        .unwrap();
+
+        alpha.save(&[skill("alpha-one", "a")], false).unwrap();
+        beta.save(&[skill("beta-one", "b")], false).unwrap();
+
+        assert_eq!(
+            alpha.get_all_skill_names().unwrap(),
+            vec!["alpha-one".to_string()]
+        );
+        assert_eq!(
+            beta.get_all_skill_names().unwrap(),
+            vec!["beta-one".to_string()]
+        );
+        assert!(!beta.skill_exists("alpha-one").unwrap());
+        assert_ne!(alpha.get_source(), beta.get_source());
     }
 }

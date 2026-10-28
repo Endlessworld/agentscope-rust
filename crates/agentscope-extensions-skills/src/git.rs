@@ -452,8 +452,9 @@ impl AgentSkillRepository for GitSkillRepository {
     }
 
     fn save(&self, _skills: &[AgentSkill], _force: bool) -> Result<bool, SkillRepositoryError> {
-        tracing::warn!("GitSkillRepository is read-only; save ignored");
-        Err(SkillRepositoryError::ReadOnly)
+        // Java `GitSkillRepository#save`: log a warning and return `false`, never throw (P2-06).
+        tracing::warn!("GitSkillRepository is read-only, save operation ignored");
+        Ok(false)
     }
 
     fn delete(&self, _skill_name: &str) -> Result<bool, SkillRepositoryError> {
@@ -462,6 +463,11 @@ impl AgentSkillRepository for GitSkillRepository {
     }
 
     fn skill_exists(&self, skill_name: &str) -> Result<bool, SkillRepositoryError> {
+        // Java `SkillFileSystemHelper#skillExists` reports a blank name as "absent" without
+        // touching the repository, so this must not trigger a sync (P2-08).
+        if skill_name.trim().is_empty() {
+            return Ok(false);
+        }
         crate::util::validate_skill_name(skill_name)?;
         Ok(self.load_all()?.iter().any(|s| s.name() == skill_name))
     }
@@ -930,16 +936,85 @@ mod tests {
         assert_eq!(desc, "Heading");
     }
 
+    // ------------------------------------------------------------------
+    // Parser edge cases (P1-09): missing / extra separators, CRLF, malformed keys
+    // ------------------------------------------------------------------
+
+    /// A second `---` line belongs to the body: only the first closing fence counts.
+    #[test]
+    fn split_frontmatter_handles_extra_separators() {
+        let md = "---\nname: a\n---\n---\nbody\n";
+        assert_eq!(split_frontmatter(md), (Some("name: a\n"), "---\nbody\n"));
+        // A `---` inside the body without an opening fence stays body content.
+        assert_eq!(
+            split_frontmatter("body\n---\nmore\n"),
+            (None, "body\n---\nmore\n")
+        );
+    }
+
+    /// Windows line endings work end to end, with and without frontmatter.
+    #[test]
+    fn split_frontmatter_handles_crlf_without_frontmatter() {
+        assert_eq!(
+            split_frontmatter("# Calc\r\nbody\r\n"),
+            (None, "# Calc\r\nbody\r\n")
+        );
+        let (name, desc) = skill_identity(
+            "---\r\nname: crlf\r\ndescription: windows\r\n---\r\n# Head\r\n",
+            "dir-name",
+        );
+        assert_eq!(name, "crlf");
+        assert_eq!(desc, "windows");
+    }
+
+    /// Frontmatter without a fence pair is ignored wholesale.
+    #[test]
+    fn frontmatter_scalars_ignores_malformed_lines() {
+        let md = "---\nno-colon-line\nkey with space: v\n: empty-key\nvalid: yes\n---\nbody\n";
+        let fm = frontmatter_scalars(md);
+        assert_eq!(fm.get("valid").map(String::as_str), Some("yes"));
+        assert_eq!(fm.len(), 1, "unexpected keys: {fm:?}");
+        // No frontmatter at all -> nothing parsed, even if key/value lines exist.
+        assert!(frontmatter_scalars("name: nope\n").is_empty());
+    }
+
+    /// An empty frontmatter block falls back to the directory name + first body heading.
+    #[test]
+    fn skill_identity_with_empty_frontmatter() {
+        let (name, desc) = skill_identity("---\n---\n# Heading\nbody\n", "dir-name");
+        assert_eq!(name, "dir-name");
+        assert_eq!(desc, "Heading");
+        // Frontmatter with only an unrelated key behaves the same way.
+        let (name, desc) = skill_identity("---\nlicense: MIT\n---\nPlain first line\n", "dir");
+        assert_eq!(name, "dir");
+        assert_eq!(desc, "Plain first line");
+    }
+
     #[test]
     fn read_only_write_paths_are_ignored() {
         let repo = GitSkillRepository::new("https://github.com/test/repo.git").unwrap();
-        assert!(matches!(
-            repo.save(&[], true),
-            Err(SkillRepositoryError::ReadOnly)
-        ));
+        // Java `GitSkillRepository#save` logs and returns `false` - no error, and consistent with
+        // `delete` (P2-06).
+        assert!(!repo.save(&[], true).unwrap());
+        let skill = AgentSkill::builder()
+            .name("x")
+            .source("s")
+            .description("d")
+            .build();
+        assert!(!repo.save(std::slice::from_ref(&skill), true).unwrap());
         assert!(!repo.delete("anything").unwrap());
         repo.set_writeable(true);
         assert!(!repo.is_writeable());
+    }
+
+    /// P2-08: a blank name is "absent" and must not trigger a sync (the URL is unreachable).
+    #[test]
+    fn skill_exists_is_false_for_a_blank_name_without_syncing() {
+        let repo = GitSkillRepository::new("https://example.invalid/owner/repo.git").unwrap();
+        assert!(!repo.skill_exists("").unwrap());
+        assert!(!repo.skill_exists("   ").unwrap());
+        // Path traversal still fails loudly.
+        assert!(repo.skill_exists("../escape").is_err());
     }
 
     #[test]
@@ -1223,6 +1298,192 @@ mod tests {
         )
         .unwrap();
         assert!(repo.get_all_skill_names().is_err());
+        repo.sync().unwrap();
+        assert_eq!(repo.get_all_skill_names().unwrap(), vec!["one".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Java `hasRemoteUpdates == false` -> no pull: local checkout changes survive a read.
+    #[test]
+    fn an_unchanged_remote_does_not_reclone_or_pull() {
+        let root = unique_dir("no-pull");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let clone = root.join("clone");
+        let repo = repo_for(&file_url(&remote), &clone);
+        assert_eq!(repo.get_all_skill_names().unwrap(), vec!["one".to_string()]);
+
+        // Dirty the working tree: a re-clone or a pull would revert it.
+        if let Some(skill_dir) = repo.skill_dir("one") {
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: one\ndescription: local edit\n---\nbody\n",
+            )
+            .unwrap();
+        }
+        // The remote did not move, so the read must not fetch.
+        assert_eq!(repo.get_skill("one").unwrap().description(), "local edit");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Java parity: every skill directory resource is exposed on the loaded skill.
+    #[test]
+    fn loads_skill_resources_from_the_checkout() {
+        let root = unique_dir("resources");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        let skill_dir = remote.join("skills/tool");
+        std::fs::create_dir_all(skill_dir.join("ref")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: tool\ndescription: A tool\n---\n\n# Tool\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("ref/notes.txt"), "notes").unwrap();
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        let skill = repo.get_skill("tool").unwrap();
+        assert_eq!(skill.description(), "A tool");
+        assert_eq!(
+            skill.resources().get("ref/notes.txt").map(String::as_str),
+            Some("notes")
+        );
+        assert!(skill.resources().contains_key("SKILL.md"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Skill names are reported sorted, matching Java's `TreeMap`-backed listing.
+    #[test]
+    fn skill_names_are_sorted() {
+        let root = unique_dir("sorted");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        for name in ["zulu", "alpha", "mike"] {
+            write_skill(&remote, &format!("skills/{name}"), name, "d");
+        }
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        assert_eq!(
+            repo.get_all_skill_names().unwrap(),
+            vec!["alpha".to_string(), "mike".to_string(), "zulu".to_string()]
+        );
+        let skills = repo.get_all_skills().unwrap();
+        assert_eq!(
+            skills.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            vec!["alpha", "mike", "zulu"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A configured branch that does not exist must surface the clone failure.
+    #[test]
+    fn an_unknown_branch_is_reported() {
+        let root = unique_dir("bad-branch");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new(file_url(&remote))
+                .branch("does-not-exist")
+                .local_path(root.join("clone")),
+        )
+        .unwrap();
+        let err = repo.get_all_skill_names().unwrap_err();
+        assert!(
+            matches!(err, SkillRepositoryError::Git(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("clone failed"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A configured `skillsRoot` that is missing from the checkout is an error, not "no skills".
+    #[test]
+    fn a_missing_skills_root_is_reported() {
+        let root = unique_dir("bad-root");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new(file_url(&remote))
+                .skills_root("packs/missing")
+                .local_path(root.join("clone")),
+        )
+        .unwrap();
+        let err = repo.get_all_skill_names().unwrap_err();
+        assert!(
+            err.to_string().contains("skillsRoot does not exist"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-empty local path that is not a git repository must not be clobbered.
+    #[test]
+    fn a_local_path_that_is_not_a_repository_is_rejected() {
+        let root = unique_dir("not-a-repo");
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("stray.txt"), "keep me").unwrap();
+
+        let repo = repo_for("https://example.invalid/owner/repo.git", &local);
+        let err = repo.get_all_skill_names().unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid git repository"),
+            "unexpected error: {err}"
+        );
+        assert!(local.join("stray.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `close()` only removes a clone the repository created itself (Java `tempDirectory` flag).
+    #[test]
+    fn close_keeps_an_explicit_local_path() {
+        let root = unique_dir("close");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let local = root.join("clone");
+        let repo = repo_for(&file_url(&remote), &local);
+        assert_eq!(repo.get_all_skill_names().unwrap().len(), 1);
+        repo.close().unwrap();
+        assert!(local.join(".git").is_dir(), "an explicit path must survive");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `sync()` is idempotent and safe to call after an automatic sync.
+    #[test]
+    fn sync_is_idempotent() {
+        let root = unique_dir("sync");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        repo.sync().unwrap();
         repo.sync().unwrap();
         assert_eq!(repo.get_all_skill_names().unwrap(), vec!["one".to_string()]);
 

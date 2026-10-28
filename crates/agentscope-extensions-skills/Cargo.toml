@@ -6,18 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-async-trait = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
 tracing = { workspace = true }
-chrono = { workspace = true }
 base64 = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# P2-10: `agentscope-core`, `async-trait`, `futures`, `chrono` and `serde` had zero references in
+# `src/` (including derive macros), and `tokio` was only named in a doc comment - all removed,
+# together with the unused dev-dependency on `tokio`. `base64` stays: `repository.rs` decodes
+# `base64:` resource payloads with it.
 
