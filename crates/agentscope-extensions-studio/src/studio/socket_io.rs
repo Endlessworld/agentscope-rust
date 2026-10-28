@@ -6,7 +6,8 @@
 //! - the Engine.IO/Socket.IO frame logic is a pure, offline-testable state machine
 //!   ([`SocketIoProtocol`] + the `parse_*` helpers),
 //! - [`SocketIoTransport`] drives it over a real WebSocket, answers Engine.IO pings, joins the
-//!   namespace with Studio's `runId` authentication and reconnects with capped backoff,
+//!   namespace with Studio's `run_id` authentication (Java `StudioWebSocketClient.java:98`) and
+//!   reconnects with capped backoff,
 //! - decoded `forwardUserInput` events are resolved into a shared [`PendingInputRegistry`] so
 //!   [`StudioWebSocketClient::wait_for_input`](super::websocket::StudioWebSocketClient::wait_for_input)
 //!   unblocks.
@@ -29,6 +30,40 @@ use crate::studio::websocket::{
 
 /// Socket.IO namespace Java connects to.
 pub const DEFAULT_NAMESPACE: &str = "/python";
+
+/// The handshake auth key Java sends.
+///
+/// Java `StudioWebSocketClient.connect()` puts the run id under `run_id`
+/// (`StudioWebSocketClient.java:98`: `auth.put("run_id", config.getRunId())`) — snake_case,
+/// unlike the camelCase used by the Studio POJOs. The Studio server validates this key, so
+/// sending `runId` made the namespace handshake look unauthenticated.
+pub const AUTH_RUN_ID_KEY: &str = "run_id";
+
+/// The key earlier Rust builds sent for the same value.
+///
+/// Only emitted when a host opts in through
+/// [`SocketIoTransport::with_legacy_auth_key`]: Studio deployments adapted to the previous
+/// payload keep working, while the default stays byte-identical to Java.
+pub const LEGACY_AUTH_RUN_ID_KEY: &str = "runId";
+
+/// Builds the namespace-connect auth payload (`{"run_id": <run id>}`).
+///
+/// With `include_legacy_key`, the pre-fix `runId` key is added alongside it; the Java key is
+/// always present so a Java-compatible server never sees an unauthenticated handshake.
+pub fn auth_payload(run_id: &str, include_legacy_key: bool) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        AUTH_RUN_ID_KEY.to_string(),
+        Value::String(run_id.to_string()),
+    );
+    if include_legacy_key {
+        payload.insert(
+            LEGACY_AUTH_RUN_ID_KEY.to_string(),
+            Value::String(run_id.to_string()),
+        );
+    }
+    Value::Object(payload)
+}
 
 /// Engine.IO protocol version used by the Studio server.
 pub const ENGINE_IO_VERSION: u32 = 4;
@@ -285,7 +320,8 @@ impl std::fmt::Debug for SocketIoTransport {
 impl SocketIoTransport {
     /// Creates a transport for `config`, resolving `forwardUserInput` into `registry`.
     pub fn new(config: &StudioConfig, registry: Arc<PendingInputRegistry>) -> StudioResult<Self> {
-        let auth = serde_json::json!({ "runId": config.run_id() });
+        // Java `StudioWebSocketClient.java:98` sends `run_id`; see [`auth_payload`].
+        let auth = auth_payload(config.run_id(), false);
         Ok(Self {
             url: socket_io_url(&config.socket_url())?,
             namespace: DEFAULT_NAMESPACE.to_string(),
@@ -297,6 +333,24 @@ impl SocketIoTransport {
             connection: Mutex::new(None),
             connected: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Adds the pre-fix `runId` auth key next to the Java `run_id` one.
+    ///
+    /// Only needed for a Studio server that was adapted to the previous Rust payload; the
+    /// default payload matches Java exactly.
+    pub fn with_legacy_auth_key(mut self) -> Self {
+        if let Some(run_id) = self
+            .auth
+            .get(AUTH_RUN_ID_KEY)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            if let Some(map) = self.auth.as_object_mut() {
+                map.insert(LEGACY_AUTH_RUN_ID_KEY.to_string(), Value::String(run_id));
+            }
+        }
+        self
     }
 
     /// Overrides the Socket.IO namespace (defaults to `/python`).
@@ -493,14 +547,54 @@ mod tests {
 
     #[test]
     fn connect_frame_carries_namespace_and_auth() {
-        let auth = serde_json::json!({ "runId": "run-1" });
+        let auth = serde_json::json!({ "run_id": "run-1" });
         assert_eq!(
             namespace_connect_frame("/python", &auth),
-            "40/python,{\"runId\":\"run-1\"}"
+            "40/python,{\"run_id\":\"run-1\"}"
         );
         assert_eq!(
             namespace_connect_frame("/", &auth),
-            "40{\"runId\":\"run-1\"}"
+            "40{\"run_id\":\"run-1\"}"
+        );
+    }
+
+    #[test]
+    fn handshake_auth_uses_the_java_snake_case_run_id_key() {
+        // Java `StudioWebSocketClient.java:98`: `auth.put("run_id", config.getRunId())`
+        // (snake_case, unlike the camelCase Studio POJO fields).
+        let config = StudioConfig::builder()
+            .studio_url("http://studio:3000")
+            .run_id("run-7")
+            .build();
+        let transport =
+            SocketIoTransport::new(&config, Arc::new(PendingInputRegistry::new())).unwrap();
+        assert_eq!(transport.auth, serde_json::json!({ "run_id": "run-7" }));
+        // ... and the namespace connect frame carries exactly that payload.
+        let mut protocol = SocketIoProtocol::new(DEFAULT_NAMESPACE, transport.auth.clone());
+        assert_eq!(
+            protocol.on_text("0{\"sid\":\"s-1\"}"),
+            vec![ProtocolAction::Send(
+                "40/python,{\"run_id\":\"run-7\"}".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_legacy_camel_case_auth_key_is_opt_in() {
+        let config = StudioConfig::builder()
+            .studio_url("http://studio:3000")
+            .run_id("run-7")
+            .build();
+        let transport = SocketIoTransport::new(&config, Arc::new(PendingInputRegistry::new()))
+            .unwrap()
+            .with_legacy_auth_key();
+        let auth = transport.auth.as_object().expect("auth object");
+        assert_eq!(auth.len(), 2);
+        // The Java key is always present, the legacy one only on request.
+        assert_eq!(auth.get(AUTH_RUN_ID_KEY), Some(&serde_json::json!("run-7")));
+        assert_eq!(
+            auth.get(LEGACY_AUTH_RUN_ID_KEY),
+            Some(&serde_json::json!("run-7"))
         );
     }
 
@@ -548,12 +642,12 @@ mod tests {
     #[test]
     fn protocol_joins_the_namespace_after_the_handshake() {
         let mut protocol =
-            SocketIoProtocol::new(DEFAULT_NAMESPACE, serde_json::json!({ "runId": "run-1" }));
+            SocketIoProtocol::new(DEFAULT_NAMESPACE, serde_json::json!({ "run_id": "run-1" }));
         let actions = protocol.on_text("0{\"sid\":\"s-1\"}");
         assert_eq!(
             actions,
             vec![ProtocolAction::Send(
-                "40/python,{\"runId\":\"run-1\"}".to_string()
+                "40/python,{\"run_id\":\"run-1\"}".to_string()
             )]
         );
         assert_eq!(protocol.sid(), Some("s-1"));

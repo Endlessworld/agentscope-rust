@@ -1,11 +1,23 @@
-//! OTel GenAI span producer, mirroring Java's `TelemetryTracingMiddleware`.
+//! OTel GenAI span producer, mirroring Java's `TelemetryTracer`.
 //!
-//! Java attaches tracing as a `MiddlewareBase` implementation active at three points
-//! (`ON_AGENT`, `ON_MODEL_CALL`, `ON_ACTING`); this module does the same with
-//! [`TelemetryTracing`]. Span lifetime is **RAII**: the span guard lives inside the
-//! returned stream, so a stream that is dropped (a timeout, an abort, a lost channel
-//! lease) still ends its span. That is what makes the cancellation seam from GAP-19
-//! observable here without any `on_cancel` hook.
+//! Java attaches tracing as a `Tracer` implementation at four points (`callAgent`,
+//! `callModel`, `callTool`, `callFormat`); this module does the same with
+//! [`TelemetryTracing`]: three of them are core [`Middleware`] hooks
+//! (`OnAgent`/`OnModelCall`/`OnActing`) and the fourth — formatting — has no core seam, so
+//! it is exposed as the synchronous [`TelemetryTracing::call_format`] wrapper, the
+//! equivalent of Java's `callFormat(formatter, msgs, supplier)`.
+//!
+//! Every span records both sides of the call, like Java:
+//! - request attributes immediately (`get_*_request_attributes`),
+//! - response attributes when the phase ends (`get_*_response_attributes`), which is why
+//!   [`SpanGuard`] carries an optional finalizer. The model span is fed by a
+//!   [`StreamChatResponseAggregator`] that tees the provider stream (Java's
+//!   `doOnNext(aggregator::append)`), the tool span by the acting phase's result sink, and
+//!   the agent span by the `AgentResult` event's `reply` payload.
+//!
+//! Span lifetime is **RAII**: the span guard lives inside the returned stream, so a stream
+//! that is dropped (a timeout, an abort, a lost channel lease) still ends its span. That is
+//! what makes the cancellation seam from GAP-19 observable here without any `on_cancel` hook.
 //!
 //! [`TraceExporter::export`] is async while middleware hooks are synchronous, so
 //! finished spans go through [`SpanSink`] — an unbounded queue drained by a background
@@ -21,17 +33,25 @@ use std::task::{Context as TaskContext, Poll};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::AgentEvent;
+use agentscope_core::message::Msg;
 use agentscope_core::middleware::{
-    ActingInput, AgentInput, EventStream, ExtensionPoint, Middleware, ModelCallInput, Next,
+    ActingInput, ActingResultsHandle, AgentInput, EventStream, ExtensionPoint, Middleware,
+    ModelCallInput, Next,
 };
+use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use chrono::Utc;
-use futures::Stream;
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
+use super::agent_scope_attributes as as_attrs;
+use super::aggregator::StreamChatResponseAggregator;
 use super::exporter::{unix_nanos, Span, SpanKind, SpanStatus, TraceExporter};
 use super::extractors::{
-    get_agent_request_attributes, get_common_attributes, get_llm_request_attributes,
-    get_tool_request_attributes,
+    get_agent_request_attributes, get_agent_response_attributes, get_common_attributes,
+    get_format_request_attributes, get_format_response_attributes, get_function_name,
+    get_llm_request_attributes, get_llm_response_attributes, get_tool_request_attributes,
+    get_tool_response_attributes, Attributes, FormatterConverter,
 };
 use super::gen_ai_attributes::operation_name;
 
@@ -40,6 +60,53 @@ use super::gen_ai_attributes::operation_name;
 /// The core `Model` trait exposes the model name but not the provider, so the value is
 /// configuration, mirroring Java's `TelemetryTracer.Builder.providerName`.
 pub const DEFAULT_PROVIDER_NAME: &str = "unknown";
+
+/// Agent type name recorded in `agentscope.function.name` when the host does not
+/// override it.
+///
+/// Java derives it reflectively (`instance.getClass().getSimpleName()`,
+/// `AttributesExtractors.java:350`), which Rust cannot do for a `&RuntimeContext`-only
+/// hook; the core's single agent implementation is `ReActAgent`.
+pub const DEFAULT_AGENT_TYPE_NAME: &str = "ReActAgent";
+
+/// Model type name used when the provider is unknown (Rust cannot reflect the type).
+const FALLBACK_MODEL_TYPE_NAME: &str = "ChatModel";
+
+/// The `agentscope.function.name` value of a tool span.
+///
+/// Java: `getFunctionName(instance, "callTool")` with the `Toolkit` instance
+/// (`TelemetryTracer.java:169`) → `Toolkit.callTool`.
+pub const TOOL_FUNCTION_NAME: &str = "Toolkit.callTool";
+
+/// Java class-like name for a provider, used to build the model span's
+/// `agentscope.function.name` the way `getFunctionName(instance, "callModel")` would
+/// (`TelemetryTracer.java:123`).
+fn model_type_name(provider_name: &str) -> &'static str {
+    match provider_name {
+        super::gen_ai_attributes::provider_name::OPENAI => "OpenAIChatModel",
+        as_attrs::provider_name::DASHSCOPE => "DashScopeChatModel",
+        super::gen_ai_attributes::provider_name::GCP_GEMINI => "GeminiChatModel",
+        super::gen_ai_attributes::provider_name::ANTHROPIC => "AnthropicChatModel",
+        _ => FALLBACK_MODEL_TYPE_NAME,
+    }
+}
+
+/// The `(key, value)` pair for `agentscope.function.name`.
+fn function_name_attribute(value: String) -> (String, serde_json::Value) {
+    (
+        as_attrs::AGENTSCOPE_FUNCTION_NAME.to_string(),
+        serde_json::Value::String(value),
+    )
+}
+
+/// The agent span name: `invoke_agent <agent name>`, like Java's
+/// `INVOKE_AGENT + " " + instance.getName()` (`TelemetryTracer.java:96`).
+fn agent_span_name(agent_name: Option<&str>) -> String {
+    match agent_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{} {name}", operation_name::INVOKE_AGENT),
+        None => operation_name::INVOKE_AGENT.to_string(),
+    }
+}
 
 /// Produces `invoke_agent` / `chat` / `execute_tool` spans for one agent.
 ///
@@ -58,6 +125,7 @@ struct TracingInner {
     sink: SpanSink,
     spans: Arc<Mutex<HashMap<String, SpanCtx>>>,
     provider_name: String,
+    agent_type: String,
 }
 
 impl Clone for TelemetryTracing {
@@ -97,6 +165,7 @@ impl TelemetryTracing {
                 sink: SpanSink::new(exporter),
                 spans: Arc::new(Mutex::new(HashMap::new())),
                 provider_name: DEFAULT_PROVIDER_NAME.to_string(),
+                agent_type: DEFAULT_AGENT_TYPE_NAME.to_string(),
             }),
         }
     }
@@ -106,6 +175,17 @@ impl TelemetryTracing {
         // The instance is not shared yet, so the state is uniquely owned here.
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.provider_name = provider_name.into();
+        }
+        self
+    }
+
+    /// Overrides the agent type name recorded in `agentscope.function.name`.
+    ///
+    /// Java reads the concrete class name reflectively; a host that wraps or renames the
+    /// agent can pass its own type name here.
+    pub fn with_agent_type_name(mut self, agent_type_name: impl Into<String>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.agent_type = agent_type_name.into();
         }
         self
     }
@@ -150,7 +230,61 @@ impl TelemetryTracing {
             span,
             sink: self.inner.sink.clone(),
             finished: false,
+            finalizer: None,
         }
+    }
+
+    /// Runs `format` inside a `format <target>` span and records both sides of the call.
+    ///
+    /// Rust equivalent of Java's `TelemetryTracer.callFormat` (`TelemetryTracer.java:203`):
+    /// Java wraps the synchronous formatter invocation in a span, records
+    /// `getFormatRequestAttributes` up front and `getFormatResponseAttributes` on success.
+    /// Core has no formatter interception point (`Middleware` exposes no `on_format`), so
+    /// hosts that format messages themselves call this wrapper directly.
+    ///
+    /// `formatter_type` is the formatter's simple class name (`"OpenAIChatFormatter"`, …); it
+    /// is mapped to the span's target through [`FormatterConverter::get_formatter_target`]
+    /// exactly like Java's `FormatterConverter`. `ctx` supplies the parent span when a run
+    /// context is at hand; pass `None` for a root format span (Java's `Context.current()`
+    /// outside a traced call).
+    ///
+    /// A panic in `format` unwinds with the span still open; the guard's `Drop` ends it with an
+    /// unset status, mirroring Java's `finally { span.end(); }` without inventing an
+    /// exception status Java does not set.
+    pub fn call_format<T: serde::Serialize>(
+        &self,
+        ctx: Option<&RuntimeContext>,
+        formatter_type: &str,
+        msgs: &[Msg],
+        format: impl FnOnce() -> T,
+    ) -> T {
+        let parent = ctx.and_then(|ctx| self.current(ctx));
+        let trace_id = parent
+            .as_ref()
+            .map(|p| p.trace_id.clone())
+            .unwrap_or_else(new_trace_id);
+        let target = FormatterConverter::get_formatter_target(formatter_type);
+        let mut attributes = get_common_attributes();
+        attributes.extend(get_format_request_attributes(target, msgs));
+        attributes.push(function_name_attribute(get_function_name(
+            formatter_type,
+            "format",
+        )));
+        let mut guard = self.begin(
+            format!("{} {target}", as_attrs::operation_name::FORMAT),
+            trace_id,
+            new_span_id(),
+            parent.map(|p| p.span_id),
+            attributes,
+            SpanKind::Internal,
+        );
+        let result = format();
+        guard
+            .span
+            .attributes
+            .extend(get_format_response_attributes(&result));
+        guard.end(SpanStatus::Ok);
+        result
     }
 }
 
@@ -170,14 +304,34 @@ impl Middleware for TelemetryTracing {
             None,
             &input.messages,
         ));
-        let guard = self.begin(
-            operation_name::INVOKE_AGENT,
-            trace_id.clone(),
-            span_id.clone(),
-            None,
-            attributes,
-            SpanKind::Internal,
-        );
+        // Java `TelemetryTracer.java:104`: `AGENTSCOPE_FUNCTION_NAME` = `<AgentType>.callAgent`.
+        attributes.push(function_name_attribute(get_function_name(
+            self.inner.agent_type.as_str(),
+            "callAgent",
+        )));
+        // Java `doOnSuccess(msg -> span.setAllAttributes(getAgentResponseAttributes(msg)))`:
+        // the reply only exists once the run produced its `AgentResult` event.
+        let reply: Arc<Mutex<Option<Msg>>> = Arc::new(Mutex::new(None));
+        let guard = self
+            .begin(
+                agent_span_name(ctx.agent_name.as_deref()),
+                trace_id.clone(),
+                span_id.clone(),
+                None,
+                attributes,
+                SpanKind::Internal,
+            )
+            .with_finalizer({
+                let reply = Arc::clone(&reply);
+                move || {
+                    reply
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone())
+                        .map(|msg| get_agent_response_attributes(&msg))
+                        .unwrap_or_default()
+                }
+            });
         // Publish the run's root span *before* the inner stream is built: the phases run
         // inside `next`, so they must be able to find their parent immediately.
         let run_key = TelemetryTracing::run_key(ctx);
@@ -191,6 +345,7 @@ impl Middleware for TelemetryTracing {
             inner,
             vec![guard],
             run_key.map(|key| (Arc::clone(&self.inner.spans), key)),
+            Some(reply),
         ))
     }
 
@@ -214,15 +369,45 @@ impl Middleware for TelemetryTracing {
             &input.tools,
             Some(&input.options),
         ));
-        let guard = self.begin(
-            format!("{} {}", operation_name::CHAT, input.model.model_name()),
-            trace_id,
-            span_id,
-            parent.map(|p| p.span_id),
-            attributes,
-            SpanKind::Client,
+        // Java `TelemetryTracer.java:124`: `<ChatModelType>.callModel`.
+        attributes.push(function_name_attribute(get_function_name(
+            model_type_name(&self.inner.provider_name),
+            "callModel",
+        )));
+        // Java feeds every streamed chunk into a `StreamChatResponseAggregator` and records
+        // `getLLMResponseAttributes(aggregator.getResponse())` in `doFinally`. Rust's
+        // `on_model_call` stream only carries `ModelCallEnd`, so the provider stream itself is
+        // teed instead — that is the same observation point Java uses.
+        let aggregate = Arc::new(Mutex::new(StreamChatResponseAggregator::create()));
+        let guard = self
+            .begin(
+                format!("{} {}", operation_name::CHAT, input.model.model_name()),
+                trace_id,
+                span_id,
+                parent.map(|p| p.span_id),
+                attributes,
+                SpanKind::Client,
+            )
+            .with_finalizer({
+                let aggregate = Arc::clone(&aggregate);
+                move || {
+                    aggregate
+                        .lock()
+                        .ok()
+                        .map(|aggregate| {
+                            let response = aggregate.response();
+                            get_llm_response_attributes(Some(&response))
+                        })
+                        .unwrap_or_default()
+                }
+            });
+        let input = ModelCallInput::new(
+            input.messages,
+            input.tools,
+            input.options,
+            Arc::new(AggregatingModel::new(input.model, aggregate)),
         );
-        Box::pin(SpanStream::new(next(input), vec![guard], None))
+        Box::pin(SpanStream::new(next(input), vec![guard], None, None))
     }
 
     fn on_acting(
@@ -233,6 +418,9 @@ impl Middleware for TelemetryTracing {
     ) -> EventStream {
         let parent = self.current(ctx);
         let tool_calls = input.tool_calls.clone();
+        // Java `doOnSuccess(result -> span.setAllAttributes(getToolResponseAttributes(result)))`:
+        // the acting phase collects its results into this handle, so it is the response source.
+        let results = input.results.clone();
         let guards = tool_calls
             .iter()
             .map(|call| {
@@ -247,6 +435,7 @@ impl Middleware for TelemetryTracing {
                     &call.name,
                     &call.input,
                 ));
+                attributes.push(function_name_attribute(TOOL_FUNCTION_NAME.to_string()));
                 self.begin(
                     format!("{} {}", operation_name::EXECUTE_TOOL, call.name),
                     trace_id,
@@ -255,9 +444,10 @@ impl Middleware for TelemetryTracing {
                     attributes,
                     SpanKind::Internal,
                 )
+                .with_finalizer(tool_result_attributes(results.clone(), call.id.clone()))
             })
             .collect();
-        Box::pin(SpanStream::new(next(input), guards, None))
+        Box::pin(SpanStream::new(next(input), guards, None, None))
     }
 
     fn active_points(&self) -> Vec<ExtensionPoint> {
@@ -274,14 +464,28 @@ struct SpanGuard {
     span: Span,
     sink: SpanSink,
     finished: bool,
+    /// Attributes that can only be computed when the phase ends (Java's `doOnSuccess` /
+    /// `doFinally` response attributes).
+    finalizer: Option<Box<dyn FnOnce() -> Attributes + Send>>,
 }
 
 impl SpanGuard {
+    /// Attaches the response-side attributes computed at end time.
+    fn with_finalizer(mut self, finalizer: impl FnOnce() -> Attributes + Send + 'static) -> Self {
+        self.finalizer = Some(Box::new(finalizer));
+        self
+    }
+
     fn end(&mut self, status: SpanStatus) {
         if self.finished {
             return;
         }
         self.finished = true;
+        if let Some(finalizer) = self.finalizer.take() {
+            // A cancelled (dropped) phase ends here too: Java's `doFinally` also records the
+            // response attributes it managed to aggregate.
+            self.span.attributes.extend(finalizer());
+        }
         self.span.end_time_unix_nano = unix_nanos(Utc::now());
         self.span.status = status;
         self.sink.record(self.span.clone());
@@ -304,6 +508,8 @@ struct SpanStream {
     guards: Vec<SpanGuard>,
     /// The run this stream belongs to, removed from the shared map when the run ends.
     run: Option<(Arc<Mutex<HashMap<String, SpanCtx>>>, String)>,
+    /// The agent run's final reply, captured from its `AgentResult` event.
+    reply: Option<Arc<Mutex<Option<Msg>>>>,
     finished: bool,
 }
 
@@ -312,12 +518,33 @@ impl SpanStream {
         inner: EventStream,
         guards: Vec<SpanGuard>,
         run: Option<(Arc<Mutex<HashMap<String, SpanCtx>>>, String)>,
+        reply: Option<Arc<Mutex<Option<Msg>>>>,
     ) -> Self {
         Self {
             inner,
             guards,
             run,
+            reply,
             finished: false,
+        }
+    }
+
+    /// Records the agent's final message, the value Java's `callAgent` receives in
+    /// `doOnSuccess`.
+    fn capture_reply(&self, event: &AgentEvent) {
+        let Some(reply) = &self.reply else {
+            return;
+        };
+        let AgentEvent::AgentResult(data) = event else {
+            return;
+        };
+        let Some(value) = data.fields.get("reply") else {
+            return;
+        };
+        if let Ok(msg) = serde_json::from_value::<Msg>(value.clone()) {
+            if let Ok(mut slot) = reply.lock() {
+                *slot = Some(msg);
+            }
         }
     }
 
@@ -352,7 +579,11 @@ impl Stream for SpanStream {
                 this.finish(SpanStatus::Error(error.to_string()));
                 Poll::Ready(Some(Err(error)))
             }
-            other => other,
+            Poll::Ready(Some(Ok(event))) => {
+                this.capture_reply(&event);
+                Poll::Ready(Some(Ok(event)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -361,6 +592,102 @@ impl Drop for SpanStream {
     fn drop(&mut self) {
         // Dropped mid-flight (timeout, abort, lost lease): the spans still end.
         self.finish(SpanStatus::Ok);
+    }
+}
+
+/// Builds the end-of-phase finalizer that records a tool span's response attributes.
+///
+/// Java records `getToolResponseAttributes(result)` on success
+/// (`TelemetryTracer.java:190`). Rust's acting phase writes each `ToolResultBlock` into
+/// [`ActingResultsHandle`] (first writer wins), which is the equivalent of the value Java's
+/// `doOnSuccess` receives — the event stream itself only carries `ToolResultEnd` state, never
+/// the output blocks.
+fn tool_result_attributes(
+    results: ActingResultsHandle,
+    tool_call_id: String,
+) -> impl FnOnce() -> Attributes + Send + 'static {
+    move || {
+        results
+            .snapshot()
+            .results
+            .iter()
+            .find(|block| block.id.as_deref() == Some(tool_call_id.as_str()))
+            .map(|block| get_tool_response_attributes(&block.output))
+            .unwrap_or_default()
+    }
+}
+
+/// A model wrapper that feeds every streamed chunk into a
+/// [`StreamChatResponseAggregator`], mirroring Java's
+/// `.doOnNext(aggregator::append)`.
+///
+/// `on_model_call` only sees `ModelCallEnd` (the text/tool deltas are routed to the agent
+/// stream through `RuntimeContext.delta_tx`), so the aggregator has to observe the provider
+/// stream directly. Every other capability is forwarded untouched.
+struct AggregatingModel {
+    inner: Arc<dyn Model>,
+    aggregate: Arc<Mutex<StreamChatResponseAggregator>>,
+}
+
+impl AggregatingModel {
+    fn new(inner: Arc<dyn Model>, aggregate: Arc<Mutex<StreamChatResponseAggregator>>) -> Self {
+        Self { inner, aggregate }
+    }
+}
+
+impl Model for AggregatingModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        tools: Vec<ToolSchema>,
+        options: GenerateOptions,
+    ) -> BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        // One `stream()` call per attempt: start clean so a retried attempt replaces the
+        // abandoned one instead of appending to it (Java has no model-level retry here).
+        if let Ok(mut aggregate) = self.aggregate.lock() {
+            *aggregate = StreamChatResponseAggregator::create();
+        }
+        let aggregate = Arc::clone(&self.aggregate);
+        Box::pin(
+            self.inner
+                .stream(messages, tools, options)
+                .map(move |chunk| {
+                    if let Ok(chunk) = &chunk {
+                        if let Ok(mut aggregate) = aggregate.lock() {
+                            aggregate.append(chunk);
+                        }
+                    }
+                    chunk
+                }),
+        )
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn supports_native_structured_output(&self) -> bool {
+        self.inner.supports_native_structured_output()
+    }
+
+    fn supports_native_structured_output_with_tools(&self) -> bool {
+        self.inner.supports_native_structured_output_with_tools()
+    }
+
+    fn supports_tool_choice_specific(&self) -> bool {
+        self.inner.supports_tool_choice_specific()
+    }
+
+    fn context_window_size(&self) -> usize {
+        self.inner.context_window_size()
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.inner.max_output_tokens()
+    }
+
+    fn descriptor(&self) -> Option<&agentscope_core::model::catalog::ModelDescriptor> {
+        self.inner.descriptor()
     }
 }
 
@@ -452,6 +779,7 @@ mod tests {
     use futures::StreamExt;
 
     use super::super::exporter::RecordingTraceExporter;
+    use crate::telemetry::gen_ai_attributes as gen_ai;
 
     fn ctx(run_id: Option<&str>) -> RuntimeContext {
         let mut ctx = RuntimeContext::default().with_agent_id("assistant");
@@ -462,6 +790,24 @@ mod tests {
 
     fn agent_input() -> AgentInput {
         AgentInput::new(vec![Msg::user("hi")])
+    }
+
+    /// The span name the default `ctx()` produces: `invoke_agent <agent name>`.
+    fn expected_agent_span_name() -> String {
+        format!("{} assistant", operation_name::INVOKE_AGENT)
+    }
+
+    fn attr_value<'a>(span: &'a Span, key: &str) -> Option<&'a serde_json::Value> {
+        span.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    fn attr_str<'a>(span: &'a Span, key: &str) -> &'a str {
+        attr_value(span, key)
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| panic!("span {} has no string attribute {key}", span.name))
     }
 
     /// A `next` continuation that yields `events` and completes.
@@ -488,7 +834,7 @@ mod tests {
         tracing.flush().await;
         let spans = exporter.spans();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].name, operation_name::INVOKE_AGENT);
+        assert_eq!(spans[0].name, expected_agent_span_name());
         assert_eq!(spans[0].status, SpanStatus::Ok);
         assert_eq!(spans[0].trace_id.len(), 32);
         assert_eq!(spans[0].span_id.len(), 16);
@@ -535,7 +881,7 @@ mod tests {
         tracing.flush().await;
         let spans = exporter.spans();
         assert_eq!(spans.len(), 1, "a dropped run must still export its span");
-        assert_eq!(spans[0].name, operation_name::INVOKE_AGENT);
+        assert_eq!(spans[0].name, expected_agent_span_name());
     }
 
     #[tokio::test]
@@ -566,7 +912,7 @@ mod tests {
         let spans = exporter.spans();
         let root = spans
             .iter()
-            .find(|s| s.name == operation_name::INVOKE_AGENT)
+            .find(|s| s.name == expected_agent_span_name())
             .expect("root span");
         let chat = spans
             .iter()
@@ -654,9 +1000,16 @@ mod tests {
             agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
         > {
             let response = agentscope_core::model::ChatResponse::builder()
+                .id("resp-real")
                 .content(vec![agentscope_core::message::ContentBlock::Text(
                     agentscope_core::message::TextBlock::new("hello"),
                 )])
+                .usage(
+                    agentscope_core::message::ChatUsage::builder()
+                        .input_tokens(4)
+                        .output_tokens(2)
+                        .build(),
+                )
                 .finish_reason("stop")
                 .build();
             Box::pin(futures::stream::iter(vec![Ok(response)]))
@@ -693,7 +1046,7 @@ mod tests {
         let spans = exporter.spans();
         let root = spans
             .iter()
-            .find(|s| s.name == operation_name::INVOKE_AGENT)
+            .find(|s| s.name == format!("{} traced", operation_name::INVOKE_AGENT))
             .expect("agent span");
         let chat = spans
             .iter()
@@ -701,8 +1054,293 @@ mod tests {
             .expect("model span");
         assert_eq!(root.status, SpanStatus::Ok);
         assert_eq!(chat.parent_span_id.as_deref(), Some(root.span_id.as_str()));
+        // Java `callAgent`: `<AgentType>.callAgent` + the reply as response attributes.
+        assert_eq!(
+            attr_str(root, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "ReActAgent.callAgent"
+        );
+        assert!(attr_str(root, gen_ai::GEN_AI_OUTPUT_MESSAGES).contains("hello"));
+        // Java `callModel`: `<ChatModelType>.callModel` + the aggregated response, which only
+        // exists if the provider stream was teed into the aggregator on the real agent path.
+        assert_eq!(
+            attr_str(chat, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "ChatModel.callModel"
+        );
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_INPUT_TOKENS),
+            Some(&serde_json::json!(4))
+        );
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_OUTPUT_TOKENS),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_RESPONSE_FINISH_REASONS),
+            Some(&serde_json::json!(["stop"]))
+        );
+        assert_eq!(attr_str(chat, gen_ai::GEN_AI_RESPONSE_ID), "resp-real");
         // The run leaves nothing behind in the shared map.
         assert!(tracing.inner.spans.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn function_names_follow_the_java_type_and_method_shape() {
+        // Java `AttributesExtractors.getFunctionName(instance, method)` =
+        // `instance.getClass().getSimpleName() + "." + method` (AttributesExtractors.java:350).
+        assert_eq!(
+            get_function_name(DEFAULT_AGENT_TYPE_NAME, "callAgent"),
+            "ReActAgent.callAgent"
+        );
+        assert_eq!(
+            get_function_name(model_type_name("openai"), "callModel"),
+            "OpenAIChatModel.callModel"
+        );
+        assert_eq!(
+            get_function_name(model_type_name("dashscope"), "callModel"),
+            "DashScopeChatModel.callModel"
+        );
+        assert_eq!(
+            get_function_name(model_type_name("gcp.gemini"), "callModel"),
+            "GeminiChatModel.callModel"
+        );
+        assert_eq!(
+            get_function_name(model_type_name("anthropic"), "callModel"),
+            "AnthropicChatModel.callModel"
+        );
+        // Rust cannot reflect the provider: unknown providers keep a generic type name.
+        assert_eq!(
+            get_function_name(model_type_name("unknown"), "callModel"),
+            "ChatModel.callModel"
+        );
+        assert_eq!(TOOL_FUNCTION_NAME, "Toolkit.callTool");
+    }
+
+    #[tokio::test]
+    async fn the_agent_span_records_the_reply_as_response_attributes() {
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let reply = Msg::assistant("the final reply");
+        let mut data = agentscope_core::event::EventData::default();
+        data.fields
+            .insert("reply".to_string(), serde_json::json!(reply));
+        let _ = drain(tracing.on_agent(
+            &ctx(Some("run-reply")),
+            agent_input(),
+            next_with(vec![
+                Ok(AgentEvent::new(AgentEventType::AgentStart)),
+                Ok(AgentEvent::AgentResult(data)),
+            ]),
+        ))
+        .await;
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        assert_eq!(spans.len(), 1);
+        // Java `doOnSuccess(msg -> span.setAllAttributes(getAgentResponseAttributes(msg)))`.
+        assert!(attr_str(&spans[0], gen_ai::GEN_AI_OUTPUT_MESSAGES).contains("the final reply"));
+        assert!(
+            attr_str(&spans[0], as_attrs::AGENTSCOPE_FUNCTION_OUTPUT).contains("the final reply")
+        );
+    }
+
+    /// A `Model` that streams two chunks, so the aggregator has something to merge.
+    struct StreamingModel;
+
+    #[async_trait::async_trait]
+    impl agentscope_core::model::Model for StreamingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: agentscope_core::model::GenerateOptions,
+        ) -> futures::stream::BoxStream<
+            '_,
+            agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+        > {
+            let first = agentscope_core::model::ChatResponse::builder()
+                .id("resp-stream")
+                .content(vec![agentscope_core::message::ContentBlock::Text(
+                    agentscope_core::message::TextBlock::new("Hel"),
+                )])
+                .usage(
+                    agentscope_core::message::ChatUsage::builder()
+                        .input_tokens(9)
+                        .output_tokens(1)
+                        .build(),
+                )
+                .build();
+            let second = agentscope_core::model::ChatResponse::builder()
+                .id("resp-stream")
+                .content(vec![agentscope_core::message::ContentBlock::Text(
+                    agentscope_core::message::TextBlock::new("lo"),
+                )])
+                .usage(
+                    agentscope_core::message::ChatUsage::builder()
+                        .input_tokens(9)
+                        .output_tokens(5)
+                        .build(),
+                )
+                .finish_reason("stop")
+                .build();
+            Box::pin(futures::stream::iter(vec![Ok(first), Ok(second)]))
+        }
+
+        fn model_name(&self) -> &str {
+            "gpt-4o-mini"
+        }
+    }
+
+    #[tokio::test]
+    async fn the_model_span_aggregates_the_streamed_response() {
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone()).with_provider_name("openai");
+        let input = ModelCallInput::new(
+            vec![Msg::user("hi")],
+            Vec::new(),
+            agentscope_core::model::GenerateOptions::default(),
+            Arc::new(StreamingModel),
+        );
+        // Drive the wrapped model the way the agent core does: consume its stream.
+        let next: Next<ModelCallInput> = Box::new(|input: ModelCallInput| {
+            let model = Arc::clone(&input.model);
+            let fut = async move {
+                let mut stream = model.stream(input.messages, input.tools, input.options);
+                let mut events = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    chunk.expect("streamed chunk");
+                    events.push(Ok(AgentEvent::new(AgentEventType::ModelCallEnd)));
+                }
+                events
+            };
+            Box::pin(futures::stream::once(fut).flat_map(futures::stream::iter))
+        });
+        let events = drain(tracing.on_model_call(&ctx(Some("run-stream")), input, next)).await;
+        assert_eq!(events.len(), 2);
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        assert_eq!(spans.len(), 1);
+        let chat = &spans[0];
+        assert_eq!(chat.name, "chat gpt-4o-mini");
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_INPUT_TOKENS),
+            Some(&serde_json::json!(9))
+        );
+        // Usage is cumulative per chunk: Java takes the max.
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_OUTPUT_TOKENS),
+            Some(&serde_json::json!(5))
+        );
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_RESPONSE_FINISH_REASONS),
+            Some(&serde_json::json!(["stop"]))
+        );
+        assert_eq!(attr_str(chat, gen_ai::GEN_AI_RESPONSE_ID), "resp-stream");
+        // The chunks are merged, not concatenated: "Hel" + "lo" is one text part.
+        assert!(attr_str(chat, gen_ai::GEN_AI_OUTPUT_MESSAGES).contains("Hello"));
+        assert_eq!(
+            attr_str(chat, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "OpenAIChatModel.callModel"
+        );
+        assert!(attr_str(chat, as_attrs::AGENTSCOPE_FUNCTION_OUTPUT).contains("resp-stream"));
+    }
+
+    #[tokio::test]
+    async fn the_tool_span_records_the_result_from_the_acting_sink() {
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let call = ToolUseBlock::new("call-1", "search", Default::default());
+        let input = ActingInput::new(vec![call.clone()]);
+        // The acting core writes its results into the handle: that is the response side.
+        let results = input.results.clone();
+        let next: Next<ActingInput> = Box::new(move |_input: ActingInput| {
+            results.record_placeholder(&call, "found it");
+            Box::pin(futures::stream::empty())
+        });
+        let _ = drain(tracing.on_acting(&ctx(Some("run-tool")), input, next)).await;
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        assert_eq!(spans.len(), 1);
+        let tool = &spans[0];
+        assert_eq!(tool.name, "execute_tool search");
+        assert_eq!(
+            attr_str(tool, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            TOOL_FUNCTION_NAME
+        );
+        assert!(attr_str(tool, gen_ai::GEN_AI_TOOL_CALL_RESULT).contains("found it"));
+        assert!(attr_str(tool, as_attrs::AGENTSCOPE_FUNCTION_OUTPUT).contains("found it"));
+    }
+
+    #[tokio::test]
+    async fn call_format_emits_a_format_span_with_both_sides() {
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let formatted =
+            tracing.call_format(None, "OpenAIChatFormatter", &[Msg::user("hi")], || {
+                vec!["formatted-1".to_string()]
+            });
+        assert_eq!(formatted, vec!["formatted-1".to_string()]);
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        assert_eq!(spans.len(), 1);
+        let format = &spans[0];
+        // Java `FormatterConverter.getFormatterTarget("OpenAIChatFormatter")` → dashscope.
+        assert_eq!(format.name, "format dashscope");
+        assert_eq!(format.kind, SpanKind::Internal);
+        assert_eq!(format.status, SpanStatus::Ok);
+        assert!(format.parent_span_id.is_none());
+        assert_eq!(
+            attr_str(format, gen_ai::GEN_AI_OPERATION_NAME),
+            as_attrs::operation_name::FORMAT
+        );
+        assert_eq!(
+            attr_str(format, as_attrs::AGENTSCOPE_FORMAT_TARGET),
+            "dashscope"
+        );
+        assert_eq!(
+            attr_str(format, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "OpenAIChatFormatter.format"
+        );
+        assert!(attr_str(format, as_attrs::AGENTSCOPE_FUNCTION_INPUT).contains("hi"));
+        assert!(attr_str(format, as_attrs::AGENTSCOPE_FUNCTION_OUTPUT).contains("formatted-1"));
+    }
+
+    #[tokio::test]
+    async fn call_format_attaches_to_the_run_span() {
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let run_ctx = ctx(Some("run-format"));
+        let inner_ctx = run_ctx.clone();
+        let tracer = tracing.clone();
+        let next: Next<AgentInput> = Box::new(move |_| {
+            tracer.call_format(
+                Some(&inner_ctx),
+                "AnthropicChatFormatter",
+                &[Msg::user("hi")],
+                || "ok",
+            );
+            Box::pin(futures::stream::empty())
+        });
+        let _ = drain(tracing.on_agent(&run_ctx, agent_input(), next)).await;
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        let root = spans
+            .iter()
+            .find(|s| s.name == expected_agent_span_name())
+            .expect("agent span");
+        let format = spans
+            .iter()
+            .find(|s| s.name.starts_with(as_attrs::operation_name::FORMAT))
+            .expect("format span");
+        assert_eq!(format.name, "format anthropic");
+        assert_eq!(
+            format.parent_span_id.as_deref(),
+            Some(root.span_id.as_str())
+        );
+        assert_eq!(format.trace_id, root.trace_id);
     }
 
     fn model_input() -> ModelCallInput {

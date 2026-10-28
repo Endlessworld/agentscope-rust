@@ -17,9 +17,9 @@
 | Java 子模块 | `io.agentscope.core.studio` + `io.agentscope.core.tracing.telemetry` |
 | Java 规模（实测 2026-10-22） | 主代码 28 文件 / **4305 行**（非空行 3738）；测试 10 文件 / **1837 行**（非空行 1554）；`@Test` 方法 91 个 |
 | Rust crate | `crates/agentscope-extensions-studio` |
-| Rust 规模（实测 2026-10-22） | 18 个 `.rs` / **5048 行**（非空行 4578）/ **59 个内联测试**（46 `#[test]` + 13 `#[tokio::test]`）|
+| Rust 规模（实测 2026-10-28） | 18 个 `.rs` / **5048+ 行** / **70 个内联测试**（54 `#[test]` + 16 `#[tokio::test]`，`cargo test` 实测 70 passed）|
 | 迁移波次 | C |
-| 当前状态 | 已完成（**59 个离线单测**；Socket.IO 真实传输 + OTLP 降级导出已落地；`TelemetryTracing` 已落地但**未自动装配**，见 §4.2 第 4 条）。**2026-10-22 静态复核**：新增 2 项真实缺口 —— `StudioMessageHook` 终态消息捕获键与 core 不一致导致转发恒不触发（§6.4 P0-1）、`TelemetryTracer` 仍有 3 处 Java 语义未覆盖（§6.4 P1-1）；另有鉴权字段名分歧（§6.4 P1-2）|
+| 当前状态 | 已完成（**70 个离线单测**；Socket.IO 真实传输 + OTLP 降级导出已落地；`TelemetryTracing` 已落地但**未自动装配**，见 §4.2 第 4 条）。**2026-10-22 静态复核**发现的 3 项已于 2026-10-28 全部关闭：P0-1 `StudioMessageHook` 捕获键（§7.1）、P1-1 `TelemetryTracer` 三处语义（§4.1.0v）、P1-2 Socket.IO 鉴权键（§4.1.0v）。仍开放 P2-1/P2-2/P2-3/P2-4 |
 | 行数口径 | Java 4305/1837 与 Rust 5048 均为**物理行**（含空行/注释）；非空行口径 Java 3738/1554、Rust 4578。汇总 tracker 的 3700/1452 与之同族，需按口径换算 |
 
 ## 2. Java 清单与依赖映射
@@ -31,7 +31,7 @@
 |---|---|---|---|
 | `studio.StudioConfig` | 连接配置（url/tracingUrl/project/runName/runId/maxRetries/reconnect*）| `studio::StudioConfig` + `StudioConfigBuilder` | 默认值对齐：url=`http://localhost:3000`、project=`UnnamedProject`、runName=`run_<ts>`、runId=UUID、maxRetries=3、reconnectAttempts=3、delay=1s、maxDelay=5s；tracingUrl 默认 `studioUrl + /v1/traces` |
 | `studio.StudioClient` | OkHttp HTTP 客户端（registerRun/pushMessage/requestUserInput + 重试 + shutdown）| `studio::StudioClient` | reqwest + 指数退避重试（base 100ms，max 5s，`max_retries` 次）；时间戳 `yyyy-MM-dd HH:mm:ss.SSS`。**静态复核**：Rust 仅对 `StudioError::Transport` 重试，Java 因非 2xx 被包成 `IOException` **也会重试**（语义分歧，见 §6.4 P2-1）|
-| `studio.StudioWebSocketClient` | Socket.IO 连接 `/python` namespace，监听 `forwardUserInput`，`waitForInput` 等待 Mono | `studio::StudioWebSocketClient` + `studio::socket_io` | `StudioTransport` trait（可插拔）+ `PendingInputRegistry`（`HashMap<requestId, oneshot>`）；**`SocketIoTransport` 为真实实现**（tokio-tungstenite 0.29 + 自实现 Engine.IO v4 握手/`40` 入房/ping-pong/指数退避重连）；帧解析为纯函数。**静态复核**：鉴权载荷键 Rust 用 `runId`，Java 用 `run_id`（见 §6.4 P1-2）|
+| `studio.StudioWebSocketClient` | Socket.IO 连接 `/python` namespace，监听 `forwardUserInput`，`waitForInput` 等待 Mono | `studio::StudioWebSocketClient` + `studio::socket_io` | `StudioTransport` trait（可插拔）+ `PendingInputRegistry`（`HashMap<requestId, oneshot>`）；**`SocketIoTransport` 为真实实现**（tokio-tungstenite 0.29 + 自实现 Engine.IO v4 握手/`40` 入房/ping-pong/指数退避重连）；帧解析为纯函数。**鉴权键已对齐 Java（2026-10-28，§4.1.0v）**：`auth_payload()` 默认发 `{"run_id": <runId>}`（Java `StudioWebSocketClient.java:98`），旧 `runId` 仅在 `SocketIoTransport::with_legacy_auth_key()` 显式开启时一并发送 |
 | `studio.StudioWebSocketClient.UserInputData` | 用户输入载荷（blocksInput + structuredInput）| `studio::UserInputData` | |
 | `studio.StudioManager` | 全局静态单例（config/client/wsClient + init builder + shutdown + TracerRegistry 注册）| `studio::StudioManager` | Rust 用 `OnceLock<RwLock<Option<...>>>` 全局；不依赖 core `TracerRegistry`（core 无此类型，见 §4.2） |
 | `studio.StudioMessageHook` | `Hook`，拦截 `PostCallEvent` 把最终消息推给 Studio | `studio::StudioMessageHook` | Rust 无 `Hook`（core `hook` 为设计决定不迁移）；改为 core `Middleware`：`on_agent` 包裹后在事件流上捕获终态消息并推送（fire-and-forget）。**静态复核**：捕获键为 `fields["message"]`，而 core `react_agent` 写入的是 `fields["reply"]`（protocol crate 写 `fields["result"]`）→ **转发恒不触发**（§6.4 P0-1）|
@@ -44,9 +44,9 @@
 | `telemetry.AgentScopeIncubatingAttributes` | AgentScope 自定义属性键 | `telemetry::agent_scope_attributes` | `agentscope.function.*`、`agentscope.format.*`。实测：Java 6 键 → Rust 5 键，缺 `AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS` |
 | `telemetry.AttributesExtractors` | 从 agent/model/tool/formatter 抽取 OTel 属性（实测 648 行）| `telemetry::extractors`（**同名模块，不存在 `AttributesExtractors` 类型**）| 纯函数（`get_*_attributes`）；复用 core 的 Msg/ContentBlock/ChatResponse/ToolSchema/GenerateOptions |
 | `telemetry.AttributesExtractors.FormatterConverter` | formatter 简单类名 → provider 名映射 | `telemetry::FormatterConverter` | DashScope/Gemini/OpenAI→dashscope；Anthropic→anthropic；其余 unknown |
-| `telemetry.AttributesExtractors.ProviderNameConverter` | ChatModelBase 实例 → provider 名（按类继承链判断）| `telemetry::ProviderNameConverter` | Rust 无运行时类反射；改为按模型类型名后缀探测（`DashScopeChatModel`/`GeminiChatModel`/`AnthropicChatModel`/`OpenAIChatModel`）。**静态复核**：`TelemetryTracing` 未调用它，而是用 `DEFAULT_PROVIDER_NAME="unknown"`/宿主 `with_provider_name` 覆盖（§6.4 P1-1）|
-| `telemetry.StreamChatResponseAggregator` | 流式 ChatResponse 聚合（text/thinking/tool_calls + usage max + finishReason）| `telemetry::StreamChatResponseAggregator` | 复用 core `ChatResponse`/`ChatUsage`/`ContentBlock`。**静态复核**：该聚合器**未被 `TelemetryTracing` 使用**（Java 用它给 `chat` span 补响应侧属性），仅作为公开 API 存在（§6.4 P1-1）|
-| `telemetry.TelemetryTracer` | `Tracer` 实现：agent/model/tool/**format** 四类 span + OTLP HTTP 导出 | **`telemetry::TelemetryTracing`**（**不存在 `TelemetryTracer` 类型**）| 包装为 core `Middleware`，实际拦截点只有 `on_agent`/`on_model_call`/`on_acting`（**无 `on_reasoning`，且缺 Java 的 `callFormat` format span**）；OTLP 导出为降级 exporter（`telemetry::exporter`，见 §4.1.0s）。**静态复核**：span 上缺 `agentscope.function.name`、缺响应侧属性（§6.4 P1-1）|
+| `telemetry.AttributesExtractors.ProviderNameConverter` | ChatModelBase 实例 → provider 名（按类继承链判断）| `telemetry::ProviderNameConverter` | Rust 无运行时类反射；改为按模型类型名后缀探测（`DashScopeChatModel`/`GeminiChatModel`/`AnthropicChatModel`/`OpenAIChatModel`）。**设计取舍**：`TelemetryTracing` 只用 `DEFAULT_PROVIDER_NAME="unknown"`/宿主 `with_provider_name` 覆盖（拿到的只是 `Arc<dyn Model>`，无类名）——2026-10-28 复核确认无法在本 crate 内反射出 provider，未随 §6.4 P1-1 关闭 |
+| `telemetry.StreamChatResponseAggregator` | 流式 ChatResponse 聚合（text/thinking/tool_calls + usage max + finishReason）| `telemetry::StreamChatResponseAggregator` | 复用 core `ChatResponse`/`ChatUsage`/`ContentBlock`。**已接入（2026-10-28，§4.1.0v）**：`TelemetryTracing::on_model_call` 用 `AggregatingModel` tee 模型流逐 chunk `append`（等价 Java `doOnNext(aggregator::append)`），span 结束时写 `get_llm_response_attributes` |
+| `telemetry.TelemetryTracer` | `Tracer` 实现：agent/model/tool/**format** 四类 span + OTLP HTTP 导出 | **`telemetry::TelemetryTracing`**（**不存在 `TelemetryTracer` 类型**）| 包装为 core `Middleware`：`on_agent`/`on_model_call`/`on_acting`（无 `on_reasoning`，core 无该必要）+ `call_format`（同步包装器，core 无 formatter 拦截点）；OTLP 导出为降级 exporter（`telemetry::exporter`，见 §4.1.0s）。**2026-10-28 已补齐（§4.1.0v）**：`agentscope.function.name`（四类 span）、三个响应侧抽取器、format span |
 | `telemetry.model.*`（**13 个类**）| OTel 消息部件模型（Text/Reasoning/ToolCallRequest/ToolCallResponse/Blob/File/Uri Part、Input/OutputMessage、Role、SystemInstructions、ToolDefinition）| `telemetry::model`（13 个 `pub` 类型，与 Java 一一对应）| serde 结构；`type` 字段判别 + JSON 字段名对齐（`mime_type`/`file_id`/`finish_reason`）|
 
 ### 2.1 依赖映射（Java → Rust）
@@ -93,7 +93,7 @@
 ### 3.2 重要但可延后（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| Socket.IO 真实握手/鉴权/重连 | StudioWebSocketClient.connect | 进行中（2026-10-22 复核：实现完整，但鉴权字段名与 Java 不一致） | `studio::socket_io`：`socket_io_url`（http(s)→ws(s) + `?EIO=4&transport=websocket`）、`parse_engine_io_open`（`0{...}` 握手）、`namespace_connect_frame`（`40/python,{...}`）、`is_ping`/`pong_frame`、`parse_socket_io_event`（`42[...]`）、`reconnect_delay`（指数退避封顶）+ `SocketIoProtocol` 状态机 + `SocketIoTransport`（真实 WS）；单测 `studio::socket_io::tests`（**12** = 11 帧层 + 1 transport 构造）。**待修**：鉴权载荷 Rust=`{"runId":...}`、Java=`{"run_id":...}`（§6.4 P1-2）|
+| Socket.IO 真实握手/鉴权/重连 | StudioWebSocketClient.connect | 已完成（2026-10-28：鉴权键已对齐 Java `run_id`） | `studio::socket_io`：`socket_io_url`（http(s)→ws(s) + `?EIO=4&transport=websocket`）、`parse_engine_io_open`（`0{...}` 握手）、`namespace_connect_frame`（`40/python,{...}`）、`is_ping`/`pong_frame`、`parse_socket_io_event`（`42[...]`）、`reconnect_delay`（指数退避封顶）+ `SocketIoProtocol` 状态机 + `SocketIoTransport`（真实 WS）；单测 `studio::socket_io::tests`（**14** = 12 帧层 + 2 鉴权键）。**鉴权键**：`auth_payload(run_id, include_legacy_key)` 默认 `{"run_id":...}`（Java `StudioWebSocketClient.java:98`），历史 `runId` 只能经 `with_legacy_auth_key()` 叠加（见 §4.1.0v）|
 | `StudioClient` 网络路径离线测（mock HTTP） | StudioClient | 待办 | 需注入 HTTP 传输抽象或 mock server（`StudioClient` 目前直接持 `reqwest::Client`，无注入点）；当前仅离测请求体构造 |
 | `StudioUserAgent` 与 core agent 循环集成 | StudioUserAgent | 待办 | 当前为独立输入提供者，调用方自行接入 agent 轮次 |
 | `StudioMessageHook` 终态消息捕获键修正 | StudioMessageHook | 待办 | core 终态消息在 `fields["reply"]`（protocol crate 为 `fields["result"]`），Rust 侧读的是 `fields["message"]` → 恒不触发（§6.4 P0-1）|
@@ -101,7 +101,7 @@
 ### 3.3 增强（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `TelemetryTracer`（core `Middleware` 包装 + span 生命周期） | TelemetryTracer | 进行中（2026-10-22 复核：span 生命周期已达标，语义覆盖仍缺 3 项） | `telemetry/tracing.rs`：`Middleware` 三拦截点（`OnAgent`/`OnModelCall`/`OnActing`）产出 `invoke_agent` / `chat {model}` / `execute_tool {name}`；span 用 **RAII 收尾**（guard 随事件流 drop 而结束，取消路径不漏 span）；父子靠 `RuntimeContext.run_id` 映射（`&RuntimeContext` 不可变，不能用 ctx 存 span）。`TraceExporter::export` 是 async 而 hook 是同步 → `SpanSink` 后台批量导出 + `flush()` 供测试/短进程。单元 7 个（1 `#[test]` + 6 `#[tokio::test]`，含「drop 掉流仍导出 span」与真实 `ReActAgent` 端到端）。**待补**：①span 缺 `agentscope.function.name`；②缺响应侧属性（`get_agent_response_attributes`/`get_llm_response_attributes`/`get_tool_response_attributes` 未被调用，`StreamChatResponseAggregator` 未接入）；③缺 Java `callFormat` 的 `format {target}` span（§6.4 P1-1）|
+| `TelemetryTracer`（core `Middleware` 包装 + span 生命周期） | TelemetryTracer | 已完成（2026-10-28：§6.4 P1-1 ①②③ 全部关闭） | `telemetry/tracing.rs`：`Middleware` 三拦截点（`OnAgent`/`OnModelCall`/`OnActing`）产出 `invoke_agent {agent}` / `chat {model}` / `execute_tool {name}`，`call_format` 产出 `format {target}`；span 用 **RAII 收尾**（guard 随事件流 drop 而结束，取消路径不漏 span）；父子靠 `RuntimeContext.run_id` 映射（`&RuntimeContext` 不可变，不能用 ctx 存 span）。`TraceExporter::export` 是 async 而 hook 是同步 → `SpanSink` 后台批量导出 + `flush()` 供测试/短进程。**2026-10-28 补齐**：①四类 span 均带 `agentscope.function.name`；②三个响应侧抽取器接入（`SpanGuard::finalizer`）：agent ← `AgentResult.fields["reply"]`、model ← `AggregatingModel` tee 模型流 + `StreamChatResponseAggregator`、tool ← `ActingResultsHandle`；③`call_format`（等价 Java `callFormat`）。单测 13 个（2 `#[test]` + 11 `#[tokio::test]`），含真实 `ReActAgent` 端到端断言 usage/finish_reason（§4.1.0v）|
 | OTLP HTTP 导出 | exporter-otlp-http | 已完成（降级 exporter）| `telemetry::exporter`：`Span`/`SpanKind`/`SpanStatus`/`OtlpEncoder`（`resourceSpans`→`scopeSpans`→`spans`，id 十六进制校验、纳秒字符串、`AnyValue` 映射）+ `TraceExporter` trait + `OtlpHttpExporter`（reqwest `POST {tracingUrl}`）/`RecordingTraceExporter`/`NoopTraceExporter`；**未引入 `opentelemetry` 依赖**（设计决定，见 §4.2）；单测 `telemetry::exporter::tests`（**10** = 8 + 2）。**待补**：Java `TelemetryTracer.Builder.addHeader/headers`（Langfuse 等需鉴权头）在 Rust 侧无对应（§6.4 P2-2）|
 | 多模态内容部件抽取 | TODO(multi-modal) | 待办 | Java 亦为 TODO；`block_to_part` 对 Image/Audio/Video 返回 None |
 
@@ -112,7 +112,7 @@
 - 验证命令与结果（2026-09-18，**历史快照**）：
   - `cargo build -p agentscope-extensions-studio` → 成功，0 error / 0 warning（仅 core/harness 既有告警）。
   - `cargo test -p agentscope-extensions-studio` → **30 passed / 0 failed**（`--lib`）；doc-tests 0 passed。
-  - 后续增量：2026-10-08 → **52 passed**（§4.1.0s）；2026-10-21 → **59 passed**（§4.1.0u）。2026-10-22 静态复核按 `#[test]`/`#[tokio::test]` 注解逐文件计数得 **59**（46 + 13），与记录一致。
+  - 后续增量：2026-10-08 → **52 passed**（§4.1.0s）；2026-10-21 → **59 passed**（§4.1.0u）；2026-10-22 → **62 passed**（§7.1）；**2026-10-28 → 70 passed / 0 failed（本次实测，§4.1.0v）**。2026-10-22 静态复核按 `#[test]`/`#[tokio::test]` 注解逐文件计数得 **59**（46 + 13），与当次记录一致。
 - 交付：`src/` **18 个文件**已接线并编译（**2026-10-22 更正**，原记 15 为 2026-09-18 快照）；`lib.rs` re-export `StudioClient/StudioConfig/StudioConfigBuilder/StudioWebSocketClient/StudioManager/StudioMessageHook/StudioUserAgent/StudioTransport/NoopStudioTransport/PendingInputRegistry/UserInputData` 及 telemetry 提取器/聚合器/模型。
 - 上一子智能体遗留 8 个编译错误的根因与修法：
   1. **E0252 ×4**：`studio/mod.rs` 里 `use crate::studio::{client,config,websocket}::…` 与同文件 `pub use` 重复导入同名符号 → 删除冗余 `use`（保留 `pub use` 作为唯一公开路径）。
@@ -158,19 +158,67 @@
 - **同步 hook / 异步 exporter**：`SpanSink` 用无界 channel + 后台任务，等价 Java `BatchSpanProcessor`；无 tokio runtime 时丢弃 span 并 warn（不 panic、不阻塞）。
 - **首版不含响应侧属性**（`gen_ai.usage.*`）：需从事件流聚合，留作后续；当前只记请求侧 + 状态 + 时间。
   > **2026-10-22 静态复核补充**：响应侧属性未落地不只是「缺 usage」——`get_agent_response_attributes`/`get_llm_response_attributes`/`get_tool_response_attributes` 三个抽取器**完全未被 `tracing.rs` 引用**，`StreamChatResponseAggregator` 也**未被接入**；同时 span 上缺 `agentscope.function.name`，且缺 Java `callFormat` 对应的 format span。三项合并计入 §6.4 P1-1。
+  > **2026-10-28 已全部补齐**（§4.1.0v）；上述两行保留为历史记录。
 
 **测试**：`a_completed_run_exports_the_agent_span`、`a_failed_run_marks_the_span_as_error`、`a_dropped_run_still_ends_the_span`（**反向验证：去掉 Drop 路径后仅此用例 FAILED**）、`nested_phases_attach_to_the_run_span`、`a_run_without_a_run_id_falls_back_to_the_session`、`only_the_three_traced_points_are_active`、`a_real_agent_run_exports_agent_and_model_spans`（真实 `ReActAgent` + Mock 模型）。
 
 **验证**：`cargo test -p agentscope-extensions-studio` → **59 passed / 0 failed**（基线 52，+7）。
+
+#### 4.1.0v 2026-10-28 执行记录：关闭 P1×2（Socket.IO 鉴权键 + `TelemetryTracing` 缺失项）
+
+> Java 参考：`agentscope-java` HEAD `16cb024ae`（`StudioWebSocketClient.java`、`TelemetryTracer.java`、`AttributesExtractors.java`）。本轮**只改本 crate**（`crates/agentscope-extensions-studio/**`）与本 tracker。
+
+**① Socket.IO 鉴权键对齐 Java（§3.2 / §6.4 P1-2）**
+
+| Java 依据 | 内容 |
+|---|---|
+| `studio/StudioWebSocketClient.java:96-99` | `Map<String,String> auth = new HashMap<>(); auth.put("run_id", config.getRunId()); options.auth = auth;` |
+| 全模块 grep `run_id\|auth\|query` | 握手鉴权**只有一个键** `run_id`（无 `project`/`token` 等其它键；`runId` 只出现在 POJO 字段，如 `PushMessageRequest.runId`，与 WS 鉴权无关） |
+
+- Rust 原实现：`serde_json::json!({ "runId": config.run_id() })` → 与 Java/Studio 服务端校验键不一致，命名空间入房可能被判未鉴权。
+- 现实现：`AUTH_RUN_ID_KEY = "run_id"`、`LEGACY_AUTH_RUN_ID_KEY = "runId"`、`auth_payload(run_id, include_legacy_key)`；`SocketIoTransport::new` 默认发 `{"run_id": ...}`；**兼容回退** `SocketIoTransport::with_legacy_auth_key()` 把旧 `runId` **叠加**在 `run_id` 之上（默认不叠加，保证与 Java 字节级一致）。
+- 测试：`handshake_auth_uses_the_java_snake_case_run_id_key`（默认载荷 + 实际 `40/python,{...}` 连接帧）、`the_legacy_camel_case_auth_key_is_opt_in`（旧键仅显式开启；Java 键恒在）；`connect_frame_carries_namespace_and_auth` / `protocol_joins_the_namespace_after_the_handshake` 中的样例载荷同步改为 `run_id`。
+
+**② `TelemetryTracing` 三处缺失（§3.3 / §6.4 P1-1）**
+
+| # | Java 依据 | 补法 |
+|---|---|---|
+| ① `agentscope.function.name` | `TelemetryTracer.java:104/124/169/215`（四类 span 均 `setAttribute(AGENTSCOPE_FUNCTION_NAME, getFunctionName(instance, method))`）；`AttributesExtractors.java:350` `class.getSimpleName() + "." + method` | `TelemetryTracing` 在四类 span 上写 `agentscope.function.name`：agent=`ReActAgent.callAgent`（`with_agent_type_name` 可覆盖）、model=`<ProviderChatModel>.callModel`（provider→Java 类名映射，未知=`ChatModel`）、tool=`Toolkit.callTool`（`TOOL_FUNCTION_NAME`）、format=`<Formatter>.format` |
+| ② 三个响应侧抽取器 + `StreamChatResponseAggregator` | `TelemetryTracer.java:110`（agent `doOnSuccess` → `getAgentResponseAttributes`）、`:143-148`（model `doOnNext(aggregator::append)` + `doFinally` → `getLLMResponseAttributes`）、`:190`（tool `doOnSuccess` → `getToolResponseAttributes`） | `SpanGuard` 新增 `finalizer: Option<Box<dyn FnOnce() -> Attributes + Send>>`（等价 Java `doFinally`/`doOnSuccess`，drop 路径同样执行）。**agent**：`SpanStream` 从 `AgentEvent::AgentResult.fields["reply"]` 反序列化 `Msg`（core 写入点 `react_agent.rs:864`）→ `get_agent_response_attributes`。**model**：`on_model_call` 用 `AggregatingModel` 包装 `input.model`，逐 chunk `StreamChatResponseAggregator::append` → `get_llm_response_attributes`（`on_model_call` 的事件流只有 `ModelCallEnd`，文本 delta 走 `ctx.delta_tx`，故必须 tee provider 流；每次 `stream()` 调用重置聚合器，重试不叠加）。**tool**：`ActingInput.results`（`ActingResultsHandle`）快照按 `tool_call_id` 匹配 → `get_tool_response_attributes`（事件流只有 `ToolResultEnd` 的 state/metadata，无输出块） |
+| ③ `callFormat` 的 format span | `TelemetryTracer.java:203-232`：span 名 `<FORMAT> <formatterTarget>`、请求侧 `getFormatRequestAttributes`、成功侧 `getFormatResponseAttributes`、`finally span.end()` | 新增 `TelemetryTracing::call_format(ctx: Option<&RuntimeContext>, formatter_type, msgs, closure)`：`FormatterConverter::get_formatter_target` 映射 target、`SpanKind::Internal`、`ctx` 提供父 span（`None`=根 span，对应 Java `Context.current()` 无上下文）；core 无 formatter 拦截点 → 宿主在格式化处调用（§4.2 第 6 条） |
+
+- **顺带对齐**：agent span 名改为 `invoke_agent <agent name>`（Java `TelemetryTracer.java:96` `INVOKE_AGENT + " " + instance.getName()`），原先只有 `invoke_agent`。
+- **未改动（记录在案）**：`gen_ai.provider.name` 仍取配置（默认 `unknown`）—— `TelemetryTracing` 只拿到 `Arc<dyn Model>`，Rust 无运行时反射（§6.3 ProviderNameConverter 行）。
+
+**新增/修改测试（+8，62 → 70）**
+`studio::socket_io::tests`：`handshake_auth_uses_the_java_snake_case_run_id_key`、`the_legacy_camel_case_auth_key_is_opt_in`。
+`telemetry::tracing::tests`：`function_names_follow_the_java_type_and_method_shape`、`the_agent_span_records_the_reply_as_response_attributes`、`the_model_span_aggregates_the_streamed_response`（两 chunk → text 合并 `Hello`、usage 取 max、finishReasons、response id）、`the_tool_span_records_the_result_from_the_acting_sink`、`call_format_emits_a_format_span_with_both_sides`、`call_format_attaches_to_the_run_span`；`a_real_agent_run_exports_agent_and_model_spans` 加强为断言真实链路下的 `function.name` 与 usage/finish_reason/response id。
+
+**验证（本次实测）**
+- `cargo build -p agentscope-extensions-studio` → **EXIT=0**，本 crate 0 error / 0 warning（仅 core/harness 既有告警）。
+- `cargo test -p agentscope-extensions-studio` → **70 passed / 0 failed / 0 ignored**。
+- `cargo fmt -p agentscope-extensions-studio -- --check` → 干净。
+
+**反向验证（逐个回退 → 对应用例 FAILED → 恢复）**
+| 回退内容 | 结果 |
+|---|---|
+| `auth_payload(...)` → `json!({"runId": ...})` | `handshake_auth_uses_the_java_snake_case_run_id_key` **FAILED**（1 failed） |
+| `AGENTSCOPE_FUNCTION_NAME` 键改成错的键名 | `the_tool_span_records_the_result_from_the_acting_sink`、`call_format_emits_a_format_span_with_both_sides`、`the_model_span_aggregates_the_streamed_response`、`a_real_agent_run_exports_agent_and_model_spans` **4 FAILED** |
+| `SpanGuard::end` 不应用 finalizer | 上述 3 个响应侧用例 + 真实链路用例 **4 FAILED**（`call_format` 用例仍 ok，因其直接写 span，验证两条路径相互独立） |
+| `on_model_call` 不包装 `AggregatingModel`（不 tee） | `the_model_span_aggregates_the_streamed_response`、`a_real_agent_run_exports_agent_and_model_spans` **2 FAILED** |
+| `call_format` 不写响应侧属性 | `call_format_emits_a_format_span_with_both_sides` **FAILED** |
+
+**未完成**：`StudioManager` 自动装配（§4.2 第 4 条）；`format` span 的宿主调用点（§4.2 第 6 条）；P2-1/P2-2/P2-3/P2-4 未动。
 
 ### 4.2 下一步与阻塞（待汇总方裁定）
 1. **【已解决 — 降级方案】** OTLP 导出**不引入 `opentelemetry`/`opentelemetry-otlp`**（避免根 `[workspace.dependencies]` 变更）：以 `telemetry::exporter` 自建 `Span` 模型 + `OtlpEncoder`（OTLP/HTTP JSON）+ `TraceExporter` trait 实现等价导出。`TelemetryTracer` 等价物已于 2026-10-21 落地（`TelemetryTracing`，§4.1.0u）。若后续要求与 OTel SDK 字节级兼容，再提请裁定。
 2. **【已解决 — 本 crate 自声明依赖】** Socket.IO：已用 `tokio-tungstenite = 0.29`（与 CHANNEL crate 同版本/同 features）+ 自实现 Engine.IO v4/Socket.IO 帧（`studio::socket_io`）。**未改根 `Cargo.toml`。**
    附带说明：`StudioManager::initialize_with` 默认仍用 `NoopStudioTransport`（Java 为无条件连接）；宿主要启用真实连接需走 `initialize_with_transport` / `StudioWebSocketClient::with_transport_and_registry`。**原因**：默认连接会让本 crate 现有离线测试向 `localhost:3000` 发起真实网络请求（违反离线测试约定）。
 3. **【core 缺口】** `GenerateOptions` 未实现 `Serialize`（本 crate 已用本地投影绕过，未改 core）；core 无 `Hook`/`TracerRegistry`（已按 §2 用 `Middleware` 替代）。
-4. **【接线待办 — 2026-10-22 复核仍存在】** `TelemetryTracing` 目前由宿主显式挂到 `MiddlewareChain`（`chain.add(Box::new(tracing.clone()))`），尚未在 `StudioManager::initialize` 里按 `StudioConfig.tracing_url` 自动装配 —— 自动装配需决定「一个 Studio 实例 vs 每个 agent 一条链」，留待后续。
+4. **【接线待办 — 2026-10-22 复核仍存在；2026-10-28 未变】** `TelemetryTracing` 目前由宿主显式挂到 `MiddlewareChain`（`chain.add(Box::new(tracing.clone()))`），尚未在 `StudioManager::initialize` 里按 `StudioConfig.tracing_url` 自动装配 —— 自动装配需决定「一个 Studio 实例 vs 每个 agent 一条链」，留待后续。
    **复核证据**：全仓 `TelemetryTracing` 的引用仅出现在 `telemetry/tracing.rs` 自身与其单测、`telemetry/mod.rs` 的 re-export；`StudioManager::initialize*` 未引用它。Java 侧对应 `StudioManager.initialize()` 内的 `TracerRegistry.register(TelemetryTracer.builder().endpoint(traceEndpoint).build())`（Java 自动装配）。
-5. **【2026-10-22 新增 — 见 §6.4】** P0-1 `StudioMessageHook` 捕获键与 core 不一致（转发恒不触发）；P1-1 `TelemetryTracer` 三处语义缺口；P1-2 Socket.IO 鉴权字段名分歧；P2-1 HTTP 错误重试语义分歧；P2-2 OTLP exporter 无自定义 header。
+5. **【2026-10-22 新增 — 见 §6.4】** ~~P1-1~~ / ~~P1-2~~ **已于 2026-10-28 关闭（§4.1.0v）**；仍开放：P0-1（已由汇总方于 2026-10-22 修复，§7.1）、P2-1 HTTP 错误重试语义分歧、P2-2 OTLP exporter 无自定义 header、P2-3 属性键缺 5 个、P2-4 `StudioUserAgent` 无 name 校验。
+6. **【2026-10-28 新增 — core 缺口】** `format` span 只能以 `TelemetryTracing::call_format(ctx, formatter_type, msgs, closure)` 形式提供：core `Middleware` 的 `ExtensionPoint` 无 formatter 拦截点，`agentscope_core::formatter` 也只有自由函数、无 formatter trait。**宿主须在真正格式化处调用该包装器**，否则 `format {target}` span 不会产生（不阻塞其他 span）。Java 侧由 `Tracer.callFormat(formatter, msgs, supplier)` 在框架内自动包裹。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-studio` 基线。
@@ -195,20 +243,20 @@
 | 测试文件 | 10 | 8（含测试的文件；`error.rs`/`lib.rs`/`mod.rs`/`user_agent.rs`/`message_hook.rs`/`model.rs` 等无内联测试）|
 | 测试行（物理）| **1837** | — |
 | 测试行（非空）| **1554** | — |
-| 测试用例数 | **91** 个 `@Test` 方法 | **59**（46 `#[test]` + 13 `#[tokio::test]`）|
+| 测试用例数 | **91** 个 `@Test` 方法 | **70**（54 `#[test]` + 16 `#[tokio::test]`；2026-10-28 实测 `cargo test` → 70 passed / 0 failed）|
 | 顶层类/类型 | 28 文件 / **44 个类型声明**（含嵌套类与接口）| 18 文件 / 与 Java 一一映射（见 §6.3）|
 | 属性键常量 | `GenAiIncubatingAttributes` 38 个 `AttributeKey` + `AgentScopeIncubatingAttributes` 6 个 | 34 + 5（缺 4 + 1，见 §6.4 P2-3）|
 | OTLP 部件模型 | `telemetry/model` **13** 个类 | `telemetry::model` **13** 个 `pub` 类型（一一对应）|
 
-Rust 逐文件测试分布（`#[test]` / `#[tokio::test]` / 合计）：
-`config.rs` 3/0/3、`pojo.rs` 5/0/5、`socket_io.rs` 12/0/12、`websocket.rs` 6/5/11、`aggregator.rs` 3/0/3、`exporter.rs` 8/2/10、`extractors.rs` 8/0/8、`tracing.rs` 1/6/7 → **合计 46/13/59**。
+Rust 逐文件测试分布（`#[test]` / `#[tokio::test]` / 合计；**2026-10-28 实测**）：
+`config.rs` 3/0/3、`message_hook.rs` 3/0/3、`pojo.rs` 5/0/5、`socket_io.rs` 14/0/14、`websocket.rs` 6/5/11、`aggregator.rs` 3/0/3、`exporter.rs` 8/2/10、`extractors.rs` 8/0/8、`tracing.rs` 2/11/13 → **合计 54/16/70**（原记 `socket_io` 12、`tracing` 7 且漏 `message_hook` 3，合计 59 为 2026-10-22 静态计数）。
 
 ### 6.3 对齐结论表
 | Java 类 / 包 | Rust 对应 | 行为覆盖 | 结论 |
 |---|---|---|---|
 | `studio.StudioConfig` | `studio::StudioConfig` + `StudioConfigBuilder` | 默认值/尾部 `/` trim/`tracingUrl` 推导全对齐；Java 无 trim，Rust 多做一次 trim（无害）| ✅ 对齐 |
 | `studio.StudioClient` | `studio::StudioClient` | 三方法 + 重试 + shutdown 均在；**重试谓词不同**（Java 含非 2xx，Rust 不含）| ⚠️ 部分（§6.4 P2-1）|
-| `studio.StudioWebSocketClient` | `studio::StudioWebSocketClient` + `studio::socket_io` | 握手/入房/ping-pong/重连/`forwardUserInput` 解码全在；**鉴权键名不同** | ⚠️ 部分（§6.4 P1-2）|
+| `studio.StudioWebSocketClient` | `studio::StudioWebSocketClient` + `studio::socket_io` | 握手/入房/ping-pong/重连/`forwardUserInput` 解码全在；鉴权键已对齐 Java `run_id`（旧 `runId` 仅 opt-in，§4.1.0v）| ✅ 对齐 |
 | `studio.StudioWebSocketClient.UserInputData` | `studio::UserInputData` | blocksInput + structuredInput 结构一致 | ✅ 对齐 |
 | `studio.StudioManager` | `studio::StudioManager` | 全局单例/init builder/getters/shutdown 在；**Java 的 `TracerRegistry.register` 自动装配缺失**（§4.2 第 4 条）| ⚠️ 部分 |
 | `studio.StudioMessageHook` | `studio::StudioMessageHook` | Middleware 形态在，但**终态消息捕获键与 core 不符 → 恒不触发** | ❌ 未对齐（§6.4 P0-1）|
@@ -219,8 +267,8 @@ Rust 逐文件测试分布（`#[test]` / `#[tokio::test]` / 合计）：
 | `telemetry.AttributesExtractors` | `telemetry::extractors`（模块，非同名类型）| 10 个 `get_*` 函数一一对应；`GenerateOptions` 用本地投影绕过 core `Serialize` 缺口 | ✅ 对齐 |
 | `…FormatterConverter` | `telemetry::FormatterConverter` | 映射表一致 | ✅ 对齐 |
 | `…ProviderNameConverter` | `telemetry::ProviderNameConverter` | 函数在，但 `TelemetryTracing` 未调用（provider 恒为 `unknown`）| ⚠️ 部分（§6.4 P1-1）|
-| `telemetry.StreamChatResponseAggregator` | `telemetry::StreamChatResponseAggregator` | 聚合逻辑在；**未被 span 管线接入** | ⚠️ 部分（§6.4 P1-1）|
-| `telemetry.TelemetryTracer` | **`telemetry::TelemetryTracing`** | span 生命周期/父子/RAII 达标；缺 `agentscope.function.name`、缺响应侧属性、缺 format span | ⚠️ 部分（§6.4 P1-1）|
+| `telemetry.StreamChatResponseAggregator` | `telemetry::StreamChatResponseAggregator` | 聚合逻辑在；**已接入 `on_model_call`**（`AggregatingModel` tee 模型流）| ✅ 对齐 |
+| `telemetry.TelemetryTracer` | **`telemetry::TelemetryTracing`** | span 生命周期/父子/RAII 达标；`agentscope.function.name` 四类 span、三个响应侧抽取器、`call_format` format span 均已落地（2026-10-28）；provider 名仍取配置（Rust 无反射）| ✅ 对齐（§4.1.0v）|
 | `telemetry.model.*`（13 类）| `telemetry::model`（13 类型）| 一一对应，`type` 判别 + `mime_type`/`file_id`/`finish_reason` 字段名对齐 | ✅ 对齐 |
 | OTLP 导出（`exporter-otlp-http`）| `telemetry::exporter`（`OtlpEncoder` + `OtlpHttpExporter`）| OTLP/HTTP JSON 编码 + POST 实现；**未引入 `opentelemetry`（已核实）**；无自定义 header | ✅ 设计等价（§6.4 P2-2）|
 
@@ -232,9 +280,9 @@ Rust 逐文件测试分布（`#[test]` / `#[tokio::test]` / 合计）：
 ### 6.4 新发现缺口
 | 编号 | 优先级 | 缺口 | 证据 | 影响 |
 |---|---|---|---|---|
-| P0-1 | **P0** | `StudioMessageHook` 捕获终态消息的键名错误，转发**恒不触发** | Rust `studio/message_hook.rs:92` 读 `data.fields.get("message")`；core `agentscope-core/src/agent/react_agent.rs:725` 写入的是 `fields["reply"]`；protocol crate 写入 `fields["result"]`。全仓无任何 `fields["message"]` 生产者 | Studio 端看不到 agent 最终消息 —— Studio 集成的主功能之一实际失效（静默失效，最坏情况）|
-| P1-1 | **P1** | `TelemetryTracer` 三处 Java 语义未覆盖：①span 缺 `agentscope.function.name`；②响应侧属性（`get_agent_response_attributes`/`get_llm_response_attributes`/`get_tool_response_attributes`）完全未接入，`StreamChatResponseAggregator` 未被 `tracing.rs` 引用；③缺 Java `callFormat` 的 `format {target}` span（core `Middleware` 无 formatter 拦截点，需另找 seam）| `telemetry/tracing.rs:32-36` 的 import 只含 3 个 request 侧抽取器；`agent_scope_attributes.rs` 的 `AGENTSCOPE_FUNCTION_NAME` 全仓仅在定义处出现；`get_agent_response_attributes` 等在 `telemetry/` 内只被 `mod.rs` re-export | 遥测数据维度明显少于 Java：`gen_ai.usage.*`/`gen_ai.output.messages` 缺失、span 无法按函数名聚合、formatter 调用不可见 |
-| P1-2 | **P1** | Socket.IO 鉴权载荷键名分歧 | Java `StudioWebSocketClient.java:98` `auth.put("run_id", config.getRunId())`（snake_case）；Rust `studio/socket_io.rs:288` `json!({ "runId": config.run_id() })`（camelCase）| 服务端按 `run_id` 校验时，Rust 握手鉴权字段对不上 → 真实 Studio 环境下入房可能被拒（离线测试无法暴露）|
+| P0-1 | **P0** | `StudioMessageHook` 捕获终态消息的键名错误，转发**恒不触发** | 已于 2026-10-22 修复（§7.1）：优先读 `fields["reply"]`，`fields["message"]` 仅作第三方回退 | — |
+| P1-1 | ~~P1~~ **已关闭（2026-10-28）** | `TelemetryTracer` 三处 Java 语义未覆盖：①span 缺 `agentscope.function.name`；②响应侧属性 + `StreamChatResponseAggregator` 未接入；③缺 `callFormat` 的 `format {target}` span | 原证据：`tracing.rs:32-36` import 只含 3 个 request 侧抽取器；`AGENTSCOPE_FUNCTION_NAME` 仅定义处出现；`get_*_response_attributes` 只被 `mod.rs` re-export | 已修复，依据与用例见 §4.1.0v；残留设计取舍：`gen_ai.provider.name` 仍取配置（Rust 无反射）、`format` span 需宿主调用 `call_format` |
+| P1-2 | ~~P1~~ **已关闭（2026-10-28）** | Socket.IO 鉴权载荷键名分歧 | 原证据：Java `StudioWebSocketClient.java:98` `auth.put("run_id", ...)`；Rust 曾发 `json!({ "runId": ... })` | 已修复：`auth_payload()` 默认 `run_id`，旧 `runId` 经 `with_legacy_auth_key()` 可选叠加；用例 `handshake_auth_uses_the_java_snake_case_run_id_key` / `the_legacy_camel_case_auth_key_is_opt_in`（§4.1.0v）|
 | P2-1 | **P2** | HTTP 错误重试语义分歧 | Java `StudioClient.java:116/161/209` 把非 2xx 包成 `IOException` → 被 `Retry.filter(t -> t instanceof IOException)` 命中**会重试**；Rust `client.rs:137` 仅 `StudioError::Transport` 可重试，`StudioError::Http` 不重试 | 服务端 5xx 时 Java 重试 3 次、Rust 立即失败 —— 健壮性弱于 Java |
 | P2-2 | **P2** | OTLP exporter 无自定义 header | Java `TelemetryTracer.Builder.addHeader/headers`（注释明写 "for authentication (e.g., Langfuse)"）；Rust `OtlpHttpExporter` 仅设 `Content-Type`（`exporter.rs:428`）| 对 Langfuse 等需鉴权头的 OTLP 后端无法落地 |
 | P2-3 | **P2** | 属性键常量缺 5 个（Java 44 → Rust 39）| 缺 `gen_ai.tool.type`、`gen_ai.usage.cache_creation.input_tokens`、`gen_ai.usage.cache_read.input_tokens`、`gen_ai.usage.reasoning.output_tokens`、`agentscope.usage.tool_use_prompt_tokens` | 语义约定覆盖不全；不影响主链路 |
@@ -288,5 +336,26 @@ Rust 逐文件测试分布（`#[test]` / `#[tokio::test]` / 合计）：
 
 ### 7.2 仍待办
 
-- `TelemetryTracer` 缺 `agentscope.function.name` span、三个响应侧抽取器 + `StreamChatResponseAggregator` 未接入。
-- Socket.IO 鉴权键 Rust `runId` vs Java `run_id`（真实环境可能握手被拒）。
+- ~~`TelemetryTracer` 缺 `agentscope.function.name` span、三个响应侧抽取器 + `StreamChatResponseAggregator` 未接入~~ → **2026-10-28 已修，见 §4.1.0v**。
+- ~~Socket.IO 鉴权键 Rust `runId` vs Java `run_id`~~ → **2026-10-28 已修，见 §4.1.0v**。
+- 仍开放：`StudioManager` 自动装配（§4.2 第 4 条）；`format` span 的宿主调用点（§4.2 第 6 条）；P2-1/P2-2/P2-3/P2-4（§6.4）。
+
+## 8. 2026-10-28 执行记录（子智能体：关闭 P1×2）
+
+**改动文件**（仅本 crate + 本 tracker）
+| 文件 | 改动 |
+|---|---|
+| `crates/agentscope-extensions-studio/src/studio/socket_io.rs` | `AUTH_RUN_ID_KEY`/`LEGACY_AUTH_RUN_ID_KEY`/`auth_payload()`；`SocketIoTransport::new` 默认发 `run_id`；`with_legacy_auth_key()` 兼容回退；+2 测试 |
+| `crates/agentscope-extensions-studio/src/telemetry/tracing.rs` | `agentscope.function.name`（agent/model/tool/format）；`SpanGuard::finalizer` + 三个响应侧抽取器接入；`AggregatingModel`（tee 模型流）+ `StreamChatResponseAggregator`；`call_format()` format span；agent span 名 `invoke_agent <name>`；+6 测试，1 个端到端用例加强 |
+| `docs/extensions/STUDIO__GAP_TRACKER.md` | §1/§2.0/§3.2/§3.3/§4.1/§4.2/§6.2/§6.3/§6.4/§7.2 状态与计数；新增 §4.1.0v 与本节 |
+
+**Java 依据**：`StudioWebSocketClient.java:96-99`（auth `run_id`）；`TelemetryTracer.java:96/104/110`（agent span 名、function.name、响应侧）、`:123-148`（model function.name + aggregator + doFinally）、`:169/190`（tool）、`:203-232`（callFormat）；`AttributesExtractors.java:350`（`getFunctionName`）；`StudioWebSocketClient.java` 全模块 grep 确认握手鉴权只有 `run_id` 一个键。
+
+**命令与结果（实测）**
+- `cargo build -p agentscope-extensions-studio` → EXIT=0，本 crate 0 warning。
+- `cargo test -p agentscope-extensions-studio` → **70 passed / 0 failed**（基线 62，+8）。
+- `cargo fmt -p agentscope-extensions-studio -- --check` → 干净。
+
+**反向验证**：5 项回退逐一确认对应用例 FAILED 后恢复（明细见 §4.1.0v 表）。
+
+**未完成**：`StudioManager` 自动装配（§4.2 #4）；`format` span 需宿主调用（§4.2 #6）；P2-1/P2-2/P2-3/P2-4。
