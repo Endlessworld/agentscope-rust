@@ -16,7 +16,7 @@ use std::time::Duration;
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::{McpClientManager, McpServerConfig, McpToolInfo};
 use async_trait::async_trait;
-use rust_mcp_sdk::schema::{CallToolResult, TextContent, Tool, ToolInputSchema};
+use rust_mcp_sdk::schema::{CallToolResult, Tool, ToolInputSchema};
 use serde_json::{Map, Value};
 
 use crate::search_result::{HigressToolInfo, HigressToolSearchResult};
@@ -122,7 +122,7 @@ impl HigressClientConfig {
 /// so they travel alongside it. Keeping them in one value makes it possible to
 /// assert (in tests and in diagnostics) that no configured knob is dropped.
 #[derive(Debug, Clone)]
-pub(crate) struct McpConnectRequest {
+pub struct McpConnectRequest {
     /// Server projection consumed by [`McpClientManager`].
     pub server: McpServerConfig,
     /// Caller-selected transport.
@@ -137,11 +137,12 @@ pub(crate) struct McpConnectRequest {
 ///
 /// [`McpClientManager`] is a concrete type that opens real sockets, which makes
 /// it impossible to observe or fail deterministically in unit tests. This trait
-/// exists only as a seam for the Higress wrapper: it is implemented for the real
-/// manager below and by an in-test recorder. It deliberately covers nothing but
-/// the operations the wrapper uses — it is not a parallel MCP abstraction.
+/// exists only as a seam for the Higress wrapper: the real manager implements it
+/// below, and callers may inject their own implementation through
+/// [`HigressMcpClientWrapper::with_transport`]. It deliberately covers nothing
+/// but the operations the wrapper uses — it is not a parallel MCP abstraction.
 #[async_trait]
-pub(crate) trait McpConnection: Send + Sync {
+pub trait HigressMcpTransport: Send + Sync {
     /// Creates and connects a client for `request`, propagating any failure.
     async fn connect_server(&self, request: McpConnectRequest) -> Result<()>;
     /// Returns the connected client id for `server`, if any.
@@ -149,18 +150,23 @@ pub(crate) trait McpConnection: Send + Sync {
     /// Lists the tools discovered for `client_id`.
     async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>>;
     /// Calls a tool on the connected client for `server`.
+    ///
+    /// `meta` is the MCP request metadata, forwarded untouched: `None` must reach
+    /// the wire as an absent `_meta` field (Java
+    /// `McpClientWrapper.callTool(name, args, meta)` passes `null` through).
     async fn call_tool_by_server(
         &self,
         server: &str,
         tool_name: &str,
         arguments: Value,
+        meta: Option<Map<String, Value>>,
     ) -> Result<Value>;
     /// Disconnects the client for `server`, if one is connected.
     async fn disconnect_by_server(&self, server: &str) -> Result<()>;
 }
 
 #[async_trait]
-impl McpConnection for McpClientManager {
+impl HigressMcpTransport for McpClientManager {
     async fn connect_server(&self, request: McpConnectRequest) -> Result<()> {
         tracing::debug!(
             server = %request.server.name,
@@ -206,8 +212,12 @@ impl McpConnection for McpClientManager {
         server: &str,
         tool_name: &str,
         arguments: Value,
+        meta: Option<Map<String, Value>>,
     ) -> Result<Value> {
-        McpClientManager::call_tool_by_server(self, server, tool_name, arguments).await
+        // `call_tool_by_server_with_meta` is the manager's metadata-aware entry
+        // point; passing `None` keeps the historic (meta-less) behaviour.
+        McpClientManager::call_tool_by_server_with_meta(self, server, tool_name, arguments, meta)
+            .await
     }
 
     async fn disconnect_by_server(&self, server: &str) -> Result<()> {
@@ -439,7 +449,7 @@ impl HigressMcpClientBuilder {
 /// MCP protocol operations to a harness [`McpClientManager`].
 pub struct HigressMcpClientWrapper {
     name: String,
-    connection: Arc<dyn McpConnection>,
+    connection: Arc<dyn HigressMcpTransport>,
     /// Server projection handed to the connection layer on `initialize`.
     server_config: McpServerConfig,
     transport_type: TransportType,
@@ -467,15 +477,22 @@ impl std::fmt::Debug for HigressMcpClientWrapper {
 impl HigressMcpClientWrapper {
     /// Creates a wrapper from an already-validated [`HigressClientConfig`].
     pub fn new(config: HigressClientConfig, manager: Arc<McpClientManager>) -> Self {
-        Self::with_connection(config, manager)
+        Self::with_transport(config, manager)
     }
 
-    /// Creates a wrapper backed by an arbitrary [`McpConnection`].
-    fn with_connection(config: HigressClientConfig, connection: Arc<dyn McpConnection>) -> Self {
+    /// Creates a wrapper backed by an arbitrary [`HigressMcpTransport`].
+    ///
+    /// This is the seam used by tests and by hosts that own their own MCP
+    /// connection layer; production code normally goes through
+    /// [`HigressMcpClientBuilder::build`].
+    pub fn with_transport(
+        config: HigressClientConfig,
+        transport: Arc<dyn HigressMcpTransport>,
+    ) -> Self {
         let server_config = config.to_server_config();
         Self {
             name: config.client_name,
-            connection,
+            connection: transport,
             server_config,
             transport_type: config.transport_type,
             timeout: config.timeout,
@@ -720,7 +737,25 @@ impl HigressMcpClientWrapper {
     /// Invokes a tool on the gateway.
     ///
     /// `arguments` may be any JSON value; object values are passed through as-is.
+    /// No request metadata is propagated — use
+    /// [`call_tool_with_meta`](Self::call_tool_with_meta) for that.
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult> {
+        self.call_tool_with_meta(tool_name, arguments, None).await
+    }
+
+    /// Invokes a tool on the gateway, propagating `meta` as MCP request metadata.
+    ///
+    /// Mirrors the Java three-argument overload
+    /// `HigressMcpClientWrapper.callTool(String, Map, Map)`, which hands `meta`
+    /// to the delegate **untouched** (including `null`/`None`, meaning "send no
+    /// `_meta` field"). Java's `testCallTool_PassesMetaStraightThrough` pins
+    /// exactly that, so no merging, filtering or defaulting happens here either.
+    pub async fn call_tool_with_meta(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        meta: Option<Map<String, Value>>,
+    ) -> Result<CallToolResult> {
         tracing::debug!(
             "Calling tool '{}' on Higress MCP client '{}' with arguments: {}",
             tool_name,
@@ -731,7 +766,7 @@ impl HigressMcpClientWrapper {
             .with_request_timeout(
                 "call_tool",
                 self.connection
-                    .call_tool_by_server(&self.name, tool_name, arguments),
+                    .call_tool_by_server(&self.name, tool_name, arguments, meta),
             )
             .await?;
         let result: CallToolResult = serde_json::from_value(raw)
@@ -751,10 +786,15 @@ impl HigressMcpClientWrapper {
     /// Calls `x_higress_tool_search` with `query` and parses the result.
     ///
     /// Mirrors the Java single-argument overload `searchTools(String query)`,
-    /// which omits `topK` and defaults to the configured `tool_search_top_k`.
+    /// whose request body is exactly `{"query": q}` — no `topK`
+    /// (`HigressMcpClientWrapper.java:317-319`).
     pub async fn search_tools(&self, query: &str) -> Result<HigressToolSearchResult> {
-        self.search_tools_with_top_k(query, self.tool_search_top_k)
-            .await
+        let mut args = Map::new();
+        args.insert("query".to_string(), Value::String(query.to_string()));
+        let result = self
+            .call_tool(TOOL_SEARCH_NAME, Value::Object(args))
+            .await?;
+        Ok(HigressToolSearchResult::parse(&result))
     }
 
     /// Calls `x_higress_tool_search` with `query` and explicit `top_k`.
@@ -821,13 +861,19 @@ pub fn convert_to_mcp_tool(tool_info: &HigressToolInfo) -> Tool {
         .as_ref()
         .and_then(build_input_schema)
         .unwrap_or_else(|| ToolInputSchema::new(Vec::new(), None, None));
+    // Java `HigressMcpClientWrapper.java:223-225` forwards `outputSchema` whenever
+    // the gateway supplied one.
+    let output_schema = tool_info
+        .output_schema
+        .as_ref()
+        .and_then(build_output_schema);
 
     Tool {
         name: tool_info.name.clone(),
         title: tool_info.title.clone(),
         description: tool_info.description.clone(),
         input_schema,
-        output_schema: None,
+        output_schema,
         annotations: None,
         meta: None,
         execution: None,
@@ -858,6 +904,42 @@ fn build_input_schema(schema: &Value) -> Option<ToolInputSchema> {
     Some(ToolInputSchema::new(required, properties, None))
 }
 
+/// Builds a [`ToolOutputSchema`] from a raw JSON schema value.
+///
+/// Java passes the gateway's `outputSchema` map through verbatim. Rust's typed
+/// [`ToolOutputSchema`] can only describe `type: "object"` results, so a
+/// non-object schema (for example a top-level array) cannot be represented and
+/// degrades to `None` instead of silently claiming an object shape.
+fn build_output_schema(schema: &Value) -> Option<rust_mcp_sdk::schema::ToolOutputSchema> {
+    let object = schema.as_object()?;
+    // `ToolOutputSchema` hard-codes `type: "object"`, so only object (or
+    // untyped) results can be represented faithfully.
+    match object.get("type").and_then(|t| t.as_str()) {
+        None | Some("object") => {}
+        Some(_) => return None,
+    }
+    let properties = object
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p| {
+            p.iter()
+                .filter_map(|(k, v)| v.as_object().map(|m| (k.clone(), m.clone())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
+    let required = object
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(rust_mcp_sdk::schema::ToolOutputSchema::new(
+        required, properties, None,
+    ))
+}
+
 /// Converts a harness-discovered [`McpToolInfo`] into an MCP [`Tool`].
 ///
 /// [`McpToolInfo`]: agentscope_harness::agent::McpToolInfo
@@ -877,21 +959,16 @@ fn mcp_tool_info_to_tool(info: &agentscope_harness::agent::McpToolInfo) -> Tool 
     }
 }
 
-/// Convenience constructor for a text content block (used by tests).
-pub(crate) fn text_content(text: impl Into<String>) -> TextContent {
-    TextContent::new(text.into(), None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Minimal recording double for [`McpConnection`].
+    /// Minimal recording double for [`HigressMcpTransport`].
     ///
     /// The harness [`McpClientManager`] is concrete and opens real sockets, so
     /// it cannot be observed from a unit test. This double records every
-    /// connect request and simulates a live server, which is exactly the seam
-    /// `initialize`/`list_tools` talk to.
+    /// connect request and tool call and simulates a live server, which is
+    /// exactly the seam `initialize`/`list_tools`/`call_tool` talk to.
     #[derive(Default)]
     struct RecordingConnection {
         requests: Mutex<Vec<McpConnectRequest>>,
@@ -899,7 +976,19 @@ mod tests {
         tools: Vec<McpToolInfo>,
         connect_error: Mutex<Option<String>>,
         connect_delay: Mutex<Option<Duration>>,
-        tool_calls: Mutex<Vec<(String, String)>>,
+        tool_calls: Mutex<Vec<RecordedCall>>,
+        /// Overrides the canned tool-call response, so tests can drive the
+        /// tool-search path with a realistic gateway payload.
+        call_response: Mutex<Option<Value>>,
+    }
+
+    /// One recorded [`HigressMcpTransport::call_tool_by_server`] invocation.
+    #[derive(Debug, Clone)]
+    struct RecordedCall {
+        server: String,
+        tool_name: String,
+        arguments: Value,
+        meta: Option<Map<String, Value>>,
     }
 
     impl RecordingConnection {
@@ -913,10 +1002,14 @@ mod tests {
         fn requests(&self) -> Vec<McpConnectRequest> {
             self.requests.lock().unwrap().clone()
         }
+
+        fn calls(&self) -> Vec<RecordedCall> {
+            self.tool_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
-    impl McpConnection for RecordingConnection {
+    impl HigressMcpTransport for RecordingConnection {
         async fn connect_server(&self, request: McpConnectRequest) -> Result<()> {
             self.requests.lock().unwrap().push(request.clone());
             if let Some(error) = self.connect_error.lock().unwrap().clone() {
@@ -954,12 +1047,18 @@ mod tests {
             &self,
             server: &str,
             tool_name: &str,
-            _arguments: Value,
+            arguments: Value,
+            meta: Option<Map<String, Value>>,
         ) -> Result<Value> {
-            self.tool_calls
-                .lock()
-                .unwrap()
-                .push((server.to_string(), tool_name.to_string()));
+            self.tool_calls.lock().unwrap().push(RecordedCall {
+                server: server.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments,
+                meta,
+            });
+            if let Some(response) = self.call_response.lock().unwrap().clone() {
+                return Ok(response);
+            }
             Ok(serde_json::json!({
                 "content": [{ "type": "text", "text": "ok" }],
                 "isError": false
@@ -1000,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_connects_and_records_full_config() {
         let recording = Arc::new(RecordingConnection::default());
-        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
 
         wrapper.initialize().await.unwrap();
 
@@ -1032,7 +1131,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_is_idempotent_and_only_connects_once() {
         let recording = Arc::new(RecordingConnection::default());
-        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
 
         wrapper.initialize().await.unwrap();
         wrapper.initialize().await.unwrap();
@@ -1044,7 +1143,7 @@ mod tests {
     async fn initialize_propagates_connection_failure() {
         let recording = Arc::new(RecordingConnection::default());
         *recording.connect_error.lock().unwrap() = Some("connection refused".to_string());
-        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
 
         let error = wrapper.initialize().await.unwrap_err();
         assert!(error.to_string().contains("connection refused"));
@@ -1061,7 +1160,7 @@ mod tests {
             .initialization_timeout(Duration::from_millis(10))
             .build_config()
             .unwrap();
-        let wrapper = HigressMcpClientWrapper::with_connection(config, recording);
+        let wrapper = HigressMcpClientWrapper::with_transport(config, recording);
 
         let error = wrapper.initialize().await.unwrap_err();
         assert!(error.to_string().contains("Timed out"));
@@ -1078,7 +1177,7 @@ mod tests {
             .sse_endpoint("https://gw.example.com/mcp")
             .build_config()
             .unwrap();
-        let wrapper = HigressMcpClientWrapper::with_connection(config, recording.clone());
+        let wrapper = HigressMcpClientWrapper::with_transport(config, recording.clone());
 
         let error = wrapper.initialize().await.unwrap_err();
         assert!(error.to_string().contains("configured for SSE"));
@@ -1091,7 +1190,7 @@ mod tests {
             test_tool("echo"),
             test_tool("add"),
         ]));
-        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording);
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording);
 
         wrapper.initialize().await.unwrap();
         let tools = wrapper.list_tools().await.unwrap();
@@ -1364,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn close_disconnects_and_resets_state() {
         let recording = Arc::new(RecordingConnection::default());
-        let wrapper = HigressMcpClientWrapper::with_connection(test_config(), recording.clone());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
         wrapper.initialize().await.unwrap();
         assert!(wrapper.is_initialized());
 
@@ -1393,5 +1492,293 @@ mod tests {
         let wrapper = HigressMcpClientWrapper::with_options("absent", manager, true, None, 10);
         let err = wrapper.search_tools("weather").await.unwrap_err();
         assert!(err.to_string().contains("absent"));
+    }
+
+    // ------------------------------------------------------------------
+    // P1-4: tool-search main path, caching and metadata passthrough
+    // ------------------------------------------------------------------
+
+    /// A gateway payload shaped like a real `x_higress_tool_search` response:
+    /// tools live in `structuredContent`, each with input *and* output schema.
+    fn tool_search_response() -> Value {
+        serde_json::json!({
+            "content": [],
+            "structuredContent": {
+                "tools": [{
+                    "name": "map___maps_weather",
+                    "title": "maps_weather",
+                    "description": "Weather by city",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": { "temp": { "type": "number" } },
+                        "required": ["temp"]
+                    }
+                }]
+            },
+            "isError": false
+        })
+    }
+
+    fn tool_search_config(query: &str, top_k: usize) -> HigressClientConfig {
+        HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .tool_search_with_top_k(query, top_k)
+            .unwrap()
+            .build_config()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_search_lists_converted_tools_and_sends_query_with_top_k() {
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.call_response.lock().unwrap() = Some(tool_search_response());
+        let wrapper = HigressMcpClientWrapper::with_transport(
+            tool_search_config("weather", 3),
+            recording.clone(),
+        );
+
+        let tools = wrapper.list_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "map___maps_weather");
+        assert_eq!(tools[0].title.as_deref(), Some("maps_weather"));
+        assert_eq!(tools[0].description.as_deref(), Some("Weather by city"));
+        assert_eq!(tools[0].input_schema.required, vec!["city".to_string()]);
+        // P1-2: `outputSchema` must survive the ToolInfo -> Tool conversion
+        // (Java `HigressMcpClientWrapper.java:223-225`).
+        let output = tools[0].output_schema.as_ref().unwrap();
+        assert_eq!(output.required, vec!["temp".to_string()]);
+        assert!(output.properties.as_ref().unwrap().contains_key("temp"));
+
+        // Request body: exactly one call to the tool-search tool, carrying the
+        // configured query and `topK` (Java `HigressMcpClientWrapper.java:164`
+        // passes both).
+        let calls = recording.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_name, TOOL_SEARCH_NAME);
+        assert_eq!(calls[0].arguments["query"], "weather");
+        assert_eq!(calls[0].arguments["topK"], 3);
+        assert!(calls[0].meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_search_results_are_cached_and_served_without_a_second_call() {
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.call_response.lock().unwrap() = Some(tool_search_response());
+        let wrapper = HigressMcpClientWrapper::with_transport(
+            tool_search_config("weather", 5),
+            recording.clone(),
+        );
+
+        let first = wrapper.list_tools().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Cache hit: the tool is available by name without another gateway
+        // round-trip.
+        let cached = wrapper.get_cached_tool("map___maps_weather").unwrap();
+        assert_eq!(cached.name, "map___maps_weather");
+        assert!(wrapper.get_cached_tool("map___maps_weather").is_some());
+        assert_eq!(recording.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_tools_without_tool_search_caches_every_tool() {
+        let recording = Arc::new(RecordingConnection::with_tools(vec![
+            test_tool("echo"),
+            test_tool("add"),
+        ]));
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        wrapper.initialize().await.unwrap();
+
+        let tools = wrapper.list_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 2);
+        for name in ["echo", "add"] {
+            assert!(
+                wrapper.get_cached_tool(name).is_some(),
+                "tool '{name}' should be cached"
+            );
+        }
+        // The plain path never touches tool search.
+        assert!(recording
+            .calls()
+            .iter()
+            .all(|call| call.tool_name != TOOL_SEARCH_NAME));
+    }
+
+    #[tokio::test]
+    async fn tool_search_failure_surfaces_as_list_tools_error() {
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.call_response.lock().unwrap() = Some(serde_json::json!({
+            "content": [],
+            "isError": true
+        }));
+        let wrapper = HigressMcpClientWrapper::with_transport(
+            tool_search_config("weather", 3),
+            recording.clone(),
+        );
+
+        let err = wrapper.list_tools().await.unwrap_err();
+
+        assert!(err.to_string().contains("Tool search failed"));
+        assert!(wrapper.get_cached_tool("map___maps_weather").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_search_falls_back_to_text_content_payload() {
+        // Gateways that do not emit `structuredContent` send the same JSON as a
+        // text block; `list_tools` must still return the tools.
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.call_response.lock().unwrap() = Some(serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({
+                    "tools": [{ "name": "text_tool", "description": "from text" }]
+                }).to_string()
+            }],
+            "isError": false
+        }));
+        let wrapper = HigressMcpClientWrapper::with_transport(
+            tool_search_config("weather", 2),
+            recording.clone(),
+        );
+
+        let tools = wrapper.list_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "text_tool");
+        assert_eq!(tools[0].description.as_deref(), Some("from text"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_with_meta_passes_meta_straight_through() {
+        let recording = Arc::new(RecordingConnection::default());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        wrapper.initialize().await.unwrap();
+
+        let mut meta = Map::new();
+        meta.insert("traceId".to_string(), Value::String("abc-123".to_string()));
+
+        wrapper
+            .call_tool_with_meta("my_tool", serde_json::json!({ "a": 1 }), Some(meta.clone()))
+            .await
+            .unwrap();
+
+        let calls = recording.calls();
+        assert_eq!(calls.len(), 1);
+        // Routed to the configured server name.
+        assert_eq!(calls[0].server, "higress");
+        assert_eq!(calls[0].tool_name, "my_tool");
+        // Untouched: same keys and values reach the transport.
+        assert_eq!(calls[0].meta, Some(meta));
+    }
+
+    #[tokio::test]
+    async fn call_tool_without_meta_passes_none() {
+        let recording = Arc::new(RecordingConnection::default());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        wrapper.initialize().await.unwrap();
+
+        // Two-argument overload (Java `callTool(name, args)` -> `callTool(name,
+        // args, null)`) and the explicit `None` overload must both send no
+        // `_meta`; Java's `testCallTool_PassesMetaStraightThrough` pins null.
+        wrapper
+            .call_tool("my_tool", serde_json::json!({ "a": 1 }))
+            .await
+            .unwrap();
+        wrapper
+            .call_tool_with_meta("my_tool", serde_json::json!({ "a": 1 }), None)
+            .await
+            .unwrap();
+
+        let calls = recording.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.meta.is_none()));
+    }
+
+    #[tokio::test]
+    async fn search_tools_single_argument_omits_top_k() {
+        let recording = Arc::new(RecordingConnection::default());
+        *recording.call_response.lock().unwrap() = Some(tool_search_response());
+        let wrapper = HigressMcpClientWrapper::with_transport(
+            tool_search_config("weather", 7),
+            recording.clone(),
+        );
+
+        let result = wrapper.search_tools("weather").await.unwrap();
+
+        assert!(result.is_success());
+        assert_eq!(result.tool_names(), vec!["map___maps_weather"]);
+        let arguments = recording.calls()[0].arguments.as_object().unwrap().clone();
+        assert_eq!(
+            arguments.get("query"),
+            Some(&Value::String("weather".into()))
+        );
+        // Java `searchTools(String query)` sends only `{"query": q}`
+        // (`HigressMcpClientWrapper.java:317-319`).
+        assert!(!arguments.contains_key("topK"));
+    }
+
+    #[test]
+    fn convert_to_mcp_tool_forwards_output_schema() {
+        let info = HigressToolInfo {
+            name: "n".into(),
+            description: None,
+            title: None,
+            input_schema: None,
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "result": { "type": "string" } },
+                "required": ["result"]
+            })),
+        };
+
+        let tool = convert_to_mcp_tool(&info);
+
+        let output = tool.output_schema.unwrap();
+        assert_eq!(output.required, vec!["result".to_string()]);
+        assert!(output.properties.unwrap().contains_key("result"));
+    }
+
+    #[test]
+    fn convert_to_mcp_tool_drops_non_object_output_schema() {
+        // Rust's typed `ToolOutputSchema` can only describe object results; an
+        // array schema must not be reported as an object shape.
+        let info = HigressToolInfo {
+            name: "n".into(),
+            description: None,
+            title: None,
+            input_schema: None,
+            output_schema: Some(serde_json::json!({ "type": "array" })),
+        };
+
+        let tool = convert_to_mcp_tool(&info);
+
+        assert!(tool.output_schema.is_none());
+    }
+
+    #[test]
+    fn convert_to_mcp_tool_handles_typeless_object_output_schema() {
+        let info = HigressToolInfo {
+            name: "n".into(),
+            description: None,
+            title: None,
+            input_schema: None,
+            output_schema: Some(serde_json::json!({
+                "properties": { "ok": { "type": "boolean" } }
+            })),
+        };
+
+        let tool = convert_to_mcp_tool(&info);
+
+        let output = tool.output_schema.unwrap();
+        assert!(output.properties.unwrap().contains_key("ok"));
+        assert!(output.required.is_empty());
     }
 }
