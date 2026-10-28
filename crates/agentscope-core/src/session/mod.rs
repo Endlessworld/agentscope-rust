@@ -35,8 +35,8 @@ pub use key::SessionKey;
 pub use log::{Head, SessionLog, SessionLogStore, Writer};
 pub use migration::{export_snapshot, export_state, fork, import_baseline, ExportedState};
 pub use models::{
-    policy_from_context, wrap as wrap_model, SessionModelPolicy, SessionModelPolicyHandle,
-    SessionModels, MODEL_POLICY_CONTEXT_KEY,
+    interrupted_model_output, policy_from_context, wrap as wrap_model, InterruptedOutput,
+    SessionModelPolicy, SessionModelPolicyHandle, SessionModels, MODEL_POLICY_CONTEXT_KEY,
 };
 pub use recorder::{
     outcome, RecorderBaseline, SessionMetrics, SessionRecorder, PARENT_CONTEXT_KEY,

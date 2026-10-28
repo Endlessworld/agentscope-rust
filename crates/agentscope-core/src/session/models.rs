@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt};
 
-use super::SessionRecorder;
+use super::{SessionEvent, SessionLog, SessionRecorder};
 use crate::agent::RuntimeContext;
 use crate::message::{
     ChatUsage, ContentBlock, Msg, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock,
@@ -66,6 +66,91 @@ pub fn policy_from_context(ctx: &RuntimeContext) -> Option<Arc<dyn SessionModelP
         .map(|handle| Arc::clone(&handle.0))
 }
 
+/// Text streamed by a model call that never finished because the process died mid-stream.
+///
+/// The checkpoint that the run resumes from was written *before* the call, so without this the
+/// answer would be regenerated from scratch — the client already showed the partial text, and
+/// a regenerated answer is a different one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterruptedOutput {
+    /// The `modelCallId` of the unfinished call.
+    pub call_id: String,
+    /// Streamed text, in order.
+    pub text: String,
+    /// Streamed thinking, in order (empty for providers that do not expose it).
+    pub thinking: String,
+}
+
+/// The partial output of the last model call that was dispatched but never ended.
+///
+/// Reads the journal, so it is only meaningful right after a crash; a call that reached
+/// `model/end` (even a failed one) is complete and yields `None`. Callers resume from the
+/// newest unfinished call rather than scoping by turn: only the latest unfinished turn can be
+/// continued, and that is where the newest call lives.
+pub async fn interrupted_model_output(
+    log: &dyn SessionLog,
+) -> crate::error::Result<Option<InterruptedOutput>> {
+    let head = log.head().await?;
+    if head.seq == 0 {
+        return Ok(None);
+    }
+    // Only the newest dispatched call can be unfinished; older ones were either ended or
+    // superseded by a retry.
+    let mut open: Option<InterruptedOutput> = None;
+    let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+        let payload: serde_json::Value = match serde_json::from_str(&event.payload_json) {
+            Ok(value) => value,
+            // A payload that cannot be decoded is not evidence of an unfinished call.
+            Err(_) => return Ok(()),
+        };
+        let call_id = payload
+            .get("modelCallId")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        match event.event_type.as_str() {
+            "model/dispatch" => {
+                open = Some(InterruptedOutput {
+                    call_id: call_id.to_string(),
+                    text: String::new(),
+                    thinking: String::new(),
+                });
+            }
+            "model/chunk" => {
+                let Some(open) = open.as_mut() else {
+                    return Ok(());
+                };
+                if call_id != open.call_id {
+                    return Ok(());
+                }
+                let Some(chunk) = payload.get("chunk") else {
+                    return Ok(());
+                };
+                let Ok(chunk) = serde_json::from_value::<ChatResponse>(chunk.clone()) else {
+                    return Ok(());
+                };
+                for block in chunk.content {
+                    match block {
+                        ContentBlock::Text(text) => open.text.push_str(&text.text),
+                        ContentBlock::Thinking(thinking) => {
+                            open.thinking.push_str(&thinking.thinking)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "model/end" => {
+                if open.as_ref().is_some_and(|open| open.call_id == call_id) {
+                    open = None;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    log.visit(0, head.seq, &mut visit).await?;
+    Ok(open.filter(|open| !open.text.is_empty() || !open.thinking.is_empty()))
+}
+
 /// Namespace for the journaled model boundary (Java `SessionModels`).
 pub struct SessionModels;
 
@@ -99,6 +184,9 @@ pub fn wrap(
         purpose: purpose.into(),
     })
 }
+
+/// How often a partially received stream is journaled even without a new delta.
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Coalesces streamed deltas before journaling.
 ///
@@ -166,9 +254,20 @@ impl MergedChunk {
     }
 
     fn should_flush(&self) -> bool {
-        self.chunks >= 64
-            || self.bytes >= 4 * 1024
-            || self.since.elapsed() >= std::time::Duration::from_secs(1)
+        self.chunks >= 64 || self.bytes >= 4 * 1024 || self.since.elapsed() >= FLUSH_INTERVAL
+    }
+
+    /// How long the current merge window may still stay open.
+    ///
+    /// The window is also closed by a timer, not only by the next delta: a provider that stalls
+    /// (or a process that dies) mid-stream must not take the text already received with it.
+    fn time_until_flush(&self) -> std::time::Duration {
+        FLUSH_INTERVAL.saturating_sub(self.since.elapsed())
+    }
+
+    /// Restarts the merge window without emitting anything.
+    fn reset_window(&mut self) {
+        self.since = std::time::Instant::now();
     }
 
     fn into_response(&mut self) -> ChatResponse {
@@ -292,7 +391,30 @@ impl Model for Recorded {
             let mut failure: Option<crate::error::Error> = None;
             let mut merged = MergedChunk::default();
             let mut inner = delegate.stream(messages, tools, options);
-            while let Some(item) = inner.next().await {
+            loop {
+                // The merge window is closed by a timer as well as by volume: if the provider
+                // goes quiet (or the process is killed) the text already streamed is already on
+                // disk, so at most one window is ever lost.
+                let item = match tokio::time::timeout(merged.time_until_flush(), inner.next()).await
+                {
+                    Ok(item) => item,
+                    Err(_) => {
+                        if merged.chunks == 0 {
+                            merged.reset_window();
+                            continue;
+                        }
+                        if let Err(error) =
+                            record_merged_chunk(&recorder, &call_id, &purpose, &mut merged).await
+                        {
+                            failure = Some(error);
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(item) = item else {
+                    break;
+                };
                 match item {
                     Ok(chunk) => {
                         // The consumer still receives every delta; the journal only keeps
@@ -527,6 +649,157 @@ mod tests {
     async fn events(log: &dyn SessionLog) -> Vec<crate::session::SessionEvent> {
         let head = log.head().await.unwrap();
         log.scan(0, head.seq).await.unwrap()
+    }
+
+    /// Streams one delta and then never produces anything again.
+    struct StallingModel;
+
+    impl Model for StallingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, crate::error::Result<ChatResponse>> {
+            Box::pin(
+                futures::stream::once(async { Ok(chunk("c1", "partial", usage(1, 1))) })
+                    .chain(futures::stream::pending()),
+            )
+        }
+
+        fn model_name(&self) -> &str {
+            "stalling"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stream_is_journaled_within_the_flush_window() {
+        // A provider that goes quiet must not keep already-streamed text in memory: the merge
+        // window closes on a timer, so a crash loses at most one window instead of everything
+        // since the last delta.
+        let log = journal().await;
+        let recorder = Arc::new(
+            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
+        let ctx = context(&recorder);
+        let wrapped = SessionModels::wrap(Arc::new(StallingModel), &ctx, "REASONING");
+        let mut stream = wrapped.stream(
+            vec![Msg::user("hi")],
+            Vec::new(),
+            GenerateOptions::default(),
+        );
+        // The first delta arrives immediately; the stream then stalls forever. Keep polling it
+        // (as the agent loop does) so the merge timer can fire.
+        let mut first_text = None;
+        let drain = async {
+            while let Some(item) = stream.next().await {
+                if let Ok(chunk) = item {
+                    for block in chunk.content {
+                        if let ContentBlock::Text(text) = block {
+                            first_text.get_or_insert(text.text);
+                        }
+                    }
+                }
+            }
+        };
+        futures::pin_mut!(drain);
+        futures::future::select(
+            drain,
+            Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1500))),
+        )
+        .await;
+        assert_eq!(first_text.as_deref(), Some("partial"));
+
+        let facts = events(&*log).await;
+        let chunks: Vec<_> = facts
+            .iter()
+            .filter(|event| event.event_type == "model/chunk")
+            .collect();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the stalled window must be committed: {:?}",
+            facts
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            chunks[0].payload_json.contains("partial"),
+            "{}",
+            chunks[0].payload_json
+        );
+        assert!(
+            !facts.iter().any(|event| event.event_type == "model/end"),
+            "the call has not ended, so it must stay continuable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_model_call_is_recoverable() {
+        let log = journal().await;
+        let recorder = Arc::new(
+            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
+        recorder
+            .record(
+                "model/dispatch",
+                &serde_json::json!({ "modelCallId": "c1" }),
+            )
+            .await
+            .unwrap();
+        for text in ["hel", "lo"] {
+            recorder
+                .record(
+                    "model/chunk",
+                    &serde_json::json!({
+                        "modelCallId": "c1",
+                        "chunk": chunk("c1", text, usage(1, 1)),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        recorder.flush().await.unwrap();
+
+        // The process died mid-stream: the text it had already streamed is still there.
+        let partial = interrupted_model_output(&*log).await.unwrap().unwrap();
+        assert_eq!(partial.call_id, "c1");
+        assert_eq!(partial.text, "hello");
+
+        // Once the call ends it is a complete answer, not a prefix to continue.
+        recorder
+            .record(
+                "model/end",
+                &serde_json::json!({ "modelCallId": "c1", "status": "completed" }),
+            )
+            .await
+            .unwrap();
+        recorder.flush().await.unwrap();
+        assert!(interrupted_model_output(&*log).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_unfinished_call_is_not_worth_continuing() {
+        let log = journal().await;
+        let recorder = Arc::new(
+            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
+        recorder
+            .record(
+                "model/dispatch",
+                &serde_json::json!({ "modelCallId": "c1" }),
+            )
+            .await
+            .unwrap();
+        recorder.flush().await.unwrap();
+        assert!(interrupted_model_output(&*log).await.unwrap().is_none());
     }
 
     #[tokio::test]
