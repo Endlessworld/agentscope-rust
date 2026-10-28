@@ -9,7 +9,13 @@
 use crate::message::{ContentBlock, Msg, MsgRole, Source};
 
 /// Metadata key controlling whether a message bypasses multi-agent history merging.
-pub const BYPASS_MULTIAGENT_HISTORY_MERGE: &str = "bypassMultiagentHistoryMerge";
+///
+/// Re-exported from [`crate::message::keys::metadata_keys`] so both formatter paths agree:
+/// the Java SDK writes `_bypass_multiagent_history_merge`, and this module previously kept a
+/// second, differing literal (`bypassMultiagentHistoryMerge`) which made the check blind to
+/// Java-written markers.
+pub const BYPASS_MULTIAGENT_HISTORY_MERGE: &str =
+    crate::message::keys::metadata_keys::BYPASS_MULTIAGENT_HISTORY_MERGE;
 
 /// Extracts plain text from a message, skipping `ThinkingBlock`s (they are never
 /// sent back to LLM APIs) and flattening `ToolResultBlock` outputs.
@@ -223,6 +229,22 @@ mod tests {
             .metadata_entry(BYPASS_MULTIAGENT_HISTORY_MERGE, serde_json::json!(true))
             .build();
         assert!(should_bypass_history(&bypass));
+    }
+
+    /// The Java SDK writes `_bypass_multiagent_history_merge`; this formatter used to look for a
+    /// different literal (`bypassMultiagentHistoryMerge`), so Java-written markers were invisible.
+    #[test]
+    fn bypass_history_honours_the_java_metadata_key() {
+        let java_style = Msg::builder()
+            .role(MsgRole::User)
+            .text_content("x")
+            .metadata_entry("_bypass_multiagent_history_merge", serde_json::json!(true))
+            .build();
+        assert!(should_bypass_history(&java_style));
+        assert_eq!(
+            BYPASS_MULTIAGENT_HISTORY_MERGE,
+            crate::message::keys::metadata_keys::BYPASS_MULTIAGENT_HISTORY_MERGE
+        );
     }
 
     #[test]
