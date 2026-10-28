@@ -1249,6 +1249,63 @@ mod tests {
         assert_eq!(adapter.delete_calls(), 0);
     }
 
+    #[tokio::test]
+    async fn list_session_ids_aggregates_every_scan_page() {
+        // A page size of 2 over 5 slots (each contributing payload+version+keys entries)
+        // forces a genuine multi-page cursor walk: stopping after the first page would
+        // silently drop most sessions.
+        let adapter = Arc::new(MemoryRedisAdapter::with_scan_page_size(2));
+        let store = RedisAgentStateStore::builder()
+            .client(adapter.clone())
+            .key_prefix(PREFIX)
+            .build()
+            .expect("builder accepts the paged adapter");
+        for session in ["s1", "s2", "s3", "s4", "s5"] {
+            store.save(Some("u1"), session, "k", json!(1)).await;
+        }
+
+        let ids = store.list_session_ids(Some("u1")).await;
+
+        assert_eq!(ids, vec!["s1", "s2", "s3", "s4", "s5"]);
+        let cursors = adapter.scan_cursor_history();
+        assert!(
+            cursors.len() > 1,
+            "expected a multi-page walk, got cursors {cursors:?}"
+        );
+        assert_eq!(cursors[0], 0, "iteration starts at cursor 0");
+        assert!(
+            cursors.iter().skip(1).all(|cursor| *cursor > 0),
+            "the walk only continues on non-zero cursors: {cursors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_all_sessions_deletes_keys_from_every_scan_page() {
+        let adapter = Arc::new(MemoryRedisAdapter::with_scan_page_size(3));
+        let store = RedisAgentStateStore::builder()
+            .client(adapter.clone())
+            .key_prefix(PREFIX)
+            .build()
+            .expect("builder accepts the paged adapter");
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
+        store.save(Some("u2"), "s2", "k", json!(2)).await;
+
+        let total = adapter.all_keys().len();
+        assert!(total > 3, "more keys than a single page, got {total}");
+
+        let removed = store.clear_all_sessions().await.unwrap();
+
+        assert_eq!(removed, total, "every page contributed keys");
+        assert!(adapter.all_keys().is_empty(), "all keys deleted");
+        assert!(
+            adapter.scan_cursor_history().len() > 1,
+            "deletion enumerated through several SCAN pages"
+        );
+    }
+
     // ---- core list-hash semantics (persisted-hash contract) --------------
 
     #[test]

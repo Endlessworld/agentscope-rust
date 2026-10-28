@@ -3,13 +3,13 @@
 //!
 //! ## Contract alignment
 //!
-//! The harness ships `SandboxExecutionGuard` as a **concrete in-process struct**
-//! (`try_enter`/`release`/`is_held`), not a trait. The extensions rollup ruling (§2.1)
-//! says storage modules must provide an `XxxSandboxExecutionGuard` while CAS/version
-//! semantics follow the harness definition. This module therefore provides a
+//! The harness ships `SandboxExecutionGuard` as a **concrete in-process struct** plus the
+//! pluggable `SandboxGuard` trait (whose `try_enter` / `release` are `async`, so a
+//! distributed backend can `await` its own polling loop). This module therefore provides a
 //! *distributed* guard with the **same method surface** (`try_enter` / `release` /
 //! `is_held`) so it can be used interchangeably by callers that need cross-process
-//! serialisation, backed by a Redis `SET NX PX` lease.
+//! serialisation, backed by a Redis `SET NX PX` lease. The trait impl awaits the
+//! acquisition directly — no `futures::executor::block_on` bridge.
 //!
 //! ## Mechanism
 //!
@@ -29,14 +29,15 @@
 //! All Redis access goes through the crate-internal [`RedisCommands`] seam, so the whole
 //! acquire / compete / release lifecycle is covered by offline tests.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use redis::Value;
 
 use agentscope_core::error::Result;
-use agentscope_harness::agent::sandbox::SandboxIsolationKey;
+use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey, SandboxLease};
 
 use crate::raw_client::RedisCommands;
 use crate::state::connection::RedisConnection;
@@ -74,6 +75,13 @@ pub struct RedisSandboxExecutionGuard {
     key_prefix: String,
     lease_ttl_ms: u64,
     retry_interval_ms: u64,
+    /// Concrete leases acquired through the harness `SandboxGuard` trait, keyed by
+    /// isolation key.
+    ///
+    /// The harness `SandboxLease` carries no release hook, so the [`RedisSandboxLease`]
+    /// (which deletes the Redis key on drop) must be retained until
+    /// `SandboxGuard::release` is called.
+    trait_leases: Arc<Mutex<HashMap<SandboxIsolationKey, Vec<RedisSandboxLease>>>>,
 }
 
 impl std::fmt::Debug for RedisSandboxExecutionGuard {
@@ -184,6 +192,76 @@ impl RedisSandboxExecutionGuard {
     pub async fn is_held(&self, key: &SandboxIsolationKey) -> bool {
         let redis_key = self.compose_key(key);
         self.commands.exists(&redis_key).await.unwrap_or(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxGuard for RedisSandboxExecutionGuard {
+    /// Acquires the Redis lease by awaiting the `SET NX PX` retry loop.
+    ///
+    /// The loop sleeps with `tokio::time::sleep` between attempts, so it must be driven by
+    /// an async runtime (it used to be wrapped in `futures::executor::block_on`, which spun
+    /// or deadlocked when the acquisition ran inside a Tokio task).
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        match RedisSandboxExecutionGuard::try_enter(self, &key).await {
+            Ok(lease) => {
+                if let Ok(mut leases) = self.trait_leases.lock() {
+                    leases.entry(key.clone()).or_default().push(lease);
+                }
+                SandboxLease::new(key)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "[sandbox-guard] failed to acquire Redis lease");
+                SandboxLease::noop()
+            }
+        }
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        let dropped =
+            self.trait_leases
+                .lock()
+                .ok()
+                .and_then(|mut leases| match leases.get_mut(key) {
+                    Some(stack) => {
+                        let lease = stack.pop();
+                        if stack.is_empty() {
+                            leases.remove(key);
+                        }
+                        lease
+                    }
+                    None => None,
+                });
+        match dropped {
+            // The token CAS delete runs on this task, never through a blocking bridge.
+            Some(lease) => {
+                lease.release().await;
+            }
+            None => {
+                RedisSandboxExecutionGuard::release(self, key).await;
+            }
+        }
+    }
+
+    /// Synchronous `EXISTS` probe.
+    ///
+    /// The harness contract keeps `is_held` synchronous; this probe performs a **single**
+    /// round-trip (no polling, no timers) and is diagnostics-only — the acquire/release path
+    /// is fully async.
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        futures::executor::block_on(RedisSandboxExecutionGuard::is_held(self, key))
+    }
+
+    fn active_count(&self) -> usize {
+        self.trait_leases
+            .lock()
+            .map(|leases| leases.values().map(|stack| stack.len()).sum())
+            .unwrap_or(0)
+    }
+
+    /// Redis `SET NX PX` serialises across processes.
+    fn is_distributed(&self) -> bool {
+        true
     }
 }
 
@@ -321,6 +399,7 @@ impl RedisSandboxExecutionGuardBuilder {
             key_prefix: self.key_prefix,
             lease_ttl_ms: self.lease_ttl_ms,
             retry_interval_ms: self.retry_interval_ms,
+            trait_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -556,5 +635,63 @@ mod tests {
         );
         assert!(commands.stored_bytes("lock:agent:bare").is_none());
         let _ = guard;
+    }
+
+    /// The harness `SandboxGuard` impl delegates to the async guard: acquire, report held,
+    /// keep the lease alive until `release`, then clear the Redis key.
+    #[tokio::test]
+    async fn harness_sandbox_guard_trait_wraps_the_redis_lease() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
+            .key_prefix("lock:")
+            .build();
+        let key = SandboxIsolationKey::new("session", "trait");
+
+        let lease = SandboxGuard::try_enter(&guard, key.clone()).await;
+        assert!(!lease.is_noop(), "lease acquired through the trait");
+        assert!(SandboxGuard::is_held(&guard, &key));
+        assert_eq!(SandboxGuard::active_count(&guard), 1);
+        assert!(commands.stored_bytes("lock:session:trait").is_some());
+
+        SandboxGuard::release(&guard, &key).await;
+        assert!(!SandboxGuard::is_held(&guard, &key));
+        assert_eq!(SandboxGuard::active_count(&guard), 0);
+        assert!(commands.stored_bytes("lock:session:trait").is_none());
+
+        // The trait object reports the Redis guard as cross-process.
+        assert!(SandboxGuard::is_distributed(&guard));
+        let object: Arc<dyn SandboxGuard> = Arc::new(guard);
+        assert!(object.is_distributed());
+    }
+
+    /// The trait methods are genuinely async: awaiting them inside a `tokio::time::timeout`
+    /// must complete instead of being bridged through `futures::executor::block_on` (which
+    /// used to stall a runtime worker while the retry loop slept).
+    #[tokio::test]
+    async fn trait_acquisition_and_release_are_awaitable() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
+            .key_prefix("lock:")
+            .retry_interval(Duration::from_millis(10))
+            .build();
+        let key = SandboxIsolationKey::new("session", "awaitable");
+
+        let lease = tokio::time::timeout(
+            Duration::from_millis(500),
+            SandboxGuard::try_enter(&guard, key.clone()),
+        )
+        .await
+        .expect("trait acquisition must not deadlock the runtime");
+        assert!(!lease.is_noop());
+        assert_eq!(commands.set_nx_calls(), 1, "uncontended: one SET NX");
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            SandboxGuard::release(&guard, &key),
+        )
+        .await
+        .expect("trait release must not deadlock the runtime");
+        assert!(!guard.is_held(&key).await);
+        assert!(commands.stored_bytes("lock:session:awaitable").is_none());
     }
 }

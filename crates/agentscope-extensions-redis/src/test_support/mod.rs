@@ -14,13 +14,14 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use agentscope_core::error::{Error, Result};
 use redis::Value;
 
 use crate::raw_client::RedisCommands;
 use crate::state::adapter::RedisClientAdapter;
+use crate::state::connection::{ScanNodeSource, ScanPager};
 use crate::store::StoreCommands;
 
 /// Redis glob matching (`*`, `?`), the same syntax `KEYS` / `SCAN MATCH` accepts.
@@ -144,11 +145,38 @@ pub(crate) struct MemoryRedisAdapter {
     sets: Mutex<HashMap<String, HashSet<String>>>,
     /// Lists (`:list`).
     lists: Mutex<HashMap<String, Vec<String>>>,
+    /// Page size used by `find_keys_by_pattern`.
+    ///
+    /// `None` means the real `COUNT` limit decides the page size (a faithful SCAN); tests
+    /// set a small value to force a genuine **multi-page cursor walk** over the key space.
+    scan_page_size: Mutex<Option<usize>>,
+    /// Cursors handed to the pager, in call order — proves the cursor chain.
+    scan_cursors: Arc<Mutex<Vec<u64>>>,
 }
 
 impl MemoryRedisAdapter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds an adapter whose SCAN pages are capped at `page_size` keys, so key
+    /// enumeration runs through several cursor round-trips.
+    pub fn with_scan_page_size(page_size: usize) -> Self {
+        assert!(page_size > 0, "page size must be positive");
+        let adapter = Self::default();
+        *adapter
+            .scan_page_size
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(page_size);
+        adapter
+    }
+
+    /// Cursors requested by SCAN, in call order (`[0, 2, 4, ..]` for a paged walk).
+    pub fn scan_cursor_history(&self) -> Vec<u64> {
+        self.scan_cursors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn data_guard(&self) -> MutexGuard<'_, MemoryRedisData> {
@@ -239,6 +267,67 @@ impl MemoryRedisAdapter {
         self.data_guard().strings.remove(key);
         self.lists_guard().remove(key);
         self.sets_guard().remove(key);
+    }
+}
+
+/// SCAN pager over a snapshot of the adapter key space.
+///
+/// Models a real per-node SCAN: the cursor is a position in the (sorted) key snapshot, a
+/// non-zero cursor is returned while more keys remain, and only the matching subset of each
+/// page is returned (so a page can be empty while the iteration still continues).
+#[derive(Debug)]
+pub(crate) struct MemoryScanPager {
+    keys: Vec<String>,
+    /// Maximum keys per page; the caller's `COUNT` can only lower it.
+    page_size: usize,
+    cursors: Arc<Mutex<Vec<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl ScanPager for MemoryScanPager {
+    async fn scan_page(
+        &self,
+        cursor: u64,
+        pattern: &str,
+        count: usize,
+    ) -> Result<(u64, Vec<String>)> {
+        self.cursors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(cursor);
+        let start = usize::try_from(cursor).unwrap_or(usize::MAX);
+        if start >= self.keys.len() {
+            return Ok((0, Vec::new()));
+        }
+        let size = self.page_size.min(count).max(1);
+        let end = start.saturating_add(size).min(self.keys.len());
+        let page: Vec<String> = self.keys[start..end]
+            .iter()
+            .filter(|key| glob_match(pattern, key))
+            .cloned()
+            .collect();
+        let next = if end >= self.keys.len() {
+            0
+        } else {
+            end as u64
+        };
+        Ok((next, page))
+    }
+}
+
+/// Single-node topology over the in-memory key space (the double models no cluster).
+#[async_trait::async_trait]
+impl ScanNodeSource for MemoryRedisAdapter {
+    async fn scan_nodes(&self) -> Result<Vec<Arc<dyn ScanPager>>> {
+        let page_size = *self
+            .scan_page_size
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Ok(vec![Arc::new(MemoryScanPager {
+            keys: self.all_keys(),
+            page_size: page_size.unwrap_or(usize::MAX),
+            cursors: self.scan_cursors.clone(),
+        })])
     }
 }
 
@@ -340,16 +429,13 @@ impl RedisClientAdapter for MemoryRedisAdapter {
         Ok(self.lists_guard().contains_key(key) || self.sets_guard().contains_key(key))
     }
 
-    /// `SCAN`-equivalent: match every existing key against the glob, deduplicated.
+    /// SCAN-equivalent: matches every existing key against the glob, deduplicated.
+    ///
+    /// Delegates to the **production** cursor loop / fan-out
+    /// (`crate::state::connection::collect_keys_across_nodes`) so the double exercises the
+    /// real paging code; `with_scan_page_size` makes the walk span several pages.
     async fn find_keys_by_pattern(&self, pattern: &str) -> Result<Vec<String>> {
-        let mut out: Vec<String> = self
-            .all_keys()
-            .into_iter()
-            .filter(|k| glob_match(pattern, k))
-            .collect();
-        out.sort();
-        out.dedup();
-        Ok(out)
+        crate::state::connection::collect_keys_across_nodes(self, pattern).await
     }
 
     async fn eval_script(

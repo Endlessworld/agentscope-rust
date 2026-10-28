@@ -3,16 +3,13 @@
 //!
 //! ## Composition (vs. the harness `DistributedStore`)
 //!
-//! The harness [`DistributedStore`] is presently a **concrete struct** exposing only
-//! `agent_state_store` + `isolation_scope` (see rollup tracker §2.2 — field set is
-//! insufficient vs. Java, which also carries `base_store` / `sandbox_snapshot_spec` /
-//! `sandbox_execution_guard` / `message_bus` / `async_tool_registry` / `task_repository`).
-//!
-//! Because subagents must not expand the harness, this crate provides its own
-//! [`RedisDistributedStore`] combiner carrying every Redis-backed component, plus
-//! [`RedisDistributedStore::to_distributed_store`] to hand the harness exactly the
-//! slice it currently understands. When the harness `DistributedStore` grows the extra
-//! fields, this mapping is the single place to extend.
+//! The harness `DistributedStore` carries `agent_state_store` + `isolation_scope` plus the
+//! composite slots `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`
+//! (rollup tracker §2.2, resolved 2026-10-28). This crate keeps its own
+//! [`RedisDistributedStore`] combiner (which carries every Redis-backed component plus the
+//! connection/prefix configuration) and
+//! [`RedisDistributedStore::to_distributed_store`] projects all of them into the harness
+//! bundle.
 //!
 //! ## Wiring
 //!
@@ -291,13 +288,23 @@ impl RedisDistributedStore {
 
     /// Projects onto the harness [`DistributedStore`].
     ///
+    /// The agent state store, snapshot spec and execution guard are always projected; the
+    /// synchronous `BaseStore` slot is filled only when this bundle retained a Redis URL
+    /// (see [`Self::base_store`]) — otherwise it stays `None` and callers use
+    /// [`Self::base_store_with_url`] to wire it explicitly.
+    ///
     /// # Errors
     /// Returns an error if the agent state store cannot be built.
     pub fn to_distributed_store(&self) -> Result<DistributedStore> {
-        Ok(DistributedStore::builder()
+        let mut builder = DistributedStore::builder()
             .agent_state_store(self.agent_state_store()?)
             .isolation_scope(self.isolation_scope)
-            .build())
+            .sandbox_snapshot_spec(Arc::new(self.sandbox_snapshot_spec()))
+            .sandbox_execution_guard(Arc::new(self.sandbox_execution_guard()));
+        if let Ok(base) = self.base_store() {
+            builder = builder.base_store(base);
+        }
+        Ok(builder.build())
     }
 }
 
@@ -435,6 +442,30 @@ mod tests {
         let projected = store.to_distributed_store().expect("projection succeeds");
         assert!(projected.agent_state_store.is_some());
         assert_eq!(projected.isolation_scope, IsolationScope::Session);
+    }
+
+    /// Tracker §2.2 resolved 2026-10-28: the snapshot spec and the distributed guard are
+    /// always projected; the KV slot needs a retained URL (documented degradation path).
+    #[tokio::test]
+    async fn to_distributed_store_projects_snapshot_spec_and_guard() {
+        let (store, _adapter) = offline_bundle();
+        let projected = store.to_distributed_store().expect("projection succeeds");
+        assert!(projected.base_store.is_none(), "no URL retained");
+        assert!(projected.sandbox_snapshot_spec.is_some());
+        assert!(projected.sandbox_execution_guard.is_some());
+    }
+
+    /// With a retained URL the lazy blocking `BaseStore` is projected too (no I/O happens
+    /// at wiring time, so this stays offline). `RedisStore::connect_lazy` needs a Tokio
+    /// runtime to build its lazy connection manager, hence the async test.
+    #[tokio::test]
+    async fn to_distributed_store_projects_base_store_when_url_is_retained() {
+        let (store, _adapter) = offline_bundle();
+        let projected = store
+            .with_url("redis://127.0.0.1:6379")
+            .to_distributed_store()
+            .expect("projection succeeds");
+        assert!(projected.base_store.is_some());
     }
 
     #[tokio::test]
