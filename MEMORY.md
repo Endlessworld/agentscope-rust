@@ -285,3 +285,8 @@
 - harness：dispatcher 改 `Notify` 唤醒 + idle 指数退避至 `IDLE_POLL_MAX=500ms`（`next_idle_backoff` 纯函数可测），有 active_run 保持 50ms。
 - 教训补充：仓库内 `docs/*.md` 与部分源码为 **LF** 行尾，PowerShell 脚本拼接多行模式必须用 `` "`n" `` 而非 `[Environment]::NewLine`（CRLF），否则 `Contains` 恒 false。`cargo fmt --all` 会改动仓库既有未格式化文件（`core/src/shutdown/mod.rs`、`extensions-sandbox/src/e2b.rs`、`harness/tests/harness_shutdown_test.rs`），只应 `rustfmt --check` 改动文件，勿全仓 fmt。
 - 反向验证脚本：`.agentscope/workspace/reverse_p2.ps1`（回退实现→跑指定测试→恢复），14 项全部如预期 FAILED。
+
+- 提交记录（2026-10-28 ACP 稳定性 P1+P2）：`04b5a30` core session（P1-14/P1-15 + P2 core）、`c2ea444` harness dispatcher、`6775164` acp 幂等键+P2、`f37d58d` 文档、`854de42` acp 有界事件队列（P1-12/P2-20）+ P2-15 回归测试。
+- **反向验证必须 bump mtime**：用 `Copy-Item` 恢复被改坏的源文件时 PowerShell 会保留备份的旧 LastWriteTime，cargo 认为文件未变而**复用回退版构建**，导致「恢复后仍 FAILED」或「恢复后假 ok」。恢复后必须 `(Get-Item $p).LastWriteTime = Get-Date` 再跑测试。
+- ACP 事件队列：`crates/agentscope-extensions-acp/src/event_queue.rs`（crate 私有模块），`EventQueue::new(4096)` + `EventQueueSender`（Drop 即 close，消费者 `recv()` 返回 None）。策略：满则丢**最新**事件并计数，`AgentResult` 永不丢；`dropped_deltas() > 0` 时 turn 结束前向客户端发「output was dropped」提示。core `react_agent.rs:845` 的 `delta_tx` 仍是 per-call 无界（未改）。
+- blob/commit 不写 `.version` 的判定在 `harness/src/agent/session/storage.rs:117`（`/commits/` 或 `/blobs/`）；`/writer-seals/` **仍会**写 `.version`（有意，勿顺手改）。
