@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 3234 行（14 个顶层类型）/ 测试 3178 行（13 个测试类 + 1 个 Stub 辅助类，共 180 个 `@Test`）；分模块 主/测：common 1868/1094、quartz 975/1445、xxl-job 391/639 |
 | Rust crate | `crates/agentscope-extensions-scheduler` |
 | 迁移波次 | C |
-| 当前状态 | 进行中（静态复核：编译层面完工，**运行时执行链路存在 P0 断裂**，见 §6） |
+| 当前状态 | 进行中（2026-10-28：7 项执行任务已全部落地，cron/中断/状态机/xxl-job 协议/cancel 语义对齐；`cargo test` 91 passed / 0 failed，见 §8） |
 
 ## 2. Java 清单与依赖映射
 
@@ -81,7 +81,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 **scheduler-xxl-job（1 个类型）**
 | Java 类 | Rust 是否存在 | 行为覆盖 |
 |---|---|---|
-| `XxlJobAgentScheduler`（363 行 / 15762B） | ✅ struct | 见 §2.0 表格与 §6；**注册/回调协议未 1:1**：无 `XxlJobHelper.log`/`handleSuccess`/`handleFail`、无 `XxlJobContext` 参数读取、无 executor `destroy()` |
+| `XxlJobAgentScheduler`（363 行 / 15762B） | ✅ struct | 见 §2.0 表格与 §8；**协议层已于 2026-10-28 补齐**：`XxlJobContext`（job id / job param / 分片 / 日志 id）+ `XxlJobHelper`（`log`/`handleSuccess`/`handleFail`）+ `try_cancel` 报错。仍无 executor `destroy()`（Rust 无 executor，设计决定）；`PostReasoningEvent` 日志 Hook 降级为「记录最终回复」（core 无 post-reasoning 挂点，§4.2-5） |
 
 ## 3. 详细缺口清单
 ### 3.1 骨架与依赖（P0）
@@ -98,17 +98,17 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | QuartzAgentScheduler schedule/cancel/getAll/shutdown/getSchedulerType | QuartzAgentScheduler(26955B) | 已完成 | tokio 定时循环 + 手写 cron 解析。**缺口：无集群回读**（Java `loadTaskFromQuartz` 从 Quartz store 重建任务；Rust 仅进程内 `HashMap`，属设计决定但 §2 表格「集群回读」表述需删） |
-| CRON / FIXED_RATE / FIXED_DELAY 三模式 | 同名 | 进行中 | 三模式均已实现。**cron 4 项 P1 语义已对齐（2026-10-26，见 §6.1）**：星期基准 1-7、dom/dow 冲突报错、非法表达式快速失败且无副作用、`zoneId` 生效。**仍缺**：`L`/`W`/`LW`/`#`、年字段、按秒轮询改精确休眠（`next_after` 仍未接线）。**FIXED_RATE 用 `tokio::interval` 但消费首个 tick 后语义正确**；FIXED_DELAY 为「完成后 sleep」——与 Java 一致 |
-| pause / resume / interrupt / getStatus | 同名 | 进行中 | pause/resume/status 可用；**`interrupt()` 只 `notify_waiters()`，不中止 in-flight 执行**（Java 走 `Scheduler.interrupt()` + `InterruptableJob.interrupted` 标志）。`get_status` 返回自定义 3 值 `TaskStatus`，Java 返回 Quartz `TriggerState`（6 值，含 BLOCKED/COMPLETE/ERROR） |
-| SchedulerRegistry | QuartzAgentSchedulerRegistry | 已完成 | `OnceLock<RwLock<HashMap>>`；但登记值为 `scheduler_id` 字符串（`self_handle_hint`），**不持有 scheduler 句柄**，`JobContext::run_task` 仅做一次 `contains` 探测（结果被 `let _` 丢弃）→ 注册表实为「只为测试可见性存在」 |
-| QuartzScheduleAgentTask | 同名 | 进行中 | 包装 JoinHandle + `AtomicBool` 控制位；**`with_factory` 未被 `QuartzAgentScheduler::schedule*` 调用**（见 §6 P0） |
-| AgentJob | AgentQuartzJob | 进行中 | 循环体存在；**`inputMsg` 未接线**：`schedule_with_input` 把 `input` 存入 `runtimes`，但 `runtimes` 全 crate 只写不读，`fire()` 调 `task.execute()`（`run_with(Vec::new())`）→ 初始消息被丢弃 |
+| CRON / FIXED_RATE / FIXED_DELAY 三模式 | 同名 | 已完成 | 三模式均已实现。cron 4 项 P1 语义于 2026-10-26 对齐（§6.1）；**Quartz 扩展关键字与年字段于 2026-10-28 落地（§8）**：`L`/`L-n`/`LW`/`nW`（dom）、`L`/`nL`/`n#k`（dow）、7 字段年（1970-2199）、`a/1` 展开、`?` 仅限日字段。`next_after` **已接入生产循环**（`CronPlan::next_fire_time` → 精确休眠，替换 1s 轮询），并补查询 API `QuartzAgentScheduler::next_fire_time` / `QuartzScheduleAgentTask::next_fire_time`（对齐 `Trigger#getNextFireTime`）。余额：无（DST 时区仍不支持，见 §4.2） |
+| pause / resume / interrupt / getStatus | 同名 | 已完成 | **2026-10-28 补齐**：`interrupt()` 经 `tokio::sync::watch` 中止 in-flight 执行（`execute_with` 内 `select!` 竞争，回落 `Error::Interrupted`），FIXED_DELAY 被中断时跳过重排（对齐 `AgentQuartzJob:49/107`）；返回「是否真有 in-flight」对齐 `Scheduler#interrupt`。`TaskStatus` 扩为 Quartz 6 值 + Rust 专用 `Cancelled`（`None/Normal/Paused/Complete/Error/Blocked/Cancelled`，新增 `as_str`/`is_terminal`），并新增 Java 同形的 `trigger_state(name) -> TaskStatus`（未知任务 = `None`）。`get_status` 保留 `Option<TaskStatus>` |
+| SchedulerRegistry | QuartzAgentSchedulerRegistry | 部分实现 | `OnceLock<RwLock<HashMap>>`；登记值为 `scheduler_id` 字符串（`self_handle_hint`），**不持有 scheduler 句柄**，无法反向查找（Java 存 `QuartzAgentScheduler` 实例）。2026-10-28 删除了原 `JobContext::run_task`（其 `contains` 探测结果为 `let _` 丢弃，纯装饰）→ 注册表现阶段只用于 `contains/get/len` 与测试可见性 |
+| QuartzScheduleAgentTask | 同名 | 已完成 | P0（`with_factory` 未接线）已于 2026-10-22 修复（§7）；**2026-10-28 补 `schedule_config()` / `agent_config()`**（Java `getScheduleConfig`/`getAgentConfig`，§7.4 遗留），并持有 `CronPlan` 供 `next_fire_time` 查询。`cancel` 现在 `shutdown()` + `join().await`（`join` 不再是死代码），`cancel` 返回后 job 循环与 in-flight 执行均已终止 |
+| AgentJob | AgentQuartzJob | 已完成 | 循环体 + `inputMsg` 已接（P0-2，§7）；2026-10-28 起 CRON 分支改为「睡到 `next_fire_time`」而非按秒轮询，无未来触发时置 `Complete`；interrupt 语义按 Java 短路 |
 
 ### 3.3 xxl-job 后端（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| XxlJobAgentScheduler（JobHandler 注册 + 本地 trigger） | XxlJobAgentScheduler(15762B) | 进行中 | 仅 NONE 模式；cancel 返回 `false` + warn（Java 抛 `UnsupportedOperationException`——**语义不等价**，调用方无法区分「不支持」与「未找到」）。**缺 Java 的三处协议行为**：① 注册前给 RuntimeAgentConfig 注入 XXL-Job 日志 Hook（`PostReasoningEvent` → `XxlJobHelper.log`）；② `trigger` 读取 `XxlJobContext.getJobParam()` 作输入；③ 执行后 `XxlJobHelper.handleSuccess/handleFail` 回调。Rust 仅 `Msg::user(param)` + 返回 Msg，无回调协议 |
-| JobHandler 注册表 | XxlJobExecutor.registryJobHandler | 进行中 | 进程内 `RwLock<HashMap<String, JobHandler>>`；**无 executor 生命周期**（Java `shutdown()` 会 `executor.destroy()`，Rust 只清 map）；注册失败无异常路径（Java 有 `registryJobHandler` 抛异常 → `RuntimeException` 的测试） |
+| XxlJobAgentScheduler（JobHandler 注册 + 本地 trigger） | XxlJobAgentScheduler(15762B) | 已完成 | 仅 NONE 模式；**2026-10-28 补齐协议层（§8）**：本 crate 新增 `xxljob::context` — `XxlJobContext`（job_id / job_param / shard_index+total / log_id / 日志与 handle 结果）+ `XxlJobHelper`（`log` / `handle_success` / `handle_fail` / `get_job_param` / `get_job_id` / `get_shard_index` / `get_shard_total` / `get_log_id`），用 `tokio::task_local!` 替代 Java 的 ThreadLocal；`trigger_with_context(name, Arc<XxlJobContext>)` 在上下文作用域内执行：`getJobParam()` → `Msg::user`，成功后 `log(reply)` + `handleSuccess`，失败 `handleFail`。**已知差异（§4.2）**：Java 的 `PostReasoningEvent` 日志 Hook 无对应（Rust core 未向 middleware 暴露「推理产出」事件），改为记录最终回复；`cancel` 见下行 |
+| JobHandler 注册表 | XxlJobExecutor.registryJobHandler | 已完成 | 进程内 `RwLock<HashMap<String, JobHandler>>`；**无 executor 生命周期**（设计决定：Rust 无 executor，`shutdown()` 清 map）；注册失败无异常路径（纯内存 insert 不会失败，属设计差异）。**cancel 语义（2026-10-28）**：新增 `XxlJobAgentScheduler::try_cancel()` 返回 Java 原文错误 `"Cancel operation is not supported by XxlJobAgentScheduler. Please use XXL-Job admin console to pause or delete the job."`，并新增 trait 默认方法 `AgentScheduler::try_cancel`（xxl-job override 为 Err）；布尔版 `cancel()` 仍返回 `false` + warn（受 trait 签名限制，无法区分「不支持/未找到」，已在 §4.2 登记） |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
@@ -127,11 +127,19 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 
 - **cron 语义对齐（2026-10-26，代码已落盘、子智能体未跑 cargo）**：4 项 P1 语义分叉修复（星期基准 1-7、dom/dow 冲突报错、非法 cron 快速失败且无副作用、`zone_id` 生效）。新增文件 `src/common/config/zone.rs`；新增 `job::CronPlan` / `quartz::resolve_cron`；`cron::CronExpression::matches`/`next_after` 泛型到任意 `TimeZone`。测试名单与「改前如何失败」见 §6.1。注意：**行为变更** —— `0 0 9 * * MON-FRI` 这类两侧都指定的 6 字段表达式现在会报错（必须写 `0 0 9 ? * MON-FRI`），调用方与示例需同步。
 
+- **2026-10-28 执行（7 项任务全部落地，§8 详表）**：cron `L`/`L-n`/`LW`/`nW`/`nL`/`n#k` + 7 字段年 + `a/1` + `?` 严格化；`next_after` 接入生产循环 + 查询 API；`interrupt()` 中止 in-flight；`TaskStatus` 6 值 + `is_terminal`/`as_str` + `trigger_state`；xxl-job `XxlJobContext`/`XxlJobHelper`/`handleSuccess`/`handleFail`/分片参数/日志 id；`cancel` 语义（quartz join 等待 + xxl-job `try_cancel` 原文报错）；`execution_count()`/`schedule_config()`/`agent_config()` 公开。
+  - 实测：`cargo test -p agentscope-extensions-scheduler` → lib **88 passed / 0 failed**、`tests/quartz_execution.rs` **3 passed / 0 failed**、doc-tests 0 → 合计 **91 passed / 0 failed**（基线 52+3=55 全绿保留，新增 36）。
+  - `cargo clippy -p agentscope-extensions-scheduler --all-targets`：本 crate 仅剩 2 条既有 warning（`module_inception`、`very_complex_type`）；本轮删除了 `next_seq` / `AsAny` / `interrupt_notify` / `JobContext::run_task` 四个死脚手架。
+  - 未新增任何依赖（未引入 `chrono-tz`，未用 `tokio-util`；interrupt 用 `tokio::sync::watch` + `select!`）。
+
 ### 4.2 下一步与阻塞
-1. ~~无阻塞~~ → **有阻塞（P0，2026-10-22 静态复核发现）**：`QuartzAgentScheduler::schedule*` 构造 `QuartzScheduleAgentTask` 后**未调用 `with_factory(self.factory)`**，任务内部残留 `NoopFactory`，任何定时/手动执行都会返回 `Err("No agent factory attached to this scheduled task")`。crate 的 6 个 quartz 测试全部只测「登记/查询/暂停/取消」，从未断言执行成功，故 37 passed 无法暴露此缺陷。另 `QuartzAgentScheduler.factory` 字段在全 crate **只写不读**（dead field，编译器未报警因被 `new` 赋值）。
-2. 建议后续：cron `next_after` 当前按秒扫描（上限 4 年 × 每分钟），若后续追求性能可优化为字段跳跃；非阻塞。另 `next_after` 在生产代码中**零调用**（仅测试用），实际触发走 `matches(Utc::now())` 秒级轮询。
-3. 未使用依赖：`futures`、`agentscope-harness`（引用数均为 0）建议裁剪；`next_seq: AtomicU64`、`interrupt_notify()`、`AsAny` trait、`TaskControl` trait 亦为未被使用的脚手架。
-4. cron 剩余增强（本轮明确不做）：`L`/`W`/`LW`/`#`、7 字段年、按秒轮询改精确休眠（`next_after` 仍未接线）、`interrupt()` 中止 in-flight、`get_status` 六值、xxl-job 回调协议、DST 时区（需 `chrono-tz`）。详见 §6 / §6.1。
+1. ~~P0（`with_factory` 未接线）~~ → **已修复（2026-10-22，§7）**；`factory` 不再 dead field。
+2. ~~`next_after` 生产零调用~~ → **已接入（2026-10-28）**：`job::CronPlan::next_fire_time` 驱动 CRON 循环精确休眠，并按字段跳跃优化（月/日/时/分逐级跳，不再逐秒扫）；查询 API `QuartzAgentScheduler::next_fire_time(name)`。
+3. 未使用依赖：`agentscope-harness`（引用数 0）建议裁剪；`futures` 仍为 0 引用。`TaskControl` trait 仍为未被使用的脚手架（保留，属公共抽象）。
+4. cron 剩余（本轮明确不做，非缺口）：**DST 时区**（`Europe/London` 等需 `chrono-tz`，当前 `resolve_zone` 明确报错而非静默降级）；Quartz 的 `Calendar` 排除日 / `misfire` 策略；`nW`/`n#k` 与列表混写（Quartz 本身亦不支持）。
+5. **跨模块需求（记入此处，未改 core/harness）**：xxl-job 的 `PostReasoningEvent → XxlJobHelper.log` 逐条日志 Hook 在 Rust 侧无等价挂点（`Middleware::on_reasoning` 只能看到**入参**，`on_acting` 为死代码，core 未向 middleware 暴露推理**产出**事件）→ 当前以「执行结束记录最终回复 + handleSuccess/handleFail」替代；若后续 core 暴露 post-reasoning 事件，可在本 crate 内补 `XxlJobLogMiddleware` 并注入 `RuntimeAgentConfig.middleware`（`spec.rs` 的 `Vec` 不可变，需先增加 `with_middleware` 之类的复制构造）。
+6. `AgentScheduler::cancel` 返回 `bool`（Java 抛异常）→ 已通过新增默认方法 `try_cancel() -> Result<bool, SchedulerError>` 补足；调用方需迁移到 `try_cancel` 才能区分「不支持」与「未找到」。
+7. `QuartzAgentScheduler::shutdown` 现在 `shutdown + join().await`（对齐 `scheduler.shutdown(true)` 的等待语义），但 `join` 用 `abort()` 实现 → in-flight 执行被丢弃而非跑完；Java `shutdown(true)` 会等作业完成。语义差异已登记，若需精确对齐应改为「先等 in-flight，再 abort 循环」。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-scheduler` 基线。
@@ -148,21 +156,21 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 |---|---|---|---|
 | 6 字段 `sec min hour dom mon dow` | ✅ | ✅ | — |
 | 5 字段（缺秒） | ❌ Quartz 拒绝 | ✅ 自动补秒=0 | Rust 更宽松（非严格对齐，但无害） |
-| 7 字段（带年） | ✅ 支持 `1970-2199`（2.3.2 运行时为 `1970..当前年+100`，`MAX_YEAR`） | ❌ `expected 5 or 6 fields, got 7` 直接报错 | **P1**：带年表达式整体不可用 |
-| `L`（last day of month / last weekday） | ✅ | ❌ `unrecognised token 'L'` | **P1**：`0 0 0 L * ?` 无法调度 |
-| `W`（nearest weekday，如 `15W`） | ✅ | ❌ 解析失败 | **P1** |
-| `LW` | ✅ | ❌ | **P1** |
-| `#`（第 n 个星期几，如 `6#3`） | ✅ | ❌ 解析失败 | **P1** |
-| `?` 仅在 dom/dow 合法 | ✅ 严格（其他字段用 `?` → `ParseException("'?' can only be specified for Day-of-Month or Day-of-Week.")`） | ⚠️ 任意字段当 `*` 接受 | 宽松，低风险 |
+| 7 字段（带年） | ✅ 支持 `1970-2199`（2.3.2 运行时为 `1970..当前年+100`，`MAX_YEAR`） | ✅ **已支持（2026-10-28，§8）**：`sec min hour dom mon dow year`，年范围 `1970-2199`，支持 `a,b` / `a-b` / `*/n`；`CronExpression::years()` 暴露 | **P1 → 已修复**：`0 0 0 1 1 ? 2030` 可调度；年耗尽后 `next_after` 返回 `None` → 任务状态置 `Complete`（Quartz `TriggerState.COMPLETE`） |
+| `L`（last day of month / last weekday） | ✅ | ✅ **已支持（2026-10-28，§8）**：dom `L` = 当月最后一天；dom `L-n` = 倒数第 n 天；dow `L` = `7`（SAT，Quartz 语义）；dow `nL` = 当月最后一个星期 n | **P1 → 已修复** |
+| `W`（nearest weekday，如 `15W`） | ✅ | ✅ **已支持（2026-10-28，§8）**：`nW` = 距第 n 天最近的周一至周五，**不跨月边界**（`1W` 落在周六 → 下周一即 3 号；月末落在周日 → 前一个周五）；当月不存在该日（如 4 月 `31W`）则当月不触发 | **P1 → 已修复** |
+| `LW` | ✅ | ✅ **已支持（2026-10-28，§8）**：当月最后一个工作日（最后一天为周六 → 周五，周日 → 周五） | **P1 → 已修复** |
+| `#`（第 n 个星期几，如 `6#3`） | ✅ | ✅ **已支持（2026-10-28，§8）**：`n#k`，`k ∈ [1,5]`，支持名称（`FRI#2`）；当月无第 k 个该星期几则不触发 | **P1 → 已修复** |
+| `?` 仅在 dom/dow 合法 | ✅ 严格（其他字段用 `?` → `ParseException("'?' can only be specified for Day-of-Month or Day-of-Week.")`） | ✅ **已修复（2026-10-28，§8）**：`parse_field(..., allow_question=false)`，非日字段出现 `?` 直接报同义错误；`? ?` 亦拒绝（Quartz 同样拒绝） | **P1 → 已修复** |
 | dom/dow 同时被指定时的行为 | ❌ **直接拒绝**：`ParseException("Support for specifying both a day-of-week AND a day-of-month parameter is not implemented.")`（Quartz 2.3.2 `CronExpression.buildExpression`；判定条件是「dom 与 dow 均非 `?`」，与是否写成 `*` 无关） | ✅ **已修复（2026-10-26，§6.1）**：`resolve_day_selector` 在解析期直接返回 `CronParseError`；6 字段要求 dom/dow **恰有一个** `?`（`*` 也算「已指定」），5 字段扩展仅在两侧都是具体值时拒绝 | **P1 → 已修复**：`schedule_runtime` 在登记前报 `Err`，与 Java 「快速失败且不登记」一致。历史：原为 OR 语义（`(false,false) => dom_ok \|\| dow_ok`）→ 同一表达式 Java=失败 / Rust=触发 |
-| `a/step`（裸起点+步长） | ✅ 展开到字段上限（Quartz `addToSet(val, end=-1, incr)` → `stopAt=59`；**`0/1` 亦展开为 0..59**） | ⚠️ **step>1 正确，step==1 退化为单值**（`cron.rs:167-171` `if step > 1 {(v,max)} else {(v,v)}`） | **P1**：`0/1`（每分钟）只匹配第 0 分钟 |
+| `a/step`（裸起点+步长） | ✅ 展开到字段上限（Quartz `addToSet(val, end=-1, incr)` → `stopAt=59`；**`0/1` 亦展开为 0..59**） | ✅ **已修复（2026-10-28，§8）**：`parse_field` 区分「有无 `/`」——有 `/` 一律展开到字段上限（含 `step == 1`），无 `/` 才是单值 | **P1 → 已修复**：`0 0/1 * * * ?` 现在每分钟触发（历史：`0/1` 只匹配第 0 分钟） |
 | `*/step` | ✅ | ✅ | — |
 | `a-b/step` | ✅ | ✅ | — |
 | 逗号枚举 `a,b,c` | ✅ | ✅ | — |
 | 月份/星期名称 `JAN-DEC`/`SUN-SAT` | ✅（大小写不敏感，`dayMap`/`monthMap`） | ✅（`to_ascii_uppercase`；名称→值 `min==1 ? idx+1 : idx` → 月 `JAN=1`、星期 `SUN=1…SAT=7`） | **对齐**（名称路径与数字路径共用同一套 1 基编号） |
 | 星期 **数字** `1-7` = SUN-SAT（Quartz 约定） | ✅ `dayMap`: SUN=1, MON=2, TUE=3, WED=4, THU=5, FRI=6, SAT=7 | ✅ **已修复（2026-10-26，§6.1）**：`parse_field(dow, 1, 7, &DOW_NAMES)`；`matches` 用 `weekday().num_days_from_sunday() + 1`，已删除 `dow==0 && matches(7)` 回绕分支 | **P1 → 已修复**：`0` 现报 `value 0 out of range [1,7]`（对应 Quartz `Day-of-Week values must be between 1 and 7`）。历史：原按 `0-7`（`1`=MON、`7`=SUN）静默错位一天 |
 | 时区 `zoneId` | ✅ `csb.inTimeZone(TimeZone.getTimeZone(zoneId))` | ✅ **已修复（2026-10-26，§6.1）**：`ScheduleConfig::zone_offset()` → `chrono::FixedOffset`；`job::CronPlan::matches_at` 用 `now.with_timezone(&offset)` 求值 | **P1 → 已修复**：`Asia/Shanghai` 的 `0 0 8 * * ?` 现在真的在北京时间 08:00 触发。限制：无 `chrono-tz`，DST 区（`Europe/London` 等）报明确错误（Java 静默降级 GMT，Rust 故意快速失败） |
-| 触发精度 | 毫秒级、由 Quartz 计算下次触发时刻 | ⚠️ 1 秒轮询 `matches(Utc::now())` | **P1**：若某次轮询落在秒边界抖动或执行耗时跨秒，会**漏掉整分钟**（`next_after` 未被使用，无法补偿） |
+| 触发精度 | 毫秒级、由 Quartz 计算下次触发时刻 | ✅ **已对齐（2026-10-28，§8）**：`CronPlan::next_fire_time`（= `CronExpression::next_after` 在配置时区求值）驱动 CRON 循环 `sleep_until`；无未来触发时置 `Complete`。`next_after` 改为字段级跳跃（年/月/日/时/分），不再逐秒扫描 | **P1 → 已修复**：不再有「1 秒轮询抖动漏掉整分钟」窗口；即使睡过头也只会晚触发一次而不会丢 |
 | 表达式非法时的行为 | `CronScheduleBuilder.cronSchedule()` 捕获 `ParseException` → 抛 **未受检** `RuntimeException("CronExpression '…' is invalid.", e)`；该异常**不被** `schedule()` 的 `catch (SchedulerException e)` 捕获 → 直接逸出 `schedule()`，且 `tasks.put(jobName, task)`（Java `:307`）**永不执行 → 任务未登记** | ✅ **已修复（2026-10-26，§6.1）**：`QuartzAgentScheduler::schedule_runtime` 在 `jobs.insert` **之前**调 `resolve_cron()`（解析表达式 + 解析时区），失败返回 `SchedulerError("CronExpression '…' is invalid: …")`；`spawn_job` 改收 `Option<CronPlan>`，循环内不再有解析/静默分支 | **P1 → 已修复**：Java=快速失败且无副作用，Rust 现同。历史：原仅 `tracing::error!` 且任务已登记、永不触发 |
 
 ## 6.1 本轮 cron 语义对齐（2026-10-26）
@@ -411,8 +419,8 @@ cargo test -p agentscope-extensions-scheduler
 
 ### 7.4 未完成项
 
-- P1-21 只完成了 `execution_count()` 与 `initial_input()`；Java 的 `getScheduleConfig()` / `getAgentConfig()` 在 `QuartzScheduleAgentTask` 上仍无可直接调用的公开访问器（`inner` 私有），属 P1，未扩大范围。
-- P1-18（cron dom/dow）、P1-4/5/6/7（cron 解析细化）、P1-22（`join()` 死代码 / shutdown 不等待 job 循环）均未处理，仍为 P1。
+- ~~P1-21~~ → **已补完（2026-10-28，§8）**：`QuartzScheduleAgentTask` 新增 `schedule_config()` / `agent_config()` / `runtime()`；连同已完成的 `execution_count()` / `initial_input()` 与 Java `getScheduleConfig()` / `getAgentConfig()` / `getExecutionCount()` 对齐。
+- P1-18（cron dom/dow）、P1-4/5/6/7（cron 解析细化）→ **已完成**（2026-10-26 §6.1 + 2026-10-28 §8）；P1-22（`join()` 死代码 / shutdown 不等待 job 循环）→ **已完成**（§8：`cancel`/`shutdown` 均 `join().await`）。
 - 未发现其它同源 P0：xxl-job 后端 factory 已正确接线，其 `trigger()` 通过 `BaseScheduleAgentTask::run` 正常执行并有既有测试覆盖。
 - `schedule_with_input` 的输入在「同名任务重复调度」时仍被忽略（与 Java 返回既有任务的语义一致），未改为覆盖。
 
@@ -431,3 +439,67 @@ cargo test -p agentscope-extensions-scheduler
 四个 channel 路由均存在（对应 Java 的 context load test 意图），而非复刻包扫描。
 
 
+
+## 8. 2026-10-28 执行记录（7 项任务）
+
+> 范围：仅 `crates/agentscope-extensions-scheduler/**`（含本 tracker），未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**` 与其它 crate；**未新增任何依赖**。
+> Java 依据：`agentscope-extensions-scheduler-{common,quartz,xxl-job}`（HEAD `16cb024ae`）。
+
+### 8.1 逐项结果
+
+| # | 任务 | 结果 | 关键实现 | Java 依据 |
+|---|---|---|---|---|
+| 1 | cron 扩展关键字 `L` / `W` / `LW` / `#` + 年字段 | ✅ 已完成 | `cron.rs` 重构：`DayOfMonthRule{Values,Last,LastOffset,LastWeekday,NearestWeekday}` + `DayOfWeekRule{Values,LastInMonth,NthInMonth}`；7 字段年（`1970-2199`）；`a/1` 展开；`?` 仅限日字段；`next_after` 改字段级跳跃 | `QuartzAgentScheduler.java:272-284`（`CronScheduleBuilder.cronSchedule` + `inTimeZone`）、Quartz 2.3.2 `CronExpression.buildExpression/getTimeAfter` |
+| 2 | `next_after` 生产零调用 | ✅ 已完成（**接线 + 查询 API 双做**） | `job::CronPlan::next_fire_time` → CRON 循环 `sleep` 到下次触发（替换 1s 轮询），无未来触发 → `Complete`；新增 `QuartzAgentScheduler::next_fire_time(name)`、`trigger_state(name)`、`QuartzScheduleAgentTask::next_fire_time(from)` | `Trigger#getNextFireTime` / `CronExpression#getNextValidTimeAfter`；`QuartzAgentScheduler.java:535-551` |
+| 3 | `interrupt()` 不中止 in-flight | ✅ 已完成 | `QuartzScheduleAgentTask` 增 `watch::Sender<u64>` 中断代次；`execute_with` 用 `select!` 与执行竞争，中断即丢弃执行 future 并返回 `Error::Interrupted`；`interrupted_count()` 可观测；FIXED_DELAY 被中断则跳过重排；`QuartzAgentScheduler::interrupt` 返回「是否真有 in-flight」 | `AgentQuartzJob.java:39/49-51/107-109/121-123`（`InterruptableJob`）、`QuartzAgentScheduler.java:479-503`（`scheduler.interrupt`） |
+| 4 | `get_status` 3 值 → Java 6 值 | ✅ 已完成 | `TaskStatus::{None,Normal,Paused,Complete,Error,Blocked,Cancelled}` + `as_str()` + `is_terminal()`（`None/Complete/Cancelled`）；`get_status` 保留 `Option`，另加 Java 同形 `trigger_state() -> TaskStatus` | `QuartzAgentScheduler.java:535-551` 返回 `Trigger.TriggerState`（NONE/NORMAL/PAUSED/COMPLETE/ERROR/BLOCKED） |
+| 5 | xxl-job 协议缺口 | ⚠️ 已完成（1 处因 core 限制降级，见 §4.2-5） | 新增 `src/xxljob/context.rs`：`XxlJobContext`（job_id/job_param/shard_index/shard_total/log_id/日志/handle 结果）+ `XxlJobHelper`（`log`/`handle_success`/`handle_fail`/`get_job_*`/`get_shard_*`/`get_log_id`），以 `tokio::task_local!` 模拟 Java ThreadLocal；`trigger_with_context` 在作用域内执行：job param → user msg、成功 `log(reply)`+`handleSuccess`、失败 `handleFail` | `XxlJobAgentScheduler.java:253/265`（`getJobParam`）、`:282`（`handleSuccess`）、`:189-201`（日志 Hook） |
+| 6 | `cancel` 语义 | ✅ 已完成 | quartz：空名/不存在 → `false`（+warn），存在 → `shutdown()` + `join().await`（job 循环与 in-flight 均终止）→ `true`；xxl-job：新增 `try_cancel() -> Result` 返回 Java 原文 `UnsupportedOperationException` 文案，trait 新增默认 `AgentScheduler::try_cancel`（xxl-job override 为 Err），布尔 `cancel` 保留 `false`+warn | `QuartzAgentScheduler.java:321-345`、`XxlJobAgentScheduler.java:299-304` |
+| 7 | `execution_count()` 未暴露 | ✅ 已完成（P0-3 已暴露，本轮补同族访问器） | `execution_count()` 已有；新增 `schedule_config()`/`agent_config()`/`runtime()`，并加 `config_accessors_are_exposed` 回归 | `BaseScheduleAgentTask.java:266-268`、`QuartzFixedDelayIntegrationTest.java:56` |
+
+### 8.2 新增 / 变更测试（36 个新测试，全部离线）
+
+| 文件 | 新增测试 |
+|---|---|
+| `src/quartz/cron.rs` | `last_day_of_month`、`last_day_offset`、`last_weekday_of_month`、`nearest_weekday_of_month`、`nearest_weekday_does_not_cross_month_boundary`、`nearest_weekday_never_fires_when_day_is_missing`、`last_day_of_week_in_month`、`nth_day_of_week_in_month`、`nth_day_of_week_skips_months_without_it`、`bare_last_day_of_week_means_saturday`、`rejects_malformed_day_extensions`、`year_field_limits_firing`、`year_field_range_matches_quartz`、`year_field_next_after_skips_years`、`step_without_range_expands_even_for_step_one`、`question_mark_only_allowed_in_day_fields`、`next_after_is_strictly_after`（17） |
+| `src/quartz/job.rs` | `next_fire_time_honours_the_configured_zone`、`next_fire_time_returns_none_when_years_are_exhausted`（2） |
+| `src/quartz/task.rs` | `config_accessors_are_exposed`、`status_reports_error_after_failed_execution`、`interrupt_aborts_in_flight_execution`、`interrupt_while_idle_does_not_abort_the_next_run`、`completed_task_is_terminal_and_has_no_next_fire_time`（5） |
+| `src/quartz/mod.rs` | `next_fire_time_query_for_cron_task`、`trigger_state_covers_quartz_states`、`interrupt_reports_whether_a_run_was_in_flight`、`cron_loop_fires_on_next_fire_time`（端到端：每秒钟 CRON 真的触发 ≥2 次）、`cancel_aborts_the_in_flight_execution`、`cancel_waits_for_the_job_loop_to_stop`（6） |
+| `src/xxljob/mod.rs` | `try_cancel_mirrors_java_unsupported_operation`、`trigger_passes_job_param_and_reports_success`、`trigger_reports_handle_fail_on_error`（3） |
+| `src/xxljob/context.rs` | `helper_resolves_the_scoped_context`、`helpers_are_noops_outside_a_scope`、`fail_code_is_500`（3） |
+
+既有测试的唯一改动：`pause_resume_status_transitions` / `pause_resume_and_status` 中 `TaskStatus::Scheduled` → `TaskStatus::Normal`（为对齐 Quartz `TriggerState.NORMAL` 而重命名变体；断言强度不变）。未删除任何测试、未加 `#[ignore]`。
+
+### 8.3 验证命令与实测
+
+```
+cargo test -p agentscope-extensions-scheduler
+→ lib:                       test result: ok. 88 passed; 0 failed; 0 ignored
+→ tests/quartz_execution.rs: test result: ok.  3 passed; 0 failed; 0 ignored
+→ Doc-tests:                 test result: ok.  0 passed; 0 failed
+→ EXIT=0（合计 91 passed / 0 failed；基线 55 全绿保留）
+
+cargo clippy -p agentscope-extensions-scheduler --all-targets
+→ 本 crate 仅 2 条既有 warning（module_inception / very_complex_type），0 error
+→ 本轮删除死脚手架 next_seq / AsAny / interrupt_notify / JobContext::run_task
+
+cargo fmt -p agentscope-extensions-scheduler（已跑，无额外改动）
+```
+
+### 8.4 反向验证（逐项回退 → 确认 FAILED → 恢复）
+
+| 回退的实现 | 期望失败的测试（实测均 FAILED） |
+|---|---|
+| `CronPlan::next_fire_time` 恒返回 `None` | `quartz::job::tests::next_fire_time_honours_the_configured_zone`、`next_fire_time_returns_none_when_years_are_exhausted`、`quartz::tests::next_fire_time_query_for_cron_task`、`quartz::tests::cron_loop_fires_on_next_fire_time` |
+| `execute_with` 去掉 `select!`（直接 await，不响应中断） | `quartz::task::tests::interrupt_aborts_in_flight_execution`（1s timeout `Elapsed`） |
+| `cancel` 去掉 `task.join().await` | `quartz::tests::cancel_aborts_the_in_flight_execution`（`left: 1`，in-flight 执行存活） |
+| `DayOfMonthRule::Last` / `NearestWeekday` / `DayOfWeekRule::NthInMonth` 返回 false | `last_day_of_month`、`nearest_weekday_of_month`、`nearest_weekday_does_not_cross_month_boundary`、`nth_day_of_week_in_month`、`nth_day_of_week_skips_months_without_it` |
+
+恢复后重跑：88 + 3 passed / 0 failed（§8.3）。
+
+### 8.5 注记
+
+- **任务示例表达式勘误**：需求给出的 `0 0 L * * ?`、`0 0 15W * * ?` 是 6 字段（Quartz `sec min hour dom mon dow`），第三个字段是**小时**，把 `L`/`15W` 放在小时位上 Quartz 同样会拒绝。正确写法为 `0 0 0 L * ?`、`0 0 0 15W * ?`，本轮测试即按此编写；`0 0 12 ? * 6#3`（第三个星期五 12:00）本身合法，已直接覆盖。
+- **行为变更**：`?` 现仅允许出现在 dom/dow（其他字段报错）→ 历史表达式若在非日字段使用 `?`，需改写为 `*`。
+- **Java 双计数问题未复刻**：Java `executeAgent` 在 `run()` 之后又调 `incrementExecutionCount()`（`XxlJobAgentScheduler.java:272`），实际每次执行 +2；Rust 保持 +1（`BaseScheduleAgentTask::run_with` 内），属**有意偏离**，已在 §4.2 记录。
+- **编译环境注记**：本轮验证期间 `agentscope-extensions-model` 正被并行会话重构，出现临时编译失败（与本 crate 无关），等待其稳定后重跑；未改动任何本 crate 之外的文件。

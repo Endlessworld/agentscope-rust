@@ -23,7 +23,9 @@ pub use quartz::{
     CronExpression, CronParseError, QuartzAgentScheduler, QuartzScheduleAgentTask,
     SchedulerRegistry, TaskStatus,
 };
-pub use xxljob::XxlJobAgentScheduler;
+pub use xxljob::{
+    XxlJobAgentScheduler, XxlJobContext, XxlJobHandleCode, XxlJobHandleResult, XxlJobHelper,
+};
 
 /// Test-only helpers shared across module unit tests.
 #[cfg(test)]

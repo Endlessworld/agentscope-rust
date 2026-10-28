@@ -4,14 +4,22 @@
 //! Java integrates with the external XXL-Job executor and only *registers* a
 //! `JobHandler` per agent; the actual cron schedule lives in the XXL-Job admin
 //! console. Rust has no xxl-job SDK, so we provide an equivalent in-process
-//! `JobHandler` registry plus a local `trigger(name, params)` used by tests and
-//! by a host application that bridges an external scheduler.
+//! `JobHandler` registry plus a local `trigger` used by tests and by a host
+//! application that bridges an external scheduler.
 //!
 //! Semantics preserved from Java:
 //! * only `ScheduleMode::NONE` is accepted at registration time;
 //! * registration is keyed by agent name (= JobHandler name);
-//! * `cancel` is **unsupported** and returns an error;
-//! * `shutdown` clears all handlers.
+//! * the trigger reads the dispatch metadata from [`XxlJobContext`]
+//!   (`getJobParam()`, sharding info, log id) and writes back through
+//!   [`XxlJobHelper`] (`log`, `handleSuccess` / `handleFail`);
+//! * `cancel` is **unsupported** — see [`XxlJobAgentScheduler::try_cancel`], the
+//!   error-carrying equivalent of Java's `UnsupportedOperationException`;
+//! * `shutdown` clears all handlers (Java additionally destroys the executor).
+
+pub mod context;
+
+pub use context::{XxlJobContext, XxlJobHandleCode, XxlJobHandleResult, XxlJobHelper};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +32,10 @@ use agentscope_core::message::Msg;
 use crate::common::config::{AgentConfig, RuntimeAgentConfig, ScheduleConfig, ScheduleMode};
 use crate::common::scheduler::scheduler::{AgentScheduler, SchedulerError};
 use crate::common::scheduler::task::{AgentFactory, BaseScheduleAgentTask, ScheduleAgentTask};
+
+/// The exact message Java throws from `cancel`.
+const CANCEL_UNSUPPORTED: &str = "Cancel operation is not supported by XxlJobAgentScheduler. \
+     Please use XXL-Job admin console to pause or delete the job.";
 
 /// A registered job handler for one agent.
 struct JobHandler {
@@ -85,14 +97,71 @@ impl XxlJobAgentScheduler {
 
     /// Triggers a registered handler locally (stand-in for an XXL-Job dispatch),
     /// passing `job_param` as the user message — mirrors Java `executeAgent`.
+    ///
+    /// The dispatch runs inside a fresh [`XxlJobContext`] so the same helper API
+    /// as in Java (`XxlJobHelper::log`, `handle_success`, `get_job_param`, …) is
+    /// available to the factory. Use [`trigger_with_context`](Self::trigger_with_context)
+    /// to supply dispatch metadata (job id, sharding, log id) explicitly.
     pub async fn trigger(&self, name: &str, job_param: &str) -> Result<Msg, SchedulerError> {
+        let context = Arc::new(XxlJobContext::new(0, job_param));
+        self.trigger_with_context(name, context).await
+    }
+
+    /// Triggers a handler with an explicit XXL-Job dispatch context.
+    ///
+    /// Mirrors Java `executeAgent(BaseScheduleAgentTask)`: the job parameter
+    /// becomes the user message, the execution runs inside the dispatch context,
+    /// the reply is logged and `handleSuccess` / `handleFail` is reported.
+    pub async fn trigger_with_context(
+        &self,
+        name: &str,
+        context: Arc<XxlJobContext>,
+    ) -> Result<Msg, SchedulerError> {
         let task = self
             .get_scheduled_agent(name)
             .ok_or_else(|| SchedulerError::new(format!("No such handler: {name}")))?;
-        let input = Msg::user(job_param.to_string());
-        task.run(vec![input])
-            .await
-            .map_err(|e| SchedulerError::new(e.to_string()))
+        let task_name = name.to_string();
+        let input = Msg::user(context.job_param().to_string());
+        let context_for_run = context.clone();
+
+        XxlJobContext::scope(context_for_run, async move {
+            tracing::info!(
+                handler = %task_name,
+                job_id = XxlJobHelper::get_job_id().unwrap_or_default(),
+                shard = XxlJobHelper::get_shard_index().unwrap_or_default(),
+                shards = XxlJobHelper::get_shard_total().unwrap_or_default(),
+                log_id = XxlJobHelper::get_log_id().unwrap_or_default(),
+                "executing XXL-Job handler"
+            );
+            match task.run(vec![input]).await {
+                Ok(reply) => {
+                    // Java's logging hook forwards each reasoning message to
+                    // `XxlJobHelper.log`; the Rust core exposes no post-reasoning
+                    // hook to middlewares, so the reply is logged instead (see
+                    // tracker §4.2).
+                    XxlJobHelper::log(reply.text_content());
+                    XxlJobHelper::handle_success(format!(
+                        "Successfully executed scheduled task '{task_name}'"
+                    ));
+                    Ok(reply)
+                }
+                Err(err) => {
+                    let message = format!("Task execution failed: {task_name}: {err}");
+                    XxlJobHelper::handle_fail(message.clone());
+                    Err(SchedulerError::new(message))
+                }
+            }
+        })
+        .await
+    }
+
+    /// Cancels a handler.
+    ///
+    /// Java throws `UnsupportedOperationException` unconditionally; this is the
+    /// faithful Rust counterpart used by callers that need to distinguish
+    /// "unsupported" from "not found".
+    pub fn try_cancel(&self, _name: &str) -> Result<(), SchedulerError> {
+        Err(SchedulerError::new(CANCEL_UNSUPPORTED))
     }
 
     /// Lists registered handler names.
@@ -113,13 +182,18 @@ impl AgentScheduler for XxlJobAgentScheduler {
     }
 
     async fn cancel(&self, _name: &str) -> bool {
-        // Java throws UnsupportedOperationException; Rust has no exceptions, so
-        // we surface the unsupported operation via `false`.
+        // Java throws UnsupportedOperationException. The boolean trait method
+        // cannot express that, so it logs and returns `false`; callers that need
+        // the Java semantics use `try_cancel` (see `AgentScheduler::try_cancel`).
         tracing::warn!(
             "Cancel operation is not supported by XxlJobAgentScheduler; \
              use the XXL-Job admin console to pause or delete the job."
         );
         false
+    }
+
+    async fn try_cancel(&self, name: &str) -> Result<bool, SchedulerError> {
+        self.try_cancel(name).map(|()| true)
     }
 
     fn get_scheduled_agent(&self, name: &str) -> Option<Arc<dyn ScheduleAgentTask>> {
@@ -158,6 +232,10 @@ impl AgentScheduler for XxlJobAgentScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use agentscope_core::error::{Error, Result as CoreResult};
+
     use crate::test_support::EchoFactory;
 
     fn runtime(name: &str) -> Arc<RuntimeAgentConfig> {
@@ -221,5 +299,126 @@ mod tests {
     async fn trigger_unknown_handler_errors() {
         let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
         assert!(sched.trigger("missing", "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn try_cancel_mirrors_java_unsupported_operation() {
+        // Java throws `UnsupportedOperationException` for cancel regardless of
+        // whether the handler exists or has already run.
+        let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
+        let err = sched.try_cancel("never-registered").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Cancel operation is not supported"),
+            "err was {err}"
+        );
+        assert!(
+            err.to_string().contains("XXL-Job admin console"),
+            "err was {err}"
+        );
+
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
+        sched.trigger("A", "p").await.unwrap();
+        let err = sched.try_cancel("A").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cancel operation is not supported by XxlJobAgentScheduler. \
+             Please use XXL-Job admin console to pause or delete the job."
+        );
+        // The trait-level counterpart reports the same error.
+        assert!(AgentScheduler::try_cancel(&sched, "A").await.is_err());
+    }
+
+    /// Factory that records the messages it received and can run a closure inside
+    /// the dispatch context (to exercise `XxlJobHelper`).
+    struct ContextFactory {
+        seen: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl AgentFactory for ContextFactory {
+        async fn run(&self, _config: &RuntimeAgentConfig, messages: Vec<Msg>) -> CoreResult<Msg> {
+            let text = messages
+                .first()
+                .map(|m| m.text_content())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(text.clone());
+            // The helper API must resolve the dispatch of the running execution.
+            assert_eq!(
+                XxlJobHelper::get_job_param().as_deref(),
+                Some(text.as_str())
+            );
+            XxlJobHelper::log(format!("received: {text}"));
+            if self.fail {
+                return Err(Error::Agent("factory boom".into()));
+            }
+            Ok(Msg::assistant(format!("reply:{text}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_passes_job_param_and_reports_success() {
+        let factory = Arc::new(ContextFactory {
+            seen: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let sched = XxlJobAgentScheduler::new(factory.clone());
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
+
+        let ctx = Arc::new(
+            XxlJobContext::new(9, "hello")
+                .with_sharding(0, 2)
+                .with_log_id(77),
+        );
+        let out = sched.trigger_with_context("A", ctx.clone()).await.unwrap();
+        assert_eq!(out.text_content(), "reply:hello");
+        assert_eq!(factory.seen.lock().unwrap().as_slice(), ["hello"]);
+
+        // §XxlJobHelper.handleSuccess + log protocol.
+        let handle = ctx.handle_result().expect("handle result reported");
+        assert_eq!(handle.code(), XxlJobHandleCode::Success);
+        assert_eq!(handle.message(), "Successfully executed scheduled task 'A'");
+        let logs = ctx.logs();
+        assert!(
+            logs.iter().any(|l| l == "received: hello"),
+            "logs: {logs:?}"
+        );
+        assert!(logs.iter().any(|l| l == "reply:hello"), "logs: {logs:?}");
+        // The context keeps the dispatch metadata available after the run.
+        assert_eq!(ctx.job_id(), 9);
+        assert_eq!(ctx.shard_index(), 0);
+        assert_eq!(ctx.shard_total(), 2);
+        assert_eq!(ctx.log_id(), 77);
+    }
+
+    #[tokio::test]
+    async fn trigger_reports_handle_fail_on_error() {
+        let factory = Arc::new(ContextFactory {
+            seen: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let sched = XxlJobAgentScheduler::new(factory);
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
+
+        let ctx = Arc::new(XxlJobContext::new(1, "boom-param"));
+        let err = sched
+            .trigger_with_context("A", ctx.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Task execution failed: A"),
+            "err was {err}"
+        );
+
+        let handle = ctx.handle_result().expect("handle result reported");
+        assert_eq!(handle.code(), XxlJobHandleCode::Fail);
+        assert!(handle.message().contains("Task execution failed: A"));
     }
 }

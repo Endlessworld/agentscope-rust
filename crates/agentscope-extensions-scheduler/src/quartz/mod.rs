@@ -21,11 +21,11 @@ pub use registry::{scheduler_registry, SchedulerRegistry};
 pub use task::{QuartzScheduleAgentTask, TaskStatus};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use tokio::sync::Notify;
+use chrono::{DateTime, Utc};
 
 use agentscope_core::message::Msg;
 
@@ -42,7 +42,6 @@ pub struct QuartzAgentScheduler {
     /// name -> running job handle
     jobs: RwLock<HashMap<String, Arc<QuartzScheduleAgentTask>>>,
     shutdown: AtomicBool,
-    next_seq: AtomicU64,
 }
 
 impl QuartzAgentScheduler {
@@ -54,7 +53,6 @@ impl QuartzAgentScheduler {
             factory,
             jobs: RwLock::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
-            next_seq: AtomicU64::new(0),
         };
         scheduler_registry().register(sched.scheduler_id.clone(), sched.self_handle_hint());
         sched
@@ -111,6 +109,7 @@ impl QuartzAgentScheduler {
             name.clone(),
             self.factory.clone(),
             input,
+            cron.clone(),
         ));
 
         self.jobs
@@ -118,7 +117,7 @@ impl QuartzAgentScheduler {
             .unwrap()
             .insert(name.clone(), task.clone());
 
-        let handle = spawn_job(self.context(), task.clone(), schedule_config.clone(), cron);
+        let handle = spawn_job(self.context(), task.clone(), schedule_config.clone());
         task.attach(handle);
 
         tracing::info!(task = %name, mode = schedule_config.schedule_mode().as_str(), "scheduled task");
@@ -160,13 +159,14 @@ impl QuartzAgentScheduler {
     }
 
     /// Sends an interrupt to a running execution.
+    ///
+    /// Mirrors Java `Scheduler#interrupt(JobKey)`: the in-flight execution is
+    /// aborted and `true` is returned; when no execution is running (or the task
+    /// does not exist) `false` is returned.
     pub fn interrupt(&self, name: &str) -> bool {
         match self.get_scheduled_agent(name) {
             Some(t) => match t.as_any().downcast_ref::<QuartzScheduleAgentTask>() {
-                Some(q) => {
-                    q.interrupt();
-                    true
-                }
+                Some(q) => q.interrupt(),
                 None => false,
             },
             None => false,
@@ -180,6 +180,23 @@ impl QuartzAgentScheduler {
                 .downcast_ref::<QuartzScheduleAgentTask>()
                 .map(|q| q.status())
         })
+    }
+
+    /// Java `getStatus` analogue: the Quartz `TriggerState`, `NONE` when the task
+    /// is unknown (Java returns `null` there; Rust uses the `None` variant).
+    pub fn trigger_state(&self, name: &str) -> TaskStatus {
+        self.get_status(name).unwrap_or(TaskStatus::None)
+    }
+
+    /// Next fire time of a CRON task, as an absolute instant.
+    ///
+    /// Mirrors Quartz `Trigger#getNextFireTime` /
+    /// `CronExpression#getNextValidTimeAfter`. Returns `None` for non-CRON tasks,
+    /// unknown names and schedules with no future firing.
+    pub fn next_fire_time(&self, name: &str) -> Option<DateTime<Utc>> {
+        let task = self.get_scheduled_agent(name)?;
+        let quart_task = task.as_any().downcast_ref::<QuartzScheduleAgentTask>()?;
+        quart_task.next_fire_time(Utc::now())
     }
 
     /// Triggers one execution of a task by name (manual run).
@@ -203,7 +220,7 @@ impl QuartzAgentScheduler {
 /// Returns `None` for non-CRON modes. Called before the task is registered so a
 /// bad expression or zone id has no side effects (Java throws before
 /// `tasks.put(...)`).
-fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<CronPlan>, SchedulerError> {
+fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<Arc<CronPlan>>, SchedulerError> {
     if schedule_config.schedule_mode() != ScheduleMode::CRON {
         return Ok(None);
     }
@@ -216,29 +233,16 @@ fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<CronPlan>, Sc
             "CronExpression '{expression}' has an invalid time zone: {e}"
         ))
     })?;
-    Ok(Some(CronPlan {
+    Ok(Some(Arc::new(CronPlan {
         expression: parsed,
         offset,
-    }))
+    })))
 }
 
 /// Context handed to a spawned job loop.
 #[derive(Clone)]
 pub(crate) struct JobContext {
     pub(crate) scheduler_id: String,
-}
-
-impl JobContext {
-    /// Runs a single execution of the task located via the registry.
-    pub(crate) async fn run_task(
-        &self,
-        task: &Arc<QuartzScheduleAgentTask>,
-    ) -> agentscope_core::error::Result<Msg> {
-        // The registry is consulted to mirror the Java job's indirection; the
-        // task itself already holds its runtime config + factory.
-        let _ = scheduler_registry().contains(self.scheduler_id.as_str());
-        task.execute().await
-    }
 }
 
 #[async_trait]
@@ -271,11 +275,18 @@ impl AgentScheduler for QuartzAgentScheduler {
         let removed = self.jobs.write().unwrap().remove(name);
         match removed {
             Some(task) => {
+                // Java `scheduler.deleteJob(taskKey)` drops the job and its trigger;
+                // the Rust equivalent must also stop and await the job loop, or the
+                // loop could keep firing after `cancel` already returned `true`.
                 task.shutdown();
+                task.join().await;
                 tracing::info!(task = %name, "cancelled task");
                 true
             }
-            None => false,
+            None => {
+                tracing::warn!(task = %name, "attempt to cancel non-existent task");
+                false
+            }
         }
     }
 
@@ -302,7 +313,10 @@ impl AgentScheduler for QuartzAgentScheduler {
         }
         let tasks: Vec<_> = self.jobs.write().unwrap().drain().map(|(_, v)| v).collect();
         for task in tasks {
+            // Java `scheduler.shutdown(true)` waits for running jobs; awaiting the
+            // job-loop handle is the Rust equivalent.
             task.shutdown();
+            task.join().await;
         }
         scheduler_registry().unregister(&self.scheduler_id);
         tracing::info!("QuartzAgentScheduler shutdown completed");
@@ -311,17 +325,6 @@ impl AgentScheduler for QuartzAgentScheduler {
     fn scheduler_type(&self) -> &'static str {
         "quartz"
     }
-}
-
-/// Marker trait so `Arc<dyn ScheduleAgentTask>` can be downcast to the concrete
-/// backend task. Implemented for every scheduler task in this crate.
-pub(crate) trait AsAny {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-/// Notify helper reused by the job loop for interrupt-driven wakeups.
-pub(crate) fn interrupt_notify() -> Arc<Notify> {
-    Arc::new(Notify::new())
 }
 
 #[cfg(test)]
@@ -398,7 +401,7 @@ mod tests {
         assert!(sched.pause("A"));
         assert_eq!(sched.get_status("A"), Some(TaskStatus::Paused));
         assert!(sched.resume("A"));
-        assert_eq!(sched.get_status("A"), Some(TaskStatus::Scheduled));
+        assert_eq!(sched.get_status("A"), Some(TaskStatus::Normal));
     }
 
     #[tokio::test]
@@ -496,5 +499,233 @@ mod tests {
             .unwrap();
         assert_eq!(task.name(), "A");
         assert!(sched.cancel("A").await);
+    }
+
+    #[tokio::test]
+    async fn next_fire_time_query_for_cron_task() {
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        sched
+            .schedule_runtime(
+                runtime("A"),
+                ScheduleConfig::builder()
+                    .cron("0 0 0 1 1 ? 2099")
+                    .build()
+                    .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Quartz `Trigger#getNextFireTime` analogue: the query goes through the
+        // same `next_after` computation the job loop uses.
+        let next = sched
+            .next_fire_time("A")
+            .expect("cron task has a next fire");
+        assert_eq!(
+            next.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2099-01-01 00:00:00"
+        );
+        // Unknown names and non-CRON tasks have no next fire time.
+        assert!(sched.next_fire_time("missing").is_none());
+        sched
+            .schedule_runtime(runtime("B"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+        assert!(sched.next_fire_time("B").is_none());
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_state_covers_quartz_states() {
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        assert_eq!(sched.trigger_state("missing"), TaskStatus::None);
+        assert!(sched.trigger_state("missing").is_terminal());
+
+        sched
+            .schedule_runtime(
+                runtime("A"),
+                ScheduleConfig::builder()
+                    .fixed_rate(100_000)
+                    .build()
+                    .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sched.trigger_state("A"), TaskStatus::Normal);
+
+        assert!(sched.pause("A"));
+        assert_eq!(sched.trigger_state("A"), TaskStatus::Paused);
+        assert!(!sched.trigger_state("A").is_terminal());
+
+        assert!(sched.resume("A"));
+        assert_eq!(sched.trigger_state("A"), TaskStatus::Normal);
+
+        assert!(sched.cancel("A").await);
+        // Java removes the task, after which `getStatus` reports NONE.
+        assert_eq!(sched.trigger_state("A"), TaskStatus::None);
+        assert_eq!(sched.get_status("A"), None);
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_whether_a_run_was_in_flight() {
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+        // Nothing is running, so Quartz would not report an interrupted job.
+        assert!(!sched.interrupt("A"));
+        assert!(!sched.interrupt("missing"));
+
+        // A manual trigger completes immediately, so an interrupt after it also
+        // finds nothing in flight, but the task itself still exists.
+        sched.trigger("A").await.unwrap();
+        assert!(!sched.interrupt("A"));
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cron_loop_fires_on_next_fire_time() {
+        // End-to-end: the CRON job loop sleeps until `next_fire_time` (i.e.
+        // `next_after` is on the production path) and really fires the task.
+        let sched = Arc::new(QuartzAgentScheduler::new(Arc::new(EchoFactory)));
+        let cfg = ScheduleConfig::builder()
+            .cron("* * * * * ?")
+            .build()
+            .unwrap();
+        let task = sched
+            .schedule_runtime(runtime("EverySecond"), cfg, None)
+            .await
+            .unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        // The query API and the job loop share the same computation.
+        assert!(sched.next_fire_time("EverySecond").is_some());
+
+        for _ in 0..150 {
+            if qt.execution_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            qt.execution_count() >= 2,
+            "cron loop did not fire twice (count {})",
+            qt.execution_count()
+        );
+
+        sched.shutdown().await;
+    }
+
+    /// Factory that sleeps, so an execution can be observed in flight.
+    struct SlowEcho {
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentFactory for SlowEcho {
+        async fn run(
+            &self,
+            _config: &RuntimeAgentConfig,
+            _messages: Vec<Msg>,
+        ) -> agentscope_core::error::Result<Msg> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            Ok(Msg::assistant("slow"))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_the_in_flight_execution() {
+        // Java `deleteJob` drops the job and its trigger; the Rust equivalent must
+        // stop the job loop *and* abandon the execution in flight, so an
+        // in-flight run never lands in the execution counter after cancel.
+        let factory = Arc::new(SlowEcho {
+            started: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sched = Arc::new(QuartzAgentScheduler::new(factory.clone()));
+        let cfg = ScheduleConfig::builder()
+            .fixed_delay(10)
+            .initial_delay(1)
+            .build()
+            .unwrap();
+        let task = sched
+            .schedule_runtime(runtime("Slow"), cfg, None)
+            .await
+            .unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        for _ in 0..100 {
+            if qt.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(qt.is_running(), "execution never started");
+        assert_eq!(qt.status(), TaskStatus::Blocked);
+
+        assert!(sched.cancel("Slow").await);
+        assert!(qt.is_cancelled());
+
+        // Give the (aborted) execution far more time than its 300 ms sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            qt.execution_count(),
+            0,
+            "in-flight execution survived cancel"
+        );
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_the_job_loop_to_stop() {
+        let sched = Arc::new(QuartzAgentScheduler::new(Arc::new(EchoFactory)));
+        let cfg = ScheduleConfig::builder()
+            .fixed_rate(10)
+            .initial_delay(1)
+            .build()
+            .unwrap();
+        let task = sched
+            .schedule_runtime(runtime("A"), cfg, None)
+            .await
+            .unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        for _ in 0..100 {
+            if qt.execution_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(qt.execution_count() >= 1, "task never fired");
+
+        assert!(sched.cancel("A").await);
+        let after_cancel = qt.execution_count();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(
+            qt.execution_count(),
+            after_cancel,
+            "job loop kept firing after cancel returned"
+        );
+        assert!(qt.is_cancelled());
+        assert!(!sched.cancel("A").await);
+
+        sched.shutdown().await;
     }
 }

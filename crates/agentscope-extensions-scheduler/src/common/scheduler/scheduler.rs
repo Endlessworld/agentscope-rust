@@ -54,6 +54,16 @@ pub trait AgentScheduler: Send + Sync {
     /// Cancels and removes a scheduled task by name.
     async fn cancel(&self, name: &str) -> bool;
 
+    /// Rust-idiomatic counterpart of Java's `cancel`.
+    ///
+    /// Java backends signal "cancel is not supported" by throwing
+    /// `UnsupportedOperationException`; the boolean [`cancel`](Self::cancel) cannot
+    /// express that, so backends that do not support cancellation override this
+    /// method with an error. The default simply forwards to `cancel`.
+    async fn try_cancel(&self, name: &str) -> Result<bool, SchedulerError> {
+        Ok(self.cancel(name).await)
+    }
+
     /// Retrieves a scheduled task by name.
     fn get_scheduled_agent(&self, name: &str) -> Option<Arc<dyn ScheduleAgentTask>>;
 
