@@ -4,11 +4,11 @@
 //! PostgreSQL agent-state store, KV store, snapshot spec, and sandbox execution guard
 //! together.
 //!
-//! **Harness note:** the harness `DistributedStore` currently only carries
-//! `agent_state_store` + `isolation_scope`. The additional components (base store,
-//! snapshot spec, guard) are exposed directly on this composer for callers to place
-//! where needed, mirroring the Java aggregation without changing harness types. See the
-//! module gap tracker §4.2.
+//! **Harness note:** the harness `DistributedStore` carries `agent_state_store` +
+//! `isolation_scope` plus the composite slots `base_store` / `sandbox_snapshot_spec` /
+//! `sandbox_execution_guard` (tracker §4.2, resolved 2026-10-28).
+//! [`PostgresDistributedStore::distributed_store`] populates all of them, mirroring the
+//! Java aggregation without changing harness types.
 
 use std::sync::Arc;
 
@@ -78,11 +78,24 @@ impl PostgresDistributedStore {
         PostgresSandboxExecutionGuard::new(Arc::clone(&self.client))
     }
 
-    /// Builds a harness [`DistributedStore`] carrying the agent-state store.
+    /// Builds a harness [`DistributedStore`] carrying every PostgreSQL component: the
+    /// agent-state store, the KV base store, the snapshot spec, and the advisory-lock
+    /// execution guard (through the harness `SandboxGuard` trait).
     pub fn distributed_store(&self) -> PgResult<DistributedStore> {
         let state: Arc<dyn agentscope_core::state::AgentStateStore> =
             Arc::new(self.agent_state_store()?);
-        Ok(DistributedStore::builder().agent_state_store(state).build())
+        let base: Arc<dyn agentscope_harness::filesystem::remote::store::BaseStore> =
+            Arc::new(self.base_store()?);
+        let snapshots: Arc<dyn agentscope_harness::agent::sandbox::SandboxSnapshotSpec> =
+            Arc::new(self.snapshot_spec()?);
+        let guard: Arc<dyn agentscope_harness::agent::sandbox::SandboxGuard> =
+            Arc::new(self.sandbox_execution_guard());
+        Ok(DistributedStore::builder()
+            .agent_state_store(state)
+            .base_store(base)
+            .sandbox_snapshot_spec(snapshots)
+            .sandbox_execution_guard(guard)
+            .build())
     }
 }
 
@@ -160,15 +173,42 @@ mod tests {
     // Java: PostgresDistributedStoreTest#createRejectsNullDataSource (Rust: a null client is
     // not representable; the analogue is the composer's projection contract below).
 
-    // The composer's `distributed_store()` exposes only the agent-state store + isolation
-    // scope (the harness `DistributedStore` has no base-store / snapshot / guard fields).
-    #[test]
-    fn distributed_store_projects_agent_state_store_only() {
+    // The composer's `distributed_store()` projects every PostgreSQL component: the
+    // agent-state store, the KV base store, the snapshot spec and the execution guard
+    // (tracker §4.2, resolved 2026-10-28).
+    #[tokio::test]
+    async fn distributed_store_projects_all_components() {
         let (c, store) = composer();
         let ds: DistributedStore = store.distributed_store().unwrap();
         assert!(ds.agent_state_store.is_some());
         assert_eq!(ds.isolation_scope, IsolationScope::default());
         assert!(c.has_table(crate::state::DEFAULT_TABLE_NAME));
+
+        let base = ds.base_store.as_ref().expect("base_store projected");
+        base.put(
+            &["filesystem".to_string()],
+            "kv",
+            json!({"a": 1}).as_object().unwrap().clone(),
+        );
+        assert!(base.get(&["filesystem".to_string()], "kv").is_some());
+
+        let spec = ds
+            .sandbox_snapshot_spec
+            .as_ref()
+            .expect("sandbox_snapshot_spec projected");
+        assert_eq!(spec.build("projected").expect("build").id(), "projected");
+
+        let guard = ds
+            .sandbox_execution_guard
+            .as_ref()
+            .expect("sandbox_execution_guard projected");
+        let key = agentscope_harness::agent::sandbox::SandboxIsolationKey::new("session", "s1");
+        let lease = guard.try_enter(key.clone()).await;
+        assert!(!lease.is_noop());
+        assert!(guard.is_held(&key));
+        assert_eq!(guard.active_count(), 1);
+        guard.release(&key).await;
+        assert!(!guard.is_held(&key));
     }
 
     // The projected store is functional end-to-end through the harness trait object.

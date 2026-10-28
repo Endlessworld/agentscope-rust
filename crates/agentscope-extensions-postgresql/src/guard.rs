@@ -12,10 +12,11 @@
 //! the isolation key via a hash, acquired with `pg_try_advisory_lock` (polling until the
 //! timeout expires) and released with `pg_advisory_unlock`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentscope_harness::agent::sandbox::SandboxIsolationKey;
+use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey, SandboxLease};
 
 use crate::client::{Cell, PostgresClient, QueryOutcome, SqlValue};
 use crate::error::{PgResult, PostgresError};
@@ -68,6 +69,7 @@ impl PostgresSandboxExecutionGuardBuilder {
             client: self.client,
             key_prefix: self.key_prefix,
             lock_timeout: self.lock_timeout,
+            trait_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -78,6 +80,12 @@ pub struct PostgresSandboxExecutionGuard {
     client: Arc<dyn PostgresClient>,
     key_prefix: String,
     lock_timeout: Duration,
+    /// Leases acquired through the harness `SandboxGuard` trait, keyed by isolation key.
+    ///
+    /// The harness `SandboxLease` carries no release hook, so the concrete
+    /// [`PostgresSandboxLease`] (which unlocks on drop) must be retained until
+    /// `SandboxGuard::release` is called.
+    trait_leases: Arc<Mutex<HashMap<SandboxIsolationKey, Vec<PostgresSandboxLease>>>>,
 }
 
 impl PostgresSandboxExecutionGuard {
@@ -157,6 +165,82 @@ impl PostgresSandboxExecutionGuard {
                 .unwrap_or(false)),
             QueryOutcome::Affected(_) => Ok(false),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxGuard for PostgresSandboxExecutionGuard {
+    /// Acquires the advisory lock and retains the concrete [`PostgresSandboxLease`] until
+    /// `SandboxGuard::release` runs (a timed-out acquisition degrades to a no-op lease,
+    /// mirroring the JDBC guard's fallback).
+    ///
+    /// The acquire probe is synchronous and polls by sleeping, so it runs on a blocking
+    /// thread: awaiting it directly would block a Tokio worker for the whole lock timeout.
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        let this = self.clone();
+        let acquire_key = key.clone();
+        let acquired = tokio::task::spawn_blocking(move || this.try_enter(&acquire_key)).await;
+        match acquired {
+            Ok(Ok(lease)) => {
+                if let Ok(mut leases) = self.trait_leases.lock() {
+                    leases.entry(key.clone()).or_default().push(lease);
+                }
+                SandboxLease::new(key)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "[postgres-guard] lock not acquired");
+                SandboxLease::noop()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "[postgres-guard] blocking acquire task failed");
+                SandboxLease::noop()
+            }
+        }
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        let dropped =
+            self.trait_leases
+                .lock()
+                .ok()
+                .and_then(|mut leases| match leases.get_mut(key) {
+                    Some(stack) => {
+                        let lease = stack.pop();
+                        if stack.is_empty() {
+                            leases.remove(key);
+                        }
+                        lease
+                    }
+                    None => None,
+                });
+        match dropped {
+            // Dropping the lease unlocks the advisory lock.
+            Some(lease) => drop(lease),
+            None => {
+                let _ = PostgresSandboxExecutionGuard::release(self, self.compose_lock_key(key));
+            }
+        }
+    }
+
+    /// PostgreSQL has no `is_held` query on the guard, so this reports the local view:
+    /// whether this guard currently retains a lease for the key.
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        self.trait_leases
+            .lock()
+            .map(|leases| leases.get(key).is_some_and(|stack| !stack.is_empty()))
+            .unwrap_or(false)
+    }
+
+    fn active_count(&self) -> usize {
+        self.trait_leases
+            .lock()
+            .map(|leases| leases.values().map(|stack| stack.len()).sum())
+            .unwrap_or(0)
+    }
+
+    /// `pg_try_advisory_lock` keys are server-scoped: they serialise across processes.
+    fn is_distributed(&self) -> bool {
+        true
     }
 }
 
@@ -424,5 +508,15 @@ mod tests {
         let lb = g.try_enter(&b).unwrap();
         assert_ne!(la.lock_name(), lb.lock_name());
         assert_eq!(c.advisory_lock_count(), 2);
+    }
+
+    /// `pg_try_advisory_lock` keys are server-scoped, so the guard must advertise itself as a
+    /// cross-process (distributed) guard.
+    #[tokio::test]
+    async fn guard_is_distributed() {
+        let g = PostgresSandboxExecutionGuard::new(client());
+        assert!(SandboxGuard::is_distributed(&g));
+        let object: Arc<dyn SandboxGuard> = Arc::new(PostgresSandboxExecutionGuard::new(client()));
+        assert!(object.is_distributed());
     }
 }

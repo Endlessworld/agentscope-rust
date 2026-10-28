@@ -10,7 +10,7 @@
 - **优先级**：P0=核心链路 / P1=重要 / P2=增强。
 - 每完成一项：把状态改 `已完成`，在 `交接信息` 写最新验证结果（命令 + 结果）。
 
-> **当前结论（2026-09-19 回填，2026-10-22 静态复核校正）**：P0 组件已全部接入且 `build`/`test` 通过；**离线测试覆盖的 P0 缺口已收窄完毕**——`cargo test` 由 **7 passed** 提升至 **105 passed / 0 failed**（2026-10-22 静态复核实测 `#[test]`/`#[tokio::test]` 共 105 个，原记录 104），六处零测试模块（`state`/`store`/`snapshot`/`guard`/`distributed`/`sql`）均已补齐用例，并以 Java 侧 5 个测试类（实测 **148** 个 `@Test`）逐条对应。补测过程中发现并修复了 `MemoryClient`（内存 SQL 模拟器）一处**从未被触发的真实缺陷**（其 SQL 分派只认未加引号的 `AGENTSCOPE_SESSIONS`/`AGENTSCOPE_SNAPSHOTS`，而 `state.rs` 实际发出的是 schema 限定名 `"agentscope"."agentscope_sessions"`、`snapshot.rs` 支持自定义表名），详见 §4.1。剩余为锁 key 哈希跨语言一致性等 P2 待确认项，详见 §3.3 与 §4；2026-10-22 复核另发现 2 项 P1 语义偏差（`ensure_version_column` 的 `DEFAULT 0` vs Java `DEFAULT 1`、`save_if_version(0)` 缺 0→1 回退），见 §3.2 与文末静态复核记录。
+> **当前结论（2026-09-19 回填，2026-10-22 静态复核校正，2026-10-28 更新）**：P0 组件已全部接入且 `build`/`test` 通过。**最新实测（2026-10-28）`cargo test -p agentscope-extensions-postgresql` = 115 passed / 0 failed / 0 ignored**；**§3.2 的 4 项 P1 语义偏差已全部关闭**（`DEFAULT 1`、`save_if_version(0)` 0→1 回退、builder `create_if_not_exist` 默认 `true`、快照 `initSchema` 失败仅告警——后两项见 §8）。以下为历史快照：**离线测试覆盖的 P0 缺口已收窄完毕**——`cargo test` 由 **7 passed** 提升至 **105 passed / 0 failed**（2026-10-22 静态复核实测 `#[test]`/`#[tokio::test]` 共 105 个，原记录 104），六处零测试模块（`state`/`store`/`snapshot`/`guard`/`distributed`/`sql`）均已补齐用例，并以 Java 侧 5 个测试类（实测 **148** 个 `@Test`）逐条对应。补测过程中发现并修复了 `MemoryClient`（内存 SQL 模拟器）一处**从未被触发的真实缺陷**（其 SQL 分派只认未加引号的 `AGENTSCOPE_SESSIONS`/`AGENTSCOPE_SNAPSHOTS`，而 `state.rs` 实际发出的是 schema 限定名 `"agentscope"."agentscope_sessions"`、`snapshot.rs` 支持自定义表名），详见 §4.1。P2 待确认项见 §3.3 与 §4。
 
 ## 1. 模块概览
 | 项 | 内容 |
@@ -19,9 +19,9 @@
 | Java 子模块 | （单模块：`root` + `sandbox` / `snapshot` / `state` / `store` 四个子包） |
 | Java 规模（实测 2026-10-22） | 主代码 **1589** 行（**6** 个类）/ 测试 **1604** 行（**5** 个测试类，**148** 个 `@Test`） |
 | Rust crate | `crates/agentscope-extensions-postgresql` |
-| Rust 规模（实测 2026-10-22） | `src/` **12** 个文件 / **3722** 行（非空）/ **105** 个测试属性（`#[test]` 75 + `#[tokio::test]` 30，见 §3.1） |
+| Rust 规模（实测 2026-10-28） | `src/` **13** 个文件（新增 `murmur3.rs`）/ **115** 个测试属性（`#[test]` 84 + `#[tokio::test]` 31，见 §4.1） |
 | 迁移波次 | B |
-| 当前状态 | **已完成 P0 骨架/组件接线 + 离线测试覆盖（build 通过，105 passed / 0 failed）；剩余 P1 语义偏差 4 项见 §3.2，P2 待确认项见 §3.3、§4.2** |
+| 当前状态 | **已完成 P0 骨架/组件接线 + 离线测试覆盖（build 通过，115 passed / 0 failed）；P1 语义偏差 4 项已全部关闭（见 §3.2），剩余 P2 待确认项见 §3.3、§4.2** |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -68,10 +68,10 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | `supportsVersioning()` / `getVersioned()` | `state/PostgresAgentStateStore.java:258,300` | **已完成（设计决定，不迁移）** | **依据**：core `AgentStateStore` trait 无版本方法，故 `getVersioned` 降为固有 `version_of()`（返回 `PgResult<i64>`），`save_if_version`/`save_versioned` 为固有方法；版本语义保留并有 `save_if_version_cas_three_branches` 等测试覆盖（版本从 1 起、`0` 为仅创建、不匹配失败、`UNVERSIONED` 无条件写） |
-| `ensureVersionColumn()`（老表补 `version` 列迁移） | 同上 `:137` | **已完成（但默认值有偏差，见 §3.2 新增行）** | 实现于 `sql::ensure_version_column_ddl` + `state.rs` builder（`build()` 时无条件执行 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0`）；`MemoryClient` 模拟该 DDL 为 no-op，`state.rs` 测试断言其出现在 `execute_batch` 中（`builder_create_if_not_exist_provisions_schema_and_table`）。**注意：Java 该 ALTER 用 `DEFAULT 1`（源码有专门注释解释为何不能用 0），Rust 用 `DEFAULT 0`** |
-| `saveIfVersion(..., 0)` 的「0→1 回退」分支 | 同上 `:375-387` | **待办（P1，2026-10-22 复核新增）** | Java 在 `expectedVersion==0` 时先 `insertIfAbsent`，若返回 `UNVERSIONED`（行已存在）**再执行 `updateIfVersion(..., 0L)`**，把迁移后仍为 0 的旧行从 0 抬到 1；Rust `state.rs:310-328` 在 `DO NOTHING` 影响 0 行时**直接返回 `UNVERSIONED`**，缺少该回退。与上一条 `DEFAULT 0` 叠加后，`version=0` 的历史行会对 `save_if_version(...,0)` 永久报「幻影 CAS 冲突」（正是 Java 源码注释所警告的场景）。修复需两处同改 |
-| `Builder.createIfNotExist` 的**默认值** | 同上 `:799`（Java `private boolean createIfNotExist = true;`） | **待办（P1，2026-10-22 复核新增）** | Java `PostgresAgentStateStore.builder(ds).build()` **默认自动建 schema+表**（Java 构造器 `new PostgresAgentStateStore(ds)` 才默认 `false`，两者不一致）；Rust `PostgresAgentStateStoreBuilder`（`state.rs:53`）默认 `create_if_not_exist: false`，即 `builder(client).build()` 在 schema 缺失时直接报 `PostgresError::Schema`——**与 Java builder 语义相反**。Rust 现有测试 `build_without_auto_create_fails_when_schema_missing` 把该差异固化为「预期行为」。修复二选一：改默认值对齐 Java，或显式记为「设计决定（不迁移）」并说明理由 |
-| `initSchema()` 失败**仅告警不抛错** | `snapshot/PostgresRemoteSnapshotClient.java:61-78` | **待办（P1，2026-10-22 复核新增）** | Java `PostgresRemoteSnapshotClient.initSchema()` 捕获 `SQLException` 后只 `log.warn(...)`，构造仍成功（Java 用例 `initSchemaFailureIsLogged` 断言 `assertNotNull(new PostgresRemoteSnapshotClient(ds, true))`）；Rust `PostgresRemoteSnapshotClient::with_table`（`snapshot.rs:45-49`）在 `initialize_schema=true` 时把 DDL 失败**上抛为 `Error`**，`PostgresSnapshotSpec::new` 亦随之失败。行为偏差（Rust 更严格，但会阻断 Java 可用的构造路径）。Rust 测试注释已自认该差异但 tracker 未登记 |
+| `ensureVersionColumn()`（老表补 `version` 列迁移） | 同上 `:137` | **已完成（2026-10-22 实现，2026-10-28 复核确认）** | 实现于 `sql::ensure_version_column_ddl` + `state.rs` builder（`build()` 时无条件执行 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1`）；`MemoryClient` 模拟该 DDL 为 no-op，`state.rs` 测试断言其出现在 `execute_batch` 中（`builder_create_if_not_exist_provisions_schema_and_table`）。**`DEFAULT 0` 偏差已于提交 `789d04f` 修正为 `DEFAULT 1`**，与 Java 源码注释口径一致 |
+| `saveIfVersion(..., 0)` 的「0→1 回退」分支 | 同上 `:375-387` | **已完成（2026-10-22 实现，2026-10-28 复核确认）** | Java 在 `expectedVersion==0` 时先 `insertIfAbsent`，若返回 `UNVERSIONED` 则再 `updateIfVersion(..., 0L)` 把迁移后仍为 0 的旧行抬到 1。Rust `state.rs::save_if_version`（现 `:314-339`）在 `DO NOTHING` 影响 0 行时**不再直接返回 `UNVERSIONED`**，而是继续走通用 CAS 分支（`version = 0 -> 1`），对应用例 `save_if_version_zero_falls_back_to_cas_for_backfilled_row`（`:1015`）；与 `DEFAULT 1` 合计已消除「`version=0` 历史行对 `save_if_version(...,0)` 永久幻影冲突」 |
+| `Builder.createIfNotExist` 的**默认值** | 同上 `:799`（Java `private boolean createIfNotExist = true;`） | **已完成（2026-10-28）** | **已对齐 Java**：`state.rs` 的 `PostgresAgentStateStoreBuilder::new` 现默认 `create_if_not_exist: true`，故 `builder(client).build()` 在空库上自动 `CREATE SCHEMA/TABLE`（等价 Java builder），构造器语义的「只校验不建表」由显式 `create_if_not_exist(false)` 表达。新增用例 `builder_defaults_to_create_if_not_exist` / `builder_default_auto_create_applies_to_custom_schema`；三个旧断言 `build_without_auto_create_fails_when_schema_missing` / `_table_missing` / `build_succeeds_when_schema_and_table_already_exist` 补 `create_if_not_exist(false)`（它们是 Java **构造器**默认（false）的等价用例，原写法的隐含默认已不存在，断言本身未放宽）。同类字段核对：`PostgresStoreBuilder::initialize_schema` 默认 `false` ↔ Java `PostgresBaseStore.Builder.initializeSchema`（`private boolean initializeSchema;`）一致；guard builder 无此类字段；快照为显式构造参数 |
+| `initSchema()` 失败**仅告警不抛错** | `snapshot/PostgresRemoteSnapshotClient.java:61-78` | **已完成（2026-10-28）** | **已对齐 Java**：`snapshot.rs::with_table` 在 `initialize_schema=true` 时改为 `if let Err(e) = ... { tracing::warn!(table, error = %e, "failed to initialize snapshot table; ...") }`，构造不再上抛（`PostgresSnapshotSpec::new` / `postgres_snapshot_spec*` 随之可用），并保留底层 message（`error = %e`）。新增用例 `constructor_tolerates_schema_init_failure`（DDL 失败的 fake client 下 4 条构造路径均成功、表名校验仍生效）。**刻意不一刀切**：`state` 的 `CREATE SCHEMA/TABLE` 与 `ensureVersionColumn`（Java `:155-186`/`:137-153` 均 `throw RuntimeException`）、`store` 的 `initializeSchema`（Java `PostgresBaseStore:175-188` `throw IllegalStateException`）、以及显式函数 `initialize_snapshot_table`（无条件上抛，用例 `explicit_initialize_helper_still_reports_failures`）保持上抛——Java 侧只有 snapshot 构造器这一处只告警 |
 | Java 用例的**未覆盖清单**（147 个 `@Test` 中 53 个无 Rust 对应用例） | 见 §3.2 末「Java→Rust 用例覆盖差异」 | **待办（P2）** | 缺口集中在三类，均属 **Java 侧 Mockito 专属**（Rust 无 mock 框架，等价覆盖已由 trait fake 承担）：① **SQL 失败路径**（`getThrowsWhenSqlFails` / `putThrowsWhenSqlFails` / `deleteThrowsWhenSqlFails` / `searchThrowsWhenSqlFails` / `uploadThrowsWhenSqlFails` / `downloadThrowsWhenSqlFails` / `existsThrowsWhenSqlFails` / `saveListThrowsWhenSqlFails` 等，Rust 侧仅 `state.rs` 有 `query_failures_surface_through_inherent_methods` / `truncate_propagates_sql_errors` / `build_propagates_batch_failures` 少量覆盖，`store`/`snapshot`/`guard` 缺）；② **JDBC 异常包装细节**（`getPropagatesResultSetCloseFailure` / `tryEnterPropagatesResultSetCloseFailure` / `tryEnterHandlesInnerSQLExceptionAndCloseFailure` / `leaseCloseHandlesConnectionCloseFailure` / `rollbackFailureIsAddedAsSuppressed`）；③ **null 参数拒绝**（`uploadRejectsNullData` / `existsRejectsNullSnapshotId` / `namespaceSegmentCannotBeNull` / `rejectsNullDataSourceInConstructor`）。另有 **Java 事务语义未迁移**（`executeInWriteTransactionRollsBackOnException` / `executeInWriteTransactionKeepsAutoCommitWhenAlreadyDisabled`）——Rust `PostgresClient` seam 无事务抽象，`state.rs` 的多语句写为**非原子**（`save_list_sync` 的 delete+insert+hash 三步无事务保护），与 Java `executeInWriteTransaction` 不同 |
 | `verifySchemaExists()` / `verifyTableExists()`（`INFORMATION_SCHEMA` 校验） | 同上 `:183,203` | **已完成** | 实现于 `sql::{SCHEMA_EXISTS_QUERY, TABLE_EXISTS_QUERY}` + `state.rs::{verify_schema_exists, verify_table_exists}`：`create_if_not_exist=false` 时先查 schema 再查 table，缺失报 `PostgresError::Schema`、查询失败报 `PostgresError::Query`；测试 `build_without_auto_create_fails_when_schema_missing` / `_table_missing` / `build_succeeds_when_schema_and_table_already_exist` 覆盖 |
 | `getDataSource()` / `close()` | 同上 `:701,737` | **已完成（设计决定，不迁移）** | **依据**：Rust 无连接所有权（client 为 `Arc<dyn PostgresClient>`，由调用方持有并管理生命周期），无 `close` 语义可迁 |
@@ -88,14 +88,18 @@
 | `tracing` 埋点缺失 | Java 侧实测日志点：`PostgresSandboxExecutionGuard` 7 处（acquire/release/close 失败等 `log.debug`/`log.warn`）、`PostgresRemoteSnapshotClient` 1 处（initSchema 失败 `log.warn`）、`PostgresBaseStore` 1 处（`LOG.debug` build）；`PostgresAgentStateStore` / `PostgresSnapshotSpec` / `PostgresDistributedStore` **无日志**。Rust 侧仅 2 处：`driver.rs:47`（连接错误）、`store.rs:217`（`put_if_version` insert 失败） | 待办 |
 | `memory::MemoryClient` 未门控 | 测试替身现为 `pub mod memory` + re-export，进入生产 API；MySQL 侧放在 `testing.rs` 子模块（`src/{state,store,snapshot,guard}/testing.rs`） | 待办（P2；若加门控需同步迁移全部测试与 `lib.rs` re-export） |
 | 组合者形态偏差 | EXTENSIONS_GAP_TRACKER §2.1 建议「字段式追加 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` + 自建 builder」；本 crate 改为「持有 `client` + 工厂方法」，且未暴露 `isolation_scope`。功能等价但形态不一致 | **待确认** |
-| `PostgresDistributedStore` 缺 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` 的**投影入口** | Java `PostgresDistributedStore` 直接 `implements DistributedStore`（4 个方法全部暴露给 harness）；Rust `distributed_store()` 只输出 harness `DistributedStore{agent_state_store, isolation_scope}`（`distributed.rs:81-87`），其余 3 个组件需调用方自行 `store.base_store()` 等工厂方法，**harness `SandboxManager` 无法自动取到 PG guard** | **待确认**（依赖 harness `DistributedStore` 扩字段，见 EXTENSIONS_GAP_TRACKER §2.2「已裁定不改 harness」） |
+| `PostgresDistributedStore` 缺 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` 的**投影入口** | Java `PostgresDistributedStore` 直接 `implements DistributedStore`（4 个方法全部暴露给 harness）；Rust `distributed_store()` 只输出 harness `DistributedStore{agent_state_store, isolation_scope}`（`distributed.rs:81-87`），其余 3 个组件需调用方自行 `store.base_store()` 等工厂方法，**harness `SandboxManager` 无法自动取到 PG guard** | **已解决（2026-10-28）**：harness `DistributedStore` 已增 `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard` 三槽 + `SandboxGuard` trait，`distributed_store()` 用 builder 填满 5 槽，`PostgresSandboxExecutionGuard` 已 `impl SandboxGuard`（详见 §2026-10-28 执行记录） |
 | 真实 PostgreSQL 集成测试 | 需真实实例（Java 侧用 H2 近 PG 方言离线跑）；当前仅内存模拟器 | 待办（环境受限） |
 | `error.rs::to_core` / `PostgresError::CasFailed` / `DriverUnavailable` 为**死代码** | `to_core`（`error.rs:46`）全 crate 无调用；`PostgresError::CasFailed` / `DriverUnavailable` 变体**从未被构造**（实测引用数 0）。Java 侧对应 `IllegalStateException("PostgresBaseStore putIfVersion (update) failed")` 是**抛出**语义，Rust 侧改为返回 `false`，故 `CasFailed` 无用 | 待办（P2，清理或补齐） |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 - **状态**：`crates/agentscope-extensions-postgresql/` 的 P0 组件已全部落地并接线；**离线测试覆盖 P0 缺口已补齐**，编译与全部测试通过。
-- **验证命令与结果（2026-09-19，本会话实测）**：
+- **验证命令与结果（2026-10-28，本轮实测）**：
+  - `cargo build -p agentscope-extensions-postgresql` → **通过**（EXIT=0；仍仅 2 个既有警告：`error.rs::to_core` dead_code、`memory.rs::SessionRow::created_at` 未读）
+  - `cargo test -p agentscope-extensions-postgresql` → **115 passed / 0 failed / 0 ignored**（EXIT=0；0 doc-tests）。分布：`sql` 19、`state` 37（15 `#[test]` + 22 `#[tokio::test]`）、`store` 19、`snapshot` 16（10 + 6）、`guard` 11、`distributed` 8（5 + 3）、`murmur3` 5 → 合计 **115**（`#[test]` 84 + `#[tokio::test]` 31）。基线（本轮开工前）为 **111 passed**，本次 +4 用例
+  - 全部测试离线：`MemoryClient` / trait fake（`FailingClient`、`BatchOkQueryFailClient`、`TruncateFailClient`、`DdlFailClient`），无真实数据库、无网络、无 `#[ignore]`
+- **验证命令与结果（2026-09-19，历史记录）**：
   - `cargo build -p agentscope-extensions-postgresql` → **通过**（exit 0；仅 2 个既有警告：`error.rs::to_core` dead_code、`memory.rs::SessionRow::created_at` 未读，均非本次新增）
   - `cargo test -p agentscope-extensions-postgresql` → **104 passed / 0 failed / 0 ignored**（+ 0 doc-tests）；用例数 **7 → 104**。分布：`sql` 19、`state` 33、`store` 19、`snapshot` 14、`guard` 11、`distributed` 8（合计 104；含 `#[tokio::test]` 异步用例）
   - 全部测试离线：后端为 `MemoryClient`（内存 SQL 模拟器）/ trait fake（`FailingClient`、`BatchOkQueryFailClient`、`TruncateFailClient`），**无真实数据库、无网络调用、无 `#[ignore]`**
@@ -105,14 +109,14 @@
 - **架构要点**：全部 SQL 经同步 `PostgresClient` seam；async trait（`AgentStateStore`、`RemoteSnapshotClient`）由 `blocking::query_async`（`spawn_blocking`）桥接；同步 `BaseStore` 直接调用 client。故**无真实数据库也能编译与测试**。
 - **复用契约（对齐 EXTENSIONS_GAP_TRACKER §2.1，未新建公共 store crate）**：`impl agentscope_core::state::AgentStateStore`（`state.rs:446`）、`impl agentscope_harness::filesystem::BaseStore`（`store.rs:130`）、`impl agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient`（`snapshot.rs:63`）、`impl SandboxSnapshotSpec`（`snapshot.rs:158`）；harness `DistributedStore` 仅取 `agent_state_store` + `isolation_scope`（见 §4.2）。
 - **B 波次统一产出契约核对（5/5 全部存在且接线）**：`PostgresDistributedStore`（`distributed.rs:26`，工厂 `agent_state_store`/`base_store`/`snapshot_client`/`snapshot_spec`/`sandbox_execution_guard` + `distributed_store()`）、`PostgresAgentStateStore`（`state.rs:130`）、`PostgresStore`（`store.rs:80`，`impl BaseStore`）、`PostgresSnapshotSpec`（`snapshot.rs:139`，`impl SandboxSnapshotSpec`）、`PostgresSandboxExecutionGuard`（`guard.rs:77`）——**5 个类型均存在、均已 re-export 到 crate 根**（`lib.rs:34-50`），且 `lib.rs` 头部文档已逐条列出。
-- **已知问题**：离线测试覆盖 P0 缺口已关闭（§3.1）；剩余为 **P1 语义偏差 4 项**（`DEFAULT 0` vs `DEFAULT 1`、`save_if_version(0)` 缺 0→1 回退、builder `create_if_not_exist` 默认值相反、快照 `initSchema` 失败上抛 vs 告警）与 P2——锁 key 哈希与 advisory lock 连接语义待确认、`tracing` 埋点缺失、`memory::MemoryClient` 未门控、组合者形态偏差、Java 事务语义未迁移（§3.2 / §3.3）。
+- **已知问题**：离线测试覆盖 P0 缺口已关闭（§3.1）；**P1 语义偏差 4 项已全部关闭**（`DEFAULT 1`、`save_if_version(0)` 0→1 回退、builder `create_if_not_exist` 默认 `true`、快照 `initSchema` 失败仅告警——见 §3.2 与 §7）。剩余为 P2：锁 key 哈希（已改 MurmurHash3，跨语言取值空间仍需真实实例验证）、advisory lock 连接语义待确认、`tracing` 埋点缺失、`memory::MemoryClient` 未门控、组合者形态偏差、Java 事务语义未迁移（§3.2 / §3.3）。
 
 ### 4.2 下一步与阻塞
 1. ~~**P0（本模块内，最优先）**：补齐离线单元测试~~ → **已完成**（2026-09-19，7 → 104 passed；2026-10-22 静态复核实测 **105** 个测试属性）。后续测试可继续下沉到 §3.3 的 advisory lock 连接池语义与真实驱动路径（需环境）。
 2. **跨模块需求（不改 harness）**：harness `SandboxExecutionGuard` 是**具体 struct 而非 trait**（`crates/agentscope-harness/src/agent/sandbox/guard.rs:13`），本 crate 无法 `impl`，只能提供镜像类型的 `PostgresSandboxExecutionGuard`（`try_enter`/`release`），**无法直接接入 harness `SandboxManager`**（后者接受具体 `SandboxExecutionGuard`）。若后续 harness 将 guard 抽为 trait，本 crate 可补 `impl`。记入此处由汇总方评估。
 3. **harness `DistributedStore` 字段不足**：已按 EXTENSIONS_GAP_TRACKER §2.1 裁定「不改 harness」，本 crate `distributed_store()` 仅携带 `agent_state_store`；`base_store`/`snapshot_spec`/`guard` 以独立工厂方法暴露。是否需扩展 harness 组合包仍待汇总方。
-4. **待确认**：锁 key 哈希（`DefaultHasher` vs Java MurmurHash3）跨语言一致性；advisory lock 在共享连接/连接池下的归属与释放语义；真实 PostgreSQL 集成测试环境。
-5. ~~**P1**：老表 `version` 列迁移（`ensureVersionColumn` 等价）与 `INFORMATION_SCHEMA` 存在性校验（`verifySchemaExists`/`verifyTableExists`）尚未迁移。~~ → **已完成**（两项均已迁移，见 §3.2）。**但复核另发现 4 项 P1 语义偏差待处理**（`DEFAULT 0` vs `DEFAULT 1`、`save_if_version(0)` 缺 0→1 回退、builder `create_if_not_exist` 默认值相反、快照 `initSchema` 失败上抛 vs 告警）。
+4. **待确认**：~~锁 key 哈希（`DefaultHasher` vs Java MurmurHash3）跨语言一致性~~ → **已改为 MurmurHash3 x64_128 并与 Java 金标向量对齐（§7 裁定 6）**，剩余为混部实机验证；advisory lock 在共享连接/连接池下的归属与释放语义；真实 PostgreSQL 集成测试环境。
+5. ~~**P1**：老表 `version` 列迁移（`ensureVersionColumn` 等价）与 `INFORMATION_SCHEMA` 存在性校验（`verifySchemaExists`/`verifyTableExists`）尚未迁移。~~ → **已完成**（两项均已迁移，见 §3.2）。~~复核另发现 4 项 P1 语义偏差待处理~~ → **4 项 P1 已全部关闭（2026-10-28）**：`DEFAULT 1` 与 `save_if_version(0)` 0→1 回退见 §7，builder `create_if_not_exist` 默认 `true` 与快照 `initSchema` 仅告警见 §8。
 6. **P2（2026-10-22 复核新增）**：Java 侧 147 个 `@Test` 中 **53 个无 Rust 对应用例**（集中于 SQL 失败路径 / JDBC 异常包装 / null 参数拒绝，详见 §3.2 末行）；Java `executeInWriteTransaction` 的**事务原子性未迁移**（Rust `save_list_sync` 的 delete+insert+hash 三步为非原子）。
 
 ## 5. 执行约定（所有会话必须遵守）
@@ -244,8 +248,8 @@
 
 ### 7.2 仍待办
 
-- **P1-3** builder `create_if_not_exist` 默认值与 Java **相反**（Java `true` / Rust `false`）→ 按 Java 写法迁移的调用方会直接构建失败。
-- **P1-4** 快照 `initSchema` 失败：Java 仅告警，Rust 上抛阻断构造路径。
+- **P1-3** builder `create_if_not_exist` 默认值与 Java **相反**（Java `true` / Rust `false`）→ 按 Java 写法迁移的调用方会直接构建失败。**（2026-10-28 已关闭，见 §8）**
+- **P1-4** 快照 `initSchema` 失败：Java 仅告警，Rust 上抛阻断构造路径。**（2026-10-28 已关闭，见 §8）**
 - **P2**：53 个 Java 用例未覆盖、`executeInWriteTransaction` 事务原子性未迁移、advisory lock 单会话归属、`CasFailed`/`DriverUnavailable`/`to_core` 死代码。
 
 ### 7.3 实施踩坑（供后续参考）
@@ -259,3 +263,79 @@
 - **约束 2（禁止）**：**不得让 Java 与 Rust 混部共享同一份带 list 的状态**。否则每次写入都退化为全量重写：功能正确，但增量优化完全失效（性能退化）。
 - **触发条件**：若未来确需混部，再实现 Java `String.hashCode()` 的 32 位截断语义，并在两侧加交叉校验用例。
 - **红线**：不要为了让两侧相等而改 `compute_hash` 的算法——那会让**已落库**的 hash 全部失配，触发一次性全量重写风暴。
+
+## 8. 2026-10-28 执行记录（关闭 P1-3 / P1-4）
+
+### 8.1 改动文件
+- `crates/agentscope-extensions-postgresql/src/state.rs`：`PostgresAgentStateStoreBuilder::new` 的 `create_if_not_exist` 默认值 `false` → **`true`**（对齐 Java `PostgresAgentStateStore.Builder.createIfNotExist = true`），并在 builder 文档中写明 Java 两个入口的差异（构造器 false / builder true）。
+- `crates/agentscope-extensions-postgresql/src/snapshot.rs`：`PostgresRemoteSnapshotClient::with_table` 在 `initialize_schema=true` 时，DDL 失败由 `?` 上抛改为 `tracing::warn!(table, error = %e, ...)` 后继续（对齐 Java `initSchema()` 只 `log.warn`），并保留底层 message。
+
+### 8.2 断言同步（旧期望被证伪，非放宽）
+| 用例 | 原写法 | 现写法 | 理由 |
+|---|---|---|---|
+| `state::tests::build_without_auto_create_fails_when_schema_missing` | `builder(c).build()` 期望 `PostgresError::Schema` | 显式 `.create_if_not_exist(false)` | 原断言编码的是「builder 默认 false」这一**错误默认值**；用例语义对应 Java **构造器** `new PostgresAgentStateStore(ds)`（默认 false），改为显式关闭自动建表后断言强度不变 |
+| `state::tests::build_without_auto_create_fails_when_table_missing` | 同上 | 同上 | 同上 |
+| `state::tests::build_succeeds_when_schema_and_table_already_exist` | `builder(c).build()`（隐含走 INFORMATION_SCHEMA 校验） | 显式 `.create_if_not_exist(false)` | 该用例意在覆盖 `verify_schema_exists` / `verify_table_exists` 两条探针；默认改 `true` 后会走 DDL 分支而不触发探针，故显式关闭以保住覆盖目标 |
+| `snapshot::tests::initialize_snapshot_table_is_idempotent` 的注释 | 注明「Rust 构造器上抛、差异未登记」 | 「构造器不再上抛，本用例固定显式 helper 的幂等路径」 | 行为已对齐，注释同步 |
+
+无删除用例、无 `#[ignore]`、无断言放宽。
+
+### 8.3 新增用例（先失败后通过）
+| 用例 | 断言 |
+|---|---|
+| `state::tests::builder_defaults_to_create_if_not_exist` | 空库上 `builder(c).build()` 成功，`has_schema` / `has_table` 为真且 DDL 含 `CREATE TABLE IF NOT EXISTS` |
+| `state::tests::builder_default_auto_create_applies_to_custom_schema` | 只改 schema/table 名（不显式开自动建表）也能建成 |
+| `snapshot::tests::constructor_tolerates_schema_init_failure` | DDL 全失败的 fake client（`DdlFailClient`）下，`new` / `with_table` / `postgres_snapshot_spec` / `PostgresSnapshotSpec::new` 四条构造路径均 `Ok` 且 `build("snap-1")` 可用；非法表名仍 `Err` |
+| `snapshot::tests::explicit_initialize_helper_still_reports_failures` | 显式 `initialize_snapshot_table` 仍上抛 `PostgresError::Query`（含底层 message），防「一刀切」回归 |
+
+### 8.4 验证
+- `cargo build -p agentscope-extensions-postgresql` → **EXIT=0**（仅 2 个既有 dead_code 警告）。
+- `cargo test -p agentscope-extensions-postgresql` → **115 passed / 0 failed / 0 ignored**（EXIT=0；开工前基线 111 passed）。
+- 反向验证 1：`create_if_not_exist` 默认值回退为 `false` → `cargo test -p agentscope-extensions-postgresql builder_default` = **2 failed**（`builder_defaults_to_create_if_not_exist`、`builder_default_auto_create_applies_to_custom_schema`），EXIT=101；恢复后转绿。
+- 反向验证 2：`snapshot.rs` 的 warn 分支回退为 `map_err(Error::from)?` → `cargo test -p agentscope-extensions-postgresql snapshot::tests` = **1 failed**（`constructor_tolerates_schema_init_failure`，`snapshot.rs:325` panic），EXIT=101；恢复后转绿。
+
+### 8.5 逐个对照 Java 的结论（未一刀切）
+| 初始化点 | Java 失败处理 | Rust 处理 | 结论 |
+|---|---|---|---|
+| `PostgresRemoteSnapshotClient.initSchema()` | `catch (SQLException) { log.warn }`（`:61-78`） | `tracing::warn!` + 继续 | **本次改为一致** |
+| `PostgresAgentStateStore.createSchemaIfNotExist` / `createTableIfNotExist` / `ensureVersionColumn` | `throw RuntimeException`（`:155-186` / `:137-153`） | `?` 上抛 | 本就一致，未改 |
+| `PostgresBaseStore.initializeSchema()` | `throw IllegalStateException`（`:175-188`） | `?` 上抛 | 本就一致，未改 |
+| builder 默认值：`PostgresBaseStore.Builder.initializeSchema` | `false`（`:392`） | `false` | 一致，未改 |
+| builder 默认值：`PostgresSandboxExecutionGuard.Builder` | 无此类字段 | 无 | 不适用 |
+
+### 8.6 未完成 / 需裁定
+- P2 维持不变：53 个 Java 用例未覆盖、`executeInWriteTransaction` 事务原子性未迁移、advisory lock 单会话归属、`CasFailed` / `DriverUnavailable` / `to_core` 死代码、`memory::MemoryClient` 未门控、组合者形态偏差、`tracing` 埋点仍缺（guard 7 处 / store 1 处 Java 日志点）。
+- 需裁定：`PostgresSnapshotSpec::new` 无法感知 DDL 失败（Java 同样无法感知）；若上层要求「建表失败即启动失败」，需显式调用本 crate 的 `initialize_snapshot_table`。
+
+## 2026-10-28 执行记录：`DistributedStore` 复合槽位投影（§4.2 已解决）
+
+### 背景
+
+harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`）与 `SandboxGuard` trait。本 crate 的 `distributed_store()` 改为 builder 写法并接线全部槽位。
+
+### 投影映射表
+
+| harness 槽位 | 类型 | 来源 | 说明 |
+|---|---|---|---|
+| `agent_state_store` | `Arc<dyn AgentStateStore>` | `Arc::new(self.agent_state_store()?)` | `create_if_not_exist(true)` |
+| `isolation_scope` | `IsolationScope` | 未设置（builder 默认） | 由调用方在 `HarnessAgent` 侧覆盖 |
+| `base_store` | `Arc<dyn BaseStore>` | `Arc::new(self.base_store()?)`（`PostgresStore`） | 建表失败会以 `PgResult` 上抛 |
+| `sandbox_snapshot_spec` | `Arc<dyn SandboxSnapshotSpec>` | `Arc::new(self.snapshot_spec()?)`（`PostgresSnapshotSpec`） | 包装 harness `RemoteSnapshotSpec` |
+| `sandbox_execution_guard` | `Arc<dyn SandboxGuard>` | `Arc::new(self.sandbox_execution_guard())` | advisory lock；新增 `impl SandboxGuard` |
+
+### 代码改动
+
+- `src/distributed.rs::distributed_store()`：填满 5 槽（builder，不用 `..Default::default()`）。
+- `src/guard.rs`：新增私有字段 `trait_leases: Arc<Mutex<HashMap<SandboxIsolationKey, Vec<PostgresSandboxLease>>>>` + `impl SandboxGuard`。
+  - `try_enter` 超时降级为 `SandboxLease::noop()`（与 JDBC guard 一致）。
+  - `is_held`：PG guard 固有 API 无 `is_held`（advisory lock 是会话级、无查询接口），trait 侧返回**本 guard 是否仍持有该 key 的租约**（已在源码注明，属薄适配差异）。
+  - `release`：优先 drop 具体租约（`Drop` 内 `pg_advisory_unlock`）；无租约时回退按 `compose_lock_key(key)` 解锁。
+- 测试：`src/distributed.rs::distributed_store_projects_all_components`（原 `..._projects_agent_state_store_only` 已替换并加强断言）。
+
+### 验证
+
+`cargo test -p agentscope-extensions-postgresql` → **115 passed / 0 failed**。
+
+### 未完成 / 语义差异
+
+- 无留空槽位；`is_held` 为本地视图（非跨进程查询），与 Java 无对应方法（Java 侧也没有 `isHeld`）。

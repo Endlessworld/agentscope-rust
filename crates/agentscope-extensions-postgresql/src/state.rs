@@ -36,6 +36,12 @@ pub const MAX_SESSION_ID_LENGTH: usize = 255;
 pub const ANON_USER: &str = "__anon__";
 
 /// Builder for [`PostgresAgentStateStore`].
+///
+/// `create_if_not_exist` defaults to `true`, matching the Java
+/// `PostgresAgentStateStore.Builder` (`private boolean createIfNotExist = true;`), so a bare
+/// `PostgresAgentStateStore::builder(client).build()` provisions the schema and table. Use
+/// [`PostgresAgentStateStoreBuilder::create_if_not_exist(false)`] for the verifying, no-DDL
+/// path — that is what the Java `new PostgresAgentStateStore(dataSource)` constructor does.
 #[derive(Debug, Clone)]
 pub struct PostgresAgentStateStoreBuilder {
     client: Arc<dyn PostgresClient>,
@@ -50,7 +56,9 @@ impl PostgresAgentStateStoreBuilder {
             client,
             schema: DEFAULT_SCHEMA_NAME.to_string(),
             table: DEFAULT_TABLE_NAME.to_string(),
-            create_if_not_exist: false,
+            // Java `Builder.createIfNotExist` defaults to `true`; keep the same default so a
+            // straight port of `PostgresAgentStateStore.builder(ds).build()` keeps working.
+            create_if_not_exist: true,
         }
     }
 
@@ -705,10 +713,18 @@ mod tests {
 
     // Java: PostgresAgentStateStoreTest#constructorDefaultsDoNotAutoCreate,
     //       #verifySchemaMissingThrows
+    //
+    // NOTE: Java has two entry points with *different* defaults — the constructor
+    // `new PostgresAgentStateStore(ds)` is `createIfNotExist = false` (this test), while
+    // `builder(ds).build()` is `true` (see `builder_defaults_to_create_if_not_exist`).
+    // The explicit `create_if_not_exist(false)` reproduces the constructor's default.
     #[test]
     fn build_without_auto_create_fails_when_schema_missing() {
         let c = client();
-        let err = PostgresAgentStateStore::builder(c).build().unwrap_err();
+        let err = PostgresAgentStateStore::builder(c)
+            .create_if_not_exist(false)
+            .build()
+            .unwrap_err();
         assert!(matches!(err, PostgresError::Schema(_)));
     }
 
@@ -718,7 +734,10 @@ mod tests {
         let c = client();
         c.execute_batch("CREATE SCHEMA IF NOT EXISTS \"agentscope\"")
             .unwrap();
-        let err = PostgresAgentStateStore::builder(c).build().unwrap_err();
+        let err = PostgresAgentStateStore::builder(c)
+            .create_if_not_exist(false)
+            .build()
+            .unwrap_err();
         assert!(matches!(err, PostgresError::Schema(_)));
     }
 
@@ -728,10 +747,50 @@ mod tests {
     fn build_succeeds_when_schema_and_table_already_exist() {
         let c = client();
         let _ = store(&c);
-        let s = PostgresAgentStateStore::builder(c).build().unwrap();
+        let s = PostgresAgentStateStore::builder(c)
+            .create_if_not_exist(false)
+            .build()
+            .unwrap();
         assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
         assert!(SCHEMA_EXISTS_QUERY.contains("INFORMATION_SCHEMA.SCHEMATA"));
         assert!(TABLE_EXISTS_QUERY.contains("INFORMATION_SCHEMA.TABLES"));
+    }
+
+    // Java: PostgresAgentStateStoreTest#builderWithDefaultsCreatesStore
+    // (`private boolean createIfNotExist = true;` in Java's Builder): a bare
+    // `builder(client).build()` must provision the schema + table instead of failing with
+    // `PostgresError::Schema` when the database is empty.
+    #[test]
+    fn builder_defaults_to_create_if_not_exist() {
+        let c = client();
+        assert!(!c.has_schema(DEFAULT_SCHEMA_NAME));
+        let s = PostgresAgentStateStore::builder(c.clone()).build().unwrap();
+        assert_eq!(s.schema_name(), DEFAULT_SCHEMA_NAME);
+        assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
+        assert!(c.has_schema(DEFAULT_SCHEMA_NAME));
+        assert!(c.has_table(DEFAULT_TABLE_NAME));
+        assert!(c
+            .ddl_statements()
+            .iter()
+            .any(|s| s.contains("CREATE TABLE IF NOT EXISTS")));
+    }
+
+    // Java: PostgresAgentStateStoreTest#builderWithDefaultsCreatesStore (custom schema,
+    // default auto-create): only the names are overridden, so the schema must still be
+    // provisioned without an explicit `create_if_not_exist(true)`.
+    #[test]
+    fn builder_default_auto_create_applies_to_custom_schema() {
+        let c = client();
+        let s = PostgresAgentStateStore::builder(c.clone())
+            .schema("custom_schema")
+            .unwrap()
+            .table("custom_sessions")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(s.schema_name(), "custom_schema");
+        assert!(c.has_schema("custom_schema"));
+        assert!(c.has_table("custom_sessions"));
     }
 
     // ---- single-value operations -------------------------------------------

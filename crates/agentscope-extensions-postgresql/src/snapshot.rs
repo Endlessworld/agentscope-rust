@@ -35,6 +35,11 @@ impl PostgresRemoteSnapshotClient {
     }
 
     /// Creates a client over a named table, optionally creating it.
+    ///
+    /// A failing `initialize_schema` DDL is logged and swallowed, mirroring the Java
+    /// `initSchema()` (which catches `SQLException` and only calls `log.warn`): the caller keeps
+    /// a usable client even when it lacks DDL privileges or the table is owned elsewhere. Only
+    /// identifier validation still fails here.
     pub fn with_table(
         client: Arc<dyn PostgresClient>,
         table: &str,
@@ -43,9 +48,16 @@ impl PostgresRemoteSnapshotClient {
         let table = validate_identifier(table, "tableName").map_err(Error::from)?;
         let full_table = qualified_table(None, &table);
         if initialize_schema {
-            client
-                .execute_batch(&snapshots_ddl(&full_table))
-                .map_err(Error::from)?;
+            // Mirrors the Java `initSchema()`: the DDL failure is logged and swallowed so the
+            // constructor still succeeds (Java catches `SQLException` and only warns). The
+            // underlying error message is kept as the `error` field.
+            if let Err(e) = client.execute_batch(&snapshots_ddl(&full_table)) {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "failed to initialize snapshot table; continuing without DDL"
+                );
+            }
         }
         Ok(Self {
             client,
@@ -194,6 +206,33 @@ mod tests {
         PostgresRemoteSnapshotClient::new(c.clone(), init).unwrap()
     }
 
+    /// A client whose DDL batch always fails, mirroring the Java mock whose
+    /// `Statement.execute` throws `SQLException` in `initSchemaFailureIsLogged`.
+    #[derive(Debug, Default)]
+    struct DdlFailClient {
+        batch_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DdlFailClient {
+        fn batch_attempts(&self) -> usize {
+            self.batch_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl PostgresClient for DdlFailClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> crate::error::PgResult<QueryOutcome> {
+            Err(PostgresError::Query("boom".into()))
+        }
+        fn execute_batch(&self, _sql: &str) -> crate::error::PgResult<()> {
+            self.batch_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(PostgresError::Query(
+                "boom: permission denied for CREATE TABLE".into(),
+            ))
+        }
+    }
+
     // Java: PostgresRemoteSnapshotClientTest#constructorWithDefaultTableInitializesSchema
     #[test]
     fn constructor_initializes_default_table() {
@@ -284,8 +323,58 @@ mod tests {
         assert!(r.exists("snap-1").await.unwrap());
     }
 
-    // Java: PostgresRemoteSnapshotClientTest#initSchemaFailureIsLogged (Java tolerates init
-    // failure; the Rust constructor propagates it — see the gap tracker §4.2).
+    // Java: PostgresRemoteSnapshotClientTest#initSchemaFailureIsLogged — the Java constructor
+    // only logs the failed DDL (`catch (SQLException e) { log.warn(...) }`) and stays usable,
+    // so a client whose `CREATE TABLE` fails must still construct successfully.
+    #[test]
+    fn constructor_tolerates_schema_init_failure() {
+        let failing = Arc::new(DdlFailClient::default());
+        let r = PostgresRemoteSnapshotClient::new(failing.clone(), true)
+            .expect("initSchema failure must be logged, not propagated");
+        assert_eq!(r.table_name(), DEFAULT_TABLE);
+        assert_eq!(failing.batch_attempts(), 1);
+
+        // Custom table + the spec helpers share the same constructor, so they tolerate it too.
+        let failing = Arc::new(DdlFailClient::default());
+        let custom = PostgresRemoteSnapshotClient::with_table(failing.clone(), "custom_snap", true)
+            .expect("custom table init failure must be logged, not propagated");
+        assert_eq!(custom.table_name(), "custom_snap");
+        assert_eq!(failing.batch_attempts(), 1);
+
+        let spec = postgres_snapshot_spec(Arc::new(DdlFailClient::default()), true)
+            .expect("spec construction must tolerate the initSchema failure");
+        assert!(spec.build("snap-1").is_ok());
+        let wrapped = PostgresSnapshotSpec::new(Arc::new(DdlFailClient::default()))
+            .expect("PostgresSnapshotSpec must tolerate the initSchema failure");
+        assert!(wrapped.inner().build("snap-1").is_ok());
+
+        // Identifier validation still fails loudly (it is not a DDL failure).
+        assert!(PostgresRemoteSnapshotClient::with_table(
+            Arc::new(DdlFailClient::default()),
+            "bad name",
+            true
+        )
+        .is_err());
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#initSchemaFailureIsLogged + the explicit
+    // `initialize_snapshot_table` helper stays strict: it is the direct analogue of the Java
+    // `initializeSchema()` DDL call (Java `PostgresBaseStore.initializeSchema` throws), so a
+    // caller that asked for initialization still sees the error.
+    #[test]
+    fn explicit_initialize_helper_still_reports_failures() {
+        let failing = Arc::new(DdlFailClient::default());
+        let handle = tokio::runtime::Runtime::new().unwrap();
+        let err = handle
+            .block_on(initialize_snapshot_table(failing.clone(), DEFAULT_TABLE))
+            .unwrap_err();
+        assert!(matches!(err, PostgresError::Query(_)));
+        assert!(err.to_string().contains("boom"));
+        assert_eq!(failing.batch_attempts(), 1);
+    }
+
+    // Java: PostgresRemoteSnapshotClientTest#initSchemaFailureIsLogged (the constructor no
+    // longer propagates, so this test pins the idempotent helper path).
     #[test]
     fn initialize_snapshot_table_is_idempotent() {
         let c = client();
