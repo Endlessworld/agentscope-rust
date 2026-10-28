@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    pending_interactions, session_error, SessionEvent, SessionInbox, SessionLog, SessionProjection,
-    SessionTurns,
+    session_error, SessionEvent, SessionInbox, SessionLog, SessionProjection, SessionTurns,
 };
 use crate::message::{
     ContentBlock, MsgBuilder, MsgRole, TextBlock, ToolCallState, ToolResultBlock, ToolResultState,
@@ -102,7 +101,9 @@ async fn close_turn_locked(
 ) -> crate::error::Result<bool> {
     // Only the latest turn can be closed: an older turn has already been superseded, and
     // writing terminal facts for it would corrupt the projection's ordering assumptions.
-    let turns = SessionTurns::read(&**log).await?;
+    // Turns, projection and pending interactions come from one replay: closing a turn used to
+    // walk the whole prefix three times, on exactly the path a crashed session takes.
+    let (turns, projection, pending) = super::views::recovery_views(&**log).await?;
     let Some(latest) = turns.latest() else {
         // Nothing was ever admitted: there is no turn to close.
         return Ok(false);
@@ -118,7 +119,6 @@ async fn close_turn_locked(
         return Ok(false);
     }
 
-    let projection = SessionProjection::read(&**log).await?;
     if !projection.uncertain_tool_calls.is_empty() && !resolve_uncertain {
         return Err(session_error(
             "Reconcile uncertain tool outcomes before cancelling this interrupted turn",
@@ -128,7 +128,6 @@ async fn close_turn_locked(
         return Ok(false);
     };
 
-    let pending = pending_interactions(&**log).await?;
     let mut cancelled_ids = BTreeSet::new();
     let mut facts = Vec::new();
     let mut seq = projection.as_of_seq;
@@ -405,8 +404,8 @@ mod tests {
     use super::*;
     use crate::message::{Msg, ToolResultBlock};
     use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionRecorder,
-        SessionTurns,
+        pending_interactions, AtomicSessionStorage, JournalSessionLog, MemorySessionStorage,
+        SessionRecorder, SessionTurns,
     };
 
     fn journal() -> Arc<dyn SessionLog> {

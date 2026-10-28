@@ -109,25 +109,41 @@ impl SessionLogExporter {
 
     /// Delivers every committed event after the sink's cursor, advancing as it goes.
     ///
-    /// The cursor advances only after `accept` succeeds, so a partial drain resumes
-    /// exactly where it stopped.
+    /// The cursor advances only after `accept` succeeds, so a partial drain resumes exactly
+    /// where it stopped. Events are read in bounded batches and the cursor is advanced once per
+    /// batch: a per-event watermark cost one head read plus one compare-and-set per event, which
+    /// dominated a long backlog. The sink contract already requires deduplication by event id,
+    /// so a batch acknowledged as a whole can never deliver twice.
     pub async fn drain(&self) -> crate::error::Result<usize> {
+        const BATCH: usize = 256;
         let name = self.sink.name().to_string();
         let mut cursor = self.log.export_cursor(&name).await?;
-        let head = self.log.head().await?.seq;
         let mut delivered = 0;
-        for event in self.log.scan(cursor, head).await? {
-            match &self.session_id {
-                Some(session_id) => self.sink.accept_for(session_id, &event)?,
-                None => self.sink.accept(&event)?,
+        loop {
+            let batch = self.log.read_after(cursor, BATCH).await?;
+            if batch.is_empty() {
+                return Ok(delivered);
             }
-            self.log
-                .advance_export_cursor(&name, cursor, event.seq)
-                .await?;
-            cursor = event.seq;
-            delivered += 1;
+            for (index, event) in batch.iter().enumerate() {
+                let accepted = match &self.session_id {
+                    Some(session_id) => self.sink.accept_for(session_id, event),
+                    None => self.sink.accept(event),
+                };
+                if let Err(error) = accepted {
+                    // Keep the "the cursor never passes an unaccepted event" contract: on a
+                    // failure, move it to the last event that was accepted, then report.
+                    if index > 0 {
+                        let last_ok = batch[index - 1].seq;
+                        let _ = self.log.advance_export_cursor(&name, cursor, last_ok).await;
+                    }
+                    return Err(error);
+                }
+                delivered += 1;
+            }
+            let last = batch.last().map(|event| event.seq).unwrap_or(cursor);
+            self.log.advance_export_cursor(&name, cursor, last).await?;
+            cursor = last;
         }
-        Ok(delivered)
     }
 }
 
@@ -226,6 +242,71 @@ mod tests {
         // A second drain is a no-op because the cursor advanced durably.
         assert_eq!(exporter.drain().await.unwrap(), 0);
         assert_eq!(sink.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn drain_advances_the_cursor_once_per_batch() {
+        // A per-event watermark cost one head read plus one compare-and-set per event, which
+        // dominated a long backlog. The cursor now moves once per batch, and a failure inside
+        // a batch still leaves it on the last acknowledged event.
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
+        let events: Vec<SessionEvent> = (1..=300u64)
+            .map(|seq| {
+                SessionEvent::new(
+                    format!("e{seq}"),
+                    seq,
+                    0,
+                    "turn/start",
+                    Some("run-1".into()),
+                    None,
+                    true,
+                    "{}",
+                )
+                .unwrap()
+            })
+            .collect();
+        log.commit(&writer, "b1", 0, &events).await.unwrap();
+        log.release(&writer).await.unwrap();
+
+        let sink = Arc::new(RecordingSink::new("sink-batch", None));
+        let exporter = SessionLogExporter::new(Arc::clone(&log), sink.clone());
+        assert_eq!(exporter.drain().await.unwrap(), 300);
+        assert_eq!(log.export_cursor("sink-batch").await.unwrap(), 300);
+        assert_eq!(sink.seen().len(), 300);
+        // A second drain is a no-op: the cursor is durable at the last event.
+        assert_eq!(exporter.drain().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failure_in_a_later_batch_keeps_the_earlier_progress() {
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
+        let events: Vec<SessionEvent> = (1..=300u64)
+            .map(|seq| {
+                SessionEvent::new(
+                    format!("e{seq}"),
+                    seq,
+                    0,
+                    "turn/start",
+                    Some("run-1".into()),
+                    None,
+                    true,
+                    "{}",
+                )
+                .unwrap()
+            })
+            .collect();
+        log.commit(&writer, "b1", 0, &events).await.unwrap();
+        log.release(&writer).await.unwrap();
+
+        // Fail on the first event of the second batch: the first batch stays acknowledged.
+        let sink = Arc::new(RecordingSink::new("sink-late", Some(256)));
+        let exporter = SessionLogExporter::new(Arc::clone(&log), sink.clone());
+        assert!(exporter.drain().await.is_err());
+        assert_eq!(log.export_cursor("sink-late").await.unwrap(), 256);
     }
 
     #[tokio::test]

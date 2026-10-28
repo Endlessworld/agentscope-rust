@@ -12,6 +12,31 @@ use crate::state::TaskVerification;
 
 use super::{session_error, SessionEvent, SessionLog};
 
+/// Folds one committed fact into a view, dropping facts the view cannot decode.
+///
+/// A payload written by a newer version — or a row left by an older one — must not make the
+/// whole session unopenable: inspection and recovery have to work on a history that is merely
+/// *partly* readable. `required` facts still stop recovery, because their loss would change the
+/// meaning of the history rather than just hide a detail.
+fn fold_tolerantly(
+    event: &SessionEvent,
+    fold: &mut impl FnMut(&SessionEvent) -> crate::error::Result<()>,
+) -> crate::error::Result<()> {
+    match fold(event) {
+        Ok(()) => Ok(()),
+        Err(error) if !event.required => {
+            tracing::warn!(
+                seq = event.seq,
+                kind = %event.event_type,
+                %error,
+                "skipping an unreadable session event"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Read-only task and input projection over one committed execution prefix.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionTurns {
@@ -66,7 +91,7 @@ impl SessionTurns {
         let mut applied = BTreeSet::new();
 
         let upper = log.head().await?.seq;
-        let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+        let mut fold = |event: &SessionEvent| -> crate::error::Result<()> {
             let data = event.data()?;
             if event.event_type == "state/restored" {
                 ordered.clear();
@@ -146,6 +171,7 @@ impl SessionTurns {
             }
             Ok(())
         };
+        let mut visit = |event: &SessionEvent| fold_tolerantly(event, &mut fold);
         log.visit(0, upper, &mut visit).await?;
 
         let turns = ordered
@@ -268,50 +294,216 @@ pub struct Transcript {
     pub messages: Vec<Msg>,
 }
 
+/// Accumulator for one transcript replay; see [`apply_projection_event`] for why this is a
+/// struct instead of a closure.
+#[derive(Default)]
+pub(crate) struct TranscriptFold {
+    ordered: Vec<String>,
+    messages: HashMap<String, Msg>,
+}
+
+pub(crate) fn apply_transcript_event(
+    fold: &mut TranscriptFold,
+    event: &SessionEvent,
+) -> crate::error::Result<()> {
+    let TranscriptFold { ordered, messages } = fold;
+    match event.event_type.as_str() {
+        "migration/baseline" => {
+            if let Some(state) = event.data()?.get("stateJson").and_then(|v| v.as_str()) {
+                let restored = crate::state::AgentState::from_json_str(state)?;
+                for msg in restored.context {
+                    if !messages.contains_key(&msg.id) {
+                        ordered.push(msg.id.clone());
+                        messages.insert(msg.id.clone(), msg);
+                    }
+                }
+            }
+        }
+        "message/user" | "message/assistant" | "tool/result" | "turn/output" => {
+            let data = event.data()?;
+            let Some(value) = data.get("message") else {
+                return Ok(());
+            };
+            let msg: Msg = serde_json::from_value(value.clone())?;
+            let is_output = event.event_type == "turn/output";
+            if is_output || !messages.contains_key(&msg.id) {
+                if !messages.contains_key(&msg.id) {
+                    ordered.push(msg.id.clone());
+                }
+                messages.insert(msg.id.clone(), msg);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_transcript(fold: TranscriptFold, as_of_seq: u64) -> Transcript {
+    Transcript {
+        as_of_seq,
+        messages: fold
+            .ordered
+            .into_iter()
+            .filter_map(|id| fold.messages.get(&id).cloned())
+            .collect(),
+    }
+}
+
 /// Rebuilds the committed transcript up to the current head.
 pub async fn transcript(log: &dyn SessionLog) -> crate::error::Result<Transcript> {
     let target = log.head().await?.seq;
-    let mut ordered: Vec<String> = Vec::new();
-    let mut messages: HashMap<String, Msg> = HashMap::new();
+    let mut fold = TranscriptFold::default();
+    let mut visit = |event: &SessionEvent| {
+        fold_tolerantly(event, &mut |event| apply_transcript_event(&mut fold, event))
+    };
+    log.visit(0, target, &mut visit).await?;
+    Ok(finish_transcript(fold, target))
+}
 
-    for event in log.scan(0, target).await? {
-        match event.event_type.as_str() {
-            "migration/baseline" => {
-                if let Some(state) = event.data()?.get("stateJson").and_then(|v| v.as_str()) {
-                    let restored = crate::state::AgentState::from_json_str(state)?;
-                    for msg in restored.context {
-                        if !messages.contains_key(&msg.id) {
-                            ordered.push(msg.id.clone());
-                            messages.insert(msg.id.clone(), msg);
-                        }
-                    }
-                }
+/// Which views a single replay should build.
+///
+/// Cold-start callers used to walk the same committed prefix once per view; these flags let one
+/// pass feed exactly the views that caller needs.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ViewSelection {
+    pub turns: bool,
+    pub projection: bool,
+    pub pending: bool,
+    pub transcript: bool,
+}
+
+/// The views produced by one replay; only the selected ones are `Some`.
+#[derive(Debug, Default)]
+pub(crate) struct SelectedViews {
+    pub turns: Option<SessionTurns>,
+    pub projection: Option<SessionProjection>,
+    pub pending: Option<BTreeMap<String, SessionEvent>>,
+    pub transcript: Option<Transcript>,
+}
+
+/// Replays the committed prefix once and folds every selected view in the same pass.
+///
+/// `hook` sees each event too, which is how a caller adds its own check (the recorder's
+/// duplicate run/turn guard) without paying for another replay.
+pub(crate) async fn replay_views(
+    log: &dyn SessionLog,
+    selection: ViewSelection,
+    hook: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+) -> crate::error::Result<SelectedViews> {
+    let upper = log.head().await?.seq;
+    let mut turns = selection.turns.then(SessionTurns::default);
+    let mut projection = selection.projection.then(ProjectionFold::default);
+    let mut pending = selection.pending.then(BTreeMap::new);
+    let mut transcript = selection.transcript.then(TranscriptFold::default);
+    let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+        let folded = (|| -> crate::error::Result<()> {
+            if let Some(turns) = turns.as_mut() {
+                turns.apply_event(event)?;
             }
-            "message/user" | "message/assistant" | "tool/result" | "turn/output" => {
-                let data = event.data()?;
-                let Some(value) = data.get("message") else {
-                    continue;
-                };
-                let msg: Msg = serde_json::from_value(value.clone())?;
-                let is_output = event.event_type == "turn/output";
-                if is_output || !messages.contains_key(&msg.id) {
-                    if !messages.contains_key(&msg.id) {
-                        ordered.push(msg.id.clone());
-                    }
-                    messages.insert(msg.id.clone(), msg);
-                }
+            if let Some(fold) = projection.as_mut() {
+                apply_projection_event(fold, event)?;
             }
-            _ => {}
+            if let Some(pending) = pending.as_mut() {
+                apply_pending_event(pending, event)?;
+            }
+            if let Some(fold) = transcript.as_mut() {
+                apply_transcript_event(fold, event)?;
+            }
+            hook(event)
+        })();
+        match folded {
+            Ok(()) => Ok(()),
+            Err(error) if !event.required => {
+                tracing::warn!(
+                    seq = event.seq,
+                    kind = %event.event_type,
+                    %error,
+                    "skipping an unreadable session event"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
-    }
-
-    Ok(Transcript {
-        as_of_seq: target,
-        messages: ordered
-            .into_iter()
-            .filter_map(|id| messages.remove(&id))
-            .collect(),
+    };
+    log.visit(0, upper, &mut visit).await?;
+    Ok(SelectedViews {
+        turns,
+        projection: projection
+            .map(|fold| finish_projection(fold, upper))
+            .transpose()?,
+        pending,
+        transcript: transcript.map(|fold| finish_transcript(fold, upper)),
     })
+}
+
+/// Turns plus pending interactions: what admitting a command needs, in one replay.
+pub async fn admission_views(
+    log: &dyn SessionLog,
+) -> crate::error::Result<(SessionTurns, BTreeMap<String, SessionEvent>)> {
+    let views = replay_views(
+        log,
+        ViewSelection {
+            turns: true,
+            pending: true,
+            ..ViewSelection::default()
+        },
+        &mut |_| Ok(()),
+    )
+    .await?;
+    Ok((
+        views.turns.unwrap_or_default(),
+        views.pending.unwrap_or_default(),
+    ))
+}
+
+/// Turns, projection and pending interactions: what closing an unfinished turn needs.
+pub async fn recovery_views(
+    log: &dyn SessionLog,
+) -> crate::error::Result<(
+    SessionTurns,
+    SessionProjection,
+    BTreeMap<String, SessionEvent>,
+)> {
+    let views = replay_views(
+        log,
+        ViewSelection {
+            turns: true,
+            projection: true,
+            pending: true,
+            transcript: false,
+        },
+        &mut |_| Ok(()),
+    )
+    .await?;
+    Ok((
+        views.turns.unwrap_or_default(),
+        views.projection.unwrap_or_default(),
+        views.pending.unwrap_or_default(),
+    ))
+}
+
+/// Projection plus transcript: what opening a recorder needs, in one replay.
+pub(crate) async fn open_views(
+    log: &dyn SessionLog,
+    hook: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+) -> crate::error::Result<(SessionProjection, Transcript)> {
+    let views = replay_views(
+        log,
+        ViewSelection {
+            projection: true,
+            transcript: true,
+            ..ViewSelection::default()
+        },
+        hook,
+    )
+    .await?;
+    Ok((
+        views.projection.unwrap_or_default(),
+        views.transcript.unwrap_or(Transcript {
+            as_of_seq: 0,
+            messages: Vec::new(),
+        }),
+    ))
 }
 
 /// Read-only recovery view. Inspection never repairs records or invokes models/tools.
@@ -327,128 +519,152 @@ pub struct SessionProjection {
     pub verifications: Vec<TaskVerification>,
 }
 
-impl SessionProjection {
-    /// Walks a committed prefix and folds state, tool outcomes and live runs.
-    pub async fn read(log: &dyn SessionLog) -> crate::error::Result<Self> {
-        let upper = log.head().await?.seq;
-        let mut cursor = 0;
-        let mut state: Option<String> = None;
-        let mut uncertain = BTreeSet::new();
-        let mut runs = BTreeSet::new();
-        let mut results: BTreeMap<String, ToolResultBlock> = BTreeMap::new();
-        let mut verifications: Vec<TaskVerification> = Vec::new();
-        let mut extensions: Vec<SessionEvent> = Vec::new();
+/// Accumulator for one projection replay.
+///
+/// A struct plus a free function (rather than a closure) so several views can share a single
+/// pass over the journal: a cold start used to walk the same prefix once per view.
+#[derive(Default)]
+pub(crate) struct ProjectionFold {
+    state: Option<String>,
+    uncertain: BTreeSet<String>,
+    runs: BTreeSet<String>,
+    results: BTreeMap<String, ToolResultBlock>,
+    verifications: Vec<TaskVerification>,
+    extensions: Vec<SessionEvent>,
+}
 
-        let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
-            super::SessionEventTypes::validate(event)?;
-            let data = event.data()?;
-            match event.event_type.as_str() {
-                "state/checkpoint" | "migration/baseline" | "state/restored" => {
-                    state = data
-                        .get("stateJson")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    results.clear();
-                    verifications.clear();
-                    extensions.clear();
+pub(crate) fn apply_projection_event(
+    fold: &mut ProjectionFold,
+    event: &SessionEvent,
+) -> crate::error::Result<()> {
+    let ProjectionFold {
+        state,
+        uncertain,
+        runs,
+        results,
+        verifications,
+        extensions,
+    } = fold;
+    super::SessionEventTypes::validate(event)?;
+    let data = event.data()?;
+    match event.event_type.as_str() {
+        "state/checkpoint" | "migration/baseline" | "state/restored" => {
+            *state = data
+                .get("stateJson")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            results.clear();
+            verifications.clear();
+            extensions.clear();
+        }
+        // A verification report is durable state, not optional telemetry: a payload that
+        // cannot be decoded fails the projection instead of being skipped. A missing
+        // `verification` key is the one tolerated case (Java guards with `!= null`).
+        "verification/result" => {
+            if let Some(value) = data.get("verification") {
+                let report: TaskVerification = serde_json::from_value(value.clone())?;
+                match verifications.iter_mut().find(|known| known.id == report.id) {
+                    // Same id committed again: the later fact wins, in place.
+                    Some(known) => *known = report,
+                    None => verifications.push(report),
                 }
-                // A verification report is durable state, not optional telemetry: a payload that
-                // cannot be decoded fails the projection instead of being skipped. A missing
-                // `verification` key is the one tolerated case (Java guards with `!= null`).
-                "verification/result" => {
-                    if let Some(value) = data.get("verification") {
-                        let report: TaskVerification = serde_json::from_value(value.clone())?;
-                        match verifications.iter_mut().find(|known| known.id == report.id) {
-                            // Same id committed again: the later fact wins, in place.
-                            Some(known) => *known = report,
-                            None => verifications.push(report),
-                        }
-                    }
-                }
-                "tool/dispatch" => {
-                    if let Some(id) = json_str(&data, "toolCallId") {
-                        uncertain.insert(id);
-                    }
-                }
-                "tool/result" => {
-                    // A persisted tool result is the authoritative outcome, regardless of
-                    // whether the action observer managed to write `action/end` (a denied or
-                    // plan-rejected call never runs one). It must clear dispatch uncertainty;
-                    // otherwise every later open demands reconciliation for a settled call.
-                    if let Some(value) = data.get("message") {
-                        if let Ok(message) =
-                            serde_json::from_value::<crate::message::Msg>(value.clone())
-                        {
-                            for result in message.tool_result_blocks() {
-                                if let Some(id) = result.id.as_deref() {
-                                    uncertain.remove(id);
-                                }
-                            }
-                        }
-                    }
-                }
-                // `action/start` is the first durable fact of a tool execution. Treating it as
-                // uncertain means a crash between "tool started" and "action/end" is recoverable
-                // even when the writer never got to record `tool/dispatch`.
-                "action/start" => {
-                    if let Some(id) = json_str(&data, "toolCallId") {
-                        uncertain.insert(id);
-                    }
-                }
-                "action/end" => {
-                    // The attempt ended, so it is no longer *uncertain* — even when the tool
-                    // failed before producing a result (`result: null`). Leaving it uncertain
-                    // would make every later open of the session demand a reconciliation for a
-                    // failure the run already recorded.
-                    let id = json_str(&data, "toolCallId").unwrap_or_default();
-                    uncertain.remove(&id);
-                    // An explicit null is a missing result, not a result to decode: earlier
-                    // writers recorded the field unconditionally, and trying to parse it fails
-                    // the whole projection (and with it every resume of that session).
-                    if let Some(value) = data.get("result").filter(|value| !value.is_null()) {
-                        // Early native action payloads omitted the polymorphic discriminator.
-                        let mut value = value.clone();
-                        if let Some(object) = value.as_object_mut() {
-                            object
-                                .entry("type")
-                                .or_insert_with(|| serde_json::json!("tool_result"));
-                        }
-                        results.insert(id, serde_json::from_value(value)?);
-                    }
-                }
-                "recovery/applied" => {
-                    if let Some(ids) = data.get("interruptedRuns").and_then(|v| v.as_array()) {
-                        for id in ids.iter().filter_map(|v| v.as_str()) {
-                            runs.remove(id);
-                        }
-                    }
-                    if let Some(ids) = data.get("resolvedToolCallIds").and_then(|v| v.as_array()) {
-                        for id in ids.iter().filter_map(|v| v.as_str()) {
+            }
+        }
+        "tool/dispatch" => {
+            if let Some(id) = json_str(&data, "toolCallId") {
+                uncertain.insert(id);
+            }
+        }
+        "tool/result" => {
+            // A persisted tool result is the authoritative outcome, regardless of
+            // whether the action observer managed to write `action/end` (a denied or
+            // plan-rejected call never runs one). It must clear dispatch uncertainty;
+            // otherwise every later open demands reconciliation for a settled call.
+            if let Some(value) = data.get("message") {
+                if let Ok(message) = serde_json::from_value::<crate::message::Msg>(value.clone()) {
+                    for result in message.tool_result_blocks() {
+                        if let Some(id) = result.id.as_deref() {
                             uncertain.remove(id);
                         }
                     }
                 }
-                "run/start" => {
-                    if let Some(id) = &event.execution_run_id {
-                        runs.insert(id.clone());
-                    }
+            }
+        }
+        // `action/start` is the first durable fact of a tool execution. Treating it as
+        // uncertain means a crash between "tool started" and "action/end" is recoverable
+        // even when the writer never got to record `tool/dispatch`.
+        "action/start" => {
+            if let Some(id) = json_str(&data, "toolCallId") {
+                uncertain.insert(id);
+            }
+        }
+        "action/end" => {
+            // The attempt ended, so it is no longer *uncertain* — even when the tool
+            // failed before producing a result (`result: null`). Leaving it uncertain
+            // would make every later open of the session demand a reconciliation for a
+            // failure the run already recorded.
+            let id = json_str(&data, "toolCallId").unwrap_or_default();
+            uncertain.remove(&id);
+            // An explicit null is a missing result, not a result to decode: earlier
+            // writers recorded the field unconditionally, and trying to parse it fails
+            // the whole projection (and with it every resume of that session).
+            if let Some(value) = data.get("result").filter(|value| !value.is_null()) {
+                // Early native action payloads omitted the polymorphic discriminator.
+                let mut value = value.clone();
+                if let Some(object) = value.as_object_mut() {
+                    object
+                        .entry("type")
+                        .or_insert_with(|| serde_json::json!("tool_result"));
                 }
-                "run/end" => {
-                    if let Some(id) = &event.execution_run_id {
-                        runs.remove(id);
-                    }
-                }
-                other => {
-                    if !super::SessionEventTypes::is_builtin(other) {
-                        extensions.push(event.clone());
-                    }
+                results.insert(id, serde_json::from_value(value)?);
+            }
+        }
+        "recovery/applied" => {
+            if let Some(ids) = data.get("interruptedRuns").and_then(|v| v.as_array()) {
+                for id in ids.iter().filter_map(|v| v.as_str()) {
+                    runs.remove(id);
                 }
             }
-            cursor = event.seq;
-            Ok(())
-        };
-        log.visit(0, upper, &mut visit).await?;
+            if let Some(ids) = data.get("resolvedToolCallIds").and_then(|v| v.as_array()) {
+                for id in ids.iter().filter_map(|v| v.as_str()) {
+                    uncertain.remove(id);
+                }
+            }
+        }
+        "run/start" => {
+            if let Some(id) = &event.execution_run_id {
+                runs.insert(id.clone());
+            }
+        }
+        "run/end" => {
+            if let Some(id) = &event.execution_run_id {
+                runs.remove(id);
+            }
+        }
+        other => {
+            if !super::SessionEventTypes::is_builtin(other) {
+                extensions.push(event.clone());
+            }
+        }
+    }
+    Ok(())
+}
 
+/// Finalizes a projection replay: realigns the recovered state with facts an older checkpoint
+/// may not contain.
+pub(crate) fn finish_projection(
+    fold: ProjectionFold,
+    upper: u64,
+) -> crate::error::Result<SessionProjection> {
+    let ProjectionFold {
+        mut state,
+        uncertain,
+        runs,
+        results,
+        verifications,
+        extensions,
+    } = fold;
+    {
         // Realign a recovered state with facts whose effect may be lost in an older
         // checkpoint: committed tool results, verification reports and extension events.
         if let Some(state_json) = &state {
@@ -483,14 +699,30 @@ impl SessionProjection {
                 state = Some(restored.to_json()?);
             }
         }
+    }
 
-        Ok(Self {
-            as_of_seq: cursor,
-            state_json: state,
-            uncertain_tool_calls: uncertain,
-            active_runs: runs,
-            verifications,
-        })
+    Ok(SessionProjection {
+        // The projection is written back after the head, even when an unreadable segment
+        // truncated the replay: new facts must continue the committed chain, not refill a
+        // hole nobody can read.
+        as_of_seq: upper,
+        state_json: state,
+        uncertain_tool_calls: uncertain,
+        active_runs: runs,
+        verifications,
+    })
+}
+
+impl SessionProjection {
+    /// Walks a committed prefix and folds state, tool outcomes and live runs.
+    pub async fn read(log: &dyn SessionLog) -> crate::error::Result<Self> {
+        let upper = log.head().await?.seq;
+        let mut fold = ProjectionFold::default();
+        let mut visit = |event: &SessionEvent| {
+            fold_tolerantly(event, &mut |event| apply_projection_event(&mut fold, event))
+        };
+        log.visit(0, upper, &mut visit).await?;
+        finish_projection(fold, upper)
     }
 
     /// Restores the projected state, if a checkpoint exists.
@@ -545,9 +777,10 @@ pub async fn pending_interactions(
 ) -> crate::error::Result<BTreeMap<String, SessionEvent>> {
     let upper = log.head().await?.seq;
     let mut result = BTreeMap::new();
-    let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+    let mut fold = |event: &SessionEvent| -> crate::error::Result<()> {
         apply_pending_event(&mut result, event)
     };
+    let mut visit = |event: &SessionEvent| fold_tolerantly(event, &mut fold);
     log.visit(0, upper, &mut visit).await?;
     Ok(result)
 }
@@ -752,6 +985,61 @@ mod tests {
     async fn commit(log: &dyn SessionLog, writer: &Writer, batch: &str, events: &[SessionEvent]) {
         let head = log.head().await.unwrap();
         log.commit(writer, batch, head.seq, events).await.unwrap();
+    }
+
+    /// One replay must produce exactly what the per-view readers produce.
+    ///
+    /// Opening a recorder now folds projection and transcript in a single pass; a divergence
+    /// between the combined fold and the standalone readers would silently change what a
+    /// resumed run sees, so they are compared on the same journal.
+    #[tokio::test]
+    async fn one_replay_matches_the_individual_views() {
+        let (_storage, log, writer) = journal().await;
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
+                event(
+                    2,
+                    "message/user",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "message": Msg::user("hello") }),
+                ),
+                event(
+                    3,
+                    "interaction/requested",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "requestId": "r1", "kind": "external_execution" }),
+                ),
+                event(
+                    4,
+                    "state/checkpoint",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "stateJson": crate::state::AgentState::default().to_json().unwrap() }),
+                ),
+            ],
+        )
+        .await;
+
+        let (projection, tx) = open_views(&*log, &mut |_| Ok(())).await.unwrap();
+        assert_eq!(projection, SessionProjection::read(&*log).await.unwrap());
+        assert_eq!(tx, super::transcript(&*log).await.unwrap());
+
+        let (turns, pending) = admission_views(&*log).await.unwrap();
+        assert_eq!(turns, SessionTurns::read(&*log).await.unwrap());
+        assert_eq!(pending, pending_interactions(&*log).await.unwrap());
+        assert_eq!(pending.len(), 1);
     }
 
     #[tokio::test]
@@ -1319,5 +1607,132 @@ mod tests {
     fn unparsable_timestamp_reports_zero() {
         assert_eq!(timestamp_millis("not-a-time"), 0);
         assert!(timestamp_millis("2026-10-20 10:11:12.345") > 0);
+    }
+
+    /// P1-14: one corrupt segment must not make the whole session unopenable.
+    #[tokio::test]
+    async fn a_corrupt_segment_still_opens_the_session_from_the_last_checkpoint() {
+        let storage = Arc::new(MemorySessionStorage::new());
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
+            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+            "s1",
+        ));
+        let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
+
+        let state = crate::state::AgentState::builder()
+            .session_id("s1")
+            .add_message(Msg::user("hi"))
+            .build();
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "run/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({}),
+                ),
+                event(2, "turn/start", None, Some("t1"), serde_json::json!({})),
+            ],
+        )
+        .await;
+        commit(
+            &*log,
+            &writer,
+            "b2",
+            &[event(
+                3,
+                "message/user",
+                None,
+                Some("t1"),
+                serde_json::json!({ "message": Msg::user("hi") }),
+            )],
+        )
+        .await;
+        commit(
+            &*log,
+            &writer,
+            "b3",
+            &[event(
+                4,
+                "state/checkpoint",
+                None,
+                Some("t1"),
+                serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+            )],
+        )
+        .await;
+
+        // Corrupt the middle segment: its checksum no longer matches, so the chain cannot be
+        // walked through it.
+        let head = log.head().await.unwrap();
+        let head_path = format!("s1/commits/{}.json", head.commit_id.clone().unwrap());
+        let head_commit: serde_json::Value =
+            serde_json::from_slice(&storage.read(&head_path).await.unwrap().unwrap().bytes)
+                .unwrap();
+        let middle = head_commit["parent"].as_str().unwrap().to_string();
+        assert!(storage
+            .compare_and_set(
+                &format!("s1/commits/{middle}.json"),
+                1,
+                b"{\"broken\":true}"
+            )
+            .await
+            .unwrap());
+
+        // A strict read still reports the damage.
+        assert!(log.scan(0, head.seq).await.is_err());
+
+        // Recovery replays the readable suffix — which is where the latest checkpoint lives —
+        // and the projection still continues the committed chain.
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert_eq!(projection.as_of_seq, head.seq);
+        let restored = projection
+            .restore()
+            .unwrap()
+            .expect("the latest checkpoint is still replayed");
+        assert_eq!(restored.context.len(), 1);
+        // The transcript opens as well.
+        assert!(transcript(&*log).await.is_ok());
+    }
+
+    /// P1-14: an optional fact a view cannot decode is skipped; a required one still stops.
+    #[tokio::test]
+    async fn an_unreadable_optional_event_is_skipped_but_a_required_one_is_not() {
+        let unreadable = serde_json::json!({ "verification": { "not": "a report" } }).to_string();
+
+        let (_storage, log, writer) = journal().await;
+        let optional = SessionEvent::new(
+            "e1",
+            1,
+            0,
+            "verification/result",
+            None,
+            None,
+            false,
+            unreadable.clone(),
+        )
+        .unwrap();
+        commit(&*log, &writer, "b1", &[optional]).await;
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert!(projection.verifications.is_empty());
+
+        let (_storage, log, writer) = journal().await;
+        let required = SessionEvent::new(
+            "e1",
+            1,
+            0,
+            "verification/result",
+            None,
+            None,
+            true,
+            unreadable,
+        )
+        .unwrap();
+        commit(&*log, &writer, "b1", &[required]).await;
+        assert!(SessionProjection::read(&*log).await.is_err());
     }
 }

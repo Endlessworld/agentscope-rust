@@ -76,6 +76,12 @@ const FLUSH_ATTEMPTS: usize = 6;
 /// Initial backoff between flush attempts.
 const FLUSH_RETRY_BASE: Duration = Duration::from_millis(100);
 
+/// How many times a flush re-bases its batch onto a head that advanced under it.
+///
+/// A re-base is not a retry: it renumbers unpublished facts after the new head. It is bounded
+/// because a prefix that keeps moving means this recorder is no longer the writer.
+const FLUSH_REBASES: usize = 3;
+
 /// Whether a persistence failure is transient enough to retry the same batch.
 ///
 /// Fencing, sealing, corrupted history and non-contiguous prefixes are ownership/data
@@ -115,6 +121,16 @@ fn is_retryable_session_error(message: &str) -> bool {
         "database is locked",
     ];
     RETRYABLE.iter().any(|needle| lower.contains(needle))
+}
+
+/// Whether the journal rejected the batch because the committed prefix moved.
+///
+/// Distinct from a transient failure (retry the same batch) and from fencing (stop): the facts
+/// are still unpublished and can be renumbered onto the new head.
+fn is_stale_prefix(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("stale committed prefix")
 }
 
 /// The logical outcome of a normally returned result, independent of the caller's handle.
@@ -158,6 +174,13 @@ fn options_payload(options: &crate::model::GenerateOptions) -> serde_json::Value
         "toolChoice": options.tool_choice,
         "responseFormat": options.response_format,
     })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// One reserved batch whose commit is in flight (or awaiting a retry).
@@ -208,6 +231,8 @@ pub struct SessionRecorder {
     heartbeat: Mutex<Option<LeaseHeartbeat>>,
     /// Serializes flush: a second flush must not commit the same reserved prefix.
     flush_lock: tokio::sync::Mutex<()>,
+    /// How long the replay took when this recorder opened.
+    replay_ms: u64,
 }
 
 impl Drop for SessionRecorder {
@@ -257,13 +282,53 @@ impl Drop for SessionRecorder {
 struct LeaseHeartbeat {
     stop: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// Wall-clock millis of the last successful renewal (or of the start).
+    last_renew_ms: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// A point-in-time snapshot of one recorder's health.
+///
+/// A stalled session used to be invisible until it failed: there was no way to tell a healthy
+/// run from one whose lease heartbeat had died, or to see how much a cold start had to replay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionMetrics {
+    /// The last durably committed sequence number.
+    pub durable_seq: u64,
+    /// Facts buffered but not committed yet.
+    pub pending_events: usize,
+    /// Bytes those buffered facts occupy.
+    pub pending_bytes: usize,
+    /// How long the last replay took when this recorder opened.
+    pub replay_ms: u64,
+    /// Milliseconds since the lease heartbeat last renewed, `None` when there is no heartbeat.
+    pub heartbeat_age_ms: Option<u64>,
+    /// The lease duration the heartbeat renews.
+    pub lease_ms: u64,
 }
 
 impl LeaseHeartbeat {
+    /// Starts the renewal tick, or reports that it could not.
+    ///
+    /// Without a Tokio runtime there is nothing to tick from. That is not fatal — every flush
+    /// renews inline before committing, so a run that keeps writing keeps its lease — but a long
+    /// silent stretch (one slow tool, one long model stream) would then be uncovered, so it is
+    /// reported instead of silently pretending the lease is guarded.
     fn start(log: Arc<dyn SessionLog>, writer: Writer, lease: Duration) -> Option<Self> {
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                tracing::warn!(
+                    run = %writer.owner,
+                    epoch = writer.epoch,
+                    "no tokio runtime for the session lease heartbeat; renewal falls back to each flush"
+                );
+                return None;
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = Arc::clone(&stop);
+        let last_renew_ms = Arc::new(std::sync::atomic::AtomicI64::new(now_ms()));
+        let task_renew = Arc::clone(&last_renew_ms);
         let interval = renew_interval(lease);
         let handle = runtime.spawn(async move {
             let mut transient_failures = 0u32;
@@ -273,7 +338,10 @@ impl LeaseHeartbeat {
                     return;
                 }
                 match log.renew(&writer, lease).await {
-                    Ok(()) => transient_failures = 0,
+                    Ok(()) => {
+                        transient_failures = 0;
+                        task_renew.store(now_ms(), Ordering::SeqCst);
+                    }
                     Err(error) => {
                         let message = error.to_string();
                         // A fenced/sealed writer has genuinely lost ownership: stop renewing
@@ -310,6 +378,7 @@ impl LeaseHeartbeat {
         Some(Self {
             stop,
             handle: Some(handle),
+            last_renew_ms,
         })
     }
 
@@ -474,6 +543,7 @@ impl SessionRecorder {
                 return Err(error);
             }
         };
+        let mut replay_ms = 0u64;
         let prepared = async {
             if let Some(baseline) = baseline.filter(|baseline| {
                 baseline.seq == head.seq
@@ -522,17 +592,18 @@ impl SessionRecorder {
                 ));
             }
             let started = std::time::Instant::now();
-            let initial = SessionProjection::read(&*log).await?;
-            let durable_seq = initial.as_of_seq;
             let mut seen_turn = false;
-            for event in log.scan(0, durable_seq).await? {
+            // One replay feeds the projection, the transcript and the duplicate run/turn check.
+            // Opening a recorder used to walk the whole prefix three times, which is the cold
+            // start a long session pays for on every new turn.
+            let mut inspect = |event: &SessionEvent| -> crate::error::Result<()> {
                 if event.execution_run_id.as_deref() == Some(run_id) {
                     return Err(session_error(
                         "Run ID already used; prepare a new execution to resume",
                     ));
                 }
                 if event.turn_id.as_deref() != Some(turn_id.as_str()) {
-                    continue;
+                    return Ok(());
                 }
                 seen_turn = true;
                 let completed = event.event_type == "turn/completed"
@@ -548,7 +619,10 @@ impl SessionRecorder {
                 if completed {
                     return Err(session_error("Turn already completed; use a new turn ID"));
                 }
-            }
+                Ok(())
+            };
+            let (initial, transcript) = super::views::open_views(&*log, &mut inspect).await?;
+            let durable_seq = initial.as_of_seq;
             if !initial.uncertain_tool_calls.is_empty() {
                 return Err(session_error(format!(
                     "Explicit reconciliation required for unknown tool outcomes: {:?}",
@@ -561,12 +635,13 @@ impl SessionRecorder {
                 None => Vec::new(),
             };
             let mut recorded_messages = HashSet::new();
-            for message in super::transcript(&*log).await?.messages {
+            for message in transcript.messages {
                 recorded_messages.insert(message.id);
             }
+            replay_ms = started.elapsed().as_millis() as u64;
             tracing::info!(
                 seq = durable_seq,
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = replay_ms,
                 "session recorder replayed the journal"
             );
             Ok((
@@ -593,6 +668,7 @@ impl SessionRecorder {
             };
 
         Ok(Self {
+            replay_ms,
             heartbeat: Mutex::new(heartbeat),
             lease,
             log,
@@ -711,6 +787,35 @@ impl SessionRecorder {
         Ok(seq)
     }
 
+    /// Re-bases the uncommitted buffer onto the journal's current head.
+    ///
+    /// Another writer advanced the committed prefix while this batch was in flight. The events
+    /// are still unpublished, so they are renumbered to follow the new head and published under
+    /// a **new** batch id: the old id is bound to the old sequence numbers, and replaying it
+    /// would be rejected as a reused id. Only the current owner may re-base — a fenced writer
+    /// must stop rather than append to a prefix it no longer owns, which is why the lease is
+    /// renewed first.
+    async fn rebase_onto_head(&self) -> crate::error::Result<(String, u64)> {
+        self.log.renew(&self.writer, self.lease).await?;
+        let head = self.log.head().await?;
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let mut guard = self.lock();
+        let mut seq = head.seq;
+        if let Some(inflight) = guard.inflight.as_mut() {
+            inflight.batch_id = batch_id.clone();
+            for event in inflight.events.iter_mut() {
+                seq += 1;
+                event.seq = seq;
+            }
+        }
+        for event in guard.pending.iter_mut() {
+            seq += 1;
+            event.seq = seq;
+        }
+        guard.durable_seq = head.seq;
+        Ok((batch_id, head.seq))
+    }
+
     /// Publishes the pending buffer as one commit.
     ///
     /// Only one flush may be in flight. Events appended while a commit is awaiting storage are
@@ -750,6 +855,10 @@ impl SessionRecorder {
         };
 
         let mut attempt = 0usize;
+        let mut rebases = 0usize;
+        // The batch id and the expected prefix change when the batch is re-based onto a head
+        // that moved under it, so both are loop-local rather than fixed for the whole flush.
+        let (mut batch, mut expected) = (batch, expected);
         loop {
             attempt += 1;
             let (events, bytes) = {
@@ -785,6 +894,31 @@ impl SessionRecorder {
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    // The committed prefix moved under this recorder: another writer (a second
+                    // process, or a run this process already forgot) committed while this batch
+                    // was in flight. The facts are still unpublished, so renumber them onto the
+                    // new head and publish again instead of failing the whole run.
+                    if is_stale_prefix(&message) && rebases < FLUSH_REBASES {
+                        rebases += 1;
+                        match self.rebase_onto_head().await {
+                            Ok((rebased, head_seq)) => {
+                                tracing::warn!(
+                                    run = %self.run_id,
+                                    head_seq,
+                                    attempt,
+                                    "the committed prefix advanced; re-basing the pending batch"
+                                );
+                                batch = rebased;
+                                expected = head_seq;
+                                continue;
+                            }
+                            Err(error) => tracing::warn!(
+                                run = %self.run_id,
+                                %error,
+                                "re-basing the pending batch failed"
+                            ),
+                        }
+                    }
                     // A transient storage/CAS failure must not poison the whole run. Retry the
                     // identical batch: the journal resolves a replayed batch id idempotently.
                     if is_retryable_session_error(&message) && attempt < FLUSH_ATTEMPTS {
@@ -819,11 +953,47 @@ impl SessionRecorder {
                             guard.failure = Some(message.clone());
                         }
                     }
+                    tracing::error!(
+                        run = %self.run_id,
+                        turn = %self.turn_id,
+                        epoch = self.writer.epoch,
+                        owner = %self.writer.owner,
+                        lease_ms = self.lease.as_millis() as u64,
+                        attempt,
+                        %error,
+                        "session commit failed permanently; the run cannot make progress"
+                    );
                     return Err(session_error(format!(
                         "Failed to commit session prefix: {message}"
                     )));
                 }
             }
+        }
+    }
+
+    /// A point-in-time health snapshot of this recorder.
+    ///
+    /// Lets a host alert on a lease whose heartbeat stopped (the run would otherwise lose
+    /// ownership only when the lease finally expires) and on a cold start whose replay is
+    /// growing with the journal.
+    pub fn metrics(&self) -> SessionMetrics {
+        let state = self.lock();
+        let heartbeat_age_ms = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|heartbeat| {
+                let last = heartbeat.last_renew_ms.load(Ordering::SeqCst);
+                (now_ms().saturating_sub(last)).max(0) as u64
+            });
+        SessionMetrics {
+            durable_seq: state.durable_seq,
+            pending_events: state.pending.len(),
+            pending_bytes: state.pending_bytes,
+            replay_ms: self.replay_ms,
+            heartbeat_age_ms,
+            lease_ms: self.lease.as_millis() as u64,
         }
     }
 
@@ -1303,7 +1473,7 @@ fn tool_results_of(data: &crate::event::EventData) -> Vec<crate::message::ToolRe
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
@@ -1353,6 +1523,43 @@ mod tests {
             if self.fail_commits.load(Ordering::SeqCst) && path.contains("/commits/") {
                 return Err(crate::error::Error::Other("storage down".into()));
             }
+            self.inner
+                .compare_and_set(path, expected_version, bytes)
+                .await
+        }
+    }
+
+    /// Storage whose head reads can be made to fail, to exercise the open failure path.
+    struct HeadFailingStorage {
+        inner: MemorySessionStorage,
+        /// Head reads still allowed before every further one fails.
+        head_reads_left: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AtomicSessionStorage for HeadFailingStorage {
+        async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
+            if path.ends_with("head.json") {
+                let left = self.head_reads_left.load(Ordering::SeqCst);
+                if left == 0 {
+                    // Fail exactly once, then behave: the test needs the session usable again
+                    // to prove the failed open gave the lease back.
+                    self.head_reads_left.store(usize::MAX, Ordering::SeqCst);
+                    return Err(crate::error::Error::Other("head read failed".into()));
+                }
+                if left != usize::MAX {
+                    self.head_reads_left.store(left - 1, Ordering::SeqCst);
+                }
+            }
+            self.inner.read(path).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            path: &str,
+            expected_version: u64,
+            bytes: &[u8],
+        ) -> crate::error::Result<bool> {
             self.inner
                 .compare_and_set(path, expected_version, bytes)
                 .await
@@ -1645,6 +1852,49 @@ mod tests {
         recorder.close().await;
     }
 
+    /// P1-15: a batch whose prefix moved under it is re-based, not failed.
+    #[tokio::test]
+    async fn a_batch_is_rebased_when_the_committed_prefix_moved() {
+        let (log, _storage) = journal().await;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        recorder
+            .record("run/start", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let before = log.head().await.unwrap();
+
+        // A commit that landed but whose acknowledgement never reached the recorder (the flush
+        // future was dropped mid-commit): the head moves on while the recorder still believes
+        // the old prefix is durable.
+        let lost = raw(
+            before.seq + 1,
+            "presentation/hint",
+            Some("run-1"),
+            None,
+            "{}",
+        );
+        log.commit(&recorder.writer, "lost-ack", before.seq, &[lost])
+            .await
+            .unwrap();
+        assert_eq!(recorder.durable_seq(), before.seq);
+
+        recorder
+            .record("turn/start", &serde_json::json!({}))
+            .await
+            .expect("a batch whose prefix moved must be re-based, not failed");
+
+        let head = log.head().await.unwrap();
+        assert_eq!(head.seq, before.seq + 2);
+        assert_eq!(recorder.durable_seq(), head.seq);
+        // The chain stays contiguous: every sequence number is committed exactly once.
+        let events = log.scan(0, head.seq).await.unwrap();
+        assert_eq!(events.len() as u64, head.seq);
+        assert_eq!(events.last().unwrap().event_type, "turn/start");
+        recorder.close().await;
+    }
+
     #[tokio::test]
     async fn a_transient_commit_failure_is_retried_and_does_not_poison_the_recorder() {
         struct FlakyStorage {
@@ -1909,6 +2159,65 @@ mod tests {
         assert_eq!(head.owner, None, "released lease must not be reclaimed");
         // Another run can take the session, which is what a closed recorder promises.
         let next = log.acquire("run-2", lease).await.unwrap();
+        log.release(&next).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metrics_report_replay_pending_and_heartbeat_age() {
+        // A stalled session used to be invisible until it failed: nothing exposed whether the
+        // lease heartbeat was still ticking, how much the cold start had to replay, or how
+        // much was buffered.
+        let (log, _storage) = journal().await;
+        seed(
+            &*log,
+            "seed",
+            vec![raw(1, "run/start", Some("run-0"), Some("t0"), "{}")],
+        )
+        .await;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+
+        let metrics = recorder.metrics();
+        assert_eq!(metrics.durable_seq, 1);
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.lease_ms, LEASE.as_millis() as u64);
+        assert!(
+            metrics.heartbeat_age_ms.is_some(),
+            "a recorder opened inside a runtime must report a live heartbeat"
+        );
+
+        recorder
+            .append("turn/start", &serde_json::json!({}))
+            .unwrap();
+        let buffered = recorder.metrics();
+        assert_eq!(buffered.pending_events, 1);
+        assert!(buffered.pending_bytes > 0);
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_open_that_fails_to_read_the_head_releases_the_writer() {
+        // Regression: `open` acquired the writer and then returned the `head()` error without
+        // releasing it, so the session stayed owned by a run that never existed for a whole
+        // lease — every following turn waited for it.
+        let storage = Arc::new(HeadFailingStorage {
+            inner: MemorySessionStorage::new(),
+            // `acquire` reads the head once; the recorder's own head read then fails.
+            head_reads_left: AtomicUsize::new(1),
+        });
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
+            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+            "s1",
+        ));
+
+        let error = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .expect_err("the failing head read must fail the open");
+        assert!(error.to_string().contains("head read failed"), "{error}");
+
+        // The lease is free again: another run takes the session without waiting for expiry.
+        let next = log.acquire("run-2", LEASE).await.unwrap();
         log.release(&next).await.unwrap();
     }
 

@@ -39,8 +39,8 @@ pub use models::{
     SessionModels, MODEL_POLICY_CONTEXT_KEY,
 };
 pub use recorder::{
-    outcome, RecorderBaseline, SessionRecorder, PARENT_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
-    TURN_ID_CONTEXT_KEY,
+    outcome, RecorderBaseline, SessionMetrics, SessionRecorder, PARENT_CONTEXT_KEY,
+    RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
 };
 pub use recovery::{abandon_turn, cancel_pending, reconcile};
 pub use state_access::{
@@ -48,8 +48,9 @@ pub use state_access::{
 };
 pub use storage::{AtomicSessionStorage, StorageValue};
 pub use views::{
-    apply_pending_event, pending_interactions, transcript, transcript_entries, transcript_jsonl,
-    SessionProjection, SessionTurns, Transcript, TranscriptEntry, Turn,
+    admission_views, apply_pending_event, pending_interactions, recovery_views, transcript,
+    transcript_entries, transcript_jsonl, SessionProjection, SessionTurns, Transcript,
+    TranscriptEntry, Turn,
 };
 
 /// Error message prefix used by session persistence failures.

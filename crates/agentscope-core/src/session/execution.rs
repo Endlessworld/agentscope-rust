@@ -9,8 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    pending_interactions, session_error, Command, SessionEvent, SessionInbox, SessionLog,
-    SessionRecorder, SessionTurns,
+    session_error, Command, SessionEvent, SessionInbox, SessionLog, SessionRecorder, SessionTurns,
 };
 use crate::agent::RuntimeContext;
 use crate::message::Msg;
@@ -43,6 +42,12 @@ pub struct SessionExecution {
     /// Applied command ids from the committed view, advanced as this run consumes guidance.
     /// Kept in memory so `before_step` does not rescan the whole journal on every step.
     applied: Arc<Mutex<BTreeSet<String>>>,
+    /// The inbox handle, created once per execution.
+    ///
+    /// Every `before_step` used to build a new `SessionInbox`, which dropped the folded
+    /// snapshot cache it carries: each step then re-read and re-decoded every accepted
+    /// command of the session.
+    inbox: Arc<std::sync::OnceLock<SessionInbox>>,
 }
 
 impl std::fmt::Debug for SessionExecution {
@@ -63,7 +68,18 @@ impl SessionExecution {
             inputs: Vec::new(),
             opened: Arc::new(AtomicBool::new(false)),
             applied: Arc::new(Mutex::new(BTreeSet::new())),
+            inbox: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// The inbox handle for this execution, created on first use.
+    fn inbox(&self) -> crate::error::Result<&SessionInbox> {
+        if let Some(inbox) = self.inbox.get() {
+            return Ok(inbox);
+        }
+        let inbox = SessionInbox::new(Arc::clone(&self.log))?;
+        let _ = self.inbox.set(inbox);
+        Ok(self.inbox.get().expect("inbox was just initialized"))
     }
 
     /// Returns the execution carried by a runtime context, if any.
@@ -101,12 +117,13 @@ impl SessionExecution {
     ) -> crate::error::Result<()> {
         let (view, pending) = match baseline {
             Some(baseline) => (baseline.turns.clone(), baseline.pending.clone()),
-            None => (
-                SessionTurns::read(&*self.log).await?,
-                pending_interactions(&*self.log).await?,
-            ),
+            // One replay for both views: admitting a command used to walk the prefix twice.
+            None => super::views::admission_views(&*self.log).await?,
         };
-        *self.applied.lock().unwrap() = view.applied.clone();
+        *self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = view.applied.clone();
         if view.started.contains(&self.command.id) {
             return Err(session_error("Command already executed"));
         }
@@ -169,7 +186,7 @@ impl SessionExecution {
                 "kind": self.command.kind,
             }),
         )?;
-        let inbox = SessionInbox::new(Arc::clone(&self.log))?;
+        let inbox = self.inbox()?;
         let turn_id = self.effective_turn_id()?;
         inbox.open(&turn_id, recorder.run_id()).await?;
         self.opened.store(true, Ordering::SeqCst);
@@ -205,8 +222,12 @@ impl SessionExecution {
         recorder: &SessionRecorder,
         state: &mut AgentState,
     ) -> crate::error::Result<()> {
-        let inbox = SessionInbox::new(Arc::clone(&self.log))?;
-        let applied = self.applied.lock().unwrap().clone();
+        let inbox = self.inbox()?;
+        let applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut known = recorder.accepted_message_ids();
         for message in &state.context {
             known.insert(message.id.clone());
@@ -240,7 +261,10 @@ impl SessionExecution {
                     &serde_json::json!({ "commandIds": &accepted }),
                 )
                 .await?;
-            self.applied.lock().unwrap().extend(accepted);
+            self.applied
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(accepted);
         }
         Ok(())
     }
@@ -253,8 +277,12 @@ impl SessionExecution {
         &self,
         recorder: &SessionRecorder,
     ) -> crate::error::Result<bool> {
-        let inbox = SessionInbox::new(Arc::clone(&self.log))?;
-        let applied = self.applied.lock().unwrap().clone();
+        let inbox = self.inbox()?;
+        let applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let snapshot = inbox.snapshot().await?;
         let pending = snapshot.commands.iter().any(|command| {
             command.kind == "steer"
@@ -272,7 +300,7 @@ impl SessionExecution {
         if !self.opened.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let inbox = SessionInbox::new(Arc::clone(&self.log))?;
+        let inbox = self.inbox()?;
         let turn_id = self.effective_turn_id()?;
         inbox.close(&turn_id, recorder.run_id()).await?;
         self.opened.store(false, Ordering::SeqCst);
@@ -281,23 +309,55 @@ impl SessionExecution {
 
     /// Command ids applied so far (for callers projecting progress).
     pub async fn applied_ids(&self) -> crate::error::Result<BTreeSet<String>> {
-        Ok(self.applied.lock().unwrap().clone())
+        Ok(self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use async_trait::async_trait;
+
     use super::*;
-    use crate::message::{Msg, ToolResultBlock, ToolUseBlock};
+    use crate::message::Msg;
     use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionEvent,
+        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionEvent, StorageValue,
     };
 
     async fn journal() -> Arc<dyn SessionLog> {
         let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
         Arc::new(JournalSessionLog::new(storage, "s1"))
+    }
+
+    /// Storage that counts reads, so a test can prove a step reused a cached fold.
+    struct CountingStorage {
+        inner: MemorySessionStorage,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AtomicSessionStorage for CountingStorage {
+        async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(path).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            path: &str,
+            expected_version: u64,
+            bytes: &[u8],
+        ) -> crate::error::Result<bool> {
+            self.inner
+                .compare_and_set(path, expected_version, bytes)
+                .await
+        }
     }
 
     async fn seed(log: &dyn SessionLog, events: Vec<SessionEvent>) {
@@ -635,6 +695,35 @@ mod tests {
         assert_eq!(
             inbox.snapshot().await.unwrap().run_id.as_deref(),
             Some(recorder.run_id())
+        );
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_step_reuses_the_folded_inbox_instead_of_rebuilding_it() {
+        // `before_step` runs on every iteration of the agent loop and used to construct a
+        // fresh `SessionInbox`, throwing away the snapshot cache it carries: each step
+        // re-read and re-decoded every accepted command of the session.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
+            inner: MemorySessionStorage::new(),
+            reads: Arc::clone(&reads),
+        });
+        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(storage, "s1"));
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
+        execution.prepare(&recorder).await.unwrap();
+
+        let mut state = crate::state::AgentState::builder().session_id("s1").build();
+        execution.before_step(&recorder, &mut state).await.unwrap();
+        let before = reads.load(Ordering::SeqCst);
+        execution.before_step(&recorder, &mut state).await.unwrap();
+        let delta = reads.load(Ordering::SeqCst) - before;
+        assert!(
+            delta <= 2,
+            "a step read {delta} values; only the head may be read when the fold is reused"
         );
         recorder.close().await;
     }

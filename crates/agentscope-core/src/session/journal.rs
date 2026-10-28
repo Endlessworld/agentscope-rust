@@ -176,32 +176,71 @@ impl JournalSessionLog {
     }
 
     /// Walks the commit chain backwards, collecting segment ids that carry `(after, through]`.
+    ///
+    /// `tolerant` decides what an unreadable segment means. A strict caller (a scan that must
+    /// return exactly `(after, through]`) fails. A replay caller gets the readable *suffix* plus
+    /// `truncated = true`: one corrupt segment must not make a whole session unopenable, and the
+    /// newest commits — the ones that carry the latest checkpoint — are the ones worth keeping.
+    /// Only data failures are tolerated; a transient storage error still surfaces, otherwise a
+    /// network hiccup would look like history loss.
     async fn segments_through(
         &self,
         head: &Head,
         after: u64,
         through: u64,
-    ) -> crate::error::Result<Vec<String>> {
+        tolerant: bool,
+    ) -> crate::error::Result<(Vec<String>, bool)> {
         let mut ids = VecDeque::new();
         let mut seen = BTreeSet::new();
         let mut expected = head.seq;
+        let mut truncated = false;
         let mut cursor = head.commit_id.clone();
         while let Some(id) = cursor {
             if !seen.insert(id.clone()) {
+                if tolerant {
+                    truncated = true;
+                    break;
+                }
                 return Err(session_error("Commit chain cycle"));
             }
             let path = self.path(&format!("commits/{id}.json"));
-            let stored = self
-                .storage
-                .read(&path)
-                .await?
-                .ok_or_else(|| session_error("Missing committed segment"))?;
-            let commit: Commit = serde_json::from_slice(&stored.bytes)?;
+            let parsed = match self.storage.read(&path).await? {
+                Some(stored) => serde_json::from_slice::<Commit>(&stored.bytes)
+                    .map_err(crate::error::Error::from),
+                None => Err(session_error("Missing committed segment")),
+            };
+            let commit = match parsed {
+                Ok(commit) => commit,
+                Err(error) if tolerant && is_unreadable(&error) => {
+                    tracing::warn!(
+                        session = %self.prefix,
+                        segment = %id,
+                        seq = expected,
+                        %error,
+                        "unreadable committed segment; replaying only the readable suffix"
+                    );
+                    truncated = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let span = commit.events.len() as u64;
             if commit.last_seq != expected
                 || commit.first_seq + span - 1 != expected
                 || commit.events.is_empty()
             {
+                if tolerant {
+                    tracing::warn!(
+                        session = %self.prefix,
+                        segment = %id,
+                        seq = expected,
+                        first_seq = commit.first_seq,
+                        last_seq = commit.last_seq,
+                        "broken committed prefix; replaying only the readable suffix"
+                    );
+                    truncated = true;
+                    break;
+                }
                 return Err(session_error("Broken committed prefix"));
             }
             if commit.first_seq <= through {
@@ -214,10 +253,25 @@ impl JournalSessionLog {
             cursor = commit.parent;
         }
         if expected > after {
-            return Err(session_error("Incomplete committed chain"));
+            if tolerant {
+                truncated = true;
+            } else {
+                return Err(session_error("Incomplete committed chain"));
+            }
         }
-        Ok(ids.into_iter().collect())
+        Ok((ids.into_iter().collect(), truncated))
     }
+}
+
+/// Whether a read failure means the bytes are unusable rather than temporarily unreachable.
+///
+/// Corrupt/missing committed data must not brick a session; an I/O or storage failure must
+/// still surface, because replaying a partial history over a transient outage loses state.
+fn is_unreadable(error: &crate::error::Error) -> bool {
+    matches!(
+        error,
+        crate::error::Error::Session(_) | crate::error::Error::Json(_)
+    )
 }
 
 fn with_payload(event: &SessionEvent, json: String) -> SessionEvent {
@@ -515,7 +569,7 @@ impl SessionLog for JournalSessionLog {
         if after == through {
             return Ok(collected);
         }
-        for id in self.segments_through(&head, after, through).await? {
+        for id in self.segments_through(&head, after, through, true).await?.0 {
             let commit = self.read_commit(&id).await?;
             for candidate in commit.events {
                 if candidate.seq <= cursor {
@@ -537,6 +591,12 @@ impl SessionLog for JournalSessionLog {
         Ok(collected)
     }
 
+    /// Replays the readable prefix of `(after, through]`.
+    ///
+    /// Unlike [`scan`](SessionLog::scan) this never fails on a corrupt segment: it stops at the
+    /// first unreadable commit and visits what it could read (normally the newest commits, which
+    /// carry the latest checkpoint). Recovery must open a session whose history is damaged; a
+    /// reader that refuses to replay at all leaves the user with no way back in.
     async fn visit(
         &self,
         after: u64,
@@ -551,16 +611,36 @@ impl SessionLog for JournalSessionLog {
             return Ok(());
         }
         let mut cursor = after;
-        for id in self.segments_through(&head, after, through).await? {
+        for id in self.segments_through(&head, after, through, true).await?.0 {
             // One commit at a time: its payload (a state checkpoint can be large) is
             // dropped before the next commit is read.
-            let commit = self.read_commit(&id).await?;
+            let commit = match self.read_commit(&id).await {
+                Ok(commit) => commit,
+                Err(error) if is_unreadable(&error) => {
+                    tracing::warn!(
+                        session = %self.prefix,
+                        segment = %id,
+                        seq = cursor,
+                        %error,
+                        "unreadable committed segment; replay stops here"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             for candidate in commit.events {
                 if candidate.seq <= cursor {
                     continue;
                 }
+                // A gap means the prefix below it is unreadable, not that the facts above it are
+                // invalid: replay continues with the newest facts instead of refusing to open.
                 if candidate.seq != cursor + 1 {
-                    return Err(session_error("Non-contiguous event sequence"));
+                    tracing::warn!(
+                        session = %self.prefix,
+                        expected = cursor + 1,
+                        found = candidate.seq,
+                        "gap in the committed prefix; replaying the readable suffix"
+                    );
                 }
                 cursor = candidate.seq;
                 visitor(&candidate)?;
@@ -568,9 +648,6 @@ impl SessionLog for JournalSessionLog {
                     return Ok(());
                 }
             }
-        }
-        if cursor < through {
-            return Err(session_error("Missing committed events"));
         }
         Ok(())
     }

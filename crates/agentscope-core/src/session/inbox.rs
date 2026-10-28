@@ -142,7 +142,10 @@ impl SessionInbox {
     pub async fn snapshot_shared(&self) -> crate::error::Result<Arc<InboxSnapshot>> {
         let head = self.journal.head().await?;
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some((seq, commit, snapshot)) = cache.as_ref() {
                 if *seq == head.seq && commit.as_deref() == head.commit_id.as_deref() {
                     return Ok(Arc::clone(snapshot));
@@ -150,7 +153,10 @@ impl SessionInbox {
             }
         }
         let snapshot = Arc::new(self.fold(&head).await?);
-        *self.cache.lock().unwrap() =
+        *self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some((head.seq, head.commit_id.clone(), Arc::clone(&snapshot)));
         Ok(snapshot)
     }
@@ -162,7 +168,7 @@ impl SessionInbox {
         let mut turn_id = None;
         let mut run_id = None;
 
-        for event in self.journal.scan(0, head.seq).await? {
+        let mut fold = |event: &SessionEvent| -> crate::error::Result<()> {
             let data = event.data()?;
             match event.event_type.as_str() {
                 "inbox/accepted" => commands.push(event.payload::<Command>()?),
@@ -189,11 +195,19 @@ impl SessionInbox {
                         handled.insert(id.to_string());
                     }
                 }
-                other => {
-                    return Err(session_error(format!("Unknown inbox event: {other}")));
-                }
+                // A newer writer may add inbox facts this build does not know. Ignoring one
+                // keeps the queue usable; failing here made the whole session unopenable.
+                other => tracing::warn!(
+                    seq = event.seq,
+                    kind = other,
+                    "ignoring an unknown inbox event"
+                ),
             }
-        }
+            Ok(())
+        };
+        // A corrupt inbox segment must not block the receipt reads that every prompt polls:
+        // replay what is readable and keep accepting new commands.
+        self.journal.visit(0, head.seq, &mut fold).await?;
         Ok(InboxSnapshot {
             commands,
             turn_id,
@@ -385,6 +399,42 @@ mod tests {
         // The same key with identical input returns the original receipt.
         assert_eq!(inbox.accept(&first).await.unwrap(), first);
         assert_eq!(inbox.snapshot().await.unwrap().commands.len(), 1);
+    }
+
+    /// P1-14: an inbox fact from a newer writer must not make the queue unreadable.
+    #[tokio::test]
+    async fn an_unknown_inbox_event_is_ignored() {
+        let (inbox, log) = inbox();
+        inbox
+            .accept(&command("c1", "submit", "hello"))
+            .await
+            .unwrap();
+
+        let journal = log.inbox().unwrap();
+        let head = journal.head().await.unwrap();
+        let writer = journal
+            .acquire("run-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let unknown = SessionEvent::new(
+            "e1",
+            head.seq + 1,
+            0,
+            "inbox/future-fact",
+            None,
+            None,
+            false,
+            "{}",
+        )
+        .unwrap();
+        journal
+            .commit(&writer, "b1", head.seq, &[unknown])
+            .await
+            .unwrap();
+        journal.release(&writer).await.unwrap();
+
+        let snapshot = inbox.snapshot().await.expect("unknown facts are ignored");
+        assert_eq!(snapshot.commands.len(), 1);
     }
 
     #[tokio::test]
