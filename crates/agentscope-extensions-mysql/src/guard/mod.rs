@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentscope_harness::agent::sandbox::SandboxIsolationKey;
+use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey, SandboxLease};
 
 use crate::error::{MysqlError, MysqlResult};
 
@@ -103,12 +103,20 @@ pub trait LockBackend: Send + Sync {
 
 /// MySQL `GET_LOCK()`-backed sandbox execution guard, mirroring
 /// `JdbcSandboxExecutionGuard`.
+#[derive(Clone)]
 pub struct MysqlSandboxExecutionGuard {
     backend: Arc<dyn LockBackend>,
     key_prefix: String,
     lock_timeout: Duration,
     /// Locally tracked leases, used by [`MysqlSandboxExecutionGuard::active_count`].
     active: Arc<Mutex<HashMap<String, usize>>>,
+    /// Concrete leases acquired through the harness `SandboxGuard` trait, keyed by
+    /// isolation key.
+    ///
+    /// The harness `SandboxLease` carries no release hook, so the [`MysqlLockLease`]
+    /// (which releases the named lock on drop) must be retained until
+    /// `SandboxGuard::release` is called.
+    trait_leases: Arc<Mutex<HashMap<SandboxIsolationKey, Vec<MysqlLockLease>>>>,
 }
 
 impl std::fmt::Debug for MysqlSandboxExecutionGuard {
@@ -195,6 +203,75 @@ impl MysqlSandboxExecutionGuard {
     }
 }
 
+#[async_trait::async_trait]
+impl SandboxGuard for MysqlSandboxExecutionGuard {
+    /// Acquires the named lock and retains the concrete [`MysqlLockLease`] until
+    /// [`SandboxGuard::release`] runs.
+    ///
+    /// The backend seam is synchronous (`GET_LOCK(name, timeout)` waits *server-side* for up
+    /// to `lock_timeout`), so the acquisition runs on a blocking thread: awaiting it directly
+    /// would stall a Tokio worker for the whole timeout.
+    ///
+    /// A timed-out acquisition degrades to a no-op lease, mirroring the JDBC guard's
+    /// fallback (the caller then runs unprotected rather than deadlocking).
+    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        let this = self.clone();
+        let acquire_key = key.clone();
+        let acquired = tokio::task::spawn_blocking(move || this.try_enter(&acquire_key)).await;
+        match acquired {
+            Ok(Ok(lease)) => {
+                if let Ok(mut leases) = self.trait_leases.lock() {
+                    leases.entry(key.clone()).or_default().push(lease);
+                }
+                SandboxLease::new(key)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "[mysql-guard] lock not acquired");
+                SandboxLease::noop()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "[mysql-guard] blocking acquire task failed");
+                SandboxLease::noop()
+            }
+        }
+    }
+
+    async fn release(&self, key: &SandboxIsolationKey) {
+        let dropped =
+            self.trait_leases
+                .lock()
+                .ok()
+                .and_then(|mut leases| match leases.get_mut(key) {
+                    Some(stack) => {
+                        let lease = stack.pop();
+                        if stack.is_empty() {
+                            leases.remove(key);
+                        }
+                        lease
+                    }
+                    None => None,
+                });
+        match dropped {
+            // Dropping the lease releases the named lock.
+            Some(lease) => drop(lease),
+            None => MysqlSandboxExecutionGuard::release(self, key),
+        }
+    }
+
+    fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+        MysqlSandboxExecutionGuard::is_held(self, key)
+    }
+
+    fn active_count(&self) -> usize {
+        MysqlSandboxExecutionGuard::active_count(self)
+    }
+
+    /// `GET_LOCK` locks are server-scoped: they serialise across processes.
+    fn is_distributed(&self) -> bool {
+        true
+    }
+}
+
 /// Builder for [`MysqlSandboxExecutionGuard`], mirroring `JdbcSandboxExecutionGuard.Builder`.
 pub struct MysqlSandboxExecutionGuardBuilder {
     backend: Arc<dyn LockBackend>,
@@ -227,6 +304,7 @@ impl MysqlSandboxExecutionGuardBuilder {
             key_prefix: self.key_prefix,
             lock_timeout: self.lock_timeout,
             active: Arc::new(Mutex::new(HashMap::new())),
+            trait_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -315,5 +393,15 @@ mod tests {
             .build();
         let key = SandboxIsolationKey::new("Session", "s1");
         assert_eq!(g.compose_lock_name(&key), "app:lock:session:s1");
+    }
+
+    /// `GET_LOCK` names are server-scoped, so the guard must advertise itself as a
+    /// cross-process (distributed) guard.
+    #[tokio::test]
+    async fn guard_is_distributed() {
+        let g = guard();
+        assert!(SandboxGuard::is_distributed(&g));
+        let object: Arc<dyn SandboxGuard> = Arc::new(guard());
+        assert!(object.is_distributed());
     }
 }

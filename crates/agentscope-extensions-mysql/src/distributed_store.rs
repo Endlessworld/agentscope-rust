@@ -9,13 +9,12 @@
 //! * [`MysqlSandboxExecutionGuard`] — distributed lock via MySQL `GET_LOCK()`.
 //!
 //! ## Harness alignment (EXTENSIONS_GAP_TRACKER.md §2.1 / §2.2)
-//! The harness `DistributedStore` currently exposes only `agent_state_store` +
-//! `isolation_scope`, whereas the Java class also carries `base_store`,
-//! `sandbox_snapshot_spec` and `sandbox_execution_guard`. Per §2.2 this is an open item
-//! for the aggregator. To stay within this crate and avoid inventing parallel harness
-//! types, `MysqlDistributedStore` keeps the full four-component bundle here and exposes
-//! [`MysqlDistributedStore::agent_state_store`] (usable directly with the harness type),
-//! plus accessors for the remaining components that the harness does not yet model.
+//! The harness `DistributedStore` carries `agent_state_store` + `isolation_scope` plus the
+//! composite slots `base_store`, `sandbox_snapshot_spec` and `sandbox_execution_guard`
+//! (tracker §2.2, resolved 2026-10-28). [`MysqlDistributedStore::to_harness_distributed_store`]
+//! therefore projects all four MySQL components: the agent state store, the KV base store,
+//! the snapshot spec, and the distributed execution guard (through the harness
+//! `SandboxGuard` trait implemented by [`MysqlSandboxExecutionGuard`]).
 
 use std::sync::Arc;
 
@@ -108,12 +107,22 @@ impl MysqlDistributedStore {
         self.isolation_scope
     }
 
-    /// Builds the harness [`DistributedStore`] wired with this bundle's agent state store
-    /// and isolation scope (the subset the harness currently models — see §2.2).
+    /// Builds the harness [`DistributedStore`] wired with this bundle's four components
+    /// (agent state store, base store, snapshot spec, execution guard) and isolation scope.
     pub fn to_harness_distributed_store(&self) -> DistributedStore {
+        let state: Arc<dyn AgentStateStore> = self.agent_state_store.clone();
+        let base: Arc<dyn agentscope_harness::filesystem::remote::store::BaseStore> =
+            self.base_store.clone();
+        let snapshots: Arc<dyn agentscope_harness::agent::sandbox::SandboxSnapshotSpec> =
+            self.snapshot_spec.clone();
+        let guard: Arc<dyn agentscope_harness::agent::sandbox::SandboxGuard> =
+            self.execution_guard.clone();
         DistributedStore::builder()
-            .agent_state_store(self.agent_state_store.clone() as Arc<dyn AgentStateStore>)
+            .agent_state_store(state)
             .isolation_scope(self.isolation_scope)
+            .base_store(base)
+            .sandbox_snapshot_spec(snapshots)
+            .sandbox_execution_guard(guard)
             .build()
     }
 }
@@ -289,6 +298,37 @@ mod tests {
         let ds = b.to_harness_distributed_store();
         assert!(ds.agent_state_store.is_some());
         assert_eq!(ds.isolation_scope, IsolationScope::User);
+    }
+
+    /// Tracker §2.2 resolved 2026-10-28: every MySQL component is projected into the
+    /// harness bundle, and the guard is usable through the object-safe `SandboxGuard`.
+    #[tokio::test]
+    async fn to_harness_distributed_store_fills_every_composite_slot() {
+        let b = bundle();
+        let ds = b.to_harness_distributed_store();
+
+        let store = ds.base_store.as_ref().expect("base_store projected");
+        let mut v = agentscope_harness::filesystem::remote::store::StoreValue::new();
+        v.insert("projected".into(), serde_json::json!(true));
+        store.put(&["ns".to_string()], "k", v);
+        assert!(store.get(&["ns".to_string()], "k").is_some());
+
+        let spec = ds
+            .sandbox_snapshot_spec
+            .as_ref()
+            .expect("sandbox_snapshot_spec projected");
+        assert_eq!(spec.build("projected").expect("build").id(), "projected");
+
+        let guard = ds
+            .sandbox_execution_guard
+            .as_ref()
+            .expect("sandbox_execution_guard projected");
+        let key = agentscope_harness::agent::sandbox::SandboxIsolationKey::new("user", "u");
+        let lease = guard.try_enter(key.clone()).await;
+        assert!(!lease.is_noop());
+        assert!(guard.is_held(&key));
+        guard.release(&key).await;
+        assert!(!guard.is_held(&key));
     }
 
     #[test]

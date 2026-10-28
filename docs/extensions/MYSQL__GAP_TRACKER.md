@@ -31,7 +31,7 @@
 | `store.MysqlJdbcStoreDialect` | MySQL 方言 | `store::MysqlStoreDialect` | 其余方言一并迁移：`Postgres/Sqlite/H2 StoreDialect`。**复核差异**：PG/H2 `namespace_path` 为 `VARCHAR(512)`，Java 为 `VARCHAR(2048)`（Java MySQL 方言为 512，已对齐）；**H2 upsert 双方均为 `MERGE INTO ... USING (VALUES ...)`（一致，非偏离）**——Java `H2JdbcStoreDialect` 的类 Javadoc 写「Uses ... `ON CONFLICT ... DO UPDATE`」属**过时注释**，其 `getUpsertSql()` 实际返回 `MERGE INTO`，故此处以代码为准 |
 | `snapshot.JdbcSnapshotSpec` | 快照 spec（BLOB 表） | `snapshot::MysqlSnapshotSpec`（`impl SandboxSnapshotSpec`） | **复用 harness `RemoteSnapshotSpec`**，快照 id 校验以 harness 为准 |
 | `snapshot.JdbcRemoteSnapshotClient` | BLOB 上传/下载/存在性 | `snapshot::MysqlRemoteSnapshotClient`（`impl RemoteSnapshotClient`） | 表名默认 `agentscope_snapshots` |
-| `sandbox.JdbcSandboxExecutionGuard` | MySQL `GET_LOCK()` 分布式锁 | `guard::MysqlSandboxExecutionGuard` / `MysqlLockLease` | harness 的 guard 是**具体 struct 非 trait**，故此处为镜像 API 的具体类型（见 §4.2）。**复核差异**：Java `composeLockName` 有 64 字符上限（超长截断 50 + `hashCode` 十六进制），本 crate **无此截断**；Java `Builder.keyPrefix` 会自动补尾部 `:` 且拒绝空白，本 crate `key_prefix()` **原样使用**（`"app:lock:"` 需自带冒号）；Java 默认超时 **1800s**，本 crate 默认 **30s**；`SandboxIsolationKey.sub_key` 为 Rust 侧新增（Java 无），属扩展非缺口 |
+| `sandbox.JdbcSandboxExecutionGuard` | MySQL `GET_LOCK()` 分布式锁 | `guard::MysqlSandboxExecutionGuard` / `MysqlLockLease` | **已解决（2026-10-28）**：harness 新增 `SandboxGuard` trait，`MysqlSandboxExecutionGuard` 已 `impl SandboxGuard`（四方法委托固有方法，内部 `trait_leases` 保留具体租约，见 §4.2 执行记录）。**复核差异**：Java `composeLockName` 有 64 字符上限（超长截断 50 + `hashCode` 十六进制），本 crate **无此截断**；Java `Builder.keyPrefix` 会自动补尾部 `:` 且拒绝空白，本 crate `key_prefix()` **原样使用**（`"app:lock:"` 需自带冒号）；Java 默认超时 **1800s**，本 crate 默认 **30s**；`SandboxIsolationKey.sub_key` 为 Rust 侧新增（Java 无），属扩展非缺口 |
 | `_hash` 变更检测键（`HASH_KEY_SUFFIX`） | 列表变更检测伴随行 | `state::HASH_KEY_SUFFIX` + `state::save_list_impl` | **已对齐（2026-10-26）**：`{key}:_hash` 行存 `agentscope_core::state::list_hash::compute_hash(values)`，写入前用 `needs_full_rewrite` 判定「全量重写 / 仅追加尾部 / 跳过」；不再被借用为版本键（版本改存行内 `version` 列） |
 
 ### 2.1 依赖映射（Java → Rust）
@@ -161,7 +161,7 @@
 
 | 契约项 | Rust 产出 | 存在 | 接线 |
 |---|---|---|---|
-| `XxxDistributedStore` | `MysqlDistributedStore` + `MysqlDistributedStoreBuilder`（`distributed_store.rs`） | ✅ | 4 组件 + `isolation_scope` 全量持有；`to_harness_distributed_store()` 输出 harness 子集 |
+| `XxxDistributedStore` | `MysqlDistributedStore` + `MysqlDistributedStoreBuilder`（`distributed_store.rs`） | ✅ | 4 组件 + `isolation_scope` 全量持有；`to_harness_distributed_store()` **全量投影 5 槽**（2026-10-28） |
 | `XxxAgentStateStore` | `state::MysqlAgentStateStore`（`impl AgentStateStore`） | ✅ | 实现 `save/save_list/get/get_list/exists/delete/list_session_ids/supports_versioning/get_versioned/save_if_version` |
 | `XxxStore`（`BaseStore`） | `store::MysqlStore`（`impl BaseStore`） | ✅ | `get/put/put_if_version/search/delete/supports_atomic_session_storage` |
 | `XxxSnapshotSpec` | `snapshot::MysqlSnapshotSpec`（`impl SandboxSnapshotSpec`，包 `RemoteSnapshotSpec`） | ✅ | `build()` 委托 harness，快照 id 校验复用 harness |
@@ -343,3 +343,33 @@
 - **约束 2（禁止）**：**不得让 Java 与 Rust 混部共享同一份带 list 的状态**。否则每次写入都退化为全量重写：功能正确，但增量优化完全失效（性能退化）。
 - **触发条件**：若未来确需混部，再实现 Java `String.hashCode()` 的 32 位截断语义，并在两侧加交叉校验用例。
 - **红线**：不要为了让两侧相等而改 `compute_hash` 的算法——那会让**已落库**的 hash 全部失配，触发一次性全量重写风暴。
+
+## 2026-10-28 执行记录：`DistributedStore` 复合槽位投影（§4.2 已解决）
+
+### 背景
+
+harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`）与 `SandboxGuard` trait。本 crate 的 `to_harness_distributed_store()` 改为 builder 写法并接线全部槽位。
+
+### 投影映射表
+
+| harness 槽位 | 类型 | 来源 | 说明 |
+|---|---|---|---|
+| `agent_state_store` | `Arc<dyn AgentStateStore>` | `Arc<MysqlAgentStateStore>` | 会话状态 |
+| `isolation_scope` | `IsolationScope` | 字段 `isolation_scope` | 默认 `User` |
+| `base_store` | `Arc<dyn BaseStore>` | `Arc<MysqlStore>` | 工作区 KV |
+| `sandbox_snapshot_spec` | `Arc<dyn SandboxSnapshotSpec>` | `Arc<MysqlSnapshotSpec>` | 快照 BLOB |
+| `sandbox_execution_guard` | `Arc<dyn SandboxGuard>` | `Arc<MysqlSandboxExecutionGuard>` | `GET_LOCK()`；新增 `impl SandboxGuard` |
+
+### 代码改动
+
+- `src/distributed_store.rs::to_harness_distributed_store()`：填满 5 槽（builder，不用 `..Default::default()`）。
+- `src/guard/mod.rs`：新增私有字段 `trait_leases: Arc<Mutex<HashMap<SandboxIsolationKey, Vec<MysqlLockLease>>>>`（harness 租约无释放钩子，需保留具体租约否则提前解锁）+ `impl SandboxGuard`；`try_enter` 超时降级为 `SandboxLease::noop()`（与 JDBC guard 一致）。
+- 测试：`src/distributed_store.rs::to_harness_distributed_store_fills_every_composite_slot`。
+
+### 验证
+
+`cargo test -p agentscope-extensions-mysql` → **71 passed / 0 failed**。
+
+### 未完成 / 语义差异
+
+- 无留空槽位；仍存在 §3 已登记的 Java 差异（64 字符截断、默认超时 1800s vs 30s），本次未变更。
