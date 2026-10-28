@@ -32,9 +32,26 @@ impl SessionKey {
         })
     }
 
-    /// Storage path: `agents/{agent}/sessions/{user}/{session}`, each component encoded so
-    /// arbitrary ids cannot escape the namespace.
+    /// Storage path: `.agentscope/sessions/{agent}/{user}/{session}`, each component encoded
+    /// so arbitrary ids cannot escape the namespace.
+    ///
+    /// Sessions used to live in `agents/{agent}/sessions/...` inside the workspace. That
+    /// polluted the project tree, so they moved under `.agentscope`; the old layout is still
+    /// readable through [`legacy_storage_path`](Self::legacy_storage_path).
     pub fn storage_path(&self) -> String {
+        format!(
+            ".agentscope/sessions/{}/{}/{}",
+            encode(&self.agent_id),
+            encode(self.user_id.as_deref().unwrap_or("")),
+            encode(&self.session_id)
+        )
+    }
+
+    /// The pre-migration location of the same session: `agents/{agent}/sessions/{user}/{session}`.
+    ///
+    /// Read-only fallback: a session that only exists here keeps being opened in place so
+    /// upgrading does not make old conversations disappear.
+    pub fn legacy_storage_path(&self) -> String {
         format!(
             "agents/{}/sessions/{}/{}",
             encode(&self.agent_id),
@@ -58,10 +75,20 @@ mod tests {
         // `s_YWxpY2U` is URL-safe base64 of "alice" without padding.
         assert_eq!(
             key.storage_path(),
-            "agents/s_Y29zdC1hc3Npc3RhbnQ/sessions/s_YWxpY2U/s_Y29udmVyc2F0aW9uLzAwMQ"
+            ".agentscope/sessions/s_Y29zdC1hc3Npc3RhbnQ/s_YWxpY2U/s_Y29udmVyc2F0aW9uLzAwMQ"
         );
         // The encoded path never contains a raw separator from the id.
         assert!(!key.storage_path().contains("conversation/001"));
+    }
+
+    #[test]
+    fn the_legacy_path_keeps_the_old_layout() {
+        let key = SessionKey::new(Some("alice"), "cost-assistant", "conversation/001").unwrap();
+        assert_eq!(
+            key.legacy_storage_path(),
+            "agents/s_Y29zdC1hc3Npc3RhbnQ/sessions/s_YWxpY2U/s_Y29udmVyc2F0aW9uLzAwMQ"
+        );
+        assert_ne!(key.storage_path(), key.legacy_storage_path());
     }
 
     #[test]
@@ -69,6 +96,9 @@ mod tests {
         let key = SessionKey::new(None::<String>, "agent", "s1").unwrap();
         assert!(key
             .storage_path()
+            .starts_with(".agentscope/sessions/s_YWdlbnQ/s_/s_"));
+        assert!(key
+            .legacy_storage_path()
             .starts_with("agents/s_YWdlbnQ/sessions/s_/s_"));
     }
 

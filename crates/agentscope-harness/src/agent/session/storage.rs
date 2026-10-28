@@ -325,7 +325,65 @@ impl WorkspaceSessionLogStore {
             storage: Arc::new(WorkspaceSessionStorage::new(fs)),
         }
     }
+
+    /// Journal prefix for `key`: the current layout, unless this session only exists in the
+    /// legacy `agents/...` tree — then it keeps being opened there.
+    ///
+    /// The fallback is deliberately not a migration: copying a live journal would fork it
+    /// (two writers, two heads). A session written by an older build simply stays where it is.
+    async fn journal_prefix(&self, key: &SessionKey) -> String {
+        let current = key.storage_path();
+        if self.has_journal(&current).await {
+            return current;
+        }
+        let legacy = key.legacy_storage_path();
+        if self.has_journal(&legacy).await {
+            tracing::debug!(
+                session = %key.session_id,
+                path = %legacy,
+                "opening a session from the legacy journal location"
+            );
+            return legacy;
+        }
+        current
+    }
+
+    /// Whether a journal already exists at `prefix` (its head, or at least its header marker).
+    async fn has_journal(&self, prefix: &str) -> bool {
+        for marker in ["head.json", "session.json"] {
+            if let Ok(Some(_)) = self.storage.read(&format!("{prefix}/{marker}")).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Collects the session keys directly under `user_path` into `keys`.
+    async fn collect_sessions(
+        &self,
+        user_path: &str,
+        agent_id: &str,
+        decoded_user: Option<&str>,
+        keys: &mut Vec<SessionKey>,
+    ) -> crate::Result<()> {
+        for session_path in self.storage.list_dirs(user_path).await? {
+            let Some(session_id) = decode_component(session_path.rsplit('/').next().unwrap_or(""))
+            else {
+                continue;
+            };
+            if let Ok(key) = SessionKey::new(decoded_user.map(str::to_string), agent_id, session_id)
+            {
+                keys.push(key);
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Root of the current session layout (`.agentscope/sessions/<agent>/<user>/<session>`).
+const SESSION_ROOT: &str = ".agentscope/sessions";
+/// Root of the pre-migration layout (`agents/<agent>/sessions/<user>/<session>`).
+const LEGACY_SESSION_ROOT: &str = "agents";
 
 #[async_trait]
 impl SessionLogStore for WorkspaceSessionLogStore {
@@ -334,55 +392,64 @@ impl SessionLogStore for WorkspaceSessionLogStore {
         key: &SessionKey,
         _context: &RuntimeContext,
     ) -> crate::Result<Arc<dyn SessionLog>> {
+        let prefix = self.journal_prefix(key).await;
         Ok(Arc::new(agentscope_core::session::JournalSessionLog::new(
             Arc::clone(&self.storage) as Arc<dyn AtomicSessionStorage>,
-            key.storage_path(),
+            prefix,
         )))
     }
 
     async fn list(&self, context: &RuntimeContext) -> crate::Result<Vec<SessionKey>> {
         let user_id = context.user_id();
-        let agents = self.storage.list_dirs("agents").await?;
         let mut keys = Vec::new();
-        for agent_path in agents {
+        // Current layout: `.agentscope/sessions/<agent>/<user>/<session>`.
+        for agent_path in self.storage.list_dirs(SESSION_ROOT).await? {
             let Some(agent_id) = decode_component(agent_path.rsplit('/').next().unwrap_or(""))
             else {
                 continue;
             };
-            let users = self
-                .storage
-                .list_dirs(&format!("{agent_path}/sessions"))
-                .await?;
-            for user_path in users {
+            for user_path in self.storage.list_dirs(&agent_path).await? {
                 let Some(decoded_user) =
                     decode_component(user_path.rsplit('/').next().unwrap_or(""))
                 else {
                     continue;
                 };
-                // Discovery never crosses user namespaces.
-                let decoded_user = if decoded_user.is_empty() {
-                    None
-                } else {
-                    Some(decoded_user)
-                };
+                // An anonymous session encodes an empty user component; discovery never
+                // crosses user namespaces.
+                let decoded_user = Some(decoded_user).filter(|user| !user.is_empty());
                 if decoded_user.as_deref() != user_id {
                     continue;
                 }
-                for session_path in self.storage.list_dirs(&user_path).await? {
-                    let Some(session_id) =
-                        decode_component(session_path.rsplit('/').next().unwrap_or(""))
-                    else {
-                        continue;
-                    };
-                    if let Ok(key) =
-                        SessionKey::new(decoded_user.clone(), agent_id.clone(), session_id)
-                    {
-                        keys.push(key);
-                    }
+                self.collect_sessions(&user_path, &agent_id, decoded_user.as_deref(), &mut keys)
+                    .await?;
+            }
+        }
+        // Legacy layout: `agents/<agent>/sessions/<user>/<session>`, read-only fallback.
+        for agent_path in self.storage.list_dirs(LEGACY_SESSION_ROOT).await? {
+            let Some(agent_id) = decode_component(agent_path.rsplit('/').next().unwrap_or(""))
+            else {
+                continue;
+            };
+            for user_path in self
+                .storage
+                .list_dirs(&format!("{agent_path}/sessions"))
+                .await?
+            {
+                let Some(decoded_user) =
+                    decode_component(user_path.rsplit('/').next().unwrap_or(""))
+                else {
+                    continue;
+                };
+                let decoded_user = Some(decoded_user).filter(|user| !user.is_empty());
+                if decoded_user.as_deref() != user_id {
+                    continue;
                 }
+                self.collect_sessions(&user_path, &agent_id, decoded_user.as_deref(), &mut keys)
+                    .await?;
             }
         }
         keys.sort();
+        keys.dedup();
         Ok(keys)
     }
 }
@@ -401,6 +468,21 @@ mod tests {
     use super::*;
     use crate::filesystem::LocalFilesystem;
     use agentscope_core::session::JournalSessionLog;
+
+    /// A minimal committed event for storage tests.
+    fn event(seq: u64, event_type: &str) -> agentscope_core::session::SessionEvent {
+        agentscope_core::session::SessionEvent::new(
+            format!("e{seq}"),
+            seq,
+            0,
+            event_type,
+            None,
+            None,
+            true,
+            "{}",
+        )
+        .unwrap()
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let base =
@@ -693,13 +775,140 @@ mod tests {
     fn storage_components_round_trip() {
         let key = SessionKey::new(Some("alice"), "agent/x", "s 1").unwrap();
         let path = key.storage_path();
-        let agent_component = path.split('/').nth(1).unwrap();
+        // `.agentscope/sessions/<agent>/<user>/<session>`
+        let agent_component = path.split('/').nth(2).unwrap();
         assert_eq!(
             decode_component(agent_component).as_deref(),
             Some("agent/x")
         );
         // A non-encoded component is rejected rather than guessed.
         assert!(decode_component("raw").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_session_is_written_under_the_agentscope_directory() {
+        let dir = temp_dir("new_layout");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let ctx = RuntimeContext::new().with_user_id("alice");
+        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+
+        let log = store.open(&key, &ctx).await.unwrap();
+        let writer = log
+            .acquire("run-1", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        log.commit(&writer, "b1", 0, &[event(1, "run/start")])
+            .await
+            .unwrap();
+        log.release(&writer).await.unwrap();
+
+        let head = format!("{}/head.json", key.storage_path());
+        assert!(
+            fs.exists(&ctx, &head).await.unwrap(),
+            "the journal must live under .agentscope/sessions"
+        );
+        assert!(
+            !fs.exists(&ctx, &format!("{}/head.json", key.legacy_storage_path()))
+                .await
+                .unwrap(),
+            "nothing may be written to the legacy location"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_only_exists_in_the_legacy_location_still_opens() {
+        // Upgrading must not make old conversations disappear: a journal written by an older
+        // build is opened where it is (no copy, so the two locations cannot fork).
+        let dir = temp_dir("legacy_fallback");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let ctx = RuntimeContext::new().with_user_id("alice");
+        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+
+        let legacy = key.legacy_storage_path();
+        {
+            let storage: Arc<dyn AtomicSessionStorage> =
+                Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
+            let log = JournalSessionLog::new(storage, legacy.clone());
+            let writer = log
+                .acquire("run-1", std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            log.commit(&writer, "b1", 0, &[event(1, "run/start")])
+                .await
+                .unwrap();
+            log.release(&writer).await.unwrap();
+        }
+
+        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let log = store.open(&key, &ctx).await.unwrap();
+        assert_eq!(log.head().await.unwrap().seq, 1);
+        assert_eq!(log.scan(0, 1).await.unwrap().len(), 1);
+        // The fallback keeps writing to the same journal instead of starting a second one.
+        let writer = log
+            .acquire("run-2", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        log.commit(&writer, "b2", 1, &[event(2, "run/end")])
+            .await
+            .unwrap();
+        log.release(&writer).await.unwrap();
+        assert!(fs
+            .exists(&ctx, &format!("{legacy}/head.json"))
+            .await
+            .unwrap());
+        assert!(!fs
+            .exists(&ctx, &format!("{}/head.json", key.storage_path()))
+            .await
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn discovery_lists_sessions_from_both_locations() {
+        let dir = temp_dir("both_layouts");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let ctx = RuntimeContext::new().with_user_id("alice");
+        let current = SessionKey::new(Some("alice"), "agent", "new-one").unwrap();
+        let legacy = SessionKey::new(Some("alice"), "agent", "old-one").unwrap();
+
+        // One session in the current layout…
+        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let log = store.open(&current, &ctx).await.unwrap();
+        let writer = log
+            .acquire("run-1", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        log.commit(&writer, "b1", 0, &[event(1, "run/start")])
+            .await
+            .unwrap();
+        log.release(&writer).await.unwrap();
+
+        // …and one only in the legacy tree.
+        {
+            let storage: Arc<dyn AtomicSessionStorage> =
+                Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
+            let log = JournalSessionLog::new(storage, legacy.legacy_storage_path());
+            let writer = log
+                .acquire("run-1", std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            log.commit(&writer, "b1", 0, &[event(1, "run/start")])
+                .await
+                .unwrap();
+            log.release(&writer).await.unwrap();
+        }
+
+        let mut keys = store.list(&ctx).await.unwrap();
+        keys.sort();
+        let mut expected = vec![current, legacy];
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
