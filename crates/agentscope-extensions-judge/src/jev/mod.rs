@@ -9,13 +9,25 @@
 //! * [`review`] — deterministic review regions and the review snapshot type.
 //! * [`execution`] — per-subscription budget/observation DTOs.
 
+pub mod application;
+pub mod call;
+pub mod client;
+pub mod code_review;
+pub mod context;
 pub mod dto;
+pub mod evaluation;
+pub mod evidence;
 pub mod execution;
 pub mod guardrail;
+pub mod integration;
+pub mod judge;
 pub mod probability;
+pub mod supervision;
 pub mod review;
+pub mod routing;
 pub mod validation;
 
+pub use client::{is_retryable_status, JevClient, JevClientBuilder};
 pub use dto::{
     Answer, ChoiceAnswer, ChoiceQuestion, JsonMap, NoulAnswer, NoulCriteria, NoulQuestion,
     Question, ScoreAnswer, ScoreQuestion, SystemOneRequest, SystemOneRequestBuilder,
@@ -141,6 +153,13 @@ pub fn default_api_key(
 
 /// The names of the environment variables Java checks, in precedence order.
 pub const API_KEY_ENV_VARS: [&str; 2] = ["TYPESAFE_API_KEY", "JEV_API_KEY"];
+
+/// Reads the API key from the environment the way `JevClient.Builder.defaultApiKey` does.
+pub fn api_key_from_env() -> Option<String> {
+    let typesafe = std::env::var(API_KEY_ENV_VARS[0]).ok();
+    let jev = std::env::var(API_KEY_ENV_VARS[1]).ok();
+    default_api_key(typesafe.as_deref(), jev.as_deref())
+}
 
 /// Extracts an HTTP error message the way `JevClient.errorMessage` does: `message`, then `error`
 /// (possibly nested at `error.<field>`), then `detail`, else the raw body.

@@ -13,3 +13,15 @@ rust-version.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# Reached only through the injectable `http::JudgeHttpTransport` seam, so unit tests stay
+# offline; `agentscope-core` / `agentscope-harness` remain undeclared by design.
+reqwest = { workspace = true }
+# `buffered` streams keep the Java `flatMapSequential` concurrency semantics for the runners.
+futures = { workspace = true }
+# Content-addressed context-archive references (Java `MessageDigest.getInstance("SHA-256")`).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

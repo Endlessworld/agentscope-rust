@@ -44,6 +44,10 @@ impl NoulCriteria {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoulQuestion {
     /// Free-form instructions (Java `Object`).
+    ///
+    /// Java annotates the record with `@JsonInclude(NON_NULL)`, so an absent `instructions` is
+    /// omitted rather than serialized as `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Value>,
     /// Optional descriptions of the two outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,11 +211,17 @@ impl Answer {
 }
 
 /// Token usage reported by the System One API.
+///
+/// Java declares both counters as primitive `long`, so Jackson turns a *missing* field into
+/// `0` instead of failing; `#[serde(default)]` reproduces that. A `null` value still fails to
+/// deserialize, exactly like Jackson binding `null` to a primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// Input tokens billed for this call.
+    #[serde(default)]
     pub input_tokens: i64,
     /// Output tokens billed for this call.
+    #[serde(default)]
     pub output_tokens: i64,
 }
 
@@ -481,5 +491,40 @@ mod tests {
             .questions(BTreeMap::new())
             .build();
         assert!(replaced.questions.is_empty());
+    }
+
+    #[test]
+    fn omits_null_noul_instructions_like_jackson_non_null() {
+        let question = Question::Noul(NoulQuestion {
+            instructions: None,
+            criteria: None,
+        });
+        assert_eq!(
+            serde_json::to_value(&question).unwrap(),
+            json!({ "type": "noul" }),
+            "Java's @JsonInclude(NON_NULL) omits absent instructions"
+        );
+
+        // An explicit JSON `null` still maps to `None`, so responses stay parseable.
+        let parsed: Question =
+            serde_json::from_value(json!({ "type": "noul", "instructions": null })).unwrap();
+        assert_eq!(
+            parsed,
+            Question::Noul(NoulQuestion {
+                instructions: None,
+                criteria: None
+            })
+        );
+    }
+
+    #[test]
+    fn usage_defaults_missing_counters_to_zero_like_a_java_primitive() {
+        let usage: Usage = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(usage, Usage::new(0, 0));
+        let partial: Usage = serde_json::from_value(json!({ "output_tokens": 7 })).unwrap();
+        assert_eq!(partial, Usage::new(0, 7));
+
+        // Jackson fails to bind `null` onto a primitive long, and so does the port.
+        assert!(serde_json::from_value::<Usage>(json!({ "input_tokens": null })).is_err());
     }
 }
