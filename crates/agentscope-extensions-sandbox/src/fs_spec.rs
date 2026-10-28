@@ -35,6 +35,8 @@ use crate::daytona::{daytona_client, DaytonaSandboxClientOptions};
 use crate::e2b::{e2b_client, E2bSandboxClientOptions};
 use crate::error::{SandboxExtensionError, SandboxResult};
 use crate::kubernetes::{kubernetes_client, KubernetesSandboxClientOptions};
+use crate::kubernetes_files::SandboxFileTransfer;
+use crate::remote::RemoteSandbox;
 use crate::workspace::shell_quote;
 
 /// Default workspace-projection entries copied into the sandbox workspace.
@@ -151,15 +153,31 @@ pub trait SandboxFilesystemSpec: Debug + Send + Sync {
 
     /// Builds a harness [`SandboxFilesystem`] bound to a live sandbox.
     fn filesystem(&self, sandbox: Arc<dyn Sandbox>, cwd: &str) -> Arc<dyn SandboxFilesystem> {
+        self.filesystem_with_transfer(sandbox, None, cwd)
+    }
+
+    /// Builds a harness [`SandboxFilesystem`] that prefers native file transfer.
+    ///
+    /// Mirrors the Java `SandboxBackedFilesystem` `instanceof SandboxFileTransfer` branch: when a
+    /// transfer adapter is supplied, paths it accepts are read/written through it and only the
+    /// remaining paths fall back to base64-over-exec. Callers obtain the adapter from
+    /// [`RemoteSandbox::file_transfer`] (or build one from a backend directly).
+    fn filesystem_with_transfer(
+        &self,
+        sandbox: Arc<dyn Sandbox>,
+        transfer: Option<Arc<dyn SandboxFileTransfer>>,
+        cwd: &str,
+    ) -> Arc<dyn SandboxFilesystem> {
         let root = self
             .effective_workspace_spec()
             .root
             .to_string_lossy()
             .replace('\\', "/");
-        Arc::new(SandboxFilesystemAdapter::new(
+        Arc::new(SandboxFilesystemAdapter::new_with_transfer(
             sandbox,
             root,
             cwd.to_string(),
+            transfer,
         ))
     }
 }
@@ -222,25 +240,74 @@ impl SandboxClient for ClientHandle {
 /// and runs shell commands on the **local host**. A remote sandbox has no local filesystem to
 /// delegate to, so every operation is expressed as a shell command run through
 /// [`Sandbox::exec`] — the same strategy the Java `SandboxBackedFilesystem` uses once a live
-/// sandbox is bound.
+/// sandbox is bound. When a [`SandboxFileTransfer`] adapter is attached, `read`/`write` (and
+/// therefore `edit`) prefer it for paths it accepts and fall back to the shell strategy
+/// otherwise, matching the Java `instanceof SandboxFileTransfer` branch.
 #[derive(Debug)]
 pub struct SandboxFilesystemAdapter {
     sandbox: Arc<dyn Sandbox>,
     workspace_root: String,
     cwd: String,
+    /// Native file-transfer adapter, when the backend exposes a runtime file API.
+    ///
+    /// Mirrors the Java `SandboxBackedFilesystem` `instanceof SandboxFileTransfer` probe: paths
+    /// the adapter accepts bypass base64-over-exec entirely.
+    transfer: Option<Arc<dyn SandboxFileTransfer>>,
 }
 
 impl SandboxFilesystemAdapter {
-    /// Creates an adapter over a live sandbox.
+    /// Creates an adapter over a live sandbox (exec-only, no native transfer).
     pub fn new(
         sandbox: Arc<dyn Sandbox>,
         workspace_root: impl Into<String>,
         cwd: impl Into<String>,
     ) -> Self {
+        Self::new_with_transfer(sandbox, workspace_root, cwd, None)
+    }
+
+    /// Creates an adapter that prefers `transfer` for the paths it accepts.
+    pub fn new_with_transfer(
+        sandbox: Arc<dyn Sandbox>,
+        workspace_root: impl Into<String>,
+        cwd: impl Into<String>,
+        transfer: Option<Arc<dyn SandboxFileTransfer>>,
+    ) -> Self {
         Self {
             sandbox,
             workspace_root: workspace_root.into(),
             cwd: cwd.into(),
+            transfer,
+        }
+    }
+
+    /// Attaches a native file-transfer adapter (builder style).
+    pub fn with_file_transfer(mut self, transfer: Arc<dyn SandboxFileTransfer>) -> Self {
+        self.transfer = Some(transfer);
+        self
+    }
+
+    /// Returns the attached native file-transfer adapter, if any.
+    pub fn file_transfer(&self) -> Option<&Arc<dyn SandboxFileTransfer>> {
+        self.transfer.as_ref()
+    }
+
+    /// Returns a live sandbox paired with its native transfer adapter as a filesystem.
+    ///
+    /// This is the Rust equivalent of the Java `SandboxBackedFilesystem` auto-detection: the
+    /// adapter asks the sandbox for its backend-provided transfer capability at construction
+    /// time.
+    pub fn from_remote_sandbox(
+        sandbox: Arc<RemoteSandbox>,
+        workspace_root: impl Into<String>,
+        cwd: impl Into<String>,
+    ) -> Self {
+        let transfer = sandbox.file_transfer();
+        let sandbox: Arc<dyn Sandbox> = sandbox;
+        Self {
+            sandbox,
+            workspace_root: workspace_root.into(),
+            cwd: cwd.into(),
+            transfer,
         }
     }
 
@@ -379,6 +446,41 @@ pub fn parse_grep_output(output: &str) -> Vec<GrepMatch> {
     matches
 }
 
+/// Applies the `sed -n 'start,endp'` line window to already-downloaded text.
+///
+/// `offset` is 0-based and `limit == 0` means "to the end". Lines keep their original
+/// terminators, so the result is byte-identical to what the exec path returns for the same
+/// window (a trailing newline is preserved, a final unterminated line stays unterminated).
+pub fn apply_line_window(content: &str, offset: usize, limit: usize) -> String {
+    let mut out = String::new();
+    let mut emitted = 0usize;
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        if index < offset {
+            continue;
+        }
+        if limit > 0 && emitted >= limit {
+            break;
+        }
+        out.push_str(line);
+        emitted += 1;
+    }
+    out
+}
+
+/// Projects downloaded bytes onto a harness [`FileData`] honouring the read window.
+///
+/// Binary payloads (NUL bytes) are returned base64-encoded in full, mirroring the exec path
+/// which cannot window binary data meaningfully.
+fn file_data_from_bytes(bytes: &[u8], offset: usize, limit: usize) -> FileData {
+    if bytes.contains(&0) {
+        use base64::Engine as _;
+        FileData::binary(base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        let text = String::from_utf8_lossy(bytes);
+        FileData::text(apply_line_window(&text, offset, limit))
+    }
+}
+
 fn decode_text(data: &FileData) -> Result<String> {
     if data.encoding == "base64" {
         use base64::Engine as _;
@@ -433,6 +535,15 @@ impl Filesystem for SandboxFilesystemAdapter {
         limit: usize,
     ) -> Result<FileData> {
         let absolute = self.resolve_path(path);
+        if let Some(transfer) = self.transfer.as_ref() {
+            if transfer.supports_file_transfer(&absolute) {
+                let bytes = transfer
+                    .download_file(&absolute)
+                    .await
+                    .map_err(|e| Error::Tool(format!("sandbox read failed for '{path}': {e}")))?;
+                return Ok(file_data_from_bytes(&bytes, offset, limit));
+            }
+        }
         if !self.exists(ctx, &absolute).await? {
             return Err(Error::Tool(format!("File '{path}' not found")));
         }
@@ -449,6 +560,15 @@ impl Filesystem for SandboxFilesystemAdapter {
 
     async fn write(&self, _ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
         let absolute = self.resolve_path(path);
+        if let Some(transfer) = self.transfer.as_ref() {
+            if transfer.supports_file_transfer(&absolute) {
+                transfer
+                    .upload_file(&absolute, content.as_bytes())
+                    .await
+                    .map_err(|e| Error::Tool(format!("sandbox write failed for '{path}': {e}")))?;
+                return Ok(());
+            }
+        }
         if let Some(parent) = crate::workspace::parent_dir(&absolute) {
             self.run_checked(&format!("mkdir -p {}", shell_quote(&parent)), "mkdir", 60)
                 .await?;
@@ -990,5 +1110,119 @@ mod tests {
         assert!(Filesystem::exists(&fs, &ctx, "a.txt").await.unwrap());
         let seen = sandbox.commands.lock().unwrap().clone();
         assert_eq!(seen, vec!["test -e /workspace/a.txt".to_string()]);
+    }
+
+    // -------------------------------- native file transfer preference (Java `instanceof`)
+
+    /// Recording `SandboxFileTransfer` scoped to a path prefix.
+    #[derive(Debug)]
+    struct FakeTransfer {
+        scope: String,
+        uploads: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        content: Vec<u8>,
+    }
+
+    impl FakeTransfer {
+        fn new(scope: &str, content: &[u8]) -> Self {
+            Self {
+                scope: scope.to_string(),
+                uploads: std::sync::Mutex::new(Vec::new()),
+                content: content.to_vec(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxFileTransfer for FakeTransfer {
+        fn supports_file_transfer(&self, absolute_path: &str) -> bool {
+            absolute_path.starts_with(&self.scope)
+        }
+
+        async fn upload_file(&self, absolute_path: &str, content: &[u8]) -> SandboxResult<()> {
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((absolute_path.to_string(), content.to_vec()));
+            Ok(())
+        }
+
+        async fn download_file(&self, _absolute_path: &str) -> SandboxResult<Vec<u8>> {
+            Ok(self.content.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_write_prefers_native_transfer() {
+        let sandbox = Arc::new(FakeSandbox::default());
+        let transfer = Arc::new(FakeTransfer::new("/workspace/", b""));
+        let fs = SandboxFilesystemAdapter::new_with_transfer(
+            sandbox.clone(),
+            "/workspace",
+            ".",
+            Some(transfer.clone()),
+        );
+        let ctx = RuntimeContext::new();
+        Filesystem::write(&fs, &ctx, "a.txt", "hello")
+            .await
+            .unwrap();
+        let uploads = transfer.uploads.lock().unwrap().clone();
+        assert_eq!(
+            uploads,
+            vec![("/workspace/a.txt".to_string(), b"hello".to_vec())]
+        );
+        // No mkdir / base64 shell command was needed.
+        assert!(sandbox.commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adapter_write_falls_back_to_exec_outside_the_transfer_scope() {
+        let sandbox = Arc::new(FakeSandbox::default());
+        let transfer = Arc::new(FakeTransfer::new("/workspace/inner/", b""));
+        let fs = SandboxFilesystemAdapter::new_with_transfer(
+            sandbox.clone(),
+            "/workspace",
+            ".",
+            Some(transfer.clone()),
+        );
+        let ctx = RuntimeContext::new();
+        Filesystem::write(&fs, &ctx, "a.txt", "hello")
+            .await
+            .unwrap();
+        assert!(transfer.uploads.lock().unwrap().is_empty());
+        let commands = sandbox.commands.lock().unwrap().clone();
+        assert!(
+            commands.iter().any(|c| c.contains("base64 -d")),
+            "commands: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_read_prefers_native_transfer_and_windows_lines() {
+        let sandbox = Arc::new(FakeSandbox::default());
+        let transfer = Arc::new(FakeTransfer::new("/workspace/", b"l1\nl2\nl3\n"));
+        let fs = SandboxFilesystemAdapter::new_with_transfer(
+            sandbox.clone(),
+            "/workspace",
+            ".",
+            Some(transfer),
+        );
+        let ctx = RuntimeContext::new();
+        let data = Filesystem::read(&fs, &ctx, "a.txt", 1, 1).await.unwrap();
+        assert_eq!(data.content, "l2\n");
+        assert!(sandbox.commands.lock().unwrap().is_empty());
+        // limit == 0 reads to the end.
+        let rest = Filesystem::read(&fs, &ctx, "a.txt", 1, 0).await.unwrap();
+        assert_eq!(rest.content, "l2\nl3\n");
+    }
+
+    #[test]
+    fn apply_line_window_matches_sed_windows() {
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(apply_line_window(text, 0, 2), "a\nb\n");
+        assert_eq!(apply_line_window(text, 2, 1), "c\n");
+        assert_eq!(apply_line_window(text, 3, 0), "d\n");
+        assert_eq!(apply_line_window(text, 9, 0), "");
+        // An unterminated final line stays unterminated.
+        assert_eq!(apply_line_window("a\nb", 1, 1), "b");
     }
 }

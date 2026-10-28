@@ -19,9 +19,12 @@
 //!   for the workspace-projection work; the envd data-plane base URL can be overridden with the
 //!   [`E2B_SANDBOX_URL_ENV`] environment variable (the official SDK's `E2B_SANDBOX_URL`).
 //!
-//! The `PROTO` codec is not implemented (it needs the envd protobuf schema); selecting it
-//! yields [`SandboxExtensionError::Unsupported`] rather than silently mis-encoding. See the
-//! module tracker for this recorded gap.
+//! The default codec is [`E2bCodec::Json`], which connectrpc/envd accepts out of the box; the
+//! Connect envelope (`5-byte frame header`) is identical for both codecs. `PROTO` remains a
+//! selectable variant for parity with the Java enum, but encoding the envd protobuf messages
+//! would require the protobuf schema / `google.protobuf.DynamicMessage` equivalent and is
+//! therefore rejected with [`SandboxExtensionError::Unsupported`] instead of silently
+//! mis-encoding. See the module tracker for this recorded design decision.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -33,8 +36,10 @@ use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::join_url;
+use crate::kubernetes_files::SandboxFileTransfer;
 use crate::remote::{
-    persist_tar, RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle,
+    ensure_output_success, RemoteBackend, RemoteExecOutput, RemoteSandboxClient,
+    RemoteSandboxHandle, TAR_TIMEOUT_SECONDS,
 };
 use crate::retry::{with_retries, RetryPolicy};
 use crate::workspace::{shell_quote, short_hash};
@@ -83,10 +88,14 @@ impl E2bPersistenceMode {
 /// Connect codec used by the envd `process.Process/Start` endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum E2bCodec {
-    /// Protobuf codec (not implemented in Rust; see module docs).
-    #[default]
+    /// Protobuf codec (not implemented in Rust; selecting it is rejected — see module docs).
     Proto,
-    /// JSON codec.
+    /// JSON codec (default).
+    ///
+    /// This is the default **because it is the only codec this crate can encode**. Java defaults
+    /// to `PROTO`; the Rust port keeps the variant for parity but makes the usable codec the
+    /// default so a default-configured backend can execute commands.
+    #[default]
     Json,
 }
 
@@ -99,11 +108,11 @@ impl E2bCodec {
         }
     }
 
-    /// Parses the discriminator, defaulting to [`E2bCodec::Proto`].
+    /// Parses the discriminator, defaulting to [`E2bCodec::Json`].
     pub fn parse(value: &str) -> Self {
         match value {
-            "JSON" => E2bCodec::Json,
-            _ => E2bCodec::Proto,
+            "PROTO" => E2bCodec::Proto,
+            _ => E2bCodec::Json,
         }
     }
 }
@@ -268,6 +277,9 @@ pub struct E2bSandboxClientOptions {
     /// placeholder interface, so no cloud-bucket source is modelled here either.
     pub volume_mounts: Vec<E2bVolumeMount>,
     /// envd Connect codec.
+    ///
+    /// Defaults to [`E2bCodec::Json`] (the only codec this crate can encode), unlike the Java
+    /// `E2bCodec.PROTO` default — see [`E2bCodec`].
     pub codec: E2bCodec,
     /// TCP connect timeout in seconds.
     pub connect_timeout_seconds: u64,
@@ -291,7 +303,7 @@ impl Default for E2bSandboxClientOptions {
             persistence_mode: E2bPersistenceMode::Tar,
             snapshot_retention: None,
             volume_mounts: Vec::new(),
-            codec: E2bCodec::Proto,
+            codec: E2bCodec::Json,
             connect_timeout_seconds: 30,
             read_timeout_seconds: 120,
             max_retries: 3,
@@ -824,7 +836,10 @@ fn is_falsy(value: &Value) -> bool {
 }
 
 /// E2B [`RemoteBackend`] implementation.
-#[derive(Debug)]
+///
+/// Cheap to clone: every field is an `Arc` / reference-counted handle, so the native
+/// file-transfer adapter can own a snapshot of the backend next to the live sandbox handle.
+#[derive(Debug, Clone)]
 pub struct E2bBackend {
     options: E2bSandboxClientOptions,
     client: Client,
@@ -840,7 +855,7 @@ pub struct E2bBackend {
     /// (`DELETE /templates/{id}`) but **no listing endpoint**, so this record is the only view of
     /// "which snapshots exist" available to the retention window. It is process-local: after a
     /// restart the list starts empty again and pre-existing snapshots become invisible.
-    known_snapshots: Mutex<Vec<String>>,
+    known_snapshots: Arc<Mutex<Vec<String>>>,
 }
 
 impl E2bBackend {
@@ -870,7 +885,7 @@ impl E2bBackend {
             client,
             retry,
             kill_deadline,
-            known_snapshots: Mutex::new(Vec::new()),
+            known_snapshots: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1200,6 +1215,81 @@ impl E2bBackend {
             .await
     }
 
+    /// Archives the workspace through envd: `tar` into a temp file, fetch it with the file API.
+    ///
+    /// Mirrors the Java `E2bSandbox#doPersistWorkspace` TAR branch (envd `runShell` + `downloadFile`)
+    /// rather than piping base64 through stdout, so large workspaces are not limited by command
+    /// output buffers. The temp archive is removed afterwards, best effort.
+    async fn persist_tar_via_files(
+        &self,
+        handle: &RemoteSandboxHandle,
+        root: &str,
+    ) -> SandboxResult<Vec<u8>> {
+        let tar_path = new_temp_tar_path();
+        let command = format!(
+            "tar -cf {} -C {} .",
+            shell_quote(&tar_path),
+            shell_quote(root)
+        );
+        let archive = match self
+            .exec_in(handle, &command, None, TAR_TIMEOUT_SECONDS)
+            .await
+        {
+            Ok(output) => match ensure_output_success("workspace archive", &output) {
+                Ok(()) => self.download_file(handle, &tar_path).await,
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        };
+        let _ = self
+            .exec_in(
+                handle,
+                &format!("rm -f {}", shell_quote(&tar_path)),
+                None,
+                30,
+            )
+            .await;
+        archive
+    }
+
+    /// Restores an archive through envd: upload it to a temp file, then `tar -xf` it.
+    ///
+    /// Mirrors the Java `E2bSandbox#doHydrateWorkspace` TAR branch (envd `uploadFile` + `runShell`).
+    async fn hydrate_tar_via_files(
+        &self,
+        handle: &RemoteSandboxHandle,
+        root: &str,
+        archive: &[u8],
+    ) -> SandboxResult<()> {
+        let tar_path = new_temp_tar_path();
+        let extracted = match self.upload_file(handle, &tar_path, archive).await {
+            Ok(()) => {
+                let command = format!(
+                    "tar -xf {} -C {}",
+                    shell_quote(&tar_path),
+                    shell_quote(root)
+                );
+                match self
+                    .exec_in(handle, &command, None, TAR_TIMEOUT_SECONDS)
+                    .await
+                {
+                    Ok(output) => ensure_output_success("workspace hydrate extract", &output),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        };
+        let _ = self
+            .exec_in(
+                handle,
+                &format!("rm -f {}", shell_quote(&tar_path)),
+                None,
+                30,
+            )
+            .await;
+        extracted
+    }
+
     /// Builds an envd request with the shared data-plane headers (`baseRequest` in Java).
     fn envd_request(
         &self,
@@ -1284,6 +1374,99 @@ async fn send_envd(
         ));
     }
     Ok(bytes.to_vec())
+}
+
+/// Builds a unique in-sandbox tar path (mirrors the Java `E2bSandbox#newTempTarPath`).
+pub fn new_temp_tar_path() -> String {
+    format!("/tmp/agentscope-ws-{}.tar", uuid::Uuid::new_v4())
+}
+
+/// Maps an absolute sandbox path to the envd file-transfer path, or `None` when untransferable.
+///
+/// Mirrors the Java `E2bSandbox#workspaceTransferPath`: the path must be absolute, live strictly
+/// beneath the workspace root (which must itself be absolute) and contain no empty, `.` or `..`
+/// segments — those escape the workspace and are left to the exec transfer strategy. The
+/// returned value is the absolute path handed to the envd `/files` endpoint. Unlike the Java
+/// code, a backslash is treated as a literal path character (Java
+/// `WorkspaceMountSupport.normalizeVirtualPath` rewrites it to `/`); both sides therefore reject
+/// the same traversal sequences.
+pub fn workspace_transfer_path(workspace_root: &str, absolute_path: &str) -> Option<String> {
+    let path = absolute_path.trim();
+    if path.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    let root = workspace_root.trim();
+    if root.is_empty() || !root.starts_with('/') {
+        return None;
+    }
+    let normalized_root = E2bVolumeMount::normalize_mount_path(root).ok()?;
+    let root_prefix = if normalized_root == "/" {
+        "/".to_string()
+    } else {
+        format!("{normalized_root}/")
+    };
+    let relative = path.strip_prefix(&root_prefix)?;
+    if relative.is_empty() {
+        return None;
+    }
+    if relative
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    Some(format!("{root_prefix}{relative}"))
+}
+
+/// `SandboxFileTransfer` backed by the envd `/files` REST API.
+///
+/// Mirrors the Java `E2bSandbox implements SandboxFileTransfer`: only paths beneath the workspace
+/// root are accepted (see [`workspace_transfer_path`]); everything else falls back to the
+/// base64-over-exec strategy in the filesystem adapter.
+#[derive(Debug, Clone)]
+pub struct E2bFileTransfer {
+    backend: E2bBackend,
+    handle: RemoteSandboxHandle,
+}
+
+impl E2bFileTransfer {
+    /// Creates an adapter for a live sandbox handle.
+    pub fn new(backend: E2bBackend, handle: RemoteSandboxHandle) -> Self {
+        Self { backend, handle }
+    }
+
+    /// Returns the wrapped live handle.
+    pub fn handle(&self) -> &RemoteSandboxHandle {
+        &self.handle
+    }
+
+    /// Resolves the transfer path, failing like the Java `requireWorkspaceTransferPath`.
+    fn require_transfer_path(&self, absolute_path: &str) -> SandboxResult<String> {
+        workspace_transfer_path(&self.backend.options.workspace_root, absolute_path).ok_or_else(
+            || {
+                SandboxExtensionError::Configuration(format!(
+                    "path is outside the sandbox workspace or invalid: {absolute_path}"
+                ))
+            },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxFileTransfer for E2bFileTransfer {
+    fn supports_file_transfer(&self, absolute_path: &str) -> bool {
+        workspace_transfer_path(&self.backend.options.workspace_root, absolute_path).is_some()
+    }
+
+    async fn upload_file(&self, absolute_path: &str, content: &[u8]) -> SandboxResult<()> {
+        let path = self.require_transfer_path(absolute_path)?;
+        self.backend.upload_file(&self.handle, &path, content).await
+    }
+
+    async fn download_file(&self, absolute_path: &str) -> SandboxResult<Vec<u8>> {
+        let path = self.require_transfer_path(absolute_path)?;
+        self.backend.download_file(&self.handle, &path).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -1448,19 +1631,27 @@ impl RemoteBackend for E2bBackend {
                 Ok(bytes.to_vec())
             }
         });
-        let body = with_exec_deadline(timeout_seconds, call).await.map_err(|err| {
-            if matches!(err, SandboxExtensionError::Runtime(SandboxErrorCode::ExecTimeout, _)) {
-                tracing::warn!(
+        let body = with_exec_deadline(timeout_seconds, call)
+            .await
+            .map_err(|err| {
+                if matches!(
+                    err,
+                    SandboxExtensionError::Runtime(SandboxErrorCode::ExecTimeout, _)
+                ) {
+                    tracing::warn!(
                     timeout_seconds = timeout_seconds,
                     "e2b: exec exceeded its deadline; the remote process was killed server-side"
                 );
-            }
-            err
-        })?;
+                }
+                err
+            })?;
         let stream = match drain_envd_stream(&body) {
             Ok(stream) => stream,
             Err(err) => {
-                if matches!(err, SandboxExtensionError::Runtime(SandboxErrorCode::ExecTimeout, _)) {
+                if matches!(
+                    err,
+                    SandboxExtensionError::Runtime(SandboxErrorCode::ExecTimeout, _)
+                ) {
                     tracing::warn!(
                         timeout_seconds = timeout_seconds,
                         "e2b: exec was killed server-side after the deadline expired"
@@ -1476,8 +1667,7 @@ impl RemoteBackend for E2bBackend {
             None => {
                 // Java：超过 deadline 却没有退出码的流，按 exec 超时处理；deadline 之前则是
                 // 普通的流异常。
-                if timeout_seconds > 0
-                    && started.elapsed() >= Duration::from_secs(timeout_seconds)
+                if timeout_seconds > 0 && started.elapsed() >= Duration::from_secs(timeout_seconds)
                 {
                     return Err(exec_timeout_error(timeout_seconds));
                 }
@@ -1528,7 +1718,7 @@ impl RemoteBackend for E2bBackend {
             }
             return Ok(E2bSnapshotRefs::encode_snapshot_id(&snapshot_id));
         }
-        persist_tar(self, handle, root).await
+        self.persist_tar_via_files(handle, root).await
     }
 
     async fn hydrate_workspace_bytes(
@@ -1555,8 +1745,15 @@ impl RemoteBackend for E2bBackend {
                 return Ok(Some(RemoteSandboxHandle::new(id, fields)));
             }
         }
-        crate::remote::hydrate_tar(self, handle, root, archive).await?;
+        self.hydrate_tar_via_files(handle, root, archive).await?;
         Ok(None)
+    }
+
+    async fn file_transfer(
+        &self,
+        handle: &RemoteSandboxHandle,
+    ) -> Option<Arc<dyn SandboxFileTransfer>> {
+        Some(Arc::new(E2bFileTransfer::new(self.clone(), handle.clone())))
     }
 }
 
@@ -2016,7 +2213,11 @@ mod tests {
         );
         assert_eq!(E2bPersistenceMode::parse("bogus"), E2bPersistenceMode::Tar);
         assert_eq!(E2bCodec::parse("JSON"), E2bCodec::Json);
-        assert_eq!(E2bCodec::parse("bogus"), E2bCodec::Proto);
+        assert_eq!(E2bCodec::parse("PROTO"), E2bCodec::Proto);
+        // The default codec must be the one this crate can actually encode (see `E2bCodec`).
+        assert_eq!(E2bCodec::parse("bogus"), E2bCodec::Json);
+        assert_eq!(E2bCodec::default(), E2bCodec::Json);
+        assert_eq!(E2bSandboxClientOptions::default().codec, E2bCodec::Json);
     }
 
     #[test]
@@ -2040,6 +2241,7 @@ mod tests {
     async fn proto_codec_exec_is_unsupported() {
         let backend = E2bBackend::new(E2bSandboxClientOptions {
             api_key: Some("k".to_string()),
+            codec: E2bCodec::Proto,
             ..Default::default()
         })
         .unwrap();
@@ -2049,6 +2251,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxExtensionError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn default_codec_exec_works_without_opt_in() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let body = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/process.Process/Start");
+                then.status(200)
+                    .header("content-type", "application/connect+json")
+                    .body(envd_body_with_exit(0, b"hi"));
+            })
+            .await;
+        // Only the API key is configured: codec, timeouts and everything else stay at defaults.
+        let backend = E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("k".to_string()),
+            envd_sandbox_url: Some(server.base_url()),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+        let output = backend
+            .exec_in(&handle, "echo hi", None, 5)
+            .await
+            .expect("the default codec must be usable");
+        body.assert_async().await;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "hi");
     }
 
     #[tokio::test]
@@ -2214,6 +2446,173 @@ mod tests {
             }
             other => panic!("expected runtime error, got {other:?}"),
         }
+    }
+
+    // ---------------------------------- native file transfer (`SandboxFileTransfer`)
+
+    #[test]
+    fn workspace_transfer_path_stays_inside_the_workspace() {
+        assert_eq!(
+            workspace_transfer_path("/home/user", "/home/user/a.txt").as_deref(),
+            Some("/home/user/a.txt")
+        );
+        assert_eq!(
+            workspace_transfer_path("/home/user/", "/home/user/sub/a.txt").as_deref(),
+            Some("/home/user/sub/a.txt")
+        );
+        // The workspace root itself, siblings that only share a prefix, relative paths and
+        // traversal segments are all declined (base64-over-exec handles them).
+        assert_eq!(workspace_transfer_path("/home/user", "/home/user"), None);
+        assert_eq!(
+            workspace_transfer_path("/home/user", "/home/user-x/a.txt"),
+            None
+        );
+        assert_eq!(workspace_transfer_path("/home/user", "/etc/hosts"), None);
+        assert_eq!(workspace_transfer_path("/home/user", "a.txt"), None);
+        assert_eq!(
+            workspace_transfer_path("/home/user", "/home/user/../etc/passwd"),
+            None
+        );
+        assert_eq!(
+            workspace_transfer_path("/home/user", "/home/user/a//b"),
+            None
+        );
+        assert_eq!(
+            workspace_transfer_path("/home/user", "/home/user/./a"),
+            None
+        );
+        assert_eq!(workspace_transfer_path("", "/home/user/a.txt"), None);
+        // A root-level workspace accepts everything beneath `/`.
+        assert_eq!(
+            workspace_transfer_path("/", "/a.txt").as_deref(),
+            Some("/a.txt")
+        );
+    }
+
+    #[test]
+    fn file_transfer_declines_paths_outside_the_workspace() {
+        let backend = E2bBackend::new(E2bSandboxClientOptions::default()).unwrap();
+        let transfer =
+            E2bFileTransfer::new(backend, RemoteSandboxHandle::new("sbx-1", BTreeMap::new()));
+        assert!(transfer.supports_file_transfer("/home/user/a.txt"));
+        assert!(!transfer.supports_file_transfer("/tmp/a.txt"));
+    }
+
+    #[tokio::test]
+    async fn file_transfer_uploads_and_downloads_through_envd_files() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let upload = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/files")
+                    .query_param("path", "/home/user/a.txt")
+                    .body_contains("hello");
+                then.status(200).body("");
+            })
+            .await;
+        let download = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/files")
+                    .query_param("path", "/home/user/a.txt");
+                then.status(200).body("world");
+            })
+            .await;
+        let backend = http_backend(server.base_url(), Some(server.base_url()));
+        let transfer =
+            E2bFileTransfer::new(backend, RemoteSandboxHandle::new("sbx-1", BTreeMap::new()));
+
+        transfer
+            .upload_file("/home/user/a.txt", b"hello")
+            .await
+            .expect("native upload succeeds");
+        upload.assert_async().await;
+        assert_eq!(
+            transfer
+                .download_file("/home/user/a.txt")
+                .await
+                .expect("native download succeeds"),
+            b"world".to_vec()
+        );
+        download.assert_async().await;
+
+        // Out-of-workspace paths are rejected instead of silently escaping.
+        assert!(transfer.upload_file("/etc/passwd", b"x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_tar_uses_envd_files_instead_of_base64_over_exec() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        // The base64-over-exec strategy must not be taken at all.
+        let base64_exec = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/process.Process/Start")
+                    .body_contains("base64");
+                then.status(200).body(envd_body_with_exit(0, b""));
+            })
+            .await;
+        let exec = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/process.Process/Start");
+                then.status(200).body(envd_body_with_exit(0, b""));
+            })
+            .await;
+        let download = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/files")
+                    .query_param_exists("path")
+                    .query_param("username", "user");
+                then.status(200).body("TARDATA");
+            })
+            .await;
+        let backend = http_backend(server.base_url(), Some(server.base_url()));
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let archive = backend
+            .persist_workspace_bytes(&handle, "/home/user")
+            .await
+            .expect("tar persist succeeds");
+        assert_eq!(archive, b"TARDATA".to_vec());
+        assert_eq!(base64_exec.hits_async().await, 0);
+        // `tar` + `rm -f` both go through the exec channel.
+        assert_eq!(exec.hits_async().await, 2);
+        assert!(download.hits_async().await >= 1);
+    }
+
+    #[tokio::test]
+    async fn hydrate_tar_uploads_the_archive_before_extracting() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let upload = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/files")
+                    .query_param_exists("path")
+                    .body_contains("TARDATA");
+                then.status(200).body("");
+            })
+            .await;
+        let exec = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/process.Process/Start")
+                    .body_contains("tar -xf");
+                then.status(200).body(envd_body_with_exit(0, b""));
+            })
+            .await;
+        let backend = http_backend(server.base_url(), Some(server.base_url()));
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        backend
+            .hydrate_workspace_bytes(&handle, "/home/user", b"TARDATA")
+            .await
+            .expect("tar hydrate succeeds");
+        upload.assert_async().await;
+        exec.assert_async().await;
     }
 
     #[tokio::test]
@@ -2621,9 +3020,7 @@ mod tests {
         assert_eq!(options.volume_mounts[0].name, "vol-a");
         assert_eq!(options.volume_mounts[0].path, "/mnt/data");
         // 路径重复必须被拒绝（Java `setVolumeMounts` 的 distinct-path 检查）。
-        let err = options
-            .with_volume_mount("vol-b", "/mnt/data")
-            .unwrap_err();
+        let err = options.with_volume_mount("vol-b", "/mnt/data").unwrap_err();
         assert!(err.to_string().contains("distinct"), "got {err}");
         // 非法挂载直接失败，不进入配置。
         assert!(E2bSandboxClientOptions::default()
@@ -2665,13 +3062,11 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST)
-                    .path("/sandboxes")
-                    .json_body(json!({
-                        "templateID": "base",
-                        "timeout": 300,
-                        "volumeMounts": [{"name": "vol-a", "path": "/mnt/data"}],
-                    }));
+                when.method(POST).path("/sandboxes").json_body(json!({
+                    "templateID": "base",
+                    "timeout": 300,
+                    "volumeMounts": [{"name": "vol-a", "path": "/mnt/data"}],
+                }));
                 then.status(200)
                     .header("content-type", "application/json")
                     .body(r#"{"sandboxID":"sbx-10","domain":"e2b.dev"}"#);

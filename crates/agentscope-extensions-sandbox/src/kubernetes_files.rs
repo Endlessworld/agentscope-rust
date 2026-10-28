@@ -472,6 +472,27 @@ pub fn build_move_command(from: &str, to: &str) -> String {
     }
 }
 
+/// Builds the absolute sandbox path of `relative` under the file-API base dir.
+///
+/// Mirrors the Java `KubernetesSandbox#fileApiPath`: a trailing slash on the base dir is
+/// tolerated and exactly one separator is emitted.
+pub fn file_api_path(base_dir: &str, relative: &str) -> String {
+    let base = base_dir.trim_end_matches('/');
+    format!("{base}/{relative}")
+}
+
+/// Builds a unique workspace-archive path relative to the file-API base dir.
+///
+/// Mirrors the Java `KubernetesSandbox#tempArchiveName`: a per-session hash prefix plus a UUID
+/// keeps concurrent persist/hydrate calls from sharing (and deleting) each other's archive.
+pub fn temp_archive_rel_path(prefix: &str, session_id: &str) -> String {
+    format!(
+        "{FILE_API_TMP_DIR_REL}/{prefix}-{:x}-{}.tar",
+        crate::workspace::short_hash(session_id),
+        uuid::Uuid::new_v4()
+    )
+}
+
 /// Maps an absolute sandbox path to a file-API-relative path, or `None` when untransferable.
 ///
 /// Mirrors `KubernetesSandbox#toFileApiRelative`: the file API is disabled when the base dir is
@@ -666,6 +687,25 @@ mod tests {
             None
         );
         assert_eq!(to_file_api_relative("/workspace", "/workspace/a//b"), None);
+    }
+
+    #[test]
+    fn file_api_path_and_temp_archive_names_are_deterministic() {
+        assert_eq!(
+            file_api_path("/workspace", ".agentscope-tmp/x.tar"),
+            "/workspace/.agentscope-tmp/x.tar"
+        );
+        assert_eq!(
+            file_api_path("/workspace/", ".agentscope-tmp/x.tar"),
+            "/workspace/.agentscope-tmp/x.tar"
+        );
+        let first = temp_archive_rel_path("ws-persist", "sess-1");
+        let second = temp_archive_rel_path("ws-persist", "sess-1");
+        assert!(first.starts_with(&format!("{FILE_API_TMP_DIR_REL}/ws-persist-")));
+        assert!(first.ends_with(".tar"));
+        // Concurrent transfers must never share an archive name (Java `tempArchiveName`).
+        assert_ne!(first, second);
+        assert!(to_file_api_relative("/workspace", &file_api_path("/workspace", &first)).is_some());
     }
 
     #[test]

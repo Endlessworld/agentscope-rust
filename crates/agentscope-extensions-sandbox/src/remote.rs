@@ -22,6 +22,7 @@ use agentscope_harness::agent::sandbox::{
 };
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
+use crate::kubernetes_files::SandboxFileTransfer;
 use crate::workspace::{build_workspace_setup_script, shell_quote, short_hash};
 
 /// Metadata key holding the backend discriminator (`e2b`, `daytona`, `agentrun`, `kubernetes`).
@@ -331,6 +332,19 @@ pub trait RemoteBackend: Send + Sync + std::fmt::Debug {
         hydrate_tar(self, handle, root, archive).await?;
         Ok(None)
     }
+
+    /// Native single-file transfer adapter for a live sandbox, when the backend supports one.
+    ///
+    /// Mirrors the Java `Sandbox implements SandboxFileTransfer` capability probe: backends that
+    /// expose a runtime file API (Kubernetes, E2B's envd `/files`) return an adapter, and the
+    /// filesystem adapter prefers it over base64-over-exec for paths it accepts. Backends without
+    /// a file API keep the default `None`.
+    async fn file_transfer(
+        &self,
+        _handle: &RemoteSandboxHandle,
+    ) -> Option<Arc<dyn SandboxFileTransfer>> {
+        None
+    }
 }
 
 /// Converts an exec output into an error when it exited non-zero.
@@ -450,6 +464,9 @@ pub struct RemoteSandbox {
     core: RemoteSandboxCore,
     handle: Option<RemoteSandboxHandle>,
     snapshot: Option<Arc<dyn SandboxSnapshot>>,
+    /// Native file-transfer adapter for the current handle, refreshed whenever a handle is
+    /// (re)established. `None` when the backend has no file API.
+    transfer: Option<Arc<dyn SandboxFileTransfer>>,
 }
 
 impl RemoteSandbox {
@@ -468,12 +485,24 @@ impl RemoteSandbox {
             core: RemoteSandboxCore::new(data),
             handle,
             snapshot,
+            transfer: None,
         }
     }
 
     /// Returns the backend name.
     pub fn backend_name(&self) -> &'static str {
         self.backend.backend_name()
+    }
+
+    /// Native file-transfer adapter for the live sandbox, when the backend exposes one.
+    ///
+    /// Mirrors the Java `Sandbox instanceof SandboxFileTransfer` probe used by
+    /// `SandboxBackedFilesystem`: callers pass the result to
+    /// [`crate::fs_spec::SandboxFilesystemAdapter::with_file_transfer`] so reads/writes inside the
+    /// runtime file API's scope skip base64-over-exec. The adapter is refreshed on every
+    /// (re)establish of the sandbox handle, so it always targets the live sandbox.
+    pub fn file_transfer(&self) -> Option<Arc<dyn SandboxFileTransfer>> {
+        self.transfer.clone()
     }
 
     fn workspace_spec(&self) -> WorkspaceSpec {
@@ -514,7 +543,16 @@ impl RemoteSandbox {
             }
         }
         self.core.sync();
+        self.refresh_file_transfer().await;
         Ok(self.handle.as_ref().expect("handle established"))
+    }
+
+    /// Rebuilds the native file-transfer adapter from the current handle.
+    async fn refresh_file_transfer(&mut self) {
+        self.transfer = match self.handle.as_ref() {
+            Some(handle) => self.backend.file_transfer(handle).await,
+            None => None,
+        };
     }
 
     fn adopt_handle(&mut self, handle: RemoteSandboxHandle) {
@@ -545,6 +583,7 @@ impl Sandbox for RemoteSandbox {
                         .await?
                     {
                         self.adopt_handle(new_handle);
+                        self.refresh_file_transfer().await;
                     }
                     restored = true;
                 }
@@ -859,6 +898,24 @@ mod tests {
     struct FakeBackend {
         commands: Mutex<Vec<String>>,
         alive: Mutex<bool>,
+        native_transfer: bool,
+    }
+
+    /// Stand-in native file-transfer adapter (see the harness-gap note in `kubernetes_files`).
+    #[derive(Debug)]
+    struct StubTransfer;
+
+    #[async_trait::async_trait]
+    impl crate::kubernetes_files::SandboxFileTransfer for StubTransfer {
+        fn supports_file_transfer(&self, _absolute_path: &str) -> bool {
+            true
+        }
+        async fn upload_file(&self, _absolute_path: &str, _content: &[u8]) -> SandboxResult<()> {
+            Ok(())
+        }
+        async fn download_file(&self, _absolute_path: &str) -> SandboxResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
     }
 
     #[async_trait::async_trait]
@@ -887,6 +944,13 @@ mod tests {
             *self.alive.lock().unwrap() = false;
             Ok(())
         }
+        async fn file_transfer(
+            &self,
+            _handle: &RemoteSandboxHandle,
+        ) -> Option<Arc<dyn crate::kubernetes_files::SandboxFileTransfer>> {
+            self.native_transfer
+                .then(|| Arc::new(StubTransfer) as Arc<_>)
+        }
         async fn exec_in(
             &self,
             _handle: &RemoteSandboxHandle,
@@ -909,6 +973,7 @@ mod tests {
         let backend = Arc::new(FakeBackend {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(false),
+            native_transfer: false,
         });
         let client = RemoteSandboxClient::new(backend.clone());
         let spec = WorkspaceSpec::new("/workspace").with_file("README.md", "hi");
@@ -933,6 +998,7 @@ mod tests {
         let backend = Arc::new(FakeBackend {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(true),
+            native_transfer: false,
         });
         let client = RemoteSandboxClient::new(backend);
         let state = sample_data().to_harness_state();
@@ -945,6 +1011,7 @@ mod tests {
         let backend = Arc::new(FakeBackend {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(false),
+            native_transfer: false,
         });
         let client = RemoteSandboxClient::new(backend);
         let json = client
@@ -952,5 +1019,29 @@ mod tests {
             .unwrap();
         let parsed = client.deserialize_state(&json).unwrap();
         assert_eq!(parsed.session_id(), "sess-1");
+    }
+
+    #[tokio::test]
+    async fn native_file_transfer_is_published_after_the_handle_is_established() {
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(true),
+            native_transfer: true,
+        });
+        let mut sandbox = RemoteSandbox::new(backend.clone(), sample_data(), None);
+        // The adapter is refreshed in `ensure_handle`, so it is absent until the sandbox starts.
+        assert!(sandbox.file_transfer().is_none());
+        sandbox.start().await.unwrap();
+        assert!(sandbox.file_transfer().is_some());
+
+        // Backends without a runtime file API keep the exec-only strategy.
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(true),
+            native_transfer: false,
+        });
+        let mut plain = RemoteSandbox::new(backend, sample_data(), None);
+        plain.start().await.unwrap();
+        assert!(plain.file_transfer().is_none());
     }
 }
