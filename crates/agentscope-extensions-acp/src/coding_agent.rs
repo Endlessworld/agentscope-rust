@@ -262,10 +262,16 @@ impl AcpCodingAgent {
         let id = session.session_id().to_string();
         // A prompt that finishes after `session/close` must not resurrect the session.
         if session.is_closed() {
-            self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+            self.sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id);
             return;
         }
-        let mut guard = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.len() >= self.max_sessions && !guard.contains_key(&id) {
             // 淘汰最久未活动的会话：`updated_at` 是提示轮次写入的 RFC-3339 时间戳，
             // 字典序即时间序；新建而未提示过的会话排在最前（最旧）。会话 id 形如
@@ -356,7 +362,10 @@ impl AcpCodingAgent {
     ) -> ListSessionsResponse {
         const PAGE_SIZE: usize = 50;
         let mut infos: Vec<SessionInfo> = {
-            let guard = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard
                 .values()
                 .filter(|session| cwd.is_none_or(|cwd| session.cwd() == cwd))
@@ -420,7 +429,12 @@ impl AcpCodingAgent {
     /// synthetic session id never reaches the journal: only the store's index is read.
     fn catalog_agent(&self, cwd: &std::path::Path) -> Arc<HarnessAgent> {
         const CATALOG_SESSION_ID: &str = "session-catalog";
-        if let Some(agent) = self.catalog_agents.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(cwd) {
+        if let Some(agent) = self
+            .catalog_agents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(cwd)
+        {
             return Arc::clone(agent);
         }
         let agent = Arc::new(match &self.session_factory {

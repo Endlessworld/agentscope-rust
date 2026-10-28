@@ -610,7 +610,10 @@ impl AcpAgentSession {
             updated_at: Arc::new(Mutex::new(None)),
         };
         {
-            let mut config = session.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut config = session
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             config.model = initial_model;
             config.mode = initial_mode;
             config.thought_level = initial_thought;
@@ -732,7 +735,11 @@ impl AcpAgentSession {
 
     /// Current model id.
     pub fn model(&self) -> String {
-        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone()
+        self.config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .model
+            .clone()
     }
 
     /// Sort key for least-recently-used eviction: the last prompt's RFC-3339 timestamp, or an
@@ -751,17 +758,28 @@ impl AcpAgentSession {
 
     /// Current mode id.
     pub fn mode(&self) -> String {
-        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode.clone()
+        self.config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mode
+            .clone()
     }
 
     /// Sets the current model.
     pub fn set_model(&mut self, model: impl Into<String>) {
-        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model = model.into();
+        self.config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .model = model.into();
         self.persist_config();
     }
 
     fn persist_config(&self) {
-        let config = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let config = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         save_session_config(&self.config_path, &config);
     }
 
@@ -772,7 +790,12 @@ impl AcpAgentSession {
 
     /// Whether `level` is valid for the currently selected model.
     pub fn has_thought_level(&self, level: &str) -> bool {
-        let model = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone();
+        let model = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .model
+            .clone();
         let ids = super::config::thought_level_ids_for(&model, &self.models);
         ids.iter().any(|id| id == level)
             || (ids.is_empty() && level == super::config::DEFAULT_THOUGHT_LEVEL)
@@ -804,7 +827,12 @@ impl AcpAgentSession {
         // Thought level -> per-call generation defaults. `auto` sends nothing
         // (provider default); explicit levels send only `reasoning_effort`
         // (see `thought_level_params`).
-        let level = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).thought_level.clone();
+        let level = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .thought_level
+            .clone();
         let opts = thought_level_params(&level);
         self.agent.set_generate_options_defaults(opts);
 
@@ -812,7 +840,12 @@ impl AcpAgentSession {
         // caller can notify the client instead of failing silently.
         let mut errors = Vec::new();
         if let Some(build) = &self.model_builder {
-            let id = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone();
+            let id = self
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .model
+                .clone();
             if !id.is_empty() && id != "default" && id != self.applied_model {
                 match build(&id, self.session_id.to_string().as_str()) {
                     Ok(model) => {
@@ -859,18 +892,28 @@ impl AcpAgentSession {
 
     /// Current thought level.
     pub fn thought_level(&self) -> String {
-        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).thought_level.clone()
+        self.config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .thought_level
+            .clone()
     }
 
     /// Sets the thought level (`auto` / `disabled` / `low` / `medium` / `high`
     /// / `max`). Applied on the next prompt.
     pub fn set_thought_level(&mut self, level: impl Into<String>) {
-        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).thought_level = level.into();
+        self.config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .thought_level = level.into();
         self.persist_config();
     }
     /// Sets the current mode.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
-        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode = mode.into();
+        self.config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mode = mode.into();
         // Apply the mode's permission context to the live agent so the *next*
         // request already runs under the new rules.
         self.apply_mode();
@@ -882,7 +925,12 @@ impl AcpAgentSession {
     /// persisted "always allow / always reject" user rules on top so they
     /// survive mode switches and session restarts.
     fn apply_mode(&mut self) {
-        let mode = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode.clone();
+        let mode = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mode
+            .clone();
         let ctx = config::permission_context_for_mode(&mode);
         self.agent.set_permission_context(ctx);
         let persisted = self.permission_store.load();
@@ -906,8 +954,14 @@ impl AcpAgentSession {
         // Publish the connection to the elicitation tool (which holds the same
         // slot across prompts, so it never needs rebuilding).
         let erased: Arc<dyn ElicitationClient> = handle.clone();
-        *self.elicitation_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(erased);
-        *self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        *self
+            .elicitation_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(erased);
+        *self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
     }
 
     /// The slot the `ask_user` tool reads the live connection from. Shared with
@@ -926,7 +980,12 @@ impl AcpAgentSession {
     /// Installs (or removes) the confirm handler that performs the ACP
     /// permission round-trip. Called at the start of every prompt run.
     fn install_confirm_handler(&self) {
-        match self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+        match self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
             Some(client) => {
                 let handler = acp_confirm_handler(
                     self.session_id.clone(),
@@ -1156,12 +1215,22 @@ impl AcpAgentSession {
             .iter()
             .map(|m| SessionMode::new(m.id.clone(), m.name.clone()))
             .collect();
-        SessionModeState::new(self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode.clone(), modes)
+        SessionModeState::new(
+            self.config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mode
+                .clone(),
+            modes,
+        )
     }
 
     /// Returns the session config options advertised to the client.
     pub fn config_options(&self) -> Vec<SessionConfigOption> {
-        let mut cfg = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cfg = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let valid_levels = super::config::thought_level_ids_for(&cfg.model, &self.models);
         if !valid_levels.iter().any(|id| id == &cfg.thought_level) {
             cfg.thought_level = super::config::DEFAULT_THOUGHT_LEVEL.to_string();
@@ -1189,7 +1258,12 @@ impl AcpAgentSession {
     pub fn selected_descriptor(
         &self,
     ) -> Option<std::sync::Arc<agentscope_core::model::catalog::ModelDescriptor>> {
-        let model = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone();
+        let model = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .model
+            .clone();
         self.models
             .iter()
             .find(|choice| choice.id == model)
@@ -1205,7 +1279,12 @@ impl AcpAgentSession {
     /// Pushes `ConfigOptionUpdate` + `UsageUpdate` to the bound client. Used by the
     /// background catalog task; a no-op when the session has no live connection.
     pub fn push_config_update(&self) {
-        let Some(client) = self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else {
+        let Some(client) = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
             return;
         };
         let options = self.config_options();
@@ -1228,7 +1307,12 @@ impl AcpAgentSession {
     /// descriptor of the newly selected model instead.
     pub fn push_usage_for_selected_model(&self) {
         use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
-        let Some(client) = self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else {
+        let Some(client) = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
             return;
         };
         let size = self
@@ -1594,11 +1678,15 @@ impl AcpAgentSession {
                 }
             }
         };
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Bounded backlog: the sink runs inside the agent and cannot block, so a stalled
+        // client would grow an unbounded channel without limit. Overflow is dropped and
+        // counted (`AGENT_RESULT` is always kept), and the end of the turn reports it.
+        let events = crate::event_queue::EventQueue::new(crate::event_queue::EVENT_QUEUE_CAPACITY);
+        let sink = crate::event_queue::EventQueueSender::new(Arc::clone(&events));
         session.set_event_sink(Arc::new(move |event: &AgentEvent| {
-            // A closed receiver only means the prompt already returned; the run itself is
+            // A closed queue only means the prompt already returned; the run itself is
             // unaffected, so dropping the event here is safe.
-            let _ = events_tx.send(event.clone());
+            sink.push(event.clone());
         }));
         // A previous turn may still be open (the process died mid-run, the provider stalled,
         // the host stopped waiting). `submit` is now the authority on how to settle it: it
@@ -1758,7 +1846,7 @@ impl AcpAgentSession {
                                 }
                             }
                         }
-                        if settled_task.is_some() && (events_closed || events_rx.is_empty()) {
+                        if settled_task.is_some() && (events_closed || events.is_empty()) {
                             break;
                         }
                     }
@@ -1774,7 +1862,7 @@ impl AcpAgentSession {
                         cancelled = true;
                         break;
                     }
-                    event = events_rx.recv(), if !events_closed => {
+                    event = events.recv(), if !events_closed => {
                         match event {
                             Some(ev) => match ev.event_type() {
                                 AgentEventType::TextBlockDelta => {
@@ -2093,7 +2181,28 @@ impl AcpAgentSession {
                     ));
                     return StopReason::Refusal;
                 }
-                _ => return StopReason::EndTurn,
+                _ => {
+                    // The client may have been too slow to keep up, in which case part of the
+                    // streamed answer never reached it. Say so instead of leaving the output
+                    // looking silently truncated.
+                    let dropped_deltas = events.dropped_deltas();
+                    if dropped_deltas > 0 {
+                        tracing::warn!(
+                            session = %self.session_id,
+                            dropped = events.dropped(),
+                            dropped_deltas,
+                            "the client could not keep up; some streamed output was dropped"
+                        );
+                        emit(super::event::message_chunk(
+                            self.session_id.clone(),
+                            "\n\n[some streamed output was dropped: the client could not keep \
+                             up]"
+                            .to_string(),
+                            message_id_opt.clone(),
+                        ));
+                    }
+                    return StopReason::EndTurn;
+                }
             }
         }
     }

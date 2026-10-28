@@ -12,7 +12,7 @@
 1. **`Session writer ownership expired or fenced` 的直接成因已消除。** 原链条是：`acquire` 先拿 120s 租约 → 全量重放 journal（可能数分钟）→ 才启动心跳 → 第一次 `flush` 续租时命中“租约已过期” → 被当成永久 fencing。现在：心跳前移到 `acquire` 之后、同 owner/epoch 过期可原地续租、transient 失败退避重试、`Stale committed prefix` 会重基而不是判死。
 2. **`The previous turn is still open` 的错误路径已移除。** dispatcher 对孤儿 open turn 自动关闭，`submit` 前按状态路由（可恢复 → 先 resume；suspended/有不确定工具 → 关闭），不再 `inbox.reject("turn_unfinished")` 丢掉用户消息。
 3. **“错误不再以那种文案出现”≠“任意中断后可继续”。** 仍然做不到的三件事：冷启动重放仍然慢（journal 无 segment/compaction，P0-2）、journal 仍落在工程目录 `agents/`（P0-11）、模型流的半截输出重启后不可恢复（P1-2）。
-4. **剩余最大风险是 journal 的体量与投影成本**（P0-2 / P1-11 / P1-12）：一 batch 一 commit 文件、无快照/回收，长会话冷启动是 O(全部 commit)，也是磁盘与重放开销的主源。
+4. **剩余最大风险是 journal 的体量与投影成本**（P0-2 / P1-11）：一 batch 一 commit 文件、无快照/回收，长会话冷启动是 O(全部 commit)，也是磁盘与重放开销的主源。
 
 ### 0.2 状态总表
 
@@ -42,13 +42,13 @@
 | P1-9 | inbox 租约过长 + 重试过短 | ✅ 已修 | `INBOX_LEASE` 120s → 10s，`ACCEPT_ATTEMPTS` 100 → 400（80ms 退避）；`launch` 失败保留 queued |
 | P1-10 | suspended / external execution 不可恢复 | ✅ 已修 | 私有扩展方法 `_agentscope/session/respond`（ACP 扩展方法须 `_` 前缀）→ `AcpAgentSession::respond` |
 | P1-11 | 投影/缓存无限增长 | ⬜ 未做 | 正解是 P0-2 的快照；直接裁剪会丢 `started`/`inputs` 的去重能力 |
-| P1-12 | 事件 channel 无界 | ⬜ 未做 | `set_event_sink` 是同步闭包，改有界 + `try_send` 会丢文本 delta（回退成“回答被截断”），需先定丢弃策略 |
+| P1-12 | 事件 channel 无界 | ✅ 已修 | 新增 `event_queue::EventQueue`（容量 4096，`Mutex` + `Notify`）：满则丢弃新事件并计数，`AGENT_RESULT` 永不丢；丢弃过 delta 时在 turn 结束前告知客户端 |
 | P1-13 | `model/chunk` 与模型流强耦合 | ✅ 已修 | `MergedChunk` 合并（4KiB / 64 delta / 1s），单次 commit 失败不再逐 token 截断 |
 | P1-14 | 损坏/未知事件让 session 永久打不开 | ✅ 已修 | `visit` 改为「重放可读后缀」；`required=false` 的坏事件跳过；inbox 未知事件忽略；只容忍数据类错误，IO 仍上报 |
 | P1-15 | `Stale committed prefix` 无重基策略 | ✅ 已修 | `flush` 判定 stale 后先 `renew`，再按新 head 重编号未提交事件 + 换新 batch id（最多 3 次） |
-| P2-1…P2-20 | 可观测性/次级风险（20 项） | ◐ 大部分已修 | 14 项已修、5 项部分（P2-3/P2-10/P2-13/P2-15/P2-16）、1 项未做（P2-20 随 P1-12），见 §2.3 |
+| P2-1…P2-20 | 可观测性/次级风险（20 项） | ◐ 大部分已修 | 15 项已修、5 项部分（P2-3/P2-10/P2-13/P2-16/P2-20），见 §2.3 |
 
-**统计：** P0 12/13 已修（P0-2 部分、P0-11 未做）；P1 11/15 已修（P1-2 / P1-11 / P1-12 未做）；P2 14 已修 / 5 部分 / 1 未做。
+**统计：** P0 12/13 已修（P0-2 部分、P0-11 未做）；P1 12/15 已修（P1-2 / P1-11 未做）；P2 15 已修 / 5 部分 / 0 未做。
 
 ### 0.3 仍未完成（及原因）
 
@@ -57,10 +57,10 @@
 | **P0-2** journal segment / compaction / retention | 一 batch 一 commit 文件且无段合并，冷启动仍要扫全部 commit。真正修法是「分段落盘 + 写入折叠后的 projection 快照 + 删除已被快照覆盖的 commit」，涉及 `SessionLog::commit/visit/read_after` 全链路与所有存储后端，缺少崩溃点设计时改不动 |
 | **P0-11** journal 默认路径在 `agents/` | 改成用户目录需要路径迁移 + 旧数据 fallback（否则老用户的会话全部“消失”），是数据面变更，需单独决策与迁移脚本 |
 | **P1-2** 模型流 partial 恢复 | 需要先定语义：客户端已看到半截文本时，重启是丢弃 partial（回到 checkpoint）还是继续（保留 partial 让模型续写）。两种都要改 projection 与 model call 状态机 |
-| **P1-11 / P1-12** 投影缓存上限 / 有界事件 channel | 只改 channel 会丢 delta（见状态总表）；投影增长的正解是 P0-2 的快照，否则裁剪会丢去重能力 |
+| **P1-11** 投影缓存上限 | 正解是 P0-2 的快照，否则裁剪会丢 `started`/`inputs` 的去重能力 |
 | **P1-4** 跨进程幂等 | ACP 的 `PromptRequest` 不携带客户端请求 id，进程重启后的重试仍会产生新 turn。要真正去重需要协议层 request id 或自定义 metadata + journal 持久化 `requestId -> turnId` |
 | **P1-14** repair / quarantine 工具 | 现在坏段只是不再阻断打开，没有显式的「截断到指定 seq / 隔离坏 commit」命令；隔离需要写侧 API 与目录清单（`list_paths` 目前约定 recovery 不使用） |
-| **P2** 其余项 | P2-20（无界 channel）随 P1-12；P2-3（`Drop` 不能 await）、P2-13（blob 懒加载要改 `visit` 签名）、P2-15（大对象独立 segment）、P2-16（chunk 采样）均为需先定设计的部分项 |
+| **P2** 其余项 | P2-3（`Drop` 不能 await）、P2-13（blob 懒加载要改 `visit` 签名）、P2-16（chunk 采样）为需先定设计的部分项；P2-10 仅剩其它 crate 的 `lock().unwrap()`；P2-20 的 core `delta_tx` 未改 |
 | **未补的测试** | 两进程 SQLite / 文件 CAS（需独立进程）、`session/list` 重启可见的端到端、`_agentscope/session/respond` 端到端（需挂起工具的 run） |
 
 ---
@@ -309,7 +309,7 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 
 ### 2.3 P2（可观测性 / 次级风险）
 
-> 2026-10-28 第四轮：P2-1/2/4/5/6/7/8/9/11/12/14/17/18/19 已修；P2-3/10/13/15/16 部分；P2-20 随 P1-12 未做。
+> 2026-10-28 第五轮：P2-15/P2-20（ACP 侧）已修，P1-12 落地。
 
 | 编号 | 问题 | 状态 | 位置 / 修复 |
 |---|---|---|---|
@@ -327,12 +327,12 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 | P2-12 | `SessionInbox::fold` 未知事件 fatal | ✅ | 随 P1-14 改为忽略 + `warn` |
 | P2-13 | `SessionProjection::read` 每个 commit 读两次、所有 blob 都 hydrate | ◐ | `journal.rs`：单 commit 单次读已落地；blob 仍随 commit 全量 hydrate（要懒加载需改 `visit` 的 `&SessionEvent` 签名） |
 | P2-14 | `SessionTurns::read`/`pending_interactions` 每次 cold turn 全量且各扫一遍 | ✅ | `views.rs`：`replay_views` 单次 visit 同时折叠多个视图；`open_views`/`admission_views`/`recovery_views` 各自只选所需视图（+ 等价性测试 `one_replay_matches_the_individual_views`） |
-| P2-15 | `MAX_INLINE_PAYLOAD_BYTES=64KB` 导致大量 blob + version 文件 | ◐ | immutable commit/blob 已不写 `.version`；大对象仍未单独 segment |
+| P2-15 | `MAX_INLINE_PAYLOAD_BYTES=64KB` 导致大量 blob + version 文件 | ✅ | immutable commit/blob 不写 `.version`（+ 回归测试 `immutable_payload_blobs_do_not_get_a_version_file`）；>64KiB 的 payload 按事件各写一个 blob，commit JSON 只留 `{}` + 引用 |
 | P2-16 | `model/chunk` 含完整 chunk/usage，每 token 都落盘 | ◐ | 随 P1-13 合并降量；进一步可采样/不落 token |
 | P2-17 | 错误日志缺少 session/run/epoch/owner/lease | ✅ | `recorder.rs` 致命提交失败带 run/turn/epoch/owner/lease/attempt；`journal.rs` 四条重放告警带 `session` 前缀；重基路径带 run/head_seq |
 | P2-18 | 没有 journal 大小/事件数/重放耗时/心跳年龄指标 | ✅ | `recorder.rs` 新增 `SessionMetrics` + `SessionRecorder::metrics()`：`durable_seq`/`pending_events`/`pending_bytes`/`replay_ms`/`heartbeat_age_ms`/`lease_ms`（告警与自动 compaction 仍待接入） |
 | P2-19 | `AgentSession::start` 每 50ms 轮询，即使 idle | ✅ | `harness/src/agent/session/session.rs`：accept 后 `Notify` 唤醒；idle 指数退避至 `IDLE_POLL_MAX = 500ms`，有活跃 run 保持 50ms |
-| P2-20 | ACP `events_tx`/core `delta_tx` unbounded | ⬜ | 见 P1-12（需要先定丢弃策略） |
+| P2-20 | ACP `events_tx`/core `delta_tx` unbounded | ◐ | ACP 侧已改有界 `EventQueue`（见 P1-12）；core `delta_tx`（`react_agent.rs:845`）仍是 per-call 无界，消费者是本次 run 的事件流，随 run 结束释放，未改 |
 
 ---
 
@@ -344,7 +344,7 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 2. **任意阶段 kill -9 后重启**：5s 内可接管/释放旧 lease；不重复执行已产生副作用的工具；原 turn 可 resume 或明确 reconcile，不丢用户输入。
 3. **冷启动重放**：10 万事件 session 在 10s 内 open（或至少租约不丢、用户不报错）。⬜ 依赖 P0-2
 4. **取消**：长工具执行中 cancel，工具在 1s 内停止/被标记 uncertain；session 可立即接受下一条 prompt。
-5. **慢客户端**：事件队列有界，内存不增长；连接断开后 run 被取消/收尾。⬜ 依赖 P1-12
+5. **慢客户端**：事件队列有界，内存不增长；连接断开后 run 被取消/收尾。✅ ACP 侧已改有界队列（超限丢弃 + 计数 + turn 结束告知）；core `delta_tx` 仍是 per-call 无界（P2-20 部分）
 6. **双进程**：两个 ACP 进程同 session 并发，不丢 commit、不 head 回退；只有一个 writer。
 7. **磁盘/网络抖动**：注入 10 次 transient 失败，run 继续或明确恢复，不能一次就 sticky。
 
@@ -399,9 +399,9 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 |---|---|
 | `cargo test -p agentscope-core --lib` | 346 passed / 0 failed / 3 ignored |
 | `cargo test -p agentscope-core --tests` | 全部 target 通过 |
-| `cargo test -p agentscope-harness --lib` | 483 passed / 0 failed |
+| `cargo test -p agentscope-harness --lib` | 484 passed / 0 failed |
 | `cargo test -p agentscope-harness --test harness_session_test --test harness_session_journal_wiring_test --test harness_session_web_tools_test` | 4 / 19 / 8 passed |
-| `cargo test -p agentscope-extensions-acp` | 60 lib + 全部集成 test 通过 |
+| `cargo test -p agentscope-extensions-acp` | 65 lib（含 5 项 `event_queue` 单测）+ 全部集成 test 通过 |
 | `cargo fmt --check`（改动文件） | 干净（`shutdown/mod.rs`、`e2b.rs`、`harness_shutdown_test.rs` 为仓库既有未格式化文件，本次未动） |
 
 反向验证（逐个回退实现 → 确认 FAILED → 恢复）：
@@ -422,6 +422,8 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 | `sort_session_infos` 回退为按 id 排序 | `the_session_list_orders_by_last_activity_not_by_id` | FAILED |
 | 不再写 `updated_at` | `a_clone_sees_the_activity_of_a_turn_it_did_not_run` | FAILED |
 | `metrics()` 的 `heartbeat_age_ms` 恒 `None` | `metrics_report_replay_pending_and_heartbeat_age` | FAILED |
+| `EventQueue::push` 的容量判定 → `if false` | `a_full_queue_drops_the_newest_and_counts_deltas`、`a_full_queue_still_accepts_the_agent_result` | FAILED |
+| `/blobs/` 从不可变列表移除 | `immutable_payload_blobs_do_not_get_a_version_file` | FAILED |
 
 ---
 

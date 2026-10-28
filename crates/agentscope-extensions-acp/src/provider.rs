@@ -83,12 +83,19 @@ impl ProviderRegistry {
 
     /// Whether the registry knows any provider (i.e. the capability is backed).
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).providers.is_empty()
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .providers
+            .is_empty()
     }
 
     /// The advertised providers, excluding disabled ones.
     pub fn list(&self) -> Vec<ProviderInfo> {
-        let guard = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard
             .providers
             .iter()
@@ -108,7 +115,10 @@ impl ProviderRegistry {
         base_url: impl Into<String>,
         headers: HashMap<String, String>,
     ) -> bool {
-        let mut guard = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(provider) = guard.providers.iter_mut().find(|p| p.id == id) else {
             return false;
         };
@@ -120,7 +130,10 @@ impl ProviderRegistry {
 
     /// Marks a provider disabled. Returns `false` when it is unknown or required.
     pub fn disable(&self, id: &str) -> bool {
-        let mut guard = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(provider) = guard.providers.iter().find(|p| p.id == id) else {
             return false;
         };
@@ -135,7 +148,10 @@ impl ProviderRegistry {
 
     /// The effective routing config for `id`, when one has been recorded.
     pub fn current(&self, id: &str) -> Option<ProviderCurrentConfig> {
-        let guard = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.disabled.iter().any(|d| d == id) {
             return None;
         }

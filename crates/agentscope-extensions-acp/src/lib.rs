@@ -11,6 +11,7 @@ pub mod coding_agent;
 pub mod config;
 pub mod elicitation;
 pub mod event;
+mod event_queue;
 pub mod ext;
 pub mod mcp_over_acp;
 pub mod permission_store;

@@ -626,6 +626,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immutable_payload_blobs_do_not_get_a_version_file() {
+        // Payload blobs are content-addressed exactly like commits, so a sibling `.version`
+        // would double the file count of a journal that already spills large tool results
+        // into one blob per event. (Writer seals are not covered: they keep their version
+        // file.)
+        let dir = temp_dir("immutable_blobs");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let storage = WorkspaceSessionStorage::new(Arc::clone(&fs));
+        let ctx = RuntimeContext::new();
+
+        let path = "s1/blobs/deadbeef";
+        assert!(storage.compare_and_set(path, 0, b"payload").await.unwrap());
+        assert!(!fs.exists(&ctx, "s1/blobs/deadbeef.version").await.unwrap());
+        // A replayed write of the same bytes stays idempotent; different bytes conflict.
+        assert!(!storage.compare_and_set(path, 0, b"payload").await.unwrap());
+        assert!(storage.compare_and_set(path, 0, b"other").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_journal_persists_across_store_instances() {
         let dir = temp_dir("reopen");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
