@@ -4,13 +4,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
+use agentscope_core::middleware::{
+    AgentInput, EventStream, ExtensionPoint, Middleware, MiddlewareChain, Next,
+};
 use agentscope_core::model::Model;
-use agentscope_core::{Agent, CallableAgent, ReActAgent};
+use agentscope_core::{Agent, AgentEvent, CallableAgent, ReActAgent, RuntimeContext};
+use futures::StreamExt;
 
 use crate::backend::dto::{CommitRequest, FeedbackRequest};
 use crate::backend::{TrinityClient, TrinityModelAdapter};
@@ -409,8 +413,15 @@ pub struct TrainingConfig {
     reward_calculator: Arc<dyn RewardCalculator>,
     commit_interval_seconds: i64,
     http_timeout: Duration,
+    /// Recorded auto-commit flag. Mirrors Java `TrainingConfig.enableAutoCommit`,
+    /// which Java writes but never reads: `startCommitScheduler()` only checks the
+    /// interval. Rust matches Java, so this value never gates the scheduler.
     enable_auto_commit: bool,
+    /// Maximum number of shadow runs executed concurrently.
     shadow_pool_size: usize,
+    /// Reserved: Java uses this as the queue capacity of its bounded-elastic shadow
+    /// scheduler; tokio has no equivalent bounded wait queue, so the value is kept
+    /// for configuration parity only.
     shadow_pool_capacity: usize,
     repeat_time: i32,
 }
@@ -449,15 +460,21 @@ impl TrainingConfig {
     pub fn http_timeout(&self) -> Duration {
         self.http_timeout
     }
-    /// Whether periodic auto-commit is enabled.
+    /// The recorded auto-commit flag (Java parity: configuration only).
+    ///
+    /// Java never reads `enableAutoCommit`; the commit scheduler is controlled
+    /// solely by [`Self::commit_interval_seconds`]. See [`TrainingRunner::start`].
     pub fn is_enable_auto_commit(&self) -> bool {
         self.enable_auto_commit
     }
-    /// Shadow agent pool size.
+    /// Maximum number of shadow runs executed concurrently.
+    ///
+    /// Used as the permit count of the router shadow semaphore, the Rust
+    /// counterpart of Java `Schedulers.newBoundedElastic(shadowPoolSize, ...)`.
     pub fn shadow_pool_size(&self) -> usize {
         self.shadow_pool_size
     }
-    /// Shadow agent queue capacity.
+    /// Reserved queue capacity of the shadow pool (not consumed at runtime).
     pub fn shadow_pool_capacity(&self) -> usize {
         self.shadow_pool_capacity
     }
@@ -549,6 +566,7 @@ impl TrainingConfigBuilder {
         self.http_timeout = timeout;
         self
     }
+    /// Records the auto-commit flag (Java parity: it does not gate the scheduler).
     pub fn enable_auto_commit(mut self, enable: bool) -> Self {
         self.enable_auto_commit = enable;
         self
@@ -600,13 +618,17 @@ impl TrainingConfigBuilder {
 // AgentCloner
 // ---------------------------------------------------------------------------
 
-/// Extra configuration for a shadow agent that cannot be read back from an
-/// existing agent (Rust has no reflection).
+/// Optional overrides for the fields [`AgentCloner`] copies onto a shadow agent.
+///
+/// Every field defaults to `None`, meaning "inherit from the production agent"
+/// (`ReActAgent::sys_prompt()` / `ReActAgent::max_iters()`), which mirrors Java's
+/// reflective field copy. Set a field only to deliberately diverge from the
+/// production agent.
 #[derive(Debug, Clone, Default)]
 pub struct ShadowAgentSpec {
-    /// System prompt copied onto the shadow agent.
+    /// Overrides the system prompt inherited from the production agent.
     pub sys_prompt: Option<String>,
-    /// Max reasoning iterations copied onto the shadow agent.
+    /// Overrides the max reasoning iterations inherited from the production agent.
     pub max_iters: Option<i32>,
 }
 
@@ -614,9 +636,14 @@ pub struct ShadowAgentSpec {
 ///
 /// The Java version uses reflection to read private fields; Rust instead copies
 /// the fields exposed through the [`agentscope_core::Agent`] trait (name,
-/// description, toolkit) and rebuilds the agent with a fresh (empty) state. Any
-/// field that cannot be read back (`sys_prompt`, `max_iters`) can be supplied via
-/// [`ShadowAgentSpec`].
+/// description, toolkit) plus the `ReActAgent` getters for the system prompt and
+/// max iterations, then rebuilds the agent with a fresh (empty) state.
+///
+/// Not migrated: Java's `modelExecutionConfig` / `toolExecutionConfig` /
+/// `toolExecutionContext` have no counterpart on `ReActAgent` in Rust (core has
+/// neither the fields nor builder setters); execution tuning is per call
+/// (`GenerateOptions::execution_config`) or per tool (`ToolConfig`), so a cloned
+/// agent simply uses the defaults for every call.
 pub struct AgentCloner;
 
 impl AgentCloner {
@@ -629,18 +656,20 @@ impl AgentCloner {
         new_model: Arc<dyn Model>,
         spec: ShadowAgentSpec,
     ) -> Result<ReActAgent> {
-        let mut builder = ReActAgent::builder()
+        // Java copies `sysPrompt` / `maxIters` reflectively; Rust reads them back
+        // through the public getters and only lets `ShadowAgentSpec` override them.
+        let sys_prompt = spec
+            .sys_prompt
+            .unwrap_or_else(|| original.sys_prompt().to_string());
+        let max_iters = spec.max_iters.unwrap_or_else(|| original.max_iters());
+        let builder = ReActAgent::builder()
             .name(format!("{}-shadow", original.name()))
             .description(original.description().to_string())
             .model(new_model)
             .toolkit(original.toolkit().clone())
+            .sys_prompt(sys_prompt)
+            .max_iters(max_iters)
             .todo_tool(false);
-        if let Some(sys_prompt) = spec.sys_prompt {
-            builder = builder.sys_prompt(sys_prompt);
-        }
-        if let Some(max_iters) = spec.max_iters {
-            builder = builder.max_iters(max_iters);
-        }
         builder.build().map_err(|e| {
             Error::Agent(format!("Failed to clone ReActAgent: {}", original.name()).into())
                 .with_source_boxed(e)
@@ -675,22 +704,38 @@ pub struct ShadowRunReport {
 
 /// Runs shadow agents to collect training data, mirroring `TrainingRouter`.
 ///
-/// The Java hook reacts to `PreCall`/`PostCall` events. Rust has no equivalent
-/// post-call hook, so this router is driven explicitly: callers hand it the
-/// production agent, the input messages and an optional training annotation, and
-/// it decides whether to train, then spawns the configured number of shadow runs.
+/// Java registers this as a global `PreCall`/`PostCall` hook. Rust has no global
+/// hook registry, so the router is driven explicitly in two ways:
+///
+/// * directly, by handing it the production agent, the input messages and an
+///   optional training annotation ([`TrainingRouter::decide`] /
+///   [`TrainingRouter::run_shadow`]);
+/// * automatically, through [`TrainingHook`], a middleware that observes the end of
+///   a production call on the agents the host attaches it to.
 pub struct TrainingRouter {
     config: TrainingConfig,
     trinity_client: TrinityClient,
+    /// Caps how many shadow runs execute at once: the Rust counterpart of Java's
+    /// `Schedulers.newBoundedElastic(shadowPoolSize, shadowPoolCapacity, ...)`.
+    shadow_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl TrainingRouter {
     /// Creates a router from a config and a Trinity client.
     pub fn new(config: TrainingConfig, trinity_client: TrinityClient) -> Self {
+        // Java's `newBoundedElastic` requires a positive size; keeping at least one
+        // slot means a zero config can never deadlock the router.
+        let slots = config.shadow_pool_size().max(1);
         Self {
             config,
             trinity_client,
+            shadow_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
         }
+    }
+
+    /// Number of shadow slots currently free (observability for hosts and tests).
+    pub fn available_shadow_slots(&self) -> usize {
+        self.shadow_slots.available_permits()
     }
 
     /// The underlying config.
@@ -744,6 +789,15 @@ impl TrainingRouter {
 
         let repeat = self.config.repeat_time();
         for i in 0..repeat {
+            // Bounded shadow concurrency (Java `newBoundedElastic`); the permit is
+            // released when this iteration finishes.
+            let _slot = match Arc::clone(&self.shadow_slots).acquire_owned().await {
+                Ok(slot) => slot,
+                Err(e) => {
+                    tracing::error!("Shadow pool unavailable, aborting training run: {e}");
+                    break;
+                }
+            };
             let run_id = RunRegistry::allocate_run_id(&task_id);
             let context = Arc::new(RunExecutionContext::create(task_id.clone(), run_id.clone()));
 
@@ -846,6 +900,134 @@ impl TrainingRouter {
 }
 
 // ---------------------------------------------------------------------------
+// TrainingHook (explicit assembly, Java `AgentBase.addSystemHook`)
+// ---------------------------------------------------------------------------
+
+/// Middleware that drives a [`TrainingRouter`] once a production call finishes.
+///
+/// Java's `TrainingRunner.start()` registers the router through
+/// `AgentBase.addSystemHook(router)`, a **process-global** hook that fires for every
+/// agent in the JVM. Rust has no global registry and core middleware chains are frozen
+/// when an agent is built, so the equivalent is an **explicit, per-agent assembly**:
+///
+/// ```text
+/// let mut chain = MiddlewareChain::new();        // or start from an existing chain
+/// let hook = runner.attach(&mut chain);          // ~= AgentBase.addSystemHook(router)
+/// let agent = Arc::new(
+///     ReActAgent::builder()
+///         .model(model)
+///         .middleware_chain(chain)
+///         .build()?,
+/// );
+/// hook.bind_agent(&agent);                       // the agent must exist first
+/// runner.start();                                // lifecycle only, no hook registration
+/// ```
+///
+/// The post-call step (selection -> shadow runs -> feedback) runs when the agent event
+/// stream is drained, which is where Java `PostCallEvent` fires. Differences from
+/// Java, both intentional:
+///
+/// * the post-call step is awaited inline instead of being subscribed on a bounded
+///   elastic pool, so a production call only completes after its shadow runs do
+///   (wrap the call in `tokio::spawn` when that latency matters);
+/// * it only applies to the agents the host attaches it to, not to every agent.
+///
+/// A call that fails before producing an `AGENT_RESULT` (for example an interrupted
+/// run) has no reply message, so it is skipped instead of being trained on.
+pub struct TrainingHook {
+    router: Arc<TrainingRouter>,
+    spec: Mutex<ShadowAgentSpec>,
+    agent: Mutex<Option<Weak<ReActAgent>>>,
+    completed_calls: Arc<AtomicUsize>,
+}
+
+impl TrainingHook {
+    /// Creates a hook driving `router`.
+    pub fn new(router: Arc<TrainingRouter>) -> Self {
+        Self {
+            router,
+            spec: Mutex::new(ShadowAgentSpec::default()),
+            agent: Mutex::new(None),
+            completed_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Overrides the shadow-clone spec used for every call this hook observes.
+    pub fn with_spec(self, spec: ShadowAgentSpec) -> Self {
+        *self.spec.lock().unwrap() = spec;
+        self
+    }
+
+    /// Adds this hook to `chain` (the Rust counterpart of `addSystemHook`).
+    pub fn install(self: &Arc<Self>, chain: &mut MiddlewareChain) {
+        chain.add_arc(self.clone());
+    }
+
+    /// Binds the production agent this hook clones for shadow runs.
+    ///
+    /// Held as a [`Weak`] reference on purpose: the agent owns its middleware chain,
+    /// so an `Arc` here would make the agent keep itself alive forever.
+    pub fn bind_agent(&self, agent: &Arc<ReActAgent>) {
+        *self.agent.lock().unwrap() = Some(Arc::downgrade(agent));
+    }
+
+    /// Number of completed production calls this hook has handled.
+    pub fn completed_calls(&self) -> usize {
+        self.completed_calls.load(Ordering::SeqCst)
+    }
+
+    /// The router this hook drives.
+    pub fn router(&self) -> Arc<TrainingRouter> {
+        Arc::clone(&self.router)
+    }
+}
+
+impl Middleware for TrainingHook {
+    fn active_points(&self) -> Vec<ExtensionPoint> {
+        vec![ExtensionPoint::OnAgent]
+    }
+
+    fn on_agent(
+        &self,
+        _ctx: &RuntimeContext,
+        input: AgentInput,
+        next: Next<AgentInput>,
+    ) -> EventStream {
+        let inputs = input.messages.clone();
+        let reply: Arc<Mutex<Option<Msg>>> = Arc::new(Mutex::new(None));
+        let reply_slot = Arc::clone(&reply);
+        let inner = next(input).inspect(move |item| {
+            if let Ok(AgentEvent::AgentResult(data)) = item {
+                if let Some(value) = data.fields.get("reply") {
+                    if let Ok(msg) = serde_json::from_value::<Msg>(value.clone()) {
+                        *reply_slot.lock().unwrap() = Some(msg);
+                    }
+                }
+            }
+        });
+        let agent = self.agent.lock().unwrap().clone();
+        let router = Arc::clone(&self.router);
+        let spec = self.spec.lock().unwrap().clone();
+        let completed = Arc::clone(&self.completed_calls);
+        let tail = futures::stream::once(async move {
+            let Some(agent) = agent.and_then(|weak| weak.upgrade()) else {
+                return;
+            };
+            let Some(output) = reply.lock().unwrap().clone() else {
+                return;
+            };
+            let agent_name = agent.name().to_string();
+            router
+                .run_shadow(&agent_name, &agent, inputs, output, None, spec)
+                .await;
+            completed.fetch_add(1, Ordering::SeqCst);
+        })
+        .filter_map(|_| async { None::<Result<AgentEvent>> });
+        Box::pin(inner.chain(tail))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TrainingRunner
 // ---------------------------------------------------------------------------
 
@@ -877,6 +1059,23 @@ impl TrainingRunner {
     /// The underlying router.
     pub fn router(&self) -> Arc<TrainingRouter> {
         Arc::clone(&self.router)
+    }
+
+    /// Installs a [`TrainingHook`] on `chain` and returns it.
+    ///
+    /// This is the explicit-assembly counterpart of Java's global
+    /// `AgentBase.addSystemHook(router)`: build the agent with the augmented chain,
+    /// then call [`TrainingHook::bind_agent`] with the finished agent. See
+    /// [`TrainingHook`] for the full pattern and the differences from Java.
+    pub fn attach(&self, chain: &mut MiddlewareChain) -> Arc<TrainingHook> {
+        let hook = Arc::new(TrainingHook::new(self.router()));
+        hook.install(chain);
+        hook
+    }
+
+    /// Whether a periodic-commit task is currently installed.
+    pub fn has_commit_scheduler(&self) -> bool {
+        self.commit_task.lock().unwrap().is_some()
     }
 
     /// Starts the runner (idempotent) and any periodic-commit task.
@@ -923,8 +1122,11 @@ impl TrainingRunner {
 
     fn start_commit_scheduler(&self) {
         let interval = self.config.commit_interval_seconds();
-        if interval <= 0 || !self.config.is_enable_auto_commit() {
-            tracing::info!("Commit scheduler disabled (interval <= 0 or auto-commit off)");
+        // Java parity: `TrainingRunner.startCommitScheduler()` only checks the
+        // interval. `enableAutoCommit` is a dead knob in Java (written by the config,
+        // never read), so Rust deliberately does not gate the scheduler on it either.
+        if interval <= 0 {
+            tracing::info!("Commit scheduler disabled (interval <= 0)");
             return;
         }
         let client = self.trinity_client.clone();
@@ -1436,7 +1638,7 @@ mod tests {
     mod model_support {
         use super::*;
         use agentscope_core::error::Result as CoreResult;
-        use agentscope_core::message::ChatUsage;
+        use agentscope_core::message::{ChatUsage, ContentBlock, TextBlock};
         use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
         use agentscope_core::ReActAgent;
         use futures::stream;
@@ -1464,6 +1666,30 @@ mod tests {
             }
         }
 
+        /// Always answers with the text block `ok`; used to drive a real production call.
+        pub struct ReplyModel;
+        impl Model for ReplyModel {
+            fn stream(
+                &self,
+                _m: Vec<Msg>,
+                _t: Vec<ToolSchema>,
+                _o: GenerateOptions,
+            ) -> futures::stream::BoxStream<'_, CoreResult<ChatResponse>> {
+                Box::pin(stream::once(async {
+                    Ok(ChatResponse::new(
+                        "reply-id",
+                        vec![ContentBlock::Text(TextBlock::new("ok"))],
+                        ChatUsage::default(),
+                        None,
+                        None,
+                    ))
+                }))
+            }
+            fn model_name(&self) -> &str {
+                "reply"
+            }
+        }
+
         pub fn agent(name: &str) -> ReActAgent {
             ReActAgent::builder()
                 .name(name)
@@ -1471,6 +1697,48 @@ mod tests {
                 .build()
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn agent_cloner_inherits_prompt_and_max_iters_by_default() {
+        let original = ReActAgent::builder()
+            .name("prod")
+            .sys_prompt("you are the production agent")
+            .max_iters(3)
+            .model(Arc::new(model_support::FakeModel))
+            .build()
+            .unwrap();
+        let shadow = AgentCloner::clone_with_model(
+            &original,
+            Arc::new(model_support::FakeModel),
+            ShadowAgentSpec::default(),
+        )
+        .unwrap();
+        // Java copies both fields reflectively; the default clone must not degrade them.
+        assert_eq!(shadow.sys_prompt(), "you are the production agent");
+        assert_eq!(shadow.max_iters(), 3);
+    }
+
+    #[test]
+    fn agent_cloner_spec_overrides_inherited_values() {
+        let original = ReActAgent::builder()
+            .name("prod")
+            .sys_prompt("production prompt")
+            .max_iters(5)
+            .model(Arc::new(model_support::FakeModel))
+            .build()
+            .unwrap();
+        let shadow = AgentCloner::clone_with_model(
+            &original,
+            Arc::new(model_support::FakeModel),
+            ShadowAgentSpec {
+                sys_prompt: Some("shadow prompt".to_string()),
+                max_iters: Some(2),
+            },
+        )
+        .unwrap();
+        assert_eq!(shadow.sys_prompt(), "shadow prompt");
+        assert_eq!(shadow.max_iters(), 2);
     }
 
     #[test]
@@ -1516,5 +1784,132 @@ mod tests {
             .await;
         // Rejected by the strategy => no shadow runs, no network calls.
         assert!(reports.is_empty());
+    }
+
+    fn router_with(sample_rate: f64, shadow_pool_size: usize) -> TrainingRouter {
+        let config = TrainingConfig::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .selection_strategy(Arc::new(SamplingRateStrategy::of(sample_rate)))
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .shadow_pool_size(shadow_pool_size)
+            .build()
+            .unwrap();
+        let client = TrinityClient::builder()
+            .endpoint("http://127.0.0.1:1")
+            .build()
+            .unwrap();
+        TrainingRouter::new(config, client)
+    }
+
+    #[tokio::test]
+    async fn router_shadow_pool_size_is_wired() {
+        let router = router_with(0.0, 3);
+        assert_eq!(router.available_shadow_slots(), 3);
+        let prod = model_support::agent("prod");
+        let reports = router
+            .run_shadow(
+                "prod",
+                &prod,
+                vec![Msg::user("hi")],
+                Msg::assistant("ok"),
+                None,
+                ShadowAgentSpec::default(),
+            )
+            .await;
+        assert!(reports.is_empty());
+        // The permit is released again after the (rejected) iteration.
+        assert_eq!(router.available_shadow_slots(), 3);
+        // A zero pool still leaves one usable slot so the router cannot deadlock.
+        let zero = router_with(0.0, 0);
+        assert_eq!(zero.available_shadow_slots(), 1);
+    }
+
+    #[test]
+    fn commit_scheduler_skipped_for_non_positive_interval() {
+        let runner = TrainingRunner::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .commit_interval_seconds(0)
+            .build()
+            .unwrap();
+        runner.start();
+        assert!(runner.is_running());
+        assert!(!runner.has_commit_scheduler());
+    }
+
+    #[tokio::test]
+    async fn commit_scheduler_ignores_enable_auto_commit_flag() {
+        let config = TrainingConfig::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .commit_interval_seconds(3600)
+            .enable_auto_commit(false)
+            .build()
+            .unwrap();
+        assert!(!config.is_enable_auto_commit());
+        let runner = TrainingRunner::builder().config(config).build().unwrap();
+        runner.start();
+        // Java parity: only the interval gates the scheduler, `enableAutoCommit` is
+        // recorded but never read.
+        assert!(runner.has_commit_scheduler());
+        runner.stop().await;
+        assert!(!runner.has_commit_scheduler());
+    }
+
+    #[test]
+    fn runner_attach_installs_hook_on_chain() {
+        let runner = TrainingRunner::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .commit_interval_seconds(0)
+            .build()
+            .unwrap();
+        let mut chain = MiddlewareChain::new();
+        let hook = runner.attach(&mut chain);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(
+            hook.router().config().trinity_endpoint(),
+            "http://127.0.0.1:1"
+        );
+        assert_eq!(hook.completed_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn training_hook_drives_post_call_after_agent_completion() {
+        let router = Arc::new(router_with(0.0, 10));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(Arc::clone(&router)));
+        hook.install(&mut chain);
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("prod")
+                .model(Arc::new(model_support::ReplyModel))
+                .middleware_chain(chain)
+                .build()
+                .unwrap(),
+        );
+        hook.bind_agent(&agent);
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        // The hook observed AGENT_RESULT once the stream drained; the 0% strategy
+        // rejects the call so no shadow run (and no network) happens.
+        assert_eq!(hook.completed_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn training_hook_without_bound_agent_is_a_passthrough() {
+        let router = Arc::new(router_with(0.0, 10));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(router));
+        hook.install(&mut chain);
+        let agent = ReActAgent::builder()
+            .name("prod")
+            .model(Arc::new(model_support::ReplyModel))
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        assert_eq!(hook.completed_calls(), 0);
     }
 }

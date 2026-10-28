@@ -20,7 +20,7 @@ pub use reward::{FnRewardCalculator, RewardCalculator, ZeroRewardCalculator};
 pub use runner::{
     task_id_generator, AgentCloner, RegistryStats, RunExecutionContext, RunRegistry,
     ShadowAgentSpec, ShadowRunReport, TaskExecutionRegistry, TrainingConfig, TrainingConfigBuilder,
-    TrainingRouter, TrainingRunner, TrainingRunnerBuilder,
+    TrainingHook, TrainingRouter, TrainingRunner, TrainingRunnerBuilder,
 };
 pub use strategy::{
     is_expired, ExplicitMarkingStrategy, SamplingRateStrategy, SelectionDecision,
