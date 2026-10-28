@@ -7,15 +7,30 @@
 //! rather than dialect overrides because the lock is session-scoped and a dialect carries no
 //! connection (see the `native_lock` module docs).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Interval between two acquisition attempts of [`SandboxLockStrategy::try_enter_async`].
+///
+/// Mirrors the Java PostgreSQL `TimeUnit.MILLISECONDS.sleep(100)` loop. Sleeping happens on
+/// the async task (`tokio::time::sleep`), never on the calling worker thread.
+pub const DEFAULT_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Outcome of a lock acquisition attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockOutcome {
     /// The lock was acquired.
     Acquired,
     /// The lock could not be acquired before the timeout expired.
+    ///
+    /// Only a **deadline expiry** (or "someone else holds it") maps here: the guard degrades
+    /// to a no-op lease.
     TimedOut,
+    /// The backend reported a failure (unreachable server, unsupported statement, ...).
+    ///
+    /// Backend failures must never be folded into [`LockOutcome::TimedOut`]: a broken lock
+    /// store is not the same thing as a contended lock, and downgrading it would let two
+    /// processes run unprotected while pretending the guard worked.
+    Failed(String),
 }
 
 /// Handle to a held distributed lock.
@@ -65,12 +80,72 @@ impl Drop for LockLease {
 }
 
 /// Blocking-until-available or timeout lock acquisition.
+///
+/// ## Sync vs async
+///
+/// [`Self::try_enter_once`] performs a **single** attempt and never sleeps. The polling loop
+/// lives in [`Self::try_enter_async`], which sleeps with `tokio::time::sleep` — a sync
+/// polling loop would have to sleep on the calling thread, which is exactly what stalls a
+/// Tokio worker (and previously forced `std::thread::sleep` inside the acquire path).
+///
+/// [`Self::try_enter`] is the sync compatibility entry point: it performs one attempt only,
+/// so existing synchronous callers keep working without blocking a runtime. It stays
+/// available for strategies (like [`crate::sandbox::TableLockStrategy`]) that must offer a
+/// blocking flavour to non-async callers.
+#[async_trait::async_trait]
 pub trait SandboxLockStrategy: Send + Sync {
-    /// Acquires the named lock, blocking until available or the timeout expires.
+    /// Performs a single acquisition attempt.
     ///
-    /// Returns `Ok(lease)` when acquired, or `Err(LockOutcome::TimedOut)` when the
-    /// timeout expired. Backends that cannot block (e.g. a lock table) poll internally.
-    fn try_enter(&self, lock_name: &str, timeout_seconds: u64) -> Result<LockLease, LockOutcome>;
+    /// `attempt_timeout` bounds **this attempt only** (a blocking-capable backend such as the
+    /// MySQL `GET_LOCK` may wait that long server-side); the whole acquisition is bounded by
+    /// [`Self::try_enter_async`]'s deadline.
+    ///
+    /// Returns `Ok(lease)` when acquired, `Err(LockOutcome::TimedOut)` when the lock is held
+    /// by someone else, and `Err(LockOutcome::Failed(_))` when the backend failed.
+    fn try_enter_once(
+        &self,
+        lock_name: &str,
+        attempt_timeout: Duration,
+    ) -> Result<LockLease, LockOutcome>;
+
+    /// Acquires the named lock, retrying until the deadline expires.
+    ///
+    /// Sleeps between attempts with `tokio::time::sleep`. Deadline expiry yields
+    /// `Err(LockOutcome::TimedOut)`; a backend failure short-circuits with
+    /// `Err(LockOutcome::Failed(_))` and is never retried into a timeout.
+    async fn try_enter_async(
+        &self,
+        lock_name: &str,
+        timeout_seconds: u64,
+    ) -> Result<LockLease, LockOutcome> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.try_enter_once(lock_name, remaining) {
+                Ok(lease) => return Ok(lease),
+                // `Acquired` as an error value is a legacy sentinel: treat it as "retry".
+                Err(LockOutcome::Acquired) | Err(LockOutcome::TimedOut) => {}
+                Err(LockOutcome::Failed(message)) => {
+                    return Err(LockOutcome::Failed(message));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(LockOutcome::TimedOut);
+            }
+            tokio::time::sleep(DEFAULT_LOCK_POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+
+    /// Synchronous single-attempt acquisition (no sleeping).
+    ///
+    /// Returns `Ok(lease)` when acquired, or `Err(LockOutcome::TimedOut)` when the lock is
+    /// unavailable / the timeout is already exhausted. Backend failures surface as
+    /// `Err(LockOutcome::Failed(_))`. Callers that can await should use
+    /// [`Self::try_enter_async`] to get the retry loop.
+    fn try_enter(&self, lock_name: &str, timeout_seconds: u64) -> Result<LockLease, LockOutcome> {
+        self.try_enter_once(lock_name, Duration::from_secs(timeout_seconds))
+    }
 
     /// Convenience wrapper accepting a [`Duration`] timeout.
     fn try_enter_for(&self, lock_name: &str, timeout: Duration) -> Result<LockLease, LockOutcome> {

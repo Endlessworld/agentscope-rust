@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use rusqlite::Transaction;
 
 use super::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession};
-use crate::dialect::{BoundSql, SqlParam};
+use crate::dialect::{BoundSql, NativeLockSession, SqlParam};
 
 /// A [`JdbcExecutor`] backed by a single `rusqlite` connection guarded by a mutex.
 ///
@@ -177,6 +177,17 @@ impl JdbcExecutor for RusqliteExecutor {
         tx.commit()
             .map_err(|e| JdbcError::Database(format!("commit batch: {e}")))?;
         Ok(total)
+    }
+
+    /// SQLite has no server-scoped advisory lock, so this backend never provides a native
+    /// lock session. Callers use the portable [`crate::sandbox::TableLockStrategy`] on
+    /// SQLite; MySQL/PostgreSQL executors live in their own driver crates and override this.
+    fn open_native_lock_session(&self) -> JdbcResult<Box<dyn NativeLockSession>> {
+        Err(JdbcError::Unsupported(
+            "SQLite has no native advisory lock (GET_LOCK / pg_try_advisory_lock); \
+             MySQL/PostgreSQL lock sessions are provided by their driver-layer executors"
+                .to_string(),
+        ))
     }
 
     /// Opens a real SQLite transaction; the callback's statements commit together or all

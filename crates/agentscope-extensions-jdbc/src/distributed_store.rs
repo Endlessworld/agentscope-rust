@@ -9,14 +9,11 @@
 //!
 //! # Alignment with harness `DistributedStore`
 //!
-//! The harness [`DistributedStore`] currently exposes only `agent_state_store` and
-//! `isolation_scope`; it has no fields for the base store / snapshot spec / execution
-//! guard / message bus (see `EXTENSIONS_GAP_TRACKER.md` §2.2). This facade therefore keeps
-//! the assembled components behind its own accessors (mirroring the Java facade's lazy
-//! component getters) and exposes a [`JdbcDistributedStore::to_harness_store`] bridge that
-//! projects the agent-state-store half into the harness type. When the harness type gains
-//! the remaining fields, the bridge can populate them without changing this crate's
-//! public surface.
+//! The harness [`DistributedStore`] carries `agent_state_store` + `isolation_scope` plus
+//! the composite slots `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard`.
+//! [`JdbcDistributedStore::to_harness_store`] populates all of them from the assembled
+//! components (the guard through the harness `SandboxGuard` trait), so the facade no
+//! longer needs a partial projection.
 
 use std::sync::Arc;
 
@@ -139,17 +136,27 @@ impl JdbcDistributedStore {
         self.dialect.clone()
     }
 
-    /// Projects the agent-state-store half into the harness [`HarnessDistributedStore`].
+    /// Projects every JDBC component into the harness [`HarnessDistributedStore`].
     ///
-    /// Used by `HarnessAgent::builder().distributed_store(...)`. The remaining JDBC
-    /// components are reached via this facade's accessors until the harness type gains the
-    /// corresponding fields.
+    /// Used by `HarnessAgent::builder().distributed_store(...)`. All four JDBC components
+    /// are representable by the harness bundle: the agent state store, the KV base store,
+    /// the snapshot spec, and the distributed execution guard (through the harness
+    /// `SandboxGuard` trait implemented by [`JdbcSandboxExecutionGuard`]).
     pub fn to_harness_store(&self) -> HarnessDistributedStore {
-        HarnessDistributedStore {
-            agent_state_store: Some(
-                self.agent_state_store.clone() as Arc<dyn agentscope_core::state::AgentStateStore>
-            ),
-            isolation_scope: self.isolation_scope.clone(),
-        }
+        let state: Arc<dyn agentscope_core::state::AgentStateStore> =
+            self.agent_state_store.clone();
+        let base: Arc<dyn agentscope_harness::filesystem::remote::store::BaseStore> =
+            self.base_store.clone();
+        let snapshots: Arc<dyn agentscope_harness::agent::sandbox::SandboxSnapshotSpec> =
+            self.snapshot_spec.clone();
+        let guard: Arc<dyn agentscope_harness::agent::sandbox::SandboxGuard> =
+            self.execution_guard.clone();
+        HarnessDistributedStore::builder()
+            .agent_state_store(state)
+            .isolation_scope(self.isolation_scope.clone())
+            .base_store(base)
+            .sandbox_snapshot_spec(snapshots)
+            .sandbox_execution_guard(guard)
+            .build()
     }
 }

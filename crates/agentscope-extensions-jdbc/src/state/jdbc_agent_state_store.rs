@@ -32,27 +32,13 @@ const SINGLE_STATE_INDEX: i64 = 0;
 /// The anonymous user namespace, mirroring core's `ANON_USER`.
 const ANON_USER: &str = "__anon__";
 
-/// Sentinel version for backends without optimistic concurrency, mirroring the Java
-/// `AgentStateStore.UNVERSIONED`. Also returned by [`JdbcAgentStateStore::save_if_version`]
-/// when a CAS write conflicts (and nothing was written).
-pub const UNVERSIONED: i64 = -1;
-
-/// A state value paired with its optimistic-concurrency version, mirroring the Java
-/// `VersionedState<T>`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct VersionedState {
-    /// The loaded state, or `None` when the key is absent.
-    pub value: Option<Value>,
-    /// The store version (`0` when the key does not yet exist on this versioning backend).
-    pub version: i64,
-}
-
-impl VersionedState {
-    /// Returns `true` when a value was present in the store.
-    pub fn is_present(&self) -> bool {
-        self.value.is_some()
-    }
-}
+// `VersionedState` / `UNVERSIONED` have exactly **one** definition in the workspace: the
+// core `agentscope_core::state` pair (adjudication A2 lifted the versioning surface onto the
+// [`AgentStateStore`] trait). They are re-exported here — rather than redefined — so the
+// pre-existing public paths (`agentscope_extensions_jdbc::{VersionedState, UNVERSIONED}` and
+// `agentscope_extensions_jdbc::state::{...}`) keep working while callers can move values
+// between this crate and core without a conversion.
+pub use agentscope_core::state::{VersionedState, UNVERSIONED};
 
 /// JDBC-backed [`AgentStateStore`].
 pub struct JdbcAgentStateStore {
@@ -571,16 +557,15 @@ impl AgentStateStore for JdbcAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> agentscope_core::state::VersionedState {
+        // The inherent method already returns the core type (single definition, re-exported
+        // at the top of this module), so no conversion is needed here.
         match JdbcAgentStateStore::get_versioned(self, user_id, session_id, key) {
-            Ok(v) => agentscope_core::state::VersionedState {
-                value: v.value,
-                version: v.version,
-            },
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!("[jdbc-state] get_versioned failed for {key}: {e}");
-                agentscope_core::state::VersionedState {
+                VersionedState {
                     value: None,
-                    version: agentscope_core::state::UNVERSIONED,
+                    version: UNVERSIONED,
                 }
             }
         }
@@ -605,7 +590,7 @@ impl AgentStateStore for JdbcAgentStateStore {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("[jdbc-state] save_if_version failed for {key}: {e}");
-                agentscope_core::state::UNVERSIONED
+                UNVERSIONED
             }
         }
     }

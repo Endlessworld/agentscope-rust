@@ -176,11 +176,53 @@ fn components_share_the_same_executor_and_dialect() {
 #[test]
 fn to_harness_store_projects_agent_state_store_and_isolation_scope() {
     // Java: JdbcDistributedStore implements DistributedStore (all accessors live on the facade).
-    // Rust: harness DistributedStore carries only agent_state_store + isolation_scope (§4.2).
+    // Rust: the harness bundle now carries every JDBC component (see tracker §2.2, resolved
+    // 2026-10-28).
     let (store, _) = new_store();
     let harness = store.to_harness_store();
     assert!(harness.agent_state_store.is_some());
     assert_eq!(harness.isolation_scope, IsolationScope::default());
+}
+
+#[tokio::test]
+async fn to_harness_store_fills_every_composite_slot() {
+    // Rust-only bridge test (tracker §2.2 resolved 2026-10-28): the JDBC facade projects its
+    // base store, snapshot spec and execution guard into the harness `DistributedStore`.
+    let (store, _) = new_store();
+    let harness = store.to_harness_store();
+
+    // base_store: the Kv store must answer `BaseStore` calls.
+    let base = harness.base_store.as_ref().expect("base_store projected");
+    let mut value = serde_json::Map::new();
+    value.insert("projected".to_string(), serde_json::json!(true));
+    base.put(&ns(&["facade"]), "k", value);
+    assert!(base.get(&ns(&["facade"]), "k").is_some());
+
+    // sandbox_snapshot_spec: must build a remote snapshot for a valid id.
+    let spec = harness
+        .sandbox_snapshot_spec
+        .as_ref()
+        .expect("sandbox_snapshot_spec projected");
+    let snapshot = spec.build("projected-snap").expect("snapshot builds");
+    assert_eq!(snapshot.id(), "projected-snap");
+    assert_eq!(snapshot.snapshot_type(), "remote");
+
+    // sandbox_execution_guard: usable through the object-safe trait.
+    let guard = harness
+        .sandbox_execution_guard
+        .as_ref()
+        .expect("sandbox_execution_guard projected");
+    let key = SandboxIsolationKey::new("user", "projected");
+    let lease = guard.try_enter(key.clone()).await;
+    assert!(!lease.is_noop());
+    assert!(guard.is_held(&key));
+    assert!(guard.active_count() >= 1);
+    guard.release(&key).await;
+    assert!(!guard.is_held(&key));
+    assert!(
+        guard.is_distributed(),
+        "JDBC projects a cross-process guard"
+    );
 }
 
 #[test]

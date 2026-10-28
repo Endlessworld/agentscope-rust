@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use super::dialect::BoundSql;
+use super::dialect::{BoundSql, NativeLockSession};
 
 mod sqlite;
 pub use sqlite::{in_memory_executor, RusqliteExecutor};
@@ -140,6 +140,26 @@ pub trait JdbcExecutor: Send + Sync + std::fmt::Debug {
             total += self.execute(bound)?;
         }
         Ok(total)
+    }
+
+    /// Opens a **dedicated** database session able to hold a server-scoped advisory lock.
+    ///
+    /// Native locks (`MySQL GET_LOCK`, `PostgreSQL pg_try_advisory_lock`) are session-scoped:
+    /// the Java implementation opens one `Connection` per lease and releases the lock by
+    /// closing it. [`JdbcExecutor`] itself is a *shared* handle (see [`RusqliteExecutor`]:
+    /// one connection behind a mutex) and cannot express that ownership, so a backend that
+    /// can open exclusive connections overrides this method to hand out a
+    /// [`NativeLockSession`]; [`crate::dialect::ExecutorNativeLockProvider`] turns such an
+    /// executor into a [`crate::dialect::NativeLockSessionProvider`] for
+    /// [`crate::sandbox::NativeLockGuard`].
+    ///
+    /// The default (and [`RusqliteExecutor`]'s) answer is [`JdbcError::Unsupported`] — the
+    /// caller should fall back to the portable [`crate::sandbox::TableLockStrategy`].
+    fn open_native_lock_session(&self) -> JdbcResult<Box<dyn NativeLockSession>> {
+        Err(JdbcError::Unsupported(format!(
+            "{} does not provide exclusive native advisory-lock sessions",
+            std::any::type_name::<Self>()
+        )))
     }
 
     /// Runs `work` as one transaction, rolling back on error.
