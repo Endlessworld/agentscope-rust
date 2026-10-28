@@ -9,9 +9,11 @@
 //! the resume lifecycle (begin run, track interrupts, finish run) synchronously around the agent
 //! run instead of through reactive `doOnComplete`/`doFinally` hooks.
 
+use std::sync::Arc;
+
 use agentscope_core::RuntimeContext;
 
-use crate::adapter::{AguiAdapterConfig, AguiAgentAdapter};
+use crate::adapter::{AguiAdapterConfig, AguiAgentAdapter, AguiStreamableAgent};
 use crate::error::AguiError;
 use crate::event::AguiEvent;
 use crate::model::{AguiMessage, RunAgentInput};
@@ -23,15 +25,35 @@ use crate::runtime::{AguiRuntimeContextRequest, SharedRuntimeContextResolver};
 pub const DEFAULT_AGENT_ID: &str = "default";
 
 /// The outcome of processing an AG-UI request.
-#[derive(Debug, Clone)]
+///
+/// Mirrors Java `AguiRequestProcessor.ProcessResult`: the resolved agent is kept on the result so
+/// transports can interrupt the run (Java keeps `Agent`; the Rust adapter works in terms of
+/// [`AguiStreamableAgent`]).
+#[derive(Clone)]
 pub struct ProcessResult {
     /// The resolved agent id.
     pub agent_id: String,
+    /// The resolved agent, when resolution succeeded.
+    ///
+    /// Java always has an agent here because it resolves before the lazy stream is built; Rust
+    /// reports agent-resolution failures as a `RUN_ERROR` event instead of an error, so this is
+    /// `None` on that path only.
+    pub agent: Option<Arc<dyn AguiStreamableAgent>>,
     /// The resolved caller-provided runtime context (AG-UI metadata excluded until the adapter
     /// enriches it).
     pub runtime_context: RuntimeContext,
     /// The AG-UI event stream produced by the run.
     pub events: Vec<AguiEvent>,
+}
+
+impl std::fmt::Debug for ProcessResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessResult")
+            .field("agent_id", &self.agent_id)
+            .field("has_agent", &self.agent.is_some())
+            .field("events", &self.events.len())
+            .finish()
+    }
 }
 
 impl ProcessResult {
@@ -48,6 +70,20 @@ impl ProcessResult {
         self.events
             .iter()
             .any(|event| matches!(event, AguiEvent::RunError { .. }))
+    }
+
+    /// Interrupts this request's active session.
+    ///
+    /// Mirrors Java `ProcessResult#interrupt(String)`: AG-UI uses `threadId` as the session id, so
+    /// a multi-session agent is interrupted only when it is running that thread. Agents without a
+    /// session-scoped interrupt (and results whose agent failed to resolve) fall back to a plain
+    /// [`Agent::interrupt`](agentscope_core::Agent::interrupt); only the session-scoped path
+    /// reports `true`.
+    pub fn interrupt(&self, thread_id: &str) -> bool {
+        match &self.agent {
+            Some(agent) => agent.interrupt_session(thread_id),
+            None => false,
+        }
     }
 }
 
@@ -114,6 +150,7 @@ impl AguiRequestProcessor {
         {
             return ProcessResult {
                 agent_id,
+                agent: None,
                 runtime_context,
                 events: self.resume_coordinator.contract_error_events(
                     input,
@@ -133,6 +170,7 @@ impl AguiRequestProcessor {
                 self.resume_coordinator.finish_run(&thread_id, &run_id);
                 return ProcessResult {
                     agent_id,
+                    agent: None,
                     runtime_context,
                     events: agent_resolution_error_events(input, &error, &self.config),
                 };
@@ -151,7 +189,7 @@ impl AguiRequestProcessor {
             .resume_coordinator
             .add_resume_interrupts(input, runtime_context.clone());
 
-        let adapter = AguiAgentAdapter::new(agent, self.config.clone());
+        let adapter = AguiAgentAdapter::new(agent.clone(), self.config.clone());
         let mut events = Vec::new();
         let mut run_error_seen = false;
         let mut run = adapter.run_with_context(&effective_input, Some(effective_runtime_context));
@@ -171,6 +209,7 @@ impl AguiRequestProcessor {
 
         ProcessResult {
             agent_id,
+            agent: Some(agent),
             runtime_context,
             events,
         }
@@ -743,17 +782,120 @@ mod tests {
     fn process_results_expose_wire_helpers() {
         let result = ProcessResult {
             agent_id: "a".to_string(),
+            agent: None,
             runtime_context: RuntimeContext::default(),
             events: vec![],
         };
         assert!(result.wire_types().is_empty());
         assert!(!result.has_error());
         assert!(format!("{result:?}").contains("ProcessResult"));
+        // No agent was resolved, so there is nothing to interrupt.
+        assert!(!result.interrupt("thread-1"));
         let processor = processor(TestResolver::default(), AguiAdapterConfig::default_config());
         assert_eq!(
             processor.config().tool_merge_mode(),
             crate::model::ToolMergeMode::MergeExternalPriority
         );
         assert!(format!("{processor:?}").contains("AguiRequestProcessor"));
+    }
+
+    /// Agent that records session-scoped interrupts, mirroring a multi-session `ReActAgent`.
+    #[derive(Default)]
+    struct SessionAgent {
+        sessions: Mutex<Vec<String>>,
+        plain: Mutex<usize>,
+        toolkit: Toolkit,
+    }
+
+    impl Agent for SessionAgent {
+        fn agent_id(&self) -> &str {
+            "session-agent"
+        }
+        fn name(&self) -> &str {
+            "session-agent"
+        }
+        fn description(&self) -> &str {
+            "records interrupts"
+        }
+        fn interrupt(&self) {
+            *self.plain.lock().unwrap() += 1;
+        }
+        fn agent_state(&self) -> agentscope_core::AgentState {
+            agentscope_core::AgentState::default()
+        }
+        fn toolkit(&self) -> &Toolkit {
+            &self.toolkit
+        }
+    }
+
+    impl AguiStreamableAgent for SessionAgent {
+        fn stream_events(
+            &self,
+            _messages: Vec<Msg>,
+            _options: StreamOptions,
+        ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn interrupt_session(&self, session_id: &str) -> bool {
+            self.sessions.lock().unwrap().push(session_id.to_string());
+            true
+        }
+    }
+
+    #[test]
+    fn interrupt_targets_the_thread_session() {
+        let agent = Arc::new(SessionAgent::default());
+        let result = ProcessResult {
+            agent_id: "session-agent".to_string(),
+            agent: Some(agent.clone()),
+            runtime_context: RuntimeContext::default(),
+            events: vec![],
+        };
+
+        assert!(result.interrupt("thread-42"));
+
+        assert_eq!(
+            agent.sessions.lock().unwrap().as_slice(),
+            &["thread-42".to_string()]
+        );
+        // The session-scoped path must not fall back to the unscoped interrupt.
+        assert_eq!(*agent.plain.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn interrupt_falls_back_for_agents_without_a_session_scope() {
+        let agent = Arc::new(StubAgent::new("plain", Vec::new()));
+        let result = ProcessResult {
+            agent_id: "plain".to_string(),
+            agent: Some(agent),
+            runtime_context: RuntimeContext::default(),
+            events: vec![],
+        };
+
+        // The default `interrupt_session` interrupts the agent but cannot claim the session.
+        assert!(!result.interrupt("thread-42"));
+    }
+
+    #[tokio::test]
+    async fn process_exposes_the_resolved_agent_for_interruption() {
+        let agent = Arc::new(SessionAgent::default());
+        let resolver = TestResolver::default();
+        resolver.registry.register("session-agent", agent.clone());
+        let processor = processor(resolver, AguiAdapterConfig::default_config());
+        let mut input = RunAgentInput::of("thread-7", "run-1");
+        input.messages.push(AguiMessage::user_message("m1", "hi"));
+        input
+            .forwarded_props
+            .insert("agentId".to_string(), json!("session-agent"));
+
+        let result = processor.process(&request(input)).await;
+
+        assert!(result.agent.is_some(), "the resolved agent is kept");
+        assert!(result.interrupt("thread-7"));
+        assert_eq!(
+            agent.sessions.lock().unwrap().as_slice(),
+            &["thread-7".to_string()]
+        );
     }
 }

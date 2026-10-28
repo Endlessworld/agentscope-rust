@@ -4,9 +4,13 @@
 //! Mirrors `io.agentscope.core.a2a.server`:
 //!
 //! * [`AgentRunner`] / [`AgentRequestOptions`] - `executor.runner`
+//! * [`executor::AgentExecuteProperties`] - `executor.AgentExecuteProperties`
 //! * [`ServerMessageConvert`] - `utils.MessageConvertUtil`
 //! * [`A2aTaskRegistry`] - `tasks` (`InMemoryTaskStore`)
 //! * [`A2aRequestHandler`] - `request.AgentScopeA2aRequestHandler`
+//! * [`registry::AgentRegistry`] / [`registry::AgentRegistryService`] - `registry`
+//! * [`transport`] - `transport.*` (`TransportWrapper`, `DeploymentProperties`, JSON-RPC)
+//! * [`server::AgentScopeA2aServer`] - `AgentScopeA2aServer`
 //!
 //! The Java implementation delegates to the `a2a-java-sdk` server stack
 //! (`DefaultRequestHandler`, `InMemoryQueueManager`, `BasePushNotificationSender`). Those are
@@ -15,12 +19,26 @@
 //! the SDK-agnostic layer actually contributes.
 
 pub mod card;
+pub mod executor;
+pub mod registry;
+pub mod server;
+pub mod transport;
 
-use std::collections::{BTreeSet, HashMap};
+pub use executor::{AgentExecuteProperties, AgentOutputProjector};
+pub use registry::{AgentRegistry, AgentRegistryService, RegistrationReport};
+pub use server::{A2aServerBuildError, AgentScopeA2aServer, AgentScopeA2aServerBuilder};
+pub use transport::{
+    DeploymentProperties, JsonRpcTransportMetadata, JsonRpcTransportWrapper,
+    JsonRpcTransportWrapperBuilder, TransportHeaders, TransportMetadata, TransportResponse,
+    TransportWrapper, TransportWrapperBuilder,
+};
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole};
+use futures::stream::BoxStream;
 
 use agentscope_extensions_a2a_client::client::SendResult;
 use agentscope_extensions_a2a_client::error::A2aError;
@@ -115,6 +133,25 @@ pub trait AgentRunner: Send + Sync {
 
     /// Stops a running task, mirroring Java `AgentRunner#stop(String)`.
     fn stop(&self, task_id: &str);
+
+    /// Optionally executes one request as an incremental event stream.
+    ///
+    /// [`stream_events`](Self::stream_events) is the message-level contract and buffers the
+    /// whole run before returning, which makes `message/stream` degrade to one final chunk.
+    /// Runners backed by a streaming agent (a core `ReActAgent`, for instance) implement this to
+    /// let the A2A server relay each `AgentEvent` as it happens, mirroring Java `AgentRunner`
+    /// returning a `Flux<AgentEvent>`.
+    ///
+    /// The default returns `None`, and the server then replays the buffered
+    /// [`stream_events`](Self::stream_events) result.
+    fn stream_events_incremental(
+        &self,
+        request_messages: Vec<Msg>,
+        options: AgentRequestOptions,
+    ) -> Option<BoxStream<'static, Result<AgentEvent, A2aError>>> {
+        let _ = (request_messages, options);
+        None
+    }
 }
 
 /// Any [`AgentRunner`] can describe the agent for agent-card defaults.
@@ -461,28 +498,6 @@ fn part_metadata_mut(part: &mut Part) -> &mut agentscope_core::message::JsonMap 
     slot.get_or_insert_with(agentscope_core::message::JsonMap::new)
 }
 
-/// Collects the text of every [`AgentEvent::AgentResult`] in a run.
-///
-/// Mirrors the outcome assembly in Java `AgentScopeAgentExecutor` (blocking path), which
-/// turns the terminal agent result into task artifacts.
-fn collect_result_text(events: &[AgentEvent]) -> String {
-    let mut chunks: Vec<String> = Vec::new();
-    for event in events {
-        if let AgentEvent::AgentResult(data) = event {
-            if let Some(value) = data.fields.get("content") {
-                if let Some(blocks) = value.as_array() {
-                    for block in blocks {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            chunks.push(text.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    chunks.join("")
-}
-
 /// JSON-RPC request handler for an A2A server.
 ///
 /// Mirrors `io.agentscope.core.a2a.server.request.AgentScopeA2aRequestHandler`, which wraps
@@ -491,27 +506,55 @@ fn collect_result_text(events: &[AgentEvent]) -> String {
 /// no background queues so that tests stay deterministic:
 ///
 /// * `message/send` - runs the agent to completion, records the artifacts, returns the task
-/// * `message/stream` - runs the agent and returns its artifact/status events
+/// * `message/stream` - relays the agent's incremental output as status/artifact events
 /// * `tasks/get` / `tasks/cancel` - task store lookups
 /// * `agent/getAuthenticatedExtendedCard` - returns the served card
+///
+/// Output assembly follows [`AgentExecuteProperties`]: which agent events become visible
+/// [`Msg`]s is decided by [`AgentOutputProjector`], and a non-blocking run only completes with a
+/// message when `complete_with_message` is set (a blocking `message/send` always does, as in
+/// Java).
 pub struct A2aRequestHandler {
     runner: Arc<dyn AgentRunner>,
     registry: Arc<A2aTaskRegistry>,
     agent_card: AgentCard,
+    execute_properties: AgentExecuteProperties,
 }
 
 impl A2aRequestHandler {
-    /// Creates a handler serving `runner` with the given agent card.
+    /// Creates a handler serving `runner` with the given agent card and default execution
+    /// properties.
     pub fn new(
         runner: Arc<dyn AgentRunner>,
         agent_card: AgentCard,
         registry: Arc<A2aTaskRegistry>,
     ) -> Self {
+        Self::new_with_properties(
+            runner,
+            agent_card,
+            registry,
+            AgentExecuteProperties::default(),
+        )
+    }
+
+    /// Creates a handler with explicit [`AgentExecuteProperties`].
+    pub fn new_with_properties(
+        runner: Arc<dyn AgentRunner>,
+        agent_card: AgentCard,
+        registry: Arc<A2aTaskRegistry>,
+        execute_properties: AgentExecuteProperties,
+    ) -> Self {
         Self {
             runner,
             registry,
             agent_card,
+            execute_properties,
         }
+    }
+
+    /// The agent execution properties driving output assembly.
+    pub fn execute_properties(&self) -> AgentExecuteProperties {
+        self.execute_properties
     }
 
     /// Builds a handler whose card is derived from `converter` inputs.
@@ -575,58 +618,74 @@ impl A2aRequestHandler {
         serde_json::to_value(&result).map_err(internal)
     }
 
-    /// `message/stream`: runs the agent and answers with its event list.
+    /// `message/stream`: relays the run as a sequence of status/artifact events.
+    ///
+    /// Java's streaming methods return a `Flux` of responses (one SSE frame each); collecting
+    /// that stream is what a non-streaming caller observes, so this shares the incremental
+    /// implementation with [`stream_responses`](Self::stream_responses).
     async fn message_stream(
         &self,
         request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcError> {
-        let params: MessageSendParams = parse_params(request)?;
-        let task = self.run_task(&params).await?;
-        let final_flag = task.status.state.is_terminal();
-        let event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
-            task.id.clone(),
-            task.status.clone(),
-            final_flag,
-        );
-        serde_json::to_value(vec![event]).map_err(internal)
+        let mut stream = self.stream_responses(request)?;
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        while let Some(response) = futures::StreamExt::next(&mut stream).await {
+            if let Some(error) = response.error {
+                return Err(error);
+            }
+            if let Some(result) = response.result {
+                results.push(result);
+            }
+        }
+        Ok(serde_json::Value::Array(results))
+    }
+
+    /// Answers a streaming method with a stream of JSON-RPC responses, one per A2A event.
+    ///
+    /// The stream is lazy: the agent is started when the first item is polled, and each
+    /// agent event is relayed before the run finishes — this is the Rust counterpart of Java
+    /// `JsonRpcTransportWrapper#handleStreamRequest` returning a `Flux<String>`.
+    pub fn stream_responses(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<BoxStream<'static, JsonRpcResponse>, JsonRpcError> {
+        let state = StreamState {
+            runner: self.runner.clone(),
+            registry: self.registry.clone(),
+            execute_properties: self.execute_properties,
+            request: request.clone(),
+            id: request.id.clone(),
+            phase: StreamPhase::Start,
+            pending: VecDeque::new(),
+        };
+        Ok(Box::pin(futures::stream::unfold(state, next_stream_item)))
     }
 
     /// Runs one submitted message through the runner and records the resulting task.
+    ///
+    /// Mirrors Java `processTaskBlocking`: a blocking request always completes with a message
+    /// carrying the compacted output.
     async fn run_task(&self, params: &MessageSendParams) -> Result<Task, JsonRpcError> {
-        let msgs = ServerMessageConvert::convert_from_message_to_msgs(&params.message);
-        let task_id = params
-            .message
-            .task_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let context_id = params
-            .message
-            .context_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let (task_id, context_id, mut events) =
+            start_run(&self.runner, &self.registry, params).await?;
+        let mut projector = AgentOutputProjector::new(self.execute_properties);
+        while let Some(event) = futures::StreamExt::next(&mut events).await {
+            let event = event
+                .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))?;
+            record_artifact_if_any(&self.registry, &task_id, &mut projector, &event);
+        }
 
-        let task = Task::new(task_id.clone(), TaskStatus::new(TaskState::Submitted));
-        self.registry.put(task);
-        self.registry
-            .update_status(&task_id, TaskStatus::new(TaskState::Working));
-
-        let options = AgentRequestOptions::new()
-            .with_task_id(task_id.clone())
-            .with_session_id(context_id.clone());
-
-        let events = self
-            .runner
-            .stream_events(msgs, options)
-            .await
-            .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))?;
-
-        let text = collect_result_text(&events);
-        if !text.is_empty() {
-            let artifact = Artifact::new(task_id.clone(), vec![Part::text(text)]);
-            self.registry.add_artifact(&task_id, artifact);
+        let compacted = projector.compacted();
+        let mut status = TaskStatus::new(TaskState::Completed);
+        if !compacted.is_empty() {
+            status.message = Some(ServerMessageConvert::convert_from_msgs_to_message(
+                &compacted,
+                &task_id,
+                &context_id,
+            ));
         }
         self.registry
-            .update_status(&task_id, TaskStatus::new(TaskState::Completed))
+            .update_status(&task_id, status)
             .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task vanished"))
     }
 
@@ -649,6 +708,244 @@ impl A2aRequestHandler {
             .cancel(&params.id)
             .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task not found"))?;
         serde_json::to_value(&task).map_err(internal)
+    }
+}
+
+/// Starts one submitted message and returns `(task_id, context_id, event stream)`.
+///
+/// Mirrors the executor's submit step: record the task as `submitted`, flip it to `working`, and
+/// open the agent run. Runners that expose an incremental stream are used as-is; the others are
+/// replayed from their buffered [`AgentRunner::stream_events`] result.
+async fn start_run(
+    runner: &Arc<dyn AgentRunner>,
+    registry: &Arc<A2aTaskRegistry>,
+    params: &MessageSendParams,
+) -> Result<
+    (
+        String,
+        String,
+        BoxStream<'static, Result<AgentEvent, A2aError>>,
+    ),
+    JsonRpcError,
+> {
+    let msgs = ServerMessageConvert::convert_from_message_to_msgs(&params.message);
+    let task_id = params
+        .message
+        .task_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let context_id = params
+        .message
+        .context_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    registry.put(Task::new(
+        task_id.clone(),
+        TaskStatus::new(TaskState::Submitted),
+    ));
+    registry.update_status(&task_id, TaskStatus::new(TaskState::Working));
+
+    let options = AgentRequestOptions::new()
+        .with_task_id(task_id.clone())
+        .with_session_id(context_id.clone());
+
+    let stream = match runner.stream_events_incremental(msgs.clone(), options.clone()) {
+        Some(stream) => stream,
+        None => {
+            let events = runner
+                .stream_events(msgs, options)
+                .await
+                .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))?;
+            Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+        }
+    };
+    Ok((task_id, context_id, stream))
+}
+
+/// Projects `event` and, when it produces client-visible output, stores it as a task artifact.
+fn record_artifact_if_any(
+    registry: &Arc<A2aTaskRegistry>,
+    task_id: &str,
+    projector: &mut AgentOutputProjector,
+    event: &AgentEvent,
+) {
+    let Some(msg) = projector.project(event) else {
+        return;
+    };
+    let parts = ServerMessageConvert::convert_from_content_blocks(&msg, false);
+    if !parts.is_empty() {
+        registry.add_artifact(task_id, Artifact::new(task_id.to_string(), parts));
+    }
+}
+
+/// The phases of one streaming request, mirroring the reactive pipeline Java builds out of
+/// `emitter.startWork()` → per-event `TaskUpdater` calls → terminal status.
+enum StreamPhase {
+    /// Nothing started yet: the agent is opened on first poll.
+    Start,
+    /// The agent is running; events arrive incrementally.
+    Running {
+        events: BoxStream<'static, Result<AgentEvent, A2aError>>,
+        projector: AgentOutputProjector,
+        task_id: String,
+        context_id: String,
+    },
+    /// The run finished; one final item was already emitted.
+    Done,
+}
+
+/// Mutable state carried through [`futures::stream::unfold`].
+struct StreamState {
+    runner: Arc<dyn AgentRunner>,
+    registry: Arc<A2aTaskRegistry>,
+    execute_properties: AgentExecuteProperties,
+    request: JsonRpcRequest,
+    id: Option<serde_json::Value>,
+    phase: StreamPhase,
+    pending: VecDeque<JsonRpcResponse>,
+}
+
+impl StreamState {
+    /// Queues a successful response carrying `value` as its `result`.
+    fn push_result<T: serde::Serialize>(&mut self, value: &T) {
+        let response = match serde_json::to_value(value) {
+            Ok(value) => JsonRpcResponse::success(value, self.id.clone()),
+            Err(error) => JsonRpcResponse::failure(internal(error), self.id.clone()),
+        };
+        self.pending.push_back(response);
+    }
+
+    /// Queues a JSON-RPC error response.
+    fn push_error(&mut self, error: JsonRpcError) {
+        self.pending
+            .push_back(JsonRpcResponse::failure(error, self.id.clone()));
+    }
+
+    /// Completes the task: record the artifacts, then emit the final status update.
+    fn finish_succeeded(
+        &mut self,
+        task_id: String,
+        context_id: String,
+        projector: AgentOutputProjector,
+    ) {
+        let compacted = projector.compacted();
+        let mut status = TaskStatus::new(TaskState::Completed);
+        if self.execute_properties.complete_with_message() && !compacted.is_empty() {
+            status.message = Some(ServerMessageConvert::convert_from_msgs_to_message(
+                &compacted,
+                &task_id,
+                &context_id,
+            ));
+        }
+        self.registry.update_status(&task_id, status.clone());
+        let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+            task_id, status, true,
+        );
+        event.context_id = Some(context_id);
+        self.push_result(&event);
+        self.phase = StreamPhase::Done;
+    }
+
+    /// Fails the task and emits the terminal status update carrying the error message.
+    fn finish_failed(&mut self, task_id: String, context_id: String, message: &str) {
+        let status = TaskStatus {
+            state: TaskState::Failed,
+            message: Some(Message::new(
+                uuid::Uuid::new_v4().to_string(),
+                MessageRole::Agent,
+                vec![Part::text(message)],
+            )),
+            timestamp: None,
+        };
+        self.registry.update_status(&task_id, status.clone());
+        let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+            task_id, status, true,
+        );
+        event.context_id = Some(context_id);
+        self.push_result(&event);
+        self.phase = StreamPhase::Done;
+    }
+}
+
+/// One poll of the streaming request, mirroring Java's per-event pipeline.
+async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, StreamState)> {
+    loop {
+        if let Some(response) = state.pending.pop_front() {
+            return Some((response, state));
+        }
+        match std::mem::replace(&mut state.phase, StreamPhase::Done) {
+            StreamPhase::Start => {
+                let params = match parse_params::<MessageSendParams>(&state.request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        state.push_error(error);
+                        continue;
+                    }
+                };
+                match start_run(&state.runner, &state.registry, &params).await {
+                    Ok((task_id, context_id, events)) => {
+                        let mut status = TaskStatus::new(TaskState::Working);
+                        status.timestamp = None;
+                        let mut event =
+                            agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+                                task_id.clone(),
+                                status,
+                                false,
+                            );
+                        event.context_id = Some(context_id.clone());
+                        state.push_result(&event);
+                        state.phase = StreamPhase::Running {
+                            events,
+                            projector: AgentOutputProjector::new(state.execute_properties),
+                            task_id,
+                            context_id,
+                        };
+                    }
+                    Err(error) => {
+                        state.push_error(error);
+                    }
+                }
+            }
+            StreamPhase::Running {
+                mut events,
+                mut projector,
+                task_id,
+                context_id,
+            } => match futures::StreamExt::next(&mut events).await {
+                Some(Ok(event)) => {
+                    if let Some(msg) = projector.project(&event) {
+                        let parts = ServerMessageConvert::convert_from_content_blocks(&msg, false);
+                        if !parts.is_empty() {
+                            let artifact = Artifact::new(task_id.clone(), parts);
+                            state.registry.add_artifact(&task_id, artifact.clone());
+                            let mut update =
+                                agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent::new(
+                                    task_id.clone(),
+                                    artifact,
+                                );
+                            update.context_id = Some(context_id.clone());
+                            update.append = Some(true);
+                            update.last_chunk = Some(false);
+                            state.push_result(&update);
+                        }
+                    }
+                    state.phase = StreamPhase::Running {
+                        events,
+                        projector,
+                        task_id,
+                        context_id,
+                    };
+                }
+                Some(Err(error)) => {
+                    state.finish_failed(task_id, context_id, &error.to_string());
+                }
+                None => {
+                    state.finish_succeeded(task_id, context_id, projector);
+                }
+            },
+            StreamPhase::Done => return None,
+        }
     }
 }
 
@@ -686,12 +983,49 @@ pub fn router(handler: Arc<A2aRequestHandler>) -> axum::Router {
         .with_state(handler)
 }
 
-/// `POST /`: decodes a [`JsonRpcRequest`] and returns a [`JsonRpcResponse`].
+/// `POST /`: hands the raw body to the JSON-RPC transport wrapper.
+///
+/// Mirrors a host controller calling `JsonRpcTransportWrapper#handleRequest`: a non-streaming
+/// method answers with one JSON body, a streaming method answers with one SSE frame per
+/// response (Java returns a `Flux` there, which Spring renders as `text/event-stream`).
 async fn jsonrpc_endpoint(
     axum::extract::State(handler): axum::extract::State<Arc<A2aRequestHandler>>,
-    axum::Json(request): axum::Json<JsonRpcRequest>,
-) -> axum::Json<JsonRpcResponse> {
-    axum::Json(handler.handle(&request).await)
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let wrapper = JsonRpcTransportWrapper::new(handler);
+    let headers: TransportHeaders = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    match wrapper
+        .handle_request(&body, &headers, &TransportMetadata::new())
+        .await
+    {
+        TransportResponse::Json(payload) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            payload,
+        )
+            .into_response(),
+        TransportResponse::Stream(stream) => {
+            let frames = futures::StreamExt::map(stream, |payload| {
+                Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default().data(payload),
+                )
+            });
+            axum::response::sse::Sse::new(frames).into_response()
+        }
+    }
 }
 
 /// `GET /.well-known/agent-card.json`.
@@ -937,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn message_stream_returns_a_final_status_update() {
+    fn message_stream_relays_the_run_incrementally() {
         let handler = handler();
         let params = MessageSendParams {
             message: Message::new("m1", MessageRole::User, vec![Part::text("ping")]),
@@ -950,11 +1284,318 @@ mod tests {
             None,
         );
         let response = rt().block_on(handler.handle(&request));
-        let events: Vec<agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent> =
+        let events: Vec<serde_json::Value> =
             serde_json::from_value(response.result.unwrap()).unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].is_final);
-        assert_eq!(events[0].status.state, TaskState::Completed);
+        assert!(
+            events.len() >= 3,
+            "expected working + artifact + final: {events:?}"
+        );
+
+        // 1. the run starts with a non-final `working` status update.
+        let first: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(events[0].clone()).unwrap();
+        assert!(!first.is_final);
+        assert_eq!(first.status.state, TaskState::Working);
+
+        // 2. the agent output arrives as artifact updates.
+        let artifact: agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent =
+            serde_json::from_value(events[1].clone()).unwrap();
+        assert_eq!(artifact.append, Some(true));
+        assert_eq!(artifact.last_chunk, Some(false));
+
+        // 3. the run ends with the final `completed` status update.
+        let last: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(events.last().unwrap().clone()).unwrap();
+        assert!(last.is_final);
+        assert_eq!(last.status.state, TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn stream_responses_emits_before_the_run_finishes() {
+        use futures::channel::mpsc;
+        use futures::StreamExt;
+
+        /// Runner whose event stream is fed by the test, so a buffering server would hang.
+        struct ChannelRunner {
+            receiver: Mutex<Option<mpsc::UnboundedReceiver<Result<AgentEvent, A2aError>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentRunner for ChannelRunner {
+            fn agent_name(&self) -> String {
+                "channel-agent".to_string()
+            }
+
+            fn agent_description(&self) -> String {
+                "fed by the test".to_string()
+            }
+
+            async fn stream_events(
+                &self,
+                _request_messages: Vec<Msg>,
+                _options: AgentRequestOptions,
+            ) -> Result<Vec<AgentEvent>, A2aError> {
+                unreachable!("the incremental path is used")
+            }
+
+            fn stream_events_incremental(
+                &self,
+                _request_messages: Vec<Msg>,
+                _options: AgentRequestOptions,
+            ) -> Option<BoxStream<'static, Result<AgentEvent, A2aError>>> {
+                let receiver = self.receiver.lock().unwrap().take()?;
+                Some(Box::pin(receiver))
+            }
+
+            fn stop(&self, _task_id: &str) {}
+        }
+
+        let (sender, receiver) = mpsc::unbounded();
+        let handler = A2aRequestHandler::new(
+            Arc::new(ChannelRunner {
+                receiver: Mutex::new(Some(receiver)),
+            }),
+            AgentCard::new("channel-agent", "http://localhost"),
+            registry(),
+        );
+        let params = MessageSendParams {
+            message: Message::new("m1", MessageRole::User, vec![Part::text("ping")]),
+            configuration: None,
+            metadata: None,
+        };
+        let request = JsonRpcRequest::new(
+            methods::MESSAGE_STREAM,
+            Some(serde_json::to_value(params).unwrap()),
+            None,
+        );
+        let mut stream = handler.stream_responses(&request).unwrap();
+
+        // Nothing is sent yet: the first item is the `working` status update.
+        let first = stream.next().await.unwrap();
+        let first: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(first.result.unwrap()).unwrap();
+        assert_eq!(first.status.state, TaskState::Working);
+
+        // Feed one delta: the server must relay it while the run is still open.
+        let mut delta = agentscope_core::event::EventData::default();
+        delta.fields.insert(
+            "reply_id".to_string(),
+            serde_json::Value::String("reply-1".to_string()),
+        );
+        delta.fields.insert(
+            "delta".to_string(),
+            serde_json::Value::String("Hel".to_string()),
+        );
+        sender
+            .unbounded_send(Ok(AgentEvent::TextBlockDelta(delta)))
+            .unwrap();
+
+        let second = stream.next().await.unwrap();
+        let second: agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent =
+            serde_json::from_value(second.result.unwrap()).unwrap();
+        assert_eq!(second.append, Some(true));
+
+        // The stream is still open — a buffering implementation could not have answered yet.
+        sender
+            .unbounded_send(Ok(AgentEvent::TextBlockDelta({
+                let mut next = agentscope_core::event::EventData::default();
+                next.fields.insert(
+                    "reply_id".to_string(),
+                    serde_json::Value::String("reply-1".to_string()),
+                );
+                next.fields.insert(
+                    "delta".to_string(),
+                    serde_json::Value::String("lo".to_string()),
+                );
+                next
+            })))
+            .unwrap();
+        let third = stream.next().await.unwrap();
+        assert!(third.result.unwrap()["artifact"]["parts"].is_array());
+
+        drop(sender);
+        let last = stream.next().await.unwrap();
+        let last: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(last.result.unwrap()).unwrap();
+        assert!(last.is_final);
+        assert_eq!(last.status.state, TaskState::Completed);
+        assert!(stream.next().await.is_none());
+
+        // Both deltas were persisted as artifacts of the completed task.
+        let task = handler.registry().get(&last.task_id).unwrap();
+        assert_eq!(task.artifacts.as_ref().unwrap().len(), 2);
+        assert_eq!(task.status.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn require_inner_message_gates_tool_output() {
+        /// Emits one text delta and one tool-result delta.
+        struct InnerRunner;
+
+        #[async_trait::async_trait]
+        impl AgentRunner for InnerRunner {
+            fn agent_name(&self) -> String {
+                "inner".to_string()
+            }
+
+            fn agent_description(&self) -> String {
+                "inner".to_string()
+            }
+
+            async fn stream_events(
+                &self,
+                _request_messages: Vec<Msg>,
+                _options: AgentRequestOptions,
+            ) -> Result<Vec<AgentEvent>, A2aError> {
+                let mut text = agentscope_core::event::EventData::default();
+                text.fields.insert(
+                    "reply_id".to_string(),
+                    serde_json::Value::String("reply-1".to_string()),
+                );
+                text.fields.insert(
+                    "delta".to_string(),
+                    serde_json::Value::String("answer".to_string()),
+                );
+                let mut tool = agentscope_core::event::EventData::default();
+                tool.fields.insert(
+                    "tool_call_id".to_string(),
+                    serde_json::Value::String("call-1".to_string()),
+                );
+                tool.fields.insert(
+                    "delta".to_string(),
+                    serde_json::Value::String("tool output".to_string()),
+                );
+                Ok(vec![
+                    AgentEvent::TextBlockDelta(text),
+                    AgentEvent::ToolResultTextDelta(tool),
+                ])
+            }
+
+            fn stop(&self, _task_id: &str) {}
+        }
+
+        let runner: Arc<dyn AgentRunner> = Arc::new(InnerRunner);
+        let params = MessageSendParams {
+            message: Message::new("m1", MessageRole::User, vec![Part::text("ping")]),
+            configuration: None,
+            metadata: None,
+        };
+        let request = JsonRpcRequest::new(
+            methods::MESSAGE_SEND,
+            Some(serde_json::to_value(params.clone()).unwrap()),
+            None,
+        );
+
+        let quiet = A2aRequestHandler::new(
+            runner.clone(),
+            AgentCard::new("inner", "http://localhost"),
+            registry(),
+        );
+        let task: Task =
+            serde_json::from_value(rt().block_on(quiet.handle(&request)).result.unwrap()).unwrap();
+        assert_eq!(task.artifacts.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            task.artifacts.as_ref().unwrap()[0].parts[0].kind(),
+            agentscope_extensions_a2a_client::model::PartKind::Text
+        );
+
+        let verbose = A2aRequestHandler::new_with_properties(
+            runner,
+            AgentCard::new("inner", "http://localhost"),
+            registry(),
+            AgentExecuteProperties::builder()
+                .require_inner_message(true)
+                .build(),
+        );
+        let task: Task =
+            serde_json::from_value(rt().block_on(verbose.handle(&request)).result.unwrap())
+                .unwrap();
+        let artifacts = task.artifacts.as_ref().unwrap();
+        assert_eq!(
+            artifacts.len(),
+            2,
+            "the tool result becomes its own artifact"
+        );
+        let part = serde_json::to_value(&artifacts[1].parts[0]).unwrap();
+        assert_eq!(part["metadata"]["_agentscope_block_type"], "tool_result");
+    }
+
+    #[test]
+    fn complete_with_message_only_applies_to_non_blocking_runs() {
+        let params = MessageSendParams {
+            message: Message::new("m1", MessageRole::User, vec![Part::text("ping")]),
+            configuration: None,
+            metadata: None,
+        };
+        let send = JsonRpcRequest::new(
+            methods::MESSAGE_SEND,
+            Some(serde_json::to_value(params.clone()).unwrap()),
+            None,
+        );
+        let stream = JsonRpcRequest::new(
+            methods::MESSAGE_STREAM,
+            Some(serde_json::to_value(params).unwrap()),
+            None,
+        );
+
+        // Blocking: always completes with a message, whatever the properties say.
+        for properties in [
+            AgentExecuteProperties::default(),
+            AgentExecuteProperties::builder()
+                .complete_with_message(true)
+                .build(),
+        ] {
+            let handler = A2aRequestHandler::new_with_properties(
+                runner("echo-agent", "echoes"),
+                AgentCard::new("echo-agent", "http://localhost"),
+                registry(),
+                properties,
+            );
+            let task: Task =
+                serde_json::from_value(rt().block_on(handler.handle(&send)).result.unwrap())
+                    .unwrap();
+            let message = task
+                .status
+                .message
+                .expect("a blocking run completes with a message");
+            assert_eq!(
+                message.parts[0].kind(),
+                agentscope_extensions_a2a_client::model::PartKind::Text
+            );
+        }
+
+        // Non-blocking: only when `complete_with_message` is set.
+        let quiet = A2aRequestHandler::new(
+            runner("echo-agent", "echoes"),
+            AgentCard::new("echo-agent", "http://localhost"),
+            registry(),
+        );
+        let events: Vec<serde_json::Value> =
+            serde_json::from_value(rt().block_on(quiet.handle(&stream)).result.unwrap()).unwrap();
+        let last: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(events.last().unwrap().clone()).unwrap();
+        assert!(last.status.message.is_none());
+
+        let verbose = A2aRequestHandler::new_with_properties(
+            runner("echo-agent", "echoes"),
+            AgentCard::new("echo-agent", "http://localhost"),
+            registry(),
+            AgentExecuteProperties::builder()
+                .complete_with_message(true)
+                .build(),
+        );
+        let events: Vec<serde_json::Value> =
+            serde_json::from_value(rt().block_on(verbose.handle(&stream)).result.unwrap()).unwrap();
+        let last: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(events.last().unwrap().clone()).unwrap();
+        let message = last
+            .status
+            .message
+            .expect("complete_with_message asks for a final message");
+        assert_eq!(
+            message.parts[0].kind(),
+            agentscope_extensions_a2a_client::model::PartKind::Text
+        );
     }
 
     #[test]

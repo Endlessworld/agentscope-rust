@@ -70,6 +70,18 @@ pub trait AguiStreamableAgent: Agent {
     ) -> futures::stream::BoxStream<'static, agentscope_core::Result<AgentEvent>> {
         self.stream_events(messages, options)
     }
+
+    /// Interrupts the session that `session_id` names, reporting whether it was the one running.
+    ///
+    /// Mirrors Java `AguiUtil.asReActAgent(agent)` + `ReActAgent#interrupt(RuntimeContext)`:
+    /// AG-UI uses the `threadId` as the session id, so the interrupt must target that session
+    /// instead of whatever the agent happens to be running. Agents without a session-scoped
+    /// interrupt keep the default: they are interrupted unconditionally and report `false`.
+    fn interrupt_session(&self, session_id: &str) -> bool {
+        let _ = session_id;
+        self.interrupt();
+        false
+    }
 }
 
 impl AguiStreamableAgent for agentscope_core::ReActAgent {
@@ -90,6 +102,10 @@ impl AguiStreamableAgent for agentscope_core::ReActAgent {
         agentscope_core::ReActAgent::stream_events_with_extensions(
             self, messages, options, extensions,
         )
+    }
+
+    fn interrupt_session(&self, session_id: &str) -> bool {
+        agentscope_core::ReActAgent::interrupt_session(self, session_id)
     }
 }
 
@@ -114,6 +130,10 @@ impl AguiStreamableAgent for agentscope_harness::agent::HarnessAgent {
         agentscope_harness::agent::HarnessAgent::stream_events_with_extensions(
             self, messages, options, extensions,
         )
+    }
+
+    fn interrupt_session(&self, session_id: &str) -> bool {
+        agentscope_harness::agent::HarnessAgent::interrupt_session(self, session_id)
     }
 }
 

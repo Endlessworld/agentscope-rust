@@ -7,6 +7,7 @@
 //! * [`RuntimeContextCustomizer`] - hook for shaping the run's `RuntimeContext`
 //! * [`AgentProtocolEventBus`] - per-task monotonic event stream with replay
 //! * [`ProtocolTaskRepository`] - control-plane `TaskRecord` persistence
+//! * [`WorkspaceProtocolTaskRepository`] - workspace-backed persistence
 //! * [`AgentProtocolTaskStore`] - task execution and control plane
 //! * [`router`] - the `/tasks` HTTP endpoints
 //!
@@ -20,8 +21,10 @@
 //! * [`ProtocolAgent`] is implemented for [`HarnessAgent`] so a harness agent drives a task.
 
 pub mod error;
+pub mod workspace_repository;
 
 pub use error::{AgentProtocolError, AgentProtocolResult};
+pub use workspace_repository::WorkspaceProtocolTaskRepository;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -684,6 +687,29 @@ impl AgentProtocolTaskStore {
         task_repository: Arc<dyn ProtocolTaskRepository>,
     ) -> Self {
         Self::new(agent_factory, task_repository, None, None, Vec::new())
+    }
+
+    /// Builds a store whose control-plane records persist under
+    /// [`AgentProtocolProperties::resolved_task_store_path`].
+    ///
+    /// Mirrors Java's wiring of `new WorkspaceProtocolTaskRepository(taskStorePath)`: the
+    /// `task_store_path` property only has an effect through this constructor, so a store built
+    /// with [`new`](Self::new) keeps records in memory.
+    pub fn with_workspace_task_store(
+        agent_factory: Arc<dyn AgentFactory>,
+        properties: AgentProtocolProperties,
+        runtime_context_customizers: Vec<Arc<dyn RuntimeContextCustomizer>>,
+    ) -> Self {
+        let task_repository: Arc<dyn ProtocolTaskRepository> = Arc::new(
+            WorkspaceProtocolTaskRepository::new(properties.resolved_task_store_path()),
+        );
+        Self::new(
+            agent_factory,
+            task_repository,
+            None,
+            Some(properties),
+            runtime_context_customizers,
+        )
     }
 
     /// The event bus backing the SSE endpoint.

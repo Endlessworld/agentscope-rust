@@ -11,7 +11,9 @@ agentscope-core = { path = "../agentscope-core" }
 agentscope-extensions-a2a-client = { path = "../agentscope-extensions-a2a-client" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }

@@ -1,4 +1,4 @@
-﻿# PROTOCOL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# PROTOCOL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **PROTOCOL** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-protocol\`
@@ -16,17 +16,21 @@
 | Java 模块 | `agentscope-extensions-protocol` |
 | Java 子模块 | a2a-client, a2a-server, agent-protocol, agui, chat-completions-web |
 | Java 规模（实测行数） | a2a-client 2896 / a2a-server 3238 / agent-protocol 1458 / agui 8467 / chat-completions-web 1851（主代码，不含测试）；**合计主 17910 / 测 21254** |
-| Rust crate | `crates/agentscope-extensions-protocol` |
-| Rust 规模（实测） | `src/` **38 文件 / 17248 行 / 302 个测试**（285 `#[test]` + 17 `#[tokio::test]`） |
+| Rust crate | facade `crates/agentscope-extensions-protocol` + 5 个拆分子 crate（`-a2a-client` / `-a2a-server` / `-agent-protocol` / `-agui` / `-chat-completions-web`，见 §7） |
+| Rust 规模（实测 2026-10-28） | 6 crate 共 **45 文件 / 20948 行 / 341 个测试**（`#[test]` 317 + `#[tokio::test]` 24）；分布：a2a-client 6 文件 2414 行 39 测、a2a-server 6 文件 3819 行 47 测、agent-protocol 3 文件 2093 行 29 测、agui 24 文件 11082 行 191 测、chat-completions-web 5 文件 1507 行 35 测、facade 1 文件 33 行 0 测 |
 | 迁移波次 | A |
-| 当前状态 | **已完成** — a2a（client+server+card+model+message）、agent-protocol、chat-completions-web 已落地；**agui 整包已迁移**（event / model / converter / adapter(+strategy) / encoder / processor / registry / runtime / constants / error，`src/agui/mod.rs` 10 个模块全部 `pub mod` 声明并 re-export），**302 test**（2026-10-22 静态复核计数）。剩余缺口均为 P1/P2 长尾或设计决定（见 §3.2/§3.3、§6 静态复核记录） |
+| 当前状态 | **已完成** — 5 个子 crate 全部落地；**2026-10-22 复核列出的 P1×7 已于 2026-10-28 全部关闭**（服务端引导层 / 执行属性 / registry 服务发现 / transport 包装层 / `message/stream` SSE 增量 / agent-protocol 落盘仓库 / agui `ProcessResult.interrupt`），余下仅 P2 长尾（见 §3.3、§6.4） |
 
-### 1.1 验证基线（最近一次实测，汇总方独立复跑）
+### 1.1 验证基线（最近一次实测，2026-10-28，本 crate 内单条命令）
 ```
-cargo build -p agentscope-extensions-protocol   -> Finished (0 errors)
-cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignored
+cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client \
+  -p agentscope-extensions-a2a-server -p agentscope-extensions-agent-protocol \
+  -p agentscope-extensions-agui -p agentscope-extensions-chat-completions-web -j 2
+-> a2a-client 39 passed / a2a-server 47 passed / agent-protocol 29 passed
+   agui 191 passed / chat-completions-web 35 passed / facade 0 passed
+   合计 341 passed; 0 failed; 0 ignored
 ```
-> **2026-10-22 静态复核**：未执行 `cargo build` / `cargo test`；302 为源码内 `#[test]`(285) + `#[tokio::test]`(17) 的静态计数（逐文件分布见 §6.2）。
+> 2026-10-22 的静态复核（302）已被本次实测取代；`cargo build` 随 `cargo test` 一并通过（0 error）。
 
 ## 2. Java 清单与依赖映射
 
@@ -48,14 +52,14 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 ### 2.2 a2a-server（`io.agentscope.core.a2a.server.*`）
 | Java 类 / 包 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
-| `AgentScopeA2aServer` / `request.AgentScopeA2aRequestHandler` | JSON-RPC 请求处理 | `a2a::server::{A2aRequestHandler, router}` | 部分完成（JSON-RPC 路由与请求分发已实现；**Server 引导层未迁移**——Java `AgentScopeA2aServer` 的 `Builder`/`ServiceLoader` transport 发现/`postEndpointReady`/`getAgentCardJson`/`close` 无对应物） |
-| `executor.AgentScopeAgentExecutor` | 任务执行编排 | `a2a::server::{AgentRunner, A2aTaskRegistry}` | 部分完成（trait + 注册表形式；**blocking/non-blocking 双模式、`AgentExecuteProperties`、订阅取消、`AgentEmitter` 语义未迁移**） |
-| `executor.AgentExecuteProperties` | `completeWithMessage` / `requireInnerMessage` 执行属性 | 无（源码 0 处引用） | 缺失 |
+| `AgentScopeA2aServer` / `request.AgentScopeA2aRequestHandler` | JSON-RPC 请求处理 + 服务装配 | `a2a::server::{A2aRequestHandler, router}` + `a2a::server::AgentScopeA2aServer`（`agentscope-extensions-a2a-server/src/{server,transport,registry,executor}.rs`） | **已完成（2026-10-28）**——引导层 `Builder`/`post_endpoint_ready()`/`agent_card_json()`/`transport_wrapper()`/`close()`/`router()` 均已落地；`ServiceLoader` SPI 以 `default_transport_builders()` + `Builder::transport_builder(..)` 替代（Rust 无 SPI 扫描，记为偏差）；`close()` 为 no-op（Rust handler 无线程） |
+| `executor.AgentScopeAgentExecutor` | 任务执行编排 | `a2a::server::{AgentRunner, A2aTaskRegistry, AgentOutputProjector}` | **已完成（2026-10-28）**——blocking（`message/send`）与非 blocking（`message/stream`）双模式已分离；`AgentOutputProjector` 复刻 Java `BaseFluxEventHandler` 的 required-event-type 表；订阅取消在 Rust 由流 drop 表达（无 `Subscription` 对象） |
+| `executor.AgentExecuteProperties` | `completeWithMessage` / `requireInnerMessage` 执行属性 | `a2a::server::AgentExecuteProperties`（builder + getter） | **已完成并接线（2026-10-28）**——`A2aRequestHandler::new_with_properties` 持有；`require_inner_message` 控制 `TOOL_PROGRESS`/`TOOL_RESULT_*_DELTA`/`HINT_BLOCK` 是否投影；`complete_with_message` 控制非阻塞终态是否带 message（阻塞恒定带，与 Java 一致） |
 | `executor.runner.{AgentRunner, BaseReActAgentRunner, ReActAgentWithBuilderRunner, AgentRequestOptions}` | runner 体系 | `a2a::server::AgentRequestOptions` + `AgentRunner` trait | 部分完成 |
 | `server.utils.MessageConvertUtil` | 服务端 Msg↔A2A 转换 | `a2a::server::ServerMessageConvert`（`convert_from_msgs_to_message` / `convert_from_msg_to_message` / `convert_from_content_blocks` / `compact_streaming_chunks` / `convert_from_message_to_msgs`） | 已完成 |
 | `card.AgentScopeAgentCardConverter` | AgentDescriptor→AgentCard | `a2a::card::{AgentDescriptor, create_agent_card, ConfigurableAgentCard, TransportProperties}` | 已完成 |
-| `registry.{AgentRegistry, AgentRegistryService}` | 智能体注册/发现 | `a2a::server::A2aTaskRegistry`（部分）| 部分完成 |
-| `transport.*` / `transport.jsonrpc.*` | JSON-RPC 传输与包装 | `a2a::client::JsonRpcTransport` + `a2a::server::router` + `a2a::card::TransportProperties`（已迁移） | 部分完成（`DeploymentProperties`/`CustomTransportProperties`/`TransportWrapper`/`TransportWrapperBuilder`/`JsonRpcTransportMetadata` 未迁移） |
+| `registry.{AgentRegistry, AgentRegistryService}` | 智能体注册/发现 | `a2a::server::{AgentRegistry, AgentRegistryService, RegistrationReport}` | **已完成并接线（2026-10-28）**——`AgentRegistry::register(&AgentCard, &[TransportProperties])` + `registry_name()`；`AgentRegistryService` 遍历全部 registry、单个失败不阻断其它（返回 `RegistrationReport{succeeded,failed}`，对应 Java 的日志语义）；由 `AgentScopeA2aServer::post_endpoint_ready()` 触发。NACOS 等发现后端直接实现该 trait 即可复用 |
+| `transport.*` / `transport.jsonrpc.*` | JSON-RPC 传输与包装 | `a2a::server::transport::{TransportWrapper, TransportWrapperBuilder, JsonRpcTransportWrapper(+Builder), JsonRpcTransportMetadata, DeploymentProperties(+Builder), CustomTransportProperties, default_transport_builders}` + `a2a::card::TransportProperties` | **已完成并接线（2026-10-28）**——`TransportResponse::{Json,Stream}` 对应 Java 的 `String`/`Flux<String>`；axum `router()` 的 `POST /` 已改走 `JsonRpcTransportWrapper`（原始 body + 解析错误映射 + 流式 SSE）；`DeploymentProperties` 默认 host 取本机 IP（UDP connect 技巧，离线），端口缺失报 `DeploymentError::MissingPort`；`CustomTransportProperties` 由 `Builder::with_custom_transport(..)` 在 build 时解析 |
 | `constants.A2aServerConstants` | `ContextKeys.IS_STREAM_KEY` | `a2a::server::server_constants::IS_STREAM_KEY`（已声明但**当前无消费点**） | 已完成 |
 | `utils.NetworkUtils` | 网络工具 | 未单独迁移（并入 card/client） | 设计决定 |
 
@@ -69,7 +73,7 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 | `AgentFactory` | 智能体工厂 | `agent_protocol::{AgentFactory, FixedAgentFactory}` | 已完成 |
 | `AgentProtocolEventBus` / `AgentProtocolTaskEventBus` | 事件总线/订阅 | `agent_protocol::{AgentProtocolEventBus, AgentProtocolTaskEventBus, EventSubscription}` | 已完成 |
 | `AgentProtocolTaskStore` | 任务存储/HITL 确认 | `agent_protocol::{AgentProtocolTaskStore, InMemoryProtocolTaskRepository, ConfirmResult, to_confirm_results, extract_pending_confirms, snapshot_value, AWAITING_CONFIRM_SENTINEL}` | 已完成 |
-| `WorkspaceProtocolTaskRepository` / `ProtocolTaskRepository` | 任务持久化仓库 | `agent_protocol::{ProtocolTaskRepository, InMemoryProtocolTaskRepository}` | 部分完成（内存仓库；workspace 落盘仓库未迁移） |
+| `WorkspaceProtocolTaskRepository` / `ProtocolTaskRepository` | 任务持久化仓库 | `agent_protocol::{ProtocolTaskRepository, InMemoryProtocolTaskRepository, WorkspaceProtocolTaskRepository}` | **已完成并接线（2026-10-28）**——`WorkspaceProtocolTaskRepository` 复用 harness `WorkspaceManager::write_task_record_json`/`read_task_record_json`/`list_task_records_json`，落 `agents/{PROTOCOL_AGENT_ID}/tasks/{PROTOCOL_SESSION_ID}.json`；`AgentProtocolTaskStore::with_workspace_task_store(..)` 让 `task_store_path` 真正生效（此前无消费方） |
 | `AgentProtocolController` | HTTP 控制器（Java 实际路径 `/tasks`、`/tasks/{taskId}`、`/tasks/{taskId}/wait`、`/tasks/{taskId}/cancel`、`/tasks/{taskId}/events`、`/tasks/{taskId}/resume`；**Java 侧无 `/api` 前缀**） | `agent_protocol::router` (axum，路径同为 `/tasks...`，未含 `/api` 前缀） | 已完成 |
 | `AgentProtocolAutoConfiguration` | Spring 自动装配 | 不适用（Rust 无 Spring） | 设计决定（不迁移）|
 
@@ -85,7 +89,7 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 | `processor.{AguiRequestProcessor, AguiResumeCoordinator}` | 请求处理/断点续跑 | `agui::processor::{request_processor, resume_coordinator, resolver}`（含 `AgentResolver`/`ProcessResult`/`AguiRequestProcessorBuilder`） | 已完成 |
 | `encoder.AguiEventEncoder` | SSE 编码 | `agui::encoder::AguiEventEncoder` | 已完成 |
 | `registry.AguiAgentRegistry` / `runtime.*` | 注册与运行时上下文 | `agui::registry::{AguiAgentRegistry, AgentFactory}` + `agui::runtime::{AguiRuntimeContextRequest, AguiRuntimeContextResolver, AguiRequestBodyParser, AguiTransport}` | 已完成 |
-| `AguiUtil` / `AguiInterruptConstants` / `AguiException` | 工具/常量/异常 | `agui::constants`（`METADATA_*`/`*_INTERRUPT_REASON`）+ `agui::error::{AguiError, AguiResult}` | 部分完成（`AguiUtil` 的 `isHarnessAgent`/`asReActAgent` 由 `agui::adapter::AguiStreamableAgent` trait（已对 `ReActAgent` 与 `HarnessAgent` 各实现一次）替代，**但 Java `ProcessResult.interrupt(threadId)` 的公开中断入口未迁移**——Rust `agui::processor::ProcessResult` 无 `interrupt` 方法） |
+| `AguiUtil` / `AguiInterruptConstants` / `AguiException` | 工具/常量/异常 | `agui::constants`（`METADATA_*`/`*_INTERRUPT_REASON`）+ `agui::error::{AguiError, AguiResult}` | **已完成（2026-10-28）**（`AguiUtil` 的 `isHarnessAgent`/`asReActAgent` 由 `agui::adapter::AguiStreamableAgent` trait 替代——已对 `ReActAgent` 与 `HarnessAgent` 各实现一次；该 trait 新增 `interrupt_session(&str) -> bool` 承载 Java 的 `asReActAgent(...).interrupt(ctx)` 语义；`ProcessResult::interrupt(thread_id)` 已迁移） |
 
 > **接线复核**：以上全部子模块已在 `src/agui/mod.rs` 声明 + re-export，且 `src/lib.rs` 有 `pub mod agui;`；均已随 crate 编译并产生测试（防「落盘但从未编译」）。
 
@@ -119,8 +123,8 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 | A2A Msg↔Part 转换 | `a2a-client/.../message/*` | 已完成 | `a2a/message.rs`（37200B / 834 行），16 单测 |
 | A2A 卡解析 | `a2a-client/.../card/*` | 已完成 | `a2a/card.rs`（27149B / 685 行），6 单测 |
 | A2A 客户端 | `a2a-client/.../A2aAgent` | 部分完成 | `a2a/client.rs`（18440B / 451 行），9 单测；**高层 Agent 门面（`A2aAgent`/`A2aAgentConfig`）未迁移** |
-| A2A 服务端 + JSON-RPC 路由 | `a2a-server/*` | 部分完成 | `a2a/server.rs`（39601B / 939 行），15 单测；**Server 引导层与 `AgentExecuteProperties` 未迁移** |
-| agent-protocol 任务生命周期 + HTTP 路由 | `agent-protocol/*` | 部分完成 | `agent_protocol.rs`（70749B / 1736 行），22 单测；**workspace 落盘仓库未迁移** |
+| A2A 服务端 + JSON-RPC 路由 | `a2a-server/*` | **已完成（2026-10-28）** | `a2a/server` 拆为 `lib.rs`（939→ 约 900 行 handler/转换）+ `server.rs`/`transport.rs`/`registry.rs`/`executor.rs`；15 个旧测试全保留，新增 31 个（合计 46） |
+| agent-protocol 任务生命周期 + HTTP 路由 | `agent-protocol/*` | **已完成（2026-10-28）** | `agent_protocol`（`lib.rs` + `error.rs` + `workspace_repository.rs`，共 2097 行）；24 旧测试 + 5 新增 = 29；workspace 落盘仓库已接线 |
 | chat-completions-web 模型/转换/构造/流式 | `chat-completions-web/*` | 已完成 | `chat_completions/`（model 545 行 / converter 307 / builder 280 / streaming 349），35 单测 |
 | agui 事件模型 | `agui/event/*`（`AguiEvent`） | **已完成** | `agui/event.rs`（63147B / 1497 行），含 11 单测（事件类型名/序列化/容忍未知类型）；事件变体 28 个与 Java `AguiEvent` record 一一对应 |
 | agui 消息/内容模型 | `agui/model/*` | **已完成** | `agui/model.rs`（31798B / 805 行）（`AguiMessage`/`MessageContent`/`InputContent`/`InputContentSource`/`AguiToolCall`/`AguiFunctionCall`），17 单测 |
@@ -128,28 +132,29 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 | agui 请求/上下文/续跑模型 | `agui/model/{RunAgentInput,AguiContext,AguiResume,...}` | **已完成** | `agui/model.rs`（805 行）含 `RunAgentInput`/`AguiContext`/`AguiResume`/`AguiTool`/`ToolMergeMode`（`ToolMergeMode` 复用 core 枚举） |
 
 ### 3.2 P1（重要）
+> **2026-10-28 状态**：原 7 项 P1（服务端引导层 / `AgentExecuteProperties` / registry 服务发现 / transport 包装层 / `message/stream` SSE 增量 / agent-protocol 落盘仓库 / agui `ProcessResult.interrupt`）**全部关闭**，详见 §8；仅「A2A 服务端 runner 体系 1:1」与本批无关，仍为部分完成。
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| A2A 服务端 runner 体系 1:1 | `executor.runner.*` | 部分完成 | 以 `AgentRunner` trait + `A2aTaskRegistry` 抽象；**具体缺**：`BaseReActAgentRunner`（按 `taskId` 缓存 `ReActAgent` + `stop()` 调 `interrupt()` + 流结束移除缓存）、`ReActAgentWithBuilderRunner`（`ReActAgent.Builder` → `buildReActAgent()`）；Rust `AgentRunner` 已含 `agent_name`/`agent_description`/`stream_events`/`stop` 四方法，但**无 per-task agent 缓存与自动 interrupt 语义** |
-| A2A 智能体注册与发现 | `registry.*` | 部分完成 | `A2aTaskRegistry` 覆盖任务；**具体缺**：`AgentRegistry` 接口（`registryName()` + `register(AgentCard, List<TransportProperties>)`）与 `AgentRegistryService`（多 registry 遍历注册 + 单个失败不影响其它）——源码 0 处引用 |
-| A2A 传输包装层 | `transport.*` | 部分完成 | 仅 JSON-RPC over HTTP；**具体缺**：`TransportWrapper`/`TransportWrapperBuilder`（`build(AgentCard, RequestHandler, Executor, AgentCard)`）、`DeploymentProperties`（host 默认取本机 IP）、`CustomTransportProperties`（`toTransportProperties`/`setDeploymentProperties`/`isEnabled`）、`JsonRpcTransportMetadata`；`TransportProperties` 本身已迁移到 `a2a::card` |
-| A2A 服务端引导层 | `AgentScopeA2aServer` | 部分完成 | **具体缺**：`Builder`（`ServiceLoader` 扫描 `TransportWrapperBuilder` SPI）、`postEndpointReady()`（触发 registry 注册）、`getTransportWrapper(name)`/`getAgentCardJson()`、`close()`；Rust 侧只有 `a2a::server::router()` 与 `A2aRequestHandler` |
-| A2A 执行属性 | `executor.AgentExecuteProperties` | 部分完成 | **具体缺**：`completeWithMessage`（非阻塞任务是否以消息收尾）、`requireInnerMessage`（是否向客户端暴露 tool-result delta / hint 等内部消息）——Rust `A2aRequestHandler::run_task` 恒定只收 `AgentResult` 文本 |
-| agent-protocol workspace 落盘仓库 | `WorkspaceProtocolTaskRepository` | 部分完成 | 仅 `InMemoryProtocolTaskRepository`；**具体缺**：基于 `WorkspaceManager` 的 `writeTaskRecord`/`readTaskRecord` 落盘实现（`AgentProtocolProperties.task_store_path` 已能解析出目录，但无消费方） |
-| agui 运行中断入口 | `AguiRequestProcessor.ProcessResult#interrupt(threadId)` | 部分完成 | **具体缺**：Rust `agui::processor::ProcessResult` 无 `interrupt` 方法（Java 通过 `AguiUtil.asReActAgent` 拿 `ReActAgent` 再按 `threadId` 建 `RuntimeContext` 调 `interrupt`） |
-| SSE 流式响应 | Spring `SseEmitter` | 部分完成 | axum router 已建；`agui::encoder::AguiEventEncoder` 提供 SSE 帧编码（含 `data:`/空行分隔/多行 data）；**缺口**：a2a 服务端 `message/stream` 目前返回一次性事件数组，**未提供真正的 SSE 增量流**（Java `JsonRpcTransportWrapper` 为 `Flow.Publisher` 流式） |
+| A2A 服务端 runner 体系 1:1 | `executor.runner.*` | 部分完成（**不在 2026-10-28 P1×7 范围**） | 以 `AgentRunner` trait + `A2aTaskRegistry` 抽象；**仍缺**：`BaseReActAgentRunner`（按 `taskId` 缓存 `ReActAgent` + `stop()` 调 `interrupt()` + 流结束移除缓存）、`ReActAgentWithBuilderRunner`（`ReActAgent.Builder` → `buildReActAgent()`）；Rust `AgentRunner` 现有 `agent_name`/`agent_description`/`stream_events`/`stream_events_incremental`/`stop`，但**无 per-task agent 缓存与自动 interrupt 语义**。`stream_events_incremental` 为 2026-10-28 新增（默认 `None`，由 handler 回放 `stream_events`），是接 core 流式 agent 的挂点 |
+| A2A 智能体注册与发现 | `registry.*` | **已完成（2026-10-28）** | `a2a::server::{AgentRegistry, AgentRegistryService, RegistrationReport}`（`agentscope-extensions-a2a-server/src/registry.rs`）；`register(agent_card, transports)` 遍历全部 registry、单点失败隔离；`AgentScopeA2aServer::post_endpoint_ready()` 触发。测试 `register_reaches_every_registry_with_the_served_transports` / `one_failing_registry_never_blocks_the_others` / `no_transport_means_no_registry_call` / `post_endpoint_ready_registers_with_every_registry_once` |
+| A2A 传输包装层 | `transport.*` | **已完成（2026-10-28）** | `src/transport.rs`：`TransportWrapper`（`async fn handle_request(body, headers, metadata) -> TransportResponse`，Java 同步版因 Rust handler 为 async 而改 async，已记偏差）、`TransportWrapperBuilder`（去掉 Java 的 `Executor` 参数——流在调用方 async 任务上跑）、`JsonRpcTransportWrapper`+`Builder`、`JsonRpcTransportMetadata`、`DeploymentProperties`+`Builder`（默认 host=本机 IP，端口缺失报错）、`CustomTransportProperties`（由 `Builder::with_custom_transport` 在 build 时 `set_deployment_properties` 后 `to_transport_properties`）。axum `POST /` 已改走 wrapper。测试 8 个（含 `non_streaming_requests_return_one_json_response` / `streaming_requests_return_a_stream_of_json_responses` / `custom_transport_properties_are_resolved_at_build_time`） |
+| A2A 服务端引导层 | `AgentScopeA2aServer` | **已完成（2026-10-28）** | `src/server.rs`：`AgentScopeA2aServer` + `Builder`（`agent_card`/`with_transport`/`transport_builder`/`deployment_properties`/`deployment_port`/`with_agent_registry`/`with_custom_transport`/`agent_execute_properties`/`task_registry`），`build()` 归一化 transport→派生 card→建 handler→建 wrapper（失败即丢弃该 transport）；`transport_wrapper`/`require_transport_wrapper`/`agent_card_json`/`post_endpoint_ready`/`handle_request`/`router`/`close`。`A2aServerBuildError::{NoTransportProperties, NoAvailableTransport}` 对齐 Java 两条 `IllegalArgumentException` 文案。`ServiceLoader` → `default_transport_builders()`（偏差：Rust 无 SPI）。测试 7 个 |
+| A2A 执行属性 | `executor.AgentExecuteProperties` | **已完成（2026-10-28）** | `src/executor.rs`：`AgentExecuteProperties{complete_with_message, require_inner_message}` + builder；`AgentOutputProjector` 复刻 `generateRequiredEventTypes`/`convertToResponseMessage`（TEXT/THINKING delta 恒投影；TOOL_PROGRESS/TOOL_RESULT_TEXT_DELTA/TOOL_RESULT_DATA_DELTA/HINT_BLOCK 需 `require_inner_message`；`AGENT_RESULT` 仅在该 run 无流式输出时兜底）。**偏差**：Rust `AgentRunner` 默认只有消息级契约，故保留 `AGENT_RESULT` 兜底分支（Java 无此事件形态）。测试 `inner_events_need_require_inner_message` / `agent_result_falls_back_only_when_nothing_was_streamed` / `require_inner_message_gates_tool_output` / `complete_with_message_only_applies_to_non_blocking_runs` |
+| agent-protocol workspace 落盘仓库 | `WorkspaceProtocolTaskRepository` | **已完成（2026-10-28）** | `agentscope-extensions-agent-protocol/src/workspace_repository.rs`：复用 harness `TaskRecord` + `WorkspaceManager`（**未另造类型**；harness `TaskRepository` trait 是会话级后台子智能体模型，与协议侧全局 `task_id` 查询语义不同，故 `ProtocolTaskRepository` 保持既有形状并在 tracker 记录理由）；`save/find` 同步 trait 实现用 `futures::executor::block_on` 驱动 workspace 的 async 写读（本地盘 `std::fs` + runtime 无关的 `tokio::sync` 锁，无需 reactor），另提供 `save_async`/`find_async`/`list_async`。接线：`AgentProtocolTaskStore::with_workspace_task_store(..)` 消费 `AgentProtocolProperties::resolved_task_store_path()`。测试 5 个 |
+| agui 运行中断入口 | `AguiRequestProcessor.ProcessResult#interrupt(threadId)` | **已完成（2026-10-28）** | `agui::processor::ProcessResult::interrupt(&self, thread_id) -> bool`：经 `AguiStreamableAgent::interrupt_session`（新增 trait 方法，默认 `interrupt()` 并返回 false；`ReActAgent`/`HarnessAgent` 覆写为各自的 `interrupt_session`）。`ProcessResult` 新增 `agent: Option<Arc<dyn AguiStreamableAgent>>`（**偏差**：Rust 在 agent 解析失败时以 `RUN_ERROR` 事件收尾、无 agent 可挂，故为 `Option`；Java 先解析再建惰性 Flux，恒有值）。测试 `interrupt_targets_the_thread_session` / `interrupt_falls_back_for_agents_without_a_session_scope` / `process_exposes_the_resolved_agent_for_interruption` |
+| SSE 流式响应 | Spring `SseEmitter` / `Flux` | **已完成（2026-10-28）** | a2a 服务端新增 `A2aRequestHandler::stream_responses(request) -> BoxStream<'static, JsonRpcResponse>`（`agentscope-extensions-a2a-server/src/lib.rs` 的 `StreamPhase` 状态机：首帧 `working`、逐事件 `artifact-update`、终帧 `completed`；`AgentRunner::stream_events_incremental(...)` 有则直连、无则回放缓冲结果）；`is_streaming_method` **仅**覆盖 `message/stream`（Java 的 wrapper 也接受 `tasks/resubscribe`，但 Java 有 per-task 事件队列；Rust handler 无队列，订阅只能用重跑实现，故保持非流式并回 `-32601`，已记偏差）；axum `POST /` 对流式方法返回 `text/event-stream`（每帧 `data: <json-rpc response>`，对齐 Java `Flux<String>` + Spring SSE）。测试 `stream_responses_emits_before_the_run_finishes`（用 channel 驱动，缓冲实现必然挂死）/ `message_stream_relays_the_run_incrementally` / `message_stream_is_served_incrementally_over_a_transport` / `resubscribe_is_not_streamed_and_reports_method_not_found` |
 | agui 适配器 + 转换策略 | `agui/adapter/*` | **已完成** | `AguiAgentAdapter`（981 行）/`AguiAdapterConfig`（302 行，12 个配置项与 Java 一一对应）+ 策略层（`context` 603 行/`converters` 1489 行/`enricher` 129 行/`registry` 334 行）；11 个内建 converter 与 Java `strategy/*` 11 个类一一对应 |
 | agui 请求处理/续跑 | `agui/processor/*` | **已完成** | `AguiRequestProcessor`（638 行）/`AguiResumeCoordinator`（600 行）/`AgentResolver`；**注**：`AguiRequestProcessorBuilder` 未暴露 Java 的 `adapterFactory` 注入点（Rust 侧 `AguiAgentAdapterFactory` trait 已存在但 processor 未接线） |
 | `TOOL_PROGRESS` 事件投影（`707400eb`） | `agui/adapter/strategy/ToolResultEventConverter` | **已完成（2026-10-20，有意不映射）** | core 已发独立 `TOOL_PROGRESS` 事件；AG-UI 侧按 Java 既定行为**显式丢弃**（Java 注释：AG-UI 没有工具进度通道，故丢弃而非透传为原始事件），Rust 用带注释的 no-op 分支对齐，**未新增任何 AG-UI 事件**。原先进度借 `TOOL_RESULT_DATA_DELTA` 透传导致的「进度被当成工具结果」风险已消除 |
 | `AguiResume.reason`（`c0d03ccea`） | `AguiMessageConverter#RESUME_PAYLOAD_REASON` | **已完成（2026-10-20）** | `AguiResume` 增 `reason: Option<String>`（`serde(default)` + `skip_serializing_if`，旧客户端缺键可反序列化）；`cancelled` 且带 reason 时，`resume_content` 用它作工具结果文本，并写入 `ConfirmResult.message`；无 reason 时保留历史默认文案 |
-| COMPLETED 任务优先取 artifacts（`6e1ee68d7`） | `A2aAgent.call()` / `TaskEvent` 结果提取 | 待办（新细项，2026-10-26 登记） | Java：COMPLETED 任务若带非空 output artifacts，**优先返回 artifacts**；无 artifacts 才回落 status message；失败终态仍保持「status message 优先于残留 artifacts」。Rust：本 crate **`rg -i artifact` 在 `src/` 零命中**（无 artifacts 概念），`A2aRequestHandler::run_task` 恒定只收 `AgentResult` 文本 —— 因此按当前实现，客户端拿到的始终是 status/文本，**artifacts 在协议层整体缺失**。属 A2A 客户端门面（`A2aAgent`）未迁移的一部分，非独立缺口，故不单列 P0 |
+| COMPLETED 任务优先取 artifacts（`6e1ee68d7`） | `A2aAgent.call()` / `TaskEvent` 结果提取 | 待办（新细项，2026-10-26 登记） | Java：COMPLETED 任务若带非空 output artifacts，**优先返回 artifacts**；无 artifacts 才回落 status message；失败终态仍保持「status message 优先于残留 artifacts」。Rust：**服务端**侧 artifacts 已存在（`A2aTaskRegistry::add_artifact` + `TaskArtifactUpdateEvent`，2026-10-28）；**客户端**侧 `agentscope-extensions-a2a-client` 仍无 artifacts 概念（`rg -i artifact src/` 零命中），结果提取只认 status/文本。属 A2A 客户端门面（`A2aAgent`）未迁移的一部分，非独立缺口，故不单列 P0 |
 
 ### 3.3 P2（增强）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | A2A MIME 探测全表 | `Files.probeContentType` | 部分完成 | Rust 侧为受控扩展名表（png/jpg/gif/webp/bmp/mp3/wav/ogg/mp4/webm/mov）；Java 走系统探测 |
 | A2A 客户端事件 Handler 类体系 | `agent.event.*` | 部分完成 | 由函数式解码替代，无 Handler 对象继承树；**Java `ClientEventContext` 的 hook（Pre/PostReasoning）与 `AgentEventEmitter` 增量发射语义亦未迁移** |
-| agui 工具/常量/异常 | `AguiUtil` 等 | 部分完成 | `agui::constants`（中断元数据/原因常量）+ `agui::error::{AguiError, AguiResult}`（覆盖 Java `AguiException` 的 `AgentNotFound`/`Encoding` 两个子类语义）；`AguiUtil` 由 `AguiStreamableAgent` trait 替代，但 `ProcessResult.interrupt` 未迁移（见 §3.2） |
+| agui 工具/常量/异常 | `AguiUtil` 等 | **已完成（2026-10-28）** | `agui::constants`（中断元数据/原因常量）+ `agui::error::{AguiError, AguiResult}`（覆盖 Java `AguiException` 的 `AgentNotFound`/`Encoding` 两个子类语义）；`AguiUtil` 由 `AguiStreamableAgent` trait 替代，`ProcessResult.interrupt` 已迁移（见 §3.2） |
 | agui transport 枚举粒度 | `AguiRuntimeContextRequest.Transport`（MVC/WEBFLUX/CUSTOM） | 部分完成 | Rust `AguiTransport` 只有 `Custom`/`Http`，MVC 与 WEBFLUX 合并为 `Http` |
 | Java `AguiMessage` 工厂方法族 | `AguiMessage.userMessage/assistantMessage/...` | 部分完成 | Rust `AguiMessage` 有 `user_message`/`user_message_blocks`/`blocks_message`/`reasoning_message`/`with_error`，但**缺** `system_message`/`tool_message` 工厂（字段仍可由 `new`/`blocks_message` 构造） |
 | Spring AutoConfiguration | `*AutoConfiguration` | **已完成（设计决定，不迁移）** | Rust 无 DI 容器；配置由各 crate 的 builder/构造参数显式传入 |
@@ -159,27 +164,37 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **Rust 产物**：`src/lib.rs` + `src/error.rs` + `src/agent_protocol.rs` + `src/chat_completions/*`（5 文件）+ `src/a2a/{mod,model,message,card,client,server}.rs`（6 文件）+ `src/agui/{mod,event,model,converter/,adapter/,adapter/strategy/,encoder,processor/,registry,runtime,constants,error}.rs`（21 文件）= **共 38 个 `.rs` / 17248 行**。
-- **测试**：**302 个**（285 `#[test]` + 17 `#[tokio::test]`；agui 整包贡献 ~156 个，覆盖 converter 双向往返 / ToolMergeMode 分支 / SSE 编码 / 策略转换 / registry / resume 协调）。
-- **验证（汇总方独立复跑，2026-10-21）**：
+- **Rust 产物（2026-10-28，crate 已拆分，见 §7）**：
+  - `agentscope-extensions-protocol`（facade）1 文件 33 行；
+  - `agentscope-extensions-a2a-client` 6 文件 2414 行（`card`/`client`/`error`/`lib`/`message`/`model`）；
+  - `agentscope-extensions-a2a-server` 6 文件 3778 行（`lib`/`card`/`server`/`transport`/`registry`/`executor`）；
+  - `agentscope-extensions-agent-protocol` 3 文件 2097 行（`lib`/`error`/`workspace_repository`）；
+  - `agentscope-extensions-agui` 24 文件 11076 行；
+  - `agentscope-extensions-chat-completions-web` 5 文件 1507 行；
+  - 合计 **45 文件 / 20905 行**。
+- **测试**：**341 个**（`#[test]` 317 + `#[tokio::test]` 24）。分布见 §1 与 §8。
+- **验证（2026-10-28 实测，单条命令 -j 2）**：
   ```
-  cargo build -p agentscope-extensions-protocol  -> Finished, 0 error
-  cargo test  -p agentscope-extensions-protocol  -> 302 passed; 0 failed; 0 ignored
+  cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client \
+    -p agentscope-extensions-a2a-server -p agentscope-extensions-agent-protocol \
+    -p agentscope-extensions-agui -p agentscope-extensions-chat-completions-web
+  -> 39 / 47 / 29 / 191 / 35 / 0 passed；合计 341 passed; 0 failed; 0 ignored
   ```
-  > **2026-10-22 静态复核**：未执行 `cargo build` / `cargo test`；302 为源码内测试属性的静态计数（逐文件分布见 §6.2）。
-- **本批（agui 整包迁移 + 收尾）交付与修复**：
+- **本批（2026-10-28 P1×7 关闭）交付**：见 §8（Java 依据、改动文件、测试名、反向验证）。
+- **历史批次（agui 整包迁移 + 收尾，2026-10-21）**：
   - agui 整包落盘（~8800 行）；**首个子智能体因网络错误中断**，留下 5 个编译错误 + 11 个失败用例且 **tracker 完全未回填**。
   - 汇总方修复 5 个编译错误：①`tool_injection.rs` 的 `AgentTool`→core `Tool`；②core `AgentEventType` **不实现 `Hash`** → `registry.rs` 转换表由 `HashMap` 改 `Vec<(AgentEventType, Arc<dyn AgentEventConverter>)>` + 线性查找；③事件流 `then(async{...}).flatten()` 替代 async `flat_map`（E0277）；④`build_tool_call_interrupt(&result, …)` 补引用（E0308）；⑤补 3 处测试模块 import。
   - 汇总方修复剩余失败用例至全绿（均已在同文件内修正，未删测试/未 `#[ignore]`）：`block_message_id` 无显式 id 时按事件类型推导块类型（`-text`）、`RunFinished.outcome` 与 Java 同为 NON_NULL 语义（断言修正）、ToolResult 数据块换行分隔断言改走两个 data 块、registry native 模式断言改为 START+CONTENT 两事件、`ToolInjection` 复原断言改为「原实例复原」而非「非 external」、`headers().len()` 随大小写敏感存储改为 3、`request_processor` 两个用例补上 agentId 与 active-run 前置条件。
 - **会话内根因修复（早期）**：
   - `chat_completions/streaming.rs` E0700、`builder.rs` 单测非法 `Msg`、`agui` 接线（`lib.rs` 缺 `pub mod agui;`）、`event.rs` `DeserializeOwned` 约束、`a2a/message.rs` 断言写错（详见 §4.3）。
-- **已知问题**：build 存在若干 unused-import 警告（`FunctionCallStream`、`HarnessAgentBuilder`、`SdkResult`、`TextBlock`、`SandboxState`、`WorkspaceSpec`、`ExecResult` 等），不影响编译与测试；属既有状态，本批未动。
+- **已知问题**：build 存在若干 unused-import / unused-const 警告（`FunctionCallStream`、`HarnessAgentBuilder`、`SdkResult`、`TextBlock`、`SandboxState`、`WorkspaceSpec`、`ExecResult`、`BUILT_IN_EVENT_TYPES` 等），不影响编译与测试；属既有状态，本批未动。
 
 ### 4.2 下一步与阻塞
-1. **agui P0/P1 已全部落地**（converter/adapter/encoder/processor/registry/runtime/模型/常量/异常），无 P0 阻塞。
-2. **仍为非 1:1 或长尾的 P1**（2026-10-22 静态复核后逐项列明，见 §3.2）：A2A 服务端引导层（`AgentScopeA2aServer`）、A2A runner 体系 1:1（`BaseReActAgentRunner`/`ReActAgentWithBuilderRunner`）、A2A registry 服务发现（`AgentRegistry`/`AgentRegistryService`）、A2A transport 包装层（`TransportWrapper*`/`DeploymentProperties`/`CustomTransportProperties`）、A2A 执行属性（`AgentExecuteProperties`）、agent-protocol workspace 落盘仓库、agui `ProcessResult.interrupt`。
-3. **跨模块需求**：agui 事件/续跑已在本 crate 内自洽实现，**未需扩展 harness**（agent 事件用 core `AgentEvent` + `AguiStreamableAgent` 适配层）。若将来需与 harness 事件总线/HITL 深度集成，另立任务评估。
-4. 无 workspace 级依赖变更需求（现有 `axum`/`reqwest`/`futures`/`async-trait` 已在本 crate 声明；本批未新增依赖）。**注**：`bytes` 已声明但未使用，清理前需汇总方确认是否影响其它 crate。
+1. **P0/P1×7 已全部落地**（见 §3.1/§3.2、§8），无 P0 阻塞。
+2. **仍为非 1:1 的 P1（明确不在本次 7 项内）**：A2A runner 体系 1:1（`BaseReActAgentRunner` per-task agent 缓存 + 自动 `interrupt`／`ReActAgentWithBuilderRunner`）；`AguiRequestProcessorBuilder` 未暴露 `adapterFactory` 注入点。
+3. **P2 长尾**（§3.3）：`A2aAgent` 高层门面 + `A2aAgentConfig`、客户端 `agent.event.*` Handler 体系、`AguiTransport` 枚举粒度、`AguiMessage.system_message/tool_message`、`bytes`/`tracing` 未用依赖、A2A MIME 全表、客户端侧 artifacts 优先提取。
+4. **跨模块需求**：本批**未改 core/harness**。`WorkspaceProtocolTaskRepository` 直接复用 harness `WorkspaceManager` 的既有 task-record API（`write_task_record_json`/`read_task_record_json`/`list_task_records_json`），无需新增能力位。`AgentRegistry` 由本 crate 提供，NACOS 等发现后端可直接实现该 trait 复用。
+5. **依赖变更**：仅 `crates/agentscope-extensions-a2a-server/Cargo.toml` 增加 `futures`、`tracing`（均为 workspace 依赖，根 `Cargo.toml` 未改）。**注**：`bytes` 仍在本 crate 声明但未使用，清理前需汇总方确认是否影响其它 crate。
 
 ### 4.3 失败测试根因（已修复）
 - **用例**：`a2a::message::tests::media_part_mime_falls_back_to_primary_type_for_unknown_extension`（`src/a2a/message.rs:765`）。
@@ -208,6 +223,8 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
 
 ## 6. 静态复核记录（2026-10-22）
+
+> **已被 §8 部分取代（2026-10-28）**：本节记录的 7 项 P1 缺口现已全部关闭（见 §3.2 与 §8）。保留本节作为历史快照；行数/测试数口径以 §1.1 / §4.1 / §8.2 的实测为准。
 
 ### 6.1 复核方式
 - **静态复核**：**未执行** `cargo build` / `cargo test`；**未修改任何 Rust 代码**；仅修改本文件 `docs/extensions/PROTOCOL__GAP_TRACKER.md`。
@@ -332,5 +349,76 @@ cargo test  -p agentscope-extensions-protocol   -> 302 passed; 0 failed; 0 ignor
 
 - 错误类型按 crate 拆分：`A2aError`（a2a-client，a2a-server 复用）、`AgentProtocolError`（agent-protocol）；不再有共享 `ProtocolError`。
 - 服务端专属的 card 构造（`ConfigurableAgentCard` / `TransportProperties` / `AgentDescriptor` / `create_agent_card`）从 `card.rs` 移到 `agentscope-extensions-a2a-server/src/card.rs`，以解除拆分后的 orphan-rule 冲突（`impl<T: AgentRunner> AgentDescriptor for T`）。
-- 测试随文件迁移，共 304 个（原 302 + 2 个错误类型用例）；`cargo check --workspace --all-targets` 通过。
+- 测试随文件迁移，拆分后 304 个（原 302 + 2 个错误类型用例）；**2026-10-28 P1×7 关闭后 341 个**（+37）。
 - `agui` 的 `token_usage_events_are_opt_in_and_accumulate` 原本依赖 `serde_json/preserve_order` 被 ACP 传递开启；拆分后改为解析 JSON 断言，不再依赖 feature 统一顺序。
+
+---
+
+## 8. 2026-10-28 执行记录 —— P1×7 关闭
+
+> 本批目标：关闭 §6.4 / §6.6 列出的 7 项 P1。代码按归属落到子 crate，facade（`agentscope-extensions-protocol`）只做 re-export，未新增任何实现代码。未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**` 或其它扩展 crate。
+
+### 8.1 逐项交付
+
+| # | P1 项 | 归属子 crate / 文件 | Java 依据 | Rust 产物 | 测试 |
+|---|---|---|---|---|---|
+| 1 | A2A 服务端引导层 | `agentscope-extensions-a2a-server/src/server.rs`（新，656 行） | `a2a-server/.../server/AgentScopeA2aServer.java`（505 行：`Builder`、`ServiceLoader`、`postEndpointReady`、`getAgentCardJson`、`close`） | `AgentScopeA2aServer` + `AgentScopeA2aServerBuilder`（`agent_card`/`with_transport`/`transport_builder`/`deployment_properties`/`deployment_port`/`with_agent_registry`/`with_custom_transport`/`agent_execute_properties`/`task_registry`）；`build()` 归一化 transport → 派生 card → 建 handler → 建 wrapper（失败丢弃该 transport）；`transport_wrapper`/`require_transport_wrapper`/`transport_names`/`agent_card_json`/`post_endpoint_ready`/`handle_request`/`router`/`close`；`A2aServerBuildError::{NoTransportProperties, NoAvailableTransport}` 文案与 Java 两条 `IllegalArgumentException` 逐字对齐 | `build_requires_transport_properties_or_a_deployment_port`、`deployment_properties_synthesize_the_default_jsonrpc_transport`、`configured_transports_without_a_builder_are_rejected`、`custom_builders_can_add_transports`、`handle_request_routes_through_the_named_transport_wrapper`、`message_stream_is_served_incrementally_over_a_transport`、`post_endpoint_ready_registers_with_every_registry_once` |
+| 2 | `AgentExecuteProperties` | `agentscope-extensions-a2a-server/src/executor.rs`（新） | `executor/AgentExecuteProperties.java`（66 行）；`AgentScopeAgentExecutor.java`（`generateRequiredEventTypes` / `convertToResponseMessage` / `processTaskBlocking` / `processTaskNonBlocking`） | `AgentExecuteProperties{complete_with_message, require_inner_message}` + builder；`AgentOutputProjector`（required-event-type 表 + `Msg` 投影 + `compacted()`）；接线：`A2aRequestHandler::new_with_properties` / `execute_properties()`，`run_task` 与流式状态机均经 projector | `properties_default_to_java_defaults_and_are_buildable`、`text_and_thinking_deltas_are_always_projected`、`inner_events_need_require_inner_message`、`agent_result_falls_back_only_when_nothing_was_streamed`、`compaction_merges_deltas_of_the_same_message`、`require_inner_message_gates_tool_output`、`complete_with_message_only_applies_to_non_blocking_runs` |
+| 3 | `AgentRegistry` / `AgentRegistryService` | `agentscope-extensions-a2a-server/src/registry.rs`（新） | `registry/AgentRegistry.java`（`registryName()` + `register(AgentCard, List<TransportProperties>)`）、`registry/AgentRegistryService.java`（遍历 + 单点失败隔离） | `AgentRegistry` trait + `AgentRegistryError`；`AgentRegistryService`（`registries`/`is_empty`/`register -> RegistrationReport`）；`RegistrationReport{succeeded, failed}` 让 Java 只写日志的成败结果对 Rust 调用方可观测。**NACOS 等发现后端直接实现该 trait 即可复用**（本批未改 nacos crate） | `register_reaches_every_registry_with_the_served_transports`、`one_failing_registry_never_blocks_the_others`、`no_transport_means_no_registry_call`、`post_endpoint_ready_registers_with_every_registry_once` |
+| 4 | `TransportWrapper*` / `DeploymentProperties` | `agentscope-extensions-a2a-server/src/transport.rs`（新） | `transport/TransportWrapper.java`、`TransportWrapperBuilder.java`、`DeploymentProperties.java`（host 默认 `NetworkUtils.getLocalIpAddress()`）、`CustomTransportProperties.java`、`transport/jsonrpc/{JsonRpcTransportWrapper,JsonRpcTransportWrapperBuilder,JsonRpcTransportMetadata}.java` | `TransportWrapper`（`async fn handle_request(body, headers, metadata) -> TransportResponse`）、`TransportResponse::{Json, Stream}`（对应 Java 的 `String` / `Flux<String>`）、`TransportWrapperBuilder`（`build` / `build_with_extended_card`）、`JsonRpcTransportWrapper`(+Builder)、`JsonRpcTransportMetadata`、`DeploymentProperties`(+Builder, `local_ip_address()` 用 UDP connect 取本机 IP 且发不出包)、`CustomTransportProperties` trait、`default_transport_builders()`（替代 `ServiceLoader`）。接线：axum `POST /` 改走 `JsonRpcTransportWrapper`；`Builder::with_custom_transport` 在 build 时注入 deployment 并转标准属性 | `jsonrpc_wrapper_declares_the_jsonrpc_transport_type`、`empty_and_malformed_bodies_become_jsonrpc_errors`、`non_streaming_requests_return_one_json_response`、`streaming_requests_return_a_stream_of_json_responses`、`streaming_method_detection_matches_the_a2a_methods`、`deployment_properties_require_a_port_and_default_the_host`、`default_transport_builders_expose_jsonrpc_only`、`send_helpers_parse_a_raw_jsonrpc_body`、`custom_transport_properties_are_resolved_at_build_time` |
+| 5 | `message/stream` SSE 增量 | `agentscope-extensions-a2a-server/src/{lib,transport}.rs` | `transport/jsonrpc/JsonRpcTransportWrapper.java#handleStreamRequest`（`Flow.Publisher` → `Flux<String>`，每响应一帧） | `A2aRequestHandler::stream_responses(&self, request) -> BoxStream<'static, JsonRpcResponse>`：`StreamPhase::{Start, Running, Done}` + `futures::stream::unfold` 状态机（首帧 `working`(final=false) → 每个投影事件一帧 `artifact-update`(append=true, lastChunk=false) → 终帧 `completed`(final=true)；失败为 `failed` + 文本 message）。`AgentRunner::stream_events_incremental(...) -> Option<BoxStream<..>>` 是接 core 流式抽象的挂点（core `ReActAgent::stream_events` 形态一致）；未实现时回放 `stream_events` 缓冲结果。axum `POST /` 对流式方法返回 `Sse<...>`（`data: <json-rpc response>`） | `stream_responses_emits_before_the_run_finishes`（channel 驱动：在 run 未结束时已收到 artifact 帧，缓冲实现必然挂死）、`message_stream_relays_the_run_incrementally`、`message_stream_is_served_incrementally_over_a_transport`、`streaming_requests_return_a_stream_of_json_responses` |
+| 6 | `WorkspaceProtocolTaskRepository` | `agentscope-extensions-agent-protocol/src/workspace_repository.rs`（新） | `agent-protocol/.../WorkspaceProtocolTaskRepository.java`（`writeTaskRecord`/`readTaskRecord` 走专用 `WorkspaceManager`，桶为 `PROTOCOL_AGENT_ID`/`PROTOCOL_SESSION_ID`） | `WorkspaceProtocolTaskRepository`：`new(path)` / `from_manager(Arc<WorkspaceManager>)` / `workspace_manager()` / `record_path()` / `save_async` / `find_async` / `list_async` + 同步 `ProtocolTaskRepository` 实现（`futures::executor::block_on`；空白 id 视为未命中，与 Java `find` 一致）。接线：`AgentProtocolTaskStore::with_workspace_task_store(factory, properties, customizers)` 消费 `AgentProtocolProperties::resolved_task_store_path()`，使 `task_store_path` 首次真正生效 | `records_round_trip_through_the_workspace_bucket`、`save_upserts_and_list_returns_every_record`、`a_missing_or_blank_id_yields_none`、`the_sync_trait_impl_persists_and_reads`、`a_second_repository_over_the_same_path_sees_the_records` |
+| 7 | `ProcessResult.interrupt(threadId)` | `agentscope-extensions-agui/src/processor/request_processor.rs` + `adapter/agent_adapter.rs` | `agui/processor/AguiRequestProcessor.java:111`（`AguiUtil.asReActAgent(agent)` → `interrupt(RuntimeContext(sessionId=threadId))`，否则 `agent.interrupt()`） | `ProcessResult::interrupt(&self, thread_id) -> bool`；新增 `AguiStreamableAgent::interrupt_session(&str) -> bool`（默认 `interrupt()` 并返回 false，`ReActAgent`/`HarnessAgent` 各自覆写为同名固有方法）；`ProcessResult` 新增 `agent: Option<Arc<dyn AguiStreamableAgent>>`，`process()` 在成功路径填充 | `interrupt_targets_the_thread_session`、`interrupt_falls_back_for_agents_without_a_session_scope`、`process_exposes_the_resolved_agent_for_interruption` |
+
+### 8.2 命令与实测
+
+```
+cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client \
+  -p agentscope-extensions-a2a-server -p agentscope-extensions-agent-protocol \
+  -p agentscope-extensions-agui -p agentscope-extensions-chat-completions-web -j 2
+```
+
+| crate | 改前 | 改后 | 结果 |
+|---|---|---|---|
+| `agentscope-extensions-a2a-client` | 39 | 39 | 0 failed |
+| `agentscope-extensions-a2a-server` | 15 | **47** | 0 failed（15 旧测试全保留） |
+| `agentscope-extensions-agent-protocol` | 24 | **29** | 0 failed |
+| `agentscope-extensions-agui` | 188 | **191** | 0 failed |
+| `agentscope-extensions-chat-completions-web` | 35 | 35 | 0 failed |
+| `agentscope-extensions-protocol`（facade） | 0 | 0 | 无测试（仅 re-export） |
+| **合计** | 304 | **341** | **341 passed / 0 failed / 0 ignored** |
+
+> 未删任何既有测试、未放宽既有断言、未 `#[ignore]`。`message_stream_returns_a_final_status_update` 因语义变化（一次性数组 → 增量序列）被改写为 `message_stream_relays_the_run_incrementally`，断言由「长度恒为 1」加强为「首帧 working / 中段 artifact / 末帧 completed」；`ProcessResult` 新增字段使两个既有测试构造处补 `agent` 字段（断言未动）。
+
+### 8.3 反向验证（回退实现 → 确认 FAILED → 恢复）
+
+| # | 回退点 | 期望失败用例 | 实测 |
+|---|---|---|---|
+| 1 | `executor.rs` 把 `ToolResultTextDelta(data) if self.require_inner_message` 改为 `if true \|\| ...`（内层事件恒投影） | `tests::require_inner_message_gates_tool_output` | FAILED（0 passed / 1 failed，断言 artifacts 数量 1 vs 2） |
+| 2 | `request_processor.rs` 把 `Some(agent) => agent.interrupt_session(thread_id)` 改为 `{ agent.interrupt(); false }`（丢掉 session 定位） | `processor::request_processor::tests::interrupt_targets_the_thread_session` | FAILED（sessions 记录为空） |
+| 3 | `workspace_repository.rs` 在 `save_async` 里提前 `return Ok(())`（不落盘） | `records_round_trip_through_the_workspace_bucket` / `save_upserts_and_list_returns_every_record` / `the_sync_trait_impl_persists_and_reads` / `a_second_repository_over_the_same_path_sees_the_records` | FAILED（1 passed / 4 failed） |
+| 4 | `transport.rs` 把 `is_streaming_method` 改为只匹配 `never/stream`（流式判定失效） | `transport::tests::streaming_requests_return_a_stream_of_json_responses` / `streaming_method_detection_matches_the_a2a_methods` | FAILED（4 passed / 2 failed） |
+
+四处回退均已恢复，`Select-String` 复核四个文件无残留（`never/stream` / `if true ||` / `agent.interrupt(); false` / 提前 `return Ok(())` 均 0 命中），恢复后重跑全绿。
+
+### 8.4 偏差与设计决定（本批新增）
+
+1. **`ServiceLoader` → 显式 builder 列表**：Rust 无 SPI 扫描，`default_transport_builders()` 提供 JSON-RPC，其它 transport 通过 `Builder::transport_builder(..)` 注册（重名后者覆盖前者，对齐 Java `Collectors.toMap` 的 merge 语义）。
+2. **`TransportWrapper::handle_request` 改 async**：Java 同步是因为其 SDK 非流式 handler 同步；Rust `A2aRequestHandler` 为 async。流式半部仍同步产出 `BoxStream`。`TransportWrapperBuilder::build` 不再收 `Executor`（Rust 的流跑在调用方 async 任务上）。
+3. **`AGENT_RESULT` 兜底分支**：Java 的 required-event-type 表只有块级 delta；Rust `AgentRunner` 默认只有消息级契约，故 `AgentOutputProjector` 在该 run 无任何流式输出时才投影 `AGENT_RESULT`（否则会与 delta 重复）。
+4. **`ProcessResult.agent` 为 `Option`**：Rust 在 agent 解析失败时以 `RUN_ERROR` 事件收尾（不返回 Err），该路径无 agent 可挂；Java 先解析再建惰性 `Flux`，恒有值。
+5. **`WorkspaceProtocolTaskRepository` 的同步/异步双面**：`ProtocolTaskRepository` 是同步 trait（`submit`/`snapshot` 链路为同步），而 harness `WorkspaceManager` 的 task-record API 是 async → trait impl 用 `futures::executor::block_on` 驱动（本地盘走 `std::fs` + runtime 无关的 `tokio::sync` 锁，无需 reactor），另暴露 `save_async`/`find_async`/`list_async`。
+6. **`tasks/resubscribe` 不做流式**：Java transport wrapper 同时接受 `message/stream` 与 `tasks/resubscribe`，因为其 SDK 保留 per-task 事件队列；Rust handler 无队列（事件一过即落成 artifact），实现订阅只能重跑 agent，故 `is_streaming_method` 只认 `message/stream`，`tasks/resubscribe` 走普通分发并回 `-32601`。
+7. **`close()` 为 no-op**：Java 用于 join handler 的队列线程；Rust handler 无后台线程。
+
+### 8.5 未完成（如实记录）
+
+| 项 | 优先级 | 原因 |
+|---|---|---|
+| `BaseReActAgentRunner` / `ReActAgentWithBuilderRunner`（per-task agent 缓存 + `stop()` 触发 `interrupt()` + 流结束移除缓存） | P1（不在本批 7 项内） | 需要 harness/core 侧「按 task 缓存 agent 并中断」的装配约定；本批已提供 `stream_events_incremental` 挂点，可与该 runner 一并落地 |
+| `tasks/resubscribe` 事件重放 | P2 | 需要 per-task 事件队列（Java 由 SDK 的 `QueueManager` 提供）；本批只能回 `-32601`，见 §8.4 第 6 条 |
+| `AguiRequestProcessorBuilder` 暴露 `adapterFactory` | P1 长尾 | 需先定义 Rust 侧 factory 与 processor 的持有关系（`AguiAgentAdapterFactory` trait 已存在，未接线） |
+| `A2aAgent` 高层客户端门面 + `A2aAgentConfig` + 客户端 `agent.event.*` Handler 体系 + 客户端 artifacts 优先 | P2 | 需要在 a2a-client 侧实现 core `Agent` trait（memory/hook/middleware/session/interrupt），本批未触及 |
+| `bytes` 未用依赖清理 | P2 | 需汇总方确认是否影响其它 crate（本批未动 `Cargo.toml` 的既有依赖项，只新增 `futures`/`tracing`） |
+
+> **注意**：本次执行期间 `crates/agentscope-extensions-model` 被另一会话并发编辑，曾导致依赖链暂时无法编译（`DEFAULT_CONVERSATION_HISTORY_PROMPT` / `dashscope` 非穷尽 match）；本批未修改该 crate，等待其稳定后重跑，最终 6 crate 全绿。
