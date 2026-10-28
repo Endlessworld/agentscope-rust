@@ -161,10 +161,10 @@ mod tests {
 
     fn adapter(user_id: &str) -> (MockTransport, ReMeLongTermMemory) {
         let mock = MockTransport::new();
-        let client = Arc::new(ReMeClient::with_transport(
-            Arc::new(mock.clone()),
-            "https://reme.test",
-        ));
+        let client = Arc::new(
+            ReMeClient::with_transport(Arc::new(mock.clone()), "https://reme.test")
+                .expect("valid base url"),
+        );
         let adapter = ReMeLongTermMemory::new(client, user_id).unwrap();
         (mock, adapter)
     }
@@ -243,10 +243,10 @@ mod tests {
 
     #[test]
     fn new_rejects_blank_user_id() {
-        let client = Arc::new(ReMeClient::with_transport(
-            Arc::new(MockTransport::new()),
-            "https://reme.test",
-        ));
+        let client = Arc::new(
+            ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
+                .expect("valid base url"),
+        );
         assert!(matches!(
             ReMeLongTermMemory::new(client, "   "),
             Err(MemError::Config(_))

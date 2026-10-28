@@ -221,12 +221,15 @@ mod tests {
     use agentscope_core::{ContentBlock, TextBlock};
 
     fn client(transport: Arc<MockTransport>) -> Arc<Mem0Client> {
-        Arc::new(Mem0Client::with_transport(
-            transport,
-            "https://mem0.test",
-            Some("key".into()),
-            crate::mem0::dto::Mem0ApiType::Platform,
-        ))
+        Arc::new(
+            Mem0Client::with_transport(
+                transport,
+                "https://mem0.test",
+                Some("key".into()),
+                crate::mem0::dto::Mem0ApiType::Platform,
+            )
+            .expect("valid base url"),
+        )
     }
 
     fn adapter(config: Mem0LongTermMemoryConfig) -> (MockTransport, Mem0LongTermMemory) {

@@ -23,6 +23,16 @@
 //! `retrieve_msgs` bridge on the Mem0 adapter that maps hits back to core [`Msg`]s),
 //! preserving the Java behaviour without introducing a parallel abstraction.
 //!
+//! ## Construction is validated
+//!
+//! Every client constructor (`Mem0Client::new` / `Mem0Client::with_api_type` /
+//! `Mem0Client::with_transport`, `ReMeClient::new` / `with_timeout` / `with_transport`,
+//! `BailianMemoryClient::*`) rejects an empty or blank base URL at construction
+//! time, mirroring the Java adapter builders (`"apiBaseUrl is required"` for
+//! Mem0 / ReMe, `"apiBaseUrl cannot be null or blank"` for Bailian). The
+//! `with_transport` constructors return [`Result`] for the same reason, so no
+//! construction path can yield a host-less request URL.
+//!
 //! ## Offline by default
 //!
 //! All clients depend on the [`HttpTransport`] seam, so assembly can inject

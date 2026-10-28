@@ -45,6 +45,9 @@ impl std::fmt::Debug for Mem0Client {
 
 impl Mem0Client {
     /// Builds a client with the Java default timeout (60s) and [`Mem0ApiType::Platform`].
+    ///
+    /// Returns [`MemError::Config`] with `"apiBaseUrl is required"` when
+    /// `api_base_url` is empty or blank.
     pub fn new(api_base_url: impl Into<String>, api_key: Option<String>) -> Result<Self> {
         Self::with_api_type(
             api_base_url,
@@ -62,21 +65,19 @@ impl Mem0Client {
         timeout: Duration,
     ) -> Result<Self> {
         let transport = Arc::new(ReqwestTransport::new(timeout)?);
-        Ok(Self::assemble(
-            transport,
-            api_base_url.into(),
-            api_key,
-            api_type,
-        ))
+        Self::assemble(transport, api_base_url.into(), api_key, api_type)
     }
 
     /// Builds a client on top of an injected transport (used by tests).
+    ///
+    /// Fails when `api_base_url` is empty or blank, mirroring Java
+    /// `Mem0LongTermMemory.Builder.build()` (`"apiBaseUrl is required"`).
     pub fn with_transport(
         transport: Arc<dyn HttpTransport>,
         api_base_url: impl Into<String>,
         api_key: Option<String>,
         api_type: Mem0ApiType,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::assemble(transport, api_base_url.into(), api_key, api_type)
     }
 
@@ -85,12 +86,17 @@ impl Mem0Client {
         api_base_url: String,
         api_key: Option<String>,
         api_type: Mem0ApiType,
-    ) -> Self {
+    ) -> Result<Self> {
+        // Java `Mem0LongTermMemory.Builder.build()`:
+        // `if (apiBaseUrl == null || apiBaseUrl.isEmpty()) throw new IllegalArgumentException(...)`.
+        // Rust additionally rejects whitespace-only URLs, which would otherwise
+        // produce the same host-less request URLs.
+        let trimmed = api_base_url.trim();
+        if trimmed.is_empty() {
+            return Err(MemError::Config("apiBaseUrl is required".into()));
+        }
         // Java strips a single trailing slash from the base URL.
-        let api_base_url = api_base_url
-            .strip_suffix('/')
-            .unwrap_or(&api_base_url)
-            .to_string();
+        let api_base_url = trimmed.strip_suffix('/').unwrap_or(trimmed).to_string();
         let (add_endpoint, search_endpoint) = match api_type {
             Mem0ApiType::Platform => (
                 PLATFORM_MEMORIES_ENDPOINT.to_string(),
@@ -101,14 +107,14 @@ impl Mem0Client {
                 SELF_HOSTED_SEARCH_ENDPOINT.to_string(),
             ),
         };
-        Self {
+        Ok(Self {
             transport,
             api_base_url,
             api_key,
             api_type,
             add_endpoint,
             search_endpoint,
-        }
+        })
     }
 
     /// The configured API type.
@@ -194,6 +200,32 @@ mod tests {
             api_key.map(str::to_string),
             api_type,
         )
+        .expect("valid base url")
+    }
+
+    #[test]
+    fn blank_base_url_is_rejected_at_construction() {
+        let transport = Arc::new(MockTransport::new());
+        for blank in ["", "   ", "  \u{0009} "] {
+            let err =
+                Mem0Client::with_transport(transport.clone(), blank, None, Mem0ApiType::Platform)
+                    .unwrap_err();
+            assert!(matches!(&err, MemError::Config(_)));
+            assert!(err.to_string().contains("apiBaseUrl is required"));
+        }
+    }
+
+    #[test]
+    fn new_rejects_blank_base_url() {
+        assert!(matches!(
+            Mem0Client::new("", None),
+            Err(MemError::Config(_))
+        ));
+        assert!(matches!(
+            Mem0Client::new("   ", None),
+            Err(MemError::Config(_))
+        ));
+        assert!(Mem0Client::new("https://mem0.test", None).is_ok());
     }
 
     #[test]
@@ -202,6 +234,21 @@ mod tests {
         let client = client(transport, None, Mem0ApiType::Platform);
         assert_eq!(client.add_endpoint(), PLATFORM_MEMORIES_ENDPOINT);
         assert_eq!(client.search_endpoint(), PLATFORM_SEARCH_ENDPOINT);
+    }
+
+    #[tokio::test]
+    async fn base_url_is_trimmed_before_building_the_request_url() {
+        let mock = MockTransport::new();
+        mock.push_body("{}");
+        let client = Mem0Client::with_transport(
+            Arc::new(mock.clone()),
+            "  https://mem0.test/  ",
+            None,
+            Mem0ApiType::Platform,
+        )
+        .unwrap();
+        client.add(&Mem0AddRequest::new()).await.unwrap();
+        assert_eq!(mock.requests()[0].0, "https://mem0.test/v1/memories/");
     }
 
     #[test]

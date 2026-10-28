@@ -30,6 +30,9 @@ impl std::fmt::Debug for ReMeClient {
 
 impl ReMeClient {
     /// Builds a client with the Java default timeout (60s).
+    ///
+    /// Returns [`MemError::Config`] with `"apiBaseUrl is required"` when
+    /// `api_base_url` is empty or blank.
     pub fn new(api_base_url: impl Into<String>) -> Result<Self> {
         Self::with_timeout(api_base_url, Duration::from_secs(60))
     }
@@ -37,23 +40,31 @@ impl ReMeClient {
     /// Builds a client with an explicit timeout.
     pub fn with_timeout(api_base_url: impl Into<String>, timeout: Duration) -> Result<Self> {
         let transport = Arc::new(ReqwestTransport::new(timeout)?);
-        Ok(Self::with_transport(transport, api_base_url))
+        Self::with_transport(transport, api_base_url)
     }
 
     /// Builds a client on top of an injected transport (used by tests).
+    ///
+    /// Fails when `api_base_url` is empty or blank, mirroring the Java
+    /// `ReMeLongTermMemory` builder (`"apiBaseUrl is required"`).
     pub fn with_transport(
         transport: Arc<dyn HttpTransport>,
         api_base_url: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let api_base_url = api_base_url.into();
-        let api_base_url = api_base_url
-            .strip_suffix('/')
-            .unwrap_or(&api_base_url)
-            .to_string();
-        Self {
+        // Java `ReMeLongTermMemory.Builder`: `if (builder.apiBaseUrl == null ||
+        // builder.apiBaseUrl.isEmpty()) throw new IllegalArgumentException(...)`.
+        // Rust additionally rejects whitespace-only URLs, which would otherwise
+        // produce the same host-less request URLs.
+        let trimmed = api_base_url.trim();
+        if trimmed.is_empty() {
+            return Err(MemError::Config("apiBaseUrl is required".into()));
+        }
+        let api_base_url = trimmed.strip_suffix('/').unwrap_or(trimmed).to_string();
+        Ok(Self {
             transport,
             api_base_url,
-        }
+        })
     }
 
     /// The configured base URL.
@@ -103,4 +114,65 @@ where
         return Ok(T::default());
     }
     serde_json::from_str(raw).map_err(MemError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::mock::MockTransport;
+
+    #[test]
+    fn blank_base_url_is_rejected_at_construction() {
+        let transport = Arc::new(MockTransport::new());
+        for blank in ["", "   ", " \u{0009} "] {
+            let err = ReMeClient::with_transport(transport.clone(), blank).unwrap_err();
+            assert!(matches!(&err, MemError::Config(_)));
+            assert!(err.to_string().contains("apiBaseUrl is required"));
+        }
+    }
+
+    #[test]
+    fn new_rejects_blank_base_url() {
+        assert!(matches!(ReMeClient::new(""), Err(MemError::Config(_))));
+        assert!(matches!(ReMeClient::new("   "), Err(MemError::Config(_))));
+        assert!(ReMeClient::new("https://reme.test").is_ok());
+    }
+
+    #[test]
+    fn base_url_is_trimmed_and_trailing_slash_stripped() {
+        let client =
+            ReMeClient::with_transport(Arc::new(MockTransport::new()), "  https://reme.test/  ")
+                .unwrap();
+        assert_eq!(client.api_base_url(), "https://reme.test");
+    }
+
+    #[tokio::test]
+    async fn add_posts_to_summary_endpoint() {
+        let mock = MockTransport::new();
+        mock.push_body("{}");
+        let client =
+            ReMeClient::with_transport(Arc::new(mock.clone()), "https://reme.test").unwrap();
+        let response = client
+            .add(&ReMeAddRequest::new("ws", Vec::new()))
+            .await
+            .unwrap();
+        assert!(response.metadata.is_none());
+        let request = &mock.requests()[0];
+        assert_eq!(request.0, format!("https://reme.test{SUMMARY_ENDPOINT}"));
+        assert_eq!(
+            request.1,
+            vec![("Content-Type".to_string(), "application/json".to_string())]
+        );
+        assert_eq!(request.2, "{\"workspace_id\":\"ws\",\"trajectories\":[]}");
+    }
+
+    #[tokio::test]
+    async fn blank_response_body_falls_back_to_default() {
+        let mock = MockTransport::new();
+        mock.push_body("   ");
+        let client = ReMeClient::with_transport(Arc::new(mock), "https://reme.test").unwrap();
+        let response = client.search(&ReMeSearchRequest::new()).await.unwrap();
+        assert!(response.answer.is_none());
+        assert!(response.memories().is_empty());
+    }
 }

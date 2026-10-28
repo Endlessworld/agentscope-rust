@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 25 文件 / 5543 行（非空 4821）；测试 18 文件 / 6850 行（非空 5746）/ 326 个 `@Test` |
 | Rust crate | `crates/agentscope-extensions-mem` |
 | 迁移波次 | A |
-| 当前状态 | **已完成**（实现层完成：25 个 Java 类 1:1 落地、66 个测试函数与代码一致；2026-10-22 静态复核（两轮）未重新编译，§3.2 遗留 5 项 P1 待办，详见 §6、§6.7） |
+| 当前状态 | **已完成**（实现层完成：25 个 Java 类 1:1 落地；2026-10-28 已修 `api_base_url` 空校验、`connect_timeout(30s)` 与 DTO 单测，实测 **96 passed / 0 failed**；§3.2 仍留 2 项待办：真实网络联调 / Java 测试逐条对照；详见 §7） |
 
 ### 1.1 Rust crate 文件清单（15 个源文件，2993 行 = 生产 2045 + 内联测试 948）
 | 文件 | 职责 |
@@ -104,8 +104,9 @@
 | Java 测试用例逐条对照迁移 | Java tests 18 文件 / 6850 行 / 326 `@Test` | 待办 | 当前 Rust 单测为**功能等价重写**，未逐条照搬 Java 测试（覆盖率 66/326 ≈ 20%，但缺口集中在 Java 侧的 MockWebServer 传输层细节与 Builder 逐字段断言） |
 | 高级检索参数（`rerank`/`filter_memories`/`fields` 等） | `Mem0SearchRequest` 等 | 已完成 | 字段已迁移并序列化；仅未做端到端验证 |
 | Java 吞错语义在 Rust 主 API 上不一致 | `Mem0LongTermMemory.retrieve` / `BailianLongTermMemory.record`+`retrieve` / `ReMeLongTermMemory.retrieve` | 待办 | Java 侧 `onErrorReturn("")` / `onErrorComplete()` 使调用方**永远看不到错误**；Rust `retrieve`/`record` 返回 `Result`（严格），等价语义放在 `retrieve_lossy`/`record_lossy`。需在汇总层决定默认用哪套（§4.2 裁定）。**注**：Mem0 `record` 与 ReMe `record` 在 Java 侧本就**不吞错**（`client.add().then()` 透传），Rust 同构，一致 |
-| `api_base_url` 必填校验缺失（Mem0 / ReMe） | `Mem0LongTermMemory.Builder.build()`（`"apiBaseUrl is required"`）/ `ReMeLongTermMemory` 构造器（`"apiBaseUrl is required"`） | 待办 | Java 在 **adapter builder** 层校验 base URL 非空；Rust 把 client 与 adapter 拆开构造后，**Mem0 `Mem0Client::assemble` 与 ReMe `ReMeClient::with_transport` 均不校验空 base URL**——`Mem0Client::new("")` / `ReMeClient::new("")` 可成功构造，运行时拼出 `/v1/memories/`、`/summary_personal_memory` 这类无主机 URL。Bailian 侧已有校验（`BailianMemoryClient::with_transport` 拒绝空 base URL / 空 key），三厂商不一致 |
-| 传输层语义差异（连接/写超时、`close`） | OkHttp `connectTimeout(30s)`/`writeTimeout(30s)`/`shutdown()` | 待办 | Rust `ReqwestTransport` 只有单一 `timeout`（Java 的 readTimeout 位），无 connect/write 分设；Java `Mem0Client.shutdown()`/`BailianMemoryClient.close()`/`ReMeClient.shutdown()` 无对应方法（`reqwest::Client` 由 Drop 释放）。功能等价但资源释放时机不可控 |
+| `api_base_url` 必填校验缺失（Mem0 / ReMe） | `Mem0LongTermMemory.Builder.build()`（`"apiBaseUrl is required"`）/ `ReMeLongTermMemory` 构造器（`"apiBaseUrl is required"`） | 已完成 | **2026-10-28 修复**：`Mem0Client::assemble` / `ReMeClient::with_transport` 对空与全空白 base URL 返回 `MemError::Config("apiBaseUrl is required")`（与 Java 文案逐字对齐）；`new` / `with_api_type` / `with_timeout` 均经这两处而同样失败。`with_transport` 签名由 `-> Self` 改为 `-> Result<Self>`——它是唯一可绕过校验的构造路径，且与 Bailian `BailianMemoryClient::with_transport` 既有风格一致；调用点与测试已同步。base URL 先 `trim()` 再剥末尾 `/`。测试：`mem0::client::tests::{blank_base_url_is_rejected_at_construction, new_rejects_blank_base_url, base_url_is_trimmed_before_building_the_request_url}`、`reme::client::tests::{blank_base_url_is_rejected_at_construction, new_rejects_blank_base_url, base_url_is_trimmed_and_trailing_slash_stripped}`。详见 §7 |
+| 传输层语义差异（连接/写超时、`close`） | OkHttp `connectTimeout(30s)`/`writeTimeout(30s)`/`shutdown()` | 已完成 | **2026-10-28**：`ReqwestTransport::new` 已加 `.connect_timeout(DEFAULT_CONNECT_TIMEOUT)`，常量 = **30s**（对齐 Java `connectTimeout(30s)`）；per-request `timeout` 仍对应 Java `readTimeout`。单测 `http::tests::connect_timeout_matches_java_thirty_seconds`。剩余两项记为 **设计决定（不迁移）**：`writeTimeout(30s)` 与 `shutdown()`/`close()` 在 Rust/reqwest 无对应能力——reqwest 不暴露独立写超时（`timeout` 覆盖含请求体写入在内的整次请求），`reqwest::Client` 无 `close`（由 Drop 释放）。不硬造。详见 §7 |
+| `bailian/dto.rs` / `reme/dto.rs` 零单测 | Java：DTO 测试共 12 类 / 161 个 `@Test`（mem0 6 类 89 个 + bailian 6 类 72 个；reme 无 DTO 测试类） | 已完成 | **2026-10-28**：补 **21** 个离线 serde 测试（bailian **11** + reme **10**），对标 `mem0/dto.rs` 的 11 个。覆盖字段别名（`meta_data` / `project_ids` / `memory_node_id` / `old_content` / `created_at` / `workspace_id` / `when_to_use` / `time_created` / `reflection_subject` / `update_result` …）、缺省值（bailian DTO 无默认 vs ReMe `top_k=5`）、`skip_serializing_if` 空缺省、未知字段容忍（Java `FAIL_ON_UNKNOWN_PROPERTIES=false`）、添加/删除计数与 `memories()` 提取顺序。无 `#[ignore]`、无网络。详见 §7 |
 
 ### 3.3 缺口（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -130,10 +131,17 @@
   2. **后续错误**：`src/http.rs` 顶层 `use std::sync::Arc;` 在移除后 `mock` 模块（经 `use super::*` 引用 `Arc`）报 E0425；已在 `mock` 模块内显式 `use std::sync::{Arc, Mutex};`。
   3. **补齐离线单测**：总数 **66**（`#[test]` 40 + `#[tokio::test]` 26，实测 2026-10-22 逐文件统计见 §6），覆盖各厂商 DTO serde 往返、消息→Mem0/Bailian/ReMe 转换、检索结果→core `Msg` 映射、搜索/添加请求构造、鉴权头、端点解析、空查询短路、mock HTTP 全链路。
   4. **清理告警**：本 crate 现无任何 warning（`agentscope-core`/`harness` 的 9 个 warning 属既有、非本 crate，未越界修改）。
+- **2026-10-28 修复（本轮，3 项）**：
+  1. **`api_base_url` 空校验**：Mem0 / ReMe client 构造期拒绝空与全空白 base URL，返回 `MemError::Config("apiBaseUrl is required")`（对齐 Java `Mem0LongTermMemory.Builder.build()` / `ReMeLongTermMemory` 构造器）；`Mem0Client::with_transport` / `ReMeClient::with_transport` 改为返回 `Result<Self>`。
+  2. **HTTP 超时对齐**：`ReqwestTransport` 新增 `connect_timeout(30s)`（`DEFAULT_CONNECT_TIMEOUT`）；`writeTimeout` / `close()` 记设计决定（不迁移）。
+  3. **DTO 单测**：`bailian/dto.rs` + `reme/dto.rs` 新增 21 个离线 serde 测试；`reme/client.rs` 新增 5 个、`mem0/client.rs` +3 个、`http.rs` +1 个。
+  - **测试函数数 66 → 96**（`#[test]` 67 + `#[tokio::test]` 29，按 `^\s*#\[test\]` / `#\[tokio::test` 实测计数口径）。
+  - **验证（2026-10-28 实测）**：`cargo build -p agentscope-extensions-mem` → exit 0（本 crate 0 warning）；`cargo test -p agentscope-extensions-mem` → **96 passed / 0 failed / 0 ignored**（exit 0）。
+  - 详见 §7（改动清单 / 签名变更说明 / 新增测试名单 / 反向验证）。
 - **验证命令与结果（2026-10-22 静态复核未复跑，以下为上一轮记录，未经本次验证）**：
   - `cargo build -p agentscope-extensions-mem` → **Finished**（exit 0，本 crate 0 warning）— *本次未执行*
   - `cargo test -p agentscope-extensions-mem` → **66 passed / 0 failed / 0 ignored**（exit 0）— *本次未执行；测试函数数 66 已静态核实（`#[test]` 40 + `#[tokio::test]` 26，逐文件统计见 §6.2）*
-- **已知问题**：无阻塞。真实网络端点未联调（见 §3.2）。§3.2 现有 **5 项 P1**（真实网络联调 / Java 测试逐条对照 / `api_base_url` 校验缺失 / 吞错语义取舍 / 传输层资源释放粒度）与 §3.3 的 P2 增强项，全部为**验证与工程完备性**类，无「Java 有能力而 Rust 缺失」的能力缺口。
+- **已知问题**：无阻塞。真实网络端点未联调（见 §3.2）。§3.2 现余 **2 项 P1 待办**（真实网络联调 / Java 测试逐条对照）；原 3 项已于 2026-10-28 完成（`api_base_url` 空校验、connect 超时对齐、DTO 单测），`writeTimeout`/`close()` 另记作设计决定（不迁移）。§3.3 的 P2 增强项不变。
 
 ### 4.2 设计裁定与阻塞
 
@@ -200,6 +208,8 @@
 | **P2** | **`BailianLongTermMemoryConfig.api_key` 是「死字段」** | Java `BailianLongTermMemory` 构造器校验 `apiKey` 非空后自建 client；Rust 改为外部注入 client，`config.api_key` 在**生产代码中从未被读取**（`rg` 仅命中声明、构造函数与测试） | 空 key 搭配一个合法 client 可通过 `BailianLongTermMemory::new`，校验被静默绕过；字段本身会误导调用方以为它生效 |
 | **P2** | **无指标 / span** | 仅 4 处 `tracing::warn!`（`bailian/memory.rs:239,252`、`mem0/memory.rs:184`、`reme/memory.rs:141`），无 `#[instrument]`、无 metric | 与 Java 的 Slf4j 基本对等，增强项 |
 
+> **2026-10-28 更新**：本节 P1 三项（`api_base_url` 空校验、传输层 connect 超时、`bailian/dto.rs` + `reme/dto.rs` 单测）已落地，详见 §7。下表「影响」列保留为问题发现时的原始描述（不再逐行改写）。
+
 ### 6.5 勘误列表
 
 | # | 原文 | 实际 | 处理 |
@@ -227,7 +237,7 @@
 - 本文件使用的状态值均在 §0 定义集合内：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
 - 本次新增条目一律取 `待办` 或 `已完成`，未引入新取值。
 - §1「当前状态」栏沿用 `已完成`，但附注「实现层完成、未重新编译、§3.2 遗留 P1 待办」，避免与 §3.2 的 `待办` 自相矛盾。
-- §3.2 现有 **5 行 `待办`**（真实网络联调 / Java 测试逐条对照 / 吞错语义取舍 / `api_base_url` 校验缺失 / 传输层资源释放粒度）；§3.3 现有 **9 行 `待办`**。两者均为**工程完备性 / 增强类**，无能力缺口。
+- 【2026-10-28 更新】§3.2 现有 **2 行 `待办`**（真实网络联调 / Java 测试逐条对照）；原 3 项已置 `已完成`（`api_base_url` 校验、传输层 connect 超时、DTO 单测），其中 writeTimeout 与 `close()` 另记作 `设计决定（不迁移）`。§3.3 仍有 **9 行 `待办`**（P2 增强类）。
 
 ### 6.7 本轮复核追加（2026-10-22 第二次静态复核）
 > 幂等说明：本轮为**同一天的第二次复核**，对 §6.1~§6.6 **就地修正**，未重复追加复核节。
@@ -269,4 +279,60 @@
 - 理由：(a) Java 25 个类 **100% 有真实对应的 Rust 实现**，无缺失类、无空壳类、无「只搬签名未搬行为」的情况；(b) 66 个离线测试函数数量与代码**完全一致**，DTO serde 往返、消息转换、请求构造、鉴权头、端点解析、空查询短路、mock HTTP 全链路均有覆盖；(c) §3.2 的 P1 **全部是「验证/工程完备性」或「API 校验前移」类**，不构成「Java 有能力、Rust 没有」的**能力缺口**——其中 `api_base_url` 校验是唯一有行为风险的项，但影响面限于「构造期报错 vs 运行期报错」，不改变正常路径行为；(d) 本轮为**纯静态复核、未重新编译**，故建议 rollup 保留「实现层完成」的措辞，并在 rollup 行注明「静态复核通过；build/test 未在本轮复跑」，以免与 §3.2 的 `待办` 项自相矛盾。
 - **若汇总方要求「零待办才可置完成」**：可先补齐 §3.2 的 `api_base_url` 校验（改动量极小，仅 `mem0/client.rs` 与 `reme/client.rs` 各加一处 `trim().is_empty()` 判断 + 对应单测），再将状态提为无保留的 `已完成`；其余 P1/P2 可留待后续波次。
 
+## 7. 执行记录（2026-10-28）
 
+> 执行范围：仅 `crates/agentscope-extensions-mem/**` 与本文档；**未改**根 `Cargo.toml`、`agentscope-core`、`agentscope-harness` 及其它 crate。**新增依赖：无**（复用已有 `serde`/`serde_json`/`reqwest`）。
+
+### 7.1 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/mem0/client.rs` | `assemble` 增加 `trim().is_empty()` 校验 → `MemError::Config("apiBaseUrl is required")`；`assemble` / `with_transport` 改返回 `Result<Self>`；`with_api_type` 传递错误；base URL 先 `trim()` 再剥末尾 `/`；+3 测试 |
+| `src/reme/client.rs` | 同构校验（`with_transport` → `Result<Self>`）；+5 测试（该文件原本无 `mod tests`） |
+| `src/mem0/memory.rs`、`src/reme/memory.rs` | 测试内 3 处 `with_transport` 调用点补 `.expect("valid base url")`（**生产代码未改**） |
+| `src/http.rs` | 新增 `pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30)`；`ReqwestTransport::new` 加 `.connect_timeout(...)`；+1 测试；doc 注明 reqwest 无独立 write timeout |
+| `src/bailian/dto.rs` | +11 个 serde 测试 |
+| `src/reme/dto.rs` | +10 个 serde 测试 |
+| `src/lib.rs` | 新增「Construction is validated」文档小节，说明三厂商构造期校验与 `with_transport` 返回 `Result` |
+
+### 7.2 签名变更说明（唯一破坏性变更）
+
+`Mem0Client::with_transport` 与 `ReMeClient::with_transport`：`-> Self` → `-> Result<Self>`。
+
+- **理由**：这两个构造函数是**唯一**能绕过 base URL 校验的入口（`Mem0Client`/`ReMeClient` 字段私有、无 `Default`）；保持 `-> Self` 就无法让空 URL 在构造期失败。返回 `Result` 与同 crate 的 `BailianMemoryClient::with_transport -> Result<Self>` 风格一致。
+- **影响面**：全仓 `rg "Mem0Client::with_transport|ReMeClient::with_transport"` 仅命中本 crate 的 4 处测试调用点，已同步；**无跨 crate 调用方**，故无下游破坏。
+- **未改动**：`Mem0Client::new` / `with_api_type` / `ReMeClient::new` / `with_timeout` 签名本就返回 `Result<Self>`，仅行为由「恒 Ok」变为「空 URL 时 Err」，正常路径不变。
+
+### 7.3 验证命令与实测
+
+| 命令 | 结果 |
+|---|---|
+| `cargo build -p agentscope-extensions-mem` | **exit 0**，本 crate **0 warning**（`agentscope-harness` 的 5 个 warning 属既有、未越界修改） |
+| `cargo test -p agentscope-extensions-mem` | **96 passed / 0 failed / 0 ignored**（exit 0）；静态计数 `#[test]` **67** + `#[tokio::test]` **29** = 96 |
+
+### 7.4 新增测试名单
+
+- `mem0::client::tests`：`blank_base_url_is_rejected_at_construction`、`new_rejects_blank_base_url`、`base_url_is_trimmed_before_building_the_request_url`
+- `reme::client::tests`：`blank_base_url_is_rejected_at_construction`、`new_rejects_blank_base_url`、`base_url_is_trimmed_and_trailing_slash_stripped`、`add_posts_to_summary_endpoint`、`blank_response_body_falls_back_to_default`
+- `http::tests`：`connect_timeout_matches_java_thirty_seconds`
+- `bailian::dto::tests`（11）：`message_roundtrips_role_and_content`、`add_request_uses_meta_data_key_not_metadata`、`add_request_skips_absent_fields`、`add_request_serializes_snake_case_fields`、`search_request_serializes_snake_case_and_flags`、`search_request_has_no_dto_level_defaults`、`memory_node_deserializes_snake_case_fields`、`memory_node_serializes_nothing_when_empty`、`add_response_deserializes_request_id_and_nodes`、`search_response_preserves_node_order`、`responses_tolerate_missing_and_unknown_fields`
+- `reme::dto::tests`（10）：`message_roundtrips_role_and_content`、`trajectory_wraps_messages_and_skips_absent_field`、`add_request_serializes_workspace_id_and_trajectories`、`search_request_defaults_top_k_to_five`、`search_request_with_parts_serializes_query_and_top_k`、`memory_item_deserializes_snake_case_fields`、`memory_item_serializes_nothing_when_empty`、`add_response_deserializes_metadata_and_update_result`、`search_response_memories_extracts_contents_in_order`、`search_response_without_metadata_has_no_memories`
+
+> 全部离线：仅用 `crate::http::mock::MockTransport` 或纯 `serde_json`，无网络、无 `#[ignore]`。
+
+### 7.5 反向验证（回退实现 → 观察 FAILED → 恢复）
+
+| # | 回退内容 | 观察结果 | 恢复 |
+|---|---|---|---|
+| 1 | `mem0/client.rs`：`assemble` 的 `if trimmed.is_empty() {` → `if false {`（文本相同，替换连带命中 `search` 的空响应体校验） | `cargo test` → **FAILED：93 passed / 3 failed**；失败项：`mem0::client::tests::blank_base_url_is_rejected_at_construction`（`unwrap_err()` on `Ok(Mem0Client { api_base_url: "" ... })`）、`new_rejects_blank_base_url`、`search_rejects_empty_body`（`assertion failed: matches!(err, MemError::Transport(_))`） | 还原后 **96 passed / 0 failed** |
+| 2 | `http.rs`：`DEFAULT_CONNECT_TIMEOUT` 30s → 10s | `cargo test` → **FAILED：95 passed / 1 failed**；`http::tests::connect_timeout_matches_java_thirty_seconds`（`assertion left == right failed: left: 10s`） | 还原后 **96 passed / 0 failed** |
+| 3 | `bailian/dto.rs`：`rename = "meta_data"` → `rename = "metadata"` | `cargo test` → **FAILED：95 passed / 1 failed**；`bailian::dto::tests::add_request_uses_meta_data_key_not_metadata`（`dto.rs:296`） | 还原后 **96 passed / 0 failed** |
+
+> 注：#1 的回退范围意外覆盖了 `Mem0Client::search` 的空响应体校验（两处 `if trimmed.is_empty()` 文本相同），因此多出 1 个失败项——反而反向证明了该替换确实生效；两个判断现均已恢复（`git diff` 核对，`mem0/client.rs` 无残留 `if false`）。
+
+### 7.6 未完成 / 需汇总方裁定
+
+1. **真实网络联调**（§3.2 仍待办）：本次全部离线，未对真实 Mem0 / Bailian / ReMe 端点回归（需凭据）。
+2. **`writeTimeout(30s)` 与 `shutdown()`/`close()`**：按任务要求记为 **设计决定（不迁移）**——Rust/reqwest 无独立 write timeout、`reqwest::Client` 无 `close`，未硬造。
+3. **Java 测试逐条对照迁移**（§3.2 仍待办）与 **吞错语义默认口径**（§3.2，需汇总方裁定 `retrieve` 严格 vs `retrieve_lossy`）未变。
+4. **校验层位置（请裁定）**：本次校验落在 **client 构造**（比 Java 的 adapter builder 更早，且覆盖所有 adapter 路径），未在 `Mem0LongTermMemory::new` / `ReMeLongTermMemory::new` 重复校验（`Arc<Mem0Client>` 已不可能持空 URL）。若汇总方要求错误必须在 adapter 层抛出，需额外 wrapper。

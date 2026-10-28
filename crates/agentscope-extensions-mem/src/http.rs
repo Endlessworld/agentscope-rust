@@ -26,15 +26,29 @@ pub trait HttpTransport: Send + Sync {
     ) -> Result<String>;
 }
 
+/// Connection-establishment timeout, mirroring Java's `connectTimeout(30s)`
+/// (`Mem0Client` / `BailianMemoryClient` / `ReMeClient` all hard-code 30s).
+///
+/// Java additionally sets `writeTimeout(30s)`; `reqwest` exposes no separate
+/// write timeout, so the per-request [`ReqwestTransport::new`] `timeout` covers
+/// the whole request including the body write. This is a documented limitation,
+/// not a behavioural gap that can be closed with `reqwest`.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `reqwest`-backed [`HttpTransport`] used in production.
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
 
 impl ReqwestTransport {
-    /// Builds a transport with the given per-request timeout (Java default 60s).
+    /// Builds a transport with the given per-request (read) timeout and the Java
+    /// default 30s connect timeout.
+    ///
+    /// The per-request timeout is Java's `readTimeout(timeout)` (default 60s);
+    /// [`DEFAULT_CONNECT_TIMEOUT`] is Java's `connectTimeout(30s)`.
     pub fn new(timeout: Duration) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
             .timeout(timeout)
             .build()
             .map_err(|e| MemError::Transport(e.to_string()))?;
@@ -174,6 +188,16 @@ mod tests {
     #[test]
     fn reqwest_transport_builds() {
         let transport = ReqwestTransport::new(Duration::from_secs(5));
+        assert!(transport.is_ok());
+    }
+
+    #[test]
+    fn connect_timeout_matches_java_thirty_seconds() {
+        // Java: connectTimeout(Duration.ofSeconds(30)) in Mem0Client / BailianMemoryClient /
+        // ReMeClient. reqwest has no separate write timeout, so the per-request timeout
+        // (Java readTimeout) stays the load-bearing knob.
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(30));
+        let transport = ReqwestTransport::new(Duration::from_secs(60));
         assert!(transport.is_ok());
     }
 }

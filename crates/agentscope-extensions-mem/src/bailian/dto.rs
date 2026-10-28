@@ -265,3 +265,180 @@ pub struct BailianSearchResponse {
     )]
     pub memory_nodes: Option<Vec<BailianMemoryNode>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn expected(raw: &str) -> Value {
+        serde_json::from_str(raw).expect("valid json literal")
+    }
+
+    #[test]
+    fn message_roundtrips_role_and_content() {
+        let message = BailianMessage::new("assistant", "hi");
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value, expected(r#"{"role":"assistant","content":"hi"}"#));
+        let back: BailianMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, message);
+        assert_eq!(BailianMessage::default(), BailianMessage::new("", ""));
+    }
+
+    #[test]
+    fn add_request_uses_meta_data_key_not_metadata() {
+        let mut metadata = JsonMap::new();
+        metadata.insert("k".to_string(), json!("v"));
+        let request = BailianAddRequest::new()
+            .with_user_id("u")
+            .with_metadata(metadata);
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["meta_data"]["k"], "v");
+        assert!(value.get("metadata").is_none());
+        let back: BailianAddRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back, request);
+    }
+
+    #[test]
+    fn add_request_skips_absent_fields() {
+        assert_eq!(
+            serde_json::to_value(BailianAddRequest::new()).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn add_request_serializes_snake_case_fields() {
+        let mut request = BailianAddRequest::new()
+            .with_user_id("u")
+            .with_messages(vec![BailianMessage::new("user", "hi")])
+            .with_memory_library_id("lib")
+            .with_project_id("proj")
+            .with_profile_schema("schema");
+        request.custom_content = Some("direct memory".to_string());
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["user_id"], "u");
+        assert_eq!(value["custom_content"], "direct memory");
+        assert_eq!(value["memory_library_id"], "lib");
+        assert_eq!(value["project_id"], "proj");
+        assert_eq!(value["profile_schema"], "schema");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"], "hi");
+        let back: BailianAddRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back, request);
+    }
+
+    #[test]
+    fn search_request_serializes_snake_case_and_flags() {
+        let request = BailianSearchRequest::new()
+            .with_user_id("u")
+            .with_messages(vec![BailianMessage::new("user", "q")])
+            .with_memory_library_id("lib")
+            .with_project_ids(vec!["p1".to_string(), "p2".to_string()])
+            .with_top_k(3)
+            .with_min_score(0.5)
+            .with_enable_rerank(true)
+            .with_enable_judge(false)
+            .with_enable_rewrite(true);
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["project_ids"], json!(["p1", "p2"]));
+        assert_eq!(value["top_k"], 3);
+        assert_eq!(value["min_score"], 0.5);
+        assert_eq!(value["enable_rerank"], true);
+        assert_eq!(value["enable_judge"], false);
+        assert_eq!(value["enable_rewrite"], true);
+        assert_eq!(value["messages"][0]["content"], "q");
+        let back: BailianSearchRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back, request);
+    }
+
+    #[test]
+    fn search_request_has_no_dto_level_defaults() {
+        // Java BailianSearchRequest has no construct defaults; top_k = 10 and
+        // min_score = 0.3 come from BailianLongTermMemory.Builder.
+        let request = BailianSearchRequest::new();
+        assert!(request.top_k.is_none());
+        assert!(request.min_score.is_none());
+        assert!(request.enable_rerank.is_none());
+        assert!(request.enable_judge.is_none());
+        assert!(request.enable_rewrite.is_none());
+        assert_eq!(serde_json::to_value(&request).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn memory_node_deserializes_snake_case_fields() {
+        let node: BailianMemoryNode = serde_json::from_str(
+            r#"{"memory_node_id":"n1","content":"c","event":"UPDATE","old_content":"o","created_at":1700000000,"updated_at":1700000001}"#,
+        )
+        .unwrap();
+        assert_eq!(node.memory_node_id.as_deref(), Some("n1"));
+        assert_eq!(node.content.as_deref(), Some("c"));
+        assert_eq!(node.event.as_deref(), Some("UPDATE"));
+        assert_eq!(node.old_content.as_deref(), Some("o"));
+        assert_eq!(node.created_at, Some(1_700_000_000));
+        assert_eq!(node.updated_at, Some(1_700_000_001));
+
+        let value = serde_json::to_value(&node).unwrap();
+        assert_eq!(value["memory_node_id"], "n1");
+        assert_eq!(value["old_content"], "o");
+        assert!(value.get("memoryNodeId").is_none());
+    }
+
+    #[test]
+    fn memory_node_serializes_nothing_when_empty() {
+        assert_eq!(
+            serde_json::to_value(BailianMemoryNode::default()).unwrap(),
+            json!({})
+        );
+        let node: BailianMemoryNode = serde_json::from_str("{}").unwrap();
+        assert_eq!(node, BailianMemoryNode::default());
+    }
+
+    #[test]
+    fn add_response_deserializes_request_id_and_nodes() {
+        let response: BailianAddResponse = serde_json::from_str(
+            r#"{"request_id":"r1","memory_nodes":[{"memory_node_id":"n1","content":"c"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(response.request_id.as_deref(), Some("r1"));
+        let nodes = response.memory_nodes.as_ref().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].memory_node_id.as_deref(), Some("n1"));
+
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["request_id"], "r1");
+        assert_eq!(value["memory_nodes"][0]["content"], "c");
+    }
+
+    #[test]
+    fn search_response_preserves_node_order() {
+        let response: BailianSearchResponse = serde_json::from_str(
+            r#"{"request_id":"r2","memory_nodes":[{"content":"a"},{"content":"b"}]}"#,
+        )
+        .unwrap();
+        let nodes = response.memory_nodes.as_ref().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].content.as_deref(), Some("a"));
+        assert_eq!(nodes[1].content.as_deref(), Some("b"));
+        assert_eq!(response.request_id.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn responses_tolerate_missing_and_unknown_fields() {
+        // Java sets FAIL_ON_UNKNOWN_PROPERTIES=false, so an envelope with
+        // unexpected keys must still deserialize.
+        let add: BailianAddResponse =
+            serde_json::from_str(r#"{"code":"Success","data":{}}"#).unwrap();
+        assert!(add.request_id.is_none());
+        assert!(add.memory_nodes.is_none());
+
+        let search: BailianSearchResponse = serde_json::from_str("{}").unwrap();
+        assert_eq!(search, BailianSearchResponse::default());
+        assert_eq!(
+            serde_json::to_value(BailianSearchResponse::default()).unwrap(),
+            json!({})
+        );
+    }
+}
