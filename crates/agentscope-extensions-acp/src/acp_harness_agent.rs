@@ -1190,7 +1190,7 @@ fn spawn_catalog_forwarder(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>
             if event.changed_keys.is_empty() {
                 continue;
             }
-            let guard = sessions.lock().unwrap();
+            let guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             for session in guard.values() {
                 let relevant = session
                     .selected_catalog_key()
@@ -1251,7 +1251,7 @@ async fn drain_sessions(sessions: &Arc<Mutex<HashMap<String, AcpAgentSession>>>,
     // set by the prompt itself, so it is authoritative even when the shutdown count is
     // zero (the ACP path must also register with `ExecutionGuard`).
     let live: Vec<AcpAgentSession> = {
-        let guard = sessions.lock().unwrap();
+        let guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.values().cloned().collect()
     };
     if live.is_empty() {

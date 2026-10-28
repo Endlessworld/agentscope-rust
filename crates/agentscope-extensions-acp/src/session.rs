@@ -19,6 +19,7 @@ use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
+use sha2::{Digest, Sha256};
 
 use agentscope_harness::agent::HarnessAgent;
 
@@ -74,6 +75,12 @@ pub struct AcpClientHandle {
 /// that never answers (a disconnected IDE, a dropped response) used to block the tool, the
 /// run and the prompt forever, with `session/cancel` unable to reach it.
 const INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long an MCP server may take to start and complete its handshake.
+///
+/// A server that hangs during startup (a missing binary that waits on stdin, an unreachable
+/// URL) used to block session creation indefinitely, before the user could even send a prompt.
+const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl AcpClientHandle {
     /// Wraps an agent-side connection whose counterpart is the ACP client.
@@ -391,7 +398,10 @@ pub struct AcpAgentSession {
     /// The provider-reported input tokens of the most recent model call. This is the
     /// real size of the live context (system prompt + tools + history), reported back
     /// by the provider; `usage.input_tokens` is cumulative and must not drive the gauge.
-    last_input_tokens: u64,
+    ///
+    /// Shared: the catalog/background tasks hold their own clone of the session and push
+    /// usage updates, so a per-clone counter would report a stale (usually zero) gauge.
+    last_input_tokens: Arc<std::sync::atomic::AtomicU64>,
     /// Client connection used to push `session/request_permission` requests
     /// when a tool call needs human confirmation. Shared across clones so a
     /// background catalog task can also push config/usage updates.
@@ -432,7 +442,10 @@ pub struct AcpAgentSession {
     /// Client-visible session title, if one was set.
     title: Option<String>,
     /// ISO-8601 timestamp of the last prompt turn.
-    updated_at: Option<String>,
+    ///
+    /// Shared: `session/list` and LRU eviction read it through a *clone* taken from the
+    /// registry, so a per-clone value would keep reporting the moment the clone was made.
+    updated_at: Arc<Mutex<Option<String>>>,
 }
 
 fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf {
@@ -464,16 +477,63 @@ fn save_session_config(path: &std::path::Path, config: &SessionConfig) {
             return;
         }
     }
-    match serde_json::to_vec_pretty(config) {
-        Ok(bytes) => {
-            if let Err(error) = std::fs::write(path, bytes) {
-                tracing::warn!(path = %path.display(), %error, "failed to persist ACP session config");
-            }
-        }
+    let bytes = match serde_json::to_vec_pretty(config) {
+        Ok(bytes) => bytes,
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to serialize ACP session config");
+            return;
+        }
+    };
+    // Write-then-rename: a crash mid-write must not leave a truncated config that the next
+    // start cannot parse. The temporary file lives next to the target so the rename stays on
+    // one filesystem, and the parent directory is fsynced so the entry itself is durable.
+    let temporary = path.with_extension("json.tmp");
+    if let Err(error) = write_and_sync(&temporary, &bytes) {
+        tracing::warn!(path = %temporary.display(), %error, "failed to write ACP session config");
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        tracing::warn!(path = %path.display(), %error, "failed to replace ACP session config");
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
         }
     }
+}
+
+/// Writes `bytes` to `path` and fsyncs the file before returning.
+fn write_and_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Derives the prompt's idempotency key from what the user actually sent.
+///
+/// ACP's `PromptRequest` carries no client request id, so the key is the hash of the prompt's
+/// text plus the moment the prompt was accepted. Hashing the content makes the journal say
+/// *which* prompt a turn belongs to (a random UUID said nothing); the timestamp keeps two
+/// identical questions two distinct turns, so a genuine repeat is never merged away while a
+/// retry inside this process keeps reusing the same key.
+fn prompt_idempotency_key(message: &Msg, accepted_at_ms: i64) -> String {
+    let mut text = String::new();
+    for block in &message.content {
+        if let agentscope_core::message::ContentBlock::Text(block) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&block.text);
+        }
+    }
+    let digest = Sha256::digest(text.as_bytes());
+    let hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("prompt-{}-{accepted_at_ms}", &hash[..16])
 }
 
 impl AcpAgentSession {
@@ -534,7 +594,7 @@ impl AcpAgentSession {
             closed: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
-            last_input_tokens: 0,
+            last_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: Arc::new(Mutex::new(None)),
             elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
@@ -547,10 +607,10 @@ impl AcpAgentSession {
             additional_directories: Vec::new(),
             config_path,
             title: None,
-            updated_at: None,
+            updated_at: Arc::new(Mutex::new(None)),
         };
         {
-            let mut config = session.config.lock().unwrap();
+            let mut config = session.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             config.model = initial_model;
             config.mode = initial_mode;
             config.thought_level = initial_thought;
@@ -639,8 +699,8 @@ impl AcpAgentSession {
         if let Some(title) = &self.title {
             update = update.title(title.clone());
         }
-        if let Some(updated_at) = &self.updated_at {
-            update = update.updated_at(updated_at.clone());
+        if let Some(updated_at) = self.updated_at() {
+            update = update.updated_at(updated_at);
         }
         SessionNotification::new(
             self.session_id.clone(),
@@ -664,36 +724,44 @@ impl AcpAgentSession {
         if let Some(title) = &self.title {
             info = info.title(title.clone());
         }
-        if let Some(updated_at) = &self.updated_at {
-            info = info.updated_at(updated_at.clone());
+        if let Some(updated_at) = self.updated_at() {
+            info = info.updated_at(updated_at);
         }
         info
     }
 
     /// Current model id.
     pub fn model(&self) -> String {
-        self.config.lock().unwrap().model.clone()
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone()
     }
 
     /// Sort key for least-recently-used eviction: the last prompt's RFC-3339 timestamp, or an
     /// empty string for a session that never ran one (sorting it first, i.e. oldest).
     pub(crate) fn updated_at_sort_key(&self) -> String {
-        self.updated_at.clone().unwrap_or_default()
+        self.updated_at().unwrap_or_default()
+    }
+
+    /// The last-activity timestamp, if a prompt has run.
+    fn updated_at(&self) -> Option<String> {
+        self.updated_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Current mode id.
     pub fn mode(&self) -> String {
-        self.config.lock().unwrap().mode.clone()
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode.clone()
     }
 
     /// Sets the current model.
     pub fn set_model(&mut self, model: impl Into<String>) {
-        self.config.lock().unwrap().model = model.into();
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model = model.into();
         self.persist_config();
     }
 
     fn persist_config(&self) {
-        let config = self.config.lock().unwrap().clone();
+        let config = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         save_session_config(&self.config_path, &config);
     }
 
@@ -704,7 +772,7 @@ impl AcpAgentSession {
 
     /// Whether `level` is valid for the currently selected model.
     pub fn has_thought_level(&self, level: &str) -> bool {
-        let model = self.config.lock().unwrap().model.clone();
+        let model = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone();
         let ids = super::config::thought_level_ids_for(&model, &self.models);
         ids.iter().any(|id| id == level)
             || (ids.is_empty() && level == super::config::DEFAULT_THOUGHT_LEVEL)
@@ -736,7 +804,7 @@ impl AcpAgentSession {
         // Thought level -> per-call generation defaults. `auto` sends nothing
         // (provider default); explicit levels send only `reasoning_effort`
         // (see `thought_level_params`).
-        let level = self.config.lock().unwrap().thought_level.clone();
+        let level = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).thought_level.clone();
         let opts = thought_level_params(&level);
         self.agent.set_generate_options_defaults(opts);
 
@@ -744,7 +812,7 @@ impl AcpAgentSession {
         // caller can notify the client instead of failing silently.
         let mut errors = Vec::new();
         if let Some(build) = &self.model_builder {
-            let id = self.config.lock().unwrap().model.clone();
+            let id = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone();
             if !id.is_empty() && id != "default" && id != self.applied_model {
                 match build(&id, self.session_id.to_string().as_str()) {
                     Ok(model) => {
@@ -791,18 +859,18 @@ impl AcpAgentSession {
 
     /// Current thought level.
     pub fn thought_level(&self) -> String {
-        self.config.lock().unwrap().thought_level.clone()
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).thought_level.clone()
     }
 
     /// Sets the thought level (`auto` / `disabled` / `low` / `medium` / `high`
     /// / `max`). Applied on the next prompt.
     pub fn set_thought_level(&mut self, level: impl Into<String>) {
-        self.config.lock().unwrap().thought_level = level.into();
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).thought_level = level.into();
         self.persist_config();
     }
     /// Sets the current mode.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
-        self.config.lock().unwrap().mode = mode.into();
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode = mode.into();
         // Apply the mode's permission context to the live agent so the *next*
         // request already runs under the new rules.
         self.apply_mode();
@@ -814,7 +882,7 @@ impl AcpAgentSession {
     /// persisted "always allow / always reject" user rules on top so they
     /// survive mode switches and session restarts.
     fn apply_mode(&mut self) {
-        let mode = self.config.lock().unwrap().mode.clone();
+        let mode = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode.clone();
         let ctx = config::permission_context_for_mode(&mode);
         self.agent.set_permission_context(ctx);
         let persisted = self.permission_store.load();
@@ -838,8 +906,8 @@ impl AcpAgentSession {
         // Publish the connection to the elicitation tool (which holds the same
         // slot across prompts, so it never needs rebuilding).
         let erased: Arc<dyn ElicitationClient> = handle.clone();
-        *self.elicitation_slot.lock().unwrap() = Some(erased);
-        *self.client.lock().unwrap() = Some(handle);
+        *self.elicitation_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(erased);
+        *self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
     }
 
     /// The slot the `ask_user` tool reads the live connection from. Shared with
@@ -858,7 +926,7 @@ impl AcpAgentSession {
     /// Installs (or removes) the confirm handler that performs the ACP
     /// permission round-trip. Called at the start of every prompt run.
     fn install_confirm_handler(&self) {
-        match self.client.lock().unwrap().clone() {
+        match self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
             Some(client) => {
                 let handler = acp_confirm_handler(
                     self.session_id.clone(),
@@ -943,43 +1011,64 @@ impl AcpAgentSession {
                     continue;
                 }
             };
-            // Dedup: skip servers already bridged this session.
+            // Dedup: skip servers already bridged this session. A name is only recorded
+            // once the bridge succeeded, so a failed connect stays retryable instead of
+            // leaving the server permanently unbridged.
+            if self
+                .bridged_servers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&name)
             {
-                let mut bridged = self.bridged_servers.lock().unwrap();
-                if bridged.contains(&name) {
-                    continue;
-                }
-                bridged.push(name.clone());
+                continue;
             }
-            match self.mcp_manager.create_client(config).await {
-                Ok(client_id) => {
-                    if let Err(e) = self.mcp_manager.connect(&client_id).await {
+            let connected = tokio::time::timeout(MCP_CONNECT_TIMEOUT, async {
+                let client_id = match self.mcp_manager.create_client(config).await {
+                    Ok(client_id) => client_id,
+                    Err(error) => {
                         tracing::warn!(
                             session = %self.session_id,
                             server = %name,
-                            %e,
-                            "failed to connect MCP server"
+                            %error,
+                            "failed to create MCP client"
                         );
-                        continue;
+                        return false;
                     }
-                    let toolkit = self.agent.toolkit();
-                    agentscope_harness::agent::bridge_mcp_tools_to_toolkit(
-                        &self.mcp_manager,
-                        toolkit,
-                    )
+                };
+                if let Err(error) = self.mcp_manager.connect(&client_id).await {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        server = %name,
+                        %error,
+                        "failed to connect MCP server"
+                    );
+                    return false;
+                }
+                let toolkit = self.agent.toolkit();
+                agentscope_harness::agent::bridge_mcp_tools_to_toolkit(&self.mcp_manager, toolkit)
                     .await;
+                true
+            })
+            .await;
+            match connected {
+                Ok(true) => {
+                    self.bridged_servers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(name.clone());
                     tracing::info!(
                         session = %self.session_id,
                         server = %name,
                         "bridged MCP server tools into session toolkit"
                     );
                 }
-                Err(e) => {
+                Ok(false) => {}
+                Err(_elapsed) => {
                     tracing::warn!(
                         session = %self.session_id,
                         server = %name,
-                        %e,
-                        "failed to create MCP client"
+                        timeout_secs = MCP_CONNECT_TIMEOUT.as_secs(),
+                        "MCP server did not connect in time"
                     );
                 }
             }
@@ -989,14 +1078,22 @@ impl AcpAgentSession {
     /// Connects a client-declared MCP-over-ACP server and bridges its tools.
     async fn apply_acp_mcp_server(&self, acp: &agent_client_protocol::schema::v1::McpServerAcp) {
         let name = acp.name.clone();
+        // Same rule as the config-based transports: record the name only after the bridge
+        // succeeded, so a failed attempt can be retried when the client re-declares it.
+        if self
+            .bridged_servers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&name)
         {
-            let mut bridged = self.bridged_servers.lock().unwrap();
-            if bridged.contains(&name) {
-                return;
-            }
-            bridged.push(name.clone());
+            return;
         }
-        let Some(client) = self.client.lock().unwrap().clone() else {
+        let Some(client) = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
             tracing::warn!(
                 session = %self.session_id,
                 server = %name,
@@ -1004,8 +1101,13 @@ impl AcpAgentSession {
             );
             return;
         };
-        match client.connect_mcp_acp(&name, acp.server_id.clone()).await {
-            Ok(connection) => {
+        let connected = tokio::time::timeout(
+            MCP_CONNECT_TIMEOUT,
+            client.connect_mcp_acp(&name, acp.server_id.clone()),
+        )
+        .await;
+        match connected {
+            Ok(Ok(connection)) => {
                 if let Err(e) = connection.bridge_tools(self.agent.toolkit()).await {
                     tracing::warn!(
                         session = %self.session_id,
@@ -1014,19 +1116,34 @@ impl AcpAgentSession {
                         "failed to list MCP-over-ACP tools"
                     );
                 }
-                self.mcp_acp_connections.lock().unwrap().push(connection);
+                self.mcp_acp_connections
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(connection);
+                self.bridged_servers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(name.clone());
                 tracing::info!(
                     session = %self.session_id,
                     server = %name,
                     "bridged MCP-over-ACP server tools into session toolkit"
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     session = %self.session_id,
                     server = %name,
                     %e,
                     "failed to connect MCP-over-ACP server"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    server = %name,
+                    timeout_secs = MCP_CONNECT_TIMEOUT.as_secs(),
+                    "MCP-over-ACP server did not connect in time"
                 );
             }
         }
@@ -1039,12 +1156,12 @@ impl AcpAgentSession {
             .iter()
             .map(|m| SessionMode::new(m.id.clone(), m.name.clone()))
             .collect();
-        SessionModeState::new(self.config.lock().unwrap().mode.clone(), modes)
+        SessionModeState::new(self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode.clone(), modes)
     }
 
     /// Returns the session config options advertised to the client.
     pub fn config_options(&self) -> Vec<SessionConfigOption> {
-        let mut cfg = self.config.lock().unwrap();
+        let mut cfg = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let valid_levels = super::config::thought_level_ids_for(&cfg.model, &self.models);
         if !valid_levels.iter().any(|id| id == &cfg.thought_level) {
             cfg.thought_level = super::config::DEFAULT_THOUGHT_LEVEL.to_string();
@@ -1072,7 +1189,7 @@ impl AcpAgentSession {
     pub fn selected_descriptor(
         &self,
     ) -> Option<std::sync::Arc<agentscope_core::model::catalog::ModelDescriptor>> {
-        let model = self.config.lock().unwrap().model.clone();
+        let model = self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).model.clone();
         self.models
             .iter()
             .find(|choice| choice.id == model)
@@ -1088,7 +1205,7 @@ impl AcpAgentSession {
     /// Pushes `ConfigOptionUpdate` + `UsageUpdate` to the bound client. Used by the
     /// background catalog task; a no-op when the session has no live connection.
     pub fn push_config_update(&self) {
-        let Some(client) = self.client.lock().unwrap().clone() else {
+        let Some(client) = self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else {
             return;
         };
         let options = self.config_options();
@@ -1099,7 +1216,7 @@ impl AcpAgentSession {
             ),
         );
         let _ = client.notify(config);
-        let used = self.last_input_tokens;
+        let used = self.last_input_tokens();
         let _ = client.notify(self.usage_notification(used));
     }
 
@@ -1111,7 +1228,7 @@ impl AcpAgentSession {
     /// descriptor of the newly selected model instead.
     pub fn push_usage_for_selected_model(&self) {
         use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
-        let Some(client) = self.client.lock().unwrap().clone() else {
+        let Some(client) = self.client.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else {
             return;
         };
         let size = self
@@ -1119,7 +1236,7 @@ impl AcpAgentSession {
             .map(|descriptor| descriptor.context_window as u64)
             .filter(|size| *size > 0)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW as u64);
-        let used = self.last_input_tokens;
+        let used = self.last_input_tokens();
         let update = SessionNotification::new(
             self.session_id.clone(),
             SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
@@ -1411,7 +1528,10 @@ impl AcpAgentSession {
         }
         // Record last-activity time and tell the client so its session list
         // shows the current `updatedAt` without a separate `session/list` call.
-        self.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        self.updated_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(chrono::Utc::now().to_rfc3339());
         emit(self.session_info_update());
         // Convert ACP content blocks into a core user message; unsupported media is
         // rejected before any model call so the client gets a readable reason.
@@ -1493,7 +1613,11 @@ impl AcpAgentSession {
                 "could not stop the active run before starting a new prompt"
             );
         }
-        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        // The key identifies this prompt in the journal: it is derived from the user's text
+        // plus the acceptance time, so a retry of this attempt reuses it while an identical
+        // question asked later is still a new turn.
+        let idempotency_key =
+            prompt_idempotency_key(&message, chrono::Utc::now().timestamp_millis());
         let mut submit_attempts = 0usize;
         let mut task = loop {
             submit_attempts += 1;
@@ -1543,7 +1667,7 @@ impl AcpAgentSession {
         // before the first model call completes. Before any model call there is no
         // real in-context count, so report zero; afterwards keep showing the last
         // provider-reported input size until the new call reports its own.
-        emit(self.usage_notification(self.last_input_tokens));
+        emit(self.usage_notification(self.last_input_tokens()));
 
         // Watchdog state.
         //
@@ -1704,12 +1828,13 @@ impl AcpAgentSession {
                                     {
                                         self.accumulate_usage(u.clone());
                                         self.accumulate_turn_usage(&u);
-                                        self.last_input_tokens = u.input_tokens;
+                                        self.last_input_tokens
+                                            .store(u.input_tokens, Ordering::SeqCst);
                                         emit(self.usage_notification(u.input_tokens));
                                     } else {
                                         // No usage on this event: keep showing the last
                                         // provider-reported context size instead of 0.
-                                        emit(self.usage_notification(self.last_input_tokens));
+                                        emit(self.usage_notification(self.last_input_tokens()));
                                     }
                                 }
                                 AgentEventType::Custom => {
@@ -1973,6 +2098,11 @@ impl AcpAgentSession {
         }
     }
 
+    /// The provider-reported input tokens of the most recent model call.
+    fn last_input_tokens(&self) -> u64 {
+        self.last_input_tokens.load(Ordering::SeqCst)
+    }
+
     /// Cumulative token usage for this session.
     pub fn usage(&self) -> &ChatUsage {
         &self.usage
@@ -2020,8 +2150,77 @@ impl AcpAgentSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{thought_level_params, turn_usage_to_response};
-    use agentscope_core::message::ChatUsage;
+    use super::{
+        prompt_idempotency_key, save_session_config, thought_level_params, turn_usage_to_response,
+    };
+    use agentscope_core::message::{ChatUsage, Msg};
+
+    #[test]
+    fn saving_a_session_config_replaces_it_atomically() {
+        // Regression: the config was written in place, so a crash mid-write left a truncated
+        // file the next start could not parse (and the session silently lost its model/mode).
+        let directory = std::env::temp_dir().join(format!(
+            "acp-config-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("session.json");
+        let first = super::SessionConfig {
+            model: "first".into(),
+            ..super::SessionConfig::default()
+        };
+        save_session_config(&path, &first);
+        let restored: super::SessionConfig =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.model, "first");
+
+        // Overwriting leaves a complete file and no temporary sibling behind.
+        let second = super::SessionConfig {
+            model: "second".into(),
+            ..super::SessionConfig::default()
+        };
+        save_session_config(&path, &second);
+        let restored: super::SessionConfig =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.model, "second");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temporary file must be renamed away"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_prompt_key_hashes_the_text_and_the_acceptance_time() {
+        let message = Msg::user("fix the build");
+        let key = prompt_idempotency_key(&message, 1_700_000_000_000);
+        assert!(key.starts_with("prompt-"), "{key}");
+        assert!(key.ends_with("-1700000000000"), "{key}");
+        // Same text at the same instant is the same turn (a retry of this attempt).
+        assert_eq!(key, prompt_idempotency_key(&message, 1_700_000_000_000));
+        // Same text later is a new turn: a genuine repeat is never merged away.
+        assert_ne!(key, prompt_idempotency_key(&message, 1_700_000_000_001));
+        // Different text is a different turn.
+        assert_ne!(
+            key,
+            prompt_idempotency_key(&Msg::user("fix the tests"), 1_700_000_000_000)
+        );
+        // Short enough for the harness limit (200 bytes) and URL-safe.
+        assert!(key.len() < 64, "{key}");
+        assert!(key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
+    }
+
+    #[test]
+    fn a_prompt_without_text_still_gets_a_key() {
+        let key = prompt_idempotency_key(&Msg::user(""), 42);
+        assert!(key.starts_with("prompt-"), "{key}");
+        assert!(key.ends_with("-42"), "{key}");
+    }
 
     #[test]
     fn an_empty_turn_reports_no_usage() {

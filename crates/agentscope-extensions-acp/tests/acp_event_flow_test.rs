@@ -232,3 +232,46 @@ async fn failed_run_reports_the_actual_error() {
         "the error prefix must not be duplicated, got {text:?}"
     );
 }
+
+/// Regression: `updated_at` and the context gauge used to be per-clone fields, so a session
+/// handle taken *before* a turn (the registry's copy, the catalog task's copy) kept reporting
+/// the moment the clone was made. They are shared now.
+#[tokio::test]
+async fn a_clone_sees_the_activity_of_a_turn_it_did_not_run() {
+    let model: Arc<dyn Model> = Arc::new(ScriptedModel {
+        responses: std::sync::Mutex::new(vec![ChatResponse::builder()
+            .content(vec![CoreBlock::Text(TextBlock::new("ok"))])
+            .build()]),
+    });
+    let agent = HarnessAgent::builder()
+        .name("acp-shared")
+        .model(model)
+        .max_iters(2)
+        .build();
+    let mut session = AcpAgentSession::new(
+        SessionId::new("s-shared"),
+        std::env::temp_dir(),
+        agent,
+        vec![],
+        vec![],
+    );
+    let observer = session.clone();
+    assert!(
+        observer.session_info().updated_at.is_none(),
+        "a session that never ran a prompt has no activity time"
+    );
+
+    session
+        .run_prompt(
+            vec![ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("do it"),
+            )],
+            |_| {},
+        )
+        .await;
+
+    assert!(
+        observer.session_info().updated_at.is_some(),
+        "the clone must observe the turn's activity time"
+    );
+}

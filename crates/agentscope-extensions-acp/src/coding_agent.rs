@@ -262,10 +262,10 @@ impl AcpCodingAgent {
         let id = session.session_id().to_string();
         // A prompt that finishes after `session/close` must not resurrect the session.
         if session.is_closed() {
-            self.sessions.lock().unwrap().remove(&id);
+            self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
             return;
         }
-        let mut guard = self.sessions.lock().unwrap();
+        let mut guard = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.len() >= self.max_sessions && !guard.contains_key(&id) {
             // 淘汰最久未活动的会话：`updated_at` 是提示轮次写入的 RFC-3339 时间戳，
             // 字典序即时间序；新建而未提示过的会话排在最前（最旧）。会话 id 形如
@@ -356,7 +356,7 @@ impl AcpCodingAgent {
     ) -> ListSessionsResponse {
         const PAGE_SIZE: usize = 50;
         let mut infos: Vec<SessionInfo> = {
-            let guard = self.sessions.lock().unwrap();
+            let guard = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             guard
                 .values()
                 .filter(|session| cwd.is_none_or(|cwd| session.cwd() == cwd))
@@ -387,8 +387,11 @@ impl AcpCodingAgent {
                 }
             }
         }
-        infos.sort_by(|a, b| a.session_id.to_string().cmp(&b.session_id.to_string()));
-        infos.dedup_by(|a, b| a.session_id == b.session_id);
+        // Drop duplicates by id *before* sorting: the two orders disagree, so `dedup_by`
+        // after the sort would leave a persisted duplicate of an in-memory session in place.
+        let mut seen_ids = std::collections::HashSet::new();
+        infos.retain(|info| seen_ids.insert(info.session_id.to_string()));
+        sort_session_infos(&mut infos);
 
         // The cursor is the exclusive lower bound (last id of the prior page).
         let start = match cursor {
@@ -417,7 +420,7 @@ impl AcpCodingAgent {
     /// synthetic session id never reaches the journal: only the store's index is read.
     fn catalog_agent(&self, cwd: &std::path::Path) -> Arc<HarnessAgent> {
         const CATALOG_SESSION_ID: &str = "session-catalog";
-        if let Some(agent) = self.catalog_agents.lock().unwrap().get(cwd) {
+        if let Some(agent) = self.catalog_agents.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(cwd) {
             return Arc::clone(agent);
         }
         let agent = Arc::new(match &self.session_factory {
@@ -879,6 +882,23 @@ async fn handle_ext_respond(
     }
 }
 
+/// Orders `session/list` entries: most recently active first.
+///
+/// Session ids are opaque (`session-<uuid>`), so ordering by id put an arbitrary session at
+/// the top of the client's picker. The id is the tie-breaker, which keeps pagination
+/// deterministic for sessions written in the same millisecond. A session without a recorded
+/// activity time (never prompted) sorts last.
+fn sort_session_infos(infos: &mut [SessionInfo]) {
+    infos.sort_by(|a, b| match (&a.updated_at, &b.updated_at) {
+        (Some(left), Some(right)) => right
+            .cmp(left)
+            .then_with(|| a.session_id.to_string().cmp(&b.session_id.to_string())),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.session_id.to_string().cmp(&b.session_id.to_string()),
+    });
+}
+
 /// Builder for [`AcpCodingAgent`].
 #[derive(Default)]
 pub struct AcpCodingAgentBuilder {
@@ -969,5 +989,46 @@ impl AcpCodingAgentBuilder {
             agent = agent.with_max_sessions(max);
         }
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_session_infos;
+    use agent_client_protocol::schema::v1::{SessionId, SessionInfo};
+
+    fn info(id: &str, updated_at: Option<&str>) -> SessionInfo {
+        let info = SessionInfo::new(SessionId::new(id), std::path::PathBuf::from("/tmp"));
+        match updated_at {
+            Some(at) => info.updated_at(at),
+            None => info,
+        }
+    }
+
+    #[test]
+    fn the_session_list_orders_by_last_activity_not_by_id() {
+        // Regression: ordering by session id put an arbitrary session first, because the id is
+        // an opaque uuid (`session-<uuid>`) with no time in it.
+        let mut infos = vec![
+            info("session-aaa", Some("2026-10-27T10:00:00Z")),
+            info("session-zzz", Some("2026-10-28T10:00:00Z")),
+            info("session-never-prompted", None),
+            info("session-mmm", Some("2026-10-27T10:00:00Z")),
+        ];
+        sort_session_infos(&mut infos);
+        let ids: Vec<String> = infos
+            .iter()
+            .map(|info| info.session_id.to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "session-zzz",
+                // Same timestamp: the id is the tie-breaker, so pagination stays stable.
+                "session-aaa",
+                "session-mmm",
+                "session-never-prompted",
+            ]
+        );
     }
 }

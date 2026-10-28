@@ -126,7 +126,7 @@ impl Tool for AskUserTool {
     }
 
     async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let client = { self.slot.lock().unwrap().clone() };
+        let client = { self.slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() };
         let Some(client) = client else {
             return Ok(ToolResultBlock::error(
                 "ask_user is unavailable: no ACP client connection is bound to this session. 
