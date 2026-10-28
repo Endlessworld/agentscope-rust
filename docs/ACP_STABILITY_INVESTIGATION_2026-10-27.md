@@ -11,7 +11,7 @@
 
 1. **`Session writer ownership expired or fenced` 的直接成因已消除。** 原链条是：`acquire` 先拿 120s 租约 → 全量重放 journal（可能数分钟）→ 才启动心跳 → 第一次 `flush` 续租时命中“租约已过期” → 被当成永久 fencing。现在：心跳前移到 `acquire` 之后、同 owner/epoch 过期可原地续租、transient 失败退避重试、`Stale committed prefix` 会重基而不是判死。
 2. **`The previous turn is still open` 的错误路径已移除。** dispatcher 对孤儿 open turn 自动关闭，`submit` 前按状态路由（可恢复 → 先 resume；suspended/有不确定工具 → 关闭），不再 `inbox.reject("turn_unfinished")` 丢掉用户消息。
-3. **“错误不再以那种文案出现”≠“任意中断后可继续”。** 仍然做不到的三件事：冷启动重放仍然慢（journal 无 segment/compaction，P0-2）、journal 仍落在工程目录 `agents/`（P0-11）、模型流的半截输出重启后不可恢复（P1-2）。
+3. **“错误不再以那种文案出现”≠“任意中断后可继续”。** 现在已能：模型流半截输出重启后由模型续写（P1-2，见 §2.2）；journal 落在 `.agentscope/sessions` 而不是工程目录（P0-11）。仍做不到：冷启动重放仍然慢（P0-2，已有设计方案 `docs/session-journal-compaction-design.md`）。
 4. **剩余最大风险是 journal 的体量与投影成本**（P0-2 / P1-11）：一 batch 一 commit 文件、无快照/回收，长会话冷启动是 O(全部 commit)，也是磁盘与重放开销的主源。
 
 ### 0.2 状态总表
@@ -19,7 +19,7 @@
 | 编号 | 问题（一句话） | 状态 | 落地方式 / 原因 |
 |---|---|---|---|
 | P0-1 | 租约在重放期间过期：心跳启动时机错误 | ✅ 已修 | `acquire` 后立即启动心跳；replay 失败先停心跳再 release |
-| P0-2 | 每 chunk 一 commit，journal 爆炸 | ◐ 部分 | `model/chunk` 已合并（4KiB / 64 delta / 1s）；**无 segment / compaction / retention** |
+| P0-2 | 每 chunk 一 commit，journal 爆炸 | ◐ 部分 | `model/chunk` 已合并（4KiB / 64 delta / 1s，且 1s 定时落盘）；**快照/segment/retention 未做**，方案见 `docs/session-journal-compaction-design.md` |
 | P0-3 | 租约过期 = 永久 fence | ✅ 已修 | `ensure_owned` 只在 owner/epoch 变化或 sealed 时失败；同 owner 过期可续租 |
 | P0-4 | 心跳一次失败就永久停止 | ✅ 已修 | transient 失败指数退避重试；只有 fenced/sealed 才停止 |
 | P0-5 | `flush` 的 clone-then-clear 丢并发 append | ✅ 已修 | `flush_lock` 串行化 + `InflightBatch` 预留 seq，成功后只确认该 batch |
@@ -28,11 +28,11 @@
 | P0-8 | 工具执行 detached，取消不停工具 | ✅ 已修 | `ActingTaskGuard` + `ActingStream`：stream drop 时置 cancel 并 abort；`run_acting_calls` 每轮检查 cancel / `check_interrupted` |
 | P0-9 | 关闭/退出没有 drain | ✅ 已修 | `run_stdio` 返回后（含错误）`drain_sessions("transport closed")`；`run_stream_with_extensions` 也持有 `ExecutionGuard` |
 | P0-10 | 文件存储 CAS 非跨进程原子、无 fsync | ✅ 已修 | `Filesystem::sync` + `LocalFilesystem::sync_all`；可变值 CAS 加 `{path}.lock` 文件锁（30s 陈旧可破）；immutable commit/blob 不写 `.version` |
-| P0-11 | journal 默认写在工程目录 `agents/` | ⬜ 未做 | 需路径迁移 + 旧数据 fallback（否则老会话“消失”），属数据面变更 |
+| P0-11 | journal 默认写在工程目录 `agents/` | ✅ 已修 | 新会话写入 `.agentscope/sessions/<agent>/<user>/<session>`；旧 `agents/...` 只读 fallback（不复制、不迁移，避免双写分叉），`list` 同时扫两处 |
 | P0-12 | 大 checkpoint 撞 `MAX_PENDING_BYTES` | ✅ 已修 | `checkpoint_now` 先 flush 再独占提交；`admits_bytes` 允许空缓冲下的单个大 payload（journal 已把 >64KiB 溢写 blob） |
 | P0-13 | `turn_unfinished` 直接拒绝新 prompt | ✅ 已修 | dispatcher 自动关闭孤儿 turn；`submit` 前按状态路由，不再 reject 用户消息 |
 | P1-1 | observation 失败被降级成可重试 tool result | ✅ 已修 | 新增 `Error::ActionDispatch`（start 失败 = 工具未执行，可重试）与 `Error::ActionObservation`（end 失败 = run 级错误，journal 保持 uncertain） |
-| P1-2 | 模型流部分输出崩溃后不可恢复 | ⬜ 未做 | 需先定策略（丢弃 partial 还是继续），且要在 projection 里跟踪 model call 状态机 |
+| P1-2 | 模型流部分输出崩溃后不可恢复 | ✅ 已修 | `interrupted_model_output` 从 journal 取未完成 model call 的已流式文本；resume 时去掉尾部的 interrupted 恢复消息、以该文本作为 assistant prefill 让模型续写 |
 | P1-3 | 每次 prompt 先 abandon，重启后无法继续 | ✅ 已修 | `prepare_open_turn_before_submit`：可恢复的 interrupted turn 先排一个 `resume`；ACP 侧改 `stop_active_run`（只打断自己拥有的 run） |
 | P1-4 | prompt 没有稳定幂等键 | ✅ 已修 | 键 = `prompt-<文本 SHA-256 前 16 hex>-<受理时间戳ms>`；**跨进程去重仍受协议限制**（见 §0.3） |
 | P1-5 | cancel 是 session 级共享 flag | ✅ 已修 | `cancel: AtomicBool` → `cancel_epoch: AtomicU64`，每个 prompt 只认自己的 epoch |
@@ -48,15 +48,13 @@
 | P1-15 | `Stale committed prefix` 无重基策略 | ✅ 已修 | `flush` 判定 stale 后先 `renew`，再按新 head 重编号未提交事件 + 换新 batch id（最多 3 次） |
 | P2-1…P2-20 | 可观测性/次级风险（20 项） | ◐ 大部分已修 | 15 项已修、5 项部分（P2-3/P2-10/P2-13/P2-16/P2-20），见 §2.3 |
 
-**统计：** P0 12/13 已修（P0-2 部分、P0-11 未做）；P1 12/15 已修（P1-2 / P1-11 未做）；P2 15 已修 / 5 部分 / 0 未做。
+**统计：** P0 13/13 已修（P0-2 部分，待快照/回收）；P1 14/15 已修（P1-11 未做）；P2 15 已修 / 5 部分 / 0 未做。
 
 ### 0.3 仍未完成（及原因）
 
 | 项 | 为什么还没做 |
 |---|---|
-| **P0-2** journal segment / compaction / retention | 一 batch 一 commit 文件且无段合并，冷启动仍要扫全部 commit。真正修法是「分段落盘 + 写入折叠后的 projection 快照 + 删除已被快照覆盖的 commit」，涉及 `SessionLog::commit/visit/read_after` 全链路与所有存储后端，缺少崩溃点设计时改不动 |
-| **P0-11** journal 默认路径在 `agents/` | 改成用户目录需要路径迁移 + 旧数据 fallback（否则老用户的会话全部“消失”），是数据面变更，需单独决策与迁移脚本 |
-| **P1-2** 模型流 partial 恢复 | 需要先定语义：客户端已看到半截文本时，重启是丢弃 partial（回到 checkpoint）还是继续（保留 partial 让模型续写）。两种都要改 projection 与 model call 状态机 |
+| **P0-2** journal segment / compaction / retention | 方案已出（`docs/session-journal-compaction-design.md`）：不可变快照 + 指针 CAS 发布 + 尾段重放 + 快照边界回收。分 S1-S4 四阶段，尚未开始实现 |
 | **P1-11** 投影缓存上限 | 正解是 P0-2 的快照，否则裁剪会丢 `started`/`inputs` 的去重能力 |
 | **P1-4** 跨进程幂等 | ACP 的 `PromptRequest` 不携带客户端请求 id，进程重启后的重试仍会产生新 turn。要真正去重需要协议层 request id 或自定义 metadata + journal 持久化 `requestId -> turnId` |
 | **P1-14** repair / quarantine 工具 | 现在坏段只是不再阻断打开，没有显式的「截断到指定 seq / 隔离坏 commit」命令；隔离需要写侧 API 与目录清单（`list_paths` 目前约定 recovery 不使用） |
@@ -191,11 +189,11 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 - **影响：** 两个 ACP 进程/两个 IDE 窗口同 session 时丢 commit、head 回退、`Stale committed prefix`；断电后已确认的 turn 消失。
 - **落地：** `Filesystem::sync`（默认 no-op）+ `LocalFilesystem::sync_all`；可变值（head/元数据/cursor）的 CAS 额外持 `{path}.lock` 文件锁（create-if-absent，30s 后视为陈旧可破，`list_paths` 过滤 `.lock`）；`replace` 先 sync 临时文件再 rename；immutable commit/blob 不写 `.version`。
 
-#### P0-11 journal 默认写在工程目录 `agents/` ⬜
+#### P0-11 journal 默认写在工程目录 `agents/` ✅
 
-- **位置：** `harness/src/agent/session/storage.rs`（`WorkspaceSessionLogStore::open`）、`core/src/session/key.rs`（`storage_path`）
+- **位置：** `harness/src/agent/session/storage.rs`（`WorkspaceSessionLogStore::journal_prefix`/`list`）、`core/src/session/key.rs`（`storage_path`/`legacy_storage_path`）
 - **影响：** 模型的文件工具可以直接读/改/删 journal；工程目录被百万文件/GB 级数据污染；会话明文内容落在工作区。
-- **修复方案：** journal 改到独立数据目录（`~/.agentscope/sessions/<workspace-hash>/` 或 `%LOCALAPPDATA%`）；若必须放 cwd，至少放 `.agentscope/sessions` 并在文件工具/索引中排除；提供 retention/GC 与启动时输出 journal 根路径。**未做原因：需路径迁移 + 旧数据 fallback。**
+- **落地：** 新会话写 `.agentscope/sessions/<agent>/<user>/<session>`；只在旧位置存在的会话由 `journal_prefix` 回退到 `agents/...` 原地打开（**不复制、不迁移**，避免两个 writer/两个 head），`list` 同时扫两处并按 key 去重。
 
 #### P0-12 大 checkpoint 撞 `MAX_PENDING_BYTES` ✅
 
@@ -222,11 +220,12 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 - **影响：** 模型重试导致重复副作用；真实 `ToolResultBlock` 被丢弃。
 - **落地：** `Error::ActionDispatch`（`action/start` 确认失败 = 工具未执行，可重试）vs `Error::ActionObservation`（`action/end` 失败 = run 级错误，journal 保持 uncertain，不降级）。
 
-#### P1-2 模型流部分输出崩溃后不可恢复 ⬜
+#### P1-2 模型流部分输出崩溃后不可恢复 ✅
 
-- **位置：** `core/src/session/models.rs`（chunk + `model/end`）、`core/src/session/views.rs`（投影不消费 chunk）、`core/src/agent/react_agent.rs`（`partial_assistant` 仅在内存）
-- **影响：** 用户已看到的半截回答重启后丢失；没有 `model/end` 就无法判断模型调用是否已发出/结果未知。
-- **修复方案：** 在 `model/end`/step 边界 checkpoint assistant 消息，或从 `model/chunk` 重建 partial；投影跟踪 model call 状态（`request/prepared` 无 `model/end` 即 incomplete）；明确“丢弃 partial”还是“继续”的恢复策略，两者必须一致。
+- **位置：** `core/src/session/models.rs`（`interrupted_model_output`、`FLUSH_INTERVAL`）、`harness/src/agent/session/session.rs`（resume 的 prefill 装配）
+- **根因：** 已流式文本只在内存；恢复用的 checkpoint 写在该次 model call 之前，重启后只能整段重生成。
+- **落地：** ①合并缓冲除了 4KiB/64 delta 外再按 **1s 定时落盘**，进程被杀最多丢一个窗口；②`interrupted_model_output` 从 journal 找出「已 `model/dispatch`、无 `model/end`」的最新调用并拼回已流式文本；③`resume` 时丢弃尾部的 interrupted 恢复消息（`GenerateReason::Interrupted`），把半截文本作为 assistant prefill 保留在末尾，模型从断点续写（历史仍是一条 assistant 消息，不重复生成）。
+- **测试：** `a_stalled_stream_is_journaled_within_the_flush_window`、`an_unfinished_model_call_is_recoverable`、`a_resumed_turn_continues_the_partial_model_output`。
 
 #### P1-3 重启后无法真正继续原 turn ✅
 
@@ -397,9 +396,10 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 
 | 命令 | 结果 |
 |---|---|
-| `cargo test -p agentscope-core --lib` | 346 passed / 0 failed / 3 ignored |
+| `cargo test -p agentscope-core --lib` | 350 passed / 0 failed / 3 ignored |
 | `cargo test -p agentscope-core --tests` | 全部 target 通过 |
-| `cargo test -p agentscope-harness --lib` | 484 passed / 0 failed |
+| `cargo test -p agentscope-harness --lib` | 487 passed / 0 failed |
+| `cargo test -p agentscope-harness --tests` | 全部 target 通过（37 个集成 test 二进制，无 `failures:`） |
 | `cargo test -p agentscope-harness --test harness_session_test --test harness_session_journal_wiring_test --test harness_session_web_tools_test` | 4 / 19 / 8 passed |
 | `cargo test -p agentscope-extensions-acp` | 65 lib（含 5 项 `event_queue` 单测）+ 全部集成 test 通过 |
 | `cargo fmt --check`（改动文件） | 干净（`shutdown/mod.rs`、`e2b.rs`、`harness_shutdown_test.rs` 为仓库既有未格式化文件，本次未动） |
@@ -424,6 +424,10 @@ WARN failed to close the cancelled turn; the next prompt may be rejected ... Ses
 | `metrics()` 的 `heartbeat_age_ms` 恒 `None` | `metrics_report_replay_pending_and_heartbeat_age` | FAILED |
 | `EventQueue::push` 的容量判定 → `if false` | `a_full_queue_drops_the_newest_and_counts_deltas`、`a_full_queue_still_accepts_the_agent_result` | FAILED |
 | `/blobs/` 从不可变列表移除 | `immutable_payload_blobs_do_not_get_a_version_file` | FAILED |
+| `storage_path()` 回退为 `agents/...` | `a_new_session_is_written_under_the_agentscope_directory` | FAILED |
+| `journal_prefix` 的 legacy fallback 关闭 | `a_session_that_only_exists_in_the_legacy_location_still_opens` | FAILED |
+| resume 的 prefill 装配关闭 | `a_resumed_turn_continues_the_partial_model_output` | FAILED |
+| `time_until_flush()` 改回固定 1h | `a_stalled_stream_is_journaled_within_the_flush_window` | FAILED |
 
 ---
 
