@@ -8,6 +8,7 @@ use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::session::{InMemorySessionLogStore, SessionKey, SessionLogStore};
 use agentscope_harness::agent::session::{AgentSession, SessionAnswer};
 use agentscope_harness::agent::HarnessAgent;
+use futures::StreamExt;
 
 /// Answers every request with fixed text.
 struct ScriptedModel(&'static str);
@@ -803,6 +804,142 @@ async fn a_resumed_turn_does_not_replay_its_original_input() {
         "the resumed turn must not duplicate the user message: {rendered:?}"
     );
     assert!(rendered.contains("resumed answer"), "{rendered}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Streams a partial answer, then stalls; later calls finish the answer.
+struct PartialThenStallModel {
+    calls: Arc<std::sync::Mutex<Vec<Vec<Msg>>>>,
+}
+
+#[async_trait::async_trait]
+impl Model for PartialThenStallModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        let index = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(messages);
+            calls.len()
+        };
+        if index == 1 {
+            // The first attempt streams half an answer and then hangs, so the process is
+            // interrupted with the text already journaled but the call unfinished.
+            Box::pin(
+                futures::stream::once(async {
+                    Ok::<_, agentscope_core::error::Error>(
+                        ChatResponse::builder()
+                            .content(vec![CoreBlock::Text(TextBlock::new("half an ans"))])
+                            .build(),
+                    )
+                })
+                .chain(futures::stream::pending::<
+                    agentscope_core::error::Result<ChatResponse>,
+                >()),
+            )
+        } else {
+            Box::pin(futures::stream::once(async {
+                Ok(ChatResponse::builder()
+                    .content(vec![CoreBlock::Text(TextBlock::new("wer"))])
+                    .build())
+            }))
+        }
+    }
+
+    fn model_name(&self) -> &str {
+        "partial-stall"
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_turn_continues_the_partial_model_output() {
+    // The client already saw "half an ans" before the crash. Resuming must not regenerate a
+    // different answer: the partial text is re-attached as an assistant prefill and the model
+    // continues it.
+    let dir = temp_dir("resume-partial");
+    let calls: Arc<std::sync::Mutex<Vec<Vec<Msg>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(PartialThenStallModel {
+                calls: Arc::clone(&calls),
+            }))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-resume-partial");
+    let key = SessionKey::new(
+        Some("alice"),
+        "session-agent",
+        "conversation-resume-partial",
+    )
+    .unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();
+
+    let task = session.submit("only once please").await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while calls.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first run never reached the model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Let the merge window close so the streamed text is committed, exactly as it would be on a
+    // real crash a second into the answer.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let run_id = session
+        .task(&task.command_id)
+        .await
+        .unwrap()
+        .run_id
+        .expect("an admitted run publishes its run id");
+    assert!(
+        agent.interrupt_run(&run_id),
+        "the active run must accept the interrupt"
+    );
+    let settled = session.await_task(&task.command_id).await.unwrap();
+    assert_eq!(settled.status, "interrupted", "{settled:?}");
+
+    let resumed = session.resume(&task.turn_id).await.unwrap();
+    let resumed = session.await_task(&resumed.command_id).await.unwrap();
+    assert_eq!(resumed.status, "completed", "{resumed:?}");
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the interrupted attempt and the resumed one: {calls:?}"
+    );
+    let last = calls.last().expect("the resumed run must call the model");
+    let trailing = last.last().expect("the request must not be empty");
+    assert_eq!(
+        trailing.role,
+        agentscope_core::message::MsgRole::Assistant,
+        "the partial output must be re-attached as an assistant prefill: {last:?}"
+    );
+    assert_eq!(
+        trailing.text_content(),
+        "half an ans",
+        "the model must continue the text it had already streamed: {last:?}"
+    );
+    assert_eq!(
+        last.iter()
+            .filter(|message| message.text_content() == "half an ans")
+            .count(),
+        1,
+        "the prefill must be attached exactly once: {last:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

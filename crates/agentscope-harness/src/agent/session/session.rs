@@ -30,6 +30,20 @@ use futures::StreamExt;
 use super::answer::SessionAnswer;
 use crate::agent::HarnessAgent;
 
+/// Metadata key marking an assistant message that was re-attached from a journaled partial
+/// model output, so a resumed run continues it instead of answering again.
+pub const PREFILL_METADATA: &str = "agentscope/prefill";
+
+/// Whether `message` is the internal recovery message a reconciled interrupt leaves behind.
+///
+/// It is never shown to the user (the transport replaces it), so it must not stay at the end
+/// of the context when the run is resumed: the model would answer it instead of continuing
+/// the text it had already streamed.
+fn is_interrupt_recovery_message(message: &Msg) -> bool {
+    message.role == MsgRole::Assistant
+        && message.generate_reason() == agentscope_core::message::GenerateReason::Interrupted
+}
+
 /// How often the dispatcher looks for accepted work.
 const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -1421,6 +1435,47 @@ async fn launch(
         restored.session_id = pinned.session_id().to_string();
         if restored.user_id.is_none() {
             restored.user_id = pinned.user_id().map(str::to_string);
+        }
+    }
+    // A run that died in the middle of a model call had already streamed text the client saw.
+    // Regenerating the answer would produce a different one, so the partial output stays in
+    // the context and the model continues where it stopped. Two things are needed for that:
+    // the interrupted recovery message ("I noticed that you have interrupted me…") must not
+    // sit *after* the partial text — the model would answer it instead of continuing — and
+    // the partial text must be the last message. Only a `resume` can carry one: a fresh
+    // submit starts a new turn with nothing to continue.
+    if command.kind == "resume" {
+        match agentscope_core::session::interrupted_model_output(log.as_ref()).await {
+            Ok(Some(partial)) if !partial.text.is_empty() => {
+                while restored
+                    .context
+                    .last()
+                    .is_some_and(is_interrupt_recovery_message)
+                {
+                    restored.context.pop();
+                }
+                if restored.context.last().map(Msg::text_content).as_deref()
+                    != Some(partial.text.as_str())
+                {
+                    let mut message = Msg::assistant(partial.text.clone());
+                    message
+                        .metadata
+                        .insert(PREFILL_METADATA.to_string(), serde_json::Value::Bool(true));
+                    restored.context.push(message);
+                }
+                tracing::info!(
+                    turn = %turn_id,
+                    call = %partial.call_id,
+                    chars = partial.text.chars().count(),
+                    "continuing a model call that was interrupted mid-stream"
+                );
+            }
+            Ok(_) => {}
+            // Reading the journal is best effort here: failing to find a partial answer must
+            // never block the resume itself.
+            Err(error) => {
+                tracing::warn!(turn = %turn_id, %error, "could not read the interrupted model output")
+            }
         }
     }
     // Admission needs turns, inputs, applied ids and pending interactions. Use the cached
