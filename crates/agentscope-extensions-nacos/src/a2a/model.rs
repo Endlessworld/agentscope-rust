@@ -32,16 +32,13 @@ pub use agentscope_extensions_a2a_client::model::{
 /// field access is forwarded through `Deref`/`DerefMut`, so `card.url`,
 /// `card.capabilities`, `card.skills`, … keep working.
 ///
-/// Only `documentationUrl` is added locally: the protocol `AgentCard` has no such
-/// field yet, and dropping it would lose data that Java
-/// `AgentCardConverterUtil` preserves in both directions. Once the protocol model
-/// carries `documentation_url`, this wrapper collapses into a plain `pub use`.
+/// `documentationUrl` is carried by the protocol [`AgentCard`] itself since
+/// 2026-10-29, so the wrapper no longer declares a local field and simply
+/// forwards it through `Deref`/`DerefMut`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct A2aAgentCard {
     #[serde(flatten)]
     pub inner: AgentCard,
-    #[serde(rename = "documentationUrl", skip_serializing_if = "Option::is_none")]
-    pub documentation_url: Option<String>,
 }
 
 impl std::ops::Deref for A2aAgentCard {
@@ -64,18 +61,17 @@ impl A2aAgentCard {
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             inner: AgentCard::new(name, url),
-            documentation_url: None,
         }
     }
 
     /// The `documentationUrl` property.
     pub fn documentation_url(&self) -> Option<&str> {
-        self.documentation_url.as_deref()
+        self.inner.documentation_url.as_deref()
     }
 
     /// Sets the `documentationUrl` property.
     pub fn set_documentation_url(&mut self, url: impl Into<String>) {
-        self.documentation_url = Some(url.into());
+        self.inner.documentation_url = Some(url.into());
     }
 }
 

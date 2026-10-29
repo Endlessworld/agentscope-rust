@@ -21,6 +21,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 base64 = { workspace = true }
 
-# Nacos skill 包（ZIP）解析/重打包；仅写入本 crate，不改根 [workspace.dependencies]。
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# Nacos skill 包（ZIP）解析/重打包；版本已上提根 [workspace.dependencies]（2026-10-29）。
+zip = { workspace = true }
 

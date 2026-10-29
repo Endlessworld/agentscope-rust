@@ -89,11 +89,11 @@
 - **【2026-10-28 闭环】**：单参 `search_tools` 已改为只发 `{"query": q}`（不再附带 `topK`），注释与实现一致；`list_tools` 的 tool-search 分支仍走两参重载。P2-1 关闭，见 §8.1。
 
 ### 4.2 下一步与阻塞
-1. **汇总方（待裁定项）**：是否将 `rust-mcp-sdk` 提升为根 `Cargo.toml` 的 `[workspace.dependencies]`（当前仅本 crate 内声明，与 harness `Cargo.lock` 锁定的 `1.0.1` 一致）。
+1. ~~**汇总方（待裁定项）**：是否将 `rust-mcp-sdk` 提升为根 `[workspace.dependencies]`~~ → **已完成（2026-10-29）**：根 `Cargo.toml` 已新增 `rust-mcp-sdk = { version = "1.0.1", default-features = false }`，harness 与本 crate 均改为 `rust-mcp-sdk = { workspace = true, ... }`，版本不再需要人工对齐。
 2. **汇总方（信息共享 / 待裁定项）**：Java `McpClientWrapper` 无 Rust 等价基类，本模块以 `McpClientManager` + server 名委托实现；若其它 C 波次模块（CONTROLPLANE/STUDIO 等）也需 MCP 客户端包装，建议统一抽象后再收敛。
 3. 真实端到端联调（连真实 Higress 网关）需 `McpClientManager` 建立连接；本 crate 已把 `HigressClientConfig` 转换成 `McpServerConfig`。**【2026-10-28 已修复】**`build(&self, manager)` 现在会调用 `wrapper.initialize()`，经 `HigressMcpTransport::connect_server` 真实创建并 connect 底层 client（`transport_type`/`timeout`/`initialization_timeout` 全部投影进 `McpConnectRequest`），失败向上返回且 `initialized` 保持 false；对应测试 `initialize_connects_and_records_full_config`（断言 manager 里能查到 client id、transport/timeout 全量透传）、`initialize_propagates_connection_failure`、`initialize_applies_initialization_timeout`、`initialize_is_idempotent_and_only_connects_once`。原「`build()` 不建连」的 P0-1 已关闭。
 4. **【2026-10-28 已完成】** 已引入 `trait HigressMcpTransport`（`list_tools` / `call_tool_by_server(…, meta)` 等），由 `McpClientManager` 实现；`HigressMcpClientWrapper::with_transport` 允许注入替身，P1-4 与 `HigressToolkit` 测试因此可离线覆盖（见 §6.3 / §8）。
-5. **保留中的真实剩余（2026-10-29 复核，均为 P2）**：① `build_input_schema` 丢 `$schema`/`additionalProperties`（P2-2）；② wrapper 级 `propagate_meta` 缺失（P2-4，仅工具级已有）；③ `Display` 带引号，与 Java `List.toString()` 微差（P2-5）；④ `HigressToolkit` 非 core `Toolkit` 子类（P2-6，需 `.into_toolkit()`）；⑤ `endpoint_with_query` 不做 URL decode/encode 与同名键合并（P2-7）；⑥ `transport_type` 未透传，harness 靠 URL 嗅探 `/sse`（P2-8）；⑦ 真实 Higress 网关联调未做（仅离线假传输）。另：`rust-mcp-sdk` 是否上提根 workspace 依赖、MCP 客户端包装抽象是否跨 C 波次统一，均为上述第 1/2 条的**待裁定项**。
+5. **保留中的真实剩余（2026-10-29 复核，均为 P2）**：① `build_input_schema` 丢 `$schema`/`additionalProperties`（P2-2）；② wrapper 级 `propagate_meta` 缺失（P2-4，仅工具级已有）；③ `Display` 带引号，与 Java `List.toString()` 微差（P2-5）；④ `HigressToolkit` 非 core `Toolkit` 子类（P2-6，需 `.into_toolkit()`）；⑤ `endpoint_with_query` 不做 URL decode/encode 与同名键合并（P2-7）；⑥ `transport_type` 未透传，harness 靠 URL 嗅探 `/sse`（P2-8）；⑦ 真实 Higress 网关联调未做（仅离线假传输）。另：`rust-mcp-sdk` 已上提 workspace（见第 1 条）；MCP 客户端包装抽象是否跨 C 波次统一仍为第 2 条的**待裁定项**。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-higress` 基线。

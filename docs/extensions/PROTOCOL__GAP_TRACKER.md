@@ -424,3 +424,15 @@ cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client
 | `bytes` 未用依赖清理 | P2 | 需汇总方确认是否影响其它 crate（本批未动 `Cargo.toml` 的既有依赖项，只新增 `futures`/`tracing`） |
 
 > **注意**：本次执行期间 `crates/agentscope-extensions-model` 被另一会话并发编辑，曾导致依赖链暂时无法编译（`DEFAULT_CONVERSATION_HISTORY_PROMPT` / `dashscope` 非穷尽 match）；本批未修改该 crate，等待其稳定后重跑，最终 6 crate 全绿。
+
+## 2026-10-29 执行记录（§1.1 跳模块项 ④）
+
+| 项 | 变更 | 验证 |
+|---|---|---|
+| `AgentCard` 补 `documentationUrl` | `agentscope-extensions-a2a-client/src/model.rs` 新增 `documentation_url: Option<String>`（serde `documentationUrl`，未设置时不输出 `null`）；`AgentCard::new` 默认 `None` | 新用例 `model::tests::agent_card_serializes_documentation_url`；a2a-client **40 passed** |
+| `TransportProperties` 下沉 | 新增 `a2a-client/src/transport_properties.rs`（`TransportProperties` + Builder + `effective_port` / `normalized_path` / `to_url` / `to_agent_interface`）；`a2a-server/src/card.rs` 删除本地实现改为 `pub use`，公共路径 `a2a::card::TransportProperties` 不变；随迁移一并删除已无用的 `card_converter::{HTTPS,HTTP}` 常量 | a2a-client 40 / a2a-server 47 / nacos 70 全绿 |
+| card 转换接线 | `create_agent_card` 现在把 `ConfigurableAgentCard.documentation_url` 传入 wire card（此前丢弃） | 同上 |
+
+**反向验证**：去掉 `documentationUrl` 的 serde rename → `agent_card_serializes_documentation_url` FAILED（39 passed / 1 failed）；恢复后 40 passed。
+
+**遗留说明**：NACOS 仍保留自己的必填版 `a2a::registry::TransportProperties`（`host: String` / `port: i32`），因其来自 `AgentRegistry::register` 的必填语义，与共享版的 `Option` 形态不同（见 `NACOS__GAP_TRACKER.md` §4.2-6）。

@@ -26,7 +26,7 @@ regex = "1"
 globset = "0.4"
 ignore.workspace = true
 rusqlite = { workspace = true, optional = true }
-rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["client", "stdio", "macros"] }
+rust-mcp-sdk = { workspace = true, features = ["client", "stdio", "macros"] }
 # Client-side SSE/Streamable-HTTP transports. Pulled directly (not via the sdk's
 # `sse`/`streamable-http` features) because those features also compile a broken
 # server-side `mcp_http` module in rust-mcp-sdk 1.0.1.

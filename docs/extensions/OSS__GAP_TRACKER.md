@@ -77,7 +77,7 @@
   - `crates/agentscope-extensions-oss/Cargo.toml`（feature 已改为 `s3`，见 §7）
   - `src/lib.rs`、`src/error.rs`、`src/client.rs`、`src/state_store.rs`、`src/base_store.rs`、`src/snapshot.rs`、`src/guard.rs`、`src/distributed_store.rs`、`src/s3.rs`（feature `s3`）
   - `tests/common/mod.rs`、`tests/agent_state_store.rs`、`tests/base_store.rs`、`tests/snapshot.rs`、`tests/guard_and_distributed.rs`、`tests/s3.rs`（feature `s3`）、**`tests/pagination.rs`（§8-2 新增）**
-- **已知问题**（历史快照，§6 静态复核新增；P1 已在 §8 关闭；P1-4 已于 2026-10-28 关闭）：**2026-10-29 复核后的真实剩余（未关闭）**：①无阿里云原生 SDK 路径（走 S3 兼容端点替代）；②MSRV 冲突（`rust-s3` 0.38 需 ≥1.85 vs workspace `rust-version = 1.80.0`）；③冗余依赖（`futures`/`chrono`/`serde`）；④死错误变体（`SnapshotNotFound`/`Backend` 零构造）；⑤`delete` 未批量（P2-5）；⑥死代码与 `allow(dead_code)`（P2-6/P2-8）；⑦`get`/`put`/`delete` 仍静默降级（§8.1-3「未做」）；⑧缺 `OssSnapshotSpec` 便捷构造器（P2-2）。以下为旧记录：
+- **MSRV（2026-10-29 裁定）**：`rust-s3 0.38.0` 声明 `edition = "2024"`（需 rustc ≥ 1.85），故本 crate 保留本地 `rust-version = "1.85"`（`Cargo.toml` 已注明原因），**不提升 workspace 的 `rust-version = "1.80.0"`**；已在 rustc 1.96.1 上验证通过。
   - ~~实机 OSS 后端未接线（P0-1）~~ → 已由裁定 8（`s3` + `S3OssClient`，§7）替代实现；`lib.rs` 文档已于 §8-4 更正。
   - ~~缺 per-key `delete`（P1-1）~~ → §8-1 已实现 `OssAgentStateStore::delete_key`。
   - ~~`list_page` 分页/续传分支零覆盖、无分页构造器（P1-2）~~ → §8-2 已补构造器 + 13 用例。
@@ -315,7 +315,7 @@
 - **未校验 SigV4 签名**：`httpmock` 接受任意 `Authorization` 头，签名正确性依赖 `rust-s3` 自身；也未验证 `session_token` 是否实际出现在 `x-amz-security-token`（仅验证配置可传入）。
 - **未覆盖虚拟主机风格**：端到端仅走「自定义 endpoint + path-style」；默认 AWS 无 endpoint 的 subdomain-style 路径未做 HTTP 级测试。
 - **环境变量回退未直接测试**：测试使用 `env_credentials(false)` 保证确定性，避免并行测试修改全局环境变量；回退逻辑仅代码审阅覆盖。
-- **MSRV**：`rust-s3 0.38.0` 声明 `edition = "2024"`（需 rustc ≥ 1.85），而 workspace `rust-version = "1.80.0"`；本轮在 rustc 1.96.1 上验证通过，若需严格 1.80 MSRV 需汇总方另行裁定依赖版本。
+- **MSRV（2026-10-29 裁定）**：`rust-s3 0.38.0` 声明 `edition = "2024"`（需 rustc ≥ 1.85），故本 crate 保留本地 `rust-version = "1.85"`（`Cargo.toml` 已注明原因），**不提升 workspace 的 `rust-version = "1.80.0"`**；已在 rustc 1.96.1 上验证通过。
 - **网关差异**：部分 S3 兼容网关对缺失对象 DELETE 返回 404、对 HEAD 返回 403 等行为可能不同；当前按「404/NoSuchKey = 不存在」处理，未在真实网关矩阵中验证。
 
 ## 8. P1 关闭记录（2026-10-26）

@@ -489,6 +489,9 @@ pub struct AgentCard {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// A URL to the documentation for this agent (A2A spec `documentationUrl`).
+    #[serde(rename = "documentationUrl", skip_serializing_if = "Option::is_none")]
+    pub documentation_url: Option<String>,
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -531,6 +534,7 @@ impl AgentCard {
         Self {
             name: name.into(),
             description: None,
+            documentation_url: None,
             url: url.into(),
             version: None,
             protocol_version: None,
@@ -766,6 +770,22 @@ mod tests {
         assert_eq!(json["defaultInputModes"][0], "text/plain");
         let back: AgentCard = serde_json::from_value(json).unwrap();
         assert_eq!(back, card);
+    }
+
+    #[test]
+    fn agent_card_serializes_documentation_url() {
+        let mut card = AgentCard::new("test-agent", "http://localhost:8080");
+        card.documentation_url = Some("https://docs.example/agent".into());
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(json["documentationUrl"], "https://docs.example/agent");
+        let back: AgentCard = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.documentation_url.as_deref(),
+            Some("https://docs.example/agent")
+        );
+        // Absent when unset (never serialized as `null`).
+        let plain = serde_json::to_value(AgentCard::new("x", "http://y")).unwrap();
+        assert!(plain.get("documentationUrl").is_none());
     }
 
     #[test]

@@ -16,8 +16,6 @@ pub mod card_converter {
     pub const DEFAULT_TRANSPORT: &str = "JSONRPC";
     /// Default input/output mode when none is configured.
     pub const DEFAULT_MODE: &str = "text";
-    pub(crate) const HTTPS: &str = "https";
-    pub(crate) const HTTP: &str = "http";
 }
 
 /// Agent card attributes that an operator may override.
@@ -152,132 +150,11 @@ impl ConfigurableAgentCardBuilder {
     }
 }
 
-/// Transport endpoint properties used to synthesize [`AgentInterface`] entries.
-///
-/// Mirrors Java `io.agentscope.core.a2a.server.transport.TransportProperties`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransportProperties {
-    pub transport_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub support_tls: bool,
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-impl TransportProperties {
-    /// Returns the Java-style fluent builder for `transport_type`.
-    pub fn builder(transport_type: impl Into<String>) -> TransportPropertiesBuilder {
-        TransportPropertiesBuilder::new(transport_type)
-    }
-
-    /// The effective port: the configured one, else the scheme default (443/80).
-    pub fn effective_port(&self) -> u16 {
-        self.port.unwrap_or(if self.support_tls { 443 } else { 80 })
-    }
-
-    /// The path with a leading `/` when non-empty, mirroring Java `getPath`.
-    pub fn normalized_path(&self) -> String {
-        let path = self.path.as_deref().unwrap_or("");
-        if path.is_empty() {
-            String::new()
-        } else if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        }
-    }
-
-    /// Renders `%s://%s:%d%s`, mirroring Java `AgentScopeAgentCardConverter#createAdditionalInterface`.
-    pub fn to_url(&self) -> String {
-        let scheme = if self.support_tls {
-            card_converter::HTTPS
-        } else {
-            card_converter::HTTP
-        };
-        format!(
-            "{}://{}:{}{}",
-            scheme,
-            self.host.as_deref().unwrap_or_default(),
-            self.effective_port(),
-            self.normalized_path()
-        )
-    }
-
-    /// Converts this transport into an [`AgentInterface`].
-    pub fn to_agent_interface(&self) -> AgentInterface {
-        AgentInterface {
-            transport: self.transport_type.clone(),
-            url: self.to_url(),
-        }
-    }
-}
-
-/// Builder for [`TransportProperties`].
-#[derive(Debug, Clone)]
-pub struct TransportPropertiesBuilder {
-    transport_type: String,
-    host: Option<String>,
-    port: Option<u16>,
-    path: Option<String>,
-    support_tls: bool,
-    extra: serde_json::Map<String, serde_json::Value>,
-}
-
-impl TransportPropertiesBuilder {
-    fn new(transport_type: impl Into<String>) -> Self {
-        Self {
-            transport_type: transport_type.into(),
-            host: None,
-            port: None,
-            path: None,
-            support_tls: false,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    pub fn host(mut self, host: impl Into<String>) -> Self {
-        self.host = Some(host.into());
-        self
-    }
-
-    pub fn port(mut self, port: u16) -> Self {
-        self.port = Some(port);
-        self
-    }
-
-    pub fn path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    pub fn support_tls(mut self, support_tls: bool) -> Self {
-        self.support_tls = support_tls;
-        self
-    }
-
-    pub fn extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.extra.insert(key.into(), value);
-        self
-    }
-
-    pub fn build(self) -> TransportProperties {
-        TransportProperties {
-            transport_type: self.transport_type,
-            host: self.host,
-            port: self.port,
-            path: self.path,
-            support_tls: self.support_tls,
-            extra: self.extra,
-        }
-    }
-}
+/// Transport endpoint properties, re-exported from the client crate (2026-10-29)
+/// so both server and client share one definition.
+pub use agentscope_extensions_a2a_client::transport_properties::{
+    TransportProperties, TransportPropertiesBuilder,
+};
 
 /// Identity of the agent being exposed, used for card defaults.
 ///
@@ -326,6 +203,7 @@ pub fn create_agent_card(
                 .clone()
                 .unwrap_or_else(|| descriptor.agent_description()),
         ),
+        documentation_url: config.documentation_url.clone(),
         url: preferred
             .as_ref()
             .map(|i| i.url.clone())

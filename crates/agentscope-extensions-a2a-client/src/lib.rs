@@ -8,14 +8,17 @@
 //!   and A2A messages/artifacts/parts.
 //! * [`client`] - JSON-RPC client for calling remote A2A agents.
 //! * [`error`] - A2A-specific [`A2aError`] / [`A2aResult`].
+//! * [`transport_properties`] - transport endpoint properties shared with the server crate.
 
 pub mod card;
 pub mod client;
 pub mod error;
 pub mod message;
 pub mod model;
+pub mod transport_properties;
 
 pub use card::{AgentCardResolver, FixedAgentCardResolver, WellKnownAgentCardResolver};
 pub use error::{A2aError, A2aResult};
 pub use message::{MessageConstants, MessageConvert};
 pub use model::*;
+pub use transport_properties::{TransportProperties, TransportPropertiesBuilder};

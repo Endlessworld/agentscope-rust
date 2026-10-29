@@ -62,8 +62,8 @@ impl NacosAgentCardConverter {
                     card.supports_authenticated_extended_card.unwrap_or(false),
                 ),
                 signatures: None,
+                documentation_url: card.documentation_url.clone(),
             },
-            documentation_url: card.documentation_url.clone(),
         }
     }
 

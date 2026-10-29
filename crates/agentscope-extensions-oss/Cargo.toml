@@ -3,6 +3,8 @@ name = "agentscope-extensions-oss"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# `rust-s3 0.38`（feature `s3`）要求 edition 2024 / Rust >= 1.85，故本 crate 保留本地
+# `rust-version` 覆盖（不继承 workspace 的 1.80）；裁定见 EXTENSIONS_GAP_TRACKER §1.1。
 rust-version = "1.85"
 
 [features]

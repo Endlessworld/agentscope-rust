@@ -130,16 +130,16 @@
   - `cargo build -p agentscope-extensions-nacos` → **exit 0**（本 crate 0 warning）。
   - `cargo test -p agentscope-extensions-nacos` → **70 passed; 0 failed; 0 ignored**（43 → +27，含 10 条反向验证用例）。
   - `cargo clippy -p agentscope-extensions-nacos --all-targets` → 仅 2 条**历史** warning（`service.rs:183` type_complexity、`registry/mod.rs:742` bool_assert_comparison，均非本轮新增）。
-- **已知问题**：无编译/测试阻塞。**2026-10-29 复核**：protocol crate A2A 模型统一已完成（§7-6）；**真实剩余**：①真实 `NacosAiService`（`reqwest`）未实现（仅 trait + `InMemoryNacosAiService`，归属待裁定，§4.2-3）；②protocol `AgentCard` 缺 `documentationUrl`（§4.2-5）；③`TransportProperties` 未复用（在 `a2a-server`，需下沉 `a2a-client`，§4.2-6）；④`getAllSkillNames`/`getRepositoryInfo` 无对应（harness `SkillRepository` 缺方法，S-3）；⑤`zip = 0.6` 未登记 workspace（§4.2-2）；⑥`SkillRepository::load` 同步 trait 内 `block_on`（§4.2-4）；⑦`AgentCardResolver` 无 TTL（§3.3）。
+- **已知问题**：无编译/测试阻塞。**2026-10-29 复核**：protocol crate A2A 模型统一已完成（§7-6）；**`documentationUrl`、`TransportProperties`、`zip` 三项跨模块请求均已关闭**（§4.2-5 / §4.2-6 / §4.2-2）。**真实剩余**：①真实 `NacosAiService`（`reqwest`）未实现（仅 trait + `InMemoryNacosAiService`，归属待裁定，§4.2-3）；②`getAllSkillNames`/`getRepositoryInfo` 无对应（harness `SkillRepository` 缺方法，S-3）；③`SkillRepository::load` 同步 trait 内 `block_on`（§4.2-4）；④`AgentCardResolver` 无 TTL（§3.3）。
 
 ### 4.2 下一步与阻塞（跨模块需求）
 
 1. ~~**【跨模块依赖】protocol crate 的 `a2a` 子模块不可编译**~~ → **已勘误并关闭（见 §6.4-1）**：protocol 的 A2A 模型可编译，本 crate 已于 2026-10-28 复用（`agentscope-extensions-a2a-client` 为新增 path 依赖）。仅 `AgentRegistry` 仍是本 crate 本地 trait。
-2. **【汇总方/根依赖】`zip = 0.6` 现为 crate 内独立版本声明**（`base64` 复用 workspace）。若需统一版本，请汇总方登记根 `[workspace.dependencies]`。
+2. ~~**【汇总方/根依赖】`zip = 0.6` 现为 crate 内独立版本声明**~~ → **已完成（2026-10-29）**：`zip = "0.6"` 已登记根 `[workspace.dependencies]`（`default-features = false, features = ["deflate"]`），本 crate 改为 `zip = { workspace = true }`。
 3. **【跨模块】真实 Nacos AI 客户端实现未提供**：`NacosAiService` 仅给出 trait + 内存实现；真实 HTTP 实现是否另立 crate / 归入 protocol 侧，待汇总方裁定。
 4. **【可选】nacos-skill 的 `load()` 为同步 trait 方法**：内部用 `block_on` 驱动 async 下载。若 harness 未来为 `SkillRepository` 增加 async 变体，应切换以避免 `block_in_place` 限制。
-5. **【跨模块】protocol `AgentCard` 缺 `documentation_url`**：`agentscope_extensions_a2a_client::model::AgentCard` 无 `documentationUrl`（Java `AgentCardConverterUtil` 双向映射该字段）。为不丢数据，本 crate 的 `A2aAgentCard` 保留为“`#[serde(flatten)] inner: AgentCard` + `documentation_url`”的薄包装（`Deref` 转发字段）。**若 PROTOCOL 侧补上该字段，本 crate 可把 `A2aAgentCard` 退化为 `pub type A2aAgentCard = AgentCard`**。请汇总方裁定。
-6. **【跨模块】`TransportProperties` 未复用**：protocol 侧同名类型位于 `agentscope-extensions-a2a-server::card::TransportProperties`，该 crate 依赖 `axum`，且 `host`/`port` 为 `Option` + 带 `extra`。本 crate 仅为 `AgentRegistry::register` 入参，保留 4 字段最小结构（`a2a/registry/mod.rs` 已注释）。若汇总方希望统一，可先将该类型下沉到 `a2a-client`。
+5. ~~**【跨模块】protocol `AgentCard` 缺 `documentation_url`**~~ → **已完成（2026-10-29）**：`agentscope_extensions_a2a_client::model::AgentCard` 已新增 `documentation_url`（serde `documentationUrl`，往返用例 `agent_card_serializes_documentation_url`）；本 crate 的 `A2aAgentCard` 已删除本地字段，仅保留 `#[serde(flatten)] inner: AgentCard` 包装（`Deref`/`DerefMut` 转发字段），未改用 `pub type`（保留 `new`/getter 便利方法）。
+6. ~~**【跨模块】`TransportProperties` 未复用**~~ → **已完成（2026-10-29）**：该类型已从 `agentscope-extensions-a2a-server::card` 下沉到 `agentscope-extensions-a2a-client::transport_properties`（server 侧改为 re-export，公共路径 `a2a::card::TransportProperties` 不变）。本 crate **仍保留自己的必填版** `a2a::registry::TransportProperties`（`host: String` / `port: i32`），因其来自 `AgentRegistry::register` 的必填语义，与共享版 `Option` 形态不同，不属重复实现。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-nacos` 基线。

@@ -67,7 +67,9 @@
 | 20 | HIGRESS | **已完成**（P1 清零，余 P2）（`initialize()` 真建连、`call_tool_with_meta`、`outputSchema`、`registration()` 已闭环） | 0 / ~7（+2 待裁定） | 57 + 1 doc |
 | 21 | JUDGE | 进行中（**P0 已清零**：`JevClient` / `OpenAIDecisionsClient`；jev 42 类 = 完整 32 / 部分 8 / 骨架 2） | 4 / ~4 | 286 |
 
-**跨模块仍待裁定（非模块内可解）**：① COS / core 的 `needs_full_rewrite` Case 3 语义；② core `AgentStateStore` 无 per-key `delete` / `close`，trait 返回 `()` 导致失败被吞；③ harness 无级联删快照的生产写入方；④ protocol `AgentCard` 缺 `documentationUrl`、`TransportProperties` 需从 `a2a-server` 下沉 `a2a-client`；⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍；⑥ 依赖归属（`object_store` 全 workspace 零引用、`rust-mcp-sdk` 是否上提、OSS `rust-s3` MSRV 1.85 vs workspace 1.80、NACOS `zip` 未登记）。
+**跨模块仍待裁定（非模块内可解）**：① COS / core 的 `needs_full_rewrite` Case 3 语义（**已裁定：对齐 Java，不改**，见 §4.14）；② core `AgentStateStore` 无 per-key `delete` / `close`，trait 返回 `()` 导致失败被吞（**待裁定，方案见 §4.14**）；③ harness 无级联删快照的生产写入方（**待实施，方案见 §4.14**）；⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍。
+
+**已关闭（2026-10-29）**：~~④ protocol `AgentCard` 缺 `documentationUrl`、`TransportProperties` 需从 `a2a-server` 下沉 `a2a-client`~~ → 已完成（见 §4.14）；~~⑥ 依赖归属（`object_store` 零引用、`rust-mcp-sdk` 是否上提、OSS `rust-s3` MSRV、NACOS `zip` 未登记）~~ → 已全部处理（见 §4.14）。
 
 ## 2. 跨模块依赖与汇总方待办
 
@@ -745,3 +747,105 @@
 - 各 tracker 内**带日期的历史执行记录章节**（§6/§7/§8/§9 等）只在必要处追加「已闭环 / 已对照」指针，不改写历史事实。
 - 各 tracker 的**真实剩余缺口**原样保留（清单见 §1.1 与各 §4.2），未借本次勘误顺手降级。
 - 测试数未重新执行，沿用 2026-10-28 / 10-29 主会话复跑值；静态属性计数与实测不一致时，两套数字并存并注明口径。
+
+## 4.14 2026-10-29 ACP 进程内存：worker 线程数、每轮回收、`[mem]` 诊断
+
+> 背景：真实实例 `acp_harness_agent` 稳态 **480 MB WS / 950 MB 私有**（32 逻辑核，57 线程）。同机实测：新起进程空载 42 MB、AionUi 全部会话库 30.5 MB、当日 ACP 报文合计 3.3 MB（单条 ≤65 KB）、journal 目录当日零写入。⇒ 内存不在"活数据"，在**分配器留存 + 线程数**：`libmimalloc-sys 0.1.49` 编译的是 mimalloc **v3**（`purge_delay` 默认 1000 ms），而 Windows 堆对大块是释放即 `VirtualFree`。
+
+| 文件 | 改动 |
+|---|---|
+| `src/mem.rs`（新增） | `worker_threads()` / `runtime()` / `usage()` / `collect()` / `report_turn()`；FFI 走 `libmimalloc-sys` 的 `extended`（`mi_process_info`、`mi_collect`），未硬编码 option 索引 |
+| `acp_harness_agent.rs` / `acp_agent_cli.rs` | `#[tokio::main]` → `mem::runtime().block_on(run())`，worker 线程数可配（默认 `min(ncpu, 8)`） |
+| `session.rs` | `run_prompt` / `run_prompt_cancellable` 结束后调 `report_turn_memory`（报告 / 回收），覆盖所有 return 分支 |
+| `Cargo.toml` | 保留 `mimalloc = "0.1"`，新增 `libmimalloc-sys = { version = "0.1", features = ["extended"] }`（新增传递依赖 `cty 0.2`） |
+
+环境变量（不设置时对非 ACP 宿主无行为变化）：
+
+- `AGENTSCOPE_ACP_WORKER_THREADS`（默认 `min(ncpu, 8)`；旧行为 = `ncpu` = 本机 32）
+- `AGENTSCOPE_ACP_MEM_REPORT=1` → 每轮一行 `[mem] turn stop=… messages=… state=…MB | rss A->BMB commit C->DMB peak_rss …`（自带一次 collect）；走 `tracing::info!`，落 `<cwd>/.agentscope/log/acp-agent.log`（或 `AGENTSCOPE_LOG_DIR`），默认 filter `info,...` 即会记录
+- `AGENTSCOPE_ACP_MEM_COLLECT`（**默认开**，`=0` 关闭）→ 每轮 `mi_collect(true)`，不打印
+
+实测 A/B（`.agentscope/workspace/memprobe`，release，每线程循环 2 MiB alloc/touch/free，peak WS / 稳态 WS，MB）：
+
+| 线程 | System | mimalloc 默认 | mimalloc + 每轮 `mi_collect(true)` |
+|---|---|---|---|
+| 8 | 4.6 / 4.0 | 21.8 / 5.5 | 9.8 / 6.0 |
+| 16 | 8.6 / 4.2 | 32.0 / — | 8.3 / 6.3 |
+| 32 | 4.6 / 4.6 | **54.4 / 34.2** | **10.5 / 6.5** |
+
+运行时验证：release 二进制空载 **37 → 13 线程**、42.1 → **33.2 MB WS**；`AGENTSCOPE_ACP_WORKER_THREADS=4` → 9 线程。`cargo test -p agentscope-extensions-acp`：lib 68 passed / 集成 12 passed / 0 failed（新增 3 条 `mem` 单测：FFI 足迹、collect 幂等、`[mem]` 行格式）。
+
+未验证（需真实对话）：`[mem]` 行只在真实 prompt 轮结束时发出（`tracing::info!`，落 `acp-agent.log`），需先部署 `target/release/acp_harness_agent.exe`。
+
+---
+
+## 4.14 2026-10-29 执行记录（§1.1 六项跨模块事项）
+
+> 本轮开始动 §1.1 末尾列的 6 项。**已完成 2 项（④ ⑥）、裁定 1 项（①）、待实施 2 项（② ③）、待裁定 1 项（⑤）**。验证均为实跑 `cargo check/test`。
+
+### 4.14.1 ④ PROTOCOL（已完成）
+
+| 项 | 变更 | 验证 |
+|---|---|---|
+| `AgentCard` 补 `documentationUrl` | `a2a-client/src/model.rs` 新增 `documentation_url: Option<String>`（serde `documentationUrl`；未设置时不输出 `null`），`AgentCard::new` 默认 `None` | 新用例 `model::tests::agent_card_serializes_documentation_url`；a2a-client **40 passed** |
+| `TransportProperties` 下沉 | 新增 `a2a-client/src/transport_properties.rs`（`TransportProperties` + Builder + `effective_port`/`normalized_path`/`to_url`/`to_agent_interface`）；`a2a-server/src/card.rs` 删本地实现改 `pub use`（公共路径 `a2a::card::TransportProperties` 不变），并删除已无用的 `card_converter::{HTTPS,HTTP}` | a2a-client 40 / a2a-server 47 / nacos 70 全绿 |
+| 转换接线 | `create_agent_card` 现在把 `ConfigurableAgentCard.documentation_url` 传入 wire card（此前丢弃） | 同上 |
+| NACOS 竖包装收敛 | `A2aAgentCard` 删除本地 `documentation_url` 字段，只保留 `#[serde(flatten)] inner: AgentCard`；`Deref/DerefMut` 使 `card.documentation_url` 调用点无需改 | nacos 70 passed（含 `a2a_card_serializes_documentation_url_flat`） |
+
+**反向验证**：去掉 `documentationUrl` 的 serde rename → `agent_card_serializes_documentation_url` FAILED（39/1）；恢复后 40 passed。
+
+### 4.14.2 ⑥ 依赖归属（已完成）
+
+| 项 | 结论 |
+|---|---|
+| `object_store = "0.14"` | **从根 `[workspace.dependencies]` 删除**（全 workspace 零引用；COS 的 `crate::object_store` 是本 crate 内部模块，同名非同一物） |
+| `rust-mcp-sdk` | **已上提**：根新增 `rust-mcp-sdk = { version = "1.0.1", default-features = false }`；harness 改 `{ workspace = true, features = ["client","stdio","macros"] }`，higress 改 `{ workspace = true }` |
+| `zip` | **已登记**：根新增 `zip = { version = "0.6", default-features = false, features = ["deflate"] }`；NACOS 改 `{ workspace = true }` |
+| OSS MSRV | **裁定**：保留 OSS crate 本地 `rust-version = "1.85"`（`rust-s3 0.38` 需 ≥ 1.85），**不提升 workspace 的 1.80**；已在 `Cargo.toml` 注明原因 |
+
+验证：`cargo check -p agentscope-harness -p agentscope-extensions-higress -p agentscope-extensions-nacos --all-targets` → EXIT=0；`cargo test -p agentscope-extensions-higress -p agentscope-extensions-nacos` → 57 / 70 + 1 doc 全绿。⚠️ `Cargo.lock` 工作区存在**其他会话**的并发改动（新增 `cty 0.2.2`，来自 acp），与本轮依赖变更无关。
+
+### 4.14.3 ① `needs_full_rewrite` Case 3（裁定：不改）
+
+**结论：保持现状，与 Java 行为等价，不引入偏离。** 依据：
+
+1. core `list_hash.rs:68-70` 用 `current_values[..existing_count]` 的前缀哈希与 `stored_hash` 比，而 store 侧存的是**整表** `compute_hash(values)`；两者长度不同，所以连续第二次纯追加仍判全量重写。
+2. Java `ListHashUtil` 同构；改正确需同时改**存储格式**（需存 `(hash, count)` 或前缀哈希），偏离 Java 且涉存量数据迁移。
+3. 影响仅为**性能**（多一次全量重写），数据无损，且首次写入自愈。
+
+⇒ 分类从「待裁定」改为「**已裁定：对齐 Java，不改**」；若未来立项需配「恢复后 `to_json()` 字节相等」黄金测试。
+
+### 4.14.4 ③ harness 级联删快照（待实施，方案已定）
+
+**根因（比 tracker 原描述更深）**：不止「没有写入方」，**状态结构也对不上**：
+
+- MONGODB `distributed_store.rs::find_session_snapshot_id` 读 `AgentStateStore` 的 session `sandbox/session/<sid>`、key `_sandbox_state`、value `{"json": "..."}`，并从 JSON 的 `snapshot.type == "remote"` / `snapshot.id` 取快照 id；
+- 而 harness `SandboxState::Remote(RemoteSandboxState)`（`sandbox/state.rs:116`）**没有 `snapshot` 字段**，`SandboxStateStore` 也只有 `InMemorySandboxStateStore`。
+
+**实施步骤（待确认后开工）**：
+1. harness `RemoteSandboxState` 增 `snapshot: Option<RemoteSnapshotRef { id }>`（serde 为 `{"type":"remote","id":...}`），保持旧数据反序列化兼容（`#[serde(default)]`）；
+2. 新增 `AgentStateStoreSandboxStateStore`（`impl SandboxStateStore`，桥接 core `AgentStateStore`，session key `sandbox/session/<isolation_key>`、key `_sandbox_state`、value `{"json": ...}`）——与 MONGODB/POSTGRESQL/JDBC 现有读取契约逐字对齐；
+3. 在 `HarnessAgent` 装配处（有 `agent_state_store` 时）默认注入该实现，保留可选覆盖；
+4. 回归：MONGODB `cascade` 用例改用真实写入（不再手工 `seed_session_snapshot`），并加「远程快照状态往返 + 级联删除实际触发」用例。
+
+预估风险：中（碰 harness 序列化格式 + agent 装配）；建议单智能体独占 harness 改动。
+
+### 4.14.5 ② core `AgentStateStore` 缺 per-key delete / 错误通道（待裁定，方案已定）
+
+**方案（低破坏）**：不改现有方法签名，新增**默认实现**的显式变体：
+
+```rust
+async fn try_save(&self, ..) -> agentscope_core::error::Result<()> { self.save(..).await; Ok(()) }
+async fn delete_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<()> { Err(unsupported) }
+async fn close(&self) -> Result<()> { Ok(()) }
+```
+
+- `delete_key` 默认返回 `Unsupported`（不假装成功），由各存储 crate 逐家覆盖；COS 的 per-key 删除、OSS 的 `delete_key`、会话级联清理均可复用。
+- `try_*` 默认委托旧方法 → 7 个存储 crate **零改动即可编译**，之后按需逐家覆盖并补错误传播用例。
+- 代价：两条并行 API（旧 `save`/`()` 与 `try_save`），需在 trait 文档里明确「新代码用 try_*」。
+
+**需你确认**：是否接受「新增 try_*/delete_key + 旧方法保留」的兼容路线（而非一次性改签名）。
+
+### 4.14.6 ⑤ MODEL 双实现取舍（仍待裁定）
+
+`anthropic` vs `anthropic_async`、`responses` vs `openai_official` 均为**平行实现**，涉及语义取舍（wire DTO 自建 vs SDK），无代码阻塞，仍建议单独决策；本轮未动。

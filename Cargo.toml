@@ -68,12 +68,16 @@ axum = { version = "0.7", default-features = false, features = ["json", "tokio",
 http = "1"
 bytes = "1"
 
+# MCP 客户端 SDK：harness 与 higress 共用，版本必须一致，故上提 workspace（2026-10-29）。
+rust-mcp-sdk = { version = "1.0.1", default-features = false }
+# skill 包 zip（NACOS 的 skill 资源上传/下载）。
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
 # 真实后端驱动（存储/技能模块 P1；由各 crate 以可选依赖 + feature 引入，默认仍走内存实现）。
 sqlx = "0.9"
 mysql_async = "0.37"
 tokio-postgres = "0.7"
 mongodb = "3"
-object_store = "0.14"
 redis = { version = "1.7", default-features = false, features = ["script", "tokio-comp", "connection-manager"] }
 
 [profile.release]
