@@ -18,7 +18,7 @@
 | Java 规模（实测行数） | 主代码 8832 / 测试 4554（见下表；2026-10-22 静态复核实测，见 §6） |
 | Rust crate | `crates/agentscope-extensions-sandbox` |
 | 迁移波次 | A |
-| 当前状态 | **总判：进行中**（仍有 P1：PortForward / watch / fs_spec projection 等）—— **已完成**（build 通过；**176 passed / 0 failed**（2026-10-28）；`fs_spec`、`kubernetes_files`、K8s 文件 API 与 E2B 原生传输**均已接线**，见 §3.2/§7） |
+| 当前状态 | **总判：进行中**（仍有 P1：PortForward / watch / fs_spec projection 等）—— **已完成**（build 通过；**177 passed / 0 failed**（2026-10-29）；`fs_spec`、`kubernetes_files`、K8s 文件 API 与 E2B 原生传输**均已接线**，见 §3.2/§7） |
 
 | Java 子模块 | 主代码 文件/行 | 测试 文件/行 | 顶层类型数 |
 |---|---|---|---|
@@ -221,7 +221,7 @@
 - **2026-10-28 实测**：`cargo build -p agentscope-extensions-sandbox` → 通过（0 error / 0 warning）；`cargo test -p agentscope-extensions-sandbox` → **176 passed / 0 failed / 0 ignored**（151 → +25，详见 §7）。`cargo fmt -p agentscope-extensions-sandbox -- --check` → 通过。
 
 ### 4.2 下一步与阻塞
-1. **harness 抽象缺口（不改 harness，仅记录）**：harness `agent::sandbox` 的 `state` 模块为私有（`mod state;`），`RemoteSandboxState` **未在 `sandbox/mod.rs` re-export**（`pub use state::{InMemorySandboxStateStore, LocalSandboxState, SandboxState, SandboxStateStore};` 不含 `RemoteSandboxState`）。本 crate 因此无法命名 `RemoteSandboxState`，只能经 `serde_json` 与 `SandboxState::Remote` 变体互转（见 `remote.rs` 内注释）。**建议汇总方考虑 re-export `RemoteSandboxState`**；在裁定前本 crate 用现有公开面绕过，**未修改 harness**。
+1. **harness 抽象缺口（不改 harness，仅记录）**：harness `agent::sandbox` 的 `state` 模块为私有（`mod state;`），`RemoteSandboxState` **未在 `sandbox/mod.rs` re-export**（`pub use state::{InMemorySandboxStateStore, LocalSandboxState, SandboxState, SandboxStateStore};` 不含 `RemoteSandboxState`）。本 crate 因此无法命名 `RemoteSandboxState`，只能经 `serde_json` 与 `SandboxState::Remote` 变体互转（见 `remote.rs` 内注释）。**已于 2026-10-29 解决**：harness `sandbox/mod.rs` 已 re-export `RemoteSandboxState` 与 `SandboxSnapshotRef`，`RemoteSandboxStateData::to_harness_state` 改为直接构造（不再靠 `serde_json` 往返），并因此能携带快照身份（见本文件末尾 2026-10-29 执行记录）。
 2. **harness 缺少 `SandboxFilesystemSpec` / `SandboxFileTransfer`**：Java 扩展的 4 个 `*FilesystemSpec` 继承 harness Java `SandboxFilesystemSpec`（`io.agentscope.harness.agent.filesystem.spec`），`SandboxFileTransfer` 亦为 harness Java 类型（`io.agentscope.harness.agent.sandbox`）。**Rust harness 复核确认两者皆无**（`rg 'SandboxFilesystemSpec|SandboxFileTransfer' crates/agentscope-harness/src/` → 0 命中；harness 只有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`）。**已按裁定在本 crate 内建适配层**（`fs_spec.rs` 的 `SandboxFilesystemSpec` + `kubernetes_files.rs` 的 `SandboxFileTransfer`），**未改 harness/core**。若 harness 后续补齐同名类型，本 crate 的实现可直接切换继承/实现面，无需改调用点。**遗留**：Java `SandboxBackedFilesystem` 会在沙箱实现 `SandboxFileTransfer` 时**优先走原生传输**；Rust harness 无此机制。**已完成（2026-10-29 勘误）**：原记「`fs_spec::SandboxFilesystemAdapter` 只能全量走 exec+base64」，实际适配器已优先原生传输（用例 `fs_spec::tests::adapter_write_prefers_native_transfer`、`adapter_read_prefers_native_transfer_and_windows_lines`），仅需调用方显式 `from_remote_sandbox(...)` / `filesystem_with_transfer(...)` 传入传输适配器（harness `Sandbox` 为 `dyn` 且无 `as_any`，无法自动下转，见 §7.5-3）。
 3. **P1 剩余**（2026-10-28 更新）：① `PortForwardStrategy`（fabric8 `LocalPortForward`）无对应，Java 在该场景（无 apiUrl/gateway）为默认 — Rust 回退 `InCluster`，已记差异；② E2B `workspaceOnVolume`（工作区在卷上时的 tar no-op / destroy 跳过 / 嵌套挂载 `--exclude`）未迁移；③ E2B `envs → envVars`、K8s `SandboxClaimSpec.lifecycle`/`additionalPodMetadata` 等 P2 字段。~~E2B Proto codec、K8s 策略语义、文件 API / 原生传输接线~~ → **已完成（见 §7）**。**2026-10-29 复核补充的完整残留清单**：(1) `PortForwardStrategy`（`LocalPortForward` 无对应）；(2) `GatewayStrategy` 无 watch（一次性读取）；(3) `K8sHelper` 的 list/watch/模板/port-forward 未迁移；(4) K8s `listSandboxClaims`/`listActiveSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName` 未迁移；(5) `SandboxFilesystemSpec` 缺 `executionGuard`/`workspaceProjectionEnabled`/`workspaceProjectionRoots`，且 `__workspace_projection__` 未真写入（仅常量保留）；(6) 原生传输需显式 `from_remote_sandbox`（`dyn Sandbox` 无 `as_any`）；(7) E2B `workspaceOnVolume` 与 `envs → envVars`；(8) K8s CRD `lifecycle`/`additionalPodMetadata`/`shutdownAfterSeconds`；(9) E2B `E2bCloudBucketMountStrategy`（Java 为空占位接口，迁移价值 0）。
 4. **真实端点联调**：需真实 E2B/Daytona/AgentRun/K8s 凭据；当前全部请求体构造/响应解析/重试均有离线单测覆盖。
@@ -355,4 +355,23 @@ cargo fmt   -p agentscope-extensions-sandbox -- --check -> 通过
 4. **E2B `Proto` codec 不迁**：需 envd protobuf schema + `DynamicMessage` 等价物，且无真实端点离线可验；envd 同时支持 JSON codec，语义等价。
 5. **`fs_spec` 适配器捕获的传输适配器在句柄重建时不会自动刷新**（构造时快照）；`RemoteSandbox` 自身的 `file_transfer()` 会在 `ensure_handle`/快照重建后刷新。如果调用方在重建后继续用旧适配器，需重新构造。
 
+---
 
+## 2026-10-29 执行记录（harness 侧沙箱状态持久化 / 快照身份）
+
+对应汇总 tracker §1.1 第 ③ 项：MONGODB 的 `cascadeDeleteSnapshots` 读 `states._sandbox_state.json` 取快照 id，而 harness 侧既无该槽位的写入实现、也无快照字段。
+
+| 项 | 变更 | 位置 |
+|---|---|---|
+| `SandboxSnapshotRef` | 新增可序列化快照身份（`noop` / `local{id}` / `remote{id}`，serde `type` 判别）；三个 `*SandboxState` 增 `#[serde(default)] snapshot`，加 `SandboxState::snapshot()` / `set_snapshot()`；旧 JSON 无该字段仍可读取 | `agentscope-harness/src/agent/sandbox/state.rs` |
+| `AgentStateStoreSandboxStateStore` | 实现 `SandboxStateStore`（桥接 core `AgentStateStore`）；槽位/key/值形态对齐 Java `SessionSandboxStateStore`：`sandbox/session\|user\|agent\|global` + `_sandbox_state` + `{json,deleted}`，`delete` 写墓碑；`list_keys` 由 `list_session_ids` 反推 | `agentscope-harness/src/agent/sandbox/session_state_store.rs`（新） |
+| `RemoteSandboxState` 导出 | 之前未 re-export，本 crate 只能靠 JSON 往返投影；现直接构造（顺带修掉一处只好靠 serde 形状维持的隐式契约） | `agentscope-harness/src/agent/sandbox/mod.rs` |
+| 本 crate `RemoteSandboxStateData` | 新增 `snapshot: Option<SandboxSnapshotRef>`，`to_harness_state`/`from_harness_state` 双向携带；`RemoteSandboxClient::create` 在 `snapshot_spec.build()` 成功后写入身份 | `src/remote.rs` |
+| Docker 后端 | 创建时同样把快照身份写回 state（此前构建后丢弃） | harness `sandbox/docker.rs` |
+
+**仍未接线（不阻塞）**：`SandboxManager` 在生产代码中无调用点（sandbox 生命周期由宿主装配），
+宿主需在 `SandboxManager::new(client, Arc::new(AgentStateStoreSandboxStateStore::new(state_store, agent_id)), agent_id)`
+时显式注入。`RemoteSandboxClient::resume` 仍不重新绑定 snapshot client（既有行为，由 `RemoteSnapshotSpec` 负责）。
+
+验证：`agentscope-extensions-sandbox` **177 passed**（含新增 `create_records_snapshot_identity_in_state`）；
+harness `--lib` 502 passed；`agentscope-extensions-mongodb` 82 passed（含新增真实链路用例）。

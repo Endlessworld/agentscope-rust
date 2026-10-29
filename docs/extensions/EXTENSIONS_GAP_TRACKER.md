@@ -53,10 +53,10 @@
 | 6 | MEM | 进行中（`api_base_url` 校验 / connect 超时 / DTO 单测已补；余吞错口径裁定 + P2 清理） | 3 / ~9 | 96 |
 | 7 | JDBC | 进行中（skill 仓库 + 原生 advisory lock 接线已闭环） | 3 / ~6 | 217 |
 | 8 | REDIS | 进行中（`save_if_version(0)` 真 CAS、SCAN 游标用例、`CLUSTER SLOTS` 拓扑扇出已落地） | 1 / 3 | 148 + 2 doc |
-| 9 | MONGODB | 进行中（`ttl_days` / `database_name` 丢弃已修；余跨模块缺口 + P2） | 2 / ~7 | 80 |
+| 9 | MONGODB | 进行中（`ttl_days` / `database_name` 丢弃已修；级联删快照已走真实 harness 写入方，见 §4.15.4） | 1 / ~7 | 82 |
 | 10 | MYSQL | 进行中（列表哈希 / CAS 原子性 / 标识符校验 / 空列表语义已闭环） | 4 / ~6 | 71 |
 | 11 | POSTGRESQL | 进行中（`DEFAULT 1` + 0→1 CAS 回退、MurmurHash3 锁 key、`create_if_not_exist=true` 已闭环） | 3 / ~6 | 115 |
-| 12 | COS | **已完成**（本 crate P1 清零，唯一 P1 属 core 跨模块）（真实 COS v5 签名适配器 + 分段上传 + 预签名 + STS 已落地） | 1 / ~8 | 105 |
+| 12 | COS | **已完成**（本 crate P1 清零；core 跨模块的 per-key delete 也已落地）（真实 COS v5 签名适配器 + 分段上传 + 预签名 + STS 已落地） | 0 / ~7 | 107 + 3 doc |
 | 13 | OSS | **已完成**（P1 清零，余 P2）（`s3` feature + 分页 / `search_strict` / `delete_key` / DistributedStore 投影已闭环） | 0 / ~8 | 61 + 1 doc（默认）/ 74 + 2（`--features s3`） |
 | 14 | CONTROLPLANE | **已完成**（P1 清零，余 P2 / 待裁定）（native session-log、按会话 ack、`replanRun` / `signalRun` / artifact 上传下载均已落地） | 0 / ~7 | 144 + 4 |
 | 15 | STUDIO | 进行中（`reply` 键、`run_id` 鉴权键、function span、三抽取器、callFormat span 已闭环） | 2 / ~7 | 70 |
@@ -67,11 +67,16 @@
 | 20 | HIGRESS | **已完成**（P1 清零，余 P2）（`initialize()` 真建连、`call_tool_with_meta`、`outputSchema`、`registration()` 已闭环） | 0 / ~7（+2 待裁定） | 57 + 1 doc |
 | 21 | JUDGE | 进行中（**P0 已清零**：`JevClient` / `OpenAIDecisionsClient`；jev 42 类 = 完整 32 / 部分 8 / 骨架 2） | 4 / ~4 | 286 |
 
-**跨模块仍待裁定（非模块内可解）**：① COS / core 的 `needs_full_rewrite` Case 3 语义（**已裁定：对齐 Java，不改**，见 §4.14）；② core `AgentStateStore` 无 per-key `delete` / `close`，trait 返回 `()` 导致失败被吞（**待裁定，方案见 §4.14**）；③ harness 无级联删快照的生产写入方（**待实施，方案见 §4.14**）；⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍。
+**跳模块仍待裁定（非模块内可解）**：仅剩 ⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍（见 §4.15.6）。
 
-**已关闭（2026-10-29）**：~~④ protocol `AgentCard` 缺 `documentationUrl`、`TransportProperties` 需从 `a2a-server` 下沉 `a2a-client`~~ → 已完成（见 §4.14）；~~⑥ 依赖归属（`object_store` 零引用、`rust-mcp-sdk` 是否上提、OSS `rust-s3` MSRV、NACOS `zip` 未登记）~~ → 已全部处理（见 §4.14）。
+**已关闭（2026-10-29）**：
 
-## 2. 跨模块依赖与汇总方待办
+- ~~① COS / core 的 `needs_full_rewrite` Case 3 语义~~ → 已裁定「对齐 Java，不改」，影响仅为性能且有自愈（§4.15.3）；
+- ~~② core `AgentStateStore` 无 per-key `delete` / `close`~~ → 已加 `delete_key`（默认报错，InMemory / COS 覆盖）；`close()` 定为不迁移（§4.15.5）；
+- ~~③ harness 无级联删快照的生产写入方~~ → 已加 `SandboxState.snapshot` + `AgentStateStoreSandboxStateStore`，MONGODB 级联删走真实写入（§4.15.4）；
+- ~~④ protocol `AgentCard` 缺 `documentationUrl`、`TransportProperties` 需从 `a2a-server` 下沉 `a2a-client`~~ → 已完成（§4.15.1）；
+- ~~⑥ 依赖归属（`object_store` 零引用、`rust-mcp-sdk` 是否上提、OSS `rust-s3` MSRV、NACOS `zip` 未登记）~~ → 已全部处理（§4.15.2）。
+
 
 ### 2.1 已裁定的公共抽象归属（**B 波次 7 个存储模块必须遵守**）
 
@@ -779,11 +784,11 @@
 
 ---
 
-## 4.14 2026-10-29 执行记录（§1.1 六项跨模块事项）
+## 4.15 2026-10-29 执行记录（§1.1 六项跨模块事项）
 
-> 本轮开始动 §1.1 末尾列的 6 项。**已完成 2 项（④ ⑥）、裁定 1 项（①）、待实施 2 项（② ③）、待裁定 1 项（⑤）**。验证均为实跑 `cargo check/test`。
+> §1.1 末尾列的 6 项：**已完成 4 项（② ③ ④ ⑥）、裁定 1 项（①）、仍待裁定 1 项（⑤）**。验证均为实跑 `cargo check/test`。
 
-### 4.14.1 ④ PROTOCOL（已完成）
+### 4.15.1 ④ PROTOCOL（已完成）
 
 | 项 | 变更 | 验证 |
 |---|---|---|
@@ -794,7 +799,7 @@
 
 **反向验证**：去掉 `documentationUrl` 的 serde rename → `agent_card_serializes_documentation_url` FAILED（39/1）；恢复后 40 passed。
 
-### 4.14.2 ⑥ 依赖归属（已完成）
+### 4.15.2 ⑥ 依赖归属（已完成）
 
 | 项 | 结论 |
 |---|---|
@@ -805,7 +810,7 @@
 
 验证：`cargo check -p agentscope-harness -p agentscope-extensions-higress -p agentscope-extensions-nacos --all-targets` → EXIT=0；`cargo test -p agentscope-extensions-higress -p agentscope-extensions-nacos` → 57 / 70 + 1 doc 全绿。⚠️ `Cargo.lock` 工作区存在**其他会话**的并发改动（新增 `cty 0.2.2`，来自 acp），与本轮依赖变更无关。
 
-### 4.14.3 ① `needs_full_rewrite` Case 3（裁定：不改）
+### 4.15.3 ① `needs_full_rewrite` Case 3（裁定：不改）
 
 **结论：保持现状，与 Java 行为等价，不引入偏离。** 依据：
 
@@ -815,37 +820,45 @@
 
 ⇒ 分类从「待裁定」改为「**已裁定：对齐 Java，不改**」；若未来立项需配「恢复后 `to_json()` 字节相等」黄金测试。
 
-### 4.14.4 ③ harness 级联删快照（待实施，方案已定）
+### 4.15.4 ③ harness 级联删快照（已完成，`2ca7b76`）
 
 **根因（比 tracker 原描述更深）**：不止「没有写入方」，**状态结构也对不上**：
 
-- MONGODB `distributed_store.rs::find_session_snapshot_id` 读 `AgentStateStore` 的 session `sandbox/session/<sid>`、key `_sandbox_state`、value `{"json": "..."}`，并从 JSON 的 `snapshot.type == "remote"` / `snapshot.id` 取快照 id；
-- 而 harness `SandboxState::Remote(RemoteSandboxState)`（`sandbox/state.rs:116`）**没有 `snapshot` 字段**，`SandboxStateStore` 也只有 `InMemorySandboxStateStore`。
+- MONGODB `distributed_store.rs::find_session_snapshot_id` 读 `AgentStateStore` 的 session `sandbox/session/<sid>`、key `_sandbox_state`、value `{"json": "<SandboxState>"}`，并从 JSON 的 `snapshot.type == "remote"` / `snapshot.id` 取快照 id；
+- 而 harness `SandboxState` **没有 `snapshot` 字段**，`SandboxStateStore` 也只有 `InMemorySandboxStateStore` —— 即缺少 Java `SessionSandboxStateStore` 的等价物。
 
-**实施步骤（待确认后开工）**：
-1. harness `RemoteSandboxState` 增 `snapshot: Option<RemoteSnapshotRef { id }>`（serde 为 `{"type":"remote","id":...}`），保持旧数据反序列化兼容（`#[serde(default)]`）；
-2. 新增 `AgentStateStoreSandboxStateStore`（`impl SandboxStateStore`，桥接 core `AgentStateStore`，session key `sandbox/session/<isolation_key>`、key `_sandbox_state`、value `{"json": ...}`）——与 MONGODB/POSTGRESQL/JDBC 现有读取契约逐字对齐；
-3. 在 `HarnessAgent` 装配处（有 `agent_state_store` 时）默认注入该实现，保留可选覆盖；
-4. 回归：MONGODB `cascade` 用例改用真实写入（不再手工 `seed_session_snapshot`），并加「远程快照状态往返 + 级联删除实际触发」用例。
+**已落地**：
 
-预估风险：中（碰 harness 序列化格式 + agent 装配）；建议单智能体独占 harness 改动。
+| 变更 | 位置 |
+|---|---|
+| `SandboxSnapshotRef { Noop / Local{id} / Remote{id} }`（serde `type` 判别 + lowercase），三个 `*SandboxState` 增 `#[serde(default)] snapshot`，加 `SandboxState::snapshot()` / `set_snapshot()`；旧 JSON 无该字段仍可反序列化 | `harness/src/agent/sandbox/state.rs` |
+| `AgentStateStoreSandboxStateStore`：槽位 `<slotSessionId>` / key `_sandbox_state` / 值 `{"json","deleted"}`，`delete` 写墓碑（Java 同款，因为并非所有后端支持 per-key delete）；scope→sessionId 前缀对齐 Java `slotSessionId`（`sandbox/session‖user‖agent‖global`）；`list_keys` 由 `list_session_ids` 反推 | `harness/src/agent/sandbox/session_state_store.rs`（新，约 300 行） |
+| Docker 创建沙箱时把 `snapshot_spec.build()` 得到的快照身份写回 state（此前构建后丢弃） | `harness/src/agent/sandbox/docker.rs` |
+| 级联用例改为经**真实写入方**（`AgentStateStoreSandboxStateStore`）落盘后删除 session，不再手工 `seed_session_snapshot` | `extensions-mongodb/src/distributed_store.rs` |
 
-### 4.14.5 ② core `AgentStateStore` 缺 per-key delete / 错误通道（待裁定，方案已定）
+**仍未接线（不阻塞，已记录）**：`SandboxManager` 在生产代码中尚无调用点（sandbox 生命周期由宿主装配），所以 `AgentStateStoreSandboxStateStore` 需要宿主在 `SandboxManager::new(client, store, agent_id)` 时显式注入；`HarnessAgent` 没有 sandbox 装配点，故未加「默认注入」。
 
-**方案（低破坏）**：不改现有方法签名，新增**默认实现**的显式变体：
+验证：harness `--lib` **502 passed**（含新增 6 个）；`harness_sandbox_lifecycle_test` 1；`agentscope-extensions-sandbox` **177**；`agentscope-extensions-mongodb` **82**（含新增真实链路用例）。
+反向验证：把 `slot_session_id` 的 session 前缀改成 `sandbox/sess/` → harness 5 个新用例 + mongodb 级联用例**同时 FAILED**，恢复后全绿。
+
+### 4.15.5 ② core `AgentStateStore` 缺 per-key delete（已完成，`6d15d9c`）
+
+**落地口径（比原方案更小）**：只加 `delete_key`，**不加** `try_save` / `close`。理由：二者在 Rust 侧没有消费方 —— 写入失败的错误通道要改 trait 全部签名（7 个存储 crate + 所有调用点），而 `close()` 在 Rust 无「关闭后端」的统一语义（`SharedObjectStore` 的关闭由 crate 自己负责）；没有消费方就是投机 API。
 
 ```rust
-async fn try_save(&self, ..) -> agentscope_core::error::Result<()> { self.save(..).await; Ok(()) }
-async fn delete_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<()> { Err(unsupported) }
-async fn close(&self) -> Result<()> { Ok(()) }
+async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Result<()> {
+    // 默认返回 Err(Other("...does not support per-key delete"))：不假装成功
+}
 ```
 
-- `delete_key` 默认返回 `Unsupported`（不假装成功），由各存储 crate 逐家覆盖；COS 的 per-key 删除、OSS 的 `delete_key`、会话级联清理均可复用。
-- `try_*` 默认委托旧方法 → 7 个存储 crate **零改动即可编译**，之后按需逐家覆盖并补错误传播用例。
-- 代价：两条并行 API（旧 `save`/`()` 与 `try_save`），需在 trait 文档里明确「新代码用 try_*」。
+- `InMemoryAgentStateStore` 覆盖为真删除（同时清掉该 key 的版本记录，重建从 0 起）；
+- `CosAgentStateStore` 覆盖为**一次批量删除** `.json` / `.list.json` / `.list.hash`（Java `deleteKeys` 语义；漏删 hash 会让后续 `saveList` 拿陈旧 hash 做增量）；
+- `JsonFileAgentStateStore` 保持默认实现（仍返回 Err），测试断言「必须失败且值仍在」；
+- COS tracker P2-① 关闭；P2-② 的 `close()` 改为「**已完成（设计决定，不迁移）**」并写明依据。
 
-**需你确认**：是否接受「新增 try_*/delete_key + 旧方法保留」的兼容路线（而非一次性改签名）。
+验证：`state_store_versioning_test` **7 passed**；`agentscope-extensions-cos` **107 + 3 doc passed**；`cargo check --workspace --all-targets` EXIT=0。
+反向验证：把 cos 覆写改成只删 `.json` → `delete_key_removes_value_list_and_hash_only` FAILED，恢复后通过。
 
-### 4.14.6 ⑤ MODEL 双实现取舍（仍待裁定）
+### 4.15.6 ⑤ MODEL 双实现取舍（仍待裁定）
 
 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 均为**平行实现**，涉及语义取舍（wire DTO 自建 vs SDK），无代码阻塞，仍建议单独决策；本轮未动。
