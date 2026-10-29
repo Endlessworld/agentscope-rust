@@ -1,4 +1,4 @@
-﻿# CHANNEL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# CHANNEL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **CHANNEL** 模块迁移的**单一事实来源**与**增量跟踪入口**。开工前读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md`；历史过程记录见 `docs/extensions/CHANNEL__MIGRATION_HISTORY.md`（**冻结**）。切勿臆断代码现状——以本文件 + `git status` + `cargo test` 实际验证为准。
 > **当前状态**：**已完成（基线 2026-10-23）**。Java 后续新特性按 §6 增量跟踪流程登记到 §3。
@@ -18,9 +18,9 @@
 |---|---|
 | Java 模块 | `agentscope-extensions-channel`（**7** 个 Maven 子模块：common, dingtalk, feishu, github, gitlab, wecom, **weixin**） |
 | Java 规模（实测 2026-10-22） | 主代码 **8251** 行 / 测试 **3954** 行（**非空行**口径；`Get-ChildItem -Recurse -Filter *.java` 逐文件非空行求和，共 **92** 个文件 = 67 main + 25 test；`@Test` 计 **161** 个 + `@ParameterizedTest` 1 个）。分模块 main/test：common 593/300、dingtalk 1599/801、feishu 1212/205、github 873/**0**、gitlab 766/**0**、wecom 1254/325、weixin 1954/2323（原始行数口径：主 **9012** / 测试 **4347**） |
-| Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **385** 个 = 266 `#[test]` + 119 `#[tokio::test]`） |
+| Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **399** passed（2026-10-26 G9 关闭后实测；**2026-10-29 勘误**：原记 385 = 266 `#[test]` + 119 `#[tokio::test]`，见 §3.1） |
 | 迁移波次 | A |
-| 当前状态 | **已完成（2026-10-23 基线）**：全部 P0/P1/P2 缺口已关闭（§3，历史细节见归档 §7/§8），文本 + 媒体链路全绿。common 主干（含 `ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地。验证基线见 §7。 |
+| 当前状态 | **总判：已完成**（代码缺口 0，仅剩环境验证）—— **已完成（2026-10-23 基线）**：全部 P0/P1/P2 缺口已关闭（§3，历史细节见归档 §7/§8），文本 + 媒体链路全绿。common 主干（含 `ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地。验证基线见 §7；**测试数已由 385 升至 399 passed**（G9 关闭后，见 §3.1）。 |
 
 ### 1.1 与 harness 的边界（已裁定，必须遵守）
 harness 提供**路由/会话绑定骨架**（不可改）：`crates/agentscope-harness/src/agent/` 下 `channel.rs`、`chatui.rs`、`inbound.rs`、`router.rs`、`binding.rs`、`peer.rs`、`dm_scope.rs`、`config.rs`。
@@ -209,6 +209,8 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | `ChannelMediaMetadata` 文件名净化 | 正则 `\p{Cf}` | 显式 Cf 区间枚举 | Rust `std` 无 Unicode general-category API，不为此新增依赖 |
 | DingTalk 回调签名 | 仅 `HmacSHA256(appSecret, ts+"\n"+appSecret)` | 同上 + 可选经典 `token+SHA1` 兼容路径 | 默认不配置 `token` 即完全等同 Java |
 | DingTalk `check_url` 首次验证 | 返回空 200 | 返回加密 `success` | 依据 DingTalk 事件订阅协议；**尚未在真实租户验证** |
+
+**遗留（2026-10-29 复核，全部为「非代码缺口（环境验证）」）**：§3 代码缺口清单已空（G1–G9 全部关闭，最后一项 G9 于 2026-10-26 关闭）。剩余项均属需真实租户环境的**非代码缺口（环境验证）**，不在本 crate 代码范围内：① DingTalk `check_url` 加密应答/验签解密；② DingTalk Stream 退避重连；③ Feishu / WeCom token 刷新与失效重取（详见 §5）。
 
 ## 5. 已知限制（需真实环境验证，非代码缺口）
 

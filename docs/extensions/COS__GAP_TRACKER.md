@@ -1,4 +1,4 @@
-﻿# COS 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# COS 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **COS** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-cos\`
@@ -19,7 +19,7 @@
 | Rust 规模（实测 2026-10-28 第二轮） | 13 个 `src/*.rs` / **5241 非空行**（5823 总行）；无 `tests/` 目录；**105** 内联 test（58 个 `#[test]` + 47 个 `#[tokio::test]`，其中 2 个为 multi-thread flavor）+ 3 个 `no_run` doctest（**只编译、不执行**） |
 | Rust crate | `crates/agentscope-extensions-cos` |
 | 迁移波次 | B |
-| 当前状态 | 已完成（**真实 COS HTTP 适配器已落地**：`CosHttpObjectStore` + 自建 `q-sign-algorithm=sha1` 签名（金标向量钉住）+ **分段上传 / 预签名 URL / STS token**（2026-10-28 第二轮）） |
+| 当前状态 | **总判：已完成**（本 crate P1 清零，唯一 P1 属 core 跨模块；余 P2）—— 已完成（**真实 COS HTTP 适配器已落地**：`CosHttpObjectStore` + 自建 `q-sign-algorithm=sha1` 签名（金标向量钉住）+ **分段上传 / 预签名 URL / STS token**（2026-10-28 第二轮）） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -65,7 +65,7 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | crate 骨架 + 依赖 | pom.xml | 已完成 | 仅改本 crate `Cargo.toml`；新增 `sha2`（workspace 已有）——**已于 2026-09-19 随 list_hash 收敛移除**；`tokio` 增 `rt-multi-thread` feature；未改根 `[workspace.dependencies]` |
-| list 增量哈希收敛到 core | `ListHashUtil.needsFullRewrite` | 已完成 | **2026-09-19**：删除本地 `compute_list_hash`（全量 SHA-256）+ 本地 `needs_full_rewrite`，改 `use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite}`；`save_list` 调用点同步收敛；`existing_count` 改为「已存列表实体长度」，与 hash 对象解耦；`sha2` 依赖移除（grep 确认无其他用途）。验证：**31 unit test passed / 0 failed**（19 × `#[test]` + 12 × `#[tokio::test]`）+ 2 个 `no_run` doctest（只编译不执行）。**2026-10-22 静态复核确认**：`rg 'fn compute_list_hash\|fn needs_full_rewrite'` 全 crate → 零命中；`Cargo.toml` 无 `sha2`（`git log -S "sha2"` → 提交 `daa700d`）→ 收敛属实 |
+| list 增量哈希收敛到 core | `ListHashUtil.needsFullRewrite` | 已完成 | **2026-09-19**：删除本地 `compute_list_hash`（全量 SHA-256）+ 本地 `needs_full_rewrite`，改 `use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite}`；`save_list` 调用点同步收敛；`existing_count` 改为「已存列表实体长度」，与 hash 对象解耦；`sha2` 依赖移除（grep 确认无其他用途）。验证（2026-09-19 当轮）：**31 unit test passed / 0 failed**（19 × `#[test]` + 12 × `#[tokio::test]`）+ 2 个 `no_run` doctest（只编译不执行）。**已完成（2026-10-29 勘误）**：原记「31 unit test」，实际现为 **105 passed / 0 failed**（58 `#[test]` + 47 `#[tokio::test]`）+ 3 个 `no_run` doctest；依据 §1 / §4.1 / §4.4（2026-10-28 第二轮 `cargo test` 实测）。**2026-10-22 静态复核确认**：`rg 'fn compute_list_hash\|fn needs_full_rewrite'` 全 crate → 零命中；`Cargo.toml` 无 `sha2`（`git log -S "sha2"` → 提交 `daa700d`）→ 收敛属实 |
 | 修复：纯追加不再恒判全量重写 | `ListHashUtil.needsFullRewrite` Case 3 | 已完成 | 旧条件 `!compute_list_hash(values).starts_with(stored_hash)` 依赖「全量 SHA-256 具有前缀性质」——**实测该假设错误**（`sha256([a])` 与 `sha256([a,b])` 互不为前缀），故条件恒 `true`，纯追加永远判需全量重写（数据无损，追加优化失效）。已实测旧实现 `old_needs_full_rewrite([a,b], old_hash([a]), 1) == true`；新实现 `needs_full_rewrite == false`（core 取 `existing_count` 前缀哈希比较）。**2026-10-22 静态复核确认**：该回归断言现以 `agent_state_store.rs::pure_append_does_not_trigger_full_rewrite` 内联形式保留（同时断言旧 `!whole.starts_with(stored_hash)` 恒为 `true`）。**注意**：core 只修到「单次追加不判重写」，**连续第二次追加**仍会因「存整表哈希 vs 比前缀哈希」而判全量重写（与 Java 同款，见 §2.2 P1-①） |
 | 修复：`stored_hash == None` 误判 | `ListHashUtil.needsFullRewrite` Case 2 | 已完成 | 旧实现 `None => true`；core 语义为 `stored_hash.is_none() && existing_count > 0` 才 `true`，即无既有数据（`existing_count == 0`）时**不**重写 |
 | 对象存储后端抽象 | `COSClient` | 已完成 | `CosObjectStore` async trait（`get/put/delete/exists/len/list_prefix/list_page/delete_many/close` + UTF-8 便捷方法）；`InMemoryCosObjectStore`（测试）+ **`CosHttpObjectStore`（真实，2026-10-28）** |
@@ -128,7 +128,7 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-**已完成**：COS 模块全部产出契约落地并复用既有 trait；list 增量哈希已收敛到 core（无平行实现）。
+**已完成**：COS 模块全部产出契约落地并复用既有 trait；list 增量哈希已收敛到 core（无平行实现）。**2026-10-29 复核**：测试数 **105**（§1 / §4.4 一致）；§3.1 旧记「31」已就地勘误（历史原文保留）；真实剩余见 §4.2（core `needs_full_rewrite` Case 3 与 Java 同款、core trait 无 per-key `delete`/`close`、`CosError::NotFound` 预留变体、分片上传无 `ListParts` 断点续传/分片级重试/进度回调、STS 不自动刷新、预签名只签 host、根 `object_store` 依赖无引用）。
 - 文件（**13 个**，与 §1 规模行一致）：`src/{lib,error,layout,object_store,http_object_store,signature,multipart,presign,agent_state_store,base_store,snapshot,guard,distributed_store}.rs`
   - 非空行分布（2026-10-28 第二轮）：`http_object_store` 2166、`agent_state_store` 686、`signature` 479、`base_store` 382、`object_store` 257、`distributed_store` 234、`multipart` 230、`presign` 217、`layout` 170、`snapshot` 150、`guard` 134、`lib` 76、`error` 60 → **合计 5241**（总行 5823）
 - 验证命令与结果（**2026-10-28 第二轮重跑**）：
@@ -303,7 +303,7 @@
 - **`list_hash` 收敛到 core**：**属实**。本 crate 无平行实现（`rg 'fn compute_list_hash|fn needs_full_rewrite'` → 零命中），`sha2` 已从 `Cargo.toml` 移除（`git log -S "sha2"` 确认提交 `daa700d`）。
 - **「追加恒全量重写」偏离修复**：**属实**。历史实现经 `git show e01809d:.../agent_state_store.rs` 确认为 `!compute_list_hash(values).starts_with(h)`，全量 SHA-256 无前缀性质 → 恒 `true`；现委托 core 后单次纯追加返回 `false`（回归测试内联保留）。
 - **B 波次统一产出契约**：**5/5 齐全**（`CosDistributedStore` / `CosAgentStateStore` / `CosStore` / `CosSnapshotSpec` / `CosSandboxExecutionGuard`），且均可从 `CosDistributedStore` 访问（`agent_state_store()`/`base_store()`/`sandbox_snapshot_spec()`/`sandbox_execution_guard()` + `shared_*` trait-object 便捷方法）。
-- **建议 rollup 状态值**：**保持 `已完成`**（rollup 行 12 现值「已完成（build + test 通过，31+2 test；…）」）。理由：P0 核心链路无缺口、产出契约 5/5 齐备、list_hash 收敛与追加偏离修复均经静态复核属实；剩余项均为 P1/P2 且其中 P1-①/P1-③ 属 core/harness 层（汇总方）、P1-② 属测试覆盖增强而非功能缺失。**唯一需在 rollup 同步的措辞修正**：「31+2 test」应表述为「**31 unit test（19 `#[test]` + 12 `#[tokio::test]`）+ 2 `no_run` doctest（只编译）**」，并追加「**真实 COS SDK 适配（含 `q-sign-algorithm` 签名）仍未开始**」。
+- **建议 rollup 状态值**：**保持 `已完成`**（rollup 行 12 现值「已完成（build + test 通过，31+2 test；…）」）。理由：P0 核心链路无缺口、产出契约 5/5 齐备、list_hash 收敛与追加偏离修复均经静态复核属实；剩余项均为 P1/P2 且其中 P1-①/P1-③ 属 core/harness 层（汇总方）、P1-② 属测试覆盖增强而非功能缺失。**唯一需在 rollup 同步的措辞修正**：「31+2 test」应表述为「**31 unit test（19 `#[test]` + 12 `#[tokio::test]`）+ 2 `no_run` doctest（只编译）**」，并追加「**真实 COS SDK 适配（含 `q-sign-algorithm` 签名）仍未开始**」。 （2026-10-29 勘误：本段为 2026-10-22 快照，已失效——现为 **105 passed**，真实 COS v5 签名适配器 / 分段上传 / 预签名 / STS 均已落地，见 §5/§6；rollup 现值见汇总 §1.1）
 
 
 ## 附录 A：`list_hash` 跨语言约束（裁定 7 登记，2026-10-22）

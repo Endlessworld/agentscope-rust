@@ -19,7 +19,7 @@
 | Java 规模（实测行数，非空行） | 主代码 **15946** / 测试 **16792**（bailian 1447/1493、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8576/10909） |
 | Rust crate | `crates/agentscope-extensions-rag` |
 | 迁移波次 | A |
-| 当前状态 | **已完成（Java 侧 RAG 类均已覆盖）** — `dify`、`ragflow`、`bailian`、`haystack`、`simple` 子模块的离线链路与外部服务链路均已迁移；2026-10-26 补 `simple` 的 **HTTP embedding 4 件**（openai / dashscope text / dashscope multimodal / ollama）+ `ReaderUtils` + `ImageReader`（新增 60 个离线测试）；**2026-10-28 两批补齐外部向量库 4 件（`QdrantStore` / `PgVectorStore` 51 测试；`MilvusStore` / `ElasticsearchStore` 60 测试），实测 `436 passed / 0 failed`**；**剩余：`ExternalApiReader`（P2）** |
+| 当前状态 | **总判：已完成**（P1 清零，余 P2）—— **已完成（Java 侧 RAG 类均已覆盖）** — `dify`、`ragflow`、`bailian`、`haystack`、`simple` 子模块的离线链路与外部服务链路均已迁移；2026-10-26 补 `simple` 的 **HTTP embedding 4 件**（openai / dashscope text / dashscope multimodal / ollama）+ `ReaderUtils` + `ImageReader`（新增 60 个离线测试）；**2026-10-28 两批补齐外部向量库 4 件（`QdrantStore` / `PgVectorStore` 51 测试；`MilvusStore` / `ElasticsearchStore` 60 测试），实测 `436 passed / 0 failed`**；**剩余：`ExternalApiReader`（P2）** |
 
 ### 1.1 Rust crate 文件清单（53 个源文件；2026-10-28 两批新增 `store/{qdrant,pgvector,milvus,elasticsearch}.rs` 4 个源文件 5587 行非空 + 111 个内联测试）
 
@@ -27,7 +27,7 @@
 > `embedding/{utils,openai,dashscope,ollama,test_support}.rs` 与 `reader/{utils,image}.rs`，
 > 并扩充了 `embedding.rs`、`reader.rs`、`hash.rs`、`lib.rs`、`Cargo.toml`。新增测试数：
 > openai 12 / dashscope 15 / ollama 8 / embedding::utils 10 / reader::utils 6 / reader::image 8 /
-> hash 1 = **60**（待主智能体统一跑 `cargo test` 确认）。
+> hash 1 = **60**。**已完成（2026-10-29 勘误）**：原记「待主智能体统一跑 `cargo test` 确认」，实际 2026-10-28 第二批已实测 **436 passed / 0 failed / 0 ignored**（见 §1.2 / §4.1）。
 | 文件 | 职责 |
 |---|---|
 | `src/lib.rs` | crate 根：15 个模块声明 + re-export；说明 Java core `rag` 包已 `@Deprecated(forRemoval)` 且 core 无对应实现 |
@@ -81,13 +81,22 @@ cargo build -p agentscope-extensions-rag
 cargo test  -p agentscope-extensions-rag   # 预计 325 passed（新增 60）
 ```
 
-**最新（2026-10-28 本轮实测）**：
+**2026-10-28 第一批实测**：
 ```
 cargo build -p agentscope-extensions-rag            -> exit 0（0 errors）
 cargo test  -p agentscope-extensions-rag --lib      -> 376 passed; 0 failed; 0 ignored
 cargo clippy -p agentscope-extensions-rag --lib --all-targets -> exit 0（新增文件无告警）
 rustfmt --edition 2021 --check (4 个改动/新增文件)   -> 无 diff
 ```
+
+**最新（2026-10-28 第二批实测）**：
+```
+cargo build -p agentscope-extensions-rag            -> exit 0（0 errors）
+cargo test  -p agentscope-extensions-rag --lib      -> 436 passed; 0 failed; 0 ignored
+cargo clippy -p agentscope-extensions-rag --lib --all-targets -> exit 0
+rustfmt --edition 2021 --check (store/{milvus,elasticsearch}.rs、store.rs、lib.rs) -> 无 diff
+```
+> 依据：§9.5（`MilvusStore` 32 测试 + `ElasticsearchStore` 28 测试 = +60）、§4.1。
 
 ## 2. Java 清单与依赖映射
 
@@ -97,7 +106,7 @@ rustfmt --edition 2021 --check (4 个改动/新增文件)   -> 无 diff
 ### 2.1 依赖映射（Java → Rust）
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
 |---|---|---|---|
-| OkHttp（`okhttp3.*`） | HTTP 传输 | `reqwest = "0.12"`（`json, rustls-tls`，本 crate `[dependencies]`）+ 可注入 transport trait | 生产用 `HttpDifyTransport`，测试用内联 mock |
+| OkHttp（`okhttp3.*`） | HTTP 传输 | `reqwest`（workspace 统一 **0.13**；本 crate 为 `reqwest = { workspace = true }`）+ 可注入 transport trait。**已完成（2026-10-29 勘误）**：原记「`reqwest = "0.12"`（`json, rustls-tls`）」，实际根 `Cargo.toml` 已统一 0.13（`default-features=false` + `json,stream,rustls,...`）；依据 `crates/agentscope-extensions-rag/Cargo.toml` | 生产用 `HttpDifyTransport`，测试用内联 mock |
 | Jackson（`ObjectMapper`/`@JsonProperty`） | JSON (反)序列化 | `serde` + `serde_json`（workspace） | 字段名 1:1 对齐，忽略未知字段 |
 | Project Reactor（`Mono`） | 异步流 | `async-trait` + `tokio`（workspace） | — |
 | Slf4j | 日志 | `tracing`（workspace） | — |
@@ -345,8 +354,8 @@ rustfmt --edition 2021 --check (4 个改动/新增文件)   -> 无 diff
 |---|---|---|---|
 | 1 | `> **Java 源码**：D:\IdeaProjects\agentscope-java\...`（文件头） | 路径已失效，实际为 `E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-rag\` | 已修正文件头 |
 | 2 | `Java 规模（实测行数）: 主代码 **15438** / 测试 **16057**`（§1） | 主 **15946** / 测 **16792**（非空行）。差值来自 simple 子模块在上轮后继续演进（simple 主 8068→**8576**、测 10188→**10909**）与 bailian 测 1479→**1493** | 已修正 §1（含 5 个子模块分项） |
-| 3 | `§3.3 文档读取器（Tika/PDF/Word/Image）… **已完成（设计决定，不迁移）**，依据：这四个 reader 直接依赖 JVM 库（Apache Tika / PDFBox / POI）` | `ImageReader.java` 的 import 只有 `ImageBlock` / `URLSource` / `ReaderException` / `Document` / `DocumentMetadata` / `List` / `Mono` —— **零第三方 JVM 依赖**；`TikaReader`/`PDFReader`/`WordReader` 才有 tika/pdfbox/poi | 已拆分：`ImageReader` 从"不迁移"改为**待办**（§2.3 / §3.3 / §4.2） |
-| 4 | `§3.3 reader 辅助（ReaderUtils）… **已完成（设计决定，不迁移）**，依据：其 SHA-256 路径仅服务于未迁移的 Tika/PDF/Word reader` | `ReaderUtils.generateDocIdMD5` 被 **`ImageReader`**（`ImageReader.java:91`）调用；`generateDocIdSHA256` 被 `TikaReader`/`PDFReader`/`ExternalApiReader` 调用。MD5 路径服务于**可迁移**的 `ImageReader` → "无调用方即无迁移价值"前提不成立 | 已由"不迁移"改为**待办**（§2.3 / §3.3） |
+| 3 | `§3.3 文档读取器（Tika/PDF/Word/Image）… **已完成（设计决定，不迁移）**，依据：这四个 reader 直接依赖 JVM 库（Apache Tika / PDFBox / POI）` | `ImageReader.java` 的 import 只有 `ImageBlock` / `URLSource` / `ReaderException` / `Document` / `DocumentMetadata` / `List` / `Mono` —— **零第三方 JVM 依赖**；`TikaReader`/`PDFReader`/`WordReader` 才有 tika/pdfbox/poi | 已拆分：`ImageReader` 从"不迁移"改为**待办**（§2.3 / §3.3 / §4.2）；2026-10-29 勘误：`ImageReader` 已落地（`src/reader/image.rs`） |
+| 4 | `§3.3 reader 辅助（ReaderUtils）… **已完成（设计决定，不迁移）**，依据：其 SHA-256 路径仅服务于未迁移的 Tika/PDF/Word reader` | `ReaderUtils.generateDocIdMD5` 被 **`ImageReader`**（`ImageReader.java:91`）调用；`generateDocIdSHA256` 被 `TikaReader`/`PDFReader`/`ExternalApiReader` 调用。MD5 路径服务于**可迁移**的 `ImageReader` → "无调用方即无迁移价值"前提不成立 | 已由"不迁移"改为**待办**（§2.3 / §3.3）；2026-10-29 勘误：`ReaderUtils` 已落地（`src/reader/utils.rs`） |
 | 5 | `§3.2 simple 外部向量库 … MilvusStore(899)` | `MilvusStore.java` 非空行 **919**（899 为旧值） | 已修正为 919 |
 | 6 | `§3.1 离线单测（265 个）\| Java 测试 16057 行` | Java 测试 **16792** 行 | 已修正 |
 | 7 | `§2.3 simple 子模块 … 31 类` | simple 子模块实际 **33 类**（rag 24 + embedding 9）；若含 Java core `io.agentscope.core.rag.*` 则为 **40 类** | 已修正 §2.3 标题 |

@@ -15,21 +15,21 @@
 | Java 模块 | ~~`agentscope-extensions-controlplane`~~ → **`agentscope-extensions-controlplane`**（commit `a2cbea5c3` 重命名） |
 | Java 子模块 | 单模块：`adapter` / `model` / `store` / `transport`（+ 根包 5 类） |
 | Java 规模（2026-10-22 实测） | controlplane：主 39 文件 **9518** 行 / 测 14 文件 **3017** 行（共 53 .java）。旧 controlplane（`a2cbea5c3~1`）：主 39 文件 9360 行 / 测 14 文件 2898 行 |
-| Rust crate | `crates/agentscope-extensions-controlplane`（**未改名**，Rust 侧无 controlplane crate） |
+| Rust crate | `crates/agentscope-extensions-controlplane`（**2026-10-22 改名已完成**，crate / 类型前缀 / env / journal 目录 / sink 名均已对齐，见汇总 §4.5 裁定 3） |
 | 迁移波次 | C |
-| 当前状态 | 进行中（P0 链路 + **P1 主干 + P2 主体**已落地：模型 + HTTP transport + 7 个 ControlPlane* store + HttpSelfRegistration + `ContractHttpServer` + `AgentScopeAdapter` + `ControlPlaneObserverMiddleware` + `ControlPlaneBridge` 事件真接线 + **`AgentTask*` 工具族 + `CollaborationClient`/`OrchestrationClient`**；2026-10-08 `cargo build` 通过、`cargo test` **106/106 全绿** → 后续会话 **125 passed** → P0-1 后 **128 lib + 4 e2e** → **2026-10-28：144 lib + 4 e2e 全绿（P1-1/P1-2/P1-3/P2-2 关闭，§8）**） |
+| 当前状态 | **总判：已完成**（P1 清零，余 P2 / 待裁定）—— 历史：P0 链路 + **P1 主干 + P2 主体**已落地（模型 + HTTP transport + 7 个 ControlPlane* store + HttpSelfRegistration + `ContractHttpServer` + `AgentScopeAdapter` + `ControlPlaneObserverMiddleware` + `ControlPlaneBridge` 事件真接线 + **`AgentTask*` 工具族 + `CollaborationClient`/`OrchestrationClient`**；2026-10-08 `cargo build` 通过、`cargo test` **106/106 全绿** → 后续会话 **125 passed** → P0-1 后 **128 lib + 4 e2e** → **2026-10-28：144 lib + 4 e2e 全绿（P1-1/P1-2/P1-3/P2-2 关闭，§8）**；**P0-1（native session-log 提交链路）已于 2026-10-22 关闭（§7：128 lib + 4 e2e）**，§6.3 全部编号项至此闭环，仅余 P2 设计决定与宿主实现待定） |
 
 ## 2. Java 清单与依赖映射
 
 ### 2.0 源文件清单（controlplane 53 个 .java：主 39 / 测 14；旧 controlplane 同为 53 个：主 39 / 测 14）
-> 下表 Java 类名一列同时给出**旧 controlplane 名**与**现行 controlplane 名**（`→` 后为新名）；Rust 对应列保持 controlplane 命名（Rust 侧未改名）。
+> 下表 Java 类名一列同时给出**旧 controlplane 名**与**现行 controlplane 名**（`→` 后为新名）；Rust 对应列使用 `ControlPlane*` 现行命名（**2026-10-22 已改名**，见汇总 §4.5 裁定 3）。
 
 根包 `io.agentscope.extensions.controlplane`（旧 `io.agentscope.extensions.controlplane`）：
 | Java 类 / 包 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
 | `ControlPlane`（旧 `ControlPlane`） | 入口：`instrument(target, config[, adapter])` / `newBridge` | `lib.rs::instrument`（等价 `ControlPlaneBridge::new`) | ✅ 薄封装 |
 | `ControlPlaneConfig`（旧 `ControlPlaneConfig`） | 连接/上报设置 record（**20 字段**，校验 agentKey/tenant/namespace/instanceKey） | `config::ControlPlaneConfig`（builder + 同校验，**20 字段一一对应**） | ✅ |
-| `SessionBridge` (1207L) | 核心桥：挂载 adapter、事件序列化、Level-1/2/4 上报、命令处理、start/close | `bridge::ControlPlaneBridge`（async/tokio） | ✅ 已完成（P1 主干）；**缺 `onCommittedEvent` 原生事件提交入口**（§6.3 P0-1） |
+| `SessionBridge` (1207L) | 核心桥：挂载 adapter、事件序列化、Level-1/2/4 上报、命令处理、start/close | `bridge::ControlPlaneBridge`（async/tokio） | ✅ 已完成（P1 主干）；`publish_committed`/`committed_event_sink()`/`export_sink_handle()` 已落地（2026-10-22 关闭 §6.3 P0-1，§7）；类级残留见 §6.2 |
 | `FrameworkAdapter` (156L) | 框架适配 SPI（13 capability 常量 + attach/detach + extractContext/listMessages...） | `adapter::FrameworkAdapter`（async_trait，**13 capability 常量逐一对应**） | ✅ trait |
 | `EventJournal` (250L) | Level-2 事件崩溃安全本地 outbox（长度前缀记录 + 序列号 + sha256 身份） | `event_journal::EventJournal` | ✅ 已完成（含 `source_watermark`/`track_source`/`acknowledge` + 临时文件 rename 原子重写，§6.3 P1-2 已完成） |
 
@@ -69,8 +69,8 @@
 子包 `adapter`：
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
-| `AgentScopeAdapter` (936L) | AgentScope 框架适配（覆盖全部 capability） | `adapter::AgentScopeAdapter` | ✅ 已完成；**缺 `publishCommitted` 转发**（§6.3 P0-1） |
-| `ControlPlaneObserverMiddleware`（旧 `ControlPlaneObserverMiddleware`，267L） | 观察中间件（Level-2 事件源） | `adapter::ControlPlaneObserverMiddleware` | ✅ 已完成；**缺 native session-log 分支**（§6.3 P0-1） |
+| `AgentScopeAdapter` (936L) | AgentScope 框架适配（覆盖全部 capability） | `adapter::AgentScopeAdapter` | ✅ 已完成；`publishCommitted` 语义由 `BridgeReporter::publish_committed` 承接（2026-10-22 关闭 §6.3 P0-1，§7）；类级残留见 §6.2 |
+| `ControlPlaneObserverMiddleware`（旧 `ControlPlaneObserverMiddleware`，267L） | 观察中间件（Level-2 事件源） | `adapter::ControlPlaneObserverMiddleware` | ✅ 已完成；native session-log 分支由 `committed_export::ControlPlaneCommittedEventSink` 承接（2026-10-22 关闭 §6.3 P0-1，§7）；类级残留见 §6.2 |
 | `HarnessAgentTaskStarter` (533L) / `HarnessWorkspaceAgentFactory` (229L) | harness 任务启动/工作区 agent 工厂 | ✅ 已完成 | `src/adapter/task_starter.rs`（`HarnessAgentTaskStarter` impl `AgentTaskStarter` + `TurnRunner` seam + `run_to_outcome` 续跑循环 + `HarnessTurnRunner`）+ `src/adapter/workspace_factory.rs`（`HarnessWorkspaceAgentFactory` + `materialize`/`tools`/`permissions`/`skill_filter`/`apply_tool_selection`）；12 个新单测（含复现 Java `HarnessAgentTaskOutcomeTest` 的 5 个场景） |
 | `AgentTask*` 工具族（5 类：`AgentTaskOutcome`/`AgentTaskOutcomeTool`/`AgentTaskToolContext`/`AgentTaskCollaborationTool`/`AgentTaskStarter`） | AgentTask 工具/上下文/产物 | ✅ 已完成 | `src/adapter/agent_task.rs`（`AgentTaskOutcome`/`State`/`ToolContext`/`AgentTaskOutcomeTool`）+ `src/adapter/collaboration_tool.rs`（`AgentTaskCollaborationTool`）；都实现 core `Tool`；`READ_ONLY_TOOLS`/`TERMINAL_TOOLS` 与 Java 一致 |
 | `AgentRuntimeSource` (56L) / `SessionCompactor` (56L) / `SessionHistorySource` (35L) / `WorkspaceAgentFactory` (29L) | 适配器辅助 SPI | ✅ trait 已落（`src/adapter/support.rs`）；宿主具体实现待后续（P2） | `AgentRuntimeSource`/`SessionCompactor`/`SessionHistorySource` 已实现为 trait；`WorkspaceAgentFactory` 由 `HarnessWorkspaceAgentFactory`（`create(definition, assignment) -> Result<HarnessAgent, String>`）实现 |
@@ -129,6 +129,7 @@
 | `ControlPlaneBridge`（attach/start/close、事件→seq、Level-1/4 上报） | `SessionBridge` | ✅ 已完成（P1 主干） | 事件 emit 已**真接线**（assign seq → journal → tracker）；新增 `describe_session`/`set_busy`/`is_busy`/`set_effective_system_prompt`/`effective_system_prompt`/`set_context_used_tokens`/`is_known_session`/`reporter()`；`BridgeReporter` 为无所有权发布句柄 |
 | `AgentScopeAdapter` | 同名类 | ✅ 已完成（P1） | `src/adapter/agent_scope_adapter.rs`；实现 `FrameworkAdapter`（`can_handle` → ReActAgent/HarnessAgent；context/message/session-command/session-abort/task/plan/export/inbound 能力）；`extract_context`/`list_messages`/`execute_command`/`session_ids` 落地 |
 | `ControlPlaneObserverMiddleware` | 同名类 | ✅ 已完成（P1） | `src/adapter/observer_middleware.rs`；`on_agent`（session_start + 输入消息 + busy + 旁路 tap）、`on_acting`（tool_call）、`on_system_prompt`（采集有效 prompt）；tool_result 由 `ToolResultTextDelta`/`ToolResultEnd` 事件重组；token 取自 `AgentResult.reply` 的 `Msg.usage` |
+| native session-log 提交链路 | `SessionBridge.onCommittedEvent` + `AgentScopeAdapter.publishCommitted` + Observer 的 `SessionExportSink` 分支 | ✅ 已完成（2026-10-22） | `src/committed_export.rs`：`ControlPlaneCommittedEventSink` 实现 core `SessionExportSink`，`translate` 镜像 `publishNative` 白名单（message/tool_call/tool_result/compaction）；`BridgeReporter::publish_committed` 按 per-source watermark 去重后入 journal；宿主经 `export_sink_handle()` 显式接线（§7 / §7.4） |
 | 适配器辅助 SPI | `SessionCompactor` / `SessionHistorySource` / `AgentRuntimeSource` / `AgentTaskStarter` | ✅ 已完成（trait 层） | `src/adapter/support.rs`；`AgentTaskStarter` 已由 `HarnessAgentTaskStarter` 具体实现 |
 | harness ASDP 执行器 | `HarnessAgentTaskStarter` (27.5KB) | ✅ 已完成（P2） | `src/adapter/task_starter.rs`；带去重（`attemptId:generation`）、`task.ack`、`ensureRunning`（409 竞态）、workspace 定义物化、协作工具注册、`run_to_outcome` 续跑预算、`cancel_unfinished` 清理、`finish`/`fail` 上报 |
 | harness 工作区工厂 | `HarnessWorkspaceAgentFactory` (11.7KB) | ✅ 已完成（P2） | `src/adapter/workspace_factory.rs`；`materialize` 拒绝绝对路径/穿越/运行态段/私有内存/符号链接；`tools`/`permissions` 纯函数与 Java 同构 |
@@ -137,9 +138,9 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-**状态：部分完成（P0 + P1 主干已落地并通过构建/测试；剩余 P2 与架构级语义差异）**
+**状态：部分完成（P0 + P1 主干已全部落地并通过构建/测试——含 2026-10-22 关闭的 P0-1 native session-log 提交链路；剩余 P2「设计决定」、宿主实现待定与架构级语义差异）**
 
-**最新验证（2026-10-28）**：`cargo test -p agentscope-extensions-controlplane` → **144 lib + 4 e2e passed / 0 failed / 0 ignored（EXIT=0）**（基线 128 + 4，本轮 **+16**）；`cargo build -p agentscope-extensions-controlplane` 成功。§6.3 的 **P1-1 / P1-2 / P1-3 / P2-2 均已关闭**，明细与反向验证见 **§8**。
+**最新验证（2026-10-28）**：`cargo test -p agentscope-extensions-controlplane` → **144 lib + 4 e2e passed / 0 failed / 0 ignored（EXIT=0）**（基线 128 + 4，本轮 **+16**）；`cargo build -p agentscope-extensions-controlplane` 成功。§6.3 的 **P1-1 / P1-2 / P1-3 / P2-2 均已关闭**，明细与反向验证见 **§8**；**P0-1 已于 2026-10-22 关闭**（§7：128 lib + 4 e2e），§6.3 六项编号缺口（P0-1 / P1-1 / P1-2 / P1-3 / P2-1 设计决定 / P2-2）至此全部闭环。
 
 本次会话（2026-10-08）交付：`ControlPlaneObserverMiddleware`（Level-2 事件源）、`AgentScopeAdapter`（框架适配）、适配器辅助 SPI、**`AgentTask*` 工具族（`AgentTaskOutcome`/`State`/`ToolContext`/`AgentTaskOutcomeTool`/`AgentTaskCollaborationTool`）**、**`CollaborationClient`/`OrchestrationClient`**、**harness 侧 `HarnessAgentTaskStarter`/`HarnessWorkspaceAgentFactory`**、**运行时工具审批回环（`RuntimeApprovalSource` + `ConfirmHandler`）**，以及 **`ControlPlaneBridge` 事件 emit 的真接线**（原为 no-op 闭包 → 事件全被吞掉）。
 
@@ -245,6 +246,15 @@
 2. 本模块 P1：**已完成**（`AgentScopeAdapter` + `ControlPlaneObserverMiddleware` + `ControlPlaneBridge` 事件真接线 + `ContractHttpServer`）。剩余为 P2（见下第 3 条）与架构级语义差异（见 §4.1「语义差异」）。
 3. 本模块 P2：`AgentTask*` 工具族、`CollaborationClient`/`OrchestrationClient`、`HarnessAgentTaskStarter`/`HarnessWorkspaceAgentFactory`（harness 侧）、**运行时工具审批回环**（`RuntimeApprovalSource` + `ConfirmHandler`）均已交付（2026-10-08）。**仍未完成**：`GrpcTransport`（设计决定暂缓，需 ASDP proto 工具链）；`SessionCompactor`/`SessionHistorySource`/`AgentRuntimeSource` 的**宿主具体实现**（仅落 trait 层 —— 这三者是应用/宿主专属能力：压缩策略、`.log.jsonl`  transcript 读取、subagent/plan 视图，crate 内无法在不臆造 harness API 的前提下给出通用实现，故有意保留为注入点）；harness builder 无 MCP 服务器接线 → `mcpServers` 选择集仅计算并导出，实际建连由宿主完成。
 
+**真实剩余（2026-10-29 复核，均已在册，非新缺口）**：
+- `transport::GrpcTransport`（ASDP gRPC）：仍为「设计决定（不迁移）」——需 ASDP proto 工具链 + proto 文件；**该「设计决定」待汇总方最终确认**（§3.2 / §6.2）。
+- `SessionCompactor` / `SessionHistorySource` / `AgentRuntimeSource`：仅 trait 层（`adapter::support`），**无宿主具体实现**（§6.2 三处 ⚠️）。
+- 宿主接线仍需显式：export sink（`export_sink_handle()`）与 builder extensions 均无 core 的可变注入 API（§7.4）。
+- harness builder 无 MCP 接线；`mcpServers` 仅计算导出，建连归宿主。
+- §6.2 三处类级残留：`SessionBridge.onCommittedEvent` / `AgentScopeAdapter.publishCommitted` / Observer 的 `SessionExportSink` 分支——功能已由 `committed_export.rs` + `BridgeReporter::publish_committed` 承接，仅未逐方法名镜像。
+- journal 默认目录口径分歧：Rust 取 `~/.agentscope/service-controlplane/event-journal`，Java `EventJournal.java:80-88` 代码实际拼 `~/.agentscope/controlplane/event-journal`（javadoc 写前者）——是否回改待汇总方裁定（§6.3 P2-2）。
+- `acknowledge` 用 `i64`（对应 Java `Integer.MIN_VALUE` 语义），非 `Option<u64>`（§8.6 第 2 条）。
+
 ### 4.3 测试失败根因分析（历史问题，已修复）
 
 修复前基线：`cargo build` 通过，`cargo test` **53 passed / 2 failed**：
@@ -289,7 +299,7 @@
 |---|---|---|---|---|
 | `ControlPlane` | 69 | `lib.rs::instrument` | ✅ 已对齐 | 入口语义一致 |
 | `ControlPlaneConfig` | 247 | `config::ControlPlaneConfig` | ✅ 已对齐 | 20 字段逐一对应，校验一致 |
-| `SessionBridge` | 1207 | `bridge::ControlPlaneBridge` | ⚠️ 部分 | **缺 `onCommittedEvent(source, nativeSeq, event)`**（原生事件提交入口，§6.3 P0-1） |
+| `SessionBridge` | 1207 | `bridge::ControlPlaneBridge` | ⚠️ 部分 | **类级残留（非功能缺口）**：Java `onCommittedEvent(source, nativeSeq, event)` 在 Rust 侧由 `BridgeReporter::publish_committed` + `committed_event_sink()`/`export_sink_handle()` 承接，功能链路已落地（2026-10-22 关闭 §6.3 P0-1，§7），**仅未逐方法名镜像** |
 | `FrameworkAdapter` | 156 | `adapter::FrameworkAdapter` | ✅ 已对齐 | 13 capability 常量逐一对应 |
 | `EventJournal` | 250 | `event_journal::EventJournal` | ✅ 已对齐 | `source_watermark`/`track_source`/`acknowledge` + 原子 rewrite（2026-10-28） |
 | `model::SessionEvent` | 200 | `model::SessionEvent` | ✅ 已对齐 | 6 type + 4 role 常量一致 |
@@ -313,8 +323,8 @@
 | `transport::GrpcTransport` | 404 | — | ❌ 缺 | 设计决定（不迁移）：需 ASDP proto 工具链，P2 |
 | `transport::CollaborationClient` | 502 | `transport::CollaborationClient` | ✅ 已对齐 | 29 个端点全部落地（含 `replanRun`/`signalRun`/`uploadArtifact`/`downloadArtifact`，2026-10-28） |
 | `transport::OrchestrationClient` | 137 | `transport::OrchestrationClient` | ✅ 已对齐 | 19 方法逐一对应 |
-| `adapter::AgentScopeAdapter` | 936 | `adapter::AgentScopeAdapter` | ⚠️ 部分 | **缺 `publishCommitted` 转发到 bridge**（§6.3 P0-1） |
-| `adapter::ControlPlaneObserverMiddleware` | 267 | `adapter::ControlPlaneObserverMiddleware` | ⚠️ 部分 | **缺 native session-log 分支**（`SessionExportSink` 注入 + `publishNative` 映射，§6.3 P0-1） |
+| `adapter::AgentScopeAdapter` | 936 | `adapter::AgentScopeAdapter` | ⚠️ 部分 | **类级残留（非功能缺口）**：`publishCommitted` 转发由 `BridgeReporter::publish_committed` 承接（2026-10-22，§7），未在 adapter 上保留同名方法 |
+| `adapter::ControlPlaneObserverMiddleware` | 267 | `adapter::ControlPlaneObserverMiddleware` | ⚠️ 部分 | **类级残留（非功能缺口）**：native session-log 分支由独立模块 `committed_export::ControlPlaneCommittedEventSink`（`SessionExportSink` 注入 + `translate` 镜像 `publishNative`）承接，未内嵌进 Observer 本体（2026-10-22，§7） |
 | `adapter::HarnessAgentTaskStarter` | 533 | `adapter::HarnessAgentTaskStarter` | ✅ 已对齐 | 12 单测含复现 Java 5 场景 |
 | `adapter::HarnessWorkspaceAgentFactory` | 229 | `adapter::HarnessWorkspaceAgentFactory` | ✅ 已对齐 | |
 | `adapter::AgentTaskOutcome` | 63 | `adapter::AgentTaskOutcome` | ✅ 已对齐 | |
@@ -327,17 +337,17 @@
 | `adapter::SessionHistorySource` | 35 | `adapter::support::SessionHistorySource` | ⚠️ 部分 | 同上 |
 | `adapter::WorkspaceAgentFactory` | 29 | `adapter::support::WorkspaceAgentFactory` | ✅ 已对齐 | 由 `HarnessWorkspaceAgentFactory` 实现 |
 
-**统计（2026-10-28 更新）**：39 个 Java 类 → **✅ 已对齐 32 / ⚠️ 部分 6 / ❌ 缺 1**（❌ 缺的 `GrpcTransport` 为已判定的「设计决定（不迁移）」；6 项 ⚠️ 中 3 项是「仅 trait 层、宿主实现待定」的既有 P2 判定，其余 3 项为 P0-1 native session-log 链路的尾部（`SessionBridge` / `AgentScopeAdapter` / `ControlPlaneObserverMiddleware`））。
+**统计（2026-10-28 更新）**：39 个 Java 类 → **✅ 已对齐 32 / ⚠️ 部分 6 / ❌ 缺 1**（❌ 缺的 `GrpcTransport` 为已判定的「设计决定（不迁移）」；6 项 ⚠️ 中 3 项是「仅 trait 层、宿主实现待定」的既有 P2 判定，其余 3 项为 **P0-1 已关闭后的类级残留**（`SessionBridge` / `AgentScopeAdapter` / `ControlPlaneObserverMiddleware`：功能链路已由 `committed_export.rs` + `BridgeReporter::publish_committed` 承接，仅未按 Java 方法名逐字镜像；2026-10-22 关闭，见 §6.3 P0-1 / §7））。
 
 ### 6.3 新发现缺口清单
 
 | 编号 | 缺口项 | Java 参考 | 优先级 | 状态 | 说明 |
 |---|---|---|---|---|---|
-| P0-1 | **native session-log 提交链路未迁移** | `SessionBridge.onCommittedEvent` / `EventJournal.sourceWatermark` / `ControlPlaneObserverMiddleware` 的 `SessionExportSink` 分支 / `AgentScopeAdapter.publishCommitted` | P0 | 待办 | Java 在 `ReActAgent.sessionLogEnabled()` 时改走「核心 session log → 原生导出 sink → journal 强制落盘 → 按 source watermark 去重」的提交链路；Rust 侧 `agentscope-core` 已有 `SessionExportSink` / `SessionLogExporter`（`crates/agentscope-core/src/session/export.rs`），但**本 crate 完全没有引用**（`rg SessionExportSink crates/agentscope-extensions-controlplane` 无命中），且 `SessionLogExporter::new` 在 core 内**除测试外无生产调用方**（`rg SessionLogExporter::new crates/` 仅命中 `export.rs` 自身测试）。**已核实的 Rust 接入点**：`ReActAgent::session_log_enabled()`（`react_agent.rs:308`）、`HarnessAgent::session_log(context)`（`harness_agent.rs:214`）、`RuntimeContext::extension::<T>(key)` / `Extensions::insert_arc`（`runtime_context.rs:45/258`）、`SessionRecorder::open_with(log, turn_id, run_id, Option<Arc<SessionLogExporter>>)`（`recorder.rs:213`）——**后者是现成的 exporter 注入位**。后果：Rust 侧 Level-2 事件仍只来自 `on_agent`/`on_acting` 旁路 tap，无法消费核心已提交事件的原生流；与 Java 新基准不等价 |
+| P0-1 | **native session-log 提交链路未迁移** | `SessionBridge.onCommittedEvent` / `EventJournal.sourceWatermark` / `ControlPlaneObserverMiddleware` 的 `SessionExportSink` 分支 / `AgentScopeAdapter.publishCommitted` | P0 | **已完成（2026-10-29 勘误）**：原记「待办」，实际已于 **2026-10-22** 落地并关闭；依据见 §7 / 用例 `committed_events_from_a_real_run_reach_the_journal_once`、`duplicate_native_watermark_exports_once`、`source_watermark_is_durable_across_bridge_reopen`、`no_sink_configured_is_a_noop`（128 lib + 4 e2e）。落地形态：`src/committed_export.rs`（`ControlPlaneCommittedEventSink` 实现 core `SessionExportSink`，`translate` 镜像 `publishNative` 白名单）+ `BridgeReporter::publish_committed`（镜像 `onCommittedEvent`/`publishCommitted`，按 per-source watermark 去重）+ `EventJournal::source_watermark` + core `SessionExportSinkHandle` / `SessionLogExporter::for_session` 注入点；**宿主接线仍显式**（`export_sink_handle()` 需宿主装进 builder/session context，§7.4）。以下为 2026-10-22 复核时的原始判断，保留备查：Java 在 `ReActAgent.sessionLogEnabled()` 时改走「核心 session log → 原生导出 sink → journal 强制落盘 → 按 source watermark 去重」的提交链路；Rust 侧 `agentscope-core` 已有 `SessionExportSink` / `SessionLogExporter`（`crates/agentscope-core/src/session/export.rs`），但**本 crate 完全没有引用**（`rg SessionExportSink crates/agentscope-extensions-controlplane` 无命中），且 `SessionLogExporter::new` 在 core 内**除测试外无生产调用方**（`rg SessionLogExporter::new crates/` 仅命中 `export.rs` 自身测试）。**已核实的 Rust 接入点**：`ReActAgent::session_log_enabled()`（`react_agent.rs:308`）、`HarnessAgent::session_log(context)`（`harness_agent.rs:214`）、`RuntimeContext::extension::<T>(key)` / `Extensions::insert_arc`（`runtime_context.rs:45/258`）、`SessionRecorder::open_with(log, turn_id, run_id, Option<Arc<SessionLogExporter>>)`（`recorder.rs:213`）——**后者是现成的 exporter 注入位**。后果：Rust 侧 Level-2 事件仍只来自 `on_agent`/`on_acting` 旁路 tap，无法消费核心已提交事件的原生流；与 Java 新基准不等价 |
 | P1-1 | env 变量名未随重命名迁移 | `ControlPlaneStores.fromEnv` 用 `CONTROL_PLANE_HTTP` / `CONTROL_PLANE_AGENT_NAME` / `CONTROL_PLANE_NAMESPACE` | P1 | 已完成（2026-10-28） | 核对结论：Rust `from_env` 已使用同名键（无 `CONTROLPLANE_*` 遗留），本轮补 `from_lookup` 健壮点 + 2 个离线键名断言测试。依据：Java `ControlPlaneStores.java:65-70`（`requireEnv("CONTROL_PLANE_HTTP")` / `BUILDER_INTERNAL_TOKEN` / `CONTROL_PLANE_AGENT_NAME` + `envOr("CONTROL_PLANE_NAMESPACE","default")`） |
 | P1-2 | EventJournal 缺 source watermark + 选择性 ack | `EventJournal.sourceWatermark(String)` / `trackSource` / `acknowledge(Map<String,Integer>)` | P1 | 已完成（2026-10-28） | watermark/trackSource 已在 P0-1 落地（本次核对语义与 Java `sourceWatermarks.merge(..., Math::max)` + `__native__` 检查点一致）；本轮补 `acknowledge(&BTreeMap<String,i64>)`（空 map = no-op、先落序列检查点、只丢 `seq <= floor`、未知会话不误丢、临时文件 + rename 原子重写、失败时内存 backlog 不丢）+ `ControlPlaneBridge::acknowledge`。依据：Java `EventJournal.java:138-148`（acknowledge）、`:200-256`（persistSequences/rewrite 原子写）、`SessionBridge.java:611-639`（onEventAck） |
 | P1-3 | `CollaborationClient` 缺 4 个端点 | `replanRun` / `signalRun` / `uploadArtifact` / `downloadArtifact` | P1 | 已完成（2026-10-28） | 4 端点逐一对照：`POST run/replan`、`POST run/signals/{name}`（`idempotencyKey` + `payload` 缺省 `{}`）、`POST /api/v1/artifacts/uploads`（multipart，`sourceTaskId`/`targetType`/`targetRef` + `file`）、`POST /api/v1/artifacts/{id}/download?taskId=`（二进制）。新增 `send_bytes_with_headers` 与 `BytesResponse.content_type`，下载返回 `ArtifactContent { content_type, bytes }`，不经 `String`。依据：Java `CollaborationClient.java:323-421` |
-| P2-1 | crate 名与类型名未随 Java 重命名 | Java → `controlplane` | P2 | 设计决定（不迁移） | 建议**保留 Rust 侧 `controlplane` 命名**（crate 名、类型名），仅在文档/注释标注「对应 Java `agentscope-extensions-controlplane`」；理由：Rust 侧改名会波及 crate 名、import 路径与全部下游引用，收益仅是对齐命名，且本模块 Rust 无 controlplane crate 的对外依赖方需求 |
+| P2-1 | crate 名与类型名未随 Java 重命名 | Java → `controlplane` | P2 | **已完成（2026-10-22 改名）** | 建议**保留 Rust 侧 `controlplane` 命名**（crate 名、类型名），仅在文档/注释标注「对应 Java `agentscope-extensions-controlplane`」；理由：Rust 侧改名会波及 crate 名、import 路径与全部下游引用，收益仅是对齐命名，且本模块 Rust 无 controlplane crate 的对外依赖方需求；2026-10-29 勘误：原记「建议保留 Rust 侧 controlplane 命名 / Rust 无 controlplane crate」，实际 crate 名、`ControlPlane*` 类型前缀、`CONTROL_PLANE_*` env、journal 目录、sink 名均已按汇总 §4.5 裁定 3 完成改名，本条不再适用 |
 | P2-2 | 默认 journal 目录名未迁移 | Java `~/.agentscope/service-controlplane/event-journal` | P2 | 已完成（2026-10-28，已核） | Rust `event_journal.rs::default_journal_dir()` 已是 `~/.agentscope/service-controlplane/event-journal`（P0-1 时已改），本轮补断言测试。**Java 侧不一致已记录**：`ControlPlaneConfig.java:43` javadoc 写 `service-controlplane`，但 `EventJournal.java:80-88` 代码实际拼 `~/.agentscope/controlplane/event-journal`——属本地 outbox，不跨语言共享，按文档化约定（= 任务口径）保留 `service-controlplane`，是否回改为 Java 字面值待汇总方裁定 |
 
 ## 7. 静态复核记录（2026-10-22）

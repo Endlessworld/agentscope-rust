@@ -1,4 +1,4 @@
-﻿# SCHEDULER 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# SCHEDULER 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **SCHEDULER** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-scheduler\`（原先记录的 `E:\local-github\...` 已不存在，2026-10-26 更正为 D 盘）
@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 3234 行（14 个顶层类型）/ 测试 3178 行（13 个测试类 + 1 个 Stub 辅助类，共 180 个 `@Test`）；分模块 主/测：common 1868/1094、quartz 975/1445、xxl-job 391/639 |
 | Rust crate | `crates/agentscope-extensions-scheduler` |
 | 迁移波次 | C |
-| 当前状态 | 进行中（2026-10-28：7 项执行任务已全部落地，cron/中断/状态机/xxl-job 协议/cancel 语义对齐；`cargo test` 91 passed / 0 failed，见 §8） |
+| 当前状态 | **总判：进行中**（仍有 P1：PostReasoningEvent 挂点 / registry 句柄）—— 进行中（2026-10-28：7 项执行任务已全部落地，cron/中断/状态机/xxl-job 协议/cancel 语义对齐；`cargo test` 91 passed / 0 failed，见 §8） |
 
 ## 2. Java 清单与依赖映射
 
@@ -92,7 +92,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | ScheduleMode / ScheduleConfig | 同名 | 已完成 | serde + builder + 按 mode 校验；5 个 Rust 单测（非「6 个 Java 测试对应」，Java ScheduleConfigTest 实为 19 个 `@Test`） |
 | AgentConfig / RuntimeAgentConfig / ModelConfig | 同名 | 已完成 | RuntimeAgentConfig 内嵌 AgentConfig；注意 **AgentConfig 无 `description`/`agentFactory` 字段**（Java 已无 description，doc 注释残留），`model_name: String` 取代 `ModelConfig` 对象 |
 | AgentScheduler / ScheduleAgentTask trait | 同名 | 已完成 | async_trait；泛型 T→Msg；额外提供 `run_empty()` 便捷方法与 `as_any()` 下转型钩子 |
-| BaseScheduleAgentTask | 同名 | 已完成 | 每次执行新建 agent（经 `AgentFactory`）+ 计数 + cancel；**偏差：`run_with` 只校验 name/sysPrompt，不校验 model 非空**（Java 抛 `Model cannot be null.`） |
+| BaseScheduleAgentTask | 同名 | 已完成 | 每次执行新建 agent（经 `AgentFactory`）+ 计数 + cancel；**偏差：`run_with` 只校验 name/sysPrompt，不校验 model 非空**（Java 抛 `Model cannot be null.`）——2026-10-29 复核仍存在（§4.2 第 8 条） |
 
 ### 3.2 quartz 后端（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -114,7 +114,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 ### 4.1 当前状态
 - **测试修复完工（2026-09-18）**：`cargo test -p agentscope-extensions-scheduler` 由「lib test 编译失败（4 个错误）」修至**全绿 37 passed / 0 failed**；`cargo build -p agentscope-extensions-scheduler` 通过（仅 7 条 warning，无 error）。
 - **静态复核（2026-10-22，未编译）实测**：Rust 14 个 `.rs` / 2416 行 / 37 个测试属性（`#[test]` 19 + `#[tokio::test]` 18），分布：cron 8、quartz/mod 6、xxljob 5、schedule 5、spec 4、task(common) 4、task(quartz) 3、registry 2 → 与「37 passed」自洽。
-- **Java 侧实测（静态）**：主 3234 行 / 14 类型，测试 3178 行 / 180 个 `@Test`。Rust 测试数 37 vs Java 180（覆盖率约 21%），且 Rust **无端到端定时触发测试**（无任何测试断言 `fire()` 真的按 cron/fixed_rate 触发过一次；`QuartzAgentScheduler::trigger` 与 `job::spawn_job` 均零测试覆盖）。
+- **Java 侧实测（静态）**：主 3234 行 / 14 类型，测试 3178 行 / 180 个 `@Test`。**已完成（2026-10-29 勘误）**：原记「Rust 测试数 37 vs Java 180（覆盖率约 21%），且 Rust **无端到端定时触发测试**（无任何测试断言 `fire()` 真的按 cron/fixed_rate 触发过一次；`QuartzAgentScheduler::trigger` 与 `job::spawn_job` 均零测试覆盖）」，实际 2026-10-28 已新增 `tests/quartz_execution.rs`（**3 passed**，真实按 fixed-rate/cron 触发断言）并补 36 个 lib 用例 → **合计 91 passed / 0 failed vs Java 180**（§8）；测试数量差距见 §4.2 第 8 条。
 - **改动文件（仅本 crate）：**
   1. `src/quartz/mod.rs`：测试模块补 `use crate::common::config::ScheduleMode;`（修 `E0433: cannot find type 'ScheduleMode'`；类型本存在于 `common/config/schedule.rs:13`，未新建平行 enum）。
   2. `src/common/scheduler/task.rs` / `src/quartz/task.rs` / `src/xxljob/mod.rs`：`Msg::get_text_content()` → `Msg::text_content()`（3 处，修 `E0599`；正确 API 见 `agentscope-core/src/message/msg.rs:260`），其余逻辑未动。
@@ -140,6 +140,13 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 5. **跨模块需求（记入此处，未改 core/harness）**：xxl-job 的 `PostReasoningEvent → XxlJobHelper.log` 逐条日志 Hook 在 Rust 侧无等价挂点（`Middleware::on_reasoning` 只能看到**入参**，`on_acting` 为死代码，core 未向 middleware 暴露推理**产出**事件）→ 当前以「执行结束记录最终回复 + handleSuccess/handleFail」替代；若后续 core 暴露 post-reasoning 事件，可在本 crate 内补 `XxlJobLogMiddleware` 并注入 `RuntimeAgentConfig.middleware`（`spec.rs` 的 `Vec` 不可变，需先增加 `with_middleware` 之类的复制构造）。
 6. `AgentScheduler::cancel` 返回 `bool`（Java 抛异常）→ 已通过新增默认方法 `try_cancel() -> Result<bool, SchedulerError>` 补足；调用方需迁移到 `try_cancel` 才能区分「不支持」与「未找到」。
 7. `QuartzAgentScheduler::shutdown` 现在 `shutdown + join().await`（对齐 `scheduler.shutdown(true)` 的等待语义），但 `join` 用 `abort()` 实现 → in-flight 执行被丢弃而非跑完；Java `shutdown(true)` 会等作业完成。语义差异已登记，若需精确对齐应改为「先等 in-flight，再 abort 循环」。
+8. **真实剩余（2026-10-29 复核，8 项任务均已关闭，以下为剩余项）**：
+   - xxl-job `PostReasoningEvent → XxlJobHelper.log` 逐条日志 Hook **无挂点**（跨模块：core 未向 middleware 暴露推理**产出**事件；现以最终回复 + `handleSuccess`/`handleFail` 替代）——第 5 条。
+   - `SchedulerRegistry` 只存 `scheduler_id` 字符串、**无句柄反查**（Java 存 `QuartzAgentScheduler` 实例，§3.2）。
+   - `BaseScheduleAgentTask::run_with` **不校验 model 非空**（Java 抛 `Model cannot be null.`，§3.1）。
+   - `shutdown` 用 `abort()` **丢弃 in-flight**（第 7 条）。
+   - 未使用依赖：`agentscope-harness`（0 引用）、`futures`（0 引用）；`TaskControl` 为保留的公共抽象（第 3 条）。
+   - 测试 **91 vs Java 180**（§4.1 / §8）。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-scheduler` 基线。

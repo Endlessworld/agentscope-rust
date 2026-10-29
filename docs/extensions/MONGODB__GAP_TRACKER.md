@@ -1,4 +1,4 @@
-﻿# MONGODB 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# MONGODB 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **MONGODB** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-mongodb\`
@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22 静态复核） | 主代码 **2235 行（9 类）** / 测试 **2429 行（9 测试类 + 2 testutil，147 个 `@Test`，见 §2）** |
 | Rust crate | `crates/agentscope-extensions-mongodb` |
 | 迁移波次 | B |
-| 当前状态 | **进行中**（2026-10-26：静态复核留下的 3 项 P1 中 **2 项已闭环**——①builder `ttl_days` 已生效（`build()` 保留字段，无参 `ensure_indexes()` 据其建 TTL 索引）、②guard `database_name` 已生效（锁集合按库限定为 `scoped_collection(db, coll)`）；**仅剩** ③级联删快照链路在 Rust harness 侧无生产写入方（跨 crate，P1）；另有 5 项 P2。测试数由 76 增至 **79**（+3，见 §4.1「2026-10-26 会话」；本轮**未跑 cargo**，由主智能体统一验证）。详见 §3.3 / §4.1） |
+| 当前状态 | **总判：进行中**（P1 为跨模块吞吐缺口 + 真实驱动）—— **进行中（2026-10-29 复核）**（2026-10-26：静态复核留下的 3 项 P1 中 **2 项已闭环**——①builder `ttl_days` 已生效（`build()` 保留字段，无参 `ensure_indexes()` 据其建 TTL 索引）、②guard `database_name` 已生效（锁集合按库限定为 `scoped_collection(db, coll)`）；**仅剩** ③级联删快照链路在 Rust harness 侧无生产写入方（跨 crate，P1）；另有 5 项 P2。测试数 76 → 79（2026-10-26）→ **80 passed / 0 failed + doc-test 1**（2026-10-28 文末执行记录；2026-10-29 静态计数 lib 81 个 `#[test]`/`#[tokio::test]`，差 1 待 cargo 复核）。`DistributedStore` 五槽投影已于 2026-10-28 完成，§4.2-1 的「投影不足」已不成立。详见 §3.3 / §4.1） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -75,7 +75,7 @@
 | `MongodbSandboxExecutionGuard` + builder + lease + guard client | `sandbox/MongoSandboxExecutionGuard.java` | 已完成 | 插入 + 过期 reclaim + token 作用域释放 + `lease_ttl/3` 续约；builder 的 `database_name` **已生效**，锁集合按库隔离（见 §3.3、§4.1） |
 | `MongodbDistributedStore` 组合者 | `MongoDistributedStore.java` | 已完成（形态差异） | 五个组件访问器 + `to_harness_store()`；含 `on_delete` 级联删快照 |
 | 无真实 DB 可用的内存后端 | Java Testcontainers / Mockito | 已完成 | `client::InMemoryMongoClient` |
-| **离线单元测试** | Java 8 测试类 **147 `@Test`**（contract test 需 Docker） | **已完成（P1 收尾）** | 现状 lib **79**（2026-10-26 新增 3，原 76）+ doc-test **1**；crate **无 `tests/` 目录**（实测 `Test-Path` = False），全为 `#[cfg(test)]` 内联单测。本轮新增：GridFS 分块边界（`255*1024-1/-/+1`）、chunk 缺失/乱序报错、legacy 回退、`exists` 双路径、`database_name` 隔离、级联删快照、键转义 `.`/`$`/`\0`/`\` round-trip、TTL 索引、error-85 迁移（瞬态恢复 + 耗尽传播）、`delete_key` 公共路径 |
+| **离线单元测试** | Java 8 测试类 **147 `@Test`**（contract test 需 Docker） | **已完成（P1 收尾）** | 现状 lib **80 passed**（2026-10-28 执行记录；76 → 79 → 80；2026-10-29 静态计数 81 个 `#[test]`/`#[tokio::test]`）+ doc-test **1**；crate **无 `tests/` 目录**（实测 `Test-Path` = False），全为 `#[cfg(test)]` 内联单测。本轮新增：GridFS 分块边界（`255*1024-1/-/+1`）、chunk 缺失/乱序报错、legacy 回退、`exists` 双路径、`database_name` 隔离、级联删快照、键转义 `.`/`$`/`\0`/`\` round-trip、TTL 索引、error-85 迁移（瞬态恢复 + 耗尽传播）、`delete_key` 公共路径 |
 
 ### 3.2 其它待办（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |

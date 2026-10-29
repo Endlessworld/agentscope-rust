@@ -1,4 +1,4 @@
-﻿# SANDBOX 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# SANDBOX 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **SANDBOX** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-sandbox\`
@@ -18,7 +18,7 @@
 | Java 规模（实测行数） | 主代码 8832 / 测试 4554（见下表；2026-10-22 静态复核实测，见 §6） |
 | Rust crate | `crates/agentscope-extensions-sandbox` |
 | 迁移波次 | A |
-| 当前状态 | **已完成**（build 通过；**176 passed / 0 failed**（2026-10-28）；`fs_spec`、`kubernetes_files`、K8s 文件 API 与 E2B 原生传输**均已接线**，见 §3.2/§7） |
+| 当前状态 | **总判：进行中**（仍有 P1：PortForward / watch / fs_spec projection 等）—— **已完成**（build 通过；**176 passed / 0 failed**（2026-10-28）；`fs_spec`、`kubernetes_files`、K8s 文件 API 与 E2B 原生传输**均已接线**，见 §3.2/§7） |
 
 | Java 子模块 | 主代码 文件/行 | 测试 文件/行 | 顶层类型数 |
 |---|---|---|---|
@@ -85,7 +85,7 @@
 | `E2bSandboxClient` | harness `SandboxClient` 工厂 | `e2b::E2bSandboxClient`（别名）、`e2b::e2b_client` | 已完成 |
 | `E2bSandboxClientOptions` | 客户端配置 | `e2b::E2bSandboxClientOptions` | 已完成 |
 | `E2bSandboxState` | 可序列化状态 | `remote::RemoteSandboxStateData` | 已完成（投影式） |
-| `E2bEnvdProcessClient` | envd Connect/进程启动与流式事件 + 文件传输 | `e2b::{build_envd_start_json_body, encode_connect_envelope, decode_connect_frames, parse_envd_event, drain_envd_stream, EnvdEvent, EnvdStreamResult, E2bFileTransfer, upload_file, download_file, files_url, workspace_transfer_path}` | 部分完成（**JSON codec + envd `/files` 上传/下载 + workspace 路径校验已实现；Proto codec 设计决定不迁移**，见 §3.2） |
+| `E2bEnvdProcessClient` | envd Connect/进程启动与流式事件 + 文件传输 | `e2b::{build_envd_start_json_body, encode_connect_envelope, decode_connect_frames, parse_envd_event, drain_envd_stream, EnvdEvent, EnvdStreamResult, E2bFileTransfer, upload_file, download_file, files_url, workspace_transfer_path}` | **已完成（2026-10-29 勘误）**：原记「部分完成」；实际 JSON codec + envd `/files` 上传/下载 + `workspaceTransferPath` 路径校验均已落地，并由 `E2bFileTransfer` 实现本 crate 的 `SandboxFileTransfer`。Proto codec 为**设计决定（不迁移）**。依据 §3.2「E2B 原生文件传输接线」「E2B envd Proto codec」两行 / §7.2 ② / 用例 `workspace_transfer_path_stays_inside_the_workspace`、`file_transfer_uploads_and_downloads_through_envd_files`、`persist_tar_uses_envd_files_instead_of_base64_over_exec` |
 | `E2bPlatformHttp` | 平台 HTTP（create/connect/snapshot） | `e2b::E2bBackend` + `parse_sandbox_fields`/`envd_host`/`basic_auth_header` | 已完成 |
 | `E2bRetry` | 瞬态失败重试（含 408） | `retry::RetryPolicy::e2b` | 已完成 |
 | `E2bSnapshotRefs` | 原生快照标记字节 | `e2b::E2bSnapshotRefs`（magic prefix + 编解码） | 已完成 |
@@ -98,7 +98,7 @@
 ### 2.4 kubernetes 子模块（`io.agentscope.extensions.sandbox.kubernetes`，39 类）
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
-| `KubernetesSandbox` | harness `Sandbox` 实现（`SandboxFileTransfer`） | `remote::RemoteSandbox` + `kubernetes::KubernetesBackend` | 部分完成（`SandboxFileTransfer` 仅在 `kubernetes_files.rs` 独立声明，**未挂到 `RemoteSandbox`/`KubernetesBackend`**，见 §3.2） |
+| `KubernetesSandbox` | harness `Sandbox` 实现（`SandboxFileTransfer`） | `remote::RemoteSandbox` + `kubernetes::KubernetesBackend` | **已完成（2026-10-29 勘误）**：原记「部分完成（`SandboxFileTransfer` 仅在 `kubernetes_files.rs` 独立声明，未挂到 `RemoteSandbox`/`KubernetesBackend`）」；实际已接通——`KubernetesBackend::native_file_transfer` → `RemoteBackend::file_transfer` → `RemoteSandbox::file_transfer()`。依据 §3.2「Kubernetes 文件 API」行 / §7.2 ① / 用例 `remote::tests::native_file_transfer_is_published_after_the_handle_is_established`、`file_transfer_uploads_and_downloads_under_the_base_dir` |
 | `KubernetesSandboxClient` | harness `SandboxClient` 工厂 | `kubernetes::KubernetesSandboxClient`（别名）、`kubernetes::kubernetes_client` | 已完成 |
 | `KubernetesSandboxClientOptions` | 客户端配置 | `kubernetes::KubernetesSandboxClientOptions` | 已完成 |
 | `KubernetesSandboxState` | 可序列化状态 | `remote::RemoteSandboxStateData` | 已完成（投影式） |
@@ -136,7 +136,7 @@
 |---|---|---|---|
 | OkHttp / Java `HttpClient` | HTTP 传输 | `reqwest`（workspace） | 超时/头部/重试见 `http.rs`、`retry.rs` |
 | Jackson (`ObjectMapper`/`SimpleModule`) | JSON (反)序列化 + 子类型注册 | `serde` + `serde_json`（workspace） | state 经 harness 封闭 enum 序列化；无 Jackson 模块概念 |
-| `com.google.protobuf`（DynamicMessage，E2B envd） | envd Connect protobuf 帧 | **无** | 仅实现 JSON codec；Proto 待办（见 §3.2）。Rust `E2bCodec::Proto` 是**默认**值，`exec_in` 遇 Proto 直接返回 `SandboxExtensionError::Unsupported` |
+| `com.google.protobuf`（DynamicMessage，E2B envd） | envd Connect protobuf 帧 | **无** | 仅实现 JSON codec。**已完成（2026-10-29 勘误）**：原记「Proto 待办；`E2bCodec::Proto` 是默认值」，实际默认已改为 `E2bCodec::Json`（`#[default]` + `E2bSandboxClientOptions::default().codec` + `E2bCodec::parse` 回落三处一致），Proto 明确为**设计决定（不迁移）**，显式选择时 `exec_in` 返回 `SandboxExtensionError::Unsupported`。依据 §3.2「E2B envd Proto codec」行 / §7.2 ④ / 用例 `default_codec_exec_works_without_opt_in`、`proto_codec_exec_is_unsupported` |
 | Kubernetes Java client（`CustomResource`） | SandboxClaim CRD 读写 | `reqwest` 直连 K8s REST（`kubernetes.rs`） | 未引入 kube-rs 等依赖 |
 | `java.util.Base64` | 工作区 tar 的 base64 | `base64`（workspace） | `remote.rs` 分块上传/解码 |
 | `java.util.UUID` | session/claim id | `uuid`（workspace） | — |
@@ -176,7 +176,7 @@
 | 快照接入 | `NoopSnapshotSpec`/快照链路 | 已完成 | 复用 harness `SandboxSnapshot(Spec)`；E2B 原生快照走 `E2bSnapshotRefs` |
 | 工作区投影 | `WorkspaceSpec`/`WorkspaceMountSupport` | 已完成 | `workspace.rs` 生成确定性 shell 脚本（tar/base64 上传） |
 | 共享 HTTP/重试 | `*Http`/`*Retry` | 已完成 | `http.rs` + `retry.rs` |
-| 离线单测（137 个） | Java 测试 4554 行 | 已完成 | 分布见 §1.1 |
+| 离线单测（**176** 个；2026-10-29 勘误，原记 137） | Java 测试 4554 行 | 已完成 | 2026-10-28 实测 **176 passed / 0 failed**（§4.1 / §7.3），分布见 §1.1 |
 
 ### 3.2 P1（重要）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -188,16 +188,16 @@
 | E2B 快照删除与保留（`a0e89a3aa`） | `E2bPlatformHttp` 的 `deleteSnapshot` + `snapshotRetention` | **已完成（2026-10-20）** | `E2bBackend::delete_snapshot` 走 `DELETE /templates/{id}`（id 按单段 percent-encode，`team/x:v1` → `team%2Fx:v1`，否则 `/` 会被解析成额外路径段）；401/404 返回可诊断错误。`E2bSandboxClientOptions::snapshot_retention`（默认关闭，`Some(0)` 亦关闭）在创建原生快照后清理最旧的**本进程已知** id。**能力边界（代码注释与报告均已写明）**：E2B 无快照列表端点，`known_snapshots` 为进程内记录，重启后旧快照不可见、无法跨进程清理；`E2bSnapshotRefs` 只是 id 编码载体，不是列表来源 |
 | K8s 连接策略 1:1 | `InClusterStrategy`/`DirectStrategy`/`GatewayStrategy`/`PortForwardStrategy`/`ConnectionStrategy` | **已完成（3/4 策略；PortForward 仍缺）** | `KubernetesConnectionStrategy { Direct, InCluster, Gateway }` + `KubernetesSandboxClientOptions::{sandbox_api_url, connection_strategy, gateway_address}`；默认优先级对齐 Java `KubernetesSandboxClient.toConnectionConfig`：显式 option → `sandbox_api_url`（Direct）→ `gateway_name`（Gateway）→ InCluster。`resolve_connector_base_url(options, strategy, sandbox_id, pod_ip, gateway_address)`：Direct = 预置 router URL（去尾斜杠）；InCluster = `http://<podIp>:<port>`（IPv6 加方括号），无 pod IP 时用 **sandbox 自身**的 `<sandboxId>.<ns>.svc.cluster.local:<port>`（修正旧实现误用 gateway 名的偏差）；Gateway = `scheme://<addr>`（Java `formatUrl` 不追加端口）。Gateway 地址优先取注入值 `gateway_address`，否则读 CRD `GET /apis/gateway.networking.k8s.io/v1/namespaces/{ns}/gateways/{name}` → `status.addresses[0].value`（对齐 Java `GatewayStrategy`，无 RBAC 时记 warn 并报配置错误）。路由头：`connector_router_headers` 注入 `X-Sandbox-ID`/`X-Sandbox-Namespace`/`X-Sandbox-Port`/`X-Sandbox-Pod-IP`，`InCluster` 不注入（Java `shouldInjectRouterHeaders`），同时用于 `POST /execute` 与文件 API。**残留**：`PortForwardStrategy`（fabric8 `LocalPortForward`）无对应；Java 默认（无 apiUrl/gateway）为 port-forward，Rust 默认回落 InCluster → 已在此记差异。测试：`connection_strategy_derivation_matches_java_priority`、`direct_strategy_uses_the_configured_router_url`、`in_cluster_strategy_uses_pod_ip_then_service_dns`、`gateway_strategy_uses_the_external_address_without_a_port`、`router_headers_follow_the_strategy`、`exec_sends_router_headers_for_router_strategies`（httpmock 断言出站头）、`gateway_strategy_reads_the_address_from_the_crd`、`gateway_strategy_prefers_the_injected_address`、`gateway_address_is_parsed_from_the_crd_status` |
 | K8s 异常类 1:1 | `client/exceptions/*`（8 类） | 设计决定（归并） | 归并到 `SandboxErrorCode`/`SandboxExtensionError`；未逐类建模 |
-| 真实端点联调 | — | 待办 | 网络层已实现但无真实凭据；测试全离线（httpmock） |
-| Java 测试逐条对照 | Java tests 23 文件 / 4554 行 | 待办 | Rust 单测为功能等价重写，未逐条照搬 |
+| 真实端点联调 | — | 待办（2026-10-29 待复核） | 网络层已实现但无真实凭据；测试全离线（httpmock） |
+| Java 测试逐条对照 | Java tests 23 文件 / 4554 行 | 待办（2026-10-29 待复核） | Rust 单测为功能等价重写，未逐条照搬（现 176 个，见 §1.1） |
 
 ### 3.3 P2（增强）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| E2B 云桶挂载策略 | `e2b/mounts/E2bCloudBucketMountStrategy` | 待办 | 无 Rust 对应。**注意**：Java 该接口是**空占位**（`intentionally empty`），无实际方法，迁移价值为 0 |
-| E2B 沙箱创建环境变量 | `E2bSandboxClientOptions.envs`（`Map<String,Supplier<String>>`）+ `E2bPlatformHttp` 的 `envVars` 字段 | 待办 | Rust `E2bSandboxClientOptions` **无 `envs` 字段**，`build_create_sandbox_body` 只发 `{templateID, timeout}`，**不发送 `envVars`**。Java `E2bFilesystemSpec.env(name, value)` 亦无对应 |
-| K8s CRD spec 扩展字段 | `SandboxClaimSpec.lifecycle`（shutdownTime/shutdownPolicy）、`SandboxClaimSpec.additionalPodMetadata`（labels/annotations）、`CreateSandboxOptions.shutdownAfterSeconds` | 待办 | Rust `build_claim_body` 只发 `spec.warmPoolRef` |
-| K8s 客户端附加能力 | `SandboxClient.listActiveSandboxes`/`listAllSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName`、`K8sHelper.listSandboxClaims` | 待办 | 无 Rust 对应 |
+| E2B 云桶挂载策略 | `e2b/mounts/E2bCloudBucketMountStrategy` | 设计决定（不迁移）（2026-10-29 勘误：原记「待办」；Java 该类为 `intentionally empty` 空接口，无方法可迁） | 无 Rust 对应。**注意**：Java 该接口是**空占位**（`intentionally empty`），无实际方法，迁移价值为 0 |
+| E2B 沙箱创建环境变量 | `E2bSandboxClientOptions.envs`（`Map<String,Supplier<String>>`）+ `E2bPlatformHttp` 的 `envVars` 字段 | 待办（2026-10-29 待复核） | Rust `E2bSandboxClientOptions` **无 `envs` 字段**，`build_create_sandbox_body` 只发 `{templateID, timeout}`，**不发送 `envVars`**。Java `E2bFilesystemSpec.env(name, value)` 亦无对应 |
+| K8s CRD spec 扩展字段 | `SandboxClaimSpec.lifecycle`（shutdownTime/shutdownPolicy）、`SandboxClaimSpec.additionalPodMetadata`（labels/annotations）、`CreateSandboxOptions.shutdownAfterSeconds` | 待办（2026-10-29 待复核） | Rust `build_claim_body` 只发 `spec.warmPoolRef` |
+| K8s 客户端附加能力 | `SandboxClient.listActiveSandboxes`/`listAllSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName`、`K8sHelper.listSandboxClaims` | 待办（2026-10-29 待复核） | 无 Rust 对应 |
 | K8s K8sHelper 细分能力 | `client/internal/K8sHelper` | 部分完成 | 以 reqwest 直连覆盖 claim/status/exec；其余（列表、watch、端口转发、模板）未迁移 |
 | Jackson 模块 | `*HarnessSandboxJacksonModule` | 设计决定（不迁移） | serde 按 enum 变体序列化 |
 | 投影哈希算法对齐 | Java `MessageDigest` | 已完成（语义等价） | Rust 用 FNV-1a；仅用于变更检测，不跨语言互操作 |
@@ -208,7 +208,7 @@
 
 ### 4.1 当前状态
 - **已完成内容**：四个远端沙箱后端（agentrun / daytona / e2b / kubernetes）全部适配到 harness `Sandbox`/`SandboxClient` trait；共享 `RemoteBackend` glue、HTTP、重试、工作区投影、状态投影、快照接入均已落地。**四后端均为真实 reqwest HTTP 实现**（非 trait 占位）：agentrun 18 处 / daytona 13 处 / e2b 34 处 / kubernetes 14 处 HTTP 调用，各含 1 个 `impl RemoteBackend`。
-- **Rust 产物**：`src/` 12 个源文件（`lib/error/http/retry/workspace/remote/agentrun/daytona/e2b/kubernetes/fs_spec/kubernetes_files.rs`），**6721 行**；**137 个单测**（`#[test]` + `#[tokio::test]`，含 `#[tokio::test(start_paused = true)]`）。
+- **Rust 产物**：`src/` 12 个源文件（`lib/error/http/retry/workspace/remote/agentrun/daytona/e2b/kubernetes/fs_spec/kubernetes_files.rs`），**10201 行**；**176 个单测**（`#[test]` + `#[tokio::test]`，含 `#[tokio::test(start_paused = true)]`）。**已完成（2026-10-29 勘误）**：原记「6721 行 / 137 个单测」，实际以 §1.1（2026-10-28 实测）与 §7.3（176 passed）为准。
 - **验证（实测，汇总方基线）**：
   ```
   cargo build -p agentscope-extensions-sandbox   -> 通过（0 error）
@@ -222,8 +222,8 @@
 
 ### 4.2 下一步与阻塞
 1. **harness 抽象缺口（不改 harness，仅记录）**：harness `agent::sandbox` 的 `state` 模块为私有（`mod state;`），`RemoteSandboxState` **未在 `sandbox/mod.rs` re-export**（`pub use state::{InMemorySandboxStateStore, LocalSandboxState, SandboxState, SandboxStateStore};` 不含 `RemoteSandboxState`）。本 crate 因此无法命名 `RemoteSandboxState`，只能经 `serde_json` 与 `SandboxState::Remote` 变体互转（见 `remote.rs` 内注释）。**建议汇总方考虑 re-export `RemoteSandboxState`**；在裁定前本 crate 用现有公开面绕过，**未修改 harness**。
-2. **harness 缺少 `SandboxFilesystemSpec` / `SandboxFileTransfer`**：Java 扩展的 4 个 `*FilesystemSpec` 继承 harness Java `SandboxFilesystemSpec`（`io.agentscope.harness.agent.filesystem.spec`），`SandboxFileTransfer` 亦为 harness Java 类型（`io.agentscope.harness.agent.sandbox`）。**Rust harness 复核确认两者皆无**（`rg 'SandboxFilesystemSpec|SandboxFileTransfer' crates/agentscope-harness/src/` → 0 命中；harness 只有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`）。**已按裁定在本 crate 内建适配层**（`fs_spec.rs` 的 `SandboxFilesystemSpec` + `kubernetes_files.rs` 的 `SandboxFileTransfer`），**未改 harness/core**。若 harness 后续补齐同名类型，本 crate 的实现可直接切换继承/实现面，无需改调用点。**遗留**：Java `SandboxBackedFilesystem` 会在沙箱实现 `SandboxFileTransfer` 时**优先走原生传输**；Rust harness 无此机制，`fs_spec::SandboxFilesystemAdapter` 只能全量走 exec+base64。
-3. **P1 剩余**（2026-10-28 更新）：① `PortForwardStrategy`（fabric8 `LocalPortForward`）无对应，Java 在该场景（无 apiUrl/gateway）为默认 — Rust 回退 `InCluster`，已记差异；② E2B `workspaceOnVolume`（工作区在卷上时的 tar no-op / destroy 跳过 / 嵌套挂载 `--exclude`）未迁移；③ E2B `envs → envVars`、K8s `SandboxClaimSpec.lifecycle`/`additionalPodMetadata` 等 P2 字段。~~E2B Proto codec、K8s 策略语义、文件 API / 原生传输接线~~ → **已完成（见 §7）**。
+2. **harness 缺少 `SandboxFilesystemSpec` / `SandboxFileTransfer`**：Java 扩展的 4 个 `*FilesystemSpec` 继承 harness Java `SandboxFilesystemSpec`（`io.agentscope.harness.agent.filesystem.spec`），`SandboxFileTransfer` 亦为 harness Java 类型（`io.agentscope.harness.agent.sandbox`）。**Rust harness 复核确认两者皆无**（`rg 'SandboxFilesystemSpec|SandboxFileTransfer' crates/agentscope-harness/src/` → 0 命中；harness 只有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`）。**已按裁定在本 crate 内建适配层**（`fs_spec.rs` 的 `SandboxFilesystemSpec` + `kubernetes_files.rs` 的 `SandboxFileTransfer`），**未改 harness/core**。若 harness 后续补齐同名类型，本 crate 的实现可直接切换继承/实现面，无需改调用点。**遗留**：Java `SandboxBackedFilesystem` 会在沙箱实现 `SandboxFileTransfer` 时**优先走原生传输**；Rust harness 无此机制。**已完成（2026-10-29 勘误）**：原记「`fs_spec::SandboxFilesystemAdapter` 只能全量走 exec+base64」，实际适配器已优先原生传输（用例 `fs_spec::tests::adapter_write_prefers_native_transfer`、`adapter_read_prefers_native_transfer_and_windows_lines`），仅需调用方显式 `from_remote_sandbox(...)` / `filesystem_with_transfer(...)` 传入传输适配器（harness `Sandbox` 为 `dyn` 且无 `as_any`，无法自动下转，见 §7.5-3）。
+3. **P1 剩余**（2026-10-28 更新）：① `PortForwardStrategy`（fabric8 `LocalPortForward`）无对应，Java 在该场景（无 apiUrl/gateway）为默认 — Rust 回退 `InCluster`，已记差异；② E2B `workspaceOnVolume`（工作区在卷上时的 tar no-op / destroy 跳过 / 嵌套挂载 `--exclude`）未迁移；③ E2B `envs → envVars`、K8s `SandboxClaimSpec.lifecycle`/`additionalPodMetadata` 等 P2 字段。~~E2B Proto codec、K8s 策略语义、文件 API / 原生传输接线~~ → **已完成（见 §7）**。**2026-10-29 复核补充的完整残留清单**：(1) `PortForwardStrategy`（`LocalPortForward` 无对应）；(2) `GatewayStrategy` 无 watch（一次性读取）；(3) `K8sHelper` 的 list/watch/模板/port-forward 未迁移；(4) K8s `listSandboxClaims`/`listActiveSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName` 未迁移；(5) `SandboxFilesystemSpec` 缺 `executionGuard`/`workspaceProjectionEnabled`/`workspaceProjectionRoots`，且 `__workspace_projection__` 未真写入（仅常量保留）；(6) 原生传输需显式 `from_remote_sandbox`（`dyn Sandbox` 无 `as_any`）；(7) E2B `workspaceOnVolume` 与 `envs → envVars`；(8) K8s CRD `lifecycle`/`additionalPodMetadata`/`shutdownAfterSeconds`；(9) E2B `E2bCloudBucketMountStrategy`（Java 为空占位接口，迁移价值 0）。
 4. **真实端点联调**：需真实 E2B/Daytona/AgentRun/K8s 凭据；当前全部请求体构造/响应解析/重试均有离线单测覆盖。
 5. **跨模块需求**：无硬阻塞。本 crate 依赖 `agentscope-core`（`Msg`/`Error`/`RuntimeContext`）与 `agentscope-harness`（sandbox trait/类型、`WorkspaceSpec`/`ExecResult`/`SandboxState`/快照 trait、`filesystem`）。无 workspace 级依赖变更需求（所有依赖已在 workspace 定义或本 crate `[dependencies]` 声明）。
 
@@ -250,7 +250,7 @@
 | Java 测试 行/文件 | 1577 / 14 | **4554 / 23** | ❌ 严重过期（-2977）；e2b 测试 3→11 文件、412→3295 行 |
 | Java 顶层类型数 | 未记录 | **71**（+12 嵌套类型） | 补录 |
 | Rust 源文件数 | 12 | **12** | ✅ |
-| Rust 源码行数 | ~6069 | **6721** | ❌ 过期（-652） |
+| Rust 源码行数 | ~6069 | **6721** | ❌ 过期（-652）；（2026-10-29 勘误：现为 **10201 行 / 176 单测**，见 §1.1/§7.3） |
 | Rust 测试数 | 108 | **137**（`#[test]`+`#[tokio::test]`） | ❌ 过期（-29） |
 
 Rust 逐文件（行 / 测试标注）：`agentrun` 724/11、`daytona` 451/7、`e2b` 1921/43、`error` 113/3、`fs_spec` 853/18、`http` 166/3、`kubernetes` 547/9、`kubernetes_files` 748/20、`lib` 45/0、`remote` 825/11、`retry` 172/7、`workspace` 156/5。
@@ -284,7 +284,7 @@ Rust 逐文件（行 / 测试标注）：`agentrun` 724/11、`daytona` 451/7、`
 | 2 | agentrun「11 / 1624，测试 3 / 315」 | 主 11 / **1626**，测试 **4 / 375** | §1 已改 |
 | 3 | e2b「13 / 1415，测试 3 / 412」 | 主 13 / **2216**，测试 **11 / 3295** | §1 已改 |
 | 4 | kubernetes「39 / 4094，测试 8 / 850」 | 主 39 / **4099**，测试 8 / **884** | §1 已改 |
-| 5 | Rust「12 个源文件，~6069 行」 | 12 个源文件，**6721 行** | §1.1 已改 |
+| 5 | Rust「12 个源文件，~6069 行」 | 12 个源文件，**6721 行** | §1.1 已改；（2026-10-29 勘误：现为 **10201 行 / 176 单测**，见 §1.1/§7.3） |
 | 6 | Rust 单测「108」 | **137**（`#[test]`+`#[tokio::test]`，`retry.rs` 4→7、`fs_spec.rs` 17→18、`e2b.rs` 15→43） | §1.1/§3.1/§4.1 已改 |
 | 7 | §1.1 `e2b.rs` 单测 15 | **43** | §1.1 已改 |
 | 8 | §1.1 `fs_spec.rs` 单测 17 | **18** | §1.1 已改 |

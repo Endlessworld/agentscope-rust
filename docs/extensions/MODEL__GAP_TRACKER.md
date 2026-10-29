@@ -19,7 +19,7 @@
 | Java 规模（去空行口径，rollup 使用） | 主代码 30058 行 / 测试 54660 行（= 33819 / 63416 扣除空行；**与上一行同源同文件，仅统计口径不同**，跨会话引用时勿混用） |
 | Rust crate | `crates/agentscope-extensions-model` |
 | 迁移波次 | A |
-| 当前状态 | **主体完成（provider 主链路 + 剩余 P1）** — `common`（HTTP seam + error/capabilities/usage/diagnostics/media/model_map/**multi_agent**）+ `ollama` + `dashscope`（含**加密 seam** 与**多智能体**）+ `anthropic`（含**内置 server tool**）+ `gemini` + `openai` / `responses`（含**多智能体分组**）/ `anthropic_async` + `openai-official`（含 proxy / x-should-retry / 枚举白名单）+ `relay`。2026-10-28 实测：**56 个源文件 / 22111 物理行 / 369 内联 + 5 集成测试 = 374 passed / 0 failed**。仍开放：anthropic 并行 tool-use 拆分、gemini Vertex AI、内置远程媒体下载、openai `compat.*` 厂商 formatter、`DashScopeMultiModalTool` 覆盖度、Java 测试逐条对照 |
+| 当前状态 | **总判：进行中**（仍有 P1 代码/对齐缺口）—— **主体完成（provider 主链路 + 剩余 P1）** — `common`（HTTP seam + error/capabilities/usage/diagnostics/media/model_map/**multi_agent**）+ `ollama` + `dashscope`（含**加密 seam** 与**多智能体**）+ `anthropic`（含**内置 server tool**）+ `gemini` + `openai` / `responses`（含**多智能体分组**）/ `anthropic_async` + `openai-official`（含 proxy / x-should-retry / 枚举白名单）+ `relay`。2026-10-28 实测：**56 个源文件 / 22111 物理行 / 369 内联 + 5 集成测试 = 374 passed / 0 failed**。仍开放：anthropic 并行 tool-use 拆分、gemini Vertex AI、内置远程媒体下载、openai `compat.*` 厂商 formatter、`DashScopeMultiModalTool` 覆盖度、Java 测试逐条对照 |
 
 ### 1.1 验证基线（2026-09-19 实测；2026-09-21 / 2026-10-12 更新；2026-10-22 静态复核）
 
@@ -158,8 +158,8 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | `dashscope.formatter.DashScopeMediaConverter` | 图片/音频/视频 → part | `dashscope::converter::{image_part, audio_part, video_part, data_part}` | 部分（函数级覆盖） |
 | `dashscope.formatter.DashScopeToolsHelper` | 工具/工具选择转换 | `dashscope::converter::{to_dashscope_tools, to_tool_choice_value}` | 部分（`Required→auto` 降级带 diagnostics） |
 | `dashscope.formatter.DashScopeResponseParser` | 响应 → `ChatResponse` | `dashscope::parser::{parse_response, DashScopeStreamIncrementer}` | 等价 |
-| `dashscope.formatter.DashScopeConversationMerger` | 多轮/多智能体会话合并（`<history>`） | 无 | **待办**（`converter.rs` 内 `merge` 命中均为 options 合并，无会话合并） |
-| `dashscope.formatter.DashScopeMultiAgentFormatter` | 多智能体格式化 | 无 | **待办** |
+| `dashscope.formatter.DashScopeConversationMerger` | 多轮/多智能体会话合并（`<history>`） | 无 | **待办**（`converter.rs` 内 `merge` 命中均为 options 合并，无会话合并）。**已完成（2026-10-29 勘误）**：实际 `dashscope::converter::{merge_conversation, merge_multimodal_conversation}` 已落地；依据 §9.4 / 用例 `multi_agent_text_mode_merges_groups_with_history_tags` |
+| `dashscope.formatter.DashScopeMultiAgentFormatter` | 多智能体格式化 | 无 | **待办**。**已完成（2026-10-29 勘误）**：实际 `dashscope::converter::to_multi_agent_messages` + `DashScopeChatModel::with_multi_agent_formatter` + provider `multiAgentFormatter` 选项已落地；依据 §9.4 / 用例 `multi_agent_formatter_is_applied_to_the_request_body` |
 | `dashscope.tool.DashScopeMultiModalTool`（93.5 KB / 29 文件之一） | 多模态工具（TTS/图像/视频等） | 无 | **待办**（本模块最大单文件） |
 
 ### 2.3 openai（53 类 / 9853 行）— **部分完成（2026-09-21 自 core 迁入本 crate）**
@@ -196,7 +196,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | `anthropic.formatter.AnthropicResponseParser` | 响应解析（含 cache control / thinking） | `anthropic::parser::{parse_message, AnthropicStreamIncrementer}` | thinking→text→tool_use；cache token 加回 input；流式增量器缓冲 tool 参数分片 |
 | `anthropic.formatter.AnthropicToolsHelper` | 工具转换 | `anthropic::converter::{to_anthropic_tools, to_tool_choice, apply_extra_body_params}` | `disable_parallel_tool_use = !parallel_tool_calls`；`Required`→`any`；末个工具带 cache_control |
 | `anthropic.formatter.AnthropicServerToolHelper`（旧表漏记） | server tool 块 ↔ SDK 内容块互转、结果状态映射 | `anthropic::parser::{METADATA_SERVER_TOOL_RESULT, blocks_of, server_tool_result_block}` + `anthropic::converter`（`ServerToolUse` 回显、`is_server_tool()` 分支） | **部分完成**：解析侧（`server_tool_use` / `web_search_tool_result` / `code_execution` / `bash_code_execution` / `text_editor_code_execution` / `tool_search` → `ToolResultBlock` + metadata）已实现且有 3 个单测；**Java 侧的 `ToolValidator` 校验与 `ServerToolUseBlockParam` 声明构造无对应** |
-| `anthropic.tool.AnthropicServerTool`（旧表漏记） | server tool 声明（web_search 等内置工具） | 无独立类型（`GeminiServerTool` 有对等物，Anthropic 侧无） | **待办**：Rust 无法把「内置 server tool」声明进请求，只能回显服务端已返回的块 |
+| `anthropic.tool.AnthropicServerTool`（旧表漏记） | server tool 声明（web_search 等内置工具） | 无独立类型（`GeminiServerTool` 有对等物，Anthropic 侧无） | **待办**：Rust 无法把「内置 server tool」声明进请求，只能回显服务端已返回的块。**已完成（2026-10-29 勘误）**：实际 `anthropic::server_tool::AnthropicServerTool` + `converter::{to_anthropic_tools_with_server, build_request_with_server_tools}` 已落地（server 先声明、名字全局唯一 fail-fast）；依据 §9.2 / 用例 `server_tools_are_declared_before_client_tools` |
 | SDK wire 类型（`MessageCreateParams`/`MessageParam`/`Message`/`RawMessageStreamEvent`） | Anthropic 官方 SDK | `anthropic::dto::{AnthropicRequest, AnthropicMessage, AnthropicContentBlock, AnthropicMessageResponse, AnthropicStreamEvent}` | Java 用官方 SDK，Rust 无对应依赖→自建 DTO/parser（方案裁定见 §4.2） |
 
 > **传输层裁定**（2026-09-19）：采用 §4.2 选项 (b) —— 复用本 crate 既有 `HttpTransport` seam + `ReqwestTransport`（生产）/`MemoryTransport`（离线测试）手写 Anthropic Messages 协议，**未引入新 HTTP / 厂商 SDK 依赖**。
@@ -241,28 +241,29 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | JUnit 5 / Mockito | 测试 | `#[test]` / `#[tokio::test]` + `MemoryTransport` fake | 离线，不新增 HTTP mock crate |
 | Spring Boot AutoConfiguration | DI / 自动装配 | 不适用 | **设计决定（不迁移）**（本模块 Java 侧亦无 Spring 依赖，`pom.xml` 仅 core/jackson/reactor/junit） |
 | `agentscope-core` / `agentscope-harness` | 内部依赖 | path 依赖 `../agentscope-core`（`Cargo.toml` 实测仅此一项 path 依赖） | ✅ **2026-10-22 复核**：§3.3 记「`agentscope-harness` 在本 crate 源码中零引用」与 §3.3「已完成（2026-09-21 从 `Cargo.toml` 移除）」**均成立**——`Cargo.toml` 当前只有 `agentscope-core` 一个 path 依赖，源码中 `agentscope_harness` 出现 **0** 次 |
-| `openai-java` 官方 SDK（`openai-official` 子模块） | Responses API 官方客户端 | `async-openai` 0.41（`features` 含 `responses` / `response-types`）+ `crate::responses` 自建 request/stream/parse | **待裁定（2026-10-22 复核）**：见 §2.8；SDK 路径不同但**能力缺口独立存在** |
+| `openai-java` 官方 SDK（`openai-official` 子模块） | Responses API 官方客户端 | `async-openai` 0.41（`features` 含 `responses` / `response-types`）+ `crate::responses` 自建 request/stream/parse | **待裁定（2026-10-22 复核）**：见 §2.8；SDK 路径不同但**能力缺口独立存在**。**已完成（2026-10-29 勘误）**：原记「待裁定」，实际已定：不引入官方 SDK，用 `common::HttpTransport` + 自建 wire DTO（§8.1），provider id / 前缀均对齐（§8.2）；双实现取舍见 §9.7 |
 
-### 2.8 openai-official（14 类 / 3716 行）— **未对照（真实缺口）**
+### 2.8 openai-official（14 类 / 3716 行）— **已完成（2026-10-29 勘误；原记「未对照（真实缺口）」）**
 > **2026-10-22 复核新增**：本节此前**完全缺失**（旧版仅在 §1 提到「旧版漏记 `openai-official`」）。Java 侧 `agentscope-extensions-model-openai-official` 是**独立 Maven 子模块**，依赖官方 `openai-java` SDK；provider id = **`openai-official`**，模型 id 前缀 = **`openai-official:`**（`OpenAIOfficialModelProvider` 的 `MODEL_ID` 正则 `openai-official:.+`），并有独立 SPI 注册文件。
 > ⚠️ **关键区分**：Rust 侧 `crate::responses`（`OpenAiResponsesModel` / `OpenAiResponsesProvider`，provider id = core 常量 `openai-responses` = `"openai-responses"`）**不是**本子模块的等价物——provider id、SDK、id 前缀三者全不同，**不可互相顶替**。
+> **已完成（2026-10-29 勘误）**：原记「未对照（真实缺口）」，实际 §8 已 Phase 1 完整落地（`openai_official` 10 文件：provider id `openai-official` 可解析 + `Model` 调用链 + 错误翻译），§9.5 关闭 Phase 2 三项（ProxyConfig / `x-should-retry` / 枚举白名单）；依据见 §8.1 / §8.2 / §9.5 / §9.6，用例 `provider::tests::registers_and_resolves_in_core_registry`、`request::tests::option_enums_are_validated_against_the_java_whitelists`。下表逐行勘误，原缺口描述保留。
 | Java 类 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
-| `openaiofficial.OpenAIResponsesChatModel`（415 行） | Responses 协议聊天模型主类 | `responses::OpenAiResponsesModel`（`src/responses/mod.rs`，691 行） | **部分完成**：请求/流式/解析主干有对等物；但 Java 侧 `ResponsesMultiAgentFormatter` 注入、`List<OpenAIServerTool> serverTools` 注入、`additionalBodyParams` 白名单 fail-fast **无对应** |
-| `openaiofficial.OpenAIOfficialModelProvider`（118 行） | SPI 注册 provider（前缀 `openai-official:`） | `responses::OpenAiResponsesProvider`（provider id `openai-responses`，`supports()` 返回 `true` 兜底） | **不等价**：provider id 与前缀均不同，Rust 侧无 `openai-official:` 前缀解析 |
-| `openaiofficial.ResponsesRequestMapper`（**834 行**，本子模块最大类） | `Msg` → Responses `ResponseCreateParams` 全量映射 | `responses::build_request`（`src/responses/mod.rs:226`） | **部分完成**：system→instructions、user→easy message、tool_use→function_call、tool_result→function_call_output 已覆盖；**多智能体分组 / 多模态图片 / `additionalBodyParams` 白名单 fail-fast / `prompt_cache_key` 等 body 参数**无对应 |
-| `openaiofficial.ResponsesMultiAgentFormatter`（355 行） | 多智能体分组（SYSTEM / TOOL_SEQUENCE / AGENT_CONVERSATION / BYPASS）+ `<history>` 包裹 | **无** | **缺失**：Rust `responses` 无任何 `<history>` / 多智能体分组实现（`responses/mod.rs` 全文无 `history`） |
-| `openaiofficial.ResponsesStreamingAssembler`（355 行） | SSE 流式装配（reasoning / message / function_call 分桶） | `responses::ResponsesIncrementer`（`:397`） | **部分完成**：text delta / reasoning delta / function_call arguments delta → `ToolUse` 已覆盖（`src/responses/mod.rs:9-13` 文档 + `accumulate`/`into_final`）；**`encryptedContent` / reasoning item 回放 / BYPASS 分支**无对应 |
-| `openaiofficial.ResponsesResponseParser`（211 行） | 非流式响应 → `ChatResponse`（reasoning/message/function_call 分桶 + refusal 短路） | `responses::ResponsesIncrementer::into_final` + `status_string` | **部分完成**：非流式与流式共用增量器；**refusal 短路（不可重试异常）**无对应 |
-| `openaiofficial.ResponsesHelper`（194 行） | 辅助构造 | 无独立类型 | 功能级可由 `responses` 的 `easy_message` / `to_request_tools` / `to_tool_choice` 覆盖，但**无一一对应物** |
-| `openaiofficial.OpenAISdkClientFactory`（139 行） | SDK client 工厂 | 无 | **设计决定候选**：Rust 用 `async-openai` 的 `Client::with_config`，不需工厂层 |
-| `openaiofficial.OpenAIOfficialConstants`（70 行） | provider id / `additionalBodyParams` 白名单 / metadata 命名空间键 | 无 | **缺失**：白名单 fail-fast 行为是 Java 侧的实际请求校验，Rust 无 |
-| `openaiofficial.OpenAIErrorTranslator`（128 行） | SDK 异常 → 统一异常 | `common::error::ModelError` + `responses::map_openai_error`（`:216`） | **部分完成**：`map_openai_error` 目前只映射 `ApiError`→`Error::HttpStatus` / 其余→`Error::Model`，**未走 `ModelError::from_parts` 的结构化归一**（与 `openai/mod.rs:338` 的实现不一致——后者已用 `ModelError::from_parts` + `ErrorKind::Timeout`/`Network`）。⚠️ **本轮新发现的不一致点** |
+| `openaiofficial.OpenAIResponsesChatModel`（415 行） | Responses 协议聊天模型主类 | `responses::OpenAiResponsesModel`（`src/responses/mod.rs`，691 行） | **部分完成**：请求/流式/解析主干有对等物；但 Java 侧 `ResponsesMultiAgentFormatter` 注入、`List<OpenAIServerTool> serverTools` 注入、`additionalBodyParams` 白名单 fail-fast **无对应**。**已完成（2026-10-29 勘误）**：原记三项「无对应」，实际 `openai_official::model::OpenAIResponsesChatModel` 已覆盖 stream/非流式 + options 合并 + 连接字段校验，formatter / serverTools / `additionalBodyParams` 白名单分别见 §8.2 与 §9.5 第 3 项 |
+| `openaiofficial.OpenAIOfficialModelProvider`（118 行） | SPI 注册 provider（前缀 `openai-official:`） | `responses::OpenAiResponsesProvider`（provider id `openai-responses`，`supports()` 返回 `true` 兜底） | **不等价**：provider id 与前缀均不同，Rust 侧无 `openai-official:` 前缀解析。**已完成（2026-10-29 勘误）**：原记「不等价 / 无前缀解析」，实际 `openai_official::provider::OpenAIOfficialModelProvider` 以 provider id `openai-official`、前缀 `openai-official:` 注册于 `default_openai_official_registry()`；依据 §8.1 / 用例 `provider::tests::registers_and_resolves_in_core_registry` |
+| `openaiofficial.ResponsesRequestMapper`（**834 行**，本子模块最大类） | `Msg` → Responses `ResponseCreateParams` 全量映射 | `responses::build_request`（`src/responses/mod.rs:226`） | **部分完成**：system→instructions、user→easy message、tool_use→function_call、tool_result→function_call_output 已覆盖；**多智能体分组 / 多模态图片 / `additionalBodyParams` 白名单 fail-fast / `prompt_cache_key` 等 body 参数**无对应。**已完成（2026-10-29 勘误）**：原记四项「无对应」，实际 `openai_official::request` 已覆盖（options / 白名单 + rejected fields fail-fast / history 含多模态 image / data / reasoning 回放 / `prompt_cache_key`）；依据 §8.2 / §9.5 第 3 项 |
+| `openaiofficial.ResponsesMultiAgentFormatter`（355 行） | 多智能体分组（SYSTEM / TOOL_SEQUENCE / AGENT_CONVERSATION / BYPASS）+ `<history>` 包裹 | **无** | **缺失**：Rust `responses` 无任何 `<history>` / 多智能体分组实现（`responses/mod.rs` 全文无 `history`）。**已完成（2026-10-29 勘误）**：原记「无 / 缺失」，实际 `openai_official::formatter::ResponsesMultiAgentFormatter` 已落地，`crate::responses` 亦于 §9.6 补齐 `merge_multi_agent_history`；依据 §8.2 / §9.6 / 用例 `multi_agent_merges_agent_turns_and_keeps_system_and_tool_sequences` |
+| `openaiofficial.ResponsesStreamingAssembler`（355 行） | SSE 流式装配（reasoning / message / function_call 分桶） | `responses::ResponsesIncrementer`（`:397`） | **部分完成**：text delta / reasoning delta / function_call arguments delta → `ToolUse` 已覆盖（`src/responses/mod.rs:9-13` 文档 + `accumulate`/`into_final`）；**`encryptedContent` / reasoning item 回放 / BYPASS 分支**无对应。**已完成（2026-10-29 勘误）**：原记三项「无对应」，实际 `openai_official::parser::ResponsesStreamingAssembler` 已覆盖 output_item.added/done、reasoning summary / text / encrypted、终态 reasoning replay 元数据与 BYPASS 分组；依据 §8.2 |
+| `openaiofficial.ResponsesResponseParser`（211 行） | 非流式响应 → `ChatResponse`（reasoning/message/function_call 分桶 + refusal 短路） | `responses::ResponsesIncrementer::into_final` + `status_string` | **部分完成**：非流式与流式共用增量器；**refusal 短路（不可重试异常）**无对应。**已完成（2026-10-29 勘误）**：原记「refusal 短路无对应」，实际 `openai_official::parser::parse_response` 在 refusal 时短路为错误；依据 §8.2 / 用例 `parser::tests::refusal_short_circuits_to_error` |
+| `openaiofficial.ResponsesHelper`（194 行） | 辅助构造 | 无独立类型 | 功能级可由 `responses` 的 `easy_message` / `to_request_tools` / `to_tool_choice` 覆盖，但**无一一对应物**。**已完成（2026-10-29 勘误）**：原记「无独立类型」，实际 `openai_official::parser::{extract_response_metadata, extract_usage}` 已覆盖（id/status/incomplete_reason/citations + 各类 token + wall-clock）；依据 §8.2 |
+| `openaiofficial.OpenAISdkClientFactory`（139 行） | SDK client 工厂 | 无 | **设计决定候选**：Rust 用 `async-openai` 的 `Client::with_config`，不需工厂层。**已完成（2026-10-29 勘误）**：原记「候选设计决定」，实际 `openai_official::model::{default_transport, build_http_request}` 承担工厂职责，且 `ProxyConfig` / `build_client` 已实现（§8.4 第 1 项 / §9.5 第 1 项）；依据 §8.2 |
+| `openaiofficial.OpenAIOfficialConstants`（70 行） | provider id / `additionalBodyParams` 白名单 / metadata 命名空间键 | 无 | **缺失**：白名单 fail-fast 行为是 Java 侧的实际请求校验，Rust 无。**已完成（2026-10-29 勘误）**：原记「缺失」，实际 `openai_official::constants`（provider id / 前缀 / 默认 base URL / env 名 / 10 项 body-params 白名单 / 元数据键 / 可重试集）已落地；依据 §8.2 / 用例 `provider::tests::create_applies_builder_options_and_strips_them`（白名单 honor） |
+| `openaiofficial.OpenAIErrorTranslator`（128 行） | SDK 异常 → 统一异常 | `common::error::ModelError` + `responses::map_openai_error`（`:216`） | **部分完成**：`map_openai_error` 目前只映射 `ApiError`→`Error::HttpStatus` / 其余→`Error::Model`，**未走 `ModelError::from_parts` 的结构化归一**（与 `openai/mod.rs:338` 的实现不一致——后者已用 `ModelError::from_parts` + `ErrorKind::Timeout`/`Network`）。⚠️ **本轮新发现的不一致点**。**已完成（2026-10-29 勘误）**：原记「未走 `ModelError::from_parts`」，实际 `openai_official::error` 已用 `ModelError::from_parts` + `ErrorKind`（`error.rs:55`），408/409/429/5xx 可重试、401/403/404/422 不可重试；依据 §8.2 / 用例 `error::tests::official_retryable_status_set_includes_408_and_409`。（`responses::map_openai_error` 的同类问题已于 2026-10-22 修复，见 §7.1） |
 | `openaiofficial.OpenAIOfficialModelException`（101 行） | 模块异常 | `agentscope_core::Error` | **设计决定**：不建平行异常体系 |
-| `openaiofficial.credential.OpenAIOfficialCredential`（127 行） | 凭据载体 | 无独立类型；经 `ModelCreationContext.api_key` / `OPENAI_API_KEY` | 与 `openai.credential.OpenAICredential` 同处理（§2.3 已记为待办/待裁定） |
-| `openaiofficial.tool.OpenAIServerTool`（125 行） | 内置 server tool 声明（web_search / code_interpreter / image_generation / tool_search） | **无** | **缺失**：Rust `responses::to_request_tools`（`:334`）**只构造 `Tool::Function`**，无任何内置 server tool 变体。⚠️ 与 gemini 侧 `GeminiServerTool`（已实现）对比明显 |
-| `openaiofficial.tool.ResponsesServerToolHelper`（**544 行**，本子模块第二大类） | server tool 块 ↔ SDK 互转 + 结果状态映射 | **无** | **缺失**：Rust 侧无 server-tool 声明/校验/结果映射 |
-| `resources/META-INF/services/...ModelProvider` | SPI 注册（`OpenAIOfficialModelProvider`） | `responses::default_responses_registry` | **设计决定**（Rust 无 `ServiceLoader`），但 provider id 不一致 |
+| `openaiofficial.credential.OpenAIOfficialCredential`（127 行） | 凭据载体 | 无独立类型；经 `ModelCreationContext.api_key` / `OPENAI_API_KEY` | 与 `openai.credential.OpenAICredential` 同处理（§2.3 已记为待办/待裁定）。**已完成（2026-10-29 勘误）**：原记「无独立类型」，实际 `openai_official::credential::OpenAIOfficialCredential` 已落地（显式值优先 + env 回退 + blank 视为缺失）；依据 §8.2（`openai.credential.OpenAICredential` 本身仍待裁定） |
+| `openaiofficial.tool.OpenAIServerTool`（125 行） | 内置 server tool 声明（web_search / code_interpreter / image_generation / tool_search） | **无** | **缺失**：Rust `responses::to_request_tools`（`:334`）**只构造 `Tool::Function`**，无任何内置 server tool 变体。⚠️ 与 gemini 侧 `GeminiServerTool`（已实现）对比明显。**已完成（2026-10-29 勘误）**：原记「缺失」，实际 `openai_official::server_tool::OpenAIServerTool`（web_search / code_interpreter / image_generation / tool_search，其余拒绝）已落地；依据 §8.2 |
+| `openaiofficial.tool.ResponsesServerToolHelper`（**544 行**，本子模块第二大类） | server tool 块 ↔ SDK 互转 + 结果状态映射 | **无** | **缺失**：Rust 侧无 server-tool 声明/校验/结果映射。**已完成（2026-10-29 勘误）**：原记「缺失」，实际 `openai_official::server_tool::{ResponsesServerToolHelper, HostedToolSearchPairing}`（merge tools / include 列表 / call-result 解码 / tool_search 配对 / 原始 item 回放）已落地；依据 §8.2 |
+| `resources/META-INF/services/...ModelProvider` | SPI 注册（`OpenAIOfficialModelProvider`） | `responses::default_responses_registry` | **设计决定**（Rust 无 `ServiceLoader`），但 provider id 不一致。**已完成（2026-10-29 勘误）**：原记「provider id 不一致」，实际 `default_openai_official_registry()` + provider id `openai-official` / 前缀 `openai-official:` 已对齐；依据 §8.1 |
 
 ## 3. 详细缺口清单
 
@@ -281,7 +282,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | anthropic provider 基线 | `anthropic.*`（**13** 类） | **已完成** | `src/anthropic/{dto,credential,converter,parser,model,provider,mod}.rs`，**61** 个单测；`lib.rs` 已声明 `pub mod anthropic;`；详见 §2.4 |
 | gemini provider 基线 | `gemini.*`（**11** 类） | **已完成** | `src/gemini/{dto,credential,converter,parser,model,provider,mod}.rs`，**58** 个单测；`lib.rs` 已声明 `pub mod gemini;`；详见 §2.5 |
 | OpenAI provider | `openai.*`（53 类） | **已完成（2026-09-21 自 core 迁入）** | `src/openai/mod.rs`（`OpenAiChatModel`/`OpenAiProvider`/`default_registry`，**1380 行**）；同批迁入 `responses`（**691 行**）与 `anthropic_async`（**712 行**）。⚠️ 原「设计决定（不迁移）」口径已作废；Java `compat.*`（12 类）/`exception.*`（8 类）/`OpenAIMultiModalTool` 仍未迁（§3.2/§3.4） |
-| **`openai-official` 子模块对照** | `openaiofficial.*`（**14 类** / 3716 行） | **待办** | **2026-10-22 复核新增**：Java 侧 `openai-official` 为**独立子模块**（`OpenAIResponsesChatModel` / `ResponsesRequestMapper` / `ResponsesMultiAgentFormatter` / `ResponsesStreamingAssembler` / `ResponsesResponseParser` / `ResponsesHelper` / `OpenAIOfficialModelProvider` / `OpenAIOfficialConstants` / `OpenAIErrorTranslator` / `OpenAIOfficialModelException` / `OpenAISdkClientFactory` / `credential.OpenAIOfficialCredential` / `tool.OpenAIServerTool` / `tool.ResponsesServerToolHelper`），provider id = **`openai-official`**（前缀 `openai-official:`），走 **官方 `openai-java` SDK**。Rust 侧 `crate::responses` 虽同为 Responses 协议，但 provider id = core 常量 **`openai-responses`**（`provider.rs:20`）、基于 `async-openai` 而非官方 Java SDK——**二者不是同一物**，不可互相顶替 |
+| **`openai-official` 子模块对照** | `openaiofficial.*`（**14 类** / 3716 行） | **已完成（2026-10-29 勘误）** | **2026-10-22 复核新增**：Java 侧 `openai-official` 为**独立子模块**（`OpenAIResponsesChatModel` / `ResponsesRequestMapper` / `ResponsesMultiAgentFormatter` / `ResponsesStreamingAssembler` / `ResponsesResponseParser` / `ResponsesHelper` / `OpenAIOfficialModelProvider` / `OpenAIOfficialConstants` / `OpenAIErrorTranslator` / `OpenAIOfficialModelException` / `OpenAISdkClientFactory` / `credential.OpenAIOfficialCredential` / `tool.OpenAIServerTool` / `tool.ResponsesServerToolHelper`），provider id = **`openai-official`**（前缀 `openai-official:`），走 **官方 `openai-java` SDK**。Rust 侧 `crate::responses` 虽同为 Responses 协议，但 provider id = core 常量 **`openai-responses`**（`provider.rs:20`）、基于 `async-openai` 而非官方 Java SDK——**二者不是同一物**，不可互相顶替。**已完成（2026-10-29 勘误）**：原记「待办」，实际 `src/openai_official/` 10 文件已交付（provider id `openai-official` / 前缀 `openai-official:` / `default_openai_official_registry()`），§8.2 已逐类对照；依据 §8.1 / 用例 `provider::tests::registers_and_resolves_in_core_registry` |
 
 ### 3.2 功能缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -302,7 +303,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | OpenAI 兼容厂商差异化行为 | `openai.compat.{deepseek,glm,kimi,minimax}`（12 类） | 待确认 | 当前仅靠 `crate::openai::OpenAiProvider` 的 base_url + core `context_windows.rs` + `common::capabilities` 覆盖。**2026-10-22 复核**：`capabilities.rs` 的前缀表覆盖 deepseek/glm/zhipu/kimi/moonshot/qwen/llama/mistral/grok/gemma/phi/ollama → `max_tokens` 兼容；`openai/mod.rs` 有 DeepSeek `reasoning_content` 回传（`requires_reasoning_passback` / `inject_reasoning_content`）。**但 GLM/Kimi/MiniMax 各自的 `*Formatter` / `*MultiAgentFormatter` 差异化（thinking 处理、multi-agent 分组）仍无对应**——Java 侧 `compat/*` 与 `formatter/{DeepSeek,GLM}*` 两套并存共 12 类。是否影响功能正确性仍待汇总方裁定（见 §4.2） |
 | OpenAI 多模态工具 | `openai.tool.OpenAIMultiModalTool`（**594 行 / 28.5 KB**） | 待确认 | core 与本 crate 均无对应；归属 MODEL 还是 TOOL 类模块未裁定。**2026-10-22 复核**：Java 侧该类体积确认（594 行），非可忽略长尾 |
 | **`openai-official` 子模块整体** | `openaiofficial.*`（**14 类 / 3716 行**） | **已完成（§8）/ Phase 2 残留已清**（2026-10-28） | 主体交付见 §8；本轮补齐 Phase 2 三项：`proxy::ProxyConfig`（`with_proxy_config` + provider `proxy` 选项，HTTP+basic auth、`nonProxyHosts` 按 base-url host 判断，SOCKS 因 reqwest 无 `socks` feature **显式报错**）、`x-should-retry` 响应头（`ModelError::retry_override`，覆盖 status 分类，包括 `false` 时不让 core 重试）、`reasoning.*` / `service_tier` / `prompt_cache_options` 枚举白名单 fail-fast。见 §9.5 |
-| Java 测试用例逐条对照迁移 | Java 测试 **54660** 行（去空行）/ **63416** 行（`wc -l`；anthropic 6259 / dashscope 13933 / gemini 5769 / ollama 5711 / openai 15793 / openai-official 7395 / e2e 8556） | 待办 | 当前 **374** 个通过的 Rust 测试（369 lib + 5 集成）为**功能等价重写**，未逐条照搬；anthropic/gemini 的 ground-truth formatter 测试尚未逐条对照。2026-10-28 已补：加密协议、多智能体分组、server tool 声明/校验、proxy 语义、`x-should-retry`、枚举白名单 |
+| Java 测试用例逐条对照迁移 | Java 测试 **54660** 行（去空行）/ **63416** 行（`wc -l`；anthropic 6259 / dashscope 13933 / gemini 5769 / ollama 5711 / openai 15793 / openai-official 7395 / e2e 8556） | 待办 | 当前 **374** 个通过的 Rust 测试（369 lib + 5 集成）为**功能等价重写**，未逐条照搬；anthropic/gemini 的 ground-truth formatter 测试尚未逐条对照。2026-10-28 已补：加密协议、多智能体分组、server tool 声明/校验、proxy 语义、`x-should-retry`、枚举白名单。（2026-10-29 勘误：上记 374 为 2026-10-28 首轮数；加密实装后为 **377 lib + 5 集成 = 382 passed**，见 §9.3） |
 | 真实厂商端点联调 | `e2e-tests`（**36 文件 / 17 个含 `@Test` 的测试类** / 8556 行） | 设计决定（不迁移） | 需要真实 API key（7 个厂商 env）+ `ENABLE_E2E`；Rust 侧坚持离线策略，网络层已实现但未对真实端点回归。**2026-10-22 复核**：该前提已核实成立，结论维持不变 |
 
 ### 3.3 增强与清理（P2）
@@ -329,7 +330,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | anthropic / gemini 官方 SDK 类型（`AnthropicOkHttpClient` / `com.google.genai.Client`）不引入 | 两子模块 `pom.xml` | **已完成（设计决定）**：经 §4.2 裁定采用选项 (b)，用 `HttpTransport` + 自建 wire DTO 替代；避免引入新第三方依赖与机器绑定 |
 | Gemini Vertex AI（`project`/`location`/OAuth2 credentials） | `GeminiModelProvider` | **已完成（设计决定：本轮不迁移）**：端点为 Vertex AI 专用主机 + OAuth2 服务账号，与 API-key 流程正交；离线 adapter **显式报错拒绝**（单测 `create_rejects_vertex_ai`）避免静默降级。后续若需，另立适配 |
 | Anthropic SDK 的 `ProxyConfig` / Gemini SDK 的 `ProxyOptions` | 两子模块构造器 | **已完成（设计决定，不迁移）**：Rust 侧代理由调用方通过 `ReqwestTransport::with_client` 注入 `reqwest::Client`（支持代理/超时/TLS），不在 provider 层重复建模 |
-| **`openai-official` 的「官方 SDK 路径」不引入** | `openai-official` 子模块 `pom.xml`（依赖 `openai-java` SDK） | **待裁定（2026-10-22 复核新增）**：Java 侧用官方 `openai-java` SDK；Rust 侧 `crate::responses` 走 `async-openai` 0.41。**是否另开一条 SDK 路径**（与 `anthropic` vs `anthropic_async` 同类问题）需汇总方裁定；但**该子模块的 multi-agent formatter / server tool / body-params 白名单等能力缺口不因 SDK 选型而消失**，应单独立项 |
+| **`openai-official` 的「官方 SDK 路径」不引入** | `openai-official` 子模块 `pom.xml`（依赖 `openai-java` SDK） | **待裁定（2026-10-22 复核新增）**：Java 侧用官方 `openai-java` SDK；Rust 侧 `crate::responses` 走 `async-openai` 0.41。**是否另开一条 SDK 路径**（与 `anthropic` vs `anthropic_async` 同类问题）需汇总方裁定；但**该子模块的 multi-agent formatter / server tool / body-params 白名单等能力缺口不因 SDK 选型而消失**，应单独立项。**已完成（2026-10-29 勘误）**：原记「待裁定」，实际已按「不引入官方 SDK」执行——`openai_official` 直接说 Responses wire protocol，§8.2 类级表已覆盖 §2.8 全部能力缺口 |
 
 ## 4. 项目状态与下一步
 
@@ -352,7 +353,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
   1. ~~`src/ollama/dto.rs` 的 embedding DTO 与 `EMBED_ENDPOINT` 常量无调用方（§3.2）。~~ **已解决**（2026-10-12，`OllamaChatModel::embed` 已接线并有单测）。
   2. ~~`agentscope-harness` 为未使用依赖（§3.3）。~~ **已解决**（2026-09-21 从 `Cargo.toml` 移除，`d86a578`）。
   3. anthropic 并行 tool-use 拆分、gemini Vertex AI 与**内置**远程媒体下载为**非本轮范围**细化缺口（§3.2/§3.3）。
-  4. **（2026-10-22 复核新增）`openai-official` 子模块（14 类 / 3716 行）完全未对照**——Rust `crate::responses` 只覆盖 Responses 协议主干，缺 multi-agent formatter / server tool / body-params 白名单（§2.8）。
+  4. **（2026-10-22 复核新增）`openai-official` 子模块（14 类 / 3716 行）完全未对照**——Rust `crate::responses` 只覆盖 Responses 协议主干，缺 multi-agent formatter / server tool / body-params 白名单（§2.8）。**已完成（2026-10-29 勘误）**：原记「完全未对照」，实际 §8 已交付 `src/openai_official/` 10 文件并逐类对照，§9.5/§9.6 补齐 Phase 2 与 `responses` 多智能体分组
   5. **（2026-10-22 复核新增）`ModelMap` / `strip_reasoning_suffix` 未被任何 provider 消费**（§3.3）。
   6. **（2026-10-22 复核新增）`base64` / `chrono` / `thiserror` 三个依赖声明但零使用**（§3.3）。
   7. 无阻塞：2026-10-28 实测 build/test 全绿（374 passed）。
@@ -369,7 +370,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 6. ~~**【非阻塞】依赖瘦身**：确认后可移除 `Cargo.toml` 中未使用的 `agentscope-harness`。~~ **已完成**（2026-09-21，`d86a578`）。
 7. **【待裁定，2026-09-21 新增】`anthropic` 双实现并存**：本 crate 现有两条 Anthropic 路径——`crate::anthropic`（§2.4，自建 wire DTO + `HttpTransport`，58 个单测）与自 core 迁入的 `crate::anthropic_async`（基于 `async-anthropic` 0.6 SDK，653 行）。两者功能重叠，需汇总方裁定保留哪条（或保留主路径 + 另一条标记 deprecated）。**叠加成本**：同时存在两套 DTO 与依赖。
 8. **【2026-10-28 新增，待裁定】`responses` vs `openai_official` 双实现**：评估结论与成本见 §9.7；建议保留双实现、新能力只进 `openai_official`、`responses` 冻结为协议主干。**合并动作不在本 crate 单方面执行**。
-9. **【2026-10-28 新增，跨模块/宿主职责】dashscope 加密与公钥拉取**：(a) `aes-gcm`/`rsa` 未链接，宿主需实现 `DashScopeCryptoProvider`（若汇总方希望内置，需本 crate `Cargo.toml` 新增两个依赖并联网 fetch，请裁定）；(b) `GET /api/v1/public-keys/latest` 需要 `HttpTransport` 增加 GET 能力（属 core/harness seam 变更，本 crate 不改），当前由宿主注入 config 或自行 GET 后调 `EncryptionConfig::from_public_key_response`。
+9. **【2026-10-28 新增，跨模块/宿主职责】dashscope 加密与公钥拉取**——**已完成（2026-10-29 勘误）**：原记「`aes-gcm`/`rsa` 未链接、公钥接口未接线、需宿主注入」，实际 `dashscope/crypto.rs` 已内置默认 `AesRsaCryptoProvider`（`aes-gcm` 0.10 / `rsa` 0.9 / `rand` 0.8 已写入本 crate `Cargo.toml`），`HttpTransport::get_json` 已加，`dashscope/model.rs` 首次加密请求经 `fetch_public_key()`（`PUBLIC_KEYS_ENDPOINT`）拉取并缓存，`enable_encrypt=true` 缺公钥时 fail-fast；依据见 §9.3 / 用例 `enable_encrypt_fetches_the_public_key_and_encrypts_the_body`、`enable_encrypt_without_a_public_key_fails_instead_of_sending_plaintext`。**原描述保留**：(a) `aes-gcm`/`rsa` 未链接，宿主需实现 `DashScopeCryptoProvider`（若汇总方希望内置，需本 crate `Cargo.toml` 新增两个依赖并联网 fetch，请裁定）；(b) `GET /api/v1/public-keys/latest` 需要 `HttpTransport` 增加 GET 能力（属 core/harness seam 变更，本 crate 不改），当前由宿主注入 config 或自行 GET 后调 `EncryptionConfig::from_public_key_response`。
 
 > **跨模块需求汇总**：本轮 anthropic/gemini 落地**不需要任何 core/harness 改动**，也**不需要修改根 `Cargo.toml`**（未新增任何依赖）。当前剩余跨模块请求仅为第 3、4 条（OpenAI 兼容厂商与多模态工具归属），均属「待裁定」而非阻塞。
 
@@ -457,14 +458,14 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 ### 7.3 逐子模块对齐结论表
 | 子模块 | Java 类数 | Rust 对应物 | 结论 | 真实缺口 |
 |---|---|---|---|---|
-| **ollama** | 22 / 5217 行 | `src/ollama/*` 7 文件 / 1641 行 | **部分完成** | `OllamaConversationMerger`（116 行）、`OllamaMultiAgentFormatter`（**508 行**）均**零对应**；`OllamaOptions`（1361 行）仅迁子集 |
-| **dashscope** | 29 / 8791 行 | `src/dashscope/*` 7 文件 / 2469 行 | **部分完成** | `DashScopeEncryptionUtils`（**AES-GCM + RSA，零实现**）、`DashScopeConversationMerger`（316 行）、`DashScopeMultiAgentFormatter`（406 行）、`DashScopeMultiModalTool`（**1770 行 / 93.5 KB**） |
-| **anthropic** | 13 / 3171 行 | `src/anthropic/*` 7 文件 / 3002 行 | **部分完成** | `tool.AnthropicServerTool`（96 行）**无等价物**（gemini 侧已有 `GeminiServerTool`）；响应侧并行 tool-use 交替拆分未实现 |
+| **ollama** | 22 / 5217 行 | `src/ollama/*` 7 文件 / 1641 行 | **部分完成** | `OllamaConversationMerger`（116 行）、`OllamaMultiAgentFormatter`（**508 行**）均**零对应**；`OllamaOptions`（1361 行）仅迁子集。（2026-10-29：两项 formatter 已闭环，见 §9.1；余 `OllamaOptions` 子集） |
+| **dashscope** | 29 / 8791 行 | `src/dashscope/*` 7 文件 / 2469 行 | **部分完成** | `DashScopeEncryptionUtils`（**AES-GCM + RSA，零实现**）、`DashScopeConversationMerger`（316 行）、`DashScopeMultiAgentFormatter`（406 行）、`DashScopeMultiModalTool`（**1770 行 / 93.5 KB**） | （2026-10-29：加密与两项 formatter 已闭环，见 §9.3 / §9.4；余 `DashScopeMultiModalTool`） |
+| **anthropic** | 13 / 3171 行 | `src/anthropic/*` 7 文件 / 3002 行 | **部分完成** | `tool.AnthropicServerTool`（96 行）**无等价物**（gemini 侧已有 `GeminiServerTool`）；响应侧并行 tool-use 交替拆分未实现。（2026-10-29：server tool 已闭环，见 §9.2；余并行拆分） |
 | **gemini** | 11 / 3071 行 | `src/gemini/*` 7 文件 / 2682 行 | **部分完成（最完整）** | Vertex AI（设计决定拒绝）；**内置**远程媒体下载缺省（seam 已有） |
 | **openai** | 53 / 9853 行 | `src/openai/mod.rs` 1380 行（**源自 core 迁入，非逐类重写**） | **部分完成** | `compat.*` 12 类（GLM/Kimi/MiniMax formatter 差异化）、`credential.OpenAICredential`、`tool.OpenAIMultiModalTool`（594 行）、`OpenAIConversationMerger` / `OpenAIMultiAgentFormatter` |
 | **responses**（Rust 独有） | — | `src/responses/mod.rs` 691 行 | **已就位（协议主干）** | 无 multi-agent 分组、无 server tool、`map_openai_error` 未走 `ModelError` 结构化归一 |
 | **anthropic_async**（Rust 独有） | — | `src/anthropic_async/mod.rs` 712 行 | **已就位（SDK 路径）** | 与 `crate::anthropic` 双实现并存，待裁定（§4.2-7） |
-| **openai-official** | **14 / 3716 行** | **无对应物** | **未对照** | 全部 14 类；见 §2.8（multi-agent formatter 355 行 / request mapper 834 行 / server tool 669 行 / streaming assembler 355 行 / body-params 白名单） |
+| **openai-official** | **14 / 3716 行** | **无对应物** | **未对照** | 全部 14 类；见 §2.8（multi-agent formatter 355 行 / request mapper 834 行 / server tool 669 行 / streaming assembler 355 行 / body-params 白名单）。（2026-10-29：已对照，见 §8 / §9.5） |
 | **e2e-tests** | 0 / 36 文件 / 8556 行 | 无 | **设计决定（不迁移）——核实成立** | 需 7 个厂商 API key + `ENABLE_E2E`（`ProviderFactory` / `E2ETestCondition` 已核实） |
 
 ### 7.4 §6「对标 new-api」十项能力符号定位（逐条核实，**全部命中**）
@@ -485,13 +486,13 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 ### 7.5 新发现缺口
 
 **P0（阻塞核心链路）**
-1. **`openai-official` 子模块（14 类 / 3716 行）完全未对照**——provider id（`openai-official` vs `openai-responses`）、id 前缀、SDK 三者全不同，`crate::responses` 不可顶替。详见 §2.8。
+1. **`openai-official` 子模块（14 类 / 3716 行）完全未对照**——provider id（`openai-official` vs `openai-responses`）、id 前缀、SDK 三者全不同，`crate::responses` 不可顶替。详见 §2.8。（2026-10-29：已对照，见 §8 / §9.5）
 
 **P1（重要功能）**
-2. **`dashscope` 请求加密零实现**——Java `DashScopeEncryptionUtils`（181 行，AES-GCM 数据 + RSA 包 AES key）在 Rust 侧只有 `PUBLIC_KEYS_ENDPOINT` 常量与 `DashScopePublicKeyResponse` DTO，**无任何加密/解密代码**（`dashscope/dto.rs` / `model.rs` 全文无 `aes`/`rsa`/`encrypt`/`decrypt`）。
-3. **`dashscope` 会话合并 / 多智能体格式化缺失**（`ConversationMerger` 316 行 + `MultiAgentFormatter` 406 行）——anthropic/gemini 各有等价物，dashscope 无。
-4. **`ollama` 会话合并 / 多智能体格式化缺失**（`ConversationMerger` 116 行 + `MultiAgentFormatter` **508 行**）。
-5. **`anthropic` 内置 server tool 声明缺失**（`tool.AnthropicServerTool` 96 行）——解析/回显侧已实现，但**无法把内置 server tool 声明进请求**；gemini 侧已有 `GeminiServerTool` 可作模板。
+2. **`dashscope` 请求加密零实现**——Java `DashScopeEncryptionUtils`（181 行，AES-GCM 数据 + RSA 包 AES key）在 Rust 侧只有 `PUBLIC_KEYS_ENDPOINT` 常量与 `DashScopePublicKeyResponse` DTO，**无任何加密/解密代码**（`dashscope/dto.rs` / `model.rs` 全文无 `aes`/`rsa`/`encrypt`/`decrypt`）。（2026-10-29：加密已闭环，见 §9.3；余项见 §4.2）
+3. **`dashscope` 会话合并 / 多智能体格式化缺失**（`ConversationMerger` 316 行 + `MultiAgentFormatter` 406 行）——anthropic/gemini 各有等价物，dashscope 无。（2026-10-29：已关闭，见 §9.4）
+4. **`ollama` 会话合并 / 多智能体格式化缺失**（`ConversationMerger` 116 行 + `MultiAgentFormatter` **508 行**）。（2026-10-29：已关闭，见 §9.1）
+5. **`anthropic` 内置 server tool 声明缺失**（`tool.AnthropicServerTool` 96 行）——解析/回显侧已实现，但**无法把内置 server tool 声明进请求**；gemini 侧已有 `GeminiServerTool` 可作模板。（2026-10-29：已关闭，见 §9.2）
 6. **`responses` 多智能体分组 + server tool 声明缺失**（Java `ResponsesMultiAgentFormatter` 355 行 + `OpenAIServerTool` 125 行 + `ResponsesServerToolHelper` 544 行）；`to_request_tools` 仅构造 `Tool::Function`。
 7. **`responses::map_openai_error` 未走结构化错误归一**——与 `openai/mod.rs:338` 的 `ModelError::from_parts` + `ErrorKind::Timeout/Network` 实现**不一致**，导致 responses 路径的 429/5xx 无法进入 `retryable()` 判定与统一分类。
 
@@ -521,7 +522,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | 14 | §3.1 | gemini 基线「10 类 / 53 个单测」 | **11 类 / 58** 个单测 |
 | 15 | §3.1 | OpenAI 行「`openai/mod.rs` 1045 行 / `responses` 620 / `anthropic_async` 653」 | **1380 / 691 / 712** |
 | 16 | §3.2 | Ollama embedding「**无客户端方法、无调用方、无单测**」 | **已接线**：`embed` / `embed_with_options` + 单测 `embed_posts_to_embed_endpoint`（`ollama/model.rs:73/78/233`） |
-| 17 | §3.2 | dashscope 整体「**已完成**；含 `DashScopeEncryptionUtils` 对应物」 | 降级为「**部分完成**」——**无任何加密实现** |
+| 17 | §3.2 | dashscope 整体「**已完成**；含 `DashScopeEncryptionUtils` 对应物」 | 降级为「**部分完成**」——**无任何加密实现**（2026-10-29：加密已闭环，见 §9.3；余项见 §4.2） |
 | 18 | §3.2 | anthropic 子模块「11 类 / 2192 行」 | **13 类 / 3171 行** |
 | 19 | §3.2 | gemini 子模块「10 类 / 2294 行」 | **11 类 / 3071 行** |
 | 20 | §3.2 | Java 测试基线「45043 行（anthropic 4677 / dashscope 11767 / gemini 4113 / ollama 4464 / openai 12886 / e2e 7136）」 | **54660 行（去空行）/ 63416（物理）**：anthropic 6259 / dashscope 13933 / gemini 5769 / ollama 5711 / openai 15793 / openai-official 7395 / e2e 8556 |
@@ -558,7 +559,7 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 ### 7.3 仍待办
 
 - `openai-official` 子模块（14 类 / 3716 行）完全未登记（§4.3 #11）。
-- dashscope 加密零实现、dashscope 与会话合并、ollama 多智能体、`AnthropicServerTool`、responses multi-agent 分组（§3 P1）。
+- dashscope 加密零实现、dashscope 与会话合并、ollama 多智能体、`AnthropicServerTool`、responses multi-agent 分组（§3 P1）。（2026-10-29：上列四项已闭环，见 §9.1–§9.4；responses 多智能体分组另见 §9.6；仍留 anthropic 并行 tool-use 拆分）
 
 ## 7. P0 修复记录（2026-10-22）— OpenAI Chat Completions 非流式请求路径
 
@@ -681,7 +682,7 @@ cargo test -p agentscope-extensions-model
   - 注入缝保留：`DashScopeCryptoProvider` trait 不变；`UnavailableCryptoProvider` 仍可显式安装（**任一操作报错，绝不静默发明文**）。默认路径：`DashScopeChatModel::new` 即持有 `AesRsaCryptoProvider`，`with_encryption_config(config)` 显式启用加密；`with_encryption(config, provider)` 仍可替换实现。
   - 接线：`DashScopeChatModel::{with_encryption, with_encryption_config, is_encryption_enabled, build_http_request_with_context}`；`build_http_request` 返回 `Result`；流式/非流式响应在反序列化前解密。
 - **金标来源（非自证）**：由 **Java JCE 生成**（`javax.crypto`，即 `DashScopeEncryptionUtils` 同款调用）：固定 AES key = ASCII `0123456789abcdef0123456789abcdef`、IV = ASCII `0123456789ab`、`input` = `{"messages":[{"role":"user","content":"hi"}]}` → `4ouKXzC5+XyQdgGH6H9eVS3qse0t6h8YQf3tNeub9sdeGgkN0MgHrQnMAjy2WdDnujA0FaOwQhAyITjGJA==`（61 B = 45 明文 + 16 tag）；另有一组含中文（你好，世界）的 UTF-8 变体。RSA 用一次性 2048-bit 测试密钥对（公钥 SPKI b64 + 私钥 PKCS#8 b64 存放在 `crypto::test_support`）；PKCS#1 v1.5 带随机填充 → 断言「私钥可解回 base64(AES key)」+ 256 B 块长，而非字节相等。
-- **未接线**：`GET /api/v1/public-keys/latest` 拉取（`HttpTransport` 只有 POST 缝）→ 宿主注入 config，或自行 GET 后调 `EncryptionConfig::from_public_key_response`（记 §4.2）。
+- **未接线**：`GET /api/v1/public-keys/latest` 拉取（`HttpTransport` 只有 POST 缝）→ 宿主注入 config，或自行 GET 后调 `EncryptionConfig::from_public_key_response`（记 §4.2）。（2026-10-29：已接线，见 §4.2 第 9 条；`HttpTransport::get_json` + `fetch_public_key()` 首次拉取并缓存）
 - **测试（新增 8 个：crypto 6 + header 金标 1 + model 端到端 1）**：`dashscope::crypto::tests::{aes_gcm_matches_the_jce_gold_vector, aes_gcm_encodes_the_plaintext_as_utf8_like_java, aes_gcm_rejects_a_tampered_tag_and_wrong_sizes, rsa_wraps_the_base64_aes_key_with_pkcs1_v1_5, rsa_rejects_a_malformed_public_key, generated_keys_and_ivs_have_the_protocol_sizes}`；`dashscope::encryption::tests::header_gold_format_matches_the_dashscope_schema`（三字段 + 紧凑 JSON）与既有 6 个；`dashscope::model::tests::{default_crypto_provider_encrypts_the_wire_body_and_header（走真实 transport：body 为密文、header 三字段、私钥解回按键 → AES 解出 `messages[0].content == "hi"`）, encryption_without_a_provider_fails_instead_of_sending_plaintext（断言未发出任何请求）}`。
 - **实测**：`cargo test -p agentscope-extensions-model` → **377 lib + 5 集成 = 382 passed / 0 failed / 0 ignored**（基线 369 + 5，新增 8）。反向验证见 §9.8。
 

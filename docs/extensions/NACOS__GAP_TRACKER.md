@@ -18,7 +18,7 @@
 | Java 规模 | 主代码 11 个 `.java`（另 4 个 `pom.xml`）2095 行 / 92.3KB；测试 8 文件 2452 行 / 122.0KB；Java `@Test` 合计 120 |
 | Rust crate | `crates/agentscope-extensions-nacos`（11 个 `.rs` + `Cargo.toml`，3050 行） |
 | 迁移波次 | C |
-| 当前状态 | **进行中**（三个子域主体已迁移，**2026-10-28 补齐 P0/P1 语义缺口**：security scheme 按 type 分派、supportedInterfaces 组装/拆分、prompt 推送语义、skill 资源 key/必填校验/zip 结构校验、A2A 类型复用 protocol crate、doOverwrite 去重前插、endpoint 去重。离线单测 **70 passed / 0 failed**，见 §7） |
+| 当前状态 | **总判：进行中**（仍有 P1：真实 NacosAiService 未实现）—— **进行中**（三个子域主体已迁移，**2026-10-28 补齐 P0/P1 语义缺口**：security scheme 按 type 分派、supportedInterfaces 组装/拆分、prompt 推送语义、skill 资源 key/必填校验/zip 结构校验、A2A 类型复用 protocol crate、doOverwrite 去重前插、endpoint 去重。离线单测 **70 passed / 0 failed**，见 §7；**2026-10-29 复核**：§2/§3 所列六项缺口（supportedInterfaces 三元组、capabilities 强制语义、prompt 推送、skill 资源 key/必填/zip、SecurityScheme 五 type、A2A 平行类型）均已在 §7 关闭（依据 §7-1⋯§7-6 + `cargo test` 70 passed）；真实剩余见 §3.3 / §4.2） |
 
 ## 2. Java 清单与依赖映射
 
@@ -91,7 +91,7 @@
 
 | 项 | 优先级 | 决定 | 说明 |
 |---|---|---|---|
-| 真实 Nacos HTTP 客户端 | P1 | 设计决定（延后） | 无成熟 Rust Nacos AI SDK；`NacosAiService` trait 为注入缝隙，与 Java `AiService` 注入点对齐；HTTP 实现归属待裁定（§4.2-3） |
+| 真实 Nacos HTTP 客户端 | P1 | 设计决定（延后） | **2026-10-29 复核**：仍仅 trait + `InMemoryNacosAiService`，`reqwest` 实现未落地；无成熟 Rust Nacos AI SDK；`NacosAiService` trait 为注入缝隙，与 Java `AiService` 注入点对齐；HTTP 实现归属待裁定（§4.2-3） |
 | 与 protocol crate 的 A2A 模型统一 | P1 | 已完成（2026-10-28） | 已复用 `agentscope_extensions_a2a_client::model` 的 `AgentSkill`/`AgentCapabilities`/`AgentProvider`/`AgentInterface`；`A2aAgentCard` 降为携带 `documentationUrl` 的薄包装（`Deref`）；`AgentRegistry` 仍本地（protocol 无）。protocol 若补 `documentation_url` 则可退化为 `pub use`（§4.2-5） |
 | `AgentCardResolver` 同步→异步 | P0 | 设计决定 | Java 版阻塞（Nacos 客户端阻塞）；Rust 侧 `NacosAiService` 为 async，故 trait 用 `async_trait` |
 | `NacosA2aRegistry` 多 endpoint 批量注册 | P2 | 设计决定 | Java 在 1 个 endpoint 时用单值、≥2 时用 `Set` 去重批量；Rust 侧统一逐个 `register_agent_endpoint`（调用次数差异可接受；但 `Set` 的去重语义不可忽略——见 §3.3 同名条目） |
@@ -101,7 +101,7 @@
 
 | 缺口项 | 优先级 | 状态 | 说明 |
 |---|---|---|---|
-| 真实 Nacos HTTP 客户端（`reqwest` 版 `NacosAiService`） | P1 | 待办（跨模块） | 见 §4.2-3 |
+| 真实 Nacos HTTP 客户端（`reqwest` 版 `NacosAiService`） | P1 | 待办（跨模块） | 见 §4.2-3；**2026-10-29 复核**：未变（仍无 `reqwest` 实现） |
 | 与 protocol crate A2A 模型/接口合并（复用 `AgentCard`/`AgentCardResolver`，仅保留 `AgentRegistry` 本地补位） | P1 | 已完成（模型部分） | 见 §7-6；`TransportProperties` 仍本地（protocol 同名类型在 `a2a-server`，会拖入 axum 且 host/port 为 Option，见 §4.2-6） |
 | A2A security scheme 结构化转换（apiKey/http/oauth2/openIdConnect/mutualTLS + OAuth flows） | P1 | 已完成 | 见 §7-2 |
 | `do_overwrite` 的接口去重与前插（Java `removeIf(equals)` + `add(0, ..)`） | P2 | 已完成 | 见 §7-3；`do_overwrite_dedups_and_prepends_the_interface` |
@@ -130,7 +130,7 @@
   - `cargo build -p agentscope-extensions-nacos` → **exit 0**（本 crate 0 warning）。
   - `cargo test -p agentscope-extensions-nacos` → **70 passed; 0 failed; 0 ignored**（43 → +27，含 10 条反向验证用例）。
   - `cargo clippy -p agentscope-extensions-nacos --all-targets` → 仅 2 条**历史** warning（`service.rs:183` type_complexity、`registry/mod.rs:742` bool_assert_comparison，均非本轮新增）。
-- **已知问题**：无。真实 Nacos 客户端与 protocol crate A2A 模型统一列为待裁定（§4.2）。
+- **已知问题**：无编译/测试阻塞。**2026-10-29 复核**：protocol crate A2A 模型统一已完成（§7-6）；**真实剩余**：①真实 `NacosAiService`（`reqwest`）未实现（仅 trait + `InMemoryNacosAiService`，归属待裁定，§4.2-3）；②protocol `AgentCard` 缺 `documentationUrl`（§4.2-5）；③`TransportProperties` 未复用（在 `a2a-server`，需下沉 `a2a-client`，§4.2-6）；④`getAllSkillNames`/`getRepositoryInfo` 无对应（harness `SkillRepository` 缺方法，S-3）；⑤`zip = 0.6` 未登记 workspace（§4.2-2）；⑥`SkillRepository::load` 同步 trait 内 `block_on`（§4.2-4）；⑦`AgentCardResolver` 无 TTL（§3.3）。
 
 ### 4.2 下一步与阻塞（跨模块需求）
 

@@ -1,4 +1,4 @@
-﻿# SKILLS 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# SKILLS 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **SKILLS** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-skills\`
@@ -20,7 +20,7 @@
 | Rust crate | `crates/agentscope-extensions-skills` |
 | Rust 规模（2026-10-28 实测） | 8 个 `.rs` / **5304 物理行** / **93 个 `#[test]`**（git 35 / mysql 26 / postgresql 18 / repository 4 / sql 5 / util 5；0 个 `#[tokio::test]`、0 doc-test）；依赖收敛到 5 个（见 §9.7） |
 | 迁移波次 | C |
-| 当前状态 | **§3.2 的 P1/P2 已全部收敛**（2026-10-28，见 §9）；P2-01 已落为 trait 方法（§7.1）、P2-09 保持 `Result`（§7.2）、P0-01 已落 jdbc crate；唯一「进行中」项为 P1-09 测试覆盖（93 vs Java 192，§9.5） |
+| 当前状态 | **总判：进行中**（仍有 P1：测试覆盖 / 真实驱动）—— **§3.2 的 P1/P2 已全部收敛**（2026-10-28，见 §9）；P2-01 已落为 trait 方法（§7.1）、P2-09 保持 `Result`（§7.2）、P0-01 已落 jdbc crate；唯一「进行中」项为 P1-09 测试覆盖（93 vs Java 192，§9.5） |
 
 ## 2. Java 清单与依赖映射
 
@@ -57,7 +57,7 @@
 | `MysqlSkillRepository` | MySQL 两张表（`agentscope_skills` / `agentscope_skill_resources`）CRUD；`createIfNotExist`；`metadata_json` 兼容探测 | `mysql::MysqlSkillRepository` | 通过 `SqlDatabase` 抽象（见 2.1），默认内存实现可测。**语义差异**：已无（P1-05/06/10、P2-02/03/05 均已收敛，见 §8.1 / §9）。本类型已 deprecated，**勿扩展** |
 | `PostgresSkillRepository` | PostgreSQL schema+两张表 CRUD；`metadata_json` 兼容探测；identifier 双引号转义 | `postgresql::PostgresSkillRepository` | 同上；identifier 最大长度 63（Java）/ schema 概念。**语义差异**：已无（P1-07/10、P2-02/03/04 均已收敛，见 §8.1 / §9）；资源插入按 `RESOURCE_BATCH_SIZE = 1000` 分块。本类型已 deprecated，**勿扩展** |
 
-> **上游状态提醒（2026-10-22 静态核对）**：Java `MysqlSkillRepository` / `PostgresSkillRepository` 均标注 `@Deprecated`，官方替代是 `agentscope-extensions-jdbc` 的 `JdbcAgentSkillRepository`（**1184 物理行 / 1099 非空行**，namespace 列 + 方言抽象，配套 `dialect/table/SkillDialect.java` / `SkillResourcesDialect.java`）。本 crate 对齐的是**已弃用的 Java 实现**；Rust `agentscope-extensions-jdbc` 目前**无 skill 模块**（`rg -i skill` = 0 命中）。是否补 `JdbcAgentSkillRepository` 需汇总方裁定（§3.2 P0-01）。
+> **上游状态提醒（2026-10-22 静态核对；2026-10-29 勘误）**：Java `MysqlSkillRepository` / `PostgresSkillRepository` 均标注 `@Deprecated`，官方替代是 `agentscope-extensions-jdbc` 的 `JdbcAgentSkillRepository`（**1184 物理行 / 1099 非空行**，namespace 列 + 方言抽象，配套 `dialect/table/SkillDialect.java` / `SkillResourcesDialect.java`）。本 crate 对齐的是**已弃用的 Java 实现**；**已完成（2026-10-29 勘误）**：原记「Rust `agentscope-extensions-jdbc` 目前无 skill 模块（`rg -i skill` = 0 命中），是否补需汇总方裁定」，实际该仓库已于 **2026-10-22** 在 jdbc crate 落地（`crates/agentscope-extensions-jdbc/src/skill/repository.rs`，`JdbcAgentSkillRepository` + `namespace` 列隔离，§3.2 P0-01）。
 
 ### 2.1 依赖映射（Java → Rust）
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
@@ -87,7 +87,7 @@
 
 | # | 缺口项 | 子模块 | 优先级 | Java 行为 | Rust 现状 | 执行状态 |
 |---|---|---|---|---|---|---|
-| P0-01 | `JdbcAgentSkillRepository`（官方替代实现）缺失 | mysql / postgresql | P0 | `agentscope-extensions-jdbc` 的 `JdbcAgentSkillRepository`（1184 物理行）+ `SkillDialect` / `SkillResourcesDialect`，带 `namespace` 列隔离 | `agentscope-extensions-jdbc` **无 skill 模块**（`rg -i skill` = 0 命中）；本 crate 只对齐**已 `@Deprecated`** 的旧实现 | 待办（需汇总方裁定归属：本 crate 内补 vs jdbc crate 内补） |
+| P0-01 | `JdbcAgentSkillRepository`（官方替代实现）缺失 | mysql / postgresql | P0 | `agentscope-extensions-jdbc` 的 `JdbcAgentSkillRepository`（1184 物理行）+ `SkillDialect` / `SkillResourcesDialect`，带 `namespace` 列隔离 | ~~`agentscope-extensions-jdbc` **无 skill 模块**（`rg -i skill` = 0 命中）~~ → **已在 jdbc crate 落地**：`crates/agentscope-extensions-jdbc/src/skill/{mod,repository}.rs`，`JdbcAgentSkillRepository` + `namespace` 列 + 无参构造绑定 namespace 的 `*_in` 变体 | **已完成（2026-10-29 勘误）**：原记「待办（需汇总方裁定归属：本 crate 内补 vs jdbc crate 内补）」，实际按裁定 B1 归 jdbc crate，于 **2026-10-22** 落地关闭 |
 | P1-01 | git 技能名来源不一致 | git | P1 | `SkillFileSystemHelper.getAllSkillNames` → `readSkillName` 解析 **SKILL.md frontmatter 的 `name`** | `git.rs` 委托 harness `load_skills_from_dir`，取**目录名**；目录名 ≠ frontmatter name 时 `get_skill(name)` 找不到 | 已完成（§8.1） |
 | P1-02 | git 技能 description 不一致 | git | P1 | `SkillUtil.createFrom` → `MarkdownSkillParser.parse` 取 frontmatter 的 `description` | harness `skill_description()` 取 SKILL.md **首个非空行**并剥 `#`；对 frontmatter 文件会返回 `---` | 已完成（§8.1；在 git 适配层重写身份，未改 harness） |
 | P1-03 | git 分支远端探测未按分支过滤 | git | P1 | `resolveRemoteHead` 用 `lsRemote.setHeads(true)` + `matchesBranch`（`refs/heads/<branch>`） | `remote_head()` 固定 `git ls-remote <url> HEAD`（远端默认分支），未按配置的 `branch` 过滤 | 已完成（§8.1） |
@@ -139,10 +139,14 @@ cargo test  -p agentscope-extensions-skills   # 33 passed; 0 failed
 ```
 
 ### 4.2 下一步与阻塞
-1. 真实 MySQL / PostgreSQL 驱动接入（`SqlDatabase` 的真实实现）仍为待办。**静态复核更新**：workspace 根 `Cargo.toml` **已**在 `[workspace.dependencies]` 登记 `sqlx = "0.9"` / `mysql_async = "0.37"` / `tokio-postgres = "0.7"`（注释即写明「存储/技能模块 P1」），但本 crate 的 `Cargo.toml` **仍未引用**；另 `agentscope-extensions-postgresql` 已有 `postgres-driver` feature + `PgSimpleClient`（`tokio-postgres`），可作为 `SqlDatabase` 真实实现的首选落点（避免重复引入驱动）。
+1. 真实 MySQL / PostgreSQL 驱动接入（`SqlDatabase` 的真实实现）仍为待办（**2026-10-29 复核确认**：`src/sql.rs` 仍只有 `InMemorySqlDatabase`）。**静态复核更新**：workspace 根 `Cargo.toml` **已**在 `[workspace.dependencies]` 登记 `sqlx = "0.9"` / `mysql_async = "0.37"` / `tokio-postgres = "0.7"`（注释即写明「存储/技能模块 P1」），但本 crate 的 `Cargo.toml` **仍未引用**；另 `agentscope-extensions-postgresql` 已有 `postgres-driver` feature + `PgSimpleClient`（`tokio-postgres`），可作为 `SqlDatabase` 真实实现的首选落点（避免重复引入驱动）。
 2. Git 仓库读写/同步路径需系统 `git` CLI。**静态复核补充**：Java 侧用 `file://` 本地仓 + JGit 即可离线测 23 个用例，Rust 侧同样可用 `git` CLI 建本地仓（`git init` + `file://` URL）离线覆盖克隆/拉取/分支。**2026-10-26 已落地**：git 侧新增 11 个 `file://` 真实仓用例（无网络、无 mock 库；需要本机有 `git` 二进制）。
 3. ~~`has_metadata_column` dead_code warning + 6 个零引用依赖~~ **2026-10-28 已清理（§9.7）**：删除 `has_metadata_column`（全仓零调用者，与 `metadata_column_type().is_some()` 重复），`Cargo.toml` 依赖 10 → 5（`agentscope-core` / `async-trait` / `futures` / `chrono` / `serde` 与未用 dev-dep `tokio` 已删；`base64` 实际在用 → 保留）。本 crate 当前 **0 warning**；core/harness 的既有 warning 未触碰。
-4. **§3.2 缺口清单为权威待办来源**；其中 P0-01（`JdbcAgentSkillRepository`）与 P2-01 / P2-09 需汇总方裁定后再动代码。
+4. **§3.2 缺口清单为权威待办来源**；~~其中 P0-01（`JdbcAgentSkillRepository`）与 P2-01 / P2-09 需汇总方裁定后再动代码~~ → **2026-10-29 勘误**：P0-01 已按裁定 B1 在 jdbc crate 落地（2026-10-22）；P2-01 已按裁定 5 落地为 trait 方法（§7.1）；仅 P2-09 仍为「设计决定（不迁移）」**待汇总方确认**（见下第 5 条）。
+5. **真实剩余（2026-10-29 复核，均为已在册项）**：
+   - 测试覆盖 **93 vs Java 192**（进行中，P1-09 / §9.5；git 35 / mysql 26 / pg 18 / repository 4 / sql 5 / util 5）。
+   - 真实 MySQL / PostgreSQL 驱动**未接入**：`SqlDatabase` 实际只有 `InMemorySqlDatabase`（workspace 已备 `sqlx`/`mysql_async`/`tokio-postgres`，本 crate `Cargo.toml` 未引用；`agentscope-extensions-postgresql` 的 `postgres-driver` + `PgSimpleClient` 是首选落点）。
+   - `close()` 失败返回 `Err`（Java 只 `warn`）：维持「设计决定（不迁移）」，**待汇总方确认**（§3.2 P2-09 / §7.2）。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-skills` 基线。

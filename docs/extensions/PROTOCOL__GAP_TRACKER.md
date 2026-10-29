@@ -19,7 +19,7 @@
 | Rust crate | facade `crates/agentscope-extensions-protocol` + 5 个拆分子 crate（`-a2a-client` / `-a2a-server` / `-agent-protocol` / `-agui` / `-chat-completions-web`，见 §7） |
 | Rust 规模（实测 2026-10-28） | 6 crate 共 **45 文件 / 20948 行 / 341 个测试**（`#[test]` 317 + `#[tokio::test]` 24）；分布：a2a-client 6 文件 2414 行 39 测、a2a-server 6 文件 3819 行 47 测、agent-protocol 3 文件 2093 行 29 测、agui 24 文件 11082 行 191 测、chat-completions-web 5 文件 1507 行 35 测、facade 1 文件 33 行 0 测 |
 | 迁移波次 | A |
-| 当前状态 | **已完成** — 5 个子 crate 全部落地；**2026-10-22 复核列出的 P1×7 已于 2026-10-28 全部关闭**（服务端引导层 / 执行属性 / registry 服务发现 / transport 包装层 / `message/stream` SSE 增量 / agent-protocol 落盘仓库 / agui `ProcessResult.interrupt`），余下仅 P2 长尾（见 §3.3、§6.4） |
+| 当前状态 | **总判：进行中**（仍有 P1 代码缺口：runner 体系 / adapterFactory / A2aAgent 门面）—— **已完成** — 5 个子 crate 全部落地；**2026-10-22 复核列出的 P1×7 已于 2026-10-28 全部关闭**（服务端引导层 / 执行属性 / registry 服务发现 / transport 包装层 / `message/stream` SSE 增量 / agent-protocol 落盘仓库 / agui `ProcessResult.interrupt`），余下仅 P2 长尾（见 §3.3、§6.4） |
 
 ### 1.1 验证基线（最近一次实测，2026-10-28，本 crate 内单条命令）
 ```
@@ -108,7 +108,7 @@ cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client
 | Jackson (`ObjectMapper`) | JSON (反)序列化 | `serde` + `serde_json`（workspace） | 已完成 |
 | JUnit 5 / Mockito | 测试 | `#[test]`/`#[tokio::test]` + 内存 fake | 已完成 |
 | Spring Web / AutoConfiguration | HTTP + DI | `axum` 0.7（`json,tokio,http1,query`） | 已完成（DI 不做） |
-| Spring `SseEmitter` | SSE 流 | `axum` SSE（`agui::encoder::AguiEventEncoder::to_sse_event`）+ `agent_protocol` 手写 `text/event-stream` 帧 | 部分完成 |
+| Spring `SseEmitter` | SSE 流 | `axum` SSE（`agui::encoder::AguiEventEncoder::to_sse_event`）+ `agent_protocol` 手写 `text/event-stream` 帧 + a2a `A2aRequestHandler::stream_responses` | 部分完成。**已完成（2026-10-29 勘误）**：原记「`message/stream` 返回一次性数组非 SSE 增量」，实际 a2a 服务端已改真 SSE（`is_streaming_method` 只认 `message/stream`，每帧 `data: <json-rpc response>`）；依据 §3.2 / §8.1 #5 / 用例 `message_stream_is_served_incrementally_over_a_transport`。仍留：`tasks/resubscribe` 未流式（回 `-32601`，§8.4 第 6 条） |
 | `HttpClient` (Java 11) | A2A 客户端 | `reqwest`（workspace 0.13）+ `JsonRpcTransport` trait | 已完成 |
 | `java.net.URL` + `Files.probeContentType` | URL 扩展名→MIME | `mime_type_from_url`（内置扩展名表） | 已完成（受控子集） |
 | `java.util.UUID` | 生成文件名 | `uuid`（workspace） | 已完成 |
@@ -299,6 +299,8 @@ cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client
 | **P2** | `tracing` 依赖几乎未使用 | Java 侧用 SLF4J 贯穿 a2a | 本 crate `tracing::` 实际调用仅 `agent_protocol.rs:290` 一处 | 可选：补齐 a2a/agui 的日志 |
 
 ### 6.5 勘误列表（原文 → 实际）
+
+> **2026-10-29 注**：本节是 2026-10-22 静态复核快照。其中 #6/#7/#10/#19/#22 所指的 P1 缺口已由 §8（2026-10-28）全部关闭，当前状态以 §3.2 / §4.2 为准。
 | # | 位置 | 原文 | 实际 |
 |---|---|---|---|
 | 1 | §1 模块概览 | `a2a-client 2401 / a2a-server 2824 / agent-protocol 1443 / agui 8325 / chat-completions-web 1851` | `a2a-client 2896 / a2a-server 3238 / agent-protocol 1458 / agui 8467 / chat-completions-web 1851`（合计主 **17910**；rollup 记 16844 已过期） |

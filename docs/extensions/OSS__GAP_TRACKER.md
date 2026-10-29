@@ -1,4 +1,4 @@
-﻿# OSS 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# OSS 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **OSS** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-oss\`
@@ -17,9 +17,9 @@
 | Java 子模块 | (单模块) |
 | Java 规模（2026-10-22 实测） | 主代码 **795 行 / 5 个类**（`OssAgentStateStore` 314、`OssBaseStore` 268、`OssDistributedStore` 77、`OssRemoteSnapshotClient` 81、`OssSnapshotSpec` 55；含空行/注释共 880 行）；测试 **290 行 / 2 个类 / 20 个 `@Test`**（137+153；含空行/注释共 336 行） |
 | Rust crate | `crates/agentscope-extensions-oss` |
-| Rust 规模（2026-10-22 实测；**§8 后用例：默认 61 + 1 doc-test / `--features s3` 72 + 2 doc-test，待实测**） | `src/` **8 文件 1210 行 / 非空 1064 行**（base_store 265、client 224、distributed_store 131、error 53、guard 65、lib 52、snapshot 128、state_store 292）；`tests/` **5 文件 525 行 / 非空 446 行**；用例 **41 个 `#[test]`/`#[tokio::test]` + 1 个 `no_run` doc-test = 42**，`src/` 内 `cfg(test)` 命中 **0** |
+| Rust 规模（2026-10-22 实测；**用例（2026-10-29 静态计数）：默认 64（`tests/` 62 + `src/guard.rs` 内联 2）+ 1 doc-test / `--features s3` 75 + 2 doc-test**） | `src/` **8 文件 1210 行 / 非空 1064 行**（base_store 265、client 224、distributed_store 131、error 53、guard 65、lib 52、snapshot 128、state_store 292）；`tests/` **5 文件 525 行 / 非空 446 行**；用例 **41 个 `#[test]`/`#[tokio::test]` + 1 个 `no_run` doc-test = 42**（2026-10-22 口径，非现行），`src/` 内 `cfg(test)` 命中 **0** |
 | 迁移波次 | B |
-| 当前状态 | **进行中（P1 已全部关闭，见 §8；§6/§7 为历史快照）**。契约 5/5 齐全，默认 feature **61 test + 1 doc-test** / `--features s3` **72 test + 2 doc-test**（待主智能体跑 cargo 确认）；仍存的结构性限制只有「无法产出完整 `DistributedStore`」（受 harness struct 约束，§4.2-1） |
+| 当前状态 | **总判：已完成**（P1 清零，余 P2）—— **进行中（P1 已全部关闭，见 §8；§6/§7 为历史快照）**。契约 5/5 齐全，默认 feature **64 test + 1 doc-test** / `--features s3` **75 test + 2 doc-test**（2026-10-29 静态计数）；`DistributedStore` 五槽已可完整产出（2026-10-28 执行记录，§4.2-1 已关闭）；真实剩余见 §4.1「2026-10-29 复核后的真实剩余（未关闭）」 |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -37,7 +37,7 @@
 ### 2.1 依赖映射（Java → Rust）
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
 |---|---|---|---|
-| `com.aliyun.oss:aliyun-sdk-oss:3.18.5` | 阿里云 OSS 对象读写 | `aliyun-oss-rust-sdk`（optional，feature `aliyun`） | 通过 `OssClient` trait 隔离；默认不编译（避免强拉未 CU 验证的 SDK）。实机后端待接入 |
+| `com.aliyun.oss:aliyun-sdk-oss:3.18.5` | 阿里云 OSS 对象读写 | `rust-s3` 0.38（optional，feature `s3`）→ `S3OssClient` | **已完成（2026-10-29 勘误）**：原记「`aliyun` 空壳 feature + 实机后端待接入」，实际裁定 8 已删该 feature，改为通用 `s3` feature + `S3OssClient`（S3 兼容端点：AWS S3/MinIO/Ceph/阿里云 OSS-S3），依据 §7（`tests/s3.rs` 7 例 + `src/s3.rs` 内联 4 例，`httpmock` 离线端到端）。**仍缺**阿里云原生 SDK 路径（P2） |
 | Jackson (`JsonUtils`) | JSON | `serde` / `serde_json`（workspace） | 已用 |
 | `agentscope-core` (provided) | AgentStateStore/ListHash | `agentscope-core`（path 依赖） | 实现其 trait，不重建 |
 | `agentscope-harness` (provided) | BaseStore/RemoteSnapshotClient/SandboxSnapshotSpec/Guard | `agentscope-harness`（path 依赖） | 实现其 trait，不重建 |
@@ -46,7 +46,7 @@
 ### 3.1 骨架与依赖（P0）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| crate 骨架 + Cargo 依赖 | pom.xml | 已完成 | 依赖仅写入本 crate `Cargo.toml`；未改根 `[workspace.dependencies]`，未改 core/harness。**冗余依赖**：`futures`、`chrono` 在 `src/`+`tests/` 中零引用（`chrono` 仅 3 处注释误命中），建议清理（P2-1） |
+| crate 骨架 + Cargo 依赖 | pom.xml | 已完成 | 依赖仅写入本 crate `Cargo.toml`；未改根 `[workspace.dependencies]`，未改 core/harness。feature 现仅 `s3`（`rust-s3` 0.38 optional，裁定 8，见 §7）。**冗余依赖（2026-10-29 复核仍未清理）**：`futures`、`chrono`、`serde` 声明但零引用（`chrono` 命中均为注释里的 synchronous 子串），建议清理（P2-1） |
 | `OssClient` 后端抽象 + `InMemoryOssClient` | `OSS` (SDK) | 已完成 | `client.rs`；put/get/exists/delete/list_page/list_all/shutdown；key 前缀归一 + snapshotId 校验辅助。**分页已补齐（§8-2）**：新增 `InMemoryOssClient::with_page_size(n)` / `page_size()`，`list_page` 受页帽约束（`max_keys=0` → 空页且 `truncated=false`）；`tests/pagination.rs` 13 用例覆盖首页/续传/最后一页/精确边界/空结果/`list_all` 多页聚合 |
 | `OssAgentStateStore` | `OssAgentStateStore` | 已完成 | 实现 `AgentStateStore`（save/save_list/get/get_list/exists/delete/list_session_ids/close）；`__anon__` 默认用户；三后缀 `.json`/`.list.json`/`.list.hash`。**per-key `delete_key` 已落地（§8-1）**（crate 固有方法，仿 MONGODB 先例，不改 core trait） |
 | `OssStore`（`BaseStore`） | `OssBaseStore` | 已完成 | 实现 `BaseStore`（get/put/put_if_version/search/delete）；`search` 按 key 排序分页、排除 `.version`；key 去前导 `/`；**错误传播已对齐（§8-3）**：新增固有方法 `search_strict -> OssResult<Vec<StoreItem>>`（列表 key 不在 namespace prefix 下 / item JSON 损坏 → `OssError::Backend`/`Json`，对齐 Java 抛 `RuntimeException`），trait `search` 委托它并在错误时返回空页 + `tracing::error!`（不再静默伪造 item key） |
@@ -67,17 +67,17 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **已完成**：`agentscope-extensions-oss` 全量实现，产出契约 4 类 trait 实现 + 组合者 + 后端抽象；§8（2026-10-26）关闭 P1-1/P1-2/P1-3/P1-7。
+- **已完成**：`agentscope-extensions-oss` 全量实现，产出契约 4 类 trait 实现 + 组合者 + 后端抽象；§8（2026-10-26）关闭 P1-1/P1-2/P1-3/P1-7；2026-10-28 关闭 P1-4（`distributed_store()` 填满 5 槽 + `impl SandboxGuard`，见文末执行记录）。
 - **验证命令与结果**（原会话记录；§8 改动**尚未由子智能体跑 cargo**，待主智能体统一验证）：
   - `cargo build -p agentscope-extensions-oss` → Finished（本 crate 无 error/warning）
   - `cargo test -p agentscope-extensions-oss`（基线，§8 前）→ **42 passed / 0 failed**
     - `agent_state_store` 15 ✓ / `base_store` 13 ✓ / `guard_and_distributed` 6 ✓ / `snapshot` 7 ✓ / doc-test 1 ✓
-  - **§8 后预期用例数**：默认 feature **61 test + 1 doc-test**（`agent_state_store` 18 / `base_store` 17 / `pagination` 13 / `guard_and_distributed` 6 / `snapshot` 7）；`--features s3` **72 test + 2 doc-test**（再 + 内联 `s3` 4 + `tests/s3.rs` 7）
+  - **用例（2026-10-29 静态计数）**：默认 feature **64 test + 1 doc-test**（`agent_state_store` 18 / `base_store` 17 / `pagination` 13 / `guard_and_distributed` 7 / `snapshot` 7 / `src/guard.rs` 内联 2）；`--features s3` **75 test + 2 doc-test**（再 + 内联 `s3` 4 + `tests/s3.rs` 7）。执行记录：2026-10-28 默认 62 passed、`--features s3` 71 passed
 - **文件清单**（实测行数）：
   - `crates/agentscope-extensions-oss/Cargo.toml`（feature 已改为 `s3`，见 §7）
   - `src/lib.rs`、`src/error.rs`、`src/client.rs`、`src/state_store.rs`、`src/base_store.rs`、`src/snapshot.rs`、`src/guard.rs`、`src/distributed_store.rs`、`src/s3.rs`（feature `s3`）
   - `tests/common/mod.rs`、`tests/agent_state_store.rs`、`tests/base_store.rs`、`tests/snapshot.rs`、`tests/guard_and_distributed.rs`、`tests/s3.rs`（feature `s3`）、**`tests/pagination.rs`（§8-2 新增）**
-- **已知问题**（历史快照，§6 静态复核新增；P1 已在 §8 关闭）：
+- **已知问题**（历史快照，§6 静态复核新增；P1 已在 §8 关闭；P1-4 已于 2026-10-28 关闭）：**2026-10-29 复核后的真实剩余（未关闭）**：①无阿里云原生 SDK 路径（走 S3 兼容端点替代）；②MSRV 冲突（`rust-s3` 0.38 需 ≥1.85 vs workspace `rust-version = 1.80.0`）；③冗余依赖（`futures`/`chrono`/`serde`）；④死错误变体（`SnapshotNotFound`/`Backend` 零构造）；⑤`delete` 未批量（P2-5）；⑥死代码与 `allow(dead_code)`（P2-6/P2-8）；⑦`get`/`put`/`delete` 仍静默降级（§8.1-3「未做」）；⑧缺 `OssSnapshotSpec` 便捷构造器（P2-2）。以下为旧记录：
   - ~~实机 OSS 后端未接线（P0-1）~~ → 已由裁定 8（`s3` + `S3OssClient`，§7）替代实现；`lib.rs` 文档已于 §8-4 更正。
   - ~~缺 per-key `delete`（P1-1）~~ → §8-1 已实现 `OssAgentStateStore::delete_key`。
   - ~~`list_page` 分页/续传分支零覆盖、无分页构造器（P1-2）~~ → §8-2 已补构造器 + 13 用例。
@@ -87,8 +87,8 @@
 
 ### 4.2 下一步与阻塞（需汇总方裁定）
 1. **harness `DistributedStore` 字段不足**（与 EXTENSIONS_GAP_TRACKER §2.2 同项）——**已解决（2026-10-28）**：harness `DistributedStore` 已增 `base_store` / `sandbox_snapshot_spec` / `sandbox_execution_guard` 三槽 + `SandboxGuard` trait；`OssDistributedStore::distributed_store()` 已用 builder 填满 5 槽（`OssStore` / `OssSnapshotSpec` / `OssSandboxExecutionGuard`），且 `OssSandboxExecutionGuard` 已 `impl SandboxGuard`。详见文末执行记录。
-2. **实机阿里云后端**：`aliyun-oss-rust-sdk` 为 optional（feature `aliyun`），默认关闭。**本轮复核已定性：这不是「依赖选型待裁定」，而是「实机后端代码根本不存在」**（`src/` 内 `cfg(feature = "aliyun")` 命中 0 处，见 §6.5 P0-1）。建议二选一：① 实现 `AliyunOssClient`（`impl OssClient`，置于 `cfg(feature = "aliyun")` 模块内）；② 或改用 `opendal`(oss service) / `object_store` 重写后端 trait。`OssClient` trait 已隔离后端，切换成本低。**同时须修正 `src/lib.rs:19-20` 的误导性文档（P1-7）**（已于 §8-4 定稿）。
-3. **未改根 `[workspace.dependencies]`**：本 crate 的 `aliyun-oss-rust-sdk` 为本地 `[dependencies]` optional，未登记到根；如需统一版本请汇总方处理。
+2. **实机阿里云后端** → **已完成（2026-10-29 勘误）**：原记「`aliyun-oss-rust-sdk` 为 optional（feature `aliyun`），默认关闭」「`cfg(feature = aliyun)` 零命中、实机后端代码根本不存在」「建议二选一：实现 `AliyunOssClient` 或改用 `opendal` / `object_store` 重写后端 trait」。实际：裁定 8（2026-10-22，§7）已删除空壳 feature，改为通用 `s3` feature + `S3OssClient`（`src/s3.rs`，`impl OssClient` 全方法；`tests/s3.rs` 7 例 + 内联 4 例，`httpmock` 离线端到端），`lib.rs` 误导性文档已在 §8-4 定稿。**真实剩余**：①无阿里云 OSS 原生 SDK 路径（走 S3 兼容端点，P2）；②`rust-s3` 0.38 需 rustc ≥ 1.85 而 workspace `rust-version = 1.80.0`（MSRV 冲突，待汇总方裁定）；③无真实云凭据 live 验证（见下条）。
+3. **未改根 `[workspace.dependencies]`**：本 crate 的 `rust-s3` 0.38（optional，feature `s3`）与 dev-dep `httpmock` 0.7 为本地声明，未登记到根；如需统一版本请汇总方处理。
 4. **实机 OSS live 验证待凭据**：端到端需真实 OSS endpoint/AK/SK（同类于 MIGRATION_GAP_TRACKER §7.3）。
 
 ## 5. 执行约定（所有会话必须遵守）
@@ -135,23 +135,23 @@
 |---|---|---|---|
 | `OssAgentStateStore` | `src/main/java/io/agentscope/extensions/oss/OssAgentStateStore.java` | `src/state_store.rs` 全量实现（7 个 trait 方法 + `close()` 便捷方法） | **等价**（除 per-key delete，见下） |
 | ├ per-key `delete(userId, sessionId, key)` | 同上 L197-215 | **无**（core `AgentStateStore` trait 未定义该方法） | **缺失（P1-1）** |
-| ├ 错误传播：失败抛 `RuntimeException` | 同上 L98/130/145/166/180/193/213/232/279（**实测 9 处**） | 全部 `tracing::error!`/`warn!` 后静默返回（`save` 返回 `()`、`get` 返回 `None`、`get_list` 返回空 `Vec`） | **部分（P1-3，语义偏软）** |
+| ├ 错误传播：失败抛 `RuntimeException` | 同上 L98/130/145/166/180/193/213/232/279（**实测 9 处**） | 全部 `tracing::error!`/`warn!` 后静默返回（`save` 返回 `()`、`get` 返回 `None`、`get_list` 返回空 `Vec`） | **部分（P1-3，语义偏软）**；2026-10-29 勘误：P1-3 已关闭（`search_strict`） |
 | ├ `close()` | 同上 L236-239 | `state_store.rs:53` `close()` 便捷方法（core trait 无 `close`，Java 接口有 `default close()`） | **等价** |
 | `OssBaseStore` | `OssBaseStore.java` | `src/base_store.rs` 全量实现（5 方法） | **等价** |
 | ├ `put_if_version` CAS | L117-134（`currentVersion != expected` → false；**无** expected=0 特判） | `base_store.rs:70-104`（**多** expected==0 → `!exists(data_key)` 特判） | **等价偏强**（harness 语义要求：Java `BaseStore.putIfVersion` 文档 L65-66 明写「`0` = 仅当 key 不存在时写」；Java 版因 `readVersion` 缺失时返回 0 而偶然通过，Rust 改为显式 `exists` 判定，结论一致且更严谨） |
 | ├ `supportsAtomicSessionStorage` | Java `BaseStore.java:29-31` 默认 `false`，`OssBaseStore` 未覆写 | Rust `BaseStore` 默认 `false`（`store.rs:63`），`OssStore` 未覆写 | **等价**（双方均 `false`；后果一致：`harness/src/agent/session/store.rs:44` 会拒绝该 store 作为 session journal） |
-| ├ 错误传播 | 抛 `RuntimeException`（**实测 6 处**） | `get` → `None`、`put`/`delete` → 记日志 | **部分（P1-3）** |
+| ├ 错误传播 | 抛 `RuntimeException`（**实测 6 处**） | `get` → `None`、`put`/`delete` → 记日志 | **部分（P1-3）**；2026-10-29 勘误：P1-3 已关闭（`search_strict`） |
 | `OssRemoteSnapshotClient` | `OssRemoteSnapshotClient.java` | `src/snapshot.rs` 实现 `RemoteSnapshotClient` | **等价**（`InputStream`→`&[u8]`） |
 | ├ snapshotId 校验 | Java 仅 `null`/blank 检查（L71-73），**不拦** `/` `\` `..` | Rust `client.rs:186-194` 额外拒绝 `/` `\` `..` NUL（对齐 harness `snapshot.rs:42-52`） | **Rust 更严（可接受）**：Java `OssRemoteSnapshotClient` 独立实现了弱校验，未复用 harness 的 `LocalSandboxSnapshot.validateId`（Java `LocalSandboxSnapshot.java:144-153` 才是强校验版）；Rust 走 harness `RemoteSnapshotSpec.build` 强校验路径 |
 | ├ 下载缺失快照 | 抛 `FileNotFoundException`（L59） | `snapshot.rs:73` 返回 `Error::Tool("Snapshot not found in OSS: …")` | **等价**（错误类型不同但均失败） |
 | `OssSnapshotSpec` | `OssSnapshotSpec.java` | `src/snapshot.rs` 包装 harness `RemoteSnapshotSpec` | **等价**（`build` 完全委托 `RemoteSnapshotSpec::build`） |
 | ├ `(endpoint, ak, sk, bucket, prefix)` 便捷构造器 | 同上 L48-58（内部 `OSSClientBuilder`） | **无**（无 SDK 依赖） | **缺失（P2-2，可接受）** |
-| `OssDistributedStore` | `OssDistributedStore.java` | `src/distributed_store.rs` | **部分（P1-4）** |
+| `OssDistributedStore` | `OssDistributedStore.java` | `src/distributed_store.rs` | **部分（P1-4）**；2026-10-29 勘误：P1-4 已关闭（五槽投影） |
 | ├ `agentStateStore()` | L63-70 → `prefix + "state/"` | `oss_agent_state_store()` → 同前缀 | **等价** |
 | ├ `baseStore()` | L72-79 → `prefix + "store/"` | `oss_base_store()` → 同前缀 | **等价** |
 | ├ `sandboxSnapshotSpec()` | L81-84 → `prefix + "snapshot/"` | `oss_snapshot_spec()` → 同前缀 | **等价** |
 | ├ `sandboxExecutionGuard()` | **未覆写** → Java `DistributedStore.java:110-112` 默认 `SandboxExecutionGuard.noop()` | `sandbox_execution_guard()` 返回 `OssSandboxExecutionGuard`（内含 harness `SandboxExecutionGuard::new()`，**非 `noop()`**，但 harness 的 `noop()` 实现即 `Self::new()`，`guard.rs:27-29`） | **行为等价**（Rust 多出便利类型，非缺口） |
-| ├ 一个完整 `DistributedStore` | 实现 `DistributedStore` 接口（5 组件齐全，Java `DistributedStore.java:303-309` `build()` 校验 `agentStateStore`+`baseStore` 非空） | `distributed_store()` 只填 `agent_state_store` | **部分（P1-4，受 harness struct 限制，见 §4.2-1）** |
+| ├ 一个完整 `DistributedStore` | 实现 `DistributedStore` 接口（5 组件齐全，Java `DistributedStore.java:303-309` `build()` 校验 `agentStateStore`+`baseStore` 非空） | `distributed_store()` 只填 `agent_state_store` | **部分（P1-4，受 harness struct 限制，见 §4.2-1）**；2026-10-29 勘误：P1-4 已关闭（五槽投影） |
 | `SandboxExecutionGuard`（harness 接口） | Java 为 `@FunctionalInterface`（`SandboxExecutionGuard.java:59`），OSS 无自有实现 | `OssSandboxExecutionGuard` 透明包装 harness struct | **等价**（且遵守 §2.1 不造平行类型；Java 接口 → Rust struct 的整体形态差异属 harness 裁定，见 rollup §2.1） |
 | 实机 `com.aliyun.oss.OSS` 后端 | `aliyun-sdk-oss:3.18.5`（`pom.xml:49-53` 硬依赖） | `OssClient` trait + `InMemoryOssClient`；`aliyun-oss-rust-sdk` 为 optional 且**零 `cfg(feature)` 使用点** | **缺失（P0-1，唯一 P0）** |
 | `JsonUtils`/Jackson | `JsonUtils.getJsonCodec()` | `serde_json` | **等价** |

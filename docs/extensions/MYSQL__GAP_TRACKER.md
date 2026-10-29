@@ -1,4 +1,4 @@
-﻿# MYSQL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# MYSQL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **MYSQL** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-mysql\`
@@ -17,9 +17,9 @@
 | Java 子模块 | （单模块） |
 | Java 规模（实测 2026-10-22） | 主代码 **2106** 行 / 测试 **358** 行（非空行口径，与 rollup「Java 主/测行」列一致；含空行总行数为 2323 / 416）（11 个主类 + 3 个测试类，共 14 个 `.java`；11 个 `@Test`） |
 | Rust crate | `crates/agentscope-extensions-mysql` |
-| Rust 规模（实测 2026-10-26） | `src/` 13 个 `.rs` 文件 / **3179** 行（非空行口径；含空行 3563）+ `Cargo.toml` 19 行；**70** 个 test 属性（49 `#[test]` + 21 `#[tokio::test]`，静态统计，实际执行数待 `cargo test` 复核） |
+| Rust 规模（实测 2026-10-26） | `src/` 13 个 `.rs` 文件 / **3179** 行（非空行口径；含空行 3563）+ `Cargo.toml` 19 行；**71 passed / 0 failed**（2026-10-28 主会话复跑；原静态统计 70 个 test 属性，见 §4.1） |
 | 迁移波次 | B |
-| 当前状态 | **进行中（2026-10-26：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent、P1-5 表名注入防护 已关闭，见 §7.3；剩余 P1：schema 存在性校验/`version` 列迁移（P1-6）、快照表自动建表（P1-7）、锁名 64 字符截断（P1-8）与 P2 若干）** |
+| 当前状态 | **总判：进行中**（仍有 P1：驱动适配器 / schema 校验 / 快照建表 / 锁名截断）—— **进行中（2026-10-26：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent、P1-5 表名注入防护 已关闭，见 §7.3；剩余 P1：schema 存在性校验/`version` 列迁移（P1-6）、快照表自动建表（P1-7）、锁名 64 字符截断（P1-8）与 P2 若干）** |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -57,7 +57,7 @@
 | `MysqlRemoteSnapshotClient` | `JdbcRemoteSnapshotClient` | 已完成 | `impl RemoteSnapshotClient` |
 | `MysqlSandboxExecutionGuard` | `JdbcSandboxExecutionGuard` | 已完成 | `try_enter`/`release`/`is_held`/`active_count`；lease Drop 自动释放 |
 | `MysqlDistributedStore` 组合 | `MysqlDistributedStore` | 已完成 | 4 组件 + `isolation_scope`；`to_harness_distributed_store()` |
-| 单元测试（无真实 MySQL） | Java 测试 358 行 / 11 `@Test` | 已完成 | 内存后端 **70** 个 test 属性（静态统计：49 `#[test]` + 21 `#[tokio::test]`；2026-10-26 新增 25 个，见 §7.3。实际执行数待 `cargo test` 复核） |
+| 单元测试（无真实 MySQL） | Java 测试 358 行 / 11 `@Test` | 已完成 | 内存后端 **71 passed / 0 failed**（2026-10-28 主会话复跑；2026-10-26 静态统计 70 个 test 属性 = 49 `#[test]` + 21 `#[tokio::test]`，实测比静态多 1） |
 
 ### 3.2 待办 / 后续增强（P1/P2）
 | 缺口项 | 说明 | 状态 |
@@ -82,7 +82,7 @@
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 - **P0 全部已完成**：`crates/agentscope-extensions-mysql/` 全部 P0 组件实现，均**复用既有 trait**（`AgentStateStore` / `BaseStore` / `SandboxSnapshotSpec` / `RemoteSnapshotClient`），CAS/版本语义以 harness 为准。
-- **P1 已关闭 4 项（2026-10-26）**：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent（原记录的回退前提已勘误）、P1-5 表名校验；P1-4 空列表 no-op 已在上轮（§7.1）关闭。**剩余 P1**：P1-6 schema 存在性校验/`version` 列迁移、P1-7 快照表自动建表、P1-8 锁名 64 字符截断。模块整体仍为「进行中」（详见 §7.3）。
+- **P1 已关闭 4 项（2026-10-26）**：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent（原记录的回退前提已勘误）、P1-5 表名校验；P1-4 空列表 no-op 已在上轮（§7.1）关闭。**剩余 P1**：P1-6 schema 存在性校验/`version` 列迁移、P1-7 快照表自动建表、P1-8 锁名 64 字符截断。模块整体仍为「进行中」（详见 §7.3）。**已完成（2026-10-29 勘误）**：P1 现存 **4 项**（上述 3 项 + 真实驱动适配器/集成测试，见 §3.2 前两行）；`saveIfVersion(0)` 回退一项已按 Java MySQL 语义勘误为「无回退」并落地（§3.2 / §7.3）。
 - **文件清单**（实测 2026-10-26，14 个文件；`src/` 13 个 `.rs` / 3563 行含空行、**3179 行非空**）：
   - `Cargo.toml`（19 行；workspace 依赖：agentscope-core/harness、serde、serde_json、thiserror、async-trait、tokio、tracing、chrono，**另含未被任何源码引用的 `futures`**，见文末勘误；本轮**未新增依赖**）
   - `src/lib.rs`（56）、`src/error.rs`（69）、`src/identifier.rs`（97，**本轮新增**）
@@ -94,12 +94,13 @@
 - **验证命令与结果**（下列为 2026-10-20 上一会话的实测值，**2026-10-26 本轮按约定未跑 cargo**——改动后由主智能体统一验证）：
   - `cargo build -p agentscope-extensions-mysql` → **Finished**（本 crate 零 warning；harness 既有 warning 与本次无关）
   - `cargo test -p agentscope-extensions-mysql` → **43 passed; 0 failed**（另 0 doc-tests）
-  - ⚠️ **待复核**：静态统计（2026-10-26）为 **70** 个 test 属性（49 + 21），需 `cargo test` 确认实际执行数
+  - ⚠️ **待复核**：静态统计（2026-10-26）为 **70** 个 test 属性（49 + 21），需 `cargo test` 确认实际执行数（**2026-10-28 已复核：71 passed / 0 failed**）
+  - **已完成（2026-10-29 勘误）**：原记「43 passed / 待复核 70」，实际 **71 passed / 0 failed**（2026-10-28 主会话复跑）；依据 §7.3 新增用例 + 本次实测 |
 - **已知问题**：无阻塞。真实 MySQL 集成测试待环境。
 
 ### 4.2 下一步与阻塞
-1. **跨模块待汇总项（不改动其它 crate）**：harness `DistributedStore` 仅含 `agent_state_store` + `isolation_scope`（实测 `crates/agentscope-harness/src/agent/distributed_store.rs:14-17` 仅两字段），而 Java 版含 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard`（另 `message_bus`/`async_tool_registry`/`task_repository`/`session_turn_gate`/`team_client`，后者此前亦遗漏）。本 crate 已在 `MysqlDistributedStore` 内保留全量 4 组件并通过 `to_harness_distributed_store()` 输出 harness 子集；是否扩展 harness `DistributedStore`（EXTENSIONS_GAP_TRACKER §2.2）仍待汇总方裁定。**实测补充**：harness `HarnessAgent` 目前也**只**从 `DistributedStore` 取 `agent_state_store`（`harness_agent.rs:1759/1890`），`base_store`/`snapshot_spec`/`guard` 在 harness 侧**无任何消费点**——即便扩展 `DistributedStore` 字段，也需 harness 侧同步接线才算真正生效。
-2. **harness `SandboxExecutionGuard` 为具体 struct 而非 trait**（实测 `crates/agentscope-harness/src/agent/sandbox/guard.rs:13 pub struct SandboxExecutionGuard`，提供 `try_enter/release/is_held`）：故本 crate 无法 `impl` 之，改为镜像 Java API 的具体类型 `MysqlSandboxExecutionGuard`（`try_enter`/`release`/`is_held`/`active_count`）。已记入本 §4.2。
+1. **跨模块待汇总项（不改动其它 crate）**：harness `DistributedStore` 仅含 `agent_state_store` + `isolation_scope`（实测 `crates/agentscope-harness/src/agent/distributed_store.rs:14-17` 仅两字段），而 Java 版含 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard`（另 `message_bus`/`async_tool_registry`/`task_repository`/`session_turn_gate`/`team_client`，后者此前亦遗漏）。本 crate 已在 `MysqlDistributedStore` 内保留全量 4 组件并通过 `to_harness_distributed_store()` 输出 harness 子集；是否扩展 harness `DistributedStore`（EXTENSIONS_GAP_TRACKER §2.2）仍待汇总方裁定。**实测补充**：harness `HarnessAgent` 目前也**只**从 `DistributedStore` 取 `agent_state_store`（`harness_agent.rs:1759/1890`），`base_store`/`snapshot_spec`/`guard` 在 harness 侧**无任何消费点**——即便扩展 `DistributedStore` 字段，也需 harness 侧同步接线才算真正生效。**已完成（2026-10-29 勘误）**：原记「harness 仅 2 字段、仍待裁定」，实际 2026-10-28 harness 新增 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` 三个可选槽位，本 crate 已投影；依据文末「2026-10-28 执行记录：`DistributedStore` 复合槽位投影（§4.2 已解决）」
+2. **harness `SandboxExecutionGuard` 为具体 struct 而非 trait**（实测 `crates/agentscope-harness/src/agent/sandbox/guard.rs:13 pub struct SandboxExecutionGuard`，提供 `try_enter/release/is_held`）：故本 crate 无法 `impl` 之，改为镜像 Java API 的具体类型 `MysqlSandboxExecutionGuard`（`try_enter`/`release`/`is_held`/`active_count`）。已记入本 §4.2。**已完成（2026-10-29 勘误）**：原记「harness guard 为具体 struct 无法 `impl`」，实际 2026-10-28 harness 新增 `SandboxGuard` trait，`MysqlSandboxExecutionGuard` 已 `impl SandboxGuard`（见 §2 映射表同行）
 3. **真实驱动适配器**（`mysql_async`/`sqlx`）可由上层按需在本 crate 加 feature 实现后端 trait；当前不强加 workspace 级重依赖。
 4. 监点（`tracing`）与真实 MySQL 集成测试可作为后续 P1/P2。
 5. **`StateBackend` 缝的破坏性变更（2026-10-26，本 crate 内）**：为让 CAS 真正原子，trait 新增必实现方法 `save_single_versioned` / `insert_single_if_absent` / `update_single_if_version`，`read_version` 由「默认实现（读 `:_hash` 行）」改为**必填**（读 `version` 列）；删除 `write_version`（唯一用途是写 `:_hash` 版本行）。`ensure_schema()` 的实现**必须**建出 `version BIGINT NOT NULL` 列（Java `ensureVersionColumn`，默认值 1 或不带默认亦可，CAS 语义要求初始为 1）。真实驱动适配器尚未落地（§3.2 第 1 行），故目前无外部实现受影响；若上层已有实现，需同步补齐。
@@ -203,9 +204,9 @@
 | # | 缺口 | Java 路径 | Rust 现状 |
 |---|---|---|---|
 | P1-1 | 列表**变更检测缺失**：中间元素被改写时 `save_list` 只按 `list_len()` 追加尾部，陈旧数据留存；Java 用 `ListHashUtil.needsFullRewrite` 全量重写 | `state/MysqlAgentStateStore.java:566-601`（+ `core.state.ListHashUtil`） | 缺失（crate 内 `list_hash` 引用数 0；core 已有 `agentscope_core::state::list_hash` 可直接复用，JDBC/PG 已接入） |
-| P1-2 | 版本 **CAS 非原子**：`read_version`→比对→`save`→`write_version` 先读后写，并发双写均可成功 | `state/MysqlAgentStateStore.java:464-546`（`INSERT`/`UPDATE ... WHERE version=?`） | 部分（语义有、原子性无；版本存 `key:_hash` 伴随行而非 `version` 列） |
-| P1-3 | `saveIfVersion(0)` **重复键回退**缺失（#3162 迁移回填 version=0 行） | 同上 `:481-493`、`:501-524` | 缺失（直接返回 `InvalidArgument` 冲突） |
-| P1-4 | 空列表 **no-op** 语义相反：Java `values.isEmpty()` 直接 return；Rust 会以 `from_index` + 空切片调用 `save_list`，后端按「total=0」修剪 → **清空**既有列表 | `state/MysqlAgentStateStore.java:571-573` | 部分（行为相反，`InMemoryStateBackend` 实测会全删） |
+| P1-2 | 版本 **CAS 非原子**：`read_version`→比对→`save`→`write_version` 先读后写，并发双写均可成功 | `state/MysqlAgentStateStore.java:464-546`（`INSERT`/`UPDATE ... WHERE version=?`） | 部分（语义有、原子性无；版本存 `key:_hash` 伴随行而非 `version` 列）；2026-10-29 勘误：已改为行内 `version` 列原子 CAS |
+| P1-3 | `saveIfVersion(0)` **重复键回退**缺失（#3162 迁移回填 version=0 行） | 同上 `:481-493`、`:501-524` | 缺失（直接返回 `InvalidArgument` 冲突）。**已完成（2026-10-29 勘误）**：原记「回退缺失」，实际 MySQL Java `insertIfAbsent` **无回退**（重复键即 `Conflict`），Rust 已按此实现并于 2026-10-26 落地（§3.2 同行 / §7.3） |
+| P1-4 | 空列表 **no-op** 语义相反：Java `values.isEmpty()` 直接 return；Rust 会以 `from_index` + 空切片调用 `save_list`，后端按「total=0」修剪 → **清空**既有列表 | `state/MysqlAgentStateStore.java:571-573` | 部分（行为相反，`InMemoryStateBackend` 实测会全删）；2026-10-29 勘误：`save_list([])` 已为 no-op |
 | P1-5 | **表名注入防护**：`MysqlStoreBuilder::table_name` / `MysqlRemoteSnapshotClient::with_table` 不校验，DDL 直接拼接 | `store/JdbcStore.java:88,392-401`（`[A-Za-z_][A-Za-z0-9_]*`） | 缺失（state 模块有 `validate_identifier`，store/snapshot 无） |
 | P1-6 | **schema 存在性校验 + `version` 列迁移**：Java 构造期 verify DB/table + `ALTER TABLE ADD COLUMN version` | `state/MysqlAgentStateStore.java:174-214,272-321` | 缺失（仅 `ensure_schema()` 交后端 + 标识符校验；`with_config(create_if_not_exist=false)` 不校验存在性） |
 | P1-7 | **快照表自动建表**：Java `JdbcSnapshotSpec` 恒传 `initializeSchema=true` 发 DDL | `snapshot/JdbcSnapshotSpec.java:29-35`、`JdbcRemoteSnapshotClient.java:61-81` | 缺失（`MysqlSnapshotSpec` 无 DDL，依赖后端实现） |
@@ -285,6 +286,8 @@
 
 > 建议 rollup 行文本：
 > `| 10 | B | MYSQL | `agentscope-extensions-mysql` | 2106 / 358 | 进行中（build + test 通过；**45 test**；B 波次 5 项契约齐全：`MysqlDistributedStore`/`MysqlAgentStateStore`/`MysqlStore`/`MysqlSnapshotSpec`/`MysqlSandboxExecutionGuard` + `LockBackend` 注入缝；**P1 缺口 8 项**：列表变更检测缺失、CAS 非原子、`saveIfVersion(0)` 回退缺失、空列表语义相反、表名未校验、schema 校验缺失、快照表不自动建表、锁名未截断，见 `MYSQL__GAP_TRACKER.md` §6） | `MYSQL__GAP_TRACKER.md` |`
+
+> **已完成（2026-10-29 勘误）**：原记「**P1 缺口 8 项**」「**45 test**」，实际 P1 现存 **4 项**（P1-6 schema 校验/`version` 列、P1-7 快照建表、P1-8 锁名截断、真实驱动与集成测试）；列表变更检测/CAS 原子性/create-if-absent/空列表 no-op/表名校验均已关闭（2026-10-22 / 2026-10-26，§3.2 / §7.1 / §7.3）；实测 **71 passed / 0 failed**（2026-10-28 主会话复跑）。
 
 
 

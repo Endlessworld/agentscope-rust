@@ -1,4 +1,4 @@
-﻿# TRAINING 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# TRAINING 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **TRAINING** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-training\`
@@ -19,7 +19,7 @@
 | Rust crate | `crates/agentscope-extensions-training` |
 | Rust 规模（2026-10-28 实测） | 5 个源文件；`runner.rs` 1722 行（其余未变：`backend.rs` 748、`lib.rs` 32、`reward.rs` 107、`strategy.rs` 720）；**74 个测试**（2026-10-28：`#[test]` 61 + `#[tokio::test]` 13） |
 | 迁移波次 | C |
-| 当前状态 | 进行中（2026-09-18 曾收尾：build ✅ / test 64 passed；2026-10-22 静态复核发现 2 项 P0 + 3 项 P1 + 4 项 P2 缺口，见 §4.2 / §6） |
+| 当前状态 | **总判：已完成**（代码面 P1 清零，余 live 联调 + P2）—— 历史：2026-09-18 收尾（build ✅ / test 64 passed）；2026-10-22 静态复核发现的 2 P0 + 3 P1 + 4 P2 已按 §4.2 处理（P0-1 经核实非缺口 / P1-3 设计决定 / P2-1 待环境 / P2-3 对齐 Java），2026-10-28 实测 **74 passed** |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -28,7 +28,7 @@
 | `backend/dto/FeedbackRequest` | Feedback API 请求体（msg_ids/reward/task_id/run_id） | `backend::dto::FeedbackRequest` | 同上 |
 | `backend/dto/StatusResponse` | 通用状态响应（status/message/isSuccess） | `backend::dto::StatusResponse` | `is_success()` 复刻 `"success".equalsIgnoreCase` |
 | `backend/TrinityClient` | Trinity Feedback/Commit HTTP 客户端（OkHttp） | `backend::TrinityClient`（`reqwest`，async） | 只有 `/feedback`、`/commit`；Chat 走 OpenAI 兼容模型 |
-| `backend/TrinityModelAdapter` | 组合包装 OpenAIChatModel，拦截响应收集 msg_id → RunExecutionContext | `backend::TrinityModelAdapter`（实现 core `Model` trait，组合 `Arc<dyn Model>`） | **不重建模型**：实现 core `Model` trait 并委派给内层 model；`stream` 中把每个 `ChatResponse.id` 记入 `RunExecutionContext`。**Java 强制 `stream(false)`，Rust 建的 `OpenAiChatModel` 恒为流式且无 stream 开关**（见 §4.2 P0-2） |
+| `backend/TrinityModelAdapter` | 组合包装 OpenAIChatModel，拦截响应收集 msg_id → RunExecutionContext | `backend::TrinityModelAdapter`（实现 core `Model` trait，组合 `Arc<dyn Model>`） | **不重建模型**：实现 core `Model` trait 并委派给内层 model；`stream` 中把每个 `ChatResponse.id` 记入 `RunExecutionContext`。**已完成（2026-10-29 勘误）**：原记「Java 强制 `stream(false)`，Rust 建的 `OpenAiChatModel` 恒为流式且无 stream 开关（见 §4.2 P0-2）」，实际已闭环——`TrinityModelAdapter::stream` 置 `options.stream = Some(false)` 并对连续重复 id 去重（`backend.rs:305-325`），MODEL 侧 `openai/mod.rs:265/311` 已读 `options.stream` 并走非流式分支（§4.2 P0-2） |
 | `reward/RewardCalculator` | 依据 shadow Agent 执行结果算 reward | `reward::RewardCalculator`（trait，`fn calculate(&self, agent: &ReActAgent) -> f64`） | Rust 用 `ReActAgent` 具体类型（等价 Java `Agent` 参数） |
 | `runner/AgentCloner` | 反射提取配置 + Builder 重建 Agent（换 model，新建空 memory） | `runner::AgentCloner::clone_with_model`（基于 `ReActAgent`/`ReActAgentBuilder` 显式重建） | Rust 无反射：name/description/toolkit 由 `Agent` trait 回读，`sys_prompt`/`max_iters` **已通过 core getter 回读**（`ReActAgent::sys_prompt()`/`max_iters()`），`ShadowAgentSpec` 降级为可选覆盖；`modelExecutionConfig`/`toolExecutionConfig`/`toolExecutionContext` **设计决定（不迁移）**（core 无字段/无 setter，见 §4.2 P1-3） |
 | `runner/RunExecutionContext` | 单次 Run 的执行上下文（msgIds/msgs/timing） | `runner::RunExecutionContext` | `Arc<Mutex<...>>` 内部可变，线程安全 |
@@ -36,7 +36,7 @@
 | `runner/TaskExecutionRegistry` | taskId → Vec<RunExecutionContext> 注册与统计 | `runner::TaskExecutionRegistry` | 同上；查询按 runId 数值排序 |
 | `runner/TaskIdGenerator` | 生成 `task-{uuid}` / `task-{ts}-{rand}` | `runner::task_id_generator`（uuid crate） | `uuid` 已在 workspace deps |
 | `runner/TrainingConfig` | 训练配置（endpoint/模型/策略/reward/commit 间隔/池/repeatTime） | `runner::TrainingConfig` + Builder | 默认值对齐 |
-| `runner/TrainingRouter` | 训练路由 Hook：PreCall 存输入、PostCall 选择+shadow 执行+feedback | `runner::TrainingRouter`（**不实现 core `Middleware`**，提供显式驱动 API `decide(...)` + `run_shadow(...)`，另附 `ShadowRunReport`） | 见 §4.2：Java Hook 的 `PreCall/PostCall` 语义在 Rust 无等价钩子，改为显式驱动（保留 `-shadow` 递归保护 / repeatTime / runId / feedback 全流程） |
+| `runner/TrainingRouter` | 训练路由 Hook：PreCall 存输入、PostCall 选择+shadow 执行+feedback | `runner::TrainingRouter` + **`runner::TrainingHook`**（core `Middleware`，`ExtensionPoint::OnAgent`，经 `TrainingRunner::attach(&mut MiddlewareChain)` 显式装配）+ 显式驱动 API `decide(...)` / `run_shadow(...)` + `ShadowRunReport` | 见 §4.2：Java Hook 的 `PreCall/PostCall` 由 `on_agent` 洋葱拦截等价承载（`TrainingHook`，2026-10-28 收口），保留 `-shadow` 递归保护 / repeatTime / runId / feedback 全流程 |
 | `runner/TrainingRunner` | 训练生命周期控制（start/stop/周期 commit） | `runner::TrainingRunner` | commit 调度用 tokio task + interval |
 | `strategy/TrainingSelectionStrategy` | 选择策略接口（`shouldSelect`/`priority`/`name`） | `strategy::TrainingSelectionStrategy`（trait） | reactor `ContextView` → 显式 `Option<&TrainingAnnotation>` 参数（见 §4.2） |
 | `strategy/SamplingRateStrategy` | 按概率采样 | `strategy::SamplingRateStrategy` | 内部 PRNG（不引 rand 依赖） |
@@ -85,7 +85,7 @@
 |---|---|---|---|
 | DTO（CommitRequest/FeedbackRequest/StatusResponse） | dto/* | 已完成 | snake_case serde；`is_success()` |
 | TrinityClient（feedback/commit HTTP） | TrinityClient | 已完成 | `reqwest` async；endpoint 必填校验；非 2xx → `Error` |
-| TrinityModelAdapter（组合 Model + 收集 msg_id） | TrinityModelAdapter | 已完成 | 实现 core `Model` trait，委派内层 `Arc<dyn Model>`；对流内每个 `ChatResponse.id` 记入 `RunExecutionContext` |
+| TrinityModelAdapter（组合 Model + 收集 msg_id） | TrinityModelAdapter | 已完成 | 实现 core `Model` trait，委派内层 `Arc<dyn Model>`；**非流式强制 + id 去重（2026-10-29 勘误后确认）**：`stream` 内 `options.stream = Some(false)`（对齐 Java `.stream(false)`），并对连续重复 `ChatResponse.id` 只记 1 次，记入 `RunExecutionContext` |
 
 ### 3.5 runner（P0）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
@@ -110,7 +110,7 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **状态：进行中（波次 C；2026-09-18 收尾重验，2026-10-22 静态复核发现 2 项 P0 + 3 项 P1 + 4 项 P2 缺口，见 §4.2 / §6）**。21 个 Java 类全部有 Rust 对应（详见 §2），划分为 4 个模块：
+- **状态：已完成（2026-10-29 勘误）**：原记「进行中（波次 C；2026-09-18 收尾重验，2026-10-22 静态复核发现 2 项 P0 + 3 项 P1 + 4 项 P2 缺口，见 §4.2 / §6）」，实际截至 2026-10-28 除 P0-1（实测 Java 亦无非缺口）、P1-3（设计决定）、P2-1（live 待条件）、P2-3（对齐 Java 全局单例）外**全部关闭**，实测 **74 passed / 0 failed**（§8.3；P0-2 状态总览见 §4.2 勘误）。21 个 Java 类全部有 Rust 对应（详见 §2），划分为 4 个模块：
   - `strategy.rs`：`TrainingAnnotation`(+Builder)/`TrainingContext`/`SelectionDecision`/`TrainingSelectionStrategy`(trait)/`SamplingRateStrategy`/`ExplicitMarkingStrategy`/`is_expired`
   - `reward.rs`：`RewardCalculator`(trait) + `FnRewardCalculator` + `ZeroRewardCalculator`
   - `backend.rs`：`dto::{CommitRequest,FeedbackRequest,StatusResponse}` + `TrinityClient`(+Builder) + `TrinityModelAdapter`(+Builder)
@@ -134,7 +134,7 @@
   2. Java `TrainingRouter` 是 `Hook`（`PreCallEvent`/`PostCallEvent`）；Rust 提供两种驱动方式：显式 API `decide(...)` + `run_shadow(...)`，以及 `TrainingHook`（`Middleware::on_agent` 包装）自动触发（2026-10-28 新增，见 §4.2 P1-2）；`-shadow` 递归保护、选择分支、repeatTime/runId/feedback 全流程保持一致。
   3. Java `AgentCloner` 用反射提取 `sysPrompt`/`maxIters` 等；Rust 无反射 → name/description/toolkit 从 `Agent` trait 读取，`sys_prompt`/`max_iters` **默认用 core getter 回读**，`ShadowAgentSpec` 仅作为显式覆盖（2026-10-28 修正，见 §4.2 P1-1）。
   4. Java `RewardCalculator.calculate(Agent)` → Rust `calculate(&ReActAgent)`（具体类型）。
-  5. Java `TrinityModelAdapter` 强制 `stream(false)`（Trinity 不支持流式）；Rust 侧 `OpenAiChatModel` 恒为流式且无关闭开关（见 §4.2 P0-2）。
+  5. Java `TrinityModelAdapter` 强制 `stream(false)`（Trinity 不支持流式）；**已完成（2026-10-29 勘误）**：原记「Rust 侧 `OpenAiChatModel` 恒为流式且无关闭开关（见 §4.2 P0-2）」，实际 `TrinityModelAdapter::stream` 已强制 `options.stream = Some(false)` + 重复 id 去重，MODEL 侧已有非流式分支（§4.2 P0-2）。
 
 ### 4.2 剩余缺口（分级）与阻塞 / 跨模块依赖
 > 以下分级为 **2026-10-22 静态复核**结果（未编译、未运行 cargo test）。P0-1 / P0-2 为本轮新发现，详见末尾「静态复核记录」。
@@ -144,7 +144,7 @@
 | 编号 | 主题 | 2026-10-28 状态 |
 |---|---|---|
 | P0-1 | 训练数据格式/轨迹采样（Java 亦无） | 非缺口（不变） |
-| P0-2 | `TrinityModelAdapter` 流式 vs 非流式 | 部分修复（§7.1/§7.2 不变，仍待 MODEL 侧非流式分支） |
+| P0-2 | `TrinityModelAdapter` 流式 vs 非流式 | **已完成（2026-10-29 勘误）**：原记「部分修复（§7.1/§7.2 不变，仍待 MODEL 侧非流式分支）」，实际 `backend.rs:305-308` 已强制 `options.stream = Some(false)` 并对重复 id 去重，MODEL `openai/mod.rs:265/311` 已读 `options.stream` 并落地非流式分支（一次调用 = 一个 `ChatResponse` = 一个 msg_id） |
 | P1-1 | `AgentCloner` 丢 `sys_prompt`/`max_iters` | **已完成**（改回读，+2 测试） |
 | P1-2 | 无法全局挂载 hook | **已收口**：不改 core，新增 `TrainingHook` + `TrainingRunner::attach`（+3 测试） |
 | P1-3 | 3 个 ExecutionConfig 字段 | **设计决定（不迁移）**（core 无字段/setter） |
@@ -166,6 +166,7 @@
   1. **协议层**：Rust 向 Trinity 的 OpenAI 兼容端点发 `stream: true`，与 Java 显式规避的行为相反；Trinity 若不支持流式，shadow 调用直接失败 → 无 msg_id → 不发 feedback → **训练闭环断链**。
   2. **数据层**：`OpenAiChatModel` 的 `StreamIncrementer` 对每个 SSE chunk 产出 1 个 `ChatResponse`，且所有 chunk 复用**同一个 completion id**（`self.id` 仅在首个非空 chunk 赋值，后续 chunk 沿用）。`TrinityModelAdapter::stream()` 对**每个** response 都 `add_msg_id(resp.id)` → 同一 id 被重复写入 N 次（N = chunk 数），而 Java 恒为 1 次。**msg_ids 列表语义被污染**（重复项），直接影响 feedback 上报的轨迹条数。
 - 裁定建议：需在 `agentscope-extensions-model` 的 `OpenAiChatModel` 暴露 stream 开关（或在 `TrinityModelAdapter` 内做 id 去重 + 强制非流式）。**当前不阻塞编译，但阻塞真实 Trinity 联调**，属本轮最高优先级缺口。
+- **已闭环（2026-10-29 勘误）**：上述两条路径都已落地——①`TrinityModelAdapter::stream` 内 `options.stream = Some(false)`（`backend.rs:305-308`）并对连续重复 id 去重；②MODEL `openai/mod.rs:265` `let streaming = options.stream.unwrap_or(true)` + `:311` 非流式分支（整次 completion → 单个 `ChatResponse`）。真实 Trinity 联调仍未做（P2-1）。
 
 **P1-1：`AgentCloner` 丢弃 `sys_prompt` / `max_iters`（core 已有 getter，本 crate 未回读）**
 - 上一版 tracker 称「core 无 getter，故由 `ShadowAgentSpec` 显式传入」——**该前提不成立**：`agentscope-core/src/agent/react_agent.rs:283` 已有 `pub fn sys_prompt(&self) -> &str`，`:288` 已有 `pub fn max_iters(&self) -> i32`。
@@ -206,6 +207,12 @@
 **P2-4：无依赖清理**
 - `Cargo.toml` 声明 `agentscope-harness`、`chrono`、`async-trait`、`thiserror` 四个依赖，但 `src/**/*.rs` 引用数均为 **0** → 可移除（减少编译面）。`agentscope-harness` 尤其值得清理，避免与「未触及 harness」的表述产生歧义。
 - **2026-10-28 已清理**：先逐项 `Select-String` 复核（`agentscope_harness`/`chrono`/`thiserror`/`async_trait` 命中均为 0）再删除。剩余 `[dependencies]`：`agentscope-core`、`agentscope-extensions-model`、`serde`、`serde_json`、`tokio`、`futures`、`tracing`、`reqwest`、`uuid`；build/test 均通过。
+
+**真实剩余（2026-10-29 复核；P0-2 / P1-1~P1-4 / P2-2 / P2-4 均已关闭，实测 74 passed，见 §8.3）**
+- **live Trinity 联调未做**（P2-1）：`TrinityClient`/`TrinityModelAdapter` 仍只经 loopback mock + 假 Model 离线验证。
+- `shadow_pool_capacity` 为**预留字段未消费**（tokio 信号量无有界等待队列，无法 1:1 映射 Java `newBoundedElastic` 的 queue bound）。
+- `RunRegistry`/`TaskExecutionRegistry` 为**进程级全局单例**（`OnceLock`），无多实例隔离（对齐 Java 静态字段）。
+- `TrainingHook` **无卸载路径**：`TrainingRunner::stop()` 只停生命周期与 commit 调度，不移除已装配的 middleware（`MiddlewareChain` `build()` 后不可变）——对应 Java `removeSystemHook` 缺失（§8.4）。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-training` 基线。
@@ -373,7 +380,7 @@
 | 信号量许可数硬编码为 1 | `router_shadow_pool_size_is_wired` | FAILED（0 passed / 1 failed） |
 
 ### 8.4 遗留
-- **P0-2**（Trinity 非流式）仍为部分修复，待 MODEL 侧让 `build_request` 读 `options.stream`（§7.2）。
+- **P0-2**（Trinity 非流式）**已完成（2026-10-29 勘误）**：原记「仍为部分修复，待 MODEL 侧让 `build_request` 读 `options.stream`（§7.2）」，实际已闭环——`backend.rs:305-308` 强制 `options.stream = Some(false)` + 重复 id 去重，MODEL `openai/mod.rs:265/311` 已读 `options.stream` 并走非流式分支（§4.2 P0-2）。
 - **P2-1** live 联调、**P2-3** 全局单例隔离不变。
 - `shadow_pool_capacity` 仍为预留（若要真正的有界队列，需自建调度器，当前不阻塞）。
 - `TrainingHook` 无「卸载」：middleware chain 在 `build()` 后不可变，宿主要停用需重建 agent；`TrainingRunner::stop()` 只停生命周期与 commit 调度，**不会**移除 hook（已在代码文档与本 tracker 注明，对应 Java `removeSystemHook` 的缺失）。

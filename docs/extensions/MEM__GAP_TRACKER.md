@@ -1,4 +1,4 @@
-﻿# MEM 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
+# MEM 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **MEM** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-mem\`
@@ -18,9 +18,9 @@
 | Java 规模（实测 2026-10-22） | 主代码 25 文件 / 5543 行（非空 4821）；测试 18 文件 / 6850 行（非空 5746）/ 326 个 `@Test` |
 | Rust crate | `crates/agentscope-extensions-mem` |
 | 迁移波次 | A |
-| 当前状态 | **已完成**（实现层完成：25 个 Java 类 1:1 落地；2026-10-28 已修 `api_base_url` 空校验、`connect_timeout(30s)` 与 DTO 单测，实测 **96 passed / 0 failed**；§3.2 仍留 2 项待办：真实网络联调 / Java 测试逐条对照；详见 §7） |
+| 当前状态 | **总判：进行中**（仍有 P1：真实联调 / 逐条测试对照 / 吞错口径待裁定）—— **已完成**（实现层完成：25 个 Java 类 1:1 落地；2026-10-28 已修 `api_base_url` 空校验、`connect_timeout(30s)` 与 DTO 单测，实测 **96 passed / 0 failed**；§3.2 仍留 2 项待办：真实网络联调 / Java 测试逐条对照；详见 §7） |
 
-### 1.1 Rust crate 文件清单（15 个源文件，2993 行 = 生产 2045 + 内联测试 948）
+### 1.1 Rust crate 文件清单（15 个源文件，2993 行 = 生产 2045 + 内联测试 948；**2026-10-29 勘误**：测试函数数已增至 **96**，行数未重测）
 | 文件 | 职责 |
 |---|---|
 | `src/lib.rs` | crate 根：模块声明、re-export、设计裁定说明 |
@@ -95,13 +95,13 @@
 | 消息 → 各厂商 message 转换 | `convertTo*Message` | 已完成 | `convert_messages` / `is_recordable` / `role_to_*_role` |
 | 检索结果 → 字符串/core `Msg` 映射 | `retrieve` / `getMemories` | 已完成 | `join_search_results` / `join_memory_nodes` / `render_search_response` / `Mem0SearchResult::to_msg` |
 | 编译错误修复（`ContentBlockKind` 导入路径） | — | 已完成 | 见 §4.1；实测两处均为 `use agentscope_core::message::msg::ContentBlockKind;`（bailian/memory.rs:7、reme/memory.rs:7） |
-| 离线单测（66 个） | Java 测试 18 文件 / 6850 行 / 326 `@Test` | 已完成 | 实测 `#[test]` 40 + `#[tokio::test]` 26 = **66**，与声明一致；覆盖 DTO 往返、转换函数、请求构造、mock HTTP 全链路 |
+| 离线单测（**96** 个；2026-10-29 勘误，原记 66） | Java 测试 18 文件 / 6850 行 / 326 `@Test` | 已完成 | 2026-10-28 实测 `#[test]` 67 + `#[tokio::test]` 29 = **96 passed / 0 failed**（§7.3）；覆盖 DTO serde 往返（含 bailian/reme 新增 21 个）、转换函数、请求构造、构造期 base URL 校验、connect 超时、mock HTTP 全链路 |
 
 ### 3.2 缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | 真实网络联调（真实 Mem0/Bailian/ReMe 服务） | — | 待办 | 需真实凭据；当前仅 mock，网络层已实现但未对真实端点回归 |
-| Java 测试用例逐条对照迁移 | Java tests 18 文件 / 6850 行 / 326 `@Test` | 待办 | 当前 Rust 单测为**功能等价重写**，未逐条照搬 Java 测试（覆盖率 66/326 ≈ 20%，但缺口集中在 Java 侧的 MockWebServer 传输层细节与 Builder 逐字段断言） |
+| Java 测试用例逐条对照迁移 | Java tests 18 文件 / 6850 行 / 326 `@Test` | 待办（2026-10-29 待复核） | 当前 Rust 单测为**功能等价重写**，未逐条照搬 Java 测试（覆盖率 **96/326 ≈ 29%**（2026-10-29 勘误，原记 66/326 ≈ 20%），缺口集中在 Java 侧的 MockWebServer 传输层细节与 Builder 逐字段断言） |
 | 高级检索参数（`rerank`/`filter_memories`/`fields` 等） | `Mem0SearchRequest` 等 | 已完成 | 字段已迁移并序列化；仅未做端到端验证 |
 | Java 吞错语义在 Rust 主 API 上不一致 | `Mem0LongTermMemory.retrieve` / `BailianLongTermMemory.record`+`retrieve` / `ReMeLongTermMemory.retrieve` | 待办 | Java 侧 `onErrorReturn("")` / `onErrorComplete()` 使调用方**永远看不到错误**；Rust `retrieve`/`record` 返回 `Result`（严格），等价语义放在 `retrieve_lossy`/`record_lossy`。需在汇总层决定默认用哪套（§4.2 裁定）。**注**：Mem0 `record` 与 ReMe `record` 在 Java 侧本就**不吞错**（`client.add().then()` 透传），Rust 同构，一致 |
 | `api_base_url` 必填校验缺失（Mem0 / ReMe） | `Mem0LongTermMemory.Builder.build()`（`"apiBaseUrl is required"`）/ `ReMeLongTermMemory` 构造器（`"apiBaseUrl is required"`） | 已完成 | **2026-10-28 修复**：`Mem0Client::assemble` / `ReMeClient::with_transport` 对空与全空白 base URL 返回 `MemError::Config("apiBaseUrl is required")`（与 Java 文案逐字对齐）；`new` / `with_api_type` / `with_timeout` 均经这两处而同样失败。`with_transport` 签名由 `-> Self` 改为 `-> Result<Self>`——它是唯一可绕过校验的构造路径，且与 Bailian `BailianMemoryClient::with_transport` 既有风格一致；调用点与测试已同步。base URL 先 `trim()` 再剥末尾 `/`。测试：`mem0::client::tests::{blank_base_url_is_rejected_at_construction, new_rejects_blank_base_url, base_url_is_trimmed_before_building_the_request_url}`、`reme::client::tests::{blank_base_url_is_rejected_at_construction, new_rejects_blank_base_url, base_url_is_trimmed_and_trailing_slash_stripped}`。详见 §7 |
@@ -116,15 +116,17 @@
 | 未使用依赖 | — | 待办 | `Cargo.toml` 声明了 `futures`、`agentscope-harness`，源码零引用（实测 `rg` 无命中）；`tokio` **仅测试用**（26 个 `#[tokio::test]`），但被放在 `[dependencies]` 而非 `[dev-dependencies]`。建议收敛依赖，属 P2 清理 |
 | `Mem0AddRequest` 便捷构造器覆盖度 | `Mem0AddRequest.Builder`（20 个 setter） | 待办 | Rust 只提供 6 个 `with_*`（messages/agent_id/user_id/run_id/metadata/infer），其余 14 个字段（`app_id`/`includes`/`excludes`/`output_format`/`custom_categories`/`custom_instructions`/`immutable`/`async_mode`/`timestamp`/`expiration_date`/`org_id`/`project_id`/`version`/`memory_type`）为 `pub` 字段可直接赋值，功能可达但无链式 API |
 | `Mem0SearchRequest` 便捷构造器覆盖度 | `Mem0SearchRequest.Builder` | 待办 | Rust 缺 `version`/`fields`/`rerank`/`keyword_search`/`filter_memories`/`threshold`/`org_id`/`project_id` 的 `with_*`（字段 `pub` 可直接赋值） |
-| `BailianLongTermMemory` 资源释放 | `AutoCloseable.close()` | 待办 | Rust 无 `close()`（`reqwest::Client` 由 Drop 释放）；Java 侧 `close()` 转发到 `BailianMemoryClient.close()` → `HttpTransport.close()` |
+| `BailianLongTermMemory` 资源释放 | `AutoCloseable.close()` | 已完成（设计决定，不迁移）（2026-10-29 勘误：原记「待办」） | Rust 无 `close()`：`reqwest::Client` 由 Drop 释放，不硬造主动关闭 API；Java 侧 `close()` 转发到 `BailianMemoryClient.close()` → `HttpTransport.close()`。依据同 §3.2「传输层语义差异」行与 §7.6-2 |
 | Mem0 消息体多带 `name` 字段 | `Mem0LongTermMemory.convertToMem0Message` | 待办 | Java 只填 `role`/`content`；Rust `convert_to_mem0_message` 额外填 `msg.name()`，导致外发 JSON 多一个 `name` 键（Mem0 侧字段合法，功能可达，属**报文形状差异**而非缺功能） |
 | `BailianLongTermMemoryConfig.api_key` 为「死字段」 | `BailianLongTermMemory` 构造器校验 `apiKey` | 待办 | Java 构造器校验 `apiKey` 非空后自建 client；Rust 改为外部传入 client，`config.api_key` 在生产代码中**从未被读取**（仅测试用），也不参与任何校验——空 key 配合法 client 可通过 `BailianLongTermMemory::new` |
 | `Mem0SearchRequest.user_id` 直接赋值绕过 filters 镜像 | `Mem0SearchRequest.setUserId` | 待办 | Java setter 保证 `user_id` 自动同步进 `filters`；Rust 只有 `with_user_id()` 才镜像，直接写 `req.user_id = Some(..)` 会**漏掉** `filters` 同步（`agent_id`/`run_id`/`app_id` 仅存在于 filters，无此问题） |
 
+> **2026-10-29 复核（状态基准）**：§3.2 已关闭 `api_base_url` 空校验、connect 30s 超时、bailian/reme DTO 单测三项（实测 **96 passed**，见 §7）；`writeTimeout`/`close()` 归入**设计决定（不迁移）**。保留中的**真实剩余**：① 真实端点联调（仅 mock）；② 测试密度 96/326；③ 吞错口径（严格 `retrieve`/`record` vs `*_lossy` 默认）**待裁定**；④ 重试/超时不可配置；⑤ 无指标/span；⑥ 未使用依赖（`futures`、`agentscope-harness`；`tokio` 应入 dev）；⑦ `Mem0AddRequest`/`Mem0SearchRequest` 缺 builder 便捷方法；⑧ Mem0 消息多 `name` 键；⑨ `BailianLongTermMemoryConfig.api_key` 死字段；⑩ 直接写 `user_id` 绕过 `filters` 镜像。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **已完成内容**：MEM 三厂商（Mem0 / Bailian / ReMe）长期记忆适配全部迁移；DTO serde 对齐；消息转换；检索结果映射；可注入 HTTP seam；离线单测 66 个。
+- **已完成内容**：MEM 三厂商（Mem0 / Bailian / ReMe）长期记忆适配全部迁移；DTO serde 对齐；消息转换；检索结果映射；可注入 HTTP seam；离线单测 **96** 个（2026-10-29 勘误，原记 66，实测见 §7.3）。
 - **本会话修复（收尾轮）**：
   1. **2 个编译错误**：`bailian/memory.rs` 与 `reme/memory.rs` 中 `use agentscope_core::{ContentBlockKind, ...}` 报 E0432——`ContentBlockKind` 并未在 `agentscope_core` crate 根 re-export（`agentscope-core/src/message/mod.rs` 仅 re-export `ContentBlock` 等，未含 `ContentBlockKind`）。
      - **修法**：改用真实公开路径 `use agentscope_core::message::msg::ContentBlockKind;`（该类型定义于 `crates/agentscope-core/src/message/msg.rs:401`，为 `pub enum`）。**未自造平行类型，未改 core**。
@@ -271,7 +273,7 @@
 > 口径说明：下表按**本 tracker 的缺口台账**统计，与 §6.4 的「§6.4 节内列出的行」为**不同口径**，二者不冲突。
 
 - **P0：0**。三厂商 25 个 Java 类在 Rust 侧 1:1 落地且行为等价，核心链路（record / retrieve / DTO 序列化 / 鉴权 / 端点）无缺失，**不构成阻塞**。
-- **P1：§3.2 共 5 项待办**。全部为「验证 / 工程完备性 / 校验前移」类，**无「Java 有能力、Rust 没有」的能力缺口**：(1) 真实网络联调（需凭据，非代码缺口）；(2) Java 测试逐条对照迁移（覆盖率 66/326 ≈ 20%，缺口集中在 Java 侧 MockWebServer 传输层细节与 Builder 逐字段断言）；(3) 吞错语义取舍（`retrieve` 严格 vs `retrieve_lossy`——Java 等价语义**已实现**，只差默认口径裁定）；(4) **`api_base_url` 校验缺失（Mem0 / ReMe）**——本轮新确认，是 P1 中**唯一有行为风险**的一项；(5) 传输层资源释放粒度（connect/write 超时、`shutdown`/`close`，功能等价）。
+- **P1：§3.2 共 5 项待办**。全部为「验证 / 工程完备性 / 校验前移」类，**无「Java 有能力、Rust 没有」的能力缺口**：(1) 真实网络联调（需凭据，非代码缺口）；(2) Java 测试逐条对照迁移（覆盖率 66/326 ≈ 20%，缺口集中在 Java 侧 MockWebServer 传输层细节与 Builder 逐字段断言）；(3) 吞错语义取舍（`retrieve` 严格 vs `retrieve_lossy`——Java 等价语义**已实现**，只差默认口径裁定）；(4) **`api_base_url` 校验缺失（Mem0 / ReMe）**——本轮新确认，是 P1 中**唯一有行为风险**的一项；(5) 传输层资源释放粒度（connect/write 超时、`shutdown`/`close`，功能等价）。 （2026-10-29 勘误：本段为 2026-10-22 快照——`api_base_url` 校验与 `connect` 超时已于 2026-10-28 修复，实测 96 passed，覆盖率 96/326 ≈ 29%；当前剩余见 §3.2/§3.3/§4.2）
 - **P2：§3.3 共 9 项待办**（重试/退避、指标、未使用依赖、2 个 Builder 覆盖度、`close()`、`name` 字段差异、`api_key` 死字段、`user_id` 镜像绕过）。均为增强 / API ergonomics / 报文形状微差，不阻塞汇总。
 
 #### 6.7.4 rollup 状态建议

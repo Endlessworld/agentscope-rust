@@ -21,7 +21,7 @@
 | Rust crate | `crates/agentscope-extensions-judge` |
 | Rust 规模（实测 2026-10-28） | **55** 个 `src/*.rs` / **23185** 行 / **286** 个测试（`#[test]` + `#[tokio::test]`；无 `tests/`、无 doc-test、无 `#[ignore]`） |
 | 是否注册 workspace | **是**（`Cargo.toml` 的 `crates/agentscope-extensions-judge`） |
-| 当前状态 | **基本完成**（两个 HTTP 客户端 + `openai-decisions` 整块 + `jev` 八个编排子包的纯函数/定义层/状态机已落地；仅剩需要 core/harness seam 的中间件与工具注册层，见 §8） |
+| 当前状态 | **总判：进行中**（仍有 P1：中间件 hook / @Tool / 路由驱动）—— **基本完成**（两个 HTTP 客户端 + `openai-decisions` 整块 + `jev` 八个编排子包的纯函数/定义层/状态机已落地；**jev 去 `browser`(4)/`example`(4) 共 42 类 = 完整 32 / 部分 8 / 骨架 2**；仅剩需要 core/harness seam 的中间件与工具注册层，见 §8 与 §4.2 第 6 条） |
 
 ### 1.1 Rust crate 文件清单
 
@@ -56,16 +56,18 @@
 |---|---|---|---|---|
 | `<root>`（Answer/Question/Choice/Score/SystemOne/JevClient 等） | 18 | 1451 | `jev/dto.rs`、`jev/mod.rs`、`jev/client.rs`、**`jev/judge.rs`（`JevJudge`，2026-10-28 补）**（+ `http.rs` seam） | **已完成** |
 | `application`（Planner/Selector/Context/CustomerSupport/DraftPipeline/MemoryGate/Rag/StageRouter/Supervisor/TeamPlanner） | 10 | 950 | `jev/application/{selector,planners,draft_pipeline,stage_router}.rs` | **基本完成**（9 完整 + `JevStageRouter` 骨架） |
-| `browser`（Navigator/ReadTool/Session/PlaywrightSession） | 4 | 1056 | 无 | **待办 P2**（依赖 Playwright，可考虑「设计决定（不迁移）」） |
+| `browser`（Navigator/ReadTool/Session/PlaywrightSession） | 4 | 1056 | 无 | **设计决定（不迁移）**（2026-10-29 确认；**待汇总方最终确认**）——依据：引入 Playwright 浏览器自动化运行时（Node 驱动 + 真实浏览器）与「纯 Rust 离线可测 crate」定位冲突；保留 trait 扩展点由宿主实现 |
 | `context`（CompactionTranscript/FileJevContextArchive/JevContextArchive/JevContextCompactor/StoreJevContextArchive） | 5 | 903 | `jev/context/**` | **基本完成**（4 完整 + `StoreJevContextArchive` 骨架） |
 | `evaluation`（Evaluator/JevEvaluationRunner/JevEvaluator 等） | 12 | 1828 | `jev/evaluation/**` | **基本完成**（11 完整 + 中间件 `onAgent/onModelCall` 骨架，`TraceCapture` 已全量） |
 | `evidence` | 3 | 744 | `jev/evidence/**` | **基本完成**（2 完整 + `JevEvidenceTool` 投影已迁、`@Tool` 注册待 seam） |
-| `example` | 4 | 1130 | 无 | **待办 P2**（示例） |
+| `example` | 4 | 1130 | 无 | **设计决定（不迁移）**（2026-10-29 确认；**待汇总方最终确认**）——依据：示例代码非运行链路，且依赖 harness 中间件装配点（`JevModelRouterMiddleware` 等），与主干解耦 |
 | `integration` | 3 | 607 | `jev/integration/**` | **基本完成**（`JevKnowledge` 完整；工具/中间件为投影 + 骨架） |
 | `review` | 4 | 1332 | `jev/review.rs` + `jev/code_review.rs` | **基本完成**（`ReviewRegions`/`JevReviewInput` 完整；`JevCodeReviewer` 定义层 + 驱动骨架、`JevCodeReviewTool` 骨架） |
 | `routing` | 2 | 818 | `jev/routing/**` | **基本完成**（`JevRouteCatalog` 完整；`JevPhaseRouting` 纯 helper + 骨架） |
 | `supervision` | 3 | 855 | `jev/supervision/**` | **基本完成**（2 完整；中间件 Schedule/Observation/tail 已迁，观察循环待 seam） |
 | `openai-decisions`（DecisionQuestion/Input/Answer/Request/Result/Usage/Client/Exception） | 8 | 795 | `openai_decisions/{mod,error,dto,protocol,client}.rs` | **已完成**（`example/` 除外） |
+
+> **计数口径（2026-10-29 勘误）**：jev 去 `browser`(4) 与 `example`(4) 后共 **42 类 = 完整 32 / 部分 8 / 骨架 2**（明细 12+10+5+3+2+3+3+4 = 42）。§8.1 合计行记「41 类」为加总笔误（其分项 32+8+2 本身为 42），以本节为准。
 
 ### 2.2 依赖映射（Java → Rust）
 
@@ -127,12 +129,14 @@
 | `review` 完整语义 | 4 类 / 1332 行 | **已完成**（2 类）+ **部分** 2 | 详见 §8.1；`JevCodeReviewer` 定义层全量（配置/问题/词汇表/signals/完整性/排序），驱动骨架 |
 | 测试覆盖 | 140 个 `@Test` | **已完成（本 crate 口径）** | Rust **286** 个（未忽略，0 `#[ignore]`）；全部离线 |
 
+> **「部分」/「骨架」的含义（2026-10-29 说明，避免误读为「主干未落地」）**：上表的「部分」= 该类**数据模型 / 纯函数 / 状态机 / 校验 / fail-closed 兜底已全部迁移并有单测**，只差需要 core/harness seam 的**中间件 hook（`onAgent`/`onModelCall`）与 `@Tool` 注册**；「骨架」= 接口形状与 fail-closed 语义已落地，驱动链留待 seam。全 crate 实测 **286 passed / 0 failed**（§7.2 / §8.4）。
+
 ### 3.3 P2（增强）
 
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `browser` 子包（Playwright） | 4 类 / 1056 行 | **建议「设计决定（不迁移）」** | 与 RAG 的 Tika/PDF reader 同理：引入浏览器自动化运行时与本 crate 定位不符；保留 trait 扩展点 |
-| `example` 子包 | 4 类 / 1130 行 | **设计决定（不迁移）** | 示例代码，非运行链路。补充：`openai_decisions` 的 `example/`（4 类）同为示例中间件，需要 harness 中间件装配点，与主干客户端解耦，本轮未迁 |
+| `browser` 子包（Playwright） | 4 类 / 1056 行 | **设计决定（不迁移）（2026-10-29 确认；待汇总方最终确认）** | 与 RAG 的 Tika/PDF reader 同理：引入浏览器自动化运行时（Node 驱动 + 真实浏览器）与本 crate「纯 Rust、离线可测」定位不符；保留 trait 扩展点由宿主实现 |
+| `example` 子包 | 4 类 / 1130 行 | **设计决定（不迁移）（2026-10-29 确认；待汇总方最终确认）** | 示例代码，非运行链路；且依赖 harness 中间件装配点，与主干客户端解耦。补充：`openai_decisions` 的 `example/`（4 类）同为示例中间件，需要 harness 中间件装配点，本轮未迁 |
 
 ## 4. 项目状态与下一步
 
@@ -150,8 +154,17 @@
 1. ~~**P0**：落地 HTTP 客户端~~ → **已完成**（`http.rs` + `jev::client` + `openai_decisions::client`）。
 2. ~~**P0**：逐字段核对 `SystemOneRequest`/`SystemOneResult`/`Usage`~~ → **已完成**（见 §2.3，修正 2 处）。
 3. ~~**P1**：按依赖顺序迁 `evaluation` → `application` → `context` → `evidence`/`routing`/`supervision`/`integration`~~ → **已完成（2026-10-28，见 §8）**。
-4. **需汇总方裁定**：`browser`（Playwright）是否按「设计决定（不迁移）」关闭；`example`（jev + openai-decisions 各 4 类）建议直接关闭。
+4. **需汇总方裁定（2026-10-29 已写清依据，等待确认）**：`browser`（Playwright）与 `example`（jev + openai-decisions 各 4 类）均按「设计决定（不迁移）」关闭——依据分别见 §2.1 / §3.3（浏览器自动化运行时与「纯 Rust、离线可测」定位冲突；示例代码非运行链路且依赖 harness 中间件装配点）。**汇总方确认前不计入缺口。**
 5. **跨模块**：四个中间件 hook、`@Tool` 注册、`BaseStore` 归档、`RuntimeContext` 扩展槽需 core/harness 侧 seam（见 §8.6）；本轮未改 `agentscope-core` / `agentscope-harness` / 根 `Cargo.toml`。
+6. **真实剩余（2026-10-29 复核；P0 已清零，实测 286 passed）**：
+   - 四个中间件 hook 未接：trace evaluation（`JevTraceEvaluationMiddleware::onAgent/onModelCall`）/ supervision（观察循环）/ response（`JevResponseMiddleware`）/ phase routing（`JevPhaseRouting` 派发）。
+   - `@Tool` 注册未接：evidence / knowledge / code_review 三个工具只有投影 + fail-closed 校验。
+   - `StoreJevContextArchive` 为 fail-closed 骨架（缺 harness `BaseStore`）。
+   - `JevStageRouter` 骨架 + `JevCodeReviewer` 的 screen→profile→locate→classify→severity→route 驱动链未接。
+   - `JevGuardrail::screen` 无响应式调用方（纯 `evaluate`，Java 由 reactive 链路驱动）。
+   - `JevConfirmedCalls` 缺 core `RuntimeContext` keyed 扩展槽。
+   - 无 `tests/` 集成测试、无 live API 测试（全离线）。
+   - 跨模块建议：core 提供 `Msg` → `TraceMessage`/`ContextMessage` 投影 trait（现由本 crate 自行投影，§8.2 / §8.6）。
 
 ## 5. 执行约定（所有会话必须遵守）
 
