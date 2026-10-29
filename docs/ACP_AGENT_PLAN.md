@@ -8,7 +8,8 @@
 ## 1. 背景与目标
 
 ### 1.1 现状
-- `agentscope-harness` 已声明 `agent-client-protocol = { path = ".../rust-sdk/src/agent-client-protocol" }`（v2.0.0）依赖，但**代码中尚未使用**。
+- `agentscope-extensions-acp` 声明 `agent-client-protocol = { version = "2.2.0", features = [6 个 unstable feature] }`（**crates.io 依赖**，无 path 依赖）；`agentscope-harness` 已不再依赖该 SDK。
+  > 2026-10-29 更正：原记「harness 声明 path 依赖 v2.0.0、代码未使用」已失效——SDK 代码整体从 harness 迁到 `agentscope-extensions-acp`，依赖于 2026-10-16 改为 crates.io（见 `docs/ACP_AGENT__GAP_TRACKER.md` §2）。
 - 核心 `ReActAgent`（`agentscope-core`）已实现 reasoning→acting 循环、tool 治理层、事件流、结构化输出等。
 - harness `HarnessAgent` 已装配 Filesystem + 工具 + middleware，但**无 call()/ReAct**，仅装配器。
 

@@ -86,7 +86,7 @@
 ### 4.5 MCP 集成（使用 rust-mcp-sdk）
 - 客户端：`rust_mcp_sdk::mcp_client::{ClientRuntime, McpClientOptions, ClientHandler}`。
 - `rust_mcp_transport` 提供 stdio/sse 传输；`rust_mcp_macros::MCPToolSchema` 生成 schema；`rust_mcp_extra` 提供 SessionStore/EventStore。
-- 建议 path 依赖：`rust-mcp-sdk = { path = "../../rust-mcp-sdk/crates/rust-mcp-sdk" }`。
+- 依赖：`rust-mcp-sdk = { version = "1.0.1", default-features = false }`（crates.io；**不用 path 依赖**，与 `async-openai` 同一约定）。
 
 ### 4.6 沙箱与文件系统
 - `kubernetes-client`/docker → Rust `kube` / `bollard`；tar 解压 → `tar` + `flate2`（zip-slip 防护）；本地 fs → `tokio::fs` / `walkdir` / `glob`。
