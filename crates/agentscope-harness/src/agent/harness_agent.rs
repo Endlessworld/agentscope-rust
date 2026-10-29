@@ -2166,6 +2166,12 @@ impl HarnessAgentBuilder {
             if let Some(task_list) = self.enable_task_list {
                 agent_builder = agent_builder.todo_tool(task_list);
             }
+            // ACP renders file diffs from the tool-result event and never reads them back
+            // from history: archiving them would keep a copy of every edited file's old+new
+            // text in the context (95% of the measured state) and in every checkpoint.
+            agent_builder = agent_builder.event_only_tool_metadata(vec![
+                crate::tool::filesystem_tools::METADATA_ACP_DIFFS.to_string(),
+            ]);
             // Native committed history is the default authority. The store is resolved in
             // `build()` rather than left to the caller, so a bare `HarnessAgent` journals
             // without any host-side `AgentSession` (Java does the same).
@@ -2227,13 +2233,13 @@ impl HarnessAgentBuilder {
             environment,
             use_legacy_xml_workspace_context: self.use_legacy_xml_workspace_context,
             disable_session_persistence: self.disable_session_persistence,
+            record_model_requests: self.record_model_requests,
             task_repository: task_repo,
             agent,
             workspace_manager: Some(workspace_manager),
             plan_mode_manager,
             memory_config,
             path_normalizer,
-            record_model_requests: self.record_model_requests,
             skill_repositories: ordered_skill_repos,
             skill_promoter: pending_skill_promoter,
             skill_usage_store: pending_skill_usage_store,
