@@ -606,6 +606,24 @@ impl ConversationCompactor {
         self.model.as_ref().map(|model| model.model_name())
     }
 
+    /// Whether this conversation has crossed the compaction trigger.
+    ///
+    /// Callers that would otherwise invoke a compaction attempt on every step use this to
+    /// skip a no-op attempt. An attempt is not free: it journals `compaction/start`, whose
+    /// payload is the whole conversation, so a step under budget would write megabytes for a
+    /// compaction that cannot happen.
+    pub fn needs_compaction(
+        &self,
+        conversation: &[Msg],
+        config: &CompactionConfig,
+        observed_tokens: Option<usize>,
+    ) -> bool {
+        let observed = observed_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or_else(|| calculate_token(conversation));
+        should_compact(conversation, observed, config)
+    }
+
     /// Runs compaction on the conversation messages if a trigger is met.
     ///
     /// Only non-SYSTEM messages should be passed. Returns `None` when no compaction was

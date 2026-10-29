@@ -183,6 +183,12 @@ impl Middleware for ConversationCompactionMiddleware {
                     crate::agent::context::context_usage(&history, &[], model_name.as_deref());
                 (history, (usage.tokens > 0).then_some(usage.tokens as usize))
             };
+            // A history under the trigger is not an attempt: skip it entirely. Invoking the
+            // compactor anyway would journal `compaction/start` (whose payload is the whole
+            // conversation) on every single step for a compaction that cannot happen.
+            if !compactor.needs_compaction(&history, &config, observed_tokens) {
+                return next(input);
+            }
             match compact_conversation(
                 state,
                 recorder,
@@ -254,6 +260,10 @@ impl Middleware for ConversationCompactionMiddleware {
                 model_name.as_deref(),
             );
             let observed_tokens = (usage.tokens > 0).then_some(usage.tokens as usize);
+            // Same rule per step: never record a compaction fact for a no-op attempt.
+            if !compactor.needs_compaction(&history, &config, observed_tokens) {
+                return next(input);
+            }
             match compact_conversation(
                 state,
                 recorder,
@@ -354,6 +364,74 @@ mod tests {
         }
         drop(guard);
         state
+    }
+
+    #[tokio::test]
+    async fn a_history_under_the_trigger_records_no_compaction_fact() {
+        // A step under budget must not journal `compaction/start`: that payload carries the
+        // whole conversation, so a no-op attempt writes megabytes for nothing (observed in
+        // production: 17 attempts / 155 MB in three minutes, every one before == after).
+        let store = agentscope_core::session::InMemorySessionLogStore::new();
+        use agentscope_core::session::SessionLogStore;
+        let key = agentscope_core::session::SessionKey::new(Some("u"), "agent", "s1").unwrap();
+        let base = RuntimeContext::new().with_user_id("u");
+        let log = store.open(&key, &base).await.unwrap();
+        let recorder = Arc::new(
+            agentscope_core::session::SessionRecorder::open(Arc::clone(&log), Some("turn"))
+                .await
+                .unwrap(),
+        );
+
+        let state = state_with_history();
+        let history = state.lock().unwrap().context().to_vec();
+        let (delta_tx, _delta_rx) = futures::channel::mpsc::unbounded();
+        let mut ctx = RuntimeContext::new()
+            .with_agent_id("agent")
+            .with_session_id("s1");
+        ctx.state = Some(Arc::clone(&state));
+        ctx.delta_tx = Some(delta_tx);
+        ctx.set_extension_arc(
+            agentscope_core::session::RECORDER_CONTEXT_KEY,
+            Arc::clone(&recorder),
+        );
+
+        let middleware = ConversationCompactionMiddleware::new(
+            Arc::new(ConversationCompactor::new(None)),
+            CompactionConfig::builder()
+                .trigger_messages(0)
+                .trigger_tokens(1_000_000)
+                .keep_messages(1)
+                .build(),
+            "agent",
+        );
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(middleware));
+
+        let core: Next<ReasoningInput> = Box::new(|_input: ReasoningInput| -> EventStream {
+            Box::pin(futures::stream::once(async move {
+                Ok(agentscope_core::event::AgentEvent::ModelCallEnd(
+                    Default::default(),
+                ))
+            }))
+        });
+        let mut messages = vec![Msg::system("frozen system prompt")];
+        messages.extend(history);
+        let input = ReasoningInput::new(messages, Vec::new(), GenerateOptions::default());
+        let events: Vec<_> = chain.wrap_reasoning(ctx, input, core).collect().await;
+        assert!(events.iter().all(|event| event.is_ok()));
+
+        let journalled = log.read_after(0, 100).await.unwrap();
+        let types: Vec<&str> = journalled
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .filter(|t| t.starts_with("compaction/"))
+            .collect();
+        assert!(
+            types.is_empty(),
+            "a no-op attempt must not be journalled, saw {types:?}"
+        );
+        assert_eq!(state.lock().unwrap().context().len(), 6);
+        recorder.close().await;
     }
 
     #[tokio::test]
