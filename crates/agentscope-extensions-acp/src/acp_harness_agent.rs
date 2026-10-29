@@ -86,6 +86,12 @@
 //! - `OPENAI_API_KEY`   — 覆盖 provider.api_key
 //! - `OPENAI_BASE_URL`  — 覆盖 provider.base_url
 
+// The session journal serializes a full `stateJson` per checkpoint (megabyte scale); the
+// default allocator keeps that peak resident after the burst. mimalloc returns it to the OS.
+// Installing it here -- the binary's crate root -- leaves every library consumer untouched.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

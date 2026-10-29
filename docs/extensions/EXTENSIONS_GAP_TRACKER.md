@@ -601,4 +601,68 @@
 
 **已知残留（有意保留，非遗漏）**：① `SandboxGuard` trait 无错误通道，后端故障在 trait 层只能 `error!` + noop，`Err` 由 crate 级 `try_enter_async`/`try_enter_checked` 提供；② `is_held()` 同步签名下，redis/mongodb 仍用一次 `block_on` 单命令探测（无轮询/`sleep`）；③ mysql/pg 的 tracker 未改（其「四方法委托」描述仍成立）。
 
+---
+
+## 4.12 2026-10-29 EventLog 内存优化（P0 / P3）
+
+> 背景：实测 EventLog 模式比 Legacy 高 2~10 倍（空载 12 MB / 日常 60~150 MB vs 12~20 MB 稳定）。先做**不触碰 prompt 语义**的两项。
+
+| 项 | 改动 | 依据 |
+|---|---|---|
+| **P0**（core） | `SessionRecorder::flush` 不再 `inflight.events.clone()`：`InflightBatch.events` 改 `Arc<Vec<SessionEvent>>`，正常路径只 `Arc::clone`（O(1)）；需要变异的 rebase 用 `Arc::make_mut`，失败回填用 `Arc::unwrap_or_clone` | `recorder.rs` 每次 flush 都复制整个 batch payload（`state/checkpoint` 可含 MB 级 `stateJson`） |
+| **P3**（ACP bin） | 两个 bin（`acp_harness_agent` / `acp_agent_cli`）装 `mimalloc` 为 `#[global_allocator]`；库消费者不受影响 | glibc/CRT arena 在突发后不归还 → RSS 不回落；mimalloc 会把峰值还给 OS |
+
+**验证**：`cargo test -p agentscope-core --lib session` 135 passed；`-p agentscope-extensions-acp --lib` 65 passed；`-p agentscope-harness --lib session` 56 passed；**全 workspace 133 targets / 4798 passed / 0 failed / 4 ignored**（与优化前完全一致）。
+
+**未做（需先 profile 或需裁定）**：① `state_access.rs` 的 `current.clone()` —— 核实为**零调用**的公开 API，不影响 ACP 热路径，但其返回值是 mutation **之前**的状态，与 Java（mutation 之后）不一致，属独立 bug，待裁定；② `state/checkpoint` 稀疏化（偏离 Java 格式，需「恢复后 `to_json()` 字节相等」护栏）；③ `previous_messages` 去字符串化（Java 同构）；④ receipts 无界（Java 同为 `List` 无上限）。
+
+**测量脚本**：`.agentscope/workspace/measure_acp_memory.ps1`（采样 RSS/私有内存，输出 CSV + peak/last/mean）。
+
+### 4.12.1 实测结果（2026-10-29，`examples/session_journal_memory_probe.rs`）
+
+场景：20 轮 × 每轮 `state/checkpoint` payload ≈ **2 MiB**（真实 `AgentState`，247 条种子消息），file journal，计数分配器统计。
+
+| 路径 | 优化前 total | 优化后 total | 优化前 peak | 优化后 peak | elapsed |
+|---|---:|---:|---:|---:|---|
+| `SessionRecorder::open`（**无 baseline**，每轮全量重放） | 10 565 MB | 10 479 MB | 33.9 MB | 33.9 MB | 1053 → **6678 ms**（O(n) 增长） |
+| `open_with_baseline`（**真实 harness 路径**，`session.rs:1380`） | 1 771 MB | 1 730 MB | 23.0 MB | 22.9 MB | 509 → 523 ms（**稳定**） |
+
+**结论（与预期不符，已如实记录）**：
+1. **P0 的真实收益只有 ≈2.3%**（1 771 → 1 730 MB）。每轮 flush 的事件数很少（6 条左右），`inflight.events.clone()` 只需复制一个 checkpoint payload，占总 churn 的比例很小。优化保留（无害、方向正确），但**不能指望它解决问题**。
+2. **真实路径不存在 O(n) 增长**：harness 已用 live state 作 baseline，重放被跳过（elapsed 稳定在 ~520 ms）。第一版探针用无 baseline 的 `open`，把 10.5 GB / 6.7 s 的**重放代价**误算进了 EventLog——这是方法错误，已修正。
+3. **真正的大头是「每轮多次全量 `state.to_json()` + journal payload 体积」**：每轮仅 2 MiB payload，分配量却达 **86.5 MB（≈43×）**。来源：`state/checkpoint` 内联 full state、`json!` 宏与 `payload.to_string()` 的重复序列化、`WorkspaceSessionStorage` 的 base64 包装。
+
+**下一步的唯一高收益项**：`state/checkpoint` 稀疏化（或降低 checkpoint 频度），预期把 86.5 MB/轮降到个位数；必须配「恢复后 `to_json()` 字节相等 + 请求体 capture 相等」双重黄金测试，因为它决定 prompt 内容（→ KV 缓存）。
+
+#### 分阶段归因（每轮 2 MiB payload，真实 baseline 路径，`PHASE` 行输出）
+
+| 阶段 | 分配量 | 倍数 | 说明 |
+|---|---:|---:|---|
+| baseline（`state.to_json()`） | 4.1 MB | 2.0× | harness 传 live state 作 baseline |
+| `open_with_baseline` | 10.2 MB | 4.9× | head 读取 + writer lease + baseline 校验 |
+| `start` | 0.1 MB | — | 已无重放 |
+| **`record(state/checkpoint)`** | **24.9 MB** | **11.9×** | `state.to_json()` → `json!` Value → `payload.to_string()`，**三份 2 MiB 副本** |
+| `finish` | 10.1 MB | 4.8× | `capture_state` 又写一次 full state checkpoint |
+| 合计 | ≈49.4 MB/轮 | ≈24× | 另有 seed/context 增长的少量分配 |
+
+**可优化（均不改事件内容 → 不影响 prompt / KV）**：
+1. ✅ 已做：`capture_state` 只解析 `CheckpointFields`（跳过整个 context）——`checkpoint` 阶段 **29.1 → 24.4 MB/轮（−16%）**，peak **29.3 → 24.6 MB**；
+2. ✅ 已做：harness `baseline.clone()` 改 move（`session.rs` 首次 open 取所有权，重试退回重放），每轮省一次 2 MiB `stateJson` 拷贝（探针绕过 harness，无法量化）；
+3. ✅ 已确认存在：`capture_state` 的 `unchanged` 早退（第一版探针手动 `record` 绕过了它，误判为缺失）；
+4. ❌ 未做（已定位）：`open_with_baseline` 的 10.2 MB = `initial.state_json.clone()`（2 MiB）+ `initial.restore()`（解析完整 state）+ `message_json(state)`（再序列化全部消息）。要省必须先 clone，需把 `SessionProjection.state_json` 改成 `Arc<str>`（跨 views/snapshot/recorder 的字段类型变更），收益 2~6 MB/轮，暂缓；
+5. ❌ 未做：`finish` 的 18.5 MB 主要是 `commit()` 把整个 batch 重新 `serde_json::to_vec` 序列化（含 2 MiB payload）+ `WorkspaceSessionStorage` 写入编码。属 journal 格式级优化（payload 已是 JSON 字符串，理想是直接拼接字节），改动大。
+
+#### 第二轮（A/B/C/E/D/G）实测与裁定
+
+| 项 | 结论 | 实测/依据 |
+|---|---|---|
+| **A** harness 每轮 `AgentState` 深拷贝（`session.rs:1333` 的 `.clone()` 后马上 `to_json()`） | ✅ 已做 | 锁内直接序列化；真实路径每轮省一次全量深拷贝（探针绕过 harness，不可量化） |
+| **B** 写盘路径 `String::from_utf8(bytes.to_vec())` | ✅ 已做 | 改后借用 `str::from_utf8(bytes)`；`finish` 阶段 **18.5 → 16.5 MB/轮（−11%）** |
+| **C** `commit_at` 校验读整个 commit | ❌ **已是 lite** | `commit_id_ending_at` 用 `CommitHeader`（`journal.rs:365`），serde 已跳过 events；只有文件读取本身无法避免（JSON 不支持部分解析） |
+| **E** 快照发布是周期尖刺 | ❌ 不成立 | `publish_snapshot_locked` 必须重建 `transcript`（`ViewSelection.transcript: true`），无法只用 `previous_state` 代替；降频只会把尖刺变大 |
+| **D** `message_json` 每轮 2 次 | ❌ 不做 | 改用「消息 id 比较」会在「同 id 内容变化」时漏写事件（tool result 回填就是这种场景），存在恢复丢数据风险 |
+| **G** pretty → compact | ❌ 实测仅 −1%，已回退 | context 以大文本为主时缩进可忽略：`pretty 2.00 MB` vs `compact 1.98 MB`；不值得为此偏离 Java 字节格式 |
+
+**第二轮后的探针基线**（10 轮，seeded=247，file backend）：`total 564.5 MB / peak 24.6 MB`，分阶段 `baseline 4.1 / open 10.2 / start 0.1 / checkpoint 24.4 / finish 16.5`（优化前同工作量为 `total ~1 300 MB / checkpoint 29.1 / finish 18.5`）。
+
 **仍存在的显式阻塞/差异**（不是本轮遗漏，已写入各 tracker）：REDIS **不做 MOVED/ASK 重定向路由**、也**无真实 Redis Cluster 集成测试**（拓扑发现已落地：`CLUSTER SLOTS` 自建解析 + 逐 primary 扇出 SCAN，见上表「REDIS（第 2 轮）」）；SANDBOX `PortForwardStrategy`（fabric8 无对应）与 Gateway watch（改为一次性读取）；CONTROLPLANE journal 路径取 Java 代码字面值 vs javadoc 的口径分歧；RAG `ExternalApiReader`（无固定 wire 契约）；JUDGE 8 个 jev 子包（~7600 行）与 `browser`（Playwright，设计决定不迁移）。

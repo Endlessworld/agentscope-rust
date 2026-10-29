@@ -115,7 +115,7 @@ impl WorkspaceSessionStorage {
         if current != expected_version {
             return Ok(false);
         }
-        let content = String::from_utf8(bytes.to_vec())
+        let content = std::str::from_utf8(bytes)
             .map_err(|_| agentscope_core::Error::Agent("session values must be UTF-8".into()))?;
         if path.contains("/commits/") || path.contains("/blobs/") || path.contains("/snapshots/") {
             // Immutable, content-addressed objects are written once. Their bytes are the

@@ -1325,63 +1325,59 @@ async fn launch(
     // recorder re-checks the head under the writer lease and falls back to the full replay
     // if a writer raced us in between.
     let head = log.head().await?;
-    let cached_state = {
+    // Serialize under the state lock instead of cloning the whole `AgentState` first: the clone
+    // copied every message (megabytes) only to be formatted and dropped right after.
+    let cached_state_json = {
         let guard = lock_state(state.as_ref());
         if guard.restored_head_matches(&head) {
-            agent.agent().map(|react| {
-                react
-                    .state_handle()
+            agent.agent().and_then(|react| {
+                let handle = react.state_handle();
+                let live = handle
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match live.to_json() {
+                    Ok(json) => Some(json),
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            %error,
+                            "could not serialize the live agent state; falling back to a journal replay"
+                        );
+                        None
+                    }
+                }
             })
         } else {
             None
         }
     };
-    let baseline = match cached_state {
-        Some(state) => match state.to_json() {
-            Ok(state_json) => {
-                tracing::debug!(
-                    session = %session_id,
-                    head_seq = head.seq,
-                    "supplying the live agent state as the recorder baseline"
-                );
-                Some(RecorderBaseline {
-                    seq: head.seq,
-                    commit_id: head.commit_id.clone(),
-                    state_json,
-                    uncertain_tool_calls: BTreeSet::new(),
-                    active_runs: BTreeSet::new(),
-                    // `respond`/`resume` continue an existing turn; a submit opens one.
-                    resumed_turn: command.kind != "submit",
-                })
-            }
-            Err(error) => {
-                tracing::warn!(
-                    session = %session_id,
-                    %error,
-                    "could not serialize the live agent state; falling back to a journal replay"
-                );
-                None
-            }
-        },
-        None => None,
-    };
+    let baseline = cached_state_json.map(|state_json| RecorderBaseline {
+        seq: head.seq,
+        commit_id: head.commit_id.clone(),
+        state_json,
+        uncertain_tool_calls: BTreeSet::new(),
+        active_runs: BTreeSet::new(),
+        // `respond`/`resume` continue an existing turn; a submit opens one.
+        resumed_turn: command.kind != "submit",
+    });
     // Opening the recorder takes the journal writer lease. That can fail transiently (a
     // previous writer still releasing, a storage hiccup); rejecting the user's prompt on the
     // first failure made it look like the session was broken. The command stays accepted while
     // we retry, so a later attempt runs the same turn.
+    // The first open attempt takes the baseline by value: it carries a full `stateJson`
+    // (megabytes), and cloning it per turn was pure copy cost. A retry after a transient open
+    // failure falls back to a journal replay -- correct, slower, and rare.
+    let mut pending_baseline = baseline;
     let mut open_attempts = 0usize;
     let recorder = loop {
         open_attempts += 1;
-        let opened = match &baseline {
+        let opened = match pending_baseline.take() {
             Some(baseline) => {
                 SessionRecorder::open_with_baseline(
                     Arc::clone(log),
                     Some(&turn_id),
                     exporter.clone(),
-                    baseline.clone(),
+                    baseline,
                 )
                 .await
             }

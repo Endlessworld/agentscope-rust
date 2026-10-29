@@ -10,6 +10,11 @@ rust-version.workspace = true
 agentscope-core = { path = "../agentscope-core" }
 agentscope-extensions-model = { path = "../agentscope-extensions-model" }
 agentscope-harness = { path = "../agentscope-harness", default-features = false }
+# Session journaling builds megabyte-sized JSON payloads per turn; the default allocator
+# keeps that burst resident (RSS never returns). mimalloc returns it to the OS.
+# Only the two binaries install it as the global allocator, so library consumers are
+# unaffected.
+mimalloc = "0.1"
 agent-client-protocol = { version = "2.2.0", features = [
     # 2.2.0（schema 1.9）起「程序化工具名」已在 v1 稳定，`unstable_tool_call_name`
     # 特性被移除。改动理由与影响见 memory/2026-10-16.md。

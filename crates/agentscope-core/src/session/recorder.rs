@@ -184,6 +184,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The state fields whose changes are recorded as separate facts.
+///
+/// `capture_state` compares these against the previous checkpoint. Parsing only these fields
+/// avoids materializing the full `AgentState` JSON tree (which contains the whole context)
+/// twice per checkpoint, which was the single largest allocation source per turn.
+#[derive(Debug, Default, serde::Deserialize)]
+struct CheckpointFields {
+    #[serde(default)]
+    tasks_context: Option<serde_json::Value>,
+    #[serde(default)]
+    plan_mode_context: Option<serde_json::Value>,
+    #[serde(default)]
+    permission_context: Option<serde_json::Value>,
+}
+
 /// One reserved batch whose commit is in flight (or awaiting a retry).
 ///
 /// Sequence numbers are reserved when the batch is drained from `pending`, so events appended
@@ -191,7 +206,9 @@ fn now_ms() -> i64 {
 #[derive(Clone)]
 struct InflightBatch {
     batch_id: String,
-    events: Vec<SessionEvent>,
+    /// Shared so a flush never copies the batch payload (a `state/checkpoint` event can be
+    /// megabytes). Callers that need to mutate it take a copy explicitly.
+    events: Arc<Vec<SessionEvent>>,
     bytes: usize,
 }
 
@@ -843,7 +860,7 @@ impl SessionRecorder {
         let mut seq = head.seq;
         if let Some(inflight) = guard.inflight.as_mut() {
             inflight.batch_id = batch_id.clone();
-            for event in inflight.events.iter_mut() {
+            for event in Arc::make_mut(&mut inflight.events).iter_mut() {
                 seq += 1;
                 event.seq = seq;
             }
@@ -873,7 +890,7 @@ impl SessionRecorder {
             // Recover it before admitting new events.
             if guard.inflight.is_some() {
                 let inflight = guard.inflight.take().expect("inflight checked");
-                let mut restored = inflight.events;
+                let mut restored = Arc::unwrap_or_clone(inflight.events);
                 restored.extend(guard.pending.drain(..));
                 guard.pending = restored;
                 guard.pending_bytes += inflight.bytes;
@@ -888,7 +905,7 @@ impl SessionRecorder {
             let expected = guard.durable_seq;
             guard.inflight = Some(InflightBatch {
                 batch_id: batch_id.clone(),
-                events,
+                events: Arc::new(events),
                 bytes,
             });
             (batch_id, expected)
@@ -908,12 +925,12 @@ impl SessionRecorder {
                     .as_ref()
                     .filter(|inflight| inflight.batch_id == batch)
                     .ok_or_else(|| session_error("Session commit batch disappeared"))?;
-                (inflight.events.clone(), inflight.bytes)
+                (Arc::clone(&inflight.events), inflight.bytes)
             };
             let commit = match self.log.renew(&self.writer, self.lease).await {
                 Ok(()) => {
                     self.log
-                        .commit(&self.writer, &batch, expected, &events)
+                        .commit(&self.writer, &batch, expected, events.as_slice())
                         .await
                 }
                 Err(error) => Err(error),
@@ -983,11 +1000,13 @@ impl SessionRecorder {
                     {
                         let mut guard = self.lock();
                         let mut restored = match guard.inflight.take() {
-                            Some(inflight) if inflight.batch_id == batch => inflight.events,
+                            Some(inflight) if inflight.batch_id == batch => {
+                                Arc::unwrap_or_clone(inflight.events)
+                            }
                             // Defensive: the in-flight slot is ours (flush is serialized), so
                             // this only happens if the state was reset underneath us. Restore
                             // the batch we committed instead of dropping its events.
-                            _ => events,
+                            _ => Arc::unwrap_or_clone(events),
                         };
                         restored.extend(guard.pending.drain(..));
                         guard.pending = restored;
@@ -1258,18 +1277,30 @@ impl SessionRecorder {
             }
         }
 
-        let previous: serde_json::Value = match previous_state {
+        let previous: CheckpointFields = match previous_state {
             Some(json) => serde_json::from_str(&json)?,
-            None => serde_json::Value::Object(Default::default()),
+            None => CheckpointFields::default(),
         };
-        let current: serde_json::Value = serde_json::from_str(&json)?;
-        for (field, event_type) in [
-            ("tasks_context", "task/changed"),
-            ("plan_mode_context", "plan/changed"),
-            ("permission_context", "permission/changed"),
+        let current: CheckpointFields = serde_json::from_str(&json)?;
+        for (event_type, current_value, previous_value) in [
+            (
+                "task/changed",
+                &current.tasks_context,
+                &previous.tasks_context,
+            ),
+            (
+                "plan/changed",
+                &current.plan_mode_context,
+                &previous.plan_mode_context,
+            ),
+            (
+                "permission/changed",
+                &current.permission_context,
+                &previous.permission_context,
+            ),
         ] {
-            if let Some(value) = current.get(field) {
-                if Some(value) != previous.get(field) {
+            if let Some(value) = current_value {
+                if Some(value) != previous_value.as_ref() {
                     self.append(event_type, &serde_json::json!({ "state": value }))?;
                 }
             }
