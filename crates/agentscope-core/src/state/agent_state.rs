@@ -119,7 +119,7 @@ impl AgentState {
 
     /// Serialize this state to a pretty-printed JSON string.
     pub fn to_json(&self) -> serde_json::Result<String> {
-        serde_json::to_string_pretty(self)
+        serde_json::to_string(self)
     }
 
     /// Deserialize an [`AgentState`] from a JSON string produced by [`to_json`](Self::to_json).

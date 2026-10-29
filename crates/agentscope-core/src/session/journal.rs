@@ -16,7 +16,7 @@
 //! exports/<hash>.json       Per-sink export watermark
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,14 @@ const PRUNE_MAX_SCAN: usize = 4096;
 
 /// Deleted commits per reclaim pass; the rest waits for the next snapshot.
 const PRUNE_BATCH: usize = 512;
+
+/// How many commits one superseded-checkpoint sweep walks back. A turn writes on the order of
+/// tens of commits, so this only bounds a pathological history instead of a normal one.
+const SUPERSEDED_MAX_COMMITS: usize = 512;
+
+/// How many events back one superseded-checkpoint sweep looks. It doubles as the safety margin
+/// that keeps a payload still referenced by an older commit from being deleted.
+const SUPERSEDED_MAX_EVENTS: u64 = 4096;
 
 /// One immutable, checksummed batch of events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,17 +168,30 @@ impl JournalSessionLog {
         let commit: Commit = serde_json::from_slice(&stored.bytes)?;
         if !commit.payload_blobs.is_empty() {
             let mut hydrated = Vec::with_capacity(commit.events.len());
+            let mut reclaimed = false;
             for event in &commit.events {
                 match commit.payload_blobs.get(&event.event_id) {
                     None => hydrated.push(event.clone()),
                     Some(blob) => {
-                        let payload = self
-                            .storage
-                            .read(&self.path(&format!("blobs/{blob}")))
-                            .await?
-                            .ok_or_else(|| {
-                                session_error("Missing or corrupt committed payload blob")
-                            })?;
+                        let path = self.path(&format!("blobs/{blob}"));
+                        let payload = self.storage.read(&path).await?;
+                        let Some(payload) = payload else {
+                            // A checkpoint superseded by a newer one in the same turn has its
+                            // payload reclaimed (see `reclaim_superseded_checkpoints`). The
+                            // event stays in the chain so everything else in its commit — the
+                            // messages recorded up to that point — remains readable.
+                            if event.event_type == "state/checkpoint" {
+                                tracing::debug!(
+                                    seq = event.seq,
+                                    %blob,
+                                    "reading a checkpoint whose payload was reclaimed"
+                                );
+                                reclaimed = true;
+                                hydrated.push(event.clone());
+                                continue;
+                            }
+                            return Err(session_error("Missing or corrupt committed payload blob"));
+                        };
                         if Self::hash(&payload.bytes) != *blob {
                             return Err(session_error("Missing or corrupt committed payload blob"));
                         }
@@ -180,9 +201,15 @@ impl JournalSessionLog {
                     }
                 }
             }
-            let verified = Self::hash(&serde_json::to_vec(&hydrated)?);
-            if verified != commit.hash {
-                return Err(session_error("Committed segment checksum mismatch"));
+            let checked = Self::hash(&serde_json::to_vec(&hydrated)?);
+            if checked != commit.hash {
+                if !reclaimed {
+                    return Err(session_error("Committed segment checksum mismatch"));
+                }
+                tracing::debug!(
+                    commit = %id,
+                    "segment checksum unverifiable because a payload was reclaimed"
+                );
             }
             return Ok(Commit {
                 events: hydrated,
@@ -602,11 +629,19 @@ impl JournalSessionLog {
             }
         }
         if deleted == 0 {
+            if complete {
+                // Commits deleted by an earlier pass may have left their payloads behind: a scan
+                // that was too large to be `complete` deletes commits but, by design, no blobs.
+                // Without this sweep those payloads stay forever -- the journal keeps its bytes
+                // (a full-context checkpoint per model call) even though nothing references them.
+                self.reclaim_orphan_blobs(&referenced).await?;
+            }
             return Ok(());
         }
         self.mark_reclaimed(floor).await?;
         if complete {
             self.reclaim_blobs(&freed_blobs).await?;
+            self.reclaim_orphan_blobs(&referenced).await?;
         }
         tracing::info!(
             session = %self.prefix,
@@ -627,6 +662,56 @@ impl JournalSessionLog {
             if let Err(error) = self.storage.remove(&path).await {
                 tracing::debug!(path = %path, %error, "session payload blob could not be reclaimed");
             }
+        }
+        Ok(())
+    }
+
+    /// Deletes payload blobs that no remaining commit references.
+    ///
+    /// `referenced` comes from the same pass that enumerated every commit, so it is the complete
+    /// live set: a blob outside it can never be hydrated again. The blob listing happens *after*
+    /// the commits are read, so a blob written by a commit this pass did not see is not deleted.
+    async fn reclaim_orphan_blobs(&self, referenced: &HashSet<String>) -> crate::error::Result<()> {
+        let directory = self.path("blobs");
+        let paths = match self.storage.list_paths(&directory).await {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::debug!(
+                    session = %self.prefix,
+                    %error,
+                    "session storage cannot list blobs; skipping the orphan sweep"
+                );
+                return Ok(());
+            }
+        };
+        let prefix = format!("{directory}/");
+        let mut deleted = 0usize;
+        for path in paths.iter().filter(|path| path.starts_with(&prefix)) {
+            let Some(name) = path.rsplit('/').next() else {
+                continue;
+            };
+            if referenced.contains(name) {
+                continue;
+            }
+            match self.storage.remove(path).await {
+                Ok(_) => {
+                    deleted += 1;
+                    if deleted >= PRUNE_BATCH {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(path = %path, %error, "orphaned session payload blob could not be removed");
+                    break;
+                }
+            }
+        }
+        if deleted > 0 {
+            tracing::info!(
+                session = %self.prefix,
+                deleted,
+                "reclaimed session payloads no commit references"
+            );
         }
         Ok(())
     }
@@ -681,17 +766,27 @@ struct CommitHeader {
 struct CommitLite {
     last_seq: u64,
     #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
     events: Vec<CommitLiteEvent>,
     #[serde(default)]
     payload_blobs: BTreeMap<String, String>,
 }
 
-/// Only the timestamp is needed to decide whether a batch is old enough to reclaim.
+/// Only the timestamp and the identity of a stored event are needed to reclaim its payload.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommitLiteEvent {
     #[serde(default)]
     occurred_at: i64,
+    #[serde(default)]
+    event_id: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default, rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 /// How far history was reclaimed.
@@ -1181,6 +1276,78 @@ impl SessionLog for JournalSessionLog {
         retention: SessionRetention,
     ) -> crate::error::Result<Option<u64>> {
         self.publish_snapshot_locked(writer, &retention).await
+    }
+
+    async fn reclaim_superseded_checkpoints(
+        &self,
+        turn_id: &str,
+        keep_seq: u64,
+    ) -> crate::error::Result<()> {
+        let head = self.head().await?;
+        let Some(mut cursor) = head.commit_id.clone() else {
+            return Ok(());
+        };
+        let stop_at = keep_seq.saturating_sub(SUPERSEDED_MAX_EVENTS);
+        // Every payload the walked prefix still references; a blob is only deleted when the
+        // checkpoint being superseded is its sole reader (identical states share one blob).
+        let mut references: HashMap<String, usize> = HashMap::new();
+        let mut candidates: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        while scanned < SUPERSEDED_MAX_COMMITS {
+            let path = self.path(&format!("commits/{cursor}.json"));
+            let commit = match self.read_commit_lite(&path).await {
+                Ok(commit) => commit,
+                Err(error) => {
+                    tracing::debug!(path = %path, %error, "stopping a superseded-checkpoint sweep");
+                    break;
+                }
+            };
+            for blob in commit.payload_blobs.values() {
+                *references.entry(blob.clone()).or_default() += 1;
+            }
+            for event in &commit.events {
+                if event.seq >= keep_seq
+                    || event.event_type != "state/checkpoint"
+                    || event.turn_id.as_deref() != Some(turn_id)
+                {
+                    continue;
+                }
+                if let Some(blob) = commit.payload_blobs.get(&event.event_id) {
+                    candidates.push(blob.clone());
+                }
+            }
+            scanned += 1;
+            if commit.last_seq <= stop_at {
+                break;
+            }
+            match commit.parent {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+        let mut reclaimed = 0usize;
+        for blob in candidates {
+            if references.get(&blob).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let path = self.path(&format!("blobs/{blob}"));
+            match self.storage.remove(&path).await {
+                Ok(_) => reclaimed += 1,
+                Err(error) => {
+                    tracing::debug!(path = %path, %error, "checkpoint payload kept for later");
+                }
+            }
+        }
+        if reclaimed > 0 {
+            tracing::debug!(
+                session = %self.prefix,
+                turn = turn_id,
+                keep_seq,
+                reclaimed,
+                "reclaimed superseded checkpoint payloads"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1693,6 +1860,244 @@ mod tests {
         let err = log.scan(0, 2400).await.unwrap_err();
         assert!(err.to_string().contains("were reclaimed"), "{err}");
         assert_eq!(log.scan(1200, 2400).await.unwrap().len(), 1200);
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_payload_blob_is_reclaimed() {
+        // A pass that is too large to enumerate completely deletes commits but no blobs (the
+        // sweep cannot prove which payloads are still reachable). Those payloads used to stay
+        // forever: hundreds of megabytes of full-context checkpoints no commit referenced.
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        commit_history(&log, &writer, 6, 200).await;
+        let retention = SessionRetention {
+            prune: true,
+            min_age: Duration::ZERO,
+        };
+        log.publish_snapshot(&writer, retention).await.unwrap();
+
+        let orphan = "agents/a/sessions/u/s1/blobs/orphaned-payload";
+        assert!(storage
+            .compare_and_set(orphan, 0, b"no commit references these bytes")
+            .await
+            .unwrap());
+
+        commit_history(&log, &writer, 6, 200).await;
+        log.publish_snapshot(&writer, retention).await.unwrap();
+
+        assert!(
+            storage.read(orphan).await.unwrap().is_none(),
+            "the unreferenced payload must be swept"
+        );
+    }
+
+    async fn blob_paths(storage: &Arc<dyn AtomicSessionStorage>) -> Vec<String> {
+        storage
+            .list_paths("agents/a/sessions/u/s1/blobs")
+            .await
+            .unwrap_or_default()
+    }
+
+    fn checkpoint_event(seq: u64, turn: &str, marker: &str) -> SessionEvent {
+        let state = serde_json::json!({
+            "marker": marker,
+            "padding": "x".repeat(MAX_INLINE_PAYLOAD_BYTES),
+        })
+        .to_string();
+        SessionEvent::new(
+            format!("c{seq}"),
+            seq,
+            0,
+            "state/checkpoint",
+            Some("run-1".into()),
+            Some(turn.into()),
+            true,
+            serde_json::json!({
+                "stateJson": state,
+                "projectorVersion": 1,
+                "reason": "before_acting",
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn superseded_checkpoint_payloads_are_reclaimed() {
+        // Recovery always resumes from the newest checkpoint, so every earlier checkpoint of the
+        // same turn is dead weight: one full `AgentState` blob (megabytes) per iteration.
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        let mut head = 0u64;
+        for (index, marker) in ["first", "second", "third"].iter().enumerate() {
+            head = log
+                .commit(
+                    &writer,
+                    &format!("b{index}"),
+                    head,
+                    &[checkpoint_event(head + 1, "t1", marker)],
+                )
+                .await
+                .unwrap()
+                .seq;
+        }
+        assert_eq!(blob_paths(&storage).await.len(), 3);
+
+        log.reclaim_superseded_checkpoints("t1", head)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            blob_paths(&storage).await.len(),
+            1,
+            "only the newest checkpoint of the turn keeps its payload"
+        );
+        let projection = crate::session::SessionProjection::read(&log).await.unwrap();
+        let state = projection.state_json.expect("newest checkpoint restores");
+        assert!(state.contains("third"), "{state}");
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_from_another_turn_is_never_reclaimed() {
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        let head = log
+            .commit(&writer, "b1", 0, &[checkpoint_event(1, "t1", "turn-one")])
+            .await
+            .unwrap()
+            .seq;
+        let head = log
+            .commit(
+                &writer,
+                "b2",
+                head,
+                &[checkpoint_event(2, "t2", "turn-two")],
+            )
+            .await
+            .unwrap()
+            .seq;
+        let head = log
+            .commit(
+                &writer,
+                "b3",
+                head,
+                &[checkpoint_event(3, "t2", "turn-two-later")],
+            )
+            .await
+            .unwrap()
+            .seq;
+        assert_eq!(blob_paths(&storage).await.len(), 3);
+
+        log.reclaim_superseded_checkpoints("t2", head)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            blob_paths(&storage).await.len(),
+            2,
+            "the previous turn's last checkpoint is the fallback for a crash in this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payload_shared_by_two_checkpoints_is_kept() {
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        let head = log
+            .commit(&writer, "b1", 0, &[checkpoint_event(1, "t1", "same")])
+            .await
+            .unwrap()
+            .seq;
+        let head = log
+            .commit(&writer, "b2", head, &[checkpoint_event(2, "t1", "same")])
+            .await
+            .unwrap()
+            .seq;
+        assert_eq!(blob_paths(&storage).await.len(), 1, "content addressed");
+
+        log.reclaim_superseded_checkpoints("t1", head)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            blob_paths(&storage).await.len(),
+            1,
+            "a payload another committed event still references must stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payload_less_checkpoint_does_not_erase_the_folded_state() {
+        let (_storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        let head = log
+            .commit(&writer, "b1", 0, &[checkpoint_event(1, "t1", "kept")])
+            .await
+            .unwrap()
+            .seq;
+        let reclaimed = SessionEvent::new(
+            "c2".to_string(),
+            2,
+            0,
+            "state/checkpoint",
+            Some("run-1".into()),
+            Some("t1".into()),
+            true,
+            "{}".to_string(),
+        )
+        .unwrap();
+        log.commit(&writer, "b2", head, &[reclaimed]).await.unwrap();
+
+        let projection = crate::session::SessionProjection::read(&log).await.unwrap();
+        let state = projection
+            .state_json
+            .expect("a readable checkpoint remains");
+        assert!(state.contains("kept"), "{state}");
+    }
+
+    #[tokio::test]
+    async fn a_payload_blob_dies_with_the_commit_that_references_it() {
+        let (storage, log) = journal();
+        let writer = acquired(&log, "run-1").await;
+        let big = "x".repeat(MAX_INLINE_PAYLOAD_BYTES + 16);
+        let payload = serde_json::json!({ "blob": big }).to_string();
+        let first =
+            SessionEvent::new("e1", 1, 0, "tool/result", None, None, true, payload).unwrap();
+        log.commit(&writer, "b1", 0, &[first, event(2, "turn/end")])
+            .await
+            .unwrap();
+        let commit_id = log.head().await.unwrap().commit_id.unwrap();
+        let commit_path = format!("agents/a/sessions/u/s1/commits/{commit_id}.json");
+        let raw: Commit =
+            serde_json::from_slice(&storage.read(&commit_path).await.unwrap().unwrap().bytes)
+                .unwrap();
+        let blob_path = format!(
+            "agents/a/sessions/u/s1/blobs/{}",
+            raw.payload_blobs.values().next().expect("one blob")
+        );
+        assert!(storage.read(&blob_path).await.unwrap().is_some());
+
+        let retention = SessionRetention {
+            prune: true,
+            min_age: Duration::ZERO,
+        };
+        commit_history(&log, &writer, 6, 200).await;
+        log.publish_snapshot(&writer, retention).await.unwrap();
+        commit_history(&log, &writer, 6, 200).await;
+        log.publish_snapshot(&writer, retention).await.unwrap();
+        let floor = log.reclaimed_floor().await.unwrap();
+        assert!(
+            floor.is_some_and(|floor| floor > 2),
+            "the batch holding the payload must fall below the reclaim floor: {floor:?}"
+        );
+        assert!(
+            storage.read(&commit_path).await.unwrap().is_none(),
+            "the commit below the floor is gone"
+        );
+        assert!(
+            storage.read(&blob_path).await.unwrap().is_none(),
+            "its payload goes with it"
+        );
     }
 
     #[tokio::test]

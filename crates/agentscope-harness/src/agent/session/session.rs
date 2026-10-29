@@ -1296,6 +1296,54 @@ async fn execution_baseline(
     Ok(ExecutionBaseline { turns, pending })
 }
 
+/// Builds a recorder baseline from the live agent state, when it still matches the committed
+/// head.
+///
+/// Returns `None` when the journal moved under this process or the state cannot be serialized:
+/// the caller then opens the recorder without a baseline, which replays the journal. Cheap
+/// enough to call again after a failed open -- it costs one `to_json()`, not a replay.
+async fn live_baseline(
+    log: &Arc<dyn SessionLog>,
+    state: &Arc<Mutex<SessionState>>,
+    agent: &Arc<HarnessAgent>,
+    command: &Command,
+    session_id: &str,
+) -> Option<RecorderBaseline> {
+    let head = log.head().await.ok()?;
+    // Serialize under the state lock instead of cloning the whole `AgentState` first: the clone
+    // copied every message (megabytes) only to be formatted and dropped right after.
+    let state_json = {
+        let guard = lock_state(state.as_ref());
+        if !guard.restored_head_matches(&head) {
+            return None;
+        }
+        let handle = agent.agent()?.state_handle();
+        let live = handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match live.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(
+                    session = %session_id,
+                    %error,
+                    "could not serialize the live agent state; falling back to a journal replay"
+                );
+                return None;
+            }
+        }
+    };
+    Some(RecorderBaseline {
+        seq: head.seq,
+        commit_id: head.commit_id.clone(),
+        state_json,
+        uncertain_tool_calls: BTreeSet::new(),
+        active_runs: BTreeSet::new(),
+        // `respond`/`resume` continue an existing turn; a submit opens one.
+        resumed_turn: command.kind != "submit",
+    })
+}
+
 /// Opens a recorder, admits the command and runs the agent to completion.
 async fn launch(
     agent: &Arc<HarnessAgent>,
@@ -1324,68 +1372,40 @@ async fn launch(
     // matches the committed head, hand it to the recorder as a baseline instead. The
     // recorder re-checks the head under the writer lease and falls back to the full replay
     // if a writer raced us in between.
-    let head = log.head().await?;
-    // Serialize under the state lock instead of cloning the whole `AgentState` first: the clone
-    // copied every message (megabytes) only to be formatted and dropped right after.
-    let cached_state_json = {
-        let guard = lock_state(state.as_ref());
-        if guard.restored_head_matches(&head) {
-            agent.agent().and_then(|react| {
-                let handle = react.state_handle();
-                let live = handle
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match live.to_json() {
-                    Ok(json) => Some(json),
-                    Err(error) => {
-                        tracing::warn!(
-                            session = %session_id,
-                            %error,
-                            "could not serialize the live agent state; falling back to a journal replay"
-                        );
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        }
-    };
-    let baseline = cached_state_json.map(|state_json| RecorderBaseline {
-        seq: head.seq,
-        commit_id: head.commit_id.clone(),
-        state_json,
-        uncertain_tool_calls: BTreeSet::new(),
-        active_runs: BTreeSet::new(),
-        // `respond`/`resume` continue an existing turn; a submit opens one.
-        resumed_turn: command.kind != "submit",
-    });
     // Opening the recorder takes the journal writer lease. That can fail transiently (a
     // previous writer still releasing, a storage hiccup); rejecting the user's prompt on the
     // first failure made it look like the session was broken. The command stays accepted while
     // we retry, so a later attempt runs the same turn.
-    // The first open attempt takes the baseline by value: it carries a full `stateJson`
-    // (megabytes), and cloning it per turn was pure copy cost. A retry after a transient open
-    // failure falls back to a journal replay -- correct, slower, and rare.
-    let mut pending_baseline = baseline;
+    // The first attempt takes the baseline by value: it carries a full `stateJson` (megabytes),
+    // and cloning it per turn was pure copy cost. A retry rebuilds it from the live state
+    // instead of replaying the journal: the rebuild is O(state), a replay is O(history).
+    let mut pending_baseline = live_baseline(log, state, agent, &command, &session_id).await;
     let mut open_attempts = 0usize;
     let recorder = loop {
         open_attempts += 1;
-        let opened = match pending_baseline.take() {
+        let attempt_baseline = match pending_baseline.take() {
+            Some(baseline) => Some(baseline),
+            // The previous attempt consumed the baseline: rebuild it rather than fall back to a
+            // replay of the whole journal.
+            None => live_baseline(log, state, agent, &command, &session_id).await,
+        };
+        let opened = match attempt_baseline {
             Some(baseline) => {
-                SessionRecorder::open_with_baseline(
+                SessionRecorder::open_with_baseline_and_policy(
                     Arc::clone(log),
                     Some(&turn_id),
                     exporter.clone(),
                     baseline,
+                    agent.recording_policy(),
                 )
                 .await
             }
             None => {
-                SessionRecorder::open_with_exporter(
+                SessionRecorder::open_with_exporter_and_policy(
                     Arc::clone(log),
                     Some(&turn_id),
                     exporter.clone(),
+                    agent.recording_policy(),
                 )
                 .await
             }
@@ -1413,7 +1433,7 @@ async fn launch(
 
     // The recorder already produced the committed projection (from the baseline or a full
     // replay). Reuse it instead of reading the journal a second time in this launcher.
-    let mut restored = match recorder.initial().restore()? {
+    let mut restored = match recorder.restore_initial()? {
         Some(state) => state,
         None => AgentState::builder()
             .session_id(&turn_id)

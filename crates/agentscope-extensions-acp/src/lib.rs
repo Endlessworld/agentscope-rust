@@ -14,13 +14,17 @@ pub mod event;
 mod event_queue;
 pub mod ext;
 pub mod mcp_over_acp;
+pub mod mem;
 pub mod permission_store;
 pub mod provider;
+pub mod recording;
+pub mod retention;
 pub mod session;
 pub mod support;
 
 pub use coding_agent::{
-    AcpCodingAgent, AcpCodingAgentBuilder, SessionBuild, ACP_CONTEXT_WINDOW_TOKENS,
+    compaction_window_tokens, AcpCodingAgent, AcpCodingAgentBuilder, SessionBuild,
+    ACP_CONTEXT_WINDOW_TOKENS,
 };
 pub use elicitation::{AskUserTool, ElicitationClient, ElicitationSlot};
 pub use mcp_over_acp::{McpAcpConnection, McpAcpTool};

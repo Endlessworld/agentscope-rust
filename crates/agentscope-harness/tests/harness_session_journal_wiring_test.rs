@@ -118,6 +118,52 @@ async fn a_bare_harness_agent_call_journals_by_default() {
 }
 
 #[tokio::test]
+async fn the_request_payload_switch_decides_what_the_journal_records() {
+    // The switch is only useful if it survives the whole assembly path (builder -> agent ->
+    // recorder). It must not touch recovery: the call stays discoverable as dispatched.
+    for record in [false, true] {
+        let dir = temp_dir(if record {
+            "requests-on"
+        } else {
+            "requests-off"
+        });
+        let store = Arc::new(InMemorySessionLogStore::new());
+        let agent = HarnessAgent::builder()
+            .name("request-payload")
+            .model(Arc::new(FixedModel {
+                reply: "ok".into(),
+                calls: Arc::new(Mutex::new(0)),
+            }))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .session_id("s-requests")
+            .user_id("alice")
+            .max_iters(1)
+            .record_model_requests(record)
+            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .build();
+
+        CallableAgent::call(&agent, vec![Msg::user("hello")])
+            .await
+            .expect("agent call");
+
+        let key = agent.session_key(&ctx()).expect("journal key");
+        let log = store.open(&key, &ctx()).await.expect("open");
+        let events = log.read_after(0, 4096).await.expect("read");
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            types.contains(&"request/prepared"),
+            record,
+            "record_model_requests={record}: {types:?}"
+        );
+        assert!(
+            types.contains(&"model/dispatch"),
+            "the call must stay discoverable: {types:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_caller_supplied_store_is_used_instead_of_the_workspace_default() {
     let dir = temp_dir("explicit");
     let store = Arc::new(InMemorySessionLogStore::new());

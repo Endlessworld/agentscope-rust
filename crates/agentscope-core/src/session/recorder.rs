@@ -57,7 +57,7 @@ fn renew_interval(lease: Duration) -> Duration {
 /// bound; failing the terminal write turned a healthy turn into an `interrupted` receipt. The
 /// journal spills payloads above 64 KiB to blobs, so the in-memory ceiling only needs to be a
 /// safety bound, not a hard event limit.
-const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether a `bytes`-sized payload may join the pending buffer.
 ///
@@ -199,6 +199,140 @@ struct CheckpointFields {
     permission_context: Option<serde_json::Value>,
 }
 
+/// One message's identity for the prefix comparison between two captures.
+///
+/// Storing the serialized message would keep a second copy of the whole conversation alive
+/// for as long as the turn runs; a length plus a hash answers the same "is this still the
+/// same message?" question in sixteen bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MessageFingerprint {
+    len: usize,
+    hash: u64,
+}
+
+/// A cheap, in-process fingerprint: only ever compared against fingerprints taken in the same
+/// process, so it needs to be fast, not stable across runs.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A JSON sink that only hashes what is written to it.
+///
+/// `serde_json::to_writer` over a hashing sink answers "did this change?" without ever
+/// materializing the JSON text, which for a checkpoint means the whole conversation is never
+/// held as a second `String`.
+#[derive(Default)]
+struct HashingSink {
+    hasher: std::collections::hash_map::DefaultHasher,
+    len: usize,
+}
+
+impl HashingSink {
+    fn finish(self) -> MessageFingerprint {
+        use std::hash::Hasher;
+        MessageFingerprint {
+            len: self.len,
+            hash: self.hasher.finish(),
+        }
+    }
+}
+
+impl std::io::Write for HashingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::hash::Hasher;
+        self.len += buf.len();
+        self.hasher.write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A sink that escapes what is written to it as the body of a JSON string.
+///
+/// The checkpoint payload embeds the state as a *string* (schema unchanged), so the state
+/// JSON has to be escaped. Writing it through this sink escapes it as serde produces it,
+/// instead of first materializing the state text and escaping that.
+struct JsonStringSink<'a> {
+    out: &'a mut Vec<u8>,
+}
+
+impl std::io::Write for JsonStringSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        escape_json_into(self.out, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Appends `bytes` escaped for use inside a JSON string.
+///
+/// UTF-8 continuation bytes pass through untouched: every byte this rewrites is ASCII, so a
+/// multi-byte sequence is never split.
+fn escape_json_into(out: &mut Vec<u8>, bytes: &[u8]) {
+    for &byte in bytes {
+        match byte {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x09 => out.extend_from_slice(b"\\t"),
+            0x0a => out.extend_from_slice(b"\\n"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0d => out.extend_from_slice(b"\\r"),
+            control if control < 0x20 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(control >> 4) as usize]);
+                out.push(HEX[(control & 0x0f) as usize]);
+            }
+            other => out.push(other),
+        }
+    }
+}
+
+/// What a recorder persists for each model call.
+///
+/// `request/prepared` carries the full `messages` + `tools` + `options` of every call. No read
+/// path consumes it — recovery uses `state/checkpoint`, `tool/dispatch` and `model/dispatch`;
+/// the projection drops it as a builtin event — so it is an audit fact, and it is by far the
+/// largest payload per call (megabytes). Hosts that do not need provider-level forensics can
+/// turn it off; the call itself is still discoverable through `model/dispatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingPolicy {
+    /// Journal the full request as `request/prepared` before dispatching it.
+    pub record_model_requests: bool,
+}
+
+impl Default for RecordingPolicy {
+    fn default() -> Self {
+        Self {
+            record_model_requests: true,
+        }
+    }
+}
+
+impl RecordingPolicy {
+    /// The policy a host gets when it says nothing: full Java-compatible recording.
+    pub fn journaling_requests() -> Self {
+        Self::default()
+    }
+
+    /// Records checkpoints and call boundaries, but not the full request payload.
+    pub fn without_request_payloads() -> Self {
+        Self {
+            record_model_requests: false,
+        }
+    }
+}
+
 /// One reserved batch whose commit is in flight (or awaiting a retry).
 ///
 /// Sequence numbers are reserved when the batch is drained from `pending`, so events appended
@@ -231,8 +365,9 @@ struct RecorderState {
     result_json: Option<String>,
     step_id: Option<String>,
     action_ids: HashMap<String, String>,
-    previous_state: Option<String>,
-    previous_messages: Vec<String>,
+    previous_state: Option<u64>,
+    previous_sections: CheckpointFields,
+    previous_messages: Vec<MessageFingerprint>,
     recorded_messages: HashSet<String>,
     input_messages: HashSet<String>,
 }
@@ -245,6 +380,14 @@ pub struct SessionRecorder {
     turn_id: String,
     resumed_turn: bool,
     initial: SessionProjection,
+    /// The serialized state the journal was opened with. The caller takes it once through
+    /// [`SessionRecorder::restore_initial`]; keeping it after that would hold a second copy of
+    /// the whole conversation for the life of the turn.
+    initial_state: Mutex<Option<String>>,
+    /// Whether the journal already carried a state baseline when this recorder opened.
+    had_baseline: bool,
+    /// What this recorder persists for each model call.
+    policy: RecordingPolicy,
     state: Mutex<RecorderState>,
     exporter: Option<Arc<SessionLogExporter>>,
     /// The lease duration this recorder acquires and renews with.
@@ -510,6 +653,24 @@ impl SessionRecorder {
         exporter: Option<Arc<SessionLogExporter>>,
         baseline: RecorderBaseline,
     ) -> crate::error::Result<Self> {
+        Self::open_with_baseline_and_policy(
+            log,
+            turn_id,
+            exporter,
+            baseline,
+            RecordingPolicy::default(),
+        )
+        .await
+    }
+
+    /// Opens a recorder with a caller-supplied baseline under an explicit recording policy.
+    pub async fn open_with_baseline_and_policy(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        exporter: Option<Arc<SessionLogExporter>>,
+        baseline: RecorderBaseline,
+        policy: RecordingPolicy,
+    ) -> crate::error::Result<Self> {
         Self::open_with_lease_and_baseline(
             log,
             turn_id,
@@ -517,6 +678,25 @@ impl SessionRecorder {
             exporter,
             LEASE,
             Some(baseline),
+            policy,
+        )
+        .await
+    }
+
+    /// Opens a recorder without a baseline under an explicit recording policy.
+    pub async fn open_with_exporter_and_policy(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        exporter: Option<Arc<SessionLogExporter>>,
+        policy: RecordingPolicy,
+    ) -> crate::error::Result<Self> {
+        Self::open_with_lease_policy(
+            log,
+            turn_id,
+            &uuid::Uuid::new_v4().to_string(),
+            exporter,
+            LEASE,
+            policy,
         )
         .await
     }
@@ -532,7 +712,28 @@ impl SessionRecorder {
         exporter: Option<Arc<SessionLogExporter>>,
         lease: Duration,
     ) -> crate::error::Result<Self> {
-        Self::open_with_lease_and_baseline(log, turn_id, run_id, exporter, lease, None).await
+        Self::open_with_lease_and_baseline(
+            log,
+            turn_id,
+            run_id,
+            exporter,
+            lease,
+            None,
+            RecordingPolicy::default(),
+        )
+        .await
+    }
+
+    /// Lease-explicit open under an explicit recording policy.
+    pub(crate) async fn open_with_lease_policy(
+        log: Arc<dyn SessionLog>,
+        turn_id: Option<&str>,
+        run_id: &str,
+        exporter: Option<Arc<SessionLogExporter>>,
+        lease: Duration,
+        policy: RecordingPolicy,
+    ) -> crate::error::Result<Self> {
+        Self::open_with_lease_and_baseline(log, turn_id, run_id, exporter, lease, None, policy).await
     }
 
     async fn open_with_lease_and_baseline(
@@ -542,6 +743,7 @@ impl SessionRecorder {
         exporter: Option<Arc<SessionLogExporter>>,
         lease: Duration,
         baseline: Option<RecorderBaseline>,
+        policy: RecordingPolicy,
     ) -> crate::error::Result<Self> {
         let turn_id = match turn_id {
             Some(id) if id.trim().is_empty() => {
@@ -722,6 +924,19 @@ impl SessionRecorder {
                 }
             };
 
+        // Keep exactly one serialized copy of the state the journal was opened with: the
+        // restore source. Everything that compares states uses a fingerprint instead.
+        let mut initial = initial;
+        let initial_state = initial.state_json.take().or(previous_state);
+        let had_baseline = initial_state.is_some();
+        let previous_state = initial_state
+            .as_deref()
+            .map(|json| fingerprint(json.as_bytes()));
+        let previous_sections = match initial_state.as_deref() {
+            Some(json) => serde_json::from_str(json)?,
+            None => CheckpointFields::default(),
+        };
+
         Ok(Self {
             replay_ms,
             heartbeat: Mutex::new(heartbeat),
@@ -732,11 +947,15 @@ impl SessionRecorder {
             turn_id,
             resumed_turn,
             initial,
+            initial_state: Mutex::new(initial_state),
+            had_baseline,
+            policy,
             state: Mutex::new(RecorderState {
                 durable_seq,
                 snapshot_seq: durable_seq,
                 snapshot_at_ms: now_ms(),
                 previous_state,
+                previous_sections,
                 previous_messages,
                 recorded_messages: recorded,
                 ..RecorderState::default()
@@ -764,6 +983,23 @@ impl SessionRecorder {
     /// The committed prefix the recorder started from.
     pub fn initial(&self) -> &SessionProjection {
         &self.initial
+    }
+
+    /// Restores the state the journal was opened with, releasing the serialized copy.
+    ///
+    /// Callers restore once, right after opening; afterwards only the running state is kept.
+    pub fn restore_initial(&self) -> crate::error::Result<Option<AgentState>> {
+        let json = self
+            .initial_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match json {
+            Some(json) => Ok(Some(
+                AgentState::from_json_str(&json).map_err(crate::error::Error::from)?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// The last durably committed sequence number.
@@ -810,9 +1046,22 @@ impl SessionRecorder {
         payload: &T,
         required: bool,
     ) -> crate::error::Result<u64> {
+        self.append_serialized_required(event_type, serde_json::to_string(payload)?, required)
+    }
+
+    /// Buffers a fact whose payload is already serialized JSON.
+    ///
+    /// Checkpoints build their payload by streaming the state into it (see
+    /// [`checkpoint_payload`]); going through a `serde_json::Value` would materialize the whole
+    /// conversation a second time.
+    fn append_serialized_required(
+        &self,
+        event_type: &str,
+        payload_json: String,
+        required: bool,
+    ) -> crate::error::Result<u64> {
         let mut guard = self.lock();
         Self::check(&guard)?;
-        let payload_json = serde_json::to_string(payload)?;
         let bytes = payload_json.len();
         let inflight_bytes = guard
             .inflight
@@ -1137,7 +1386,7 @@ impl SessionRecorder {
 
     /// Records the run/turn start facts and the first input.
     pub async fn start(&self, input: &[Msg], state: &AgentState) -> crate::error::Result<()> {
-        if self.initial.state_json.is_none() {
+        if !self.had_baseline {
             self.append(
                 "migration/baseline",
                 &serde_json::json!({ "stateJson": state.to_json()?, "coverage": "baseline_only" }),
@@ -1208,15 +1457,15 @@ impl SessionRecorder {
 
     /// Snapshots the working state as durable facts plus a checkpoint.
     pub fn capture_state(&self, state: &AgentState, reason: &str) -> crate::error::Result<()> {
-        let json = state.to_json()?;
         let messages = message_json(state)?;
+        let state_fingerprint = state_fingerprint(state)?;
 
         // Decide what changed under the lock, then append with the lock released:
         // `append` takes the same (non-reentrant) mutex.
-        let (replaced, durable_seq, fresh, previous_state) = {
+        let (replaced, durable_seq, fresh, changed) = {
             let mut guard = self.lock();
             Self::check(&guard)?;
-            let unchanged = guard.previous_state.as_deref() == Some(json.as_str())
+            let unchanged = guard.previous_state == Some(state_fingerprint)
                 && state
                     .context
                     .iter()
@@ -1240,7 +1489,34 @@ impl SessionRecorder {
                     fresh.push((message.clone(), applied));
                 }
             }
-            (replaced, durable_seq, fresh, guard.previous_state.clone())
+            let current = checkpoint_fields(state)?;
+            let mut changed: Vec<(&'static str, serde_json::Value)> = Vec::new();
+            let before = &guard.previous_sections;
+            for (event_type, now, previous) in [
+                (
+                    "task/changed",
+                    &current.tasks_context,
+                    &before.tasks_context,
+                ),
+                (
+                    "plan/changed",
+                    &current.plan_mode_context,
+                    &before.plan_mode_context,
+                ),
+                (
+                    "permission/changed",
+                    &current.permission_context,
+                    &before.permission_context,
+                ),
+            ] {
+                if let Some(value) = now {
+                    if Some(value) != previous.as_ref() {
+                        changed.push((event_type, value.clone()));
+                    }
+                }
+            }
+            guard.previous_sections = current;
+            (replaced, durable_seq, fresh, changed)
         };
 
         if replaced {
@@ -1277,45 +1553,17 @@ impl SessionRecorder {
             }
         }
 
-        let previous: CheckpointFields = match previous_state {
-            Some(json) => serde_json::from_str(&json)?,
-            None => CheckpointFields::default(),
-        };
-        let current: CheckpointFields = serde_json::from_str(&json)?;
-        for (event_type, current_value, previous_value) in [
-            (
-                "task/changed",
-                &current.tasks_context,
-                &previous.tasks_context,
-            ),
-            (
-                "plan/changed",
-                &current.plan_mode_context,
-                &previous.plan_mode_context,
-            ),
-            (
-                "permission/changed",
-                &current.permission_context,
-                &previous.permission_context,
-            ),
-        ] {
-            if let Some(value) = current_value {
-                if Some(value) != previous_value.as_ref() {
-                    self.append(event_type, &serde_json::json!({ "state": value }))?;
-                }
-            }
+        for (event_type, value) in changed {
+            self.append(event_type, &serde_json::json!({ "state": value }))?;
         }
-        self.append(
+        self.append_serialized_required(
             "state/checkpoint",
-            &serde_json::json!({
-                "projectorVersion": 1,
-                "stateJson": json,
-                "reason": reason,
-            }),
+            checkpoint_payload(state, reason)?,
+            true,
         )?;
         {
             let mut guard = self.lock();
-            guard.previous_state = Some(json);
+            guard.previous_state = Some(state_fingerprint);
             guard.previous_messages = messages;
         }
         Ok(())
@@ -1332,7 +1580,24 @@ impl SessionRecorder {
         // facts in one oversized batch.
         self.flush().await?;
         self.capture_state(state, reason)?;
-        self.flush().await
+        self.flush().await?;
+        // Recovery always resumes from the newest checkpoint, so every earlier checkpoint of
+        // this turn is unreadable-by-design: a full `AgentState` (megabytes) per iteration that
+        // nothing consumes. Reclaiming their payloads keeps the journal at one checkpoint per
+        // turn without weakening the durability of what the turn actually did.
+        let keep_seq = self.durable_seq();
+        if let Err(error) = self
+            .log
+            .reclaim_superseded_checkpoints(&self.turn_id, keep_seq)
+            .await
+        {
+            tracing::warn!(
+                turn = %self.turn_id,
+                %error,
+                "superseded checkpoint payloads kept for a later sweep"
+            );
+        }
+        Ok(())
     }
 
     /// Records a prepared model request and its dispatch, mirroring Java `prepareModel`.
@@ -1350,17 +1615,35 @@ impl SessionRecorder {
         if let Some(state) = state {
             self.checkpoint_now(state, "before_model").await?;
         }
-        self.append(
-            "request/prepared",
-            &serde_json::json!({
-                "modelCallId": call_id,
-                "purpose": purpose,
-                "model": input.model.model_name(),
-                "messages": input.messages,
-                "tools": input.tools,
-                "options": options_payload(&input.options),
-            }),
-        )?;
+        // `request/prepared` is the only event carrying the full request payload, and no read
+        // path consumes it: recovery uses the checkpoint plus `model/dispatch`, and the
+        // projection drops it as a builtin. A host without provider-level forensics needs can
+        // turn it off; the call stays discoverable as dispatched below.
+        if self.policy.record_model_requests {
+            // A borrowed projection: serializing the request straight from the input avoids
+            // building a `serde_json::Value` tree of the whole conversation first.
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct PreparedRequest<'a> {
+                model_call_id: &'a str,
+                purpose: &'a str,
+                model: &'a str,
+                messages: &'a [Msg],
+                tools: &'a [crate::model::ToolSchema],
+                options: serde_json::Value,
+            }
+            self.append(
+                "request/prepared",
+                &PreparedRequest {
+                    model_call_id: call_id,
+                    purpose,
+                    model: input.model.model_name(),
+                    messages: &input.messages,
+                    tools: &input.tools,
+                    options: options_payload(&input.options),
+                },
+            )?;
+        }
         self.append(
             "model/dispatch",
             &serde_json::json!({ "modelCallId": call_id, "attemptId": call_id }),
@@ -1548,12 +1831,49 @@ fn message_event_type(message: &Msg) -> &'static str {
     }
 }
 
-fn message_json(state: &AgentState) -> crate::error::Result<Vec<String>> {
+fn message_json(state: &AgentState) -> crate::error::Result<Vec<MessageFingerprint>> {
     state
         .context
         .iter()
-        .map(|message| serde_json::to_string(message).map_err(crate::error::Error::from))
+        .map(|message| {
+            let mut sink = HashingSink::default();
+            serde_json::to_writer(&mut sink, message).map_err(crate::error::Error::from)?;
+            Ok(sink.finish())
+        })
         .collect()
+}
+
+/// Serializes the state once into a hashing sink to fingerprint it without its JSON text.
+fn state_fingerprint(state: &AgentState) -> crate::error::Result<u64> {
+    let mut sink = HashingSink::default();
+    serde_json::to_writer(&mut sink, state).map_err(crate::error::Error::from)?;
+    Ok(sink.finish().hash)
+}
+
+/// The changed-worthy sections of a state, compared against the previous capture.
+fn checkpoint_fields(state: &AgentState) -> crate::error::Result<CheckpointFields> {
+    Ok(CheckpointFields {
+        tasks_context: Some(serde_json::to_value(&state.tasks_context)?),
+        plan_mode_context: Some(serde_json::to_value(&state.plan_mode_context)?),
+        permission_context: Some(serde_json::to_value(&state.permission_context)?),
+    })
+}
+
+/// Builds the `state/checkpoint` payload with the state embedded as an escaped JSON string.
+///
+/// The state is streamed into the payload buffer, so a checkpoint of a multi-megabyte
+/// conversation never exists as a second `String` (let alone as a `serde_json::Value`).
+fn checkpoint_payload(state: &AgentState, reason: &str) -> crate::error::Result<String> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"{\"projectorVersion\":1,\"stateJson\":\"");
+    {
+        let mut sink = JsonStringSink { out: &mut out };
+        serde_json::to_writer(&mut sink, state).map_err(crate::error::Error::from)?;
+    }
+    out.extend_from_slice(b"\",\"reason\":\"");
+    escape_json_into(&mut out, reason.as_bytes());
+    out.extend_from_slice(b"\"}");
+    String::from_utf8(out).map_err(|error| session_error(format!("checkpoint payload: {error}")))
 }
 
 /// Extracts tool calls from an event payload (`toolCalls` / `tool_calls`).
@@ -1763,6 +2083,149 @@ mod tests {
         recorder.close().await;
     }
 
+    /// `prepare_model` only reads the model name; streaming is never reached.
+    struct NamedModel(&'static str);
+
+    impl crate::model::Model for NamedModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: crate::model::GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, crate::error::Result<crate::model::ChatResponse>> {
+            unimplemented!("prepare_model never streams")
+        }
+
+        fn model_name(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recording_policy_decides_whether_the_request_body_is_journalled() {
+        for (policy, expected) in [
+            (RecordingPolicy::default(), true),
+            (RecordingPolicy::without_request_payloads(), false),
+        ] {
+            let (log, _storage) = journal().await;
+            let recorder = SessionRecorder::open_with_exporter_and_policy(
+                Arc::clone(&log),
+                Some("t1"),
+                None,
+                policy,
+            )
+            .await
+            .unwrap();
+            let state = crate::state::AgentState::builder().session_id("s1").build();
+            let input = crate::middleware::ModelCallInput::new(
+                vec![Msg::user("hello")],
+                Vec::new(),
+                crate::model::GenerateOptions::default(),
+                Arc::new(NamedModel("m")),
+            );
+            recorder
+                .prepare_model(&input, "c1", "chat", Some(&state))
+                .await
+                .unwrap();
+
+            let types = event_types(&*log).await;
+            assert_eq!(
+                types.iter().any(|t| t == "request/prepared"),
+                expected,
+                "{types:?}"
+            );
+            assert!(
+                types.iter().any(|t| t == "model/dispatch"),
+                "the call stays discoverable without the payload: {types:?}"
+            );
+            recorder.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn restoring_the_initial_state_releases_it() {
+        // The journal hands the recorder one serialized state; the launcher restores it once
+        // and the recorder must not keep it afterwards: it is a second copy of the whole
+        // conversation alive for the rest of the turn.
+        let (log, _storage) = journal().await;
+        let state = crate::state::AgentState::builder()
+            .session_id("s1")
+            .add_message(Msg::user("hello"))
+            .build();
+        seed(
+            &*log,
+            "run-0",
+            vec![raw(
+                1,
+                "state/checkpoint",
+                Some("run-0"),
+                Some("t0"),
+                &serde_json::json!({
+                    "stateJson": state.to_json().unwrap(),
+                    "projectorVersion": 1,
+                    "reason": "run_completed",
+                })
+                .to_string(),
+            )],
+        )
+        .await;
+
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        assert!(
+            recorder.initial().state_json.is_none(),
+            "the projection never carries the serialized state"
+        );
+        let restored = recorder.restore_initial().unwrap().expect("restored");
+        assert_eq!(restored.context.len(), 1);
+        assert!(
+            recorder.restore_initial().unwrap().is_none(),
+            "restoring once must release the serialized copy"
+        );
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_keeps_only_its_newest_checkpoint_payload() {
+        let (log, storage) = journal().await;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        let state = crate::state::AgentState::builder().session_id("s1").build();
+        recorder.start(&[], &state).await.unwrap();
+
+        let mut messages: Vec<Msg> = Vec::new();
+        for index in 0..3 {
+            // Small enough that only the checkpoint payload spills: the messages themselves stay
+            // inline, so every reclaimed blob is a superseded state.
+            messages.push(Msg::user(format!("{index}-{}", "x".repeat(40_000))));
+            let mut builder = crate::state::AgentState::builder().session_id("s1");
+            for message in &messages {
+                builder = builder.add_message(message.clone());
+            }
+            recorder
+                .checkpoint_now(&builder.build(), "before_acting")
+                .await
+                .unwrap();
+        }
+
+        let blobs = storage.list_paths("s1/blobs").await.unwrap();
+        assert_eq!(
+            blobs.len(),
+            1,
+            "each checkpoint supersedes the previous one of the same turn"
+        );
+        let projection = crate::session::SessionProjection::read(&*log)
+            .await
+            .unwrap();
+        let restored = projection
+            .state_json
+            .expect("the newest checkpoint restores");
+        assert!(restored.contains("2-"), "{restored}");
+        recorder.close().await;
+    }
+
     #[tokio::test]
     async fn reusing_a_turn_marks_the_run_as_resumed() {
         let (log, _storage) = journal().await;
@@ -1838,6 +2301,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reconciliation required"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_payload_round_trips_every_character_class() {
+        // The checkpoint embeds the state as an escaped JSON *string*. Escaping is now streamed
+        // as the state is serialized, so the payload must still decode back to the exact same
+        // state — this is the crash-recovery path.
+        let (log, _storage) = journal().await;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        let control = char::from_u32(1).unwrap();
+        let tricky = format!(
+            "quote \" backslash \\ newline \n tab \t cr \r control {control} unicode 中文 火箭 🚀 slash /"
+        );
+        let state = crate::state::AgentState::builder()
+            .session_id("s1")
+            .add_message(Msg::user(tricky))
+            .build();
+        recorder.capture_state(&state, "before_model").unwrap();
+        recorder.flush().await.unwrap();
+
+        let head = log.head().await.unwrap();
+        let events = log.scan(0, head.seq).await.unwrap();
+        let checkpoint = events
+            .iter()
+            .find(|e| e.event_type == "state/checkpoint")
+            .expect("checkpoint recorded");
+        let payload = checkpoint.data().unwrap();
+        let state_json = payload["stateJson"]
+            .as_str()
+            .expect("stateJson must stay a string");
+        assert_eq!(
+            crate::state::AgentState::from_json_str(state_json).unwrap(),
+            state
+        );
+
+        // The fold through the journal must reach the same state, escaped payload and all.
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert_eq!(projection.restore().unwrap().expect("restored"), state);
+        recorder.close().await;
     }
 
     #[tokio::test]

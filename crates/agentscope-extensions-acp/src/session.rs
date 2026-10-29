@@ -1387,7 +1387,9 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
     {
-        self.run_prompt_inner(content, emit, cancellation).await
+        let stop = self.run_prompt_inner(content, emit, cancellation).await;
+        self.report_turn_memory(stop);
+        stop
     }
 
     /// Runs a prompt against the core agent and streams updates.
@@ -1398,7 +1400,32 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
     {
-        self.run_prompt_inner(content, emit, None).await
+        let stop = self.run_prompt_inner(content, emit, None).await;
+        self.report_turn_memory(stop);
+        stop
+    }
+
+    /// Per-turn memory line (`INFO`, always) plus the optional post-turn collect
+    /// (`AGENTSCOPE_ACP_MEM_COLLECT`, on by default). A turn's megabyte-sized buffers are
+    /// collectable once it is committed, so this is the point where returning them to the OS is
+    /// meaningful. The expensive `state=` field only appears under `AGENTSCOPE_ACP_MEM_REPORT`.
+    fn report_turn_memory(&self, stop: StopReason) {
+        // Never block here: this runs on the async runtime, and the agent task may hold the state
+        // lock across an await point -- a blocking `lock()` on a current-thread runtime would
+        // deadlock the session. A contended lock just means the line omits the state fields.
+        let state = self.agent.agent().map(|react| react.state_handle());
+        let guard = state.as_ref().and_then(|handle| handle.try_lock().ok());
+        let messages = guard.as_ref().map(|state| state.context.len());
+        let state_bytes = if crate::mem::report_enabled() {
+            guard
+                .as_ref()
+                .and_then(|state| state.to_json().ok())
+                .map(|json| json.len())
+        } else {
+            None
+        };
+        drop(guard);
+        crate::mem::note_turn(&format!("StopReason::{stop:?}"), messages, state_bytes);
     }
 
     /// Converts ACP content blocks into a core user message, rejecting unsupported media

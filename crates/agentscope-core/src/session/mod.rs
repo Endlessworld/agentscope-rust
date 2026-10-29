@@ -40,8 +40,8 @@ pub use models::{
     SessionModelPolicy, SessionModelPolicyHandle, SessionModels, MODEL_POLICY_CONTEXT_KEY,
 };
 pub use recorder::{
-    outcome, RecorderBaseline, SessionMetrics, SessionRecorder, PARENT_CONTEXT_KEY,
-    RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+    outcome, RecorderBaseline, RecordingPolicy, SessionMetrics, SessionRecorder,
+    PARENT_CONTEXT_KEY, RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
 };
 pub use recovery::{abandon_turn, cancel_pending, reconcile};
 pub use snapshot::{

@@ -399,7 +399,7 @@ impl WorkspaceSessionLogStore {
 }
 
 /// Root of the current session layout (`.agentscope/sessions/<agent>/<user>/<session>`).
-const SESSION_ROOT: &str = ".agentscope/sessions";
+pub(crate) const SESSION_ROOT: &str = ".agentscope/sessions";
 /// Root of the pre-migration layout (`agents/<agent>/sessions/<user>/<session>`).
 const LEGACY_SESSION_ROOT: &str = "agents";
 

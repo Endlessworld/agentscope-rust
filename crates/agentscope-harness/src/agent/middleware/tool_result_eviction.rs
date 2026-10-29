@@ -54,19 +54,68 @@ impl Middleware for ToolResultEvictionMiddleware {
         let fs = self.fs.clone();
         let config = self.config.clone();
         let agent_name = ctx.agent_name.clone().unwrap_or_default();
-        let messages = input.messages.clone();
+        // `input` is owned here: move the conversation into the future instead of deep-copying
+        // it. For a long session that copy is megabytes on every reasoning step.
+        let ReasoningInput {
+            messages,
+            tools,
+            options,
+        } = input;
 
         let fut = async move {
             let mut replacements: HashMap<ToolResultFingerprint, String> = HashMap::new();
             let (rebuilt, changed) =
                 evict_messages(&fs, &config, &agent_name, &ctx, messages, &mut replacements).await;
-            if !changed {
-                return next(input);
+            if changed {
+                apply_to_state(&ctx, &replacements);
             }
-            let new_input = ReasoningInput::new(rebuilt, input.tools, input.options);
-            next(new_input)
+            next(ReasoningInput::new(rebuilt, tools, options))
         };
         Box::pin(futures::stream::once(fut).flatten())
+    }
+}
+
+/// Makes an eviction stick by rewriting the archived history as well.
+///
+/// The reasoning middleware runs on a *copy* of the conversation, so offloading there alone
+/// leaves the full output in the agent state — and in every checkpoint, and in every later
+/// request — for the rest of the session. Rewriting the state too is what actually bounds the
+/// resident context; matching by fingerprint (`id` + name + text) limits the rewrite to the
+/// exact results that were just offloaded, so nothing else in the history is touched.
+fn apply_to_state(ctx: &RuntimeContext, replacements: &HashMap<ToolResultFingerprint, String>) {
+    let Some(state) = &ctx.state else {
+        return;
+    };
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for message in guard.context.iter_mut() {
+        let mut hits: Vec<(usize, String)> = Vec::new();
+        for (index, block) in message.content.iter().enumerate() {
+            let ContentBlock::ToolResult(tr) = block else {
+                continue;
+            };
+            if is_evicted(tr) {
+                continue;
+            }
+            if let Some(placeholder) = replacements.get(&fingerprint(tr)) {
+                hits.push((index, placeholder.clone()));
+            }
+        }
+        if hits.is_empty() {
+            continue;
+        }
+        let mut blocks = std::mem::take(&mut message.content);
+        for (index, placeholder) in hits {
+            let block = std::mem::replace(
+                &mut blocks[index],
+                ContentBlock::Text(TextBlock::new(String::new())),
+            );
+            if let ContentBlock::ToolResult(tr) = block {
+                blocks[index] = ContentBlock::ToolResult(with_placeholder(tr, placeholder));
+            }
+        }
+        message.content = blocks;
     }
 }
 
@@ -85,66 +134,64 @@ pub(crate) async fn evict_messages(
     let mut rebuilt: Vec<Msg> = Vec::with_capacity(messages.len());
     let mut changed = false;
     for msg in messages {
-        let new_msg = evict_message(fs, config, agent_name, ctx, msg.clone(), replacements).await;
-        if let Some(m) = new_msg {
-            changed = true;
-            rebuilt.push(m);
-        } else {
-            rebuilt.push(msg);
-        }
+        let (msg, msg_changed) = evict_message(fs, config, agent_name, ctx, msg, replacements).await;
+        changed |= msg_changed;
+        rebuilt.push(msg);
     }
     (rebuilt, changed)
 }
 
-/// Evicts oversized tool results in a single message. Returns `Some(msg)` if rebuilt.
+/// Evicts oversized tool results in a single message, returning `(msg, changed)`.
+///
+/// The message is taken by value: it is rebuilt in place only when a result actually
+/// qualifies, so a normal reasoning step copies nothing.
 async fn evict_message(
     fs: &Arc<dyn Filesystem>,
     config: &ToolResultEvictionConfig,
     agent_name: &str,
     ctx: &RuntimeContext,
-    msg: Msg,
+    mut msg: Msg,
     replacements: &mut HashMap<ToolResultFingerprint, String>,
-) -> Option<Msg> {
+) -> (Msg, bool) {
     if msg.content.is_empty() {
-        return None;
+        return (msg, false);
     }
-    let mut rebuilt_blocks: Vec<ContentBlock> = Vec::with_capacity(msg.content.len());
+    // Probe before rebuilding: most messages carry no oversized result, and rebuilding every
+    // block would clone the whole conversation on every reasoning step.
+    let mut placeholders: Vec<Option<String>> = Vec::with_capacity(msg.content.len());
     let mut changed = false;
-    for block in msg.content {
-        match block {
-            ContentBlock::ToolResult(tr) if !is_evicted(&tr) => {
-                let fp = fingerprint(&tr);
-                let placeholder = if let Some(p) = replacements.get(&fp) {
+    for block in &msg.content {
+        let placeholder = match block {
+            ContentBlock::ToolResult(tr) if !is_evicted(tr) => {
+                let fp = fingerprint(tr);
+                if let Some(p) = replacements.get(&fp) {
                     Some(p.clone())
                 } else {
-                    let p = maybe_evict(fs, config, agent_name, ctx, &tr).await;
+                    let p = maybe_evict(fs, config, agent_name, ctx, tr).await;
                     if let Some(ref p) = p {
                         replacements.insert(fp, p.clone());
                     }
                     p
-                };
-                if let Some(p) = placeholder {
-                    changed = true;
-                    rebuilt_blocks.push(ContentBlock::ToolResult(with_placeholder(tr, p)));
-                } else {
-                    rebuilt_blocks.push(ContentBlock::ToolResult(tr));
                 }
             }
-            other => rebuilt_blocks.push(other),
-        }
+            _ => None,
+        };
+        changed |= placeholder.is_some();
+        placeholders.push(placeholder);
     }
     if !changed {
-        return None;
+        return (msg, false);
     }
-    Some(
-        Msg::builder_for_role(Some(msg.role))
-            .id(msg.id)
-            .name(msg.name.unwrap_or_default())
-            .content(rebuilt_blocks)
-            .metadata(msg.metadata.clone())
-            .timestamp(msg.timestamp)
-            .build(),
-    )
+    let blocks = std::mem::take(&mut msg.content);
+    msg.content = blocks
+        .into_iter()
+        .zip(placeholders)
+        .map(|(block, placeholder)| match (block, placeholder) {
+            (ContentBlock::ToolResult(tr), Some(p)) => ContentBlock::ToolResult(with_placeholder(tr, p)),
+            (block, _) => block,
+        })
+        .collect();
+    (msg, true)
 }
 
 /// Evicts a single oversized tool result, writing it to disk and returning the placeholder.
@@ -357,5 +404,66 @@ mod tests {
         };
         assert_eq!(small_tr.text_content(), "tiny");
         assert!(!is_evicted(small_tr));
+    }
+
+    #[tokio::test]
+    async fn an_eviction_is_written_back_to_the_archived_history() {
+        // The middleware runs on a copy of the conversation; unless the offload is mirrored
+        // into the agent state the full output stays resident (and checkpointed) forever.
+        let dir = std::env::temp_dir().join(format!("agentscope_evict_state_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir));
+        let config = ToolResultEvictionConfig::builder()
+            .max_result_chars(10)
+            .preview_chars(4)
+            .eviction_path("blobs")
+            .excluded_tool_names(std::collections::HashSet::new())
+            .build();
+
+        let big = Msg::builder_for_role(Some(MsgRole::Tool))
+            .content(vec![ContentBlock::ToolResult(big_tool_result(
+                "0123456789ABCDEF",
+            ))])
+            .build();
+        let small = Msg::tool("call_2", "execute", "tiny");
+        let mut state = agentscope_core::state::AgentState::default();
+        state.context = vec![big, small];
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let mut ctx = RuntimeContext::new();
+        ctx.state = Some(Arc::clone(&state));
+
+        let mut replacements: HashMap<ToolResultFingerprint, String> = HashMap::new();
+        let (rebuilt, changed) = evict_messages(
+            &fs,
+            &config,
+            "agent",
+            &ctx,
+            state.lock().unwrap().context.clone(),
+            &mut replacements,
+        )
+        .await;
+        assert!(changed);
+        apply_to_state(&ctx, &replacements);
+
+        let guard = state.lock().unwrap();
+        let archived = match &guard.context[0].content[0] {
+            ContentBlock::ToolResult(t) => t,
+            _ => panic!("expected tool result"),
+        };
+        assert!(is_evicted(archived), "the archive must be offloaded too");
+        assert!(archived.text_content().contains("blobs"));
+        // The rendering the model sees and the archive carry the same placeholder.
+        let rendered = match &rebuilt[0].content[0] {
+            ContentBlock::ToolResult(t) => t,
+            _ => panic!("expected tool result"),
+        };
+        assert_eq!(archived.text_content(), rendered.text_content());
+        // A small result is left alone.
+        let untouched = match &guard.context[1].content[0] {
+            ContentBlock::ToolResult(t) => t,
+            _ => panic!("expected tool result"),
+        };
+        assert_eq!(untouched.text_content(), "tiny");
     }
 }

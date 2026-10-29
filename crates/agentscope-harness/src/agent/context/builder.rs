@@ -317,14 +317,14 @@ impl ContextPipeline {
                     &eviction.config,
                     &agent_name,
                     &fs_ctx,
-                    current.clone(),
+                    current,
                     &mut replacements,
                 )
                 .await;
                 if changed {
                     transforms.push("tool_result_offload".to_string());
-                    current = rebuilt;
                 }
+                current = rebuilt;
             }
         }
         // 3.5 Task projection. Java projects inside the compiler before measuring, so the

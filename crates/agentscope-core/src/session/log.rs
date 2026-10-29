@@ -176,6 +176,21 @@ pub trait SessionLog: Send + Sync {
     ) -> crate::error::Result<Option<u64>> {
         Ok(None)
     }
+
+    /// Deletes the payloads of checkpoints that a newer checkpoint in the same turn supersedes.
+    ///
+    /// Recovery always resumes from the newest checkpoint, so an earlier checkpoint of the same
+    /// turn can never be read back: it is a full `AgentState` (megabytes) written once per
+    /// iteration that nothing consumes. Only payloads are reclaimed, never the commit itself —
+    /// a commit also carries the messages recorded up to that point. Backends that do not spill
+    /// payloads keep the no-op default.
+    async fn reclaim_superseded_checkpoints(
+        &self,
+        _turn_id: &str,
+        _keep_seq: u64,
+    ) -> crate::error::Result<()> {
+        Ok(())
+    }
 }
 
 /// Extensible session log backend. Opening a reader must not acquire a writer or repair

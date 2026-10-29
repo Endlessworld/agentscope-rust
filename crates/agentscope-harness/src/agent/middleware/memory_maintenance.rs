@@ -4,8 +4,8 @@
 //! Fires on the agent invocation completion (via `on_agent` tail) and is throttled by a
 //! configurable minimum gap. Steps: expire daily memory files older than
 //! `daily_file_retention_days` into `memory/archive/`, run LLM consolidation if a
-//! consolidator is configured, and prune session log files older than
-//! `session_retention_days`.
+//! consolidator is configured, and drop sessions idle for longer than
+//! `session_retention_days` (journals included).
 
 use std::sync::Arc;
 
@@ -15,11 +15,39 @@ use futures::StreamExt;
 
 use crate::agent::isolation_scope::IsolationScope;
 use crate::agent::memory::MemoryConsolidator;
-use crate::agent::workspace::constants::{AGENTS_DIR, MEMORY_DIR};
+use crate::agent::session::storage::SESSION_ROOT;
+use crate::agent::workspace::constants::MEMORY_DIR;
 use crate::filesystem::Filesystem;
 
 /// Default minimum gap between two maintenance runs (30 minutes).
 pub const DEFAULT_MIN_GAP_SECS: i64 = 1800;
+
+/// Upper bound on the idle window of a session journal, in days.
+///
+/// The event log carries a full-context checkpoint per model call, so a journal grows with the
+/// conversation while a single-file transcript did not: an abandoned sub-agent namespace reached
+/// tens of gigabytes. Journals therefore age out faster than `session_retention_days` (180 by
+/// default); `AGENTSCOPE_JOURNAL_RETENTION_DAYS` overrides the window for hosts that want to keep
+/// (or drop) them sooner.
+pub const DEFAULT_JOURNAL_RETENTION_DAYS: i64 = 30;
+
+/// Environment override for the idle window applied to session journals, in days.
+pub const JOURNAL_RETENTION_ENV: &str = "AGENTSCOPE_JOURNAL_RETENTION_DAYS";
+
+/// The file whose modification time says whether a session is still in use.
+const HEAD_FILE: &str = "head.json";
+/// Names below a session directory that hold its journal; never part of the walk.
+const JOURNAL_DIRS: &[&str] = &[
+    "commits",
+    "blobs",
+    "snapshots",
+    "writer-seals",
+    "inbox",
+    "exports",
+];
+/// `<agent>/<user>/<session>` sits three levels below [`SESSION_ROOT`]; the extra level keeps a
+/// host-specific nesting from being mistaken for a session.
+const MAX_JOURNAL_DEPTH: usize = 4;
 
 /// Process-wide per-isolation-key maintenance timestamps (millis).
 static SHARED_LAST_RUN_AT: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
@@ -146,27 +174,60 @@ impl MemoryMaintenanceMiddleware {
         }
     }
 
-    /// Deletes session log files (`*.log.jsonl`) older than the retention window.
+    /// Deletes sessions no client opened for the retention window.
+    ///
+    /// The journal layout (`.agentscope/sessions/<agent>/<user>/<session>/`) is walked one level
+    /// at a time because `glob` reports no modification times -- and because the event log writes
+    /// every commit as a new file, so a session racing the sweep must be recognised from its
+    /// `head.json`. A session idle past the window is dropped whole (commits, payload blobs and
+    /// snapshots): nobody touched it, and its log is only useful to a live run.
     async fn prune_old_sessions(&self, ctx: &RuntimeContext) {
-        let Ok(files) = self
-            .fs
-            .glob(ctx, &format!("{AGENTS_DIR}/**/*.log.jsonl"), "/")
-            .await
-        else {
-            return;
-        };
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(self.session_retention_days);
-        for fi in files {
-            if fi.is_directory {
-                continue;
-            }
-            let Ok(modified) = chrono::DateTime::parse_from_rfc3339(&fi.modified_at) else {
+        let cutoff = chrono::Utc::now() - self.journal_retention();
+        let mut queue = vec![(SESSION_ROOT.to_string(), 0usize)];
+        while let Some((dir, depth)) = queue.pop() {
+            let Ok(entries) = self.fs.ls(ctx, &dir).await else {
                 continue;
             };
-            if modified.with_timezone(&chrono::Utc) < cutoff {
-                let _ = self.fs.delete(ctx, &fi.path).await;
+            let mut idle_head = None;
+            let mut children = Vec::new();
+            for entry in &entries {
+                let name = entry.path.rsplit('/').next().unwrap_or_default();
+                if entry.is_directory {
+                    // Journal internals are never walked: a session is decided by its head file.
+                    if !JOURNAL_DIRS.contains(&name) {
+                        children.push(entry.path.trim_end_matches('/').to_string());
+                    }
+                } else if name == HEAD_FILE {
+                    idle_head = Some(is_idle_since(&entry.modified_at, cutoff));
+                }
             }
+            match idle_head {
+                Some(true) => {
+                    let _ = self.fs.delete(ctx, &dir).await;
+                    continue;
+                }
+                Some(false) => continue,
+                None => {}
+            }
+            if depth >= MAX_JOURNAL_DEPTH {
+                continue;
+            }
+            queue.extend(children.into_iter().map(|child| (child, depth + 1)));
         }
+    }
+
+    /// Idle window applied to journals: the configured session retention, capped by
+    /// [`DEFAULT_JOURNAL_RETENTION_DAYS`] unless the environment says otherwise.
+    fn journal_retention(&self) -> chrono::Duration {
+        let days = std::env::var(JOURNAL_RETENTION_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|days| *days >= 0)
+            .unwrap_or_else(|| {
+                self.session_retention_days
+                    .min(DEFAULT_JOURNAL_RETENTION_DAYS)
+            });
+        chrono::Duration::days(days)
     }
 }
 
@@ -179,6 +240,16 @@ impl MemoryMaintenanceDefaults {
     fn default_session_retention() -> i64 {
         crate::agent::memory::DEFAULT_SESSION_RETENTION_DAYS
     }
+}
+
+/// Whether a file's last modification predates `cutoff`.
+///
+/// An unparseable timestamp keeps the file: the sweep only acts on evidence that the session is
+/// idle, so a clock/format surprise must never delete live data.
+fn is_idle_since(modified_at: &str, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(modified_at)
+        .map(|modified| modified.with_timezone(&chrono::Utc) < cutoff)
+        .unwrap_or(false)
 }
 
 fn file_name_of(path: &str) -> String {
@@ -232,6 +303,7 @@ impl Middleware for MemoryMaintenanceMiddleware {
 mod tests {
     use super::*;
     use crate::filesystem::LocalFilesystem;
+    use std::path::Path;
 
     #[tokio::test]
     async fn expire_daily_files_archives_old_dates() {
@@ -273,6 +345,87 @@ mod tests {
             .exists(&ctx, &format!("{MEMORY_DIR}/{today}.md"))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn prune_old_sessions_drops_idle_journals_and_keeps_live_ones() {
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_maint_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir.clone()));
+        let ctx = RuntimeContext::new();
+        let idle = format!("{SESSION_ROOT}/agent/user/s_idle");
+        let live = format!("{SESSION_ROOT}/agent/user/s_live");
+        for session in [&idle, &live] {
+            fs.write(&ctx, &format!("{session}/head.json"), "{}")
+                .await
+                .unwrap();
+            fs.write(&ctx, &format!("{session}/commits/c1.json"), "{}")
+                .await
+                .unwrap();
+        }
+        // Only the head file is inspected for idleness, so age it like an abandoned session.
+        let head = std::fs::File::options()
+            .write(true)
+            .open(Path::new(&dir).join(&idle).join("head.json"))
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        head.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(head);
+
+        let mw = MemoryMaintenanceMiddleware {
+            fs: fs.clone(),
+            consolidator: None,
+            daily_file_retention_days: 90,
+            session_retention_days: 180,
+            min_gap: chrono::Duration::zero(),
+            isolation_scope: IsolationScope::User,
+        };
+        mw.prune_old_sessions(&ctx).await;
+
+        assert!(
+            !fs.exists(&ctx, &idle).await.unwrap(),
+            "an idle journal is dropped whole"
+        );
+        assert!(
+            fs.exists(&ctx, &format!("{live}/head.json")).await.unwrap(),
+            "a session still being written survives"
+        );
+        assert!(
+            fs.exists(&ctx, &format!("{live}/commits/c1.json"))
+                .await
+                .unwrap(),
+            "the live journal keeps its commits"
+        );
+    }
+
+    /// The days-window for journals is capped by the journal default and overridable, because a
+    /// journal grows per model call and cannot ride the 180-day transcript window.
+    #[tokio::test]
+    async fn journal_retention_is_capped_and_overridable() {
+        let mw = MemoryMaintenanceMiddleware {
+            fs: Arc::new(LocalFilesystem::sandboxed(std::env::temp_dir())),
+            consolidator: None,
+            daily_file_retention_days: 90,
+            session_retention_days: 180,
+            min_gap: chrono::Duration::zero(),
+            isolation_scope: IsolationScope::User,
+        };
+        assert_eq!(
+            mw.journal_retention(),
+            chrono::Duration::days(DEFAULT_JOURNAL_RETENTION_DAYS)
+        );
+        let shorter = MemoryMaintenanceMiddleware {
+            fs: Arc::clone(&mw.fs),
+            consolidator: None,
+            daily_file_retention_days: 90,
+            session_retention_days: 7,
+            min_gap: chrono::Duration::zero(),
+            isolation_scope: IsolationScope::User,
+        };
+        assert_eq!(shorter.journal_retention(), chrono::Duration::days(7));
     }
 
     #[tokio::test]

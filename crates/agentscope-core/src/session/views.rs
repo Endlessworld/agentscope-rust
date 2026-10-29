@@ -498,10 +498,11 @@ pub(crate) fn apply_projection_event(
     let data = event.data()?;
     match event.event_type.as_str() {
         "state/checkpoint" | "migration/baseline" | "state/restored" => {
-            *state = data
-                .get("stateJson")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            // Only a present payload replaces the state folded so far: a checkpoint whose payload
+            // a newer checkpoint superseded (or a malformed event) must not erase it.
+            if let Some(json) = data.get("stateJson").and_then(|value| value.as_str()) {
+                *state = Some(json.to_string());
+            }
             results.clear();
             verifications.clear();
             extensions.clear();

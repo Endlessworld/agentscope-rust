@@ -105,7 +105,9 @@ impl SessionRetention {
     /// Reads `AGENTSCOPE_SESSION_RETENTION` once per publish.
     ///
     /// `off`, `0`, `false` and `no` disable deletion; anything else (including an absent value)
-    /// keeps the default. A number is read as the minimum age in days.
+    /// keeps the default. A bare number is read as the minimum age in days; a `m`/`h`/`d` suffix
+    /// reads minutes/hours/days, which is what bounds the journal of a long-running session (each
+    /// turn appends a full-state checkpoint blob, see `journal::blobs`).
     pub fn from_env() -> Self {
         match std::env::var("AGENTSCOPE_SESSION_RETENTION") {
             Ok(value) => {
@@ -113,19 +115,37 @@ impl SessionRetention {
                 match trimmed.as_str() {
                     "off" | "0" | "false" | "no" | "disabled" => Self::OFF,
                     "" => Self::default(),
-                    other => match other.parse::<u64>() {
-                        Ok(days) if days == 0 => Self::OFF,
-                        Ok(days) => Self {
-                            min_age: Duration::from_secs(days * 86_400),
+                    other => match parse_min_age(other) {
+                        Some(min_age) if min_age.is_zero() => Self::OFF,
+                        Some(min_age) => Self {
+                            min_age,
                             ..Self::default()
                         },
-                        Err(_) => Self::default(),
+                        None => Self::default(),
                     },
                 }
             }
             Err(_) => Self::default(),
         }
     }
+}
+
+/// Parses `90m` / `6h` / `2d` / `30s`; a bare number is days. Returns `None` for anything else so
+/// the caller can fall back to the default instead of silently disabling retention.
+fn parse_min_age(value: &str) -> Option<Duration> {
+    let (number, unit) = match value.char_indices().next_back() {
+        Some((index, last)) if last.is_ascii_alphabetic() => (&value[..index], Some(last)),
+        _ => (value, None),
+    };
+    let number: u64 = number.trim().parse().ok()?;
+    let seconds = match unit {
+        None | Some('d') => number.checked_mul(86_400)?,
+        Some('h') => number.checked_mul(3_600)?,
+        Some('m') => number.checked_mul(60)?,
+        Some('s') => number,
+        Some(_) => return None,
+    };
+    Some(Duration::from_secs(seconds))
 }
 
 impl Default for SessionRetention {
@@ -188,6 +208,23 @@ mod tests {
             SessionRetention::default().min_age,
             Duration::from_secs(30 * 86_400)
         );
+    }
+
+    /// A long-running session writes one full-state checkpoint blob per turn, so retention has to
+    /// be expressible in hours -- days are too coarse to bound a single day's journal.
+    #[test]
+    fn retention_accepts_sub_day_units() {
+        assert_eq!(parse_min_age("90m"), Some(Duration::from_secs(5_400)));
+        assert_eq!(parse_min_age("6h"), Some(Duration::from_secs(21_600)));
+        assert_eq!(parse_min_age("2d"), Some(Duration::from_secs(172_800)));
+        assert_eq!(parse_min_age("30s"), Some(Duration::from_secs(30)));
+        // A bare number keeps its historical meaning: days.
+        assert_eq!(parse_min_age("7"), Some(Duration::from_secs(604_800)));
+        // Zero means "do not prune", which `from_env` maps onto `OFF`.
+        assert_eq!(parse_min_age("0"), Some(Duration::ZERO));
+        // Unknown spellings fall back to the default rather than disabling retention.
+        assert_eq!(parse_min_age("soon"), None);
+        assert_eq!(parse_min_age("6w"), None);
     }
 
     #[test]

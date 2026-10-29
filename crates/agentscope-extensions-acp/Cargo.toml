@@ -10,11 +10,6 @@ rust-version.workspace = true
 agentscope-core = { path = "../agentscope-core" }
 agentscope-extensions-model = { path = "../agentscope-extensions-model" }
 agentscope-harness = { path = "../agentscope-harness", default-features = false }
-# Session journaling builds megabyte-sized JSON payloads per turn; the default allocator
-# keeps that burst resident (RSS never returns). mimalloc returns it to the OS.
-# Only the two binaries install it as the global allocator, so library consumers are
-# unaffected.
-mimalloc = "0.1"
 agent-client-protocol = { version = "2.2.0", features = [
     # 2.2.0（schema 1.9）起「程序化工具名」已在 v1 稳定，`unstable_tool_call_name`
     # 特性被移除。改动理由与影响见 memory/2026-10-16.md。
@@ -64,3 +59,22 @@ rusqlite = ["agentscope-harness/rusqlite"]
 # Embedded minimal build: mirrors `agentscope-harness`'s `lite` feature,
 # dropping the bundled SQLite index.
 lite = []
+
+# The allocator is platform-specific. Session journaling builds megabyte-sized JSON payloads per
+# turn; on Linux/glibc the default allocator keeps that burst in its arena (RSS never returns), so
+# mimalloc hands it back. On Windows the CRT already releases large blocks on `free` and mimalloc
+# measured *worse* (54 MB vs 4.6 MB peak RSS across 32 threads: one heap per thread, purged on a
+# 1 s timer), so it is not installed there. Only the two binaries install it either way.
+[target.'cfg(unix)'.dependencies]
+mimalloc = "0.1"
+# `mi_process_info` / `mi_collect` back the `src/mem.rs` diagnostics; the `extended` feature only
+# adds FFI declarations on top of the same static library, it does not change how mimalloc builds.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# `GetProcessMemoryInfo` is the `src/mem.rs` footprint source once mimalloc is gone.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

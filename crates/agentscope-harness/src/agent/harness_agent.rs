@@ -90,6 +90,8 @@ pub struct HarnessAgent {
     use_legacy_xml_workspace_context: bool,
     /// Whether `disableSessionPersistence` was requested (stored/propagated config).
     disable_session_persistence: bool,
+    /// Whether each model call journals its full request payload.
+    record_model_requests: bool,
     /// Task repository bound to this agent (defaults to a `WorkspaceTaskRepository`).
     task_repository: Arc<dyn TaskRepository>,
     /// The embedded ReAct agent that drives the reasoning→acting loop.
@@ -171,6 +173,11 @@ impl HarnessAgent {
     /// inert flag but is retained for configuration parity.
     pub fn disable_session_persistence(&self) -> bool {
         self.disable_session_persistence
+    }
+
+    /// The recording policy this agent opens session recorders with.
+    pub fn recording_policy(&self) -> agentscope_core::session::RecordingPolicy {
+        recording_policy_for(self.record_model_requests)
     }
 
     /// The task repository bound to this agent.
@@ -562,6 +569,20 @@ fn no_model_error() -> agentscope_core::error::Error {
 }
 
 /// Builder for `HarnessAgent`.
+/// Maps the `record_model_requests` switch onto the recorder policy.
+///
+/// Both recorder paths (the session scheduler's and the one a `ReActAgent` opens for itself)
+/// resolve the policy here, so the switch cannot mean two different things.
+fn recording_policy_for(
+    record_model_requests: bool,
+) -> agentscope_core::session::RecordingPolicy {
+    if record_model_requests {
+        agentscope_core::session::RecordingPolicy::journaling_requests()
+    } else {
+        agentscope_core::session::RecordingPolicy::without_request_payloads()
+    }
+}
+
 pub struct HarnessAgentBuilder {
     name: Option<String>,
     model: Option<Arc<dyn Model>>,
@@ -669,6 +690,8 @@ pub struct HarnessAgentBuilder {
     /// Mirrors Java's currently inert `disableSessionPersistence` flag. It is retained
     /// and propagated to subagents so the configuration surface stays aligned.
     disable_session_persistence: bool,
+    /// Whether each model call journals its full request payload.
+    record_model_requests: bool,
     // ---- Graceful shutdown ----
     /// 是否挂载 `GracefulShutdownMiddleware`（请求登记 + shutdown 期间拒绝新请求）。
     graceful_shutdown_enabled: bool,
@@ -711,6 +734,7 @@ impl Default for HarnessAgentBuilder {
             disable_at_path_expansion: false,
             disable_memory_hooks: false,
             disable_tool_result_eviction: false,
+            record_model_requests: true,
             disable_compaction: false,
             disable_subagents: false,
             disable_dynamic_subagents: false,
@@ -1366,6 +1390,17 @@ impl HarnessAgentBuilder {
     /// Rust keeps the same configuration surface and propagates it to subagents.
     pub fn disable_session_persistence(mut self) -> Self {
         self.disable_session_persistence = true;
+        self
+    }
+
+    /// Journals (or not) the full payload of every model call as `request/prepared`.
+    ///
+    /// On by default, matching the Java recorder. Turning it off keeps the checkpoints and the
+    /// `model/dispatch` boundary facts, so recovery and interrupted-output replay keep working;
+    /// only the per-call request snapshot goes away, which is an audit fact and the largest
+    /// payload the journal writes.
+    pub fn record_model_requests(mut self, enabled: bool) -> Self {
+        self.record_model_requests = enabled;
         self
     }
 
@@ -2139,7 +2174,11 @@ impl HarnessAgentBuilder {
                     agent_builder = agent_builder
                         .session_log_agent_id(agent_id.clone())
                         .session_log_store(Arc::clone(store))
-                        .session_history_mode(SessionHistoryMode::EventLog);
+                        .session_history_mode(SessionHistoryMode::EventLog)
+                        // The recorder this agent opens itself honours the same policy as the
+                        // one the session scheduler opens, so `record_model_requests` means the
+                        // same thing on both paths.
+                        .recording_policy(recording_policy_for(self.record_model_requests));
                 }
                 None => {
                     agent_builder = agent_builder.session_history_mode(SessionHistoryMode::Legacy);
@@ -2194,6 +2233,7 @@ impl HarnessAgentBuilder {
             plan_mode_manager,
             memory_config,
             path_normalizer,
+            record_model_requests: self.record_model_requests,
             skill_repositories: ordered_skill_repos,
             skill_promoter: pending_skill_promoter,
             skill_usage_store: pending_skill_usage_store,

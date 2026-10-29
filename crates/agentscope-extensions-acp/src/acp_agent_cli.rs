@@ -21,8 +21,9 @@
 //!   /models            — list available models (from ~/.agentscope/models.json)
 //!   /quit | /exit      — exit
 
-// Same allocator rationale as `acp_harness_agent`: this CLI relays large streaming payloads
-// from the agent subprocess and benefits from a prompt that returns peak memory to the OS.
+// Same allocator rationale as `acp_harness_agent`: a prompt allocator that returns peak memory to
+// the OS is worth it on Linux/glibc, while the Windows CRT already does it (see that file).
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -934,8 +935,12 @@ async fn run_repl(session: &mut ActiveSession<'static, Agent>) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    agentscope_extensions_acp::mem::runtime().block_on(run())
+}
+
+async fn run() -> Result<()> {
+    agentscope_extensions_acp::retention::apply_session_defaults();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

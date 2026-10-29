@@ -40,12 +40,36 @@ use super::support::ClientSupport;
 const AGENT_NAME: &str = "agentscope-coding-agent";
 const AGENT_VERSION: &str = "0.1.0";
 
+/// How many per-`cwd` index agents stay cached. Each one is a full `HarnessAgent`.
+const MAX_CATALOG_AGENTS: usize = 4;
+
 /// Default model id used when `CODING_MODEL_ID` is not set.
 const DEFAULT_MODEL_ID: &str = "gpt-4o";
 
-/// Context window the ACP agents compact against: conversation compaction triggers once the
-/// accumulated context reaches this many tokens.
+/// Default context window the ACP agents compact against.
+///
+/// Deliberately **independent of the selected model's window**: a model that advertises a
+/// 1M-token window (the measured case: `opencode-go/deepseek-v4.1-flash`) would otherwise
+/// push the trigger to ~878k tokens, so the conversation would be re-sent for hundreds of
+/// thousands of tokens before anything is summarized. Override with
+/// `AGENTSCOPE_ACP_COMPACTION_WINDOW` (tokens; `0`/unset keeps the default).
 pub const ACP_CONTEXT_WINDOW_TOKENS: usize = 256_000;
+
+/// The window the conversation compactor sizes itself against.
+pub fn compaction_window_tokens() -> usize {
+    parse_compaction_window(std::env::var("AGENTSCOPE_ACP_COMPACTION_WINDOW").ok().as_deref())
+}
+
+/// Parses the `AGENTSCOPE_ACP_COMPACTION_WINDOW` override.
+///
+/// Anything unusable (unset, non-numeric, `0`) falls back to the default so a typo cannot
+/// silently disable compaction.
+fn parse_compaction_window(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(ACP_CONTEXT_WINDOW_TOKENS)
+}
 
 /// Builds an [`OpenAiChatModel`] from the environment (mirrors Java `CodingAgentFactory`).
 ///
@@ -67,12 +91,9 @@ fn build_env_model() -> Arc<dyn Model> {
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
 fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model = build_env_model();
-    let window = model.context_window_size();
-    let trigger = trigger_for_window(if window > 0 {
-        window
-    } else {
-        ACP_CONTEXT_WINDOW_TOKENS
-    });
+    // The trigger comes from the ACP's own window attribute, never from the model's
+    // advertised window (see `ACP_CONTEXT_WINDOW_TOKENS`).
+    let trigger = trigger_for_window(compaction_window_tokens());
     let workspace = cwd.join(".agentscope").join("workspace");
     HarnessAgent::builder()
         .name("agentscope-coding-agent")
@@ -88,6 +109,8 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
                 .build(),
         )
         .max_iters(50)
+        // `request/prepared` 默认不记（恢复不依赖它）；`AGENTSCOPE_ACP_RECORD_MODEL_REQUESTS=1` 恢复。
+        .record_model_requests(crate::recording::record_model_requests())
         // 同 ACP 主路径：中断/崩溃后把悬挂的 tool_use 补成 error result。
         .enable_pending_tool_recovery(true)
         // 与 ACP 主路径一致：开启任务投影，交给上下文编译器产出 `<TASK_STATE>` 与 manifest。
@@ -145,6 +168,15 @@ pub struct AcpCodingAgent {
     /// Agents built only to read the durable session index per `cwd`, so
     /// `session/list` does not rebuild one on every call.
     catalog_agents: Mutex<HashMap<PathBuf, Arc<HarnessAgent>>>,
+}
+
+/// Picks which cached catalog agent to drop when the map is full: any entry other than the one
+/// being inserted. Insertion order carries no meaning here — the bound is what matters.
+fn catalog_eviction<'a>(
+    keys: impl Iterator<Item = &'a PathBuf>,
+    cwd: &std::path::Path,
+) -> Option<&'a PathBuf> {
+    keys.into_iter().find(|key| key.as_path() != cwd)
 }
 
 impl AcpCodingAgent {
@@ -446,10 +478,18 @@ impl AcpCodingAgent {
             }),
             None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
         });
-        self.catalog_agents
+        // Each cached catalog agent is a full `HarnessAgent`, so the map is bounded: a client
+        // that lists sessions in many directories must not accumulate one agent per directory.
+        let mut guard = self
+            .catalog_agents
             .lock()
-            .unwrap()
-            .insert(cwd.to_path_buf(), Arc::clone(&agent));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.len() >= MAX_CATALOG_AGENTS {
+            if let Some(stale) = catalog_eviction(guard.keys(), cwd).cloned() {
+                guard.remove(&stale);
+            }
+        }
+        guard.insert(cwd.to_path_buf(), Arc::clone(&agent));
         agent
     }
 
@@ -1017,6 +1057,50 @@ mod tests {
             Some(at) => info.updated_at(at),
             None => info,
         }
+    }
+
+    #[test]
+    fn the_compaction_window_is_its_own_attribute_not_the_model_window() {
+        // The window a 1M-token model advertises must not set the compaction trigger: the
+        // conversation would grow past ~878k tokens before anything is summarized.
+        assert_eq!(
+            super::parse_compaction_window(None),
+            super::ACP_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            super::parse_compaction_window(Some(" 300000 ")),
+            300_000
+        );
+        // A typo or a zero must not silently disable compaction.
+        assert_eq!(
+            super::parse_compaction_window(Some("0")),
+            super::ACP_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            super::parse_compaction_window(Some("256k")),
+            super::ACP_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[test]
+    fn the_catalog_cache_drops_another_directory_when_it_is_full() {
+        // Each cached catalog agent is a whole `HarnessAgent`; without a bound, listing sessions
+        // in many directories would keep one agent alive per directory.
+        let keys = vec![
+            std::path::PathBuf::from("/a"),
+            std::path::PathBuf::from("/b"),
+        ];
+        let cwd = std::path::PathBuf::from("/c");
+        let stale = super::catalog_eviction(keys.iter(), &cwd).expect("an eviction candidate");
+        assert_ne!(stale.as_path(), cwd.as_path());
+        assert!(keys.contains(stale));
+    }
+
+    #[test]
+    fn the_catalog_cache_keeps_the_only_entry_being_replaced() {
+        let keys = vec![std::path::PathBuf::from("/a")];
+        let cwd = std::path::PathBuf::from("/a");
+        assert!(super::catalog_eviction(keys.iter(), &cwd).is_none());
     }
 
     #[test]

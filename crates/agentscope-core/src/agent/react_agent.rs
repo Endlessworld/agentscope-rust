@@ -134,6 +134,16 @@ struct AgentCore {
     /// Exactly one history authority: state store (legacy) or native event log.
     /// Mirrors Java `ReActAgent.sessionHistoryMode` (default `EVENT_LOG`).
     session_history_mode: SessionHistoryMode,
+    /// What a recorder this agent opens itself journals per model call.
+    recording_policy: crate::session::RecordingPolicy,
+    /// Tool-result metadata keys that exist only for the event stream.
+    ///
+    /// A transport may attach render-only payload to a result (for example the ACP file
+    /// diffs, which carry the whole old/new file content). Such keys are delivered on the
+    /// `ToolResultEnd` event and then dropped, so the archived message — and therefore the
+    /// journal, every checkpoint and every later request — does not keep a second copy of
+    /// data the client already rendered.
+    event_only_tool_metadata: Vec<String>,
 }
 
 /// RAII guard that finalizes a call's run when the call's future goes away.
@@ -758,8 +768,15 @@ impl ReActAgent {
         let exporter = sink.map(|handle| {
             Arc::new(handle.exporter_for_session(Arc::clone(&log), key.session_id.clone()))
         });
-        let recorder =
-            Arc::new(SessionRecorder::open_with_exporter(log, turn_id.as_deref(), exporter).await?);
+        let recorder = Arc::new(
+            SessionRecorder::open_with_exporter_and_policy(
+                log,
+                turn_id.as_deref(),
+                exporter,
+                self.core.recording_policy,
+            )
+            .await?,
+        );
         extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
         Ok(Some(recorder))
     }
@@ -1242,6 +1259,8 @@ pub struct ReActAgentBuilder {
     session_log_store: Option<Arc<dyn SessionLogStore>>,
     session_log_agent_id: Option<String>,
     session_history_mode: SessionHistoryMode,
+    recording_policy: crate::session::RecordingPolicy,
+    event_only_tool_metadata: Vec<String>,
 }
 
 impl Default for ReActAgentBuilder {
@@ -1265,6 +1284,8 @@ impl Default for ReActAgentBuilder {
             session_log_store: None,
             session_log_agent_id: None,
             session_history_mode: SessionHistoryMode::EventLog,
+            recording_policy: crate::session::RecordingPolicy::default(),
+            event_only_tool_metadata: Vec::new(),
         }
     }
 }
@@ -1395,6 +1416,26 @@ impl ReActAgentBuilder {
         self
     }
 
+    /// Sets what a recorder this agent opens itself journals per model call.
+    ///
+    /// Hosts that attach a recorder through the runtime context (the session scheduler) set
+    /// this on their own recorder instead; the policy must match on both paths so the switch
+    /// means one thing.
+    pub fn recording_policy(mut self, policy: crate::session::RecordingPolicy) -> Self {
+        self.recording_policy = policy;
+        self
+    }
+
+    /// Declares tool-result metadata keys that are delivered on the event stream only.
+    ///
+    /// The transport reads them from `ToolResultEnd`; archiving them would keep a second
+    /// copy of what the client already rendered (a file diff can be hundreds of kilobytes
+    /// per call) in the context, the journal and every checkpoint.
+    pub fn event_only_tool_metadata(mut self, keys: Vec<String>) -> Self {
+        self.event_only_tool_metadata = keys;
+        self
+    }
+
     /// Builds the [`ReActAgent`].
     pub fn build(self) -> Result<ReActAgent> {
         let model = self
@@ -1451,6 +1492,8 @@ impl ReActAgentBuilder {
             // Java: `builder.sessionLogAgentId == null ? getName() : builder.sessionLogAgentId`.
             session_log_agent_id: self.session_log_agent_id.unwrap_or_else(|| name.clone()),
             session_history_mode: self.session_history_mode,
+            recording_policy: self.recording_policy,
+            event_only_tool_metadata: self.event_only_tool_metadata,
         });
         Ok(ReActAgent {
             id,
@@ -1920,7 +1963,7 @@ async fn reasoning_phase(
     // without this handoff an overflow compaction would summarize — and then durably
     // replace — a history that is missing this step's guidance. Only `context` is handed
     // over; the rest of the shared state already carries the loop's snapshot.
-    let published_context = publish_context(core, state);
+    publish_context(core, state);
 
     // Java prepends a fresh copy of the frozen `CallExecution.systemMsg` to every
     // reasoning request. The conversation state itself remains system-free.
@@ -1964,7 +2007,7 @@ async fn reasoning_phase(
         Err(e) => {
             // A budget-overflow compaction may have rewritten the shared history before the
             // model call failed; keep that reduction instead of restoring the oversized clone.
-            adopt_published_context(core, state, &published_context);
+            adopt_published_context(core, state);
             // Keep the assistant message the model had already produced when the
             // call was interrupted, so the interrupted turn can reconcile its
             // dangling tool_use blocks instead of losing the response entirely
@@ -1982,7 +2025,7 @@ async fn reasoning_phase(
     // history *during* the model call. This loop runs on a private state clone, so take the
     // middleware's rewrite back before appending the assistant message; otherwise the next
     // iteration would publish the old oversized history back and compaction would be undone.
-    adopt_published_context(core, state, &published_context);
+    adopt_published_context(core, state);
     let mut final_msg = final_msg;
     // Tag the usage with the model that reported it. Token accounting anchors on this
     // number, and a model switch changes the tokenizer, so a mismatch must invalidate it.
@@ -1997,29 +2040,28 @@ async fn reasoning_phase(
     Ok(final_msg)
 }
 
-/// Hands the loop's conversation to the shared state and returns what was published.
+/// Hands the loop's conversation to the shared state.
 ///
 /// The shared state is the handle `RuntimeContext` exposes to middlewares. The loop runs
 /// on a private clone, so without this handoff a middleware that reads `ctx.state.context()`
 /// (overflow compaction) would see a history missing anything appended after the turn
 /// snapshot — accepted guidance, for instance. Only the conversation is handed over: task,
 /// plan-mode and permission state belong to the tools and are not overwritten here.
-fn publish_context(core: &Arc<AgentCore>, state: &AgentState) -> Vec<Msg> {
-    let context = state.context().to_vec();
-    core.state.lock().unwrap().context = context.clone();
-    context
+fn publish_context(core: &Arc<AgentCore>, state: &AgentState) {
+    core.state.lock().unwrap().context = state.context().to_vec();
 }
 
 /// Takes back a conversation rewrite a middleware made during the model call.
 ///
-/// The loop publishes its context right before the call and compares it afterwards, so any
-/// difference is a middleware rewrite (overflow compaction, proactive compaction). Adopting
-/// it keeps the next iteration and the next turn on the compacted history instead of
-/// republishing the oversized one. `published` is exactly what the middlewares were handed;
-/// an unchanged context leaves the loop's clone untouched.
-fn adopt_published_context(core: &Arc<AgentCore>, state: &mut AgentState, published: &[Msg]) {
+/// The loop publishes its context right before the call, so any difference between the
+/// shared state and the loop's own (untouched during the call) copy is a middleware rewrite
+/// (overflow compaction, proactive compaction). Adopting it keeps the next iteration and the
+/// next turn on the compacted history instead of republishing the oversized one. Comparing
+/// against the loop's copy avoids holding a third copy of the whole conversation per call;
+/// an unchanged context leaves the loop's copy untouched.
+fn adopt_published_context(core: &Arc<AgentCore>, state: &mut AgentState) {
     let shared = core.state.lock().unwrap();
-    if shared.context() != published {
+    if shared.context() != state.context() {
         state.context = shared.context().to_vec();
         if !shared.summary().is_empty() {
             state.set_summary(shared.summary().to_string());
@@ -3255,8 +3297,9 @@ async fn run_acting_calls(
                         let suspend_reason = rb.suspend_reason().map(str::to_string);
                         let final_state = rb.final_state();
                         let metadata = rb.metadata.clone();
-                        let bound = bind_result(call, rb);
+                        let mut bound = bind_result(call, rb);
                         let rd = is_return_direct_result(run.core, &bound);
+                        strip_event_only_metadata(run.core, &mut bound);
                         results.record(bound, rd);
                         if was_suspended {
                             emit_require_external_execution(
@@ -3357,8 +3400,9 @@ async fn run_acting_calls(
                                 let suspend_reason = rb.suspend_reason().map(str::to_string);
                                 let final_state = rb.final_state();
                                 let metadata = rb.metadata.clone();
-                                let bound = bind_result(effective_call, rb);
+                                let mut bound = bind_result(effective_call, rb);
                                 let rd = is_return_direct_result(run.core, &bound);
+                                strip_event_only_metadata(run.core, &mut bound);
                                 results.record(bound, rd);
                                 if was_suspended {
                                     emit_require_external_execution(
@@ -3510,8 +3554,9 @@ async fn run_parallel_batch(
     for outcome in outcomes {
         match outcome {
             Ok((call, rb)) => {
-                let bound = bind_result(call, rb);
+                let mut bound = bind_result(call, rb);
                 let return_direct = is_return_direct_result(run.core, &bound);
+                strip_event_only_metadata(run.core, &mut bound);
                 results.record(bound, return_direct);
             }
             Err((call, error, message)) => {
@@ -3906,6 +3951,21 @@ fn bind_result(call: &ToolUseBlock, rb: ToolResultBlock) -> ToolResultBlock {
         output: rb.output,
         metadata: rb.metadata,
         state,
+    }
+}
+
+/// Drops metadata that exists only for the event stream before a result is archived.
+///
+/// The `ToolResultEnd` event is built from its own copy of the metadata, so the transport
+/// still receives it; what is dropped here is the *archived* copy. That keeps a
+/// client-render payload (a whole old/new file diff, say) out of the context, the journal
+/// and every later checkpoint.
+fn strip_event_only_metadata(core: &AgentCore, bound: &mut ToolResultBlock) {
+    if core.event_only_tool_metadata.is_empty() || bound.metadata.is_empty() {
+        return;
+    }
+    for key in &core.event_only_tool_metadata {
+        bound.metadata.remove(key);
     }
 }
 
@@ -5379,6 +5439,91 @@ mod tests {
             event.data().fields.get("state"),
             Some(&serde_json::json!("INTERRUPTED")),
             "the emitted event must not downgrade an interrupt to ERROR"
+        );
+    }
+
+    /// A tool that answers with render-only metadata, like the filesystem tools whose
+    /// `acp_diffs` carry a whole old/new file pair for the client to render.
+    struct DiffTool;
+
+    #[async_trait]
+    impl Tool for DiffTool {
+        fn name(&self) -> &str {
+            "diff_write"
+        }
+        fn description(&self) -> &str {
+            "writes a file and reports the diff"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _args: JsonMap,
+            _ctx: ToolExecutionContext,
+        ) -> Result<ToolResultBlock> {
+            let mut result = ToolResultBlock::text("written");
+            result.metadata.insert(
+                "acp_diffs".to_string(),
+                serde_json::json!([{"path": "a.txt", "old_text": "old", "new_text": "new"}]),
+            );
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn render_only_metadata_reaches_the_event_but_not_the_archived_history() {
+        // The ACP client renders file diffs from the tool-result event, and a provider
+        // request never reads tool-result metadata. Keeping the same bytes in the archived
+        // message would put a second copy of every edited file into the context, the journal
+        // and every checkpoint (95% of a 9 MB state in production).
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(DiffTool));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "diff_write", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-event-only-metadata")
+            .model(model)
+            .toolkit(toolkit)
+            .event_only_tool_metadata(vec!["acp_diffs".to_string()])
+            .build()
+            .unwrap();
+
+        let mut stream = agent.stream_events(
+            vec![Msg::user("write a.txt")],
+            crate::agent::stream_options::StreamOptions::defaults(),
+        );
+        let mut carried = false;
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if event.event_type() == AgentEventType::ToolResultEnd {
+                carried = event
+                    .data()
+                    .fields
+                    .get("metadata")
+                    .is_some_and(|metadata| metadata.get("acp_diffs").is_some());
+            }
+        }
+        assert!(
+            carried,
+            "the tool-result event must still carry the diff for the client"
+        );
+
+        let archived = agent.core.state.lock().unwrap().context().to_vec();
+        let tool_result = archived
+            .iter()
+            .flat_map(Msg::tool_result_blocks)
+            .find(|block| block.name.as_deref() == Some("diff_write"))
+            .expect("the tool result is archived");
+        assert!(
+            !tool_result.metadata.contains_key("acp_diffs"),
+            "the archived copy must not keep the render-only payload, kept {:?}",
+            tool_result.metadata.keys().collect::<Vec<_>>()
         );
     }
 

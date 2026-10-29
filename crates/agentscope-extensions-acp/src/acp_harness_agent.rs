@@ -86,9 +86,13 @@
 //! - `OPENAI_API_KEY`   — 覆盖 provider.api_key
 //! - `OPENAI_BASE_URL`  — 覆盖 provider.base_url
 
-// The session journal serializes a full `stateJson` per checkpoint (megabyte scale); the
-// default allocator keeps that peak resident after the burst. mimalloc returns it to the OS.
-// Installing it here -- the binary's crate root -- leaves every library consumer untouched.
+// The session journal serializes a full `stateJson` per checkpoint (megabyte scale). On
+// Linux/glibc the default allocator keeps that peak in its arena, so mimalloc (which returns it)
+// is worth installing. On Windows the CRT already `VirtualFree`s large blocks on `free`, and
+// mimalloc made the same workload *worse* -- one heap per thread, purged on a 1 s timer: measured
+// 54 MB peak RSS across 32 threads versus 4.6 MB with the system allocator. So it stays a unix
+// choice. Installing it here -- the binary's crate root -- leaves every library consumer untouched.
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -101,7 +105,7 @@ use agentscope_core::model::catalog::CatalogAwareModel;
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
 use agentscope_core::model::{GenerateOptions, Model};
 use agentscope_extensions_acp::config::ModelChoice;
-use agentscope_extensions_acp::ACP_CONTEXT_WINDOW_TOKENS;
+use agentscope_extensions_acp::compaction_window_tokens;
 use agentscope_extensions_acp::{config::default_modes, AcpAgentSession, AcpCodingAgent};
 use agentscope_extensions_acp::{AskUserTool, SessionBuild};
 use agentscope_extensions_model::{AnthropicMessagesModel, OpenAiChatModel, OpenAiResponsesModel};
@@ -963,18 +967,28 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
     let model: Arc<dyn Model> = build_model(&model_id, &base_url, &api_key, protocol, session_id);
     let context_window = model.context_window_size();
-    // The compactor counts conversation history only; the compiled request also carries
-    // the system prompt and tool schemas. Derive the trigger from the *input allowance*
-    // (and leave headroom for that fixed overhead), otherwise compaction fires only after
-    // the budget is already exhausted.
-    let compaction_trigger = if context_window > 0 {
-        trigger_for_window(context_window)
-    } else {
-        trigger_for_window(ACP_CONTEXT_WINDOW_TOKENS)
-    };
+    // 压缩阈值**不跟随所选模型的窗口**：1M 窗口的模型会把触发点推到 ~880k tokens，对话会在毫无
+    // 收缩的情况下被反复重发。改用 ACP 自己的窗口属性（默认 256k，`AGENTSCOPE_ACP_COMPACTION_WINDOW`
+    // 覆盖）；模型窗口仅用于下面工具结果外置的规模缩放。
+    let compaction_trigger = trigger_for_window(compaction_window_tokens());
     // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
     // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
     let resolver_session = session_id.to_string();
+
+    // 工具结果外置的阈值与豁免：Rust 的 read_file / grep / glob / list 返回的是完整内容
+    // （工具本身不会分页截断），若继续按默认豁免，一次大文件读取就会永久驻留在 context、
+    // checkpoint 和后续每轮请求里。因此它们也参与外置，context 只保留 head+tail 预览 +
+    // 落盘路径；write_file / edit_file / memory_* 这类小输出仍保持豁免。
+    let mut eviction = ToolResultEvictionConfig::defaults().scaled_for_window(context_window);
+    for tool in [
+        "read_file",
+        "grep_files",
+        "glob_files",
+        "list_files",
+        "session_search",
+    ] {
+        eviction.excluded_tool_names.remove(tool);
+    }
 
     let workspace = cwd.join(".agentscope").join("workspace");
     let mut builder = HarnessAgent::builder()
@@ -1031,10 +1045,12 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         )
         // 工具结果外置：超过 80k 字符的工具输出（如构建日志）写入磁盘，
         // context 只保留预览占位符，避免大输出驻留内存。
-        .tool_result_eviction(
-            ToolResultEvictionConfig::defaults().scaled_for_window(context_window),
-        )
+        .tool_result_eviction(eviction)
         .max_iters(9999)
+        // `request/prepared` 携带完整请求体，恢复路径不读它（恢复依赖 `state/checkpoint` +
+        // `model/dispatch`），因此默认关闭以省内存/磁盘；
+        // `AGENTSCOPE_ACP_RECORD_MODEL_REQUESTS=1` 可随时恢复完整记录，行为与旧版一致。
+        .record_model_requests(agentscope_extensions_acp::recording::record_model_requests())
         // 被中断/崩溃打断后，把悬挂的 tool_use 补成 error result 再续跑，避免
         // ToolCallPairSanitizer 静默丢弃整条 assistant 消息（对齐 Java maybePatchPendingToolCalls）。
         .enable_pending_tool_recovery(true);
@@ -1122,8 +1138,14 @@ fn init_logging() {
     tracing::info!("logging to {}", log_file.display());
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Worker count is a knobs, not `ncpu`: this agent serves one conversation, and every extra
+    // thread also costs a mimalloc heap that keeps its own freed pages resident.
+    agentscope_extensions_acp::mem::runtime().block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    agentscope_extensions_acp::retention::apply_session_defaults();
     init_logging();
     agentscope_core::model::catalog::ModelCatalog::global().spawn_background_refresh();
 
@@ -1196,7 +1218,9 @@ fn spawn_catalog_forwarder(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>
             if event.changed_keys.is_empty() {
                 continue;
             }
-            let guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for session in guard.values() {
                 let relevant = session
                     .selected_catalog_key()
@@ -1257,7 +1281,9 @@ async fn drain_sessions(sessions: &Arc<Mutex<HashMap<String, AcpAgentSession>>>,
     // set by the prompt itself, so it is authoritative even when the shutdown count is
     // zero (the ACP path must also register with `ExecutionGuard`).
     let live: Vec<AcpAgentSession> = {
-        let guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.values().cloned().collect()
     };
     if live.is_empty() {
