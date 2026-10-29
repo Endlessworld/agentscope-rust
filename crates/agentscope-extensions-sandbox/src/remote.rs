@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::{
-    ExecResult, Sandbox, SandboxClient, SandboxClientOptions, SandboxSnapshot, SandboxSnapshotSpec,
-    SandboxState, WorkspaceSpec,
+    ExecResult, RemoteSandboxState, Sandbox, SandboxClient, SandboxClientOptions, SandboxSnapshot,
+    SandboxSnapshotRef, SandboxSnapshotSpec, SandboxState, WorkspaceSpec,
 };
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
@@ -125,6 +125,9 @@ pub struct RemoteSandboxStateData {
     pub extra: BTreeMap<String, String>,
     /// Workspace specification used to (re)build the remote workspace.
     pub workspace_spec: Option<WorkspaceSpec>,
+    /// Snapshot the workspace was persisted as (identity only — the client is re-bound by the
+    /// snapshot spec on resume, mirroring Java `RemoteSandboxSnapshot`'s `@JsonIgnore` client).
+    pub snapshot: Option<SandboxSnapshotRef>,
 }
 
 impl RemoteSandboxStateData {
@@ -159,35 +162,18 @@ impl RemoteSandboxStateData {
                 Err(e) => tracing::warn!("sandbox: failed to serialize workspace spec: {e}"),
             }
         }
-        // The harness `state` module is private and does not re-export `RemoteSandboxState`, so the
-        // `Remote` variant payload cannot be named directly. Reconstruct it through serde against
-        // the enum's `tag = "type"` representation. (Recorded as a harness gap in tracker 4.2.)
-        let value = serde_json::json!({
-            "type": "Remote",
-            "session_id": self.session_id,
-            "endpoint": self.endpoint,
-            "token": self.token,
-            "workspace_root_ready": self.workspace_root_ready,
-            "workspace_projection_hash": self.workspace_projection_hash,
-            "metadata": metadata,
-        });
-        match serde_json::from_value::<SandboxState>(value) {
-            Ok(state) => state,
-            Err(e) => {
-                // Should be unreachable: the shape below mirrors `RemoteSandboxState` exactly.
-                tracing::error!("sandbox: failed to build Remote state ({e}); using minimal state");
-                serde_json::from_value(serde_json::json!({
-                    "type": "Remote",
-                    "session_id": self.session_id,
-                    "endpoint": self.endpoint,
-                    "token": self.token,
-                    "workspace_root_ready": self.workspace_root_ready,
-                    "workspace_projection_hash": self.workspace_projection_hash,
-                    "metadata": {}
-                }))
-                .expect("minimal remote state is always valid")
-            }
-        }
+        // `RemoteSandboxState` is now exported by the harness, so the projection is a direct
+        // struct construction (it used to go through a JSON round-trip and could not carry the
+        // snapshot identity).
+        SandboxState::Remote(RemoteSandboxState {
+            session_id: self.session_id.clone(),
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            workspace_root_ready: self.workspace_root_ready,
+            workspace_projection_hash: self.workspace_projection_hash.clone(),
+            metadata,
+            snapshot: self.snapshot.clone(),
+        })
     }
 
     /// Reconstructs typed state from a harness [`SandboxState`].
@@ -239,6 +225,7 @@ impl RemoteSandboxStateData {
             workspace_projection_hash: remote.workspace_projection_hash.clone(),
             extra,
             workspace_spec,
+            snapshot: remote.snapshot.clone(),
         })
     }
 }
@@ -738,6 +725,11 @@ impl SandboxClient for RemoteSandboxClient {
             workspace_projection_hash: None,
             extra: BTreeMap::new(),
             workspace_spec: Some(workspace_spec.clone()),
+            // Record the identity so a persisted state can be cascaded back to the snapshot
+            // (MONGODB `cascadeDeleteSnapshots` reads exactly this field).
+            snapshot: snapshot
+                .as_ref()
+                .map(|s| SandboxSnapshotRef::from_snapshot(s.as_ref())),
         };
         Ok(Box::new(RemoteSandbox::new(
             self.backend.clone(),
@@ -789,6 +781,7 @@ mod tests {
             workspace_projection_hash: Some("abc".to_string()),
             extra,
             workspace_spec: Some(WorkspaceSpec::new("/home/user").with_file("a.txt", "hi")),
+            snapshot: None,
         }
     }
 
@@ -992,6 +985,53 @@ mod tests {
         let recorded = backend.commands.lock().unwrap().clone();
         assert!(recorded.iter().any(|c| c.contains("mkdir -p /workspace")));
         assert!(recorded.iter().any(|c| c.contains("echo hi")));
+    }
+
+    #[tokio::test]
+    async fn create_records_snapshot_identity_in_state() {
+        #[derive(Debug)]
+        struct FakeRemoteSnapshotClient;
+
+        #[async_trait::async_trait]
+        impl agentscope_harness::agent::sandbox::RemoteSnapshotClient for FakeRemoteSnapshotClient {
+            async fn upload(&self, _snapshot_id: &str, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            async fn download(&self, _snapshot_id: &str) -> Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            async fn exists(&self, _snapshot_id: &str) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+        });
+        let client = RemoteSandboxClient::new(backend).with_snapshot_spec(Arc::new(
+            agentscope_harness::agent::sandbox::RemoteSnapshotSpec::new(Arc::new(
+                FakeRemoteSnapshotClient,
+            )),
+        ));
+        let spec = WorkspaceSpec::new("/workspace");
+        let sandbox = client.create(&spec, None, None).await.unwrap();
+
+        let state = sandbox.state();
+        let snapshot_id = match state.snapshot() {
+            Some(SandboxSnapshotRef::Remote { id }) => id.clone(),
+            other => panic!("expected a remote snapshot ref, got {other:?}"),
+        };
+        assert_eq!(snapshot_id, state.session_id());
+
+        // The typed carrier round-trips the identity, so a persisted state keeps it.
+        let data = RemoteSandboxStateData::from_harness_state(&state).unwrap();
+        assert_eq!(data.snapshot, state.snapshot().cloned());
+        assert_eq!(
+            data.to_harness_state().snapshot(),
+            state.snapshot().cloned().as_ref()
+        );
     }
 
     #[tokio::test]

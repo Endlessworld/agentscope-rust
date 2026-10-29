@@ -2335,6 +2335,7 @@ mod tests {
             workspace_projection_hash: None,
             extra: handle.extra.clone(),
             workspace_spec: None,
+            snapshot: None,
         };
         assert_eq!(data.to_harness_state().session_id(), "sess-1");
     }
