@@ -1,9 +1,22 @@
 //! agentscope-extensions-jdbc — multi-database JDBC dialect abstraction for
 //! AgentScope Rust, mirroring `io.agentscope.extensions.jdbc`.
 //!
-//! Replaces the deprecated `agentscope-extensions-mysql` and
-//! `agentscope-extensions-postgresql` modules with a single module that supports MySQL,
-//! PostgreSQL, H2, and SQLite through one aggregated [`dialect::AbstractJdbcDialect`].
+//! One aggregated [`dialect::AbstractJdbcDialect`] serves four vendor dialects — MySQL,
+//! PostgreSQL, H2-style ANSI and SQLite — so every component below is database-agnostic and free
+//! of inline SQL.
+//!
+//! # Execution backends
+//!
+//! Only [`backend::RusqliteExecutor`] (SQLite, including in-memory) ships with this crate; the
+//! MySQL / PostgreSQL / H2 dialects have **no bundled executor**. `agentscope-extensions-mysql`
+//! and `-postgresql` still exist as independent crates (they are *not* replaced by this one), and
+//! neither provides an [`backend::JdbcExecutor`]. To run these components against a real server,
+//! the driver crate or the host must supply an executor, which **must** override:
+//! * [`backend::JdbcExecutor::in_transaction`] — the default is non-transactional, and
+//!   [`skill`] writes two tables inside one transaction;
+//! * [`backend::JdbcExecutor::open_native_lock_session`] — server-scoped advisory locks
+//!   (`GET_LOCK` / `pg_try_advisory_lock`) need a dedicated session per lease, which the shared
+//!   handle cannot express.
 //!
 //! # Architecture
 //!
@@ -37,9 +50,9 @@
 //! # Execution backend
 //!
 //! Java components take a `javax.sql.DataSource`. Rust has no universal JDBC surface, so
-//! components depend on the [`backend::JdbcExecutor`] trait. The default concrete backend
-//! is [`backend::RusqliteExecutor`] (SQLite, including in-memory), which mirrors the Java
-//! H2/SQLite test backends.
+//! components depend on the [`backend::JdbcExecutor`] trait. The only backend shipped here is
+//! [`backend::RusqliteExecutor`] (SQLite, including in-memory), which mirrors the Java H2/SQLite
+//! test backends; see "Execution backends" above for what a MySQL/PostgreSQL executor owes.
 
 pub mod backend;
 pub mod dialect;

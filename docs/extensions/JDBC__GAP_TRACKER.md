@@ -18,7 +18,7 @@
 | Java 规模（实测，2026-10-22 静态复核） | 主代码 **5265 非空行 / 5731 物理行**（24 个 `.java`）/ 测试 **4406 非空行 / 4907 物理行**（19 个 `.java`；**175** 个 `@Test` + **5** 个 `@ParameterizedTest`（执行次数远多于 5），`H2TestSupport` 为支撑类无 `@Test`）。**注**：Java 侧含 `skill` 包（3 个主类 1313 非空行 / 4 个测试类 37 个 `@Test`），Rust 侧**完全缺失**，见 §3.5 |
 | Rust crate | `crates/agentscope-extensions-jdbc` |
 | 迁移波次 | B |
-| 当前状态 | **总判：进行中**（仍有 P1：驱动 executor / in_transaction / 集成测试）—— **基本完成**（2026-10-28 实测：`cargo build` exit 0；`cargo test` = **217 passed / 0 failed**，含 src 内联 **7** + `tests/` **209**（10 个文件）+ doc-tests **1**；**本轮关闭** P1「原生 advisory lock 端到端接线」+ P2「PG 轮询上移策略层」+ P2「`VersionedState`/`UNVERSIONED` 双份定义」。剩余：环境受限的真实 MySQL/PG 集成测试、`dialect/mod.rs` 文档与 `session_state_check_table_exists` 默认实现两项 P2，见 §3.2/§3.3/§3.5/§4.2） |
+| 当前状态 | **总判：进行中**（2026-10-29 核实后 P1 仅 2 项：缺 MySQL/PG 执行后端、缺真实容器集成测试）—— **基本完成**（2026-10-28 实测：`cargo build` exit 0；`cargo test` = **217 passed / 0 failed**，含 src 内联 **7** + `tests/` **209**（10 个文件）+ doc-tests **1**；**本轮关闭** P1「原生 advisory lock 端到端接线」+ P2「PG 轮询上移策略层」+ P2「`VersionedState`/`UNVERSIONED` 双份定义」。剩余：**P1**「无 MySQL/PG `JdbcExecutor` 实现」+「真实容器集成测试（环境受限）」；**P2**「原生锁缺宿主装配点」、`dialect/mod.rs` 文档失真、`session_state_check_table_exists` 默认实现残留；`in_transaction` 改记为「新增后端前置约束」而非 P1。核实证据与口径见 §9（2026-10-29） |
 
 ### 1.1 基线（开工/完工实测）
 | 项 | 开工基线 | 完工基线 |
@@ -194,7 +194,7 @@
 
 ### 4.2 下一步与阻塞
 1. **测试覆盖缺口**：**P0 缺口未完全关闭**（2026-10-22 静态复核修正）——skill 相关 **37 条 `@Test`** 完全未覆盖（§3.5 P0）；`MysqlIntegrationTest`/`PostgresIntegrationTest`（各 **8** 条 Testcontainers 用例，需 Docker + mysql/pg 驱动，环境受限）；`DialectSqlTests` 中依赖真实 H2 `MERGE INTO` 执行语义的部分。Java 总计 **175 `@Test` + 5 `@ParameterizedTest`**，Rust 侧当前 **166 test**（口径见 §6）。**已完成（2026-10-29 勘误）**：原记「skill 37 条未覆盖 / P0 未关闭 / 166 test」，实际 skill 仓库已于 2026-10-22 落地（`src/skill/repository.rs`）、**P0 已关闭**，`tests/skill_repository_tests.rs` 32 条全绿；真实剩余为 `MysqlIntegrationTest`/`PostgresIntegrationTest`（各 8 条，Docker）与 `DialectBuilderTableGroupsTest` 7 条；实测 **217 passed / 0 failed**（2026-10-28）；依据 §1.1 / §3.1 / §7 / §8.3。
-2. **功能缺口**：① **P1 原生 advisory lock 已接线（2026-10-28）**：`NativeLockSessionProvider` / `SessionScopedLockSession` / `ExecutorNativeLockProvider` / `JdbcExecutor::open_native_lock_session` / `sandbox::NativeLockGuard` + 策略层 `poll_acquire`，见 §3.5 与 §8；剩余仅为「驱动 crate 覆盖 `open_native_lock_session`」这一实现动作（本 crate 禁止引入 `mysql_async`/`tokio-postgres`/`sqlx`）。② **P2 已关闭**：PG 轮询已上移到策略层；`VersionedState`/`UNVERSIONED` 已收敛到 core。③ **P2 仍待办**：`dialect/mod.rs` 文档与 trait 组成不符、`session_state_check_table_exists` 默认实现残留（§3.5）；**P0 skill 仓库已由 2026-10-22 会话完成**（§7），§3.5 旧结论已勘误。
+2. **功能缺口**：① **P1 原生 advisory lock 已接线（2026-10-28）**：`NativeLockSessionProvider` / `SessionScopedLockSession` / `ExecutorNativeLockProvider` / `JdbcExecutor::open_native_lock_session` / `sandbox::NativeLockGuard` + 策略层 `poll_acquire`，见 §3.5 与 §8；剩余仅为「驱动 crate 覆盖 `open_native_lock_session`」这一实现动作（本 crate 禁止引入 `mysql_async`/`tokio-postgres`/`sqlx`）。**2026-10-29 核实**：该动作至今无人做——`rg "NativeLockGuard|ExecutorNativeLockProvider" crates/` 只命中 `tests/native_lock_provider_tests.rs`，生产代码**零调用**，所以「已接线」应读作「seam 已就绪」，端到端仍缺宿主挂载 → **整条降为 P2**（见 §9）。② **P2 已关闭**：PG 轮询已上移到策略层；`VersionedState`/`UNVERSIONED` 已收敛到 core。③ **P2 仍待办**：`dialect/mod.rs` 文档与 trait 组成不符、`session_state_check_table_exists` 默认实现残留（§3.5）；**P0 skill 仓库已由 2026-10-22 会话完成**（§7），§3.5 旧结论已勘误。
 3. **跨模块需求（不改 harness/core）**：(a) harness `DistributedStore` 仅含 `agent_state_store` + `isolation_scope`，本 crate 已在 `JdbcDistributedStore` 内保留全量 4 组件并通过 `to_harness_store()` 输出子集，是否扩展 harness 类型（`EXTENSIONS_GAP_TRACKER.md` §2.2）待裁定；(b) ~~harness `SandboxExecutionGuard` 为具体 struct，本 crate 无法 `impl`（§3.4）~~ → **已完成（2026-10-29 勘误）**：原记「harness guard 为具体 struct 无法接入」，实际 2026-10-28 harness 新增 `SandboxGuard` trait（`agent/sandbox/guard.rs:14`），`JdbcSandboxExecutionGuard` 已 `impl SandboxGuard`（§3.4 / `to_harness_store_fills_every_composite_slot`）；(c) **core `AgentStateStore` 版本化面已裁定并落地**（2026-10-22 静态复核）：core trait 已含 `supports_versioning`/`get_versioned`/`save_if_version` + `VersionedState`/`UNVERSIONED`（`agentscope-core/src/state/store.rs:12,17,68,76,98`），本 crate 的 `impl AgentStateStore` **已覆写这 3 个方法**（`jdbc_agent_state_store.rs:565,569,590`）。**原「需汇总方裁定是否提升为 core trait 方法」的阻塞已解除**；**遗留**：本 crate 仍重复定义了一份同名 `VersionedState`/`UNVERSIONED`，建议收敛到 core 类型（§3.5 P2）。
 4. **设计决定（不迁移）已逐条标记为「已完成（设计决定，不迁移）」于 §3.4**，依据已写明（H2 由 `AnsiDialect` 承担、SPI 自动注册改产品名匹配、`objectMapper` 注入/连接所有权/`close` 随 `DataSource` 消失等）。
 5. 剩余 dead_code helper（2026-10-22 静态复核修正）：**`delete_lock` 有调用方**（`jdbc_guard.rs:94`）；真正无生产调用方的是 `query_optional_int`（`backend/sqlite.rs:163`）、`slot_param`（`jdbc_agent_state_store.rs:630`）、`namespace_param`（`jdbc_store.rs:259`）。
@@ -380,9 +380,10 @@ H2 专属 `SET REFERENTIAL_INTEGRITY`（Rust 用 `PRAGMA foreign_keys` 等价覆
    `skill_content` 还原成资源）。
 2. **生成 id 回查**：`JdbcExecutor` 未暴露 generated-keys，插入后在事务内按
    `(namespace, name)` 回查。UNIQUE 约束保证唯一；若将来支持“改名 upsert”需重新评估。
-3. **事务能力**：新增 `JdbcExecutor::in_transaction`；默认实现仍是非事务（与旧后端兼容）。
-   目前仅 `RusqliteExecutor` 提供真正事务。MySQL/PostgreSQL 若接入真实后端，应覆盖该方法，
-   否则资源插入失败无法回滚 skill 行。
+3. **事务能力（2026-10-29 改口径）**：新增 `JdbcExecutor::in_transaction`，默认实现非事务，
+   目前仅 `RusqliteExecutor` 覆盖为真事务。**这是「新增执行后端的前置约束」而非现存缺陷**：
+   当前只有 SQLite 一种可执行后端且已覆盖，不存在「默认实现被使用」的实际路径；约束对象是
+   将来接入 MySQL/PostgreSQL 的 executor —— 漏覆盖会导致资源插入失败时 skill 行无法回滚。
 4. **schema 缺列不降级**：与 Java 一致，但 task 中“老 schema 无 metadata_json 列时降级”的
    期望未实现——Java 的行为是校验期直接拒绝并给出 ALTER 提示。若需要自动降级需另立需求。
 5. 四家 vendor 的 skill DDL 目前未接入 `AbstractJdbcDialect::create_table_ddls()`（保持既有
@@ -508,3 +509,69 @@ harness `DistributedStore` 新增三个可选复合槽位 + `SandboxGuard` trait
 
 - 无留空槽位。
 - `active_count()` 语义为「本 guard 经 trait 路径持有的租约数」（方言表锁无全局计数），与 Java 的进程内计数口径一致。
+
+---
+
+## 9. 2026-10-29 缺口核实（P1 口径修订）
+
+> 对 §1 总判行列的 3 项 P1 逐条验源码。结论：**2 项真实、1 项被写重了**，另有 1 项应降级。
+> 所有证据均可用文中命令复现。
+
+### 9.1 缺口 1（真实，保持 P1）：无 MySQL/PG 执行后端
+
+```text
+rg "impl JdbcExecutor for" crates/
+  crates/agentscope-extensions-jdbc/src/backend/sqlite.rs:136        <- 唯一真实实现
+  crates/agentscope-extensions-jdbc/tests/state_tests.rs:148          <- 测试 fake
+  crates/agentscope-extensions-jdbc/tests/native_lock_provider_tests.rs:501  <- 测试 fake
+```
+
+且 `crates/agentscope-extensions-mysql/Cargo.toml` 与 `-postgresql/Cargo.toml` **均不依赖本 crate**（无 jdbc 字样），
+即没有任何一方提供 executor。后果：`JdbcStore` / `JdbcAgentStateStore` / `JdbcSnapshotSpec` /
+`JdbcSandboxExecutionGuard` / `JdbcAgentSkillRepository` 在真实 MySQL/PG 上**无可用后端**，仅 SQLite 可跑。
+
+**增量发现（更严重）**：`src/lib.rs:4-7` 宣称本 crate「Replaces the deprecated `agentscope-extensions-mysql` and
+`agentscope-extensions-postgresql` modules … supports MySQL, PostgreSQL, H2, and SQLite」——
+实际上①mysql/postgresql 两个 crate 仍在且各自独立实现（未被取代）；②H2 无后端；③MySQL/PG 无后端。
+该 crate 级文档具有误导性，**已就地修正**。
+
+### 9.2 缺口 2（真实，但由 P1 降为 P2）：原生锁无生产装配点
+
+```text
+rg "NativeLockGuard|ExecutorNativeLockProvider" crates/ -> 仅命中 tests/native_lock_provider_tests.rs
+```
+
+seam（`NativeLockSessionProvider` / `SessionScopedLockSession` / `ExecutorNativeLockProvider`）与策略、便捷入口
+（`NativeLockGuard::from_executor`）均存在，18 条端到端用例也已覆盖，但**生产代码零调用**：
+没有宿主挂载点，且与缺口 1 同根（没有真实 MySQL/PG executor 可包）。
+⇒ 降为 **P2**：「seam 已就绪，缺宿主装配」。
+
+### 9.3 缺口 3（被写重了）：`in_transaction` 不是当前缺陷
+
+`src/backend/mod.rs:178` 默认实现确实非事务，`src/backend/sqlite.rs:196` 已覆盖为真事务。
+但**当前只有 SQLite 一种执行后端且已覆盖**，不存在「默认实现被使用」的实际路径：
+`src/skill/repository.rs:371/443/464` 的「写 skill 行 → 回查 id → 写 resource 行」事务包裹在 SQLite 上已生效。
+⇒ 从 P1 改为「**新增执行后端的前置约束**」（trait 文档已有警告，§7.5-3 已改口径）。
+
+### 9.4 缺口 4（真实，环境受限）：无真实容器集成测试
+
+`crates/agentscope-extensions-jdbc/tests/` 共 10 个文件，全部基于 `RusqliteExecutor::in_memory()`；
+`Cargo.toml` 无 `testcontainers`，测试中 `#[ignore]` **零命中**。Java 侧两个 `*IntegrationTest`（各 8 条）无对应物。
+
+### 9.5 修订后的 JDBC 缺口口径
+
+| 项 | 原口径 | 新口径 | 依据 |
+|---|---|---|---|
+| 无 MySQL/PG executor | P1 | **P1（保持）** | §9.1 |
+| 真实容器集成测试 | P1 | **P1（保持，环境受限）** | §9.4 |
+| 原生锁端到端接线 | P1（称「已接线」） | **P2（seam 就绪，缺宿主挂载）** | §9.2 |
+| `in_transaction` 默认非事务 | P1 | **前置约束（非缺陷）** | §9.3 |
+| `lib.rs` crate 文档失真 | 未记录 | **已修（2026-10-29）** | §9.1 |
+
+### 9.6 建议的收口路径（未实施）
+
+1. 给 `JdbcDistributedStore` 加 `native_lock_guard(flavor)` 便捷入口（把 `ExecutorNativeLockProvider` 包掉），
+   让宿主无需手写 provider —— 仍不需引入驱动依赖；
+2. 执行后端二选一由汇总方裁定：**(a)** 驱动 crate 提供 `impl JdbcExecutor`（推荐，保持本 crate 零驱动依赖）；
+   **(b)** 本 crate 加 `feature = "mysql"` / `"postgres"` 并引入驱动；
+3. 容器集成测试待环境（Docker）就绪后按 Java 两个 `*IntegrationTest` 逐条对齐。

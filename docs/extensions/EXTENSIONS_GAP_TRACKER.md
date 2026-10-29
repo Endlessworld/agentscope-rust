@@ -51,7 +51,7 @@
 | 4 | SANDBOX | 进行中（K8s 文件 API、E2B 原生传输、三连接策略、codec 默认 Json 均已落地） | ~6 / ~5 | 176 |
 | 5 | CHANNEL | **已完成**（代码缺口 0；仅剩真实租户联调，非代码缺口） | 0 / 0 | 399 |
 | 6 | MEM | 进行中（`api_base_url` 校验 / connect 超时 / DTO 单测已补；余吞错口径裁定 + P2 清理） | 3 / ~9 | 96 |
-| 7 | JDBC | 进行中（skill 仓库 + 原生 advisory lock 接线已闭环） | 3 / ~6 | 217 |
+| 7 | JDBC | 进行中（skill 仓库已闭环；**2026-10-29 核实**：原生锁 seam 就绪但生产零调用 → 降 P2；`in_transaction` 改记为「新增后端前置约束」） | 2 / ~7 | 217 |
 | 8 | REDIS | 进行中（`save_if_version(0)` 真 CAS、SCAN 游标用例、`CLUSTER SLOTS` 拓扑扇出已落地） | 1 / 3 | 148 + 2 doc |
 | 9 | MONGODB | 进行中（`ttl_days` / `database_name` 丢弃已修；级联删快照已走真实 harness 写入方，见 §4.15.4） | 1 / ~7 | 82 |
 | 10 | MYSQL | 进行中（列表哈希 / CAS 原子性 / 标识符校验 / 空列表语义已闭环） | 4 / ~6 | 71 |
@@ -862,3 +862,22 @@ async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -
 ### 4.15.6 ⑤ MODEL 双实现取舍（仍待裁定）
 
 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 均为**平行实现**，涉及语义取舍（wire DTO 自建 vs SDK），无代码阻塞，仍建议单独决策；本轮未动。
+
+---
+
+## 4.16 2026-10-29 JDBC 缺口核实（P1 口径修订）
+
+对 JDBC 总判行列的 3 项 P1 逐条验源码（证据与命令见 `JDBC__GAP_TRACKER.md` §9）：
+
+| 项 | 结论 |
+|---|---|
+| 无 MySQL/PG `JdbcExecutor` | **真实，保持 P1**：`impl JdbcExecutor for` 全仓仅 3 处（SQLite + 2 个测试 fake），且 mysql/postgresql 两个 crate 也**不依赖**本 crate → 组件在真实 MySQL/PG 上无可用后端 |
+| 真实容器集成测试 | **真实，保持 P1（环境受限）**：`tests/` 10 个文件全离线，无 `testcontainers`，`#[ignore]` 零命中 |
+| 原生锁端到端接线 | **降为 P2**：seam / 策略 / 18 条用例齐备，但 `NativeLockGuard`/`ExecutorNativeLockProvider` 在**生产代码零调用**（只有测试引用）→ 应读作「seam 已就绪，缺宿主挂载」 |
+| `in_transaction` 默认非事务 | **改记为「新增执行后端的前置约束」**：当前只有 SQLite 一种后端且已覆盖，不存在「默认实现被使用」的实际路径 |
+| `lib.rs` crate 文档 | **已修**：原文称「取代 mysql/postgresql 模块、支持 MySQL/PG/H2/SQLite」，实际两个 crate 仍在且独立、H2/PG/MySQL 均无执行后端 |
+
+⇒ JDBC 剩余 **P1 仅 2 项**（执行后端、容器集成测试），另加 P2「原生锁缺宿主装配点」；总判仍为「进行中」。
+
+验证：`cargo test -p agentscope-extensions-jdbc -j 2` → 217 passed / 0 failed（12 个 test target）；
+`cargo doc -p agentscope-extensions-jdbc --no-deps` EXIT=0（仅 3 处既有 unresolved link 警告，与本轮无关）。
