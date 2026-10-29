@@ -50,6 +50,10 @@ pub struct DockerSandboxState {
     /// Additional metadata.
     pub metadata: std::collections::HashMap<String, String>,
 
+    /// Snapshot the workspace was persisted as, re-bound to a client on resume.
+    #[serde(default)]
+    pub snapshot: Option<SandboxSnapshotRef>,
+
     /// Default for [`DockerSandboxState::container_owned`]: the SDK owns containers it created.
     /// Human-readable container name (`agentscope-sandbox-<sessionId>`).
     #[serde(default)]
@@ -109,6 +113,10 @@ pub struct LocalSandboxState {
 
     /// Additional metadata.
     pub metadata: std::collections::HashMap<String, String>,
+
+    /// Snapshot the workspace was persisted as, re-bound to a client on resume.
+    #[serde(default)]
+    pub snapshot: Option<SandboxSnapshotRef>,
 }
 
 /// Remote sandbox state.
@@ -131,6 +139,51 @@ pub struct RemoteSandboxState {
 
     /// Additional metadata.
     pub metadata: std::collections::HashMap<String, String>,
+
+    /// Snapshot the workspace was persisted as, re-bound to a client on resume.
+    #[serde(default)]
+    pub snapshot: Option<SandboxSnapshotRef>,
+}
+
+/// Serializable identity of a workspace snapshot, persisted inside [`SandboxState`].
+///
+/// Mirrors the JSON shape of the Java `SandboxSnapshot` hierarchy (`type` discriminator plus an
+/// `id`). Only the identity is persisted: the `RemoteSnapshotClient` cannot be serialized and is
+/// re-bound from the builder at resume time, exactly like Java `RemoteSandboxSnapshot` whose
+/// resolved client is `@JsonIgnore`. The local snapshot's `basePath` is likewise not persisted —
+/// the resume spec (`LocalSnapshotSpec`) owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SandboxSnapshotRef {
+    /// Snapshotting disabled.
+    Noop,
+
+    /// Snapshot stored on the local filesystem.
+    Local {
+        /// Snapshot identifier (also the archive file name).
+        id: String,
+    },
+
+    /// Snapshot stored by a remote [`RemoteSnapshotClient`](super::RemoteSnapshotClient).
+    Remote {
+        /// Snapshot identifier understood by the remote client.
+        id: String,
+    },
+}
+
+impl SandboxSnapshotRef {
+    /// Derives the persisted identity from a runtime snapshot.
+    pub fn from_snapshot(snapshot: &dyn super::SandboxSnapshot) -> Self {
+        match snapshot.snapshot_type() {
+            "noop" => Self::Noop,
+            "local" => Self::Local {
+                id: snapshot.id().to_string(),
+            },
+            _ => Self::Remote {
+                id: snapshot.id().to_string(),
+            },
+        }
+    }
 }
 
 impl SandboxState {
@@ -167,6 +220,24 @@ impl SandboxState {
             SandboxState::Docker(state) => state.workspace_projection_hash.as_deref(),
             SandboxState::Local(state) => state.workspace_projection_hash.as_deref(),
             SandboxState::Remote(state) => state.workspace_projection_hash.as_deref(),
+        }
+    }
+
+    /// Returns the persisted snapshot identity, when the workspace was snapshotted.
+    pub fn snapshot(&self) -> Option<&SandboxSnapshotRef> {
+        match self {
+            SandboxState::Docker(state) => state.snapshot.as_ref(),
+            SandboxState::Local(state) => state.snapshot.as_ref(),
+            SandboxState::Remote(state) => state.snapshot.as_ref(),
+        }
+    }
+
+    /// Records the snapshot identity the workspace was persisted as.
+    pub fn set_snapshot(&mut self, snapshot: Option<SandboxSnapshotRef>) {
+        match self {
+            SandboxState::Docker(state) => state.snapshot = snapshot,
+            SandboxState::Local(state) => state.snapshot = snapshot,
+            SandboxState::Remote(state) => state.snapshot = snapshot,
         }
     }
 }
@@ -266,6 +337,7 @@ mod tests {
             workspace_spec: None,
             workspace_projection_hash: Some("hash123".to_string()),
             metadata: std::collections::HashMap::new(),
+            snapshot: None,
         });
 
         let json = serde_json::to_string(&state).unwrap();
@@ -306,6 +378,7 @@ mod tests {
             workspace_root_ready: false,
             workspace_projection_hash: None,
             metadata: std::collections::HashMap::new(),
+            snapshot: None,
         });
 
         // Save state

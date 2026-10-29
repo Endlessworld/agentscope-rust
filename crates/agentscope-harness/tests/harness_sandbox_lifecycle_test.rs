@@ -74,6 +74,7 @@ impl SandboxClient for CountingClient {
                 workspace_root_ready: false,
                 workspace_projection_hash: None,
                 metadata: Default::default(),
+                snapshot: None,
             }),
             started: Arc::clone(&self.sandbox_started),
         }))

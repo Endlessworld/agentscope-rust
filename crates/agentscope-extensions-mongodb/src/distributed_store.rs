@@ -412,6 +412,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_session_cascades_to_snapshot_written_by_the_harness_store() {
+        // The slot the cascade lookup reads used to have no production writer: MONGODB could
+        // parse `states._sandbox_state.json` but nothing ever wrote it. This test exercises the
+        // real harness writer (`AgentStateStoreSandboxStateStore`) end to end, instead of
+        // hand-seeding the document.
+        use agentscope_core::state::AgentStateStore;
+        use agentscope_harness::agent::sandbox::{
+            AgentStateStoreSandboxStateStore, RemoteSandboxState, SandboxSnapshotRef, SandboxState,
+            SandboxStateStore,
+        };
+
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let s = MongodbDistributedStore::new(raw.clone(), Some("agentscope"));
+
+        s.snapshot_client()
+            .upload("snap-77", b"workspace-tar")
+            .await
+            .unwrap();
+
+        let sandbox_store = AgentStateStoreSandboxStateStore::new(
+            Arc::new(s.agent_state_store().clone()),
+            "agent-1",
+        );
+        sandbox_store
+            .save(
+                "session:sess-77",
+                &SandboxState::Remote(RemoteSandboxState {
+                    session_id: "sess-77".to_string(),
+                    endpoint: "http://localhost:8080".to_string(),
+                    token: None,
+                    workspace_root_ready: true,
+                    workspace_projection_hash: None,
+                    metadata: Default::default(),
+                    snapshot: Some(SandboxSnapshotRef::Remote {
+                        id: "snap-77".to_string(),
+                    }),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Deleting the *session* cascades into its `sandbox/session/<id>` slot.
+        s.agent_state_store()
+            .delete(Some("__anon__"), "sess-77")
+            .await;
+        assert!(!s.snapshot_client().exists("snap-77").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn deleting_session_without_snapshot_does_not_error() {
         let raw = Arc::new(InMemoryMongoClient::new());
         let s = MongodbDistributedStore::new(raw.clone(), Some("agentscope"));

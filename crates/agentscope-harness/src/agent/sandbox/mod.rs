@@ -22,6 +22,7 @@ mod key;
 pub mod layout;
 mod lease;
 mod manager;
+mod session_state_store;
 pub mod snapshot;
 mod state;
 mod workspace_spec;
@@ -39,12 +40,16 @@ pub use layout::{
 };
 pub use lease::SandboxLease;
 pub use manager::{SandboxAcquireResult, SandboxManager};
+pub use session_state_store::{AgentStateStoreSandboxStateStore, SANDBOX_STATE_KEY};
 pub use snapshot::{
     LocalSandboxSnapshot, LocalSnapshotSpec, NoopSandboxSnapshot, NoopSnapshotSpec,
     RemoteSandboxSnapshot, RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshot,
     SandboxSnapshotSpec,
 };
-pub use state::{InMemorySandboxStateStore, LocalSandboxState, SandboxState, SandboxStateStore};
+pub use state::{
+    InMemorySandboxStateStore, LocalSandboxState, RemoteSandboxState, SandboxSnapshotRef,
+    SandboxState, SandboxStateStore,
+};
 pub use workspace_spec::{
     CopySpec, DefaultWorkspaceSpecApplier, ExecResult, WorkspaceSpec, WorkspaceSpecApplier,
 };

@@ -402,6 +402,7 @@ mod tests {
                     workspace_root_ready: false,
                     workspace_projection_hash: None,
                     metadata: std::collections::HashMap::new(),
+                    snapshot: None,
                 }),
                 running: false,
             }

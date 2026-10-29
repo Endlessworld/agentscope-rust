@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use super::snapshot::SandboxSnapshot;
-use super::state::{DockerSandboxState, SandboxState};
+use super::state::{DockerSandboxState, SandboxSnapshotRef, SandboxState};
 use super::workspace_spec::{ExecResult, WorkspaceSpec};
 use super::{Sandbox, SandboxClient, SandboxClientOptions, SandboxSnapshotSpec};
 
@@ -53,7 +53,7 @@ impl SandboxClient for DockerSandboxClient {
     ) -> Result<Box<dyn Sandbox>> {
         let options = options.cloned().unwrap_or_default();
         let session_id = uuid::Uuid::new_v4().to_string();
-        let state = DockerSandboxState {
+        let mut state = DockerSandboxState {
             session_id: session_id.clone(),
             container_id: None,
             container_name: None,
@@ -76,14 +76,22 @@ impl SandboxClient for DockerSandboxClient {
             workspace_projection_hash: None,
             workspace_spec: Some(workspace_spec.clone()),
             metadata: std::collections::HashMap::new(),
+            snapshot: None,
         };
         debug!(
             "[sandbox-docker] Creating new sandbox: id={}, image={}",
             state.session_id, state.image
         );
+        let bound = match snapshot_spec {
+            Some(spec) => Some(spec.build(&session_id)?),
+            None => None,
+        };
+        if let Some(snapshot) = &bound {
+            state.snapshot = Some(SandboxSnapshotRef::from_snapshot(snapshot.as_ref()));
+        }
         let sandbox = DockerSandbox::new(SandboxState::Docker(state));
-        let sandbox = match snapshot_spec {
-            Some(spec) => sandbox.with_snapshot(spec.build(&session_id)?),
+        let sandbox = match bound {
+            Some(snapshot) => sandbox.with_snapshot(snapshot),
             None => sandbox,
         };
         Ok(Box::new(sandbox))
@@ -797,6 +805,7 @@ mod tests {
             workspace_projection_hash: None,
             workspace_spec: None,
             metadata: std::collections::HashMap::new(),
+            snapshot: None,
         }
     }
 
@@ -861,6 +870,7 @@ mod tests {
             workspace_root_ready: false,
             workspace_projection_hash: None,
             metadata: std::collections::HashMap::new(),
+            snapshot: None,
         });
         assert!(client.resume(&state).await.is_err());
         assert!(client
