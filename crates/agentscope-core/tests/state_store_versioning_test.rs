@@ -87,3 +87,38 @@ async fn json_file_store_degrades_to_unconditional_writes() {
     assert_eq!(store.get(None, "s", "k").await, Some(json!(1)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn in_memory_delete_key_removes_only_that_key() {
+    let store = InMemoryAgentStateStore::new();
+    store.save(Some("u"), "s", "a", json!(1)).await;
+    store.save_list(Some("u"), "s", "b", &[json!(1), json!(2)]).await;
+
+    store.delete_key(Some("u"), "s", "a").await.unwrap();
+
+    assert_eq!(store.get(Some("u"), "s", "a").await, None);
+    // Version bookkeeping is dropped together with the value, so a re-create starts at 0.
+    assert_eq!(store.get_versioned(Some("u"), "s", "a").await.version, 0);
+    // Other keys and other sessions are untouched.
+    assert_eq!(
+        store.get_list(Some("u"), "s", "b").await,
+        vec![json!(1), json!(2)]
+    );
+    assert!(store.exists(Some("u"), "s").await);
+}
+
+#[tokio::test]
+async fn json_file_store_reports_per_key_delete_as_unsupported() {
+    // The trait default must fail loudly rather than pretend the value was removed.
+    let dir = std::env::temp_dir().join(format!(
+        "agentscope-state-store-delete-key-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = JsonFileAgentStateStore::new(&dir);
+    store.save(None, "s", "k", json!(1)).await;
+
+    assert!(store.delete_key(None, "s", "k").await.is_err());
+    assert_eq!(store.get(None, "s", "k").await, Some(json!(1)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -73,6 +73,27 @@ pub trait AgentStateStore: Send + Sync {
     /// Delete a session and all its data.
     async fn delete(&self, user_id: Option<&str>, session_id: &str);
 
+    /// Delete a single state value, keeping the rest of the session intact.
+    ///
+    /// Mirrors the extra `delete(userId, sessionId, key)` overload in Java's
+    /// `AgentStateStore`: it drops the value's payload **and** any side objects the backend
+    /// keeps for it (e.g. COS removes `.json`, `.list.json` and `.list.hash`).
+    ///
+    /// Not every backend can honour a per-key delete, so the default implementation reports an
+    /// error instead of silently succeeding — callers must see that the value is still there.
+    /// [`InMemoryAgentStateStore`] and the object-storage backends override it.
+    async fn delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<()> {
+        let _ = (user_id, session_id, key);
+        Err(crate::Error::Other(
+            "this AgentStateStore backend does not support per-key delete".to_string(),
+        ))
+    }
+
     /// List session identifiers under the given user namespace (`None` = anonymous).
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String>;
 
@@ -265,6 +286,27 @@ impl AgentStateStore for InMemoryAgentStateStore {
             .get(&normalize_user(user_id))
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    async fn delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<()> {
+        require_session_id(session_id)?;
+        if let Some(session) = self
+            .inner
+            .write()
+            .unwrap()
+            .get_mut(&normalize_user(user_id))
+            .and_then(|bucket| bucket.get_mut(session_id))
+        {
+            session.single.remove(key);
+            session.list.remove(key);
+            session.versions.remove(key);
+        }
+        Ok(())
     }
 
     fn supports_versioning(&self) -> bool {

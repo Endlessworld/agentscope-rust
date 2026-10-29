@@ -255,6 +255,27 @@ impl AgentStateStore for CosAgentStateStore {
         }
     }
 
+    async fn delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<()> {
+        // Java `CosAgentStateStore.delete(userId, sessionId, key)` removes the value plus its
+        // list payload and incremental hash, so a later `saveList` cannot append onto a stale
+        // hash. All three objects go out in one batch (`deleteKeys`).
+        let to_core = |e: CosError| {
+            agentscope_core::error::Error::Other(format!("COS per-key delete failed: {e}"))
+        };
+        let keys = [
+            self.state_key(user_id, session_id, key).map_err(to_core)?,
+            self.list_key(user_id, session_id, key).map_err(to_core)?,
+            self.hash_key(user_id, session_id, key).map_err(to_core)?,
+        ];
+        self.object_store.delete_many(&keys).await.map_err(to_core)?;
+        Ok(())
+    }
+
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
         let user_prefix = format!(
             "{}{}/",
@@ -594,6 +615,35 @@ mod tests {
                 "agentscope/state/u1/s1/items.list.json".to_string(),
                 "agentscope/state/u1/s1/k.json".to_string(),
             ]
+        );
+    }
+
+    /// Java `delete(userId, sessionId, key)` removes the value plus its list payload and
+    /// incremental hash, leaving every other key of the session intact.
+    #[tokio::test]
+    async fn delete_key_removes_value_list_and_hash_only() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        s.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        s.save_list(Some("u1"), "s1", "k", &[serde_json::json!("a")])
+            .await;
+        s.save(Some("u1"), "s1", "other", serde_json::json!(2))
+            .await;
+
+        s.delete_key(Some("u1"), "s1", "k").await.unwrap();
+
+        let mut keys = backend.list_prefix("").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["agentscope/state/u1/s1/other.json".to_string()]);
+        assert_eq!(s.get(Some("u1"), "s1", "k").await, None);
+        assert!(s.get_list(Some("u1"), "s1", "k").await.is_empty());
+        assert_eq!(
+            s.get(Some("u1"), "s1", "other").await,
+            Some(serde_json::json!(2))
         );
     }
 
