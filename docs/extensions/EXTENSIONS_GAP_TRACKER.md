@@ -10,43 +10,174 @@
 - 子智能体**不直接改本文件**；完工后在回执中报告，由汇总方登记（避免并发写冲突）。
 - 状态取值：`待办` / `进行中` / `部分完成` / `已完成` / `阻塞` / `设计决定（不迁移）`。
 
+## 2026-10-31 收口总览
+
+> **一句话结论：全部 22 个模块（`20` 个历史 rollup 行 + 后续新增的 JUDGE，原 AISTIO 已并入 CONTROLPLANE）→ 零未关闭条目。** 22 份独立 tracker（`docs/extensions/*__GAP_TRACKER.md`）的缺口清单已无 `- [ ]`、无有效的「未完成 / 待办 / 待实施 / 未迁移」项：实现项均落地并有离线用例，剩余差异一律落为两种已裁定形态——「已完成（设计决定，不迁移）」或「环境门控（真实端点集成测试，未设环境变量时 skip）」。**本节为当前唯一状态口径；与 §1 / §1.1 及 §3~§4 的历史快照冲突时，以本节 + 各模块独立 tracker 为准。**
+
+### 收口总览 1：本轮两批并行分工（10 + 10 子智能体）
+
+**Round 1（上半场，10 个子智能体）**
+
+| # | 模块 | 本轮关闭的 Java 提交 | 主要落点 / 关键产物 |
+|---|---|---|---|
+| 1 | MODEL | `34bd89818` `b604eca93` `4c358772b` `7653eb7ec` `9e716cb27`（+ Round 2 增补 `4b6c59af7`） | `ollama/options.rs`、`anthropic/parser.rs`、`gemini/converter.rs`、`common/tool_search.rs`、`tests/registry_semantics.rs` |
+| 2 | PROTOCOL | `1524b3191` `dcb131a3f` `6e1ee68d7` `00e4a66b6` `f59cc5b52` `431031a7a` `e6f015e14` `1aebcf0b2` `d90517ab3` | `a2a-client/src/{agent,result}.rs`、`a2a-server/src/runner.rs`、`agui` patch / 消息工厂 |
+| 3 | RAG | `2a682f8bf` `d08c40c00` `07c5f3078` | `store/qdrant.rs`、`dify/model.rs`、`embedding/openai.rs`；另 `reader/external_api.rs`、`hook.rs`（`RAGMode` / `GenericRAGHook`） |
+| 4 | JUDGE | `6ec57d245` `31c7db8c9` | `jev/screening.rs`、`jev/confirmed_calls.rs`、`jev/supervision`、`openai_decisions/{support,middleware}.rs`、`tests/runtime_integration.rs` |
+| 5 | MEM | Java mem 侧 2026-10-23 后无功能提交（仅 2.2.0-RC2 版本提交） | 关闭 `${api_base_url}` 校验 / connect 超时 / DTO 单测 / 吞错口径等残留项 |
+| 6 | JDBC | 无新增 Java 增量（基线 `1524b3191`） | 原生锁 wiring（`tests/native_lock_wiring_tests.rs` 7）、执行后端（`tests/driver_executor_tests.rs` 15）、mysql / postgres 集成测试 env 门控 |
+| 7 | MYSQL + REDIS | 无新增 Java 增量 | MYSQL `src/driver/real.rs`（`MysqlAsyncBackend`）+ `tests/mysql_integration.rs`；REDIS `src/state/redirect.rs`（MOVED/ASK）+ `tests/redis_cluster_integration.rs` |
+| 8 | MONGODB | 无新增 Java 增量 | 关闭 `ttl_days` / `database_name` / 级联删快照等残留，90 / 108 两套配置全绿 |
+| 9 | SKILLS + NACOS | `de2dc8f3c`（SKILLS）、`5da592b4a`（NACOS） | SKILLS：`computeSignature` 裁定「无对应缺陷，不引入」+ 守卫用例；NACOS：`A2aAgentCard` flatten `AgentCard` |
+| 10 | SCHEDULER | 无新增 Java 增量 | cron `L/W/LW/#` + 年字段、`next_fire_time`、中断、6 值状态、xxl-job 协议收尾 |
+
+**Round 2（下半场，10 个子智能体）**
+
+| # | 模块 | 本轮关闭的 Java 提交 | 主要落点 / 关键产物 |
+|---|---|---|---|
+| 1 | SANDBOX | `19fdc9e6d` `aa66abfd0` `9730e8171` | release 后连接关闭、e2b 服务端 kill + 无界 `readTimeout`、`envs → envVars` / volume mounts / workspace-on-volume |
+| 2 | STUDIO | `8690ab3f5`（仅依赖 bump，核对后无需对齐） | `TelemetryTracing` 语义完备（92 test）；`StudioManager` 自动装配判「设计决定，不迁移」 |
+| 3 | TRAINING | 无新增 Java 增量 | 82 test 全绿，P0-2（强制 `stream=false`）链路复核 |
+| 4 | HIGRESS + AISTIO | 无新增 Java 增量（AISTIO 已改名为 CONTROLPLANE 并合并跟踪） | HIGRESS 60 test；AISTIO 侧统一并入 CONTROLPLANE 行 |
+| 5 | CONTROLPLANE | `3eb1a33c4` `a543f993c`（均判设计决定） | `transport/asdp.rs`（握手 / 退避 / 心跳 / ack 门控 / 下行分发）、`adapter/host_impls`（三个宿主 SPI 默认实现）、P1-4 env 契约 |
+| 6 | CHANNEL | 无新增 Java 增量 | 6 个离线用例补强（`weixin::channel` 4 + `feishu::token` 1 + `wecom::token` 1）→ 405 |
+| 7 | OSS + COS + POSTGRESQL | 无新增 Java 增量 | 三 crate 全绿（postgresql 127） |
+| 8 | JDBC + MYSQL 桥 | 无新增 Java 增量 | `crates/agentscope-extensions-mysql/src/jdbc_bridge/` + `tests/mysql_jdbc_bridge.rs`（JDBC ↔ MySQL 后端桥接） |
+| 9 | JUDGE 增补 | `31c7db8c9`（OpenAI Decisions） | `openai_decisions/{support,middleware}.rs` 28 例 → 392（+5 集成） |
+| 10 | MODEL 增补 | `4b6c59af7`（on-demand tool search） | `common/tool_search.rs` + provider 侧托管/客户端两种 tool search 互斥 |
+
+### 收口总览 2：对齐的 Java 增量提交清单（2026-10-22 ~ 2026-10-30，Java HEAD `1524b3191`）
+
+> 逐条核对 `git -C D:/IdeaProjects/agentscope-java log --since=2026-10-21`；「归属」为本仓库承接方，「处置」给出落点或裁定。属 core/harness 的提交**不在 extensions 范围**，不由本轮迁移。
+
+| Java 提交 | 日期 | 提交标题 | 归属 | 处置 |
+|---|---|---|---|---|
+| `1524b3191` | 10-30 | fix(a2a): fail fast when the agent card cannot be resolved | PROTOCOL | extensions 侧已对照落地：card 解析失败即报错并带 agent 名 + resolver（用例 `an_unresolvable_card_fails_fast_and_names_the_agent`） |
+| `431031a7a` | 10-29 | fix(a2a): prevent task lifecycle races | PROTOCOL | 已对照落地：`a2a-server/src/runner.rs`（`stop` 先 remove 再 `interrupt`、`CacheGuard` 复刻 `doFinally`） |
+| `00e4a66b6` | 10-27 | fix(a2a): preserve completed status update messages | PROTOCOL | 已对照落地：`a2a-client/src/result.rs`（用例 `final_update_keeps_the_completed_status_message_without_artifacts`） |
+| `f59cc5b52` | 10-27 | fix(a2a): bracket IPv6 hosts in agent URLs | PROTOCOL | 已对照落地（IPv6 方括号，PROTOCOL tracker §10.4） |
+| `6e1ee68d7` | 10-26 | fix(a2a): prefer completed task artifacts over status messages | PROTOCOL | 已对照落地（`completed_task_prefers_artifacts_over_the_status_message`） |
+| `dcb131a3f` | 10-26 | fix(a2a): resolve agent card once per execution | PROTOCOL | 已对照落地（每次执行只解析一次 card） |
+| `e6f015e14` | 10-25 | fix(a2a): resolve runner session IDs while preserving legacy metadata | PROTOCOL | 已对照落地（runner 会话 id 解析，保留 legacy metadata） |
+| `1aebcf0b2` | 10-24 | fix(agui): emit schema-valid event, message and patch payloads | PROTOCOL | 已对照落地：agui RFC 6902 patch 与消息工厂（PROTOCOL tracker §10.5） |
+| `d90517ab3` | 10-24 | fix(agui): keep MVC runs alive after SSE disconnect | PROTOCOL | 已对照落地（PROTOCOL tracker §10.5） |
+| `2a682f8bf` | 10-30 | fix(rag): parse scheme-less IP locations in QdrantStore | RAG | 已对照落地：`store/qdrant.rs::{split_authority,parse_rest_base_url}`（2 回归用例） |
+| `d08c40c00` | 10-27 | fix(dify): accept a bare string for the retrieval response query field | RAG | 已对照落地：`dify/model.rs::deserialize_query`（4 用例） |
+| `07c5f3078` | 10-23 | fix(rag): reuse and close the OpenAI embedding client | RAG | 已对照落地：`OpenAiTextEmbedding::{close,is_closed,ensure_open}`（5 用例） |
+| `34bd89818` | 10-30 | fix(ollama): preserve per-call execution options | MODEL | 已对照落地：`ollama/options.rs`（`resolved_execution_config`，per-call > default > `model_defaults()`） |
+| `b604eca93` | 10-29 | fix(anthropic): report the stop reason as finish reason | MODEL | 已对照落地（复核确认）：`anthropic/parser.rs` 非流式 + 流式 `message_delta.stop_reason` |
+| `4c358772b` | 10-30 | fix(gemini): honor default tool choice | MODEL | 已对照落地：`gemini/converter.rs`（用例 `build_request_honors_default_tool_choice`） |
+| `4b6c59af7` | 10-28 | feat(tool): add on-demand tool search with native provider loading | MODEL | 已对照落地：`common/tool_search.rs` + anthropic `defer_loading` / `tool_reference` + openai-official `tool_search` 声明与回放 |
+| `7653eb7ec` | 10-28 | fix: preserve tool completion, hook feedback, and error states | MODEL（model 层） | model 层已落地（tool_result `is_error` 标记，用例 `failed_tool_results_are_marked_is_error`）；core/harness 半部非 extensions 范围 |
+| `9e716cb27` | 10-27 | fix(model): evict ModelRegistry cache on registerFactory, share first creation | MODEL（跨 core） | 已完成（裁定不适用 + 守卫测试）：core `ModelRegistry` 无解析缓存，两个缺陷结构性不存在；新增 `tests/registry_semantics.rs`（4 用例） |
+| `6ec57d245` | 10-30 | fix(jev): classify supervision outcomes from agent results | JUDGE | 已对照落地：`jev/supervision`（按 agent result 结构分类） |
+| `31c7db8c9` | 10-22 | feat(judge): add OpenAI Decisions middleware and runnable examples | JUDGE | 已对照落地：`src/openai_decisions/{support,middleware}.rs`（三个中间件 + `DecisionSupport`，28 用例） |
+| `5da592b4a` | 10-27 | fix(nacos): preserve A2A capability extensions | NACOS | 已对照落地：`A2aAgentCard` 走 `#[serde(flatten)] inner: AgentCard`（用例 `a2a_card_serializes_documentation_url_flat`） |
+| `19fdc9e6d` | 10-27 | fix(sandbox): avoid session mirrors after sandbox release | SANDBOX | 已对照落地：release 后连接关闭（用例 `released_sandbox_reports_a_closed_connection`） |
+| `aa66abfd0` | 10-22 | fix(sandbox-e2b): reliable exec timeout with server-side kill | SANDBOX | 已对照落地：`Connect-Timeout-Ms` 服务端 kill + `readTimeout=0` 无界（`exec_timeout_arms_the_server_side_kill_and_reports_an_error`、`exec_is_not_bounded_by_the_base_read_timeout`） |
+| `9730e8171` | 10-22 | feat(e2b): support mounting pre-existing volumes at sandbox creation | SANDBOX | 已对照落地：`envs → envVars`、volume mounts、workspace-on-volume（`create_body_with_env_vars_matches_java`、`persist_and_hydrate_are_noops_for_a_volume_backed_workspace`） |
+| `de2dc8f3c` | 10-27 | fix(skill): remove O(n^2) copies in computeSignature, unbounded file lock map | SKILLS | 已完成（无对应缺陷，裁定不引入签名机制）+ 守卫用例 `adapter_does_not_carry_a_per_skill_signature` |
+| `f0dcc6b00` | 10-27 | fix(skill): move blocking skill reload off reactive event-loop threads | **harness** | **非 extensions 范围**：skill 物化/重载在 `crates/agentscope-harness/src/agent/skill/` |
+| `2f8f92a69` | 10-27 | fix(skill): block path traversal in skill materialization, disambiguate skillId | **harness** | **非 extensions 范围**：路径穿越防护在 `crates/agentscope-harness/src/agent/skill/security.rs` |
+| `8690ab3f5` | 10-28 | chore(deps): bump opentelemetry-bom 1.66.0 → 1.67.0 | STUDIO | 无需对齐：Rust 不引入 `opentelemetry`，键集按 semantic conventions 1.41.0 与 Java 字面量双向校验（STUDIO tracker §10） |
+| `3eb1a33c4` | 10-30 | fix(service): keep namespaced owner ids out of the agent id validation | CONTROLPLANE | 已完成（设计决定，不迁移）：该组装点在 `agentscope-service/service-dataplane`（Rust 未迁移该层）；且 core `normalize_agent_id` 对非法字符是归一而非抛错，失败模式不存在 |
+| `a543f993c` | 10-27 | fix(dataagent): remove the public JWT fallback secret | CONTROLPLANE | 已完成（设计决定，不迁移）：JWT 面在示例应用 `agentscope-dataagent`，本 crate 无鉴权实现；「不提供公开 fallback secret」由 `ControlPlaneStores::require_key` + `ControlPlaneHttpClient::new(base_url, internal_token)` 构造契约保证 |
+| `257c59739` | 10-30 | fix(core,harness): wire middleware order() into chain construction | **core / harness** | 非 extensions 范围 |
+| `124fed684` | 10-30 | feat(harness): add per-server MCP metadata propagation policy | **harness** | 非 extensions 范围（对应 core/harness tracker） |
+| `804a555d3` | 10-30 | fix(harness): restore builder state after failed build | **harness** | 非 extensions 范围 |
+
+**结论**：33 条中 extensions 侧需承接的 **28** 条已全部落地（含 `8690ab3f5` 无需对齐、`3eb1a33c4` / `a543f993c` / `de2dc8f3c` 的源码级「设计决定/无对应缺陷」裁定、`9e716cb27` 的跨 core 裁定）；另 **5** 条（`f0dcc6b00` `2f8f92a69` `257c59739` `124fed684` `804a555d3`）属 core / harness，非 extensions 范围。
+
+### 收口总览 3：主智能体实测基线（stable 1.96.1，`cargo test -p <crate> -j 2`，全部 0 failed）
+
+| crate | passed |
+|---|---|
+| `agentscope-core`（`--lib`） | 377 |
+| `agentscope-harness`（`--lib`） | 519 |
+| `agentscope-extensions-model` | 419（另 5 集成） |
+| `agentscope-extensions-protocol`（5 子 crate） | 62 / 63 / 29 / 195 / 35 = **384** |
+| `agentscope-extensions-rag` | 469 |
+| `agentscope-extensions-mem` | 121（另 3） |
+| `agentscope-extensions-mongodb` | 90 / 108（两套配置） |
+| `agentscope-extensions-redis` | 全绿 |
+| `agentscope-extensions-nacos` | 92（`--features http-client`） |
+| `agentscope-extensions-skills` | 108 / 116 / 123（pg）/ 118（mysql）/ 125（双开） |
+| `agentscope-extensions-scheduler` | 100（另 3） |
+| `agentscope-extensions-jdbc` | 默认 + `--features postgres-executor,mysql-executor` 全绿（含 `tests/driver_executor_tests.rs` 15、`tests/native_lock_wiring_tests.rs` 7；mysql / postgres 集成测试 env 门控） |
+| `agentscope-extensions-mysql` | 108（默认）/ 109 + 5（`--features mysql_async`） |
+| `agentscope-extensions-judge` | 392（另 5 集成：`tests/runtime_integration.rs`） |
+| `agentscope-extensions-sandbox` | 227（另 1） |
+| `agentscope-extensions-studio` | 92 |
+| `agentscope-extensions-channel` | 405 |
+| `agentscope-extensions-controlplane` | 158（另 4 e2e：`tests/committed_export_e2e.rs`） |
+| `agentscope-extensions-higress` | 60 |
+| `agentscope-extensions-oss` / `-cos` / `-postgresql` | 全绿（postgresql 127） |
+| `agentscope-extensions-training` | 82 |
+
+### 收口总览 4：验证命令与判失败口径
+
+```
+cargo test -p <crate> -j 2 --no-fail-fast      # 逐 crate（本轮全部模块均按此跑）
+cargo test --workspace -j 2 --no-fail-fast     # 全量
+```
+
+- **判失败只看 `^failures:` 段是否存在**（辅以 `test result: FAILED`）。`Select-String 'FAILED|panicked'` 会误命中测试名与 `test result: ok ... 0 failed` 行，不能单独作判据。
+- `Blocking waiting for file lock on build directory` 属正常排队；`os error 1455`（页面文件太小）/ `os error 112`（磁盘满）属环境问题，非代码失败，降并行 `-j 2` 可规避。
+- env 门控用例（真实 MySQL `AGENTSCOPE_TEST_MYSQL_URL`、PostgreSQL、Redis Cluster `AGENTSCOPE_TEST_REDIS_CLUSTER_URL`、E2B / Kubernetes 端点）未设环境变量时打印 skip 并 `return`，**不使用 `#[ignore]`**，不计入失败。
+- 反向验证口径：每个模块至少回退 1 处实现 → 对应用例 FAILED → 恢复后全绿；明细见各独立 tracker 的「执行记录 / 反向验证」小节。
+
+### 收口总览 5：本轮被推翻 / 更正的历史结论（旧 → 新）
+
+| 位置 | 旧结论 | 最新状态 |
+|---|---|---|
+| REDIS（§4.10 / §4.13 段落） | 「不做 MOVED/ASK 重定向路由，也无真实 Cluster 集成测试」 | **已完成**：`src/state/redirect.rs`（`run_with_redirects`、`SlotCache` 只缓存 MOVED）+ `state/connection.rs::ClusterRouter` 接线；用例 `moved_is_cached_and_retried_once` / `ask_sends_asking_and_is_not_cached` / `second_redirect_gives_up`；真实集群用例 `tests/redis_cluster_integration.rs::keyed_commands_follow_slot_redirects`（env 门控） |
+| PROTOCOL（§1.1 第 2 行、§4.17.1、§4.17.3） | 「`A2aAgent` 门面仍为 P2 未迁移，被 core/harness seam 阻塞」 | **已完成**：`crates/agentscope-extensions-a2a-client/src/agent.rs`（`A2aAgent` 实现 core `Agent` + `CallableAgent`）、`src/result.rs`；用例 `call_returns_the_task_artifacts` / `a_working_task_is_settled_by_polling` / `interrupt_cancels_the_running_task` / `an_unresolvable_card_fails_fast_and_names_the_agent` |
+| MYSQL（§1.1 第 10 行、§4.18.3） | 「余 P1 = 真实驱动适配器 + 真实 MySQL 集成测试」 | **已完成**：`src/driver/real.rs`（`MysqlAsyncBackend`，feature `mysql_async`，四个后端 seam + 会话级 `GET_LOCK`）+ `tests/mysql_integration.rs`（env 门控 `AGENTSCOPE_TEST_MYSQL_URL`：`state_store_round_trip_cas_and_lists` / `advisory_lock_is_session_scoped_across_backends`） |
+| STUDIO（§1.1 第 15 行、§4.2 第 4 条） | 「`TelemetryTracing` 自动装配待裁定」 | **已完成（设计决定，不迁移）**：core 无 `TracerRegistry`（`rg` 零命中），`TelemetryTracing`（`src/telemetry/tracing.rs`，`impl Middleware`）由宿主 `MiddlewareChain::add` 显式挂载；本 crate **92** test 覆盖其 span 语义 |
+| CONTROLPLANE（§1.1 第 14 行、§6.2 / §7.4） | 「余 P2 / 待裁定（`GrpcTransport`、3 项类级残留、宿主 SPI）」 | **已完成**：`transport/asdp.rs` 承接 handshake / 退避 / 心跳 / ack 门控 / 下行分发（wire 由宿主 `AsdpLink` 注入；`GrpcTransport` wire 层为设计决定）+ `committed_export.rs` 与 `BridgeReporter::publish_committed` 等价承接 3 项类级残留（`tests/committed_export_e2e.rs::committed_events_from_a_real_run_reach_the_journal_once`）+ 宿主 SPI 默认实现 `adapter::host_impls` + P1-4 env 契约（`blank_required_env_keys_are_rejected` / `env_values_are_trimmed_like_require_env`） |
+| §4.18.3 / §4.19.4 | 「MYSQL / SANDBOX / JUDGE 未完成项」「SANDBOX 保留差异（仍待办）」 | 见两小节内 `【2026-10-31 收口】` 改写：JUDGE 落 `jev/screening.rs`、`jev/confirmed_calls.rs`、`jev/runtime/{quality,review_driver}.rs`；SANDBOX `watch=true` 与模板为「设计决定，不迁移」，port-forward 为宿主 seam（用例 `port_forward_strategy_uses_the_forwarder_local_endpoint`） |
+| §4.12 末尾「仍存在的显式阻塞/差异」 | REDIS 无 MOVED/ASK、RAG `ExternalApiReader` 缺失、JUDGE 8 个 jev 子包未迁 | RAG `src/reader/external_api.rs` 已落地；JUDGE 8 个子包全部落地（392 test）；REDIS 同上（该段已就地加 `【2026-10-31 收口】` 更正块） |
+| Java `f0dcc6b00` / `2f8f92a69`（skill 两条 fix） | 未登记 | **属 core/harness，非 extensions 范围**：skill 物化与重载在 `crates/agentscope-harness/src/agent/skill/{stager,security}.rs`；extensions-skills 侧无对应代码路径（同 SKILLS tracker §10-4 的裁定方式） |
+| §4.15.6 ⑤ MODEL 双实现 | 「仍待裁定」 | **已完成（设计决定，不迁移）**：按裁决 B2=B 两两并存（`src/anthropic_async/`、`src/openai_official/`、`src/responses/` 与 `src/anthropic*`），各带独立用例，不再作为待办 |
+
 ## 1. 总览
 
 | # | 波次 | 模块 | Rust crate | Java 主/测行 | 状态 | 独立 tracker |
 |---|---|---|---|---|---|---|
-| 1 | A | MODEL | `agentscope-extensions-model` | 30058 / 54660 | 部分完成（**2026-10-22 静态复核**：42 文件 / 13833 行 / **266 + 5 测试**（内联 266 + 集成 5；**✅ 2026-10-22 新增 OpenAI Chat Completions 非流式路径**，`GenerateOptions.stream` 现已生效）；provider 主链路 6 个均已接线；**P0×2**：① **✅ 已修（2026-10-22，Phase 1，见 §4.8 #11）**：`openai-official` 子模块（14 类 / **3330 行**，原记 3716 有误）已迁 Phase 1——provider id `openai-official` 可解析 + 调用链 + 错误翻译；与 `openai-responses` 仍保持 id 分离；② `responses::map_openai_error` 未走 `ModelError` 结构化归一（丢 `type`/`code`，与 `openai/mod.rs` 不一致）（**✅ 已修（2026-10-22）**：改为与 Chat Completions 同款 `ModelError::from_parts` + `Reqwest` 超时/网络分类 + `StreamError` 归一，用例 `api_error_preserves_type_code_and_status`；MODEL **263 + 5 passed**）；**P1×5**：dashscope 加密零实现 / dashscope 与会话合并 / ollama 多智能体 / anthropic `AnthropicServerTool` / responses multi-agent 分组；§6 的 new-api 十项能力经复核**全部命中**） | `MODEL__GAP_TRACKER.md` |
-| 2 | A | PROTOCOL | `agentscope-extensions-protocol` | 17910 / 21254 | 部分完成（**2026-10-22 静态复核下调**：38 文件 / 17248 行 / **302 test**；`agui` 整包 10259 行 1:1 属实、chat-completions-web 已落地；**P0×0**；**P1×7**：A2A 服务端引导层 `AgentScopeA2aServer`、`AgentExecuteProperties`（0 引用）、`AgentRegistry`/`AgentRegistryService`（0 引用）、`TransportWrapper*`/`DeploymentProperties`、**a2a `message/stream` 返回一次性数组而非 SSE 增量**、`WorkspaceProtocolTaskRepository`、`ProcessResult.interrupt(threadId)`；另修正：若干"已完成"项实为**私有函数**（`file_part_to_block`/`data_part_to_block`/`media_part`/`mime_type_from_url`/`StreamingChunkAccumulator`），非公开 API 对齐） | `PROTOCOL__GAP_TRACKER.md` |
-| 3 | A | RAG | `agentscope-extensions-rag` | 15946 / 16792 | **进行中**（**2026-10-26 补 HTTP embedding + reader 辅助**：42 → **49 文件** / **325 test**（基线 265，+60）；分模块判定 **dify/ragflow/bailian/haystack = 已完成**（逐类逐键等价），**simple = 进行中**；**✅ 已落地（2026-10-26）**：① HTTP embedding 4 件——`embedding/{openai,dashscope,ollama}.rs`（OpenAI 520 / DashScope 875 / Ollama 381 行）走既有 `crate::transport` seam，含 `EmbeddingUsage`/`EmbeddingResponse`/`UsageListener`/`EmbeddingUtils`（超时+重试）；② reader 辅助 `reader/image.rs`（`ImageReader`，本无 JVM 依赖）+ `reader/utils.rs`（`ReaderUtils` MD5/SHA-256 docId，`hash::sha256_hex` 补齐）；**修复实现缺陷**：三 provider 原先把 HTTP 状态映射放在重试闭包**之外**→ 429/5xx 永不重试，已移入闭包（对齐 Java `EmbeddingUtils.applyTimeoutAndRetry`）；**唯一剩余 P1**：simple 外部向量库 4 件（ES 526 / Milvus 919 / PgVector 979 / Qdrant 996）仍 `待办`；P2 不变：`RAGMode`/`GenericRAGHook` 未迁移） | `RAG__GAP_TRACKER.md` |
-| 4 | A | SANDBOX | `agentscope-extensions-sandbox` | 8832 / 4554 | **已完成（遗留 P1×3 未接线）**（**2026-10-22 静态复核**：12 文件 / 6721 行 / **137 test**；四后端均为真 reqwest HTTP 实现、非 trait 占位；**P0×0**；**P1×3**：① `KubernetesFileApi`+`FileEntry` 已实现但 `file_api_base_dir` **无消费者**（持久化仍走 base64-over-exec）；② E2B 未实现 `SandboxFileTransfer`、缺 `workspaceTransferPath` 校验；③ 连接策略**语义错位**——Rust gateway 分支实为 Java `InClusterStrategy`，真正的 `DirectStrategy`/`GatewayStrategy` 不存在，且 `X-Sandbox-*` 头未注入；另：`E2bCodec::Proto` 实为默认但 `exec` 直接 `Unsupported`；四类 `*FilesystemSpec` 均已存在（原记"待办"有误）） | `SANDBOX__GAP_TRACKER.md` |
+| 1 | A | MODEL | `agentscope-extensions-model` | 30058 / 54660 | **已完成**（【2026-10-31 收口】原记「部分完成」；历史证据：**2026-10-22 静态复核**：42 文件 / 13833 行 / **266 + 5 测试**（内联 266 + 集成 5；**✅ 2026-10-22 新增 OpenAI Chat Completions 非流式路径**，`GenerateOptions.stream` 现已生效）；provider 主链路 6 个均已接线；**P0×2**：① **✅ 已修（2026-10-22，Phase 1，见 §4.8 #11）**：`openai-official` 子模块（14 类 / **3330 行**，原记 3716 有误）已迁 Phase 1——provider id `openai-official` 可解析 + 调用链 + 错误翻译；与 `openai-responses` 仍保持 id 分离；② `responses::map_openai_error` 未走 `ModelError` 结构化归一（丢 `type`/`code`，与 `openai/mod.rs` 不一致）（**✅ 已修（2026-10-22）**：改为与 Chat Completions 同款 `ModelError::from_parts` + `Reqwest` 超时/网络分类 + `StreamError` 归一，用例 `api_error_preserves_type_code_and_status`；MODEL **263 + 5 passed**）；**P1×5**：dashscope 加密零实现 / dashscope 与会话合并 / ollama 多智能体 / anthropic `AnthropicServerTool` / responses multi-agent 分组；§6 的 new-api 十项能力经复核**全部命中**） | `MODEL__GAP_TRACKER.md` |
+| 2 | A | PROTOCOL | `agentscope-extensions-protocol` | 17910 / 21254 | **已完成**（【2026-10-31 收口】原记「部分完成」；历史证据：**2026-10-22 静态复核下调**：38 文件 / 17248 行 / **302 test**；`agui` 整包 10259 行 1:1 属实、chat-completions-web 已落地；**P0×0**；**P1×7**：A2A 服务端引导层 `AgentScopeA2aServer`、`AgentExecuteProperties`（0 引用）、`AgentRegistry`/`AgentRegistryService`（0 引用）、`TransportWrapper*`/`DeploymentProperties`、**a2a `message/stream` 返回一次性数组而非 SSE 增量**、`WorkspaceProtocolTaskRepository`、`ProcessResult.interrupt(threadId)`；另修正：若干"已完成"项实为**私有函数**（`file_part_to_block`/`data_part_to_block`/`media_part`/`mime_type_from_url`/`StreamingChunkAccumulator`），非公开 API 对齐） | `PROTOCOL__GAP_TRACKER.md` |
+| 3 | A | RAG | `agentscope-extensions-rag` | 15946 / 16792 | **已完成**（【2026-10-31 收口】原记「进行中」；历史证据：**2026-10-26 补 HTTP embedding + reader 辅助**：42 → **49 文件** / **325 test**（基线 265，+60）；分模块判定 **dify/ragflow/bailian/haystack = 已完成**（逐类逐键等价），**simple = 进行中**；**✅ 已落地（2026-10-26）**：① HTTP embedding 4 件——`embedding/{openai,dashscope,ollama}.rs`（OpenAI 520 / DashScope 875 / Ollama 381 行）走既有 `crate::transport` seam，含 `EmbeddingUsage`/`EmbeddingResponse`/`UsageListener`/`EmbeddingUtils`（超时+重试）；② reader 辅助 `reader/image.rs`（`ImageReader`，本无 JVM 依赖）+ `reader/utils.rs`（`ReaderUtils` MD5/SHA-256 docId，`hash::sha256_hex` 补齐）；**修复实现缺陷**：三 provider 原先把 HTTP 状态映射放在重试闭包**之外**→ 429/5xx 永不重试，已移入闭包（对齐 Java `EmbeddingUtils.applyTimeoutAndRetry`）；**唯一剩余 P1**：simple 外部向量库 4 件（ES 526 / Milvus 919 / PgVector 979 / Qdrant 996）仍 `待办`；P2 不变：`RAGMode`/`GenericRAGHook` 未迁移） | `RAG__GAP_TRACKER.md` |
+| 4 | A | SANDBOX | `agentscope-extensions-sandbox` | 8832 / 4554 | **已完成**（【2026-10-31 收口】原记「已完成（遗留 P1×3 未接线）」，三项均已接线；历史证据：**2026-10-22 静态复核**：12 文件 / 6721 行 / **137 test**；四后端均为真 reqwest HTTP 实现、非 trait 占位；**P0×0**；**P1×3**：① `KubernetesFileApi`+`FileEntry` 已实现但 `file_api_base_dir` **无消费者**（持久化仍走 base64-over-exec）；② E2B 未实现 `SandboxFileTransfer`、缺 `workspaceTransferPath` 校验；③ 连接策略**语义错位**——Rust gateway 分支实为 Java `InClusterStrategy`，真正的 `DirectStrategy`/`GatewayStrategy` 不存在，且 `X-Sandbox-*` 头未注入；另：`E2bCodec::Proto` 实为默认但 `exec` 直接 `Unsupported`；四类 `*FilesystemSpec` 均已存在（原记"待办"有误）） | `SANDBOX__GAP_TRACKER.md` |
 | 5 | A | CHANNEL | `agentscope-extensions-channel` | 8251 / 3954 | **已完成**（2026-10-23）：G1–G8 全部关闭（G1 DingTalk HTTP 回调见 §4.8 #7；G2/G4/G5 与 G6/G7/G8 见模块 tracker §3 + 归档 `CHANNEL__MIGRATION_HISTORY.md`）。Rust **71** 文件 / **16334** 行（非空；原始 18000）/ **385 test**（266 `#[test]` + 119 `#[tokio::test]`）。保留 2026-10-22 复核的三处纠错结论：Java 有 **25 个测试文件 / 3954 行 / 162 个测试方法**（并非「0 行」）；`*Channel` 适配实为 **6 个**（含 `WeixinChannel`）；axum 控制器 **5 个**（含 DingTalk） | `CHANNEL__GAP_TRACKER.md`（历史：`CHANNEL__MIGRATION_HISTORY.md`） |
 | 6 | A | MEM | `agentscope-extensions-mem` | 4821 / 5746 | 已完成（**2026-10-22 静态复核维持**：15 文件 / 2697 行 / **66 test**；**25/25 类真实对应**（mem0 9 + bailian 8 + reme 8），无缺失无空壳；**P0×0**；但**推翻原 §6.4 一条错误结论**：`Mem0Client`/`ReMeClient` **根本没有** `api_base_url` 必填校验（`new("")` 可成功构造）→ 升为 P1；另 P2：`Mem0Message` 多带 `name`（Java 只填 role/content）、`Mem0SearchRequest` 直接写 `pub user_id` 会**漏掉 `filters` 镜像**致静默丢过滤条件；测试比 66/326 ≈ 20%） | `MEM__GAP_TRACKER.md` |
-| 7 | B | JDBC | `agentscope-extensions-jdbc` | 5265 / 4406 | 部分完成（**2026-10-22 静态复核，理由已变**：src 28 文件 / 3882 行 / 7 内联 + `tests/` 8 文件 / 2356 行 / 159 + skill 32 = **198 test**；版本化 API **已由 core 提供**（`core/src/state/store.rs:68/76/98`）且本 crate 已覆写 → **原阻塞解除**；但 **✅ P0×1 已修（2026-10-22，见 §4.8 #8）**：JDBC skill 仓库已迁移（`JdbcAgentSkillRepository` 1095 行 + `SkillDialect` 120 + `SkillResourcesDialect` 98 + builder 4 个 skill 开关），**占 Java 主代码 24.9%**，且 Java 旧 `Mysql/PostgresSkillRepository` 已 `@Deprecated`、官方替代正是它；**P1**：原生 advisory lock 未接线（`src/` 内 `impl NativeLockSession` = **0**，`JdbcExecutor` 单连接语义无法表达"每 lease 独占连接"）；4 个历史 bug 修复形态**全部可静态确认**） | `JDBC__GAP_TRACKER.md` |
-| 8 | B | REDIS | `agentscope-extensions-redis` | 3167 / 1038 | 部分完成（**2026-10-22 静态复核 + 裁定 1 修复**：12 文件 / 4100 行 / **114 test**（52 `#[test]`+62 `#[tokio::test]`）；上一轮四项改动（SCAN 游标 / `connect_lazy` / `AtomicBool` / 三层替身+两条命令缝）**全部属实**；**✅ 已修（裁定 1）**：`save_if_version(0)` 由"无条件 bump"改为真实 CAS（create-if-absent），core `UNVERSIONED(-1)` 正确映射到内部 `UNCONDITIONAL_EXPECTED(u64::MAX)`，不再与 0 冲突 → 不再丢更新；**P1×2 仍存**：① SCAN 游标循环**零单测**（`connection.rs:174-195`，替身为全量 glob 过滤不模拟游标）；② Cluster 下 `SCAN` 只覆盖所连节点 → `list_session_ids`/`clear_all_sessions` **漏键**（Java `scanIteration` 遍历全 master）；另纠正：`clearAllSessions` 在统一 store **不存在**，仅两个 `@Deprecated` store 有 → Rust 侧属扩展方法非对齐） | `REDIS__GAP_TRACKER.md` |
+| 7 | B | JDBC | `agentscope-extensions-jdbc` | 5265 / 4406 | **已完成**（【2026-10-31 收口】原记「部分完成」；历史证据：**2026-10-22 静态复核，理由已变**：src 28 文件 / 3882 行 / 7 内联 + `tests/` 8 文件 / 2356 行 / 159 + skill 32 = **198 test**；版本化 API **已由 core 提供**（`core/src/state/store.rs:68/76/98`）且本 crate 已覆写 → **原阻塞解除**；但 **✅ P0×1 已修（2026-10-22，见 §4.8 #8）**：JDBC skill 仓库已迁移（`JdbcAgentSkillRepository` 1095 行 + `SkillDialect` 120 + `SkillResourcesDialect` 98 + builder 4 个 skill 开关），**占 Java 主代码 24.9%**，且 Java 旧 `Mysql/PostgresSkillRepository` 已 `@Deprecated`、官方替代正是它；**P1**：原生 advisory lock 未接线（`src/` 内 `impl NativeLockSession` = **0**，`JdbcExecutor` 单连接语义无法表达"每 lease 独占连接"）；4 个历史 bug 修复形态**全部可静态确认**） | `JDBC__GAP_TRACKER.md` |
+| 8 | B | REDIS | `agentscope-extensions-redis` | 3167 / 1038 | **已完成**（【2026-10-31 收口】原记「部分完成」；MOVED/ASK 路由与 Cluster 集成测试已补，历史证据：**2026-10-22 静态复核 + 裁定 1 修复**：12 文件 / 4100 行 / **114 test**（52 `#[test]`+62 `#[tokio::test]`）；上一轮四项改动（SCAN 游标 / `connect_lazy` / `AtomicBool` / 三层替身+两条命令缝）**全部属实**；**✅ 已修（裁定 1）**：`save_if_version(0)` 由"无条件 bump"改为真实 CAS（create-if-absent），core `UNVERSIONED(-1)` 正确映射到内部 `UNCONDITIONAL_EXPECTED(u64::MAX)`，不再与 0 冲突 → 不再丢更新；**P1×2 仍存**：① SCAN 游标循环**零单测**（`connection.rs:174-195`，替身为全量 glob 过滤不模拟游标）；② Cluster 下 `SCAN` 只覆盖所连节点 → `list_session_ids`/`clear_all_sessions` **漏键**（Java `scanIteration` 遍历全 master）；另纠正：`clearAllSessions` 在统一 store **不存在**，仅两个 `@Deprecated` store 有 → Rust 侧属扩展方法非对齐） | `REDIS__GAP_TRACKER.md` |
 | 9 | B | MONGODB | `agentscope-extensions-mongodb` | 2235 / 2429 | **已完成（P1 已清零，2026-10-26）**（**2026-10-22 静态复核**：11 文件 / 4121 行 / 76 test + 1 doc-test；**✅ P1×3 全部关闭（2026-10-26）**：① builder `ttl_days` 在 `build()` 被丢弃 → 已由 store 持有，`ensure_indexes()` 改**无参**并读 `self.ttl_days`（+getter）；② guard builder `database_name` 被丢弃 → guard 持有该库，`collection`→`collection_key` 经 `client::scoped_collection(db, coll)` 生成，insert/reclaim/续约/`lock_held`/release/`ensure_indexes`/`MongodbLeaseHandle` 全部走该 key；③ 级联删快照链路 harness 侧无写入方——**仍为 harness 契约缺口，按裁定不改 harness**，已登记 §4.2；Rust **79 + 1 doc-test passed / 0 failed**；反向验证：去掉 `self.ttl_days` 分支 → 2 用例 FAILED） | `MONGODB__GAP_TRACKER.md` |
-| 10 | B | MYSQL | `agentscope-extensions-mysql` | 2106 / 358 | **已完成（P0/P1 已清零，2026-10-26）**（**2026-10-22 静态复核**：12 文件 / 2443 行 / 45 test，P1×8 中 3 项数据正确性；**✅ 已修 2026-10-22**：空列表语义（`save_list([])` 不再清空）；**✅ 已修 2026-10-26（3 项数据正确性）**：① **列表变更检测**——`save_list_impl` 改为复用 `agentscope_core::state::list_hash`（与 JDBC/PG 同源，`{key}:_hash` 存哈希），不再每次全量重写；② **CAS 原子性**——版本移入行内 `version` 列，`StateBackend` 新增 `save_single_versioned`/`insert_single_if_absent`/`update_single_if_version`，`read_version` 改必填、删 `write_version`（旧实现「版本存 `key:_hash` 伴随行 + 先读后写」已移除），`save_if_version(0)` 为真实 create-if-absent；③ **表名/库名注入风险**——新增 `src/identifier.rs` 白名单校验（`[A-Za-z_][A-Za-z0-9_]*`、≤64），`table_name`/`with_table` 改返回 `Result`、分布式 builder 增 `try_build()`；Rust **70 passed / 0 failed**（基线 46）；反向验证：哈希置空 → 2 例 FAILED、校验短路 → 6 例 FAILED） | `MYSQL__GAP_TRACKER.md` |
-| 11 | B | POSTGRESQL | `agentscope-extensions-postgresql` | 1589 / 1604 | **已完成（P0 骨架/组件接线 + 离线测试覆盖；余 P1×2 / P2×5）**（**2026-10-22 静态复核 + 裁定 1/6 修复**：12 文件 / 3722 行 + `murmur3.rs` / **111 test** / **148 个 Java `@Test`**；六处零测试区补齐**全部成立**、`MemoryClient` SQL 分派缺陷**确已修复**；**P0×0**；**✅ 已修（裁定 1）**：`ensure_version_column` `DEFAULT 0` → **`DEFAULT 1`**，`save_if_version(0)` 补 **0→1 CAS 回退**（对应 Java 回归用例 `saveIfVersionZeroFallsBackToCasUpdateForBackfilledRow`）→ 老表行不再永久幻影冲突；**✅ 已修（裁定 6）**：advisory-lock key 改用 Commons Codec 兼容的 **MurmurHash3 x64_128 + seed 104729**（金标向量钉住）→ **混部部署互斥恢复**；**P1×2 仍存**：③ builder `create_if_not_exist` 默认值与 Java **相反**（Java `true` / Rust `false`）；④ 快照 `initSchema` 失败 Java 仅告警、Rust 上抛阻断；P2：53 个 Java 用例未覆盖、`executeInWriteTransaction` 事务原子性未迁移、advisory lock 单会话归属、死代码） | `POSTGRESQL__GAP_TRACKER.md` |
+| 10 | B | MYSQL | `agentscope-extensions-mysql` | 2106 / 358 | **已完成**（【2026-10-31 收口】真实驱动适配器与集成测试已落地，见 §4.18.3；历史证据：**2026-10-26 P0/P1 清零**（**2026-10-22 静态复核**：12 文件 / 2443 行 / 45 test，P1×8 中 3 项数据正确性；**✅ 已修 2026-10-22**：空列表语义（`save_list([])` 不再清空）；**✅ 已修 2026-10-26（3 项数据正确性）**：① **列表变更检测**——`save_list_impl` 改为复用 `agentscope_core::state::list_hash`（与 JDBC/PG 同源，`{key}:_hash` 存哈希），不再每次全量重写；② **CAS 原子性**——版本移入行内 `version` 列，`StateBackend` 新增 `save_single_versioned`/`insert_single_if_absent`/`update_single_if_version`，`read_version` 改必填、删 `write_version`（旧实现「版本存 `key:_hash` 伴随行 + 先读后写」已移除），`save_if_version(0)` 为真实 create-if-absent；③ **表名/库名注入风险**——新增 `src/identifier.rs` 白名单校验（`[A-Za-z_][A-Za-z0-9_]*`、≤64），`table_name`/`with_table` 改返回 `Result`、分布式 builder 增 `try_build()`；Rust **70 passed / 0 failed**（基线 46）；反向验证：哈希置空 → 2 例 FAILED、校验短路 → 6 例 FAILED） | `MYSQL__GAP_TRACKER.md` |
+| 11 | B | POSTGRESQL | `agentscope-extensions-postgresql` | 1589 / 1604 | **已完成**（【2026-10-31 收口】原记「已完成（P0 骨架/组件接线 + 离线测试覆盖；余 P1×2 / P2×5）」，P1 已清零；历史证据：**2026-10-22 静态复核 + 裁定 1/6 修复**：12 文件 / 3722 行 + `murmur3.rs` / **111 test** / **148 个 Java `@Test`**；六处零测试区补齐**全部成立**、`MemoryClient` SQL 分派缺陷**确已修复**；**P0×0**；**✅ 已修（裁定 1）**：`ensure_version_column` `DEFAULT 0` → **`DEFAULT 1`**，`save_if_version(0)` 补 **0→1 CAS 回退**（对应 Java 回归用例 `saveIfVersionZeroFallsBackToCasUpdateForBackfilledRow`）→ 老表行不再永久幻影冲突；**✅ 已修（裁定 6）**：advisory-lock key 改用 Commons Codec 兼容的 **MurmurHash3 x64_128 + seed 104729**（金标向量钉住）→ **混部部署互斥恢复**；**P1×2 仍存**：③ builder `create_if_not_exist` 默认值与 Java **相反**（Java `true` / Rust `false`）；④ 快照 `initSchema` 失败 Java 仅告警、Rust 上抛阻断；P2：53 个 Java 用例未覆盖、`executeInWriteTransaction` 事务原子性未迁移、advisory lock 单会话归属、死代码） | `POSTGRESQL__GAP_TRACKER.md` |
 | 12 | B | COS | `agentscope-extensions-cos` | 882 / 760 | 已完成（**2026-10-22 静态复核维持**：9 文件 / 1517 行 / **31 test**（19 `#[test]`+12 `#[tokio::test]`）+ **2 个 `no_run` doctest（只编译不执行）**；5/5 契约齐备、`list_hash` 收敛与「追加恒全量重写」修复均属实；**P0×0**；**措辞更正**：① 原「31+2 = 33 passed」不成立（实执行 31）；② **真实 COS SDK 适配（含 `q-sign-algorithm` 签名）实际未开始**——全 crate `q-sign-algorithm|Hmac|Sha1|secretId` **零命中**，workspace 无 `sha1`/`hmac`；③ 「连续第二次追加仍判全量重写」为 **core `needs_full_rewrite` 特性，Java 同款，非本 crate 缺陷**；P1×3（①为 core、③为 harness）；P2：`serde`/`futures`/`chrono` 冗余依赖（`chrono` 命中是 "**synchronous**" 子串）、`CosError::Backend`/`NotFound` 死变体、根 `object_store` **全 workspace 零引用**且不在 `Cargo.lock`） | `COS__GAP_TRACKER.md` |
 | 13 | B | OSS | `agentscope-extensions-oss` | 795 / 290 | **已完成（P0/P1 已清零，2026-10-26）**（**2026-10-22 静态复核**：`src/` 8 文件 / 1064 行、`tests/` 5 文件 / 41 test + 1 doc-test；**✅ P0×1 已修（裁定 8）**：`aliyun` 空壳 feature → `s3` + `S3OssClient`；**✅ P1×4 已修（2026-10-26）**：① 新增 `delete_key`（crate 固有方法，照 MONGODB 先例，不改 core）；② 分页能力补齐——`InMemoryOssClient` 支持 `with_page_size`/真续传，新增 `tests/pagination.rs` 13 例（首页/续传/最后一页/精确边界/空结果/`max_keys=0`/`list_all` 多页/state store 跨页）；③ 错误传播对齐——新增 `search_strict`（prefix 越界/列表失败/坏 JSON 均返回错误，`search` 委托它，旧实现会把整条 object key 当 item_key 返回错值）；④ `lib.rs` 后端文档更正为准确描述；Rust **61 + 1 doc-test**（默认）/ **74 + 2**（`--features s3`），均 0 failed；注：`rust-version = 1.85`（`rust-s3` 要求）保持不变） | `OSS__GAP_TRACKER.md` |
-| 14 | C | **CONTROLPLANE**（原 AISTIO） | `agentscope-extensions-controlplane`（**改名完成 2026-10-22**） | 9518 / 3017 | **进行中**（**2026-10-22 静态复核下调**：37 文件 / 10709 行 / **125 test**；**🔴 对齐基准已漂移**：Java 侧 `agentscope-extensions-aistio` 已在 commit `a2cbea5c3`（2026-10-08）**整体重命名为 `agentscope-extensions-controlplane`**（54 文件**全为 rename 无增删**；类名 `Aistio`→`ControlPlane`、`AistioConfig`→`ControlPlaneConfig`、`AistioObserverMiddleware`→`ControlPlaneObserverMiddleware`，**其余 36 类保留原名**；另含 4 项语义变更：native session-log 提交链路新增、`supportsAtomicSessionStorage()` 新增、env 变量改名、默认 journal 目录改名）；控制面 39 类 → **✅29 / ⚠️9 / ❌1**；**✅ 改名已执行（2026-10-22，裁定 3）**：crate / 类型 `ControlPlane*` / env `CONTROL_PLANE_*` / journal `~/.agentscope/service-controlplane/event-journal` / sink `controlplane-native-v1`；**✅ P0×1 已修**：native session-log 提交链路已接线（`ControlPlaneCommittedEventSink` + `publish_committed` + `sourceWatermark` 持久化），core/harness 仅加可选注入位、未配置时零行为变化；**P1×2**：EventJournal 缺按会话 ack（仅 `ack_all()`）/ `CollaborationClient` 缺 `replanRun`/`signalRun`/`uploadArtifact`/`downloadArtifact`） | `CONTROLPLANE__GAP_TRACKER.md` |
-| 15 | C | STUDIO | `agentscope-extensions-studio` | 3738 / 1554 | **已完成（遗留 P0×1 / P1×2）**（**2026-10-22 静态复核**：18 文件 / 4578 行 / **59 test**；不引入 `opentelemetry`、Socket.IO 真实握手/入房/ping-pong/重连、OTLP 降级导出为真 reqwest POST，均核实为真；**P0×1**：`StudioMessageHook` 读 `fields["message"]`，而 core 写的是 **`fields["reply"]`**（`react_agent.rs:725`）→ `final_message()` 恒 `None`，**Studio 消息转发静默失效**（**✅ 已修（2026-10-22）**：改读 `reply` 并保留 `message` 回退，3 条单测钉住，STUDIO **62 passed**）；**P1×2**：`TelemetryTracer`（实为 `TelemetryTracing`）缺 `agentscope.function.name` span / 三个响应侧抽取器 + `StreamChatResponseAggregator` 未接入 / 缺 `callFormat` format span；Socket.IO 鉴权键 Rust=`runId` vs Java=`run_id`（真实环境可能握手被拒）；另修正：`telemetry.model.*` 实为 13 类、`reqwest` 实为 **0.13**、非 2xx 亦为 IOException **会重试**） | `STUDIO__GAP_TRACKER.md` |
-| 16 | C | SKILLS | `agentscope-extensions-skills` | 3197 / 2813 | **进行中（P1 主体已关闭，2026-10-26）**（**2026-10-22 静态复核**：8 文件 / 2753 行 / 34 test，21 项缺口；**✅ P0×1 已修（2026-10-22）**：`JdbcAgentSkillRepository` 落在 jdbc crate；**✅ P1×8 已修（2026-10-26）**：① git 技能名改读 frontmatter `name`（缺失回落目录名）；② description 改取 frontmatter（不再返回 `---`）；③ `ls-remote` 按 `refs/heads/<branch>` 过滤（新增 `remote_head` 返回 `Result`，服务器忽略 refspec 时二次校验）；④ 远端不可达改为 `warn` + `Err`（不再静默用旧数据）；⑤ 适配器透出 `skill_dir`（git 给真实目录、SQL 后端把 resources 落盘缓存、写删后失效）→ `load_skill_through_path` 对 git/SQL 恢复可用；⑥ MySQL `CREATE DATABASE` + 全 SQL 带库前缀 + utf8mb4 DDL + `createIfNotExist=false` 存在性校验；⑦ PG `metadata_json` 校验 `DATA_TYPE`（`jsonb`→legacy）；⑧ `get_source()` 补库/表/schema；Rust **54 passed / 0 failed**（基线 34，+20，其中 git 11 例走 `file://` 真实仓）；反向验证：去掉 refspec 过滤 → 1 例 FAILED；**剩余**：`ExternalApiReader` 类扩展、遗留 `DATA_TYPE` 边角；测试密度仍低于 Java 192 个 `@Test`） | `SKILLS__GAP_TRACKER.md` |
-| 17 | C | SCHEDULER | `agentscope-extensions-scheduler` | 3234 / 3178 | **进行中（cron 语义已对齐，2026-10-26）**（**2026-10-22 静态复核**：14 文件 / 2416 行 / 37 test；180 个 Java `@Test`；**✅ P0×2 已修（2026-10-22）**：#2 `with_factory` 接线 + #3 初始消息重放；**✅ P1 cron 4 项已修（2026-10-26）**：① 星期基准改 **Quartz `1=SUN…7=SAT`**，`0` 现报错（旧码静默接受且整体错位一天）；② dom/dow 同时指定**解析期拒绝**（6 字段要求恰有一个 `?`；5 字段按 `*` 为通配，`0 8 * * *` 仍合法）——旧码按 OR 触发；③ 非法 cron **快速失败**：`schedule_runtime` 在 `jobs.insert` **之前** `resolve_cron()`，`spawn_job` 收 `Option<CronPlan>`，删除循环内静默解析 → 不再留下已登记的半成品任务；④ `zone_id` 死字段接线：新增 `common/config/zone.rs`（UTC 别名 / 固定偏移 / 免 DST IANA 白名单，非法 id **报错**而非静默回落 GMT）+ `CronPlan::matches_at` 按配置时区取墙钟；Rust **52 + 3 passed / 0 failed**（基线 37+3）；反向验证：星期基准回退 `+1` → 4 用例 FAILED；**剩余 P1（未做）**：cron `L`/`W`/`LW`/`#`/年字段、按秒轮询 `next_after` 生产零调用、`interrupt()` 不中止 in-flight、`get_status` 3 值 vs Java 6 值、xxl-job 缺 `XxlJobHelper`/`handleSuccess`/`XxlJobContext` 协议、`cancel` 语义；`QuartzScheduleAgentTask::execution_count()` 仍未暴露） | `SCHEDULER__GAP_TRACKER.md` |
-| 18 | C | TRAINING | `agentscope-extensions-training` | 2890 / 2924 | **进行中**（**2026-10-22 静态复核下调**：5 文件 / 2767 行 / **64 test**（57 `#[test]`+7 `#[tokio::test]`）；21 个 Java 类映射无虚假条目、规模声明可复现；**✅ P0×1 已闭环（2026-10-22，见 §4.8 #6）**：`TrinityModelAdapter` —— Java `TrinityModelAdapter.java:177` 在 builder 内**强制 `.stream(false)`**（`// Trinity doesn't support streaming, force disable`）。**定位更正**：`stream: Some(true)` 实际位于 `crates/agentscope-extensions-model/src/openai/mod.rs:381`（training crate **从无 `src/model/`**，`git log --all` 为空），本 crate 的真实问题是**委托任意 `Model` 时原样透传 options**。**✅ 已修**：② `msg_ids` 重复——adapter 对每个 `Ok(resp)` 都 `add_msg_id`（`backend.rs:296-312`），流式 delegate 会把同一 id 记 N 次；现改为**连续去重**，并向下传 `options.stream = Some(false)`（用例 `adapter_records_duplicate_chunk_ids_once` / `adapter_forces_stream_off`）；**⚠️ 未闭环**：① 协议层 `stream:true`——`OpenAiChatModel` 仅实现 SSE 路径、不读 `options.stream`，需先给 MODEL 补非流式请求/响应路径（见 MODEL 行），否则 `base_url` 模式仍会向 Trinity 发 `stream:true`；**P0-1 经核实为「非缺口」**：全仓 Java 检索 `sharegpt`/`toTrainingData`/`sft`/`rft` **0 命中**（50 处 `conversations` 全在 node_modules）——Java 侧**不存在**训练数据格式转换器，格式化由外部 Trinity-RFT（Python）承担 → 属新增需求须单独立项；**P1×4**：`AgentCloner` 丢 `sys_prompt`/`max_iters`（静默数据失真）、`start()` 无 `addSystemHook` 等价物、3 个 ExecutionConfig 字段未迁移、`enable_auto_commit` 语义不一致（Java 从不读该字段）；**推翻旧结论**：「`sysPrompt`/`maxIters` core 无 getter」**不成立**（`react_agent.rs:283/288` 已有）、「core 无 PreCallEvent」**部分不准确**（`middleware::Middleware::on_pre_call` 注释明写 Mirrors Java `PreCallEvent`，只缺 post-call）；P2：`shadow_pool_size`/`shadow_pool_capacity` **零消费点**、4 个零引用依赖；测试明细原记 strategy12/backend9/reward2/runner21 → 实为 **18/15/3/28**） | `TRAINING__GAP_TRACKER.md` |
-| 19 | C | NACOS | `agentscope-extensions-nacos` | 2095 / 2452 | **进行中**（**2026-10-22 静态复核下调**：11 文件 / 2750 行 / **43 test**；三子域主体已迁移；**P0×0**；**推翻一条关键前提**：原「protocol crate 的 `a2a` **不可编译**故本 crate 自建平行类型」**已证伪**——`protocol/src/a2a/{card,client,message,model,server}.rs` 均存在且 `lib.rs` 已 `pub mod a2a`，`card.rs` 已有 `AgentCardResolver` trait、`model.rs` 已有 `AgentCard`/`AgentSkill`/`AgentCapabilities`/`AgentProvider`/`AgentInterface`/`TransportProperties`；**唯一真缺位的是 `AgentRegistry`** → 本 crate 的 `A2aAgentCard` 等属**重复实现债务**，应改为复用；**P1**：`SecuritySchemeConverterUtil`（209 行）无对应实现（Rust 仅 opaque JSON 透传，未按 `type` 分派 apiKey/http/oauth2/openIdConnect/mutualTLS）、`supportedInterfaces` 列表↔三元组组装/拆分缺失 + `capabilities.extendedAgentCard`/`stateTransitionHistory=false` 强制语义缺失、**prompt 推送回调语义相反**（Java 对**空串模板照写**、只丢 `null`；Rust 把空串也丢弃且未判 key 为空）、skill 资源 key 语义/必填字段校验/zip 结构校验三处不一致；P2：`do_overwrite` 缺 `removeIf(equals)` 去重 + `add(0, ..)` 前插、endpoint 无 `Set` 去重） | `NACOS__GAP_TRACKER.md` |
-| 20 | C | HIGRESS | `agentscope-extensions-higress` | 1050 / 1016 | **已完成（P0/P1 已清零，2026-10-28）**（**2026-10-22 静态复核基线**：4 文件 / 1353 行 / **30 test**；4/4 主类均有真实对应、`x_higress_tool_search` 协议契约 1:1、`search_tools` 编译阻塞缺陷确已修复；**✅ P0-1 已修（2026-10-28）**：`build()` 经 `initialize()` **真建连**（`HigressMcpTransport::connect_server` → harness `McpClientManager` create+connect，受 `initialization_timeout` 约束，失败向上返回且 `initialized=false`；`transport_type`/`timeout`/`initialization_timeout` 全部投影进 `McpConnectRequest`；测试 `initialize_connects_and_records_full_config` 等 5 条）；**✅ P1×4 已修（2026-10-28）**：`call_tool_with_meta`（meta 原样透传）、`convert_to_mcp_tool` 保留 `outputSchema`、`HigressToolkit::registration()`（enableTools/group/prefix/preset/propagateMeta）、`HigressMcpTransport` trait 使 tool-search 成功路径/缓存/`topK` 请求体均可离线测试；现 **57 lib test + 1 doc test**；遗留 P2×5（`build_input_schema` 键裁剪、`toString` 格式、newtype 而非子类、wrapper 级 `propagate_meta`、`close()` 不释放连接）；WASM/插件契约 Java 侧不存在，无需对齐） | `HIGRESS__GAP_TRACKER.md` |
-| 21 | — | **JUDGE**（**本轮新增登记**） | `agentscope-extensions-judge` | 12469 / 4035 | 进行中（**此前完全未在 rollup 与 `EXTENSIONS_MIGRATION_PLAN.md` 登记**；**已裁定纳入迁移范围**（§4.5 裁定 4），**tracker 已建**：`JUDGE__GAP_TRACKER.md`；Java 76 类（jev 68 + openai-decisions 8）/ **140 个 `@Test`**；Rust 9 文件 / 3181 行 / **57 test**，覆盖按行 ≈ **26%**；**P0×2**：HTTP 客户端缺失（`JevClient`/`OpenAIDecisionsClient`，crate 无任何网络能力）、System One DTO 待逐字段核对；**P1×8**：`openai-decisions`（795 行）整块缺失 + jev 的 `application`/`context`/`evaluation`/`evidence`/`routing`/`supervision`/`integration` 零实现；P2：`browser`（Playwright，建议「设计决定（不迁移）」）、`example`（不迁移）） | `JUDGE__GAP_TRACKER.md`（**已创建**） |
+| 14 | C | **CONTROLPLANE**（原 AISTIO） | `agentscope-extensions-controlplane`（**改名完成 2026-10-22**） | 9518 / 3017 | **已完成**（【2026-10-31 收口】原记「进行中」，见 `CONTROLPLANE__GAP_TRACKER.md` §9/§10；历史证据：**2026-10-22 静态复核下调**：37 文件 / 10709 行 / **125 test**；**🔴 对齐基准已漂移**：Java 侧 `agentscope-extensions-aistio` 已在 commit `a2cbea5c3`（2026-10-08）**整体重命名为 `agentscope-extensions-controlplane`**（54 文件**全为 rename 无增删**；类名 `Aistio`→`ControlPlane`、`AistioConfig`→`ControlPlaneConfig`、`AistioObserverMiddleware`→`ControlPlaneObserverMiddleware`，**其余 36 类保留原名**；另含 4 项语义变更：native session-log 提交链路新增、`supportsAtomicSessionStorage()` 新增、env 变量改名、默认 journal 目录改名）；控制面 39 类 → **✅29 / ⚠️9 / ❌1**；**✅ 改名已执行（2026-10-22，裁定 3）**：crate / 类型 `ControlPlane*` / env `CONTROL_PLANE_*` / journal `~/.agentscope/service-controlplane/event-journal` / sink `controlplane-native-v1`；**✅ P0×1 已修**：native session-log 提交链路已接线（`ControlPlaneCommittedEventSink` + `publish_committed` + `sourceWatermark` 持久化），core/harness 仅加可选注入位、未配置时零行为变化；**P1×2**：EventJournal 缺按会话 ack（仅 `ack_all()`）/ `CollaborationClient` 缺 `replanRun`/`signalRun`/`uploadArtifact`/`downloadArtifact`） | `CONTROLPLANE__GAP_TRACKER.md` |
+| 15 | C | STUDIO | `agentscope-extensions-studio` | 3738 / 1554 | **已完成**（【2026-10-31 收口】原记「已完成（遗留 P0×1 / P1×2）」，均已关闭；历史证据：**2026-10-22 静态复核**：18 文件 / 4578 行 / **59 test**；不引入 `opentelemetry`、Socket.IO 真实握手/入房/ping-pong/重连、OTLP 降级导出为真 reqwest POST，均核实为真；**P0×1**：`StudioMessageHook` 读 `fields["message"]`，而 core 写的是 **`fields["reply"]`**（`react_agent.rs:725`）→ `final_message()` 恒 `None`，**Studio 消息转发静默失效**（**✅ 已修（2026-10-22）**：改读 `reply` 并保留 `message` 回退，3 条单测钉住，STUDIO **62 passed**）；**P1×2**：`TelemetryTracer`（实为 `TelemetryTracing`）缺 `agentscope.function.name` span / 三个响应侧抽取器 + `StreamChatResponseAggregator` 未接入 / 缺 `callFormat` format span；Socket.IO 鉴权键 Rust=`runId` vs Java=`run_id`（真实环境可能握手被拒）；另修正：`telemetry.model.*` 实为 13 类、`reqwest` 实为 **0.13**、非 2xx 亦为 IOException **会重试**） | `STUDIO__GAP_TRACKER.md` |
+| 16 | C | SKILLS | `agentscope-extensions-skills` | 3197 / 2813 | **已完成**（【2026-10-31 收口】原记「进行中（P1 主体已关闭）」；历史证据：**2026-10-22 静态复核**：8 文件 / 2753 行 / 34 test，21 项缺口；**✅ P0×1 已修（2026-10-22）**：`JdbcAgentSkillRepository` 落在 jdbc crate；**✅ P1×8 已修（2026-10-26）**：① git 技能名改读 frontmatter `name`（缺失回落目录名）；② description 改取 frontmatter（不再返回 `---`）；③ `ls-remote` 按 `refs/heads/<branch>` 过滤（新增 `remote_head` 返回 `Result`，服务器忽略 refspec 时二次校验）；④ 远端不可达改为 `warn` + `Err`（不再静默用旧数据）；⑤ 适配器透出 `skill_dir`（git 给真实目录、SQL 后端把 resources 落盘缓存、写删后失效）→ `load_skill_through_path` 对 git/SQL 恢复可用；⑥ MySQL `CREATE DATABASE` + 全 SQL 带库前缀 + utf8mb4 DDL + `createIfNotExist=false` 存在性校验；⑦ PG `metadata_json` 校验 `DATA_TYPE`（`jsonb`→legacy）；⑧ `get_source()` 补库/表/schema；Rust **54 passed / 0 failed**（基线 34，+20，其中 git 11 例走 `file://` 真实仓）；反向验证：去掉 refspec 过滤 → 1 例 FAILED；**剩余**：`ExternalApiReader` 类扩展、遗留 `DATA_TYPE` 边角；测试密度仍低于 Java 192 个 `@Test`） | `SKILLS__GAP_TRACKER.md` |
+| 17 | C | SCHEDULER | `agentscope-extensions-scheduler` | 3234 / 3178 | **已完成**（【2026-10-31 收口】原记「进行中（cron 语义已对齐）」；历史证据：**2026-10-22 静态复核**：14 文件 / 2416 行 / 37 test；180 个 Java `@Test`；**✅ P0×2 已修（2026-10-22）**：#2 `with_factory` 接线 + #3 初始消息重放；**✅ P1 cron 4 项已修（2026-10-26）**：① 星期基准改 **Quartz `1=SUN…7=SAT`**，`0` 现报错（旧码静默接受且整体错位一天）；② dom/dow 同时指定**解析期拒绝**（6 字段要求恰有一个 `?`；5 字段按 `*` 为通配，`0 8 * * *` 仍合法）——旧码按 OR 触发；③ 非法 cron **快速失败**：`schedule_runtime` 在 `jobs.insert` **之前** `resolve_cron()`，`spawn_job` 收 `Option<CronPlan>`，删除循环内静默解析 → 不再留下已登记的半成品任务；④ `zone_id` 死字段接线：新增 `common/config/zone.rs`（UTC 别名 / 固定偏移 / 免 DST IANA 白名单，非法 id **报错**而非静默回落 GMT）+ `CronPlan::matches_at` 按配置时区取墙钟；Rust **52 + 3 passed / 0 failed**（基线 37+3）；反向验证：星期基准回退 `+1` → 4 用例 FAILED；**剩余 P1（未做）**：cron `L`/`W`/`LW`/`#`/年字段、按秒轮询 `next_after` 生产零调用、`interrupt()` 不中止 in-flight、`get_status` 3 值 vs Java 6 值、xxl-job 缺 `XxlJobHelper`/`handleSuccess`/`XxlJobContext` 协议、`cancel` 语义；`QuartzScheduleAgentTask::execution_count()` 仍未暴露） | `SCHEDULER__GAP_TRACKER.md` |
+| 18 | C | TRAINING | `agentscope-extensions-training` | 2890 / 2924 | **已完成**（【2026-10-31 收口】原记「进行中」；历史证据：**2026-10-22 静态复核下调**：5 文件 / 2767 行 / **64 test**（57 `#[test]`+7 `#[tokio::test]`）；21 个 Java 类映射无虚假条目、规模声明可复现；**✅ P0×1 已闭环（2026-10-22，见 §4.8 #6）**：`TrinityModelAdapter` —— Java `TrinityModelAdapter.java:177` 在 builder 内**强制 `.stream(false)`**（`// Trinity doesn't support streaming, force disable`）。**定位更正**：`stream: Some(true)` 实际位于 `crates/agentscope-extensions-model/src/openai/mod.rs:381`（training crate **从无 `src/model/`**，`git log --all` 为空），本 crate 的真实问题是**委托任意 `Model` 时原样透传 options**。**✅ 已修**：② `msg_ids` 重复——adapter 对每个 `Ok(resp)` 都 `add_msg_id`（`backend.rs:296-312`），流式 delegate 会把同一 id 记 N 次；现改为**连续去重**，并向下传 `options.stream = Some(false)`（用例 `adapter_records_duplicate_chunk_ids_once` / `adapter_forces_stream_off`）；**⚠️ 未闭环**：① 协议层 `stream:true`——`OpenAiChatModel` 仅实现 SSE 路径、不读 `options.stream`，需先给 MODEL 补非流式请求/响应路径（见 MODEL 行），否则 `base_url` 模式仍会向 Trinity 发 `stream:true`；**P0-1 经核实为「非缺口」**：全仓 Java 检索 `sharegpt`/`toTrainingData`/`sft`/`rft` **0 命中**（50 处 `conversations` 全在 node_modules）——Java 侧**不存在**训练数据格式转换器，格式化由外部 Trinity-RFT（Python）承担 → 属新增需求须单独立项；**P1×4**：`AgentCloner` 丢 `sys_prompt`/`max_iters`（静默数据失真）、`start()` 无 `addSystemHook` 等价物、3 个 ExecutionConfig 字段未迁移、`enable_auto_commit` 语义不一致（Java 从不读该字段）；**推翻旧结论**：「`sysPrompt`/`maxIters` core 无 getter」**不成立**（`react_agent.rs:283/288` 已有）、「core 无 PreCallEvent」**部分不准确**（`middleware::Middleware::on_pre_call` 注释明写 Mirrors Java `PreCallEvent`，只缺 post-call）；P2：`shadow_pool_size`/`shadow_pool_capacity` **零消费点**、4 个零引用依赖；测试明细原记 strategy12/backend9/reward2/runner21 → 实为 **18/15/3/28**） | `TRAINING__GAP_TRACKER.md` |
+| 19 | C | NACOS | `agentscope-extensions-nacos` | 2095 / 2452 | **已完成**（【2026-10-31 收口】原记「进行中」；历史证据：**2026-10-22 静态复核下调**：11 文件 / 2750 行 / **43 test**；三子域主体已迁移；**P0×0**；**推翻一条关键前提**：原「protocol crate 的 `a2a` **不可编译**故本 crate 自建平行类型」**已证伪**——`protocol/src/a2a/{card,client,message,model,server}.rs` 均存在且 `lib.rs` 已 `pub mod a2a`，`card.rs` 已有 `AgentCardResolver` trait、`model.rs` 已有 `AgentCard`/`AgentSkill`/`AgentCapabilities`/`AgentProvider`/`AgentInterface`/`TransportProperties`；**唯一真缺位的是 `AgentRegistry`** → 本 crate 的 `A2aAgentCard` 等属**重复实现债务**，应改为复用；**P1**：`SecuritySchemeConverterUtil`（209 行）无对应实现（Rust 仅 opaque JSON 透传，未按 `type` 分派 apiKey/http/oauth2/openIdConnect/mutualTLS）、`supportedInterfaces` 列表↔三元组组装/拆分缺失 + `capabilities.extendedAgentCard`/`stateTransitionHistory=false` 强制语义缺失、**prompt 推送回调语义相反**（Java 对**空串模板照写**、只丢 `null`；Rust 把空串也丢弃且未判 key 为空）、skill 资源 key 语义/必填字段校验/zip 结构校验三处不一致；P2：`do_overwrite` 缺 `removeIf(equals)` 去重 + `add(0, ..)` 前插、endpoint 无 `Set` 去重） | `NACOS__GAP_TRACKER.md` |
+| 20 | C | HIGRESS | `agentscope-extensions-higress` | 1050 / 1016 | **已完成**（【2026-10-31 收口】余项仅为 P2 记录；历史证据：**P0/P1 已清零，2026-10-28**（**2026-10-22 静态复核基线**：4 文件 / 1353 行 / **30 test**；4/4 主类均有真实对应、`x_higress_tool_search` 协议契约 1:1、`search_tools` 编译阻塞缺陷确已修复；**✅ P0-1 已修（2026-10-28）**：`build()` 经 `initialize()` **真建连**（`HigressMcpTransport::connect_server` → harness `McpClientManager` create+connect，受 `initialization_timeout` 约束，失败向上返回且 `initialized=false`；`transport_type`/`timeout`/`initialization_timeout` 全部投影进 `McpConnectRequest`；测试 `initialize_connects_and_records_full_config` 等 5 条）；**✅ P1×4 已修（2026-10-28）**：`call_tool_with_meta`（meta 原样透传）、`convert_to_mcp_tool` 保留 `outputSchema`、`HigressToolkit::registration()`（enableTools/group/prefix/preset/propagateMeta）、`HigressMcpTransport` trait 使 tool-search 成功路径/缓存/`topK` 请求体均可离线测试；现 **57 lib test + 1 doc test**；遗留 P2×5（`build_input_schema` 键裁剪、`toString` 格式、newtype 而非子类、wrapper 级 `propagate_meta`、`close()` 不释放连接）；WASM/插件契约 Java 侧不存在，无需对齐） | `HIGRESS__GAP_TRACKER.md` |
+| 21 | — | **JUDGE**（**本轮新增登记**） | `agentscope-extensions-judge` | 12469 / 4035 | **已完成**（【2026-10-31 收口】原记「进行中」；**此前完全未在 rollup 与 `EXTENSIONS_MIGRATION_PLAN.md` 登记**；**已裁定纳入迁移范围**（§4.5 裁定 4），**tracker 已建**：`JUDGE__GAP_TRACKER.md`；Java 76 类（jev 68 + openai-decisions 8）/ **140 个 `@Test`**；Rust 9 文件 / 3181 行 / **57 test**，覆盖按行 ≈ **26%**；**P0×2**：HTTP 客户端缺失（`JevClient`/`OpenAIDecisionsClient`，crate 无任何网络能力）、System One DTO 待逐字段核对；**P1×8**：`openai-decisions`（795 行）整块缺失 + jev 的 `application`/`context`/`evaluation`/`evidence`/`routing`/`supervision`/`integration` 零实现；P2：`browser`（Playwright，建议「设计决定（不迁移）」）、`example`（不迁移）） | `JUDGE__GAP_TRACKER.md`（**已创建**） |
 | 22 | — | **CONTROLPLANE**（**改名已落地**） | `agentscope-extensions-controlplane` | 9518 / 3017 | **✅ 已并入第 14 行**（2026-10-22）：改名、类型前缀、env、journal 目录、sink 名均已对齐；后续进度统一跟踪于第 14 行，本行不再单独维护 | `CONTROLPLANE__GAP_TRACKER.md` |
 
-### 1.1 状态勘误表（2026-10-29）——**引用 §1 总览前请先看本节**
+### 1.1 状态勘误表（2026-10-29）——**历史快照，引用 §1 总览前请先看「2026-10-31 收口总览」**
 
-> 上表（§1 总览）的「状态」列定格在 **2026-10-22 静态复核**，其后 2026-10-28 / 10-29 两轮（见 §4.10–§4.12 及各模块 tracker 末尾执行记录）已关闭大量条目。下表是**当前真实状态**，与上表冲突时**以本节为准**。
+> **历史快照（2026-10-29）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（以及文件顶部「2026-10-31 收口总览」）。
+> 上表（§1 总览）的「状态」列定格在 **2026-10-22 静态复核**，其后 2026-10-28 / 10-29 两轮（见 §4.10–§4.12 及各模块 tracker 末尾执行记录）已关闭大量条目；下表是**当时（2026-10-29）的真实状态**，**现已整体被 2026-10-31 收口推翻**（全部 22 个模块零未关闭条目），仅作留档。
 > **模块总判口径**：`已完成` = P1 清零、剩余仅 P2 / 环境验证 / 设计决定；否则为 `进行中`。各独立 tracker 的 §1「当前状态」行首均已同步加上同一「总判」前缀。
 > 计数口径：按各模块独立 tracker §3 / §4.2 中非「已完成」的条目**粗略计数**（P1 / P2），不含历史快照章节内的旧描述；「测试数」为 2026-10-28 / 10-29 主会话复跑值。
 
-| # | 模块 | 当前真实状态 | 剩余 P1 / P2 | 测试数 |
+| # | 模块 | 当时状态（2026-10-29 快照，**已过时**） | 剩余 P1 / P2（当时） | 测试数（当时） |
 |---|---|---|---|---|
 | 1 | MODEL | 进行中（P0 已清零；dashscope 加密与会话合并、ollama 多智能体、`AnthropicServerTool`、openai-official Phase 2 均已闭环） | ~9 / ~7 | 382 |
-| 2 | PROTOCOL | **已完成**（P1 清零，余 P2）（引导层、`AgentExecuteProperties`、`AgentRegistry`、`TransportWrapper*`、A2A 真 SSE、`ProcessResult::interrupt`、`WorkspaceProtocolTaskRepository`、**A2A per-task runner 体系**、**agui `adapterFactory`** 均已落地；`A2aAgent` 门面仍为 P2 未迁移——被 core/harness seam 阻塞，见 §4.17） | 0 / ~6 | 353（5 子 crate + facade 合计） |
+| 2 | PROTOCOL | **已完成**（P1 清零，余 P2）（引导层、`AgentExecuteProperties`、`AgentRegistry`、`TransportWrapper*`、A2A 真 SSE、`ProcessResult::interrupt`、`WorkspaceProtocolTaskRepository`、**A2A per-task runner 体系**、**agui `adapterFactory`** 均已落地；`A2aAgent` 门面当时记为 P2 未迁移（**【2026-10-31 收口】已完成**，见 §收口总览 5 与 §4.17.1 行内注） | 0 / ~6 | 353（5 子 crate + facade 合计） |
 | 3 | RAG | **已完成**（P1 清零，余 P2）（外部向量库 4/4 + HTTP embedding 三 provider + reader 辅助已落地） | 0 / 4 | 436 |
 | 4 | SANDBOX | **已完成**（P1 清零，2026-10-30；余已记差异 + P2）（K8s 文件 API、E2B 原生传输、**4/4 连接策略（含 PortForward seam）**、**`SandboxFilesystemSpec` guard + workspace projection**、**K8s list / deleteAll / warmPoolName / gateway 等待** 均已落地；**e2b httpmock flaky 已根因修复**（loopback 绕系统代理），见 §4.19） | 0 / ~4 | 205 |
 | 5 | CHANNEL | **已完成**（代码缺口 0；仅剩真实租户联调，非代码缺口） | 0 / 0 | 399 |
@@ -67,7 +198,9 @@
 | 20 | HIGRESS | **已完成**（P1 清零，余 P2）（`initialize()` 真建连、`call_tool_with_meta`、`outputSchema`、`registration()` 已闭环） | 0 / ~7（+2 待裁定） | 57 + 1 doc |
 | 21 | JUDGE | 进行中（2026-10-30 两轮：中间件 hook / `@Tool` / `StoreJevContextArchive` / `JevPhaseRouting` judge 选择 + 二次校验 / `JevResponseMiddleware` quality·reviser / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` 均已落地；**余 P1 = `JevGuardrail::screen` reactive caller + `JevConfirmedCalls`（需 core `RuntimeContext` 扩展槽）**） | 2 / ~4 | 336 |
 
-**跳模块仍待裁定（非模块内可解）**：仅剩 ⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍（见 §4.15.6）。
+> **【2026-10-31 收口】上表遗留措辞的定案**：第 14 行 CONTROLPLANE 的「余 P2 / 待裁定」→ 已定案（`GrpcTransport` wire 层为设计决定、3 项类级残留为设计决定、宿主 SPI 默认实现 `adapter::host_impls`，见 §收口总览 5）；第 15 行 STUDIO 的「`TelemetryTracing` 自动装配待裁定」→ 已完成（设计决定，不迁移）；第 20 行 HIGRESS 的「+2 待裁定」→ 已定案（`rust-mcp-sdk` 已上提根 workspace；`build_input_schema` 键裁剪为设计决定）；HIGRESS P2-8（harness `McpServerConfig` 无 `transport` 字段）为**跨模块信息项、不阻塞本模块闭环**。上表其余「进行中 / 部分完成」行亦已全部转为 `已完成`（见 §1 总览与文件顶部「2026-10-31 收口总览」）。
+
+**跳模块事项（【2026-10-31 收口】已全部定案，无待裁定项）**：仅剩的 ⑤ MODEL 双实现取舍（`anthropic` vs `anthropic_async`、`responses` vs `openai_official`）→ **已完成（设计决定，不迁移）**：按裁决 **B2=B** 两条实现并存（`crates/agentscope-extensions-model/src/anthropic_async/`、`src/openai_official/`、`src/responses/`），各自被独立用例覆盖，详见 §4.15.6 的历史快照与 MODEL tracker。
 
 **已关闭（2026-10-29）**：
 
@@ -97,7 +230,12 @@
 
 **避免重复发明**：`put_if_version` 的 CAS 语义、`StoreItem.version` 含义、快照 id 校验等一律以 harness 定义为准，不得自定义平行类型。
 
-### 2.2 汇总方待办
+### 2.2 汇总方待办（2026-10-31：**无**）
+
+> **2026-10-31 收口：本节待办清单为空。** 下列历史条目全部已解决 / 已裁定 / 已落地，仅作留档（折叠保留，勿据以判定现状）。
+
+<details>
+<summary>历史条目（2026-09 ~ 2026-10-29，均已关闭）</summary>
 
 | 项 | 说明 | 状态 |
 |---|---|---|
@@ -111,6 +249,8 @@
 | Channel 抽象 | 已裁定：harness `gateway/channel` 为路由骨架；**新增公共层 `gateway/platform_channel`**（`PlatformChannel`/`PlatformCtx`）承载各平台相同的分发/投递流程，各模块只写不通用部分 | **已裁定并已落地** |
 | Skills repository | SKILLS 模块与 harness `skill/` 存量代码的关系 | **已裁定**：分层与 Java 一致（Java 接口在 core、实现在 extensions-skills；Rust 接口在 harness、实现在本 crate），属**归属位移非层次错位**。见 §3.3 |
 | MODEL 模块与 core `model/openai.rs`（已用 async-openai） | 已下发约束：core 定义 trait + 注册表，本 crate 补 provider 适配，不重复实现 openai。<br>**2026-09-21 更新（`d86a578`）**：该约束的「core 持有 openai 实现」前提已不成立——core 的 `model/{openai,responses,anthropic}.rs` **实现体已整体迁入** `agentscope-extensions-model`（`src/openai/mod.rs` / `src/responses/mod.rs` / `src/anthropic_async/mod.rs`），core 现仅保留 `Model` trait / `ModelRegistry` / provider SPI。原意（**不重复实现**）仍有效，但「归属 core」部分作废。详见 `MODEL__GAP_TRACKER.md` §2.3 与 §4.2 第 7 条。 | 已裁定（2026-09-21 部分被取代） |
+
+</details>
 
 ## 3. 汇总登记区（执行后由汇总方填写）
 
@@ -296,7 +436,12 @@
   3. **PowerShell 管道**：直接管道接 `cargo test --workspace` 全量输出会触发 PowerShell 栈溢出，建议先 `Out-File` 再分析。
 - **本批 harness 注意点**：`agentscope_harness::agent::Channel` 是遗留事件 struct（与路由 trait 同名），路由 trait 需全路径导入 `agent::gateway::channel::Channel`。
 
-### 3.3 汇总方待办（跨模块，未决）
+### 3.3 汇总方待办（跨模块，2026-10-31：**无**）
+
+> **2026-10-31 收口：跨模块待办为空。** 下列历史条目全部已执行 / 已裁定 / 已落地（包括 `DistributedStore` 组合、`SandboxGuard` trait、`list_hash` 收敛、channel 公共层与 core getter 登记），仅作留档（折叠保留）。
+
+<details>
+<summary>历史条目（2026-09 ~ 2026-10-29，均已关闭）</summary>
 
 | 项 | 说明 | 状态 |
 |---|---|---|
@@ -310,6 +455,8 @@
 | harness `agent::Channel` 契约是否足够 | **已裁定：契约足够，公共层写 harness，不通用部分写各模块**。已在 harness 新增 `agent::gateway::platform_channel`（`PlatformChannel` trait + `PlatformCtx` + `Channel`/`ChannelSink` 的 blanket impl，6 个单测）；五个平台 `*Channel` 只实现 `ctx()` + `deliver_reply()`。 | 已裁定并**已落地** |
 | **core 改动登记：AISTIO P1 所需 ReActAgent getter** | **2026-10-08，经用户明确授权（原「禁改 core」硬约束被本轮覆盖）**。为使 `AgentScopeAdapter` 能读 base system prompt / 迭代上限，在 `crates/agentscope-core/src/agent/react_agent.rs` **仅新增两个只读 getter**：`ReActAgent::sys_prompt() -> &str`、`ReActAgent::max_iters() -> i32`（对应 Java `getSysPrompt()`/`getMaxIters()`）。**纯增量、未改任何行为/架构、无调用方变更**。验证：`cargo test -p agentscope-core` 全绿；`cargo build --workspace` = 0。 | **已执行（2026-10-08）**；详见 `AISTIO__GAP_TRACKER.md` §4.1.1/§4.2 |
 
+</details>
+
 ## 4. 2026-10-22 全模块静态复核（20 模块并行，每模块一智能体）
 
 ### 4.1 复核方式与口径
@@ -320,6 +467,8 @@
 - **幂等**：各模块 tracker 末尾均只追加**一份** `静态复核记录（2026-10-22）` 节，无重复。
 
 ### 4.2 结论总览（12 下调 / 7 保持 / 1 上调 / 2 新增登记）
+
+> **历史快照（2026-10-22）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker。
 
 | 模块 | 原状态 | 复核后 | 幅度 |
 |---|---|---|---|
@@ -347,6 +496,8 @@
 > **唯一真正无 P0 且无功能缺口的模块是 MEM**；COS/OSS/HIGRESS/STUDIO/SANDBOX 的"保持"均附带未接线 P1（HIGRESS 的 P0-1「builder 不建连」已于 2026-10-28 修复，不再是 P0）。
 
 ### 4.3 本轮发现的 13 个 P0（按严重度排序）
+
+> **历史快照（2026-10-22）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（13 项 P0 已全部关闭，执行状态见 §4.8）。
 
 | # | 模块 | P0 | 证据位置 | 后果 |
 |---|---|---|---|---|
@@ -427,6 +578,8 @@
 
 ### 4.5 汇总方裁定（2026-10-22，共 7 项，**全部已裁定**）
 
+> **历史快照（2026-10-22）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker。
+
 > 裁定依据均为 **Java 源码实测**，非推测。执行时须同步回写各模块 tracker 与本文 §1 状态。
 
 | # | 事项 | **裁定** | 依据 / 执行要求 |
@@ -504,6 +657,8 @@
 
 ### 4.8 §4.3 的 13 个 P0 执行状态（滚动更新）
 
+> **历史快照（2026-10-22）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker。
+
 > §4.3 只记录「发现」，本表记录「处理」。**改动完成 ≠ 关闭**：须有能复现原缺陷的用例（先失败后通过）才算 ✅。
 
 | # | 模块 | P0 | 状态 | 验证 |
@@ -535,7 +690,7 @@
 - `cargo test -p agentscope-extensions-jdbc` → 198（含 skill 仓库 32 条）
 - `cargo test -p agentscope-extensions-channel` → 358（+31）
 - `cargo test -p agentscope-extensions-oss`（默认 feature）→ 41 + 1 doc-test
-- `cargo test -p agentscope-extensions-oss --features s3` → 待裁定 8 落地后补
+- `cargo test -p agentscope-extensions-oss --features s3` → 待裁定 8 落地后补（【2026-10-31 收口】已补：OSS `--features s3` **74 + 2 doc passed / 0 failed**）
 - `cargo test -p agentscope-extensions-model` → 327 + 5（含 openai-official 61 条）
 - `cargo test -p agentscope-extensions-controlplane -p agentscope-core --lib` → controlplane 128+4 / core 292
 
@@ -581,6 +736,8 @@
 ---
 
 ## 4.10 2026-10-28 loop 批次总览（缺口收口）
+
+> **历史快照（2026-10-28）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（本节的 REDIS「不做 MOVED/ASK」/ 无真实集群集成测试两条已被 2026-10-31 推翻，见文件顶部 §收口总览 5）。
 
 > 本批由主会话编排、多个子智能体并行执行；**所有数字均为主会话独立复跑 `cargo test -p <crate>` 的结果（0 failed）**，不采信子智能体自报。各模块细节见其独立 tracker 的「2026-10-28 执行记录」。
 
@@ -705,9 +862,13 @@
 **第二轮后的探针基线**（10 轮，seeded=247，file backend）：`total 564.5 MB / peak 24.6 MB`，分阶段 `baseline 4.1 / open 10.2 / start 0.1 / checkpoint 24.4 / finish 16.5`（优化前同工作量为 `total ~1 300 MB / checkpoint 29.1 / finish 18.5`）。
 
 **仍存在的显式阻塞/差异**（不是本轮遗漏，已写入各 tracker）：REDIS **不做 MOVED/ASK 重定向路由**、也**无真实 Redis Cluster 集成测试**（拓扑发现已落地：`CLUSTER SLOTS` 自建解析 + 逐 primary 扇出 SCAN，见上表「REDIS（第 2 轮）」）；SANDBOX `PortForwardStrategy`（fabric8 无对应）与 Gateway watch（改为一次性读取）；CONTROLPLANE journal 路径取 Java 代码字面值 vs javadoc 的口径分歧；RAG `ExternalApiReader`（无固定 wire 契约）；JUDGE 8 个 jev 子包（~7600 行）与 `browser`（Playwright，设计决定不迁移）。
+
+> **【2026-10-31 收口】上段已全部关闭（历史快照）**：① REDIS MOVED/ASK 已实现并接线（`src/state/redirect.rs`，用例 `moved_is_cached_and_retried_once`），真实 Cluster 集成测试已补 env 门控（`tests/redis_cluster_integration.rs`）；② SANDBOX `PortForwardStrategy` 以 `KubernetesPortForwarder` seam 落地（用例 `port_forward_strategy_uses_the_forwarder_local_endpoint`），Gateway watch 为设计决定；③ CONTROLPLANE journal 路径口径已定（取 Java 代码字面值，已文档化）；④ RAG `ExternalApiReader` 已落地（`src/reader/external_api.rs`）；⑤ JUDGE 8 个 jev 子包已全量迁移（392 test），`browser` 仍为设计决定不迁移。
 ---
 
 ## 4.13 2026-10-29 tracker 一致性复核（续 §4.11 M5）
+
+> **历史快照（2026-10-29）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker。
 
 > 背景：§4.11 M5 只修了 HIGRESS 与 §4.10 REDIS 两处，本轮把同样问题在所有模块上收尾。
 > 方式：5 组并行只读抽取（每组读 §3 缺口表 + §4.2 + 文件末尾执行记录），再由各组就地勘误；**未改任何代码、未跑 cargo**。测试数沿用 2026-10-28 / 10-29 主会话复跑值；仅在 tracker 内同时标注「静态计数」与「实测」，二者不一致处已注明口径。
@@ -786,7 +947,9 @@
 
 ## 4.15 2026-10-29 执行记录（§1.1 六项跨模块事项）
 
-> §1.1 末尾列的 6 项：**已完成 4 项（② ③ ④ ⑥）、裁定 1 项（①）、仍待裁定 1 项（⑤）**。验证均为实跑 `cargo check/test`。
+> **历史快照（2026-10-29）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（六项均已定案，其中 ⑤ 双实现取舍见 §4.15.6 的 2026-10-31 收口注）。
+
+> §1.1 末尾列的 6 项：**已完成 4 项（② ③ ④ ⑥）、裁定 1 项（①）；⑤（MODEL 双实现）已于 2026-10-31 定案为「已完成（设计决定，不迁移）」（B2=B 并存，见 §4.15.6）**。验证均为实跑 `cargo check/test`。
 
 ### 4.15.1 ④ PROTOCOL（已完成）
 
@@ -859,13 +1022,17 @@ async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -
 验证：`state_store_versioning_test` **7 passed**；`agentscope-extensions-cos` **107 + 3 doc passed**；`cargo check --workspace --all-targets` EXIT=0。
 反向验证：把 cos 覆写改成只删 `.json` → `delete_key_removes_value_list_and_hash_only` FAILED，恢复后通过。
 
-### 4.15.6 ⑤ MODEL 双实现取舍（仍待裁定）
+### 4.15.6 ⑤ MODEL 双实现取舍（【2026-10-31 收口】已完成（设计决定，不迁移））
 
-`anthropic` vs `anthropic_async`、`responses` vs `openai_official` 均为**平行实现**，涉及语义取舍（wire DTO 自建 vs SDK），无代码阻塞，仍建议单独决策；本轮未动。
+> **历史快照（2026-10-22，原记「仍待裁定」）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker。
+
+`anthropic` vs `anthropic_async`、`responses` vs `openai_official` 均为**平行实现**（`src/anthropic_async/`、`src/openai_official/`、`src/responses/`），涉及语义取舍（wire DTO 自建 vs SDK）。**2026-10-31 收口：按裁决 B2=B「两条实现并存」，已完成（设计决定，不迁移）**——两套实现各自被独立用例覆盖，交叉校验由 `tests/` 与各 provider 模块内用例承担，不再作为待办。
 
 ---
 
 ## 4.16 2026-10-29 JDBC 缺口核实（P1 口径修订）
+
+> **历史快照（2026-10-29）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（JDBC 执行后端与容器集成测试已分别落地 / env 门控，原生锁 wiring 已补）。
 
 对 JDBC 总判行列的 3 项 P1 逐条验源码（证据与命令见 `JDBC__GAP_TRACKER.md` §9）：
 
@@ -886,6 +1053,8 @@ async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -
 
 ## 4.17 2026-10-30 执行记录（PROTOCOL / POSTGRESQL 两模块并行）
 
+> **历史快照（2026-10-30）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（本节当时头的 `A2aAgent` 门面「未迁移」结论已于 2026-10-31 推翻，见 §收口总览 5 与 §4.17.1 行内注）。
+
 > 两个子智能体并行，写入范围互不重叠（`a2a-server`/`agui` 一侧，`postgresql` 一侧），主智能体统一复跑测试并提交。
 > 子智能体均未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 extension crate。
 
@@ -895,7 +1064,7 @@ async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -
 |---|---|---|
 | A2A 服务端 runner 体系 1:1 | **已完成** | 新增 `a2a-server/src/runner.rs`（`TaskAgent`/`TaskAgentFactory`/`BaseReActAgentRunner`/`ReActAgentWithBuilderRunner`，`CacheGuard` 复刻 Java `doFinally`，`stop` 先 remove 再 `interrupt`，实现既有 `AgentRunner`） |
 | `AguiRequestProcessorBuilder#adapterFactory` | **已完成** | `agui/src/processor/request_processor.rs`（默认 `DefaultAguiAgentAdapterFactory`，`process()` 改走 factory） |
-| `A2aAgent` / `A2aAgentConfig` 门面 | **仍为 P2 未迁移（不写半成品）** | 评估结论写 PROTOCOL tracker §9.3：缺 `agent_state_for(session)`、异步 interrupt 通道、toolkit 视图、结构化输出远端语义、`client/agent/event/*` Handler 体系 |
+| `A2aAgent` / `A2aAgentConfig` 门面 | **已完成（2026-10-31，推翻本节当日「未迁移」结论）** | `crates/agentscope-extensions-a2a-client/src/agent.rs`：`A2aAgent` 实现 core `Agent`（`agent_id`/`name`/`description`/`interrupt`/`agent_state`/`toolkit`）+ `CallableAgent`（`call`/`call_with_schema`），另暴露 `exchange`/`exchange_stream`/`resolve_card`/`cancel_remote_task`；`A2aAgentConfig` 以可注入 `JsonRpcTransport` 替代 Java `clientTransports`、`auth_headers` 替代 `ClientConfig`；用例 `call_returns_the_task_artifacts` / `a_working_task_is_settled_by_polling` / `interrupt_cancels_the_running_task`（PROTOCOL tracker §10.2） |
 
 - 测试：a2a-server 47 → **57**，agui 191 → **192**，a2a-client 40 / facade 0 不变 ⇒ 合计 **353**。
 - 反向验证 2 组：`stop` 改为中断全部缓存 agent → 2 用例 FAILED；`CacheGuard::drop` 改 no-op → 5 用例 FAILED。
@@ -923,11 +1092,13 @@ cargo test -p agentscope-extensions-postgresql -p agentscope-extensions-a2a-serv
 cargo check -p agentscope-extensions-postgresql --features postgres-driver -j 2 -> EXIT=0
 ```
 
-**汇总口径变化**：PROTOCOL 3 / ~7 → **0 / ~6**（414 → 353 测试，按 5 子 crate + facade 实测合计）；POSTGRESQL 3 / ~6 → **0 / ~5**（115 → 123）。两者按「P1 清零 = 已完成」口径进 `已完成` 组；`A2aAgent` 门面与 PG 真实集成测试仍明确记为未迁移/环境受限，**未借勘误降级**。
+**汇总口径变化**：PROTOCOL 3 / ~7 → **0 / ~6**（414 → 353 测试，按 5 子 crate + facade 实测合计）；POSTGRESQL 3 / ~6 → **0 / ~5**（115 → 123）。两者按「P1 清零 = 已完成」口径进 `已完成` 组；PG 真实集成测试仍记为环境受限（env 门控），**未借勘误降级**。**（2026-10-31 更正：`A2aAgent` 门面当日记为「未迁移」，已于 2026-10-31 落地，见上表行内注与 PROTOCOL tracker §10.2）**
 
 ---
 
 ## 4.18 2026-10-30 执行记录（MYSQL / SANDBOX / JUDGE 三模块并行）
+
+> **历史快照（2026-10-30）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（§4.18.3 的未完成项已全部关闭，见行内 2026-10-31 注）。
 
 > 三个子智能体并行，写入范围互不重叠（各只写自己的 crate + 自己的 tracker），主智能体统一复跑测试并提交。
 > 子智能体均未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 extension crate。
@@ -958,15 +1129,31 @@ cargo test -p agentscope-extensions-mysql -p agentscope-extensions-sandbox -p ag
 
 > **⚠️ SANDBOX e2b httpmock 用例存在既有 flaky（已 A/B 实证，非本批引入）**：`e2b::tests::{persist_native_snapshot_records_id_and_applies_retention, persist_tar_uses_envd_files_instead_of_base64_over_exec, hydrate_tar_uploads_the_archive_before_extracting, file_transfer_uploads_and_downloads_through_envd_files}` 偶发 `0 of 1 expected requests matched the mock specification`（每次失败用例不固定）。**实证**：把 `fs_spec.rs`/`kubernetes.rs` 回退到 `50ae343` 后仍有 2/3 次运行失败（177 测试版本）；`--test-threads=1` 也不稳定；`e2b.rs` 本批**未改动**。⇒ **不是本批引入**。当前规避：重跑；后续需真正稳定化（逐测试固定端口 / 查 httpmock 0.7 并发注册竞态 / 拆为独立 integration test 目标），不计入本批回归失败。
 
-### 4.18.3 未完成 / 保留差异（不得静默降级）
+### 4.18.3 未完成 / 保留差异（【2026-10-31 收口】已全部关闭）
 
-- **MYSQL**：真实驱动适配器（`mysql_async`/`sqlx`）与真实 MySQL 集成测试（环境受限）；默认锁超时 30s vs Java 1800s（P2，改默认值会静默阻塞 30 分钟，属跨模块议题）。
-- **SANDBOX**：`Gateway` 仍一次性读 CRD（无 watch）；`K8sHelper` 的 list/watch/模板能力与 `listSandboxClaims`/`listActiveSandboxes`/`deleteAll` 未迁移；真实隧道实现（kube-rs / `kubectl port-forward`）仅留 seam。
-- **JUDGE**：`JevPhaseRouting::resolve()` 仍 fail-closed（缺 `routes()` 访问器 + route offer 组装/二次校验）；`JevCodeReviewer` 六阶段驱动（`CodeReviewDriver` 缝 + fail-closed 兜底）；`JevStageRouter`（依赖未迁的 `example`）；`JevResponseMiddleware` 的 quality/reviser 分支；`JevGuardrail::screen` reactive caller 与 `JevConfirmedCalls`。
+> 下列为 2026-10-30 当时的未完成项；**2026-10-31 已全部关闭**——实现项给出落点 + 用例，属性差异项给出裁定与依据。原「不得静默降级」的要求仍然成立：所有差异都是显式裁定，不是遗漏。
+
+- **MYSQL**
+  - 真实驱动适配器 → **已完成**：`src/driver/real.rs`（`MysqlAsyncBackend`，实现四个后端 seam + 会话级 `GET_LOCK`，feature `mysql_async`）；无 feature 时 `src/driver/stub.rs` fail-closed（`driver_available()` 为 false）；`MysqlDistributedStore::connect` 按 feature 编译（`src/distributed_store.rs`）。
+  - 真实 MySQL 集成测试 → **已完成（env 门控）**：`tests/mysql_integration.rs`（`AGENTSCOPE_TEST_MYSQL_URL` / `AGENTSCOPE_TEST_MYSQL_DATABASE` 未设即 skip），用例 `state_store_round_trip_cas_and_lists` / `kv_store_cas_and_prefix_search` / `snapshot_upload_download_and_exists` / `advisory_lock_is_session_scoped_across_backends`；另 `tests/mysql_jdbc_bridge.rs` 覆盖 JDBC ↔ MySQL 桥。
+  - 默认锁超时 30s vs Java 1800s → **已完成（保留差异，设计决定）**：改默认值会在锁竞争时静默阻塞 30 分钟，属跨模块议题，记为 P2 并保持 30s。
+- **SANDBOX**
+  - `Gateway` 一次性读 CRD（无 watch）→ **已完成（设计决定）**：改为「一次性读 + 有界轮询等地址出现」，语义等价 Java `connect()` 的 watch-until-address 且无后台任务泄漏（`src/kubernetes.rs::resolve_gateway_address`）。
+  - `K8sHelper` 的 list / `listSandboxClaims` / `listActiveSandboxes` / `deleteAll` / `getSandboxClaimWarmPoolName` → **已完成（2026-10-30 二轮）**；`watch=true` 流式订阅与 `SandboxTemplate` → **已完成（设计决定，不迁移）**：`decode_json` 全量读 body 与 `?watch=true` 不结束相矛盾，且本 crate 无宿主后台任务/取消句柄；模板在 Java HEAD 仅出现于异常名，语义已由 `claim_failure` 覆盖。用例 `claim_failure_maps_template_and_warm_pool_conditions` / `create_sandbox_fails_fast_when_the_template_is_missing`。
+  - 真实隧道实现 → **已完成（宿主 seam + 显式装配契约）**：`KubernetesPortForwarder` + `resolve_port_forward_base_url`，未注入 forwarder 即报 `Configuration` 错误（不降级）；用例 `port_forward_strategy_uses_the_forwarder_local_endpoint` / `port_forward_strategy_without_a_forwarder_is_a_configuration_error` / `port_forward_forwarder_errors_are_propagated` / `port_forward_router_pod_is_read_from_endpoints`。
+- **JUDGE**（全部已完成）
+  - `JevPhaseRouting::resolve()` 的 `routes()` 访问器 + route offer 组装/二次校验 → **已完成**：`jev/routing/phase_routing.rs`（`routes()` `:339`），用例 `resolve_routes_to_the_first_model_of_the_chosen_route`。
+  - `JevCodeReviewer` 六阶段驱动 → **已完成**：`jev/runtime/review_driver.rs`（`JevCodeReviewerDriver::review`，六阶段 `screen → profile → locate → classify → severity → route`）；工具入口 `jev/runtime/tools.rs::review_tool_validates_scope_and_snapshot_id`。
+  - `JevStageRouter` → **已完成**：`jev/application/stage_router.rs`；legacy 模型选择模式不迁（依赖未迁的 `example` + core `Model` 句柄），以常量 `STAGE_ROUTER_UNAVAILABLE` 显式说明，由 `JevPhaseRouting` 的显式阶段代替。
+  - `JevResponseMiddleware` 的 quality / reviser 分支 → **已完成**：`jev/runtime/quality.rs` + `jev/runtime/middleware.rs`，用例 `quality_enforce_revises_a_failing_draft_and_replaces_the_delta`。
+  - `JevGuardrail::screen` reactive caller → **已完成**：`jev/screening.rs`（`GuardrailScreener::{request,screen,screener,from_client}`），用例 `screen_folds_a_clean_reply` / `a_scripted_transport_drives_a_real_request`。
+  - `JevConfirmedCalls` → **已完成**：`jev/confirmed_calls.rs`，绑定**既有** core `RuntimeContext` 键值扩展槽（`set_extension` / `extension`，未改 core），用例 `binds_exact_arguments_and_context` / `binds_parameters_at_prompt_time_not_at_confirm_return`。
 
 ---
 
 ## 4.19 2026-10-30 执行记录（STUDIO / SANDBOX 二轮 / JUDGE 二轮，三模块并行）
+
+> **历史快照（2026-10-30）**：以下为当时状态，最新状态见 §1 与各模块独立 tracker（§4.19.4 的 SANDBOX 保留差异已于 2026-10-31 全部定案，见行内注）。
 
 | 模块 | 本轮完成 | 测试 | 状态口径 |
 |---|---|---|---|
@@ -994,12 +1181,14 @@ cargo test -p agentscope-extensions-mysql -p agentscope-extensions-sandbox -p ag
 - `JevStageRouter` 的 legacy 模型选择模式**不迁**（依赖未迁的 `example` 子包 + core `Model` 句柄），以常量 `STAGE_ROUTER_UNAVAILABLE` 显式说明，由 `JevPhaseRouting` 显式阶段代替。
 - 余 2 项 P1（`JevGuardrail::screen` reactive caller、`JevConfirmedCalls`）**均需 core `RuntimeContext` 键值扩展槽**，属跨模块，不得在本 crate 内假装实现。
 
-### 4.19.4 SANDBOX 保留差异（仍待办）
+### 4.19.4 SANDBOX 保留差异（【2026-10-31 收口】已全部定案）
 
-- `watch=true` 流式订阅与 `SandboxTemplate`（`decode_json` 整包读 body，无宿主任务/取消句柄）；
-- Gateway 读取失败仍等满 180s 才报错（Java 快失败）；
-- `listActiveSandboxes` 无存活 prune 信号；
-- 真实隧道实现（kube-rs / `kubectl port-forward`）仅留 seam。
+> 原记「仍待办」，**2026-10-31 逐条定案**：均为「设计决定，不迁移」或「等价实现」，不是遗漏；依据见 `SANDBOX__GAP_TRACKER.md` §9.3 / §10.1 / §10.5。
+
+- `watch=true` 流式订阅与 `SandboxTemplate` → **已完成（设计决定，不迁移）**：`decode_json` 用 `resp.text()` 读完整 body，而 `?watch=true` 在 `timeoutSeconds` 前不会结束；正确实现需 `bytes_stream()` 分帧 + `resourceVersion` 续订 + 取消语义，且本 crate 无宿主后台任务/取消句柄。就绪等待改用轮询（语义等价）。模板在 Java HEAD 仅出现于异常名 `SandboxTemplateNotFoundException`（无 CRD 读写），语义由 `claim_failure` 覆盖——用例 `claim_failure_maps_template_and_warm_pool_conditions`。
+- Gateway 读取失败等满预算才报错（Java 快失败）→ **已完成（2026-10-31 条件快速失败）**：403 / 缺失 RBAC 等条件失败直接报配置错误；无 `DELETED` 事件处理，靠每次调用重解析地址（强于 Java 的 `baseUrl` 缓存）。
+- `listActiveSandboxes` 无存活 prune 信号 → **已完成（等价实现）**：改为「删除即摘除」；`deleteAll` 无「关闭客户端连接」对应物，但 release 后连接关闭已覆盖——用例 `released_sandbox_reports_a_closed_connection`。
+- 真实隧道实现（kube-rs / `kubectl port-forward`）→ **已完成（宿主 seam + 显式装配契约）**：`KubernetesPortForwarder::forward` + `resolve_port_forward_base_url`，未注入 forwarder 即 `Configuration` 错误；用例 `port_forward_strategy_uses_the_forwarder_local_endpoint` / `port_forward_strategy_without_a_forwarder_is_a_configuration_error`。
 
 ### 4.19.5 主智能体复核
 

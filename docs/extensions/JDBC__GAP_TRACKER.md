@@ -284,7 +284,7 @@
 | §3.1 | `DialectSqlTests`（21/21 全覆盖） | Java `DialectSqlTests` 实为 **30** 条 `@Test`；Rust 有直接对应 **26** 条，未对应 **4** 条：3 条 skill 断言（`skillSqlIsNamespaceScoped`/`skillDdlsIndexAndCollateNamespace`/`skillStatementsNeverUpdateNamespace`）+ `postgresStateUpsertIncrementsVersion`（PG 状态 UPSERT `version = {}.version + 1` 缺断言，SQL 已含该子句）。另 `mysqlDialectIsLockStrategy` 的 Rust 对应用例只断言 `supports_native_locks()` |
 | §3.1 | `AbstractJdbcDialectFromTest`（6/8） | Java 实为 **8** 条 `@Test`；Rust 覆盖 **6/8**（`throwsOnConnectionFailure`/`throwsForNullDataSource` 因无 `DataSource` 而无对应），**结论不变** |
 | §3.1 | 未覆盖「`MysqlIntegrationTest`/`PostgresIntegrationTest`（10 条）」 | 各 **8** 条，合计 **16** 条 |
-| §3.1 | 「离线单元测试」状态 = **已完成（离线可覆盖部分）** | **部分完成** —— skill 相关 37 条 + `DialectBuilderTableGroupsTest` 7 条因 skill 未迁移而未覆盖（属 P0 功能缺口，非环境受限）；2026-10-29 勘误：skill 仓库已在 jdbc crate 落地、P0 已关，仅剩 `DialectBuilderTableGroupsTest` 7 条与 Docker 集成测试 |
+| §3.1 | 「离线单元测试」状态 = **已完成（离线可覆盖部分）** | **部分完成** —— skill 相关 37 条 + `DialectBuilderTableGroupsTest` 7 条因 skill 未迁移而未覆盖（属 P0 功能缺口，非环境受限）；2026-10-29 勘误：skill 仓库已在 jdbc crate 落地、P0 已关，仅剩 `DialectBuilderTableGroupsTest` 7 条与 Docker 集成测试；**2026-10-31 收口 → 已完成**：两个集成测试各 8 条由 `tests/{mysql,postgres}_integration_tests.rs`（`AGENTSCOPE_TEST_{MYSQL,POSTGRES}_URL` 门控）覆盖，表组用例由 `tests/dialect_sql_tests.rs` 覆盖 |
 | §3.2 | Java `MysqlDialect.java:181-238` | 实际 `tryEnter` 在 **246-330** 行 |
 | §3.2 | Java `PostgresDialect.java:182-252` | 实际 `tryEnter` 在 **231-330** 行 |
 | §3.2 | Java `JdbcAgentStateStore.java:203,231,252` | 实际 `supportsVersioning` **148** / `getVersioned` **153** / `readVersion` **176** / `saveIfVersion` **203** |

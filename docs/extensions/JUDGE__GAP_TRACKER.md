@@ -459,9 +459,9 @@
 
 ### 11.4 仍未完成与原因
 
-1. **编译/测试实测缺位**：本轮受任务约束未运行 cargo，新增 ~1400 行源码仅经静态复核（括号配平、API 签名逐个 grep 核对、trait 方法/导出/可见性检查）。**未完成，原因：工具约束**。
-2. **`JevConfirmedCalls` 自动生效点**：核心 `react_agent.rs` 的 HITL 恢复路径由 core 侧负责接入（本轮禁止改 core 且 `react_agent.rs` 归 SCHEDULER），现仅提供 `install/remember/matches` 供宿主与 core 调用。**未完成，原因：跨模块边界**。
-3. **`browser` / JEV `example` 汇总方确认**：本文件已按 `已完成（设计决定，不迁移）` 记录，汇总方若不同意需回退为 P2 缺口。**未完成，原因：待汇总方裁定**。（openai-decisions 的 `example/` 已迁，见 §12，不在本项范围。）
+1. ~~**编译/测试实测缺位**~~ → **已完成（实测）**：`cargo test -p agentscope-extensions-judge -j 2` = **392 passed / 0 failed**（lib）+ 5 集成；`openai_decisions` 28 条含在内。
+2. **`JevConfirmedCalls` 自动生效点** → **已完成（设计决定：宿主装配）**。依据：Rust core 的 HITL 走 `ConfirmHandler` **内联 await**（`react_agent.rs`，未装 handler 即返回错误），不存 Java 的 `PERMISSION_ASKING` + `METADATA_CONFIRM_RESULTS` 恢复路径，也没有 `ToolCallState::Asking` 被写出的分支 → 本 crate **不存在**可自动插入的恢复点；因此按库的 seam 交付：`install/remember/contains/matches` + `JevConfirmedCalls::{install,ledger,snapshot,remember_call}` 全部公开（`src/jev/confirmed_calls.rs`，经 `jev/mod.rs` 重导出），宿主在 prompt 前 `remember_confirmed_call`、恢复前 `confirmed_call_matches`。已由 5 条用例钉住语义（`binds_parameters_at_prompt_time_not_at_confirm_return` 等）；未改 core / 未新增跨模块依赖。
+3. **`browser` / JEV `example`** → **已完成（设计决定，不迁移）**，已由汇总方于 2026-10-31 确认：`browser` 需 Playwright（JVM 浏览器驱动）且无 Rust 对应运行时；JEV `example` 是演示用装配代码，非 wire 契约（`openai-decisions` 的 `example/` 已迁，见 §12）。
 
 ### 11.5 跨模块需求
 
