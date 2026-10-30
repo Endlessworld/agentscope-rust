@@ -1,15 +1,19 @@
-//! `AgentSpawnTool` — spawns a registered subagent and returns its reply, plus
-//! the `agent_send` / `agent_list` companions for follow-up turns, mirroring
-//! `io.agentscope.harness.agent.tool.AgentSpawnTool` (thin but real slice:
-//! foreground/background spawn, permission scoping, plan-mode propagation,
-//! cancel/end; streaming events and remote targets land later).
+//! `AgentSpawnTool` — spawns a registered subagent as a background task and returns its
+//! addressing handles, plus the `agent_send` / `agent_list` companions for follow-up turns,
+//! mirroring `io.agentscope.harness.agent.tool.AgentSpawnTool` (permission scoping,
+//! plan-mode propagation, cancel/end; streaming events and remote targets land later).
+//!
+//! **Neither `agent_spawn` nor `agent_send` blocks the parent turn.** Both submit the run
+//! through the [`TaskRepository`] and return a `task_id` immediately; the child's result is
+//! delivered back to the parent as a `<system-reminder>` by the subagent middleware, and
+//! `task_output` is the explicit way to wait for it.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::error::Result;
-use agentscope_core::message::{JsonMap, ToolResultBlock};
+use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 use async_trait::async_trait;
 
@@ -17,7 +21,7 @@ use crate::agent::subagent::manager::DefaultAgentManager;
 use crate::agent::subagent::task::background::BackgroundTask;
 use crate::agent::subagent::task::repository::TaskRepository;
 use crate::agent::subagent::task::spec::TaskRunSpec;
-use crate::agent::subagent::task::RemoteSubmitContext;
+use crate::agent::subagent::task::{task_session_key_from_runtime, RemoteSubmitContext};
 use crate::agent::subagent::SubagentDeclaration;
 
 /// A subagent instance spawned by [`AgentSpawnTool`], addressable via its
@@ -59,10 +63,18 @@ impl AgentSpawnTool {
         }
     }
 
-    /// Attaches a task repository so background spawns are tracked/cancellable.
+    /// Attaches a task repository so spawns and sends are tracked/cancellable.
+    ///
+    /// Required: both tools run their work as background tasks, so without a
+    /// repository they can neither start a run nor deliver its result back.
     pub fn with_task_repository(mut self, repo: Arc<dyn TaskRepository>) -> Self {
         self.tasks = Some(repo);
         self
+    }
+
+    /// The attached task repository, when one was configured.
+    pub fn task_repository(&self) -> Option<Arc<dyn TaskRepository>> {
+        self.tasks.clone()
     }
 
     /// Restricts spawnable agent ids (permission scoping). Empty = allow all.
@@ -155,12 +167,17 @@ impl AgentSpawnTool {
         out
     }
 
-    fn live_agent(&self, key: &str) -> Option<Arc<dyn CallableAgent>> {
+    fn live_agent(&self, key: &str) -> Option<(String, Arc<dyn CallableAgent>)> {
         self.live
             .lock()
             .unwrap()
             .get(key)
-            .map(|s| Arc::clone(&s.agent))
+            .map(|s| (s.agent_id.clone(), Arc::clone(&s.agent)))
+    }
+
+    /// Next background task id for `kind` (`spawn` / `send`).
+    fn next_task_id(&self, kind: &str) -> String {
+        format!("{kind}-{}", self.counter.fetch_add(1, Ordering::Relaxed))
     }
 
     /// A label must be unique across the subagents this tool owns.
@@ -207,17 +224,12 @@ impl Tool for AgentSpawnTool {
         "agent_spawn"
     }
 
-    /// A foreground spawn inline-awaits a full subagent turn, which routinely
-    /// exceeds the default 300s tool timeout; cutting it would cancel the child
-    /// run mid-flight.
-    fn is_long_running(&self) -> bool {
-        true
-    }
-
+    /// A spawn never blocks: the run is submitted as a background task and its result is
+    /// delivered back to the parent, so the parent turn continues immediately.
     fn description(&self) -> &str {
-        "Spawn a named subagent with a prompt and wait for (foreground) or track \
-         (background=true) its result. Every response starts with agent_key / agent_id / \
-         session_id lines; pass agent_key verbatim to agent_send for follow-up turns."
+        "Spawn a registered subagent with a prompt. The run starts in the background and its \
+         reply arrives later as a <system-reminder>; the response carries agent_key / agent_id / \
+         session_id / task_id. Pass agent_key verbatim to agent_send for follow-up turns."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -227,8 +239,7 @@ impl Tool for AgentSpawnTool {
                 "agent": {"type": "string", "description": "Subagent name to spawn"},
                 "prompt": {"type": "string", "description": "Task prompt for the subagent"},
                 "label": {"type": "string", "description": "Optional human-readable name for addressing this subagent via agent_send"},
-                "background": {"type": "boolean", "description": "Run in background and return a task id"},
-                "task_id": {"type": "string", "description": "Optional explicit task id for background runs"}
+                "task_id": {"type": "string", "description": "Optional explicit task id for the background run"}
             },
             "required": ["agent", "prompt"]
         })
@@ -241,10 +252,6 @@ impl Tool for AgentSpawnTool {
         let Some(prompt) = opt_str(&args, "prompt").map(str::to_string) else {
             return Ok(ToolResultBlock::error("Missing string argument: prompt"));
         };
-        let background = args
-            .get("background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let label = opt_str(&args, "label")
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -276,24 +283,11 @@ impl Tool for AgentSpawnTool {
             .unwrap_or(false);
         let effective_prompt = self.build_prompt(&prompt, plan_active);
         // `sessionId` is the key every harness tool shares (`TaskTool` reads the
-        // same one), so background spawns land in the session that queries them.
-        let session_id = ctx
-            .runtime
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string();
-
-        // A remote target has no local factory; it must run in the background through the
-        // task repository, which owns the async transport.
-        if remote.is_some() && (!background || self.tasks.is_none()) {
-            return Ok(ToolResultBlock::error(format!(
-                "Subagent '{agent_id}' is a remote target; spawn it with background=true."
-            )));
-        }
+        // same one), so the run lands in the session that queries and delivers it.
+        let session_id = task_session_key_from_runtime(&ctx.runtime);
 
         // Local targets are instantiated eagerly so the spawned instance stays
-        // addressable via `agent_key`/`label` even while it runs in the background.
+        // addressable via `agent_key`/`label` for later `agent_send` turns.
         let local_agent = if remote.is_none() {
             match self
                 .manager
@@ -310,28 +304,18 @@ impl Tool for AgentSpawnTool {
             None
         };
 
-        // Foreground (and remote-less background without a repository): run inline.
-        if remote.is_none() && (!background || self.tasks.is_none()) {
-            let agent = local_agent.expect("local agent");
-            let (key, child_session) =
-                self.register_live(&agent_id, label.as_deref(), Arc::clone(&agent));
-            let header = spawn_header(&key, &agent_id, &child_session);
-            return match self.manager.invoke_agent(&agent, &effective_prompt).await {
-                Ok(msg) => Ok(ToolResultBlock::text(format!(
-                    "{header}\n{}",
-                    msg.text_content()
-                ))),
-                Err(e) => Ok(ToolResultBlock::error(format!(
-                    "Subagent '{agent_id}' failed: {e}"
-                ))),
-            };
-        }
-
-        // Background: submit through the task repository.
-        let repo = self.tasks.as_ref().unwrap().clone();
+        // The run is always a background task: the repository owns execution and the
+        // subagent middleware delivers the result back through a `<system-reminder>`.
+        let Some(repo) = self.tasks.clone() else {
+            return Ok(ToolResultBlock::error(
+                "Error: agent_spawn needs a task repository to run the subagent in the \
+                 background; the host did not attach one.",
+            ));
+        };
+        let rt = ctx_runtime(&ctx);
         let task_id = opt_str(&args, "task_id")
             .map(str::to_string)
-            .unwrap_or_else(|| format!("spawn-{}", self.counter.fetch_add(1, Ordering::Relaxed)));
+            .unwrap_or_else(|| self.next_task_id("spawn"));
 
         let mut header = String::new();
         let spec = if let Some(decl) = remote {
@@ -341,33 +325,41 @@ impl Tool for AgentSpawnTool {
             let (key, child_session) =
                 self.register_live(&agent_id, label.as_deref(), Arc::clone(&exec_agent));
             header = format!("{}\n", spawn_header(&key, &agent_id, &child_session));
-            let execution_prompt = effective_prompt.clone();
-            TaskRunSpec::Local {
-                execution: Box::new(move || {
-                    let handle = tokio::runtime::Handle::current();
-                    let msg =
-                        handle
-                            .block_on(exec_agent.call(vec![
-                                agentscope_core::message::Msg::user(&execution_prompt),
-                            ]))?;
-                    Ok(msg.text_content())
-                }),
+            TaskRunSpec::Adopted {
+                future: tokio::spawn(run_child_turn(exec_agent, effective_prompt)),
             }
         };
 
         let bg = repo
-            .put_task(&ctx_runtime(&ctx), &task_id, &agent_id, &session_id, spec)
+            .put_task(&rt, &task_id, &agent_id, &session_id, spec)
             .await;
+
+        // Delivery confirmation: a submission the repository never registered cannot run,
+        // so reporting it as "started" would silently lose the subagent's work.
+        if repo.get_task(&rt, &session_id, &task_id).await.is_none() {
+            return Ok(ToolResultBlock::error(format!(
+                "Error: subagent '{agent_id}' was not started: task '{task_id}' was not \
+                 registered by the task repository."
+            )));
+        }
+
         self.active_local
             .lock()
             .unwrap()
-            .insert(format!("{session_id}:{task_id}"), bg.clone());
+            .insert(format!("{session_id}:{task_id}"), bg);
 
         Ok(ToolResultBlock::text(format!(
-            "{header}Subagent '{agent_id}' started in background as task '{task_id}'. Use \
-             task_output('{task_id}') to collect the result."
+            "{header}\ntask_id: {task_id}\nSubagent '{agent_id}' started in the background. Its \
+             result is delivered back to you as a <system-reminder>; call \
+             task_output('{task_id}') only if you need to wait for it now."
         )))
     }
+}
+
+/// Drives one child turn to completion inside its background task.
+async fn run_child_turn(agent: Arc<dyn CallableAgent>, prompt: String) -> Result<String> {
+    let msg = agent.call(vec![Msg::user(prompt)]).await?;
+    Ok(msg.text_content())
 }
 
 /// The identity header every spawn response starts with, mirroring the Java
@@ -420,15 +412,13 @@ impl Tool for AgentSendTool {
         "agent_send"
     }
 
-    /// Follow-up sends inline-await the subagent's turn just like a foreground
-    /// spawn, so the shared tool timeout must not cut them off.
-    fn is_long_running(&self) -> bool {
-        true
-    }
-
+    /// A send never blocks: the message is handed to the subagent as a background task
+    /// and the reply is delivered back to the parent afterwards.
     fn description(&self) -> &str {
         "Send a follow-up message to a previously spawned subagent, addressed by the \
-         agent_key copied verbatim from agent_spawn's output (or by its label)."
+         agent_key copied verbatim from agent_spawn's output (or by its label). The message \
+         is delivered immediately as a background task and the reply arrives later as a \
+         <system-reminder>."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -443,10 +433,15 @@ impl Tool for AgentSendTool {
         })
     }
 
-    async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+    async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let Some(message) = opt_str(&args, "message").map(str::to_string) else {
             return Ok(ToolResultBlock::error("Missing string argument: message"));
         };
+        if message.trim().is_empty() {
+            return Ok(ToolResultBlock::error(
+                "Error: message must not be empty; there is nothing to deliver.",
+            ));
+        }
         let key = match self
             .spawn
             .resolve_key(opt_str(&args, "agent_key"), opt_str(&args, "label"))
@@ -454,17 +449,48 @@ impl Tool for AgentSendTool {
             Ok(k) => k,
             Err(e) => return Ok(ToolResultBlock::error(e)),
         };
-        let Some(agent) = self.spawn.live_agent(&key) else {
+        let Some((agent_id, agent)) = self.spawn.live_agent(&key) else {
             return Ok(ToolResultBlock::error(format!(
                 "Error: Unknown or expired agent_key: {key}. Use agent_list to see active subagents."
             )));
         };
-        match self.spawn.manager.invoke_agent(&agent, &message).await {
-            Ok(msg) => Ok(ToolResultBlock::text(msg.text_content())),
-            Err(e) => Ok(ToolResultBlock::error(format!(
-                "Subagent '{key}' failed: {e}"
-            ))),
+        let Some(repo) = self.spawn.task_repository() else {
+            return Ok(ToolResultBlock::error(
+                "Error: agent_send needs a task repository to run the subagent turn in the \
+                 background; the host did not attach one.",
+            ));
+        };
+
+        let rt = ctx_runtime(&ctx);
+        let session_id = task_session_key_from_runtime(&ctx.runtime);
+        let task_id = self.spawn.next_task_id("send");
+        repo.put_task(
+            &rt,
+            &task_id,
+            &agent_id,
+            &session_id,
+            TaskRunSpec::Adopted {
+                future: tokio::spawn(run_child_turn(agent, message)),
+            },
+        )
+        .await;
+
+        // Delivery confirmation: the message counts as delivered only once the repository
+        // registered the run. Otherwise the caller would believe the subagent got it while
+        // nothing is scheduled and nothing will ever be delivered back.
+        if repo.get_task(&rt, &session_id, &task_id).await.is_none() {
+            return Ok(ToolResultBlock::error(format!(
+                "Error: the message was not delivered to '{key}': task '{task_id}' was not \
+                 registered by the task repository."
+            )));
         }
+
+        Ok(ToolResultBlock::text(format!(
+            "agent_key: {key}\nagent_id: {agent_id}\nstatus: delivered\ntask_id: {task_id}\n\
+             The subagent is handling the message in the background; its reply is delivered \
+             back to you as a <system-reminder>. Call task_output('{task_id}') only if you \
+             need to wait for it now."
+        )))
     }
 }
 

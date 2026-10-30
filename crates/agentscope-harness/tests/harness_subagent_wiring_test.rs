@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use agentscope_core::agent::{Agent, StreamOptions};
+use agentscope_core::agent::{Agent, RuntimeContext, StreamOptions};
 use agentscope_core::formatter::JsonSchema;
 use agentscope_core::message::{ContentBlock as CoreBlock, JsonMap, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
@@ -105,6 +105,29 @@ async fn call(agent: &HarnessAgent, tool: &str, a: JsonMap) -> String {
         .text_content()
 }
 
+/// Extracts the `task_id` out of a spawn/send response.
+fn task_id_of(out: &str) -> String {
+    out.lines()
+        .find_map(|l| l.strip_prefix("task_id: "))
+        .unwrap_or_else(|| panic!("no task_id line in output: {out}"))
+        .trim()
+        .to_string()
+}
+
+/// Pulls a task's detail text, waiting for it to settle (`task_output(block=true)`).
+async fn task_text(agent: &HarnessAgent, task_id: &str) -> String {
+    call(
+        agent,
+        "task_output",
+        args(&[
+            ("task_id", serde_json::json!(task_id)),
+            ("block", serde_json::json!(true)),
+            ("timeout", serde_json::json!(5000)),
+        ]),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn build_registers_agent_and_task_tools() {
     let dir = temp_dir("tools");
@@ -170,7 +193,6 @@ async fn background_spawn_output_is_collectable_via_task_output() {
             args(&[
                 ("agent", serde_json::json!("worker")),
                 ("prompt", serde_json::json!("do it")),
-                ("background", serde_json::json!(true)),
             ]),
             ctx.clone(),
         )
@@ -178,14 +200,10 @@ async fn background_spawn_output_is_collectable_via_task_output() {
         .expect("spawn ok")
         .text_content();
     assert!(
-        started.contains("started in background as task"),
+        started.contains("started in the background"),
         "out: {started}"
     );
-    let task_id = started
-        .split("as task '")
-        .nth(1)
-        .and_then(|s| s.split('\'').next())
-        .expect("task id in spawn output");
+    let task_id = task_id_of(&started);
 
     let out = agent
         .toolkit()
@@ -223,7 +241,8 @@ async fn built_in_general_purpose_subagent_is_spawnable() {
         out.contains("agent_key: agent:general-purpose:"),
         "out: {out}"
     );
-    assert!(out.ends_with("child reply"), "out: {out}");
+    let detail = task_text(&agent, &task_id_of(&out)).await;
+    assert!(detail.contains("child reply"), "out: {detail}");
 }
 
 #[tokio::test]
@@ -245,9 +264,11 @@ async fn declared_subagent_runs_as_leaf_and_accepts_follow_up_send() {
         spawned.contains("agent_key: agent:worker:"),
         "out: {spawned}"
     );
-    assert!(spawned.ends_with("child reply"), "out: {spawned}");
+    let detail = task_text(&agent, &task_id_of(&spawned)).await;
+    assert!(detail.contains("child reply"), "out: {detail}");
 
-    // Address the live child through its label (Java `agent_send`).
+    // Address the live child through its label (Java `agent_send`). The message is
+    // delivered immediately and the reply comes back through the task channel.
     let sent = call(
         &agent,
         "agent_send",
@@ -257,7 +278,9 @@ async fn declared_subagent_runs_as_leaf_and_accepts_follow_up_send() {
         ]),
     )
     .await;
-    assert!(sent.contains("child reply"), "out: {sent}");
+    assert!(sent.contains("status: delivered"), "out: {sent}");
+    let detail = task_text(&agent, &task_id_of(&sent)).await;
+    assert!(detail.contains("child reply"), "out: {detail}");
 
     let listed = call(&agent, "agent_list", args(&[])).await;
     assert!(listed.contains("agent_key: agent:worker:"), "out: {listed}");
@@ -297,7 +320,8 @@ async fn workspace_subagents_md_folder_is_scanned_and_spawnable() {
     )
     .await;
     assert!(out.contains("agent_key: agent:helper:"), "out: {out}");
-    assert!(out.ends_with("child reply"), "out: {out}");
+    let detail = task_text(&agent, &task_id_of(&out)).await;
+    assert!(detail.contains("child reply"), "out: {detail}");
 }
 
 #[tokio::test]
@@ -313,7 +337,8 @@ async fn declared_model_override_uses_the_resolver() {
         ]),
     )
     .await;
-    assert!(out.ends_with("fast reply"), "out: {out}");
+    let detail = task_text(&agent, &task_id_of(&out)).await;
+    assert!(detail.contains("fast reply"), "out: {detail}");
 
     // Without a resolver the override is ignored and the parent model is inherited.
     let dir2 = temp_dir("model-fallback");
@@ -336,7 +361,8 @@ async fn declared_model_override_uses_the_resolver() {
         ]),
     )
     .await;
-    assert!(out.ends_with("parent reply"), "out: {out}");
+    let detail = task_text(&agent, &task_id_of(&out)).await;
+    assert!(detail.contains("parent reply"), "out: {detail}");
 }
 
 /// A model that records every prompt it receives and answers with a fixed text.
@@ -461,7 +487,8 @@ async fn set_model_switch_propagates_to_newly_spawned_subagents() {
         ]),
     )
     .await;
-    assert!(out.ends_with("v2 reply"), "out: {out}");
+    let detail = task_text(&agent, &task_id_of(&out)).await;
+    assert!(detail.contains("v2 reply"), "out: {detail}");
 }
 
 #[tokio::test]
@@ -533,7 +560,7 @@ async fn agent_send_recovers_a_failed_subagent_in_process() {
         })
         .build();
 
-    // 1) The foreground spawn fails on its first run.
+    // 1) The spawn starts in the background; the child fails on its first run.
     let failed = call(
         &agent,
         "agent_spawn",
@@ -544,7 +571,8 @@ async fn agent_send_recovers_a_failed_subagent_in_process() {
         ]),
     )
     .await;
-    assert!(failed.contains("transient failure"), "out: {failed}");
+    let detail = task_text(&agent, &task_id_of(&failed)).await;
+    assert!(detail.contains("transient failure"), "out: {detail}");
 
     // The failed child is still registered and addressable.
     let listed = call(&agent, "agent_list", args(&[])).await;
@@ -560,6 +588,253 @@ async fn agent_send_recovers_a_failed_subagent_in_process() {
         ]),
     )
     .await;
-    assert_eq!(recovered, "recovered");
+    assert!(recovered.contains("status: delivered"), "out: {recovered}");
+    let detail = task_text(&agent, &task_id_of(&recovered)).await;
+    assert!(detail.contains("recovered"), "out: {detail}");
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+/// A child that only answers once the test opens its gate — the proof that a send returns
+/// before the subagent has produced anything.
+struct GatedAgent {
+    open: Arc<std::sync::atomic::AtomicBool>,
+    toolkit: agentscope_core::tool::Toolkit,
+}
+
+#[async_trait::async_trait]
+impl Agent for GatedAgent {
+    fn agent_id(&self) -> &str {
+        "gated"
+    }
+    fn name(&self) -> &str {
+        "gated"
+    }
+    fn description(&self) -> &str {
+        "waits for the gate"
+    }
+    fn interrupt(&self) {}
+    fn agent_state(&self) -> AgentState {
+        AgentState::default()
+    }
+    fn toolkit(&self) -> &agentscope_core::tool::Toolkit {
+        &self.toolkit
+    }
+}
+
+#[async_trait::async_trait]
+impl agentscope_core::agent::CallableAgent for GatedAgent {
+    async fn call(&self, _messages: Vec<Msg>) -> agentscope_core::error::Result<Msg> {
+        while !self.open.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Ok(Msg::assistant("late reply"))
+    }
+    async fn call_with_schema(
+        &self,
+        messages: Vec<Msg>,
+        _schema: JsonSchema,
+    ) -> agentscope_core::error::Result<Msg> {
+        self.call(messages).await
+    }
+}
+
+#[tokio::test]
+async fn agent_send_hands_the_message_over_without_waiting_for_the_reply() {
+    // Regression: `agent_send` used to inline-await the whole child turn, blocking the
+    // parent. It must now report `status: delivered` while the child is still running, and
+    // the reply must come back through the task/delivery channel.
+    let dir = temp_dir("send-async");
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let agent = HarnessAgent::builder()
+        .name("main")
+        .model(Arc::new(ScriptedModel("parent reply")))
+        .cwd(dir.to_path_buf())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .subagent_factory_with_description("gated", "waits for the gate", {
+            let open = Arc::clone(&open);
+            move |_name| {
+                Arc::new(GatedAgent {
+                    open: Arc::clone(&open),
+                    toolkit: agentscope_core::tool::Toolkit::new(),
+                }) as Arc<dyn agentscope_core::agent::CallableAgent>
+            }
+        })
+        .build();
+
+    // The spawn also runs in the background, so it returns while the child is gated.
+    let spawned = call(
+        &agent,
+        "agent_spawn",
+        args(&[
+            ("agent", serde_json::json!("gated")),
+            ("prompt", serde_json::json!("first turn")),
+            ("label", serde_json::json!("g")),
+        ]),
+    )
+    .await;
+    assert!(
+        spawned.contains("agent_key: agent:gated:"),
+        "out: {spawned}"
+    );
+
+    // The send returns while the child still has not answered: the gate is closed.
+    let sent = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        call(
+            &agent,
+            "agent_send",
+            args(&[
+                ("label", serde_json::json!("g")),
+                ("message", serde_json::json!("second turn")),
+            ]),
+        ),
+    )
+    .await
+    .expect("agent_send must return without waiting for the child");
+    assert!(sent.contains("status: delivered"), "out: {sent}");
+    assert!(
+        !sent.contains("late reply"),
+        "send awaited the child: {sent}"
+    );
+    let send_task = task_id_of(&sent);
+    let running = call(
+        &agent,
+        "task_output",
+        args(&[
+            ("task_id", serde_json::json!(send_task)),
+            ("block", serde_json::json!(false)),
+        ]),
+    )
+    .await;
+    assert!(
+        !running.contains("late reply"),
+        "the child answered before the gate opened: {running}"
+    );
+
+    // Open the gate: the delivered turn now completes and its reply is collectable.
+    open.store(true, Ordering::SeqCst);
+    let detail = task_text(&agent, &send_task).await;
+    assert!(detail.contains("late reply"), "out: {detail}");
+}
+
+/// A child with a fixed, distinguishable reply.
+struct FixedChildAgent {
+    toolkit: agentscope_core::tool::Toolkit,
+}
+
+#[async_trait::async_trait]
+impl Agent for FixedChildAgent {
+    fn agent_id(&self) -> &str {
+        "worker"
+    }
+    fn name(&self) -> &str {
+        "worker"
+    }
+    fn description(&self) -> &str {
+        "answers immediately"
+    }
+    fn interrupt(&self) {}
+    fn agent_state(&self) -> AgentState {
+        AgentState::default()
+    }
+    fn toolkit(&self) -> &agentscope_core::tool::Toolkit {
+        &self.toolkit
+    }
+}
+
+#[async_trait::async_trait]
+impl agentscope_core::agent::CallableAgent for FixedChildAgent {
+    async fn call(&self, _messages: Vec<Msg>) -> agentscope_core::error::Result<Msg> {
+        Ok(Msg::assistant("child says hi"))
+    }
+    async fn call_with_schema(
+        &self,
+        messages: Vec<Msg>,
+        _schema: JsonSchema,
+    ) -> agentscope_core::error::Result<Msg> {
+        self.call(messages).await
+    }
+}
+
+#[tokio::test]
+async fn spawned_subagent_result_is_delivered_on_the_next_turn() {
+    // End-to-end contract: a spawn returns immediately, the child runs in the background,
+    // and its result reaches the parent as a `<system-reminder>` on the next reasoning step.
+    use futures::StreamExt;
+
+    let dir = temp_dir("spawn-delivery");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = HarnessAgent::builder()
+        .name("main")
+        .model(Arc::new(RecordingModel {
+            seen: Arc::clone(&seen),
+            reply: "main reply",
+        }))
+        .cwd(dir.to_path_buf())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .session_id("s1")
+        .subagent_factory_with_description("worker", "does work", |_name| {
+            Arc::new(FixedChildAgent {
+                toolkit: agentscope_core::tool::Toolkit::new(),
+            }) as Arc<dyn agentscope_core::agent::CallableAgent>
+        })
+        .build();
+
+    let spawned = agent
+        .toolkit()
+        .get_tool("agent_spawn")
+        .expect("agent_spawn registered")
+        .call(
+            args(&[
+                ("agent", serde_json::json!("worker")),
+                ("prompt", serde_json::json!("do it")),
+            ]),
+            ToolExecutionContext {
+                runtime: serde_json::Map::from_iter([(
+                    "sessionId".to_string(),
+                    serde_json::Value::String("s1".to_string()),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn ok")
+        .text_content();
+    let task_id = task_id_of(&spawned);
+
+    // Wait for the child without going through `task_output` (which stamps delivered).
+    let repo = agent.task_repository();
+    let rc = RuntimeContext::default().with_session_id("s1");
+    let bg = repo
+        .get_task(&rc, "s1", &task_id)
+        .await
+        .expect("task registered");
+    let waiter = Arc::clone(&bg);
+    assert!(
+        tokio::task::spawn_blocking(move || waiter.wait_for_completion(5_000))
+            .await
+            .unwrap(),
+        "the background run must settle"
+    );
+
+    let events: Vec<_> = agent
+        .stream_events(vec![Msg::user("hi")], StreamOptions::defaults())
+        .collect()
+        .await;
+    for ev in events {
+        ev.expect("agent run must succeed");
+    }
+    let prompts = seen.lock().unwrap().clone();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains("background subagent task") && p.contains("child says hi")),
+        "the child result was not delivered back: {prompts:?}"
+    );
+    assert!(
+        repo.is_delivered(&rc, "s1", &task_id).await,
+        "the delivery must be stamped after the turn"
+    );
 }

@@ -1,13 +1,17 @@
-//! Tests for the thin-but-real `AgentSpawnTool` slice: foreground spawn,
-//! permission scoping, plan-mode propagation and background tracking.
+//! Tests for the `AgentSpawnTool` slice: background spawn, permission scoping,
+//! plan-mode propagation and task tracking.
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentscope_core::agent::{Agent, CallableAgent};
+use agentscope_core::agent::{Agent, CallableAgent, RuntimeContext};
 use agentscope_core::message::{JsonMap, Msg};
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
 
 use agentscope_harness::agent::subagent::manager::DefaultAgentManager;
+use agentscope_harness::agent::subagent::task::{
+    TaskRepository, WorkspaceTaskRepository, TASK_FALLBACK_SESSION,
+};
 use agentscope_harness::agent::subagent::{
     SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode,
 };
@@ -90,13 +94,63 @@ async fn run(tool: &dyn Tool, a: JsonMap) -> String {
         .text_content()
 }
 
+fn workdir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("as_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn new_repo(dir: &Path) -> Arc<dyn TaskRepository> {
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir));
+    Arc::new(WorkspaceTaskRepository::new(fs, "parent"))
+}
+
+/// A tool context scoped to `session` (`sessionId` is the key `tool_runtime` injects).
+fn ctx_for_session(session: &str) -> ToolExecutionContext {
+    let mut ctx = ToolExecutionContext::default();
+    ctx.runtime.insert(
+        "sessionId".to_string(),
+        serde_json::Value::String(session.to_string()),
+    );
+    ctx
+}
+
+/// Extracts the `task_id` out of a spawn/send response.
+fn task_id_of(out: &str) -> String {
+    out.lines()
+        .find_map(|l| l.strip_prefix("task_id: "))
+        .unwrap_or_else(|| panic!("no task_id line in output: {out}"))
+        .trim()
+        .to_string()
+}
+
+/// Waits for the task and returns its result (or failure message).
+async fn wait_result(repo: &Arc<dyn TaskRepository>, session: &str, task_id: &str) -> String {
+    let rc = RuntimeContext::default().with_session_id(session);
+    let bg = repo
+        .get_task(&rc, session, task_id)
+        .await
+        .expect("task registered");
+    let waiter = Arc::clone(&bg);
+    let finished = tokio::task::spawn_blocking(move || waiter.wait_for_completion(5_000))
+        .await
+        .unwrap();
+    assert!(finished, "task {task_id} did not settle");
+    bg.get_result()
+        .or_else(|| bg.get_error())
+        .expect("terminal task has a result or an error")
+}
+
 #[tokio::test]
-async fn foreground_spawn_returns_subagent_reply() {
+async fn spawn_returns_a_task_id_and_runs_the_child_in_the_background() {
+    let dir = workdir("fg");
+    let repo = new_repo(&dir);
     let manager = Arc::new(DefaultAgentManager::new(&[entry(
         "researcher",
         SubagentMode::Subagent,
     )]));
-    let tool = AgentSpawnTool::new(manager);
+    let tool = AgentSpawnTool::new(manager).with_task_repository(Arc::clone(&repo));
 
     let out = run(
         &tool,
@@ -106,9 +160,21 @@ async fn foreground_spawn_returns_subagent_reply() {
         ]),
     )
     .await;
-    // Responses carry the agent_key/session header (Java `formatSpawnInfo`) ahead of the reply.
-    assert!(out.ends_with("dummy reply from researcher"), "out: {out}");
+    // The spawn must not await the child: the response carries the addressing header and a
+    // task id, and the reply arrives later through the task/delivery channel.
     assert!(out.contains("agent_key: agent:researcher:"), "out: {out}");
+    assert!(out.contains("started in the background"), "out: {out}");
+    assert!(
+        !out.contains("dummy reply"),
+        "spawn awaited the child: {out}"
+    );
+
+    let task_id = task_id_of(&out);
+    assert_eq!(
+        wait_result(&repo, TASK_FALLBACK_SESSION, &task_id).await,
+        "dummy reply from researcher"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -220,7 +286,9 @@ async fn plan_mode_is_propagated_into_child_prompt() {
         "echo",
         Arc::new(EchoFactory),
     )]));
-    let tool = AgentSpawnTool::new(manager);
+    let dir = workdir("plan");
+    let repo = new_repo(&dir);
+    let tool = AgentSpawnTool::new(manager).with_task_repository(Arc::clone(&repo));
 
     // Without plan flag → NORMAL.
     let out = run(
@@ -231,7 +299,11 @@ async fn plan_mode_is_propagated_into_child_prompt() {
         ]),
     )
     .await;
-    assert!(out.ends_with("NORMAL"), "out: {out}");
+    let task_id = task_id_of(&out);
+    assert_eq!(
+        wait_result(&repo, TASK_FALLBACK_SESSION, &task_id).await,
+        "NORMAL"
+    );
 
     // With plan_mode_active runtime flag → PLAN.
     let mut ctx = ToolExecutionContext::default();
@@ -249,55 +321,41 @@ async fn plan_mode_is_propagated_into_child_prompt() {
         )
         .await
         .unwrap();
-    assert!(
-        block.text_content().ends_with("PLAN"),
-        "out: {}",
-        block.text_content()
+    let task_id = task_id_of(&block.text_content());
+    assert_eq!(
+        wait_result(&repo, TASK_FALLBACK_SESSION, &task_id).await,
+        "PLAN"
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn background_spawn_registers_trackable_task_and_end_cancels() {
-    let dir = std::env::temp_dir().join(format!("as_spawn_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+async fn spawn_registers_trackable_task_and_end_cancels() {
+    let dir = workdir("track");
+    let repo = new_repo(&dir);
 
     let manager = Arc::new(DefaultAgentManager::new(&[entry(
         "slow",
         SubagentMode::Subagent,
     )]));
-    let repo = Arc::new(
-        agentscope_harness::agent::subagent::task::WorkspaceTaskRepository::new(fs, "parent"),
-    );
-    let tool = Arc::new(AgentSpawnTool::new(manager).with_task_repository(repo));
-
-    let mut ctx = ToolExecutionContext::default();
-    ctx.runtime.insert(
-        "session_id".to_string(),
-        serde_json::Value::String("s1".into()),
-    );
+    let tool = Arc::new(AgentSpawnTool::new(manager).with_task_repository(Arc::clone(&repo)));
 
     let block = tool
         .call(
             args(&[
                 ("agent", serde_json::json!("slow")),
                 ("prompt", serde_json::json!("work")),
-                ("background", serde_json::Value::Bool(true)),
                 ("task_id", serde_json::json!("bg-1")),
             ]),
-            ctx,
+            ctx_for_session("s1"),
         )
         .await
         .unwrap();
     let text = block.text_content();
-    assert!(
-        text.contains("background as task 'bg-1'"),
-        "bg output: {text}"
-    );
+    assert!(text.contains("task_id: bg-1"), "bg output: {text}");
 
     // end_spawn finds and cancels the tracked local task (no panic either way).
-    let _ = tool.end_spawn("s1", "bg-1");
+    assert!(tool.end_spawn("s1", "bg-1"));
     assert!(!tool.end_spawn("s1", "missing"));
 
     let _ = std::fs::remove_dir_all(&dir);

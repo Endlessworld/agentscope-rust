@@ -335,7 +335,7 @@
 **Missing Tools**
 | # | Java Tool | Rust target | Status | Priority |
 |---|---|---|---|---|
-| T1 | `AgentSpawnTool` | `src/tool/agent_spawn.rs` | 🟠 薄实切面：fg/bg spawn + 权限最小化 + plan-mode 传播 + end_spawn + **远程目标（本轮接线 `TaskRunSpec::Remote`）**；流式事件待办 | P0 |
+| T1 | `AgentSpawnTool` | `src/tool/agent_spawn.rs` | 🟠 薄实切面：spawn/send **非阻塞投递**（一律后台任务 + `<system-reminder>` 回送）+ 权限最小化 + plan-mode 传播 + end_spawn + **远程目标（本轮接线 `TaskRunSpec::Remote`）**；流式事件待办 | P0 |
 | T2 | `AgentGenerateTool` | `src/tool/agent_generate.rs` | ✅ | P2 |
 | T3 | `TeamTool` | `src/tool/team.rs` | ✅（TeamClient 10 ops + 角色裁剪；submitPlan/approvePlan 待 plan 桥） | P1 |
 | T4 | `MemorySearchTool` | `src/tool/memory_search.rs` | ✅ | P0 |
@@ -436,7 +436,7 @@
 - ✅ `update_awaiting_confirm()` 已实现（终态 no-op + 去抖）。
 - ✅ `heartbeat()`（30s）与 `sweep_orphaned_tasks()`（5min 扫描 / 10min 判死）已实现，并由 `ensure_maintenance()` 随首次 `put_task` 启动（PeriodicGate 节流 + 首扫抖动；`shutdown()` 时 abort）。
 - ✅ 持久化 CAS（2026-09-17）：`TaskRecord` 新增单调 `version`；`update_record_status` 改为乐观并发循环（重读→比对 `version`→重试，`RECORD_CAS_RETRIES=5`），`cancel_task` / `mark_delivered` / `update_awaiting_confirm` 写入时 bump version；新增 version/CAS 单测。
-- ✅ `TaskRunSpec::Remote` 生产接线（2026-09-17）：`AgentSpawnTool` 对带 `url` 的声明后台 spawn 时构造 `TaskRunSpec::Remote`（`tool/agent_spawn.rs::remote_spec()` 映射 streaming/detail/context attributes）；前台远程目标明确报错要求 `background=true`；2 单测。
+- ✅ `TaskRunSpec::Remote` 生产接线（2026-09-17）：`AgentSpawnTool` 对带 `url` 的声明构造 `TaskRunSpec::Remote`（`tool/agent_spawn.rs::remote_spec()` 映射 streaming/detail/context attributes）；2 单测。（2026-10-30：spawn/send 改为一律非阻塞投递，不再有「前台远程目标」的报错分支。）
 
 仍缺口：
 - ❌ `BackgroundTask::when_complete`（Rust 走 `set_done` + Future 模型，暂不需要）。

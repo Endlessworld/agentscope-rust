@@ -82,11 +82,10 @@ pub trait Tool: Send + Sync {
         true
     }
     /// Whether this tool may legitimately run longer than the configured
-    /// execution timeout (e.g. tools that inline-await a full agent turn such
-    /// as `agent_spawn` / `agent_send` / a blocking `task_output`). The
-    /// executor then skips its timeout wrapper for the tool, so a slow call
-    /// completes instead of being cancelled mid-run. Retry policy is
-    /// unaffected. Defaults to `false`.
+    /// execution timeout (e.g. a blocking `task_output` / `wait_async_results`
+    /// barrier that waits for background work). The executor then skips its
+    /// timeout wrapper for the tool, so a slow call completes instead of being
+    /// cancelled mid-run. Retry policy is unaffected. Defaults to `false`.
     fn is_long_running(&self) -> bool {
         false
     }

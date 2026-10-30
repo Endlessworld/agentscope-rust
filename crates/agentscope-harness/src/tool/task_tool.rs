@@ -9,7 +9,9 @@ use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
 use async_trait::async_trait;
 
-use crate::agent::subagent::task::{BackgroundTask, TaskRepository, TaskStatus};
+use crate::agent::subagent::task::{
+    task_session_key_from_runtime, BackgroundTask, TaskRepository, TaskStatus,
+};
 
 /// Shared core for the three task tools.
 pub struct TaskTool {
@@ -38,21 +40,13 @@ impl TaskTool {
     }
 }
 
-/// Reads the parent session id out of the tool execution context, if present.
+/// Reads the parent session id out of the tool execution context.
 fn session_from_ctx(ctx: &ToolExecutionContext) -> String {
-    ctx.runtime
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    task_session_key_from_runtime(&ctx.runtime)
 }
 
 fn runtime_for(session: &str) -> RuntimeContext {
-    if session.is_empty() {
-        RuntimeContext::default()
-    } else {
-        RuntimeContext::default().with_session_id(session)
-    }
+    RuntimeContext::default().with_session_id(session)
 }
 
 fn required_str(args: &JsonMap, key: &str) -> Result<String> {

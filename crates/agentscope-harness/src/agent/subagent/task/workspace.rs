@@ -367,11 +367,23 @@ impl TaskRepository for WorkspaceTaskRepository {
                     )
                     .await
                 }
-                TaskRunSpec::Adopted { future } => match future.await {
-                    Ok(Ok(r)) => Ok(r),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(je) => Err(format!("task join error: {je}")),
-                },
+                TaskRunSpec::Adopted { future } => {
+                    // `cancel_task` aborts *this* wrapper task. Propagate that abort to the
+                    // adopted run, otherwise a cancelled subagent turn keeps executing
+                    // detached (and keeps burning tokens after the user cancelled it).
+                    struct AbortOnDrop(tokio::task::AbortHandle);
+                    impl Drop for AbortOnDrop {
+                        fn drop(&mut self) {
+                            self.0.abort();
+                        }
+                    }
+                    let _abort_on_drop = AbortOnDrop(future.abort_handle());
+                    match future.await {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(je) => Err(format!("task join error: {je}")),
+                    }
+                }
             };
 
             let terminal = match &outcome {

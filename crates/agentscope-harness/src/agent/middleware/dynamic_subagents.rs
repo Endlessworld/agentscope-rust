@@ -19,7 +19,7 @@ use crate::agent::middleware::{
     build_delivery_reminder, build_task_summary, prepend_to_system_message,
     render_subagent_section, subagents::deliver_after_completion,
 };
-use crate::agent::subagent::task::TaskRepository;
+use crate::agent::subagent::task::{task_session_key, TaskRepository};
 use crate::agent::subagent::{
     load_from_directory, load_from_filesystem, DefaultAgentManager, SubagentDeclaration,
     SubagentEntry, SubagentFactory, SUBAGENTS_DIR,
@@ -148,7 +148,7 @@ impl Middleware for DynamicSubagentsMiddleware {
             // newly-completed background tasks are surfaced as a
             // <system-reminder> and stamped delivered only after this reasoning
             // step completes successfully.
-            let session = rc.session_id().unwrap_or("").to_string();
+            let session = task_session_key(&rc);
             let pending = repo.find_pending_deliveries(&rc, &session).await;
             let delivery_msg = if pending.is_empty() {
                 None

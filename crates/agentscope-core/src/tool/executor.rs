@@ -142,9 +142,9 @@ async fn execute_with_policy(
     let cfg = config
         .cloned()
         .unwrap_or_else(ExecutionConfig::tool_defaults);
-    // Long-running tools (e.g. `agent_send` awaiting a full subagent turn) opt
-    // out of the timeout wrapper: cutting them would cancel a live agent run
-    // mid-flight, not just withhold its result.
+    // Long-running tools (e.g. a blocking `task_output` barrier) opt out of the
+    // timeout wrapper: cutting them would abort work the caller explicitly asked
+    // to wait for.
     let timeout = if tool.is_long_running() {
         None
     } else {

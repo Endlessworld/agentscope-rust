@@ -13,7 +13,7 @@ use agentscope_core::middleware::{Middleware, Next, ReasoningInput};
 use agentscope_core::tool::Tool;
 use futures::StreamExt;
 
-use crate::agent::subagent::task::{TaskDelivery, TaskRepository, TaskStatus};
+use crate::agent::subagent::task::{task_session_key, TaskDelivery, TaskRepository, TaskStatus};
 use crate::agent::subagent::SubagentEntry;
 use crate::tool::TaskTool;
 
@@ -34,13 +34,14 @@ Subagents are ephemeral — they live only for the duration of the task and retu
 - `agent` (required): which subagent to instantiate
 - `prompt` (required): the task prompt for the subagent
 - `label` (optional): human-readable name for referencing via send
-- `background` (optional): run in the background and return a task_id instead of waiting
-- Response always includes `agent_key:` (opaque handle) — save it for follow-up sends
+- `task_id` (optional): explicit task id for the background run
+- The call returns immediately with `agent_key:` (opaque handle), `session_id:` and `task_id:` — the run itself is always in the background
 
 **`%s`** — Send a follow-up message to an existing subagent
 - `agent_key`: copy the **full value** after `agent_key:` from spawn output (starts with `agent:`). This is NOT `agent_id`, NOT `session_id`, and NOT `task_id`
 - Or use `label` if you set one at spawn (mutually exclusive with agent_key)
 - `message` (required): content to send
+- The message is handed over immediately (`status: delivered` + a `task_id`); the reply arrives later as a `<system-reminder>`
 
 **`%s`** — List active subagents
 
@@ -55,9 +56,10 @@ Subagents are ephemeral — they live only for the duration of the task and retu
 **`task_list`** — List all in-flight background tasks.
 
 ### Background task flow
-1. Spawn with `background=true` to fire-and-forget; the response gives you a task_id.
+1. `agent_spawn` and `agent_send` never block the turn: they return as soon as the run is started (spawn) or the message is handed over (send), together with a `task_id`.
 2. **Do not poll.** Continue with other work; when the task finishes you'll see a `<system-reminder>` containing its result.
 3. If the agent has nothing useful to do, hand control back to the user — the next reasoning round will surface any completions.
+4. `task_output(task_id, block=true)` is the explicit way to wait for one task right now.
 
 ### Available agent ids
 %s
@@ -75,8 +77,8 @@ Subagents are ephemeral — they live only for the duration of the task and retu
 4. **Reconcile** → Incorporate or synthesize the result into the main thread
 
 ### Usage patterns
-- **Parallel execution**: Launch multiple subagents concurrently with background=true, then collect results with task_output(block=false) after a delay
-- **Sync delegation**: Omit background for simple one-shot delegation
+- **Parallel execution**: Spawn several subagents in one turn, then continue; every result arrives as a `<system-reminder>`
+- **Sync delegation**: Call `task_output(task_id)` right after a spawn when you genuinely need the answer before continuing
 - **Persistent session**: Reuse the `agent_key` from spawn with send for multi-turn interaction
 - **Cancel stale work**: Use task_cancel to stop background tasks that are no longer needed
 - Subagent results are NOT visible to the user — always summarize them in your response
@@ -143,7 +145,7 @@ impl Middleware for SubagentsMiddleware {
         if entries.is_empty() {
             return next(input);
         }
-        let session = ctx.session_id().unwrap_or("").to_string();
+        let session = task_session_key(ctx);
         let repo = Arc::clone(&self.task_repository);
         let rc = ctx.clone();
         let sid = session.clone();
@@ -180,8 +182,9 @@ impl Middleware for SubagentsMiddleware {
 
 /// Wraps the downstream reasoning stream so the terminal-task deliveries that
 /// were surfaced as `<system-reminder>` are stamped delivered **only after**
-/// the reasoning step completes successfully (a failed step keeps them pending
-/// for redelivery). Returns `downstream` unchanged when nothing is pending.
+/// the reasoning step completes without a stream error (a failed step keeps
+/// them pending for redelivery). Returns `downstream` unchanged when nothing is
+/// pending.
 ///
 /// Shared by the static [`SubagentsMiddleware`] and the dynamic
 /// [`super::DynamicSubagentsMiddleware`] so both deliver background-task
@@ -197,16 +200,22 @@ pub(crate) fn deliver_after_completion(
         return downstream;
     }
     let tail = async move {
-        let mut stream = downstream;
-        while let Some(ev) = stream.next().await {
-            let _ = ev;
+        // Collected, not drained: `run_reasoning` reads stream errors emitted before the
+        // model core runs, so dropping them would degrade a real failure into the
+        // indistinguishable "model produced no message".
+        let events: Vec<Result<AgentEvent>> = downstream.collect().await;
+        if events.iter().all(|ev| ev.is_ok()) {
+            for d in &pending {
+                repo.mark_delivered(&rc, &session_id, &d.task_id).await;
+            }
         }
-        for d in &pending {
-            repo.mark_delivered(&rc, &session_id, &d.task_id).await;
-        }
-        Vec::<Result<AgentEvent>>::new()
+        events
     };
-    Box::pin(futures::stream::once(tail).map(futures::stream::iter).flatten())
+    Box::pin(
+        futures::stream::once(tail)
+            .map(futures::stream::iter)
+            .flatten(),
+    )
 }
 
 /// Builds the single aggregated `<system-reminder>` message surfacing newly-terminal

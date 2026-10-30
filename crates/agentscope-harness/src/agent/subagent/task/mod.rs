@@ -1,6 +1,9 @@
 //! Background subagent task repository, mirroring
 //! `io.agentscope.harness.agent.subagent.task`.
 
+use agentscope_core::agent::RuntimeContext;
+use agentscope_core::message::JsonMap;
+
 pub mod background;
 pub mod delivery;
 pub mod protocol_client;
@@ -21,6 +24,35 @@ pub use repository::{TaskCompletionCallback, TaskRepository, SUPPRESS_COMPLETION
 pub use spec::TaskRunSpec;
 pub use status::TaskStatus;
 pub use workspace::WorkspaceTaskRepository;
+
+/// Session key used for task records when the caller carries no session id.
+///
+/// Task submission (`agent_spawn` / `agent_send` / the task tools) and terminal-task
+/// delivery (the subagent middlewares) must derive the key the same way, otherwise a task
+/// submitted under the fallback is queried under another key and its result is never
+/// delivered back.
+pub const TASK_FALLBACK_SESSION: &str = "default";
+
+/// Task session key of a runtime context, falling back to [`TASK_FALLBACK_SESSION`].
+pub fn task_session_key(ctx: &RuntimeContext) -> String {
+    ctx.session_id()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(TASK_FALLBACK_SESSION)
+        .to_string()
+}
+
+/// Task session key from a tool call's runtime map (the `sessionId` key), falling back
+/// to [`TASK_FALLBACK_SESSION`].
+pub fn task_session_key_from_runtime(runtime: &JsonMap) -> String {
+    runtime
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(TASK_FALLBACK_SESSION)
+        .to_string()
+}
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
 pub(crate) fn now_millis() -> u64 {

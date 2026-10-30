@@ -161,3 +161,54 @@ async fn pending_deliveries_and_mark_delivered() {
         .is_empty());
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
+
+/// An adopted run (the shape `agent_spawn` / `agent_send` submit) must stop when the task is
+/// cancelled: `cancel_task` aborts the wrapper task, which has to propagate into the adopted
+/// execution instead of leaving it running detached.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_task_aborts_an_adopted_run() {
+    struct StoppedOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StoppedOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let dir = temp_dir("cancel-adopted").await;
+    let repo = new_repo(&dir);
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner = {
+        // The guard is built *outside* the async block and moved in, so it also fires when
+        // the task is aborted before it is ever polled.
+        let guard = StoppedOnDrop(Arc::clone(&stopped));
+        tokio::spawn(async move {
+            let _guard = guard;
+            futures::future::pending::<agentscope_core::error::Result<String>>().await
+        })
+    };
+    let bg = repo
+        .put_task(
+            &ctx(),
+            "t1",
+            "sub1",
+            "sess",
+            TaskRunSpec::Adopted { future: inner },
+        )
+        .await;
+    assert_eq!(bg.get_task_status(), TaskStatus::Running);
+
+    assert!(repo.cancel_task(&ctx(), "sess", "t1").await);
+    // Give the abort a moment to unwind the adopted task.
+    for _ in 0..50 {
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        stopped.load(std::sync::atomic::Ordering::SeqCst),
+        "the cancelled adopted run kept executing"
+    );
+    assert_eq!(bg.get_task_status(), TaskStatus::Cancelled);
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
