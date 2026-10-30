@@ -33,14 +33,26 @@ pub enum StudioError {
     /// Not retryable: the agent already applied its own model/tool retry policy.
     #[error("studio agent error: {0}")]
     Agent(String),
+
+    /// An argument was rejected before any I/O happened.
+    ///
+    /// Mirrors Java's `IllegalArgumentException` checks (e.g. a blank
+    /// `StudioUserAgent` name).
+    #[error("invalid studio argument: {0}")]
+    InvalidArgument(String),
 }
 
 impl StudioError {
     /// Whether this error is retryable by the HTTP retry logic.
     ///
-    /// Mirrors Java's `Retry.backoff(...).filter(t -> t instanceof IOException)` —
-    /// only transport/network failures are retried, not HTTP status or
-    /// serialization errors.
+    /// Only [`StudioError::Transport`] is retried: this crate separates network failures from
+    /// HTTP-status failures, and a blind retry of a rejected request would re-submit
+    /// `pushMessage` / `requestUserInput` for nothing.
+    ///
+    /// **Deviation from Java**: `StudioClient.executeWithRetry` filters on
+    /// `t instanceof IOException`, and Java's client turns *every* non-2xx response into an
+    /// `IOException` (`StudioClient.java:116/161/209`), so Java does retry 4xx/5xx. Rust keeps
+    /// the status visible in [`StudioError::Http`] instead (tracker §6.4 P2-1).
     pub fn is_retryable(&self) -> bool {
         matches!(self, StudioError::Transport(_))
     }

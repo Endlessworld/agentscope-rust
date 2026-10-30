@@ -224,14 +224,23 @@ impl StudioUserAgentBuilder {
     }
 
     /// Builds the user agent.
-    pub fn build(self) -> StudioUserAgent {
-        StudioUserAgent {
+    ///
+    /// Mirrors Java's `StudioUserAgent.Builder.build()` (`StudioUserAgent.java:327-331`),
+    /// which rejects a null/blank name with `IllegalArgumentException("Agent name cannot be
+    /// null or empty")`; here that becomes [`StudioError::InvalidArgument`] (tracker §6.4 P2-4).
+    pub fn build(self) -> StudioResult<StudioUserAgent> {
+        if self.name.trim().is_empty() {
+            return Err(StudioError::InvalidArgument(
+                "Agent name cannot be null or empty".to_string(),
+            ));
+        }
+        Ok(StudioUserAgent {
             name: self.name,
             description: self.description,
             studio_client: self.studio_client,
             ws_client: self.ws_client,
             input_timeout: self.input_timeout,
-        }
+        })
     }
 }
 
@@ -302,7 +311,8 @@ mod tests {
                 test_config(),
                 transport.clone(),
             )))
-            .build();
+            .build()
+            .expect("valid name");
 
         let reply = user
             .drive_round_with(&agent(), Msg::user("hello"))
@@ -330,7 +340,8 @@ mod tests {
                 test_config(),
                 transport.clone(),
             )))
-            .build();
+            .build()
+            .expect("valid name");
 
         let reply = user
             .drive_round_with(&agent(), Msg::user("hello"))
@@ -383,11 +394,36 @@ mod tests {
             }
         }
 
-        let user = StudioUserAgent::builder().name("User").build();
+        let user = StudioUserAgent::builder()
+            .name("User")
+            .build()
+            .expect("valid name");
         let err = user
             .drive_round_with(&FailingAgent, Msg::user("hello"))
             .await
             .expect_err("agent error surfaces");
         assert!(matches!(err, StudioError::Agent(_)), "got {err:?}");
+    }
+
+    /// Tracker §6.4 P2-4: Java's `StudioUserAgent.Builder.build()` rejects a blank name.
+    #[test]
+    fn blank_names_are_rejected_like_java() {
+        for name in ["", "   ", "\t"] {
+            match StudioUserAgent::builder().name(name).build() {
+                Err(StudioError::InvalidArgument(message)) => {
+                    assert_eq!(message, "Agent name cannot be null or empty");
+                }
+                Err(other) => panic!("unexpected error for {name:?}: {other}"),
+                Ok(_) => panic!("blank name {name:?} was accepted"),
+            }
+        }
+        assert_eq!(
+            StudioUserAgent::builder()
+                .name("User")
+                .build()
+                .expect("valid name")
+                .name(),
+            "User"
+        );
     }
 }

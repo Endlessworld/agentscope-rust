@@ -361,14 +361,17 @@ pub struct OtlpHttpExporter {
     endpoint: String,
     encoder: OtlpEncoder,
     resource: Attributes,
+    headers: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for OtlpHttpExporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `reqwest::Client` holds connection-pool state; print the meaningful fields only.
+        // Header values are credentials (e.g. Langfuse basic auth), so only the count is shown.
         f.debug_struct("OtlpHttpExporter")
             .field("endpoint", &self.endpoint)
             .field("resource", &self.resource)
+            .field("header_count", &self.headers.len())
             .finish_non_exhaustive()
     }
 }
@@ -386,6 +389,7 @@ impl OtlpHttpExporter {
             endpoint: endpoint.into(),
             encoder: OtlpEncoder::default(),
             resource,
+            headers: Vec::new(),
         }
     }
 
@@ -408,6 +412,37 @@ impl OtlpHttpExporter {
         &self.endpoint
     }
 
+    /// Adds a header sent with every OTLP request, replacing any header of the same name.
+    ///
+    /// Mirrors Java's `TelemetryTracer.Builder.addHeader` (`TelemetryTracer.java:340`), which
+    /// is a `HashMap` put; the javadoc names authentication (e.g. Langfuse) as the use case
+    /// (tracker §6.4 P2-2).
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let key = key.into();
+        self.headers.retain(|(existing, _)| existing != &key);
+        self.headers.push((key, value.into()));
+        self
+    }
+
+    /// Replaces the whole header set, mirroring Java's `TelemetryTracer.Builder.headers`.
+    pub fn with_headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers = headers
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self
+    }
+
+    /// The configured headers, in insertion order (Java's `HashMap` carries no order).
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// The encoded payload that [`TraceExporter::export`] would POST.
     pub fn encode(&self, spans: &[Span]) -> StudioResult<Value> {
         self.encoder.encode(&self.resource, spans)
@@ -421,11 +456,17 @@ impl TraceExporter for OtlpHttpExporter {
             return Ok(());
         }
         let payload = self.encoder.encode(&self.resource, spans)?;
-        let response = self
+        let mut request = self
             .http
             .post(&self.endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
+            .json(&payload);
+        // Custom headers come last so they may override the defaults (Java's exporter builder
+        // adds them after setting the content type).
+        for (key, value) in &self.headers {
+            request = request.header(key.as_str(), value.as_str());
+        }
+        let response = request
             .send()
             .await
             .map_err(|err| StudioError::Transport(err.to_string()))?;
@@ -621,5 +662,52 @@ mod tests {
             })
             .collect();
         assert_eq!(keys, vec!["agentscope", "proj", "run-9"]);
+    }
+
+    /// Tracker §6.4 P2-2: custom OTLP headers (Java `TelemetryTracer.Builder.addHeader`).
+    #[test]
+    fn otlp_headers_replace_same_named_entries_like_java_add_header() {
+        let exporter = OtlpHttpExporter::new("http://studio:3000/v1/traces", Vec::new())
+            .with_header("Authorization", "Bearer first")
+            .with_header("X-Langfuse-Session", "run-9")
+            .with_header("Authorization", "Bearer second");
+
+        assert_eq!(
+            exporter.headers().to_vec(),
+            vec![
+                ("X-Langfuse-Session".to_string(), "run-9".to_string()),
+                ("Authorization".to_string(), "Bearer second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_headers_replaces_the_whole_header_set_like_java_headers() {
+        let exporter = OtlpHttpExporter::new("http://studio:3000/v1/traces", Vec::new())
+            .with_header("Authorization", "Bearer old")
+            .with_headers([("Authorization", "Basic abc"), ("X-Scope", "traces")]);
+
+        assert_eq!(
+            exporter.headers().to_vec(),
+            vec![
+                ("Authorization".to_string(), "Basic abc".to_string()),
+                ("X-Scope".to_string(), "traces".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_exporter_from_config_sends_no_extra_headers() {
+        let config = StudioConfig::builder()
+            .studio_url("http://studio:3000")
+            .run_id("run-9")
+            .build();
+        assert!(OtlpHttpExporter::from_config(&config).headers().is_empty());
+        // The debug rendering must not leak header values (credentials).
+        let debug = format!(
+            "{:?}",
+            OtlpHttpExporter::from_config(&config).with_header("Authorization", "Bearer secret")
+        );
+        assert!(!debug.contains("Bearer secret"), "{debug}");
     }
 }

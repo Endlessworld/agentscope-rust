@@ -207,6 +207,24 @@ pub fn get_llm_response_attributes(response: Option<&ChatResponse>) -> Attribute
             gen_ai::GEN_AI_USAGE_OUTPUT_TOKENS.to_string(),
             serde_json::json!(response.usage.output_tokens),
         ));
+        // Java `AttributesExtractors.java:229-243` records every usage metric the response
+        // carries, unconditionally (no zero filtering).
+        attrs.push((
+            gen_ai::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS.to_string(),
+            serde_json::json!(response.usage.cache_creation_tokens),
+        ));
+        attrs.push((
+            gen_ai::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS.to_string(),
+            serde_json::json!(response.usage.cached_tokens),
+        ));
+        attrs.push((
+            gen_ai::GEN_AI_USAGE_REASONING_OUTPUT_TOKENS.to_string(),
+            serde_json::json!(response.usage.reasoning_tokens),
+        ));
+        attrs.push((
+            as_attrs::AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS.to_string(),
+            serde_json::json!(response.usage.tool_use_prompt_tokens),
+        ));
         opt_string_attr(
             &mut attrs,
             gen_ai::GEN_AI_OUTPUT_MESSAGES,
@@ -590,6 +608,43 @@ mod tests {
         assert_eq!(
             attr_str(&empty, as_attrs::AGENTSCOPE_FUNCTION_OUTPUT),
             "null"
+        );
+    }
+
+    /// Tracker §6.4 P2-3: the four usage metrics core `ChatUsage` carries
+    /// (`AttributesExtractors.java:229-243`), including the AgentScope-only one.
+    #[test]
+    fn llm_response_attributes_record_every_usage_metric() {
+        let response = ChatResponse::new(
+            "resp-2",
+            vec![ContentBlock::Text(TextBlock::new("ok"))],
+            ChatUsage::builder()
+                .input_tokens(100)
+                .output_tokens(20)
+                .cache_creation_tokens(7)
+                .cached_tokens(11)
+                .reasoning_tokens(3)
+                .tool_use_prompt_tokens(5)
+                .build(),
+            None,
+            Some("stop".to_string()),
+        );
+        let attrs = get_llm_response_attributes(Some(&response));
+        assert_eq!(
+            attr(&attrs, gen_ai::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS).unwrap(),
+            &serde_json::json!(7)
+        );
+        assert_eq!(
+            attr(&attrs, gen_ai::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS).unwrap(),
+            &serde_json::json!(11)
+        );
+        assert_eq!(
+            attr(&attrs, gen_ai::GEN_AI_USAGE_REASONING_OUTPUT_TOKENS).unwrap(),
+            &serde_json::json!(3)
+        );
+        assert_eq!(
+            attr(&attrs, as_attrs::AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS).unwrap(),
+            &serde_json::json!(5)
         );
     }
 
