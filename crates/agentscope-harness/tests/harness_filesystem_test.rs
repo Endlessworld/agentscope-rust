@@ -587,6 +587,115 @@ async fn grep_tool_flags_and_output_modes() {
 }
 
 #[tokio::test]
+async fn grep_content_output_is_compacted_into_path_headings() {
+    use serde_json::json;
+
+    let dir = temp_dir("grep_compact").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let storage = "/crates/agentscope-harness/src/agent/session/storage.rs";
+    let sqlite = "/crates/agentscope-harness/src/agent/session/sqlite.rs";
+    fs.write(
+        &ctx(),
+        storage,
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}",
+    )
+    .await
+    .unwrap();
+    fs.write(&ctx(), sqlite, "fn delta() {}\nfn epsilon() {}")
+        .await
+        .unwrap();
+
+    let tool = FilesystemTool::grep_files(Arc::clone(&fs));
+    let out = tool
+        .call(
+            json!({"pattern": "fn", "path": "/"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            tool_ctx(),
+        )
+        .await
+        .unwrap();
+    let text = tool_text(&out);
+    assert!(
+        text.starts_with("[paths grouped; N:<text> = line N of the path above]\n"),
+        "got: {text}"
+    );
+    // The path is a heading seen once; its matches keep only `line:text`.
+    assert_eq!(text.matches(storage).count(), 1, "got: {text}");
+    assert!(
+        text.contains(&format!(
+            "{storage}\n1:fn alpha() {{}}\n2:fn beta() {{}}\n3:fn gamma() {{}}"
+        )),
+        "got: {text}"
+    );
+    assert!(
+        text.contains(&format!("{sqlite}\n1:fn delta() {{}}\n2:fn epsilon() {{}}")),
+        "got: {text}"
+    );
+    assert_eq!(
+        out.metadata.get("agentscope.output_compact.hoistedFiles"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        out.metadata.get("agentscope.output_compact.hoistedLines"),
+        Some(&json!(5))
+    );
+    assert!(out
+        .metadata
+        .get("agentscope.output_compact.savedChars")
+        .is_some());
+}
+
+#[tokio::test]
+async fn grep_output_compaction_can_be_disabled() {
+    use agentscope_harness::CompactConfig;
+    use serde_json::json;
+
+    let dir = temp_dir("grep_compact_off").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let storage = "/crates/agentscope-harness/src/agent/session/storage.rs";
+    fs.write(
+        &ctx(),
+        storage,
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}",
+    )
+    .await
+    .unwrap();
+    let args = json!({"pattern": "fn", "path": "/"})
+        .as_object()
+        .unwrap()
+        .clone();
+
+    let tool =
+        FilesystemTool::grep_files_with_compaction(Arc::clone(&fs), CompactConfig::disabled());
+    let out = tool.call(args.clone(), tool_ctx()).await.unwrap();
+    let text = tool_text(&out);
+    assert!(
+        text.starts_with(&format!("{storage}:1:fn alpha() {{}}")),
+        "raw `path:line:text` expected, got: {text}"
+    );
+    assert!(out.metadata.is_empty(), "got: {:?}", out.metadata);
+
+    // `count` mode prints `path:count`, which has no repeated prefix to fold away.
+    let tool = FilesystemTool::grep_files(Arc::clone(&fs));
+    let out = tool
+        .call(
+            json!({"pattern": "fn", "path": "/", "output_mode": "count"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            tool_ctx(),
+        )
+        .await
+        .unwrap();
+    let text = tool_text(&out);
+    assert_eq!(text.lines().count(), 1, "got: {text}");
+    assert!(text.contains(&format!("{storage}:3")), "got: {text}");
+    assert!(out.metadata.is_empty(), "got: {:?}", out.metadata);
+}
+
+#[tokio::test]
 async fn grep_ignore_case_survives_literal_fallback() {
     let dir = temp_dir("grep_literal_ci").await;
     let fs = LocalFilesystem::sandboxed(&dir);

@@ -67,19 +67,8 @@ pub(crate) fn format_execute_output(
                 hoisted_lines = report.hoisted_lines,
                 "shell output compacted"
             );
-            metadata.insert(
-                "agentscope.output_compact.savedChars".to_string(),
-                serde_json::Value::from(report.saved_chars as u64),
-            );
-            metadata.insert(
-                "agentscope.output_compact.hoistedFiles".to_string(),
-                serde_json::Value::from(report.hoisted_files as u64),
-            );
-            metadata.insert(
-                "agentscope.output_compact.hoistedLines".to_string(),
-                serde_json::Value::from(report.hoisted_lines as u64),
-            );
         }
+        report.record_metadata(&mut metadata);
         text.push_str(&report.text);
     }
     if truncated {

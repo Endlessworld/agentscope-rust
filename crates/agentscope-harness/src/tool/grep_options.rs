@@ -7,6 +7,7 @@
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::JsonMap;
 
+use super::output_compact::{compact_grep_like, CompactConfig, CompactReport};
 use crate::filesystem::GrepMatch;
 
 /// Extensions per `-t` type name. Deliberately small: only names a coding agent
@@ -98,11 +99,23 @@ pub(crate) fn targets(args: &JsonMap) -> Vec<String> {
 }
 
 /// Renders matches according to `output_mode` (`content` | `files_with_matches` | `count`).
-pub(crate) fn format_matches(matches: &[GrepMatch], limit: usize, mode: &str) -> String {
+///
+/// The rendered text is then run through [`compact_grep_like`]: `content` output repeats
+/// the full path on every match line, which compaction collapses into per-path headings.
+/// The other modes print bare paths (or `path:count`), which the compactor leaves alone,
+/// so a single call covers all three without a mode switch.
+pub(crate) fn format_matches(
+    matches: &[GrepMatch],
+    limit: usize,
+    mode: &str,
+    compact: &CompactConfig,
+) -> CompactReport {
     if matches.is_empty() {
-        return "No matches found".to_string();
+        // Still routed through the compactor so callers always read the final text
+        // off the report (a one-line input is never rewritten).
+        return compact_grep_like("No matches found", compact);
     }
-    match mode {
+    let text = match mode {
         "files_with_matches" => {
             let mut paths: Vec<&str> = matches.iter().map(|m| m.path.as_str()).collect();
             paths.dedup();
@@ -142,5 +155,6 @@ pub(crate) fn format_matches(matches: &[GrepMatch], limit: usize, mode: &str) ->
                 .join("\n");
             super::filesystem_tools::append_truncation_notice(lines, total, limit, "matches")
         }
-    }
+    };
+    compact_grep_like(&text, compact)
 }

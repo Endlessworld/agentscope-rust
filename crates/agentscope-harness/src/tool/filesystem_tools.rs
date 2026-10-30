@@ -9,6 +9,7 @@ use agentscope_core::message::ToolResultBlock;
 use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
 use async_trait::async_trait;
 
+use super::output_compact::CompactConfig;
 use crate::filesystem::Filesystem;
 
 /// Metadata key carrying ACP file diffs (`[{path, old_text, new_text}]`) produced by
@@ -182,6 +183,8 @@ pub struct FilesystemTool {
     description: String,
     read_only: bool,
     schema: serde_json::Value,
+    /// Compaction of `grep_files` output; unused by the other tools.
+    compact: CompactConfig,
 }
 impl FilesystemTool {
     pub fn read_file(fs: Arc<dyn Filesystem>) -> Self {
@@ -203,6 +206,7 @@ impl FilesystemTool {
                 },
                 "required": ["filePath"]
             }),
+            compact: CompactConfig::from_env(),
         }
     }
 
@@ -230,6 +234,7 @@ impl FilesystemTool {
                 },
                 "required": ["operations"]
             }),
+            compact: CompactConfig::from_env(),
         }
     }
 
@@ -276,6 +281,7 @@ impl FilesystemTool {
                     "replace_all": {"type": "boolean", "description": "单个编辑形式：是否替换所有匹配项（默认 false）", "default": false}
                 }
             }),
+            compact: CompactConfig::from_env(),
         }
     }
 
@@ -299,6 +305,19 @@ impl FilesystemTool {
                 },
                 "required": ["pattern"]
             }),
+            compact: CompactConfig::from_env(),
+        }
+    }
+
+    /// Creates `grep_files` with an explicit output-compaction configuration.
+    ///
+    /// `content` mode repeats the full path on every match line; compaction collapses such
+    /// runs into per-path headings. It is on by default (`AGENTSCOPE_OUTPUT_COMPACT=0`
+    /// switches the default off) and [`CompactConfig::disabled`] does the same per tool.
+    pub fn grep_files_with_compaction(fs: Arc<dyn Filesystem>, compact: CompactConfig) -> Self {
+        Self {
+            compact,
+            ..Self::grep_files(fs)
         }
     }
 
@@ -317,6 +336,7 @@ impl FilesystemTool {
                 },
                 "required": ["pattern"]
             }),
+            compact: CompactConfig::from_env(),
         }
     }
 
@@ -333,6 +353,7 @@ impl FilesystemTool {
                 },
                 "required": ["path"]
             }),
+            compact: CompactConfig::from_env(),
         }
     }
 
@@ -546,7 +567,21 @@ impl Tool for FilesystemTool {
                     };
                     matches.extend(found);
                 }
-                super::grep_options::format_matches(&matches, limit, &mode)
+                let report =
+                    super::grep_options::format_matches(&matches, limit, &mode, &self.compact);
+                if report.compacted {
+                    tracing::debug!(
+                        saved_chars = report.saved_chars,
+                        hoisted_files = report.hoisted_files,
+                        hoisted_lines = report.hoisted_lines,
+                        "grep output compacted"
+                    );
+                }
+                let mut metadata = JsonMap::new();
+                report.record_metadata(&mut metadata);
+                let mut block = ToolResultBlock::text(report.text);
+                block.metadata = metadata;
+                return Ok(block);
             }
             "glob_files" => {
                 let pattern = str_arg(&args, "pattern")?;

@@ -21,6 +21,7 @@
 
 use std::sync::OnceLock;
 
+use agentscope_core::message::JsonMap;
 use regex::Regex;
 
 /// Environment variable that turns compaction off (`0`/`false`/`off`/`no`).
@@ -120,6 +121,13 @@ pub struct CompactReport {
     pub saved_chars: usize,
 }
 
+/// Tool-result metadata key holding the characters saved by a compaction pass.
+pub const METADATA_SAVED_CHARS: &str = "agentscope.output_compact.savedChars";
+/// Tool-result metadata key holding the number of hoisted path headings.
+pub const METADATA_HOISTED_FILES: &str = "agentscope.output_compact.hoistedFiles";
+/// Tool-result metadata key holding the number of `N:<text>` match lines.
+pub const METADATA_HOISTED_LINES: &str = "agentscope.output_compact.hoistedLines";
+
 impl CompactReport {
     fn unchanged(text: &str) -> Self {
         Self {
@@ -129,6 +137,28 @@ impl CompactReport {
             hoisted_lines: 0,
             saved_chars: 0,
         }
+    }
+
+    /// Records the pass in tool-result metadata; a no-op when nothing was compacted.
+    ///
+    /// Shared by every tool that compacts its output (`execute`, `grep_files`) so the
+    /// metadata keys stay in one place.
+    pub fn record_metadata(&self, metadata: &mut JsonMap) {
+        if !self.compacted {
+            return;
+        }
+        metadata.insert(
+            METADATA_SAVED_CHARS.to_string(),
+            serde_json::Value::from(self.saved_chars as u64),
+        );
+        metadata.insert(
+            METADATA_HOISTED_FILES.to_string(),
+            serde_json::Value::from(self.hoisted_files as u64),
+        );
+        metadata.insert(
+            METADATA_HOISTED_LINES.to_string(),
+            serde_json::Value::from(self.hoisted_lines as u64),
+        );
     }
 }
 
