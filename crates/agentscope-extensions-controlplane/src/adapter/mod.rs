@@ -5,6 +5,7 @@ mod agent_scope_adapter;
 mod agent_task;
 mod collaboration_tool;
 mod framework_adapter;
+mod host_impls;
 mod observer_middleware;
 mod support;
 mod task_starter;
@@ -22,6 +23,10 @@ pub use framework_adapter::{
     CAP_SESSION_COMMAND, CAP_SUBAGENT_INVENTORY, CAP_SUBAGENT_TASK_COMMAND,
     CAP_SUBAGENT_TASK_QUERY, CAP_TASK_QUERY, CAP_WORKSPACE_INVENTORY, COMMAND_ABORT,
     COMMAND_COMPRESS, COMMAND_TERMINATE,
+};
+pub use host_impls::{
+    subagent_task_json, HarnessSessionCompactor, StoreSessionHistorySource,
+    TaskRepositoryRuntimeSource,
 };
 pub(crate) use observer_middleware::AdapterShared;
 pub use observer_middleware::ControlPlaneObserverMiddleware;

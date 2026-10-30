@@ -440,12 +440,17 @@ impl FrameworkAdapter for AgentScopeAdapter {
                     )));
                 };
                 let summary = compactor.compact(session_id, &mut state).await?;
-                if let Some(reporter) = self.shared.reporter() {
-                    reporter.publish(
-                        SessionEvent::builder(session_id, crate::model::TYPE_COMPACTION)
-                            .content(summary.clone())
-                            .build(),
-                    );
+                // A compactor that found nothing to compact returns an empty summary;
+                // publishing an empty `compaction` event would tell the control plane a
+                // rewrite happened when the history is unchanged.
+                if !summary.trim().is_empty() {
+                    if let Some(reporter) = self.shared.reporter() {
+                        reporter.publish(
+                            SessionEvent::builder(session_id, crate::model::TYPE_COMPACTION)
+                                .content(summary.clone())
+                                .build(),
+                        );
+                    }
                 }
                 Ok(CommandOutcome {
                     ok: true,
@@ -478,7 +483,7 @@ fn window_used_tokens(context: &[Msg]) -> i64 {
 }
 
 /// Builds a Level-3 history entry from a message.
-fn message_item(seq: i64, msg: &Msg) -> MessageItem {
+pub(crate) fn message_item(seq: i64, msg: &Msg) -> MessageItem {
     let mut item = MessageItem::of(seq, role_of(msg), text_of(msg));
     for block in msg.content() {
         match block {

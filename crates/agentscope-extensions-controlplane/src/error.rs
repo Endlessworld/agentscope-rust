@@ -42,6 +42,10 @@ pub enum ControlPlaneError {
     /// The operation is declared as a capability but not implemented.
     #[error("unsupported controlplane operation: {0}")]
     Unsupported(String),
+
+    /// A host hook failed inside the extension (e.g. conversation compaction).
+    #[error("controlplane internal error: {0}")]
+    Internal(String),
 }
 
 /// Convenience result alias.

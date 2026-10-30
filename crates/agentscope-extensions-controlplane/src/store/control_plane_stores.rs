@@ -64,6 +64,12 @@ impl ControlPlaneStores {
     /// `CONTROL_PLANE_HTTP`, `BUILDER_INTERNAL_TOKEN`, `CONTROL_PLANE_AGENT_NAME` (all
     /// required) and `CONTROL_PLANE_NAMESPACE` (defaults to `default`).
     ///
+    /// As in Java `requireEnv`, a **blank** value counts as missing and every value is
+    /// trimmed. Rejecting blank matters for the token: an empty
+    /// `BUILDER_INTERNAL_TOKEN` would otherwise build a client that calls the control plane
+    /// with an empty `X-Builder-Internal-Token`, i.e. unauthenticated, and the failure would
+    /// only surface later as a `401`.
+    ///
     /// The keys are the renamed control-plane deployment contract. Java exposes no legacy
     /// `CONTROLPLANE_*` alias, so this port deliberately does not either — reading a legacy
     /// key would silently diverge from the control plane it talks to.
@@ -79,7 +85,11 @@ impl ControlPlaneStores {
         let http_base = require_key(&mut lookup, ENV_CONTROL_PLANE_HTTP)?;
         let token = require_key(&mut lookup, ENV_BUILDER_INTERNAL_TOKEN)?;
         let agent_name = require_key(&mut lookup, ENV_CONTROL_PLANE_AGENT_NAME)?;
-        let namespace = lookup(ENV_CONTROL_PLANE_NAMESPACE).unwrap_or_else(|| "default".into());
+        // Java `envOr(name, "default")`: absent **or blank** falls back, otherwise trimmed.
+        let namespace = lookup(ENV_CONTROL_PLANE_NAMESPACE)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE.to_string());
         Self::create(http_base, token, agent_name, namespace)
     }
 
@@ -168,12 +178,19 @@ impl ControlPlaneStores {
     }
 }
 
-/// Reads a required environment value, reporting the key that is missing.
+/// Reads a required environment value, mirroring Java `requireEnv`: an absent **or blank**
+/// value is rejected (reporting the key) and a present value is trimmed.
+///
+/// Blank is rejected on purpose: `BUILDER_INTERNAL_TOKEN=""` must not silently produce a
+/// client that talks to the control plane without a usable credential.
 fn require_key(
     lookup: &mut dyn FnMut(&str) -> Option<String>,
     name: &str,
 ) -> ControlPlaneResult<String> {
-    lookup(name).ok_or_else(|| ControlPlaneError::Config(format!("{name} is required")))
+    match lookup(name) {
+        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        _ => Err(ControlPlaneError::Config(format!("{name} is required"))),
+    }
 }
 
 /// Standard tenant query string appended to every `/api/v1/dp/*` call.
@@ -259,5 +276,67 @@ mod tests {
                 .contains("BUILDER_INTERNAL_TOKEN is required"),
             "{err}"
         );
+    }
+
+    /// Java `requireEnv` rejects `null` **and** `isBlank()`: a blank internal token must fail
+    /// at construction instead of producing an unauthenticated control-plane client.
+    #[test]
+    fn blank_required_env_keys_are_rejected() {
+        for blank in ["", "   ", "\t\n"] {
+            let err = ControlPlaneStores::from_lookup(|key| match key {
+                "CONTROL_PLANE_HTTP" => Some("http://cp".to_string()),
+                "BUILDER_INTERNAL_TOKEN" => Some(blank.to_string()),
+                "CONTROL_PLANE_AGENT_NAME" => Some("friday".to_string()),
+                _ => None,
+            })
+            .err()
+            .expect("a blank token must fail");
+            assert!(
+                err.to_string()
+                    .contains("BUILDER_INTERNAL_TOKEN is required"),
+                "{err}"
+            );
+        }
+
+        let err = ControlPlaneStores::from_lookup(|key| match key {
+            "CONTROL_PLANE_HTTP" => Some("  ".to_string()),
+            "BUILDER_INTERNAL_TOKEN" => Some("tok".to_string()),
+            "CONTROL_PLANE_AGENT_NAME" => Some("friday".to_string()),
+            _ => None,
+        })
+        .err()
+        .expect("a blank base url must fail");
+        assert!(
+            err.to_string().contains("CONTROL_PLANE_HTTP is required"),
+            "{err}"
+        );
+    }
+
+    /// Java `requireEnv` / `envOr` trim; a padded token would otherwise be sent verbatim in
+    /// `X-Builder-Internal-Token` and a padded namespace would leak into every `?namespace=`.
+    #[test]
+    fn env_values_are_trimmed_like_require_env() {
+        let stores = ControlPlaneStores::from_lookup(|key| match key {
+            "CONTROL_PLANE_HTTP" => Some("  http://cp:8080  ".to_string()),
+            "BUILDER_INTERNAL_TOKEN" => Some(" tok ".to_string()),
+            "CONTROL_PLANE_AGENT_NAME" => Some(" friday ".to_string()),
+            "CONTROL_PLANE_NAMESPACE" => Some(" team-a ".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(stores.http().base_url(), "http://cp:8080");
+        assert_eq!(stores.agent_name(), "friday");
+        assert_eq!(stores.namespace(), "team-a");
+
+        // A blank namespace falls back to `default` (Java `envOr`), it does not become empty.
+        let stores = ControlPlaneStores::from_lookup(|key| match key {
+            "CONTROL_PLANE_HTTP" => Some("http://cp".to_string()),
+            "BUILDER_INTERNAL_TOKEN" => Some("tok".to_string()),
+            "CONTROL_PLANE_AGENT_NAME" => Some("friday".to_string()),
+            "CONTROL_PLANE_NAMESPACE" => Some("   ".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(stores.namespace(), "default");
     }
 }

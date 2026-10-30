@@ -10,3 +10,5 @@
 - 环境变量：`AISTIO_*` → `CONTROL_PLANE_*`
 
 历史内容已全部迁入新文件，请勿在此继续记录。
+
+> **2026-10-31 二轮收口（本模块）**：AISTIO 遗留的两类残留已在 CONTROLPLANE crate 内闭环——① `GrpcTransport`：wire 层维持「设计决定（不迁移）」（Java proto 契约存在：`agentscope-service/service-controlplane/internal/asdp/asdp.proto`，但需 protoc + tonic/prost + 构建期拷贝，且 bidi 流无法走 unary JSON 通道），**语义层已落地** `src/transport/asdp.rs`（handshake/退避/心跳/ack 门控 outbox/下行分发 + `AsdpLink` seam）；② `SessionCompactor` / `SessionHistorySource` / `AgentRuntimeSource` 已提供宿主默认实现（`src/adapter/host_impls.rs`），`AgentTaskStarter` 早已由 `HarnessAgentTaskStarter` 实现。详情见 `CONTROLPLANE__GAP_TRACKER.md` 第 10 节。

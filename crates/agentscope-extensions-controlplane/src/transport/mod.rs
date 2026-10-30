@@ -6,6 +6,14 @@ mod contract_provider;
 mod control_plane_http_client;
 mod http_self_registration;
 mod orchestration_client;
+pub mod asdp;
+
+pub use asdp::{
+    AsdpEvent, AsdpLink, AsdpTransport, ConnectRequest, ConnectResponse, ConversationTurnCommand,
+    Downstream, DownstreamPayload, EventReport, EventReportAck, ExecutionAttemptCommand,
+    Heartbeat, SessionCommand, SessionEventCursor, SessionEventMsg, Upstream, UpstreamMeta,
+    UpstreamPayload, HEARTBEAT_INTERVAL, RECONNECT_BASE, RECONNECT_MAX,
+};
 
 pub use collaboration_client::{
     await_runtime_tool_approval, ArtifactContent, CollaborationClient, RuntimeApprovalDecision,
