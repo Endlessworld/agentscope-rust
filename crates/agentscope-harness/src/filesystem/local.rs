@@ -395,18 +395,14 @@ impl Filesystem for LocalFilesystem {
         }
         let content = String::from_utf8_lossy(&bytes).into_owned();
         let lines: Vec<&str> = content.split('\n').collect();
-        let start = offset;
+        // Out-of-range pagination is clamped, not rejected: an offset at or past the
+        // end yields an empty slice, which callers read as "no more lines".
+        let start = offset.min(lines.len());
         let end = if limit > 0 {
-            (start + limit).min(lines.len())
+            start.saturating_add(limit).min(lines.len())
         } else {
             lines.len()
         };
-        if start >= lines.len() {
-            return Err(Error::Tool(format!(
-                "Line offset {offset} exceeds file length ({} lines)",
-                lines.len()
-            )));
-        }
         Ok(FileData::text(lines[start..end].join("\n")))
     }
 

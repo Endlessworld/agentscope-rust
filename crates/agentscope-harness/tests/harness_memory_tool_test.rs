@@ -108,6 +108,29 @@ async fn memory_get_reads_line_range() {
 }
 
 #[tokio::test]
+async fn memory_get_clamps_start_past_eof_to_empty() {
+    let (dir, wm) = make_workspace("get_past_eof");
+    let save = MemorySaveTool::new(Arc::clone(&wm));
+    let get = MemoryGetTool::new(Arc::clone(&wm));
+
+    run(&save, tool_args(&[("content", str_arg("- alpha"))])).await;
+
+    // A startLine past the end must not fail: the requested range is just empty.
+    let out = run(
+        &get,
+        tool_args(&[
+            ("path", str_arg("MEMORY.md")),
+            ("startLine", serde_json::json!(395)),
+            ("endLine", serde_json::json!(400)),
+        ]),
+    )
+    .await;
+    assert_eq!(out, "");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn memory_get_reports_missing_file_and_traversal() {
     let (dir, wm) = make_workspace("get_err");
     let get = MemoryGetTool::new(Arc::clone(&wm));

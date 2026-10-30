@@ -247,18 +247,14 @@ impl Filesystem for RemoteFilesystem {
             return Ok(file_data);
         }
         let lines: Vec<&str> = file_data.content.split('\n').collect();
-        let start = offset;
+        // Out-of-range pagination is clamped, not rejected: an offset at or past the
+        // end yields an empty slice, which callers read as "no more lines".
+        let start = offset.min(lines.len());
         let end = if limit > 0 {
-            (start + limit).min(lines.len())
+            start.saturating_add(limit).min(lines.len())
         } else {
             lines.len()
         };
-        if start >= lines.len() {
-            return Err(Error::Tool(format!(
-                "Line offset {offset} exceeds file length ({} lines)",
-                lines.len()
-            )));
-        }
         Ok(FileData {
             content: lines[start..end].join("\n"),
             encoding: file_data.encoding,
@@ -485,6 +481,18 @@ mod tests {
         // offset/limit slice
         let sliced = fs.read(&ctx, "/notes/a.md", 1, 1).await.unwrap();
         assert_eq!(sliced.content, "line2");
+    }
+
+    #[tokio::test]
+    async fn read_clamps_offset_past_eof() {
+        let fs = fs();
+        let ctx = RuntimeContext::new();
+        fs.write(&ctx, "/a.md", "one\ntwo").await.unwrap();
+        assert_eq!(fs.read(&ctx, "/a.md", 99, 10).await.unwrap().content, "");
+        assert_eq!(
+            fs.read(&ctx, "/a.md", 1, usize::MAX).await.unwrap().content,
+            "two"
+        );
     }
 
     #[tokio::test]

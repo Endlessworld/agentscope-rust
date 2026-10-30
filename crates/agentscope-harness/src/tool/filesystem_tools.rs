@@ -41,19 +41,53 @@ fn with_diffs(mut result: ToolResultBlock, diffs: Vec<serde_json::Value>) -> Too
     result
 }
 
+/// Deserializes a field that may arrive either as a single value or as a list.
+///
+/// Models routinely send `filePath` as a bare string even though the schema
+/// advertises an array; rejecting that only produced an unactionable serde error.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+fn de_path_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(match OneOrMany::<String>::deserialize(deserializer)? {
+        OneOrMany::One(path) => vec![path],
+        OneOrMany::Many(paths) => paths,
+    })
+}
+
+/// Deserializes a line-count argument, clamping negatives to 0 instead of failing
+/// the whole call (a negative offset means "from the start", a negative limit
+/// means "to the end").
+fn de_line_count<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let value = Option::<i64>::deserialize(deserializer)?.unwrap_or(0);
+    Ok(value.max(0) as usize)
+}
+
 /// Read-file parameters, mirroring `ReadFileTool.FilesReader`.
 /// `file_paths` supports batching multiple absolute paths.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadFileParams {
-    /// Absolute path(s) to read; batch is supported.
-    #[serde(rename = "filePath")]
+    /// Absolute path(s) to read; a single path or a batch is accepted.
+    #[serde(rename = "filePath", deserialize_with = "de_path_list")]
     pub file_paths: Vec<String>,
-    /// 0-indexed starting line offset (default: file start).
-    #[serde(default)]
+    /// 0-indexed starting line offset (default: file start). Negative clamps to 0.
+    #[serde(default, deserialize_with = "de_line_count")]
     pub offset: usize,
-    /// Max lines to read per file (default: 100).
-    #[serde(default = "default_read_limit")]
+    /// Max lines to read per file (default: 100; 0 = no limit). Negative clamps to 0.
+    #[serde(default = "default_read_limit", deserialize_with = "de_line_count")]
     pub limit: usize,
 }
 

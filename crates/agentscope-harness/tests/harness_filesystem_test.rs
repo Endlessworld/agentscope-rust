@@ -57,6 +57,64 @@ async fn local_write_read_edit_delete() {
 }
 
 #[tokio::test]
+async fn read_clamps_offset_past_eof_instead_of_erroring() {
+    let dir = temp_dir("read_past_eof").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+    fs.write(&ctx(), "/a.txt", "l1\nl2\nl3").await.unwrap();
+
+    // offset at or past the end -> empty slice, no error
+    assert_eq!(fs.read(&ctx(), "/a.txt", 3, 10).await.unwrap().content, "");
+    assert_eq!(
+        fs.read(&ctx(), "/a.txt", 395, 100).await.unwrap().content,
+        ""
+    );
+    // a huge limit must not overflow the slice bound
+    assert_eq!(
+        fs.read(&ctx(), "/a.txt", 1, usize::MAX)
+            .await
+            .unwrap()
+            .content,
+        "l2\nl3"
+    );
+}
+
+#[tokio::test]
+async fn read_file_tool_accepts_single_path_and_clamps_paging() {
+    use serde_json::json;
+
+    let dir = temp_dir("read_tool_params").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    fs.write(&ctx(), "/a.txt", "l1\nl2\nl3").await.unwrap();
+    let tool = FilesystemTool::read_file(Arc::clone(&fs));
+
+    // `filePath` as a bare string + a negative offset is tolerated.
+    let out = tool
+        .call(
+            json!({"filePath": "/a.txt", "offset": -1, "limit": 2})
+                .as_object()
+                .unwrap()
+                .clone(),
+            tool_ctx(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tool_text(&out), "### /a.txt\nl1\nl2");
+
+    // offset past the end reads to the end of the file instead of erroring.
+    let out = tool
+        .call(
+            json!({"filePath": ["/a.txt"], "offset": 395})
+                .as_object()
+                .unwrap()
+                .clone(),
+            tool_ctx(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tool_text(&out), "### /a.txt\n");
+}
+
+#[tokio::test]
 async fn local_sandboxed_blocks_traversal() {
     let dir = temp_dir("sandbox").await;
     let fs = LocalFilesystem::sandboxed(&dir);

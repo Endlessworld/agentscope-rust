@@ -98,13 +98,8 @@ impl Tool for MemoryGetTool {
             (end_line as usize).min(lines.len())
         };
 
-        if start >= lines.len() {
-            return Ok(ToolResultBlock::text(format!(
-                "Error: startLine {start_line} exceeds file length {}",
-                lines.len()
-            )));
-        }
-
+        // A `startLine` at or past the end is not an error: the requested range is
+        // simply empty, so the loop below yields nothing.
         let mut sb = String::new();
         for i in start..end {
             sb.push_str(&format!("{}|{}\n", i + 1, lines[i]));
