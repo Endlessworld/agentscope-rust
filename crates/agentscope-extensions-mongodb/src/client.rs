@@ -1,19 +1,22 @@
 //! Driver-agnostic MongoDB document-database abstraction.
 //!
 //! The Java module depends directly on `com.mongodb.client.MongoClient` /
-//! `MongoCollection` / `MongoDatabase`. The Rust workspace does **not** carry a
-//! MongoDB driver dependency (and per the migration contract this crate must not
-//! add heavy driver deps to the root workspace), so we model the small slice of the
-//! driver API the stores actually need behind a [`MongoClient`] trait:
+//! `MongoCollection` / `MongoDatabase`. This crate instead models the small slice of the
+//! driver API the stores actually need behind a [`MongoClient`] trait, so the store logic
+//! stays driver-agnostic and fully testable offline:
 //!
 //! * document CRUD with server-side-ish comparison/update primitives, and
 //! * index lifecycle ([`create_index`](MongoClient::create_index) etc.).
 //!
+//! Capability boundary (verified against the Java module): it never uses change streams
+//! (`watch`), bulk writes (`insertMany` / `bulkWrite` / `updateMany` / `deleteMany`) or
+//! multi-document transactions, so the trait surface below is complete for the migration.
+//!
 //! Two implementations are provided:
-//! * [`InMemoryMongoClient`] — a faithful, fully-featured in-process backend used by
-//!   the contract tests (and usable as an embedded, dependency-free store).
-//! * A real driver can be plugged in later by implementing the same trait, without
-//!   touching any of the store logic (see the crate tracker §4.2).
+//! * [`InMemoryMongoClient`] — a faithful, fully-featured in-process backend used by the
+//!   contract tests (and usable as an embedded, dependency-free store).
+//! * A real driver (the workspace exposes `mongodb = "3"`) plugs in by implementing this
+//!   same trait, without touching any of the store logic (see the crate tracker §4.2).
 //!
 //! The data path deliberately mirrors MongoDB semantics we depend on:
 //! * documents live in named collections inside named databases;
@@ -108,8 +111,6 @@ pub enum MongoError {
     IndexNotFound,
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    #[error("illegal state: {0}")]
-    IllegalState(String),
     #[error("backend error: {0}")]
     Backend(String),
 }

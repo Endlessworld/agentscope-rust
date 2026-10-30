@@ -373,6 +373,11 @@ mod tests {
         s.delete(&ns(), "a.txt");
         assert!(s.get(&ns(), "a.txt").is_none());
         assert!(s.get(&ns(), "b.txt").is_some());
+        // Idempotent, mirroring Java `MongoBaseStoreTest#deleteRemovesItem` +
+        // `MongoBaseStoreContractTest#delete_isIdempotent`.
+        s.delete(&ns(), "a.txt");
+        assert!(s.get(&ns(), "a.txt").is_none());
+        assert!(s.get(&ns(), "b.txt").is_some());
     }
 
     #[test]

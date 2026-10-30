@@ -12,15 +12,22 @@
 //! | `MongoAgentStateStore` | [`MongodbAgentStateStore`] | `agentscope_core::state::AgentStateStore` |
 //! | `MongoBaseStore` | [`MongodbStore`] | `agentscope_harness::filesystem::remote::store::BaseStore` |
 //! | `MongoSnapshotSpec` | [`MongodbSnapshotSpec`] | `agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec` |
-//! | `MongoSandboxExecutionGuard` | [`MongodbSandboxExecutionGuard`] / [`MongodbGuardClient`] | `agentscope_harness::agent::sandbox::guard::SandboxExecutionGuard` |
+//! | `MongoSandboxExecutionGuard` | [`MongodbSandboxExecutionGuard`] / [`MongodbGuardClient`] | `agentscope_harness::agent::sandbox::SandboxGuard` (the guard *trait*) |
 //!
 //! ## Driver-agnostic design
 //!
 //! The Java module depends directly on the MongoDB Java driver. This crate models the
 //! small slice of the driver API it needs behind the [`client::MongoClient`] trait, so
-//! it carries **no heavy driver dependency** (only `sha2`/`uuid` are added, both already
-//! workspace deps). [`client::InMemoryMongoClient`] is a faithful in-process backend used
-//! by the contract tests; a real driver can be plugged in by implementing the same trait.
+//! the store logic is transport-agnostic (the workspace exposes `mongodb = "3"` for a
+//! real backend — see the crate tracker §4.2). [`client::InMemoryMongoClient`] is a
+//! faithful in-process backend used by the contract tests; a real driver plugs in by
+//! implementing the same trait.
+//!
+//! The guard is exposed twice on purpose: [`MongodbSandboxExecutionGuard`] is the
+//! MongoDB-specific lock (inherent `try_enter` / `release_async`), while
+//! [`MongodbGuardClient`] adapts it to the object-safe
+//! [`agentscope_harness::agent::sandbox::SandboxGuard`] trait so it can be projected into
+//! `DistributedStore::sandbox_execution_guard` and driven by `SandboxManager`.
 //!
 //! ## CAS / version semantics
 //!

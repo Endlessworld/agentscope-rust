@@ -13,15 +13,17 @@
 //! component set and projects all of it via
 //! [`MongodbDistributedStore::to_harness_store`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::distributed_store::DistributedStore;
 use agentscope_harness::agent::isolation_scope::IsolationScope;
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use crate::client::MongoClient;
-use crate::constants::{DEFAULT_DATABASE, SNAPSHOTS_COLLECTION};
+use crate::client::{scoped_collection, MongoClient};
+use crate::constants::{
+    BASE_STORE_COLLECTION, DEFAULT_DATABASE, SESSIONS_COLLECTION, SNAPSHOTS_COLLECTION,
+};
 use crate::sandbox_guard::{MongodbGuardClient, MongodbSandboxExecutionGuard};
 use crate::snapshot::{MongodbRemoteSnapshotClient, MongodbSnapshotSpec};
 use crate::state_store::MongodbAgentStateStore;
@@ -40,11 +42,6 @@ pub struct MongodbDistributedStore {
     snapshot_spec: MongodbSnapshotSpec,
     execution_guard: Arc<MongodbSandboxExecutionGuard>,
     guard_client: Arc<MongodbGuardClient>,
-
-    /// Cache of lazily-created state stores, keyed by nothing (single instance); kept
-    /// behind a Mutex to mirror Java's volatile double-checked caching without
-    /// changing the shared component identities.
-    _cache: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for MongodbDistributedStore {
@@ -65,6 +62,13 @@ impl MongodbDistributedStore {
     pub fn new(client: Arc<dyn MongoClient>, database_name: Option<&str>) -> Self {
         let database_name = database_name.unwrap_or(DEFAULT_DATABASE).to_string();
 
+        // Every component is database-scoped (Java: `mongoClient.getDatabase(databaseName)
+        // .getCollection(...)`). The flat `MongoClient` seam encodes the database into the
+        // collection key via `scoped_collection`, so two stores on different databases
+        // never share documents.
+        let sessions_collection = scoped_collection(&database_name, SESSIONS_COLLECTION);
+        let base_collection = scoped_collection(&database_name, BASE_STORE_COLLECTION);
+
         let agent_state_store = {
             // Cascade-delete snapshots when a session is removed. Only the SESSION
             // scope is eligible because a SESSION-scoped sandbox is tied 1:1 to the
@@ -73,28 +77,46 @@ impl MongodbDistributedStore {
             let cascade_snapshot_client =
                 MongodbRemoteSnapshotClient::new(client.clone(), Some(&database_name), None);
             let cascade_state_client = client.clone();
-            let cascade_db = database_name.clone();
+            let cascade_collection = sessions_collection.clone();
             MongodbAgentStateStore::builder()
                 .client(client.clone())
-                .on_delete(Arc::new(move |_user_id, session_id| {
-                    let snapshot_client = cascade_snapshot_client.clone();
-                    let state_client = cascade_state_client.clone();
-                    let db = cascade_db.clone();
-                    let session_id = session_id.to_string();
-                    // Best-effort, synchronous cascade via the blocking executor.
-                    let _ = futures::executor::block_on(async move {
-                        if let Some(snapshot_id) =
-                            find_session_snapshot_id(&state_client, &db, &session_id).await
-                        {
-                            let _ = snapshot_client.delete(&snapshot_id).await;
-                        }
-                    });
-                }))
+                .collection(sessions_collection.clone())
+                .on_delete(Arc::new(
+                    move |_user_id: Option<String>,
+                          session_id: String|
+                          -> futures::future::BoxFuture<'static, ()> {
+                        let snapshot_client = cascade_snapshot_client.clone();
+                        let state_client = cascade_state_client.clone();
+                        let collection = cascade_collection.clone();
+                        Box::pin(async move {
+                            let snapshot_id = match find_session_snapshot_id(
+                                &state_client,
+                                &collection,
+                                &session_id,
+                            )
+                            .await
+                            {
+                                Some(id) => id,
+                                None => return,
+                            };
+                            match snapshot_client.delete(&snapshot_id).await {
+                                Ok(true) => tracing::info!(
+                                    "[mongo-cascade] deleted snapshot {snapshot_id} for session {session_id}"
+                                ),
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!(
+                                    "[mongo-cascade] failed to cascade-delete snapshot \
+                                     {snapshot_id} for session {session_id}: {e}"
+                                ),
+                            }
+                        })
+                    },
+                ))
                 .build()
                 .expect("client provided")
         };
 
-        let base_store = MongodbStore::with_defaults(client.clone());
+        let base_store = MongodbStore::new(client.clone(), base_collection);
         let snapshot_client =
             MongodbRemoteSnapshotClient::new(client.clone(), Some(&database_name), None);
         let snapshot_spec = MongodbSnapshotSpec::new(
@@ -119,7 +141,6 @@ impl MongodbDistributedStore {
             snapshot_spec,
             execution_guard,
             guard_client,
-            _cache: Arc::new(Mutex::new(())),
         }
     }
 
@@ -164,8 +185,8 @@ impl MongodbDistributedStore {
         &self.execution_guard
     }
 
-    /// A harness-trait [`SandboxExecutionGuard`](agentscope_harness::agent::sandbox::guard::SandboxExecutionGuard)
-    /// view of the MongoDB guard.
+    /// The harness [`SandboxGuard`](agentscope_harness::agent::sandbox::SandboxGuard) view
+    /// of the MongoDB guard.
     pub fn sandbox_execution_guard(&self) -> Arc<MongodbGuardClient> {
         self.guard_client.clone()
     }
@@ -214,24 +235,20 @@ fn map_err(e: crate::client::MongoError) -> Error {
 /// Best-effort lookup of a SESSION-scoped remote snapshot id for a session.
 ///
 /// Mirrors Java `MongoDistributedStore.findSessionSnapshotId`: reads the harness
-/// `SessionSandboxStateStore` slot (`sandbox/session/<sessionId>` /
+/// `AgentStateStoreSandboxStateStore` slot (`sandbox/session/<sessionId>` /
 /// `_sandbox_state`) from the sessions collection and extracts `snapshot.id` when
 /// `snapshot.type == "remote"`.
+///
+/// The slot is always written with `user = None` (see
+/// `agentscope_harness::agent::sandbox::AgentStateStoreSandboxStateStore`), which is the
+/// anonymous column — the same `null` user Java passes to `agentStateStore().get(...)`.
 async fn find_session_snapshot_id(
     client: &Arc<dyn MongoClient>,
-    database_name: &str,
+    collection: &str,
     session_id: &str,
 ) -> Option<String> {
-    let _ = database_name; // collection is resolved from the store default
-    let filter = crate::client::FindFilter::eq(
-        "_id",
-        json!({ "user": "__anon__", "session": format!("sandbox/session/{session_id}") }),
-    );
-    let doc = client
-        .find_one(crate::constants::SESSIONS_COLLECTION, &filter)
-        .await
-        .ok()
-        .flatten()?;
+    let filter = crate::state_store::slot_filter(None, &format!("sandbox/session/{session_id}"));
+    let doc = client.find_one(collection, &filter).await.ok().flatten()?;
     let json_str = doc
         .get("states")
         .and_then(|v| v.as_object())
@@ -286,8 +303,10 @@ mod tests {
         })
         .to_string();
         let update = Update::new().set("states._sandbox_state.json", json!(state));
+        // The distributed store database-scopes every component, including the session
+        // collection the cascade reads.
         raw.update_one(
-            crate::constants::SESSIONS_COLLECTION,
+            &scoped_collection("agentscope", SESSIONS_COLLECTION),
             &filter,
             &update,
             &UpdateOptions { upsert: true },
@@ -471,5 +490,50 @@ mod tests {
         // No sandbox-state slot → cascade lookup finds nothing; deletion still succeeds.
         s.agent_state_store().delete(Some("u"), "sess-2").await;
         assert!(!s.agent_state_store().exists(Some("u"), "sess-2").await);
+    }
+
+    /// Java scopes every component with `getDatabase(databaseName)`; the flat `MongoClient`
+    /// seam encodes it into the collection key, so two stores on different databases must
+    /// not see each other's session state or workspace files.
+    #[tokio::test]
+    async fn database_name_partitions_state_and_base_store() {
+        use agentscope_core::state::AgentStateStore;
+
+        let client: Arc<dyn MongoClient> = Arc::new(InMemoryMongoClient::new());
+        let a = MongodbDistributedStore::new(client.clone(), Some("db_a"));
+        let b = MongodbDistributedStore::new(client.clone(), Some("db_b"));
+
+        a.agent_state_store()
+            .save(Some("u"), "sess", "k", json!("a"))
+            .await;
+        b.agent_state_store()
+            .save(Some("u"), "sess", "k", json!("b"))
+            .await;
+        assert_eq!(
+            a.agent_state_store().get(Some("u"), "sess", "k").await,
+            Some(json!("a"))
+        );
+        assert_eq!(
+            b.agent_state_store().get(Some("u"), "sess", "k").await,
+            Some(json!("b"))
+        );
+
+        let mut value = serde_json::Map::new();
+        value.insert("content".to_string(), json!("a-file"));
+        a.base_store().put(&["ns".to_string()], "k", value);
+        assert!(a.base_store().get(&["ns".to_string()], "k").is_some());
+        assert!(
+            b.base_store().get(&["ns".to_string()], "k").is_none(),
+            "db_b must not see db_a's workspace files"
+        );
+
+        assert_ne!(
+            a.agent_state_store().collection(),
+            b.agent_state_store().collection()
+        );
+        assert!(a
+            .agent_state_store()
+            .collection()
+            .starts_with("db_a::"));
     }
 }

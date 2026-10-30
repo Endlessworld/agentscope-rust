@@ -38,7 +38,8 @@ const FIELD_EXPIRES_AT: &str = "expiresAt";
 ///
 /// Unlike the Java class (which implements `SandboxExecutionGuard` directly), this
 /// Rust type holds a MongoDB client and is used via [`MongodbGuardClient`], which is
-/// what actually implements the harness [`SandboxExecutionGuard`] trait for a given
+/// what actually implements the harness
+/// [`SandboxGuard`](agentscope_harness::agent::sandbox::SandboxGuard) trait for a given
 /// isolation key.
 #[derive(Clone)]
 pub struct MongodbSandboxExecutionGuard {
@@ -703,6 +704,100 @@ mod tests {
         )
         .await
         .expect("trait release must not deadlock the runtime");
+        assert!(!client.is_held(&key));
+        assert_eq!(client.active_count(), 0);
+    }
+
+    /// Java `lockDocumentExpiryUsesLeaseTtlNotAcquisitionTimeout` + `builderWithCustomOwner`:
+    /// the lock document records the owner label, the token, and an `expiresAt` derived from
+    /// `lease_ttl` (not from `lock_timeout`).
+    #[tokio::test]
+    async fn lock_document_records_owner_and_lease_ttl() {
+        let g = MongodbSandboxExecutionGuard::builder(Arc::new(InMemoryMongoClient::new()))
+            .lease_ttl(Duration::from_secs(120))
+            .lock_timeout(Duration::from_secs(5))
+            .owner("owner-1")
+            .build();
+        let key = SandboxIsolationKey::new("user", "u1");
+        let before = chrono::Utc::now().timestamp_millis();
+        let lease = g.try_enter(&key).await.unwrap();
+
+        let filter = FindFilter::eq("_id", json!(lease.lock_id()));
+        let doc = g
+            .client
+            .find_one(g.collection_key(), &filter)
+            .await
+            .unwrap()
+            .expect("lock document exists");
+        assert_eq!(doc.get("owner").and_then(|v| v.as_str()), Some("owner-1"));
+        assert_eq!(
+            doc.get("token").and_then(|v| v.as_str()),
+            Some(lease.token())
+        );
+        let expires_at = doc
+            .get("expiresAt")
+            .and_then(|v| v.as_i64())
+            .expect("expiresAt written on acquisition");
+        let expected = before + 120_000;
+        assert!(
+            (expires_at - expected).abs() <= 5_000,
+            "expiresAt must derive from lease_ttl (got {expires_at}, expected ~{expected})"
+        );
+    }
+
+    /// The renewal task (every `lease_ttl / 3`) keeps pushing `expiresAt` forward, so a
+    /// long-running sandbox never loses its lock to the TTL index.
+    #[tokio::test]
+    async fn lease_renewal_extends_the_lock_expiry() {
+        let g = MongodbSandboxExecutionGuard::builder(Arc::new(InMemoryMongoClient::new()))
+            .lease_ttl(Duration::from_millis(300))
+            .retry_interval(Duration::from_millis(10))
+            .lock_timeout(Duration::from_millis(100))
+            .build();
+        let key = SandboxIsolationKey::new("session", "renewed");
+        let lease = g.try_enter(&key).await.unwrap();
+        let initial_expiry = lease.expires_at();
+        let filter = FindFilter::eq("_id", json!(lease.lock_id()));
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        let doc = g
+            .client
+            .find_one(g.collection_key(), &filter)
+            .await
+            .unwrap()
+            .expect("lock document still present");
+        let renewed_expiry = doc
+            .get("expiresAt")
+            .and_then(|v| v.as_i64())
+            .expect("expiresAt is written on acquisition");
+        assert!(
+            renewed_expiry > initial_expiry,
+            "renewal must extend expiresAt ({renewed_expiry} > {initial_expiry})"
+        );
+        // The lease still owns the lock after several renewal cycles.
+        assert!(g.lock_held(lease.lock_id(), chrono::Utc::now().timestamp_millis()));
+    }
+
+    /// End-to-end lifecycle mirroring `SandboxManager::release_lease`: the manager claims
+    /// the lease, then awaits `SandboxGuard::release`, which deletes the lock document.
+    /// A second release is a no-op (the harness `mark_released` gate makes it exactly once).
+    #[tokio::test]
+    async fn harness_lifecycle_releases_the_lock_exactly_once() {
+        let client = MongodbGuardClient::new(Arc::new(guard()));
+        let key = SandboxIsolationKey::new("session", "lifecycle");
+
+        let lease = client.try_enter(key.clone()).await;
+        assert!(!lease.is_noop());
+        assert!(client.is_held(&key));
+
+        assert!(lease.mark_released(), "the manager claims the lease first");
+        client.release(&key).await;
+        assert!(!client.is_held(&key), "the lock document is deleted");
+        assert_eq!(client.active_count(), 0);
+
+        assert!(!lease.mark_released(), "release is exactly once");
+        client.release(&key).await;
         assert!(!client.is_held(&key));
         assert_eq!(client.active_count(), 0);
     }

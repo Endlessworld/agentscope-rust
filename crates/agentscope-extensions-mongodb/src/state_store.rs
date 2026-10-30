@@ -37,7 +37,21 @@ const FIELD_HASHES: &str = "hashes";
 
 /// Sentinel returned by [`MongodbAgentStateStore::save_if_version`] when the
 /// conditional write lost the CAS race.
-pub const UNVERSIONED: i64 = -1;
+///
+/// Re-exported from `agentscope_core::state` so the versioning protocol has a single
+/// source of truth shared with the other storage backends (value `-1`, which never
+/// collides with a real stored version: those start at 1).
+pub use agentscope_core::state::UNVERSIONED;
+
+/// Async callback invoked before a session slot is deleted, receiving the owned
+/// `(user_id, session_id)`.
+///
+/// It returns a boxed future so the callback can await the backend directly; a
+/// synchronous callback would have to bridge with `futures::executor::block_on`, which
+/// stalls (and can deadlock) the runtime.
+pub type SessionDeleteCallback = Arc<
+    dyn Fn(Option<String>, String) -> futures::future::BoxFuture<'static, ()> + Send + Sync,
+>;
 
 /// Validates a state key for use as a field name inside the `states` sub-document.
 ///
@@ -77,7 +91,7 @@ fn slot_id(user_id: Option<&str>, session_id: &str) -> Value {
     json!({ "user": normalize_user(user_id), "session": session_id })
 }
 
-fn slot_filter(user_id: Option<&str>, session_id: &str) -> FindFilter {
+pub(crate) fn slot_filter(user_id: Option<&str>, session_id: &str) -> FindFilter {
     FindFilter::eq("_id", slot_id(user_id, session_id))
 }
 
@@ -98,7 +112,7 @@ pub struct MongodbAgentStateStore {
     /// Session TTL in days as configured through the builder; `None` (or a
     /// non-positive value) disables the TTL index.
     ttl_days: Option<i64>,
-    on_delete: Option<Arc<dyn Fn(Option<&str>, &str) + Send + Sync>>,
+    on_delete: Option<SessionDeleteCallback>,
 }
 
 impl std::fmt::Debug for MongodbAgentStateStore {
@@ -125,6 +139,12 @@ impl MongodbAgentStateStore {
     /// The session TTL in days configured on the builder, if any.
     pub fn ttl_days(&self) -> Option<i64> {
         self.ttl_days
+    }
+
+    /// The collection this store reads and writes (database-scoped when the store was
+    /// built through [`crate::MongodbDistributedStore`]).
+    pub fn collection(&self) -> &str {
+        &self.collection
     }
 
     /// Creates a store with the default collection name
@@ -177,8 +197,6 @@ impl MongodbAgentStateStore {
     ) -> Result<(Option<Value>, i64), MongoError> {
         validate_state_key(key)?;
         let filter = slot_filter(user_id, session_id);
-        let state_field = format!("{FIELD_STATES}.{key}");
-        let version_field = format!("{FIELD_VERSIONS}.{key}");
         let doc = self.client.find_one(&self.collection, &filter).await?;
         let Some(doc) = doc else {
             return Ok((None, 0));
@@ -196,7 +214,6 @@ impl MongodbAgentStateStore {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let value = states.get(key).map(key_escaper::unescape);
-        let _ = (state_field, version_field);
         Ok((value, version))
     }
 
@@ -490,6 +507,7 @@ impl MongodbAgentStateStore {
         key: &str,
     ) -> Result<(), MongoError> {
         validate_state_key(key)?;
+        require_session_id(session_id)?;
         let filter = slot_filter(user_id, session_id);
         let update = Update::new()
             .unset(format!("{FIELD_STATES}.{key}"))
@@ -576,7 +594,9 @@ impl AgentStateStore for MongodbAgentStateStore {
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
         if let Some(cb) = &self.on_delete {
-            cb(user_id, session_id);
+            // Awaited, with no block_on bridge. The callback owns its error policy: the
+            // cascade in MongodbDistributedStore logs failures and never blocks deletion.
+            cb(user_id.map(str::to_string), session_id.to_string()).await;
         }
         let filter = slot_filter(user_id, session_id);
         let _ = self.client.delete_one(&self.collection, &filter).await;
@@ -612,6 +632,8 @@ impl AgentStateStore for MongodbAgentStateStore {
     ) -> agentscope_core::state::VersionedState {
         match MongodbAgentStateStore::get_version(self, user_id, session_id, key).await {
             Ok((value, version)) => agentscope_core::state::VersionedState { value, version },
+            // Error path: report UNVERSIONED (no usable version) instead of a stale 0, so a
+            // CAS writer can never mistake a failed read for create-if-absent.
             Err(_) => agentscope_core::state::VersionedState {
                 value: None,
                 version: agentscope_core::state::UNVERSIONED,
@@ -649,7 +671,7 @@ pub struct MongodbAgentStateStoreBuilder {
     client: Option<Arc<dyn MongoClient>>,
     collection: Option<String>,
     ttl_days: Option<i64>,
-    on_delete: Option<Arc<dyn Fn(Option<&str>, &str) + Send + Sync>>,
+    on_delete: Option<SessionDeleteCallback>,
 }
 
 impl MongodbAgentStateStoreBuilder {
@@ -672,10 +694,10 @@ impl MongodbAgentStateStoreBuilder {
         self
     }
 
-    /// Optional callback invoked before a session document is deleted, receiving
-    /// `(user_id, session_id)`. Used by [`crate::MongodbDistributedStore`] to
+    /// Optional async callback invoked before a session document is deleted, receiving
+    /// the owned `(user_id, session_id)`. Used by [`crate::MongodbDistributedStore`] to
     /// cascade-delete associated snapshots.
-    pub fn on_delete(mut self, cb: Arc<dyn Fn(Option<&str>, &str) + Send + Sync>) -> Self {
+    pub fn on_delete(mut self, cb: SessionDeleteCallback) -> Self {
         self.on_delete = Some(cb);
         self
     }
@@ -803,6 +825,70 @@ mod tests {
         );
     }
 
+    /// Java `MongoAgentStateStoreTest#saveListAppendOnNewSessionIncludesSetOnInsert`: the
+    /// first write of a slot records the session identity columns (`user_id` /
+    /// `session_id`) so `listSessionIds` can find it by `distinct`.
+    #[tokio::test]
+    async fn set_on_insert_records_session_identity() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let s = MongodbAgentStateStore::with_defaults(raw.clone());
+        s.save(Some("u1"), "sess", "k", json!(1)).await;
+        s.save_list(Some("u1"), "sess2", "list", &[json!(1)]).await;
+
+        for session in ["sess", "sess2"] {
+            let filter = FindFilter::eq("_id", json!({ "user": "u1", "session": session }));
+            let doc = raw
+                .find_one(crate::constants::SESSIONS_COLLECTION, &filter)
+                .await
+                .unwrap()
+                .expect("session document exists");
+            assert_eq!(doc.get("user_id").and_then(|v| v.as_str()), Some("u1"));
+            assert_eq!(
+                doc.get("session_id").and_then(|v| v.as_str()),
+                Some(session)
+            );
+        }
+    }
+
+    /// Java `MongoAgentStateStoreContractTest#concurrentWriters_onlyOneSucceeds`: the
+    /// create-if-absent branch is atomic on the server, so two racing writers cannot both
+    /// create the same key.
+    #[tokio::test]
+    async fn concurrent_create_if_absent_only_one_writer_wins() {
+        let s = store();
+        let a = json!("a");
+        let b = json!("b");
+        let first = s.save_if_version(Some("u"), "sess", "k", &a, 0);
+        let second = s.save_if_version(Some("u"), "sess", "k", &b, 0);
+        let (first, second) = tokio::join!(first, second);
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            results.iter().filter(|v| **v == 1).count(),
+            1,
+            "exactly one create-if-absent may win: {results:?}"
+        );
+        assert_eq!(
+            results.iter().filter(|v| **v == UNVERSIONED).count(),
+            1,
+            "the loser reports UNVERSIONED: {results:?}"
+        );
+        let (_, version) = s.get_version(Some("u"), "sess", "k").await.unwrap();
+        assert_eq!(version, 1);
+    }
+
+    /// Java validates `sessionId` in `slotId(...)` and throws `IllegalArgumentException`
+    /// for a blank id; the inherent APIs report it as `InvalidArgument`.
+    #[tokio::test]
+    async fn blank_session_id_is_rejected() {
+        let s = store();
+        assert!(s
+            .save_if_version(Some("u"), "  ", "k", &json!(1), UNVERSIONED)
+            .await
+            .is_err());
+        assert!(s.delete_key(Some("u"), "", "k").await.is_err());
+        assert!(s.delete_key(Some("u"), "sess", "bad.key").await.is_err());
+    }
+
     #[tokio::test]
     async fn versions_increment_and_cas_works() {
         let s = store();
@@ -837,6 +923,37 @@ mod tests {
         let (value, version) = s.get_version(Some("u"), "sess", "k").await.unwrap();
         assert_eq!(value, Some(json!(3)));
         assert_eq!(version, 2);
+    }
+
+    /// The core `AgentStateStore` versioning surface (not just the inherent
+    /// `get_version` / `save_if_version` pair): `supports_versioning()` is true, an absent
+    /// key reports version `0` (not `UNVERSIONED`), and a lost CAS reports `UNVERSIONED`
+    /// without overwriting the stored value.
+    #[tokio::test]
+    async fn trait_versioning_surface_matches_core_contract() {
+        let s = store();
+        assert!(AgentStateStore::supports_versioning(&s));
+
+        let absent = s.get_versioned(Some("u"), "sess", "k").await;
+        assert_eq!(absent.value, None);
+        assert_eq!(
+            absent.version, 0,
+            "an absent key reports version 0 on a versioning backend"
+        );
+
+        assert_eq!(
+            AgentStateStore::save_if_version(&s, Some("u"), "sess", "k", json!(1), 0).await,
+            1
+        );
+        let current = s.get_versioned(Some("u"), "sess", "k").await;
+        assert_eq!(current.value, Some(json!(1)));
+        assert_eq!(current.version, 1);
+
+        assert_eq!(
+            AgentStateStore::save_if_version(&s, Some("u"), "sess", "k", json!(2), 0).await,
+            agentscope_core::state::UNVERSIONED
+        );
+        assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!(1)));
     }
 
     #[tokio::test]
@@ -1023,15 +1140,30 @@ mod tests {
     async fn on_delete_callback_fires() {
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = fired.clone();
+        let observed = Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let observed_slot = observed.clone();
         let store = MongodbAgentStateStore::builder()
             .client(Arc::new(InMemoryMongoClient::new()))
-            .on_delete(Arc::new(move |_u, _s| {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            .on_delete(Arc::new(move |user, session| {
+                let flag = flag.clone();
+                let observed = observed_slot.clone();
+                Box::pin(async move {
+                    *observed.lock().unwrap() =
+                        Some((user.unwrap_or_default(), session));
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
             }))
             .build()
             .unwrap();
         store.save(Some("u"), "sess", "k", json!(1)).await;
         store.delete(Some("u"), "sess").await;
         assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+        // The callback receives the owned identity of the deleted slot and runs before
+        // the document is removed, so a cascade can still read the session's slots.
+        assert_eq!(
+            observed.lock().unwrap().clone(),
+            Some(("u".to_string(), "sess".to_string()))
+        );
+        assert!(!store.exists(Some("u"), "sess").await);
     }
 }
