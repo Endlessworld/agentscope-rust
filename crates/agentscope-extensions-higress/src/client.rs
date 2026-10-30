@@ -75,29 +75,67 @@ pub struct HigressClientConfig {
     pub tool_search_query: Option<String>,
     /// Maximum number of tools returned by tool search.
     pub tool_search_top_k: usize,
+    /// Whether request metadata (`_meta`) is propagated to this server.
+    ///
+    /// Mirrors Java `McpClientWrapper.propagateMeta` (default `true`); projected
+    /// into [`McpServerConfig::propagate_meta`] so the harness honours it.
+    pub propagate_meta: bool,
 }
 
 impl HigressClientConfig {
     /// Builds the endpoint with any configured query parameters appended.
     ///
-    /// Parameters are merged with whatever the endpoint already carries,
-    /// matching the Java builder's documented behaviour.
+    /// Mirrors Java `McpClientBuilder.extractEndpoint`
+    /// (`agentscope-core/.../McpClientBuilder.java:740-795`): the endpoint's own
+    /// query is URL-decoded, the configured parameters are merged on top (a
+    /// configured value wins over a duplicate key coming from the URL), and the
+    /// result is URL-encoded again with `URLEncoder` semantics (`+` for spaces).
+    ///
+    /// Rust keeps the scheme/host in the returned value (the harness needs a full
+    /// URL), whereas Java only returns `path?query` for its transport builder.
     pub fn endpoint_with_query(&self) -> String {
-        if self.query_params.is_empty() {
-            return self.endpoint.clone();
-        }
-        let separator = if self.endpoint.contains('?') {
-            '&'
-        } else {
-            '?'
+        let (base, existing) = match self.endpoint.split_once('?') {
+            Some((base, query)) => (base, query),
+            None => (self.endpoint.as_str(), ""),
         };
-        let query = self
-            .query_params
+        let mut merged: Vec<(String, String)> = Vec::new();
+        for param in existing.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let (key, value) = match param.split_once('=') {
+                Some((key, value)) => (key, value),
+                None => (param, ""),
+            };
+            let key = decode_query_component(key);
+            let value = decode_query_component(value);
+            // A duplicate key in the URL keeps the last value, like Java's map put.
+            match merged.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(slot) => slot.1 = value,
+                None => merged.push((key, value)),
+            }
+        }
+        for (key, value) in &self.query_params {
+            match merged.iter_mut().find(|(existing, _)| existing == key) {
+                Some(slot) => slot.1 = value.clone(),
+                None => merged.push((key.clone(), value.clone())),
+            }
+        }
+        if merged.is_empty() {
+            return base.to_string();
+        }
+        let query = merged
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    encode_query_component(k),
+                    encode_query_component(v)
+                )
+            })
             .collect::<Vec<_>>()
             .join("&");
-        format!("{}{}{}", self.endpoint, separator, query)
+        format!("{base}?{query}")
     }
 
     /// Projects this configuration into a harness [`McpServerConfig`] so the
@@ -112,6 +150,7 @@ impl HigressClientConfig {
         McpServerConfig::new(self.client_name.clone())
             .url(self.endpoint_with_query())
             .headers(self.headers.clone())
+            .propagate_meta(self.propagate_meta)
     }
 }
 
@@ -243,6 +282,7 @@ pub struct HigressMcpClientBuilder {
     enable_tool_search: bool,
     tool_search_query: Option<String>,
     tool_search_top_k: usize,
+    propagate_meta: bool,
 }
 
 impl HigressMcpClientBuilder {
@@ -268,6 +308,7 @@ impl HigressMcpClientBuilder {
             enable_tool_search: false,
             tool_search_query: None,
             tool_search_top_k: DEFAULT_TOOL_SEARCH_TOP_K,
+            propagate_meta: true,
         })
     }
 
@@ -362,6 +403,17 @@ impl HigressMcpClientBuilder {
         Ok(self)
     }
 
+    /// Sets whether request metadata (`_meta`) is propagated to the gateway.
+    ///
+    /// Mirrors Java `McpClientWrapper.setPropagateMeta`: the default is `true`,
+    /// and `false` keeps internal metadata (trace ids, callback URLs) inside the
+    /// process. The value is projected into the harness `McpServerConfig`, which
+    /// reads it live on every call.
+    pub fn propagate_meta(mut self, propagate_meta: bool) -> Self {
+        self.propagate_meta = propagate_meta;
+        self
+    }
+
     /// Validates the configuration, mirroring the Java `validateConfiguration`.
     fn validate(&self) -> Result<()> {
         match &self.endpoint {
@@ -420,6 +472,7 @@ impl HigressMcpClientBuilder {
             enable_tool_search: self.enable_tool_search,
             tool_search_query: self.tool_search_query.clone(),
             tool_search_top_k: self.tool_search_top_k,
+            propagate_meta: self.propagate_meta,
         })
     }
 
@@ -458,6 +511,9 @@ pub struct HigressMcpClientWrapper {
     enable_tool_search: bool,
     tool_search_query: Option<String>,
     tool_search_top_k: usize,
+    /// Connection-level `_meta` switch (Java `McpClientWrapper.propagateMeta`).
+    /// Atomic so the Java "live switch" semantics survive `&self` accessors.
+    propagate_meta: std::sync::atomic::AtomicBool,
     initialized: Mutex<bool>,
     /// Serialises `initialize` so concurrent callers connect at most once.
     init_guard: tokio::sync::Mutex<()>,
@@ -500,6 +556,7 @@ impl HigressMcpClientWrapper {
             enable_tool_search: config.enable_tool_search,
             tool_search_query: config.tool_search_query,
             tool_search_top_k: config.tool_search_top_k,
+            propagate_meta: std::sync::atomic::AtomicBool::new(config.propagate_meta),
             initialized: Mutex::new(false),
             init_guard: tokio::sync::Mutex::new(()),
             cached_tools: Mutex::new(HashMap::new()),
@@ -528,6 +585,7 @@ impl HigressMcpClientWrapper {
             enable_tool_search,
             tool_search_query,
             tool_search_top_k,
+            propagate_meta: std::sync::atomic::AtomicBool::new(true),
             initialized: Mutex::new(false),
             init_guard: tokio::sync::Mutex::new(()),
             cached_tools: Mutex::new(HashMap::new()),
@@ -547,6 +605,24 @@ impl HigressMcpClientWrapper {
     /// Whether the client has been initialized.
     pub fn is_initialized(&self) -> bool {
         *self.initialized.lock().unwrap()
+    }
+
+    /// Whether request metadata (`_meta`) is propagated to the gateway.
+    ///
+    /// Mirrors Java `McpClientWrapper.getPropagateMeta()`.
+    pub fn propagate_meta(&self) -> bool {
+        self.propagate_meta.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Toggles request-metadata propagation.
+    ///
+    /// Mirrors Java `McpClientWrapper.setPropagateMeta(boolean)`: the switch is
+    /// live (no reconnect needed) and is re-applied to the harness config on the
+    /// next [`initialize`](Self::initialize), which is the value the manager
+    /// reads for every call.
+    pub fn set_propagate_meta(&self, propagate_meta: bool) {
+        self.propagate_meta
+            .store(propagate_meta, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Establishes the real MCP connection, mirroring Java's
@@ -600,8 +676,10 @@ impl HigressMcpClientWrapper {
         }
 
         tracing::info!("Initializing Higress MCP client: {}", self.name);
+        let mut server = self.server_config.clone();
+        server.propagate_meta = self.propagate_meta();
         let request = McpConnectRequest {
-            server: self.server_config.clone(),
+            server,
             transport: self.transport_type,
             timeout: self.timeout,
             initialization_timeout: self.initialization_timeout,
@@ -881,7 +959,77 @@ pub fn convert_to_mcp_tool(tool_info: &HigressToolInfo) -> Tool {
     }
 }
 
+/// Decodes an `application/x-www-form-urlencoded` query component the way Java's
+/// `URLDecoder.decode(..., UTF_8)` does: `+` becomes a space and `%XX` escapes are
+/// resolved. Malformed escapes are kept verbatim rather than rejected.
+fn decode_query_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        out.push(high * 16 + low);
+                        index += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encodes a query component the way Java's `URLEncoder.encode(..., UTF_8)` does:
+/// alphanumerics plus `.-*_` stay as-is, a space becomes `+`, everything else is
+/// `%XX`.
+fn encode_query_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'*' | b'_' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push('+'),
+            byte => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Builds a [`ToolInputSchema`] from a raw JSON schema value.
+///
+/// DESIGN: `rust-mcp-schema` 0.10.3 models the MCP input schema as a closed
+/// struct (`type: "object"` + `properties` + `required` only,
+/// `rust-mcp-schema-0.10.3/src/generated_schema/2025_06_18/mcp_schema.rs`
+/// `pub struct ToolInputSchema`), so keys such as `$schema`,
+/// `additionalProperties` or `$defs` have no representation and cannot be
+/// forwarded. Java passes the gateway map through verbatim because its
+/// `McpSchema.Tool` keeps the schema as an untyped map. This is a type-system
+/// limitation, not a dropped conversion: `properties`/`required` are preserved
+/// and each property is kept as its raw schema object.
 fn build_input_schema(schema: &Value) -> Option<ToolInputSchema> {
     let object = schema.as_object()?;
     let properties = object
@@ -1375,6 +1523,61 @@ mod tests {
             vec![("Authorization".to_string(), "Bearer t".to_string())]
         );
         assert!(server.command.is_none());
+    }
+
+    #[test]
+    fn endpoint_with_query_merges_duplicate_keys_and_encodes_like_java() {
+        let config = HigressMcpClientBuilder::create("c")
+            .unwrap()
+            .sse_endpoint("https://gw.example.com/sse?token=a%20b&token=c+d&keep=1")
+            .query_param("q", "a&b")
+            .query_param("token", "x y")
+            .build_config()
+            .unwrap();
+        assert_eq!(
+            config.endpoint_with_query(),
+            "https://gw.example.com/sse?token=x+y&keep=1&q=a%26b"
+        );
+    }
+
+    #[test]
+    fn propagate_meta_defaults_true_and_projects_into_server_config() {
+        let config = HigressMcpClientBuilder::create("c")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .build_config()
+            .unwrap();
+        assert!(config.propagate_meta);
+        assert!(config.to_server_config().propagate_meta);
+
+        let config = HigressMcpClientBuilder::create("c")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .propagate_meta(false)
+            .build_config()
+            .unwrap();
+        assert!(!config.propagate_meta);
+        assert!(!config.to_server_config().propagate_meta);
+    }
+
+    #[tokio::test]
+    async fn initialize_applies_propagate_meta_switch() {
+        let recording = Arc::new(RecordingConnection::default());
+        let config = HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .propagate_meta(false)
+            .build_config()
+            .unwrap();
+        let wrapper = HigressMcpClientWrapper::with_transport(config, recording.clone());
+        assert!(!wrapper.propagate_meta());
+
+        wrapper.initialize().await.unwrap();
+        assert!(!recording.requests()[0].server.propagate_meta);
+
+        // The switch stays live after construction, like Java's setter.
+        wrapper.set_propagate_meta(true);
+        assert!(wrapper.propagate_meta());
     }
 
     #[test]

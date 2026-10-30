@@ -18,7 +18,7 @@
 | Java 规模（静态复核实测） | 主代码 **1050 行** / 测试 **1016 行**（非空行；含空行分别 1146 / 1252）；rollup 记的 1071 / 971 与实测不符，见 §6 勘误 |
 | Rust crate | `crates/agentscope-extensions-higress` |
 | 迁移波次 | C |
-| 当前状态 | **总判：已完成**（P1 清零，余 P2）—— 已完成（57 个 lib test + 1 个 doc test 通过；P1-1 ~ P1-4 于 2026-10-28 关闭，见 §6.5） |
+| 当前状态 | **总判：已完成**（P1 清零，P2 于 2026-10-31 收口——P2-4/P2-5/P2-6/P2-7 已落地，P2-2 定性为「设计决定（不迁移）」，P2-8 转跨模块需求；见 §6.3 / §9）—— 已完成（57 lib test + 1 doc test；P1-1 ~ P1-4 于 2026-10-28 关闭） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -93,7 +93,7 @@
 2. **汇总方（信息共享 / 待裁定项）**：Java `McpClientWrapper` 无 Rust 等价基类，本模块以 `McpClientManager` + server 名委托实现；若其它 C 波次模块（CONTROLPLANE/STUDIO 等）也需 MCP 客户端包装，建议统一抽象后再收敛。
 3. 真实端到端联调（连真实 Higress 网关）需 `McpClientManager` 建立连接；本 crate 已把 `HigressClientConfig` 转换成 `McpServerConfig`。**【2026-10-28 已修复】**`build(&self, manager)` 现在会调用 `wrapper.initialize()`，经 `HigressMcpTransport::connect_server` 真实创建并 connect 底层 client（`transport_type`/`timeout`/`initialization_timeout` 全部投影进 `McpConnectRequest`），失败向上返回且 `initialized` 保持 false；对应测试 `initialize_connects_and_records_full_config`（断言 manager 里能查到 client id、transport/timeout 全量透传）、`initialize_propagates_connection_failure`、`initialize_applies_initialization_timeout`、`initialize_is_idempotent_and_only_connects_once`。原「`build()` 不建连」的 P0-1 已关闭。
 4. **【2026-10-28 已完成】** 已引入 `trait HigressMcpTransport`（`list_tools` / `call_tool_by_server(…, meta)` 等），由 `McpClientManager` 实现；`HigressMcpClientWrapper::with_transport` 允许注入替身，P1-4 与 `HigressToolkit` 测试因此可离线覆盖（见 §6.3 / §8）。
-5. **保留中的真实剩余（2026-10-29 复核，均为 P2）**：① `build_input_schema` 丢 `$schema`/`additionalProperties`（P2-2）；② wrapper 级 `propagate_meta` 缺失（P2-4，仅工具级已有）；③ `Display` 带引号，与 Java `List.toString()` 微差（P2-5）；④ `HigressToolkit` 非 core `Toolkit` 子类（P2-6，需 `.into_toolkit()`）；⑤ `endpoint_with_query` 不做 URL decode/encode 与同名键合并（P2-7）；⑥ `transport_type` 未透传，harness 靠 URL 嗅探 `/sse`（P2-8）；⑦ 真实 Higress 网关联调未做（仅离线假传输）。另：`rust-mcp-sdk` 已上提 workspace（见第 1 条）；MCP 客户端包装抽象是否跨 C 波次统一仍为第 2 条的**待裁定项**。
+5. **P2 收口（2026-10-31）**：P2-4 / P2-5 / P2-6 / P2-7 已闭环；P2-2 定性「设计决定（不迁移）」；**P2-8 仍为跨模块需求**（harness `McpServerConfig` 无 `transport` 字段，`mcp_client_manager.rs:533` 的 `is_sse_url` 靠 URL 含 `/sse` 嗅探，本 crate 无法在不改 harness 的前提下显式指定传输），已记入回执「跨模块需求」，待汇总方裁定。其余旧条目（① ② ③ ④ ⑤ ⑥ ⑦）见 §9 逐条状态。另：`rust-mcp-sdk` 已上提 workspace（见第 1 条）；MCP 客户端包装抽象是否跨 C 波次统一仍为第 2 条的**待裁定项**。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-higress` 基线。
@@ -155,7 +155,7 @@
 
 ### 6.3 新发现缺口
 
-> **状态（2026-10-28 更新）**：**已完成** = P1-1 / P1-2 / P1-3 / P1-4 / P2-1 / P2-3；**部分完成** = P2-4（工具级 `propagate_meta` 已有，wrapper 级 `get/set_propagate_meta` 仍缺）；**待办** = P2-2 / P2-5 / P2-6 / P2-7 / P2-8。原 P0-1（builder 不建连）已于 2026-10-28 修复（`initialize()` 真建连，见 §6.2 与 §8）。逐条执行依据、测试名与反向验证见 §8。
+> **状态（2026-10-31 收口）**：P1-1 ~ P1-4 / P0-1 / P2-1 / P2-3 已于 2026-10-28 关闭；**P2-4（wrapper 级 `propagate_meta`）、P2-5（`Display` 文本）、P2-6（`toolkit()`/`into_toolkit()`，原记「待办」实为早已落地）、P2-7（query 合并/编解码）已于 2026-10-31 关闭**；**P2-2 定性为「设计决定（不迁移）」**（`rust-mcp-schema` 0.10.3 `ToolInputSchema` 为封闭结构体，`$schema`/`additionalProperties` 无表示位）；**P2-8 为跨模块需求**（harness `McpServerConfig` 无 transport 字段）。逐条依据与用例见 §9。
 
 | 编号 | 优先级 | 缺口 | 证据（Java / Rust） |
 |---|---|---|---|
@@ -165,13 +165,13 @@
 | P1-3 | **P1** | **`HigressToolkit` 注册能力大幅弱于 Java**：① 只能注册 `HigressMcpClientWrapper`（Java `registerMcpClient(McpClientWrapper)` 接受任意 wrapper，按 `instanceof` 决定是否缓存，Java 有 `testRegisterMcpClient_NonHigressClient` 钉住）；② 无 `enableTools`/`disableTools`/`group`/`toolNamePrefix`/`presetParameters`/`propagateMeta` 过滤与分组参数（Java 走 core `McpClientManager.registerMcpClient` 8 参重载 + `Toolkit.registration()` 流式 API，且 Higress 官方文档 `docs/v2/*/integration/infrastructure/higress.md` 明确宣传 `toolkit.registration().mcpClient(client).enableTools(...).group(...).apply()`）；③ 注册的工具**未调用 `toolkit.set_mcp_client_name()`**，丢失 core 的 MCP 客户端归属标注（Java `RegisteredToolFunction.mcpClientName`）。 | Java `HigressToolkit.java:99-111`、core `McpClientManager.java:73-230`、core `Toolkit.java:1030-1053`；Rust `toolkit.rs:67-80` |
 | P1-4 | **P1** | **核心链路（tool-search 成功路径）无测试且不可测**：Java 有 `testListTools_WithToolSearch` / `..._Error` / `..._CachesTools` / `testListTools_WithoutToolSearch_CachesTools` / `testSearchTools_WithQueryAndTopK`（断言请求体 `topK==3`）/ `testConvertToMcpTool_*` 共 8+ 用例；Rust 仅覆盖失败路径。根因：`HigressMcpClientWrapper` 直接依赖**具体类型** `Arc<McpClientManager>`，**无 trait 抽象**，无法像 Java 用 Mockito mock delegate 那样注入桩 → 缓存路径、转换路径、请求体断言均无法离线验证（§3.3 的 `HigressToolkit` P2 测试同样因此挂起）。建议引入 `trait HigressMcpTransport { list_tools / call_tool }` 并让 `McpClientManager` 实现之。 | Java `HigressMcpClientWrapperTest.java:144-188, 282-305, 336-377`；Rust `client.rs:329-337`、`:859-895` |
 | P2-1 | **P2** | **单参 `search_tools` 仍发 `topK` + 文档注释自相矛盾**：`client.rs:497-498` 注释称「omits `topK`」，实现却在 `:513` 无条件写入 `topK`；Java 单参重载只发 `{"query": q}`。 | Java `:317-320`；Rust `client.rs:495-516` |
-| P2-2 | **P2** | **`build_input_schema` 只保留 `properties` + `required`**：Java 把 `inputSchema` 整张 map 原样交给 `McpSchema.Tool.builder(name, map)`；Rust 丢弃 `$schema`/`additionalProperties`/`type` 变体等键，且 `properties` 中非对象值被 `filter_map` 丢弃。 | Java `:210-227`；Rust `client.rs:565-582` |
+| P2-2 | ~~**P2**~~ 设计决定（不迁移） | **`build_input_schema` 只保留 `properties` + `required`**：Java 把 `inputSchema` 整张 map 原样交给 `McpSchema.Tool.builder(name, map)`；Rust 丢弃 `$schema`/`additionalProperties`/`type` 变体等键，且 `properties` 中非对象值被 `filter_map` 丢弃。 | Java `:210-227`；Rust `client.rs:565-582` |
 | P2-3 | **P2** | **`close()` 不释放底层连接**：Java `close()` 调 `delegateClient.close()`（并 try/catch 吞异常）；Rust 仅复位本地标志 + 清缓存，不 `manager.disconnect/remove_client`。**（2026-10-29 勘误：已修复——`close()` 现调 `disconnect_by_server` 并清理本地状态，用例 `close_disconnects_and_resets_state`）** | Java `:279-294`；Rust `client.rs` `close()` |
-| P2-4 | **P2** | **缺 `propagate_meta` 开关**：Java core `McpClientWrapper` 有 `getPropagateMeta()/setPropagateMeta()`；Higress wrapper 继承之，Rust 侧无对应 API（harness `McpServerConfig::propagate_meta` 仅在 `McpServerRegistrar` 路径生效，Higress 自行 `to_server_config()` 时未设置 → 默认 `true`）。 | Java core `McpClientWrapper.java:101-115`；Rust `client.rs:100-104` |
-| P2-5 | **P2** | **`toString` 文本格式微差**：Java `HigressToolSearchResult{tools=[a, b]}`；Rust `HigressToolSearchResult{tools=["a", "b"]}`（`{:?}` 带引号）。Java 断言仅 `contains("tools=")`，故不破坏测试契约。 | Java `:211-217`；Rust `search_result.rs:181-193` |
-| P2-6 | **P2** | **`HigressToolkit` 非 `Toolkit` 子类**：Java `HigressToolkit extends Toolkit`，可直接 `ReActAgent.builder().toolkit(higressToolkit)`；Rust 是 newtype，`ReActAgent` 需要 core `Toolkit`，须 `.into_toolkit()`（或 `.toolkit()` 借用）。 | Java `HigressToolkit.java:56`；Rust `toolkit.rs:22-25, 56-58`；core `react_agent.rs:1126` |
-| P2-7 | **P2** | **query 参数语义弱于 Java**：Java core `extractEndpoint()` 会 **URL-decode 原 URL query、按键合并（新增优先）、并 `URLEncoder.encode` 后拼接**；Rust `endpoint_with_query()` 直接 `k=v&k2=v2` 追加、无编码、同名键会产生重复参数。 | Java core `McpClientBuilder.java:748-800`；Rust `client.rs:84-96` |
-| P2-8 | **P2** | **transport 选择未透传**：Rust `HigressClientConfig.transport_type` 仅存于配置，`to_server_config()` 不携带；harness 依 URL 是否含 `/sse` 自行嗅探（`mcp_client_manager.rs:540-542`），与 Java 显式 `sseTransport/streamableHttpTransport` 不等价（URL 含 `/sse` 的 StreamableHTTP 端点会被误判）。 | Java `:413-416`；Rust `client.rs:100-104`、`harness/mcp_client_manager.rs:217` |
+| P2-4 | ~~**P2**~~ 已关闭 2026-10-31 | **缺 `propagate_meta` 开关**：Java core `McpClientWrapper` 有 `getPropagateMeta()/setPropagateMeta()`；Higress wrapper 继承之，Rust 侧无对应 API（harness `McpServerConfig::propagate_meta` 仅在 `McpServerRegistrar` 路径生效，Higress 自行 `to_server_config()` 时未设置 → 默认 `true`）。 | Java core `McpClientWrapper.java:101-115`；Rust `client.rs:100-104` |
+| P2-5 | ~~**P2**~~ 已关闭 2026-10-31 | **`toString` 文本格式微差**：Java `HigressToolSearchResult{tools=[a, b]}`；Rust `HigressToolSearchResult{tools=["a", "b"]}`（`{:?}` 带引号）。Java 断言仅 `contains("tools=")`，故不破坏测试契约。 | Java `:211-217`；Rust `search_result.rs:181-193` |
+| P2-6 | ~~**P2**~~ 已关闭（早已落地，2026-10-31 核实） | **`HigressToolkit` 非 `Toolkit` 子类**：Java `HigressToolkit extends Toolkit`，可直接 `ReActAgent.builder().toolkit(higressToolkit)`；Rust 是 newtype，`ReActAgent` 需要 core `Toolkit`，须 `.into_toolkit()`（或 `.toolkit()` 借用）。 | Java `HigressToolkit.java:56`；Rust `toolkit.rs:22-25, 56-58`；core `react_agent.rs:1126` |
+| P2-7 | ~~**P2**~~ 已关闭 2026-10-31 | **query 参数语义弱于 Java**：Java core `extractEndpoint()` 会 **URL-decode 原 URL query、按键合并（新增优先）、并 `URLEncoder.encode` 后拼接**；Rust `endpoint_with_query()` 直接 `k=v&k2=v2` 追加、无编码、同名键会产生重复参数。 | Java core `McpClientBuilder.java:748-800`；Rust `client.rs:84-96` |
+| P2-8 | ~~**P2**~~ 转跨模块需求（harness） | **transport 选择未透传**：Rust `HigressClientConfig.transport_type` 仅存于配置，`to_server_config()` 不携带；harness 依 URL 是否含 `/sse` 自行嗅探（`mcp_client_manager.rs:540-542`），与 Java 显式 `sseTransport/streamableHttpTransport` 不等价（URL 含 `/sse` 的 StreamableHTTP 端点会被误判）。 | Java `:413-416`；Rust `client.rs:100-104`、`harness/mcp_client_manager.rs:217` |
 
 ### 6.4 勘误列表（原文 → 实际）
 
@@ -303,3 +303,33 @@ cargo test  -p agentscope-extensions-higress   # EXIT=0
 3. **`group` 语义**：Java `McpClientManager` 要求分组已存在（`validateGroupExists`），core `ToolRegistration.group` 会按需创建 → 本 crate 采用 core 语义（不存在则创建），已在 `group()` doc 注明。
 4. **`initialize()` 时机**：`apply()`/`register_mcp_client()` 现在先 `initialize()` 再 `list_tools()`（同 Java），未初始化且无 endpoint 的客户端会得到明确错误（原先报 `No connected MCP client`）。
 5. **`McpToolSource` 是 Rust 侧替身**：Java 的 `McpClientWrapper` 基类在 Rust 无对应，本 crate 用窄 trait 承接其「任意客户端 + `instanceof` 缓存」语义；其它 C 波次模块若也需 MCP 客户端包装，可考虑上提（见 §4.2 第 2 条）。
+
+## 9. 执行记录（2026-10-31）— P2 收口
+
+> 本轮为**代码执行**（未跑 cargo，由主智能体统一验证）。改动仅限 `crates/agentscope-extensions-higress/src/{client,search_result}.rs`；未改根 `Cargo.toml`、core、harness 与其它 crate。
+
+### 9.1 逐条处置
+
+| 编号 | 处置 | 源码依据 / 落点 | 代表用例 |
+|---|---|---|---|
+| **P2-4** | **已关闭**：wrapper 级 `propagate_meta()` / `set_propagate_meta(&self, bool)`（`AtomicBool`，保留 Java 实时开关语义）+ `HigressClientConfig.propagate_meta` + `HigressMcpClientBuilder::propagate_meta(bool)`；`to_server_config()` 与 `initialize()` 均把开关投影进 `McpServerConfig.propagate_meta`（harness `mcp_client_manager.rs:66` 字段、`:98` setter） | Java core `McpClientWrapper.java:101-115`（get/set）；`client.rs` 新字段与方法 | `client::tests::propagate_meta_defaults_true_and_projects_into_server_config`、`client::tests::initialize_applies_propagate_meta_switch` |
+| **P2-5** | **已关闭**：`Display` 改为 `HigressToolSearchResult{tools=[a, b]}`（`join(", ")`，无引号） | Java `HigressToolSearchResult.java:211-217`（`List.toString()`）；`search_result.rs` `impl Display` | `search_result::tests` 既有 Display 用例（断言 `tools=`） |
+| **P2-6** | **已关闭（早已落地）**：`HigressToolkit::toolkit() -> &Toolkit`（`toolkit.rs:137`）与 `into_toolkit() -> Toolkit`（`:142`）均已存在，可直接喂 `ReActAgent.builder().toolkit(...)`；tracker 原表记为「待办」属**过时行** | Java `HigressToolkit extends Toolkit`；`toolkit.rs:137/142` | —（API 核实） |
+| **P2-7** | **已关闭**：`endpoint_with_query()` 改为「既有 query 先 URL-decode → 配置参数覆盖同名键 → 按 Java `URLEncoder` 语义重新编码」；新增 `decode_query_component`/`encode_query_component`/`hex_value`（`+`↔空格、`%XX`、保留 `.-*_`）。Rust 仍返回完整 URL（含 scheme/host），Java `extractEndpoint()` 只返回 `path?query`（其 transport 需要），已在 doc 注明 | Java core `McpClientBuilder.java:740-795`；`client.rs` | `client::tests::endpoint_with_query_merges_duplicate_keys_and_encodes_like_java`（同时断言既有 `token` 被覆盖、`&`→`%26`、空格→`+`） |
+| **P2-2** | **设计决定（不迁移）**：`rust-mcp-schema 0.10.3` 的 `ToolInputSchema` 是封闭结构体（仅 `type: "object"` + `properties` + `required`，见 `rust-mcp-schema-0.10.3/src/generated_schema/2025_06_18/mcp_schema.rs` 的 `pub struct ToolInputSchema` 与 `impl ToolInputSchema::new`），**没有** `$schema`/`additionalProperties`/`$defs` 的表示位；Java 侧 `McpSchema.Tool.builder(name, Map)` 保留的是无类型 map，因此能原样透传。`properties`/`required` 已完整保留，非对象 property 被丢弃是 MCP 规范要求（property 必须是 schema 对象）。已在 `build_input_schema` 加 **DESIGN:** 注释 | Java `HigressMcpClientWrapper.java:210-227`；Rust `client.rs::build_input_schema` | `client::tests::convert_to_mcp_tool_*`（既有 6 个） |
+| **P2-8** | **跨模块需求（未关闭）**：`McpServerConfig` 无 transport 字段，harness 只能按 `url.contains("/sse")` 选 SSE/StreamableHTTP（`mcp_client_manager.rs:533-535`，调用点 `:216`）。本 crate 已做到「配置与 URL 路由不一致时 `initialize()` 明确报错」（`initialize_rejects_transport_mismatch`），但**无法显式指定传输**。需 harness 在 `McpServerConfig` 增 `transport: McpTransportKind`（或在 `McpConnectRequest` 同级透传），**超出本 crate 写入范围** | Java `HigressMcpClientBuilder.java:413-416`（显式 `sseTransport`/`streamableHttpTransport`） | `client::tests::initialize_rejects_transport_mismatch`（既有） |
+| 真实网关联调 | 仍为**不做**：单测用 `RecordingConnection`，真实 SSE/StreamableHTTP 握手依赖外部 Higress 网关，本环境不可用（非缺口，沿用 §7.4） | — | — |
+
+### 9.2 新增用例（4 个）
+
+- `client::tests::endpoint_with_query_merges_duplicate_keys_and_encodes_like_java`
+- `client::tests::propagate_meta_defaults_true_and_projects_into_server_config`
+- `client::tests::initialize_applies_propagate_meta_switch`
+- （`Display` 由既有 `search_result` 用例覆盖，未新增）
+
+预期基线：**60 lib test + 1 doc test**（原 57 + 3）。验证命令：`cargo test -p agentscope-extensions-higress`。
+
+### 9.3 反向验证建议（由主智能体执行）
+
+1. 把 `to_server_config()` 的 `.propagate_meta(...)` 与 `initialize()` 的 `server.propagate_meta = ...` 去掉 → 应从 `propagate_meta_defaults_true_and_projects_into_server_config`、`initialize_applies_propagate_meta_switch` FAILED。
+2. `endpoint_with_query` 回退为「`k=v&` 直接拼接」→ 应从 `endpoint_with_query_merges_duplicate_keys_and_encodes_like_java` FAILED。

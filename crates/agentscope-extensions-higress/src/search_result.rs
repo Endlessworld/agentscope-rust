@@ -191,8 +191,8 @@ impl std::fmt::Display for HigressToolSearchResult {
         } else {
             write!(
                 f,
-                "HigressToolSearchResult{{tools={:?}}}",
-                self.tool_names()
+                "HigressToolSearchResult{{tools=[{}]}}",
+                self.tool_names().join(", ")
             )
         }
     }
@@ -347,7 +347,7 @@ mod tests {
         }));
         assert_eq!(
             HigressToolSearchResult::parse(&ok).to_string(),
-            "HigressToolSearchResult{tools=[\"x\"]}"
+            "HigressToolSearchResult{tools=[x]}"
         );
 
         let err = call_result(serde_json::json!({ "content": [], "isError": true }));
