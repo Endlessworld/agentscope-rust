@@ -22,7 +22,7 @@ use agentscope_core::{
     convert_tool_result_to_string, determine_media_type, extract_text_content, file_to_base64,
     is_local_file, resolve_mime_type, validate_image_extension, ContentBlock, DataBlock, Error,
     GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole, Result, Source, ToolChoice,
-    ToolResultBlock, ToolSchema, ToolUseBlock,
+    ToolResultBlock, ToolResultState, ToolSchema, ToolUseBlock,
 };
 
 use super::dto::{
@@ -33,6 +33,7 @@ use super::dto::{
 };
 use super::parser::METADATA_SERVER_TOOL_RESULT;
 use super::server_tool::AnthropicServerTool;
+use crate::common::tool_search;
 
 /// Per-request formatting switches derived from [`GenerateOptions`].
 #[derive(Debug, Clone, Default)]
@@ -133,6 +134,14 @@ pub fn image_source(source: &Source) -> Result<AnthropicImageSource> {
                         media_type
                     },
                     data: file_to_base64(path)?,
+                })
+            } else if let Some(resolved) = crate::common::remote_media_cache().get(url) {
+                // Prefetched through `RemoteMediaCache::prefetch`: inline it as
+                // base64 so the provider does not have to reach the origin (and
+                // works for URLs Anthropic cannot fetch itself).
+                Ok(AnthropicImageSource::Base64 {
+                    media_type: resolved.mime_type,
+                    data: resolved.base64,
                 })
             } else {
                 Ok(AnthropicImageSource::Url { url: url.clone() })
@@ -294,13 +303,33 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
             text: convert_tool_result_to_string(&block.output),
         });
     }
+    // A successful client-executed tool search turns every match into a
+    // `tool_reference` block, which is how Anthropic loads a deferred
+    // definition (`AnthropicMessageConverter#convertToolResult`). A failed
+    // search must not resurrect tools, hence the state check.
+    if tool_search::mode_of(&block.metadata) == Some(tool_search::ToolSearchMode::Deferred)
+        && block.state != ToolResultState::Error
+    {
+        for tool_name in tool_search::loaded_tool_names(&block.metadata) {
+            content.push(AnthropicToolResultContent::ToolReference { tool_name });
+        }
+    }
     AnthropicMessage {
         role: "user".to_string(),
         content: vec![AnthropicContentBlock::ToolResult(
             AnthropicToolResultBlock {
                 tool_use_id: block.id.clone().unwrap_or_default(),
                 content,
-                is_error: None,
+                // ERROR / DENIED / INTERRUPTED results are explicitly marked as
+                // failures so the model can react to them (Java maps the same
+                // three states to `is_error: true`).
+                is_error: matches!(
+                    block.state,
+                    ToolResultState::Error
+                        | ToolResultState::Denied
+                        | ToolResultState::Interrupted
+                )
+                .then_some(true),
                 cache_control: fmt.cache_control.then(|| fmt.marker()),
             },
         )],
@@ -317,7 +346,26 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
 /// empty content).
 pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<AnthropicMessage> {
     let mut out: Vec<AnthropicMessage> = Vec::new();
-    for msg in messages.iter() {
+    let mut index = 0usize;
+    while index < messages.len() {
+        let msg = &messages[index];
+
+        // Parallel client tool calls: Anthropic requires a strict
+        // assistant(tool_use) -> user(tool_result) alternation, so an assistant
+        // message with several tool uses is expanded into one
+        // assistant/user pair per call (`AnthropicMessageConverter#convert`).
+        if msg.role == MsgRole::Assistant {
+            let tool_uses = client_tool_uses(msg);
+            if tool_uses.len() > 1 {
+                let split = collect_split_tool_results(messages, index + 1);
+                if should_split_parallel_tool_calls(&tool_uses, &split) {
+                    out.extend(convert_parallel_tool_calls(msg, &tool_uses, &split, fmt));
+                    index += split.consumed + 1;
+                    continue;
+                }
+            }
+        }
+
         let (tool_results, regular): (Vec<ContentBlock>, Vec<ContentBlock>) = msg
             .content
             .iter()
@@ -339,6 +387,112 @@ pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<A
                 out.push(tool_result_message(&tr, fmt));
             }
         }
+        index += 1;
+    }
+    out
+}
+
+/// The consecutive pure tool-result messages that follow an assistant message.
+struct SplitToolResults {
+    by_id: std::collections::BTreeMap<String, ToolResultBlock>,
+    consumed: usize,
+}
+
+/// Client-executed tool calls (server tools are executed by the provider).
+fn client_tool_uses(msg: &Msg) -> Vec<&ToolUseBlock> {
+    msg.content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse(tool) if !tool.is_server_tool() => Some(tool),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collects the consecutive messages made up **entirely** of tool results.
+///
+/// The scan stops at the first message with non-tool-result content, because
+/// such a message must stay in its original position instead of being consumed
+/// into the split sequence.
+fn collect_split_tool_results(messages: &[Msg], start: usize) -> SplitToolResults {
+    let mut by_id = std::collections::BTreeMap::new();
+    let mut consumed = 0usize;
+    for msg in &messages[start..] {
+        let results: Vec<&ToolResultBlock> = msg
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect();
+        if results.is_empty() || results.len() != msg.content.len() {
+            break;
+        }
+        consumed += 1;
+        for result in results {
+            if let Some(id) = result.id.as_ref().filter(|id| !id.is_empty()) {
+                by_id.entry(id.clone()).or_insert_with(|| result.clone());
+            }
+        }
+    }
+    SplitToolResults { by_id, consumed }
+}
+
+/// Whether the assistant message should be expanded into the anthropic
+/// tool-use/tool-result alternation (Java `shouldSplitParallelToolCalls`).
+fn should_split_parallel_tool_calls(
+    tool_uses: &[&ToolUseBlock],
+    split: &SplitToolResults,
+) -> bool {
+    if split.consumed == 0 || tool_uses.len() <= 1 {
+        return false;
+    }
+    if tool_uses.iter().any(|tool| tool.id.trim().is_empty()) {
+        return false;
+    }
+    split.by_id.len() == tool_uses.len()
+        && tool_uses
+            .iter()
+            .all(|tool| split.by_id.contains_key(&tool.id))
+}
+
+/// Expands one assistant message with parallel tool uses into alternating
+/// messages; leading content is attached only to the first assistant message so
+/// it is not duplicated.
+fn convert_parallel_tool_calls(
+    assistant: &Msg,
+    tool_uses: &[&ToolUseBlock],
+    split: &SplitToolResults,
+    fmt: &ChatFormatOptions,
+) -> Vec<AnthropicMessage> {
+    let leading: Vec<ContentBlock> = assistant
+        .content
+        .iter()
+        .filter(|block| match block {
+            ContentBlock::ToolUse(tool) => tool.is_server_tool(),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+
+    let mut out = Vec::new();
+    for (index, tool_use) in tool_uses.iter().enumerate() {
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        if index == 0 {
+            blocks.extend(leading.iter().cloned());
+        }
+        blocks.push(ContentBlock::ToolUse((*tool_use).clone()));
+        let converted = message_content_blocks(&blocks, fmt);
+        if !converted.is_empty() {
+            out.push(AnthropicMessage {
+                role: role_str(assistant.role).to_string(),
+                content: converted,
+            });
+        }
+        if let Some(result) = split.by_id.get(&tool_use.id) {
+            out.push(tool_result_message(result, fmt));
+        }
     }
     out
 }
@@ -348,10 +502,14 @@ pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<A
 // ---------------------------------------------------------------------------
 
 /// Converts tool schemas into Anthropic tool declarations. When prompt caching
-/// is on, the **last** tool carries the marker so the whole tool prefix is
-/// cached (Anthropic caches everything up to and including the marked block).
+/// is on, the **last eager** (non-deferred) tool carries the marker so the whole
+/// tool prefix is cached (Anthropic caches everything up to and including the
+/// marked block). Deferred definitions cannot carry `cache_control`
+/// (`AnthropicToolsHelper#applyTools` skips them).
 pub fn to_anthropic_tools(tools: &[ToolSchema], fmt: &ChatFormatOptions) -> Vec<AnthropicTool> {
-    let last = tools.len().saturating_sub(1);
+    let last_eager = tools
+        .iter()
+        .rposition(|schema| schema.defer_loading != Some(true));
     tools
         .iter()
         .enumerate()
@@ -359,7 +517,9 @@ pub fn to_anthropic_tools(tools: &[ToolSchema], fmt: &ChatFormatOptions) -> Vec<
             name: schema.name.clone(),
             description: schema.description.clone(),
             input_schema: serde_json::Value::Object(schema.parameters.clone()),
-            cache_control: (fmt.cache_control && index == last).then(|| fmt.marker()),
+            defer_loading: schema.defer_loading,
+            cache_control: (fmt.cache_control && Some(index) == last_eager)
+                .then(|| fmt.marker()),
         })
         .collect()
 }
@@ -983,6 +1143,144 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_results_are_marked_is_error() {
+        // Java `AnthropicMessageConverter` maps ERROR / DENIED / INTERRUPTED to
+        // `is_error: true` so the model can react to the failure, while a
+        // successful result stays unmarked.
+        for (state, expected) in [
+            (ToolResultState::Error, Some(true)),
+            (ToolResultState::Denied, Some(true)),
+            (ToolResultState::Interrupted, Some(true)),
+            (ToolResultState::Success, None),
+        ] {
+            let mut block = ToolResultBlock::new(
+                "toolu_1",
+                "get_weather",
+                vec![ContentBlock::Text(TextBlock::new("boom"))],
+            );
+            block.state = state;
+            let message = tool_result_message(&block, &plain());
+            match &message.content[0] {
+                AnthropicContentBlock::ToolResult(tr) => {
+                    assert_eq!(tr.is_error, expected, "state={state:?}");
+                    assert_eq!(tr.tool_use_id, "toolu_1");
+                    assert_eq!(
+                        tr.content,
+                        vec![AnthropicToolResultContent::Text {
+                            text: "boom".into()
+                        }]
+                    );
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_tool_uses_split_into_alternating_pairs() {
+        // Anthropic rejects an assistant message whose tool_use blocks are not
+        // answered one-by-one, so two calls become assistant/user pairs (Java
+        // `convertParallelToolCalls`).
+        let messages = vec![
+            Msg::assistant_blocks(vec![
+                ContentBlock::Text(TextBlock::new("checking")),
+                ContentBlock::ToolUse(ToolUseBlock::new("t1", "a", JsonMap::new())),
+                ContentBlock::ToolUse(ToolUseBlock::new("t2", "b", JsonMap::new())),
+            ]),
+            Msg::tool("t1", "a", "ra"),
+            Msg::tool("t2", "b", "rb"),
+        ];
+        let out = to_anthropic_messages(&messages, &plain());
+        assert_eq!(
+            out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["assistant", "user", "assistant", "user"]
+        );
+        // The leading text is attached once, to the first assistant message.
+        let first: Vec<&str> = out[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                AnthropicContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first, vec!["checking"]);
+        assert!(out[1].content.iter().all(|b| matches!(
+            b,
+            AnthropicContentBlock::ToolResult(tr) if tr.tool_use_id == "t1"
+        )));
+    }
+
+    #[test]
+    fn parallel_tool_uses_stay_unsplit_when_a_result_is_missing() {
+        let messages = vec![
+            Msg::assistant_blocks(vec![
+                ContentBlock::ToolUse(ToolUseBlock::new("t1", "a", JsonMap::new())),
+                ContentBlock::ToolUse(ToolUseBlock::new("t2", "b", JsonMap::new())),
+            ]),
+            Msg::tool("t1", "a", "ra"),
+        ];
+        let out = to_anthropic_messages(&messages, &plain());
+        // No split: the assistant message is emitted as one message with both
+        // calls, followed by the single result.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content.len(), 2);
+    }
+
+    #[test]
+    fn deferred_search_results_become_tool_references() {
+        let mut metadata = JsonMap::new();
+        metadata.insert(
+            tool_search::METADATA_MODE.to_string(),
+            serde_json::json!("DEFERRED"),
+        );
+        metadata.insert(
+            tool_search::METADATA_TOOLS.to_string(),
+            serde_json::json!([{"name": "get_weather"}]),
+        );
+        let mut block = ToolResultBlock::new(
+            "tu_1",
+            "tool_search",
+            vec![ContentBlock::Text(TextBlock::new("found 1 tool"))],
+        );
+        block.metadata = metadata.clone();
+        let message = tool_result_message(&block, &plain());
+        match &message.content[0] {
+            AnthropicContentBlock::ToolResult(tr) => {
+                assert_eq!(tr.content.len(), 2);
+                assert!(tr.content.iter().any(|c| matches!(
+                    c,
+                    AnthropicToolResultContent::ToolReference { tool_name }
+                        if tool_name == "get_weather"
+                )));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        // A failed search must not resurrect the deferred tools.
+        block.state = ToolResultState::Error;
+        let message = tool_result_message(&block, &plain());
+        match &message.content[0] {
+            AnthropicContentBlock::ToolResult(tr) => assert_eq!(tr.content.len(), 1),
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_marker_skips_deferred_tool_definitions() {
+        let fmt = ChatFormatOptions {
+            cache_control: true,
+            cache_ttl: None,
+        };
+        let mut deferred = tool_schema("searchable");
+        deferred.defer_loading = Some(true);
+        let converted = to_anthropic_tools(&[tool_schema("eager"), deferred], &fmt);
+        assert!(converted[0].cache_control.is_some());
+        assert!(converted[1].cache_control.is_none());
+        assert_eq!(converted[1].defer_loading, Some(true));
+    }
+
+    #[test]
     fn empty_message_is_dropped() {
         // An empty-content message yields no transferable block and must not
         // produce an empty-content request (Anthropic rejects one).
@@ -999,6 +1297,33 @@ mod tests {
             }
             other => panic!("expected text fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prefetched_remote_image_is_inlined_instead_of_passed_through() {
+        let url = "https://example.invalid/anthropic-prefetched.png";
+        crate::common::remote_media_cache().insert(
+            url,
+            crate::common::ResolvedMedia {
+                base64: "QUJD".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+        );
+        let source = image_source(&Source::Url(URLSource::new(url))).unwrap();
+        match source {
+            AnthropicImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "QUJD");
+            }
+            other => panic!("expected inlined base64, got {other:?}"),
+        }
+
+        // Without a cache entry the URL is passed through as before.
+        let source = image_source(&Source::Url(URLSource::new(
+            "https://example.invalid/anthropic-unfetchable.png",
+        )))
+        .unwrap();
+        assert!(matches!(source, AnthropicImageSource::Url { .. }));
     }
 
     #[test]

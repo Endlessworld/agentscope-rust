@@ -6,13 +6,18 @@
 //! [`MediaResolver`] seam every provider shares, instead of three divergent
 //! behaviours (Claude passes the URL through, Gemini/Ollama reject it).
 //!
-//! The default resolver handles base64 and local files and **explicitly rejects**
-//! remote URLs; a host that wants remote downloads registers its own resolver
+//! The default resolver handles base64 and local files, and serves remote URLs
+//! from the process-wide [`remote_media_cache`] (**explicitly rejecting** URLs that
+//! were never [`RemoteMediaCache::prefetch`]ed, so nothing performs hidden network
+//! I/O). A host that wants a different download policy registers its own resolver
 //! via [`set_media_resolver`] (mirrors new-api's `SetMediaResolver`).
 
-use std::sync::{Arc, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use agentscope_core::{determine_media_type, is_local_file, Error, Result, Source};
+
+use super::transport::HttpTransport;
 
 /// Inlined media bytes plus the MIME type they should be labelled with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +42,8 @@ pub trait MediaResolver: Send + Sync {
 }
 
 /// Default resolver: base64 passes through, local files are read, remote URLs
-/// are rejected with an actionable message.
+/// are served from [`remote_media_cache`] (or rejected with an actionable
+/// message when they were never prefetched).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultMediaResolver;
 
@@ -68,15 +74,102 @@ impl MediaResolver for DefaultMediaResolver {
                         mime_type,
                     })
                 } else {
-                    Err(Error::Model(format!(
-                        "remote media URL '{}' requires a registered MediaResolver \
-                         (call agentscope_extensions_model::common::set_media_resolver); purpose={purpose}",
-                        u.url
-                    )))
+                    match remote_media_cache().get(&u.url) {
+                        Some(mut resolved) => {
+                            if let Some(mime) = u.mime_type.clone().filter(|m| !m.trim().is_empty())
+                            {
+                                resolved.mime_type = mime;
+                            }
+                            Ok(resolved)
+                        }
+                        None => Err(Error::Model(format!(
+                            "remote media URL '{}' has not been fetched; prefetch it with \
+                             agentscope_extensions_model::common::remote_media_cache().prefetch(...) \
+                             or register a MediaResolver; purpose={purpose}",
+                            u.url
+                        ))),
+                    }
                 }
             }
         }
     }
+}
+
+/// In-memory cache of remote media bytes.
+///
+/// The [`MediaResolver`] seam is synchronous because providers stream
+/// synchronously and an async hop would infect every converter signature.
+/// Downloading is therefore a separate, **async** step: the host calls
+/// [`RemoteMediaCache::prefetch`] (which uses the shared
+/// [`HttpTransport`]), and every provider then resolves that URL through the
+/// process-wide cache. A prefetched URL is inlined as base64 exactly like a
+/// `data:` source, so Gemini/Ollama stop rejecting remote images.
+#[derive(Debug, Default)]
+pub struct RemoteMediaCache {
+    entries: RwLock<BTreeMap<String, ResolvedMedia>>,
+}
+
+impl RemoteMediaCache {
+    /// Creates an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached media for `url`, if any.
+    pub fn get(&self, url: &str) -> Option<ResolvedMedia> {
+        self.entries.read().ok()?.get(url).cloned()
+    }
+
+    /// Number of cached entries.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|e| e.len()).unwrap_or(0)
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Stores an already-resolved media payload for `url`.
+    pub fn insert(&self, url: impl Into<String>, media: ResolvedMedia) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.insert(url.into(), media);
+        }
+    }
+
+    /// Downloads `url` through `transport` and caches the base64 payload.
+    ///
+    /// The MIME type comes from the response's `content-type`, falling back to
+    /// the URL's extension. A non-success status surfaces through the shared
+    /// [`crate::common::ModelError`] normalisation.
+    pub async fn prefetch(
+        &self,
+        transport: &dyn HttpTransport,
+        url: &str,
+    ) -> Result<ResolvedMedia> {
+        if let Some(cached) = self.get(url) {
+            return Ok(cached);
+        }
+        let (bytes, content_type) = transport.get_bytes(url, &[], "media").await?;
+        let mime_type = content_type
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| Some(determine_media_type(url)))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        use base64::Engine as _;
+        let resolved = ResolvedMedia {
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type,
+        };
+        self.insert(url, resolved.clone());
+        Ok(resolved)
+    }
+}
+
+static REMOTE_CACHE: OnceLock<Arc<RemoteMediaCache>> = OnceLock::new();
+
+/// The process-wide remote media cache used by [`DefaultMediaResolver`].
+pub fn remote_media_cache() -> &'static Arc<RemoteMediaCache> {
+    REMOTE_CACHE.get_or_init(|| Arc::new(RemoteMediaCache::new()))
 }
 
 static RESOLVER: OnceLock<Arc<dyn MediaResolver>> = OnceLock::new();
@@ -124,10 +217,61 @@ mod tests {
 
     #[test]
     fn default_resolver_rejects_remote_url() {
-        let source = Source::Url(URLSource::new("https://example.com/a.png"));
+        let source = Source::Url(URLSource::new("https://example.invalid/never-fetched.png"));
         let err = DefaultMediaResolver.resolve(&source, "test").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("requires a registered MediaResolver"));
+        assert!(err.to_string().contains("has not been fetched"));
+    }
+
+    #[test]
+    fn default_resolver_serves_prefetched_remote_media() {
+        let cache = RemoteMediaCache::new();
+        cache.insert(
+            "https://example.invalid/cached.png",
+            ResolvedMedia {
+                base64: "AAAA".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("https://example.invalid/cached.png").is_some());
+        assert!(cache.get("https://example.invalid/other.png").is_none());
+        assert!(RemoteMediaCache::default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefetch_downloads_through_the_transport_and_caches() {
+        let transport = crate::common::MemoryTransport {
+            bytes_response: Some((vec![1, 2, 3], Some("image/png".to_string()))),
+            ..Default::default()
+        };
+        let cache = RemoteMediaCache::new();
+        let resolved = cache
+            .prefetch(&transport, "https://example.invalid/a.png")
+            .await
+            .unwrap();
+        assert_eq!(resolved.mime_type, "image/png");
+        assert_eq!(resolved.base64, "AQID");
+        assert!(transport
+            .last_get_url()
+            .unwrap()
+            .ends_with("a.png"));
+
+        // A second prefetch is served from the cache: the transport would
+        // otherwise fail (only one response configured).
+        let again = cache
+            .prefetch(&transport, "https://example.invalid/a.png")
+            .await
+            .unwrap();
+        assert_eq!(again, resolved);
+    }
+
+    #[tokio::test]
+    async fn prefetch_reports_transports_without_get_support() {
+        let transport = crate::common::MemoryTransport::default();
+        let err = RemoteMediaCache::new()
+            .prefetch(&transport, "https://example.invalid/a.png")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no GET bytes configured"));
     }
 }

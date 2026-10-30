@@ -17,6 +17,18 @@
 //! performs **zero** real HTTP calls.
 //!
 //! See `docs/extensions/MODEL__GAP_TRACKER.md` for the authoritative gap list.
+//!
+//! ## Registry resolution semantics
+//! [`ModelRegistry`](agentscope_core::ModelRegistry) belongs to core and is
+//! deliberately **uncached**: `register` takes `&mut self` and replaces the
+//! provider registered under the same `provider_id`, while `resolve` builds a
+//! fresh model instance on every call. Java `9e716cb27` hardened the Java
+//! registry's *resolution cache* (evict on `registerFactory`, share one
+//! creation across concurrent first callers, never cache failures); neither
+//! defect can occur here because there is no cache in the first place. The
+//! invariants a future cache would have to preserve are pinned by
+//! `tests/registry_semantics.rs`; moving to a cached registry is a **core-side**
+//! change, recorded in `docs/extensions/MODEL__GAP_TRACKER.md` §4.2 #11.
 
 pub mod anthropic;
 pub mod anthropic_async;
@@ -35,10 +47,12 @@ pub use anthropic_async::{
     default_anthropic_registry, AnthropicMessagesModel, AnthropicMessagesProvider,
 };
 pub use common::{
-    decode_stream_line, merge_non_zero, resolve_capabilities, resolve_media, set_media_resolver,
-    strip_reasoning_suffix, ConversionDiagnostic, DefaultMediaResolver, Diagnostics, ErrorKind,
+    decode_stream_line, media_resolver, merge_non_zero, remote_media_cache, resolve_capabilities,
+    resolve_media, set_diagnostic_sink, set_media_resolver, strip_reasoning_suffix,
+    tool_search_schema, ConversionDiagnostic, DefaultMediaResolver, Diagnostics, ErrorKind,
     HttpRequestSpec, HttpTransport, JsonStream, MediaResolver, MemoryTransport, ModelCapabilities,
-    ModelError, ModelMap, ReqwestTransport, ResolvedMedia, SharedTransport, TransportConfig,
+    ModelError, ModelMap, RemoteMediaCache, ReqwestTransport, ResolvedMedia, Severity,
+    SharedTransport, ToolSearchMode, TransportConfig,
 };
 pub use dashscope::{
     DashScopeChatModel, DashScopeCredential, DashScopeCryptoProvider, DashScopeModelProvider,

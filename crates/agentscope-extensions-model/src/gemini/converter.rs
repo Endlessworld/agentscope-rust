@@ -369,6 +369,9 @@ pub fn build_request_with_server_tools(
     server_tools: &[GeminiServerTool],
 ) -> GeminiRequest {
     let generation_config = apply_options(options, default_options);
+    // The effective tool choice is the per-call value, falling back to the model
+    // default (Java `GeminiChatModel#buildGenerateContentConfig` merges
+    // `generateOptions` with `defaultOptions` before applying the choice).
     let tool_choice = options
         .tool_choice
         .as_ref()
@@ -377,6 +380,13 @@ pub fn build_request_with_server_tools(
     let mut tools_body = to_gemini_tools(tools).map(|tool| vec![tool]);
     let mut tool_config = tool_choice;
     merge_server_tools(&mut tools_body, &mut tool_config, server_tools);
+    // Gemini rejects a `toolConfig` that has no tools to constrain, so a
+    // configured choice is dropped when neither client nor server tools exist.
+    let tool_config = if tools_body.is_some() {
+        tool_config
+    } else {
+        None
+    };
 
     GeminiRequest {
         contents: to_gemini_contents(messages),
@@ -656,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_media_is_rejected_with_a_text_fallback() {
+    fn unfetched_remote_media_is_rejected_with_a_text_fallback() {
         let contents = to_gemini_contents(&[Msg::user_blocks(vec![ContentBlock::Image(
             ImageBlock::new(Source::Url(URLSource::new("https://x/a.png"))),
         )])]);
@@ -665,7 +675,9 @@ mod tests {
             text.starts_with("[Image - processing failed:"),
             "got {text}"
         );
-        assert!(text.contains("requires a registered MediaResolver"));
+        // Remote media reaches the wire only after `RemoteMediaCache::prefetch`
+        // has downloaded it; the fallback has to say how to do that.
+        assert!(text.contains("has not been fetched"), "got {text}");
     }
 
     #[test]
@@ -782,6 +794,38 @@ mod tests {
                 .function_calling_config
                 .allowed_function_names,
             Some(vec!["f".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_request_honors_default_tool_choice() {
+        // Java `4c358772b`: the effective tool choice comes from
+        // `GenerateOptions.mergeOptions(defaults)`, so a call that does not set
+        // one still inherits the model-level default.
+        let defaults = GenerateOptions {
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
+        let request = build_request(
+            &[Msg::user("hi")],
+            &[tool_schema("f")],
+            &GenerateOptions::default(),
+            &defaults,
+        );
+        assert_eq!(
+            request.tool_config.unwrap().function_calling_config.mode,
+            "ANY"
+        );
+
+        // A per-call choice wins over the default.
+        let per_call = GenerateOptions {
+            tool_choice: Some(ToolChoice::None),
+            ..Default::default()
+        };
+        let request = build_request(&[Msg::user("hi")], &[tool_schema("f")], &per_call, &defaults);
+        assert_eq!(
+            request.tool_config.unwrap().function_calling_config.mode,
+            "NONE"
         );
     }
 

@@ -23,6 +23,7 @@ use super::constants::{
 };
 use super::error::translate_optional_status;
 use super::server_tool::{HostedToolSearchPairing, ResponsesServerToolHelper};
+use crate::common::tool_search;
 
 const FRAGMENT_PLACEHOLDER: &str = "__fragment__";
 
@@ -40,6 +41,13 @@ pub fn parse_response(
     let mut pairing = HostedToolSearchPairing::default();
 
     for item in output_items(response) {
+        // A client-executed tool search is a local call, not a provider tool:
+        // it must be decoded first, otherwise the server-tool path would mark
+        // it as provider-executed and the agent would never dispatch it.
+        if let Some(block) = extract_client_tool_search(item) {
+            tool_blocks.push(block);
+            continue;
+        }
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => {
                 extract_reasoning(item, &mut summary, &mut reasoning_text);
@@ -110,6 +118,37 @@ pub fn parse_response(
         usage,
         Some(metadata),
         finish_reason,
+    ))
+}
+
+/// Decodes a **client-executed** `tool_search_call` output item.
+///
+/// Mirrors `ResponsesToolHelper#decodeClientToolSearch`: the call becomes a local
+/// `tool_search` tool use flagged with
+/// [`tool_search::METADATA_CLIENT_TOOL_SEARCH_CALL`], so the marshaller keeps it
+/// out of the provider-executed branch and the transcript can be replayed. A
+/// provider-executed (`execution: server`) call returns `None` and follows the
+/// server-tool path.
+fn extract_client_tool_search(item: &Value) -> Option<ContentBlock> {
+    if item.get("type").and_then(Value::as_str) != Some("tool_search_call")
+        || item.get("execution").and_then(Value::as_str) != Some("client")
+    {
+        return None;
+    }
+    let id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())?;
+    let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let input = arguments.as_object().cloned().unwrap_or_default();
+    Some(ContentBlock::ToolUse(
+        ToolUseBlock::builder()
+            .id(id)
+            .name(tool_search::TOOL_SEARCH_TOOL_NAME)
+            .input(input)
+            .content(arguments.to_string())
+            .metadata(tool_search::client_tool_search_metadata())
+            .build(),
     ))
 }
 
@@ -216,15 +255,20 @@ impl ResponsesStreamingAssembler {
             }
             Some("response.output_item.done") => {
                 let item = event.get("item").unwrap_or(&Value::Null);
-                let companion = self.pairing.companion_call_id(item);
-                for block in ResponsesServerToolHelper::decode_blocks(item, companion.as_deref()) {
-                    results.push(ChatResponse::new(
-                        String::new(),
-                        vec![block],
-                        ChatUsage::default(),
-                        None,
-                        None,
-                    ));
+                if let Some(block) = extract_client_tool_search(item) {
+                    results.push(block_response(block));
+                } else {
+                    let companion = self.pairing.companion_call_id(item);
+                    for block in ResponsesServerToolHelper::decode_blocks(item, companion.as_deref())
+                    {
+                        results.push(ChatResponse::new(
+                            String::new(),
+                            vec![block],
+                            ChatUsage::default(),
+                            None,
+                            None,
+                        ));
+                    }
                 }
             }
             Some("response.image_generation_call.partial_image") => {

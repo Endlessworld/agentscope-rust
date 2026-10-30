@@ -52,7 +52,9 @@ use agentscope_core::model::tool_choice::ToolChoice;
 use agentscope_core::model::tool_schema::ToolSchema;
 
 use crate::common::error::{ErrorKind, ModelError};
-use crate::common::{diagnostics, resolve_capabilities_with, usage};
+use crate::common::{diagnostics, resolve_capabilities_with, usage, ModelMap};
+
+pub mod compat;
 
 /// Connection-establishment timeout for the underlying HTTP client.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -259,13 +261,17 @@ impl Model for OpenAiChatModel {
         // wire: `CreateChatCompletionRequest` has no extension field, so the
         // typed request is serialized to a JSON object and the extra params
         // are merged in before the BYOT call.
-        let extra_body = options.additional_body_params.clone();
+        // `multiAgentFormatter` is a provider-side selector consumed by
+        // `build_request`, never a wire field: drop it from the pass-through
+        // extras so OpenAI-compatible backends never see it.
+        let mut extra_body = options.additional_body_params.clone();
+        extra_body.remove(crate::common::MULTI_AGENT_FORMATTER_KEY);
         // Capture the transport mode before `options` is moved into the builder.
         // `None` keeps the historical streaming default.
         let streaming = options.stream.unwrap_or(true);
         let capabilities = resolve_capabilities_with(&model_name, self.descriptor.as_deref());
         let (request, reasoning) = build_request(
-            model_name,
+            model_name.clone(),
             messages,
             tools,
             options,
@@ -295,6 +301,9 @@ impl Model for OpenAiChatModel {
         if self.reasoning_passback {
             inject_reasoning_content(&mut body, &reasoning);
         }
+        // Vendor-specific sanitising (DeepSeek/GLM/Kimi/MiniMax). Runs last so it
+        // sees both `additional_body_params` and the injected reasoning fields.
+        crate::openai::compat::apply_vendor_rules(&model_name, &mut body);
 
         // Non-streaming path. `GenerateOptions::stream == Some(false)` is what
         // OpenAI-compatible backends that do not speak SSE expect (e.g. the
@@ -403,7 +412,65 @@ impl Model for OpenAiChatModel {
 }
 
 /// Provider that registers [`OpenAiChatModel`] under the `openai` provider id.
-pub struct OpenAiProvider;
+/// Provider for OpenAI and OpenAI-compatible gateways.
+///
+/// Beyond constructing [`OpenAiChatModel`] it owns two host-configurable name
+/// rules that Java applies *before* the request is built:
+///
+/// * [`ModelMap`] — chained alias mapping (`gpt-4` → `gpt-4.1`), mirroring the
+///   Java `ModelMap`; a cycle is reported instead of looping.
+/// * reasoning suffix — `-thinking-4096` / `-high` are stripped from the wire
+///   model id and turned into `thinking_budget` / `reasoning_effort`.
+#[derive(Debug, Default, Clone)]
+pub struct OpenAiProvider {
+    model_map: Option<ModelMap>,
+    reasoning_suffix: bool,
+}
+
+impl OpenAiProvider {
+    /// Creates a provider without name rules.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs a model-name mapping table (applied before anything else).
+    pub fn with_model_map(mut self, map: ModelMap) -> Self {
+        self.model_map = Some(map);
+        self
+    }
+
+    /// Enables the `-thinking-<n>` / `-<effort>` suffix convention.
+    ///
+    /// Mirrors Java's reasoning-suffix handling: the suffix never reaches the
+    /// wire, it only seeds the per-request thinking knobs.
+    pub fn with_reasoning_suffix(mut self, enabled: bool) -> Self {
+        self.reasoning_suffix = enabled;
+        self
+    }
+
+    /// Resolves the mapped model id and strips the reasoning suffix.
+    fn normalize_context(&self, mut ctx: ModelCreationContext) -> Result<ModelCreationContext> {
+        if let Some(map) = &self.model_map {
+            ctx.model = map
+                .resolve(&ctx.model)
+                .map_err(|error| Error::Model(error.to_string()))?;
+        }
+        if self.reasoning_suffix {
+            let (base, hint) = crate::common::strip_reasoning_suffix(&ctx.model);
+            if let Some(hint) = hint {
+                ctx.model = base;
+                ctx.enable_thinking = true;
+                if ctx.options.thinking_budget.is_none() {
+                    ctx.options.thinking_budget = hint.budget_tokens;
+                }
+                if ctx.options.reasoning_effort.is_none() {
+                    ctx.options.reasoning_effort = hint.effort;
+                }
+            }
+        }
+        Ok(ctx)
+    }
+}
 
 impl ModelProvider for OpenAiProvider {
     fn provider_id(&self) -> &str {
@@ -415,6 +482,7 @@ impl ModelProvider for OpenAiProvider {
         true
     }
     fn create(&self, ctx: ModelCreationContext) -> Result<Arc<dyn Model>> {
+        let ctx = self.normalize_context(ctx)?;
         let model = OpenAiChatModel::from_context(&ctx)?;
         Ok(Arc::new(model))
     }
@@ -423,7 +491,7 @@ impl ModelProvider for OpenAiProvider {
 /// Builds a registry pre-populated with the default OpenAI-compatible provider.
 pub fn default_registry() -> ModelRegistry {
     let mut registry = ModelRegistry::new();
-    registry.register(Arc::new(OpenAiProvider));
+    registry.register(Arc::new(OpenAiProvider::new()));
     registry
 }
 
@@ -467,6 +535,18 @@ fn build_request(
     strict_json_schema: Option<bool>,
     capabilities: Option<crate::common::ModelCapabilities>,
 ) -> (CreateChatCompletionRequest, Vec<Option<String>>) {
+    // Multi-agent formatter: opt-in per call via
+    // `additional_body_params["multiAgentFormatter"]` (`true` = default prompt,
+    // string = custom prompt), the same selector `ollama` / `dashscope` /
+    // `responses` use. Java parity: `OpenAIMultiAgentFormatter` +
+    // `OpenAIConversationMerger`. The selector is consumed here so it never
+    // reaches the wire.
+    let mut options = options;
+    let messages = match crate::common::take_multi_agent_prompt(&mut options) {
+        Some(prompt) => crate::common::merge_multi_agent_history(messages, &prompt),
+        None => messages,
+    };
+
     let request_tools = to_request_tools(tools);
     let has_tools = request_tools.is_some();
 
@@ -1225,6 +1305,73 @@ mod tests {
     }
 
     #[test]
+    fn multi_agent_formatter_merges_agent_turns_into_one_history_message() {
+        // Java `OpenAIMultiAgentFormatter` / `OpenAIConversationMerger`: every
+        // run of plain agent messages collapses into one `<history>` user
+        // message (only the first run carries the prompt), while system messages
+        // and tool sequences keep their ordinary mapping. The selector itself
+        // must never reach the wire.
+        let named = |text: &str, name: &str| {
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .name(name)
+                .text_content(text)
+                .build()
+        };
+        let messages = vec![
+            Msg::system("be helpful"),
+            named("hello", "Alice"),
+            named("hi there", "Bob"),
+            Msg::tool("call-1", "search", "42"),
+            named("done", "Alice"),
+        ];
+        let mut options = GenerateOptions::default();
+        options.additional_body_params.insert(
+            crate::common::MULTI_AGENT_FORMATTER_KEY.to_string(),
+            serde_json::json!(true),
+        );
+
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            messages,
+            vec![],
+            options,
+            false,
+            None,
+            None,
+        );
+        let body = serde_json::to_value(&req).unwrap();
+        let wire = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(wire[0]["role"], "system", "system stays individual: {body:?}");
+        let first_history = wire[1]["content"].as_str().expect("history text");
+        assert!(
+            first_history.starts_with(crate::common::DEFAULT_CONVERSATION_HISTORY_PROMPT),
+            "the first agent group carries the prompt: {first_history:?}"
+        );
+        assert!(first_history.contains("Alice: hello"));
+        assert!(first_history.contains("Bob: hi there"));
+        assert!(first_history.contains(crate::common::HISTORY_START_TAG));
+        assert!(first_history.contains(crate::common::HISTORY_END_TAG));
+
+        let last = wire.last().expect("last message");
+        assert_eq!(last["role"], "user");
+        let last_text = last["content"].as_str().unwrap_or_default();
+        assert!(
+            last_text.contains("Alice: done"),
+            "the run after the tool sequence merges as well: {body:?}"
+        );
+        assert!(
+            !last_text.contains(crate::common::DEFAULT_CONVERSATION_HISTORY_PROMPT),
+            "only the first agent group carries the prompt"
+        );
+        assert!(
+            !body.to_string().contains("multiAgentFormatter"),
+            "the selector leaked into the body: {body:?}"
+        );
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn reasoning_model_drops_unsupported_sampling_params() {
         let options = GenerateOptions {
@@ -1810,5 +1957,54 @@ mod tests {
             req.stream_options.as_ref().and_then(|o| o.include_usage),
             Some(true)
         );
+    }
+
+    fn context(model: &str) -> ModelCreationContext {
+        let mut ctx = ModelCreationContext::new("openai", model);
+        ctx.api_key = Some("test-key".to_string());
+        ctx.base_url = Some("https://example.invalid/v1".to_string());
+        ctx
+    }
+
+    #[test]
+    fn provider_applies_the_model_map_before_creating_the_model() {
+        let mut map = ModelMap::default();
+        map.insert("fast", "gpt-4.1");
+        map.insert("gpt-4.1", "gpt-4.1-2026-01-01");
+        let provider = OpenAiProvider::new().with_model_map(map);
+        let model = provider.create(context("fast")).unwrap();
+        // Chained resolution: fast -> gpt-4.1 -> gpt-4.1-2026-01-01.
+        assert_eq!(model.model_name(), "gpt-4.1-2026-01-01");
+    }
+
+    #[test]
+    fn provider_reports_model_map_cycles_instead_of_looping() {
+        let mut map = ModelMap::default();
+        map.insert("a", "b");
+        map.insert("b", "a");
+        let provider = OpenAiProvider::new().with_model_map(map);
+        let err = match provider.create(context("a")) {
+            Ok(_) => panic!("expected a cycle error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("cycle"), "got {err}");
+    }
+
+    #[test]
+    fn provider_strips_the_reasoning_suffix_and_seeds_the_thinking_knobs() {
+        let provider = OpenAiProvider::new().with_reasoning_suffix(true);
+        let model = provider
+            .create(context("gpt-4o-thinking-4096"))
+            .unwrap();
+        assert_eq!(model.model_name(), "gpt-4o");
+
+        let model = provider.create(context("gpt-4o-high")).unwrap();
+        assert_eq!(model.model_name(), "gpt-4o");
+
+        // Without the opt-in the name goes through untouched.
+        let model = OpenAiProvider::new()
+            .create(context("gpt-4o-high"))
+            .unwrap();
+        assert_eq!(model.model_name(), "gpt-4o-high");
     }
 }

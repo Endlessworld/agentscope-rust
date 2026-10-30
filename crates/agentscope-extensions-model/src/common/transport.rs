@@ -82,6 +82,13 @@ pub struct HttpRequestSpec {
     pub stream: bool,
     /// Provider id used to tag structured errors (e.g. `openai`).
     pub provider: String,
+    /// Per-request timeout overriding [`TransportConfig::read_timeout`].
+    ///
+    /// Providers set this from the resolved `ExecutionConfig.timeout`, so a
+    /// per-call execution budget reaches the wire instead of being dropped by
+    /// the model-specific options conversion (Java: `OllamaChatModel` passes the
+    /// merged `ExecutionConfig` to the execution layer).
+    pub timeout: Option<Duration>,
 }
 
 impl HttpRequestSpec {
@@ -93,7 +100,14 @@ impl HttpRequestSpec {
             body,
             stream: false,
             provider: "http".to_string(),
+            timeout: None,
         }
+    }
+
+    /// Sets a per-request timeout, overriding the transport-wide read timeout.
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Adds a header to the request.
@@ -139,6 +153,23 @@ pub trait HttpTransport: Send + Sync {
         headers: &[(String, String)],
         provider: &str,
     ) -> Result<serde_json::Value> {
+        let _ = (headers, provider);
+        Err(Error::Model(format!(
+            "HTTP transport does not support GET {url}"
+        )))
+    }
+
+    /// Performs a `GET` returning raw bytes plus the response `content-type`.
+    ///
+    /// Used to inline remote media (see [`super::media::RemoteMediaCache`]).
+    /// The default implementation reports that this transport cannot issue
+    /// `GET`, mirroring [`Self::get_json`].
+    async fn get_bytes(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        provider: &str,
+    ) -> Result<(Vec<u8>, Option<String>)> {
         let _ = (headers, provider);
         Err(Error::Model(format!(
             "HTTP transport does not support GET {url}"
@@ -278,7 +309,10 @@ impl ReqwestTransport {
         &self,
         req: &HttpRequestSpec,
     ) -> std::result::Result<serde_json::Value, ModelError> {
-        let builder = apply_headers(self.client.post(&req.url).json(&req.body), &req.headers);
+        let mut builder = apply_headers(self.client.post(&req.url).json(&req.body), &req.headers);
+        if let Some(timeout) = req.timeout {
+            builder = builder.timeout(timeout);
+        }
         let response = builder
             .send()
             .await
@@ -334,7 +368,11 @@ impl HttpTransport for ReqwestTransport {
 
     fn post_json_stream<'a>(&'a self, req: HttpRequestSpec) -> JsonStream<'a> {
         Box::pin(async_stream::try_stream! {
-            let builder = apply_headers(self.client.post(&req.url).json(&req.body), &req.headers);
+            let mut builder =
+                apply_headers(self.client.post(&req.url).json(&req.body), &req.headers);
+            if let Some(timeout) = req.timeout {
+                builder = builder.timeout(timeout);
+            }
             let provider = req.provider.clone();
             let response = builder
                 .send()
@@ -395,6 +433,43 @@ impl HttpTransport for ReqwestTransport {
         serde_json::from_str(&text)
             .map_err(|e| Error::Model(format!("{provider}: invalid JSON response from {url}: {e}")))
     }
+
+    /// Issues a real `GET` and returns the raw body plus its `content-type`.
+    async fn get_bytes(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        provider: &str,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let builder = apply_headers(self.client.get(url), headers);
+        let response = builder.send().await.map_err(|e| map_reqwest(provider, e))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or(value)
+                    .trim()
+                    .to_string()
+            });
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| map_reqwest(provider, e))?;
+        if !status.is_success() {
+            return Err(ModelError::new(
+                provider,
+                status.as_u16(),
+                format!("failed to fetch media from {url}"),
+            )
+            .to_core());
+        }
+        Ok((bytes.to_vec(), content_type))
+    }
 }
 
 /// An in-memory transport used by the offline unit tests.
@@ -410,6 +485,8 @@ pub struct MemoryTransport {
     /// Response returned by [`HttpTransport::get_json`] (e.g. the DashScope public-key
     /// endpoint used by request encryption). `None` fails the `GET`.
     pub get_response: Option<serde_json::Value>,
+    /// Response returned by [`HttpTransport::get_bytes`] (remote media).
+    pub bytes_response: Option<(Vec<u8>, Option<String>)>,
     /// Records the last request spec received (for assertions).
     pub captured: Arc<std::sync::Mutex<Option<HttpRequestSpec>>>,
     /// Records the last `GET` URL received (for assertions).
@@ -486,6 +563,22 @@ impl HttpTransport for MemoryTransport {
         self.get_response.clone().ok_or_else(|| {
             Error::Model(format!(
                 "MemoryTransport: no GET response configured for {url}"
+            ))
+        })
+    }
+
+    async fn get_bytes(
+        &self,
+        url: &str,
+        _headers: &[(String, String)],
+        _provider: &str,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        if let Ok(mut guard) = self.captured_get_url.lock() {
+            *guard = Some(url.to_string());
+        }
+        self.bytes_response.clone().ok_or_else(|| {
+            Error::Model(format!(
+                "MemoryTransport: no GET bytes configured for {url}"
             ))
         })
     }

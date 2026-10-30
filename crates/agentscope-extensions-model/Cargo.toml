@@ -9,12 +9,13 @@ rust-version.workspace = true
 agentscope-core = { path = "../agentscope-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
-chrono = { workspace = true }
+# NOTE: `chrono` / `thiserror` were declared but never referenced (timestamps go
+# through `tracing`, errors through the hand-written `ModelError`), so they were
+# dropped in the 2026-10-31 loop.
 # 本 crate 新增依赖（用具体版本号，见 docs/extensions/MODEL__GAP_TRACKER.md §4.2）
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { workspace = true }

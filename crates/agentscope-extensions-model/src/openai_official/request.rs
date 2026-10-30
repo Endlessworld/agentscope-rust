@@ -9,7 +9,8 @@
 use agentscope_core::error::{Error, Result};
 use agentscope_core::formatter::ResponseFormat;
 use agentscope_core::message::{
-    ContentBlock, DataBlock, Msg, MsgRole, Source, ThinkingBlock, ToolResultBlock, ToolUseBlock,
+    ContentBlock, DataBlock, Msg, MsgRole, Source, ThinkingBlock, ToolResultBlock, ToolResultState,
+    ToolUseBlock,
 };
 use agentscope_core::model::{GenerateOptions, ToolChoice, ToolSchema};
 use serde_json::{json, Map, Value};
@@ -19,6 +20,7 @@ use super::constants::{
 };
 use super::formatter::ResponsesMultiAgentFormatter;
 use super::server_tool::{OpenAIServerTool, ResponsesServerToolHelper};
+use crate::common::tool_search;
 
 /// Maps messages, tools and options to a Responses API request body.
 pub fn map_request(
@@ -51,6 +53,10 @@ pub fn map_request(
         Some(formatter) => formatter.format_history(messages)?,
         None => map_history(messages)?,
     };
+    // Client-executed tool search: the loaded definitions carry the strict
+    // default of the model unless they declare their own (Java
+    // `applyToolSearchStrictDefaults`).
+    let input = apply_tool_search_strict_defaults(input, strict_tools);
     if let Some(map) = body.as_object_mut() {
         map.insert("input".to_string(), Value::Array(input));
     }
@@ -58,7 +64,15 @@ pub fn map_request(
     let has_tool_search = server_tools
         .iter()
         .any(|tool| tool.kind() == super::server_tool::OpenAIServerToolKind::ToolSearch);
-    let client_tools = map_tools(tools, strict_tools, has_tool_search)?;
+    // Hosted tool search (a server tool) and client-executed tool search (a
+    // response tool) are mutually exclusive loading protocols.
+    let has_client_tool_search = tools.iter().any(tool_search::is_tool_search_schema);
+    if has_tool_search && has_client_tool_search {
+        return Err(Error::Model(
+            "Hosted and client-executed tool search cannot be combined".to_string(),
+        ));
+    }
+    let client_tools = map_tools(tools, strict_tools, has_tool_search || has_client_tool_search)?;
     let merged = ResponsesServerToolHelper::merge_tools(client_tools, server_tools);
     if !merged.is_empty() {
         body["tools"] = Value::Array(merged);
@@ -504,6 +518,10 @@ fn map_tool_use_block(tool: &ToolUseBlock, items: &mut Vec<Value>) -> Result<()>
         }
         return Ok(());
     }
+    if tool_search::is_client_tool_search_call(&tool.metadata) {
+        items.push(restore_client_tool_search(tool));
+        return Ok(());
+    }
     if tool.id.trim().is_empty() {
         return Err(Error::Model(
             "ToolUseBlock.id must not be null for history replay".to_string(),
@@ -541,6 +559,13 @@ fn map_tool_result_block(result: &ToolResultBlock, items: &mut Vec<Value>) -> Re
         .ok_or_else(|| {
             Error::Model("ToolResultBlock.id must not be null for history replay".to_string())
         })?;
+
+    // A result for a client-executed tool search is replayed as a
+    // `tool_search_output` item carrying the definitions it loaded.
+    if tool_search::has_client_tool_search_call(items, call_id) {
+        items.push(client_tool_search_output(result, call_id));
+        return Ok(());
+    }
 
     let has_non_text = result
         .output
@@ -599,7 +624,124 @@ fn map_tools(
 ) -> Result<Vec<Value>> {
     tools
         .iter()
-        .map(|schema| map_function_tool(schema, strict_tools, has_tool_search))
+        .map(|schema| {
+            if tool_search::is_tool_search_schema(schema) {
+                return Ok(map_tool_search_tool(schema));
+            }
+            map_function_tool(schema, strict_tools, has_tool_search)
+        })
+        .collect()
+}
+
+/// Maps the client-executed `tool_search` declaration.
+///
+/// The model is told to search (and call) client-side, so the discovered
+/// definitions come back as `tool_search_output` items this crate replays
+/// (`ResponsesRequestMapper` / `ResponsesToolHelper`).
+fn map_tool_search_tool(schema: &ToolSchema) -> Value {
+    let mut tool = json!({
+        "type": "tool_search",
+        "execution": "client",
+        "parameters": Value::Object(schema.parameters.clone()),
+    });
+    if !schema.description.is_empty() {
+        tool["description"] = json!(schema.description);
+    }
+    tool
+}
+
+/// Replays a decoded client tool search as a native `tool_search_call` item.
+fn restore_client_tool_search(tool: &ToolUseBlock) -> Value {
+    let arguments = if tool.input.is_empty() {
+        tool.content
+            .as_deref()
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        Value::Object(tool.input.clone())
+    };
+    json!({
+        "type": "tool_search_call",
+        "call_id": tool.id,
+        "execution": "client",
+        "arguments": arguments,
+        "status": "completed",
+    })
+}
+
+/// Replays a successful client tool search as a `tool_search_output` item
+/// carrying the definitions it loaded (`ResponsesRequestMapper`).
+///
+/// A failed search contributes no tools: the model must not be able to call a
+/// definition the search never returned.
+fn client_tool_search_output(result: &ToolResultBlock, call_id: &str) -> Value {
+    let mut tools = Vec::new();
+    if result.state != ToolResultState::Error {
+        for schema in tool_search::loaded_tool_schemas(&result.metadata) {
+            tools.push(loaded_tool_definition(&schema));
+        }
+    }
+    json!({
+        "type": "tool_search_output",
+        "call_id": call_id,
+        "execution": "client",
+        "status": "completed",
+        "tools": tools,
+    })
+}
+
+/// One loaded tool definition inside `tool_search_output.tools`.
+///
+/// `strict` is only emitted when the discovered schema declares it; a missing
+/// value is filled in from the model's `strictTools` default by
+/// [`apply_tool_search_strict_defaults`].
+fn loaded_tool_definition(schema: &ToolSchema) -> Value {
+    let parameters = if schema.parameters.is_empty() {
+        json!({"type": "object", "properties": {}})
+    } else {
+        Value::Object(schema.parameters.clone())
+    };
+    let mut tool = json!({
+        "type": "function",
+        "name": schema.name,
+        "parameters": parameters,
+    });
+    if !schema.description.is_empty() {
+        tool["description"] = json!(schema.description);
+    }
+    if let Some(output_schema) = &schema.output_schema {
+        if !output_schema.is_empty() {
+            tool["output_schema"] = Value::Object(output_schema.clone());
+        }
+    }
+    if let Some(strict) = schema.strict {
+        tool["strict"] = json!(strict);
+    }
+    tool
+}
+
+/// Fills the model's `strictTools` default into client-loaded definitions that
+/// do not declare `strict` (Java `applyToolSearchStrictDefaults`).
+fn apply_tool_search_strict_defaults(items: Vec<Value>, strict_tools: Option<bool>) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            if item.get("type").and_then(Value::as_str) != Some("tool_search_output")
+                || item.get("execution").and_then(Value::as_str) != Some("client")
+            {
+                return item;
+            }
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                for tool in tools {
+                    let is_function =
+                        tool.get("type").and_then(Value::as_str) == Some("function");
+                    if is_function && tool.get("strict").is_none() {
+                        tool["strict"] = json!(strict_tools.unwrap_or(false));
+                    }
+                }
+            }
+            item
+        })
         .collect()
 }
 

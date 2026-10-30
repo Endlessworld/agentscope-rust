@@ -147,6 +147,16 @@ impl AnthropicChatModel {
         &self.server_tools
     }
 
+    /// The native tool-loading protocol of this provider.
+    ///
+    /// Anthropic loads deferred definitions through `tool_search` and returns
+    /// matches as `tool_reference` blocks, i.e. `ToolSearchMode::Deferred`
+    /// (Java: `AnthropicChatModel#getToolSearchMode`). Core's `Model` trait has
+    /// no such method yet, so it is exposed here as an inherent accessor.
+    pub fn tool_search_mode(&self) -> crate::common::tool_search::ToolSearchMode {
+        crate::common::tool_search::ToolSearchMode::Deferred
+    }
+
     /// The resolved messages endpoint URL.
     pub fn endpoint_url(&self) -> String {
         format!("{}{}", self.base_url, MESSAGES_ENDPOINT)

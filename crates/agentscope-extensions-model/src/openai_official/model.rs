@@ -163,6 +163,17 @@ impl OpenAIResponsesChatModel {
         "/responses"
     }
 
+    /// The native tool-loading protocol of this provider.
+    ///
+    /// The Responses provider declares a client-executed `tool_search` tool and
+    /// loads the matches through `tool_search_output` items, i.e.
+    /// `ToolSearchMode::Client` (Java: `OpenAIResponsesChatModel#getToolSearchMode`).
+    /// Core's `Model` trait has no such method yet, so it is exposed here as an
+    /// inherent accessor.
+    pub fn tool_search_mode(&self) -> crate::common::tool_search::ToolSearchMode {
+        crate::common::tool_search::ToolSearchMode::Client
+    }
+
     /// Builds the URL + body for a single request.
     pub fn build_http_request(
         &self,

@@ -120,15 +120,99 @@ pub fn take_bool_option(options: &mut GenerateOptions, key: &str) -> Option<bool
     })
 }
 
+/// Provider-selector option consumed by [`take_multi_agent_prompt`]. It is a
+/// *format selection hint*, never a wire field: providers must strip it before
+/// serializing the request body.
+pub const MULTI_AGENT_FORMATTER_KEY: &str = "multiAgentFormatter";
+
 /// Reads the `multiAgentFormatter` selector: `true` selects the default prompt,
 /// a string supplies a custom conversation-history prompt, anything else (or
 /// `false`) leaves the plain chat formatter active.
 pub fn take_multi_agent_prompt(options: &mut GenerateOptions) -> Option<String> {
-    match take_option(options, "multiAgentFormatter")? {
+    match take_option(options, MULTI_AGENT_FORMATTER_KEY)? {
         serde_json::Value::Bool(true) => Some(DEFAULT_CONVERSATION_HISTORY_PROMPT.to_string()),
         serde_json::Value::String(prompt) if !prompt.trim().is_empty() => Some(prompt),
         _ => None,
     }
+}
+
+/// Merges one run of plain agent messages into a single `<history>` user message.
+///
+/// Mirrors the merge half of `OpenAIMultiAgentFormatter` /
+/// `OpenAIConversationMerger` (and the provider-specific `*MultiAgentFormatter`
+/// / `*ConversationMerger`): `"<name>: <text>"` per text/hint/thinking block,
+/// `"<name>: [Image]"` for media. Media is textually referenced because the
+/// merged message is emitted through the plain-text mapping; adapters that keep
+/// real media parts (e.g. `openai-official`) merge at their own layer.
+///
+/// Tool blocks never reach this function: [`is_tool_related`] keeps tool
+/// sequences out of agent groups.
+pub fn merge_agent_group(group: &[Msg], history_prompt: &str) -> Msg {
+    let mut text = String::new();
+    if !history_prompt.is_empty() {
+        text.push_str(history_prompt);
+    }
+    text.push_str(HISTORY_START_TAG);
+    text.push('\n');
+
+    for msg in group {
+        let name = agent_name(msg);
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(t) => text.push_str(&format!("{name}: {}\n", t.text)),
+                ContentBlock::Hint(h) => {
+                    text.push_str(&format!("{name}: {}\n", h.hint.clone().unwrap_or_default()))
+                }
+                ContentBlock::Thinking(t) => text.push_str(&format!("{name}: {}\n", t.thinking)),
+                ContentBlock::Image(_) => text.push_str(&format!("{name}: [Image]\n")),
+                ContentBlock::Audio(_) => text.push_str(&format!("{name}: [Audio]\n")),
+                ContentBlock::Video(_) => text.push_str(&format!("{name}: [Video]\n")),
+                ContentBlock::Data(_) => text.push_str(&format!("{name}: [Data]\n")),
+                // Tool blocks always live in a tool sequence, never in an agent group.
+                ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_) => {}
+            }
+        }
+    }
+    text.push_str(HISTORY_END_TAG);
+    Msg::user(text)
+}
+
+/// Applies the multi-agent grouping: system messages stay individual, tool
+/// sequences keep their normal mapping, and each run of plain agent messages
+/// collapses into one `<history>` message. Only the first agent group carries
+/// the conversation-history prompt.
+pub fn merge_multi_agent_history(messages: Vec<Msg>, history_prompt: &str) -> Vec<Msg> {
+    let mut out: Vec<Msg> = Vec::with_capacity(messages.len());
+    let mut pending: Vec<Msg> = Vec::new();
+    let mut is_first_agent_group = true;
+
+    for msg in messages {
+        let flush = |pending: &mut Vec<Msg>, out: &mut Vec<Msg>, is_first: &mut bool| {
+            if pending.is_empty() {
+                return;
+            }
+            let prompt = if *is_first { history_prompt } else { "" };
+            *is_first = false;
+            out.push(merge_agent_group(pending, prompt));
+            pending.clear();
+        };
+
+        if msg.role == MsgRole::System || is_tool_related(&msg) {
+            flush(&mut pending, &mut out, &mut is_first_agent_group);
+            out.push(msg);
+        } else {
+            pending.push(msg);
+        }
+    }
+    let prompt = if is_first_agent_group {
+        history_prompt
+    } else {
+        ""
+    };
+    if !pending.is_empty() {
+        out.push(merge_agent_group(&pending, prompt));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -142,6 +226,31 @@ mod tests {
             .name(name)
             .text_content(text)
             .build()
+    }
+
+    #[test]
+    fn history_merge_keeps_system_and_tool_sequences_and_prompts_only_the_first_group() {
+        let messages = vec![
+            Msg::system("sys"),
+            named("hello", "Alice"),
+            Msg::tool("call-1", "search", "42"),
+            named("done", "Bob"),
+        ];
+        let merged = merge_multi_agent_history(messages, "PROMPT");
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].role, MsgRole::System);
+        let first = merged[1].text_content();
+        assert!(first.starts_with("PROMPT"), "got {first:?}");
+        assert!(first.contains("Alice: hello"));
+        assert!(first.contains(HISTORY_START_TAG) && first.contains(HISTORY_END_TAG));
+        assert_eq!(merged[2].role, MsgRole::Tool, "tool sequences pass through");
+        let second = merged[3].text_content();
+        assert!(second.contains("Bob: done"));
+        assert!(
+            !second.contains("PROMPT"),
+            "only the first group carries the prompt"
+        );
     }
 
     #[test]

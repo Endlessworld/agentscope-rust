@@ -8,6 +8,8 @@
 //! diagnostics are surfaced through `tracing`; the type is public so a future
 //! gateway layer can also attach them to a response.
 
+use std::sync::{Arc, OnceLock, RwLock};
+
 use serde::Serialize;
 
 /// Severity of a conversion diagnostic.
@@ -53,8 +55,38 @@ impl ConversionDiagnostic {
     }
 }
 
+/// A host-installed sink for structured collection.
+///
+/// [`Diagnostics`] is the per-conversion accumulator; this is the process-wide
+/// fan-out for hosts (gateways, tests) that want every diagnostic without
+/// plumbing a collector through every converter signature.
+pub type DiagnosticSink = Arc<dyn Fn(&ConversionDiagnostic) + Send + Sync>;
+
+static SINK: OnceLock<RwLock<Option<DiagnosticSink>>> = OnceLock::new();
+
+fn sink_slot() -> &'static RwLock<Option<DiagnosticSink>> {
+    SINK.get_or_init(|| RwLock::new(None))
+}
+
+/// Installs (or replaces) the process-wide diagnostic sink.
+pub fn set_diagnostic_sink(sink: DiagnosticSink) {
+    if let Ok(mut slot) = sink_slot().write() {
+        *slot = Some(sink);
+    }
+}
+
+/// Removes the process-wide diagnostic sink.
+pub fn clear_diagnostic_sink() {
+    if let Ok(mut slot) = sink_slot().write() {
+        *slot = None;
+    }
+}
+
 /// Records a diagnostic with `tracing` (the default sink).
 pub fn emit(diagnostic: &ConversionDiagnostic) {
+    if let Some(sink) = sink_slot().read().ok().and_then(|slot| slot.as_ref().cloned()) {
+        sink(diagnostic);
+    }
     match diagnostic.severity {
         Severity::Info => tracing::info!(
             code = %diagnostic.code,
@@ -158,5 +190,29 @@ mod tests {
     fn severity_serialises_lowercase() {
         let value = serde_json::to_value(Severity::Warning).unwrap();
         assert_eq!(value, serde_json::json!("warning"));
+    }
+
+    #[test]
+    fn installed_sink_receives_emitted_diagnostics() {
+        let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink_bag = captured.clone();
+        set_diagnostic_sink(Arc::new(move |diagnostic| {
+            if let Ok(mut guard) = sink_bag.lock() {
+                guard.push(diagnostic.code.clone());
+            }
+        }));
+        warn("tool_choice_downgraded", "tool_choice", "required -> auto");
+        clear_diagnostic_sink();
+        emit(&ConversionDiagnostic::new(
+            Severity::Info,
+            "after_clear",
+            "",
+            "no sink installed",
+        ));
+
+        let guard = captured.lock().unwrap();
+        assert!(guard.contains(&"tool_choice_downgraded".to_string()));
+        // Cleared sink no longer receives events.
+        assert!(!guard.contains(&"after_clear".to_string()));
     }
 }

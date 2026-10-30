@@ -284,7 +284,7 @@ fn build_request(
     // here so it never reaches the wire.
     let mut options = options;
     let messages = match crate::common::take_multi_agent_prompt(&mut options) {
-        Some(prompt) => merge_multi_agent_history(messages, &prompt),
+        Some(prompt) => crate::common::merge_multi_agent_history(messages, &prompt),
         None => messages,
     };
 
@@ -379,83 +379,6 @@ fn build_request(
         req.max_output_tokens = Some(n);
     }
     req
-}
-
-// ── Multi-agent formatter ───────────────────────────────────────────────
-
-/// Merges one run of plain agent messages into a single `<history>` user message.
-///
-/// Mirrors the merge half of `ResponsesMultiAgentFormatter` /
-/// `OpenAIMultiAgentFormatter`: `"<name>: <text>"` per text/hint/thinking block,
-/// `"<name>: [Image]"` for media (media is textually referenced because the
-/// merged message is emitted through the plain-text Responses mapping; the
-/// `openai-official` adapter keeps real image parts there instead).
-fn merge_agent_group(group: &[Msg], history_prompt: &str) -> Msg {
-    let mut text = String::new();
-    if !history_prompt.is_empty() {
-        text.push_str(history_prompt);
-    }
-    text.push_str(crate::common::HISTORY_START_TAG);
-    text.push('\n');
-
-    for msg in group {
-        let name = crate::common::agent_name(msg);
-        for block in &msg.content {
-            match block {
-                ContentBlock::Text(t) => text.push_str(&format!("{name}: {}\n", t.text)),
-                ContentBlock::Hint(h) => {
-                    text.push_str(&format!("{name}: {}\n", h.hint.clone().unwrap_or_default()))
-                }
-                ContentBlock::Thinking(t) => text.push_str(&format!("{name}: {}\n", t.thinking)),
-                ContentBlock::Image(_) => text.push_str(&format!("{name}: [Image]\n")),
-                ContentBlock::Audio(_) => text.push_str(&format!("{name}: [Audio]\n")),
-                ContentBlock::Video(_) => text.push_str(&format!("{name}: [Video]\n")),
-                ContentBlock::Data(_) => text.push_str(&format!("{name}: [Data]\n")),
-                // Tool blocks always live in a tool sequence, never in an agent group.
-                ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_) => {}
-            }
-        }
-    }
-    text.push_str(crate::common::HISTORY_END_TAG);
-    Msg::user(text)
-}
-
-/// Applies the multi-agent grouping: system messages stay individual (they
-/// become `instructions`), tool sequences keep their normal mapping, and each
-/// run of plain agent messages collapses into one `<history>` message. Only the
-/// first agent group carries the conversation-history prompt.
-fn merge_multi_agent_history(messages: Vec<Msg>, history_prompt: &str) -> Vec<Msg> {
-    let mut out: Vec<Msg> = Vec::with_capacity(messages.len());
-    let mut pending: Vec<Msg> = Vec::new();
-    let mut is_first_agent_group = true;
-
-    for msg in messages {
-        let flush = |pending: &mut Vec<Msg>, out: &mut Vec<Msg>, is_first: &mut bool| {
-            if pending.is_empty() {
-                return;
-            }
-            let prompt = if *is_first { history_prompt } else { "" };
-            *is_first = false;
-            out.push(merge_agent_group(pending, prompt));
-            pending.clear();
-        };
-
-        if msg.role == MsgRole::System || crate::common::is_tool_related(&msg) {
-            flush(&mut pending, &mut out, &mut is_first_agent_group);
-            out.push(msg);
-        } else {
-            pending.push(msg);
-        }
-    }
-    let prompt = if is_first_agent_group {
-        history_prompt
-    } else {
-        ""
-    };
-    if !pending.is_empty() {
-        out.push(merge_agent_group(&pending, prompt));
-    }
-    out
 }
 
 fn easy_message(role: Role, text: String) -> InputItem {

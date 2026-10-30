@@ -9,7 +9,9 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
-use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
+use agentscope_core::{
+    ChatResponse, Error, ExecutionConfig, GenerateOptions, Model, Msg, Result, ToolSchema,
+};
 
 use crate::common::{HttpRequestSpec, SharedTransport};
 use crate::ollama::converter::{build_request, to_multi_agent_messages, to_ollama_messages};
@@ -120,14 +122,22 @@ impl OllamaChatModel {
         input: Vec<String>,
         options: Option<&OllamaOptions>,
     ) -> Result<Vec<Vec<f32>>> {
-        let request = crate::ollama::dto::OllamaEmbeddingRequest::new(&self.model_name, input);
+        let mut request = crate::ollama::dto::OllamaEmbeddingRequest::new(&self.model_name, input);
+        // `/api/embed` accepts the same `options` / `keep_alive` fields as
+        // `/api/chat`, so a per-call budget (e.g. `num_ctx`) must not be dropped.
+        if let Some(options) = options {
+            let map = options.to_options_map();
+            if !map.is_empty() {
+                request.options = Some(map);
+            }
+            request.keep_alive = options.keep_alive.clone();
+        }
         let body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
         let spec = HttpRequestSpec::new(
             format!("{}{}", self.base_url.trim_end_matches('/'), EMBED_ENDPOINT),
             body,
         )
         .provider("ollama");
-        let _ = options; // reserved for future per-call options plumbing
         let value = self.transport.post_json(spec).await?;
         let response: crate::ollama::dto::OllamaEmbeddingResponse =
             serde_json::from_value(value).map_err(Error::from)?;
@@ -145,6 +155,33 @@ impl OllamaChatModel {
     /// The resolved base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The execution config that governs one call.
+    ///
+    /// Per-call options win over the model defaults, and unset fields fall back
+    /// to [`ExecutionConfig::model_defaults`]. Mirrors Java's
+    /// `OllamaOptions#getExecutionConfig` after `defaultOptions.merge(options)`.
+    pub fn resolved_execution_config(&self, options: &GenerateOptions) -> ExecutionConfig {
+        self.default_options
+            .resolved_execution_config(options.execution_config)
+    }
+
+    /// The timeout **explicitly** requested by the caller or the model defaults.
+    ///
+    /// Unlike [`Self::resolved_execution_config`] this does not fall back to the
+    /// model defaults, so an Ollama call without an execution budget keeps the
+    /// transport's idle read timeout instead of being capped at
+    /// [`ExecutionConfig::model_defaults`]'s per-attempt timeout.
+    pub fn explicit_timeout(&self, options: &GenerateOptions) -> Option<std::time::Duration> {
+        options
+            .execution_config
+            .and_then(|config| config.timeout)
+            .or_else(|| {
+                self.default_options
+                    .execution_config
+                    .and_then(|config| config.timeout)
+            })
     }
 
     /// The default options.
@@ -203,7 +240,10 @@ impl Model for OllamaChatModel {
                 body,
             )
             .streaming(stream_enabled)
-            .provider("ollama");
+            .provider("ollama")
+            // A per-call / model-default execution budget must reach the wire;
+            // otherwise the caller's timeout would be silently ignored.
+            .timeout(self.explicit_timeout(&options));
 
             if stream_enabled {
                 let mut frames = self.transport.post_json_stream(spec);
@@ -303,6 +343,27 @@ mod tests {
         assert_eq!(req.provider, "ollama");
     }
 
+    #[tokio::test]
+    async fn embed_forwards_per_call_options_and_keep_alive() {
+        let transport = MemoryTransport::with_response(serde_json::json!({
+            "model": "nomic-embed-text",
+            "embeddings": [[0.1]]
+        }));
+        let model = OllamaChatModel::new("nomic-embed-text", None, Arc::new(transport.clone()));
+        let options = OllamaOptions {
+            num_ctx: Some(8192),
+            keep_alive: Some("5m".into()),
+            ..Default::default()
+        };
+        model
+            .embed_with_options(vec!["a".into()], Some(&options))
+            .await
+            .unwrap();
+        let body = transport.last_request().unwrap().body;
+        assert_eq!(body["options"]["num_ctx"], serde_json::json!(8192));
+        assert_eq!(body["keep_alive"], serde_json::json!("5m"));
+    }
+
     async fn collect(
         model: &OllamaChatModel,
         options: GenerateOptions,
@@ -341,6 +402,105 @@ mod tests {
         assert_eq!(spec.body["model"], serde_json::json!("llama3"));
         assert_eq!(spec.body["stream"], serde_json::json!(false));
         assert_eq!(spec.body["messages"][0]["role"], serde_json::json!("user"));
+    }
+
+    #[tokio::test]
+    async fn per_call_execution_timeout_reaches_the_request() {
+        let transport = MemoryTransport::with_response(serde_json::json!({
+            "model": "llama3",
+            "message": { "role": "assistant", "content": "ok" },
+            "done": true
+        }));
+        let model = model_with(transport.clone());
+        let options = GenerateOptions {
+            stream: Some(false),
+            execution_config: Some(ExecutionConfig {
+                timeout: Some(std::time::Duration::from_millis(200)),
+                max_attempts: Some(3),
+                ..Default::default()
+            }),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+
+        let out = collect(&model, options).await;
+        assert!(out[0].is_ok());
+
+        let spec = transport.last_request().unwrap();
+        // The per-call timeout is applied to the wire request...
+        assert_eq!(spec.timeout, Some(std::time::Duration::from_millis(200)));
+        // ...and never serialized into the body.
+        assert!(spec.body.get("timeout").is_none());
+        assert!(spec.body["options"].get("timeout").is_none());
+        assert_eq!(spec.body["options"]["temperature"], serde_json::json!(0.2));
+    }
+
+    #[tokio::test]
+    async fn model_default_execution_timeout_applies_when_the_call_omits_it() {
+        let transport = MemoryTransport::with_response(serde_json::json!({
+            "model": "llama3",
+            "message": { "role": "assistant", "content": "ok" },
+            "done": true
+        }));
+        let model = model_with(transport.clone()).with_default_options(OllamaOptions {
+            execution_config: Some(ExecutionConfig {
+                timeout: Some(std::time::Duration::from_secs(42)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out[0].is_ok());
+        assert_eq!(
+            transport.last_request().unwrap().timeout,
+            Some(std::time::Duration::from_secs(42))
+        );
+
+        // A per-call budget overrides the model default.
+        let out = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                execution_config: Some(ExecutionConfig {
+                    timeout: Some(std::time::Duration::from_millis(7)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out[0].is_ok());
+        assert_eq!(
+            transport.last_request().unwrap().timeout,
+            Some(std::time::Duration::from_millis(7))
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_without_an_execution_budget_keep_the_transport_timeout() {
+        let transport = MemoryTransport::with_response(serde_json::json!({
+            "model": "llama3",
+            "message": { "role": "assistant", "content": "ok" },
+            "done": true
+        }));
+        let model = model_with(transport.clone());
+        let _ = collect(
+            &model,
+            GenerateOptions {
+                stream: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(transport.last_request().unwrap().timeout.is_none());
     }
 
     #[tokio::test]

@@ -200,6 +200,8 @@ pub struct AnthropicToolResultBlock {
 pub enum AnthropicToolResultContent {
     Text { text: String },
     Image { source: AnthropicImageSource },
+    /// Reference to a tool discovered by `tool_search` (deferred loading).
+    ToolReference { tool_name: String },
 }
 
 /// Ephemeral prompt-cache marker (`{"type":"ephemeral"}`).
@@ -228,6 +230,11 @@ pub struct AnthropicTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Marks the definition as deferred: it is only *loadable* through
+    /// `tool_search` and a match is returned as a `tool_reference` block
+    /// (mirrors the Java SDK's `Tool.deferLoading`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<AnthropicCacheControl>,
 }

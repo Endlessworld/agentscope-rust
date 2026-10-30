@@ -931,6 +931,35 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_tool_result_keeps_its_media_parts() {
+        // Java `DashScopeMultiAgentFormatter` / multimodal path: a tool result
+        // carrying media must stay a `tool` message whose content is a part
+        // list, not a flattened string (otherwise the image is lost).
+        let result = agentscope_core::ToolResultBlock::new(
+            "call_1",
+            "get_image",
+            vec![
+                ContentBlock::Text(TextBlock::new("here")),
+                ContentBlock::Image(ImageBlock::new(Source::Base64(
+                    agentscope_core::Base64Source::new("image/png", "AAAA"),
+                ))),
+            ],
+        );
+        let mut msg = Msg::tool("call_1", "get_image", "");
+        msg.content = vec![ContentBlock::ToolResult(result)];
+        let msgs = to_dashscope_messages(vec![msg], true);
+        assert_eq!(msgs[0].role.as_deref(), Some("tool"));
+        assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_1"));
+        match msgs[0].content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => {
+                assert_eq!(parts[0].text.as_deref(), Some("here"));
+                assert_eq!(parts[1].image.as_deref(), Some("data:image/png;base64,AAAA"));
+            }
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn thinking_blocks_are_dropped() {
         let mut msg = Msg::user("x");
         msg.content
