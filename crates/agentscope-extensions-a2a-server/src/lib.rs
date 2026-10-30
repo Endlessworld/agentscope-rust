@@ -4,6 +4,8 @@
 //! Mirrors `io.agentscope.core.a2a.server`:
 //!
 //! * [`AgentRunner`] / [`AgentRequestOptions`] - `executor.runner`
+//! * [`runner::BaseReActAgentRunner`] / [`runner::ReActAgentWithBuilderRunner`] -
+//!   `executor.runner.{BaseReActAgentRunner,ReActAgentWithBuilderRunner}`
 //! * [`executor::AgentExecuteProperties`] - `executor.AgentExecuteProperties`
 //! * [`ServerMessageConvert`] - `utils.MessageConvertUtil`
 //! * [`A2aTaskRegistry`] - `tasks` (`InMemoryTaskStore`)
@@ -21,11 +23,16 @@
 pub mod card;
 pub mod executor;
 pub mod registry;
+pub mod runner;
 pub mod server;
 pub mod transport;
 
 pub use executor::{AgentExecuteProperties, AgentOutputProjector};
 pub use registry::{AgentRegistry, AgentRegistryService, RegistrationReport};
+pub use runner::{
+    BaseReActAgentRunner, ReActAgentBuilderFactory, ReActAgentWithBuilderRunner, TaskAgent,
+    TaskAgentFactory,
+};
 pub use server::{A2aServerBuildError, AgentScopeA2aServer, AgentScopeA2aServerBuilder};
 pub use transport::{
     DeploymentProperties, JsonRpcTransportMetadata, JsonRpcTransportWrapper,

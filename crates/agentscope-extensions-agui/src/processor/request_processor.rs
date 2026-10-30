@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use agentscope_core::RuntimeContext;
 
-use crate::adapter::{AguiAdapterConfig, AguiAgentAdapter, AguiStreamableAgent};
+use crate::adapter::{
+    AguiAdapterConfig, AguiAgentAdapterFactory, AguiStreamableAgent, DefaultAguiAgentAdapterFactory,
+};
 use crate::error::AguiError;
 use crate::event::AguiEvent;
 use crate::model::{AguiMessage, RunAgentInput};
@@ -91,6 +93,7 @@ impl ProcessResult {
 pub struct AguiRequestProcessor {
     agent_resolver: Box<dyn AgentResolver>,
     config: AguiAdapterConfig,
+    adapter_factory: Arc<dyn AguiAgentAdapterFactory>,
     resume_coordinator: AguiResumeCoordinator,
     runtime_context_resolver: Option<SharedRuntimeContextResolver>,
 }
@@ -112,6 +115,12 @@ impl AguiRequestProcessor {
     /// The adapter configuration.
     pub fn config(&self) -> &AguiAdapterConfig {
         &self.config
+    }
+
+    /// The factory creating one adapter per run, mirroring Java
+    /// `AguiRequestProcessor#adapterFactory`.
+    pub fn adapter_factory(&self) -> &Arc<dyn AguiAgentAdapterFactory> {
+        &self.adapter_factory
     }
 
     /// The resume coordinator, exposed so callers can inspect open interrupts.
@@ -189,7 +198,7 @@ impl AguiRequestProcessor {
             .resume_coordinator
             .add_resume_interrupts(input, runtime_context.clone());
 
-        let adapter = AguiAgentAdapter::new(agent.clone(), self.config.clone());
+        let adapter = self.adapter_factory.create(agent.clone(), self.config.clone());
         let mut events = Vec::new();
         let mut run_error_seen = false;
         let mut run = adapter.run_with_context(&effective_input, Some(effective_runtime_context));
@@ -336,6 +345,7 @@ fn agent_resolution_error_events(
 pub struct AguiRequestProcessorBuilder {
     agent_resolver: Option<Box<dyn AgentResolver>>,
     config: Option<AguiAdapterConfig>,
+    adapter_factory: Option<Arc<dyn AguiAgentAdapterFactory>>,
     runtime_context_resolver: Option<SharedRuntimeContextResolver>,
 }
 
@@ -343,6 +353,7 @@ impl std::fmt::Debug for AguiRequestProcessorBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AguiRequestProcessorBuilder")
             .field("has_agent_resolver", &self.agent_resolver.is_some())
+            .field("has_adapter_factory", &self.adapter_factory.is_some())
             .field(
                 "has_runtime_context_resolver",
                 &self.runtime_context_resolver.is_some(),
@@ -370,6 +381,16 @@ impl AguiRequestProcessorBuilder {
         self
     }
 
+    /// Sets the factory used to create the per-run adapter.
+    ///
+    /// Mirrors Java `AguiRequestProcessor.Builder#adapterFactory`; the default is
+    /// [`DefaultAguiAgentAdapterFactory`], which builds a standard
+    /// [`AguiAgentAdapter`](crate::adapter::AguiAgentAdapter).
+    pub fn adapter_factory(mut self, factory: Arc<dyn AguiAgentAdapterFactory>) -> Self {
+        self.adapter_factory = Some(factory);
+        self
+    }
+
     /// Builds the processor.
     ///
     /// # Panics
@@ -380,6 +401,9 @@ impl AguiRequestProcessorBuilder {
         AguiRequestProcessor {
             agent_resolver: self.agent_resolver.expect("agentResolver cannot be null"),
             config: self.config.unwrap_or_default(),
+            adapter_factory: self
+                .adapter_factory
+                .unwrap_or_else(|| Arc::new(DefaultAguiAgentAdapterFactory)),
             resume_coordinator: AguiResumeCoordinator::new(),
             runtime_context_resolver: self.runtime_context_resolver,
         }
@@ -392,6 +416,7 @@ pub type FnRuntimeContextResolver = fn(&AguiRuntimeContextRequest) -> Option<Run
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::AguiAgentAdapter;
     use crate::adapter::AguiStreamableAgent;
     use crate::model::{AguiContext, AguiResume, AguiTool};
     use crate::registry::AguiAgentRegistry;
@@ -896,6 +921,74 @@ mod tests {
         assert_eq!(
             agent.sessions.lock().unwrap().as_slice(),
             &["thread-7".to_string()]
+        );
+    }
+
+    /// Factory recording every `create` call and delegating to the default adapter.
+    #[derive(Default)]
+    struct RecordingAdapterFactory {
+        calls: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl AguiAgentAdapterFactory for RecordingAdapterFactory {
+        fn create(
+            &self,
+            agent: Arc<dyn AguiStreamableAgent>,
+            config: AguiAdapterConfig,
+        ) -> AguiAgentAdapter {
+            self.calls.lock().unwrap().push((
+                agent.agent_id().to_string(),
+                config.default_agent_id().map(str::to_string),
+            ));
+            DefaultAguiAgentAdapterFactory.create(agent, config)
+        }
+    }
+
+    // Java: `AguiRequestProcessor.Builder#adapterFactory` — the configured factory creates the
+    // adapter of every run, and the default keeps the previous behaviour.
+    #[tokio::test]
+    async fn adapter_factory_from_the_builder_creates_the_per_run_adapter() {
+        let resolver = TestResolver::default();
+        resolver.registry.register(
+            "from_config",
+            Arc::new(StubAgent::new("from_config", vec![start_event()])),
+        );
+        let factory = Arc::new(RecordingAdapterFactory::default());
+        let config = AguiAdapterConfig::builder()
+            .default_agent_id("from_config")
+            .build();
+        let processor = AguiRequestProcessor::builder()
+            .agent_resolver(Box::new(resolver))
+            .config(config.clone())
+            .adapter_factory(factory.clone())
+            .build();
+
+        let mut input = RunAgentInput::of("t", "r");
+        input.messages.push(AguiMessage::user_message("m1", "hi"));
+        let from_factory = processor.process(&request(input.clone())).await;
+
+        assert_eq!(
+            factory.calls.lock().unwrap().as_slice(),
+            &[("from_config".to_string(), Some("from_config".to_string()))],
+            "one adapter per run, built from the resolved agent and the processor config"
+        );
+        assert!(!from_factory.has_error());
+
+        // The default factory produces the very same events.
+        let default_resolver = TestResolver::default();
+        default_resolver.registry.register(
+            "from_config",
+            Arc::new(StubAgent::new("from_config", vec![start_event()])),
+        );
+        let default_processor = AguiRequestProcessor::builder()
+            .agent_resolver(Box::new(default_resolver))
+            .config(config)
+            .build();
+        let from_default = default_processor.process(&request(input)).await;
+        assert_eq!(
+            from_factory.wire_types(),
+            from_default.wire_types(),
+            "injecting a factory must not change the emitted event stream"
         );
     }
 }
