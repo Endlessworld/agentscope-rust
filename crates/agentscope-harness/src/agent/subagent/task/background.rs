@@ -36,11 +36,20 @@ impl BackgroundTask {
         agent_id: String,
         handle: Option<tokio::task::JoinHandle<()>>,
     ) -> Arc<Self> {
+        Self::new_at(task_id, agent_id, now_millis(), handle)
+    }
+
+    fn new_at(
+        task_id: String,
+        agent_id: String,
+        created_at: u64,
+        handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> Arc<Self> {
         let now = now_millis();
         Arc::new(Self {
             task_id,
             agent_id,
-            created_at: now,
+            created_at,
             last_checked_at: AtomicU64::new(now),
             cancelled: AtomicBool::new(false),
             handle: Mutex::new(handle),
@@ -78,6 +87,39 @@ impl BackgroundTask {
     ) -> Arc<Self> {
         let bt = Self::new(task_id.into(), agent_id.into(), None);
         bt.set_done(result);
+        bt
+    }
+
+    /// Rebuilds a task from its durable record, preserving the persisted `created_at` and the
+    /// exact lifecycle status.
+    ///
+    /// Both matter for reporting: a reconstructed task that starts from "now" makes every
+    /// listing claim the task was just created, and collapsing `Cancelled` into a failed result
+    /// makes an explicit cancellation indistinguishable from an execution error.
+    pub fn from_record(
+        task_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        created_at: u64,
+        status: TaskStatus,
+        result: Option<String>,
+        error_message: Option<String>,
+    ) -> Arc<Self> {
+        let bt = Self::new_at(task_id.into(), agent_id.into(), created_at, None);
+        match status {
+            TaskStatus::Completed => bt.set_done(Ok(result.unwrap_or_default())),
+            TaskStatus::Cancelled => {
+                bt.cancelled.store(true, Ordering::Relaxed);
+                bt.set_done(Err(
+                    error_message.unwrap_or_else(|| "task cancelled".to_string())
+                ));
+            }
+            TaskStatus::Failed => {
+                bt.set_done(Err(error_message.unwrap_or_else(|| "Failed".to_string())))
+            }
+            // Nothing is executing any more, but the record is the only truth left: report the
+            // task exactly as the record describes it instead of inventing a failure.
+            TaskStatus::Pending | TaskStatus::Running => {}
+        }
         bt
     }
 
@@ -253,5 +295,73 @@ impl BackgroundTask {
             st = guard;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_record_preserves_created_at() {
+        // Regression: a record rebuilt for a listing used to start from "now", so every
+        // `task_list` reported the task as created at the moment of the listing.
+        let created = 1_700_000_000_000u64;
+        let task = BackgroundTask::from_record(
+            "t1",
+            "sub",
+            created,
+            TaskStatus::Completed,
+            Some("done".into()),
+            None,
+        );
+        assert_eq!(task.created_at(), created);
+        assert_eq!(task.get_task_status(), TaskStatus::Completed);
+        assert_eq!(task.get_result().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn from_record_keeps_a_cancelled_task_cancelled() {
+        // Regression: non-completed records were all folded into `Failed`, so an explicit
+        // cancellation was indistinguishable from an execution error.
+        let task = BackgroundTask::from_record(
+            "t1",
+            "sub",
+            1_700_000_000_000,
+            TaskStatus::Cancelled,
+            None,
+            None,
+        );
+        assert_eq!(task.get_task_status(), TaskStatus::Cancelled);
+        assert_eq!(task.get_status_string(), "Cancelled");
+        assert_eq!(task.get_error().as_deref(), Some("task cancelled"));
+    }
+
+    #[test]
+    fn from_record_keeps_failure_details() {
+        let task = BackgroundTask::from_record(
+            "t1",
+            "sub",
+            1_700_000_000_000,
+            TaskStatus::Failed,
+            None,
+            Some("boom".into()),
+        );
+        assert_eq!(task.get_task_status(), TaskStatus::Failed);
+        assert_eq!(task.get_error().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn from_record_does_not_turn_a_live_record_into_a_failure() {
+        let task = BackgroundTask::from_record(
+            "t1",
+            "sub",
+            1_700_000_000_000,
+            TaskStatus::Running,
+            None,
+            None,
+        );
+        assert_eq!(task.get_task_status(), TaskStatus::Running);
+        assert!(!task.is_completed());
     }
 }

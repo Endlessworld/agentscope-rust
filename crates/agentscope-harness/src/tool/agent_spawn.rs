@@ -22,7 +22,7 @@ use crate::agent::subagent::task::background::BackgroundTask;
 use crate::agent::subagent::task::repository::TaskRepository;
 use crate::agent::subagent::task::spec::TaskRunSpec;
 use crate::agent::subagent::task::{task_session_key_from_runtime, RemoteSubmitContext};
-use crate::agent::subagent::SubagentDeclaration;
+use crate::agent::subagent::{SubagentDeclaration, SubagentSessionRepair};
 
 /// A subagent instance spawned by [`AgentSpawnTool`], addressable via its
 /// `agent_key` (and optionally its `label`) for follow-up `agent_send` turns.
@@ -31,6 +31,8 @@ pub struct SpawnedAgent {
     pub session_id: String,
     pub label: Option<String>,
     pub agent: Arc<dyn CallableAgent>,
+    /// Settles a session left unusable by a cancelled turn, when the factory supplies one.
+    pub repair: Option<Arc<dyn SubagentSessionRepair>>,
 }
 
 /// Spawns registered subagents as tool invocations.
@@ -105,6 +107,7 @@ impl AgentSpawnTool {
         agent_id: &str,
         label: Option<&str>,
         agent: Arc<dyn CallableAgent>,
+        repair: Option<Arc<dyn SubagentSessionRepair>>,
     ) -> (String, String) {
         let uuid = uuid::Uuid::new_v4();
         let key = format!("agent:{agent_id}:{uuid}");
@@ -122,6 +125,7 @@ impl AgentSpawnTool {
                 session_id: session_id.clone(),
                 label: label.map(str::to_string),
                 agent,
+                repair,
             },
         );
         (key, session_id)
@@ -167,12 +171,19 @@ impl AgentSpawnTool {
         out
     }
 
-    fn live_agent(&self, key: &str) -> Option<(String, Arc<dyn CallableAgent>)> {
+    fn live_agent(
+        &self,
+        key: &str,
+    ) -> Option<(
+        String,
+        Arc<dyn CallableAgent>,
+        Option<Arc<dyn SubagentSessionRepair>>,
+    )> {
         self.live
             .lock()
             .unwrap()
             .get(key)
-            .map(|s| (s.agent_id.clone(), Arc::clone(&s.agent)))
+            .map(|s| (s.agent_id.clone(), Arc::clone(&s.agent), s.repair.clone()))
     }
 
     /// Next background task id for `kind` (`spawn` / `send`).
@@ -291,9 +302,9 @@ impl Tool for AgentSpawnTool {
         let local_agent = if remote.is_none() {
             match self
                 .manager
-                .create_agent_if_present(&agent_id, &ctx_runtime(&ctx))
+                .create_agent_with_repair_if_present(&agent_id, &ctx_runtime(&ctx))
             {
-                Some(a) => Some(a),
+                Some(pair) => Some(pair),
                 None => {
                     return Ok(ToolResultBlock::error(format!(
                         "No spawnable subagent named '{agent_id}' is registered."
@@ -321,12 +332,16 @@ impl Tool for AgentSpawnTool {
         let spec = if let Some(decl) = remote {
             remote_spec(decl, &agent_id, &effective_prompt)
         } else {
-            let exec_agent = local_agent.expect("local agent");
-            let (key, child_session) =
-                self.register_live(&agent_id, label.as_deref(), Arc::clone(&exec_agent));
+            let (exec_agent, repair) = local_agent.expect("local agent");
+            let (key, child_session) = self.register_live(
+                &agent_id,
+                label.as_deref(),
+                Arc::clone(&exec_agent),
+                repair.clone(),
+            );
             header = format!("{}\n", spawn_header(&key, &agent_id, &child_session));
             TaskRunSpec::Adopted {
-                future: tokio::spawn(run_child_turn(exec_agent, effective_prompt)),
+                future: tokio::spawn(run_child_turn(exec_agent, repair, effective_prompt)),
             }
         };
 
@@ -357,9 +372,33 @@ impl Tool for AgentSpawnTool {
 }
 
 /// Drives one child turn to completion inside its background task.
-async fn run_child_turn(agent: Arc<dyn CallableAgent>, prompt: String) -> Result<String> {
-    let msg = agent.call(vec![Msg::user(prompt)]).await?;
-    Ok(msg.text_content())
+async fn run_child_turn(
+    agent: Arc<dyn CallableAgent>,
+    repair: Option<Arc<dyn SubagentSessionRepair>>,
+    prompt: String,
+) -> Result<String> {
+    match agent.call(vec![Msg::user(prompt.clone())]).await {
+        Ok(msg) => Ok(msg.text_content()),
+        // A turn cancelled mid-tool leaves an unknown outcome in the journal, which makes every
+        // later open of that session fail. Settle it (recording `interrupted`, never success)
+        // and replay this prompt once instead of leaving the `agent_key` permanently unusable.
+        Err(err) => match repair {
+            Some(repair) if is_unreconciled(&err) => {
+                repair.repair().await?;
+                let msg = agent.call(vec![Msg::user(prompt)]).await?;
+                Ok(msg.text_content())
+            }
+            _ => Err(err),
+        },
+    }
+}
+
+/// Whether a call was refused because the journal still holds an unknown tool outcome.
+fn is_unreconciled(error: &agentscope_core::Error) -> bool {
+    matches!(
+        error,
+        agentscope_core::Error::Session(message) if message.contains("reconciliation required")
+    )
 }
 
 /// The identity header every spawn response starts with, mirroring the Java
@@ -449,7 +488,7 @@ impl Tool for AgentSendTool {
             Ok(k) => k,
             Err(e) => return Ok(ToolResultBlock::error(e)),
         };
-        let Some((agent_id, agent)) = self.spawn.live_agent(&key) else {
+        let Some((agent_id, agent, repair)) = self.spawn.live_agent(&key) else {
             return Ok(ToolResultBlock::error(format!(
                 "Error: Unknown or expired agent_key: {key}. Use agent_list to see active subagents."
             )));
@@ -470,7 +509,7 @@ impl Tool for AgentSendTool {
             &agent_id,
             &session_id,
             TaskRunSpec::Adopted {
-                future: tokio::spawn(run_child_turn(agent, message)),
+                future: tokio::spawn(run_child_turn(agent, repair, message)),
             },
         )
         .await;
@@ -542,6 +581,145 @@ impl Tool for AgentListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    use agentscope_core::agent::Agent;
+    use agentscope_core::formatter::JsonSchema;
+    use agentscope_core::state::AgentState;
+    use agentscope_core::tool::Toolkit;
+
+    /// A child whose first turn is refused because the journal still holds an unknown tool
+    /// outcome (what an aborted turn leaves behind).
+    struct UnreconciledOnce {
+        calls: AtomicUsize,
+        toolkit: Toolkit,
+    }
+
+    #[async_trait]
+    impl Agent for UnreconciledOnce {
+        fn agent_id(&self) -> &str {
+            "child"
+        }
+        fn name(&self) -> &str {
+            "child"
+        }
+        fn description(&self) -> &str {
+            "child"
+        }
+        fn interrupt(&self) {}
+        fn agent_state(&self) -> AgentState {
+            AgentState::default()
+        }
+        fn toolkit(&self) -> &Toolkit {
+            &self.toolkit
+        }
+    }
+
+    #[async_trait]
+    impl CallableAgent for UnreconciledOnce {
+        async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(agentscope_core::Error::Session(
+                    "session log: Explicit reconciliation required for unknown tool outcomes: \
+                     {\"call-1\"}"
+                        .into(),
+                ))
+            } else {
+                Ok(Msg::assistant("recovered"))
+            }
+        }
+        async fn call_with_schema(&self, messages: Vec<Msg>, _schema: JsonSchema) -> Result<Msg> {
+            self.call(messages).await
+        }
+    }
+
+    /// Counts repair invocations so the test can see the hook actually ran.
+    struct CountingRepair(Arc<AtomicUsize>);
+
+    impl SubagentSessionRepair for CountingRepair {
+        fn repair(&self) -> futures::future::BoxFuture<'_, Result<bool>> {
+            let count = Arc::clone(&self.0);
+            Box::pin(async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_session_is_repaired_and_the_prompt_replayed() {
+        // Regression: a cancelled subagent turn leaves an unknown tool outcome in its journal.
+        // Every later `agent_send` to that `agent_key` then failed with "reconciliation
+        // required", so the subagent was permanently unusable.
+        let repairs = Arc::new(AtomicUsize::new(0));
+        let agent: Arc<dyn CallableAgent> = Arc::new(UnreconciledOnce {
+            calls: AtomicUsize::new(0),
+            toolkit: Toolkit::new(),
+        });
+
+        let out = run_child_turn(
+            agent,
+            Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
+            "go".to_string(),
+        )
+        .await
+        .expect("the replayed turn must succeed");
+
+        assert_eq!(out, "recovered");
+        assert_eq!(repairs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_failure_is_not_papered_over_by_a_repair() {
+        struct AlwaysFails(Toolkit);
+
+        #[async_trait]
+        impl Agent for AlwaysFails {
+            fn agent_id(&self) -> &str {
+                "child"
+            }
+            fn name(&self) -> &str {
+                "child"
+            }
+            fn description(&self) -> &str {
+                "child"
+            }
+            fn interrupt(&self) {}
+            fn agent_state(&self) -> AgentState {
+                AgentState::default()
+            }
+            fn toolkit(&self) -> &Toolkit {
+                &self.0
+            }
+        }
+
+        #[async_trait]
+        impl CallableAgent for AlwaysFails {
+            async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
+                Err(agentscope_core::Error::Agent("boom".into()))
+            }
+            async fn call_with_schema(
+                &self,
+                messages: Vec<Msg>,
+                _schema: JsonSchema,
+            ) -> Result<Msg> {
+                self.call(messages).await
+            }
+        }
+
+        let repairs = Arc::new(AtomicUsize::new(0));
+        let agent: Arc<dyn CallableAgent> = Arc::new(AlwaysFails(Toolkit::new()));
+        let err = run_child_turn(
+            agent,
+            Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
+            "go".to_string(),
+        )
+        .await
+        .expect_err("a non-journal failure must propagate");
+
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(repairs.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn remote_spec_maps_declaration_fields() {

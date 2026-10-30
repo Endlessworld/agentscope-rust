@@ -16,7 +16,7 @@ pub mod materialize;
 pub mod protocol;
 pub mod task;
 
-pub use entry::{SubagentEntry, SubagentFactory};
+pub use entry::{SubagentEntry, SubagentFactory, SubagentSessionRepair};
 pub use loader::{
     load_from_directory, load_from_file, load_from_filesystem, parse, SUBAGENTS_DIR, SUBAGENT_GLOB,
 };

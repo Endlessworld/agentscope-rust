@@ -7,7 +7,9 @@ use agentscope_core::agent::{CallableAgent, RuntimeContext};
 use agentscope_core::error::Result;
 use agentscope_core::message::Msg;
 
-use super::{SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode};
+use super::{
+    SubagentDeclaration, SubagentEntry, SubagentFactory, SubagentMode, SubagentSessionRepair,
+};
 
 /// Registry of subagent factories keyed by agent id, mirroring `DefaultAgentManager`.
 pub struct DefaultAgentManager {
@@ -52,6 +54,20 @@ impl DefaultAgentManager {
         agent_id: &str,
         parent_rc: &RuntimeContext,
     ) -> Option<Arc<dyn CallableAgent>> {
+        self.create_agent_with_repair_if_present(agent_id, parent_rc)
+            .map(|(agent, _)| agent)
+    }
+
+    /// Like [`Self::create_agent_if_present`], but also returns the instance's session repair
+    /// hook so a cancelled run can be reconciled before the next turn.
+    pub fn create_agent_with_repair_if_present(
+        &self,
+        agent_id: &str,
+        parent_rc: &RuntimeContext,
+    ) -> Option<(
+        Arc<dyn CallableAgent>,
+        Option<Arc<dyn SubagentSessionRepair>>,
+    )> {
         if agent_id.is_empty() {
             return None;
         }
@@ -59,7 +75,7 @@ impl DefaultAgentManager {
         if self.is_primary_only(agent_id) {
             return None;
         }
-        Some(factory.create(parent_rc))
+        Some(factory.create_with_repair(parent_rc))
     }
 
     /// Whether `agent_id` is registered with a PRIMARY-only declaration.

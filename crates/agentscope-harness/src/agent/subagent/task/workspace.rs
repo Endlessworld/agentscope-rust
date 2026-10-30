@@ -253,14 +253,14 @@ impl WorkspaceTaskRepository {
     }
 
     fn synthetic_from_record(&self, rec: &TaskRecord) -> Arc<BackgroundTask> {
-        let result = match rec.status {
-            TaskStatus::Completed => Ok(rec.result.clone().unwrap_or_default()),
-            _ => Err(rec
-                .error_message
-                .clone()
-                .unwrap_or_else(|| rec.status.as_str().to_string())),
-        };
-        BackgroundTask::from_result(rec.task_id.clone(), rec.sub_agent_id.clone(), result)
+        BackgroundTask::from_record(
+            rec.task_id.clone(),
+            rec.sub_agent_id.clone(),
+            rec.created_at,
+            rec.status,
+            rec.result.clone(),
+            rec.error_message.clone(),
+        )
     }
 }
 
@@ -1695,6 +1695,48 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         let rec = read_records(fs.as_ref(), &ctx, &tasks_path("parent", "sess")).await;
         assert_eq!(rec["t-sup"].status, TaskStatus::Completed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_reports_the_recorded_creation_time_and_cancel_status() {
+        // Regression: tasks rebuilt for a listing restarted their clock at "now" and folded a
+        // cancelled record into a failure, so `task_list` and `task_output` disagreed.
+        let (dir, fs) = temp_fs("list_fidelity");
+        let ctx = RuntimeContext::default();
+        let path = tasks_path("parent", "sess");
+        let mut map = BTreeMap::new();
+
+        let mut cancelled = TaskRecord::new("cancelled", "sub1", "parent", "sess");
+        cancelled.status = TaskStatus::Cancelled;
+        cancelled.cancel_requested = true;
+        cancelled.created_at = 1_600_000_000_000;
+        map.insert("cancelled".to_string(), cancelled);
+
+        let mut done = TaskRecord::new("done", "sub1", "parent", "sess");
+        done.status = TaskStatus::Completed;
+        done.result = Some("ok".into());
+        done.created_at = 1_600_000_123_456;
+        map.insert("done".to_string(), done);
+
+        write_records(fs.as_ref(), &ctx, &path, &map).await;
+
+        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        let tasks = repo.list_tasks(&ctx, "sess", None).await;
+        let find = |id: &str| {
+            tasks
+                .iter()
+                .find(|t| t.task_id() == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        assert_eq!(find("cancelled").created_at(), 1_600_000_000_000);
+        assert_eq!(
+            find("cancelled").get_task_status(),
+            TaskStatus::Cancelled,
+            "a cancelled task must not be reported as failed"
+        );
+        assert_eq!(find("done").created_at(), 1_600_000_123_456);
+        assert_eq!(find("done").get_task_status(), TaskStatus::Completed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

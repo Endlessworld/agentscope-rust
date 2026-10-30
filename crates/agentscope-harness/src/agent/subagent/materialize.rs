@@ -10,7 +10,7 @@ use agentscope_core::model::{GenerateOptions, Model};
 use agentscope_core::state::AgentStateStore;
 use agentscope_core::tool::Toolkit;
 
-use super::{SubagentDeclaration, SubagentFactory, SubagentWorkspaceMode};
+use super::{SubagentDeclaration, SubagentFactory, SubagentSessionRepair, SubagentWorkspaceMode};
 use crate::agent::memory::compaction::CompactionConfig;
 use crate::agent::memory::{MemoryConfig, ToolResultEvictionConfig};
 use crate::agent::skill::SkillFilter;
@@ -536,6 +536,51 @@ impl SubagentFactory for LeafFactory {
     fn create(&self, parent_rc: &RuntimeContext) -> Arc<dyn CallableAgent> {
         Arc::new(self.build(parent_rc))
     }
+
+    fn create_with_repair(
+        &self,
+        parent_rc: &RuntimeContext,
+    ) -> (
+        Arc<dyn CallableAgent>,
+        Option<Arc<dyn SubagentSessionRepair>>,
+    ) {
+        let agent = Arc::new(self.build(parent_rc));
+        let repair = Arc::new(HarnessSessionRepair {
+            agent: Arc::clone(&agent),
+        });
+        (agent, Some(repair))
+    }
+}
+
+/// Session repair for one instance built by [`LeafFactory`].
+///
+/// A cancelled subagent turn is aborted mid-flight, so the tool it was running may never
+/// produce a result. The journal keeps that call as an unknown outcome and refuses to open the
+/// session again until it is settled. Repairing through `abandon_turn` records the unknown
+/// outcomes as `interrupted` (never as success) so the same `agent_key` stays usable.
+struct HarnessSessionRepair {
+    agent: Arc<HarnessAgent>,
+}
+
+impl SubagentSessionRepair for HarnessSessionRepair {
+    fn repair(&self) -> futures::future::BoxFuture<'_, agentscope_core::error::Result<bool>> {
+        Box::pin(async move {
+            // No journal means nothing can be unsettled: a child without session persistence
+            // has no unknown tool outcome to reconcile.
+            let Ok(log) = self.agent.session_log(&RuntimeContext::default()).await else {
+                return Ok(false);
+            };
+            let turns = agentscope_core::session::SessionTurns::read(&*log).await?;
+            let Some(latest) = turns.latest() else {
+                return Ok(false);
+            };
+            if latest.ended() {
+                return Ok(false);
+            }
+            let turn_id = latest.turn_id.clone();
+            agentscope_core::session::abandon_turn(log, &turn_id).await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +677,124 @@ mod tests {
             .general_purpose_leaf()
             .build(&RuntimeContext::new());
         assert!(child.disable_session_persistence());
+    }
+
+    #[tokio::test]
+    async fn a_leaf_factory_hands_out_a_session_repair_hook() {
+        // Regression: nothing repaired the journal of a cancelled child, so the unknown tool
+        // outcome it left behind made every later `agent_send` to that key fail.
+        let factory = blueprint(false).general_purpose_leaf();
+        let (_agent, repair) = factory.create_with_repair(&RuntimeContext::new());
+        assert!(repair.is_some(), "a persisted leaf must be repairable");
+    }
+
+    #[tokio::test]
+    async fn repairing_a_clean_session_is_a_no_op() {
+        let factory = blueprint(false).general_purpose_leaf();
+        let (_agent, repair) = factory.create_with_repair(&RuntimeContext::new());
+        let repaired = repair.expect("hook present").repair().await.unwrap();
+        assert!(
+            !repaired,
+            "a session with no open turn has nothing to settle"
+        );
+    }
+
+    #[tokio::test]
+    async fn repairing_a_child_without_session_persistence_is_a_no_op() {
+        // No journal means no unknown outcome: the hook must not turn "nothing to repair"
+        // into an error the caller has to handle.
+        let mut blueprint = (*blueprint(false)).clone();
+        blueprint.disable_session_persistence = true;
+        let factory = Arc::new(blueprint).general_purpose_leaf();
+        let (_agent, repair) = factory.create_with_repair(&RuntimeContext::new());
+        let repaired = repair.expect("hook present").repair().await.unwrap();
+        assert!(!repaired);
+    }
+
+    #[tokio::test]
+    async fn session_repair_settles_a_turn_aborted_mid_tool() {
+        use agentscope_core::session::{InMemorySessionLogStore, SessionEvent, SessionLogStore};
+
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_subagent_repair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn SessionLogStore> = Arc::new(InMemorySessionLogStore::new());
+        let agent = Arc::new(
+            HarnessAgent::builder()
+                .name("child")
+                .model(Arc::new(StubModel) as Arc<dyn Model>)
+                .cwd(dir.clone())
+                .workspace(dir.join("ws"))
+                .session_log_store(Arc::clone(&store))
+                .max_iters(2)
+                .build(),
+        );
+        let ctx = RuntimeContext::new();
+        let log = agent.session_log(&ctx).await.expect("journal");
+
+        // What an aborted subagent turn actually leaves behind: a dispatched tool call with no
+        // result.
+        let state = agentscope_core::state::AgentState::builder().build();
+        let checkpoint = serde_json::json!({ "stateJson": state.to_json().unwrap() });
+        let events: Vec<SessionEvent> = vec![
+            SessionEvent::new(
+                "e1",
+                1,
+                0,
+                "state/checkpoint",
+                None,
+                None,
+                true,
+                checkpoint.to_string(),
+            )
+            .unwrap(),
+            SessionEvent::new(
+                "e2",
+                2,
+                0,
+                "run/start",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                "{}",
+            )
+            .unwrap(),
+            SessionEvent::new(
+                "e3",
+                3,
+                0,
+                "tool/dispatch",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                r#"{"toolCallId":"call-1"}"#,
+            )
+            .unwrap(),
+        ];
+        let writer = log
+            .acquire("run-0", std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        log.commit(&writer, "seed", 0, &events).await.unwrap();
+        log.release(&writer).await.unwrap();
+
+        // The session refuses to open while the outcome stays unknown.
+        let err = agent.call(vec![Msg::user("hi")]).await.unwrap_err();
+        assert!(err.to_string().contains("reconciliation required"), "{err}");
+
+        let repair = HarnessSessionRepair {
+            agent: Arc::clone(&agent),
+        };
+        assert!(
+            repair.repair().await.unwrap(),
+            "the open turn must be closed"
+        );
+
+        // Repaired: the same instance accepts a prompt again.
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A stub distinguishable by `model_name`.
