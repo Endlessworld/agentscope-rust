@@ -15,7 +15,7 @@
 //! Keeping SQL as `(text, params)` lets the concrete stores own the schema and all
 //! statement semantics, exactly like the Java module.
 
-use crate::error::PgResult;
+use crate::error::{PgResult, PostgresError};
 
 /// A value bound into a SQL statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +131,48 @@ impl QueryOutcome {
     }
 }
 
+/// A single `(sql, params)` statement, used by
+/// [`PostgresClient::execute_in_transaction`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlStatement {
+    pub sql: String,
+    pub params: Vec<SqlValue>,
+}
+
+impl SqlStatement {
+    pub fn new(sql: impl Into<String>, params: Vec<SqlValue>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+        }
+    }
+}
+
+/// A **dedicated** PostgreSQL session (exactly one server connection) that can hold
+/// advisory locks.
+///
+/// PostgreSQL advisory locks are **session-scoped**: a lock is owned by the session that
+/// acquired it, is re-entrant *within* that session, keeps other sessions out, and is
+/// released when the session ends. Servicing `pg_try_advisory_lock` / `pg_advisory_unlock`
+/// over a client that arbitrarily multiplexes statements across connections (or reuses one
+/// shared connection for several logical leases) therefore silently breaks mutual exclusion
+/// — two "different" leases can end up in the same session and both "succeed".
+///
+/// Java obtains a fresh `Connection` per lease and closes it in `PostgresLease#close()`
+/// (`PostgresSandboxExecutionGuard`); this trait is the Rust equivalent.
+pub trait PostgresLockSession: Send + Sync + std::fmt::Debug {
+    /// `SELECT pg_try_advisory_lock($1)` on this session.
+    fn try_lock(&self, lock_name: i64) -> PgResult<bool>;
+
+    /// `SELECT pg_advisory_unlock($1)` on this session.
+    fn unlock(&self, lock_name: i64) -> PgResult<bool>;
+
+    /// Ends the session; the server releases every advisory lock it still holds.
+    ///
+    /// Mirrors Java `Connection#close()`. Must be idempotent.
+    fn close(&mut self);
+}
+
 /// A synchronous PostgreSQL client seam.
 ///
 /// Implementations must be cheaply cloneable (typically `Arc` inside) and safe to
@@ -143,4 +185,32 @@ pub trait PostgresClient: Send + Sync + std::fmt::Debug {
     ///
     /// Used for schema initialization DDL.
     fn execute_batch(&self, sql: &str) -> PgResult<()>;
+
+    /// Opens a **dedicated** session for advisory locks (see [`PostgresLockSession`]).
+    ///
+    /// The default implementation **fails explicitly**: a client that cannot hand out
+    /// independent sessions would make `pg_try_advisory_lock` report success for concurrent
+    /// leases in the same process, i.e. it would pretend to be a distributed lock. Callers
+    /// (`PostgresSandboxExecutionGuard`) propagate this error instead of degrading.
+    fn open_lock_session(&self) -> PgResult<Box<dyn PostgresLockSession>> {
+        Err(PostgresError::DriverUnavailable(format!(
+            "{self:?} does not support dedicated advisory-lock sessions; \
+             refusing to report a lock as acquired"
+        )))
+    }
+
+    /// Runs `statements` atomically on a **dedicated** connection (`BEGIN` … `COMMIT`),
+    /// rolling back on the first failure, and returns one outcome per statement in order.
+    ///
+    /// Mirrors Java `PostgresAgentStateStore#executeInWriteTransaction`. This is a
+    /// capability-style batch (not a closure) so the seam stays object-safe and free of
+    /// async-lifetime plumbing. The default implementation **fails explicitly** rather than
+    /// running the statements non-atomically behind the caller's back.
+    fn execute_in_transaction(&self, statements: &[SqlStatement]) -> PgResult<Vec<QueryOutcome>> {
+        let _ = statements;
+        Err(PostgresError::DriverUnavailable(format!(
+            "{self:?} does not support write transactions; refusing to run a multi-statement \
+             write non-atomically"
+        )))
+    }
 }

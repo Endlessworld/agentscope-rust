@@ -12,7 +12,7 @@ use agentscope_core::state::{list_hash, AgentStateStore};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::client::{Cell, PostgresClient, QueryOutcome, SqlValue};
+use crate::client::{Cell, PostgresClient, QueryOutcome, SqlStatement, SqlValue};
 use crate::error::{PgResult, PostgresError};
 use crate::sql::{
     ensure_version_column_ddl, qualified_table, sessions_ddl, validate_identifier,
@@ -375,6 +375,11 @@ impl PostgresAgentStateStore {
     }
 
     /// Synchronous list save with hash-based incremental append (mirrors Java's `save`).
+    ///
+    /// Both write shapes are multi-statement (delete + N inserts + hash row), so they go
+    /// through [`PostgresClient::execute_in_transaction`]: Java wraps the same work in
+    /// `executeInWriteTransaction`, and a half-applied rewrite would leave the list and its
+    /// `":_hash"` companion row out of sync forever.
     fn save_list_sync(&self, slot: &str, key: &str, values: &[Value]) -> PgResult<()> {
         if values.is_empty() {
             return Ok(());
@@ -387,71 +392,94 @@ impl PostgresAgentStateStore {
             list_hash::needs_full_rewrite(values, stored_hash.as_deref(), existing_count);
 
         if needs_full_rewrite {
-            self.delete_list_items_sync(slot, key)?;
-            self.insert_items_sync(slot, key, values, 0)?;
-            self.save_hash_sync(slot, &hash_key, &current_hash)?;
+            let mut statements = vec![Self::delete_list_items_stmt(&self.full_table, slot, key)];
+            statements.extend(Self::insert_items_stmts(
+                &self.full_table,
+                slot,
+                key,
+                values,
+                0,
+            )?);
+            statements.push(Self::save_hash_stmt(
+                &self.full_table,
+                slot,
+                &hash_key,
+                &current_hash,
+            ));
+            self.client.execute_in_transaction(&statements)?;
         } else if values.len() > existing_count {
-            let new_items = &values[existing_count..];
-            self.insert_items_sync(slot, key, new_items, existing_count)?;
-            self.save_hash_sync(slot, &hash_key, &current_hash)?;
+            let mut statements = Self::insert_items_stmts(
+                &self.full_table,
+                slot,
+                key,
+                &values[existing_count..],
+                existing_count,
+            )?;
+            statements.push(Self::save_hash_stmt(
+                &self.full_table,
+                slot,
+                &hash_key,
+                &current_hash,
+            ));
+            self.client.execute_in_transaction(&statements)?;
         }
         Ok(())
     }
 
-    fn delete_list_items_sync(&self, slot: &str, key: &str) -> PgResult<()> {
-        let sql = format!(
-            "DELETE FROM {} WHERE session_id = $1 AND state_key = $2",
-            self.full_table
-        );
-        let params = [SqlValue::text(slot), SqlValue::text(key)];
-        self.client.query(&sql, &params)?;
-        Ok(())
+    fn delete_list_items_stmt(full_table: &str, slot: &str, key: &str) -> SqlStatement {
+        SqlStatement::new(
+            format!("DELETE FROM {full_table} WHERE session_id = $1 AND state_key = $2"),
+            vec![SqlValue::text(slot), SqlValue::text(key)],
+        )
     }
 
-    fn insert_items_sync(
-        &self,
+    fn insert_items_stmts(
+        full_table: &str,
         slot: &str,
         key: &str,
         items: &[Value],
         start_index: usize,
-    ) -> PgResult<()> {
+    ) -> PgResult<Vec<SqlStatement>> {
         let sql = format!(
-            "INSERT INTO {} (session_id, state_key, item_index, state_data) VALUES ($1, $2, $3, $4)",
-            self.full_table
+            "INSERT INTO {full_table} (session_id, state_key, item_index, state_data) \
+             VALUES ($1, $2, $3, $4)"
         );
+        let mut statements = Vec::with_capacity(items.len());
         for (offset, item) in items.iter().enumerate() {
             let json = serde_json::to_string(item)
                 .map_err(|e| PostgresError::Encode(format!("list item encode failed: {e}")))?;
-            let params = [
-                SqlValue::text(slot),
-                SqlValue::text(key),
-                SqlValue::int((start_index + offset) as i32),
-                SqlValue::text(json),
-            ];
-            self.client.query(&sql, &params)?;
+            statements.push(SqlStatement::new(
+                sql.clone(),
+                vec![
+                    SqlValue::text(slot),
+                    SqlValue::text(key),
+                    SqlValue::int((start_index + offset) as i32),
+                    SqlValue::text(json),
+                ],
+            ));
         }
-        Ok(())
+        Ok(statements)
     }
 
-    fn save_hash_sync(&self, slot: &str, hash_key: &str, hash: &str) -> PgResult<()> {
+    fn save_hash_stmt(full_table: &str, slot: &str, hash_key: &str, hash: &str) -> SqlStatement {
         let now = chrono::Utc::now().timestamp_millis();
         let sql = format!(
-            "INSERT INTO {} (session_id, state_key, item_index, state_data, updated_at) \
+            "INSERT INTO {full_table} (session_id, state_key, item_index, state_data, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (session_id, state_key, item_index) DO UPDATE SET \
                  state_data = EXCLUDED.state_data, \
-                 updated_at = EXCLUDED.updated_at",
-            self.full_table
+                 updated_at = EXCLUDED.updated_at"
         );
-        let params = [
-            SqlValue::text(slot),
-            SqlValue::text(hash_key),
-            SqlValue::int(SINGLE_STATE_INDEX),
-            SqlValue::text(hash),
-            SqlValue::BigInt(now),
-        ];
-        self.client.query(&sql, &params)?;
-        Ok(())
+        SqlStatement::new(
+            sql,
+            vec![
+                SqlValue::text(slot),
+                SqlValue::text(hash_key),
+                SqlValue::int(SINGLE_STATE_INDEX),
+                SqlValue::text(hash),
+                SqlValue::BigInt(now),
+            ],
+        )
     }
 
     /// Truncates the whole session table (mirrors `truncateAllSessions`).
@@ -1162,6 +1190,133 @@ mod tests {
         let s = store(&c);
         s.save_list(None, "s1", "items", &[]).await;
         assert_eq!(c.session_row_count(), 0);
+    }
+
+    // Java: PostgresAgentStateStore#executeInWriteTransaction (see also
+    // `PostgresAgentStateStoreTest#executeInWriteTransactionRollsBackOnException`)
+    //
+    // `saveList`'s full-rewrite path is delete + N inserts + hash row. Java wraps it in
+    // `executeInWriteTransaction`; without a transaction a mid-way failure leaves the list
+    // truncated (or half rewritten) *and* the ":_hash" row stale, which the incremental
+    // append logic can never repair.
+    #[tokio::test]
+    async fn save_list_rolls_back_when_a_statement_fails_midway() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[json!(1), json!(2)])
+            .await;
+        assert_eq!(c.session_row_count(), 3);
+
+        // Full rewrite sequence: #1 get_sync, #2 list_count, #3 DELETE, #4/#5/#6 the three
+        // item INSERTs — fail the *third* insert (= the 6th query) so the DELETE and two
+        // inserts are already applied when the transaction aborts.
+        let before = c.query_count();
+        c.fail_query_after(5);
+        let err = s
+            .save_list_sync(&slot("s1"), "items", &[json!(9), json!(8), json!(7)])
+            .unwrap_err();
+        assert!(matches!(err, PostgresError::Query(_)), "got {err:?}");
+        assert_eq!(
+            c.query_count() - before,
+            6,
+            "the failure must land on the third item insert, not earlier"
+        );
+
+        // Nothing was applied: same rows, same content, same hash row.
+        assert_eq!(c.session_row_count(), 3);
+        assert_eq!(
+            s.get_list(None, "s1", "items").await,
+            vec![json!(1), json!(2)]
+        );
+        assert_eq!(
+            s.get_sync(
+                &slot("s1"),
+                &format!("items{HASH_KEY_SUFFIX}"),
+                SINGLE_STATE_INDEX
+            )
+            .unwrap()
+            .as_deref(),
+            Some(compute_hash(&[json!(1), json!(2)]).as_str())
+        );
+
+        // The store is still usable afterwards (no poisoned session).
+        s.save_list(None, "s1", "items", &[json!(1), json!(2), json!(3)])
+            .await;
+        assert_eq!(
+            s.get_list(None, "s1", "items").await,
+            vec![json!(1), json!(2), json!(3)]
+        );
+    }
+
+    // Java: PostgresAgentStateStore#executeInWriteTransaction — the append-only path
+    // (N inserts + hash row) is atomic too: a failure must not bump the hash row past the
+    // rows that were actually written.
+    #[tokio::test]
+    async fn save_list_append_rolls_back_when_the_hash_write_fails() {
+        let c = client();
+        let s = store(&c);
+        s.save_list(None, "s1", "items", &[json!(1)]).await;
+        assert_eq!(c.session_row_count(), 2);
+
+        // Append sequence: #1 get_sync, #2 list_count, #3 INSERT new item, #4 hash upsert
+        // (fails) — so the new item row has already been written when the abort happens.
+        let before = c.query_count();
+        c.fail_query_after(3);
+        assert!(s
+            .save_list_sync(&slot("s1"), "items", &[json!(1), json!(2)])
+            .is_err());
+        assert_eq!(
+            c.query_count() - before,
+            4,
+            "the failure must land on the hash upsert"
+        );
+
+        assert_eq!(c.session_row_count(), 2);
+        assert_eq!(s.get_list(None, "s1", "items").await, vec![json!(1)]);
+        assert_eq!(
+            s.get_sync(
+                &slot("s1"),
+                &format!("items{HASH_KEY_SUFFIX}"),
+                SINGLE_STATE_INDEX
+            )
+            .unwrap()
+            .as_deref(),
+            Some(compute_hash(&[json!(1)]).as_str())
+        );
+    }
+
+    // Explicit failure rather than a silent non-atomic write: a client that cannot run a
+    // write transaction makes the list save fail with `DriverUnavailable` (Java always has
+    // a `Connection`, so this branch is Rust-specific).
+    #[tokio::test]
+    async fn save_list_requires_transaction_support() {
+        /// Wraps a working client but does **not** implement `execute_in_transaction`.
+        #[derive(Debug)]
+        struct NoTransactionClient(Arc<MemoryClient>);
+
+        impl PostgresClient for NoTransactionClient {
+            fn query(&self, sql: &str, params: &[SqlValue]) -> PgResult<QueryOutcome> {
+                self.0.query(sql, params)
+            }
+            fn execute_batch(&self, sql: &str) -> PgResult<()> {
+                self.0.execute_batch(sql)
+            }
+        }
+
+        let inner = client();
+        let s = PostgresAgentStateStore::builder(Arc::new(NoTransactionClient(inner.clone())))
+            .create_if_not_exist(true)
+            .build()
+            .unwrap();
+        let err = s
+            .save_list_sync(&slot("s1"), "items", &[json!(1)])
+            .unwrap_err();
+        assert!(
+            matches!(err, PostgresError::DriverUnavailable(_)),
+            "got {err:?}"
+        );
+        // Nothing was written.
+        assert_eq!(inner.session_row_count(), 0);
     }
 
     // ---- truncate -----------------------------------------------------------

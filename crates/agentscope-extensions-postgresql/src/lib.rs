@@ -16,6 +16,15 @@
 //! [`MemoryClient`] is an in-memory SQL simulator used by this crate's tests, so the
 //! crate compiles and tests with **no live database**. The real driver adapter
 //! (`PgSimpleClient`, feature `postgres-driver`) wraps `tokio-postgres`.
+//!
+//! Two capabilities are **session-scoped** and therefore explicit on the seam:
+//! * [`PostgresClient::open_lock_session`] yields a dedicated connection per advisory-lock
+//!   lease (PG advisory locks belong to a session; sharing one would silently break mutual
+//!   exclusion — see [`guard`]).
+//! * [`PostgresClient::execute_in_transaction`] runs a multi-statement write atomically on a
+//!   dedicated connection (Java `executeInWriteTransaction`).
+//!
+//! Both default to an explicit [`PostgresError::DriverUnavailable`] instead of degrading.
 
 pub mod blocking;
 pub mod client;
@@ -33,7 +42,9 @@ mod murmur3;
 #[cfg(feature = "postgres-driver")]
 pub mod driver;
 
-pub use client::{Cell, PostgresClient, QueryOutcome, Row, SqlValue};
+pub use client::{
+    Cell, PostgresClient, PostgresLockSession, QueryOutcome, Row, SqlStatement, SqlValue,
+};
 pub use distributed::PostgresDistributedStore;
 pub use error::{PgResult, PostgresError};
 pub use guard::{

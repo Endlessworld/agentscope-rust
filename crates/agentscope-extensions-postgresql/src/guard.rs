@@ -11,6 +11,19 @@
 //! Mirrors the Java `PostgresSandboxExecutionGuard`: a 64-bit lock key is derived from
 //! the isolation key via a hash, acquired with `pg_try_advisory_lock` (polling until the
 //! timeout expires) and released with `pg_advisory_unlock`.
+//!
+//! # Session ownership (why leases open their own connection)
+//!
+//! `pg_try_advisory_lock` locks are **session-scoped** and **re-entrant inside a session**.
+//! Issuing them over a shared client (one `tokio_postgres::Client`, or a pool that may hand
+//! the same connection to two leases) makes two different leases land in the same session, so
+//! the second `pg_try_advisory_lock` "succeeds" and mutual exclusion silently disappears.
+//! Java avoids this by taking a dedicated `Connection` per lease
+//! (`PostgresSandboxExecutionGuard#tryEnter`) and closing it in `PostgresLease#close()`.
+//! This crate does the same through [`PostgresClient::open_lock_session`]: every
+//! [`PostgresSandboxLease`] owns exactly one [`PostgresLockSession`], and dropping the lease
+//! both unlocks and ends the session. A client that cannot provide dedicated sessions makes
+//! [`PostgresSandboxExecutionGuard::try_enter`] fail explicitly instead of pretending.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey, SandboxLease};
 
-use crate::client::{Cell, PostgresClient, QueryOutcome, SqlValue};
+use crate::client::{PostgresClient, PostgresLockSession};
 use crate::error::{PgResult, PostgresError};
 
 /// Default lock-key prefix, matching the Java `DEFAULT_KEY_PREFIX`.
@@ -118,19 +131,26 @@ impl PostgresSandboxExecutionGuard {
 
     /// Tries to acquire the advisory lock, polling until the timeout expires.
     ///
+    /// A **dedicated session** is opened for the attempt (Java `dataSource.getConnection()`);
+    /// it is kept alive for the whole lease and closed by [`PostgresSandboxLease::release`] /
+    /// `Drop`. On timeout or error the session is dropped, which ends it and releases any
+    /// lock it may have taken.
+    ///
     /// On success returns a [`PostgresSandboxLease`] whose [`Drop`] releases the lock.
     pub fn try_enter(&self, key: &SandboxIsolationKey) -> PgResult<PostgresSandboxLease> {
         let lock_name = self.compose_lock_key(key);
+        let session = self.client.open_lock_session()?;
         let deadline = Instant::now() + self.lock_timeout;
         loop {
-            if self.try_lock_once(lock_name)? {
+            if session.try_lock(lock_name)? {
                 return Ok(PostgresSandboxLease {
-                    client: Arc::clone(&self.client),
+                    session: Some(session),
                     lock_name,
                     released: false,
                 });
             }
             if Instant::now() >= deadline {
+                // Dropping `session` ends the connection: nothing is left held.
                 return Err(PostgresError::LockTimeout(format!(
                     "{lock_name} (timeout={}s)",
                     self.lock_timeout.as_secs()
@@ -140,39 +160,46 @@ impl PostgresSandboxExecutionGuard {
         }
     }
 
-    fn try_lock_once(&self, lock_name: i64) -> PgResult<bool> {
-        let sql = "SELECT pg_try_advisory_lock($1)";
-        let params = [SqlValue::BigInt(lock_name)];
-        match self.client.query(sql, &params)? {
-            QueryOutcome::Rows(rows) => Ok(rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(Cell::as_bool)
-                .unwrap_or(false)),
-            QueryOutcome::Affected(_) => Ok(false),
-        }
-    }
-
-    /// Releases a previously-acquired lock by key.
+    /// Releases the advisory lock identified by `lock_name` **if this guard retains a lease
+    /// for it** (i.e. it was acquired through [`SandboxGuard::try_enter`]).
+    ///
+    /// Returns `Ok(false)` when no retained lease matches. With session-scoped locks a foreign
+    /// session can never unlock (`pg_advisory_unlock` only succeeds for the owning session),
+    /// which is exactly Java's behaviour — it exposes no cross-lease release API at all.
     pub fn release(&self, lock_name: i64) -> PgResult<bool> {
-        let sql = "SELECT pg_advisory_unlock($1)";
-        let params = [SqlValue::BigInt(lock_name)];
-        match self.client.query(sql, &params)? {
-            QueryOutcome::Rows(rows) => Ok(rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(Cell::as_bool)
-                .unwrap_or(false)),
-            QueryOutcome::Affected(_) => Ok(false),
+        let lease = self.trait_leases.lock().ok().and_then(|mut leases| {
+            let matched_key = leases.iter().find_map(|(key, stack)| {
+                stack
+                    .iter()
+                    .any(|lease| lease.lock_name == lock_name)
+                    .then(|| key.clone())
+            })?;
+            let stack = leases.get_mut(&matched_key)?;
+            let index = stack.iter().position(|l| l.lock_name == lock_name)?;
+            let lease = stack.remove(index);
+            if stack.is_empty() {
+                leases.remove(&matched_key);
+            }
+            Some(lease)
+        });
+        match lease {
+            // Dropping the lease unlocks and ends its session.
+            Some(mut lease) => lease.release(),
+            None => Ok(false),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl SandboxGuard for PostgresSandboxExecutionGuard {
-    /// Acquires the advisory lock and retains the concrete [`PostgresSandboxLease`] until
-    /// `SandboxGuard::release` runs (a timed-out acquisition degrades to a no-op lease,
-    /// mirroring the JDBC guard's fallback).
+    /// Acquires the advisory lock on a dedicated session and retains the concrete
+    /// [`PostgresSandboxLease`] until `SandboxGuard::release` runs.
+    ///
+    /// The harness trait returns a `SandboxLease` with no error channel, so a failed
+    /// acquisition degrades to [`SandboxLease::noop`] — loudly (`error!` for a client without
+    /// session support, `warn!` for a timeout). The inherent
+    /// [`PostgresSandboxExecutionGuard::try_enter`] never degrades: it returns the error, so
+    /// callers that need hard mutual exclusion should use it directly.
     ///
     /// The acquire probe is synchronous and polls by sleeping, so it runs on a blocking
     /// thread: awaiting it directly would block a Tokio worker for the whole lock timeout.
@@ -186,6 +213,15 @@ impl SandboxGuard for PostgresSandboxExecutionGuard {
                     leases.entry(key.clone()).or_default().push(lease);
                 }
                 SandboxLease::new(key)
+            }
+            Ok(Err(PostgresError::DriverUnavailable(e))) => {
+                // Never pretend: this client cannot provide dedicated lock sessions.
+                tracing::error!(
+                    error = %e,
+                    "[postgres-guard] advisory locks unsupported by this client; \
+                     execution proceeds WITHOUT distributed exclusion"
+                );
+                SandboxLease::noop()
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "[postgres-guard] lock not acquired");
@@ -245,8 +281,12 @@ impl SandboxGuard for PostgresSandboxExecutionGuard {
 }
 
 /// A lease held on a PostgreSQL advisory lock; releases on drop.
+///
+/// It owns the **dedicated session** the lock was acquired on (Java `PostgresLease` holds the
+/// `Connection`): releasing unlocks *and* closes the session, so the server frees everything
+/// the session still holds even if the explicit unlock failed.
 pub struct PostgresSandboxLease {
-    client: Arc<dyn PostgresClient>,
+    session: Option<Box<dyn PostgresLockSession>>,
     lock_name: i64,
     released: bool,
 }
@@ -257,21 +297,28 @@ impl PostgresSandboxLease {
         self.lock_name
     }
 
-    /// Releases the lock; safe to call multiple times.
+    /// Whether this lease still owns a live session.
+    pub fn is_open(&self) -> bool {
+        !self.released && self.session.is_some()
+    }
+
+    /// Unlocks and closes the session; safe to call multiple times (the second call returns
+    /// `false`, mirroring Java `leaseCloseHandlesReleaseFailure`'s double-close expectations).
     pub fn release(&mut self) -> PgResult<bool> {
         if self.released {
             return Ok(false);
         }
         self.released = true;
-        let sql = "SELECT pg_advisory_unlock($1)";
-        let params = [SqlValue::BigInt(self.lock_name)];
-        match self.client.query(sql, &params)? {
-            QueryOutcome::Rows(rows) => Ok(rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(Cell::as_bool)
-                .unwrap_or(false)),
-            QueryOutcome::Affected(_) => Ok(false),
+        match self.session.take() {
+            Some(mut session) => {
+                // Always end the session, even if the explicit unlock fails: closing the
+                // connection is what actually guarantees the lock is gone (Java does the same
+                // in the `finally` block of `PostgresLease#close`).
+                let unlocked = session.unlock(self.lock_name);
+                session.close();
+                unlocked
+            }
+            None => Ok(false),
         }
     }
 }
@@ -287,6 +334,7 @@ impl std::fmt::Debug for PostgresSandboxLease {
         f.debug_struct("PostgresSandboxLease")
             .field("lock_name", &self.lock_name)
             .field("released", &self.released)
+            .field("session_open", &self.session.is_some())
             .finish()
     }
 }
@@ -294,15 +342,17 @@ impl std::fmt::Debug for PostgresSandboxLease {
 #[cfg(test)]
 mod tests {
     //! Offline unit tests mirroring `PostgresSandboxExecutionGuardTest` (JUnit5 + Mockito on
-    //! the Java side). `MemoryClient` models a PG session per client: `fork()` yields a
-    //! second "connection" over the same lock table, so re-entrancy, contention and release
-    //! can all be asserted without a live server.
+    //! the Java side). `MemoryClient` models PostgreSQL *sessions*: `fork()` shares the lock
+    //! table (same server, another client) while every `open_lock_session()` call yields a
+    //! distinct session, so re-entrancy, contention and release can all be asserted without a
+    //! live server.
     //!
     //! Note: the 64-bit lock key uses MurmurHash3 x64/128 hash[0], exactly as
     //! `PostgresSandboxExecutionGuard#composeLockKey` does, so Rust and Java interoperate
     //! on the same advisory-lock keys (see `crate::murmur3`).
 
     use super::*;
+    use crate::client::{QueryOutcome, SqlValue};
     use crate::memory::MemoryClient;
 
     fn client() -> Arc<MemoryClient> {
@@ -386,18 +436,119 @@ mod tests {
 
     // Java: PostgresSandboxExecutionGuardTest#tryEnterAcquiresLockAndReturnsLease
     #[test]
-    fn try_enter_acquires_and_reenters_same_connection() {
+    fn try_enter_acquires_lock_and_returns_lease() {
         let c = client();
         let g = PostgresSandboxExecutionGuard::new(c.clone());
         let k = key("session", "s1");
-        let lease = g.try_enter(&k).unwrap();
+        let mut lease = g.try_enter(&k).unwrap();
+        assert_eq!(lease.lock_name(), g.compose_lock_key(&k));
+        assert!(lease.is_open());
         assert_eq!(c.advisory_lock_count(), 1);
-        // PG advisory locks are re-entrant per session.
-        let lease2 = g.try_enter(&k).unwrap();
-        assert_eq!(lease.lock_name(), lease2.lock_name());
-        assert_eq!(g.release(lease.lock_name()).unwrap(), true);
-        drop(lease);
-        drop(lease2);
+        assert!(lease.release().unwrap());
+        assert_eq!(c.advisory_lock_count(), 0);
+    }
+
+    // Java: PostgresSandboxExecutionGuard#tryEnter opens a *dedicated* `Connection` per lease.
+    // Two leases for the same key therefore contend even inside one process; with a shared
+    // connection both would "succeed" (PG advisory locks are re-entrant per session) and
+    // mutual exclusion would silently disappear.
+    #[test]
+    fn distinct_leases_on_the_same_key_are_mutually_exclusive() {
+        let c = client();
+        let g = PostgresSandboxExecutionGuard::builder(c.clone())
+            .lock_timeout(Duration::from_millis(80))
+            .unwrap()
+            .build();
+        let k = key("session", "exclusive");
+        let first = g.try_enter(&k).unwrap();
+        let err = g.try_enter(&k).unwrap_err();
+        assert!(matches!(err, PostgresError::LockTimeout(_)));
+        assert_eq!(c.advisory_lock_count(), 1);
+
+        // Once the first lease is released (unlock + session close) the key is free again.
+        drop(first);
+        assert_eq!(c.advisory_lock_count(), 0);
+        let second = g.try_enter(&k).unwrap();
+        assert_eq!(second.lock_name(), g.compose_lock_key(&k));
+        assert_eq!(c.advisory_lock_count(), 1);
+    }
+
+    // Java: `pg_try_advisory_lock` is re-entrant *within* the owning session and
+    // `pg_advisory_unlock` peels one nesting level at a time — the seam models that faithfully.
+    #[test]
+    fn lock_session_is_reentrant_within_one_session() {
+        let c = client();
+        let mut session = c.open_lock_session().unwrap();
+        let name = 42;
+        assert!(session.try_lock(name).unwrap());
+        assert!(session.try_lock(name).unwrap(), "same session re-enters");
+        assert_eq!(c.advisory_lock_count(), 1);
+
+        // A different session is excluded while the owner holds it.
+        let mut other = c.fork().open_lock_session().unwrap();
+        assert!(!other.try_lock(name).unwrap());
+
+        // One unlock only drops one level: the lock is still held.
+        assert!(session.unlock(name).unwrap());
+        assert!(!other.try_lock(name).unwrap());
+
+        // The second unlock really frees it.
+        assert!(session.unlock(name).unwrap());
+        assert!(other.try_lock(name).unwrap());
+
+        // A non-owner cannot unlock someone else's lock.
+        assert!(!session.unlock(name).unwrap());
+
+        other.close();
+        session.close();
+    }
+
+    // Java: `PostgresLease#close()` closes the `Connection` in a `finally` block, so the lock
+    // is gone even without a successful `pg_advisory_unlock`.
+    #[test]
+    fn closing_a_lock_session_releases_every_lock_it_holds() {
+        let c = client();
+        let mut session = c.open_lock_session().unwrap();
+        assert!(session.try_lock(7).unwrap());
+        assert!(session.try_lock(9).unwrap());
+        assert_eq!(c.advisory_lock_count(), 2);
+
+        session.close();
+        assert_eq!(c.advisory_lock_count(), 0);
+        session.close(); // idempotent
+
+        // A closed session fails instead of pretending to hold a lock.
+        assert!(session.try_lock(7).is_err());
+
+        // Everything it held is now available to another session.
+        let mut other = c.open_lock_session().unwrap();
+        assert!(other.try_lock(7).unwrap());
+        other.close();
+    }
+
+    /// A client that can only offer a *shared* connection must make the guard fail loudly.
+    /// The default `PostgresClient::open_lock_session` returns `DriverUnavailable`, and the
+    /// guard must never fall back to running advisory SQL on the shared connection.
+    #[test]
+    fn client_without_dedicated_sessions_fails_loudly() {
+        #[derive(Debug)]
+        struct SharedOnlyClient;
+
+        impl PostgresClient for SharedOnlyClient {
+            fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+                unreachable!("advisory locks must not run on the shared connection")
+            }
+            fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+                Ok(())
+            }
+        }
+
+        let g = PostgresSandboxExecutionGuard::new(Arc::new(SharedOnlyClient));
+        let err = g.try_enter(&key("session", "no-session")).unwrap_err();
+        assert!(
+            matches!(err, PostgresError::DriverUnavailable(_)),
+            "expected an explicit failure, got {err:?}"
+        );
     }
 
     // Java: PostgresSandboxExecutionGuardTest#tryEnterTimesOutWhenLockNeverAcquired

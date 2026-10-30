@@ -26,6 +26,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 # Real PostgreSQL driver (optional, feature = "postgres-driver").
-tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+# `runtime` enables `Config::connect` / `tokio_postgres::connect` (they are feature-gated in
+# tokio-postgres 0.7; without it this optional module did not compile at all).
+tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1", "runtime"] }
 bytes = { version = "1", optional = true }
 

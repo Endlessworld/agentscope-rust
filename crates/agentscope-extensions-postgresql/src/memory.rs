@@ -4,16 +4,24 @@
 //! database. It recognises the exact statement shapes emitted by [`crate::store`],
 //! [`crate::state`], and [`crate::snapshot`] (dispatched on a normalised form of the
 //! SQL text) and simulates table state in `HashMap`s, including `ON CONFLICT`
-//! upserts, conditional CAS updates, `LIKE ... ESCAPE '!'` prefix search, and
-//! advisory locks.
+//! upserts, conditional CAS updates, `LIKE ... ESCAPE '!'` prefix search, advisory locks
+//! and write transactions (`execute_in_transaction` rolls the tables back on failure).
+//!
+//! Advisory locks are served **per session** ([`MemoryLockSession`]), never from the shared
+//! connection: PostgreSQL scopes such locks to the session that took them, so a fake that
+//! answered them on a shared client would happily "grant" the same lock to two leases and
+//! hide a real mutual-exclusion bug.
 //!
 //! It is intentionally **not** a general SQL engine; it only implements the
 //! behaviour the crate depends on.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::client::{Cell, PostgresClient, QueryOutcome, Row, SqlValue};
+use crate::client::{
+    Cell, PostgresClient, PostgresLockSession, QueryOutcome, Row, SqlStatement, SqlValue,
+};
 use crate::error::{PgResult, PostgresError};
 
 /// A row in the session-state table.
@@ -33,7 +41,7 @@ struct StoreRow {
     updated_at: i64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Tables {
     /// (session_id, state_key, item_index) -> row
     sessions: HashMap<(String, String, i32), SessionRow>,
@@ -41,9 +49,12 @@ struct Tables {
     store: HashMap<(String, String), StoreRow>,
     /// snapshot_id -> data
     snapshots: HashMap<String, Vec<u8>>,
-    /// Advisory locks held, keyed by lock name. Value is a token so the same
-    /// connection can re-acquire.
-    advisory_locks: HashMap<i64, String>,
+    /// Advisory locks held, keyed by lock name.
+    ///
+    /// PostgreSQL gives a lock key to exactly one *session* at a time, and that session may
+    /// re-enter it (`pg_try_advisory_lock` succeeds again, `pg_advisory_unlock` only drops
+    /// one level). `depth` models that nesting.
+    advisory_locks: HashMap<i64, LockHeld>,
     /// Schemas created via `CREATE SCHEMA IF NOT EXISTS "x"`.
     schemas: HashSet<String>,
     /// Unqualified names of tables created via `CREATE TABLE IF NOT EXISTS`.
@@ -52,28 +63,73 @@ struct Tables {
     ddl_statements: Vec<String>,
 }
 
+/// The session currently owning an advisory lock, plus its re-entrancy depth.
+#[derive(Debug, Clone)]
+struct LockHeld {
+    session: String,
+    depth: u32,
+}
+
 /// In-memory [`PostgresClient`] used for tests.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryClient {
     tables: Arc<Mutex<Tables>>,
-    /// A unique token representing this client's "connection" for advisory locks.
-    conn_token: String,
+    /// Test hook: the number of successful queries left before one is made to fail
+    /// (`Some(0)` fails the very next query). Kept outside [`Tables`] so a simulated
+    /// `ROLLBACK` does not re-arm it.
+    fail_queries: Arc<Mutex<Option<usize>>>,
+    /// Number of queries issued through [`PostgresClient::query`] (including failed ones).
+    /// Lets tests pin *where* an injected failure happened instead of relying on luck.
+    queries: Arc<AtomicUsize>,
 }
 
 impl MemoryClient {
     pub fn new() -> Self {
         Self {
             tables: Arc::new(Mutex::new(Tables::default())),
-            conn_token: uuid::Uuid::new_v4().to_string(),
+            fail_queries: Arc::new(Mutex::new(None)),
+            queries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Creates a *separate* client over the *same* tables (simulating a second
-    /// connection/JVM): useful for CAS and lock concurrency tests.
+    /// Creates a *separate* client over the *same* tables (simulating a second database
+    /// user / JVM): useful for CAS and lock concurrency tests.
+    ///
+    /// Advisory locks are **not** shared through this token: each lease opens its own
+    /// session via [`PostgresClient::open_lock_session`], exactly like a real connection.
     pub fn fork(&self) -> Self {
         Self {
             tables: Arc::clone(&self.tables),
-            conn_token: uuid::Uuid::new_v4().to_string(),
+            fail_queries: Arc::new(Mutex::new(None)),
+            queries: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Test hook: makes the `n`-th query from now on fail (`n = 0` fails the next one).
+    ///
+    /// Used to prove that a multi-statement write routed through
+    /// [`PostgresClient::execute_in_transaction`] leaves no partial rows behind.
+    pub fn fail_query_after(&self, n: usize) {
+        *self.fail_queries.lock().unwrap() = Some(n);
+    }
+
+    /// How many queries have been issued so far (test hook).
+    pub fn query_count(&self) -> usize {
+        self.queries.load(Ordering::SeqCst)
+    }
+
+    fn should_fail(&self) -> bool {
+        let mut remaining = self.fail_queries.lock().unwrap();
+        match *remaining {
+            Some(0) => {
+                *remaining = None;
+                true
+            }
+            Some(n) => {
+                *remaining = Some(n - 1);
+                false
+            }
+            None => false,
         }
     }
 
@@ -237,32 +293,26 @@ impl MemoryClient {
 
 impl PostgresClient for MemoryClient {
     fn query(&self, sql: &str, params: &[SqlValue]) -> PgResult<QueryOutcome> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        if self.should_fail() {
+            return Err(PostgresError::Query(
+                "MemoryClient: injected query failure (test hook)".into(),
+            ));
+        }
         let n = Self::normalize(sql);
         let mut t = self.tables.lock().unwrap();
 
         // ---- advisory locks ----
-        if n.starts_with("SELECT PG_TRY_ADVISORY_LOCK") {
-            let key = Self::i64_of(params, 0);
-            match t.advisory_locks.get(&key) {
-                None => {
-                    t.advisory_locks.insert(key, self.conn_token.clone());
-                    return Ok(QueryOutcome::Rows(vec![vec![Cell::Bool(true)]]));
-                }
-                Some(owner) if owner == &self.conn_token => {
-                    return Ok(QueryOutcome::Rows(vec![vec![Cell::Bool(true)]]));
-                }
-                _ => return Ok(QueryOutcome::Rows(vec![vec![Cell::Bool(false)]])),
-            }
-        }
-        if n.starts_with("SELECT PG_ADVISORY_UNLOCK") {
-            let key = Self::i64_of(params, 0);
-            match t.advisory_locks.get(&key).cloned() {
-                Some(owner) if owner == self.conn_token => {
-                    t.advisory_locks.remove(&key);
-                    return Ok(QueryOutcome::Rows(vec![vec![Cell::Bool(true)]]));
-                }
-                _ => return Ok(QueryOutcome::Rows(vec![vec![Cell::Bool(false)]])),
-            }
+        // Advisory locks belong to a *session*, so they can only be served by a dedicated
+        // lock session ([`PostgresClient::open_lock_session`]). Answering them on the shared
+        // connection would report success to several logical leases at once — i.e. a fake
+        // distributed lock — so this is an explicit error instead.
+        if n.starts_with("SELECT PG_TRY_ADVISORY_LOCK")
+            || n.starts_with("SELECT PG_ADVISORY_UNLOCK")
+        {
+            return Err(PostgresError::DriverUnavailable(
+                "advisory locks must be taken on a dedicated session (open_lock_session)".into(),
+            ));
         }
 
         // ---- session state: upsert (save / save_hash) ----
@@ -665,6 +715,104 @@ impl PostgresClient for MemoryClient {
             }
         }
         Ok(())
+    }
+
+    fn open_lock_session(&self) -> PgResult<Box<dyn PostgresLockSession>> {
+        Ok(Box::new(MemoryLockSession {
+            tables: Arc::clone(&self.tables),
+            session: uuid::Uuid::new_v4().to_string(),
+            closed: false,
+        }))
+    }
+
+    fn execute_in_transaction(&self, statements: &[SqlStatement]) -> PgResult<Vec<QueryOutcome>> {
+        // Simulate `BEGIN` by snapshotting the tables, and `ROLLBACK` by restoring the
+        // snapshot when a statement fails: a failed multi-statement write must leave **no**
+        // partial rows behind (Java `executeInWriteTransaction`).
+        let snapshot = { self.tables.lock().unwrap().clone() };
+        let mut outcomes = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            match <Self as PostgresClient>::query(self, &stmt.sql, &stmt.params) {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(e) => {
+                    *self.tables.lock().unwrap() = snapshot;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(outcomes)
+    }
+}
+
+/// One simulated PostgreSQL session (a single `Connection`) over a shared [`Tables`].
+///
+/// Session identity is what makes mutual exclusion real here: re-entering a lock from the
+/// *same* session succeeds and nests (`pg_try_advisory_lock`), while another session sees a
+/// conflict, and `close()` releases everything this session still holds (Java
+/// `Connection#close()`).
+#[derive(Debug)]
+pub struct MemoryLockSession {
+    tables: Arc<Mutex<Tables>>,
+    session: String,
+    closed: bool,
+}
+
+impl PostgresLockSession for MemoryLockSession {
+    fn try_lock(&self, lock_name: i64) -> PgResult<bool> {
+        if self.closed {
+            return Err(PostgresError::Query(
+                "advisory-lock session is already closed".into(),
+            ));
+        }
+        let mut t = self.tables.lock().unwrap();
+        match t.advisory_locks.get_mut(&lock_name) {
+            None => {
+                t.advisory_locks.insert(
+                    lock_name,
+                    LockHeld {
+                        session: self.session.clone(),
+                        depth: 1,
+                    },
+                );
+                Ok(true)
+            }
+            // Re-entrant within the owning session.
+            Some(held) if held.session == self.session => {
+                held.depth += 1;
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+        }
+    }
+
+    fn unlock(&self, lock_name: i64) -> PgResult<bool> {
+        if self.closed {
+            return Err(PostgresError::Query(
+                "advisory-lock session is already closed".into(),
+            ));
+        }
+        let mut t = self.tables.lock().unwrap();
+        match t.advisory_locks.get_mut(&lock_name) {
+            Some(held) if held.session == self.session => {
+                held.depth -= 1;
+                if held.depth == 0 {
+                    t.advisory_locks.remove(&lock_name);
+                }
+                Ok(true)
+            }
+            // A different session never owns this lock, so it cannot release it.
+            _ => Ok(false),
+        }
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let mut t = self.tables.lock().unwrap();
+        t.advisory_locks
+            .retain(|_, held| held.session != self.session);
     }
 }
 
