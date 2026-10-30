@@ -48,7 +48,7 @@
 | 1 | MODEL | 进行中（P0 已清零；dashscope 加密与会话合并、ollama 多智能体、`AnthropicServerTool`、openai-official Phase 2 均已闭环） | ~9 / ~7 | 382 |
 | 2 | PROTOCOL | **已完成**（P1 清零，余 P2）（引导层、`AgentExecuteProperties`、`AgentRegistry`、`TransportWrapper*`、A2A 真 SSE、`ProcessResult::interrupt`、`WorkspaceProtocolTaskRepository`、**A2A per-task runner 体系**、**agui `adapterFactory`** 均已落地；`A2aAgent` 门面仍为 P2 未迁移——被 core/harness seam 阻塞，见 §4.17） | 0 / ~6 | 353（5 子 crate + facade 合计） |
 | 3 | RAG | **已完成**（P1 清零，余 P2）（外部向量库 4/4 + HTTP embedding 三 provider + reader 辅助已落地） | 0 / 4 | 436 |
-| 4 | SANDBOX | **已完成**（P1 清零，2026-10-30；余已记差异 + P2）（K8s 文件 API、E2B 原生传输、**4/4 连接策略（含 PortForward seam）**、**`SandboxFilesystemSpec` guard + workspace projection** 均已落地；`Gateway` 无 watch / K8s list·watch 未迁移仍为已记差异，见 §4.18） | 0 / ~4 | 188 |
+| 4 | SANDBOX | **已完成**（P1 清零，2026-10-30；余已记差异 + P2）（K8s 文件 API、E2B 原生传输、**4/4 连接策略（含 PortForward seam）**、**`SandboxFilesystemSpec` guard + workspace projection**、**K8s list / deleteAll / warmPoolName / gateway 等待** 均已落地；**e2b httpmock flaky 已根因修复**（loopback 绕系统代理），见 §4.19） | 0 / ~4 | 205 |
 | 5 | CHANNEL | **已完成**（代码缺口 0；仅剩真实租户联调，非代码缺口） | 0 / 0 | 399 |
 | 6 | MEM | 进行中（`api_base_url` 校验 / connect 超时 / DTO 单测已补；余吞错口径裁定 + P2 清理） | 3 / ~9 | 96 |
 | 7 | JDBC | 进行中（skill 仓库已闭环；**2026-10-29 核实**：原生锁 seam 就绪但生产零调用 → 降 P2；`in_transaction` 改记为「新增后端前置约束」） | 2 / ~7 | 217 |
@@ -59,13 +59,13 @@
 | 12 | COS | **已完成**（本 crate P1 清零；core 跨模块的 per-key delete 也已落地）（真实 COS v5 签名适配器 + 分段上传 + 预签名 + STS 已落地） | 0 / ~7 | 107 + 3 doc |
 | 13 | OSS | **已完成**（P1 清零，余 P2）（`s3` feature + 分页 / `search_strict` / `delete_key` / DistributedStore 投影已闭环） | 0 / ~8 | 61 + 1 doc（默认）/ 74 + 2（`--features s3`） |
 | 14 | CONTROLPLANE | **已完成**（P1 清零，余 P2 / 待裁定）（native session-log、按会话 ack、`replanRun` / `signalRun` / artifact 上传下载均已落地） | 0 / ~7 | 144 + 4 |
-| 15 | STUDIO | 进行中（`reply` 键、`run_id` 鉴权键、function span、三抽取器、callFormat span 已闭环） | 2 / ~7 | 70 |
+| 15 | STUDIO | **已完成**（P1 清零，2026-10-30）（`reply` 键、`run_id` 鉴权键、function span、三抽取器、callFormat span、**`StudioClient` HTTP 传输注入（网络路径可离线测）**、**`StudioUserAgent::drive_round` 与 core 循环集成** 均已落地；余 P2 与「`TelemetryTracing` 自动装配」待裁定） | 0 / ~7 | 83 |
 | 16 | SKILLS | 进行中（P0-01 与 P1-01~P1-11 全部关闭） | 2 / 1 | 93 |
 | 17 | SCHEDULER | 进行中（cron `L/W/LW/#` 与年字段、`next_fire_time`、`interrupt`、6 值状态、xxl-job 协议已落地） | 2 / ~4 | 88 + 3 |
 | 18 | TRAINING | **已完成**（代码面 P1 清零，余 live 联调）（**P0-2 已闭环**：adapter 强制 `stream=false` + MODEL 非流式分支齐备） | 0 / 3 | 74 |
 | 19 | NACOS | 进行中（`SecuritySchemeConverterUtil`、`supportedInterfaces`、prompt 空串、skill 校验、A2A 类型复用均已闭环） | 1 / ~6 | 70 |
 | 20 | HIGRESS | **已完成**（P1 清零，余 P2）（`initialize()` 真建连、`call_tool_with_meta`、`outputSchema`、`registration()` 已闭环） | 0 / ~7（+2 待裁定） | 57 + 1 doc |
-| 21 | JUDGE | 进行中（**2026-10-30**：四个中间件 hook（trace / response / supervision / phase routing）、`@Tool` 注册（evidence / knowledge / code_review）、`StoreJevContextArchive`（harness `BaseStore`）均已落地） | 4 / ~4 | 308 |
+| 21 | JUDGE | 进行中（2026-10-30 两轮：中间件 hook / `@Tool` / `StoreJevContextArchive` / `JevPhaseRouting` judge 选择 + 二次校验 / `JevResponseMiddleware` quality·reviser / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` 均已落地；**余 P1 = `JevGuardrail::screen` reactive caller + `JevConfirmedCalls`（需 core `RuntimeContext` 扩展槽）**） | 2 / ~4 | 336 |
 
 **跳模块仍待裁定（非模块内可解）**：仅剩 ⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍（见 §4.15.6）。
 
@@ -963,3 +963,48 @@ cargo test -p agentscope-extensions-mysql -p agentscope-extensions-sandbox -p ag
 - **MYSQL**：真实驱动适配器（`mysql_async`/`sqlx`）与真实 MySQL 集成测试（环境受限）；默认锁超时 30s vs Java 1800s（P2，改默认值会静默阻塞 30 分钟，属跨模块议题）。
 - **SANDBOX**：`Gateway` 仍一次性读 CRD（无 watch）；`K8sHelper` 的 list/watch/模板能力与 `listSandboxClaims`/`listActiveSandboxes`/`deleteAll` 未迁移；真实隧道实现（kube-rs / `kubectl port-forward`）仅留 seam。
 - **JUDGE**：`JevPhaseRouting::resolve()` 仍 fail-closed（缺 `routes()` 访问器 + route offer 组装/二次校验）；`JevCodeReviewer` 六阶段驱动（`CodeReviewDriver` 缝 + fail-closed 兜底）；`JevStageRouter`（依赖未迁的 `example`）；`JevResponseMiddleware` 的 quality/reviser 分支；`JevGuardrail::screen` reactive caller 与 `JevConfirmedCalls`。
+
+---
+
+## 4.19 2026-10-30 执行记录（STUDIO / SANDBOX 二轮 / JUDGE 二轮，三模块并行）
+
+| 模块 | 本轮完成 | 测试 | 状态口径 |
+|---|---|---|---|
+| STUDIO | `StudioClient` 新增 `StudioHttpTransport` 注入缝（默认 `ReqwestStudioTransport`，生产行为不变）+ `StudioUserAgent::drive_round{,_with}` 接入 core `CallableAgent` | 70 → **83** | **已完成**（P1 清零） |
+| SANDBOX | ① **e2b httpmock flaky 根因修复**；② K8s `listSandboxClaims` / `listActiveSandboxes` / `deleteAll` / `getSandboxClaimWarmPoolName`；③ Gateway 地址等待 | 188 → **205** | 已完成（保留差异见下） |
+| JUDGE | `JevPhaseRouting` judge 选择 + 二次校验、`ResponseMiddleware` quality·reviser 分支、`JevCodeReviewer` 六阶段驱动、`JevStageRouter`（不含 legacy） | 308 → **336** | 进行中（余 2 项需 core seam） |
+
+### 4.19.1 最重要的发现：e2b flaky 的根因不是测试写法，而是**系统代理**
+
+`reqwest` 0.13 的 `system-proxy` 路径经 hyper-util 把 Windows `ProxyOverride` 里的 `127.*` 当成**字面域名**放进 `NoProxy`，于是发往 loopback mock server 的请求实际走了本机系统代理（`127.0.0.1:10808`），空闲 keep-alive 被 RST → `Os 10053 ConnectionAborted` / `0 of 1 expected requests matched`。
+
+- **修法**：`src/http.rs` 新增 `is_loopback_target` / `bypass_proxy_for_loopback` / `client_builder`，四个远程后端（agentrun / daytona / e2b / kubernetes）构造 client 时接入：**loopback 目标 ⇒ `no_proxy()`**（对齐 Java OkHttp `<local>` bypass），非 loopback 保留系统代理。
+- **验证**：`--lib` 连续 8 次全绿（子智能体另跑 60 次 0 失败；主智能体再跑 6 次全绿）；反向验证把 `bypass_proxy_for_loopback` 恒返回 builder → 12 次跑 11 次失败（含原 4 个 e2b 用例）。
+- **教训**：本仓库环境里 `git config http.proxy=http://127.0.0.1:10808`（端口未监听）曾被记为「cargo 代理坑」（见 MEMORY），同一个代理也是**测试 flaky 的真因**。以后 loopback mock 类测试飘红，先查系统代理 / `ProxyOverride`，别先怀疑测试并发。
+
+### 4.19.2 STUDIO 实现要点
+
+- `StudioHttpRequest` / `StudioHttpResponse` / `trait StudioHttpTransport`；`StudioClient` 字段由 `reqwest::Client` 改为 `Arc<dyn StudioHttpTransport>`，新增 `with_transport()`；`post_json` 改为「先序列化再进重试循环」，非 2xx 仍映射 `StudioError::Http`（**只重试 Transport 错误**的现状规则保持不变）。
+- 测试锁定了 §4.2 P2-1 的现状（500 只发 1 次），**未顺手改语义**。
+- `drive_round` 是「一轮」而非自动多轮循环：终止/中断策略需宿主决定（Java 靠 `AgentBase` 子类化）。
+
+### 4.19.3 JUDGE 本轮注意点
+
+- **子智能体回执丢失且未改 tracker**：代码已落盘（含新文件 `runtime/quality.rs` / `runtime/review_driver.rs`），但返回空。⇒ §10 与反向验证由主智能体补做：①注释 `revalidate` 的 `input_restriction` 分支 → `revalidation_drops_a_target_that_no_longer_fits` FAILED；②ENFORCE 分支提前 `return events` → `quality_enforce_revises_a_failing_draft_and_replaces_the_delta` FAILED；恢复后 336/0。
+- `JevStageRouter` 的 legacy 模型选择模式**不迁**（依赖未迁的 `example` 子包 + core `Model` 句柄），以常量 `STAGE_ROUTER_UNAVAILABLE` 显式说明，由 `JevPhaseRouting` 显式阶段代替。
+- 余 2 项 P1（`JevGuardrail::screen` reactive caller、`JevConfirmedCalls`）**均需 core `RuntimeContext` 键值扩展槽**，属跨模块，不得在本 crate 内假装实现。
+
+### 4.19.4 SANDBOX 保留差异（仍待办）
+
+- `watch=true` 流式订阅与 `SandboxTemplate`（`decode_json` 整包读 body，无宿主任务/取消句柄）；
+- Gateway 读取失败仍等满 180s 才报错（Java 快失败）；
+- `listActiveSandboxes` 无存活 prune 信号；
+- 真实隧道实现（kube-rs / `kubectl port-forward`）仅留 seam。
+
+### 4.19.5 主智能体复核
+
+```
+cargo test -p agentscope-extensions-judge -p agentscope-extensions-studio -j 2  -> 336 / 83 passed, 0 failed
+cargo test -p agentscope-extensions-sandbox --lib  (×6)                         -> 205 passed / 0 failed 每次
+cargo build -p agentscope-extensions-judge                                      -> EXIT=0，本 crate 0 warning
+```

@@ -39,10 +39,11 @@ use crate::jev::evaluation::capture::{JevTraceEvaluationMiddleware, TraceCapture
 use crate::jev::evaluation::trace::{
     TraceBlock, TraceMessage, TraceResultPart, TraceToolResult, TraceToolSchema, TraceToolUse,
 };
-use crate::jev::execution::{Decision, Mode};
-use crate::jev::guardrail::Verdict;
+use crate::jev::execution::{Decision, Mode, Status};
+use crate::jev::integration::response::ResponseLimits;
 use crate::jev::routing::catalog::Snapshot;
 use crate::jev::routing::phase_routing::{input_restriction, InputRestriction, RoutingReport};
+use crate::jev::runtime::quality::QualitySettings;
 use crate::jev::supervision::middleware::{append_tail, Observation, Schedule};
 use crate::jev::supervision::supervisor::{Report as SupervisionReport, Scope, TaskAdvice};
 
@@ -282,39 +283,47 @@ impl Middleware for TraceEvaluationMiddleware {
 // 2. Response screening (`JevResponseMiddleware`)
 // ---------------------------------------------------------------------------------------------
 
-/// The async screening call the host provides (`JevGuardrail::screen`).
-///
-/// Java's `screen` is a reactive System One call; the injected future keeps the middleware
-/// offline-testable while the pure [`JevGuardrail::evaluate`](crate::jev::guardrail::JevGuardrail::evaluate)
-/// stays the only verdict fold.
-pub type Screener = Arc<dyn Fn(&str) -> BoxedFuture<Result<Verdict, JevError>> + Send + Sync>;
+/// The screening seam and its outcome, owned by [`crate::jev::runtime::quality`] and re-exported
+/// here so `runtime::middleware::{Screener, ScreenOutcome}` keeps working.
+pub use crate::jev::runtime::quality::{ScreenOutcome, ScreenPolicy, Screener};
 
-/// What one screening round decided.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScreenOutcome {
-    /// Whether the text must be withheld.
-    pub blocked: bool,
-    /// Why it was blocked (the Java `Rejected` reason).
-    pub reason: String,
+/// The Java `Rejected` message (`"JEV response withheld: " + reason`).
+pub fn withheld(reason: &str) -> Error {
+    Error::Agent(format!("JEV response withheld: {reason}"))
 }
 
 /// Drives `JevResponseMiddleware` over the model-call hook.
 ///
 /// `ENFORCE` buffers the call's events, screens the assembled draft and either replays the buffered
-/// events or fails the call with `OUTPUT_BLOCK`; `SHADOW` observes the stream and screens after it
-/// ends without changing it.
+/// events or fails the call with the Java `Rejected` message; `SHADOW` observes the stream and
+/// screens after it ends without changing anything. With a [`QualitySettings`] attached the
+/// quality assess/revision loop also runs on the buffered draft (Java's `review`), so an
+/// `ENFORCE` quality policy can withhold an inconclusive answer or replay a revised one.
 pub struct ResponseMiddleware {
     mode: Mode,
-    limits: crate::jev::integration::response::ResponseLimits,
+    limits: ResponseLimits,
     block_on_review: bool,
     screener: Screener,
+    quality: Option<Arc<QualitySettings>>,
+}
+
+impl Clone for ResponseMiddleware {
+    fn clone(&self) -> Self {
+        Self {
+            mode: self.mode,
+            limits: self.limits,
+            block_on_review: self.block_on_review,
+            screener: Arc::clone(&self.screener),
+            quality: self.quality.clone(),
+        }
+    }
 }
 
 impl ResponseMiddleware {
     /// Creates the middleware; `mode` must not be `OFF` for it to participate.
     pub fn new(
         mode: Mode,
-        limits: crate::jev::integration::response::ResponseLimits,
+        limits: ResponseLimits,
         block_on_review: bool,
         screener: Screener,
     ) -> Self {
@@ -323,7 +332,14 @@ impl ResponseMiddleware {
             limits,
             block_on_review,
             screener,
+            quality: None,
         }
+    }
+
+    /// Attaches the quality policy (`JevResponseMiddleware.quality(...)`).
+    pub fn with_quality(mut self, quality: QualitySettings) -> Self {
+        self.quality = Some(Arc::new(quality));
+        self
     }
 
     /// The configured mode.
@@ -336,37 +352,26 @@ impl ResponseMiddleware {
         &self.limits
     }
 
+    /// The attached quality policy, if any.
+    pub fn quality(&self) -> Option<&QualitySettings> {
+        self.quality.as_deref()
+    }
+
     /// The Java order (`200`).
     pub fn order_hint(&self) -> i32 {
         crate::jev::integration::response::MIDDLEWARE_ORDER
     }
 
-    async fn screen(&self, draft: &str) -> Result<ScreenOutcome, JevError> {
-        if draft.trim().is_empty() {
-            return Ok(ScreenOutcome {
-                blocked: false,
-                reason: String::new(),
-            });
-        }
-        if draft.chars().count() > self.limits.max_chars {
-            return Err(JevError::invalid("INPUT_LIMIT"));
-        }
-        let verdict = (self.screener)(draft).await?;
-        Ok(ScreenOutcome {
-            blocked: verdict.blocked(self.block_on_review),
-            reason: format!("OUTPUT_{}", outcome_name(verdict.outcome)),
-        })
+    fn policy(&self) -> ScreenPolicy {
+        ScreenPolicy::new(
+            Arc::clone(&self.screener),
+            self.limits.max_chars,
+            self.block_on_review,
+        )
     }
-}
 
-/// The Java enum name of an [`Outcome`](crate::jev::guardrail::Outcome).
-fn outcome_name(outcome: crate::jev::guardrail::Outcome) -> &'static str {
-    use crate::jev::guardrail::Outcome;
-    match outcome {
-        Outcome::Pass => "PASS",
-        Outcome::Review => "REVIEW",
-        Outcome::Block => "BLOCK",
-        Outcome::Support => "SUPPORT",
+    async fn screen(&self, draft: &str) -> Result<ScreenOutcome, JevError> {
+        self.policy().check(draft.to_string()).await
     }
 }
 
@@ -381,69 +386,120 @@ impl Middleware for ResponseMiddleware {
         input: ModelCallInput,
         next: Next<ModelCallInput>,
     ) -> EventStream {
-        match self.mode {
-            Mode::Off => next(input),
-            Mode::Shadow => {
-                let draft = Arc::new(Mutex::new(String::new()));
-                let collected = Arc::clone(&draft);
-                let stream = next(input).map(move |event| {
-                    if let Ok(AgentEvent::TextBlockDelta(data)) = &event {
-                        if let Some(delta) = text_delta(data) {
-                            collected.lock().unwrap().push_str(delta);
-                        }
-                    }
-                    event
-                });
-                let screener = Arc::clone(&self.screener);
-                let limits = self.limits;
-                let block_on_review = self.block_on_review;
-                then_after(stream, async move {
-                    let text = { draft.lock().unwrap().clone() };
-                    if text.trim().is_empty() || text.chars().count() > limits.max_chars {
-                        return;
-                    }
-                    // Observation only: the verdict is never acted on in SHADOW.
-                    let _ = screener(&text).await.map(|verdict| verdict.blocked(block_on_review));
-                })
-            }
-            Mode::Enforce => {
-                let middleware = ResponseMiddleware {
-                    mode: self.mode,
-                    limits: self.limits,
-                    block_on_review: self.block_on_review,
-                    screener: Arc::clone(&self.screener),
-                };
-                Box::pin(
-                    futures::stream::once(async move {
-                        let events: Vec<CoreResult<AgentEvent>> = next(input).collect().await;
-                        let mut text = String::new();
-                        for event in &events {
-                            if let Ok(AgentEvent::TextBlockDelta(data)) = event {
-                                if let Some(delta) = text_delta(data) {
-                                    text.push_str(delta);
-                                }
-                            }
-                        }
-                        match middleware.screen(&text).await {
-                            Ok(outcome) if outcome.blocked => {
-                                futures::stream::iter(vec![Err(Error::Agent(format!(
-                                    "{}: {}",
-                                    outcome.reason, "OUTPUT_BLOCK"
-                                )))])
-                            }
-                            Ok(_) => futures::stream::iter(events),
-                            Err(error) => futures::stream::iter(vec![Err(Error::Agent(
-                                error.message().to_string(),
-                            ))]),
-                        }
-                    })
-                    .flatten(),
-                )
-            }
+        let quality_mode = self.quality.as_ref().map_or(Mode::Off, |quality| quality.mode);
+        if self.mode == Mode::Off && quality_mode == Mode::Off {
+            return next(input);
         }
+        let enforce = self.mode == Mode::Enforce || quality_mode == Mode::Enforce;
+        if !enforce {
+            // SHADOW: never delay or replace the downstream events; a cap stops capture, not the
+            // turn (Java's `Capture.shadowAdd`).
+            let this = self.clone();
+            let observed = input.clone();
+            let draft = Arc::new(Mutex::new(String::new()));
+            let collected = Arc::clone(&draft);
+            let limits = self.limits;
+            let stream = next(input).map(move |event| {
+                if let Ok(AgentEvent::TextBlockDelta(data)) = &event {
+                    if let Some(delta) = text_delta(data) {
+                        let mut guard = collected.lock().unwrap();
+                        if delta.chars().count()
+                            <= limits.max_chars.saturating_sub(guard.chars().count())
+                        {
+                            guard.push_str(delta);
+                        }
+                    }
+                }
+                event
+            });
+            return then_after(stream, async move {
+                let text = { draft.lock().unwrap().clone() };
+                if text.trim().is_empty() {
+                    return;
+                }
+                // Observation only: neither verdict nor assessment changes the stream.
+                if this.screen(&text).await.is_err() {
+                    return;
+                }
+                let Some(quality) = this.quality.clone() else {
+                    return;
+                };
+                if quality.mode == Mode::Off {
+                    return;
+                }
+                let trace = trace_projection(&observed);
+                let _ = crate::jev::runtime::quality::assess(
+                    &quality,
+                    &observed,
+                    &trace,
+                    &text,
+                    &this.limits,
+                    &this.policy(),
+                )
+                .await;
+            });
+        }
+
+        // ENFORCE: buffer the whole call, screen, assess, then replay, replace or withhold.
+        let this = self.clone();
+        Box::pin(
+            futures::stream::once(async move {
+                let quality = this.quality.clone();
+                let trace = trace_projection(&input);
+                let events: Vec<CoreResult<AgentEvent>> = next(input.clone()).collect().await;
+                let capture = match crate::jev::runtime::quality::capture(&events, &this.limits) {
+                    Ok(capture) => capture,
+                    Err(error) => return vec![Err(withheld(error.message()))],
+                };
+                let outcome = match this.screen(&capture.text).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => return vec![Err(withheld(error.message()))],
+                };
+                if outcome.blocked {
+                    return vec![Err(withheld(&outcome.reason))];
+                }
+                let Some(quality) = quality else {
+                    return events;
+                };
+                if quality.mode == Mode::Off || capture.tools || capture.text.trim().is_empty() {
+                    return events;
+                }
+                let decision = crate::jev::runtime::quality::assess(
+                    &quality,
+                    &input,
+                    &trace,
+                    &capture.text,
+                    &this.limits,
+                    &this.policy(),
+                )
+                .await;
+                if quality.mode != Mode::Enforce {
+                    return events;
+                }
+                match decision.status {
+                    Status::Decided => {
+                        let revised = decision.value.unwrap_or_default();
+                        if revised == capture.text {
+                            return events;
+                        }
+                        match crate::jev::runtime::quality::replace_text(events, &revised) {
+                            Ok(replaced) => replaced,
+                            Err(error) => vec![Err(withheld(error.message()))],
+                        }
+                    }
+                    _ => vec![Err(withheld(&decision.reason))],
+                }
+            })
+            .map(|events| futures::stream::iter(events))
+            .flatten(),
+        )
     }
 }
 
+/// Projects the call's messages once, before the inner stream consumes the input.
+fn trace_projection(input: &ModelCallInput) -> Vec<TraceMessage> {
+    trace_messages(&input.messages)
+}
 // ---------------------------------------------------------------------------------------------
 // 3. Supervision observation (`JevSupervisionMiddleware`)
 // ---------------------------------------------------------------------------------------------
@@ -757,8 +813,11 @@ mod tests {
     use agentscope_core::middleware::ReasoningInput;
     use agentscope_core::model::GenerateOptions;
     use agentscope_core::message::ToolResultState;
+    use serde_json::json;
+    use crate::jev::call::testing::ScriptedCaller;
+    use crate::jev::runtime::quality::{revise_with_model, Revision, Reviser};
     use crate::jev::evaluation::metrics::Thresholds;
-    use crate::jev::guardrail::Outcome;
+    use crate::jev::guardrail::{Outcome, Verdict};
     use crate::jev::integration::response::ResponseLimits;
     use crate::jev::execution::Options;
     use crate::jev::supervision::supervisor::Report;
@@ -999,8 +1058,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn phase_routing_applies_the_resolved_model_and_effort_in_enforce() {
+    #[tokio::test]
+    async fn phase_routing_applies_the_resolved_model_and_effort_in_enforce() {
         let report = RoutingReport {
             route: Some("fast".into()),
             model: Some("model-b".into()),
@@ -1010,6 +1069,7 @@ mod tests {
             probabilities: BTreeMap::new(),
             skipped: Vec::new(),
             judge_model: Some("jev".into()),
+            judge_usage: Some(crate::jev::dto::Usage::new(1, 1)),
         };
         let expected = report.clone();
         let resolver: RouteResolver = Arc::new(move |_snapshot| {
@@ -1020,14 +1080,13 @@ mod tests {
         let ctx = runtime();
         let captured = Arc::new(Mutex::new(None));
         let seen = Arc::clone(&captured);
-        let events = collect(middleware.on_model_call(
+        let events = middleware.on_model_call(
             &ctx,
             ModelCallInput::new(vec![user("q")], Vec::new(), GenerateOptions::default(), Arc::new(NoopModel)),
             Box::new(move |input| {
                 *seen.lock().unwrap() = Some(input.options.clone());
                 stream_of(vec![text_event("x")])
-            }),
-        ));
+            }),).collect::<Vec<_>>().await;
         assert_eq!(events.len(), 1);
         let options = captured.lock().unwrap().take().unwrap();
         assert_eq!(options.model_name.as_deref(), Some("model-b"));
@@ -1070,6 +1129,7 @@ mod tests {
             probabilities: BTreeMap::new(),
             skipped: Vec::new(),
             judge_model: None,
+            judge_usage: None,
         }
     }
 
@@ -1090,4 +1150,279 @@ mod tests {
             Box::pin(async { Ok(empty_routing_report()) })
         })));
     }
+
+    // --- response quality / reviser (`JevResponseMiddleware.quality`) ---
+
+    fn quality_definition() -> crate::jev::judge::Definition {
+        crate::jev::judge::Definition::new(
+            "v1",
+            vec![crate::jev::judge::Criterion::new(
+                "a",
+                crate::jev::dto::NoulQuestion::new(json!("is the answer right?"), None),
+                true,
+                0.2,
+                0.8,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn noul_reply(noul: f64) -> crate::jev::dto::SystemOneResult {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "a".to_string(),
+            crate::jev::dto::Answer::Noul(crate::jev::dto::NoulAnswer { noul: Some(noul) }),
+        );
+        crate::jev::dto::SystemOneResult {
+            model: Some("jev".to_string()),
+            answers: Some(answers),
+            usage: Some(crate::jev::dto::Usage::new(2, 2)),
+        }
+    }
+
+    fn scripted_judge(values: Vec<f64>) -> (Arc<ScriptedCaller>, Arc<crate::jev::judge::JevJudge>) {
+        let responses = values.into_iter().map(|noul| Ok(noul_reply(noul))).collect();
+        let scripted = Arc::new(ScriptedCaller::new(responses));
+        let judge = Arc::new(
+            crate::jev::judge::JevJudge::new(
+                scripted.as_caller(),
+                std::time::Duration::from_millis(500),
+            )
+            .unwrap(),
+        );
+        (scripted, judge)
+    }
+
+    fn reviser(chunks: &[&str], seen: Arc<Mutex<Vec<String>>>) -> Reviser {
+        let chunks: Vec<String> = chunks.iter().map(|chunk| (*chunk).to_string()).collect();
+        Arc::new(move |revision: Revision| {
+            seen.lock().unwrap().push(revision.draft.clone());
+            let chunks = chunks.clone();
+            Box::pin(async move { Ok(chunks) })
+        })
+    }
+
+    fn text_of(event: &CoreResult<AgentEvent>) -> String {
+        match event {
+            Ok(AgentEvent::TextBlockDelta(data)) => data
+                .fields
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn call_input() -> ModelCallInput {
+        ModelCallInput::new(
+            vec![user("q")],
+            Vec::new(),
+            GenerateOptions::default(),
+            Arc::new(NoopModel),
+        )
+    }
+
+    fn quality_middleware(
+        mode: Mode,
+        values: Vec<f64>,
+        chunks: &[&str],
+        max_revisions: usize,
+    ) -> (ResponseMiddleware, Arc<ScriptedCaller>, Arc<Mutex<Vec<String>>>) {
+        let (scripted, judge) = scripted_judge(values);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let settings = QualitySettings::new(
+            mode,
+            judge,
+            quality_definition(),
+            reviser(chunks, Arc::clone(&seen)),
+            max_revisions,
+        )
+        .unwrap();
+        (
+            ResponseMiddleware::new(
+                Mode::Enforce,
+                ResponseLimits::defaults(),
+                true,
+                screener(false),
+            )
+            .with_quality(settings),
+            scripted,
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn quality_enforce_revises_a_failing_draft_and_replaces_the_delta() {
+        let (middleware, scripted, seen) =
+            quality_middleware(Mode::Enforce, vec![0.1, 0.9], &["revised answer"], 1);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("bad "), text_event("answer")])),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(text_of(&events[0]), "revised answer");
+        assert_eq!(*seen.lock().unwrap(), vec!["bad answer".to_string()]);
+        // One assessment of the draft, one of the revision.
+        assert_eq!(scripted.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn quality_enforce_withholds_an_inconclusive_assessment() {
+        let (middleware, _scripted, _seen) =
+            quality_middleware(Mode::Enforce, vec![0.1], &["revised"], 0);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("draft")])),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 1);
+        let error = events[0].as_ref().unwrap_err();
+        assert!(format!("{error:?}").contains("QUALITY_FAIL"));
+    }
+
+    #[tokio::test]
+    async fn quality_off_keeps_the_draft() {
+        let (scripted, judge) = scripted_judge(vec![0.1]);
+        let settings = QualitySettings::new(
+            Mode::Off,
+            judge,
+            quality_definition(),
+            Arc::new(revise_with_model),
+            1,
+        )
+        .unwrap();
+        let middleware = ResponseMiddleware::new(
+            Mode::Enforce,
+            ResponseLimits::defaults(),
+            true,
+            screener(false),
+        )
+        .with_quality(settings);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("a"), text_event("b")])),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(text_of(&events[1]), "b");
+        assert!(scripted.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quality_passes_without_revision() {
+        let (middleware, scripted, seen) =
+            quality_middleware(Mode::Enforce, vec![0.9], &["unused"], 1);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("good"), text_event(" answer")])),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(scripted.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quality_skips_tool_calls_and_blank_drafts() {
+        let (middleware, scripted, _seen) =
+            quality_middleware(Mode::Enforce, vec![0.1], &["x"], 1);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| {
+                stream_of(vec![
+                    text_event("hi"),
+                    AgentEvent::ToolCallStart(EventData::default()),
+                ])
+            }),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert!(scripted.requests().is_empty());
+
+        let (middleware, scripted, _seen) =
+            quality_middleware(Mode::Enforce, vec![0.1], &["x"], 1);
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("   ")])),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 1);
+        assert!(scripted.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quality_shadow_observes_without_replacing() {
+        let (scripted, judge) = scripted_judge(vec![0.1]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let settings = QualitySettings::new(
+            Mode::Shadow,
+            judge,
+            quality_definition(),
+            reviser(&["revised"], Arc::clone(&seen)),
+            1,
+        )
+        .unwrap();
+        let middleware = ResponseMiddleware::new(
+            Mode::Off,
+            ResponseLimits::defaults(),
+            true,
+            screener(false),
+        )
+        .with_quality(settings);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("draft")])),).collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(text_of(&events[0]), "draft");
+        // The assessment runs once and is discarded; SHADOW never revises.
+        assert_eq!(scripted.requests().len(), 1);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blocked_revision_is_withheld() {
+        let rounds = Arc::new(Mutex::new(0usize));
+        let counted = Arc::clone(&rounds);
+        let policy: Screener = Arc::new(move |_text| {
+            let counted = Arc::clone(&counted);
+            Box::pin(async move {
+                let mut guard = counted.lock().unwrap();
+                *guard += 1;
+                Ok(Verdict {
+                    outcome: if *guard == 1 {
+                        Outcome::Pass
+                    } else {
+                        Outcome::Block
+                    },
+                    scores: BTreeMap::new(),
+                    severity: 0.0,
+                    triggered: Vec::new(),
+                })
+            })
+        });
+        let (_scripted, judge) = scripted_judge(vec![0.1, 0.9]);
+        let settings = QualitySettings::new(
+            Mode::Enforce,
+            judge,
+            quality_definition(),
+            reviser(&["revised"], Arc::new(Mutex::new(Vec::new()))),
+            1,
+        )
+        .unwrap();
+        let middleware = ResponseMiddleware::new(Mode::Enforce, ResponseLimits::defaults(), true, policy)
+            .with_quality(settings);
+        let ctx = runtime();
+        let events = middleware.on_model_call(
+            &ctx,
+            call_input(),
+            Box::new(|_i| stream_of(vec![text_event("draft")])),).collect::<Vec<_>>().await;
+        let error = events[0].as_ref().unwrap_err();
+        assert!(format!("{error:?}").contains("OUTPUT_BLOCK"));
+        assert_eq!(*rounds.lock().unwrap(), 2);
+    }
+
 }

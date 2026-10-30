@@ -7,19 +7,20 @@
 //! This module ports the **definition layer**, which is what makes the stages reproducible:
 //! [`ReviewConfig`] and its validation, the dimension/rubric constants, the screening questions,
 //! the category/mechanism/owner vocabularies, the report shapes, the signal ranking and the
-//! deterministic [`compute_complete`] rule. The staged driver itself fails closed with
-//! [`CODE_REVIEWER_UNAVAILABLE`] (see `docs/extensions/JUDGE__GAP_TRACKER.md` §4.2).
+//! deterministic [`compute_complete`] rule. The staged driver itself lives in
+//! [`crate::jev::runtime::review_driver::ReviewDriver`], which needs an injected System One caller;
+//! [`JevCodeReviewer::review`] therefore stays fail-closed with [`CODE_REVIEWER_UNAVAILABLE`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
 use crate::error::JevError;
-use crate::jev::dto::{ChoiceQuestion, NoulQuestion, Question, ScoreQuestion};
+use crate::jev::dto::{ChoiceQuestion, NoulQuestion, Question, ScoreQuestion, Usage};
 use crate::jev::review::{Region, ReviewMode};
 
-/// Why the staged reviewer cannot run from this crate yet.
-pub const CODE_REVIEWER_UNAVAILABLE: &str = "JevCodeReviewer's staged screen/profile/locate/classify driver needs the core RuntimeContext seam and the per-stage budget plumbing; only the definition layer is ported";
+/// Why a [`JevCodeReviewer`] on its own cannot run the staged review.
+pub const CODE_REVIEWER_UNAVAILABLE: &str = "JevCodeReviewer has no System One caller; build a runtime::review_driver::ReviewDriver with an injected Caller";
 
 /// The five review dimensions (`JevCodeReviewer.DIMENSIONS`).
 pub const DIMENSIONS: [&str; 5] = [
@@ -269,6 +270,8 @@ pub struct ReviewCall {
     pub status: String,
     /// The model that answered.
     pub model: Option<String>,
+    /// The billable usage, kept even when the reply broke the contract.
+    pub usage: Option<Usage>,
     /// Wall-clock time spent.
     pub elapsed_millis: u64,
 }
@@ -533,7 +536,9 @@ impl JevCodeReviewer {
         &self.config
     }
 
-    /// Fails closed: the staged driver needs the core seam.
+    /// Fails closed: a reviewer without a System One caller cannot review.
+    ///
+    /// Use [`crate::jev::runtime::review_driver::ReviewDriver`] for the staged pipeline.
     pub fn review(&self) -> Result<ReviewReport, JevError> {
         Err(JevError::protocol(CODE_REVIEWER_UNAVAILABLE))
     }

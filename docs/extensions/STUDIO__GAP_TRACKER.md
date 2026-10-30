@@ -17,9 +17,9 @@
 | Java 子模块 | `io.agentscope.core.studio` + `io.agentscope.core.tracing.telemetry` |
 | Java 规模（实测 2026-10-22） | 主代码 28 文件 / **4305 行**（非空行 3738）；测试 10 文件 / **1837 行**（非空行 1554）；`@Test` 方法 91 个 |
 | Rust crate | `crates/agentscope-extensions-studio` |
-| Rust 规模（实测 2026-10-28） | 18 个 `.rs` / **5048+ 行** / **70 个内联测试**（54 `#[test]` + 16 `#[tokio::test]`，`cargo test` 实测 70 passed）|
+| Rust 规模（实测 2026-10-30） | 19 个 `.rs` / **6631 行**（非空行 6016）/ **83 个内联测试**（53 `#[test]` + 30 `#[tokio::test]`，`cargo test` 实测 83 passed）|
 | 迁移波次 | C |
-| 当前状态 | **总判：进行中**（仍有 P1：StudioClient 无注入点 / UserAgent 未集成）—— 已完成（**70 个离线单测**；Socket.IO 真实传输 + OTLP 降级导出已落地；`TelemetryTracing` 已落地但**未自动装配**，见 §4.2 第 4 条）。**2026-10-22 静态复核**发现的 3 项已于 2026-10-28 全部关闭：P0-1 `StudioMessageHook` 捕获键（§7.1）、P1-1 `TelemetryTracer` 三处语义（§4.1.0v）、P1-2 Socket.IO 鉴权键（§4.1.0v）。仍开放 P2-1/P2-2/P2-3/P2-4 |
+| 当前状态 | **总判：已完成（P1 清零）**—— 原 2 项 P1（`StudioClient` 无 HTTP 注入点 / `StudioUserAgent` 未集成 core agent 循环）已于 **2026-10-30** 关闭（见 §9）。已完成（**83 个离线单测**；Socket.IO 真实传输 + OTLP 降级导出已落地；`TelemetryTracing` 已落地但**未自动装配**，见 §4.2 第 4 条）。**2026-10-22 静态复核**发现的 3 项已于 2026-10-28 全部关闭：P0-1 `StudioMessageHook` 捕获键（§7.1）、P1-1 `TelemetryTracer` 三处语义（§4.1.0v）、P1-2 Socket.IO 鉴权键（§4.1.0v）。仍开放 P2-1/P2-2/P2-3/P2-4 |
 | 行数口径 | Java 4305/1837 与 Rust 5048 均为**物理行**（含空行/注释）；非空行口径 Java 3738/1554、Rust 4578。汇总 tracker 的 3700/1452 与之同族，需按口径换算 |
 
 ## 2. Java 清单与依赖映射
@@ -94,8 +94,8 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | Socket.IO 真实握手/鉴权/重连 | StudioWebSocketClient.connect | 已完成（2026-10-28：鉴权键已对齐 Java `run_id`） | `studio::socket_io`：`socket_io_url`（http(s)→ws(s) + `?EIO=4&transport=websocket`）、`parse_engine_io_open`（`0{...}` 握手）、`namespace_connect_frame`（`40/python,{...}`）、`is_ping`/`pong_frame`、`parse_socket_io_event`（`42[...]`）、`reconnect_delay`（指数退避封顶）+ `SocketIoProtocol` 状态机 + `SocketIoTransport`（真实 WS）；单测 `studio::socket_io::tests`（**14** = 12 帧层 + 2 鉴权键）。**鉴权键**：`auth_payload(run_id, include_legacy_key)` 默认 `{"run_id":...}`（Java `StudioWebSocketClient.java:98`），历史 `runId` 只能经 `with_legacy_auth_key()` 叠加（见 §4.1.0v）|
-| `StudioClient` 网络路径离线测（mock HTTP） | StudioClient | 待办（2026-10-29 复核确认） | 需注入 HTTP 传输抽象或 mock server（`StudioClient` 目前直接持 `reqwest::Client`，`studio/client.rs:22` `http: reqwest::Client`，无注入点）；当前仅离测请求体构造 |
-| `StudioUserAgent` 与 core agent 循环集成 | StudioUserAgent | 待办（2026-10-29 复核确认） | 当前为独立输入提供者，调用方自行接入 agent 轮次 |
+| `StudioClient` 网络路径离线测（mock HTTP） | StudioClient | 已完成（2026-10-30，§9） | 新增 `studio/http.rs` 注入点：`trait StudioHttpTransport { async fn execute(&self, StudioHttpRequest) -> StudioResult<StudioHttpResponse> }` + `ReqwestStudioTransport`（生产，行为不变）+ `StudioClient::with_transport`；`StudioClient` 改持 `Arc<dyn StudioHttpTransport>`。11 个离线用例走真实公开方法（方法/路径/头/JSON body、2xx、非 2xx 不重试、传输错误重试/耗尽）|
+| `StudioUserAgent` 与 core agent 循环集成 | StudioUserAgent | 已完成（2026-10-30，§9；诚实范围见交接信息） | 新增 `StudioUserAgent::drive_round(&A)` / `drive_round_with(&A, Msg)`，泛型约束为 core `CallableAgent`（`ReActAgent`/`HarnessAgent` 直接可用）：取输入 → 推送用户消息到 Studio（失败仅告警）→ 跑一轮 agent → 返回回复；agent 错误映射为 `StudioError::Agent`。**不做**「自动多轮 / 终端交互」循环，那是宿主职责（Java 靠 `AgentBase` 子类化，core 无此机制）|
 | `StudioMessageHook` 终态消息捕获键修正 | StudioMessageHook | 已完成（2026-10-22；2026-10-29 勘误：原记「待办」） | core 终态消息在 `fields["reply"]`（protocol crate 为 `fields["result"]`），Rust 侧原先读 `fields["message"]` → 恒不触发（§6.4 P0-1）。现 `final_message` 优先 `reply`、`message` 作第三方回退（`studio/message_hook.rs:88-97`），用例 `reads_reply_key_written_by_core` / `falls_back_to_message_key` / `non_result_events_yield_none`（§7.1）|
 
 ### 3.3 增强（P2）
@@ -221,8 +221,8 @@
 5. **【2026-10-22 新增 — 见 §6.4】** ~~P1-1~~ / ~~P1-2~~ **已于 2026-10-28 关闭（§4.1.0v）**；仍开放：P0-1（已由汇总方于 2026-10-22 修复，§7.1）、P2-1 HTTP 错误重试语义分歧、P2-2 OTLP exporter 无自定义 header、P2-3 属性键缺 5 个、P2-4 `StudioUserAgent` 无 name 校验。
 6. **【2026-10-28 新增 — core 缺口】** `format` span 只能以 `TelemetryTracing::call_format(ctx, formatter_type, msgs, closure)` 形式提供：core `Middleware` 的 `ExtensionPoint` 无 formatter 拦截点，`agentscope_core::formatter` 也只有自由函数、无 formatter trait。**宿主须在真正格式化处调用该包装器**，否则 `format {target}` span 不会产生（不阻塞其他 span）。Java 侧由 `Tracer.callFormat(formatter, msgs, supplier)` 在框架内自动包裹。
 7. **【真实剩余（2026-10-29 复核，均为已在册项，非新缺口）】**
-   - `StudioClient` 无 HTTP 注入点（`studio/client.rs:22` 直接持 `reqwest::Client`）→ 网络路径不可离线测（§3.2）。
-   - `StudioUserAgent` 未与 core agent 循环集成（仅独立输入提供者，§3.2）。
+   - ~~`StudioClient` 无 HTTP 注入点（`studio/client.rs:22` 直接持 `reqwest::Client`）→ 网络路径不可离线测（§3.2）。~~ **已解决 2026-10-30（§9）**：`studio/http.rs` 注入点 + 11 个离线用例。
+   - ~~`StudioUserAgent` 未与 core agent 循环集成（仅独立输入提供者，§3.2）。~~ **已解决 2026-10-30（§9）**：`drive_round` / `drive_round_with`（泛型 `CallableAgent`）。
    - `TelemetryTracing` 未在 `StudioManager::initialize*` 自动装配（第 4 条）。
    - `format` span 需宿主显式调 `call_format`（第 6 条）。
    - 非 2xx 不重试（Java 会重试，§6.4 P2-1）。
@@ -370,3 +370,46 @@ Rust 逐文件测试分布（`#[test]` / `#[tokio::test]` / 合计；**2026-10-2
 **反向验证**：5 项回退逐一确认对应用例 FAILED 后恢复（明细见 §4.1.0v 表）。
 
 **未完成**：`StudioManager` 自动装配（§4.2 #4）；`format` span 需宿主调用（§4.2 #6）；P2-1/P2-2/P2-3/P2-4。
+
+## 9. 2026-10-30 执行记录 — StudioClient 传输注入 / UserAgent 集成评估
+
+**任务与 Java 依据**
+- 任务 1（P1）：`StudioClient` 加 HTTP 传输注入点，使网络路径可离线测。Java 依据 `StudioClient.java`：`registerRun` → `POST {base}/trpc/registerRun`、`pushMessage` → `POST {base}/trpc/pushMessage`、`requestUserInput` → `POST {base}/trpc/requestUserInput`；三者均 `RequestBody.create(json, MediaType.get("application/json; charset=utf-8"))`，**无鉴权头**；`executeWithRetry` = `Retry.backoff(config.getMaxRetries(), 100ms).maxBackoff(5s).filter(IOException)`。
+- 任务 2（P1）：`StudioUserAgent` 与 core agent 循环集成。Java `StudioUserAgent extends AgentBase`（`getInputFromStudio` = `requestUserInput` + `waitForInput(timeout)`，`onErrorResume` 回退终端）。
+
+**改动文件**（仅本 crate + 本 tracker）
+| 文件 | 改动 |
+|---|---|
+| `src/studio/http.rs`（**新增**） | `StudioHttpRequest`/`StudioHttpResponse`/`trait StudioHttpTransport`（`async fn execute(&self, StudioHttpRequest) -> StudioResult<StudioHttpResponse>`）+ `ReqwestStudioTransport`（生产实现，10s connect / 30s request，行为与旧内联实现一致）+ `JSON_CONTENT_TYPE`/`HTTP_POST` + `#[cfg(test)] testing::{ScriptedTransport, Outcome}` |
+| `src/studio/client.rs` | `http: reqwest::Client` → `transport: Arc<dyn StudioHttpTransport>`；新增 `with_transport()`；`post_json` 改为「序列化 → 构建 `StudioHttpRequest` → 重试循环（`send_once`）」；`send_once` 负责非 2xx → `StudioError::Http`；+10 测试 |
+| `src/studio/mod.rs` | `pub mod http` + re-export；新增 `StudioManager::initialize_with_transports(config, http, ws)`（`initialize_with_transport` 改为委托，语义不变） |
+| `src/studio/user_agent.rs` | 新增 `drive_round<A: CallableAgent>` / `drive_round_with<A: CallableAgent>(agent, Msg)`；+3 测试 |
+| `src/error.rs` | 新增 `StudioError::Agent(String)`（不可重试，`is_retryable` 仍仅 `Transport`） |
+| `src/lib.rs` | re-export `StudioHttpRequest/Response/Transport/ReqwestStudioTransport`；模块文档补一条 |
+| `docs/extensions/STUDIO__GAP_TRACKER.md` | §1/§3.2/§4.2 #7 + 本节 |
+
+**新增测试（+13，均离线；transport 为脚本化）**
+- `studio::client::tests`（10，全部通过 `StudioClient` 公开方法）：`register_run_posts_java_shaped_request`（方法/路径/`Content-Type`/无鉴权头/body 六字段/`yyyy-MM-dd HH:mm:ss.SSS` 时间戳）、`push_message_posts_java_shaped_request`、`push_message_falls_back_to_reply_id_for_unnamed_messages`、`request_user_input_posts_java_shaped_request`（返回值 == body `requestId`、无 `structuredInput`）、`request_user_input_forwards_structured_schema`、`success_statuses_are_decoded_as_ok`（200/204）、`http_status_errors_are_not_retried`（§4.2 P2-1 现状锁定：500 仅 1 次尝试）、`transport_errors_are_retried_then_succeed`（重试请求体与 URL 不变）、`transport_errors_stop_after_max_retries`（1 + max_retries 次）、`role_labels_match_java`
+- `studio::user_agent::tests`（3）：`drive_round_with_feeds_a_core_agent_loop`（真实 `ReActAgent` + StubModel，断言回复与 `/trpc/pushMessage` 的用户消息）、`drive_round_with_tolerates_a_failed_push`（500 不中断本轮）、`drive_round_with_surfaces_agent_errors`（→ `StudioError::Agent`）
+
+**命令与结果（实测）**
+- `cargo test -p agentscope-extensions-studio -j 2` → **EXIT=0，83 passed / 0 failed / 0 ignored**（doc-tests 0 passed；基线 70）
+- `cargo clippy -p agentscope-extensions-studio --all-targets` → EXIT=0；本 crate 仅 2 条**既有** `clippy::type_complexity`（`telemetry/tracing.rs:510/520`），新代码 0 告警
+- `cargo fmt -p agentscope-extensions-studio -- --check` → 干净
+
+**反向验证（2 组，均回退 → FAILED → 恢复 → 全绿）**
+| # | 回退内容 | 结果 |
+|---|---|---|
+| 1 | `client.rs::send_once` 的 `if !response.is_success()` → `if false && !response.is_success()`（非 2xx 不再报错） | `http_status_errors_are_not_retried` FAILED（`test result: FAILED. 0 passed; 1 failed`） |
+| 2 | `user_agent.rs::drive_round_with` 推送失败改为 `client.push_message(...).await?`（不再容忍） | `drive_round_with_tolerates_a_failed_push` FAILED |
+
+**设计要点与诚实边界**
+- 传输契约：非 2xx 以 `Ok(StudioHttpResponse)` 返回、由 `StudioClient` 映射为 `StudioError::Http`；网络失败为 `StudioError::Transport`（唯一可重试变体）；传输层自身不重试（与 `judge` crate 的 `JudgeHttpTransport` 同构）。
+- **只锁定不改语义**：Java 把非 2xx 包成 `IOException` 会重试，Rust 不重试 —— 该分歧仍归 §4.2 P2-1，本轮用测试把现状固化（`http_status_errors_are_not_retried`），**未顺手修改**。
+- `StudioManager` 新增 `initialize_with_transports(config, http, ws)`；`initialize_with_transport` 语义不变（HTTP 侧 reqwest）。
+- UserAgent 集成**未改 core/harness**：`drive_round*` 以 core `CallableAgent`（`agentscope_core::agent::agent_traits`）为泛型边界，`ReActAgent` 与 `HarnessAgent` 直接可用；用户消息先推 Studio（失败仅告警），agent 错误映射为 `StudioError::Agent`（Java 的 `getInputFromStudio` 失败才回退终端，agent 错误不吞）。
+
+**未完成项与原因**
+1. `StudioUserAgent` 自动多轮循环（`loop { drive_round }` + 退出条件 + 中断传播）→ 需宿主决定终止/中断策略（Java `AgentBase` 子类化后由框架驱动，本 crate 无同构宿主），不臆造。
+2. `StudioManager` 自动装配 `TelemetryTracing`（§4.2 #4）、`format` span 宿主调用（§4.2 #6）—— 本轮未涉及。
+3. P2-1（HTTP 错误重试语义分歧，本轮按现状锁定）、P2-2（OTLP 自定义 header）、P2-3（属性键缺 5）、P2-4（`StudioUserAgent` name 校验）仍开放。

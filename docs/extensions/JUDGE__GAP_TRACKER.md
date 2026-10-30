@@ -21,7 +21,7 @@
 | Rust crate | `crates/agentscope-extensions-judge` |
 | Rust 规模（实测 2026-10-28） | **55** 个 `src/*.rs` / **23185** 行 / **286** 个测试（`#[test]` + `#[tokio::test]`；无 `tests/`、无 doc-test、无 `#[ignore]`） |
 | 是否注册 workspace | **是**（`Cargo.toml` 的 `crates/agentscope-extensions-judge`） |
-| 当前状态 | **总判：进行中**（2026-10-30 更新：中间件 hook / @Tool / `StoreJevContextArchive` 已落地，见 §9；P1 未清零 —— 剩余 `JevPhaseRouting` 的 judge 选择、`JevCodeReviewer` 六阶段驱动、`JevStageRouter`、`JevResponseMiddleware` 的 quality/reviser 分支）。**基本完成**（两个 HTTP 客户端 + `openai-decisions` 整块 + `jev` 八个编排子包的纯函数/定义层/状态机已落地；**jev 去 `browser`(4)/`example`(4) 共 42 类 = 完整 32 / 部分 8 / 骨架 2**） |
+| 当前状态 | **总判：进行中**（2026-10-30 两轮：中间件 hook / @Tool / `StoreJevContextArchive` 见 §9；`JevPhaseRouting` judge 选择与二次校验 / `JevResponseMiddleware` quality·reviser / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` 见 §10；**实测 336 passed / 0 failed**）。**P1 剩余仅两项且均需 core seam**：`JevGuardrail::screen` 的 reactive caller、`JevConfirmedCalls`（需 `RuntimeContext` 键值扩展槽）；`browser` / `example` 两个子包为「设计决定（不迁移）」，待汇总方确认 |
 
 ### 1.1 Rust crate 文件清单
 
@@ -388,3 +388,27 @@
 
 - `UnavailableContextArchive` 保留（无 store 的宿主仍需 fail-closed 占位）；`HARNESS_STORE_ARCHIVE_UNAVAILABLE` 文案仍指「本 crate 不依赖 harness」，现已在 §1.1/§9.1 说明该前提仅对 `archive.rs` 之外成立。
 - `Cargo.lock` 因新增两个 path 依赖变化属预期，未 stage、未还原。
+
+---
+
+## 10. 2026-10-30 执行记录（二）— phase routing / quality·reviser / reviewer 驱动 / stage router
+
+> 本轮代码由子智能体完成；**子智能体回执丢失（返回空）且未改本 tracker**，§10 与反向验证由主智能体根据落盘代码与实测补齐。
+> 未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 extension crate。
+
+| # | 项 | 结果 | 产物 |
+|---|---|---|---|
+| 1 | `JevPhaseRouting` 的 judge 选择与二次校验 | **已完成** | `src/jev/routing/phase_routing.rs`（+1221）：`routes()` 访问器、offer 组装（allowlist / exclusion）、命中后二次校验、`None` 路由不适用、低置信度仅报告不采用、skipped 候选带 Java reason code |
+| 2 | `JevResponseMiddleware` 的 quality / reviser 分支 | **已完成** | 新增 `src/jev/runtime/quality.rs`（25 KB）：`ScreenPolicy`（复用既有 `Screener` 缝）、`Revision`、`QualitySettings`、`revise_with_model`（模型调用走注入缝）、`capture`/`collect_text`/`replace_text`；`runtime/middleware.rs` 接 OFF / SHADOW / ENFORCE 三态 |
+| 3 | `JevCodeReviewer` 六阶段驱动 | **已完成（驱动层）** | 新增 `src/jev/runtime/review_driver.rs`（35 KB）：`ReviewDriver::{new, from_reviewer, config, mode, review}`，按 Java 顺序串行执行六阶段、`StageFailure` 短路、错误传播与结果聚合 |
+| 4 | `JevStageRouter` | **已完成（不含 legacy 模式）** | `src/jev/application/stage_router.rs`（+230）：`Phase` / `JevStageRouter::{new, begin, metadata_key, routing}`；**legacy 模型选择模式不迁**（`example` 子包依赖 core `Model` 句柄与 eligibility 谓词），以常量 `STAGE_ROUTER_UNAVAILABLE` 显式说明，并提供 `JevPhaseRouting` 显式阶段作为替代 |
+
+**测试**：`cargo test -p agentscope-extensions-judge -j 2` → EXIT=0，**336 passed / 0 failed / 0 ignored**（基线 308，+28）。
+`cargo build -p agentscope-extensions-judge` → EXIT=0，**本 crate 0 warning**（仅 core/harness 既有 warning）。
+新增用例（部分）：`resolve_routes_to_the_first_model_of_the_chosen_route`、`offers_apply_the_allowlist_and_exclusion_rules`、`resolution_without_a_caller_fails_closed`、`a_low_confidence_route_is_reported_but_not_used`、`the_none_route_is_not_applicable_and_leaves_the_call_alone`、`skipped_candidates_carry_the_java_reason_codes`、`a_pinned_model_is_used_without_asking_the_judge`、`an_explicit_phase_picks_its_first_usable_model`、`revalidation_drops_a_target_that_no_longer_fits`、`phase_routing_applies_the_resolved_model_and_effort_in_enforce`、`quality_enforce_revises_a_failing_draft_and_replaces_the_delta`、`quality_enforce_withholds_an_inconclusive_assessment`、`quality_shadow_observes_without_replacing`、`quality_skips_tool_calls_and_blank_drafts`、`a_blocked_revision_is_withheld`、`stages_and_goals_are_required`、`a_stage_routes_to_its_first_capable_model_without_asking_the_judge`、`an_unknown_or_uncapable_stage_fails_closed`、`a_pinned_request_still_keeps_its_target`。
+
+**反向验证（主智能体补做，2 组）**：
+1. 注释掉 `revalidate` 的 `input_restriction(...)` 分支 → `revalidation_drops_a_target_that_no_longer_fits` **FAILED**（断言 `!...is_valid()` 失败），恢复后绿；
+2. 在 `ResponseMiddleware` 的 ENFORCE 分支提前 `return events`（既不改写也不拦）→ `quality_enforce_revises_a_failing_draft_and_replaces_the_delta` **FAILED**，恢复后 336/0 全绿。
+
+**未完成（P1 剩余，均需 core seam）**：`JevGuardrail::screen` 的 reactive caller、`JevConfirmedCalls`（需 core `RuntimeContext` 键值扩展槽）；`browser` / `example` 两个子包仍为「设计决定（不迁移）」，待汇总方确认。

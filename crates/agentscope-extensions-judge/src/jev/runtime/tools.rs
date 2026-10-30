@@ -25,12 +25,14 @@ use serde_json::{json, Value};
 
 use crate::error::JevError;
 use crate::jev::application::KnowledgeDocument;
+use crate::jev::call::Caller;
 use crate::jev::code_review::{JevCodeReviewer, ReviewReport};
 use crate::jev::evidence::tool::{evidence_result, EvidenceResult, JevEvidenceTool};
 use crate::jev::evidence::{JevEvidenceProcessor, JevPassage};
-use crate::jev::execution::Decision;
+use crate::jev::execution::{Decision, Mode};
 use crate::jev::integration::knowledge::{knowledge_passages, JevKnowledge};
 use crate::jev::review::JevReviewInput;
+use crate::jev::runtime::review_driver::ReviewDriver;
 
 /// The evidence tool name (`@Tool(name = "search_evidence")`).
 pub const EVIDENCE_TOOL_NAME: &str = "search_evidence";
@@ -294,10 +296,9 @@ pub trait CodeReviewSource: Send + Sync {
 
 /// Runs the staged review over a loaded snapshot (`JevCodeReviewer.review`).
 ///
-/// The driver is a trait because the six-stage screen/profile/locate/classify/severity/route
-/// pipeline is its own task (tracker §9.5); the crate's default driver delegates to
-/// [`JevCodeReviewer`] and therefore fails closed with
-/// [`CODE_REVIEWER_UNAVAILABLE`](crate::jev::code_review::CODE_REVIEWER_UNAVAILABLE).
+/// The driver is a trait so a host can substitute its own pipeline; the crate's own driver is
+/// [`JevCodeReviewerDriver`], which runs the six stages with
+/// [`ReviewDriver`](crate::jev::runtime::review_driver::ReviewDriver).
 #[async_trait]
 pub trait CodeReviewDriver: Send + Sync {
     /// Reviews a validated snapshot.
@@ -305,24 +306,63 @@ pub trait CodeReviewDriver: Send + Sync {
 }
 
 /// The crate's own driver: delegates to the ported [`JevCodeReviewer`].
+///
+/// [`JevCodeReviewerDriver::new`] has no System One caller and therefore stays fail-closed with
+/// [`CODE_REVIEWER_UNAVAILABLE`](crate::jev::code_review::CODE_REVIEWER_UNAVAILABLE);
+/// [`JevCodeReviewerDriver::with_caller`] wires the staged driver.
 pub struct JevCodeReviewerDriver {
     reviewer: Arc<JevCodeReviewer>,
+    staged: Option<ReviewDriver>,
 }
 
 impl JevCodeReviewerDriver {
-    /// Wraps a configured reviewer.
+    /// Wraps a configured reviewer without a System One caller (fail-closed).
     pub fn new(reviewer: Arc<JevCodeReviewer>) -> Self {
-        Self { reviewer }
+        Self {
+            reviewer,
+            staged: None,
+        }
+    }
+
+    /// Wraps a configured reviewer and runs the staged driver over `caller`.
+    ///
+    /// Fails closed for [`Mode::Enforce`](crate::jev::execution::Mode::Enforce), because a review
+    /// is advice and never an approval.
+    pub fn with_caller(
+        reviewer: Arc<JevCodeReviewer>,
+        caller: Caller,
+        mode: Mode,
+    ) -> Result<Self, JevError> {
+        let staged = ReviewDriver::from_reviewer(&reviewer, caller, mode)?;
+        Ok(Self {
+            reviewer,
+            staged: Some(staged),
+        })
+    }
+
+    /// The wrapped reviewer definition.
+    pub fn reviewer(&self) -> &Arc<JevCodeReviewer> {
+        &self.reviewer
+    }
+
+    /// Whether the staged pipeline is wired (rather than fail-closed).
+    pub fn is_staged(&self) -> bool {
+        self.staged.is_some()
     }
 }
 
 #[async_trait]
 impl CodeReviewDriver for JevCodeReviewerDriver {
-    async fn review(&self, _input: JevReviewInput) -> Result<Decision<ReviewReport>, JevError> {
-        // `JevCodeReviewer::review` is fail-closed until the staged driver lands; once it
-        // returns a report this adapter needs no change.
-        let report = self.reviewer.review()?;
-        Ok(Decision::decided(report))
+    async fn review(&self, input: JevReviewInput) -> Result<Decision<ReviewReport>, JevError> {
+        match &self.staged {
+            Some(driver) => driver.review(input).await,
+            None => {
+                // Fail-closed: without a caller nothing can be reviewed, and silence is never an
+                // approval.
+                let report = self.reviewer.review()?;
+                Ok(Decision::decided(report))
+            }
+        }
     }
 }
 

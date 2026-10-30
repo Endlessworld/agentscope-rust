@@ -18,7 +18,7 @@
 | Java 规模（实测行数） | 主代码 8832 / 测试 4554（见下表；2026-10-22 静态复核实测，见 §6） |
 | Rust crate | `crates/agentscope-extensions-sandbox` |
 | 迁移波次 | A |
-| 当前状态 | **总判：P1 清零（2026-10-30，按 §3.2 P1 行口径）**——原 P1 项（PortForward / K8s 文件 API / fs_spec projection+guard）均已落地，剩余仅 P2 字段与真实端点联调—— **已完成**（build 通过；**188 passed / 0 failed**（2026-10-30）；`fs_spec`、`kubernetes_files`、K8s 文件 API 与 E2B 原生传输**均已接线**，见 §3.2/§7）。⚠️ **保留差异（若汇总方视为 P1 则需上调，不得静默降级）**：① `Gateway` 连接策略仍为一次性读 CRD（无 watch）；② `K8sHelper` 的 list / watch / 模板能力未迁移（`listSandboxClaims`/`listActiveSandboxes`/`deleteAll` 等）；两项均在 §7 残留清单 (2)(3)(4) 中待办 |
+| 当前状态 | **总判：P1 清零（2026-10-30 二轮，按 §3.2 P1 行口径）**——原 P1 项（PortForward / K8s 文件 API / fs_spec projection+guard）均已落地，剩余仅 P2 字段与真实端点联调—— **已完成**（build 通过；**188 passed / 0 failed**（2026-10-30 一轮；二轮 **205 passed**，`--lib` 连跑 8 次全绿，见 §9.5）；`fs_spec`、`kubernetes_files`、K8s 文件 API 与 E2B 原生传输**均已接线**，见 §3.2/§7）。⚠️ **保留差异（若汇总方视为 P1 则需上调，不得静默降级）**：① `Gateway` 连接策略为「一次性读 + 有界轮询等地址出现」，**无后台 watch 任务**（Java 用 fabric8 `Watch`；Rust 无宿主任务/取消句柄，长任务会泄漏；且 Rust 每次调用重解析地址，强于 Java 的 `baseUrl` 缓存，见 §9.4）；② `K8sHelper` 的 **`watch=true` 流式订阅**、模板（`SandboxTemplate`）、port-forward 其余能力未迁移（list/get/delete/warmPool 已于二轮完成，§9.2）；③ `listActiveSandboxes` 的「prune 非 active 条目」无等价存活信号（改为删除即摘除）。~~K8sHelper 的 list（`listSandboxClaims`/`listActiveSandboxes`/`deleteAll`）~~ → **已于 2026-10-30 二轮完成** |
 
 | Java 子模块 | 主代码 文件/行 | 测试 文件/行 | 顶层类型数 |
 |---|---|---|---|
@@ -197,8 +197,8 @@
 | E2B 云桶挂载策略 | `e2b/mounts/E2bCloudBucketMountStrategy` | 设计决定（不迁移）（2026-10-29 勘误：原记「待办」；Java 该类为 `intentionally empty` 空接口，无方法可迁） | 无 Rust 对应。**注意**：Java 该接口是**空占位**（`intentionally empty`），无实际方法，迁移价值为 0 |
 | E2B 沙箱创建环境变量 | `E2bSandboxClientOptions.envs`（`Map<String,Supplier<String>>`）+ `E2bPlatformHttp` 的 `envVars` 字段 | 待办（2026-10-29 待复核） | Rust `E2bSandboxClientOptions` **无 `envs` 字段**，`build_create_sandbox_body` 只发 `{templateID, timeout}`，**不发送 `envVars`**。Java `E2bFilesystemSpec.env(name, value)` 亦无对应 |
 | K8s CRD spec 扩展字段 | `SandboxClaimSpec.lifecycle`（shutdownTime/shutdownPolicy）、`SandboxClaimSpec.additionalPodMetadata`（labels/annotations）、`CreateSandboxOptions.shutdownAfterSeconds` | 待办（2026-10-29 待复核） | Rust `build_claim_body` 只发 `spec.warmPoolRef` |
-| K8s 客户端附加能力 | `SandboxClient.listActiveSandboxes`/`listAllSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName`、`K8sHelper.listSandboxClaims` | 待办（2026-10-29 待复核） | 无 Rust 对应 |
-| K8s K8sHelper 细分能力 | `client/internal/K8sHelper` | 部分完成 | 以 reqwest 直连覆盖 claim/status/exec；其余（列表、watch、端口转发、模板）未迁移 |
+| K8s 客户端附加能力 | `SandboxClient.listActiveSandboxes`/`listAllSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName`、`K8sHelper.listSandboxClaims` | **已完成（2026-10-30，见 §9.2）** | `KubernetesBackend::{list_sandbox_claims(Option<&str>), get_sandbox_claim, get_sandbox_claim_warm_pool_name, delete_sandbox_claim, list_active_sandboxes, delete_all}` + 纯函数 `parse_claim_names`/`claim_warm_pool_name`；`active_claims: Arc<Mutex<BTreeSet>>` 复刻 Java `activeSandboxes`（`namespace/claimName` 键），`create_sandbox`/`connect_sandbox` 记录、`kill_sandbox`/`delete_sandbox_claim`/`delete_all` 摘除 |
+| K8s K8sHelper 细分能力 | `client/internal/K8sHelper` | 部分完成（2026-10-30：list/get/delete/warmPool 已迁移，见 §9.2） | 以 reqwest 直连覆盖 claim create/get/list/delete/status/exec；`watch=true` 流式订阅、模板（`SandboxTemplate`）仍未迁移（见 §9.3 评估） |
 | Jackson 模块 | `*HarnessSandboxJacksonModule` | 设计决定（不迁移） | serde 按 enum 变体序列化 |
 | 投影哈希算法对齐 | Java `MessageDigest` | 已完成（语义等价） | Rust 用 FNV-1a；仅用于变更检测，不跨语言互操作 |
 | E2B 创建请求缺 volume mount（2026-10-26 新增） | `9730e8171`/`aa66abfd0`（`E2bPlatformHttp.createSandbox` 支持 `volumeMounts`） | ✅ 已完成（2026-10-27） | `e2b.rs`：新增 `E2bVolumeMount { name, path }`——`name` 是**平台侧已存在的 E2B 卷**、`path` 是沙箱内绝对路径（对齐 Java `E2bVolumeMount`；Java 的 `E2bCloudBucketMountStrategy` 在同 commit 里是**空占位接口**，故云桶挂载双方都不实现，tracker 旧描述里的“宿主目录/云桶”与 Java 实际不符，已更正）；`normalize_mount_path`（trim / `\`→`/` / 折叠 `//` / 去尾斜杠）、`covers_workspace_root`、`require_distinct_mount_paths` 逐条对齐 Java；`E2bSandboxClientOptions.volume_mounts` + `with_volume_mount`；`build_create_sandbox_body_with_mounts` 输出 `volumeMounts: [{name, path}]`，**空挂载时整字段省略**（`build_create_sandbox_body` 签名与输出完全不变），新建 / connect 兜底重建 / 原生快照恢复三条创建路径共用。测试：`create_body_with_volume_mounts_matches_java`、`create_body_without_volume_mounts_keeps_the_legacy_shape`、`platform_create_sends_volume_mounts`（httpmock 精确断言请求体）、`volume_mount_validates_name_and_normalizes_path`、`volume_mount_covers_workspace_root`、`require_distinct_mount_paths_rejects_duplicates`、`options_with_volume_mount_validates_and_rejects_duplicates`。反向验证：关掉挂载写入分支 → 前两条 FAILED。**遗留**：Java 的 `workspaceOnVolume`（工作区落在卷上时 TAR persist/hydrate 变 no-op、destroy 跳过 `rm -rf`、嵌套挂载 tar `--exclude`）未迁移，建议单开一条 |
@@ -225,6 +225,7 @@
 2. **harness 缺少 `SandboxFilesystemSpec` / `SandboxFileTransfer`**：Java 扩展的 4 个 `*FilesystemSpec` 继承 harness Java `SandboxFilesystemSpec`（`io.agentscope.harness.agent.filesystem.spec`），`SandboxFileTransfer` 亦为 harness Java 类型（`io.agentscope.harness.agent.sandbox`）。**Rust harness 复核确认两者皆无**（`rg 'SandboxFilesystemSpec|SandboxFileTransfer' crates/agentscope-harness/src/` → 0 命中；harness 只有 `SandboxFilesystem` trait + `SandboxBackedFilesystem`）。**已按裁定在本 crate 内建适配层**（`fs_spec.rs` 的 `SandboxFilesystemSpec` + `kubernetes_files.rs` 的 `SandboxFileTransfer`），**未改 harness/core**。若 harness 后续补齐同名类型，本 crate 的实现可直接切换继承/实现面，无需改调用点。**遗留**：Java `SandboxBackedFilesystem` 会在沙箱实现 `SandboxFileTransfer` 时**优先走原生传输**；Rust harness 无此机制。**已完成（2026-10-29 勘误）**：原记「`fs_spec::SandboxFilesystemAdapter` 只能全量走 exec+base64」，实际适配器已优先原生传输（用例 `fs_spec::tests::adapter_write_prefers_native_transfer`、`adapter_read_prefers_native_transfer_and_windows_lines`），仅需调用方显式 `from_remote_sandbox(...)` / `filesystem_with_transfer(...)` 传入传输适配器（harness `Sandbox` 为 `dyn` 且无 `as_any`，无法自动下转，见 §7.5-3）。
 3. **P1 剩余**（2026-10-28 更新）：① `PortForwardStrategy`（fabric8 `LocalPortForward`）无对应，Java 在该场景（无 apiUrl/gateway）为默认 — Rust 回退 `InCluster`，已记差异；② E2B `workspaceOnVolume`（工作区在卷上时的 tar no-op / destroy 跳过 / 嵌套挂载 `--exclude`）未迁移；③ E2B `envs → envVars`、K8s `SandboxClaimSpec.lifecycle`/`additionalPodMetadata` 等 P2 字段。~~E2B Proto codec、K8s 策略语义、文件 API / 原生传输接线~~ → **已完成（见 §7）**。**2026-10-29 复核补充的完整残留清单**：(1) `PortForwardStrategy`（`LocalPortForward` 无对应）；(2) `GatewayStrategy` 无 watch（一次性读取）；(3) `K8sHelper` 的 list/watch/模板/port-forward 未迁移；(4) K8s `listSandboxClaims`/`listActiveSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName` 未迁移；(5) `SandboxFilesystemSpec` 缺 `executionGuard`/`workspaceProjectionEnabled`/`workspaceProjectionRoots`，且 `__workspace_projection__` 未真写入（仅常量保留）；(6) 原生传输需显式 `from_remote_sandbox`（`dyn Sandbox` 无 `as_any`）；(7) E2B `workspaceOnVolume` 与 `envs → envVars`；(8) K8s CRD `lifecycle`/`additionalPodMetadata`/`shutdownAfterSeconds`；(9) E2B `E2bCloudBucketMountStrategy`（Java 为空占位接口，迁移价值 0）。
    > **2026-10-30**：上述 (1) `PortForwardStrategy` 与 (5) `SandboxFilesystemSpec` 的 guard/projection 已完成（见 §8）；(2)(3)(4)(6)(7)(8)(9) 仍待办。
+   > **2026-10-30 二轮**：(2) `Gateway` 地址等待、(4) `listSandboxClaims`/`listActiveSandboxes`/`deleteAll`/`getSandboxClaimWarmPoolName` 已完成（见 §9.2 / §9.4）；(3) 仅剩 `watch=true` 流式订阅、模板与 port-forward 其余能力；(6)(7)(8)(9) 仍待办。另：`--lib` 高频 flake 的根因（本机系统代理劫持 loopback mock 流量）已修复，见 §9.1。
 4. **真实端点联调**：需真实 E2B/Daytona/AgentRun/K8s 凭据；当前全部请求体构造/响应解析/重试均有离线单测覆盖。
 5. **跨模块需求**：无硬阻塞。本 crate 依赖 `agentscope-core`（`Msg`/`Error`/`RuntimeContext`）与 `agentscope-harness`（sandbox trait/类型、`WorkspaceSpec`/`ExecResult`/`SandboxState`/快照 trait、`filesystem`）。无 workspace 级依赖变更需求（所有依赖已在 workspace 定义或本 crate `[dependencies]` 声明）。
 
@@ -351,7 +352,7 @@ cargo fmt   -p agentscope-extensions-sandbox -- --check -> 通过
 
 ### 7.5 已知差异 / 需裁定
 1. **`PortForwardStrategy` 未迁移**（需 fabric8 `LocalPortForward` 等价物）。Java 在「无 apiUrl、无 gateway」时为默认策略；Rust 默认回落 `InCluster`（pod IP → 服务 DNS）。已在 §3.2 记差异。→ **已迁移（2026-10-30，`KubernetesPortForwarder` seam，见 §8）**
-2. **`Gateway` 策略的地址来源**：优先注入的 `gateway_address`，否则读 Gateway CRD（`gateway.networking.k8s.io/v1` REST，需 `api_url` + RBAC）；Java 额外 watch 就绪事件，Rust 为一次性读取（无 watch）。
+2. **`Gateway` 策略的地址来源**：优先注入的 `gateway_address`，否则读 Gateway CRD（`gateway.networking.k8s.io/v1` REST，需 `api_url` + RBAC）；Java 额外 watch 就绪事件，Rust 为一次性读取（无 watch）。→ **2026-10-30 二轮：已改为「一次性读 + 有界轮询等地址出现」（等价 Java `connect()` 的 watch-until-address，无后台任务），见 §9.4；变更感知靠每次调用重解析**
 3. **`SandboxFilesystemSpec::filesystem` 仍不自动探测原生传输**：harness `Sandbox` 是 `dyn` 且无 `as_any`，无法从 `Arc<dyn Sandbox>` 下转；因此提供 `SandboxFilesystemAdapter::from_remote_sandbox(Arc<RemoteSandbox>, ..)` 与 `filesystem_with_transfer(...)` 显式接线（传 `RemoteSandbox::file_transfer()`）。
 4. **E2B `Proto` codec 不迁**：需 envd protobuf schema + `DynamicMessage` 等价物，且无真实端点离线可验；envd 同时支持 JSON codec，语义等价。
 5. **`fs_spec` 适配器捕获的传输适配器在句柄重建时不会自动刷新**（构造时快照）；`RemoteSandbox` 自身的 `file_transfer()` 会在 `ensure_handle`/快照重建后刷新。如果调用方在重建后继续用旧适配器，需重新构造。
@@ -419,7 +420,7 @@ cargo test -p agentscope-extensions-sandbox -j 2                 -> 188 passed /
 cargo clippy -p agentscope-extensions-sandbox --all-targets     -> 本 crate 两文件 0 warning（其余 warning 在他处，预先存在）
 cargo fmt -p agentscope-extensions-sandbox                      -> 已格式化
 ```
-> ⚠️ 环境性 flake（**与本次改动无关，已在未改动基线上复现**）：本 crate 的 httpmock 用例（`kubernetes::{persist_workspace_uses_the_file_api_when_enabled, hydrate_workspace_uploads_the_archive_then_extracts, file_transfer_uploads_and_downloads_under_the_base_dir}`、`e2b::{persist_tar_*, hydrate_tar_*}`）在**高频连续重跑 / 机器高负载**下偶发 `Transport("error sending request for url (http://127.0.0.1:*…)")`（`RetryPolicy` 不重试 Transport，故直接失败）。实测：用 `git show HEAD:` 临时还原两文件（真基线与首轮二进制均 177 tests）后连跑 5 次失败 1 次、单用例连跑 8 次失败 0 次；本版连跑亦为同类、失败用例每次不同且包含本次**未改动**的 `e2b` 用例 ⇒ 判定为 Windows 高负载下 `httpmock` 建连竞争，非代码缺陷；重跑即绿（已取得 188/0/EXIT=0 的完整绿跑）。
+> ⚠️ 环境性 flake（**与本次改动无关，已在未改动基线上复现**）：本 crate 的 httpmock 用例（`kubernetes::{persist_workspace_uses_the_file_api_when_enabled, hydrate_workspace_uploads_the_archive_then_extracts, file_transfer_uploads_and_downloads_under_the_base_dir}`、`e2b::{persist_tar_*, hydrate_tar_*}`）在**高频连续重跑 / 机器高负载**下偶发 `Transport("error sending request for url (http://127.0.0.1:*…)")`（`RetryPolicy` 不重试 Transport，故直接失败）。实测：用 `git show HEAD:` 临时还原两文件（真基线与首轮二进制均 177 tests）后连跑 5 次失败 1 次、单用例连跑 8 次失败 0 次；本版连跑亦为同类、失败用例每次不同且包含本次**未改动**的 `e2b` 用例 ⇒ 判定为 Windows 高负载下 `httpmock` 建连竞争，非代码缺陷；重跑即绿（已取得 188/0/EXIT=0 的完整绿跑）。→ **2026-10-30 二轮已定位真因（本机系统代理劫持 loopback mock 流量），见 §9.1；修复后连跑 68 次 0 失败**
 
 ### 8.6 反向验证（回退 → FAILED → 恢复 → 全绿）
 | # | 回退内容 | FAILED 用例（实测） |
@@ -434,4 +435,106 @@ cargo fmt -p agentscope-extensions-sandbox                      -> 已格式化
 1. **真实 port-forward 实现**：本次只落地 seam（`KubernetesPortForwarder`）与解析链路（pod 发现 + 端口常量 + 本地 base URL 推导）；真正的隧道（kube-rs port-forward / `kubectl port-forward` 子进程）需真实集群验收，与本 crate「无真实端点联调」同类，记 §4.2。
 2. **`Gateway` / `Endpoints` 仍是一次性读取**（无 watch），与 §7.5-2 一致。
 3. **`PortForwardStrategy#close()` 的隧道生命周期未建模**：回收归 forwarder 实现方（trait 文档已写明幂等要求与生命周期归属）。
-4. `K8sHelper` 的 list/watch/模板/port-forward 其余能力、`listSandboxClaims` 等仍在 §4.2 清单 (3)(4) 待办。
+4. `K8sHelper` 的 list/watch/模板/port-forward 其余能力、`listSandboxClaims` 等仍在 §4.2 清单 (3)(4) 待办。→ **2026-10-30 二轮：list/get/delete/warmPool 已完成，见 §9.2；仅剩 `watch=true` 流式订阅与模板**
+
+---
+
+## 9. 2026-10-30 执行记录（二）— e2b httpmock flaky 稳定化 / K8s list·delete·warmPool / Gateway 等待
+
+对应 §4.2 清单 **(2)(3)(4)**、§7.5-2 与 §8.5 记录的 flake。
+
+### 9.1 任务 1：e2b / httpmock「0 of 1 expected requests matched」根因与修复
+
+**诊断（先复现分布，再抓真实错误链，未凭猜测改代码）**
+1. 复现分布：`--lib` 连跑 15 次失败 5 次；失败用例**不限于** §8.5 记录的 4 个，`kubernetes::tests::{file_transfer_uploads_and_downloads_under_the_base_dir, hydrate_workspace_uploads_the_archive_then_extracts}` 同样命中。共同点：**一个测试内连续两次请求同一个 mock server，第二个失败**（`a hits=1 b hits=0`，请求根本没到服务端）。
+2. 真实错误链（临时把 reqwest 错误以 `{e:?}` 打印，未落盘、已还原）：`hyper_util::client::legacy::Error(SendRequest, hyper::Error(Io, Os { code: 10053, kind: ConnectionAborted }))` = **WSAECONNABORTED**，keep-alive 复用连接被中止。
+3. 最小复现（临时 integration test：起 mock → 同 client 顺序两个 POST → drop，400 轮）：16/400 失败且全是第二个请求；失败时响应头出现 `proxy-connection: keep-alive` / `keep-alive: timeout=60`，而 `.no_proxy()` 客户端 **300/300 全绿**且这些头消失。
+4. 环境定位：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 为 `ProxyEnable=1`、`ProxyServer=127.0.0.1:10808`、`ProxyOverride` 含 `127.*`。reqwest 0.13 的 `system-proxy` feature 走 `hyper-util::client::proxy::matcher` 读该注册表项，把 `ProxyOverride` 原样塞进 `NoProxy`（只做了 `*.`→`` 的替换），于是 `127.*` 成为**字面域名**、永远不匹配 `127.0.0.1` ⇒ loopback mock 流量全部进本地系统代理，代理回收空闲连接时给客户端 RST。
+5. 结论（逐条排除题面怀疑方向）：**不是** httpmock 0.7 的端口复用 / `start_async` 与注册竞态（同一用例第一个请求必成功）；**不是** mock 在 `assert_async` 前被 drop；**不是** 生产 `RetryPolicy` 重试打空（`Transport` 不可重试）；**不是** `body_contains` 与 multipart 时序；**不是** `known_snapshots` 等全局状态。是**机器系统代理劫持 loopback**，故「回退到 `50ae343` 仍失败」「`--test-threads=1` 仍失败」都能解释。
+
+**修复（生产代码，非测试绕过；未加 `#[ignore]`、未删/放宽任何断言）**
+| 位置 | 改动 |
+|---|---|
+| `src/http.rs` | 新增 `is_loopback_target(value)`（接受 URL 或裸 `host[:port]`；`localhost` 忽略大小写与尾点、`127.0.0.0/8`、`::1`；`127.0.0.1.example.com`、`http://[::2]`、`http://10.0.0.5` 判否）与 `bypass_proxy_for_loopback(builder, targets)`：**任一**目标为 loopback 时 `builder.no_proxy()`，否则保留 ambient（环境变量 / 系统）代理；`client_builder(opts)` 抽出共用构建器，`build_client` 行为不变 |
+| `src/agentrun.rs` / `src/daytona.rs` / `src/e2b.rs` / `src/kubernetes.rs` | 4 个后端构造 reqwest client 处接线：agentrun=`base_url`；daytona=`control_plane_base_url`+`toolbox_base_url`；e2b=`api_base_url`+`envd_sandbox_url`+`E2B_SANDBOX_URL` 覆盖值；kubernetes=`api_url`+`sandbox_api_url`+`gateway_address` |
+| `src/lib.rs` | re-export 两个新函数 |
+
+依据：Java `OkHttp` 的默认 `ProxySelector` 对本地地址一律 bypass（`<local>`），故「loopback 不走代理」是**对齐 Java 的行为**，同时修掉 port-forward / 本地 router 场景下真实用户会踩的同一个坑；非 loopback 流量仍走系统代理，外网行为不变。无新增依赖。
+
+### 9.2 任务 2：K8s 列表 / 删除 / warmPool（`K8sHelper` + `SandboxClient` 等价物）
+
+Java 依据（逐文件读取）：`client/internal/K8sHelper.java` 的 `listSandboxClaims(namespace, labelSelector)`（`withLabelSelector` 仅在非空白时生效，取 `items[].metadata.name`，保留服务端顺序）、`getSandboxClaim`（404 返 `null`）、`deleteSandboxClaim`（名空即 no-op、404 视为已删）；`client/SandboxClient.java` 的 `listActiveSandboxes`（`activeSandboxes` 的 `namespace/claimName` 键集，prune 非 active）、`deleteAll`（逐个删除、逐个吞错打日志）、`getSandboxClaimWarmPoolName`（claim 缺失抛 `SandboxNotFoundException`，无 `spec.warmPoolRef` 返 `null`）。
+
+| 位置 | 改动 |
+|---|---|
+| `src/kubernetes.rs` 纯函数 | `parse_claim_names(&Value)`（保留顺序、跳过无 `metadata.name` 或空白名）、`claim_warm_pool_name(&Value)`（`spec.warmPoolRef.name`，空白视为无） |
+| `src/kubernetes.rs` 后端方法 | `list_sandbox_claims(Option<&str>)`（`?labelSelector=`，经 `RequestBuilder::query` 正确编码）、`get_sandbox_claim`（404→`Ok(None)`）、`get_sandbox_claim_warm_pool_name`（缺失→`Runtime(WorkspaceStartError)`，正文逐字对齐 Java 消息 `SandboxClaim '<name>' not found in namespace '<ns>'.`）、`delete_sandbox_claim`（空名 no-op、404 容忍）、`list_active_sandboxes()`（有序键集）、`delete_all()`（全试一遍、取首个错误、**始终**清空注册表） |
+| 注册表 | 新增字段 `active_claims: Arc<Mutex<BTreeSet<String>>>`；`create_sandbox` / `connect_sandbox` 记录、`kill_sandbox` / `delete_sandbox_claim` / `delete_all` 摘除（`kill_sandbox` 现复用统一的 `delete_claim_in`，行为不变：404 容忍） |
+| 内部 | `claims_collection_path_in(ns)` / `claim_path_in(ns, name)`（`delete_all` 需按各键自带 namespace 删除）；`k8s_request_query(method, path, query, body)`（`k8s_request` 委托为空 query，行为不变） |
+
+**语义差异（已记 §9.7）**：① Java `listActiveSandboxes` 会 prune「客户端句柄已失活」的条目，claim-only 后端没有该存活信号，改为「删除即摘除」；② `deleteAll` 在 Java 里走 `Sandbox#terminate()`（含关闭连接），Rust 等价物是「删 claim」（无客户端连接可关）。
+
+### 9.3 `watch=true` 流式订阅：评估结论（未实现，仅留待办）
+
+- **Java 侧**：`K8sHelper.resolveSandboxName` / `waitForSandboxReady` 用 fabric8 `Watch`（长连接事件流）；`listSandboxClaims` **本身不用 watch**（一次性 `list()`），所以 K8s `list` 系列已完整。
+- **Rust 侧现状**：就绪等待已用**轮询**实现（`wait_until_ready`，`READY_POLL_INTERVAL_MS=1500ms`，语义等价且已有测试），因此 `watch` 不是 list 的前置条件。
+- **不做流式 `watch` 的理由**：① `KubernetesBackend::decode_json` 用 `resp.text()` 读完整个 body，而 `?watch=true` 的响应在 `timeoutSeconds` 前**不会结束**，当前请求助手直接卡死；② 要正确实现需 `bytes_stream()` 逐行分帧 + 取消语义 + 重连 `resourceVersion` 续订，属独立子系统；③ 本 crate 无宿主后台任务/取消句柄（见 §9.4 同类评估），长连接只能挂在调用栈上，容易泄漏。
+- 结论：记 §4.2 (3) 残余，等宿主提供任务生命周期后再做；如需「事件驱动就绪」可先降级为轮询（已具备）。
+
+### 9.4 任务 3：`Gateway` 地址等待与变更感知
+
+- **Java 依据**（`internal/strategy/GatewayStrategy.java`）：`connect()` 首次 `get` 拿不到地址时，用 fabric8 `Watch` 等 `gatewayReadyTimeoutSeconds`（`GatewayConnectionConfig` 默认 180s），`DELETED` 事件报错；拿到后 `volatile baseUrl` **缓存**，`close()` 才清空。即 Java **不监听地址变更**，只等「地址出现」。
+- **原 Rust**：`resolve_gateway_address()` 一次性 `get`，拿不到就报配置错误。
+- **本次落地**：新增 `KubernetesBackend::wait_for_gateway_address()`（预算复用 `sandbox_ready_timeout_seconds`，默认 180s，与 Java 默认值一致；轮询间隔复用 `READY_POLL_INTERVAL_MS`）+ 可测的 `wait_for_gateway_address_with(budget, interval, fetch)`（超时返回 `Ok(None)`、fetch 错误原样上抛、`interval` 下限钳到 1ms 防忙等）；`connector_base_url` 的 `Gateway` 分支改用它，超时报 `Runtime(ConfigurationError)`，正文 `Timed out waiting for gateway address: <name>`（对齐 Java）。**未派生任何后台任务**，因此不需要取消句柄、无泄漏。
+- **变更感知**：`connector_base_url` 每次调用都重解析（无 `baseUrl` 缓存），地址变化会在下一次 exec/文件 API 请求生效 —— 比 Java 的「缓存到 `close()`」更强，故**不引入 watch 任务**。
+- **保留差异**：① `resolve_gateway_address` 对**读取失败**（如 403）仍返 `Ok(None)`，于是会等满预算再报超时；Java 会把 ApiException 直接抛出（快速失败）。② 无 `DELETED` 事件处理（轮询下表现为一直 `None` → 超时）。两项记 §9.7。
+
+### 9.5 测试与验证（实测）
+
+**新增 17 个离线用例（188 → 205）**
+| 文件 | 用例 |
+|---|---|
+| `http` | `loopback_targets_are_recognized`（含裸 `127.0.0.1:10000`、`localhost:49983`、`[::1]`、`localhost.`）、`non_loopback_targets_are_rejected`（含 `127.0.0.1.example.com`、`localhost.evil.test`、`10.0.0.5`、`[::2]`、空串）、`proxy_bypass_only_applies_to_loopback_targets` |
+| `kubernetes`（纯函数） | `parse_claim_names_skips_missing_and_blank_names`、`claim_warm_pool_name_reads_the_reference` |
+| `kubernetes`（httpmock） | `list_sandbox_claims_returns_names_in_server_order`、`list_sandbox_claims_sends_the_label_selector`、`get_sandbox_claim_returns_none_on_404`、`get_sandbox_claim_warm_pool_name_reads_the_claim`、`get_sandbox_claim_warm_pool_name_errors_when_the_claim_is_missing`、`delete_sandbox_claim_tolerates_404_and_blank_names`、`active_claims_track_attach_and_forget_deletes`、`delete_all_removes_every_tracked_claim`、`delete_all_reports_the_first_failure_but_clears_the_registry` |
+| `kubernetes`（等待语义） | `gateway_address_wait_polls_until_the_address_appears`（注入 fetch 序列，断言 3 次轮询）、`gateway_address_wait_gives_up_after_the_budget`（含错误上抛）、`gateway_without_a_published_address_times_out_with_the_java_message`（httpmock 断言轮询命中 ≥2 次） |
+
+**判据：`cargo test -p agentscope-extensions-sandbox --lib` 连续 8 次全绿**
+```
+run 1: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.53s)
+run 2: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.53s)
+run 3: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.53s)
+run 4: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.54s)
+run 5: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.52s)
+run 6: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.52s)
+run 7: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.53s)
+run 8: EXIT=0 failures_segment=False | ok. 205 passed; 0 failed; 0 ignored (1.53s)
+```
+（修复前同一二进制连跑 15 次失败 5 次；修复后另加跑 60 次 0 失败。）
+
+```
+cargo test -p agentscope-extensions-sandbox -j 2      -> 205 passed / 0 failed / 0 ignored（EXIT=0；基线 188）
+cargo build -p agentscope-extensions-sandbox          -> 0 error（本 crate 无新 warning）
+cargo fmt -p agentscope-extensions-sandbox -- --check  -> 通过
+```
+
+### 9.6 反向验证（回退 → FAILED → 恢复 → 全绿）
+| # | 回退内容 | 结果（实测） |
+|---|---|---|
+| 1 | `bypass_proxy_for_loopback` 恒返回 `builder`（等于回到修复前） | 连跑 12 次 **11 次失败**，命中原 4 个 e2b 用例 + `kubernetes::{file_transfer_uploads_and_downloads_under_the_base_dir, delete_sandbox_claim_tolerates_404_and_blank_names, active_claims_track_attach_and_forget_deletes, delete_all_*}` ⇒ 直接证明修复的就是该根因 |
+| 2 | `k8s_request_query` 丢弃 `?labelSelector=` | `kubernetes::tests::list_sandbox_claims_sends_the_label_selector` FAILED（204 passed / 1 failed） |
+| 3 | `delete_all` 的键集改为空（等于不删任何 claim） | `delete_all_removes_every_tracked_claim`、`delete_all_reports_the_first_failure_but_clears_the_registry` FAILED（203 / 2） |
+| 4 | `wait_for_gateway_address` 回退为一次性 `resolve_gateway_address` | `gateway_without_a_published_address_times_out_with_the_java_message` FAILED（204 / 1，用时 0.04s 说明确实没轮询） |
+
+恢复后：`cargo test -p agentscope-extensions-sandbox --lib -j 2` → **205 passed / 0 failed（EXIT=0）**。
+
+### 9.7 未完成项与保留差异
+1. **`watch=true` 流式订阅**（claims / Gateway）未实现（理由见 §9.3 / §9.4）；就绪等待仍为轮询，语义等价。
+2. **Gateway 失败快慢**：CRD 读取错误（403 等）在 Rust 侧表现为「等满预算后超时」，Java 是快速失败；`DELETED` 事件未建模。
+3. **`listActiveSandboxes` 的存活 prune** 无等价信号（改为删除即摘除）；`deleteAll` 无「关闭客户端连接」对应物。
+4. **`SandboxTemplate`（模板）相关能力**仍未迁移（§4.2 (3) 残余）。
+5. **flaky 的环境依赖**：本机 `ProxyEnable=1` + `ProxyOverride` 含 `127.*` 才会触发；修复后与代理开关无关（loopback 恒不走代理）。CI 若有系统代理亦同样受保护。
+
+
+
+
