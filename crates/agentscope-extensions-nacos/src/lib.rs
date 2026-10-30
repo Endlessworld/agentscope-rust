@@ -18,8 +18,15 @@
 //! See `docs/extensions/NACOS__GAP_TRACKER.md` for the migration mapping.
 
 pub mod a2a;
+pub mod http;
 pub mod prompt;
 pub mod service;
 pub mod skill;
 
+pub use http::{
+    HttpRequest, HttpResponse, NacosHttpAiService, NacosHttpConfig, NacosHttpTransport,
+};
 pub use service::{AiServiceError, AiServiceResult, InMemoryNacosAiService, NacosAiService};
+
+#[cfg(feature = "http-client")]
+pub use http::{spawn_polling, ReqwestNacosTransport};

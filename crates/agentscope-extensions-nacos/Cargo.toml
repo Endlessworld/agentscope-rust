@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Default build stays HTTP-stack free: `NacosHttpAiService` is compiled (its client logic is
+# transport-agnostic and tested against a fake transport) but no `reqwest` is pulled in.
+default = []
+# Adds `ReqwestNacosTransport` (the real HTTP client) plus `spawn_polling`.
+http-client = ["dep:reqwest"]
+
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
@@ -23,4 +30,8 @@ base64 = { workspace = true }
 
 # Nacos skill 包（ZIP）解析/重打包；版本已上提根 [workspace.dependencies]（2026-10-29）。
 zip = { workspace = true }
+
+# Real Nacos AI HTTP client (feature `http-client`, optional). `reqwest` is the workspace-pinned
+# HTTP stack used by every other network extension crate.
+reqwest = { workspace = true, optional = true }
 

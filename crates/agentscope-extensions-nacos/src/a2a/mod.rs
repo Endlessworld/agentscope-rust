@@ -23,8 +23,8 @@ pub use converter::{
 pub use discovery::{AgentCardResolver, NacosAgentCardResolver};
 pub use model::{
     A2aAgentCapabilities, A2aAgentCard, A2aAgentInterface, A2aAgentProvider, A2aAgentSkill,
-    NacosAgentCapabilities, NacosAgentCard, NacosAgentEndpoint, NacosAgentInterface,
-    NacosAgentProvider, NacosAgentSkill,
+    NacosAgentCapabilities, NacosAgentCard, NacosAgentEndpoint, NacosAgentExtension,
+    NacosAgentInterface, NacosAgentProvider, NacosAgentSkill,
 };
 pub use registry::{
     AgentRegistry, NacosA2aRegistry, NacosA2aRegistryProperties, NacosA2aRegistryPropertiesBuilder,

@@ -91,22 +91,22 @@
 
 | 项 | 优先级 | 决定 | 说明 |
 |---|---|---|---|
-| 真实 Nacos HTTP 客户端 | P1 | 设计决定（延后） | **2026-10-29 复核**：仍仅 trait + `InMemoryNacosAiService`，`reqwest` 实现未落地；无成熟 Rust Nacos AI SDK；`NacosAiService` trait 为注入缝隙，与 Java `AiService` 注入点对齐；HTTP 实现归属待裁定（§4.2-3） |
+| 真实 Nacos HTTP 客户端 | P1 | **已完成（2026-10-31，§8-1）** | `src/http.rs::NacosHttpAiService` 实现整个 `NacosAiService`（`/v1/ai/agent`、`/v1/ai/agent/endpoint`、`/v1/ai/prompt`、`/v1/ai/skill`），经 `NacosHttpTransport` 缝隙注入；真实 `reqwest` 客户端 `ReqwestNacosTransport` 在 `http-client` feature 后（默认构建不加依赖）。离线用例走假 transport（§8-1）。原「延后」裁定作废 |
 | 与 protocol crate 的 A2A 模型统一 | P1 | 已完成（2026-10-28） | 已复用 `agentscope_extensions_a2a_client::model` 的 `AgentSkill`/`AgentCapabilities`/`AgentProvider`/`AgentInterface`；`A2aAgentCard` 降为携带 `documentationUrl` 的薄包装（`Deref`）；`AgentRegistry` 仍本地（protocol 无）。protocol 若补 `documentation_url` 则可退化为 `pub use`（§4.2-5） |
 | `AgentCardResolver` 同步→异步 | P0 | 设计决定 | Java 版阻塞（Nacos 客户端阻塞）；Rust 侧 `NacosAiService` 为 async，故 trait 用 `async_trait` |
 | `NacosA2aRegistry` 多 endpoint 批量注册 | P2 | 设计决定 | Java 在 1 个 endpoint 时用单值、≥2 时用 `Set` 去重批量；Rust 侧统一逐个 `register_agent_endpoint`（调用次数差异可接受；但 `Set` 的去重语义不可忽略——见 §3.3 同名条目） |
-| `NacosSkillRepository` 的 `load()` 同步 trait | P2 | 设计决定 | harness `SkillRepository::load` 为同步 → 内部 `block_on` 驱动 async 下载（对齐 Java 阻塞 `getAllSkills`）；有 runtime 时走 `block_in_place`，测试无 runtime 时走临时 current-thread runtime |
+| `NacosSkillRepository` 的 `load()` 同步 trait | P2 | 已完成（2026-10-31 修正） | harness `SkillRepository::load` 为同步 → 内部 `block_on` 驱动 async 下载；**原实现只判断「有无 runtime」就直接 `block_in_place`，在 current-thread runtime（`#[tokio::test]` 默认）会 panic** → 改为先判 `Handle::runtime_flavor()`，仅多线程 runtime 用 `block_in_place`，否则用临时 current-thread runtime。用例 `skill::load_from_a_current_thread_runtime_does_not_panic`（§8-3） |
 
 ### 3.3 剩余缺口（增强项，非阻塞）
 
 | 缺口项 | 优先级 | 状态 | 说明 |
 |---|---|---|---|
-| 真实 Nacos HTTP 客户端（`reqwest` 版 `NacosAiService`） | P1 | 待办（跨模块） | 见 §4.2-3；**2026-10-29 复核**：未变（仍无 `reqwest` 实现） |
+| 真实 Nacos HTTP 客户端（`reqwest` 版 `NacosAiService`） | P1 | **已完成（2026-10-31）** | 见 §8-1（`NacosHttpAiService` + `NacosHttpTransport` + `ReqwestNacosTransport`） |
 | 与 protocol crate A2A 模型/接口合并（复用 `AgentCard`/`AgentCardResolver`，仅保留 `AgentRegistry` 本地补位） | P1 | 已完成（模型部分） | 见 §7-6；`TransportProperties` 仍本地（protocol 同名类型在 `a2a-server`，会拖入 axum 且 host/port 为 Option，见 §4.2-6） |
 | A2A security scheme 结构化转换（apiKey/http/oauth2/openIdConnect/mutualTLS + OAuth flows） | P1 | 已完成 | 见 §7-2 |
 | `do_overwrite` 的接口去重与前插（Java `removeIf(equals)` + `add(0, ..)`） | P2 | 已完成 | 见 §7-3；`do_overwrite_dedups_and_prepends_the_interface` |
 | `NacosAgentRegistry` 批量 endpoint 去重（Java `Set` 语义） | P2 | 已完成 | 见 §7-3；`duplicate_endpoints_are_registered_once` |
-| `AgentCardResolver` 缓存失效/TTL 策略 | P2 | 待办 | Java 亦仅靠订阅推送更新、无 TTL；当前保持一致 |
+| `AgentCardResolver` 缓存失效/TTL 策略 | P2 | **已完成（2026-10-31）** | 新增 `NacosAgentCardResolver::with_ttl(Duration)` / `invalidate(name)`；默认 `None` 保持 Java 的永不过期行为。用例 `a_zero_ttl_refetches_the_card`、`a_cached_card_never_expires_without_a_ttl`、`invalidate_drops_a_cached_card`（§8-3） |
 
 ## 4. 项目状态与下一步
 
@@ -258,7 +258,62 @@
 
 ### 7-7 未做 / 顺带发现
 
-- **S-3 未做**：`getAllSkillNames`/`getRepositoryInfo` 无对应（harness `SkillRepository` 无对应方法；`NacosSkillRepository::location()` 已提供 `getRepositoryInfo().location` 等价值）。
+- **S-3 已关闭（2026-10-31）**：`getAllSkillNames`/`getRepositoryInfo` 在 `NacosSkillRepository` 上以**固有方法**提供（`all_skill_names()` / `repository_info() -> NacosSkillRepositoryInfo`）；harness `SkillRepository` 不加方法（§8-3）。
 - 既有测试中编码了错语义的 3 条已**收紧**到 Java 语义（非放宽）：`parse_frontmatter_uses_fallback_name` → `missing_name_is_rejected`；`resource_paths_are_normalized_to_forward_slashes` → `resource_paths_are_relative_to_the_root`；`empty_capabilities_round_trip_as_defaults` → `nacos_capabilities_become_definite_booleans`；`security_schemes_kept_as_opaque_json` → `security_schemes_are_converted_by_type`。
 - `NacosAgentCard.url` 由 `String` 改为 `Option<String>`（对齐 Nacos/Java 可空 url）；调用点 `registry` 测试已同步。
+
+---
+
+## 8. 2026-10-31 loop 收口记录（模块：NACOS；仅改本 crate + 本 tracker）
+
+> 本回合约束：**只做代码编辑，不运行 cargo / rustc / clippy / fmt**（由主智能体统一验证）。下文「用例名」均为待主智能体验证的离线用例，**不是已跑过的结论**。
+
+### 8-1 P1：真实 `NacosAiService`（HTTP）已落地
+
+| 维度 | 结论 |
+|---|---|
+| 新增文件 | `src/http.rs`（客户端主体 + 测试）、`src/http/reqwest_transport.rs`（`reqwest` 适配，feature `http-client`） |
+| 选型 | 客户端逻辑与传输分离：`NacosHttpTransport`（`async fn execute(HttpRequest) -> HttpResponse`）为缝隙，避开对 `reqwest` 的硬依赖；默认构建（`default = []`）**不引入任何新依赖**，客户端逻辑仍编译且被假 transport 全覆盖 |
+| 端点 | `/v1/ai/agent`（release/GET）、`/v1/ai/agent/endpoint`、`/v1/ai/prompt`、`/v1/ai/skill`；四个路径均可在 `NacosHttpConfig` 覆盖（不同 Nacos 部署的前缀 `/nacos` 与路径版本差异） |
+| 语义 | ①`accessToken` 追加为 query 参数并做 RFC3986 转义；②响应同时接受裸 JSON 与 Nacos 信封 `{"code":0,"data":…}`；③`404` → `get_*` 返回 `Ok(None)`、`subscribe_*`/`download_*` 返回 `AiServiceError::not_found`；④错误体 `{code,message}` 逐字保留（`a_nacos_error_body_keeps_its_code_and_message`） |
+| 订阅 | Nacos 走 gRPC 推送，HTTP 无法持久流 → `subscribe_*` 做首次拉取 + 登记 listener，新增 `poll_once()` 做变更检测（返回触发数）；`http-client` 下另有 `spawn_polling(service, interval)` 定时驱动 |
+| 用例 | `get_agent_card_builds_the_v1_url_and_parses_the_card`、`an_absent_card_is_none_but_a_broken_payload_is_an_error`、`the_nacos_envelope_is_unwrapped`、`release_agent_card_posts_the_card_and_set_as_latest`、`register_agent_endpoint_posts_the_endpoint_json`、`prompts_are_parsed_and_subscriptions_fire_on_change`、`agent_card_subscriptions_are_polled_for_changes`、`subscribing_to_a_missing_card_is_not_found`、`skill_zips_are_downloaded_with_version_or_label`、`the_http_service_is_interchangeable_with_the_in_memory_one`、`urls_skip_blank_parameters`、`a_nacos_error_body_keeps_its_code_and_message` |
+| 风险 | 上游 AI OpenAPI 的**精确路径/参数形状**无法离线核实（Nacos 版本差异），因此全部路径/参数集中在一处并用可覆盖的 `NacosHttpConfig` 表达；真实实例联调时只需改配置 |
+
+### 8-2 Java 增量 `5da592b4a`（fix(nacos): preserve A2A capability extensions）已对齐
+
+- **Java**：`AgentCardConverterUtil` 双向补 `capabilities.extensions`：`uri` / `description` / `required`（缺失→`false`）/ `params`，并保留 `null` vs 空列表的区别。
+- **Rust 原状**：`convert_capabilities_to_a2a` 硬编码 `extensions: None`、`convert_capabilities_to_nacos` 丢字段 —— 即该 Java bug 的同构缺陷（注册/解析经 Nacos 往返后扩展全丢）。
+- **落地**：`a2a/model.rs` 新增 `NacosAgentExtension`（四字段 + `#[serde(flatten)] extra`）与 `NacosAgentCapabilities::extensions: Option<Vec<..>>`；`a2a/converter.rs` 新增 `convert_extension_to_a2a` / `convert_extension_to_nacos`。`Option::as_ref().map(..)` 保留 `None` vs `Some(vec![])`。**Rust 额外**：A2A 侧把 extensions 建模为不透明 `Vec<Value>`，未知字段进 `extra` 后能原样回写（Java 会丢）。
+- **用例**：`nacos_extensions_keep_uri_description_required_and_params`、`a_missing_nacos_required_flag_becomes_false`、`absent_and_empty_extension_lists_stay_distinct`、`unknown_extension_fields_survive_a_round_trip`、`a2a_extensions_without_a_nacos_counterpart_are_kept_verbatim`。
+
+### 8-3 P2 三项裁定 + 落地
+
+| 项 | 裁定 | 落地 |
+|---|---|---|
+| `AgentCardResolver` 无 TTL | 补 TTL，默认 `None`（Java 行为不变） | `with_ttl(Duration)` / `invalidate(name)`；缓存项带 `fetched_at: Instant` |
+| `SkillRepository::load` 同步 trait 内 `block_on` | 保留同步 `block_on`（harness trait 不改），但修正 runtime flavour 判断，消除 current-thread runtime panic | `Handle::runtime_flavor() == MultiThread` 才 `block_in_place`，否则临时 current-thread runtime |
+| `getAllSkillNames` / `getRepositoryInfo` 无对应 | **harness `SkillRepository` 不加方法**（跨 crate，越界）；在 crate 内以固有方法提供 | `NacosSkillRepository::all_skill_names()`、`repository_info() -> NacosSkillRepositoryInfo`（`Display` 对齐 Java `toString`） |
+
+用例：`a_zero_ttl_refetches_the_card`、`a_cached_card_never_expires_without_a_ttl`、`invalidate_drops_a_cached_card`、`load_from_a_current_thread_runtime_does_not_panic`、`all_skill_names_and_repository_info_are_available`。
+
+### 8-4 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/http.rs`（新） | `HttpRequest` / `HttpResponse` / `NacosHttpTransport` / `NacosHttpConfig` / `NacosHttpAiService`（完整 trait 实现 + `poll_once`）+ 12 用例 |
+| `src/http/reqwest_transport.rs`（新） | `ReqwestNacosTransport`、`spawn_polling`（feature `http-client`） |
+| `src/lib.rs` | `pub mod http;` + 导出；`http-client` 下导出 `ReqwestNacosTransport`/`spawn_polling` |
+| `src/a2a/model.rs` | `NacosAgentExtension` + `NacosAgentCapabilities::extensions` |
+| `src/a2a/converter.rs` | capability extensions 双向转换 + 5 用例 |
+| `src/a2a/mod.rs` | 导出 `NacosAgentExtension` |
+| `src/a2a/discovery.rs` | TTL/`invalidate` + `CachedCard` + 3 用例 |
+| `src/skill/mod.rs` | `block_on` flavour 修正、`all_skill_names`/`repository_info` + `NacosSkillRepositoryInfo` + 2 用例 |
+| `Cargo.toml` | `[features] default=[] / http-client=["dep:reqwest"]`；`reqwest = { workspace = true, optional = true }` |
+
+### 8-5 跨模块需求 / 未关闭项
+
+1. **跨模块**：harness `AgentRegistry`/`SkillRepository::get_all_skill_names` 仍缺位 —— 本回合按约束不改 harness，nacos 侧用本地 trait + 固有方法补偿。
+2. **未关闭**：Nacos 长连接（gRPC/`ConfigService` 监听）未实现 —— 以 `poll_once`/`spawn_polling` 代替，属**语义近似**（延时不等于推送）。若要真推送需引入 Nacos gRPC 客户端（无成熟 Rust SDK）。
+3. **未关闭**：`http-client` feature 下的 `reqwest` 传输层无可离线单测（需真实 server），其逻辑极薄（造请求 → 取 status/body），由 `NacosHttpTransport` 假实现覆盖同构路径。
 

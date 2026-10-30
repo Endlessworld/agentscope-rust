@@ -16,11 +16,12 @@
 //!   [`super::security_scheme`].
 
 use agentscope_extensions_a2a_client::model::AgentCard;
+use serde_json::Value;
 
 use super::model::{
     A2aAgentCapabilities, A2aAgentCard, A2aAgentInterface, A2aAgentProvider, A2aAgentSkill,
-    NacosAgentCapabilities, NacosAgentCard, NacosAgentInterface, NacosAgentProvider,
-    NacosAgentSkill,
+    NacosAgentCapabilities, NacosAgentCard, NacosAgentExtension, NacosAgentInterface,
+    NacosAgentProvider, NacosAgentSkill,
 };
 use super::security_scheme::{convert_to_a2a_security_schemes, convert_to_nacos_security_schemes};
 
@@ -204,8 +205,73 @@ fn convert_capabilities_to_a2a(c: &NacosAgentCapabilities) -> A2aAgentCapabiliti
         streaming: Some(c.streaming.unwrap_or(false)),
         push_notifications: Some(c.push_notifications.unwrap_or(false)),
         state_transition_history: None,
-        extensions: None,
+        // `5da592b4a`: Nacos and A2A both carry `capabilities.extensions`; copying only the
+        // boolean flags dropped every extension's uri/description/required/params.
+        extensions: c
+            .extensions
+            .as_ref()
+            .map(|list| list.iter().map(convert_extension_to_a2a).collect()),
     }
+}
+
+/// Nacos extension → A2A extension (a JSON object, because the protocol crate keeps the
+/// extensions opaque for forward compatibility).
+fn convert_extension_to_a2a(extension: &NacosAgentExtension) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("uri".to_string(), Value::String(extension.uri.clone()));
+    if let Some(description) = &extension.description {
+        map.insert("description".to_string(), Value::String(description.clone()));
+    }
+    // A2A's `required` is a primitive boolean: a missing Nacos value maps to `false`
+    // (Java `Boolean.TRUE.equals(extension.getRequired())`).
+    map.insert(
+        "required".to_string(),
+        Value::Bool(extension.required.unwrap_or(false)),
+    );
+    if let Some(params) = &extension.params {
+        map.insert("params".to_string(), params.clone());
+    }
+    // Unknown Nacos fields are carried through untouched (never overwriting a known key).
+    for (key, value) in &extension.extra {
+        if !map.contains_key(key) {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+/// A2A extension (opaque JSON) → Nacos extension. Non-object entries are skipped.
+fn convert_extension_to_nacos(value: &Value) -> Option<NacosAgentExtension> {
+    let object = value.as_object()?;
+    let uri = object
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let description = object
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let required = Some(
+        object
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    );
+    // Structured parameters are kept unchanged; an explicit JSON `null` is "absent".
+    let params = object.get("params").cloned().filter(|v| !v.is_null());
+    let extra = object
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "uri" | "description" | "required" | "params"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    Some(NacosAgentExtension {
+        uri,
+        description,
+        required,
+        params,
+        extra,
+    })
 }
 
 /// A2A → Nacos capabilities: `stateTransitionHistory` is always `false`
@@ -215,6 +281,12 @@ fn convert_capabilities_to_nacos(c: &A2aAgentCapabilities) -> NacosAgentCapabili
         streaming: c.streaming,
         push_notifications: c.push_notifications,
         state_transition_history: Some(false),
+        // `null` (absent) stays `None`; an explicitly empty list stays `Some(vec![])`.
+        extensions: c.extensions.as_ref().map(|list| {
+            list.iter()
+                .filter_map(convert_extension_to_nacos)
+                .collect()
+        }),
     }
 }
 
@@ -529,5 +601,110 @@ mod tests {
         assert_eq!(json["preferredTransport"], "JSONRPC");
         assert_eq!(json["defaultInputModes"][0], "text/plain");
         assert!(!json.as_object().unwrap().contains_key("securitySchemes"));
+    }
+
+    // ------------------------------------------------------------------
+    // `5da592b4a` fix(nacos): preserve A2A capability extensions
+    // ------------------------------------------------------------------
+
+    fn extension() -> NacosAgentExtension {
+        NacosAgentExtension {
+            uri: "https://example.com/ext/v1".to_string(),
+            description: Some("vendor extension".to_string()),
+            required: Some(true),
+            params: Some(serde_json::json!({"mode": "fast", "retries": 2})),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn nacos_extensions_keep_uri_description_required_and_params() {
+        let mut card = NacosAgentCard::new("n", "http://h");
+        card.capabilities.extensions = Some(vec![extension()]);
+
+        let a2a = convert_to_a2a_agent_card(&card);
+        let extensions = a2a.capabilities.extensions.as_ref().expect("extensions");
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0]["uri"], "https://example.com/ext/v1");
+        assert_eq!(extensions[0]["description"], "vendor extension");
+        assert_eq!(extensions[0]["required"], true);
+        // Structured parameters are unchanged, not stringified.
+        assert_eq!(extensions[0]["params"]["mode"], "fast");
+        assert_eq!(extensions[0]["params"]["retries"], 2);
+
+        // … and back to Nacos without losing anything.
+        let back = convert_to_nacos_agent_card(&a2a);
+        assert_eq!(back.capabilities.extensions, Some(vec![extension()]));
+    }
+
+    #[test]
+    fn a_missing_nacos_required_flag_becomes_false() {
+        let mut card = NacosAgentCard::new("n", "http://h");
+        card.capabilities.extensions = Some(vec![NacosAgentExtension {
+            uri: "https://example.com/ext/v1".to_string(),
+            ..Default::default()
+        }]);
+        let a2a = convert_to_a2a_agent_card(&card);
+        // A2A uses a primitive boolean, so `null` must not survive as a missing field.
+        assert_eq!(
+            a2a.capabilities.extensions.as_ref().unwrap()[0]["required"],
+            false
+        );
+    }
+
+    #[test]
+    fn absent_and_empty_extension_lists_stay_distinct() {
+        let mut absent = NacosAgentCard::new("n", "http://h");
+        absent.capabilities.extensions = None;
+        assert_eq!(
+            convert_to_a2a_agent_card(&absent).capabilities.extensions,
+            None
+        );
+
+        let mut empty = NacosAgentCard::new("n", "http://h");
+        empty.capabilities.extensions = Some(Vec::new());
+        let a2a = convert_to_a2a_agent_card(&empty);
+        assert_eq!(a2a.capabilities.extensions, Some(Vec::new()));
+        // Both directions keep the distinction.
+        assert_eq!(
+            convert_to_nacos_agent_card(&a2a).capabilities.extensions,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unknown_extension_fields_survive_a_round_trip() {
+        let mut card = NacosAgentCard::new("n", "http://h");
+        let mut extra = serde_json::Map::new();
+        extra.insert("x-vendor".to_string(), serde_json::json!({"a": 1}));
+        card.capabilities.extensions = Some(vec![NacosAgentExtension {
+            extra,
+            ..extension()
+        }]);
+
+        let a2a = convert_to_a2a_agent_card(&card);
+        assert_eq!(a2a.capabilities.extensions.as_ref().unwrap()[0]["x-vendor"]["a"], 1);
+        let back = convert_to_nacos_agent_card(&a2a);
+        let restored = &back.capabilities.extensions.as_ref().unwrap()[0];
+        assert_eq!(restored.extra.get("x-vendor"), Some(&serde_json::json!({"a": 1})));
+    }
+
+    #[test]
+    fn a2a_extensions_without_a_nacos_counterpart_are_kept_verbatim() {
+        // Opaque JSON from a third-party agent card: only the four known keys are typed, the
+        // rest travels in `extra`; non-object entries are skipped instead of panicking.
+        let mut a2a = sample_a2a();
+        a2a.capabilities.extensions = Some(vec![
+            serde_json::json!({"uri": "https://x", "required": true, "params": null, "other": 5}),
+            serde_json::json!("not-an-object"),
+        ]);
+        let nacos = convert_to_nacos_agent_card(&a2a);
+        let extensions = nacos.capabilities.extensions.as_ref().unwrap();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].uri, "https://x");
+        assert_eq!(extensions[0].required, Some(true));
+        // An explicit JSON null parameter is "absent", not `Value::Null`.
+        assert_eq!(extensions[0].params, None);
+        assert_eq!(extensions[0].extra.get("other"), Some(&serde_json::json!(5)));
     }
 }

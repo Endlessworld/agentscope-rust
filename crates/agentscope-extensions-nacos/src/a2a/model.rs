@@ -92,6 +92,34 @@ pub struct NacosAgentCapabilities {
         skip_serializing_if = "Option::is_none"
     )]
     pub state_transition_history: Option<bool>,
+    /// Capability extensions, mirroring Nacos `AgentCapabilities#extensions`.
+    ///
+    /// `None` (absent) and `Some(vec![])` (explicitly empty) are distinct and both survive a
+    /// conversion round trip, exactly like Java `getExtensions() != null` (`5da592b4a`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<NacosAgentExtension>>,
+}
+
+/// A Nacos capability extension, mirroring `com.alibaba.nacos.api.ai.model.a2a.AgentExtension`.
+///
+/// Java only carries `uri` / `description` / `required` / `params`; the [`extra`](Self::extra)
+/// map is a Rust-side addition so fields the Nacos model does not know about survive a
+/// Nacos → A2A → Nacos round trip instead of being silently dropped.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NacosAgentExtension {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The A2A model uses a primitive boolean, so an absent value is materialised as `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Structured parameter values, kept unchanged (arbitrary JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+    /// Unknown fields, round-tripped verbatim.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Nacos agent provider.

@@ -50,6 +50,36 @@ pub struct NacosSkillRepository {
     known_skill_names: Vec<String>,
 }
 
+/// Repository metadata returned by [`NacosSkillRepository::repository_info`], mirroring
+/// `io.agentscope.core.skill.repository.AgentSkillRepositoryInfo`.
+///
+/// Declared locally (rather than reusing `agentscope-extensions-skills`' type) so this crate
+/// does not depend on another extension crate for a three-field descriptor; the `Display`
+/// format mirrors the Java `toString`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NacosSkillRepositoryInfo {
+    /// Repository type (`nacos`).
+    pub repo_type: String,
+    /// Repository location (`nacos://<namespace>`).
+    pub location: String,
+    /// Always `false`: Nacos skill packages are read-only.
+    pub writeable: bool,
+    /// The namespace the repository reads from.
+    pub namespace_id: String,
+    /// Number of configured enumerable skill names.
+    pub skill_count: usize,
+}
+
+impl std::fmt::Display for NacosSkillRepositoryInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AgentSkillRepositoryInfo{{type='{}', location='{}', writable={}}}",
+            self.repo_type, self.location, self.writeable
+        )
+    }
+}
+
 impl NacosSkillRepository {
     /// Creates a repository for `namespace_id` with no properties or known names.
     pub fn new(service: Arc<dyn NacosAiService>, namespace_id: impl Into<String>) -> Self {
@@ -124,6 +154,30 @@ impl NacosSkillRepository {
     /// The resolved skill label, if any.
     pub fn skill_label(&self) -> Option<&str> {
         self.skill_label.as_deref()
+    }
+
+    /// Mirrors Java `AgentSkillRepository#getAllSkillNames()`.
+    ///
+    /// Nacos exposes no "list every skill" API, so the answer is the configured
+    /// [`known_skill_names`](Self::with_known) list; it is returned even when a download would
+    /// fail (the Java interface reports names, not downloads).
+    ///
+    /// This is an **inherent** method on purpose: the harness `SkillRepository` trait is owned by
+    /// another crate and has no `getAllSkillNames` / `getRepositoryInfo` (tracker §3.3 P2), so
+    /// adding them there is out of scope for this crate.
+    pub fn all_skill_names(&self) -> Vec<String> {
+        self.known_skill_names.clone()
+    }
+
+    /// Mirrors Java `AgentSkillRepository#getRepositoryInfo()`.
+    pub fn repository_info(&self) -> NacosSkillRepositoryInfo {
+        NacosSkillRepositoryInfo {
+            repo_type: REPO_TYPE.to_string(),
+            location: self.location.clone(),
+            writeable: false,
+            namespace_id: self.namespace_id.clone(),
+            skill_count: self.known_skill_names.len(),
+        }
     }
 
     /// Downloads a skill ZIP bytes using the version/label precedence: version
@@ -224,9 +278,39 @@ impl SkillRepository for NacosSkillRepository {
 
 /// Drives `fut` to completion, reusing the current Tokio runtime when present
 /// and otherwise creating a temporary current-thread runtime.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+///
+/// `tokio::task::block_in_place` **panics on a current-thread runtime** (it is only legal on
+/// the multi-threaded scheduler), which is exactly the flavour `#[tokio::test]` uses. The
+/// harness `SkillRepository::load` is synchronous and may be called from either flavour, so the
+/// flavour is checked first and a scratch runtime is used otherwise (tracker §3.3 P2).
+fn block_on<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        Ok(_) => {
+            // Current-thread runtime: blocking here would panic (`block_in_place` is
+            // multi-thread only) and `Runtime::block_on` cannot nest. A scoped thread
+            // drives its own runtime instead, so the borrowed future stays valid.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build a scratch Tokio runtime")
+                            .block_on(fut)
+                    })
+                    .join()
+                    .expect("scratch Tokio runtime thread panicked")
+            })
+        }
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -340,6 +424,47 @@ mod tests {
         let svc = service_with_skill("demo");
         let repo = NacosSkillRepository::new(svc, "public");
         assert!(repo.load().is_empty());
+    }
+
+    /// §3.3 P2: the harness `SkillRepository` trait is synchronous, and `load()` may be called
+    /// from a **current-thread** runtime (what `#[tokio::test]` uses), where `block_in_place`
+    /// panics. `block_on` must therefore pick a scratch runtime for that flavour.
+    #[tokio::test]
+    async fn load_from_a_current_thread_runtime_does_not_panic() {
+        let svc = service_with_skill("demo");
+        let repo = NacosSkillRepository::with_known(svc, "public", None, vec!["demo".to_string()]);
+        let skills = repo.load();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name(), "demo");
+    }
+
+    /// §3.3 P2 adjudication: `getAllSkillNames` / `getRepositoryInfo` have no harness
+    /// counterpart, so they are provided as inherent methods on this crate's repository.
+    #[test]
+    fn all_skill_names_and_repository_info_are_available() {
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let repo = NacosSkillRepository::with_known(
+            svc,
+            "dev",
+            None,
+            vec!["alpha".to_string(), "beta".to_string()],
+        );
+        assert_eq!(
+            repo.all_skill_names(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        let info = repo.repository_info();
+        assert_eq!(info.repo_type, "nacos");
+        assert_eq!(info.namespace_id, "dev");
+        assert_eq!(info.skill_count, 2);
+        assert!(!info.writeable);
+        assert_eq!(
+            info.to_string(),
+            format!(
+                "AgentSkillRepositoryInfo{{type='nacos', location='{}', writable=false}}",
+                info.location
+            )
+        );
     }
 
     #[test]
