@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, ClientBuilder, Method, RequestBuilder};
 use serde_json::Value;
 
 use crate::error::{SandboxExtensionError, SandboxResult};
@@ -32,13 +32,75 @@ impl Default for HttpOptions {
     }
 }
 
-/// Builds a `reqwest::Client` honoring the given timeouts.
-pub fn build_client(opts: &HttpOptions) -> SandboxResult<Client> {
+/// Returns a client builder carrying the given timeouts and the ambient proxy configuration.
+pub fn client_builder(opts: &HttpOptions) -> ClientBuilder {
     Client::builder()
         .connect_timeout(Duration::from_secs(opts.connect_timeout_seconds))
         .timeout(Duration::from_secs(opts.read_timeout_seconds))
+}
+
+/// Builds a `reqwest::Client` honoring the given timeouts.
+pub fn build_client(opts: &HttpOptions) -> SandboxResult<Client> {
+    client_builder(opts)
         .build()
         .map_err(|e| SandboxExtensionError::Transport(format!("failed to build HTTP client: {e}")))
+}
+
+/// Returns whether `value` (a URL, or a bare `host[:port]`) addresses a loopback host.
+///
+/// Recognizes `localhost` (case-insensitively, with an optional trailing dot) and the whole
+/// IPv4 `127.0.0.0/8` range as well as `::1`. A bare host is accepted so that values such as a
+/// gateway address (`127.0.0.1:10000`) can be tested before they are turned into a URL.
+pub fn is_loopback_target(value: &str) -> bool {
+    fn host_is_loopback(url: &reqwest::Url) -> bool {
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.');
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        host.parse::<std::net::IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
+    }
+
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if let Ok(url) = reqwest::Url::parse(value) {
+        if url.host_str().is_some() {
+            return host_is_loopback(&url);
+        }
+    }
+    // Not a URL on its own (e.g. `127.0.0.1:10000`): retry with a synthetic scheme.
+    match reqwest::Url::parse(&format!("http://{value}")) {
+        Ok(url) => host_is_loopback(&url),
+        Err(_) => false,
+    }
+}
+
+/// Disables the ambient (environment / OS-level) proxy when any target in `targets` is a
+/// loopback address.
+///
+/// Loopback traffic must never be handed to a proxy. `hyper-util` maps the Windows
+/// `ProxyOverride` entry `127.*` onto a literal domain name, so the bypass list never matches
+/// `127.0.0.1`; a machine with a system-wide proxy then routes every request to a locally
+/// served sandbox endpoint (port-forward, local mock server) through that proxy, which
+/// intermittently resets idle keep-alive connections. The Java backend is unaffected because
+/// `OkHttp`'s default proxy selector always exempts local addresses.
+///
+/// Non-loopback traffic keeps the ambient proxy configuration.
+pub fn bypass_proxy_for_loopback(builder: ClientBuilder, targets: &[&str]) -> ClientBuilder {
+    if targets.iter().any(|target| is_loopback_target(target)) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
 }
 
 /// Joins a base URL and a path, trimming exactly one slash at the boundary.
@@ -191,5 +253,58 @@ mod tests {
     #[test]
     fn build_client_succeeds() {
         assert!(build_client(&HttpOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn loopback_targets_are_recognized() {
+        for value in [
+            "http://127.0.0.1:8080",
+            "http://127.5.6.7",
+            "https://127.0.0.1",
+            "http://localhost:1234",
+            "http://LOCALHOST/",
+            "http://localhost./x",
+            "http://[::1]:8080",
+            "127.0.0.1:10000",
+            "localhost:49983",
+        ] {
+            assert!(is_loopback_target(value), "{value} should be loopback");
+        }
+    }
+
+    #[test]
+    fn non_loopback_targets_are_rejected() {
+        for value in [
+            "",
+            "   ",
+            "https://api.e2b.app",
+            "https://kubernetes.default.svc",
+            "http://127.0.0.1.example.com",
+            "http://localhost.evil.test",
+            "http://10.0.0.5:8080",
+            "http://[::2]:8080",
+            "not a url",
+        ] {
+            assert!(!is_loopback_target(value), "{value} should not be loopback");
+        }
+    }
+
+    #[test]
+    fn proxy_bypass_only_applies_to_loopback_targets() {
+        // A loopback target produces a client that never proxies, so requests reach the
+        // local server even when the machine has a system-wide proxy configured.
+        assert!(
+            bypass_proxy_for_loopback(Client::builder(), &["http://127.0.0.1:9"])
+                .build()
+                .is_ok()
+        );
+        assert!(
+            bypass_proxy_for_loopback(Client::builder(), &["https://api.e2b.app", ""])
+                .build()
+                .is_ok()
+        );
+        assert!(bypass_proxy_for_loopback(Client::builder(), &[])
+            .build()
+            .is_ok());
     }
 }

@@ -35,7 +35,7 @@ use reqwest::{Client, Response};
 use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
-use crate::http::join_url;
+use crate::http::{bypass_proxy_for_loopback, join_url};
 use crate::kubernetes_files::SandboxFileTransfer;
 use crate::remote::{
     ensure_output_success, RemoteBackend, RemoteExecOutput, RemoteSandboxClient,
@@ -872,13 +872,21 @@ impl E2bBackend {
         options: E2bSandboxClientOptions,
         kill_deadline: Arc<dyn E2bKillDeadline>,
     ) -> SandboxResult<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
-            .timeout(Duration::from_secs(options.read_timeout_seconds))
-            .build()
-            .map_err(|e| {
-                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
-            })?;
+        // Envd may be reached through a fixed gateway (option or `E2B_SANDBOX_URL`); include every
+        // statically known endpoint so a loopback target keeps its traffic off the ambient proxy.
+        let envd_override = envd_sandbox_url_from_env();
+        let client = bypass_proxy_for_loopback(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
+                .timeout(Duration::from_secs(options.read_timeout_seconds)),
+            &[
+                options.api_base_url.as_str(),
+                options.envd_sandbox_url.as_deref().unwrap_or_default(),
+                envd_override.as_deref().unwrap_or_default(),
+            ],
+        )
+        .build()
+        .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
         let retry = RetryPolicy::e2b(options.max_retries);
         Ok(Self {
             options,

@@ -34,7 +34,9 @@ pub mod retry;
 pub mod workspace;
 
 pub use error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
-pub use http::{build_client, join_url, HttpClient, HttpOptions};
+pub use http::{
+    build_client, bypass_proxy_for_loopback, is_loopback_target, join_url, HttpClient, HttpOptions,
+};
 pub use remote::{
     ensure_output_success, workspace_projection_hash, RemoteBackend, RemoteExecOutput,
     RemoteSandbox, RemoteSandboxClient, RemoteSandboxCore, RemoteSandboxHandle,

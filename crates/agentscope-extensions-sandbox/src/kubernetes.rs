@@ -18,14 +18,14 @@
 //! ([`crate::kubernetes_files`]) instead of base64-over-exec, mirroring the Java
 //! `KubernetesSandbox#persistViaFileApi` / `SandboxFileTransfer` paths.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use reqwest::{Client, Response};
 use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
-use crate::http::join_url;
+use crate::http::{bypass_proxy_for_loopback, join_url};
 use crate::kubernetes_files::{
     file_api_path, temp_archive_rel_path, ExecTransport, KubernetesFileApi, KubernetesFileTransfer,
     ReqwestFileApiTransport, SandboxFileTransfer, FILE_API_TMP_DIR_REL,
@@ -430,6 +430,72 @@ pub fn parse_claim_status(value: &Value) -> KubernetesClaimStatus {
     }
 }
 
+/// Extracts the claim names from a Kubernetes `SandboxClaimList` payload.
+///
+/// Mirrors the Java `K8sHelper#listSandboxClaims`: the server order is preserved and claims
+/// without `metadata.name` are skipped (blank names are skipped too, so the result is directly
+/// usable for follow-up `DELETE` calls).
+pub fn parse_claim_names(value: &Value) -> Vec<String> {
+    value
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("metadata")
+                        .and_then(|metadata| metadata.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Returns `spec.warmPoolRef.name` from a claim payload.
+///
+/// Mirrors the Java `SandboxClient#getSandboxClaimWarmPoolName`, which returns `null` when the
+/// claim carries no `spec` or no `warmPoolRef`.
+pub fn claim_warm_pool_name(claim: &Value) -> Option<String> {
+    claim
+        .get("spec")
+        .and_then(|spec| spec.get("warmPoolRef"))
+        .and_then(|reference| reference.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+/// Polls `fetch` until it yields an address or `budget` elapses.
+///
+/// Returns `Ok(None)` on timeout and propagates fetch errors unchanged. Extracted from
+/// [`KubernetesBackend::wait_for_gateway_address`] so the wait/cancel shape is testable without
+/// sleeping or touching the network.
+async fn wait_for_gateway_address_with<F, Fut>(
+    budget: std::time::Duration,
+    interval: std::time::Duration,
+    mut fetch: F,
+) -> SandboxResult<Option<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SandboxResult<Option<String>>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(address) = fetch().await? {
+            return Ok(Some(address));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(interval.max(std::time::Duration::from_millis(1))).await;
+    }
+}
+
 /// Resolves the sandbox server base URL for an explicit connection strategy.
 ///
 /// Mirrors the Java strategy tree:
@@ -640,25 +706,41 @@ pub struct KubernetesBackend {
     options: KubernetesSandboxClientOptions,
     client: Client,
     retry: RetryPolicy,
+    /// Claims this backend created or attached to, as `"{namespace}/{claimName}"` keys.
+    ///
+    /// Mirrors the Java `SandboxClient#activeSandboxes` registry: the Java map is keyed the same
+    /// way and drives `listActiveSandboxes()` / `deleteAll()` / `close()`. Java prunes entries
+    /// whose client-side `Sandbox` is no longer active; a claim-only backend has no such liveness
+    /// signal, so entries are dropped by [`KubernetesBackend::kill_sandbox`],
+    /// [`KubernetesBackend::delete_sandbox_claim`] and [`KubernetesBackend::delete_all`].
+    active_claims: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl KubernetesBackend {
     /// Builds a backend, wiring up the reqwest client and retry policy.
     pub fn new(options: KubernetesSandboxClientOptions) -> SandboxResult<Self> {
-        let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(
-                options.connect_timeout_seconds,
-            ))
-            .timeout(std::time::Duration::from_secs(options.read_timeout_seconds))
-            .build()
-            .map_err(|e| {
-                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
-            })?;
+        // Any of the configured endpoints can be a locally served router (port-forward, local
+        // gateway); such traffic must stay off the ambient proxy.
+        let client = bypass_proxy_for_loopback(
+            Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(
+                    options.connect_timeout_seconds,
+                ))
+                .timeout(std::time::Duration::from_secs(options.read_timeout_seconds)),
+            &[
+                options.api_url.as_deref().unwrap_or_default(),
+                options.sandbox_api_url.as_deref().unwrap_or_default(),
+                options.gateway_address.as_deref().unwrap_or_default(),
+            ],
+        )
+        .build()
+        .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
         let retry = RetryPolicy::kubernetes(options.max_retries);
         Ok(Self {
             options,
             client,
             retry,
+            active_claims: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -668,14 +750,21 @@ impl KubernetesBackend {
     }
 
     fn claims_collection_path(&self) -> String {
+        self.claims_collection_path_in(&self.options.namespace)
+    }
+
+    fn claims_collection_path_in(&self, namespace: &str) -> String {
         format!(
-            "/apis/{CLAIM_API_GROUP}/{CLAIM_API_VERSION}/namespaces/{}/{CLAIM_PLURAL_NAME}",
-            self.options.namespace
+            "/apis/{CLAIM_API_GROUP}/{CLAIM_API_VERSION}/namespaces/{namespace}/{CLAIM_PLURAL_NAME}"
         )
     }
 
     fn claim_path(&self, claim_name: &str) -> String {
-        format!("{}/{claim_name}", self.claims_collection_path())
+        self.claim_path_in(&self.options.namespace, claim_name)
+    }
+
+    fn claim_path_in(&self, namespace: &str, claim_name: &str) -> String {
+        format!("{}/{claim_name}", self.claims_collection_path_in(namespace))
     }
 
     fn api_base(&self) -> SandboxResult<String> {
@@ -696,6 +785,135 @@ impl KubernetesBackend {
         self.options.resolve_connection_strategy()
     }
 
+    // ------------------------------------------------------- claim registry / listing (K8sHelper)
+
+    fn claim_key(&self, namespace: &str, claim_name: &str) -> String {
+        format!("{namespace}/{claim_name}")
+    }
+
+    fn active_claims_guard(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.active_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn track_claim(&self, claim_name: &str) {
+        let key = self.claim_key(&self.options.namespace, claim_name);
+        self.active_claims_guard().insert(key);
+    }
+
+    fn untrack_claim(&self, namespace: &str, claim_name: &str) {
+        self.active_claims_guard()
+            .remove(&self.claim_key(namespace, claim_name));
+    }
+
+    /// Returns the `"{namespace}/{claimName}"` keys this backend created or attached to.
+    ///
+    /// Mirrors the Java `SandboxClient#listActiveSandboxes` (which returns the `activeSandboxes`
+    /// key set after pruning sandboxes whose client-side handle is no longer active). The set is
+    /// sorted so the result is deterministic; see the `active_claims` field for the liveness
+    /// difference.
+    pub fn list_active_sandboxes(&self) -> Vec<String> {
+        self.active_claims_guard().iter().cloned().collect()
+    }
+
+    /// Lists `SandboxClaim` names in the configured namespace, optionally filtered by a label
+    /// selector (`?labelSelector=`), mirroring the Java `K8sHelper#listSandboxClaims`.
+    ///
+    /// Names keep the server's ordering and claims without `metadata.name` are skipped, exactly
+    /// like the Java implementation.
+    pub async fn list_sandbox_claims(
+        &self,
+        label_selector: Option<&str>,
+    ) -> SandboxResult<Vec<String>> {
+        let path = self.claims_collection_path();
+        let selector = label_selector.map(str::trim).filter(|s| !s.is_empty());
+        let query: Vec<(&str, &str)> = match selector {
+            Some(selector) => vec![("labelSelector", selector)],
+            None => Vec::new(),
+        };
+        let value = self
+            .k8s_request_query(reqwest::Method::GET, &path, &query, None)
+            .await?;
+        Ok(parse_claim_names(&value))
+    }
+
+    /// Fetches a single claim, returning `Ok(None)` for HTTP 404 (the Java
+    /// `K8sHelper#getSandboxClaim` returns `null`).
+    pub async fn get_sandbox_claim(&self, claim_name: &str) -> SandboxResult<Option<Value>> {
+        let path = self.claim_path(claim_name);
+        match self.k8s_request(reqwest::Method::GET, &path, None).await {
+            Ok(value) => Ok(Some(value)),
+            Err(SandboxExtensionError::Http { status: 404, .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Returns the warm-pool name referenced by a claim.
+    ///
+    /// Mirrors the Java `SandboxClient#getSandboxClaimWarmPoolName`: a missing claim is an error,
+    /// and a claim without `spec.warmPoolRef` yields `Ok(None)`.
+    pub async fn get_sandbox_claim_warm_pool_name(
+        &self,
+        claim_name: &str,
+    ) -> SandboxResult<Option<String>> {
+        let claim = self.get_sandbox_claim(claim_name).await?;
+        let Some(claim) = claim else {
+            return Err(SandboxExtensionError::Runtime(
+                SandboxErrorCode::WorkspaceStartError,
+                format!(
+                    "SandboxClaim '{claim_name}' not found in namespace '{}'.",
+                    self.options.namespace
+                ),
+            ));
+        };
+        Ok(claim_warm_pool_name(&claim))
+    }
+
+    /// Deletes a claim, tolerating HTTP 404 and blank names, mirroring the Java
+    /// `K8sHelper#deleteSandboxClaim` ("no-op if already deleted").
+    pub async fn delete_sandbox_claim(&self, claim_name: &str) -> SandboxResult<()> {
+        self.delete_claim_in(&self.options.namespace, claim_name)
+            .await
+    }
+
+    async fn delete_claim_in(&self, namespace: &str, claim_name: &str) -> SandboxResult<()> {
+        if claim_name.trim().is_empty() {
+            return Ok(());
+        }
+        let path = self.claim_path_in(namespace, claim_name);
+        let result = match self.k8s_request(reqwest::Method::DELETE, &path, None).await {
+            Ok(_) => Ok(()),
+            Err(SandboxExtensionError::Http { status: 404, .. }) => Ok(()),
+            Err(err) => Err(err),
+        };
+        self.untrack_claim(namespace, claim_name);
+        result
+    }
+
+    /// Deletes every claim this backend tracks, mirroring the Java `SandboxClient#deleteAll`:
+    /// all tracked claims are attempted, the registry is cleared, and the first failure is
+    /// returned after the remaining deletions have been tried.
+    pub async fn delete_all(&self) -> SandboxResult<()> {
+        let keys: Vec<String> = self.list_active_sandboxes();
+        let mut first_error: Option<SandboxExtensionError> = None;
+        for key in keys {
+            let Some((namespace, claim_name)) = key.split_once('/') else {
+                continue;
+            };
+            if let Err(err) = self.delete_claim_in(namespace, claim_name).await {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        self.active_claims_guard().clear();
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     /// The sandbox resource name when known, the claim name otherwise (used by the in-cluster
     /// service DNS name).
     pub fn sandbox_id_of(handle: &RemoteSandboxHandle) -> String {
@@ -707,6 +925,35 @@ impl KubernetesBackend {
             .filter(|name| !name.is_empty())
             .unwrap_or(&handle.id)
             .to_string()
+    }
+
+    /// Resolves the Gateway external address, waiting up to the sandbox-ready budget for the
+    /// Gateway CRD to publish one.
+    ///
+    /// Mirrors the Java `GatewayStrategy#connect`, which reads the address once and then
+    /// **watches** the Gateway for `gatewayReadyTimeoutSeconds` until an address appears (a
+    /// deleted Gateway is an error). Rust polls [`Self::resolve_gateway_address`] on the same
+    /// interval as the claim readiness wait and gives up with a configuration error; no
+    /// background task is spawned, so there is nothing to cancel or leak. Continuous
+    /// change-notification is not needed: unlike Java (which caches the formatted base URL until
+    /// `close()`), [`Self::connector_base_url`] re-resolves on every call, so an address change is
+    /// picked up by the next request.
+    pub async fn wait_for_gateway_address(&self) -> SandboxResult<String> {
+        let budget =
+            std::time::Duration::from_secs(self.options.sandbox_ready_timeout_seconds.max(1));
+        let interval = std::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+        match wait_for_gateway_address_with(budget, interval, || self.resolve_gateway_address())
+            .await?
+        {
+            Some(address) => Ok(address),
+            None => Err(SandboxExtensionError::Runtime(
+                SandboxErrorCode::ConfigurationError,
+                format!(
+                    "Timed out waiting for gateway address: {}",
+                    self.options.gateway_name.as_deref().unwrap_or("")
+                ),
+            )),
+        }
     }
 
     /// Resolves the Gateway external address.
@@ -820,7 +1067,7 @@ impl KubernetesBackend {
             return resolve_port_forward_base_url(&self.options, &sandbox_id, &pod).await;
         }
         let gateway_address = if strategy == KubernetesConnectionStrategy::Gateway {
-            self.resolve_gateway_address().await?
+            Some(self.wait_for_gateway_address().await?)
         } else {
             None
         };
@@ -995,19 +1242,37 @@ impl KubernetesBackend {
         path: &str,
         body: Option<Value>,
     ) -> SandboxResult<Value> {
+        self.k8s_request_query(method, path, &[], body).await
+    }
+
+    async fn k8s_request_query(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> SandboxResult<Value> {
         let base = self.api_base()?;
         let url = join_url(&base, path);
         let token = self.options.api_token.clone();
         let client = self.client.clone();
         let retry = self.retry.clone();
+        let query: Vec<(String, String)> = query
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
         with_retries(&retry, move || {
             let client = client.clone();
             let url = url.clone();
             let method = method.clone();
             let token = token.clone();
             let body = body.clone();
+            let query = query.clone();
             async move {
                 let mut request = client.request(method, &url);
+                if !query.is_empty() {
+                    request = request.query(&query);
+                }
                 if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
                     request = request.bearer_auth(token);
                 }
@@ -1102,6 +1367,7 @@ impl RemoteBackend for KubernetesBackend {
         self.k8s_request(reqwest::Method::POST, &collection, Some(body))
             .await?;
         let status = self.wait_until_ready(&claim_name).await?;
+        self.track_claim(&claim_name);
         Ok(self.handle_from_status(&claim_name, &status))
     }
 
@@ -1109,16 +1375,13 @@ impl RemoteBackend for KubernetesBackend {
         let path = self.claim_path(sandbox_id);
         let value = self.k8s_request(reqwest::Method::GET, &path, None).await?;
         let status = parse_claim_status(&value);
+        self.track_claim(sandbox_id);
         Ok(self.handle_from_status(sandbox_id, &status))
     }
 
     async fn kill_sandbox(&self, sandbox_id: &str) -> SandboxResult<()> {
-        let path = self.claim_path(sandbox_id);
-        match self.k8s_request(reqwest::Method::DELETE, &path, None).await {
-            Ok(_) => Ok(()),
-            Err(SandboxExtensionError::Http { status: 404, .. }) => Ok(()),
-            Err(err) => Err(err),
-        }
+        self.delete_claim_in(&self.options.namespace, sandbox_id)
+            .await
     }
 
     async fn exec_in(
@@ -2023,5 +2286,397 @@ mod tests {
             ]})),
             Some("router-2".to_string())
         );
+    }
+    // ------------------------------------------- claim listing / registry (Java K8sHelper parity)
+
+    fn claim_list_backend(base_url: &str) -> KubernetesBackend {
+        KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace: "team-a".to_string(),
+            api_url: Some(base_url.to_string()),
+            file_api_base_dir: String::new(),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// `KubernetesSandboxClientOptions` with a one-second readiness budget.
+    fn short_budget_backend(base_url: &str) -> KubernetesBackend {
+        KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace: "team-a".to_string(),
+            api_url: Some(base_url.to_string()),
+            gateway_name: Some("gw".to_string()),
+            sandbox_ready_timeout_seconds: 1,
+            file_api_base_dir: String::new(),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_claim_names_skips_missing_and_blank_names() {
+        let names = parse_claim_names(&json!({
+            "items": [
+                {"metadata": {"name": "claim-b"}},
+                {"metadata": {}},
+                {},
+                {"metadata": {"name": "  "}},
+                {"metadata": {"name": "claim-a"}}
+            ]
+        }));
+        // Server order is preserved (Java `listSandboxClaims` does not sort).
+        assert_eq!(names, vec!["claim-b".to_string(), "claim-a".to_string()]);
+        assert!(parse_claim_names(&json!({})).is_empty());
+        assert!(parse_claim_names(&json!({"items": []})).is_empty());
+        assert!(parse_claim_names(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn claim_warm_pool_name_reads_the_reference() {
+        assert_eq!(
+            claim_warm_pool_name(&json!({"spec": {"warmPoolRef": {"name": "pool-a"}}})),
+            Some("pool-a".to_string())
+        );
+        assert_eq!(claim_warm_pool_name(&json!({"spec": {}})), None);
+        assert_eq!(claim_warm_pool_name(&json!({})), None);
+        assert_eq!(
+            claim_warm_pool_name(&json!({"spec": {"warmPoolRef": {"name": "  "}}})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_claims_returns_names_in_server_order() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let list = server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims",
+                );
+                then.status(200).json_body(json!({
+                    "items": [
+                        {"metadata": {"name": "agentscope-b"}},
+                        {"metadata": {"name": "agentscope-a"}}
+                    ]
+                }));
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        assert_eq!(
+            backend.list_sandbox_claims(None).await.unwrap(),
+            vec!["agentscope-b".to_string(), "agentscope-a".to_string()]
+        );
+        list.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_claims_sends_the_label_selector() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        // Only matches when the selector is really sent as `?labelSelector=`; a request without it
+        // falls through to httpmock's 404 and the call below fails.
+        let list = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(
+                        "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims",
+                    )
+                    .query_param("labelSelector", "app=demo,tier=agent");
+                then.status(200)
+                    .json_body(json!({"items": [{"metadata": {"name": "agentscope-c"}}]}));
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        assert_eq!(
+            backend
+                .list_sandbox_claims(Some("app=demo,tier=agent"))
+                .await
+                .unwrap(),
+            vec!["agentscope-c".to_string()]
+        );
+        list.assert_async().await;
+    }
+    #[tokio::test]
+    async fn get_sandbox_claim_returns_none_on_404() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let get = server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/missing",
+                );
+                then.status(404)
+                    .json_body(json!({"kind": "Status", "reason": "NotFound"}));
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        assert!(backend
+            .get_sandbox_claim("missing")
+            .await
+            .unwrap()
+            .is_none());
+        get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_claim_warm_pool_name_reads_the_claim() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let get = server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                then.status(200).json_body(
+                    json!({"metadata": {"name": "c1"}, "spec": {"warmPoolRef": {"name": "pool-a"}}}),
+                );
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        assert_eq!(
+            backend
+                .get_sandbox_claim_warm_pool_name("c1")
+                .await
+                .unwrap(),
+            Some("pool-a".to_string())
+        );
+        get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_claim_warm_pool_name_errors_when_the_claim_is_missing() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/gone",
+                );
+                then.status(404).body("not found");
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        let err = backend
+            .get_sandbox_claim_warm_pool_name("gone")
+            .await
+            .unwrap_err();
+        // Java throws `SandboxNotFoundException` with this message.
+        assert!(
+            err.to_string()
+                .contains("SandboxClaim 'gone' not found in namespace 'team-a'."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_claim_tolerates_404_and_blank_names() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                then.status(200)
+                    .json_body(json!({"kind": "Status", "status": "Success"}));
+            })
+            .await;
+        let gone = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/gone",
+                );
+                then.status(404).body("not found");
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        backend.delete_sandbox_claim("c1").await.unwrap();
+        // Already deleted claims are a no-op, exactly like `K8sHelper#deleteSandboxClaim`.
+        backend.delete_sandbox_claim("gone").await.unwrap();
+        // Blank names never reach the API.
+        backend.delete_sandbox_claim("   ").await.unwrap();
+        delete.assert_async().await;
+        gone.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn active_claims_track_attach_and_forget_deletes() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                then.status(200)
+                    .json_body(json!({"metadata": {"name": "c1"}}));
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                then.status(200).body("");
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        assert!(backend.list_active_sandboxes().is_empty());
+        backend.connect_sandbox("c1").await.unwrap();
+        // Java keys the registry as `namespace/claimName`.
+        assert_eq!(
+            backend.list_active_sandboxes(),
+            vec!["team-a/c1".to_string()]
+        );
+        backend.kill_sandbox("c1").await.unwrap();
+        assert!(backend.list_active_sandboxes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_all_removes_every_tracked_claim() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        for (claim, path) in [
+            (
+                "c1",
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+            ),
+            (
+                "c2",
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c2",
+            ),
+        ] {
+            server
+                .mock_async(move |when, then| {
+                    when.method(GET).path(path);
+                    then.status(200)
+                        .json_body(json!({"metadata": {"name": claim}}));
+                })
+                .await;
+        }
+        let delete_c1 = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                then.status(200).body("");
+            })
+            .await;
+        let delete_c2 = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c2",
+                );
+                then.status(200).body("");
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        backend.connect_sandbox("c1").await.unwrap();
+        backend.connect_sandbox("c2").await.unwrap();
+        assert_eq!(backend.list_active_sandboxes().len(), 2);
+        backend.delete_all().await.unwrap();
+        delete_c1.assert_async().await;
+        delete_c2.assert_async().await;
+        assert!(backend.list_active_sandboxes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_all_reports_the_first_failure_but_clears_the_registry() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                then.status(200)
+                    .json_body(json!({"metadata": {"name": "c1"}}));
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/c1",
+                );
+                // 400 is not retryable, so the failure surfaces on the first attempt.
+                then.status(400).body("bad request");
+            })
+            .await;
+        let backend = claim_list_backend(&server.base_url());
+        backend.connect_sandbox("c1").await.unwrap();
+        let err = backend.delete_all().await.unwrap_err();
+        assert_eq!(err.status(), Some(400));
+        assert!(backend.list_active_sandboxes().is_empty());
+    }
+
+    // ------------------------------------------------- gateway address wait (Java GatewayStrategy)
+
+    #[tokio::test]
+    async fn gateway_address_wait_polls_until_the_address_appears() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let polls_ref = polls.clone();
+        let address = wait_for_gateway_address_with(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+            move || {
+                let polls = polls_ref.clone();
+                async move {
+                    let seen = polls.fetch_add(1, Ordering::SeqCst);
+                    // Mirrors a Gateway that only publishes an address once programmed.
+                    Ok((seen >= 2).then(|| "1.2.3.4".to_string()))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(address, Some("1.2.3.4".to_string()));
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gateway_address_wait_gives_up_after_the_budget() {
+        let address = wait_for_gateway_address_with(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+            || async { Ok(None) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(address, None);
+        // Fetch errors are propagated instead of being reported as a timeout.
+        let err = wait_for_gateway_address_with(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+            || async { Err(SandboxExtensionError::Transport("boom".to_string())) },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn gateway_without_a_published_address_times_out_with_the_java_message() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let crd = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/apis/gateway.networking.k8s.io/v1/namespaces/team-a/gateways/gw");
+                then.status(200)
+                    .json_body(json!({"status": {"addresses": []}}));
+            })
+            .await;
+        let backend = short_budget_backend(&server.base_url());
+        let err = backend.wait_for_gateway_address().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Timed out waiting for gateway address: gw"),
+            "unexpected error: {err}"
+        );
+        // Polled more than once before giving up (a plain `get` would only see one hit).
+        assert!(crd.hits_async().await >= 2);
     }
 }

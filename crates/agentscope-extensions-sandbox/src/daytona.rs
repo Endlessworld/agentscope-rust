@@ -14,7 +14,7 @@ use reqwest::{Client, Response};
 use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
-use crate::http::join_url;
+use crate::http::{bypass_proxy_for_loopback, join_url};
 use crate::remote::{RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle};
 use crate::retry::{with_retries, RetryPolicy};
 
@@ -172,13 +172,17 @@ pub struct DaytonaBackend {
 impl DaytonaBackend {
     /// Builds a backend, wiring up the reqwest client and retry policy.
     pub fn new(options: DaytonaSandboxClientOptions) -> SandboxResult<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
-            .timeout(Duration::from_secs(options.read_timeout_seconds))
-            .build()
-            .map_err(|e| {
-                SandboxExtensionError::Transport(format!("failed to build client: {e}"))
-            })?;
+        let client = bypass_proxy_for_loopback(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
+                .timeout(Duration::from_secs(options.read_timeout_seconds)),
+            &[
+                options.control_plane_base_url.as_str(),
+                options.toolbox_base_url.as_str(),
+            ],
+        )
+        .build()
+        .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
         let retry = RetryPolicy::daytona(options.max_retries);
         Ok(Self {
             options,
