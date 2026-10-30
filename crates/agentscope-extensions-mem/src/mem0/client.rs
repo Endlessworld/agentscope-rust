@@ -9,6 +9,8 @@ use crate::mem0::dto::{
     Mem0AddRequest, Mem0AddResponse, Mem0ApiType, Mem0SearchRequest, Mem0SearchResponse,
     Mem0SearchResult,
 };
+use crate::retry::{RetryPolicy, RetryTransport};
+use crate::telemetry::{InstrumentedTransport, MemMetrics};
 
 /// Platform endpoints (official cloud service).
 pub const PLATFORM_MEMORIES_ENDPOINT: &str = "/v1/memories/";
@@ -30,6 +32,8 @@ pub struct Mem0Client {
     api_type: Mem0ApiType,
     add_endpoint: String,
     search_endpoint: String,
+    /// Present for the `reqwest`-backed constructors, so a host can scrape counters.
+    metrics: Option<Arc<MemMetrics>>,
 }
 
 impl std::fmt::Debug for Mem0Client {
@@ -64,8 +68,37 @@ impl Mem0Client {
         api_type: Mem0ApiType,
         timeout: Duration,
     ) -> Result<Self> {
-        let transport = Arc::new(ReqwestTransport::new(timeout)?);
-        Self::assemble(transport, api_base_url.into(), api_key, api_type)
+        Self::with_api_type_and_policy(
+            api_base_url,
+            api_key,
+            api_type,
+            timeout,
+            RetryPolicy::default(),
+        )
+    }
+
+    /// Builds a client with an explicit deployment type, timeout and retry policy.
+    ///
+    /// The transport chain is `Retry(Instrumented(Reqwest))`: retries are counted by
+    /// [`RetryTransport`], per-attempt counters/span by [`InstrumentedTransport`].
+    /// [`RetryPolicy::default`] performs a single attempt, matching Java.
+    pub fn with_api_type_and_policy(
+        api_base_url: impl Into<String>,
+        api_key: Option<String>,
+        api_type: Mem0ApiType,
+        timeout: Duration,
+        policy: RetryPolicy,
+    ) -> Result<Self> {
+        let metrics = MemMetrics::shared();
+        let instrumented: Arc<dyn HttpTransport> = Arc::new(InstrumentedTransport::new(
+            Arc::new(ReqwestTransport::new(timeout)?),
+            Arc::clone(&metrics),
+        ));
+        let transport: Arc<dyn HttpTransport> =
+            Arc::new(RetryTransport::new(instrumented, policy));
+        let mut client = Self::assemble(transport, api_base_url.into(), api_key, api_type)?;
+        client.metrics = Some(metrics);
+        Ok(client)
     }
 
     /// Builds a client on top of an injected transport (used by tests).
@@ -114,7 +147,14 @@ impl Mem0Client {
             api_type,
             add_endpoint,
             search_endpoint,
+            metrics: None,
         })
+    }
+
+    /// The counters fed by the instrumented transport, when the client was built by
+    /// one of the `reqwest`-backed constructors.
+    pub fn metrics(&self) -> Option<&MemMetrics> {
+        self.metrics.as_deref()
     }
 
     /// The configured API type.
@@ -165,8 +205,14 @@ impl Mem0Client {
     ///
     /// Supports both API response shapes, matching Java `Mem0Client.search`:
     /// a bare JSON array (v1.0) or an object with a `results` field (v1.1).
+    ///
+    /// `user_id` is re-mirrored into `filters` before serialization so a request
+    /// built by field assignment / deserialization can never lose the tenant filter
+    /// (Java `Mem0SearchRequest.setUserId` guarantees the same invariant).
     pub async fn search(&self, request: &Mem0SearchRequest) -> Result<Mem0SearchResponse> {
-        let body = serde_json::to_string(request)?;
+        let mut request = request.clone();
+        request.sync_filters();
+        let body = serde_json::to_string(&request)?;
         let raw = self.post(&self.search_endpoint, &body).await?;
         let trimmed = raw.trim();
         if trimmed.starts_with('[') {
@@ -308,5 +354,68 @@ mod tests {
         let client = client(Arc::new(mock), None, Mem0ApiType::Platform);
         let err = client.search(&Mem0SearchRequest::new()).await.unwrap_err();
         assert!(matches!(err, MemError::Transport(_)));
+    }
+
+    /// Java `Mem0ClientTest.testAddRequestHttpError`: the status and body stay visible.
+    #[tokio::test]
+    async fn add_propagates_http_status_and_body() {
+        let mock = MockTransport::new();
+        mock.push_response(Err(MemError::HttpStatus {
+            status: 401,
+            body: "{\"detail\":\"unauthorized\"}".into(),
+        }));
+        let client = client(Arc::new(mock), Some("bad"), Mem0ApiType::Platform);
+        let err = client.add(&Mem0AddRequest::new()).await.unwrap_err();
+        match err {
+            MemError::HttpStatus { status, body } => {
+                assert_eq!(status, 401);
+                assert!(body.contains("unauthorized"));
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    /// Java `Mem0ClientTest.testAddRequestInvalidJson` / `testSearchRequestInvalidJson`.
+    #[tokio::test]
+    async fn invalid_json_surfaces_as_a_json_error() {
+        let mock = MockTransport::new();
+        mock.push_body("not json");
+        let client = client(Arc::new(mock.clone()), None, Mem0ApiType::Platform);
+        assert!(matches!(
+            client.add(&Mem0AddRequest::new()).await.unwrap_err(),
+            MemError::Json(_)
+        ));
+
+        mock.push_body("also not json");
+        assert!(matches!(
+            client.search(&Mem0SearchRequest::new()).await.unwrap_err(),
+            MemError::Json(_)
+        ));
+    }
+
+    /// The tenant filter is restored from a deserialized request before it hits the wire.
+    #[tokio::test]
+    async fn search_wire_payload_always_carries_the_user_id_filter() {
+        let mock = MockTransport::new();
+        mock.push_body("{}");
+        let client = client(Arc::new(mock.clone()), None, Mem0ApiType::Platform);
+        let request: Mem0SearchRequest =
+            serde_json::from_value(serde_json::json!({"query": "q", "user_id": "u"})).unwrap();
+        assert!(request.filters.get("user_id").is_none());
+        client.search(&request).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&mock.requests()[0].2).unwrap();
+        assert_eq!(body["filters"]["user_id"], "u");
+    }
+
+    /// The `reqwest`-backed constructors install the instrumented transport, so a host
+    /// can scrape counters without rebuilding the client.
+    #[test]
+    fn default_construction_exposes_metrics() {
+        let client = Mem0Client::new("https://mem0.test", None).unwrap();
+        let metrics = client.metrics().expect("instrumented transport installed");
+        assert_eq!(metrics.snapshot().requests, 0);
+        // Injected transports are not instrumented: the caller owns that seam.
+        let injected = self::client(Arc::new(MockTransport::new()), None, Mem0ApiType::Platform);
+        assert!(injected.metrics().is_none());
     }
 }

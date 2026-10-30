@@ -147,10 +147,18 @@ pub struct BailianLongTermMemory {
 
 impl BailianLongTermMemory {
     /// Creates an adapter, validating the key and user identifier like Java.
+    ///
+    /// Java `BailianLongTermMemory.Builder.build()` checks `apiKey` (`"apiKey cannot be
+    /// null or blank"`) *before* building the client. The Rust adapter takes an already
+    /// built client, so the check is repeated here: otherwise `config.api_key` would be
+    /// a dead field and an empty key paired with a valid client would slip through.
     pub fn new(
         client: Arc<BailianMemoryClient>,
         config: BailianLongTermMemoryConfig,
     ) -> Result<Self> {
+        if config.api_key.trim().is_empty() {
+            return Err(MemError::Config("apiKey cannot be null or blank".into()));
+        }
         if config.user_id.trim().is_empty() {
             return Err(MemError::Config("userId cannot be null or blank".into()));
         }
@@ -378,6 +386,27 @@ mod tests {
         ));
     }
 
+    /// Java `BailianLongTermMemoryTest.testBuilderRequiresApiKey` /
+    /// `testBuilderWithBlankApiKey`: the adapter itself rejects an empty key, even
+    /// when a valid client is injected.
+    #[test]
+    fn new_rejects_blank_api_key() {
+        let client = Arc::new(
+            BailianMemoryClient::with_transport(
+                Arc::new(MockTransport::new()),
+                "key",
+                DEFAULT_BASE_URL,
+            )
+            .unwrap(),
+        );
+        for blank in ["", "   "] {
+            let config = BailianLongTermMemoryConfig::new(blank, "user");
+            let err = BailianLongTermMemory::new(Arc::clone(&client), config).unwrap_err();
+            assert!(matches!(err, MemError::Config(_)));
+            assert!(err.to_string().contains("apiKey cannot be null or blank"));
+        }
+    }
+
     #[test]
     fn client_rejects_blank_base_url() {
         // Mirrors Java `BailianMemoryClient` builder validation.
@@ -428,6 +457,29 @@ mod tests {
         assert_eq!(req.user_id.as_deref(), Some("user"));
         assert!(req.memory_library_id.is_none());
         assert!(req.metadata.is_none());
+    }
+
+    /// Java `testRecordWithMemoryLibraryId` / `testRecordWithProfileSchema` /
+    /// `testRecordWithProjectId` / `testRecordWithMetadata`: the optional identifiers
+    /// travel on the add body when configured.
+    #[tokio::test]
+    async fn record_posts_optional_identifiers_and_metadata() {
+        let mut config = BailianLongTermMemoryConfig::new("key", "user");
+        config.memory_library_id = Some("lib".into());
+        config.project_id = Some("proj".into());
+        config.profile_schema = Some("schema".into());
+        let mut metadata = JsonMap::new();
+        metadata.insert("tier".into(), serde_json::json!("gold"));
+        config.metadata = Some(metadata);
+        let (mock, adapter) = adapter(config);
+        mock.push_body(r#"{"memory_nodes":[]}"#);
+        adapter.record(&[Msg::user("hi")]).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&mock.requests()[0].2).unwrap();
+        assert_eq!(body["user_id"], "user");
+        assert_eq!(body["memory_library_id"], "lib");
+        assert_eq!(body["project_id"], "proj");
+        assert_eq!(body["profile_schema"], "schema");
+        assert_eq!(body["meta_data"]["tier"], "gold");
     }
 
     #[tokio::test]

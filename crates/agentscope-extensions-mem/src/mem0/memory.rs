@@ -28,11 +28,17 @@ pub fn role_to_mem0_role(role: MsgRole) -> &'static str {
 }
 
 /// Converts a single [`Msg`] to a [`Mem0Message`].
+///
+/// Java `Mem0LongTermMemory.convertToMem0Message` only sets `role` and `content`
+/// (`Mem0Message.builder().role(role).content(text).build()`), so the message `name`
+/// is deliberately **not** forwarded: keeping the wire payload byte-identical to Java
+/// matters for callers that assert on the request body. [`Mem0Message::with_name`]
+/// stays available for callers that need an explicit sender name.
 pub fn convert_to_mem0_message(msg: &Msg) -> Mem0Message {
     Mem0Message {
         role: role_to_mem0_role(msg.role()).to_string(),
         content: msg.text_content(),
-        name: msg.name().map(str::to_string),
+        name: None,
     }
 }
 
@@ -149,7 +155,9 @@ impl Mem0LongTermMemory {
 
     /// Records messages to Mem0, mirroring `Mem0LongTermMemory.record`.
     ///
-    /// Returns without a request when nothing survives filtering.
+    /// Returns without a request when nothing survives filtering. Java chains
+    /// `client.add(...).then()` with no `onErrorComplete()`, so the error stays
+    /// visible; there is deliberately no `record_lossy` on this adapter.
     pub async fn record(&self, msgs: &[Msg]) -> Result<()> {
         if msgs.is_empty() {
             return Ok(());
@@ -248,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_message_preserves_name() {
+    fn convert_message_matches_java_and_omits_name() {
         let msg = Msg::builder()
             .role(MsgRole::User)
             .name("alice")
@@ -257,7 +265,12 @@ mod tests {
         let converted = convert_to_mem0_message(&msg);
         assert_eq!(converted.role, "user");
         assert_eq!(converted.content, "hi");
-        assert_eq!(converted.name.as_deref(), Some("alice"));
+        // Java `convertToMem0Message` never forwards the sender name.
+        assert_eq!(converted.name, None);
+        assert!(serde_json::to_value(&converted)
+            .unwrap()
+            .get("name")
+            .is_none());
     }
 
     #[test]
@@ -445,5 +458,51 @@ mod tests {
         });
         mock.push_body(r#"{"results":[{"memory":"one"},{"memory":"two"}]}"#);
         assert_eq!(adapter.retrieve_lossy(&Msg::user("q")).await, "one\ntwo");
+    }
+
+    /// Java `Mem0LongTermMemoryTest.testBuilderWithAllIdentifiers` +
+    /// `testRecordWithValidMessages`: every configured identifier reaches the add body.
+    #[tokio::test]
+    async fn record_posts_all_configured_identifiers_without_a_name_key() {
+        let (mock, adapter) = adapter(Mem0LongTermMemoryConfig {
+            agent_id: Some("agent".into()),
+            user_id: Some("user".into()),
+            run_id: Some("run".into()),
+            metadata: None,
+        });
+        mock.push_body("{}");
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .name("alice")
+            .text_content("hello")
+            .build();
+        adapter.record(&[msg]).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&mock.requests()[0].2).unwrap();
+        assert_eq!(body["agent_id"], "agent");
+        assert_eq!(body["user_id"], "user");
+        assert_eq!(body["run_id"], "run");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        // Wire-shape parity with Java: no `name` key.
+        assert!(body["messages"][0].get("name").is_none());
+    }
+
+    /// Java `Mem0LongTermMemory.record` chains `client.add(...).then()` with **no**
+    /// `onErrorComplete()`, so the error stays visible — the Rust strict `record`
+    /// matches, and there is deliberately no `record_lossy` on this adapter.
+    #[tokio::test]
+    async fn record_surfaces_http_errors_like_java() {
+        let (mock, adapter) = adapter(Mem0LongTermMemoryConfig {
+            user_id: Some("u".into()),
+            ..Default::default()
+        });
+        mock.push_response(Err(MemError::HttpStatus {
+            status: 500,
+            body: "boom".into(),
+        }));
+        assert!(matches!(
+            adapter.record(&[Msg::user("hello")]).await.unwrap_err(),
+            MemError::HttpStatus { status: 500, .. }
+        ));
     }
 }

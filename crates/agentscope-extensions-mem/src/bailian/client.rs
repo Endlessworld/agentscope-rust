@@ -8,6 +8,8 @@ use crate::bailian::dto::{
 };
 use crate::error::{MemError, Result};
 use crate::http::{HttpTransport, ReqwestTransport};
+use crate::retry::{RetryPolicy, RetryTransport};
+use crate::telemetry::{InstrumentedTransport, MemMetrics};
 
 /// Default base URL (`https://dashscope.aliyuncs.com`).
 pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com";
@@ -23,6 +25,8 @@ pub struct BailianMemoryClient {
     transport: Arc<dyn HttpTransport>,
     api_base_url: String,
     api_key: String,
+    /// Present for the `reqwest`-backed constructors, so a host can scrape counters.
+    metrics: Option<Arc<MemMetrics>>,
 }
 
 impl std::fmt::Debug for BailianMemoryClient {
@@ -45,12 +49,32 @@ impl BailianMemoryClient {
         api_base_url: Option<String>,
         timeout: Duration,
     ) -> Result<Self> {
-        let transport = Arc::new(ReqwestTransport::new(timeout)?);
-        Self::with_transport(
+        Self::with_timeout_and_policy(api_key, api_base_url, timeout, RetryPolicy::default())
+    }
+
+    /// Builds a client with an explicit timeout and retry policy.
+    ///
+    /// The transport chain is `Retry(Instrumented(Reqwest))`; counters are exposed
+    /// through [`Self::metrics`]. The default policy is a single attempt (Java parity).
+    pub fn with_timeout_and_policy(
+        api_key: impl Into<String>,
+        api_base_url: Option<String>,
+        timeout: Duration,
+        policy: RetryPolicy,
+    ) -> Result<Self> {
+        let metrics = MemMetrics::shared();
+        let instrumented: Arc<dyn HttpTransport> = Arc::new(InstrumentedTransport::new(
+            Arc::new(ReqwestTransport::new(timeout)?),
+            Arc::clone(&metrics),
+        ));
+        let transport: Arc<dyn HttpTransport> = Arc::new(RetryTransport::new(instrumented, policy));
+        let mut client = Self::with_transport(
             transport,
             api_key,
             api_base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-        )
+        )?;
+        client.metrics = Some(metrics);
+        Ok(client)
     }
 
     /// Builds a client on top of an injected transport (used by tests).
@@ -78,7 +102,14 @@ impl BailianMemoryClient {
             transport,
             api_base_url,
             api_key,
+            metrics: None,
         })
+    }
+
+    /// The counters fed by the instrumented transport, when the client was built by
+    /// one of the `reqwest`-backed constructors.
+    pub fn metrics(&self) -> Option<&MemMetrics> {
+        self.metrics.as_deref()
     }
 
     /// The configured base URL.
@@ -122,5 +153,43 @@ impl BailianMemoryClient {
         let body = serde_json::to_string(request)?;
         let raw = self.post(SEARCH_MEMORY_ENDPOINT, &body).await?;
         Ok(serde_json::from_str(&raw)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::mock::MockTransport;
+
+    #[test]
+    fn default_construction_defaults_the_base_url_and_installs_metrics() {
+        let client = BailianMemoryClient::new("key", None).unwrap();
+        assert_eq!(client.api_base_url(), DEFAULT_BASE_URL);
+        let metrics = client.metrics().expect("instrumented transport installed");
+        assert_eq!(metrics.snapshot().requests, 0);
+    }
+
+    #[test]
+    fn injected_transports_are_not_instrumented() {
+        let client = BailianMemoryClient::with_transport(
+            Arc::new(MockTransport::new()),
+            "key",
+            DEFAULT_BASE_URL,
+        )
+        .unwrap();
+        assert!(client.metrics().is_none());
+    }
+
+    #[test]
+    fn policy_constructor_is_equivalent_to_the_default_one() {
+        let client = BailianMemoryClient::with_timeout_and_policy(
+            "key",
+            Some("https://bailian.test/".into()),
+            Duration::from_secs(5),
+            RetryPolicy::new(3, Duration::from_millis(10), Duration::from_millis(50), 2.0),
+        )
+        .unwrap();
+        assert_eq!(client.api_base_url(), "https://bailian.test");
+        assert!(client.metrics().is_some());
     }
 }

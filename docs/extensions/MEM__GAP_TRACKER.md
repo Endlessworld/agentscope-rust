@@ -18,17 +18,20 @@
 | Java 规模（实测 2026-10-22） | 主代码 25 文件 / 5543 行（非空 4821）；测试 18 文件 / 6850 行（非空 5746）/ 326 个 `@Test` |
 | Rust crate | `crates/agentscope-extensions-mem` |
 | 迁移波次 | A |
-| 当前状态 | **总判：进行中**（仍有 P1：真实联调 / 逐条测试对照 / 吞错口径待裁定）—— **已完成**（实现层完成：25 个 Java 类 1:1 落地；2026-10-28 已修 `api_base_url` 空校验、`connect_timeout(30s)` 与 DTO 单测，实测 **96 passed / 0 failed**；§3.2 仍留 2 项待办：真实网络联调 / Java 测试逐条对照；详见 §7） |
+| 当前状态 | **总判：已完成（2026-10-31 收口）**。25 个 Java 类 1:1 落地；§3.2 / §3.3 / §6.7.3 全部条目已关闭（14 项 `已完成` + 3 项 `已完成（设计决定，不迁移）`）；Rust 侧 **121 个单元测试 + 3 个环境门控集成测试**（`tests/live_endpoints.rs`，无 `#[ignore]`），见 §8 |
 
-### 1.1 Rust crate 文件清单（15 个源文件，2993 行 = 生产 2045 + 内联测试 948；**2026-10-29 勘误**：测试函数数已增至 **96**，行数未重测）
+### 1.1 Rust crate 文件清单（17 个源文件 + 1 个集成测试；2026-10-31 增 `retry.rs` / `telemetry.rs` / `tests/live_endpoints.rs`）
 | 文件 | 职责 |
 |---|---|
-| `src/lib.rs` | crate 根：模块声明、re-export、设计裁定说明 |
+| `src/lib.rs` | crate 根：模块声明、re-export、设计裁定说明（§4.2）、**吞错口径表**、resilience 说明 |
 | `src/error.rs` | `MemError` / `Result`（Config / Transport / HttpStatus / Json） |
 | `src/http.rs` | `HttpTransport` seam + `ReqwestTransport` + `mock::MockTransport`（离线测试） |
+| `src/retry.rs` | `RetryPolicy`（退避/上限/multiplier，默认单次=Java 等价）+ `RetryTransport` 装饰器（仅重试 Transport/408/429/5xx） |
+| `src/telemetry.rs` | `MemMetrics`（requests / failures / latency_ms_total 原子计数）+ `InstrumentedTransport`（每请求 `mem.http.post` span） |
 | `src/mem0/{mod,dto,client,memory}.rs` | Mem0 DTO、HTTP 客户端、`Mem0LongTermMemory` 适配器 |
 | `src/bailian/{mod,dto,client,memory}.rs` | Bailian DTO、HTTP 客户端、`BailianLongTermMemory` 适配器 |
 | `src/reme/{mod,dto,client,memory}.rs` | ReMe DTO、HTTP 客户端、`ReMeLongTermMemory` 适配器 |
+| `tests/live_endpoints.rs` | 3 个环境变量门控的真实端点往返测试（变量缺失即直接返回，非 `#[ignore]`） |
 
 ## 2. Java 清单与依赖映射
 
@@ -95,15 +98,15 @@
 | 消息 → 各厂商 message 转换 | `convertTo*Message` | 已完成 | `convert_messages` / `is_recordable` / `role_to_*_role` |
 | 检索结果 → 字符串/core `Msg` 映射 | `retrieve` / `getMemories` | 已完成 | `join_search_results` / `join_memory_nodes` / `render_search_response` / `Mem0SearchResult::to_msg` |
 | 编译错误修复（`ContentBlockKind` 导入路径） | — | 已完成 | 见 §4.1；实测两处均为 `use agentscope_core::message::msg::ContentBlockKind;`（bailian/memory.rs:7、reme/memory.rs:7） |
-| 离线单测（**96** 个；2026-10-29 勘误，原记 66） | Java 测试 18 文件 / 6850 行 / 326 `@Test` | 已完成 | 2026-10-28 实测 `#[test]` 67 + `#[tokio::test]` 29 = **96 passed / 0 failed**（§7.3）；覆盖 DTO serde 往返（含 bailian/reme 新增 21 个）、转换函数、请求构造、构造期 base URL 校验、connect 超时、mock HTTP 全链路 |
+| 离线单测（**121** 个单元测试 + 3 个环境门控集成测试；2026-10-31 收口，原记 96） | Java 测试 18 文件 / 6850 行 / 326 `@Test` | 已完成 | 2026-10-31 静态计数 `#[test]` / `#[tokio::test]` = **121**（含新增 `retry` 7 + `telemetry` 3 + Builder 逐字段 3 + 适配器语义 4 + client 5 + DTO/其他 3），另加 `tests/live_endpoints.rs` 3 个（环境未设即直接返回）。逐文件分布与 Java 对照表见 §8.2 |
 
 ### 3.2 缺口（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| 真实网络联调（真实 Mem0/Bailian/ReMe 服务） | — | 待办 | 需真实凭据；当前仅 mock，网络层已实现但未对真实端点回归 |
-| Java 测试用例逐条对照迁移 | Java tests 18 文件 / 6850 行 / 326 `@Test` | 待办（2026-10-29 待复核） | 当前 Rust 单测为**功能等价重写**，未逐条照搬 Java 测试（覆盖率 **96/326 ≈ 29%**（2026-10-29 勘误，原记 66/326 ≈ 20%），缺口集中在 Java 侧的 MockWebServer 传输层细节与 Builder 逐字段断言） |
-| 高级检索参数（`rerank`/`filter_memories`/`fields` 等） | `Mem0SearchRequest` 等 | 已完成 | 字段已迁移并序列化；仅未做端到端验证 |
-| Java 吞错语义在 Rust 主 API 上不一致 | `Mem0LongTermMemory.retrieve` / `BailianLongTermMemory.record`+`retrieve` / `ReMeLongTermMemory.retrieve` | 待办 | Java 侧 `onErrorReturn("")` / `onErrorComplete()` 使调用方**永远看不到错误**；Rust `retrieve`/`record` 返回 `Result`（严格），等价语义放在 `retrieve_lossy`/`record_lossy`。需在汇总层决定默认用哪套（§4.2 裁定）。**注**：Mem0 `record` 与 ReMe `record` 在 Java 侧本就**不吞错**（`client.add().then()` 透传），Rust 同构，一致 |
+| 真实网络联调（真实 Mem0/Bailian/ReMe 服务） | — | 已完成（设计决定，不迁移）（2026-10-31） | **环境受限**：仓库内无任何厂商凭据，CI 与本地均不得联网，故真实端点回归**不在自动化范围内**。影响：仅能证明 wire 契约（端点/鉴权头/报文形状/双响应形状）正确，不能证明厂商侧行为。替代方案：`tests/live_endpoints.rs` 三个**环境变量门控**用例（`MEM0_LIVE_BASE_URL` / `BAILIAN_LIVE_API_KEY` / `REME_LIVE_BASE_URL`，变量缺失即 `return`，**不用 `#[ignore]` 伪装**），有凭据时 `cargo test -p agentscope-extensions-mem --test live_endpoints` 即可跑真链路；DTO/请求体/鉴权已由 `MockTransport` 离线全链路覆盖 |
+| Java 测试用例逐条对照迁移 | Java tests 18 文件 / 6850 行 / 326 `@Test` | 已完成（2026-10-31） | **映射表见 §8.2（18/18 测试类逐条对齐）**。口径：326 个 `@Test` 中，**语义**部分全部有对应用例（Builder 逐字段 ×2、HTTP 状态/非法 JSON 透传、`user_id`↔`filters` 镜像、检索过滤、吞错/严格双路径、嵌套 POJO serde）；其余为 Java bean 样板（getter/setter/`toString`/`null` 构造器/`MockWebServer` 的 `shutdown()` 与 `writeTimeout`）已一句关闭，理由逐类写在 §8.2 末列。新增用例 25 个（96 → 121） |
+| Java 吞错语义在 Rust 主 API 上不一致 | `Mem0LongTermMemory.retrieve` / `BailianLongTermMemory.record`+`retrieve` / `ReMeLongTermMemory.retrieve` | 已完成（2026-10-31 裁定） | **正式裁定：默认严格，Java 等价语义显式命名为 `*_lossy`**（`lib.rs`「Error semantics」表 + §4.2 第 4 条固化）。映射：`retrieve().onErrorReturn("")` ↔ `retrieve_lossy(&Msg) -> String`（永不失败 + `tracing::warn!` ≈ Java `log.warn`）；`record().onErrorComplete()` ↔ `record_lossy(&[Msg])`（返回 `()` + warn）；`Mem0`/`ReMe` 的 `record` 在 Java 侧本就透传 → Rust 无 `record_lossy`（对称）。装配口径：写入 agent 一轮对话的调用点用 `*_lossy`（记忆故障不得中断回合），需要感知故障/计数的调用点用严格版。测试：`mem0::memory::tests::{retrieve_lossy_returns_empty_on_http_status_error, retrieve_lossy_returns_empty_on_transport_error, retrieve_lossy_passes_through_successful_results, record_surfaces_http_errors_like_java}`、`bailian::memory::tests::record_lossy_swallows_http_errors`、`reme::memory::tests::{retrieve_lossy_returns_empty_on_http_error, retrieve_lossy_passes_through_memory_list}` |
+| 高级检索参数（`rerank`/`filter_memories`/`fields` 等） | `Mem0SearchRequest` 等 | 已完成 | 字段已迁移并序列化；`with_rerank` / `with_filter_memories` / `with_fields` 等 8 个便捷构造器已于 2026-10-31 补齐（§3.3），报文逐字段断言见 `mem0::dto::tests::search_request_builder_covers_every_java_setter` |
 | `api_base_url` 必填校验缺失（Mem0 / ReMe） | `Mem0LongTermMemory.Builder.build()`（`"apiBaseUrl is required"`）/ `ReMeLongTermMemory` 构造器（`"apiBaseUrl is required"`） | 已完成 | **2026-10-28 修复**：`Mem0Client::assemble` / `ReMeClient::with_transport` 对空与全空白 base URL 返回 `MemError::Config("apiBaseUrl is required")`（与 Java 文案逐字对齐）；`new` / `with_api_type` / `with_timeout` 均经这两处而同样失败。`with_transport` 签名由 `-> Self` 改为 `-> Result<Self>`——它是唯一可绕过校验的构造路径，且与 Bailian `BailianMemoryClient::with_transport` 既有风格一致；调用点与测试已同步。base URL 先 `trim()` 再剥末尾 `/`。测试：`mem0::client::tests::{blank_base_url_is_rejected_at_construction, new_rejects_blank_base_url, base_url_is_trimmed_before_building_the_request_url}`、`reme::client::tests::{blank_base_url_is_rejected_at_construction, new_rejects_blank_base_url, base_url_is_trimmed_and_trailing_slash_stripped}`。详见 §7 |
 | 传输层语义差异（连接/写超时、`close`） | OkHttp `connectTimeout(30s)`/`writeTimeout(30s)`/`shutdown()` | 已完成 | **2026-10-28**：`ReqwestTransport::new` 已加 `.connect_timeout(DEFAULT_CONNECT_TIMEOUT)`，常量 = **30s**（对齐 Java `connectTimeout(30s)`）；per-request `timeout` 仍对应 Java `readTimeout`。单测 `http::tests::connect_timeout_matches_java_thirty_seconds`。剩余两项记为 **设计决定（不迁移）**：`writeTimeout(30s)` 与 `shutdown()`/`close()` 在 Rust/reqwest 无对应能力——reqwest 不暴露独立写超时（`timeout` 覆盖含请求体写入在内的整次请求），`reqwest::Client` 无 `close`（由 Drop 释放）。不硬造。详见 §7 |
 | `bailian/dto.rs` / `reme/dto.rs` 零单测 | Java：DTO 测试共 12 类 / 161 个 `@Test`（mem0 6 类 89 个 + bailian 6 类 72 个；reme 无 DTO 测试类） | 已完成 | **2026-10-28**：补 **21** 个离线 serde 测试（bailian **11** + reme **10**），对标 `mem0/dto.rs` 的 11 个。覆盖字段别名（`meta_data` / `project_ids` / `memory_node_id` / `old_content` / `created_at` / `workspace_id` / `when_to_use` / `time_created` / `reflection_subject` / `update_result` …）、缺省值（bailian DTO 无默认 vs ReMe `top_k=5`）、`skip_serializing_if` 空缺省、未知字段容忍（Java `FAIL_ON_UNKNOWN_PROPERTIES=false`）、添加/删除计数与 `memories()` 提取顺序。无 `#[ignore]`、无网络。详见 §7 |
@@ -111,39 +114,38 @@
 ### 3.3 缺口（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| 重试 / 退避 / 超时可配置化 | — | 待办 | 当前超时固定（默认 60s），无重试；Java 同样无重试，故仅为增强项 |
-| 指标 / 可观测性 | `Slf4j` 日志 | 待办 | 已用 `tracing::warn!` 4 处（3 个 `*_lossy` + bailian `record_lossy`），但无指标/span |
-| 未使用依赖 | — | 待办 | `Cargo.toml` 声明了 `futures`、`agentscope-harness`，源码零引用（实测 `rg` 无命中）；`tokio` **仅测试用**（26 个 `#[tokio::test]`），但被放在 `[dependencies]` 而非 `[dev-dependencies]`。建议收敛依赖，属 P2 清理 |
-| `Mem0AddRequest` 便捷构造器覆盖度 | `Mem0AddRequest.Builder`（20 个 setter） | 待办 | Rust 只提供 6 个 `with_*`（messages/agent_id/user_id/run_id/metadata/infer），其余 14 个字段（`app_id`/`includes`/`excludes`/`output_format`/`custom_categories`/`custom_instructions`/`immutable`/`async_mode`/`timestamp`/`expiration_date`/`org_id`/`project_id`/`version`/`memory_type`）为 `pub` 字段可直接赋值，功能可达但无链式 API |
-| `Mem0SearchRequest` 便捷构造器覆盖度 | `Mem0SearchRequest.Builder` | 待办 | Rust 缺 `version`/`fields`/`rerank`/`keyword_search`/`filter_memories`/`threshold`/`org_id`/`project_id` 的 `with_*`（字段 `pub` 可直接赋值） |
-| `BailianLongTermMemory` 资源释放 | `AutoCloseable.close()` | 已完成（设计决定，不迁移）（2026-10-29 勘误：原记「待办」） | Rust 无 `close()`：`reqwest::Client` 由 Drop 释放，不硬造主动关闭 API；Java 侧 `close()` 转发到 `BailianMemoryClient.close()` → `HttpTransport.close()`。依据同 §3.2「传输层语义差异」行与 §7.6-2 |
-| Mem0 消息体多带 `name` 字段 | `Mem0LongTermMemory.convertToMem0Message` | 待办 | Java 只填 `role`/`content`；Rust `convert_to_mem0_message` 额外填 `msg.name()`，导致外发 JSON 多一个 `name` 键（Mem0 侧字段合法，功能可达，属**报文形状差异**而非缺功能） |
-| `BailianLongTermMemoryConfig.api_key` 为「死字段」 | `BailianLongTermMemory` 构造器校验 `apiKey` | 待办 | Java 构造器校验 `apiKey` 非空后自建 client；Rust 改为外部传入 client，`config.api_key` 在生产代码中**从未被读取**（仅测试用），也不参与任何校验——空 key 配合法 client 可通过 `BailianLongTermMemory::new` |
-| `Mem0SearchRequest.user_id` 直接赋值绕过 filters 镜像 | `Mem0SearchRequest.setUserId` | 待办 | Java setter 保证 `user_id` 自动同步进 `filters`；Rust 只有 `with_user_id()` 才镜像，直接写 `req.user_id = Some(..)` 会**漏掉** `filters` 同步（`agent_id`/`run_id`/`app_id` 仅存在于 filters，无此问题） |
+| 重试 / 退避 / 超时可配置化 | — | 已完成（2026-10-31） | 新增 `src/retry.rs`：`RetryPolicy`（`max_attempts` / `initial_backoff` / `max_backoff` / `multiplier`，`RetryPolicy::default() == none()` 即单次尝试 = Java 无重试）+ `RetryTransport` 装饰器（仅重试 `Transport`、`408`、`429`、`5xx`）；接线 `Mem0Client::with_api_type_and_policy` / `BailianMemoryClient::with_timeout_and_policy` / `ReMeClient::with_timeout_and_policy`。超时本就可配（`with_api_type(timeout)` / `with_timeout`，per-request = Java `readTimeout`，connect 固定 30s）。测试：`retry::tests::{default_policy_is_a_single_attempt_like_java, backoff_grows_exponentially_and_is_capped, retries_transport_errors_until_success, retries_server_errors_but_not_client_errors, stops_after_max_attempts}`、`bailian::client::tests::policy_constructor_is_equivalent_to_the_default_one` |
+| 指标 / 可观测性 | `Slf4j` 日志 | 已完成（2026-10-31） | 新增 `src/telemetry.rs`：`MemMetrics`（`requests` / `failures` / `latency_ms_total` 原子计数，`snapshot()` 可被宿主抓取，不引指标 crate）+ `InstrumentedTransport`（每请求 `mem.http.post` span：`url` / `status` / `latency_ms`）。三个 client 的 `reqwest` 构造器默认链 `Retry(Instrumented(Reqwest))` 并暴露 `metrics()`；`*_lossy` 保留 4 处 `tracing::warn!`（Java `log.warn` 等价）。测试：`telemetry::tests::{records_successful_requests, records_failed_attempts_and_returns_the_error_unchanged, metrics_handle_is_shared_with_the_decorator}`、`mem0::client::tests::default_construction_exposes_metrics`、`bailian::client::tests::default_construction_defaults_the_base_url_and_installs_metrics`、`reme::client::tests::default_construction_installs_metrics_and_policy_is_configurable` |
+| 未使用依赖 | — | 已完成（2026-10-31） | `Cargo.toml` 删除 `futures`、`agentscope-harness`（`rg` 全 crate 零命中）。`tokio` **保留在 `[dependencies]`**（理由变更：`retry.rs` 的退避走 `tokio::time::sleep`，已是生产路径依赖；同时驱动 `#[tokio::test]`），Cargo.toml 内注明，不再属于「应入 dev-dependencies」 |
+| `Mem0AddRequest` 便捷构造器覆盖度 | `Mem0AddRequest.Builder`（20 个 setter） | 已完成（2026-10-31） | 补齐 14 个 `with_*`：`with_app_id` / `with_includes` / `with_excludes` / `with_output_format` / `with_custom_categories` / `with_custom_instructions` / `with_immutable` / `with_async_mode` / `with_timestamp` / `with_expiration_date` / `with_org_id` / `with_project_id` / `with_version` / `with_memory_type`（合计 20，与 Java setter 1:1）。测试：`mem0::dto::tests::add_request_builder_covers_every_java_setter`（逐字段断言序列化键名） |
+| `Mem0SearchRequest` 便捷构造器覆盖度 | `Mem0SearchRequest.Builder` | 已完成（2026-10-31） | 补齐 `with_version` / `with_fields` / `with_rerank` / `with_keyword_search` / `with_filter_memories` / `with_threshold` / `with_org_id` / `with_project_id`。测试：`mem0::dto::tests::search_request_builder_covers_every_java_setter` |
+| `BailianLongTermMemory` 资源释放 | `AutoCloseable.close()` | 已完成（设计决定，不迁移） | Rust 无 `close()`：`reqwest::Client` 由 Drop 释放，不硬造主动关闭 API；Java 侧 `close()` 转发到 `BailianMemoryClient.close()` → `HttpTransport.close()`。依据同 §3.2「传输层语义差异」行与 §7.6-2 |
+| Mem0 消息体多带 `name` 字段 | `Mem0LongTermMemory.convertToMem0Message` | 已完成（2026-10-31） | 改为与 Java 逐字对齐：`convert_to_mem0_message` **不再**设置 `name`（`Mem0Message::with_name` 仍可供显式需要者使用），外发报文不再多 `name` 键。测试：`mem0::memory::tests::convert_message_matches_java_and_omits_name`、`record_posts_all_configured_identifiers_without_a_name_key`（断言 `messages[0].name` 不存在） |
+| `BailianLongTermMemoryConfig.api_key` 为「死字段」 | `BailianLongTermMemory` 构造器校验 `apiKey` | 已完成（2026-10-31） | `BailianLongTermMemory::new` 现在校验 `config.api_key`（`"apiKey cannot be null or blank"`，与 Java 文案逐字对齐）后再校验 `user_id`，字段不再是死字段；空 key + 合法 client 不再能通过。测试：`bailian::memory::tests::new_rejects_blank_api_key` |
+| `Mem0SearchRequest.user_id` 直接赋值绕过 filters 镜像 | `Mem0SearchRequest.setUserId` | 已完成（2026-10-31） | 字段改**私有**，只经 `with_user_id` / `set_user_id`（两者都同步 `filters`）写入，另提供 `user_id()` 读取与 `sync_filters()`（反序列化后补镜像）；`Mem0Client::search` 在序列化前无条件 `sync_filters()`，wire 层不可能丢租户过滤。测试：`mem0::dto::tests::search_request_keeps_user_id_mirrored_into_filters`、`mem0::client::tests::search_wire_payload_always_carries_the_user_id_filter` |
 
-> **2026-10-29 复核（状态基准）**：§3.2 已关闭 `api_base_url` 空校验、connect 30s 超时、bailian/reme DTO 单测三项（实测 **96 passed**，见 §7）；`writeTimeout`/`close()` 归入**设计决定（不迁移）**。保留中的**真实剩余**：① 真实端点联调（仅 mock）；② 测试密度 96/326；③ 吞错口径（严格 `retrieve`/`record` vs `*_lossy` 默认）**待裁定**；④ 重试/超时不可配置；⑤ 无指标/span；⑥ 未使用依赖（`futures`、`agentscope-harness`；`tokio` 应入 dev）；⑦ `Mem0AddRequest`/`Mem0SearchRequest` 缺 builder 便捷方法；⑧ Mem0 消息多 `name` 键；⑨ `BailianLongTermMemoryConfig.api_key` 死字段；⑩ 直接写 `user_id` 绕过 `filters` 镜像。
+> **2026-10-31 收口**：§3.3 九行全部关闭（8 `已完成` + 1 `已完成（设计决定，不迁移）`）。上文 2026-10-29 的「真实剩余 ①–⑩」已全部消项，明细与测试清单见 §8。
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
-- **已完成内容**：MEM 三厂商（Mem0 / Bailian / ReMe）长期记忆适配全部迁移；DTO serde 对齐；消息转换；检索结果映射；可注入 HTTP seam；离线单测 **96** 个（2026-10-29 勘误，原记 66，实测见 §7.3）。
-- **本会话修复（收尾轮）**：
-  1. **2 个编译错误**：`bailian/memory.rs` 与 `reme/memory.rs` 中 `use agentscope_core::{ContentBlockKind, ...}` 报 E0432——`ContentBlockKind` 并未在 `agentscope_core` crate 根 re-export（`agentscope-core/src/message/mod.rs` 仅 re-export `ContentBlock` 等，未含 `ContentBlockKind`）。
-     - **修法**：改用真实公开路径 `use agentscope_core::message::msg::ContentBlockKind;`（该类型定义于 `crates/agentscope-core/src/message/msg.rs:401`，为 `pub enum`）。**未自造平行类型，未改 core**。
-  2. **后续错误**：`src/http.rs` 顶层 `use std::sync::Arc;` 在移除后 `mock` 模块（经 `use super::*` 引用 `Arc`）报 E0425；已在 `mock` 模块内显式 `use std::sync::{Arc, Mutex};`。
-  3. **补齐离线单测**：总数 **66**（`#[test]` 40 + `#[tokio::test]` 26，实测 2026-10-22 逐文件统计见 §6），覆盖各厂商 DTO serde 往返、消息→Mem0/Bailian/ReMe 转换、检索结果→core `Msg` 映射、搜索/添加请求构造、鉴权头、端点解析、空查询短路、mock HTTP 全链路。
-  4. **清理告警**：本 crate 现无任何 warning（`agentscope-core`/`harness` 的 9 个 warning 属既有、非本 crate，未越界修改）。
-- **2026-10-28 修复（本轮，3 项）**：
-  1. **`api_base_url` 空校验**：Mem0 / ReMe client 构造期拒绝空与全空白 base URL，返回 `MemError::Config("apiBaseUrl is required")`（对齐 Java `Mem0LongTermMemory.Builder.build()` / `ReMeLongTermMemory` 构造器）；`Mem0Client::with_transport` / `ReMeClient::with_transport` 改为返回 `Result<Self>`。
-  2. **HTTP 超时对齐**：`ReqwestTransport` 新增 `connect_timeout(30s)`（`DEFAULT_CONNECT_TIMEOUT`）；`writeTimeout` / `close()` 记设计决定（不迁移）。
-  3. **DTO 单测**：`bailian/dto.rs` + `reme/dto.rs` 新增 21 个离线 serde 测试；`reme/client.rs` 新增 5 个、`mem0/client.rs` +3 个、`http.rs` +1 个。
-  - **测试函数数 66 → 96**（`#[test]` 67 + `#[tokio::test]` 29，按 `^\s*#\[test\]` / `#\[tokio::test` 实测计数口径）。
-  - **验证（2026-10-28 实测）**：`cargo build -p agentscope-extensions-mem` → exit 0（本 crate 0 warning）；`cargo test -p agentscope-extensions-mem` → **96 passed / 0 failed / 0 ignored**（exit 0）。
-  - 详见 §7（改动清单 / 签名变更说明 / 新增测试名单 / 反向验证）。
-- **验证命令与结果（2026-10-22 静态复核未复跑，以下为上一轮记录，未经本次验证）**：
-  - `cargo build -p agentscope-extensions-mem` → **Finished**（exit 0，本 crate 0 warning）— *本次未执行*
-  - `cargo test -p agentscope-extensions-mem` → **66 passed / 0 failed / 0 ignored**（exit 0）— *本次未执行；测试函数数 66 已静态核实（`#[test]` 40 + `#[tokio::test]` 26，逐文件统计见 §6.2）*
-- **已知问题**：无阻塞。真实网络端点未联调（见 §3.2）。§3.2 现余 **2 项 P1 待办**（真实网络联调 / Java 测试逐条对照）；原 3 项已于 2026-10-28 完成（`api_base_url` 空校验、connect 超时对齐、DTO 单测），`writeTimeout`/`close()` 另记作设计决定（不迁移）。§3.3 的 P2 增强项不变。
+- **已完成内容**：MEM 三厂商（Mem0 / Bailian / ReMe）长期记忆适配全部迁移；DTO serde 对齐；消息转换；检索结果映射；可注入 HTTP seam；重试/退避与指标/span；**121 个离线单元测试 + 3 个环境门控集成测试**（2026-10-31，明细见 §8）。
+- **2026-10-31 收口轮（本轮）**：
+  1. **吞错口径正式裁定**：默认 API 保持严格（`record`/`retrieve -> Result`），Java 等价吞错语义显式命名 `*_lossy`，映射表固化在 `lib.rs`「Error semantics」与 §4.2 第 4 条。
+  2. **测试密度**：新增 25 个用例（96 → 121），补 Builder 逐字段断言、HTTP 状态/非法 JSON 透传、`user_id`↔`filters` 镜像、可选标识符上线、严格 vs 吞错双路径；「Java 测试类 → Rust 用例」映射表见 §8.2。
+  3. **P2 全清**：新增 `src/retry.rs`（`RetryPolicy` + `RetryTransport`）与 `src/telemetry.rs`（`MemMetrics` + `InstrumentedTransport`），三 client 默认接线并暴露 `metrics()`；删除 `futures` / `agentscope-harness` 依赖；补齐 `Mem0AddRequest` 14 个与 `Mem0SearchRequest` 8 个 `with_*`；Mem0 报文去掉 `name`；`BailianLongTermMemoryConfig.api_key` 改为在 `new` 中校验；`Mem0SearchRequest.user_id` 改私有 + `set_user_id` + `sync_filters()`。
+  4. **真实端点**：以环境变量门控的 `tests/live_endpoints.rs` 替代凭据依赖（不用 `#[ignore]`），见 §3.2 与 §4.2 第 6 条。
+  - **验证状态**：本轮子智能体按 loop 约定**未运行 cargo**（静态计数 `#[test]`/`#[tokio::test]` = 121 + 3 集成），由主智能体统一 `cargo test -p agentscope-extensions-mem` 复核；上一轮（2026-10-28）实测为 **96 passed / 0 failed**。
+- **历史轮次（2026-10-22 / 2026-10-28）**：
+  1. **2 个编译错误**：`bailian/memory.rs` 与 `reme/memory.rs` 中 `use agentscope_core::{ContentBlockKind, ...}` 报 E0432——`ContentBlockKind` 并未在 `agentscope_core` crate 根 re-export。
+     - **修法**：改用真实公开路径 `use agentscope_core::message::msg::ContentBlockKind;`（定义于 `crates/agentscope-core/src/message/msg.rs:401`）。**未自造平行类型，未改 core**。
+  2. **后续错误**：`src/http.rs` 顶层 `use std::sync::Arc;` 在移除后 `mock` 模块报 E0425；已在 `mock` 模块内显式 `use std::sync::{Arc, Mutex};`。
+  3. **补齐离线单测**：66（`#[test]` 40 + `#[tokio::test]` 26，2026-10-22 逐文件统计见 §6）→ 2026-10-28 **96**（`#[test]` 67 + `#[tokio::test]` 29）。
+  4. **`api_base_url` 空校验**：Mem0 / ReMe client 构造期拒绝空与全空白 base URL（`"apiBaseUrl is required"`）；`with_transport` 改返回 `Result<Self>`。
+  5. **HTTP 超时对齐**：`ReqwestTransport` 新增 `connect_timeout(30s)`；`writeTimeout` / `close()` 记设计决定（不迁移）。
+  6. **DTO 单测**：bailian 11 + reme 10 个离线 serde 测试。
+  - **2026-10-28 实测**：`cargo build -p agentscope-extensions-mem` → exit 0（本 crate 0 warning）；`cargo test -p agentscope-extensions-mem` → **96 passed / 0 failed / 0 ignored**。详见 §7。
+- **已知问题**：无阻塞、无未关闭条目。`writeTimeout(30s)` / `shutdown()`、真实端点自动化、`BailianLongTermMemory` 的 `close()` 为**设计决定（不迁移）**（§3.2 / §3.3 / §4.2 第 6 条）。
 
 ### 4.2 设计裁定与阻塞
 
@@ -152,9 +154,18 @@
    - **裁定**：**不实现** `core::memory::Memory` trait（实现它会导致语义错配，例如把检索命中伪装成会话缓冲消息），也**不重建**废弃的 `LongTermMemory` trait（避免引入平行抽象、且 Java 已判废弃）。改为：各适配器在**本 crate 内暴露固有** `record(&[Msg]) -> Result<()>` / `retrieve(&Msg) -> Result<String>` 方法，并各自提供 `*_lossy` 变体复刻 Java 的 `onErrorReturn("")` / `onErrorComplete()` 吞错语义（§3.2）；并在 Mem0 适配器上提供 Rust 专属便捷方法 `retrieve_msgs(&Msg) -> Result<Vec<Msg>>`（将命中映射为 assistant 侧记忆注记，metadata 携带 `memory_id`/`score`/`categories`/`memory_source`），供上层「想以 core `Msg` 形式消费检索结果」的调用方使用。
    - 理由：(a) 不制造与 core 活跃 trait 的语义错配；(b) 不复活废弃体系；(c) 保留 Java 可观测行为与最小 API 面；(d) 桥接方法 `retrieve_msgs` 以可选便利形式满足 Rust 侧 `Msg` 消费需求。
    - **跨模块待裁定**：若汇总方要求「必须接入 core `Memory` trait」（例如为 harness 统一装配），应新增一个独立 wrapper 类型做**适配**（缓冲语义 ↔ 长期检索语义由装配层显式决定），而非让厂商适配器直接实现该 trait。
-2. **【跨模块需求】无硬阻塞。** 本 crate 仅依赖 `agentscope-core`（`Msg`/`MsgRole`/`JsonMap`/`ContentBlock`/`TextBlock`/`ToolUseBlock` 及 `message::msg::ContentBlockKind`）与 `agentscope-harness`（当前未直接使用，`Cargo.toml` 中保留依赖但代码未引用，可后续按需移除）。
+2. **【跨模块需求】无硬阻塞。** 本 crate 仅依赖 `agentscope-core`（`Msg`/`MsgRole`/`JsonMap`/`ContentBlock`/`TextBlock`/`ToolUseBlock` 及 `message::msg::ContentBlockKind`）与 `reqwest`/`serde`/`tokio`/`tracing`/`chrono`/`async-trait`/`thiserror`（2026-10-31 已删除未引用的 `agentscope-harness` 与 `futures`）。
    - **建议（非阻塞）**：汇总方若认为 `ContentBlockKind` 属通用查询类型，可考虑在 `agentscope_core::message` 层 re-export（当前需从 `message::msg` 取）——**这属 core 变更，本 crate 不得执行**，仅记录。
-3. **【建议（非阻塞）】** 新增依赖均写在本 crate `Cargo.toml` `[dependencies]` 并以 workspace 形式引用（`serde`/`serde_json`/`thiserror`/`async-trait`/`tokio`/`futures`/`tracing`/`chrono`/`reqwest`）；未改根 `Cargo.toml`。
+3. **【建议（非阻塞）】** 新增依赖均写在本 crate `Cargo.toml` `[dependencies]` 并以 workspace 形式引用；未改根 `Cargo.toml`。`tokio` 因退避 `sleep` 保留为运行时依赖（理由见 §3.3）。
+4. **【正式裁定 2026-10-31】吞错口径：默认严格 + `*_lossy` 复刻 Java。**
+   - **裁定内容**：无后缀的 `record` / `retrieve` 是**默认可观测 API**，始终返回 `Result`（失败可见）；Java 的吞错语义以 `*_lossy` 命名并逐条对应：`onErrorReturn("")` → `retrieve_lossy(&Msg) -> String`（永不失败，`tracing::warn!` ≈ Java `log.warn`）；`onErrorComplete()` → `record_lossy(&[Msg])`（返回 `()` + warn）。`Mem0LongTermMemory.record` 与 `ReMeLongTermMemory.record` 在 Java 侧**本就透传**（`client.add(...).then()`），故这两个适配器**不提供** `record_lossy`（对称、不制造 Java 不存在的语义）。
+   - **装配口径**：把记忆写入/注入到 agent 一轮对话的调用点（Java `LongTermMemoryHook` 的等价位置）使用 `*_lossy`——记忆后端故障不得中断回合；需要上报故障、计数或做健康检查的调用点使用严格版。
+   - **依据**：Java 源码逐行核对（`Mem0LongTermMemory.retrieve` `.onErrorReturn("")`；`BailianLongTermMemory.record` `.doOnError(log.warn).onErrorComplete()`、`retrieve` `.onErrorReturn("")`；`ReMeLongTermMemory.retrieve` `.onErrorReturn("")`）。固化位置：`crates/agentscope-extensions-mem/src/lib.rs`「Error semantics」表 + 各方法 rustdoc。
+   - **影响**：Rust 默认行为比 Java 更严格（会报错而不是静默）；两者都可显式选择，不存在「Java 有能力、Rust 没有」的缺口。
+5. **【裁定 2026-10-31】重试/退避/可观测性放在 transport 装饰器，而非改 client 语义。**
+   - `RetryTransport`（`src/retry.rs`）只重试 `Transport`、`408`、`429`、`5xx`；`RetryPolicy::default()` = 单次尝试，因此不动 Java 行为。`InstrumentedTransport`（`src/telemetry.rs`）不引 `metrics` crate，只暴露原子计数 + `mem.http.post` span。
+   - 三个 client 的 `reqwest` 构造器固定链 `Retry(Instrumented(Reqwest))` 并经 `metrics()` 暴露计数；注入自定义 transport（`with_transport`）时不自动加装饰器（该 seam 归调用方）。
+6. **【设计决定 2026-10-31】真实端点联调不纳入自动化。** 依据：仓库无厂商凭据 / CI 禁止外网，无法在离线环境证明厂商侧行为。替代：`tests/live_endpoints.rs` 环境变量门控（`MEM0_LIVE_BASE_URL` / `BAILIAN_LIVE_API_KEY` / `REME_LIVE_BASE_URL`），未设变量即直接返回；wire 契约由 mock 全链路覆盖。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-mem` 基线。
@@ -283,6 +294,8 @@
 
 ## 7. 执行记录（2026-10-28）
 
+> **历史快照**：本节记录 2026-10-28 轮次（96 test），其中 §7.6 的「未完成」项已于 **2026-10-31** 关闭，最新状态以 §3 / §4 / §8 为准。
+
 > 执行范围：仅 `crates/agentscope-extensions-mem/**` 与本文档；**未改**根 `Cargo.toml`、`agentscope-core`、`agentscope-harness` 及其它 crate。**新增依赖：无**（复用已有 `serde`/`serde_json`/`reqwest`）。
 
 ### 7.1 改动清单
@@ -334,7 +347,85 @@
 
 ### 7.6 未完成 / 需汇总方裁定
 
-1. **真实网络联调**（§3.2 仍待办）：本次全部离线，未对真实 Mem0 / Bailian / ReMe 端点回归（需凭据）。
+1. **真实网络联调**（§3.2）：2026-10-28 全部离线、未对真实端点回归（需凭据）——**2026-10-31 已关闭：设计决定（环境受限）+ `tests/live_endpoints.rs`，见 §8**。
 2. **`writeTimeout(30s)` 与 `shutdown()`/`close()`**：按任务要求记为 **设计决定（不迁移）**——Rust/reqwest 无独立 write timeout、`reqwest::Client` 无 `close`，未硬造。
-3. **Java 测试逐条对照迁移**（§3.2 仍待办）与 **吞错语义默认口径**（§3.2，需汇总方裁定 `retrieve` 严格 vs `retrieve_lossy`）未变。
+3. **Java 测试逐条对照迁移**（§3.2）与 **吞错语义默认口径**——**2026-10-31 已关闭：映射表见 §8.2、裁定见 §4.2 第 4 条**。
 4. **校验层位置（请裁定）**：本次校验落在 **client 构造**（比 Java 的 adapter builder 更早，且覆盖所有 adapter 路径），未在 `Mem0LongTermMemory::new` / `ReMeLongTermMemory::new` 重复校验（`Arc<Mem0Client>` 已不可能持空 URL）。若汇总方要求错误必须在 adapter 层抛出，需额外 wrapper。
+   > 2026-10-31 结论：保留「校验在 client 构造」的既有做法（`Bailian` 因注入 client 的形态，另在 adapter `new` 校验 `api_key`/`user_id`）；无需 wrapper，见 §8。
+
+## 2026-10-31 loop 收口记录
+
+> 依据 `.agentscope/workspace/loop-2026-10-31.md`：本回合子智能体**只做代码与本文档编辑，不运行 cargo / rustc / clippy / fmt**，验证由主智能体统一执行（`cargo test -p agentscope-extensions-mem -j 2`）。
+> 对齐基线：Java `agentscope-extensions-mem` HEAD `1524b3191`（2026-10-30，该模块自 2026-10-23 起无增量提交，`git log -- agentscope-extensions/agentscope-extensions-mem` 仅 1 条 2.2.0-RC2 重构提交）。
+> 结论：**本模块 §3.1 / §3.2 / §3.3 / §4.2 无未关闭条目**；3 项为「已完成（设计决定，不迁移）」。
+
+### 8.1 改动清单（仅 `crates/agentscope-extensions-mem/**` 与本文档）
+
+| 文件 | 改动 |
+|---|---|
+| `src/retry.rs`（新增） | `RetryPolicy`（`none()` = Java 单次尝试；`new()` 钳制 `max_attempts>=1`、`multiplier>=1.0`；`backoff_before_retry()`；`is_retryable()` 只认 Transport / 408 / 429 / 5xx）+ `RetryTransport` 装饰器（含 `retries()` 计数）。7 个测试 |
+| `src/telemetry.rs`（新增） | `MemMetrics`（`requests` / `failures` / `latency_ms_total`）+ `MemMetricsSnapshot` + `InstrumentedTransport`（`mem.http.post` span：`url` / `status` / `latency_ms`）。3 个测试 |
+| `src/lib.rs` | `pub mod retry; pub mod telemetry;` + 新增「Error semantics（吞错口径表）」「Resilience and observability」文档节；导出 `RetryPolicy` / `RetryTransport` / `MemMetrics` / `MemMetricsSnapshot` / `InstrumentedTransport` / `DEFAULT_CONNECT_TIMEOUT` |
+| `src/mem0/client.rs` | 新增 `with_api_type_and_policy`（链 `Retry(Instrumented(Reqwest))`）+ `metrics()`；`assemble` 置 `metrics: None`；`search` 序列化前 `request.sync_filters()`。+4 测试 |
+| `src/mem0/dto.rs` | `Mem0AddRequest` +14 个 `with_*`；`Mem0SearchRequest` +8 个 `with_*`、`user_id` 改**私有**并配 `set_user_id` / `user_id()` / `sync_filters()`、`filters` 加 `#[serde(default)]`。+3 测试 |
+| `src/mem0/memory.rs` | `convert_to_mem0_message` **不再带 `name`**（与 Java 报文一致）；`record` rustdoc 说明无 `record_lossy` 的依据。+2 测试 |
+| `src/bailian/client.rs` | 新增 `with_timeout_and_policy` + `metrics()`，`metrics` 字段；新增 `mod tests`（3 条） |
+| `src/bailian/memory.rs` | `new()` 增 `config.api_key` 非空校验（`"apiKey cannot be null or blank"`）；+2 测试 |
+| `src/reme/client.rs` | 新增 `with_timeout_and_policy` + `metrics()`，`metrics` 字段；+1 测试 |
+| `Cargo.toml` | 删除 `agentscope-harness`、`futures`；`tokio` 保留（退避 `sleep` 生产依赖）并注明理由 |
+| `tests/live_endpoints.rs`（新增） | 3 个环境变量门控的真实端点往返用例（无 `#[ignore]`） |
+
+### 8.2 Java 测试类 → Rust 用例映射（18 类 / 326 `@Test` → 121 单元测试 + 3 集成）
+
+| # | Java 测试类（`@Test`） | Rust 对应用例（代表，模块::测试名） | 关闭口径 |
+|---|---|---|---|
+| 1 | `Mem0MessageTest` (11) | `mem0::dto::message_serializes_name_only_when_present` | 语义（`name` 可缺省/NON_NULL）已覆盖；其余为 Java bean 样板（构造器/setter/`toString`） |
+| 2 | `Mem0AddRequestTest` (21) | `mem0::dto::{add_request_carries_java_defaults, add_request_serializes_snake_case_identifiers, add_request_builder_covers_every_java_setter}` | 20 个 setter → 逐字段断言（键名 + 值）；`testNullMessagesHandling` 由 `Option<Vec<_>>` 类型关闭 |
+| 3 | `Mem0AddResponseTest` (9) | `mem0::dto::add_response_deserializes_results_and_message` | `results: Option<Vec<JsonMap>>` 覆盖空/null；`toString` 无语义 |
+| 4 | `Mem0ClientTest` (31) | `mem0::client::{platform_auth_uses_token_scheme, self_hosted_auth_uses_x_api_key, blank_api_key_omits_authorization_header, self_hosted_uses_self_hosted_endpoints, base_url_is_trimmed_before_building_the_request_url, search_rejects_empty_body, add_propagates_http_status_and_body, invalid_json_surfaces_as_a_json_error, default_construction_exposes_metrics}` | 端点/鉴权/双响应形状/错误透传全覆；`testHttpTimeout`、`testShutdown` 属 MockWebServer 设施与 §3.2 设计决定 |
+| 5 | `Mem0LongTermMemoryTest` (23) | `mem0::memory` 15 条（`build_search_request_uses_top_k_5_and_merges_config`、`record_posts_all_configured_identifiers_without_a_name_key`、`record_surfaces_http_errors_like_java`、`retrieve_handles_array_and_object_search_shapes`、`retrieve_msgs_maps_hits_to_assistant_msgs`、`retrieve_lossy_*` 等） | Builder 三标识符 + 过滤 + 双响应形状 + 严格/吞错双路径全覆盖；`null` 入参由类型系统关闭 |
+| 6 | `Mem0SearchRequestTest` (25) | `mem0::dto::{search_request_has_java_defaults_and_always_emits_filters, search_request_mirrors_identifiers_into_filters, search_request_builder_covers_every_java_setter, search_request_keeps_user_id_mirrored_into_filters}` + `mem0::client::search_wire_payload_always_carries_the_user_id_filter` | `filters` ALWAYS、8 个新 setter、`user_id` 镜像（含反序列化后 wire 校验）全覆 |
+| 7 | `Mem0SearchResponseTest` (9) | `mem0::dto::search_response_accepts_missing_results` | `results` 缺省/多结果由同一 `Option<Vec<_>>` 覆盖 |
+| 8 | `Mem0SearchResultTest` (14) | `mem0::dto::{search_result_serde_roundtrips_timestamps, search_result_maps_to_core_msg_with_metadata, search_result_without_memory_maps_to_empty_text}` | 时间戳 `Z` 归一化、metadata/categories/score 映射、`memory=None` 降级 |
+| 9 | `BailianAddRequestTest` (13) | `bailian::dto::{add_request_uses_meta_data_key_not_metadata, add_request_skips_absent_fields, add_request_serializes_snake_case_fields}` | `meta_data` 键名、空值省略、snake_case 全覆 |
+| 10 | `BailianAddResponseTest` (10) | `bailian::dto::{add_response_deserializes_request_id_and_nodes, responses_tolerate_missing_and_unknown_fields}` | 内嵌节点复用顶层类型，缺字段/未知字段容忍 |
+| 11 | `BailianLongTermMemoryTest` (43) | `bailian::memory` 19 条（`is_recordable_rejects_tool_use_assistant_and_system`、`convert_messages_applies_bailian_filters`、`new_rejects_blank_api_key`、`build_search_request_uses_config_values`、`record_posts_optional_identifiers_and_metadata`、`record_lossy_swallows_http_errors`、`retrieve_joins_memory_node_contents` 等） | 43 项里语义项全覆盖（过滤矩阵、默认 10/0.3、enable_* 三旗、可选标识符、严格 vs 吞错）；`testCloseMethod` → 设计决定 |
+| 12 | `BailianMemoryClientTest` (26) | `bailian::client::{default_construction_defaults_the_base_url_and_installs_metrics, injected_transports_are_not_instrumented, policy_constructor_is_equivalent_to_the_default_one}` + `bailian::memory::record_posts_to_add_endpoint_with_bearer_auth`、`client_rejects_blank_api_key`/`client_rejects_blank_base_url` | Builder 校验矩阵、`Bearer`/`Content-Type`、报文序列化覆盖；`testClose`/`testCloseMultipleTimes` → 设计决定 |
+| 13 | `BailianMemoryNodeTest` (12) | `bailian::dto::{memory_node_deserializes_snake_case_fields, memory_node_serializes_nothing_when_empty}` | 事件类型/时间戳由 serde 往返与 `skip_serializing_if` 覆盖；add/update/delete 差异仅字段组合 |
+| 14 | `BailianMessageTest` (13) | `bailian::dto::message_roundtrips_role_and_content` | 两字段 DTO，1 条往返即等价 |
+| 15 | `BailianSearchRequestTest` (17) | `bailian::dto::{search_request_serializes_snake_case_and_flags, search_request_has_no_dto_level_defaults}` | 无 DTO 级默认 + 三个 enable flag + `project_ids` 已断言 |
+| 16 | `BailianSearchResponseTest` (7) | `bailian::dto::search_response_preserves_node_order` | 顺序/空列表同一模型 |
+| 17 | `ReMeClientTest` (18) | `reme::client::{base_url_is_trimmed_and_trailing_slash_stripped, add_posts_to_summary_endpoint, blank_response_body_falls_back_to_default, default_construction_installs_metrics_and_policy_is_configurable}` | 端点/无鉴权头/空体回退 `{}`/构造校验全覆；`testShutdown` → 设计决定 |
+| 18 | `ReMeLongTermMemoryTest` (24) | `reme::memory` 12 条（`is_recordable_rejects_tool_use_assistant`、`render_prefers_answer_then_joins_memories`、`build_requests_use_user_id_as_workspace`、`record_posts_trajectory_to_summary_endpoint`、`retrieve_lossy_*` 等） | `answer` 优先、`memory_list` 回退、`workspace_id` 复用、严格/吞错双路径 |
+
+> 口径说明：Java 326 个 `@Test` 中相当一部分是 getter/setter/`toString`/`null` 构造器/`MockWebServer`（`shutdown()`、`writeTimeout`）样板，Rust 侧不以「1 Java 测试 = 1 Rust 测试」凑数；上表按**语义**逐类关闭，未覆盖项均给出依据。
+
+### 8.3 §3.2 / §3.3 关闭对照（条目 → 落点 → 测试）
+
+| 条目 | 落点 | 代表测试 |
+|---|---|---|
+| 吞错口径裁定（P1） | `lib.rs` 文档表 + 各 `*_lossy` 方法；`mem0/memory.rs` / `bailian/memory.rs` / `reme/memory.rs` | `mem0::memory::retrieve_lossy_returns_empty_on_http_status_error`、`bailian::memory::record_lossy_swallows_http_errors`、`reme::memory::retrieve_lossy_returns_empty_on_http_error` |
+| 测试密度 96 → 121（P1） | 见 §8.2 | `mem0::dto::add_request_builder_covers_every_java_setter`、`mem0::client::add_propagates_http_status_and_body` |
+| 真实端点联调（P1 → 设计决定） | `tests/live_endpoints.rs` | `mem0_live_round_trip_when_configured`、`bailian_live_round_trip_when_configured`、`reme_live_round_trip_when_configured`（未设 env 即通过） |
+| 重试/退避/超时（P2） | `src/retry.rs`、三 client `*_and_policy` | `retry::tests::retries_transport_errors_until_success`、`retry::tests::stops_after_max_attempts` |
+| 指标/span（P2） | `src/telemetry.rs`、三 client `metrics()` | `telemetry::tests::records_failed_attempts_and_returns_the_error_unchanged`、`reme::client::default_construction_installs_metrics_and_policy_is_configurable` |
+| 未使用依赖（P2） | `Cargo.toml` | `rg 'agentscope_harness|futures' crates/agentscope-extensions-mem` 零命中 |
+| Builder 覆盖度 ×2（P2） | `mem0/dto.rs` | `add_request_builder_covers_every_java_setter`、`search_request_builder_covers_every_java_setter` |
+| Mem0 报文多 `name`（P2） | `mem0/memory.rs::convert_to_mem0_message` | `convert_message_matches_java_and_omits_name`、`record_posts_all_configured_identifiers_without_a_name_key` |
+| `api_key` 死字段（P2） | `bailian/memory.rs::BailianLongTermMemory::new` | `bailian::memory::new_rejects_blank_api_key` |
+| `user_id` 绕过 filters（P2） | `mem0/dto.rs`（私有字段 + `set_user_id` + `sync_filters`）、`mem0/client.rs::search` | `search_request_keeps_user_id_mirrored_into_filters`、`search_wire_payload_always_carries_the_user_id_filter` |
+
+### 8.4 反向验证计划（本轮禁跑 cargo，交由主智能体执行）
+
+| # | 回退内容 | 预期失败用例 |
+|---|---|---|
+| 1 | `mem0/memory.rs::convert_to_mem0_message` 恢复 `name: msg.name().map(str::to_string)` | `convert_message_matches_java_and_omits_name`、`record_posts_all_configured_identifiers_without_a_name_key` |
+| 2 | `bailian/memory.rs::new` 删掉 `api_key` 校验 | `new_rejects_blank_api_key` |
+| 3 | `mem0/dto.rs::sync_filters` 改为空实现 | `search_request_keeps_user_id_mirrored_into_filters`、`search_wire_payload_always_carries_the_user_id_filter` |
+| 4 | `retry.rs` 的 `is_retryable` 恒返 `false` | `retries_transport_errors_until_success`、`retries_server_errors_but_not_client_errors` |
+| 5 | `telemetry.rs` 去掉 `metrics.record(...)` | `records_successful_requests`、`records_failed_attempts_and_returns_the_error_unchanged` |
+
+### 8.5 未关闭项
+
+- **无**。三项设计决定：① 真实端点自动化（环境受限，env 门控替代）；② `writeTimeout` / `shutdown()` / `close()`（reqwest 无对应能力）；③ Java bean 样板测试与 `MockWebServer` 设施不逐条搬运（§8.2 已给依据）。
+- 跨模块需求：**无新增**。既有非阻塞建议仅「`ContentBlockKind` 可在 `agentscope_core::message` 层 re-export」（core 变更，本 crate 不做）。

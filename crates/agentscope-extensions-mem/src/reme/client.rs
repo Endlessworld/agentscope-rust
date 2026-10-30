@@ -6,6 +6,8 @@ use std::time::Duration;
 use crate::error::{MemError, Result};
 use crate::http::{HttpTransport, ReqwestTransport};
 use crate::reme::dto::{ReMeAddRequest, ReMeAddResponse, ReMeSearchRequest, ReMeSearchResponse};
+use crate::retry::{RetryPolicy, RetryTransport};
+use crate::telemetry::{InstrumentedTransport, MemMetrics};
 
 /// Add-memory endpoint.
 pub const SUMMARY_ENDPOINT: &str = "/summary_personal_memory";
@@ -18,6 +20,8 @@ pub const RETRIEVE_ENDPOINT: &str = "/retrieve_personal_memory";
 pub struct ReMeClient {
     transport: Arc<dyn HttpTransport>,
     api_base_url: String,
+    /// Present for the `reqwest`-backed constructors, so a host can scrape counters.
+    metrics: Option<Arc<MemMetrics>>,
 }
 
 impl std::fmt::Debug for ReMeClient {
@@ -39,8 +43,27 @@ impl ReMeClient {
 
     /// Builds a client with an explicit timeout.
     pub fn with_timeout(api_base_url: impl Into<String>, timeout: Duration) -> Result<Self> {
-        let transport = Arc::new(ReqwestTransport::new(timeout)?);
-        Self::with_transport(transport, api_base_url)
+        Self::with_timeout_and_policy(api_base_url, timeout, RetryPolicy::default())
+    }
+
+    /// Builds a client with an explicit timeout and retry policy.
+    ///
+    /// The transport chain is `Retry(Instrumented(Reqwest))`; counters are exposed
+    /// through [`Self::metrics`]. The default policy is a single attempt (Java parity).
+    pub fn with_timeout_and_policy(
+        api_base_url: impl Into<String>,
+        timeout: Duration,
+        policy: RetryPolicy,
+    ) -> Result<Self> {
+        let metrics = MemMetrics::shared();
+        let instrumented: Arc<dyn HttpTransport> = Arc::new(InstrumentedTransport::new(
+            Arc::new(ReqwestTransport::new(timeout)?),
+            Arc::clone(&metrics),
+        ));
+        let transport: Arc<dyn HttpTransport> = Arc::new(RetryTransport::new(instrumented, policy));
+        let mut client = Self::with_transport(transport, api_base_url)?;
+        client.metrics = Some(metrics);
+        Ok(client)
     }
 
     /// Builds a client on top of an injected transport (used by tests).
@@ -64,7 +87,14 @@ impl ReMeClient {
         Ok(Self {
             transport,
             api_base_url,
+            metrics: None,
         })
+    }
+
+    /// The counters fed by the instrumented transport, when the client was built by
+    /// one of the `reqwest`-backed constructors.
+    pub fn metrics(&self) -> Option<&MemMetrics> {
+        self.metrics.as_deref()
     }
 
     /// The configured base URL.
@@ -174,5 +204,22 @@ mod tests {
         let response = client.search(&ReMeSearchRequest::new()).await.unwrap();
         assert!(response.answer.is_none());
         assert!(response.memories().is_empty());
+    }
+
+    #[test]
+    fn default_construction_installs_metrics_and_policy_is_configurable() {
+        let client = ReMeClient::new("https://reme.test").unwrap();
+        assert!(client.metrics().is_some());
+        let client = ReMeClient::with_timeout_and_policy(
+            "https://reme.test",
+            Duration::from_secs(5),
+            RetryPolicy::new(2, Duration::from_millis(10), Duration::from_millis(20), 2.0),
+        )
+        .unwrap();
+        assert!(client.metrics().is_some());
+        assert!(ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
+            .unwrap()
+            .metrics()
+            .is_none());
     }
 }

@@ -7,13 +7,15 @@ rust-version.workspace = true
 
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+# `tokio` is a runtime dependency because the retry decorator sleeps between
+# attempts (`tokio::time::sleep`); it also drives the `#[tokio::test]` cases.
+# `futures` and `agentscope-harness` were declared but never referenced and were
+# dropped (see MEM__GAP_TRACKER.md §3.3).
 tokio = { workspace = true }
-futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }

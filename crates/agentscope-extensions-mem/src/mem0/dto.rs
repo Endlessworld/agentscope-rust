@@ -191,6 +191,90 @@ impl Mem0AddRequest {
         self.infer = Some(infer);
         self
     }
+
+    /// Sets the application identifier.
+    pub fn with_app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
+        self
+    }
+
+    /// Sets the `includes` prompt fragment.
+    pub fn with_includes(mut self, includes: impl Into<String>) -> Self {
+        self.includes = Some(includes.into());
+        self
+    }
+
+    /// Sets the `excludes` prompt fragment.
+    pub fn with_excludes(mut self, excludes: impl Into<String>) -> Self {
+        self.excludes = Some(excludes.into());
+        self
+    }
+
+    /// Sets the output format version.
+    pub fn with_output_format(mut self, output_format: impl Into<String>) -> Self {
+        self.output_format = Some(output_format.into());
+        self
+    }
+
+    /// Sets the custom categories map.
+    pub fn with_custom_categories(mut self, custom_categories: JsonMap) -> Self {
+        self.custom_categories = Some(custom_categories);
+        self
+    }
+
+    /// Sets the custom instructions.
+    pub fn with_custom_instructions(mut self, custom_instructions: impl Into<String>) -> Self {
+        self.custom_instructions = Some(custom_instructions.into());
+        self
+    }
+
+    /// Sets the `immutable` flag.
+    pub fn with_immutable(mut self, immutable: bool) -> Self {
+        self.immutable = Some(immutable);
+        self
+    }
+
+    /// Sets the `async_mode` flag.
+    pub fn with_async_mode(mut self, async_mode: bool) -> Self {
+        self.async_mode = Some(async_mode);
+        self
+    }
+
+    /// Sets the Unix timestamp.
+    pub fn with_timestamp(mut self, timestamp: i64) -> Self {
+        self.timestamp = Some(timestamp);
+        self
+    }
+
+    /// Sets the expiration date (`YYYY-MM-DD`).
+    pub fn with_expiration_date(mut self, expiration_date: impl Into<String>) -> Self {
+        self.expiration_date = Some(expiration_date.into());
+        self
+    }
+
+    /// Sets the organisation identifier.
+    pub fn with_org_id(mut self, org_id: impl Into<String>) -> Self {
+        self.org_id = Some(org_id.into());
+        self
+    }
+
+    /// Sets the project identifier.
+    pub fn with_project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = Some(project_id.into());
+        self
+    }
+
+    /// Sets the API version.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Sets the deprecated `memory_type` field (JSON parity only).
+    pub fn with_memory_type(mut self, memory_type: impl Into<String>) -> Self {
+        self.memory_type = Some(memory_type.into());
+        self
+    }
 }
 
 /// Response of the Mem0 add API.
@@ -215,7 +299,10 @@ pub struct Mem0SearchRequest {
     pub version: Option<String>,
     /// Filters (`user_id`, `agent_id`, `run_id`, `app_id`, ...).
     ///
-    /// Always serialized, even when empty (`@JsonInclude(ALWAYS)` in Java).
+    /// Always serialized, even when empty (`@JsonInclude(ALWAYS)` in Java). Defaults
+    /// to an empty map on deserialization, mirroring Jackson's field initializer in
+    /// `Mem0SearchRequest` (a payload without `filters` must not be rejected).
+    #[serde(default)]
     pub filters: JsonMap,
     /// Maximum number of results (Java default `10`).
     #[serde(rename = "top_k", skip_serializing_if = "Option::is_none")]
@@ -242,8 +329,13 @@ pub struct Mem0SearchRequest {
     #[serde(rename = "project_id", skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     /// User identifier (also mirrored into `filters`).
+    ///
+    /// Private so it cannot be assigned without updating `filters`: Java
+    /// `Mem0SearchRequest.setUserId` always synchronises the two, and a filter-less
+    /// search would silently leak across users. Use [`Self::with_user_id`] /
+    /// [`Self::set_user_id`] (or [`Self::sync_filters`] after deserialization).
     #[serde(rename = "user_id", skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
+    user_id: Option<String>,
 }
 
 impl Default for Mem0SearchRequest {
@@ -286,12 +378,86 @@ impl Mem0SearchRequest {
     /// Sets `user_id` and mirrors it into `filters`, matching Java
     /// `Builder.userId` / `setUserId`.
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.set_user_id(user_id);
+        self
+    }
+
+    /// Sets `user_id` in place and mirrors it into `filters`, matching Java
+    /// `Mem0SearchRequest.setUserId`.
+    pub fn set_user_id(&mut self, user_id: impl Into<String>) -> &mut Self {
         let user_id = user_id.into();
         self.filters.insert(
             "user_id".to_string(),
             serde_json::Value::String(user_id.clone()),
         );
         self.user_id = Some(user_id);
+        self
+    }
+
+    /// The configured user identifier.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    /// Re-applies the `user_id` → `filters` mirror.
+    ///
+    /// Needed after deserializing a request whose `filters` object omitted
+    /// `user_id` (Serde cannot run Java's setter, and the Mem0 API requires the
+    /// filter to isolate a tenant). [`crate::mem0::client::Mem0Client::search`] calls
+    /// it before every request, so the wire payload can never lose the filter.
+    pub fn sync_filters(&mut self) -> &mut Self {
+        if let Some(user_id) = self.user_id.clone() {
+            self.filters
+                .insert("user_id".to_string(), serde_json::Value::String(user_id));
+        }
+        self
+    }
+
+    /// Sets the API version.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Sets the response `fields` projection.
+    pub fn with_fields(mut self, fields: Vec<String>) -> Self {
+        self.fields = Some(fields);
+        self
+    }
+
+    /// Sets the `rerank` flag.
+    pub fn with_rerank(mut self, rerank: bool) -> Self {
+        self.rerank = Some(rerank);
+        self
+    }
+
+    /// Sets the `keyword_search` flag.
+    pub fn with_keyword_search(mut self, keyword_search: bool) -> Self {
+        self.keyword_search = Some(keyword_search);
+        self
+    }
+
+    /// Sets the `filter_memories` flag.
+    pub fn with_filter_memories(mut self, filter_memories: bool) -> Self {
+        self.filter_memories = Some(filter_memories);
+        self
+    }
+
+    /// Sets the similarity `threshold`.
+    pub fn with_threshold(mut self, threshold: f64) -> Self {
+        self.threshold = Some(threshold);
+        self
+    }
+
+    /// Sets the organisation identifier.
+    pub fn with_org_id(mut self, org_id: impl Into<String>) -> Self {
+        self.org_id = Some(org_id.into());
+        self
+    }
+
+    /// Sets the project identifier.
+    pub fn with_project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = Some(project_id.into());
         self
     }
 
@@ -501,7 +667,7 @@ mod tests {
             .with_agent_id("a")
             .with_run_id("r")
             .with_app_id("app");
-        assert_eq!(req.user_id.as_deref(), Some("u"));
+        assert_eq!(req.user_id(), Some("u"));
         assert_eq!(req.filters["user_id"], "u");
         assert_eq!(req.filters["agent_id"], "a");
         assert_eq!(req.filters["run_id"], "r");
@@ -586,5 +752,107 @@ mod tests {
         assert_eq!(msg.text_content(), "");
         assert_eq!(msg.metadata()["memory_source"], "mem0");
         assert!(msg.metadata().get("memory_id").is_none());
+    }
+
+    /// Covers Java `Mem0AddRequestTest` builder tests
+    /// (`testBuilderWithCustomCategories` / `testBuilderWithTimestampAndExpiration` /
+    /// `testBuilderWithImmutableAndAsyncMode` / `testBuilderWithOrgAndProject` /
+    /// `testBuilderWithVersion` / `testBuilderWithDeprecatedMemoryType` /
+    /// `testBuilderWithIncludesAndExcludes` / `testBuilderWithCustomInstructions`)
+    /// as one field-by-field assertion over the serialized payload.
+    #[test]
+    fn add_request_builder_covers_every_java_setter() {
+        let mut categories = JsonMap::new();
+        categories.insert("food".into(), serde_json::json!("likes"));
+        let req = Mem0AddRequest::new()
+            .with_messages(vec![Mem0Message::new("user", "hi")])
+            .with_agent_id("a")
+            .with_user_id("u")
+            .with_app_id("app")
+            .with_run_id("r")
+            .with_metadata(JsonMap::new())
+            .with_includes("inc")
+            .with_excludes("exc")
+            .with_output_format("v1.0")
+            .with_custom_categories(categories)
+            .with_custom_instructions("be nice")
+            .with_immutable(true)
+            .with_async_mode(false)
+            .with_timestamp(1_700_000_000)
+            .with_expiration_date("2026-12-31")
+            .with_org_id("org")
+            .with_project_id("proj")
+            .with_version("v1")
+            .with_memory_type("factual");
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["agent_id"], "a");
+        assert_eq!(json["user_id"], "u");
+        assert_eq!(json["app_id"], "app");
+        assert_eq!(json["run_id"], "r");
+        assert_eq!(json["includes"], "inc");
+        assert_eq!(json["excludes"], "exc");
+        assert_eq!(json["output_format"], "v1.0");
+        assert_eq!(json["custom_categories"]["food"], "likes");
+        assert_eq!(json["custom_instructions"], "be nice");
+        assert_eq!(json["immutable"], true);
+        assert_eq!(json["async_mode"], false);
+        assert_eq!(json["timestamp"], 1_700_000_000);
+        assert_eq!(json["expiration_date"], "2026-12-31");
+        assert_eq!(json["org_id"], "org");
+        assert_eq!(json["project_id"], "proj");
+        assert_eq!(json["version"], "v1");
+        assert_eq!(json["memory_type"], "factual");
+        // `infer` keeps the Java constructor default unless overridden.
+        assert_eq!(json["infer"], true);
+    }
+
+    /// Covers Java `Mem0SearchRequestTest`
+    /// (`testBuilderWithFields` / `testBuilderWithRerank` / `testBuilderWithKeywordSearch` /
+    /// `testBuilderWithFilterMemories` / `testBuilderWithThreshold` /
+    /// `testBuilderWithOrgAndProject` / `testBuilderWithVersion`) with one
+    /// field-by-field assertion.
+    #[test]
+    fn search_request_builder_covers_every_java_setter() {
+        let req = Mem0SearchRequest::new()
+            .with_query("q")
+            .with_version("v1")
+            .with_fields(vec!["memory".into()])
+            .with_rerank(true)
+            .with_keyword_search(true)
+            .with_filter_memories(false)
+            .with_threshold(0.4)
+            .with_org_id("org")
+            .with_project_id("proj");
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["version"], "v1");
+        assert_eq!(json["fields"], serde_json::json!(["memory"]));
+        assert_eq!(json["rerank"], true);
+        assert_eq!(json["keyword_search"], true);
+        assert_eq!(json["filter_memories"], false);
+        assert!((json["threshold"].as_f64().unwrap() - 0.4).abs() < 1e-9);
+        assert_eq!(json["org_id"], "org");
+        assert_eq!(json["project_id"], "proj");
+    }
+
+    /// Java `Mem0SearchRequestTest.testBuilderWithUserIdFilter`: the user id must
+    /// never exist without the matching `filters.user_id`, including when the caller
+    /// mutates the request in place (`set_user_id`) or deserializes a payload whose
+    /// `filters` object is empty (`sync_filters`).
+    #[test]
+    fn search_request_keeps_user_id_mirrored_into_filters() {
+        let mut req = Mem0SearchRequest::new();
+        req.set_user_id("u");
+        assert_eq!(req.user_id(), Some("u"));
+        assert_eq!(req.filters["user_id"], "u");
+
+        let mut deserialized: Mem0SearchRequest =
+            serde_json::from_value(serde_json::json!({"user_id": "u", "filters": {}})).unwrap();
+        assert!(deserialized.filters.get("user_id").is_none());
+        deserialized.sync_filters();
+        assert_eq!(deserialized.filters["user_id"], "u");
+        assert_eq!(
+            serde_json::to_value(&deserialized).unwrap()["filters"]["user_id"],
+            "u"
+        );
     }
 }

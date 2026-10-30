@@ -109,6 +109,10 @@ impl ReMeLongTermMemory {
     }
 
     /// Records messages to ReMe, mirroring `ReMeLongTermMemory.record`.
+    ///
+    /// Java chains `client.add(...).then()` with no `onErrorComplete()`, so the error
+    /// stays visible; there is deliberately no `record_lossy` on this adapter (see
+    /// the crate-level error-semantics table).
     pub async fn record(&self, msgs: &[Msg]) -> Result<()> {
         if msgs.is_empty() {
             return Ok(());
