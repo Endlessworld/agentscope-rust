@@ -171,4 +171,31 @@ mod tests {
         assert_eq!(p.token().await.unwrap(), "t-2");
         assert_eq!(transport.request_count(), 2);
     }
+
+    #[tokio::test]
+    async fn an_expired_cache_entry_is_refetched() {
+        // WeCom's expiry path: a token past its refresh deadline is replaced instead of returned.
+        let store: Arc<dyn AccessTokenStore> = Arc::new(InMemoryAccessTokenStore::new());
+        store.put(CachedAccessToken::new("stale", now_ms() - 1));
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(
+                200,
+                r#"{"errcode":0,"access_token":"t-fresh","expires_in":7200}"#,
+            ),
+        ]));
+        let p = WeComAccessTokenProvider::with_store(
+            "https://qyapi.weixin.qq.com",
+            "corp",
+            "sec",
+            transport.clone(),
+            store.clone(),
+        );
+        assert_eq!(p.token().await.unwrap(), "t-fresh");
+        assert_eq!(transport.request_count(), 1);
+        let cached = store.get().expect("the refresh must write through the store");
+        assert_eq!(cached.value, "t-fresh");
+        assert!(cached.refresh_at_ms > now_ms());
+        assert_eq!(p.token().await.unwrap(), "t-fresh");
+        assert_eq!(transport.request_count(), 1);
+    }
 }

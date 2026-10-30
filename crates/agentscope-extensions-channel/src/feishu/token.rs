@@ -228,6 +228,35 @@ mod tests {
         assert!(store.get().is_none());
     }
 
+    #[tokio::test]
+    async fn an_expired_cache_entry_is_refetched() {
+        // A cached token whose proactive-refresh deadline has passed must not be reused: this is the
+        // "token expired / re-fetch" path, exercised without any network access.
+        let store: Arc<dyn AccessTokenStore> = Arc::new(InMemoryAccessTokenStore::new());
+        store.put(CachedAccessToken::new("stale", now_ms() - 1));
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(
+                200,
+                r#"{"code":0,"tenant_access_token":"t-fresh","expire":7200}"#,
+            ),
+        ]));
+        let p = FeishuAccessTokenProvider::with_store(
+            "https://open.feishu.cn",
+            "cli",
+            "s",
+            transport.clone(),
+            store.clone(),
+        );
+        assert_eq!(p.token().await.unwrap(), "t-fresh");
+        assert_eq!(transport.request_count(), 1);
+        // The re-fetched token is usable immediately: its deadline is 80 % of the TTL out.
+        let cached = store.get().expect("the refresh must write through the store");
+        assert_eq!(cached.value, "t-fresh");
+        assert!(cached.refresh_at_ms > now_ms());
+        assert_eq!(p.token().await.unwrap(), "t-fresh");
+        assert_eq!(transport.request_count(), 1);
+    }
+
     #[test]
     fn default_response_timeout_is_ten_seconds() {
         let p = FeishuAccessTokenProvider::new(

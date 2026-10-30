@@ -33,6 +33,9 @@
 //!   the consumer routes through the shared harness router exactly like the other adapters.
 //! - Java keeps `MAX_DISPATCH_ATTEMPTS` and the retry counter inside the lease session; the same
 //!   counter is kept per session here so a new owner starts a fresh budget.
+//! - The consumer `backoff` is instance state (Java `private volatile long backoff = 1000`), like
+//!   the original: it doubles on every failed attempt up to `maxBackoffMs` and is only reset by a
+//!   healthy poll+drain round — not by re-acquiring the lease.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +69,18 @@ pub const CHANNEL_TYPE: &str = "weixin";
 /// within a tenure this stops a message whose dispatch keeps failing from re-running the agent
 /// forever.
 pub const MAX_DISPATCH_ATTEMPTS: i32 = 3;
+
+/// Backoff the consumer starts with and returns to after a healthy poll+drain round, mirroring the
+/// Java `private volatile long backoff = 1000` / `backoff = 1000` recovery lines.
+pub const INITIAL_BACKOFF_MS: i64 = 1_000;
+
+/// Doubling consumer backoff capped by `maxBackoffMs`, exactly the Java
+/// `backoff = Math.min(p.maxBackoffMs(), backoff * 2)` step.
+///
+/// `saturating_mul` keeps an absurdly large `maxBackoffMs` from wrapping into a negative sleep.
+pub fn next_backoff(current: i64, max_backoff_ms: i64) -> i64 {
+    current.saturating_mul(2).min(max_backoff_ms)
+}
 
 /// Grace period for a cancelled turn to wind down before it is dropped.
 ///
@@ -221,7 +236,7 @@ impl WeixinChannel {
             listener,
             lease_holder: next_client_id(),
             runtime: RwLock::new(Runtime {
-                backoff_ms: 1_000,
+                backoff_ms: INITIAL_BACKOFF_MS,
                 ..Runtime::default()
             }),
         }
@@ -289,6 +304,11 @@ impl WeixinChannel {
         &self.core
     }
 
+    /// Whether the consumer loop is supposed to be working (`running` in Java).
+    ///
+    /// This is **not** "a lease tenure is active": the flag stays true across tenures and is cleared
+    /// only by [`Self::stop`] (or a credential rejection). Use [`Self::active_session`] to ask whether
+    /// this instance currently owns the account.
     pub fn is_running(&self) -> bool {
         self.runtime
             .read()
@@ -324,7 +344,8 @@ impl WeixinChannel {
             runtime.active = Some(session.clone());
             runtime.running = true;
             runtime.started = true;
-            runtime.backoff_ms = 1_000;
+            // The backoff deliberately survives a re-acquired lease: Java keeps doubling it across
+            // consecutive failures and only resets it once a poll+drain round succeeds.
         }
         self.notify("lease acquired", |listener| {
             listener.on_lease_acquired(&self.properties.account_id, session.lease())
@@ -333,6 +354,11 @@ impl WeixinChannel {
     }
 
     /// Release the active session: fence it, ask the provider to stop, and drop the lease.
+    ///
+    /// Only the tenure ends here — the channel stays `running`, because Java's `running` flag is the
+    /// channel-level "the consumer loop should keep working" flag, cleared exclusively by
+    /// [`Self::stop`]. Clearing it here would make [`Self::run_consumer`] return after the very first
+    /// tenure and never re-acquire the lease (no retry after a transient provider failure).
     pub async fn end_consuming(&self, session: &Arc<LeaseSession>) {
         session.invalidate();
         {
@@ -343,7 +369,6 @@ impl WeixinChannel {
                 .is_some_and(|active| Arc::ptr_eq(active, session))
             {
                 runtime.active = None;
-                runtime.running = false;
             }
         }
         // Stop is an external side effect too: a stale consumer must not stop its successor.
@@ -402,13 +427,25 @@ impl WeixinChannel {
             if !self.is_running() {
                 return;
             }
-            let backoff = {
-                let mut runtime = self.runtime.write().expect("weixin runtime lock poisoned");
-                runtime.backoff_ms = (runtime.backoff_ms * 2).min(self.properties.max_backoff_ms);
-                runtime.backoff_ms
-            };
+            let backoff = self.escalate_backoff();
             tokio::time::sleep(std::time::Duration::from_millis(backoff as u64)).await;
         }
+    }
+
+    /// Double the consumer backoff (capped by `maxBackoffMs`) and return the new value.
+    ///
+    /// Mirrors the Java `backoff` field: it is instance state, not per-lease state, so a run of
+    /// failures keeps escalating even though each attempt re-acquires the account lease.
+    fn escalate_backoff(&self) -> i64 {
+        let mut runtime = self.runtime.write().expect("weixin runtime lock poisoned");
+        runtime.backoff_ms = next_backoff(runtime.backoff_ms, self.properties.max_backoff_ms);
+        runtime.backoff_ms
+    }
+
+    /// Reset the consumer backoff after a healthy poll+drain round (Java `backoff = 1000`).
+    fn reset_backoff(&self) {
+        let mut runtime = self.runtime.write().expect("weixin runtime lock poisoned");
+        runtime.backoff_ms = INITIAL_BACKOFF_MS;
     }
 
     /// One lease tenure: announce to the provider, then poll and drain until the lease is lost.
@@ -466,6 +503,8 @@ impl WeixinChannel {
                 }
                 Err(error) => return ConsumeOutcome::Transient(error),
             }
+            // A full poll+drain round is the Java recovery point (`backoff = 1000`).
+            self.reset_backoff();
             self.notify("recovered", |listener| {
                 listener.on_recovered(&self.properties.account_id)
             });
@@ -937,6 +976,42 @@ mod tests {
             .build()
     }
 
+    /// A channel whose consumer backoff can actually be observed: `maxBackoffMs` is the only knob
+    /// that caps it, and `channel()` leaves it at the 60 s default.
+    fn channel_with_max_backoff(
+        transport: Arc<RecordingTransport>,
+        max_backoff_ms: i64,
+    ) -> Arc<WeixinChannel> {
+        let properties = WeixinChannelProperties::from_json(
+            "weixin",
+            &serde_json::json!({
+                "accountId": ACCOUNT,
+                "leaseMs": 60_000,
+                "dispatchTimeoutMs": 5_000,
+                "maxBackoffMs": max_backoff_ms,
+            }),
+        )
+        .unwrap();
+        Arc::new(WeixinChannel::create(
+            "weixin",
+            ChannelConfig::of_with_default("weixin", "main"),
+            properties,
+            FixedCredentialProvider::from_token("tok").unwrap().shared(),
+            Arc::new(in_memory_store()),
+            Arc::new(RecordingWeixinRuntimeListener::new()),
+            transport,
+            &ChannelSeams::new(),
+        ))
+    }
+
+    fn backoff_of(channel: &WeixinChannel) -> i64 {
+        channel
+            .runtime
+            .read()
+            .expect("weixin runtime lock poisoned")
+            .backoff_ms
+    }
+
     fn address() -> OutboundAddress {
         OutboundAddress::direct("weixin", "weixin:DIRECT:peer-a")
     }
@@ -1058,6 +1133,92 @@ mod tests {
         assert!(!session.is_valid());
         assert!(channel.active_session().is_none());
         assert!(channel.start().is_err());
+    }
+
+    #[test]
+    fn next_backoff_doubles_and_stops_at_the_cap() {
+        assert_eq!(next_backoff(INITIAL_BACKOFF_MS, 60_000), 2_000);
+        assert_eq!(next_backoff(16_000, 60_000), 32_000);
+        assert_eq!(next_backoff(32_000, 60_000), 60_000);
+        assert_eq!(next_backoff(60_000, 60_000), 60_000);
+        // An absurdly large cap must clamp instead of wrapping into a negative sleep.
+        assert_eq!(next_backoff(i64::MAX, 60_000), 60_000);
+    }
+
+    #[tokio::test]
+    async fn consumer_backoff_escalates_and_survives_a_reacquired_lease() {
+        let transport = Arc::new(RecordingTransport::new());
+        let channel = channel_with_max_backoff(transport, 5_000);
+        assert_eq!(backoff_of(&channel), INITIAL_BACKOFF_MS);
+        assert_eq!(channel.escalate_backoff(), 2_000);
+        assert_eq!(channel.escalate_backoff(), 4_000);
+        // `maxBackoffMs` is the ceiling, not a value the loop can overshoot.
+        assert_eq!(channel.escalate_backoff(), 5_000);
+        assert_eq!(channel.escalate_backoff(), 5_000);
+        // Re-acquiring the account lease must not hide a run of failures: Java only resets the
+        // backoff on recovery, so a re-subscribed consumer keeps waiting longer, not shorter.
+        let session = channel.begin_consuming().unwrap().unwrap();
+        assert!(session.is_valid());
+        assert_eq!(backoff_of(&channel), 5_000);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_poll_and_drain_resets_the_consumer_backoff() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            // notifystart
+            PreparedResponse::new(200, "{\"ret\":0}"),
+            // getupdates: one healthy, empty batch
+            PreparedResponse::new(
+                200,
+                "{\"ret\":0,\"get_updates_buf\":\"next\",\"msgs\":[]}",
+            ),
+            // getupdates: the provider fails right after the healthy round
+            PreparedResponse::new(200, "{\"ret\":-1}"),
+        ]));
+        let channel = channel_with_max_backoff(transport, 60_000);
+        channel.escalate_backoff();
+        channel.escalate_backoff();
+        assert_eq!(backoff_of(&channel), 4_000);
+        let session = channel.begin_consuming().unwrap().unwrap();
+        let outcome = channel.consume(&session).await;
+        assert!(matches!(outcome, ConsumeOutcome::Transient(_)));
+        // The round polled and drained, so the next failure waits from the initial delay again.
+        assert_eq!(backoff_of(&channel), INITIAL_BACKOFF_MS);
+    }
+
+    #[tokio::test]
+    async fn the_consumer_reacquires_the_lease_after_a_transient_failure() {
+        // Regression: `end_consuming()` used to clear the `running` flag, so `run_consumer()`
+        // returned after the very first tenure and the whole retry/backoff path was unreachable.
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            // tenure 1: notifystart
+            PreparedResponse::new(200, "{\"ret\":0}"),
+            // tenure 1: getupdates fails, so the tenure ends and the loop has to back off
+            PreparedResponse::new(200, "{\"ret\":-1}"),
+        ]));
+        // A tiny `maxBackoffMs` keeps the retry loop fast: the first wait is `min(2000, 10)`.
+        let channel = channel_with_max_backoff(transport.clone(), 10);
+        // `run_consumer` honours the channel-level `running` flag (Java: cleared only by `stop`),
+        // so the channel has to be started before the loop will consume anything.
+        channel.start().expect("a fresh channel can be started");
+        let consumer = {
+            let channel = Arc::clone(&channel);
+            tokio::spawn(async move { channel.run_consumer().await })
+        };
+        // notifystart + getupdates + notifystop = 3 requests; a fourth means a new tenure began.
+        let mut waited_ms = 0;
+        while transport.request_count() < 4 && waited_ms < 1_000 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            waited_ms += 5;
+        }
+        let seen = transport.request_count();
+        assert!(
+            seen >= 4,
+            "the consumer must retry after a transient failure, saw {seen} request(s)"
+        );
+        assert!(channel.is_running());
+        channel.stop();
+        consumer.await.expect("the consumer task must not panic");
     }
 
     #[test]

@@ -18,9 +18,9 @@
 |---|---|
 | Java 模块 | `agentscope-extensions-channel`（**7** 个 Maven 子模块：common, dingtalk, feishu, github, gitlab, wecom, **weixin**） |
 | Java 规模（实测 2026-10-22） | 主代码 **8251** 行 / 测试 **3954** 行（**非空行**口径；`Get-ChildItem -Recurse -Filter *.java` 逐文件非空行求和，共 **92** 个文件 = 67 main + 25 test；`@Test` 计 **161** 个 + `@ParameterizedTest` 1 个）。分模块 main/test：common 593/300、dingtalk 1599/801、feishu 1212/205、github 873/**0**、gitlab 766/**0**、wecom 1254/325、weixin 1954/2323（原始行数口径：主 **9012** / 测试 **4347**） |
-| Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **399** passed（2026-10-26 G9 关闭后实测；**2026-10-29 勘误**：原记 385 = 266 `#[test]` + 119 `#[tokio::test]`，见 §3.1） |
+| Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **405** passed（预期，待主智能体实测回填）；已知基线：2026-10-26 G9 关闭后实测 **399**（**2026-10-29 勘误**：原记 385 = 266 `#[test]` + 119 `#[tokio::test]`，见 §3.1；**2026-10-31** G10 新增 6 个） |
 | 迁移波次 | A |
-| 当前状态 | **总判：已完成**（代码缺口 0，仅剩环境验证）—— **已完成（2026-10-23 基线）**：全部 P0/P1/P2 缺口已关闭（§3，历史细节见归档 §7/§8），文本 + 媒体链路全绿。common 主干（含 `ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地。验证基线见 §7；**测试数已由 385 升至 399 passed**（G9 关闭后，见 §3.1）。 |
+| 当前状态 | **总判：已完成**（代码缺口 0）—— 基线 **2026-10-23**：全部 P0/P1/P2 缺口已关闭（§3，历史细节见归档 §7/§8），文本 + 媒体链路全绿；**2026-10-26** G9 关闭；**2026-10-31** G10 关闭（weixin 消费循环重试链 + 退避升级，另补 token 过期重取离线测试）。common 主干（含 `ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地。验证基线见 §7。 |
 
 ### 1.1 与 harness 的边界（已裁定，必须遵守）
 harness 提供**路由/会话绑定骨架**（不可改）：`crates/agentscope-harness/src/agent/` 下 `channel.rs`、`chatui.rs`、`inbound.rs`、`router.rs`、`binding.rs`、`peer.rs`、`dm_scope.rs`、`config.rs`。
@@ -121,7 +121,7 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | Java 类 | 职责 | Rust 对应 | 状态 |
 |---|---|---|---|
 | `WeixinChannelProperties.java` (**83**) | 配置解析（accountId/baseUrl/ilinkUserId/channelVersion/botAgent/5 个超时与租约） | `weixin/properties.rs` | ✅ 等价（10 个字段逐一对应） |
-| `WeixinChannel.java` (**644**) | Channel 生命周期/长轮询/租约/收件箱/回复 | `weixin/channel.rs` (**1322**) | ✅ 等价（`begin_consuming`/`end_consuming`/`run_consumer`/`poll_once`/`drain_inbox`/`send_reply`/`spawn_lease_renewal`/`LeaseSession`；含 GAP-19 取消信号） |
+| `WeixinChannel.java` (**644**) | Channel 生命周期/长轮询/租约/收件箱/回复 | `weixin/channel.rs` | ✅ 等价（`begin_consuming`/`end_consuming`/`run_consumer`/`poll_once`/`drain_inbox`/`send_reply`/`spawn_lease_renewal`/`LeaseSession`；含 GAP-19 取消信号；消费退避按 Java 语义升级至 `maxBackoffMs`，见 §3.2 G10） |
 | `WeixinInboundMapper.java` (**81**) | iLink 文本消息 → `InboundMessage`（仅 DIRECT，`selfId` 自过滤） | `weixin/inbound.rs` | ✅ 等价（`channelMessageId` + `weixinContextToken`） |
 | `WeixinOutboundClient.java` (**297**) | `sendmessage`/`getupdates`/`notifystart`/`notifystop` | `weixin/outbound.rs` (**712**) | ✅ 等价 |
 | `WeixinLoginClient.java` (**174**) | 扫码登录 `start`/`poll`/`verify` + `scaned_but_redirect` 换域名 | `weixin/login.rs` (**470**) | ✅ 等价 |
@@ -163,6 +163,7 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | G7 | P2 | 过期文档注释（5 处） | 已完成 | 2026-10-23 | history §8.6 |
 | G8 | P2 | `IdempotencyStore` TTL 窗口重启语义 | 已完成 | 2026-10-23 | history §8.4 |
 | G9 | P2 | 飞书 `responseTimeout` 不可配（`FeishuAccessTokenProvider` / `FeishuOutboundClient` 构造参数，默认 10 s，构造期校验正数） | 已完成 | 2026-10-26 | 下表 + `72bfef4` |
+| G10 | P1 | 个人微信 iLink 消费循环重试链失效 + 退避不升级（`maxBackoffMs` 死配置）：`end_consuming()` 清 `running` → `run_consumer()` 首个任期即退出（永不重试）；`begin_consuming()` 每次把 `backoff_ms` 重置为 1000 → 永远停在 2000 | 已完成 | 2026-10-31 | `weixin/channel.rs`（`end_consuming`/`is_running` doc、`INITIAL_BACKOFF_MS`/`next_backoff`/`escalate_backoff`/`reset_backoff`）+ §3.2 |
 | — | — | 骨架/接线/依赖/离线测试覆盖（原 §3.1 四项） | 已完成 | 2026-10-22 | history §4.1 |
 
 ### 3.1 G9 关闭记录（2026-10-26）
@@ -184,7 +185,25 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 
 **验证**：`cargo test -p agentscope-extensions-channel` → **399 passed / 0 failed**。
 
-新条目一律追加在表尾（编号接 G9、G10…），状态先置 `待办`，关闭后补日期与历史引用。
+### 3.2 G10 关闭记录（2026-10-31）
+
+**缺口**（两个叠加缺陷，都在同一条「重试链」上）：
+1. **重试链形同虚设**：`end_consuming()` 在释放租约时把 `Runtime.running` 一并清零，而 `run_consumer()` 每轮都调它，因此**第一个租约任期结束即退出**（瞬时失败、租约丢失都不会重试），退避代码永不可达；
+2. **退避不升级**：`begin_consuming()` 每次把 `runtime.backoff_ms` 重置为 `1_000`，失败退避只在 `run_consumer()` 里加倍一次，因每次失败都会重新获取租约，退避永远停在 `2000` 一档，配置项 `maxBackoffMs` 实际无效。
+
+**Java 基线**（`WeixinChannel.java`）：`running` 是**通道级**开关（只由停止/凭据拒绝清零）；`private volatile long backoff = 1000`；`catch` 分支 `sleep(backoff); backoff = Math.min(p.maxBackoffMs(), backoff * 2)`；只有 `polled && drainInbox` 成功后才 `backoff = 1000`。
+
+**修法**：
+- `end_consuming()` 只清 `active`，不再改 `running`（并在 doc 里写清「running ≠ 当前有租约」）；`is_running()` 补同口径 doc；
+- 新增 `pub const INITIAL_BACKOFF_MS: i64 = 1_000` 与 `pub fn next_backoff(current, max)`（`saturating_mul(2).min(max)`，防溢出后 `sleep(负数)`）；
+- `escalate_backoff()` / `reset_backoff()` 两个私有方法，`run_consumer()` 失败后调前者，`consume()` 在 poll+drain 都成功后调后者；
+- `begin_consuming()` 不再改 `backoff_ms`；模块头注释补充该差异点。
+
+**测试**（全离线，无真实网络）：`weixin::channel::tests::the_consumer_reacquires_the_lease_after_a_transient_failure`（**回退 `end_consuming` 的 `running = false` 即 FAILED**：`run_consumer` 首次任期即退出，只看到 3 个请求）、`consumer_backoff_escalates_and_survives_a_reacquired_lease`（**回退 `begin_consuming` 的重置行即 FAILED**）、`a_healthy_poll_and_drain_resets_the_consumer_backoff`（notifystart + 一次健康 getupdates + 一次 `ret:-1`，断言回到 `INITIAL_BACKOFF_MS`）、`next_backoff_doubles_and_stops_at_the_cap`。
+
+> 本轮的验证由主智能体统一执行（子智能体不跑 cargo），因此 §7 仍以主智能体实测为准；本轮新增测试共 **6** 个（weixin 4 + feishu token 1 + wecom token 1）。
+
+新条目一律追加在表尾（编号接 G11…），状态先置 `待办`，关闭后补日期与历史引用。
 
 已定性、不属遗留工作的事项：
 - **A2A / 长轮询等拉取式入站**：Java 侧无对应类 → 设计决定（不迁移）；weixin 的 iLink 长轮询已迁移在 `weixin/channel.rs`。
@@ -209,14 +228,25 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | `ChannelMediaMetadata` 文件名净化 | 正则 `\p{Cf}` | 显式 Cf 区间枚举 | Rust `std` 无 Unicode general-category API，不为此新增依赖 |
 | DingTalk 回调签名 | 仅 `HmacSHA256(appSecret, ts+"\n"+appSecret)` | 同上 + 可选经典 `token+SHA1` 兼容路径 | 默认不配置 `token` 即完全等同 Java |
 | DingTalk `check_url` 首次验证 | 返回空 200 | 返回加密 `success` | 依据 DingTalk 事件订阅协议；**尚未在真实租户验证** |
+| weixin 失败后租约处理 | 同一租约内原地 `sleep(backoff)`，只保留租约 | `consume()` 返回后 `end_consuming()` 释放租约，外层重新 `begin_consuming()` | 两者语义等价（都是重试 + 退避）；Rust 侧释放租约让其它实例可接管，且重新获取会重新审计 `notifystart`。**退避值本身跨租约保留**（G10，§3.2） |
 
-**遗留（2026-10-29 复核，全部为「非代码缺口（环境验证）」）**：§3 代码缺口清单已空（G1–G9 全部关闭，最后一项 G9 于 2026-10-26 关闭）。剩余项均属需真实租户环境的**非代码缺口（环境验证）**，不在本 crate 代码范围内：① DingTalk `check_url` 加密应答/验签解密；② DingTalk Stream 退避重连；③ Feishu / WeCom token 刷新与失效重取（详见 §5）。
+**遗留（2026-10-31 复核，已收敛）**：§3 代码缺口清单已空（G1–G10 全部关闭）。2026-10-29 曾把三项登记为「非代码缺口（环境验证）」，本轮逐项复核后重新裁定：**三项的离线可测部分均已落地为代码+单测**，只剩真实租户联调（不在本 crate 代码范围）：
 
-## 5. 已知限制（需真实环境验证，非代码缺口）
+| 原登记项 | 2026-10-31 裁定 | 源码 + 离线测试证据 |
+|---|---|---|
+| ① DingTalk `check_url` 加密应答 / 验签解密 | 已完成（离线可测部分已全覆盖） | `dingtalk/controller.rs::answers_the_first_check_url_verification_with_an_encrypted_success`、`answers_check_url_in_plain_text_when_encryption_is_disabled`、`dispatches_an_encrypted_message`、`accepts_the_classic_msg_signature_when_a_token_is_configured`；`dingtalk/crypto.rs` 金标向量 `hmac_signature_matches_the_java_gold_vector` / `decrypts_the_java_gold_ciphertext` |
+| ② DingTalk Stream 退避重连 | 已完成（离线可测部分已全覆盖） | `dingtalk/stream.rs::backoff_doubles_up_to_the_cap`、`start_serves_frames_and_reconnects_after_close`、`stop_while_sleeping_in_backoff_ends_the_loop`、`callback_is_acked_before_the_payload_is_dispatched`（ACK 时序） |
+| ③ Feishu / WeCom token 刷新与失效重取 | 已完成（2026-10-31 补「过期缓存 → 重取」缺失覆盖） | 失效重取：`feishu/outbound.rs::parse_send_response_extracts_message_id_and_invalidates_on_auth_error`、`wecom/outbound.rs` 同构测试、各 provider `token_is_cached_until_invalidated`；**新增** 过期重取：`feishu/token.rs::an_expired_cache_entry_is_refetched`、`wecom/token.rs::an_expired_cache_entry_is_refetched`；80% TTL：`common/token.rs` 中 `refresh_at_ms` 测试 |
+| ④ 个人微信 iLink 消费循环重试/退避 | **原为真缺口（G10），本轮已修** | 见 §3 + §3.2：`end_consuming()` 曾清 `running` 导致首任期即退出（永不重试）；`begin_consuming()` 曾重置 `backoff_ms` 导致 `maxBackoffMs` 死配置。现按 Java 语义重试 + 跨租约升级、仅由健康 poll+drain 重置 |
 
-- **DingTalk**：真实租户的 HTTP 回调验签/解密、`check_url` 加密应答、Stream 连接与退避重连。
+## 5. 已知限制（只剩「真实租户联调」，离线可测部分已全覆盖）
+
+> 2026-10-31 复核：下列四项都曾有「环境验证」注册，但经核查，它们的**可离线部分均有源码 + 单测**（证据见 §4.2 遗留表），因此只剩真实租户/真实网关联调。
+
+- **DingTalk**：真实租户的 HTTP 回调验签/解密、`check_url` 加密应答、Stream 连接与退避重连（离线已由 `dingtalk/controller.rs` 与 `dingtalk/stream.rs` 测试覆盖）。
 - **Feishu**：真实事件订阅需配置 `verificationToken`（未配置时普通事件一律 401，与 Java 一致）。
-- **WeCom / DingTalk / Feishu**：真实 token 刷新与失效重取。
+- **WeCom / DingTalk / Feishu**：真实 token 刷新与失效重取（离线已由 `*_token.rs` / `*_outbound.rs` 测试覆盖，含新增的「过期缓存 → 重取」）。
+- **weixin**：真实 iLink 网关的长轮询/租约/消息投递；退避策略已离线覆盖（G10）。
 - 全部单测均为离线（`HttpTransport` / `WebSocketConnector` seam + 金标向量），不发真实网络请求。
 
 ## 6. 增量跟踪流程（下次 Java 出现新特性时）
@@ -248,6 +278,8 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | `cargo check -p agentscope-extensions-channel --all-targets` | 0 error；本 crate 0 warning |
 | `cargo test -p agentscope-extensions-channel` | **385 passed / 0 failed / 0 ignored**（doc-test 0） |
 | `cargo clippy -p agentscope-extensions-channel --all-targets` | 仅 crate 内既有历史提示，无新增 |
+
+**2026-10-31 增量（待主智能体统一实测回填）**：新增 6 个离线单测（`weixin::channel::tests` 4 + `feishu::token::tests` 1 + `wecom::token::tests` 1），预期基线 `399 → 405 passed / 0 failed`；反向验证项：`the_consumer_reacquires_the_lease_after_a_transient_failure`（回退 `end_consuming` 的 `running = false` → FAILED）、`consumer_backoff_escalates_and_survives_a_reacquired_lease`（回退 `begin_consuming` 的重置行 → FAILED）。
 
 - 测试构成：266 `#[test]` + 119 `#[tokio::test]`。
 - 分模块：common 62 / dingtalk 78 / feishu 44 / github 32 / gitlab 35 / wecom 48 / weixin 86。
