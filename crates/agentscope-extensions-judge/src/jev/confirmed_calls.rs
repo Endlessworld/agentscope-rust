@@ -137,15 +137,34 @@ impl JevConfirmedCalls {
 
     /// The fingerprint of one call: SHA-256 over the name and the arguments with sorted keys.
     fn fingerprint(call: &ToolUseBlock) -> Option<String> {
-        let payload = json!({
+        let payload = canonical_json(json!({
             "name": call.name,
             "arguments": Value::Object(call.input.clone()),
-        });
-        // `serde_json::Map` is a `BTreeMap`, so nested objects serialize with sorted keys, matching
-        // Java's `SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS`.
+        }));
         let bytes = serde_json::to_vec(&payload).ok()?;
         let digest = Sha256::digest(&bytes);
         Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
+/// Recursively sorts object keys so the serialised form is canonical.
+///
+/// `serde_json::Map` is a `BTreeMap` only without the `preserve_order` feature; the workspace
+/// enables it, so the map is insertion-ordered. Sorting here (rather than relying on the map
+/// type) keeps the fingerprint stable regardless of how the caller built the arguments and
+/// mirrors Java's `SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS`.
+fn canonical_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical_json).collect()),
+        other => other,
     }
 }
 
