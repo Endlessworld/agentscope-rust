@@ -21,7 +21,7 @@
 | Rust crate | `crates/agentscope-extensions-judge` |
 | Rust 规模（实测 2026-10-28） | **55** 个 `src/*.rs` / **23185** 行 / **286** 个测试（`#[test]` + `#[tokio::test]`；无 `tests/`、无 doc-test、无 `#[ignore]`） |
 | 是否注册 workspace | **是**（`Cargo.toml` 的 `crates/agentscope-extensions-judge`） |
-| 当前状态 | **总判：进行中**（仍有 P1：中间件 hook / @Tool / 路由驱动）—— **基本完成**（两个 HTTP 客户端 + `openai-decisions` 整块 + `jev` 八个编排子包的纯函数/定义层/状态机已落地；**jev 去 `browser`(4)/`example`(4) 共 42 类 = 完整 32 / 部分 8 / 骨架 2**；仅剩需要 core/harness seam 的中间件与工具注册层，见 §8 与 §4.2 第 6 条） |
+| 当前状态 | **总判：进行中**（2026-10-30 更新：中间件 hook / @Tool / `StoreJevContextArchive` 已落地，见 §9；P1 未清零 —— 剩余 `JevPhaseRouting` 的 judge 选择、`JevCodeReviewer` 六阶段驱动、`JevStageRouter`、`JevResponseMiddleware` 的 quality/reviser 分支）。**基本完成**（两个 HTTP 客户端 + `openai-decisions` 整块 + `jev` 八个编排子包的纯函数/定义层/状态机已落地；**jev 去 `browser`(4)/`example`(4) 共 42 类 = 完整 32 / 部分 8 / 骨架 2**） |
 
 ### 1.1 Rust crate 文件清单
 
@@ -44,7 +44,7 @@
 | `src/openai_decisions/protocol.rs` | 1063 | 13 | **新增**：请求体编码 + 响应解析/校验（Java `parseAnswer/parseChoice/parseScore`） |
 | `src/openai_decisions/client.rs` | 766 | 16 | **新增**：`OpenAIDecisionsClient` + `DecisionsRetryPolicy` + 重试/超时/脱敏 |
 
-> `Cargo.toml` 依赖：`serde` / `serde_json` / `thiserror` / `async-trait` / `tokio` / **`reqwest`（workspace 0.13）** / `futures`（runner 的 `buffered` 顺序并发）/ `sha2`（`FileJevContextArchive` 的 SHA-256 内容寻址）；均走 workspace。`reqwest` 只经 `http::JudgeHttpTransport` seam 触达，单测全离线。`agentscope-core` / `agentscope-harness` 仍**刻意不声明**（本模块用本地缝替代，见 §8.2/§8.6）。
+> `Cargo.toml` 依赖：`serde` / `serde_json` / `thiserror` / `async-trait` / `tokio` / **`reqwest`（workspace 0.13）** / `futures`（runner 的 `buffered` 顺序并发）/ `sha2`（`FileJevContextArchive` 的 SHA-256 内容寻址）；均走 workspace。`reqwest` 只经 `http::JudgeHttpTransport` seam 触达，单测全离线。`agentscope-core` / `agentscope-harness` 自 **2026-10-30** 起以 path 依赖声明（仅 `jev::runtime` 使用：`BaseStore` 归档、`Tool`、`Middleware`，见 §9）；其余模块仍只用本地缝。
 >
 > **2026-10-28 新增目录**（详见 §8）：`src/jev/{call,judge,code_review}.rs`、`src/jev/evaluation/**`（10 文件）、`src/jev/context/**`（5）、`src/jev/application/**`（4）、`src/jev/evidence/**`（3）、`src/jev/routing/**`（2）、`src/jev/supervision/**`（3）、`src/jev/integration/**`（2）。
 
@@ -310,3 +310,81 @@
 2. **core `Msg` ↔ `TraceMessage`/`ContextMessage` 适配**：建议由 core 提供 `From<&Msg> for ...` 风格的投影 trait，否则每个宿主都要手写。
 3. **harness `BaseStore` 适配**：`StoreJevContextArchive` 需要 `put_if_version/get/search` 三方法（`UnavailableContextArchive` 现为 fail-closed 占位）。
 4. **`RuntimeContext` 扩展槽**：`JevConfirmedCalls`、`EvidenceSource`、`Source`（routing snapshot）等仍依赖 keyed 扩展槽。
+5. **2026-10-30 更新（§9）**：`BaseStore` 归档、@Tool 三层、四个中间件 hook 已落地（`src/jev/runtime/**`）；仍剩 `JevPhaseRouting` 的 judge 选择、`JevCodeReviewer` 六阶段驱动、`JevStageRouter`、`JevResponseMiddleware` 的 quality/reviser 分支，原因见 §9.5。第 3/4 条中的 `EvidenceSource`/`Source` 注入改用工具构造期持有（`ToolExecutionContext` 无 `extensions` 包）。
+
+## 9. 执行记录（2026-10-30）— 中间件 hook / @Tool / 归档 / 路由派发
+
+> 本轮把 §8.6 列出的三个 core/harness seam 真正接上：`StoreJevContextArchive`、`@Tool` 注册层、四个中间件 hook。全部绑定集中在新模块 `src/jev/runtime/**`，**纯函数层签名与测试不变**（仅两处 `&dyn Fn` 加 `+ Sync`，见 §9.2）。
+
+### 9.1 落地项
+
+| 项 | Rust 产物 | Java 依据 | 说明 |
+|---|---|---|---|
+| `StoreJevContextArchive` | `src/jev/runtime/archive.rs` | `jev/context/StoreJevContextArchive.java` | 命名空间 `["jev","context", sha256(user), sha256(agent), sha256(session)]`；内容寻址 `ref = sha256(snapshot JSON)`；写入用 `BaseStore::put_if_version(..., 0)` create-if-absent，失败时回读比对 `snapshot` 字节，不一致即 `archive requires acknowledged create-if-absent storage`；`restore` 校验引用格式 / 大小 / 校验和 / `version==1` / scope 相等；**6 条 Java 消息逐字对齐**（`positive snapshot limit required` / `snapshot limit` / `missing or invalid snapshot` / `snapshot scope mismatch`） |
+| `@Tool`：`search_evidence` | `src/jev/runtime/tools.rs` `EvidenceSearchTool` | `jev/evidence/JevEvidenceTool.java` | 名称 / 描述 / 参数 schema（`query`，required）逐字；scope 缺失 → `EVIDENCE_SCOPE_REQUIRED`；检索结果为空 decision → `EVIDENCE_SOURCE_UNAVAILABLE`；返回 Java 同构 `{status, passages[{id,version,text,classification,score}]}` |
+| `@Tool`：`search_knowledge` | `tools.rs` `KnowledgeSearchTool` | `jev/integration/JevKnowledgeTool.java` | 复用 `JevKnowledge::retrieve(query, limit, acl)`（ACL 优先 + ENFORCE 候选限额 + SHADOW/ENFORCE）；返回 `[{id,text}]` |
+| `@Tool`：`review_code_snapshot` | `tools.rs` `ReviewCodeTool` | `jev/review/JevCodeReviewTool.java` | scope → `REVIEW_SCOPE_REQUIRED`；快照 id 空/超 512/含控制字符 → `INVALID_SNAPSHOT_ID`；快照由宿主 `CodeReviewSource` 解析（非文件路径）；六阶段驱动未接时 `JevCodeReviewerDriver` 保持 fail-closed（§9.5） |
+| `register_jev_tools(&Toolkit, cfg)` | `tools.rs` | — | 返回注册名列表；测试断言注册后 `Toolkit::get_tool` 可取到三个 |
+| `JevTraceEvaluationMiddleware` | `runtime/middleware.rs` `TraceEvaluationMiddleware` | `jev/evaluation/JevTraceEvaluationMiddleware.java` | `on_agent` 开 capture、透传事件流、`AGENT_RESULT.reply` 触发 `finish`，流结束后 `evaluate`（有界、post-run）并回调 observer，不改事件；`on_model_call` 用 `observe` 喂快照；`order()==300`；`OFF` 纯透传 |
+| `JevResponseMiddleware` | `middleware.rs` `ResponseMiddleware` | `jev/integration/JevResponseMiddleware.java` | `on_model_call`：`OFF` 透传；`SHADOW` 累积 `TEXT_BLOCK_DELTA` 后仅观察；`ENFORCE` 缓冲整条流 → screen → 未拦截重放、拦截则替换为 `Err(Agent("OUTPUT_BLOCK: ..."))`（等价 Java `Rejected` 使本次调用失败）；`order()==200` |
+| `JevSupervisionMiddleware` | `middleware.rs` `SupervisionMiddleware` | `jev/supervision/JevSupervisionMiddleware.java` | `on_agent` 开 run（`Scope` from user/session/run_id）、`on_model_call` 按 `Schedule` 门控把用户请求与 `TEXT_BLOCK_DELTA` 追加进有界 tail（`append_tail`），流结束后调 `Auditor` 并发布 `Observation`；`order()==310` |
+| `JevPhaseRouting` 派发 | `middleware.rs` `PhaseRoutingMiddleware` | `jev/routing/JevPhaseRouting.java` | `on_model_call`：`OFF` 透传；`input_restriction`（pinned：api_key/base_url/endpoint_path/**model_name**；non-text 块扫描）命中即原样放行；否则调注入 `RouteResolver`，`ENFORCE` 下把 `report.model` → `options.model_name`、`report.effort` → `options.reasoning_effort` 后再 `next`，并记录 `report(run_key)`；resolver 失败不改变目标 |
+
+依赖：`crates/agentscope-extensions-judge/Cargo.toml` 新增 `agentscope-core = { path = "../agentscope-core" }`、`agentscope-harness = { path = "../agentscope-harness" }`（仅 `jev::runtime` 使用，无 workspace 版本锁定需求）。
+
+### 9.2 结构决定与对既有代码的最小改动
+
+1. **绑定集中在 `jev::runtime`**（`mod.rs` / `archive.rs` / `tools.rs` / `middleware.rs`），四个中间件与三个工具都是**新类型**，包装既有纯状态机；`evaluation/capture.rs`、`integration/response.rs`、`supervision/middleware.rs`、`routing/phase_routing.rs`、`evidence/tool.rs` 的公开 API 与测试均未改。
+2. **两处签名收紧**（为使 `async_trait` 生成的 future 满足 `Send`）：`evidence/processor.rs::process(authorized: &dyn Fn(&JevPassage) -> bool)` → `&(dyn Fn(&JevPassage) -> bool + Sync)`；`integration/knowledge.rs::retrieve(acl: &dyn Fn(&KnowledgeDocument) -> bool)` → `&(dyn Fn(...) -> bool + Sync)`。语义不变，既有调用点（闭包）自然满足。
+3. **结果序列化**：`code_review.rs` 的 `Screening` / `Profile` / `Signal` / `Disposition` / `ReviewAdvice` / `Finding` / `FollowUp` / `ReviewCall` / `ReviewReport` 补 `serde::Serialize`（结构体 `rename_all = "camelCase"`、枚举 `SCREAMING_SNAKE_CASE`），使工具返回与 Java record 同构。
+4. **身份来源**：`ToolExecutionContext.runtime` 的 `userId`/`sessionId`（core `tool_runtime` 写入，另兼容 `user_id`/`session_id`），与 harness `artifact_delivery` / `wait_async` 一致。
+
+### 9.3 测试与验证
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p agentscope-extensions-judge -j 2` | **308 passed / 0 failed / 0 ignored**（基线 286 → +22） |
+| `cargo build -p agentscope-extensions-judge -j 2` | EXIT=0，**本 crate 0 warning**（core/harness 的既有 warning 与本次无关） |
+
+新增测试（22 个，全离线）：
+
+- `jev::runtime::archive`（6）：`namespace_hashes_each_scope_component`（三个 SHA-256 用**跨实现算出的字面量**，与实现不同源）、`save_then_restore_round_trips_and_is_content_addressed`、`limits_and_references_are_enforced`、`a_store_without_create_if_absent_support_is_rejected`、`a_snapshot_for_another_scope_is_rejected`、`tampered_bytes_are_rejected`。
+- `jev::runtime::tools`（8）：`schemas_match_the_java_tool_parameters`、`tool_scope_requires_both_ids`、`evidence_tool_returns_delivered_passages_only`、`evidence_tool_fails_closed_without_scope_or_query`、`knowledge_tool_projects_id_and_text_after_the_acl`、`review_tool_validates_scope_and_snapshot_id`、`register_jev_tools_wires_every_configured_tool`、`reviewer_driver_is_fail_closed_until_the_staged_driver_lands`。
+- `jev::runtime::middleware`（8）：`trace_projection_carries_roles_blocks_and_tools`、`trace_middleware_off_is_a_passthrough`、`trace_middleware_shadow_opens_and_closes_a_capture`、`response_middleware_off_passes_through_and_enforce_withholds`、`supervision_middleware_publishes_one_bounded_observation`、`phase_routing_applies_the_resolved_model_and_effort_in_enforce`、`phase_routing_skips_pinned_and_non_text_calls`、`reasoning_hook_is_untouched`。
+
+### 9.4 语义等价 / 差异（§8.6 更新）
+
+| 项 | Java | Rust | 判定 |
+|---|---|---|---|
+| hook 可用性 | `onAgent` / `onModelCall` | `Middleware::on_agent` / `on_model_call` | **等价**，无需替代 hook（`§8.6` 第 1 条已解除） |
+| 跨 hook 状态传递 | Reactor `Context` | 中间件内部 `Mutex<HashMap<run_id 或 session_id>>` | 等价（`&RuntimeContext` 不可变，无法写 `Extensions`）；并发多个 run 互不干扰 |
+| trace 评价时机 | `concatWith`（流末尾、有界） | 流 `.chain(once(async ...))` 末尾 await | 等价 |
+| response 拦截 | `ENFORCE` 缓冲后 `Rejected` | 缓冲后替换为 `Err(Error::Agent(...))` | 等价（本次调用失败）；`on_model_call` 已产生的更早事件无法撤回，与 Java 相同（Java 也只在 `ENFORCE` 缓冲） |
+| response quality/reviser | `assess` + `reviser` + 最多 `maxRevisions` 轮 | **未接**（只用 `safety` 分支） | 差异，见 §9.5 |
+| supervision 调度 | boundedElastic + jitter 定时 | 调用数 / `periodic_interval_millis` 门控（`SystemTime`） | 语义近似（无定时器线程）；同一 `Schedule` 结构 |
+| routing 快照 | `Source.read` 读宿主快照 | `RouteResolver` 注入（`Snapshot` 由注入方提供，`output_reserve` 取 `max_tokens`） | 适配层差异；`pinned_model` 取 `options.model_name` |
+| `JevEvidenceTool.Source` / `JevKnowledgeTool` 的 ACL | 从 `RuntimeContext` 取 `Source` | 构造期注入（`EvidenceSource` trait / `acl` 闭包） | 差异：`ToolExecutionContext` 无 `Extensions`；scope 仍来自调用上下文，失败码不变 |
+
+### 9.5 未完成项与确切原因
+
+1. **`JevPhaseRouting` 的 judge 选择（`resolve()` 仍 fail-closed）**：缺 (a) `JevPhaseRouting` 的 `routes()` 访问器；(b) route offer 组装 + `route`/`none` Choice 题 + 二次校验（`excluded` 重跑）＋ `share()` 重放语义。中间件侧的判定、注入 resolver、`ENFORCE` 覆盖与报告记录已可用。
+2. **`JevCodeReviewer` 六阶段驱动**（screen→profile→locate→classify→severity→route）：Java 1099 行、5 类 SystemOne 调用 + 每阶段预算/限额/完整性汇总；本轮未接，`CodeReviewDriver` 缝 + `JevCodeReviewerDriver` 保持 fail-closed（有反向测试）。
+3. **`JevStageRouter`**：依赖 `example/JevModelRouterMiddleware`（示例子包，未迁）与显式阶段入口 `jev.stage`。
+4. **`JevResponseMiddleware` 的 quality 分支**：`quality_state` 纯函数已在，但还需 `JevJudge` 判定 + reviser 重写 + `maxRevisions` 循环 + `replaceText`（改写已发出的 delta）。
+5. **`JevGuardrail::screen` 的 reactive caller**、**`JevConfirmedCalls`**：仍需宿主提供 SystemOne 调用与运行级确认记录。
+6. **定时监督**：无 bounded-elastic 等价物，`Schedule` 的 jitter 语义只保留上界。
+
+### 9.6 反向验证（回退实现 → FAILED → 恢复）
+
+| 回退点 | 结果 | 恢复后 |
+|---|---|---|
+| `archive::save` 去掉 create-if-absent 回读比对 | `jev::runtime::archive` **FAILED 1**（`a_store_without_create_if_absent_support_is_rejected`） | 6 passed |
+| `tools::validate_snapshot_id` 恒拒绝 | `jev::runtime::tools` **FAILED 1**（`review_tool_validates_scope_and_snapshot_id`） | 8 passed |
+| `ResponseMiddleware` 的 `ENFORCE` 恒不拦截 | `jev::runtime::middleware` **FAILED 1**（`response_middleware_off_passes_through_and_enforce_withholds`） | 8 passed |
+
+另有一处**真实缺陷**由测试当场捕获并修复：`PhaseRoutingMiddleware::restriction` 初版漏掉 `options.model_name`（Java 的 pinned 检查含 model 名），`phase_routing_skips_pinned_and_non_text_calls` FAILED → 补齐后通过。
+
+### 9.7 遗留提醒
+
+- `UnavailableContextArchive` 保留（无 store 的宿主仍需 fail-closed 占位）；`HARNESS_STORE_ARCHIVE_UNAVAILABLE` 文案仍指「本 crate 不依赖 harness」，现已在 §1.1/§9.1 说明该前提仅对 `archive.rs` 之外成立。
+- `Cargo.lock` 因新增两个 path 依赖变化属预期，未 stage、未还原。

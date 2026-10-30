@@ -19,7 +19,7 @@
 | Rust crate | `crates/agentscope-extensions-mysql` |
 | Rust 规模（实测 2026-10-26） | `src/` 13 个 `.rs` 文件 / **3179** 行（非空行口径；含空行 3563）+ `Cargo.toml` 19 行；**71 passed / 0 failed**（2026-10-28 主会话复跑；原静态统计 70 个 test 属性，见 §4.1） |
 | 迁移波次 | B |
-| 当前状态 | **总判：进行中**（仍有 P1：驱动适配器 / schema 校验 / 快照建表 / 锁名截断）—— **进行中（2026-10-26：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent、P1-5 表名注入防护 已关闭，见 §7.3；剩余 P1：schema 存在性校验/`version` 列迁移（P1-6）、快照表自动建表（P1-7）、锁名 64 字符截断（P1-8）与 P2 若干）** |
+| 当前状态 | **总判：进行中**（P1 功能性缺口 **已清零**）—— **进行中（2026-10-30：P1-6 schema 校验/`version` 列迁移、P1-7 快照表自动建表、P1-8 锁名 64 字符截断 全部关闭，见 §8；P1-1/2/3/5 见 §7.3，P1-4 见 §7.1）。剩余 P1 = 真实驱动适配器 + 真实 MySQL 集成测试（均需环境，见 §3.2 前两行 / §8.6）；P2 若干** |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -69,11 +69,12 @@
 | **列表变更检测（`ListHashUtil`）** | Java `save(list)` 用 `HASH_KEY_SUFFIX` + `ListHashUtil.computeHash/needsFullRewrite` 判定「无变化则跳过 / 仅前缀变化则全量重写 / 纯追加则只插尾部」；本 crate 原仅按 `list_len()` 追加，中间元素被改写时不会重写 | **已完成（2026-10-26）**：`state::save_list_impl` 复用 core `agentscope_core::state::list_hash`（`compute_hash` / `needs_full_rewrite`），`{key}:_hash` 行存列表哈希。测试：`save_list_detects_mutated_prefix`、`save_list_persists_core_list_hash_row`、`save_list_unchanged_skips_backend_write` |
 | **版本 CAS 原子性** | Java 版本存于独立 `version` 列，`saveIfVersion` 走 `INSERT` / `UPDATE ... WHERE version=?`，由数据库保证原子；本 crate 原用 `key:_hash` 伴随行「先读后写」 | **已完成（2026-10-26）**：`StateBackend` 新增 `save_single_versioned` / `insert_single_if_absent` / `update_single_if_version`（契约为**单条**原子语句）与必填 `read_version`（读 `version` 列）；`save_if_version` 不再先读版本。测试：`save_if_version_delegates_cas_instead_of_read_then_write`、`cas_conflict_does_not_write`、`save_upsert_bumps_version_column`、`cas_update_requires_matching_version` |
 | **`saveIfVersion(0)` 迁移行回退** | 原记录称「Java #3162 遇重复键回退 `UPDATE ... WHERE version=0`」 | **勘误 + 已完成（2026-10-26）**：题面复核 Java `MysqlAgentStateStore#insertIfAbsent`（`:477-500`）**没有**回退——重复键（1062）直接返回 `UNVERSIONED`（PG/JDBC 版才有回退）。Rust 现按 MySQL Java 语义实现：`expected==0` 为真实 create-if-absent，重复键冲突即 `Conflict`。该回退是否需要（PG/JDBC 一致性）留待汇总方裁定，记 §4.2 |
-| **schema 校验/版本列补齐** | Java 构造期 `verifyDatabaseExists`/`verifyTableExists`/`ensureVersionColumn`（`ALTER TABLE ... ADD COLUMN version BIGINT NOT NULL DEFAULT 1`）；本 crate 只有 `ensure_schema()`（后端实现负责）与标识符校验，无存在性校验、无版本列迁移 | 部分（P1，**未变**；现已要求 `ensure_schema()` 必须建出 `version` 列，见 §7.3） |
-| **锁名 64 字符上限** | Java `composeLockName` 超 64 字符截断为 `前50 + ":" + hex(hashCode)`（MySQL `GET_LOCK` 限制）；本 crate 无截断，长 key 会由驱动侧失败 | 待办（P1） |
+| **schema 校验/版本列补齐** | Java 构造期 `verifyDatabaseExists`/`verifyTableExists`/`ensureVersionColumn`（`ALTER TABLE ... ADD COLUMN version BIGINT NOT NULL DEFAULT 1`）；本 crate 原只有 `ensure_schema()`（后端实现负责）与标识符校验，无存在性校验、无版本列迁移 | **已完成（2026-10-30，§8.1）**：`StateBackend` 的 `ensure_schema` 换成 `execute_ddl` + `database_exists`/`table_exists`/`table_columns` 探针；DDL 由本 crate 生成（`create_database_sql`/`create_sessions_table_sql`/`add_version_column_sql`），`create_if_not_exist=false` 先校验库再校验表（`MysqlError::Schema` + Java 原文），两分支末尾都跑幂等 `ensure_version_column`。测试：`auto_create_provisions_database_and_table`、`missing_database_is_reported_when_not_auto_creating`、`missing_table_is_reported_when_not_auto_creating`、`legacy_table_gets_the_version_column_migration`、`version_column_migration_is_idempotent`、`existing_version_column_is_left_alone`、`ddl_failure_propagates_when_auto_creating`、`custom_names_flow_into_the_provisioning_ddl`、`create_table_ddl_pins_binary_collation_on_key_columns` |
+| **快照表自动建表（P1-7）** | Java `JdbcSnapshotSpec` 恒传 `initializeSchema=true`，`JdbcRemoteSnapshotClient#initSchema` 发 `CREATE TABLE IF NOT EXISTS`（`snapshot_id VARCHAR(512) COLLATE utf8mb4_bin PK`）；本 crate `MysqlSnapshotSpec` 原不发 DDL | **已完成（2026-10-30，§8.2）**：新增 `snapshot_table_ddl()` + `SnapshotBackend::execute_ddl`；`MysqlSnapshotSpec::new/with_table` 恒走 `*_and_schema` 构造，DDL 失败**仅 `tracing::warn!`**（对齐 Java `log.warn`，不抛错）。测试：`snapshot_ddl_matches_the_java_statement`、`spec_issues_the_table_ddl_on_construction`、`spec_with_table_issues_ddl_for_the_custom_table`、`ddl_failure_is_logged_not_raised`、`client_without_initialize_schema_emits_no_ddl` |
+| **锁名 64 字符上限** | Java `composeLockName` 超 64 字符截断为 `前50 + ":" + hex(hashCode)`（MySQL `GET_LOCK` 限制）；本 crate 无截断，长 key 会由驱动侧失败 | **已完成（2026-10-30，§8.3）**：`truncate_lock_name`（UTF-16 计长，`前50 + ':' + Integer.toHexString(String.hashCode())`，负数 8 位无符号 hex）+ `java_string_hash_code`；`compose_lock_name` 统一走截断。金标向量由真实 Java 24 跑出（`f4aead7e`/`f3714f1b`/`2f91cd3e`/`80000000`）。测试：`java_string_hash_code_matches_java_gold_values`、`compose_lock_name_keeps_names_at_the_limit`、`compose_lock_name_truncates_over_the_limit`、`compose_lock_name_uses_unsigned_hex_for_negative_hash`、`truncated_names_never_exceed_the_limit` |
 | **表名注入防护（store/snapshot）** | Java `JdbcStore.Builder.tableName` 强制 `[A-Za-z_][A-Za-z0-9_]*`；本 crate `MysqlStoreBuilder::table_name`/`MysqlRemoteSnapshotClient::with_table` 原不做校验，DDL 直接拼接 | **已完成（2026-10-26）**：两处均改为返回 `MysqlResult`；`MysqlDistributedStoreBuilder` 新增 `try_build()`（`build()` 委托并 `expect`）在构造期校验。测试：`rejects_injection_payloads`（identifier）、`table_name_rejects_injection_payloads`、`with_table_rejects_unsafe_identifiers`、`try_build_rejects_unsafe_table_names` |
 | **空列表语义（与 Java 相反）** | Java `save(list)` 在 `values.isEmpty()` 时**直接 return**（不触碰既有行）；本 crate 原以 `from_index=list_len()` + 空切片调用后端，内存后端按「total=0」修剪 → **清空**既有列表 | **已完成（2026-10-22，§7.1）**：`save_list` 对空切片直接返回（no-op），测试 `save_list_empty_is_a_no_op` |
-| **`key_prefix` 归一化 + 默认锁超时** | Java `Builder.keyPrefix` 自动补尾部 `:`、拒绝空白，默认超时 1800s（30 分钟）；本 crate `key_prefix()` 原样使用（须自带冒号，否则拼出 `app:lockuser:u1`），默认超时 **30s** | 待办（P2） |
+| **`key_prefix` 归一化 + 默认锁超时** | Java `Builder.keyPrefix` 自动补尾部 `:`、拒绝空白，默认超时 1800s（30 分钟）；本 crate `key_prefix()` 原样使用（须自带冒号，否则拼出 `app:lockuser:u1`），默认超时 **30s** | **归一化已完成（2026-10-30，§8.3）**：`key_prefix`（空白 → panic）/`try_key_prefix`（空白 → `InvalidArgument("keyPrefix must not be blank")`），缺尾冒号自动补（Java 不 trim，此处同）。测试：`key_prefix_is_normalised_with_a_trailing_colon`、`blank_key_prefix_is_rejected`。**默认锁超时 30s vs 1800s 仍是 P2 未动**：改默认值会让所有既有调用方静默等待 30 分钟，且 harness 侧 `SandboxGuard::try_enter` 无超时配置面，需与 `MysqlDistributedStoreBuilder` 一并评估，见 §8.6 |
 | **状态 key / session id 长度校验** | Java `validateStateKey`/`validateSessionId` 限长 255 且 key 非空；本 crate 仅校验 `session_id` 非空，**不限长、不校验 `state_key`** | 待办（P2） |
 | **`truncateAllSessions` / `clearAllSessions`** | Java 提供测试/运维清理入口；本 crate 无对应 API（`delete` 仅按会话） | 待办（P2） |
 | **`getDataSource` 访问器** | Java `getDatabaseName`/`getTableName`/`getDataSource`；本 crate 有前两者，无后者（后端 trait 抽象下不适用） | 设计决定（不迁移） |
@@ -82,7 +83,7 @@
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 - **P0 全部已完成**：`crates/agentscope-extensions-mysql/` 全部 P0 组件实现，均**复用既有 trait**（`AgentStateStore` / `BaseStore` / `SandboxSnapshotSpec` / `RemoteSnapshotClient`），CAS/版本语义以 harness 为准。
-- **P1 已关闭 4 项（2026-10-26）**：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent（原记录的回退前提已勘误）、P1-5 表名校验；P1-4 空列表 no-op 已在上轮（§7.1）关闭。**剩余 P1**：P1-6 schema 存在性校验/`version` 列迁移、P1-7 快照表自动建表、P1-8 锁名 64 字符截断。模块整体仍为「进行中」（详见 §7.3）。**已完成（2026-10-29 勘误）**：P1 现存 **4 项**（上述 3 项 + 真实驱动适配器/集成测试，见 §3.2 前两行）；`saveIfVersion(0)` 回退一项已按 Java MySQL 语义勘误为「无回退」并落地（§3.2 / §7.3）。
+- **P1 已关闭 4 项（2026-10-26）**：P1-1 列表变更检测、P1-2 CAS 原子性、P1-3 create-if-absent（原记录的回退前提已勘误）、P1-5 表名校验；P1-4 空列表 no-op 已在上轮（§7.1）关闭。**剩余 P1**：P1-6 schema 存在性校验/`version` 列迁移、P1-7 快照表自动建表、P1-8 锁名 64 字符截断。模块整体仍为「进行中」（详见 §7.3）。**已完成（2026-10-29 勘误）**：P1 现存 **4 项**（上述 3 项 + 真实驱动适配器/集成测试，见 §3.2 前两行）；`saveIfVersion(0)` 回退一项已按 Java MySQL 语义勘误为「无回退」并落地（§3.2 / §7.3）。**已完成（2026-10-30）**：P1-6 / P1-7 / P1-8 已全部关闭（见 §8），P1 功能性缺口清零；`cargo test -p agentscope-extensions-mysql -j 2` → **98 passed / 0 failed**；剩余 P1 仅真实驱动适配器 + 真实 MySQL 集成测试（环境受限）。
 - **文件清单**（实测 2026-10-26，14 个文件；`src/` 13 个 `.rs` / 3563 行含空行、**3179 行非空**）：
   - `Cargo.toml`（19 行；workspace 依赖：agentscope-core/harness、serde、serde_json、thiserror、async-trait、tokio、tracing、chrono，**另含未被任何源码引用的 `futures`**，见文末勘误；本轮**未新增依赖**）
   - `src/lib.rs`（56）、`src/error.rs`（69）、`src/identifier.rs`（97，**本轮新增**）
@@ -376,3 +377,62 @@ harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sand
 ### 未完成 / 语义差异
 
 - 无留空槽位；仍存在 §3 已登记的 Java 差异（64 字符截断、默认超时 1800s vs 30s），本次未变更。
+  - **更新（2026-10-30）**：64 字符截断已于 §8.3 落地；默认超时 1800s vs 30s 仍未变更（见 §8.6）。
+
+## 8. 2026-10-30 执行记录 — P1-6 / P1-7 / P1-8（MYSQL）
+
+> 范围：只改 `crates/agentscope-extensions-mysql/**` + 本 tracker；未 `git add`/`git commit`，未碰根 `Cargo.toml`、core、harness、其它 extension crate。**未新增任何依赖**。测试全部离线（`InMemory*` 测试双）。
+> 验证：`cargo test -p agentscope-extensions-mysql -j 2` → **98 passed / 0 failed / 0 ignored**（基线 71，+27 用例），EXITCODE=0，无 `^failures:` 段。
+
+### 8.1 P1-6 schema 存在性校验 + `version` 列迁移
+
+- **Java 依据**：`state/MysqlAgentStateStore.java:174-184`（构造期分支）、`:186-213`（`ensureVersionColumn`，`INFORMATION_SCHEMA.COLUMNS` 计数 → `ALTER TABLE ... ADD COLUMN version BIGINT NOT NULL DEFAULT 1`）、`:215-252`（`createDatabaseIfNotExist` / `createTableIfNotExist`，`version BIGINT NOT NULL DEFAULT 0` + `session_id`/`state_key` 的 `COLLATE utf8mb4_bin`）、`:272-296`（`verifyDatabaseExists`）、`:298-320`（`verifyTableExists`）。
+- **改前失败点**：`MysqlAgentStateStore::new()` 用 `let _ = backend.ensure_schema()` **吞掉 DDL 错误**；`create_if_not_exist == false` 时**完全不校验**库/表是否存在；`version` 列是否存在于表上无人过问 → 指向旧库时所有 CAS 读到 0（`get_versioned` 语义错、`saveIfVersion(0)` 走 INSERT 撞重复键）。
+- **改法（缝的形态换了，理由见下）**：`StateBackend` 的 `ensure_schema()` 删除，改为
+  `execute_ddl(&self, sql)` + `database_exists(db)` + `table_exists(db, table)` + `table_columns(db, table)`；
+  DDL 文本由本 crate 生成（与 `store/*Dialect` 的既有做法一致）：`create_database_sql` / `create_sessions_table_sql` / `add_version_column_sql`（均 `pub` 并 re-export）。
+  构造期 `bootstrap_schema()`：`true` → CREATE DATABASE IF NOT EXISTS + CREATE TABLE IF NOT EXISTS；`false` → 先库后表，缺失返回 `MysqlError::Schema` 并带 Java 原文（`Database does not exist: {db}. Use ... to auto-create.` / `Table does not exist: {db}.{table}. ...`）；**两分支末尾都**调 `ensure_version_column`（列探针命中即跳过，幂等）。
+- **与 §7.3「`ensure_schema` 必须建出 `version` 列」的关系**：该契约已由本节的 `create_sessions_table_sql` 承担（`version BIGINT NOT NULL DEFAULT 0`，**照抄 Java**；写路径一律显式写 `1`，迁移路径 `DEFAULT 1` 给存量行回填）。不再有 `ensure_schema`，§4.2 第 5 条描述的是当时形态，现状以本节为准。
+- **破坏性 API 变更（本 crate 内）**：`MysqlAgentStateStore::new(backend)` 由 `-> Self` 改为 `-> MysqlResult<Self>`（不再吞错）；`StateBackend` 4 个新必实现方法。crate 内调用点已全部改（`distributed_store::try_build`、单测 3 处）。
+- **测试**：`auto_create_provisions_database_and_table`、`create_table_ddl_pins_binary_collation_on_key_columns`、`missing_database_is_reported_when_not_auto_creating`、`missing_table_is_reported_when_not_auto_creating`、`legacy_table_gets_the_version_column_migration`、`version_column_migration_is_idempotent`、`existing_version_column_is_left_alone`、`ddl_failure_propagates_when_auto_creating`、`custom_names_flow_into_the_provisioning_ddl`；测试双侧：`create_statements_update_the_modelled_schema`、`create_table_requires_the_database_first`、`alter_adds_the_version_column_once`、`alter_on_an_unknown_table_fails`。
+
+### 8.2 P1-7 快照表自动建表
+
+- **Java 依据**：`snapshot/JdbcSnapshotSpec.java:27-35`（两个构造器**恒传** `initializeSchema=true`）、`snapshot/JdbcRemoteSnapshotClient.java:56-81`（`initSchema`：`CREATE TABLE IF NOT EXISTS`，`snapshot_id VARCHAR(512) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY`、`data LONGBLOB`、`ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC`；**`catch (SQLException) → log.warn`，不抛**）。
+- **改法**：新增 `snapshot_table_ddl(table_name)`（逐字对齐 Java DDL）+ `SnapshotBackend::execute_ddl`；`MysqlRemoteSnapshotClient` 增 `initialize_schema` 字段与 `new_with_schema` / `with_table_and_schema`（`new`/`with_table` 保持 `initializeSchema=false`，对齐 Java 的显式开关）；`MysqlSnapshotSpec::new`/`with_table` 恒走 `*_and_schema`（= Java spec 的 `true`）；DDL 失败**仅 `tracing::warn!`**，构造不失败。
+- **失败口径**：**构造期不上抛**（Java 只 `log.warn`）——与 P1-6 的 state 侧（Java 抛 `RuntimeException`/`IllegalStateException`，Rust 用 `MysqlError::Schema`）刻意相反，勿「统一」。
+- **测试**：`snapshot_ddl_matches_the_java_statement`、`spec_issues_the_table_ddl_on_construction`、`spec_with_table_issues_ddl_for_the_custom_table`、`ddl_failure_is_logged_not_raised`、`client_without_initialize_schema_emits_no_ddl`；测试双侧 `ddl_is_recorded_and_can_be_made_to_fail`。
+
+### 8.3 P1-8 `GET_LOCK` 锁名 64 字符截断 + `key_prefix` 归一化
+
+- **Java 依据**：`sandbox/JdbcSandboxExecutionGuard.java:99-107`（`composeLockName`：`if (raw.length() <= 64) return raw; int hash = raw.hashCode(); return raw.substring(0, 50) + ":" + Integer.toHexString(hash);`）、`:155-161`（`Builder.keyPrefix`：`isBlank()` → `IllegalArgumentException("keyPrefix must not be blank")`，缺尾 `:` 自动补）。
+- **改法**：`java_string_hash_code`（UTF-16 code unit 上 `h*31+c` 的 `i32` wrapping）与 `truncate_lock_name`（Java `toHexString` = `format!("{:x}", hash as u32)`，负数 8 位无符号）；`compose_lock_name` 组装后统一截断（`sub_key` 为 Rust 侧扩展，一并参与截断）。`key_prefix` 归一化：`try_key_prefix`（空白 → `MysqlError::InvalidArgument("keyPrefix must not be blank")`），`key_prefix` 委托并 `expect`（Java 抛异常，对应 panic；构造器 builder 非 `Result`，保持既有风格）。
+- **金标向量（独立来源）**：直接跑 **真实 Java 24**（`java LockNameGold2.java`，独立于 Rust 实现）得到，硬编码进测试：
+  - 65 字符（`...user:` + 36×`y`）→ `hashCode = -189878914` → `f4aead7e`
+  - 68 字符（39×`y`）→ `-210677989` → `f3714f1b`；89 字符（60×`x`）→ `798084414` → `2f91cd3e`
+  - `"polygenelubricants"` → `Integer.MIN_VALUE` → `80000000`；`"abc"` → `96354`；`""` → `0`
+  - 64 字符边界原样返回（`agentscope:sandbox:lock:` 24 + `user:` 5 + 35×`y`）
+- **测试**：`java_string_hash_code_matches_java_gold_values`、`compose_lock_name_keeps_names_at_the_limit`、`compose_lock_name_truncates_over_the_limit`、`compose_lock_name_uses_unsigned_hex_for_negative_hash`、`truncated_names_never_exceed_the_limit`、`key_prefix_is_normalised_with_a_trailing_colon`、`blank_key_prefix_is_rejected`。
+
+### 8.4 反向验证（逐项回退实现 → 确认 FAILED → 恢复）
+
+| # | 回退动作 | 观测 |
+|---|---|---|
+| 1 | `truncate_lock_name` 开头加 `if true { return raw.to_string() }` | `guard::tests` → **FAILED 12 passed / 3 failed**：`compose_lock_name_truncates_over_the_limit`、`compose_lock_name_uses_unsigned_hex_for_negative_hash`、`truncated_names_never_exceed_the_limit` |
+| 2 | `MysqlRemoteSnapshotClient::init_schema` 开头提前 `return` | `snapshot::tests` → **FAILED 7 passed / 3 failed**：`spec_issues_the_table_ddl_on_construction`、`spec_with_table_issues_ddl_for_the_custom_table`、`client_without_initialize_schema_emits_no_ddl` |
+| 3 | `bootstrap_schema` 的 `database_exists` 校验短路（`if false && ...`） | `state::tests` → **FAILED 27 passed / 1 failed**：`missing_database_is_reported_when_not_auto_creating` |
+| 4 | `ensure_version_column` 开头提前 `return Ok(())` | `state::tests` → **FAILED 26 passed / 2 failed**：`legacy_table_gets_the_version_column_migration`、`version_column_migration_is_idempotent` |
+
+恢复后复跑全量：`cargo test -p agentscope-extensions-mysql -j 2` → **98 passed / 0 failed**（`^failures:` 段不存在）。
+
+### 8.5 改动文件
+
+`crates/agentscope-extensions-mysql/src/{lib.rs,guard/mod.rs,snapshot/mod.rs,snapshot/testing.rs,state/mod.rs,state/testing.rs}`（`Cargo.toml` **未改**，无新增依赖）；本 tracker。
+
+### 8.6 未完成项与原因
+
+1. **真实驱动适配器**（P1，环境/依赖受限）：`StateBackend` 新增的 4 个方法、`SnapshotBackend::execute_ddl` 均**未**有 `mysql_async`/`sqlx` 实现；本 crate 不引入重依赖（§2.1 决策）。接入时 state 侧需把 `execute_ddl` 映射到 `Statement::execute`、三个探针映射到 `INFORMATION_SCHEMA` 查询；snapshot 侧 `execute_ddl` 直接执行传入的 `CREATE TABLE`。
+2. **真实 MySQL 集成测试**（P1，环境受限）：同上，仍需实例。
+3. **默认锁超时 30s vs Java 1800s**（P2，**未改，有意**）：本 crate 的 `MysqlSandboxExecutionGuard` 目前由 harness `SandboxGuard::try_enter` 调用（无超时入参），把默认值抬到 1800s 会让锁竞争路径静默阻塞 30 分钟；应连同 `MysqlDistributedStoreBuilder` 的超时配置面与 harness 侧接线一起改，属跨模块议题（记 §4.2）。
+4. **`tracing` 日志（P2）**：本轮已在快照建表失败点启用 `tracing::warn!`（Java `log.warn` 对齐），其余 Java 日志点（store 构建、guard 获取/释放的 `log.debug`）仍未补。
+5. 其余 P2（状态 key 长度校验、`truncateAllSessions`、锁超时）未动，见 §3.2。

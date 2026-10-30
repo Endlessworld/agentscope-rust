@@ -48,13 +48,13 @@
 | 1 | MODEL | 进行中（P0 已清零；dashscope 加密与会话合并、ollama 多智能体、`AnthropicServerTool`、openai-official Phase 2 均已闭环） | ~9 / ~7 | 382 |
 | 2 | PROTOCOL | **已完成**（P1 清零，余 P2）（引导层、`AgentExecuteProperties`、`AgentRegistry`、`TransportWrapper*`、A2A 真 SSE、`ProcessResult::interrupt`、`WorkspaceProtocolTaskRepository`、**A2A per-task runner 体系**、**agui `adapterFactory`** 均已落地；`A2aAgent` 门面仍为 P2 未迁移——被 core/harness seam 阻塞，见 §4.17） | 0 / ~6 | 353（5 子 crate + facade 合计） |
 | 3 | RAG | **已完成**（P1 清零，余 P2）（外部向量库 4/4 + HTTP embedding 三 provider + reader 辅助已落地） | 0 / 4 | 436 |
-| 4 | SANDBOX | 进行中（K8s 文件 API、E2B 原生传输、三连接策略、codec 默认 Json 均已落地） | ~6 / ~5 | 176 |
+| 4 | SANDBOX | **已完成**（P1 清零，2026-10-30；余已记差异 + P2）（K8s 文件 API、E2B 原生传输、**4/4 连接策略（含 PortForward seam）**、**`SandboxFilesystemSpec` guard + workspace projection** 均已落地；`Gateway` 无 watch / K8s list·watch 未迁移仍为已记差异，见 §4.18） | 0 / ~4 | 188 |
 | 5 | CHANNEL | **已完成**（代码缺口 0；仅剩真实租户联调，非代码缺口） | 0 / 0 | 399 |
 | 6 | MEM | 进行中（`api_base_url` 校验 / connect 超时 / DTO 单测已补；余吞错口径裁定 + P2 清理） | 3 / ~9 | 96 |
 | 7 | JDBC | 进行中（skill 仓库已闭环；**2026-10-29 核实**：原生锁 seam 就绪但生产零调用 → 降 P2；`in_transaction` 改记为「新增后端前置约束」） | 2 / ~7 | 217 |
 | 8 | REDIS | 进行中（`save_if_version(0)` 真 CAS、SCAN 游标用例、`CLUSTER SLOTS` 拓扑扇出已落地） | 1 / 3 | 148 + 2 doc |
 | 9 | MONGODB | 进行中（`ttl_days` / `database_name` 丢弃已修；级联删快照已走真实 harness 写入方，见 §4.15.4） | 1 / ~7 | 82 |
-| 10 | MYSQL | 进行中（列表哈希 / CAS 原子性 / 标识符校验 / 空列表语义已闭环） | 4 / ~6 | 71 |
+| 10 | MYSQL | 进行中（**P1-6/P1-7/P1-8 已闭环**：schema 校验 + `version` 列迁移、快照表自动建表、`GET_LOCK` 锁名 64 字符截断；**余 P1 = 真实驱动适配器 + 真实 MySQL 集成测试**（环境受限）） | 1 / ~6 | 98 |
 | 11 | POSTGRESQL | **已完成**（P1 清零）（`DEFAULT 1` + 0→1 CAS 回退、MurmurHash3 锁 key、`create_if_not_exist=true`、**advisory lock 每租约独占会话**、**`save_list` 写事务** 均已闭环；余 P2 + 真实 PG 集成测试（环境受限），见 §4.17） | 0 / ~5 | 123 |
 | 12 | COS | **已完成**（本 crate P1 清零；core 跨模块的 per-key delete 也已落地）（真实 COS v5 签名适配器 + 分段上传 + 预签名 + STS 已落地） | 0 / ~7 | 107 + 3 doc |
 | 13 | OSS | **已完成**（P1 清零，余 P2）（`s3` feature + 分页 / `search_strict` / `delete_key` / DistributedStore 投影已闭环） | 0 / ~8 | 61 + 1 doc（默认）/ 74 + 2（`--features s3`） |
@@ -65,7 +65,7 @@
 | 18 | TRAINING | **已完成**（代码面 P1 清零，余 live 联调）（**P0-2 已闭环**：adapter 强制 `stream=false` + MODEL 非流式分支齐备） | 0 / 3 | 74 |
 | 19 | NACOS | 进行中（`SecuritySchemeConverterUtil`、`supportedInterfaces`、prompt 空串、skill 校验、A2A 类型复用均已闭环） | 1 / ~6 | 70 |
 | 20 | HIGRESS | **已完成**（P1 清零，余 P2）（`initialize()` 真建连、`call_tool_with_meta`、`outputSchema`、`registration()` 已闭环） | 0 / ~7（+2 待裁定） | 57 + 1 doc |
-| 21 | JUDGE | 进行中（**P0 已清零**：`JevClient` / `OpenAIDecisionsClient`；jev 42 类 = 完整 32 / 部分 8 / 骨架 2） | 4 / ~4 | 286 |
+| 21 | JUDGE | 进行中（**2026-10-30**：四个中间件 hook（trace / response / supervision / phase routing）、`@Tool` 注册（evidence / knowledge / code_review）、`StoreJevContextArchive`（harness `BaseStore`）均已落地） | 4 / ~4 | 308 |
 
 **跳模块仍待裁定（非模块内可解）**：仅剩 ⑤ MODEL 的 `anthropic` vs `anthropic_async`、`responses` vs `openai_official` 双实现取舍（见 §4.15.6）。
 
@@ -924,3 +924,42 @@ cargo check -p agentscope-extensions-postgresql --features postgres-driver -j 2 
 ```
 
 **汇总口径变化**：PROTOCOL 3 / ~7 → **0 / ~6**（414 → 353 测试，按 5 子 crate + facade 实测合计）；POSTGRESQL 3 / ~6 → **0 / ~5**（115 → 123）。两者按「P1 清零 = 已完成」口径进 `已完成` 组；`A2aAgent` 门面与 PG 真实集成测试仍明确记为未迁移/环境受限，**未借勘误降级**。
+
+---
+
+## 4.18 2026-10-30 执行记录（MYSQL / SANDBOX / JUDGE 三模块并行）
+
+> 三个子智能体并行，写入范围互不重叠（各只写自己的 crate + 自己的 tracker），主智能体统一复跑测试并提交。
+> 子智能体均未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 extension crate。
+
+| 模块 | 本轮完成 | 提交 | 测试 | 状态口径 |
+|---|---|---|---|---|
+| MYSQL | P1-6 schema 校验 + `version` 列迁移、P1-7 快照表自动建表、P1-8 `GET_LOCK` 锁名 64 字符截断（+ `key_prefix` 归一化） | `660849b` | 71 → **98** | 进行中（余 P1 = 真实驱动适配器 + 真实 MySQL 集成测试） |
+| SANDBOX | `PortForwardStrategy`（`KubernetesPortForwarder` seam，未注入即报错不降级）、`SandboxFilesystemSpec` 的 `executionGuard` / `workspaceProjectionEnabled` / `workspaceProjectionRoots` + `__workspace_projection__` 真写入 `LayoutSpec.entries` | `86d56a9` | 177 → **188** | 已完成（P1 清零，保留差异见下） |
+| JUDGE | `jev::runtime` 新模块：`StoreJevContextArchive`（harness `BaseStore`）、`@Tool` 注册（evidence / knowledge / code_review）、四个中间件 hook（trace / response / supervision / phase routing） | `605099a`（judge 代码） | 286 → **308** | 进行中（P1 未清零，剩余见下） |
+
+### 4.18.1 关键实现决定
+
+- **MYSQL 锁名截断**：Java `Integer.toHexString(name.hashCode())` 的 32 位有符号整型溢出与负数 8 位无符号 hex 语义**精确复刻**；金标向量由**真实 Java 24 独立跑出**（65 → `f4aead7e`、68 → `f3714f1b`、89 → `2f91cd3e`、`polygenelubricants` → `80000000`），不用实现自身反推。
+- **MYSQL 失败口径刻意不统一**：state 构造期 DDL / 存在性校验失败**上抛**（`MysqlError::Schema`，带 Java 原文）；snapshot 建表失败**仅 `tracing::warn`**（Java 只 `log.warn`）。**不要「统一」这两处**。
+- **MYSQL 破坏性变更（crate 内，无外部使用者）**：`MysqlAgentStateStore::new()` → `MysqlResult<Self>`；`StateBackend::ensure_schema()` 拆为 `execute_ddl` + `database_exists`/`table_exists`/`table_columns`；`SnapshotBackend` 新增必实现 `execute_ddl`。
+- **SANDBOX 不静默降级**：选 `PortForward` 但未注入 `port_forwarder` 时返回 `Configuration` 错误（不回落到 `InCluster`）；默认策略仍为 `InCluster`（Java 在该场景默认为 port-forward，差异已在代码文档与 tracker 注明）。
+- **JUDGE 首次引入 core/harness 依赖**：仅 `jev::runtime` 使用（`BaseStore` / `Tool` / `Middleware`），纯函数层保持独立；中间件只用 harness **已存在**的 `on_agent` / `on_model_call`，未改 harness。测试当场抓到真实缺陷：restriction 漏判 `options.model_name`（pinned），已修。
+
+### 4.18.2 验证与反向验证
+
+```
+cargo test -p agentscope-extensions-mysql -p agentscope-extensions-sandbox -p agentscope-extensions-judge -j 2
+ -> judge 308 / mysql 98: 0 failed
+ -> sandbox: 见下方 flaky 说明
+```
+
+反向验证（子智能体执行、主智能体复核）：MYSQL 4 组（截断 / DDL / 存在性校验 / version 迁移）、SANDBOX 3 组（无 forwarder 回落 / 投影条目恒 None / guard 恒 None）、JUDGE 3 组（archive create-if-absent 回读 / snapshot id 恒拒 / ENFORCE 恒不拦截）。
+
+> **⚠️ SANDBOX e2b httpmock 用例存在既有 flaky**：`e2b::tests::{persist_native_snapshot_records_id_and_applies_retention, persist_tar_uses_envd_files_instead_of_base64_over_exec, hydrate_tar_uploads_the_archive_before_extracting}` 在机器高负载 / 多份 cargo 并发时偶发 `0 of 1 expected requests matched the mock specification`（每次失败的用例不同，单跑稳定，`e2b.rs` 本批未改动）。**后续需单独稳定化**（隔离 httpmock 端口或串行化该组用例），不计入本批回归失败。
+
+### 4.18.3 未完成 / 保留差异（不得静默降级）
+
+- **MYSQL**：真实驱动适配器（`mysql_async`/`sqlx`）与真实 MySQL 集成测试（环境受限）；默认锁超时 30s vs Java 1800s（P2，改默认值会静默阻塞 30 分钟，属跨模块议题）。
+- **SANDBOX**：`Gateway` 仍一次性读 CRD（无 watch）；`K8sHelper` 的 list/watch/模板能力与 `listSandboxClaims`/`listActiveSandboxes`/`deleteAll` 未迁移；真实隧道实现（kube-rs / `kubectl port-forward`）仅留 seam。
+- **JUDGE**：`JevPhaseRouting::resolve()` 仍 fail-closed（缺 `routes()` 访问器 + route offer 组装/二次校验）；`JevCodeReviewer` 六阶段驱动（`CodeReviewDriver` 缝 + fail-closed 兜底）；`JevStageRouter`（依赖未迁的 `example`）；`JevResponseMiddleware` 的 quality/reviser 分支；`JevGuardrail::screen` reactive caller 与 `JevConfirmedCalls`。
