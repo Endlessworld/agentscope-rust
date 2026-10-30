@@ -46,7 +46,7 @@
 | # | 模块 | 当前真实状态 | 剩余 P1 / P2 | 测试数 |
 |---|---|---|---|---|
 | 1 | MODEL | 进行中（P0 已清零；dashscope 加密与会话合并、ollama 多智能体、`AnthropicServerTool`、openai-official Phase 2 均已闭环） | ~9 / ~7 | 382 |
-| 2 | PROTOCOL | 进行中（引导层、`AgentExecuteProperties`、`AgentRegistry`、`TransportWrapper*`、A2A 真 SSE、`ProcessResult::interrupt`、`WorkspaceProtocolTaskRepository` 均已落地） | 3 / ~7 | 414（5 子 crate + facade 合计） |
+| 2 | PROTOCOL | **已完成**（P1 清零，余 P2）（引导层、`AgentExecuteProperties`、`AgentRegistry`、`TransportWrapper*`、A2A 真 SSE、`ProcessResult::interrupt`、`WorkspaceProtocolTaskRepository`、**A2A per-task runner 体系**、**agui `adapterFactory`** 均已落地；`A2aAgent` 门面仍为 P2 未迁移——被 core/harness seam 阻塞，见 §4.17） | 0 / ~6 | 353（5 子 crate + facade 合计） |
 | 3 | RAG | **已完成**（P1 清零，余 P2）（外部向量库 4/4 + HTTP embedding 三 provider + reader 辅助已落地） | 0 / 4 | 436 |
 | 4 | SANDBOX | 进行中（K8s 文件 API、E2B 原生传输、三连接策略、codec 默认 Json 均已落地） | ~6 / ~5 | 176 |
 | 5 | CHANNEL | **已完成**（代码缺口 0；仅剩真实租户联调，非代码缺口） | 0 / 0 | 399 |
@@ -55,7 +55,7 @@
 | 8 | REDIS | 进行中（`save_if_version(0)` 真 CAS、SCAN 游标用例、`CLUSTER SLOTS` 拓扑扇出已落地） | 1 / 3 | 148 + 2 doc |
 | 9 | MONGODB | 进行中（`ttl_days` / `database_name` 丢弃已修；级联删快照已走真实 harness 写入方，见 §4.15.4） | 1 / ~7 | 82 |
 | 10 | MYSQL | 进行中（列表哈希 / CAS 原子性 / 标识符校验 / 空列表语义已闭环） | 4 / ~6 | 71 |
-| 11 | POSTGRESQL | 进行中（`DEFAULT 1` + 0→1 CAS 回退、MurmurHash3 锁 key、`create_if_not_exist=true` 已闭环） | 3 / ~6 | 115 |
+| 11 | POSTGRESQL | **已完成**（P1 清零）（`DEFAULT 1` + 0→1 CAS 回退、MurmurHash3 锁 key、`create_if_not_exist=true`、**advisory lock 每租约独占会话**、**`save_list` 写事务** 均已闭环；余 P2 + 真实 PG 集成测试（环境受限），见 §4.17） | 0 / ~5 | 123 |
 | 12 | COS | **已完成**（本 crate P1 清零；core 跨模块的 per-key delete 也已落地）（真实 COS v5 签名适配器 + 分段上传 + 预签名 + STS 已落地） | 0 / ~7 | 107 + 3 doc |
 | 13 | OSS | **已完成**（P1 清零，余 P2）（`s3` feature + 分页 / `search_strict` / `delete_key` / DistributedStore 投影已闭环） | 0 / ~8 | 61 + 1 doc（默认）/ 74 + 2（`--features s3`） |
 | 14 | CONTROLPLANE | **已完成**（P1 清零，余 P2 / 待裁定）（native session-log、按会话 ack、`replanRun` / `signalRun` / artifact 上传下载均已落地） | 0 / ~7 | 144 + 4 |
@@ -881,3 +881,46 @@ async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -
 
 验证：`cargo test -p agentscope-extensions-jdbc -j 2` → 217 passed / 0 failed（12 个 test target）；
 `cargo doc -p agentscope-extensions-jdbc --no-deps` EXIT=0（仅 3 处既有 unresolved link 警告，与本轮无关）。
+
+---
+
+## 4.17 2026-10-30 执行记录（PROTOCOL / POSTGRESQL 两模块并行）
+
+> 两个子智能体并行，写入范围互不重叠（`a2a-server`/`agui` 一侧，`postgresql` 一侧），主智能体统一复跑测试并提交。
+> 子智能体均未改根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 extension crate。
+
+### 4.17.1 PROTOCOL：关闭最后两项 P1（`4f0f329`）
+
+| 项 | 结果 | 文件 |
+|---|---|---|
+| A2A 服务端 runner 体系 1:1 | **已完成** | 新增 `a2a-server/src/runner.rs`（`TaskAgent`/`TaskAgentFactory`/`BaseReActAgentRunner`/`ReActAgentWithBuilderRunner`，`CacheGuard` 复刻 Java `doFinally`，`stop` 先 remove 再 `interrupt`，实现既有 `AgentRunner`） |
+| `AguiRequestProcessorBuilder#adapterFactory` | **已完成** | `agui/src/processor/request_processor.rs`（默认 `DefaultAguiAgentAdapterFactory`，`process()` 改走 factory） |
+| `A2aAgent` / `A2aAgentConfig` 门面 | **仍为 P2 未迁移（不写半成品）** | 评估结论写 PROTOCOL tracker §9.3：缺 `agent_state_for(session)`、异步 interrupt 通道、toolkit 视图、结构化输出远端语义、`client/agent/event/*` Handler 体系 |
+
+- 测试：a2a-server 47 → **57**，agui 191 → **192**，a2a-client 40 / facade 0 不变 ⇒ 合计 **353**。
+- 反向验证 2 组：`stop` 改为中断全部缓存 agent → 2 用例 FAILED；`CacheGuard::drop` 改 no-op → 5 用例 FAILED。
+- 偏差（非缺口）：Rust `ReActAgentBuilder::build` 消费 builder ⇒ 工厂用闭包；重复 taskId 在增量路径以流内首个 `Err` 上报；查重与插入在同一锁内完成（Java 有竞态）。
+
+### 4.17.2 POSTGRESQL：关闭两项正确性/原子性缺口（`c9dc756`）
+
+| 项 | 结果 |
+|---|---|
+| advisory lock **会话归属**（§3.3 待确认项，实为正确性风险） | **已完成**：`PostgresClient::open_lock_session()` + `PostgresLockSession`（`try_lock`/`unlock`/`close`），**默认显式返回 `DriverUnavailable`**，不再假装加锁成功；driver 保存 `Config` 为每租约开专用连接（`close` 关连接 = 服务端释放该会话全部锁）；`MemoryClient` 建模真实会话语义（同会话可重入、异会话互斥） |
+| `save_list_sync` 三步非原子 | **已完成**：新增 `PostgresClient::execute_in_transaction(&[SqlStatement])`（能力式批量，非 async 闭包，保持 object-safe），默认显式失败；`save_list` 全量重写与追加两条路径均改走事务（对齐 Java `executeInWriteTransaction`） |
+| 既有缺陷（顺带修复） | `tokio-postgres` 缺 `runtime` feature ⇒ `--features postgres-driver` **此前完全无法编译**；已补并实测通过 |
+
+- 测试：115 → **123**（0 failed / 0 ignored），`--features postgres-driver` 同样 123/0。
+- 反向验证 3 组：会话 token 固定（等价共享连接）→ 互斥用例 FAILED；`unlock` 不释放 → 重入用例 FAILED；事务不回滚 → 2 个 rollback 用例 FAILED。
+- 残留（P2 / 环境）：真实 PG 集成测试、`tracing` 埋点、`MemoryClient` 门控、组合者形态、`to_core`/`created_at` 死代码。
+
+### 4.17.3 主智能体复核
+
+```
+cargo test -p agentscope-extensions-postgresql -p agentscope-extensions-a2a-server \
+           -p agentscope-extensions-agui -p agentscope-extensions-protocol \
+           -p agentscope-extensions-a2a-client -j 2
+ -> 123 / 57 / 192 / 0 / 40 passed; 0 failed; 0 ignored  (EXIT=0，无 failures: 段)
+cargo check -p agentscope-extensions-postgresql --features postgres-driver -j 2 -> EXIT=0
+```
+
+**汇总口径变化**：PROTOCOL 3 / ~7 → **0 / ~6**（414 → 353 测试，按 5 子 crate + facade 实测合计）；POSTGRESQL 3 / ~6 → **0 / ~5**（115 → 123）。两者按「P1 清零 = 已完成」口径进 `已完成` 组；`A2aAgent` 门面与 PG 真实集成测试仍明确记为未迁移/环境受限，**未借勘误降级**。

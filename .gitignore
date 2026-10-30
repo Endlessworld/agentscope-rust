@@ -1,4 +1,6 @@
+.idea
 .agentscope
+.openidea
 agents
 /target/**
 /MEMORY.md

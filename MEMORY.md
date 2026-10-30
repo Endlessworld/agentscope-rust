@@ -438,3 +438,13 @@
 - 分提交踩坑：commit 3 与 commit 4 若按「core react_agent 先 / core/session RecordingPolicy 后」拆，会互相引用对方的类型（`RecordingPolicy` 定义在后、`record_model_requests()` 装配在前）→ 中间提交不编译；最终合并成一个提交才自洽。结论：**互相依赖的类型/装配改动必须同一提交**，拆提交前先确认「谁定义、谁调用」。
 - `git apply --cached --unidiff-zero` 部分暂存可用，但**会把 +N 行插到 hunk 头声明的行号处**：结构体字面量新增字段若原 hunk 行号有偏移，字段会插到别的位置（编译无影响、语义不变），后续提交再「移动」它就会多出 +1/-1 噪声。部分暂存后应 `git show <commit>:<file>` 抽查字节。
 - `acp_interrupted_turn_test::a_cancelled_turn_does_not_block_the_next_prompt` 曾在 `cargo test -j 2` 全量并行下挂死 60s+，单独/串行/8 次循环均 1.0s 通过（8/8）——属负载下偶发，**不是 `report_turn_memory` 的 bug**（去掉调用后的那次通过是环境巧合）。判 flaky 前先 `Start-Process` 循环跑目标测试二进制 8 次。
+
+- 2026-10-30：`docs/session-journal-compaction-design.md` 的 S1–S4 方案经代码核实已全部落地（core `src/session/{snapshot,journal,views,recorder,export,storage}.rs` + harness `agent/session/storage.rs::remove`；`cargo test -p agentscope-core --lib session::` = 143 passed / 0 failed）。该设计文档已删除并 `git stage`（D 状态）。MEMORY 中「P0-2 方案（未实现）」的旧条目作废，以实现要点条目为准。S4 的 transcript tool-result 摘要化按原文属未实现的产品决策，不算缺口。
+
+- 2026-10-30 批次（两子智能体并行）：PROTOCOL 与 POSTGRESQL 均 **P1 清零 → 已完成**。提交 `4f0f329` feat(protocol) / `c9dc756` fix(postgresql) / `8c52a37` docs(extensions)。
+- PROTOCOL：新增 `crates/agentscope-extensions-a2a-server/src/runner.rs`（`TaskAgent`/`TaskAgentFactory`/`BaseReActAgentRunner`/`ReActAgentWithBuilderRunner`，`CacheGuard` 复刻 Java `doFinally`，`stop` 先 remove 再 `interrupt`）；agui `AguiRequestProcessorBuilder#adapter_factory` 接线（默认 `DefaultAguiAgentAdapterFactory`）。`A2aAgent`/`A2aAgentConfig` 评估结论：**不做**（P2，被 core/harness seam 阻塞：缺 `agent_state_for(session)`、异步 interrupt 通道、toolkit 视图、结构化输出远端语义、`client/agent/event/*` Handler 体系），见 PROTOCOL tracker §9.3。
+- POSTGRESQL：`PostgresClient::open_lock_session()` + `PostgresLockSession`（try_lock/unlock/close）默认显式 `DriverUnavailable`；driver 保存 `tokio_postgres::Config`，每租约开专用连接；`MemoryClient` 建模真实会话语义（同会话可重入、异会话互斥）。`save_list` 两条路径改走 `execute_in_transaction(&[SqlStatement])`（能力式批量，非 async 闭包）。**顺带修既有缺陷**：`tokio-postgres` 缺 `runtime` feature → `--features postgres-driver` 此前根本无法编译。
+- 实测基线（2026-10-30）：postgresql **123**、a2a-server **57**、agui **192**、a2a-client **40**、protocol 0（合计 353）；`--features postgres-driver` 123/0；`cargo check --features postgres-driver` EXIT=0。
+- 汇总 tracker 口径：PROTOCOL 3/~7 → **0/~6**（测试 414 → 353 实测合计）、POSTGRESQL 3/~6 → **0/~5**（115 → 123）；独立 tracker 的 §1 总判统一为「已完成（P1 清零）」，环境受限项（真实 PG 集成测试）不阻塞已完成。
+- 提交技巧（本轮新用）：并发会话已把若干 docs 删除**放进了 index**，用 `git commit -- <pathspec>` 做部分提交可避开他人 staged 内容（先 `git stage` 自己的文件即可，untracked 新文件会被带入）。
+- JDBC 交接建议的 `JdbcDistributedStore::native_lock_guard(flavor)` 便捷入口**已判定为重复**：`NativeLockGuard::from_executor(executor, flavor)` 早已存在（`sandbox/native_lock_guard.rs:224`），按「不写投机性代码」原则未加。

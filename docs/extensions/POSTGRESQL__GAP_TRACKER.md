@@ -19,9 +19,9 @@
 | Java 子模块 | （单模块：`root` + `sandbox` / `snapshot` / `state` / `store` 四个子包） |
 | Java 规模（实测 2026-10-22） | 主代码 **1589** 行（**6** 个类）/ 测试 **1604** 行（**5** 个测试类，**148** 个 `@Test`） |
 | Rust crate | `crates/agentscope-extensions-postgresql` |
-| Rust 规模（实测 2026-10-28） | `src/` **13** 个文件（新增 `murmur3.rs`）/ **115** 个测试属性（`#[test]` 84 + `#[tokio::test]` 31，见 §4.1） |
+| Rust 规模（实测 2026-10-28） | `src/` **13** 个文件（新增 `murmur3.rs`）/ **115** → **123** 个测试属性（2026-10-30 复测，见 §9；分布 `state` 40 / `sql` 19 / `store` 19 / `snapshot` 16 / `guard` 16 / `distributed` 8 / `murmur3` 5） |
 | 迁移波次 | B |
-| 当前状态 | **总判：进行中**（仍有 P1：advisory lock 会话归属 / 事务原子性 / 集成测试）—— **已完成 P0 骨架/组件接线 + 离线测试覆盖（build 通过，115 passed / 0 failed）；P1 语义偏差 4 项已全部关闭（见 §3.2），剩余 P2 待确认项见 §3.3、§4.2** |
+| 当前状态 | **总判：已完成（P1 清零，2026-10-30）**—— P0 骨架/组件接线 + 离线测试覆盖完成（**2026-10-30 实测 123 passed / 0 failed / 0 ignored**，见 §9）；§3.2 的 4 项 P1 语义偏差已于 10-28 关闭，10-30 又关闭「advisory lock 会话归属」与「`save_list_sync` 事务原子性」（§9）。**剩余仅为真实 PostgreSQL 集成测试（环境受限，非代码缺口）与 §3.3 / §4.2 的 P2 项** |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -72,7 +72,7 @@
 | `saveIfVersion(..., 0)` 的「0→1 回退」分支 | 同上 `:375-387` | **已完成（2026-10-22 实现，2026-10-28 复核确认）** | Java 在 `expectedVersion==0` 时先 `insertIfAbsent`，若返回 `UNVERSIONED` 则再 `updateIfVersion(..., 0L)` 把迁移后仍为 0 的旧行抬到 1。Rust `state.rs::save_if_version`（现 `:314-339`）在 `DO NOTHING` 影响 0 行时**不再直接返回 `UNVERSIONED`**，而是继续走通用 CAS 分支（`version = 0 -> 1`），对应用例 `save_if_version_zero_falls_back_to_cas_for_backfilled_row`（`:1015`）；与 `DEFAULT 1` 合计已消除「`version=0` 历史行对 `save_if_version(...,0)` 永久幻影冲突」 |
 | `Builder.createIfNotExist` 的**默认值** | 同上 `:799`（Java `private boolean createIfNotExist = true;`） | **已完成（2026-10-28）** | **已对齐 Java**：`state.rs` 的 `PostgresAgentStateStoreBuilder::new` 现默认 `create_if_not_exist: true`，故 `builder(client).build()` 在空库上自动 `CREATE SCHEMA/TABLE`（等价 Java builder），构造器语义的「只校验不建表」由显式 `create_if_not_exist(false)` 表达。新增用例 `builder_defaults_to_create_if_not_exist` / `builder_default_auto_create_applies_to_custom_schema`；三个旧断言 `build_without_auto_create_fails_when_schema_missing` / `_table_missing` / `build_succeeds_when_schema_and_table_already_exist` 补 `create_if_not_exist(false)`（它们是 Java **构造器**默认（false）的等价用例，原写法的隐含默认已不存在，断言本身未放宽）。同类字段核对：`PostgresStoreBuilder::initialize_schema` 默认 `false` ↔ Java `PostgresBaseStore.Builder.initializeSchema`（`private boolean initializeSchema;`）一致；guard builder 无此类字段；快照为显式构造参数 |
 | `initSchema()` 失败**仅告警不抛错** | `snapshot/PostgresRemoteSnapshotClient.java:61-78` | **已完成（2026-10-28）** | **已对齐 Java**：`snapshot.rs::with_table` 在 `initialize_schema=true` 时改为 `if let Err(e) = ... { tracing::warn!(table, error = %e, "failed to initialize snapshot table; ...") }`，构造不再上抛（`PostgresSnapshotSpec::new` / `postgres_snapshot_spec*` 随之可用），并保留底层 message（`error = %e`）。新增用例 `constructor_tolerates_schema_init_failure`（DDL 失败的 fake client 下 4 条构造路径均成功、表名校验仍生效）。**刻意不一刀切**：`state` 的 `CREATE SCHEMA/TABLE` 与 `ensureVersionColumn`（Java `:155-186`/`:137-153` 均 `throw RuntimeException`）、`store` 的 `initializeSchema`（Java `PostgresBaseStore:175-188` `throw IllegalStateException`）、以及显式函数 `initialize_snapshot_table`（无条件上抛，用例 `explicit_initialize_helper_still_reports_failures`）保持上抛——Java 侧只有 snapshot 构造器这一处只告警 |
-| Java 用例的**未覆盖清单**（147 个 `@Test` 中 53 个无 Rust 对应用例） | 见 §3.2 末「Java→Rust 用例覆盖差异」 | **待办（P2）** | 缺口集中在三类，均属 **Java 侧 Mockito 专属**（Rust 无 mock 框架，等价覆盖已由 trait fake 承担）：① **SQL 失败路径**（`getThrowsWhenSqlFails` / `putThrowsWhenSqlFails` / `deleteThrowsWhenSqlFails` / `searchThrowsWhenSqlFails` / `uploadThrowsWhenSqlFails` / `downloadThrowsWhenSqlFails` / `existsThrowsWhenSqlFails` / `saveListThrowsWhenSqlFails` 等，Rust 侧仅 `state.rs` 有 `query_failures_surface_through_inherent_methods` / `truncate_propagates_sql_errors` / `build_propagates_batch_failures` 少量覆盖，`store`/`snapshot`/`guard` 缺）；② **JDBC 异常包装细节**（`getPropagatesResultSetCloseFailure` / `tryEnterPropagatesResultSetCloseFailure` / `tryEnterHandlesInnerSQLExceptionAndCloseFailure` / `leaseCloseHandlesConnectionCloseFailure` / `rollbackFailureIsAddedAsSuppressed`）；③ **null 参数拒绝**（`uploadRejectsNullData` / `existsRejectsNullSnapshotId` / `namespaceSegmentCannotBeNull` / `rejectsNullDataSourceInConstructor`）。另有 **Java 事务语义未迁移**（`executeInWriteTransactionRollsBackOnException` / `executeInWriteTransactionKeepsAutoCommitWhenAlreadyDisabled`）——Rust `PostgresClient` seam 无事务抽象，`state.rs` 的多语句写为**非原子**（`save_list_sync` 的 delete+insert+hash 三步无事务保护），与 Java `executeInWriteTransaction` 不同 |
+| Java 用例的**未覆盖清单**（147 个 `@Test` 中 53 个无 Rust 对应用例） | 见 §3.2 末「Java→Rust 用例覆盖差异」 | **待办（P2）** | 缺口集中在三类，均属 **Java 侧 Mockito 专属**（Rust 无 mock 框架，等价覆盖已由 trait fake 承担）：① **SQL 失败路径**（`getThrowsWhenSqlFails` / `putThrowsWhenSqlFails` / `deleteThrowsWhenSqlFails` / `searchThrowsWhenSqlFails` / `uploadThrowsWhenSqlFails` / `downloadThrowsWhenSqlFails` / `existsThrowsWhenSqlFails` / `saveListThrowsWhenSqlFails` 等，Rust 侧仅 `state.rs` 有 `query_failures_surface_through_inherent_methods` / `truncate_propagates_sql_errors` / `build_propagates_batch_failures` 少量覆盖，`store`/`snapshot`/`guard` 缺）；② **JDBC 异常包装细节**（`getPropagatesResultSetCloseFailure` / `tryEnterPropagatesResultSetCloseFailure` / `tryEnterHandlesInnerSQLExceptionAndCloseFailure` / `leaseCloseHandlesConnectionCloseFailure` / `rollbackFailureIsAddedAsSuppressed`）；③ **null 参数拒绝**（`uploadRejectsNullData` / `existsRejectsNullSnapshotId` / `namespaceSegmentCannotBeNull` / `rejectsNullDataSourceInConstructor`）。另有 **Java 事务语义未迁移**（`executeInWriteTransactionRollsBackOnException` / `executeInWriteTransactionKeepsAutoCommitWhenAlreadyDisabled`）——Rust `PostgresClient` seam 无事务抽象，`state.rs` 的多语句写为**非原子**（`save_list_sync` 的 delete+insert+hash 三步无事务保护），与 Java `executeInWriteTransaction` 不同（**已于 2026-10-30 关闭**：新增 `PostgresClient::execute_in_transaction` 能力缝，`save_list_sync` 两条写路径均改走该缝，`MemoryClient` 仿真回滚，见 §9；仅 `executeInWriteTransactionKeepsAutoCommitWhenAlreadyDisabled` 属连接池 autoCommit 复用语义，Rust 无对应概念，记不迁移） |
 | `verifySchemaExists()` / `verifyTableExists()`（`INFORMATION_SCHEMA` 校验） | 同上 `:183,203` | **已完成** | 实现于 `sql::{SCHEMA_EXISTS_QUERY, TABLE_EXISTS_QUERY}` + `state.rs::{verify_schema_exists, verify_table_exists}`：`create_if_not_exist=false` 时先查 schema 再查 table，缺失报 `PostgresError::Schema`、查询失败报 `PostgresError::Query`；测试 `build_without_auto_create_fails_when_schema_missing` / `_table_missing` / `build_succeeds_when_schema_and_table_already_exist` 覆盖 |
 | `getDataSource()` / `close()` | 同上 `:701,737` | **已完成（设计决定，不迁移）** | **依据**：Rust 无连接所有权（client 为 `Arc<dyn PostgresClient>`，由调用方持有并管理生命周期），无 `close` 语义可迁 |
 | `truncateAllSessions()` | 同上 `:718` | 已完成 | `state::truncate_all_sessions()` |
@@ -84,7 +84,7 @@
 |---|---|---|
 | 锁 key 哈希算法差异 | Java 用 MurmurHash3（`MurmurHash3.hash128(raw.getBytes(UTF_8))[0]`，128 位结果的**低 64 位**）；Rust 用 `DefaultHasher`（SipHash-1-3，`guard.rs:105-107`）。**静态可判定为不一致**：两者是完全不同的哈希族，且 Rust `DefaultHasher` 的输出**不保证跨 Rust 版本稳定**（标准库明确声明），故同前缀下两语言生成的 advisory lock key **不互通**（跨语言混布存在并发互斥失效风险）。Java 的 `raw` 拼接式为 `keyPrefix + scope.name().toLowerCase() + ":" + value`（`IsolationScope` 是枚举），Rust 侧 `scope` 是 `String`（`SandboxIsolationKey.scope`），拼接式等价但**取值空间不同**（Java 仅 4 个枚举值，Rust 为任意字符串） | **已完成（2026-10-29 勘误）**：原记「待确认 / `DefaultHasher` 不互通」，实际已改 Commons Codec 兼容 **MurmurHash3 x64_128 + seed 104729**（`src/murmur3.rs`，金标向量钉住）；依据 §7 裁定 6 / `murmur3` 5 用例 |
 | guard 文档与实现不一致 | 经核：`src/guard.rs:7` 现文档为 `try_enter` / `release`，**与实现一致**（早期声称的 `is_held` 已不存在） | **已完成（实测已一致）** |
-| advisory lock 与连接池语义 | Java 每租约独占 `Connection`，锁随连接关闭自动释放；Rust `PgSimpleClient` 为共享 client + `spawn_blocking`，而 PG advisory lock 是**会话级**，共享连接下锁归属/释放时机可能与 Java 不同（`MemoryClient` 无法暴露该风险）。**静态可判定为真实风险**：`PgSimpleClient` 内部只有**单个** `tokio_postgres::Client`（`driver.rs:21-24`），`spawn_blocking` 并不保证两次 `query` 落在同一 PG 会话上；`pg_try_advisory_lock` / `pg_advisory_unlock` 若落在不同会话则语义失效 | **待确认** |
+| advisory lock 与连接池语义 | Java 每租约独占 `Connection`，锁随连接关闭自动释放；Rust `PgSimpleClient` 为共享 client + `spawn_blocking`，而 PG advisory lock 是**会话级**，共享连接下锁归属/释放时机可能与 Java 不同（`MemoryClient` 无法暴露该风险）。**静态可判定为真实风险**：`PgSimpleClient` 内部只有**单个** `tokio_postgres::Client`（`driver.rs:21-24`），`spawn_blocking` 并不保证两次 `query` 落在同一 PG 会话上；`pg_try_advisory_lock` / `pg_advisory_unlock` 若落在不同会话则语义失效 | **已解决（2026-10-30）**：改为每租约一个**专用会话**（新增 `PostgresLockSession` / `PostgresClient::open_lock_session`，`PgSimpleClient` 每租约新建连接，`MemoryClient` 按会话建模重入/互斥/关闭释放），见 §9。**补充更正**：原描述「`spawn_blocking` 并不保证两次 `query` 落在同一会话」不准确——它始终是同一个 `tokio_postgres::Client`（同一会话），真正的风险是单会话**可重入**，同进程两个租约会互相「加锁成功」 |
 | `tracing` 埋点缺失 | Java 侧实测日志点：`PostgresSandboxExecutionGuard` 7 处（acquire/release/close 失败等 `log.debug`/`log.warn`）、`PostgresRemoteSnapshotClient` 1 处（initSchema 失败 `log.warn`）、`PostgresBaseStore` 1 处（`LOG.debug` build）；`PostgresAgentStateStore` / `PostgresSnapshotSpec` / `PostgresDistributedStore` **无日志**。Rust 侧仅 2 处：`driver.rs:47`（连接错误）、`store.rs:217`（`put_if_version` insert 失败） | 待办 |
 | `memory::MemoryClient` 未门控 | 测试替身现为 `pub mod memory` + re-export，进入生产 API；MySQL 侧放在 `testing.rs` 子模块（`src/{state,store,snapshot,guard}/testing.rs`） | 待办（P2；若加门控需同步迁移全部测试与 `lib.rs` re-export） |
 | 组合者形态偏差 | EXTENSIONS_GAP_TRACKER §2.1 建议「字段式追加 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` + 自建 builder」；本 crate 改为「持有 `client` + 工厂方法」，且未暴露 `isolation_scope`。功能等价但形态不一致 | **待确认** |
@@ -115,9 +115,9 @@
 1. ~~**P0（本模块内，最优先）**：补齐离线单元测试~~ → **已完成**（2026-09-19，7 → 104 passed；2026-10-22 静态复核实测 **105** 个测试属性）。后续测试可继续下沉到 §3.3 的 advisory lock 连接池语义与真实驱动路径（需环境）。
 2. **跨模块需求（不改 harness）**：harness `SandboxExecutionGuard` 是**具体 struct 而非 trait**（`crates/agentscope-harness/src/agent/sandbox/guard.rs:13`），本 crate 无法 `impl`，只能提供镜像类型的 `PostgresSandboxExecutionGuard`（`try_enter`/`release`），**无法直接接入 harness `SandboxManager`**（后者接受具体 `SandboxExecutionGuard`）。若后续 harness 将 guard 抽为 trait，本 crate 可补 `impl`。记入此处由汇总方评估。**已完成（2026-10-29 勘误）**：原记「无法 `impl` / 无法接入 `SandboxManager`」，实际 2026-10-28 harness 已新增 `SandboxGuard` trait，`PostgresSandboxExecutionGuard` 已 `impl SandboxGuard` 并经 `distributed_store()` 投影（见文末 2026-10-28 执行记录）
 3. **harness `DistributedStore` 字段不足**：已按 EXTENSIONS_GAP_TRACKER §2.1 裁定「不改 harness」，本 crate `distributed_store()` 仅携带 `agent_state_store`；`base_store`/`snapshot_spec`/`guard` 以独立工厂方法暴露。是否需扩展 harness 组合包仍待汇总方。**已完成（2026-10-29 勘误）**：原记「harness 字段不足、仍待裁定」，实际 2026-10-28 harness 新增 3 个可选槽位，本 crate 已投影并填满 5 槽（见文末 2026-10-28 执行记录）
-4. **待确认**：~~锁 key 哈希（`DefaultHasher` vs Java MurmurHash3）跨语言一致性~~ → **已改为 MurmurHash3 x64_128 并与 Java 金标向量对齐（§7 裁定 6）**，剩余为混部实机验证；advisory lock 在共享连接/连接池下的归属与释放语义；真实 PostgreSQL 集成测试环境。
+4. **待确认**：~~锁 key 哈希（`DefaultHasher` vs Java MurmurHash3）跨语言一致性~~ → **已改为 MurmurHash3 x64_128 并与 Java 金标向量对齐（§7 裁定 6）**，剩余为混部实机验证；advisory lock 在共享连接/连接池下的归属与释放语义；真实 PostgreSQL 集成测试环境。**前者已于 2026-10-30 解决（专用会话租约，见 §9），仅剩真实 PG 实机验证**
 5. ~~**P1**：老表 `version` 列迁移（`ensureVersionColumn` 等价）与 `INFORMATION_SCHEMA` 存在性校验（`verifySchemaExists`/`verifyTableExists`）尚未迁移。~~ → **已完成**（两项均已迁移，见 §3.2）。~~复核另发现 4 项 P1 语义偏差待处理~~ → **4 项 P1 已全部关闭（2026-10-28）**：`DEFAULT 1` 与 `save_if_version(0)` 0→1 回退见 §7，builder `create_if_not_exist` 默认 `true` 与快照 `initSchema` 仅告警见 §8。
-6. **P2（2026-10-22 复核新增）**：Java 侧 147 个 `@Test` 中 **53 个无 Rust 对应用例**（集中于 SQL 失败路径 / JDBC 异常包装 / null 参数拒绝，详见 §3.2 末行）；Java `executeInWriteTransaction` 的**事务原子性未迁移**（Rust `save_list_sync` 的 delete+insert+hash 三步为非原子）。
+6. **P2（2026-10-22 复核新增）**：Java 侧 147 个 `@Test` 中 **53 个无 Rust 对应用例**（集中于 SQL 失败路径 / JDBC 异常包装 / null 参数拒绝，详见 §3.2 末行）；Java `executeInWriteTransaction` 的**事务原子性未迁移**（Rust `save_list_sync` 的 delete+insert+hash 三步为非原子）。**已关闭（2026-10-30，见 §9）**
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-postgresql` 基线。
@@ -339,3 +339,73 @@ harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sand
 ### 未完成 / 语义差异
 
 - 无留空槽位；`is_held` 为本地视图（非跨进程查询），与 Java 无对应方法（Java 侧也没有 `isHeld`）。
+
+> **本节部分描述已被 §9 取代（2026-10-30）**：`try_enter` 现在是**每租约一条专用会话**（不再是共享连接）；`PostgresSandboxLease::release()` 走会话 `unlock` + `close()`；无租约时不再「按 `compose_lock_key(key)` 回退解锁」（跨会话无法解锁，返回 `Ok(false)`）。
+
+---
+
+## 9. 2026-10-30 执行记录 — advisory lock 会话归属 / `save_list_sync` 原子性
+
+### Java 依据
+
+- `sandbox/PostgresSandboxExecutionGuard.java`：`tryEnter` 每次 `dataSource.getConnection()` 取**独立 `Connection`**，并在该连接上轮询 `SELECT pg_try_advisory_lock(?)`；内部类 `PostgresLease#close()` 先 `SELECT pg_advisory_unlock(?)`，再在 `finally` 里 `conn.close()`。类注释明确「锁绑定在连接上，连接关闭即自动释放」。
+- `state/PostgresAgentStateStore.java#executeInWriteTransaction`（`:239-258`）：`setAutoCommit(false)` → 执行 → `commit()`；异常 → `rollback()`（失败则 `addSuppressed`）→ 抛出；`finally` 复原 autoCommit。`saveList`（`:453`）的 delete + N×insert + `:_hash` 三步整体位于该事务内。
+
+### 任务 1（原 P1）：advisory lock 的会话归属
+
+**问题**：PG advisory lock 是**会话级**且**同会话可重入**。旧实现 `PgSimpleClient` 只持一个 `tokio_postgres::Client`，`spawn_blocking` 不改变会话，因此同一进程内两个租约对同一隔离 key 的第二次 `pg_try_advisory_lock` 会返回 true —— 互斥静默失效。
+
+| 文件 | 改动 |
+|---|---|
+| `src/client.rs` | 新增 `PostgresLockSession` trait（`try_lock` / `unlock` / `close`）与 `PostgresClient::open_lock_session()`；**默认实现返回 `PostgresError::DriverUnavailable`**（显式失败，绝不假装加锁成功） |
+| `src/guard.rs` | `try_enter` 为每个租约 `open_lock_session()` 取独立会话并在其上轮询；`PostgresSandboxLease` 改持 `Option<Box<dyn PostgresLockSession>>`，`release()`/`Drop` 先 `unlock` 再 `close`（unlock 失败也关会话，对齐 Java `finally`）；`release(lock_name)` 只在**本 guard 保留的租约**中查找（跨会话无法解锁，与 Java 无跨租约释放 API 一致）；`SandboxGuard::try_enter` 对 `DriverUnavailable` 用 `error!` 明确记录「无分布式互斥」 |
+| `src/driver.rs` | `PgSimpleClient` 增持 `config: Config` + `Arc<Runtime>`；`open_lock_session()` 用同一 `Config` 新建**专用连接**（`PgLockSession`），`close()` 丢弃 client 关闭连接 |
+| `src/memory.rs` | 新增 `MemoryLockSession`：每会话唯一 token + 重入计数 `depth`、异会话互斥、`close()` 释放该会话全部锁；**共享连接上的 advisory SQL 改为显式报错**；`fork()` 语义收敛为「同库的另一客户端」 |
+| `crates/agentscope-extensions-postgresql/Cargo.toml` | `tokio-postgres` 增加 `runtime` feature。**既有缺陷**：`Config::connect` / `tokio_postgres::connect` 均受该 feature 门控，此前 `--features postgres-driver` 编译失败（`EXIT=101`） |
+| `src/lib.rs` | 导出 `PostgresLockSession` / `SqlStatement`；架构文档补两条会话级能力 |
+
+新增离线测试（`guard.rs`，均带 `// Java:` 溯源）：
+
+- `try_enter_acquires_lock_and_returns_lease`
+- `distinct_leases_on_the_same_key_are_mutually_exclusive` ← 需求①（含③：释放后他人可获取）
+- `lock_session_is_reentrant_within_one_session` ← 需求②（同会话重入 + 异会话互斥 + 逐层 unlock + 非 owner 不能解锁）
+- `closing_a_lock_session_releases_every_lock_it_holds` ← 需求⑤（含 `close()` 幂等、关闭后拒绝操作、锁可被他人重新获取）
+- `client_without_dedicated_sessions_fails_loudly` ← 不支持独立会话的 client 必须 `DriverUnavailable`（fake 的 `query` 用 `unreachable!` 钉死「不得回退到共享连接」）
+- 需求④（Drop 自动释放）与「锁名/permit 语义不变」由既有 `lease_drop_releases_lock` / `lease_release_is_idempotent` / `release_by_key_reports_owner_mismatch` / `compose_lock_key_*` / `murmur3` 5 用例继续覆盖
+
+**行为变更（有意，向 Java 对齐）**：同一 guard 对同一 key 连续两次 `try_enter` 现在会**竞争**（旧用例 `try_enter_acquires_and_reenters_same_connection` 按「共享连接可重入」的假语义编写，已替换为租约级用例）。重入只存在于**单一租约会话内**。
+
+### 任务 2（原 P2）：`save_list_sync` 原子性
+
+- `src/client.rs`：新增能力式事务缝 `PostgresClient::execute_in_transaction(&[SqlStatement]) -> PgResult<Vec<QueryOutcome>>`（默认 `DriverUnavailable`，不做非原子兜底）+ `SqlStatement { sql, params }`。选批量能力而非 async 闭包：保持对象安全，规避 async trait 生命周期与 `spawn_blocking` 组合。
+- `src/state.rs`：`save_list_sync` 两条写路径（全量重写 = delete + N×insert + hash；增量追加 = N×insert + hash）改为先构造语句再 `execute_in_transaction`；`delete_list_items_sync` / `insert_items_sync` / `save_hash_sync` 改为纯语句构造器（`delete_list_items_stmt` / `insert_items_stmts` / `save_hash_stmt`），SQL 文本与参数顺序不变（`MemoryClient` 分派不受影响）。
+- `src/driver.rs`：`execute_in_transaction` 用专用连接 + `BEGIN` / `COMMIT`，任一语句失败 `ROLLBACK` 并返回原错误。
+- `src/memory.rs`：`execute_in_transaction` 快照 `Tables` → 逐语句执行 → 失败整体恢复（真 rollback）；新增测试钩子 `fail_query_after(n)` / `query_count()`，把「失败落在第几条语句」钉死（避免用例悄悄退化）。
+- 新增测试（`state.rs`，`// Java:` 溯源）：
+  - `save_list_rolls_back_when_a_statement_fails_midway`（失败落在第 3 条 insert，断言行数 / 内容 / `:_hash` 行全部未变，且之后仍可用）
+  - `save_list_append_rolls_back_when_the_hash_write_fails`（失败落在 hash upsert）
+  - `save_list_requires_transaction_support`（不支持事务的 client → `DriverUnavailable` 且零写入）
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p agentscope-extensions-postgresql -j 2` | **EXIT=0，123 passed / 0 failed / 0 ignored**（基线 116；+7 = guard +5 新 −1 旧 + state +3） |
+| `cargo test -p agentscope-extensions-postgresql -j 2 --features postgres-driver` | **EXIT=0，123 passed / 0 failed** |
+| `cargo build -p agentscope-extensions-postgresql --features postgres-driver` | **EXIT=0**（改动前 EXIT=101，缺 `runtime` feature） |
+| `cargo fmt -p agentscope-extensions-postgresql -- --check` | **EXIT=0** |
+
+用例分布：`state` 40 / `sql` 19 / `store` 19 / `snapshot` 16 / `guard` 16 / `distributed` 8 / `murmur3` 5 = **123**。全部离线（`MemoryClient` + trait fake），无真实 DB、无网络、无 `#[ignore]`。
+
+### 反向验证（3 组，均已恢复）
+
+1. **共享会话**：把 `MemoryClient::open_lock_session` 的会话 token 改为按 client 指针固定（等价旧「一个连接服务全部租约」）→ `guard::tests::distinct_leases_on_the_same_key_are_mutually_exclusive` **FAILED**（第二个租约「成功」，正是被修掉的 bug），其余 guard 用例仍绿；恢复后全绿。
+2. **unlock 不释放**：`MemoryLockSession::unlock` 改为只减计数不删行 → `guard::tests::lock_session_is_reentrant_within_one_session` **FAILED**；恢复后全绿。
+3. **事务不回滚**：`MemoryClient::execute_in_transaction` 失败分支去掉快照恢复 → `state::tests::save_list_rolls_back_when_a_statement_fails_midway` 与 `save_list_append_rolls_back_when_the_hash_write_fails` 均 **FAILED**（`2 failed / 37 passed`）；恢复后 123 passed。
+
+### 未完成 / 残留
+
+1. **真实 PostgreSQL 集成测试**仍未做（环境受限，需 PG 实例 / Docker）：`PgLockSession` 的「专用连接 + 会话关闭释放」与 `execute_in_transaction` 的 `BEGIN/COMMIT/ROLLBACK` 目前**仅编译验证**，未对真实服务端跑过。
+2. §3.3 余项：`tracing` 埋点缺失（Java guard 侧 7 处日志；本次仅补 `DriverUnavailable` 的 `error!`）、`memory::MemoryClient` 未门控、组合者形态偏差、`error.rs` 死代码。
+3. §3.2 末行：Java 53 个 Mockito 专属 `@Test` 仍无对应用例；其中「`executeInWriteTransaction` 未迁移」已由本节关闭，`executeInWriteTransactionKeepsAutoCommitWhenAlreadyDisabled` 属连接池 autoCommit 复用语义，Rust 无对应概念 → 记「设计决定（不迁移）」。
+4. 事务缝只覆盖 `save_list`：`save` / `save_if_version` / `truncate` / 单值 CAS 本就是单语句，无需事务。
