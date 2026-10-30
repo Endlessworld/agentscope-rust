@@ -314,6 +314,15 @@ impl TaskRepository for WorkspaceTaskRepository {
         let local_key = format!("{session_id}:{task_id}");
         let bg = BackgroundTask::controlled(task_id, sub_agent_id);
 
+        // `cancel()` aborts the wrapper task. Dropping a `JoinHandle` *detaches* its task, so a
+        // cancel that lands before the wrapper reaches the `Adopted` arm would leave the adopted
+        // run executing (dropping the spec drops the handle without aborting it). Capture the
+        // abort handle here and abort from the wrapper's own drop, which runs on abort too.
+        let adopted_abort = match &spec {
+            TaskRunSpec::Adopted { future } => Some(future.abort_handle()),
+            _ => None,
+        };
+
         let state = Arc::clone(&self.state);
         let transport = Arc::clone(&self.transport);
         let task_ctx = ctx.clone();
@@ -324,6 +333,17 @@ impl TaskRepository for WorkspaceTaskRepository {
         let cb = self.completion_callback.read().await.clone();
 
         let handle = tokio::task::spawn(async move {
+            /// Aborts the adopted run whenever the wrapper goes away — completion **or** an
+            /// external `abort()` while the wrapper is still waiting on its own bookkeeping.
+            struct AbortAdoptedOnDrop(Option<tokio::task::AbortHandle>);
+            impl Drop for AbortAdoptedOnDrop {
+                fn drop(&mut self) {
+                    if let Some(handle) = &self.0 {
+                        handle.abort();
+                    }
+                }
+            }
+            let _adopted = AbortAdoptedOnDrop(adopted_abort);
             let session_id = session_for_task;
             update_record_status(
                 state.fs.as_ref(),
