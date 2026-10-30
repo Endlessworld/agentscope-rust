@@ -956,7 +956,7 @@ cargo test -p agentscope-extensions-mysql -p agentscope-extensions-sandbox -p ag
 
 反向验证（子智能体执行、主智能体复核）：MYSQL 4 组（截断 / DDL / 存在性校验 / version 迁移）、SANDBOX 3 组（无 forwarder 回落 / 投影条目恒 None / guard 恒 None）、JUDGE 3 组（archive create-if-absent 回读 / snapshot id 恒拒 / ENFORCE 恒不拦截）。
 
-> **⚠️ SANDBOX e2b httpmock 用例存在既有 flaky**：`e2b::tests::{persist_native_snapshot_records_id_and_applies_retention, persist_tar_uses_envd_files_instead_of_base64_over_exec, hydrate_tar_uploads_the_archive_before_extracting}` 在机器高负载 / 多份 cargo 并发时偶发 `0 of 1 expected requests matched the mock specification`（每次失败的用例不同，单跑稳定，`e2b.rs` 本批未改动）。**后续需单独稳定化**（隔离 httpmock 端口或串行化该组用例），不计入本批回归失败。
+> **⚠️ SANDBOX e2b httpmock 用例存在既有 flaky（已 A/B 实证，非本批引入）**：`e2b::tests::{persist_native_snapshot_records_id_and_applies_retention, persist_tar_uses_envd_files_instead_of_base64_over_exec, hydrate_tar_uploads_the_archive_before_extracting, file_transfer_uploads_and_downloads_through_envd_files}` 偶发 `0 of 1 expected requests matched the mock specification`（每次失败用例不固定）。**实证**：把 `fs_spec.rs`/`kubernetes.rs` 回退到 `50ae343` 后仍有 2/3 次运行失败（177 测试版本）；`--test-threads=1` 也不稳定；`e2b.rs` 本批**未改动**。⇒ **不是本批引入**。当前规避：重跑；后续需真正稳定化（逐测试固定端口 / 查 httpmock 0.7 并发注册竞态 / 拆为独立 integration test 目标），不计入本批回归失败。
 
 ### 4.18.3 未完成 / 保留差异（不得静默降级）
 
