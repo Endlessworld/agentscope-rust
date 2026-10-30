@@ -27,6 +27,12 @@ pub enum StudioError {
     /// Generic WebSocket/transport failure.
     #[error("studio websocket error: {0}")]
     WebSocket(String),
+
+    /// The underlying core/harness agent failed while driving a conversation round.
+    ///
+    /// Not retryable: the agent already applied its own model/tool retry policy.
+    #[error("studio agent error: {0}")]
+    Agent(String),
 }
 
 impl StudioError {

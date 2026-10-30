@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod config;
+pub mod http;
 pub mod message_hook;
 pub mod pojo;
 pub mod socket_io;
@@ -14,6 +15,9 @@ pub mod websocket;
 
 pub use client::StudioClient;
 pub use config::{StudioConfig, StudioConfigBuilder};
+pub use http::{
+    ReqwestStudioTransport, StudioHttpRequest, StudioHttpResponse, StudioHttpTransport,
+};
 pub use message_hook::StudioMessageHook;
 pub use socket_io::{
     EngineIoHandshake, ProtocolAction, SocketIoEvent, SocketIoProtocol, SocketIoTransport,
@@ -94,16 +98,31 @@ impl StudioManager {
         Self::initialize_with_transport(config, Arc::new(NoopStudioTransport)).await
     }
 
-    /// Runs initialization with an explicit transport.
+    /// Runs initialization with an explicit WebSocket transport.
     ///
     /// Hosts that want the real Socket.IO connection pass a
     /// [`SocketIoTransport`](super::socket_io::SocketIoTransport) built over a shared
-    /// [`PendingInputRegistry`]; the default is a no-op transport so tests stay offline.
+    /// [`PendingInputRegistry`]; the default is a no-op transport so tests stay offline. The
+    /// HTTP side uses the `reqwest` transport.
     pub async fn initialize_with_transport(
         config: StudioConfig,
         transport: Arc<dyn StudioTransport>,
     ) -> StudioResult<()> {
-        let client = Arc::new(StudioClient::new(config.clone()));
+        Self::initialize_with_transports(config, Arc::new(ReqwestStudioTransport::new()), transport)
+            .await
+    }
+
+    /// Runs initialization with explicit HTTP and WebSocket transports.
+    ///
+    /// Both seams are injectable so the whole startup path (`registerRun` + socket connect) can
+    /// run offline; production hosts pass [`ReqwestStudioTransport`] and a
+    /// [`SocketIoTransport`](super::socket_io::SocketIoTransport).
+    pub async fn initialize_with_transports(
+        config: StudioConfig,
+        http_transport: Arc<dyn StudioHttpTransport>,
+        transport: Arc<dyn StudioTransport>,
+    ) -> StudioResult<()> {
+        let client = Arc::new(StudioClient::with_transport(config.clone(), http_transport));
         let ws_client = Arc::new(StudioWebSocketClient::with_transport(
             config.clone(),
             transport,

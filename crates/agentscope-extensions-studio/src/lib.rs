@@ -18,6 +18,8 @@
 //! - Java uses Socket.IO. Rust has no Socket.IO client in this workspace, so the
 //!   wire format is abstracted behind [`studio::StudioTransport`] and the event
 //!   parsing is implemented as pure, offline-testable functions.
+//! - The REST wire call sits behind [`studio::StudioHttpTransport`] (`reqwest` in production), so
+//!   `registerRun` / `pushMessage` / `requestUserInput` are covered offline.
 //! - OTLP export is deferred (tracker §4.2): attributes are extracted as
 //!   `(String, serde_json::Value)` pairs so no `opentelemetry` dependency is
 //!   required for the core logic.
@@ -28,7 +30,7 @@ pub mod telemetry;
 
 pub use error::{StudioError, StudioResult};
 pub use studio::{
-    NoopStudioTransport, PendingInputRegistry, StudioClient, StudioConfig, StudioConfigBuilder,
-    StudioManager, StudioMessageHook, StudioTransport, StudioUserAgent, StudioWebSocketClient,
-    UserInputData,
+    NoopStudioTransport, PendingInputRegistry, ReqwestStudioTransport, StudioClient, StudioConfig,
+    StudioConfigBuilder, StudioHttpRequest, StudioHttpResponse, StudioHttpTransport, StudioManager,
+    StudioMessageHook, StudioTransport, StudioUserAgent, StudioWebSocketClient, UserInputData,
 };
