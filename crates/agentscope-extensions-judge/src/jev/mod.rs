@@ -13,6 +13,7 @@ pub mod application;
 pub mod call;
 pub mod client;
 pub mod code_review;
+pub mod confirmed_calls;
 pub mod context;
 pub mod dto;
 pub mod evaluation;
@@ -22,13 +23,18 @@ pub mod guardrail;
 pub mod integration;
 pub mod judge;
 pub mod probability;
-pub mod runtime;
-pub mod supervision;
 pub mod review;
 pub mod routing;
+pub mod runtime;
+pub mod screening;
+pub mod supervision;
 pub mod validation;
 
 pub use client::{is_retryable_status, JevClient, JevClientBuilder};
+pub use confirmed_calls::{
+    contains as confirmed_call_contains, matches as confirmed_call_matches,
+    remember as remember_confirmed_call, Approval, JevConfirmedCalls, CONFIRMED_CALLS_KEY,
+};
 pub use dto::{
     Answer, ChoiceAnswer, ChoiceQuestion, JsonMap, NoulAnswer, NoulCriteria, NoulQuestion,
     Question, ScoreAnswer, ScoreQuestion, SystemOneRequest, SystemOneRequestBuilder,
@@ -45,6 +51,7 @@ pub use review::{
     patch_regions, source_regions, JevReviewInput, Region, ReviewFile, ReviewMode, Side,
     TestEvidence,
 };
+pub use screening::GuardrailScreener;
 pub use validation::{
     level_keys, require_confidence, require_probability, validate_answer, validate_probabilities,
     validate_question, validate_request, validate_response, validate_result, CHOICE_OPTION_RANGE,

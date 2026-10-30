@@ -28,20 +28,38 @@
 //! [`jev::evaluation`], [`jev::context`], [`jev::application`], [`jev::evidence`],
 //! [`jev::routing`], [`jev::supervision`], [`jev::integration`] and [`jev::code_review`].
 //!
+//! ## Host bindings (`jev::runtime`)
+//!
+//! [`jev::runtime`] is the only module that binds the framework-free state machines to
+//! `agentscope-core` / `agentscope-harness`:
+//!
+//! * the four middleware hooks (`TraceEvaluationMiddleware`, `ResponseMiddleware`,
+//!   `SupervisionMiddleware`, `PhaseRoutingMiddleware`), including the guardrail screening caller
+//!   ([`jev::screening::GuardrailScreener`] — `JevGuardrail.screen` over the real `JevClient`), the
+//!   quality/reviser branch and the supervision capture that classifies the agent result into
+//!   `worker_active` / `worker_failed` (Java `6ec57d245`);
+//! * the `@Tool` layer (`register_jev_tools` for `search_evidence`, `search_knowledge`,
+//!   `review_code_snapshot`) and the staged `JevCodeReviewer` driver;
+//! * `StoreJevContextArchive` over the harness `BaseStore` (content-addressed, create-if-absent).
+//!
+//! [`jev::confirmed_calls`] binds tool approvals to a `RuntimeContext` keyed slot
+//! (`RuntimeContext::set_extension`), so a resumed call only matches the arguments the user saw.
+//! `tests/runtime_integration.rs` drives these through the real `MiddlewareChain` / `Toolkit` /
+//! `BaseStore` entry points.
+//!
 //! ## Not landed (no gap claimed as done)
 //!
-//! Everything below needs a `agentscope-core` / `agentscope-harness` seam this crate deliberately
-//! does not depend on, plus `JevGuardrail::screen`'s reactive caller and `JevConfirmedCalls`:
-//!
-//! * the reactive middleware hooks (`JevTraceEvaluationMiddleware::onAgent/onModelCall`,
-//!   `JevSupervisionMiddleware`'s observer loop, `JevResponseMiddleware::onModelCall`,
-//!   `JevPhaseRouting::onModelCall`) — their pure state machines/tables *are* ported;
-//! * tool registration (`JevEvidenceTool`, `JevKnowledgeTool`, `JevCodeReviewTool`) — the
-//!   agent-visible projections are ported;
-//! * `JevStageRouter` (needs `JevModelRouterMiddleware` from `example/`) and `JevCodeReviewer`'s
-//!   staged driver;
-//! * `StoreJevContextArchive` (needs harness `BaseStore`) and the `browser/` + `example/`
-//!   sub-packages.
+//! * `browser/` (Playwright) — recorded as `已完成（设计决定，不迁移）`: a Node-driven real browser
+//!   runtime contradicts this crate's offline testable scope. Replacement: the trait/source seams
+//!   (`jev::runtime::tools::EvidenceSource`, `jev::runtime::tools::CodeReviewSource`) let a host
+//!   supply them.
+//! * the JEV `example/` package — recorded as `已完成（设计决定，不迁移）`: it is packaging, not runtime
+//!   code, and its model-selection role is covered by [`jev::application::stage_router`] plus
+//!   [`jev::runtime::PhaseRoutingMiddleware`]. The *openai-decisions* `example/` package is **not**
+//!   in that category: it holds real middleware and is ported as
+//!   [`openai_decisions::middleware`].
+//! * `JevStageRouter`'s legacy model-selection mode (needs `example/JevModelRouterMiddleware`); the
+//!   explicit stage entry + `JevPhaseRouting` remain.
 //!
 //! All are tracked in `docs/extensions/JUDGE__GAP_TRACKER.md`.
 

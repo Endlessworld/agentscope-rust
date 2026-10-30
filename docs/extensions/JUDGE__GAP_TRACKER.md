@@ -19,9 +19,9 @@
 | Java 子模块 | `jev`（System One 判定框架，68 类）、`openai-decisions`（OpenAI 决策 API 客户端，8 类） |
 | Java 规模（实测 2026-10-22，非空行） | 主代码 **12469**（jev 11674 + openai-decisions 795）/ 测试 **4035**（15 文件 / **140 个 `@Test`**） |
 | Rust crate | `crates/agentscope-extensions-judge` |
-| Rust 规模（实测 2026-10-28） | **55** 个 `src/*.rs` / **23185** 行 / **286** 个测试（`#[test]` + `#[tokio::test]`；无 `tests/`、无 doc-test、无 `#[ignore]`） |
+| Rust 规模（2026-11-01 重测：`src` **66** 个文件 / **32461** 行 / **392** 个测试；另 `tests/runtime_integration.rs` 1 文件 / 430 行 / 5 个集成用例；`#[ignore]` 共 **0** 个） | **2026-10-30 实测 336 passed / 0 failed**；2026-10-31 与 2026-11-01 新增的用例待主智能体统一实测 |
 | 是否注册 workspace | **是**（`Cargo.toml` 的 `crates/agentscope-extensions-judge`） |
-| 当前状态 | **总判：进行中**（2026-10-30 两轮：中间件 hook / @Tool / `StoreJevContextArchive` 见 §9；`JevPhaseRouting` judge 选择与二次校验 / `JevResponseMiddleware` quality·reviser / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` 见 §10；**实测 336 passed / 0 failed**）。**P1 剩余仅两项且均需 core seam**：`JevGuardrail::screen` 的 reactive caller、`JevConfirmedCalls`（需 `RuntimeContext` 键值扩展槽）；`browser` / `example` 两个子包为「设计决定（不迁移）」，待汇总方确认 |
+| 当前状态 | **总判：进行中（P1 已清零）**（2026-10-30 两轮：中间件 hook / @Tool / `StoreJevContextArchive` 见 §9；`JevPhaseRouting` judge 选择与二次校验 / `JevResponseMiddleware` quality·reviser / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` 见 §10；2026-10-31：supervision 结果分类（Java `6ec57d245`）/ `JevGuardrail::screen` 调用方 / `JevConfirmedCalls` / `tests/` 集成测试 见 §11；2026-11-01：Java `31c7db8c9` 的 OpenAI Decisions 三个中间件 + `DecisionSupport` 见 §12；**上一轮实测 336 passed / 0 failed，§11 / §12 的源码改动待主智能体实测**）；`browser` 子包与 **JEV** `example` 子包为「已完成（设计决定，不迁移）」（§11.3，§12.4 已拆分订正：openai-decisions 的 `example/` **不是**示例，已按其真实运行时语义迁移） |
 
 ### 1.1 Rust crate 文件清单
 
@@ -43,6 +43,8 @@
 | `src/openai_decisions/dto.rs` | 779 | 7 | **新增**：Input / Question / Option / Level / Request(+Builder) / Answer / Result / Usage |
 | `src/openai_decisions/protocol.rs` | 1063 | 13 | **新增**：请求体编码 + 响应解析/校验（Java `parseAnswer/parseChoice/parseScore`） |
 | `src/openai_decisions/client.rs` | 766 | 16 | **新增**：`OpenAIDecisionsClient` + `DecisionsRetryPolicy` + 重试/超时/脱敏 |
+| `src/openai_decisions/support.rs` | 247 | 7 | **2026-11-01 新增**：`DecisionSupport` 投影（最新用户文本 / 受限角色·文本历史 / 确定性 JSON / 概率校验 / run key） |
+| `src/openai_decisions/middleware.rs` | 2020 | 21 | **2026-11-01 新增**：`DecisionCaller` 缝 + 三个可选中间件（`ModelRouterMiddleware` / `ToolSelectionMiddleware` / `AutoModeMiddleware`） |
 
 > `Cargo.toml` 依赖：`serde` / `serde_json` / `thiserror` / `async-trait` / `tokio` / **`reqwest`（workspace 0.13）** / `futures`（runner 的 `buffered` 顺序并发）/ `sha2`（`FileJevContextArchive` 的 SHA-256 内容寻址）；均走 workspace。`reqwest` 只经 `http::JudgeHttpTransport` seam 触达，单测全离线。`agentscope-core` / `agentscope-harness` 自 **2026-10-30** 起以 path 依赖声明（仅 `jev::runtime` 使用：`BaseStore` 归档、`Tool`、`Middleware`，见 §9）；其余模块仍只用本地缝。
 >
@@ -60,12 +62,12 @@
 | `context`（CompactionTranscript/FileJevContextArchive/JevContextArchive/JevContextCompactor/StoreJevContextArchive） | 5 | 903 | `jev/context/**` | **基本完成**（4 完整 + `StoreJevContextArchive` 骨架） |
 | `evaluation`（Evaluator/JevEvaluationRunner/JevEvaluator 等） | 12 | 1828 | `jev/evaluation/**` | **基本完成**（11 完整 + 中间件 `onAgent/onModelCall` 骨架，`TraceCapture` 已全量） |
 | `evidence` | 3 | 744 | `jev/evidence/**` | **基本完成**（2 完整 + `JevEvidenceTool` 投影已迁、`@Tool` 注册待 seam） |
-| `example` | 4 | 1130 | 无 | **设计决定（不迁移）**（2026-10-29 确认；**待汇总方最终确认**）——依据：示例代码非运行链路，且依赖 harness 中间件装配点（`JevModelRouterMiddleware` 等），与主干解耦 |
+| `example`（**仅 JEV**） | 4 | 1130 | 无 | **设计决定（不迁移）**（2026-10-29 确认；**待汇总方最终确认**）——依据：示例代码非运行链路，且依赖 harness 中间件装配点（`JevModelRouterMiddleware` 等），与主干解耦。**openai-decisions 的 `example/` 不在此列**，已迁（§12） |
 | `integration` | 3 | 607 | `jev/integration/**` | **基本完成**（`JevKnowledge` 完整；工具/中间件为投影 + 骨架） |
 | `review` | 4 | 1332 | `jev/review.rs` + `jev/code_review.rs` | **基本完成**（`ReviewRegions`/`JevReviewInput` 完整；`JevCodeReviewer` 定义层 + 驱动骨架、`JevCodeReviewTool` 骨架） |
 | `routing` | 2 | 818 | `jev/routing/**` | **基本完成**（`JevRouteCatalog` 完整；`JevPhaseRouting` 纯 helper + 骨架） |
 | `supervision` | 3 | 855 | `jev/supervision/**` | **基本完成**（2 完整；中间件 Schedule/Observation/tail 已迁，观察循环待 seam） |
-| `openai-decisions`（DecisionQuestion/Input/Answer/Request/Result/Usage/Client/Exception） | 8 | 795 | `openai_decisions/{mod,error,dto,protocol,client}.rs` | **已完成**（`example/` 除外） |
+| `openai-decisions`（DecisionQuestion/Input/Answer/Request/Result/Usage/Client/Exception） | 8 | 795 | `openai_decisions/{mod,error,dto,protocol,client,support,middleware}.rs` | **已完成**（含 `example/` 的 4 类：`DecisionSupport` → `support.rs`，三个中间件 → `middleware.rs`，见 §12） |
 
 > **计数口径（2026-10-29 勘误）**：jev 去 `browser`(4) 与 `example`(4) 后共 **42 类 = 完整 32 / 部分 8 / 骨架 2**（明细 12+10+5+3+2+3+3+4 = 42）。§8.1 合计行记「41 类」为加总笔误（其分项 32+8+2 本身为 42），以本节为准。
 
@@ -118,16 +120,18 @@
 
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `openai-decisions` 整块 | 8 类 / 795 行 | **已完成** | `src/openai_decisions/**`（5 文件 / 2802 行 / 39 测试）；仅 `example/` 中间件未迁（依赖 harness 中间件装配，见 §3.3） |
-| `evaluation` 子包 | 12 类 / 1828 行 | **已完成**（11 类）+ **部分**（中间件 hooks） | 详见 §8.1：`jev/evaluation/**`；`TraceCapture` 状态机全量，`JevTraceEvaluationMiddleware::onAgent/onModelCall` 需 core 中间件 |
-| `application` 子包 | 10 类 / 950 行 | **已完成**（9 类）+ **骨架** 1 | 详见 §8.1；`JevStageRouter` 需 `example/JevModelRouterMiddleware` |
-| `context` 子包 | 5 类 / 903 行 | **已完成**（4 类）+ **骨架** 1 | 详见 §8.1；`StoreJevContextArchive` 需 harness `BaseStore`（`UnavailableContextArchive` fail-closed） |
-| `evidence` 子包 | 3 类 / 744 行 | **已完成**（2 类）+ **部分** 1 | 详见 §8.1；`JevEvidenceTool` 投影已迁，`@Tool` 注册待 seam |
-| `routing` 子包 | 2 类 / 818 行 | **已完成**（1 类）+ **部分** 1 | 详见 §8.1；`JevPhaseRouting` 纯 helper 已迁，派发循环待中间件 |
-| `supervision` 子包 | 3 类 / 855 行 | **已完成**（2 类）+ **部分** 1 | 详见 §8.1；观察循环待 core 事件流 |
-| `integration` 子包 | 3 类 / 607 行 | **已完成**（1 类）+ **部分** 2 | 详见 §8.1；工具注册与 `onModelCall` 待 seam |
-| `review` 完整语义 | 4 类 / 1332 行 | **已完成**（2 类）+ **部分** 2 | 详见 §8.1；`JevCodeReviewer` 定义层全量（配置/问题/词汇表/signals/完整性/排序），驱动骨架 |
-| 测试覆盖 | 140 个 `@Test` | **已完成（本 crate 口径）** | Rust **286** 个（未忽略，0 `#[ignore]`）；全部离线 |
+| `openai-decisions` 整块 | 8 类 / 795 行（+ `example/` 4 类） | **已完成** | `src/openai_decisions/**`（7 文件 / 5087 行 / 67 测试）+ **2026-11-01 新增** `support.rs` / `middleware.rs`（`DecisionSupport` + 三个中间件，见 §12） |
+| `evaluation` 子包 | 12 类 / 1828 行 | **已完成**（12 类） | 详见 §8.1 + §9.1；中间件 hook 已接线（`runtime/middleware.rs` 的 `TraceEvaluationMiddleware`，§11.2） |
+| `application` 子包 | 10 类 / 950 行 | **已完成**（10 类，legacy 模型选择模式不迁） | 详见 §8.1 + §10 行 4 + §11.3；`JevStageRouter` 显式阶段入口已落地 |
+| `context` 子包 | 5 类 / 903 行 | **已完成**（5 类） | 详见 §8.1 + §9.1；`StoreJevContextArchive` 已接 harness `BaseStore`（§11.2） |
+| `evidence` 子包 | 3 类 / 744 行 | **已完成**（3 类） | 详见 §8.1 + §9.1；`@Tool` 注册已落地（`register_jev_tools`，§11.2） |
+| `routing` 子包 | 2 类 / 818 行 | **已完成**（2 类） | 详见 §8.1 + §10 行 1；派发由 `PhaseRoutingMiddleware` 驱动 |
+| `supervision` 子包 | 3 类 / 855 行 | **已完成**（3 类） | 详见 §8.1 + §11.1 行 1；观察循环已接线（`runtime/capture.rs` 的 `SupervisionCapture` + `SupervisionMiddleware`），终态按 agent 结果分类（Java `6ec57d245`） |
+| `integration` 子包 | 3 类 / 607 行 | **已完成**（3 类） | 详见 §8.1 + §9.1；工具注册与 `on_model_call` 已接 |
+| `review` 完整语义 | 4 类 / 1332 行 | **已完成**（4 类） | 详见 §8.1 + §10 行 3；六阶段驱动见 `runtime/review_driver.rs` |
+| `JevGuardrail::screen` 调用方 | `guardrail.rs`（纯 `evaluate`） | **已完成**（2026-10-31） | `screening.rs`：`GuardrailScreener::{request,screen,screener,from_client}`，经既有 `http::JudgeHttpTransport` 缝驱动；用例 `screen_folds_a_clean_reply` / `a_scripted_transport_drives_a_real_request` |
+| `JevConfirmedCalls` | core `RuntimeContext` 键值扩展槽 | **已完成**（2026-10-31） | `confirmed_calls.rs`：绑定**既有** `RuntimeContext::{set_extension,set_extension_arc,extension}`，**未改 core**；用例 `binds_parameters_at_prompt_time_not_at_confirm_return` / `binds_exact_arguments_and_context` |
+| 测试覆盖 | 140 个 `@Test` | **已完成（本 crate 口径）** | Rust **336** 个（2026-10-30 实测，未忽略，0 `#[ignore]`）+ 2026-10-31 新增（`screening`/`confirmed_calls`/`capture` 单测 + `tests/runtime_integration.rs` 5 例，待实测）+ 2026-11-01 新增 28 例（`openai_decisions/{support,middleware}.rs`）；**静态总数 392 + 5**（§1）；全部离线 |
 
 > **「部分」/「骨架」的含义（2026-10-29 说明，避免误读为「主干未落地」）**：上表的「部分」= 该类**数据模型 / 纯函数 / 状态机 / 校验 / fail-closed 兜底已全部迁移并有单测**，只差需要 core/harness seam 的**中间件 hook（`onAgent`/`onModelCall`）与 `@Tool` 注册**；「骨架」= 接口形状与 fail-closed 语义已落地，驱动链留待 seam。全 crate 实测 **286 passed / 0 failed**（§7.2 / §8.4）。
 
@@ -135,36 +139,35 @@
 
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| `browser` 子包（Playwright） | 4 类 / 1056 行 | **设计决定（不迁移）（2026-10-29 确认；待汇总方最终确认）** | 与 RAG 的 Tika/PDF reader 同理：引入浏览器自动化运行时（Node 驱动 + 真实浏览器）与本 crate「纯 Rust、离线可测」定位不符；保留 trait 扩展点由宿主实现 |
-| `example` 子包 | 4 类 / 1130 行 | **设计决定（不迁移）（2026-10-29 确认；待汇总方最终确认）** | 示例代码，非运行链路；且依赖 harness 中间件装配点，与主干客户端解耦。补充：`openai_decisions` 的 `example/`（4 类）同为示例中间件，需要 harness 中间件装配点，本轮未迁 |
+| `browser` 子包（Playwright） | 4 类 / 1056 行 | **已完成（设计决定，不迁移）**（2026-10-31 正式化，见 §11.3） | 源码级依据：Java `jev/browser/PlaywrightSession` 依赖 Node 驱动 + 真实浏览器二进制，本工作区无 Playwright/Node 运行时依赖；影响：不提供 `Navigator`/`ReadTool` 实现；替代：保留 `EvidenceSource`/`CodeReviewSource` 注入缝由宿主提供 |
+| `example` 子包（**仅 JEV**） | 4 类 / 1130 行 | **已完成（设计决定，不迁移）**（2026-10-31 正式化，见 §11.3） | 源码级依据：位于 `agentscope-examples/`，非运行链路；`JevModelRouterMiddleware` 仅装配示例；影响：`JevStageRouter` 无 legacy 模型选择模式；替代：`JevStageRouter::begin` + `PhaseRoutingMiddleware`（`STAGE_ROUTER_UNAVAILABLE` 常量说明）。**`openai_decisions` 的 `example/`（4 类）不适用本判定**——它承载真实运行时中间件（Java `31c7db8c9`），已迁为 `openai_decisions::middleware`（§12） |
 
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
 
-- **已完成**：crate 骨架、错误类型、System One 的 DTO/执行/guardrail/概率/校验/评审纯函数层；**HTTP 传输 seam + 两个客户端**；**`openai-decisions` 整块**；**`jev` 八个编排子包**（`evaluation`/`application`/`context`/`evidence`/`routing`/`supervision`/`integration`/`review` 的纯函数、定义层、状态机与 fail-closed 骨架）。共 55 文件 / 23185 行 / 286 test。
-- **验证命令与结果（2026-10-28 二次实测）**：
-  - `cargo test -p agentscope-extensions-judge` → **286 passed / 0 failed / 0 ignored**（基线 126 → +160）。
-  - `cargo build -p agentscope-extensions-judge` → 成功，0 warning。
-  - 反向验证 3 项：见 §8.5。
-- **已知问题**：`jev` 的四个中间件 hook（trace evaluation / supervision / response / phase routing）、`@Tool` 注册（evidence/knowledge/code review）、`StoreJevContextArchive`、`JevStageRouter`、`JevCodeReviewer` 驱动仍未落地（均需 core/harness seam，见 §8.6）；无 `tests/` 集成测试；无 live API 测试（全离线）。
+- **已完成**：crate 骨架、错误类型、System One 的 DTO/执行/guardrail/概率/校验/评审纯函数层；**HTTP 传输 seam + 两个客户端**；**`openai-decisions` 整块（含 `example/` 三个中间件，§12）**；**`jev` 八个编排子包全量**（§9 / §10）；**`jev::runtime` 四个中间件 hook + 三个 `@Tool` + `StoreJevContextArchive` + 六阶段 reviewer 驱动 + `JevStageRouter`**；**2026-10-31 收口**：supervision 结果分类（Java `6ec57d245`）、`JevGuardrail::screen` 调用方（`screening.rs`）、`JevConfirmedCalls`（`confirmed_calls.rs`）、`tests/runtime_integration.rs`（见 §11）；**2026-11-01**：Java `31c7db8c9` 的 `OpenAIDecisions{ModelRouter,ToolSelection,AutoMode}Middleware` + `DecisionSupport`（`openai_decisions/{support,middleware}.rs`，§12），`16cb024ae` 裁定为无需等价实现（§12.5）。文件数/行数/测试数以 §1 的 2026-11-01 重测为准（66 `src` 文件 / 32753 行 / 392 test + 5 集成用例）。
+- **验证命令与结果**：上一轮（2026-10-30）`cargo test -p agentscope-extensions-judge -j 2` → **336 passed / 0 failed / 0 ignored**、`cargo build -p agentscope-extensions-judge` → 0 warning（§10）。**2026-10-31 与 2026-11-01 两轮均未运行 cargo（任务约束），新增/改动文件待主智能体实测。**
+- **已知问题**：仅剩三项（详见 §11.4 / §12.6）——①本轮源码改动**未编译验证**（任务约束禁跑 cargo）；②`JevConfirmedCalls` 的自动生效点（core HITL 恢复路径）需 core 侧接线，本 crate 不改 core；③`browser` / 仅 JEV 的 `example` 不迁移判定待汇总方确认。**原列「四个中间件 hook / `@Tool` 注册 / `StoreJevContextArchive` / `JevStageRouter` / `JevCodeReviewer` / `JevGuardrail::screen` 调用方 / `JevConfirmedCalls` / OpenAI Decisions 中间件未落地」已全部失效（已落地，见 §9/§10/§11/§12）**；`tests/` 集成测试已建立，仍无 live API 测试（全离线）。
 
 ### 4.2 下一步与阻塞
 
 1. ~~**P0**：落地 HTTP 客户端~~ → **已完成**（`http.rs` + `jev::client` + `openai_decisions::client`）。
 2. ~~**P0**：逐字段核对 `SystemOneRequest`/`SystemOneResult`/`Usage`~~ → **已完成**（见 §2.3，修正 2 处）。
 3. ~~**P1**：按依赖顺序迁 `evaluation` → `application` → `context` → `evidence`/`routing`/`supervision`/`integration`~~ → **已完成（2026-10-28，见 §8）**。
-4. **需汇总方裁定（2026-10-29 已写清依据，等待确认）**：`browser`（Playwright）与 `example`（jev + openai-decisions 各 4 类）均按「设计决定（不迁移）」关闭——依据分别见 §2.1 / §3.3（浏览器自动化运行时与「纯 Rust、离线可测」定位冲突；示例代码非运行链路且依赖 harness 中间件装配点）。**汇总方确认前不计入缺口。**
-5. **跨模块**：四个中间件 hook、`@Tool` 注册、`BaseStore` 归档、`RuntimeContext` 扩展槽需 core/harness 侧 seam（见 §8.6）；本轮未改 `agentscope-core` / `agentscope-harness` / 根 `Cargo.toml`。
-6. **真实剩余（2026-10-29 复核；P0 已清零，实测 286 passed）**：
-   - 四个中间件 hook 未接：trace evaluation（`JevTraceEvaluationMiddleware::onAgent/onModelCall`）/ supervision（观察循环）/ response（`JevResponseMiddleware`）/ phase routing（`JevPhaseRouting` 派发）。
-   - `@Tool` 注册未接：evidence / knowledge / code_review 三个工具只有投影 + fail-closed 校验。
-   - `StoreJevContextArchive` 为 fail-closed 骨架（缺 harness `BaseStore`）。
-   - `JevStageRouter` 骨架 + `JevCodeReviewer` 的 screen→profile→locate→classify→severity→route 驱动链未接。
-   - `JevGuardrail::screen` 无响应式调用方（纯 `evaluate`，Java 由 reactive 链路驱动）。
-   - `JevConfirmedCalls` 缺 core `RuntimeContext` keyed 扩展槽。
-   - 无 `tests/` 集成测试、无 live API 测试（全离线）。
-   - 跨模块建议：core 提供 `Msg` → `TraceMessage`/`ContextMessage` 投影 trait（现由本 crate 自行投影，§8.2 / §8.6）。
+4. ~~**需汇总方裁定**：`browser` / `example`~~ → **已按「已完成（设计决定，不迁移）」正式化（2026-10-31，§11.3，含源码级依据/影响/替代方案）**；汇总方如不同意，回退为 P2 缺口即可。**适用范围仅 `browser` 与 JEV `example`**：openai-decisions 的 `example/` 是真实运行时中间件，已于 2026-11-01 迁移（§12），不在裁定范围。
+5. **跨模块（已解除）**：四个中间件 hook、`@Tool` 注册、`BaseStore` 归档、`RuntimeContext` 扩展槽曾需 core/harness 侧 seam（§8.6），2026-10-31 已全部用**既有** API 接通（见第 6 条）；2026-10-31 与 2026-11-01 两轮均未改 `agentscope-core` / `agentscope-harness` / 根 `Cargo.toml`。
+6. **真实剩余（2026-10-31 收口后）**：
+   - ~~四个中间件 hook 未接~~ → **已接**（`jev/runtime/middleware.rs`，见 §9.1）。
+   - ~~`@Tool` 注册未接~~ → **已接**（`register_jev_tools`，见 §9.1）。
+   - ~~`StoreJevContextArchive` 为骨架~~ → **已接 harness `BaseStore`**（§9.1）。
+   - ~~`JevStageRouter` 骨架 + `JevCodeReviewer` 驱动未接~~ → **已接**（§10 行 3/4）。
+   - ~~`JevGuardrail::screen` 无响应式调用方~~ → **已落地**（`screening.rs`，§11.1）。
+   - ~~`JevConfirmedCalls` 缺扩展槽~~ → **已落地**（`confirmed_calls.rs`，用既有 `RuntimeContext` 键值槽，未改 core）。
+   - ~~无 `tests/` 集成测试~~ → **已建 `tests/runtime_integration.rs`**（5 个装配级用例，全离线）。
+   - ~~`OpenAIDecisions*Middleware` 未迁~~ → **已迁**（`openai_decisions/middleware.rs`，§12）。
+   - **仍剩**：①本轮源码改动待编译/测试实测（任务约束）；②`JevConfirmedCalls` 的 core 侧自动生效点（HITL 恢复）；③`browser` / JEV `example` 待汇总方确认；④无 live API 测试（有意）。
+   - 跨模块建议（非阻塞）：core 提供 `Msg` → `TraceMessage`/`ContextMessage` 投影 trait（现由本 crate 自行投影，§8.2 / §8.6）。
 
 ## 5. 执行约定（所有会话必须遵守）
 
@@ -412,3 +415,119 @@
 2. 在 `ResponseMiddleware` 的 ENFORCE 分支提前 `return events`（既不改写也不拦）→ `quality_enforce_revises_a_failing_draft_and_replaces_the_delta` **FAILED**，恢复后 336/0 全绿。
 
 **未完成（P1 剩余，均需 core seam）**：`JevGuardrail::screen` 的 reactive caller、`JevConfirmedCalls`（需 core `RuntimeContext` 键值扩展槽）；`browser` / `example` 两个子包仍为「设计决定（不迁移）」，待汇总方确认。
+
+> **2026-10-31 追记（本节为历史快照，勿据此判定现状）**：上述两项已落地（`jev/screening.rs`、`jev/confirmed_calls.rs`，见 §11.1）；`browser` / JEV `example` 已定案（见 §11.3）。
+
+## 11. 2026-10-31 执行记录（loop 收口：supervision 结果分类 / screening 调用方 / confirmed calls）
+
+> 依据 Java HEAD `1524b3191`，本期主提交 `6ec57d2459f7a46677f40d26db54ef85f599d08a`（`fix(jev): classify supervision outcomes from agent results (#3862)`，XiaoyuPeng，2026-10-30）。
+> **本轮按任务约束禁止运行 `cargo`/`rustc`/`clippy`/`fmt`，未做编译或测试实测**；下列状态为**源码级**核对结果，编译与测试验证由主智能体统一执行后再改「实测」字段。未改 core / harness / 根 `Cargo.toml`。
+
+### 11.1 本轮落地项（已完成，代码位置 + 离线用例名）
+
+| # | 项 | 状态 | 代码位置 | 代表离线用例 |
+|---|---|---|---|---|
+| 1 | supervision 终态改为「按 agent 结果分类」（Java `6ec57d245`） | **已完成** | 新增 `src/jev/runtime/capture.rs`（`SupervisionCapture`）；`src/jev/runtime/middleware.rs` 的 `SupervisionMiddleware::on_agent` 折叠每个事件并在流末取快照；`src/jev/runtime/mod.rs` 导出 | `suspended_results_stay_active_and_are_not_failures`、`failed_and_interrupted_results_are_failures`、`a_successful_continuation_after_denial_is_not_a_failure`、`a_forwarded_child_outcome_cannot_overwrite_the_parent`、`an_own_iteration_limit_fails_immediately`、`the_snapshot_carries_the_classified_flags` |
+| 2 | `JevGuardrail::screen` 的 reactive caller | **已完成** | 新增 `src/jev/screening.rs`：`GuardrailScreener::{request,screen,screener,from_client}` + `caller_from_client` 复用既有 `http::JudgeHttpTransport` 缝；`ResponseMiddleware` 的 `Screener` 即由此闭合 | `the_screening_request_matches_the_java_shape`、`screen_folds_a_clean_reply`、`screen_folds_a_blocking_reply`、`an_incomplete_reply_is_rejected`、`a_caller_failure_is_surfaced_unchanged`、`the_screener_adapter_plugs_into_the_response_policy`、`a_scripted_transport_drives_a_real_request`、`concurrent_screens_share_one_binding` |
+| 3 | `JevConfirmedCalls` | **已完成** | 新增 `src/jev/confirmed_calls.rs`：`JevConfirmedCalls::{install,ledger,snapshot,remember,remember_call,contains,matches,clear}` + 自由函数 `remember/contains/matches`；绑定**既有** core 键值扩展槽 `RuntimeContext::{set_extension,set_extension_arc,extension}`（`crates/agentscope-core/src/agent/runtime_context.rs`），**无需改 core** | `binds_parameters_at_prompt_time_not_at_confirm_return`、`binds_exact_arguments_and_context`、`a_call_without_an_id_is_never_remembered_or_matched`、`installing_is_idempotent_and_keeps_the_ledger`、`no_ledger_means_no_match` |
+| 4 | 真实装配入口的集成测试 | **已完成** | 新增 `tests/runtime_integration.rs`（本 crate 首个 `tests/` 目标，全离线；仅 in-process transport double） | `a_chain_routes_the_guardrail_screener_and_the_supervisor`、`the_toolkit_runs_a_registered_jev_tool`、`the_store_backed_archive_round_trips_a_snapshot`、`an_approval_survives_a_resume_but_not_an_argument_change`、`the_guardrail_screen_drives_a_real_request_and_folds_the_verdict` |
+
+**语义要点（对齐 Java `6ec57d245`）**：
+- 终态只来自 `AGENT_RESULT` 的 `generateReason`，经 `agentscope_core::session::outcome` 分为 `completed` / `suspended` / `failed` / `interrupted`；
+- `suspended`（`PERMISSION_ASKING` / `TOOL_SUSPENDED` / `*_STOP_REQUESTED`）→ `worker_active = true` 且**不是**失败，暂停不得被判为可完成；
+- `EXCEED_MAX_ITERS` 仍立即失败，但仅限**本 agent** 事件（`EventData.source` 为空/空白）；子 agent 转发的 `EXCEED_MAX_ITERS` / `AGENT_RESULT` 不再覆盖父级结论；
+- `REQUEST_STOP` / `ALL_TOOLS_DENIED` 边界事件**不再**单独视为失败（此前「全工具被拒后继续成功」被误判为 worker 失败即该 bug）。
+
+### 11.2 对既有「骨架」记述的更正（源码复核，非本轮新代码）
+
+以下各项在 §9 / §10 已落地，本节仅确认其**存在且已接线**（测试名取自源码，未在本轮重跑）：
+
+| 项 | 位置 | 状态 |
+|---|---|---|
+| `StoreJevContextArchive` | `src/jev/runtime/archive.rs`（命名空间 `jev/context/<u>/<a>/<s>`、key `snapshot`、内容寻址 + create-if-absent） | **已完成**（原记「骨架」→ 更正） |
+| `@Tool` 注册（`search_evidence` / `search_knowledge` / `review_code_snapshot`） | `src/jev/runtime/tools.rs` 的 `register_jev_tools` + `JevToolConfig` | **已完成**（原记「待 seam」→ 更正） |
+| 四个中间件 hook | `src/jev/runtime/middleware.rs`：`TraceEvaluationMiddleware` / `ResponseMiddleware` / `SupervisionMiddleware` / `PhaseRoutingMiddleware` | **已完成** |
+| `JevCodeReviewer` 六阶段驱动 | `src/jev/runtime/review_driver.rs` | **已完成（驱动层）** |
+| `JevStageRouter` | `src/jev/application/stage_router.rs` | **已完成（不含 legacy 模型选择模式）** |
+
+### 11.3 `browser` / `example` 判定正式化
+
+| 子包 | 状态 | 源码级依据 | 影响 | 替代方案 |
+|---|---|---|---|---|
+| `browser`（4 类 / 1056 行） | **已完成（设计决定，不迁移）** | Java `jev/browser/*` 的 `PlaywrightSession` 依赖 Node 驱动 + 真实浏览器二进制；本 crate 定位「纯 Rust、离线可测」，且工作区无 Playwright/Node 运行时依赖 | 无浏览器自动化驱动（不提供 `Navigator`/`ReadTool` 实现） | 保留 `EvidenceSource` / `CodeReviewSource` 注入缝，由宿主提供真实浏览器或抓取实现 |
+| `example`（**仅 JEV** 4 类 / 1130 行） | **已完成（设计决定，不迁移）**（2026-11-01 拆分订正：原行含 openai-decisions，已不适用） | 位于 `agentscope-examples/`，非运行链路；`JevModelRouterMiddleware` 只是装配示例，其能力已由 `PhaseRoutingMiddleware` + `JevStageRouter` 覆盖；**openai-decisions 的 `example/` 不是示例**（Java `31c7db8c9` 的提交说明称其为 opt-in middleware，已安装在 agent loop 上），已迁，见 §12 | `JevStageRouter` 无 legacy「模型选择」模式 | `JevStageRouter::begin(stage, goal)` + `PhaseRoutingMiddleware` 显式阶段路由（常量 `STAGE_ROUTER_UNAVAILABLE` 说明） |
+
+### 11.4 仍未完成与原因
+
+1. **编译/测试实测缺位**：本轮受任务约束未运行 cargo，新增 ~1400 行源码仅经静态复核（括号配平、API 签名逐个 grep 核对、trait 方法/导出/可见性检查）。**未完成，原因：工具约束**。
+2. **`JevConfirmedCalls` 自动生效点**：核心 `react_agent.rs` 的 HITL 恢复路径由 core 侧负责接入（本轮禁止改 core 且 `react_agent.rs` 归 SCHEDULER），现仅提供 `install/remember/matches` 供宿主与 core 调用。**未完成，原因：跨模块边界**。
+3. **`browser` / JEV `example` 汇总方确认**：本文件已按 `已完成（设计决定，不迁移）` 记录，汇总方若不同意需回退为 P2 缺口。**未完成，原因：待汇总方裁定**。（openai-decisions 的 `example/` 已迁，见 §12，不在本项范围。）
+
+### 11.5 跨模块需求
+
+- **无新增**。`JevConfirmedCalls` 使用既有 `RuntimeContext` 键值扩展槽，未要求 core 新增 API；screening 走既有 `http::JudgeHttpTransport`；supervision 走既有 `session::outcome`。
+- 建议（非阻塞）：core 的 HITL 恢复路径在重放 pending tool call 前调用 `jev::confirmed_calls::matches(ctx, call)`，否则该账本只能由宿主手工驱动。
+
+---
+
+## 12. 2026-11-01 执行记录（OpenAI Decisions 中间件 / `6ec57d245` 复核 / `16cb024ae` 裁定）
+
+> 依据 Java HEAD `1524b3191`。本期主提交 `31c7db8c9`（`feat(judge): add OpenAI Decisions middleware and runnable examples`，2026-10-22）。
+> **本轮按任务约束禁止运行 `cargo` / 编译 / 测试**；状态为**源码级**核对。新建两个文件仅用 `rustfmt --check` 做了解析校验（输出为空、无语法错），编译/测试由主智能体统一执行。未改 core / harness / 根 `Cargo.toml`，未改 `Cargo.toml` 依赖。
+
+### 12.1 本轮落地项（`31c7db8c9`）
+
+| # | Java 类 | 状态 | Rust 位置 | 代表离线用例 |
+|---|---|---|---|---|
+| 1 | `DecisionSupport`（109 行） | **已完成** | `src/openai_decisions/support.rs`（`latest_user_text` / `recent_messages` / `json` / `require_probability` / `run_key`） | `the_latest_user_turn_is_trimmed_and_skips_other_roles`、`recent_messages_flatten_tool_results_and_keep_newest_last`、`the_projection_respects_both_budgets_without_splitting_characters`、`probabilities_must_be_finite_and_bounded` |
+| 2 | `OpenAIDecisionsModelRouterMiddleware`（255 行） | **已完成** | `middleware.rs` `ModelRouterMiddleware` + `ModelRouterMiddlewareBuilder` + `ModelChoice` / `RoutingDecision` / `Compatibility` | `the_router_selects_once_per_invocation_and_swaps_the_model`、`a_refusal_low_confidence_or_unknown_choice_keeps_the_caller_model`、`the_router_requires_explicit_compatibility_for_tool_calls`、`a_reused_context_does_not_inherit_a_previous_route` |
+| 3 | `OpenAIDecisionsToolSelectionMiddleware`（277 行） | **已完成** | `middleware.rs` `ToolSelectionMiddleware` + builder | `selection_keeps_essential_tools_caps_relevant_ones_and_preserves_order`、`selection_retains_the_original_tools_on_ambiguity_refusal_or_failure`、`selection_batches_more_than_four_hundred_tools`、`a_forced_tool_is_never_judged` |
+| 4 | `OpenAIDecisionsAutoModeMiddleware`（294 行） | **已完成** | `middleware.rs` `AutoModeMiddleware` + builder + `denied_result` / `denied_events` | `the_guard_denies_risky_and_refused_calls_and_keeps_the_others`、`the_guard_fails_closed_without_a_state_or_on_an_error`、`explicit_fail_open_allows_a_failed_assessment`、`the_guard_batches_more_than_four_hundred_calls` |
+| 5 | `OpenAIDecisionsRetryPolicy` + `Builder.retryPolicy` | **已完成（2026-10-28 已落，无需改动）** | `openai_decisions/client.rs` 的 `DecisionsRetryPolicy` / `OpenAIDecisionsClientBuilder::retry_policy` | 既有 `retry_policy_matches_java_constructors`、`retries_only_when_the_policy_opts_in`、`exposes_http_status_and_retry_hint_without_retrying_by_default` |
+| 6 | Spring Boot 自动配置（`OpenAIDecisionsProperties` / 两个 starter 类） | **已完成（设计决定，不迁移）** | 无 | 依据：本仓库无 Spring Boot / 依赖注入容器，中间件的 `enabled` / `fail_open` / 阈值已全部暴露为 builder 方法，由宿主自己构造并注册；影响：没有 YAML 配置绑定；替代：`ModelRouterMiddleware::from_client(client)` + 链式 builder |
+| 7 | 可运行示例（`OpenAIDecisionsMiddlewareExample` 238 行 + `docs/v2/{en,zh}/integration/judge/openai-decisions.md`） | **已完成（设计决定，不迁移）** | 无 | 依据：示例位于 `agentscope-examples/documentation` 演示工程（`exec:java` + 真实 API key + JVM 代理），非库代码；影响：不提供 route/select/guard 三模式 demo；替代：本 §12.1 的 21 个离线用例逐项覆盖同样行为 |
+
+依赖：**无新增**。三个中间件只用 `agentscope-core`（已依赖）与已有 `serde_json` / `futures`。
+
+### 12.2 语义对照（Java → Rust）
+
+| 项 | Java | Rust | 判定 |
+|---|---|---|---|
+| 路由决定的存与读 | `ctx.put(RoutingDecision.class, ...)` / 静态 `decision(ctx)` | 中间件内 `run_id`→`session_id` 键的 `Mutex<HashMap>` + `decision(&ctx)` | 适配层差异（`&RuntimeContext` 不可变）；同一 run 语义等价，测试见 `a_reused_context_does_not_inherit_a_previous_route` |
+| 被拒调用的结果落盘 | `state.contextMutable().add(ToolResultMessageBuilder.buildToolResultMsg(...))` | `ActingInput::results.record(denied_result(...), false)`（core 在 acting 结束后写成 tool 消息） | 等价（同一落盘点，见 `react_agent.rs` 的 `results.snapshot()`） |
+| 被拒调用的三事件 | `AgentEventEmitter.emit(Start/TextDelta/End)` | 直接返回 `AgentEvent::with_fields(ToolResultStart/ToolResultTextDelta/ToolResultEnd)` 事件流 | 等价（中间件返回的流由 core 转发到 `delta_tx`），字段名与 core 自身发射的一致（`reply_id` / `tool_call_id` / `tool_name` / `delta` / `state`） |
+| 兼容性谓词异常 | `try/catch (RuntimeException) → usable=false` | 不捕获 panic | 有意差异；默认谓词与 builder 注入的闭包均为纯判定，不预期 panic |
+| 批内失败 | `onErrorResume(failOpen ? batch : List.of())`（每批独立） | `assess` 逐批 match，失败时按 `fail_open` 逐批放行/全拒 | 等价（`explicit_fail_open_allows_a_failed_assessment`） |
+| 无 `AgentState` | `state == null ? failOpen ? guarded : List.of()` | `ctx.state` 为 `None` 时同规则 | 等价 |
+| 工具集过滤 | Java 用 `Set<String> required` + 保留原 `input.tools()` 顺序 | `Vec<String>` + 保留原顺序 | 等价（`selection_keeps_essential_tools_caps_relevant_ones_and_preserves_order` 断言了顺序） |
+| 并发批 | `Flux.range(...).concatMap(...)`（串行） | `chunks(400)` + 逐个 `await`（串行） | 等价（`vec![400, 1]` 断言了请求数与顺序） |
+| 空结果 | `switchIfEmpty(error("Decisions returned no result"))` | 调用缝返回 `Result`，没有空流，故无此分支 | 无对应物（已写入代码模块文档） |
+
+### 12.3 代码内已声明的差异（不重复展开）
+
+`src/openai_decisions/middleware.rs` 模块文档已列出三条：`RuntimeContext` 不可变导致的 decision 存储方式、被拒结果走 `ActingInput::results`、不把 panic 翻译为「不兼容」。此处仅登记，不另作缺口。
+
+### 12.4 订正：`openai-decisions` 的 `example/` **不是**“示例”
+
+- **依据（源码级）**：`31c7db8c9` 的提交说明写明三个类为 “three opt-in middleware implementations”，并被 `OpenAIDecisionsAutoConfiguration` 引用；类实现 `MiddlewareBase`，带 `activePoints()` / `order()`，属**运行时链路**。
+- **同步修改**：§2.1 的 `openai-decisions` 行、§3.2 的整块行、§3.3 与 §11.3 的 `example` 行均已改为「仅 JEV」。
+- **遗留口径**：§7.5 / §8.1 / §9.5 等**历史快照**中的「`openai_decisions/example/` 4 类示例中间件未迁」为当时事实，不再回写；以本节为准。
+
+### 12.5 `6ec57d245` / `16cb024ae` 裁定
+
+| 提交 | 裁定 | 证据 |
+|---|---|---|
+| `6ec57d245` `fix(jev): classify supervision outcomes from agent results` | **已完成（2026-10-31 已落，本轮源码复核）** | `src/jev/runtime/capture.rs` 逐条对上 Java diff：①`own_event` 判定（`source` 为 `None`/空）后才采信 `AGENT_RESULT` 与 `EXCEED_MAX_ITERS`；②`outcome(reply.generate_reason())` 把 `failed`/`interrupted` 记为失败、`suspended` 记 `worker_suspended`，`REQUEST_STOP` / `ALL_TOOLS_DENIED` 边界事件不再单独置失败；③`worker_active() = !completed \|\| worker_suspended` 对应 Java `!complete \|\| workerSuspended`。另核 `agentscope_core::session::outcome` 与 Java `SessionRecorder.outcome` 分支逐字一致（含 `MAX_ITERATIONS`/`ALL_TOOLS_DENIED → failed`）。用例：`suspended_results_stay_active_and_are_not_failures`、`a_successful_continuation_after_denial_is_not_a_failure`、`a_forwarded_child_outcome_cannot_overwrite_the_parent` |
+| `16cb024ae` `test: deflake JEV trace evaluation ...` | **已完成（无需等价实现）** | Java 本提交对 JEV 的改动**只有测试侧**：`JevTraceEvaluationTest` 把评估预算 3s → 60s（另两处 flake 在 Feishu channel（涉及生产码 `responseTimeout` 可配，归 CHANNEL 模块）与 subagent，不属本模块）。Rust 侧：`JevTraceEvaluator::Limits.budget` 是构造参数（`evaluation/evaluator.rs:29`），默认 3s 仅作为 `Limits::default()` 的默认值；`Limits::default()` 在本 crate 的 `src/**` 与 `tests/**` **0 命中**（`tests/` 未构造 `Limits`；`ResponseLimits::defaults()` 是别的类型），凡走评估的用例都显式给预算，后端为内存 caller，不存在「调度停顿消耗预算」的 flaky 断言。故不改代码；新增用例仍按显式预算书写（如 `selection_batches_more_than_four_hundred_tools` 与本题无关，但同一约定）。 |
+
+### 12.6 仍未完成与跨模块
+
+1. **编译/测试实测缺位**（同 §11.4 第 1 条）：本轮新增 `support.rs`（247 行 / 7 测试）与 `middleware.rs`（2020 行 / 21 测试），仅 `rustfmt --check` 通过。**未完成，原因：任务约束禁跑 cargo**。
+2. **中间件装配点由宿主负责**：三个中间件默认 `enabled=false`，宿主须 `enabled(true)` 后放入 `MiddlewareChain`；harness `HarnessAgentBuilder` 没有 OpenAI Decisions 的注册入口（与无 Spring Boot starter 同因）。**跨模块建议（非阻塞）**：harness 提供 `with_decisions_middlewares(...)` 一类的注册快捷方式，否则宿主需自行拼 `MiddlewareChain`。
+3. **`JevConfirmedCalls` 的 core 侧自动生效点**：沿用 §11.4 第 2 条，未变。
+4. **`browser` / JEV `example` 汇总方确认**：沿用 §11.4 第 3 条，未变。
+
+### 12.7 跨模块需求
+
+- **无新增**。未要求 core 新增 API（`ToolChoice::Specific`、`ActingInput::results`、`AgentEvent::with_fields`、`Model::supports_native_structured_output` 均为既有能力）。
+- 非阻塞建议一条：见 §12.6 第 2 条（harness 侧注册入口）。

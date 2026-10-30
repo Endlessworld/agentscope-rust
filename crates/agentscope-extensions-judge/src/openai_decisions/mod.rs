@@ -13,20 +13,27 @@
 //!   [`JudgeHttpTransport`](crate::http::JudgeHttpTransport), with the wrapper retry policy
 //!   disabled by default.
 //! * [`error`] — [`DecisionsError`], the sanitized `OpenAIDecisionsException` analogue.
+//! * [`support`] — the shared evidence projection (latest user turn, bounded role/text history,
+//!   deterministic JSON, probability checks) Java keeps in `DecisionSupport`.
+//! * [`middleware`] — the three opt-in middlewares over core's agent loop
+//!   ([`ModelRouterMiddleware`], [`ToolSelectionMiddleware`], [`AutoModeMiddleware`]).
 //!
-//! ## Not landed
+//! ## Host bindings
 //!
-//! The Java `example` sub-package (`DecisionSupport`, `OpenAIDecisionsAutoModeMiddleware`,
-//! `OpenAIDecisionsModelRouterMiddleware`, `OpenAIDecisionsToolSelectionMiddleware`) is sample
-//! middleware over harness agent abstractions; it is out of scope here and tracked in
-//! `docs/extensions/JUDGE__GAP_TRACKER.md`.
+//! The middlewares live in [`middleware`] because they implement
+//! [`agentscope_core::middleware::Middleware`]; nothing else in this module depends on a host. A
+//! Decisions call reaches them through the injected [`DecisionCaller`] seam, so every test is
+//! offline: production wires [`caller_from_client`], tests answer with a fixed
+//! [`DecisionResult`].
 
 use std::ops::RangeInclusive;
 
 pub mod client;
 pub mod dto;
 pub mod error;
+pub mod middleware;
 pub mod protocol;
+pub mod support;
 
 pub use client::{
     is_retryable_status, normalize_decision_base_url, DecisionsRetryPolicy, OpenAIDecisionsClient,
@@ -38,7 +45,18 @@ pub use dto::{
     DecisionValue, ScoreProbability, IMAGE_URL_MESSAGE,
 };
 pub use error::DecisionsError;
+pub use middleware::{
+    caller_from_client, AutoModeMiddleware, AutoModeMiddlewareBuilder, Compatibility,
+    DecisionCaller, DecisionFuture, ModelChoice, ModelRouterMiddleware,
+    ModelRouterMiddlewareBuilder, RoutingDecision, ToolSelectionMiddleware,
+    ToolSelectionMiddlewareBuilder, DEFAULT_DENY_MESSAGE, DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_CONTEXT_MESSAGES, DEFAULT_MAX_TOOLS, DEFAULT_REJECTION_THRESHOLD,
+    DEFAULT_ROUTING_CONFIDENCE, DEFAULT_ROUTING_INSTRUCTIONS, DEFAULT_SAFETY_THRESHOLD,
+    DEFAULT_SELECTION_CONFIDENCE, GUARD_CONTEXT_CHARS, GUARD_CONTEXT_MESSAGES, GUARD_REPLY_ID,
+    ROUTING_QUESTION,
+};
 pub use protocol::{decision_body, parse_decision_response};
+pub use support::{json as support_json, latest_user_text, recent_messages, RecentMessage};
 
 /// Default OpenAI API base URL (`OpenAIDecisionsClient.DEFAULT_BASE_URL`).
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";

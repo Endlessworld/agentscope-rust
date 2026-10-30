@@ -21,19 +21,21 @@
 //! layers they wrap: the pure modules keep their signatures and their tests.
 
 pub mod archive;
+pub mod capture;
 pub mod middleware;
 pub mod quality;
 pub mod review_driver;
 pub mod tools;
 
 pub use archive::{context_namespace, StoreJevContextArchive, NAMESPACE_PREFIX, SNAPSHOT_KEY};
+pub use capture::{SupervisionCapture, MAX_RECENT_EVENTS};
 pub use middleware::{
-    PhaseRoutingMiddleware, ResponseMiddleware, RouteResolver, SupervisionMiddleware,
-    TraceEvaluationMiddleware,
+    PhaseRoutingMiddleware, ResponseMiddleware, RouteResolver, SupervisionEvidenceSource,
+    SupervisionMiddleware, TraceEvaluationMiddleware,
 };
 pub use quality::{
-    assess, capture, collect_text, judge_status_name, outcome_name, replace_text, revise_with_model,
-    QualitySettings, Reviser, Revision, ScreenOutcome, ScreenPolicy, Screener,
+    assess, capture, collect_text, judge_status_name, outcome_name, replace_text,
+    revise_with_model, QualitySettings, Reviser, Revision, ScreenOutcome, ScreenPolicy, Screener,
 };
 pub use review_driver::{
     ReviewDriver, EVIDENCE_RULES, FILE_LIMIT, FOLLOW_UP_PENDING, INCOMPLETE_REVIEW,
