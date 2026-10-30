@@ -3,7 +3,7 @@
 //! Rust port of `io.agentscope.core.training.runner`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -191,21 +191,38 @@ impl std::fmt::Display for RunExecutionContext {
 // RunRegistry
 // ---------------------------------------------------------------------------
 
-/// Allocates monotonically increasing run ids per task, mirroring `RunRegistry`.
-static RUN_REGISTRY: OnceLock<Mutex<HashMap<String, AtomicUsize>>> = OnceLock::new();
-
-fn run_registry() -> &'static Mutex<HashMap<String, AtomicUsize>> {
-    RUN_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// Registry mapping a task id to its run counter, mirroring `RunRegistry`.
+///
+/// Java stores this in `static` fields, so every router in the JVM shares one counter
+/// space. Rust keeps that space available explicitly through [`RunRegistry::global`],
+/// but the registry itself is an ordinary handle: a [`TrainingRouter`] owns its own
+/// instance, so two routers — and, importantly, two unit tests — never mutate shared
+/// process-wide state. Concurrent tests therefore cannot wipe each other's counters
+/// (the flakiness that used to require a global test mutex).
+#[derive(Debug, Default)]
+pub struct RunRegistry {
+    counters: Mutex<HashMap<String, AtomicUsize>>,
 }
 
-/// Registry mapping a task id to its run counter.
-pub struct RunRegistry;
-
 impl RunRegistry {
+    /// Creates an empty, isolated registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The process-wide registry (Java parity: Java's `RunRegistry` is all-static).
+    ///
+    /// Only use this when several routers must share one run-id space on purpose;
+    /// the default [`TrainingRouter::new`] gives each router its own registry.
+    pub fn global() -> Arc<RunRegistry> {
+        static GLOBAL: OnceLock<Arc<RunRegistry>> = OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| Arc::new(RunRegistry::new())))
+    }
+
     /// Allocates the next run id for `task_id` (starting at `0`).
-    pub fn allocate_run_id(task_id: &str) -> String {
+    pub fn allocate_run_id(&self, task_id: &str) -> String {
         assert!(!task_id.is_empty(), "Task ID cannot be null");
-        let mut map = run_registry().lock().unwrap();
+        let mut map = self.counters.lock().unwrap();
         let counter = map
             .entry(task_id.to_string())
             .or_insert_with(|| AtomicUsize::new(0));
@@ -214,11 +231,11 @@ impl RunRegistry {
     }
 
     /// The current run count for `task_id` (0 when unknown).
-    pub fn get_current_run_count(task_id: &str) -> usize {
+    pub fn get_current_run_count(&self, task_id: &str) -> usize {
         if task_id.is_empty() {
             return 0;
         }
-        run_registry()
+        self.counters
             .lock()
             .unwrap()
             .get(task_id)
@@ -227,87 +244,91 @@ impl RunRegistry {
     }
 
     /// Removes the counter for `task_id`.
-    pub fn cleanup(task_id: &str) {
+    pub fn cleanup(&self, task_id: &str) {
         if !task_id.is_empty() {
-            run_registry().lock().unwrap().remove(task_id);
+            self.counters.lock().unwrap().remove(task_id);
         }
     }
 
     /// Removes all counters.
-    pub fn clear_all() {
-        run_registry().lock().unwrap().clear();
+    pub fn clear_all(&self) {
+        self.counters.lock().unwrap().clear();
     }
 
     /// Number of tracked tasks.
-    pub fn size() -> usize {
-        run_registry().lock().unwrap().len()
+    pub fn size(&self) -> usize {
+        self.counters.lock().unwrap().len()
     }
 
     /// Reserved for future time-based cleanup (mirrors `cleanupOldTasks`).
-    pub fn cleanup_old_tasks(_ttl: Duration) {}
+    pub fn cleanup_old_tasks(&self, _ttl: Duration) {}
 }
 
 // ---------------------------------------------------------------------------
 // TaskExecutionRegistry
 // ---------------------------------------------------------------------------
 
-/// Stores execution contexts for all runs of all tasks, mirroring
+/// Registry of run execution contexts grouped by task, mirroring
 /// `TaskExecutionRegistry`.
-static TASK_EXECUTION_REGISTRY: OnceLock<Mutex<HashMap<String, Vec<Arc<RunExecutionContext>>>>> =
-    OnceLock::new();
-
-fn task_execution_registry() -> &'static Mutex<HashMap<String, Vec<Arc<RunExecutionContext>>>> {
-    TASK_EXECUTION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+///
+/// Like [`RunRegistry`] this is an instance handle: a router owns one, and
+/// [`TaskExecutionRegistry::global`] provides the JVM-static behaviour on demand.
+#[derive(Debug, Default)]
+pub struct TaskExecutionRegistry {
+    runs: Mutex<HashMap<String, Vec<Arc<RunExecutionContext>>>>,
 }
 
-/// Registry of run execution contexts grouped by task.
-pub struct TaskExecutionRegistry;
-
 impl TaskExecutionRegistry {
+    /// Creates an empty, isolated registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The process-wide registry (Java parity: Java's registry is all-static).
+    pub fn global() -> Arc<TaskExecutionRegistry> {
+        static GLOBAL: OnceLock<Arc<TaskExecutionRegistry>> = OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| Arc::new(TaskExecutionRegistry::new())))
+    }
+
     /// Registers a run context.
-    pub fn register(context: Arc<RunExecutionContext>) {
+    pub fn register(&self, context: Arc<RunExecutionContext>) {
         let task_id = context.get_task_id().to_string();
-        let mut map = task_execution_registry().lock().unwrap();
+        let mut map = self.runs.lock().unwrap();
         map.entry(task_id).or_default().push(context);
     }
 
     /// Returns all run contexts for `task_id`, sorted ascending by numeric run id.
-    pub fn get_runs_by_task(task_id: &str) -> Vec<Arc<RunExecutionContext>> {
+    pub fn get_runs_by_task(&self, task_id: &str) -> Vec<Arc<RunExecutionContext>> {
         if task_id.is_empty() {
             return Vec::new();
         }
-        let map = task_execution_registry().lock().unwrap();
+        let map = self.runs.lock().unwrap();
         let mut contexts = map.get(task_id).cloned().unwrap_or_default();
         contexts.sort_by_key(|c| c.get_run_id().parse::<i64>().unwrap_or(0));
         contexts
     }
 
     /// Returns the context for a specific `(task_id, run_id)`, if present.
-    pub fn get_run(task_id: &str, run_id: &str) -> Option<Arc<RunExecutionContext>> {
+    pub fn get_run(&self, task_id: &str, run_id: &str) -> Option<Arc<RunExecutionContext>> {
         if task_id.is_empty() || run_id.is_empty() {
             return None;
         }
-        let map = task_execution_registry().lock().unwrap();
+        let map = self.runs.lock().unwrap();
         map.get(task_id)
             .and_then(|v| v.iter().find(|c| c.get_run_id() == run_id).cloned())
     }
 
     /// All known task ids.
-    pub fn get_all_task_ids() -> Vec<String> {
-        task_execution_registry()
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect()
+    pub fn get_all_task_ids(&self) -> Vec<String> {
+        self.runs.lock().unwrap().keys().cloned().collect()
     }
 
     /// Number of runs registered for `task_id`.
-    pub fn get_run_count(task_id: &str) -> usize {
+    pub fn get_run_count(&self, task_id: &str) -> usize {
         if task_id.is_empty() {
             return 0;
         }
-        task_execution_registry()
+        self.runs
             .lock()
             .unwrap()
             .get(task_id)
@@ -316,26 +337,21 @@ impl TaskExecutionRegistry {
     }
 
     /// Total number of tasks.
-    pub fn get_task_count() -> usize {
-        task_execution_registry().lock().unwrap().len()
+    pub fn get_task_count(&self) -> usize {
+        self.runs.lock().unwrap().len()
     }
 
     /// Total number of runs across all tasks.
-    pub fn get_total_run_count() -> usize {
-        task_execution_registry()
-            .lock()
-            .unwrap()
-            .values()
-            .map(Vec::len)
-            .sum()
+    pub fn get_total_run_count(&self) -> usize {
+        self.runs.lock().unwrap().values().map(Vec::len).sum()
     }
 
     /// Removes all data for `task_id`, returning the number of runs removed.
-    pub fn cleanup(task_id: &str) -> usize {
+    pub fn cleanup(&self, task_id: &str) -> usize {
         if task_id.is_empty() {
             return 0;
         }
-        task_execution_registry()
+        self.runs
             .lock()
             .unwrap()
             .remove(task_id)
@@ -344,15 +360,15 @@ impl TaskExecutionRegistry {
     }
 
     /// Removes all data.
-    pub fn clear_all() {
-        task_execution_registry().lock().unwrap().clear();
+    pub fn clear_all(&self) {
+        self.runs.lock().unwrap().clear();
     }
 
     /// Returns a statistical summary.
-    pub fn get_stats() -> RegistryStats {
+    pub fn get_stats(&self) -> RegistryStats {
         RegistryStats {
-            task_count: Self::get_task_count(),
-            total_run_count: Self::get_total_run_count(),
+            task_count: self.get_task_count(),
+            total_run_count: self.get_total_run_count(),
         }
     }
 }
@@ -419,9 +435,10 @@ pub struct TrainingConfig {
     enable_auto_commit: bool,
     /// Maximum number of shadow runs executed concurrently.
     shadow_pool_size: usize,
-    /// Reserved: Java uses this as the queue capacity of its bounded-elastic shadow
-    /// scheduler; tokio has no equivalent bounded wait queue, so the value is kept
-    /// for configuration parity only.
+    /// Upper bound on shadow runs admitted at once (in flight or waiting for a
+    /// slot), the counterpart of the queue capacity of Java's
+    /// `Schedulers.newBoundedElastic(shadowPoolSize, shadowPoolCapacity, ...)`.
+    /// Runs submitted beyond this bound are dropped with a warning.
     shadow_pool_capacity: usize,
     repeat_time: i32,
 }
@@ -474,7 +491,10 @@ impl TrainingConfig {
     pub fn shadow_pool_size(&self) -> usize {
         self.shadow_pool_size
     }
-    /// Reserved queue capacity of the shadow pool (not consumed at runtime).
+    /// Maximum number of shadow runs admitted at once.
+    ///
+    /// Enforced by [`TrainingRouter`] as the queue bound of the shadow scheduler;
+    /// values below `1` are treated as `1`.
     pub fn shadow_pool_capacity(&self) -> usize {
         self.shadow_pool_capacity
     }
@@ -575,6 +595,7 @@ impl TrainingConfigBuilder {
         self.shadow_pool_size = size;
         self
     }
+    /// Sets the queue bound of the shadow scheduler (Java `shadowPoolCapacity`).
     pub fn shadow_pool_capacity(mut self, capacity: usize) -> Self {
         self.shadow_pool_capacity = capacity;
         self
@@ -702,6 +723,17 @@ pub struct ShadowRunReport {
     pub feedback_submitted: bool,
 }
 
+/// RAII guard for one admitted shadow run: releases the admission slot on drop.
+struct ShadowAdmission<'a> {
+    router: &'a TrainingRouter,
+}
+
+impl Drop for ShadowAdmission<'_> {
+    fn drop(&mut self) {
+        self.router.shadow_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Runs shadow agents to collect training data, mirroring `TrainingRouter`.
 ///
 /// Java registers this as a global `PreCall`/`PostCall` hook. Rust has no global
@@ -718,11 +750,48 @@ pub struct TrainingRouter {
     /// Caps how many shadow runs execute at once: the Rust counterpart of Java's
     /// `Schedulers.newBoundedElastic(shadowPoolSize, shadowPoolCapacity, ...)`.
     shadow_slots: Arc<tokio::sync::Semaphore>,
+    /// Bounded admission (queue) counter, the counterpart of the queue bound of
+    /// Java's bounded-elastic scheduler (`shadowPoolCapacity`).
+    shadow_in_flight: AtomicUsize,
+    /// Run-id allocator used by this router. Instance-scoped by default instead of
+    /// process-global, so independent runners (and tests) cannot interfere.
+    run_registry: Arc<RunRegistry>,
+    /// Run-context store used by this router.
+    task_registry: Arc<TaskExecutionRegistry>,
 }
 
 impl TrainingRouter {
     /// Creates a router from a config and a Trinity client.
+    ///
+    /// The router gets its **own** [`RunRegistry`] / [`TaskExecutionRegistry`]. Java
+    /// keeps both in `static` fields, so all routers in a JVM share them; use
+    /// [`TrainingRouter::with_global_registries`] to reproduce that exactly.
     pub fn new(config: TrainingConfig, trinity_client: TrinityClient) -> Self {
+        Self::with_registries(
+            config,
+            trinity_client,
+            Arc::new(RunRegistry::new()),
+            Arc::new(TaskExecutionRegistry::new()),
+        )
+    }
+
+    /// Creates a router sharing the process-wide registries (Java parity).
+    pub fn with_global_registries(config: TrainingConfig, trinity_client: TrinityClient) -> Self {
+        Self::with_registries(
+            config,
+            trinity_client,
+            RunRegistry::global(),
+            TaskExecutionRegistry::global(),
+        )
+    }
+
+    /// Creates a router with explicit registries (dependency injection).
+    pub fn with_registries(
+        config: TrainingConfig,
+        trinity_client: TrinityClient,
+        run_registry: Arc<RunRegistry>,
+        task_registry: Arc<TaskExecutionRegistry>,
+    ) -> Self {
         // Java's `newBoundedElastic` requires a positive size; keeping at least one
         // slot means a zero config can never deadlock the router.
         let slots = config.shadow_pool_size().max(1);
@@ -730,12 +799,47 @@ impl TrainingRouter {
             config,
             trinity_client,
             shadow_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+            shadow_in_flight: AtomicUsize::new(0),
+            run_registry,
+            task_registry,
         }
     }
 
     /// Number of shadow slots currently free (observability for hosts and tests).
     pub fn available_shadow_slots(&self) -> usize {
         self.shadow_slots.available_permits()
+    }
+
+    /// Number of shadow runs currently admitted (in flight or waiting for a slot).
+    pub fn pending_shadow_runs(&self) -> usize {
+        self.shadow_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The run-id allocator this router uses.
+    pub fn run_registry(&self) -> &Arc<RunRegistry> {
+        &self.run_registry
+    }
+
+    /// The run-context store this router uses.
+    pub fn task_registry(&self) -> &Arc<TaskExecutionRegistry> {
+        &self.task_registry
+    }
+
+    /// Admits one shadow run, returning `None` when the bounded queue is full.
+    ///
+    /// Java's `Schedulers.newBoundedElastic(size, capacity, ...)` rejects work once
+    /// `capacity` tasks are queued; a tokio semaphore has an unbounded wait queue, so
+    /// the bound is enforced here by counting admitted-but-unfinished runs. Training is
+    /// best-effort data collection, so an over-capacity run is dropped (with a warning)
+    /// rather than failing the production call. `capacity <= 0` is treated as `1` so a
+    /// zero cannot wedge the router.
+    fn try_admit_shadow_run(&self) -> Option<ShadowAdmission<'_>> {
+        let capacity = self.config.shadow_pool_capacity().max(1);
+        if self.shadow_in_flight.fetch_add(1, Ordering::SeqCst) >= capacity {
+            self.shadow_in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(ShadowAdmission { router: self })
     }
 
     /// The underlying config.
@@ -789,6 +893,16 @@ impl TrainingRouter {
 
         let repeat = self.config.repeat_time();
         for i in 0..repeat {
+            // Bounded queue (Java `newBoundedElastic` capacity): drop the run instead
+            // of queueing without bound when too many are already pending.
+            let Some(_admission) = self.try_admit_shadow_run() else {
+                tracing::warn!(
+                    "Shadow pool queue full (capacity {}), skipping training run for task {}",
+                    self.config.shadow_pool_capacity(),
+                    task_id
+                );
+                break;
+            };
             // Bounded shadow concurrency (Java `newBoundedElastic`); the permit is
             // released when this iteration finishes.
             let _slot = match Arc::clone(&self.shadow_slots).acquire_owned().await {
@@ -798,7 +912,7 @@ impl TrainingRouter {
                     break;
                 }
             };
-            let run_id = RunRegistry::allocate_run_id(&task_id);
+            let run_id = self.run_registry.allocate_run_id(&task_id);
             let context = Arc::new(RunExecutionContext::create(task_id.clone(), run_id.clone()));
 
             let report = self
@@ -812,7 +926,7 @@ impl TrainingRouter {
             reports.push(report);
 
             if i == repeat - 1 {
-                RunRegistry::cleanup(&task_id);
+                self.run_registry.cleanup(&task_id);
             }
         }
         reports
@@ -890,7 +1004,7 @@ impl TrainingRouter {
         match self.trinity_client.feedback(&request).await {
             Ok(()) => {
                 report.feedback_submitted = true;
-                TaskExecutionRegistry::register(context);
+                self.task_registry.register(context);
             }
             Err(e) => tracing::error!("Failed to submit feedback: {e}"),
         }
@@ -930,7 +1044,9 @@ impl TrainingRouter {
 /// * the post-call step is awaited inline instead of being subscribed on a bounded
 ///   elastic pool, so a production call only completes after its shadow runs do
 ///   (wrap the call in `tokio::spawn` when that latency matters);
-/// * it only applies to the agents the host attaches it to, not to every agent.
+/// * it only applies to the agents the host attaches it to, not to every agent;
+/// * unloading is done through [`TrainingHook::disable`] (Java
+///   `removeSystemHook`), because a built [`MiddlewareChain`] cannot be edited.
 ///
 /// A call that fails before producing an `AGENT_RESULT` (for example an interrupted
 /// run) has no reply message, so it is skipped instead of being trained on.
@@ -939,6 +1055,11 @@ pub struct TrainingHook {
     spec: Mutex<ShadowAgentSpec>,
     agent: Mutex<Option<Weak<ReActAgent>>>,
     completed_calls: Arc<AtomicUsize>,
+    /// When `false` the hook stays installed but behaves like the default middleware
+    /// (pure passthrough). This is the Rust counterpart of Java
+    /// `AgentBase.removeSystemHook(router)`: a built [`MiddlewareChain`] cannot be
+    /// edited, so "uninstalling" means disabling.
+    enabled: AtomicBool,
 }
 
 impl TrainingHook {
@@ -949,7 +1070,28 @@ impl TrainingHook {
             spec: Mutex::new(ShadowAgentSpec::default()),
             agent: Mutex::new(None),
             completed_calls: Arc::new(AtomicUsize::new(0)),
+            enabled: AtomicBool::new(true),
         }
+    }
+
+    /// Enables or disables the hook at runtime (Java `addSystemHook`/`removeSystemHook`).
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Re-enables the hook after [`Self::disable`].
+    pub fn enable(&self) {
+        self.set_enabled(true);
+    }
+
+    /// Disables the hook; it stays in the chain but no longer drives the router.
+    pub fn disable(&self) {
+        self.set_enabled(false);
+    }
+
+    /// Whether the hook currently drives the router.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
     }
 
     /// Overrides the shadow-clone spec used for every call this hook observes.
@@ -993,6 +1135,9 @@ impl Middleware for TrainingHook {
         input: AgentInput,
         next: Next<AgentInput>,
     ) -> EventStream {
+        if !self.is_enabled() {
+            return next(input);
+        }
         let inputs = input.messages.clone();
         let reply: Arc<Mutex<Option<Msg>>> = Arc::new(Mutex::new(None));
         let reply_slot = Arc::clone(&reply);
@@ -1036,8 +1181,12 @@ pub struct TrainingRunner {
     config: TrainingConfig,
     trinity_client: TrinityClient,
     router: Arc<TrainingRouter>,
-    running: std::sync::atomic::AtomicBool,
+    running: AtomicBool,
     commit_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Hooks installed through [`TrainingRunner::attach`], weakly held so the runner
+    /// never keeps an agent's middleware alive. [`TrainingRunner::stop`] disables them
+    /// (Java `removeSystemHook`).
+    hooks: Mutex<Vec<Weak<TrainingHook>>>,
 }
 
 impl TrainingRunner {
@@ -1070,7 +1219,32 @@ impl TrainingRunner {
     pub fn attach(&self, chain: &mut MiddlewareChain) -> Arc<TrainingHook> {
         let hook = Arc::new(TrainingHook::new(self.router()));
         hook.install(chain);
+        self.hooks.lock().unwrap().push(Arc::downgrade(&hook));
         hook
+    }
+
+    /// Disables every hook installed through [`Self::attach`].
+    ///
+    /// This is the Rust counterpart of Java `AgentBase.removeSystemHook(router)`: a
+    /// built [`MiddlewareChain`] is immutable, so the hook stays in the chain but
+    /// behaves like a plain passthrough. Entries whose hook has been dropped are
+    /// pruned. Called automatically by [`Self::stop`].
+    pub fn disable_attached_hooks(&self) {
+        let mut hooks = self.hooks.lock().unwrap();
+        hooks.retain(|weak| match weak.upgrade() {
+            Some(hook) => {
+                hook.disable();
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Number of live hooks installed through [`Self::attach`].
+    pub fn attached_hook_count(&self) -> usize {
+        let mut hooks = self.hooks.lock().unwrap();
+        hooks.retain(|weak| weak.strong_count() > 0);
+        hooks.len()
     }
 
     /// Whether a periodic-commit task is currently installed.
@@ -1098,6 +1272,8 @@ impl TrainingRunner {
         if let Some(handle) = self.commit_task.lock().unwrap().take() {
             handle.abort();
         }
+        // Java `stop()` also removes the system hook; here that means disabling it.
+        self.disable_attached_hooks();
         let _ = self.commit().await;
         tracing::info!("TrainingRunner stopped");
     }
@@ -1233,8 +1409,9 @@ impl TrainingRunnerBuilder {
             config,
             trinity_client,
             router,
-            running: std::sync::atomic::AtomicBool::new(false),
+            running: AtomicBool::new(false),
             commit_task: Mutex::new(None),
+            hooks: Mutex::new(Vec::new()),
         })
     }
 }
@@ -1251,18 +1428,6 @@ mod tests {
     use super::*;
     use crate::reward::ZeroRewardCalculator;
     use crate::strategy::{SamplingRateStrategy, TrainingAnnotation};
-
-    /// Serialises tests that touch the process-global `RunRegistry` /
-    /// `TaskExecutionRegistry`.
-    ///
-    /// Without this they run concurrently under `cargo test`'s default thread
-    /// pool and each test's `clear_all()` wipes the other's counters, which made
-    /// `run_registry_allocates_incrementing_ids` flaky (observed:
-    /// `get_current_run_count("task-a") == 0` instead of `2`).
-    fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[test]
     fn run_execution_context_collects() {
@@ -1292,41 +1457,68 @@ mod tests {
         assert_eq!(ctx.get_messages()[0].text_content(), "b");
     }
 
+    // Registry tests use instance registries (`RunRegistry::new()` /
+    // `TaskExecutionRegistry::new()`), so they never mutate process-wide state and
+    // stay correct when cargo runs tests in parallel (`-j 2` and above).
+
     #[test]
     fn run_registry_allocates_incrementing_ids() {
-        let _guard = registry_test_lock();
-        RunRegistry::clear_all();
-        assert_eq!(RunRegistry::allocate_run_id("task-a"), "0");
-        assert_eq!(RunRegistry::allocate_run_id("task-a"), "1");
-        assert_eq!(RunRegistry::get_current_run_count("task-a"), 2);
-        assert_eq!(RunRegistry::allocate_run_id("task-b"), "0");
-        assert_eq!(RunRegistry::size(), 2);
-        RunRegistry::cleanup("task-a");
-        assert_eq!(RunRegistry::get_current_run_count("task-a"), 0);
+        let registry = RunRegistry::new();
+        assert_eq!(registry.allocate_run_id("task-a"), "0");
+        assert_eq!(registry.allocate_run_id("task-a"), "1");
+        assert_eq!(registry.get_current_run_count("task-a"), 2);
+        assert_eq!(registry.allocate_run_id("task-b"), "0");
+        assert_eq!(registry.size(), 2);
+        registry.cleanup("task-a");
+        assert_eq!(registry.get_current_run_count("task-a"), 0);
+    }
+
+    #[test]
+    fn run_registry_instances_are_isolated() {
+        let a = RunRegistry::new();
+        let b = RunRegistry::new();
+        assert_eq!(a.allocate_run_id("task"), "0");
+        assert_eq!(a.allocate_run_id("task"), "1");
+        // A second registry has its own counter space: no cross-test interference.
+        assert_eq!(b.allocate_run_id("task"), "0");
+        assert_eq!(b.get_current_run_count("task"), 1);
+        assert_eq!(a.get_current_run_count("task"), 2);
+    }
+
+    #[test]
+    fn run_registry_global_is_a_shared_singleton() {
+        // Java parity: `global()` is a process-wide singleton, shared by reference.
+        let first = RunRegistry::global();
+        let second = RunRegistry::global();
+        assert!(Arc::ptr_eq(&first, &second));
+        // Use a unique task id instead of `clear_all()` so this stays parallel-safe.
+        let task = task_id_generator::generate();
+        assert_eq!(first.allocate_run_id(&task), "0");
+        assert_eq!(second.get_current_run_count(&task), 1);
+        second.cleanup(&task);
     }
 
     #[test]
     fn task_execution_registry_flow() {
-        let _guard = registry_test_lock();
-        TaskExecutionRegistry::clear_all();
+        let registry = TaskExecutionRegistry::new();
         let c1 = Arc::new(RunExecutionContext::create("t", "1"));
         let c0 = Arc::new(RunExecutionContext::create("t", "0"));
-        TaskExecutionRegistry::register(c1);
-        TaskExecutionRegistry::register(c0);
-        let runs = TaskExecutionRegistry::get_runs_by_task("t");
+        registry.register(c1);
+        registry.register(c0);
+        let runs = registry.get_runs_by_task("t");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].get_run_id(), "0");
         assert_eq!(runs[1].get_run_id(), "1");
-        assert!(TaskExecutionRegistry::get_run("t", "1").is_some());
-        assert_eq!(TaskExecutionRegistry::get_run_count("t"), 2);
-        assert_eq!(TaskExecutionRegistry::get_task_count(), 1);
-        assert_eq!(TaskExecutionRegistry::get_total_run_count(), 2);
-        let stats = TaskExecutionRegistry::get_stats();
+        assert!(registry.get_run("t", "1").is_some());
+        assert_eq!(registry.get_run_count("t"), 2);
+        assert_eq!(registry.get_task_count(), 1);
+        assert_eq!(registry.get_total_run_count(), 2);
+        let stats = registry.get_stats();
         assert_eq!(stats.get_task_count(), 1);
         assert_eq!(stats.get_total_run_count(), 2);
         assert!((stats.get_average_runs_per_task() - 2.0).abs() < 1e-9);
-        assert_eq!(TaskExecutionRegistry::cleanup("t"), 2);
-        assert_eq!(TaskExecutionRegistry::get_task_count(), 0);
+        assert_eq!(registry.cleanup("t"), 2);
+        assert_eq!(registry.get_task_count(), 0);
     }
 
     #[test]
@@ -1509,49 +1701,95 @@ mod tests {
 
     #[test]
     fn run_registry_handles_empty_ids_and_cleanup_old_tasks() {
-        let _guard = registry_test_lock();
-        RunRegistry::clear_all();
-        assert_eq!(RunRegistry::get_current_run_count(""), 0);
-        RunRegistry::cleanup(""); // no-op
-                                  // Reserved interface mirrors Java's no-op TODO.
-        RunRegistry::cleanup_old_tasks(Duration::from_secs(60));
-        assert_eq!(RunRegistry::size(), 0);
+        let registry = RunRegistry::new();
+        assert_eq!(registry.get_current_run_count(""), 0);
+        registry.cleanup(""); // no-op
+                              // Reserved interface mirrors Java's no-op TODO.
+        registry.cleanup_old_tasks(Duration::from_secs(60));
+        assert_eq!(registry.size(), 0);
     }
 
     #[test]
     #[should_panic]
     fn run_registry_rejects_empty_task_id() {
-        let _guard = registry_test_lock();
-        let _ = RunRegistry::allocate_run_id("");
+        let registry = RunRegistry::new();
+        let _ = registry.allocate_run_id("");
     }
 
     #[test]
     fn task_execution_registry_empty_lookups() {
-        let _guard = registry_test_lock();
-        TaskExecutionRegistry::clear_all();
-        assert!(TaskExecutionRegistry::get_runs_by_task("").is_empty());
-        assert!(TaskExecutionRegistry::get_runs_by_task("missing").is_empty());
-        assert!(TaskExecutionRegistry::get_run("", "0").is_none());
-        assert!(TaskExecutionRegistry::get_run("t", "").is_none());
-        assert!(TaskExecutionRegistry::get_run("missing", "0").is_none());
-        assert_eq!(TaskExecutionRegistry::get_run_count(""), 0);
-        assert_eq!(TaskExecutionRegistry::cleanup(""), 0);
-        assert_eq!(TaskExecutionRegistry::cleanup("missing"), 0);
-        assert_eq!(TaskExecutionRegistry::get_task_count(), 0);
-        assert_eq!(TaskExecutionRegistry::get_total_run_count(), 0);
-        assert!(TaskExecutionRegistry::get_all_task_ids().is_empty());
+        let registry = TaskExecutionRegistry::new();
+        assert!(registry.get_runs_by_task("").is_empty());
+        assert!(registry.get_runs_by_task("missing").is_empty());
+        assert!(registry.get_run("", "0").is_none());
+        assert!(registry.get_run("t", "").is_none());
+        assert!(registry.get_run("missing", "0").is_none());
+        assert_eq!(registry.get_run_count(""), 0);
+        assert_eq!(registry.cleanup(""), 0);
+        assert_eq!(registry.cleanup("missing"), 0);
+        assert_eq!(registry.get_task_count(), 0);
+        assert_eq!(registry.get_total_run_count(), 0);
+        assert!(registry.get_all_task_ids().is_empty());
     }
 
     #[test]
     fn task_execution_registry_lists_task_ids() {
-        let _guard = registry_test_lock();
-        TaskExecutionRegistry::clear_all();
-        TaskExecutionRegistry::register(Arc::new(RunExecutionContext::create("t-a", "0")));
-        TaskExecutionRegistry::register(Arc::new(RunExecutionContext::create("t-b", "0")));
-        let mut ids = TaskExecutionRegistry::get_all_task_ids();
+        let registry = TaskExecutionRegistry::new();
+        registry.register(Arc::new(RunExecutionContext::create("t-a", "0")));
+        registry.register(Arc::new(RunExecutionContext::create("t-b", "0")));
+        let mut ids = registry.get_all_task_ids();
         ids.sort();
         assert_eq!(ids, vec!["t-a".to_string(), "t-b".to_string()]);
-        TaskExecutionRegistry::clear_all();
+        registry.clear_all();
+        assert_eq!(registry.get_task_count(), 0);
+    }
+
+    #[test]
+    fn task_execution_registry_global_is_a_shared_singleton() {
+        let first = TaskExecutionRegistry::global();
+        let second = TaskExecutionRegistry::global();
+        assert!(Arc::ptr_eq(&first, &second));
+        let task = task_id_generator::generate();
+        first.register(Arc::new(RunExecutionContext::create(&task, "0")));
+        assert_eq!(second.get_run_count(&task), 1);
+        second.cleanup(&task);
+    }
+
+    #[test]
+    fn routers_own_isolated_registries_by_default() {
+        let router_a = router_with(0.0, 1);
+        let router_b = router_with(0.0, 1);
+        // Independent instances => no shared process-wide state.
+        assert!(!Arc::ptr_eq(
+            router_a.run_registry(),
+            router_b.run_registry()
+        ));
+        assert!(!Arc::ptr_eq(
+            router_a.task_registry(),
+            router_b.task_registry()
+        ));
+        assert_eq!(router_a.run_registry().allocate_run_id("task"), "0");
+        // `router_b` is unaffected by `router_a`'s allocation.
+        assert_eq!(router_b.run_registry().get_current_run_count("task"), 0);
+        assert_eq!(router_a.run_registry().get_current_run_count("task"), 1);
+
+        // Java parity is still available on request.
+        let shared = TrainingRouter::with_global_registries(
+            TrainingConfig::builder()
+                .trinity_endpoint("http://127.0.0.1:1")
+                .reward_calculator(Arc::new(ZeroRewardCalculator))
+                .build()
+                .unwrap(),
+            TrinityClient::builder()
+                .endpoint("http://127.0.0.1:1")
+                .build()
+                .unwrap(),
+        );
+        assert!(Arc::ptr_eq(shared.run_registry(), &RunRegistry::global()));
+        assert!(Arc::ptr_eq(
+            shared.task_registry(),
+            &TaskExecutionRegistry::global()
+        ));
     }
 
     #[test]
@@ -1787,11 +2025,20 @@ mod tests {
     }
 
     fn router_with(sample_rate: f64, shadow_pool_size: usize) -> TrainingRouter {
+        router_with_capacity(sample_rate, shadow_pool_size, 1000)
+    }
+
+    fn router_with_capacity(
+        sample_rate: f64,
+        shadow_pool_size: usize,
+        shadow_pool_capacity: usize,
+    ) -> TrainingRouter {
         let config = TrainingConfig::builder()
             .trinity_endpoint("http://127.0.0.1:1")
             .selection_strategy(Arc::new(SamplingRateStrategy::of(sample_rate)))
             .reward_calculator(Arc::new(ZeroRewardCalculator))
             .shadow_pool_size(shadow_pool_size)
+            .shadow_pool_capacity(shadow_pool_capacity)
             .build()
             .unwrap();
         let client = TrinityClient::builder()
@@ -1799,6 +2046,54 @@ mod tests {
             .build()
             .unwrap();
         TrainingRouter::new(config, client)
+    }
+
+    #[tokio::test]
+    async fn router_shadow_queue_capacity_bounds_admission() {
+        let router = router_with_capacity(1.0, 2, 1);
+        assert_eq!(router.pending_shadow_runs(), 0);
+        let held = router
+            .try_admit_shadow_run()
+            .expect("first run is admitted");
+        assert_eq!(router.pending_shadow_runs(), 1);
+        // Queue bound reached: the next run is dropped instead of queued forever
+        // (Java `newBoundedElastic(size, capacity, ...)` rejects work likewise).
+        assert!(router.try_admit_shadow_run().is_none());
+        assert_eq!(router.pending_shadow_runs(), 1);
+        drop(held);
+        assert_eq!(router.pending_shadow_runs(), 0);
+        assert!(router.try_admit_shadow_run().is_some());
+
+        // A zero capacity degrades to one slot so a bad config cannot wedge the router.
+        let zero = router_with_capacity(1.0, 2, 0);
+        let held_zero = zero.try_admit_shadow_run();
+        assert!(held_zero.is_some());
+        assert!(zero.try_admit_shadow_run().is_none());
+        drop(held_zero);
+        assert_eq!(zero.pending_shadow_runs(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_shadow_checks_queue_capacity_before_running() {
+        let router = router_with_capacity(1.0, 1, 1);
+        let prod = model_support::agent("prod");
+        let held = router.try_admit_shadow_run().expect("admission slot");
+        // Selection would accept, but admission is full, so no shadow run is made
+        // (and therefore no network call is attempted).
+        let reports = router
+            .run_shadow(
+                "prod",
+                &prod,
+                vec![Msg::user("hi")],
+                Msg::assistant("ok"),
+                None,
+                ShadowAgentSpec::default(),
+            )
+            .await;
+        assert!(reports.is_empty());
+        assert_eq!(router.pending_shadow_runs(), 1);
+        drop(held);
+        assert_eq!(router.pending_shadow_runs(), 0);
     }
 
     #[tokio::test]
@@ -1911,5 +2206,67 @@ mod tests {
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(reply.text_content(), "ok");
         assert_eq!(hook.completed_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn training_hook_disable_makes_it_a_passthrough() {
+        let router = Arc::new(router_with(0.0, 10));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(router));
+        hook.install(&mut chain);
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("prod")
+                .model(Arc::new(model_support::ReplyModel))
+                .middleware_chain(chain)
+                .build()
+                .unwrap(),
+        );
+        hook.bind_agent(&agent);
+        assert!(hook.is_enabled());
+        // Java `removeSystemHook`: the middleware stays in the chain but stops driving
+        // the router.
+        hook.disable();
+        assert!(!hook.is_enabled());
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        assert_eq!(hook.completed_calls(), 0);
+
+        hook.enable();
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(hook.completed_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_stop_disables_attached_hooks() {
+        let runner = TrainingRunner::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            // 0% sampling keeps the hook's post-call step offline (no shadow run).
+            .selection_strategy(Arc::new(SamplingRateStrategy::of(0.0)))
+            .commit_interval_seconds(0)
+            .build()
+            .unwrap();
+        let mut chain = MiddlewareChain::new();
+        let hook = runner.attach(&mut chain);
+        assert_eq!(runner.attached_hook_count(), 1);
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("prod")
+                .model(Arc::new(model_support::ReplyModel))
+                .middleware_chain(chain)
+                .build()
+                .unwrap(),
+        );
+        hook.bind_agent(&agent);
+        runner.start();
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(hook.completed_calls(), 1);
+
+        runner.stop().await;
+        assert!(!hook.is_enabled());
+        // The production agent keeps working; only the training hook went quiet.
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(hook.completed_calls(), 1);
     }
 }

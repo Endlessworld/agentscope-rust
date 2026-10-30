@@ -17,9 +17,9 @@
 | Java 子模块 | backend/reward/runner/strategy |
 | Java 规模（2026-10-22 实测） | 主代码 20 文件 / 3275 总行（有效行 1463）/ 测试 19 文件 / 3457 总行（有效行 2008）；主 20 个顶层类（+8 个嵌套类）；17 个测试类带 `@Test`，`@Test` 共 166 |
 | Rust crate | `crates/agentscope-extensions-training` |
-| Rust 规模（2026-10-28 实测） | 5 个源文件；`runner.rs` 1722 行（其余未变：`backend.rs` 748、`lib.rs` 32、`reward.rs` 107、`strategy.rs` 720）；**74 个测试**（2026-10-28：`#[test]` 61 + `#[tokio::test]` 13） |
+| Rust 规模（2026-10-31 实测） | 5 个源文件；`runner.rs` 2272 行（其余未变：`backend.rs` 748、`lib.rs` 32、`reward.rs` 107、`strategy.rs` 720）；**82 个测试**（2026-10-31：`#[test]` 65 + `#[tokio::test]` 17；分模块 strategy 18 / backend 17 / reward 3 / runner 44） |
 | 迁移波次 | C |
-| 当前状态 | **总判：已完成**（代码面 P1 清零，余 live 联调 + P2）—— 历史：2026-09-18 收尾（build ✅ / test 64 passed）；2026-10-22 静态复核发现的 2 P0 + 3 P1 + 4 P2 已按 §4.2 处理（P0-1 经核实非缺口 / P1-3 设计决定 / P2-1 待环境 / P2-3 对齐 Java），2026-10-28 实测 **74 passed** |
+| 当前状态 | **总判：已完成**（代码面 P0/P1/P2 全清，余 live 联调 P2-1）—— 历史：2026-09-18 收尾（build ✅ / test 64 passed）；2026-10-22 静态复核 2 P0 + 3 P1 + 4 P2 按 §4.2 处理；2026-10-28 实测 74 passed；**2026-10-31 收口：注册表去进程全局化（P2-3）、`shadow_pool_capacity` 接线（P2-2）、`TrainingHook` 卸载（P2-5），源码测试数 82（待实跑确认），并删除测试串行锁** |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -28,12 +28,12 @@
 | `backend/dto/FeedbackRequest` | Feedback API 请求体（msg_ids/reward/task_id/run_id） | `backend::dto::FeedbackRequest` | 同上 |
 | `backend/dto/StatusResponse` | 通用状态响应（status/message/isSuccess） | `backend::dto::StatusResponse` | `is_success()` 复刻 `"success".equalsIgnoreCase` |
 | `backend/TrinityClient` | Trinity Feedback/Commit HTTP 客户端（OkHttp） | `backend::TrinityClient`（`reqwest`，async） | 只有 `/feedback`、`/commit`；Chat 走 OpenAI 兼容模型 |
-| `backend/TrinityModelAdapter` | 组合包装 OpenAIChatModel，拦截响应收集 msg_id → RunExecutionContext | `backend::TrinityModelAdapter`（实现 core `Model` trait，组合 `Arc<dyn Model>`） | **不重建模型**：实现 core `Model` trait 并委派给内层 model；`stream` 中把每个 `ChatResponse.id` 记入 `RunExecutionContext`。**已完成（2026-10-29 勘误）**：原记「Java 强制 `stream(false)`，Rust 建的 `OpenAiChatModel` 恒为流式且无 stream 开关（见 §4.2 P0-2）」，实际已闭环——`TrinityModelAdapter::stream` 置 `options.stream = Some(false)` 并对连续重复 id 去重（`backend.rs:305-325`），MODEL 侧 `openai/mod.rs:265/311` 已读 `options.stream` 并走非流式分支（§4.2 P0-2） |
+| `backend/TrinityModelAdapter` | 组合包装 OpenAIChatModel，拦截响应收集 msg_id → RunExecutionContext | `backend::TrinityModelAdapter`（实现 core `Model` trait，组合 `Arc<dyn Model>`） | **不重建模型**：实现 core `Model` trait 并委派给内层 model；`stream` 中把每个 `ChatResponse.id` 记入 `RunExecutionContext`。**已完成（2026-10-29 勘误）**：原记「Java 强制 `stream(false)`，Rust 建的 `OpenAiChatModel` 恒为流式且无 stream 开关（见 §4.2 P0-2）」，实际已闭环——`TrinityModelAdapter::stream` 置 `options.stream = Some(false)` 并对连续重复 id 去重（`backend.rs:305-325`），MODEL 侧 `openai/mod.rs:271/320` 已读 `options.stream` 并走非流式分支（§4.2 P0-2） |
 | `reward/RewardCalculator` | 依据 shadow Agent 执行结果算 reward | `reward::RewardCalculator`（trait，`fn calculate(&self, agent: &ReActAgent) -> f64`） | Rust 用 `ReActAgent` 具体类型（等价 Java `Agent` 参数） |
 | `runner/AgentCloner` | 反射提取配置 + Builder 重建 Agent（换 model，新建空 memory） | `runner::AgentCloner::clone_with_model`（基于 `ReActAgent`/`ReActAgentBuilder` 显式重建） | Rust 无反射：name/description/toolkit 由 `Agent` trait 回读，`sys_prompt`/`max_iters` **已通过 core getter 回读**（`ReActAgent::sys_prompt()`/`max_iters()`），`ShadowAgentSpec` 降级为可选覆盖；`modelExecutionConfig`/`toolExecutionConfig`/`toolExecutionContext` **设计决定（不迁移）**（core 无字段/无 setter，见 §4.2 P1-3） |
 | `runner/RunExecutionContext` | 单次 Run 的执行上下文（msgIds/msgs/timing） | `runner::RunExecutionContext` | `Arc<Mutex<...>>` 内部可变，线程安全 |
-| `runner/RunRegistry` | taskId → Run 计数（自增 runId） | `runner::RunRegistry`（静态全局，`Mutex<HashMap>`） | Java 为静态单例；Rust 用 `OnceLock` 全局 |
-| `runner/TaskExecutionRegistry` | taskId → Vec<RunExecutionContext> 注册与统计 | `runner::TaskExecutionRegistry` | 同上；查询按 runId 数值排序 |
+| `runner/RunRegistry` | taskId → Run 计数（自增 runId） | `runner::RunRegistry`（实例句柄：`new()` / `global()`） | Java 为静态单例；Rust 默认**每 router 一个实例**（`TrainingRouter::new`），`RunRegistry::global()` 保留 JVM 级共享能力（`TrainingRouter::with_global_registries`）。测试不再共享进程状态（§9） |
+| `runner/TaskExecutionRegistry` | taskId → Vec<RunExecutionContext> 注册与统计 | `runner::TaskExecutionRegistry`（实例句柄，同上） | 同上；查询按 runId 数值排序 |
 | `runner/TaskIdGenerator` | 生成 `task-{uuid}` / `task-{ts}-{rand}` | `runner::task_id_generator`（uuid crate） | `uuid` 已在 workspace deps |
 | `runner/TrainingConfig` | 训练配置（endpoint/模型/策略/reward/commit 间隔/池/repeatTime） | `runner::TrainingConfig` + Builder | 默认值对齐 |
 | `runner/TrainingRouter` | 训练路由 Hook：PreCall 存输入、PostCall 选择+shadow 执行+feedback | `runner::TrainingRouter` + **`runner::TrainingHook`**（core `Middleware`，`ExtensionPoint::OnAgent`，经 `TrainingRunner::attach(&mut MiddlewareChain)` 显式装配）+ 显式驱动 API `decide(...)` / `run_shadow(...)` + `ShadowRunReport` | 见 §4.2：Java Hook 的 `PreCall/PostCall` 由 `on_agent` 洋葱拦截等价承载（`TrainingHook`，2026-10-28 收口），保留 `-shadow` 递归保护 / repeatTime / runId / feedback 全流程 |
@@ -50,7 +50,7 @@
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
 |---|---|---|---|
 | okhttp3（OkHttpClient/Request/Response/MediaType） | Trinity Feedback/Commit HTTP | `reqwest`（workspace deps 已有，0.12，json+rustls） | 仅本 crate `[dependencies]` 使用 |
-| reactor-core（Mono/Flux/Schedulers） | 响应式 + 有界弹性线程池跑 shadow | `tokio`（async fn / spawn / interval） | shadow 跑在 tokio 任务，池大小由 Tokio 运行时承载 |
+| reactor-core（Mono/Flux/Schedulers） | 响应式 + 有界弹性线程池跑 shadow | `tokio`（async fn / spawn / interval） | shadow 跑在 tokio 任务；池参数两个都已接线（`shadow_pool_size` → `Semaphore` 并发上限，`shadow_pool_capacity` → 准入计数上限，2026-10-31） |
 | reactor.util.context（Context/ContextView） | 训练标记跨线程传播 | 显式 `TrainingAnnotation` 参数 | Rust 无等价上下文；见 §4.2 |
 | jackson（@JsonProperty snake_case） | DTO 序列化 | `serde` + `#[serde(rename_all = "snake_case")]` | commit/feedback 体字段名对齐 |
 | `io.agentscope.core.model.openai.OpenAIChatModel` | Trinity Chat（OpenAI 兼容） | `agentscope_extensions_model::OpenAiChatModel`（2026-09-21 前为 `agentscope_core::model::OpenAiChatModel`） | TrinityModelAdapter 组合它（`Arc<dyn Model>`） |
@@ -91,35 +91,36 @@
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | RunExecutionContext | RunExecutionContext | 已完成 | taskId/runId/msgIds/msgs/startTime + duration |
-| RunRegistry（runId 自增 + cleanup） | RunRegistry | 已完成 | 全局 `OnceLock<Mutex<HashMap>>` |
-| TaskExecutionRegistry（注册/查询/统计） | TaskExecutionRegistry | 已完成 | 含 `RegistryStats` |
+| RunRegistry（runId 自增 + cleanup） | RunRegistry | 已完成（2026-10-31 改实例句柄） | 实例字段 `Mutex<HashMap<String, AtomicUsize>>`；`RunRegistry::new()` 隔离实例、`RunRegistry::global()` 进程级单例（Java 对齐）；`TrainingRouter::new` 默认用实例，`with_global_registries` 用全局 |
+| TaskExecutionRegistry（注册/查询/统计） | TaskExecutionRegistry | 已完成（2026-10-31 改实例句柄） | 同上：`new()` / `global()` / `TrainingRouter::with_registries(...)` 注入 |
 | TaskIdGenerator | TaskIdGenerator | 已完成 | `task-{uuid}` / `task-{ts}-{rand}` |
 | TrainingConfig + Builder | TrainingConfig | 已完成 | 默认值对齐；build 校验 endpoint+rewardCalculator |
 | AgentCloner（换 model 重建 shadow） | AgentCloner | 已完成（2026-10-28） | 基于 `ReActAgentBuilder` 重建（name+`-shadow`/description/toolkit/model/`todo_tool(false)`）；**`sys_prompt`/`max_iters` 默认从原 agent 回读**（`original.sys_prompt()`/`original.max_iters()`），`ShadowAgentSpec` 仅在显式提供时覆盖（§4.2 P1-1 已关闭）；`modelExecutionConfig`/`toolExecutionConfig`/`toolExecutionContext` = **设计决定（不迁移）**（core 无关字段与 setter，见 §4.2 P1-3） |
-| TrainingRouter（选择 + shadow + feedback） | TrainingRouter | 已完成（语义调整） | 提供显式 `decide`/`run_shadow` API，以及 **`TrainingHook`（core `Middleware`, `OnAgent`）** 自动驱动；保留 `-shadow` 递归保护、repeatTime/runId/feedback 全流程；`shadow_pool_size` **已接线**（`tokio::sync::Semaphore` 并发上限，`available_shadow_slots()` 可观测），`shadow_pool_capacity` 为**预留字段**（见 §4.2 P2-2） |
-| TrainingRunner（start/stop/周期 commit） | TrainingRunner | 已完成 | tokio 任务 + interval；start/stop 幂等；**调度器只看 `commit_interval_seconds`**（`enable_auto_commit` 仅记录，对齐 Java，§4.2 P1-4）；`has_commit_scheduler()` 可观测；`attach(&mut MiddlewareChain)` 提供显式 hook 装配（§4.2 P1-2） |
+| TrainingRouter（选择 + shadow + feedback） | TrainingRouter | 已完成（语义调整） | 提供显式 `decide`/`run_shadow` API，以及 **`TrainingHook`（core `Middleware`, `OnAgent`）** 自动驱动；保留 `-shadow` 递归保护、repeatTime/runId/feedback 全流程；`shadow_pool_size` 接线 = 信号量并发上限（`available_shadow_slots()`），`shadow_pool_capacity` **2026-10-31 接线** = 有界准入队列上限（`pending_shadow_runs()`，超限丢弃并告警；§4.2 P2-2）；`run_registry()`/`task_registry()` 暴露实例注册表 |
+| TrainingRunner（start/stop/周期 commit） | TrainingRunner | 已完成 | tokio 任务 + interval；start/stop 幂等；**调度器只看 `commit_interval_seconds`**（`enable_auto_commit` 仅记录，对齐 Java，§4.2 P1-4）；`has_commit_scheduler()` 可观测；`attach(&mut MiddlewareChain)` 提供显式 hook 装配（§4.2 P1-2）；**`stop()` 会 disable 已装 hook**（≈`removeSystemHook`，§4.2 P2-5），`attached_hook_count()`/`disable_attached_hooks()` 可观测/可手动调用 |
 
 ### 3.6 测试（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
 | strategy 单测 | *Test | 已完成 | 18 项（strategy.rs）：annotation（enabled/过期/labels+metadata）、context（mark/mark_with_labels/mark_with_metadata/with_annotation）、decision 工厂+Display、sampling（边界/非法值 panic/priority/name）、explicit（无标记/未启用/过期/优先级/名称/metadata+taskId 透传）、`is_expired` 辅助 |
-| backend DTO + client 单测 | *Test | 已完成 | 15 项（backend.rs，含 5 个 `#[tokio::test]`）：DTO snake_case 往返（commit/feedback）、缺省字段不序列化、StatusResponse 反序列化+大小写不敏感成功、endpoint/timeout 校验、loopback mock HTTP（feedback/commit 请求体+非 2xx）、adapter 收集 msg_id / 无 context 警告路径 / 由 base_url 自建模型 |
+| backend DTO + client 单测 | *Test | 已完成 | 17 项（backend.rs，含 7 个 `#[tokio::test]`）：DTO snake_case 往返（commit/feedback）、缺省字段不序列化、StatusResponse 反序列化+大小写不敏感成功、endpoint/timeout 校验、loopback mock HTTP（feedback/commit 请求体+非 2xx）、adapter 收集 msg_id / 无 context 警告路径 / 由 base_url 自建模型 |
 | reward 单测 | RewardCalculatorTest | 已完成 | 3 项：闭包代理、Zero 常量、闭包读取 agent 字段 |
-| runner 单测 | *Test | 已完成 | 36 项（runner.rs，含 6 个 `#[tokio::test]`；2026-10-28 新增 8 项：cloner 继承/覆盖、pool 接线、commit 调度两个、hook 装配与有/无绑定两种路径）：RunExecutionContext（收集/空 id panic/eq/display/set_messages）、RunRegistry（自增/清理/空 id panic/cleanup_old_tasks）、TaskExecutionRegistry（注册/排序/空查询/统计/ids/cleanup）、TaskIdGenerator、TrainingConfig（默认/校验/可选 setter/repeatTime/sampleRate）、TrainingRunner（builder 校验/start-stop 幂等/混用忽略）、router（recursion/sampling/explicit）、AgentCloner+ShadowAgentSpec、run_shadow 未选中短路 |
-| **合计** | | | **74 passed / 0 failed**（2026-10-28 实测 `cargo test -p agentscope-extensions-training`：strategy 18 / backend 17 / reward 3 / runner 36；源码内 `#[test]` 61 + `#[tokio::test]` 13 = 74；无 `#[ignore]`，无 doc-test） |
+| runner 单测 | *Test | 已完成 | 44 项（runner.rs，含 10 个 `#[tokio::test]`；2026-10-28 新增 8 项：cloner 继承/覆盖、pool 接线、commit 调度两个、hook 装配与有/无绑定两种路径；**2026-10-31 新增 8 项**：注册表实例隔离/global 单例×2、router 默认隔离注册表、队列容量准入×2、hook 禁用直通、`stop()` 禁用已装 hook）：RunExecutionContext（收集/空 id panic/eq/display/set_messages）、RunRegistry（自增/清理/空 id panic/cleanup_old_tasks）、TaskExecutionRegistry（注册/排序/空查询/统计/ids/cleanup）、TaskIdGenerator、TrainingConfig（默认/校验/可选 setter/repeatTime/sampleRate）、TrainingRunner（builder 校验/start-stop 幂等/混用忽略）、router（recursion/sampling/explicit）、AgentCloner+ShadowAgentSpec、run_shadow 未选中短路 |
+| **合计** | | | **82 passed / 0 failed**（2026-10-31 源码计数：`#[test]` 65 + `#[tokio::test]` 17 = 82；分模块 strategy 18 / backend 17 / reward 3 / runner 44；无 `#[ignore]`，无 doc-test。2026-10-28 基线 74，本轮 +8。**待主智能体实跑确认**） |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **状态：已完成（2026-10-29 勘误）**：原记「进行中（波次 C；2026-09-18 收尾重验，2026-10-22 静态复核发现 2 项 P0 + 3 项 P1 + 4 项 P2 缺口，见 §4.2 / §6）」，实际截至 2026-10-28 除 P0-1（实测 Java 亦无非缺口）、P1-3（设计决定）、P2-1（live 待条件）、P2-3（对齐 Java 全局单例）外**全部关闭**，实测 **74 passed / 0 failed**（§8.3；P0-2 状态总览见 §4.2 勘误）。21 个 Java 类全部有 Rust 对应（详见 §2），划分为 4 个模块：
+- **状态：已完成（2026-10-31 收口）**：截至 2026-10-28 除 P0-1（实测 Java 亦无非缺口）、P1-3（设计决定）、P2-1（live 待条件）、P2-2/P2-3 外已全部关闭；**2026-10-31 又关闭 P2-2（`shadow_pool_capacity` 接线）、P2-3（注册表去进程全局化）、P2-5（`TrainingHook` 卸载）与 §7.3 测试串行锁**，源码测试数 82（待主智能体实跑确认）。21 个 Java 类全部有 Rust 对应（详见 §2），划分为 4 个模块：
   - `strategy.rs`：`TrainingAnnotation`(+Builder)/`TrainingContext`/`SelectionDecision`/`TrainingSelectionStrategy`(trait)/`SamplingRateStrategy`/`ExplicitMarkingStrategy`/`is_expired`
   - `reward.rs`：`RewardCalculator`(trait) + `FnRewardCalculator` + `ZeroRewardCalculator`
   - `backend.rs`：`dto::{CommitRequest,FeedbackRequest,StatusResponse}` + `TrinityClient`(+Builder) + `TrinityModelAdapter`(+Builder)
-  - `runner.rs`：`task_id_generator`/`RunExecutionContext`/`RunRegistry`/`TaskExecutionRegistry`(+`RegistryStats`)/`TrainingConfig`(+Builder)/`AgentCloner`(+`ShadowAgentSpec`)/`TrainingRouter`(+`ShadowRunReport`)/`TrainingRunner`(+Builder)
+  - `runner.rs`：`task_id_generator`/`RunExecutionContext`/`RunRegistry`（`new`/`global`）/`TaskExecutionRegistry`（`new`/`global`）(+`RegistryStats`)/`TrainingConfig`(+Builder)/`AgentCloner`(+`ShadowAgentSpec`)/`TrainingRouter`(+`ShadowRunReport`)/`TrainingHook`/`TrainingRunner`(+Builder)
 - **验证命令与结果**（2026-09-18 收尾重验；2026-10-22 静态复核确认测试数自洽）：
   - `cargo build -p agentscope-extensions-training` → 通过（Finished，exit 0，无 error）
   - `cargo test -p agentscope-extensions-training` → **64 passed; 0 failed**（2026-09-18 基线；经 §7.1 增至 66，2026-10-28 增至 **74**，见下行）
   - 首轮基线 37 passed；本轮补齐 27 个离线单测（无网络、无 Trinity 依赖）。
   - **2026-10-28 复验**：`cargo build -p agentscope-extensions-training` → exit 0（本 crate 无新警告）；`cargo test -p agentscope-extensions-training` → **74 passed / 0 failed**（lib 74，doc-test 0）；连跑 3 次一致。新增 8 项测试见 §8。
+  - **2026-10-31 收口（未实跑，按硬约束由主智能体统一验证）**：源码测试函数 82（`#[test]` 65 + `#[tokio::test]` 17），本 crate 改动仅 `src/runner.rs`；`registry_test_lock` 已删除，测试之间不再共享任何进程全局可变状态。待主智能体跑 `cargo test -p agentscope-extensions-training`（建议 `-j 2` 连跑 2-3 次）确认。
   - 静态复核（2026-10-22，未编译）：源码内 `#[test]` 57 + `#[tokio::test]` 7 = **64**，与声明一致；无 `#[ignore]`、无 doc-test 块，故「64 test 通过」与代码一致（未重跑 cargo）。
 - **复用既有 trait（未重建平行类型）**：
   - `core::Model` trait：`TrinityModelAdapter` 实现它并委派内层 `Arc<dyn Model>`（组合模式，对齐 Java）。
@@ -135,6 +136,8 @@
   3. Java `AgentCloner` 用反射提取 `sysPrompt`/`maxIters` 等；Rust 无反射 → name/description/toolkit 从 `Agent` trait 读取，`sys_prompt`/`max_iters` **默认用 core getter 回读**，`ShadowAgentSpec` 仅作为显式覆盖（2026-10-28 修正，见 §4.2 P1-1）。
   4. Java `RewardCalculator.calculate(Agent)` → Rust `calculate(&ReActAgent)`（具体类型）。
   5. Java `TrinityModelAdapter` 强制 `stream(false)`（Trinity 不支持流式）；**已完成（2026-10-29 勘误）**：原记「Rust 侧 `OpenAiChatModel` 恒为流式且无关闭开关（见 §4.2 P0-2）」，实际 `TrinityModelAdapter::stream` 已强制 `options.stream = Some(false)` + 重复 id 去重，MODEL 侧已有非流式分支（§4.2 P0-2）。
+  6. **（2026-10-31）注册表作用域**：Java `RunRegistry`/`TaskExecutionRegistry` 是 `static` 字段（全 JVM 共享）；Rust 改为实例句柄，`TrainingRouter::new` 默认一 router 一套，`with_global_registries` 复现 Java 语义。取舍理由见 §4.2 P2-3（可测试性 + 避免隐式进程状态）。
+  7. **（2026-10-31）hook 卸载**：Java `removeSystemHook` 真移除；Rust 用 `TrainingHook::disable()`（引用仍留在不可变 chain 内，但 `on_agent` 直通），`TrainingRunner::stop()` 自动 disable 所有 `attach()` 过的 hook（§4.2 P2-5）。
 
 ### 4.2 剩余缺口（分级）与阻塞 / 跨模块依赖
 > 以下分级为 **2026-10-22 静态复核**结果（未编译、未运行 cargo test）。P0-1 / P0-2 为本轮新发现，详见末尾「静态复核记录」。
@@ -144,15 +147,16 @@
 | 编号 | 主题 | 2026-10-28 状态 |
 |---|---|---|
 | P0-1 | 训练数据格式/轨迹采样（Java 亦无） | 非缺口（不变） |
-| P0-2 | `TrinityModelAdapter` 流式 vs 非流式 | **已完成（2026-10-29 勘误）**：原记「部分修复（§7.1/§7.2 不变，仍待 MODEL 侧非流式分支）」，实际 `backend.rs:305-308` 已强制 `options.stream = Some(false)` 并对重复 id 去重，MODEL `openai/mod.rs:265/311` 已读 `options.stream` 并落地非流式分支（一次调用 = 一个 `ChatResponse` = 一个 msg_id） |
+| P0-2 | `TrinityModelAdapter` 流式 vs 非流式 | **已完成（2026-10-29 勘误）**：原记「部分修复（§7.1/§7.2 不变，仍待 MODEL 侧非流式分支）」，实际 `backend.rs:305-308` 已强制 `options.stream = Some(false)` 并对重复 id 去重，MODEL `openai/mod.rs:271/320` 已读 `options.stream` 并落地非流式分支（一次调用 = 一个 `ChatResponse` = 一个 msg_id） |
 | P1-1 | `AgentCloner` 丢 `sys_prompt`/`max_iters` | **已完成**（改回读，+2 测试） |
 | P1-2 | 无法全局挂载 hook | **已收口**：不改 core，新增 `TrainingHook` + `TrainingRunner::attach`（+3 测试） |
 | P1-3 | 3 个 ExecutionConfig 字段 | **设计决定（不迁移）**（core 无字段/setter） |
 | P1-4 | `enable_auto_commit` 语义 | **已完成**（对齐 Java：只看 interval，+2 测试） |
 | P2-1 | live 验证 | 待条件（不变） |
-| P2-2 | `shadow_pool_size`/`capacity` | **部分接线**：size → 信号量；capacity = 预留字段 |
-| P2-3 | 全局单例隔离 | 不变（对齐 Java） |
+| P2-2 | `shadow_pool_size`/`capacity` | **已完成（2026-10-31）**：size → 信号量并发上限；capacity → 有界准入（`pending_shadow_runs()`，超限丢弃 + 告警） |
+| P2-3 | 全局单例隔离 | **已完成（2026-10-31）**：注册表改实例句柄（`new()`/`global()`），`TrainingRouter::new` 默认隔离，`with_global_registries` 保留 Java 语义 |
 | P2-4 | 4 个零引用依赖 | **已完成**（已删除） |
+| P2-5 | `TrainingHook` 无卸载路径 | **已完成（2026-10-31）**：`disable()/enable()/is_enabled()` + `TrainingRunner::stop()` 自动 disable（+2 测试） |
 
 **P0-1：Java → Rust 缺「训练数据生成 / 格式转换」与「轨迹采样」两域（实测确认 Java 侧亦无）**
 - 复核以全仓 `*.java` 检索 `sharegpt` / `ShareGPT` / `conversations` / `toTrainingData` / `trainingSample` / `sft` / `rft`：**命中 0**（50 处 `conversations` 命中全部来自 node_modules `package-lock.json`，与 Java 源码无关）。
@@ -166,7 +170,7 @@
   1. **协议层**：Rust 向 Trinity 的 OpenAI 兼容端点发 `stream: true`，与 Java 显式规避的行为相反；Trinity 若不支持流式，shadow 调用直接失败 → 无 msg_id → 不发 feedback → **训练闭环断链**。
   2. **数据层**：`OpenAiChatModel` 的 `StreamIncrementer` 对每个 SSE chunk 产出 1 个 `ChatResponse`，且所有 chunk 复用**同一个 completion id**（`self.id` 仅在首个非空 chunk 赋值，后续 chunk 沿用）。`TrinityModelAdapter::stream()` 对**每个** response 都 `add_msg_id(resp.id)` → 同一 id 被重复写入 N 次（N = chunk 数），而 Java 恒为 1 次。**msg_ids 列表语义被污染**（重复项），直接影响 feedback 上报的轨迹条数。
 - 裁定建议：需在 `agentscope-extensions-model` 的 `OpenAiChatModel` 暴露 stream 开关（或在 `TrinityModelAdapter` 内做 id 去重 + 强制非流式）。**当前不阻塞编译，但阻塞真实 Trinity 联调**，属本轮最高优先级缺口。
-- **已闭环（2026-10-29 勘误）**：上述两条路径都已落地——①`TrinityModelAdapter::stream` 内 `options.stream = Some(false)`（`backend.rs:305-308`）并对连续重复 id 去重；②MODEL `openai/mod.rs:265` `let streaming = options.stream.unwrap_or(true)` + `:311` 非流式分支（整次 completion → 单个 `ChatResponse`）。真实 Trinity 联调仍未做（P2-1）。
+- **已闭环（2026-10-29 勘误）**：上述两条路径都已落地——①`TrinityModelAdapter::stream` 内 `options.stream = Some(false)`（`backend.rs:305-308`）并对连续重复 id 去重；②MODEL `openai/mod.rs:271` `let streaming = options.stream.unwrap_or(true)` + `:320` 非流式分支（整次 completion → 单个 `ChatResponse`）。真实 Trinity 联调仍未做（P2-1）。
 
 **P1-1：`AgentCloner` 丢弃 `sys_prompt` / `max_iters`（core 已有 getter，本 crate 未回读）**
 - 上一版 tracker 称「core 无 getter，故由 `ShadowAgentSpec` 显式传入」——**该前提不成立**：`agentscope-core/src/agent/react_agent.rs:283` 已有 `pub fn sys_prompt(&self) -> &str`，`:288` 已有 `pub fn max_iters(&self) -> i32`。
@@ -195,24 +199,36 @@
 **P2-1：live 验证待条件**
 - `TrinityClient`/`TrinityModelAdapter` 真实 HTTP 往返需 Trinity 服务端点；本轮单测均离线（loopback mock + 假 Model），未做真连。P0-2 的流式问题在离线单测中不可见（假 Model 只产出 1 个带 id 的 response）。
 
-**P2-2：`shadow_pool_size` / `shadow_pool_capacity` 存值未生效**
+**P2-2：`shadow_pool_size` / `shadow_pool_capacity` 存值未生效（2026-10-31 已全部接线；标题保留为历史记录）**
 - Java 用 `Schedulers.newBoundedElastic(shadowPoolSize, shadowPoolCapacity, "training-shadow")` 调度 shadow 调用（异步、限流、队列有界）。
 - Rust `TrainingConfig` 保留这两个字段并有 getter/builder，但**全 crate 无任何消费点**（检索仅命中定义与测试断言）→ shadow 并发度实际由调用方自行 `tokio::spawn` 决定，配置形同虚设。tracker §2.1 原表述「shadow 跑在 tokio 任务，池大小由 Tokio 运行时承载」掩盖了「配置值未被使用」的事实。
 - **2026-10-28 部分接线**：`shadow_pool_size` → `TrainingRouter` 内 `Arc<tokio::sync::Semaphore>`（许可数 `shadow_pool_size.max(1)`，`run_shadow` 每轮 `acquire_owned()`），新增 `available_shadow_slots()` 观测点。`shadow_pool_capacity` **明确为预留字段**（tokio 信号量没有有界等待队列，无法 1:1 映射 Java `newBoundedElastic` 的 queue bound），既有 getter/builder 保留，文档已标注「not consumed at runtime」。
 - 测试：`router_shadow_pool_size_is_wired`（size=3 → 3 slots；size=0 → 兜底 1 slot，不阻塞）。
+- **2026-10-31 完成（capacity 接线）**：不再依赖「tokio 无有界队列」的妥协——`TrainingRouter` 增加 `shadow_in_flight: AtomicUsize` 与私有 `try_admit_shadow_run() -> Option<ShadowAdmission<'_>>`：准入计数 `fetch_add` 大于等于 `shadow_pool_capacity.max(1)` 即退回并**丢弃**该轮 shadow（`tracing::warn!` + `break`），`ShadowAdmission` 是 RAII 守卫在轮次结束 `fetch_sub` 释放。语义对齐 Java `newBoundedElastic(size, capacity, ...)` 的「队列满即拒绝」，差异仅为拒绝后是跳过而非抛 `RejectedExecutionException`（训练数据采集属尽力而为，不应打断生产调用）。观测点 `pending_shadow_runs()`。
+- 新增测试：`router_shadow_queue_capacity_bounds_admission`（capacity=1 → 第二个准入为 `None`，释放后可再准入；capacity=0 退化为 1）、`run_shadow_checks_queue_capacity_before_running`（占满准入后 `run_shadow` 返回空 reports 且不发网络请求 → 证明 `run_shadow` 真的走了准入）。
 
-**P2-3：全局单例隔离**
-- `RunRegistry`/`TaskExecutionRegistry` 为进程内全局单例（对齐 Java 静态字段）；如需多实例隔离需后续改造。
+**P2-3：全局单例隔离（2026-10-31 已完成）**
+- 原状：`RunRegistry`/`TaskExecutionRegistry` 为进程内全局单例（`static OnceLock<Mutex<HashMap>>`，对齐 Java 静态字段）；测试靠 `registry_test_lock()` 串行化才不互相 `clear_all()`。
+- **改造**：两者改为**实例句柄**——字段私有 `Mutex<HashMap<...>>`，`new()` 返回独立实例，`global()` 返回 `Arc<Self>` 进程级单例（`OnceLock<Arc<...>>`，保留 Java 全静态语义）。
+  - `TrainingRouter::new(config, client)` → 每 router 一套独立注册表；
+  - `TrainingRouter::with_global_registries(config, client)` → 共用 `global()`（Java 对齐）；
+  - `TrainingRouter::with_registries(config, client, run_registry, task_registry)` → 依赖注入；
+  - `TrainingRouter::run_registry()` / `task_registry()` 取回句柄。
+- 影响：`run_shadow` 改用 `self.run_registry.allocate_run_id/cleanup`、`run_single_shadow` 改用 `self.task_registry.register`；**无进程全局可变状态参与测试**，`registry_test_lock` 及其 `clear_all()` 已删除（见 §7.3 与 §9）。
+- 差异（有意）：Java 的 run 计数在所有 router 间共享；Rust 默认按 router 隔离（更符合「一个 runner 一次训练」的直觉），需要 Java 语义时显式选 `with_global_registries`。
+
+**P2-5：`TrainingHook` 无卸载路径（2026-10-31 已完成）**
+- 原状：`MiddlewareChain` 在 `build()` 后不可变，hook 装上后无法移除，`TrainingRunner::stop()` 只停生命周期与 commit 调度 → 对应 Java `AgentBase.removeSystemHook` 的缺失。
+- **改造**：`TrainingHook` 增加 `enabled: AtomicBool` + `set_enabled/enable/disable/is_enabled`；`on_agent` 在禁用时**直接 `next(input)` 直通**（不克隆 reply、不跑 shadow）。`TrainingRunner` 以 `Mutex<Vec<Weak<TrainingHook>>>` 记录 `attach()` 装过的 hook（弱引用，不延长 agent/middleware 生命周期），`stop()` 调用 `disable_attached_hooks()`；另暴露 `attached_hook_count()` 与可手动调用的 `disable_attached_hooks()`。
+- 测试：`training_hook_disable_makes_it_a_passthrough`（disable → 调一次 agent，`completed_calls` 仍为 0；enable 后变 1）、`runner_stop_disables_attached_hooks`（attach → start → 调 agent（1）→ stop → 再调 agent，仍为 1，且 agent 本身照常返回）。
 
 **P2-4：无依赖清理**
 - `Cargo.toml` 声明 `agentscope-harness`、`chrono`、`async-trait`、`thiserror` 四个依赖，但 `src/**/*.rs` 引用数均为 **0** → 可移除（减少编译面）。`agentscope-harness` 尤其值得清理，避免与「未触及 harness」的表述产生歧义。
 - **2026-10-28 已清理**：先逐项 `Select-String` 复核（`agentscope_harness`/`chrono`/`thiserror`/`async_trait` 命中均为 0）再删除。剩余 `[dependencies]`：`agentscope-core`、`agentscope-extensions-model`、`serde`、`serde_json`、`tokio`、`futures`、`tracing`、`reqwest`、`uuid`；build/test 均通过。
 
-**真实剩余（2026-10-29 复核；P0-2 / P1-1~P1-4 / P2-2 / P2-4 均已关闭，实测 74 passed，见 §8.3）**
-- **live Trinity 联调未做**（P2-1）：`TrinityClient`/`TrinityModelAdapter` 仍只经 loopback mock + 假 Model 离线验证。
-- `shadow_pool_capacity` 为**预留字段未消费**（tokio 信号量无有界等待队列，无法 1:1 映射 Java `newBoundedElastic` 的 queue bound）。
-- `RunRegistry`/`TaskExecutionRegistry` 为**进程级全局单例**（`OnceLock`），无多实例隔离（对齐 Java 静态字段）。
-- `TrainingHook` **无卸载路径**：`TrainingRunner::stop()` 只停生命周期与 commit 调度，不移除已装配的 middleware（`MiddlewareChain` `build()` 后不可变）——对应 Java `removeSystemHook` 缺失（§8.4）。
+**真实剩余（2026-10-31 收口复核；P0-2 / P1-1~P1-4 / P2-2 / P2-3 / P2-4 / P2-5 均已关闭）**
+- **live Trinity 联调未做**（P2-1，唯一未关闭项，且**非代码缺口**）：`TrinityClient`/`TrinityModelAdapter` 仍只经 loopback mock + 假 Model 离线验证；本环境无 Trinity 服务端点，且无 `#[ignore]`/env gated 用例（按硬约束不得用忽略凑绿）。
+- 可选后续（非缺口，未立项）：真正的「有界阻塞队列」（当前超容量即丢弃而非排队等待）；若要 Java `RejectedExecutionException` 等价的硬失败，需宿主层把丢弃改为错误。
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-training` 基线。
@@ -322,6 +338,7 @@
 - **现象**：`cargo test --workspace` 偶发 `run_registry_allocates_incrementing_ids` 失败（`get_current_run_count("task-a")` 得到 0 而非 2）。
 - **根因**：`RunRegistry` / `TaskExecutionRegistry` 是进程级 `static`，而两条测试各自调用 `clear_all()`；cargo 默认并行跑测试时互相清空计数。属**既有测试缺陷**，非生产代码回归。
 - **修复**：测试模块内加 `registry_test_lock()`，6 条触及全局注册表的测试串行化（`MutexGuard`，中毒时取回内部值）。
+- **2026-10-31 已废弃该方案（根因消除）**：串行锁只是掩盖共享状态，锁外仍有访问路径（`run_shadow` 内部的 `allocate_run_id`/`register` 并不可见）。现注册表为实例句柄，测试全部改用 `RunRegistry::new()` / `TaskExecutionRegistry::new()`，**锁已删除**；仅 2 条测 `global()` 单例的用例共用进程级单例，且各自使用 `task_id_generator::generate()` 生成的唯一 taskId（不调 `clear_all()`）→ 任意并行度下无冲突。详见 §9。
 - **验证**：`cargo test -p agentscope-extensions-training --lib` 连跑 3 次均 **66 passed**；全量 `cargo test --workspace` → **EXIT=0**。
 ## 8. 2026-10-28 执行记录（P1-1 / P1-4 / P1-2 / P1-3 / P2-2 / P2-4）
 
@@ -379,8 +396,52 @@
 | `bind_agent` 改为空实现（hook 不绑定） | `training_hook_drives_post_call_after_agent_completion` | FAILED（1 passed / 1 failed） |
 | 信号量许可数硬编码为 1 | `router_shadow_pool_size_is_wired` | FAILED（0 passed / 1 failed） |
 
-### 8.4 遗留
-- **P0-2**（Trinity 非流式）**已完成（2026-10-29 勘误）**：原记「仍为部分修复，待 MODEL 侧让 `build_request` 读 `options.stream`（§7.2）」，实际已闭环——`backend.rs:305-308` 强制 `options.stream = Some(false)` + 重复 id 去重，MODEL `openai/mod.rs:265/311` 已读 `options.stream` 并走非流式分支（§4.2 P0-2）。
-- **P2-1** live 联调、**P2-3** 全局单例隔离不变。
-- `shadow_pool_capacity` 仍为预留（若要真正的有界队列，需自建调度器，当前不阻塞）。
-- `TrainingHook` 无「卸载」：middleware chain 在 `build()` 后不可变，宿主要停用需重建 agent；`TrainingRunner::stop()` 只停生命周期与 commit 调度，**不会**移除 hook（已在代码文档与本 tracker 注明，对应 Java `removeSystemHook` 的缺失）。
+### 8.4 遗留（2026-10-31 已更新，见 §9）
+- **P0-2**（Trinity 非流式）**已完成（2026-10-29 勘误）**：原记「仍为部分修复，待 MODEL 侧让 `build_request` 读 `options.stream`（§7.2）」，实际已闭环——`backend.rs:305-308` 强制 `options.stream = Some(false)` + 重复 id 去重，MODEL `openai/mod.rs:271/320` 已读 `options.stream` 并走非流式分支（§4.2 P0-2）。
+- ~~**P2-1** live 联调、**P2-3** 全局单例隔离不变。~~ → P2-3 已于 2026-10-31 关闭（实例注册表），P2-1 仍待环境。
+- ~~`shadow_pool_capacity` 仍为预留~~ → 2026-10-31 已接线为有界准入队列（§4.2 P2-2）。
+- ~~`TrainingHook` 无「卸载」~~ → 2026-10-31 增加 `disable()` 且 `TrainingRunner::stop()` 自动 disable（§4.2 P2-5）。
+
+## 9. 2026-10-31 收口（注册表去全局化 / 队列容量 / hook 卸载）
+
+### 9.1 变更文件
+| 文件 | 变更 |
+|---|---|
+| `crates/agentscope-extensions-training/src/runner.rs` | 1985 → 2272 行：①`RunRegistry`/`TaskExecutionRegistry` 改**实例句柄**（私有 `Mutex<HashMap<..>>` 字段 + `new()` + `global()`，删除两个 `static OnceLock<Mutex<..>>` 与其自由函数）；②`TrainingRouter` 增 `run_registry`/`task_registry`/`shadow_in_flight`，新增 `with_registries`/`with_global_registries`/`run_registry()`/`task_registry()`/`pending_shadow_runs()`/私有 `try_admit_shadow_run()` + `ShadowAdmission` RAII 守卫；③`TrainingHook` 增 `enabled: AtomicBool` 与 `set_enabled/enable/disable/is_enabled`（禁用时 `on_agent` 直通）；④`TrainingRunner` 增 `hooks: Mutex<Vec<Weak<TrainingHook>>>`、`disable_attached_hooks()`、`attached_hook_count()`，`attach()` 记录弱引用、`stop()` 调用 disable；⑤测试全部改用实例注册表、**删除 `registry_test_lock`**，+8 用例 |
+| `docs/extensions/TRAINING__GAP_TRACKER.md` | §1 / §2 / §3.5 / §3.6 / §4.1（含已知差异 6、7）/ §4.2（P2-2 / P2-3 / P2-5 / 真实剩余）/ §7.3 / §8.4 + 本 §9 |
+
+未改：根 `Cargo.toml`、`agentscope-core/**`、`agentscope-harness/**`、其它 crate；本 crate `Cargo.toml` 亦未变动（无新增依赖）。
+
+### 9.2 逐项处置
+| 编号 | 处置 | 证据 |
+|---|---|---|
+| P2-3 全局单例隔离 | **已完成（落代码）** | `RunRegistry`/`TaskExecutionRegistry` 为实例；`TrainingRouter::new` 与 `with_registries`/`with_global_registries` 三种装配；`run_shadow`/`run_single_shadow` 只用 `self.run_registry`/`self.task_registry`（`runner.rs` 内已无 `RunRegistry::allocate_run_id(` 等静态调用，也无线程级 static 可变状态） |
+| P2-2 `shadow_pool_capacity` | **已完成（落代码）** | `try_admit_shadow_run()` 用 `shadow_in_flight.fetch_add` 与 `capacity.max(1)` 比较，超限退回并丢弃该轮；`ShadowAdmission::drop` 释放；`run_shadow` 每轮先准入后取信号量 |
+| P2-5 hook 卸载 | **已完成（落代码）** | `TrainingHook::disable()` + `on_agent` 早退直通；`TrainingRunner::stop()` → `disable_attached_hooks()`（弱引用列表，不延长 agent 生命周期） |
+| P2-1 live 联调 | **未关闭（环境）** | 无 Trinity 端点；不引入 `#[ignore]`/env-gated 空跑用例（硬约束） |
+| 可选后续 | 未立项 | 若需 Java `RejectedExecutionException` 等价的硬失败 / 真正阻塞排队，需宿主层改造；当前「超容量丢弃」是训练数据采集场景下的有意选型 |
+
+### 9.3 测试竞态「真正修掉」的依据（替代 §7.3 的串行锁）
+- 旧方案的问题：`registry_test_lock()` 只能串行化**测试直接调用**注册表的那几行；`run_shadow` 内部的 `allocate_run_id` / `TaskExecutionRegistry::register` / `cleanup` 无法被该锁覆盖，任何新增「跑通一次 shadow」的测试都会重新引入竞态。
+- 新方案：注册表**不是进程全局**了。默认路径（`TrainingRouter::new`）每 router 一份，测试里 `RunRegistry::new()` 每用例一份 → 用例之间零共享可变状态，`-j 2`（乃至默认并行度）下天然稳定。
+- 仍共享 `global()` 的只有 2 条**只测单例语义**的用例：`run_registry_global_is_a_shared_singleton`、`task_execution_registry_global_is_a_shared_singleton`。二者用 `task_id_generator::generate()`（uuid）作为 taskId，**不调用 `clear_all()`**，只对自己创建的 key 断言并 cleanup → 与任何并行用例不冲突（不同 key）。
+- `routers_own_isolated_registries_by_default` 断言 `Arc::ptr_eq` 反向性质（默认不同实例、`with_global_registries` 与 `global()` 同一实例），把「隔离是默认」与「Java 语义可选」都钉住。
+
+### 9.4 P2 残留裁定（含「provider HTTP 400 / 迭代上限语义」口径）
+- **「provider HTTP 400 中断」**：属**上次 live 联调的环境/协议现象**（provider 拒绝请求体），本 crate 无任何断言、无代码分支与之对应（`grep 400` 在 `src/**` 零命中）。离线层面真正相关的是 P0-2（Trinity 非流式），已闭环；因此本项**不新增代码**，结论：非缺口。
+- **「迭代上限语义」**：`max_iters` 已由 `AgentCloner` 从生产 agent 回读（P1-1），`ShadowAgentSpec.max_iters` 仅覆盖；core 的迭代上限本身在 `ReActAgent` 内实现，本 crate 不重复实现也不改写 → 结论：非缺口（与 P1-3「三个 ExecutionConfig 字段 = 设计决定（不迁移）」同源：Rust 的执行调控按调用/按工具下发，不上提到 agent 级）。
+- `shadow_pool_capacity` / 注册表全局单例 / hook 卸载三项旧残留已在本轮关闭（见 9.2）。
+
+### 9.5 反向验证建议（主智能体执行；本轮按约束未跑 cargo）
+| 回退内容 | 定向用例 | 预期 |
+|---|---|---|
+| `try_admit_shadow_run` 恒返回 `Some`（去掉容量判断） | `router_shadow_queue_capacity_bounds_admission` / `run_shadow_checks_queue_capacity_before_running` | FAILED |
+| `run_shadow` 中删除准入调用 | `run_shadow_checks_queue_capacity_before_running` | FAILED |
+| `on_agent` 去掉 `if !self.is_enabled()` 早退 | `training_hook_disable_makes_it_a_passthrough` | FAILED |
+| `stop()` 去掉 `disable_attached_hooks()` | `runner_stop_disables_attached_hooks` | FAILED |
+| `TrainingRouter::new` 改用 `global()` 注册表 | `routers_own_isolated_registries_by_default` | FAILED |
+| 把 `RunRegistry::new()` 换回共享 static | `run_registry_instances_are_isolated` | FAILED |
+
+### 9.6 未关闭项
+- **P2-1 live Trinity 联调**（唯一未关闭项，环境依赖；离线面已覆盖到 loopback mock + `TrinityModelAdapter` 强制非流式 + msg_id 去重）。
+- 回执约定：本轮只改 `crates/agentscope-extensions-training/**` 与本 tracker；`docs/extensions/EXTENSIONS_GAP_TRACKER.md` 的 TRAINING 行仍写着「已加测试内互斥锁」，**需汇总方同步改为「注册表实例化，无需串行锁」**（跨模块需求，本轮无写权限）。
