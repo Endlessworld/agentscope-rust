@@ -21,8 +21,29 @@ use crate::identifier::validate_identifier;
 /// Default snapshot table name, mirroring `DEFAULT_TABLE`.
 pub const DEFAULT_SNAPSHOT_TABLE: &str = "agentscope_snapshots";
 
+/// DDL for the snapshot BLOB table, mirroring `JdbcRemoteSnapshotClient#initSchema`.
+///
+/// `snapshot_id` is caller-supplied, so it pins `utf8mb4_bin` — the table default
+/// (`utf8mb4` / case-insensitive collation) would make ids differing only in letter case
+/// collide, and the second upload would silently overwrite the first. `ROW_FORMAT=DYNAMIC`
+/// keeps the 512-character primary key under InnoDB's index limit. Both choices copy the
+/// Java statement verbatim; `utf8mb4_bin` is also what this crate's `store` key columns use.
+pub fn snapshot_table_ddl(table_name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (\
+         snapshot_id VARCHAR(512) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY, \
+         data LONGBLOB NOT NULL, \
+         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+    )
+}
+
 /// Low-level blob persistence surface used by [`MysqlRemoteSnapshotClient`].
 pub trait SnapshotBackend: Send + Sync + std::fmt::Debug {
+    /// Executes a DDL statement (schema bootstrap). Mirrors the
+    /// `Connection.createStatement().execute(ddl)` call in Java `initSchema`.
+    fn execute_ddl(&self, sql: &str) -> Result<()>;
+
     /// Upserts the archive bytes for `snapshot_id`.
     fn upload(&self, snapshot_id: &str, data: &[u8]) -> Result<()>;
 
@@ -39,15 +60,22 @@ pub trait SnapshotBackend: Send + Sync + std::fmt::Debug {
 pub struct MysqlRemoteSnapshotClient {
     backend: Arc<dyn SnapshotBackend>,
     table_name: String,
+    initialize_schema: bool,
 }
 
 impl MysqlRemoteSnapshotClient {
     /// Creates a client over the given backend with the default table name.
+    ///
+    /// Equivalent to Java's `initializeSchema = false`: no DDL is issued.
     pub fn new(backend: Arc<dyn SnapshotBackend>) -> Self {
-        Self {
-            backend,
-            table_name: DEFAULT_SNAPSHOT_TABLE.to_string(),
-        }
+        Self::build(backend, DEFAULT_SNAPSHOT_TABLE, false)
+            .expect("the default table name is a valid identifier")
+    }
+
+    /// Creates a client that bootstraps the default table on construction.
+    pub fn new_with_schema(backend: Arc<dyn SnapshotBackend>) -> Self {
+        Self::build(backend, DEFAULT_SNAPSHOT_TABLE, true)
+            .expect("the default table name is a valid identifier")
     }
 
     /// Creates a client with an explicit table name.
@@ -55,9 +83,28 @@ impl MysqlRemoteSnapshotClient {
     /// The name is spliced into SQL verbatim, so it must match `[A-Za-z_][A-Za-z0-9_]*`
     /// (max 64 characters). A blank name falls back to [`DEFAULT_SNAPSHOT_TABLE`]; anything
     /// else invalid is rejected instead of reaching a statement.
+    ///
+    /// Equivalent to Java's `initializeSchema = false`: no DDL is issued.
     pub fn with_table(
         backend: Arc<dyn SnapshotBackend>,
         table_name: impl Into<String>,
+    ) -> MysqlResult<Self> {
+        Self::build(backend, table_name, false)
+    }
+
+    /// Creates a client with an explicit table name that bootstraps the table on
+    /// construction (`initializeSchema = true`, what `JdbcSnapshotSpec` always passes).
+    pub fn with_table_and_schema(
+        backend: Arc<dyn SnapshotBackend>,
+        table_name: impl Into<String>,
+    ) -> MysqlResult<Self> {
+        Self::build(backend, table_name, true)
+    }
+
+    fn build(
+        backend: Arc<dyn SnapshotBackend>,
+        table_name: impl Into<String>,
+        initialize_schema: bool,
     ) -> MysqlResult<Self> {
         let raw: String = table_name.into();
         let table_name = if raw.trim().is_empty() {
@@ -65,15 +112,44 @@ impl MysqlRemoteSnapshotClient {
         } else {
             validate_identifier(&raw, "Snapshot table name")?
         };
-        Ok(Self {
+        let client = Self {
             backend,
             table_name,
-        })
+            initialize_schema,
+        };
+        client.init_schema();
+        Ok(client)
+    }
+
+    /// Issues the snapshot-table DDL when `initializeSchema` is on.
+    ///
+    /// Mirrors Java: a failing `CREATE TABLE` is **only logged** (`log.warn`) — the client
+    /// is still usable, and the failure surfaces later as a failed upload/download rather
+    /// than as a constructor error.
+    fn init_schema(&self) {
+        if !self.initialize_schema {
+            return;
+        }
+        if let Err(err) = self
+            .backend
+            .execute_ddl(&snapshot_table_ddl(&self.table_name))
+        {
+            tracing::warn!(
+                table = %self.table_name,
+                error = %err,
+                "failed to initialize snapshot table"
+            );
+        }
     }
 
     /// Table name this client writes to.
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+
+    /// Whether this client bootstraps the table on construction.
+    pub fn initialize_schema(&self) -> bool {
+        self.initialize_schema
     }
 }
 
@@ -110,8 +186,12 @@ pub struct MysqlSnapshotSpec {
 
 impl MysqlSnapshotSpec {
     /// Builds a spec over the given blob backend with the default table.
+    ///
+    /// Mirrors `JdbcSnapshotSpec`: the snapshot table DDL is always issued on construction
+    /// (Java passes `initializeSchema = true`). A failing DDL is only logged, matching the
+    /// Java `log.warn` in `initSchema`.
     pub fn new(backend: Arc<dyn SnapshotBackend>) -> Self {
-        let client = Arc::new(MysqlRemoteSnapshotClient::new(backend));
+        let client = Arc::new(MysqlRemoteSnapshotClient::new_with_schema(backend));
         Self {
             inner: RemoteSnapshotSpec::new(client),
         }
@@ -122,7 +202,9 @@ impl MysqlSnapshotSpec {
         backend: Arc<dyn SnapshotBackend>,
         table_name: impl Into<String>,
     ) -> MysqlResult<Self> {
-        let client = Arc::new(MysqlRemoteSnapshotClient::with_table(backend, table_name)?);
+        let client = Arc::new(MysqlRemoteSnapshotClient::with_table_and_schema(
+            backend, table_name,
+        )?);
         Ok(Self {
             inner: RemoteSnapshotSpec::new(client),
         })
@@ -149,8 +231,10 @@ pub mod testing;
 #[cfg(test)]
 mod tests {
     use super::testing::InMemorySnapshotBackend;
-    use super::{MysqlRemoteSnapshotClient, MysqlSnapshotSpec, DEFAULT_SNAPSHOT_TABLE};
-    use agentscope_harness::agent::sandbox::snapshot::{SandboxSnapshot, SandboxSnapshotSpec};
+    use super::{
+        snapshot_table_ddl, MysqlRemoteSnapshotClient, MysqlSnapshotSpec, DEFAULT_SNAPSHOT_TABLE,
+    };
+    use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec;
     use std::sync::Arc;
 
     fn spec() -> MysqlSnapshotSpec {
@@ -217,5 +301,78 @@ mod tests {
         assert!(MysqlSnapshotSpec::with_table(backend, "bad name").is_err());
         let backend = Arc::new(InMemorySnapshotBackend::default());
         assert!(MysqlRemoteSnapshotClient::with_table(backend, "a".repeat(65)).is_err());
+    }
+
+    // ---------------------------------------------------------------------------------
+    // P1-7: snapshot table auto-creation (Java `JdbcRemoteSnapshotClient#initSchema`)
+    // ---------------------------------------------------------------------------------
+
+    /// The DDL must mirror Java verbatim: binary collation on the caller-supplied key
+    /// column (case-insensitive would make `A` and `a` collide), LONGBLOB payload and
+    /// `ROW_FORMAT=DYNAMIC` for the 512-char primary key.
+    #[test]
+    fn snapshot_ddl_matches_the_java_statement() {
+        let ddl = snapshot_table_ddl("agentscope_snapshots");
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS agentscope_snapshots ("));
+        assert!(ddl.contains("snapshot_id VARCHAR(512) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY"));
+        assert!(ddl.contains("data LONGBLOB NOT NULL"));
+        assert!(ddl.contains("created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"));
+        assert!(ddl.contains("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"));
+    }
+
+    /// `JdbcSnapshotSpec` always passes `initializeSchema = true`.
+    #[test]
+    fn spec_issues_the_table_ddl_on_construction() {
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        let _spec = MysqlSnapshotSpec::new(backend.clone());
+        assert_eq!(
+            backend.ddl_log(),
+            vec![snapshot_table_ddl(DEFAULT_SNAPSHOT_TABLE)]
+        );
+    }
+
+    #[test]
+    fn spec_with_table_issues_ddl_for_the_custom_table() {
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        let _spec = MysqlSnapshotSpec::with_table(backend.clone(), "custom_snaps")
+            .expect("valid identifier");
+        assert_eq!(backend.ddl_log(), vec![snapshot_table_ddl("custom_snaps")]);
+    }
+
+    /// Java catches the `SQLException` and calls `log.warn` only — construction must not
+    /// fail, and the store stays usable.
+    #[tokio::test]
+    async fn ddl_failure_is_logged_not_raised() {
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        backend.fail_ddl(true);
+        let spec = MysqlSnapshotSpec::new(backend.clone());
+        assert!(backend.ddl_log().is_empty());
+        let snap = spec.build("sess-1").expect("build");
+        snap.persist(b"archive").await.unwrap();
+        assert!(snap.is_restorable().await.unwrap());
+        assert_eq!(snap.restore().await.unwrap(), b"archive");
+    }
+
+    /// `initializeSchema = false` (Java's explicit opt-out) must not touch the schema.
+    #[test]
+    fn client_without_initialize_schema_emits_no_ddl() {
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        let client = MysqlRemoteSnapshotClient::new(backend.clone());
+        assert!(!client.initialize_schema());
+        assert!(backend.ddl_log().is_empty());
+
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        let client = MysqlRemoteSnapshotClient::with_table(backend.clone(), "custom_snaps")
+            .expect("valid identifier");
+        assert!(!client.initialize_schema());
+        assert!(backend.ddl_log().is_empty());
+
+        let backend = Arc::new(InMemorySnapshotBackend::default());
+        let client = MysqlRemoteSnapshotClient::new_with_schema(backend.clone());
+        assert!(client.initialize_schema());
+        assert_eq!(
+            backend.ddl_log(),
+            vec![snapshot_table_ddl(DEFAULT_SNAPSHOT_TABLE)]
+        );
     }
 }

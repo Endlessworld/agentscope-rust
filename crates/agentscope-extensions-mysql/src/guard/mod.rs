@@ -25,6 +25,78 @@ use crate::error::{MysqlError, MysqlResult};
 /// Default lock-name prefix, mirroring `DEFAULT_KEY_PREFIX`.
 pub const DEFAULT_KEY_PREFIX: &str = "agentscope:sandbox:lock:";
 
+/// Maximum lock-name length accepted by MySQL `GET_LOCK()`.
+///
+/// Mirrors the `raw.length() <= 64` guard in `JdbcSandboxExecutionGuard#composeLockName`.
+pub const MAX_LOCK_NAME_LENGTH: usize = 64;
+
+/// Number of leading characters kept when a lock name has to be truncated.
+///
+/// Mirrors `raw.substring(0, 50)` in `JdbcSandboxExecutionGuard#composeLockName`.
+const LOCK_NAME_HEAD_LEN: usize = 50;
+
+/// Java `String.hashCode()` over UTF-16 code units, with wrapping 32-bit arithmetic.
+///
+/// `hash = hash * 31 + code_unit`, computed with the same overflow behaviour as Java's
+/// signed `int` (so negative results are expected). Used to reproduce the
+/// `composeLockName` hash exactly instead of a different (e.g. SipHash) digest.
+pub fn java_string_hash_code(value: &str) -> i32 {
+    value.encode_utf16().fold(0i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    })
+}
+
+/// Java `Integer.toHexString(hash)`: unsigned 32-bit lowercase hex, no zero padding.
+fn java_hash_hex(hash: i32) -> String {
+    format!("{:x}", hash as u32)
+}
+
+/// Brings an over-long lock name under MySQL's `GET_LOCK()` limit.
+///
+/// Mirrors `JdbcSandboxExecutionGuard#composeLockName`:
+///
+/// ```java
+/// if (raw.length() <= 64) return raw;
+/// int hash = raw.hashCode();
+/// return raw.substring(0, 50) + ":" + Integer.toHexString(hash);
+/// ```
+///
+/// Lengths are counted in UTF-16 code units (Java `String.length()`). Truncation never
+/// splits a surrogate pair, so the result stays valid UTF-8; Java would produce a lone
+/// surrogate there. All practical lock names are ASCII, where both agree.
+pub fn truncate_lock_name(raw: &str) -> String {
+    if raw.encode_utf16().count() <= MAX_LOCK_NAME_LENGTH {
+        return raw.to_string();
+    }
+    let mut head = String::new();
+    let mut head_units = 0usize;
+    for ch in raw.chars() {
+        let units = ch.len_utf16();
+        if head_units + units > LOCK_NAME_HEAD_LEN {
+            break;
+        }
+        head.push(ch);
+        head_units += units;
+    }
+    format!("{head}:{}", java_hash_hex(java_string_hash_code(raw)))
+}
+
+/// Normalises a lock-name prefix the way Java's `Builder.keyPrefix` does: blank is a hard
+/// error (`IllegalArgumentException("keyPrefix must not be blank")`), and a missing trailing
+/// `:` is appended so the composed name never glues the prefix to the scope.
+fn normalize_key_prefix(prefix: String) -> MysqlResult<String> {
+    if prefix.trim().is_empty() {
+        return Err(MysqlError::InvalidArgument(
+            "keyPrefix must not be blank".to_string(),
+        ));
+    }
+    if prefix.ends_with(':') {
+        Ok(prefix)
+    } else {
+        Ok(format!("{prefix}:"))
+    }
+}
+
 /// A held distributed lock. Dropping it releases the lock (mirroring Java's
 /// `SandboxLease.close()` calling `RELEASE_LOCK()` and closing the connection).
 pub struct MysqlLockLease {
@@ -141,7 +213,9 @@ impl MysqlSandboxExecutionGuard {
     /// Composes the MySQL lock name for an isolation key.
     ///
     /// Mirrors `JdbcSandboxExecutionGuard.composeLockName`: the scope is lower-cased and
-    /// joined with the value and optional sub-key.
+    /// joined with the value (plus the Rust-only optional sub-key), then the result is
+    /// truncated to MySQL's 64-character `GET_LOCK()` limit
+    /// ([`truncate_lock_name`]).
     pub fn compose_lock_name(&self, key: &SandboxIsolationKey) -> String {
         let mut name = format!(
             "{}{}:{}",
@@ -153,7 +227,7 @@ impl MysqlSandboxExecutionGuard {
             name.push(':');
             name.push_str(sub);
         }
-        name
+        truncate_lock_name(&name)
     }
 
     /// Tries to acquire a lease for the given isolation key.
@@ -281,9 +355,19 @@ pub struct MysqlSandboxExecutionGuardBuilder {
 
 impl MysqlSandboxExecutionGuardBuilder {
     /// Overrides the lock-name prefix (default: [`DEFAULT_KEY_PREFIX`]).
-    pub fn key_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.key_prefix = prefix.into();
-        self
+    ///
+    /// Mirrors Java `Builder.keyPrefix`: a blank prefix is rejected and a missing trailing
+    /// `:` is appended. Java throws `IllegalArgumentException`; this infallible builder
+    /// convenience panics instead — use [`Self::try_key_prefix`] for untrusted input.
+    pub fn key_prefix(self, prefix: impl Into<String>) -> Self {
+        self.try_key_prefix(prefix)
+            .expect("keyPrefix must not be blank")
+    }
+
+    /// Overrides the lock-name prefix, surfacing a blank prefix as an error.
+    pub fn try_key_prefix(mut self, prefix: impl Into<String>) -> MysqlResult<Self> {
+        self.key_prefix = normalize_key_prefix(prefix.into())?;
+        Ok(self)
     }
 
     /// Overrides the lock acquisition timeout (default: 30s).
@@ -393,6 +477,95 @@ mod tests {
             .build();
         let key = SandboxIsolationKey::new("Session", "s1");
         assert_eq!(g.compose_lock_name(&key), "app:lock:session:s1");
+    }
+
+    // Golden vectors for Java `String.hashCode()` / `Integer.toHexString()` semantics.
+    // Expected values were produced by actually running Java 24:
+    //   javac/java LockNameGold.java (see MYSQL__GAP_TRACKER.md §8), not by the Rust impl.
+    #[test]
+    fn java_string_hash_code_matches_java_gold_values() {
+        assert_eq!(java_string_hash_code(""), 0);
+        assert_eq!(java_string_hash_code("abc"), 96354);
+        // Well-known overflow case: Integer.MIN_VALUE, whose hex form is 8 characters.
+        assert_eq!(java_string_hash_code("polygenelubricants"), i32::MIN);
+        assert_eq!(java_hash_hex(i32::MIN), "80000000");
+        assert_eq!(java_hash_hex(0), "0");
+        assert_eq!(java_hash_hex(96354), "17862");
+    }
+
+    /// 64 chars (`agentscope:sandbox:lock:` 24 + "user:" 5 + 35 value) is still accepted.
+    #[test]
+    fn compose_lock_name_keeps_names_at_the_limit() {
+        let g = guard();
+        let raw = format!("agentscope:sandbox:lock:user:{}", "y".repeat(35));
+        assert_eq!(raw.len(), MAX_LOCK_NAME_LENGTH);
+        assert_eq!(g.compose_lock_name(&SandboxIsolationKey::new("user", "y".repeat(35))), raw);
+    }
+
+    /// 65 chars is truncated to `前 50 + ":" + Integer.toHexString(hashCode())`
+    /// (Java: `raw.hashCode()` of the 65-char name is `-189878914` = `0xf4aead7e`).
+    #[test]
+    fn compose_lock_name_truncates_over_the_limit() {
+        let g = guard();
+        let key = SandboxIsolationKey::new("user", "y".repeat(36));
+        assert_eq!(
+            g.compose_lock_name(&key),
+            "agentscope:sandbox:lock:user:yyyyyyyyyyyyyyyyyyyyy:f4aead7e"
+        );
+    }
+
+    /// Negative `hashCode` must render as 8 unsigned hex digits (`Integer.toHexString`),
+    /// never with a leading `-`.
+    #[test]
+    fn compose_lock_name_uses_unsigned_hex_for_negative_hash() {
+        let g = guard();
+        // 89-char name: hash = 798084414 (0x2f91cd3e).
+        let key = SandboxIsolationKey::new("user", "x".repeat(60));
+        assert_eq!(
+            g.compose_lock_name(&key),
+            "agentscope:sandbox:lock:user:xxxxxxxxxxxxxxxxxxxxx:2f91cd3e"
+        );
+        // 68-char name: hash = -210677989 (0xf3714f1b).
+        let key = SandboxIsolationKey::new("user", "y".repeat(39));
+        assert_eq!(
+            g.compose_lock_name(&key),
+            "agentscope:sandbox:lock:user:yyyyyyyyyyyyyyyyyyyyy:f3714f1b"
+        );
+    }
+
+    /// The composed name stays within `GET_LOCK`'s limit for any input length.
+    #[test]
+    fn truncated_names_never_exceed_the_limit() {
+        let g = guard();
+        let long = "z".repeat(300);
+        let name = g.compose_lock_name(&SandboxIsolationKey::with_sub_key("session", long.clone(), long));
+        assert!(name.len() <= MAX_LOCK_NAME_LENGTH);
+        assert_eq!(name.len(), 59, "50 head chars + ':' + 8 hex chars");
+    }
+
+    /// Java `Builder.keyPrefix` appends a missing trailing `:`.
+    #[test]
+    fn key_prefix_is_normalised_with_a_trailing_colon() {
+        let g = MysqlSandboxExecutionGuard::builder(Arc::new(InMemoryLockBackend::default()))
+            .key_prefix("app:lock")
+            .build();
+        assert_eq!(
+            g.compose_lock_name(&SandboxIsolationKey::new("User", "u1")),
+            "app:lock:user:u1"
+        );
+    }
+
+    /// Java `Builder.keyPrefix` rejects a blank prefix.
+    #[test]
+    fn blank_key_prefix_is_rejected() {
+        let result = MysqlSandboxExecutionGuard::builder(Arc::new(InMemoryLockBackend::default()))
+            .try_key_prefix("   ");
+        let err = match result {
+            Ok(_) => panic!("a blank keyPrefix must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, MysqlError::InvalidArgument(_)));
+        assert!(err.to_string().contains("keyPrefix must not be blank"));
     }
 
     /// `GET_LOCK` names are server-scoped, so the guard must advertise itself as a

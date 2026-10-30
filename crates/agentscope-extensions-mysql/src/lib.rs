@@ -38,15 +38,18 @@ pub mod store;
 pub use distributed_store::{MysqlDistributedStore, MysqlDistributedStoreBuilder};
 pub use error::{MysqlError, MysqlResult};
 pub use guard::{
-    LockBackend, MysqlLockLease, MysqlSandboxExecutionGuard, MysqlSandboxExecutionGuardBuilder,
-    DEFAULT_KEY_PREFIX,
+    java_string_hash_code, truncate_lock_name, LockBackend, MysqlLockLease,
+    MysqlSandboxExecutionGuard, MysqlSandboxExecutionGuardBuilder, DEFAULT_KEY_PREFIX,
+    MAX_LOCK_NAME_LENGTH,
 };
 pub use identifier::{validate_identifier, MAX_IDENTIFIER_LENGTH};
 pub use snapshot::{
-    MysqlRemoteSnapshotClient, MysqlSnapshotSpec, SnapshotBackend, DEFAULT_SNAPSHOT_TABLE,
+    snapshot_table_ddl, MysqlRemoteSnapshotClient, MysqlSnapshotSpec, SnapshotBackend,
+    DEFAULT_SNAPSHOT_TABLE,
 };
 pub use state::{
-    CasOutcome, MysqlAgentStateStore, StateBackend, DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME,
+    add_version_column_sql, create_database_sql, create_sessions_table_sql, CasOutcome,
+    MysqlAgentStateStore, StateBackend, DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME,
     HASH_KEY_SUFFIX, SINGLE_STATE_INDEX,
 };
 pub use store::{

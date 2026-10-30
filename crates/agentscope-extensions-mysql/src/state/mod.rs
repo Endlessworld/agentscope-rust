@@ -44,6 +44,53 @@ pub const DEFAULT_DATABASE_NAME: &str = "agentscope";
 /// Default table name, mirroring `DEFAULT_TABLE_NAME`.
 pub const DEFAULT_TABLE_NAME: &str = "agentscope_sessions";
 
+/// `CREATE DATABASE` statement, mirroring the DDL Java's `createDatabaseIfNotExist` issues.
+///
+/// `IF NOT EXISTS` keeps it idempotent, so `create_if_not_exist` can be requested on an
+/// already-provisioned server.
+pub fn create_database_sql(database_name: &str) -> String {
+    format!(
+        "CREATE DATABASE IF NOT EXISTS `{database_name}` \
+         DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    )
+}
+
+/// `CREATE TABLE` statement, mirroring Java's `createTableIfNotExist`.
+///
+/// `session_id` / `state_key` are case-sensitive identifiers, so they pin `utf8mb4_bin`:
+/// the table default collation is case-insensitive, which would silently merge session ids
+/// or state keys differing only in letter case. `version` is declared here with `DEFAULT 0`
+/// exactly like Java; every write path sets the version explicitly (`1` on insert), and the
+/// migration path ([`add_version_column_sql`]) backfills pre-existing rows with `1`, because
+/// `0` is the "row absent" sentinel `read_version` reports.
+pub fn create_sessions_table_sql(database_name: &str, table_name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS `{database_name}`.`{table_name}` (\
+         session_id VARCHAR(255) COLLATE utf8mb4_bin NOT NULL, \
+         state_key VARCHAR(255) COLLATE utf8mb4_bin NOT NULL, \
+         item_index INT NOT NULL DEFAULT 0, \
+         state_data LONGTEXT NOT NULL, \
+         version BIGINT NOT NULL DEFAULT 0, \
+         created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, \
+         PRIMARY KEY (session_id, state_key, item_index)\
+         ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    )
+}
+
+/// `ALTER TABLE ... ADD COLUMN version` migration, mirroring Java's `ensureVersionColumn`.
+///
+/// `DEFAULT 1` (not `0`): the ALTER backfills every pre-existing row with the default, and
+/// `0` is the sentinel [`StateBackend::read_version`] reports for "row absent". Backfilling
+/// `0` would make those rows look absent to `save_if_version(.., Some(0))`, which takes the
+/// INSERT branch and hits a duplicate key — a phantom CAS conflict.
+pub fn add_version_column_sql(database_name: &str, table_name: &str) -> String {
+    format!(
+        "ALTER TABLE `{database_name}`.`{table_name}` \
+         ADD COLUMN version BIGINT NOT NULL DEFAULT 1"
+    )
+}
+
 /// Outcome of a version-guarded single-value write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CasOutcome {
@@ -76,8 +123,28 @@ pub enum CasOutcome {
 ///                                               -- 0 rows affected => Conflict
 /// ```
 pub trait StateBackend: Send + Sync {
-    /// Ensures the schema (database + table, including the `version` column) exists.
-    fn ensure_schema(&self) -> MysqlResult<()>;
+    /// Executes a DDL statement (schema bootstrap or the `version` column migration).
+    ///
+    /// Mirrors the `Connection.prepareStatement(ddl).execute()` calls Java issues in
+    /// `createDatabaseIfNotExist`, `createTableIfNotExist` and `ensureVersionColumn`. The
+    /// statement text is produced by [`create_database_sql`],
+    /// [`create_sessions_table_sql`] and [`add_version_column_sql`], so the crate — not the
+    /// adapter — owns the schema shape.
+    fn execute_ddl(&self, sql: &str) -> MysqlResult<()>;
+
+    /// Whether `database_name` exists. Mirrors Java `verifyDatabaseExists`, which probes
+    /// `INFORMATION_SCHEMA.SCHEMATA`.
+    fn database_exists(&self, database_name: &str) -> MysqlResult<bool>;
+
+    /// Whether `table_name` exists inside `database_name`. Mirrors Java
+    /// `verifyTableExists`, which probes `INFORMATION_SCHEMA.TABLES`.
+    fn table_exists(&self, database_name: &str, table_name: &str) -> MysqlResult<bool>;
+
+    /// Column names of `table_name`, in schema order. Mirrors the
+    /// `INFORMATION_SCHEMA.COLUMNS` count probe in Java `ensureVersionColumn`.
+    ///
+    /// An unknown table yields an empty vector (the caller has already verified existence).
+    fn table_columns(&self, database_name: &str, table_name: &str) -> MysqlResult<Vec<String>>;
 
     /// Unversioned upsert of a value at `item_index = 0`; `version` is left untouched.
     ///
@@ -211,18 +278,28 @@ impl std::fmt::Debug for MysqlAgentStateStore {
 
 impl MysqlAgentStateStore {
     /// Creates a store with the default database and table, auto-creating the schema.
-    pub fn new(backend: Arc<dyn StateBackend>) -> Self {
-        let store = Self {
-            backend,
-            database_name: DEFAULT_DATABASE_NAME.to_string(),
-            table_name: DEFAULT_TABLE_NAME.to_string(),
-            create_if_not_exist: true,
-        };
-        let _ = store.backend.ensure_schema();
-        store
+    ///
+    /// Java's no-arg constructor is the opposite (verify-only, `createIfNotExist = false`);
+    /// this convenience keeps the historical Rust default of auto-creation but no longer
+    /// swallows a failing bootstrap — schema errors are returned to the caller.
+    pub fn new(backend: Arc<dyn StateBackend>) -> MysqlResult<Self> {
+        Self::with_config(backend, None, None, true)
     }
 
     /// Creates a store with explicit database/table names and auto-creation semantics.
+    ///
+    /// Mirrors Java `MysqlAgentStateStore(DataSource, databaseName, tableName,
+    /// createIfNotExist)`:
+    ///
+    /// * `create_if_not_exist == true` — creates the database and table (both
+    ///   `IF NOT EXISTS`, so it is idempotent) before returning.
+    /// * `create_if_not_exist == false` — verifies the database exists, then the table;
+    ///   a missing one is reported as [`MysqlError::Schema`] carrying the Java message
+    ///   ("Database does not exist: …" / "Table does not exist: …").
+    ///
+    /// Both branches then run the `version` column migration
+    /// ([`ensure_version_column`]), which is what upgrades databases created by the
+    /// pre-versioning schema.
     pub fn with_config(
         backend: Arc<dyn StateBackend>,
         database_name: Option<&str>,
@@ -248,10 +325,37 @@ impl MysqlAgentStateStore {
             table_name,
             create_if_not_exist,
         };
-        if create_if_not_exist {
-            store.backend.ensure_schema()?;
-        }
+        store.bootstrap_schema()?;
         Ok(store)
+    }
+
+    /// Creates the schema, or verifies it, then runs the `version` column migration.
+    ///
+    /// Ordering follows Java's constructor: `createDatabaseIfNotExist` →
+    /// `createTableIfNotExist` **or** `verifyDatabaseExists` → `verifyTableExists`, and in
+    /// both cases `ensureVersionColumn` last.
+    fn bootstrap_schema(&self) -> MysqlResult<()> {
+        let database_name = &self.database_name;
+        let table_name = &self.table_name;
+        if self.create_if_not_exist {
+            self.backend.execute_ddl(&create_database_sql(database_name))?;
+            self.backend
+                .execute_ddl(&create_sessions_table_sql(database_name, table_name))?;
+        } else {
+            if !self.backend.database_exists(database_name)? {
+                return Err(MysqlError::Schema(format!(
+                    "Database does not exist: {database_name}. \
+                     Use MysqlAgentStateStore::with_config(.., true) to auto-create."
+                )));
+            }
+            if !self.backend.table_exists(database_name, table_name)? {
+                return Err(MysqlError::Schema(format!(
+                    "Table does not exist: {database_name}.{table_name}. \
+                     Use MysqlAgentStateStore::with_config(.., true) to auto-create."
+                )));
+            }
+        }
+        ensure_version_column(self.backend.as_ref(), database_name, table_name)
     }
 
     /// Database name this store writes to.
@@ -519,6 +623,24 @@ impl AgentStateStore for MysqlAgentStateStore {
     }
 }
 
+/// Adds the `version` column when the table predates it, mirroring Java
+/// `ensureVersionColumn`.
+///
+/// Idempotent: the `INFORMATION_SCHEMA.COLUMNS` probe short-circuits when the column is
+/// already there, so calling it on every construction costs one query and never fails with
+/// MySQL's `ER_DUP_FIELDNAME` on a repeated `ALTER TABLE`.
+fn ensure_version_column(
+    backend: &dyn StateBackend,
+    database_name: &str,
+    table_name: &str,
+) -> MysqlResult<()> {
+    let columns = backend.table_columns(database_name, table_name)?;
+    if columns.iter().any(|c| c.eq_ignore_ascii_case("version")) {
+        return Ok(());
+    }
+    backend.execute_ddl(&add_version_column_sql(database_name, table_name))
+}
+
 fn require_session_id(session_id: &str) -> MysqlResult<String> {
     if session_id.trim().is_empty() {
         return Err(MysqlError::BlankSessionId);
@@ -537,6 +659,7 @@ mod tests {
 
     fn store() -> MysqlAgentStateStore {
         MysqlAgentStateStore::new(Arc::new(InMemoryStateBackend::default()))
+            .expect("in-memory schema bootstrap")
     }
 
     #[tokio::test]
@@ -658,7 +781,10 @@ mod tests {
     /// Store plus a handle on its backend, for white-box assertions on the raw rows.
     fn store_with_backend() -> (MysqlAgentStateStore, Arc<InMemoryStateBackend>) {
         let backend = Arc::new(InMemoryStateBackend::default());
-        (MysqlAgentStateStore::new(backend.clone()), backend)
+        (
+            MysqlAgentStateStore::new(backend.clone()).expect("in-memory schema bootstrap"),
+            backend,
+        )
     }
 
     // ---- list change detection (Java `ListHashUtil`) ------------------------------
@@ -764,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn save_if_version_delegates_cas_instead_of_read_then_write() {
         let backend = Arc::new(StaleVersionBackend::new(InMemoryStateBackend::default()));
-        let s = MysqlAgentStateStore::new(backend);
+        let s = MysqlAgentStateStore::new(backend).expect("in-memory schema bootstrap");
         s.save_if_version(Some("u"), "sess", "k", json!(1), None)
             .await
             .unwrap();
@@ -777,5 +903,198 @@ mod tests {
         assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!(2)));
         // The stale reader is still stale — proof that the write never went through it.
         assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 0);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // P1-6: constructor schema verification + `version` column migration
+    // (Java `MysqlAgentStateStore` ctor / `verifyDatabaseExists` / `verifyTableExists` /
+    //  `ensureVersionColumn`)
+    // ---------------------------------------------------------------------------------
+
+    /// `create_if_not_exist == true` provisions the database and the table, and the table
+    /// carries every column the store reads/writes, both `utf8mb4_bin` key columns included.
+    #[test]
+    fn auto_create_provisions_database_and_table() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        let s = MysqlAgentStateStore::with_config(backend.clone(), None, None, true)
+            .expect("bootstrap");
+        assert_eq!(s.database_name(), DEFAULT_DATABASE_NAME);
+        assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
+        assert!(backend.has_database(DEFAULT_DATABASE_NAME));
+        assert!(backend.has_table(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME));
+
+        let columns = backend.columns(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME);
+        for expected in [
+            "session_id",
+            "state_key",
+            "item_index",
+            "state_data",
+            "version",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "missing column {expected:?} in {columns:?}"
+            );
+        }
+        // Java: `CREATE DATABASE IF NOT EXISTS` then `CREATE TABLE IF NOT EXISTS`.
+        let ddl = backend.ddl_log();
+        assert_eq!(ddl.len(), 2, "one CREATE DATABASE + one CREATE TABLE: {ddl:?}");
+        assert_eq!(ddl[0], create_database_sql(DEFAULT_DATABASE_NAME));
+        assert_eq!(
+            ddl[1],
+            create_sessions_table_sql(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME)
+        );
+    }
+
+    /// Java pins `utf8mb4_bin` on both key columns; the case-insensitive table default would
+    /// merge `S1`/`s1` and `K`/`k` into one row.
+    #[test]
+    fn create_table_ddl_pins_binary_collation_on_key_columns() {
+        let ddl = create_sessions_table_sql("agentscope", "agentscope_sessions");
+        assert!(ddl
+            .starts_with("CREATE TABLE IF NOT EXISTS `agentscope`.`agentscope_sessions` ("));
+        assert!(ddl.contains("session_id VARCHAR(255) COLLATE utf8mb4_bin NOT NULL"));
+        assert!(ddl.contains("state_key VARCHAR(255) COLLATE utf8mb4_bin NOT NULL"));
+        assert!(ddl.contains("version BIGINT NOT NULL DEFAULT 0"));
+        assert!(ddl.contains("PRIMARY KEY (session_id, state_key, item_index)"));
+        assert!(ddl.contains("state_data LONGTEXT NOT NULL"));
+    }
+
+    /// `create_if_not_exist == false` verifies the database first (Java
+    /// `verifyDatabaseExists`) and reports the Java message when it is missing.
+    #[test]
+    fn missing_database_is_reported_when_not_auto_creating() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        let err = MysqlAgentStateStore::with_config(backend.clone(), None, None, false)
+            .expect_err("empty server has no database");
+        assert!(matches!(err, MysqlError::Schema(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("Database does not exist: agentscope"),
+            "{err}"
+        );
+        assert!(
+            backend.ddl_log().is_empty(),
+            "verification must not create anything"
+        );
+    }
+
+    /// The database may exist while the table does not — Java's second check.
+    #[test]
+    fn missing_table_is_reported_when_not_auto_creating() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        backend.create_database(DEFAULT_DATABASE_NAME);
+        let err = MysqlAgentStateStore::with_config(backend.clone(), None, None, false)
+            .expect_err("database without table");
+        assert!(matches!(err, MysqlError::Schema(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("Table does not exist: agentscope.agentscope_sessions"),
+            "{err}"
+        );
+        assert!(backend.ddl_log().is_empty());
+    }
+
+    /// A table created before versioning gets the `ALTER TABLE ... DEFAULT 1` migration on
+    /// construction, even with `create_if_not_exist == false` (Java runs
+    /// `ensureVersionColumn` in both branches).
+    #[test]
+    fn legacy_table_gets_the_version_column_migration() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        backend.create_legacy_table(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME);
+        assert!(!backend
+            .columns(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME)
+            .iter()
+            .any(|c| c == "version"));
+
+        let _s = MysqlAgentStateStore::with_config(backend.clone(), None, None, false)
+            .expect("existing schema is upgraded");
+
+        assert!(backend
+            .columns(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME)
+            .iter()
+            .any(|c| c == "version"));
+        assert_eq!(
+            backend.ddl_log(),
+            vec![add_version_column_sql(
+                DEFAULT_DATABASE_NAME,
+                DEFAULT_TABLE_NAME
+            )],
+            "exactly one ALTER, with DEFAULT 1 (0 is the 'row absent' sentinel)"
+        );
+        assert!(add_version_column_sql("agentscope", "agentscope_sessions")
+            .ends_with("ADD COLUMN version BIGINT NOT NULL DEFAULT 1"));
+    }
+
+    /// The migration is idempotent: a second construction finds `version` and issues no DDL
+    /// (MySQL would otherwise fail the repeated `ALTER TABLE` with ER_DUP_FIELDNAME).
+    #[test]
+    fn version_column_migration_is_idempotent() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        backend.create_legacy_table(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME);
+        MysqlAgentStateStore::with_config(backend.clone(), None, None, false)
+            .expect("first upgrade");
+        let after_first = backend.ddl_log().len();
+        assert_eq!(after_first, 1);
+
+        MysqlAgentStateStore::with_config(backend.clone(), None, None, false)
+            .expect("second construction");
+        assert_eq!(backend.ddl_log().len(), after_first, "no repeated ALTER");
+    }
+
+    /// A table that already has `version` is left untouched, and `auto_create` on an
+    /// existing table is a pair of idempotent `IF NOT EXISTS` statements.
+    #[test]
+    fn existing_version_column_is_left_alone() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        MysqlAgentStateStore::with_config(backend.clone(), None, None, true)
+            .expect("bootstrap");
+        let after_create = backend.ddl_log().len();
+        assert_eq!(after_create, 2);
+
+        MysqlAgentStateStore::with_config(backend.clone(), None, None, false)
+            .expect("verify existing schema");
+        assert_eq!(
+            backend.ddl_log().len(),
+            after_create,
+            "nothing to migrate, nothing to create"
+        );
+    }
+
+    /// A failing DDL must surface instead of leaving a half-provisioned store behind
+    /// (the previous implementation discarded the `ensure_schema` result).
+    #[test]
+    fn ddl_failure_propagates_when_auto_creating() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        backend.fail_ddl(true);
+        let err = MysqlAgentStateStore::with_config(backend.clone(), None, None, true)
+            .expect_err("CREATE DATABASE failed");
+        assert!(matches!(err, MysqlError::Sql(_)), "{err:?}");
+        assert!(!backend.has_database(DEFAULT_DATABASE_NAME));
+    }
+
+    /// Custom names flow into the DDL verbatim and are still validated as identifiers.
+    #[test]
+    fn custom_names_flow_into_the_provisioning_ddl() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        let s = MysqlAgentStateStore::with_config(
+            backend.clone(),
+            Some("custom_db"),
+            Some("custom_sessions"),
+            true,
+        )
+        .expect("bootstrap");
+        assert_eq!(s.database_name(), "custom_db");
+        assert_eq!(s.table_name(), "custom_sessions");
+        assert!(backend.has_table("custom_db", "custom_sessions"));
+        assert_eq!(
+            backend.ddl_log(),
+            vec![
+                create_database_sql("custom_db"),
+                create_sessions_table_sql("custom_db", "custom_sessions")
+            ]
+        );
     }
 }
