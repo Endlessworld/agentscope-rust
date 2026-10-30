@@ -59,7 +59,7 @@ impl TransportProperties {
         format!(
             "{}://{}:{}{}",
             scheme,
-            self.host.as_deref().unwrap_or_default(),
+            format_host_for_url(self.host.as_deref().unwrap_or_default()),
             self.effective_port(),
             self.normalized_path()
         )
@@ -71,6 +71,20 @@ impl TransportProperties {
             transport: self.transport_type.clone(),
             url: self.to_url(),
         }
+    }
+}
+
+/// Formats a host for use in a URL authority, adding brackets to unbracketed IPv6 literals.
+///
+/// Mirrors Java `NetworkUtils#formatHostForUrl`: host names, IPv4 addresses and already
+/// bracketed IPv6 hosts are returned unchanged; an unbracketed IPv6 literal such as `::1`
+/// becomes `[::1]`, so `scheme://host:port` stays a valid HTTP authority.
+pub fn format_host_for_url(host: &str) -> String {
+    let needs_brackets = host.contains(':') && !(host.starts_with('[') && host.ends_with(']'));
+    if needs_brackets {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
@@ -131,5 +145,47 @@ impl TransportPropertiesBuilder {
             support_tls: self.support_tls,
             extra: self.extra,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Java: NetworkUtilsTest#formatHostForUrl — host names, IPv4 and bracketed IPv6 keep their
+    // existing form, an unbracketed IPv6 literal gains brackets.
+    #[test]
+    fn ipv6_hosts_are_bracketed_and_other_hosts_are_untouched() {
+        assert_eq!(format_host_for_url("::1"), "[::1]");
+        assert_eq!(format_host_for_url("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(format_host_for_url("[::1]"), "[::1]");
+        assert_eq!(format_host_for_url("agent.example.com"), "agent.example.com");
+        assert_eq!(format_host_for_url("127.0.0.1"), "127.0.0.1");
+        assert_eq!(format_host_for_url(""), "");
+    }
+
+    // Java: AgentScopeAgentCardConverterTest — the synthesized interface URL must stay a valid
+    // authority for an IPv6 host.
+    #[test]
+    fn ipv6_transport_renders_a_bracketed_authority() {
+        let ipv6 = TransportProperties::builder("JSONRPC")
+            .host("::1")
+            .port(8080)
+            .path("a2a")
+            .build();
+        assert_eq!(ipv6.to_url(), "http://[::1]:8080/a2a");
+        assert_eq!(
+            ipv6.to_agent_interface(),
+            AgentInterface {
+                transport: "JSONRPC".to_string(),
+                url: "http://[::1]:8080/a2a".to_string(),
+            }
+        );
+
+        let hostname = TransportProperties::builder("JSONRPC")
+            .host("localhost")
+            .port(8080)
+            .build();
+        assert_eq!(hostname.to_url(), "http://localhost:8080");
     }
 }

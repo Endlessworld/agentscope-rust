@@ -755,7 +755,8 @@ async fn start_run(
 
     let options = AgentRequestOptions::new()
         .with_task_id(task_id.clone())
-        .with_session_id(context_id.clone());
+        .with_session_id(resolve_session_id(&params.message, &context_id))
+        .with_user_id(resolve_user_id(&params.message).unwrap_or_default());
 
     let stream = match runner.stream_events_incremental(msgs.clone(), options.clone()) {
         Some(stream) => stream,
@@ -768,6 +769,46 @@ async fn start_run(
         }
     };
     Ok((task_id, context_id, stream))
+}
+
+/// Resolves the session id of one request, mirroring Java
+/// `AgentScopeAgentExecutor#getSessionId(RequestContext)` (`e6f015e14`).
+///
+/// A non-blank legacy `message.metadata["sessionId"]` wins so existing session keys keep
+/// working; otherwise the SDK-resolved A2A `contextId` is used. The protocol message's
+/// `contextId` is never rewritten.
+fn resolve_session_id(message: &Message, context_id: &str) -> String {
+    if let Some(legacy) = message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("sessionId"))
+    {
+        let text = metadata_text(legacy);
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    context_id.to_string()
+}
+
+/// Resolves the user id of one request from `message.metadata["userId"]`, mirroring Java
+/// `AgentScopeAgentExecutor#getUserId`.
+fn resolve_user_id(message: &Message) -> Option<String> {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("userId"))
+        .map(metadata_text)
+}
+
+/// Renders a metadata value the way Java's `String.valueOf(Object)` does: strings verbatim,
+/// everything else through its JSON text.
+fn metadata_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Projects `event` and, when it produces client-visible output, stores it as a task artifact.
@@ -1249,6 +1290,110 @@ mod tests {
         let msgs = ServerMessageConvert::convert_from_message_to_msgs(&message);
         // core::Msg would panic for a user message holding a thinking block.
         assert_eq!(msgs[0].role, MsgRole::Assistant);
+    }
+
+    /// Records the [`AgentRequestOptions`] of every run.
+    struct CapturingRunner {
+        seen: Arc<Mutex<Vec<AgentRequestOptions>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRunner for CapturingRunner {
+        fn agent_name(&self) -> String {
+            "capturing-agent".to_string()
+        }
+
+        fn agent_description(&self) -> String {
+            "captures the request options".to_string()
+        }
+
+        async fn stream_events(
+            &self,
+            _request_messages: Vec<Msg>,
+            options: AgentRequestOptions,
+        ) -> Result<Vec<AgentEvent>, A2aError> {
+            self.seen.lock().unwrap().push(options);
+            let mut data = EventData::default();
+            data.fields
+                .insert("reply".to_string(), serde_json::json!("ok"));
+            Ok(vec![AgentEvent::AgentResult(data)])
+        }
+
+        fn stop(&self, _task_id: &str) {}
+    }
+
+    // Java: e6f015e14 — a standard A2A client that only sends `contextId` must give the runner a
+    // session id; an explicit legacy `metadata.sessionId` keeps precedence.
+    #[test]
+    fn a_standard_client_session_id_comes_from_the_context_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = A2aRequestHandler::new(
+            Arc::new(CapturingRunner { seen: seen.clone() }),
+            AgentCard::new("capturing-agent", "http://localhost"),
+            registry(),
+        );
+        let mut message = Message::new("m1", MessageRole::User, vec![Part::text("ping")]);
+        message.context_id = Some("ctx-1".to_string());
+
+        let params = MessageSendParams {
+            message,
+            configuration: None,
+            metadata: None,
+        };
+        let request = JsonRpcRequest::new(
+            methods::MESSAGE_SEND,
+            Some(serde_json::to_value(params).unwrap()),
+            Some(serde_json::Value::from(1)),
+        );
+        rt().block_on(handler.handle(&request));
+
+        let options = seen.lock().unwrap().first().cloned().expect("one run");
+        assert_eq!(options.session_id(), Some("ctx-1"));
+        // Java returns "" for a missing `metadata.userId`.
+        assert_eq!(options.user_id(), Some(""));
+    }
+
+    #[test]
+    fn legacy_session_metadata_wins_over_the_context_id() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("sessionId".to_string(), serde_json::json!("legacy-session"));
+        metadata.insert("userId".to_string(), serde_json::json!("alice"));
+        let message = Message {
+            message_id: "m1".to_string(),
+            role: MessageRole::User,
+            parts: vec![Part::text("ping")],
+            metadata: Some(metadata),
+            context_id: Some("ctx-1".to_string()),
+            task_id: None,
+            kind: "message".to_string(),
+        };
+
+        assert_eq!(resolve_session_id(&message, "ctx-1"), "legacy-session");
+        assert_eq!(resolve_user_id(&message).as_deref(), Some("alice"));
+    }
+
+    // Java: null, empty and whitespace-only legacy values fall back to the protocol context id.
+    #[test]
+    fn blank_legacy_session_metadata_falls_back_to_the_context_id() {
+        for legacy in ["", "   "] {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("sessionId".to_string(), serde_json::json!(legacy));
+            let message = Message {
+                message_id: "m1".to_string(),
+                role: MessageRole::User,
+                parts: vec![Part::text("ping")],
+                metadata: Some(metadata),
+                context_id: Some("ctx-1".to_string()),
+                task_id: None,
+                kind: "message".to_string(),
+            };
+            assert_eq!(resolve_session_id(&message, "ctx-1"), "ctx-1");
+        }
+
+        // No metadata at all: the protocol context id is used.
+        let message = Message::new("m1", MessageRole::User, vec![Part::text("ping")]);
+        assert_eq!(resolve_session_id(&message, "ctx-9"), "ctx-9");
+        assert_eq!(resolve_user_id(&message), None);
     }
 
     #[test]

@@ -19,12 +19,25 @@ use crate::model::{AgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 /// Resolves the [`AgentCard`] of a remote agent by name.
 ///
 /// Mirrors Java `io.agentscope.core.a2a.agent.card.AgentCardResolver`.
+///
+/// Java's contract allows `null` ("no card is found for that name") and the caller fails fast
+/// with an `IllegalStateException`; the Rust contract reports the same case as an `Err`, which
+/// [`A2aClient`](crate::client::A2aClient) turns into
+/// [`A2aError::CardUnavailable`] naming the agent and this resolver.
 pub trait AgentCardResolver: Send + Sync {
     /// Produces the agent card for `agent_name`.
     fn get_agent_card(
         &self,
         agent_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<AgentCard, A2aError>> + Send + '_>>;
+
+    /// Name of this resolver implementation, used in fail-fast diagnostics.
+    ///
+    /// Mirrors Java's `agentCardResolver.getClass().getSimpleName()`.
+    fn resolver_name(&self) -> &'static str {
+        let full = std::any::type_name::<Self>();
+        full.rsplit("::").next().unwrap_or(full)
+    }
 }
 
 /// Always returns the same, statically configured card.

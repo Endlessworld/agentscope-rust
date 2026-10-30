@@ -147,22 +147,47 @@ impl AguiEventType {
 }
 
 /// A JSON Patch operation (RFC 6902) used by [`AguiEvent::StateDelta`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// Serialization follows RFC 6902 instead of skipping every absent member (Java `1aebcf0b2`):
+/// `add` / `replace` / `test` always carry a `value` member, even when it is `null`; `remove` /
+/// `move` / `copy` never do; `from` is only emitted when present.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct JsonPatchOperation {
     /// Operation name (`add`, `remove`, `replace`, `move`, `copy`, `test`).
     pub op: String,
     /// JSON Pointer path.
     pub path: String,
-    /// Value to add/replace (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Value to add/replace/test (optional).
     pub value: Option<Value>,
     /// Source path for `move`/`copy` operations.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
 }
 
+impl Serialize for JsonPatchOperation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("op", &self.op)?;
+        map.serialize_entry("path", &self.path)?;
+        if self.includes_value() {
+            // `Option::serialize` writes `null` for `None`, which RFC 6902 requires for
+            // `add` / `replace` / `test`.
+            map.serialize_entry("value", &self.value)?;
+        }
+        if let Some(from) = &self.from {
+            map.serialize_entry("from", from)?;
+        }
+        map.end()
+    }
+}
+
 impl JsonPatchOperation {
+    /// Whether this operation carries a `value` member per RFC 6902.
+    fn includes_value(&self) -> bool {
+        !matches!(self.op.as_str(), "remove" | "move" | "copy")
+    }
+
     /// Creates an `add` operation.
     pub fn add(path: impl Into<String>, value: Option<Value>) -> Self {
         Self {
@@ -200,6 +225,26 @@ impl JsonPatchOperation {
             path: path.into(),
             value: None,
             from: Some(from.into()),
+        }
+    }
+
+    /// Creates a `copy` operation.
+    pub fn copy(from: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            op: "copy".to_string(),
+            path: path.into(),
+            value: None,
+            from: Some(from.into()),
+        }
+    }
+
+    /// Creates a `test` operation.
+    pub fn test(path: impl Into<String>, value: Option<Value>) -> Self {
+        Self {
+            op: "test".to_string(),
+            path: path.into(),
+            value,
+            from: None,
         }
     }
 }
@@ -1930,5 +1975,37 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: AguiEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, event);
+    }
+
+    // Java: AguiEventTest (1aebcf0b2) — a JSON Patch payload must stay RFC 6902 valid:
+    // `add`/`replace`/`test` keep an explicit `value` (even null), `remove`/`move`/`copy` never
+    // carry one, and `from` is only present for `move`/`copy`.
+    #[test]
+    fn patch_operations_follow_rfc_6902_payload_rules() {
+        let add = serde_json::to_value(JsonPatchOperation::add("/x", None)).unwrap();
+        assert_eq!(add, json!({"op": "add", "path": "/x", "value": null}));
+
+        let replace =
+            serde_json::to_value(JsonPatchOperation::replace("/x", Some(json!(7)))).unwrap();
+        assert_eq!(replace, json!({"op": "replace", "path": "/x", "value": 7}));
+
+        let test = serde_json::to_value(JsonPatchOperation::test("/x", None)).unwrap();
+        assert_eq!(test, json!({"op": "test", "path": "/x", "value": null}));
+
+        let remove = serde_json::to_value(JsonPatchOperation::remove("/x")).unwrap();
+        assert_eq!(remove, json!({"op": "remove", "path": "/x"}));
+        assert!(remove.get("value").is_none(), "remove must omit value");
+
+        let moved = serde_json::to_value(JsonPatchOperation::move_("/a", "/b")).unwrap();
+        assert_eq!(moved, json!({"op": "move", "path": "/b", "from": "/a"}));
+
+        let copied = serde_json::to_value(JsonPatchOperation::copy("/a", "/b")).unwrap();
+        assert_eq!(copied, json!({"op": "copy", "path": "/b", "from": "/a"}));
+
+        // Deserialization still reads both shapes back.
+        let back: JsonPatchOperation = serde_json::from_value(remove).unwrap();
+        assert_eq!(back, JsonPatchOperation::remove("/x"));
+        let back: JsonPatchOperation = serde_json::from_value(add).unwrap();
+        assert_eq!(back, JsonPatchOperation::add("/x", None));
     }
 }

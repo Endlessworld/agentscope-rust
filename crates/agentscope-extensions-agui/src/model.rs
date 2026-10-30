@@ -112,6 +112,49 @@ impl AguiMessage {
         )
     }
 
+    /// Creates an assistant message with plain text content.
+    ///
+    /// Mirrors Java `AguiMessage#assistantMessage(String, String)`.
+    pub fn assistant_message(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::new(
+            id,
+            "assistant",
+            Some(MessageContent::Text(content.into())),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Creates a system message with plain text content.
+    ///
+    /// Mirrors Java `AguiMessage#systemMessage(String, String)`.
+    pub fn system_message(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::new(
+            id,
+            "system",
+            Some(MessageContent::Text(content.into())),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Creates a tool message answering `tool_call_id` with plain text content.
+    ///
+    /// Mirrors Java `AguiMessage#toolMessage(String, String, String)`.
+    pub fn tool_message(
+        id: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            id,
+            "tool",
+            Some(MessageContent::Text(content.into())),
+            Vec::new(),
+            Some(tool_call_id.into()),
+        )
+    }
+
     /// The plain text content, or `None` when the content is not [`MessageContent::Text`].
     pub fn text_content(&self) -> Option<&str> {
         match &self.content {
@@ -902,5 +945,40 @@ mod tests {
         assert_eq!(decoded.error.as_deref(), Some("sandbox unavailable"));
         assert_eq!(decoded.tool_call_id.as_deref(), Some("tc-1"));
         assert_eq!(decoded, reported);
+    }
+
+    // Java: AguiMessage factories (`assistantMessage` / `systemMessage` / `toolMessage`).
+    #[test]
+    fn message_factories_fill_the_role_specific_fields() {
+        let assistant = AguiMessage::assistant_message("m1", "hello");
+        assert!(assistant.is_assistant_message());
+        assert_eq!(assistant.text_content(), Some("hello"));
+
+        let system = AguiMessage::system_message("m2", "be brief");
+        assert!(system.is_system_message());
+        assert_eq!(system.text_content(), Some("be brief"));
+
+        let tool = AguiMessage::tool_message("m3", "tc-1", "42");
+        assert!(tool.is_tool_message());
+        assert_eq!(tool.tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(tool.text_content(), Some("42"));
+        // Tool calls are not used by any of these factories.
+        assert!(!tool.has_tool_calls());
+    }
+
+    // Java: AguiModelTest (1aebcf0b2) — a schema-valid message payload omits null content,
+    // null `toolCallId` and an empty `toolCalls` array.
+    #[test]
+    fn message_payload_omits_absent_members() {
+        let message = AguiMessage::new("m1", "assistant", None, Vec::new(), None);
+        let value = serde_json::to_value(&message).unwrap();
+        assert!(value.get("content").is_none());
+        assert!(value.get("toolCalls").is_none());
+        assert!(value.get("toolCallId").is_none());
+
+        let user = AguiMessage::user_message("m2", "hi");
+        let value = serde_json::to_value(&user).unwrap();
+        assert_eq!(value["content"], json!("hi"));
+        assert!(value.get("toolCallId").is_none());
     }
 }

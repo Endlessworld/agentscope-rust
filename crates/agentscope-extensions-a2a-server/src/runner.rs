@@ -12,6 +12,8 @@
 //! Java ties the cache to `ConcurrentHashMap<String, ReActAgent>` and the removal to
 //! `doFinally(...)`. Rust keeps the same semantics with a [`CacheGuard`] whose `Drop` removes the
 //! entry, so completion, stream errors and early `drop` of the event stream all release the slot.
+//! Like Java's `agentCache.remove(taskId, agent)` the guard only removes the entry it owns, so a
+//! stream that outlives a restart cannot evict the replacement agent.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -91,19 +93,29 @@ pub trait TaskAgentFactory: Send + Sync {
 }
 
 /// Removes the cached agent of one task when the run ends, mirroring Java
-/// `doFinally(signal -> agentCache.remove(taskId))`.
+/// `doFinally(signal -> agentCache.remove(taskId, agent))`.
 ///
 /// The guard is dropped on every exit path: normal completion, a stream error, and a caller that
-/// drops the event stream before draining it.
+/// drops the event stream before draining it. It only removes the entry when the cache still
+/// holds **this** agent instance, so a stream that outlives a restart (the task was stopped and
+/// started again with the same id) never evicts its replacement — the race fixed in Java
+/// `431031a7a`.
 struct CacheGuard {
     agents: Arc<Mutex<HashMap<String, Arc<dyn TaskAgent>>>>,
     task_id: String,
+    agent: Arc<dyn TaskAgent>,
 }
 
 impl Drop for CacheGuard {
     fn drop(&mut self) {
         if let Ok(mut agents) = self.agents.lock() {
-            agents.remove(&self.task_id);
+            let owns_entry = agents
+                .get(&self.task_id)
+                .map(|current| Arc::ptr_eq(current, &self.agent))
+                .unwrap_or(false);
+            if owns_entry {
+                agents.remove(&self.task_id);
+            }
         }
     }
 }
@@ -152,27 +164,31 @@ impl<F: TaskAgentFactory> BaseReActAgentRunner<F> {
 
     /// Builds and caches the agent of one task.
     ///
-    /// Java checks `containsKey` and then `put`s, which races under concurrent starts; holding the
-    /// lock across the check-and-insert keeps the per-task slot exclusive.
+    /// Java checks `containsKey`, builds an agent, then inserts with `putIfAbsent` and reports the
+    /// duplicate when another start won the race. Building outside the lock keeps a slow factory
+    /// from serializing every task, and re-checking under the lock keeps the per-task slot
+    /// exclusive (the fix from Java `431031a7a`).
     fn register(&self, task_id: &str) -> Result<Arc<dyn TaskAgent>, A2aError> {
+        if self.is_cached(task_id) {
+            return Err(already_started(task_id));
+        }
+        let agent = self.factory.build()?;
         let mut agents = self
             .agents
             .lock()
             .map_err(|_| A2aError::InvalidRequest("agent cache is poisoned".to_string()))?;
         if agents.contains_key(task_id) {
-            return Err(A2aError::InvalidRequest(format!(
-                "Agent already exists for taskId: {task_id}"
-            )));
+            return Err(already_started(task_id));
         }
-        let agent = self.factory.build()?;
         agents.insert(task_id.to_string(), agent.clone());
         Ok(agent)
     }
 
-    fn guard(&self, task_id: &str) -> CacheGuard {
+    fn guard(&self, task_id: &str, agent: &Arc<dyn TaskAgent>) -> CacheGuard {
         CacheGuard {
             agents: self.agents.clone(),
             task_id: task_id.to_string(),
+            agent: agent.clone(),
         }
     }
 }
@@ -195,7 +211,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         let task_id = required_task_id(&options)?;
         let agent = self.register(&task_id)?;
         // Dropped on every exit path below, including an erroring event stream.
-        let _guard = self.guard(&task_id);
+        let _guard = self.guard(&task_id, &agent);
         let mut stream = agent.stream_events(request_messages);
         let mut events = Vec::new();
         while let Some(item) = stream.next().await {
@@ -214,7 +230,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         let task_id = options.task_id().map(str::to_string)?;
         match self.register(&task_id) {
             Ok(agent) => {
-                let guard = self.guard(&task_id);
+                let guard = self.guard(&task_id, &agent);
                 let stream = agent.stream_events(request_messages).map(move |item| {
                     // The closure owns the guard, so dropping the stream releases the cache slot.
                     let _ = &guard;
@@ -250,6 +266,11 @@ fn required_task_id(options: &AgentRequestOptions) -> Result<String, A2aError> {
         .task_id()
         .map(str::to_string)
         .ok_or_else(|| A2aError::InvalidRequest("AgentRunner requires a taskId".to_string()))
+}
+
+/// The error a duplicate start reports, mirroring Java `IllegalStateException`.
+fn already_started(task_id: &str) -> A2aError {
+    A2aError::InvalidRequest(format!("Agent already exists for taskId: {task_id}"))
 }
 
 /// Builds a fresh [`ReActAgent`] per task from a caller-supplied builder closure.
@@ -804,6 +825,128 @@ mod tests {
         let runner = ReActAgentWithBuilderRunner::with_builder(|| {
             Err(A2aError::Transport("no model".to_string()))
         });
+        let error = rt()
+            .block_on(runner.stream_events(vec![Msg::user("go")], options("t1")))
+            .unwrap_err();
+        assert!(matches!(error, A2aError::Transport(_)));
+        assert!(runner.cached_task_ids().is_empty());
+    }
+
+    // Java: 431031a7a — an old stream that terminates after a restart must not remove the agent
+    // that replaced it (`agentCache.remove(taskId, agent)` in `doFinally`).
+    #[test]
+    fn an_old_stream_never_evicts_the_replacement_agent() {
+        let recorder = Arc::new(Recorder::default());
+        let runner = BaseReActAgentRunner::new(FakeFactory::new(
+            recorder.clone(),
+            FakeOutcome::Pending,
+        ));
+
+        let old_stream = rt().block_on(async {
+            let mut stream = runner
+                .stream_events_incremental(vec![Msg::user("one")], options("t1"))
+                .expect("incremental stream");
+            assert!(stream.next().await.is_some());
+            stream
+        });
+        assert_eq!(runner.cached_task_ids(), vec!["t1".to_string()]);
+
+        // Stop (cancel) the run and restart the same task id, as a client retry does.
+        runner.stop("t1");
+        assert!(runner.cached_task_ids().is_empty());
+        assert_eq!(recorder.interrupted(), vec!["a0".to_string()]);
+
+        let replacement = rt().block_on(async {
+            let mut stream = runner
+                .stream_events_incremental(vec![Msg::user("two")], options("t1"))
+                .expect("the restarted task gets a fresh agent");
+            assert!(stream.next().await.is_some());
+            stream
+        });
+        assert_eq!(runner.cached_task_ids(), vec!["t1".to_string()]);
+
+        // The old stream terminates only now: it must leave the replacement alone.
+        drop(old_stream);
+        assert_eq!(
+            runner.cached_task_ids(),
+            vec!["t1".to_string()],
+            "the terminating old stream keeps the replacement agent cached"
+        );
+
+        drop(replacement);
+        assert!(runner.cached_task_ids().is_empty());
+    }
+
+    // Java: 431031a7a — the per-task slot is exclusive, so concurrent starts of one task id get
+    // exactly one agent; the others report "Agent already exists for taskId" without building or
+    // evicting the running agent.
+    #[test]
+    fn concurrent_starts_of_one_task_are_rejected_without_evicting_the_owner() {
+        let recorder = Arc::new(Recorder::default());
+        let runner = Arc::new(BaseReActAgentRunner::new(FakeFactory::new(
+            recorder.clone(),
+            FakeOutcome::Pending,
+        )));
+
+        // The owner keeps its stream alive, so the slot stays taken for the whole test.
+        let owner = rt().block_on(async {
+            let mut stream = runner
+                .stream_events_incremental(vec![Msg::user("owner")], options("t1"))
+                .expect("incremental stream");
+            assert!(stream.next().await.is_some());
+            stream
+        });
+        assert_eq!(runner.cached_task_ids(), vec!["t1".to_string()]);
+
+        let mut handles = Vec::new();
+        for index in 0..4 {
+            let runner = runner.clone();
+            handles.push(std::thread::spawn(move || {
+                rt().block_on(async move {
+                    let mut stream = runner
+                        .stream_events_incremental(
+                            vec![Msg::user(format!("loser-{index}"))],
+                            options("t1"),
+                        )
+                        .expect("the contract still yields a stream");
+                    matches!(stream.next().await, Some(Err(_)))
+                })
+            }));
+        }
+        for handle in handles {
+            assert!(
+                handle.join().expect("worker thread"),
+                "every concurrent start is rejected"
+            );
+        }
+
+        assert_eq!(
+            recorder.built(),
+            vec!["a0".to_string()],
+            "losers never build an agent"
+        );
+        assert_eq!(
+            runner.cached_task_ids(),
+            vec!["t1".to_string()],
+            "the owner keeps the slot"
+        );
+
+        drop(owner);
+        assert!(runner.cached_task_ids().is_empty());
+    }
+
+    // Java: 431031a7a also rolls the cache back when stream creation fails synchronously. Rust
+    // creates the guard before asking the agent for its stream, so any early failure (panicking
+    // factory or agent) drops the guard and releases the slot; a failing factory is covered by
+    // `a_failing_builder_is_reported_and_never_cached`.
+    #[test]
+    fn a_stream_error_releases_the_cache_slot() {
+        let recorder = Arc::new(Recorder::default());
+        let runner = BaseReActAgentRunner::new(FakeFactory::new(
+            recorder,
+            FakeOutcome::Fail,
+        ));
+
         let error = rt()
             .block_on(runner.stream_events(vec![Msg::user("go")], options("t1")))
             .unwrap_err();

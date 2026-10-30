@@ -31,6 +31,25 @@ pub enum A2aError {
     /// The requested method is not supported by this handler.
     #[error("unsupported method: {0}")]
     UnsupportedMethod(String),
+    /// No agent card could be resolved for the agent, so the call fails before any
+    /// request is sent.
+    ///
+    /// Mirrors Java `A2aAgent#startCall`, which throws an `IllegalStateException` naming the
+    /// agent and the resolver instead of building a client from a `null` card. Rust resolvers
+    /// report the missing card as an error already (there is no `null`), so the client wraps
+    /// that error with the agent name and the resolver that produced it.
+    #[error(
+        "No AgentCard found for A2A agent '{agent_name}' via {resolver}. \
+         Check that the agent name matches the name registered on the server ({detail})"
+    )]
+    CardUnavailable {
+        /// Name of the agent whose card was requested.
+        agent_name: String,
+        /// Concrete resolver implementation (Java `getClass().getSimpleName()`).
+        resolver: String,
+        /// The resolver's own failure text.
+        detail: String,
+    },
     /// The payload was structurally invalid.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -45,6 +64,19 @@ impl A2aError {
     /// Wraps a `serde_json` error as [`A2aError::Json`].
     pub fn json(err: serde_json::Error) -> Self {
         A2aError::Json(err)
+    }
+
+    /// Wraps a resolver failure as a fail-fast [`A2aError::CardUnavailable`].
+    pub fn card_unavailable(
+        agent_name: &str,
+        resolver: &str,
+        error: A2aError,
+    ) -> Self {
+        A2aError::CardUnavailable {
+            agent_name: agent_name.to_string(),
+            resolver: resolver.to_string(),
+            detail: error.to_string(),
+        }
     }
 }
 
@@ -71,5 +103,22 @@ mod tests {
             message: "task not found".to_string(),
         };
         assert_eq!(err.to_string(), "json-rpc error -32001: task not found");
+    }
+
+    // Java: A2aAgent#startCall (1524b3191) — the failure names the agent and the resolver class.
+    #[test]
+    fn card_unavailable_names_the_agent_and_the_resolver() {
+        let err = A2aError::card_unavailable(
+            "remote",
+            "FixedAgentCardResolver",
+            A2aError::Transport("no card".to_string()),
+        );
+        assert!(matches!(err, A2aError::CardUnavailable { .. }));
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "No AgentCard found for A2A agent 'remote' via FixedAgentCardResolver. \
+             Check that the agent name matches the name registered on the server (transport error: no card)"
+        );
     }
 }

@@ -175,8 +175,21 @@ impl A2aClient {
     }
 
     /// Resolves the remote agent card.
+    ///
+    /// Fails fast, mirroring Java `A2aAgent#startCall`: when the resolver cannot produce a card
+    /// the error names the agent and the resolver instead of letting the call proceed with an
+    /// empty endpoint.
     pub async fn agent_card(&self) -> Result<AgentCard, A2aError> {
-        self.resolver.get_agent_card(&self.agent_name).await
+        self.resolver
+            .get_agent_card(&self.agent_name)
+            .await
+            .map_err(|error| {
+                A2aError::card_unavailable(
+                    &self.agent_name,
+                    self.resolver.resolver_name(),
+                    error,
+                )
+            })
     }
 
     /// `message/send`: sends a message and waits for the agent's reply.

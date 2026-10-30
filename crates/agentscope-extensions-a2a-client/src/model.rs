@@ -281,6 +281,24 @@ impl TaskState {
             TaskState::Completed | TaskState::Canceled | TaskState::Failed | TaskState::Rejected
         )
     }
+
+    /// The wire name of this state (`"completed"`, `"input-required"`, ...).
+    ///
+    /// The names match the A2A protocol values this enum serializes to, so diagnostics built
+    /// from them stay stable regardless of the Rust variant spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskState::Submitted => "submitted",
+            TaskState::Working => "working",
+            TaskState::InputRequired => "input-required",
+            TaskState::Completed => "completed",
+            TaskState::Canceled => "canceled",
+            TaskState::Failed => "failed",
+            TaskState::Rejected => "rejected",
+            TaskState::AuthRequired => "auth-required",
+            TaskState::Unknown => "unknown",
+        }
+    }
 }
 
 /// Task status: state plus optional message and timestamp.
