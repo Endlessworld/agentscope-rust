@@ -128,7 +128,7 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-**已完成**：COS 模块全部产出契约落地并复用既有 trait；list 增量哈希已收敛到 core（无平行实现）。**2026-10-29 复核**：测试数 **105**（§1 / §4.4 一致）；§3.1 旧记「31」已就地勘误（历史原文保留）；真实剩余见 §4.2（core `needs_full_rewrite` Case 3 与 Java 同款、core trait 无 per-key `delete`/`close`、`CosError::NotFound` 预留变体、分片上传无 `ListParts` 断点续传/分片级重试/进度回调、STS 不自动刷新、预签名只签 host、根 `object_store` 依赖无引用）。
+**已完成**：COS 模块全部产出契约落地并复用既有 trait；list 增量哈希已收敛到 core（无平行实现）。**2026-10-29 复核**：测试数 **105**（§1 / §4.4 一致）；§3.1 旧记「31」已就地勘误（历史原文保留）；真实剩余见 §4.2（core `needs_full_rewrite` Case 3 与 Java 同款、分片上传无 `ListParts` 断点续传/分片级重试/进度回调、STS 不自动刷新、预签名只签 host、根 `object_store` 依赖无引用）。**2026-10-31 收口**：原列的「core trait 无 per-key `delete`」已不成立——core `AgentStateStore` 已有 `delete_key` 默认实现且本 crate 覆写之（`close()` 仍无 trait 对应，属设计决定）；`CosError::NotFound` 已接线（§5）。
 - 文件（**13 个**，与 §1 规模行一致）：`src/{lib,error,layout,object_store,http_object_store,signature,multipart,presign,agent_state_store,base_store,snapshot,guard,distributed_store}.rs`
   - 非空行分布（2026-10-28 第二轮）：`http_object_store` 2166、`agent_state_store` 686、`signature` 479、`base_store` 382、`object_store` 257、`distributed_store` 234、`multipart` 230、`presign` 217、`layout` 170、`snapshot` 150、`guard` 134、`lib` 76、`error` 60 → **合计 5241**（总行 5823）
 - 验证命令与结果（**2026-10-28 第二轮重跑**）：
@@ -153,7 +153,7 @@
 - 旧行为实测（一次性探针，已删除）：旧 `needs_full_rewrite([a,b], old_hash([a]), 1) == true`（纯追加被误判为全量重写）；新实现同输入为 `false`。
 - 已知问题：无编译错误。**2026-10-28 更新**：真实 COS 后端已落地（`CosHttpObjectStore`），下列 2026-10-22 记录的 3 项静态缺口均已处理：
   - ~~`serde` / `futures` / `chrono` 冗余依赖~~ → **已删除**（`rg` 复核仍零使用点；`chrono` 的 2 处命中确为注释里的 "synchronous" 子串）
-  - ~~`CosError::Backend` / `NotFound` 从未被构造~~ → `Backend` 现由 HTTP 传输/响应体读取路径构造；新增 `Service{status,code,message}`（403/404 区分）与 `Closed`（close 后请求），`NotFound` 仍未被构造（保留：语义前缀 + `From<CosError> for core Error` 走 `to_string()`，删除会改变公开 API；标注为预留变体）
+  - ~~`CosError::Backend` / `NotFound` 从未被构造~~ → `Backend` 现由 HTTP 传输/响应体读取路径构造；新增 `Service{status,code,message}`（403/404 区分）与 `Closed`（close 后请求）；**`NotFound` 也已接线（2026-10-31）**：`CosRemoteSnapshotClient::download` 在 `get` 返回 `Ok(None)` 时改为 `Err(CosError::NotFound(key).into())`（对齐 Java 侧 SDK 的 object-not-found 异常），用例 `download_missing_snapshot_reports_not_found`
   - `object_store`（根 `[workspace.dependencies]`，`0.14`）仍**全 workspace 无引用且不在 `Cargo.lock`** → 属汇总方 P2，本 crate 未动根 `Cargo.toml`
 
 ### 4.2 下一步与阻塞
@@ -400,3 +400,31 @@ harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sand
 - 只签 `host`（预签名），因此不支持需要客户端发送自定义头的场景；`response-*` 类参数可经 `presign_url` 的 `params` 扩展（`presign_get/put` 目前不暴露——保持 API 最小）。
 - STS **不做自动刷新**：token 过期后调用方需 `with_credentials(...)` 换新（共享连接池与 `closed` 标志）。
 - 无 `ListParts` 断点续传、无分片级重试（失败即 abort 回滚）、无上传进度回调、`Upload Part`/`Complete` 不发送 `Content-MD5`（COS 文档标可选）；内存峰值约 2× 对象大小（整体副本 + 单片副本），未做真正流式上传。
+
+## 5. 2026-10-31 收口执行记录（P2-③ `NotFound` 预留变体 / `needs_full_rewrite` 约束复核）
+
+> 范围：仅 `crates/agentscope-extensions-cos/**` 与本文件；未动根 `Cargo.toml`/core/harness。
+> **未跑 cargo**（按约定由主智能体统一验证）。
+
+### 5.1 逐项处置
+
+| 条目 | 处置 | 源码级依据 |
+|---|---|---|
+| `CosError::NotFound` 预留变体（§4.1 / §3.2 残留 P2-③） | **已关闭**（接线而非删除） | `src/snapshot.rs::download`：`Ok(None) => Err(CosError::NotFound(key).into())`；`impl From<CosError> for core::Error`（同文件）将错讯固定为 `Error::Tool("snapshot not found: {key}")`，与旧内联文案（`Snapshot not found in COS:`）语义一致但可分类 |
+| `needs_full_rewrite` 约束复核（总 tracker 硬约束：`stored_hash == None && existing_count == 0` 必须返回 `false`，且不得用 SHA-256 前缀比较） | **满足，无需改代码** | core `state::list_hash::needs_full_rewrite` 仅三条分支：缩量 → `true`；`stored_hash.is_none() && existing_count > 0` → `true`；否则 `has_changed(compute_hash(prefix), stored_hash)`，而 `has_changed(_, None) == false` ⇒ 空数据无 hash ⇒ `false`。本 crate `save_list` 的 `existing_count` 取自**列表实体长度**、与 hash 对象解耦（`agent_state_store.rs` 注释已明述），且全 crate `rg 'fn compute_hash|fn needs_full_rewrite|starts_with\('` 零命中（无本地实现、无前缀比较） |
+| per-key `delete` 与 core trait | **已完成** | `agent_state_store.rs` 内 `async fn delete_key(...) -> core Result<()>` 直接写 trait 方法（非仅固有方法），一次 `delete_many` 删 `.json`/`.list.json`/`.list.hash`，错讯前缀 `COS per-key delete failed:`；用例 `delete_key_removes_value_list_and_hash_only` |
+| `close()` 无 trait 对应 | **已完成（设计决定，不迁移）** | **依据**：core `AgentStateStore` 无 `close`（生命周期由持有 `Arc<dyn CosObjectStore>` 的调用方管理）；`CosAgentStateStore::close()` 作为固有方法委托 `CosObjectStore::close()`，不强迫 trait 变更 |
+
+### 5.2 改动与用例
+
+| 文件 | 改动 |
+|---|---|
+| `src/snapshot.rs` | `download` 缺失分支改 `CosError::NotFound`；新增用例 `download_missing_snapshot_reports_not_found`（同时断言 `CosError::NotFound` 的 `Display` 文案） |
+
+用例数：`snapshot` 5 → **6**（2 `#[test]` + 4 `#[tokio::test]`）；整包 **105 → 106** lib unit tests（3 个 `no_run` doctest 不变）。
+
+### 5.3 未完成 / 残留（沿用 §4.1 / §4.2）
+
+- **跨模块**：core `needs_full_rewrite` Case 3 在「连续第二次纯追加」时仍判全量重写（与 Java 同款，非本 crate 缺陷）——需 core 层裁定，见回执「跨模块需求」。
+- 分片上传长尾（`ListParts` / 分片级重试 / 进度回调）、STS 自动刷新、预签名只签 host：均已在 §4.2/§4.4 记为设计边界，本轮不涉。
+- 真实 COS 云 live 验证仍需凭据。

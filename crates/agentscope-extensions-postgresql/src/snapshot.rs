@@ -233,6 +233,24 @@ mod tests {
         }
     }
 
+    // Java: PostgresRemoteSnapshotClientTest#uploadThrowsWhenSqlFails,
+    //       #downloadThrowsWhenSqlFails, #existsThrowsWhenSqlFails
+    #[tokio::test]
+    async fn sql_failures_surface_through_the_remote_client() {
+        let client = PostgresRemoteSnapshotClient::with_table(
+            Arc::new(DdlFailClient::default()),
+            "snap_fail",
+            false,
+        )
+        .unwrap();
+
+        assert!(client.upload("s1", b"archive").await.is_err());
+        assert!(client.download("s1").await.is_err());
+        assert!(client.exists("s1").await.is_err());
+        // Blank ids are rejected before any SQL runs (Java null/blank checks).
+        assert!(client.upload("", b"archive").await.is_err());
+    }
+
     // Java: PostgresRemoteSnapshotClientTest#constructorWithDefaultTableInitializesSchema
     #[test]
     fn constructor_initializes_default_table() {

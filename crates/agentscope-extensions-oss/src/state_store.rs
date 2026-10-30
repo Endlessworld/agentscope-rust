@@ -12,6 +12,16 @@
 //! Per-key deletion (`delete_key`) removes all three objects for one key while
 //! keeping the rest of the session intact; session-level `delete` (the core
 //! trait method) removes every object under the session prefix.
+//!
+//! # Error semantics
+//!
+//! Java `OssAgentStateStore` throws `RuntimeException` whenever OSS fails. The core
+//! [`AgentStateStore`] trait has no error channel (its `save`/`get`/`delete` return plain
+//! values), so the trait implementation can only log. Every operation therefore also has a
+//! **strict** inherent twin (`save_strict`, `save_list_strict`, `get_strict`,
+//! `get_list_strict`, `exists_strict`, `delete_session_strict`, `list_session_ids_strict`)
+//! that returns [`OssResult`], which is how callers distinguish a backend failure from
+//! "no data" — the behaviour Java callers get by catching `RuntimeException`.
 
 use std::sync::Arc;
 
@@ -83,6 +93,131 @@ impl OssAgentStateStore {
         self.client.delete(&list_key)?;
         self.client.delete(&hash_key)?;
         Ok(())
+    }
+
+    // ---- strict (error-propagating) variants ----
+    //
+    // Java `OssAgentStateStore` throws `RuntimeException` on every backend failure, but the
+    // core `AgentStateStore` trait has no error channel. These inherent methods are where
+    // the failure stays observable; the trait methods delegate to them and merely log.
+    // Callers that must tell "backend down" from "no data" (the Java semantics) use these.
+
+    /// Saves a single state value, propagating validation/encoding/backend failures.
+    pub async fn save_strict(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> OssResult<()> {
+        let object_key = self.state_object_key(user_id, session_id, key)?;
+        let json = serde_json::to_string(&value)?;
+        self.put_string(&object_key, &json)
+    }
+
+    /// Saves a list, propagating listing/encoding/backend failures.
+    ///
+    /// The incremental-append decision is delegated to
+    /// [`agentscope_core::state::list_hash`] exactly as before; only the error handling is
+    /// strict here.
+    pub async fn save_list_strict(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+    ) -> OssResult<()> {
+        let list_key = self.list_object_key(user_id, session_id, key)?;
+        let hash_key = self.hash_object_key(user_id, session_id, key)?;
+
+        let current_hash = compute_hash(values);
+        let stored_hash = self.get_string(&hash_key)?;
+
+        // Mirrors Java `existingCount`: the length of the list actually stored, **independent**
+        // of whether the hash object exists. Decoupling them is what makes
+        // `needs_full_rewrite` Case 2 (missing hash + existing data) reachable, and it also
+        // catches "emptied list without hash" (otherwise a stale list object would survive).
+        let existing_count = match self.get_string(&list_key)? {
+            Some(existing_json) => {
+                serde_json::from_str::<Vec<serde_json::Value>>(&existing_json)?.len()
+            }
+            None => 0,
+        };
+
+        let rewrite = needs_full_rewrite(values, stored_hash.as_deref(), existing_count)
+            || values.len() != existing_count;
+
+        if rewrite {
+            let json = serde_json::to_string(values)?;
+            self.put_string(&list_key, &json)?;
+        }
+        self.put_string(&hash_key, &current_hash)
+    }
+
+    /// Loads a single state value, distinguishing "absent" (`Ok(None)`) from failure.
+    pub async fn get_strict(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> OssResult<Option<serde_json::Value>> {
+        let object_key = self.state_object_key(user_id, session_id, key)?;
+        let Some(json) = self.get_string(&object_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    /// Loads a list value: absent → `Ok(vec![])`, backend/decode failure → `Err`.
+    pub async fn get_list_strict(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> OssResult<Vec<serde_json::Value>> {
+        let list_key = self.list_object_key(user_id, session_id, key)?;
+        let Some(json) = self.get_string(&list_key)? else {
+            return Ok(Vec::new());
+        };
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Whether the session holds any object, propagating backend failures.
+    pub async fn exists_strict(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> OssResult<bool> {
+        let prefix = self.session_prefix(user_id, session_id)?;
+        Ok(!self.client.list_page(&prefix, 1, None)?.objects.is_empty())
+    }
+
+    /// Deletes every object of a session, propagating the first failure.
+    pub async fn delete_session_strict(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> OssResult<()> {
+        let prefix = self.session_prefix(user_id, session_id)?;
+        for key in self.client.list_all(&prefix)? {
+            self.client.delete(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Lists the session ids of a user, propagating backend failures.
+    pub async fn list_session_ids_strict(&self, user_id: Option<&str>) -> OssResult<Vec<String>> {
+        let user_prefix = format!("{}{}/", self.key_prefix, normalize_user(user_id));
+        let mut session_ids = std::collections::BTreeSet::new();
+        for key in self.client.list_all(&user_prefix)? {
+            let remainder = key.strip_prefix(&user_prefix).unwrap_or("");
+            if let Some(slash) = remainder.find('/') {
+                if slash > 0 {
+                    session_ids.insert(remainder[..slash].to_string());
+                }
+            }
+        }
+        Ok(session_ids.into_iter().collect())
     }
 
     // ---- internal helpers ----
@@ -165,6 +300,18 @@ fn normalize_user(user_id: Option<&str>) -> String {
     }
 }
 
+/// Logs a failure from a non-error-returning trait method.
+///
+/// Blank identifiers are the caller's mistake (Java also rejects them up front), so they
+/// stay at `warn`; everything else is a backend/decode failure and logs at `error`.
+fn log_state_failure(op: &str, key: &str, error: &OssError) {
+    if matches!(error, OssError::BlankIdentifier(_)) {
+        tracing::warn!(error = %error, key, op, "OssAgentStateStore rejected");
+    } else {
+        tracing::error!(error = %error, key, op, "OssAgentStateStore failed");
+    }
+}
+
 #[async_trait]
 impl AgentStateStore for OssAgentStateStore {
     async fn save(
@@ -174,16 +321,8 @@ impl AgentStateStore for OssAgentStateStore {
         key: &str,
         value: serde_json::Value,
     ) {
-        let object_key = match self.state_object_key(user_id, session_id, key) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(error = %e, "OssAgentStateStore::save rejected");
-                return;
-            }
-        };
-        let json = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        if let Err(e) = self.put_string(&object_key, &json) {
-            tracing::error!(error = %e, key = %object_key, "failed to save state");
+        if let Err(e) = self.save_strict(user_id, session_id, key, value).await {
+            log_state_failure("save", key, &e);
         }
     }
 
@@ -194,47 +333,11 @@ impl AgentStateStore for OssAgentStateStore {
         key: &str,
         values: &[serde_json::Value],
     ) {
-        let (list_key, hash_key) = match (
-            self.list_object_key(user_id, session_id, key),
-            self.hash_object_key(user_id, session_id, key),
-        ) {
-            (Ok(l), Ok(h)) => (l, h),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!(error = %e, "OssAgentStateStore::save_list rejected");
-                return;
-            }
-        };
-
-        let result: OssResult<()> = (|| {
-            let current_hash = compute_hash(values);
-            let stored_hash = self.get_string(&hash_key)?;
-
-            let existing_count = if stored_hash.is_some() {
-                match self.get_string(&list_key)? {
-                    Some(existing_json) => {
-                        serde_json::from_str::<Vec<serde_json::Value>>(&existing_json)
-                            .map(|v| v.len())
-                            .unwrap_or(0)
-                    }
-                    None => 0,
-                }
-            } else {
-                0
-            };
-
-            let rewrite = needs_full_rewrite(values, stored_hash.as_deref(), existing_count)
-                || values.len() != existing_count;
-
-            if rewrite {
-                let json = serde_json::to_string(values)?;
-                self.put_string(&list_key, &json)?;
-            }
-            self.put_string(&hash_key, &current_hash)?;
-            Ok(())
-        })();
-
-        if let Err(e) = result {
-            tracing::error!(error = %e, key, "failed to save list");
+        if let Err(e) = self
+            .save_list_strict(user_id, session_id, key, values)
+            .await
+        {
+            log_state_failure("save_list", key, &e);
         }
     }
 
@@ -244,9 +347,13 @@ impl AgentStateStore for OssAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Option<serde_json::Value> {
-        let object_key = self.state_object_key(user_id, session_id, key).ok()?;
-        let json = self.get_string(&object_key).ok()??;
-        serde_json::from_str(&json).ok()
+        match self.get_strict(user_id, session_id, key).await {
+            Ok(value) => value,
+            Err(e) => {
+                log_state_failure("get", key, &e);
+                None
+            }
+        }
     }
 
     async fn get_list(
@@ -255,23 +362,18 @@ impl AgentStateStore for OssAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Vec<serde_json::Value> {
-        let list_key = match self.list_object_key(user_id, session_id, key) {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
-        let Some(json) = self.get_string(&list_key).ok().flatten() else {
-            return Vec::new();
-        };
-        serde_json::from_str::<Vec<serde_json::Value>>(&json).unwrap_or_default()
+        match self.get_list_strict(user_id, session_id, key).await {
+            Ok(values) => values,
+            Err(e) => {
+                log_state_failure("get_list", key, &e);
+                Vec::new()
+            }
+        }
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        let prefix = match self.session_prefix(user_id, session_id) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        match self.client.list_page(&prefix, 1, None) {
-            Ok(page) => !page.objects.is_empty(),
+        match self.exists_strict(user_id, session_id).await {
+            Ok(exists) => exists,
             Err(e) => {
                 tracing::error!(error = %e, "failed to check session existence");
                 false
@@ -280,38 +382,40 @@ impl AgentStateStore for OssAgentStateStore {
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
-        let prefix = match self.session_prefix(user_id, session_id) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        match self.client.list_all(&prefix) {
-            Ok(keys) => {
-                for k in keys {
-                    let _ = self.client.delete(&k);
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "failed to delete session"),
+        if let Err(e) = self.delete_session_strict(user_id, session_id).await {
+            tracing::error!(error = %e, "failed to delete session");
         }
     }
 
-    async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
-        let user_prefix = format!("{}{}/", self.key_prefix, normalize_user(user_id));
-        let mut session_ids = std::collections::BTreeSet::new();
-        match self.client.list_all(&user_prefix) {
-            Ok(keys) => {
-                for key in keys {
-                    let remainder = &key[user_prefix.len()..];
-                    if let Some(slash) = remainder.find('/') {
-                        if slash > 0 {
-                            session_ids.insert(remainder[..slash].to_string());
-                        }
-                    }
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "failed to list sessions"),
-        }
-        session_ids.into_iter().collect()
+    async fn delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<()> {
+        // Java `OssAgentStateStore.delete(userId, sessionId, key)` removes the value plus its
+        // list payload and incremental hash. The trait has an error channel here (unlike the
+        // other methods), so the failure must stay observable instead of being logged away.
+        OssAgentStateStore::delete_key(self, user_id, session_id, key)
+            .await
+            .map_err(|e| agentscope_core::error::Error::Other(format!("OSS per-key delete failed: {e}")))
     }
+
+    async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
+        match self.list_session_ids_strict(user_id).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to list sessions");
+                Vec::new()
+            }
+        }
+    }
+
+    // Versioning: `OssClient` has no conditional-put seam (`If-Match` / `If-None-Match`), so
+    // a read-check-write here would be a *fake* CAS, and Java `OssAgentStateStore` does not
+    // override `supportsVersioning` / `getVersioned` / `saveIfVersion` either. The core
+    // defaults (`supports_versioning() == false`, `save_if_version` degrading to `save` and
+    // returning `UNVERSIONED`) are therefore the intended semantics — see tracker §8.4.
 }
 
 /// Builder for [`OssAgentStateStore`].

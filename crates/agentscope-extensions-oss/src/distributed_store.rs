@@ -12,14 +12,12 @@
 use std::sync::Arc;
 
 use agentscope_harness::agent::distributed_store::DistributedStore;
-use agentscope_harness::filesystem::remote::store::BaseStore;
-
-use crate::base_store::{OssStore, DEFAULT_KEY_PREFIX as STORE_DEFAULT_PREFIX};
+use crate::base_store::OssStore;
 use crate::client::{normalize_prefix, OssClient};
 use crate::error::{OssError, OssResult};
 use crate::guard::OssSandboxExecutionGuard;
 use crate::snapshot::OssSnapshotSpec;
-use crate::state_store::{OssAgentStateStore, DEFAULT_KEY_PREFIX as STATE_DEFAULT_PREFIX};
+use crate::state_store::OssAgentStateStore;
 
 /// Default top-level key prefix used by the composed distributed store.
 pub const DEFAULT_KEY_PREFIX: &str = "agentscope/";
@@ -131,14 +129,4 @@ impl OssDistributedStore {
             .sandbox_execution_guard(Arc::new(self.guard.clone()))
             .build())
     }
-}
-
-// The default prefixes are only referenced for documentation parity with Java;
-// keep them available via the sub-modules and silence dead-code when unused.
-#[allow(dead_code)]
-const _DEFAULT_PREFIXES: (&str, &str) = (STATE_DEFAULT_PREFIX, STORE_DEFAULT_PREFIX);
-
-/// Blanket helper: box an [`OssStore`] as an `Arc<dyn BaseStore>`.
-pub fn as_arc_base_store(store: OssStore) -> Arc<dyn BaseStore> {
-    Arc::new(store)
 }

@@ -140,17 +140,46 @@ impl PostgresSandboxExecutionGuard {
     pub fn try_enter(&self, key: &SandboxIsolationKey) -> PgResult<PostgresSandboxLease> {
         let lock_name = self.compose_lock_key(key);
         let session = self.client.open_lock_session()?;
+        // Java: `PostgresSandboxExecutionGuard.java:71` —
+        // `log.debug("[sandbox-guard] Acquiring PostgreSQL advisory lock: {}", lockName)`.
+        tracing::debug!(
+            lock_name,
+            "[sandbox-guard] acquiring PostgreSQL advisory lock"
+        );
         let deadline = Instant::now() + self.lock_timeout;
         loop {
-            if session.try_lock(lock_name)? {
-                return Ok(PostgresSandboxLease {
-                    session: Some(session),
-                    lock_name,
-                    released: false,
-                });
+            match session.try_lock(lock_name) {
+                Ok(true) => {
+                    // Java: `:83` — `log.debug("... acquired after {} attempts")`.
+                    tracing::debug!(
+                        lock_name,
+                        "[sandbox-guard] acquired PostgreSQL advisory lock"
+                    );
+                    return Ok(PostgresSandboxLease {
+                        session: Some(session),
+                        lock_name,
+                        released: false,
+                    });
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // Java: `:116` — warn when the acquire query itself fails.
+                    tracing::warn!(
+                        error = %e,
+                        lock_name,
+                        "[sandbox-guard] advisory lock acquisition failed"
+                    );
+                    return Err(e);
+                }
             }
             if Instant::now() >= deadline {
                 // Dropping `session` ends the connection: nothing is left held.
+                // Java: `:107` — warn on timeout.
+                tracing::warn!(
+                    lock_name,
+                    timeout_seconds = self.lock_timeout.as_secs(),
+                    "[sandbox-guard] timed out waiting for PostgreSQL advisory lock"
+                );
                 return Err(PostgresError::LockTimeout(format!(
                     "{lock_name} (timeout={}s)",
                     self.lock_timeout.as_secs()
@@ -315,6 +344,25 @@ impl PostgresSandboxLease {
                 // connection is what actually guarantees the lock is gone (Java does the same
                 // in the `finally` block of `PostgresLease#close`).
                 let unlocked = session.unlock(self.lock_name);
+                match &unlocked {
+                    // Java: `:150` — `log.debug("[sandbox-guard] Released ...: {}")`.
+                    Ok(true) => tracing::debug!(
+                        lock_name = self.lock_name,
+                        "[sandbox-guard] released PostgreSQL advisory lock"
+                    ),
+                    // Java: `:152` — warn when the release reports "not owner".
+                    Ok(false) => tracing::warn!(
+                        lock_name = self.lock_name,
+                        "[sandbox-guard] unlock reported no lock owned by this session"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        lock_name = self.lock_name,
+                        "[sandbox-guard] failed to release PostgreSQL advisory lock"
+                    ),
+                }
+                // `PostgresLockSession::close` has no error channel (Java logs `:161` when
+                // `Connection#close` throws); ending the session is infallible from here.
                 session.close();
                 unlocked
             }

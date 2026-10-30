@@ -2,7 +2,7 @@
 //!
 //! Mirrors the `RuntimeException`/`IllegalStateException` surfaces of the Java module.
 
-use agentscope_core::error::{Error as CoreError, Result as CoreResult};
+use agentscope_core::error::Error as CoreError;
 
 /// Errors raised by the PostgreSQL-backed stores.
 #[derive(Debug, thiserror::Error)]
@@ -22,9 +22,6 @@ pub enum PostgresError {
     /// A supplied identifier (schema/table/key) is invalid.
     #[error("Invalid identifier: {0}")]
     InvalidIdentifier(String),
-    /// A CAS precondition failed (version mismatch).
-    #[error("CAS failed for {key}: expected version {expected}")]
-    CasFailed { key: String, expected: u64 },
     /// A lock could not be acquired within the configured timeout.
     #[error("Timed out waiting for PostgreSQL advisory lock: {0}")]
     LockTimeout(String),
@@ -41,8 +38,3 @@ impl From<PostgresError> for CoreError {
 
 /// Convenience alias for results produced by this crate.
 pub type PgResult<T> = std::result::Result<T, PostgresError>;
-
-/// Converts a [`PgResult`] into the crate-wide [`CoreResult`].
-pub(crate) fn to_core<T>(r: PgResult<T>) -> CoreResult<T> {
-    r.map_err(CoreError::from)
-}

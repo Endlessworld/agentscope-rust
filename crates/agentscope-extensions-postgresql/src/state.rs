@@ -4,7 +4,11 @@
 //! * session state stored in `(session_id, state_key, item_index)` rows;
 //! * single values at `item_index = 0`, list items at `0..n`;
 //! * a `":_hash"` companion row for list change detection;
-//! * versioned CAS via `save_if_version` (version starts at 1, `0` = unversioned).
+//! * versioned CAS via `save_if_version` (version starts at 1, `0` = unversioned);
+//! * every [`AgentStateStore`] method is `async` but the SQL seam is synchronous, so each one
+//!   hops onto the blocking pool ([`crate::blocking`]) before touching the client — calling
+//!   `PgSimpleClient` directly from an async context would `block_on` inside a runtime and
+//!   panic.
 
 use std::sync::Arc;
 
@@ -160,6 +164,67 @@ impl PostgresAgentStateStore {
 
     pub fn table_name(&self) -> &str {
         &self.table
+    }
+
+    /// Runs a blocking store operation on the blocking pool.
+    ///
+    /// [`AgentStateStore`] is async but [`PostgresClient`] is synchronous, and `PgSimpleClient`
+    /// drives the latter with its own runtime + `block_on` — which panics when the calling
+    /// thread is already inside a Tokio runtime. Every async method therefore hops onto the
+    /// blocking pool first, exactly as documented in [`crate::blocking`].
+    async fn run_blocking<T, F>(&self, op: F) -> PgResult<T>
+    where
+        F: FnOnce(Self) -> PgResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = self.clone();
+        match tokio::task::spawn_blocking(move || op(store)).await {
+            Ok(result) => result,
+            Err(e) => Err(PostgresError::Query(format!(
+                "blocking task join failed: {e}"
+            ))),
+        }
+    }
+
+    /// Session existence probe (sync; backs the async [`AgentStateStore::exists`]).
+    fn session_exists_sync(&self, slot: &str) -> PgResult<bool> {
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE session_id = $1 LIMIT 1",
+            self.full_table
+        );
+        match self.client.query(&sql, &[SqlValue::text(slot)])? {
+            QueryOutcome::Rows(rows) => Ok(!rows.is_empty()),
+            QueryOutcome::Affected(n) => Ok(n > 0),
+        }
+    }
+
+    /// Session delete (sync; backs the async [`AgentStateStore::delete`]).
+    fn delete_session_sync(&self, slot: &str) -> PgResult<()> {
+        let sql = format!("DELETE FROM {} WHERE session_id = $1", self.full_table);
+        self.client.query(&sql, &[SqlValue::text(slot)])?;
+        Ok(())
+    }
+
+    /// Session-id listing for one user segment (sync; backs
+    /// [`AgentStateStore::list_session_ids`]).
+    fn list_session_ids_sync(&self, user_segment: &str) -> PgResult<Vec<String>> {
+        let prefix = format!("{user_segment}:");
+        let pattern = format!("{prefix}%");
+        let sql = format!(
+            "SELECT DISTINCT session_id FROM {} WHERE session_id LIKE $1 ORDER BY session_id",
+            self.full_table
+        );
+        let QueryOutcome::Rows(rows) = self.client.query(&sql, &[SqlValue::text(pattern)])? else {
+            return Ok(Vec::new());
+        };
+        let mut ids: Vec<String> = rows
+            .into_iter()
+            .filter_map(|r| r.first().and_then(Cell::as_str).map(str::to_string))
+            .filter_map(|slot| slot.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     fn slot_id(user_id: Option<&str>, session_id: &str) -> PgResult<String> {
@@ -492,7 +557,14 @@ impl PostgresAgentStateStore {
 #[async_trait]
 impl AgentStateStore for PostgresAgentStateStore {
     async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: Value) {
-        let _ = self.save_versioned(user_id, session_id, key, &value);
+        let user = user_id.map(str::to_string);
+        let session = session_id.to_string();
+        let key = key.to_string();
+        let _ = self
+            .run_blocking(move |store| {
+                store.save_versioned(user.as_deref(), &session, &key, &value)
+            })
+            .await;
     }
 
     async fn save_list(
@@ -508,7 +580,11 @@ impl AgentStateStore for PostgresAgentStateStore {
         if Self::validate_state_key(key).is_err() {
             return;
         }
-        let _ = self.save_list_sync(&slot, key, values);
+        let key = key.to_string();
+        let values = values.to_vec();
+        let _ = self
+            .run_blocking(move |store| store.save_list_sync(&slot, &key, &values))
+            .await;
     }
 
     async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
@@ -516,7 +592,11 @@ impl AgentStateStore for PostgresAgentStateStore {
         if Self::validate_state_key(key).is_err() {
             return None;
         }
-        let json = self.get_sync(&slot, key, SINGLE_STATE_INDEX).ok()??;
+        let key = key.to_string();
+        let json = self
+            .run_blocking(move |store| store.get_sync(&slot, &key, SINGLE_STATE_INDEX))
+            .await
+            .ok()??;
         serde_json::from_str(&json).ok()
     }
 
@@ -527,7 +607,9 @@ impl AgentStateStore for PostgresAgentStateStore {
         if Self::validate_state_key(key).is_err() {
             return Vec::new();
         }
-        self.get_list_rows_sync(&slot, key)
+        let key = key.to_string();
+        self.run_blocking(move |store| store.get_list_rows_sync(&slot, &key))
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter_map(|json| serde_json::from_str(&json).ok())
@@ -538,24 +620,18 @@ impl AgentStateStore for PostgresAgentStateStore {
         let Ok(slot) = Self::slot_id(user_id, session_id) else {
             return false;
         };
-        let sql = format!(
-            "SELECT 1 FROM {} WHERE session_id = $1 LIMIT 1",
-            self.full_table
-        );
-        let params = [SqlValue::text(slot)];
-        matches!(
-            self.client.query(&sql, &params),
-            Ok(QueryOutcome::Rows(rows)) if !rows.is_empty()
-        )
+        self.run_blocking(move |store| store.session_exists_sync(&slot))
+            .await
+            .unwrap_or(false)
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
         let Ok(slot) = Self::slot_id(user_id, session_id) else {
             return;
         };
-        let sql = format!("DELETE FROM {} WHERE session_id = $1", self.full_table);
-        let params = [SqlValue::text(slot)];
-        let _ = self.client.query(&sql, &params);
+        let _ = self
+            .run_blocking(move |store| store.delete_session_sync(&slot))
+            .await;
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
@@ -563,26 +639,9 @@ impl AgentStateStore for PostgresAgentStateStore {
             Some(u) if !u.trim().is_empty() => u.to_string(),
             _ => ANON_USER.to_string(),
         };
-        let prefix = format!("{user_segment}:");
-        let pattern = format!("{prefix}%");
-        let sql = format!(
-            "SELECT DISTINCT session_id FROM {} WHERE session_id LIKE $1 ORDER BY session_id",
-            self.full_table
-        );
-        let params = [SqlValue::text(pattern)];
-        match self.client.query(&sql, &params) {
-            Ok(QueryOutcome::Rows(rows)) => {
-                let mut ids: Vec<String> = rows
-                    .into_iter()
-                    .filter_map(|r| r.first().and_then(Cell::as_str).map(str::to_string))
-                    .filter_map(|slot| slot.strip_prefix(&prefix).map(str::to_string))
-                    .collect();
-                ids.sort();
-                ids.dedup();
-                ids
-            }
-            _ => Vec::new(),
-        }
+        self.run_blocking(move |store| store.list_session_ids_sync(&user_segment))
+            .await
+            .unwrap_or_default()
     }
 
     fn supports_versioning(&self) -> bool {
@@ -595,25 +654,35 @@ impl AgentStateStore for PostgresAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> agentscope_core::state::VersionedState {
+        let unversioned = || agentscope_core::state::VersionedState {
+            value: None,
+            version: agentscope_core::state::UNVERSIONED,
+        };
         let Ok(slot) = Self::slot_id(user_id, session_id) else {
-            return agentscope_core::state::VersionedState {
-                value: None,
-                version: agentscope_core::state::UNVERSIONED,
-            };
+            return unversioned();
         };
         if Self::validate_state_key(key).is_err() {
-            return agentscope_core::state::VersionedState {
-                value: None,
-                version: agentscope_core::state::UNVERSIONED,
-            };
+            return unversioned();
         }
-        let value = self
-            .get_sync(&slot, key, SINGLE_STATE_INDEX)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok());
-        let version = self.read_version_sync(&slot, key).unwrap_or(0);
-        agentscope_core::state::VersionedState { value, version }
+        let key = key.to_string();
+        let loaded = self
+            .run_blocking(move |store| {
+                let value = store.get_sync(&slot, &key, SINGLE_STATE_INDEX)?;
+                let version = store.read_version_sync(&slot, &key)?;
+                Ok((value, version))
+            })
+            .await;
+        match loaded {
+            Ok((Some(json), version)) => agentscope_core::state::VersionedState {
+                value: serde_json::from_str(&json).ok(),
+                version,
+            },
+            Ok((None, version)) => agentscope_core::state::VersionedState {
+                value: None,
+                version,
+            },
+            Err(_) => unversioned(),
+        }
     }
 
     async fn save_if_version(
@@ -624,14 +693,21 @@ impl AgentStateStore for PostgresAgentStateStore {
         value: Value,
         expected_version: i64,
     ) -> i64 {
-        match PostgresAgentStateStore::save_if_version(
-            self,
-            user_id,
-            session_id,
-            key,
-            &value,
-            expected_version,
-        ) {
+        let user = user_id.map(str::to_string);
+        let session = session_id.to_string();
+        let key = key.to_string();
+        match self
+            .run_blocking(move |store| {
+                store.save_if_version(
+                    user.as_deref(),
+                    &session,
+                    &key,
+                    &value,
+                    expected_version,
+                )
+            })
+            .await
+        {
             Ok(v) => v,
             Err(_) => agentscope_core::state::UNVERSIONED,
         }
@@ -1438,5 +1514,64 @@ mod tests {
         )
         .unwrap();
         assert!(s.get(None, "s1", "k").await.is_none());
+    }
+
+    /// Wraps [`MemoryClient`] but fails if a query runs on the thread polling the async test.
+    ///
+    /// The SQL seam ([`PostgresClient`]) is synchronous and the real driver
+    /// (`PgSimpleClient`) calls `block_on` internally, which panics inside a runtime. Every
+    /// `AgentStateStore` method is therefore contractually required to go through
+    /// [`PostgresAgentStateStore::run_blocking`]; this client enforces that contract by
+    /// rejecting the runtime's own polling thread (blocking-pool threads are fine).
+    #[derive(Debug)]
+    struct OffRuntimeClient {
+        runtime_thread: std::thread::ThreadId,
+    }
+
+    impl OffRuntimeClient {
+        fn assert_off_runtime(&self, what: &str) {
+            assert!(
+                std::thread::current().id() != self.runtime_thread,
+                "synchronous {what} ran on the Tokio runtime thread"
+            );
+        }
+    }
+
+    impl PostgresClient for OffRuntimeClient {
+        fn query(&self, sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            self.assert_off_runtime(&format!("SQL ({sql})"));
+            if sql.to_lowercase().contains("information_schema") {
+                return Ok(QueryOutcome::Rows(vec![Vec::new()]));
+            }
+            Ok(QueryOutcome::Rows(Vec::new()))
+        }
+
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            self.assert_off_runtime("DDL");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn async_trait_methods_never_touch_the_client_on_the_runtime_thread() {
+        let client: Arc<dyn PostgresClient> = Arc::new(OffRuntimeClient {
+            runtime_thread: std::thread::current().id(),
+        });
+        // `build()` runs the INFORMATION_SCHEMA checks synchronously, so it must be called
+        // off-runtime too — the same rule the async methods implement via `run_blocking`.
+        let s = tokio::task::spawn_blocking(move || {
+            PostgresAgentStateStore::builder(client)
+                .create_if_not_exist(false)
+                .build()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(s.get(None, "s1", "k").await, None);
+        assert!(s.get_list(None, "s1", "k").await.is_empty());
+        assert!(!s.exists(None, "s1").await);
+        assert!(s.list_session_ids(None).await.is_empty());
+        let _ = s.delete(None, "s1").await;
     }
 }

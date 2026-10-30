@@ -22,6 +22,12 @@
 //! `substring`). The harness [`BaseStore::search`] signature has no error channel,
 //! so it delegates to `search_strict` and returns an empty page on error instead
 //! of fabricating item keys.
+//!
+//! The same split exists for the other CRUD methods, because Java `OssBaseStore`
+//! throws on every failure while the synchronous [`BaseStore`] trait cannot:
+//! [`OssStore::get_strict`], [`OssStore::put_strict`],
+//! [`OssStore::put_if_version_strict`] and [`OssStore::delete_strict`] return
+//! [`OssResult`], while the trait methods delegate to them and only log.
 
 use std::sync::Arc;
 
@@ -47,15 +53,8 @@ pub struct OssStore {
 // operations happen inline, matching Java `OssBaseStore`.
 impl BaseStore for OssStore {
     fn get(&self, namespace: &[String], key: &str) -> Option<StoreItem> {
-        let data_key = self.data_object_key(namespace, key);
-        let version_key = self.version_object_key(namespace, key);
-        match self.get_string(&data_key) {
-            Ok(Some(json)) => {
-                let value = serde_json::from_str::<StoreValue>(&json).ok()?;
-                let version = self.read_version(&version_key);
-                Some(StoreItem::new(key, value, version))
-            }
-            Ok(None) => None,
+        match self.get_strict(namespace, key) {
+            Ok(item) => item,
             Err(e) => {
                 tracing::error!(error = %e, key, "failed to get item");
                 None
@@ -64,15 +63,7 @@ impl BaseStore for OssStore {
     }
 
     fn put(&self, namespace: &[String], key: &str, value: StoreValue) {
-        if let Err(e) = (|| -> OssResult<()> {
-            let data_key = self.data_object_key(namespace, key);
-            let version_key = self.version_object_key(namespace, key);
-            let json = serde_json::to_string(&value)?;
-            self.put_string(&data_key, &json)?;
-            let current = self.read_version(&version_key);
-            self.put_string(&version_key, &(current + 1).to_string())?;
-            Ok(())
-        })() {
+        if let Err(e) = self.put_strict(namespace, key, value) {
             tracing::error!(error = %e, key, "failed to put item");
         }
     }
@@ -84,28 +75,8 @@ impl BaseStore for OssStore {
         value: StoreValue,
         expected_version: u64,
     ) -> bool {
-        let result = (|| -> OssResult<bool> {
-            let data_key = self.data_object_key(namespace, key);
-            let version_key = self.version_object_key(namespace, key);
-            let current = self.read_version(&version_key);
-
-            // CAS: version 0 means "write only if not present".
-            let matches = if expected_version == 0 {
-                !self.client.exists(&data_key)?
-            } else {
-                current == expected_version
-            };
-            if !matches {
-                return Ok(false);
-            }
-            let json = serde_json::to_string(&value)?;
-            self.put_string(&data_key, &json)?;
-            self.put_string(&version_key, &(current + 1).to_string())?;
-            Ok(true)
-        })();
-
-        match result {
-            Ok(v) => v,
+        match self.put_if_version_strict(namespace, key, value, expected_version) {
+            Ok(written) => written,
             Err(e) => {
                 tracing::error!(error = %e, key, "failed to put_if_version item");
                 false
@@ -127,12 +98,9 @@ impl BaseStore for OssStore {
     }
 
     fn delete(&self, namespace: &[String], key: &str) {
-        let data_key = self.data_object_key(namespace, key);
-        let version_key = self.version_object_key(namespace, key);
-        if let Err(e) = self.client.delete(&data_key) {
-            tracing::error!(error = %e, key, "failed to delete item data");
+        if let Err(e) = self.delete_strict(namespace, key) {
+            tracing::error!(error = %e, key, "failed to delete item");
         }
-        let _ = self.client.delete(&version_key);
     }
 }
 
@@ -140,6 +108,74 @@ impl OssStore {
     /// Creates a builder.
     pub fn builder() -> OssStoreBuilder {
         OssStoreBuilder::default()
+    }
+
+    /// Loads an item, distinguishing "absent" (`Ok(None)`) from a backend/decode failure.
+    ///
+    /// Java `OssBaseStore.get` throws `RuntimeException` when the listing/read fails, which
+    /// the harness [`BaseStore::get`] signature cannot express; this inherent twin restores
+    /// the distinction.
+    pub fn get_strict(&self, namespace: &[String], key: &str) -> OssResult<Option<StoreItem>> {
+        let data_key = self.data_object_key(namespace, key);
+        let version_key = self.version_object_key(namespace, key);
+        let Some(json) = self.get_string(&data_key)? else {
+            return Ok(None);
+        };
+        let value = serde_json::from_str::<StoreValue>(&json)?;
+        let version = self.read_version_strict(&version_key)?;
+        Ok(Some(StoreItem::new(key, value, version)))
+    }
+
+    /// Writes an item unconditionally (`version + 1`), propagating backend failures.
+    pub fn put_strict(
+        &self,
+        namespace: &[String],
+        key: &str,
+        value: StoreValue,
+    ) -> OssResult<()> {
+        let data_key = self.data_object_key(namespace, key);
+        let version_key = self.version_object_key(namespace, key);
+        let json = serde_json::to_string(&value)?;
+        let current = self.read_version_strict(&version_key)?;
+        self.put_string(&data_key, &json)?;
+        self.put_string(&version_key, &(current + 1).to_string())
+    }
+
+    /// CAS write with an error channel: `Ok(false)` is a failed precondition, `Err` is a
+    /// backend/decode failure — the distinction Java gets from "returns false" vs
+    /// `RuntimeException`.
+    pub fn put_if_version_strict(
+        &self,
+        namespace: &[String],
+        key: &str,
+        value: StoreValue,
+        expected_version: u64,
+    ) -> OssResult<bool> {
+        let data_key = self.data_object_key(namespace, key);
+        let version_key = self.version_object_key(namespace, key);
+        let current = self.read_version_strict(&version_key)?;
+
+        // CAS: version 0 means "write only if not present".
+        let matches = if expected_version == 0 {
+            !self.client.exists(&data_key)?
+        } else {
+            current == expected_version
+        };
+        if !matches {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(&value)?;
+        self.put_string(&data_key, &json)?;
+        self.put_string(&version_key, &(current + 1).to_string())?;
+        Ok(true)
+    }
+
+    /// Deletes the item and its `.version` sidecar, propagating the first failure.
+    pub fn delete_strict(&self, namespace: &[String], key: &str) -> OssResult<()> {
+        let data_key = self.data_object_key(namespace, key);
+        let version_key = self.version_object_key(namespace, key);
+        self.client.delete(&data_key)?;
+        self.client.delete(&version_key)
     }
 
     /// Searches `namespace` and returns a page of items, **propagating backend
@@ -194,7 +230,7 @@ impl OssStore {
                 data_key.strip_suffix(JSON_SUFFIX).unwrap_or(data_key),
                 VERSION_SUFFIX
             );
-            let version = self.read_version(&version_key);
+            let version = self.read_version_strict(&version_key)?;
             items.push(StoreItem::new(item_key, value, version));
         }
         Ok(items)
@@ -239,10 +275,16 @@ impl OssStore {
         )
     }
 
-    fn read_version(&self, version_key: &str) -> u64 {
-        match self.get_string(version_key) {
-            Ok(Some(content)) => content.trim().parse::<u64>().unwrap_or(0),
-            _ => 0,
+    /// Reads the `.version` sidecar, treating a malformed value as a backend inconsistency
+    /// (Java `Long.parseLong` throws `NumberFormatException` → `RuntimeException`).
+    fn read_version_strict(&self, version_key: &str) -> OssResult<u64> {
+        match self.get_string(version_key)? {
+            None => Ok(0),
+            Some(content) => content.trim().parse::<u64>().map_err(|_| {
+                OssError::Backend(format!(
+                    "version object '{version_key}' is not a number: '{content}'"
+                ))
+            }),
         }
     }
 

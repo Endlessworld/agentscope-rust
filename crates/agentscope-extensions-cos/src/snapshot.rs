@@ -57,7 +57,10 @@ impl RemoteSnapshotClient for CosRemoteSnapshotClient {
         let key = self.object_key(snapshot_id)?;
         match self.object_store.get(&key).await {
             Ok(Some(bytes)) => Ok(bytes),
-            Ok(None) => Err(Error::Tool(format!("Snapshot not found in COS: {key}"))),
+            // Java `CosRemoteSnapshotClient#download` fails with the SDK's "object not found"
+            // error; keep the typed [`CosError::NotFound`] variant so callers can tell a
+            // missing snapshot apart from a transport/auth failure.
+            Ok(None) => Err(CosError::NotFound(key).into()),
             Err(e) => Err(Error::Tool(e.to_string())),
         }
     }
@@ -135,6 +138,18 @@ mod tests {
         assert!(client.exists("s1").await.unwrap());
         assert_eq!(client.download("s1").await.unwrap(), b"archive");
         assert!(client.download("nope").await.is_err());
+    }
+
+    // Java: CosRemoteSnapshotClientTest#downloadMissingSnapshotThrows �� the typed
+    // `CosError::NotFound` variant is what makes the failure classifiable.
+    #[tokio::test]
+    async fn download_missing_snapshot_reports_not_found() {
+        let client =
+            CosRemoteSnapshotClient::new(InMemoryCosObjectStore::new().shared(), Some("snap/"));
+        let err = client.download("absent").await.unwrap_err().to_string();
+        assert!(err.contains("snapshot not found"), "unexpected: {err}");
+        assert!(err.contains("snap/absent.tar"), "unexpected: {err}");
+        assert_eq!(CosError::NotFound("x".into()).to_string(), "snapshot not found: x");
     }
 
     #[tokio::test]

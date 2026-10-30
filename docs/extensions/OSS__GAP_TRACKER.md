@@ -82,7 +82,7 @@
   - ~~缺 per-key `delete`（P1-1）~~ → §8-1 已实现 `OssAgentStateStore::delete_key`。
   - ~~`list_page` 分页/续传分支零覆盖、无分页构造器（P1-2）~~ → §8-2 已补构造器 + 13 用例。
   - ~~`search` prefix 不匹配静默返回错值（P1-3）~~ → §8-3 已改为 `search_strict` 返回 `OssError`。
-  - `futures`/`chrono`/`serde`/`tokio`（`[dependencies]` 中的）零引用；`OssError::SnapshotNotFound`/`Backend` 未被构造（P2-1/P2-3）。
+  - ~~`futures`/`chrono`/`serde`/`tokio`（`[dependencies]` 中的）零引用；`OssError::SnapshotNotFound`/`Backend` 未被构造（P2-1/P2-3）~~ → **已关闭（2026-10-31，见 §9）**：`serde`/`futures`/`chrono` 删除、`tokio` 改 optional 且仅由 `s3` feature 引入；两个错误变体均已有构造点。
   - Java `OssBaseStore.putIfVersion` 用 `long`，Java `OssAgentStateStore` 另有 `supportsVersioning`/`getVersioned`/`saveIfVersion` 版本化 API；Rust 侧 `OssAgentStateStore` **未覆写** `supports_versioning`/`get_versioned`/`save_if_version`（默认 `false`/降级为无条件写），与 Java 一致，但意味着 OSS 状态存储**无乐观并发**（P2-7）。
 
 ### 4.2 下一步与阻塞（需汇总方裁定）
@@ -403,5 +403,51 @@ harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sand
 ### 未完成 / 语义差异
 
 - 无留空槽位；guard 仍是进程内语义（OSS 无分布式锁后端，与 Java 一致：Java OSS 模块根本没有 guard）。
+
+## 9. 2026-10-31 收口执行记录（P1-3 残余 / P2-1 / P2-3 / P2-5 / P2-6 / P2-7 / P2-8）
+
+> 范围：仅 `crates/agentscope-extensions-oss/**` 与本文件。未动根 `Cargo.toml`、`agentscope-core`、`agentscope-harness` 及其它 crate。
+> **未跑 cargo**（本轮按约定只做代码编辑，构建/测试由主智能体统一验证）；下文用例数为静态计数。
+
+### 9.1 逐项处置
+
+| 条目 | 处置 | 源码级依据 |
+|---|---|---|
+| P1-3 残余（§8.1-3「未做」：`BaseStore::get/put/put_if_version/delete` 与 `AgentStateStore` 全部写读方法静默降级） | **已关闭**——补「严格孪生」固有方法，trait 方法改为委托孪生 + 记日志（trait 无错误通道，与 §8 既定范式一致） | `base_store.rs`：`get_strict` / `put_strict` / `put_if_version_strict` / `delete_strict` / `search_strict` / `read_version_strict`（私有）；`state_store.rs`：`save_strict` / `save_list_strict` / `get_strict` / `get_list_strict` / `exists_strict` / `delete_session_strict` / `list_session_ids_strict`。「absent」仍为 `Ok(None)`/`Ok(vec![])`，只有真实故障才 `Err` |
+| P2-1 冗余依赖 | **已关闭** | `Cargo.toml`：删 `serde`/`futures`/`chrono`；`tokio` 改 `optional = true`，仅由 `s3 = ["dep:rust-s3", "dep:tokio"]` 引入；`[dev-dependencies]` 保留 `tokio`（`#[tokio::test]` 需要） |
+| P2-3 死错误变体 | **已关闭**——改为构造而非删除（保留可分类错误） | `snapshot.rs`：`download` 缺失 → `OssError::SnapshotNotFound(key)`（对齐 Java `FileNotFoundException`）；`base_store.rs`：越界 key 与不可解析 `.version` → `OssError::Backend(..)` |
+| P2-4 注释与代码不符 | 已修（§8 同批） | `search_strict` 内注释：`.version` 被排除；`.list.json` 因前缀隔离不会出现在本 store 命名空间 |
+| P2-5 session 级删除未批量 | **已完成（设计决定，不迁移）** | **依据**：Java 的 1000/批 `deleteObjects` 是 SDK 层批量 API；`OssClient` 抽象（含 `s3` feature）只暴露单对象 `delete`，S3 的 `POST /?delete` 需独立签名请求且 `rust-s3 0.38` 未暴露。逐 key 删除语义等价（幂等），代价是请求数线性增长——已在 `delete_session_strict` 文档注明 |
+| P2-6 死代码 | **已关闭** | `distributed_store.rs`：删 `pub fn as_arc_base_store`（`rg` 复核全仓零调用，删除前已确认无测试/文档引用该符号）与 `_DEFAULT_PREFIXES` 占位桩；`snapshot.rs`：删 `_assert_remote_snapshot_used` 桩及随之无用的 `RemoteSandboxSnapshot` 导入 |
+| P2-7 状态存储无乐观并发 | **已完成（设计决定，不迁移）** | **依据**：`OssClient` 无条件写缝（无 `If-Match`），read-check-write 只能是**假 CAS**；Java `OssAgentStateStore` 同样未覆写 `supportsVersioning`/`getVersioned`/`saveIfVersion`。故保留 core 默认实现，并由 `state_store_keeps_the_core_defaults_for_versioning` 钉死（`supports_versioning()==false`、`save_if_version` 降级写 + 返回 `UNVERSIONED`） |
+| P2-8 零调用访问器 | **已关闭（补用例消化，不删 API）** | `accessors_expose_the_configured_bucket_and_prefix` 覆盖 `bucket_name()`/`key_prefix()`（state / store / snapshot / distributed 四处）；`guard_wraps_an_existing_harness_guard` 覆盖 `from_harness`/`inner`/`active_count` |
+
+### 9.2 顺带修复的两个真实缺陷
+
+1. **`save_list_strict` 的 `existing_count` 与 hash 解耦**（`state_store.rs`）：旧实现只在 `stored_hash.is_some()` 时读列表长度，因此「`.list.json` 存在但 `.list.hash` 丢失」时 `existing_count == 0`，`needs_full_rewrite` 的 Case 1（列表变短）永远不可达——清空列表时旧 `.list.json` 会残留。现改为**无条件读列表实体长度**（对齐 Java `existingCount` 与 COS 实现），用例 `state_save_list_rewrites_when_the_hash_sidecar_is_missing`（先塞 `[1,2,3]` 无 hash，再写 `[9]`、再写 `[]`）。
+2. **trait 级 per-key 删除被默认实现挡掉**：core `AgentStateStore::delete_key` 默认返回 `Err("... does not support per-key delete")`，而本 crate 只在固有方法上实现 per-key 删除 → 经 `dyn AgentStateStore` 调用必然失败。现 `impl AgentStateStore` 覆写 `delete_key`，委托固有方法并保留错误信息（前缀 `OSS per-key delete failed:`），用例 `trait_delete_key_removes_only_the_targeted_key`（含空白 sessionId 报错分支）。
+
+### 9.3 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `Cargo.toml` | 依赖清理（P2-1） |
+| `src/state_store.rs` | 7 个 strict 孪生（P1-3）；trait 方法改委托；`save_list_strict` 长度语义修复；trait `delete_key` 覆写；模块文档补 strict 说明 |
+| `src/base_store.rs` | 5 个 strict 孪生 + 私有 `read_version_strict`；`.version` 不可解析 → `Backend`；模块文档补错误语义 |
+| `src/snapshot.rs` | `SnapshotNotFound` 构造（P2-3）；删占位桩（P2-6） |
+| `src/distributed_store.rs` | 删 `as_arc_base_store` / `_DEFAULT_PREFIXES`（P2-6） |
+| `tests/strict_errors.rs` | **新增**（11 用例：7 `#[tokio::test]` + 4 `#[test]`） |
+
+### 9.4 用例与计数（静态）
+
+`tests/strict_errors.rs`（11）：`state_strict_variants_surface_backend_failures`、`state_trait_methods_degrade_to_empty_without_fabricating_data`、`state_absent_values_are_ok_none_not_errors`、`corrupt_state_payload_is_visible_only_through_the_strict_variant`、`state_save_list_rewrites_when_the_hash_sidecar_is_missing`、`state_store_keeps_the_core_defaults_for_versioning`、`trait_delete_key_removes_only_the_targeted_key`、`base_store_strict_variants_surface_backend_failures`、`unparsable_version_object_is_a_backend_error_in_strict_mode`、`accessors_expose_the_configured_bucket_and_prefix`、`guard_wraps_an_existing_harness_guard`。
+
+预期总数：默认 feature **64 → 75 test**（+11，doc-test 1 不变）；`--features s3` **75 → 86 test**（+11，doc-test 2 不变）。
+
+### 9.5 未完成 / 残留
+
+- **真实 OSS/S3 云 live 验证**仍待凭据（§4.2-4）。
+- trait 方法（`get`/`search`/`save` …）仍只能「记日志 + 降级」（trait 无错误通道）；需区分「后端宕机 / 无数据」的调用方须改用 `*_strict`。
+- `delete_session_strict` 逐 key 删除（P2-5 设计决定），大 session 请求数线性增长。
 
 

@@ -13,19 +13,19 @@ default = []
 # Aliyun OSS S3-compatible endpoints, ...). Off by default so the crate still
 # builds without the HTTP/TLS dependency stack; the trait-based surface
 # (`OssClient` + `InMemoryOssClient`) is always available.
-s3 = ["dep:rust-s3"]
+s3 = ["dep:rust-s3", "dep:tokio"]
 
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
+# `tokio` is only used by the optional S3 backend (it owns a private runtime to drive
+# `rust-s3` from the synchronous trait), so it is gated behind the `s3` feature and the
+# default build stays free of the async runtime.
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "time"] }
 tracing = { workspace = true }
-chrono = { workspace = true }
 # Generic S3 backend. `default-features = false` avoids native-tls/OpenSSL; the
 # `tokio-rustls-tls` feature pulls in rustls + tokio. `fail-on-err` makes
 # non-2xx responses surface as typed `S3Error::HttpFailWithBody(status, body)`

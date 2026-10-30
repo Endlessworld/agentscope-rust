@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::snapshot::{
-    RemoteSandboxSnapshot, RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshot,
-    SandboxSnapshotSpec,
+    RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshot, SandboxSnapshotSpec,
 };
 use async_trait::async_trait;
 
@@ -70,7 +69,10 @@ impl RemoteSnapshotClient for OssRemoteSnapshotClient {
         let key = self.object_key(snapshot_id)?;
         match self.client.get(&key) {
             Ok(Some(bytes)) => Ok(bytes),
-            Ok(None) => Err(Error::Tool(format!("Snapshot not found in OSS: {key}"))),
+            // Java `OssRemoteSnapshotClient` throws `FileNotFoundException` here; the typed
+            // [`OssError::SnapshotNotFound`] variant keeps the same distinction for Rust
+            // callers ("missing snapshot" vs "backend failure").
+            Ok(None) => Err(OssError::SnapshotNotFound(key).into()),
             Err(e) => Err(Error::Tool(format!("OSS snapshot download failed: {e}"))),
         }
     }
@@ -123,10 +125,4 @@ impl SandboxSnapshotSpec for OssSnapshotSpec {
         // RemoteSandboxSnapshot wiring stay identical to the built-in backend.
         self.inner.build(snapshot_id)
     }
-}
-
-// Silence unused import warning when the concrete snapshot type is not named here.
-#[allow(dead_code)]
-fn _assert_remote_snapshot_used() -> Option<RemoteSandboxSnapshot> {
-    None
 }

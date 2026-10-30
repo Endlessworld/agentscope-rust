@@ -66,6 +66,8 @@ impl PostgresStoreBuilder {
             ddl.push_str(&store_ddl(&full_table));
             self.client.execute_batch(&ddl)?;
         }
+        // Java: `PostgresBaseStore.java:440` — `LOG.debug("PostgresBaseStore built: table={}")`.
+        tracing::debug!(table = %full_table, "PostgresBaseStore built");
         Ok(PostgresStore {
             client: self.client,
             schema: self.schema,
@@ -624,5 +626,62 @@ mod tests {
         assert!(!is_duplicate_key(&PostgresError::Query(
             "connection reset".into()
         )));
+    }
+
+    // ---- SQL failure paths --------------------------------------------------
+
+    /// A client whose statements always fail, mirroring the Java Mockito setup
+    /// (`when(...).thenThrow(new SQLException(...))` in `*ThrowsWhenSqlFails`).
+    #[derive(Debug)]
+    struct FailingClient {
+        fail_batch: bool,
+    }
+
+    impl PostgresClient for FailingClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            Err(PostgresError::Query("connection reset".into()))
+        }
+
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            if self.fail_batch {
+                Err(PostgresError::Query("permission denied".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Java: PostgresBaseStoreTest#getThrowsWhenSqlFails / #putThrowsWhenSqlFails /
+    //       #deleteThrowsWhenSqlFails / #searchThrowsWhenSqlFails
+    #[test]
+    fn sql_failures_never_fabricate_a_successful_result() {
+        let s = PostgresStore::builder(Arc::new(FailingClient { fail_batch: false }))
+            .build()
+            .unwrap();
+        let n = ns(&[ "filesystem" ]);
+
+        assert!(s.get(&n, "k").is_none());
+        s.put(&n, "k", val(json!({ "a": 1 })));
+        assert!(s.get(&n, "k").is_none());
+        // Neither CAS branch may report "written" when the backend failed.
+        assert!(!s.put_if_version(&n, "k", val(json!({ "a": 2 })), 0));
+        assert!(!s.put_if_version(&n, "k", val(json!({ "a": 2 })), 3));
+        assert!(s.search(&n, 10, 0).is_empty());
+        assert!(s.search(&n, 0, 0).is_empty());
+        s.delete(&n, "k");
+        // Blank keys are rejected before any SQL runs (Java `null` checks).
+        assert!(s.get(&n, "").is_none());
+        s.put(&n, "", val(json!({ "a": 1 })));
+        assert!(!s.put_if_version(&n, "", val(json!({ "a": 1 })), 0));
+    }
+
+    // Java: PostgresBaseStoreTest#buildThrowsWhenSchemaInitializationFails
+    #[test]
+    fn initialize_schema_failure_is_reported_on_build() {
+        let err = PostgresStore::builder(Arc::new(FailingClient { fail_batch: true }))
+            .initialize_schema(true)
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, PostgresError::Query(_)));
     }
 }
