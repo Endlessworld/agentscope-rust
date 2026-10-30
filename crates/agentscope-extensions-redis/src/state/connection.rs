@@ -18,16 +18,16 @@
 //! ([`ClusterScanNodeSource`] + [`NodeConnectionFactory`]), so one `SCAN` iteration runs per
 //! primary — the same coverage Java gets from `UnifiedJedis.scanIteration`.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
 
 use agentscope_core::error::{Error, Result};
 
 use super::adapter::RedisClientAdapter;
+use super::redirect::{CommandFailure, RedirectTransport, SlotCache};
 use crate::raw_client::{ManagerRedisCommands, RedisCommands};
 
 fn map_err(context: &str, e: redis::RedisError) -> Error {
@@ -122,7 +122,7 @@ pub(crate) async fn collect_keys_across_nodes(
 // ---------------------------------------------------------------------------
 
 /// A primary node address discovered through `CLUSTER SLOTS`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ClusterNodeAddr {
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -306,6 +306,10 @@ pub struct RedisConnection {
     /// Sentinel node, or one per primary for a Redis Cluster
     /// ([`RedisConnection::connect_cluster`]).
     scan_source: Arc<dyn ScanNodeSource>,
+    /// `Some` for a cluster connection: routes key-scoped commands to the primary that owns
+    /// the key and follows `MOVED` / `ASK` redirects once
+    /// ([`super::redirect::run_with_redirects`]).
+    router: Option<Arc<ClusterRouter>>,
 }
 
 impl std::fmt::Debug for RedisConnection {
@@ -329,20 +333,23 @@ impl RedisConnection {
                 manager: manager.clone(),
             }),
             manager,
+            router: None,
         })
     }
 
-    /// Connects to a **Redis Cluster** seed node and enables cluster-wide key enumeration.
+    /// Connects to a **Redis Cluster** seed node and enables cluster-wide key enumeration
+    /// **and slot routing**.
     ///
-    /// All commands still go through `seed_url`'s node (this crate does not implement
-    /// slot routing — the driver's `cluster` feature is deliberately off), but
-    /// [`find_keys_by_pattern`] discovers every primary with `CLUSTER SLOTS` and runs one
-    /// `SCAN` iteration per primary, matching Java's `UnifiedJedis.scanIteration`
-    /// ("traverses every master in cluster mode").
+    /// Key-scoped commands start at the primary that owns the key's slot (learned from
+    /// previous `MOVED` replies, else the seed node) and follow one `MOVED` / `ASK`
+    /// redirect, so a resharding or migrating cluster stops returning errors to callers.
+    /// [`find_keys_by_pattern`] additionally discovers every primary with `CLUSTER SLOTS`
+    /// and runs one `SCAN` iteration per primary, matching Java's
+    /// `UnifiedJedis.scanIteration` ("traverses every master in cluster mode").
     ///
-    /// Topology is resolved lazily on each key enumeration (so failover / resharding is
-    /// picked up) and every per-primary connection reuses the seed's credentials, DB and
-    /// TLS settings.
+    /// Topology is resolved lazily (each key enumeration, and on every redirect) so failover
+    /// / resharding is picked up, and every per-primary connection reuses the seed's
+    /// credentials, DB and TLS settings.
     pub async fn connect_cluster(seed_url: &str) -> Result<Self> {
         let client = redis::Client::open(normalize_url(seed_url))
             .map_err(|e| Error::Other(format!("Invalid Redis URL: {e}")))?;
@@ -353,9 +360,12 @@ impl RedisConnection {
             fallback_host: seed_host(client.get_connection_info().addr()),
             manager: manager.clone(),
         };
-        let factory = SeedClientNodeFactory { client };
+        let factory = SeedClientNodeFactory {
+            client: client.clone(),
+        };
         Ok(Self {
             scan_source: Arc::new(ClusterScanNodeSource::new(topology, factory)),
+            router: Some(Arc::new(ClusterRouter::new(client, manager.clone()))),
             manager,
         })
     }
@@ -367,6 +377,7 @@ impl RedisConnection {
                 manager: manager.clone(),
             }),
             manager,
+            router: None,
         }
     }
 
@@ -400,79 +411,119 @@ impl RedisConnection {
     pub(crate) fn raw_client(&self) -> Arc<dyn RedisCommands> {
         Arc::new(ManagerRedisCommands::new(self.manager.clone()))
     }
+
+    /// Runs a key-scoped command, following `MOVED` / `ASK` redirects when this connection
+    /// was built by [`connect_cluster`](Self::connect_cluster).
+    ///
+    /// A standalone / Sentinel connection (no router) sends straight to the single node, so
+    /// the behaviour is unchanged there.
+    pub(crate) async fn run_keyed(
+        &self,
+        key: &str,
+        cmd: &redis::Cmd,
+    ) -> Result<redis::Value> {
+        match &self.router {
+            Some(router) => router.run(key, cmd).await,
+            None => self.run_on_connection(cmd).await,
+        }
+    }
+
+    /// Runs a command that names no key (`PING`, `CLUSTER SLOTS`, an EVAL without keys).
+    ///
+    /// No key means no slot, so this always targets the seed connection: a cluster never
+    /// redirects a keyless command.
+    pub(crate) async fn run_unkeyed(&self, cmd: &redis::Cmd) -> Result<redis::Value> {
+        self.run_on_connection(cmd).await
+    }
+
+    async fn run_on_connection(&self, cmd: &redis::Cmd) -> Result<redis::Value> {
+        let mut conn = self.manager.clone();
+        cmd.query_async(&mut conn).await.map_err(|e| map_err("command", e))
+    }
 }
 
 #[async_trait]
 impl RedisClientAdapter for RedisConnection {
     async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let mut conn = self.manager.clone();
-        conn.set::<_, _, ()>(key, value)
-            .await
-            .map_err(|e| map_err("SET", e))
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg(value);
+        let _: redis::Value = self.run_keyed(key, &cmd).await?;
+        Ok(())
     }
 
     async fn get(&self, key: &str) -> Result<Option<String>> {
-        let mut conn = self.manager.clone();
-        conn.get::<_, Option<String>>(key)
-            .await
-            .map_err(|e| map_err("GET", e))
+        let mut cmd = redis::cmd("GET");
+        cmd.arg(key);
+        let reply = self.run_keyed(key, &cmd).await?;
+        decode_reply(&reply)
     }
 
     async fn right_push_list(&self, key: &str, value: &str) -> Result<()> {
-        let mut conn = self.manager.clone();
-        conn.rpush::<_, _, ()>(key, value)
-            .await
-            .map_err(|e| map_err("RPUSH", e))
+        let mut cmd = redis::cmd("RPUSH");
+        cmd.arg(key).arg(value);
+        let _: redis::Value = self.run_keyed(key, &cmd).await?;
+        Ok(())
     }
 
     async fn range_list(&self, key: &str, start: i64, end: i64) -> Result<Vec<String>> {
-        let mut conn = self.manager.clone();
-        conn.lrange::<_, Vec<String>>(key, start as isize, end as isize)
-            .await
-            .map_err(|e| map_err("LRANGE", e))
+        let mut cmd = redis::cmd("LRANGE");
+        cmd.arg(key).arg(start).arg(end);
+        let reply = self.run_keyed(key, &cmd).await?;
+        decode_reply(&reply)
     }
 
     async fn get_list_length(&self, key: &str) -> Result<i64> {
-        let mut conn = self.manager.clone();
-        conn.llen::<_, i64>(key)
-            .await
-            .map_err(|e| map_err("LLEN", e))
+        let mut cmd = redis::cmd("LLEN");
+        cmd.arg(key);
+        let reply = self.run_keyed(key, &cmd).await?;
+        decode_reply(&reply)
     }
 
+    /// `DEL` for several keys.
+    ///
+    /// Redis Cluster rejects a multi-key command whose keys do not share a slot
+    /// (`CROSSSLOT`). The callers here delete one session's keys, which the V1 key layout
+    /// pins to a single slot (`{user/session}` hash tag); routing by the first key is
+    /// therefore correct for both layouts — for V0, a cross-slot set would have been
+    /// rejected by the cluster anyway, so no behaviour regresses.
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
-        if keys.is_empty() {
+        let Some(first) = keys.first() else {
             return Ok(());
+        };
+        let mut cmd = redis::cmd("DEL");
+        for key in keys {
+            cmd.arg(key);
         }
-        let mut conn = self.manager.clone();
-        conn.del::<_, ()>(keys).await.map_err(|e| map_err("DEL", e))
+        let _: redis::Value = self.run_keyed(first, &cmd).await?;
+        Ok(())
     }
 
     async fn add_to_set(&self, key: &str, member: &str) -> Result<()> {
-        let mut conn = self.manager.clone();
-        conn.sadd::<_, _, ()>(key, member)
-            .await
-            .map_err(|e| map_err("SADD", e))
+        let mut cmd = redis::cmd("SADD");
+        cmd.arg(key).arg(member);
+        let _: redis::Value = self.run_keyed(key, &cmd).await?;
+        Ok(())
     }
 
     async fn get_set_members(&self, key: &str) -> Result<Vec<String>> {
-        let mut conn = self.manager.clone();
-        conn.smembers::<_, Vec<String>>(key)
-            .await
-            .map_err(|e| map_err("SMEMBERS", e))
+        let mut cmd = redis::cmd("SMEMBERS");
+        cmd.arg(key);
+        let reply = self.run_keyed(key, &cmd).await?;
+        decode_reply(&reply)
     }
 
     async fn get_set_size(&self, key: &str) -> Result<i64> {
-        let mut conn = self.manager.clone();
-        conn.scard::<_, i64>(key)
-            .await
-            .map_err(|e| map_err("SCARD", e))
+        let mut cmd = redis::cmd("SCARD");
+        cmd.arg(key);
+        let reply = self.run_keyed(key, &cmd).await?;
+        decode_reply(&reply)
     }
 
     async fn key_exists(&self, key: &str) -> Result<bool> {
-        let mut conn = self.manager.clone();
-        conn.exists::<_, bool>(key)
-            .await
-            .map_err(|e| map_err("EXISTS", e))
+        let mut cmd = redis::cmd("EXISTS");
+        cmd.arg(key);
+        let reply = self.run_keyed(key, &cmd).await?;
+        decode_reply(&reply)
     }
 
     /// Finds all keys matching a glob pattern using the `SCAN` cursor protocol.
@@ -492,7 +543,6 @@ impl RedisClientAdapter for RedisConnection {
         keys: &[String],
         args: &[String],
     ) -> Result<Option<i64>> {
-        let mut conn = self.manager.clone();
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(script).arg(keys.len());
         for k in keys {
@@ -501,10 +551,12 @@ impl RedisClientAdapter for RedisConnection {
         for a in args {
             cmd.arg(a);
         }
-        let reply: redis::Value = cmd
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| map_err("EVAL", e))?;
+        // A script is routed by its first key (a cluster rejects a script whose keys span
+        // slots). A keyless script can run anywhere, so it goes to the seed node.
+        let reply = match keys.first() {
+            Some(key) => self.run_keyed(key, &cmd).await?,
+            None => self.run_unkeyed(&cmd).await?,
+        };
         Ok(value_to_i64(&reply))
     }
 }
@@ -512,6 +564,136 @@ impl RedisClientAdapter for RedisConnection {
 // ---------------------------------------------------------------------------
 // Production wiring
 // ---------------------------------------------------------------------------
+
+/// Decodes a raw reply into `T`, reporting a decode failure as a Redis error.
+fn decode_reply<T: redis::FromRedisValue>(value: &redis::Value) -> Result<T> {
+    T::from_redis_value(value.clone())
+        .map_err(|e| Error::Other(format!("Redis reply decode: {e}")))
+}
+
+/// Routes key-scoped commands across a Redis Cluster.
+///
+/// The router starts at the primary that last claimed the key's slot (learned from `MOVED`
+/// replies) and falls back to the seed connection, then follows **one** `MOVED` / `ASK`
+/// redirect ([`super::redirect::run_with_redirects`]). Client-side slot routing is
+/// deliberately hand-written instead of enabling the `redis` crate's `cluster` feature,
+/// whose `cluster-async` client would replace the connection seam the whole crate is built
+/// on.
+pub(crate) struct ClusterRouter {
+    /// Template for per-node connections (keeps AUTH / DB / TLS from the seed URL).
+    client: redis::Client,
+    /// The connection that ran `CLUSTER SLOTS` and serves keyless commands.
+    seed: ConnectionManager,
+    /// One lazily opened connection per primary, reused across commands.
+    nodes: tokio::sync::Mutex<HashMap<ClusterNodeAddr, ConnectionManager>>,
+    /// Slot -> primary mapping learned from `MOVED` replies.
+    slots: Mutex<SlotCache>,
+}
+
+impl std::fmt::Debug for ClusterRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterRouter").finish_non_exhaustive()
+    }
+}
+
+impl ClusterRouter {
+    fn new(client: redis::Client, seed: ConnectionManager) -> Self {
+        Self {
+            client,
+            seed,
+            nodes: tokio::sync::Mutex::new(HashMap::new()),
+            slots: Mutex::new(SlotCache::new()),
+        }
+    }
+
+    /// Returns (and caches) a connection to `node`.
+    async fn node_manager(&self, node: &ClusterNodeAddr) -> Result<ConnectionManager> {
+        if let Some(existing) = self
+            .nodes
+            .lock()
+            .await
+            .get(node)
+            .map(|manager| manager.clone())
+        {
+            return Ok(existing);
+        }
+        let info = self.client.get_connection_info();
+        let addr = with_endpoint(info.addr(), node);
+        let client = redis::Client::open(info.clone().set_addr(addr)).map_err(|e| {
+            Error::Other(format!(
+                "Invalid Redis cluster node {}: {e}",
+                node.to_redis_url()
+            ))
+        })?;
+        let manager = ConnectionManager::new(client).await.map_err(|e| {
+            Error::Other(format!(
+                "Redis cluster routing: cannot connect to {}: {e}",
+                node.to_redis_url()
+            ))
+        })?;
+        self.nodes
+            .lock()
+            .await
+            .insert(node.clone(), manager.clone());
+        Ok(manager)
+    }
+
+    /// Runs `cmd` for `key`, following at most one redirect.
+    pub(crate) async fn run(&self, key: &str, cmd: &redis::Cmd) -> Result<redis::Value> {
+        let slot = super::redirect::slot_for_key(key);
+        let start = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(slot)
+            .cloned();
+        let transport = RoutedCommand {
+            router: self,
+            cmd,
+            start,
+        };
+        super::redirect::run_with_redirects(&transport, &self.slots).await
+    }
+}
+
+/// One attempt of a routed command: binds the router, the pending command and the cached
+/// starting node into the [`RedirectTransport`] seam the retry loop drives.
+struct RoutedCommand<'a> {
+    router: &'a ClusterRouter,
+    cmd: &'a redis::Cmd,
+    start: Option<ClusterNodeAddr>,
+}
+
+#[async_trait]
+impl RedirectTransport for RoutedCommand<'_> {
+    async fn send(
+        &self,
+        target: Option<&ClusterNodeAddr>,
+        asking: bool,
+    ) -> std::result::Result<redis::Value, CommandFailure> {
+        let effective = target.cloned().or_else(|| self.start.clone());
+        let mut conn = match &effective {
+            Some(node) => self
+                .router
+                .node_manager(node)
+                .await
+                .map_err(|e| CommandFailure::Other(e.to_string()))?,
+            None => self.router.seed.clone(),
+        };
+        if asking {
+            // Redis requires ASKING on the same connection, immediately before the command
+            // that targets a key being migrated.
+            let _: redis::Value = redis::cmd("ASKING")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| CommandFailure::from_message(e.to_string()))?;
+        }
+        self.cmd
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CommandFailure::from_message(e.to_string()))
+    }
+}
 
 /// [`ScanPager`] backed by the shared [`ConnectionManager`] (one connected node).
 #[derive(Debug)]

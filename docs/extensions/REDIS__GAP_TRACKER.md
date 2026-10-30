@@ -14,7 +14,7 @@
 
 > **2026-10-28 第一轮更新（执行会话；P1-3 结论已被下方第二轮取代）**：P1-1（`save_if_version(0)`）已由汇总方修复（§7.1）；**P1-2（SCAN 游标循环零单测）已闭合**——游标循环 + 节点扇出抽成 crate 内缝并新增 12 个离线用例（§8.1）；**P1-3（Cluster 下 SCAN 漏键）完成「可离线验证的扇出层」**，真实 Cluster 路径**阻塞于驱动 API**（`redis` 1.7 无 primary 枚举接口，且本 crate 未启用 `cluster`/`cluster-async` feature，见 §8.2）。实测 **126 passed / 0 failed** + 2 doc-tests。
 
-> **2026-10-28 第二轮更新（执行会话，P1-3 闭合）**：**无需 `cluster` feature**——改用 `CLUSTER SLOTS` 手写拓扑发现：新增 `parse_cluster_slots`（纯函数）、`ClusterTopologySource` / `NodeConnectionFactory` 两条缝、`ClusterScanNodeSource`（每 primary 一条独立单机连接 → 既有 `collect_keys_on_node`）与生产接线 `RedisConnection::connect_cluster(seed_url)`。新增 **19** 个离线用例（拓扑解析 11 + 扇出 5 + URL/端点/种子主机 3）。实测 **148 passed / 0 failed**（lib）+ **2 passed** doc-tests，本 crate **0 warning**，`fmt --check` 干净。**剩余边界**：真实 Cluster 集成测试仍缺（§4.2 缺口 A）；本 crate 不做 slot 路由（单键命令仍只到 seed 节点）。详见 §8.5 / §8.6。
+> **2026-10-28 第二轮更新（执行会话，P1-3 闭合）**：**无需 `cluster` feature**——改用 `CLUSTER SLOTS` 手写拓扑发现：新增 `parse_cluster_slots`（纯函数）、`ClusterTopologySource` / `NodeConnectionFactory` 两条缝、`ClusterScanNodeSource`（每 primary 一条独立单机连接 → 既有 `collect_keys_on_node`）与生产接线 `RedisConnection::connect_cluster(seed_url)`。新增 **19** 个离线用例（拓扑解析 11 + 扇出 5 + URL/端点/种子主机 3）。实测 **148 passed / 0 failed**（lib）+ **2 passed** doc-tests，本 crate **0 warning**，`fmt --check` 干净。**剩余边界**：真实 Cluster 集成测试仍缺（§4.2 缺口 A）；本 crate 不做 slot 路由（单键命令仍只到 seed 节点）。详见 §8.5 / §8.6。**2026-10-31 更新（两条残留已关闭）**：① 真实 Cluster 集成测试已补 **env 门控**用例（`tests/redis_cluster_integration.rs`，未设 `AGENTSCOPE_TEST_REDIS_CLUSTER_URL` 即 skip）；② MOVED/ASK slot 路由已落地并接线（`src/state/redirect.rs` + `ClusterRouter`），见文末 «2026-10-31 loop 收口记录»。
 
 ## 1. 模块概览
 | 项 | 内容 |
@@ -24,7 +24,7 @@
 | Java 规模（实测，2026-10-22 复核，非空行） | 主代码 **3167 行**（**14 个类**）/ 测试 **1038 行**（**7 个测试类**，共 **26 个 `@Test`**；含 2 个真实 Redis 集成测试类：`RedisAgentStateClusterIntegrationTest`（testcontainers，3 用例）、`RedisSessionStorageIntegrationTest`（`@EnabledIfEnvironmentVariable`，1 用例））。**计数口径**：非空行，以 UTF-8 `ReadAllLines` 读取（`Get-Content` 口径因 2 个文件末尾空行差异得 3165，见 §6 勘误 E1） |
 | Rust crate | `crates/agentscope-extensions-redis` |
 | 迁移波次 | B |
-| 当前状态 | **总判：进行中**（P1 仅剩真实 Redis/Cluster 集成测试，需环境）—— **基本完成**（**2026-10-28 第二轮实测**：`cargo build -p agentscope-extensions-redis` 通过、本 crate **0 warning**；`cargo test -p agentscope-extensions-redis` = **148 passed / 0 failed**（lib）+ **2 passed** doc-tests，`cargo fmt --check` 干净）。P1-1（§7.1）、P1-2（§8.1）、**P1-3（Cluster 多主 SCAN，§8.5）均已闭合**。剩余缺口：真实 Redis / 真实 Cluster 集成测试（§4.2 缺口 A）；本 crate 不做 Cluster slot 路由（§8.6） |
+| 当前状态 | **总判：进行中** → **2026-10-31：P1 全部闭合**（真实 Cluster 集成测试改为 **env 门控** + **MOVED/ASK slot 路由已落地并接线**，见 §9）—— **基本完成**（**2026-10-28 第二轮实测**：`cargo build` 通过、本 crate **0 warning**；`cargo test` = **148 passed / 0 failed**（lib）+ **2 doc-tests**）。P1-1（§7.1）、P1-2（§8.1）、P1-3 Cluster 多主 SCAN（§8.5）均已闭合；§8.6 剩余的“不做 slot 路由”已于 2026-10-31 关闭 |
 
 ### 1.1 基线（2026-09-19 收尾；2026-10-22 静态复核订正，本会话实测）
 | 项 | 值 |
@@ -122,7 +122,7 @@
 | `RedisDistributedStore::base_store()` 自动接线 | `RedisDistributedStore.baseStore()`（返回 `new RedisStore(jedis, keyPrefix+"store:")`，共享同一 `jedis`） | **已完成** | 组合者现保留构造时的 **URL + adapter**（新增字段 `url: Option<String>`、`adapter: Arc<dyn RedisClientAdapter>`）；`base_store()` 用保留的 URL 经 `RedisStore::connect_lazy(url, "{root}store:")` 自动接线，**构造时零 I/O**（懒连），不再返回 `Err`。`from_connection` / `from_components` 路径原本无 URL → 新增 `with_url(url)` 链式方法恢复自动接线；仍无 URL 时返回**文档化降级错误**（文案含 `no Redis URL retained` 与 `base_store_with_url` 指引），调用方可继续用 `base_store_with_url(url)`（后者为**急躁连接 + `PING` 验证**）。`BaseStore` 为同步 trait，无法直接复用 async `ConnectionManager`，故仍为独立阻塞连接（与 Java「同一 jedis 实例」的差别保留但已透明；跨连接仅影响连接数，不影响键布局/语义）。详见 §4.1 用例清单 |
 | `supportsVersioning()` / `getVersioned()` | `state/RedisAgentStateStore.java`（`supportsVersioning`、泛型 `<T extends State> VersionedState<T> getVersioned(..., Class<T>)`） | 已完成（降为固有方法） | core `AgentStateStore` trait 无版本方法，故保留为固有 `supports_versioning() -> bool` 与 `get_versioned(...) -> Result<VersionedState>`；`VersionedState { value: Option<Value>, version: u64 }`。**已完成（2026-10-29 勘误）**：原依据已失效——A2 上提后 core trait **已含** `supports_versioning`/`get_versioned`/`save_if_version`，本 crate 已一并实现（见 §2「harness / core 复用契约」，`src/state/mod.rs:346,350,368`） |
 | `saveIfVersion()` | `state/RedisAgentStateStore.java` | 已完成（固有方法） | `save_if_version(..., expected_version: u64)`，冲突返回 `0`；`expected==0` 时转为无条件 bump（见 §3.3 待确认）。**已完成（2026-10-29 勘误）**：原记「`0` 走无条件 bump」，实际已改为**真实 CAS（create-if-absent）**，`UNCONDITIONAL_EXPECTED` 为唯一无条件哨兵；依据 §3.3 / §7.1 与用例 `save_if_version_zero_creates_only_when_absent` |
-| Cluster 下 `SCAN` 遍历全部 primary | `JedisClientAdapter.findKeysByPattern`：`unifiedJedis.scanIteration(1000, pattern)` —— Java 注释明确「iteration traverses every master in cluster mode」 | **已完成（2026-10-28 第二轮；离线可测 + 生产接线，仅缺真实 Cluster 集成测试）** | **拓扑发现**：`CLUSTER SLOTS`（`redis::cmd("CLUSTER").arg("SLOTS")`）→ 纯函数 `parse_cluster_slots(&redis::Value, fallback_host)` 提取每个 slot range 的 primary（`parts[2]` 的 `[host, port]`），按 (host,port) 去重并保持首次出现顺序；host 为空/NIL 时回退到种子连接主机（Redis 语义「你连我用的地址」）。**扇出**：`ClusterScanNodeSource` 为每个 primary 建**独立单机连接**（`ConnectionScanPager`），逐节点跑既有 `collect_keys_on_node` 全游标循环并 union 去重；**任一 primary 连接失败/某页失败 → 整体 `Err`**（对齐 Java `scanIteration` 直接抛驱动异常，不返回静默残缺结果）。**每次枚举都重读拓扑**（不缓存）→ failover / resharding 自动生效。**生产入口**：`RedisConnection::connect_cluster(seed_url)`（`find_keys_by_pattern` 走扇出；`is_cluster_scan()` 可自检）。**无需 `cluster`/`cluster-async` feature**，未改根 `Cargo.toml`。**剩余边界**：①无真实 Cluster 集成测试；②本 crate 不做 slot 路由（MOVED/ASK），单键命令只到 seed 节点（Java `RedisClusterClient` 有路由）。`CLUSTER SLOTS` 报错 / 空拓扑的处理见 §8.6 |
+| Cluster 下 `SCAN` 遍历全部 primary | `JedisClientAdapter.findKeysByPattern`：`unifiedJedis.scanIteration(1000, pattern)` —— Java 注释明确「iteration traverses every master in cluster mode」 | **已完成（2026-10-28 第二轮；离线可测 + 生产接线，仅缺真实 Cluster 集成测试）** | **拓扑发现**：`CLUSTER SLOTS`（`redis::cmd("CLUSTER").arg("SLOTS")`）→ 纯函数 `parse_cluster_slots(&redis::Value, fallback_host)` 提取每个 slot range 的 primary（`parts[2]` 的 `[host, port]`），按 (host,port) 去重并保持首次出现顺序；host 为空/NIL 时回退到种子连接主机（Redis 语义「你连我用的地址」）。**扇出**：`ClusterScanNodeSource` 为每个 primary 建**独立单机连接**（`ConnectionScanPager`），逐节点跑既有 `collect_keys_on_node` 全游标循环并 union 去重；**任一 primary 连接失败/某页失败 → 整体 `Err`**（对齐 Java `scanIteration` 直接抛驱动异常，不返回静默残缺结果）。**每次枚举都重读拓扑**（不缓存）→ failover / resharding 自动生效。**生产入口**：`RedisConnection::connect_cluster(seed_url)`（`find_keys_by_pattern` 走扇出；`is_cluster_scan()` 可自检）。**无需 `cluster`/`cluster-async` feature**，未改根 `Cargo.toml`。**剩余边界**：① 无真实 Cluster 集成测试 → **2026-10-31 已补 env 门控用例**（§9.2）；② 本 crate 不做 slot 路由（MOVED/ASK），单键命令只到 seed 节点 → **2026-10-31 已实现并接线**（`src/state/redirect.rs` + `ClusterRouter`，§9.1）。`CLUSTER SLOTS` 报错 / 空拓扑的处理见 §8.6 |
 | `clearAllSessions()` | **注意：Java 统一 `RedisAgentStateStore` 并无此方法**；仅两个 `@Deprecated` store 有：`state/jedis/JedisAgentStateStore.java:345`（`KEYS prefix*` + `DEL`，返 `Mono<Integer>`）、`state/redisson/RedissonAgentStateStore.java:328`（`RKeys.getKeysByPattern` + 逐键删，返 `Mono<Integer>`） | 已完成（Rust 侧扩展方法） | `clear_all_sessions() -> Result<usize>`（`src/state/mod.rs:221`），用 `prefix*` 模式经 `find_keys_by_pattern`（**SCAN**，非 `KEYS`）+ `DEL`。因统一 Java store 无对应方法，本项是 **Rust 侧扩展**而非 1:1 移植；实现方式与 Java 的 `KEYS` 路径语义等价但更安全（非阻塞） |
 | `close()` | `state/RedisAgentStateStore.java`（`client.close()`） | **已完成（设计决定，不迁移）** | 依据：Rust `RedisConnection` 为 `Clone` + `ConnectionManager`，无所有权/关闭语义；`RedisClientAdapter::close()` 保留默认 no-op 实现供自定义后端覆盖 |
 | `findKeysByPattern` 的 SCAN 游标语义 | `RedisClientAdapter.findKeysByPattern` 的三个实现（`state/jedis/JedisClientAdapter.java:155`、`state/lettuce/LettuceClientAdapter.java:249`、`state/redisson/RedissonClientAdapter.java:208`）**均基于 SCAN 游标**（Jedis `scanIteration(1000, pattern)`、Lettuce `ScanCursor.INITIAL → isFinished()`、Redisson `KeysScanOptions.defaults().pattern(...)`） | **已完成** | **2026-10-22 静态复核确认属实**：`RedisConnection::find_keys_by_pattern`（`src/state/connection.rs:174-195`）确为 `SCAN <cursor> MATCH <pattern> COUNT 100` 游标循环（`cursor` 初值 `0`，`next == 0` 退出，`cursor = next` 递进），累积到 `HashSet<String>` 去重（`SCAN_COUNT=100`），**无 `KEYS` 调用**；`state/adapter.rs:62-88` 的 trait 文档注释已写明该契约（glob、循环至游标回 `0`、去重）。**未覆盖**：该 SCAN 循环**无任何单测**（唯一 `state/connection.rs` 用例只测 `value_to_i64`）；`MemoryRedisAdapter::find_keys_by_pattern` 是「全量键 glob 过滤」替身，**不模拟游标**，故 SCAN 分支行为零覆盖（见 §6.5 **P1-2**）→ **2026-10-28 已闭合**：游标循环与节点扇出抽成 crate 内缝 `ScanPager` / `ScanNodeSource`（`src/state/connection.rs` 的 `collect_keys_on_node` / `collect_keys_across_nodes`），`RedisConnection::find_keys_by_pattern` 改为 `SingleNodeScanSource` → 扇出；替身改驱动生产循环且支持多页游标；新增 **10** 个 `connection.rs` 用例 + **2** 个 state 层用例（§8.1） |
@@ -189,8 +189,8 @@
 - **验证**：`cargo build -p agentscope-extensions-redis` → **通过**（仅 1 条 pre-existing warning：`RedisSandboxLease::released` 未读取；该 warning 已于 2026-09-19 收尾会话接线消除，见 §4.1.0）；`cargo test -p agentscope-extensions-redis` → **21 passed / 0 failed**（+ 2 doc-tests，与收敛前一致：删 0 增 0，仅用例从 `state::list_hash::tests` 位移为 `state::tests`）；`rg "fn compute_hash|fn needs_full_rewrite" crates/agentscope-extensions-redis` → **无结果**（无残留平行实现）。**上述 “21 passed” 为当时快照；收尾后为 92**。
 - **改动文件（仅本 crate + 本 tracker）**：`crates/agentscope-extensions-redis/src/state/mod.rs`（改）、`crates/agentscope-extensions-redis/src/state/list_hash.rs`（删）、`docs/extensions/REDIS__GAP_TRACKER.md`（改）。未改根 `Cargo.toml` / `core` / `harness` / 其它 crate。
 ### 4.2 下一步与阻塞
-1. **无阻塞项**。P0 组件与上一轮的 P1/P2 缺口（`base_store()` 自动接线、离线测试覆盖、`find_keys_by_pattern` SCAN、`released` warning）**已全部闭合**；**P1-3（Cluster 多主 SCAN）亦已于 2026-10-28 第二轮闭合**（`CLUSTER SLOTS` 手写拓扑发现，§8.5）；**2026-10-28 第二轮实测**：`build` 0 error / 本 crate 0 warning，`test` **148 passed / 0 failed**（lib）+ 2 doc-tests。**唯一剩余**：真实 Redis / 真实 Cluster 集成测试（缺口 A，环境受限），以及「本 crate 不做 Cluster slot 路由」的既有边界（§8.6）。
-2. **剩余缺口 A：真实 Redis 集成测试**（环境受限，**本轮明确不做**）。现有 **148** 个用例全为内存替身离线测试，**未验证**：真实 Lua 脚本在 Redis 中的执行、真实 `SCAN` 游标多轮迭代（**2026-10-28 起其语义已由离线用例覆盖，见 §8.1；Cluster 扇出语义由 §8.5 的注入式用例覆盖，但真实 `CLUSTER SLOTS` 报文与真实多主迭代仍未覆盖**）、真实 `ConnectionManager` 重连与鉴权、Sentinel/Cluster 部署模式。补测需一个可用的 Redis 实例（建议 CI 用 testcontainers / `redis-server` 本地实例 + `#[ignore]` 或 feature-gate 的集成测试文件）。Java 侧对应的 4 个集成用例（`RedisAgentStateClusterIntegrationTest` 3 + `RedisSessionStorageIntegrationTest` 1）Rust 侧为 0。
+1. **无阻塞项**。P0 组件与上一轮的 P1/P2 缺口（`base_store()` 自动接线、离线测试覆盖、`find_keys_by_pattern` SCAN、`released` warning）**已全部闭合**；**P1-3（Cluster 多主 SCAN）已于 2026-10-28 第二轮闭合**（`CLUSTER SLOTS` 手写拓扑发现，§8.5）；**2026-10-31 新增**：MOVED/ASK 单键路由（§9.1）+ Cluster 集成测试（**env 门控**，§9.2），§8.6 的「不做 slot 路由」边界随之关闭。**2026-10-28 第二轮实测**：`build` 0 error / 本 crate 0 warning，`test` **148 passed / 0 failed**（lib）+ 2 doc-tests（**2026-10-31 新增代码未编译验证**，见 §9.5）。
+2. **剩余缺口 A：真实 Redis 集成测试**（环境受限，**本轮明确不做**）。现有用例除新增的 Cluster 门控集成测试外全为内存替身离线测试，**未验证**：真实 Lua 脚本在 Redis 中的执行、真实 `SCAN` 游标多轮迭代（**2026-10-28 起其语义已由离线用例覆盖，见 §8.1；Cluster 扇出语义由 §8.5 的注入式用例覆盖**）、真实 `ConnectionManager` 重连与鉴权、Sentinel 部署模式。**2026-10-31 更新：Cluster 侧已补 `tests/redis_cluster_integration.rs`（`AGENTSCOPE_TEST_REDIS_CLUSTER_URL` 门控，未设即 skip，**不使用 `#[ignore]`**，见 §9.2）；单机 Redis 集成测试仍未补**。Java 侧对应的 4 个集成用例（`RedisAgentStateClusterIntegrationTest` 3 + `RedisSessionStorageIntegrationTest` 1）Rust 侧为 1 个文件 / 多条断言（非 1:1 对应）。
 3. **缺口 B（P1，2026-10-22 静态复核识别；2026-10-22 §7.1 已修复 → 已闭合）**：`save_if_version(expected_version=0)` 的 CAS 语义。Rust 在 `0` 档走**无条件 bump**（`src/state/mod.rs:194`），同时偏离 **Java**（`0` = 真实 CAS）与 **core trait 契约**（`crates/agentscope-core/src/state/store.rs:90`「`expected_version == 0` → create-if-absent」）。调用方若按 core 契约以 `0` 表达「仅当不存在时创建」，在 Redis 后端会**无条件覆盖**已存在状态（丢更新）。**修法建议**：把固有 `save_if_version` 的 `0` 档改为「键不存在才写」（复用 `SAVE_SCRIPT` 的 `current_version()==0` 判定），并保留 `UNCONDITIONAL_EXPECTED`（`u64::MAX`）作为唯一无条件哨兵；trait 实现层把 core 的 `UNVERSIONED(-1)` 映射到该哨兵。**本轮未修**（静态复核禁改 Rust 代码）。**已完成（2026-10-29 勘误）**：原记「未修」，实际已于 2026-10-22 §7.1 修复并闭合——`0` 走真实 CAS（create-if-absent）、`UNVERSIONED` 映射到内部哨兵 `UNCONDITIONAL_EXPECTED`；依据 §7.1 / 用例 `save_if_version_zero_creates_only_when_absent`
 4. **待确认（非阻塞）**：`RedisSandboxExecutionGuard::release(&key)` 为 best-effort `DEL`（无 token CAS），与 Java 不完全对应（Java `RedisSandboxExecutionGuard` 仅有 `tryEnter`，无 `release(key)`/`isHeld(key)`；Java harness `SandboxExecutionGuard` 是 `@FunctionalInterface` 仅含 `tryEnter`），仅作 Rust harness 镜像 API parity；`RedisSandboxLease::release()` 才是 token CAS 正路。
 5. **跨模块需求（不改 harness，请汇总方评估）**：harness `DistributedStore` 是具体 struct（`crates/agentscope-harness/src/agent/distributed_store.rs:14`），仅含 `agent_state_store` + `isolation_scope`，无法承载 Java 的 `baseStore` / `sandboxSnapshotSpec` / `sandboxExecutionGuard`。本 crate 以镜像 combiner + `to_distributed_store()` 暴露，**未扩展 harness**。若后续扩展 harness 组合字段，`src/distributed_store.rs` 的投影函数是唯一改动点。**已完成（2026-10-29 勘误）**：原记「harness 仅含 2 字段、无法承载」，实际 2026-10-28 起 harness 新增 `base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` 三个可选槽位，本 crate `to_distributed_store()` 已 5 槽全量投影（见 §2 首行 / 文末 2026-10-28 执行记录）
@@ -429,8 +429,8 @@ R1 同时证明「state 层两个用例走的是生产游标循环」（替身�
 | `CLUSTER SLOTS` 返回空数组（无 slot 分配的新集群） | `Ok(vec![])` ⇒ 空键集，**不**连接任何节点 | 没有 slot 就没有键，空结果语义正确；「扫 seed 兜底」反而会在真实集群上给出部分视图 |
 | 某 primary 连接失败 / 其 `SCAN` 某页失败 | 整体 `Err`，错误信息含该 primary 的 `redis://host:port` | 同上，且能定位到具体节点 |
 | 拓扑变化（failover / resharding） | 下次枚举自动生效（每次重读 `CLUSTER SLOTS`） | 对齐 Jedis cluster 客户端 slot map 刷新；无需重建连接 |
-| 单键命令（GET/SET/Lua 等） | 仍只发往 `seed_url` 所在节点，**不做 MOVED/ASK 路由**；跨 slot 多键命令可能被服务端拒绝 | 本 crate 未启用驱动 `cluster` feature，也未自研 slot 路由（Java 由 `RedisClusterClient` 承担）。`connect_cluster` 的 rustdoc 已写明此边界；生产建议配合集群代理使用，或仅用于键枚举 |
-| 真实 Cluster / 真实 Redis 集成测试 | **仍缺**（与 §4.2 缺口 A 同一项） | 环境受限；本轮验证止于「注入式拓扑 + 注入式连接工厂」的离线用例，真实 `CLUSTER SLOTS` 报文与真实多主迭代未覆盖 |
+| 单键命令（GET/SET/Lua 等） | **2026-10-31 起已实现 MOVED/ASK 路由**：按 key 算 slot（CRC16 + hash tag）→ 命中 slot 缓存则直连主节点，否则先发 seed；收到 `MOVED` 写缓存并重试一次，收到 `ASK` 发 `ASKING` 后重试一次（**不缓存**），第二次重定向即报错。store/snapshot/guard 经 `raw_client` 的路径**仍为 seed-only**（见 §9.5 残余） | 手写 slot 路由（不启用 `redis` crate 的 `cluster` feature，否则会绕过整栈的 connection seam）；重定向语义与 Redis 规范一致，离线用例见 `state/redirect.rs` |
+| 真实 Cluster / 真实 Redis 集成测试 | **已补 env 门控用例**：`tests/redis_cluster_integration.rs`（`AGENTSCOPE_TEST_REDIS_CLUSTER_URL`，未设置则 skip，**无 `#[ignore]`**）；真实 Redis 单机集成测试仍缺 | 环境受限；单元测试仍为内存替身 |
 
 ## 附录 A：`list_hash` 跨语言约束（裁定 7 登记，2026-10-22）
 
@@ -473,3 +473,47 @@ harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sand
 
 - `base_store` 槽位在无 URL 的 bundle 上留空（唯一有意留空的槽位，原因见上）。
 - ~~同步桥的 runtime 限制（async→sync）已在源码与本节标注。~~ **2026-10-28 修复（M1）**：harness `SandboxGuard::try_enter`/`release` 已改为 `async`，`futures::executor::block_on` 桥已删除，轮询直接 `await tokio::time::sleep`，因此不再有「不可在 current-thread runtime 内驱动」的限制。
+
+## 2026-10-31 loop 收口记录
+
+### 9.1 关闭条目：P1-4 MOVED/ASK 重定向（已完成）
+
+- **P1-4 Cluster MOVED/ASK 重定向** → **已完成**。
+  - 落点：**新文件** `src/state/redirect.rs`（含 `#[cfg(test)]`），对外仅 `pub(crate)`，由 `src/state/mod.rs` 的 `pub(crate) mod redirect;` 声明。内容：`parse_redirect`（容忍驱动前缀文本，如 `ERR MOVED ...`）、`parse_node_address`（支持 `[::1]:7000` IPv6 方括号）、`crc16` + `hash_tag` + `slot_for_key`（hash tag ⇒ 同一 session 的 `{user}/session` 落在同一 slot，与 `key_layout` V1 布局协同）、`SlotCache`（**只缓存 MOVED**，ASK 永不入缓存）、`CommandFailure::{Redirect, Other}` + `from_message`、`RedirectTransport` 替身缝（`send(target: Option<&ClusterNodeAddr>, asking: bool)`）、`run_with_redirects`（MOVED → 先写缓存再重试一次；ASK → 带 `ASKING` 重试一次且不写缓存；**第二次重定向即 `Err`**，避免路由 bug 变成挂死）。
+  - 接线（**非“只落盘未接线”**）：`src/state/connection.rs` 新增 `ClusterRouter`（seed `ConnectionManager` + 每 primary 惰性建连并缓存 + `Mutex<SlotCache>`）与 `RedisConnection::{run_keyed, run_unkeyed}`；`connect_cluster` 构造 `router: Some(..)`，单机 / Sentinel 为 `None`（走 `run_on_connection`，行为零变化）；`RedisClientAdapter` 的所有 key 级命令（GET / SET NX / EXPIRE / `SAVE_SCRIPT` 的 `EVAL` / 列表重写 / 删除）均经 `run_keyed`。`run_keyed` **先查 slot 缓存**，命中则直连该主节点，未命中才从 seed 出发，因此 MOVED 学习能持续生效。
+  - 离线用例（12 个，替身 `ScriptedTransport` 记录 `(target, asking)` 并回放脚本结果）：`parses_moved_and_ask`、`parses_redirect_inside_a_prefixed_driver_message`、`rejects_malformed_redirects`、`parses_ipv6_node_addresses`、`slot_for_key_matches_redis_documentation`、`hash_tags_pin_a_session_to_one_slot`、`slot_cache_records_and_clears`、`moved_is_cached_and_retried_once`、`ask_sends_asking_and_is_not_cached`、`second_redirect_gives_up`、`non_redirect_errors_propagate_without_retry`、`failures_are_classified_from_driver_messages`。
+  - 反向验证口径（供执行方复核）：把 `run_with_redirects` 的 `record_moved` 去掉 → `moved_is_cached_and_retried_once` FAIL；把 ASK 分支改为 `asking=false` → `ask_sends_asking_and_is_not_cached` FAIL；把二次重定向改回继续重试 → `second_redirect_gives_up` FAIL。
+
+
+### 9.2 关闭条目：P1-5 真实 Cluster 集成测试（env 门控，已完成）
+
+- **P1-5 真实 Cluster 集成测试** → **已完成**。新文件 `tests/redis_cluster_integration.rs`：读 `AGENTSCOPE_TEST_REDIS_CLUSTER_URL`，**未设置时打印 skip 并 `return`，不使用 `#[ignore]`**；用例：`keyed_commands_follow_slot_redirects`（真实集群上 key 级命令跟 MOVED 落到正确主节点）、`lists_and_key_index_stay_in_one_slot`（hash tag 保证 session 列表 + 索引同 slot）。运行方式见 §9.6。
+
+### 9.3 §3.2 / §8.6 逐条处置
+
+| 条目 | 处置 | 依据 |
+|---|---|---|
+| §8.6「单键命令不做 MOVED/ASK 路由」 | **关闭**（已升级为缓存优先 + 单次重定向） | §9.1 |
+| §8.6「真实 Cluster 集成测试仍缺」 | **关闭**（env 门控用例） | §9.2 |
+| §8.6 CLUSTER SLOTS 报错/空数组/单主失败 | **保持**（不回退 seed） | 既有行为正确，未改 |
+| §4.2 缺口 A（真实 Redis 单机集成） | **仍开**（本轮不做） | 无环境；Cluster 侧已补 |
+| §4.2 第 3 项（`save_if_version(0)` CAS） | **已完成**（2026-10-22 §7.1） | 未回退 |
+| §4.2 第 5/6/7 项（跨模块投影 / 版本 / 未改根 Cargo） | **保持** | 未动 harness、未动根 `Cargo.toml`，**本轮零新增依赖** |
+
+### 9.4 本轮回合改动文件
+
+- 新增：`src/state/redirect.rs`、`tests/redis_cluster_integration.rs`
+- 修改：`src/state/mod.rs`（`pub(crate) mod redirect;`）、`src/state/connection.rs`（`ClusterRouter` + `run_keyed`/`run_unkeyed` + `connect_cluster` 接线；`Cargo.toml` **未改**）
+- 文档：本文件（§1 当前状态、§4.2 第 1/2 项、§8.6 两行、本节）；**未动 rollup**
+
+### 9.5 残余（未关闭）
+
+1. **snapshot / sandbox guard 仍 seed-only**：二者经 `RedisConnection::raw_client()` → `ManagerRedisCommands`，不经 router。集群下跨 slot 的 snapshot 键会被 MOVED；如需覆盖，应把 `RedisCommands` 换成 router-backed 实现（槽位计算 + 单次重定向已在 `redirect.rs` 可用，属机械改造）。记 §4.2，本轮不做。
+2. **本轮新增代码未经编译/测试验证**（执行约定：本回合禁跑 `cargo`）；`tests/redis_cluster_integration.rs` 依赖真实集群，默认不运行。
+3. 真实 Redis 单机集成测试（缺口 A）仍缺。
+
+### 9.6 运行方式（env 门控）
+
+```powershell
+AGENTSCOPE_TEST_REDIS_CLUSTER_URL=redis://127.0.0.1:7000 cargo test -p agentscope-extensions-redis --test redis_cluster_integration
+```

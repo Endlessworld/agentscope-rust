@@ -32,6 +32,7 @@ use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};
 pub mod adapter;
 pub mod connection;
 pub mod key_layout;
+pub(crate) mod redirect;
 pub(crate) mod version_support;
 
 use self::adapter::RedisClientAdapter;
