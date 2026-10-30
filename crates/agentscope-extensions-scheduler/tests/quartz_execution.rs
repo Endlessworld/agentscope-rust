@@ -43,12 +43,41 @@ impl AgentFactory for RecordingFactory {
     }
 }
 
+/// Model stub: execution validation requires a non-null model (Java
+/// `Model cannot be null.`), but these tests drive a recording factory and never
+/// reach a provider.
+struct StubModel;
+
+impl agentscope_core::model::Model for StubModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<agentscope_core::model::ToolSchema>,
+        _options: agentscope_core::model::GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
+        Box::pin(futures::stream::once(async {
+            Ok(agentscope_core::model::ChatResponse::builder()
+                .content(vec![
+                    agentscope_core::message::ContentBlock::Text(
+                        agentscope_core::message::TextBlock::new("stub"),
+                    ),
+                ])
+                .build())
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "stub-model"
+    }
+}
+
 fn runtime(name: &str) -> Arc<RuntimeAgentConfig> {
     Arc::new(
         RuntimeAgentConfig::builder()
             .name(name)
             .model_name("m")
             .sys_prompt("sys")
+            .model(Arc::new(StubModel))
             .build()
             .unwrap(),
     )

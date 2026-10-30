@@ -39,6 +39,16 @@ pub trait Middleware: Send + Sync {
         next(input)
     }
 
+    /// Notified with the assistant message one reasoning step produced.
+    ///
+    /// Runs right after the (middleware-wrapped) model call returns and before the
+    /// loop decides whether to act, so it sees exactly what the model emitted for
+    /// this iteration — after any `on_reasoning`/`on_model_call` rewrite. It is a
+    /// **notification only** (no `next` delegation): the message cannot be
+    /// rewritten, and failed reasoning steps do not fire it. Mirrors Java
+    /// `PostReasoningEvent#getReasoningMessage()`; the default is a no-op.
+    async fn on_reasoning_result(&self, _ctx: &RuntimeContext, _message: &Msg) {}
+
     /// Intercepts the tool-call execution phase.
     fn on_acting(
         &self,
@@ -126,6 +136,9 @@ pub trait Middleware: Send + Sync {
 pub enum ExtensionPoint {
     OnAgent,
     OnReasoning,
+    /// `Middleware::on_reasoning_result` — a produced reasoning message (Java
+    /// `PostReasoningEvent`).
+    OnReasoningResult,
     OnActing,
     OnModelCall,
     OnSystemPrompt,
@@ -135,9 +148,10 @@ pub enum ExtensionPoint {
 
 impl ExtensionPoint {
     /// Every extension point, in declaration order.
-    pub const ALL: [ExtensionPoint; 7] = [
+    pub const ALL: [ExtensionPoint; 8] = [
         ExtensionPoint::OnAgent,
         ExtensionPoint::OnReasoning,
+        ExtensionPoint::OnReasoningResult,
         ExtensionPoint::OnActing,
         ExtensionPoint::OnModelCall,
         ExtensionPoint::OnSystemPrompt,
@@ -243,6 +257,17 @@ impl MiddlewareChain {
     ) {
         for mw in self.participants(ExtensionPoint::OnAgentStateReady) {
             mw.on_agent_state_ready(ctx, state, input_messages);
+        }
+    }
+
+    /// Notifies every participating middleware of a produced reasoning message.
+    ///
+    /// Mirrors Java `PostReasoningEvent`: called once per reasoning iteration with
+    /// the assistant message the model (or `on_reasoning`) produced. Notification
+    /// only — the message is borrowed, so it cannot be rewritten.
+    pub async fn notify_reasoning_result(&self, ctx: &RuntimeContext, message: &Msg) {
+        for mw in self.participants(ExtensionPoint::OnReasoningResult) {
+            mw.on_reasoning_result(ctx, message).await;
         }
     }
 
@@ -369,5 +394,51 @@ mod tests {
             .map(|middleware| middleware.order())
             .collect();
         assert_eq!(orders, vec![2, 2, 1, 0]);
+    }
+
+    /// Records the reasoning messages it is notified about.
+    struct ReasoningResultRecorder {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        participate: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Middleware for ReasoningResultRecorder {
+        async fn on_reasoning_result(&self, _ctx: &RuntimeContext, message: &Msg) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(message.text_content());
+        }
+
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            if self.participate {
+                vec![ExtensionPoint::OnReasoningResult]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_reasoning_result_reaches_participants_only() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ReasoningResultRecorder {
+            seen: std::sync::Arc::clone(&seen),
+            participate: true,
+        }));
+        chain.add(Box::new(ReasoningResultRecorder {
+            seen: std::sync::Arc::clone(&seen),
+            participate: false,
+        }));
+
+        chain
+            .notify_reasoning_result(&RuntimeContext::new(), &Msg::assistant("step one"))
+            .await;
+
+        // Only the participating middleware is invoked.
+        assert_eq!(*seen.lock().unwrap(), vec!["step one".to_string()]);
+        assert_eq!(chain.len(), 2);
     }
 }

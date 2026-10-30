@@ -3,9 +3,9 @@
 //!
 //! Java uses the Quartz library (Job/Trigger). Rust has no Quartz binding, so we
 //! reproduce the same observable semantics with tokio tasks:
-//! * `CRON`        — evaluated by the crate-local cron parser, ticking every
-//!   second and comparing against the wall clock of `ScheduleConfig::zone_id`
-//!   (UTC when unset).
+//! * `CRON`        — evaluated by the crate-local cron parser and fired at the
+//!   exact `next_fire_time` of the configured zone (`ScheduleConfig::zone_id`,
+//!   UTC when unset).
 //! * `FIXED_RATE`  — `tokio::time::interval`, constant interval between starts.
 //! * `FIXED_DELAY` — `sleep(delay)` after each completion (sequential).
 //!
@@ -17,7 +17,7 @@ mod registry;
 mod task;
 
 pub use cron::{CronExpression, CronParseError};
-pub use registry::{scheduler_registry, SchedulerRegistry};
+pub use registry::{scheduler_registry, RegistryEntry, SchedulerRegistry};
 pub use task::{QuartzScheduleAgentTask, TaskStatus};
 
 use std::collections::HashMap;
@@ -46,27 +46,65 @@ pub struct QuartzAgentScheduler {
 
 impl QuartzAgentScheduler {
     /// Creates a new scheduler with the given agent factory.
+    ///
+    /// The instance is **not** registered in the process-wide registry yet: Java
+    /// registers in the constructor, Rust needs a shared owner for the weak
+    /// handle. Use [`new_shared`](Self::new_shared) (or
+    /// [`register_self`](Self::register_self)) when the registry entry is wanted,
+    /// e.g. so a job can look its scheduler back up by id.
     pub fn new(factory: Arc<dyn AgentFactory>) -> Self {
-        let scheduler_id = uuid::Uuid::new_v4().to_string();
-        let sched = Self {
+        Self::with_id(factory, uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Creates a scheduler with an explicit id (see [`Self::builder`]).
+    fn with_id(factory: Arc<dyn AgentFactory>, scheduler_id: String) -> Self {
+        Self {
             scheduler_id,
             factory,
             jobs: RwLock::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
-        };
-        scheduler_registry().register(sched.scheduler_id.clone(), sched.self_handle_hint());
-        sched
+        }
+    }
+
+    /// Creates the scheduler and registers it in the process-wide registry.
+    ///
+    /// Mirror of Java's constructor (`QuartzAgentSchedulerRegistry.register`).
+    pub fn new_shared(factory: Arc<dyn AgentFactory>) -> Arc<Self> {
+        Arc::new(Self::new(factory)).register_self()
+    }
+
+    /// Registers this scheduler in the process-wide registry and returns the handle.
+    pub fn register_self(self: Arc<Self>) -> Arc<Self> {
+        scheduler_registry().register(&self);
+        self
+    }
+
+    /// Creates a builder, mirroring Java `QuartzAgentScheduler.builder()`.
+    ///
+    /// Java's `Builder#autoStart` has no Rust counterpart (a tokio job loop starts
+    /// with its task, there is no scheduler-wide start/standby switch); a custom
+    /// Quartz `Scheduler` cannot be injected either. What remains is the
+    /// deterministic `schedulerId`, which matters for registry lookups across
+    /// restarts.
+    pub fn builder(factory: Arc<dyn AgentFactory>) -> QuartzAgentSchedulerBuilder {
+        QuartzAgentSchedulerBuilder {
+            factory,
+            scheduler_id: None,
+        }
+    }
+
+    /// Java's single-argument `schedule(AgentConfig)` overload: schedules with the
+    /// default schedule config (`ScheduleMode::NONE`, manual triggering only).
+    pub async fn schedule_default(
+        &self,
+        agent_config: AgentConfig,
+    ) -> Result<Arc<dyn ScheduleAgentTask>, SchedulerError> {
+        self.schedule(agent_config, ScheduleConfig::none()).await
     }
 
     /// The unique id of this scheduler instance.
     pub fn scheduler_id(&self) -> &str {
         &self.scheduler_id
-    }
-
-    // Registry stores task names keyed by scheduler id; the handle hint is a
-    // plain name so the job loop can locate the scheduler without a strong `Arc`.
-    fn self_handle_hint(&self) -> String {
-        self.scheduler_id.clone()
     }
 
     /// Schedules using a runtime configuration (carries model/toolkit/middleware).
@@ -214,6 +252,35 @@ impl QuartzAgentScheduler {
     }
 }
 
+/// Builder for [`QuartzAgentScheduler`], mirroring Java's
+/// `QuartzAgentScheduler.Builder` (only the parts that have a Rust meaning).
+pub struct QuartzAgentSchedulerBuilder {
+    factory: Arc<dyn AgentFactory>,
+    scheduler_id: Option<String>,
+}
+
+impl QuartzAgentSchedulerBuilder {
+    /// Sets a deterministic scheduler id (Java `Builder#schedulerId`).
+    pub fn scheduler_id(mut self, id: impl Into<String>) -> Self {
+        self.scheduler_id = Some(id.into());
+        self
+    }
+
+    /// Builds the scheduler (not registered; see
+    /// [`QuartzAgentScheduler::new_shared`]).
+    pub fn build(self) -> QuartzAgentScheduler {
+        let id = self
+            .scheduler_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        QuartzAgentScheduler::with_id(self.factory, id)
+    }
+
+    /// Builds the scheduler and registers it in the process-wide registry.
+    pub fn build_shared(self) -> Arc<QuartzAgentScheduler> {
+        Arc::new(self.build()).register_self()
+    }
+}
+
 /// Parses the cron expression and resolves its time zone, mirroring Java's
 /// `CronScheduleBuilder.cronSchedule(...)` + `csb.inTimeZone(...)`.
 ///
@@ -339,6 +406,7 @@ mod tests {
                 .name(name)
                 .model_name("m")
                 .sys_prompt("sys")
+                .model(crate::test_support::stub_model("ok"))
                 .build()
                 .unwrap(),
         )
@@ -355,6 +423,49 @@ mod tests {
         assert!(sched.get_scheduled_agent("A").is_some());
         assert_eq!(sched.all_schedule_agent_tasks().len(), 1);
         assert_eq!(sched.scheduler_type(), "quartz");
+    }
+
+    #[tokio::test]
+    async fn builder_sets_a_deterministic_scheduler_id() {
+        // Java `Builder#schedulerId`: the id is what a job uses to find its
+        // scheduler in the registry, so it must be settable and stable.
+        let sched = QuartzAgentScheduler::builder(Arc::new(EchoFactory))
+            .scheduler_id("fixed-id")
+            .build_shared();
+        assert_eq!(sched.scheduler_id(), "fixed-id");
+        assert!(scheduler_registry().get_handle("fixed-id").is_some());
+
+        sched.shutdown().await;
+        assert!(scheduler_registry().get_handle("fixed-id").is_none());
+    }
+
+    #[tokio::test]
+    async fn schedule_default_uses_none_mode_and_needs_a_runtime_model() {
+        // Java's single-arg `schedule(AgentConfig)` builds the model from its
+        // `ModelConfig`; Rust has no provider registry in this crate, so the
+        // serializable path schedules fine and fails at execution time with the
+        // same `Model cannot be null.` message Java would raise for a missing model.
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        let cfg = AgentConfig::builder()
+            .name("A")
+            .model_name("m")
+            .sys_prompt("sys")
+            .build()
+            .unwrap();
+        let task = sched.schedule_default(cfg).await.unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+        assert_eq!(qt.schedule_config().schedule_mode(), ScheduleMode::NONE);
+        let err = task.run_empty().await.unwrap_err();
+        // `Error::Agent` renders as `Agent error: {0}`; the Java text is the payload.
+        match err {
+            agentscope_core::error::Error::Agent(message) => {
+                assert_eq!(message, "Model cannot be null.")
+            }
+            other => panic!("expected an agent error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -406,13 +517,21 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_clears_registry_and_tasks() {
-        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        let sched = QuartzAgentScheduler::new_shared(Arc::new(EchoFactory));
         sched
             .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
             .await
             .unwrap();
+        let id = sched.scheduler_id().to_string();
+        // Java registers in the constructor; the shared constructor keeps that.
+        assert!(scheduler_registry().get_handle(&id).is_some());
+
         sched.shutdown().await;
         assert!(sched.all_schedule_agent_tasks().is_empty());
+        assert!(
+            scheduler_registry().get_handle(&id).is_none(),
+            "shutdown must unregister the scheduler"
+        );
         assert!(sched
             .schedule_runtime(runtime("B"), ScheduleConfig::none(), None)
             .await
@@ -645,10 +764,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_aborts_the_in_flight_execution() {
-        // Java `deleteJob` drops the job and its trigger; the Rust equivalent must
-        // stop the job loop *and* abandon the execution in flight, so an
-        // in-flight run never lands in the execution counter after cancel.
+    async fn cancel_waits_for_the_in_flight_execution_to_finish() {
+        // Java `deleteJob` drops the job and its trigger but never interrupts a
+        // running execution (only `Scheduler.interrupt` does), and the Rust
+        // counterpart waits for the loop to stop: the in-flight run therefore
+        // completes and is counted, and no further firing happens afterwards.
         let factory = Arc::new(SlowEcho {
             started: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -678,16 +798,95 @@ mod tests {
 
         assert!(sched.cancel("Slow").await);
         assert!(qt.is_cancelled());
-
-        // Give the (aborted) execution far more time than its 300 ms sleep.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // `cancel` returned only after the loop stopped, so the run that was in
+        // flight completed and was counted, and the loop did not fire again.
         assert_eq!(
             qt.execution_count(),
-            0,
-            "in-flight execution survived cancel"
+            1,
+            "cancel must wait for the in-flight execution instead of discarding it"
         );
+        assert!(!qt.is_running());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(qt.execution_count(), 1, "the loop kept firing after cancel");
 
         sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fixed_rate_cancel_waits_for_the_in_flight_execution() {
+        // FIXED_RATE used to race the firing itself against `cancelled()` inside one
+        // `select!`, so a cancel dropped the execution future mid-run (the run was
+        // never counted). Only the wait for the next tick may be raced, exactly like
+        // the FIXED_DELAY/CRON branches, so the in-flight run completes.
+        let sched = Arc::new(QuartzAgentScheduler::new(Arc::new(SlowEcho {
+            started: std::sync::atomic::AtomicUsize::new(0),
+        })));
+        let cfg = ScheduleConfig::builder()
+            .fixed_rate(50)
+            .initial_delay(1)
+            .build()
+            .unwrap();
+        let task = sched.schedule_runtime(runtime("Rate"), cfg, None).await.unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        for _ in 0..100 {
+            if qt.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(qt.is_running(), "execution never started");
+
+        assert!(sched.cancel("Rate").await);
+        assert_eq!(
+            qt.execution_count(),
+            1,
+            "the FIXED_RATE in-flight execution must complete, not be dropped"
+        );
+        assert!(!qt.is_running());
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_in_flight_execution() {
+        // Java `scheduler.shutdown(true)` waits for running jobs; the Rust
+        // equivalent must not abort the execution that is in flight.
+        let sched = Arc::new(QuartzAgentScheduler::new(Arc::new(SlowEcho {
+            started: std::sync::atomic::AtomicUsize::new(0),
+        })));
+        let cfg = ScheduleConfig::builder()
+            .fixed_delay(10)
+            .initial_delay(1)
+            .build()
+            .unwrap();
+        let task = sched
+            .schedule_runtime(runtime("Slow"), cfg, None)
+            .await
+            .unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        for _ in 0..100 {
+            if qt.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(qt.is_running(), "execution never started");
+
+        sched.shutdown().await;
+        assert_eq!(
+            qt.execution_count(),
+            1,
+            "shutdown must let the in-flight execution finish (Java shutdown(true))"
+        );
+        assert!(sched.all_schedule_agent_tasks().is_empty());
     }
 
     #[tokio::test]

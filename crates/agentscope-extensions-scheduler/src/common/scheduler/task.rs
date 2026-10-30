@@ -130,7 +130,8 @@ impl BaseScheduleAgentTask {
                 self.name()
             )));
         }
-        // Validate before creating an agent, mirroring Java `createAgent`.
+        // Validate before creating an agent, mirroring Java `createAgent`:
+        // name/sysPrompt first, then the model (`Model cannot be null.`).
         if self.agent_config.name().trim().is_empty()
             || self
                 .agent_config
@@ -140,6 +141,9 @@ impl BaseScheduleAgentTask {
                 .is_empty()
         {
             return Err(Error::Agent(AgentConfigError::MissingSysPrompt.to_string()));
+        }
+        if self.agent_config.model().is_none() {
+            return Err(Error::Agent(AgentConfigError::MissingModel.to_string()));
         }
         let result = self.factory.run(&self.agent_config, messages).await;
         self.increment_execution_count();
@@ -205,6 +209,7 @@ mod tests {
             .name("Agent")
             .model_name("m")
             .sys_prompt("sys")
+            .model(crate::test_support::stub_model("ok"))
             .build()
             .unwrap()
     }
@@ -274,5 +279,55 @@ mod tests {
         assert!(task.run_empty().await.is_err());
         assert_eq!(factory.calls.load(Ordering::SeqCst), 0);
         assert_eq!(task.execution_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_model_fails_with_the_java_message() {
+        // Java `BaseScheduleAgentTask#createAgent` throws
+        // `IllegalArgumentException("Model cannot be null.")` after the name/sysPrompt
+        // check, before any agent is built.
+        let factory = Arc::new(CountingFactory {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        });
+        let cfg = RuntimeAgentConfig::builder()
+            .name("A")
+            .model_name("m")
+            .sys_prompt("sys")
+            .build()
+            .unwrap();
+        assert!(cfg.model().is_none());
+        let task = BaseScheduleAgentTask::new(
+            Arc::new(cfg),
+            ScheduleConfig::none(),
+            factory.clone(),
+        );
+
+        let err = task.run_empty().await.unwrap_err();
+        // `Error::Agent` renders as `Agent error: {0}`; the Java text is the payload.
+        match err {
+            Error::Agent(message) => assert_eq!(message, "Model cannot be null."),
+            other => panic!("expected an agent error, got {other:?}"),
+        }
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(task.execution_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_execution_still_counts() {
+        // Java increments the counter after `run` regardless of the outcome, so a
+        // failing execution is counted too.
+        let factory = Arc::new(CountingFactory {
+            calls: AtomicUsize::new(0),
+            fail: true,
+        });
+        let task = BaseScheduleAgentTask::new(
+            Arc::new(runtime_config()),
+            ScheduleConfig::none(),
+            factory.clone(),
+        );
+        assert!(task.run_empty().await.is_err());
+        assert_eq!(task.execution_count(), 1);
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
     }
 }

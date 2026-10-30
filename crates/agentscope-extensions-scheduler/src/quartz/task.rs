@@ -342,12 +342,35 @@ impl QuartzScheduleAgentTask {
         result
     }
 
+    /// Grace period [`join`](Self::join) grants an in-flight execution to finish
+    /// before the job loop is aborted (Java waits indefinitely; a hard bound keeps
+    /// a wedged provider call from hanging `shutdown`).
+    pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Stops the job loop and waits for it to finish.
+    ///
+    /// Mirrors Java `Scheduler.shutdown(true)` / `deleteJob`, neither of which
+    /// interrupts a running job: the loop is cooperative, so once it observes
+    /// [`shutdown`](Self::shutdown) it returns *after* the in-flight execution
+    /// completed. Only [`interrupt`](Self::interrupt) abandons a running
+    /// execution, exactly like Quartz `InterruptableJob`.
     pub(crate) async fn join(&self) {
+        self.join_with_grace(Self::SHUTDOWN_GRACE).await
+    }
+
+    /// [`join`](Self::join) with an explicit grace period.
+    ///
+    /// The loop is asked to stop first (its `cancelled()`/`wait_if_paused()`
+    /// selects win over the next sleep); the handle is aborted only if the
+    /// in-flight execution outlives `grace`, so a wedged provider call cannot
+    /// dead-wait the caller forever.
+    pub(crate) async fn join_with_grace(&self, grace: std::time::Duration) {
         let handle = self.handle.lock().unwrap().take();
-        if let Some(h) = handle {
-            h.abort();
-            let _ = h.await;
+        if let Some(handle) = handle {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(grace, handle).await.is_err() {
+                abort.abort();
+            }
         }
     }
 }
@@ -389,6 +412,7 @@ mod tests {
                 .name(name)
                 .model_name("m")
                 .sys_prompt("sys")
+                .model(crate::test_support::stub_model("ok"))
                 .build()
                 .unwrap(),
         )

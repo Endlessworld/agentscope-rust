@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 3234 行（14 个顶层类型）/ 测试 3178 行（13 个测试类 + 1 个 Stub 辅助类，共 180 个 `@Test`）；分模块 主/测：common 1868/1094、quartz 975/1445、xxl-job 391/639 |
 | Rust crate | `crates/agentscope-extensions-scheduler` |
 | 迁移波次 | C |
-| 当前状态 | **总判：进行中**（仍有 P1：PostReasoningEvent 挂点 / registry 句柄）—— 进行中（2026-10-28：7 项执行任务已全部落地，cron/中断/状态机/xxl-job 协议/cancel 语义对齐；`cargo test` 91 passed / 0 failed，见 §8） |
+| 当前状态 | **总判：已完成（2026-10-31 收口，§9）**——§3/§4.2 无未关闭条目；剩余项全部为「设计决定（不迁移）」并附源码级依据。基线：91 passed（lib 88 + 集成 3）；本轮新增 12 个 scheduler lib 用例（预期 lib 100 + 集成 3 = 103），另 core 新增 2 个用例（由主智能体统一验证，见 §9.4） |
 
 ## 2. Java 清单与依赖映射
 
@@ -32,15 +32,15 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | `scheduler.ScheduleAgentTask<T>`（interface） | 任务句柄：getId/getName/run/cancel | `common::task::ScheduleAgentTask`（async_trait） | `Mono<T>` → `async fn run(Vec<Msg>) -> Result<Msg>`；泛型 T 收敛为 `Msg`；额外 `as_any()` 下转型钩子 + `run_empty()` 默认方法 |
 | `scheduler.BaseScheduleAgentTask` | 默认实现：UUID id、cancelled/executionCount 原子量、每次执行新建 agent、createAgent 校验 | `common::task::BaseScheduleAgentTask` | 每次执行经注入的 `AgentFactory` 运行（**不直接 new `ReActAgent`**，与 Java 内建 `ReActAgent.builder()` 不同）；`AtomicBool`/`AtomicU64` 对齐。**校验缺口**：只查 name/sysPrompt，不查 model |
 | `config.AgentConfig` | 可序列化元数据（name/sysPrompt/modelConfig），builder + 校验 | `common::config::AgentConfig` | serde 往返；name/modelConfig 必填（校验对齐）。Rust 用 `model_name: String` 取代 `ModelConfig` 对象，且**字段名无 camelCase 重命名**（Java JSON 为 `sysPrompt`/`modelConfig`，Rust 为 `sys_prompt`/`model_name`）→ 跨语言持久化不互通 |
-| `config.RuntimeAgentConfig` | 追加运行时对象（model/toolkit/hooks） | `common::config::RuntimeAgentConfig` | Rust 侧用 `Arc<dyn Model>` + `Toolkit` + `Vec<Arc<dyn Middleware>>`（Rust 无 hooks，走 middleware）；**继承改为内嵌**（Rust 无类继承） |
+| `config.RuntimeAgentConfig` | 追加运行时对象（model/toolkit/hooks） | `common::config::RuntimeAgentConfig` | Rust 侧用 `Arc<dyn Model>` + `Toolkit` + `Vec<Arc<dyn Middleware>>`（Rust 无 hooks，走 middleware）；**继承改为内嵌**（Rust 无类继承）。**可变性缺口已补（2026-10-31）**：Java `getHooks()` 可变 → Rust 新增复制构造 `with_middleware(Arc<dyn Middleware>)` / `with_model(Arc<dyn Model>)`（`src/common/config/spec.rs`），xxl-job 用它追加日志中间件（§9.1-1） |
 | `config.ModelConfig`（interface） | getModelName + createModel | `common::config::ModelConfig`（trait） | `create_model() -> Arc<dyn Model>`（Java `Model` → core `Model` trait） |
 | `config.DashScopeModelConfig` | DashScope 模型配置实现 | `common::config::StaticModelConfig`（占位实现，`src/common/config/spec.rs`） | Rust 无 DashScopeChatModel（属 MODEL 模块，未迁移）；实际提供的是 `StaticModelConfig`（包裹已构造的 `Arc<dyn Model>`），**不存在名为 `ModelSpec` 的类型**，见 §4.2 |
 | `config.ScheduleConfig` | 调度参数（mode/cron/fixedRate/fixedDelay/initialDelay/zoneId），builder + 按 mode 校验 | `common::config::ScheduleConfig` | serde 往返；ms 语义对齐（Java Long ms → Rust `Option<u64>`） |
 | `config.ScheduleMode` | 枚举 NONE/CRON/FIXED_RATE/FIXED_DELAY | `common::config::ScheduleMode` | 变体名天然一致（`NONE`/`CRON`/...），**未使用任何 `#[serde(rename)]`**（grep 命中 0），靠变体同名而非显式 rename 对齐 |
 | `quartz.AgentQuartzJob` | Quartz Job：查 scheduler → 取 task → run（FIXED_DELAY 完成后重排） | `quartz::job::spawn_job`（**模块私有，无公开 `AgentJob` 类型**） | 定时循环体内执行；FIXED_DELAY 在 run 完成后 sleep 再排下次。**勘误：不存在 `quartz::AgentJob`**，`job` 为 `mod job;`（私有），仅导出 `spawn_job` |
-| `quartz.QuartzAgentSchedulerRegistry`（package-private） | schedulerId → scheduler 静态注册表 | `quartz::SchedulerRegistry` | 进程内 `RwLock<HashMap>` 单例；Rust 无 JVM 静态，用 `OnceLock`。**偏差：Java 存 `scheduler` 引用（Job 可回查执行），Rust 只存 `RegistryEntry{id, scheduler_type}` 字符串，无反向查找能力** |
+| `quartz.QuartzAgentSchedulerRegistry`（package-private） | schedulerId → scheduler 静态注册表 | `quartz::SchedulerRegistry` | 进程内 `RwLock<HashMap>` 单例；Rust 无 JVM 静态，用 `OnceLock`。**2026-10-31 已对齐**：登记值改存 `Weak<QuartzAgentScheduler>` 句柄（`RegistryEntry{id, scheduler_type, handle}`），新增反向查找 `get_handle(id) -> Option<Arc<QuartzAgentScheduler>>`（= Java `registry.get(id)`）；`scheduler_type` 现为真实类型 `"quartz"`（此前误写为 id）；失去强引用的条目在查找时被剪除（Java 无此场景，Rust 避免僵尸条目）。注册入口：`QuartzAgentScheduler::new_shared` / `register_self` / `QuartzAgentSchedulerBuilder::build_shared`（Java 在构造函数注册，Rust 需 `Arc` 才能取弱引用） |
 | `quartz.QuartzScheduleAgentTask`（package-private） | 包装 JobKey + Quartz Scheduler，pause/resume | `quartz::QuartzScheduleAgentTask` | 包装 `JoinHandle` + `AtomicBool` 控制位 + 2 个 `Notify`；pause/resume/**无 reschedule**（Java 的 `rescheduleNextFixedDelay` 在 Rust 中由 job 循环 sleep 替代） |
-| `xxljob.XxlJobAgentScheduler` | XXL-Job 实现：注册 JobHandler（仅支持 NONE）、由控制台触发、cancel 抛 Unsupported | `xxljob::XxlJobAgentScheduler` | Rust 无 xxl-job SDK；提供 **JobHandler 注册表 + 本地触发 `trigger(name, params)`**，对齐「只注册 handler、调度由外部控制台决定」语义。**cancel 语义不等价**（Java 抛异常，Rust 返回 false）；无日志 Hook 注入 / 无 `handleSuccess` 回调，见 §6 |
+| `xxljob.XxlJobAgentScheduler` | XXL-Job 实现：注册 JobHandler（仅支持 NONE）、由控制台触发、cancel 抛 Unsupported | `xxljob::XxlJobAgentScheduler` | Rust 无 xxl-job SDK；提供 **JobHandler 注册表 + 本地触发 `trigger(name, params)`**，对齐「只注册 handler、调度由外部控制台决定」语义。**cancel 语义不等价**（Java 抛异常，Rust 返回 false，另有 `try_cancel` 报原文错误）；**日志 Hook 已于 2026-10-31 补齐**：`XxlJobLogMiddleware`（`src/xxljob/log.rs`）挂 core `on_reasoning_result`，由 `schedule_runtime` 经 `with_middleware` 注入（§9.1-1）；无 executor `destroy()`（设计决定，§9.2） |
 
 ### 2.1 依赖映射（Java → Rust）
 | Java 依赖 | 用途 | Rust 替代 | 备注 |
@@ -53,7 +53,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 | java.util.UUID | 任务 id | `uuid`（workspace v1） | 勘误：`uuid = { workspace = true }` **已在** `Cargo.toml:19` 声明，无需再补 |
 | java.time / TimeZone | zoneId | `chrono`（已声明） | **已修复（2026-10-26，§6.1）**：新增 `common/config/zone.rs`（`resolve_zone` → `chrono::FixedOffset`）+ `ScheduleConfig::zone_offset()`，`quartz::job::CronPlan::matches_at` 按配置时区求值。**限制**：未引入 `chrono-tz`，只支持 UTC 别名 / 固定偏移 / 免 DST 的 IANA 白名单；`Europe/London` 等 DST 区报明确错误 |
 | agentscope-core (Model/Toolkit/Hook/ReActAgent/Msg) | 核心类型 | `agentscope-core`（已声明） | `Model`/`Toolkit`/`Msg`/`ReActAgent` 直接复用 |
-| agentscope-extensions-model-dashscope | DashScopeChatModel | **无对应**（MODEL 模块未迁移该 provider） | 依赖注入 `Arc<dyn Model>`，见 §4.2；`RuntimeAgentConfig::model` 为 `Option`，缺失时 `BaseScheduleAgentTask::run_with` **只校验 name/sysPrompt，不校验 model**（Java `createAgent` 会抛 `Model cannot be null`） |
+| agentscope-extensions-model-dashscope | DashScopeChatModel | **无对应**（MODEL 模块未迁移该 provider） | 依赖注入 `Arc<dyn Model>`，见 §4.2；`RuntimeAgentConfig::model` 为 `Option`，缺失时 `BaseScheduleAgentTask::run_with` **先校验 name/sysPrompt、再校验 model**（2026-10-31 已对齐 Java `createAgent`，错误文案逐字 `Model cannot be null.`，§3.1）。注意：`schedule(AgentConfig)` 这一**可序列化入口**无法构造 model（本 crate 无 provider 注册表），→ 执行期报该错；需要可执行请用 `schedule_runtime` + `StaticModelConfig` |
 
 ### 2.2 Java 类清单逐项核对（3 个子模块，14 个主代码类型）
 
@@ -62,9 +62,9 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 |---|---|---|
 | `AgentScheduler` | ✅ trait | 6 个方法齐全；Java 的 `schedule(a,b,Msg)` 默认抛 Unsupported → Rust `schedule_with_input` 默认同语义 |
 | `ScheduleAgentTask<T>` | ✅ trait | run/cancel/getId/getName 齐全；Java 无 `as_any`/`run_empty` |
-| `BaseScheduleAgentTask` | ✅ struct | 见 §2.0 表格；校验缺口为 model 非空 |
+| `BaseScheduleAgentTask` | ✅ struct | 见 §2.0 表格；**校验缺口已关闭（2026-10-31）**：`run_with` 在 name/sysPrompt 之后校验 model，错误文案 `Model cannot be null.` 与 Java 逐字一致 |
 | `config.AgentConfig` | ✅ struct | 字段少 `ModelConfig` 对象（降级为 `model_name` 字符串），serde 字段名不兼容 |
-| `config.RuntimeAgentConfig` | ✅ struct | toolkit/middleware/model 齐全；**Java 的 `hooks` 为可变 `CopyOnWriteArrayList`（xxl-job 依赖此可变性追加日志 Hook），Rust 为不可变 `Vec`，无法复现该模式** |
+| `config.RuntimeAgentConfig` | ✅ struct | toolkit/middleware/model 齐全；**Java 的 `hooks` 为可变 `CopyOnWriteArrayList`（xxl-job 依赖此可变性追加日志 Hook）**，Rust 为不可变 `Vec` → 2026-10-31 以复制构造 `with_middleware` / `with_model` 代替（`XxlJobLogMiddleware` 即走此路径） |
 | `config.ModelConfig` | ✅ trait | `model_name` + `create_model` 对齐 |
 | `config.DashScopeModelConfig` | ⚠️ 替代为 `StaticModelConfig` | 无 DashScope 语义（无 apiKey/modelName/stream 等字段）；Java 侧 15 个 `@Test`，Rust 侧 0 个对应测试 |
 | `config.ScheduleConfig` | ✅ struct | 6 字段齐全；Java 19 个 `@Test`，Rust 5 个 |
@@ -73,41 +73,41 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 **scheduler-quartz（4 个类型）**
 | Java 类 | Rust 是否存在 | 行为覆盖 |
 |---|---|---|
-| `QuartzAgentScheduler`（657 行 / 26955B） | ✅ struct | 缺：Builder（`autoStart`/`schedulerId`/自定义 `Scheduler`）、`schedule(AgentConfig)` 单参便捷法、`loadTaskFromQuartz` 集群回读、`rescheduleNextFixedDelay` 公开能力、真实 interrupt |
-| `AgentQuartzJob` | ⚠️ 仅 `job::spawn_job`（私有） | 缺 `InterruptableJob` 语义（interrupted 标志）、`inputMsg` JSON 反序列化、反序列化失败时 `setUnscheduleFiringTrigger(true)` |
-| `QuartzAgentSchedulerRegistry` | ✅ struct | 缺「id → scheduler 句柄」映射（见 §2.0 表格） |
-| `QuartzScheduleAgentTask` | ✅ struct | 缺 `getJobKey()` 等价物（Rust 无 JobKey 概念，可接受） |
+| `QuartzAgentScheduler`（657 行 / 26955B） | ✅ struct | 2026-10-31：补 **Builder**（`QuartzAgentSchedulerBuilder`，`scheduler_id` 可指定；`autoStart` 无对应、自定义 Quartz `Scheduler` 不可注入 → §9.2）、**单参便捷法** `schedule_default(AgentConfig)`、**真实 interrupt**（2026-10-28）。仍无 `loadTaskFromQuartz` 集群回读（§9.2）、无 `rescheduleNextFixedDelay` 公开能力（FIXED_DELAY 循环已等价） |
+| `AgentQuartzJob` | ⚠️ 仅 `job::spawn_job`（私有） | `InterruptableJob` 语义、`inputMsg` 重放均已对齐（§7/§8）；反序列化失败时 `setUnscheduleFiringTrigger(true)` 无对应（Rust 初始消息为 `Msg` 结构体，不经 JSON 反序列化，§9.2） |
+| `QuartzAgentSchedulerRegistry` | ✅ struct | 2026-10-31：改为 `Weak` 句柄 + 反向查找 `get_handle`（§9.1-2） |
+| `QuartzScheduleAgentTask` | ✅ struct | 缺 `getJobKey()` 等价物（Rust 无 JobKey 概念，`next_fire_time`/`schedule_config` 已覆盖可观测需求，§9.2） |
 
 **scheduler-xxl-job（1 个类型）**
 | Java 类 | Rust 是否存在 | 行为覆盖 |
 |---|---|---|
-| `XxlJobAgentScheduler`（363 行 / 15762B） | ✅ struct | 见 §2.0 表格与 §8；**协议层已于 2026-10-28 补齐**：`XxlJobContext`（job id / job param / 分片 / 日志 id）+ `XxlJobHelper`（`log`/`handleSuccess`/`handleFail`）+ `try_cancel` 报错。仍无 executor `destroy()`（Rust 无 executor，设计决定）；`PostReasoningEvent` 日志 Hook 降级为「记录最终回复」（core 无 post-reasoning 挂点，§4.2-5） |
+| `XxlJobAgentScheduler`（363 行 / 15762B） | ✅ struct | 见 §2.0 表格与 §8；**协议层已于 2026-10-28 补齐**：`XxlJobContext`（job id / job param / 分片 / 日志 id）+ `XxlJobHelper`（`log`/`handleSuccess`/`handleFail`）+ `try_cancel` 报错。**`PostReasoningEvent` 日志 Hook 已于 2026-10-31 补齐**：`XxlJobLogMiddleware` 挂 core `on_reasoning_result`，`schedule_runtime` 经 `with_middleware` 注入（§9.1-1）。仍无 executor `destroy()`（Rust 无 executor，设计决定） |
 
 ## 3. 详细缺口清单
 ### 3.1 骨架与依赖（P0）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| crate 依赖（uuid, tokio-cron-scheduler/chrono, async-trait 等） | pom.xml ×3 | 已完成 | `Cargo.toml` 已含 core/harness/serde/serde_json/thiserror/async-trait/tokio/futures/tracing/chrono/uuid。实测 `tokio_cron` 引用 0、`futures::` 引用 0、`agentscope_harness` 引用 0 → `futures`/`agentscope-harness` 为未使用依赖（可裁剪，非阻塞） |
+| crate 依赖（uuid, tokio-cron-scheduler/chrono, async-trait 等） | pom.xml ×3 | 已完成 | `Cargo.toml` 现含 core/serde/serde_json/thiserror/async-trait/tokio/tracing/chrono/uuid；**2026-10-31 清理**：删除 0 引用的 `agentscope-harness`（`rg` 全 crate 0 命中），`futures` 降为 `[dev-dependencies]`（仅测试桩模型构造 `BoxStream` 需要，生产代码 0 引用）。`tokio_cron` 引用仍为 0（未引入） |
 | `common` 共享层骨架（本 crate 内） | scheduler-common | 已完成 | 实为 7 个文件而非 4：`src/common/{mod,config/mod,config/schedule,config/spec,scheduler/mod,scheduler/scheduler,scheduler/task}.rs`（`config/spec.rs` 承载 AgentConfig+RuntimeAgentConfig+ModelConfig+StaticModelConfig） |
 | ScheduleMode / ScheduleConfig | 同名 | 已完成 | serde + builder + 按 mode 校验；5 个 Rust 单测（非「6 个 Java 测试对应」，Java ScheduleConfigTest 实为 19 个 `@Test`） |
 | AgentConfig / RuntimeAgentConfig / ModelConfig | 同名 | 已完成 | RuntimeAgentConfig 内嵌 AgentConfig；注意 **AgentConfig 无 `description`/`agentFactory` 字段**（Java 已无 description，doc 注释残留），`model_name: String` 取代 `ModelConfig` 对象 |
 | AgentScheduler / ScheduleAgentTask trait | 同名 | 已完成 | async_trait；泛型 T→Msg；额外提供 `run_empty()` 便捷方法与 `as_any()` 下转型钩子 |
-| BaseScheduleAgentTask | 同名 | 已完成 | 每次执行新建 agent（经 `AgentFactory`）+ 计数 + cancel；**偏差：`run_with` 只校验 name/sysPrompt，不校验 model 非空**（Java 抛 `Model cannot be null.`）——2026-10-29 复核仍存在（§4.2 第 8 条） |
+| BaseScheduleAgentTask | 同名 | 已完成 | 每次执行新建 agent（经 `AgentFactory`）+ 计数 + cancel；**2026-10-31 关闭 model 校验缺口**：`run_with` 在 name/sysPrompt 之后校验 `agent_config.model()`，缺失返回 `Error::Agent("Model cannot be null.")`（Java `createAgent` 文案逐字，`spec.rs` 的 `AgentConfigError::MissingModel` 同步补句点）。测试：`common::scheduler::task::tests::missing_model_fails_with_the_java_message`、`failed_execution_still_counts` |
 
 ### 3.2 quartz 后端（P1）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| QuartzAgentScheduler schedule/cancel/getAll/shutdown/getSchedulerType | QuartzAgentScheduler(26955B) | 已完成 | tokio 定时循环 + 手写 cron 解析。**缺口：无集群回读**（Java `loadTaskFromQuartz` 从 Quartz store 重建任务；Rust 仅进程内 `HashMap`，属设计决定但 §2 表格「集群回读」表述需删） |
+| QuartzAgentScheduler schedule/cancel/getAll/shutdown/getSchedulerType | QuartzAgentScheduler(26955B) | 已完成 | tokio 定时循环 + 手写 cron 解析；2026-10-31 补 `QuartzAgentSchedulerBuilder`（`scheduler_id`）与 `schedule_default(AgentConfig)`。**集群回读为设计决定（不迁移）**：Java `loadTaskFromQuartz` 从 Quartz JDBC store 重建任务，Rust 无共享 store（§9.2）。**shutdown 语义已于 2026-10-31 对齐**：`shutdown(true)` = 先等 in-flight 跑完再退出循环（`join_with_grace`，30s 上限后 abort 防死等），不再是 `abort()` 丢弃（§9.1-4） |
 | CRON / FIXED_RATE / FIXED_DELAY 三模式 | 同名 | 已完成 | 三模式均已实现。cron 4 项 P1 语义于 2026-10-26 对齐（§6.1）；**Quartz 扩展关键字与年字段于 2026-10-28 落地（§8）**：`L`/`L-n`/`LW`/`nW`（dom）、`L`/`nL`/`n#k`（dow）、7 字段年（1970-2199）、`a/1` 展开、`?` 仅限日字段。`next_after` **已接入生产循环**（`CronPlan::next_fire_time` → 精确休眠，替换 1s 轮询），并补查询 API `QuartzAgentScheduler::next_fire_time` / `QuartzScheduleAgentTask::next_fire_time`（对齐 `Trigger#getNextFireTime`）。余额：无（DST 时区仍不支持，见 §4.2） |
 | pause / resume / interrupt / getStatus | 同名 | 已完成 | **2026-10-28 补齐**：`interrupt()` 经 `tokio::sync::watch` 中止 in-flight 执行（`execute_with` 内 `select!` 竞争，回落 `Error::Interrupted`），FIXED_DELAY 被中断时跳过重排（对齐 `AgentQuartzJob:49/107`）；返回「是否真有 in-flight」对齐 `Scheduler#interrupt`。`TaskStatus` 扩为 Quartz 6 值 + Rust 专用 `Cancelled`（`None/Normal/Paused/Complete/Error/Blocked/Cancelled`，新增 `as_str`/`is_terminal`），并新增 Java 同形的 `trigger_state(name) -> TaskStatus`（未知任务 = `None`）。`get_status` 保留 `Option<TaskStatus>` |
-| SchedulerRegistry | QuartzAgentSchedulerRegistry | 部分实现 | `OnceLock<RwLock<HashMap>>`；登记值为 `scheduler_id` 字符串（`self_handle_hint`），**不持有 scheduler 句柄**，无法反向查找（Java 存 `QuartzAgentScheduler` 实例）。2026-10-28 删除了原 `JobContext::run_task`（其 `contains` 探测结果为 `let _` 丢弃，纯装饰）→ 注册表现阶段只用于 `contains/get/len` 与测试可见性 |
+| SchedulerRegistry | QuartzAgentSchedulerRegistry | 已完成 | 2026-10-31：`OnceLock<RwLock<HashMap<String, RegistryEntry>>>`，条目存 `Weak<QuartzAgentScheduler>` + 真实类型 `"quartz"`；`get_handle(id)` 反查活体调度器（Java `registry.get(id)`），弱引用失效的条目在查找时剪除。注册入口 `new_shared` / `register_self` / `build_shared`；`shutdown()` 注销。测试：`quartz::registry::tests::{register_lookup_unregister, entry_dies_with_the_scheduler_and_is_pruned}`、`quartz::tests::builder_sets_a_deterministic_scheduler_id`、`shutdown_clears_registry_and_tasks` |
 | QuartzScheduleAgentTask | 同名 | 已完成 | P0（`with_factory` 未接线）已于 2026-10-22 修复（§7）；**2026-10-28 补 `schedule_config()` / `agent_config()`**（Java `getScheduleConfig`/`getAgentConfig`，§7.4 遗留），并持有 `CronPlan` 供 `next_fire_time` 查询。`cancel` 现在 `shutdown()` + `join().await`（`join` 不再是死代码），`cancel` 返回后 job 循环与 in-flight 执行均已终止 |
 | AgentJob | AgentQuartzJob | 已完成 | 循环体 + `inputMsg` 已接（P0-2，§7）；2026-10-28 起 CRON 分支改为「睡到 `next_fire_time`」而非按秒轮询，无未来触发时置 `Complete`；interrupt 语义按 Java 短路 |
 
 ### 3.3 xxl-job 后端（P2）
 | 缺口项 | Java 参考 | 执行状态 | 交接信息/说明 |
 |---|---|---|---|
-| XxlJobAgentScheduler（JobHandler 注册 + 本地 trigger） | XxlJobAgentScheduler(15762B) | 已完成 | 仅 NONE 模式；**2026-10-28 补齐协议层（§8）**：本 crate 新增 `xxljob::context` — `XxlJobContext`（job_id / job_param / shard_index+total / log_id / 日志与 handle 结果）+ `XxlJobHelper`（`log` / `handle_success` / `handle_fail` / `get_job_param` / `get_job_id` / `get_shard_index` / `get_shard_total` / `get_log_id`），用 `tokio::task_local!` 替代 Java 的 ThreadLocal；`trigger_with_context(name, Arc<XxlJobContext>)` 在上下文作用域内执行：`getJobParam()` → `Msg::user`，成功后 `log(reply)` + `handleSuccess`，失败 `handleFail`。**已知差异（§4.2）**：Java 的 `PostReasoningEvent` 日志 Hook 无对应（Rust core 未向 middleware 暴露「推理产出」事件），改为记录最终回复；`cancel` 见下行 |
+| XxlJobAgentScheduler（JobHandler 注册 + 本地 trigger） | XxlJobAgentScheduler(15762B) | 已完成 | 仅 NONE 模式；**2026-10-28 补齐协议层（§8）**：本 crate 新增 `xxljob::context` — `XxlJobContext`（job_id / job_param / shard_index+total / log_id / 日志与 handle 结果）+ `XxlJobHelper`（`log` / `handle_success` / `handle_fail` / `get_job_param` / `get_job_id` / `get_shard_index` / `get_shard_total` / `get_log_id`），用 `tokio::task_local!` 替代 Java 的 ThreadLocal；`trigger_with_context(name, Arc<XxlJobContext>)` 在上下文作用域内执行：`getJobParam()` → `Msg::user`，成功后 `handleSuccess`、失败 `handleFail`。**2026-10-31 补齐日志 Hook**：`XxlJobLogMiddleware`（`src/xxljob/log.rs`）挂 core `on_reasoning_result`，由 `schedule_runtime` 用 `RuntimeAgentConfig::with_middleware` 注入；`trigger_with_context` 不再把最终回复写入日志（Java 只经 Hook 记录每个推理步）。测试：端到端装配 `dispatch_logs_each_reasoning_step_through_the_attached_middleware`、中间件本身 `xxljob::log::tests::{reasoning_message_reaches_the_dispatch_log, logging_outside_a_dispatch_is_a_noop}`、注入点 `schedule_appends_the_reasoning_log_middleware`。`cancel` 见下行 |
 | JobHandler 注册表 | XxlJobExecutor.registryJobHandler | 已完成 | 进程内 `RwLock<HashMap<String, JobHandler>>`；**无 executor 生命周期**（设计决定：Rust 无 executor，`shutdown()` 清 map）；注册失败无异常路径（纯内存 insert 不会失败，属设计差异）。**cancel 语义（2026-10-28）**：新增 `XxlJobAgentScheduler::try_cancel()` 返回 Java 原文错误 `"Cancel operation is not supported by XxlJobAgentScheduler. Please use XXL-Job admin console to pause or delete the job."`，并新增 trait 默认方法 `AgentScheduler::try_cancel`（xxl-job override 为 Err）；布尔版 `cancel()` 仍返回 `false` + warn（受 trait 签名限制，无法区分「不支持/未找到」，已在 §4.2 登记） |
 
 ## 4. 项目状态与下一步
@@ -132,22 +132,26 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
   - `cargo clippy -p agentscope-extensions-scheduler --all-targets`：本 crate 仅剩 2 条既有 warning（`module_inception`、`very_complex_type`）；本轮删除了 `next_seq` / `AsAny` / `interrupt_notify` / `JobContext::run_task` 四个死脚手架。
   - 未新增任何依赖（未引入 `chrono-tz`，未用 `tokio-util`；interrupt 用 `tokio::sync::watch` + `select!`）。
 
-### 4.2 下一步与阻塞
-1. ~~P0（`with_factory` 未接线）~~ → **已修复（2026-10-22，§7）**；`factory` 不再 dead field。
-2. ~~`next_after` 生产零调用~~ → **已接入（2026-10-28）**：`job::CronPlan::next_fire_time` 驱动 CRON 循环精确休眠，并按字段跳跃优化（月/日/时/分逐级跳，不再逐秒扫）；查询 API `QuartzAgentScheduler::next_fire_time(name)`。
-3. 未使用依赖：`agentscope-harness`（引用数 0）建议裁剪；`futures` 仍为 0 引用。`TaskControl` trait 仍为未被使用的脚手架（保留，属公共抽象）。
-4. cron 剩余（本轮明确不做，非缺口）：**DST 时区**（`Europe/London` 等需 `chrono-tz`，当前 `resolve_zone` 明确报错而非静默降级）；Quartz 的 `Calendar` 排除日 / `misfire` 策略；`nW`/`n#k` 与列表混写（Quartz 本身亦不支持）。
-5. **跨模块需求（记入此处，未改 core/harness）**：xxl-job 的 `PostReasoningEvent → XxlJobHelper.log` 逐条日志 Hook 在 Rust 侧无等价挂点（`Middleware::on_reasoning` 只能看到**入参**，`on_acting` 为死代码，core 未向 middleware 暴露推理**产出**事件）→ 当前以「执行结束记录最终回复 + handleSuccess/handleFail」替代；若后续 core 暴露 post-reasoning 事件，可在本 crate 内补 `XxlJobLogMiddleware` 并注入 `RuntimeAgentConfig.middleware`（`spec.rs` 的 `Vec` 不可变，需先增加 `with_middleware` 之类的复制构造）。
-6. `AgentScheduler::cancel` 返回 `bool`（Java 抛异常）→ 已通过新增默认方法 `try_cancel() -> Result<bool, SchedulerError>` 补足；调用方需迁移到 `try_cancel` 才能区分「不支持」与「未找到」。
-7. `QuartzAgentScheduler::shutdown` 现在 `shutdown + join().await`（对齐 `scheduler.shutdown(true)` 的等待语义），但 `join` 用 `abort()` 实现 → in-flight 执行被丢弃而非跑完；Java `shutdown(true)` 会等作业完成。语义差异已登记，若需精确对齐应改为「先等 in-flight，再 abort 循环」。
-8. **真实剩余（2026-10-29 复核，8 项任务均已关闭，以下为剩余项）**：
-   - xxl-job `PostReasoningEvent → XxlJobHelper.log` 逐条日志 Hook **无挂点**（跨模块：core 未向 middleware 暴露推理**产出**事件；现以最终回复 + `handleSuccess`/`handleFail` 替代）——第 5 条。
-   - `SchedulerRegistry` 只存 `scheduler_id` 字符串、**无句柄反查**（Java 存 `QuartzAgentScheduler` 实例，§3.2）。
-   - `BaseScheduleAgentTask::run_with` **不校验 model 非空**（Java 抛 `Model cannot be null.`，§3.1）。
-   - `shutdown` 用 `abort()` **丢弃 in-flight**（第 7 条）。
-   - 未使用依赖：`agentscope-harness`（0 引用）、`futures`（0 引用）；`TaskControl` 为保留的公共抽象（第 3 条）。
-   - 测试 **91 vs Java 180**（§4.1 / §8）。
+- **2026-10-31 loop 收口（8 项 = 原 6 项 + §3/§8 遗留 2 项，§9）**：core 新增推理产出 hook（additive）；`XxlJobLogMiddleware` + `RuntimeAgentConfig::with_middleware`；registry 改弱引用句柄反查；`run_with` 补 model 校验（`Model cannot be null.`）；`shutdown`/`cancel` 改「先等 in-flight 再退出循环」；删 `agentscope-harness`、`futures` 降 dev-dep；补 Builder/`schedule_default`。
+  - **测试**：基线 lib 88 + 集成 3 = 91；本轮新增 **12** 个 scheduler lib 用例 → **预期 lib 100 + 集成 3 = 103**（另 core 新增 2 个用例，计入 core crate）。子智能体按本轮约定**未执行 cargo**，实测结果由主智能体统一回填（§9.4）。
+  - 未删除任何既有测试/断言；两处断言**语义更正**并写明理由：`cancel_aborts_the_in_flight_execution` → `cancel_waits_for_the_in_flight_execution_to_finish`（Java `deleteJob` 不中断运行中作业）；xxl-job `reply:hello` 日志断言 → 改为「调度器不再写最终回复日志，由 Hook 记录推理步」（§9.1-1）。
 
+### 4.2 下一步与阻塞（2026-10-31 全部收口）
+
+> 原 1–8 条全部关闭；剩余无未关闭条目。裁定依据见 §9.2。
+
+| # | 原条目 | 状态 | 落点 / 依据 |
+|---|---|---|---|
+| 1 | P0 `with_factory` 未接线 | 已完成 | 2026-10-22 §7；`factory` 已非 dead field |
+| 2 | `next_after` 生产零调用 | 已完成 | 2026-10-28 §8：`CronPlan::next_fire_time` 驱动精确休眠 + 查询 API |
+| 3 | 未使用依赖 `agentscope-harness` / `futures`；`TaskControl` 脚手架 | 已完成 | 2026-10-31：删除 `agentscope-harness`（0 引用），`futures` 降为 `[dev-dependencies]`（仅测试桩模型需要）；`TaskControl` **保留**为公共控制面抽象（`pause/resume/interrupt` 三方法，后端可自选实现），是有意保留的 API 而非死代码 |
+| 4 | cron 剩余（DST / `Calendar` / `misfire` / `nW`+列表混写） | 已完成（设计决定，不迁移） | 见 §9.2 逐项依据与替代 |
+| 5 | xxl-job `PostReasoningEvent → XxlJobHelper.log` 无挂点 | 已完成 | 2026-10-31：core 新增 `Middleware::on_reasoning_result` + `ExtensionPoint::OnReasoningResult` + `MiddlewareChain::notify_reasoning_result`（`middleware.rs`），调用点在 `react_agent.rs::run_reasoning`；crate 侧 `XxlJobLogMiddleware` 由 `schedule_runtime` 经 `with_middleware` 注入（§9.1-1） |
+| 6 | `cancel` 返回 bool（Java 抛异常） | 已完成 | 2026-10-28 `try_cancel`；2026-10-31 补充：`cancel` 语义改为「停循环 + 等在途执行跑完」（对齐 `deleteJob` 不中断运行中作业） |
+| 7 | `shutdown` 用 `abort()` 丢弃 in-flight | 已完成 | 2026-10-31：`QuartzScheduleAgentTask::join_with_grace`（默认 30s，超时才 abort 防死等）；`job.rs` FIXED_RATE 分支把 `fire` 移出 `select!`（否则 cancel 会丢弃在途执行）；测试 `shutdown_waits_for_the_in_flight_execution`、`cancel_waits_for_the_in_flight_execution_to_finish`、`fixed_rate_cancel_waits_for_the_in_flight_execution` |
+| 8 | 2026-10-29 剩余 6 项（日志 Hook / registry 句柄 / model 校验 / shutdown / 未用依赖 / 测试 91 vs 180） | 已完成 | 前 5 项同上；测试项见 §4.1 + §9.3 映射表 |
+| — | `RuntimeAgentConfig.middleware` 不可变（无法复现 Java hooks 追加） | 已完成 | 2026-10-31 新增复制构造 `with_middleware` / `with_model`（`src/common/config/spec.rs`），测试 `common::config::spec::tests::with_middleware_returns_a_copy_and_keeps_the_original` |
+ 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-scheduler` 基线。
 - 改动中：保持 `cargo build -p agentscope-extensions-scheduler` / `cargo test -p agentscope-extensions-scheduler` 通过。
@@ -199,7 +203,11 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
 
 **未做（仍为待办，未改动）**：`L`/`W`/`LW`/`#`、7 字段年、按秒轮询改精确休眠（`next_after` 仍零调用）、`interrupt()` 中止 in-flight、`get_status` 六值、xxl-job 回调协议；时区未引入 `chrono-tz`（DST 区需显式传偏移）。
 
+> 上段为 **2026-10-26 快照**：其中除 DST 时区外均已落地（2026-10-28 §8）或已登记为设计决定（§9.2）；当前状态以 §3 / §9 为准。
+
 ## 静态复核记录（2026-10-22）
+
+> **历史快照**：本节与后续「第二轮补充复核」的 P0/P1 结论及 rollup 建议均已过时（P0 于 §7 修复、cron 于 §6.1/§8 修复、剩余项于 §9 收口）。**当前状态以 §3 / §9 为准**。
 
 ### 复核方式
 - **纯静态**：通读 tracker + Rust crate 全部 14 个 `.rs`（2416 行）+ Java 3 子模块 28 个 `.java`（6412 行）。
@@ -460,7 +468,7 @@ cargo test -p agentscope-extensions-scheduler
 | 2 | `next_after` 生产零调用 | ✅ 已完成（**接线 + 查询 API 双做**） | `job::CronPlan::next_fire_time` → CRON 循环 `sleep` 到下次触发（替换 1s 轮询），无未来触发 → `Complete`；新增 `QuartzAgentScheduler::next_fire_time(name)`、`trigger_state(name)`、`QuartzScheduleAgentTask::next_fire_time(from)` | `Trigger#getNextFireTime` / `CronExpression#getNextValidTimeAfter`；`QuartzAgentScheduler.java:535-551` |
 | 3 | `interrupt()` 不中止 in-flight | ✅ 已完成 | `QuartzScheduleAgentTask` 增 `watch::Sender<u64>` 中断代次；`execute_with` 用 `select!` 与执行竞争，中断即丢弃执行 future 并返回 `Error::Interrupted`；`interrupted_count()` 可观测；FIXED_DELAY 被中断则跳过重排；`QuartzAgentScheduler::interrupt` 返回「是否真有 in-flight」 | `AgentQuartzJob.java:39/49-51/107-109/121-123`（`InterruptableJob`）、`QuartzAgentScheduler.java:479-503`（`scheduler.interrupt`） |
 | 4 | `get_status` 3 值 → Java 6 值 | ✅ 已完成 | `TaskStatus::{None,Normal,Paused,Complete,Error,Blocked,Cancelled}` + `as_str()` + `is_terminal()`（`None/Complete/Cancelled`）；`get_status` 保留 `Option`，另加 Java 同形 `trigger_state() -> TaskStatus` | `QuartzAgentScheduler.java:535-551` 返回 `Trigger.TriggerState`（NONE/NORMAL/PAUSED/COMPLETE/ERROR/BLOCKED） |
-| 5 | xxl-job 协议缺口 | ⚠️ 已完成（1 处因 core 限制降级，见 §4.2-5） | 新增 `src/xxljob/context.rs`：`XxlJobContext`（job_id/job_param/shard_index/shard_total/log_id/日志/handle 结果）+ `XxlJobHelper`（`log`/`handle_success`/`handle_fail`/`get_job_*`/`get_shard_*`/`get_log_id`），以 `tokio::task_local!` 模拟 Java ThreadLocal；`trigger_with_context` 在作用域内执行：job param → user msg、成功 `log(reply)`+`handleSuccess`、失败 `handleFail` | `XxlJobAgentScheduler.java:253/265`（`getJobParam`）、`:282`（`handleSuccess`）、`:189-201`（日志 Hook） |
+| 5 | xxl-job 协议缺口 | ⚠️ 已完成（1 处因 core 限制降级，见 §4.2-5） | 新增 `src/xxljob/context.rs`：`XxlJobContext`（job_id/job_param/shard_index/shard_total/log_id/日志/handle 结果）+ `XxlJobHelper`（`log`/`handle_success`/`handle_fail`/`get_job_*`/`get_shard_*`/`get_log_id`），以 `tokio::task_local!` 模拟 Java ThreadLocal；`trigger_with_context` 在作用域内执行：job param → user msg、成功 `handleSuccess`、失败 `handleFail`（最终回复**不**写调度日志：Java `XxlJobAgentScheduler.java:278-282` 只用 `logger.info` 记录结果，逐条日志由 `:189-201` 的 Hook 负责，2026-10-31 起由 `XxlJobLogMiddleware` 承接，§9.1-1） | `XxlJobAgentScheduler.java:253/265`（`getJobParam`）、`:282`（`handleSuccess`）、`:189-201`（日志 Hook） |
 | 6 | `cancel` 语义 | ✅ 已完成 | quartz：空名/不存在 → `false`（+warn），存在 → `shutdown()` + `join().await`（job 循环与 in-flight 均终止）→ `true`；xxl-job：新增 `try_cancel() -> Result` 返回 Java 原文 `UnsupportedOperationException` 文案，trait 新增默认 `AgentScheduler::try_cancel`（xxl-job override 为 Err），布尔 `cancel` 保留 `false`+warn | `QuartzAgentScheduler.java:321-345`、`XxlJobAgentScheduler.java:299-304` |
 | 7 | `execution_count()` 未暴露 | ✅ 已完成（P0-3 已暴露，本轮补同族访问器） | `execution_count()` 已有；新增 `schedule_config()`/`agent_config()`/`runtime()`，并加 `config_accessors_are_exposed` 回归 | `BaseScheduleAgentTask.java:266-268`、`QuartzFixedDelayIntegrationTest.java:56` |
 
@@ -510,3 +518,90 @@ cargo fmt -p agentscope-extensions-scheduler（已跑，无额外改动）
 - **行为变更**：`?` 现仅允许出现在 dom/dow（其他字段报错）→ 历史表达式若在非日字段使用 `?`，需改写为 `*`。
 - **Java 双计数问题未复刻**：Java `executeAgent` 在 `run()` 之后又调 `incrementExecutionCount()`（`XxlJobAgentScheduler.java:272`），实际每次执行 +2；Rust 保持 +1（`BaseScheduleAgentTask::run_with` 内），属**有意偏离**，已在 §4.2 记录。
 - **编译环境注记**：本轮验证期间 `agentscope-extensions-model` 正被并行会话重构，出现临时编译失败（与本 crate 无关），等待其稳定后重跑；未改动任何本 crate 之外的文件。
+
+## 9. 2026-10-31 loop 收口记录
+
+> 范围：`crates/agentscope-extensions-scheduler/**`（含本 crate `Cargo.toml`）+ **core 授权改动**（`middleware/middleware.rs`、`agent/react_agent.rs` 的 hook 与调用点，见 §9.1-1）；未改 harness、未改 `RuntimeContext`、未改根 `Cargo.toml`、未动其它 crate。
+> Java 对照：`D:\IdeaProjects\agentscope-java`（HEAD `1524b3191`）的 `agentscope-extensions-scheduler-{common,quartz,xxl-job}`。
+> 约定：本轮子智能体**不跑 cargo**，实测由主智能体统一回填。
+
+### 9.1 逐项关闭
+
+| # | 条目 | 结论 | 代码落点 | 测试 |
+|---|---|---|---|---|
+| 1 | xxl-job `PostReasoningEvent → XxlJobHelper.log` 逐条日志 Hook 无挂点 | **已完成** | core：`Middleware::on_reasoning_result`（`middleware.rs:50`，additive 默认空实现）、`ExtensionPoint::OnReasoningResult`（`:139/:141`，`ALL` 由 7 → 8，`:154`）、`MiddlewareChain::notify_reasoning_result`（`:268-271`）；调用点 `react_agent.rs::run_reasoning` **`:2151-2155`（调用语句 `:2154`）**（仅 `Ok(message)` 时触发，不改写消息、不改既有行为）。crate：`src/xxljob/log.rs` `XxlJobLogMiddleware`；注入点 `xxljob::XxlJobAgentScheduler::schedule_runtime`（`runtime.with_middleware(XxlJobLogMiddleware::shared())`） | core `middleware::tests::notify_reasoning_result_reaches_participants_only`、`react_agent::tests::reasoning_result_hook_fires_once_per_reasoning_step`；crate `xxljob::log::tests::{reasoning_message_reaches_the_dispatch_log, logging_outside_a_dispatch_is_a_noop}`、`xxljob::tests::{schedule_appends_the_reasoning_log_middleware, dispatch_logs_each_reasoning_step_through_the_attached_middleware}` |
+| 2 | `SchedulerRegistry` 只存字符串、无句柄反查 | **已完成** | `src/quartz/registry.rs`：`RegistryEntry{id, scheduler_type, handle: Weak<QuartzAgentScheduler>}` + `get_handle()` / `is_alive()`；`register` / `register_with_type` 改用句柄、`scheduler_type` 写真实类型；`scheduler_type` 不再被误写成 id（删除 `self_handle_hint`）。注册入口：`quartz/mod.rs` `new_shared` / `register_self` / `QuartzAgentSchedulerBuilder::build_shared` | `quartz::registry::tests::{register_lookup_unregister, entry_dies_with_the_scheduler_and_is_pruned}`、`quartz::tests::{builder_sets_a_deterministic_scheduler_id, shutdown_clears_registry_and_tasks}` |
+| 3 | `run_with` 不校验 model | **已完成** | `src/common/scheduler/task.rs::run_with`：name/sysPrompt 之后校验 `agent_config.model()`；`spec.rs` `AgentConfigError::MissingModel` 文案改为 `Model cannot be null.`（含句点，与 Java `BaseScheduleAgentTask.java:244` 逐字一致） | `common::scheduler::task::tests::{missing_model_fails_with_the_java_message, failed_execution_still_counts}`、`quartz::tests::schedule_default_uses_none_mode_and_needs_a_runtime_model` |
+| 4 | `shutdown` 用 `abort()` 丢弃 in-flight | **已完成** | `src/quartz/task.rs`：`join()` 改为 `join_with_grace(SHUTDOWN_GRACE = 30s)` —— 先唤醒协作退出（`cancelled()`/`wait_if_paused()` 的 select 生效），await 句柄；仅在超过 grace 时 `abort()` 防死等。`cancel` 与 `shutdown` 共用该路径（Java `deleteJob` 亦不中断运行中作业）；`src/quartz/job.rs` **FIXED_RATE 分支**把 `fire(&task)` 移出 `select!`（原先 cancel 与 tick 同处一个 select，cancel 会在执行中途丢弃 future，与「等 in-flight 跑完」自相矛盾），现在只在等下一个 tick 时与 `cancelled()` 竞争 | `quartz::tests::{shutdown_waits_for_the_in_flight_execution, cancel_waits_for_the_in_flight_execution_to_finish, fixed_rate_cancel_waits_for_the_in_flight_execution, cancel_waits_for_the_job_loop_to_stop}` |
+| 5 | 未使用依赖 `agentscope-harness` / `futures` | **已完成** | `Cargo.toml`：删除 `agentscope-harness`（全 crate 0 引用），`futures` 移入 `[dev-dependencies]`（仅测试桩模型 `BoxStream` 需要）；`TaskControl` 保留（公共控制面抽象，非死代码） | 编译产物层面验证（主智能体跑 `cargo build -p` 确认无 unused-dep 相关错误） |
+| 6 | 测试 91 vs Java 180 | **已完成（映射表见 §9.3）** | 新增 12 个 scheduler 语义用例 + core 2 个（见下表），其余为 mock/Builder/toString/equals 细节 | 见 §9.3 |
+| 7 | `RuntimeAgentConfig.middleware` 不可变 | **已完成** | `src/common/config/spec.rs`：`with_middleware(Arc<dyn Middleware>)` / `with_model(Arc<dyn Model>)`（复制构造，不改原配置） | `common::config::spec::tests::with_middleware_returns_a_copy_and_keeps_the_original` |
+| 8 | 其它 §3 尾部「缺」项 | **已完成 / 已完成（设计决定）** | `QuartzAgentSchedulerBuilder`（`scheduler_id`）+ `QuartzAgentScheduler::schedule_default` + `XxlJobAgentScheduler::schedule_default`（对齐 Java 单参 `schedule(AgentConfig)`）；其余见 §9.2 | `quartz::tests::{builder_sets_a_deterministic_scheduler_id, schedule_default_uses_none_mode_and_needs_a_runtime_model}` |
+
+**新增用例汇总（14：scheduler 12 + core 2）**：core 2（`notify_reasoning_result_reaches_participants_only`、`reasoning_result_hook_fires_once_per_reasoning_step`）；scheduler 12（`missing_model_fails_with_the_java_message`、`failed_execution_still_counts`、`with_middleware_returns_a_copy_and_keeps_the_original`、`entry_dies_with_the_scheduler_and_is_pruned`、`builder_sets_a_deterministic_scheduler_id`、`schedule_default_uses_none_mode_and_needs_a_runtime_model`、`shutdown_waits_for_the_in_flight_execution`、`fixed_rate_cancel_waits_for_the_in_flight_execution`、`schedule_appends_the_reasoning_log_middleware`、`dispatch_logs_each_reasoning_step_through_the_attached_middleware`、`xxljob::log` 2 个）——其中 `register_lookup_unregister` 为改写、`cancel_aborts_the_in_flight_execution` 为语义更正。
+
+### 9.2 设计决定（不迁移）清单（源码级依据）
+
+| 项 | 依据 | 影响 | 替代 |
+|---|---|---|---|
+| Quartz 集群回读（`loadTaskFromQuartz`） | Java 从 Quartz **JDBC JobStore** 反序列化 JobDataMap 重建任务（`QuartzAgentScheduler.java:471-530`）；Rust 无 Quartz store、无跨节点共享的任务存储 | 多节点部署时不共享调度任务 | 任务注册表为进程内结构；需要集群请由宿主把调度决策（cron）外置（xxl-job 模式）或每节点各自调度 |
+| Quartz `Builder#autoStart` / 注入自定义 `Scheduler` | Rust 无 scheduler 级 start/standby 与 Quartz `Scheduler` 对象；tokio job loop 随任务启动 | 无「先建后启」两阶段 | `QuartzAgentSchedulerBuilder::scheduler_id` 已提供；启动语义由 `schedule_runtime` 隐式完成 |
+| `rescheduleNextFixedDelay` 公开能力 | Java 用一次性 Trigger + 完成后重排；Rust 以 FIXED_DELAY 循环 sleep 等价（`job.rs`），无需外部重排 API | 无 API 可手动重排 | `next_fire_time` 查询 + `trigger` 手动触发 |
+| `AgentQuartzJob` 的 `inputMsg` JSON 反序列化 + `setUnscheduleFiringTrigger(true)` | Rust 初始消息以 `Msg` 结构体保存（不序列化，`QuartzScheduleAgentTask.initial_input`），不存在反序列化失败分支；任务因表达式非法在**注册前**已失败（§6） | 无 JSON 兼容层，跨语言持久化不互通 | 需要持久化时由宿主自行序列化 `Msg` |
+| `QuartzScheduleAgentTask#getJobKey` | Rust 无 `JobKey`（无 Quartz）；可观测信息由 `id()`/`name()`/`schedule_config()`/`next_fire_time()` 提供 | 无 JobKey 字符串 | 上述访问器 |
+| cron `Calendar` 排除日 / `misfire` 策略 | Quartz 运行时能力；Rust 自研解析器无 Calendar 抽象，misfire 无意义（`sleep_until` + 单次补偿语义已在 §6 说明） | 不支持节假日排除 | 调用方在 factory 内自行跳过；或在 cron 表达式上规避 |
+| cron DST 时区（`Europe/London` 等） | 未引入 `chrono-tz`（避免为 DST 增加依赖）；`resolve_zone` 对 DST 区**明确报错**而非静默降级 GMT（Java 是静默降级，Rust 故意更严格） | DST 区需显式传固定偏移 | `zone_id` 传固定偏移别名或 UTC |
+| `nW` / `n#k` 与列表混写 | Quartz 本身亦不支持（`CronExpression` 同字段只能一种语法） | 无 | 拆多条表达式 |
+| xxl-job executor `destroy()` / 注册失败异常路径 | Rust 无 executor；注册为内存 `HashMap` insert，不会失败（`XxlJobAgentScheduler:343-348` 对应 `executor.destroy()`） | 无 executor 生命周期 | `shutdown()` 清空 handler |
+| `schedule(AgentConfig)` 可序列化入口的 model | Java `RuntimeAgentConfig.Builder#modelConfig` 内部 `modelConfig.createModel()`；本 crate 无 provider 注册表（DashScope 属 MODEL 模块） | 可序列化入口只能调度、执行期报 `Model cannot be null.` | 用 `schedule_runtime` + `StaticModelConfig`/`Arc<dyn Model>` |
+| Java 执行计数双计（`executeAgent` 再 `incrementExecutionCount`） | `XxlJobAgentScheduler.java:272`；Rust 保持每次执行 +1 | 计数不等价（Rust 更正确） | 有意偏离，已由测试 `failed_execution_still_counts`/`execution_count` 系列锁死 |
+| Spring 包扫描 / channel 回调控制器注册 | 见 §7.5 | 无 | 显式挂载 router（由宿主初始化测试断言） |
+
+### 9.3 Java 测试类 → Rust 用例映射（180 → 103）
+
+| Java 测试类 | `@Test` | Rust 对应 | 关闭口径 |
+|---|---|---|---|
+| `QuartzAgentSchedulerTest` | 49 | `quartz::tests`（21：schedule/duplicate/cancel/pause-resume/status/shutdown/invalid-cron/invalid-zone/next_fire_time/trigger_state/interrupt/cron-loop/固定延迟/shutdown 等待/in-flight cancel/registry），`tests/quartz_execution.rs`（3） | 语义用例（调度、取消、状态、cron 校验、端到端触发）全覆盖；其余为 Mockito 校验「Quartz API 被调用」的 mock 细节，Rust 无 Quartz 对象可 mock → 以行为断言替代 |
+| `XxlJobAgentSchedulerTest` | 34 | `xxljob::tests`（11）+ `xxljob::context::tests`（3）+ `xxljob::log::tests`（2） | 注册/触发/上下文/日志/Hook/`try_cancel` 全覆盖；executor 生命周期与「注册失败抛 RuntimeException」无对应物（§9.2） |
+| `ScheduleConfigTest` | 19 | `common::config::schedule::tests`（5）+ `common::config::zone::tests`（4） | 4 种 mode 的校验、cron 必填、固定间隔/延迟正数、zone 解析与默认 UTC 全覆盖；余为 builder/getter/equals/toString 细节（Rust `derive(Debug, Clone, PartialEq, Eq)` + 同名 getter 默认等价） |
+| `DashScopeModelConfigTest` | 15 | 无（`StaticModelConfig` 无对应字段） | **设计决定**：provider 配置属 MODEL 模块（dashscope 未迁移），本 crate 只接收已构造 `Arc<dyn Model>` |
+| `AgentConfigTest` | 13 | `common::config::spec::tests`（2：name+model 必填、serde 往返） | 必填校验与序列化语义覆盖；余为 builder/getter 细节 |
+| `BaseScheduleAgentTaskTest` | 11 | `common::scheduler::task::tests`（6） | run 计数、取消后不可 run、cancel 幂等 + 回调一次、缺 sysPrompt、缺 model（Java 文案）、失败仍计数 |
+| `AgentQuartzJobTest` | 11 | `quartz::job::tests`（cron 求值/时区/next_fire_time）+ `tests/quartz_execution.rs`（固定延迟触发、initial input 重放）+ `quartz::tests::cron_loop_fires_on_next_fire_time` | interrupt 短路 → `interrupt_aborts_in_flight_execution` + FIXED_DELAY 跳过重排；`setUnscheduleFiringTrigger` 无对应（§9.2） |
+| `RuntimeAgentConfigTest` | 9 | `common::config::spec::tests`（3） | 内嵌 meta、`from(AgentConfig)`、`with_middleware` 复制构造（Java 的可变 hooks 语义） |
+| `ScheduleModeTest` | 6 | `schedule::tests`（`serde_roundtrip_uses_java_enum_names` 等） | 4 变体 + `as_str` + serde 名称；Java 的 `values()/valueOf()` 由 enum 天然提供 |
+| `QuartzScheduleAgentTaskTest` | 5 | `quartz::task::tests`（8：config accessors/status error/interrupt 两个/completed/count/initial input） | 语义超集 |
+| `ScheduleAgentTaskTest` | 4 | `common::scheduler::task::tests` + `quartz::task::tests` | trait 契约（id/name/run/cancel）由实现测试覆盖 |
+| `ModelConfigTest` | 3 | `StaticModelConfig`（`model_name`/`create_model`） | 2 个 getter 的实现，行为由「执行期使用配置的 model」端到端用例（`dispatch_logs_each_reasoning_step_through_the_attached_middleware`）证明 |
+| `QuartzFixedDelayIntegrationTest` | 1 | `tests/quartz_execution.rs`（3） | 3 个集成用例是它的超集（含 `execution_count` 轮询断言） |
+
+**结论**：语义缺口已补（日志 Hook、model 校验、registry 反查、shutdown 等待、Builder、单参便捷法）；剩余 77 个数量差全部来自 JVM 专有 mock/Builder 细节与未迁移的 DashScope provider 配置类，不再单独补测。
+
+### 9.4 验证（由主智能体执行并回填）
+
+```
+cargo test -p agentscope-extensions-scheduler
+  → 预期 lib: 100 passed / 0 failed（基线 88 + 12）、tests/quartz_execution.rs: 3 passed、doc-tests 0
+
+cargo test -p agentscope-core --lib middleware agent
+  → 预期 core lib 基线 +2（新增 2 个用例）
+
+cargo build -p agentscope-extensions-scheduler
+  → 预期 0 error；无 agentscope-harness 依赖
+```
+
+**反向验证（回退 → 期望 FAILED → 恢复）**
+
+| 回退的实现 | 期望失败的用例 |
+|---|---|
+| `run_reasoning` 去掉 `notify_reasoning_result` 调用 | `react_agent::tests::reasoning_result_hook_fires_once_per_reasoning_step`、`xxljob::tests::dispatch_logs_each_reasoning_step_through_the_attached_middleware`、`xxljob::log::tests::reasoning_message_reaches_the_dispatch_log` |
+| `schedule_runtime` 去掉 `with_middleware` 注入 | `xxljob::tests::{schedule_appends_the_reasoning_log_middleware, dispatch_logs_each_reasoning_step_through_the_attached_middleware}` |
+| `run_with` 去掉 model 校验 | `common::scheduler::task::tests::missing_model_fails_with_the_java_message`、`quartz::tests::schedule_default_uses_none_mode_and_needs_a_runtime_model` |
+| `join_with_grace` 改回 `abort()` | `quartz::tests::{shutdown_waits_for_the_in_flight_execution, cancel_waits_for_the_in_flight_execution_to_finish}` |
+| job.rs FIXED_RATE 分支把 ire(&task) 放回 select! 内 | quartz::tests::fixed_rate_cancel_waits_for_the_in_flight_execution（旧行为中途丢弃执行 → xecution_count() 为 0） |
+| `SchedulerRegistry::get_handle` 改为 `None` | `quartz::registry::tests::{register_lookup_unregister, entry_dies_with_the_scheduler_and_is_pruned}`、`quartz::tests::{builder_sets_a_deterministic_scheduler_id, shutdown_clears_registry_and_tasks}` |
+
+### 9.5 跨模块记录
+
+- **core**（本模块获授权的唯一改动）：`middleware/middleware.rs` 与 `agent/react_agent.rs` 的 **additive** hook（无行为变更，默认空实现；`ExtensionPoint::ALL` 7 → 8）。**未触碰 `RuntimeContext`**（JUDGE 独占）、未改 harness。
+- **需汇总方登记**：`EXTENSIONS_GAP_TRACKER.md` 第 17 行状态应改为「已完成（2026-10-31 收口，§9）」；core 新增 `on_reasoning_result` 扩展点是否需在 core 侧 tracker 登记，由主智能体裁定。

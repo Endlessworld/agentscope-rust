@@ -18,8 +18,10 @@
 //! * `shutdown` clears all handlers (Java additionally destroys the executor).
 
 pub mod context;
+mod log;
 
 pub use context::{XxlJobContext, XxlJobHandleCode, XxlJobHandleResult, XxlJobHelper};
+pub use log::XxlJobLogMiddleware;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,6 +84,13 @@ impl XxlJobAgentScheduler {
             return Ok(existing);
         }
 
+        // Java appends its `PostReasoningEvent` -> `XxlJobHelper.log` hook to the
+        // caller's hooks list (`XxlJobAgentScheduler:189-201`). Rust configs are
+        // immutable, so the effective config is a copy carrying the extra
+        // middleware; a factory that builds its agent from this config's
+        // `middleware()` chain gets every reasoning message logged.
+        let runtime = Arc::new(runtime.with_middleware(XxlJobLogMiddleware::shared()));
+
         let task = Arc::new(BaseScheduleAgentTask::new(
             runtime,
             schedule_config,
@@ -93,6 +102,16 @@ impl XxlJobAgentScheduler {
             .insert(name.clone(), JobHandler { task: task.clone() });
         tracing::info!(handler = %name, "registered XXL-Job handler");
         Ok(task)
+    }
+
+    /// Java's single-argument `schedule(AgentConfig)` overload: registers with the
+    /// default schedule config (`ScheduleMode::NONE`).
+    pub fn schedule_default(
+        &self,
+        agent_config: AgentConfig,
+    ) -> Result<Arc<dyn ScheduleAgentTask>, SchedulerError> {
+        let runtime = RuntimeAgentConfig::from(agent_config);
+        self.schedule_runtime(Arc::new(runtime), ScheduleConfig::none())
     }
 
     /// Triggers a registered handler locally (stand-in for an XXL-Job dispatch),
@@ -111,7 +130,8 @@ impl XxlJobAgentScheduler {
     ///
     /// Mirrors Java `executeAgent(BaseScheduleAgentTask)`: the job parameter
     /// becomes the user message, the execution runs inside the dispatch context,
-    /// the reply is logged and `handleSuccess` / `handleFail` is reported.
+    /// each reasoning step is logged through [`XxlJobLogMiddleware`], and
+    /// `handleSuccess` / `handleFail` is reported.
     pub async fn trigger_with_context(
         &self,
         name: &str,
@@ -135,11 +155,9 @@ impl XxlJobAgentScheduler {
             );
             match task.run(vec![input]).await {
                 Ok(reply) => {
-                    // Java's logging hook forwards each reasoning message to
-                    // `XxlJobHelper.log`; the Rust core exposes no post-reasoning
-                    // hook to middlewares, so the reply is logged instead (see
-                    // tracker §4.2).
-                    XxlJobHelper::log(reply.text_content());
+                    // Java logs each reasoning step through the injected hook
+                    // (`XxlJobLogMiddleware`) and only reports the outcome here; the
+                    // final reply itself is not written to the dispatch log.
                     XxlJobHelper::handle_success(format!(
                         "Successfully executed scheduled task '{task_name}'"
                     ));
@@ -244,9 +262,70 @@ mod tests {
                 .name(name)
                 .model_name("m")
                 .sys_prompt("sys")
+                .model(crate::test_support::stub_model("reasoned"))
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn schedule_appends_the_reasoning_log_middleware() {
+        // Java appends its `PostReasoningEvent` logging hook to the config at
+        // registration time; the Rust equivalent is a middleware appended to the
+        // effective (copied) runtime config.
+        let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
+        let input = runtime("A");
+        assert!(input.middleware().is_empty());
+        let task = sched.schedule_runtime(input.clone(), ScheduleConfig::none()).unwrap();
+
+        let base = task
+            .as_any()
+            .downcast_ref::<crate::common::scheduler::BaseScheduleAgentTask>()
+            .expect("xxl-job stores a BaseScheduleAgentTask");
+        assert_eq!(base.agent_config().middleware().len(), 1);
+        // The caller's config is left untouched (Rust configs are immutable).
+        assert!(input.middleware().is_empty());
+    }
+
+    /// Factory that builds its agent the way production does: the model and the
+    /// middleware chain come from the runtime config, so the hook attached by
+    /// `schedule_runtime` actually runs.
+    struct ConfigDrivenFactory;
+
+    #[async_trait]
+    impl AgentFactory for ConfigDrivenFactory {
+        async fn run(&self, config: &RuntimeAgentConfig, messages: Vec<Msg>) -> CoreResult<Msg> {
+            let mut chain = agentscope_core::middleware::MiddlewareChain::new();
+            for mw in config.middleware() {
+                chain.add_arc(mw.clone());
+            }
+            let agent = agentscope_core::agent::ReActAgent::builder()
+                .name(config.name())
+                .sys_prompt(config.sys_prompt().unwrap_or_default())
+                .model(config.model().cloned().expect("model configured"))
+                .middleware_chain(chain)
+                .build()?;
+            agent.call(messages).await
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_logs_each_reasoning_step_through_the_attached_middleware() {
+        // End-to-end through the real assembly path: scheduler -> task -> factory
+        // -> ReActAgent -> core `on_reasoning_result` -> `XxlJobHelper.log`.
+        let sched = XxlJobAgentScheduler::new(Arc::new(ConfigDrivenFactory));
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .unwrap();
+
+        let ctx = Arc::new(XxlJobContext::new(5, "hello").with_log_id(11));
+        let reply = sched.trigger_with_context("A", ctx.clone()).await.unwrap();
+        assert_eq!(reply.text_content(), "reasoned");
+
+        // Java: every `PostReasoningEvent` reasoning message goes to the job log.
+        assert_eq!(ctx.logs(), vec!["reasoned".to_string()]);
+        let handle = ctx.handle_result().expect("handle result reported");
+        assert_eq!(handle.code(), XxlJobHandleCode::Success);
     }
 
     #[tokio::test]
@@ -388,7 +467,11 @@ mod tests {
             logs.iter().any(|l| l == "received: hello"),
             "logs: {logs:?}"
         );
-        assert!(logs.iter().any(|l| l == "reply:hello"), "logs: {logs:?}");
+        // The final reply is no longer copied into the log by the scheduler: Java
+        // logs each reasoning step through its hook (see
+        // `dispatch_logs_each_reasoning_step_through_the_attached_middleware`), and
+        // this factory does not run an agent, so nothing else is logged.
+        assert!(!logs.iter().any(|l| l == "reply:hello"), "logs: {logs:?}");
         // The context keeps the dispatch metadata available after the run.
         assert_eq!(ctx.job_id(), 9);
         assert_eq!(ctx.shard_index(), 0);

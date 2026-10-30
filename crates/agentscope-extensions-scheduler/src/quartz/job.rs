@@ -141,19 +141,22 @@ pub(crate) fn spawn_job(
                 // "start after initial delay" semantics.
                 ticker.tick().await;
                 loop {
+                    // Only the wait for the next tick is raced against cancel: an
+                    // execution in flight is never dropped, so `shutdown(true)` /
+                    // `deleteJob` (which never interrupt a running job in Java) can
+                    // wait for it to finish.
                     tokio::select! {
-                        _ = ticker.tick() => {
-                            if task.is_cancelled() {
-                                return;
-                            }
-                            task.wait_if_paused().await;
-                            if task.is_cancelled() {
-                                return;
-                            }
-                            let _ = fire(&task).await;
-                        }
+                        _ = ticker.tick() => {}
                         _ = task.cancelled() => return,
                     }
+                    if task.is_cancelled() {
+                        return;
+                    }
+                    task.wait_if_paused().await;
+                    if task.is_cancelled() {
+                        return;
+                    }
+                    let _ = fire(&task).await;
                 }
             }
             ScheduleMode::FIXED_DELAY => {

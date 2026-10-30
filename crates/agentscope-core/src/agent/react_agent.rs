@@ -2146,6 +2146,13 @@ async fn run_reasoning(
             Some(error) => Err(error),
             None => Err(Error::Agent("model produced no message".into())),
         });
+    // Java `PostReasoningEvent`: tell the chain what this reasoning step produced so a
+    // middleware can observe (and, e.g., log) each intermediate assistant message. A
+    // notification only — the message is borrowed and cannot be rewritten, and a failed
+    // step does not fire it (Java does not publish the event either).
+    if let Ok(message) = &result {
+        chain.notify_reasoning_result(ctx, message).await;
+    }
     result
 }
 /// Helper: emit an agent event through the delta_tx channel if available.
@@ -6069,6 +6076,46 @@ mod tests {
             agent.active_run().is_none(),
             "the run must be cleared after the call"
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_result_hook_fires_once_per_reasoning_step() {
+        // Java `PostReasoningEvent`: the produced assistant message must reach the
+        // middleware chain through the real builder + `call` path (a regression that
+        // drops `notify_reasoning_result` from `run_reasoning` fails here).
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait]
+        impl crate::middleware::Middleware for Recorder {
+            async fn on_reasoning_result(
+                &self,
+                _ctx: &crate::agent::RuntimeContext,
+                message: &Msg,
+            ) {
+                self.0.lock().unwrap().push(message.text_content());
+            }
+
+            fn active_points(&self) -> Vec<crate::middleware::ExtensionPoint> {
+                vec![crate::middleware::ExtensionPoint::OnReasoningResult]
+            }
+        }
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(Recorder(Arc::clone(&seen))));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![text_response("reasoned once")],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-reasoning-result")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec!["reasoned once".to_string()]);
     }
 
     #[tokio::test]

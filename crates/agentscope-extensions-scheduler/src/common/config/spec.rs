@@ -145,7 +145,10 @@ pub enum AgentConfigError {
     #[error("ModelConfig must not be null")]
     MissingModelConfig,
     /// Model must not be null when building `RuntimeAgentConfig`.
-    #[error("Model cannot be null")]
+    ///
+    /// Message is byte-identical to Java `BaseScheduleAgentTask#createAgent`
+    /// (`throw new IllegalArgumentException("Model cannot be null.")`).
+    #[error("Model cannot be null.")]
     MissingModel,
     /// System prompt must not be empty when creating an agent.
     #[error("Parameter configuration error: name or sysPrompt cannot be empty.")]
@@ -198,6 +201,26 @@ impl RuntimeAgentConfig {
     /// The runtime middleware chain.
     pub fn middleware(&self) -> &[Arc<dyn Middleware>] {
         &self.middleware
+    }
+
+    /// Returns a copy of this config with `middleware` appended.
+    ///
+    /// Java exposes hooks as a mutable `CopyOnWriteArrayList` so a backend can
+    /// attach one to an existing config (xxl-job appends its `PostReasoningEvent`
+    /// log hook in `XxlJobAgentScheduler`). Rust configs are immutable, so the
+    /// equivalent is a copy carrying the extra middleware: the caller's config
+    /// keeps its original chain.
+    pub fn with_middleware(&self, middleware: Arc<dyn Middleware>) -> Self {
+        let mut next = self.clone();
+        next.middleware.push(middleware);
+        next
+    }
+
+    /// Returns a copy with the model replaced.
+    pub fn with_model(&self, model: Arc<dyn Model>) -> Self {
+        let mut next = self.clone();
+        next.model = Some(model);
+        next
     }
 }
 
@@ -346,5 +369,26 @@ mod tests {
             .unwrap();
         let rt = RuntimeAgentConfig::from(cfg);
         assert_eq!(rt.name(), "A");
+    }
+
+    struct NoopMiddleware;
+
+    impl Middleware for NoopMiddleware {}
+
+    #[test]
+    fn with_middleware_returns_a_copy_and_keeps_the_original() {
+        let base = RuntimeAgentConfig::builder()
+            .name("A")
+            .model_name("m")
+            .build()
+            .unwrap();
+        assert!(base.middleware().is_empty());
+
+        let with_mw = base.with_middleware(Arc::new(NoopMiddleware));
+        assert_eq!(with_mw.middleware().len(), 1);
+        assert!(
+            base.middleware().is_empty(),
+            "with_middleware must not mutate the original config"
+        );
     }
 }
