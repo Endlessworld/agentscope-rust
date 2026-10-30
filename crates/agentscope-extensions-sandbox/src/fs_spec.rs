@@ -6,9 +6,15 @@
 //! [`SandboxFilesystem`] trait and the local `SandboxBackedFilesystem` helper. Rather than
 //! modifying the harness (out of scope for this crate), this module defines a small local
 //! equivalent — [`SandboxFilesystemSpec`] — that captures the same declarative surface
-//! (client + workspace projection + snapshot override + isolation scope) and an adapter
-//! ([`SandboxFilesystemAdapter`]) implementing the harness [`SandboxFilesystem`] trait through
-//! a live [`Sandbox`].
+//! (client + workspace projection + snapshot override + isolation scope + execution guard) and an
+//! adapter ([`SandboxFilesystemAdapter`]) implementing the harness [`SandboxFilesystem`] trait
+//! through a live [`Sandbox`].
+//!
+//! Workspace projection mirrors the Java `SandboxFilesystemSpec` exactly: when projection is
+//! enabled and a host workspace root is supplied, [`SandboxFilesystemSpec::layout_spec`] writes a
+//! [`WorkspaceProjectionEntry`] under [`WORKSPACE_PROJECTION_ENTRY_KEY`] into the harness
+//! [`LayoutSpec`] entry map, and [`SandboxFilesystemSpec::projection_payload`] turns it into the
+//! archive the sandbox hydrates at start (harness `WorkspaceProjectionApplier`).
 //!
 //! Design decision (tracker §4.2): the spec lives in this crate, not in the harness. If the
 //! harness later gains a `SandboxFilesystemSpec`, the four `*FilesystemSpec` types below can be
@@ -16,13 +22,15 @@
 //! `effective_workspace_spec` / `effective_snapshot_spec` / `build_context` surface.
 
 use std::fmt::Debug;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
 use agentscope_harness::agent::sandbox::{
-    NoopSnapshotSpec, Sandbox, SandboxClient, SandboxClientOptions, SandboxContext,
-    SandboxSnapshotSpec, SandboxState, WorkspaceSpec,
+    LayoutSpec, NoopSnapshotSpec, ProjectionPayload, Sandbox, SandboxClient, SandboxClientOptions,
+    SandboxContext, SandboxGuard, SandboxSnapshotSpec, SandboxState, WorkspaceProjectionApplier,
+    WorkspaceProjectionEntry, WorkspaceSpec,
 };
 use agentscope_harness::agent::IsolationScope;
 use agentscope_harness::filesystem::{
@@ -33,7 +41,7 @@ use async_trait::async_trait;
 use crate::agentrun::{agentrun_client, AgentRunSandboxClientOptions};
 use crate::daytona::{daytona_client, DaytonaSandboxClientOptions};
 use crate::e2b::{e2b_client, E2bSandboxClientOptions};
-use crate::error::{SandboxExtensionError, SandboxResult};
+use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::kubernetes::{kubernetes_client, KubernetesSandboxClientOptions};
 use crate::kubernetes_files::SandboxFileTransfer;
 use crate::remote::RemoteSandbox;
@@ -54,12 +62,49 @@ pub const DEFAULT_WORKSPACE_PROJECTION_ROOTS: [&str; 5] = [
 pub const DEFAULT_WORKSPACE_PROJECTION_DIRS: [&str; 4] =
     ["skills", "subagents", "knowledge", ".skills-cache"];
 
-/// Event name used to carry a projected entry inside a Java `WorkspaceSpec`.
+/// Event name used to carry a projected entry inside a workspace spec.
 ///
-/// Java stores projection entries in the workspace-spec map under this key. Rust keeps the
-/// workspace spec as typed fields, so the include roots are carried as directory entries
-/// instead. The constant is retained for parity / diagnostics.
+/// Mirrors the Java `SandboxFilesystemSpec` entry key: the projection entry is stored in the
+/// layout entry map under this name. Rust keeps the materialization-oriented `WorkspaceSpec`
+/// typed (root / directories / files), so the entry lives in the harness [`LayoutSpec`] returned
+/// by [`SandboxFilesystemSpec::layout_spec`], where the harness `WorkspaceProjectionApplier` picks
+/// it up.
 pub const WORKSPACE_PROJECTION_ENTRY_KEY: &str = "__workspace_projection__";
+
+/// Returns the default projection roots as owned strings (Java
+/// `SandboxFilesystemSpec.DEFAULT_WORKSPACE_PROJECTION_ROOTS`).
+pub fn default_workspace_projection_roots() -> Vec<String> {
+    DEFAULT_WORKSPACE_PROJECTION_ROOTS
+        .iter()
+        .map(|root| (*root).to_string())
+        .collect()
+}
+
+/// Absolutises `root` without touching the filesystem.
+///
+/// Mirrors the Java `hostWorkspaceRoot.toAbsolutePath().normalize()` call: relative roots are
+/// joined onto the current directory, and `.`/`..` segments are folded lexically (the host
+/// workspace may not exist yet, so `canonicalize` is not usable).
+fn absolute_path(root: &Path) -> PathBuf {
+    let joined = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(root))
+            .unwrap_or_else(|_| root.to_path_buf())
+    };
+    let mut folded = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                folded.pop();
+            }
+            other => folded.push(other.as_os_str()),
+        }
+    }
+    folded
+}
 
 /// Builds the default workspace spec: root plus the standard projection directories.
 pub fn default_workspace_spec(root: &str) -> WorkspaceSpec {
@@ -101,6 +146,103 @@ pub trait SandboxFilesystemSpec: Debug + Send + Sync {
 
     /// Returns the configured isolation scope, if any.
     fn isolation_scope(&self) -> Option<IsolationScope>;
+
+    /// Returns the execution guard applied to sandbox executions, if any.
+    ///
+    /// Mirrors the Java `SandboxFilesystemSpec#getExecutionGuard`. The guard is **retained**, not
+    /// applied here: hosts wire it into
+    /// `SandboxManager::with_shared_guard(spec.execution_guard().unwrap_or(noop))`, exactly where
+    /// Java passes it to `new SandboxManager(..., executionGuard)`.
+    fn execution_guard(&self) -> Option<Arc<dyn SandboxGuard>> {
+        None
+    }
+
+    /// Whether host workspace projection is enabled (Java
+    /// `workspaceProjectionEnabled`, default `true`).
+    fn workspace_projection_enabled(&self) -> bool {
+        true
+    }
+
+    /// Roots projected from the host workspace (Java `workspaceProjectionRoots`, default
+    /// [`DEFAULT_WORKSPACE_PROJECTION_ROOTS`]).
+    fn workspace_projection_roots(&self) -> Vec<String> {
+        default_workspace_projection_roots()
+    }
+
+    /// Builds the `__workspace_projection__` entry for `host_workspace_root`, if projection is on.
+    ///
+    /// Mirrors the Java `buildWorkspaceSpecWithProjection`: the source root is absolutised and the
+    /// include roots are the configured projection roots. `None` when projection is disabled or no
+    /// host workspace root is supplied (the Java `toSandboxContext()` overload passes `null`).
+    fn workspace_projection_entry(
+        &self,
+        host_workspace_root: Option<&Path>,
+    ) -> Option<(String, WorkspaceProjectionEntry)> {
+        if !self.workspace_projection_enabled() {
+            return None;
+        }
+        let host = host_workspace_root?;
+        Some((
+            WORKSPACE_PROJECTION_ENTRY_KEY.to_string(),
+            WorkspaceProjectionEntry {
+                ephemeral: false,
+                source_root: absolute_path(host).to_string_lossy().replace('\\', "/"),
+                include_roots: self.workspace_projection_roots(),
+            },
+        ))
+    }
+
+    /// Returns the harness [`LayoutSpec`] for this platform.
+    ///
+    /// This is the Rust analogue of the Java `WorkspaceSpec` entries map: when a host workspace
+    /// root is supplied and projection is enabled, the map really contains the
+    /// [`WORKSPACE_PROJECTION_ENTRY_KEY`] entry, so the harness `WorkspaceProjectionApplier` can
+    /// turn it into an archive at sandbox start.
+    fn layout_spec(&self, host_workspace_root: Option<&Path>) -> LayoutSpec {
+        let root = self
+            .workspace_spec()
+            .root
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut layout = LayoutSpec::new().with_root(root);
+        if let Some((key, entry)) = self.workspace_projection_entry(host_workspace_root) {
+            layout = layout.entry(key, entry);
+        }
+        layout
+    }
+
+    /// Builds the projection archive for `host_workspace_root`.
+    ///
+    /// Delegates to the harness `WorkspaceProjectionApplier`, the Rust counterpart of the Java
+    /// archive hydration performed inside `Sandbox#start()`. `Ok(None)` when projection is
+    /// disabled or nothing matches the include roots.
+    fn projection_payload(
+        &self,
+        host_workspace_root: &Path,
+    ) -> SandboxResult<Option<ProjectionPayload>> {
+        WorkspaceProjectionApplier::build(&self.layout_spec(Some(host_workspace_root))).map_err(
+            |e| {
+                SandboxExtensionError::Runtime(
+                    SandboxErrorCode::WorkspaceStartError,
+                    format!("workspace projection failed: {e}"),
+                )
+            },
+        )
+    }
+
+    /// Builds the harness [`SandboxContext`] plus the workspace-projection payload.
+    ///
+    /// Mirrors the Java `toSandboxContext(Path hostWorkspaceRoot)` call site in `HarnessAgent`:
+    /// the projection entry is written into the layout spec under
+    /// [`WORKSPACE_PROJECTION_ENTRY_KEY`] and the payload is what the sandbox hydrates at start.
+    fn build_context_with_projection(
+        &self,
+        host_workspace_root: &Path,
+    ) -> SandboxResult<(SandboxContext, Option<ProjectionPayload>)> {
+        let context = self.build_context()?;
+        let payload = self.projection_payload(host_workspace_root)?;
+        Ok((context, payload))
+    }
 
     /// Overrides the snapshot spec (builder-style).
     fn with_snapshot_spec(self, spec: Arc<dyn SandboxSnapshotSpec>) -> Self
@@ -697,11 +839,30 @@ impl Filesystem for SandboxFilesystemAdapter {
 }
 
 /// Shared builder state reused by every platform spec.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct SpecCommon {
     snapshot_override: Option<Arc<dyn SandboxSnapshotSpec>>,
     workspace_override: Option<WorkspaceSpec>,
     isolation_scope: Option<IsolationScope>,
+    /// Guard retained for the host (Java `executionGuard`).
+    execution_guard: Option<Arc<dyn SandboxGuard>>,
+    /// Whether host workspace projection is enabled (Java default: `true`).
+    workspace_projection_enabled: bool,
+    /// Roots projected from the host workspace (Java `workspaceProjectionRoots`).
+    workspace_projection_roots: Vec<String>,
+}
+
+impl Default for SpecCommon {
+    fn default() -> Self {
+        Self {
+            snapshot_override: None,
+            workspace_override: None,
+            isolation_scope: None,
+            execution_guard: None,
+            workspace_projection_enabled: true,
+            workspace_projection_roots: default_workspace_projection_roots(),
+        }
+    }
 }
 
 impl SpecCommon {
@@ -756,15 +917,45 @@ macro_rules! platform_spec {
                 self
             }
 
-            /// Adds an extra workspace-projection root.
+            /// Adds an extra workspace directory to create (not a Java
+            /// `workspaceProjectionRoots` entry — see `workspace_projection_roots`).
             pub fn add_projection_root(mut self, entry: impl Into<String>) -> Self {
                 self.extra_roots.push(entry.into());
                 self
             }
 
-            /// Returns the extra projection roots.
+            /// Returns the extra workspace directories (see `add_projection_root`).
             pub fn projection_roots(&self) -> &[String] {
                 &self.extra_roots
+            }
+
+            /// Sets the execution guard (mirrors the Java `executionGuard(...)`).
+            ///
+            /// The guard is retained on the spec so the host can hand it to
+            /// `SandboxManager::with_shared_guard`; read it back with
+            /// [`SandboxFilesystemSpec::execution_guard`].
+            pub fn with_execution_guard(mut self, guard: Arc<dyn SandboxGuard>) -> Self {
+                self.common.execution_guard = Some(guard);
+                self
+            }
+
+            /// Enables or disables host workspace projection (mirrors the Java
+            /// `workspaceProjectionEnabled(...)`; default `true`).
+            pub fn with_workspace_projection_enabled(mut self, enabled: bool) -> Self {
+                self.common.workspace_projection_enabled = enabled;
+                self
+            }
+
+            /// Replaces the projected include roots (mirrors the Java
+            /// `workspaceProjectionRoots(...)`; an empty list projects nothing).
+            pub fn with_workspace_projection_roots<I, S>(mut self, roots: I) -> Self
+            where
+                I: IntoIterator<Item = S>,
+                S: Into<String>,
+            {
+                self.common.workspace_projection_roots =
+                    roots.into_iter().map(Into::into).collect();
+                self
             }
 
             /// Returns the workspace root reported by the platform options.
@@ -807,6 +998,18 @@ macro_rules! platform_spec {
 
             fn isolation_scope(&self) -> Option<IsolationScope> {
                 self.common.isolation_scope
+            }
+
+            fn execution_guard(&self) -> Option<Arc<dyn SandboxGuard>> {
+                self.common.execution_guard.clone()
+            }
+
+            fn workspace_projection_enabled(&self) -> bool {
+                self.common.workspace_projection_enabled
+            }
+
+            fn workspace_projection_roots(&self) -> Vec<String> {
+                self.common.workspace_projection_roots.clone()
             }
 
             fn with_snapshot_spec(mut self, spec: Arc<dyn SandboxSnapshotSpec>) -> Self {
@@ -876,8 +1079,10 @@ platform_spec!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_harness::agent::sandbox::ExecResult;
-    use std::path::PathBuf;
+    use agentscope_harness::agent::sandbox::{
+        ExecResult, SandboxExecutionGuard, SandboxGuard, SandboxIsolationKey, WorkspaceEntry,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn shell_quote_handles_spaces() {
@@ -1026,6 +1231,154 @@ mod tests {
         assert!(context.client().is_some());
         assert_eq!(context.isolation_scope(), Some(&IsolationScope::Agent));
         assert!(context.workspace_spec().is_some());
+    }
+
+    #[test]
+    fn projection_entry_is_written_when_enabled() {
+        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default());
+        // No host root -> no entry (Java `toSandboxContext()` passes null).
+        assert!(spec.layout_spec(None).entries.is_empty());
+
+        let layout = spec.layout_spec(Some(Path::new("host-workspace")));
+        let entry = layout
+            .entries
+            .get(WORKSPACE_PROJECTION_ENTRY_KEY)
+            .expect("projection entry is written");
+        match entry {
+            WorkspaceEntry::WorkspaceProjection(projection) => {
+                assert_eq!(
+                    projection.include_roots,
+                    default_workspace_projection_roots()
+                );
+                assert!(projection.include_roots.contains(&"AGENTS.md".to_string()));
+                assert!(projection.source_root.ends_with("host-workspace"));
+                assert!(Path::new(&projection.source_root).is_absolute());
+                assert!(!projection.ephemeral);
+            }
+            other => panic!("expected a workspace projection entry, got {other:?}"),
+        }
+        assert_eq!(layout.root, spec.workspace_root());
+    }
+
+    #[test]
+    fn projection_entry_is_omitted_when_disabled() {
+        let spec = DaytonaFilesystemSpec::new(DaytonaSandboxClientOptions::default())
+            .with_workspace_projection_enabled(false);
+        assert!(!spec.workspace_projection_enabled());
+        assert!(spec
+            .layout_spec(Some(Path::new("/host/workspace")))
+            .entries
+            .is_empty());
+        assert!(spec
+            .projection_payload(Path::new("/host/workspace"))
+            .expect("disabled projection is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn projection_roots_are_configurable() {
+        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .with_workspace_projection_roots(["AGENTS.md".to_string(), "docs".to_string()]);
+        assert_eq!(
+            spec.workspace_projection_roots(),
+            vec!["AGENTS.md".to_string(), "docs".to_string()]
+        );
+        let layout = spec.layout_spec(Some(Path::new("/host/ws")));
+        match layout.entries.get(WORKSPACE_PROJECTION_ENTRY_KEY).unwrap() {
+            WorkspaceEntry::WorkspaceProjection(projection) => {
+                assert_eq!(projection.include_roots, vec!["AGENTS.md", "docs"]);
+                assert!(projection.source_root.ends_with("host/ws"));
+                assert!(!projection.source_root.contains('\\'));
+            }
+            other => panic!("expected a workspace projection entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_guard_is_retained() {
+        let guard: Arc<dyn SandboxGuard> = Arc::new(SandboxExecutionGuard::new());
+        let spec = AgentRunFilesystemSpec::new(AgentRunSandboxClientOptions::default())
+            .with_execution_guard(guard);
+        let retained = spec.execution_guard().expect("guard is retained");
+        let key = SandboxIsolationKey::new("user", "u1");
+        let _lease = retained.try_enter(key.clone()).await;
+        assert!(retained.is_held(&key));
+        retained.release(&key).await;
+        assert!(!retained.is_held(&key));
+    }
+
+    #[test]
+    fn every_platform_spec_accepts_guard_and_projection_settings() {
+        let guard: Arc<dyn SandboxGuard> = Arc::new(SandboxExecutionGuard::new());
+        let specs: Vec<Box<dyn SandboxFilesystemSpec>> = vec![
+            Box::new(
+                AgentRunFilesystemSpec::new(AgentRunSandboxClientOptions::default())
+                    .with_execution_guard(guard.clone())
+                    .with_workspace_projection_enabled(true)
+                    .with_workspace_projection_roots(["AGENTS.md"]),
+            ),
+            Box::new(
+                DaytonaFilesystemSpec::new(DaytonaSandboxClientOptions::default())
+                    .with_execution_guard(guard.clone())
+                    .with_workspace_projection_enabled(true)
+                    .with_workspace_projection_roots(["AGENTS.md"]),
+            ),
+            Box::new(
+                E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+                    .with_execution_guard(guard.clone())
+                    .with_workspace_projection_enabled(true)
+                    .with_workspace_projection_roots(["AGENTS.md"]),
+            ),
+            Box::new(
+                KubernetesFilesystemSpec::new(KubernetesSandboxClientOptions::default())
+                    .with_execution_guard(guard.clone())
+                    .with_workspace_projection_enabled(true)
+                    .with_workspace_projection_roots(["AGENTS.md"]),
+            ),
+        ];
+        for spec in &specs {
+            assert!(
+                spec.execution_guard().is_some(),
+                "{} lost its guard",
+                spec.platform()
+            );
+            assert!(spec.workspace_projection_enabled());
+            assert_eq!(spec.workspace_projection_roots(), vec!["AGENTS.md"]);
+            let layout = spec.layout_spec(Some(Path::new("/host/ws")));
+            assert!(layout.entries.contains_key(WORKSPACE_PROJECTION_ENTRY_KEY));
+        }
+        // Only the Kubernetes spec has usable default options (the other backends require
+        // credentials), so the context + payload path is exercised there.
+        let (context, payload) =
+            KubernetesFilesystemSpec::new(KubernetesSandboxClientOptions::default())
+                .with_workspace_projection_roots(["AGENTS.md"])
+                .build_context_with_projection(Path::new("/host/ws"))
+                .expect("context builds");
+        assert!(context.workspace_spec().is_some());
+        // `/host/ws` does not exist here, so nothing is projected.
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn projection_payload_projects_the_include_roots() {
+        let host = std::env::temp_dir().join(format!(
+            "agentscope-sandbox-projection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(host.join("skills")).unwrap();
+        std::fs::write(host.join("AGENTS.md"), b"hello agents").unwrap();
+        std::fs::write(host.join("skills/skill.md"), b"skill body").unwrap();
+
+        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .with_workspace_projection_roots(["AGENTS.md", "skills"]);
+        let payload = spec
+            .projection_payload(&host)
+            .expect("projection builds")
+            .expect("projection is not empty");
+        assert_eq!(payload.file_count, 2);
+        assert!(payload.tar_bytes.starts_with(b"AGENTS.md"));
+
+        std::fs::remove_dir_all(&host).unwrap();
     }
 
     /// Minimal fake sandbox used to exercise the filesystem adapter without a network.

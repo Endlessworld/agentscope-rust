@@ -5,13 +5,13 @@
 //! against the sandbox server's `POST /execute` endpoint.
 //!
 //! The Java client supports four connection strategies (direct / gateway / in-cluster /
-//! port-forward). Rust implements three of them explicitly — [`KubernetesConnectionStrategy`]
-//! `Direct` (a pre-configured router URL), `InCluster` (pod IP, then the per-sandbox service
-//! DNS name) and `Gateway` (the external address published on the Gateway CRD, or an injected
-//! address). Router-based strategies inject the `X-Sandbox-ID` / `X-Sandbox-Namespace` /
-//! `X-Sandbox-Port` / `X-Sandbox-Pod-IP` routing headers exactly like the Java
-//! `SandboxConnector`. `PortForwardStrategy` needs a fabric8 `LocalPortForward` equivalent and
-//! stays a recorded gap in the module tracker.
+//! port-forward) and Rust implements all four — [`KubernetesConnectionStrategy`] `Direct` (a
+//! pre-configured router URL), `InCluster` (pod IP, then the per-sandbox service DNS name),
+//! `Gateway` (the external address published on the Gateway CRD, or an injected address) and
+//! `PortForward` (a local tunnel to the router pod, resolved through the injected
+//! [`KubernetesPortForwarder`] seam — Rust has no fabric8 `LocalPortForward`). Router-based
+//! strategies inject the `X-Sandbox-ID` / `X-Sandbox-Namespace` / `X-Sandbox-Port` /
+//! `X-Sandbox-Pod-IP` routing headers exactly like the Java `SandboxConnector`.
 //!
 //! When [`KubernetesSandboxClientOptions::file_api_base_dir`] is set, workspace archives and
 //! single-file transfers go through the sandbox runtime file API
@@ -59,6 +59,12 @@ pub const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 pub const GATEWAY_API_VERSION: &str = "v1";
 /// Gateway API plural name (mirrors Java `Constants.GATEWAY_PLURAL`).
 pub const GATEWAY_PLURAL: &str = "gateways";
+/// Router service fronting every sandbox (mirrors Java `Constants.ROUTER_SERVICE_NAME`).
+pub const ROUTER_SERVICE_NAME: &str = "sandbox-router-svc";
+/// Port served by the router service (mirrors Java `Constants.ROUTER_PORT`).
+pub const ROUTER_PORT: u16 = 8080;
+/// Namespace the router lives in by default (mirrors Java `LocalTunnelConnectionConfig`).
+pub const DEFAULT_ROUTER_NAMESPACE: &str = "agent-sandbox-system";
 
 /// Router header carrying the sandbox (claim) id.
 pub const HEADER_SANDBOX_ID: &str = "X-Sandbox-ID";
@@ -72,8 +78,8 @@ pub const HEADER_SANDBOX_POD_IP: &str = "X-Sandbox-Pod-IP";
 /// How the sandbox HTTP endpoint is discovered (mirrors the Java `ConnectionStrategy` tree).
 ///
 /// Java has four strategies (`DirectStrategy`, `GatewayStrategy`, `InClusterStrategy`,
-/// `PortForwardStrategy`); Rust implements the first three — port-forwarding needs a fabric8
-/// `LocalPortForward` equivalent and remains a recorded gap.
+/// `PortForwardStrategy`); Rust implements all four. Port-forwarding is a seam rather than a
+/// fabric8 client: [`KubernetesPortForwarder`] supplies the local endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KubernetesConnectionStrategy {
     /// Use the pre-configured router API URL ([`KubernetesSandboxClientOptions::sandbox_api_url`]).
@@ -91,6 +97,14 @@ pub enum KubernetesConnectionStrategy {
     /// read from the Gateway CRD (`status.addresses[0].value`) or supplied by the caller via
     /// [`KubernetesSandboxClientOptions::gateway_address`] when the CRD is not readable.
     Gateway,
+    /// Tunnel to the router pod through a local port.
+    ///
+    /// Mirrors the Java `PortForwardStrategy` + `LocalTunnelConnectionConfig`: the port forward
+    /// targets the `sandbox-router-svc` pod on [`ROUTER_PORT`] and the connector base URL becomes
+    /// `http://<local host>:<local port>`. The tunnel itself is not a fabric8 client in Rust but
+    /// the injected [`KubernetesPortForwarder`]; selecting this strategy without a forwarder is a
+    /// configuration error (never a silent fallback to another strategy).
+    PortForward,
 }
 
 impl KubernetesConnectionStrategy {
@@ -100,14 +114,71 @@ impl KubernetesConnectionStrategy {
             KubernetesConnectionStrategy::Direct => "direct",
             KubernetesConnectionStrategy::InCluster => "in-cluster",
             KubernetesConnectionStrategy::Gateway => "gateway",
+            KubernetesConnectionStrategy::PortForward => "port-forward",
         }
     }
 
     /// Whether `X-Sandbox-*` router headers must be injected (Java
     /// `ConnectionStrategy#shouldInjectRouterHeaders`, `false` only for in-cluster).
+    ///
+    /// `PortForward` still talks to the router service (through the tunnel), so it injects them
+    /// exactly like `Direct`.
     pub fn should_inject_router_headers(self) -> bool {
         !matches!(self, KubernetesConnectionStrategy::InCluster)
     }
+}
+
+/// Local endpoint produced by a [`KubernetesPortForwarder`] (Java
+/// `PortForwardStrategy#connect` returns `http://127.0.0.1:<localPort>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedEndpoint {
+    /// Local host to dial (normally `127.0.0.1`).
+    pub local_host: String,
+    /// Local port bound by the tunnel (fabric8 `LocalPortForward#getLocalPort`).
+    pub local_port: u16,
+}
+
+impl ForwardedEndpoint {
+    /// Creates an endpoint from a host and port.
+    pub fn new(local_host: impl Into<String>, local_port: u16) -> Self {
+        Self {
+            local_host: local_host.into(),
+            local_port,
+        }
+    }
+
+    /// Renders `scheme://host:port`, bracketing IPv6 literals like the other strategies.
+    pub fn base_url(&self, scheme: &str) -> String {
+        format!(
+            "{}://{}:{}",
+            scheme.trim(),
+            host_for_url(self.local_host.trim()),
+            self.local_port
+        )
+    }
+}
+
+/// Minimal seam for the Java `PortForwardStrategy` (fabric8 `LocalPortForward`).
+///
+/// Java opens a fabric8 port-forward from `localhost:<localPort>` to the sandbox router pod and
+/// derives the connector base URL from it. Rust has no fabric8 client, so the tunnel is injected:
+/// implementations own whatever transport they have (a kube-rs port-forward, an out-of-process
+/// `kubectl port-forward` child, a test double) and report the local endpoint back.
+///
+/// Implementations should be **idempotent** for a given
+/// `(namespace, pod_name, remote_port)`: [`KubernetesBackend::connector_base_url`] may ask for the
+/// same tunnel more than once per sandbox and expects the same live endpoint back (Java caches the
+/// forward while `LocalPortForward#isAlive()`).
+#[async_trait::async_trait]
+pub trait KubernetesPortForwarder: std::fmt::Debug + Send + Sync {
+    /// Opens (or reuses) a tunnel from a local port to `remote_port` on `pod_name`.
+    async fn forward(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        pod_name: &str,
+        remote_port: u16,
+    ) -> SandboxResult<ForwardedEndpoint>;
 }
 
 /// Options for the Kubernetes sandbox client (mirrors `KubernetesSandboxClientOptions`).
@@ -140,6 +211,21 @@ pub struct KubernetesSandboxClientOptions {
     /// Used by the `Gateway` strategy when the Gateway CRD cannot be read (no RBAC / no
     /// `api_url`); the Java `GatewayStrategy` always reads the CRD.
     pub gateway_address: Option<String>,
+    /// Injected port-forwarder used by the `PortForward` strategy.
+    ///
+    /// Mirrors the Java `PortForwardStrategy` (fabric8 `LocalPortForward`). Rust has no fabric8
+    /// client, so the tunnel is a seam: selecting `PortForward` without a forwarder is a
+    /// configuration error and never falls back to another strategy.
+    pub port_forwarder: Option<Arc<dyn KubernetesPortForwarder>>,
+    /// Namespace of the router service targeted by the port-forward (Java
+    /// `LocalTunnelConnectionConfig.routerNamespace`, default [`DEFAULT_ROUTER_NAMESPACE`]).
+    pub port_forward_router_namespace: String,
+    /// Router pod to forward to.
+    ///
+    /// When `None` the pod name is read from the router service `Endpoints`
+    /// (`subsets[].addresses[].targetRef.name`, Java `PortForwardStrategy#resolveRouterPod`).
+    /// Set it explicitly when the `Endpoints` resource is not readable.
+    pub port_forward_pod: Option<String>,
     /// Bearer token for the Kubernetes API.
     pub api_token: Option<String>,
     /// Gateway name used to derive the connector base URL.
@@ -171,6 +257,9 @@ impl Default for KubernetesSandboxClientOptions {
             sandbox_api_url: None,
             connection_strategy: None,
             gateway_address: None,
+            port_forwarder: None,
+            port_forward_router_namespace: DEFAULT_ROUTER_NAMESPACE.to_string(),
+            port_forward_pod: None,
             api_token: None,
             gateway_name: None,
             gateway_namespace: None,
@@ -188,10 +277,11 @@ impl KubernetesSandboxClientOptions {
     /// Resolves the effective connection strategy.
     ///
     /// An explicit [`Self::connection_strategy`] wins; otherwise the Java priority order is
-    /// reproduced: a pre-configured router URL (`Direct`), then a gateway name (`Gateway`),
-    /// then in-cluster. Java falls back to `LocalTunnelConnectionConfig` (port-forward) for the
-    /// last case; Rust has no fabric8 `LocalPortForward` equivalent, so it joins the sandbox
-    /// pod/service directly — the difference is recorded in the module tracker.
+    /// reproduced: a pre-configured router URL (`Direct`), then a gateway name (`Gateway`), then
+    /// in-cluster. Java falls back to `LocalTunnelConnectionConfig` (port-forward) for the last
+    /// case; Rust keeps `InCluster` as the default because the tunnel would otherwise require an
+    /// injected [`KubernetesPortForwarder`] — `PortForward` is therefore only selected explicitly
+    /// (tracked difference, see the module tracker).
     pub fn resolve_connection_strategy(&self) -> KubernetesConnectionStrategy {
         if let Some(strategy) = self.connection_strategy {
             return strategy;
@@ -352,6 +442,10 @@ pub fn parse_claim_status(value: &Value) -> KubernetesClaimStatus {
 /// * [`KubernetesConnectionStrategy::Gateway`] — `scheme://<gatewayAddress>` from the Gateway
 ///   CRD status address (Java `GatewayStrategy#formatUrl`; the port is **not** appended, IPv6
 ///   literals are bracketed).
+/// * [`KubernetesConnectionStrategy::PortForward`] — not resolvable here: the tunnel is async and
+///   needs the injected forwarder, so use [`resolve_port_forward_base_url`] (or
+///   [`KubernetesBackend::connector_base_url`]). Passing it to this function is a configuration
+///   error, never a silent fallback to in-cluster.
 ///
 /// `sandbox_id` is the sandbox resource name when available (`status.sandbox.name`) and the
 /// claim name otherwise.
@@ -417,7 +511,52 @@ pub fn resolve_connector_base_url(
                 host_for_url(address)
             ))
         }
+        KubernetesConnectionStrategy::PortForward => Err(SandboxExtensionError::Configuration(
+            "Kubernetes PortForward strategy needs the async port-forward seam; call \
+             resolve_port_forward_base_url (or KubernetesBackend::connector_base_url) instead of \
+             resolve_connector_base_url"
+                .to_string(),
+        )),
     }
+}
+
+/// Resolves the connector base URL for [`KubernetesConnectionStrategy::PortForward`].
+///
+/// Mirrors the Java `PortForwardStrategy#connect`: the router pod is port-forwarded on
+/// [`ROUTER_PORT`] and the base URL becomes the local endpoint (`http://127.0.0.1:<port>`).
+/// Unlike Java there is no implicit fabric8 client, so a missing
+/// [`KubernetesSandboxClientOptions::port_forwarder`] is reported as a configuration error — the
+/// caller never silently gets another strategy's URL.
+pub async fn resolve_port_forward_base_url(
+    options: &KubernetesSandboxClientOptions,
+    sandbox_id: &str,
+    pod_name: &str,
+) -> SandboxResult<String> {
+    let forwarder = options.port_forwarder.as_ref().ok_or_else(|| {
+        SandboxExtensionError::Configuration(
+            "Kubernetes PortForward strategy requires an injected port forwarder \
+             (KubernetesSandboxClientOptions::port_forwarder); refusing to fall back to another \
+             strategy"
+                .to_string(),
+        )
+    })?;
+    let pod = pod_name.trim();
+    if pod.is_empty() {
+        return Err(SandboxExtensionError::Configuration(
+            "Kubernetes PortForward strategy needs the router pod name \
+             (KubernetesSandboxClientOptions::port_forward_pod or the sandbox-router-svc Endpoints)"
+                .to_string(),
+        ));
+    }
+    let endpoint = forwarder
+        .forward(
+            sandbox_id,
+            &options.port_forward_router_namespace,
+            pod,
+            ROUTER_PORT,
+        )
+        .await?;
+    Ok(endpoint.base_url("http"))
 }
 
 /// Renders a host for URL interpolation, bracketing IPv6 literals (Java
@@ -443,6 +582,32 @@ pub fn parse_gateway_address(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
+}
+
+/// Extracts the first ready router pod name from an `Endpoints` resource
+/// (`subsets[].addresses[].targetRef.name`).
+///
+/// Mirrors the Java `PortForwardStrategy#resolveRouterPod`: subsets without addresses are
+/// skipped, and addresses without a `targetRef.name` are ignored.
+pub fn parse_endpoint_target_pod(value: &Value) -> Option<String> {
+    let subsets = value.get("subsets")?.as_array()?;
+    for subset in subsets {
+        let Some(addresses) = subset.get("addresses").and_then(Value::as_array) else {
+            continue;
+        };
+        for address in addresses {
+            let name = address
+                .get("targetRef")
+                .and_then(|target| target.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if let Some(name) = name {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Builds the `X-Sandbox-*` router headers injected for router-based strategies.
@@ -594,9 +759,66 @@ impl KubernetesBackend {
         }
     }
 
+    /// Resolves the router pod targeted by the `PortForward` strategy.
+    ///
+    /// An injected [`KubernetesSandboxClientOptions::port_forward_pod`] wins (the escape hatch for
+    /// clusters where the `Endpoints` resource is not readable); otherwise the pod name is read
+    /// from `GET /api/v1/namespaces/{ns}/endpoints/sandbox-router-svc` →
+    /// `subsets[].addresses[].targetRef.name`, mirroring the Java
+    /// `PortForwardStrategy#resolveRouterPod`. A failed read is reported as `Ok(None)` so the
+    /// caller raises a configuration error instead of a transport error.
+    pub async fn resolve_router_pod(&self) -> SandboxResult<Option<String>> {
+        if let Some(pod) = self
+            .options
+            .port_forward_pod
+            .as_deref()
+            .map(str::trim)
+            .filter(|pod| !pod.is_empty())
+        {
+            return Ok(Some(pod.to_string()));
+        }
+        if self
+            .options
+            .api_url
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let path = format!(
+            "/api/v1/namespaces/{}/endpoints/{ROUTER_SERVICE_NAME}",
+            self.options.port_forward_router_namespace
+        );
+        match self.k8s_request(reqwest::Method::GET, &path, None).await {
+            Ok(value) => Ok(parse_endpoint_target_pod(&value)),
+            Err(err) => {
+                tracing::warn!("kubernetes: failed to read {ROUTER_SERVICE_NAME} endpoints: {err}");
+                Ok(None)
+            }
+        }
+    }
+
     /// Resolves the sandbox HTTP base URL for `handle` according to the effective strategy.
+    ///
+    /// `PortForward` is handled before the synchronous resolver: it needs the async tunnel and
+    /// the router pod, and a missing forwarder/pod is a configuration error (never a silent
+    /// fallback to `InCluster`).
     pub async fn connector_base_url(&self, handle: &RemoteSandboxHandle) -> SandboxResult<String> {
         let strategy = self.connection_strategy();
+        let sandbox_id = Self::sandbox_id_of(handle);
+        if strategy == KubernetesConnectionStrategy::PortForward {
+            let pod = self.resolve_router_pod().await?.ok_or_else(|| {
+                SandboxExtensionError::Configuration(format!(
+                    "Kubernetes PortForward strategy could not resolve the router pod \
+                     (KubernetesSandboxClientOptions::port_forward_pod or the {ROUTER_SERVICE_NAME} \
+                     Endpoints in namespace {})",
+                    self.options.port_forward_router_namespace
+                ))
+            })?;
+            return resolve_port_forward_base_url(&self.options, &sandbox_id, &pod).await;
+        }
         let gateway_address = if strategy == KubernetesConnectionStrategy::Gateway {
             self.resolve_gateway_address().await?
         } else {
@@ -605,7 +827,7 @@ impl KubernetesBackend {
         resolve_connector_base_url(
             &self.options,
             strategy,
-            &Self::sandbox_id_of(handle),
+            &sandbox_id,
             handle.extra.get("pod_ip").map(String::as_str),
             gateway_address.as_deref(),
         )
@@ -1601,5 +1823,205 @@ mod tests {
             backend.exec_in(&handle, "ls", None, 5).await.unwrap_err(),
             SandboxExtensionError::Configuration(_)
         ));
+    }
+
+    /// Port-forward test double recording every request.
+    #[derive(Debug)]
+    struct FakePortForwarder {
+        endpoint: std::result::Result<ForwardedEndpoint, String>,
+        calls: std::sync::Mutex<Vec<(String, String, String, u16)>>,
+    }
+
+    impl FakePortForwarder {
+        fn new(endpoint: std::result::Result<ForwardedEndpoint, String>) -> Self {
+            Self {
+                endpoint,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String, String, u16)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KubernetesPortForwarder for FakePortForwarder {
+        async fn forward(
+            &self,
+            sandbox_id: &str,
+            namespace: &str,
+            pod_name: &str,
+            remote_port: u16,
+        ) -> SandboxResult<ForwardedEndpoint> {
+            self.calls.lock().unwrap().push((
+                sandbox_id.to_string(),
+                namespace.to_string(),
+                pod_name.to_string(),
+                remote_port,
+            ));
+            self.endpoint
+                .clone()
+                .map_err(SandboxExtensionError::Transport)
+        }
+    }
+
+    #[tokio::test]
+    async fn port_forward_strategy_uses_the_forwarder_local_endpoint() {
+        let forwarder = Arc::new(FakePortForwarder::new(Ok(ForwardedEndpoint::new(
+            "127.0.0.1",
+            54321,
+        ))));
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            connection_strategy: Some(KubernetesConnectionStrategy::PortForward),
+            port_forwarder: Some(forwarder.clone()),
+            port_forward_pod: Some("router-abc".to_string()),
+            file_api_base_dir: String::new(),
+            ..Default::default()
+        })
+        .unwrap();
+        let base = backend
+            .connector_base_url(&handle_with_pod_ip("10.0.0.5"))
+            .await
+            .expect("the forwarded endpoint wins");
+        assert_eq!(base, "http://127.0.0.1:54321");
+        // The tunnel targets the router pod on the router port, in the router namespace.
+        assert_eq!(
+            forwarder.calls(),
+            vec![(
+                "sandbox-1".to_string(),
+                DEFAULT_ROUTER_NAMESPACE.to_string(),
+                "router-abc".to_string(),
+                ROUTER_PORT
+            )]
+        );
+        // The tunnel still fronts the router, so the routing headers are injected.
+        let headers = backend.router_headers(&handle_with_pod_ip("10.0.0.5"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == HEADER_SANDBOX_ID && v == "sandbox-1"));
+    }
+
+    #[tokio::test]
+    async fn port_forward_strategy_without_a_forwarder_is_a_configuration_error() {
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            connection_strategy: Some(KubernetesConnectionStrategy::PortForward),
+            port_forward_pod: Some("router-abc".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let err = backend
+            .connector_base_url(&handle_with_pod_ip("10.0.0.5"))
+            .await
+            .expect_err("no forwarder means no base url");
+        match err {
+            SandboxExtensionError::Configuration(message) => {
+                assert!(
+                    message.contains("port_forwarder"),
+                    "unexpected message: {message}"
+                );
+                // Crucially, it must not fall back to the in-cluster pod IP URL.
+                assert!(!message.contains("10.0.0.5"));
+            }
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+        // The synchronous resolver never silently reroutes a port-forward request either.
+        assert!(matches!(
+            resolve_connector_base_url(
+                &KubernetesSandboxClientOptions::default(),
+                KubernetesConnectionStrategy::PortForward,
+                "sandbox-1",
+                Some("10.0.0.5"),
+                None
+            ),
+            Err(SandboxExtensionError::Configuration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn port_forward_forwarder_errors_are_propagated() {
+        let forwarder = Arc::new(FakePortForwarder::new(Err(
+            "tunnel refused by the API server".to_string(),
+        )));
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            connection_strategy: Some(KubernetesConnectionStrategy::PortForward),
+            port_forwarder: Some(forwarder),
+            port_forward_pod: Some("router-abc".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let err = backend
+            .connector_base_url(&handle_with_pod_ip("10.0.0.5"))
+            .await
+            .expect_err("forwarder failure must surface");
+        assert!(
+            format!("{err}").contains("tunnel refused by the API server"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_forward_router_pod_is_read_from_endpoints() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let endpoints = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/api/v1/namespaces/agent-sandbox-system/endpoints/sandbox-router-svc");
+                then.status(200).json_body(json!({
+                    "subsets": [{
+                        "addresses": [{
+                            "ip": "10.0.0.9",
+                            "targetRef": {"kind": "Pod", "name": "router-abc"}
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let forwarder = Arc::new(FakePortForwarder::new(Ok(ForwardedEndpoint::new(
+            "127.0.0.1",
+            41000,
+        ))));
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            connection_strategy: Some(KubernetesConnectionStrategy::PortForward),
+            api_url: Some(server.base_url()),
+            port_forwarder: Some(forwarder.clone()),
+            file_api_base_dir: String::new(),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            backend
+                .connector_base_url(&handle_with_pod_ip("10.0.0.5"))
+                .await
+                .unwrap(),
+            "http://127.0.0.1:41000"
+        );
+        endpoints.assert_async().await;
+        assert_eq!(forwarder.calls()[0].2, "router-abc");
+    }
+
+    #[test]
+    fn forwarded_endpoint_renders_http_and_brackets_ipv6() {
+        assert_eq!(
+            ForwardedEndpoint::new("127.0.0.1", 49152).base_url("http"),
+            "http://127.0.0.1:49152"
+        );
+        assert_eq!(
+            ForwardedEndpoint::new(" ::1 ", 9).base_url("http"),
+            "http://[::1]:9"
+        );
+        assert_eq!(
+            parse_endpoint_target_pod(&json!({"subsets": [{"addresses": []}, {}]})),
+            None
+        );
+        assert_eq!(
+            parse_endpoint_target_pod(&json!({"subsets": [
+                {"addresses": [{"ip": "1.2.3.4"}]},
+                {"addresses": [{"targetRef": {"name": " router-2 "}}]}
+            ]})),
+            Some("router-2".to_string())
+        );
     }
 }
