@@ -35,6 +35,15 @@ pub enum MysqlError {
     /// Internal consistency failure (e.g. lock bookkeeping).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// No usable database driver: the `mysql_async` feature is off, the URL is invalid, or
+    /// the server could not be reached.
+    ///
+    /// The driver-backed backend ([`crate::MysqlAsyncBackend`]) reports this **at
+    /// construction**, so a missing driver or an unreachable server can never be mistaken
+    /// for a working store that silently drops writes.
+    #[error("mysql driver unavailable: {0}")]
+    DriverUnavailable(String),
 }
 
 impl MysqlError {

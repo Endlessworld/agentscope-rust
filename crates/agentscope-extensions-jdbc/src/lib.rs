@@ -7,11 +7,18 @@
 //!
 //! # Execution backends
 //!
-//! Only [`backend::RusqliteExecutor`] (SQLite, including in-memory) ships with this crate; the
-//! MySQL / PostgreSQL / H2 dialects have **no bundled executor**. `agentscope-extensions-mysql`
-//! and `-postgresql` still exist as independent crates (they are *not* replaced by this one), and
-//! neither provides an [`backend::JdbcExecutor`]. To run these components against a real server,
-//! the driver crate or the host must supply an executor, which **must** override:
+//! * [`backend::RusqliteExecutor`] — SQLite (including in-memory), always built, fully offline;
+//!   mirrors the Java H2/SQLite test backends.
+//! * `backend::driver::PostgresExecutor` — real PostgreSQL over `tokio-postgres`, opt-in via the
+//!   `postgres-executor` feature (`backend::driver::connect_postgres`). It implements
+//!   `in_transaction` atomically and `open_native_lock_session` (`pg_try_advisory_lock`).
+//! * MySQL — [`backend::driver::MysqlSqlClient`] over `mysql_async`, opt-in via the
+//!   `mysql-executor` feature (`backend::driver::connect_mysql`,
+//!   `backend::driver::mysql_executor_from_env`). Same threading model as PostgreSQL; every
+//!   native-lock lease opens its own connection and speaks `GET_LOCK` / `RELEASE_LOCK` /
+//!   `IS_USED_LOCK`.
+//!
+//! An executor written outside this crate **must** override:
 //! * [`backend::JdbcExecutor::in_transaction`] — the default is non-transactional, and
 //!   [`skill`] writes two tables inside one transaction;
 //! * [`backend::JdbcExecutor::open_native_lock_session`] — server-scoped advisory locks
@@ -30,8 +37,10 @@
 //!    [`dialect::BoundSql`] returned by dialect methods.
 //! 3. **Dialect layer** — [`dialect::AbstractJdbcDialect`] implements all table-domain
 //!    traits (`StoreDialect`, `SessionStateDialect`, `SnapshotDialect`, `SkillDialect`,
-//!    `SkillResourcesDialect`) plus the lock strategy. Holds a unified table prefix +
-//!    per-table overrides.
+//!    `SkillResourcesDialect`). Lock strategies are **separate** types
+//!    ([`sandbox::TableLockStrategy`], [`dialect::MysqlNativeLockStrategy`],
+//!    [`dialect::PostgresNativeLockStrategy`]) because advisory locks are session-scoped and a
+//!    dialect carries no connection.
 //! 4. **Vendor layer** — one type per database ([`dialect::vendor`]), overriding only DDL
 //!    and divergent SQL syntax.
 //!
@@ -50,9 +59,10 @@
 //! # Execution backend
 //!
 //! Java components take a `javax.sql.DataSource`. Rust has no universal JDBC surface, so
-//! components depend on the [`backend::JdbcExecutor`] trait. The only backend shipped here is
-//! [`backend::RusqliteExecutor`] (SQLite, including in-memory), which mirrors the Java H2/SQLite
-//! test backends; see "Execution backends" above for what a MySQL/PostgreSQL executor owes.
+//! components depend on the [`backend::JdbcExecutor`] trait. Three backends ship here —
+//! [`backend::RusqliteExecutor`] (always) plus `backend::driver::PostgresExecutor`
+//! (`postgres-executor`) and `backend::driver::MysqlExecutor` (`mysql-executor`); see
+//! "Execution backends" above for what an out-of-crate executor owes.
 
 pub mod backend;
 pub mod dialect;
@@ -65,6 +75,15 @@ pub mod store;
 
 pub use backend::{
     ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor, SharedExecutor,
+};
+pub use backend::driver::{DriverExecutor, SqlClient};
+#[cfg(feature = "postgres-executor")]
+pub use backend::driver::{
+    connect_postgres, postgres_executor_from_env, PostgresExecutor, POSTGRES_URL_ENV,
+};
+#[cfg(feature = "mysql-executor")]
+pub use backend::driver::{
+    connect_mysql, mysql_executor_from_env, MysqlExecutor, MYSQL_URL_ENV,
 };
 pub use distributed_store::JdbcDistributedStore;
 pub use sandbox::{

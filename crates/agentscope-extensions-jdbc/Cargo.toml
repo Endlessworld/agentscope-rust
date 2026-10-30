@@ -5,6 +5,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# The default build pulls in **no** driver crate and compiles/tests fully offline against
+# SQLite (`RusqliteExecutor`). Driver backends are opt-in:
+default = []
+# Real PostgreSQL backend (`backend::driver::PostgresSqlClient`, `connect_postgres`).
+# Enables the env-gated integration tests in `tests/postgres_integration_tests.rs` too.
+postgres-executor = ["dep:tokio-postgres"]
+# Real MySQL backend (`backend::driver::MysqlSqlClient`, `connect_mysql`) with native
+# `GET_LOCK` / `RELEASE_LOCK` sessions. Enables the env-gated integration tests in
+# `tests/mysql_integration_tests.rs` too.
+mysql-executor = ["dep:mysql_async"]
+
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
@@ -29,6 +41,16 @@ rusqlite = { workspace = true }
 # advisory-lock key folding). `sha2` is already a workspace-pinned dependency; referenced
 # by name here, not added to the root [workspace.dependencies].
 sha2 = { workspace = true }
+# Real PostgreSQL driver, only with `feature = "postgres-executor"` (see [features]).
+# `tokio-postgres` is workspace-registered and already resolved in `Cargo.lock`, so enabling
+# the feature needs no lockfile change; its default `runtime` feature is exactly the
+# `Config::connect` + background-connection-task support this backend needs.
+tokio-postgres = { workspace = true, optional = true }
+# Real MySQL driver, only with `feature = "mysql-executor"` (see [features]). The workspace
+# pin is `mysql_async = "0.37"` and the crate is already resolved in `Cargo.lock` (through
+# `agentscope-extensions-mysql`), with its sources present in the local registry, so enabling
+# the feature adds a dependency edge only — no new crate, no network fetch.
+mysql_async = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Ground-truth SHA-256 for the native-lock key/name assertions (same pinned version as the

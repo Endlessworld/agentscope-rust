@@ -49,6 +49,13 @@ pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
     }
 
     /// Table-existence probe (used when schema auto-creation is disabled).
+    ///
+    /// **Fail-closed sentinel.** The default returns **no rows even for an existing table**, so
+    /// [`crate::state::JdbcAgentStateStore::verify_table_exists`] — which treats an empty result
+    /// as "missing" — reports the table as missing instead of silently accepting it. Every
+    /// vendor dialect (ANSI/H2, MySQL, PostgreSQL, SQLite) overrides this with a real
+    /// `information_schema` / `sqlite_master` probe; a new vendor that forgets to override
+    /// therefore fails loudly at start-up rather than quietly believing a missing table exists.
     fn session_state_check_table_exists(&self, table_name: &str) -> BoundSql {
         BoundSql::new(
             format!("SELECT 1 FROM {table_name} WHERE 1 = 0"),

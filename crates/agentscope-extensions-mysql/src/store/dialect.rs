@@ -138,7 +138,7 @@ impl StoreDialect for PostgresStoreDialect {
 
     fn create_table_sql(&self) -> &'static str {
         "CREATE TABLE IF NOT EXISTS {table} (\
-           namespace_path VARCHAR(512) NOT NULL,\
+           namespace_path VARCHAR(2048) NOT NULL,\
            item_key       VARCHAR(255) NOT NULL,\
            value_json     TEXT         NOT NULL,\
            version        BIGINT       NOT NULL,\
@@ -218,7 +218,7 @@ impl StoreDialect for H2StoreDialect {
 
     fn create_table_sql(&self) -> &'static str {
         "CREATE TABLE IF NOT EXISTS {table} (\
-           namespace_path VARCHAR(512) NOT NULL,\
+           namespace_path VARCHAR(2048) NOT NULL,\
            item_key       VARCHAR(255) NOT NULL,\
            value_json     CLOB         NOT NULL,\
            version        BIGINT       NOT NULL,\
@@ -381,5 +381,17 @@ mod tests {
                 d.name()
             );
         }
+    }
+
+    /// `namespace_path` lengths follow each vendor class: MySQL is capped at 512 because the
+    /// composite primary key must stay under InnoDB's 3072-byte utf8mb4 limit, while
+    /// PostgreSQL and H2 use 2048 exactly like the Java dialects (SQLite has no limit).
+    #[test]
+    fn namespace_path_length_matches_each_java_dialect() {
+        let ddl_of = |d: &dyn StoreDialect| d.create_table_sql().to_string();
+        assert!(ddl_of(&MysqlStoreDialect).contains("namespace_path VARCHAR(512)"));
+        assert!(ddl_of(&PostgresStoreDialect).contains("namespace_path VARCHAR(2048)"));
+        assert!(ddl_of(&H2StoreDialect).contains("namespace_path VARCHAR(2048)"));
+        assert!(ddl_of(&SqliteStoreDialect).contains("namespace_path TEXT"));
     }
 }

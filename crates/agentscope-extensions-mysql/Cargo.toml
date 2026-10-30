@@ -5,15 +5,39 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# The default build stays dependency-light: the crate compiles and its unit tests run
+# without a MySQL server. Enable `mysql_async` to pull in the real driver adapter
+# (`driver::MysqlAsyncBackend`), which implements all four backend traits.
+default = []
+mysql_async = ["dep:mysql_async"]
+# JDBC façade over MySQL (`jdbc_bridge`): `MysqlJdbcStore` wraps
+# `JdbcDistributedStore::create_with_dialect_and_schema` around the MySQL executor owned by
+# `agentscope-extensions-jdbc`. Enabling it turns on that crate's `mysql-executor` feature.
+# The dependency points this way (mysql → jdbc) because jdbc must stay driver-agnostic.
+jdbc-bridge = [
+    "dep:agentscope-extensions-jdbc",
+    "agentscope-extensions-jdbc/mysql-executor",
+]
+
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
 agentscope-harness = { path = "../agentscope-harness" }
+# JDBC façade bridge (optional, feature = "jdbc-bridge"); see [features].
+agentscope-extensions-jdbc = { path = "../agentscope-extensions-jdbc", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+# Real MySQL driver (optional, feature = "mysql_async").
+mysql_async = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Drives the async `AgentStateStore` / `RemoteSnapshotClient` methods in the live MySQL
+# integration tests (the backend seams themselves are synchronous).
+futures = { workspace = true }
 

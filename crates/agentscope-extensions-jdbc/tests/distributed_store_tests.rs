@@ -246,3 +246,39 @@ fn schema_creation_can_be_disabled() {
         "disabling schema creation must fail on an empty database"
     );
 }
+
+#[tokio::test]
+async fn reopen_with_auto_create_disabled_accepts_the_existing_schema() {
+    // Java: DialectBuilderTableGroupsTest.reopenWithAutoCreateFalse — the builder's
+    // `autoCreateTable(false)` path must succeed when a previous run already created the
+    // tables (it verifies, it does not create). Dedicated case so the guarantee is not left
+    // as an implicit side effect of the skill repository's setup helper.
+    let executor = Arc::new(RusqliteExecutor::in_memory().unwrap());
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+
+    let first = JdbcDistributedStore::create_with_dialect_and_schema(
+        executor.clone(),
+        dialect.clone(),
+        true,
+    )
+    .expect("the first open creates the schema");
+    let mut value = serde_json::Map::new();
+    value.insert("v".to_string(), serde_json::json!(1));
+    first.base_store().put(&ns(&["reopen"]), "k", value);
+    drop(first);
+
+    // Re-open the *same* database with auto-creation off: verification must pass and the
+    // component must keep working against the tables the first open left behind.
+    let reopened = JdbcDistributedStore::create_with_dialect_and_schema(
+        executor,
+        dialect,
+        false,
+    )
+    .expect("re-opening an existing schema with auto-create off must succeed");
+    let item = reopened
+        .base_store()
+        .get(&ns(&["reopen"]), "k")
+        .expect("the data written by the first open must still be there");
+    assert_eq!(item.value.get("v"), Some(&serde_json::json!(1)));
+}
+

@@ -25,6 +25,15 @@ use crate::error::{MysqlError, MysqlResult};
 /// Default lock-name prefix, mirroring `DEFAULT_KEY_PREFIX`.
 pub const DEFAULT_KEY_PREFIX: &str = "agentscope:sandbox:lock:";
 
+/// Default lock acquisition timeout, mirroring Java
+/// `JdbcSandboxExecutionGuard.DEFAULT_LOCK_TIMEOUT_SECONDS = 1800` (30 minutes).
+///
+/// The previous Rust default was 30s. A shorter timeout turns a busy-but-healthy lock into
+/// a spurious "contention failed" result for long-running sandbox work, so the default now
+/// matches Java; callers who want a fail-fast lease narrow it with
+/// [`MysqlSandboxExecutionGuardBuilder::lock_timeout`].
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1800);
+
 /// Maximum lock-name length accepted by MySQL `GET_LOCK()`.
 ///
 /// Mirrors the `raw.length() <= 64` guard in `JdbcSandboxExecutionGuard#composeLockName`.
@@ -206,7 +215,7 @@ impl MysqlSandboxExecutionGuard {
         MysqlSandboxExecutionGuardBuilder {
             backend,
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
-            lock_timeout: Duration::from_secs(30),
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
         }
     }
 
@@ -238,6 +247,7 @@ impl MysqlSandboxExecutionGuard {
     pub fn try_enter(&self, key: &SandboxIsolationKey) -> MysqlResult<MysqlLockLease> {
         let lock_name = self.compose_lock_name(key);
         if self.backend.try_acquire(&lock_name, self.lock_timeout)? {
+            tracing::debug!(lock = %lock_name, "acquired MySQL advisory lock");
             *self
                 .active
                 .lock()
@@ -251,6 +261,11 @@ impl MysqlSandboxExecutionGuard {
                 active: Arc::clone(&self.active),
             })
         } else {
+            tracing::warn!(
+                lock = %lock_name,
+                timeout_secs = self.lock_timeout.as_secs(),
+                "MySQL advisory lock acquisition timed out"
+            );
             Err(MysqlError::LockTimeout(format!(
                 "{lock_name} (timeout={}s)",
                 self.lock_timeout.as_secs()
@@ -261,6 +276,7 @@ impl MysqlSandboxExecutionGuard {
     /// Releases a lease held for the given isolation key (by composed name).
     pub fn release(&self, key: &SandboxIsolationKey) {
         let lock_name = self.compose_lock_name(key);
+        tracing::debug!(lock = %lock_name, "releasing MySQL advisory lock");
         let _ = self.backend.release_lock(&lock_name);
         MysqlLockLease::decrement_active(&self.active, &lock_name);
     }
@@ -370,7 +386,7 @@ impl MysqlSandboxExecutionGuardBuilder {
         Ok(self)
     }
 
-    /// Overrides the lock acquisition timeout (default: 30s).
+    /// Overrides the lock acquisition timeout (default: [`DEFAULT_LOCK_TIMEOUT`], 1800s).
     pub fn lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
         self
@@ -403,6 +419,18 @@ mod tests {
 
     fn guard() -> MysqlSandboxExecutionGuard {
         MysqlSandboxExecutionGuard::builder(Arc::new(InMemoryLockBackend::default())).build()
+    }
+
+    /// Java's `JdbcSandboxExecutionGuard.Builder` defaults to 1800s; a shorter Rust default
+    /// made long sandbox runs report "contention" instead of waiting their turn.
+    #[test]
+    fn default_lock_timeout_matches_java() {
+        assert_eq!(DEFAULT_LOCK_TIMEOUT, Duration::from_secs(1800));
+        assert_eq!(guard().lock_timeout, DEFAULT_LOCK_TIMEOUT);
+        let narrowed = MysqlSandboxExecutionGuard::builder(Arc::new(InMemoryLockBackend::default()))
+            .lock_timeout_seconds(5)
+            .build();
+        assert_eq!(narrowed.lock_timeout, Duration::from_secs(5));
     }
 
     #[test]

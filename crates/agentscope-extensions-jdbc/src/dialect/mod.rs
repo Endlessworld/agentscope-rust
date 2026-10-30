@@ -7,9 +7,13 @@
 //! 2. **Component layer** — [`crate::JdbcStore`], [`crate::JdbcAgentStateStore`],
 //!    [`crate::JdbcSnapshotSpec`], [`crate::JdbcSandboxExecutionGuard`]. Zero inline
 //!    SQL — all SQL sourced from [`BoundSql`] returned by dialect methods.
-//! 3. **Dialect layer** — [`AbstractJdbcDialect`] implements all table-domain traits
-//!    and the [`SandboxLockStrategy`] contract. Holds a unified table prefix +
-//!    per-table overrides.
+//! 3. **Dialect layer** — [`AbstractJdbcDialect`] aggregates the table-domain traits
+//!    ([`StoreDialect`], [`SessionStateDialect`], [`SnapshotDialect`], [`SkillDialect`],
+//!    [`SkillResourcesDialect`]) and holds a unified table prefix + per-table overrides.
+//!    The lock contract is **not** part of it: [`SandboxLockStrategy`] implementations are
+//!    separate types ([`crate::sandbox::TableLockStrategy`], [`MysqlNativeLockStrategy`],
+//!    [`PostgresNativeLockStrategy`]) because a dialect carries no connection and advisory
+//!    locks are session-scoped (see the `native_lock` module docs).
 //! 4. **Vendor layer** — one type per database ([`vendor::MysqlDialect`], etc.),
 //!    overriding only DDL and divergent SQL syntax.
 

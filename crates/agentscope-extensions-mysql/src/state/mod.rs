@@ -389,6 +389,7 @@ impl MysqlAgentStateStore {
         expected_version: Option<i64>,
     ) -> MysqlResult<i64> {
         require_session_id(session_id)?;
+        validate_state_key(key)?;
         let json = serde_json::to_string(&value)?;
         match expected_version {
             None => self
@@ -456,6 +457,7 @@ impl MysqlAgentStateStore {
         key: &str,
         values: &[serde_json::Value],
     ) -> MysqlResult<()> {
+        validate_state_key(key)?;
         let hash_key = format!("{key}{HASH_KEY_SUFFIX}");
         let current_hash = list_hash::compute_hash(values);
         let stored_hash = self.backend.get_single(user_id, session_id, &hash_key)?;
@@ -485,7 +487,23 @@ impl MysqlAgentStateStore {
         key: &str,
     ) -> MysqlResult<i64> {
         require_session_id(session_id)?;
+        validate_state_key(key)?;
         self.backend.read_version(user_id, session_id, key)
+    }
+
+    /// Truncates the session table, mirroring Java `truncateAllSessions`.
+    ///
+    /// MySQL treats `TRUNCATE TABLE` as DDL (implicit commit, not rollbackable, requires
+    /// the `DROP` privilege), so it is issued directly rather than through a write path.
+    /// The reported count is always `0`, the value the driver returns for `TRUNCATE` —
+    /// exactly as in Java. The deprecated Java `clearAllSessions()` (`DELETE FROM`, row
+    /// count) is intentionally not ported: Java itself points callers at this method.
+    pub fn truncate_all_sessions(&self) -> MysqlResult<u64> {
+        self.backend.execute_ddl(&format!(
+            "TRUNCATE TABLE `{}`.`{}`",
+            self.database_name, self.table_name
+        ))?;
+        Ok(0)
     }
 }
 
@@ -645,7 +663,36 @@ fn require_session_id(session_id: &str) -> MysqlResult<String> {
     if session_id.trim().is_empty() {
         return Err(MysqlError::BlankSessionId);
     }
+    require_max_length(session_id, "sessionId")?;
     Ok(session_id.to_string())
+}
+
+/// Maximum length of a session id or state key, matching both the Java
+/// `validateSessionId` / `validateStateKey` limit and the `VARCHAR(255)` columns.
+///
+/// Without it a longer key reaches MySQL as a silently truncated value (non-strict mode)
+/// or an opaque `Data too long` error (strict mode), and two keys sharing a 255-character
+/// prefix would collide.
+pub const MAX_STATE_IDENTIFIER_LENGTH: usize = 255;
+
+/// Validates a state key, mirroring Java `validateStateKey`: non-blank, at most
+/// [`MAX_STATE_IDENTIFIER_LENGTH`] characters.
+pub fn validate_state_key(state_key: &str) -> MysqlResult<()> {
+    if state_key.trim().is_empty() {
+        return Err(MysqlError::InvalidArgument(
+            "stateKey must not be blank".to_string(),
+        ));
+    }
+    require_max_length(state_key, "stateKey")
+}
+
+fn require_max_length(value: &str, label: &str) -> MysqlResult<()> {
+    if value.chars().count() > MAX_STATE_IDENTIFIER_LENGTH {
+        return Err(MysqlError::InvalidArgument(format!(
+            "{label} must be at most {MAX_STATE_IDENTIFIER_LENGTH} characters"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1095,6 +1142,101 @@ mod tests {
                 create_database_sql("custom_db"),
                 create_sessions_table_sql("custom_db", "custom_sessions")
             ]
+        );
+    }
+
+    /// Mirrors Java `saveIfVersionUnconditionalAbsentKeyReturnsZero`: reading the version of
+    /// a key that was never written reports `0`, and an unconditional save then starts at 1.
+    #[test]
+    fn absent_key_reports_version_zero() {
+        let s = store();
+        assert_eq!(s.read_version(Some("u"), "sess", "never").unwrap(), 0);
+    }
+
+    /// Java `validateStateKey`: blank keys and keys longer than 255 characters are rejected
+    /// before they reach the `VARCHAR(255)` column, where they would be truncated or
+    /// collide with a sibling key sharing the prefix.
+    #[tokio::test]
+    async fn state_key_validation_mirrors_java() {
+        let s = store();
+        let blank = s
+            .save_if_version(Some("u"), "sess", "  ", json!(1), None)
+            .await;
+        assert!(
+            matches!(blank, Err(MysqlError::InvalidArgument(_))),
+            "unexpected: {blank:?}"
+        );
+
+        let long = "k".repeat(MAX_STATE_IDENTIFIER_LENGTH + 1);
+        assert!(matches!(
+            s.read_version(Some("u"), "sess", &long),
+            Err(MysqlError::InvalidArgument(_))
+        ));
+
+        let at_limit = "k".repeat(MAX_STATE_IDENTIFIER_LENGTH);
+        assert_eq!(s.read_version(Some("u"), "sess", &at_limit).unwrap(), 0);
+        assert!(validate_state_key("ok").is_ok());
+    }
+
+    /// `truncate_all_sessions` issues the Java `TRUNCATE TABLE` statement, and the rows are
+    /// gone afterwards (the deprecated `clearAllSessions()` is not ported).
+    #[tokio::test]
+    async fn truncate_all_sessions_clears_rows() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        let s = MysqlAgentStateStore::new(backend.clone()).expect("bootstrap");
+        s.save_if_version(Some("u"), "sess", "k", json!(1), None)
+            .await
+            .expect("save");
+        assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 1);
+
+        assert_eq!(s.truncate_all_sessions().expect("truncate"), 0);
+        assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 0);
+        assert!(backend
+            .ddl_log()
+            .iter()
+            .any(|sql| sql == "TRUNCATE TABLE `agentscope`.`agentscope_sessions`"));
+    }
+
+    /// Java `saveIfVersionUnconditionalPropagatesReadVersionException`: a backend failure on
+    /// the CAS path must surface, never be reported as "unversioned" or a silent success.
+    #[tokio::test]
+    async fn cas_backend_errors_propagate() {
+        let backend = Arc::new(InMemoryStateBackend::default());
+        let s = MysqlAgentStateStore::new(backend.clone()).expect("bootstrap");
+
+        backend.fail_cas(true);
+        let create = s
+            .save_if_version(Some("u"), "sess", "k", json!(1), Some(0))
+            .await;
+        assert!(matches!(create, Err(MysqlError::Sql(_))), "{create:?}");
+        assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 0);
+
+        backend.fail_cas(false);
+        assert_eq!(
+            s.save_if_version(Some("u"), "sess", "k", json!(1), Some(0))
+                .await
+                .expect("create after recovery"),
+            1
+        );
+        backend.fail_cas(true);
+        let update = s
+            .save_if_version(Some("u"), "sess", "k", json!(2), Some(1))
+            .await;
+        assert!(matches!(update, Err(MysqlError::Sql(_))), "{update:?}");
+    }
+
+    /// Java `createTablePrimaryKeyFitsInnoDbUtf8mb4Limit`: the composite key must stay under
+    /// InnoDB's 3072-byte limit for `utf8mb4` ((512 + 255) * 4 = 3068 bytes).
+    #[test]
+    fn create_table_primary_key_fits_inno_db_limit() {
+        let ddl = create_sessions_table_sql(DEFAULT_DATABASE_NAME, DEFAULT_TABLE_NAME);
+        let bytes = (512 + 255) * 4;
+        assert!(bytes <= 3072, "{bytes} bytes exceeds the index limit");
+        assert!(ddl.contains("session_id VARCHAR(255)"), "{ddl}");
+        assert!(ddl.contains("state_key VARCHAR(255)"), "{ddl}");
+        assert!(
+            ddl.contains("PRIMARY KEY (session_id, state_key, item_index)"),
+            "{ddl}"
         );
     }
 }

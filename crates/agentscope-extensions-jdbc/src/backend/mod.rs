@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use super::dialect::{BoundSql, NativeLockSession};
 
+pub mod driver;
 mod sqlite;
 pub use sqlite::{in_memory_executor, RusqliteExecutor};
 
@@ -72,6 +73,13 @@ pub enum JdbcError {
     /// A feature is not supported by this backend.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+    /// The backend is not configured (missing connection string / environment variable).
+    ///
+    /// Distinct from [`JdbcError::Database`] so callers — and the env-gated integration
+    /// tests — can tell "no server configured" apart from "server said no", instead of
+    /// silently dialling `localhost`.
+    #[error("invalid configuration: {0}")]
+    Configuration(String),
 }
 
 /// Minimal statement-execution surface used inside a transaction.
@@ -170,11 +178,13 @@ pub trait JdbcExecutor: Send + Sync + std::fmt::Debug {
     /// implementation is non-transactional (it simply runs `work` against `self`); real
     /// backends override it.
     ///
-    /// **警告**：依赖此默认实现的多语句组件（目前是 `JdbcAgentSkillRepository`：先写
-    /// `agentscope_skills`、再按回查 id 写 `agentscope_skill_resources`）在后端未覆盖此方法
-    /// 时**没有原子性**——资源插入失败会留下孤儿 skill 行。当前 crate 内只有
-    /// `RusqliteExecutor` 提供了真事务；新增 MySQL/PostgreSQL executor 时**必须**覆盖此方法，
-    /// 否则不应把该后端用于 skill 仓库写入。
+    /// **Precondition for multi-statement writers** — `JdbcAgentSkillRepository` writes
+    /// `agentscope_skills` and then, using the id it read back, `agentscope_skill_resources`.
+    /// An executor that does **not** override this method has no atomicity at all, so a failed
+    /// resource insert leaves an orphan skill row. In this crate `RusqliteExecutor` and every
+    /// `backend::driver::DriverExecutor` override it (`BEGIN` … `COMMIT` / `ROLLBACK` on one
+    /// connection); any new executor **must** do the same, or the skill repository must not be
+    /// wired to it.
     fn in_transaction(
         &self,
         work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,

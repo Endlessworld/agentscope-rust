@@ -21,18 +21,19 @@
 //! lock and closes the connection, exactly like the Java `lease.close()`.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agentscope_harness::agent::sandbox::SandboxIsolationKey;
 
 use super::jdbc_guard::{
-    compose_lock_name, normalize_key_prefix, JdbcSandboxLease, DEFAULT_KEY_PREFIX,
-    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    compose_lock_name, normalize_key_prefix, JdbcSandboxExecutionGuard, JdbcSandboxLease,
+    DEFAULT_KEY_PREFIX, DEFAULT_LOCK_TIMEOUT_SECONDS,
 };
 use crate::backend::SharedExecutor;
 use crate::dialect::{
     ExecutorNativeLockProvider, LockLease, LockOutcome, MysqlNativeLockStrategy, NativeLockError,
     NativeLockSession, NativeLockSessionProvider, PostgresNativeLockStrategy, SandboxLockStrategy,
-    SessionScopedLockSession,
+    SessionScopedLockSession, DEFAULT_LOCK_POLL_INTERVAL,
 };
 
 /// Which native lock identity [`NativeLockGuard`] uses (Java `MysqlDialect` vs
@@ -294,5 +295,123 @@ impl Drop for NativeLockGuardLease {
         // `SessionScopedLockSession::drop` is the safety net for anything still held).
         self.inner.release();
         let _ = self.strategy.take();
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Host assembly: one guard, a fresh exclusive session per acquisition
+// ---------------------------------------------------------------------------
+
+/// [`SandboxLockStrategy`] that opens a **fresh** exclusive session per acquisition.
+///
+/// [`JdbcSandboxExecutionGuard`] owns a single `Arc<dyn SandboxLockStrategy>` for its whole
+/// lifetime, while a native advisory lock needs a *new* session per lease. This adapter is the
+/// bridge: it keeps the provider and opens the session lazily inside
+/// [`SandboxLockStrategy::try_enter_async`], so the guard — and therefore the
+/// `sandbox_execution_guard` slot produced by
+/// [`crate::JdbcDistributedStore::to_harness_store`] — can be assembled **before** any
+/// connection exists.
+///
+/// This is the assembly point the earlier revisions were missing: without it,
+/// `ExecutorNativeLockProvider` had no production caller at all.
+pub(crate) struct NativeProviderStrategy {
+    provider: Arc<dyn NativeLockSessionProvider>,
+    flavor: NativeLockFlavor,
+}
+
+impl std::fmt::Debug for NativeProviderStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeProviderStrategy")
+            .field("flavor", &self.flavor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeProviderStrategy {
+    pub(crate) fn new(
+        provider: Arc<dyn NativeLockSessionProvider>,
+        flavor: NativeLockFlavor,
+    ) -> Self {
+        Self { provider, flavor }
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxLockStrategy for NativeProviderStrategy {
+    /// Single-attempt acquisition is impossible here: the session has to be opened first, and
+    /// opening one is asynchronous. Callers use [`Self::try_enter_async`].
+    fn try_enter_once(
+        &self,
+        lock_name: &str,
+        attempt_timeout: Duration,
+    ) -> Result<LockLease, LockOutcome> {
+        let _ = (lock_name, attempt_timeout);
+        Err(LockOutcome::Failed(
+            "native advisory locks must be acquired through try_enter_async: opening a \
+             dedicated session is asynchronous"
+                .to_string(),
+        ))
+    }
+
+    async fn try_enter_async(
+        &self,
+        lock_name: &str,
+        timeout_seconds: u64,
+    ) -> Result<LockLease, LockOutcome> {
+        let session = self
+            .provider
+            .open()
+            .await
+            .map_err(|error| LockOutcome::Failed(error.to_string()))?;
+        let scoped: Arc<dyn NativeLockSession> = Arc::from(Box::new(SessionScopedLockSession::new(
+            session,
+        ))
+            as Box<dyn NativeLockSession>);
+        let strategy = self.flavor.strategy(scoped.clone());
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match strategy.try_enter_once(lock_name, remaining) {
+                Ok(mut lease) => {
+                    // The lease must own both halves: the dialect lease (releases the
+                    // server-side lock) and the session view (closing it releases anything
+                    // still held, mirroring the Java `lease.close()`).
+                    let view = scoped.clone();
+                    // `release` is an `FnMut`, so the session view is taken out of an
+                    // `Option` on the first call instead of being moved by the closure.
+                    let mut view = Some(view);
+                    return Ok(LockLease::new(lock_name.to_string(), move || {
+                        lease.release();
+                        view.take();
+                    }));
+                }
+                Err(LockOutcome::Acquired) | Err(LockOutcome::TimedOut) => {}
+                Err(LockOutcome::Failed(message)) => return Err(LockOutcome::Failed(message)),
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Dropping `scoped` closes the session and releases whatever it holds.
+                return Err(LockOutcome::TimedOut);
+            }
+            tokio::time::sleep(DEFAULT_LOCK_POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+}
+
+impl JdbcSandboxExecutionGuard {
+    /// Creates a guard that acquires **native** advisory locks (`GET_LOCK` /
+    /// `pg_try_advisory_lock`) through `executor`'s
+    /// [`crate::backend::JdbcExecutor::open_native_lock_session`].
+    ///
+    /// This is the minimal host assembly point for the native-lock path: the resulting guard is
+    /// an ordinary [`JdbcSandboxExecutionGuard`], so it drops straight into
+    /// [`crate::JdbcDistributedStore::with_native_lock_guard`], `Arc<dyn SandboxGuard>` and the
+    /// harness `sandbox_execution_guard` slot. A backend without advisory locks (SQLite)
+    /// reports [`crate::backend::JdbcError::Unsupported`] per acquisition; the guard then
+    /// degrades to a no-op lease and logs it, exactly like a contended lock.
+    pub fn with_native_lock(executor: SharedExecutor, flavor: NativeLockFlavor) -> Self {
+        let provider: Arc<dyn NativeLockSessionProvider> =
+            Arc::new(ExecutorNativeLockProvider::new(executor));
+        Self::new(Arc::new(NativeProviderStrategy::new(provider, flavor)))
     }
 }

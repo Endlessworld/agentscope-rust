@@ -1,6 +1,8 @@
-//! Aggregate dialect implementing all table-domain traits plus the lock strategy,
-//! mirroring `AbstractJdbcDialect`.
+//! Aggregate dialect implementing all table-domain traits (store / session state / snapshot /
+//! skill / skill resources), mirroring `AbstractJdbcDialect`.
 //!
+//! Lock strategies are **not** part of the dialect: advisory locks are session-scoped and a
+//! dialect carries no connection (see `dialect::lock_strategy` and `dialect::native_lock`).
 //! Holds a unified table prefix and per-table name overrides. Vendor dialects extend
 //! this type and override only the methods where their SQL diverges from the ANSI
 //! baseline. Table-name resolution priority: per-table override > prefix + base.
@@ -148,7 +150,13 @@ pub fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
 }
 
 /// Aggregate dialect: implements [`StoreDialect`] + [`SessionStateDialect`] +
-/// [`SnapshotDialect`], and provides table-name resolution plus lock strategy hooks.
+/// [`SnapshotDialect`] + [`SkillDialect`] + [`SkillResourcesDialect`], and provides table-name
+/// resolution plus the `supports_native_locks` capability bit.
+///
+/// It deliberately does **not** implement `SandboxLockStrategy`: a dialect carries no
+/// connection, and advisory locks are session-scoped, so the lock strategies are separate
+/// types ([`crate::sandbox::TableLockStrategy`], [`crate::dialect::MysqlNativeLockStrategy`],
+/// [`crate::dialect::PostgresNativeLockStrategy`]).
 ///
 /// The trait methods themselves resolve the final, prefixed table names; vendors
 /// override only the DDL/UPSERT methods where their syntax diverges.

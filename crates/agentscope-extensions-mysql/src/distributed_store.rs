@@ -82,6 +82,33 @@ impl MysqlDistributedStore {
         )
     }
 
+    /// Connects the whole bundle to `url` over one [`crate::MysqlAsyncBackend`].
+    ///
+    /// Equivalent to `MysqlDistributedStore::builder(backend.clone(), backend.clone(),
+    /// backend.clone(), backend).try_build()`: the driver adapter implements all four seams,
+    /// so the caller does not have to name them. Construction fails eagerly (schema bootstrap,
+    /// unreachable server) instead of handing back a half-configured bundle.
+    #[cfg(feature = "mysql_async")]
+    pub fn connect(url: &str) -> MysqlResult<Self> {
+        let backend = crate::MysqlAsyncBackend::connect(url)?;
+        let state: Arc<dyn StateBackend> = backend.clone();
+        let sql: Arc<dyn SqlBackend> = backend.clone();
+        let snapshot: Arc<dyn SnapshotBackend> = backend.clone();
+        let lock: Arc<dyn LockBackend> = backend;
+        Self::builder(state, sql, snapshot, lock).try_build()
+    }
+
+    /// Without the `mysql_async` feature there is no driver to build the bundle over, so this
+    /// reports [`MysqlError`](crate::MysqlError)`::DriverUnavailable` explicitly instead of
+    /// pretending to have a working store.
+    #[cfg(not(feature = "mysql_async"))]
+    pub fn connect(url: &str) -> MysqlResult<Self> {
+        Err(crate::MysqlError::DriverUnavailable(format!(
+            "the `mysql_async` feature is disabled; rebuild with `--features mysql_async` \
+             to connect to {url}"
+        )))
+    }
+
     /// The agent session-state store.
     pub fn agent_state_store(&self) -> Arc<MysqlAgentStateStore> {
         Arc::clone(&self.agent_state_store)
@@ -205,17 +232,24 @@ impl MysqlDistributedStoreBuilder {
     /// not a plain `[A-Za-z_][A-Za-z0-9_]*` identifier fails loudly instead of being
     /// concatenated into SQL. Keeps the previous best-effort behaviour for schema
     /// bootstrapping: when `initialize_schema` is set and creating the schema fails, the
-    /// state store is rebuilt without auto-creation.
+    /// state store is rebuilt without auto-creation — but the downgrade is now logged and
+    /// the second attempt's error is returned (never swallowed).
     pub fn try_build(self) -> MysqlResult<MysqlDistributedStore> {
         let agent_state_store = if self.initialize_schema {
             match MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, true) {
                 Ok(store) => store,
-                Err(_) => MysqlAgentStateStore::with_config(
-                    self.state_backend.clone(),
-                    None,
-                    None,
-                    false,
-                )?,
+                Err(bootstrap_error) => {
+                    tracing::warn!(
+                        error = %bootstrap_error,
+                        "schema auto-creation failed; verifying the existing schema instead"
+                    );
+                    MysqlAgentStateStore::with_config(
+                        self.state_backend.clone(),
+                        None,
+                        None,
+                        false,
+                    )?
+                }
             }
         } else {
             MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, false)?

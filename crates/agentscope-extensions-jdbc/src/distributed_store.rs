@@ -22,7 +22,7 @@ use agentscope_harness::agent::isolation_scope::IsolationScope;
 
 use crate::backend::{JdbcResult, SharedExecutor};
 use crate::dialect::{detect_dialect, AbstractJdbcDialect};
-use crate::sandbox::JdbcSandboxExecutionGuard;
+use crate::sandbox::{JdbcSandboxExecutionGuard, NativeLockFlavor};
 use crate::snapshot::JdbcSnapshotSpec;
 use crate::state::JdbcAgentStateStore;
 use crate::store::JdbcStore;
@@ -104,6 +104,38 @@ impl JdbcDistributedStore {
     pub fn with_isolation_scope(mut self, scope: IsolationScope) -> Self {
         self.isolation_scope = scope;
         self
+    }
+
+    /// Replaces the portable table-lock guard with a **native advisory-lock** guard
+    /// (`GET_LOCK` / `pg_try_advisory_lock`).
+    ///
+    /// This is the host assembly point for the native-lock path: the store keeps its shared
+    /// executor, and every acquisition opens a fresh exclusive session through
+    /// [`crate::backend::JdbcExecutor::open_native_lock_session`]. The projected
+    /// [`Self::to_harness_store`] guard is therefore genuinely cross-process, and no caller has
+    /// to hand-wire [`crate::dialect::ExecutorNativeLockProvider`].
+    ///
+    /// ```text
+    /// // feature `postgres-executor`
+    /// let store = JdbcDistributedStore::create(Arc::new(connect_postgres(url)?), "PostgreSQL")?
+    ///     .with_native_lock_guard(NativeLockFlavor::Postgres);
+    /// let harness = store.to_harness_store();     // sandbox_execution_guard = pg advisory lock
+    /// ```
+    pub fn with_native_lock_guard(mut self, flavor: NativeLockFlavor) -> Self {
+        self.execution_guard = Arc::new(JdbcSandboxExecutionGuard::with_native_lock(
+            self.executor.clone(),
+            flavor,
+        ));
+        self
+    }
+
+    /// Builds a native advisory-lock guard over this store's executor, leaving the store's own
+    /// guard untouched.
+    ///
+    /// Useful when the host wants the portable table lock for its store but a native lock for a
+    /// specific sandbox isolation scope.
+    pub fn native_lock_guard(&self, flavor: NativeLockFlavor) -> JdbcSandboxExecutionGuard {
+        JdbcSandboxExecutionGuard::with_native_lock(self.executor.clone(), flavor)
     }
 
     /// The agent state store component.

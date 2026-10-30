@@ -11,8 +11,9 @@ use agentscope_extensions_jdbc::dialect::vendor::{
     AnsiDialect, MysqlDialect, PostgresDialect, SqliteDialect,
 };
 use agentscope_extensions_jdbc::dialect::{
-    detect_dialect, validate_identifier, AbstractJdbcDialect, DialectKind, JdbcDialectBuilder,
-    SessionStateDialect, SnapshotDialect, StoreDialect,
+    detect_dialect, validate_identifier, AbstractJdbcDialect, BoundSql, DialectKind,
+    JdbcDialectBuilder, SessionStateDialect, SkillDialect, SkillResourcesDialect, SnapshotDialect,
+    StoreDialect, TableNameConfigurable, TableNames,
 };
 
 // ---------------------------------------------------------------------------
@@ -592,4 +593,213 @@ fn bound_sql_exposes_text_and_int_params_in_order() {
     assert_eq!(bs.params[2].as_text(), Some("ns"));
     assert_eq!(bs.params[3].as_text(), Some("k"));
     assert_eq!(bs.params[4].as_int(), Some(3));
+}
+
+// ---------------------------------------------------------------------------
+//  Versioned session-state UPSERT (AD-2 / `save_if_version`)
+//  Java has no dialect-level assertion for this; pinned here because the MySQL
+//  `version ... DEFAULT 0` ghost-CAS defect (JDBC__GAP_TRACKER §9.5) came from exactly this
+//  template drifting apart between vendors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_state_upsert_writes_version_one_and_increments_on_conflict() {
+    // A fresh row must start at version 1 through the *statement*, never through the DDL
+    // default: the JDBC agent-state store relies on `expected == 1` after the first write.
+    let postgres = PostgresDialect::new();
+    let sqlite = SqliteDialect::new();
+    let dialects: [&dyn SessionStateDialect; 2] = [&postgres, &sqlite];
+    for d in dialects {
+        let bs = d.session_state_upsert("slot", "key", 2, "{}");
+        assert!(
+            bs.sql.contains("VALUES (?, ?, ?, ?, 1)"),
+            "explicit version = 1 on insert: {}",
+            bs.sql
+        );
+        assert!(
+            bs.sql.contains("version = agentscope_sessions.version + 1"),
+            "conflict path must increment: {}",
+            bs.sql
+        );
+    }
+}
+
+#[test]
+fn postgres_upsert_can_return_the_new_version_atomically() {
+    // Only Postgres/H2 offer a returning upsert; MySQL must degrade (documented, non-atomic).
+    let returning = PostgresDialect::new()
+        .session_state_upsert_returning_version("slot", "key", 2, "{}")
+        .expect("postgres can return the version in the same statement");
+    assert!(
+        returning.sql.trim_end().ends_with("RETURNING version"),
+        "{}",
+        returning.sql
+    );
+    assert!(
+        MysqlDialect::new()
+            .session_state_upsert_returning_version("slot", "key", 2, "{}")
+            .is_none(),
+        "MySQL has no RETURNING: callers must take the documented SELECT fallback"
+    );
+}
+
+#[test]
+fn create_table_ddls_covers_the_three_store_owned_tables_only() {
+    // Java: `AbstractJdbcDialect.createTableDdls()` — store → sessions → snapshots. The skill
+    // tables are created by `JdbcSkillRepository::initialize_with_schema`, so a store-only
+    // deployment never needs them and a skill-only one never creates the store tables.
+    let ddls = PostgresDialect::new().create_table_ddls();
+    let joined = ddls.join("\n");
+    for table in [
+        "agentscope_store",
+        "agentscope_sessions",
+        "agentscope_snapshots",
+    ] {
+        assert!(
+            joined.contains(table),
+            "{table} must be created by create_table_ddls()"
+        );
+    }
+    assert!(
+        !joined.to_lowercase().contains("skill"),
+        "skill tables belong to the skill repository, not to create_table_ddls()"
+    );
+    let sqlite = SqliteDialect::new().create_table_ddls().join("\n");
+    assert!(!sqlite.to_lowercase().contains("skill"));
+}
+
+/// A dialect that implements only the two required statements, so the **default**
+/// `session_state_check_table_exists` is reachable (every shipped vendor overrides it).
+struct BareDialect {
+    names: TableNames,
+}
+
+impl TableNameConfigurable for BareDialect {
+    fn table_names(&self) -> &TableNames {
+        &self.names
+    }
+}
+
+impl SessionStateDialect for BareDialect {
+    fn session_state_create_table_ddls(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn session_state_upsert(
+        &self,
+        _slot_id: &str,
+        _key: &str,
+        _index: i32,
+        _json: &str,
+    ) -> BoundSql {
+        BoundSql::no_params("INSERT INTO nowhere VALUES (1)")
+    }
+}
+
+#[test]
+fn default_session_state_probe_is_fail_closed() {
+    // A vendor dialect that forgets to override the probe must not silently "confirm" a table:
+    // the default returns no rows *even for an existing table*, and
+    // `JdbcAgentStateStore::verify_table_exists` treats an empty result as "missing".
+    use agentscope_extensions_jdbc::backend::JdbcExecutor;
+    use agentscope_extensions_jdbc::RusqliteExecutor;
+
+    let dialect = BareDialect {
+        names: TableNames::new(),
+    };
+    let probe = dialect.session_state_check_table_exists("agentscope_sessions");
+    assert_eq!(probe.sql, "SELECT 1 FROM agentscope_sessions WHERE 1 = 0");
+
+    let executor = RusqliteExecutor::in_memory().unwrap();
+    executor
+        .execute(&BoundSql::no_params(
+            "CREATE TABLE agentscope_sessions (id TEXT)",
+        ))
+        .unwrap();
+    assert_eq!(
+        executor.query(&probe).unwrap().len(),
+        0,
+        "the default probe can never confirm that a table exists"
+    );
+
+    // The shipped vendors answer for real (PostgreSQL asks `information_schema`).
+    let postgres = PostgresDialect::new().session_state_check_table_exists("agentscope_sessions");
+    assert!(postgres.sql.contains("information_schema.tables"), "{}", postgres.sql);
+    assert_eq!(postgres.params.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+//  Skill table identity
+//  Java: DialectSqlTests.skillDdlsIndexAndCollateNamespace /
+//        DialectSqlTests.skillStatementsNeverUpdateNamespace
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skill_ddl_keeps_the_namespace_unique_key_and_mysql_collation() {
+    // The namespace is part of a skill's identity, so the unique key must cover
+    // (namespace, name) on every vendor, and MySQL must pin the namespace to a binary
+    // collation (`Team-A` and `team-a` stay different skills).
+    let postgres = PostgresDialect::new();
+    let mysql = MysqlDialect::new();
+    let sqlite = SqliteDialect::new();
+    let ansi = AnsiDialect::new();
+    let vendors: [&dyn AbstractJdbcDialect; 4] = [&postgres, &mysql, &sqlite, &ansi];
+
+    for dialect in vendors {
+        let skills = dialect.skill_create_table_ddls().join("\n");
+        assert!(skills.contains("uk_namespace_name"), "{skills}");
+        assert!(skills.contains("(namespace, name)"), "{skills}");
+        let resources = dialect.skill_resources_create_table_ddls().join("\n");
+        assert!(
+            resources.contains("namespace"),
+            "resources must be namespaced: {resources}"
+        );
+    }
+
+    let mysql_skills = mysql.skill_create_table_ddls().join("\n");
+    assert!(
+        mysql_skills.contains("COLLATE utf8mb4_bin"),
+        "MySQL namespace must be binary-collated: {mysql_skills}"
+    );
+    let mysql_resources = mysql.skill_resources_create_table_ddls().join("\n");
+    assert!(
+        mysql_resources.contains("COLLATE utf8mb4_bin"),
+        "{mysql_resources}"
+    );
+}
+
+#[test]
+fn skill_statements_never_update_the_namespace() {
+    // No statement may move an existing row between namespaces: the namespace is always a
+    // predicate (or an INSERT column), never an UPDATE target.
+    let dialect = PostgresDialect::new();
+    let statements = [
+        dialect.skill_select_by_name("team-a", "n"),
+        dialect.skill_select_all("team-a"),
+        dialect.skill_select_all_names("team-a"),
+        dialect.skill_exists("team-a", "n"),
+        dialect.skill_select_id_by_name("team-a", "n"),
+        dialect.skill_delete_by_name("team-a", "n"),
+        dialect.skill_delete_all("team-a"),
+        dialect.skill_resources_select_all("team-a"),
+        dialect.skill_resources_delete_all("team-a"),
+    ];
+
+    for bound in statements {
+        assert!(
+            !bound.sql.to_ascii_uppercase().contains("SET NAMESPACE"),
+            "namespace must never be updated: {}",
+            bound.sql
+        );
+        assert!(
+            !bound.sql.trim_start().to_ascii_uppercase().starts_with("UPDATE"),
+            "skill statements never update rows: {}",
+            bound.sql
+        );
+        assert!(
+            bound.params.iter().any(|param| param.as_text() == Some("team-a")),
+            "the namespace must be bound, not inlined: {}",
+            bound.sql
+        );
+    }
 }

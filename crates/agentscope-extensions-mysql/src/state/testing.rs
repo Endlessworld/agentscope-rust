@@ -49,6 +49,9 @@ pub struct InMemoryStateBackend {
     ddl_log: Mutex<Vec<String>>,
     /// When set, every `execute_ddl` fails (simulates a locked or read-only server).
     fail_ddl: AtomicBool,
+    /// When set, the CAS primitives fail (simulates a driver/statement error so tests can
+    /// prove the store propagates it instead of swallowing it).
+    fail_cas: AtomicBool,
 }
 
 impl InMemoryStateBackend {
@@ -65,6 +68,16 @@ impl InMemoryStateBackend {
     /// Makes every subsequent `execute_ddl` fail.
     pub fn fail_ddl(&self, fail: bool) {
         self.fail_ddl.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes every subsequent version-guarded write fail.
+    pub fn fail_cas(&self, fail: bool) {
+        self.fail_cas.store(fail, Ordering::SeqCst);
+    }
+
+    /// Error surfaced by the CAS primitives when [`Self::fail_cas`] is on.
+    fn cas_error(&self) -> MysqlError {
+        MysqlError::Sql("statement failed".to_string())
     }
 
     /// DDL statements accepted so far, in order.
@@ -235,6 +248,11 @@ impl StateBackend for InMemoryStateBackend {
                 if !columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
                     columns.push(column);
                 }
+            } else if upper.starts_with("TRUNCATE TABLE") {
+                // Java `truncateAllSessions`: the double must really drop the rows, not
+                // just record the statement, so a test can prove the cleanup happened.
+                self.rows.lock().unwrap().clear();
+                self.versions.lock().unwrap().clear();
             }
         }
         self.ddl_log.lock().unwrap().push(sql.to_string());
@@ -300,6 +318,9 @@ impl StateBackend for InMemoryStateBackend {
         state_key: &str,
         value_json: &str,
     ) -> MysqlResult<CasOutcome> {
+        if self.fail_cas.load(Ordering::SeqCst) {
+            return Err(self.cas_error());
+        }
         let key = Self::key(user_id, session_id);
         let mut rows = self.rows.lock().unwrap();
         let mut versions = self.versions.lock().unwrap();
@@ -333,6 +354,9 @@ impl StateBackend for InMemoryStateBackend {
         value_json: &str,
         expected_version: i64,
     ) -> MysqlResult<CasOutcome> {
+        if self.fail_cas.load(Ordering::SeqCst) {
+            return Err(self.cas_error());
+        }
         let key = Self::key(user_id, session_id);
         let mut rows = self.rows.lock().unwrap();
         let mut versions = self.versions.lock().unwrap();
