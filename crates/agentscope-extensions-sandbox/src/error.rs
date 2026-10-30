@@ -26,6 +26,11 @@ pub enum SandboxErrorCode {
     WorkspaceArchiveWriteError,
     /// The remote sandbox could not be reached or answered with an unexpected payload.
     RemoteTransportError,
+    /// An operation was attempted after the sandbox connection was closed.
+    ///
+    /// Mirrors the Java `SandboxErrorCode.SANDBOX_CONNECTION_CLOSED`, raised by
+    /// `KubernetesSandbox#requireActiveConnection` (Java commit `19fdc9e6d`).
+    ConnectionClosed,
     /// The supplied client options are invalid.
     ConfigurationError,
 }
@@ -41,6 +46,7 @@ impl SandboxErrorCode {
             SandboxErrorCode::WorkspaceArchiveReadError => "WORKSPACE_ARCHIVE_READ_ERROR",
             SandboxErrorCode::WorkspaceArchiveWriteError => "WORKSPACE_ARCHIVE_WRITE_ERROR",
             SandboxErrorCode::RemoteTransportError => "REMOTE_TRANSPORT_ERROR",
+            SandboxErrorCode::ConnectionClosed => "SANDBOX_CONNECTION_CLOSED",
             SandboxErrorCode::ConfigurationError => "CONFIGURATION_ERROR",
         }
     }

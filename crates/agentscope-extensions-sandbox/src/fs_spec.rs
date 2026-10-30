@@ -1076,6 +1076,31 @@ platform_spec!(
     "`SandboxFilesystemSpec` for the agent-sandbox Kubernetes backend."
 );
 
+impl E2bFilesystemSpec {
+    /// Registers a sandbox-creation environment variable (Java `E2bFilesystemSpec#env`).
+    ///
+    /// Blank names are rejected, mirroring the Java option setter.
+    pub fn env(self, name: impl Into<String>, value: impl Into<String>) -> SandboxResult<Self> {
+        let mut spec = self;
+        spec.options = spec.options.with_env(name, value)?;
+        Ok(spec)
+    }
+
+    /// Mounts a pre-existing E2B volume (Java `E2bFilesystemSpec#volumeMount`).
+    ///
+    /// The mount is validated eagerly (absolute in-sandbox path, distinct from the other mounts)
+    /// and threaded into the `POST /sandboxes` body by the backend.
+    pub fn volume_mount(
+        self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+    ) -> SandboxResult<Self> {
+        let mut spec = self;
+        spec.options = spec.options.with_volume_mount(name, path)?;
+        Ok(spec)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,6 +1330,28 @@ mod tests {
         assert!(retained.is_held(&key));
         retained.release(&key).await;
         assert!(!retained.is_held(&key));
+    }
+
+    #[test]
+    fn e2b_spec_builders_thread_envs_and_volume_mounts() {
+        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .env("TOKEN", "abc")
+            .expect("valid env")
+            .volume_mount("vol-a", "/mnt/data")
+            .expect("valid mount");
+        assert_eq!(
+            spec.options().envs.get("TOKEN").map(String::as_str),
+            Some("abc")
+        );
+        assert_eq!(spec.options().volume_mounts.len(), 1);
+        assert_eq!(spec.options().volume_mounts[0].path, "/mnt/data");
+        // 校验语义与 options 一致：空 env 名与相对挂载路径都要拒绝。
+        assert!(E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .env("  ", "x")
+            .is_err());
+        assert!(E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .volume_mount("vol-a", "relative")
+            .is_err());
     }
 
     #[test]

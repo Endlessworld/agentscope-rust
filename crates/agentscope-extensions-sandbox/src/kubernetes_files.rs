@@ -14,13 +14,14 @@
 //! module tracker.
 
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{SandboxExtensionError, SandboxResult};
+use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::join_url;
 use crate::remote::RemoteExecOutput;
 
@@ -526,6 +527,14 @@ pub trait SandboxFileTransfer: Send + Sync + Debug {
 
     /// Downloads the file at `absolute_path`.
     async fn download_file(&self, absolute_path: &str) -> SandboxResult<Vec<u8>>;
+
+    /// Marks the underlying connection as closed (called when the sandbox is released).
+    ///
+    /// Mirrors the Java `KubernetesSandbox#requireActiveConnection` (commit `19fdc9e6d`): a
+    /// transfer adapter that outlives its sandbox must fail with
+    /// [`SandboxErrorCode::ConnectionClosed`] instead of sending requests to a dead router.
+    /// Default: no-op, for backends that do not model a connection lifecycle.
+    fn close(&self) {}
 }
 
 /// `SandboxFileTransfer` backed by the runtime file API and an optional exec fallback.
@@ -533,6 +542,7 @@ pub trait SandboxFileTransfer: Send + Sync + Debug {
 pub struct KubernetesFileTransfer {
     api: KubernetesFileApi,
     file_api_base_dir: String,
+    closed: Arc<AtomicBool>,
 }
 
 impl KubernetesFileTransfer {
@@ -541,7 +551,24 @@ impl KubernetesFileTransfer {
         Self {
             api,
             file_api_base_dir: file_api_base_dir.into(),
+            closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Returns whether the sandbox connection was closed.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Rejects transfers once the sandbox was released.
+    fn ensure_active(&self) -> SandboxResult<()> {
+        if self.is_closed() {
+            return Err(SandboxExtensionError::Runtime(
+                SandboxErrorCode::ConnectionClosed,
+                "Kubernetes sandbox connection has been closed".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the configured file-API base dir.
@@ -570,7 +597,12 @@ impl SandboxFileTransfer for KubernetesFileTransfer {
         to_file_api_relative(&self.file_api_base_dir, absolute_path).is_some()
     }
 
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
     async fn upload_file(&self, absolute_path: &str, content: &[u8]) -> SandboxResult<()> {
+        self.ensure_active()?;
         let relative = self.require_relative(absolute_path)?;
         // The runtime file API is not required to create parent directories.
         if let Some(parent) = crate::workspace::parent_dir(absolute_path) {
@@ -593,6 +625,7 @@ impl SandboxFileTransfer for KubernetesFileTransfer {
     }
 
     async fn download_file(&self, absolute_path: &str) -> SandboxResult<Vec<u8>> {
+        self.ensure_active()?;
         let relative = self.require_relative(absolute_path)?;
         self.api.read(&relative).await
     }
@@ -924,6 +957,44 @@ mod tests {
         let posts = transport.posts.lock().unwrap().clone();
         assert_eq!(posts.len(), 1);
         assert!(String::from_utf8_lossy(&posts[0].2).contains("filename=\"sub/a.txt\""));
+    }
+
+    #[tokio::test]
+    async fn closed_transfer_reports_connection_closed_without_a_request() {
+        // Java `KubernetesSandbox#requireActiveConnection`（commit 19fdc9e6d）：沙箱释放后
+        // 继续使用旧的传输适配器必须报 SANDBOX_CONNECTION_CLOSED，而不是打到已死的 router。
+        let transport = Arc::new(FakeTransport::default());
+        let exec = Arc::new(FakeExec::default());
+        let transfer = KubernetesFileTransfer::new(
+            api(transport.clone()).with_exec(exec.clone()),
+            "/workspace",
+        );
+        assert!(!transfer.is_closed());
+        transfer.close();
+        assert!(transfer.is_closed());
+        // `supports_file_transfer` 与 Java 一致，仍只看路径前缀。
+        assert!(transfer.supports_file_transfer("/workspace/a.txt"));
+
+        for err in [
+            transfer
+                .upload_file("/workspace/a.txt", b"x")
+                .await
+                .unwrap_err(),
+            transfer
+                .download_file("/workspace/a.txt")
+                .await
+                .unwrap_err(),
+        ] {
+            match err {
+                SandboxExtensionError::Runtime(SandboxErrorCode::ConnectionClosed, message) => {
+                    assert_eq!(message, "Kubernetes sandbox connection has been closed");
+                }
+                other => panic!("expected a closed-connection error, got {other:?}"),
+            }
+        }
+        assert!(transport.gets.lock().unwrap().is_empty());
+        assert!(transport.posts.lock().unwrap().is_empty());
+        assert!(exec.commands.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -188,6 +188,22 @@ pub struct KubernetesSandboxClientOptions {
     pub namespace: String,
     /// Warm-pool name referenced by the claim.
     pub warm_pool_name: Option<String>,
+    /// Extra labels applied to the created `SandboxClaim`.
+    ///
+    /// Mirrors the Java `CreateSandboxOptions#labels`; [`CREATED_BY_LABEL`] is always added on top
+    /// and wins over a caller-supplied value (Java `K8sHelper#createSandboxClaim`).
+    pub claim_labels: BTreeMap<String, String>,
+    /// TTL for the claim, expressed as `spec.lifecycle.shutdownTime` + `shutdownPolicy=Delete`.
+    ///
+    /// Mirrors the Java `CreateSandboxOptions#shutdownAfterSeconds` (a positive number of
+    /// seconds; `Some(0)` is rejected, Java throws `IllegalArgumentException`).
+    pub shutdown_after_seconds: Option<u64>,
+    /// Pod labels written to `spec.additionalPodMetadata.labels`
+    /// (Java `CreateSandboxOptions#podLabels`).
+    pub pod_labels: BTreeMap<String, String>,
+    /// Pod annotations written to `spec.additionalPodMetadata.annotations`
+    /// (Java `CreateSandboxOptions#podAnnotations`).
+    pub pod_annotations: BTreeMap<String, String>,
     /// Absolute workspace root inside the sandbox.
     pub workspace_root: String,
     /// Base directory used by the sandbox file API.
@@ -251,6 +267,10 @@ impl Default for KubernetesSandboxClientOptions {
         Self {
             namespace: "default".to_string(),
             warm_pool_name: None,
+            claim_labels: BTreeMap::new(),
+            shutdown_after_seconds: None,
+            pod_labels: BTreeMap::new(),
+            pod_annotations: BTreeMap::new(),
             workspace_root: DEFAULT_WORKSPACE_ROOT.to_string(),
             file_api_base_dir: DEFAULT_WORKSPACE_ROOT.to_string(),
             api_url: None,
@@ -322,18 +342,196 @@ impl KubernetesSandboxClientOptions {
 
 /// Builds the `SandboxClaim` CRD body for a deterministic claim name.
 pub fn build_claim_body(namespace: &str, claim_name: &str, warm_pool_name: &str) -> Value {
+    build_claim_body_with_options(
+        namespace,
+        claim_name,
+        warm_pool_name,
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+}
+
+/// Builds a `SandboxClaim` body carrying the optional spec extensions.
+///
+/// Mirrors the Java `K8sHelper#createSandboxClaim`: caller labels are merged with
+/// [`CREATED_BY_LABEL`] (which always wins), `lifecycle` is only emitted when a TTL was
+/// configured (see [`claim_lifecycle`]) and `additionalPodMetadata` is only emitted when at least
+/// one pod label or annotation is present, so a plain claim keeps the legacy body.
+pub fn build_claim_body_with_options(
+    namespace: &str,
+    claim_name: &str,
+    warm_pool_name: &str,
+    claim_labels: &BTreeMap<String, String>,
+    lifecycle: Option<&Value>,
+    pod_labels: &BTreeMap<String, String>,
+    pod_annotations: &BTreeMap<String, String>,
+) -> Value {
+    let mut labels: BTreeMap<String, Value> = claim_labels
+        .iter()
+        .filter(|(key, _)| !key.trim().is_empty())
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    labels.insert(
+        CREATED_BY_LABEL.to_string(),
+        Value::String(CREATED_BY_VALUE.to_string()),
+    );
+
+    let mut spec = serde_json::Map::new();
+    spec.insert("warmPoolRef".to_string(), json!({ "name": warm_pool_name }));
+    if let Some(lifecycle) = lifecycle {
+        spec.insert("lifecycle".to_string(), lifecycle.clone());
+    }
+    let pod_labels: BTreeMap<String, Value> = pod_labels
+        .iter()
+        .filter(|(key, _)| !key.trim().is_empty())
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    let pod_annotations: BTreeMap<String, Value> = pod_annotations
+        .iter()
+        .filter(|(key, _)| !key.trim().is_empty())
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    if !pod_labels.is_empty() || !pod_annotations.is_empty() {
+        let mut metadata = serde_json::Map::new();
+        if !pod_labels.is_empty() {
+            metadata.insert(
+                "labels".to_string(),
+                Value::Object(pod_labels.into_iter().collect()),
+            );
+        }
+        if !pod_annotations.is_empty() {
+            metadata.insert(
+                "annotations".to_string(),
+                Value::Object(pod_annotations.into_iter().collect()),
+            );
+        }
+        spec.insert("additionalPodMetadata".to_string(), Value::Object(metadata));
+    }
+
     json!({
         "apiVersion": format!("{CLAIM_API_GROUP}/{CLAIM_API_VERSION}"),
         "kind": "SandboxClaim",
         "metadata": {
             "name": claim_name,
             "namespace": namespace,
-            "labels": { CREATED_BY_LABEL: CREATED_BY_VALUE },
+            "labels": Value::Object(labels.into_iter().collect()),
         },
-        "spec": {
-            "warmPoolRef": { "name": warm_pool_name }
-        }
+        "spec": Value::Object(spec),
     })
+}
+
+/// Builds `spec.lifecycle` for a claim TTL.
+///
+/// Mirrors the Java `K8sHelper#createSandboxClaim` TTL branch: `shutdownTime` is the ISO-8601
+/// instant (`ISO_INSTANT`, second precision, `Z` suffix) of `now + shutdownAfterSeconds` and
+/// `shutdownPolicy` is always `Delete`. `Some(0)` is a caller bug and rejected.
+pub fn claim_lifecycle(
+    shutdown_after_seconds: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> SandboxResult<Option<Value>> {
+    let Some(seconds) = shutdown_after_seconds else {
+        return Ok(None);
+    };
+    if seconds == 0 {
+        return Err(SandboxExtensionError::Configuration(
+            "shutdownAfterSeconds must be positive".to_string(),
+        ));
+    }
+    let delta = i64::try_from(seconds).map_err(|_| {
+        SandboxExtensionError::Configuration(format!(
+            "shutdownAfterSeconds is out of range: {seconds}"
+        ))
+    })?;
+    let shutdown_at = now + chrono::Duration::seconds(delta);
+    let shutdown_time =
+        shutdown_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, /* use_z */ true);
+    Ok(Some(json!({
+        "shutdownTime": shutdown_time,
+        "shutdownPolicy": "Delete",
+    })))
+}
+
+/// A fatal `SandboxClaim` condition reported by the agent-sandbox controller.
+///
+/// Mirrors the Java `K8sHelper#checkClaimFailureConditions`, which turns these two `Ready=False`
+/// reasons into dedicated exceptions instead of waiting for the ready timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimFailure {
+    /// `Ready=False, reason=TemplateNotFound` (Java `SandboxTemplateNotFoundException`).
+    TemplateNotFound(String),
+    /// `reason=WarmPoolNotFound` (Java `SandboxWarmPoolNotFoundException`).
+    WarmPoolNotFound(String),
+}
+
+impl ClaimFailure {
+    /// Error message, verbatim from the Java exceptions.
+    pub fn message(&self) -> String {
+        match self {
+            ClaimFailure::TemplateNotFound(detail) => {
+                format!("SandboxTemplate requested does not exist: {detail}")
+            }
+            ClaimFailure::WarmPoolNotFound(detail) => {
+                format!("SandboxWarmPool requested does not exist: {detail}")
+            }
+        }
+    }
+}
+
+/// Detects the fatal claim conditions Java maps to dedicated exceptions.
+///
+/// A missing condition `message` falls back to the Java default text (`Template not found` /
+/// `WarmPool not found`). `None` means "no fatal condition yet" — keep waiting.
+pub fn claim_failure(value: &Value) -> Option<ClaimFailure> {
+    let conditions = value.get("status")?.get("conditions")?.as_array()?;
+    for condition in conditions {
+        let reason = condition
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message = condition.get("message").and_then(Value::as_str);
+        let kind = condition
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let status = condition
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match reason {
+            // Java requires `type=Ready, status=False` for the template branch (a condition with
+            // the same reason but another type must not short-circuit the readiness wait).
+            "TemplateNotFound" if kind == "Ready" && status == "False" => {
+                return Some(ClaimFailure::TemplateNotFound(
+                    message.unwrap_or("Template not found").to_string(),
+                ))
+            }
+            // The warm-pool branch only looks at the reason (Java `checkClaimFailureConditions`).
+            "WarmPoolNotFound" => {
+                return Some(ClaimFailure::WarmPoolNotFound(
+                    message.unwrap_or("WarmPool not found").to_string(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Selects the preferred pod IP of a claim.
+///
+/// Mirrors the Java `K8sHelper#selectPodIp`: the first non-blank IPv4 address wins (an IPv6
+/// literal contains `:`, and a router in front of a dual-stack cluster may prefer IPv4),
+/// otherwise the first non-blank entry is used.
+pub fn select_pod_ip(pod_ips: &[String]) -> Option<String> {
+    if let Some(ipv4) = pod_ips
+        .iter()
+        .find(|ip| !ip.trim().is_empty() && !ip.contains(':'))
+    {
+        return Some(ipv4.clone());
+    }
+    pod_ips.first().filter(|ip| !ip.trim().is_empty()).cloned()
 }
 
 /// Builds the sandbox server `POST /execute` request body.
@@ -1296,6 +1494,14 @@ impl KubernetesBackend {
         loop {
             let path = self.claim_path(claim_name);
             if let Ok(value) = self.k8s_request(reqwest::Method::GET, &path, None).await {
+                // Fail fast on the controller conditions Java turns into dedicated exceptions
+                // instead of burning the whole readiness budget (`K8sHelper`).
+                if let Some(failure) = claim_failure(&value) {
+                    return Err(SandboxExtensionError::Runtime(
+                        SandboxErrorCode::WorkspaceStartError,
+                        failure.message(),
+                    ));
+                }
                 let status = parse_claim_status(&value);
                 if status.ready && status.sandbox_name.is_some() {
                     return Ok(status);
@@ -1328,8 +1534,8 @@ impl KubernetesBackend {
         if let Some(name) = &status.sandbox_name {
             extra.insert("sandbox_name".to_string(), name.clone());
         }
-        if let Some(ip) = status.pod_ips.first() {
-            extra.insert("pod_ip".to_string(), ip.clone());
+        if let Some(ip) = select_pod_ip(&status.pod_ips) {
+            extra.insert("pod_ip".to_string(), ip);
         }
         RemoteSandboxHandle::new(claim.to_string(), extra)
     }
@@ -1363,7 +1569,16 @@ impl RemoteBackend for KubernetesBackend {
             })?;
         let claim_name = format!("agentscope-{session_id}");
         let collection = self.claims_collection_path();
-        let body = build_claim_body(&self.options.namespace, &claim_name, &warm_pool);
+        let lifecycle = claim_lifecycle(self.options.shutdown_after_seconds, chrono::Utc::now())?;
+        let body = build_claim_body_with_options(
+            &self.options.namespace,
+            &claim_name,
+            &warm_pool,
+            &self.options.claim_labels,
+            lifecycle.as_ref(),
+            &self.options.pod_labels,
+            &self.options.pod_annotations,
+        );
         self.k8s_request(reqwest::Method::POST, &collection, Some(body))
             .await?;
         let status = self.wait_until_ready(&claim_name).await?;
@@ -1514,6 +1729,235 @@ mod tests {
             CREATED_BY_VALUE
         );
         assert_eq!(body["spec"]["warmPoolRef"]["name"], "pool-a");
+    }
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .expect("fixed instant parses")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn claim_body_carries_lifecycle_and_pod_metadata() {
+        // 对齐 Java `K8sHelper#createSandboxClaim`：claim 标签合并、TTL 走 lifecycle、
+        // pod labels/annotations 走 additionalPodMetadata。
+        let lifecycle = claim_lifecycle(Some(600), fixed_now()).unwrap();
+        let mut labels = BTreeMap::new();
+        labels.insert("team".to_string(), "sandbox".to_string());
+        let mut pod_labels = BTreeMap::new();
+        pod_labels.insert("pool".to_string(), "a".to_string());
+        let mut pod_annotations = BTreeMap::new();
+        pod_annotations.insert("agents.x-k8s.io/pod-name".to_string(), "pod-1".to_string());
+        let body = build_claim_body_with_options(
+            "ns",
+            "agentscope-s1",
+            "pool-a",
+            &labels,
+            lifecycle.as_ref(),
+            &pod_labels,
+            &pod_annotations,
+        );
+        assert_eq!(body["metadata"]["labels"]["team"], "sandbox");
+        assert_eq!(
+            body["metadata"]["labels"][CREATED_BY_LABEL],
+            CREATED_BY_VALUE
+        );
+        assert_eq!(
+            body["spec"]["lifecycle"]["shutdownTime"],
+            "2026-10-30T00:10:00Z"
+        );
+        assert_eq!(body["spec"]["lifecycle"]["shutdownPolicy"], "Delete");
+        assert_eq!(body["spec"]["additionalPodMetadata"]["labels"]["pool"], "a");
+        assert_eq!(
+            body["spec"]["additionalPodMetadata"]["annotations"]["agents.x-k8s.io/pod-name"],
+            "pod-1"
+        );
+        assert_eq!(body["spec"]["warmPoolRef"]["name"], "pool-a");
+    }
+
+    #[test]
+    fn claim_body_keeps_the_legacy_shape_without_extras() {
+        let body = build_claim_body("ns", "agentscope-s1", "pool-a");
+        assert!(body["spec"].get("lifecycle").is_none());
+        assert!(body["spec"].get("additionalPodMetadata").is_none());
+        assert_eq!(
+            body["metadata"]["labels"].as_object().map(|m| m.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn claim_lifecycle_rejects_zero_and_formats_iso_instant() {
+        assert!(claim_lifecycle(None, fixed_now()).unwrap().is_none());
+        let err = claim_lifecycle(Some(0), fixed_now()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("shutdownAfterSeconds must be positive"),
+            "got {err}"
+        );
+        let lifecycle = claim_lifecycle(Some(90), fixed_now()).unwrap().unwrap();
+        assert_eq!(lifecycle["shutdownTime"], "2026-10-30T00:01:30Z");
+    }
+
+    #[test]
+    fn claim_failure_maps_template_and_warm_pool_conditions() {
+        // Java `checkClaimFailureConditions`：这两类 Ready=False 原因要立即失败。
+        let template = json!({"status": {"conditions": [
+            {"type": "Ready", "status": "False", "reason": "TemplateNotFound",
+             "message": "template 'base' missing"}
+        ]}});
+        assert_eq!(
+            claim_failure(&template).map(|failure| failure.message()),
+            Some("SandboxTemplate requested does not exist: template 'base' missing".to_string())
+        );
+        let pool = json!({"status": {"conditions": [
+            {"type": "Ready", "status": "False", "reason": "WarmPoolNotFound"}
+        ]}});
+        assert_eq!(
+            claim_failure(&pool),
+            Some(ClaimFailure::WarmPoolNotFound(
+                "WarmPool not found".to_string()
+            ))
+        );
+        let ready = json!({"status": {"conditions": [
+            {"type": "Ready", "status": "True", "reason": "Ready"}
+        ]}});
+        assert!(claim_failure(&ready).is_none());
+        assert!(claim_failure(&json!({})).is_none());
+        // 非 Ready 条件上的同名 reason 不能短路就绪等待（Java 要求 type=Ready & status=False）。
+        let other_condition = json!({"status": {"conditions": [
+            {"type": "Available", "status": "False", "reason": "TemplateNotFound"}
+        ]}});
+        assert!(claim_failure(&other_condition).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_fails_fast_when_the_template_is_missing() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let created = server
+            .mock_async(|when, then| {
+                when.method(POST).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/default/sandboxclaims",
+                );
+                then.status(201)
+                    .json_body(json!({"metadata": {"name": "agentscope-sess-1"}}));
+            })
+            .await;
+        let claim = server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/default/sandboxclaims/agentscope-sess-1",
+                );
+                then.status(200).json_body(json!({"status": {"conditions": [
+                    {"type": "Ready", "status": "False", "reason": "TemplateNotFound",
+                     "message": "template 'base' missing"}
+                ]}}));
+            })
+            .await;
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            api_url: Some(server.base_url()),
+            warm_pool_name: Some("pool-a".to_string()),
+            sandbox_ready_timeout_seconds: 180,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let err = backend.create_sandbox("sess-1").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SandboxTemplate requested does not exist"),
+            "got {err}"
+        );
+        // 快速失败：只轮询一次，不烧满 180s 预算。
+        created.assert_async().await;
+        assert_eq!(claim.hits_async().await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_sends_the_extended_claim_spec() {
+        // 接线验证：`claim_labels`/`shutdown_after_seconds`/`pod_labels`/`pod_annotations` 必须真的进
+        // `POST .../sandboxclaims` 的请求体（Java `K8sHelper#createSandboxClaim`），而不是只存在
+        // 于 `build_claim_body_with_options` 的纯函数测试里。
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let created = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(
+                        "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims",
+                    )
+                    .json_body_partial(
+                        json!({
+                            "metadata": {"labels": {"team": "blue"}},
+                            "spec": {
+                                "warmPoolRef": {"name": "pool-a"},
+                                "lifecycle": {"shutdownPolicy": "Delete"},
+                                "additionalPodMetadata": {
+                                    "labels": {"pool": "a"},
+                                    "annotations": {"note": "x"}
+                                }
+                            }
+                        })
+                        .to_string(),
+                    );
+                then.status(201)
+                    .json_body(json!({"metadata": {"name": "agentscope-sess-9"}}));
+            })
+            .await;
+        let claim = server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/agentscope-sess-9",
+                );
+                then.status(200).json_body(json!({"status": {
+                    "sandbox": {"name": "sandbox-9", "podIPs": ["10.0.0.9"]},
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }}));
+            })
+            .await;
+        let mut claim_labels = BTreeMap::new();
+        claim_labels.insert("team".to_string(), "blue".to_string());
+        let mut pod_labels = BTreeMap::new();
+        pod_labels.insert("pool".to_string(), "a".to_string());
+        let mut pod_annotations = BTreeMap::new();
+        pod_annotations.insert("note".to_string(), "x".to_string());
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace: "team-a".to_string(),
+            api_url: Some(server.base_url()),
+            warm_pool_name: Some("pool-a".to_string()),
+            claim_labels,
+            shutdown_after_seconds: Some(600),
+            pod_labels,
+            pod_annotations,
+            sandbox_ready_timeout_seconds: 30,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let handle = backend.create_sandbox("sess-9").await.unwrap();
+        assert_eq!(handle.id, "agentscope-sess-9");
+        created.assert_async().await;
+        assert!(claim.hits_async().await >= 1);
+    }
+
+    #[test]
+    fn select_pod_ip_prefers_ipv4_and_skips_blanks() {
+        // Java `K8sHelper#selectPodIp`：优先第一个非空 IPv4，都没有才用首项。
+        let dual = vec!["fd00::1".to_string(), "10.0.0.1".to_string()];
+        assert_eq!(select_pod_ip(&dual).as_deref(), Some("10.0.0.1"));
+        // Java only falls back to the *first* entry, so a blank head yields nothing even when
+        // a later IPv6 literal is present.
+        let ipv6_only = vec!["  ".to_string(), "fd00::1".to_string()];
+        assert_eq!(select_pod_ip(&ipv6_only).as_deref(), None);
+        assert_eq!(
+            select_pod_ip(&["fd00::1".to_string(), "  ".to_string()]).as_deref(),
+            Some("fd00::1")
+        );
+        assert_eq!(select_pod_ip(&[]), None);
+        assert_eq!(select_pod_ip(&["  ".to_string()]), None);
     }
 
     #[test]
@@ -2678,5 +3122,62 @@ mod tests {
         );
         // Polled more than once before giving up (a plain `get` would only see one hit).
         assert!(crd.hits_async().await >= 2);
+    }
+
+    // --------------------------- real cluster (env-gated; never `#[ignore]`)
+
+    /// Live claim create → exec → delete round-trip against a real agent-sandbox cluster.
+    ///
+    /// Skipped with a printed notice unless `AGENTSCOPE_TEST_K8S_API_URL` and
+    /// `AGENTSCOPE_TEST_K8S_WARM_POOL` are set, so the offline run never talks to a cluster.
+    /// `AGENTSCOPE_TEST_K8S_TOKEN` / `AGENTSCOPE_TEST_K8S_NAMESPACE` are optional.
+    #[tokio::test]
+    async fn live_kubernetes_round_trip_when_a_cluster_is_configured() {
+        let (Ok(api_url), Ok(warm_pool)) = (
+            std::env::var("AGENTSCOPE_TEST_K8S_API_URL"),
+            std::env::var("AGENTSCOPE_TEST_K8S_WARM_POOL"),
+        ) else {
+            eprintln!(
+                "skip: AGENTSCOPE_TEST_K8S_API_URL / AGENTSCOPE_TEST_K8S_WARM_POOL are not set"
+            );
+            return;
+        };
+        if api_url.trim().is_empty() || warm_pool.trim().is_empty() {
+            eprintln!("skip: AGENTSCOPE_TEST_K8S_* values are blank");
+            return;
+        }
+        let namespace = std::env::var("AGENTSCOPE_TEST_K8S_NAMESPACE")
+            .ok()
+            .filter(|ns| !ns.trim().is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let api_token = std::env::var("AGENTSCOPE_TEST_K8S_TOKEN").ok();
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace,
+            warm_pool_name: Some(warm_pool),
+            api_url: Some(api_url),
+            api_token,
+            sandbox_ready_timeout_seconds: 300,
+            ..Default::default()
+        })
+        .expect("valid Kubernetes options");
+
+        let session = format!("live-{}", uuid::Uuid::new_v4().simple());
+        let handle = backend
+            .create_sandbox(&session)
+            .await
+            .expect("create claim");
+        let output = backend
+            .exec_in(&handle, "echo agentscope-live", None, 60)
+            .await
+            .expect("exec in the Kubernetes sandbox");
+        assert!(
+            output.stdout.contains("agentscope-live"),
+            "unexpected exec output: {}",
+            output.stdout
+        );
+        backend
+            .kill_sandbox(&handle.id)
+            .await
+            .expect("delete the claim");
     }
 }

@@ -542,6 +542,27 @@ impl RemoteSandbox {
         };
     }
 
+    /// Error reported when an operation runs against a released sandbox handle.
+    ///
+    /// Mirrors the Java `KubernetesSandbox#requireActiveConnection` (commit `19fdc9e6d`), which
+    /// replaced a generic "not started" failure with a dedicated `SANDBOX_CONNECTION_CLOSED`
+    /// code and a message naming the backend (`Kubernetes sandbox connection has been closed`).
+    fn connection_closed_error(&self) -> Error {
+        let backend = self.backend.backend_name();
+        // Capitalize the backend name so the Kubernetes message is byte-identical to the Java
+        // `SandboxException.SandboxRuntimeException` text.
+        let mut chars = backend.chars();
+        let name = match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        };
+        SandboxExtensionError::Runtime(
+            SandboxErrorCode::ConnectionClosed,
+            format!("{name} sandbox connection has been closed"),
+        )
+        .into()
+    }
+
     fn adopt_handle(&mut self, handle: RemoteSandboxHandle) {
         self.core.data.sandbox_id = Some(handle.id.clone());
         if !handle.extra.is_empty() {
@@ -597,7 +618,7 @@ impl Sandbox for RemoteSandbox {
         let handle = self
             .handle
             .clone()
-            .ok_or_else(|| Error::Other("sandbox not started".to_string()))?;
+            .ok_or_else(|| self.connection_closed_error())?;
         let root = self.core.data.workspace_root.clone();
         let archive = self.backend.persist_workspace_bytes(&handle, &root).await?;
         if let Some(snapshot) = self.snapshot.clone() {
@@ -610,6 +631,12 @@ impl Sandbox for RemoteSandbox {
     }
 
     async fn shutdown(&mut self) -> Result<()> {
+        // Release the native transfer before the handle disappears: a filesystem adapter still
+        // holding it then reports `SANDBOX_CONNECTION_CLOSED` instead of talking to a dead
+        // sandbox (Java `KubernetesSandbox#requireActiveConnection`, commit `19fdc9e6d`).
+        if let Some(transfer) = self.transfer.take() {
+            transfer.close();
+        }
         if self.core.data.sandbox_owned {
             if let Some(id) = self.handle.as_ref().map(|h| h.id.clone()) {
                 self.backend.kill_sandbox(&id).await?;
@@ -640,7 +667,7 @@ impl Sandbox for RemoteSandbox {
         let handle = self
             .handle
             .as_ref()
-            .ok_or_else(|| Error::Other("sandbox not started".to_string()))?;
+            .ok_or_else(|| self.connection_closed_error())?;
         let output = self
             .backend
             .exec_in(handle, command, None, timeout_seconds.unwrap_or(120))
@@ -652,7 +679,7 @@ impl Sandbox for RemoteSandbox {
         let handle = self
             .handle
             .as_ref()
-            .ok_or_else(|| Error::Other("sandbox not started".to_string()))?;
+            .ok_or_else(|| self.connection_closed_error())?;
         let root = self.core.data.workspace_root.clone();
         Ok(self.backend.persist_workspace_bytes(handle, &root).await?)
     }
@@ -661,7 +688,7 @@ impl Sandbox for RemoteSandbox {
         let handle = self
             .handle
             .as_ref()
-            .ok_or_else(|| Error::Other("sandbox not started".to_string()))?;
+            .ok_or_else(|| self.connection_closed_error())?;
         let root = self.core.data.workspace_root.clone();
         let _ = self
             .backend
@@ -1084,5 +1111,41 @@ mod tests {
         let mut plain = RemoteSandbox::new(backend, sample_data(), None);
         plain.start().await.unwrap();
         assert!(plain.file_transfer().is_none());
+    }
+
+    #[tokio::test]
+    async fn released_sandbox_reports_a_closed_connection() {
+        // Java `KubernetesSandbox#requireActiveConnection`（commit 19fdc9e6d）：释放后的一切
+        // 操作都带 SANDBOX_CONNECTION_CLOSED 错误码，而不是笼统的 "not started"。
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(true),
+            native_transfer: true,
+        });
+        let mut sandbox = RemoteSandbox::new(backend.clone(), sample_data(), None);
+        sandbox.start().await.unwrap();
+        assert!(sandbox.file_transfer().is_some());
+        sandbox.shutdown().await.unwrap();
+
+        // 原生传输随连接一起释放，旧适配器随之关闭。
+        assert!(sandbox.file_transfer().is_none());
+
+        match sandbox.exec(None, "echo hi", Some(5)).await {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("SANDBOX_CONNECTION_CLOSED"),
+                    "got {message}"
+                );
+                assert!(
+                    message.contains("Fake sandbox connection has been closed"),
+                    "got {message}"
+                );
+            }
+            Ok(_) => panic!("expected a closed-connection error"),
+        }
+        assert!(sandbox.persist_workspace().await.is_err());
+        assert!(sandbox.hydrate_workspace(b"archive").await.is_err());
+        assert!(sandbox.stop().await.is_err());
     }
 }

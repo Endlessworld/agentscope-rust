@@ -233,6 +233,80 @@ pub fn require_distinct_mount_paths(mounts: &[E2bVolumeMount]) -> SandboxResult<
     Ok(())
 }
 
+/// Returns whether `workspace_root` lives on one of the mounted volumes.
+///
+/// Mirrors the Java `E2bSandboxState#isWorkspaceOnVolume` derived from
+/// `E2bVolumeMount#coversWorkspaceRoot`: the root equals a mount path or sits strictly beneath
+/// it. When true the workspace bytes are durable through the volume, so TAR persistence becomes
+/// a no-op and the sandbox teardown must not delete them (Java commit `9730e8171`).
+pub fn workspace_on_volume(workspace_root: &str, mounts: &[E2bVolumeMount]) -> bool {
+    mounts
+        .iter()
+        .any(|mount| E2bVolumeMount::covers_workspace_root(workspace_root, &mount.path))
+}
+
+/// Builds the `tar --exclude` arguments for mounts nested strictly beneath `workspace_root`.
+///
+/// Mirrors the Java `WorkspaceMountSupport#tarExcludeArgsForAbsolutePaths`: a mount equal to the
+/// root contributes nothing (persistence is a no-op in that case) and a mount outside the root is
+/// never traversed by `tar -C root .`, so only strictly-nested mounts yield
+/// `--exclude=./<relative path>`. Input order is preserved.
+pub fn volume_tar_exclude_args(workspace_root: &str, mounts: &[E2bVolumeMount]) -> Vec<String> {
+    let Ok(root) = E2bVolumeMount::normalize_mount_path(workspace_root) else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    for mount in mounts {
+        let Ok(path) = E2bVolumeMount::normalize_mount_path(&mount.path) else {
+            continue;
+        };
+        if path == root {
+            continue;
+        }
+        let relative = if root == "/" {
+            path.trim_start_matches('/').to_string()
+        } else {
+            match path.strip_prefix(&format!("{root}/")) {
+                Some(rest) => rest.to_string(),
+                None => continue,
+            }
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        args.push(format!("--exclude=./{relative}"));
+    }
+    args
+}
+
+/// Builds the workspace `tar` command used by the E2B TAR persistence path.
+///
+/// Mirrors the Java `E2bSandbox#buildTarCommand` after commit `9730e8171`: the `--exclude`
+/// arguments are shell-quoted (they derive from user-configured mount paths and may contain
+/// spaces) and are applied on **both** branches — create must not duplicate volume bytes into the
+/// archive, extract must not let stale archive entries write through a mount point into shared
+/// persistent data.
+pub fn build_e2b_tar_command(
+    create: bool,
+    tar_path: &str,
+    root: &str,
+    excludes: &[String],
+) -> String {
+    let mut command = String::from("tar ");
+    for exclude in excludes {
+        command.push_str(&shell_quote(exclude));
+        command.push(' ');
+    }
+    command.push_str(if create { "-cf " } else { "-xf " });
+    command.push_str(&shell_quote(tar_path));
+    command.push_str(" -C ");
+    command.push_str(&shell_quote(root));
+    if create {
+        command.push_str(" .");
+    }
+    command
+}
+
 /// Options for the E2B sandbox client (mirrors `E2bSandboxClientOptions`).
 #[derive(Debug, Clone)]
 pub struct E2bSandboxClientOptions {
@@ -276,6 +350,14 @@ pub struct E2bSandboxClientOptions {
     /// The Java cloud-bucket mount strategy (`E2bCloudBucketMountStrategy`) is an empty
     /// placeholder interface, so no cloud-bucket source is modelled here either.
     pub volume_mounts: Vec<E2bVolumeMount>,
+    /// Environment variables injected into the sandbox at creation time.
+    ///
+    /// Mirrors the Java `E2bSandboxClientOptions#envs` (`Map<String, Supplier<String>>`) and the
+    /// `envVars` object of `POST /sandboxes`. Java resolves the suppliers on **every** creation
+    /// so short-lived values stay fresh and skips `null`/empty values; Rust stores plain strings
+    /// (resolved by the caller when the options are built) and keeps the same "empty value is
+    /// omitted" rule.
+    pub envs: BTreeMap<String, String>,
     /// envd Connect codec.
     ///
     /// Defaults to [`E2bCodec::Json`] (the only codec this crate can encode), unlike the Java
@@ -303,6 +385,7 @@ impl Default for E2bSandboxClientOptions {
             persistence_mode: E2bPersistenceMode::Tar,
             snapshot_retention: None,
             volume_mounts: Vec::new(),
+            envs: BTreeMap::new(),
             codec: E2bCodec::Json,
             connect_timeout_seconds: 30,
             read_timeout_seconds: 120,
@@ -324,6 +407,27 @@ impl E2bSandboxClientOptions {
         let mount = E2bVolumeMount::new(name, path)?;
         self.volume_mounts.push(mount);
         require_distinct_mount_paths(&self.volume_mounts)?;
+        Ok(self)
+    }
+
+    /// Registers a sandbox-creation environment variable.
+    ///
+    /// Mirrors the Java `E2bSandboxClientOptions#env(name, value)`: blank names are rejected
+    /// eagerly (Java `IllegalArgumentException`, here a configuration error) and an empty value
+    /// is dropped from the request body by [`build_create_sandbox_body_with_envs`], exactly like
+    /// the Java `E2bSandbox#resolveEnvVars`.
+    pub fn with_env(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> SandboxResult<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(SandboxExtensionError::Configuration(
+                "env name must not be blank".to_string(),
+            ));
+        }
+        self.envs.insert(name, value.into());
         Ok(self)
     }
 }
@@ -379,7 +483,32 @@ pub fn build_create_sandbox_body_with_mounts(
     timeout_seconds: u64,
     mounts: &[E2bVolumeMount],
 ) -> Value {
+    build_create_sandbox_body_with_envs(template_id, timeout_seconds, mounts, &BTreeMap::new())
+}
+
+/// Builds the `POST /sandboxes` request body with volume mounts and environment variables.
+///
+/// Mirrors the Java `E2bPlatformHttp#createSandbox(templateId, timeoutSeconds, mounts, envVars)`:
+/// `envVars` is an object of `name -> value` and, like `volumeMounts`, the field is **omitted**
+/// when it would be empty. Blank env names and empty values are dropped, matching the Java
+/// `E2bSandbox#resolveEnvVars` (which skips `null` / empty values).
+pub fn build_create_sandbox_body_with_envs(
+    template_id: &str,
+    timeout_seconds: u64,
+    mounts: &[E2bVolumeMount],
+    envs: &BTreeMap<String, String>,
+) -> Value {
     let mut body = json!({ "templateID": template_id, "timeout": timeout_seconds });
+    if !envs.is_empty() {
+        let entries: serde_json::Map<String, Value> = envs
+            .iter()
+            .filter(|(name, value)| !name.trim().is_empty() && !value.is_empty())
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect();
+        if !entries.is_empty() {
+            body["envVars"] = Value::Object(entries);
+        }
+    }
     if !mounts.is_empty() {
         let entries: Vec<Value> = mounts
             .iter()
@@ -426,11 +555,13 @@ pub fn connect_timeout_ms_header(timeout_seconds: u64) -> Option<String> {
 
 /// The overall client-side deadline of an exec call.
 ///
-/// `None` means "no exec deadline": the transport-level `read_timeout_seconds` stays the
-/// only bound (the legacy behaviour). Otherwise the deadline is the requested timeout plus
+/// `None` means "no exec deadline": the exec request then carries no per-request timeout at
+/// all and runs on [`E2bBackend`]'s deadline-only client (no client-level total timeout), so
+/// the call is genuinely unbounded — exactly the Java per-call client with `readTimeout = 0`
+/// and `callTimeout(0)`. Otherwise the deadline is the requested timeout plus
 /// [`CLIENT_TIMEOUT_SLACK_SECONDS`], mirroring the Java per-call `callTimeout`: the server
-/// deadline fires first (and kills the process), the slack only guarantees a bounded
-/// return when the server never answers.
+/// deadline fires first (and kills the process), the slack only guarantees a bounded return
+/// when the server never answers.
 pub fn exec_client_deadline(timeout_seconds: u64) -> Option<Duration> {
     if timeout_seconds == 0 {
         return None;
@@ -442,10 +573,10 @@ pub fn exec_client_deadline(timeout_seconds: u64) -> Option<Duration> {
 
 /// Runs `fut` under the exec deadline, mapping an expired deadline onto an exec timeout.
 ///
-/// `timeout_seconds == 0` means "no deadline" and leaves `fut` untouched (the
-/// transport-level timeout remains the only bound). The error message never contains the
-/// command text: commands are model-generated and may inline secrets (same choice as the
-/// Java `SandboxException.ExecTimeoutException`).
+/// `timeout_seconds == 0` means "no deadline" and leaves `fut` untouched (the exec runs on the
+/// deadline-only client, i.e. unbounded). The error message never contains the command text:
+/// commands are model-generated and may inline secrets (same choice as the Java
+/// `SandboxException.ExecTimeoutException`).
 pub async fn with_exec_deadline<T, F>(timeout_seconds: u64, fut: F) -> SandboxResult<T>
 where
     F: std::future::Future<Output = SandboxResult<T>>,
@@ -843,6 +974,15 @@ fn is_falsy(value: &Value) -> bool {
 pub struct E2bBackend {
     options: E2bSandboxClientOptions,
     client: Client,
+    /// HTTP client for envd `process.Process/Start`, carrying **no** client-level total
+    /// timeout (only the connect timeout).
+    ///
+    /// Mirrors the Java per-call client from commit `aa66abfd0` (`readTimeout = 0`): the total
+    /// duration of an exec is owned solely by the per-call deadline (`Connect-Timeout-Ms` +
+    /// [`exec_client_deadline`]). A base `read_timeout_seconds` would otherwise pre-empt a
+    /// larger exec timeout and report a bogus failure, and a deadline of 0 must be genuinely
+    /// unbounded (Java `callTimeout(0)`).
+    exec_client: Client,
     retry: RetryPolicy,
     /// Channel asking envd to kill the remote process when the exec deadline lapses.
     ///
@@ -872,25 +1012,53 @@ impl E2bBackend {
         options: E2bSandboxClientOptions,
         kill_deadline: Arc<dyn E2bKillDeadline>,
     ) -> SandboxResult<Self> {
+        // Fail fast on a relative workspace root (Java `E2bSandboxClient#requireAbsoluteWorkspaceRoot`,
+        // hardening from commit `9730e8171`): a relative root would be resolved against the envd
+        // process cwd, so `tar -C` and the volume-coverage checks would silently target the wrong
+        // directory.
+        if !options.workspace_root.trim().starts_with('/') {
+            return Err(SandboxExtensionError::Configuration(format!(
+                "E2B workspaceRoot must be an absolute in-sandbox path but was: {}",
+                options.workspace_root
+            )));
+        }
         // Envd may be reached through a fixed gateway (option or `E2B_SANDBOX_URL`); include every
         // statically known endpoint so a loopback target keeps its traffic off the ambient proxy.
         let envd_override = envd_sandbox_url_from_env();
-        let client = bypass_proxy_for_loopback(
-            Client::builder()
-                .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
-                .timeout(Duration::from_secs(options.read_timeout_seconds)),
-            &[
+        // Scoped so the `&str` borrows of `options` (for the loopback proxy check) end before
+        // `options` is moved into `Self`.
+        let (client, exec_client) = {
+            let targets = [
                 options.api_base_url.as_str(),
                 options.envd_sandbox_url.as_deref().unwrap_or_default(),
                 envd_override.as_deref().unwrap_or_default(),
-            ],
-        )
-        .build()
-        .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
+            ];
+            let build = |builder: reqwest::ClientBuilder| {
+                bypass_proxy_for_loopback(builder, &targets)
+                    .build()
+                    .map_err(|e| {
+                        SandboxExtensionError::Transport(format!("failed to build client: {e}"))
+                    })
+            };
+            // Control/data-plane client: `read_timeout_seconds` bounds ordinary calls.
+            let client = build(
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(options.connect_timeout_seconds))
+                    .timeout(Duration::from_secs(options.read_timeout_seconds)),
+            )?;
+            // Exec client: no client-level total timeout (Java per-call `readTimeout = 0`,
+            // commit `aa66abfd0`); the per-call deadline is the only owner of the exec duration.
+            let exec_client = build(
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(options.connect_timeout_seconds)),
+            )?;
+            (client, exec_client)
+        };
         let retry = RetryPolicy::e2b(options.max_retries);
         Ok(Self {
             options,
             client,
+            exec_client,
             retry,
             kill_deadline,
             known_snapshots: Arc::new(Mutex::new(Vec::new())),
@@ -1163,10 +1331,11 @@ impl E2bBackend {
         &self,
         template_id: &str,
     ) -> SandboxResult<BTreeMap<String, String>> {
-        let body = build_create_sandbox_body_with_mounts(
+        let body = build_create_sandbox_body_with_envs(
             template_id,
             self.options.sandbox_timeout_seconds,
             &self.options.volume_mounts,
+            &self.options.envs,
         );
         let value = self.platform_post("/sandboxes", &body).await?;
         Ok(parse_sandbox_fields(&value))
@@ -1234,11 +1403,8 @@ impl E2bBackend {
         root: &str,
     ) -> SandboxResult<Vec<u8>> {
         let tar_path = new_temp_tar_path();
-        let command = format!(
-            "tar -cf {} -C {} .",
-            shell_quote(&tar_path),
-            shell_quote(root)
-        );
+        let excludes = volume_tar_exclude_args(root, &self.options.volume_mounts);
+        let command = build_e2b_tar_command(true, &tar_path, root, &excludes);
         let archive = match self
             .exec_in(handle, &command, None, TAR_TIMEOUT_SECONDS)
             .await
@@ -1272,11 +1438,8 @@ impl E2bBackend {
         let tar_path = new_temp_tar_path();
         let extracted = match self.upload_file(handle, &tar_path, archive).await {
             Ok(()) => {
-                let command = format!(
-                    "tar -xf {} -C {}",
-                    shell_quote(&tar_path),
-                    shell_quote(root)
-                );
+                let excludes = volume_tar_exclude_args(root, &self.options.volume_mounts);
+                let command = build_e2b_tar_command(false, &tar_path, root, &excludes);
                 match self
                     .exec_in(handle, &command, None, TAR_TIMEOUT_SECONDS)
                     .await
@@ -1582,7 +1745,9 @@ impl RemoteBackend for E2bBackend {
         let auth = basic_auth_header(&self.options.run_user);
         let access_token = handle.extra.get("envd_access_token").cloned();
         let sandbox_id = handle.id.clone();
-        let client = self.client.clone();
+        // Exec runs on the deadline-only client: `read_timeout_seconds` must never pre-empt the
+        // per-call deadline (Java `aa66abfd0`).
+        let client = self.exec_client.clone();
         let retry = self.retry.clone();
         // 服务端 kill：把 Connect deadline 绑到 start 请求上，envd 到点终止远端进程。
         // `timeout_seconds == 0` 表示不限时，此时连 kill 都不请求。
@@ -1726,6 +1891,11 @@ impl RemoteBackend for E2bBackend {
             }
             return Ok(E2bSnapshotRefs::encode_snapshot_id(&snapshot_id));
         }
+        // The workspace bytes are durable through the mounted volume: persist a no-op marker
+        // instead of archiving files the volume itself keeps (Java `doPersistWorkspace`).
+        if workspace_on_volume(root, &self.options.volume_mounts) {
+            return Ok(Vec::new());
+        }
         self.persist_tar_via_files(handle, root).await
     }
 
@@ -1735,6 +1905,13 @@ impl RemoteBackend for E2bBackend {
         root: &str,
         archive: &[u8],
     ) -> SandboxResult<Option<RemoteSandboxHandle>> {
+        // An empty archive is the volume-backed no-op marker written by `persist_workspace_bytes`
+        // (a session may flip between volume-backed and plain persistence, replacing a real
+        // archive with this marker). There is nothing to extract, and extracting nothing must not
+        // overwrite what the volume already holds (Java `doHydrateWorkspace`).
+        if archive.is_empty() {
+            return Ok(None);
+        }
         if let Some(snapshot_id) = E2bSnapshotRefs::decode_snapshot_id_if_present(archive) {
             if !snapshot_id.trim().is_empty() {
                 let mut fields = self.create_from_template(&snapshot_id).await?;
@@ -3065,6 +3242,199 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn create_body_with_env_vars_matches_java() {
+        let mut envs = BTreeMap::new();
+        envs.insert("FOO".to_string(), "bar".to_string());
+        // 空值必须被丢弃（Java `resolveEnvVars` 跳过 null/空串）。
+        envs.insert("EMPTY".to_string(), String::new());
+        let body = build_create_sandbox_body_with_envs("base", 300, &[], &envs);
+        assert_eq!(body["templateID"], "base");
+        assert_eq!(body["timeout"], 300);
+        assert_eq!(body["envVars"], json!({ "FOO": "bar" }));
+        assert!(body.get("volumeMounts").is_none());
+    }
+
+    #[test]
+    fn create_body_omits_env_vars_when_empty() {
+        // 无环境变量时请求体必须和旧形状完全一致（不能塞空对象）。
+        assert_eq!(
+            build_create_sandbox_body_with_envs("base", 300, &[], &BTreeMap::new()),
+            json!({ "templateID": "base", "timeout": 300 })
+        );
+        let mut blank = BTreeMap::new();
+        blank.insert("  ".to_string(), "x".to_string());
+        blank.insert("EMPTY".to_string(), String::new());
+        assert!(
+            build_create_sandbox_body_with_envs("base", 300, &[], &blank)
+                .get("envVars")
+                .is_none(),
+            "blank names and empty values must not create the field"
+        );
+    }
+
+    #[test]
+    fn with_env_rejects_blank_names() {
+        let err = E2bSandboxClientOptions::default()
+            .with_env("   ", "value")
+            .unwrap_err();
+        assert!(err.to_string().contains("env name must not be blank"));
+        let options = E2bSandboxClientOptions::default()
+            .with_env("TOKEN", "abc")
+            .expect("valid env");
+        assert_eq!(options.envs.get("TOKEN").map(String::as_str), Some("abc"));
+    }
+
+    #[test]
+    fn workspace_on_volume_detects_mount_coverage() {
+        let mounts = vec![
+            E2bVolumeMount::new("vol-a", "/mnt/data").unwrap(),
+            E2bVolumeMount::new("vol-b", "/srv/ws/cache").unwrap(),
+        ];
+        assert!(workspace_on_volume("/mnt/data", &mounts));
+        assert!(workspace_on_volume("/mnt/data/sub", &mounts));
+        // A mount nested *inside* the workspace leaves the rest of it on the sandbox disk, so
+        // the workspace is not "on a volume" (Java `E2bVolumeMount#coversWorkspaceRoot`).
+        assert!(!workspace_on_volume("/srv/ws", &mounts));
+        assert!(workspace_on_volume("/srv/ws/cache/sub", &mounts));
+        assert!(!workspace_on_volume("/srv/ws2", &mounts));
+        assert!(!workspace_on_volume("/mnt/data-x", &mounts));
+        assert!(!workspace_on_volume("/home/user", &mounts));
+        assert!(!workspace_on_volume("/home/user", &[]));
+    }
+
+    #[test]
+    fn volume_tar_exclude_args_only_cover_nested_mounts() {
+        let mounts = vec![
+            E2bVolumeMount::new("vol-a", "/home/user/cache").unwrap(),
+            // 与 root 相同：整棵工作区在卷上，persist 直接 no-op，不产生 exclude。
+            E2bVolumeMount::new("vol-b", "/home/user").unwrap(),
+            // root 之外：`tar -C root .` 根本不会遍历到。
+            E2bVolumeMount::new("vol-c", "/mnt/data").unwrap(),
+            E2bVolumeMount::new("vol-d", "/home/user/shared data").unwrap(),
+        ];
+        assert_eq!(
+            volume_tar_exclude_args("/home/user", &mounts),
+            vec![
+                "--exclude=./cache".to_string(),
+                "--exclude=./shared data".to_string(),
+            ]
+        );
+        assert_eq!(
+            volume_tar_exclude_args("/", &mounts),
+            vec![
+                "--exclude=./home/user/cache".to_string(),
+                "--exclude=./home/user".to_string(),
+                "--exclude=./mnt/data".to_string(),
+                "--exclude=./home/user/shared data".to_string(),
+            ]
+        );
+        assert!(volume_tar_exclude_args("", &mounts).is_empty());
+    }
+
+    #[test]
+    fn build_e2b_tar_command_quotes_excludes() {
+        let excludes = vec![
+            "--exclude=./cache".to_string(),
+            "--exclude=./a b".to_string(),
+        ];
+        assert_eq!(
+            build_e2b_tar_command(true, "/tmp/ws.tar", "/home/user", &excludes),
+            "tar --exclude=./cache '--exclude=./a b' -cf /tmp/ws.tar -C /home/user ."
+        );
+        assert_eq!(
+            build_e2b_tar_command(false, "/tmp/ws.tar", "/home/user", &excludes),
+            "tar --exclude=./cache '--exclude=./a b' -xf /tmp/ws.tar -C /home/user"
+        );
+        assert_eq!(
+            build_e2b_tar_command(true, "/tmp/ws.tar", "/home/user", &[]),
+            "tar -cf /tmp/ws.tar -C /home/user ."
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_and_hydrate_are_noops_for_a_volume_backed_workspace() {
+        // 工作区在卷上：persist 返回空标记，hydrate 遇空标记直接 no-op，且都不发请求。
+        let backend = E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url: "http://127.0.0.1:1".to_string(),
+            volume_mounts: vec![E2bVolumeMount::new("vol-a", "/home/user").unwrap()],
+            ..Default::default()
+        })
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let archive = backend
+            .persist_workspace_bytes(&handle, "/home/user")
+            .await
+            .expect("volume-backed persist is a no-op");
+        assert!(archive.is_empty());
+
+        let adopted = backend
+            .hydrate_workspace_bytes(&handle, "/home/user", b"")
+            .await
+            .expect("empty marker hydrates as a no-op");
+        assert!(adopted.is_none());
+
+        // 非卷工作区仍走 TAR（此处以连接错误证明它没有提前返回）。
+        let plain = E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url: "http://127.0.0.1:1".to_string(),
+            read_timeout_seconds: 1,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(plain
+            .persist_workspace_bytes(&handle, "/home/user")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn relative_workspace_root_is_rejected() {
+        let err = E2bBackend::new(E2bSandboxClientOptions {
+            workspace_root: "workspace".to_string(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("E2B workspaceRoot must be an absolute in-sandbox path"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_create_sends_env_vars() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/sandboxes").json_body(json!({
+                    "templateID": "base",
+                    "timeout": 300,
+                    "envVars": {"FOO": "bar"},
+                }));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"sandboxID":"sbx-11","domain":"e2b.dev"}"#);
+            })
+            .await;
+        let options = E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url: server.base_url(),
+            ..Default::default()
+        }
+        .with_env("FOO", "bar")
+        .unwrap();
+        let backend = E2bBackend::new(options).unwrap();
+
+        let handle = backend.create_sandbox("sess-1").await.unwrap();
+        mock.assert_async().await;
+        assert_eq!(handle.id, "sbx-11");
+    }
+
     #[tokio::test]
     async fn platform_create_sends_volume_mounts() {
         use httpmock::prelude::*;
@@ -3268,6 +3638,42 @@ mod tests {
         mock.assert_async().await;
     }
 
+    /// Java `aa66abfd0`: exec must not be bounded by the base `readTimeout`; only the per-call
+    /// deadline owns the duration. `read_timeout_seconds` is 1 s here, the mock answers after
+    /// 1.5 s and the exec has **no** deadline (`0`), so a client-level timeout would fail it.
+    #[tokio::test]
+    async fn exec_is_not_bounded_by_the_base_read_timeout() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/process.Process/Start");
+                then.status(200)
+                    .delay(Duration::from_millis(1500))
+                    .body(envd_body_with_exit(0, b"slow"));
+            })
+            .await;
+        let backend = E2bBackend::new(E2bSandboxClientOptions {
+            api_key: Some("secret".to_string()),
+            api_base_url: "http://127.0.0.1:1".to_string(),
+            envd_sandbox_url: Some(server.base_url()),
+            codec: E2bCodec::Json,
+            read_timeout_seconds: 1,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+
+        let output = backend
+            .exec_in(&handle, "echo slow", None, 0)
+            .await
+            .expect("an exec without a deadline must not be cut by read_timeout_seconds");
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "slow");
+        mock.assert_async().await;
+    }
+
     #[test]
     fn drain_envd_stream_maps_deadline_exceeded_to_an_exec_timeout() {
         let err = drain_envd_stream(&envd_body_with_deadline_exceeded()).unwrap_err();
@@ -3278,5 +3684,64 @@ mod tests {
             }
             other => panic!("expected an exec timeout error, got {other:?}"),
         }
+    }
+
+    // --------------------------- real endpoint (env-gated; never `#[ignore]`)
+
+    /// Live create → exec → persist → shutdown round-trip against the real E2B API.
+    ///
+    /// The test is **skipped with a printed notice** unless `AGENTSCOPE_TEST_E2B_API_KEY` is set,
+    /// so the default offline run never touches the network (no `#[ignore]`, which would hide the
+    /// test from a normal run). `AGENTSCOPE_TEST_E2B_URL` overrides the platform base URL and
+    /// `AGENTSCOPE_TEST_E2B_TEMPLATE` the template id (default `base`).
+    #[tokio::test]
+    async fn live_e2b_round_trip_when_a_real_api_key_is_configured() {
+        use agentscope_harness::agent::sandbox::{Sandbox as _, SandboxClient as _, WorkspaceSpec};
+
+        let api_key = match std::env::var("AGENTSCOPE_TEST_E2B_API_KEY") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => {
+                eprintln!("skip: AGENTSCOPE_TEST_E2B_API_KEY is not set");
+                return;
+            }
+        };
+        let api_base_url = std::env::var("AGENTSCOPE_TEST_E2B_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| "https://api.e2b.app".to_string());
+        let template_id = std::env::var("AGENTSCOPE_TEST_E2B_TEMPLATE")
+            .ok()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| "base".to_string());
+        let client = e2b_client(E2bSandboxClientOptions {
+            api_key: Some(api_key),
+            api_base_url,
+            template_id,
+            sandbox_timeout_seconds: 120,
+            ..Default::default()
+        })
+        .expect("valid E2B options");
+
+        let spec = WorkspaceSpec::new("/home/user");
+        let mut sandbox = client
+            .create(&spec, None, None)
+            .await
+            .expect("create E2B sandbox");
+        sandbox.start().await.expect("start E2B sandbox");
+        let result = sandbox
+            .exec(None, "echo agentscope-live", Some(30))
+            .await
+            .expect("exec in the E2B sandbox");
+        assert!(
+            result.combined_output().contains("agentscope-live"),
+            "unexpected exec output: {}",
+            result.combined_output()
+        );
+        let archive = sandbox
+            .persist_workspace()
+            .await
+            .expect("persist workspace");
+        assert!(!archive.is_empty(), "workspace archive must not be empty");
+        sandbox.shutdown().await.expect("shutdown E2B sandbox");
     }
 }
