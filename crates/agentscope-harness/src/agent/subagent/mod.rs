@@ -23,8 +23,8 @@ pub use loader::{
 pub use manager::DefaultAgentManager;
 pub use materialize::{
     allowlisted_inherited_toolkit, build_subagent_sys_prompt, declared_generate_options,
-    declared_skill_filter, derive_child_session_id, resolve_declared_model, SubagentBlueprint,
-    SUBAGENT_CONTEXT_SECTION,
+    declared_skill_filter, derive_child_session_id, resolve_declared_model, SharedModelSlot,
+    SubagentBlueprint, SUBAGENT_CONTEXT_SECTION,
 };
 pub use task::{
     BackgroundTask, TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec,

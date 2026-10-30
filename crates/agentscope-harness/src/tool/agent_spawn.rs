@@ -207,6 +207,13 @@ impl Tool for AgentSpawnTool {
         "agent_spawn"
     }
 
+    /// A foreground spawn inline-awaits a full subagent turn, which routinely
+    /// exceeds the default 300s tool timeout; cutting it would cancel the child
+    /// run mid-flight.
+    fn is_long_running(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Spawn a named subagent with a prompt and wait for (foreground) or track \
          (background=true) its result. Every response starts with agent_key / agent_id / \
@@ -411,6 +418,12 @@ impl AgentSendTool {
 impl Tool for AgentSendTool {
     fn name(&self) -> &str {
         "agent_send"
+    }
+
+    /// Follow-up sends inline-await the subagent's turn just like a foreground
+    /// spawn, so the shared tool timeout must not cut them off.
+    fn is_long_running(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {

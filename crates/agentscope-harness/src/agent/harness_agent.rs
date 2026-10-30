@@ -54,7 +54,7 @@ use super::skill::{
 use super::subagent::task::repository::TaskRepository;
 use super::subagent::task::WorkspaceTaskRepository;
 use super::subagent::{
-    CustomSubagentFactory, DefaultAgentManager, SubagentBlueprint, SubagentDeclaration,
+    CustomSubagentFactory, DefaultAgentManager, SharedModelSlot, SubagentBlueprint, SubagentDeclaration,
     SubagentEntry,
 };
 use super::team::{TeamClient, TeamContext};
@@ -122,6 +122,10 @@ pub struct HarnessAgent {
     session_log_store: Option<Arc<dyn SessionLogStore>>,
     /// 该 agent 的优雅关闭管理器（默认每个 agent 一个独立实例）。
     shutdown_manager: Arc<GracefulShutdownManager>,
+    /// Shared slot bridging runtime model switches to subagent factories: when
+    /// set, [`HarnessAgent::set_model`] publishes the new model through it so
+    /// children spawned after the switch are built with it.
+    subagent_model_slot: SharedModelSlot,
 }
 
 /// The default maximum reasoning→acting iterations used when none is configured.
@@ -475,7 +479,12 @@ impl HarnessAgent {
     /// Replaces the model bound to the embedded ReAct agent. The next reasoning
     /// call uses the new model while conversation state is preserved (dynamic
     /// model switching). No-op without a configured model.
+    ///
+    /// The switch is also published to the shared subagent model slot, so agents
+    /// spawned after the switch inherit the new model (already-spawned children
+    /// keep the model they were built with).
     pub fn set_model(&self, model: Arc<dyn Model>) {
+        self.subagent_model_slot.set(Arc::clone(&model));
         if let Some(agent) = &self.agent {
             agent.set_model(model);
         }
@@ -1935,9 +1944,14 @@ impl HarnessAgentBuilder {
                     agent_id.clone(),
                 ))
             });
+        // Shared model slot: `set_model` publishes runtime switches through it,
+        // so children spawned after a switch get the new model instead of the
+        // build-time snapshot. Created unconditionally; only consumed when the
+        // subagent block below assembles the factories.
+        let subagent_model_slot = SharedModelSlot::new(self.model.as_ref().map(Arc::clone));
         if !self.leaf_subagent && !self.disable_subagents && self.model.is_some() {
             let blueprint = Arc::new(SubagentBlueprint {
-                model: self.model.clone(),
+                model: subagent_model_slot.clone(),
                 model_resolver: self.model_resolver.clone(),
                 skill_filter: self.skill_filter.clone(),
                 generate_options: self.generate_options_defaults.clone(),
@@ -2247,6 +2261,7 @@ impl HarnessAgentBuilder {
             skill_audit_log: pending_skill_audit_log,
             session_log_store,
             shutdown_manager,
+            subagent_model_slot,
         }
     }
 }

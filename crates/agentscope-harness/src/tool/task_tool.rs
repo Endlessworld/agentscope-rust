@@ -115,6 +115,12 @@ impl Tool for TaskOutputTool {
     fn name(&self) -> &str {
         "task_output"
     }
+
+    /// `block=true` waits (up to 600s) for a background task to settle; the
+    /// shared 300s tool timeout must not cut that wait short.
+    fn is_long_running(&self) -> bool {
+        true
+    }
     fn description(&self) -> &str {
         "Retrieve the output of a background subagent task by task_id. Prefer block=false to check status without waiting."
     }

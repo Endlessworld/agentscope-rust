@@ -16,7 +16,8 @@ use agentscope_core::tool::Tool;
 use futures::StreamExt;
 
 use crate::agent::middleware::{
-    build_task_summary, prepend_to_system_message, render_subagent_section,
+    build_delivery_reminder, build_task_summary, prepend_to_system_message,
+    render_subagent_section, subagents::deliver_after_completion,
 };
 use crate::agent::subagent::task::TaskRepository;
 use crate::agent::subagent::{
@@ -143,6 +144,18 @@ impl Middleware for DynamicSubagentsMiddleware {
                 mgr.replace_agents(&merged);
             }
 
+            // Terminal-task delivery, same channel as the static middleware:
+            // newly-completed background tasks are surfaced as a
+            // <system-reminder> and stamped delivered only after this reasoning
+            // step completes successfully.
+            let session = rc.session_id().unwrap_or("").to_string();
+            let pending = repo.find_pending_deliveries(&rc, &session).await;
+            let delivery_msg = if pending.is_empty() {
+                None
+            } else {
+                Some(build_delivery_reminder(&pending))
+            };
+
             let mut addition = String::new();
             if !merged.is_empty() {
                 addition.push_str(&render_subagent_section(&merged, false));
@@ -150,11 +163,19 @@ impl Middleware for DynamicSubagentsMiddleware {
             if let Some(summary) = build_task_summary(&*repo, &rc).await {
                 addition.push_str(&summary);
             }
-            if addition.is_empty() {
+            if addition.is_empty() && delivery_msg.is_none() {
                 return next(input);
             }
-            let rebuilt = prepend_to_system_message(input.messages, &addition);
-            next(ReasoningInput::new(rebuilt, input.tools, input.options))
+            let mut rebuilt = if addition.is_empty() {
+                input.messages
+            } else {
+                prepend_to_system_message(input.messages, &addition)
+            };
+            if let Some(dm) = delivery_msg {
+                rebuilt.push(dm);
+            }
+            let downstream = next(ReasoningInput::new(rebuilt, input.tools, input.options));
+            deliver_after_completion(downstream, repo, rc, session, pending)
         };
         Box::pin(futures::stream::once(fut).flatten())
     }

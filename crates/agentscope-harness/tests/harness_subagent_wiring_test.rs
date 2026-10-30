@@ -1,12 +1,16 @@
 //! Wiring tests for `HarnessAgent::build()`: the spawn/send/list agent tools must be
 //! registered on the toolkit and declarations must materialise into callable leaf
 //! subagents (mirrors Java `buildSubagentEntries` + `SubagentsMiddleware.getTools()`).
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use agentscope_core::agent::StreamOptions;
+use agentscope_core::agent::{Agent, StreamOptions};
+use agentscope_core::formatter::JsonSchema;
 use agentscope_core::message::{ContentBlock as CoreBlock, JsonMap, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+use agentscope_core::state::AgentState;
 use agentscope_core::tool::ToolExecutionContext;
+use agentscope_harness::agent::subagent::task::{TaskRepository, TaskRunSpec};
 use agentscope_harness::agent::subagent::SubagentDeclaration;
 use agentscope_harness::agent::HarnessAgent;
 
@@ -333,4 +337,229 @@ async fn declared_model_override_uses_the_resolver() {
     )
     .await;
     assert!(out.ends_with("parent reply"), "out: {out}");
+}
+
+/// A model that records every prompt it receives and answers with a fixed text.
+struct RecordingModel {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    reply: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Model for RecordingModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        let text = self.reply;
+        {
+            let mut seen = self.seen.lock().unwrap();
+            for m in &messages {
+                seen.push(m.text_content());
+            }
+        }
+        Box::pin(futures::stream::once(async move {
+            Ok(ChatResponse::builder()
+                .content(vec![CoreBlock::Text(TextBlock::new(text))])
+                .build())
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "recording"
+    }
+}
+
+#[tokio::test]
+async fn dynamic_middleware_delivers_completed_background_tasks() {
+    // Regression: the default dynamic subagent middleware must surface
+    // terminal background-task results as a <system-reminder> (previously only
+    // the static middleware did, so the main agent never got notified) and
+    // stamp them delivered after the turn.
+    use futures::StreamExt;
+
+    let dir = temp_dir("dyn-delivery");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = HarnessAgent::builder()
+        .name("main")
+        .model(Arc::new(RecordingModel {
+            seen: Arc::clone(&seen),
+            reply: "main reply",
+        }))
+        .cwd(dir.to_path_buf())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .session_id("s1")
+        .subagent(SubagentDeclaration::new("worker", "does work", "You work."))
+        .build();
+
+    // A background task finishes while the main agent is idle.
+    let repo = agent.task_repository();
+    let ctx = agentscope_core::agent::RuntimeContext::default().with_session_id("s1");
+    let bg = repo
+        .put_task(
+            &ctx,
+            "t-done",
+            "worker",
+            "s1",
+            TaskRunSpec::Local {
+                execution: Box::new(|| Ok("bg result".to_string())),
+            },
+        )
+        .await;
+    let finished = tokio::task::spawn_blocking(move || bg.wait_for_completion(5_000))
+        .await
+        .unwrap();
+    assert!(finished, "background task must settle before the turn");
+
+    // The next reasoning step must surface the result as a <system-reminder>.
+    let events: Vec<_> = agent
+        .stream_events(vec![Msg::user("hi")], StreamOptions::defaults())
+        .collect()
+        .await;
+    for ev in events {
+        ev.expect("agent run must succeed");
+    }
+    let prompts = seen.lock().unwrap().clone();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains("background subagent task") && p.contains("bg result")),
+        "delivery reminder missing from model prompts: {prompts:?}"
+    );
+    assert!(
+        repo.is_delivered(&ctx, "s1", "t-done").await,
+        "delivery must be stamped after the turn"
+    );
+}
+
+#[tokio::test]
+async fn set_model_switch_propagates_to_newly_spawned_subagents() {
+    // Regression: `set_model` must publish the switch through the shared
+    // subagent model slot, so children spawned afterwards are built with the
+    // new model instead of the build-time snapshot.
+    let dir = temp_dir("model-switch");
+    let agent = HarnessAgent::builder()
+        .name("main")
+        .model(Arc::new(ScriptedModel("v1 reply")))
+        .cwd(dir.to_path_buf())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .subagent(SubagentDeclaration::new("worker", "does work", "You work."))
+        .build();
+
+    agent.set_model(Arc::new(ScriptedModel("v2 reply")));
+
+    let out = call(
+        &agent,
+        "agent_spawn",
+        args(&[
+            ("agent", serde_json::json!("worker")),
+            ("prompt", serde_json::json!("go")),
+        ]),
+    )
+    .await;
+    assert!(out.ends_with("v2 reply"), "out: {out}");
+}
+
+#[tokio::test]
+async fn agent_send_recovers_a_failed_subagent_in_process() {
+    // In-process recovery: a subagent whose run failed stays registered and
+    // addressable — `agent_send` re-invokes the same instance and can succeed.
+    struct FailOnceAgent {
+        attempts: Arc<AtomicUsize>,
+        toolkit: agentscope_core::tool::Toolkit,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for FailOnceAgent {
+        fn agent_id(&self) -> &str {
+            "flaky"
+        }
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        fn description(&self) -> &str {
+            "fails once"
+        }
+        fn interrupt(&self) {}
+        fn agent_state(&self) -> AgentState {
+            AgentState::default()
+        }
+        fn toolkit(&self) -> &agentscope_core::tool::Toolkit {
+            &self.toolkit
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agentscope_core::agent::CallableAgent for FailOnceAgent {
+        async fn call(&self, _messages: Vec<Msg>) -> agentscope_core::error::Result<Msg> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(agentscope_core::error::Error::Agent(
+                    "transient failure".to_string(),
+                ))
+            } else {
+                Ok(Msg::assistant("recovered"))
+            }
+        }
+        async fn call_with_schema(
+            &self,
+            messages: Vec<Msg>,
+            _schema: JsonSchema,
+        ) -> agentscope_core::error::Result<Msg> {
+            self.call(messages).await
+        }
+    }
+
+    let dir = temp_dir("recovery");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let agent = HarnessAgent::builder()
+        .name("main")
+        .model(Arc::new(ScriptedModel("parent reply")))
+        .cwd(dir.to_path_buf())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .subagent_factory_with_description("flaky", "fails once", {
+            let attempts = Arc::clone(&attempts);
+            move |_name| {
+                Arc::new(FailOnceAgent {
+                    attempts: Arc::clone(&attempts),
+                    toolkit: agentscope_core::tool::Toolkit::new(),
+                }) as Arc<dyn agentscope_core::agent::CallableAgent>
+            }
+        })
+        .build();
+
+    // 1) The foreground spawn fails on its first run.
+    let failed = call(
+        &agent,
+        "agent_spawn",
+        args(&[
+            ("agent", serde_json::json!("flaky")),
+            ("prompt", serde_json::json!("go")),
+            ("label", serde_json::json!("flaky-one")),
+        ]),
+    )
+    .await;
+    assert!(failed.contains("transient failure"), "out: {failed}");
+
+    // The failed child is still registered and addressable.
+    let listed = call(&agent, "agent_list", args(&[])).await;
+    assert!(listed.contains("agent_key: agent:flaky:"), "out: {listed}");
+
+    // 2) `agent_send` re-activates the same instance and the run succeeds.
+    let recovered = call(
+        &agent,
+        "agent_send",
+        args(&[
+            ("label", serde_json::json!("flaky-one")),
+            ("message", serde_json::json!("try again")),
+        ]),
+    )
+    .await;
+    assert_eq!(recovered, "recovered");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }

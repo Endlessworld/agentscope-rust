@@ -3,7 +3,7 @@
 //! `buildGeneralPurposeFactory` / `allowlistedInheritedToolkit` /
 //! `deriveChildSessionId`.
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use agentscope_core::agent::{CallableAgent, RuntimeContext};
 use agentscope_core::model::{GenerateOptions, Model};
@@ -161,6 +161,31 @@ pub fn resolve_declared_workspace(decl: &SubagentDeclaration, main_workspace: &P
     isolated
 }
 
+/// Shared, runtime-swappable slot holding the parent model captured by a
+/// [`SubagentBlueprint`]. `HarnessAgent::set_model` writes through it, so a
+/// child materialised *after* a runtime model switch inherits the new model
+/// instead of the build-time snapshot (children already spawned keep the
+/// model they were built with).
+#[derive(Clone, Default)]
+pub struct SharedModelSlot(Arc<RwLock<Option<Arc<dyn Model>>>>);
+
+impl SharedModelSlot {
+    /// Creates a slot pre-loaded with the parent's build-time model.
+    pub fn new(model: Option<Arc<dyn Model>>) -> Self {
+        Self(Arc::new(RwLock::new(model)))
+    }
+
+    /// Current model held by the slot.
+    pub fn get(&self) -> Option<Arc<dyn Model>> {
+        self.0.read().unwrap().clone()
+    }
+
+    /// Publishes a runtime model switch to every child created from now on.
+    pub fn set(&self, model: Arc<dyn Model>) {
+        *self.0.write().unwrap() = Some(model);
+    }
+}
+
 /// Resolves the effective model for a declared subagent (mirrors Java `resolveModel`): a blank
 /// override inherits the parent model; a failing/absent resolver falls back to it as well.
 pub fn resolve_declared_model(
@@ -228,7 +253,9 @@ pub fn declared_generate_options(
 /// Immutable snapshot of the parent build used to materialise children.
 #[derive(Clone)]
 pub struct SubagentBlueprint {
-    pub model: Option<Arc<dyn Model>>,
+    /// Parent model, shared through a slot so a runtime `set_model` switch on
+    /// the parent propagates to children spawned after the switch.
+    pub model: SharedModelSlot,
     /// Turns a `decl.model` override id into a model (mirrors Java `Builder.modelResolver`).
     pub model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
     /// Parent skill filter that children inherit (mirrors Java `capturedSkillFilter`).
@@ -376,9 +403,10 @@ impl LeafFactory {
             .sys_prompt(self.sys_prompt.clone())
             .max_iters(self.max_iters)
             .enable_pending_tool_recovery(self.enable_pending_tool_recovery);
+        let parent_model = self.blueprint.model.get();
         let model = resolve_declared_model(
             self.model_override.as_deref(),
-            self.blueprint.model.as_ref(),
+            parent_model.as_ref(),
             self.blueprint.model_resolver.as_ref().map(|r| r.as_ref()),
             &self.name,
         );
@@ -553,7 +581,7 @@ mod tests {
     fn blueprint(parent_flag: bool) -> Arc<SubagentBlueprint> {
         let dir = scratch();
         Arc::new(SubagentBlueprint {
-            model: Some(Arc::new(StubModel) as Arc<dyn Model>),
+            model: SharedModelSlot::new(Some(Arc::new(StubModel) as Arc<dyn Model>)),
             model_resolver: None,
             skill_filter: SkillFilter::only(&[]),
             generate_options: None,
@@ -604,6 +632,43 @@ mod tests {
             .general_purpose_leaf()
             .build(&RuntimeContext::new());
         assert!(child.disable_session_persistence());
+    }
+
+    /// A stub distinguishable by `model_name`.
+    struct NamedStub(&'static str);
+
+    #[async_trait::async_trait]
+    impl Model for NamedStub {
+        fn stream(
+            &self,
+            _messages: Vec<agentscope_core::message::Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+            Box::pin(futures::stream::once(async {
+                Ok(ChatResponse::builder()
+                    .content(vec![ContentBlock::Text(TextBlock::new("ok"))])
+                    .build())
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            self.0
+        }
+    }
+
+    /// `HarnessAgent::set_model` publishes the switch through the shared slot,
+    /// so a child materialised afterwards must be built with the new model.
+    #[test]
+    fn model_switch_propagates_to_children_created_afterwards() {
+        let bp = blueprint(false);
+        bp.model.set(Arc::new(NamedStub("switched")) as Arc<dyn Model>);
+        let child = bp.general_purpose_leaf().build(&RuntimeContext::new());
+        let model = child
+            .agent()
+            .expect("the child is built with a model")
+            .model();
+        assert_eq!(model.model_name(), "switched");
     }
 
     #[test]

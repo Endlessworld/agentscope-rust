@@ -172,27 +172,41 @@ impl Middleware for SubagentsMiddleware {
             }
 
             // Mark delivered ONLY after the inner reasoning completes successfully.
-            let repo2 = Arc::clone(&repo);
-            let sid2 = sid.clone();
-            let rc2 = rc.clone();
-            let tail = async move {
-                let mut stream = downstream;
-                while let Some(ev) = stream.next().await {
-                    let _ = ev;
-                }
-                for d in &pending {
-                    repo2.mark_delivered(&rc2, &sid2, &d.task_id).await;
-                }
-                Vec::<Result<AgentEvent>>::new()
-            };
-            Box::pin(
-                futures::stream::once(tail)
-                    .map(futures::stream::iter)
-                    .flatten(),
-            )
+            deliver_after_completion(downstream, repo, rc, sid, pending)
         };
         Box::pin(futures::stream::once(fut).flatten())
     }
+}
+
+/// Wraps the downstream reasoning stream so the terminal-task deliveries that
+/// were surfaced as `<system-reminder>` are stamped delivered **only after**
+/// the reasoning step completes successfully (a failed step keeps them pending
+/// for redelivery). Returns `downstream` unchanged when nothing is pending.
+///
+/// Shared by the static [`SubagentsMiddleware`] and the dynamic
+/// [`super::DynamicSubagentsMiddleware`] so both deliver background-task
+/// results through the same channel.
+pub(crate) fn deliver_after_completion(
+    downstream: agentscope_core::middleware::EventStream,
+    repo: Arc<dyn TaskRepository>,
+    rc: RuntimeContext,
+    session_id: String,
+    pending: Vec<TaskDelivery>,
+) -> agentscope_core::middleware::EventStream {
+    if pending.is_empty() {
+        return downstream;
+    }
+    let tail = async move {
+        let mut stream = downstream;
+        while let Some(ev) = stream.next().await {
+            let _ = ev;
+        }
+        for d in &pending {
+            repo.mark_delivered(&rc, &session_id, &d.task_id).await;
+        }
+        Vec::<Result<AgentEvent>>::new()
+    };
+    Box::pin(futures::stream::once(tail).map(futures::stream::iter).flatten())
 }
 
 /// Builds the single aggregated `<system-reminder>` message surfacing newly-terminal

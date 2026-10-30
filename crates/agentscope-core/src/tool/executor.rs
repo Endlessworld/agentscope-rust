@@ -142,7 +142,14 @@ async fn execute_with_policy(
     let cfg = config
         .cloned()
         .unwrap_or_else(ExecutionConfig::tool_defaults);
-    let timeout = cfg.timeout;
+    // Long-running tools (e.g. `agent_send` awaiting a full subagent turn) opt
+    // out of the timeout wrapper: cutting them would cancel a live agent run
+    // mid-flight, not just withhold its result.
+    let timeout = if tool.is_long_running() {
+        None
+    } else {
+        cfg.timeout
+    };
     let max_attempts = cfg.max_attempts.unwrap_or(1);
     let mut attempt: u32 = 0;
     loop {
@@ -170,6 +177,83 @@ async fn execute_with_policy(
                 }
                 tokio::time::sleep(cfg.backoff_for(attempt - 1)).await;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{JsonMap, ToolResultBlock, ToolUseBlock};
+    use crate::tool::{Tool, ToolExecutionContext, Toolkit};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A tool that sleeps past the test timeout before answering.
+    struct SleepyTool {
+        long_running: bool,
+    }
+
+    #[async_trait]
+    impl Tool for SleepyTool {
+        fn name(&self) -> &str {
+            "sleepy"
+        }
+        fn description(&self) -> &str {
+            "sleeps past the timeout"
+        }
+        fn is_long_running(&self) -> bool {
+            self.long_running
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(
+            &self,
+            _args: JsonMap,
+            _ctx: ToolExecutionContext,
+        ) -> crate::error::Result<ToolResultBlock> {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(ToolResultBlock::text("done"))
+        }
+    }
+
+    fn config(timeout_ms: u64) -> ExecutionConfig {
+        ExecutionConfig::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+    }
+
+    async fn run(long_running: bool) -> Result<ToolResultBlock> {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(SleepyTool { long_running }));
+        let call = ToolUseBlock::new("c1", "sleepy", JsonMap::new());
+        ToolExecutor::new()
+            .execute(
+                &toolkit,
+                &call,
+                ToolExecutionContext::default(),
+                Some(&config(20)),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn long_running_tool_skips_the_execution_timeout() {
+        let out = run(true).await.expect("long-running tool must not be cut off");
+        assert_eq!(out.text_content(), "done");
+    }
+
+    #[tokio::test]
+    async fn regular_tool_is_still_cut_by_the_execution_timeout() {
+        let err = run(false).await.expect_err("regular tool hits the timeout");
+        match err {
+            Error::Tool(msg) => {
+                assert!(msg.contains("Tool execution timeout after"), "{msg}");
+                assert!(msg.contains("sleepy"), "{msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }

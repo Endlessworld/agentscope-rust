@@ -55,6 +55,12 @@ impl Tool for WaitAsyncResultsTool {
         "wait_async_results"
     }
 
+    /// The barrier may wait up to its own `timeout_ms` (default 60s, max 600s),
+    /// so the shared tool timeout must not cut it short.
+    fn is_long_running(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Block until background async tool executions finish (or time out). Pass task_ids \
          to wait for specific tasks, or omit them to wait for all pending tasks of the \
