@@ -647,6 +647,32 @@ impl SqlConnection for InMemoryConnection {
             projected.entry("id".to_string()).or_insert(SqlValue::Null);
             out.push(SqlRow::new(projected));
         }
+        if let Some(tail) = lower.split("order by").nth(1) {
+            let desc = tail.contains(" desc");
+            let column = tail
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ')')
+                .find(|s| !s.is_empty())
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+            if !column.is_empty() {
+                out.sort_by(|a, b| {
+                    let order = match (a.get(&column), b.get(&column)) {
+                        (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(&y),
+                        (SqlValue::Int(x), SqlValue::Int(y)) => x.cmp(&y),
+                        (SqlValue::Null, SqlValue::Null) => std::cmp::Ordering::Equal,
+                        (SqlValue::Null, _) => std::cmp::Ordering::Less,
+                        (_, SqlValue::Null) => std::cmp::Ordering::Greater,
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if desc {
+                        order.reverse()
+                    } else {
+                        order
+                    }
+                });
+            }
+        }
         Ok(out)
     }
 
@@ -669,10 +695,17 @@ impl SqlConnection for InMemoryConnection {
         let id = {
             let mut st = self.state.lock().unwrap();
             let entry = st.tables.entry(table.clone()).or_default();
-            entry.next_id += 1;
-            entry.next_id
+            let id = match row.get("id").and_then(|value| value.as_int()) {
+                Some(id) => id,
+                None => {
+                    entry.next_id += 1;
+                    entry.next_id
+                }
+            };
+            entry.next_id = entry.next_id.max(id);
+            id
         };
-        row.insert("id".to_string(), SqlValue::Int(id));
+        row.entry("id".to_string()).or_insert(SqlValue::Int(id));
         let write = StagedWrite::Insert { table, row, id };
         if self.auto_commit {
             self.apply_write(write);
@@ -808,6 +841,90 @@ mod tests {
             .unwrap();
         assert_eq!(affected, 2);
         assert_eq!(db.rows("t").len(), 2);
+    }
+
+    /// `SqlParam::text(None)` is SQL `NULL`; `Some` is bound as text (no interpolation).
+    #[test]
+    fn text_parameter_materialises_null_for_none() {
+        assert_eq!(SqlParam::text(None::<String>), SqlParam::Null);
+        assert_eq!(SqlParam::text(Some("x")), SqlParam::Text("x".to_string()));
+    }
+
+    /// `SqlValue` coercions are the contract the repositories rely on when reading columns.
+    #[test]
+    fn sql_value_accessors_coerce_and_reject() {
+        assert_eq!(SqlValue::Text("42".into()).as_int(), Some(42));
+        assert_eq!(SqlValue::Int(7).as_text(), None);
+        assert_eq!(SqlValue::Null.as_text(), None);
+        assert_eq!(SqlValue::Null.as_int(), None);
+        assert_eq!(SqlValue::Text("not-a-number".into()).as_int(), None);
+    }
+
+    /// An absent column reads as `NULL` instead of panicking (metadata_json columns of legacy
+    /// schemas are simply not selected).
+    #[test]
+    fn missing_columns_read_as_null() {
+        let row = SqlRow::new([("name", SqlValue::Text("a".into()))]);
+        assert_eq!(row.get("absent"), SqlValue::Null);
+        assert_eq!(row.get_text("absent"), None);
+        assert_eq!(row.get_int("name"), None);
+        assert_eq!(row.get_text("name").as_deref(), Some("a"));
+    }
+
+    /// `execute` reports the affected row count and honours an explicit primary key.
+    #[test]
+    fn execute_reports_affected_rows_and_keeps_explicit_ids() {
+        let db = InMemorySqlDatabase::new();
+        let mut conn = db.connection().unwrap();
+        conn.execute("CREATE TABLE t (id BIGINT, name VARCHAR(255))", &[])
+            .unwrap();
+        conn.insert_returning_id(
+            "INSERT INTO t (id, name) VALUES (?, ?)",
+            &[SqlParam::Int(42), SqlParam::Text("a".into())],
+        )
+        .unwrap();
+        let rows = conn.query("SELECT id, name FROM t WHERE id = ?", &[SqlParam::Int(42)])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_int("id"), Some(42));
+        let deleted = conn
+            .execute("DELETE FROM t WHERE name = ?", &[SqlParam::Text("a".into())])
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(db.rows("t").is_empty());
+    }
+
+    /// `commit` / `rollback` outside a transaction are no-ops, and toggling auto-commit twice
+    /// does not open two nested transactions (JDBC `setAutoCommit` is idempotent).
+    #[test]
+    fn transaction_controls_are_idempotent() {
+        let db = InMemorySqlDatabase::new();
+        let mut conn = db.connection().unwrap();
+        conn.execute("CREATE TABLE t (id BIGINT, name VARCHAR(255))", &[])
+            .unwrap();
+        conn.commit().unwrap();
+        conn.rollback().unwrap();
+        conn.set_auto_commit(false).unwrap();
+        conn.set_auto_commit(false).unwrap();
+        conn.insert_returning_id(
+            "INSERT INTO t (name) VALUES (?)",
+            &[SqlParam::Text("x".into())],
+        )
+        .unwrap();
+        conn.commit().unwrap();
+        conn.set_auto_commit(true).unwrap();
+        assert_eq!(db.rows("t").len(), 1);
+    }
+
+    /// An empty batch is a no-op (the PostgreSQL repository skips it, but the seam must agree).
+    #[test]
+    fn empty_batch_is_a_noop() {
+        let db = InMemorySqlDatabase::new();
+        let mut conn = db.connection().unwrap();
+        conn.execute("CREATE TABLE t (id BIGINT, name VARCHAR(255))", &[])
+            .unwrap();
+        assert_eq!(conn.execute_batch("INSERT INTO t (name) VALUES (?)", &[]).unwrap(), 0);
+        assert!(db.rows("t").is_empty());
     }
 }
 

@@ -1086,4 +1086,68 @@ mod tests {
             Some(&serde_json::json!("meta"))
         );
     }
+
+    /// Java parity: `getAllSkillNames` is ordered (the harness loader relies on a stable order).
+    #[test]
+    fn all_skill_names_are_sorted() {
+        let r = repo();
+        r.save(
+            &[skill("charlie", "c"), skill("alpha", "a"), skill("bravo", "b")],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r.get_all_skill_names().unwrap(),
+            vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()]
+        );
+        let all = r.get_all_skills().unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.name().to_string()).collect::<Vec<_>>(),
+            vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()]
+        );
+    }
+
+    /// Java parity: `delete` removes the skill row **and** its resource rows, and a re-save
+    /// starts from a clean slate (no stale resources resurface).
+    #[test]
+    fn delete_removes_resources_and_a_resave_starts_clean() {
+        let r = repo();
+        r.save(&[skill("calc", "1")], false).unwrap();
+        assert!(r.delete("calc").unwrap());
+        assert!(r.get_skill("calc").is_err());
+
+        let slim = AgentSkill::builder()
+            .name("calc")
+            .source("custom")
+            .description("2")
+            .add_resource("SKILL.md", "# slim")
+            .build();
+        r.save(&[slim], false).unwrap();
+        let loaded = r.get_skill("calc").unwrap();
+        assert_eq!(loaded.resources().len(), 1);
+        assert_eq!(loaded.resources().get("a.txt"), None);
+    }
+
+    /// The trait's default `skill_dir` / `close` apply to the SQL backends: skills live in
+    /// rows, so the adapter materialises them and `close` is a no-op that never fails.
+    #[test]
+    fn sql_backend_has_no_skill_dir_and_closes_cleanly() {
+        let r = repo();
+        r.save(&[skill("calc", "1")], false).unwrap();
+        assert_eq!(r.skill_dir("calc"), None);
+        assert!(r.close().is_ok());
+        assert!(r.close().is_ok());
+    }
+
+    /// `setWriteable(false)` must also block `delete` / `clearAllSkills`, not only `save`.
+    #[test]
+    fn read_only_blocks_delete_and_clear() {
+        let r = repo();
+        r.save(&[skill("calc", "1")], false).unwrap();
+        r.set_writeable(false);
+        assert!(!r.delete("calc").unwrap());
+        assert_eq!(r.clear_all_skills().unwrap(), 0);
+        assert!(r.skill_exists("calc").unwrap());
+        assert!(!r.get_repository_info().writable);
+    }
 }

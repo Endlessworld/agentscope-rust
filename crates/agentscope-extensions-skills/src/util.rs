@@ -227,4 +227,46 @@ mod tests {
         m.insert("extra".into(), Value::Bool(true));
         assert!(has_extended_metadata(&m));
     }
+
+    /// Java parity: `MAX_SKILL_NAME_LENGTH = 255`, counted in characters (not bytes), so a
+    /// 255-character name passes and 256 fails - regardless of multi-byte content.
+    #[test]
+    fn skill_name_length_limit_is_counted_in_characters() {
+        assert!(validate_skill_name(&"a".repeat(MAX_SKILL_NAME_LENGTH)).is_ok());
+        assert!(validate_skill_name(&"a".repeat(MAX_SKILL_NAME_LENGTH + 1)).is_err());
+        // 255 CJK characters are 765 bytes: a byte-based limit would reject them.
+        assert!(validate_skill_name(&"\u{6280}".repeat(MAX_SKILL_NAME_LENGTH)).is_ok());
+    }
+
+    /// Java parity: `validateResourcePath` bounds the path to 500 characters and only rejects
+    /// blanks - sub-directories and `.` segments are allowed (only `..` is blocked elsewhere).
+    #[test]
+    fn resource_path_validation_bounds() {
+        assert!(validate_resource_path("refs/table.csv").is_ok());
+        assert!(validate_resource_path(&"r".repeat(MAX_RESOURCE_PATH_LENGTH)).is_ok());
+        assert!(validate_resource_path(&"r".repeat(MAX_RESOURCE_PATH_LENGTH + 1)).is_err());
+        assert!(validate_resource_path("   ").is_err());
+    }
+
+    /// P2-02: the identifier limit is backend-specific (MySQL 64 / PostgreSQL 63); the same
+    /// 64-character name is legal for MySQL and illegal for PostgreSQL.
+    #[test]
+    fn identifier_length_limits_are_backend_specific() {
+        let name = "a".repeat(64);
+        assert!(validate_identifier(&name, "table", 64).is_ok());
+        assert!(validate_identifier(&name, "table", 63).is_err());
+        assert!(validate_identifier("", "table", 64).is_err());
+    }
+
+    /// `deserialize_metadata` falls back to the legacy columns when `metadata_json` is absent,
+    /// blank or malformed (Java `JsonUtils` swallow-and-warn).
+    #[test]
+    fn malformed_metadata_json_falls_back_to_columns() {
+        for json in [None, Some("   "), Some("{not json")] {
+            let m = deserialize_metadata(json, "n", "d");
+            assert_eq!(m.get("name"), Some(&Value::String("n".into())));
+            assert_eq!(m.get("description"), Some(&Value::String("d".into())));
+            assert_eq!(m.len(), 2, "only the authoritative columns remain");
+        }
+    }
 }

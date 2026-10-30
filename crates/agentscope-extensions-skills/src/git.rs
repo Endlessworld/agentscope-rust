@@ -502,12 +502,18 @@ impl AgentSkillRepository for GitSkillRepository {
 
     fn close(&self) -> Result<(), SkillRepositoryError> {
         if self.owns_temp_dir && self.local_path.exists() {
-            std::fs::remove_dir_all(&self.local_path).map_err(|e| {
-                SkillRepositoryError::Io(format!(
-                    "failed to cleanup local repository directory {}: {e}",
-                    self.local_path.display()
-                ))
-            })?;
+            // Java `GitSkillRepository#close` only logs a failed cleanup (`LOGGER.warn`) and
+            // returns normally: a leaked temp directory must not fail the caller's shutdown
+            // path. The trait keeps `Result` for backends that *can* fail (a driver that must
+            // flush), but a filesystem cleanup failure is logged and swallowed here so the
+            // semantics match Java byte for byte.
+            if let Err(e) = std::fs::remove_dir_all(&self.local_path) {
+                tracing::warn!(
+                    path = %self.local_path.display(),
+                    error = %e,
+                    "failed to cleanup local repository directory"
+                );
+            }
         }
         Ok(())
     }
@@ -1470,6 +1476,53 @@ mod tests {
         repo.close().unwrap();
         assert!(local.join(".git").is_dir(), "an explicit path must survive");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P2-09: a temp clone owned by the repository is removed by `close()`, and a second call
+    /// is a no-op (Java `close()` is idempotent).
+    #[test]
+    fn close_removes_an_owned_temp_dir_and_is_idempotent() {
+        let root = unique_dir("close-owned");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = GitSkillRepository::new(file_url(&remote)).unwrap();
+        assert_eq!(repo.get_all_skill_names().unwrap(), vec!["one".to_string()]);
+        let local = repo.local_path().to_path_buf();
+        assert!(local.is_dir());
+        repo.close().unwrap();
+        assert!(!local.exists(), "an owned temp clone must be removed");
+        // Second call is a no-op, not an error.
+        repo.close().unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P2-09 (adjudicated): Java `GitSkillRepository#close` only logs a failed cleanup
+    /// (`LOGGER.warn`) and returns normally, so a leaked temp directory can never fail the
+    /// caller's shutdown path. Rust keeps the `Result` return type (the trait serves backends
+    /// that *can* fail) but swallows the filesystem failure the same way. On Windows an open
+    /// handle inside the tree makes `remove_dir_all` fail, which pins the swallow branch.
+    #[test]
+    fn close_never_returns_a_cleanup_failure() {
+        let root = unique_dir("close-failing");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = GitSkillRepository::new(file_url(&remote)).unwrap();
+        assert_eq!(repo.get_all_skill_names().unwrap().len(), 1);
+        let local = repo.local_path().to_path_buf();
+        // Keep a handle open so the directory cannot be unlinked on Windows.
+        let held = std::fs::File::open(local.join(".git").join("HEAD")).ok();
+        assert!(repo.close().is_ok(), "a failed cleanup must not surface as Err");
+        drop(held);
+
+        let _ = std::fs::remove_dir_all(&local);
         let _ = std::fs::remove_dir_all(&root);
     }
 

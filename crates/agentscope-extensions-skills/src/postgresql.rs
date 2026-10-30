@@ -966,4 +966,59 @@ mod tests {
         assert!(!beta.skill_exists("alpha-one").unwrap());
         assert_ne!(alpha.get_source(), beta.get_source());
     }
+
+    /// Java parity: `getAllSkillNames` / `getAllSkills` are ordered and keep resources grouped.
+    #[test]
+    fn all_skills_are_listed_in_name_order() {
+        let r = repo();
+        r.save(&[skill("zeta", "z"), skill("alpha", "a")], false)
+            .unwrap();
+        assert_eq!(
+            r.get_all_skill_names().unwrap(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+        let all = r.get_all_skills().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name(), "alpha");
+        assert_eq!(
+            all[0].resources().get("r/data.json").map(|c| c.as_str()),
+            Some("{}")
+        );
+    }
+
+    /// Java parity: `clearAllSkills` reports the number of removed skills and cascades to the
+    /// resource rows (the foreign key is `ON DELETE CASCADE`).
+    #[test]
+    fn clear_all_skills_reports_the_removed_count() {
+        let r = repo();
+        r.save(&[skill("a", "1"), skill("b", "2")], false).unwrap();
+        assert_eq!(r.clear_all_skills().unwrap(), 2);
+        assert!(r.get_all_skills().unwrap().is_empty());
+        // Idempotent: clearing an empty store is 0, not an error.
+        assert_eq!(r.clear_all_skills().unwrap(), 0);
+    }
+
+    /// The trait's default `skill_dir` / `close` apply to the SQL backend: skills live in rows,
+    /// so the adapter materialises them and `close` is a no-op that never fails.
+    #[test]
+    fn sql_backend_has_no_skill_dir_and_closes_cleanly() {
+        let r = repo();
+        r.save(&[skill("p", "1")], false).unwrap();
+        assert_eq!(r.skill_dir("p"), None);
+        assert!(r.close().is_ok());
+        assert!(r.close().is_ok());
+    }
+
+    /// `setWriteable(false)` must block `delete` / `clearAllSkills` as well as `save`, and the
+    /// reported repository info follows the flag.
+    #[test]
+    fn read_only_blocks_delete_and_clear() {
+        let r = repo();
+        r.save(&[skill("p", "1")], false).unwrap();
+        r.set_writeable(false);
+        assert!(!r.delete("p").unwrap());
+        assert_eq!(r.clear_all_skills().unwrap(), 0);
+        assert!(r.skill_exists("p").unwrap());
+        assert!(!r.get_repository_info().writable);
+    }
 }

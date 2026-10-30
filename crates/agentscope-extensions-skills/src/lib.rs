@@ -27,6 +27,11 @@ pub mod git;
 pub mod mysql;
 pub mod postgresql;
 
+/// Real (feature-gated) `SqlDatabase` drivers. Empty unless `postgres-driver` / `mysql-driver`
+/// is enabled, so the default build pulls in no driver dependency.
+#[cfg(any(feature = "postgres-driver", feature = "mysql-driver"))]
+pub mod driver;
+
 pub use error::SkillRepositoryError;
 pub use repository::{AgentSkillRepository, AgentSkillRepositoryInfo, RepoBackedSkillRepository};
 pub use sql::{InMemorySqlDatabase, SqlConnection, SqlDatabase, SqlParam, SqlRow, SqlValue};
@@ -34,3 +39,8 @@ pub use sql::{InMemorySqlDatabase, SqlConnection, SqlDatabase, SqlParam, SqlRow,
 pub use git::{GitSkillRepository, GitSkillRepositoryConfig};
 pub use mysql::{MysqlSkillRepository, MysqlSkillRepositoryConfig};
 pub use postgresql::{PostgresSkillRepository, PostgresSkillRepositoryConfig};
+
+#[cfg(feature = "postgres-driver")]
+pub use driver::{PgSqlConnection, PgSqlDatabase};
+#[cfg(feature = "mysql-driver")]
+pub use driver::{MysqlSqlConnection, MysqlSqlDatabase};
