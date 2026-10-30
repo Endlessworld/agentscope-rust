@@ -9,6 +9,7 @@
 //! `"OpenAITextEmbedding only supports TextBlock, but got: ImageBlock"`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +38,11 @@ pub const PROVIDER: &str = "openai";
 ///
 /// Built through [`OpenAiTextEmbedding::builder`], which validates the same required fields as
 /// the Java builder (api key, model name, positive dimensions).
+///
+/// The HTTP client is created once in [`OpenAiTextEmbedding::builder`] and shared by every call
+/// and every retry — Java `07c5f3078` fixed the same leak in `OpenAITextEmbedding`, which built a
+/// new SDK client per subscription. Call [`OpenAiTextEmbedding::close`] when the model is no
+/// longer needed: subsequent embeddings fail immediately and never enter the retry pipeline.
 pub struct OpenAiTextEmbedding {
     api_key: String,
     model_name: String,
@@ -45,6 +51,7 @@ pub struct OpenAiTextEmbedding {
     execution: EmbeddingExecutionConfig,
     transport: Arc<dyn HttpTransport>,
     usage_listener: Option<UsageListener>,
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for OpenAiTextEmbedding {
@@ -53,6 +60,7 @@ impl std::fmt::Debug for OpenAiTextEmbedding {
             .field("model_name", &self.model_name)
             .field("dimensions", &self.dimensions)
             .field("base_url", &self.base_url)
+            .field("closed", &self.is_closed())
             .finish_non_exhaustive()
     }
 }
@@ -77,6 +85,35 @@ impl OpenAiTextEmbedding {
     /// The execution (timeout + retry) configuration.
     pub fn execution_config(&self) -> &EmbeddingExecutionConfig {
         &self.execution
+    }
+
+    /// Closes the model so that further embeddings fail without entering the retry pipeline.
+    ///
+    /// Ports Java `OpenAITextEmbedding#close` (commit `07c5f3078`, `AutoCloseable`). Repeated
+    /// calls have no effect and closing an unused model performs no I/O, matching Java
+    /// `closingUnusedModelDoesNotCreateClient`.
+    ///
+    /// Embedding futures created **before** the close but first polled afterwards also fail:
+    /// the closed check runs when the future is polled, exactly like Java's subscription-time
+    /// `Mono.defer` guard. Wait for in-flight embeddings to finish before closing.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::close`] has been called (Java `closed`).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Rejects every call after [`Self::close`] with the Java error text.
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(RagError::Embedding(format!(
+                "OpenAITextEmbedding is closed (model={}, provider={PROVIDER})",
+                self.model_name
+            )));
+        }
+        Ok(())
     }
 
     /// Builds the wire request for `block` without sending it.
@@ -168,6 +205,9 @@ impl EmbeddingModel for OpenAiTextEmbedding {
     }
 
     async fn embed_with_usage(&self, block: &ContentBlock) -> Result<EmbeddingResponse> {
+        // Checked before the retry pipeline so a closed model emits exactly one error and
+        // never sleeps / re-sends (Java `closedModelDoesNotRetryEvenWhenRetriesAreEnabled`).
+        self.ensure_open()?;
         let response = self.embed_inner(block).await?;
         if let Some(listener) = &self.usage_listener {
             listener(&response.usage);
@@ -181,6 +221,10 @@ impl EmbeddingModel for OpenAiTextEmbedding {
 
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn close(&self) {
+        OpenAiTextEmbedding::close(self);
     }
 }
 
@@ -228,6 +272,7 @@ impl OpenAiEmbeddingResponseBody {
                     input_tokens: input,
                     output_tokens: 0,
                     total_tokens: total,
+                    time_seconds: None,
                 }
             }
             None => EmbeddingUsage::default(),
@@ -342,6 +387,7 @@ impl OpenAiTextEmbeddingBuilder {
             execution,
             transport,
             usage_listener: self.usage_listener,
+            closed: AtomicBool::new(false),
         })
     }
 }
@@ -410,14 +456,11 @@ mod tests {
 
         assert_eq!(response.embedding, vec![0.1, 0.2, 0.3]);
         assert_eq!(response.dimensions(), 3);
-        assert_eq!(
-            response.usage,
-            EmbeddingUsage {
-                input_tokens: 6,
-                output_tokens: 0,
-                total_tokens: 6
-            }
-        );
+        // `with_elapsed` also stamps `usage.time_seconds` (Java `EmbeddingUsage.time`).
+        assert_eq!(response.usage.input_tokens, 6);
+        assert_eq!(response.usage.output_tokens, 0);
+        assert_eq!(response.usage.total_tokens, 6);
+        assert!(response.usage.time_seconds.is_some());
         assert_eq!(response.model, "text-embedding-3-small");
         assert!(response.elapsed.is_some());
         assert_eq!(transport.requests().len(), 1);
@@ -598,5 +641,103 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("dimensions must be positive"));
+    }
+
+    // ---- lifecycle (Java `OpenAITextEmbeddingLifecycleTest`, commit 07c5f3078) ----
+
+    #[tokio::test]
+    async fn repeated_calls_reuse_one_transport() {
+        // Java built a new SDK client per subscription (and per retry), accumulating resources
+        // until 07c5f3078 made it lazy-but-single. The Rust port builds one transport in
+        // `build()` and every call goes through that instance.
+        let transport =
+            ScriptedTransport::with_responses((0..20).map(|_| HttpResponse::new(200, success_body())).collect());
+        let model = model(transport.clone());
+        for _ in 0..20 {
+            model
+                .embed(&ContentBlock::Text(TextBlock::new("hello")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(transport.requests().len(), 20);
+        assert!(!model.is_closed());
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent_and_rejects_later_embeddings() {
+        let transport =
+            ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
+        let model = model(transport.clone());
+        model
+            .embed(&ContentBlock::Text(TextBlock::new("hello")))
+            .await
+            .unwrap();
+
+        model.close();
+        model.close();
+        assert!(model.is_closed());
+
+        let err = model
+            .embed(&ContentBlock::Text(TextBlock::new("hello")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("OpenAITextEmbedding is closed"),
+            "err={err}"
+        );
+        // The rejected call never reached the transport.
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_model_bypasses_the_retry_pipeline() {
+        // Java `closedModelDoesNotRetryEvenWhenRetriesAreEnabled`, uninitialized variant: a
+        // closed model must fail before the retry wrapper, so the transport is never touched.
+        let transport = ScriptedTransport::with_responses(vec![]);
+        let model = OpenAiTextEmbedding::builder()
+            .api_key("k")
+            .model_name("m")
+            .dimensions(3)
+            .base_url("https://api.test/v1")
+            .execution_config(EmbeddingExecutionConfig::disabled().with_retry(RetryPolicy::new(3)))
+            .build()
+            .unwrap()
+            .with_transport(transport.clone());
+        model.close();
+
+        let err = model
+            .embed(&ContentBlock::Text(TextBlock::new("hi")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("closed"), "err={err}");
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn future_created_before_close_is_rejected() {
+        // Mirrors Java's "Mono created before close(), subscribed after".
+        let transport =
+            ScriptedTransport::with_responses(vec![HttpResponse::new(200, success_body())]);
+        let model = model(transport.clone());
+        let block = ContentBlock::Text(TextBlock::new("hello"));
+        let pending = model.embed(&block);
+        model.close();
+
+        let err = pending.await.unwrap_err();
+        assert!(err.to_string().contains("closed"), "err={err}");
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trait_object_close_marks_the_model_closed() {
+        let transport = ScriptedTransport::with_responses(vec![]);
+        let model: Arc<dyn EmbeddingModel> = Arc::new(model(transport));
+        model.close();
+
+        let err = model
+            .embed(&ContentBlock::Text(TextBlock::new("hi")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("closed"), "err={err}");
     }
 }

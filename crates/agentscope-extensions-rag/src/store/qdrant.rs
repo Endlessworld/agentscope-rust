@@ -240,6 +240,10 @@ impl QdrantConfigBuilder {
 /// Mirrors Java `parseLocation`: HTTP(S) URLs are used as-is (trailing `/` stripped), a bare
 /// `host` or `host:port` gets an `http(s)://` prefix. Two Java-only forms are rejected
 /// because Qdrant serves them over gRPC/local mode only: `:memory:` and `file://...`.
+///
+/// Scheme-less locations are parsed as an authority, never as a URI: Java 2a682f8bf fixed
+/// `127.0.0.1:6334` being rejected by `URI.create` (a scheme cannot start with a digit) and
+/// silently degrading the whole string to a hostname; see [`split_authority`].
 pub fn parse_rest_base_url(location: &str, tls: bool) -> Result<String> {
     let trimmed = location.trim();
     if trimmed.is_empty() {
@@ -258,18 +262,33 @@ pub fn parse_rest_base_url(location: &str, tls: bool) -> Result<String> {
     }
 
     let scheme = if tls { "https" } else { "http" };
-    let authority = trimmed.trim_end_matches('/');
-    if has_explicit_port(authority) {
-        Ok(format!("{scheme}://{authority}"))
-    } else {
-        Ok(format!("{scheme}://{authority}:{DEFAULT_HTTP_PORT}"))
+    let (host, port) = split_authority(trimmed.trim_end_matches('/'));
+    match port {
+        Some(port) => Ok(format!("{scheme}://{host}:{port}")),
+        None => Ok(format!("{scheme}://{host}:{DEFAULT_HTTP_PORT}")),
     }
 }
 
-fn has_explicit_port(authority: &str) -> bool {
+/// Splits a scheme-less `host[:port]` authority into its host and an explicit port.
+///
+/// Covers the locations Java 2a682f8bf had to special-case because `URI.create` cannot parse
+/// them: dotted IPs (`127.0.0.1:6334`, `10.0.0.5:7334`) and bare host names (`my_host:6334`)
+/// were rejected outright and then degraded to `host = "127.0.0.1:16334"`. A bare IPv6 literal
+/// (`::1`) is additionally bracketed so the resulting URL stays valid; Java only accepted the
+/// bracketed form (`[::1]:6334`).
+fn split_authority(authority: &str) -> (String, Option<String>) {
+    if authority.matches(':').count() > 1 && !authority.starts_with('[') {
+        return (format!("[{authority}]"), None);
+    }
     match authority.rsplit_once(':') {
-        Some((_, port)) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
-        None => false,
+        Some((host, port))
+            if !host.is_empty()
+                && !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            (host.to_string(), Some(port.to_string()))
+        }
+        _ => (authority.to_string(), None),
     }
 }
 
@@ -847,6 +866,66 @@ mod tests {
         assert_eq!(
             parse_rest_base_url(" qdrant.internal ", false).unwrap(),
             "http://qdrant.internal:6333"
+        );
+    }
+
+    #[test]
+    fn parse_base_url_accepts_scheme_less_ip_locations() {
+        // Java 2a682f8bf: a scheme-less location is a host[:port] authority, not a URI.
+        // `URI.create("127.0.0.1:6334")` throws (a scheme cannot start with a digit) and the
+        // old catch block turned the whole string into the hostname, so the store failed to
+        // build. The REST port keeps the explicit port as-is (Java increments 6333 -> 6334
+        // only because it then speaks gRPC).
+        for (location, expected) in [
+            ("http://localhost:6333", "http://localhost:6333"),
+            ("https://qdrant.example.com", "https://qdrant.example.com"),
+            ("http://127.0.0.1:16334", "http://127.0.0.1:16334"),
+            ("localhost:6334", "http://localhost:6334"),
+            ("localhost", "http://localhost:6333"),
+            ("qdrant-0.svc:7334", "http://qdrant-0.svc:7334"),
+            ("127.0.0.1:6334", "http://127.0.0.1:6334"),
+            ("10.0.0.5:7334", "http://10.0.0.5:7334"),
+            ("127.0.0.1", "http://127.0.0.1:6333"),
+            ("my_host:6334", "http://my_host:6334"),
+            ("[::1]:6334", "http://[::1]:6334"),
+            ("[::1]", "http://[::1]:6333"),
+            // Bare IPv6 literals are bracketed so the URL stays valid (Java only accepted
+            // the bracketed form).
+            ("::1", "http://[::1]:6333"),
+            ("2001:db8::1", "http://[2001:db8::1]:6333"),
+        ] {
+            assert_eq!(
+                parse_rest_base_url(location, false).unwrap(),
+                expected,
+                "location = {location}"
+            );
+        }
+
+        assert_eq!(
+            parse_rest_base_url("127.0.0.1:6334", true).unwrap(),
+            "https://127.0.0.1:6334"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_a_scheme_less_ip_location() {
+        let config = QdrantConfig::builder()
+            .location("127.0.0.1:6334")
+            .collection_name("knowledge")
+            .dimensions(2)
+            .build()
+            .unwrap();
+        assert_eq!(config.location(), "127.0.0.1:6334");
+        // Java defaults `useTransportLayerSecurity = true`, so a scheme-less authority keeps
+        // https; the fix is that the location parses at all (previously the store failed to
+        // build). Turning TLS off yields plain http.
+        assert_eq!(
+            parse_rest_base_url(config.location(), config.use_transport_layer_security()).unwrap(),
+            "https://127.0.0.1:6334"
+        );
+        assert_eq!(
+            parse_rest_base_url(config.location(), false).unwrap(),
+            "http://127.0.0.1:6334"
         );
     }
 

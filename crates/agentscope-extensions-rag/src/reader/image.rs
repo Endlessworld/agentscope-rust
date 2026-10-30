@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::model::{Document, DocumentMetadata};
 use crate::reader::utils::generate_doc_id_md5;
-use crate::reader::{Reader, ReaderInput};
+use crate::reader::{input_as_path, Reader, ReaderInput};
 
 /// Extensions supported by [`ImageReader`] (Java `getSupportedFormats`).
 pub const SUPPORTED_FORMATS: [&str; 7] = ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"];
@@ -63,18 +63,6 @@ impl Reader for ImageReader {
             .iter()
             .map(|format| (*format).to_string())
             .collect()
-    }
-}
-
-/// Resolves a [`ReaderInput`] to the path / URL string the reader needs.
-///
-/// Java's `ReaderInput.asString()` returned whatever string the input was built with, which for
-/// `fromFile(path)` is the path. Rust's [`ReaderInput::as_string`] eagerly reads file *contents*,
-/// which an image reader must not do, so the path is taken directly here.
-fn input_as_path(input: &ReaderInput) -> String {
-    match input {
-        ReaderInput::String(value) => value.clone(),
-        ReaderInput::File(path) => path.display().to_string(),
     }
 }
 

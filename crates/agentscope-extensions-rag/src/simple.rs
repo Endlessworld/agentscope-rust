@@ -5,15 +5,14 @@
 //! root because they are shared with other backends).
 //!
 //! The Java submodule also ships HTTP embedding providers (`dashscope`, `ollama`, `openai`),
-//! now ported in [`crate::embedding`], and external vector stores (`ElasticsearchStore`,
-//! `MilvusStore`, `PgVectorStore`, `QdrantStore`), still tracked as gaps in
-//! `RAG__GAP_TRACKER.md` §3.2.
+//! ported in [`crate::embedding`], and external vector stores (`ElasticsearchStore`,
+//! `MilvusStore`, `PgVectorStore`, `QdrantStore`), ported in [`crate::store`].
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::embedding::EmbeddingModel;
+use crate::embedding::{EmbeddingModel, EmbeddingResponse, UsageListener};
 use crate::error::{RagError, Result};
 use crate::knowledge::{filter_and_rank, Knowledge};
 use crate::model::{Document, RetrieveConfig};
@@ -24,21 +23,34 @@ use crate::store::{SearchQuery, VdbStore};
 /// Ports `io.agentscope.core.rag.knowledge.SimpleKnowledge`:
 /// * `add_documents`: embed every document's content, then batch-store them.
 /// * `retrieve`: embed the query, search the store, filter/sort/limit.
+///
+/// Both paths report the provider's [`crate::embedding::EmbeddingUsage`] to an optional
+/// [`UsageListener`], exactly like Java's `usageListener` callback.
 pub struct SimpleKnowledge {
     embedding_model: Arc<dyn EmbeddingModel>,
     embedding_store: Arc<dyn VdbStore>,
+    usage_listener: Option<UsageListener>,
 }
 
 impl SimpleKnowledge {
     /// Creates a knowledge base from an embedding model and a vector store.
-    pub fn new(
-        embedding_model: Arc<dyn EmbeddingModel>,
-        embedding_store: Arc<dyn VdbStore>,
-    ) -> Self {
+    pub fn new(embedding_model: Arc<dyn EmbeddingModel>, embedding_store: Arc<dyn VdbStore>) -> Self {
         Self {
             embedding_model,
             embedding_store,
+            usage_listener: None,
         }
+    }
+
+    /// Registers a token-usage callback (Java builder `usageListener`).
+    pub fn with_usage_listener(mut self, listener: UsageListener) -> Self {
+        self.usage_listener = Some(listener);
+        self
+    }
+
+    /// The registered usage callback, if any.
+    pub fn usage_listener(&self) -> Option<&UsageListener> {
+        self.usage_listener.as_ref()
     }
 
     /// The embedding model backing this knowledge base.
@@ -49,6 +61,13 @@ impl SimpleKnowledge {
     /// The vector store backing this knowledge base.
     pub fn embedding_store(&self) -> &Arc<dyn VdbStore> {
         &self.embedding_store
+    }
+
+    /// Notifies the listener after an embedding response (Java `notifyUsage`).
+    fn notify_usage(&self, response: &EmbeddingResponse) {
+        if let Some(listener) = &self.usage_listener {
+            listener(&response.usage);
+        }
     }
 }
 
@@ -61,11 +80,12 @@ impl Knowledge for SimpleKnowledge {
 
         let mut embedded = Vec::with_capacity(documents.len());
         for mut document in documents {
-            let embedding = self
+            let response = self
                 .embedding_model
-                .embed(&document.metadata.content)
+                .embed_with_usage(&document.metadata.content)
                 .await?;
-            document.set_embedding(embedding);
+            self.notify_usage(&response);
+            document.set_embedding(response.embedding);
             embedded.push(document);
         }
 
@@ -80,11 +100,12 @@ impl Knowledge for SimpleKnowledge {
         let query_block = agentscope_core::message::ContentBlock::Text(
             agentscope_core::message::TextBlock::new(query),
         );
-        let query_embedding = self.embedding_model.embed(&query_block).await?;
+        let response = self.embedding_model.embed_with_usage(&query_block).await?;
+        self.notify_usage(&response);
 
         // Java passes `scoreThreshold = null` to the store and filters afterwards;
         // the shared `filter_and_rank` helper reproduces that final step.
-        let mut search = SearchQuery::new(query_embedding, config.limit);
+        let mut search = SearchQuery::new(response.embedding, config.limit);
         if let Some(name) = &config.vector_name {
             search = search.with_vector_name(name.clone());
         }
@@ -125,6 +146,7 @@ impl Knowledge for EmptyKnowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::EmbeddingUsage;
     use crate::model::DocumentMetadata;
     use crate::reader::{Reader, ReaderInput, SplitStrategy, TextReader};
     use std::sync::Arc;
@@ -264,5 +286,90 @@ mod tests {
             knowledge.add_documents(vec![text_doc("x", "d", "0")]).await,
             Err(RagError::Unsupported(_))
         ));
+    }
+
+    /// Embedder that reports usage, like the HTTP providers do.
+    struct UsageEmbedding {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl EmbeddingModel for UsageEmbedding {
+        async fn embed(
+            &self,
+            block: &agentscope_core::message::ContentBlock,
+        ) -> Result<Vec<f64>> {
+            Ok(self.embed_with_usage(block).await?.embedding)
+        }
+
+        async fn embed_with_usage(
+            &self,
+            _block: &agentscope_core::message::ContentBlock,
+        ) -> Result<EmbeddingResponse> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(EmbeddingResponse::new(
+                vec![1.0, 0.0],
+                EmbeddingUsage::new(7, 0).with_time_seconds(0.125),
+                "usage-model",
+            ))
+        }
+
+        fn model_name(&self) -> &str {
+            "usage-model"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_listener_receives_add_and_retrieve_usage() {
+        // Java `SimpleKnowledge` calls `notifyUsage` after every embedding in `addDocuments`
+        // and once in `retrieve`.
+        let seen: Arc<std::sync::Mutex<Vec<EmbeddingUsage>>> = Arc::new(Default::default());
+        let sink = seen.clone();
+        let store = Arc::new(crate::store::InMemoryStore::new(2).unwrap());
+        let knowledge = SimpleKnowledge::new(
+            Arc::new(UsageEmbedding {
+                calls: std::sync::Mutex::new(0),
+            }),
+            store,
+        )
+        .with_usage_listener(Arc::new(move |usage: &EmbeddingUsage| {
+            sink.lock().unwrap().push(*usage);
+        }));
+        assert!(knowledge.usage_listener().is_some());
+
+        knowledge
+            .add_documents(vec![text_doc("a", "d1", "0"), text_doc("b", "d2", "0")])
+            .await
+            .unwrap();
+        knowledge
+            .retrieve("a", &RetrieveConfig::new(1, 0.0))
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].input_tokens, 7);
+        assert_eq!(seen[0].total_tokens, 7);
+        assert_eq!(seen[0].time_seconds, Some(0.125));
+    }
+
+    #[tokio::test]
+    async fn no_usage_listener_is_a_no_op() {
+        let store = Arc::new(crate::store::InMemoryStore::new(2).unwrap());
+        let knowledge = SimpleKnowledge::new(
+            Arc::new(UsageEmbedding {
+                calls: std::sync::Mutex::new(0),
+            }),
+            store,
+        );
+        assert!(knowledge.usage_listener().is_none());
+        knowledge
+            .add_documents(vec![text_doc("a", "d1", "0")])
+            .await
+            .unwrap();
     }
 }

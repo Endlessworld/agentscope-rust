@@ -485,6 +485,7 @@ impl DashScopeEmbeddingEnvelope {
             },
             output_tokens: output,
             total_tokens: total,
+            time_seconds: None,
         }
     }
 }
@@ -928,7 +929,8 @@ mod tests {
             EmbeddingUsage {
                 input_tokens: 2,
                 output_tokens: 3,
-                total_tokens: 5
+                total_tokens: 5,
+                time_seconds: response.usage.time_seconds,
             }
         );
     }

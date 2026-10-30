@@ -22,11 +22,15 @@
 //!   [`DashScopeMultiModalEmbedding`](embedding::DashScopeMultiModalEmbedding),
 //!   [`OllamaTextEmbedding`](embedding::OllamaTextEmbedding)).
 //! * [`reader`] — [`Reader`](reader::Reader), [`TextReader`](reader::TextReader),
-//!   [`ImageReader`](reader::ImageReader), the `ReaderUtils` id helpers and the
+//!   [`ImageReader`](reader::ImageReader), [`ExternalApiReader`](reader::ExternalApiReader)
+//!   (caller-injected parsing API), the `ReaderUtils` id helpers and the
 //!   character/paragraph/token chunking algorithms.
 //! * [`message`] — mapping retrieved documents onto [`agentscope_core::message::Msg`],
 //!   covering both the agentic-tool format and the generic-hook `<retrieved_knowledge>`
 //!   injection.
+//! * [`hook`] — [`RagMode`](hook::RagMode), the [`GenericRagHook`](hook::GenericRagHook)
+//!   automatic-retrieval hook and its `Middleware` adapter
+//!   ([`GenericRagMiddleware`](hook::GenericRagMiddleware)).
 //! * [`retry`] — the exponential-backoff retry helper used by HTTP backends.
 //! * [`simple`] — [`SimpleKnowledge`](simple::SimpleKnowledge), a local, fully offline
 //!   embedding + in-memory vector store knowledge base.
@@ -59,6 +63,7 @@ pub mod embedding;
 pub mod error;
 pub mod hash;
 pub mod haystack;
+pub mod hook;
 pub mod knowledge;
 pub mod message;
 pub mod model;
@@ -76,13 +81,18 @@ pub use embedding::{
     OpenAiTextEmbedding, OpenAiTextEmbeddingBuilder, UsageListener, DEFAULT_DIMENSIONS,
 };
 pub use error::{RagError, Result};
+pub use hook::{GenericRagHook, GenericRagMiddleware, RagMode};
 pub use knowledge::{filter_and_rank, Knowledge};
 pub use message::{
     build_retrieved_knowledge_msg, extract_query_from_messages, format_documents_for_tool,
     RETRIEVED_KNOWLEDGE_CLOSE, RETRIEVED_KNOWLEDGE_OPEN,
 };
 pub use model::{Document, DocumentMetadata, RetrieveConfig};
-pub use reader::{chunk_text, ImageReader, Reader, ReaderInput, SplitStrategy, TextReader};
+pub use reader::{
+    chunk_text, BodyAsMarkdown, ExternalApiReader, ExternalApiReaderBuilder,
+    ExternalApiRequestBuilder, ExternalApiResponseParser, ImageReader, Reader, ReaderInput,
+    SplitStrategy, TextReader,
+};
 pub use simple::{in_memory_knowledge, EmptyKnowledge, SimpleKnowledge};
 pub use store::{
     cosine_similarity, euclidean_distance, squared_euclidean_distance, ElasticsearchConfig,

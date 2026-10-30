@@ -347,7 +347,8 @@ mod tests {
             EmbeddingUsage {
                 input_tokens: 7,
                 output_tokens: 0,
-                total_tokens: 7
+                total_tokens: 7,
+                time_seconds: response.usage.time_seconds,
             }
         );
         assert_eq!(response.model, "nomic-embed-text");

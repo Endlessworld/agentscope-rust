@@ -1,12 +1,13 @@
 //! Document readers and text chunking.
 //!
 //! Ports `io.agentscope.core.rag.reader` (`Reader`, `ReaderInput`, `AbstractChunkingReader`,
-//! `TextReader`, `TextChunker`, `SplitStrategy`).
+//! `TextReader`, `TextChunker`, `SplitStrategy`, `ReaderUtils`, `ImageReader`, `ExternalApiReader`).
 //!
-//! The Java `TikaReader` / `PDFReader` / `WordReader` / `ExternalApiReader`
-//! depend on JVM libraries (Apache Tika, PDFBox, POI) and external services; they are left
-//! as gaps (tracker §3, P2). `TextReader`, the chunking algorithm, the dependency-free
-//! [`ImageReader`] and the id helpers (`ReaderUtils`) are fully ported.
+//! The Java `TikaReader` / `PDFReader` / `WordReader` depend on JVM libraries (Apache Tika,
+//! PDFBox, POI) and are a deliberate non-migration (tracker §3.3, P2). `TextReader`, the
+//! chunking algorithm, the dependency-free [`ImageReader`], the id helpers (`ReaderUtils`) and
+//! the [`ExternalApiReader`] (caller-injected request/response contract over
+//! [`crate::transport`]) are fully ported.
 
 use agentscope_core::message::ContentBlock;
 use async_trait::async_trait;
@@ -14,9 +15,14 @@ use async_trait::async_trait;
 use crate::error::{RagError, Result};
 use crate::model::{Document, DocumentMetadata};
 
+pub mod external_api;
 pub mod image;
 pub mod utils;
 
+pub use external_api::{
+    BodyAsMarkdown, ExternalApiReader, ExternalApiReaderBuilder, ExternalApiRequestBuilder,
+    ExternalApiResponseParser,
+};
 pub use image::{ImageReader, SUPPORTED_FORMATS};
 pub use utils::{
     bytes_to_hex, generate_doc_id, generate_doc_id_md5, generate_doc_id_sha256, DocIdAlgorithm,
@@ -93,6 +99,18 @@ pub trait Reader: Send + Sync {
 
     /// File extensions supported by this reader.
     fn supported_formats(&self) -> Vec<String>;
+}
+
+/// Resolves a [`ReaderInput`] to its path / URL string.
+///
+/// Java's `ReaderInput.asString()` returned whatever string the input was built with, which for
+/// `fromFile(path)` is the path. Rust's [`ReaderInput::as_string`] eagerly reads file *contents*,
+/// which path-based readers ([`ImageReader`], [`ExternalApiReader`]) must not do.
+pub(crate) fn input_as_path(input: &ReaderInput) -> String {
+    match input {
+        ReaderInput::String(value) => value.clone(),
+        ReaderInput::File(path) => path.display().to_string(),
+    }
 }
 
 /// Validates chunking parameters.

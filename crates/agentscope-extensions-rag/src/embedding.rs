@@ -40,16 +40,17 @@ pub const DEFAULT_DIMENSIONS: usize = 1024;
 
 /// Callback invoked with the token usage of every completed embedding call.
 ///
-/// Java's `EmbeddingModel` exposed neither a usage DTO nor a listener (the vendor SDK kept the
-/// `usage` block private), so token accounting was not observable from the RAG layer. The Rust
-/// port carries it explicitly because every provider below already parses the field.
+/// Mirrors Java `SimpleKnowledge.usageListener` / `EmbeddingModel`'s `Consumer<EmbeddingUsage>`;
+/// see `EmbeddingUsage` for the field mapping.
 pub type UsageListener = Arc<dyn Fn(&EmbeddingUsage) + Send + Sync>;
 
 /// Token usage reported by an embedding provider.
 ///
 /// `input_tokens` covers text tokens (and image + text tokens for the multimodal DashScope
-/// API); `output_tokens` is only non-zero for multimodal models.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// API); `output_tokens` is only non-zero for multimodal models. `time_seconds` carries the
+/// client-side duration Java keeps inside the usage object (`EmbeddingUsage.getTime()`), because
+/// a [`UsageListener`] only ever sees the usage record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingUsage {
     /// Tokens billed as input.
     #[serde(default)]
@@ -60,6 +61,10 @@ pub struct EmbeddingUsage {
     /// Total tokens reported by the provider.
     #[serde(default)]
     pub total_tokens: u64,
+    /// Client-side duration of the call in seconds (Java `EmbeddingUsage.time`); `None` when
+    /// the call was not timed (e.g. a local model or a hand-built usage record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_seconds: Option<f64>,
 }
 
 impl EmbeddingUsage {
@@ -69,12 +74,19 @@ impl EmbeddingUsage {
             input_tokens,
             output_tokens,
             total_tokens: input_tokens + output_tokens,
+            time_seconds: None,
         }
     }
 
     /// Overrides `total_tokens` with the value the provider reported verbatim.
     pub fn with_total_tokens(mut self, total_tokens: u64) -> Self {
         self.total_tokens = total_tokens;
+        self
+    }
+
+    /// Records the client-side duration in seconds (Java `EmbeddingUsage.time`).
+    pub fn with_time_seconds(mut self, time_seconds: f64) -> Self {
+        self.time_seconds = Some(time_seconds);
         self
     }
 
@@ -113,7 +125,14 @@ impl EmbeddingResponse {
     }
 
     /// Records the measured client-side duration.
+    ///
+    /// Also stamps [`EmbeddingUsage::time_seconds`] (Java records the same duration inside the
+    /// usage object, and `UsageListener`s only receive the usage), unless a provider already set
+    /// it explicitly.
     pub fn with_elapsed(mut self, elapsed: Duration) -> Self {
+        if self.usage.time_seconds.is_none() {
+            self.usage.time_seconds = Some(elapsed.as_secs_f64());
+        }
         self.elapsed = Some(elapsed);
         self
     }
@@ -148,6 +167,13 @@ pub trait EmbeddingModel: Send + Sync {
 
     /// Dimension of the produced vectors.
     fn dimensions(&self) -> usize;
+
+    /// Releases provider resources; no-op by default.
+    ///
+    /// Ports Java's `EmbeddingModel` + `AutoCloseable` lifecycle (`07c5f3078`): implementations
+    /// that own a connection pool may override it, and further embeddings should then fail
+    /// without entering the retry pipeline. The default keeps local / in-memory models open.
+    fn close(&self) {}
 }
 
 /// Extracts the embeddable text from a content block.

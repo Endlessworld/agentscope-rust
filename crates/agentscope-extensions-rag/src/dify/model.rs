@@ -5,13 +5,21 @@
 //! `@JsonProperty` annotations exactly, and every struct ignores unknown fields like
 //! Jackson's `@JsonIgnoreProperties(ignoreUnknown = true)`.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// Root response of `POST /datasets/{dataset_id}/retrieve`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DifyResponse {
     /// Echoed query.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Dify Cloud (`api.dify.ai`) sends a bare string (`"query": "ping"`), self-hosted Dify an
+    /// object (`"query": {"content": "ping"}`); see [`deserialize_query`].
+    #[serde(
+        default,
+        deserialize_with = "deserialize_query",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub query: Option<Query>,
     /// Retrieved records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +44,34 @@ pub struct Query {
     /// Query content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+/// Deserializes the top-level `query` field in both shapes Dify deployments send.
+///
+/// Ports Java `DifyQueryDeserializer` (commit `d08c40c00`): Dify Cloud returns
+/// `"query": "ping"` while self-hosted Dify returns `"query": {"content": "ping"}`. Modelling
+/// it as an object alone made Jackson reject the whole response for Dify Cloud, discarding
+/// **every** retrieved record. The field is informational (nothing in this crate reads it), so
+/// any other shape (number, array, bool) yields `None` instead of failing the response — losing
+/// the echoed query is harmless, losing the records is not.
+pub fn deserialize_query<'de, D>(deserializer: D) -> std::result::Result<Option<Query>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(Query {
+            content: Some(text),
+        }),
+        Some(Value::Object(map)) => Some(Query {
+            content: map
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }),
+        Some(_) => None,
+    })
 }
 
 /// A single retrieval record: a segment plus its score.
@@ -274,5 +310,66 @@ mod tests {
         let json = serde_json::to_string(&parsed).unwrap();
         let again: DifyResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, again);
+    }
+
+    // Java `DifyRAGClientTest#testParseResponseWithBareStringQuery`.
+    const CLOUD_SAMPLE: &str = r#"{
+      "query": "What is RAG?",
+      "records": [
+        { "segment": { "id": "seg-1", "content": "Test content", "document_id": "doc-1" }, "score": 0.95 }
+      ]
+    }"#;
+
+    #[test]
+    fn bare_string_query_keeps_every_record() {
+        let parsed: DifyResponse = serde_json::from_str(CLOUD_SAMPLE).unwrap();
+        assert_eq!(
+            parsed.query.as_ref().unwrap().content.as_deref(),
+            Some("What is RAG?")
+        );
+        assert_eq!(parsed.record_count(), 1);
+        assert_eq!(
+            parsed.records.as_ref().unwrap()[0]
+                .segment
+                .as_ref()
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("seg-1")
+        );
+    }
+
+    #[test]
+    fn object_query_is_unchanged_and_records_are_empty() {
+        // Java `DifyRAGClientTest#testParseResponseWithObjectQuery`.
+        let parsed: DifyResponse =
+            serde_json::from_str(r#"{"query": {"content": "What is RAG?"}, "records": []}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.query.as_ref().unwrap().content.as_deref(),
+            Some("What is RAG?")
+        );
+        assert!(parsed.records.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_query_shape_keeps_the_records() {
+        // Losing the echoed query is harmless; losing the records is not.
+        for query in ["42", "[1, 2]", "true", "null"] {
+            let body = format!(r#"{{"query": {query}, "records": []}}"#);
+            let parsed: DifyResponse = serde_json::from_str(&body).unwrap();
+            assert!(parsed.query.is_none(), "query = {query}");
+            assert_eq!(parsed.record_count(), 0, "query = {query}");
+        }
+
+        let parsed: DifyResponse =
+            serde_json::from_str(r#"{"query": {"other": "x"}, "records": []}"#).unwrap();
+        assert_eq!(parsed.query, Some(Query { content: None }));
+    }
+
+    #[test]
+    fn missing_query_stays_none() {
+        let parsed: DifyResponse = serde_json::from_str(r#"{"records": []}"#).unwrap();
+        assert!(parsed.query.is_none());
     }
 }
