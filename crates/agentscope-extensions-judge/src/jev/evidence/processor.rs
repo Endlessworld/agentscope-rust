@@ -367,7 +367,7 @@ impl JevEvidenceProcessor {
         &self,
         query: &str,
         candidates: Vec<JevPassage>,
-        authorized: &dyn Fn(&JevPassage) -> bool,
+        authorized: &(dyn Fn(&JevPassage) -> bool + Sync),
         top_k: usize,
     ) -> Result<Decision<Report>, JevError> {
         if query.trim().is_empty()

@@ -165,7 +165,7 @@ async fn is_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     let mut encoded = String::with_capacity(64);
     for byte in digest {

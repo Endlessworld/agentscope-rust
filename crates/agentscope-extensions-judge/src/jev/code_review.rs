@@ -121,7 +121,8 @@ impl ReviewConfig {
 }
 
 /// One file's screening row (`JevCodeReviewer.Screening`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Screening {
     /// The file path.
     pub path: String,
@@ -136,7 +137,8 @@ pub struct Screening {
 }
 
 /// One file's profile (`JevCodeReviewer.Profile`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Profile {
     /// The file path.
     pub path: String,
@@ -151,7 +153,7 @@ pub struct Profile {
 }
 
 /// One screening signal: a concern worth investigating (`JevCodeReviewer.Signal`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Signal {
     /// The file path.
     pub path: String,
@@ -162,7 +164,8 @@ pub struct Signal {
 }
 
 /// How a follow-up ended (`JevCodeReviewer.Disposition`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Disposition {
     /// Evidence was located.
     Located,
@@ -193,7 +196,8 @@ impl Disposition {
 }
 
 /// The review advice (`JevCodeReviewer.Advice`); a prompt for humans, never an approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReviewAdvice {
     /// Comment on the change.
     Comment,
@@ -212,7 +216,8 @@ impl ReviewAdvice {
 }
 
 /// One located finding (`JevCodeReviewer.Finding`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Finding {
     /// The signal that produced it.
     pub signal: Signal,
@@ -237,7 +242,8 @@ pub struct Finding {
 }
 
 /// One follow-up (`JevCodeReviewer.FollowUp`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FollowUp {
     /// The signal.
     pub signal: Signal,
@@ -250,7 +256,8 @@ pub struct FollowUp {
 }
 
 /// One model call (`JevCodeReviewer.Call`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReviewCall {
     /// `screen`, `profile`, `locate`, `mechanism`, `severity` or `route`.
     pub stage: String,
@@ -267,7 +274,8 @@ pub struct ReviewCall {
 }
 
 /// The review report (`JevCodeReviewer.Report`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReviewReport {
     /// The reviewed revision.
     pub revision: String,

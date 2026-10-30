@@ -6,17 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 
 # Ports `agentscope-extensions-judge/agentscope-extensions-jev` (TypeSafe System One).
-# The landed scope is dependency-free DTO + pure functions; the HTTP client lands later
-# (see the module docs in `src/lib.rs`), so `agentscope-core` / `agentscope-harness` /
-# `reqwest` are deliberately not declared yet.
+# `agentscope-core` / `agentscope-harness` are path dependencies of the `jev::runtime` seam
+# module only: `BaseStore`-backed context archiving, the `Tool` implementations and the
+# `Middleware` hooks. Every pure/DTO/orchestration module stays independent of them.
 [dependencies]
+agentscope-core = { path = "../agentscope-core" }
+agentscope-harness = { path = "../agentscope-harness" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 # Reached only through the injectable `http::JudgeHttpTransport` seam, so unit tests stay
-# offline; `agentscope-core` / `agentscope-harness` remain undeclared by design.
+# offline.
 reqwest = { workspace = true }
 # `buffered` streams keep the Java `flatMapSequential` concurrency semantics for the runners.
 futures = { workspace = true }

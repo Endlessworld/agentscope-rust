@@ -115,7 +115,7 @@ impl JevKnowledge {
         &self,
         query: &str,
         limit: usize,
-        acl: &dyn Fn(&KnowledgeDocument) -> bool,
+        acl: &(dyn Fn(&KnowledgeDocument) -> bool + Sync),
     ) -> Result<Vec<KnowledgeDocument>, JevError> {
         let delegate_limit = if self.mode == Mode::Enforce {
             self.candidate_limit.max(limit)

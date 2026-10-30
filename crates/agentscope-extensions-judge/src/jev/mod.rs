@@ -22,6 +22,7 @@ pub mod guardrail;
 pub mod integration;
 pub mod judge;
 pub mod probability;
+pub mod runtime;
 pub mod supervision;
 pub mod review;
 pub mod routing;

@@ -325,6 +325,8 @@ dependencies = [
 name = "agentscope-extensions-judge"
 version = "0.1.0"
 dependencies = [
+ "agentscope-core",
+ "agentscope-harness",
  "async-trait",
  "futures",
  "reqwest 0.13.4",
