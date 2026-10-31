@@ -129,10 +129,33 @@ impl AiServiceError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } => true,
-            Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
+            Self::Http { status, .. } => is_retryable_status(*status),
             Self::Business { .. } | Self::Serde { .. } => false,
         }
     }
+}
+
+/// Whether an HTTP status is worth retrying (`429` or `5xx`).
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// Exponential backoff for a background loop: `base` while healthy, `base * 2^failures`
+/// (capped at `cap`) while failing.
+///
+/// Shared by the Nacos polling loop and the registry heartbeat so both recover from an outage
+/// at the same pace, mirroring the model-call retry schedule (`2, 4, 8, … 60s`).
+pub(crate) fn exponential_backoff(
+    base: std::time::Duration,
+    failures: u32,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    if failures == 0 {
+        return base;
+    }
+    let factor = 2f64.powi(failures.min(16) as i32);
+    let backoff = std::time::Duration::from_secs_f64(base.as_secs_f64() * factor);
+    backoff.min(cap.max(base))
 }
 
 /// Convenience result alias.
@@ -186,6 +209,24 @@ pub fn render_template(template: &str, args: Option<&HashMap<String, String>>) -
 /// `AiService#downloadSkillZip*`.
 pub type SkillZip = Vec<u8>;
 
+/// Endpoint type released with an AgentCard, mirroring `AiConstants.A2a.A2A_ENDPOINT_TYPE_SERVICE`.
+///
+/// Nacos expects `releaseAgentCard(card, endpointType, setAsLatest)`; the Java module always
+/// passes the `service` type (NACOS-05). The value is a trait parameter, so a caller that
+/// publishes some other Nacos endpoint type can pass its own string.
+pub const A2A_ENDPOINT_TYPE_SERVICE: &str = "service";
+
+/// A recorded [`NacosAiService::release_agent_card`] call (see [`InMemoryNacosAiService`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedAgentCard {
+    /// Agent name the card was published for.
+    pub name: String,
+    /// Endpoint type sent with the release (`service` in the Java module).
+    pub endpoint_type: String,
+    /// Whether the release asked Nacos to mark the card as the latest version.
+    pub set_as_latest: bool,
+}
+
 /// Callback invoked when a subscribed prompt changes, mirroring
 /// `AbstractNacosPromptListener#onEvent`.
 pub type PromptListener = Arc<dyn Fn(&str, &NacosPrompt) + Send + Sync>;
@@ -202,9 +243,13 @@ pub trait NacosAiService: Send + Sync {
     // ---- A2A registry ----
 
     /// Publishes an AgentCard, mirroring `releaseAgentCard(card, endpointType, setAsLatest)`.
+    ///
+    /// `endpoint_type` is the Nacos endpoint type; [`A2A_ENDPOINT_TYPE_SERVICE`] is what the
+    /// Java module sends (NACOS-05).
     async fn release_agent_card(
         &self,
         card: &NacosAgentCard,
+        endpoint_type: &str,
         set_as_latest: bool,
     ) -> AiServiceResult<()>;
 
@@ -269,7 +314,7 @@ pub trait NacosAiService: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryNacosAiService {
     cards: Mutex<HashMap<String, NacosAgentCard>>,
-    released: Mutex<Vec<(String, bool)>>,
+    released: Mutex<Vec<ReleasedAgentCard>>,
     endpoints: Mutex<Vec<(String, NacosAgentEndpoint)>>,
     prompts: Mutex<HashMap<String, NacosPrompt>>,
     prompt_listeners: Mutex<HashMap<String, PromptListener>>,
@@ -301,6 +346,16 @@ impl InMemoryNacosAiService {
 
     /// Records released AgentCards `(name, set_as_latest)`.
     pub fn released_cards(&self) -> Vec<(String, bool)> {
+        self.released
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|released| (released.name.clone(), released.set_as_latest))
+            .collect()
+    }
+
+    /// Records the full release payloads, including the `endpointType` (NACOS-05).
+    pub fn released_cards_detailed(&self) -> Vec<ReleasedAgentCard> {
         self.released.lock().unwrap().clone()
     }
 
@@ -354,16 +409,18 @@ impl NacosAiService for InMemoryNacosAiService {
     async fn release_agent_card(
         &self,
         card: &NacosAgentCard,
+        endpoint_type: &str,
         set_as_latest: bool,
     ) -> AiServiceResult<()> {
         self.cards
             .lock()
             .unwrap()
             .insert(card.name.clone(), card.clone());
-        self.released
-            .lock()
-            .unwrap()
-            .push((card.name.clone(), set_as_latest));
+        self.released.lock().unwrap().push(ReleasedAgentCard {
+            name: card.name.clone(),
+            endpoint_type: endpoint_type.to_string(),
+            set_as_latest,
+        });
         Ok(())
     }
 

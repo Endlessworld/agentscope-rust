@@ -27,10 +27,14 @@ pub mod service;
 pub mod skill;
 
 pub use http::{
-    HttpRequest, HttpResponse, NacosHttpAiService, NacosHttpConfig, NacosHttpTransport,
-    DEFAULT_NAMESPACE, DEFAULT_TOKEN_REFRESH_RATIO, DEFAULT_TOKEN_TTL,
+    HttpRequest, HttpResponse, NacosHttpAiService, NacosHttpConfig, NacosHttpTransport, RetryPolicy,
+    DEFAULT_NAMESPACE, DEFAULT_RETRY_INITIAL_BACKOFF, DEFAULT_RETRY_MAX_ATTEMPTS,
+    DEFAULT_RETRY_MAX_BACKOFF, DEFAULT_TOKEN_REFRESH_RATIO, DEFAULT_TOKEN_TTL,
 };
-pub use service::{AiServiceError, AiServiceResult, InMemoryNacosAiService, NacosAiService};
+pub use service::{
+    AiServiceError, AiServiceResult, InMemoryNacosAiService, NacosAiService, ReleasedAgentCard,
+    A2A_ENDPOINT_TYPE_SERVICE,
+};
 
 #[cfg(feature = "http-client")]
 pub use http::{spawn_polling, ReqwestNacosTransport};

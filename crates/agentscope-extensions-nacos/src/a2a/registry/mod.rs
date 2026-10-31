@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::service::{AiServiceError, AiServiceResult, NacosAiService};
+use crate::service::{AiServiceError, AiServiceResult, NacosAiService, A2A_ENDPOINT_TYPE_SERVICE};
 
 use super::converter::{
     apply_supported_interfaces, convert_to_nacos_agent_card, supported_interfaces,
@@ -350,6 +350,63 @@ impl NacosA2aRegistry {
         Ok(())
     }
 
+    /// Replays the initial registration once (one heartbeat tick, NACOS-07).
+    ///
+    /// The payloads are exactly those of [`Self::register_agent`] — same card, same endpoint
+    /// set — so a card or endpoint the server dropped is restored, and a still-registered one
+    /// is simply overwritten. The "card already exists" probe of the initial registration is
+    /// skipped, so a tick costs one `POST` per artifact instead of a `GET` + `POST`.
+    ///
+    /// Java relies on the Nacos SDK keeping a long-lived connection to the server for instance
+    /// health; a plain HTTP client has no such connection, so the host repeats the calls (see
+    /// [`Self::spawn_heartbeat`] for the built-in loop).
+    pub async fn heartbeat(
+        &self,
+        agent_card: &A2aAgentCard,
+        properties: &NacosA2aRegistryProperties,
+    ) -> Result<(), String> {
+        let nacos_card = convert_to_nacos_agent_card(agent_card);
+        self.release_agent_card(&nacos_card, properties).await?;
+        self.register_endpoints(&nacos_card, properties).await?;
+        Ok(())
+    }
+
+    /// Replays [`Self::heartbeat`] every `interval` until the returned handle is aborted.
+    ///
+    /// A failed tick is logged and retried with exponential backoff
+    /// ([`heartbeat_backoff`], capped at [`MAX_HEARTBEAT_BACKOFF`]); a successful tick resets
+    /// the schedule to `interval`. `interval` is injectable, so the loop is testable with
+    /// millisecond ticks.
+    pub fn spawn_heartbeat(
+        self: &std::sync::Arc<Self>,
+        agent_card: A2aAgentCard,
+        properties: NacosA2aRegistryProperties,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let registry = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut failures = 0u32;
+            loop {
+                match registry.heartbeat(&agent_card, &properties).await {
+                    Ok(()) => failures = 0,
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        warn!(
+                            agent = %agent_card.name,
+                            failures,
+                            error = %error,
+                            "Nacos heartbeat failed, retrying with backoff"
+                        );
+                    }
+                }
+                let delay = heartbeat_backoff(interval, failures);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        })
+    }
+
     async fn try_release_agent_card(
         &self,
         card: &NacosAgentCard,
@@ -367,11 +424,22 @@ impl NacosA2aRegistry {
             );
         }
         info!(agent = %card.name, "Register agent card to Nacos.");
+        self.release_agent_card(card, properties).await?;
+        info!(agent = %card.name, "Register agent card to Nacos successfully.");
+        Ok(())
+    }
+
+    /// Publishes the card, mirroring `NacosA2aRegistry#releaseAgentCard`
+    /// (`card`, `A2A_ENDPOINT_TYPE_SERVICE`, `setAsLatest`).
+    async fn release_agent_card(
+        &self,
+        card: &NacosAgentCard,
+        properties: &NacosA2aRegistryProperties,
+    ) -> Result<(), String> {
         self.service
-            .release_agent_card(card, properties.is_set_as_latest)
+            .release_agent_card(card, A2A_ENDPOINT_TYPE_SERVICE, properties.is_set_as_latest)
             .await
             .map_err(|e| e.to_string())?;
-        info!(agent = %card.name, "Register agent card to Nacos successfully.");
         Ok(())
     }
 
@@ -677,6 +745,18 @@ impl NacosAgentRegistry {
     }
 }
 
+/// Upper bound of the heartbeat backoff (NACOS-07).
+pub const MAX_HEARTBEAT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Delay before the next [`NacosA2aRegistry::heartbeat`] tick.
+///
+/// `interval` while the last tick succeeded; exponential (capped at
+/// [`MAX_HEARTBEAT_BACKOFF`]) after consecutive failures. Pure so the schedule is testable
+/// without sleeping.
+pub fn heartbeat_backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration {
+    crate::service::exponential_backoff(interval, failures, MAX_HEARTBEAT_BACKOFF)
+}
+
 /// Merges env-sourced attributes into deploy-sourced ones, mirroring
 /// `NacosAgentRegistry#overwriteAttributes`.
 fn overwrite_attributes(
@@ -769,6 +849,7 @@ mod tests {
     use crate::a2a::model::{A2aAgentCard, NacosAgentCard};
     use crate::service::InMemoryNacosAiService;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn transport_builder_requires_transport() {
@@ -862,6 +943,9 @@ mod tests {
         registry.register_agent(&card, &props).await.unwrap();
 
         assert_eq!(svc.released_cards(), vec![("agent".to_string(), true)]);
+        // NACOS-05: the release carries `endpointType=service`, like Java's
+        // `releaseAgentCard(card, AiConstants.A2a.A2A_ENDPOINT_TYPE_SERVICE, setAsLatest)`.
+        assert_eq!(svc.released_cards_detailed()[0].endpoint_type, "service");
         let endpoints = svc.registered_endpoints();
         assert_eq!(endpoints.len(), 1);
         // Endpoint mirrors Java's `buildAgentEndpoint`: address/port + card version.
@@ -1032,5 +1116,77 @@ mod tests {
 
         registry.register_agent(&card, &props).await.unwrap();
         assert_eq!(svc.registered_endpoints().len(), 1);
+    }
+
+    /// NACOS-07: a heartbeat replays exactly the payloads of the initial registration, so a
+    /// server-side removal is repaired without a duplicated/empty endpoint.
+    #[tokio::test]
+    async fn a_heartbeat_replays_the_registration_payload() {
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let registry = NacosA2aRegistry::new(svc.clone());
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+        let mut props = NacosA2aRegistryProperties::default();
+        props.add_transport(
+            NacosA2aTransportProperties::builder()
+                .transport("JSONRPC")
+                .host("localhost")
+                .port(8080)
+                .build()
+                .unwrap(),
+        );
+
+        registry.register_agent(&card, &props).await.unwrap();
+        registry.heartbeat(&card, &props).await.unwrap();
+
+        let released = svc.released_cards_detailed();
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0], released[1]);
+        assert_eq!(released[1].endpoint_type, "service");
+
+        // The endpoint is replayed verbatim (same transport/address/port, still exactly one).
+        let endpoints = svc.registered_endpoints();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].1, endpoints[1].1);
+        assert_eq!(endpoints[1].1.port, 8080);
+    }
+
+    /// NACOS-07: the heartbeat loop keeps ticking (with an injectable interval) until aborted.
+    #[tokio::test]
+    async fn the_heartbeat_loop_ticks_until_it_is_aborted() {
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let registry = Arc::new(NacosA2aRegistry::new(svc.clone()));
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+        let mut props = NacosA2aRegistryProperties::default();
+        props.add_transport(
+            NacosA2aTransportProperties::builder()
+                .transport("JSONRPC")
+                .host("localhost")
+                .port(8080)
+                .build()
+                .unwrap(),
+        );
+
+        let handle = registry.spawn_heartbeat(card, props, Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        handle.abort();
+
+        let released = svc.released_cards_detailed();
+        assert!(
+            released.len() >= 2,
+            "the heartbeat ticked {} time(s)",
+            released.len()
+        );
+        assert!(released.iter().all(|card| card == &released[0]));
+        assert_eq!(svc.registered_endpoints().len(), released.len());
+    }
+
+    /// NACOS-07: the heartbeat backs off exponentially after a failure and resets on success.
+    #[test]
+    fn the_heartbeat_backoff_grows_and_is_capped() {
+        let interval = Duration::from_secs(1);
+        assert_eq!(heartbeat_backoff(interval, 0), interval);
+        assert_eq!(heartbeat_backoff(interval, 1), Duration::from_secs(2));
+        assert_eq!(heartbeat_backoff(interval, 2), Duration::from_secs(4));
+        assert_eq!(heartbeat_backoff(interval, 40), MAX_HEARTBEAT_BACKOFF);
     }
 }

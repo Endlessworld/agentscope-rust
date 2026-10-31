@@ -135,6 +135,96 @@ pub const DEFAULT_TOKEN_TTL: std::time::Duration = std::time::Duration::from_sec
 /// Ratio of `tokenTtl` after which the token is refreshed early (NACOS-03).
 pub const DEFAULT_TOKEN_REFRESH_RATIO: f64 = 0.9;
 
+/// Total attempts made for a retryable failure (Nacos SDK default: one retry on top of the
+/// first try).
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff before the first retry (doubles on every further attempt).
+pub const DEFAULT_RETRY_INITIAL_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+/// Upper bound of the exponential backoff.
+pub const DEFAULT_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Retry policy for **retryable** failures (`Transport`, `429`, `5xx`), mirroring the Nacos
+/// SDK, which retries a failed HTTP call a few times before surfacing the error (NACOS-06).
+///
+/// Only failures classified as retryable by [`AiServiceError::is_retryable`] are retried: a
+/// Nacos business code or an undecodable payload is terminal on the first try. Retried calls
+/// are safe by construction — every Nacos AI endpoint is keyed by agent/prompt/skill name, so a
+/// repeated `releaseAgentCard`/`registerAgentEndpoint` writes the same state again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryPolicy {
+    /// Total attempts, including the first one (`1` disables retrying).
+    pub max_attempts: u32,
+    /// Backoff before the first retry.
+    pub initial_backoff: std::time::Duration,
+    /// Cap applied to the exponential growth.
+    pub max_backoff: std::time::Duration,
+    /// Growth factor applied per attempt.
+    pub multiplier: f64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            initial_backoff: DEFAULT_RETRY_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_RETRY_MAX_BACKOFF,
+            multiplier: 2.0,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// A policy that never retries.
+    pub const fn none() -> Self {
+        Self {
+            max_attempts: 1,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+            multiplier: 1.0,
+        }
+    }
+
+    /// Builds a policy with exponential backoff (factor `2.0`).
+    pub fn new(
+        max_attempts: u32,
+        initial_backoff: std::time::Duration,
+        max_backoff: std::time::Duration,
+    ) -> Self {
+        Self {
+            max_attempts: max_attempts.max(1),
+            initial_backoff,
+            max_backoff,
+            multiplier: 2.0,
+        }
+    }
+
+    /// The backoff to wait **after** `attempt` (1-based) failed.
+    ///
+    /// Kept as a pure function so the schedule is unit-testable without sleeping.
+    pub fn backoff(&self, attempt: u32) -> std::time::Duration {
+        if attempt == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let multiplier = if self.multiplier.is_finite() && self.multiplier >= 1.0 {
+            self.multiplier
+        } else {
+            1.0
+        };
+        let factor = multiplier.powi(attempt.saturating_sub(1).min(32) as i32);
+        let backoff =
+            std::time::Duration::from_secs_f64(self.initial_backoff.as_secs_f64() * factor);
+        backoff.min(self.max_backoff)
+    }
+
+    /// Whether another attempt is allowed after `attempt` (1-based) already failed.
+    pub fn should_retry(&self, attempt: u32) -> bool {
+        attempt < self.max_attempts.max(1)
+    }
+}
+
 /// Configuration for [`NacosHttpAiService`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct NacosHttpConfig {
@@ -169,6 +259,9 @@ pub struct NacosHttpConfig {
     pub prompt_path: String,
     /// Skill ZIP path.
     pub skill_path: String,
+    /// Retry policy for retryable failures (NACOS-06); defaults to
+    /// [`RetryPolicy::default`] (`3` attempts, `200ms` doubling, capped at `2s`).
+    pub retry: RetryPolicy,
 }
 
 impl NacosHttpConfig {
@@ -188,6 +281,7 @@ impl NacosHttpConfig {
             agent_endpoint_path: "/v1/ai/agent/endpoint".to_string(),
             prompt_path: "/v1/ai/prompt".to_string(),
             skill_path: "/v1/ai/skill".to_string(),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -225,6 +319,14 @@ impl NacosHttpConfig {
     /// Sets the login path.
     pub fn with_auth_path(mut self, path: impl Into<String>) -> Self {
         self.auth_path = path.into();
+        self
+    }
+
+    /// Overrides the retry policy applied to retryable failures (NACOS-06).
+    ///
+    /// Use [`RetryPolicy::none`] to fail on the first attempt.
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -412,19 +514,50 @@ impl NacosHttpAiService {
         }
     }
 
-    /// Executes `request`, injecting the current access token.
+    /// Executes `request`, retrying **retryable** failures per [`NacosHttpConfig::retry`]
+    /// (NACOS-06).
+    ///
+    /// The last attempt's outcome is returned unchanged, so a caller still maps a final `5xx`
+    /// to its own error; terminal failures (business code, decode error, `4xx`) are returned
+    /// immediately.
+    async fn send(&self, request: HttpRequest) -> AiServiceResult<HttpResponse> {
+        let mut attempt = 1u32;
+        loop {
+            let outcome = self.send_once(&request).await;
+            let retryable = match &outcome {
+                Ok(response) => crate::service::is_retryable_status(response.status),
+                Err(error) => error.is_retryable(),
+            };
+            if !retryable || !self.config.retry.should_retry(attempt) {
+                return outcome;
+            }
+            let backoff = self.config.retry.backoff(attempt);
+            warn!(
+                attempt,
+                backoff_ms = backoff.as_millis() as u64,
+                url = %request.url,
+                "Nacos request failed with a retryable error, retrying"
+            );
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+            }
+            attempt += 1;
+        }
+    }
+
+    /// Executes `request` once, injecting the current access token.
     ///
     /// When credentials are configured and the server rejects the token (`401`/`403`), the
     /// token is refreshed once and the original request is replayed — mirroring the Nacos SDK,
     /// which re-authenticates on a token expiry rejection (NACOS-03).
-    async fn send(&self, request: HttpRequest) -> AiServiceResult<HttpResponse> {
+    async fn send_once(&self, request: &HttpRequest) -> AiServiceResult<HttpResponse> {
         let token = self.access_token().await?;
-        let response = self.execute_with_token(&request, token.as_deref()).await?;
+        let response = self.execute_with_token(request, token.as_deref()).await?;
         if matches!(response.status, 401 | 403) && self.config.has_credentials() {
             warn!(status = response.status, "Nacos rejected the accessToken, logging in again");
             self.invalidate_token();
             if let Some(refreshed) = self.access_token().await? {
-                return self.execute_with_token(&request, Some(&refreshed)).await;
+                return self.execute_with_token(request, Some(&refreshed)).await;
             }
         }
         Ok(response)
@@ -588,11 +721,15 @@ impl NacosAiService for NacosHttpAiService {
     async fn release_agent_card(
         &self,
         card: &NacosAgentCard,
+        endpoint_type: &str,
         set_as_latest: bool,
     ) -> AiServiceResult<()> {
         let url = self.url(
             &self.config.agent_path,
-            &[("setAsLatest", set_as_latest.to_string())],
+            &[
+                ("endpointType", endpoint_type.to_string()),
+                ("setAsLatest", set_as_latest.to_string()),
+            ],
         );
         let body = serde_json::to_vec(card)
             .map_err(|e| AiServiceError::new(AiServiceError::INVALID_PARAM, e.to_string()))?;
@@ -828,8 +965,9 @@ pub use reqwest_transport::{spawn_polling, ReqwestNacosTransport};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::InMemoryNacosAiService;
+    use crate::service::{InMemoryNacosAiService, A2A_ENDPOINT_TYPE_SERVICE};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// Records requests and replays a queued response per call.
     struct FakeTransport {
@@ -928,13 +1066,16 @@ mod tests {
         let transport = FakeTransport::new(vec![HttpResponse::new(200, "ok")]);
         let service = service(Arc::clone(&transport));
         let card = NacosAgentCard::new("local", "http://agent:9000");
-        service.release_agent_card(&card, true).await.unwrap();
+        service
+            .release_agent_card(&card, A2A_ENDPOINT_TYPE_SERVICE, true)
+            .await
+            .unwrap();
 
         let request = &transport.requests()[0];
         assert_eq!(request.method, "POST");
         assert_eq!(
             request.url,
-            "http://nacos:8848/nacos/v1/ai/agent?setAsLatest=true&namespaceId=public&accessToken=tok%20en"
+            "http://nacos:8848/nacos/v1/ai/agent?endpointType=service&setAsLatest=true&namespaceId=public&accessToken=tok%20en"
         );
         assert_eq!(request.content_type.as_deref(), Some("application/json"));
         let posted: NacosAgentCard = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
@@ -949,7 +1090,10 @@ mod tests {
         )]);
         let service = service(Arc::clone(&transport));
         let card = NacosAgentCard::new("local", "http://agent:9000");
-        let error = service.release_agent_card(&card, false).await.unwrap_err();
+        let error = service
+            .release_agent_card(&card, A2A_ENDPOINT_TYPE_SERVICE, false)
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), 12001);
         assert_eq!(error.message(), "invalid param");
         assert!(matches!(error, AiServiceError::Business { code: 12001, .. }));
@@ -1301,7 +1445,10 @@ mod tests {
         ]);
         let service = service(Arc::clone(&transport));
         let card = NacosAgentCard::new("local", "http://agent:9000");
-        let write = service.release_agent_card(&card, false).await.unwrap_err();
+        let write = service
+            .release_agent_card(&card, A2A_ENDPOINT_TYPE_SERVICE, false)
+            .await
+            .unwrap_err();
         assert_eq!(write.code(), 300);
         assert_eq!(write.message(), "agent exists");
 
@@ -1324,5 +1471,130 @@ mod tests {
         assert_eq!(AiServiceError::http(503, "unavailable").code(), 503);
         assert!(AiServiceError::http(404, "gone").is_not_found());
         assert!(AiServiceError::new(AiServiceError::NOT_FOUND, "gone").is_not_found());
+    }
+
+    /// NACOS-05: `releaseAgentCard` carries the endpoint type, like
+    /// `releaseAgentCard(card, A2A_ENDPOINT_TYPE_SERVICE, setAsLatest)`.
+    #[tokio::test]
+    async fn the_release_carries_the_endpoint_type() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, "ok"),
+            HttpResponse::new(200, "ok"),
+        ]);
+        let service = service(Arc::clone(&transport));
+        let card = NacosAgentCard::new("local", "http://agent:9000");
+        service
+            .release_agent_card(&card, A2A_ENDPOINT_TYPE_SERVICE, false)
+            .await
+            .unwrap();
+        // The type is a parameter, so a caller can publish another Nacos endpoint type.
+        service
+            .release_agent_card(&card, "agent", false)
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert!(
+            requests[0].url.contains("endpointType=service&setAsLatest=false"),
+            "{}",
+            requests[0].url
+        );
+        assert!(requests[1].url.contains("endpointType=agent"), "{}", requests[1].url);
+    }
+
+    /// NACOS-06: a retryable status is retried and the last attempt's result is returned.
+    #[tokio::test]
+    async fn a_retryable_failure_is_retried_until_it_succeeds() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(500, "boom"),
+            HttpResponse::new(503, "still down"),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_access_token("tok")
+                .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
+            transport.clone(),
+        );
+
+        let card = service
+            .get_agent_card("remote", None)
+            .await
+            .unwrap()
+            .expect("a card after two failures");
+        assert_eq!(card.name, "remote");
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    /// NACOS-06: a terminal failure (business code / `4xx`) is not retried, and the retry
+    /// budget is honoured when every attempt fails.
+    #[tokio::test]
+    async fn terminal_failures_are_not_retried_and_the_budget_is_finite() {
+        // `404` is terminal: exactly one request.
+        let transport = FakeTransport::new(vec![HttpResponse::new(404, "")]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
+            transport.clone(),
+        );
+        assert!(service.get_agent_card("missing", None).await.unwrap().is_none());
+        assert_eq!(transport.requests().len(), 1);
+
+        // Every attempt fails with a retryable status: the last response is surfaced.
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(500, "boom"),
+            HttpResponse::new(500, "boom"),
+            HttpResponse::new(500, "boom"),
+            HttpResponse::new(200, card_json("unused")),
+        ]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
+            transport.clone(),
+        );
+        let error = service.get_agent_card("remote", None).await.unwrap_err();
+        assert_eq!(error.code(), 500);
+        assert!(error.is_retryable());
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    /// NACOS-06: a transport failure (e.g. an expired request timeout) is retryable and is
+    /// surfaced as [`AiServiceError::Transport`] once the budget is spent.
+    #[tokio::test]
+    async fn a_transport_timeout_is_retryable() {
+        let transport = FakeTransport::new(Vec::new());
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_retry(RetryPolicy::new(2, Duration::ZERO, Duration::ZERO)),
+            transport.clone(),
+        );
+        let error = service.get_agent_card("remote", None).await.unwrap_err();
+        assert!(matches!(error, AiServiceError::Transport { .. }), "{error:?}");
+        assert!(error.is_retryable());
+        // Two attempts: the fake transport answers "no queued response" (a transport failure).
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    /// NACOS-06: the backoff schedule is exponential and capped.
+    #[test]
+    fn the_retry_policy_backs_off_exponentially_and_stops_at_the_budget() {
+        let policy = RetryPolicy::new(
+            4,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+        assert_eq!(policy.backoff(0), Duration::ZERO);
+        assert_eq!(policy.backoff(1), Duration::from_millis(100));
+        assert_eq!(policy.backoff(2), Duration::from_millis(200));
+        // Capped at `max_backoff`.
+        assert_eq!(policy.backoff(3), Duration::from_millis(300));
+        assert_eq!(policy.backoff(10), Duration::from_millis(300));
+
+        assert!(policy.should_retry(1));
+        assert!(policy.should_retry(3));
+        assert!(!policy.should_retry(4));
+
+        assert_eq!(RetryPolicy::default().max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
+        assert!(!RetryPolicy::none().should_retry(1));
     }
 }
