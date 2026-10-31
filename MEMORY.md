@@ -537,3 +537,10 @@
 - **本轮修掉的典型失败**（主智能体统一 loop）：CONTROLPLANE `bridge` 三例因测试用 `ControlPlaneBridge::new(cfg)` 未 `.start()`（journal 未开 → `pending_event_count()` 恒 0）；ACP `closing_a_session_stops_a_running_turn` 因 closed 分支仍走 `abandon_turn`→`acquire_writer`（1200×25ms≈30s 等 journal 写者租约）→ 改为 closed 时 500ms 有界关闭；RAG `embedding_wire_contract` 钉的 `OLLAMA_REQUEST` 字段序与实际 `json!({"model","input"})` 相反（`serde_json` 保序，字节相等断言会失败）。
 - **逐 crate 实测（默认特性，同日）**：core 476（lib 384 + 3 ignored）、harness lib 530、model 428、judge 422、channel 427、rag 478(+6 wire)、sandbox 235、agui 195、controlplane 175(lib)+4、redis 175、mem 131、pg 130、skills 123、cos 116、mysql 113、scheduler 110、nacos 105、mongodb 101、studio 95、training 87、acp lib 75(+16 集成)、a2a-server 67、a2a-client 65、higress 60、jdbc(39 state + 21/25/7 lock + 51 dialect…)、chat-completions-web 35、agent-protocol 32、oss `--features s3` 全绿、protocol 0（仅 lib 无测试）。
 - **工具坑补充**：①全量 `cargo test --workspace` 首轮编译约 15–20 分钟 → 必须 `Start-Process pwsh -File` 后台 + 日志轮询，不能单命令直跑（工具上限 ~300s）；②统计「test result:」必须锚定行首 `^test result: `，否则会把名为 `test result::tests::*` 的用例名算成 target；③`git status --porcelain | Where-Object { $_ -like '??*' }` 是错的（`?` 在 `-like` 里是单字符通配），应用 `Select-String -Pattern '^\?\?'`；④`git diff` 直接管道会喷几百行 CRLF 警告，改用 `git diff --stat` 或落文件。
+
+- 用户要求（2026-10-31）：**提交代码必须按功能模块拆分**（一个模块/crate 一组提交，前缀形如 `feat(extensions/<module>): ...`，提交正文带缺口编号如 `CHANNEL-N05`）；core/harness 基础设施改动单独一条；**禁止**把多模块改动压成一条大提交（Round 1 的「P0 批次」大提交方式不再沿用）。
+- 提交落 `dev` 仍遵守最高规则：`dev` 上禁止 merge，保持线性历史（cherry-pick / rebase）。
+
+- **恢复被临时回退的文件别用 `Copy-Item`（会保留源文件的 LastWriteTime）**：cargo 的 freshness 判定若发现输入 mtime 早于 fingerprint，会认为「无改动」而继续用旧的 rlib/测试二进制（反向验证后恢复实现，测试仍按回退版本 FAILED）。恢复后必须 `(Get-Item <f>).LastWriteTime = Get-Date` 或直接重新写入内容，再重跑。
+- **`cargo fmt -p <crate>` 会连带重排他人未格式化的既有代码**（本次 state.rs 一个测试、store.rs 一行），产生无关 churn；做法：先 `cargo fmt -p <crate> -- --check` 定位，只对自己新增行手工对齐，或 fmt 后按 `git diff -U0 | Select-String '^@@'` 逐 hunk 还原非自己改动的部分。
+- **PowerShell `-File` 运行 .ps1 默认按 ANSI(GBK) 解析**：含中文的脚本用 `powershell -File` 执行会把中文写成乱码（`銆?`）；本机改用 `pwsh -NoProfile -File`（默认 UTF-8）即可。
