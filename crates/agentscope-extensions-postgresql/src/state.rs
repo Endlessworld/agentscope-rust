@@ -359,7 +359,10 @@ impl PostgresAgentStateStore {
             SqlValue::text(key),
             SqlValue::int(SINGLE_STATE_INDEX),
             SqlValue::text(json),
-            SqlValue::BigInt(now),
+            // `sessions_ddl` declares `updated_at TIMESTAMP`; binding the millisecond value
+            // as `BIGINT` failed at the driver's Bind stage (`cannot convert between i64 and
+            // timestamp`), and `save` only logs such errors (the table stayed empty).
+            SqlValue::Timestamp(now),
         ];
         self.client.query(&sql, &params)?;
         self.read_version_sync(&slot, key)
@@ -396,7 +399,7 @@ impl PostgresAgentStateStore {
                 SqlValue::text(key),
                 SqlValue::int(SINGLE_STATE_INDEX),
                 SqlValue::text(&json),
-                SqlValue::BigInt(now),
+                SqlValue::Timestamp(now),
             ];
             match self.client.query(&sql, &params)? {
                 QueryOutcome::Affected(1) => return Ok(1),
@@ -420,7 +423,7 @@ impl PostgresAgentStateStore {
         let params = [
             SqlValue::text(json),
             SqlValue::BigInt(new_version),
-            SqlValue::BigInt(now),
+            SqlValue::Timestamp(now),
             SqlValue::text(slot),
             SqlValue::text(key),
             SqlValue::int(SINGLE_STATE_INDEX),
@@ -542,7 +545,7 @@ impl PostgresAgentStateStore {
                 SqlValue::text(hash_key),
                 SqlValue::int(SINGLE_STATE_INDEX),
                 SqlValue::text(hash),
-                SqlValue::BigInt(now),
+                SqlValue::Timestamp(now),
             ],
         )
     }
@@ -1573,5 +1576,99 @@ mod tests {
         assert!(!s.exists(None, "s1").await);
         assert!(s.list_session_ids(None).await.is_empty());
         let _ = s.delete(None, "s1").await;
+    }
+
+    // ---- bound-literal types -------------------------------------------------------
+
+    /// Wraps [`MemoryClient`] and keeps every `(sql, params)` pair it was handed.
+    ///
+    /// The simulator rewrites `created_at`/`updated_at` from its own clock, so it accepts
+    /// **any** value in those slots and cannot notice a wrong bind type; recording the pair
+    /// lets a test assert the literal type the real driver would receive.
+    #[derive(Debug)]
+    struct RecordingClient {
+        inner: MemoryClient,
+        statements: std::sync::Mutex<Vec<(String, Vec<SqlValue>)>>,
+    }
+
+    impl RecordingClient {
+        fn new() -> Self {
+            Self {
+                inner: MemoryClient::new(),
+                statements: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captured(&self) -> Vec<(String, Vec<SqlValue>)> {
+            self.statements.lock().unwrap().clone()
+        }
+    }
+
+    impl PostgresClient for RecordingClient {
+        fn query(&self, sql: &str, params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            self.statements
+                .lock()
+                .unwrap()
+                .push((sql.to_string(), params.to_vec()));
+            self.inner.query(sql, params)
+        }
+
+        fn execute_batch(&self, sql: &str) -> PgResult<()> {
+            self.inner.execute_batch(sql)
+        }
+    }
+
+    /// Regression for the `updated_at` **bind type** (offline, no server needed).
+    ///
+    /// `sessions_ddl` declares `updated_at TIMESTAMP`, but the save paths used to bind the
+    /// millisecond value as `SqlValue::BigInt`. `tokio-postgres` rejects that at the Bind
+    /// stage (`cannot convert between i64 and timestamp`) and `save` only logs the failure, so
+    /// the table silently stayed empty; the live suite caught it as a `None`/`Some` round-trip
+    /// mismatch. `MemoryClient` accepts any value in the timestamp slot, so this asserts the
+    /// literal type on all three save paths instead of relying on the live database.
+    #[test]
+    fn every_save_path_binds_updated_at_as_a_timestamp() {
+        let client = Arc::new(RecordingClient::new());
+        let store = PostgresAgentStateStore::create_if_not_exist(
+            client.clone() as Arc<dyn PostgresClient>
+        )
+        .unwrap();
+
+        // 1. Unconditional upsert (`save` / `save_versioned`).
+        store.save_versioned(Some("u"), "s1", "k", &json!(1)).unwrap();
+        // 2. Create-if-absent (`save_if_version(..., 0)`): INSERT ... DO NOTHING.
+        store.save_if_version(Some("u"), "s1", "k2", &json!(2), 0).unwrap();
+        // 3. CAS update of an existing row: UPDATE ... updated_at = $3.
+        store.save_if_version(Some("u"), "s1", "k", &json!(3), 1).unwrap();
+
+        let captured = client.captured();
+        let mut checked: Vec<String> = Vec::new();
+        for (sql, params) in &captured {
+            let upper = sql.to_ascii_uppercase();
+            let slot = if upper.starts_with("INSERT INTO") && upper.contains("UPDATED_AT") {
+                // INSERT ... VALUES ($1, $2, $3, $4, 1, $5)
+                4
+            } else if upper.starts_with("UPDATE") && upper.contains("UPDATED_AT") {
+                // UPDATE ... SET state_data = $1, version = $2, updated_at = $3
+                2
+            } else {
+                continue;
+            };
+            match params.get(slot) {
+                Some(SqlValue::Timestamp(_)) => {
+                    checked.push(upper.split_whitespace().next().unwrap().to_string())
+                }
+                Some(other) => panic!(
+                    "updated_at must bind SqlValue::Timestamp, got {other:?} at ${} of: {sql}",
+                    slot + 1
+                ),
+                None => panic!("missing updated_at parameter ${} of: {sql}", slot + 1),
+            }
+        }
+        assert_eq!(
+            checked,
+            vec!["INSERT".to_string(), "INSERT".to_string(), "UPDATE".to_string()],
+            "all three save paths must bind updated_at: {captured:#?}"
+        );
     }
 }
