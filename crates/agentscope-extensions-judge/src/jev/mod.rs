@@ -44,7 +44,7 @@ pub use dto::{
     Question, ScoreAnswer, ScoreQuestion, SystemOneRequest, SystemOneRequestBuilder,
     SystemOneResult, Usage,
 };
-pub use execution::{Decision, JevExecution, Mode, Options, Record, Status};
+pub use execution::{Decision, JevExecution, Mode, Observer, Options, Record, Status};
 pub use guardrail::{Hazard, JevGuardrail, Outcome, Verdict};
 pub use probability::{
     probability_sum_tolerance, sum_keyed, sum_probabilities, sum_within_tolerance,

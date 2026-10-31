@@ -2,11 +2,9 @@
 //!
 //! Java's middleware runs a per-invocation observer loop: it subscribes to the worker event stream
 //! once, buffers only event **type names** plus a bounded output tail, and on both a minimum and a
-//! periodic interval assesses the captured snapshot. That loop needs the core `MiddlewareBase`,
-//! `AgentEvent`, `TextBlockDeltaEvent` and operator/timer plumbing, which this crate does not depend
-//! on, so it is **not** ported.
-//!
-//! What *is* ported: the validated [`Schedule`], the [`Observation`] record, the evidence request
+//! periodic interval assesses the captured snapshot. That observer loop lives in
+//! [`SupervisionMiddleware`](crate::jev::runtime::middleware::SupervisionMiddleware); this module
+//! keeps its validated parts — the [`Schedule`], the [`Observation`] record, the evidence request
 //! shape and [`append_tail`] (the bounded, truncation-aware tail accumulation the capture uses).
 
 use std::sync::Arc;
@@ -17,8 +15,8 @@ use crate::jev::execution::Decision;
 use super::evidence::SupervisionEvidence;
 use super::supervisor::{Report, Scope, TaskAdvice};
 
-/// Why the observer loop cannot be driven from this crate.
-pub const SUPERVISION_MIDDLEWARE_UNAVAILABLE: &str = "JevSupervisionMiddleware needs the core middleware event stream (onAgent, AgentEvent, bounded-elastic scheduling); the observer loop is not ported";
+/// Why the fail-closed placeholder cannot run the observer loop itself.
+pub const SUPERVISION_MIDDLEWARE_UNAVAILABLE: &str = "this placeholder is fail-closed; the observer loop is jev::runtime::middleware::SupervisionMiddleware";
 
 /// The jittered assessment schedule (`JevSupervisionMiddleware.Schedule`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +99,11 @@ pub struct Observation {
     pub advice: TaskAdvice,
 }
 
-/// The middleware's structural skeleton.
+/// The fail-closed placeholder kept for hosts that expect Java's type names.
+///
+/// The observer loop is
+/// [`SupervisionMiddleware`](crate::jev::runtime::middleware::SupervisionMiddleware); using this
+/// type keeps `ENFORCE` fail-closed instead of silently skipping supervision.
 #[derive(Debug, Clone)]
 pub struct SupervisionMiddlewareUnavailable {
     reason: String,

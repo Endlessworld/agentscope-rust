@@ -1,9 +1,10 @@
 //! The pure content-safety verdict fold of `JevGuardrail`.
 //!
 //! Java's `JevGuardrail` combines a reactive `caller` with an immutable safety policy
-//! (hazard questions, review/action/severity thresholds) and a pure `evaluate` fold. Only the
-//! policy types and the fold are landed here: the network call needs the `JevClient` transport
-//! that this module does not implement yet.
+//! (hazard questions, review/action/severity thresholds) and a pure `evaluate` fold. The policy
+//! types and the fold live here; the reactive caller side is
+//! [`GuardrailScreener`](crate::jev::screening::GuardrailScreener), which drives
+//! [`JevGuardrail::evaluate`] through the `jev::call::Caller` seam.
 //!
 //! The fold is deliberately blunt: a hazard's own action wins above `action_threshold`, a plain
 //! `REVIEW` above `review_threshold`, the maximum outcome across hazards is taken, and a review

@@ -3,11 +3,15 @@
 //! Mirrors `io.agentscope.extensions.judge.jev.JevExecution` minus the reactive plumbing: Java's
 //! `execute` wraps a `Mono<Decision<T>>` with a timeout, swallows errors into
 //! `Decision { status: ERROR, reason: "TIMEOUT" | "CALL_OR_RESPONSE_ERROR" }` and reports a
-//! metadata record to an observer that must never change execution. Here the same facts are
-//! modelled as data plus pure transitions, so an async runtime can drive them later.
+//! metadata record to an observer that must never change execution. Here the facts stay data plus
+//! pure transitions, and `jev::call::execute_guarded` drives them (including the `doOnCancel`
+//! `CANCELLED` report when the future is dropped).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+use agentscope_core::agent::RuntimeContext;
 
 use crate::error::JevError;
 
@@ -147,8 +151,15 @@ pub struct Record {
     pub recommendation: BTreeMap<String, String>,
 }
 
+/// The observation hook of [`Options`] (`JevExecution.Options#observer`).
+///
+/// The context is `None` when the execution was driven by
+/// [`execute_guarded`](super::call::execute_guarded), which has no `RuntimeContext` in scope;
+/// [`execute_guarded_with_context`](super::call::execute_guarded_with_context) forwards one.
+pub type Observer = Arc<dyn Fn(Option<&RuntimeContext>, &Record) + Send + Sync>;
+
 /// Per-subscription execution options.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Options {
     /// Whether and how JEV participates.
     pub mode: Mode,
@@ -156,6 +167,26 @@ pub struct Options {
     pub budget: Duration,
     /// Integration version (non-blank).
     pub version: String,
+    /// Observation hook, invoked once per execution (`JevExecution.Options#observer`).
+    pub observer: Observer,
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The observer has no `Debug` representation; everything else is plain data.
+        f.debug_struct("Options")
+            .field("mode", &self.mode)
+            .field("budget", &self.budget)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Options {
+    /// Compares the data fields only: observers are closures without an identity.
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode && self.budget == other.budget && self.version == other.version
+    }
 }
 
 /// Default budget when the integration is disabled (`Options.disabled`).
@@ -165,7 +196,7 @@ pub const DEFAULT_BUDGET: Duration = Duration::from_secs(2);
 pub const DEFAULT_VERSION: &str = "v1";
 
 impl Options {
-    /// Creates and validates options.
+    /// Creates and validates options with the default no-op observer.
     pub fn new(mode: Mode, budget: Duration, version: impl Into<String>) -> Result<Self, JevError> {
         let version = version.into();
         if budget.is_zero() {
@@ -178,7 +209,14 @@ impl Options {
             mode,
             budget,
             version,
+            observer: noop_observer(),
         })
+    }
+
+    /// Installs the observation hook (`Options#observer`).
+    pub fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = observer;
+        self
     }
 
     /// The disabled options Java ships as `Options.disabled()`.
@@ -187,8 +225,14 @@ impl Options {
             mode: Mode::Off,
             budget: DEFAULT_BUDGET,
             version: DEFAULT_VERSION.to_string(),
+            observer: noop_observer(),
         }
     }
+}
+
+/// The no-op observer Java uses in `Options.disabled()` (`(ctx, record) -> {}`).
+pub fn noop_observer() -> Observer {
+    Arc::new(|_context, _record| {})
 }
 
 /// A per-subscription execution scope: a fixed purpose plus immutable [`Options`].
@@ -238,6 +282,33 @@ impl JevExecution {
             elapsed,
             recommendation: decision.recommendation.clone(),
         }
+    }
+
+    /// Hands one observation to the configured [`Observer`] (`JevExecution.observe`).
+    ///
+    /// Observability must never change execution, so a panicking observer is contained. Note
+    /// that `catch_unwind` only works with unwinding panics: under `panic = "abort"` (the release
+    /// profile) a panicking observer aborts the process instead of being ignored.
+    pub fn observe(
+        &self,
+        context: Option<&RuntimeContext>,
+        status: Status,
+        reason: &str,
+        elapsed: Duration,
+        recommendation: &BTreeMap<String, String>,
+    ) {
+        let record = Record {
+            purpose: self.purpose.clone(),
+            version: self.options.version.clone(),
+            mode: self.options.mode,
+            status,
+            reason: reason.to_string(),
+            elapsed,
+            recommendation: recommendation.clone(),
+        };
+        let observer = Arc::clone(&self.options.observer);
+        let _ =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(context, &record)));
     }
 }
 

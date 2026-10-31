@@ -1,16 +1,18 @@
 //! The agent-visible projection of an evidence report (`JevEvidenceTool`).
 //!
 //! Java registers [`JevEvidenceTool::search`] on the core toolkit and reads its evidence source and
-//! ACL from the runtime context. This crate does not depend on the core `Tool`/`RuntimeContext`
-//! traits, so registration is a documented skeleton; the *projection* — which passages are shown,
-//! with which classification and score, and which status string — is ported as a pure function.
+//! ACL from the runtime context. Runtime registration lives in
+//! [`register_jev_tools`](crate::jev::runtime::tools::register_jev_tools);
+//! [`JevEvidenceTool::register`] remains only as the fail-closed fallback for hosts that wire the
+//! tool themselves. The *projection* — which passages are shown, with which classification and
+//! score, and which status string — is ported as a pure function.
 
 use crate::error::JevError;
 
 use super::processor::Report;
 
-/// Why the tool cannot be registered from this crate.
-pub const TOOL_UNAVAILABLE: &str = "JevEvidenceTool registration needs the core Toolkit/RuntimeContext seam; only the pure Result projection is ported";
+/// Why the fail-closed [`JevEvidenceTool::register`] cannot register the tool.
+pub const TOOL_UNAVAILABLE: &str = "JevEvidenceTool::register is fail-closed; register the tool through jev::runtime::tools::register_jev_tools";
 
 /// One passage as the agent sees it (`JevEvidenceTool.Passage`).
 #[derive(Debug, Clone, PartialEq)]
@@ -119,7 +121,8 @@ impl JevEvidenceTool {
         Ok(())
     }
 
-    /// Fails closed: registration needs the core toolkit.
+    /// Fails closed: the runtime registration is
+    /// [`register_jev_tools`](crate::jev::runtime::tools::register_jev_tools).
     pub fn register(&self) -> Result<(), JevError> {
         Err(JevError::protocol(TOOL_UNAVAILABLE))
     }

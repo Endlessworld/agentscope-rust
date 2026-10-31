@@ -1,9 +1,9 @@
 //! `JevResponseMiddleware` shapes: the quality state, the conversation text and the limits.
 //!
 //! Java screens model turns before their events are released, refines tool-free final drafts and
-//! can replace a text delta. That needs the core `MiddlewareBase`, `AgentEvent` and
-//! `TextBlockDelta` types, so the reactive part is **not** ported. The quality state builder — the
-//! evidence the judge sees — is pure and fully ported.
+//! can replace a text delta. That reactive part lives in
+//! [`ResponseMiddleware`](crate::jev::runtime::middleware::ResponseMiddleware); the quality state
+//! builder — the evidence the judge sees — is pure and lives here.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use crate::error::JevError;
 use crate::jev::evaluation::{JevTrace, TraceMessage};
 
-/// Why the response middleware cannot be driven from this crate.
-pub const RESPONSE_MIDDLEWARE_UNAVAILABLE: &str = "JevResponseMiddleware needs the core middleware model-call event stream (onModelCall, AgentEvent, TextBlockDelta) to withhold or replace a draft; only the quality state is ported";
+/// Why the fail-closed placeholder cannot drive the middleware itself.
+pub const RESPONSE_MIDDLEWARE_UNAVAILABLE: &str = "this placeholder is fail-closed; the reactive middleware is jev::runtime::middleware::ResponseMiddleware";
 
 /// The middleware order Java declares (`order()`).
 pub const MIDDLEWARE_ORDER: i32 = 200;
@@ -121,7 +121,11 @@ pub fn quality_state(messages: &[TraceMessage], draft: &str) -> Result<JevTrace,
     JevTrace::without_issues("answer-review", state)
 }
 
-/// The middleware's structural skeleton.
+/// The fail-closed placeholder kept for hosts that expect Java's type names.
+///
+/// The reactive middleware is
+/// [`ResponseMiddleware`](crate::jev::runtime::middleware::ResponseMiddleware); using this type
+/// keeps `ENFORCE` fail-closed instead of silently releasing an unscreened draft.
 #[derive(Debug, Clone)]
 pub struct ResponseMiddlewareUnavailable {
     reason: String,

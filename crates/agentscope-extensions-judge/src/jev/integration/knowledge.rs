@@ -18,8 +18,8 @@ use crate::jev::execution::{Mode, Options, Status};
 
 use crate::jev::application::JevCandidateSelector;
 
-/// Why the tool cannot be registered from this crate.
-pub const KNOWLEDGE_TOOL_UNAVAILABLE: &str = "JevKnowledgeTool registration needs the core Toolkit/RuntimeContext seam; only the pure passage projection is ported";
+/// Why the fail-closed [`JevKnowledgeTool::register`] cannot register the tool.
+pub const KNOWLEDGE_TOOL_UNAVAILABLE: &str = "JevKnowledgeTool::register is fail-closed; register the tool through jev::runtime::tools::register_jev_tools";
 
 /// The minimum a host knowledge backend must offer (`Knowledge.retrieve`).
 #[async_trait]
@@ -193,7 +193,8 @@ impl KnowledgeTool {
         self.limit
     }
 
-    /// Fails closed: registration needs the core toolkit.
+    /// Fails closed: the runtime registration is
+    /// [`register_jev_tools`](crate::jev::runtime::tools::register_jev_tools).
     pub fn register(&self) -> Result<(), JevError> {
         Err(JevError::protocol(KNOWLEDGE_TOOL_UNAVAILABLE))
     }

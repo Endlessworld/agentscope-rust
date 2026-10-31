@@ -11,9 +11,12 @@ use super::message::ContextMessage;
 /// The only envelope version this port reads and writes.
 pub const ARCHIVE_VERSION: u32 = 1;
 
-/// The error Java reports when the durable archive is unavailable.
+/// The error reported by the fail-closed placeholder, i.e. when the host supplied no store.
+///
+/// The store-backed implementation is
+/// [`StoreJevContextArchive`](crate::jev::runtime::archive::StoreJevContextArchive).
 pub const HARNESS_STORE_ARCHIVE_UNAVAILABLE: &str =
-    "context archive unavailable: Java's StoreJevContextArchive needs the harness BaseStore, which this crate does not depend on";
+    "context archive unavailable: no harness BaseStore was injected; use jev::runtime::archive::StoreJevContextArchive";
 
 /// The owner triple a snapshot belongs to (`JevContextArchive.Scope`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,12 +125,11 @@ pub trait JevContextArchive: Send + Sync {
     ) -> Result<Vec<ContextMessage>, JevError>;
 }
 
-/// An archive that always reports why durable storage is unavailable.
+/// An archive that always reports that the host supplied no store.
 ///
-/// Java's `StoreJevContextArchive` delegates to the harness `BaseStore`; this crate does not
-/// depend on the harness, so a host that wants store-backed archiving implements
-/// [`JevContextArchive`] over its own store. Wiring this type keeps `ENFORCE` fail-closed instead
-/// of silently dropping the recovery snapshot.
+/// The store-backed implementation is
+/// [`StoreJevContextArchive`](crate::jev::runtime::archive::StoreJevContextArchive). Using this
+/// type keeps `ENFORCE` fail-closed instead of silently dropping the recovery snapshot.
 pub struct UnavailableContextArchive {
     reason: String,
 }

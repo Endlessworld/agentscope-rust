@@ -13,9 +13,9 @@
 //! * [`text_backend`] — the chat-completion JSON adapter for offline evaluation.
 //! * [`capture`] — the middleware capture state machine.
 //!
-//! Java additionally contains `JevTraceEvaluationMiddleware`, whose reactive `MiddlewareBase`
-//! hooks are not ported (see `docs/extensions/JUDGE__GAP_TRACKER.md` §4.2); the state machine it
-//! drives *is* ported as [`capture::TraceCapture`].
+//! Java additionally contains `JevTraceEvaluationMiddleware`; its reactive `MiddlewareBase` hooks
+//! live in [`crate::jev::runtime::middleware::TraceEvaluationMiddleware`], and the state machine
+//! they drive is ported here as [`capture::TraceCapture`].
 
 pub mod capture;
 pub mod evaluation_runner;
