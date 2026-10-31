@@ -296,6 +296,80 @@
 
 **分派说明**：本轮共 22 个并行子智能体；其中 harness 第二路（复核 `on_agent_built`/`deliver_with_receipt`/`McpTransport`/`McpToolSource`/`SandboxManager::release`/`HARNESS-04`）**净改动 0**——六项均已在批次 2 落盘，其自建测试与既有用例重复已删除。
 
+
+### 3.3.6 Round 2 执行结果（2026-11-01，Wave A 独占 + Wave B 20 路并行）
+
+> 口径：每个子智能体**自验收**（`cargo build -p <crate> -j 2` + `cargo test -p <crate> -j 2 --no-fail-fast` + feature 门控 + 至少 1 处反向验证：回退实现 → `FAILED` → 恢复全绿；测试失败必须自己修到绿）。主智能体最后跑一次全 workspace 全量并判定。
+
+#### Wave A（harness 独占单路，前置）
+
+| 交付 | 位置 |
+|---|---|
+| `SandboxGuard::try_enter(&self, key) -> Result<SandboxLease>`（async，**fail-closed**：拿不到租约返回 `Err`，不再降级 `SandboxLease::noop()`） | `harness/src/agent/sandbox/guard.rs` |
+| 唯一生产落点改为 `lease = self.execution_guard.try_enter(key.clone()).await?;`——失败**不 resume / 不 create**、不 fallback | `harness/src/agent/sandbox/manager.rs:213` |
+| 7 个存储 crate 签名同步；原有 fail-open 分支（拿不到锁仍继续）一律改 `Err`（cos/oss 委托进程内 guard 恒 `Ok`，无需失败分支） | `extensions-{jdbc,mysql,postgresql,mongodb,redis,cos,oss}/src/sandbox/*` |
+| 新用例 `guard_acquisition_failure_aborts_the_acquire`（`FailingGuard` + `CountingSandboxClient`：断言**未**调用 create/resume） | `harness/src/agent/sandbox/manager.rs` |
+
+实测：harness lib 531 / redis 187 / mysql 115 / postgresql 130 / mongodb 108 / cos 119 / oss 77 / jdbc 257，全 0 failed，EXITCODE=0。反向验证 2 处（`?` → `warn!` + `noop`；redis `Err` → `Ok(noop)`）均 `FAILED` → 恢复。
+
+**有意不收口的遗留**：`jdbc/src/sandbox/jdbc_guard.rs` 的**同步**兼容入口 `try_enter` 仍返回 `JdbcSandboxLease`（超时降级 noop）——它不在 harness 生产路径上，收口需连带改造同步调用方；理由记 `JDBC__GAP_TRACKER.md` §4.2 项 8。`controlplane` 自建 `ControlPlaneSandboxLease::try_enter` 不受本 trait 影响。
+
+#### Wave B（20 路并行，全部交付并通过自验收）
+
+| 模块 | 关闭缺口 | 关键交付 | 实测 |
+|---|---|---|---|
+| MODEL | `MODEL-03/04/09` | OpenAI prompt 缓存标记（`MAX_CACHE_MARKERS=4`）；音频 `input_audio` / 视频降级文本；Gemini `PROVIDER_OPTION_KEYS` 过滤 + per-call `strictJsonSchema` | 445（419→+8 新增用例） |
+| PROTOCOL | `PROTO-A2A-04/02/06` | `tasks/resubscribe` per-task 事件 log + `lastEventSeq` 游标回放、未知任务 `-32001`、重连不重跑 agent；`send_stream` + `SseDecoder` 半帧安全 + `A2aAgent::stream_events`（顺带修分块文本被拼成 `"Hel\nlo"`）；`tasks/list` → `-32004` | a2a-client 71 / a2a-server 70 |
+| RAG | `RAG-01/02/05` | `is_retryable_status` / `execute_with_retry` / `RetryingTransport`（**预算耗尽返回最后一次响应**而非 `Err`，保住 RAGFlow/HayStack 语义）；Dify `topK>=1`、scoreThreshold/weights ∈[0,1]；`limit==0` → `Limit must be positive` | lib 492（`--features pdf,docx` 494） |
+| SANDBOX | `SANDBOX-05/06/07` | exec 默认 cwd=`workspace_root`（k8s 仅在有 cwd 时 `cd <root> && ( cmd )`）；`OUTPUT_TRUNCATE_BYTES=512KiB` + `truncate_utf8_bytes` 码点边界安全；E2B `append_capped` 超限仍消费保 exitCode | 244（227→+9） |
+| CHANNEL | `CHANNEL-N05/N04` | **结构发现**：harness 对 `T: PlatformChannel` 有 `ChannelSink` blanket impl → 平台适配器无法覆写默认方法；新增 `common/receipt.rs` 的 `ReceiptChannel`/`ReceiptSink<C>`、`ChannelRegistry::with_manager_and_receipts`、`build_gateway_registry_with_receipts`，飞书 `delivery_id`→返回 `message_id`；`common::http::ensure_success` 非 2xx → `ChannelError::Remote{status, body≤200}` | 440（426→+14） |
+| CONTROLPLANE | `CP-05/06/07` | `dispatch_downstream(AsdpEvent)` 接事件泵（`sessionCmd`/`executionAttempt`（cancel 终止）/`conversationTurn`）；`context` adapter 权威、`subagents`/`workspaces` 委托、无 adapter → `Unsupported`；压缩后锁内写回 `state_handle()` + `agent_state_store.save` | lib 183 + 4 e2e |
+| STUDIO | `STUDIO-06/12/13` | export 失败指数退避（`EXPORT_MAX_ATTEMPTS=3`，100ms 起翻倍封顶 5s）；`TelemetryTracing::on_format` + `active_points()` 纳入 `OnFormat`（`format=None` 不出 span）；provider 名优先 core `Model::provider_name()` | 102 lib + 1 集成（96→+7） |
+| SKILLS | `SKILLS-04/05/07` | `sync_lock: Mutex<()>` git 同步单飞 + `clone_count()`；`split_frontmatter` 允许 `---` 尾随空白；MySQL 单次 `execute_batch` + `inserted != len` 报错；顺修 `SKILLS-01` 残留 bug：`SyncBridge` 在 async 上下文 drop 多线程 runtime panic → `Option<Runtime>` + `Drop::shutdown_background` | 128 / 138(pg) / 133(mysql) |
+| SCHEDULER | `SCHED-02/03/04` | 取消即从 `jobs` 摘除（`Arc<RwLock<HashMap>>` + `Weak` 无环）；`FIXED_RATE` 显式 `period` 网格跳空不补触发、`CRON` `FIRE_ONCE_NOW`；首触发时序用例（`[dev-dependencies]` 加 tokio `test-util`） | 115 lib + 3 集成 |
+| TRAINING | `TRAIN-02/03`、`TRAIN-10`（本 crate 侧） | `on_agent` 后处理改 `handle.spawn`（无 runtime 只告警不 panic）；`has_agent()` + `unbound_hook_count()`；`ShadowAgentBlueprint` 快照取代 `Weak`、`bind_blueprint`/`clone_blueprint`/`run_shadow_blueprint`、`bind_agent` 改收 `&ReActAgent` | 91 |
+| NACOS | `NACOS-05/06/07` | `release_agent_card(card, endpoint_type, set_as_latest)`（恒传 `"service"`，HTTP query 首位）；`RetryPolicy` 默认 3 次 / 200ms×2 / 上限 2s（仅 Transport / 429 / 5xx），逐请求 timeout 默认 30s，polling 退避上限 60s；`heartbeat()` + 可 abort 的 `spawn_heartbeat()` | 115（`--features http-client`，92→+23；默认 113） |
+| HIGRESS | `HIGRESS-02/06/07` | `call_tool_with_meta` 每次读连接级 `propagate_meta`；`to_server_config()` 投影 `McpServerConfig.transport`；删本 crate `McpToolSource`，re-export harness 的 + `register_higress_client(...)`（`instanceof` 语义替代记 `HIGRESS-X11`） | 63 lib + 1 doc |
+| MEM + JUDGE（合并一路） | `MEM-04/06`、`JUDGE-02/03` | `is_recordable` 完整 Java 谓词（角色 / 无 `ToolUseBlock` / 文本非空 / 无 `<compressed_history>`；Bailian `trim()` vs ReMe `is_empty()`）；`Options.observer` + `Observation::Drop` 补报 `Cancelled`（`catch_unwind` 吞观察器 panic）；7 处陈旧 fail-closed 文案改指 `jev::runtime` | MEM 138+3+1 / JUDGE 426+5 |
+| JDBC | `JDBC-12/04/10` | 覆写 `try_get_versioned`/`try_save_if_version`，`JdbcError`→`core::Error::Session`（torn row 不再冒充 `version==0`）；`MAX_STATE_COLUMN_LENGTH=255` + `utf16_len()` 对齐 Java `String.length()` + `validate_ids`；`strip_comments` | 268（257→+11） |
+| REDIS | `REDIS-05/11/06/13` | `try_*` 覆写（无错版由 `try_*` 派生 + `tracing::error!` 后降级 `UNVERSIONED`；`Err` 与 CAS 冲突可区分）；`is_held` 先 `warn!` 再 false，同 key 不可重入（vs host 进程内 guard 可重入）；`exists` 改单条 `SCARD` | lib 186 + 9 env-gated + 2 doc |
+| MONGODB | `MONGO-03/04/06` | `build_with_indexes()` / `DistributedStore::try_new()` async（**不做** lazy ensure，偏差记 tracker）；fail-closed 收尾 + 经 `SandboxManager::with_shared_guard` 真实装配路径；续约 `find_one_and_update(upsert:false)`，`Ok(None)` → `is_lock_lost()` + 停续约 | lib 106 + live 5 + doc 2 |
+| MYSQL | `MYSQL-04/05/13/10` | 会话键 `0x1F`→`:`，收敛 `compose_slot_id`/`slot_id_prefix`；poison 容忍、`release` 仅释放自己的租约；`user:session` ≤255 拒 `:` 歧义；`MysqlError::Conflict{key,expected,found}` | 118（`--features mysql_async` 117 + 5 skip） |
+| POSTGRESQL | `PG-04/02/10` | 四类失败全 `Err`（含租约登记表 Mutex 中毒），`rg "SandboxLease::noop" src` 零命中；`PostgresError::Sql{code,message}` 保留 SQLSTATE（`is_duplicate_key` 以 class-23 为准）；解码失败 `warn!`，坏 payload ≠ `UNVERSIONED`；顺修两处既有测试缺陷（`store.get()` 与 `Option<StoreValue>` 比较编译失败；`driver::tests::block_on_*` async 上下文 drop Runtime panic） | 136（`--features postgres-driver` lib 139 + 集成 6） |
+| COS | `COS-02/03/04` | `try_get_versioned`/`try_save_if_version`（不可失败版出错回落 `version=0`，**绝不返回 `UNVERSIONED`**）；`.version` sidecar + 条件写真 CAS（`get_etagged`/`put_if_match`（412→Conflict）/`put_if_absent`/`supports_conditional_writes()`）；`exists` 改 `list_page(prefix, None, 1)` | 129（119→+13） |
+| OSS | `OSS-02/03/04`、`OSS-09` | `OssClient` 条件写 seam（`get_with_etag`/`put_conditional`/`PutOutcome`，默认 `Unsupported` 不破坏第三方后端；`put_if_version_strict` 以 `.version` sidecar 为 CAS 锚点）；ETag → 63-bit FNV-1a 令牌作 version；`run()` `tokio::time::timeout` 默认 60s + `100ms·2^n` 上限 5s、0~25% 抖动、默认 3 次重试 | 82（`--features s3` 107）+ doc |
+
+#### 跨模块需求（Wave C 候选，累计 10 条，均需 harness/core 独占）
+
+1. `HarnessAgentHandle` 补 `description` / `sys_prompt` / `max_iters`（或 `on_agent_built` 给 `&HarnessAgent`）→ 解锁 `TRAIN-10` 的 `attach_to(builder)`。
+2. harness `McpClientManager::call_tool_with_meta` 读 `config.propagate_meta`；`McpToolInfo` 补 `title` / `output_schema`（HIGRESS）。
+3. core `convert_call_tool_result`（`HIGRESS-03/05`）。
+4. `AsdpTransport` 补上行回报方法（CONTROLPLANE `executionAttempt`(ack/start/heartbeat/cancelled) 与 `conversationTurn`；与 `CP-13`「不主动推送」同源）。
+5. harness `PlatformChannel::deliver_with_receipt` 默认方法（CHANNEL `XM1`；落地后可删 `ReceiptSink` 适配层）。
+6. `PreparedResponse` 扩响应头（CHANNEL `N04` 限流诊断）。
+7. core `AgentStateStore` 补 `try_save`/`try_save_list`/`try_delete`（JDBC `save`/`save_list`/`delete` 仍只能 warn 降级）。
+8. core 补 `try_get`/`try_list`/`try_exists`/`try_list_session_ids`（REDIS）+ `try_get_list`/`try_save_list`（COS）。
+9. harness skill 单目录装载暴露缝（`SKILLS-06`，否则要复制第三份资源扫描）。
+10. harness `SandboxGuard::is_held` 同步签名导致只能阻塞探测（`REDIS-07`）；另 harness 侧 release→`kill_sandbox` 的 manager 级用例（`SANDBOX-09`）。
+
+**非阻塞提示**：core `ExtensionPoint::OnFormat` 不带 formatter 输出，format span 无 `agentscope.function.output`；`async-openai` 0.41 无 `video_url` part（上游限制，已降级文本）。
+
+#### 反作弊审计
+
+- 无新增 `#[ignore]`（此前 2 处 `rg` 命中为 tracker 文档文字，非代码）；无新增 `todo!()` / `unimplemented!()`。
+- 断言净增 +582 / −21；测试函数净增 +153。
+- 反向验证残留扫描：`rg "REVERSE-VERIFICATION" crates -g '*.rs'` **零命中**（`r2-cos` 中途曾把 `conditional_write` 改成恒 `Written`，交付前已恢复；仅 `history/PROTOCOL__MIGRATION_HISTORY.md` 正文提及该词）。
+
+#### 提交（按功能模块分组，`dev` 线性）
+
+24 条，按「一模块一组」拆分：`feat(harness)` ×1（Wave A `SandboxGuard`）、`feat(extensions/<mod>)` ×20（model / protocol / rag / sandbox / channel / controlplane / studio / skills / scheduler / training / nacos / higress / mem+judge / jdbc / redis / mongodb / mysql / postgresql / cos / oss）、`chore(deps)` ×1（`Cargo.lock`：a2a-client `futures` / scheduler `test-util`）、`chore(memory)` ×1（文本/marker 收尾随对应模块提交）。每条正文列缺口编号 + 验证结果。`git log --merges --oneline` 在 `dev` 上**无输出**（线性历史，无 merge commit）。
+
+#### 剩余 P1/P2（Round 3 候选）
+
+- MODEL-05~08/10 + P2 14~18；SANDBOX-04/08 + 10~14；CP-08 + CP-13 上行；STUDIO-03/05/07~11；SCHED-07/08/10；HIGRESS-01/04；JDBC-05（需 `JdbcError` 携带 SQLSTATE）/06~09/11。
+- REDIS-01（`ManagerRedisCommands` 注入 `ClusterRouter`）/07~10/12/14；MONGO-05/07/08/09/10；MYSQL-02（写事务）/06~09/11/12；NACOS-08/09/10/12/13/14。
+- PROTO-A2A-03、PROTO-AP-02；RAG-03/04/06/07/22；SKILLS-03（TLS 需根 workspace 加 rustls feature）/06/08/09/11；COS-05/06/07；OSS-08（列表/snapshot 组合 + 真机 412 验证）；MEM-05；TRAIN-04~09①。
+
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）
@@ -305,6 +379,7 @@ cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表�
 cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
+- **全量（Round 2 收口实测，2026-11-01）**：**173 targets / 5814 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 1 基线 **+15 targets / +162 passed**，ignored 未增。
 - **全量（Round 1 收口实测，2026-10-31）**：**158 targets / 5652 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）。工具链 `rustc 1.97.1 (8bab26f4f 2026-07-14)`。
 - **6 个 ignored**：`agentscope-core` lib 3 个（既有）+ 3 个 ```ignore 文档示例（CHANNEL `platform_channel.rs`、RAG `hook.rs`、HARNESS 新增示例），**无 `#[ignore]` 新增**。
 - **本轮修掉的失败（主智能体统一验证 loop）**：`agentscope-core` `FormatInjector::on_format` 签名、MODEL `openai` `Option<Option<_>>`、agent-protocol `LAST_EVENT_ID`、RAG `docx` 字节串转义、harness `tools.rs` 生命周期/所有权、mem 测试 trait 转型、nacos `FakeTransport` 强转与 A2A 1.0 形状、scheduler quartz 注入锁、CHANNEL wecom 截断、STUDIO span 周期导出、CONTROLPLANE bridge 三例（缺 `start()` 未开 journal）、ACP `session/close`（closed 分支仍等 journal 写者租约 → 加 500ms 有界关闭）、RAG `embedding_wire_contract` 字节序。
@@ -323,7 +398,7 @@ cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 
 ### 4.3 后续事项
 
-1. **~~P0 清零（30 条）~~ 已完成（2026-10-31 Round 1，见 §3.3.5）**：四组顺序执行完毕，全量 158 targets / 5652 passed / 0 failed。下一步按 §3.3.5「仍阻塞 / 未开工」清单推进：先由 harness 独占一轮改 `SandboxGuard::try_enter -> Result` 解锁 5 个存储模块，再处理已解锁项（`JDBC-12`/`COS-02`/`REDIS-05`/`STUDIO-12,13`/`MODEL-12,13`/`ACP-04`/`CHANNEL-N05`/`TRAIN-10`）。
+1. **~~P0 清零（30 条）~~ 已完成（2026-10-31 Round 1，见 §3.3.5）**；**~~P1 解锁项 + P2 长尾一轮~~ 已完成（2026-11-01 Round 2，见 §3.3.6）**：Wave A（`SandboxGuard::try_enter -> Result` fail-closed）解锁 5 个存储模块，Wave B 20 路并行关闭 63 条 P1/P2，全量 173 targets / 5814 passed / 0 failed。下一步：① 按 §3.3.6「跨模块需求」10 条做 **Wave C**（harness/core 独占串行，每条独立提交）；② 剩余 P1/P2 见 §3.3.6 结尾与各模块 tracker。
 2. **~~待裁定 41 条~~ 已完成（2026-10-31 全部裁定，见 §3.3）**：36 项转 `待办`（按 §3.1 的 P0 分组顺序执行）、5 项转 `设计决定（不迁移）`（`COS-08` / `MODEL-13` / `CORE-14` / `CP-13` / `OSS-10`）；`HARNESS-16` 关闭为 `已完成`、`HARNESS-15` 去重退役。执行批次见 §3.3.4。
 3. **真实后端联调**：MySQL / PostgreSQL / Redis（单机 + 集群）/ MongoDB / Docker 沙箱**已实测通过**（§3.2 + `history/EXTENSIONS_MIGRATION_HISTORY.md`）；仍缺环境：E2B、Kubernetes、MEM 三厂商、CHANNEL 真实租户、Trinity-RFT。
 4. **可选增强（P2，136 条）**：测试密度对齐 Java（如 SKILLS 108 vs 192 `@Test`、POSTGRESQL 53 个 Java 用例未覆盖）；各 tracker §3.5 的 P2 行即候选清单。
