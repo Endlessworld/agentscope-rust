@@ -28,7 +28,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscope_harness::agent::skill::model::AgentSkill;
@@ -125,6 +126,15 @@ pub struct GitSkillRepository {
     owns_temp_dir: bool,
     /// The `git` program every invocation uses (normalised at construction, see SKILLS-10).
     git_binary: String,
+    /// Serialises whole synchronization passes (SKILLS-04).
+    ///
+    /// Kept apart from [`Self::state`] so the pass can still lock the state fields inside: a
+    /// second thread must wait for the clone / pull to finish instead of racing it and cloning on
+    /// top of a half-written work tree. Java gets this from
+    /// `GitSkillRepository#ensureRepositorySynced` being `synchronized`.
+    sync_lock: Mutex<()>,
+    /// How many `git clone` invocations this instance performed (see [`Self::clone_count`]).
+    clone_count: AtomicUsize,
     state: Mutex<SyncState>,
 }
 
@@ -161,6 +171,8 @@ impl GitSkillRepository {
             local_path,
             owns_temp_dir,
             git_binary,
+            sync_lock: Mutex::new(()),
+            clone_count: AtomicUsize::new(0),
             state: Mutex::new(SyncState {
                 skills_path: None,
                 last_remote_ref: None,
@@ -171,6 +183,14 @@ impl GitSkillRepository {
     /// The local clone directory.
     pub fn local_path(&self) -> &Path {
         &self.local_path
+    }
+
+    /// Number of `git clone` invocations this instance performed.
+    ///
+    /// Observability for the single-flight guarantee of [`Self::ensure_repository_synced`]
+    /// (SKILLS-04): concurrent first reads must clone exactly once.
+    pub fn clone_count(&self) -> usize {
+        self.clone_count.load(Ordering::Relaxed)
     }
 
     /// Extracts a concise `owner/repo` identifier from a git URL, mirroring
@@ -239,6 +259,7 @@ impl GitSkillRepository {
     /// Clones the remote repository into the local path.
     fn clone_repository(&self) -> Result<(), SkillRepositoryError> {
         tracing::info!(url = %self.cfg.remote_url, path = %self.local_path.display(), "cloning git skill repository");
+        self.clone_count.fetch_add(1, Ordering::Relaxed);
         if let Some(parent) = self.local_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -358,7 +379,17 @@ impl GitSkillRepository {
     }
 
     /// Ensures the clone exists (cloning or pulling as needed) and resolves the skills path.
+    ///
+    /// The whole pass is single-flight (SKILLS-04): Java marks `ensureRepositorySynced`
+    /// `synchronized`, and without the same guarantee two threads reading a fresh repository
+    /// both see an empty directory and race `remove_dir_all` + `git clone` into the same path,
+    /// leaving a failed or half-written work tree. The lock is separate from [`Self::state`] so
+    /// it can be held across the git invocations (and so it never re-enters `state`).
     fn ensure_repository_synced(&self) -> Result<(), SkillRepositoryError> {
+        let _guard = self
+            .sync_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let empty = !self.local_path.exists() || is_empty_dir(&self.local_path);
         if empty {
             // A previously created temp dir must be removed before `git clone`.
@@ -752,10 +783,20 @@ fn first_body_line(skill_md: &str) -> Option<String> {
 fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
     let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
     let rest = match text.strip_prefix("---") {
-        Some(rest) if rest.starts_with('\n') || rest.starts_with("\r\n") => {
-            rest.trim_start_matches(['\r', '\n'])
+        // Java `MarkdownSkillParser.FRONTMATTER_PATTERN` is `^\uFEFF?---\s*[\r\n]+...`, so blank
+        // space between the opening fence and the line break is allowed (SKILLS-05); a suffix
+        // (`---x`) is not a fence.
+        Some(rest) => {
+            let after_blanks = rest.trim_start_matches([' ', '\t']);
+            match after_blanks
+                .strip_prefix("\r\n")
+                .or_else(|| after_blanks.strip_prefix('\n'))
+            {
+                None => return (None, text),
+                Some(after) => after.trim_start_matches(['\r', '\n']),
+            }
         }
-        _ => return (None, text),
+        None => return (None, text),
     };
     let mut offset = 0usize;
     for line in rest.split_inclusive('\n') {
@@ -1007,6 +1048,39 @@ mod tests {
             split_frontmatter("---\nname: calc\n---  \t\nbody\n"),
             (Some("name: calc\n"), "body\n")
         );
+    }
+
+    /// SKILLS-05: Java's pattern allows blank space between the opening fence and the line break.
+    #[test]
+    fn split_frontmatter_accepts_trailing_blanks_after_the_opening_fence() {
+        assert_eq!(
+            split_frontmatter("---   \t\nname: calc\n---\nbody\n"),
+            (Some("name: calc\n"), "body\n")
+        );
+        assert_eq!(
+            split_frontmatter("---  \r\nname: calc\r\n---\r\nbody\r\n"),
+            (Some("name: calc\r\n"), "body\r\n")
+        );
+        // A fence followed by blanks but no line break is still not a fence.
+        assert_eq!(split_frontmatter("---  x\nbody\n"), (None, "---  x\nbody\n"));
+    }
+
+    /// SKILLS-05 end-to-end: a skill whose opening fence carries blanks keeps its frontmatter
+    /// identity instead of degrading to the directory name / a `---` description.
+    #[test]
+    fn skill_identity_reads_a_frontmatter_after_a_blank_padded_fence() {
+        let (name, description) = skill_identity(
+            "--- \t\nname: calc\ndescription: Adds numbers\n---\n# Calc\n",
+            "dir-name",
+        );
+        assert_eq!(name, "calc");
+        assert_eq!(description, "Adds numbers");
+
+        // Without a description the fallback must skip the fence and read the body heading.
+        let (name, description) = skill_identity("--- \nname: calc\n---\n# Calc skill\n", "dir");
+        assert_eq!(name, "calc");
+        assert_ne!(description, "---");
+        assert_eq!(description, "Calc skill");
     }
 
     #[test]
@@ -1688,6 +1762,38 @@ mod tests {
         repo.sync().unwrap();
         repo.sync().unwrap();
         assert_eq!(repo.get_all_skill_names().unwrap(), vec!["one".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SKILLS-04: `ensureRepositorySynced` is single-flight, like Java's `synchronized`.
+    ///
+    /// Eight threads open the same never-synced repository at once; without the sync lock they
+    /// all see an empty directory and race `remove_dir_all` + `git clone` into it (failed or
+    /// half-written work tree), and the clone counter goes above one.
+    #[test]
+    fn concurrent_first_reads_synchronise_once() {
+        let root = unique_dir("concurrent");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/one", "one", "first");
+        commit_all(&remote, "initial");
+
+        let repo = std::sync::Arc::new(repo_for(&file_url(&remote), &root.join("clone")));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let repo = std::sync::Arc::clone(&repo);
+                std::thread::spawn(move || repo.get_all_skill_names())
+            })
+            .collect();
+        for handle in handles {
+            let names = handle
+                .join()
+                .expect("worker thread")
+                .expect("read succeeds");
+            assert_eq!(names, vec!["one".to_string()]);
+        }
+        assert_eq!(repo.clone_count(), 1, "the clone must run once");
 
         let _ = std::fs::remove_dir_all(&root);
     }

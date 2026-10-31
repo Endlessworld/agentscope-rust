@@ -34,7 +34,6 @@
 
 use std::fmt::Display;
 use std::future::Future;
-use std::sync::Arc;
 
 use crate::error::SkillRepositoryError;
 
@@ -65,7 +64,7 @@ fn db_error(context: &str, error: impl Display) -> SkillRepositoryError {
 /// [`SyncBridge::run`] therefore hands the future to a dedicated OS thread when it detects an
 /// ambient runtime; see its docs for why `block_in_place` is not an option.
 pub(crate) struct SyncBridge {
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
     backend: &'static str,
 }
 
@@ -77,7 +76,17 @@ impl SyncBridge {
             .enable_all()
             .build()
             .map_err(|e| db_error(backend, format!("failed to build runtime: {e}")))?;
-        Ok(Self { runtime, backend })
+        Ok(Self {
+            runtime: Some(runtime),
+            backend,
+        })
+    }
+
+    /// The bridge runtime; only absent once the bridge is being dropped.
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("runtime is present until drop")
     }
 
     /// Runs `future` to completion on the bridge runtime.
@@ -107,7 +116,7 @@ impl SyncBridge {
             // unwinding through the caller's runtime.
             return std::thread::scope(|scope| {
                 scope
-                    .spawn(|| self.runtime.block_on(future))
+                    .spawn(|| self.runtime().block_on(future))
                     .join()
                     .map_err(|_| {
                         db_error(
@@ -117,7 +126,7 @@ impl SyncBridge {
                     })
             });
         }
-        Ok(self.runtime.block_on(future))
+        Ok(self.runtime().block_on(future))
     }
 
     /// Spawns a driver's connection task (PostgreSQL needs its `Connection` polled).
@@ -126,7 +135,22 @@ impl SyncBridge {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.runtime.spawn(future);
+        self.runtime().spawn(future);
+    }
+}
+
+impl Drop for SyncBridge {
+    /// Tears the bridge runtime down without waiting for its workers.
+    ///
+    /// A repository is normally dropped on a Tokio worker (it lives inside an
+    /// `Arc<dyn AgentSkillRepository>` owned by an async agent), and dropping a multi-thread
+    /// `Runtime` there panics with "Cannot drop a runtime in a context where blocking is not
+    /// allowed", because the default drop waits for the blocking pool. `shutdown_background`
+    /// never waits, so the drop is safe both inside and outside async contexts.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 

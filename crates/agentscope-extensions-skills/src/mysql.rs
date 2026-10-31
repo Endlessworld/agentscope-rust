@@ -404,23 +404,43 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
             .unwrap_or_default()
     }
 
+    /// Inserts the resource rows in one batch (`insertResources`).
+    ///
+    /// Java builds a single `PreparedStatement`, `addBatch()`s every resource and calls
+    /// `executeBatch()` once, then throws when the driver reports fewer rows than the batch held.
+    /// The same single round trip and row-count check are expressed on top of
+    /// [`SqlConnection::execute_batch`] (SKILLS-07); PostgreSQL additionally chunks by
+    /// `RESOURCE_BATCH_SIZE` for the bind-parameter limit, MySQL does not.
     fn insert_resources(
         &self,
         conn: &mut D::Connection,
         skill_id: i64,
         resources: &SkillResources,
     ) -> Result<(), SkillRepositoryError> {
+        if resources.is_empty() {
+            return Ok(());
+        }
         let sql = format!(
             "INSERT INTO {} (id, resource_path, resource_content) VALUES (?, ?, ?)",
             self.full_table_name(&self.cfg.resources_table_name)
         );
-        for (path, content) in resources {
-            let params = [
-                SqlParam::Int(skill_id),
-                SqlParam::Text(path.clone()),
-                SqlParam::Text(content.clone()),
-            ];
-            conn.execute(&sql, &params)?;
+        let batch: Vec<Vec<SqlParam>> = resources
+            .iter()
+            .map(|(path, content)| {
+                vec![
+                    SqlParam::Int(skill_id),
+                    SqlParam::Text(path.clone()),
+                    SqlParam::Text(content.clone()),
+                ]
+            })
+            .collect();
+        let inserted = conn.execute_batch(&sql, &batch)?;
+        if inserted != resources.len() {
+            // Java throws `SQLException` when `executeBatch` reports fewer rows than the batch.
+            return Err(SkillRepositoryError::Database(format!(
+                "failed to insert all resources for id '{skill_id}': expected {}, inserted {inserted}",
+                resources.len()
+            )));
         }
         Ok(())
     }
@@ -925,6 +945,37 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, SkillRepositoryError::InvalidArgument { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // SKILLS-07: resource inserts use one batch round trip (Java addBatch/executeBatch)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resource_inserts_use_one_batch() {
+        let db = Arc::new(InterceptingSqlDatabase::recording());
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        r.save(&[skill("calc", "calc skill")], false).unwrap();
+
+        // `skill()` carries SKILL.md + a.txt, both in a single execute_batch call.
+        assert_eq!(db.batch_sizes(), vec![2]);
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        assert_eq!(r.get_skill("calc").unwrap().resources().len(), 2);
+    }
+
+    /// Java throws when `executeBatch` reports fewer rows than the batch held.
+    #[test]
+    fn short_resource_batches_are_reported() {
+        let db = Arc::new(InterceptingSqlDatabase::recording().with_batch_shortfall(1));
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        let err = r.save(&[skill("calc", "calc skill")], false).unwrap_err();
+        match err {
+            SkillRepositoryError::Database(message) => {
+                assert!(message.contains("expected 2, inserted 1"), "{message}")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(db.batch_sizes(), vec![2], "one batch, then the row check");
     }
 
     // ------------------------------------------------------------------

@@ -939,11 +939,14 @@ pub(crate) mod test_support {
     ///
     /// * `needle` + `skip`: fails every executed statement whose SQL contains `needle`, after
     ///   letting the first `skip` matches through (counted per connection);
-    /// * `batches`: the size of every [`SqlConnection::execute_batch`] call.
+    /// * `batches`: the size of every [`SqlConnection::execute_batch`] call;
+    /// * `batch_shortfall`: rows the fake under-reports from every batch, so the "driver lost
+    ///   rows" branch stays reachable.
     pub(crate) struct InterceptingSqlDatabase {
         inner: InMemorySqlDatabase,
         needle: Option<String>,
         skip: usize,
+        batch_shortfall: usize,
         failures: Arc<AtomicUsize>,
         batches: Arc<Mutex<Vec<usize>>>,
     }
@@ -959,11 +962,18 @@ pub(crate) mod test_support {
             Self::with_fault(Some(needle.to_string()), skip)
         }
 
+        /// Makes every [`SqlConnection::execute_batch`] report `rows` fewer affected rows.
+        pub(crate) fn with_batch_shortfall(mut self, rows: usize) -> Self {
+            self.batch_shortfall = rows;
+            self
+        }
+
         fn with_fault(needle: Option<String>, skip: usize) -> Self {
             Self {
                 inner: InMemorySqlDatabase::new(),
                 needle,
                 skip,
+                batch_shortfall: 0,
                 failures: Arc::new(AtomicUsize::new(0)),
                 batches: Arc::new(Mutex::new(Vec::new())),
             }
@@ -994,6 +1004,7 @@ pub(crate) mod test_support {
                 needle: self.needle.clone(),
                 skip: self.skip,
                 matched: 0,
+                batch_shortfall: self.batch_shortfall,
                 failures: self.failures.clone(),
                 batches: self.batches.clone(),
             })
@@ -1006,6 +1017,7 @@ pub(crate) mod test_support {
         needle: Option<String>,
         skip: usize,
         matched: usize,
+        batch_shortfall: usize,
         failures: Arc<AtomicUsize>,
         batches: Arc<Mutex<Vec<usize>>>,
     }
@@ -1063,7 +1075,8 @@ pub(crate) mod test_support {
         ) -> Result<usize, SkillRepositoryError> {
             self.batches.lock().unwrap().push(params.len());
             self.guard(sql)?;
-            self.inner.execute_batch(sql, params)
+            let affected = self.inner.execute_batch(sql, params)?;
+            Ok(affected.saturating_sub(self.batch_shortfall))
         }
 
         fn set_auto_commit(&mut self, enabled: bool) -> Result<(), SkillRepositoryError> {
