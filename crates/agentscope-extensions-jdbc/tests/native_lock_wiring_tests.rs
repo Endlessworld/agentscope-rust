@@ -208,7 +208,9 @@ async fn the_guard_acquires_a_native_lock_through_the_executor() {
     let isolation = key();
     let expected = postgres_lock_key(&guard.compose_lock_name(&isolation)).to_string();
 
-    let lease = SandboxGuard::try_enter(&guard, isolation.clone()).await;
+    let lease = SandboxGuard::try_enter(&guard, isolation.clone())
+        .await
+        .expect("lease");
     assert!(!lease.is_noop(), "the lease must hold a real advisory lock");
     assert_eq!(backend.opens(), 1);
     assert_eq!(backend.attempts(), vec![expected.clone()]);
@@ -226,7 +228,7 @@ async fn every_acquisition_opens_a_new_session() {
     let guard = native_guard(&backend, NativeLockFlavor::Postgres);
 
     for _ in 0..3 {
-        let lease = SandboxGuard::try_enter(&guard, key()).await;
+        let lease = SandboxGuard::try_enter(&guard, key()).await.expect("lease");
         assert!(!lease.is_noop());
         SandboxGuard::release(&guard, &key()).await;
     }
@@ -244,7 +246,9 @@ async fn the_mysql_flavor_uses_the_composed_lock_name() {
     let isolation = key();
     let composed = guard.compose_lock_name(&isolation);
 
-    let lease = SandboxGuard::try_enter(&guard, isolation.clone()).await;
+    let lease = SandboxGuard::try_enter(&guard, isolation.clone())
+        .await
+        .expect("lease");
     assert!(!lease.is_noop());
     assert_eq!(backend.attempts(), vec![composed.clone()]);
     assert!(composed.starts_with(DEFAULT_KEY_PREFIX));
@@ -275,7 +279,7 @@ async fn the_distributed_store_projects_a_native_lock_guard() {
     assert!(guard.is_distributed());
 
     let isolation = key();
-    let lease = guard.try_enter(isolation.clone()).await;
+    let lease = guard.try_enter(isolation.clone()).await.expect("lease");
     assert!(!lease.is_noop());
     assert_eq!(backend.opens(), 1);
 
@@ -284,7 +288,7 @@ async fn the_distributed_store_projects_a_native_lock_guard() {
 }
 
 #[tokio::test]
-async fn a_backend_without_advisory_locks_degrades_to_a_noop_lease() {
+async fn a_backend_without_advisory_locks_is_an_error_not_a_noop_lease() {
     let store = JdbcDistributedStore::create(in_memory_executor().unwrap(), "SQLite")
         .expect("sqlite store")
         .with_native_lock_guard(NativeLockFlavor::Mysql);
@@ -293,10 +297,15 @@ async fn a_backend_without_advisory_locks_degrades_to_a_noop_lease() {
         .sandbox_execution_guard
         .expect("the harness store carries the execution guard");
 
-    let lease = guard.try_enter(key()).await;
+    // Fail-closed: SQLite has no advisory locks, so the guard cannot claim the isolation
+    // key. It must report the failure instead of handing back a no-op lease.
+    let error = guard
+        .try_enter(key())
+        .await
+        .expect_err("SQLite has no advisory locks: the guard must not claim the lock");
     assert!(
-        lease.is_noop(),
-        "SQLite has no advisory locks: the guard must degrade, not claim the lock"
+        format!("{error}").contains("advisory lock"),
+        "the backend limitation must be reported: {error}"
     );
 }
 
@@ -329,7 +338,10 @@ async fn a_contended_lock_times_out_to_a_noop_lease() {
     let guard = native_guard(&backend, NativeLockFlavor::Mysql).with_timeout_seconds(0);
 
     let lease = SandboxGuard::try_enter(&guard, key()).await;
-    assert!(lease.is_noop());
+    assert!(
+        lease.is_err(),
+        "an exhausted deadline is a failed acquisition on the harness path"
+    );
     // An exhausted deadline makes exactly one attempt (no spinning).
     assert_eq!(backend.attempts().len(), 1);
     assert_eq!(backend.closes(), 1);

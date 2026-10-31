@@ -166,7 +166,7 @@ async fn long_lock_name_is_sha256_normalised() {
         SandboxIsolationKey::resolve(Some(&IsolationScope::Global), None, &long_value)
             .expect("isolation key");
 
-    let lease = guard.try_enter(isolation.clone()).await;
+    let lease = guard.try_enter(isolation.clone()).await.expect("lease");
     assert!(
         !lease.is_noop(),
         "GET_LOCK must succeed with the normalised (>64 char) name on a live server"

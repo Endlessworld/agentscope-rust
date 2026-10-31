@@ -26,10 +26,63 @@ fn is_valid_identifier(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Removes `--` line comments and `/* ... */` block comments, leaving quoted literals and
+/// quoted identifiers intact (a `--` inside `'...'` is data, not a comment).
+///
+/// Mirrors the Java `CreateTableDdlParser.stripComments`. Comments are not cosmetic here: a
+/// leading `-- CREATE TABLE other (...)` would otherwise be picked up as the reference DDL
+/// (columns that this table does not declare), and a parenthesised remark inside the column
+/// list shifts the parenthesis matching that delimits it.
+fn strip_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Quoted literal / identifier: copy verbatim, honouring the doubled-quote escape.
+            '\'' | '"' | '`' => {
+                out.push(c);
+                while let Some(q) = chars.next() {
+                    out.push(q);
+                    if q == c {
+                        if chars.peek() == Some(&c) {
+                            // Doubled quote inside the literal: the second one escapes it.
+                            if let Some(second) = chars.next() {
+                                out.push(second);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
+                }
+                // Keep the neighbouring tokens apart (`a--x\nb` must not become `ab`).
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Returns the column names declared by the first parseable `CREATE TABLE` in `ddl`.
 ///
 /// `None` means "not parseable" — the caller skips validation rather than guessing.
 pub fn parse_create_table_columns(ddl: &str) -> Option<Vec<String>> {
+    let ddl = strip_comments(ddl);
     let lower = ddl.to_ascii_lowercase();
     let create_at = lower.find("create table")?;
     let open_rel = ddl[create_at..].find('(')?;
@@ -202,6 +255,46 @@ mod tests {
     fn non_create_statements_are_not_parseable() {
         assert_eq!(parse_create_table_columns("CREATE INDEX i ON t (a)"), None);
         assert_eq!(parse_create_table_columns("not sql at all"), None);
+    }
+
+    // JDBC-10 / Java `CreateTableDdlParser.stripComments`.
+    #[test]
+    fn a_commented_out_create_table_is_not_the_reference_ddl() {
+        let ddl = "-- CREATE TABLE legacy (bogus TEXT NOT NULL);\n\
+                   CREATE TABLE t (a TEXT NOT NULL, b INTEGER NOT NULL)";
+        assert_eq!(
+            parse_create_table_columns(ddl),
+            Some(vec!["a".to_string(), "b".to_string()]),
+            "the comment must not contribute columns"
+        );
+    }
+
+    #[test]
+    fn block_comments_do_not_shift_the_column_list() {
+        let ddl = "CREATE TABLE t (\n  a TEXT /* primary list (id) */,\n  /* (ignored) */ b INT\n)";
+        assert_eq!(
+            parse_create_table_columns(ddl),
+            Some(vec!["a".to_string(), "b".to_string()]),
+            "parentheses inside comments must not affect column-list matching"
+        );
+    }
+
+    #[test]
+    fn a_comment_marker_inside_a_literal_is_data() {
+        // `--` and `/*` are only comment markers outside quotes; stripping inside a literal
+        // would truncate that literal and could swallow the remaining columns.
+        let ddl = "CREATE TABLE t (a TEXT DEFAULT '-- not a comment', b TEXT DEFAULT '/* no */')";
+        assert_eq!(
+            parse_create_table_columns(ddl),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn strip_comments_keeps_token_separation() {
+        assert_eq!(strip_comments("a--x\nb"), "a \nb");
+        assert_eq!(strip_comments("a/*x*/b"), "a b");
+        assert_eq!(strip_comments("'a''--b'"), "'a''--b'");
     }
 
     #[test]

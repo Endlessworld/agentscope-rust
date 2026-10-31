@@ -213,7 +213,7 @@ async fn to_harness_store_fills_every_composite_slot() {
         .as_ref()
         .expect("sandbox_execution_guard projected");
     let key = SandboxIsolationKey::new("user", "projected");
-    let lease = guard.try_enter(key.clone()).await;
+    let lease = guard.try_enter(key.clone()).await.expect("lease");
     assert!(!lease.is_noop());
     assert!(guard.is_held(&key));
     assert!(guard.active_count() >= 1);

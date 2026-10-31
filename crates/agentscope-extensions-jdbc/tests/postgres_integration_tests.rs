@@ -130,7 +130,7 @@ async fn native_advisory_lock_round_trip() {
     )
     .expect("isolation key");
 
-    let lease = guard.try_enter(isolation.clone()).await;
+    let lease = guard.try_enter(isolation.clone()).await.expect("lease");
     assert!(
         !lease.is_noop(),
         "pg_try_advisory_lock must succeed on a live server"

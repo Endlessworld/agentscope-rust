@@ -31,6 +31,9 @@ const HASH_KEY_SUFFIX: &str = ":_hash";
 const SINGLE_STATE_INDEX: i64 = 0;
 /// The anonymous user namespace, mirroring core's `ANON_USER`.
 const ANON_USER: &str = "__anon__";
+/// Maximum length of the `session_id` / `state_key` columns (`VARCHAR(255)`) and of the
+/// encoded `slot_id`, measured in UTF-16 code units like Java's `String.length()`.
+const MAX_STATE_COLUMN_LENGTH: usize = 255;
 
 // `VersionedState` / `UNVERSIONED` have exactly **one** definition in the workspace: the
 // core `agentscope_core::state` pair (adjudication A2 lifted the versioning surface onto the
@@ -133,7 +136,42 @@ impl JdbcAgentStateStore {
         if key.trim().is_empty() {
             return Err(JdbcError::Database("key must not be blank".into()));
         }
+        if utf16_len(key) > MAX_STATE_COLUMN_LENGTH {
+            return Err(JdbcError::Database(format!(
+                "state key is too long: {} UTF-16 code units, the column allows \
+                 {MAX_STATE_COLUMN_LENGTH}",
+                utf16_len(key)
+            )));
+        }
         Ok(())
+    }
+
+    /// Validates the identifiers a row is keyed by and returns the encoded `slot_id`.
+    ///
+    /// The length guards mirror the Java `JdbcAgentStateStore` checks: `session_id` and
+    /// `state_key` are `VARCHAR(255)` (here the `slot_id` column holds `user:session`), so an
+    /// over-long value would only surface as a driver error — which the infallible trait
+    /// methods collapse to a warning, i.e. a silently lost write. Rejecting it up front makes
+    /// the failure visible on the fallible paths (`try_save_if_version` et al.).
+    fn validate_ids(
+        user_id: Option<&str>,
+        session_id: &str,
+        key: Option<&str>,
+    ) -> JdbcResult<String> {
+        Self::validate_session(session_id)?;
+        if let Some(key) = key {
+            Self::validate_key(key)?;
+        }
+        let slot = Self::slot_id(user_id, session_id);
+        if utf16_len(&slot) > MAX_STATE_COLUMN_LENGTH {
+            return Err(JdbcError::Database(format!(
+                "sessionId is too long: the encoded slot '{}' is {} UTF-16 code units, the \
+                 column allows {MAX_STATE_COLUMN_LENGTH}",
+                slot,
+                utf16_len(&slot)
+            )));
+        }
+        Ok(slot)
     }
 
     /// Rejects negative expected versions other than [`UNVERSIONED`], mirroring the Java
@@ -221,8 +259,8 @@ impl JdbcAgentStateStore {
     /// Whether this backend supports optimistic concurrency, mirroring the Java
     /// `supportsVersioning()`. Always `true` for JDBC.
     ///
-    /// Core's `AgentStateStore` trait exposes no versioning surface, so the versioned API
-    /// below is reachable only as inherent methods (see §3.2 / §4.2).
+    /// The versioned API is exposed twice: as the inherent methods below (fallible,
+    /// `JdbcResult`) and as the corresponding [`AgentStateStore`] trait methods.
     pub fn supports_versioning(&self) -> bool {
         true
     }
@@ -235,9 +273,7 @@ impl JdbcAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> JdbcResult<i64> {
-        Self::validate_session(session_id)?;
-        Self::validate_key(key)?;
-        let slot = Self::slot_id(user_id, session_id);
+        let slot = Self::validate_ids(user_id, session_id, Some(key))?;
         self.read_version_at(&slot, key)
     }
 
@@ -249,9 +285,7 @@ impl JdbcAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> JdbcResult<VersionedState> {
-        Self::validate_session(session_id)?;
-        Self::validate_key(key)?;
-        let slot = Self::slot_id(user_id, session_id);
+        let slot = Self::validate_ids(user_id, session_id, Some(key))?;
         let bound = self
             .dialect
             .session_state_select(&slot, key, SINGLE_STATE_INDEX as i32);
@@ -263,16 +297,22 @@ impl JdbcAgentStateStore {
             });
         };
         let mut columns = row.into_iter();
-        let json = columns.next().and_then(|c| c.as_text().map(str::to_string));
+        // The column is `NOT NULL`: a row without a readable payload is a torn row, not an
+        // absent key. Reporting it as "nothing stored" would hand the caller a fresh
+        // `version == 0` and let the next write silently overwrite whatever is there.
+        let json = columns
+            .next()
+            .and_then(|c| c.as_text().map(str::to_string))
+            .ok_or_else(|| {
+                JdbcError::Database(format!("state row for key '{key}' has no readable payload"))
+            })?;
         let version = columns.next().and_then(|c| c.as_int()).unwrap_or(0);
-        let value = match json {
-            Some(j) => Some(
-                serde_json::from_str(&j)
-                    .map_err(|e| JdbcError::Database(format!("deserialize state: {e}")))?,
-            ),
-            None => None,
-        };
-        Ok(VersionedState { value, version })
+        let value = serde_json::from_str(&json)
+            .map_err(|e| JdbcError::Database(format!("deserialize state: {e}")))?;
+        Ok(VersionedState {
+            value: Some(value),
+            version,
+        })
     }
 
     /// Compare-and-swap write of a single state value, mirroring the Java `saveIfVersion`.
@@ -295,10 +335,8 @@ impl JdbcAgentStateStore {
         value: Value,
         expected_version: i64,
     ) -> JdbcResult<i64> {
-        Self::validate_session(session_id)?;
-        Self::validate_key(key)?;
+        let slot = Self::validate_ids(user_id, session_id, Some(key))?;
         Self::validate_expected_version(expected_version)?;
-        let slot = Self::slot_id(user_id, session_id);
         let json = Self::json_of(&value)?;
 
         if expected_version == UNVERSIONED {
@@ -502,10 +540,9 @@ impl JdbcAgentStateStore {
 #[async_trait]
 impl AgentStateStore for JdbcAgentStateStore {
     async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: Value) {
-        if Self::validate_session(session_id).is_err() || Self::validate_key(key).is_err() {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
             return;
-        }
-        let slot = Self::slot_id(user_id, session_id);
+        };
         let Ok(json) = Self::json_of(&value) else {
             return;
         };
@@ -521,10 +558,9 @@ impl AgentStateStore for JdbcAgentStateStore {
         key: &str,
         values: &[Value],
     ) {
-        if Self::validate_session(session_id).is_err() || Self::validate_key(key).is_err() {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
             return;
-        }
-        let slot = Self::slot_id(user_id, session_id);
+        };
         if let Err(e) = self.save_list_impl(&slot, key, values) {
             // The read-modify-write runs in one transaction, so a failure here means the whole
             // append was rolled back — the stored list is still at its previous length, never
@@ -536,10 +572,7 @@ impl AgentStateStore for JdbcAgentStateStore {
     }
 
     async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
-        if Self::validate_session(session_id).is_err() || Self::validate_key(key).is_err() {
-            return None;
-        }
-        let slot = Self::slot_id(user_id, session_id);
+        let slot = Self::validate_ids(user_id, session_id, Some(key)).ok()?;
         let bound = self
             .dialect
             .session_state_select(&slot, key, SINGLE_STATE_INDEX as i32);
@@ -553,10 +586,9 @@ impl AgentStateStore for JdbcAgentStateStore {
     }
 
     async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<Value> {
-        if Self::validate_session(session_id).is_err() || Self::validate_key(key).is_err() {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
             return Vec::new();
-        }
-        let slot = Self::slot_id(user_id, session_id);
+        };
         let bound = self.dialect.session_state_select_list(&slot, key);
         let Ok(rows) = self.executor.query(&bound) else {
             return Vec::new();
@@ -572,10 +604,9 @@ impl AgentStateStore for JdbcAgentStateStore {
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        if Self::validate_session(session_id).is_err() {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, None) else {
             return false;
-        }
-        let slot = Self::slot_id(user_id, session_id);
+        };
         let bound = self.dialect.session_state_exists(&slot);
         self.executor
             .query(&bound)
@@ -584,10 +615,9 @@ impl AgentStateStore for JdbcAgentStateStore {
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
-        if Self::validate_session(session_id).is_err() {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, None) else {
             return;
-        }
-        let slot = Self::slot_id(user_id, session_id);
+        };
         let bound = self.dialect.session_state_delete_session(&slot);
         if let Err(e) = self.executor.execute(&bound) {
             tracing::warn!("[jdbc-state] delete failed for session {session_id}: {e}");
@@ -623,15 +653,53 @@ impl AgentStateStore for JdbcAgentStateStore {
         true
     }
 
+    /// Fallible read of a value plus its version.
+    ///
+    /// A corrupt or unreadable payload is reported as an error instead of being collapsed to
+    /// "nothing stored": the store is the caller's only record of the session, so pretending a
+    /// torn row is absent would hand out `version == 0` and let the next write overwrite it.
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::Result<VersionedState> {
+        JdbcAgentStateStore::get_versioned(self, user_id, session_id, key).map_err(state_error)
+    }
+
+    /// Fallible CAS write.
+    ///
+    /// Mirrors the Java `saveIfVersion`, which throws on a backend failure instead of
+    /// reporting it as a conflict: `UNVERSIONED` must mean "another writer won", never "the
+    /// write never landed".
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+        expected_version: i64,
+    ) -> agentscope_core::Result<i64> {
+        JdbcAgentStateStore::save_if_version(
+            self,
+            user_id,
+            session_id,
+            key,
+            value,
+            expected_version,
+        )
+        .map_err(state_error)
+    }
+
     async fn get_versioned(
         &self,
         user_id: Option<&str>,
         session_id: &str,
         key: &str,
     ) -> agentscope_core::state::VersionedState {
-        // The inherent method already returns the core type (single definition, re-exported
-        // at the top of this module), so no conversion is needed here.
-        match JdbcAgentStateStore::get_versioned(self, user_id, session_id, key) {
+        // Infallible surface: `try_get_versioned` is the single implementation, so the
+        // degraded and the fallible view can never disagree about what went wrong.
+        match self.try_get_versioned(user_id, session_id, key).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("[jdbc-state] get_versioned failed for {key}: {e}");
@@ -651,14 +719,10 @@ impl AgentStateStore for JdbcAgentStateStore {
         value: Value,
         expected_version: i64,
     ) -> i64 {
-        match JdbcAgentStateStore::save_if_version(
-            self,
-            user_id,
-            session_id,
-            key,
-            value,
-            expected_version,
-        ) {
+        match self
+            .try_save_if_version(user_id, session_id, key, value, expected_version)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("[jdbc-state] save_if_version failed for {key}: {e}");
@@ -666,6 +730,17 @@ impl AgentStateStore for JdbcAgentStateStore {
             }
         }
     }
+}
+
+/// Maps a backend failure onto core's error type for the `try_*` channel.
+fn state_error(error: JdbcError) -> agentscope_core::Error {
+    agentscope_core::Error::Session(format!("jdbc state store: {error}"))
+}
+
+/// Length of `value` in UTF-16 code units — the unit Java's `String.length()` (and therefore
+/// the `VARCHAR(255)` guard this mirrors) counts in.
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
 }
 
 /// Extracts the `version` column (second column of the versioned projection) from a

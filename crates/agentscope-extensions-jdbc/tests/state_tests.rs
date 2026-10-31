@@ -1174,3 +1174,179 @@ async fn save_if_version_negative_expected_is_rejected() {
     let after_trait_call = store.get_versioned(Some("u"), "s", "k").unwrap();
     assert!(!after_trait_call.is_present());
 }
+
+// ---------------------------------------------------------------------------
+//  JDBC-12: the `try_*` channel reports failures instead of degrading
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn try_get_versioned_reports_a_corrupt_payload() {
+    // Java: JdbcAgentStateStore.getVersioned deserializes inside `executeInWriteTransaction`
+    // and a Jackson failure becomes a RuntimeException. The infallible core method can only
+    // degrade, so `try_get_versioned` must be the channel that never turns a torn row into
+    // "nothing stored" — a `version == 0` would let the next write silently overwrite it.
+    let (store, executor) = new_store_with_executor();
+    let dialect = SqliteDialect::new();
+    executor
+        .execute(&dialect.session_state_upsert("u:s", "k", 0, "{not json"))
+        .expect("seeding a corrupt payload must succeed");
+
+    let err = AgentStateStore::try_get_versioned(&store, Some("u"), "s", "k")
+        .await
+        .expect_err("a corrupt payload must surface as an error, not as an absent key");
+    assert!(err.to_string().contains("deserialize state"), "{err}");
+    assert!(
+        matches!(err, agentscope_core::Error::Session(_)),
+        "state-store failures travel on core's session error channel: {err:?}"
+    );
+
+    // The inherent fallible method agrees, and the infallible surface degrades deterministically.
+    assert!(store.get_versioned(Some("u"), "s", "k").is_err());
+    let degraded = AgentStateStore::get_versioned(&store, Some("u"), "s", "k").await;
+    assert!(!degraded.is_present());
+    assert_eq!(degraded.version, UNVERSIONED);
+}
+
+#[tokio::test]
+async fn try_get_versioned_reports_a_row_without_a_readable_payload() {
+    // `state_data` is `NOT NULL`, so a row whose payload is not text at all (here a BLOB
+    // written by hand) is a torn row, not an absent key.
+    let (store, executor) = new_store_with_executor();
+    executor
+        .execute(&BoundSql::no_params(
+            "INSERT INTO agentscope_sessions (session_id, state_key, item_index, state_data, \
+             version) VALUES ('u:s', 'k', 0, x'00', 1)",
+        ))
+        .expect("seeding a non-text payload must succeed");
+
+    let err = AgentStateStore::try_get_versioned(&store, Some("u"), "s", "k")
+        .await
+        .expect_err("an unreadable payload must be an error");
+    assert!(err.to_string().contains("no readable payload"), "{err}");
+}
+
+#[tokio::test]
+async fn try_save_if_version_keeps_conflicts_and_failures_apart() {
+    // `UNVERSIONED` must mean "another writer won"; a backend/validation failure must be an
+    // `Err`. Collapsing the two (the infallible surface's behaviour) is what JDBC-12 is about.
+    let store = new_store();
+    assert_eq!(
+        AgentStateStore::try_save_if_version(&store, Some("u"), "s", "k", text("a"), 0)
+            .await
+            .expect("create-if-absent on a fresh key must succeed"),
+        1
+    );
+    assert_eq!(
+        AgentStateStore::try_save_if_version(&store, Some("u"), "s", "k", text("b"), 0)
+            .await
+            .expect("a CAS conflict is not a failure"),
+        UNVERSIONED,
+        "a lost race is reported as a conflict, not as an error"
+    );
+    assert_eq!(
+        AgentStateStore::try_save_if_version(&store, Some("u"), "s", "k", text("c"), 1)
+            .await
+            .unwrap(),
+        2
+    );
+
+    let err = AgentStateStore::try_save_if_version(&store, Some("u"), "s", "k", text("d"), -3)
+        .await
+        .expect_err("an invalid expected version must be an error, not a conflict");
+    assert!(err.to_string().contains("expectedVersion"), "{err}");
+
+    assert_eq!(
+        text_of(&store.get(Some("u"), "s", "k").await.unwrap()),
+        "c",
+        "the rejected write must not reach the store"
+    );
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 2);
+}
+
+// ---------------------------------------------------------------------------
+//  JDBC-04: identifiers must fit the `VARCHAR(255)` columns
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn over_long_state_key_is_rejected_before_reaching_the_driver() {
+    // Java: JdbcAgentStateStore rejects `key.length() > 255` with IllegalArgumentException.
+    // Without the guard MySQL/PG report a driver error that the infallible trait methods
+    // swallow as a warning — a silently lost write.
+    let store = new_store();
+    let key = "k".repeat(256);
+
+    let err = store
+        .save_if_version(Some("u"), "s", &key, text("a"), 0)
+        .expect_err("an over-long key must be rejected");
+    assert!(err.to_string().contains("too long"), "{err}");
+    assert!(store.read_version(Some("u"), "s", &key).is_err());
+    assert!(store.get_versioned(Some("u"), "s", &key).is_err());
+
+    // The infallible entry points refuse it too, so no partial write reaches the backend.
+    AgentStateStore::save(&store, Some("u"), "s", &key, text("a")).await;
+    assert!(store.get(Some("u"), "s", &key).await.is_none());
+    AgentStateStore::save_list(&store, Some("u"), "s", &key, &[text("a")]).await;
+    assert!(store.get_list(Some("u"), "s", &key).await.is_empty());
+}
+
+#[tokio::test]
+async fn state_key_at_the_column_limit_is_accepted() {
+    let store = new_store();
+    let key = "k".repeat(255);
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", &key, text("a"), 0)
+            .expect("255 characters is exactly what VARCHAR(255) holds"),
+        1
+    );
+    assert_eq!(
+        text_of(&store.get(Some("u"), "s", &key).await.unwrap()),
+        "a"
+    );
+}
+
+#[tokio::test]
+async fn over_long_session_slot_is_rejected() {
+    // The `session_id` column holds the `user:session` composite, so the limit applies to that
+    // value (Java checks `slotId.length()`): 253 characters of session id + `u:` fit exactly.
+    let store = new_store();
+    let fits = "s".repeat(253);
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), &fits, "k", text("a"), 0)
+            .expect("a slot of exactly 255 characters must be accepted"),
+        1
+    );
+
+    let too_long = "s".repeat(254);
+    let err = store
+        .save_if_version(Some("u"), &too_long, "k", text("a"), 0)
+        .expect_err("a slot over 255 characters must be rejected");
+    assert!(err.to_string().contains("too long"), "{err}");
+    assert!(
+        !AgentStateStore::exists(&store, Some("u"), &too_long).await,
+        "the infallible entry points must refuse it as well"
+    );
+}
+
+#[tokio::test]
+async fn length_limits_count_utf16_code_units() {
+    // Java measures with `String.length()` (UTF-16 code units), so an emoji counts as 2: 127 of
+    // them are 254 units and fit, 128 are 256 and do not (a `chars().count()` check would let
+    // the latter through and hit the driver instead).
+    let store = new_store();
+    let fits = "😀".repeat(127);
+    assert_eq!(
+        store
+            .save_if_version(Some("u"), "s", &fits, text("a"), 0)
+            .expect("254 UTF-16 code units fit"),
+        1
+    );
+    let too_long = "😀".repeat(128);
+    assert!(
+        store
+            .save_if_version(Some("u"), "s", &too_long, text("a"), 0)
+            .is_err(),
+        "256 UTF-16 code units must be rejected"
+    );
+}

@@ -343,25 +343,39 @@ impl SandboxGuard for JdbcSandboxExecutionGuard {
     /// Acquires the distributed lock asynchronously and retains the concrete
     /// [`JdbcSandboxLease`] so the lock stays held until [`SandboxGuard::release`] runs.
     ///
-    /// The harness trait carries no error channel, so a backend failure is logged at error
-    /// level and surfaces as a no-op lease; callers that need the error must use
-    /// [`JdbcSandboxExecutionGuard::try_enter_async`], which returns it.
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+    /// **Fail-closed**: both a backend failure and a missed acquisition deadline return
+    /// `Err`, so the caller aborts. They used to be downgraded to a no-op lease on this
+    /// path, which silently ran the sandbox without the distributed lock. The inherent
+    /// [`JdbcSandboxExecutionGuard::try_enter_async`] keeps its documented `Ok(noop)`
+    /// fallback for callers that explicitly accept it.
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
         match JdbcSandboxExecutionGuard::try_enter_async(self, key.clone()).await {
-            Ok(lease) => {
-                let acquired = lease.is_acquired();
+            Ok(lease) if lease.is_acquired() => {
                 if let Ok(mut leases) = self.trait_leases.lock() {
                     leases.entry(key.clone()).or_default().push(lease);
                 }
-                if acquired {
-                    SandboxLease::new(key)
-                } else {
-                    SandboxLease::noop()
-                }
+                Ok(SandboxLease::new(key))
+            }
+            // `try_enter_async` reports a missed deadline as `Ok(noop)`: a no-op lease is
+            // still a failed acquisition on this path.
+            Ok(_) => {
+                let lock_name = self.compose_lock_name(&key);
+                tracing::error!(
+                    lock = %lock_name,
+                    "[jdbc-guard] sandbox lock not acquired before the timeout"
+                );
+                Err(agentscope_core::error::Error::Other(format!(
+                    "JDBC sandbox guard lock not acquired before the timeout: {lock_name}"
+                )))
             }
             Err(error) => {
                 tracing::error!(error = %error, "[jdbc-guard] sandbox lock backend failed");
-                SandboxLease::noop()
+                Err(agentscope_core::error::Error::Other(format!(
+                    "JDBC sandbox guard lock backend failed: {error}"
+                )))
             }
         }
     }
