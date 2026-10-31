@@ -297,8 +297,21 @@ impl BaseStore for PostgresStore {
     }
 }
 
-/// Heuristic duplicate-key detection (mirrors the Java `isDuplicateKey`).
+/// Duplicate-key detection (mirrors the Java `PostgresBaseStore#isDuplicateKey`).
+///
+/// Java reads `SQLException#getSQLState()` and accepts any class-23 code (`startsWith("23")` =
+/// integrity constraint violation), which is locale-independent. The driver now reports the
+/// code structurally ([`PostgresError::Sql`]), so classification no longer depends on the
+/// server's `lc_messages`; the message substring check only remains for clients that cannot
+/// expose a SQLSTATE (e.g. a test double sending a bare message).
 fn is_duplicate_key(e: &PostgresError) -> bool {
+    if let PostgresError::Sql {
+        code: Some(code), ..
+    } = e
+    {
+        // A reported code is authoritative: do not re-interpret the message.
+        return code.starts_with("23");
+    }
     let msg = e.to_string().to_lowercase();
     msg.contains("duplicate key") || msg.contains("23505") || msg.contains("unique constraint")
 }
@@ -626,6 +639,65 @@ mod tests {
         assert!(!is_duplicate_key(&PostgresError::Query(
             "connection reset".into()
         )));
+
+        // PG-02: a structurally reported SQLSTATE is authoritative, so a server whose
+        // `lc_messages` is not English (localised text without the literals above) still
+        // classifies as a CAS conflict — Java matches `getSQLState().startsWith("23")`.
+        assert!(is_duplicate_key(&PostgresError::Sql {
+            code: Some("23505".into()),
+            message: "重复键违反了唯一约束 «x_pkey»".into(),
+        }));
+        assert!(is_duplicate_key(&PostgresError::Sql {
+            code: Some("23000".into()),
+            message: "integrity constraint violation".into(),
+        }));
+        // Other classes are not conflicts, even if the message mentions a duplicate key.
+        assert!(!is_duplicate_key(&PostgresError::Sql {
+            code: Some("42P01".into()),
+            message: "duplicate key".into(),
+        }));
+        // Without a code the message fallback still applies.
+        assert!(is_duplicate_key(&PostgresError::Sql {
+            code: None,
+            message: "duplicate key value violates unique constraint".into(),
+        }));
+
+        // The code survives into the rendered message so operators can see it in logs.
+        assert!(PostgresError::Sql {
+            code: Some("23505".into()),
+            message: "boom".into(),
+        }
+        .to_string()
+        .contains("23505"));
+    }
+
+    /// A client whose plain `INSERT` (the create-only CAS path) reports a *localised*
+    /// duplicate-key failure with a structural `SQLSTATE` (PG-02).
+    #[derive(Debug)]
+    struct LocalisedDuplicateClient;
+
+    impl PostgresClient for LocalisedDuplicateClient {
+        fn query(&self, sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            if sql.starts_with("INSERT") {
+                return Err(PostgresError::Sql {
+                    code: Some("23505".into()),
+                    message: "重复键违反了唯一约束 «agentscope_store_pkey»".into(),
+                });
+            }
+            Ok(QueryOutcome::Affected(0))
+        }
+
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            Ok(())
+        }
+    }
+
+    // PG-02: `putIfVersion(.., 0)` must treat a class-23 SQLSTATE as a failed CAS even when the
+    // server message is localised, and must never report a SQL failure as a successful CAS.
+    #[test]
+    fn structured_sqlstate_classifies_a_localised_duplicate_key() {
+        let s = PostgresStore::with_schema_init(Arc::new(LocalisedDuplicateClient)).unwrap();
+        assert!(!s.put_if_version(&ns(&["filesystem"]), "k", val(json!({"a": 1})), 0));
     }
 
     // ---- SQL failure paths --------------------------------------------------

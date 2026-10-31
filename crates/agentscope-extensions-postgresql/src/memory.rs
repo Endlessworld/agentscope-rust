@@ -590,9 +590,12 @@ impl PostgresClient for MemoryClient {
             }
             // Plain insert (CAS expected_version == 0): fail on duplicate.
             if t.store.contains_key(&slot) {
-                return Err(PostgresError::Query(
-                    "duplicate key value violates unique constraint (SQLSTATE 23505)".into(),
-                ));
+                // Structured `SQLSTATE` 23505, like a real server: the store classifies the
+                // conflict by code (locale-independent), not by message text.
+                return Err(PostgresError::Sql {
+                    code: Some("23505".into()),
+                    message: "duplicate key value violates unique constraint".into(),
+                });
             }
             t.store.insert(
                 slot,

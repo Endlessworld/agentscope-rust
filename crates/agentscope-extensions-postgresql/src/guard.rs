@@ -224,41 +224,72 @@ impl SandboxGuard for PostgresSandboxExecutionGuard {
     /// Acquires the advisory lock on a dedicated session and retains the concrete
     /// [`PostgresSandboxLease`] until `SandboxGuard::release` runs.
     ///
-    /// The harness trait returns a `SandboxLease` with no error channel, so a failed
-    /// acquisition degrades to [`SandboxLease::noop`] — loudly (`error!` for a client without
-    /// session support, `warn!` for a timeout). The inherent
-    /// [`PostgresSandboxExecutionGuard::try_enter`] never degrades: it returns the error, so
-    /// callers that need hard mutual exclusion should use it directly.
+    /// **Fail-closed** (PG-04): a failed acquisition returns `Err` and the caller aborts:
+    /// a lock timeout, a client without dedicated-session support
+    /// ([`PostgresError::DriverUnavailable`]) and a panicked blocking task all surface as
+    /// errors. They used to degrade to [`SandboxLease::noop`], so the sandbox ran with no
+    /// cross-process exclusion at all. The inherent
+    /// [`PostgresSandboxExecutionGuard::try_enter`] keeps returning the typed error.
+    ///
+    /// Retention is part of the contract too: if the acquired lease cannot be parked in the
+    /// internal registry (poisoned mutex), the lock is already dropped, so this returns `Err`
+    /// instead of handing back a lease that holds nothing.
     ///
     /// The acquire probe is synchronous and polls by sleeping, so it runs on a blocking
     /// thread: awaiting it directly would block a Tokio worker for the whole lock timeout.
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
         let this = self.clone();
         let acquire_key = key.clone();
         let acquired = tokio::task::spawn_blocking(move || this.try_enter(&acquire_key)).await;
         match acquired {
             Ok(Ok(lease)) => {
-                if let Ok(mut leases) = self.trait_leases.lock() {
-                    leases.entry(key.clone()).or_default().push(lease);
+                // Park the concrete lease (it unlocks on drop) before reporting success. A
+                // poisoned registry would drop it right away, i.e. report a hold that does not
+                // exist — fail instead of letting the caller run without exclusion.
+                let retained = match self.trait_leases.lock() {
+                    Ok(mut leases) => {
+                        leases.entry(key.clone()).or_default().push(lease);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "[postgres-guard] lease registry is poisoned; dropping the lease"
+                        );
+                        false
+                    }
+                };
+                if !retained {
+                    return Err(agentscope_core::error::Error::Other(
+                        "PostgreSQL sandbox guard could not retain the acquired lease".into(),
+                    ));
                 }
-                SandboxLease::new(key)
+                Ok(SandboxLease::new(key))
             }
             Ok(Err(PostgresError::DriverUnavailable(e))) => {
                 // Never pretend: this client cannot provide dedicated lock sessions.
                 tracing::error!(
                     error = %e,
-                    "[postgres-guard] advisory locks unsupported by this client; \
-                     execution proceeds WITHOUT distributed exclusion"
+                    "[postgres-guard] advisory locks unsupported by this client"
                 );
-                SandboxLease::noop()
+                Err(agentscope_core::error::Error::Other(format!(
+                    "PostgreSQL sandbox guard advisory locks unsupported by this client: {e}"
+                )))
             }
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "[postgres-guard] lock not acquired");
-                SandboxLease::noop()
+                tracing::error!(error = %e, "[postgres-guard] lock not acquired");
+                Err(agentscope_core::error::Error::Other(format!(
+                    "PostgreSQL sandbox guard lock not acquired: {e}"
+                )))
             }
             Err(e) => {
                 tracing::error!(error = %e, "[postgres-guard] blocking acquire task failed");
-                SandboxLease::noop()
+                Err(agentscope_core::error::Error::Other(format!(
+                    "PostgreSQL sandbox guard blocking acquire task failed: {e}"
+                )))
             }
         }
     }
@@ -409,6 +440,20 @@ mod tests {
 
     fn key(scope: &str, value: &str) -> SandboxIsolationKey {
         SandboxIsolationKey::new(scope, value)
+    }
+
+    /// A client that can only offer a *shared* connection, i.e. no dedicated advisory-lock
+    /// sessions. Used by the inherent and trait fail-closed cases below.
+    #[derive(Debug)]
+    struct SharedOnlyClient;
+
+    impl PostgresClient for SharedOnlyClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            unreachable!()
+        }
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            Ok(())
+        }
     }
 
     // Java: PostgresSandboxExecutionGuardTest#builderWithDefaultsCreatesGuard
@@ -579,18 +624,6 @@ mod tests {
     /// guard must never fall back to running advisory SQL on the shared connection.
     #[test]
     fn client_without_dedicated_sessions_fails_loudly() {
-        #[derive(Debug)]
-        struct SharedOnlyClient;
-
-        impl PostgresClient for SharedOnlyClient {
-            fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
-                unreachable!("advisory locks must not run on the shared connection")
-            }
-            fn execute_batch(&self, _sql: &str) -> PgResult<()> {
-                Ok(())
-            }
-        }
-
         let g = PostgresSandboxExecutionGuard::new(Arc::new(SharedOnlyClient));
         let err = g.try_enter(&key("session", "no-session")).unwrap_err();
         assert!(
@@ -717,5 +750,109 @@ mod tests {
         assert!(SandboxGuard::is_distributed(&g));
         let object: Arc<dyn SandboxGuard> = Arc::new(PostgresSandboxExecutionGuard::new(client()));
         assert!(object.is_distributed());
+    }
+
+    // PG-04: the harness `SandboxGuard` path must actually hold (and later release) the advisory
+    // lock — a green trait `try_enter` that forgot to retain the concrete lease would report a
+    // hold while the lock was already gone.
+    #[tokio::test]
+    async fn trait_try_enter_holds_the_lock_until_release() {
+        let c = client();
+        let g = PostgresSandboxExecutionGuard::new(c.clone());
+        let k = key("session", "trait-roundtrip");
+        let object: Arc<dyn SandboxGuard> = Arc::new(g.clone());
+
+        let lease = object.try_enter(k.clone()).await.expect("lease");
+        assert!(!lease.is_noop());
+        assert_eq!(lease.key(), &k);
+        assert!(object.is_held(&k));
+        assert_eq!(object.active_count(), 1);
+        assert_eq!(c.advisory_lock_count(), 1);
+
+        object.release(&k).await;
+        assert!(!object.is_held(&k));
+        assert_eq!(object.active_count(), 0);
+        assert_eq!(c.advisory_lock_count(), 0);
+
+        // Releasing again must not touch (or panic on) a lease that is already gone.
+        object.release(&k).await;
+        assert_eq!(object.active_count(), 0);
+    }
+
+    // PG-04 (fail-closed): a client without dedicated sessions must make the trait entry return
+    // `Err` so the caller aborts, instead of handing back `SandboxLease::noop()`.
+    #[tokio::test]
+    async fn trait_try_enter_is_fail_closed_without_dedicated_sessions() {
+        let object: Arc<dyn SandboxGuard> = Arc::new(PostgresSandboxExecutionGuard::new(Arc::new(
+            SharedOnlyClient,
+        )));
+        let k = key("session", "trait-no-session");
+        let err = object.try_enter(k.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported by this client"),
+            "unexpected: {err}"
+        );
+        assert!(!object.is_held(&k));
+        assert_eq!(object.active_count(), 0);
+    }
+
+    // PG-04 (fail-closed): a lock timeout must also surface as `Err` — the old code warned and
+    // returned a no-op lease, so two sandboxes could hold the same isolation key.
+    #[tokio::test]
+    async fn trait_try_enter_is_fail_closed_on_lock_timeout() {
+        let c = client();
+        let k = key("session", "trait-timeout");
+        let holder = PostgresSandboxExecutionGuard::new(Arc::new(c.fork()));
+        let held = holder.try_enter(&k).unwrap();
+
+        let object: Arc<dyn SandboxGuard> = Arc::new(
+            PostgresSandboxExecutionGuard::builder(c.clone())
+                .lock_timeout(Duration::from_millis(80))
+                .unwrap()
+                .build(),
+        );
+        let err = object.try_enter(k.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("lock not acquired"),
+            "unexpected: {err}"
+        );
+        assert!(!object.is_held(&k));
+        assert_eq!(object.active_count(), 0);
+
+        // Once the holder lets go, the same trait entry succeeds and can be released.
+        drop(held);
+        let lease = object
+            .try_enter(k.clone())
+            .await
+            .expect("lease after release");
+        assert!(!lease.is_noop());
+        assert_eq!(c.advisory_lock_count(), 1);
+        object.release(&k).await;
+        assert_eq!(c.advisory_lock_count(), 0);
+    }
+
+    // PG-04 (fail-closed): if the internal lease registry was poisoned, the acquired lease is
+    // dropped immediately — reporting `Ok` there would hand out a hold that no longer exists.
+    #[tokio::test]
+    async fn trait_try_enter_fails_when_the_lease_registry_is_poisoned() {
+        let c = client();
+        let g = PostgresSandboxExecutionGuard::new(c.clone());
+        let poisoner = g.clone();
+        let join = std::thread::spawn(move || {
+            let _held = poisoner.trait_leases.lock().unwrap();
+            panic!("poison the lease registry");
+        });
+        assert!(join.join().is_err(), "the poisoning thread must panic");
+
+        let object: Arc<dyn SandboxGuard> = Arc::new(g);
+        let k = key("session", "trait-poisoned");
+        let err = object.try_enter(k.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("could not retain"),
+            "unexpected: {err}"
+        );
+        assert!(!object.is_held(&k));
+        // The lock taken by the abandoned attempt is gone, so nothing leaks.
+        assert_eq!(c.advisory_lock_count(), 0);
     }
 }

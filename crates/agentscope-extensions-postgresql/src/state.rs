@@ -604,11 +604,25 @@ impl AgentStateStore for PostgresAgentStateStore {
             return None;
         }
         let key = key.to_string();
+        let logged_key = key.clone();
         let json = self
             .run_blocking(move |store| store.get_sync(&slot, &key, SINGLE_STATE_INDEX))
             .await
             .ok()??;
-        serde_json::from_str(&json).ok()
+        match serde_json::from_str(&json) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                // Java throws (`getThrowsWhenJsonInvalid`); the trait has no error channel, so
+                // the value is reported missing *loudly* — the key itself does exist (PG-10).
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    key = %logged_key,
+                    "PostgreSQL state value is not valid JSON; reporting it as missing"
+                );
+                None
+            }
+        }
     }
 
     async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<Value> {
@@ -619,11 +633,25 @@ impl AgentStateStore for PostgresAgentStateStore {
             return Vec::new();
         }
         let key = key.to_string();
-        self.run_blocking(move |store| store.get_list_rows_sync(&slot, &key))
+        let logged_key = key.clone();
+        let rows = self
+            .run_blocking(move |store| store.get_list_rows_sync(&slot, &key))
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|json| match serde_json::from_str(&json) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    // Java throws on a bad payload; here the item is skipped loudly (PG-10).
+                    tracing::warn!(
+                        error = %e,
+                        session = %session_id,
+                        key = %logged_key,
+                        "skipping a PostgreSQL list item that is not valid JSON"
+                    );
+                    None
+                }
+            })
             .collect()
     }
 
@@ -676,6 +704,7 @@ impl AgentStateStore for PostgresAgentStateStore {
             return unversioned();
         }
         let key = key.to_string();
+        let logged_key = key.clone();
         let loaded = self
             .run_blocking(move |store| {
                 let value = store.get_sync(&slot, &key, SINGLE_STATE_INDEX)?;
@@ -684,9 +713,27 @@ impl AgentStateStore for PostgresAgentStateStore {
             })
             .await;
         match loaded {
-            Ok((Some(json), version)) => agentscope_core::state::VersionedState {
-                value: serde_json::from_str(&json).ok(),
-                version,
+            Ok((Some(json), version)) => match serde_json::from_str(&json) {
+                Ok(value) => agentscope_core::state::VersionedState {
+                    value: Some(value),
+                    version,
+                },
+                Err(e) => {
+                    // A missing value here is a **decode** failure, not a missing key: the
+                    // stored version is still reported so callers do not mistake it for
+                    // `UNVERSIONED` (PG-10).
+                    tracing::warn!(
+                        error = %e,
+                        session = %session_id,
+                        key = %logged_key,
+                        version,
+                        "PostgreSQL state value is not valid JSON; keeping the stored version"
+                    );
+                    agentscope_core::state::VersionedState {
+                        value: None,
+                        version,
+                    }
+                }
             },
             Ok((None, version)) => agentscope_core::state::VersionedState {
                 value: None,
@@ -709,13 +756,7 @@ impl AgentStateStore for PostgresAgentStateStore {
         let key = key.to_string();
         match self
             .run_blocking(move |store| {
-                store.save_if_version(
-                    user.as_deref(),
-                    &session,
-                    &key,
-                    &value,
-                    expected_version,
-                )
+                store.save_if_version(user.as_deref(), &session, &key, &value, expected_version)
             })
             .await
         {
@@ -1557,11 +1598,16 @@ mod tests {
         assert!(s.save_if_version(None, "s1", "k", &json!(1), 0).is_err());
     }
 
-    // Java: PostgresAgentStateStoreTest#getThrowsWhenJsonInvalid
-    #[tokio::test]
-    async fn get_returns_none_for_invalid_json_payload() {
-        let c = client();
-        let s = store(&c);
+    /// Inserts a raw session row so decode failures can be exercised (Java mocks the
+    /// `ResultSet` instead).
+    fn insert_raw(
+        c: &Arc<MemoryClient>,
+        s: &PostgresAgentStateStore,
+        session: &str,
+        key: &str,
+        index: i32,
+        data: &str,
+    ) {
         c.query(
             &format!(
                 "INSERT INTO {} (session_id, state_key, item_index, state_data, version, updated_at) \
@@ -1569,15 +1615,56 @@ mod tests {
                 s.full_table
             ),
             &[
-                SqlValue::text(slot("s1")),
-                SqlValue::text("k"),
-                SqlValue::int(SINGLE_STATE_INDEX),
-                SqlValue::text("not json"),
+                SqlValue::text(slot(session)),
+                SqlValue::text(key),
+                SqlValue::int(index),
+                SqlValue::text(data),
                 SqlValue::BigInt(0),
             ],
         )
         .unwrap();
+    }
+
+    // Java: PostgresAgentStateStoreTest#getThrowsWhenJsonInvalid
+    #[tokio::test]
+    async fn get_returns_none_for_invalid_json_payload() {
+        let c = client();
+        let s = store(&c);
+        insert_raw(&c, &s, "s1", "k", SINGLE_STATE_INDEX, "not json");
         assert!(s.get(None, "s1", "k").await.is_none());
+    }
+
+    // PG-10: a decode failure is not a missing key — `get_versioned` keeps the stored version
+    // (so it is not mistaken for `UNVERSIONED`) and `get_list` skips only the bad item. Java
+    // throws (`getThrowsWhenJsonInvalid`); the core trait has no error channel, so the
+    // degradation is made explicit and logged.
+    #[tokio::test]
+    async fn invalid_json_keeps_the_stored_version_and_skips_only_that_list_item() {
+        let c = client();
+        let s = store(&c);
+        insert_raw(&c, &s, "s1", "single", SINGLE_STATE_INDEX, "not json");
+        assert!(s.get(None, "s1", "single").await.is_none());
+
+        let versioned = s.get_versioned(None, "s1", "single").await;
+        assert!(versioned.value.is_none());
+        assert_eq!(
+            versioned.version, 1,
+            "the stored version must survive a decode failure"
+        );
+        assert_ne!(
+            versioned.version,
+            agentscope_core::state::UNVERSIONED,
+            "a bad payload is not an unversioned key"
+        );
+
+        // List read: the bad item is dropped, the valid ones are kept in index order.
+        insert_raw(&c, &s, "s1", "list", 0, "not json");
+        insert_raw(&c, &s, "s1", "list", 1, "{\"v\": 2}");
+        insert_raw(&c, &s, "s1", "list", 2, "[3]");
+        assert_eq!(
+            s.get_list(None, "s1", "list").await,
+            vec![json!({"v": 2}), json!([3])]
+        );
     }
 
     /// Wraps [`MemoryClient`] but fails if a query runs on the thread polling the async test.

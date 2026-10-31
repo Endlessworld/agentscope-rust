@@ -237,7 +237,10 @@ async fn base_store_operations_inside_a_multi_thread_runtime_do_not_panic() {
 
     let ns = vec!["filesystem".to_string()];
     store.put(&ns, "k", value(json!({"v": 1})));
-    assert_eq!(store.get(&ns, "k"), Some(value(json!({"v": 1}))));
+    assert_eq!(
+        store.get(&ns, "k").map(|item| item.value),
+        Some(value(json!({"v": 1})))
+    );
 
     // Advisory-lock / transaction paths drive extra connections from the same worker.
     assert!(store.put_if_version(&ns, "k", value(json!({"v": 2})), 1));

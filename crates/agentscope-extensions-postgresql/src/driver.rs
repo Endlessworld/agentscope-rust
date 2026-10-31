@@ -148,7 +148,7 @@ impl PgLockSession {
             let row = client
                 .query_one(sql, &[&lock_name])
                 .await
-                .map_err(|e| PostgresError::Query(e.to_string()))?;
+                .map_err(driver_error)?;
             row.try_get::<_, bool>(0)
                 .map_err(|e| PostgresError::Decode(e.to_string()))
         })
@@ -168,6 +168,21 @@ impl PostgresLockSession for PgLockSession {
         // Dropping the client makes the connection task finish and the socket close, which is
         // what releases the session's advisory locks.
         self.client.take();
+    }
+}
+
+/// Maps a driver error to [`PostgresError`], preserving the server-reported `SQLSTATE`.
+///
+/// Java reads `SQLException#getSQLState()` (its duplicate-key check accepts class `23`), so the
+/// code must not be folded into a message: `lc_messages` may be non-English, in which case the
+/// message-based fallback in `store::is_duplicate_key` cannot classify the failure.
+fn driver_error(e: tokio_postgres::Error) -> PostgresError {
+    match e.code() {
+        Some(code) => PostgresError::Sql {
+            code: Some(code.code().to_string()),
+            message: e.to_string(),
+        },
+        None => PostgresError::Query(e.to_string()),
     }
 }
 
@@ -256,20 +271,14 @@ async fn execute_statement(
 
     let upper = sql.trim_start().to_uppercase();
     if upper.starts_with("SELECT") {
-        let rows = client
-            .query(sql, &refs)
-            .await
-            .map_err(|e| PostgresError::Query(e.to_string()))?;
+        let rows = client.query(sql, &refs).await.map_err(driver_error)?;
         let mut out: Vec<Row> = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(decode_row(&row));
         }
         Ok(QueryOutcome::Rows(out))
     } else {
-        let affected = client
-            .execute(sql, &refs)
-            .await
-            .map_err(|e| PostgresError::Query(e.to_string()))?;
+        let affected = client.execute(sql, &refs).await.map_err(driver_error)?;
         Ok(QueryOutcome::Affected(affected as u64))
     }
 }
@@ -321,6 +330,16 @@ mod tests {
             .expect("driver runtime")
     }
 
+    /// Drops the driver runtime **off** the async context.
+    ///
+    /// `Runtime::drop` panics with "Cannot drop a runtime in a context where blocking is not
+    /// allowed" when it happens on a runtime thread, so the test hands it to a plain thread.
+    fn drop_off_runtime(runtime: Runtime) {
+        std::thread::spawn(move || drop(runtime))
+            .join()
+            .expect("drop the driver runtime on a plain thread");
+    }
+
     /// PG-01 regression: the driver used to call `Runtime::block_on` unconditionally, which
     /// panics with "cannot block the current thread from within a runtime" exactly here —
     /// on a Tokio worker, i.e. on the harness `RemoteFilesystem` path.
@@ -332,6 +351,7 @@ mod tests {
         assert_eq!(block_on(&runtime, async { 2u32 }), 2);
         let joined = tokio::spawn(async { 3u32 }).await.expect("worker survived");
         assert_eq!(joined, 3);
+        drop_off_runtime(runtime);
     }
 
     /// `block_in_place` is illegal on a current-thread runtime, so that branch drives the
@@ -340,6 +360,7 @@ mod tests {
     async fn block_on_works_from_inside_a_current_thread_runtime() {
         let runtime = driver_runtime();
         assert_eq!(block_on(&runtime, async { 41u32 }), 41);
+        drop_off_runtime(runtime);
     }
 
     /// Plain threads (and the `spawn_blocking` pool, which has no ambient context) keep

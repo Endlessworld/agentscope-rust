@@ -10,6 +10,18 @@ pub enum PostgresError {
     /// A SQL statement failed to execute.
     #[error("PostgreSQL query failed: {0}")]
     Query(String),
+    /// A statement failed with a server-reported `SQLSTATE`.
+    ///
+    /// Carrying the code keeps error classification independent of the server's `lc_messages`
+    /// (Java reads `SQLException#getSQLState()`), e.g. duplicate-key detection in
+    /// `crate::store`, which must work with a non-English server locale.
+    #[error("PostgreSQL SQL error (SQLSTATE {}): {message}", code.as_deref().unwrap_or("unknown"))]
+    Sql {
+        /// The five-character `SQLSTATE` when the driver reported one.
+        code: Option<String>,
+        /// The server/client message, verbatim.
+        message: String,
+    },
     /// Schema initialization failed.
     #[error("PostgreSQL schema initialization failed: {0}")]
     Schema(String),
