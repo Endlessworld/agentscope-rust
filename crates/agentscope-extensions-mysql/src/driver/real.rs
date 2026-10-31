@@ -130,8 +130,15 @@ impl MysqlAsyncBackend {
         format!("{user}{SESSION_USER_SEPARATOR}")
     }
 
-    fn state_table(&self) -> &str {
-        &self.config.state_table
+    /// Database-qualified state table, exactly like Java `MysqlAgentStateStore#getFullTableName`.
+    ///
+    /// Java renders `` `database`.`table` `` into **every** state statement (DDL, DML and
+    /// `TRUNCATE`). Emitting the bare name here instead made the writes land in whatever schema
+    /// the URL selected, while the bootstrap/`TRUNCATE` stayed in `config.database` — two
+    /// different tables, so a truncated table kept its rows and a documented URL such as
+    /// `mysql://…/mysql` pointed the DML at a table that never exists there.
+    fn state_table(&self) -> String {
+        format!("`{}`.`{}`", self.config.database, self.config.state_table)
     }
 }
 
@@ -619,11 +626,11 @@ impl SnapshotBackend for MysqlAsyncBackend {
             .map_err(core_error)
     }
 
-    fn upload(&self, snapshot_id: &str, data: &[u8]) -> CoreResult<()> {
+    fn upload(&self, table: &str, snapshot_id: &str, data: &[u8]) -> CoreResult<()> {
         let sql = format!(
             "INSERT INTO {} (snapshot_id, data) VALUES (?, ?) \
              ON DUPLICATE KEY UPDATE data = VALUES(data)",
-            self.config.snapshot_table
+            table
         );
         let mut conn = self.conn().map_err(|e| CoreError::Tool(e.to_string()))?;
         self.block_on(async {
@@ -633,11 +640,8 @@ impl SnapshotBackend for MysqlAsyncBackend {
         .map_err(core_error)
     }
 
-    fn download(&self, snapshot_id: &str) -> CoreResult<Vec<u8>> {
-        let sql = format!(
-            "SELECT data FROM {} WHERE snapshot_id = ?",
-            self.config.snapshot_table
-        );
+    fn download(&self, table: &str, snapshot_id: &str) -> CoreResult<Vec<u8>> {
+        let sql = format!("SELECT data FROM {table} WHERE snapshot_id = ?");
         let mut conn = self.conn().map_err(|e| CoreError::Tool(e.to_string()))?;
         self.block_on(async {
             conn.exec_first::<Vec<u8>, _, _>(&sql, (snapshot_id.to_string(),))
@@ -647,11 +651,8 @@ impl SnapshotBackend for MysqlAsyncBackend {
         .ok_or_else(|| CoreError::Tool(format!("snapshot not found: {snapshot_id}")))
     }
 
-    fn exists(&self, snapshot_id: &str) -> CoreResult<bool> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE snapshot_id = ?",
-            self.config.snapshot_table
-        );
+    fn exists(&self, table: &str, snapshot_id: &str) -> CoreResult<bool> {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE snapshot_id = ?");
         let mut conn = self.conn().map_err(|e| CoreError::Tool(e.to_string()))?;
         let count = self
             .block_on(async {
@@ -731,13 +732,13 @@ impl LockBackend for MysqlAsyncBackend {
         let mut conn = self.conn()?;
         let holder = self
             .block_on(async {
-                conn.exec_first::<i64, _, _>(
+                conn.exec_first::<Option<i64>, _, _>(
                     "SELECT IS_USED_LOCK(?)",
                     (lock_name.to_string(),),
                 )
                 .await
             })
             .map_err(driver_error)?;
-        Ok(holder.is_some())
+        Ok(holder.flatten().is_some())
     }
 }

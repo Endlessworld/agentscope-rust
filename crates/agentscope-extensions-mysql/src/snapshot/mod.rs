@@ -39,19 +39,25 @@ pub fn snapshot_table_ddl(table_name: &str) -> String {
 }
 
 /// Low-level blob persistence surface used by [`MysqlRemoteSnapshotClient`].
+///
+/// Every data statement takes the **table name** because the table is owned by the client
+/// (`MysqlRemoteSnapshotClient::with_table`), not by the backend: the real backend used to
+/// substitute its own `MysqlAsyncConfig::snapshot_table`, so `with_table(...)` bootstrapped
+/// one table and then read/wrote another one (the live integration test caught this as
+/// `Table 'agentscope_test.agentscope_it_snapshots' doesn't exist`).
 pub trait SnapshotBackend: Send + Sync + std::fmt::Debug {
     /// Executes a DDL statement (schema bootstrap). Mirrors the
     /// `Connection.createStatement().execute(ddl)` call in Java `initSchema`.
     fn execute_ddl(&self, sql: &str) -> Result<()>;
 
-    /// Upserts the archive bytes for `snapshot_id`.
-    fn upload(&self, snapshot_id: &str, data: &[u8]) -> Result<()>;
+    /// Upserts the archive bytes for `snapshot_id` into `table`.
+    fn upload(&self, table: &str, snapshot_id: &str, data: &[u8]) -> Result<()>;
 
-    /// Downloads the archive bytes for `snapshot_id`.
-    fn download(&self, snapshot_id: &str) -> Result<Vec<u8>>;
+    /// Downloads the archive bytes for `snapshot_id` from `table`.
+    fn download(&self, table: &str, snapshot_id: &str) -> Result<Vec<u8>>;
 
-    /// Whether a snapshot with `snapshot_id` exists.
-    fn exists(&self, snapshot_id: &str) -> Result<bool>;
+    /// Whether a snapshot with `snapshot_id` exists in `table`.
+    fn exists(&self, table: &str, snapshot_id: &str) -> Result<bool>;
 }
 
 /// [`RemoteSnapshotClient`] backed by JDBC BLOB storage, mirroring
@@ -157,19 +163,19 @@ impl MysqlRemoteSnapshotClient {
 impl RemoteSnapshotClient for MysqlRemoteSnapshotClient {
     async fn upload(&self, snapshot_id: &str, data: &[u8]) -> Result<()> {
         self.backend
-            .upload(snapshot_id, data)
+            .upload(&self.table_name, snapshot_id, data)
             .map_err(|e| Error::Tool(format!("mysql snapshot upload failed: {e}")))
     }
 
     async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
         self.backend
-            .download(snapshot_id)
+            .download(&self.table_name, snapshot_id)
             .map_err(|e| Error::Tool(format!("mysql snapshot download failed: {e}")))
     }
 
     async fn exists(&self, snapshot_id: &str) -> Result<bool> {
         self.backend
-            .exists(snapshot_id)
+            .exists(&self.table_name, snapshot_id)
             .map_err(|e| Error::Tool(format!("mysql snapshot exists check failed: {e}")))
     }
 }

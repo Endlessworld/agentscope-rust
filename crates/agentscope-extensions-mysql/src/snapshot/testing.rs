@@ -40,26 +40,31 @@ impl SnapshotBackend for InMemorySnapshotBackend {
         Ok(())
     }
 
-    fn upload(&self, snapshot_id: &str, data: &[u8]) -> Result<()> {
+    fn upload(&self, table: &str, snapshot_id: &str, data: &[u8]) -> Result<()> {
         self.blobs
             .lock()
             .unwrap()
-            .insert(snapshot_id.to_string(), data.to_vec());
+            .insert(row_key(table, snapshot_id), data.to_vec());
         Ok(())
     }
 
-    fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
+    fn download(&self, table: &str, snapshot_id: &str) -> Result<Vec<u8>> {
         self.blobs
             .lock()
             .unwrap()
-            .get(snapshot_id)
+            .get(&row_key(table, snapshot_id))
             .cloned()
             .ok_or_else(|| Error::Tool(format!("snapshot not found: {snapshot_id}")))
     }
 
-    fn exists(&self, snapshot_id: &str) -> Result<bool> {
-        Ok(self.blobs.lock().unwrap().contains_key(snapshot_id))
+    fn exists(&self, table: &str, snapshot_id: &str) -> Result<bool> {
+        Ok(self.blobs.lock().unwrap().contains_key(&row_key(table, snapshot_id)))
     }
+}
+
+/// Keeps the emulated rows separated per table, like the real primary key would.
+fn row_key(table: &str, snapshot_id: &str) -> String {
+    format!("{table}\u{1F}{snapshot_id}")
 }
 
 #[cfg(test)]
@@ -69,11 +74,14 @@ mod tests {
     #[test]
     fn upload_download_exists() {
         let b = InMemorySnapshotBackend::default();
-        assert!(!b.exists("s").unwrap());
-        b.upload("s", b"data").unwrap();
-        assert!(b.exists("s").unwrap());
-        assert_eq!(b.download("s").unwrap(), b"data");
-        assert!(b.download("missing").is_err());
+        let t = "agentscope_snapshots";
+        assert!(!b.exists(t, "s").unwrap());
+        b.upload(t, "s", b"data").unwrap();
+        assert!(b.exists(t, "s").unwrap());
+        assert_eq!(b.download(t, "s").unwrap(), b"data");
+        assert!(b.download(t, "missing").is_err());
+        // Rows are per table: the same id in another table stays independent.
+        assert!(!b.exists("other_snapshots", "s").unwrap());
     }
 
     #[test]

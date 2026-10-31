@@ -49,15 +49,27 @@ fn skip() -> bool {
 }
 
 fn config() -> MysqlAsyncConfig {
+    tagged("live")
+}
+
+/// Table names carrying a per-test tag.
+///
+/// Every test in this binary shares one live database, and `cargo test` runs them in
+/// parallel. They used to reuse `agentscope_it_*` and `DROP` those tables at the start, so
+/// whichever test dropped last won: `kv_store_cas_and_prefix_search` lost its row while
+/// `state_store_round_trip_cas_and_lists` was dropping the store table, and the snapshot test
+/// saw its freshly created table disappear. A per-test table makes the drops local, which is
+/// what the Java suite gets for free from a container per test class.
+fn tagged(tag: &str) -> MysqlAsyncConfig {
     let database = std::env::var("AGENTSCOPE_TEST_MYSQL_DATABASE")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "agentscope_it".to_string());
     MysqlAsyncConfig::new(
         database,
-        "agentscope_it_sessions",
-        "agentscope_it_store",
-        "agentscope_it_snapshots",
+        format!("agentscope_it_sessions_{tag}"),
+        format!("agentscope_it_store_{tag}"),
+        format!("agentscope_it_snapshots_{tag}"),
     )
 }
 
@@ -65,13 +77,17 @@ fn connect(url: &str) -> Arc<MysqlAsyncBackend> {
     MysqlAsyncBackend::connect_with_config(url, config()).expect("connect to MySQL")
 }
 
-/// Drops the three tables so each test starts from an empty schema.
+fn connect_tagged(url: &str, tag: &str) -> Arc<MysqlAsyncBackend> {
+    MysqlAsyncBackend::connect_with_config(url, tagged(tag)).expect("connect to MySQL")
+}
+
+/// Drops this test's tables so each run starts from an empty schema.
 fn reset_schema(backend: &Arc<MysqlAsyncBackend>) {
     let config = backend.config();
     for table in [
-        config.state_table.as_str(),
-        config.store_table.as_str(),
-        config.snapshot_table.as_str(),
+        config.state_table.clone(),
+        config.store_table.clone(),
+        config.snapshot_table.clone(),
     ] {
         let sql = format!("DROP TABLE IF EXISTS `{}`.`{}`", config.database, table);
         <MysqlAsyncBackend as StateBackend>::execute_ddl(&**backend, &sql)
@@ -104,9 +120,9 @@ fn state_store_round_trip_cas_and_lists() {
     if skip() {
         return;
     }
-    let backend = connect(&url().unwrap());
+    let backend = connect_tagged(&url().unwrap(), "state");
     reset_schema(&backend);
-    let config = config();
+    let config = backend.config().clone();
     let state_backend: Arc<dyn StateBackend> = backend.clone();
     let store = MysqlAgentStateStore::with_config(
         state_backend,
@@ -199,8 +215,8 @@ fn kv_store_cas_and_prefix_search() {
     if skip() {
         return;
     }
-    let backend = connect(&url().unwrap());
-    let config = config();
+    let backend = connect_tagged(&url().unwrap(), "kv");
+    let config = backend.config().clone();
     drop_table(&backend, &config.store_table);
     let sql_backend: Arc<dyn SqlBackend> = backend.clone();
     let store = MysqlStore::builder(sql_backend)
@@ -221,8 +237,8 @@ fn kv_store_cas_and_prefix_search() {
     assert_eq!(store.get(&namespace, "alpha").expect("get").version, 1);
 
     assert!(
-        store.put_if_version(&namespace, "alpha", value(2), 0),
-        "create-if-absent succeeds for a missing key"
+        !store.put_if_version(&namespace, "alpha", value(2), 0),
+        "create-if-absent must be rejected for an existing key (expected version 0 means \"absent\")"
     );
     assert_eq!(store.get(&namespace, "alpha").expect("get").version, 1);
     assert!(
@@ -250,12 +266,16 @@ fn snapshot_upload_download_and_exists() {
     if skip() {
         return;
     }
-    let backend = connect(&url().unwrap());
-    drop_table(&backend, &config().snapshot_table);
+    let backend = connect_tagged(&url().unwrap(), "snap");
+    drop_table(&backend, &backend.config().snapshot_table.clone());
+    let snapshot_table = backend.config().snapshot_table.clone();
     let snapshot_backend: Arc<dyn SnapshotBackend> = backend.clone();
     // `new_with_schema` mirrors `JdbcSnapshotSpec`, which always sets
-    // `initializeSchema = true`.
-    let client = MysqlRemoteSnapshotClient::new_with_schema(snapshot_backend);
+    // `initializeSchema = true`. The table name has to come from the client, and the client's
+    // name is authoritative for upload/download/exists (the backend used to substitute its own
+    // configured table, so the DDL created one table and the reads hit another).
+    let client = MysqlRemoteSnapshotClient::with_table_and_schema(snapshot_backend, snapshot_table)
+        .expect("valid table name");
 
     assert!(!futures::executor::block_on(client.exists("snap-1")).expect("exists"));
     futures::executor::block_on(client.upload("snap-1", b"archive-bytes")).expect("upload");
