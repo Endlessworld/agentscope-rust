@@ -18,10 +18,13 @@
 //!
 //! The Java module depends directly on the MongoDB Java driver. This crate models the
 //! small slice of the driver API it needs behind the [`client::MongoClient`] trait, so
-//! the store logic is transport-agnostic (the workspace exposes `mongodb = "3"` for a
-//! real backend — see the crate tracker §4.2). [`client::InMemoryMongoClient`] is a
-//! faithful in-process backend used by the contract tests; a real driver plugs in by
-//! implementing the same trait.
+//! the store logic is transport-agnostic. Two implementations ship:
+//!
+//! * [`client::InMemoryMongoClient`] — a faithful in-process backend used by the
+//!   contract tests (dependency-free, fully offline);
+//! * [`MongodbClient`] — the **real driver** backend (`mongodb` 3.x), used in production
+//!   and exercised by the env-gated live tests in `tests/mongodb_live.rs`
+//!   (`AGENTSCOPE_TEST_MONGODB_URL`).
 //!
 //! The guard is exposed twice on purpose: [`MongodbSandboxExecutionGuard`] is the
 //! MongoDB-specific lock (inherent `try_enter` / `release_async`), while
@@ -41,6 +44,20 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
+//! use agentscope_extensions_mongodb::MongodbClient;
+//!
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! // Real driver (pings the deployment so a bad URI fails immediately).
+//! let client = Arc::new(MongodbClient::connect("mongodb://127.0.0.1:27017").await?);
+//! let store = agentscope_extensions_mongodb::MongodbDistributedStore::new(client, Some("agentscope"));
+//! store.ensure_indexes().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! Offline (no server needed) — the same store logic over the in-process backend:
+//!
+//! ```
+//! use std::sync::Arc;
 //! use agentscope_extensions_mongodb::{MongodbDistributedStore, client::InMemoryMongoClient};
 //!
 //! # async fn demo() -> agentscope_core::error::Result<()> {
@@ -50,6 +67,7 @@
 //! ```
 
 pub mod client;
+pub mod client_mongodb;
 pub mod constants;
 pub mod distributed_store;
 pub mod index_utils;
@@ -64,6 +82,7 @@ pub use constants::{
     BASE_STORE_COLLECTION, DEFAULT_DATABASE, SANDBOX_LOCKS_COLLECTION, SESSIONS_COLLECTION,
     SNAPSHOTS_COLLECTION,
 };
+pub use client_mongodb::MongodbClient;
 pub use distributed_store::MongodbDistributedStore;
 pub use index_utils::{create_index_with_migration, IndexSpec};
 pub use sandbox_guard::{MongodbGuardClient, MongodbSandboxExecutionGuard};

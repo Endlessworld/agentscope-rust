@@ -233,7 +233,7 @@ impl FindFilter {
 
 /// A single update operator/assignment.
 #[derive(Debug, Clone)]
-enum UpdateOp {
+pub(crate) enum UpdateOp {
     Set(String, Value),
     SetOnInsert(String, Value),
     Inc(String, i64),
@@ -287,6 +287,16 @@ impl Update {
     pub fn combine(mut self, other: Update) -> Self {
         self.ops.extend(other.ops);
         self
+    }
+
+    /// The update operators in application order.
+    ///
+    /// Crate-internal: the real-driver backend ([`crate::client_mongodb`]) renders these
+    /// into a MongoDB update document (`$set` / `$setOnInsert` / `$inc` / `$push` /
+    /// `$unset`) instead of applying them in-process, so both backends share a single
+    /// source of truth for operator semantics.
+    pub(crate) fn ops(&self) -> &[UpdateOp] {
+        &self.ops
     }
 
     fn apply(&self, doc: &mut Map<String, Value>, is_insert: bool) {
