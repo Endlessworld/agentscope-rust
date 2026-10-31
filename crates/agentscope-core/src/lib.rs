@@ -45,6 +45,10 @@ pub use formatter::{
     SUPPORTED_VIDEO_EXTENSIONS, WARN_SIZE_BYTES,
 };
 pub use interruption::{InterruptContext, InterruptControl, InterruptSource};
+// `Memory` is a deprecated compatibility layer (Java `Memory` is `@Deprecated since 2.0.0`:
+// the conversation is owned by `AgentState.context`). Re-exported unchanged so existing
+// hosts keep compiling for one minor cycle.
+#[allow(deprecated)]
 pub use memory::{InMemoryMemory, Memory, StateBackedMemory};
 pub use message::{
     metadata_keys, AudioBlock, Base64Source, ChatUsage, ContentBlock, DataBlock, GenerateReason,
@@ -59,7 +63,7 @@ pub use model::{
     resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder, ExecutionConfig,
     ExecutionConfigBuilder, GenerateOptions, GenerateOptionsBuilder, Model, ModelCapabilities,
     ModelCreationContext, ModelProvider, ModelProviderSupport, ModelRegistry, ModelUtils,
-    StructuredOutputReminder, ToolChoice, ToolSchema, DEFAULT_PROVIDER_ID,
+    StructuredOutputReminder, ToolChoice, ToolSchema, ToolSearchMode, DEFAULT_PROVIDER_ID,
 };
 pub use observation::{
     observe_action, status_of, ActionObservation, ActionObserver, ActionStatus, ObserverHandle,

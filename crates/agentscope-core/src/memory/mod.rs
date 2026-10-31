@@ -10,6 +10,16 @@ use crate::state::{AgentState, AgentStateStore};
 pub const MEMORY_MESSAGES_KEY: &str = "memory_messages";
 
 /// Interface for memory components that store conversation history.
+///
+/// **Deprecated**: the conversation is owned by [`AgentState::context`], which the agent loop
+/// reads and writes directly. Java marks `Memory` `@Deprecated since 2.0.0` for the same
+/// reason. This trait and its two implementations stay as a compatibility layer for one
+/// minor cycle so hosts that still hold a `Memory` keep compiling.
+#[deprecated(
+    since = "0.1.0",
+    note = "the conversation is owned by AgentState::context (Java `Memory` is @Deprecated since 2.0.0); \
+            kept as a compatibility layer for one minor cycle"
+)]
 #[async_trait]
 pub trait Memory: Send + Sync {
     /// Adds a message to the memory.
@@ -53,6 +63,7 @@ impl InMemoryMemory {
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl Memory for InMemoryMemory {
     fn add_message(&self, message: Msg) {
@@ -128,6 +139,7 @@ impl StateBackedMemory {
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl Memory for StateBackedMemory {
     fn add_message(&self, message: Msg) {

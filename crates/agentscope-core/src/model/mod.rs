@@ -15,6 +15,7 @@ pub mod model;
 pub mod provider;
 pub mod tool_choice;
 pub mod tool_schema;
+pub mod tool_search_mode;
 
 pub use cache_policy::CachePolicy;
 pub use catalog::{
@@ -33,3 +34,4 @@ pub use provider::{
 };
 pub use tool_choice::ToolChoice;
 pub use tool_schema::ToolSchema;
+pub use tool_search_mode::ToolSearchMode;

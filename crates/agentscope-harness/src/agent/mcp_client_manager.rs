@@ -46,6 +46,71 @@ pub struct McpToolInfo {
     pub server: String,
 }
 
+/// Transport an MCP server connection must use.
+///
+/// Mirrors the `transport` discriminator of Java `tools/McpServerConfig`
+/// (`stdio` / `sse` / `http`). `McpServerConfig::transport` is optional: when absent the
+/// manager keeps sniffing the config (`command` -> stdio, `/sse` URL -> SSE, other URL ->
+/// Streamable HTTP), which is the historical behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransport {
+    /// Spawn a child process and speak MCP over stdin/stdout.
+    Stdio,
+    /// Legacy HTTP+SSE transport.
+    Sse,
+    /// Streamable HTTP transport (Java `http`).
+    StreamableHttp,
+}
+
+impl McpTransport {
+    /// The wire name used by `tools.json` (`http` for Streamable HTTP, like Java).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Sse => "sse",
+            Self::StreamableHttp => "http",
+        }
+    }
+
+    /// Parses the wire name; accepts `http` (Java) and `streamable_http`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stdio" => Some(Self::Stdio),
+            "sse" => Some(Self::Sse),
+            "http" => Some(Self::StreamableHttp),
+            "streamable_http" | "streamable-http" | "streamablehttp" => {
+                Some(Self::StreamableHttp)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The transport a config resolves to, together with the endpoint it will use.
+///
+/// Owns its strings so `connect()` can plan first and mutate the client instance after
+/// the borrow of the config ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedTransport {
+    /// stdio, using `command` (command line including arguments).
+    Stdio { command: String },
+    /// Legacy SSE, using `url`.
+    Sse { url: String },
+    /// Streamable HTTP, using `url`.
+    StreamableHttp { url: String },
+}
+
+impl PlannedTransport {
+    /// The transport kind that was planned.
+    pub fn kind(&self) -> McpTransport {
+        match self {
+            Self::Stdio { .. } => McpTransport::Stdio,
+            Self::Sse { .. } => McpTransport::Sse,
+            Self::StreamableHttp { .. } => McpTransport::StreamableHttp,
+        }
+    }
+}
+
 /// Configuration for an MCP server to register as a tool source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -62,6 +127,10 @@ pub struct McpServerConfig {
     /// per-tool switch at call time. The value is read live from the stored client
     /// instance on every call, so `set_propagate_meta` takes effect immediately.
     pub propagate_meta: bool,
+    /// Explicit transport selection. `None` keeps the sniffing behaviour (see
+    /// [`McpTransport`]): `command` -> stdio, an `/sse` URL -> SSE, any other URL ->
+    /// Streamable HTTP. Mirrors Java `tools/McpServerConfig.transport`.
+    pub transport: Option<McpTransport>,
 }
 
 impl McpServerConfig {
@@ -72,6 +141,7 @@ impl McpServerConfig {
             url: None,
             headers: Vec::new(),
             propagate_meta: true,
+            transport: None,
         }
     }
 
@@ -87,6 +157,12 @@ impl McpServerConfig {
 
     pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Pins the transport instead of letting `connect` sniff it from `command`/`url`.
+    pub fn transport(mut self, transport: McpTransport) -> Self {
+        self.transport = Some(transport);
         self
     }
 
@@ -173,9 +249,9 @@ impl McpClientManager {
         // Create handler
         let handler = DefaultClientHandler {};
 
-        // Create the MCP client. The transport type varies by config:
-        // - `command`  -> stdio
-        // - `url`      -> SSE (path ends with /sse) or Streamable HTTP otherwise
+        // Choose the transport: an explicit `transport` pin wins, otherwise sniff the
+        // config (`command` -> stdio, `/sse` URL -> SSE, other URL -> Streamable HTTP).
+        let planned = plan_transport(&client.config)?;
         let headers_map = if client.config.headers.is_empty() {
             None
         } else {
@@ -188,32 +264,33 @@ impl McpClientManager {
                     .collect::<std::collections::HashMap<_, _>>(),
             )
         };
-        let mcp_client = if let Some(command) = &client.config.command {
-            // Parse command and arguments
-            let parts: Vec<&str> = command.split_whitespace().collect();
-            if parts.is_empty() {
-                return Err(Error::Other("Empty command".to_string()));
-            }
-            let program = parts[0];
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        let mcp_client = match &planned {
+            PlannedTransport::Stdio { command } => {
+                // Parse command and arguments
+                let parts: Vec<&str> = command.split_whitespace().collect();
+                if parts.is_empty() {
+                    return Err(Error::Other("Empty command".to_string()));
+                }
+                let program = parts[0];
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-            let transport = StdioTransport::create_with_server_launch(
-                program,
-                args,
-                None,
-                TransportOptions::default(),
-            )
-            .map_err(|e| Error::Other(format!("Failed to create stdio transport: {}", e)))?;
-            client_runtime::create_client(McpClientOptions {
-                client_details,
-                transport,
-                handler: handler.to_mcp_client_handler(),
-                task_store: None,
-                server_task_store: None,
-                message_observer: None,
-            })
-        } else if let Some(url) = &client.config.url {
-            if is_sse_url(url) {
+                let transport = StdioTransport::create_with_server_launch(
+                    program,
+                    args,
+                    None,
+                    TransportOptions::default(),
+                )
+                .map_err(|e| Error::Other(format!("Failed to create stdio transport: {}", e)))?;
+                client_runtime::create_client(McpClientOptions {
+                    client_details,
+                    transport,
+                    handler: handler.to_mcp_client_handler(),
+                    task_store: None,
+                    server_task_store: None,
+                    message_observer: None,
+                })
+            }
+            PlannedTransport::Sse { url } => {
                 // Legacy SSE transport.
                 let sse_options = ClientSseTransportOptions {
                     custom_headers: headers_map,
@@ -229,7 +306,8 @@ impl McpClientManager {
                     server_task_store: None,
                     message_observer: None,
                 })
-            } else {
+            }
+            PlannedTransport::StreamableHttp { url } => {
                 // Streamable HTTP transport.
                 let transport_options = StreamableTransportOptions {
                     mcp_url: url.clone(),
@@ -251,8 +329,6 @@ impl McpClientManager {
                     message_observer: None,
                 })
             }
-        } else {
-            return Err(Error::Other("No command or URL specified".to_string()));
         };
 
         // Start the client
@@ -452,6 +528,22 @@ impl McpClientManager {
         })
     }
 
+    /// Finds any client id registered for the given server name, connected or not.
+    ///
+    /// A [`McpClientSource`](super::mcp::McpClientSource) uses this to connect a
+    /// configured-but-idle server on demand; `find_client_id_by_server` only reports
+    /// live connections.
+    pub async fn find_any_client_id_by_server(&self, server: &str) -> Option<String> {
+        let clients = self.clients.lock().await;
+        clients.iter().find_map(|(id, inst)| {
+            if inst.config.name == server {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Calls a tool on the connected client for the given server name.
     pub async fn call_tool_by_server(
         &self,
@@ -534,6 +626,63 @@ fn is_sse_url(url: &str) -> bool {
     url.contains("/sse")
 }
 
+/// Resolves the transport a config must connect with.
+///
+/// An explicit [`McpServerConfig::transport`] is authoritative — the caller pinned it, so
+/// a mismatch (e.g. `stdio` without a command) is a configuration error rather than a
+/// silent fallback. Without a pin the historical sniffing applies: `command` -> stdio,
+/// `/sse` URL -> legacy SSE, any other URL -> Streamable HTTP.
+pub fn plan_transport(config: &McpServerConfig) -> Result<PlannedTransport> {
+    let command = config.command.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let url = config.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+
+    match config.transport {
+        Some(McpTransport::Stdio) => match command {
+            Some(command) => Ok(PlannedTransport::Stdio {
+                command: command.to_string(),
+            }),
+            None => Err(Error::Other(format!(
+                "MCP server '{}' declares transport 'stdio' but has no command",
+                config.name
+            ))),
+        },
+        Some(McpTransport::Sse) => match url {
+            Some(url) => Ok(PlannedTransport::Sse {
+                url: url.to_string(),
+            }),
+            None => Err(Error::Other(format!(
+                "MCP server '{}' declares transport 'sse' but has no url",
+                config.name
+            ))),
+        },
+        Some(McpTransport::StreamableHttp) => match url {
+            Some(url) => Ok(PlannedTransport::StreamableHttp {
+                url: url.to_string(),
+            }),
+            None => Err(Error::Other(format!(
+                "MCP server '{}' declares transport 'http' but has no url",
+                config.name
+            ))),
+        },
+        None => {
+            if let Some(command) = command {
+                return Ok(PlannedTransport::Stdio {
+                    command: command.to_string(),
+                });
+            }
+            match url {
+                Some(url) if is_sse_url(url) => Ok(PlannedTransport::Sse {
+                    url: url.to_string(),
+                }),
+                Some(url) => Ok(PlannedTransport::StreamableHttp {
+                    url: url.to_string(),
+                }),
+                None => Err(Error::Other("No command or URL specified".to_string())),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +706,78 @@ mod tests {
             cfg.headers[0],
             ("Authorization".to_string(), "Bearer t".to_string())
         );
+    }
+
+    // ---- Explicit transport selection (`tools.json` `transport`) ----
+
+    #[test]
+    fn transport_pin_overrides_sniffing() {
+        // No `/sse` in the path, but the pin says SSE: the pin wins.
+        let cfg = McpServerConfig::new("srv")
+            .url("http://mcp.example.com/mcp")
+            .transport(McpTransport::Sse);
+        assert_eq!(
+            plan_transport(&cfg).unwrap(),
+            PlannedTransport::Sse {
+                url: "http://mcp.example.com/mcp".to_string()
+            }
+        );
+
+        // A `/sse` path, but the pin says streamable HTTP: the pin wins.
+        let cfg = McpServerConfig::new("srv")
+            .url("http://mcp.example.com/sse")
+            .transport(McpTransport::StreamableHttp);
+        assert_eq!(
+            plan_transport(&cfg).unwrap(),
+            PlannedTransport::StreamableHttp {
+                url: "http://mcp.example.com/sse".to_string()
+            }
+        );
+
+        // Unpinned configs keep sniffing.
+        let sniffed = plan_transport(&McpServerConfig::new("srv").url("http://x/sse")).unwrap();
+        assert_eq!(sniffed.kind(), McpTransport::Sse);
+        let sniffed = plan_transport(&McpServerConfig::new("srv").url("http://x/mcp")).unwrap();
+        assert_eq!(sniffed.kind(), McpTransport::StreamableHttp);
+        let sniffed = plan_transport(&McpServerConfig::new("srv").command("npx -y server")).unwrap();
+        assert_eq!(sniffed.kind(), McpTransport::Stdio);
+    }
+
+    #[test]
+    fn transport_pin_without_the_matching_endpoint_is_rejected() {
+        // Before the pin existed this config silently took the URL/no-transport path, so
+        // a `stdio` declaration without a command looked like "nothing configured".
+        let error = plan_transport(&McpServerConfig::new("files").transport(McpTransport::Stdio))
+            .expect_err("a stdio pin without a command must be rejected");
+        let text = format!("{error}");
+        assert!(text.contains("stdio"), "{text}");
+        assert!(text.contains("files"), "the error names the server: {text}");
+
+        let error = plan_transport(
+            &McpServerConfig::new("gateway")
+                .command("npx -y gateway")
+                .transport(McpTransport::StreamableHttp),
+        )
+        .expect_err("an http pin without a url must be rejected");
+        assert!(format!("{error}").contains("http"), "{error}");
+    }
+
+    #[test]
+    fn transport_wire_names_round_trip() {
+        assert_eq!(McpTransport::Stdio.as_str(), "stdio");
+        assert_eq!(McpTransport::Sse.as_str(), "sse");
+        assert_eq!(McpTransport::StreamableHttp.as_str(), "http");
+        for transport in [
+            McpTransport::Stdio,
+            McpTransport::Sse,
+            McpTransport::StreamableHttp,
+        ] {
+            assert_eq!(McpTransport::parse(transport.as_str()), Some(transport));
+        }
+        assert_eq!(
+            McpTransport::parse("streamable_http"),
+            Some(McpTransport::StreamableHttp)
+        );
+        assert_eq!(McpTransport::parse("carrier-pigeon"), None);
     }
 }

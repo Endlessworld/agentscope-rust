@@ -19,7 +19,7 @@ pub mod peer;
 pub mod router;
 
 pub use binding::ChannelBinding;
-pub use channel::Channel;
+pub use channel::{unsupported_delivery_receipt, Channel, DeliveryReceipt};
 pub use chatui::{ChatUiChannel, ChatUiRequest, OutboundEnvelope, SendOptions};
 pub use config::ChannelConfig;
 pub use dm_scope::DmScope;

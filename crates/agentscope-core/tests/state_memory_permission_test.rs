@@ -8,7 +8,9 @@ use agentscope_core::shutdown::{GracefulShutdownManager, ShutdownState};
 use agentscope_core::state::{
     AgentState, AgentStateStore, InMemoryAgentStateStore, JsonFileAgentStateStore, Task, TaskState,
 };
+#[allow(deprecated)]
 use agentscope_core::InMemoryMemory;
+#[allow(deprecated)]
 use agentscope_core::Memory;
 
 fn sample_msg(role: MsgRole, text: &str) -> Msg {
@@ -204,6 +206,9 @@ fn task_json_round_trip() {
     assert!(json.contains("created_at"));
 }
 
+// The `Memory` trait is a deprecated compatibility layer; its round trip stays covered
+// until the trait is removed.
+#[allow(deprecated)]
 #[tokio::test]
 async fn memory_save_load_round_trip() {
     let store = InMemoryAgentStateStore::new();

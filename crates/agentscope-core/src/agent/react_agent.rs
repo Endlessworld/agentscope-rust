@@ -1715,7 +1715,12 @@ async fn execute_iteration(
                     return Ok(msg);
                 }
             }
-            GenerateReason::ReasoningStopRequested | GenerateReason::MaxIterations => {
+            // A stop requested by a hook/middleware ends the turn here: acting on the
+            // message would keep running exactly the work the stop asked to abandon.
+            GenerateReason::ReasoningStopRequested
+            | GenerateReason::ActingStopRequested
+            | GenerateReason::MiddlewareStopRequested
+            | GenerateReason::MaxIterations => {
                 return Ok(msg);
             }
             _ => {
@@ -1728,6 +1733,11 @@ async fn execute_iteration(
                 }
             }
         };
+        if let Some(stopped) = outcome.stopped {
+            // The stop message is the turn's result; the acting phase already persisted the
+            // results that ran before the stop, so the context stays well formed.
+            return Ok(stopped);
+        }
         if outcome.return_direct {
             // returnDirect short-circuit: the successful tool result *is* the turn's
             // final answer, so no further reasoning iteration runs. The closing
@@ -1756,6 +1766,8 @@ struct ActingOutcome {
     return_direct: bool,
     /// The executed results, in tool-call order (used to build the closing message).
     results: Vec<ToolResultBlock>,
+    /// A middleware stopped the turn during acting; this message *is* the turn's result.
+    stopped: Option<Msg>,
 }
 
 /// Synthesizes the closing assistant message of a `returnDirect` turn, mirroring
@@ -1980,8 +1992,15 @@ async fn reasoning_phase(
         .toolkit
         .tool_schemas_with(tool_request_config.as_deref());
     let model = core.model.lock().unwrap().clone();
+    // `OnFormat` seam: middlewares may rewrite the structured-output request before it is
+    // built. It runs for every reasoning step (Java's `callFormat` wraps each formatter
+    // invocation), so a rewrite always lands in the provider call it belongs to.
+    let mut response_format = ctx.response_format.clone();
+    core.middleware_chain
+        .apply_format(ctx, &mut response_format)
+        .await;
     let mut ob = GenerateOptions::builder().model_name(model.model_name());
-    if let Some(rf) = &ctx.response_format {
+    if let Some(rf) = &response_format {
         ob = ob.response_format(rf.clone());
     }
     // Merge per-agent generation defaults (reasoning effort, retry policy, ...)
@@ -2036,7 +2055,18 @@ async fn reasoning_phase(
             serde_json::Value::String(model_name),
         );
     }
-    state.context_mut().push(final_msg.clone());
+    // A stop that never produced a message must not add an empty assistant turn to the
+    // history (Java returns that message without persisting it).
+    let synthesized_stop = final_msg.content().is_empty()
+        && matches!(
+            final_msg.generate_reason(),
+            GenerateReason::ReasoningStopRequested
+                | GenerateReason::ActingStopRequested
+                | GenerateReason::MiddlewareStopRequested
+        );
+    if !synthesized_stop {
+        state.context_mut().push(final_msg.clone());
+    }
     Ok(final_msg)
 }
 
@@ -2067,6 +2097,76 @@ fn adopt_published_context(core: &Arc<AgentCore>, state: &mut AgentState) {
             state.set_summary(shared.summary().to_string());
         }
     }
+}
+
+/// Reads the `GenerateReason` an event payload carries, if any.
+///
+/// Java puts it on `RequestStopEvent` as a typed field; Rust keeps it in the event payload
+/// under the same `generate_reason` metadata key the text projections use. Both the metadata
+/// map and the flattened `fields` are checked so a producer that attaches it either way is
+/// understood.
+fn event_generate_reason(data: &EventData) -> Option<GenerateReason> {
+    for key in [
+        crate::message::metadata_keys::EVENT_GENERATE_REASON,
+        "generateReason",
+    ] {
+        let Some(raw) = data
+            .metadata
+            .get(key)
+            .or_else(|| data.fields.get(key))
+        else {
+            continue;
+        };
+        if let Ok(reason) = serde_json::from_value::<GenerateReason>(raw.clone()) {
+            return Some(reason);
+        }
+        // Tolerate a lower-case wire spelling from a hand-built payload.
+        if let Some(name) = raw.as_str() {
+            if let Ok(reason) = serde_json::from_value::<GenerateReason>(
+                serde_json::Value::String(name.to_ascii_uppercase()),
+            ) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+/// The reason a `RequestStop` ends the turn with: the one it carries, or the phase default.
+fn stop_reason(data: &EventData, phase_default: GenerateReason) -> GenerateReason {
+    event_generate_reason(data).unwrap_or(phase_default)
+}
+
+/// Builds the assistant message that ends a turn a middleware stopped.
+///
+/// `results` are the tool results produced before the stop; each is paired with its
+/// `tool_use` block so the persisted context holds no dangling call and a follow-up turn can
+/// resume from it (Java `buildStopMsg`).
+fn stop_message(
+    ctx: &crate::agent::RuntimeContext,
+    calls: &[ToolUseBlock],
+    results: &[ToolResultBlock],
+    reason: GenerateReason,
+) -> Msg {
+    let mut content: Vec<ContentBlock> = Vec::new();
+    for result in results {
+        if let Some(call) = result
+            .id
+            .as_deref()
+            .and_then(|id| calls.iter().find(|call| call.id == id))
+        {
+            content.push(ContentBlock::ToolUse(call.clone()));
+        }
+        content.push(ContentBlock::ToolResult(result.clone()));
+    }
+    let mut builder = Msg::builder()
+        .role(MsgRole::Assistant)
+        .content(content)
+        .generate_reason(reason);
+    if let Some(name) = ctx.agent_name.as_deref() {
+        builder = builder.name(name);
+    }
+    builder.build()
 }
 
 /// Runs the reasoning phase through the middleware chain, wrapping the raw model
@@ -2131,27 +2231,51 @@ async fn run_reasoning(
         })
     };
 
-    let stream = chain.wrap_reasoning(ctx.clone(), input, reasoning_core);
-    let events: Vec<_> = stream.collect().await;
+    let mut stream = chain.wrap_reasoning(ctx.clone(), input, reasoning_core);
+    // A middleware can ask the agent to stop by emitting `RequestStop` (Java
+    // `RequestStopEvent`). The stream is abandoned at that point instead of being drained, so
+    // a middleware that stops *before* delegating prevents the model call entirely, and the
+    // rest of the round — acting on this message and any further iteration — is discarded.
+    let mut events: Vec<crate::error::Result<AgentEvent>> = Vec::new();
+    let mut stopped = None;
+    while let Some(item) = stream.next().await {
+        if let Ok(AgentEvent::RequestStop(data)) = &item {
+            stopped = Some(stop_reason(data, GenerateReason::ReasoningStopRequested));
+            events.push(item);
+            break;
+        }
+        events.push(item);
+    }
+    drop(stream);
     // A middleware can fail before the model core runs (for example the context
     // compiler rejecting an over-budget request). That failure only exists as a
     // stream item; discarding it here would turn every such failure into the
     // indistinguishable "model produced no message" error.
     let stream_error = events.into_iter().find_map(|event| event.err());
-    let result = slot
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap_or_else(|| match stream_error {
+    let produced = slot.lock().unwrap().take();
+    // A stop that never reached the model has no reasoning message to report; the synthesized
+    // one is the turn's closing result, not something the model produced.
+    let synthesized_stop = produced.is_none() && stopped.is_some();
+    let result = match (produced, stopped) {
+        // Whatever the model already produced is kept (its text may have been streamed to
+        // the caller); only the reason changes, so no tool call is acted on.
+        (Some(Ok(message)), Some(reason)) => Ok(message.with_generate_reason(reason)),
+        (Some(result), _) => result,
+        // A stop without a message is not a failure: the middleware answered the round
+        // itself (Java `Mono.justOrEmpty(finalMsg)` on the same branch).
+        (None, Some(reason)) => Ok(stop_message(ctx, &[], &[], reason)),
+        (None, None) => match stream_error {
             Some(error) => Err(error),
             None => Err(Error::Agent("model produced no message".into())),
-        });
+        },
+    };
     // Java `PostReasoningEvent`: tell the chain what this reasoning step produced so a
     // middleware can observe (and, e.g., log) each intermediate assistant message. A
     // notification only — the message is borrowed and cannot be rewritten, and a failed
     // step does not fire it (Java does not publish the event either).
-    if let Ok(message) = &result {
-        chain.notify_reasoning_result(ctx, message).await;
+    match (&result, synthesized_stop) {
+        (Ok(message), false) => chain.notify_reasoning_result(ctx, message).await,
+        _ => {}
     }
     result
 }
@@ -2912,6 +3036,10 @@ async fn acting_phase(
         }
     }
 
+    // A middleware may stop the turn from inside its acting stream (Java `RequestStopEvent`
+    // observed by `acting().doOnNext`). Kept outside the branch so the single-pass path leaves
+    // it as `None`.
+    let mut stop: Option<GenerateReason> = None;
     if core
         .middleware_chain
         .participants(ExtensionPoint::OnActing)
@@ -2943,15 +3071,55 @@ async fn acting_phase(
             ),
         );
         while let Some(item) = stream.next().await {
+            // A stop request ends the phase: the rest of the stream (the remaining tool
+            // calls, their post-acting hooks) must not run. The event is still forwarded so
+            // observers see the request, and dropping the stream aborts the acting task.
+            if let Ok(AgentEvent::RequestStop(data)) = &item {
+                stop = Some(stop_reason(data, GenerateReason::ActingStopRequested));
+                if let Some(tx) = &ctx.delta_tx {
+                    let _ = tx.unbounded_send(item);
+                }
+                break;
+            }
             if let Some(tx) = &ctx.delta_tx {
                 let _ = tx.unbounded_send(item);
             }
         }
+        // Dropping the stream cancels the detached acting task (see `ActingTaskGuard`).
+        drop(stream);
     }
 
     let snapshot = results.snapshot();
     if let Some(message) = snapshot.error {
         return Err(Error::Agent(message));
+    }
+    // A stopped phase is a completed turn, not a broken one: whatever ran before the stop is
+    // kept (paired with its `tool_use`) and the turn ends with the requested reason. Without
+    // this the empty result set used to surface as "acting phase produced no result".
+    if let Some(reason) = stop {
+        let message = stop_message(ctx, &pending, &snapshot.results, reason);
+        // A stopped phase still owes an answer for the calls that already ran: persist their
+        // results so the context holds no dangling `tool_use` a resumed turn would trip over.
+        // The closing message itself is *not* persisted (Java returns it the same way).
+        if !snapshot.results.is_empty() {
+            let result_msg = Msg::builder()
+                .role(MsgRole::Tool)
+                .content(
+                    snapshot
+                        .results
+                        .iter()
+                        .cloned()
+                        .map(ContentBlock::ToolResult)
+                        .collect(),
+                )
+                .build();
+            state.context_mut().push(result_msg);
+        }
+        return Ok(ActingOutcome {
+            results: snapshot.results,
+            stopped: Some(message),
+            ..Default::default()
+        });
     }
     // A short-circuit needs the core to have run to completion: an offloaded phase (a
     // middleware completed the stream first) must not lift results into the closing
@@ -3008,6 +3176,7 @@ async fn acting_phase(
         suspended: snapshot.suspended,
         return_direct,
         results,
+        stopped: None,
     })
 }
 
@@ -6580,6 +6749,252 @@ mod tests {
         assert!(
             err.to_string().contains("produced no result"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A `RequestStop` payload carrying an explicit `generate_reason`, like a middleware
+    /// that knows which `GenerateReason` the stop means.
+    fn stop_event(reason: Option<GenerateReason>) -> AgentEvent {
+        let mut data = EventData::default();
+        if let Some(reason) = reason {
+            data.fields.insert(
+                crate::message::metadata_keys::EVENT_GENERATE_REASON.to_string(),
+                serde_json::to_value(reason).unwrap(),
+            );
+        }
+        AgentEvent::RequestStop(data)
+    }
+
+    /// Stops the turn from the reasoning boundary without calling the model.
+    struct ReasoningStopMiddleware {
+        reason: Option<GenerateReason>,
+    }
+
+    impl Middleware for ReasoningStopMiddleware {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnReasoning]
+        }
+
+        fn on_reasoning(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            _input: ReasoningInput,
+            _next: Next<ReasoningInput>,
+        ) -> EventStream {
+            let event = stop_event(self.reason);
+            Box::pin(futures::stream::once(async move { Ok(event) }))
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_stop_request_ends_the_turn_with_the_phase_default_reason() {
+        // CORE-01: a `RequestStop` used to be swallowed. Because the middleware never calls
+        // `next`, the model was never invoked and the turn failed with "model produced no
+        // message" instead of ending as a (resumable) stop.
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![text_response("must not be reached")],
+        ));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ReasoningStopMiddleware { reason: None }));
+        let agent = ReActAgent::builder()
+            .name("t-stop-reasoning")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        assert_eq!(
+            reply.generate_reason(),
+            GenerateReason::ReasoningStopRequested
+        );
+        // The model core never ran, so no model text can appear in the reply.
+        assert!(reply.text_content().is_empty());
+    }
+
+    /// Stops the turn from the acting boundary without delegating to the core.
+    struct ActingStopMiddleware {
+        reason: Option<GenerateReason>,
+    }
+
+    impl Middleware for ActingStopMiddleware {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnActing]
+        }
+
+        fn on_acting(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            _input: ActingInput,
+            _next: Next<ActingInput>,
+        ) -> EventStream {
+            let event = stop_event(self.reason);
+            Box::pin(futures::stream::once(async move { Ok(event) }))
+        }
+    }
+
+    #[tokio::test]
+    async fn acting_stop_request_without_results_ends_the_turn_instead_of_erroring() {
+        // CORE-01: the acting phase used to demand a result for every pending call, so a
+        // middleware that only emitted `RequestStop` produced the hard error "acting phase
+        // produced no result". A stop is a legitimate outcome, not a broken phase.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c-stop", "add", JsonMap::new())],
+        ));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ActingStopMiddleware { reason: None }));
+        let agent = ReActAgent::builder()
+            .name("t-stop-acting")
+            .model(model)
+            .toolkit(toolkit)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert_eq!(reply.generate_reason(), GenerateReason::ActingStopRequested);
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "a stopped acting phase must not execute the pending calls"
+        );
+    }
+
+    /// Runs the acting core, then asks the agent to stop with an explicit reason.
+    struct ActingStopAfterCore {
+        reason: GenerateReason,
+    }
+
+    impl Middleware for ActingStopAfterCore {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnActing]
+        }
+
+        fn on_acting(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            input: ActingInput,
+            next: Next<ActingInput>,
+        ) -> EventStream {
+            let event = stop_event(Some(self.reason));
+            let inner = next(input);
+            Box::pin(inner.chain(futures::stream::once(async move { Ok(event) })))
+        }
+    }
+
+    #[tokio::test]
+    async fn acting_stop_request_keeps_partial_results_and_its_own_generate_reason() {
+        // The reason carried by the event wins over the phase default, and the results that
+        // ran before the stop stay in the turn: the reply pairs each `tool_result` with its
+        // `tool_use`, so the context holds no dangling call (Java `buildStopMsg`).
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c-partial", "add", input)],
+        ));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(ActingStopAfterCore {
+            reason: GenerateReason::MiddlewareStopRequested,
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-stop-acting-partial")
+            .model(model)
+            .toolkit(toolkit)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert_eq!(
+            reply.generate_reason(),
+            GenerateReason::MiddlewareStopRequested
+        );
+        assert_eq!(*counter.lock().unwrap(), 1);
+        assert_eq!(reply.tool_use_blocks().count(), 1);
+        let results: Vec<ToolResultBlock> = reply.tool_result_blocks().cloned().collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.as_deref(), Some("c-partial"));
+    }
+
+    /// A model that records the `response_format` of every request it serves.
+    struct FormatRecordingModel {
+        seen: Arc<Mutex<Vec<Option<ResponseFormat>>>>,
+    }
+
+    #[async_trait]
+    impl Model for FormatRecordingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            self.seen.lock().unwrap().push(options.response_format.clone());
+            Box::pin(futures::stream::once(async { Ok(text_response("done")) }))
+        }
+
+        fn model_name(&self) -> &str {
+            "format-recording"
+        }
+    }
+
+    /// Adds a `json_object` format when the caller asked for none.
+    struct FormatInjector;
+
+    #[async_trait]
+    impl Middleware for FormatInjector {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnFormat]
+        }
+
+        async fn on_format(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            format: &mut Option<ResponseFormat>,
+        ) {
+            if format.is_none() {
+                *format = Some(ResponseFormat::json_object());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn on_format_middleware_rewrites_the_request_the_provider_sees() {
+        // STUDIO-12: core had no framework-level format interception point, so a middleware
+        // could not rewrite the structured-output request at all.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model = Arc::new(FormatRecordingModel {
+            seen: Arc::clone(&seen),
+        });
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(FormatInjector));
+        let agent = ReActAgent::builder()
+            .name("t-format")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(ResponseFormat::json_object())],
+            "the rewrite must reach the provider request"
         );
     }
 

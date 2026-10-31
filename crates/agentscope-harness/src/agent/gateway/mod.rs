@@ -66,8 +66,9 @@ impl Gateway {
 }
 
 pub use channel::{
-    ChannelBinding, ChannelConfig, ChannelRouter, ChatUiChannel, ChatUiRequest, DmScope,
-    InboundMessage, OutboundEnvelope, Peer, PeerKind, RouteResult, SendOptions,
+    unsupported_delivery_receipt, ChannelBinding, ChannelConfig, ChannelRouter, ChatUiChannel,
+    ChatUiRequest, DeliveryReceipt, DmScope, InboundMessage, OutboundEnvelope, Peer, PeerKind,
+    RouteResult, SendOptions,
 };
 pub use gateway_bootstrap::{GatewayBootstrap, GatewayBootstrapBuilder};
 pub use harness_gateway::{

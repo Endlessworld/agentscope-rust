@@ -62,6 +62,14 @@ impl SandboxAcquireResult {
         self.sandbox
     }
 
+    /// Takes the sandbox out of the result, leaving it empty.
+    ///
+    /// `Sandbox::close` needs `&mut dyn Sandbox`, and `SandboxManager::release` consumes
+    /// the result, so it takes ownership of the box before closing it.
+    pub fn take_sandbox(&mut self) -> Option<Box<dyn Sandbox>> {
+        self.sandbox.take()
+    }
+
     /// Returns true if this is a self-managed sandbox.
     pub fn is_self_managed(&self) -> bool {
         self.self_managed
@@ -272,24 +280,34 @@ impl SandboxManager {
 
     /// Releases a sandbox (stop + shutdown if self-managed) and closes its guard lease.
     ///
+    /// Consumes the acquire result: a self-managed sandbox is **closed here and nowhere
+    /// else**, so the backend resources (container / tmpdir / K8s claim) cannot outlive the
+    /// call that created them. Mirrors Java `SandboxManager.release`, which calls
+    /// `sandbox.stop()` + `sandbox.shutdown()` and skips user-managed sandboxes (the caller
+    /// owns those and reuses them across acquire/release cycles).
+    ///
     /// The guard release is **awaited here and nowhere else**: dropping a `SandboxLease`
     /// never releases (see [`SandboxLease`]), so a caller that skips this method leaves an
     /// isolation key held until the backend's lease TTL expires.
-    pub async fn release(&self, result: &SandboxAcquireResult) {
+    pub async fn release(&self, result: SandboxAcquireResult) {
+        let mut result = result;
         // User-managed sandboxes are owned by the caller; their lease is a no-op.
         if result.is_self_managed() {
-            if let Some(sandbox) = result.sandbox() {
-                // Stop the sandbox
-                // Note: We can't call mutable methods on &dyn Sandbox, so we need to handle this differently
-                // In a real implementation, we'd need to take ownership or use interior mutability
+            if let Some(mut sandbox) = result.take_sandbox() {
                 debug!(
                     "[sandbox] Releasing self-managed sandbox: {}",
                     sandbox.state().session_id()
                 );
+                // `close()` = stop (persist snapshot) + shutdown (destroy resources). A
+                // failed snapshot must not leave the backend alive, so `shutdown` is still
+                // attempted when `close()` fails: teardown is fail-closed.
+                if let Err(e) = sandbox.close().await {
+                    warn!("[sandbox] Failed to close sandbox: {}", e);
+                    if let Err(e) = sandbox.shutdown().await {
+                        warn!("[sandbox] Failed to shut down sandbox: {}", e);
+                    }
+                }
             }
-
-            // For now, we'll just log. The actual stop/shutdown would need to be handled
-            // by the caller or through a different mechanism.
         }
 
         self.release_lease(result.lease()).await;
@@ -660,21 +678,24 @@ mod tests {
         );
         assert_eq!(observed.enters(), 1);
 
-        manager.release(&result).await;
+        manager.release(result).await;
         assert!(
             !observed.is_held(&key),
             "release must free the isolation key"
         );
-        assert!(result.lease().is_released());
         assert_eq!(
             (observed.enters(), observed.releases()),
             (1, 1),
             "fake guard must see exactly one enter and one release"
         );
 
-        // A second release is a no-op: it must not release another caller's hold.
-        manager.release(&result).await;
-        assert_eq!(observed.releases(), 1, "repeated release is idempotent");
+        // `release` consumes the acquire result, so a double release is not expressible;
+        // the key is free again and a new acquire re-enters exactly once.
+        let again = manager.acquire(&context, None).await.unwrap();
+        assert!(observed.is_held(&key), "the key can be re-acquired");
+        assert_eq!((observed.enters(), observed.releases()), (2, 1));
+        manager.release(again).await;
+        assert_eq!((observed.enters(), observed.releases()), (2, 2));
     }
 
     #[tokio::test]
@@ -697,5 +718,125 @@ mod tests {
             "a failed acquisition must not leak the isolation key"
         );
         assert_eq!((observed.enters(), observed.releases()), (1, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    //  Fail-closed teardown (SANDBOX-09: `release` must `close()` the sandbox)
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct CloseCounters {
+        stops: AtomicUsize,
+        shutdowns: AtomicUsize,
+    }
+
+    /// A self-managed sandbox whose teardown is observable.
+    #[derive(Debug)]
+    struct ClosingSandbox {
+        state: SandboxState,
+        counters: Arc<CloseCounters>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for ClosingSandbox {
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.counters.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<()> {
+            self.counters.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn state(&self) -> &SandboxState {
+            &self.state
+        }
+
+        async fn exec(
+            &self,
+            _runtime_context: Option<&RuntimeContext>,
+            _command: &str,
+            _timeout_seconds: Option<u64>,
+        ) -> Result<ExecResult> {
+            unreachable!("the teardown tests never execute commands")
+        }
+
+        async fn persist_workspace(&self) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        async fn hydrate_workspace(&self, _archive: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn closing_state() -> SandboxState {
+        SandboxState::Local(super::super::state::LocalSandboxState {
+            session_id: "close-me".to_string(),
+            temp_dir: "/tmp/close-me".to_string(),
+            workspace_root_ready: true,
+            workspace_projection_hash: None,
+            metadata: std::collections::HashMap::new(),
+            snapshot: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_self_managed_sandbox() {
+        let counters = Arc::new(CloseCounters::default());
+        let manager = SandboxManager::new(
+            Arc::new(MockSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+        );
+        let result = SandboxAcquireResult::self_managed_no_guard(Box::new(ClosingSandbox {
+            state: closing_state(),
+            counters: Arc::clone(&counters),
+        }));
+
+        manager.release(result).await;
+
+        assert_eq!(
+            counters.stops.load(Ordering::SeqCst),
+            1,
+            "release must call stop() (snapshot persistence)"
+        );
+        assert_eq!(
+            counters.shutdowns.load(Ordering::SeqCst),
+            1,
+            "release must call shutdown() (destroy backend resources)"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_leaves_a_user_managed_sandbox_alive() {
+        let counters = Arc::new(CloseCounters::default());
+        let manager = SandboxManager::new(
+            Arc::new(MockSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+        );
+        let result = SandboxAcquireResult::user_managed(Box::new(ClosingSandbox {
+            state: closing_state(),
+            counters: Arc::clone(&counters),
+        }));
+
+        manager.release(result).await;
+
+        assert_eq!(
+            counters.stops.load(Ordering::SeqCst),
+            0,
+            "the caller owns a user-managed sandbox and reuses it"
+        );
+        assert_eq!(counters.shutdowns.load(Ordering::SeqCst), 0);
     }
 }

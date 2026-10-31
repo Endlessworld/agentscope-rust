@@ -211,4 +211,50 @@ pub trait SessionLogStore: Send + Sync {
             "This session log store does not support discovery",
         ))
     }
+
+    /// Deletes the journal for a logical key, including everything the backend keeps beside it
+    /// (snapshots, inbox, export cursors).
+    ///
+    /// Backends that cannot delete the journal must fail visibly: a caller that believes a
+    /// session is gone while its history is still readable would keep leaking it. The default
+    /// therefore reports unsupported instead of pretending success.
+    async fn delete(&self, _key: &SessionKey) -> crate::error::Result<()> {
+        Err(session_error(
+            "This session log store does not support deletion",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that only implements the mandatory `open`, so `delete`'s default is what runs.
+    struct OpenOnlyStore;
+
+    #[async_trait]
+    impl SessionLogStore for OpenOnlyStore {
+        async fn open(
+            &self,
+            _key: &SessionKey,
+            _context: &RuntimeContext,
+        ) -> crate::error::Result<Arc<dyn SessionLog>> {
+            Err(session_error("open is not implemented by this test store"))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_delete_reports_unsupported_instead_of_succeeding() {
+        let store = OpenOnlyStore;
+        let key = SessionKey::new(None::<String>, "agent", "session").unwrap();
+        let error = store
+            .delete(&key)
+            .await
+            .expect_err("an unsupported delete must not report success");
+        assert!(
+            matches!(error, crate::error::Error::Session(_)),
+            "unexpected error kind: {error:?}"
+        );
+        assert!(error.to_string().contains("does not support deletion"));
+    }
 }

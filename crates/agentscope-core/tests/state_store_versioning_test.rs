@@ -107,6 +107,133 @@ async fn in_memory_delete_key_removes_only_that_key() {
     assert!(store.exists(Some("u"), "s").await);
 }
 
+/// A store that implements only the required trait surface, so the **default** `try_*`
+/// methods are the ones under test.
+#[derive(Default)]
+struct PlainStore {
+    values: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+#[async_trait::async_trait]
+impl AgentStateStore for PlainStore {
+    async fn save(&self, _u: Option<&str>, session: &str, key: &str, value: serde_json::Value) {
+        self.values
+            .lock()
+            .unwrap()
+            .insert(format!("{session}/{key}"), value);
+    }
+
+    async fn save_list(&self, _u: Option<&str>, _s: &str, _k: &str, _v: &[serde_json::Value]) {}
+
+    async fn get(&self, _u: Option<&str>, session: &str, key: &str) -> Option<serde_json::Value> {
+        self.values
+            .lock()
+            .unwrap()
+            .get(&format!("{session}/{key}"))
+            .cloned()
+    }
+
+    async fn get_list(&self, _u: Option<&str>, _s: &str, _k: &str) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    async fn exists(&self, _u: Option<&str>, _s: &str) -> bool {
+        false
+    }
+
+    async fn delete(&self, _u: Option<&str>, _s: &str) {}
+
+    async fn list_session_ids(&self, _u: Option<&str>) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn default_try_methods_delegate_to_the_infallible_surface() {
+    // The `try_*` family must not silently change behaviour for backends that keep the
+    // infallible contract: the defaults delegate to `get_versioned` / `save_if_version`.
+    let store = PlainStore::default();
+
+    let absent = store.try_get_versioned(None, "s", "k").await.unwrap();
+    assert!(!absent.is_present());
+    assert_eq!(absent.version, UNVERSIONED);
+
+    // A non-versioning backend writes unconditionally and reports `UNVERSIONED`.
+    assert_eq!(
+        store
+            .try_save_if_version(None, "s", "k", json!(1), 0)
+            .await
+            .unwrap(),
+        UNVERSIONED
+    );
+    let loaded = store.try_get_versioned(None, "s", "k").await.unwrap();
+    assert_eq!(loaded.value, Some(json!(1)));
+    assert_eq!(loaded.version, UNVERSIONED);
+}
+
+#[tokio::test]
+async fn in_memory_try_methods_reject_a_blank_session_id() {
+    // The infallible methods drop a blank session id on the floor (`let _ = require_...`);
+    // the fallible surface must report it instead of writing to the `""` session.
+    let store = InMemoryAgentStateStore::new();
+    assert!(store
+        .try_get_versioned(None, "  ", "k")
+        .await
+        .is_err());
+    assert!(store
+        .try_save_if_version(None, "  ", "k", json!(1), 0)
+        .await
+        .is_err());
+    assert!(!store.exists(None, "").await);
+}
+
+#[tokio::test]
+async fn json_file_try_get_versioned_reports_a_corrupt_payload() {
+    // `get_versioned` collapses a parse failure to "nothing stored"; the fallible variant
+    // must surface it so a caller does not overwrite a state it failed to read.
+    let dir = std::env::temp_dir().join(format!(
+        "agentscope-state-store-try-read-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = JsonFileAgentStateStore::new(&dir);
+    let session_dir = dir.join("__anon__").join("s");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(session_dir.join("k.json"), "{not json").unwrap();
+
+    assert!(store.get_versioned(None, "s", "k").await.value.is_none());
+    assert!(store.try_get_versioned(None, "s", "k").await.is_err());
+
+    // A missing key is still an ordinary absence, not a failure.
+    let missing = store.try_get_versioned(None, "s", "other").await.unwrap();
+    assert!(!missing.is_present());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn json_file_try_save_if_version_reports_a_failed_write() {
+    // A write that never lands must not look like a lost CAS race (`UNVERSIONED`) or like
+    // an ordinary `save` that succeeds.
+    let dir = std::env::temp_dir().join(format!(
+        "agentscope-state-store-try-write-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = JsonFileAgentStateStore::new(&dir);
+    // Occupy the session directory path with a regular file so every write fails.
+    let user_dir = dir.join("__anon__");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("s"), "blocked").unwrap();
+
+    store.save(None, "s", "k", json!(1)).await;
+    assert_eq!(store.get(None, "s", "k").await, None);
+    assert!(store
+        .try_save_if_version(None, "s", "k", json!(1), 0)
+        .await
+        .is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn json_file_store_reports_per_key_delete_as_unsupported() {
     // The trait default must fail loudly rather than pretend the value was removed.

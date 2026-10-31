@@ -122,6 +122,21 @@ pub trait AgentStateStore: Send + Sync {
         }
     }
 
+    /// Fallible variant of [`AgentStateStore::get_versioned`].
+    ///
+    /// `get_versioned` collapses every failure to "nothing stored", which is fine for a
+    /// best-effort read but hides a corrupt payload or an unreachable backend from a caller
+    /// that must not continue on a wrong assumption. Backends that can detect such failures
+    /// override this; the default preserves the infallible behaviour.
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<VersionedState> {
+        Ok(self.get_versioned(user_id, session_id, key).await)
+    }
+
     /// Compare-and-swap write of a single state value.
     ///
     /// * `expected_version == 0` — create-if-absent (also satisfied by a row whose stored
@@ -143,6 +158,25 @@ pub trait AgentStateStore: Send + Sync {
         let _ = expected_version;
         self.save(user_id, session_id, key, value).await;
         UNVERSIONED
+    }
+
+    /// Fallible variant of [`AgentStateStore::save_if_version`].
+    ///
+    /// `save_if_version` reports a failed write as a CAS conflict ([`UNVERSIONED`]) or drops
+    /// it entirely, so a caller cannot tell "another writer won" from "the write never
+    /// landed". Backends that can report the difference override this; the default preserves
+    /// the infallible behaviour and therefore never fails.
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> Result<i64> {
+        Ok(self
+            .save_if_version(user_id, session_id, key, value, expected_version)
+            .await)
     }
 }
 
@@ -361,6 +395,33 @@ impl AgentStateStore for InMemoryAgentStateStore {
         session.versions.insert(key.to_string(), next);
         next
     }
+
+    // The in-memory backend cannot fail to read or write, but it can still be handed an
+    // unusable key. Reporting that instead of silently writing to the `""` session keeps the
+    // fallible surface honest.
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<VersionedState> {
+        require_session_id(session_id)?;
+        Ok(self.get_versioned(user_id, session_id, key).await)
+    }
+
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> Result<i64> {
+        require_session_id(session_id)?;
+        Ok(self
+            .save_if_version(user_id, session_id, key, value, expected_version)
+            .await)
+    }
 }
 
 /// JSON file-based [`AgentStateStore`] implementation.
@@ -513,6 +574,57 @@ impl AgentStateStore for JsonFileAgentStateStore {
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
         let _ = tokio::fs::remove_dir_all(self.session_dir(user_id, session_id)).await;
+    }
+
+    // The JSON backend can genuinely fail: a corrupt payload is not the same as an absent
+    // one, and a failed atomic write is not the same as a lost CAS race. Both used to look
+    // like "nothing stored" / "conflict" to the caller.
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<VersionedState> {
+        require_session_id(session_id)?;
+        let path = self.state_path(user_id, session_id, key);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(text) => {
+                let value = serde_json::from_str(&text).map_err(|error| {
+                    crate::Error::Other(format!(
+                        "failed to parse state value `{key}` at `{}`: {error}",
+                        path.display()
+                    ))
+                })?;
+                Ok(VersionedState {
+                    value: Some(value),
+                    version: UNVERSIONED,
+                })
+            }
+            // A missing file is the ordinary "absent key" case, not a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(VersionedState {
+                value: None,
+                version: UNVERSIONED,
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> Result<i64> {
+        // No optimistic concurrency: the write is unconditional, like `save_if_version`,
+        // but a failure to land it is reported instead of dropped.
+        let _ = expected_version;
+        require_session_id(session_id)?;
+        let path = self.state_path(user_id, session_id, key);
+        let json = serde_json::to_string_pretty(&value)?;
+        self.atomic_write(&path, &json).await?;
+        Ok(UNVERSIONED)
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {

@@ -12,6 +12,7 @@ use async_trait::async_trait;
 
 use crate::agent::bus::MessageBus;
 
+use super::channel::channel::{unsupported_delivery_receipt, DeliveryReceipt};
 use super::msg_context::MsgContext;
 use super::session_turn_gate::SessionTurnGate;
 use super::subagent::{InMemorySubagentRegistry, SubagentRecord, SubagentRegistry};
@@ -102,6 +103,21 @@ pub trait GatewayAgent: Send + Sync {
 pub trait ChannelSink: Send + Sync {
     fn channel_id(&self) -> &str;
     async fn deliver(&self, address: &OutboundAddress, messages: Vec<Msg>) -> Result<()>;
+
+    /// Delivers a batch and returns the provider's delivery receipt.
+    ///
+    /// Mirrors Java `Channel.deliverWithReceipt`: the default is fail-closed and
+    /// reports *unsupported*, so a sink that cannot report a provider id never looks
+    /// like a successful durable delivery. Sinks whose transport returns receipts
+    /// (Feishu / Weixin) override it.
+    async fn deliver_with_receipt(
+        &self,
+        _address: &OutboundAddress,
+        _messages: Vec<Msg>,
+        _delivery_id: Option<&str>,
+    ) -> Result<DeliveryReceipt> {
+        Err(unsupported_delivery_receipt(self.channel_id()))
+    }
 }
 
 /// Registry and lifecycle manager for outbound delivery sinks.

@@ -18,6 +18,7 @@ pub mod shutdown;
 pub mod skill;
 pub mod subagent;
 pub mod team;
+pub mod tools;
 pub mod verification;
 pub mod workspace;
 
@@ -38,20 +39,23 @@ pub use distributed_store::{DistributedStore, DistributedStoreBuilder};
 pub use gateway::{
     create_completion_callback, deterministic_hash, wire_task_completion, Channel, ChannelBinding,
     ChannelConfig, ChannelManager, ChannelRouter, ChannelSink, ChatUiChannel, ChatUiRequest,
-    DefaultSubagentMaterializer, DmScope, Gateway, GatewayAgent, GatewayBootstrap,
+    DefaultSubagentMaterializer, DeliveryReceipt, DmScope, Gateway, GatewayAgent, GatewayBootstrap,
     GatewayBootstrapBuilder, GatewayTurnContext, HarnessGateway, InMemorySubagentRegistry,
     InboundMessage, MsgContext, OutboundAddress, OutboundEnvelope, Peer, PeerKind, PlatformChannel,
     PlatformCtx, RouteResult, SendOptions, SessionTurnGate, SubagentMaterializer, SubagentRecord,
     SubagentRegistry, TaskCompletionBridge, WakeupDispatcher, WakeupTarget,
 };
-pub use harness_agent::{HarnessAgent, HarnessAgentBuilder};
+pub use harness_agent::{AgentBuiltCallback, HarnessAgent, HarnessAgentBuilder, HarnessAgentHandle};
 pub use isolation_scope::IsolationScope;
 pub use mcp::{
-    bridge_mcp_tools_to_toolkit, try_bridge_mcp_tools_to_toolkit, McpMetaPropagationOptions,
-    McpServerConfig, McpServerRegistrar, McpServerRegistrationListener,
-    McpServerRegistrationResult, McpServerRegistrationStatus, Registrar,
+    bridge_mcp_tools_to_toolkit, try_bridge_mcp_tools_to_toolkit, McpClientSource,
+    McpMetaPropagationOptions, McpServerConfig, McpServerRegistrar, McpServerRegistrationListener,
+    McpServerRegistrationResult, McpServerRegistrationStatus, McpToolSource, Registrar,
 };
-pub use mcp_client_manager::{McpClientInstance, McpClientManager, McpToolInfo};
+pub use mcp_client_manager::{
+    plan_transport, McpClientInstance, McpClientManager, McpToolInfo, McpTransport,
+    PlannedTransport,
+};
 pub use memory::{
     compaction::{
         build_summary_message, calculate_token, filter_summary_messages,
@@ -103,6 +107,9 @@ pub use subagent::{
     SubagentMode, SubagentWorkspaceMode, TaskCompletionCallback, TaskDelivery, TaskRecord,
     TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository, SUBAGENTS_DIR, SUBAGENT_GLOB,
     SUPPRESS_COMPLETION_CALLBACK,
+};
+pub use tools::{
+    HarnessPlatformTools, McpServerEntry, ToolFilter, ToolsConfig, ToolsConfigLoader,
 };
 pub use verification::{verify, DeterministicVerifier, SettledAction, Verdict};
 pub use workspace::{

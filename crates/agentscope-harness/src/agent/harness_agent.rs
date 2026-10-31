@@ -37,13 +37,16 @@ use super::memory::{
     MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig,
 };
 use super::middleware::{
-    AgentTraceMiddleware, AtPathExpansionMiddleware, ConversationCompactionMiddleware,
-    DynamicSubagentsMiddleware, GracefulShutdownMiddleware, HarnessSkillMiddleware,
-    InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware, PlanModeConfig,
-    PlanModeMiddleware, SkillCuratorMiddleware, SkillUsageMiddleware, StateCheckpointMiddleware,
-    SubagentsMiddleware, TeamsMiddleware, ToolCallPairSanitizerMiddleware,
-    ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
+    AgentTraceMiddleware, AsyncToolMiddleware, AtPathExpansionMiddleware,
+    ConversationCompactionMiddleware, DynamicSubagentsMiddleware, GracefulShutdownMiddleware,
+    HarnessSkillMiddleware, InboxMiddleware, MemoryFlushMiddleware, MemoryMaintenanceMiddleware,
+    PlanModeConfig, PlanModeMiddleware, SandboxLifecycleMiddleware, SkillCuratorMiddleware,
+    SkillUsageMiddleware, StateCheckpointMiddleware, SubagentsMiddleware, TeamsMiddleware,
+    ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
 };
+use super::sandbox::{SandboxContext, SandboxManager};
+use super::mcp::Registrar;
+use super::tools::{ToolFilter, ToolsConfig, ToolsConfigLoader};
 use super::shutdown::GracefulShutdownController;
 use super::skill::{
     build_promoter, compose_skill_repositories, default_gate, AuditEntry,
@@ -139,9 +142,76 @@ const DEFAULT_MAX_ITERS: i32 = 10;
 /// Default workspace-relative directory for plan files.
 const DEFAULT_PLAN_DIR: &str = "plans";
 
+/// Callback invoked once, right after [`HarnessAgentBuilder::build`] has assembled the agent.
+///
+/// The harness cannot depend on extension crates, so a crate that needs to attach a hook
+/// (training, judging, custom telemetry) receives this callback through
+/// [`HarnessAgentBuilder::on_agent_built`] and registers its own middleware/observers from
+/// there — the alternative was every host re-implementing the assembly and forgetting a
+/// `bind_agent` step.
+pub type AgentBuiltCallback = Arc<dyn Fn(&HarnessAgentHandle) + Send + Sync>;
+
+/// A cheap, cloneable handle to a built [`HarnessAgent`].
+///
+/// Holds only the parts a hook needs (identity, model, tool catalog and the live agent
+/// state), never the agent itself: a self-referencing `Arc<HarnessAgent>` cached inside the
+/// agent would leak (Java's `ConcurrentHashMap` cache has exactly that hazard).
+#[derive(Clone)]
+pub struct HarnessAgentHandle {
+    name: String,
+    agent_id: String,
+    model: Option<Arc<dyn Model>>,
+    toolkit: Toolkit,
+    state: Option<Arc<Mutex<AgentState>>>,
+}
+
+impl HarnessAgentHandle {
+    /// The agent name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The stable agent id (defaults to the name).
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// The model the agent was built with (`None` in assembly-only mode).
+    pub fn model(&self) -> Option<&Arc<dyn Model>> {
+        self.model.as_ref()
+    }
+
+    /// The (already tool-filtered) toolkit the agent runs with.
+    pub fn toolkit(&self) -> &Toolkit {
+        &self.toolkit
+    }
+
+    /// The live agent state handle (`None` when no model was configured).
+    ///
+    /// This is the same handle the runner writes, so a hook can read annotations, plan
+    /// state or session ids without a second source of truth.
+    pub fn state(&self) -> Option<&Arc<Mutex<AgentState>>> {
+        self.state.as_ref()
+    }
+}
+
 impl HarnessAgent {
     pub fn builder() -> HarnessAgentBuilder {
         HarnessAgentBuilder::default()
+    }
+
+    /// Returns a cheap handle for host/extension hook assembly.
+    ///
+    /// This is what [`HarnessAgentBuilder::on_agent_built`] receives at build time; hosts
+    /// that already own the agent can take the same handle later.
+    pub fn handle(&self) -> HarnessAgentHandle {
+        HarnessAgentHandle {
+            name: self.name.clone(),
+            agent_id: self.agent_id.clone(),
+            model: self.model.clone(),
+            toolkit: self.toolkit.clone(),
+            state: self.agent.as_ref().map(|agent| agent.state_handle()),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -749,6 +819,17 @@ pub struct HarnessAgentBuilder {
     shutdown_state_saver: Option<Arc<dyn ShutdownStateSaver>>,
     /// shutdown 超时：超时后强制中断仍在运行的请求。
     shutdown_timeout: Option<Duration>,
+    // ---- Tool governance / sandbox / extension hooks ----
+    /// Explicit tool governance; `None` loads `workspace/tools.json` during `build()`.
+    tools_config: Option<ToolsConfig>,
+    /// Registrar used to declare the `mcpServers` entries of `tools.json`.
+    mcp_registrar: Option<Arc<dyn Registrar>>,
+    /// Sandbox manager that drives `SandboxLifecycleMiddleware`.
+    sandbox_manager: Option<Arc<SandboxManager>>,
+    /// Sandbox context used for acquisition decisions (a bare context by default).
+    sandbox_context: Option<SandboxContext>,
+    /// Host callback invoked with a handle right after the agent is built.
+    on_agent_built: Option<AgentBuiltCallback>,
 }
 
 impl Default for HarnessAgentBuilder {
@@ -837,6 +918,11 @@ impl Default for HarnessAgentBuilder {
             shutdown_manager: None,
             shutdown_state_saver: None,
             shutdown_timeout: None,
+            tools_config: None,
+            mcp_registrar: None,
+            sandbox_manager: None,
+            sandbox_context: None,
+            on_agent_built: None,
         }
     }
 }
@@ -1364,8 +1450,58 @@ impl HarnessAgentBuilder {
     }
 
     /// Sets the timeout applied to async tool executions (mirrors Java `asyncToolTimeout`).
+    ///
+    /// Setting a timeout also installs [`AsyncToolMiddleware`]: tool calls that exceed it
+    /// are offloaded to the background, a placeholder result keeps the loop moving, and the
+    /// real result is delivered through the session inbox.
     pub fn async_tool_timeout(mut self, timeout: Duration) -> Self {
         self.async_tool_timeout = Some(timeout);
+        self
+    }
+
+    /// Delegates sandbox acquire/persist/release to [`SandboxLifecycleMiddleware`]
+    /// (mirrors Java `HarnessAgent.Builder.sandboxFilesystemSpec`).
+    ///
+    /// Without a manager the agent never touches a sandbox; the host (typically the
+    /// `agentscope-extensions-sandbox` crate) constructs the manager with its platform
+    /// client and state store.
+    pub fn sandbox_manager(mut self, manager: Arc<SandboxManager>) -> Self {
+        self.sandbox_manager = Some(manager);
+        self
+    }
+
+    /// Sets the sandbox context used for acquisition decisions (isolation scope,
+    /// workspace spec, snapshot/client options).
+    pub fn sandbox_context(mut self, context: SandboxContext) -> Self {
+        self.sandbox_context = Some(context);
+        self
+    }
+
+    /// Overrides `workspace/tools.json` tool governance.
+    ///
+    /// When unset, `build()` loads `tools.json` from the resolved workspace (a missing or
+    /// unparseable file leaves the tool catalog untouched).
+    pub fn tools_config(mut self, config: ToolsConfig) -> Self {
+        self.tools_config = Some(config);
+        self
+    }
+
+    /// Registers the `mcpServers` declared by `tools.json` through `registrar`
+    /// (production: `McpServerRegistrar`).
+    pub fn mcp_registrar(mut self, registrar: Arc<dyn Registrar>) -> Self {
+        self.mcp_registrar = Some(registrar);
+        self
+    }
+
+    /// Installs a callback invoked with a [`HarnessAgentHandle`] once the agent is built.
+    ///
+    /// This is the harness-level attach point for extension crates (training hooks,
+    /// judges, custom telemetry) so a host never has to double-implement assembly.
+    pub fn on_agent_built<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&HarnessAgentHandle) + Send + Sync + 'static,
+    {
+        self.on_agent_built = Some(Arc::new(callback));
         self
     }
 
@@ -1577,6 +1713,22 @@ impl HarnessAgentBuilder {
             ))));
         }
 
+        // ---- Sandbox lifecycle ----
+        // Java builds this from `sandboxFilesystemSpec`; the Rust equivalent is an explicit
+        // manager + context pair supplied by the host (the sandbox platform crate owns the
+        // client). Without a manager the agent never acquires a sandbox at all, so the
+        // middleware is simply not installed.
+        if let Some(manager) = self.sandbox_manager.clone() {
+            let sandbox_context = self
+                .sandbox_context
+                .clone()
+                .unwrap_or_else(|| SandboxContext::builder().build());
+            middleware.add(Box::new(SandboxLifecycleMiddleware::new(
+                manager,
+                sandbox_context,
+            )));
+        }
+
         // A deferred registration error must surface here rather than silently dropping the
         // caller's context source. `build()` is infallible by contract, and an invalid context
         // registration is a programming error (Java throws `IllegalArgumentException`).
@@ -1727,6 +1879,17 @@ impl HarnessAgentBuilder {
                 ".agentscope/bus/async-tools",
             )) as Arc<dyn AsyncToolRegistry>)
         });
+        // ---- Async tool offloading ----
+        // `async_tool_timeout` is only meaningful with a consumer: Java installs
+        // `AsyncToolMiddleware` right before the inbox whenever a timeout is configured, so
+        // the placeholder can be drained on the next reasoning step.
+        if let (Some(bus), Some(timeout)) = (message_bus.clone(), self.async_tool_timeout) {
+            let mut builder = AsyncToolMiddleware::builder(bus, timeout);
+            if let Some(reg) = async_tool_registry.clone() {
+                builder = builder.async_tool_registry(reg);
+            }
+            middleware.add(Box::new(builder.build()));
+        }
         if let Some(bus) = message_bus.clone() {
             let mut inbox = InboxMiddleware::builder(bus);
             if let Some(reg) = async_tool_registry.clone() {
@@ -1962,6 +2125,36 @@ impl HarnessAgentBuilder {
                 }
                 None => crate::tool::register_web_tools(&toolkit),
             }
+        }
+
+        // ---- Tool governance (`workspace/tools.json`) ----
+        // Mirrors Java `HarnessAgent.build()`: declare the MCP servers, then narrow the
+        // catalog. Both run after every catalogued tool is registered and before the
+        // platform tools (meta tool, subagents, plan/skill tools) are added, so an `allow`
+        // list can never disable the coordination runtime.
+        let tools_config = self
+            .tools_config
+            .clone()
+            .or_else(|| ToolsConfigLoader::load(&workspace_manager));
+        if let Some(config) = tools_config.as_ref() {
+            if let Some(registrar) = self.mcp_registrar.clone() {
+                for (name, entry) in &config.mcp_servers {
+                    match entry.to_server_config(name) {
+                        Ok(server) => {
+                            if let Err(e) = registrar.register(&server) {
+                                tracing::warn!("failed to register MCP server '{name}': {e}");
+                            }
+                        }
+                        Err(e) => tracing::warn!("skipping MCP server '{name}': {e}"),
+                    }
+                }
+            } else if !config.mcp_servers.is_empty() {
+                tracing::warn!(
+                    "tools.json declares {} MCP server(s) but no mcp_registrar was configured",
+                    config.mcp_servers.len()
+                );
+            }
+            ToolFilter::apply(&toolkit, config);
         }
 
         // ---- Meta tool (reset_equipped_tools) ----
@@ -2279,7 +2472,7 @@ impl HarnessAgentBuilder {
             }
         }
 
-        HarnessAgent {
+        let built = HarnessAgent {
             name,
             agent_id,
             description,
@@ -2310,7 +2503,16 @@ impl HarnessAgentBuilder {
             session_log_store,
             shutdown_manager,
             subagent_model_slot,
+        };
+
+        // Host/extension attach point: the callback sees the finished agent (post tool
+        // filtering, post middleware assembly) through a cheap handle. Fires exactly once,
+        // because `build()` consumes the builder.
+        if let Some(callback) = self.on_agent_built.take() {
+            callback(&built.handle());
         }
+
+        built
     }
 }
 

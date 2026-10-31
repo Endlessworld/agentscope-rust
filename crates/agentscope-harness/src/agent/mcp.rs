@@ -379,3 +379,193 @@ pub async fn try_bridge_mcp_tools_to_toolkit(
 
     Ok(registered)
 }
+
+// ---------------------------------------------------------------------------
+// MCP tool source abstraction (HIGRESS-07)
+// ---------------------------------------------------------------------------
+
+/// A source of MCP tools that a toolkit can register.
+///
+/// Mirrors Java's `McpClientWrapper` base class: `Toolkit.registerMcpClient` is declared
+/// against the base type, so *any* MCP client can be registered and only provider-specific
+/// subclasses are cached (Java's `instanceof` check). Rust has no client base class, so
+/// this narrow port stands in for it. The harness implements it for every server managed
+/// by [`McpClientManager`] (see [`McpClientSource`]); extension crates (Higress, …) accept
+/// `Arc<dyn McpToolSource>` instead of defining their own MCP-client abstraction.
+///
+/// Provider-specific downcasts (e.g. "is this a Higress client?") deliberately stay in the
+/// extension crate: the harness must not depend on a provider type.
+#[async_trait::async_trait]
+pub trait McpToolSource: Send + Sync {
+    /// The unique client/server name (Java `McpClientWrapper.getName()`).
+    fn name(&self) -> &str;
+
+    /// Establishes the connection, if it is not already established.
+    ///
+    /// A toolkit calls this before listing tools (Java
+    /// `Toolkit.registerMcpClient` → `initialize()`), so the tool list is never read from
+    /// an unconnected client.
+    async fn initialize(&self) -> Result<()>;
+
+    /// Lists the tools this client exposes.
+    async fn list_tools(&self) -> Result<Vec<rust_mcp_sdk::schema::Tool>>;
+
+    /// Invokes a tool, propagating `meta` as MCP request metadata.
+    ///
+    /// `meta` must be forwarded untouched: `None` means "send no `_meta`".
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        meta: Option<agentscope_core::message::JsonMap>,
+    ) -> Result<rust_mcp_sdk::schema::CallToolResult>;
+}
+
+/// [`McpToolSource`] backed by one server registered on a [`McpClientManager`].
+///
+/// The manager owns the connection and the discovery cache; this adapter exposes one of
+/// its servers through the abstract tool-source port, so a toolkit (Higress or any other)
+/// can register MCP tools without knowing about `rust_mcp_sdk` clients or the manager.
+#[derive(Clone)]
+pub struct McpClientSource {
+    manager: std::sync::Arc<McpClientManager>,
+    server: String,
+}
+
+impl McpClientSource {
+    /// Creates a source for `server` on `manager`.
+    ///
+    /// The server must already be registered with the manager
+    /// ([`McpClientManager::create_client`]); `initialize` connects it on demand.
+    pub fn new(manager: std::sync::Arc<McpClientManager>, server: impl Into<String>) -> Self {
+        Self {
+            manager,
+            server: server.into(),
+        }
+    }
+
+    /// The server name this source exposes.
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// The manager this source reads through.
+    pub fn manager(&self) -> &std::sync::Arc<McpClientManager> {
+        &self.manager
+    }
+
+    /// The connected client id for this server, or an error when it is not connected.
+    async fn connected_client_id(&self) -> Result<String> {
+        self.manager
+            .find_client_id_by_server(&self.server)
+            .await
+            .ok_or_else(|| {
+                agentscope_core::error::Error::Other(format!(
+                    "MCP server '{}' is not connected; call initialize() first",
+                    self.server
+                ))
+            })
+    }
+}
+
+/// Converts a harness-discovered [`McpToolInfo`] into an MCP schema [`Tool`].
+///
+/// [`Tool`]: rust_mcp_sdk::schema::Tool
+fn mcp_tool_info_to_schema_tool(info: &McpToolInfo) -> rust_mcp_sdk::schema::Tool {
+    rust_mcp_sdk::schema::Tool {
+        name: info.name.clone(),
+        title: None,
+        description: info.description.clone(),
+        input_schema: build_tool_input_schema(&info.parameters),
+        output_schema: None,
+        annotations: None,
+        meta: None,
+        execution: None,
+        icons: Vec::new(),
+    }
+}
+
+/// Builds an MCP [`ToolInputSchema`] from a raw JSON schema value.
+///
+/// `rust-mcp-schema` models the input schema as a closed struct (`type: "object"` +
+/// `properties` + `required`), so keys such as `$schema` or `additionalProperties` have no
+/// representation; `properties`/`required` are preserved and each property keeps its raw
+/// schema object. This is the same projection the Higress adapter applies.
+///
+/// [`ToolInputSchema`]: rust_mcp_sdk::schema::ToolInputSchema
+fn build_tool_input_schema(schema: &serde_json::Value) -> rust_mcp_sdk::schema::ToolInputSchema {
+    let Some(object) = schema.as_object() else {
+        return rust_mcp_sdk::schema::ToolInputSchema::new(Vec::new(), None, None);
+    };
+    let properties = object
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p| {
+            p.iter()
+                .filter_map(|(k, v)| v.as_object().map(|m| (k.clone(), m.clone())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
+    let required = object
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    rust_mcp_sdk::schema::ToolInputSchema::new(required, properties, None)
+}
+
+#[async_trait::async_trait]
+impl McpToolSource for McpClientSource {
+    fn name(&self) -> &str {
+        &self.server
+    }
+
+    async fn initialize(&self) -> Result<()> {
+        if self.manager.find_client_id_by_server(&self.server).await.is_some() {
+            return Ok(());
+        }
+        let client_id = self
+            .manager
+            .find_any_client_id_by_server(&self.server)
+            .await
+            .ok_or_else(|| {
+                agentscope_core::error::Error::Other(format!(
+                    "No MCP client configured for server '{}'",
+                    self.server
+                ))
+            })?;
+        self.manager.connect(&client_id).await
+    }
+
+    async fn list_tools(&self) -> Result<Vec<rust_mcp_sdk::schema::Tool>> {
+        let client_id = self.connected_client_id().await?;
+        Ok(self
+            .manager
+            .list_tools(&client_id)
+            .await?
+            .iter()
+            .map(mcp_tool_info_to_schema_tool)
+            .collect())
+    }
+
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        meta: Option<agentscope_core::message::JsonMap>,
+    ) -> Result<rust_mcp_sdk::schema::CallToolResult> {
+        let client_id = self.connected_client_id().await?;
+        let value = self
+            .manager
+            .call_tool_with_meta(&client_id, tool_name, arguments, meta)
+            .await?;
+        serde_json::from_value(value).map_err(|e| {
+            agentscope_core::error::Error::Other(format!(
+                "MCP tool '{tool_name}' returned an unparseable result: {e}"
+            ))
+        })
+    }
+}

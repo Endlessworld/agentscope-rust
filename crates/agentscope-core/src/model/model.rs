@@ -6,6 +6,7 @@ use crate::message::Msg;
 use super::chat_response::ChatResponse;
 use super::generate_options::GenerateOptions;
 use super::tool_schema::ToolSchema;
+use super::tool_search_mode::ToolSearchMode;
 
 /// A language model that can stream chat completions.
 #[async_trait::async_trait]
@@ -20,6 +21,26 @@ pub trait Model: Send + Sync {
 
     /// The model name, for logging and identification.
     fn model_name(&self) -> &str;
+
+    /// The provider family this model belongs to (`"openai"`, `"anthropic"`, …), for
+    /// telemetry and diagnostics.
+    ///
+    /// Defaults to `"unknown"` so a custom model never has to invent an identity; providers
+    /// that know their family override it. Mirrors the Java `Model#getProviderName()`
+    /// contract used by the tracer's `gen_ai.provider.name` attribute.
+    fn provider_name(&self) -> &str {
+        "unknown"
+    }
+
+    /// How this provider receives tools discovered by a client-side `tool_search`.
+    ///
+    /// Defaults to [`ToolSearchMode::Function`] — ordinary function calling, which every
+    /// provider understands. Providers with a native discovery protocol (Anthropic deferred
+    /// definitions, OpenAI Responses client search) override it. Mirrors Java
+    /// `Model#getToolSearchMode()`.
+    fn tool_search_mode(&self) -> ToolSearchMode {
+        ToolSearchMode::Function
+    }
 
     /// Whether this model supports native structured output.
     fn supports_native_structured_output(&self) -> bool {

@@ -55,8 +55,10 @@ impl Middleware for SandboxLifecycleMiddleware {
             };
             let stream = next(input);
             let events: Vec<_> = stream.collect().await;
-            if let Some(res) = &acquired {
-                manager.persist_state(res, &sctx, Some(&rt)).await;
+            if let Some(res) = acquired {
+                manager.persist_state(&res, &sctx, Some(&rt)).await;
+                // By value: `release` owns the result so it can close a self-managed
+                // sandbox (stop + shutdown) instead of only releasing the lease.
                 manager.release(res).await;
             }
             events

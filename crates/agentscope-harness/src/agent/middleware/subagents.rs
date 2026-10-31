@@ -32,7 +32,7 @@ Subagents are ephemeral — they live only for the duration of the task and retu
 
 **`%s`** — Spawn an isolated subagent
 - `agent` (required): which subagent to instantiate
-- `prompt` (required): the task prompt for the subagent
+- `prompt` (required): the task prompt for the subagent. For coding tasks, also include the `<编码指南>` section from your own system prompt (the coding guidelines, verbatim) so the subagent follows the same rules
 - `label` (optional): human-readable name for referencing via send
 - `task_id` (optional): explicit task id for the background run
 - The call returns immediately with `agent_key:` (opaque handle), `session_id:` and `task_id:` — the run itself is always in the background

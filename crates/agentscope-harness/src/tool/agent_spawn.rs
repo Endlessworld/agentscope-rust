@@ -248,7 +248,7 @@ impl Tool for AgentSpawnTool {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "Subagent name to spawn"},
-                "prompt": {"type": "string", "description": "Task prompt for the subagent"},
+                "prompt": {"type": "string", "description": "Task prompt for the subagent. For coding tasks, also include the `<编码指南>` section from your own system prompt (the coding guidelines, verbatim) so the subagent follows the same rules"},
                 "label": {"type": "string", "description": "Optional human-readable name for addressing this subagent via agent_send"},
                 "task_id": {"type": "string", "description": "Optional explicit task id for the background run"}
             },

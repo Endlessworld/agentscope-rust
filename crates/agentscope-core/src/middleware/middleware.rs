@@ -69,6 +69,22 @@ pub trait Middleware: Send + Sync {
         next(input)
     }
 
+    /// Rewrites the structured-output (`response_format`) request right before the model call
+    /// it belongs to.
+    ///
+    /// A transformer (no `next` delegation), like [`Middleware::on_pre_call`]: the middleware
+    /// sees the format the caller requested — `None` when the call is unconstrained — and may
+    /// replace it, clear it, or leave it untouched. It runs once per reasoning step, before
+    /// the request is built, so a rewrite reaches the provider. This is the framework-level
+    /// `format` interception point a tracer wraps (`Tracer.callFormat`): telemetry records the
+    /// format request/response here instead of depending on the host to call its wrapper.
+    async fn on_format(
+        &self,
+        _ctx: &RuntimeContext,
+        _format: &mut Option<crate::formatter::ResponseFormat>,
+    ) {
+    }
+
     /// Transforms the request-scoped system prompt (pipeline pattern).
     ///
     /// Runs once per call, after `on_agent` has supplied any request-scoped system
@@ -141,6 +157,9 @@ pub enum ExtensionPoint {
     OnReasoningResult,
     OnActing,
     OnModelCall,
+    /// `Middleware::on_format` — the structured-output request (Java `Tracer.callFormat`'s
+    /// framework-level interception point).
+    OnFormat,
     OnSystemPrompt,
     OnPreCall,
     OnAgentStateReady,
@@ -148,12 +167,13 @@ pub enum ExtensionPoint {
 
 impl ExtensionPoint {
     /// Every extension point, in declaration order.
-    pub const ALL: [ExtensionPoint; 8] = [
+    pub const ALL: [ExtensionPoint; 9] = [
         ExtensionPoint::OnAgent,
         ExtensionPoint::OnReasoning,
         ExtensionPoint::OnReasoningResult,
         ExtensionPoint::OnActing,
         ExtensionPoint::OnModelCall,
+        ExtensionPoint::OnFormat,
         ExtensionPoint::OnSystemPrompt,
         ExtensionPoint::OnPreCall,
         ExtensionPoint::OnAgentStateReady,
@@ -268,6 +288,21 @@ impl MiddlewareChain {
     pub async fn notify_reasoning_result(&self, ctx: &RuntimeContext, message: &Msg) {
         for mw in self.participants(ExtensionPoint::OnReasoningResult) {
             mw.on_reasoning_result(ctx, message).await;
+        }
+    }
+
+    /// Applies the chain's format transformers in order, skipping middlewares that do not
+    /// participate in `OnFormat`.
+    ///
+    /// Called by the reasoning phase immediately before the model request is built, so a
+    /// rewrite lands in the provider call it belongs to.
+    pub async fn apply_format(
+        &self,
+        ctx: &RuntimeContext,
+        format: &mut Option<crate::formatter::ResponseFormat>,
+    ) {
+        for mw in self.participants(ExtensionPoint::OnFormat) {
+            mw.on_format(ctx, format).await;
         }
     }
 
@@ -440,5 +475,86 @@ mod tests {
         // Only the participating middleware is invoked.
         assert_eq!(*seen.lock().unwrap(), vec!["step one".to_string()]);
         assert_eq!(chain.len(), 2);
+    }
+
+    /// Rewrites the format request, recording the value it was handed.
+    struct FormatRewriter {
+        order: i32,
+        suffix: &'static str,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        participate: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Middleware for FormatRewriter {
+        fn order(&self) -> i32 {
+            self.order
+        }
+
+        async fn on_format(
+            &self,
+            _ctx: &RuntimeContext,
+            format: &mut Option<crate::formatter::ResponseFormat>,
+        ) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format.as_ref().map(|f| f.format_type.clone()));
+            if let Some(format) = format {
+                format.format_type = format!("{}{}", format.format_type, self.suffix);
+            }
+        }
+
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            if self.participate {
+                vec![ExtensionPoint::OnFormat]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_format_rewrites_in_priority_order_for_participants_only() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(FormatRewriter {
+            order: 1,
+            suffix: "-inner",
+            seen: std::sync::Arc::clone(&seen),
+            participate: true,
+        }));
+        chain.add(Box::new(FormatRewriter {
+            order: 5,
+            suffix: "-outer",
+            seen: std::sync::Arc::clone(&seen),
+            participate: true,
+        }));
+        chain.add(Box::new(FormatRewriter {
+            order: 9,
+            suffix: "-skipped",
+            seen: std::sync::Arc::clone(&seen),
+            participate: false,
+        }));
+
+        let mut format = Some(crate::formatter::ResponseFormat {
+            format_type: "json_schema".to_string(),
+            json_schema: None,
+        });
+        chain
+            .apply_format(&RuntimeContext::new(), &mut format)
+            .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Some("json_schema".to_string()),
+                Some("json_schema-outer".to_string())
+            ]
+        );
+        assert_eq!(
+            format.expect("a format was supplied").format_type,
+            "json_schema-outer-inner"
+        );
     }
 }

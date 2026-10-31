@@ -1,8 +1,38 @@
 //! Integration tests for the core `model` and `formatter` modules.
 use agentscope_core::{
-    ChatResponse, ContentBlock, ExecutionConfig, GenerateOptions, JsonSchema, Msg, MsgRole,
-    ResponseFormat, TextBlock, ToolChoice, ToolSchema,
+    ChatResponse, ContentBlock, ExecutionConfig, GenerateOptions, JsonSchema, Model, Msg, MsgRole,
+    ResponseFormat, TextBlock, ToolChoice, ToolSchema, ToolSearchMode,
 };
+
+/// A model that implements only the mandatory surface, so the trait defaults are under test.
+struct DefaultsModel;
+
+#[async_trait::async_trait]
+impl Model for DefaultsModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::Result<ChatResponse>> {
+        Box::pin(futures::stream::empty())
+    }
+
+    fn model_name(&self) -> &str {
+        "defaults"
+    }
+}
+
+#[test]
+fn model_defaults_expose_unknown_provider_and_function_tool_search() {
+    // MODEL-12 / STUDIO-13: the two capabilities used to be provider-only inherent
+    // accessors, so a `dyn Model` could not be asked about them at all.
+    let model = DefaultsModel;
+    assert_eq!(model.provider_name(), "unknown");
+    assert_eq!(model.tool_search_mode(), ToolSearchMode::Function);
+    assert_eq!(ToolSearchMode::default(), ToolSearchMode::Function);
+    assert_eq!(ToolSearchMode::Deferred.as_str(), "DEFERRED");
+}
 
 #[test]
 fn tool_choice_specific_validation() {
