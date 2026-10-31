@@ -15,11 +15,18 @@
 //!
 //! ## Versioning / CAS
 //!
-//! Version semantics follow the harness [`AgentStateStore`] contract: "the store does not
-//! expose an explicit version API; implementations that support optimistic concurrency
-//! expose it out-of-band". Here [`RedisAgentStateStore::save_if_version`] and
-//! [`RedisAgentStateStore::get_versioned`] surface the Java `saveIfVersion` / `getVersioned`
-//! operations, which are built directly on the shared [`SAVE_SCRIPT`] CAS primitive.
+//! Version semantics follow the harness [`AgentStateStore`] contract
+//! (`expected == 0` = create-if-absent, `-1` = [`UNVERSIONED`] = unconditional). Here
+//! [`RedisAgentStateStore::save_if_version`] and
+//! [`RedisAgentStateStore::get_versioned`] surface the Java `saveIfVersion` /
+//! `getVersioned` operations, which are built directly on the shared [`SAVE_SCRIPT`] CAS
+//! primitive.
+//!
+//! The **fallible** [`AgentStateStore::try_get_versioned`] /
+//! [`AgentStateStore::try_save_if_version`] overrides are the error-preserving surface
+//! (Java throws a `RuntimeException`); the infallible trait methods are derived from them
+//! and only log before degrading, so a backend outage can no longer masquerade as "no
+//! state" without a trace (REDIS-05).
 
 use std::sync::Arc;
 
@@ -27,7 +34,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use agentscope_core::error::{Error, Result};
-use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore};
+use agentscope_core::state::{compute_hash, needs_full_rewrite, AgentStateStore, UNVERSIONED};
 
 pub mod adapter;
 pub mod connection;
@@ -300,25 +307,43 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
+    /// Whether the session has at least one tracked key.
+    ///
+    /// A single `SCARD` on the session index answers it, exactly like Java
+    /// `RedisAgentStateStore#exists` (`getSetSize(keysKey) > 0`); the previous shape issued
+    /// an `EXISTS` first and discarded its answer (REDIS-13). A backend failure is still
+    /// reported as `false` (the trait has no `Result` channel) but is now logged.
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        let Ok(layout) = self.resolve_key_layout(user_id, session_id) else {
-            return false;
-        };
-        let keys_key = layout.keys_key();
-        match self.client.key_exists(&keys_key).await {
-            Ok(true) => self
+        let probed = match self.resolve_key_layout(user_id, session_id) {
+            Ok(layout) => self
                 .client
-                .get_set_size(&keys_key)
+                .get_set_size(&layout.keys_key())
                 .await
-                .map(|n| n > 0)
-                .unwrap_or(false),
-            _ => false,
+                .map(|size| size > 0),
+            Err(e) => Err(e),
+        };
+        match probed {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "RedisAgentStateStore::exists failed for session {}/{}: {e}",
+                    key_layout::normalize_user(user_id),
+                    session_id
+                );
+                false
+            }
         }
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
         if let Err(e) = self.delete_inner(user_id, session_id).await {
-            tracing::error!("RedisAgentStateStore::delete failed: {e}");
+            // Java logs `Failed to delete session: user/session`; the failing slot must be
+            // identifiable from the log alone (REDIS-05).
+            tracing::error!(
+                "RedisAgentStateStore::delete failed for session {}/{}: {e}",
+                key_layout::normalize_user(user_id),
+                session_id
+            );
         }
     }
 
@@ -376,24 +401,60 @@ impl AgentStateStore for RedisAgentStateStore {
         true
     }
 
+    /// Infallible view of [`RedisAgentStateStore::get_versioned`].
+    ///
+    /// Derived from [`AgentStateStore::try_get_versioned`], so both surfaces share one
+    /// implementation. A backend failure collapses to `version = `[`UNVERSIONED`], the same
+    /// value a non-versioning backend reports; callers that must not continue on a wrong
+    /// assumption call `try_get_versioned` instead (REDIS-05 / REDIS-11).
     async fn get_versioned(
         &self,
         user_id: Option<&str>,
         session_id: &str,
         key: &str,
     ) -> agentscope_core::state::VersionedState {
-        match RedisAgentStateStore::get_versioned(self, user_id, session_id, key).await {
-            Ok(v) => agentscope_core::state::VersionedState {
-                value: v.value,
-                version: i64::try_from(v.version).unwrap_or(i64::MAX),
-            },
-            Err(_) => agentscope_core::state::VersionedState {
-                value: None,
-                version: agentscope_core::state::UNVERSIONED,
-            },
+        match AgentStateStore::try_get_versioned(self, user_id, session_id, key).await {
+            Ok(versioned) => versioned,
+            Err(e) => {
+                tracing::error!(
+                    "RedisAgentStateStore::get_versioned failed for session {}/{} key {key}: {e}",
+                    key_layout::normalize_user(user_id),
+                    session_id
+                );
+                agentscope_core::state::VersionedState {
+                    value: None,
+                    version: UNVERSIONED,
+                }
+            }
         }
     }
 
+    /// Fallible read: reports a transport / decoding failure instead of the
+    /// "nothing stored" that [`AgentStateStore::get_versioned`] would return (REDIS-05).
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<agentscope_core::state::VersionedState> {
+        let versioned = RedisAgentStateStore::get_versioned(self, user_id, session_id, key).await?;
+        let version = i64::try_from(versioned.version).map_err(|_| {
+            Error::Other(format!(
+                "state version {} for key {key} exceeds i64::MAX",
+                versioned.version
+            ))
+        })?;
+        Ok(agentscope_core::state::VersionedState {
+            value: versioned.value,
+            version,
+        })
+    }
+
+    /// Infallible CAS write, derived from [`AgentStateStore::try_save_if_version`].
+    ///
+    /// `UNVERSIONED` means "another writer won **or** the write never landed"; Java throws
+    /// for the latter. Callers that must not lose an update call `try_save_if_version`
+    /// (REDIS-05 / REDIS-11).
     async fn save_if_version(
         &self,
         user_id: Option<&str>,
@@ -402,26 +463,63 @@ impl AgentStateStore for RedisAgentStateStore {
         value: Value,
         expected_version: i64,
     ) -> i64 {
-        // Core contract: `UNVERSIONED` (-1) is the unconditional sentinel and `0` is a real
-        // CAS version meaning "create if absent". The u64-backed implementation uses
-        // `UNCONDITIONAL_EXPECTED` (u64::MAX) for the former, so the sentinels never collide.
-        // Successful writes always bump to >= 1, so `Ok(0)` unambiguously means "conflict".
-        let expected = if expected_version == agentscope_core::state::UNVERSIONED {
-            UNCONDITIONAL_EXPECTED
-        } else if expected_version < 0 {
-            return agentscope_core::state::UNVERSIONED;
-        } else {
-            expected_version as u64
-        };
-        match RedisAgentStateStore::save_if_version(
-            self, user_id, session_id, key, &value, expected,
+        match AgentStateStore::try_save_if_version(
+            self,
+            user_id,
+            session_id,
+            key,
+            value,
+            expected_version,
         )
         .await
         {
-            Ok(0) => agentscope_core::state::UNVERSIONED,
-            Ok(v) => i64::try_from(v).unwrap_or(i64::MAX),
-            Err(_) => agentscope_core::state::UNVERSIONED,
+            Ok(version) => version,
+            Err(e) => {
+                tracing::error!(
+                    "RedisAgentStateStore::save_if_version failed for session {}/{} key {key} (expected {expected_version}): {e}",
+                    key_layout::normalize_user(user_id),
+                    session_id
+                );
+                UNVERSIONED
+            }
         }
+    }
+
+    /// Fallible CAS write: `Ok(UNVERSIONED)` is a real conflict, `Err` means the write
+    /// never landed (REDIS-05).
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+        expected_version: i64,
+    ) -> Result<i64> {
+        // Core contract: `UNVERSIONED` (-1) is the unconditional sentinel and `0` is a real
+        // CAS version meaning "create if absent". The u64-backed implementation uses
+        // `UNCONDITIONAL_EXPECTED` (u64::MAX) for the former, so the sentinels never collide.
+        // Successful writes always bump to >= 1, so an inherent `Ok(0)` is unambiguously a
+        // conflict, which core spells `UNVERSIONED`.
+        let expected = if expected_version == UNVERSIONED {
+            UNCONDITIONAL_EXPECTED
+        } else if expected_version < 0 {
+            return Err(Error::Other(format!(
+                "invalid expected_version {expected_version} for key {key}: must be >= 0 or UNVERSIONED ({UNVERSIONED})"
+            )));
+        } else {
+            expected_version as u64
+        };
+        let written =
+            RedisAgentStateStore::save_if_version(self, user_id, session_id, key, &value, expected)
+                .await?;
+        if written == 0 {
+            return Ok(UNVERSIONED);
+        }
+        i64::try_from(written).map_err(|_| {
+            Error::Other(format!(
+                "state version {written} for key {key} exceeds i64::MAX"
+            ))
+        })
     }
 }
 
@@ -970,6 +1068,22 @@ mod tests {
         assert!(!store.exists(Some("u1"), "  ").await, "blank session");
     }
 
+    /// REDIS-13: Java answers `exists` with a single `getSetSize(keysKey)`; the Rust path
+    /// used to issue `EXISTS` first and throw that answer away.
+    #[tokio::test]
+    async fn exists_costs_one_round_trip() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+
+        assert!(store.exists(Some("u1"), "s1").await);
+        assert_eq!(adapter.set_size_calls(), 1, "one SCARD answers it");
+        assert_eq!(adapter.key_exists_calls(), 0, "no EXISTS round trip");
+
+        assert!(!store.exists(Some("u1"), "empty").await);
+        assert_eq!(adapter.set_size_calls(), 2);
+        assert_eq!(adapter.key_exists_calls(), 0);
+    }
+
     #[tokio::test]
     async fn delete_removes_payload_version_and_tracking() {
         let (store, adapter) = store();
@@ -1387,6 +1501,138 @@ mod tests {
             .unwrap();
         assert_eq!(result, 0, "conflict is signalled as version 0");
         assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(1)));
+    }
+
+    // ---- core `try_*` surface (REDIS-05 / REDIS-11) -----------------------
+
+    #[tokio::test]
+    async fn try_get_versioned_returns_payload_and_version() {
+        let (store, _adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        store.save(Some("u1"), "s1", "k", json!(2)).await;
+
+        let versioned = AgentStateStore::try_get_versioned(&store, Some("u1"), "s1", "k")
+            .await
+            .expect("reachable backend");
+        assert_eq!(versioned.value, Some(json!(2)));
+        assert_eq!(versioned.version, 2);
+
+        let absent = AgentStateStore::try_get_versioned(&store, Some("u1"), "s1", "missing")
+            .await
+            .expect("a missing key is not an error");
+        assert_eq!(absent.value, None);
+        assert_eq!(absent.version, 0, "create-if-absent version");
+    }
+
+    /// REDIS-05: a backend failure must reach the caller instead of reading as "no state".
+    /// The infallible surface keeps its old `Option`-shaped contract but now logs and
+    /// reports [`UNVERSIONED`] (REDIS-11).
+    #[tokio::test]
+    async fn try_get_versioned_surfaces_a_backend_failure() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        adapter.configure(|d| d.fail_get = true);
+
+        let error = AgentStateStore::try_get_versioned(&store, Some("u1"), "s1", "k")
+            .await
+            .expect_err("a transport failure must not look like a missing key");
+        assert!(
+            format!("{error}").contains("injected Redis GET failure"),
+            "{error}"
+        );
+
+        let degraded = AgentStateStore::get_versioned(&store, Some("u1"), "s1", "k").await;
+        assert_eq!(degraded.value, None);
+        assert_eq!(degraded.version, UNVERSIONED);
+    }
+
+    #[tokio::test]
+    async fn try_save_if_version_writes_and_bumps_the_version() {
+        let (store, _adapter) = store();
+        assert_eq!(
+            AgentStateStore::try_save_if_version(&store, Some("u1"), "s1", "k", json!(1), 0)
+                .await
+                .unwrap(),
+            1,
+            "0 == create-if-absent"
+        );
+        assert_eq!(
+            AgentStateStore::try_save_if_version(&store, Some("u1"), "s1", "k", json!(2), 1)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            AgentStateStore::try_save_if_version(
+                &store,
+                Some("u1"),
+                "s1",
+                "k",
+                json!(3),
+                UNVERSIONED
+            )
+            .await
+            .unwrap(),
+            3,
+            "UNVERSIONED == unconditional"
+        );
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, Some(json!(3)));
+    }
+
+    /// REDIS-05: "another writer won" (`Ok(UNVERSIONED)`) must be distinguishable from
+    /// "the write never landed" (`Err`). The infallible surface flattens both to
+    /// [`UNVERSIONED`].
+    #[tokio::test]
+    async fn try_save_if_version_separates_conflict_from_transport_failure() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await; // version 1
+
+        let conflict =
+            AgentStateStore::try_save_if_version(&store, Some("u1"), "s1", "k", json!(2), 7)
+                .await
+                .expect("a conflict is not a transport error");
+        assert_eq!(conflict, UNVERSIONED);
+
+        adapter.configure(|d| d.fail_eval = true);
+        let error =
+            AgentStateStore::try_save_if_version(&store, Some("u1"), "s1", "k", json!(3), 1)
+                .await
+                .expect_err("a failed write must not look like a conflict");
+        assert!(
+            format!("{error}").contains("injected Redis EVAL failure"),
+            "{error}"
+        );
+        assert_eq!(
+            AgentStateStore::save_if_version(&store, Some("u1"), "s1", "k", json!(3), 1).await,
+            UNVERSIONED,
+            "the infallible surface still degrades"
+        );
+
+        adapter.configure(|d| d.fail_eval = false);
+        assert_eq!(
+            store.get(Some("u1"), "s1", "k").await,
+            Some(json!(1)),
+            "the failed write left the stored state alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_save_if_version_rejects_a_negative_expected_version() {
+        let (store, adapter) = store();
+        let error =
+            AgentStateStore::try_save_if_version(&store, Some("u1"), "s1", "k", json!(1), -5)
+                .await
+                .expect_err("only UNVERSIONED may be negative");
+        assert!(
+            format!("{error}").contains("invalid expected_version -5"),
+            "{error}"
+        );
+        assert_eq!(adapter.eval_calls(), 0, "rejected before any Redis write");
+        assert_eq!(
+            AgentStateStore::save_if_version(&store, Some("u1"), "s1", "k", json!(1), -5).await,
+            UNVERSIONED
+        );
+        assert_eq!(store.get(Some("u1"), "s1", "k").await, None);
     }
 
     // ---- session enumeration ---------------------------------------------

@@ -64,6 +64,12 @@ pub(crate) struct MemoryRedisData {
     pub fail_set_bytes: bool,
     pub fail_expire: bool,
     pub fail_release_script: bool,
+    /// `exists` on the raw command surface returns a transport error.
+    pub fail_exists: bool,
+    /// `get` returns a transport error (read-path failure injection).
+    pub fail_get: bool,
+    /// `eval_script` returns a transport error (CAS script path failure injection).
+    pub fail_eval: bool,
     // --- call counters -----------------------------------------------------
     pub adapter_eval_calls: usize,
     pub adapter_delete_calls: usize,
@@ -71,6 +77,8 @@ pub(crate) struct MemoryRedisData {
     pub adapter_deleted_key_total: usize,
     pub adapter_max_delete_batch: usize,
     pub adapter_push_calls: usize,
+    pub adapter_key_exists_calls: usize,
+    pub adapter_set_size_calls: usize,
     pub raw_eval_calls: usize,
     pub store_eval_calls: usize,
     pub set_nx_calls: usize,
@@ -183,6 +191,11 @@ impl MemoryRedisAdapter {
         self.data.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Mutates the shared state (error toggles / call counters) for failure injection.
+    pub fn configure(&self, f: impl FnOnce(&mut MemoryRedisData)) {
+        f(&mut self.data_guard());
+    }
+
     fn sets_guard(&self) -> MutexGuard<'_, HashMap<String, HashSet<String>>> {
         self.sets.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -212,6 +225,16 @@ impl MemoryRedisAdapter {
     /// Number of individual `right_push_list` calls.
     pub fn push_calls(&self) -> usize {
         self.data_guard().adapter_push_calls
+    }
+
+    /// Number of `key_exists` (`EXISTS`) invocations.
+    pub fn key_exists_calls(&self) -> usize {
+        self.data_guard().adapter_key_exists_calls
+    }
+
+    /// Number of `get_set_size` (`SCARD`) invocations.
+    pub fn set_size_calls(&self) -> usize {
+        self.data_guard().adapter_set_size_calls
     }
 
     /// Raw string value of a key (e.g. the `:_hash` change-detection marker).
@@ -341,6 +364,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn get(&self, key: &str) -> Result<Option<String>> {
+        if self.data_guard().fail_get {
+            return Err(Error::Other("injected Redis GET failure".to_string()));
+        }
         Ok(self.data_guard().string_of(key))
     }
 
@@ -415,6 +441,7 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn get_set_size(&self, key: &str) -> Result<i64> {
+        self.data_guard().adapter_set_size_calls += 1;
         Ok(self
             .sets_guard()
             .get(key)
@@ -423,6 +450,7 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn key_exists(&self, key: &str) -> Result<bool> {
+        self.data_guard().adapter_key_exists_calls += 1;
         if self.data_guard().strings.contains_key(key) {
             return Ok(true);
         }
@@ -444,6 +472,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
         keys: &[String],
         args: &[String],
     ) -> Result<Option<i64>> {
+        if self.data_guard().fail_eval {
+            return Err(Error::Other("injected Redis EVAL failure".to_string()));
+        }
         let is_discard = script == crate::state::DISCARD_TRACKED_KEY_SCRIPT;
         if is_discard && keys.len() == 1 && args.len() == 1 {
             let mut sets = self.sets_guard();
@@ -521,6 +552,10 @@ impl MemoryRedisCommands {
     pub fn release_eval_calls(&self) -> usize {
         self.inspect(|d| d.raw_eval_calls)
     }
+
+    pub fn exists_calls(&self) -> usize {
+        self.inspect(|d| d.exists_calls)
+    }
 }
 
 #[async_trait::async_trait]
@@ -542,6 +577,9 @@ impl RedisCommands for MemoryRedisCommands {
     async fn exists(&self, key: &str) -> Result<bool> {
         let mut data = self.guard();
         data.exists_calls += 1;
+        if data.fail_exists {
+            return Err(Error::Other("injected EXISTS failure".to_string()));
+        }
         Ok(data.strings.contains_key(key))
     }
 

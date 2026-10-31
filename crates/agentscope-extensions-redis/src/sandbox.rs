@@ -28,6 +28,13 @@
 //!
 //! All Redis access goes through the crate-internal [`RedisCommands`] seam, so the whole
 //! acquire / compete / release lifecycle is covered by offline tests.
+//!
+//! ## Not re-entrant
+//!
+//! Unlike the harness in-process `SandboxExecutionGuard`, a Redis lease is **not**
+//! re-entrant: `SET NX` fails while the key exists, so a second `try_enter` for a key held by
+//! the same or another caller keeps spinning until the lease is released or its TTL expires
+//! (Java behaves the same way). Nested callers must reuse the one [`RedisSandboxLease`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -189,9 +196,19 @@ impl RedisSandboxExecutionGuard {
     }
 
     /// Whether the given key is currently held (by anyone).
+    ///
+    /// Diagnostics only, and deliberately not fail-open: a Redis error must not read as
+    /// "the slot is free", so it is logged at `warn` before reporting `false` (the harness
+    /// trait method is synchronous and cannot return `Result`).
     pub async fn is_held(&self, key: &SandboxIsolationKey) -> bool {
         let redis_key = self.compose_key(key);
-        self.commands.exists(&redis_key).await.unwrap_or(false)
+        match self.commands.exists(&redis_key).await {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::warn!("[sandbox-guard] failed to probe Redis lease {redis_key}: {e}");
+                false
+            }
+        }
     }
 }
 
@@ -202,17 +219,22 @@ impl SandboxGuard for RedisSandboxExecutionGuard {
     /// The loop sleeps with `tokio::time::sleep` between attempts, so it must be driven by
     /// an async runtime (it used to be wrapped in `futures::executor::block_on`, which spun
     /// or deadlocked when the acquisition ran inside a Tokio task).
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+    ///
+    /// **Fail-closed** (REDIS-06): when Redis rejects the `SET NX PX` (connection lost,
+    /// AUTH failure, wrong type) the error is returned and the caller aborts. It used to be
+    /// logged and downgraded to [`SandboxLease::noop`], which let the sandbox run without
+    /// the cross-process exclusion the guard exists to provide.
+    async fn try_enter(&self, key: SandboxIsolationKey) -> Result<SandboxLease> {
         match RedisSandboxExecutionGuard::try_enter(self, &key).await {
             Ok(lease) => {
                 if let Ok(mut leases) = self.trait_leases.lock() {
                     leases.entry(key.clone()).or_default().push(lease);
                 }
-                SandboxLease::new(key)
+                Ok(SandboxLease::new(key))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "[sandbox-guard] failed to acquire Redis lease");
-                SandboxLease::noop()
+                tracing::error!(error = %e, "[sandbox-guard] failed to acquire Redis lease");
+                Err(e)
             }
         }
     }
@@ -647,7 +669,9 @@ mod tests {
             .build();
         let key = SandboxIsolationKey::new("session", "trait");
 
-        let lease = SandboxGuard::try_enter(&guard, key.clone()).await;
+        let lease = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("trait acquisition succeeds");
         assert!(!lease.is_noop(), "lease acquired through the trait");
         assert!(SandboxGuard::is_held(&guard, &key));
         assert_eq!(SandboxGuard::active_count(&guard), 1);
@@ -681,7 +705,8 @@ mod tests {
             SandboxGuard::try_enter(&guard, key.clone()),
         )
         .await
-        .expect("trait acquisition must not deadlock the runtime");
+        .expect("trait acquisition must not deadlock the runtime")
+        .expect("trait acquisition succeeds");
         assert!(!lease.is_noop());
         assert_eq!(commands.set_nx_calls(), 1, "uncontended: one SET NX");
 
@@ -693,5 +718,140 @@ mod tests {
         .expect("trait release must not deadlock the runtime");
         assert!(!guard.is_held(&key).await);
         assert!(commands.stored_bytes("lock:session:awaitable").is_none());
+    }
+
+    /// REDIS-06 (fail-closed): when the lock store rejects the acquisition, the **trait**
+    /// surface must return the error. It used to log and downgrade to
+    /// [`SandboxLease::noop`], so the caller ran the sandbox with no cross-process
+    /// exclusion at all while reporting success.
+    #[tokio::test]
+    async fn trait_acquisition_failure_is_an_error_not_a_noop_lease() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
+            .key_prefix("lock:")
+            .retry_interval(Duration::from_millis(1))
+            .build();
+        commands.configure(|d| d.fail_set_nx = true);
+        let key = SandboxIsolationKey::new("session", "fail-closed");
+
+        let error = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect_err("a failed acquisition must not yield a lease");
+        assert!(
+            format!("{error}").contains("Redis sandbox guard SET NX failed"),
+            "{error}"
+        );
+        assert_eq!(
+            SandboxGuard::active_count(&guard),
+            0,
+            "no lease may be retained after a failed acquisition"
+        );
+        assert!(!guard.is_held(&key).await);
+        assert!(
+            commands.stored_bytes("lock:session:fail-closed").is_none(),
+            "a rejected SET NX must not leave a lock key behind"
+        );
+    }
+
+    /// REDIS-06: the failure is not sticky — once the lock store answers again the same
+    /// guard acquires normally, so fail-closed never turns into fail-forever.
+    #[tokio::test]
+    async fn trait_acquisition_recovers_after_a_failed_attempt() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
+            .key_prefix("lock:")
+            .retry_interval(Duration::from_millis(1))
+            .build();
+        let key = SandboxIsolationKey::new("session", "recover");
+
+        commands.configure(|d| d.fail_set_nx = true);
+        SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect_err("lock store is down");
+        assert_eq!(SandboxGuard::active_count(&guard), 0);
+
+        commands.configure(|d| d.fail_set_nx = false);
+        let lease = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("the guard must recover once the lock store answers");
+        assert!(!lease.is_noop());
+        assert_eq!(SandboxGuard::active_count(&guard), 1);
+        assert!(guard.is_held(&key).await);
+
+        SandboxGuard::release(&guard, &key).await;
+        assert_eq!(SandboxGuard::active_count(&guard), 0);
+        assert!(commands.stored_bytes("lock:session:recover").is_none());
+    }
+
+    /// REDIS-06: each held slot is tracked independently, so releasing one never frees the
+    /// other's Redis key (the harness reports `active_count` per acquired lease).
+    #[tokio::test]
+    async fn trait_leases_are_tracked_per_key() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
+            .key_prefix("lock:")
+            .retry_interval(Duration::from_millis(1))
+            .build();
+        let first = SandboxIsolationKey::new("session", "one");
+        let second = SandboxIsolationKey::new("session", "two");
+
+        SandboxGuard::try_enter(&guard, first.clone())
+            .await
+            .expect("first slot");
+        SandboxGuard::try_enter(&guard, second.clone())
+            .await
+            .expect("second slot");
+        assert_eq!(SandboxGuard::active_count(&guard), 2);
+
+        SandboxGuard::release(&guard, &first).await;
+        assert_eq!(SandboxGuard::active_count(&guard), 1);
+        assert!(
+            !guard.is_held(&first).await,
+            "the released slot is free again"
+        );
+        assert!(guard.is_held(&second).await, "the other slot is untouched");
+
+        SandboxGuard::release(&guard, &second).await;
+        assert_eq!(SandboxGuard::active_count(&guard), 0);
+        assert!(commands.stored_bytes("lock:session:two").is_none());
+    }
+
+    /// REDIS-06: a held slot is not handed out twice — the second acquisition spins on
+    /// `SET NX` until the lease is released (same as Java `tryEnter`).
+    #[tokio::test]
+    async fn a_held_lease_is_not_reentrant() {
+        let (guard, _commands) = guard("lock:", Duration::from_millis(5));
+        let key = SandboxIsolationKey::new("session", "no-reentry");
+        let lease = guard.try_enter(&key).await.unwrap();
+
+        let second = tokio::time::timeout(Duration::from_millis(50), guard.try_enter(&key)).await;
+        assert!(second.is_err(), "a held key must not be handed out twice");
+
+        lease.release().await;
+        let again = guard
+            .try_enter(&key)
+            .await
+            .expect("released slot is acquirable again");
+        again.release().await;
+    }
+
+    /// REDIS-06: `is_held` must not report "free" silently when the probe itself fails;
+    /// the result is still `false` (synchronous harness contract) but the failure is logged
+    /// instead of being swallowed by `unwrap_or(false)`.
+    #[tokio::test]
+    async fn is_held_logs_a_failed_probe_instead_of_swallowing_it() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
+            .key_prefix("lock:")
+            .build();
+        let key = SandboxIsolationKey::new("session", "probe");
+        assert!(guard.try_enter(&key).await.is_ok());
+
+        commands.configure(|d| d.fail_exists = true);
+        assert!(!guard.is_held(&key).await);
+        assert_eq!(commands.exists_calls(), 1, "one probe, no retry storm");
+
+        commands.configure(|d| d.fail_exists = false);
+        assert!(guard.is_held(&key).await);
     }
 }
