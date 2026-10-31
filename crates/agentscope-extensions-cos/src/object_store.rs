@@ -14,6 +14,7 @@
 //! [`CosObjectStore::delete_many`] exposes batch deletion (Java `deleteObjects`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -40,6 +41,29 @@ impl ObjectListPage {
     pub fn is_truncated(&self) -> bool {
         self.next_continuation_token.is_some()
     }
+}
+
+/// An object read together with the entity tag the service assigned to it.
+///
+/// The entity tag is what makes [`CosObjectStore::put_if_match`] an atomic
+/// compare-and-swap: COS rejects the write with `412` when the stored object no
+/// longer carries that tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtaggedObject {
+    /// Entity tag (`ETag`) as returned by the service, quotes included when the
+    /// service sends them (COS does: `"5d41402a..."`).
+    pub etag: String,
+    /// Raw object bytes.
+    pub data: Vec<u8>,
+}
+
+/// Outcome of a conditional write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalWrite {
+    /// The precondition held and the object was written.
+    Written,
+    /// The precondition failed (`412 Precondition Failed`); nothing was written.
+    Conflict,
 }
 
 /// Minimal async object-store surface required by the COS components.
@@ -119,7 +143,53 @@ pub trait CosObjectStore: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Reads an object together with its entity tag; `None` when it is absent.
+    ///
+    /// Needed by optimistic concurrency (see [`CosObjectStore::put_if_match`]). The
+    /// default implementation reports that the backend cannot supply entity tags, so
+    /// a caller never mistakes a synthetic tag for a real precondition.
+    async fn get_etagged(&self, key: &str) -> Result<Option<EtaggedObject>> {
+        let _ = key;
+        Err(CosError::Config(
+            "this object store backend does not expose entity tags".to_string(),
+        ))
+    }
+
+    /// Writes `data` only if the stored object still carries `etag`.
+    ///
+    /// A missing object or a different tag yields [`ConditionalWrite::Conflict`]
+    /// rather than an error. Unsupported by default, like
+    /// [`CosObjectStore::get_etagged`].
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<ConditionalWrite> {
+        let _ = (key, data, etag);
+        Err(CosError::Config(
+            "this object store backend does not support conditional writes".to_string(),
+        ))
+    }
+
+    /// Writes `data` only if the object does not exist yet.
+    ///
+    /// Unsupported by default, like [`CosObjectStore::get_etagged`].
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<ConditionalWrite> {
+        let _ = (key, data);
+        Err(CosError::Config(
+            "this object store backend does not support conditional writes".to_string(),
+        ))
+    }
+
+    /// Whether this backend can serve [`CosObjectStore::get_etagged`] and honour
+    /// [`CosObjectStore::put_if_match`] / [`CosObjectStore::put_if_absent`].
+    ///
+    /// Default `false`: a backend that only implements plain reads/writes must not let
+    /// the state store advertise CAS versioning, because its preconditions could not
+    /// be enforced. Backends that do support them (in-memory, COS over HTTP) override
+    /// this to `true`.
+    fn supports_conditional_writes(&self) -> bool {
+        false
+    }
+
     /// Deletes several objects, treating missing keys as no-ops.
+
     ///
     /// Mirrors Java's `deleteObjects` batch call. The default implementation issues
     /// one [`Self::delete`] per key; [`crate::CosHttpObjectStore`] issues the real
@@ -156,10 +226,18 @@ pub trait CosObjectStore: Send + Sync + std::fmt::Debug {
 pub type SharedObjectStore = Arc<dyn CosObjectStore>;
 
 /// Thread-safe, process-local [`CosObjectStore`] used for testing and local
-/// development. Keys are kept sorted so list results are deterministic.
+/// development. Keys are kept sorted so list results are deterministic, and every
+/// write mints an entity tag so conditional writes behave like COS.
 #[derive(Debug, Default)]
 pub struct InMemoryCosObjectStore {
-    objects: RwLock<BTreeMap<String, Vec<u8>>>,
+    objects: RwLock<BTreeMap<String, InMemoryObject>>,
+    next_etag: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct InMemoryObject {
+    data: Vec<u8>,
+    etag: String,
 }
 
 impl InMemoryCosObjectStore {
@@ -171,20 +249,81 @@ impl InMemoryCosObjectStore {
     pub fn shared(self) -> SharedObjectStore {
         Arc::new(self)
     }
+
+    fn next_tag(&self) -> u64 {
+        self.next_etag.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Inserts `data` under `key` with a freshly minted entity tag and returns it.
+    fn store_locked(
+        objects: &mut BTreeMap<String, InMemoryObject>,
+        key: &str,
+        data: &[u8],
+        tag: u64,
+    ) -> String {
+        let etag = format!("\"{tag}\"");
+        objects.insert(
+            key.to_string(),
+            InMemoryObject {
+                data: data.to_vec(),
+                etag: etag.clone(),
+            },
+        );
+        etag
+    }
 }
 
 #[async_trait]
 impl CosObjectStore for InMemoryCosObjectStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.objects.read().await.get(key).cloned())
+        Ok(self
+            .objects
+            .read()
+            .await
+            .get(key)
+            .map(|object| object.data.clone()))
     }
 
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.objects
-            .write()
-            .await
-            .insert(key.to_string(), data.to_vec());
+        let mut objects = self.objects.write().await;
+        Self::store_locked(&mut objects, key, data, self.next_tag());
         Ok(())
+    }
+
+    async fn get_etagged(&self, key: &str) -> Result<Option<EtaggedObject>> {
+        Ok(self
+            .objects
+            .read()
+            .await
+            .get(key)
+            .map(|object| EtaggedObject {
+                etag: object.etag.clone(),
+                data: object.data.clone(),
+            }))
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<ConditionalWrite> {
+        let mut objects = self.objects.write().await;
+        match objects.get(key) {
+            Some(current) if current.etag == etag => {
+                Self::store_locked(&mut objects, key, data, self.next_tag());
+                Ok(ConditionalWrite::Written)
+            }
+            _ => Ok(ConditionalWrite::Conflict),
+        }
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<ConditionalWrite> {
+        let mut objects = self.objects.write().await;
+        if objects.contains_key(key) {
+            return Ok(ConditionalWrite::Conflict);
+        }
+        Self::store_locked(&mut objects, key, data, self.next_tag());
+        Ok(ConditionalWrite::Written)
+    }
+
+    fn supports_conditional_writes(&self) -> bool {
+        true
     }
 
     async fn delete(&self, key: &str) -> Result<()> {

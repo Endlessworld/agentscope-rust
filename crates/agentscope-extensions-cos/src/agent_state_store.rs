@@ -13,11 +13,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite};
-use agentscope_core::state::AgentStateStore;
+use agentscope_core::state::{AgentStateStore, VersionedState, UNVERSIONED};
 use async_trait::async_trait;
 
-use crate::layout::{session_prefix, DEFAULT_STATE_PREFIX, HASH_SUFFIX, JSON_SUFFIX, LIST_SUFFIX};
-use crate::object_store::SharedObjectStore;
+use crate::layout::{
+    session_prefix, DEFAULT_STATE_PREFIX, HASH_SUFFIX, JSON_SUFFIX, LIST_SUFFIX, VERSION_SUFFIX,
+};
+use crate::object_store::{ConditionalWrite, SharedObjectStore};
 use crate::{CosError, Result};
 
 /// Marker type indicating the concrete `CosAgentStateStore` implementation.
@@ -89,6 +91,59 @@ impl CosAgentStateStore {
             session_prefix(&self.key_prefix, user, session)?
         ))
     }
+
+    /// Key of the version counter used by [`AgentStateStore::save_if_version`].
+    ///
+    /// Same `{key}.version` side object as the base store; COS has no per-object
+    /// version field, and keeping the counter out of the state JSON preserves the
+    /// Java-compatible payload layout.
+    fn version_key(&self, user: Option<&str>, session: &str, key: &str) -> Result<String> {
+        Ok(format!(
+            "{}{key}{VERSION_SUFFIX}",
+            session_prefix(&self.key_prefix, user, session)?
+        ))
+    }
+
+    /// Parses a stored version counter.
+    ///
+    /// A malformed or negative counter is a real error: reporting it as `0` would
+    /// turn a corrupt object into a spurious "create-if-absent" CAS.
+    fn parse_version(version_key: &str, content: &str) -> Result<i64> {
+        let text = content.trim();
+        let version = text.parse::<i64>().map_err(|e| {
+            CosError::Serialization(format!(
+                "version object {version_key} is not an integer: {e}"
+            ))
+        })?;
+        if version < 0 {
+            return Err(CosError::Serialization(format!(
+                "version object {version_key} is negative ({version})"
+            )));
+        }
+        Ok(version)
+    }
+
+    /// Reads the version counter of `version_key`; `None` means "never written".
+    async fn read_version(&self, version_key: &str) -> Result<Option<i64>> {
+        let Some(content) = self.object_store.get_string(version_key).await? else {
+            return Ok(None);
+        };
+        Self::parse_version(version_key, &content).map(Some)
+    }
+
+    /// Best-effort unconditional counter increment used by [`AgentStateStore::save`].
+    ///
+    /// `save` keeps last-writer-wins semantics, but it must still advance the
+    /// counter: otherwise a plain write followed by a CAS at the stale version would
+    /// silently overwrite it.
+    async fn bump_version(&self, version_key: &str) -> Result<i64> {
+        let current = self.read_version(version_key).await?.unwrap_or(0);
+        let next = current + 1;
+        self.object_store
+            .put_string(version_key, &next.to_string())
+            .await?;
+        Ok(next)
+    }
 }
 
 /// Builder for [`CosAgentStateStore`].
@@ -148,6 +203,16 @@ impl AgentStateStore for CosAgentStateStore {
         };
         if let Err(e) = self.object_store.put_string(&object_key, &json).await {
             tracing::error!(error = %e, "Failed to write COS object: {object_key}");
+            return;
+        }
+        // Keep the CAS counter in step with the value even on the unconditional path.
+        match self.version_key(user_id, session_id, key) {
+            Ok(version_key) => {
+                if let Err(e) = self.bump_version(&version_key).await {
+                    tracing::error!(error = %e, "Failed to bump COS state version: {version_key}");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "Failed to resolve version key: {key}"),
         }
     }
 
@@ -236,8 +301,11 @@ impl AgentStateStore for CosAgentStateStore {
             Ok(p) => p,
             Err(_) => return false,
         };
-        match self.object_store.list_prefix(&prefix).await {
-            Ok(keys) => !keys.is_empty(),
+        // One object is all that is needed, so ask for a single key instead of
+        // listing the whole session prefix (Java `CosAgentStateStore.exists` sets
+        // `maxKeys=1` for the same reason).
+        match self.object_store.list_page(&prefix, None, 1).await {
+            Ok(page) => !page.keys.is_empty(),
             Err(_) => false,
         }
     }
@@ -263,7 +331,9 @@ impl AgentStateStore for CosAgentStateStore {
     ) -> agentscope_core::error::Result<()> {
         // Java `CosAgentStateStore.delete(userId, sessionId, key)` removes the value plus its
         // list payload and incremental hash, so a later `saveList` cannot append onto a stale
-        // hash. All three objects go out in one batch (`deleteKeys`).
+        // hash. The Rust port also drops the CAS counter, otherwise a re-created key would
+        // keep the deleted key's version and a later `save_if_version(0)` could never
+        // succeed. All four objects go out in one batch (`deleteKeys`).
         let to_core = |e: CosError| {
             agentscope_core::error::Error::Other(format!("COS per-key delete failed: {e}"))
         };
@@ -271,9 +341,189 @@ impl AgentStateStore for CosAgentStateStore {
             self.state_key(user_id, session_id, key).map_err(to_core)?,
             self.list_key(user_id, session_id, key).map_err(to_core)?,
             self.hash_key(user_id, session_id, key).map_err(to_core)?,
+            self.version_key(user_id, session_id, key)
+                .map_err(to_core)?,
         ];
-        self.object_store.delete_many(&keys).await.map_err(to_core)?;
+        self.object_store
+            .delete_many(&keys)
+            .await
+            .map_err(to_core)?;
         Ok(())
+    }
+
+    fn supports_versioning(&self) -> bool {
+        // Only advertise CAS when the backend can actually enforce a precondition;
+        // otherwise callers degrade to last-writer-wins `save` instead of seeing every
+        // CAS fail.
+        self.object_store.supports_conditional_writes()
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> VersionedState {
+        match self.try_get_versioned(user_id, session_id, key).await {
+            Ok(state) => state,
+            Err(e) => {
+                // Infallible surface: log the failure, but never report
+                // `UNVERSIONED` here — that would let the next CAS overwrite blindly.
+                tracing::error!(error = %e, "Failed to read versioned state: {key}");
+                VersionedState {
+                    value: None,
+                    version: 0,
+                }
+            }
+        }
+    }
+
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<VersionedState> {
+        let to_core = |e: CosError| {
+            agentscope_core::error::Error::Other(format!("COS versioned read failed: {e}"))
+        };
+        let object_key = self.state_key(user_id, session_id, key).map_err(to_core)?;
+        let version_key = self
+            .version_key(user_id, session_id, key)
+            .map_err(to_core)?;
+
+        let value = match self
+            .object_store
+            .get_string(&object_key)
+            .await
+            .map_err(to_core)?
+        {
+            Some(json) => Some(
+                serde_json::from_str::<serde_json::Value>(&json).map_err(|e| {
+                    agentscope_core::error::Error::Other(format!(
+                        "COS state object {object_key} is not valid JSON: {e}"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        let version = self
+            .read_version(&version_key)
+            .await
+            .map_err(to_core)?
+            .unwrap_or(0);
+        Ok(VersionedState { value, version })
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> i64 {
+        match self
+            .try_save_if_version(user_id, session_id, key, value, expected_version)
+            .await
+        {
+            Ok(version) => version,
+            Err(e) => {
+                // Infallible contract: report the failure as "not written" (the same
+                // signal as a lost CAS) so the caller never assumes a successful write.
+                // `UNVERSIONED` here means "nothing was written", not "overwrite".
+                tracing::error!(error = %e, "Failed to write versioned state: {key}");
+                UNVERSIONED
+            }
+        }
+    }
+
+    /// Compare-and-swap on the `{key}.version` side object.
+    ///
+    /// The counter is claimed with a **conditional** PUT (`If-Match` against the
+    /// version object's ETag, `If-None-Match: *` when it does not exist yet), so two
+    /// processes racing on the same version cannot both win: COS answers `412` and
+    /// the loser gets [`UNVERSIONED`]. The value is written only after the counter is
+    /// claimed.
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> agentscope_core::error::Result<i64> {
+        let to_core = |e: CosError| {
+            agentscope_core::error::Error::Other(format!("COS versioned write failed: {e}"))
+        };
+        let object_key = self.state_key(user_id, session_id, key).map_err(to_core)?;
+        let version_key = self
+            .version_key(user_id, session_id, key)
+            .map_err(to_core)?;
+        let json = serde_json::to_string(&value).map_err(|e| {
+            to_core(CosError::Serialization(format!(
+                "failed to serialize state {key}: {e}"
+            )))
+        })?;
+
+        if expected_version == UNVERSIONED {
+            // Unconditional overwrite (`save` semantics) that still advances the
+            // counter so later CAS reads do not observe a stale version.
+            self.object_store
+                .put_string(&object_key, &json)
+                .await
+                .map_err(to_core)?;
+            return self.bump_version(&version_key).await.map_err(to_core);
+        }
+
+        let (current, etag) = match self
+            .object_store
+            .get_etagged(&version_key)
+            .await
+            .map_err(to_core)?
+        {
+            Some(object) => {
+                let text = String::from_utf8(object.data).map_err(|e| {
+                    to_core(CosError::Serialization(format!(
+                        "version object {version_key} is not UTF-8: {e}"
+                    )))
+                })?;
+                (
+                    Self::parse_version(&version_key, &text).map_err(to_core)?,
+                    Some(object.etag),
+                )
+            }
+            None => (0, None),
+        };
+        if current != expected_version {
+            return Ok(UNVERSIONED);
+        }
+
+        let next = current + 1;
+        let counter = next.to_string();
+        let claimed = match etag.as_deref() {
+            Some(etag) => {
+                self.object_store
+                    .put_if_match(&version_key, counter.as_bytes(), etag)
+                    .await
+            }
+            None => {
+                self.object_store
+                    .put_if_absent(&version_key, counter.as_bytes())
+                    .await
+            }
+        }
+        .map_err(to_core)?;
+        if claimed == ConditionalWrite::Conflict {
+            // Another writer claimed this version between our read and our write.
+            return Ok(UNVERSIONED);
+        }
+
+        self.object_store
+            .put_string(&object_key, &json)
+            .await
+            .map_err(to_core)?;
+        Ok(next)
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
@@ -611,17 +861,20 @@ mod tests {
             keys,
             vec![
                 "agentscope/state/__anon__/s2/k.json".to_string(),
+                "agentscope/state/__anon__/s2/k.version".to_string(),
                 "agentscope/state/u1/s1/items.list.hash".to_string(),
                 "agentscope/state/u1/s1/items.list.json".to_string(),
                 "agentscope/state/u1/s1/k.json".to_string(),
+                "agentscope/state/u1/s1/k.version".to_string(),
             ]
         );
     }
 
     /// Java `delete(userId, sessionId, key)` removes the value plus its list payload and
-    /// incremental hash, leaving every other key of the session intact.
+    /// incremental hash, leaving every other key of the session intact. The Rust port also
+    /// drops the CAS counter so a re-created key starts over at version 0.
     #[tokio::test]
-    async fn delete_key_removes_value_list_and_hash_only() {
+    async fn delete_key_removes_value_list_hash_and_version() {
         let backend = InMemoryCosObjectStore::new().shared();
         let s = CosAgentStateStore::builder()
             .object_store(backend.clone())
@@ -638,13 +891,367 @@ mod tests {
 
         let mut keys = backend.list_prefix("").await.unwrap();
         keys.sort();
-        assert_eq!(keys, vec!["agentscope/state/u1/s1/other.json".to_string()]);
+        assert_eq!(
+            keys,
+            vec![
+                "agentscope/state/u1/s1/other.json".to_string(),
+                "agentscope/state/u1/s1/other.version".to_string(),
+            ]
+        );
         assert_eq!(s.get(Some("u1"), "s1", "k").await, None);
         assert!(s.get_list(Some("u1"), "s1", "k").await.is_empty());
         assert_eq!(
             s.get(Some("u1"), "s1", "other").await,
             Some(serde_json::json!(2))
         );
+    }
+
+    /// `save` stays last-writer-wins but must still advance the counter, otherwise a
+    /// CAS at the stale version could overwrite it silently.
+    #[tokio::test]
+    async fn save_advances_the_version_counter() {
+        let s = store();
+        let fresh = s.get_versioned(Some("u1"), "s1", "k").await;
+        assert_eq!(fresh.version, 0);
+        assert!(fresh.value.is_none());
+
+        s.save(Some("u1"), "s1", "k", serde_json::json!({"n": 1}))
+            .await;
+        let first = s.get_versioned(Some("u1"), "s1", "k").await;
+        assert_eq!(first.version, 1);
+        assert_eq!(first.value, Some(serde_json::json!({"n": 1})));
+
+        s.save(Some("u1"), "s1", "k", serde_json::json!({"n": 2}))
+            .await;
+        assert_eq!(s.get_versioned(Some("u1"), "s1", "k").await.version, 2);
+    }
+
+    /// Expected version `0` creates; a second CAS at `0` must report the conflict and
+    /// leave the stored value untouched.
+    #[tokio::test]
+    async fn save_if_version_creates_then_reports_the_lost_race() {
+        let s = store();
+        let created = s
+            .save_if_version(Some("u1"), "s1", "k", serde_json::json!({"v": 1}), 0)
+            .await;
+        assert_eq!(created, 1);
+        assert_eq!(
+            s.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!({"v": 1}))
+        );
+
+        let conflicted = s
+            .save_if_version(Some("u1"), "s1", "k", serde_json::json!({"v": 2}), 0)
+            .await;
+        assert_eq!(conflicted, UNVERSIONED);
+        assert_eq!(
+            s.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!({"v": 1})),
+            "a lost CAS must not write"
+        );
+
+        let advanced = s
+            .save_if_version(Some("u1"), "s1", "k", serde_json::json!({"v": 2}), 1)
+            .await;
+        assert_eq!(advanced, 2);
+        assert_eq!(
+            s.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!({"v": 2}))
+        );
+    }
+
+    /// Two writers that both read version 1: the first CAS wins, the second one's
+    /// `If-Match` no longer matches the version object, so it must conflict instead of
+    /// overwriting the winner's value.
+    #[tokio::test]
+    async fn stale_etag_cas_conflicts_instead_of_overwriting() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let a = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+        let b = CosAgentStateStore::builder()
+            .object_store(backend)
+            .build()
+            .unwrap();
+
+        a.save(Some("u1"), "s1", "k", serde_json::json!({"writer": "seed"}))
+            .await;
+        let seen_by_a = a.try_get_versioned(Some("u1"), "s1", "k").await.unwrap();
+        let seen_by_b = b.try_get_versioned(Some("u1"), "s1", "k").await.unwrap();
+        assert_eq!(seen_by_a.version, 1);
+        assert_eq!(seen_by_b.version, 1);
+
+        let won = b
+            .try_save_if_version(
+                Some("u1"),
+                "s1",
+                "k",
+                serde_json::json!({"writer": "b"}),
+                seen_by_b.version,
+            )
+            .await
+            .unwrap();
+        assert_eq!(won, 2);
+
+        let lost = a
+            .try_save_if_version(
+                Some("u1"),
+                "s1",
+                "k",
+                serde_json::json!({"writer": "a"}),
+                seen_by_a.version,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lost, UNVERSIONED);
+        assert_eq!(
+            a.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!({"writer": "b"}))
+        );
+        assert_eq!(a.get_versioned(Some("u1"), "s1", "k").await.version, 2);
+    }
+
+    /// Backend wrapper that serves a **stale** view of one version object: the body and
+    /// entity tag captured *before* a concurrent commit, i.e. exactly what a writer that
+    /// read early would hold. All other calls are forwarded, including the conditional
+    /// writes, so the real backend still enforces the precondition.
+    #[derive(Debug)]
+    struct StaleViewStore {
+        inner: SharedObjectStore,
+        stale_key: String,
+        stale: crate::object_store::EtaggedObject,
+    }
+
+    #[async_trait]
+    impl crate::CosObjectStore for StaleViewStore {
+        async fn get(&self, key: &str) -> crate::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, data: &[u8]) -> crate::Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn delete(&self, key: &str) -> crate::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn exists(&self, key: &str) -> crate::Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn len(&self) -> usize {
+            self.inner.len().await
+        }
+        async fn list_prefix(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+        async fn get_etagged(
+            &self,
+            key: &str,
+        ) -> crate::Result<Option<crate::object_store::EtaggedObject>> {
+            if key == self.stale_key {
+                return Ok(Some(self.stale.clone()));
+            }
+            self.inner.get_etagged(key).await
+        }
+        async fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            etag: &str,
+        ) -> crate::Result<crate::object_store::ConditionalWrite> {
+            self.inner.put_if_match(key, data, etag).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            data: &[u8],
+        ) -> crate::Result<crate::object_store::ConditionalWrite> {
+            self.inner.put_if_absent(key, data).await
+        }
+        fn supports_conditional_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A writer whose *read* predates a concurrent commit still sees the old version
+    /// number, so the version comparison alone would let it write. Only the `If-Match`
+    /// precondition (old entity tag) can stop it — this is what makes the CAS atomic
+    /// across processes rather than merely "check then write".
+    #[tokio::test]
+    async fn stale_etag_conflicts_even_when_the_version_numbers_agree() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let writer_b = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        writer_b
+            .save(Some("u1"), "s1", "k", serde_json::json!({"writer": "seed"}))
+            .await;
+
+        // Writer A only ever sees the version-1 view it read before B committed.
+        let stale_key = writer_b.version_key(Some("u1"), "s1", "k").unwrap();
+        let stale = backend.get_etagged(&stale_key).await.unwrap().unwrap();
+        assert_eq!(stale.data, b"1");
+        let writer_a = CosAgentStateStore::builder()
+            .object_store(Arc::new(StaleViewStore {
+                inner: backend.clone(),
+                stale_key,
+                stale,
+            }))
+            .build()
+            .unwrap();
+
+        // B commits version 2.
+        assert_eq!(
+            writer_b
+                .try_save_if_version(Some("u1"), "s1", "k", serde_json::json!({"writer": "b"}), 1)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // A also believes version 1, so the version check passes — the stale `If-Match`
+        // is the only thing left, and it must reject the write.
+        assert_eq!(
+            writer_a
+                .try_save_if_version(Some("u1"), "s1", "k", serde_json::json!({"writer": "a"}), 1)
+                .await
+                .unwrap(),
+            UNVERSIONED
+        );
+        assert_eq!(
+            writer_b.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!({"writer": "b"}))
+        );
+        assert_eq!(
+            writer_b.get_versioned(Some("u1"), "s1", "k").await.version,
+            2
+        );
+    }
+
+    /// `UNVERSIONED` means "overwrite unconditionally", and the counter must still move
+    /// forward so a later CAS cannot resurrect the old version.
+    #[tokio::test]
+    async fn unconditional_cas_overwrites_and_bumps_the_version() {
+        let s = store();
+        s.save(Some("u1"), "s1", "k", serde_json::json!({"v": 1}))
+            .await;
+        let overwritten = s
+            .try_save_if_version(
+                Some("u1"),
+                "s1",
+                "k",
+                serde_json::json!({"v": 2}),
+                UNVERSIONED,
+            )
+            .await
+            .unwrap();
+        assert_eq!(overwritten, 2);
+        assert_eq!(
+            s.get(Some("u1"), "s1", "k").await,
+            Some(serde_json::json!({"v": 2}))
+        );
+    }
+
+    /// Deleting a key drops its counter too, so a re-created key starts at version 0.
+    #[tokio::test]
+    async fn delete_key_resets_the_version_counter() {
+        let s = store();
+        s.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        assert_eq!(s.get_versioned(Some("u1"), "s1", "k").await.version, 1);
+
+        s.delete_key(Some("u1"), "s1", "k").await.unwrap();
+
+        let after = s.try_get_versioned(Some("u1"), "s1", "k").await.unwrap();
+        assert!(after.value.is_none());
+        assert_eq!(after.version, 0);
+        assert_eq!(
+            s.save_if_version(Some("u1"), "s1", "k", serde_json::json!(2), 0)
+                .await,
+            1
+        );
+    }
+
+    /// A corrupt payload or counter is reported as an error by the fallible surface, and
+    /// the infallible `get_versioned` must report version `0` — never `UNVERSIONED`,
+    /// which would let the next CAS overwrite blindly.
+    #[tokio::test]
+    async fn corrupt_objects_surface_as_errors() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        let state_key = s.state_key(Some("u1"), "s1", "k").unwrap();
+        backend.put_string(&state_key, "{not json").await.unwrap();
+        let err = s
+            .try_get_versioned(Some("u1"), "s1", "k")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "got: {err}");
+        let fallback = s.get_versioned(Some("u1"), "s1", "k").await;
+        assert!(fallback.value.is_none());
+        assert_eq!(fallback.version, 0, "the fallback must not be UNVERSIONED");
+
+        let version_key = s.version_key(Some("u1"), "s1", "k").unwrap();
+        // Restore a valid payload so the counter is what fails next.
+        backend.put_string(&state_key, "1").await.unwrap();
+        backend
+            .put_string(&version_key, "not-a-number")
+            .await
+            .unwrap();
+        let err = s
+            .try_get_versioned(Some("u1"), "s1", "k")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not an integer"), "got: {err}");
+        let err = s
+            .try_save_if_version(Some("u1"), "s1", "k", serde_json::json!(1), 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not an integer"), "got: {err}");
+    }
+
+    /// Backend failures reach the caller through the fallible surface instead of being
+    /// folded into "nothing stored".
+    #[tokio::test]
+    async fn backend_failures_are_not_swallowed() {
+        #[derive(Debug)]
+        struct FailingStore;
+
+        #[async_trait]
+        impl crate::CosObjectStore for FailingStore {
+            async fn get(&self, _key: &str) -> crate::Result<Option<Vec<u8>>> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn put(&self, _key: &str, _data: &[u8]) -> crate::Result<()> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn delete(&self, _key: &str) -> crate::Result<()> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn exists(&self, _key: &str) -> crate::Result<bool> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn list_prefix(&self, _prefix: &str) -> crate::Result<Vec<String>> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+        }
+
+        let s = CosAgentStateStore::builder()
+            .object_store(Arc::new(FailingStore))
+            .build()
+            .unwrap();
+        // A backend without conditional-write support must not advertise versioning.
+        assert!(!s.supports_versioning());
+
+        let err = s
+            .try_get_versioned(Some("u1"), "s1", "k")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("boom"), "got: {err}");
+        assert_eq!(s.get(Some("u1"), "s1", "k").await, None);
     }
 
     /// Blank / `/`-only / backslash / leading-slash prefixes all normalize the Java

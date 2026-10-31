@@ -68,7 +68,9 @@ use quick_xml::Reader;
 use reqwest::{Method, Response, StatusCode};
 
 use crate::multipart::{self, MultipartPlan};
-use crate::object_store::{CosObjectStore, ObjectListPage, DEFAULT_LIST_PAGE_SIZE};
+use crate::object_store::{
+    ConditionalWrite, CosObjectStore, EtaggedObject, ObjectListPage, DEFAULT_LIST_PAGE_SIZE,
+};
 use crate::presign;
 use crate::signature::{self, CosCredentials};
 use crate::{CosError, Result};
@@ -838,6 +840,29 @@ impl CosHttpObjectStore {
         Ok(())
     }
 
+    /// One conditional `PUT`: the extra header (`if-match` / `if-none-match`) is
+    /// signed and sent, and `412 Precondition Failed` maps to
+    /// [`ConditionalWrite::Conflict`] instead of an error.
+    async fn conditional_put(
+        &self,
+        key: &str,
+        data: &[u8],
+        condition: (&str, &str),
+    ) -> Result<ConditionalWrite> {
+        let headers = vec![
+            ("content-type".to_string(), PUT_CONTENT_TYPE.to_string()),
+            (condition.0.to_string(), condition.1.to_string()),
+        ];
+        let response = self
+            .send(Method::PUT, Some(key), &[], Some(data.to_vec()), &headers)
+            .await?;
+        match response.status().as_u16() {
+            200..=299 => Ok(ConditionalWrite::Written),
+            412 => Ok(ConditionalWrite::Conflict),
+            _ => Err(error_from_response(response).await),
+        }
+    }
+
     /// Headers that are signed: `host`, the session token when present, and the
     /// operation-specific extras (`content-type`, `content-md5`).
     fn signed_headers(&self, extra: &[(String, String)]) -> Vec<(String, String)> {
@@ -1074,6 +1099,42 @@ impl CosObjectStore for CosHttpObjectStore {
             .await?;
         ensure_success(response).await?;
         Ok(())
+    }
+
+    async fn get_etagged(&self, key: &str) -> Result<Option<EtaggedObject>> {
+        let response = self.send(Method::GET, Some(key), &[], None, &[]).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = ensure_success(response).await?;
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CosError::Backend(format!("COS GET {key} returned no ETag header")))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CosError::Backend(format!("failed to read COS response body: {e}")))?;
+        Ok(Some(EtaggedObject {
+            etag,
+            data: bytes.to_vec(),
+        }))
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<ConditionalWrite> {
+        self.conditional_put(key, data, ("if-match", etag)).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<ConditionalWrite> {
+        self.conditional_put(key, data, ("if-none-match", "*"))
+            .await
+    }
+
+    fn supports_conditional_writes(&self) -> bool {
+        true
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -1360,6 +1421,7 @@ mod tests {
     //! query parameters, signed header list and `Authorization` value.
 
     use super::*;
+    use agentscope_core::state::AgentStateStore;
     use httpmock::prelude::*;
     use std::sync::atomic::AtomicUsize;
 
@@ -1614,6 +1676,178 @@ mod tests {
         assert!(!store.exists("gone").await.unwrap());
         yes.assert_async().await;
         no.assert_async().await;
+    }
+
+    /// `get_etagged` hands back the service `ETag` alongside the body; it is what the
+    /// state store feeds into `If-Match`.
+    #[tokio::test]
+    async fn get_etagged_returns_the_service_etag() {
+        let server = MockServer::start_async().await;
+        let store = store_for(&server);
+
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/versioned.txt");
+                then.status(200)
+                    .header("ETag", "\"5d41402abc4b2a76b9719d911017c592\"")
+                    .body("hello");
+            })
+            .await;
+
+        let object = store.get_etagged("versioned.txt").await.unwrap().unwrap();
+        assert_eq!(object.data, b"hello");
+        assert_eq!(object.etag, "\"5d41402abc4b2a76b9719d911017c592\"");
+        mock.assert_async().await;
+
+        let missing = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/absent.txt");
+                then.status(404)
+                    .body("<Error><Code>NoSuchKey</Code></Error>");
+            })
+            .await;
+        assert!(store.get_etagged("absent.txt").await.unwrap().is_none());
+        missing.assert_async().await;
+    }
+
+    /// A response without `ETag` cannot be used as a precondition, so it is reported
+    /// instead of being silently treated as "unversioned".
+    #[tokio::test]
+    async fn get_etagged_requires_an_etag_header() {
+        let server = MockServer::start_async().await;
+        let store = store_for(&server);
+
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/no-etag.txt");
+                then.status(200).body("hello");
+            })
+            .await;
+
+        let err = store.get_etagged("no-etag.txt").await.unwrap_err();
+        assert!(err.to_string().contains("no ETag"), "got: {err}");
+    }
+
+    /// `put_if_match` signs and sends `If-Match`, maps `412` to a conflict and a `2xx`
+    /// to a write.
+    #[tokio::test]
+    async fn put_if_match_signs_the_condition_and_maps_412_to_conflict() {
+        let server = MockServer::start_async().await;
+        let store = store_for(&server);
+        let key = "agentscope/state/u1/s1/k.version";
+        let extra = [
+            ("content-type", PUT_CONTENT_TYPE),
+            ("if-match", "\"etag-1\""),
+        ];
+        let auth = expected_authorization(&store, "PUT", Some(key), &[], &extra);
+        assert!(
+            auth.contains("q-header-list=content-type;host;if-match"),
+            "the conditional header must be part of the signature: {auth}"
+        );
+
+        let conflicting = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/agentscope/state/u1/s1/k.version")
+                    .header("if-match", "\"etag-1\"")
+                    .header("authorization", auth.as_str())
+                    .body("2");
+                then.status(412)
+                    .body("<Error><Code>PreconditionFailed</Code></Error>");
+            })
+            .await;
+
+        assert_eq!(
+            store.put_if_match(key, b"2", "\"etag-1\"").await.unwrap(),
+            ConditionalWrite::Conflict
+        );
+        conflicting.assert_hits_async(1).await;
+
+        let written = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/agentscope/state/u1/s1/k.version")
+                    .header("if-match", "\"etag-2\"")
+                    .body("3");
+                then.status(200);
+            })
+            .await;
+        assert_eq!(
+            store.put_if_match(key, b"3", "\"etag-2\"").await.unwrap(),
+            ConditionalWrite::Written
+        );
+        written.assert_hits_async(1).await;
+    }
+
+    /// Create-if-absent uses `If-None-Match: *`; a `412` means somebody created the
+    /// object first.
+    #[tokio::test]
+    async fn put_if_absent_sends_if_none_match_star() {
+        let server = MockServer::start_async().await;
+        let store = store_for(&server);
+        let key = "agentscope/state/u1/s1/k.version";
+
+        let created = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/agentscope/state/u1/s1/k.version")
+                    .header("if-none-match", "*")
+                    .body("1");
+                then.status(200);
+            })
+            .await;
+        assert_eq!(
+            store.put_if_absent(key, b"1").await.unwrap(),
+            ConditionalWrite::Written
+        );
+        created.assert_hits_async(1).await;
+
+        let raced = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/agentscope/state/u1/s1/k.version")
+                    .header("if-none-match", "*")
+                    .body("2");
+                then.status(412);
+            })
+            .await;
+        assert_eq!(
+            store.put_if_absent(key, b"2").await.unwrap(),
+            ConditionalWrite::Conflict
+        );
+        raced.assert_hits_async(1).await;
+    }
+
+    /// `CosAgentStateStore::exists` asks COS for exactly one key instead of listing the
+    /// whole session prefix (Java sets `maxKeys=1`).
+    #[tokio::test]
+    async fn state_store_exists_asks_for_a_single_key() {
+        let server = MockServer::start_async().await;
+        let store = store_for(&server);
+        let state_store = crate::CosAgentStateStore::builder()
+            .object_store(Arc::new(store))
+            .build()
+            .unwrap();
+
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/")
+                    .query_param("list-type", "2")
+                    .query_param("max-keys", "1")
+                    .query_param("prefix", "agentscope/state/u1/s1/");
+                then.status(200).body(
+                    "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                     <Contents><Key>agentscope/state/u1/s1/k.json</Key></Contents>\
+                     <NextContinuationToken>next</NextContinuationToken>\
+                     </ListBucketResult>",
+                );
+            })
+            .await;
+
+        assert!(state_store.exists(Some("u1"), "s1").await);
+        // A single request, and no follow-up page even though the listing is truncated.
+        mock.assert_hits_async(1).await;
     }
 
     #[tokio::test]
@@ -2673,9 +2907,8 @@ mod tests {
         let mock = server
             .mock_async(|when, then| {
                 when.method(GET).path("/always-503");
-                then.status(503).body(
-                    "<Error><Code>ServiceUnavailable</Code><Message>later</Message></Error>",
-                );
+                then.status(503)
+                    .body("<Error><Code>ServiceUnavailable</Code><Message>later</Message></Error>");
             })
             .await;
 

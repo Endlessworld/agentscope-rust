@@ -89,8 +89,14 @@ impl CosSandboxExecutionGuard {
 
 #[async_trait::async_trait]
 impl SandboxGuard for CosSandboxExecutionGuard {
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
-        CosSandboxExecutionGuard::try_enter(self, key)
+    /// Delegates to the in-process harness guard, which cannot fail: it only bumps a local
+    /// re-entrant counter. COS has no server-side lock primitive, so there is no acquisition
+    /// to lose and `Ok(lease)` is truthful rather than a swallowed failure.
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
+        Ok(CosSandboxExecutionGuard::try_enter(self, key))
     }
 
     async fn release(&self, key: &SandboxIsolationKey) {

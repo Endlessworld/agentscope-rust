@@ -68,8 +68,8 @@ pub use multipart::{
     MIN_MULTIPART_PART_SIZE,
 };
 pub use object_store::{
-    CosObjectStore, InMemoryCosObjectStore, ObjectListPage, SharedObjectStore,
-    DEFAULT_LIST_PAGE_SIZE,
+    ConditionalWrite, CosObjectStore, EtaggedObject, InMemoryCosObjectStore, ObjectListPage,
+    SharedObjectStore, DEFAULT_LIST_PAGE_SIZE,
 };
 pub use presign::MAX_PRESIGN_EXPIRE_SECS;
 pub use signature::{CosCredentials, CosSignature};
