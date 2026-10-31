@@ -7,8 +7,9 @@
 //! core [`Toolkit`](agentscope_core::tool::Toolkit) (including its fluent
 //! `ToolRegistration`); this crate adds only what core has no equivalent for:
 //!
-//! * a narrow [`McpToolSource`] port so *any* MCP client can be registered while
-//!   only Higress clients are cached (Java `instanceof HigressMcpClientWrapper`),
+//! * a [`McpToolSource`] port (the harness one, shared with the other extension
+//!   crates) so *any* MCP client can be registered, while only Higress clients
+//!   are cached (Java `instanceof HigressMcpClientWrapper`),
 //! * `enableTools` / `disableTools` filtering and `toolNamePrefix` renaming
 //!   (core `ToolRegistration` has neither),
 //! * per-registration metadata propagation, reusing the harness
@@ -27,48 +28,31 @@ use serde_json::Value;
 
 use crate::client::HigressMcpClientWrapper;
 
-/// A source of MCP tools that a [`HigressToolkit`] can register.
+/// The MCP tool-source port a [`HigressToolkit`] registers, **re-exported from**
+/// the harness (HIGRESS-07).
 ///
 /// Mirrors Java's `McpClientWrapper` base class: `Toolkit.registerMcpClient` is
-/// declared against the base type, so any MCP client can be registered, and only
-/// Higress clients are cached for later access. Rust has no client base class, so
-/// this narrow port stands in for it. Production code uses the implementation for
-/// [`HigressMcpClientWrapper`]; tests and hosts may supply their own.
-#[async_trait]
-pub trait McpToolSource: Send + Sync {
-    /// The unique client name (Java `McpClientWrapper.getName()`).
-    fn name(&self) -> &str;
+/// declared against the base type, so any MCP client can be registered. The
+/// port now lives in `agentscope_harness::agent` and is shared by every
+/// extension crate; the harness also ships [`McpClientSource`], an adapter for
+/// one server on an [`McpClientManager`].
+///
+/// Only Higress clients are cached for later access (Java
+/// `mcpClientWrapper instanceof HigressMcpClientWrapper`). The shared port has
+/// no `Any` supertrait to downcast through, so the equivalent is an explicit
+/// typed entry point: [`HigressToolkit::register_higress_client`] /
+/// [`McpClientRegistration::higress_client`].
+///
+/// [`McpClientSource`]: agentscope_harness::agent::McpClientSource
+/// [`McpClientManager`]: agentscope_harness::agent::McpClientManager
+pub use agentscope_harness::agent::McpToolSource;
 
-    /// Establishes the connection, if not already established.
-    ///
-    /// Java `Toolkit.registerMcpClient` calls `initialize()` before listing
-    /// tools, and so does [`McpClientRegistration::apply`].
-    async fn initialize(&self) -> Result<()>;
-
-    /// Lists the tools this client exposes.
-    async fn list_tools(&self) -> Result<Vec<McpSchemaTool>>;
-
-    /// Invokes a tool, propagating `meta` as MCP request metadata.
-    ///
-    /// `meta` must be forwarded untouched: `None` means "send no `_meta`".
-    async fn call_tool(
-        &self,
-        tool_name: &str,
-        arguments: Value,
-        meta: Option<JsonMap>,
-    ) -> Result<CallToolResult>;
-
-    /// Returns this source as a Higress client when it is one.
-    ///
-    /// This is the Rust equivalent of Java's
-    /// `mcpClientWrapper instanceof HigressMcpClientWrapper` check, which decides
-    /// whether the client is cached. The default is `None`, i.e. "not a Higress
-    /// client".
-    fn as_higress(self: Arc<Self>) -> Option<Arc<HigressMcpClientWrapper>> {
-        None
-    }
-}
-
+/// [`McpToolSource`] implementation for the Higress wrapper.
+///
+/// Delegates to the wrapper's own methods, which is what
+/// [`McpClientRegistration::apply`] drives; Higress-specific behaviour (tool
+/// search, caching, connection-level metadata switch) therefore stays in the
+/// wrapper instead of leaking into the shared port.
 #[async_trait]
 impl McpToolSource for HigressMcpClientWrapper {
     fn name(&self) -> &str {
@@ -90,10 +74,6 @@ impl McpToolSource for HigressMcpClientWrapper {
         meta: Option<JsonMap>,
     ) -> Result<CallToolResult> {
         HigressMcpClientWrapper::call_tool_with_meta(self, tool_name, arguments, meta).await
-    }
-
-    fn as_higress(self: Arc<Self>) -> Option<Arc<HigressMcpClientWrapper>> {
-        Some(self)
     }
 }
 
@@ -164,16 +144,27 @@ impl HigressToolkit {
         McpClientRegistration::new(self)
     }
 
-    /// Registers an MCP client with the toolkit using default options.
+    /// Registers any MCP client with the toolkit using default options.
     ///
-    /// Any [`McpToolSource`] is accepted; when the client is a
-    /// [`HigressMcpClientWrapper`] it is additionally cached for later access via
+    /// Nothing is cached: the shared [`McpToolSource`] port carries no `Any`
+    /// supertrait, so Java's `instanceof HigressMcpClientWrapper` cannot be
+    /// expressed here. Use
+    /// [`register_higress_client`](Self::register_higress_client) to register a
+    /// [`HigressMcpClientWrapper`] and make it retrievable through
     /// [`get_higress_mcp_client`](Self::get_higress_mcp_client).
+    pub async fn register_mcp_client(&self, mcp_client: Arc<dyn McpToolSource>) -> Result<usize> {
+        self.registration().mcp_client(mcp_client).apply().await
+    }
+
+    /// Registers a Higress client and caches it once registration succeeded.
     ///
     /// Mirrors the Java `registerMcpClient` override (which caches only after
     /// `super.registerMcpClient(...)` succeeds).
-    pub async fn register_mcp_client(&self, mcp_client: Arc<dyn McpToolSource>) -> Result<usize> {
-        self.registration().mcp_client(mcp_client).apply().await
+    pub async fn register_higress_client(
+        &self,
+        client: Arc<HigressMcpClientWrapper>,
+    ) -> Result<usize> {
+        self.registration().higress_client(client).apply().await
     }
 
     /// Registers a tool directly (delegates to the core toolkit).
@@ -206,6 +197,9 @@ impl HigressToolkit {
 pub struct McpClientRegistration<'a> {
     toolkit: &'a HigressToolkit,
     client: Option<Arc<dyn McpToolSource>>,
+    /// Set by [`higress_client`](Self::higress_client): the typed handle cached
+    /// after a successful registration.
+    higress_client: Option<Arc<HigressMcpClientWrapper>>,
     enable_tools: Option<Vec<String>>,
     disable_tools: Option<Vec<String>>,
     group: Option<String>,
@@ -219,6 +213,7 @@ impl<'a> McpClientRegistration<'a> {
         Self {
             toolkit,
             client: None,
+            higress_client: None,
             enable_tools: None,
             disable_tools: None,
             group: None,
@@ -230,6 +225,18 @@ impl<'a> McpClientRegistration<'a> {
 
     /// Sets the MCP client to register.
     pub fn mcp_client(mut self, client: Arc<dyn McpToolSource>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Sets a Higress client to register and to cache after a successful
+    /// registration.
+    ///
+    /// The Rust equivalent of Java's `instanceof HigressMcpClientWrapper`
+    /// guard: the typed argument is what makes the caching decision, because the
+    /// shared [`McpToolSource`] port cannot be downcast.
+    pub fn higress_client(mut self, client: Arc<HigressMcpClientWrapper>) -> Self {
+        self.higress_client = Some(Arc::clone(&client));
         self.client = Some(client);
         self
     }
@@ -315,6 +322,7 @@ impl<'a> McpClientRegistration<'a> {
         let Self {
             toolkit,
             client,
+            higress_client,
             enable_tools,
             disable_tools,
             group,
@@ -421,8 +429,9 @@ impl<'a> McpClientRegistration<'a> {
         }
 
         // Java caches only Higress clients (`instanceof`), and only after a
-        // successful registration.
-        if let Some(higress) = Arc::clone(&client).as_higress() {
+        // successful registration. The shared port cannot be downcast, so the
+        // caller opts in through `higress_client(...)`.
+        if let Some(higress) = higress_client {
             *toolkit.higress_client.lock().unwrap() = Some(higress);
             tracing::info!(
                 "Higress MCP client '{}' registered successfully",
@@ -984,10 +993,36 @@ mod tests {
         let client = Arc::new(HigressMcpClientWrapper::with_transport(config, transport));
         let toolkit = HigressToolkit::new();
 
-        let registered = toolkit.register_mcp_client(client).await.unwrap();
+        let registered = toolkit.register_higress_client(client).await.unwrap();
 
         assert_eq!(registered, 1);
         let cached = toolkit.get_higress_mcp_client().unwrap();
         assert_eq!(cached.name(), "higress");
+    }
+
+    #[tokio::test]
+    async fn harness_mcp_client_source_uses_the_shared_port() {
+        use agentscope_harness::agent::{McpClientManager, McpClientSource, McpServerConfig};
+
+        // HIGRESS-07: the adapter the harness ships for one managed server is a
+        // first-class source here, so a host no longer needs a Higress-specific
+        // client abstraction to register MCP tools.
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .create_client(McpServerConfig::new("higress").url("https://gw.example.com/mcp"))
+            .await
+            .unwrap();
+        let source: Arc<dyn McpToolSource> =
+            Arc::new(McpClientSource::new(Arc::clone(&manager), "higress"));
+        assert_eq!(source.name(), "higress");
+
+        // Offline check of the adapter contract: without a connection its tool
+        // listing fails loudly instead of returning an empty list.
+        let error = source.list_tools().await.unwrap_err();
+        assert!(error.to_string().contains("is not connected"));
+
+        // …and it plugs into the fluent registration unchanged.
+        let toolkit = HigressToolkit::new();
+        let _registration = toolkit.registration().mcp_client(source);
     }
 }

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentscope_core::error::{Error, Result};
-use agentscope_harness::agent::{McpClientManager, McpServerConfig, McpToolInfo};
+use agentscope_harness::agent::{McpClientManager, McpServerConfig, McpToolInfo, McpTransport};
 use async_trait::async_trait;
 use rust_mcp_sdk::schema::{CallToolResult, Tool, ToolInputSchema};
 use serde_json::{Map, Value};
@@ -48,6 +48,18 @@ impl TransportType {
         match self {
             TransportType::Sse => "sse",
             TransportType::StreamableHttp => "streamable-http",
+        }
+    }
+
+    /// The harness transport this selection pins.
+    ///
+    /// Mirrors the explicit `sseTransport` / `streamableHttpTransport` branches of
+    /// Java `HigressMcpClientBuilder#createMcpClientBuilder`: the choice is
+    /// authoritative instead of being sniffed from the endpoint URL.
+    pub fn to_mcp_transport(self) -> McpTransport {
+        match self {
+            TransportType::Sse => McpTransport::Sse,
+            TransportType::StreamableHttp => McpTransport::StreamableHttp,
         }
     }
 }
@@ -141,15 +153,15 @@ impl HigressClientConfig {
     /// Projects this configuration into a harness [`McpServerConfig`] so the
     /// caller can establish a real connection through [`McpClientManager`].
     ///
-    /// The harness selects the concrete transport from the URL (SSE when the
-    /// URL contains `/sse`, Streamable HTTP otherwise). `transport_type` is
-    /// validated against that routing rule in
-    /// [`HigressMcpClientWrapper::initialize`], so a misconfigured transport is
-    /// reported instead of being silently ignored.
+    /// The selected `transport_type` is pinned through
+    /// [`McpServerConfig::transport`], so the harness never has to sniff `/sse`
+    /// from the URL and an SSE endpoint that does not contain `/sse` still
+    /// connects over SSE (HIGRESS-06).
     pub fn to_server_config(&self) -> McpServerConfig {
         McpServerConfig::new(self.client_name.clone())
             .url(self.endpoint_with_query())
             .headers(self.headers.clone())
+            .transport(self.transport_type.to_mcp_transport())
             .propagate_meta(self.propagate_meta)
     }
 }
@@ -157,7 +169,7 @@ impl HigressClientConfig {
 /// Everything the wrapper needs to hand to the connection layer when it
 /// establishes the real MCP connection.
 ///
-/// [`McpServerConfig`] cannot carry the transport choice or the two timeouts,
+/// [`McpServerConfig`] carries the transport choice, but not the two timeouts,
 /// so they travel alongside it. Keeping them in one value makes it possible to
 /// assert (in tests and in diagnostics) that no configured knob is dropped.
 #[derive(Debug, Clone)]
@@ -617,9 +629,11 @@ impl HigressMcpClientWrapper {
     /// Toggles request-metadata propagation.
     ///
     /// Mirrors Java `McpClientWrapper.setPropagateMeta(boolean)`: the switch is
-    /// live (no reconnect needed) and is re-applied to the harness config on the
-    /// next [`initialize`](Self::initialize), which is the value the manager
-    /// reads for every call.
+    /// live (no reconnect needed). It is applied on every call by
+    /// [`call_tool_with_meta`](Self::call_tool_with_meta) — the Java
+    /// `propagateMeta && clientWrapper.isPropagateMeta()` conjunction — and is
+    /// also re-applied to the harness config on the next
+    /// [`initialize`](Self::initialize).
     pub fn set_propagate_meta(&self, propagate_meta: bool) {
         self.propagate_meta
             .store(propagate_meta, std::sync::atomic::Ordering::Relaxed);
@@ -655,8 +669,6 @@ impl HigressMcpClientWrapper {
                 self.name
             )));
         }
-
-        self.validate_transport()?;
 
         // A connection for this server may already exist on the shared manager
         // (another wrapper, or a previous initialize). Reuse it rather than
@@ -708,33 +720,6 @@ impl HigressMcpClientWrapper {
                 "Timed out after {:?} initializing Higress MCP client '{}'",
                 self.initialization_timeout, self.name
             ))),
-        }
-    }
-
-    /// Ensures the configured transport agrees with how the harness routes the
-    /// URL (`/sse` in the URL selects SSE, everything else Streamable HTTP).
-    ///
-    /// Without this check `transport_type` would be silently ignored, because
-    /// [`McpServerConfig`] has no transport field and the manager infers it.
-    fn validate_transport(&self) -> Result<()> {
-        let Some(url) = self.server_config.url.as_deref() else {
-            return Ok(());
-        };
-        let routes_to_sse = url.contains("/sse");
-        match (self.transport_type, routes_to_sse) {
-            (TransportType::Sse, false) => Err(Error::Other(format!(
-                "Higress MCP client '{}' is configured for SSE but endpoint '{}' does not \
-                 contain '/sse'; the harness McpClientManager would use Streamable HTTP. \
-                 Use an SSE endpoint or streamable_http_endpoint().",
-                self.name, url
-            ))),
-            (TransportType::StreamableHttp, true) => Err(Error::Other(format!(
-                "Higress MCP client '{}' is configured for Streamable HTTP but endpoint '{}' \
-                 contains '/sse'; the harness McpClientManager would use SSE. Use \
-                 sse_endpoint() or an endpoint without '/sse'.",
-                self.name, url
-            ))),
-            _ => Ok(()),
         }
     }
 
@@ -828,12 +813,19 @@ impl HigressMcpClientWrapper {
     /// to the delegate **untouched** (including `null`/`None`, meaning "send no
     /// `_meta` field"). Java's `testCallTool_PassesMetaStraightThrough` pins
     /// exactly that, so no merging, filtering or defaulting happens here either.
+    ///
+    /// The connection-level switch still applies: Java `McpTool` sends metadata
+    /// only when `propagateMeta && clientWrapper.isPropagateMeta()`, so after
+    /// [`set_propagate_meta(false)`](Self::set_propagate_meta) the metadata is
+    /// dropped here (HIGRESS-02). The switch is read on every call, so flipping
+    /// it takes effect immediately, without a reconnect.
     pub async fn call_tool_with_meta(
         &self,
         tool_name: &str,
         arguments: Value,
         meta: Option<Map<String, Value>>,
     ) -> Result<CallToolResult> {
+        let meta = if self.propagate_meta() { meta } else { None };
         tracing::debug!(
             "Calling tool '{}' on Higress MCP client '{}' with arguments: {}",
             tool_name,
@@ -1110,6 +1102,7 @@ fn mcp_tool_info_to_tool(info: &agentscope_harness::agent::McpToolInfo) -> Tool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentscope_harness::agent::plan_transport;
 
     /// Minimal recording double for [`HigressMcpTransport`].
     ///
@@ -1316,20 +1309,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_rejects_transport_mismatch() {
-        let recording = Arc::new(RecordingConnection::default());
+    async fn initialize_pins_sse_for_an_endpoint_without_a_sse_suffix() {
+        // Before HIGRESS-06 this configuration was rejected: the harness sniffed
+        // `/sse` from the URL and would have silently used Streamable HTTP. The
+        // transport is pinned on `McpServerConfig` now, so the caller's choice
+        // is authoritative and the connection goes through SSE.
+        let recording = Arc::new(RecordingConnection::with_tools(vec![test_tool("echo")]));
         let config = HigressMcpClientBuilder::create("higress")
             .unwrap()
-            // SSE selected but the URL has no `/sse`, so the manager would
-            // silently route it to Streamable HTTP.
             .sse_endpoint("https://gw.example.com/mcp")
             .build_config()
             .unwrap();
         let wrapper = HigressMcpClientWrapper::with_transport(config, recording.clone());
 
-        let error = wrapper.initialize().await.unwrap_err();
-        assert!(error.to_string().contains("configured for SSE"));
-        assert!(recording.requests().is_empty());
+        wrapper.initialize().await.unwrap();
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].server.transport, Some(McpTransport::Sse));
+        assert_eq!(requests[0].transport, TransportType::Sse);
+        // The projection the harness actually plans with agrees (no sniffing).
+        assert_eq!(
+            plan_transport(&requests[0].server).unwrap().kind(),
+            McpTransport::Sse
+        );
+        assert_eq!(wrapper.list_tools().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1526,6 +1530,38 @@ mod tests {
     }
 
     #[test]
+    fn to_server_config_pins_the_selected_transport() {
+        // HIGRESS-06: the selection is projected instead of being sniffed from
+        // the URL, so an SSE endpoint without a `/sse` suffix still uses SSE.
+        let sse = HigressMcpClientBuilder::create("c")
+            .unwrap()
+            .sse_endpoint("https://gw.example.com/mcp")
+            .build_config()
+            .unwrap();
+        assert_eq!(sse.to_server_config().transport, Some(McpTransport::Sse));
+        assert_eq!(
+            plan_transport(&sse.to_server_config()).unwrap().kind(),
+            McpTransport::Sse
+        );
+
+        // …and the reverse: an explicit Streamable HTTP pin wins over a `/sse`
+        // path that would otherwise be sniffed as SSE.
+        let http = HigressMcpClientBuilder::create("c")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/sse")
+            .build_config()
+            .unwrap();
+        assert_eq!(
+            http.to_server_config().transport,
+            Some(McpTransport::StreamableHttp)
+        );
+        assert_eq!(
+            plan_transport(&http.to_server_config()).unwrap().kind(),
+            McpTransport::StreamableHttp
+        );
+    }
+
+    #[test]
     fn endpoint_with_query_merges_duplicate_keys_and_encodes_like_java() {
         let config = HigressMcpClientBuilder::create("c")
             .unwrap()
@@ -1578,6 +1614,46 @@ mod tests {
         // The switch stays live after construction, like Java's setter.
         wrapper.set_propagate_meta(true);
         assert!(wrapper.propagate_meta());
+    }
+
+    #[tokio::test]
+    async fn set_propagate_meta_false_strips_metadata_from_calls() {
+        let recording = Arc::new(RecordingConnection::default());
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        wrapper.initialize().await.unwrap();
+
+        let mut meta = Map::new();
+        meta.insert(
+            "io.agentscope/toolCallId".to_string(),
+            Value::String("call-1".to_string()),
+        );
+
+        wrapper
+            .call_tool_with_meta("echo", serde_json::json!({ "q": "x" }), Some(meta.clone()))
+            .await
+            .unwrap();
+        wrapper.set_propagate_meta(false);
+        wrapper
+            .call_tool_with_meta("echo", serde_json::json!({ "q": "x" }), Some(meta.clone()))
+            .await
+            .unwrap();
+
+        let calls = recording.calls();
+        assert_eq!(calls.len(), 2);
+        // Default (`true`) forwards the caller's metadata untouched.
+        assert_eq!(calls[0].meta.as_ref(), Some(&meta));
+        // The connection-level switch wins over the caller's map (Java
+        // `propagateMeta && clientWrapper.isPropagateMeta()`), and it is live:
+        // no reconnect happened.
+        assert!(calls[1].meta.is_none());
+        assert_eq!(recording.requests().len(), 1);
+
+        wrapper.set_propagate_meta(true);
+        wrapper
+            .call_tool_with_meta("echo", serde_json::json!({ "q": "x" }), Some(meta.clone()))
+            .await
+            .unwrap();
+        assert_eq!(recording.calls().last().unwrap().meta.as_ref(), Some(&meta));
     }
 
     #[test]
