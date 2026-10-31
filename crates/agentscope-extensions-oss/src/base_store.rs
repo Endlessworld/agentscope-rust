@@ -13,6 +13,16 @@
 //! increments on every successful write; `put_if_version` with expected `0`
 //! writes only when the item does not yet exist.
 //!
+//! # Compare-and-set
+//!
+//! With a client that implements conditional writes
+//! ([`OssClient::put_conditional`]) the `.version` sidecar doubles as the CAS anchor:
+//! the backend evaluates `If-Match`/`If-None-Match` on it, so of two writers racing on
+//! the same expected version exactly one wins and the payload is written by the winner
+//! only. [`BaseStore::supports_atomic_session_storage`] is only `true` in that case —
+//! the fallback for plain clients is the Java read-check-write sequence, which cannot
+//! fence concurrent writers.
+//!
 //! # Search error semantics
 //!
 //! [`OssStore::search_strict`] mirrors the Java error behaviour of
@@ -33,7 +43,7 @@ use std::sync::Arc;
 
 use agentscope_harness::filesystem::remote::store::{BaseStore, StoreItem, StoreValue};
 
-use crate::client::{normalize_prefix, strip_leading_slashes, OssClient};
+use crate::client::{normalize_prefix, strip_leading_slashes, OssClient, PutCondition, PutOutcome};
 use crate::error::{OssError, OssResult};
 
 /// Default key prefix for base-store objects.
@@ -102,6 +112,15 @@ impl BaseStore for OssStore {
             tracing::error!(error = %e, key, "failed to delete item");
         }
     }
+
+    /// Declares real CAS support when the client can do ETag-guarded writes.
+    ///
+    /// Without the precondition the Java `putIfVersion` is a read-check-write sequence, so
+    /// two writers can both "win"; only a backend-evaluated precondition may back a session
+    /// journal (harness `StoreSessionStorage` refuses anything else).
+    fn supports_atomic_session_storage(&self) -> bool {
+        self.client.supports_conditional_writes()
+    }
 }
 
 impl OssStore {
@@ -144,6 +163,12 @@ impl OssStore {
     /// CAS write with an error channel: `Ok(false)` is a failed precondition, `Err` is a
     /// backend/decode failure — the distinction Java gets from "returns false" vs
     /// `RuntimeException`.
+    ///
+    /// Two objects make up an item (`{key}.json` + `{key}.version`), and object storage has
+    /// no multi-object transaction, so the **`.version` sidecar is the CAS anchor**: the
+    /// write is decided by one backend-evaluated `If-Match` (or `If-None-Match: *`) on that
+    /// object, and the payload is written only by the writer that won. Clients without
+    /// conditional writes fall back to the Java read-check-write sequence.
     pub fn put_if_version_strict(
         &self,
         namespace: &[String],
@@ -153,20 +178,76 @@ impl OssStore {
     ) -> OssResult<bool> {
         let data_key = self.data_object_key(namespace, key);
         let version_key = self.version_object_key(namespace, key);
-        let current = self.read_version_strict(&version_key)?;
+        let json = serde_json::to_string(&value)?;
 
-        // CAS: version 0 means "write only if not present".
+        if !self.client.supports_conditional_writes() {
+            return self.put_if_version_read_check_write(
+                &data_key,
+                &version_key,
+                &json,
+                expected_version,
+            );
+        }
+
+        // Version 0 means "write only if the item does not exist yet"; the data object
+        // itself is the thing that must be absent.
+        if expected_version == 0 {
+            return match self.client.put_conditional(
+                &data_key,
+                json.as_bytes(),
+                &PutCondition::IfNoneMatchAny,
+            )? {
+                PutOutcome::PreconditionFailed => Ok(false),
+                PutOutcome::Written { .. } => {
+                    self.put_string(&version_key, "1")?;
+                    Ok(true)
+                }
+            };
+        }
+
+        let Some(current_object) = self.client.get_with_etag(&version_key)? else {
+            // No version sidecar ⇒ stored version 0, which cannot match `expected_version`.
+            return Ok(false);
+        };
+        let current = parse_version_object(&version_key, &current_object.content)?;
+        if current != expected_version {
+            return Ok(false);
+        }
+        match self.client.put_conditional(
+            &version_key,
+            (current + 1).to_string().as_bytes(),
+            &PutCondition::IfMatch(current_object.etag),
+        )? {
+            PutOutcome::PreconditionFailed => Ok(false),
+            PutOutcome::Written { .. } => {
+                // The version bump is the commit point: a failure here leaves the new
+                // version visible with the previous payload, which is still detectable
+                // (and is the only window a two-object layout can offer).
+                self.put_string(&data_key, &json)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Java-compatible non-atomic CAS used when the client has no conditional writes.
+    fn put_if_version_read_check_write(
+        &self,
+        data_key: &str,
+        version_key: &str,
+        json: &str,
+        expected_version: u64,
+    ) -> OssResult<bool> {
+        let current = self.read_version_strict(version_key)?;
         let matches = if expected_version == 0 {
-            !self.client.exists(&data_key)?
+            !self.client.exists(data_key)?
         } else {
             current == expected_version
         };
         if !matches {
             return Ok(false);
         }
-        let json = serde_json::to_string(&value)?;
-        self.put_string(&data_key, &json)?;
-        self.put_string(&version_key, &(current + 1).to_string())?;
+        self.put_string(data_key, json)?;
+        self.put_string(version_key, &(current + 1).to_string())?;
         Ok(true)
     }
 
@@ -278,13 +359,9 @@ impl OssStore {
     /// Reads the `.version` sidecar, treating a malformed value as a backend inconsistency
     /// (Java `Long.parseLong` throws `NumberFormatException` → `RuntimeException`).
     fn read_version_strict(&self, version_key: &str) -> OssResult<u64> {
-        match self.get_string(version_key)? {
+        match self.client.get(version_key)? {
             None => Ok(0),
-            Some(content) => content.trim().parse::<u64>().map_err(|_| {
-                OssError::Backend(format!(
-                    "version object '{version_key}' is not a number: '{content}'"
-                ))
-            }),
+            Some(bytes) => parse_version_object(version_key, &bytes),
         }
     }
 
@@ -298,6 +375,19 @@ impl OssStore {
             None => Ok(None),
         }
     }
+}
+
+/// Parses a `.version` sidecar payload.
+///
+/// A malformed value is a backend inconsistency (Java `Long.parseLong` throws
+/// `NumberFormatException` → `RuntimeException`), which must not be read as version 0.
+fn parse_version_object(version_key: &str, content: &[u8]) -> OssResult<u64> {
+    let content = String::from_utf8_lossy(content);
+    content.trim().parse::<u64>().map_err(|_| {
+        OssError::Backend(format!(
+            "version object '{version_key}' is not a number: '{content}'"
+        ))
+    })
 }
 
 /// Builder for [`OssStore`].

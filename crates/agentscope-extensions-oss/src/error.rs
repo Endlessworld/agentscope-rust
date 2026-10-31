@@ -37,6 +37,18 @@ pub enum OssError {
     #[error("oss backend error: {0}")]
     Backend(String),
 
+    /// The backend does not implement an optional capability (e.g. an
+    /// [`crate::OssClient`] without ETag-guarded conditional writes).
+    #[error("unsupported OSS client capability: {0}")]
+    Unsupported(&'static str),
+
+    /// A request exceeded the client's configured timeout.
+    ///
+    /// `S3OssClient` enforces this on its worker thread, so a hung backend fails
+    /// fast instead of parking the calling thread forever.
+    #[error("OSS request timed out after {0:?}")]
+    Timeout(std::time::Duration),
+
     /// The generic S3 backend (`rust-s3`) failed.
     ///
     /// Kept as a typed variant (rather than a `String`) so callers can inspect
@@ -63,6 +75,34 @@ pub enum OssError {
     #[cfg(feature = "s3")]
     #[error("s3 request failed with HTTP {status}: {body}")]
     S3Http { status: u16, body: String },
+}
+
+impl OssError {
+    /// Whether retrying the same request could succeed.
+    ///
+    /// This mirrors the Java OSS SDK's `maxErrorRetry` decision: transient server
+    /// failures (5xx), throttling (429), request timeouts and transport failures are
+    /// retryable; a rejected request (4xx other than 429) is not.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            OssError::Timeout(_) => true,
+            #[cfg(feature = "s3")]
+            OssError::S3Http { status, .. } => is_retryable_status(*status),
+            #[cfg(feature = "s3")]
+            OssError::S3(inner) => match inner {
+                s3::error::S3Error::HttpFailWithBody(status, _) => is_retryable_status(*status),
+                // Transport-level failures (refused/reset/DNS) are transient by nature.
+                s3::error::S3Error::Reqwest(_) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+fn is_retryable_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..600).contains(&status)
 }
 
 impl From<OssError> for CoreError {

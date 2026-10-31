@@ -166,25 +166,29 @@ async fn state_save_list_rewrites_when_the_hash_sidecar_is_missing() {
 }
 
 #[tokio::test]
-async fn state_store_keeps_the_core_defaults_for_versioning() {
-    // Documented design decision (tracker §8.4): `OssClient` has no conditional-put seam and
-    // Java `OssAgentStateStore` does not override the versioned API either, so the core
-    // defaults must stay in force: no optimistic concurrency, `save_if_version` degrades to an
-    // unconditional write and reports `UNVERSIONED`.
+async fn state_store_reports_real_versioning_for_a_conditional_client() {
+    // OSS-03 (Round 2): the client implements ETag-guarded conditional writes, so the core
+    // versioned API is honoured instead of degrading: `save_if_version` is a real CAS and a
+    // stale expected version reports `UNVERSIONED` **without** writing.
     let client = common::mem_client();
     let store = state_store(common::as_dyn(&client));
-    assert!(!AgentStateStore::supports_versioning(&store));
+    assert!(AgentStateStore::supports_versioning(&store));
     assert_eq!(
         AgentStateStore::get_versioned(&store, None, "s1", "k")
             .await
             .version,
+        0,
+        "an absent key reports version 0 on a versioning backend"
+    );
+    assert_ne!(
+        AgentStateStore::save_if_version(&store, None, "s1", "k", json!(1), 0).await,
         agentscope_core::state::UNVERSIONED
     );
+    // Stale write loses and leaves the stored value untouched.
     assert_eq!(
-        AgentStateStore::save_if_version(&store, None, "s1", "k", json!(1), 7).await,
+        AgentStateStore::save_if_version(&store, None, "s1", "k", json!(2), 0).await,
         agentscope_core::state::UNVERSIONED
     );
-    // The degraded write still lands (last-writer-wins), like Java.
     assert_eq!(store.get(None, "s1", "k").await, Some(json!(1)));
 }
 

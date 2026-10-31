@@ -13,6 +13,15 @@
 //! keeping the rest of the session intact; session-level `delete` (the core
 //! trait method) removes every object under the session prefix.
 //!
+//! # Optimistic concurrency
+//!
+//! [`AgentStateStore::supports_versioning`] is `true` when the client can do ETag-guarded
+//! conditional writes ([`OssClient::put_conditional`]). A state key's version is then the
+//! token derived from the object's ETag ([`etag_version_token`]), and
+//! [`AgentStateStore::save_if_version`] is a single backend-evaluated `If-Match` /
+//! `If-None-Match` — two writers racing on the same expected version cannot both commit.
+//! The list layout (`.list.json` / `.list.hash`) is outside the versioned API.
+//!
 //! # Error semantics
 //!
 //! Java `OssAgentStateStore` throws `RuntimeException` whenever OSS fails. The core
@@ -25,11 +34,11 @@
 
 use std::sync::Arc;
 
-use agentscope_core::state::store::AgentStateStore;
+use agentscope_core::state::store::{AgentStateStore, VersionedState, UNVERSIONED};
 use agentscope_core::state::{compute_hash, needs_full_rewrite};
 use async_trait::async_trait;
 
-use crate::client::{normalize_prefix, OssClient};
+use crate::client::{etag_version_token, normalize_prefix, OssClient, PutCondition, PutOutcome};
 use crate::error::{OssError, OssResult};
 
 /// Default key prefix for agent state objects.
@@ -411,11 +420,161 @@ impl AgentStateStore for OssAgentStateStore {
         }
     }
 
-    // Versioning: `OssClient` has no conditional-put seam (`If-Match` / `If-None-Match`), so
-    // a read-check-write here would be a *fake* CAS, and Java `OssAgentStateStore` does not
-    // override `supportsVersioning` / `getVersioned` / `saveIfVersion` either. The core
-    // defaults (`supports_versioning() == false`, `save_if_version` degrading to `save` and
-    // returning `UNVERSIONED`) are therefore the intended semantics — see tracker §8.4.
+    // Versioning: the state object itself carries the ETag that anchors the CAS, so a
+    // client with conditional writes gives real optimistic concurrency. Clients without
+    // them keep the core defaults (no versioning, `save_if_version` degrading to `save`)
+    // instead of pretending a read-check-write is atomic.
+
+    fn supports_versioning(&self) -> bool {
+        self.client.supports_conditional_writes()
+    }
+
+    async fn get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> VersionedState {
+        match self.try_get_versioned(user_id, session_id, key).await {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(error = %e, key, "failed to read versioned state");
+                VersionedState {
+                    value: None,
+                    version: UNVERSIONED,
+                }
+            }
+        }
+    }
+
+    async fn try_get_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<VersionedState> {
+        let object_key = self
+            .state_object_key(user_id, session_id, key)
+            .map_err(|e| core_error("read versioned state", e))?;
+        if !self.client.supports_conditional_writes() {
+            let value = self
+                .get_strict(user_id, session_id, key)
+                .await
+                .map_err(|e| core_error("read versioned state", e))?;
+            return Ok(VersionedState {
+                value,
+                version: UNVERSIONED,
+            });
+        }
+        let Some(object) = self
+            .client
+            .get_with_etag(&object_key)
+            .map_err(|e| core_error("read versioned state", e))?
+        else {
+            // Absent key on a versioning backend reports version 0 (core contract).
+            return Ok(VersionedState {
+                value: None,
+                version: 0,
+            });
+        };
+        let text = String::from_utf8_lossy(&object.content);
+        let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+            agentscope_core::error::Error::Other(format!(
+                "OSS state object '{object_key}' is not valid JSON: {e}"
+            ))
+        })?;
+        Ok(VersionedState {
+            value: Some(value),
+            version: etag_version_token(&object.etag),
+        })
+    }
+
+    async fn save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> i64 {
+        match self
+            .try_save_if_version(user_id, session_id, key, value, expected_version)
+            .await
+        {
+            Ok(version) => version,
+            Err(e) => {
+                // Reporting `UNVERSIONED` after a failed write keeps the contract honest:
+                // callers treat it as "nothing committed", never as a new version.
+                tracing::error!(error = %e, key, "failed to save versioned state");
+                UNVERSIONED
+            }
+        }
+    }
+
+    async fn try_save_if_version(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: i64,
+    ) -> agentscope_core::error::Result<i64> {
+        if !self.client.supports_conditional_writes() {
+            self.save_strict(user_id, session_id, key, value)
+                .await
+                .map_err(|e| core_error("save versioned state", e))?;
+            return Ok(UNVERSIONED);
+        }
+        let object_key = self
+            .state_object_key(user_id, session_id, key)
+            .map_err(|e| core_error("save versioned state", e))?;
+        let json = serde_json::to_string(&value)
+            .map_err(|e| core_error("encode versioned state", OssError::Json(e)))?;
+
+        if expected_version == UNVERSIONED {
+            return match self
+                .client
+                .put_conditional(&object_key, json.as_bytes(), &PutCondition::Any)
+                .map_err(|e| core_error("save versioned state", e))?
+            {
+                PutOutcome::Written { etag } => Ok(etag_version_token(&etag)),
+                PutOutcome::PreconditionFailed => Err(agentscope_core::error::Error::Other(
+                    "unconditional OSS state write reported a precondition failure".to_string(),
+                )),
+            };
+        }
+
+        let condition = if expected_version == 0 {
+            PutCondition::IfNoneMatchAny
+        } else {
+            let Some(current) = self
+                .client
+                .get_with_etag(&object_key)
+                .map_err(|e| core_error("save versioned state", e))?
+            else {
+                // Nothing stored ⇒ version 0 ≠ expected_version.
+                return Ok(UNVERSIONED);
+            };
+            if etag_version_token(&current.etag) != expected_version {
+                return Ok(UNVERSIONED);
+            }
+            PutCondition::IfMatch(current.etag)
+        };
+
+        match self
+            .client
+            .put_conditional(&object_key, json.as_bytes(), &condition)
+            .map_err(|e| core_error("save versioned state", e))?
+        {
+            PutOutcome::Written { etag } => Ok(etag_version_token(&etag)),
+            PutOutcome::PreconditionFailed => Ok(UNVERSIONED),
+        }
+    }
+}
+
+/// Wraps an OSS failure for the core trait's error channel.
+fn core_error(op: &str, error: OssError) -> agentscope_core::error::Error {
+    agentscope_core::error::Error::Other(format!("OSS {op} failed: {error}"))
 }
 
 /// Builder for [`OssAgentStateStore`].

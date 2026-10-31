@@ -21,6 +21,57 @@ use std::sync::Mutex;
 
 use crate::error::{OssError, OssResult};
 
+/// An object payload together with the backend's opaque ETag token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OssObjectVersion {
+    /// Object bytes.
+    pub content: Vec<u8>,
+    /// Backend ETag of exactly these bytes.
+    pub etag: String,
+}
+
+/// Precondition for a conditional (compare-and-set) write.
+///
+/// S3/OSS evaluate the precondition (`If-Match` / `If-None-Match`) inside the backend in
+/// one shot, so of several writers racing on the same ETag exactly one wins. That is what
+/// turns [`crate::OssStore::put_if_version`] into a real CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutCondition {
+    /// Overwrite unconditionally.
+    Any,
+    /// Write only when the stored object's ETag equals this token.
+    IfMatch(String),
+    /// Write only when no object exists at the key.
+    IfNoneMatchAny,
+}
+
+impl PutCondition {
+    /// The precondition request header, or `None` for [`PutCondition::Any`].
+    ///
+    /// Only the S3 backend translates conditions into headers; the in-memory client
+    /// evaluates them directly.
+    #[cfg(feature = "s3")]
+    pub(crate) fn as_header(&self) -> Option<(&'static str, &str)> {
+        match self {
+            PutCondition::Any => None,
+            PutCondition::IfMatch(etag) => Some(("if-match", etag.as_str())),
+            PutCondition::IfNoneMatchAny => Some(("if-none-match", "*")),
+        }
+    }
+}
+
+/// Outcome of [`OssClient::put_conditional`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// The object was written; carries the ETag of the new contents.
+    Written {
+        /// ETag the backend assigned to the written bytes.
+        etag: String,
+    },
+    /// The precondition did not hold; nothing was written.
+    PreconditionFailed,
+}
+
 /// A single object listing entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OssObjectSummary {
@@ -92,6 +143,35 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
 
     /// Shuts the underlying client down. Default: no-op.
     fn shutdown(&self) {}
+
+    /// Whether [`OssClient::get_with_etag`] and [`OssClient::put_conditional`] are
+    /// implemented, i.e. the backend can anchor optimistic concurrency.
+    ///
+    /// Default `false`: the stores then keep the Java read-check-write behaviour and
+    /// refuse to claim atomic session storage / state versioning.
+    fn supports_conditional_writes(&self) -> bool {
+        false
+    }
+
+    /// Reads `object_key` together with its ETag, returning `None` when it does not exist.
+    fn get_with_etag(&self, object_key: &str) -> OssResult<Option<OssObjectVersion>> {
+        let _ = object_key;
+        Err(OssError::Unsupported("conditional writes"))
+    }
+
+    /// Writes `content` subject to `condition`.
+    ///
+    /// A precondition that does not hold is reported as [`PutOutcome::PreconditionFailed`]
+    /// (a conflict, not an error); backend failures stay [`OssError`].
+    fn put_conditional(
+        &self,
+        object_key: &str,
+        content: &[u8],
+        condition: &PutCondition,
+    ) -> OssResult<PutOutcome> {
+        let _ = (object_key, content, condition);
+        Err(OssError::Unsupported("conditional writes"))
+    }
 }
 
 /// In-memory [`OssClient`] for tests and local development.
@@ -104,10 +184,58 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
 /// [`InMemoryOssClient::with_page_size`] to emulate a backend page cap.
 #[derive(Debug, Default)]
 pub struct InMemoryOssClient {
-    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    objects: Mutex<InMemoryObjects>,
     shut_down: Mutex<bool>,
     /// Optional per-page object cap, emulating the backend `MaxKeys` limit.
     page_size: Option<usize>,
+}
+
+/// Object table plus the write counter that keeps ETags unique per write.
+#[derive(Debug, Default)]
+struct InMemoryObjects {
+    objects: BTreeMap<String, InMemoryObject>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InMemoryObject {
+    content: Vec<u8>,
+    etag: String,
+}
+
+/// Assigns the next ETag. The generation counter is included so that even rewriting
+/// identical bytes yields a fresh ETag, matching the "every write is a new version"
+/// behaviour the stores rely on (a plain content hash would make such a CAS pass).
+fn next_etag(state: &mut InMemoryObjects, content: &[u8]) -> String {
+    state.generation += 1;
+    format!("{:016x}-{:016x}", fnv1a64(content), state.generation)
+}
+
+/// 64-bit FNV-1a, used only to derive opaque equality tokens.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Derives the state-store version token for an object's ETag.
+///
+/// Core's [`agentscope_core::state::AgentStateStore`] versions are `i64` while ETags are
+/// opaque strings, so the token is a hash of the ETag. It is deliberately **not**
+/// monotonic: it is an equality token, and a CAS compares it with the ETag that is
+/// actually stored. Hashing keeps it stable across processes, so a version written by one
+/// writer stays meaningful to another.
+pub fn etag_version_token(etag: &str) -> i64 {
+    // `0` is reserved for "absent on a versioning backend", so it must never be produced.
+    let token = fnv1a64(etag.as_bytes()) & 0x7fff_ffff_ffff_ffff;
+    if token == 0 {
+        1
+    } else {
+        token as i64
+    }
 }
 
 impl InMemoryOssClient {
@@ -124,7 +252,7 @@ impl InMemoryOssClient {
     /// `page_size` is clamped to at least `1`.
     pub fn with_page_size(page_size: usize) -> Self {
         Self {
-            objects: Mutex::new(BTreeMap::new()),
+            objects: Mutex::new(InMemoryObjects::default()),
             shut_down: Mutex::new(false),
             page_size: Some(page_size.max(1)),
         }
@@ -138,7 +266,7 @@ impl InMemoryOssClient {
 
     /// Returns the number of stored objects.
     pub fn len(&self) -> usize {
-        self.objects.lock().unwrap().len()
+        self.objects.lock().unwrap().objects.len()
     }
 
     /// Returns whether no objects are stored.
@@ -154,23 +282,39 @@ impl InMemoryOssClient {
 
 impl OssClient for InMemoryOssClient {
     fn put(&self, object_key: &str, content: &[u8]) -> OssResult<()> {
-        self.objects
-            .lock()
-            .unwrap()
-            .insert(object_key.to_string(), content.to_vec());
+        let mut state = self.objects.lock().unwrap();
+        let etag = next_etag(&mut state, content);
+        state.objects.insert(
+            object_key.to_string(),
+            InMemoryObject {
+                content: content.to_vec(),
+                etag,
+            },
+        );
         Ok(())
     }
 
     fn get(&self, object_key: &str) -> OssResult<Option<Vec<u8>>> {
-        Ok(self.objects.lock().unwrap().get(object_key).cloned())
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .objects
+            .get(object_key)
+            .map(|object| object.content.clone()))
     }
 
     fn exists(&self, object_key: &str) -> OssResult<bool> {
-        Ok(self.objects.lock().unwrap().contains_key(object_key))
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key(object_key))
     }
 
     fn delete(&self, object_key: &str) -> OssResult<()> {
-        self.objects.lock().unwrap().remove(object_key);
+        self.objects.lock().unwrap().objects.remove(object_key);
         Ok(())
     }
 
@@ -180,8 +324,12 @@ impl OssClient for InMemoryOssClient {
         max_keys: usize,
         continuation_token: Option<&str>,
     ) -> OssResult<OssListPage> {
-        let guard = self.objects.lock().unwrap();
-        let mut matched: Vec<&String> = guard.keys().filter(|k| k.starts_with(prefix)).collect();
+        let state = self.objects.lock().unwrap();
+        let mut matched: Vec<&String> = state
+            .objects
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .collect();
         matched.sort();
 
         let start = match continuation_token {
@@ -221,6 +369,54 @@ impl OssClient for InMemoryOssClient {
 
     fn shutdown(&self) {
         *self.shut_down.lock().unwrap() = true;
+    }
+
+    fn supports_conditional_writes(&self) -> bool {
+        // A single mutex covers the compare-and-swap, so within this process the
+        // precondition really is atomic.
+        true
+    }
+
+    fn get_with_etag(&self, object_key: &str) -> OssResult<Option<OssObjectVersion>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .objects
+            .get(object_key)
+            .map(|object| OssObjectVersion {
+                content: object.content.clone(),
+                etag: object.etag.clone(),
+            }))
+    }
+
+    fn put_conditional(
+        &self,
+        object_key: &str,
+        content: &[u8],
+        condition: &PutCondition,
+    ) -> OssResult<PutOutcome> {
+        let mut state = self.objects.lock().unwrap();
+        let holds = match condition {
+            PutCondition::Any => true,
+            PutCondition::IfMatch(etag) => state
+                .objects
+                .get(object_key)
+                .is_some_and(|object| object.etag == *etag),
+            PutCondition::IfNoneMatchAny => !state.objects.contains_key(object_key),
+        };
+        if !holds {
+            return Ok(PutOutcome::PreconditionFailed);
+        }
+        let etag = next_etag(&mut state, content);
+        state.objects.insert(
+            object_key.to_string(),
+            InMemoryObject {
+                content: content.to_vec(),
+                etag: etag.clone(),
+            },
+        );
+        Ok(PutOutcome::Written { etag })
     }
 }
 

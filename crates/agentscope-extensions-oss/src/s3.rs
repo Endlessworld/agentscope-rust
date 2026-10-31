@@ -19,6 +19,14 @@
 //! owned thread keeps the client safe from Tokio worker threads, current-thread
 //! runtimes, `spawn_blocking` threads and plain OS threads alike.
 //!
+//! # Resilience
+//!
+//! Every request is bounded by the client's `timeout` ([`DEFAULT_TIMEOUT`] by default) and
+//! retried up to `max_retries` times ([`DEFAULT_MAX_RETRIES`]) when the failure is
+//! retryable ([`OssError::is_retryable`]: 5xx, 408/429, transport errors, timeouts), using
+//! exponential backoff with jitter. A rejected request (403/404/412, ...) is never
+//! retried. Configure both on the builder.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -36,18 +44,34 @@
 //! ```
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::error::S3Error;
 use s3::region::Region;
 
-use crate::client::{OssClient, OssListPage, OssObjectSummary};
+use crate::client::{
+    OssClient, OssListPage, OssObjectSummary, OssObjectVersion, PutCondition, PutOutcome,
+};
 use crate::error::{OssError, OssResult};
 
 /// Default S3 region used when the builder does not specify one.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Default per-request timeout (Java uses the SDK's `ClientConfiguration` timeouts).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default number of retries after the first attempt (Java `maxErrorRetry = 3`).
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Base delay of the exponential retry backoff.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Upper bound of a single retry backoff.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// S3 maximum number of keys per `ListObjectsV2` page.
 const MAX_KEYS_PER_PAGE: usize = 1000;
@@ -63,6 +87,8 @@ pub struct S3OssClient {
     region: String,
     endpoint: Option<String>,
     path_style: bool,
+    timeout: Duration,
+    max_retries: u32,
 }
 
 impl fmt::Debug for S3OssClient {
@@ -73,6 +99,8 @@ impl fmt::Debug for S3OssClient {
             .field("region", &self.region)
             .field("endpoint", &self.endpoint)
             .field("path_style", &self.path_style)
+            .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
             .finish_non_exhaustive()
     }
 }
@@ -103,24 +131,76 @@ impl S3OssClient {
         self.path_style
     }
 
-    /// Runs `build(bucket)` on the worker thread and blocks until it completes.
+    /// Returns the per-request timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Returns how many times a retryable failure is retried.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    /// Runs `build(bucket)` on the worker thread, blocking until it completes.
     ///
-    /// The future is **created on the worker thread**, so the caller's runtime
-    /// is never entered and `block_on` cannot nest. `build` receives the shared
-    /// bucket so the produced future is `'static` instead of borrowing `self`.
-    fn run<Fut, Out>(
-        &self,
-        build: impl FnOnce(Arc<Bucket>) -> Fut + Send + 'static,
-    ) -> OssResult<Out>
+    /// Every attempt is bounded by [`Self::timeout`], and a failure reported as
+    /// retryable by [`OssError::is_retryable`] (5xx, 429/408, transport error, timeout)
+    /// is retried up to [`Self::max_retries`] times with exponential backoff plus
+    /// jitter. `build` is an `Fn` so each attempt builds a fresh future; the future is
+    /// **created on the worker thread**, so the caller's runtime is never entered and
+    /// `block_on` cannot nest.
+    fn run<Fut, Out>(&self, build: impl Fn(Arc<Bucket>) -> Fut + Send + 'static) -> OssResult<Out>
     where
         Fut: std::future::Future<Output = Result<Out, S3Error>> + 'static,
         Out: Send + 'static,
     {
         let bucket = Arc::clone(&self.bucket);
-        self.worker
-            .execute(move |runtime| runtime.block_on(build(bucket)))?
-            .map_err(OssError::from)
+        let timeout = self.timeout;
+        let max_retries = self.max_retries;
+        let result = self.worker.execute(move |runtime| {
+            let mut attempt: u32 = 0;
+            loop {
+                let outcome = runtime.block_on(async {
+                    match tokio::time::timeout(timeout, build(Arc::clone(&bucket))).await {
+                        Ok(Ok(value)) => Ok(value),
+                        Ok(Err(error)) => Err(OssError::from(error)),
+                        Err(_) => Err(OssError::Timeout(timeout)),
+                    }
+                });
+                match outcome {
+                    Ok(value) => return Ok(value),
+                    Err(error) if attempt < max_retries && error.is_retryable() => {
+                        attempt += 1;
+                        // The timer handle is only available inside the worker's runtime,
+                        // so the sleep future must be created there (not at the call site).
+                        let delay = retry_delay(attempt);
+                        runtime.block_on(async move { tokio::time::sleep(delay).await });
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })?;
+        result
     }
+}
+
+/// Delay before retry number `attempt` (1-based): exponential with up to 25% jitter so a
+/// fleet of clients does not stampede the same object after a backend hiccup.
+fn retry_delay(attempt: u32) -> Duration {
+    static JITTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+    let exponent = attempt.saturating_sub(1).min(6);
+    let base = RETRY_BASE_DELAY.as_millis() as u64;
+    let capped = base
+        .saturating_mul(1u64 << exponent)
+        .min(RETRY_MAX_DELAY.as_millis() as u64);
+
+    let mut x = JITTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed) ^ u64::from(attempt);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+
+    Duration::from_millis(capped * (100 + x % 26) / 100)
 }
 
 /// A unit of work for the [`S3Worker`] thread: it receives the worker's runtime
@@ -243,6 +323,8 @@ pub struct S3OssClientBuilder {
     session_token: Option<String>,
     path_style: Option<bool>,
     env_credentials: bool,
+    timeout: Option<Duration>,
+    max_retries: Option<u32>,
 }
 
 impl Default for S3OssClientBuilder {
@@ -256,6 +338,8 @@ impl Default for S3OssClientBuilder {
             session_token: None,
             path_style: None,
             env_credentials: true,
+            timeout: None,
+            max_retries: None,
         }
     }
 }
@@ -355,6 +439,24 @@ impl S3OssClientBuilder {
         self
     }
 
+    /// Sets the per-request timeout (defaults to [`DEFAULT_TIMEOUT`]).
+    ///
+    /// The timeout is enforced on the client's worker thread, so a hung backend fails
+    /// with [`OssError::Timeout`] instead of parking the calling thread forever.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how often a retryable failure is retried (defaults to [`DEFAULT_MAX_RETRIES`]).
+    ///
+    /// `0` disables retries. Only failures reported as retryable by
+    /// [`OssError::is_retryable`] are retried.
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
     /// Validates the configuration and builds the client.
     pub fn build(self) -> OssResult<S3OssClient> {
         let bucket_name = match self.bucket {
@@ -428,6 +530,8 @@ impl S3OssClientBuilder {
             region: region_name,
             endpoint,
             path_style,
+            timeout: self.timeout.unwrap_or(DEFAULT_TIMEOUT),
+            max_retries: self.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
         })
     }
 }
@@ -480,16 +584,21 @@ fn ensure_success(status: u16, body: &[u8]) -> OssResult<()> {
 impl OssClient for S3OssClient {
     fn put(&self, object_key: &str, content: &[u8]) -> OssResult<()> {
         let key = object_key.to_string();
-        let body = content.to_vec();
-        let response = self.run(move |bucket| async move {
-            bucket.put_object(key.as_str(), body.as_slice()).await
+        let body = Arc::new(content.to_vec());
+        let response = self.run(move |bucket| {
+            let key = key.clone();
+            let body = Arc::clone(&body);
+            async move { bucket.put_object(key.as_str(), body.as_slice()).await }
         })?;
         ensure_success(response.status_code(), response.as_slice())
     }
 
     fn get(&self, object_key: &str) -> OssResult<Option<Vec<u8>>> {
         let key = object_key.to_string();
-        match self.run(move |bucket| async move { bucket.get_object(key.as_str()).await }) {
+        match self.run(move |bucket| {
+            let key = key.clone();
+            async move { bucket.get_object(key.as_str()).await }
+        }) {
             Ok(response) => {
                 let status = response.status_code();
                 if status == 404 {
@@ -507,7 +616,10 @@ impl OssClient for S3OssClient {
 
     fn exists(&self, object_key: &str) -> OssResult<bool> {
         let key = object_key.to_string();
-        match self.run(move |bucket| async move { bucket.head_object(key.as_str()).await }) {
+        match self.run(move |bucket| {
+            let key = key.clone();
+            async move { bucket.head_object(key.as_str()).await }
+        }) {
             Ok((_, status)) if (200..300).contains(&status) => Ok(true),
             Ok((_, 404)) => Ok(false),
             Ok((_, status)) => Err(unexpected_status(status, b"")),
@@ -520,7 +632,10 @@ impl OssClient for S3OssClient {
         // S3 DeleteObject is idempotent, but some gateways return 404 for a
         // missing key; both are treated as success.
         let key = object_key.to_string();
-        match self.run(move |bucket| async move { bucket.delete_object(key.as_str()).await }) {
+        match self.run(move |bucket| {
+            let key = key.clone();
+            async move { bucket.delete_object(key.as_str()).await }
+        }) {
             Ok(response) if (200..300).contains(&response.status_code()) => Ok(()),
             Ok(response) if response.status_code() == 404 => Ok(()),
             Ok(response) => Err(unexpected_status(
@@ -547,10 +662,14 @@ impl OssClient for S3OssClient {
         let key_prefix = prefix.to_string();
         let token = continuation_token.map(str::to_string);
         let page_size = max_keys.min(MAX_KEYS_PER_PAGE);
-        let (page, status) = self.run(move |bucket| async move {
-            bucket
-                .list_page(key_prefix, None, token, None, Some(page_size))
-                .await
+        let (page, status) = self.run(move |bucket| {
+            let key_prefix = key_prefix.clone();
+            let token = token.clone();
+            async move {
+                bucket
+                    .list_page(key_prefix, None, token, None, Some(page_size))
+                    .await
+            }
         })?;
         ensure_success(status, b"")?;
 
@@ -566,6 +685,102 @@ impl OssClient for S3OssClient {
             next_token: page.next_continuation_token,
         })
     }
+
+    fn supports_conditional_writes(&self) -> bool {
+        true
+    }
+
+    fn get_with_etag(&self, object_key: &str) -> OssResult<Option<OssObjectVersion>> {
+        let key = object_key.to_string();
+        match self.run(move |bucket| {
+            let key = key.clone();
+            async move { bucket.get_object(key.as_str()).await }
+        }) {
+            Ok(response) => {
+                let status = response.status_code();
+                if status == 404 {
+                    return Ok(None);
+                }
+                if !(200..300).contains(&status) {
+                    return Err(unexpected_status(status, response.as_slice()));
+                }
+                let etag = etag_of(&response).ok_or_else(|| {
+                    OssError::Backend(format!(
+                        "S3 GET for '{object_key}' returned no ETag, so it cannot anchor a CAS"
+                    ))
+                })?;
+                Ok(Some(OssObjectVersion {
+                    content: response.as_slice().to_vec(),
+                    etag,
+                }))
+            }
+            Err(error) if is_missing_object(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn put_conditional(
+        &self,
+        object_key: &str,
+        content: &[u8],
+        condition: &PutCondition,
+    ) -> OssResult<PutOutcome> {
+        let key = object_key.to_string();
+        let body = Arc::new(content.to_vec());
+        let condition = condition.clone();
+        let outcome = self.run(move |bucket| {
+            let key = key.clone();
+            let body = Arc::clone(&body);
+            let condition = condition.clone();
+            async move {
+                let mut request = bucket.put_object_builder(key.as_str(), body.as_slice());
+                if let Some((name, value)) = condition.as_header() {
+                    request = request.with_header(name, value)?;
+                }
+                request.execute().await
+            }
+        });
+
+        match outcome {
+            Ok(response) => {
+                let status = response.status_code();
+                if is_precondition_failed_status(status) {
+                    return Ok(PutOutcome::PreconditionFailed);
+                }
+                ensure_success(status, response.as_slice())?;
+                let etag = etag_of(&response).ok_or_else(|| {
+                    OssError::Backend(format!(
+                        "S3 PUT for '{object_key}' returned no ETag, so it cannot anchor a CAS"
+                    ))
+                })?;
+                Ok(PutOutcome::Written { etag })
+            }
+            Err(error) if is_precondition_failed_error(&error) => {
+                Ok(PutOutcome::PreconditionFailed)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Reads the `ETag` response header (S3 and gateways vary only in casing).
+fn etag_of(response: &s3::request::ResponseData) -> Option<String> {
+    response
+        .headers()
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| value)
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// `412 Precondition Failed` (and `409 ConditionalRequestConflict`) reject a conditional write.
+fn is_precondition_failed_status(status: u16) -> bool {
+    status == 412 || status == 409
+}
+
+/// [`is_precondition_failed_status`] for the [`OssError`] wrapper produced by `run`.
+fn is_precondition_failed_error(error: &OssError) -> bool {
+    matches!(error, OssError::S3(inner) if matches!(inner, S3Error::HttpFailWithBody(status, _) if is_precondition_failed_status(*status)))
 }
 
 #[cfg(test)]

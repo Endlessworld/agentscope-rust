@@ -37,6 +37,16 @@
 //! follows the tokens. [`InMemoryOssClient::with_page_size`] emulates a page cap
 //! so multi-page paths can be tested offline.
 //!
+//! # Compare-and-set
+//!
+//! A backend that implements [`OssClient::get_with_etag`] and
+//! [`OssClient::put_conditional`] (both in-memory and S3 clients do) can serve as an
+//! optimistic-concurrency anchor: [`OssStore`] then declares
+//! `supports_atomic_session_storage()` and [`OssAgentStateStore`] declares
+//! `supports_versioning()`, so both are single-shot backend-evaluated preconditions
+//! instead of a read-check-write race. A client without them keeps the Java behaviour
+//! and is refused by the harness session journal.
+//!
 //! ```no_run
 //! # #[cfg(feature = "s3")]
 //! # fn main() {
@@ -86,7 +96,10 @@ pub mod snapshot;
 pub mod state_store;
 
 pub use base_store::{OssStore, OssStoreBuilder};
-pub use client::{InMemoryOssClient, OssClient, OssListPage, OssObjectSummary};
+pub use client::{
+    etag_version_token, InMemoryOssClient, OssClient, OssListPage, OssObjectSummary,
+    OssObjectVersion, PutCondition, PutOutcome,
+};
 pub use distributed_store::OssDistributedStore;
 pub use error::{OssError, OssResult};
 pub use guard::OssSandboxExecutionGuard;
