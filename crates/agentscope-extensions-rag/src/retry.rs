@@ -66,7 +66,7 @@ where
 }
 
 /// Whether an error should be retried (transport, 429 or 5xx).
-fn is_retryable_error(err: &RagError) -> bool {
+pub(crate) fn is_retryable_error(err: &RagError) -> bool {
     match err {
         RagError::Http(_) | RagError::Io(_) => true,
         RagError::Api { status_code, .. } => *status_code == 429 || *status_code >= 500,

@@ -331,6 +331,54 @@ mod tests {
         assert!(matches!(err, RagError::Http(_)));
     }
 
+    /// A `429` enters the retry loop and the retried call can succeed (Java `RetryInterceptor`).
+    #[tokio::test]
+    async fn a_429_is_retried_and_the_next_attempt_succeeds() {
+        let shared = SharedMock(Arc::new(MockTransport::with_responses(vec![
+            crate::transport::HttpResponse::new(429, "slow down"),
+            crate::transport::HttpResponse::new(
+                200,
+                r#"{"code": 0, "data": {"chunks": [], "total": 0}}"#,
+            ),
+        ])));
+        let client = RAGFlowClient::with_transport(
+            config(1),
+            Arc::new(crate::transport::RetryingTransport::new(
+                Arc::new(shared.clone()),
+                crate::retry::RetryPolicy::new(1),
+            )),
+        );
+
+        let response = client.retrieve("q", None, None, None).await.unwrap();
+        assert_eq!(response.chunk_count(), 0);
+        assert_eq!(shared.0.requests.lock().unwrap().len(), 2);
+    }
+
+    /// A `400` is terminal: the retry loop must send it exactly once.
+    #[tokio::test]
+    async fn a_400_is_sent_exactly_once() {
+        let shared = SharedMock(Arc::new(MockTransport::with_responses(vec![
+            crate::transport::HttpResponse::new(400, "bad request"),
+        ])));
+        let client = RAGFlowClient::with_transport(
+            config(3),
+            Arc::new(crate::transport::RetryingTransport::new(
+                Arc::new(shared.clone()),
+                crate::retry::RetryPolicy::new(3),
+            )),
+        );
+
+        let err = client.retrieve("q", None, None, None).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RagError::Api {
+                status_code: 400,
+                ..
+            }
+        ));
+        assert_eq!(shared.0.requests.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn retrieve_passes_metadata_condition_through() {
         let (client, shared) = client(vec![crate::transport::HttpResponse::new(200, "{}")]);

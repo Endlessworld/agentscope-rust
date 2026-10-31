@@ -308,7 +308,9 @@ mod tests {
         }
 
         let path = temp_file("injected.pdf");
-        let reader = PdfReader::new(7, SplitStrategy::Paragraph, 0)
+        // 16 chars holds either paragraph ("first page" / "second page") without the
+        // oversized-paragraph fallback, so paragraph chunking yields exactly two chunks.
+        let reader = PdfReader::new(16, SplitStrategy::Paragraph, 0)
             .unwrap()
             .with_extractor(Arc::new(Fixed));
         assert!(reader.has_extractor());

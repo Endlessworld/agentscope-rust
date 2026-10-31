@@ -9,12 +9,13 @@
 //! implementation and never open a socket.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::error::{RagError, Result};
-use crate::retry::{retry_async, RetryPolicy};
+use crate::retry::{is_retryable_error, RetryPolicy};
 
 /// HTTP verbs used by the backends in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,41 +198,111 @@ impl ReqwestTransport {
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
-        retry_async(&self.retry, || {
-            let client = self.client.clone();
-            let request = request.clone();
-            let extra_headers = self.extra_headers.clone();
-            async move {
-                let mut builder = match request.method {
-                    HttpMethod::Get => client.get(&request.url),
-                    HttpMethod::Post => client.post(&request.url),
-                    HttpMethod::Put => client.put(&request.url),
-                    HttpMethod::Delete => client.delete(&request.url),
-                };
+        execute_with_retry(&self.retry, || self.send_once(&request)).await
+    }
+}
 
-                for (name, value) in extra_headers.iter() {
-                    builder = builder.header(name, value);
-                }
-                for (name, value) in &request.headers {
-                    builder = builder.header(name, value);
-                }
-                if let Some(body) = &request.body {
-                    builder = builder.body(body.clone());
-                }
+impl ReqwestTransport {
+    /// Performs one exchange without retrying.
+    async fn send_once(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        let mut builder = match request.method {
+            HttpMethod::Get => self.client.get(&request.url),
+            HttpMethod::Post => self.client.post(&request.url),
+            HttpMethod::Put => self.client.put(&request.url),
+            HttpMethod::Delete => self.client.delete(&request.url),
+        };
 
-                let response = builder
-                    .send()
-                    .await
-                    .map_err(|e| RagError::Http(e.to_string()))?;
-                let status_code = response.status().as_u16();
-                let body = response
-                    .text()
-                    .await
-                    .map_err(|e| RagError::Http(e.to_string()))?;
-                Ok(HttpResponse { status_code, body })
-            }
-        })
-        .await
+        for (name, value) in self.extra_headers.iter() {
+            builder = builder.header(name, value);
+        }
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| RagError::Http(e.to_string()))?;
+        let status_code = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| RagError::Http(e.to_string()))?;
+        Ok(HttpResponse { status_code, body })
+    }
+}
+
+/// Whether a status code must be retried: `429` and `5xx`, like the Java `RetryInterceptor`.
+pub fn is_retryable_status(status_code: u16) -> bool {
+    status_code == 429 || status_code >= 500
+}
+
+/// Sends until `send` yields a non-retryable outcome or the retry budget is spent.
+///
+/// Retried are transport failures plus `429` / `5xx` responses (the Java `RetryInterceptor`
+/// behaviour). When the budget is exhausted the **last outcome is returned unchanged** — a
+/// `429`/`5xx` response is handed back rather than converted into an error, so each client
+/// keeps its own vendor-specific taxonomy (Java's interceptor also returned the last response
+/// to the client once it gave up).
+pub async fn execute_with_retry<F, Fut>(policy: &RetryPolicy, mut send: F) -> Result<HttpResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<HttpResponse>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        let outcome = send().await;
+        let retryable = match &outcome {
+            Ok(response) => is_retryable_status(response.status_code),
+            Err(err) => is_retryable_error(err),
+        };
+        if !retryable || attempt >= policy.max_retries {
+            return outcome;
+        }
+        let delay = policy.base_delay * 2u32.pow(attempt);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        attempt += 1;
+    }
+}
+
+/// Adds the retry semantics of [`ReqwestTransport`] to any [`HttpTransport`].
+///
+/// Production clients build a [`ReqwestTransport`], which already retries; wrapping an injected
+/// transport makes custom HTTP stacks (and offline tests) observe the same behaviour.
+pub struct RetryingTransport {
+    inner: Arc<dyn HttpTransport>,
+    policy: RetryPolicy,
+}
+
+impl std::fmt::Debug for RetryingTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetryingTransport")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetryingTransport {
+    /// Wraps `inner` with the given retry policy.
+    pub fn new(inner: Arc<dyn HttpTransport>, policy: RetryPolicy) -> Self {
+        Self { inner, policy }
+    }
+
+    /// The active retry policy.
+    pub fn policy(&self) -> &RetryPolicy {
+        &self.policy
+    }
+}
+
+#[async_trait]
+impl HttpTransport for RetryingTransport {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+        execute_with_retry(&self.policy, || self.inner.execute(request.clone())).await
     }
 }
 
@@ -378,5 +449,111 @@ mod tests {
     fn method_wire_names() {
         assert_eq!(HttpMethod::Get.as_str(), "GET");
         assert_eq!(HttpMethod::Delete.as_str(), "DELETE");
+    }
+
+    #[test]
+    fn only_429_and_5xx_are_retryable_statuses() {
+        for retryable in [429u16, 500, 502, 503, 599] {
+            assert!(is_retryable_status(retryable), "{retryable} should retry");
+        }
+        for terminal in [200u16, 204, 400, 401, 403, 404, 422] {
+            assert!(!is_retryable_status(terminal), "{terminal} must not retry");
+        }
+    }
+
+    /// Replays scripted responses in order and records every request, never touching a socket.
+    #[derive(Default)]
+    struct ScriptedTransport {
+        responses: std::sync::Mutex<std::collections::VecDeque<HttpResponse>>,
+        requests: std::sync::Mutex<Vec<HttpRequest>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(responses: Vec<HttpResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: std::sync::Mutex::new(responses.into_iter().collect()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for ScriptedTransport {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+            self.requests.lock().unwrap().push(request);
+            let mut responses = self.responses.lock().unwrap();
+            if responses.len() > 1 {
+                Ok(responses.pop_front().unwrap())
+            } else {
+                responses
+                    .front()
+                    .cloned()
+                    .ok_or_else(|| RagError::Http("no scripted response left".to_string()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_429_is_retried_and_the_retry_can_succeed() {
+        let inner = ScriptedTransport::new(vec![
+            HttpResponse::new(429, "slow down"),
+            HttpResponse::new(200, "{}"),
+        ]);
+        let transport = RetryingTransport::new(inner.clone(), RetryPolicy::new(1));
+        let response = transport
+            .execute(HttpRequest::new(HttpMethod::Get, "http://x"))
+            .await
+            .unwrap();
+        assert_eq!(response.status_code, 200);
+        assert_eq!(inner.request_count(), 2);
+        assert_eq!(transport.policy().max_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn a_400_is_sent_exactly_once() {
+        let inner = ScriptedTransport::new(vec![HttpResponse::new(400, "bad request")]);
+        let transport = RetryingTransport::new(inner.clone(), RetryPolicy::new(3));
+        let response = transport
+            .execute(HttpRequest::new(HttpMethod::Get, "http://x"))
+            .await
+            .unwrap();
+        assert_eq!(response.status_code, 400);
+        assert_eq!(inner.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_5xx_returns_the_last_response_to_the_client() {
+        let inner = ScriptedTransport::new(vec![HttpResponse::new(503, "down")]);
+        let transport = RetryingTransport::new(inner.clone(), RetryPolicy::new(2));
+        let response = transport
+            .execute(HttpRequest::new(HttpMethod::Get, "http://x"))
+            .await
+            .unwrap();
+        assert_eq!(response.status_code, 503);
+        assert_eq!(response.body, "down");
+        assert_eq!(inner.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn transport_failures_are_still_retried() {
+        struct AlwaysFailing;
+
+        #[async_trait]
+        impl HttpTransport for AlwaysFailing {
+            async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+                Err(RagError::Http("connection refused".to_string()))
+            }
+        }
+
+        let transport = RetryingTransport::new(Arc::new(AlwaysFailing), RetryPolicy::new(0));
+        let err = transport
+            .execute(HttpRequest::new(HttpMethod::Get, "http://x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RagError::Http(_)));
     }
 }

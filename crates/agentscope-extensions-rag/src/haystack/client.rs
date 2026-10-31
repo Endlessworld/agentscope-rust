@@ -264,6 +264,48 @@ mod tests {
         assert!(transport.requests.lock().unwrap().is_empty());
     }
 
+    /// A `429` enters the retry loop and the retried call can succeed (Java `RetryInterceptor`).
+    #[tokio::test]
+    async fn a_429_is_retried_and_the_next_attempt_succeeds() {
+        // `ScriptedTransport` pops from the back, so the scripted order is reversed here.
+        let transport = ScriptedTransport::with_responses(vec![
+            HttpResponse::new(200, success_body()),
+            HttpResponse::new(429, "slow down"),
+        ]);
+        let client = HayStackClient::with_transport(
+            config(),
+            Arc::new(crate::transport::RetryingTransport::new(
+                transport.clone(),
+                crate::retry::RetryPolicy::new(1),
+            )),
+        );
+
+        let response = client.retrieve("q", None, None).await.unwrap();
+        assert_eq!(response.effective_documents().len(), 2);
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    }
+
+    /// A `400` is terminal: sent once, and its body is still parsed (Java only logged the status).
+    #[tokio::test]
+    async fn a_400_is_sent_exactly_once() {
+        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(
+            400,
+            r#"{"code":1001,"error":"bad request"}"#,
+        )]);
+        let client = HayStackClient::with_transport(
+            config(),
+            Arc::new(crate::transport::RetryingTransport::new(
+                transport.clone(),
+                crate::retry::RetryPolicy::new(3),
+            )),
+        );
+
+        let error = client.retrieve("q", None, None).await.unwrap_err();
+        assert!(error.to_string().contains("bad request"), "{error}");
+        assert_eq!(error.error_code(), Some("1001"));
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn non_zero_code_is_an_api_error_carrying_the_message() {
         let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(

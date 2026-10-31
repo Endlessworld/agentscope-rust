@@ -262,12 +262,15 @@ impl DifyRAGConfigBuilder {
     }
 
     /// Sets `top_k`.
+    ///
+    /// Java's `Builder.topK` rejects values below `1`; the builder cannot fail, so the
+    /// equivalent check lives in [`DifyRAGConfigBuilder::build`].
     pub fn top_k(mut self, top_k: i32) -> Self {
         self.top_k = Some(top_k);
         self
     }
 
-    /// Sets the score threshold.
+    /// Sets the score threshold (0-1, validated by [`DifyRAGConfigBuilder::build`]).
     pub fn score_threshold(mut self, threshold: f64) -> Self {
         self.score_threshold = Some(threshold);
         self
@@ -285,7 +288,7 @@ impl DifyRAGConfigBuilder {
         self
     }
 
-    /// Sets the hybrid-search weight.
+    /// Sets the hybrid-search weight (0-1, validated by [`DifyRAGConfigBuilder::build`]).
     pub fn weights(mut self, weights: f64) -> Self {
         self.weights = Some(weights);
         self
@@ -310,6 +313,9 @@ impl DifyRAGConfigBuilder {
     }
 
     /// Sets the maximum number of retries.
+    ///
+    /// Java's `Builder.maxRetries` rejects negative values; `u32` makes that unrepresentable,
+    /// so no equivalent check exists here.
     pub fn max_retries(mut self, retries: u32) -> Self {
         self.max_retries = Some(retries);
         self
@@ -325,6 +331,12 @@ impl DifyRAGConfigBuilder {
     ///
     /// Mirrors Java `DifyRAGConfig`'s constructor, which throws when the API key or dataset
     /// id is null/blank, and otherwise applies the `DEFAULT_*` constants.
+    ///
+    /// Java also validated the numeric knobs inside its builder setters (`topK >= 1`,
+    /// `scoreThreshold` / `weights` within `[0, 1]`); Rust setters cannot fail, so the same
+    /// checks run here with the Java messages verbatim. The comparisons keep Java's `NaN`
+    /// behaviour (a `NaN` threshold/weight passes). Java's `maxRetries cannot be negative`
+    /// has no counterpart because the field is a `u32`.
     pub fn build(self) -> Result<DifyRAGConfig> {
         let api_key = self.api_key.unwrap_or_default().trim().to_string();
         if api_key.is_empty() {
@@ -337,6 +349,27 @@ impl DifyRAGConfigBuilder {
         if dataset_id.is_empty() {
             return Err(RagError::InvalidArgument(
                 "Dataset ID cannot be null or empty".to_string(),
+            ));
+        }
+
+        if self.top_k.is_some_and(|top_k| top_k < 1) {
+            return Err(RagError::InvalidArgument(
+                "topK must be larger than 1".to_string(),
+            ));
+        }
+
+        if self
+            .score_threshold
+            .is_some_and(|threshold| threshold < 0.0 || threshold > 1.0)
+        {
+            return Err(RagError::InvalidArgument(
+                "scoreThreshold must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+
+        if self.weights.is_some_and(|w| w < 0.0 || w > 1.0) {
+            return Err(RagError::InvalidArgument(
+                "weights must be between 0.0 and 1.0".to_string(),
             ));
         }
 
@@ -402,6 +435,71 @@ mod tests {
             .dataset_id("")
             .build()
             .is_err());
+    }
+
+    fn invalid_argument_message(err: RagError) -> String {
+        match err {
+            RagError::InvalidArgument(message) => message,
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_top_k_below_one() {
+        let err = DifyRAGConfig::builder()
+            .api_key("k")
+            .dataset_id("d")
+            .top_k(0)
+            .build()
+            .unwrap_err();
+        assert_eq!(invalid_argument_message(err), "topK must be larger than 1");
+    }
+
+    #[test]
+    fn builder_rejects_a_score_threshold_outside_the_unit_interval() {
+        for threshold in [-0.1, 1.1] {
+            let err = DifyRAGConfig::builder()
+                .api_key("k")
+                .dataset_id("d")
+                .score_threshold(threshold)
+                .build()
+                .unwrap_err();
+            assert_eq!(
+                invalid_argument_message(err),
+                "scoreThreshold must be between 0.0 and 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_rejects_weights_outside_the_unit_interval() {
+        for weights in [-0.1, 1.1] {
+            let err = DifyRAGConfig::builder()
+                .api_key("k")
+                .dataset_id("d")
+                .weights(weights)
+                .build()
+                .unwrap_err();
+            assert_eq!(
+                invalid_argument_message(err),
+                "weights must be between 0.0 and 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_accepts_the_documented_boundaries() {
+        let cfg = DifyRAGConfig::builder()
+            .api_key("k")
+            .dataset_id("d")
+            .top_k(1)
+            .score_threshold(1.0)
+            .weights(0.0)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.top_k, 1);
+        assert_eq!(cfg.score_threshold, 1.0);
+        assert_eq!(cfg.weights, Some(0.0));
     }
 
     #[test]

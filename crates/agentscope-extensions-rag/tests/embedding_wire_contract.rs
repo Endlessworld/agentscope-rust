@@ -107,11 +107,17 @@ fn the_ollama_embedding_request_is_the_contract_the_model_extension_reads() {
         serde_json::from_str::<Value>(OLLAMA_REQUEST).unwrap(),
         "the RAG request body drifted from the pinned contract"
     );
-    assert_eq!(
-        serde_json::to_string(&body).unwrap(),
-        OLLAMA_REQUEST,
-        "the serialized body must stay byte-identical"
-    );
+    // JSON object member order is not part of the wire contract, and `serde_json::Map`'s
+    // ordering depends on the workspace-wide `preserve_order` feature (feature unification),
+    // so pin the key set instead of the byte layout.
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("the request body is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["input", "model"], "no extra keys may be sent");
 
     // The MODEL extension must be able to consume exactly this body...
     let request: OllamaEmbeddingRequest = serde_json::from_str(OLLAMA_REQUEST).unwrap();

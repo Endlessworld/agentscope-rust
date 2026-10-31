@@ -212,6 +212,14 @@ impl VdbStore for InMemoryStore {
             )));
         }
 
+        // Java validated the dimensions first and then rejected a non-positive limit
+        // (`IllegalArgumentException("Limit must be positive")`).
+        if query.limit == 0 {
+            return Err(RagError::InvalidArgument(
+                "Limit must be positive".to_string(),
+            ));
+        }
+
         let guard = self.documents.read().expect("store lock poisoned");
         let mut scored: Vec<Document> = Vec::with_capacity(guard.len());
 
@@ -322,6 +330,25 @@ mod tests {
         let store = InMemoryStore::new(3).unwrap();
         assert!(matches!(
             store.add(vec![doc("A", vec![1.0, 0.0])]).await,
+            Err(RagError::VectorStore(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_rejects_a_zero_limit_like_java() {
+        let store = InMemoryStore::new(2).unwrap();
+        store.add(vec![doc("A", vec![1.0, 0.0])]).await.unwrap();
+
+        match store.search(&SearchQuery::new(vec![1.0, 0.0], 0)).await {
+            Err(RagError::InvalidArgument(message)) => {
+                assert_eq!(message, "Limit must be positive")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        // Java validated the dimensions first, so a dimension mismatch wins over the limit.
+        assert!(matches!(
+            store.search(&SearchQuery::new(vec![1.0], 0)).await,
             Err(RagError::VectorStore(_))
         ));
     }
