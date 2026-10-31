@@ -59,8 +59,13 @@ impl Redirect {
 pub(crate) fn parse_redirect(message: &str) -> Option<Redirect> {
     let mut tokens = message.split_whitespace();
     while let Some(token) = tokens.next() {
-        let moved = token == "MOVED";
-        let ask = token == "ASK";
+        // The wire form is `MOVED <slot> <host>:<port>`, but `redis` renders the reply through
+        // `Debug` for its own error kind, i.e. `Moved: <slot> <host>:<port>` / `Ask: ...`.
+        // Matching the raw token case-sensitively therefore never recognised a live redirect
+        // and every `MOVED` surfaced as `Other("Redis command failed: Moved: ...")`.
+        let kind = token.trim_end_matches(':').to_ascii_uppercase();
+        let moved = kind == "MOVED";
+        let ask = kind == "ASK";
         if !moved && !ask {
             continue;
         }
@@ -299,6 +304,40 @@ mod tests {
         ClusterNodeAddr::new(host, port)
     }
 
+    /// The form a live server actually produces.
+    ///
+    /// `redis` renders a redirect reply through `Debug`: `Moved: <slot> <host>:<port>` and
+    /// `Ask: ...` — capitalised, **with a colon after the keyword**, and possibly behind the
+    /// driver's own prefix. This is the case the production path hits; the plain
+    /// `MOVED <slot> <host>:<port>` wire text below is only kept for compatibility.
+    #[test]
+    fn parses_the_debug_rendered_redirect_from_a_live_cluster() {
+        assert_eq!(
+            parse_redirect("Redis command failed: Moved: 12536 127.0.0.1:7002"),
+            Some(Redirect::Moved {
+                slot: 12536,
+                node: node("127.0.0.1", 7002)
+            })
+        );
+        assert_eq!(
+            parse_redirect("Ask: 3999 10.0.0.7:7000"),
+            Some(Redirect::Ask {
+                slot: 3999,
+                node: node("10.0.0.7", 7000)
+            })
+        );
+        // The raw driver error text, exactly as the live run surfaced it.
+        match CommandFailure::from_message("Redis command failed: Moved: 12536 127.0.0.1:7002") {
+            CommandFailure::Redirect(Redirect::Moved { slot, node }) => {
+                assert_eq!(slot, 12536);
+                assert_eq!(node.host, "127.0.0.1");
+                assert_eq!(node.port, 7002);
+            }
+            other => panic!("expected a MOVED redirect, got {other:?}"),
+        }
+    }
+
+    /// Compatibility: the bare wire spelling still parses.
     #[test]
     fn parses_moved_and_ask() {
         assert_eq!(
