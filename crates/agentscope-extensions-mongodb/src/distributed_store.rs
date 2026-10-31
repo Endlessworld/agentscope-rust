@@ -151,6 +151,26 @@ impl MongodbDistributedStore {
         }
     }
 
+    /// Creates a distributed store **and** its component indexes (MONGO-03).
+    ///
+    /// Java's `MongoDistributedStore` eagerly constructs every component, and each
+    /// component constructor calls `ensureIndexes()`. A Rust deployment that used plain
+    /// [`Self::new`] and forgot [`Self::ensure_indexes`] silently lost the session TTL
+    /// index (sessions never expire) and the compound indexes (full collection scans).
+    /// This async constructor is the equivalent: [`Self::new`] plus
+    /// `ensure_indexes().await`.
+    ///
+    /// [`Self::new`] stays available for callers that manage indexes themselves (e.g.
+    /// migrations that need the collections to exist first).
+    pub async fn try_new(
+        client: Arc<dyn MongoClient>,
+        database_name: Option<&str>,
+    ) -> Result<Self> {
+        let store = Self::new(client, database_name);
+        store.ensure_indexes().await?;
+        Ok(store)
+    }
+
     /// Sets the isolation scope for the harness projection.
     pub fn with_isolation_scope(mut self, scope: IsolationScope) -> Self {
         self.isolation_scope = scope;
@@ -328,6 +348,68 @@ mod tests {
         s.ensure_indexes().await.unwrap();
     }
 
+    /// MONGO-03: the eager constructor leaves every component index in place, mirroring
+    /// the Java components whose constructors call `ensureIndexes()`. Plain `new` keeps
+    /// creating none (that is the hazard the eager constructor closes).
+    #[tokio::test]
+    async fn try_new_creates_every_component_index() {
+        use crate::client::MongoClient as _;
+        use crate::constants::SANDBOX_LOCKS_COLLECTION;
+
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let client: Arc<dyn MongoClient> = raw.clone();
+
+        let _plain = MongodbDistributedStore::new(client.clone(), Some("plain"));
+        assert!(
+            raw.list_indexes(&scoped_collection("plain", SESSIONS_COLLECTION))
+                .await
+                .unwrap()
+                .is_empty(),
+            "`new` creates no index; only `try_new`/`ensure_indexes` do"
+        );
+
+        let s = MongodbDistributedStore::try_new(client.clone(), Some("eager"))
+            .await
+            .expect("try_new creates the component indexes");
+        assert_eq!(s.database_name(), "eager");
+
+        let sessions = raw
+            .list_indexes(&scoped_collection("eager", SESSIONS_COLLECTION))
+            .await
+            .unwrap();
+        let compound = sessions
+            .iter()
+            .find(|i| i.keys.len() == 2)
+            .expect("session compound index");
+        assert_eq!(
+            compound.keys,
+            vec![("user_id".to_string(), 1), ("session_id".to_string(), 1)]
+        );
+
+        let base = raw
+            .list_indexes(&scoped_collection("eager", BASE_STORE_COLLECTION))
+            .await
+            .unwrap();
+        let namespace = base
+            .iter()
+            .find(|i| i.keys.len() == 2)
+            .expect("base store namespace+key index");
+        assert_eq!(
+            namespace.keys,
+            vec![("namespace".to_string(), 1), ("key".to_string(), 1)]
+        );
+
+        let locks = raw
+            .list_indexes(&scoped_collection("eager", SANDBOX_LOCKS_COLLECTION))
+            .await
+            .unwrap();
+        let lock_ttl = locks
+            .iter()
+            .find(|i| i.expire_after_seconds == Some(0))
+            .expect("sandbox lock TTL index");
+        assert_eq!(lock_ttl.keys, vec![("expiresAt".to_string(), 1)]);
+    }
+
     #[tokio::test]
     async fn state_store_component_round_trips() {
         let s = store();
@@ -364,7 +446,7 @@ mod tests {
         let guard = s.sandbox_execution_guard();
         use agentscope_harness::agent::sandbox::SandboxIsolationKey;
         let key = SandboxIsolationKey::new("user", "u");
-        let lease = guard.try_enter(key.clone()).await;
+        let lease = guard.try_enter(key.clone()).await.expect("lease");
         assert!(!lease.is_noop());
         guard.release(&key).await;
     }
@@ -403,7 +485,7 @@ mod tests {
             .as_ref()
             .expect("sandbox_execution_guard projected");
         let key = agentscope_harness::agent::sandbox::SandboxIsolationKey::new("user", "u");
-        let lease = guard.try_enter(key.clone()).await;
+        let lease = guard.try_enter(key.clone()).await.expect("lease");
         assert!(!lease.is_noop());
         assert!(guard.is_held(&key));
         guard.release(&key).await;

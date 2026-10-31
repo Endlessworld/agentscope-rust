@@ -365,7 +365,7 @@ async fn sandbox_guard_lease_is_mutually_exclusive() {
         assert!(!view.is_held(&key));
 
         // The lock is free again; the harness view acquires and releases it too.
-        let sandbox_lease = view.try_enter(key.clone()).await;
+        let sandbox_lease = view.try_enter(key.clone()).await.expect("lease");
         assert!(!sandbox_lease.is_noop());
         assert!(view.is_held(&key));
         view.release(&key).await;

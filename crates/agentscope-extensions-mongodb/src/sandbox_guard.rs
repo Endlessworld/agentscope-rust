@@ -15,6 +15,7 @@
 //! `SET NX` + CAS token pattern). While a [`MongodbLease`] is open, a background task
 //! renews the lease every `lease_ttl / 3`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -172,6 +173,8 @@ impl MongodbSandboxExecutionGuard {
         let renew_id = lock_id.clone();
         let renew_token = token.clone();
         let renew_interval = interval;
+        let lock_lost = Arc::new(AtomicBool::new(false));
+        let renew_lost = lock_lost.clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(renew_interval);
             // Skip the immediate first tick; renew after one interval.
@@ -182,18 +185,37 @@ impl MongodbSandboxExecutionGuard {
                 let filter = FindFilter::eq(FIELD_LOCK_ID, json!(renew_id.clone()))
                     .and(FindFilter::eq(FIELD_TOKEN, json!(renew_token.clone())));
                 let update = Update::new().set(FIELD_EXPIRES_AT, json!(new_expires));
-                if client
-                    .update_one(
+                // `find_one_and_update` (instead of `update_one`) reports whether a
+                // document still matched: `None` means the lock document is gone or its
+                // token was overwritten (expired and reclaimed by another owner), i.e. the
+                // lease lost the lock while the call kept running (MONGO-06).
+                match client
+                    .find_one_and_update(
                         &collection_key,
                         &filter,
                         &update,
-                        &crate::client::UpdateOptions::default(),
+                        &FindOneAndUpdateOptions {
+                            upsert: false,
+                            return_after: true,
+                        },
                     )
                     .await
-                    .is_err()
                 {
-                    // Never let an error escape; TTL expiry remains a safety valve.
-                    continue;
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        // Nothing left to renew: flip the flag so the host can react and
+                        // stop the ticker instead of pushing writes that match nothing.
+                        renew_lost.store(true, Ordering::SeqCst);
+                        tracing::warn!(
+                            "[sandbox-guard] MongoDB lock {renew_id} lost during execution \
+                             (expired or reclaimed); continuing without the lock"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        // Never let an error escape; TTL expiry remains a safety valve.
+                        tracing::warn!("[sandbox-guard] failed to renew MongoDB lock {renew_id}: {e}");
+                    }
                 }
             }
         });
@@ -203,6 +225,7 @@ impl MongodbSandboxExecutionGuard {
             lock_id,
             token,
             expires_at,
+            lock_lost,
             renewal: Some(handle),
         }
     }
@@ -232,6 +255,9 @@ pub struct MongodbLeaseHandle {
     lock_id: String,
     token: String,
     expires_at: i64,
+    /// Set by the renewal task when the lock document disappeared (expired and
+    /// reclaimed, or its token was overwritten).
+    lock_lost: Arc<AtomicBool>,
     renewal: Option<JoinHandle<()>>,
 }
 
@@ -259,6 +285,16 @@ impl MongodbLeaseHandle {
     /// The initial expiry timestamp (millis since epoch).
     pub fn expires_at(&self) -> i64 {
         self.expires_at
+    }
+
+    /// True once renewal found the lock document gone (or owned by another token), i.e.
+    /// the lease is no longer guarding the isolation key.
+    ///
+    /// Mirrors Java `MongoLease.renew` warning on `matchedCount == 0`; the flag lets the
+    /// host observe the loss (Java only logs). The renewal ticker stops in that case —
+    /// there is nothing left to renew — and the caller must treat the sandbox as unlocked.
+    pub fn is_lock_lost(&self) -> bool {
+        self.lock_lost.load(Ordering::SeqCst)
     }
 
     /// Releases the lock, deleting the document only when the token still matches.
@@ -448,21 +484,26 @@ impl MongodbGuardClient {
 
     /// Tries to acquire a lease for the given isolation key.
     ///
-    /// Awaits the distributed lock acquisition (which polls with `tokio::time::sleep`). On
-    /// acquisition failure it degrades to a no-op lease rather than deadlocking the caller
-    /// (the harness trait has no error channel; the underlying
-    /// [`MongodbSandboxExecutionGuard::try_enter`] reports the error).
-    pub async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+    /// Awaits the distributed lock acquisition (which polls with `tokio::time::sleep`).
+    /// **Fail-closed** (MONGO-04): a failed acquisition returns `Err` so the caller aborts;
+    /// it used to degrade to [`SandboxLease::noop`], which dropped cross-process exclusion
+    /// without telling anyone.
+    pub async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
         match self.inner.try_enter(&key).await {
             Ok(lease) => {
                 if let Ok(mut leases) = self.leases.lock() {
                     leases.entry(key.clone()).or_default().push(lease);
                 }
-                SandboxLease::new(key)
+                Ok(SandboxLease::new(key))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "[sandbox-guard] failed to acquire MongoDB lock");
-                SandboxLease::noop()
+                tracing::error!(error = %e, "[sandbox-guard] failed to acquire MongoDB lock");
+                Err(agentscope_core::error::Error::Other(format!(
+                    "MongoDB sandbox guard lock not acquired: {e}"
+                )))
             }
         }
     }
@@ -507,7 +548,10 @@ impl MongodbGuardClient {
 
 #[async_trait::async_trait]
 impl SandboxGuard for MongodbGuardClient {
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
         MongodbGuardClient::try_enter(self, key).await
     }
 
@@ -671,7 +715,7 @@ mod tests {
     async fn adapter_mirrors_harness_guard_surface() {
         let client = MongodbGuardClient::new(Arc::new(guard()));
         let key = SandboxIsolationKey::new("user", "u1");
-        let lease = client.try_enter(key.clone()).await;
+        let lease = client.try_enter(key.clone()).await.expect("lease");
         assert!(!lease.is_noop());
         assert_eq!(client.active_count(), 1);
         assert!(client.is_held(&key));
@@ -695,7 +739,8 @@ mod tests {
             SandboxGuard::try_enter(&client, key.clone()),
         )
         .await
-        .expect("trait acquisition must not deadlock the runtime");
+        .expect("trait acquisition must not deadlock the runtime")
+        .expect("trait acquisition succeeds");
         assert!(!lease.is_noop());
 
         tokio::time::timeout(
@@ -787,7 +832,7 @@ mod tests {
         let client = MongodbGuardClient::new(Arc::new(guard()));
         let key = SandboxIsolationKey::new("session", "lifecycle");
 
-        let lease = client.try_enter(key.clone()).await;
+        let lease = client.try_enter(key.clone()).await.expect("lease");
         assert!(!lease.is_noop());
         assert!(client.is_held(&key));
 
@@ -800,5 +845,167 @@ mod tests {
         client.release(&key).await;
         assert!(!client.is_held(&key));
         assert_eq!(client.active_count(), 0);
+    }
+
+    /// MONGO-04: the adapter is **fail-closed**. A lock that cannot be taken surfaces as
+    /// `Err`; it must never degrade to a no-op lease (which would drop cross-process
+    /// mutual exclusion silently, the exact bug the contract exists to prevent).
+    #[tokio::test]
+    async fn guard_client_fails_closed_when_the_lock_is_held() {
+        let inner = Arc::new(guard());
+        let holder = MongodbGuardClient::new(inner.clone());
+        let loser = MongodbGuardClient::new(inner.clone());
+        let key = SandboxIsolationKey::new("user", "u1");
+
+        let held = holder.try_enter(key.clone()).await.expect("first lease");
+        assert!(!held.is_noop());
+
+        let error = SandboxGuard::try_enter(&loser, key.clone())
+            .await
+            .expect_err("a held lock must not yield a lease");
+        assert!(
+            format!("{error}").contains("MongoDB sandbox guard lock not acquired"),
+            "{error}"
+        );
+        assert_eq!(loser.active_count(), 0, "no lease is recorded on failure");
+        assert!(holder.is_held(&key), "the holder keeps the lock");
+
+        holder.release(&key).await;
+        assert!(!holder.is_held(&key));
+    }
+
+    /// MONGO-04 through the real assembly path: `SandboxManager::acquire` propagates the
+    /// guard error with `?`, so no sandbox is created while the distributed lock is held
+    /// elsewhere. Before the fix the guard returned a no-op lease, the manager continued
+    /// and the sandbox client was reached.
+    #[tokio::test]
+    async fn harness_manager_aborts_when_the_mongo_lock_is_unavailable() {
+        use agentscope_harness::agent::isolation_scope::IsolationScope;
+        use agentscope_harness::agent::sandbox::{
+            InMemorySandboxStateStore, SandboxContext, SandboxManager,
+        };
+
+        let inner = Arc::new(guard());
+        let holder = MongodbGuardClient::new(inner.clone());
+        let key = SandboxIsolationKey::new("agent", "mongo-agent");
+        let held = holder.try_enter(key.clone()).await.expect("holder lease");
+
+        let manager = SandboxManager::with_shared_guard(
+            Arc::new(UnreachableSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "mongo-agent",
+            Arc::new(MongodbGuardClient::new(inner.clone())),
+        );
+        let context = SandboxContext::builder()
+            .isolation_scope(IsolationScope::Agent)
+            .build();
+
+        let error = manager
+            .acquire(&context, None)
+            .await
+            .expect_err("acquire must abort while the lock is held");
+        assert!(
+            format!("{error}").contains("MongoDB sandbox guard lock not acquired"),
+            "the guard error must be the one that aborts the acquisition: {error}"
+        );
+
+        drop(held);
+        holder.release(&key).await;
+    }
+
+    /// A sandbox backend that must never be reached: any call reports it explicitly, so a
+    /// test can tell "the guard aborted the acquisition" from "the backend was used".
+    struct UnreachableSandboxClient;
+
+    #[async_trait::async_trait]
+    impl agentscope_harness::agent::sandbox::SandboxClient for UnreachableSandboxClient {
+        async fn create(
+            &self,
+            _workspace_spec: &agentscope_harness::agent::sandbox::WorkspaceSpec,
+            _snapshot_spec: Option<&dyn agentscope_harness::agent::sandbox::SandboxSnapshotSpec>,
+            _options: Option<&agentscope_harness::agent::sandbox::SandboxClientOptions>,
+        ) -> Result<Box<dyn agentscope_harness::agent::sandbox::Sandbox>> {
+            Err(Error::Other(
+                "sandbox client must not be reached without the lock".into(),
+            ))
+        }
+
+        async fn resume(
+            &self,
+            _state: &agentscope_harness::agent::sandbox::SandboxState,
+        ) -> Result<Box<dyn agentscope_harness::agent::sandbox::Sandbox>> {
+            Err(Error::Other(
+                "sandbox client must not be reached without the lock".into(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _sandbox: &dyn agentscope_harness::agent::sandbox::Sandbox,
+        ) -> Result<()> {
+            Err(Error::Other(
+                "sandbox client must not be reached without the lock".into(),
+            ))
+        }
+
+        fn serialize_state(
+            &self,
+            state: &agentscope_harness::agent::sandbox::SandboxState,
+        ) -> Result<String> {
+            serde_json::to_string(state).map_err(|e| Error::Other(e.to_string()))
+        }
+
+        fn deserialize_state(
+            &self,
+            json: &str,
+        ) -> Result<agentscope_harness::agent::sandbox::SandboxState> {
+            serde_json::from_str(json).map_err(|e| Error::Other(e.to_string()))
+        }
+    }
+
+    /// MONGO-06: renewal notices when the lock document is gone / stolen and stops pushing
+    /// `expiresAt`, flagging the lease instead of renewing forever in silence.
+    #[tokio::test]
+    async fn renewal_detects_a_lost_lock() {
+        let g = MongodbSandboxExecutionGuard::builder(Arc::new(InMemoryMongoClient::new()))
+            .lease_ttl(Duration::from_millis(300))
+            .retry_interval(Duration::from_millis(10))
+            .lock_timeout(Duration::from_millis(100))
+            .build();
+        let key = SandboxIsolationKey::new("session", "stolen");
+        let lease = g.try_enter(&key).await.unwrap();
+        assert!(!lease.is_lock_lost());
+
+        // Another owner reclaims the lock: same `_id`, different token.
+        let filter = FindFilter::eq("_id", json!(lease.lock_id()));
+        let update = Update::new().set("token", json!("other-owner"));
+        g.client
+            .update_one(g.collection_key(), &filter, &update, &Default::default())
+            .await
+            .unwrap();
+
+        // One renewal cycle (lease_ttl / 3) is enough to observe the loss.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            lease.is_lock_lost(),
+            "renewal must flag the lease once its token no longer matches"
+        );
+        // The ticker stopped, so the stolen document keeps the other owner's token.
+        let doc = g
+            .client
+            .find_one(g.collection_key(), &filter)
+            .await
+            .unwrap()
+            .expect("lock document still exists");
+        assert_eq!(
+            doc.get("token").and_then(|v| v.as_str()),
+            Some("other-owner")
+        );
+        // The ticker stopped, so `expiresAt` was not pushed forward by our renewal.
+        assert_eq!(
+            doc.get("expiresAt").and_then(|v| v.as_i64()),
+            Some(lease.expires_at()),
+            "a lost lease must stop renewing"
+        );
     }
 }

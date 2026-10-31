@@ -158,8 +158,10 @@ impl MongodbAgentStateStore {
         MongodbAgentStateStoreBuilder::default()
     }
 
-    /// Ensures the required indexes exist. Must be called before use (Java's
-    /// constructor does it eagerly; here it is a separate async step).
+    /// Ensures the required indexes exist. Must be called before use when the store was
+    /// built with [`MongodbAgentStateStoreBuilder::build`] (Java's constructor does it
+    /// eagerly; [`MongodbAgentStateStoreBuilder::build_with_indexes`] and
+    /// [`crate::MongodbDistributedStore::try_new`] are the eager equivalents).
     ///
     /// The session TTL index is derived from the `ttl_days` configured on the
     /// builder — mirroring Java `MongoAgentStateStore` calling
@@ -719,6 +721,20 @@ impl MongodbAgentStateStoreBuilder {
         };
         Ok(store)
     }
+
+    /// Builds the store **and** creates its indexes (composite `(user_id, session_id)`
+    /// plus the `ttl_days`-driven `_updated_at` TTL index), so the store can never be
+    /// used in the "TTL configured but index missing → sessions never expire" state
+    /// (MONGO-03).
+    ///
+    /// This is the Rust equivalent of Java `MongoAgentStateStore`'s constructor, which
+    /// calls `ensureIndexes(builder.ttlDays)` eagerly. [`Self::build`] stays available for
+    /// callers that manage the index lifecycle themselves (e.g. migrations).
+    pub async fn build_with_indexes(self) -> MongoResult<MongodbAgentStateStore> {
+        let store = self.build()?;
+        store.ensure_indexes().await?;
+        Ok(store)
+    }
 }
 
 /// Convenience: a store backed by the in-process [`InMemoryMongoClient`], used for
@@ -1134,6 +1150,39 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(s3.ttl_days(), None);
+    }
+
+    /// MONGO-03: `build_with_indexes` creates the composite **and** the `ttl_days`-driven
+    /// TTL index eagerly (Java's constructor equivalent), so a store can never be used in
+    /// the "TTL configured but index missing → sessions never expire" state.
+    #[tokio::test]
+    async fn build_with_indexes_creates_the_composite_and_ttl_indexes() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let client: Arc<dyn MongoClient> = raw.clone();
+        let s = MongodbAgentStateStore::builder()
+            .client(client.clone())
+            .ttl_days(2)
+            .build_with_indexes()
+            .await
+            .expect("indexes are created while building");
+
+        let indexes = client
+            .list_indexes(crate::constants::SESSIONS_COLLECTION)
+            .await
+            .unwrap();
+        assert!(
+            indexes.iter().any(|i| i.keys
+                == vec![("user_id".to_string(), 1), ("session_id".to_string(), 1)]
+                && !i.sparse),
+            "composite (user_id, session_id) index must be created eagerly: {indexes:?}"
+        );
+        let ttl = indexes
+            .iter()
+            .find(|i| i.expire_after_seconds.is_some())
+            .expect("ttl index created eagerly from the builder's ttl_days");
+        assert_eq!(ttl.expire_after_seconds, Some(2 * 86_400));
+        assert_eq!(ttl.keys, vec![("_updated_at".to_string(), 1)]);
+        assert_eq!(s.ttl_days(), Some(2));
     }
 
     #[tokio::test]
