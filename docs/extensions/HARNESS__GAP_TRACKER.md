@@ -23,7 +23,7 @@
 | Java 规模（2026-10-31 实测） | **295** 个 `.java` / **≈53.3k** 行（主代码）；`src/test` **192** 个 `.java` |
 | Rust crate | `crates/agentscope-harness`（**153** 个 `.rs` / **≈49.6k** 行）+ 36 个 `tests/*.rs`；`src` 内测试属性 **524** 处 |
 | 迁移波次 | core-adjacent（非 extensions 波次）；ACP 独立为 `crates/agentscope-extensions-acp` |
-| 当前状态 | **主体已迁移、生产可用**；本轮复核发现 **2 处「文件已落盘但未接线」**（HARNESS-04/05）与 1 处 **P0 待裁定**（HARNESS-15，归属 acp crate） |
+| 当前状态 | **主体已迁移、生产可用**；本轮复核发现 **2 处「文件已落盘但未接线」**（HARNESS-04/05）；原 1 处 **P0 待裁定**（HARNESS-15）已去重退役，执行归 acp crate 的 `ACP-01`，本 crate P0 归零 |
 
 > 2026-10-31 全量对齐复核：按 Java 包逐包复核完毕（§2），新增缺口/待裁定 17 条（§3.5），差异 8 + 9 条（§4.3）。全量测试数字沿用 `EXTENSIONS_GAP_TRACKER.md` §4.1 实测（workspace 156 targets / 5395 passed / 0 failed / 5 ignored；`agentscope-harness --lib` 519），**本轮未跑 cargo**。
 
@@ -82,6 +82,9 @@
 
 > 复核基线：Java `main` @ `1524b3191`；Rust 工作树 HEAD `d7f5218`。本表为本轮逐包核对结论，**存量 §3.1–§3.4 历史清单保持原样未重新编号**（本文件为首版，故无历史段）。
 > 编号规则：`<MOD>-NN`（缺口，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；§4.3 差异另有 `HARNESS-D<NN>` / `HARNESS-X<NN>` 系列。编号本模块内唯一、单调递增，不复用历史编号。
+> `HARNESS-15` 已去重退役（2026-10-31）：与 `docs/ACP_AGENT__GAP_TRACKER.md` 的 `ACP-01` 为同一问题，执行归 ACP-01；编号保留、不复用（清单条目 544 → 543）。
+> **2026-10-31 裁定（汇总方已确认）**：本文件的 `待裁定` 项已全部裁定，状态列更新为 `待办` / `设计决定（不迁移）` / `已完成`；裁定结论、依据与执行批次见 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.3。
+> 正文其它位置出现的旧「待裁定 N 项」为复核时点快照，一律以 §3.5/§3.6 表格的状态列为准。
 
 ### 3.5.1 缺口与待裁定
 
@@ -101,9 +104,8 @@
 | HARNESS-12 | P2 | 缺 `stopOnReject`：工具被权限拒绝后是否终止本轮 | `HarnessAgent.java:1941`（委托 core `ReActAgent.Builder.stopOnReject`，core `ReActAgent.java:6362`） | `rg 'stop_on_reject'` 于 core+harness **零命中**（另核 `stop_on_rejection` 零命中） | 待办 | core 增字段 + harness 旋钮；验收：拒绝后按开关分别「继续下一步」与「以 Rejected 结束」 |
 | HARNESS-13 | P2 | builder 未暴露执行配置（`modelExecutionConfig`/`toolExecutionConfig`/`maxRetries`），只能经 `generate_options_defaults` 迂回 | `HarnessAgent.java#Builder.modelExecutionConfig,toolExecutionConfig` | `rg 'ExecutionConfig' crates/agentscope-harness/src` **零命中**（core 有 `model/execution_config.rs`）；`harness_agent.rs:1270 generate_options_defaults` 可携带 `execution_config` | 待办 | 增两个 builder 方法直连 core `ExecutionConfig`；验收：与 Java 相同的重试序列（2/4/8/16/32/60s） |
 | HARNESS-14 | P2 | 缺框架内置 context 约定文案（Java 从 classpath 资源加载一次性注入） | `middleware/ContextConventionsMiddleware.java`（`/io/agentscope/harness/context-conventions.md`，`HarnessRuntimeMiddleware` 标记） | `rg 'context-conventions|conventions'` 仅命中无关注释；harness 无 `include_str!` 资源、无 `.md` 资源文件 | 待办 | 若产品需要，加 `assets/context-conventions.md` + `include_str!` 并作为默认 instruction 注册；否则转 D 条目 |
-| HARNESS-15 | P1 | **ACP `running` 状态无上限等待 → `a_cancelled_turn_does_not_block_the_next_prompt` 在 Windows 永久挂起**（生产表现为「输出中断后再说 continue 无任何响应」） | Java 侧无对应（ACP 为 Rust 独有） | `crates/agentscope-extensions-acp/src/session.rs:1586-1612` 已把 admission 等待改为「可取消 + closed 轮询」，但根因方向仍是 SDK `$/cancel_request` 未送达 agent；用例 `tests/acp_interrupted_turn_test.rs:62`；`EXTENSIONS_GAP_TRACKER.md` §4.2-1 记录 `f81c8b1` 即复现 | 待裁定 | 归属 `agentscope-extensions-acp`（非本 crate）：①对 `running` 加可取消上限；②或修 cancel 送达；验收：该用例在 Windows 稳定通过、全量不再需要 `--skip` |
-| HARNESS-16 | P1 | `acp_stdio_thought_test` 依赖 live 模型 reasoning，偶发失败 | Java 无对应 | `crates/agentscope-extensions-acp/tests/acp_stdio_thought_test.rs`；`EXTENSIONS_GAP_TRACKER.md` §4.2-2 | 待裁定 | 归属 acp crate：改为本地 StubModel 注入 reasoning，去掉 live 依赖 |
-| HARNESS-17 | P2 | `training::runner` 进程级 `OnceLock` 静态注册表 + `clear_all()` 测试间竞争 | Java 无对应 | `crates/agentscope-extensions-training/src/...runner`；`EXTENSIONS_GAP_TRACKER.md` §4.2-3 | 待裁定 | 归属 training crate：注册表改为实例级或加串行锁 |
+| HARNESS-16 | P1 | `acp_stdio_thought_test` 依赖 live 模型 reasoning，偶发失败 | Java 无对应 | `crates/agentscope-extensions-acp/tests/acp_stdio_thought_test.rs`；`EXTENSIONS_GAP_TRACKER.md` §4.2-2 | 已完成 | 归属 acp crate：改为本地 StubModel 注入 reasoning，去掉 live 依赖 【裁定 2026-10-31：已修：acp_stdio_thought_test 改为内置脚本化 SSE，不再依赖 live reasoning】 |
+| HARNESS-17 | P2 | `training::runner` 进程级 `OnceLock` 静态注册表 + `clear_all()` 测试间竞争 | Java 无对应 | `crates/agentscope-extensions-training/src/...runner`；`EXTENSIONS_GAP_TRACKER.md` §4.2-3 | 待办 | 归属 training crate：注册表改为实例级或加串行锁 【裁定 2026-10-31：改实例级注册表，删全局 clear_all 依赖】 |
 
 ### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
 
@@ -135,7 +137,7 @@
 2. **产品可用性**：HARNESS-01（tools.json 治理）→ HARNESS-09（MCP 服务器声明式注册）应串成一条链实现。
 3. **可靠性**：HARNESS-02（failover）与 HARNESS-12（stopOnReject）需改 `agentscope-core`，**必须由单一智能体独占串行**，不得与其他 core 改动并行。
 4. **阻塞**：HARNESS-03 依赖是否把 `FilesystemSpec` 上提到 harness（当前扩展 crate 已有 stand-in，属架构裁定，记 §4.2 待汇总方裁定）。
-5. **跨 crate 待裁定**：HARNESS-15/16（acp）、HARNESS-17（training）不在本 crate 边界内，仅登记不实施。
+5. **跨 crate 项（2026-10-31 裁定后）**：原 HARNESS-15 已去重退役（归 acp `ACP-01`）、HARNESS-16 关闭为 `已完成`、HARNESS-17 转 `待办`（training 注册表改实例级）；三者均不在本 crate 边界内，仅登记不实施。
 
 ### 4.3 与 Java 的已知差异（有意为之，非缺口）
 

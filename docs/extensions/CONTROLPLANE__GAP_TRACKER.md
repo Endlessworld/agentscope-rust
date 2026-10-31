@@ -141,6 +141,8 @@
 
 > 复核基线：Java `main` @ `1524b3191`；Rust 工作树 HEAD 见仓库。本表为本轮逐文件核对结论，**存量 §3.1–§3.4 历史清单保持原样未重新编号**。
 > 编号规则：`CP-NN`（缺口，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；§4.4 差异另有 `CP-D<NN>` / `CP-X<NN>` 系列。编号本模块内唯一、单调递增，不复用历史编号。
+> **2026-10-31 裁定（汇总方已确认）**：本文件的 `待裁定` 项已全部裁定，状态列更新为 `待办` / `设计决定（不迁移）` / `已完成`；裁定结论、依据与执行批次见 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.3。
+> 正文其它位置出现的旧「待裁定 N 项」为复核时点快照，一律以 §3.5/§3.6 表格的状态列为准。
 > 覆盖面：Java 主 39 类（9518 行）/ 测 14 类（3017 行）逐个映射；Rust 40 个 `.rs`（约 13.5k 行）逐包核对（adapter / transport / bridge / committed_export / event_journal / store / model）。优先级按**业务能力是否可达**判定，不按代码行数。
 > 测试数只引用既有实测：**158 lib passed / 0 failed + 4 e2e**（`tests/committed_export_e2e.rs`），本轮未运行 `cargo`。
 
@@ -160,7 +162,7 @@
 | CP-10 | P2 | 会话状态视图缺失：无 phase 状态机、`session_state` 恒 `busy:false`/`phase:running`、`sessions` 只回 id+phase（Java 返回 messageCount/tokenUsage/contextPressure/startedAt/lastActiveAt/isCompacted/taskSummary/framework） | `SessionBridge.java#setPhase`(L538)、`PHASE_ACTIVE/IDLE/COMPRESSING/ARCHIVED/TERMINATED`(L81-86)、`#sessionState`(L980-1027)、`#sessions`(L923) | `rg 'PHASE_|set_phase' src` 零命中；`src/transport/contract_provider.rs:52-73` 的默认 `session_phase` 恒 `running`、`session_state` 恒 `busy:false`，bridge 未覆盖（`src/bridge.rs:486-543`） | 待办 | bridge 维护 phase（busy → active/idle、compress → compressing、terminate → terminated）并输出 Java 同名字段；验收：断言 terminate 后 `phase=terminated`、压缩中 `phase=compressing`、进行中 `busy=true` |
 | CP-11 | P2 | busy 泄漏：只在 `AgentEnd` 复位，流报错/被取消/被 drop 时 `busy` 永久为 true（Java 用 `doFinally`） | `ControlPlaneObserverMiddleware.java#onAgent`（`doFinally(signal -> markBusy(false))`，L94、L120） | `src/adapter/observer_middleware.rs:217-219` 仅 `AgentEvent::AgentEnd` 分支复位 | 待办 | 在流终止的所有路径复位（`Drop` guard 或 `chain(once(...))`）；验收：`next` 返回 `Err` 的用例断言 `bridge.is_busy(session)==false` |
 | CP-12 | P2 | ASDP 无身份刷新入口：注册身份/凭证变化无法传播到后续帧 | `GrpcTransport.java#updateIdentity`(L178)、`SessionBridge.java#start` L229-241（`setIdentityListener` → `grpc.updateIdentity`） | `src/transport/asdp.rs:358-480` 无 `update_identity`；`UpstreamMeta` 在 `new` 时固定 | 待办 | 增加 `update_identity(credential/agent_id/binding_id/instance_key/generation)`，后续帧用新 meta；验收：单测断言更新后连接帧 `meta.agentId`/`generation` 变化 |
-| CP-13 | P2 | Level-1/Level-4/inventory 的**主动推送**是否需要在 Rust 侧实现（当前只有契约 HTTP 可拉取） | `SessionBridge.java#reportLevel1`(L676, 10s)、`#pushContext`(L653, cooldown 30s)、`#reportInventory`(L716, 30s) | `rg 'report_level1|push_context|report_inventory' src` 零命中；契约拉取已具备（`src/transport/contract_http_server.rs:155-186`）；`asdp.rs` 定义了 `UpstreamPayload::{SessionReport,ContextReport,Inventory}` 但 `frame()` 私有（`asdp.rs:479`）、无发送方法 | 待裁定 | 待与控制面协议确认：若控制面只经契约 HTTP 拉取，则本项关闭并在 §4.4 记差异；若需 push，在 CP-04 的 ASDP 环路上补 `report_sessions`/`report_context`/`report_inventory` 三个发送方法 |
+| CP-13 | P2 | Level-1/Level-4/inventory 的**主动推送**是否需要在 Rust 侧实现（当前只有契约 HTTP 可拉取） | `SessionBridge.java#reportLevel1`(L676, 10s)、`#pushContext`(L653, cooldown 30s)、`#reportInventory`(L716, 30s) | `rg 'report_level1|push_context|report_inventory' src` 零命中；契约拉取已具备（`src/transport/contract_http_server.rs:155-186`）；`asdp.rs` 定义了 `UpstreamPayload::{SessionReport,ContextReport,Inventory}` 但 `frame()` 私有（`asdp.rs:479`）、无发送方法 | 设计决定（不迁移） | 待与控制面协议确认：若控制面只经契约 HTTP 拉取，则本项关闭并在 §4.4 记差异；若需 push，在 CP-04 的 ASDP 环路上补 `report_sessions`/`report_context`/`report_inventory` 三个发送方法 【裁定 2026-10-31：不做主动推送：控制面走契约 HTTP 拉取；若协议要求再立项】 |
 
 ### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
 

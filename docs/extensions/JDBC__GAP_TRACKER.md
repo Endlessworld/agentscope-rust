@@ -160,6 +160,8 @@
 > 规模口径（源码统计，非测试运行结果）：Java 主代码 24 个 `.java`（含 3 个 `package-info`），测试 18 个类 **179** 个 `@Test`（另 5 个 `@ParameterizedTest`，`JdbcUnconditionalVersionTest`）；Rust `src/**` **37** 个 `.rs`、`tests/` **14** 个文件（`#[test]`/`#[tokio::test]` 合计 **259** + `src` 内联 **7**）。测试运行口径沿用 §1.1 既有实测：默认 **217 passed / 0 failed**，`postgres-executor + mysql-executor` 下 **271**。
 
 ### 3.6.1 缺口与待裁定
+> **2026-10-31 裁定（汇总方已确认）**：本文件的 `待裁定` 项已全部裁定，状态列更新为 `待办` / `设计决定（不迁移）` / `已完成`；裁定结论、依据与执行批次见 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.3。
+> 正文其它位置出现的旧「待裁定 N 项」为复核时点快照，一律以 §3.5/§3.6 表格的状态列为准。
 
 | 编号 | 优先级 | 缺口项（可执行描述） | Java 参考（文件#符号） | Rust 现状（文件:行 / rg 零命中） | 执行状态 | 下一动作 |
 |---|---|---|---|---|---|---|
@@ -174,7 +176,7 @@
 | JDBC-09 | P2 | MySQL 快照表 DDL 缺表级 `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`（Java 显式声明）。 | `dialect/vendor/MysqlDialect.java:155-163` | `src/dialect/vendor/mysql.rs:144-149`（列级 `CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` 已显式，表级子句缺失） | 待办（低风险） | 补表尾子句；影响面：唯一文本列已显式排序规则，仅在服务器默认 charset 非 utf8mb4 时影响新建表元数据 |
 | JDBC-10 | P2 | 表结构校验的 DDL 解析不剥离 SQL 注释（Java `stripComments`），带 `--` / `/* */` 注释的 DDL 可能解析出错误列集合或误判为不可解析而跳过校验。 | `dialect/TableSchemaValidator.java#CreateTableDdlParser.stripComments`（:376-417） | `src/dialect/table_schema.rs:32-105`（直接定位 `create table` 后的第一个 `(`；`rg 'strip_comment' src/dialect/table_schema.rs` 零命中） | 待办 | 解析前剥离注释；验收：带注释的 `CREATE TABLE` 解析出同一列集合 |
 | JDBC-11 | P2 | 缺多写者并发/交错用例：Java 用 4 写者 × 25 轮断言版本唯一且连续，并用连接 Proxy 断言「返回自己的版本」；Rust 只有单线程 + `InstrumentedExecutor` 单点交错。 | `state/JdbcUnconditionalVersionTest.java#concurrentStoreInstancesReturnUniqueContiguousVersions`、`#returnsOwnVersionEvenWhenAnotherWriterCommitsBeforeConnectionCloses` | `tests/state_tests.rs`（36 条，单线程；交错注入见 `tests/state_tests.rs:113-140` 的 `InstrumentedExecutor`；`rg '#\[ignore\]' tests/` 零命中） | 待办 | 在文件型 SQLite / `DriverExecutor` 上补多实例并发用例（与 JDBC-01/02 联动） |
-| JDBC-12 | 待裁定 | 写失败被静默降级：`save`/`save_list`/`delete` 失败仅 `tracing::warn!`，调用方无法感知状态未落库（Java 抛 `RuntimeException`）。是否在 core `AgentStateStore` 增设可观测失败通道，还是由本 crate 另提供 `try_save*` 固有方法。 | `state/JdbcAgentStateStore.java#executeInWriteTransaction`（:498-530，统一包成 `RuntimeException`） | `src/state/jdbc_agent_state_store.rs:435-462`（`save`/`save_list` 吞错 + warn）、`:505-521`（`delete` 同） | 待裁定 | 汇总方决定通道归属；在此之前本 crate 可先补 `*_checked` 固有方法供 harness 内部使用 |
+| JDBC-12 | P1 | 写失败被静默降级：`save`/`save_list`/`delete` 失败仅 `tracing::warn!`，调用方无法感知状态未落库（Java 抛 `RuntimeException`）。是否在 core `AgentStateStore` 增设可观测失败通道，还是由本 crate 另提供 `try_save*` 固有方法。 | `state/JdbcAgentStateStore.java#executeInWriteTransaction`（:498-530，统一包成 `RuntimeException`） | `src/state/jdbc_agent_state_store.rs:435-462`（`save`/`save_list` 吞错 + warn）、`:505-521`（`delete` 同） | 待办 | 汇总方决定通道归属；在此之前本 crate 可先补 `*_checked` 固有方法供 harness 内部使用 【裁定 2026-10-31：A：core AgentStateStore 增 try_* 默认方法族，harness 落盘改走 try_*】 |
 
 ### 3.6.2 本轮复核确认已对齐（抽样，不求穷举）
 

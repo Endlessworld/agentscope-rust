@@ -114,6 +114,8 @@
 
 > 复核基线：Java `main` @ `1524b3191`；Rust 工作树 HEAD 见仓库。本表为本轮逐文件核对结论，**存量 §3.1–§3.4 历史清单保持原样未重新编号**。
 > 编号规则：`NACOS-NN`（缺口，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；§4.3 差异另有 `NACOS-D<NN>` / `NACOS-X<NN>` 系列。编号本模块内唯一、单调递增，不复用历史编号。
+> **2026-10-31 裁定（汇总方已确认）**：本文件的 `待裁定` 项已全部裁定，状态列更新为 `待办` / `设计决定（不迁移）` / `已完成`；裁定结论、依据与执行批次见 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.3。
+> 正文其它位置出现的旧「待裁定 N 项」为复核时点快照，一律以 §3.5/§3.6 表格的状态列为准。
 > 复核范围：Java 三子模块 11 个主类（2095 行）/ 8 个测试类（120 个 `@Test`）↔ Rust crate 14 个 `.rs`；测试数沿用既有实测 **92 passed / 0 failed（`--features http-client`，默认构建同）**，本轮未运行 cargo。
 
 ### 3.5.1 缺口与待裁定
@@ -134,8 +136,8 @@
 | NACOS-12 | P2 | 订阅无退订/关闭：listener 表只增不减，`poll_once` 永久拉取已弃用的 key | 模块内 Java 亦未显式退订（`NacosPromptListener` 无 unsubscribe），生命周期由 `AiService` 客户端销毁承担 | `src/http.rs:196-203` `Subscriptions` 只有 insert/读取；`rg 'unsubscribe|remove_listener|fn close|fn shutdown' src` 零命中 | 待办 | 增 `unsubscribe_prompt`/`unsubscribe_card` 与 `NacosHttpAiService::close()`；验收：退订后 `poll_once()` 不再发起该 key 的请求（fake transport 请求计数） |
 | NACOS-13 | P2 | 「HTTP 轮询 → 订阅者」缺端到端用例；`spawn_polling` 全仓无调用方（仅 re-export），订阅刷新实际未接线 | Java push 由 SDK 长连接直达 `AbstractNacosPromptListener#onEvent`（`NacosPromptListener.java:50-64`） | `spawn_polling` 仅 `src/lib.rs:32` re-export 与 `src/http/reqwest_transport.rs:62` 定义，`rg 'spawn_polling' --glob '*.rs'` 无第三处；`src/http.rs:725-780` 只覆盖 `poll_once` 与 listener 各自行为 | 待办 | 补用例：`NacosPromptListener` / `NacosAgentCardResolver` 建在 `NacosHttpAiService` 之上，fake transport 第二次返回变更值 → `poll_once()` 后其缓存/lookup 返回新值；并给 `NacosHttpAiService::polling(interval)` 便捷装配；验收：该端到端用例绿 |
 | NACOS-14 | P2 | `NacosSkillRepositoryInfo.location` 的文档注释写成 `nacos://<namespace>`，与实现 `namespace:<ns>` 不符（实现正确、注释错，易误导调用方） | `NacosSkillRepository.java:88`（`LOCATION_PREFIX = namespace:`）、`:148` | `src/skill/mod.rs:57-58` 注释 vs `src/skill/mod.rs:115`（实测 `namespace:public`，既有用例 `repo_metadata_matches_java` 已断言正确值） | 待办 | 只改注释；验收：注释与 `repo_metadata_matches_java` 期望一致 |
-| NACOS-15 | P2 | 待裁定：`AiServiceError` 是否升级为分类枚举（Transport / Http / Business / Serde），以支持重试判定与 fallback 分支 | `NacosException` 以 `errCode` 分类，调用方按码分支（`NacosSkillRepository.java#getSkill` 只特判 `NOT_FOUND`） | `src/service.rs:24-52` 单一 `{code, message}`；传输失败与解析失败都归 `code=500`（`src/http.rs:296`、`:311`） | 待裁定 | 与 NACOS-06 / NACOS-11 一并定：若做重试，必须先有「可重试」信号；裁决后统一改 `service.rs` 与全部调用点（`rg 'AiServiceError::new' src` 全部复核） |
-| NACOS-16 | P2 | 待裁定：namespace 语义归属——按配置（一 service 一 namespace，`NacosHttpConfig.namespace`）还是按调用（trait 方法逐次带 `namespaceId`） | Java 每个 `AiService` 绑定一份 `Properties(namespace)`；`NacosSkillRepository` 的 `namespaceId` 只用于 source/location，下载仍走注入的 `AiService` | 现状同 Java（`src/skill/mod.rs:64`），但 HTTP 实现必须显式带参才能落到正确命名空间 → 与 NACOS-04 强相关 | 待裁定 | 若选配置级：`NacosHttpConfig.namespace` 变必填并覆盖所有请求，NACOS-04 即关闭；若选参数级：trait 全方法加 `namespace` 参数，`NacosSkillRepository` 用自己的 `namespace_id` 覆盖配置 |
+| NACOS-15 | P2 | 待裁定：`AiServiceError` 是否升级为分类枚举（Transport / Http / Business / Serde），以支持重试判定与 fallback 分支 | `NacosException` 以 `errCode` 分类，调用方按码分支（`NacosSkillRepository.java#getSkill` 只特判 `NOT_FOUND`） | `src/service.rs:24-52` 单一 `{code, message}`；传输失败与解析失败都归 `code=500`（`src/http.rs:296`、`:311`） | 待办 | 与 NACOS-06 / NACOS-11 一并定：若做重试，必须先有「可重试」信号；裁决后统一改 `service.rs` 与全部调用点（`rg 'AiServiceError::new' src` 全部复核） 【裁定 2026-10-31：A：升级为分类枚举 Transport/Http/Business/Serde，保留 code/message 构造】 |
+| NACOS-16 | P2 | 待裁定：namespace 语义归属——按配置（一 service 一 namespace，`NacosHttpConfig.namespace`）还是按调用（trait 方法逐次带 `namespaceId`） | Java 每个 `AiService` 绑定一份 `Properties(namespace)`；`NacosSkillRepository` 的 `namespaceId` 只用于 source/location，下载仍走注入的 `AiService` | 现状同 Java（`src/skill/mod.rs:64`），但 HTTP 实现必须显式带参才能落到正确命名空间 → 与 NACOS-04 强相关 | 待办 | 若选配置级：`NacosHttpConfig.namespace` 变必填并覆盖所有请求，NACOS-04 即关闭；若选参数级：trait 全方法加 `namespace` 参数，`NacosSkillRepository` 用自己的 `namespace_id` 覆盖配置 【裁定 2026-10-31：A：配置级 namespace 必填 + 方法级可选 override，顺带关闭 NACOS-04】 |
 
 ### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
 

@@ -3,7 +3,7 @@
 > **用途**：`agentscope-extensions` 迁移的**汇总视图**（22 个模块的状态、跨模块裁定、验收口径）。**不替代**任何模块 tracker。
 > **单一事实来源**：`docs/extensions/<MODULE>__GAP_TRACKER.md`。本文件与独立 tracker 冲突时**以独立 tracker 为准**，并在下次汇总时回填本文。
 > **开工顺序**：本文件 → 本模块 tracker → `docs/extensions/EXTENSIONS_MIGRATION_PLAN.md`（范围/波次/并行约束）→ `docs/MIGRATION_PLAN.md` + `docs/MIGRATION_GAP_TRACKER.md`（core/harness）。
-> **结论（2026-10-31 全量对齐复核后）**：历史 22 个模块的**存量**缺口清单仍全部关闭；但本轮**逐文件复核**（Java `main` @ `1524b3191` ↔ 本仓 HEAD，覆盖 30 个 crate：22 个 extensions 模块 + core + harness + acp + 6 个 protocol 子 crate）新增 **544 行带唯一编号的清单条目**：**待办 220 / 待裁定 41 / 已完成（本轮确认已对齐）264 / 无显式状态 19**，其中 **P0 30 条**（§3.1）。⇒ 结论更正为：**迁移未真正完成，P0 未清零前不达生产可用**。
+> **结论（2026-10-31 全量对齐复核后）**：历史 22 个模块的**存量**缺口清单仍全部关闭；但本轮**逐文件复核**（Java `main` @ `1524b3191` ↔ 本仓 HEAD，覆盖 30 个 crate：22 个 extensions 模块 + core + harness + acp + 6 个 protocol 子 crate）共 **543 行带唯一编号的清单条目**（`HARNESS-15` 去重退役，原 544）：**待办 254 / 设计决定（不迁移）5 / 已完成（本轮确认已对齐）265 / 无显式状态 19 / 待裁定 0**，其中 **P0 30 条**（§3.1）。逐行核对时 `待裁定` 实为 **43 行**（汇总表原把 `ACP-03`/`ACP-04` 并入「待办」）；其中 **41 项已于 2026-10-31 全部裁定**（§3.3），另 2 行按「已修 / 重复」关闭。⇒ 结论：**迁移未真正完成，P0 未清零前不达生产可用**。
 > **历史**：裁剪前的完整历史快照存档于 [`history/EXTENSIONS_MIGRATION_HISTORY.md`](./history/EXTENSIONS_MIGRATION_HISTORY.md)（只读，仅供追溯）。
 
 ## 0. 如何阅读本文件
@@ -50,8 +50,8 @@
 
 | 项 | tracker | 对照面 | 缺口行 | P0 | 待裁定 |
 |---|---|---|---|---|---|
-| CORE | [`CORE__GAP_TRACKER.md`](./CORE__GAP_TRACKER.md)（新建） | `agentscope-core` 22 个 Java 包（361 类 / 63k 行）↔ 103 个 `.rs` / 36.5k 行 | 26 | 1（CORE-01） | 2（CORE-13/14） |
-| HARNESS | [`HARNESS__GAP_TRACKER.md`](./HARNESS__GAP_TRACKER.md)（新建） | `agentscope-harness` 全包（295 类 / 53k 行）↔ 153 个 `.rs` / 49.8k 行 | 28 | 1（HARNESS-15，归属 acp） | 3（HARNESS-15/16/17） |
+| CORE | [`CORE__GAP_TRACKER.md`](./CORE__GAP_TRACKER.md)（新建） | `agentscope-core` 22 个 Java 包（361 类 / 63k 行）↔ 103 个 `.rs` / 36.5k 行 | 26 | 1（CORE-01） | 0（2026-10-31 已裁定） |
+| HARNESS | [`HARNESS__GAP_TRACKER.md`](./HARNESS__GAP_TRACKER.md)（新建） | `agentscope-harness` 全包（295 类 / 53k 行）↔ 153 个 `.rs` / 49.8k 行 | 28 | 0（HARNESS-15 去重退役） | 0（2026-10-31 已裁定） |
 | ACP | [`docs/ACP_AGENT__GAP_TRACKER.md`](../ACP_AGENT__GAP_TRACKER.md)（沿用并补充） | **Java 无 ACP**（`rg -i acp` 对 Java 源码零命中）→ 改按协议规范/`ACP_AGENT_PLAN.md` 核对 | 20 | 1（ACP-01） | 0 |
 
 - 两份新 tracker **取代**根 `GAP_TRACKER.md` 与 `docs/MIGRATION_GAP_TRACKER.md` 中 core/harness 相关段落的口径（旧文件保留作历史）。
@@ -76,7 +76,7 @@
 | B4=A | 新建 judge/jev crate | 已落地：`crates/agentscope-extensions-judge`；根 `Cargo.toml` 仅加 1 行 `[workspace] members`（唯一授权例外） |
 | B5=A | tracer seam 归并到 STUDIO telemetry exporter | 已落地：`studio/src/telemetry/exporter.rs::TraceExporter`（trait 注入，不引入 `opentelemetry` crate） |
 | B6=A | 补 plan-mode 白名单与拒绝逻辑 | 已落地：core `PLAN_MODE_ALWAYS_ALLOWED` / `plan_mode_denies()`，harness `PlanModeHandle` 注册进 toolkit |
-| C1=A | 引入 liteparse 做 RAG 文档解析（替代 JVM 解析器） | 落地口径：`TextReader` 等文本路径已迁；`TikaReader`/`PDFReader`/`WordReader` 判不迁移（`rag/src/reader.rs` 头注释 + RAG tracker §3.3） |
+| C1=A | 引入 liteparse 做 RAG 文档解析（替代 JVM 解析器） | 落地口径：`TextReader` 等文本路径已迁；`TikaReader`/`PDFReader`/`WordReader` 判不迁移（`rag/src/reader.rs` 头注释 + RAG tracker §3.3）；**2026-10-31 `RAG-09` 改判**：不引入 liteparse，改 `Reader` seam + 可选 `pdf`/`docx` feature + `ExternalApiReader` 接外部服务（§3.3.1） |
 | C2=A | Redis **Cluster hash tag** | 已落地：REDIS `state/redirect.rs`（MOVED/ASK）+ `CLUSTER SLOTS` 拓扑扇出 + env 门控集群用例 |
 | C3=A | 接受 JDBC **破坏性重构** | 按新结构落地（`dialect`/`store`/`state`/`snapshot`/`sandbox` 重划），不设旧 API 兼容层 |
 | C4=A | server tools（Gemini/Anthropic）立项改 **core** | 已落地：core `is_server_tool` / `inline_server_tool_result_ids`；gemini `GeminiServerTool`、anthropic 6 个 `*ToolResult` 变体 + metadata 回放 |
@@ -97,11 +97,12 @@
 
 **历史结论（2026-10-31 复核前）**：22 份独立 tracker 的原缺口表已无 `- [ ]`、无有效「未完成 / 待办 / 待实施 / 未迁移」项，剩余差异落为 §3.2 的两种已裁定形态。
 
-**现行结论（2026-10-31 全量对齐复核）**：逐文件复核对出 **P0 30 / P1 97 / P2 131 / 待裁定 41**，**P0 清零前不得声称生产可用**。编号规范：`<MOD>-NN` = 缺口（状态取 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；`<MOD>-DNN` = 设计决定（不迁移）；`<MOD>-XNN` = 设计决定与已知差异。**存量历史清单保持原样未重编号**。
+**现行结论（2026-10-31 全量对齐复核 + 汇总方裁定）**：逐文件复核对出 **P0 30 / P1 101 / P2 136**（裁定后补录优先级：`JDBC-12`/`OSS-09`/`TRAIN-10`/`TRAIN-11` = P1；`MODEL-12`/`MODEL-13`/`OSS-10`/`STUDIO-12`/`STUDIO-13` = P2）；`待裁定` 43 行已于 2026-10-31 全部处理完毕（**41 项裁定**：转 `待办` 36 项、转 `设计决定（不迁移）` 5 项；另 `HARNESS-16` 关闭为 `已完成`、`HARNESS-15` 去重退役），**`待裁定` 归零**，结论见 §3.3。**P0 清零前不得声称生产可用**。编号规范：`<MOD>-NN` = 缺口（状态取 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；`<MOD>-DNN` = 设计决定（不迁移）；`<MOD>-XNN` = 设计决定与已知差异。**存量历史清单保持原样未重编号**。
 
-### 3.1 各模块复核结果（2026-10-31）
+### 3.1 各模块复核结果（2026-10-31，**裁定前快照**）
 
 > 口径：以各模块 tracker 的「2026-10-31 全量对齐复核清单」为准；数字仅计算带模块前缀的编号行（`已对齐` 行计入「已完成」列）；`PROTOCOL` 按子 crate 前缀 `PROTO-A2A-*` / `PROTO-AP-*` / `PROTO-AGUI-*` / `PROTO-CCW-*` 统计。
+> **本表为复核时点快照（裁定前）**：43 行 `待裁定`（41 项裁定 + `HARNESS-16` 关闭 + `HARNESS-15` 退役）已于 2026-10-31 全部处理完毕（§3.3）；原 ACP 行 `待办 7 / 待裁定 0` 是汇总口径错误（`ACP-03`/`ACP-04` 行内状态为 `待裁定`），已就地更正为 `待办 5 / 待裁定 2`（裁定后均转 `待办`）。
 
 | 模块 | 编号前缀 | 待办 | 待裁定 | P0 | P1 | P2 | 已完成/已对齐 | 最高优先级项（一行） |
 |---|---|---|---|---|---|---|---|---|
@@ -128,7 +129,7 @@
 | JUDGE | `JUDGE-` | 2 | 2 | 0 | 2 | 2 | 8 | JUDGE-01 JEV 三个中间件未迁（待裁定归属）；openai-decisions 已全量覆盖 |
 | CORE | `CORE-` | 12 | 2 | 1 | 4 | 9 | 12 | CORE-01 middleware `RequestStop` 无消费点 → 中间件停止语义失效 |
 | HARNESS | `HARNESS-` | 14 | 3 | 0 | 9 | 8 | 11 | HARNESS-15 降为 P1（测试侧已修 `5883c98`）；HARNESS-04/05 `AsyncToolMiddleware`/`SandboxLifecycleMiddleware` 未接线；HARNESS-01 `tools.json` 治理缺失 |
-| ACP | `ACP-` | 7 | 0 | 0 | 4 | 3 | 13 | ACP-01 降为 P1（测试侧已修 `5883c98`，残留为 `running` 无上限设计风险） |
+| ACP | `ACP-` | 5 | 2 | 0 | 4 | 3 | 13 | ACP-01 降为 P1（测试侧已修 `5883c98`，残留为 `running` 无上限设计风险） |
 
 **P0 分组（30 条，建议按此顺序清零）**
 
@@ -139,7 +140,7 @@
 | 3 | 消息可靠性（丢消息/静默失败） | CHANNEL-N01 / N02 / N03 |
 | 4 | 运行时安全（panic / 不可恢复） | OSS-01、PG-01、REDIS-03、SANDBOX-01 / 03 |
 
-**待裁定（41 条）**：均为 trait/抽象归属或跨模块决策，需汇总方裁定后才能在模块内落地。典型：`SandboxGuard::try_enter` 无 `Result` 通道（REDIS-06 / MYSQL-05）、`Channel::deliver_with_receipt` 归属（CHANNEL-N05）、ACP cancel 归属（HARNESS-15）、`@Tool` 宏是否新建 `agentscope-macros`（CORE-14）、A2A 单版本 vs 双版本协商（PROTO-A2A-01）、hook 是否上提 harness（TRAIN-10）、`Memory` 是否标 deprecated（CORE-13）、JEV 中间件归属（JUDGE-01/04）。
+**~~待裁定（41 条）~~ 已于 2026-10-31 全部裁定（见 §3.3）；以下为复核时点快照，不再代表现行状态**：均为 trait/抽象归属或跨模块决策，需汇总方裁定后才能在模块内落地。典型：`SandboxGuard::try_enter` 无 `Result` 通道（REDIS-06 / MYSQL-05）、`Channel::deliver_with_receipt` 归属（CHANNEL-N05）、ACP cancel 归属（HARNESS-15）、`@Tool` 宏是否新建 `agentscope-macros`（CORE-14）、A2A 单版本 vs 双版本协商（PROTO-A2A-01）、hook 是否上提 harness（TRAIN-10）、`Memory` 是否标 deprecated（CORE-13）、JEV 中间件归属（JUDGE-01/04）。
 
 原「零未关闭条目」口径见 §3.2（存量差异，仍有效）。
 
@@ -163,6 +164,79 @@
 | 设计决定 | SANDBOX `watch=true` 模板与 port-forward | port-forward 为宿主 seam（`port_forward_strategy_uses_the_forwarder_local_endpoint`） |
 | 设计决定 | HIGRESS `build_input_schema` 键裁剪 | 为 Java 内部字段裁剪行为，无协议影响 |
 
+### 3.3 裁定记录（2026-10-31，汇总方已确认）
+
+> 口径：本节是 `待裁定` 项的**唯一裁定结论**；各模块 tracker 的状态列与行内 `【裁定 2026-10-31：…】` 标注与本节一致。
+> 裁定原则（冲突时按序）：① 正确性 > 兼容性 > 便利性（静默丢数据 / 静默失去互斥一律 fail-closed，允许破内部 API）；② core/harness 只做「加默认方法 / 只读 getter / 可选字段」，默认值保持现行为；③ 不引入反向依赖（harness 不依赖 extension crate，装配入口由能力方提供）；④ 不新增硬依赖换能力（seam + 可选 feature 优先）；⑤ 对齐 Java 语义、不照抄实现；⑥ 每条裁定必须落到一条会失败的测试，只改文档不算关闭。
+
+**结论：43 行 `待裁定` 全部处理完毕 → 转 `待办` 36 / 转 `设计决定（不迁移）` 5 / 关闭 2（`HARNESS-16` 已完成、`HARNESS-15` 去重退役）→ `待裁定` 归零。** 裁定后总数：待办 254 / 设计决定 5 / 已完成 265 / 无显式状态 19 = 543 条（`HARNESS-15` 退役后）。
+
+#### 3.3.1 转 `待办`（36 项）
+
+| 编号 | 裁定结论（一行） |
+|---|---|
+| `JDBC-12`（P1） | core `AgentStateStore` 增 `try_*` 默认方法族（默认 `Err(unsupported)`），harness 落盘改走 `try_*` |
+| `COS-02` | 同上；读解析失败返回 `Err`，不再 `.ok()` / `unwrap_or_default()` |
+| `REDIS-05` | 同上；另把 `delete` 错误文案补 user/session |
+| `REDIS-06` | `SandboxGuard::try_enter` 改返回 `Result`，取锁失败即中止 |
+| `MYSQL-05` | 同 `REDIS-06` |
+| `PG-04` | 同 `REDIS-06` |
+| `MONGO-04` | 同 `REDIS-06` |
+| `MODEL-12`（P2） | 上提 `Model::tool_search_mode()`，默认 `Function` |
+| `STUDIO-13`（P2） | 上提 `Model::provider_name()` 默认 `unknown`；`with_provider_name` 失效改为可见 |
+| `STUDIO-12`（P2） | core 增 `ExtensionPoint::OnFormat` + `Middleware::on_format`，在 `call_with_format` 包裹 |
+| `ACP-03` | handler 改用 `cx` + `agent.inspect_session` 回放 chunk |
+| `ACP-04` | core `SessionLogStore::delete` 默认 `Err(unsupported)` + acp 调 delete + 删 sidecar |
+| `HARNESS-17` | training 注册表改实例级，删全局 `clear_all` 依赖 |
+| `MEM-01`（P0） | mem crate 提供 `MemLongTermMemoryMiddleware`，宿主经 builder `.middleware()` 挂载 |
+| `CHANNEL-N09` | channel crate 提供 `build_gateway_registry` 单入口 + 真实装配测试 |
+| `TRAIN-10`（P1） | harness 加通用 `on_agent_built` + `agent_handle`；training 提供 `attach_to(builder)` |
+| `TRAIN-11`（P1） | （a）`RuntimeContext.extensions` 为主 +（b）`annotation_provider` 兜底，并存 |
+| `HIGRESS-07` | `McpToolSource` trait 上提 harness，`McpClientManager` 提供 adapter |
+| `PROTO-A2A-01`（P0） | 单版本切 1.0（`supportedInterfaces`/`protocolBinding`/`securityRequirements`/PascalCase），dispatch 保留 0.3 方法名别名两个版本周期 |
+| `PROTO-A2A-05` | 不做 push：能力位保持 `false`，四方法返回 `UnsupportedOperationError` |
+| `CHANNEL-N05` | harness `Channel`/`ChannelSink` 加默认 `deliver_with_receipt`（默认 `Err(Unsupported)`），飞书/微信覆写 |
+| `HIGRESS-06` | `McpServerConfig` 加 `transport: Option<McpTransport>`（`None` = 保持嗅探） |
+| `SCHED-05` | 文档声明单实例前提 + `SchedulerLock` trait（默认 no-op）由宿主注入 |
+| `SCHED-06` | 宿主桥接契约（`ExecutorBridge` + 字段映射文档），不内置 HTTP server |
+| `SCHED-09` | 可配 `Arc<Semaphore>`，默认 10 |
+| `SKILLS-10` | 保持系统 `git` CLI + 启动自检（`git --version`）+ 明确错误文案 |
+| `OSS-09`（P1） | 提升 workspace MSRV 至 1.85 |
+| `RAG-09` | 撤销 C1=A（不引入 liteparse）：`Reader` seam + 可选 feature（pdf/docx）+ `ExternalApiReader` 接外部服务 |
+| `RAG-10` | 维持 RAG 自持 `EmbeddingModel`，加 rag→model 的 wire 契约测试挡漂移 |
+| `NACOS-15` | 升级为分类枚举 `Transport`/`Http`/`Business`/`Serde`，保留 `code/message` 构造 |
+| `NACOS-16` | 配置级 `namespace` 必填 + 方法级可选 override，顺带关闭 `NACOS-04` |
+| `JUDGE-01` | 撤销原「非运行链路」判定：照 `openai_decisions/middleware.rs` 迁移三中间件到 `src/jev/runtime` |
+| `JUDGE-04` | 不改 core：judge 提供 `JevConfirmGuard::wrap`，由装配层比对 |
+| `CORE-13` | `Memory` 兼容层保留 + `#[deprecated]`，一个 minor 周期后再评估删除 |
+| `SANDBOX-09` | `SandboxManager::release` 按值消费 `SandboxAcquireResult` 并 `close()` |
+| `PG-03` | 接受与 Java 的 DDL 差异：`DEFAULT 1` + insert 显式 `version=1` + 旧库迁移脚本 |
+
+#### 3.3.2 转 `设计决定（不迁移）`（5 项）
+
+| 编号 | 裁定结论（一行） |
+|---|---|
+| `COS-08` | 对象存储无租约原语：保持进程内 + `is_distributed=false`，跨进程互斥由 jdbc/redis/pg/mysql/mongo guard 承担 |
+| `MODEL-13`（P2） | 维持无解析缓存；若将来加缓存须同时做注册驱逐 + 单飞 |
+| `CORE-14` | 本轮不建 `agentscope-macros`；若做只做 `#[derive(ToolParams)]`（参数结构 → schema），不做函数宏 |
+| `CP-13` | 不做主动推送：控制面走契约 HTTP 拉取；若协议要求再立项 |
+| `OSS-10`（P2） | 仅 S3 兼容子集；原生特性将来走 `opendal` 第二后端（可选 feature） |
+
+#### 3.3.3 关闭（2 项）
+
+| 编号 | 关闭原因 |
+|---|---|
+| `HARNESS-16` → `已完成` | `acp_stdio_thought_test` 早已改为内置脚本化 OpenAI 兼容 SSE（`tests/acp_stdio_thought_test.rs:96-199`），不再依赖 live reasoning；§4.2-2 的 flaky 记录同步更正 |
+| `HARNESS-15` → 去重退役 | 与 `docs/ACP_AGENT__GAP_TRACKER.md` 的 `ACP-01` 为同一问题（同 `session.rs` 行号、同用例），执行归 `ACP-01`；编号保留不复用 |
+
+#### 3.3.4 裁定后执行批次
+
+1. **批次 0（唯二 P0 裁定项，已转 `待办`）**：`PROTO-A2A-01`、`MEM-01`。
+2. **批次 1（core，单智能体串行）**：`try_*` 方法族、`SandboxGuard::try_enter -> Result`、`Model::tool_search_mode`/`provider_name`、`ExtensionPoint::OnFormat`、`SessionLogStore::delete`、`Memory` 弃用标注 —— 全部非破坏式（默认方法 / 新增扩展点）。
+3. **批次 2（harness）**：`on_agent_built` + `agent_handle`、`Channel::deliver_with_receipt`、`McpServerConfig.transport`、`McpToolSource` 上提、`SandboxManager::release` 按值 + fail-closed 接线。
+4. **批次 3（模块落地）**：各 crate 实现 + 故障注入测试。
+5. **批次 4（文档收口）**：`COS-08`/`MODEL-13`/`CORE-14`/`CP-13`/`OSS-10` 落 §4.3.1、`RAG-09` 改判记录、`SCHED-05/06` 契约文档、`HARNESS-15/16` 状态更正。
+
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable 1.96.1）
@@ -184,16 +258,16 @@ cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ### 4.2 已知非本轮问题（pre-existing，不计入模块缺口）
 
 1. ~~ACP `a_cancelled_turn_does_not_block_the_next_prompt` 永久挂起~~ **已修**（提交 `5883c98`，仅测试代码）。真因不是 cancel 链路：用例硬编码 `sleep(400ms)` 后取消，而冷会话到首次模型调用前的簿记约 0.7–1.0s；取消若抢赢，第 1 轮在到达 provider 前就被取消，于是 fixture 的「首次调用永久挂起」落到没人取消的第 2 轮 → 永久等待。改为等模型调用计数 ≥1 再取消（10s 上限 + 超时断言），断言强度未降。残留风险：provider 永不返回且客户端永不取消时 `running` 仍无上限（有意不加粗粒度超时，避免杀掉健康长任务）。
-2. `acp_stdio_thought_test` 依赖 live 模型的 reasoning 输出 → 偶发失败（既有 flaky）。
+2. ~~`acp_stdio_thought_test` 依赖 live 模型的 reasoning 输出 → 偶发失败~~ **已修（`HARNESS-16` 关闭，2026-10-31 裁定）**：测试改为内置脚本化 OpenAI 兼容 SSE（`tests/acp_stdio_thought_test.rs:96-199`），不再依赖 provider 返回 reasoning；遗留仅是 `agent_exe()` 依赖预构建 bin（见 ACP-05）。
 3. `agentscope-extensions-training::runner` 使用进程级 `OnceLock` 静态注册表 + `clear_all()`，默认并行度下测试间竞争 → 单跑稳定（`-j 2` 可规避）。
 
 ### 4.3 后续事项
 
 1. **P0 清零（30 条）**：按 §3.1 的四组顺序执行（装配接线 → 互操作协议 → 消息可靠性 → 运行时安全）。每组完工后回填本模块 tracker §3.5 状态并同步本文 §3.1。
-2. **待裁定 41 条**：需汇总方先就抽象归属做裁定（trait 签名是否加 `Result`、`deliver_with_receipt` 归属、ACP cancel 归属、`@Tool` 宏、A2A 单/双版本、hook 上提 harness 等），裁定后转为 `待办`。
+2. **~~待裁定 41 条~~ 已完成（2026-10-31 全部裁定，见 §3.3）**：36 项转 `待办`（按 §3.1 的 P0 分组顺序执行）、5 项转 `设计决定（不迁移）`（`COS-08` / `MODEL-13` / `CORE-14` / `CP-13` / `OSS-10`）；`HARNESS-16` 关闭为 `已完成`、`HARNESS-15` 去重退役。执行批次见 §3.3.4。
 3. **真实后端联调**：MySQL / PostgreSQL / Redis（单机 + 集群）/ MongoDB / Docker 沙箱**已实测通过**（§3.2 + `history/EXTENSIONS_MIGRATION_HISTORY.md`）；仍缺环境：E2B、Kubernetes、MEM 三厂商、CHANNEL 真实租户、Trinity-RFT。
-4. **可选增强（P2，131 条）**：测试密度对齐 Java（如 SKILLS 108 vs 192 `@Test`、POSTGRESQL 53 个 Java 用例未覆盖）；各 tracker §3.5 的 P2 行即候选清单。
-5. **历史遗留（已部分消化）**：ACP `running` 无上限仅在「provider 永不返回且客户端永不取消」时可触发——测试侧竞态已由 `5883c98` 修复，**ACP-01 / HARNESS-15 已降为 P1**，动手改设计前需先论证不会误杀健康长任务；`acp_stdio_thought_test` 已改脚本化 SSE，不再依赖 live reasoning（HARNESS-16 注记）；`training::runner` 进程级静态注册表竞争（HARNESS-17）。
+4. **可选增强（P2，136 条）**：测试密度对齐 Java（如 SKILLS 108 vs 192 `@Test`、POSTGRESQL 53 个 Java 用例未覆盖）；各 tracker §3.5 的 P2 行即候选清单。
+5. **历史遗留（已部分消化）**：ACP `running` 无上限仅在「provider 永不返回且客户端永不取消」时可触发——测试侧竞态已由 `5883c98` 修复，**ACP-01 已降为 P1（`HARNESS-15` 已于 2026-10-31 去重退役，执行归 `ACP-01`）**，动手改设计前需先论证不会误杀健康长任务；`acp_stdio_thought_test` 已改脚本化 SSE，不再依赖 live reasoning（HARNESS-16 注记）；`training::runner` 进程级静态注册表竞争（HARNESS-17）。
 
 ## 5. 执行约定（所有会话必须遵守）
 

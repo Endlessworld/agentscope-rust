@@ -72,6 +72,8 @@
 
 > 复核基线：Java `main` @ `1524b3191`；Rust 工作树 HEAD 见仓库。本表为本轮逐文件核对结论，**存量 §3.1–§3.2 历史清单保持原样未重新编号**。
 > 编号规则：`OSS-NN`（缺口，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；§4.3 差异另有 `OSS-D<NN>` / `OSS-X<NN>` 系列。编号本模块内唯一、单调递增，不复用历史编号。
+> **2026-10-31 裁定（汇总方已确认）**：本文件的 `待裁定` 项已全部裁定，状态列更新为 `待办` / `设计决定（不迁移）` / `已完成`；裁定结论、依据与执行批次见 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §3.3。
+> 正文其它位置出现的旧「待裁定 N 项」为复核时点快照，一律以 §3.5/§3.6 表格的状态列为准。
 > 测试口径：**既有实测 64 passed（默认，+1 doc-test）/ 75 passed（`--features s3`，+2 doc-test）**；本轮**未运行** cargo，静态计数为默认 76 / `--features s3` 87（`tests/strict_errors.rs` 12 例晚于上述实测口径）。
 
 ### 3.5.1 缺口与待裁定
@@ -86,8 +88,8 @@
 | OSS-06 | P2 | `search` 每翻一页都枚举 namespace 下**全部** key 再内存排序切页：大 namespace 下 O(n) 列表 + 全量内存驻留，翻页越深越慢 | `OssBaseStore.java#search`（同一实现：listAll + `Collections.sort` + subList） | `src/base_store.rs:191-240`（`list_all` → `sort` → 切片）、`src/client.rs:73-92`（`list_all` 循环翻页） | 待办 | 直接用服务端有序翻页：请求 `max_keys = offset + limit` 或 `start_after`/continuation token，避免全量列举；验收：`search(limit=10, offset=0)` 只发 1 次 list 且 `max-keys` 有界（httpmock 断言） |
 | OSS-07 | P2 | 大对象无 multipart 上传：单次 PUT 受 5 GiB 限制，超大 sandbox 快照/文件会直接失败；`put` 也无 `Content-Type`/`Content-MD5` 校验 | `OssRemoteSnapshotClient.java#upload`（单次 `putObject`，OSS 同为 5 GB 上限——Java 侧亦未分片） | `src/snapshot.rs:61-66`（`client.put(&key, data)` 单次）、`src/s3.rs:350-352`（`bucket.put_object`） | 待办 | `OssClient` 增可选 `put_multipart(key, data, part_size)`（CreateMultipartUpload/UploadPart/Complete）；验收：httpmock 断言分片序列，<5 GiB 路径行为不变 |
 | OSS-08 | P2 | S3 后端与 store 层「组合」零覆盖：`tests/s3.rs` 只测 `S3OssClient` 五种方法，`OssAgentStateStore`/`OssStore` + `S3OssClient` 从未一起被驱动（OSS-01 正因此漏网） | `OssAgentStateStoreTest.java` / `OssBaseStoreTest.java`（用 mock `OSS` 直接覆盖 store 层，各 10 `@Test`） | `rg 'S3OssClient' crates/agentscope-extensions-oss` 仅 `src/s3.rs`、`tests/s3.rs`、`src/lib.rs` 文档；`tests/s3.rs` 用同步 `#[test]` | 待办 | 新增 `tests/s3_store.rs`（httpmock）：state 单值/列表读写、`put_if_version` CAS、`search` 分页、snapshot 上传下载；验收：≥6 例、含至少 2 例 `#[tokio::test]`（与 OSS-01 联动） |
-| OSS-09 | 待裁定 | MSRV 冲突：本 crate `rust-version = "1.85"`（`rust-s3 0.38` 为 edition 2024），workspace 为 `1.80.0` —— 是否提升 workspace MSRV，或改用 `object_store`/`opendal` 后端 | `pom.xml`（Java 21；无对应约束） | `crates/agentscope-extensions-oss/Cargo.toml:7-9`（注释已说明原因）；根 `Cargo.toml` `rust-version = "1.80.0"` | 待裁定 | 汇总方裁定：提升 workspace MSRV 至 1.85（影响全仓 CI 镜像）或替换后端依赖；裁定前保持现状 |
-| OSS-10 | 待裁定 | 是否需要阿里云 OSS **原生**能力（对象标签、SSE-KMS、OSS-HDFS、图片处理、`x-oss-*` 头）：当前唯一路径是 S3 兼容端点，无法覆盖这些特性 | `pom.xml#com.aliyun.oss:aliyun-sdk-oss:3.18.5`（原生 `OSS` 客户端） | `crates/agentscope-extensions-oss/Cargo.toml`（依赖仅 `rust-s3`，feature 仅 `s3`）；`rg 'aliyun' -g '*.rs' src` 零命中 | 待裁定 | 若宿主确需 OSS 原生特性，评估 `aliyun-oss-rust-sdk`/`opendal` 并新增第二后端（保持 `OssClient` trait 不变）；否则在 `lib.rs` 能力边界处明示「仅 S3 兼容子集」 |
+| OSS-09 | P1 | MSRV 冲突：本 crate `rust-version = "1.85"`（`rust-s3 0.38` 为 edition 2024），workspace 为 `1.80.0` —— 是否提升 workspace MSRV，或改用 `object_store`/`opendal` 后端 | `pom.xml`（Java 21；无对应约束） | `crates/agentscope-extensions-oss/Cargo.toml:7-9`（注释已说明原因）；根 `Cargo.toml` `rust-version = "1.80.0"` | 待办 | 汇总方裁定：提升 workspace MSRV 至 1.85（影响全仓 CI 镜像）或替换后端依赖；裁定前保持现状 【裁定 2026-10-31：提升 workspace MSRV 至 1.85（rust-s3 0.38 需 edition 2024）】 |
+| OSS-10 | P2 | 是否需要阿里云 OSS **原生**能力（对象标签、SSE-KMS、OSS-HDFS、图片处理、`x-oss-*` 头）：当前唯一路径是 S3 兼容端点，无法覆盖这些特性 | `pom.xml#com.aliyun.oss:aliyun-sdk-oss:3.18.5`（原生 `OSS` 客户端） | `crates/agentscope-extensions-oss/Cargo.toml`（依赖仅 `rust-s3`，feature 仅 `s3`）；`rg 'aliyun' -g '*.rs' src` 零命中 | 设计决定（不迁移） | 若宿主确需 OSS 原生特性，评估 `aliyun-oss-rust-sdk`/`opendal` 并新增第二后端（保持 `OssClient` trait 不变）；否则在 `lib.rs` 能力边界处明示「仅 S3 兼容子集」 【裁定 2026-10-31：仅 S3 兼容子集；原生特性将来走 opendal 第二后端（可选 feature）】 |
 
 ### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
 
