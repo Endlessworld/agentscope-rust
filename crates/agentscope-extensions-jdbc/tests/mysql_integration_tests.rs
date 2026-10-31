@@ -25,7 +25,8 @@ use std::sync::Arc;
 use agentscope_extensions_jdbc::backend::{ColumnValue, JdbcError, JdbcExecutor};
 use agentscope_extensions_jdbc::dialect::vendor::MysqlDialect;
 use agentscope_extensions_jdbc::dialect::{
-    detect_dialect, AbstractJdbcDialect, BoundSql, DialectKind,
+    detect_dialect, AbstractJdbcDialect, BoundSql, DialectKind, TableNameConfig,
+    TableNameConfigurable,
 };
 use agentscope_extensions_jdbc::sandbox::NativeLockFlavor;
 use agentscope_extensions_jdbc::skill::JdbcAgentSkillRepository;
@@ -176,23 +177,39 @@ async fn long_lock_name_is_sha256_normalised() {
 #[tokio::test]
 async fn build_blocks_when_a_legacy_table_lacks_the_version_column() {
     // Java: MysqlIntegrationTest.buildBlocksOnLegacyTableMissingColumn
+    //
+    // The regression *requires* `ALTER TABLE ... DROP COLUMN version`, i.e. a global schema
+    // mutation. Java can afford that because every test class owns a throwaway container;
+    // here all tests share one live database, so mutating the shared `agentscope_sessions`
+    // table made the concurrently running `state_store_crud` fail (`save` could not see the
+    // `version` column it was just told about). Give this test its own table instead of
+    // serialising the whole binary: the defect under test is the *validator*, not the name.
     let Some(executor) = executor() else {
         return;
     };
+    let table = "agentscope_sessions_legacy";
+    let mysql = MysqlDialect::new();
+    mysql.table_names().apply(TableNameConfig {
+        session_state_table_name: Some(table.to_string()),
+        ..Default::default()
+    });
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(mysql);
+
     // Best effort reset: a previously interrupted run may have left the column dropped.
     // Both failures (table missing / column already present) are expected and ignored.
-    let _ = executor.execute(&BoundSql::no_params(
-        "ALTER TABLE agentscope_sessions ADD COLUMN version BIGINT NOT NULL DEFAULT 1",
-    ));
-    JdbcDistributedStore::create(executor.clone(), "MySQL").expect("initial schema");
+    let _ = executor.execute(&BoundSql::no_params(format!(
+        "ALTER TABLE {table} ADD COLUMN version BIGINT NOT NULL DEFAULT 1"
+    )));
+    JdbcDistributedStore::create_with_dialect(executor.clone(), dialect.clone())
+        .expect("initial schema");
 
     executor
-        .execute(&BoundSql::no_params(
-            "ALTER TABLE agentscope_sessions DROP COLUMN version",
-        ))
+        .execute(&BoundSql::no_params(format!(
+            "ALTER TABLE {table} DROP COLUMN version"
+        )))
         .expect("regress the sessions table to the legacy shape");
 
-    let error = JdbcDistributedStore::create(executor.clone(), "MySQL")
+    let error = JdbcDistributedStore::create_with_dialect(executor.clone(), dialect)
         .expect_err("a table without the version column must block construction");
     let message = error.to_string();
     assert!(message.contains("version"), "unexpected message: {message}");
@@ -203,9 +220,9 @@ async fn build_blocks_when_a_legacy_table_lacks_the_version_column() {
 
     // Keep the database reusable for the next run.
     executor
-        .execute(&BoundSql::no_params(
-            "ALTER TABLE agentscope_sessions ADD COLUMN version BIGINT NOT NULL DEFAULT 1",
-        ))
+        .execute(&BoundSql::no_params(format!(
+            "DROP TABLE IF EXISTS {table}"
+        )))
         .expect("restore the version column");
 }
 

@@ -85,7 +85,14 @@ impl TableLockStrategy {
             return Ok(());
         }
         let ddl = self.dialect.lock_create_table_ddl();
-        if let Err(e) = self.executor.execute(&BoundSql::no_params(ddl)) {
+        // Same serialized bootstrap as the state/store/snapshot/skill tables: two processes
+        // creating `agentscope_distributed_locks` at the same time hit PostgreSQL's
+        // `pg_type_typname_nsp_index` race just like `CREATE TABLE ... sessions` did.
+        if let Err(e) = crate::schema_bootstrap::run_ddl(
+            &*self.executor,
+            self.dialect.as_ref(),
+            std::slice::from_ref(&ddl),
+        ) {
             self.ensured.store(false, Ordering::SeqCst);
             return Err(e);
         }

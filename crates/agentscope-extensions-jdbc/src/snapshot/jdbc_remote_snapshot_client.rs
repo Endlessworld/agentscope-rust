@@ -53,9 +53,7 @@ impl JdbcRemoteSnapshotClient {
     /// resulting schema (Java `TableSchemaValidator`).
     pub fn init_schema(&self) -> JdbcResult<()> {
         let ddls = self.dialect.snapshot_create_table_ddls();
-        for ddl in &ddls {
-            self.executor.execute(&BoundSql::no_params(ddl.clone()))?;
-        }
+        crate::schema_bootstrap::run_ddl(&*self.executor, self.dialect.as_ref(), &ddls)?;
         validate_table_schema(
             &*self.executor,
             self.dialect.as_ref(),

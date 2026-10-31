@@ -148,16 +148,10 @@ impl JdbcAgentSkillRepository {
 
     /// Runs the dialect's idempotent skill DDL, then validates both tables.
     pub fn create_schema(&self) -> Result<(), SkillRepositoryError> {
-        for ddl in self.dialect.skill_create_table_ddls() {
-            self.executor
-                .execute(&BoundSql::no_params(ddl))
-                .map_err(db_error)?;
-        }
-        for ddl in self.dialect.skill_resources_create_table_ddls() {
-            self.executor
-                .execute(&BoundSql::no_params(ddl))
-                .map_err(db_error)?;
-        }
+        let mut ddls = self.dialect.skill_create_table_ddls();
+        ddls.extend(self.dialect.skill_resources_create_table_ddls());
+        crate::schema_bootstrap::run_ddl(self.executor.as_ref(), self.dialect.as_ref(), &ddls)
+            .map_err(db_error)?;
         self.verify_schema()
     }
 

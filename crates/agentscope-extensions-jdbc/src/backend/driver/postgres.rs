@@ -9,7 +9,7 @@
 
 use std::str::FromStr;
 
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, Row};
 
 use super::{to_dollar_placeholders, DriverExecutor, SqlClient};
@@ -108,13 +108,46 @@ fn to_postgres_params(params: &[SqlParam]) -> Vec<Box<dyn ToSql + Sync + Send>> 
         .map(|param| -> Box<dyn ToSql + Sync + Send> {
             match param {
                 SqlParam::Text(value) => Box::new(value.clone()),
-                SqlParam::Int(value) => Box::new(*value),
+                SqlParam::Int(value) => Box::new(PgInt(*value)),
                 SqlParam::Blob(value) => Box::new(value.clone()),
                 // A typed NULL: `Option<String>` binds SQL NULL for any inferred column type.
                 SqlParam::Null => Box::new(Option::<String>::None),
             }
         })
         .collect()
+}
+
+/// Binds a crate-wide [`SqlParam::Int`] into whatever integer width the target column has.
+///
+/// `postgres-types`' `ToSql` implementations are width-strict: `i64` only accepts `int8`.
+/// The crate's parameter model carries *every* integer as `i64`, while the JDBC-faithful DDL
+/// declares some columns as `INT` (`agentscope_sessions.item_index`). Binding the raw `i64`
+/// therefore failed at the `Bind` stage — before the server ever saw the statement — with
+/// `error serializing parameter N`; `AgentStateStore::save` only logs such failures, so the
+/// session-state table silently stayed empty. JDBC's `setObject` coerces the width, and so
+/// does this wrapper (it reports an out-of-range value instead of truncating).
+#[derive(Debug, Clone, Copy)]
+struct PgInt(i64);
+
+impl ToSql for PgInt {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match *ty {
+            Type::INT2 => i16::try_from(self.0)?.to_sql(ty, out),
+            Type::INT4 => i32::try_from(self.0)?.to_sql(ty, out),
+            Type::OID => u32::try_from(self.0)?.to_sql(ty, out),
+            _ => self.0.to_sql(ty, out),
+        }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INT2 | Type::INT4 | Type::INT8 | Type::OID)
+    }
+
+    to_sql_checked!();
 }
 
 /// Borrows the owned parameters for the driver call; the `Send` bound of the owned boxes

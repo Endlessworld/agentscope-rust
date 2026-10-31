@@ -68,6 +68,7 @@ pub mod backend;
 pub mod dialect;
 mod distributed_store;
 pub mod sandbox;
+mod schema_bootstrap;
 pub mod skill;
 pub mod snapshot;
 pub mod state;
