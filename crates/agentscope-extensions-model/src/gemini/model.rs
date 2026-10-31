@@ -23,6 +23,10 @@ use crate::gemini::credential::{
 use crate::gemini::dto::{GeminiErrorBody, GeminiResponse};
 use crate::gemini::parser::{parse_response, GeminiStreamIncrementer};
 
+/// Provider knobs consumed by the provider/model: they must never be merged
+/// into the request body (Java keeps them in `ModelCreationContext#options`).
+const PROVIDER_OPTION_KEYS: [&str; 2] = ["vertexAI", "contextWindowSize"];
+
 /// Normalises a Gemini error body into a structured [`ModelError`].
 fn gemini_error(error: &GeminiErrorBody) -> Error {
     ModelError::from_parts(
@@ -137,10 +141,15 @@ impl GeminiChatModel {
             &self.server_tools,
         );
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
-        // Extra body params merge last so callers can override any field.
+        // Extra body params merge last so callers can override any field, but
+        // provider knobs are never wire fields (MODEL-09): Java keeps them in
+        // `ModelCreationContext#options`, so they are dropped here.
         if let Some(map) = body.as_object_mut() {
             for opts in [&self.default_options, options] {
                 for (key, value) in &opts.additional_body_params {
+                    if PROVIDER_OPTION_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
                     map.insert(key.clone(), value.clone());
                 }
             }
@@ -424,6 +433,37 @@ mod tests {
         assert_eq!(
             spec.body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             serde_json::json!(256)
+        );
+    }
+
+    #[test]
+    fn provider_knobs_never_reach_the_request_body() {
+        // MODEL-09: `contextWindowSize` / `vertexAI` are provider knobs (Java
+        // keeps them in `ModelCreationContext#options`), so they must not be
+        // merged into the REST body.
+        let mut defaults = GenerateOptions::default();
+        defaults
+            .additional_body_params
+            .insert("contextWindowSize".to_string(), serde_json::json!(321_000));
+        defaults
+            .additional_body_params
+            .insert("vertexAI".to_string(), serde_json::json!(false));
+        let model = model_with(MemoryTransport::default(), "gemini-2.5-flash")
+            .with_default_options(defaults);
+        let mut options = GenerateOptions::default();
+        options
+            .additional_body_params
+            .insert("contextWindowSize".to_string(), serde_json::json!(4096));
+        let spec = model.build_http_request(vec![Msg::user("hi")], Vec::new(), &options, false);
+        assert!(
+            spec.body.get("contextWindowSize").is_none(),
+            "provider knob leaked into the body: {:?}",
+            spec.body
+        );
+        assert!(
+            spec.body.get("vertexAI").is_none(),
+            "provider knob leaked into the body: {:?}",
+            spec.body
         );
     }
 

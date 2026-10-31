@@ -20,15 +20,16 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartAudio,
+    ChatCompletionRequestMessageContentPartImage,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest, FinishReason, FunctionCall,
-    FunctionName, FunctionObject, ImageUrl, ReasoningEffort, ResponseFormat as OaiResponseFormat,
-    ResponseFormatJsonSchema, ToolChoiceOptions,
+    FunctionName, FunctionObject, ImageUrl, InputAudio, InputAudioFormat, ReasoningEffort,
+    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema, ToolChoiceOptions,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
@@ -303,22 +304,32 @@ impl OpenAiChatModel {
         // `multiAgentFormatter` is a provider-side selector consumed by
         // `build_request`, never a wire field: drop it from the pass-through
         // extras so OpenAI-compatible backends never see it.
+        // `strictJsonSchema` is a provider knob, never a wire field: a per-call
+        // value overrides the model-level default (MODEL-09) and is then dropped
+        // so it cannot leak through `additional_body_params` either.
+        let strict_json_schema = options
+            .additional_body_params
+            .remove(STRICT_JSON_SCHEMA_OPTION)
+            .and_then(|value| value.as_bool())
+            .or(self.strict_json_schema);
         let mut extra_body = options.additional_body_params.clone();
         extra_body.remove(crate::common::MULTI_AGENT_FORMATTER_KEY);
         // `thinking_budget` has no typed field in `async-openai`; Java's
         // `OpenAIRequest#thinkingBudget` sends it as a top-level wire field.
         let thinking_budget = options.thinking_budget;
+        // Automatic prompt-cache marking is opt-in per request(`cache_control`).
+        let cache_control = options.cache_control;
         // Capture the transport mode before `options` is moved into the builder.
         // `None` keeps the historical streaming default.
         let streaming = options.stream.unwrap_or(true);
         let capabilities = resolve_capabilities_with(&model_name, self.descriptor.as_deref());
-        let (request, reasoning) = build_request(
+        let (request, extras) = build_request(
             model_name.clone(),
             messages,
             tools,
             options,
             self.reasoning_passback,
-            self.strict_json_schema,
+            strict_json_schema,
             Some(capabilities),
         );
         // Serialize eagerly; on failure fall back to the typed request so the
@@ -344,8 +355,11 @@ impl OpenAiChatModel {
         // conversion is not 1:1 (a tool message may fan out to N wire messages),
         // hence the parallel `reasoning` vector recorded at build time.
         if self.reasoning_passback {
-            inject_reasoning_content(&mut body, &reasoning);
+            inject_reasoning_content(&mut body, &extras.reasoning);
         }
+        // Prompt caching: message-level metadata directives first, then the
+        // automatic policy when the caller opted in.
+        apply_cache_control(&mut body, &extras.cache_directives, cache_control);
         // Vendor-specific sanitising (DeepSeek/GLM/Kimi/MiniMax). Runs last so it
         // sees both `additional_body_params` and the injected reasoning fields.
         crate::openai::compat::apply_vendor_rules(&model_name, &mut body);
@@ -485,6 +499,13 @@ impl Model for OpenAiChatModel {
 /// Consumed by [`OpenAiChatModel::from_context`], never sent on the wire.
 const STRICT_JSON_SCHEMA_OPTION: &str = "strictJsonSchema";
 
+/// Maximum number of `cache_control` markers a provider accepts per request
+/// (Java `OpenAIBaseFormatter#MAX_CACHE_MARKERS`).
+pub const MAX_CACHE_MARKERS: usize = 4;
+
+/// Wire field carrying a prompt-cache breakpoint marker.
+const CACHE_CONTROL_FIELD: &str = "cache_control";
+
 /// Provider that registers [`OpenAiChatModel`] under the `openai` provider id.
 /// Provider for OpenAI and OpenAI-compatible gateways.
 ///
@@ -608,7 +629,7 @@ fn build_request(
     reasoning_passback: bool,
     strict_json_schema: Option<bool>,
     capabilities: Option<crate::common::ModelCapabilities>,
-) -> (CreateChatCompletionRequest, Vec<Option<String>>) {
+) -> (CreateChatCompletionRequest, MessageExtras) {
     // Multi-agent formatter: opt-in per call via
     // `additional_body_params["multiAgentFormatter"]` (`true` = default prompt,
     // string = custom prompt), the same selector `ollama` / `dashscope` /
@@ -627,6 +648,7 @@ fn build_request(
     let RequestMessages {
         messages: request_messages,
         reasoning,
+        cache_directives,
     } = to_request_messages(messages, reasoning_passback);
     // `None` keeps the historical streaming default (TRAINING/agent loop relies
     // on it); `Some(false)` must reach the wire as a plain non-streaming
@@ -721,7 +743,15 @@ fn build_request(
     if let Some(rf) = &options.response_format {
         req.response_format = to_response_format(rf, strict_json_schema);
     }
-    (req, reasoning)
+    (req, MessageExtras { reasoning, cache_directives })
+}
+
+/// Bookkeeping recorded while converting core `Msg`s, addressed by wire index.
+struct MessageExtras {
+    /// The `reasoning_content` to replay for each wire message.
+    reasoning: Vec<Option<String>>,
+    /// The `Msg`-level `cache_control` metadata directive of each wire message.
+    cache_directives: Vec<Option<bool>>,
 }
 
 /// The result of converting core [`Msg`]s into OpenAI wire messages.
@@ -731,6 +761,10 @@ struct RequestMessages {
     /// Parallel to `messages`: the `reasoning_content` to replay for each wire
     /// message (only populated for assistant turns when passback is enabled).
     reasoning: Vec<Option<String>>,
+    /// Parallel to `messages`: the message-level cache directive of each wire
+    /// message (`true` = the message asked for a marker, `None` = no explicit
+    /// preference, so the automatic policy may still mark it).
+    cache_directives: Vec<Option<bool>>,
 }
 
 fn has_image_block(msg: &Msg) -> bool {
@@ -739,20 +773,114 @@ fn has_image_block(msg: &Msg) -> bool {
         .any(|block| matches!(block, ContentBlock::Image(_)))
 }
 
+/// Reads the `cache_control` metadata directive of a message.
+///
+/// Mirrors `OpenAIBaseFormatter#cacheControlDirective`: only booleans count, so
+/// a missing or malformed value means no explicit preference.
+fn metadata_cache_directive(msg: &Msg) -> Option<bool> {
+    msg.metadata
+        .get(agentscope_core::metadata_keys::CACHE_CONTROL)
+        .and_then(|value| value.as_bool())
+}
+
+fn text_content_part(text: impl Into<String>) -> ChatCompletionRequestUserMessageContentPart {
+    ChatCompletionRequestUserMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
+        text: text.into(),
+    })
+}
+
+/// Maps an audio media type to the `input_audio.format` value.
+///
+/// The API only accepts `wav` / `mp3`; Java's `OpenAIConverterUtils#detectAudioFormat`
+/// also yields `opus` / `flac`, which the API rejects, so those degrade to a text
+/// reference instead of sending an invalid format.
+fn audio_format(media_type: &str) -> Option<InputAudioFormat> {
+    let media_type = media_type.to_ascii_lowercase();
+    if media_type.contains("wav") {
+        Some(InputAudioFormat::Wav)
+    } else if media_type.contains("mp3") || media_type.contains("mpeg") {
+        Some(InputAudioFormat::Mp3)
+    } else {
+        None
+    }
+}
+
+/// `AudioBlock` -> `input_audio` part (base64 sources only; URL audio is not
+/// accepted by the API and is sent as a text reference, like Java).
+fn audio_content_part(source: &Source) -> ChatCompletionRequestUserMessageContentPart {
+    match source {
+        Source::Base64(audio) if !audio.data.is_empty() => match audio_format(&audio.media_type) {
+            Some(format) => ChatCompletionRequestUserMessageContentPart::InputAudio(
+                ChatCompletionRequestMessageContentPartAudio {
+                    input_audio: InputAudio {
+                        data: audio.data.clone(),
+                        format,
+                    },
+                },
+            ),
+            None => {
+                diagnostics::warn(
+                    "audio_unsupported_format",
+                    "input_audio",
+                    format!(
+                        "audio media type '{}' is not accepted by the provider; sent as text",
+                        audio.media_type
+                    ),
+                );
+                text_content_part(format!("[Audio - unsupported format: {}]", audio.media_type))
+            }
+        },
+        Source::Base64(_) => text_content_part("[Audio - data missing]"),
+        Source::Url(url) if !url.url.is_empty() => {
+            diagnostics::warn(
+                "audio_url_not_inlined",
+                "input_audio",
+                "URL-based audio cannot be inlined by input_audio; sent as a text reference",
+            );
+            text_content_part(format!("[Audio URL: {}]", url.url))
+        }
+        Source::Url(_) => text_content_part("[Audio URL - missing]"),
+    }
+}
+
+/// `VideoBlock` -> text reference.
+///
+/// `async-openai` 0.41 has no `video_url` content part, so the block is degraded
+/// to a text reference instead of being dropped silently. Java sends a
+/// `video_url` part; the wire difference is recorded in `MODEL__GAP_TRACKER.md`.
+fn video_content_part(source: &Source) -> ChatCompletionRequestUserMessageContentPart {
+    let reference = match source {
+        Source::Url(url) => url.url.clone(),
+        Source::Base64(video) if !video.data.is_empty() => {
+            format!("data:{};base64,{}", video.media_type, video.data)
+        }
+        Source::Base64(_) => String::new(),
+    };
+    diagnostics::warn(
+        "video_not_inlined",
+        "video_url",
+        "the provider DTO cannot express a video_url part; the video is sent as a text reference",
+    );
+    if reference.is_empty() {
+        text_content_part("[Video - source missing]")
+    } else {
+        text_content_part(format!("[Video URL: {reference}]"))
+    }
+}
+
 fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
     let mut parts = Vec::new();
-    let mut has_image = false;
+    // `true` once a non-text block contributed a part: Java's
+    // `OpenAIMessageConverter#convertUserMessage` switches to the content-part
+    // array exactly when the message carries media (`hasMediaContent`).
+    let mut multipart = false;
     for block in &msg.content {
         match block {
             ContentBlock::Text(text) if !text.text.is_empty() => {
-                parts.push(ChatCompletionRequestUserMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText {
-                        text: text.text.clone(),
-                    },
-                ));
+                parts.push(text_content_part(text.text.clone()));
             }
             ContentBlock::Image(image) => {
-                has_image = true;
+                multipart = true;
                 let url = match &image.source {
                     Source::Url(source) => source.url.clone(),
                     Source::Base64(source) => {
@@ -765,10 +893,18 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
                     },
                 ));
             }
+            ContentBlock::Video(video) => {
+                multipart = true;
+                parts.push(video_content_part(&video.source));
+            }
+            ContentBlock::Audio(audio) => {
+                multipart = true;
+                parts.push(audio_content_part(&audio.source));
+            }
             _ => {}
         }
     }
-    if has_image {
+    if multipart {
         ChatCompletionRequestUserMessageContent::Array(parts)
     } else {
         ChatCompletionRequestUserMessageContent::Text(extract_text_content(msg))
@@ -778,7 +914,9 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
 fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestMessages {
     let mut out = Vec::new();
     let mut reasoning = Vec::new();
+    let mut cache_directives = Vec::new();
     for msg in messages {
+        let cache_directive = metadata_cache_directive(&msg);
         match msg.role {
             MsgRole::System => {
                 out.push(ChatCompletionRequestMessage::System(
@@ -790,6 +928,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                     },
                 ));
                 reasoning.push(None);
+                cache_directives.push(cache_directive);
             }
             MsgRole::User => {
                 out.push(ChatCompletionRequestMessage::User(
@@ -803,6 +942,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                 // entry here shifts every later assistant turn and drops its
                 // `reasoning_content`.
                 reasoning.push(None);
+                cache_directives.push(cache_directive);
             }
             MsgRole::Assistant => {
                 let text = extract_text_content(&msg);
@@ -847,6 +987,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                 } else {
                     None
                 });
+                cache_directives.push(cache_directive);
             }
             MsgRole::Tool => {
                 for tr in msg.tool_result_blocks() {
@@ -859,6 +1000,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                             },
                         ));
                         reasoning.push(None);
+                        cache_directives.push(cache_directive);
                     }
                 }
             }
@@ -867,6 +1009,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
     RequestMessages {
         messages: out,
         reasoning,
+        cache_directives,
     }
 }
 
@@ -911,6 +1054,126 @@ fn inject_reasoning_content(body: &mut serde_json::Value, reasoning: &[Option<St
             );
         }
     }
+}
+
+/// Applies prompt-cache markers to the serialized request body.
+///
+/// Two passes, mirroring Java `OpenAIMessageConverter#applyCacheControlFromMetadata`
+/// followed by `OpenAIBaseFormatter#applyAutomaticCacheControl`:
+///
+/// 1. a message whose metadata asked for caching (`_cache_control = true`) always
+///    gets a marker, regardless of the request-level option;
+/// 2. when the caller opted in (`GenerateOptions::cache_control == Some(true)`)
+///    the final message and every system message without an explicit directive
+///    are marked too, capped at [`MAX_CACHE_MARKERS`] markers per request.
+fn apply_cache_control(
+    body: &mut serde_json::Value,
+    directives: &[Option<bool>],
+    automatic: Option<bool>,
+) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for (index, directive) in directives.iter().enumerate() {
+        if *directive != Some(true) {
+            continue;
+        }
+        if let Some(message) = messages.get_mut(index) {
+            set_cache_control_on_content(message);
+        }
+    }
+    if automatic != Some(true) || messages.is_empty() {
+        return;
+    }
+    let mut marker_count = count_cache_markers(messages);
+    if marker_count > MAX_CACHE_MARKERS {
+        diagnostics::warn(
+            "cache_markers_over_limit",
+            CACHE_CONTROL_FIELD,
+            format!(
+                "request already carries {marker_count} cache markers; the provider only uses the last {MAX_CACHE_MARKERS}, so automatic markers are skipped"
+            ),
+        );
+        return;
+    }
+    let mut candidates = vec![messages.len() - 1];
+    for (index, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(|role| role.as_str()) == Some("system") {
+            candidates.push(index);
+        }
+    }
+    for index in candidates {
+        if marker_count >= MAX_CACHE_MARKERS {
+            break;
+        }
+        if directives.get(index).copied().flatten().is_some() {
+            continue;
+        }
+        if let Some(message) = messages.get_mut(index) {
+            if message_has_cache_marker(message) {
+                continue;
+            }
+            set_cache_control_on_content(message);
+            marker_count += 1;
+        }
+    }
+}
+
+/// Places a `cache_control` marker on the final content part of a wire message,
+/// converting string content into a single text part when required.
+///
+/// Mirrors `OpenAIBaseFormatter#setCacheControlOnContent`: an existing marker is
+/// preserved (never overwritten).
+fn set_cache_control_on_content(message: &mut serde_json::Value) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    match object.get_mut("content") {
+        Some(serde_json::Value::String(text)) => {
+            let mut part = serde_json::json!({ "type": "text", "text": text.clone() });
+            if let Some(part_object) = part.as_object_mut() {
+                part_object.insert(CACHE_CONTROL_FIELD.to_string(), ephemeral_cache_control());
+            }
+            *object.get_mut("content").expect("content") = serde_json::Value::Array(vec![part]);
+        }
+        Some(serde_json::Value::Array(parts)) => {
+            if let Some(part) = parts.last_mut() {
+                if !has_cache_marker(part) {
+                    if let Some(part_object) = part.as_object_mut() {
+                        part_object
+                            .insert(CACHE_CONTROL_FIELD.to_string(), ephemeral_cache_control());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ephemeral_cache_control() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral" })
+}
+
+fn has_cache_marker(part: &serde_json::Value) -> bool {
+    part.get(CACHE_CONTROL_FIELD)
+        .is_some_and(|value| !value.is_null())
+}
+
+fn message_has_cache_marker(message: &serde_json::Value) -> bool {
+    message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .is_some_and(|parts| parts.iter().any(has_cache_marker))
+}
+
+/// Counts the content parts already carrying a marker.
+fn count_cache_markers(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|part| has_cache_marker(part))
+        .count()
 }
 
 fn to_request_tools(tools: Vec<ToolSchema>) -> Option<Vec<ChatCompletionTools>> {
@@ -1627,6 +1890,7 @@ mod tests {
         let RequestMessages {
             messages,
             reasoning,
+            ..
         } = to_request_messages(vec![msg], true);
         let mut body = serde_json::json!({ "messages": messages });
         inject_reasoning_content(&mut body, &reasoning);
@@ -1646,6 +1910,7 @@ mod tests {
         let RequestMessages {
             messages,
             reasoning,
+            ..
         } = to_request_messages(vec![msg], false);
         let mut body = serde_json::json!({ "messages": messages });
         inject_reasoning_content(&mut body, &reasoning);
@@ -1664,6 +1929,7 @@ mod tests {
         let RequestMessages {
             messages,
             reasoning,
+            ..
         } = to_request_messages(vec![msg], true);
         let mut body = serde_json::json!({ "messages": messages });
         inject_reasoning_content(&mut body, &reasoning);
@@ -1683,6 +1949,7 @@ mod tests {
         let RequestMessages {
             messages,
             reasoning,
+            ..
         } = to_request_messages(vec![msg], true);
         let mut body = serde_json::json!({ "messages": messages });
         inject_reasoning_content(&mut body, &reasoning);
@@ -1713,6 +1980,7 @@ mod tests {
         let RequestMessages {
             messages,
             reasoning,
+            ..
         } = to_request_messages(vec![assistant, tool], true);
         assert_eq!(messages.len(), 3);
         assert_eq!(reasoning.len(), 3);
@@ -1743,6 +2011,7 @@ mod tests {
         let RequestMessages {
             messages,
             reasoning,
+            ..
         } = to_request_messages(vec![user, assistant], true);
         assert_eq!(messages.len(), 2);
         assert_eq!(reasoning.len(), messages.len(), "reasoning must stay 1:1");
@@ -2130,5 +2399,208 @@ mod tests {
             .create(context("gpt-4o-high"))
             .unwrap();
         assert_eq!(model.model_name(), "gpt-4o-high");
+    }
+
+    fn cache_capable_model() -> OpenAiChatModel {
+        OpenAiChatModel::new("gpt-4o", Some("sk-test".to_string()), None).expect("model")
+    }
+
+    fn audio_message_block(media_type: &str, data: &str) -> Msg {
+        Msg::user_blocks(vec![ContentBlock::Audio(agentscope_core::AudioBlock::new(
+            Source::Base64(Base64Source::new(media_type, data)),
+        ))])
+    }
+
+    #[test]
+    fn user_audio_becomes_input_audio_part() {
+        // MODEL-04: `AudioBlock` used to be dropped silently. Base64 wav/mp3
+        // audio maps onto the `input_audio` content part (Java
+        // `OpenAIMessageConverter#convertContentBlocks`).
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            vec![audio_message_block("audio/wav", "UklGRg==")],
+            vec![],
+            GenerateOptions::default(),
+            false,
+            None,
+            None,
+        );
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["type"], "input_audio");
+        assert_eq!(
+            body["messages"][0]["content"][0]["input_audio"]["format"],
+            "wav"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["input_audio"]["data"],
+            "UklGRg=="
+        );
+    }
+
+    #[test]
+    fn unsupported_audio_format_degrades_to_a_text_reference() {
+        // `opus` / `flac` are not accepted by `input_audio`, so the block must
+        // be visible as text instead of being dropped or sent as a bad format.
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            vec![audio_message_block("audio/opus", "T3B1cw==")],
+            vec![],
+            GenerateOptions::default(),
+            false,
+            None,
+            None,
+        );
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "[Audio - unsupported format: audio/opus]"
+        );
+    }
+
+    #[test]
+    fn user_video_block_reaches_the_wire() {
+        // MODEL-04: `VideoBlock` used to hit the catch-all arm.
+        // `async-openai` cannot express a `video_url` part, so the video is
+        // degraded to a text reference instead of being dropped.
+        let msg = Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("watch")),
+            ContentBlock::Video(agentscope_core::VideoBlock::new(Source::Url(
+                agentscope_core::URLSource::new("https://example.test/clip.mp4"),
+            ))),
+        ]);
+        let (req, _) = build_request(
+            "gpt-4o".into(),
+            vec![msg],
+            vec![],
+            GenerateOptions::default(),
+            false,
+            None,
+            None,
+        );
+        let body = serde_json::to_value(&req).unwrap();
+        let parts = body["messages"][0]["content"]
+            .as_array()
+            .expect("media blocks switch the message to the content-part array");
+        assert_eq!(
+            parts[1]["text"],
+            "[Video URL: https://example.test/clip.mp4]",
+            "video must surface as a text reference: {body:?}"
+        );
+    }
+
+    #[test]
+    fn per_call_strict_json_schema_sets_the_default_without_leaking() {
+        // MODEL-09: a per-call `strictJsonSchema` knob is a provider option, not
+        // a wire field, exactly like the creation-time one.
+        let mut options = GenerateOptions {
+            response_format: Some(json_schema_response_format(None)),
+            ..Default::default()
+        };
+        options.additional_body_params.insert(
+            STRICT_JSON_SCHEMA_OPTION.to_string(),
+            serde_json::json!(true),
+        );
+        let (body, _) = cache_capable_model().prepare_body(
+            vec![sample_msg()],
+            vec![],
+            options,
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["strict"],
+            serde_json::json!(true),
+            "per-call knob must seed the schema default: {body:?}"
+        );
+        assert!(
+            body.get(STRICT_JSON_SCHEMA_OPTION).is_none(),
+            "provider knob leaked into the wire body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn automatic_cache_control_marks_system_and_last_message() {
+        // MODEL-03: `cache_control: true` mirrors Java
+        // `OpenAIBaseFormatter#applyAutomaticCacheControl` — the final message
+        // and every system message receive an ephemeral marker.
+        let options = GenerateOptions {
+            cache_control: Some(true),
+            ..Default::default()
+        };
+        let messages = vec![
+            Msg::system("be helpful"),
+            Msg::user("hello"),
+            Msg::assistant("hi"),
+        ];
+        let (body, _) = cache_capable_model().prepare_body(messages, vec![], options);
+        let wire = body["messages"].as_array().expect("messages");
+        assert_eq!(
+            wire[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "system message must be marked: {body:?}"
+        );
+        assert_eq!(
+            wire[2]["content"][0]["cache_control"]["type"], "ephemeral",
+            "last message must be marked: {body:?}"
+        );
+        assert_eq!(
+            wire[1]["content"],
+            serde_json::json!("hello"),
+            "an unmarked middle message keeps its plain string content: {body:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_metadata_cache_control_is_honored_without_the_option() {
+        // Java `OpenAIMessageConverter#applyCacheControlFromMetadata`: a message
+        // that asks for caching via `_cache_control` is marked even when the
+        // request-level `cache_control` option is unset.
+        let marked = Msg::builder()
+            .role(MsgRole::User)
+            .text_content("remember this")
+            .metadata_entry(agentscope_core::metadata_keys::CACHE_CONTROL, serde_json::json!(true))
+            .build();
+        let (body, _) = cache_capable_model().prepare_body(
+            vec![Msg::system("be helpful"), marked],
+            vec![],
+            GenerateOptions::default(),
+        );
+        let wire = body["messages"].as_array().expect("messages");
+        assert_eq!(
+            wire[1]["content"][0]["cache_control"]["type"], "ephemeral",
+            "metadata directive must mark the message: {body:?}"
+        );
+        assert_eq!(
+            wire[0]["content"],
+            serde_json::json!("be helpful"),
+            "without the option the system message stays unmarked: {body:?}"
+        );
+    }
+
+    #[test]
+    fn cache_markers_above_the_cap_skip_automatic_marking() {
+        // Above `MAX_CACHE_MARKERS` explicit markers the provider only honours
+        // the last N, so Java warns and adds no automatic marker at all.
+        let marked = |text: &str| {
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .text_content(text)
+                .metadata_entry(
+                    agentscope_core::metadata_keys::CACHE_CONTROL,
+                    serde_json::json!(true),
+                )
+                .build()
+        };
+        let mut messages: Vec<Msg> = (0..5).map(|i| marked(&format!("turn {i}"))).collect();
+        messages.push(Msg::user("fresh question"));
+        let options = GenerateOptions {
+            cache_control: Some(true),
+            ..Default::default()
+        };
+        let (body, _) = cache_capable_model().prepare_body(messages, vec![], options);
+        let wire = body["messages"].as_array().expect("messages");
+        assert_eq!(
+            wire.last().expect("last")["content"],
+            serde_json::json!("fresh question"),
+            "automatic marking must be skipped above the cap: {body:?}"
+        );
     }
 }
