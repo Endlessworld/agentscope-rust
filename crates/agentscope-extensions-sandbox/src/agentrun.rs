@@ -826,12 +826,15 @@ impl RemoteBackend for AgentRunBackend {
         }
         let text = extract_mcp_text(&response).unwrap_or_default();
         let parsed = parse_exec_payload(&text);
-        Ok(RemoteExecOutput {
+        let mut output = RemoteExecOutput {
             exit_code: parsed.exit_code,
             stdout: parsed.stdout,
             stderr: parsed.stderr,
             truncated: false,
-        })
+        };
+        // Java `AgentRunSandbox#doExec`: 512 KiB stdout budget + `truncated` flag.
+        output.truncate_stdout();
+        Ok(output)
     }
 }
 
@@ -1257,5 +1260,60 @@ mod tests {
         // No unauthenticated `tools/call` may be issued without a session.
         call.assert_hits_async(0).await;
         assert!(backend.mcp_session_id("sbx-2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_truncates_stdout_at_512_kib() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/mcp")
+                    .body_contains("\"method\":\"initialize\"");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .header("Mcp-Session-Id", "mcp-sess-1")
+                    .json_body(json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {"protocolVersion": "2025-03-26"}
+                    }));
+            })
+            .await;
+        // 600 KiB of stdout, well past the Java `OUTPUT_TRUNCATE_BYTES` budget.
+        let exec_payload = serde_json::to_string(&json!({
+            "exitCode": 0,
+            "stdout": "x".repeat(600 * 1024),
+            "stderr": "warn",
+        }))
+        .unwrap();
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/mcp")
+                    .body_contains("\"method\":\"tools/call\"");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{"type": "text", "text": exec_payload}],
+                            "isError": false
+                        }
+                    }));
+            })
+            .await;
+
+        let backend = mock_backend(&server, None);
+        let handle = RemoteSandboxHandle::new("sbx-1", BTreeMap::new());
+        let output = backend
+            .exec_in(&handle, "cat big", Some(DEFAULT_WORKSPACE_ROOT), 5)
+            .await
+            .unwrap();
+        assert!(output.truncated);
+        assert_eq!(output.stdout.len(), crate::remote::OUTPUT_TRUNCATE_BYTES);
+        assert_eq!(output.stderr, "warn");
     }
 }

@@ -38,8 +38,8 @@ use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::{bypass_proxy_for_loopback, join_url};
 use crate::kubernetes_files::SandboxFileTransfer;
 use crate::remote::{
-    ensure_output_success, RemoteBackend, RemoteExecOutput, RemoteSandboxClient,
-    RemoteSandboxHandle, TAR_TIMEOUT_SECONDS,
+    ensure_output_success, truncate_utf8_bytes, RemoteBackend, RemoteExecOutput, RemoteSandboxClient,
+    RemoteSandboxHandle, OUTPUT_TRUNCATE_BYTES, TAR_TIMEOUT_SECONDS,
 };
 use crate::retry::{with_retries, RetryPolicy};
 use crate::workspace::{shell_quote, short_hash};
@@ -855,12 +855,30 @@ fn decode_b64_field(parent: &Value, field: &str) -> Vec<u8> {
 /// Aggregated result of draining an envd process stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvdStreamResult {
-    /// Combined stdout bytes.
+    /// Combined stdout bytes (capped at [`OUTPUT_TRUNCATE_BYTES`]).
     pub stdout: Vec<u8>,
-    /// Combined stderr bytes.
+    /// Combined stderr bytes (capped at [`OUTPUT_TRUNCATE_BYTES`]).
     pub stderr: Vec<u8>,
     /// Exit code (error when the stream ended without an end event).
     pub exit_code: Option<i32>,
+    /// Whether a captured stream reached the [`OUTPUT_TRUNCATE_BYTES`] budget.
+    pub truncated: bool,
+}
+
+/// Appends `chunk` to `buffer` while keeping it within the [`OUTPUT_TRUNCATE_BYTES`] budget.
+///
+/// Returns whether the budget was reached, so the caller can flag `truncated` exactly like Java
+/// (`stdout.size() >= OUTPUT_TRUNCATE_BYTES || stderr.size() >= OUTPUT_TRUNCATE_BYTES`). The
+/// stream is still fully consumed — only the retained bytes are bounded, which is what keeps a
+/// runaway process from exhausting the client's memory.
+fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let room = OUTPUT_TRUNCATE_BYTES.saturating_sub(buffer.len());
+    if chunk.len() <= room {
+        buffer.extend_from_slice(chunk);
+    } else {
+        buffer.extend_from_slice(&chunk[..room]);
+    }
+    buffer.len() >= OUTPUT_TRUNCATE_BYTES
 }
 
 /// Drains a full Connect response body into an aggregated result.
@@ -904,8 +922,8 @@ pub fn drain_envd_stream(data: &[u8]) -> SandboxResult<EnvdStreamResult> {
             continue;
         }
         if let Ok(event) = parse_envd_event(&envelope.payload) {
-            result.stdout.extend_from_slice(&event.stdout);
-            result.stderr.extend_from_slice(&event.stderr);
+            result.truncated |= append_capped(&mut result.stdout, &event.stdout);
+            result.truncated |= append_capped(&mut result.stderr, &event.stderr);
             if let Some(code) = event.exit_code {
                 result.exit_code = Some(code);
             }
@@ -1852,9 +1870,17 @@ impl RemoteBackend for E2bBackend {
         };
         Ok(RemoteExecOutput {
             exit_code,
-            stdout: String::from_utf8_lossy(&stream.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stream.stderr).into_owned(),
-            truncated: false,
+            stdout: String::from_utf8_lossy(truncate_utf8_bytes(
+                &stream.stdout,
+                OUTPUT_TRUNCATE_BYTES,
+            ))
+            .into_owned(),
+            stderr: String::from_utf8_lossy(truncate_utf8_bytes(
+                &stream.stderr,
+                OUTPUT_TRUNCATE_BYTES,
+            ))
+            .into_owned(),
+            truncated: stream.truncated,
         })
     }
 
@@ -2370,6 +2396,36 @@ mod tests {
         assert_eq!(result.stdout, b"hello world");
         assert_eq!(result.stderr, b"warn");
         assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn drain_envd_stream_caps_each_stream_at_512_kib() {
+        // Three 200 KiB stdout frames: the retained bytes stop at the budget (memory guard) while
+        // the stream is still fully consumed so the exit code is not lost.
+        let chunk = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 200 * 1024]);
+        let mut body = Vec::new();
+        for _ in 0..3 {
+            body.extend_from_slice(&encode_connect_envelope(
+                serde_json::to_vec(&json!({"event":{"data":{"stdout":chunk}}}))
+                    .unwrap()
+                    .as_slice(),
+            ));
+        }
+        body.extend_from_slice(&encode_connect_envelope(
+            serde_json::to_vec(&json!({"event":{"end":{"exitCode":0}}}))
+                .unwrap()
+                .as_slice(),
+        ));
+
+        let result = drain_envd_stream(&body).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.stdout.len(), crate::remote::OUTPUT_TRUNCATE_BYTES);
+        assert_eq!(result.exit_code, Some(0));
+
+        // A stream that stays under the budget is never flagged.
+        let small = drain_envd_stream(&envd_body_with_exit(0, b"hello")).unwrap();
+        assert!(!small.truncated);
+        assert_eq!(small.stdout, b"hello");
     }
 
     #[test]

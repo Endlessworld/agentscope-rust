@@ -1326,7 +1326,7 @@ mod tests {
             .with_execution_guard(guard);
         let retained = spec.execution_guard().expect("guard is retained");
         let key = SandboxIsolationKey::new("user", "u1");
-        let _lease = retained.try_enter(key.clone()).await;
+        let _lease = retained.try_enter(key.clone()).await.expect("lease");
         assert!(retained.is_held(&key));
         retained.release(&key).await;
         assert!(!retained.is_held(&key));

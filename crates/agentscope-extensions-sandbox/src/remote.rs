@@ -47,6 +47,25 @@ pub const WS_B64_TMP_PATH: &str = "/tmp/agentscope-ws.b64";
 pub const B64_CHUNK: usize = 4000;
 /// Default timeout for tar archive operations, in seconds (mirrors Java `TAR_TIMEOUT_SECONDS`).
 pub const TAR_TIMEOUT_SECONDS: u64 = 300;
+/// Byte budget for a single captured exec stream (mirrors Java `OUTPUT_TRUNCATE_BYTES`,
+/// `512 * 1024`, in `AgentRunSandbox`/`DaytonaSandbox`/`E2bEnvdProcessClient`).
+pub const OUTPUT_TRUNCATE_BYTES: usize = 512 * 1024;
+
+/// Cuts `bytes` to at most `limit` bytes without splitting a UTF-8 code point.
+///
+/// Java's `truncateUtf8` decodes the first `limit` bytes and lets a cut code point become a
+/// replacement character; Rust `String`s cannot hold a partial code point, so the trailing
+/// continuation bytes are dropped instead.
+pub fn truncate_utf8_bytes(bytes: &[u8], limit: usize) -> &[u8] {
+    if bytes.len() <= limit {
+        return bytes;
+    }
+    let mut end = limit;
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    &bytes[..end]
+}
 
 /// Output of a command executed through a backend's exec channel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -70,6 +89,20 @@ impl RemoteExecOutput {
             stderr,
             truncated: false,
         }
+    }
+
+    /// Applies the Java 512 KiB stdout budget, flagging the output when it was reached.
+    ///
+    /// Mirrors `AgentRunSandbox#doExec`/`DaytonaSandbox#doExec`: only **stdout** is budgeted
+    /// (stderr is forwarded verbatim) and the flag trips as soon as the captured stream reaches
+    /// the budget (`>=`, not `>`), so an exactly-512 KiB output is reported as truncated.
+    pub fn truncate_stdout(&mut self) {
+        if self.stdout.len() < OUTPUT_TRUNCATE_BYTES {
+            return;
+        }
+        let capped = truncate_utf8_bytes(self.stdout.as_bytes(), OUTPUT_TRUNCATE_BYTES);
+        self.stdout = String::from_utf8_lossy(capped).into_owned();
+        self.truncated = true;
     }
 
     /// Projects onto the harness [`ExecResult`].
@@ -694,10 +727,20 @@ impl Sandbox for RemoteSandbox {
             .handle
             .as_ref()
             .ok_or_else(|| self.connection_closed_error())?;
-        let output = self
+        // Java always runs the command inside the workspace root (`AgentRunSandbox#relativeOrAbsoluteCwd`,
+        // `E2bSandbox#doExec`, `KubernetesSandbox#doExec`); each backend maps this absolute root
+        // onto its own cwd dialect (Daytona strips the leading `/`).
+        let root = self.core.data.workspace_root.clone();
+        let mut output = self
             .backend
-            .exec_in(handle, command, None, timeout_seconds.unwrap_or(120))
+            .exec_in(
+                handle,
+                command,
+                Some(root.as_str()),
+                timeout_seconds.unwrap_or(120),
+            )
             .await?;
+        output.truncate_stdout();
         Ok(output.to_exec_result())
     }
 
@@ -938,6 +981,49 @@ mod tests {
     }
 
     #[test]
+    fn exec_output_stdout_is_budgeted_at_512_kib() {
+        // Java `AgentRunSandbox#doExec` / `DaytonaSandbox#doExec`: 600 KiB stdout is cut to the
+        // budget and flagged, stderr is forwarded verbatim.
+        let mut output = RemoteExecOutput::new(0, "x".repeat(600 * 1024), "err".to_string());
+        output.truncate_stdout();
+        assert!(output.truncated);
+        assert_eq!(output.stdout.len(), OUTPUT_TRUNCATE_BYTES);
+        assert_eq!(output.stderr, "err");
+
+        // Java flags `>=` the budget, so exactly-at-budget output is truncated without dropping
+        // a byte.
+        let mut at_budget = RemoteExecOutput::new(0, "y".repeat(OUTPUT_TRUNCATE_BYTES), String::new());
+        at_budget.truncate_stdout();
+        assert!(at_budget.truncated);
+        assert_eq!(at_budget.stdout.len(), OUTPUT_TRUNCATE_BYTES);
+
+        // Under the budget nothing changes.
+        let mut small = RemoteExecOutput::new(0, "hi".to_string(), String::new());
+        small.truncate_stdout();
+        assert!(!small.truncated);
+        assert_eq!(small.stdout, "hi");
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_keeps_code_points_whole() {
+        let accented = "ééé"; // 2 bytes per code point
+        assert_eq!(truncate_utf8_bytes(accented.as_bytes(), 3), "é".as_bytes());
+        assert_eq!(truncate_utf8_bytes(accented.as_bytes(), 1), b"" as &[u8]);
+        assert_eq!(truncate_utf8_bytes(b"abc", 10), b"abc");
+
+        // A budget landing inside an emoji (4 bytes) must not leave a partial code point.
+        let mut output = RemoteExecOutput::new(
+            0,
+            format!("{}🚀", "a".repeat(OUTPUT_TRUNCATE_BYTES - 1)),
+            String::new(),
+        );
+        output.truncate_stdout();
+        assert!(output.truncated);
+        assert_eq!(output.stdout.len(), OUTPUT_TRUNCATE_BYTES - 1);
+        assert!(output.stdout.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
     fn exec_output_converts_to_harness_result() {
         let out = RemoteExecOutput::new(3, "o".into(), "e".into());
         let result = out.to_exec_result();
@@ -956,6 +1042,8 @@ mod tests {
         native_transfer: bool,
         /// Number of `create_sandbox` calls, so tests can prove `resume` does not recreate.
         creates: Mutex<usize>,
+        /// `cwd` passed by each `exec_in` call, so tests can pin the workspace-root default.
+        cwds: Mutex<Vec<Option<String>>>,
     }
 
     /// Stand-in native file-transfer adapter (see the harness-gap note in `kubernetes_files`).
@@ -1013,9 +1101,13 @@ mod tests {
             &self,
             _handle: &RemoteSandboxHandle,
             command: &str,
-            _cwd: Option<&str>,
+            cwd: Option<&str>,
             _timeout_seconds: u64,
         ) -> SandboxResult<RemoteExecOutput> {
+            self.cwds
+                .lock()
+                .unwrap()
+                .push(cwd.map(str::to_string));
             self.commands.lock().unwrap().push(command.to_string());
             // Emulate `tar | base64` for an empty archive so `stop` can round-trip.
             if command.contains("base64 -w0") {
@@ -1033,6 +1125,7 @@ mod tests {
             alive: Mutex::new(false),
             native_transfer: false,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let client = RemoteSandboxClient::new(backend.clone());
         let spec = WorkspaceSpec::new("/workspace").with_file("README.md", "hi");
@@ -1075,6 +1168,7 @@ mod tests {
             alive: Mutex::new(false),
             native_transfer: false,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let client = RemoteSandboxClient::new(backend).with_snapshot_spec(Arc::new(
             agentscope_harness::agent::sandbox::RemoteSnapshotSpec::new(Arc::new(
@@ -1107,6 +1201,7 @@ mod tests {
             alive: Mutex::new(true),
             native_transfer: false,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let client = RemoteSandboxClient::new(backend);
         let state = sample_data().to_harness_state();
@@ -1121,6 +1216,7 @@ mod tests {
             alive: Mutex::new(false),
             native_transfer: false,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let client = RemoteSandboxClient::new(backend.clone());
 
@@ -1158,6 +1254,65 @@ mod tests {
         }
         resumed.start().await.unwrap();
         assert_eq!(*backend.creates.lock().unwrap(), 1, "resume must not call create_sandbox");
+    }
+
+    #[tokio::test]
+    async fn exec_runs_inside_the_workspace_root() {
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let client = RemoteSandboxClient::new(backend.clone());
+        let spec = WorkspaceSpec::new("/workspace");
+        let mut sandbox = client.create(&spec, None, None).await.unwrap();
+        sandbox.start().await.unwrap();
+        sandbox.exec(None, "ls", Some(5)).await.unwrap();
+
+        let cwds = backend.cwds.lock().unwrap().clone();
+        assert_eq!(
+            cwds.last().cloned().flatten().as_deref(),
+            Some("/workspace"),
+            "exec runs inside the workspace root (Java doExec)"
+        );
+        assert!(
+            cwds[..cwds.len() - 1].iter().all(Option::is_none),
+            "internal projection/archive commands keep absolute paths and no cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_stops_and_destroys_the_owned_sandbox() {
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let client = RemoteSandboxClient::new(backend.clone());
+        let spec = WorkspaceSpec::new("/workspace").with_file("a.txt", "hi");
+        let mut sandbox = client.create(&spec, None, None).await.unwrap();
+        sandbox.start().await.unwrap();
+        assert!(*backend.alive.lock().unwrap(), "start creates the remote sandbox");
+
+        // `Sandbox::close` = stop (archive the workspace) + shutdown (kill the remote sandbox).
+        // This is what harness `SandboxManager::release` calls for self-managed sandboxes
+        // (SANDBOX-09), so the remote sandbox cannot outlive the release.
+        sandbox.close().await.unwrap();
+        assert!(!sandbox.is_running());
+        assert!(
+            !*backend.alive.lock().unwrap(),
+            "close must destroy the owned remote sandbox"
+        );
+        assert!(backend
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("base64 -w0")));
     }
 
     #[test]
@@ -1213,6 +1368,7 @@ mod tests {
             alive: Mutex::new(true),
             native_transfer: true,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let mut sandbox = RemoteSandbox::new(backend.clone(), sample_data(), None);
         // The adapter is refreshed in `ensure_handle`, so it is absent until the sandbox starts.
@@ -1226,6 +1382,7 @@ mod tests {
             alive: Mutex::new(true),
             native_transfer: false,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let mut plain = RemoteSandbox::new(backend, sample_data(), None);
         plain.start().await.unwrap();
@@ -1241,6 +1398,7 @@ mod tests {
             alive: Mutex::new(true),
             native_transfer: true,
             creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
         });
         let mut sandbox = RemoteSandbox::new(backend.clone(), sample_data(), None);
         sandbox.start().await.unwrap();

@@ -400,18 +400,21 @@ impl RemoteBackend for DaytonaBackend {
         cwd: Option<&str>,
         timeout_seconds: u64,
     ) -> SandboxResult<RemoteExecOutput> {
-        let cwd = cwd
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| relative_cwd(&self.options.workspace_root));
+        // Java `DaytonaSandbox#doExec` always runs inside the workspace root, expressed relative
+        // to the sandbox home (`relativeCwd(workspaceRoot)`).
+        let cwd = relative_cwd(cwd.unwrap_or(self.options.workspace_root.as_str()));
         let result = self
             .execute_raw(&handle.id, command, Some(&cwd), timeout_seconds)
             .await?;
-        Ok(RemoteExecOutput {
+        let mut output = RemoteExecOutput {
             exit_code: result.exit_code,
             stdout: result.result,
             stderr: String::new(),
             truncated: false,
-        })
+        };
+        // Java `DaytonaSandbox#doExec`: 512 KiB stdout budget + `truncated` flag.
+        output.truncate_stdout();
+        Ok(output)
     }
 }
 
@@ -526,5 +529,37 @@ mod tests {
             backend.create_sandbox("s").await.unwrap_err(),
             SandboxExtensionError::Configuration(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn exec_sends_a_relative_workspace_cwd_and_budgets_stdout() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/toolbox/sbx-9/process/execute")
+                    .json_body_partial(
+                        r#"{"command":"ls","cwd":"home/daytona/workspace"}"#,
+                    );
+                then.status(200)
+                    .json_body(json!({"exitCode": 0, "result": "x".repeat(600 * 1024)}));
+            })
+            .await;
+        let backend = DaytonaBackend::new(DaytonaSandboxClientOptions {
+            api_key: Some("key".to_string()),
+            toolbox_base_url: server.base_url(),
+            ..Default::default()
+        })
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("sbx-9", BTreeMap::new());
+        let output = backend
+            .exec_in(&handle, "ls", Some(DEFAULT_WORKSPACE_ROOT), 5)
+            .await
+            .unwrap();
+        // Java `DaytonaSandbox#doExec`: relative cwd + 512 KiB stdout budget.
+        mock.assert_async().await;
+        assert!(output.truncated);
+        assert_eq!(output.stdout.len(), crate::remote::OUTPUT_TRUNCATE_BYTES);
     }
 }

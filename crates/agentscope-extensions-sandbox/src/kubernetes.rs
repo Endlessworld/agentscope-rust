@@ -539,6 +539,12 @@ pub fn build_execute_body(command: &str) -> Value {
     json!({ "command": command })
 }
 
+/// Wraps a command so it runs inside `root` (mirrors Java `KubernetesSandbox#doExec`, which
+/// always sends `cd <workspaceRoot> && ( …command… )`).
+pub fn wrap_workspace_command(root: &str, command: &str) -> String {
+    format!("cd {} && ( {command} )", shell_quote(root))
+}
+
 /// Result of a sandbox-server command execution.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KubernetesExecResult {
@@ -1603,12 +1609,17 @@ impl RemoteBackend for KubernetesBackend {
         &self,
         handle: &RemoteSandboxHandle,
         command: &str,
-        _cwd: Option<&str>,
+        cwd: Option<&str>,
         timeout_seconds: u64,
     ) -> SandboxResult<RemoteExecOutput> {
         let base = self.connector_base_url(handle).await?;
         let url = join_url(&base, "execute");
-        let body = build_execute_body(command);
+        // A caller-supplied cwd is the workspace root: run the command inside it like Java does.
+        // Internal archive/hydrate commands pass no cwd and keep their absolute paths.
+        let body = match cwd.filter(|c| !c.trim().is_empty()) {
+            Some(root) => build_execute_body(&wrap_workspace_command(root, command)),
+            None => build_execute_body(command),
+        };
         let headers = self.router_headers(handle);
         let client = self.client.clone();
         let retry = self.retry.clone();
@@ -2266,6 +2277,45 @@ mod tests {
             .expect("exec succeeds");
         assert_eq!(output.stdout, "o");
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn exec_runs_inside_the_workspace_root() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute").json_body(json!({
+                    "command": "cd /workspace && ( ls )",
+                }));
+                then.status(200)
+                    .json_body(json!({"stdout": "o", "stderr": "", "exitCode": 0}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let output = backend
+            .exec_in(
+                &handle_with_pod_ip("10.0.0.5"),
+                "ls",
+                Some(DEFAULT_WORKSPACE_ROOT),
+                5,
+            )
+            .await
+            .expect("exec succeeds");
+        assert_eq!(output.stdout, "o");
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn wrap_workspace_command_quotes_the_root() {
+        assert_eq!(
+            wrap_workspace_command("/workspace", "ls -la"),
+            "cd /workspace && ( ls -la )"
+        );
+        assert_eq!(
+            wrap_workspace_command("/with space", "ls"),
+            "cd '/with space' && ( ls )"
+        );
     }
 
     #[tokio::test]
