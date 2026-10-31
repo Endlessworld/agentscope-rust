@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
-use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use agentscope_harness::agent::{
+    ChannelConfig, DeliveryReceipt, OutboundAddress, PlatformChannel, PlatformCtx,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -31,7 +33,7 @@ use super::properties::FeishuChannelProperties;
 use super::token::FeishuAccessTokenProvider;
 use crate::common::{
     constant_time_eq, to_core_error, AccessTokenProvider, BotLoopGuard, ChannelCore,
-    ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
+    ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, ReceiptChannel, Result,
 };
 
 /// Channel type name, mirroring `FeishuChannel.TYPE` (the `agentscope.json#channels[*].type` key).
@@ -160,6 +162,24 @@ impl FeishuChannel {
         &self.core
     }
 
+    /// Deliver one host-persisted reply and return the provider's receipt.
+    ///
+    /// Mirrors Java `FeishuChannel#deliverWithReceipt`: the delivery id becomes the Feishu `uuid`,
+    /// so the provider collapses a retried notification onto the message it already created, and
+    /// the returned `message_id` is the receipt a durable worker stores.
+    pub async fn deliver_with_receipt(
+        &self,
+        address: &OutboundAddress,
+        message: &Msg,
+        delivery_id: Option<&str>,
+    ) -> CoreResult<DeliveryReceipt> {
+        self.outbound
+            .send_with_receipt(address, message, delivery_id)
+            .await
+            .map(DeliveryReceipt::with_message_id)
+            .map_err(to_core_error)
+    }
+
     /// Full callback pipeline, in the Java order: signature check -> decrypt -> URL handshake ->
     /// event-token authentication -> mapping -> de-duplication -> bot-loop guard -> dispatch.
     pub async fn handle_callback(
@@ -280,6 +300,18 @@ impl PlatformChannel for FeishuChannel {
     }
 }
 
+#[async_trait]
+impl ReceiptChannel for FeishuChannel {
+    async fn deliver_with_receipt(
+        &self,
+        address: &OutboundAddress,
+        message: &Msg,
+        delivery_id: Option<&str>,
+    ) -> CoreResult<DeliveryReceipt> {
+        Self::deliver_with_receipt(self, address, message, delivery_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +408,44 @@ mod tests {
         assert_eq!(c.channel_id(), "feishu");
         assert_eq!(c.config().channel_id, "feishu");
         assert!(c.crypto().is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_with_receipt_returns_the_provider_message_id() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, r#"{"code":0,"data":{"message_id":"om_42"}}"#),
+        ]));
+        let props = FeishuChannelProperties::from_json(
+            "feishu",
+            &serde_json::json!({"appId": "cli_x", "appSecret": "s", "verificationToken": "vt"}),
+        )
+        .unwrap();
+        let token: Arc<dyn AccessTokenProvider> = Arc::new(StaticTokenProvider::new("tok"));
+        let c = FeishuChannel::new(
+            "feishu",
+            ChannelConfig::of("feishu"),
+            props,
+            None,
+            FeishuOutboundClient::new(API_BASE, token, transport.clone()),
+            FeishuInboundMapper::new("feishu"),
+            Arc::new(IdempotencyStore::with_defaults()),
+            BotLoopGuard::with_defaults(),
+        );
+
+        let receipt = ReceiptChannel::deliver_with_receipt(
+            &c,
+            &OutboundAddress::direct("feishu", "feishu:DIRECT:oc_1"),
+            &Msg::user("hi"),
+            Some("d-1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.message_id.as_deref(), Some("om_42"));
+        assert_eq!(
+            transport.last_request().unwrap().body.unwrap()["uuid"],
+            serde_json::json!("d-1"),
+            "the delivery id must reach Feishu as its idempotency key"
+        );
     }
 
     #[tokio::test]

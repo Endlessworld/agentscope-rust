@@ -11,8 +11,8 @@ use agentscope_harness::agent::{OutboundAddress, PeerKind};
 use serde_json::{json, Value};
 
 use crate::common::{
-    looks_like_markdown, parse_peer_target, AccessTokenProvider, ChannelError, HttpMethod,
-    HttpTransport, PeerTarget, PreparedRequest, Result,
+    ensure_success, looks_like_markdown, parse_peer_target, AccessTokenProvider, ChannelError,
+    HttpMethod, HttpTransport, PeerTarget, PreparedRequest, Result,
 };
 
 /// DingTalk outbound client. The production `WebClient` is replaced by a pluggable
@@ -107,6 +107,10 @@ impl DingTalkOutboundClient {
     }
 
     /// Fetch a token, build the requests and execute them in order.
+    ///
+    /// A non-2xx answer is an error (Java `WebClient.retrieve()`): an expired token, a missing user
+    /// or a rate-limited robot must not look like a delivered reply (CHANNEL-N04). The token is
+    /// still invalidated first, so the next attempt starts from a fresh credential.
     pub async fn send(&self, address: &OutboundAddress, messages: &[Msg]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -120,6 +124,7 @@ impl DingTalkOutboundClient {
             {
                 self.token_provider.invalidate();
             }
+            ensure_success(&response)?;
         }
         Ok(())
     }
@@ -134,6 +139,7 @@ impl DingTalkOutboundClient {
 mod tests {
     use super::*;
     use crate::common::testing::{RecordingTransport, StaticTokenProvider};
+    use crate::common::PreparedResponse;
 
     fn client(transport: Arc<RecordingTransport>) -> DingTalkOutboundClient {
         DingTalkOutboundClient::new(
@@ -231,5 +237,33 @@ mod tests {
         let address = OutboundAddress::direct("dingtalk", "dingtalk:DIRECT:u1");
         c.send(&address, &[]).await.unwrap();
         assert_eq!(transport.request_count(), 0);
+    }
+
+    /// CHANNEL-N04: the Java client goes through `retrieve()`, so a rejected send is an error —
+    /// the token is still invalidated first, so the next attempt starts from a fresh credential.
+    #[tokio::test]
+    async fn a_rejected_send_is_an_error_and_invalidates_the_token() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(429, r#"{"code":"Throttling","message":"too many"}"#),
+        ]));
+        let provider = Arc::new(StaticTokenProvider::new("tok-1"));
+        let c = DingTalkOutboundClient::new(
+            "https://api.dingtalk.com",
+            provider.clone(),
+            "robot-1",
+            transport,
+        );
+        let address = OutboundAddress::direct("dingtalk", "dingtalk:DIRECT:u1");
+
+        let err = c
+            .send(&address, &[Msg::user("hi")])
+            .await
+            .expect_err("a 429 must not look like a delivered message");
+        assert!(
+            matches!(err, ChannelError::Remote { status: 429, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Throttling"), "{err}");
+        assert!(provider.was_invalidated());
     }
 }

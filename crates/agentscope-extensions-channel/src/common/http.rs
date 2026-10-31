@@ -107,6 +107,30 @@ impl PreparedResponse {
     }
 }
 
+/// Characters of a provider error body echoed in an error message (the same bound the WeCom
+/// send-response check uses).
+pub const MAX_ERROR_SNIPPET_CHARS: usize = 200;
+
+/// Reject a non-2xx provider response, mirroring the Java `WebClient.retrieve()` contract.
+///
+/// The Java outbound clients go through `retrieve()`, so a 401 (bad token), 403/404 (unknown repo
+/// or issue), 422 (rejected content) or 429 (rate limit) lands in `onError` instead of being
+/// reported as a delivered message. The body is echoed truncated: it is diagnostics, not payload.
+pub fn ensure_success(response: &PreparedResponse) -> Result<()> {
+    if response.is_success() {
+        return Ok(());
+    }
+    let body: String = response
+        .body
+        .chars()
+        .take(MAX_ERROR_SNIPPET_CHARS)
+        .collect();
+    Err(ChannelError::Remote {
+        status: response.status,
+        body,
+    })
+}
+
 /// Executes [`PreparedRequest`]s. Implementations must be safe to share across tasks.
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
@@ -227,6 +251,30 @@ impl HttpTransport for ReqwestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_success_accepts_2xx_and_rejects_the_rest_with_a_bounded_snippet() {
+        assert!(ensure_success(&PreparedResponse::new(201, "")).is_ok());
+        assert!(ensure_success(&PreparedResponse::new(204, "")).is_ok());
+
+        let err = ensure_success(&PreparedResponse::new(401, "denied")).unwrap_err();
+        match &err {
+            ChannelError::Remote { status, body } => {
+                assert_eq!(*status, 401);
+                assert_eq!(body, "denied");
+            }
+            other => panic!("expected a remote error, got {other:?}"),
+        }
+
+        let long = "x".repeat(MAX_ERROR_SNIPPET_CHARS * 2);
+        let err = ensure_success(&PreparedResponse::new(500, long)).unwrap_err();
+        match err {
+            ChannelError::Remote { body, .. } => {
+                assert_eq!(body.chars().count(), MAX_ERROR_SNIPPET_CHARS);
+            }
+            other => panic!("expected a remote error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn post_json_sets_content_type_and_body() {

@@ -133,14 +133,18 @@ impl FeishuOutboundClient {
     }
 
     /// Send a single message and return the Feishu `message_id`.
+    ///
+    /// `delivery_id` becomes the request `uuid`, Feishu's idempotency key, so a retried durable
+    /// notification returns the first message id instead of posting twice (Java
+    /// `FeishuOutboundClient#sendWithReceipt`).
     pub async fn send_with_receipt(
         &self,
         address: &OutboundAddress,
         msg: &Msg,
-        delivery_id: &str,
+        delivery_id: Option<&str>,
     ) -> Result<String> {
         let token = self.token_provider.token().await?;
-        let request = self.prepare_with_receipt(token.as_str(), address, msg, Some(delivery_id))?;
+        let request = self.prepare_with_receipt(token.as_str(), address, msg, delivery_id)?;
         let response = self.transport.execute(request).await?;
         let message_id = self.parse_send_response(&response.body)?;
         if message_id.trim().is_empty() {
@@ -273,10 +277,29 @@ mod tests {
         let c = client(transport, Arc::new(StaticTokenProvider::new("tok")));
         let address = OutboundAddress::direct("feishu", "feishu:DIRECT:oc_1");
         let id = c
-            .send_with_receipt(&address, &Msg::user("hi"), "d-1")
+            .send_with_receipt(&address, &Msg::user("hi"), Some("d-1"))
             .await
             .unwrap();
         assert_eq!(id, "om_42");
+    }
+
+    #[tokio::test]
+    async fn a_receipt_without_a_delivery_id_sends_no_uuid() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, r#"{"code":0,"data":{"message_id":"om_43"}}"#),
+        ]));
+        let c = client(transport.clone(), Arc::new(StaticTokenProvider::new("tok")));
+        let address = OutboundAddress::direct("feishu", "feishu:DIRECT:oc_1");
+        let id = c
+            .send_with_receipt(&address, &Msg::user("hi"), None)
+            .await
+            .unwrap();
+        assert_eq!(id, "om_43");
+        let body = transport.last_request().unwrap().body.unwrap();
+        assert!(
+            body.get("uuid").is_none(),
+            "a host without a delivery id must not fabricate one: {body}"
+        );
     }
 
     #[test]

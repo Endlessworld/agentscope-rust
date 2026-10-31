@@ -32,7 +32,7 @@ pub trait InboundEventDeduplicator: Send + Sync {
     /// that cannot answer cheaply: de-duplication then happens once the event has been handled
     /// ("durable intake owns deduplication"), so a transient failure never becomes a permanent
     /// drop.
-    fn contains(&self, key: &str) -> bool {
+    fn contains(&self, _key: &str) -> bool {
         false
     }
 }

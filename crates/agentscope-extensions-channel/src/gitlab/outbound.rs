@@ -7,7 +7,7 @@ use agentscope_harness::agent::OutboundAddress;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::json;
 
-use crate::common::{ChannelError, HttpTransport, PreparedRequest, Result};
+use crate::common::{ensure_success, ChannelError, HttpTransport, PreparedRequest, Result};
 
 /// Matches Java `URLEncoder.encode(path, UTF-8)`: everything except `A-Za-z0-9.-_*` is escaped.
 const JAVA_URL_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
@@ -109,12 +109,16 @@ impl GitLabOutboundClient {
     }
 
     /// Execute one request per message.
+    ///
+    /// A non-2xx answer is an error (Java `WebClient.retrieve()`): a bad private token, an unknown
+    /// project or a rejected note must not look like a delivered reply (CHANNEL-N04).
     pub async fn send(&self, address: &OutboundAddress, messages: &[Msg]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
         for request in self.prepare(address, messages)? {
-            self.transport.execute(request).await?;
+            let response = self.transport.execute(request).await?;
+            ensure_success(&response)?;
         }
         Ok(())
     }
@@ -124,6 +128,7 @@ impl GitLabOutboundClient {
 mod tests {
     use super::*;
     use crate::common::testing::RecordingTransport;
+    use crate::common::PreparedResponse;
 
     fn client(transport: Arc<RecordingTransport>) -> GitLabOutboundClient {
         GitLabOutboundClient::new("https://gitlab.com/api/v4", "pat", transport)
@@ -184,5 +189,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transport.request_count(), 2);
+    }
+
+    /// CHANNEL-N04: the Java client goes through `retrieve()`, so a rejected note must be an error
+    /// instead of a silent "delivered".
+    #[tokio::test]
+    async fn a_rejected_note_is_an_error() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(403, r#"{"message":"403 Forbidden"}"#),
+        ]));
+        let c = client(transport);
+        let address = OutboundAddress::direct("gitlab", "gitlab:THREAD:grp/proj#9:Issue");
+
+        let err = c
+            .send(&address, &[Msg::user("lgtm")])
+            .await
+            .expect_err("a 403 must not look like a delivered note");
+        assert!(
+            matches!(err, ChannelError::Remote { status: 403, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("403 Forbidden"), "{err}");
     }
 }

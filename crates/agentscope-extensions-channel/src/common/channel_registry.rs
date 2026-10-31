@@ -29,6 +29,8 @@ use std::sync::{Arc, RwLock};
 use agentscope_harness::agent::gateway::channel::Channel;
 use agentscope_harness::agent::{ChannelManager, ChannelSink};
 
+use super::receipt::{ReceiptChannel, ReceiptSink};
+
 /// Typed registry of platform channels, optionally mirrored into a harness [`ChannelManager`].
 pub struct ChannelRegistry<C>
 where
@@ -36,6 +38,10 @@ where
 {
     channels: RwLock<BTreeMap<String, Arc<C>>>,
     manager: Option<Arc<ChannelManager>>,
+    /// Builds the sink mirrored into the harness `ChannelManager`. `None` mirrors the channel
+    /// itself, whose `deliver_with_receipt` then fails closed; receipt-capable platforms mirror a
+    /// [`ReceiptSink`] instead (CHANNEL-N05).
+    receipt_mirror: Option<fn(Arc<C>) -> Arc<dyn ChannelSink>>,
 }
 
 impl<C> std::fmt::Debug for ChannelRegistry<C>
@@ -46,6 +52,7 @@ where
         f.debug_struct("ChannelRegistry")
             .field("channel_ids", &self.channel_ids())
             .field("mirrors_into_channel_manager", &self.manager.is_some())
+            .field("mirrors_receipts", &self.receipt_mirror.is_some())
             .finish()
     }
 }
@@ -58,6 +65,7 @@ where
         Self {
             channels: RwLock::new(BTreeMap::new()),
             manager: None,
+            receipt_mirror: None,
         }
     }
 }
@@ -77,6 +85,7 @@ where
         Self {
             channels: RwLock::new(BTreeMap::new()),
             manager: Some(manager),
+            receipt_mirror: None,
         }
     }
 
@@ -90,7 +99,10 @@ where
             .expect("channel registry lock poisoned")
             .insert(channel_id, channel.clone());
         if let Some(manager) = &self.manager {
-            let sink: Arc<dyn ChannelSink> = channel;
+            let sink: Arc<dyn ChannelSink> = match self.receipt_mirror {
+                Some(build) => build(channel.clone()),
+                None => channel,
+            };
             manager.register(sink).await;
         }
     }
@@ -136,6 +148,27 @@ where
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl<C> ChannelRegistry<C>
+where
+    C: ReceiptChannel + Channel + ChannelSink + 'static,
+{
+    /// A registry whose harness mirror is **receipt-aware** (CHANNEL-N05).
+    ///
+    /// Platforms whose transport returns a provider message id (Feishu, Weixin) must register
+    /// through this constructor: the harness blanket-impls `ChannelSink` for every
+    /// `PlatformChannel`, so the only way to override the fail-closed `deliver_with_receipt`
+    /// default is to mirror a [`ReceiptSink`] instead of the raw channel.
+    pub fn with_manager_and_receipts(manager: Arc<ChannelManager>) -> Self {
+        Self {
+            channels: RwLock::new(BTreeMap::new()),
+            manager: Some(manager),
+            receipt_mirror: Some(|channel: Arc<C>| -> Arc<dyn ChannelSink> {
+                Arc::new(ReceiptSink::new(channel))
+            }),
+        }
     }
 }
 

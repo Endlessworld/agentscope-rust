@@ -6,7 +6,7 @@ use agentscope_core::message::Msg;
 use agentscope_harness::agent::OutboundAddress;
 use serde_json::json;
 
-use crate::common::{ChannelError, HttpTransport, PreparedRequest, Result};
+use crate::common::{ensure_success, ChannelError, HttpTransport, PreparedRequest, Result};
 
 /// GitHub outbound client built on the pluggable [`HttpTransport`] seam.
 pub struct GitHubOutboundClient {
@@ -108,12 +108,16 @@ impl GitHubOutboundClient {
     }
 
     /// Execute one request per message.
+    ///
+    /// A non-2xx answer is an error (Java `WebClient.retrieve()`): a bad token, an unknown repo or
+    /// a rejected comment must not look like a delivered reply (CHANNEL-N04).
     pub async fn send(&self, address: &OutboundAddress, messages: &[Msg]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
         for request in self.prepare(address, messages)? {
-            self.transport.execute(request).await?;
+            let response = self.transport.execute(request).await?;
+            ensure_success(&response)?;
         }
         Ok(())
     }
@@ -123,6 +127,7 @@ impl GitHubOutboundClient {
 mod tests {
     use super::*;
     use crate::common::testing::RecordingTransport;
+    use crate::common::PreparedResponse;
 
     fn client(transport: Arc<RecordingTransport>) -> GitHubOutboundClient {
         GitHubOutboundClient::new("https://api.github.com", "pat", transport)
@@ -188,5 +193,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transport.request_count(), 2);
+    }
+
+    /// CHANNEL-N04: the Java client goes through `retrieve()`, so a rejected comment must be an
+    /// error instead of a silent "delivered".
+    #[tokio::test]
+    async fn a_rejected_comment_is_an_error() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(401, r#"{"message":"Bad credentials"}"#),
+        ]));
+        let c = client(transport);
+        let address = OutboundAddress::direct("github", "github:THREAD:octo/repo#7");
+
+        let err = c
+            .send(&address, &[Msg::user("a")])
+            .await
+            .expect_err("a 401 must not look like a delivered comment");
+        assert!(
+            matches!(err, ChannelError::Remote { status: 401, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Bad credentials"), "{err}");
     }
 }

@@ -44,7 +44,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use agentscope_core::agent::CancelSignal;
 use agentscope_core::error::Result as CoreResult;
 use agentscope_core::message::Msg;
-use agentscope_harness::agent::{ChannelConfig, OutboundAddress, PlatformChannel, PlatformCtx};
+use agentscope_harness::agent::{
+    ChannelConfig, DeliveryReceipt, OutboundAddress, PlatformChannel, PlatformCtx,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -59,7 +61,7 @@ use super::properties::WeixinChannelProperties;
 use super::state_store::{WeixinInboxClaim, WeixinInboxMessage, WeixinLease, WeixinStateStore};
 use crate::common::{
     to_core_error as channel_to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry,
-    ChannelSeams, HttpTransport, Result,
+    ChannelSeams, HttpTransport, ReceiptChannel, Result,
 };
 
 /// Channel type name, mirroring `WeixinChannel.TYPE`.
@@ -749,21 +751,30 @@ impl WeixinChannel {
 
     /// Send one host-persisted reply and return the provider's receipt.
     ///
-    /// A host that persists replies needs the receipt, not a local acknowledgement: only the
-    /// provider's message id proves iLink accepted the reply.
+    /// Mirrors Java `WeixinChannel#deliverWithReceipt`: the context token stored for the addressed
+    /// peer is used (iLink requires it), and the lease is fenced before the provider call so a host
+    /// delivery worker can never send on a stale lease. iLink has no caller-supplied idempotency
+    /// key, so the Java `deliveryId` argument has no counterpart here.
     pub async fn deliver_with_receipt(
         &self,
         address: &OutboundAddress,
         message: &Msg,
-        context_token: Option<&str>,
-    ) -> WeixinResult<Option<String>> {
-        let session = self
-            .active_session()
-            .ok_or_else(|| WeixinError::operation("Weixin consumer is not active"))?;
-        self.require_lease(&session)?;
-        self.outbound
-            .send_with_receipt(address, message, context_token)
+    ) -> CoreResult<DeliveryReceipt> {
+        let session = self.active_session().ok_or_else(|| {
+            to_core_error(WeixinError::operation("Weixin consumer is not active"))
+        })?;
+        self.require_lease(&session).map_err(to_core_error)?;
+        let token = self
+            .state_store
+            .load_context_token(&self.properties.account_id, peer_of(&address.to));
+        let receipt = self
+            .outbound
+            .send_with_receipt(address, message, token.as_deref())
             .await
+            .map_err(to_core_error)?;
+        Ok(receipt
+            .map(DeliveryReceipt::with_message_id)
+            .unwrap_or_default())
     }
 
     /// Stop the consumer: fence the active session and mark the channel stopped.
@@ -872,6 +883,18 @@ impl PlatformChannel for WeixinChannel {
         self.deliver_to_peer(address, &messages)
             .await
             .map_err(to_core_error)
+    }
+}
+
+#[async_trait]
+impl ReceiptChannel for WeixinChannel {
+    async fn deliver_with_receipt(
+        &self,
+        address: &OutboundAddress,
+        message: &Msg,
+        _delivery_id: Option<&str>,
+    ) -> CoreResult<DeliveryReceipt> {
+        Self::deliver_with_receipt(self, address, message).await
     }
 }
 
@@ -1083,6 +1106,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_receipt_delivery_uses_the_stored_token_and_reports_the_provider_id() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, r#"{"message_id":"receipt-1"}"#),
+        ]));
+        let (channel, store) = channel(transport.clone());
+        let session = channel.begin_consuming().unwrap().unwrap();
+        assert!(store.save_context_token(ACCOUNT, session.lease(), "peer-a", "ctx-9"));
+
+        let receipt = ReceiptChannel::deliver_with_receipt(
+            &*channel,
+            &address(),
+            &assistant("hello"),
+            Some("d-9"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.message_id.as_deref(), Some("receipt-1"));
+        let body = transport.last_request().unwrap().body.unwrap();
+        assert_eq!(body["msg"]["context_token"], serde_json::json!("ctx-9"));
+    }
+
+    #[tokio::test]
+    async fn a_receipt_delivery_without_a_live_lease_is_refused() {
+        let transport = Arc::new(RecordingTransport::new());
+        let (channel, _store) = channel(transport.clone());
+        let error =
+            ReceiptChannel::deliver_with_receipt(&*channel, &address(), &assistant("hello"), None)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("not active"));
+        assert_eq!(
+            transport.request_count(),
+            0,
+            "a channel with no consumer must not ask iLink for a receipt"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lost_lease_suppresses_the_late_reply() {
         let transport = Arc::new(RecordingTransport::with_responses(vec![
             PreparedResponse::new(200, "{\"message_id\":\"receipt-1\"}"),
@@ -1168,10 +1229,7 @@ mod tests {
             // notifystart
             PreparedResponse::new(200, "{\"ret\":0}"),
             // getupdates: one healthy, empty batch
-            PreparedResponse::new(
-                200,
-                "{\"ret\":0,\"get_updates_buf\":\"next\",\"msgs\":[]}",
-            ),
+            PreparedResponse::new(200, "{\"ret\":0,\"get_updates_buf\":\"next\",\"msgs\":[]}"),
             // getupdates: the provider fails right after the healthy round
             PreparedResponse::new(200, "{\"ret\":-1}"),
         ]));
