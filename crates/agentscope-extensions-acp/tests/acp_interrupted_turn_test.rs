@@ -27,8 +27,8 @@ use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpCodingAgent;
 use agentscope_harness::agent::HarnessAgent;
 
-/// Answers immediately on the first call, then blocks forever (so the client can cancel the
-/// first prompt mid-run and leave the turn interrupted).
+/// Blocks forever on the first call (so the client can cancel the first prompt mid-run and
+/// leave the turn interrupted), then answers immediately on every later call.
 struct BlockingFirstModel {
     calls: Arc<AtomicUsize>,
 }
@@ -62,6 +62,8 @@ impl Model for BlockingFirstModel {
 async fn a_cancelled_turn_does_not_block_the_next_prompt() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_factory = Arc::clone(&calls);
+    // The client half watches the same counter, to know when turn 1 has entered the model.
+    let calls_for_client = Arc::clone(&calls);
     let (agent_channel, client_channel) = Channel::duplex();
 
     let agent = AcpCodingAgent::builder()
@@ -87,7 +89,7 @@ async fn a_cancelled_turn_does_not_block_the_next_prompt() {
         .builder()
         .connect_with(
             client_channel,
-            |connection: ConnectionTo<Agent>| async move {
+            move |connection: ConnectionTo<Agent>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
@@ -103,7 +105,27 @@ async fn a_cancelled_turn_does_not_block_the_next_prompt() {
                     session_id.clone(),
                     vec![ContentBlock::Text(TextContent::new("start working"))],
                 ));
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                // Wait until the run has actually entered the model before cancelling.
+                //
+                // The cancel has to hit a turn that is *mid-model-call*: the fixture's model
+                // blocks in its first `stream()`, and the assertion at the end of this test
+                // requires the model to be called twice (once per prompt), so turn 1 must reach
+                // the provider. A fixed delay cannot guarantee that: opening the session journal
+                // and committing the turn's pre-model facts (writer lease, `session_input` and
+                // `before_model` checkpoints, `model/dispatch`) takes ~0.7-1s on a cold session in
+                // a debug build on Windows, well past the 400ms this test used to wait. When the
+                // cancel won that race, turn 1 was interrupted before the provider was ever
+                // entered, so the fixture's "first call blocks forever" landed on turn 2 -- which
+                // nobody cancels -- and the test hung instead of exercising the cancel path.
+                // Synchronising on the model call is what the forced-interrupt case below does.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while calls_for_client.load(Ordering::SeqCst) == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the first prompt never reached the model"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
                 first.cancel()?;
                 let first = first.block_task().await?;
                 assert_eq!(
