@@ -441,6 +441,10 @@ impl FrameworkAdapter for AgentScopeAdapter {
                     )));
                 };
                 let summary = compactor.compact(session_id, &mut state).await?;
+                // Compacting a copy would only change what the control plane shows while the
+                // next turn still sends the full history (tracker CP-07): write the compacted
+                // context back into the buffer the agent actually reads.
+                self.commit_compacted_state(&target, session_id, &state).await;
                 // A compactor that found nothing to compact returns an empty summary;
                 // publishing an empty `compaction` event would tell the control plane a
                 // rewrite happened when the history is unchanged.
@@ -639,6 +643,46 @@ impl FrameworkAdapter for AgentScopeAdapter {
 }
 
 impl AgentScopeAdapter {
+    /// Writes a compaction result back into the state the next turn reads.
+    ///
+    /// Mirrors Java `AgentScopeAdapter.handleCommand`, which compacts the **live**
+    /// `AgentState` resolved by `resolveState`. core's state sits behind a mutex that cannot
+    /// be held across the (async) compaction, so the compactor runs on a copy and only the
+    /// compacted `context` is written back — never a whole-state replacement, because a
+    /// concurrent turn may have moved other fields on in the meantime. A [`HarnessAgent`]
+    /// additionally persists the new state, so a later turn that reloads from its
+    /// `AgentStateStore` does not resurrect the pre-compaction history.
+    async fn commit_compacted_state(
+        &self,
+        target: &Arc<dyn Any + Send + Sync>,
+        session_id: &str,
+        compacted: &AgentState,
+    ) {
+        if let Some(react) = Self::react_of(target) {
+            let handle = react.state_handle();
+            let mut live = handle.lock().unwrap_or_else(|p| p.into_inner());
+            // core keeps a single state slot: only the session that owns it may be rewritten.
+            if live.session_id == compacted.session_id {
+                *live.context_mut() = compacted.context.clone();
+            }
+        }
+        let Some(harness) = target.downcast_ref::<HarnessAgent>() else {
+            return;
+        };
+        let Some(store) = harness
+            .distributed_store()
+            .and_then(|ds| ds.agent_state_store.as_ref())
+        else {
+            return;
+        };
+        let Ok(value) = serde_json::to_value(compacted) else {
+            return;
+        };
+        store
+            .save(self.user_of(session_id).as_deref(), session_id, "state", value)
+            .await;
+    }
+
     /// Runs one user message through the live agent, mirroring
     /// `AgentScopeAdapter.callUserMessage`.
     async fn call_user_message(&self, session_id: &str, content: &str) -> ControlPlaneResult<Msg> {
@@ -990,6 +1034,81 @@ mod tests {
             bridge.is_known_session("s-attach"),
             "on_bridge_attached did not reach AdapterShared; Level-2 events were dropped"
         );
+    }
+
+    /// Compactor double that keeps only the newest message, so a write-back is observable.
+    struct TrimCompactor;
+
+    #[async_trait]
+    impl SessionCompactor for TrimCompactor {
+        async fn compact(
+            &self,
+            _session_id: &str,
+            state: &mut AgentState,
+        ) -> ControlPlaneResult<String> {
+            if let Some(last) = state.context.last().cloned() {
+                state.context = vec![last];
+            }
+            Ok("trimmed".into())
+        }
+    }
+
+    /// CP-07: `compress` must compact the buffer the next turn actually reads. Before the
+    /// write-back the compaction ran on a clone, so the control plane showed a compacted
+    /// context while the agent kept sending the full history.
+    #[tokio::test]
+    async fn compress_writes_the_compacted_context_back_into_the_live_state() {
+        let mut adapter = AgentScopeAdapter::new(Some(Arc::new(TrimCompactor)));
+        let agent = Arc::new(react_agent());
+        let session = agent.agent_state().session_id.clone();
+        {
+            let handle = agent.state_handle();
+            let mut state = handle.lock().unwrap_or_else(|p| p.into_inner());
+            state.context = vec![Msg::user("one"), Msg::user("two"), Msg::user("three")];
+        }
+        let target: Arc<dyn Any + Send + Sync> = agent.clone();
+        adapter
+            .attach(target, Arc::new(|_e: SessionEvent| {}))
+            .unwrap();
+
+        let outcome = adapter
+            .execute_command(&session, COMMAND_COMPRESS, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.message, "trimmed");
+        let live = agent.agent_state();
+        assert_eq!(
+            live.context.len(),
+            1,
+            "the live context was not compacted: only the clone was rewritten"
+        );
+        assert_eq!(live.context[0].text_content(), "three");
+    }
+
+    /// CP-07: a compaction for a session this single-slot agent is not serving must leave the
+    /// live state alone (never rewrite another session's history).
+    #[tokio::test]
+    async fn compress_leaves_the_live_state_alone_for_a_foreign_session() {
+        let mut adapter = AgentScopeAdapter::new(Some(Arc::new(TrimCompactor)));
+        let agent = Arc::new(react_agent());
+        let session = agent.agent_state().session_id.clone();
+        {
+            let handle = agent.state_handle();
+            let mut state = handle.lock().unwrap_or_else(|p| p.into_inner());
+            state.context = vec![Msg::user("one"), Msg::user("two")];
+        }
+        let target: Arc<dyn Any + Send + Sync> = agent.clone();
+        adapter
+            .attach(target, Arc::new(|_e: SessionEvent| {}))
+            .unwrap();
+
+        let foreign = "someone-elses-session";
+        assert!(!session.is_empty());
+        assert!(adapter
+            .execute_command(foreign, COMMAND_COMPRESS, None)
+            .await
+            .is_err());
+        assert_eq!(agent.agent_state().context.len(), 2);
     }
 
     /// A runtime source that supports every optional capability, so the capability bits can be

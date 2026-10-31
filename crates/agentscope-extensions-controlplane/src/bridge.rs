@@ -20,19 +20,21 @@ use async_trait::async_trait;
 use agentscope_core::session::SessionExportSink;
 
 use crate::adapter::{
-    CommandOutcome, FrameworkAdapter, CAP_SESSION_COMMAND, COMMAND_ABORT, COMMAND_COMPRESS,
-    COMMAND_TERMINATE,
+    CommandOutcome, FrameworkAdapter, CAP_SESSION_COMMAND, CAP_SUBAGENT_INVENTORY,
+    CAP_WORKSPACE_INVENTORY, COMMAND_ABORT, COMMAND_COMPRESS, COMMAND_TERMINATE,
 };
 use crate::committed_export::committed_event_sink;
 use crate::config::ControlPlaneConfig;
 use crate::error::{ControlPlaneError, ControlPlaneResult};
 use crate::event_journal::EventJournal;
 use crate::model::{
-    ContextSnapshot, ContextTracker, Inventory, MessagePage, SessionEvent, ToolInfo,
+    AgentTaskAssignment, ContextSnapshot, ContextTracker, Inventory, MessagePage, SessionEvent,
+    ToolInfo,
 };
 use crate::transport::{
     AsdpEvent, AsdpTransport, ContractHttpServer, ContractProvider, EventReport, EventReportAck,
-    HttpSelfRegistration, RegisteredIdentity, RegistrationOptions, SessionEventMsg,
+    ExecutionAttemptCommand, HttpSelfRegistration, RegisteredIdentity, RegistrationOptions,
+    SessionEventMsg,
 };
 
 /// Level-2 outbox flush period (`SessionBridge.EVENT_FLUSH_INTERVAL_MS`).
@@ -530,6 +532,19 @@ impl ControlPlaneBridge {
         apply_ack(&self.state, ack)
     }
 
+    /// Dispatches one ASDP downstream command to the mounted adapter.
+    ///
+    /// `sessionCmd` reaches [`FrameworkAdapter::execute_command`], `executionAttempt` reaches
+    /// [`FrameworkAdapter::handle_agent_task`] and `conversationTurn` reaches
+    /// [`FrameworkAdapter::run_conversation_turn`] — the three handlers Java's
+    /// `SessionBridge.start` binds to the gRPC transport. The background reader calls this
+    /// for every decoded frame; exposing it lets a host drive the same path from its own
+    /// wire layer. A rejected command is returned as an error (never a panic) so a bad
+    /// push-down cannot break the bridge.
+    pub async fn dispatch_downstream(&self, event: AsdpEvent) -> ControlPlaneResult<()> {
+        dispatch_downstream(self.adapter.clone(), event).await
+    }
+
     /// Spawns the outbox pump and the downstream reader.
     ///
     /// `interval` is the flush period ([`EVENT_FLUSH_INTERVAL`] in production, a few
@@ -550,6 +565,11 @@ impl ControlPlaneBridge {
             }
         });
         let read_state = Arc::clone(&self.state);
+        // Commands reach the same adapter the contract server dispatches to. They are
+        // handled in arrival order, so a conversation turn holds the reader: the control
+        // plane reads that as backpressure, and a report whose ack lands late is simply
+        // resent under the same `report_id` (idempotent on the control plane).
+        let reader_adapter = self.adapter.clone();
         let reader = tokio::spawn(async move {
             loop {
                 match transport.next_event().await {
@@ -558,7 +578,13 @@ impl ControlPlaneBridge {
                             tracing::debug!("controlplane: event ack rejected: {error}");
                         }
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(event)) => {
+                        if let Err(error) =
+                            dispatch_downstream(reader_adapter.clone(), event).await
+                        {
+                            tracing::debug!("controlplane: downstream command rejected: {error}");
+                        }
+                    }
                     Ok(None) => break,
                     Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
                 }
@@ -810,16 +836,7 @@ impl BridgeContractView {
         command: &str,
     ) -> ControlPlaneResult<CommandOutcome> {
         let adapter = self.require_adapter(CAP_SESSION_COMMAND)?;
-        let outcome = adapter.execute_command(session_id, command, None).await?;
-        if !outcome.ok {
-            let message = if outcome.message.is_empty() {
-                format!("session {session_id} is not active")
-            } else {
-                outcome.message
-            };
-            return Err(ControlPlaneError::NotFound(message));
-        }
-        Ok(outcome)
+        dispatch_session_command(&adapter, session_id, command, None).await
     }
 
     fn is_busy(&self, session_id: &str) -> bool {
@@ -834,6 +851,34 @@ impl ContractProvider for BridgeContractView {
     }
 
     async fn context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
+        // The adapter reads the framework's live state, which is authoritative; the
+        // tracker's event-derived view is the fallback when that read fails (mirrors
+        // `SessionBridge.context`).
+        if let Some(adapter) = self.adapter.clone() {
+            match adapter.extract_context(session_id).await {
+                Ok(snapshot) => {
+                    // A framework that serves no such session must not look like an empty
+                    // one, unless the event stream already saw it (Java throws here).
+                    if snapshot.messages.is_empty()
+                        && !self.lock_state().trackers.contains_key(session_id)
+                    {
+                        return Err(ControlPlaneError::NotFound(format!(
+                            "session not found: {session_id}"
+                        )));
+                    }
+                    return Ok(snapshot);
+                }
+                // Java rethrows `UnsupportedOperationException`: an adapter that cannot
+                // answer must not be papered over with an event-derived guess.
+                Err(error @ ControlPlaneError::Unsupported(_)) => return Err(error),
+                Err(error) => {
+                    tracing::debug!(
+                        "controlplane: extractContext failed for {session_id}, \
+                         falling back to the tracker: {error}"
+                    );
+                }
+            }
+        }
         let framework = self.config.agent_key.clone();
         let state = self.lock_state();
         match state.trackers.get(session_id) {
@@ -888,17 +933,14 @@ impl ContractProvider for BridgeContractView {
     }
 
     async fn subagents(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
-        let inv = self.inventory().await?;
-        Ok(inv.subagents.iter().map(|s| s.to_json_value()).collect())
+        let adapter = self.require_adapter(CAP_SUBAGENT_INVENTORY)?;
+        let inventory = adapter.list_subagents().await?;
+        Ok(inventory.subagents.iter().map(|s| s.to_json_value()).collect())
     }
 
     async fn workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
-        let inv = self.inventory().await?;
-        Ok(inv
-            .workspaces
-            .iter()
-            .map(|w| serde_json::json!({ "path": w.path, "mode": w.mode }))
-            .collect())
+        let adapter = self.require_adapter(CAP_WORKSPACE_INVENTORY)?;
+        adapter.list_workspaces().await
     }
 
     /// `GET .../tasks`: the adapter's todo list (capability `task-query`).
@@ -1015,6 +1057,134 @@ fn session_event_msg(event: &SessionEvent) -> SessionEventMsg {
             .framework_meta
             .as_ref()
             .map(|value| value.to_string()),
+    }
+}
+
+/// Dispatches a session command to `adapter`.
+///
+/// Shared by the HTTP routes and the ASDP push-down handler (Java
+/// `SessionBridge.dispatchCommand` serves both): a missing adapter or a rejected command is
+/// an error, never a silent success.
+async fn dispatch_session_command(
+    adapter: &Arc<dyn FrameworkAdapter>,
+    session_id: &str,
+    command: &str,
+    payload: Option<serde_json::Value>,
+) -> ControlPlaneResult<CommandOutcome> {
+    let outcome = adapter.execute_command(session_id, command, payload).await?;
+    if !outcome.ok {
+        let message = if outcome.message.is_empty() {
+            format!("session {session_id} is not active")
+        } else {
+            outcome.message
+        };
+        return Err(ControlPlaneError::NotFound(message));
+    }
+    Ok(outcome)
+}
+
+/// Consumer side of the ASDP channel: routes one decoded downstream frame to the adapter.
+///
+/// Mirrors the three handlers Java's `SessionBridge.start` binds: `dispatchCommand` for
+/// `sessionCmd`, `onExecutionAttempt` for `executionAttempt`, `onConversationTurn` for
+/// `conversationTurn`. Every arm reports instead of panicking, so a malformed or unwanted
+/// push-down cannot break the bridge.
+async fn dispatch_downstream(
+    adapter: Option<Arc<dyn FrameworkAdapter>>,
+    event: AsdpEvent,
+) -> ControlPlaneResult<()> {
+    match event {
+        AsdpEvent::SessionCommand(command) => {
+            let adapter = adapter
+                .ok_or_else(|| ControlPlaneError::Unsupported(CAP_SESSION_COMMAND.to_string()))?;
+            dispatch_session_command(
+                &adapter,
+                &command.session_id,
+                &command.command,
+                command.params.as_deref().map(command_params),
+            )
+            .await
+            .map(|_| ())
+        }
+        AsdpEvent::ExecutionAttempt(command) => {
+            // `cancel` ends the attempt: Java reports it as cancelled and never dispatches it.
+            if command.command == "cancel" {
+                return Ok(());
+            }
+            let Some(adapter) = adapter else {
+                return Ok(());
+            };
+            adapter.handle_agent_task(assignment_of(&command)).await
+        }
+        AsdpEvent::ConversationTurn(command) => {
+            let Some(adapter) = adapter else {
+                return Ok(());
+            };
+            let content = notice_content(command.input.as_deref());
+            if content.trim().is_empty() {
+                return Err(ControlPlaneError::Config(
+                    "conversation input.message is required".into(),
+                ));
+            }
+            let reply = adapter
+                .run_conversation_turn(&command.session_id, &content)
+                .await?;
+            if reply.trim().is_empty() {
+                return Err(ControlPlaneError::Internal(
+                    "conversation completed without an assistant reply".into(),
+                ));
+            }
+            Ok(())
+        }
+        // Acks are applied by the reader before dispatch; the remaining arms need no consumer.
+        AsdpEvent::Acked(_) | AsdpEvent::ConnectRejected(_) | AsdpEvent::Ignored => Ok(()),
+    }
+}
+
+/// Reads `sessionCmd.params`, which carries an opaque JSON blob (Java passes raw bytes).
+fn command_params(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+/// Builds the execution envelope for an `executionAttempt` frame.
+fn assignment_of(command: &ExecutionAttemptCommand) -> AgentTaskAssignment {
+    AgentTaskAssignment {
+        attempt_id: command.attempt_id.clone(),
+        agent_task_id: command.agent_task_id.clone(),
+        run_id: command.run_id.clone(),
+        node_id: command.node_id.clone(),
+        generation: command.generation,
+        command: command.command.clone(),
+        context_url: command.context_url.clone(),
+        task_token: command.task_token.clone(),
+        attempt_token: command.attempt_token.clone(),
+        session_id: execution_session_id(command.runtime_binding.as_deref()),
+        payload: command.payload.clone().unwrap_or_default().into_bytes(),
+        timestamp: command.timestamp,
+    }
+}
+
+/// Reads `sessionId` out of an attempt's runtime binding (mirrors
+/// `SessionBridge.executionSessionId`: an absent or invalid binding means "no session").
+fn execution_session_id(binding: Option<&str>) -> String {
+    binding
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("sessionId").and_then(|id| id.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Reads a conversation input, mirroring Java `SessionBridge.readNotice`: `content`, then
+/// `message`, then the whole JSON document; an unparsable payload is taken verbatim.
+fn notice_content(input: Option<&str>) -> String {
+    let Some(raw) = input else {
+        return String::new();
+    };
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => message_content(&value),
+        Err(_) => raw.to_string(),
     }
 }
 
@@ -1392,9 +1562,13 @@ mod tests {
     #[derive(Default)]
     struct RecordingAdapter {
         commands: Mutex<Vec<String>>,
+        payloads: Mutex<Vec<Option<serde_json::Value>>>,
         plan_mode: Mutex<Option<serde_json::Value>>,
         injected: Mutex<Vec<String>>,
         cancelled: Mutex<Vec<String>>,
+        assignments: Mutex<Vec<AgentTaskAssignment>>,
+        turns: Mutex<Vec<String>>,
+        fail_context: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1419,21 +1593,63 @@ mod tests {
             Ok(())
         }
         async fn extract_context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
+            if self.fail_context.load(Ordering::SeqCst) {
+                return Err(ControlPlaneError::Internal("live state unavailable".into()));
+            }
+            let messages = if session_id == "s1" {
+                vec![crate::model::ContextMessage::new(
+                    crate::model::ROLE_USER,
+                    "from-adapter",
+                )]
+            } else {
+                Vec::new()
+            };
             Ok(ContextSnapshot::builder(session_id)
                 .framework("recording")
+                .messages(messages)
                 .build())
+        }
+        async fn list_subagents(&self) -> ControlPlaneResult<Inventory> {
+            let mut inventory = Inventory::default();
+            inventory.subagents = vec![crate::model::SubagentInfo {
+                name: "sub-1".into(),
+                ..Default::default()
+            }];
+            Ok(inventory)
+        }
+        async fn list_workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+            Ok(vec![serde_json::json!({ "path": "/work", "mode": "rw" })])
         }
         async fn execute_command(
             &self,
             _session_id: &str,
             command: &str,
-            _payload: Option<serde_json::Value>,
+            payload: Option<serde_json::Value>,
         ) -> ControlPlaneResult<CommandOutcome> {
             self.commands.lock().unwrap().push(command.to_string());
+            self.payloads.lock().unwrap().push(payload);
             Ok(CommandOutcome {
                 ok: true,
                 message: String::new(),
             })
+        }
+        async fn handle_agent_task(
+            &self,
+            assignment: AgentTaskAssignment,
+        ) -> ControlPlaneResult<()> {
+            self.assignments.lock().unwrap().push(assignment);
+            Ok(())
+        }
+        async fn run_conversation_turn(
+            &self,
+            _session_id: &str,
+            content: &str,
+        ) -> ControlPlaneResult<String> {
+            self.turns.lock().unwrap().push(content.to_string());
+            if content == "silent" {
+                return Ok(String::new());
+            }
+            Ok(format!("echo: {content}"))
         }
         async fn list_tasks(&self, _session_id: &str) -> ControlPlaneResult<Vec<serde_json::Value>> {
             Ok(vec![serde_json::json!({ "id": "t1", "state": "pending" })])
@@ -1546,6 +1762,25 @@ mod tests {
             content: &str,
         ) -> ControlPlaneResult<()> {
             self.0.inject_user_message(session_id, content).await
+        }
+        async fn list_subagents(&self) -> ControlPlaneResult<Inventory> {
+            self.0.list_subagents().await
+        }
+        async fn list_workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+            self.0.list_workspaces().await
+        }
+        async fn handle_agent_task(
+            &self,
+            assignment: AgentTaskAssignment,
+        ) -> ControlPlaneResult<()> {
+            self.0.handle_agent_task(assignment).await
+        }
+        async fn run_conversation_turn(
+            &self,
+            session_id: &str,
+            content: &str,
+        ) -> ControlPlaneResult<String> {
+            self.0.run_conversation_turn(session_id, content).await
         }
     }
 
@@ -1937,5 +2172,248 @@ mod tests {
         assert_eq!(EVENT_FLUSH_INTERVAL, Duration::from_millis(5_000));
         assert_eq!(EVENT_ACK_TIMEOUT, Duration::from_millis(15_000));
         bridge.close().unwrap();
+    }
+
+    // ── CP-05: ASDP downstream command dispatch ──
+
+    fn session_command(session_id: &str, command: &str, params: Option<&str>) -> AsdpEvent {
+        AsdpEvent::SessionCommand(crate::transport::SessionCommand {
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            params: params.map(str::to_string),
+        })
+    }
+
+    fn execution_attempt(command: &str) -> AsdpEvent {
+        AsdpEvent::ExecutionAttempt(ExecutionAttemptCommand {
+            attempt_id: "attempt-1".into(),
+            agent_task_id: "task-1".into(),
+            run_id: "run-1".into(),
+            node_id: "node-1".into(),
+            generation: 2,
+            command: command.into(),
+            context_url: "https://cp.example/context".into(),
+            task_token: "task-token".into(),
+            attempt_token: "attempt-token".into(),
+            runtime_binding: Some(r#"{"sessionId":"sess-9"}"#.into()),
+            payload: Some(r#"{"prompt":"hi"}"#.into()),
+            timestamp: 1_700_000_000_000,
+        })
+    }
+
+    fn conversation_turn(input: Option<&str>) -> AsdpEvent {
+        AsdpEvent::ConversationTurn(crate::transport::ConversationTurnCommand {
+            invocation_id: "inv-1".into(),
+            conversation_id: "conv-1".into(),
+            turn_id: "turn-1".into(),
+            session_id: "s1".into(),
+            agent_id: "friday".into(),
+            binding_id: "bind-1".into(),
+            instance_id: "inst-1".into(),
+            generation: 3,
+            input: input.map(str::to_string),
+            deadline: i64::MAX,
+            correlation_id: "corr-1".into(),
+        })
+    }
+
+    /// CP-05: `sessionCmd` frames reach `execute_command` with their JSON params, and a
+    /// bridge with no adapter reports the missing capability instead of dropping the frame.
+    #[tokio::test]
+    async fn session_commands_from_the_upstream_reach_the_adapter() {
+        let (bridge, adapter) = adapter_bridge();
+        bridge
+            .dispatch_downstream(session_command(
+                "s1",
+                COMMAND_ABORT,
+                Some(r#"{"reason":"user"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            *adapter.commands.lock().unwrap(),
+            vec![COMMAND_ABORT.to_string()]
+        );
+        assert_eq!(
+            adapter.payloads.lock().unwrap()[0],
+            Some(serde_json::json!({ "reason": "user" }))
+        );
+
+        let bare = ControlPlaneBridge::new(events_config());
+        let error = bare
+            .dispatch_downstream(session_command("s1", COMMAND_ABORT, None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlPlaneError::Unsupported(ref cap) if cap == CAP_SESSION_COMMAND),
+            "expected Unsupported({CAP_SESSION_COMMAND}), got {error:?}"
+        );
+        // A frame with no consumer is not an error: a bad push-down must never be fatal.
+        bare.dispatch_downstream(AsdpEvent::Ignored).await.unwrap();
+    }
+
+    /// CP-05: `executionAttempt` frames become `AgentTaskAssignment`s; `cancel` is terminal
+    /// (Java reports it as cancelled and never dispatches it).
+    #[tokio::test]
+    async fn execution_attempts_reach_handle_agent_task_and_cancel_is_terminal() {
+        let (bridge, adapter) = adapter_bridge();
+        bridge
+            .dispatch_downstream(execution_attempt("dispatch"))
+            .await
+            .unwrap();
+        let assignments = adapter.assignments.lock().unwrap().clone();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].session_id, "sess-9");
+        assert_eq!(assignments[0].generation, 2);
+        assert_eq!(assignments[0].agent_task_id, "task-1");
+        assert_eq!(assignments[0].payload, br#"{"prompt":"hi"}"#.to_vec());
+
+        bridge
+            .dispatch_downstream(execution_attempt("cancel"))
+            .await
+            .unwrap();
+        assert_eq!(adapter.assignments.lock().unwrap().len(), 1);
+    }
+
+    /// CP-05: `conversationTurn` frames run through the adapter; a missing input or a blank
+    /// reply is an error, never a silent success.
+    #[tokio::test]
+    async fn conversation_turns_run_through_the_adapter() {
+        let (bridge, adapter) = adapter_bridge();
+        bridge
+            .dispatch_downstream(conversation_turn(Some(r#"{"message":"hello"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(*adapter.turns.lock().unwrap(), vec!["hello".to_string()]);
+
+        assert!(matches!(
+            bridge.dispatch_downstream(conversation_turn(None)).await,
+            Err(ControlPlaneError::Config(_))
+        ));
+        assert!(matches!(
+            bridge
+                .dispatch_downstream(conversation_turn(Some(r#"{"content":"silent"}"#)))
+                .await,
+            Err(ControlPlaneError::Internal(_))
+        ));
+    }
+
+    /// Link double that delivers one queued downstream frame and then completes the stream.
+    struct PushOnceLink {
+        frames: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        sent: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AsdpLink for PushOnceLink {
+        async fn send(&self, frame: &str) -> ControlPlaneResult<()> {
+            self.sent.lock().unwrap().push(frame.to_string());
+            Ok(())
+        }
+        async fn recv(&self) -> ControlPlaneResult<Option<String>> {
+            let mut frames = self.frames.lock().await;
+            Ok(frames.recv().await)
+        }
+        async fn close(&self) -> ControlPlaneResult<()> {
+            Ok(())
+        }
+    }
+
+    /// CP-05: the background reader — not only the public entry point — dispatches pushed
+    /// commands, so an ASDP-attached bridge really consumes them.
+    #[tokio::test]
+    async fn the_asdp_reader_dispatches_pushed_commands() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(
+            serde_json::json!({
+                "sessionCmd": { "sessionId": "s1", "command": COMMAND_TERMINATE }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        drop(tx);
+        let link: Arc<dyn AsdpLink> = Arc::new(PushOnceLink {
+            frames: tokio::sync::Mutex::new(rx),
+            sent: Mutex::new(Vec::new()),
+        });
+        let transport = asdp_transport(link);
+
+        let mut bridge = ControlPlaneBridge::new(events_config());
+        let adapter = Arc::new(RecordingAdapter::default());
+        let target: Arc<dyn std::any::Any + Send + Sync> = Arc::new(0u8);
+        bridge
+            .attach(
+                target,
+                Box::new(SharedRecordingAdapter(Arc::clone(&adapter))),
+            )
+            .unwrap();
+        bridge.attach_asdp(Arc::clone(&transport));
+        bridge.spawn_event_pump(Arc::clone(&transport), Duration::from_millis(5));
+
+        let mut dispatched = false;
+        for _ in 0..200 {
+            if !adapter.commands.lock().unwrap().is_empty() {
+                dispatched = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(dispatched, "the ASDP reader never dispatched the pushed command");
+        assert_eq!(
+            *adapter.commands.lock().unwrap(),
+            vec![COMMAND_TERMINATE.to_string()]
+        );
+        bridge.close().unwrap();
+    }
+
+    // ── CP-06: contract read routes delegate to the adapter ──
+
+    /// CP-06: `subagents` / `workspaces` used to answer from an always-empty inventory; they
+    /// must ask the attached adapter (mirrors `SessionBridge.subagents` / `workspaces`).
+    #[tokio::test]
+    async fn subagent_and_workspace_inventory_come_from_the_adapter() {
+        let (bridge, _adapter) = adapter_bridge();
+        let subagents = bridge.subagents().await.unwrap();
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0]["name"], "sub-1");
+        let workspaces = bridge.workspaces().await.unwrap();
+        assert_eq!(workspaces[0]["path"], "/work");
+
+        // Without an adapter the route reports the missing capability (Java throws too).
+        let bare = ControlPlaneBridge::new(events_config());
+        assert!(matches!(
+            bare.subagents().await,
+            Err(ControlPlaneError::Unsupported(_))
+        ));
+        assert!(matches!(
+            bare.workspaces().await,
+            Err(ControlPlaneError::Unsupported(_))
+        ));
+    }
+
+    /// CP-06: `context` is served by the adapter (the live state is authoritative) and only
+    /// falls back to the event-derived tracker when that read fails.
+    #[tokio::test]
+    async fn context_prefers_the_adapter_and_falls_back_to_the_tracker() {
+        let (bridge, adapter) = adapter_bridge();
+        let snapshot = bridge.context("s1").await.unwrap();
+        assert_eq!(snapshot.messages[0].content, "from-adapter");
+
+        bridge.record_event(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("from-events")
+                .build(),
+        );
+        adapter.fail_context.store(true, Ordering::SeqCst);
+        let snapshot = bridge.context("s1").await.unwrap();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].content, "from-events");
+
+        // A framework that serves no such session is a 404, not an empty snapshot.
+        adapter.fail_context.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            bridge.context("unknown").await,
+            Err(ControlPlaneError::NotFound(_))
+        ));
     }
 }
