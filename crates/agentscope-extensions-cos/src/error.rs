@@ -65,6 +65,21 @@ impl CosError {
     pub fn is_signature_error(&self) -> bool {
         matches!(self.status(), Some(401) | Some(403))
     }
+
+    /// Whether retrying the request could succeed.
+    ///
+    /// Transport failures and timeouts ([`CosError::Backend`] as returned by the
+    /// HTTP layer) plus the transient statuses `408`, `429` and `5xx` are
+    /// retryable; any other `4xx` (signature errors, missing objects, conflicts) is
+    /// a caller error. Mirrors the Java SDK `ClientConfig.maxErrorRetry` notion of
+    /// a retryable service exception.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            CosError::Backend(_) => true,
+            CosError::Service { status, .. } => matches!(status, 408 | 429 | 500..=599),
+            _ => false,
+        }
+    }
 }
 
 /// Convenience result alias for this crate.

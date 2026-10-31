@@ -426,17 +426,11 @@ mod tests {
             user_id: Some("u".into()),
             ..Default::default()
         });
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 404,
-            body: "{\"error\":\"Not found\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(404, "{\"error\":\"Not found\"}")));
         // The strict API keeps the error visible...
         assert!(adapter.retrieve(&Msg::user("q")).await.is_err());
         // ...while the Java-parity variant swallows it.
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 404,
-            body: "{\"error\":\"Not found\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(404, "{\"error\":\"Not found\"}")));
         assert_eq!(adapter.retrieve_lossy(&Msg::user("q")).await, "");
     }
 
@@ -496,10 +490,7 @@ mod tests {
             user_id: Some("u".into()),
             ..Default::default()
         });
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 500,
-            body: "boom".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(500, "boom")));
         assert!(matches!(
             adapter.record(&[Msg::user("hello")]).await.unwrap_err(),
             MemError::HttpStatus { status: 500, .. }

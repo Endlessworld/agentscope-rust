@@ -19,4 +19,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+# `futures` builds the `EventStream` values returned by
+# `MemLongTermMemoryMiddleware` (`stream::once(...).chain(...)` / `flatten`), i.e. it is
+# on the production assembly path since MEM-01.
+futures = { workspace = true }
+
+[dev-dependencies]
+# MEM-01 acceptance: the long-term-memory wiring is exercised through the real
+# `HarnessAgent` assembly entry (`builder().middleware(chain)`), not by poking the
+# adapter. Only a dev-dependency: the crate itself stays harness-agnostic, and the
+# dependency is acyclic (harness does not depend on this crate).
+agentscope-harness = { path = "../agentscope-harness" }
 

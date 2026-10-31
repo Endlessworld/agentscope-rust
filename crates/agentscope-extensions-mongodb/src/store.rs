@@ -109,15 +109,59 @@ impl MongodbStore {
 
     fn parse_value(raw: &Value) -> StoreValue {
         match raw {
-            Value::Object(map) => {
-                let unescaped = key_escaper::unescape(&Value::Object(map.clone()));
-                match unescaped {
-                    Value::Object(m) => m,
-                    _ => StoreValue::new(),
+            Value::Object(_) => Self::unescaped_store_value(raw),
+            // MONGO-02: rows written before values became sub-documents keep the JSON payload
+            // in a *string* (Java `MongoBaseStore` accepted `String` values and ran
+            // `fromJson`). Returning an empty map for those silently lost the whole value.
+            Value::String(text) => match serde_json::from_str::<Value>(text) {
+                Ok(parsed @ Value::Object(_)) => Self::unescaped_store_value(&parsed),
+                Ok(other) => {
+                    tracing::warn!(
+                        kind = json_kind(&other),
+                        "[mongo-store] string value holds a non-object JSON payload; \
+                         returning an empty value"
+                    );
+                    StoreValue::new()
                 }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "[mongo-store] string value is not valid JSON; returning an empty value"
+                    );
+                    StoreValue::new()
+                }
+            },
+            Value::Null => StoreValue::new(),
+            other => {
+                // Java throws `IllegalStateException` here; `BaseStore` has no error channel,
+                // so log loudly rather than dropping the value silently.
+                tracing::warn!(
+                    kind = json_kind(other),
+                    "[mongo-store] unexpected stored value type; returning an empty value"
+                );
+                StoreValue::new()
             }
+        }
+    }
+
+    /// Unescapes a stored object back into a `StoreValue`.
+    fn unescaped_store_value(raw: &Value) -> StoreValue {
+        match key_escaper::unescape(raw) {
+            Value::Object(m) => m,
             _ => StoreValue::new(),
         }
+    }
+}
+
+/// Human-readable JSON type name for log lines.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -398,5 +442,43 @@ mod tests {
         let bad = format!("a{NS_SEPARATOR}b");
         s.put(&ns(), &bad, value("x"));
         assert!(s.get(&ns(), &bad).is_none());
+    }
+
+    /// MONGO-02: legacy rows keep the JSON payload in a **string** (Java `MongoBaseStore`
+    /// accepted `String` values and ran `fromJson`). Before the fix `parse_value` returned an
+    /// empty map for every non-object, so reading such a row silently lost the whole value.
+    #[test]
+    fn legacy_json_string_values_are_read_back() {
+        let client = Arc::new(crate::client::InMemoryMongoClient::new());
+        let s = MongodbStore::with_defaults(client.clone());
+        let id = MongodbStore::item_doc_id(&ns(), "a.txt").unwrap();
+        let mut doc = serde_json::Map::new();
+        doc.insert("_id".to_string(), json!(id));
+        doc.insert("key".to_string(), json!("a.txt"));
+        doc.insert(
+            "namespace".to_string(),
+            json!(MongodbStore::namespace_path(&ns()).unwrap()),
+        );
+        doc.insert(
+            "value".to_string(),
+            json!(r#"{"content":"legacy"}"#),
+        );
+        doc.insert("version".to_string(), json!(7));
+        futures::executor::block_on(client.insert_one(BASE_STORE_COLLECTION, doc)).unwrap();
+
+        let item = s.get(&ns(), "a.txt").expect("legacy row must be readable");
+        assert_eq!(item.key, "a.txt");
+        assert_eq!(item.version, 7);
+        assert_eq!(item.value.get("content").unwrap(), &json!("legacy"));
+
+        // Search decodes through the same path.
+        let found = s.search(&ns(), 10, 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].value.get("content").unwrap(), &json!("legacy"));
+
+        // A string that is not a JSON object still yields an empty (non-panicking) value.
+        let broken = MongodbStore::parse_value(&json!("not json"));
+        assert!(broken.is_empty());
+        assert!(MongodbStore::parse_value(&json!(42)).is_empty());
     }
 }

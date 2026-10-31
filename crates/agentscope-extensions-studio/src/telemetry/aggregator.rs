@@ -78,6 +78,10 @@ pub struct StreamChatResponseAggregator {
     tool_calls_acc: ToolCallsAccumulator,
     input_tokens: u64,
     output_tokens: u64,
+    cached_tokens: u64,
+    cache_creation_tokens: u64,
+    reasoning_tokens: u64,
+    tool_use_prompt_tokens: u64,
     time: f64,
     finish_reason: Option<String>,
 }
@@ -106,6 +110,14 @@ impl StreamChatResponseAggregator {
         // Providers report cumulative totals, so take the max of each chunk.
         self.input_tokens = self.input_tokens.max(chunk.usage.input_tokens);
         self.output_tokens = self.output_tokens.max(chunk.usage.output_tokens);
+        self.cached_tokens = self.cached_tokens.max(chunk.usage.cached_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .max(chunk.usage.cache_creation_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(chunk.usage.reasoning_tokens);
+        self.tool_use_prompt_tokens = self
+            .tool_use_prompt_tokens
+            .max(chunk.usage.tool_use_prompt_tokens);
         if chunk.usage.time != 0.0 {
             self.time = chunk.usage.time;
         }
@@ -129,7 +141,10 @@ impl StreamChatResponseAggregator {
             usage: ChatUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
-                cached_tokens: 0,
+                cached_tokens: self.cached_tokens,
+                cache_creation_tokens: self.cache_creation_tokens,
+                reasoning_tokens: self.reasoning_tokens,
+                tool_use_prompt_tokens: self.tool_use_prompt_tokens,
                 time: self.time,
                 ..Default::default()
             },
@@ -236,5 +251,40 @@ mod tests {
         let resp = agg.response();
         assert_eq!(resp.usage.input_tokens, 5);
         assert_eq!(resp.usage.time, 1.5);
+    }
+
+    #[test]
+    fn cache_reasoning_and_tool_use_usage_are_max_aggregated() {
+        // STUDIO-04: providers report cumulative usage, so every metric takes the max across
+        // chunks. Before the fix only input/output were aggregated and the four below stayed 0.
+        let mut agg = StreamChatResponseAggregator::create();
+        agg.append(&ChatResponse::new(
+            "",
+            vec![],
+            ChatUsage::builder()
+                .input_tokens(11)
+                .output_tokens(4)
+                .cached_tokens(5)
+                .cache_creation_tokens(7)
+                .reasoning_tokens(9)
+                .tool_use_prompt_tokens(3)
+                .build(),
+            None,
+            None,
+        ));
+        // A later chunk with zeros must not reset the totals.
+        agg.append(&ChatResponse::new(
+            "",
+            vec![],
+            ChatUsage::builder().input_tokens(11).output_tokens(4).build(),
+            None,
+            None,
+        ));
+
+        let usage = agg.response().usage;
+        assert_eq!(usage.cached_tokens, 5);
+        assert_eq!(usage.cache_creation_tokens, 7);
+        assert_eq!(usage.reasoning_tokens, 9);
+        assert_eq!(usage.tool_use_prompt_tokens, 3);
     }
 }

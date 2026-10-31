@@ -58,11 +58,12 @@ fn db_error(context: &str, error: impl Display) -> SkillRepositoryError {
 /// `SqlConnection` methods take `&mut self` and return owned values, so there is no cursor
 /// lifetime crossing the bridge — every call is a self-contained `block_on`.
 ///
-/// # Panics / errors
+/// # Running inside another runtime
 ///
-/// `block_on` cannot be nested inside another runtime: calling any driver method from a Tokio
-/// worker thread would panic, so [`SyncBridge::new`] is used with [`SyncBridge::run`] which
-/// reports the situation as [`SkillRepositoryError::Database`] instead of panicking.
+/// `block_on` cannot be nested inside another runtime, and the harness calls the synchronous
+/// `SqlDatabase` seam from async code (`SkillRepository::load()` runs on a Tokio worker).
+/// [`SyncBridge::run`] therefore hands the future to a dedicated OS thread when it detects an
+/// ambient runtime; see its docs for why `block_in_place` is not an option.
 pub(crate) struct SyncBridge {
     runtime: tokio::runtime::Runtime,
     backend: &'static str,
@@ -80,15 +81,41 @@ impl SyncBridge {
     }
 
     /// Runs `future` to completion on the bridge runtime.
+    ///
+    /// `block_on` must not be nested in another runtime (Tokio panics with "Cannot start a
+    /// runtime from within a runtime"), yet the harness drives this *synchronous* seam from async
+    /// code: `SkillRepository::load()` is called straight from a Tokio worker
+    /// (`harness/agent/skill/manage.rs`, `harness_agent.rs`). Reporting an error there made every
+    /// MySQL / PostgreSQL skill repository useless for a real agent, so when an ambient runtime is
+    /// detected the future is moved to a **dedicated OS thread** and `block_on` runs there: a fresh
+    /// thread starts with no Tokio context, which is exactly the condition `block_on` requires.
+    ///
+    /// `tokio::task::block_in_place` is deliberately *not* used: it panics on a current-thread
+    /// runtime (the harness tests and `#[tokio::test]` default to that flavour) and it would block
+    /// a worker of the caller's runtime instead of a thread we own.
+    ///
+    /// The driver futures are `Send` (each one owns or `&mut`-borrows its connection), so the
+    /// scoped thread only needs a `Send` future and a `Send` output.
     pub(crate) fn run<F>(&self, future: F) -> Result<F::Output, SkillRepositoryError>
     where
-        F: Future,
+        F: Future + Send,
+        F::Output: Send,
     {
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(db_error(
-                self.backend,
-                "the synchronous `SqlDatabase` seam must be driven from a blocking thread",
-            ));
+            // `std::thread::scope` keeps the borrows (`&self.runtime`, the future) valid without
+            // requiring `'static`; the join propagates a driver panic as an error instead of
+            // unwinding through the caller's runtime.
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(future))
+                    .join()
+                    .map_err(|_| {
+                        db_error(
+                            self.backend,
+                            "the driver thread panicked while running a query",
+                        )
+                    })
+            });
         }
         Ok(self.runtime.block_on(future))
     }
@@ -136,11 +163,51 @@ fn pg_placeholders(sql: &str) -> String {
     out
 }
 
-#[cfg(feature = "postgres-driver")]
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ------------------------------------------------------------------
+    // SKILLS-01: the bridge must work from inside a Tokio runtime
+    // ------------------------------------------------------------------
+
+    /// The harness calls the synchronous `SqlDatabase` seam from async code
+    /// (`SkillRepository::load()` runs on a Tokio worker), so the bridge must be able to drive a
+    /// driver future while an ambient runtime is current. Before the fix `run` returned
+    /// `Database(... must be driven from a blocking thread)`, which the repository adapter then
+    /// turned into an empty skill table.
+    ///
+    /// The default `#[tokio::test]` flavour is a *current-thread* runtime - the case where
+    /// `block_in_place` panics - so this also pins the no-`block_in_place` decision.
+    #[tokio::test]
+    async fn sync_bridge_runs_inside_a_tokio_runtime() {
+        let bridge = SyncBridge::new("test").expect("bridge runtime");
+        let answer = bridge
+            .run(async { 42 })
+            .expect("a driver future must be drivable from async code");
+        assert_eq!(answer, 42);
+    }
+
+    /// A driver-level failure is still a *value*: the `Result` crosses the bridge untouched, so a
+    /// failed query is never mistaken for a broken bridge.
+    #[tokio::test]
+    async fn sync_bridge_forwards_the_future_output_inside_a_tokio_runtime() {
+        let bridge = SyncBridge::new("test").expect("bridge runtime");
+        let outcome: Result<u8, &str> = bridge
+            .run(async { Err("driver said no") })
+            .expect("the bridge itself must not fail");
+        assert_eq!(outcome, Err("driver said no"));
+    }
+
+    /// Outside a runtime the future is still driven on the caller's thread (no extra hop, and the
+    /// pre-existing sync contract is unchanged).
+    #[test]
+    fn sync_bridge_runs_outside_a_tokio_runtime() {
+        let bridge = SyncBridge::new("test").expect("bridge runtime");
+        assert_eq!(bridge.run(async { 7 }).expect("run"), 7);
+    }
+
+    #[cfg(feature = "postgres-driver")]
     #[test]
     fn placeholders_are_numbered_in_order() {
         assert_eq!(
@@ -150,6 +217,7 @@ mod tests {
         assert_eq!(pg_placeholders("SELECT 1"), "SELECT 1");
     }
 
+    #[cfg(feature = "postgres-driver")]
     #[test]
     fn placeholders_inside_quoted_text_are_left_alone() {
         assert_eq!(
@@ -158,9 +226,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres-driver")]
     #[test]
     fn placeholders_are_renumbered_from_one_per_statement() {
         assert_eq!(pg_placeholders("SELECT ?"), "SELECT $1");
-        assert_eq!(pg_placeholders("DELETE FROM t WHERE id = ?"), "DELETE FROM t WHERE id = $1");
+        assert_eq!(
+            pg_placeholders("DELETE FROM t WHERE id = ?"),
+            "DELETE FROM t WHERE id = $1"
+        );
     }
 }

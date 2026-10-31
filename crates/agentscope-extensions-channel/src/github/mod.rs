@@ -22,7 +22,10 @@ pub mod properties;
 pub mod signature;
 
 pub use bot_identity::{BotIdentity, GitHubBotIdentityResolver, UNRESOLVED_USER_ID};
-pub use channel::{GitHubCallbackOutcome, GitHubChannel, GitHubChannelRegistry};
+pub use channel::{
+    GitHubCallbackOutcome, GitHubChannel, GitHubChannelRegistry, CHANNEL_TYPE,
+    SUPPORTED_EVENT_TYPES,
+};
 pub use inbound::GitHubInboundMapper;
 pub use outbound::GitHubOutboundClient;
 pub use properties::GitHubChannelProperties;

@@ -638,30 +638,25 @@ impl ClusterRouter {
         Ok(manager)
     }
 
-    /// Runs `cmd` for `key`, following at most one redirect.
+    /// Runs `cmd` for `key`, following at most one redirect and refreshing a stale slot map
+    /// once.
     pub(crate) async fn run(&self, key: &str, cmd: &redis::Cmd) -> Result<redis::Value> {
         let slot = super::redirect::slot_for_key(key);
-        let start = self
-            .slots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(slot)
-            .cloned();
         let transport = RoutedCommand {
             router: self,
             cmd,
-            start,
+            slot,
         };
-        super::redirect::run_with_redirects(&transport, &self.slots).await
+        super::redirect::run_with_redirects(&transport, &self.slots, slot).await
     }
 }
 
-/// One attempt of a routed command: binds the router, the pending command and the cached
-/// starting node into the [`RedirectTransport`] seam the retry loop drives.
+/// One command attempt of a routed command: binds the router, the pending command and the
+/// slot into the [`RedirectTransport`] seam the retry loop drives.
 struct RoutedCommand<'a> {
     router: &'a ClusterRouter,
     cmd: &'a redis::Cmd,
-    start: Option<ClusterNodeAddr>,
+    slot: u16,
 }
 
 #[async_trait]
@@ -671,7 +666,17 @@ impl RedirectTransport for RoutedCommand<'_> {
         target: Option<&ClusterNodeAddr>,
         asking: bool,
     ) -> std::result::Result<redis::Value, CommandFailure> {
-        let effective = target.cloned().or_else(|| self.start.clone());
+        // Re-read the cached owner on *every* attempt: a stale-topology refresh evicts the
+        // entry, and the retry must then start from the seed node instead of the demoted
+        // primary that is still cached in a snapshot taken before the loop.
+        let effective = target.cloned().or_else(|| {
+            self.router
+                .slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(self.slot)
+                .cloned()
+        });
         let mut conn = match &effective {
             Some(node) => self
                 .router

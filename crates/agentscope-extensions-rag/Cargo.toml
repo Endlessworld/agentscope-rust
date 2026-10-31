@@ -28,4 +28,20 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Wire-contract guard for `src/embedding/**` (tracker RAG-10: RAG keeps its own `EmbeddingModel`,
+# but the Ollama/OpenAI wire shapes must stay identical to the MODEL extension's). A path
+# dev-dependency on a workspace member: it is already compiled for every workspace build (harness
+# depends on it), so this adds no new third-party crate.
+agentscope-extensions-model = { path = "../agentscope-extensions-model" }
+
+[features]
+default = []
+# Optional PDF format reader (`src/reader/pdf.rs`): adds the bundled, dependency-free
+# `pdftotext` (poppler-utils) extractor. Off by default; without it `PdfReader` reports
+# `RagError::Reader` and hosts inject their own `PdfTextExtractor` or delegate to
+# `ExternalApiReader` (tracker RAG-09).
+pdf = []
+# Optional DOCX format reader (`src/reader/docx.rs`): adds the bundled, dependency-free
+# `pandoc -t plain` extractor. Same contract as `pdf`.
+docx = []
 

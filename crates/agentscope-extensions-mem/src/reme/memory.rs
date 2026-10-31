@@ -82,8 +82,12 @@ impl ReMeLongTermMemory {
     /// Creates an adapter with the workspace identifier (Java `userId`).
     pub fn new(client: Arc<ReMeClient>, user_id: impl Into<String>) -> Result<Self> {
         let user_id = user_id.into();
+        // Java `ReMeLongTermMemory.Builder.build()` throws `IllegalArgumentException(
+        // "userId is required")`. Rust additionally rejects whitespace-only ids (→ §4.3.2
+        // `MEM-X03`); the message is Java's verbatim so a ported call site keeps the same
+        // diagnostic.
         if user_id.trim().is_empty() {
-            return Err(MemError::Config("userId cannot be null or blank".into()));
+            return Err(MemError::Config("userId is required".into()));
         }
         Ok(Self { client, user_id })
     }
@@ -251,10 +255,12 @@ mod tests {
             ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
                 .expect("valid base url"),
         );
-        assert!(matches!(
-            ReMeLongTermMemory::new(client, "   "),
-            Err(MemError::Config(_))
-        ));
+        // MEM-03: the message is Java's verbatim (`"userId is required"`).
+        for blank in ["", "   ", " \u{0009} "] {
+            let err = ReMeLongTermMemory::new(Arc::clone(&client), blank).unwrap_err();
+            assert!(matches!(&err, MemError::Config(_)));
+            assert_eq!(err.to_string(), "invalid memory configuration: userId is required");
+        }
     }
 
     #[test]
@@ -319,15 +325,9 @@ mod tests {
     async fn retrieve_lossy_returns_empty_on_http_error() {
         // Mirrors Java `testRetrieveWithHttpError`: `onErrorReturn("")`.
         let (mock, adapter) = adapter("alice");
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 500,
-            body: "{\"error\":\"boom\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(500, "{\"error\":\"boom\"}")));
         assert!(adapter.retrieve(&Msg::user("q")).await.is_err());
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 500,
-            body: "{\"error\":\"boom\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(500, "{\"error\":\"boom\"}")));
         assert_eq!(adapter.retrieve_lossy(&Msg::user("q")).await, "");
     }
 

@@ -538,6 +538,10 @@ async fn gridfs_file_ids(bucket: &GridFsBucket, filename: &str) -> MongoResult<V
 
 #[async_trait]
 impl MongoClient for MongodbClient {
+    fn default_database(&self) -> &str {
+        &self.default_database
+    }
+
     async fn insert_one(&self, collection: &str, doc: Map<String, Value>) -> MongoResult<()> {
         let coll = self.collection(collection);
         let mut document = json_map_to_document(&doc);

@@ -34,6 +34,9 @@ use crate::common::{
     ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
 };
 
+/// Channel type name, mirroring `FeishuChannel.TYPE` (the `agentscope.json#channels[*].type` key).
+pub const CHANNEL_TYPE: &str = "feishu";
+
 /// Typed registry of `FeishuChannel` handles, keyed by `channel_id`.
 pub type FeishuChannelRegistry = ChannelRegistry<FeishuChannel>;
 
@@ -49,6 +52,9 @@ pub enum FeishuCallbackOutcome {
     Challenge(String),
     /// Event acknowledged: duplicate, non-text, loop-guarded, or dispatched (200 `{}`).
     Accepted,
+    /// The event could not be dispatched (no gateway / agent failure). Answered with **503** so
+    /// Feishu redelivers it, mirroring the Java `onErrorResume(... SERVICE_UNAVAILABLE)`.
+    Unavailable,
 }
 
 /// Feishu channel adapter: shared routing/gateway state plus Feishu-specific collaborators.
@@ -232,16 +238,31 @@ impl FeishuChannel {
             return FeishuCallbackOutcome::Accepted;
         };
 
-        // 6. De-duplication by `event_id`, then the per-peer bot-loop guard.
+        // 6. De-duplication by `event_id` and the per-peer bot-loop guard. Both are **peeks**: the
+        //    idempotency key is only recorded once the dispatch succeeded (step 7), because a
+        //    transient gateway failure must stay redeliverable. Java likewise leaves the actual
+        //    de-duplication to the durable intake instead of the callback entry point.
         let event_id = FeishuInboundMapper::extract_event_id(&envelope);
-        if !self.core.admit(event_id.as_deref(), &inbound.peer.key()) {
+        if self.core.is_duplicate(event_id.as_deref()) {
+            return FeishuCallbackOutcome::Accepted;
+        }
+        if !self.core.allow_peer(&inbound.peer.key()) {
             return FeishuCallbackOutcome::Accepted;
         }
 
-        // 7. Dispatch; the channel delivers the reply through its own transport. Failures are
-        //    swallowed so the provider stops retrying (Java logs and still answers 200).
-        let _ = PlatformChannel::dispatch(self, inbound).await;
-        FeishuCallbackOutcome::Accepted
+        // 7. Dispatch; the channel delivers the reply through its own transport. A failure is
+        //    *not* swallowed: Feishu must be told to redeliver (503) instead of losing the
+        //    message, so the event id is only recorded after a successful dispatch.
+        match PlatformChannel::dispatch(self, inbound).await {
+            Ok(_) => {
+                self.core.record(event_id.as_deref());
+                FeishuCallbackOutcome::Accepted
+            }
+            Err(err) => {
+                tracing::warn!("Feishu dispatch failed; asking the provider to redeliver: {err}");
+                FeishuCallbackOutcome::Unavailable
+            }
+        }
     }
 }
 
@@ -263,7 +284,7 @@ impl PlatformChannel for FeishuChannel {
 mod tests {
     use super::*;
     use crate::common::testing::{RecordingTransport, StaticTokenProvider};
-    use crate::common::{ChannelError, IdempotencyStore};
+    use crate::common::{ChannelError, IdempotencyStore, PreparedResponse};
     use agentscope_harness::agent::gateway::channel::Channel as _;
 
     const API_BASE: &str = "https://open.feishu.cn";
@@ -288,6 +309,64 @@ mod tests {
         build(
             serde_json::json!({"appId": "cli_x", "appSecret": "s", "verificationToken": "vt"}),
             None,
+        )
+    }
+
+    /// Same channel, but with a seeded transport so a dispatched reply is actually delivered.
+    fn build_with_a_deliverable_reply() -> FeishuChannel {
+        let props = FeishuChannelProperties::from_json(
+            "feishu",
+            &serde_json::json!({"appId": "cli_x", "appSecret": "s", "verificationToken": "vt"}),
+        )
+        .unwrap();
+        let token: Arc<dyn AccessTokenProvider> = Arc::new(StaticTokenProvider::new("tok"));
+        FeishuChannel::new(
+            "feishu",
+            ChannelConfig::of_with_default("feishu", "main"),
+            props,
+            None,
+            FeishuOutboundClient::new(
+                API_BASE,
+                token,
+                Arc::new(RecordingTransport::with_responses(vec![
+                    PreparedResponse::new(200, r#"{"code":0,"data":{"message_id":"om_2"}}"#),
+                ])),
+            ),
+            FeishuInboundMapper::new("feishu"),
+            Arc::new(IdempotencyStore::with_defaults()),
+            BotLoopGuard::with_defaults(),
+        )
+    }
+
+    /// A gateway agent that echoes a fixed reply, so `dispatch` runs a real turn offline.
+    struct EchoAgent;
+
+    #[async_trait]
+    impl agentscope_harness::agent::GatewayAgent for EchoAgent {
+        async fn call(
+            &self,
+            _messages: Vec<Msg>,
+            _ctx: &agentscope_harness::agent::GatewayTurnContext,
+        ) -> CoreResult<Msg> {
+            Ok(Msg::builder()
+                .role(agentscope_core::message::MsgRole::Assistant)
+                .text_content("ok")
+                .build())
+        }
+    }
+
+    /// Attach a gateway whose main agent answers, so a valid event is dispatched end to end.
+    async fn with_a_working_gateway(c: FeishuChannel) -> FeishuChannel {
+        let gateway = Arc::new(agentscope_harness::agent::HarnessGateway::create_standalone());
+        gateway.bind_main_agent(Arc::new(EchoAgent)).await;
+        c.core().init(gateway);
+        c
+    }
+
+    /// A valid text event for `event_id` carrying the configured verification token.
+    fn text_event(event_id: &str) -> String {
+        format!(
+            r#"{{"header":{{"event_id":"{event_id}","token":"vt"}},"event":{{"sender":{{"sender_type":"user","sender_id":{{"open_id":"ou_1"}}}},"message":{{"message_id":"om_1","message_type":"text","content":"{{\"text\":\"hi\"}}","chat_id":"oc_1","chat_type":"p2p"}}}}}}"#
         )
     }
 
@@ -388,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn normal_events_require_the_configured_header_token() {
-        let c = plain();
+        let c = with_a_working_gateway(build_with_a_deliverable_reply()).await;
         let event = |token: &str| {
             format!(
                 r#"{{"header":{{"event_id":"e1","token":"{token}"}},"event":{{"sender":{{"sender_type":"user","sender_id":{{"open_id":"ou_1"}}}},"message":{{"message_id":"om_1","message_type":"text","content":"{{\"text\":\"hi\"}}","chat_id":"oc_1","chat_type":"p2p"}}}}}}"#
@@ -434,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_event_ids_are_dropped_by_the_idempotency_guard() {
-        let c = plain();
+        let c = with_a_working_gateway(build_with_a_deliverable_reply()).await;
         let body = r#"{"header":{"event_id":"e1","token":"vt"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","message_type":"text","content":"{\"text\":\"hi\"}","chat_id":"oc_1","chat_type":"p2p"}}}"#;
         // The first sighting is admitted; the duplicate never reaches the guards again.
         assert_eq!(
@@ -443,6 +522,31 @@ mod tests {
         );
         assert_eq!(
             c.handle_callback(None, None, None, body).await,
+            FeishuCallbackOutcome::Accepted
+        );
+        assert_eq!(c.core().admitted(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_dispatch_is_unavailable_and_stays_redeliverable() {
+        // No gateway: the turn cannot run, which must be a 503 (redeliver) and not a silent 200.
+        let c = plain();
+        let body = text_event("e1");
+        assert_eq!(
+            c.handle_callback(None, None, None, &body).await,
+            FeishuCallbackOutcome::Unavailable
+        );
+        // The idempotency key was not consumed by the failure, so the redelivery is handled again.
+        assert_eq!(
+            c.handle_callback(None, None, None, &body).await,
+            FeishuCallbackOutcome::Unavailable
+        );
+        assert_eq!(c.core().admitted(), 0);
+
+        // Once a gateway is present the same event is dispatched and then de-duplicated.
+        let c = with_a_working_gateway(build_with_a_deliverable_reply()).await;
+        assert_eq!(
+            c.handle_callback(None, None, None, &body).await,
             FeishuCallbackOutcome::Accepted
         );
         assert_eq!(c.core().admitted(), 1);

@@ -21,8 +21,11 @@
 //!
 //! [`TraceExporter::export`] is async while middleware hooks are synchronous, so
 //! finished spans go through [`SpanSink`] — an unbounded queue drained by a background
-//! task, the equivalent of Java's `BatchSpanProcessor`. Hosts that need determinism
-//! (tests, short-lived processes) call [`TelemetryTracing::flush`].
+//! task, the equivalent of Java's `BatchSpanProcessor`. The task exports on a schedule
+//! (`StudioConfig::telemetry_batch_interval`, default 5s) and as soon as a batch is full
+//! (`StudioConfig::telemetry_batch_size`, default 512), so a long-lived agent exports without
+//! leaking spans. Hosts that need determinism (tests, short-lived processes) still call
+//! [`TelemetryTracing::flush`].
 //!
 //! [`TraceExporter::export`]: super::exporter::TraceExporter::export
 
@@ -30,6 +33,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::AgentEvent;
@@ -54,6 +58,9 @@ use super::extractors::{
     get_tool_response_attributes, Attributes, FormatterConverter,
 };
 use super::gen_ai_attributes::operation_name;
+use crate::studio::config::{
+    StudioConfig, DEFAULT_TELEMETRY_BATCH_INTERVAL, DEFAULT_TELEMETRY_BATCH_SIZE,
+};
 
 /// Provider name recorded on model-call spans when the host does not override it.
 ///
@@ -158,11 +165,24 @@ struct SpanCtx {
 impl TelemetryTracing {
     /// Creates a producer that exports through `exporter`.
     ///
+    /// Batching follows the OTel SDK defaults (5s schedule delay, 512 spans per batch); use
+    /// [`TelemetryTracing::with_config`] to take those knobs from a [`StudioConfig`].
+    ///
     /// Must be called inside a Tokio runtime: the sink drains on a background task.
     pub fn new(exporter: Arc<dyn TraceExporter>) -> Self {
+        Self::with_batch_config(exporter, BatchConfig::default())
+    }
+
+    /// Creates a producer whose batched export follows `config`
+    /// (`telemetry_batch_interval` / `telemetry_batch_size`).
+    pub fn with_config(exporter: Arc<dyn TraceExporter>, config: &StudioConfig) -> Self {
+        Self::with_batch_config(exporter, BatchConfig::from_config(config))
+    }
+
+    fn with_batch_config(exporter: Arc<dyn TraceExporter>, batch_config: BatchConfig) -> Self {
         Self {
             inner: Arc::new(TracingInner {
-                sink: SpanSink::new(exporter),
+                sink: SpanSink::new(exporter, batch_config),
                 spans: Arc::new(Mutex::new(HashMap::new())),
                 provider_name: DEFAULT_PROVIDER_NAME.to_string(),
                 agent_type: DEFAULT_AGENT_TYPE_NAME.to_string(),
@@ -691,6 +711,39 @@ impl Model for AggregatingModel {
     }
 }
 
+/// Batching knobs for the background span exporter.
+///
+/// Mirrors the OTel SDK `BatchSpanProcessor` options Java installs in
+/// `TelemetryTracer.Builder#build` (`scheduleDelay` + `maxExportBatchSize`), which is what makes
+/// a long-lived `TelemetryTracing` export at all (STUDIO-02).
+#[derive(Debug, Clone, Copy)]
+struct BatchConfig {
+    /// How often finished spans are flushed even when the batch is not full.
+    interval: Duration,
+    /// Number of buffered spans that triggers an immediate export.
+    max_batch_size: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_TELEMETRY_BATCH_INTERVAL,
+            max_batch_size: DEFAULT_TELEMETRY_BATCH_SIZE,
+        }
+    }
+}
+
+impl BatchConfig {
+    fn from_config(config: &StudioConfig) -> Self {
+        Self {
+            // `tokio::time::interval` panics on a zero period, and a zero batch size would
+            // export span-by-span; clamp both instead of trusting the caller.
+            interval: config.telemetry_batch_interval().max(Duration::from_millis(1)),
+            max_batch_size: config.telemetry_batch_size().max(1),
+        }
+    }
+}
+
 /// Serializes finished spans to an async exporter without blocking the middleware.
 #[derive(Clone)]
 struct SpanSink {
@@ -704,23 +757,45 @@ enum Batch {
 }
 
 impl SpanSink {
-    fn new(exporter: Arc<dyn TraceExporter>) -> Self {
+    fn new(exporter: Arc<dyn TraceExporter>, batch_config: BatchConfig) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Batch>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     let mut batch: Vec<Span> = Vec::new();
-                    while let Some(message) = rx.recv().await {
-                        match message {
-                            Batch::Span(span) => batch.push(*span),
-                            Batch::Flush(ack) => {
-                                export(&exporter, &mut batch).await;
-                                let _ = ack.send(());
-                            }
+                    // First tick fires one interval from now, like `BatchSpanProcessor`'s
+                    // repeating schedule (not immediately).
+                    let mut ticker = tokio::time::interval_at(
+                        tokio::time::Instant::now() + batch_config.interval,
+                        batch_config.interval,
+                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            message = rx.recv() => match message {
+                                Some(Batch::Span(span)) => {
+                                    batch.push(*span);
+                                    // A full batch is exported right away, so the buffer is
+                                    // bounded even when spans arrive faster than the schedule.
+                                    if batch.len() >= batch_config.max_batch_size {
+                                        export(&exporter, &mut batch).await;
+                                    }
+                                }
+                                Some(Batch::Flush(ack)) => {
+                                    export(&exporter, &mut batch).await;
+                                    let _ = ack.send(());
+                                }
+                                None => {
+                                    // The producer is gone: flush what is left.
+                                    export(&exporter, &mut batch).await;
+                                    break;
+                                }
+                            },
+                            // Only the periodic tick: `export` early-returns on an empty
+                            // batch, so an idle tracer costs nothing.
+                            _ = ticker.tick() => export(&exporter, &mut batch).await,
                         }
                     }
-                    // The producer is gone: flush what is left.
-                    export(&exporter, &mut batch).await;
                 });
                 Self { tx, closed: false }
             }
@@ -1166,6 +1241,10 @@ mod tests {
                     agentscope_core::message::ChatUsage::builder()
                         .input_tokens(9)
                         .output_tokens(1)
+                        .cached_tokens(5)
+                        .cache_creation_tokens(7)
+                        .reasoning_tokens(9)
+                        .tool_use_prompt_tokens(3)
                         .build(),
                 )
                 .build();
@@ -1230,6 +1309,24 @@ mod tests {
         assert_eq!(
             attr_value(chat, gen_ai::GEN_AI_USAGE_OUTPUT_TOKENS),
             Some(&serde_json::json!(5))
+        );
+        // STUDIO-04: cache / cache-creation / reasoning / tool-use usage reaches the span
+        // instead of being recorded as 0.
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS),
+            Some(&serde_json::json!(5))
+        );
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS),
+            Some(&serde_json::json!(7))
+        );
+        assert_eq!(
+            attr_value(chat, gen_ai::GEN_AI_USAGE_REASONING_OUTPUT_TOKENS),
+            Some(&serde_json::json!(9))
+        );
+        assert_eq!(
+            attr_value(chat, as_attrs::AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS),
+            Some(&serde_json::json!(3))
         );
         assert_eq!(
             attr_value(chat, gen_ai::GEN_AI_RESPONSE_FINISH_REASONS),
@@ -1341,6 +1438,91 @@ mod tests {
             Some(root.span_id.as_str())
         );
         assert_eq!(format.trace_id, root.trace_id);
+    }
+
+    /// Groups its exports so batch boundaries are observable.
+    #[derive(Debug, Default)]
+    struct GroupingExporter {
+        calls: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TraceExporter for GroupingExporter {
+        async fn export(&self, spans: &[Span]) -> crate::error::StudioResult<()> {
+            if !spans.is_empty() {
+                self.calls.lock().expect("calls lock").push(spans.len());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spans_are_exported_on_the_schedule_without_a_flush() {
+        // STUDIO-02: a long-lived tracer (`MiddlewareChain` holds it) must not depend on the
+        // host calling `flush()`; the `BatchSpanProcessor`-style schedule does it.
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let stream = tracing.on_agent(
+            &ctx(Some("run-schedule")),
+            agent_input(),
+            next_with(vec![Ok(AgentEvent::new(AgentEventType::AgentStart))]),
+        );
+        let _ = drain(stream).await;
+        assert_eq!(exporter.len(), 0, "nothing exports before the schedule fires");
+
+        // No `flush()`: only the tokio clock moves (default interval is 5s). Under
+        // `start_paused` the runtime may auto-advance to earlier timers, so step the clock
+        // in interval-sized jumps until the schedule fires (at most two jumps are needed).
+        let mut exported = false;
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(6)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            if !exporter.is_empty() {
+                exported = true;
+                break;
+            }
+        }
+        assert!(
+            exported,
+            "the batch schedule must export finished spans without an explicit flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_batch_is_exported_immediately() {
+        // STUDIO-02: the batch size caps the buffer, so spans must not wait for the schedule.
+        let exporter = Arc::new(GroupingExporter::default());
+        let config = StudioConfig::builder()
+            .telemetry_batch_interval(Duration::from_secs(3600))
+            .telemetry_batch_size(2)
+            .build();
+        let tracing = TelemetryTracing::with_config(exporter.clone(), &config);
+
+        for run in 0..3 {
+            let run_id = format!("run-cap-{run}");
+            let stream = tracing.on_agent(
+                &ctx(Some(run_id.as_str())),
+                agent_input(),
+                next_with(vec![Ok(AgentEvent::new(AgentEventType::AgentStart))]),
+            );
+            let _ = drain(stream).await;
+        }
+
+        // The export happens on the sink's background task; give it a few polls (no sleeping).
+        for _ in 0..64 {
+            if !exporter.calls.lock().expect("calls lock").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let calls = exporter.calls.lock().expect("calls lock").clone();
+        assert_eq!(
+            calls.first(),
+            Some(&2),
+            "a full batch must be exported at once, got {calls:?}"
+        );
     }
 
     fn model_input() -> ModelCallInput {

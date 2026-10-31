@@ -31,6 +31,7 @@ fn usage_of(usage: &AnthropicUsage) -> ChatUsage {
         output_tokens: usage.output_tokens,
         cached_tokens: usage.cached(),
         cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+        reasoning_tokens: usage.reasoning(),
         ..Default::default()
     }
 }
@@ -212,6 +213,9 @@ impl AnthropicStreamIncrementer {
                 merged.input_tokens = update.input_tokens;
                 merged.cached_tokens = update.cached_tokens;
             }
+            if update.reasoning_tokens > 0 {
+                merged.reasoning_tokens = update.reasoning_tokens;
+            }
             merged.time = update.time;
             self.usage = Some(merged);
         }
@@ -352,6 +356,26 @@ mod tests {
             }
             other => panic!("expected tool use, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_carries_extended_thinking_tokens() {
+        // Java `AnthropicResponseParser` reads `output_tokens_details.thinking_tokens`
+        // into `ChatUsage.reasoning_tokens` (MODEL-11).
+        let parsed = parse_message(&response(serde_json::json!({
+            "id": "msg_t",
+            "content": [
+                { "type": "text", "text": "done" }
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 40,
+                "output_tokens_details": { "thinking_tokens": 32 }
+            },
+            "stop_reason": "end_turn"
+        })));
+        assert_eq!(parsed.usage.output_tokens, 40);
+        assert_eq!(parsed.usage.reasoning_tokens, 32);
     }
 
     #[test]

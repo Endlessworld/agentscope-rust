@@ -21,9 +21,7 @@ use agentscope_harness::agent::isolation_scope::IsolationScope;
 use serde_json::Value;
 
 use crate::client::{scoped_collection, MongoClient};
-use crate::constants::{
-    BASE_STORE_COLLECTION, DEFAULT_DATABASE, SESSIONS_COLLECTION, SNAPSHOTS_COLLECTION,
-};
+use crate::constants::{BASE_STORE_COLLECTION, SESSIONS_COLLECTION, SNAPSHOTS_COLLECTION};
 use crate::sandbox_guard::{MongodbGuardClient, MongodbSandboxExecutionGuard};
 use crate::snapshot::{MongodbRemoteSnapshotClient, MongodbSnapshotSpec};
 use crate::state_store::MongodbAgentStateStore;
@@ -56,11 +54,20 @@ impl std::fmt::Debug for MongodbDistributedStore {
 impl MongodbDistributedStore {
     /// Creates a distributed store over the given client and database name.
     ///
-    /// Databases/collections default to [`DEFAULT_DATABASE`] and the per-component
-    /// default collection constants. Call [`MongodbDistributedStore::ensure_indexes`]
-    /// before first use to create the required indexes.
+    /// `database_name = None` follows the **client's** default database
+    /// ([`MongoClient::default_database`] — the URI database, else
+    /// [`DEFAULT_DATABASE`](crate::constants::DEFAULT_DATABASE)), mirroring Java
+    /// `MongoDistributedStore#fromConnectionString` which reads
+    /// `connectionString.getDatabase()`: hardcoding `agentscope` here made a store built over
+    /// `mongodb://host/mydb` read/write a different database than the Java deployment did
+    /// (MONGO-01).
+    ///
+    /// Call [`MongodbDistributedStore::ensure_indexes`] before first use to create the
+    /// required indexes.
     pub fn new(client: Arc<dyn MongoClient>, database_name: Option<&str>) -> Self {
-        let database_name = database_name.unwrap_or(DEFAULT_DATABASE).to_string();
+        let database_name = database_name
+            .map(str::to_string)
+            .unwrap_or_else(|| client.default_database().to_string());
 
         // Every component is database-scoped (Java: `mongoClient.getDatabase(databaseName)
         // .getCollection(...)`). The flat `MongoClient` seam encodes the database into the
@@ -406,6 +413,28 @@ mod tests {
     fn defaults_to_agentscope_database() {
         let s = MongodbDistributedStore::new(Arc::new(InMemoryMongoClient::new()), None);
         assert_eq!(s.database_name(), "agentscope");
+    }
+
+    /// MONGO-01: `new(client, None)` must follow the **connection's** database, not a hardcoded
+    /// `agentscope` (Java `MongoDistributedStore#fromConnectionString` reads
+    /// `connectionString.getDatabase()`). Before the fix a store over `mongodb://host/mydb`
+    /// wrote sessions/workspace files into `agentscope` and could not see existing data.
+    #[tokio::test]
+    async fn default_database_follows_the_client_connection() {
+        use agentscope_core::state::AgentStateStore;
+
+        let raw = Arc::new(InMemoryMongoClient::new().with_default_database("mydb"));
+        let s = MongodbDistributedStore::new(raw.clone(), None);
+        assert_eq!(s.database_name(), "mydb");
+
+        s.agent_state_store().save(None, "sess", "k", json!(1)).await;
+        let scoped = scoped_collection("mydb", SESSIONS_COLLECTION);
+        assert_eq!(raw.document_count(&scoped), 1);
+        assert_eq!(raw.document_count(SESSIONS_COLLECTION), 0);
+
+        // An explicit database name still wins over the connection default.
+        let explicit = MongodbDistributedStore::new(raw.clone(), Some("otherdb"));
+        assert_eq!(explicit.database_name(), "otherdb");
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
+use crate::constants::DEFAULT_DATABASE;
 use crate::index_utils::IndexSpec;
 
 /// Default GridFS chunk size (255 KB), matching the MongoDB driver default.
@@ -353,6 +354,18 @@ pub trait MongoClient: Send + Sync {
     /// (or a unique index key) already exists.
     async fn insert_one(&self, collection: &str, doc: Map<String, Value>) -> MongoResult<()>;
 
+    /// The database this client connects to **by default** (the database named in the
+    /// connection URI, else [`DEFAULT_DATABASE`]).
+    ///
+    /// Mirrors Java `MongoDistributedStore#fromConnectionString`, which uses
+    /// `connectionString.getDatabase()` instead of a hardcoded name: a store built without an
+    /// explicit database must follow the connection, otherwise migrating an existing
+    /// deployment (`mongodb://host/mydb`) silently reads/writes `agentscope` and finds none of
+    /// the existing data (MONGO-01).
+    fn default_database(&self) -> &str {
+        DEFAULT_DATABASE
+    }
+
     /// Finds the first document matching `filter`.
     async fn find_one(
         &self,
@@ -549,11 +562,21 @@ pub struct InMemoryMongoClient {
     /// Test hook: number of upcoming `create_index` calls to force-fail with error
     /// 85, simulating a concurrent node that keeps re-creating a conflicting index.
     forced_index_conflicts: std::sync::atomic::AtomicUsize,
+    /// Default database reported through [`MongoClient::default_database`]; `None` until a
+    /// test simulates a URI that names a database.
+    default_database: Option<String>,
 }
 
 impl InMemoryMongoClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test hook: reports `database` as the default database, as if the connection URI were
+    /// `mongodb://host/<database>` (MONGO-01).
+    pub fn with_default_database(mut self, database: impl Into<String>) -> Self {
+        self.default_database = Some(database.into());
+        self
     }
 
     /// Test hook: forces the next `n` [`MongoClient::create_index`] calls to fail with
@@ -589,6 +612,10 @@ impl InMemoryMongoClient {
 
 #[async_trait]
 impl MongoClient for InMemoryMongoClient {
+    fn default_database(&self) -> &str {
+        self.default_database.as_deref().unwrap_or(DEFAULT_DATABASE)
+    }
+
     async fn insert_one(&self, collection: &str, doc: Map<String, Value>) -> MongoResult<()> {
         self.with_collection(collection, |state| {
             let id = doc.get("_id").cloned();

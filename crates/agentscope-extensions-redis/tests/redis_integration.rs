@@ -9,6 +9,8 @@
 //!   rewrite and the marker write leaves the two out of sync);
 //! * `find_keys_by_pattern` really drives the `SCAN` cursor over several round-trips;
 //! * `redis::aio::ConnectionManager` really reconnects after its socket dies;
+//! * the synchronous `BaseStore` (`RedisStore`) rebuilds its blocking connection after the
+//!   socket is killed; and
 //! * `SET NX PX` / the token-CAS `DEL` script really serialise a lease across clients.
 //!
 //! ```text
@@ -40,8 +42,9 @@ use std::time::{Duration, Instant};
 use agentscope_core::state::AgentStateStore as _;
 use agentscope_extensions_redis::state::adapter::RedisClientAdapter;
 use agentscope_extensions_redis::state::RedisAgentStateStore;
-use agentscope_extensions_redis::{RedisConnection, RedisSandboxExecutionGuard};
+use agentscope_extensions_redis::{RedisConnection, RedisSandboxExecutionGuard, RedisStore};
 use agentscope_harness::agent::sandbox::SandboxIsolationKey;
+use agentscope_harness::filesystem::remote::store::{BaseStore, StoreValue};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -726,4 +729,79 @@ async fn distributed_lease_uses_set_nx_and_a_token_cas_release() {
             .is_empty(),
         "no lease keys are left behind"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. BaseStore blocking reconnect
+// ---------------------------------------------------------------------------
+
+/// The synchronous `BaseStore` (`RedisStore`) holds **one** blocking connection instead of
+/// taking a pooled connection per command (which is what Java's `JedisPooled` does), so a
+/// socket that dies must be evicted and rebuilt. Before the fix a single `CLIENT KILL` broke
+/// every later workspace KV operation of that store for the rest of the process lifetime.
+#[tokio::test]
+async fn base_store_reconnects_after_its_blocking_socket_is_killed() {
+    if skip() {
+        return;
+    }
+    let admin = live_connection().await;
+    let prefix = prefix_for("store-reconnect");
+    let namespace = vec!["files".to_string()];
+
+    let store = RedisStore::connect(&redis_url().unwrap(), &prefix).expect("connect the store");
+    let mut value = StoreValue::new();
+    value.insert("size".to_string(), json!(1));
+    store.put(&namespace, "a.txt", value);
+
+    let before = store
+        .client_id()
+        .expect("CLIENT ID of the store's blocking connection");
+
+    // Kill exactly that connection from a *different* client.
+    let mut manager = admin.manager().clone();
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(before)
+        .query_async(&mut manager)
+        .await
+        .expect("CLIENT KILL must succeed");
+    assert_eq!(
+        killed, 1,
+        "the store's connection {before} must have been killed"
+    );
+
+    // The next command may fail once while the store notices the dead socket; it must
+    // recover on its own, without a new `RedisStore::connect`.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0usize;
+    let item = loop {
+        attempts += 1;
+        if let Some(item) = store.get(&namespace, "a.txt") {
+            break item;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the blocking store never reconnected after CLIENT KILL"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(attempts <= 20, "reconnect took {attempts} attempts");
+    assert_eq!(item.value.get("size"), Some(&json!(1)));
+
+    let after = store
+        .client_id()
+        .expect("CLIENT ID after the reconnect");
+    assert_ne!(
+        after, before,
+        "the dead socket must be replaced, not reused"
+    );
+
+    // Fully usable again: writes (not just reads) go through too.
+    let mut next = StoreValue::new();
+    next.insert("size".to_string(), json!(2));
+    store.put(&namespace, "b.txt", next);
+    assert!(store.get(&namespace, "b.txt").is_some());
+
+    cleanup(&admin, &prefix).await;
 }

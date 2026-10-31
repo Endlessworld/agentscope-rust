@@ -8,11 +8,14 @@
 //! * [`guardrail`] — content-safety policy + pure verdict fold.
 //! * [`review`] — deterministic review regions and the review snapshot type.
 //! * [`execution`] — per-subscription budget/observation DTOs.
+//! * [`confirmed_calls`] — the per-context HITL approval ledger; [`confirm_guard`] is the host
+//!   binding that snapshots before the prompt and re-checks the approved arguments at resume.
 
 pub mod application;
 pub mod call;
 pub mod client;
 pub mod code_review;
+pub mod confirm_guard;
 pub mod confirmed_calls;
 pub mod context;
 pub mod dto;
@@ -31,6 +34,7 @@ pub mod supervision;
 pub mod validation;
 
 pub use client::{is_retryable_status, JevClient, JevClientBuilder};
+pub use confirm_guard::{ConfirmGuardError, JevConfirmGuard};
 pub use confirmed_calls::{
     contains as confirmed_call_contains, matches as confirmed_call_matches,
     remember as remember_confirmed_call, Approval, JevConfirmedCalls, CONFIRMED_CALLS_KEY,

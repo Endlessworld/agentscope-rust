@@ -9,6 +9,11 @@
 //! ASK   3999 127.0.0.1:6381   -- a migration is in flight: ASKING + retry once, no caching
 //! ```
 //!
+//! A failover produces no redirect at all: the cached primary is **demoted** to a replica and
+//! keeps answering `READONLY` (or `CLUSTERDOWN` / `TRYAGAIN` while the cluster reconfigures).
+//! Those codes are therefore treated as "the cached slot map is stale": the slot entry is
+//! evicted and the command is retried once from the seed node, which relearns the owner.
+//!
 //! This module holds the pure pieces ([`parse_redirect`], [`slot_for_key`], [`SlotCache`])
 //! and the retry loop ([`run_with_redirects`]), which is written against the
 //! [`RedirectTransport`] seam so the "one redirection, then give up" rule is covered
@@ -161,6 +166,18 @@ impl SlotCache {
         self.slots.insert(slot, node);
     }
 
+    /// Forgets the cached owner of `slot`, so the next command for that slot starts from the
+    /// seed node and relearns the owner from the redirect it receives.
+    ///
+    /// Used when a node answers `READONLY` / `CLUSTERDOWN` / `TRYAGAIN`: the cached primary
+    /// was demoted by a failover (or the cluster is reconfiguring), and a stale entry would
+    /// keep sending the command to a replica that can only reject writes.
+    ///
+    /// Returns whether an entry was actually present.
+    pub(crate) fn invalidate(&mut self, slot: u16) -> bool {
+        self.slots.remove(&slot).is_some()
+    }
+
     /// Number of cached slots (test-only introspection).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -173,18 +190,50 @@ impl SlotCache {
 pub(crate) enum CommandFailure {
     /// The node asked us to retry elsewhere.
     Redirect(Redirect),
+    /// The node does not own the slot (any more) or the cluster is reconfiguring: the cached
+    /// slot map is stale.
+    StaleTopology(String),
     /// A real failure (network, auth, wrong type, ...).
     Other(String),
 }
 
+/// Server error codes that mean "the client's slot map is stale".
+///
+/// * `READONLY` — a write reached a node that has been demoted to a replica by a failover;
+///   the cached owner is no longer the primary.
+/// * `CLUSTERDOWN` — the node reports no slot coverage (a failed primary not replaced yet).
+/// * `TRYAGAIN` — the cluster is reconfiguring (a migration is in flight).
+///
+/// The crate keeps its own slot map (the driver's `cluster` feature is off), so nothing else
+/// would ever refresh it: `MOVED` is the only other signal, and a demoted primary answers
+/// `READONLY` instead of redirecting, which would leave every later write to that slot
+/// failing forever.
+const STALE_TOPOLOGY_CODES: [&str; 3] = ["READONLY", "CLUSTERDOWN", "TRYAGAIN"];
+
+/// Scans a driver error message for a stale-topology code.
+///
+/// The `redis` crate renders a server error as `<Kind>: <CODE> <detail>` (or just the bare
+/// reply when the kind is unknown), so the code is looked up token by token instead of
+/// assuming it starts the message.
+pub(crate) fn is_stale_topology(message: &str) -> bool {
+    message.split_whitespace().any(|token| {
+        let code = token.trim_end_matches(':').to_ascii_uppercase();
+        STALE_TOPOLOGY_CODES.contains(&code.as_str())
+    })
+}
+
 impl CommandFailure {
-    /// Builds a failure from a driver error message, recognising redirect replies.
+    /// Builds a failure from a driver error message, recognising redirect replies and stale
+    /// topology errors.
     pub(crate) fn from_message(message: impl Into<String>) -> Self {
         let message = message.into();
-        match parse_redirect(&message) {
-            Some(redirect) => CommandFailure::Redirect(redirect),
-            None => CommandFailure::Other(message),
+        if let Some(redirect) = parse_redirect(&message) {
+            return CommandFailure::Redirect(redirect);
         }
+        if is_stale_topology(&message) {
+            return CommandFailure::StaleTopology(message);
+        }
+        CommandFailure::Other(message)
     }
 }
 
@@ -205,48 +254,94 @@ pub(crate) trait RedirectTransport: Send + Sync {
     ) -> std::result::Result<redis::Value, CommandFailure>;
 }
 
-/// Runs a command, following **at most one** redirection.
+/// How many redirections a single command may follow.
+const MAX_REDIRECTS: usize = 1;
+
+/// How many times a stale slot map may be refreshed for one command.
+const MAX_TOPOLOGY_REFRESHES: usize = 1;
+
+/// Locks the slot cache, ignoring poisoning (the cache is a plain map; a panic elsewhere
+/// must not turn routing into a hard failure).
+fn lock_cache(cache: &std::sync::Mutex<SlotCache>) -> std::sync::MutexGuard<'_, SlotCache> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Runs a command, following **at most one** redirection and refreshing a stale slot map
+/// **once**.
 ///
 /// * `MOVED` — records the new owner in `cache` and retries there once.
 /// * `ASK` — retries on the target with `ASKING`, **without** touching the cache.
-/// * a second redirect, or any other error, is returned as an error: a cluster that keeps
-///   redirecting is unhealthy, and retrying forever would turn a routing bug into a hang.
+/// * `READONLY` / `CLUSTERDOWN` / `TRYAGAIN` ([`CommandFailure::StaleTopology`]) — the cached
+///   owner of `slot` is no longer the primary (a failover demoted it), so the entry is
+///   evicted and the command is retried once from the seed node, which relearns the owner
+///   through the redirect the new primary answers with.
+/// * a second redirect, a second stale-topology signal, or any other error is returned as an
+///   error: a cluster that keeps redirecting is unhealthy, and retrying forever would turn a
+///   routing bug into a hang.
 ///
 /// The slot from a `MOVED` is cached before the retry so a later command for the same slot
 /// (or a later call after a failure) skips the discovery round-trip.
 pub(crate) async fn run_with_redirects(
     transport: &dyn RedirectTransport,
     cache: &std::sync::Mutex<SlotCache>,
+    slot: u16,
 ) -> Result<redis::Value> {
-    match transport.send(None, false).await {
-        Ok(value) => return Ok(value),
-        Err(CommandFailure::Other(message)) => {
-            return Err(Error::Other(format!("Redis command failed: {message}")))
-        }
-        Err(CommandFailure::Redirect(redirect)) => {
-            if let Redirect::Moved { slot, node } = &redirect {
-                cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record_moved(*slot, node.clone());
+    let mut redirects = 0usize;
+    let mut refreshes = 0usize;
+    // Explicit target of the next attempt; `None` means "start from the cached owner, or the
+    // seed node when the slot map has no entry".
+    let mut target: Option<ClusterNodeAddr> = None;
+    let mut asking = false;
+    loop {
+        match transport.send(target.as_ref(), asking).await {
+            Ok(value) => return Ok(value),
+            Err(CommandFailure::Redirect(redirect)) => {
+                if redirects >= MAX_REDIRECTS {
+                    return Err(Error::Other(format!(
+                        "Redis command was redirected twice ({} slot {} -> {}); giving up",
+                        if matches!(redirect, Redirect::Ask { .. }) {
+                            "ASK"
+                        } else {
+                            "MOVED"
+                        },
+                        redirect.slot(),
+                        redirect.node().to_redis_url()
+                    )));
+                }
+                redirects += 1;
+                if let Redirect::Moved { slot, node } = &redirect {
+                    lock_cache(cache).record_moved(*slot, node.clone());
+                }
+                target = Some(redirect.node().clone());
+                asking = matches!(redirect, Redirect::Ask { .. });
             }
-            let target = redirect.node().clone();
-            let asking = matches!(redirect, Redirect::Ask { .. });
-            match transport.send(Some(&target), asking).await {
-                Ok(value) => Ok(value),
-                Err(CommandFailure::Redirect(again)) => Err(Error::Other(format!(
-                    "Redis command was redirected twice ({} slot {} -> {}); giving up",
-                    if matches!(again, Redirect::Ask { .. }) {
-                        "ASK"
-                    } else {
-                        "MOVED"
-                    },
-                    again.slot(),
-                    again.node().to_redis_url()
-                ))),
-                Err(CommandFailure::Other(message)) => Err(Error::Other(format!(
-                    "Redis command failed after redirect: {message}"
-                ))),
+            Err(CommandFailure::StaleTopology(message)) => {
+                if refreshes >= MAX_TOPOLOGY_REFRESHES {
+                    return Err(Error::Other(format!(
+                        "Redis slot {slot} still reports a stale cluster topology after \
+                         refreshing the slot map ({message}); giving up"
+                    )));
+                }
+                refreshes += 1;
+                let evicted = lock_cache(cache).invalidate(slot);
+                tracing::debug!(
+                    "Redis slot {} reported a stale topology ({message}); evicted={evicted}, \
+                     retrying from the seed node",
+                    slot
+                );
+                // Forget the redirect target as well: the retry must re-resolve the owner
+                // from the (now emptied) slot map instead of reusing the demoted node.
+                target = None;
+                asking = false;
+            }
+            Err(CommandFailure::Other(message)) => {
+                return Err(Error::Other(if redirects == 0 {
+                    format!("Redis command failed: {message}")
+                } else {
+                    format!("Redis command failed after redirect: {message}")
+                }));
             }
         }
     }
@@ -431,7 +526,9 @@ mod tests {
         ]);
         let cache = Mutex::new(SlotCache::new());
 
-        let value = run_with_redirects(&transport, &cache).await.expect("retry");
+        let value = run_with_redirects(&transport, &cache, 3999)
+            .await
+            .expect("retry");
         assert_eq!(value, Value::Int(42));
         assert_eq!(
             transport.calls(),
@@ -451,7 +548,9 @@ mod tests {
         ]);
         let cache = Mutex::new(SlotCache::new());
 
-        run_with_redirects(&transport, &cache).await.expect("retry");
+        run_with_redirects(&transport, &cache, 12)
+            .await
+            .expect("retry");
         assert_eq!(
             transport.calls(),
             vec![(None, false), (Some(node("127.0.0.1", 7000)), true)]
@@ -473,7 +572,7 @@ mod tests {
         ]);
         let cache = Mutex::new(SlotCache::new());
 
-        let err = run_with_redirects(&transport, &cache)
+        let err = run_with_redirects(&transport, &cache, 1)
             .await
             .expect_err("a second redirect must fail");
         assert!(err.to_string().contains("redirected twice"), "{err}");
@@ -487,7 +586,7 @@ mod tests {
         ))]);
         let cache = Mutex::new(SlotCache::new());
 
-        let err = run_with_redirects(&transport, &cache)
+        let err = run_with_redirects(&transport, &cache, 1)
             .await
             .expect_err("must fail");
         assert!(err.to_string().contains("WRONGTYPE"), "{err}");
@@ -504,5 +603,111 @@ mod tests {
             CommandFailure::from_message("NOAUTH Authentication required"),
             CommandFailure::Other(_)
         ));
+    }
+
+    #[test]
+    fn stale_topology_codes_are_classified() {
+        for message in [
+            // The raw server reply.
+            "READONLY You can't write against a read only replica.",
+            // How the driver renders it (kind + ": " + detail).
+            "ReadOnly: READONLY You can't write against a read only replica.",
+            "CLUSTERDOWN The cluster is down",
+            "TryAgain: TRYAGAIN Multiple keys request during rehashing of slot",
+        ] {
+            assert!(
+                matches!(
+                    CommandFailure::from_message(message),
+                    CommandFailure::StaleTopology(_)
+                ),
+                "not classified as stale topology: {message}"
+            );
+        }
+        // A redirect always wins, and real errors stay real.
+        assert!(matches!(
+            CommandFailure::from_message("Moved: 1 127.0.0.1:7000"),
+            CommandFailure::Redirect(Redirect::Moved { slot: 1, .. })
+        ));
+        assert!(matches!(
+            CommandFailure::from_message("WRONGTYPE Operation against a key"),
+            CommandFailure::Other(_)
+        ));
+    }
+
+    /// A failover demotes the cached primary to a replica: the next write is answered with
+    /// `READONLY`, and the cached slot entry must be evicted so the retry can start over
+    /// from the seed node. Before the fix `READONLY` was `CommandFailure::Other`, i.e. the
+    /// write failed and every later write to that slot kept failing on the same dead entry.
+    #[tokio::test]
+    async fn readonly_evicts_the_stale_slot_and_retries_once() {
+        let transport = ScriptedTransport::new(vec![
+            Err(CommandFailure::from_message(
+                "ReadOnly: READONLY You can't write against a read only replica.",
+            )),
+            Ok(Value::Int(1)),
+        ]);
+        let mut slots = SlotCache::new();
+        slots.record_moved(3999, node("10.0.0.1", 7000));
+        let cache = Mutex::new(slots);
+
+        let value = run_with_redirects(&transport, &cache, 3999)
+            .await
+            .expect("the refreshed slot map lets the write through");
+
+        assert_eq!(value, Value::Int(1));
+        assert_eq!(transport.calls().len(), 2, "exactly one retry");
+        assert!(
+            cache.lock().unwrap().get(3999).is_none(),
+            "the demoted primary must be evicted from the slot map"
+        );
+    }
+
+    /// The retry after a refresh may itself be redirected (the seed node knows the new
+    /// owner): one redirect is still allowed, and it is cached.
+    #[tokio::test]
+    async fn a_refresh_can_be_followed_by_one_redirect() {
+        let transport = ScriptedTransport::new(vec![
+            Err(CommandFailure::from_message("CLUSTERDOWN The cluster is down")),
+            Err(CommandFailure::Redirect(Redirect::Moved {
+                slot: 7,
+                node: node("10.0.0.2", 7001),
+            })),
+            Ok(Value::Nil),
+        ]);
+        let cache = Mutex::new(SlotCache::new());
+
+        let value = run_with_redirects(&transport, &cache, 7)
+            .await
+            .expect("refresh + one redirect");
+
+        assert_eq!(value, Value::Nil);
+        assert_eq!(
+            transport.calls(),
+            vec![
+                (None, false),
+                (None, false),
+                (Some(node("10.0.0.2", 7001)), false)
+            ]
+        );
+        assert_eq!(cache.lock().unwrap().get(7), Some(&node("10.0.0.2", 7001)));
+    }
+
+    /// A cluster that keeps answering `READONLY` is broken: one refresh, then give up.
+    #[tokio::test]
+    async fn a_second_stale_topology_signal_gives_up() {
+        let transport = ScriptedTransport::new(vec![
+            Err(CommandFailure::from_message(
+                "READONLY You can't write against a read only replica.",
+            )),
+            Err(CommandFailure::from_message("TRYAGAIN rehashing in progress")),
+        ]);
+        let cache = Mutex::new(SlotCache::new());
+
+        let err = run_with_redirects(&transport, &cache, 42)
+            .await
+            .expect_err("a second stale signal must fail");
+
+        assert!(err.to_string().contains("stale cluster topology"), "{err}");
+        assert_eq!(transport.calls().len(), 2, "one refresh, then give up");
     }
 }

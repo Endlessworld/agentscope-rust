@@ -9,6 +9,7 @@ use async_trait::async_trait;
 
 use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
+use agentscope_core::model::Model;
 
 use crate::common::config::{AgentConfigError, RuntimeAgentConfig, ScheduleConfig};
 
@@ -22,6 +23,22 @@ pub trait AgentFactory: Send + Sync {
     /// Builds a fresh agent instance from the runtime configuration and runs a
     /// single call with the given input messages.
     async fn run(&self, config: &RuntimeAgentConfig, messages: Vec<Msg>) -> Result<Msg>;
+
+    /// Resolves the model to execute with when the runtime config carries none.
+    ///
+    /// Java turns the serializable `AgentConfig.modelConfig` into a `Model`
+    /// inside `BaseScheduleAgentTask#createAgent` (`getModelConfig().createModel()`).
+    /// This crate has no provider registry, so only the host can map a model
+    /// *name* to a `Model`; that lookup lives on the factory. When a model is
+    /// resolved here it is injected into the config handed to
+    /// [`run`](Self::run), so the factory can build its agent from
+    /// `config.model()` exactly like Java does.
+    ///
+    /// The default keeps the pre-existing behaviour: the config's own model, if
+    /// any (`None` when the config only carries a model name).
+    fn resolve_model(&self, config: &RuntimeAgentConfig) -> Option<Arc<dyn Model>> {
+        config.model().cloned()
+    }
 }
 
 /// Optional control surface a backend can attach to a task.
@@ -142,10 +159,26 @@ impl BaseScheduleAgentTask {
         {
             return Err(Error::Agent(AgentConfigError::MissingSysPrompt.to_string()));
         }
-        if self.agent_config.model().is_none() {
+        // Java `createAgent` builds the model from the config (`createModel()`)
+        // before validating; the Rust equivalent is a host-side lookup, so the
+        // config's model and the factory's resolution are both accepted. Only
+        // when neither can produce one does the Java `Model cannot be null.`
+        // error apply.
+        let resolved_model = match self.agent_config.model() {
+            Some(model) => Some(model.clone()),
+            None => self.factory.resolve_model(&self.agent_config),
+        };
+        let Some(model) = resolved_model else {
             return Err(Error::Agent(AgentConfigError::MissingModel.to_string()));
-        }
-        let result = self.factory.run(&self.agent_config, messages).await;
+        };
+        // Hand the resolved model to the factory so `run` sees the same config
+        // Java's `createAgent` would have built.
+        let config = if self.agent_config.model().is_some() {
+            self.agent_config.clone()
+        } else {
+            Arc::new(self.agent_config.with_model(model))
+        };
+        let result = self.factory.run(&config, messages).await;
         self.increment_execution_count();
         result
     }
@@ -187,6 +220,8 @@ impl ScheduleAgentTask for BaseScheduleAgentTask {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    use crate::common::config::AgentConfig;
 
     struct CountingFactory {
         calls: AtomicUsize,
@@ -329,5 +364,66 @@ mod tests {
         assert!(task.run_empty().await.is_err());
         assert_eq!(task.execution_count(), 1);
         assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Factory that resolves a model itself, the way a host with a provider
+    /// registry does, and records what the config carried when `run` was called.
+    struct ResolvingFactory {
+        calls: AtomicUsize,
+        saw_model: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AgentFactory for ResolvingFactory {
+        fn resolve_model(&self, config: &RuntimeAgentConfig) -> Option<Arc<dyn Model>> {
+            // Only the serializable model *name* is available on this path.
+            (config.model_name() == "qwen-max").then(|| crate::test_support::stub_model("resolved"))
+        }
+
+        async fn run(
+            &self,
+            config: &RuntimeAgentConfig,
+            _messages: Vec<Msg>,
+        ) -> Result<Msg> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.saw_model
+                .store(config.model().is_some(), Ordering::SeqCst);
+            Ok(Msg::assistant("ran"))
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_resolved_model_is_accepted_and_handed_to_run() {
+        // `RuntimeAgentConfig::from(AgentConfig)` carries no model (that is the
+        // serializable `schedule(AgentConfig)` path), so before
+        // `AgentFactory::resolve_model` every run aborted with
+        // `Model cannot be null.` even though the host knew how to build one.
+        let factory = Arc::new(ResolvingFactory {
+            calls: AtomicUsize::new(0),
+            saw_model: AtomicBool::new(false),
+        });
+        let cfg = RuntimeAgentConfig::from(
+            AgentConfig::builder()
+                .name("A")
+                .model_name("qwen-max")
+                .sys_prompt("sys")
+                .build()
+                .unwrap(),
+        );
+        assert!(cfg.model().is_none(), "serializable path carries no model");
+        let task = BaseScheduleAgentTask::new(
+            Arc::new(cfg),
+            ScheduleConfig::none(),
+            factory.clone(),
+        );
+
+        let reply = task.run_empty().await.unwrap();
+        assert_eq!(reply.text_content(), "ran");
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            factory.saw_model.load(Ordering::SeqCst),
+            "the factory-resolved model must be injected into the config handed to `run`"
+        );
+        assert_eq!(task.execution_count(), 1);
     }
 }

@@ -6,14 +6,18 @@
 //! synchronous adapter can wrap it with `block_on` where needed.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentscope_extensions_a2a_client::error::A2aError;
+use agentscope_extensions_a2a_client::model::AgentCard;
 use async_trait::async_trait;
 
 use super::converter::convert_to_a2a_agent_card;
 use super::model::A2aAgentCard;
-use crate::service::{AgentCardListener, NacosAiService};
+use crate::service::{AgentCardListener, AiServiceError, NacosAiService};
 
 /// A resolved AgentCard plus the moment it was fetched.
 #[derive(Debug, Clone)]
@@ -81,9 +85,16 @@ impl NacosAgentCardResolver {
     }
 }
 
-#[async_trait]
-impl AgentCardResolver for NacosAgentCardResolver {
-    async fn get_agent_card(&self, agent_name: &str) -> Result<A2aAgentCard, String> {
+impl NacosAgentCardResolver {
+    /// Resolves a card, preserving the Nacos error kind.
+    ///
+    /// The local [`AgentCardResolver`] trait reports failures as `String` (it predates the
+    /// protocol trait); the protocol adapter needs the classification to report `NOT_FOUND` as
+    /// [`A2aError::CardUnavailable`] instead of a transport failure (NACOS-02).
+    pub async fn resolve_detailed(
+        &self,
+        agent_name: &str,
+    ) -> Result<A2aAgentCard, AiServiceError> {
         if let Some(cached) = self.cached(agent_name) {
             return Ok(cached);
         }
@@ -104,11 +115,7 @@ impl AgentCardResolver for NacosAgentCardResolver {
             );
         });
 
-        let fetched = self
-            .service
-            .subscribe_agent_card(agent_name, listener)
-            .await
-            .map_err(|e| e.to_string())?;
+        let fetched = self.service.subscribe_agent_card(agent_name, listener).await?;
         let card = convert_to_a2a_agent_card(&fetched);
 
         // Merge: the listener may have written a newer value during the call.
@@ -125,6 +132,67 @@ impl AgentCardResolver for NacosAgentCardResolver {
             },
         );
         Ok(chosen)
+    }
+}
+
+#[async_trait]
+impl AgentCardResolver for NacosAgentCardResolver {
+    async fn get_agent_card(&self, agent_name: &str) -> Result<A2aAgentCard, String> {
+        self.resolve_detailed(agent_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+// ===========================================================================
+// Protocol-side interop (NACOS-02)
+// ===========================================================================
+
+/// The resolver name reported to the A2A client (Java `getClass().getSimpleName()`).
+const PROTOCOL_RESOLVER_NAME: &str = "NacosAgentCardResolver";
+
+/// Implements the **protocol** card resolver
+/// (`agentscope_extensions_a2a_client::card::AgentCardResolver`), so a Nacos-discovered card can
+/// be consumed by [`A2aClient`](agentscope_extensions_a2a_client::client::A2aClient).
+///
+/// Mirrors Java `NacosAgentCardResolver implements
+/// io.agentscope.core.a2a.agent.card.AgentCardResolver`. The existing cache / TTL / push
+/// bookkeeping is reused; only the error shape differs (the protocol trait wants
+/// [`A2aError`], and a Nacos `NOT_FOUND` must become [`A2aError::CardUnavailable`] so the client
+/// fails fast with the agent name and this resolver's name).
+impl agentscope_extensions_a2a_client::card::AgentCardResolver for NacosAgentCardResolver {
+    fn get_agent_card(
+        &self,
+        agent_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentCard, A2aError>> + Send + '_>> {
+        // The trait ties the returned future to `&self` only, so the borrowed name is
+        // copied before the async block captures it.
+        let agent_name = agent_name.to_string();
+        Box::pin(async move {
+            let card = self.resolve_detailed(&agent_name).await.map_err(|error| {
+                to_protocol_error(PROTOCOL_RESOLVER_NAME, &agent_name, error)
+            })?;
+            Ok(card.inner)
+        })
+    }
+
+    fn resolver_name(&self) -> &'static str {
+        PROTOCOL_RESOLVER_NAME
+    }
+}
+
+/// Maps a Nacos discovery failure onto the protocol [`A2aError`].
+fn to_protocol_error(resolver: &str, agent_name: &str, error: AiServiceError) -> A2aError {
+    if error.is_not_found() {
+        return A2aError::CardUnavailable {
+            agent_name: agent_name.to_string(),
+            resolver: resolver.to_string(),
+            detail: error.to_string(),
+        };
+    }
+    match error {
+        AiServiceError::Http { status, message } => A2aError::Http { status, message },
+        other => A2aError::Transport(other.to_string()),
     }
 }
 
@@ -235,5 +303,48 @@ mod tests {
             resolver.get_agent_card("remote").await.unwrap().url,
             "http://r:9999"
         );
+    }
+
+    /// NACOS-02: the protocol resolver feeds an A2A client and reports its own name.
+    #[tokio::test]
+    async fn the_protocol_resolver_feeds_the_a2a_client() {
+        use agentscope_extensions_a2a_client::card::AgentCardResolver as ProtocolResolver;
+        use agentscope_extensions_a2a_client::client::A2aClient;
+
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        svc.set_agent_card("remote", NacosAgentCard::new("remote", "http://r:9000"));
+        let resolver: Arc<dyn ProtocolResolver> = Arc::new(NacosAgentCardResolver::new(svc));
+
+        assert_eq!(resolver.resolver_name(), "NacosAgentCardResolver");
+
+        let client = A2aClient::new("remote", resolver);
+        let card = client.agent_card().await.unwrap();
+        assert_eq!(card.name, "remote");
+        assert_eq!(card.url, "http://r:9000");
+    }
+
+    /// NACOS-02: a Nacos `NOT_FOUND` surfaces as `CardUnavailable` naming this resolver.
+    #[tokio::test]
+    async fn a_missing_card_is_reported_as_card_unavailable() {
+        use agentscope_extensions_a2a_client::card::AgentCardResolver as ProtocolResolver;
+        use agentscope_extensions_a2a_client::client::A2aClient;
+
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let resolver: Arc<dyn ProtocolResolver> = Arc::new(NacosAgentCardResolver::new(svc));
+        let client = A2aClient::new("ghost", resolver);
+
+        let error = client.agent_card().await.unwrap_err();
+        match error {
+            A2aError::CardUnavailable {
+                agent_name,
+                resolver,
+                detail,
+            } => {
+                assert_eq!(agent_name, "ghost");
+                assert_eq!(resolver, "NacosAgentCardResolver");
+                assert!(detail.contains("NacosAgentCardResolver"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

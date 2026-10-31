@@ -6,14 +6,18 @@
 //!
 //! # Blocking model
 //!
-//! [`OssClient`] is synchronous, so [`S3OssClient`] owns a dedicated Tokio
-//! runtime and drives each `rust-s3` future with [`Runtime::block_on`]. The
-//! runtime is created once per client; calls never build a new runtime.
+//! [`OssClient`] is synchronous while `rust-s3` is async, so [`S3OssClient`]
+//! owns a **dedicated worker thread** hosting a private Tokio runtime. Each
+//! request is shipped to that thread as a job and its result comes back over a
+//! channel; the caller's thread only blocks on the channel and **never** enters
+//! a runtime.
 //!
-//! > **Do not call these methods from a Tokio worker thread.** `block_on`
-//! > panics when invoked inside an async runtime. Wrap calls in
-//! > [`tokio::task::spawn_blocking`] (or `block_in_place` on a multi-thread
-//! > runtime) when the caller is async.
+//! That matters because the core/harness store methods (`AgentStateStore` is
+//! `async fn`, `BaseStore` is plain `fn`) call the blocking [`OssClient`]
+//! inline on whatever thread polls them. `Runtime::block_on` would panic there
+//! with "Cannot start a runtime from within a runtime"; handing the work to an
+//! owned thread keeps the client safe from Tokio worker threads, current-thread
+//! runtimes, `spawn_blocking` threads and plain OS threads alike.
 //!
 //! # Example
 //!
@@ -32,6 +36,7 @@
 //! ```
 
 use std::fmt;
+use std::sync::Arc;
 
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
@@ -49,11 +54,11 @@ const MAX_KEYS_PER_PAGE: usize = 1000;
 
 /// S3-compatible implementation of [`OssClient`].
 ///
-/// Holds a dedicated multi-threaded Tokio runtime and a `rust-s3` [`Bucket`].
-/// See the [module docs](self) for the blocking contract.
+/// Holds a dedicated worker thread (with its own Tokio runtime) plus a shared
+/// `rust-s3` [`Bucket`]. See the [module docs](self) for the blocking contract.
 pub struct S3OssClient {
-    runtime: tokio::runtime::Runtime,
-    bucket: Box<Bucket>,
+    worker: S3Worker,
+    bucket: Arc<Bucket>,
     bucket_name: String,
     region: String,
     endpoint: Option<String>,
@@ -98,8 +103,132 @@ impl S3OssClient {
         self.path_style
     }
 
-    fn run<F: std::future::Future>(&self, future: F) -> F::Output {
-        self.runtime.block_on(future)
+    /// Runs `build(bucket)` on the worker thread and blocks until it completes.
+    ///
+    /// The future is **created on the worker thread**, so the caller's runtime
+    /// is never entered and `block_on` cannot nest. `build` receives the shared
+    /// bucket so the produced future is `'static` instead of borrowing `self`.
+    fn run<Fut, Out>(
+        &self,
+        build: impl FnOnce(Arc<Bucket>) -> Fut + Send + 'static,
+    ) -> OssResult<Out>
+    where
+        Fut: std::future::Future<Output = Result<Out, S3Error>> + 'static,
+        Out: Send + 'static,
+    {
+        let bucket = Arc::clone(&self.bucket);
+        self.worker
+            .execute(move |runtime| runtime.block_on(build(bucket)))?
+            .map_err(OssError::from)
+    }
+}
+
+/// A unit of work for the [`S3Worker`] thread: it receives the worker's runtime
+/// and drives one request to completion there.
+type Job = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+
+/// Owns the dedicated thread that hosts the private Tokio runtime.
+///
+/// `rust-s3` is async but [`OssClient`] is synchronous, and the stores call the
+/// client inline from `async fn` bodies (core `AgentStateStore`) — i.e. possibly
+/// on a Tokio worker thread, where `Runtime::block_on` panics. Shipping every
+/// job to an owned thread removes the nested-runtime hazard entirely and does
+/// not depend on the caller's runtime flavour (`block_in_place` requires a
+/// multi-thread runtime, so it would still panic on `#[tokio::test]`).
+struct S3Worker {
+    // `std::sync::mpsc::Sender` is `Send` but **not** `Sync`, while `OssClient`
+    // requires `Send + Sync`; the mutex only exists to restore `Sync` (the lock is
+    // held for the duration of a single non-blocking `send`).
+    sender: Option<std::sync::Mutex<std::sync::mpsc::Sender<Job>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl S3Worker {
+    fn new() -> OssResult<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel::<Job>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<OssResult<()>>();
+
+        let thread = std::thread::Builder::new()
+            .name("agentscope-oss-s3".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => {
+                        let _ = ready_tx.send(Ok(()));
+                        runtime
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(OssError::S3Config(format!(
+                            "failed to create Tokio runtime: {error}"
+                        ))));
+                        return;
+                    }
+                };
+                while let Ok(job) = receiver.recv() {
+                    job(&runtime);
+                }
+                // The runtime is dropped here, on its own thread: dropping it
+                // from inside the caller's runtime would panic.
+            })
+            .map_err(|error| {
+                OssError::S3Config(format!("failed to spawn S3 worker thread: {error}"))
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender: Some(std::sync::Mutex::new(sender)),
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                drop(sender);
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => Err(OssError::S3Config(
+                "S3 worker thread exited during startup".to_string(),
+            )),
+        }
+    }
+
+    /// Queues `work` and blocks the calling thread until it produced a result.
+    fn execute<Out, F>(&self, work: F) -> OssResult<Out>
+    where
+        F: FnOnce(&tokio::runtime::Runtime) -> Out + Send + 'static,
+        Out: Send + 'static,
+    {
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<Out>();
+        let job: Job = Box::new(move |runtime: &tokio::runtime::Runtime| {
+            let _ = result_tx.send(work(runtime));
+        });
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| OssError::Backend("S3 client is shut down".to_string()))?;
+        {
+            let sender = sender
+                .lock()
+                .map_err(|_| OssError::Backend("S3 worker channel is poisoned".to_string()))?;
+            sender
+                .send(job)
+                .map_err(|_| OssError::Backend("S3 worker thread is gone".to_string()))?;
+        }
+        result_rx
+            .recv()
+            .map_err(|_| OssError::Backend("S3 worker thread dropped the response".to_string()))
+    }
+}
+
+impl Drop for S3Worker {
+    fn drop(&mut self) {
+        // Dropping the sender ends the worker's `recv()` loop; joining makes
+        // shutdown deterministic (an in-flight request still completes).
+        self.sender = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -288,16 +417,13 @@ impl S3OssClientBuilder {
             bucket
         };
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("agentscope-oss-s3")
-            .build()
-            .map_err(|e| OssError::S3Config(format!("failed to create Tokio runtime: {e}")))?;
+        // The runtime lives on the worker thread; only a channel handle is kept
+        // here, so no `block_on` ever runs on the caller's (possibly async) thread.
+        let worker = S3Worker::new()?;
 
         Ok(S3OssClient {
-            runtime,
-            bucket,
+            worker,
+            bucket: Arc::from(bucket),
             bucket_name,
             region: region_name,
             endpoint,
@@ -331,6 +457,11 @@ fn is_not_found(error: &S3Error) -> bool {
     }
 }
 
+/// [`is_not_found`] for the [`OssError`] wrapper produced by `S3OssClient::run`.
+fn is_missing_object(error: &OssError) -> bool {
+    matches!(error, OssError::S3(inner) if is_not_found(inner))
+}
+
 fn unexpected_status(status: u16, body: &[u8]) -> OssError {
     OssError::S3Http {
         status,
@@ -348,12 +479,17 @@ fn ensure_success(status: u16, body: &[u8]) -> OssResult<()> {
 
 impl OssClient for S3OssClient {
     fn put(&self, object_key: &str, content: &[u8]) -> OssResult<()> {
-        let response = self.run(self.bucket.put_object(object_key, content))?;
+        let key = object_key.to_string();
+        let body = content.to_vec();
+        let response = self.run(move |bucket| async move {
+            bucket.put_object(key.as_str(), body.as_slice()).await
+        })?;
         ensure_success(response.status_code(), response.as_slice())
     }
 
     fn get(&self, object_key: &str) -> OssResult<Option<Vec<u8>>> {
-        match self.run(self.bucket.get_object(object_key)) {
+        let key = object_key.to_string();
+        match self.run(move |bucket| async move { bucket.get_object(key.as_str()).await }) {
             Ok(response) => {
                 let status = response.status_code();
                 if status == 404 {
@@ -364,33 +500,35 @@ impl OssClient for S3OssClient {
                     Err(unexpected_status(status, response.as_slice()))
                 }
             }
-            Err(error) if is_not_found(&error) => Ok(None),
-            Err(error) => Err(OssError::S3(error)),
+            Err(error) if is_missing_object(&error) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
     fn exists(&self, object_key: &str) -> OssResult<bool> {
-        match self.run(self.bucket.head_object(object_key)) {
+        let key = object_key.to_string();
+        match self.run(move |bucket| async move { bucket.head_object(key.as_str()).await }) {
             Ok((_, status)) if (200..300).contains(&status) => Ok(true),
             Ok((_, 404)) => Ok(false),
             Ok((_, status)) => Err(unexpected_status(status, b"")),
-            Err(error) if is_not_found(&error) => Ok(false),
-            Err(error) => Err(OssError::S3(error)),
+            Err(error) if is_missing_object(&error) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
     fn delete(&self, object_key: &str) -> OssResult<()> {
         // S3 DeleteObject is idempotent, but some gateways return 404 for a
         // missing key; both are treated as success.
-        match self.run(self.bucket.delete_object(object_key)) {
+        let key = object_key.to_string();
+        match self.run(move |bucket| async move { bucket.delete_object(key.as_str()).await }) {
             Ok(response) if (200..300).contains(&response.status_code()) => Ok(()),
             Ok(response) if response.status_code() == 404 => Ok(()),
             Ok(response) => Err(unexpected_status(
                 response.status_code(),
                 response.as_slice(),
             )),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(OssError::S3(error)),
+            Err(error) if is_missing_object(&error) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -406,13 +544,14 @@ impl OssClient for S3OssClient {
 
         // `max_keys` and `continuation_token` are forwarded to S3 verbatim;
         // this is a real ListObjectsV2 request, not a slice of a full listing.
-        let (page, status) = self.run(self.bucket.list_page(
-            prefix.to_string(),
-            None,
-            continuation_token.map(str::to_string),
-            None,
-            Some(max_keys.min(MAX_KEYS_PER_PAGE)),
-        ))?;
+        let key_prefix = prefix.to_string();
+        let token = continuation_token.map(str::to_string);
+        let page_size = max_keys.min(MAX_KEYS_PER_PAGE);
+        let (page, status) = self.run(move |bucket| async move {
+            bucket
+                .list_page(key_prefix, None, token, None, Some(page_size))
+                .await
+        })?;
         ensure_success(status, b"")?;
 
         let objects = page

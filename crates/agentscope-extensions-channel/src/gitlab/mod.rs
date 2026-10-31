@@ -21,7 +21,7 @@ pub mod properties;
 pub mod signature;
 
 pub use bot_identity::GitLabBotIdentityResolver;
-pub use channel::{GitLabCallbackOutcome, GitLabChannel, GitLabChannelRegistry};
+pub use channel::{GitLabCallbackOutcome, GitLabChannel, GitLabChannelRegistry, CHANNEL_TYPE};
 pub use inbound::GitLabInboundMapper;
 pub use outbound::GitLabOutboundClient;
 pub use properties::GitLabChannelProperties;

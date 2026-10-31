@@ -11,6 +11,9 @@
 //!   `review_code_snapshot`, plus [`register_jev_tools`].
 //! * [`middleware`] — the four `Middleware` hooks (trace evaluation, response screening,
 //!   supervision observation, phase routing dispatch).
+//! * [`selection`] — the three JEV selection middlewares (Java `jev/example`): model routing
+//!   (`ON_AGENT` + `ON_MODEL_CALL`), tool selection (`ON_REASONING`) and the automatic-execution
+//!   guard (`ON_ACTING`), plus the `JevSelectionSupport` helpers (tracker `JUDGE-01`).
 //! * [`quality`] — the response middleware's quality/reviser branches: the assess loop, the
 //!   revision seam, `replaceText` and the capture/buffer limits.
 //! * [`review_driver`] — the staged `JevCodeReviewer` driver
@@ -25,6 +28,7 @@ pub mod capture;
 pub mod middleware;
 pub mod quality;
 pub mod review_driver;
+pub mod selection;
 pub mod tools;
 
 pub use archive::{context_namespace, StoreJevContextArchive, NAMESPACE_PREFIX, SNAPSHOT_KEY};
@@ -40,6 +44,12 @@ pub use quality::{
 pub use review_driver::{
     ReviewDriver, EVIDENCE_RULES, FILE_LIMIT, FOLLOW_UP_PENDING, INCOMPLETE_REVIEW,
     NO_SOURCE_FILES, REVIEW_FINISHED,
+};
+pub use selection::{
+    ContextStrategy, JevAutoModeMiddleware, JevAutoModeMiddlewareBuilder, JevModelRouterMiddleware,
+    JevModelRouterMiddlewareBuilder, JevToolSelectionMiddleware, JevToolSelectionMiddlewareBuilder,
+    ModelChoice, RiskDecision, RoutingDecision, DEFAULT_DENY_MESSAGE, DEFAULT_SAFETY_THRESHOLD,
+    ROUTING_QUESTION,
 };
 pub use tools::{
     register_jev_tools, CodeReviewDriver, CodeReviewSource, EvidenceSearchTool, EvidenceSource,

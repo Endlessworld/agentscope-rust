@@ -189,15 +189,20 @@ impl Mem0Client {
         headers
     }
 
-    async fn post(&self, endpoint: &str, body: &str) -> Result<String> {
+    /// POSTs `body` to `endpoint`, tagging a non-2xx failure with the Java vendor and
+    /// operation names (`Mem0Client#executePostRaw`).
+    async fn post(&self, operation: &'static str, endpoint: &str, body: &str) -> Result<String> {
         let url = format!("{}{}", self.api_base_url, endpoint);
-        self.transport.post_json(&url, &self.headers(), body).await
+        self.transport
+            .post_json(&url, &self.headers(), body)
+            .await
+            .map_err(|err| err.with_context("Mem0", operation))
     }
 
     /// Adds memories: `POST /v1/memories/` (platform) or `POST /memories` (self-hosted).
     pub async fn add(&self, request: &Mem0AddRequest) -> Result<Mem0AddResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post(&self.add_endpoint, &body).await?;
+        let raw = self.post("add request", &self.add_endpoint, &body).await?;
         Ok(serde_json::from_str(&raw)?)
     }
 
@@ -213,7 +218,7 @@ impl Mem0Client {
         let mut request = request.clone();
         request.sync_filters();
         let body = serde_json::to_string(&request)?;
-        let raw = self.post(&self.search_endpoint, &body).await?;
+        let raw = self.post("search request", &self.search_endpoint, &body).await?;
         let trimmed = raw.trim();
         if trimmed.starts_with('[') {
             let results: Vec<Mem0SearchResult> = serde_json::from_str(trimmed)?;
@@ -360,14 +365,14 @@ mod tests {
     #[tokio::test]
     async fn add_propagates_http_status_and_body() {
         let mock = MockTransport::new();
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 401,
-            body: "{\"detail\":\"unauthorized\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(
+            401,
+            "{\"detail\":\"unauthorized\"}",
+        )));
         let client = client(Arc::new(mock), Some("bad"), Mem0ApiType::Platform);
         let err = client.add(&Mem0AddRequest::new()).await.unwrap_err();
         match err {
-            MemError::HttpStatus { status, body } => {
+            MemError::HttpStatus { status, body, .. } => {
                 assert_eq!(status, 401);
                 assert!(body.contains("unauthorized"));
             }
@@ -417,5 +422,29 @@ mod tests {
         // Injected transports are not instrumented: the caller owns that seam.
         let injected = self::client(Arc::new(MockTransport::new()), None, Mem0ApiType::Platform);
         assert!(injected.metrics().is_none());
+    }
+
+    /// MEM-02: a non-2xx failure carries the Java vendor *and* operation name, so a
+    /// `401` can be told apart by the operation that raised it.
+    #[tokio::test]
+    async fn http_failures_name_the_vendor_and_the_operation() {
+        let mock = MockTransport::new();
+        mock.push_response(Err(MemError::http_status(401, "unauthorized")));
+        let client = client(Arc::new(mock.clone()), Some("bad"), Mem0ApiType::Platform);
+        let err = client.add(&Mem0AddRequest::new()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Mem0 API add request failed with status 401: unauthorized"
+        );
+
+        mock.push_response(Err(MemError::http_status(500, "boom")));
+        let err = client
+            .search(&Mem0SearchRequest::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Mem0 API search request failed with status 500: boom"
+        );
     }
 }

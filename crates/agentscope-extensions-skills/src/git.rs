@@ -8,6 +8,13 @@
 //! documented authentication model (`~/.gitconfig` / credential helpers for HTTPS, `~/.ssh`
 //! for SSH) and avoids pulling the `git2` C dependency (not present in `Cargo.lock`).
 //!
+//! Carrier adjudication (SKILLS-10): **keep the CLI**, and verify it up front with
+//! `git --version` ([`GitSkillRepository::check_git_available`], invoked from
+//! [`GitSkillRepository::from_config`]) so a missing or broken binary fails at construction with
+//! an actionable message instead of surfacing as an opaque error on the first read. The binary is
+//! injectable through [`GitSkillRepositoryConfig::git_binary`] for hosts that install git outside
+//! `PATH`.
+//!
 //! Each read triggers a lightweight remote-ref check (filtered to `refs/heads/<branch>`, like
 //! Java's `setHeads(true)` + `matchesBranch`) and only pulls when the remote ref changed, exactly
 //! like the Java `ensureRepositorySynced` / `hasRemoteUpdates` pair. An unreachable remote is a
@@ -45,6 +52,13 @@ pub struct GitSkillRepositoryConfig {
     pub skills_root: Option<String>,
     /// When `true`, reads synchronize the clone first.
     pub auto_sync: bool,
+    /// The `git` program to invoke; `None` uses `git` from `PATH`.
+    ///
+    /// SKILLS-10: the backend keeps the system `git` CLI (no `gix`/`git2` dependency, and Java
+    /// documents the `~/.gitconfig` / credential-helper / `~/.ssh` auth model), so hosts that
+    /// install git outside `PATH` - and tests that need a deterministic failure - can point at an
+    /// explicit binary.
+    pub git_binary: Option<String>,
 }
 
 impl GitSkillRepositoryConfig {
@@ -57,6 +71,7 @@ impl GitSkillRepositoryConfig {
             source: None,
             skills_root: None,
             auto_sync: true,
+            git_binary: None,
         }
     }
 
@@ -89,6 +104,12 @@ impl GitSkillRepositoryConfig {
         self.auto_sync = auto;
         self
     }
+
+    /// Overrides the `git` program (default: `git` from `PATH`), see [`Self::git_binary`].
+    pub fn git_binary(mut self, binary: impl Into<String>) -> Self {
+        self.git_binary = Some(binary.into());
+        self
+    }
 }
 
 /// Internal mutable sync state, guarded by a mutex (mirrors the Java `synchronized`).
@@ -102,6 +123,8 @@ pub struct GitSkillRepository {
     cfg: GitSkillRepositoryConfig,
     local_path: PathBuf,
     owns_temp_dir: bool,
+    /// The `git` program every invocation uses (normalised at construction, see SKILLS-10).
+    git_binary: String,
     state: Mutex<SyncState>,
 }
 
@@ -122,6 +145,11 @@ impl GitSkillRepository {
         // Java stores `remoteUrl.trim()`; keep an untrimmed value out of every shell call below.
         let mut cfg = cfg;
         cfg.remote_url = cfg.remote_url.trim().to_string();
+        // SKILLS-10: the CLI carrier is a runtime dependency, so verify it here - before a temp
+        // clone dir is created - and report one actionable error instead of an opaque failure on
+        // the first read.
+        let git_binary = normalize_git_binary(cfg.git_binary.as_deref());
+        Self::check_git_available(&git_binary)?;
         let (local_path, owns_temp_dir) = match &cfg.local_path {
             Some(p) => (p.clone(), false),
             None => (create_temp_dir()?, true),
@@ -132,6 +160,7 @@ impl GitSkillRepository {
             cfg,
             local_path,
             owns_temp_dir,
+            git_binary,
             state: Mutex::new(SyncState {
                 skills_path: None,
                 last_remote_ref: None,
@@ -182,19 +211,27 @@ impl GitSkillRepository {
             .collect()
     }
 
-    /// Runs `git <args>` in the given working directory, mapping failures to
+    /// Runs `<program> <args>` in the given working directory, mapping failures to
     /// [`SkillRepositoryError::Git`].
+    ///
+    /// `program` comes from [`GitSkillRepositoryConfig::git_binary`] (normalised once at
+    /// construction), so the error message names the binary that was actually invoked.
     fn run_git(
+        program: &str,
         cwd: Option<&Path>,
         args: &[&str],
     ) -> Result<std::process::Output, SkillRepositoryError> {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(program);
         cmd.args(args);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
         let output = cmd.output().map_err(|e| {
-            SkillRepositoryError::Git(format!("failed to run `git {}`: {e}", args.join(" ")))
+            SkillRepositoryError::Git(format!(
+                "failed to run `{program} {}`: {e}. The git skill backend runs the system git CLI; \
+                 install git, put it on PATH, or set `GitSkillRepositoryConfig::git_binary`.",
+                args.join(" ")
+            ))
         })?;
         Ok(output)
     }
@@ -213,7 +250,7 @@ impl GitSkillRepository {
         args.push(self.cfg.remote_url.clone());
         args.push(self.local_path.to_string_lossy().to_string());
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = Self::run_git(None, &arg_refs)?;
+        let output = Self::run_git(&self.git_binary, None, &arg_refs)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SkillRepositoryError::Git(format!(
@@ -222,15 +259,15 @@ impl GitSkillRepository {
                 stderr.trim()
             )));
         }
-        if let Ok(head) = Self::rev_parse(&self.local_path, "HEAD") {
+        if let Ok(head) = Self::rev_parse(&self.git_binary, &self.local_path, "HEAD") {
             self.state.lock().unwrap().last_remote_ref = Some(head);
         }
         Ok(())
     }
 
-    /// `git rev-parse <rev>` in `dir`.
-    fn rev_parse(dir: &Path, rev: &str) -> Result<String, SkillRepositoryError> {
-        let output = Self::run_git(Some(dir), &["rev-parse", rev])?;
+    /// `<program> rev-parse <rev>` in `dir`.
+    fn rev_parse(program: &str, dir: &Path, rev: &str) -> Result<String, SkillRepositoryError> {
+        let output = Self::run_git(program, Some(dir), &["rev-parse", rev])?;
         if !output.status.success() {
             return Err(SkillRepositoryError::Git(format!("rev-parse {rev} failed")));
         }
@@ -256,7 +293,7 @@ impl GitSkillRepository {
         let spec = branch.map(|b| format!("refs/heads/{b}"));
         let mut args: Vec<&str> = vec!["ls-remote", self.cfg.remote_url.as_str()];
         args.push(spec.as_deref().unwrap_or("HEAD"));
-        let output = Self::run_git(None, &args)?;
+        let output = Self::run_git(&self.git_binary, None, &args)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SkillRepositoryError::Git(format!(
@@ -299,14 +336,15 @@ impl GitSkillRepository {
         };
         let mut state = self.state.lock().unwrap();
         if state.last_remote_ref.is_none() {
-            state.last_remote_ref = Self::rev_parse(&self.local_path, "HEAD").ok();
+            state.last_remote_ref = Self::rev_parse(&self.git_binary, &self.local_path, "HEAD").ok();
         }
         Ok(state.last_remote_ref.as_deref() != Some(remote.as_str()))
     }
 
     /// Pulls the latest changes into an existing clone.
     fn pull_repository(&self) -> Result<(), SkillRepositoryError> {
-        let output = Self::run_git(Some(&self.local_path), &["pull", "--ff-only"])?;
+        let output =
+            Self::run_git(&self.git_binary, Some(&self.local_path), &["pull", "--ff-only"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SkillRepositoryError::Git(format!(
@@ -315,7 +353,7 @@ impl GitSkillRepository {
                 stderr.trim()
             )));
         }
-        self.state.lock().unwrap().last_remote_ref = Self::rev_parse(&self.local_path, "HEAD").ok();
+        self.state.lock().unwrap().last_remote_ref = Self::rev_parse(&self.git_binary, &self.local_path, "HEAD").ok();
         Ok(())
     }
 
@@ -378,6 +416,44 @@ impl GitSkillRepository {
             ));
         }
         Ok(())
+    }
+
+    /// Verifies that the `git` binary is runnable and reports a version (`git --version`).
+    ///
+    /// SKILLS-10 adjudication: the backend keeps shelling out to the system `git` CLI rather than
+    /// taking a `gix` / `git2` dependency (zero new crates, and the user's credential model -
+    /// `~/.gitconfig`, credential helpers, `~/.ssh` - keeps working exactly as Java documents).
+    /// The price is a runtime dependency on the binary, so the check runs in [`Self::from_config`]:
+    /// a missing `git` becomes one clear, actionable error at construction time.
+    ///
+    /// Returns the raw version line (`git version 2.43.0`).
+    pub fn check_git_available(git_binary: &str) -> Result<String, SkillRepositoryError> {
+        let program = normalize_git_binary(Some(git_binary));
+        let output = Command::new(&program)
+            .arg("--version")
+            .output()
+            .map_err(|e| {
+                SkillRepositoryError::Git(format!(
+                    "`{program} --version` could not be executed: {e}. The git skill backend runs \
+                     the system git CLI; install git, put it on PATH, or set \
+                     `GitSkillRepositoryConfig::git_binary` to its path."
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(SkillRepositoryError::Git(format!(
+                "`{program} --version` failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.contains("git version") {
+            return Err(SkillRepositoryError::Git(format!(
+                "`{program} --version` did not report a git version (got {version:?}); \
+                 `GitSkillRepositoryConfig::git_binary` must point at a git executable"
+            )));
+        }
+        Ok(version)
     }
 
     /// Forces a synchronization pass (mirrors the Java `sync()`).
@@ -526,6 +602,18 @@ impl Drop for GitSkillRepository {
             let _ = std::fs::remove_dir_all(&self.local_path);
         }
     }
+}
+
+/// The `git` program to invoke: the configured override, or `git` from `PATH`.
+///
+/// A blank / whitespace-only override is treated as "unspecified" so an empty config value never
+/// turns into a confusing `Command::new("")` failure (SKILLS-10).
+fn normalize_git_binary(configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|program| !program.is_empty())
+        .unwrap_or("git")
+        .to_string()
 }
 
 /// Creates a unique temp directory (no `tempfile` dependency).
@@ -1021,6 +1109,67 @@ mod tests {
         assert!(!repo.skill_exists("   ").unwrap());
         // Path traversal still fails loudly.
         assert!(repo.skill_exists("../escape").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // SKILLS-10: the git CLI carrier is verified up front
+    // ------------------------------------------------------------------
+
+    /// The startup self-check the CLI carrier relies on: `git --version` must run and report a
+    /// git version (offline, no clone).
+    #[test]
+    fn git_self_check_reports_the_system_git_version() {
+        let version = GitSkillRepository::check_git_available("git").expect("git --version");
+        assert!(
+            version.starts_with("git version"),
+            "unexpected output: {version}"
+        );
+    }
+
+    /// A missing / unusable binary fails at construction time with a message that says what to do,
+    /// instead of surfacing as an opaque failure on the first read.
+    #[test]
+    fn git_self_check_rejects_an_unusable_binary_at_construction_time() {
+        let result = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new("file:///nonexistent/agentscope-skills")
+                .git_binary("agentscope-no-such-git-binary-2026"),
+        );
+        let error = match result {
+            Ok(_) => panic!("a missing git binary must fail at construction time"),
+            Err(e) => e,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("agentscope-no-such-git-binary-2026"),
+            "{message}"
+        );
+        assert!(message.contains("--version"), "{message}");
+        // The message must name the configuration knob that fixes it.
+        assert!(message.contains("git_binary"), "{message}");
+        assert!(matches!(error, SkillRepositoryError::Git(_)));
+    }
+
+    /// The configured binary drives *every* invocation (not just the self-check), and a padded
+    /// override is normalised instead of being passed to `Command::new` verbatim.
+    #[test]
+    fn git_binary_override_is_normalised_and_used() {
+        let root = unique_dir("git-binary");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "s1", "s1", "first");
+        commit_all(&remote, "initial");
+
+        let repo = GitSkillRepository::from_config(
+            GitSkillRepositoryConfig::new(file_url(&remote))
+                .local_path(root.join("clone"))
+                .git_binary("  git  "),
+        )
+        .expect("an explicit git path must work");
+        assert_eq!(
+            repo.get_all_skill_names().unwrap(),
+            vec!["s1".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

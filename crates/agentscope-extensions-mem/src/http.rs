@@ -83,10 +83,9 @@ impl HttpTransport for ReqwestTransport {
             .await
             .map_err(|e| MemError::Transport(e.to_string()))?;
         if !status.is_success() {
-            return Err(MemError::HttpStatus {
-                status: status.as_u16(),
-                body: text,
-            });
+            // Vendor / operation labels are attached by the client that owns the call
+            // (`MemError::with_context`); this seam is deliberately agnostic.
+            return Err(MemError::http_status(status.as_u16(), text));
         }
         Ok(text)
     }

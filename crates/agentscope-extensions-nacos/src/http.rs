@@ -12,6 +12,18 @@
 //! * [`ReqwestNacosTransport`] is the real client, behind the `http-client` feature, so the
 //!   default build stays dependency-free.
 //!
+//! ## Auth and namespace
+//!
+//! * **Auth (NACOS-03)**: with `username`/`password` configured the service logs in through
+//!   `POST /v1/auth/login`, caches `accessToken` and refreshes it early (90% of `tokenTtl`);
+//!   `401`/`403` triggers exactly one re-login and a replay of the original request. A static
+//!   `access_token` is used when no credentials are configured, and as the fallback when a
+//!   login attempt fails.
+//! * **Namespace (NACOS-04/16)**: `NacosHttpConfig::namespace` is required and sent as
+//!   `namespaceId` on **every** request (read and write); an empty value means "server default"
+//!   and is omitted. [`NacosHttpAiService::for_namespace`] gives a scoped view for another
+//!   namespace.
+//!
 //! ## Endpoint assumptions
 //!
 //! Nacos instances differ in prefix (`/nacos`) and in how strictly the AI OpenAPI is
@@ -19,6 +31,8 @@
 //! the Nacos 3.x layout. Responses are accepted both bare (`{...card...}`) and wrapped in the
 //! Nacos envelope (`{"code":0,"data":{...}}`), and a `404` maps to `Ok(None)` for the
 //! `get_*` methods (absent) and to [`AiServiceError::not_found`] for the `subscribe_*` ones.
+//! An envelope with a non-zero `code` is a business rejection even when the status is `200`
+//! (NACOS-11): reads and writes both surface it as [`AiServiceError::Business`].
 //!
 //! ## Subscriptions
 //!
@@ -33,6 +47,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::a2a::model::{NacosAgentCard, NacosAgentEndpoint};
 use crate::service::{
@@ -111,15 +126,41 @@ pub trait NacosHttpTransport: Send + Sync {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, String>;
 }
 
+/// The Nacos default namespace id, used when an embedder wants the server default.
+pub const DEFAULT_NAMESPACE: &str = "public";
+
+/// Token TTL assumed when the login response carries no `tokenTtl` (Nacos default: 5 hours).
+pub const DEFAULT_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(18_000);
+
+/// Ratio of `tokenTtl` after which the token is refreshed early (NACOS-03).
+pub const DEFAULT_TOKEN_REFRESH_RATIO: f64 = 0.9;
+
 /// Configuration for [`NacosHttpAiService`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NacosHttpConfig {
     /// Base URL including the context path, e.g. `http://127.0.0.1:8848/nacos`.
     pub base_url: String,
-    /// Nacos `accessToken` query parameter, appended to every request when set.
+    /// A static Nacos `accessToken` (mirrors `Properties(accessToken)`).
+    ///
+    /// Used when no `username`/`password` credentials are configured, and as the fallback
+    /// value when a login attempt fails (NACOS-03).
     pub access_token: Option<String>,
-    /// Nacos namespace (`namespaceId`), sent on the mutating calls.
-    pub namespace: Option<String>,
+    /// Nacos username used to log in through [`Self::auth_path`] (NACOS-03).
+    pub username: Option<String>,
+    /// Nacos password used to log in through [`Self::auth_path`] (NACOS-03).
+    pub password: Option<String>,
+    /// Login path, defaulting to `/v1/auth/login`.
+    pub auth_path: String,
+    /// Ratio of `tokenTtl` after which the token is refreshed early (default
+    /// [`DEFAULT_TOKEN_REFRESH_RATIO`]: 90%).
+    pub token_refresh_ratio: f64,
+    /// Nacos namespace (`namespaceId`).
+    ///
+    /// **Configuration-level and required** (NACOS-16 ruling A): the service is bound to one
+    /// namespace, like a Java `AiService` built from `Properties(namespace)`, and every request
+    /// carries it. An empty value means "use the server default namespace" and is omitted from
+    /// the query string. Per-call override: [`NacosHttpAiService::for_namespace`].
+    pub namespace: String,
     /// AgentCard path.
     pub agent_path: String,
     /// Agent endpoint path.
@@ -131,12 +172,18 @@ pub struct NacosHttpConfig {
 }
 
 impl NacosHttpConfig {
-    /// Configuration with the Nacos 3.x default paths.
-    pub fn new(base_url: impl Into<String>) -> Self {
+    /// Configuration for `namespace` with the Nacos 3.x default paths.
+    ///
+    /// `namespace` is required; pass [`DEFAULT_NAMESPACE`] for the Nacos default namespace.
+    pub fn new(base_url: impl Into<String>, namespace: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
             access_token: None,
-            namespace: None,
+            username: None,
+            password: None,
+            auth_path: "/v1/auth/login".to_string(),
+            token_refresh_ratio: DEFAULT_TOKEN_REFRESH_RATIO,
+            namespace: namespace.into(),
             agent_path: "/v1/ai/agent".to_string(),
             agent_endpoint_path: "/v1/ai/agent/endpoint".to_string(),
             prompt_path: "/v1/ai/prompt".to_string(),
@@ -144,17 +191,67 @@ impl NacosHttpConfig {
         }
     }
 
-    /// Sets the `accessToken` query parameter.
+    /// Sets the static `accessToken` query parameter.
     pub fn with_access_token(mut self, token: impl Into<String>) -> Self {
         self.access_token = Some(token.into());
         self
     }
 
-    /// Sets the namespace used by the mutating calls.
-    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
-        self.namespace = Some(namespace.into());
+    /// Configures the `username`/`password` pair used to log in and refresh the token.
+    ///
+    /// Mirrors the Nacos SDK, which logs in when the properties carry credentials.
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
         self
     }
+
+    /// Sets the namespace (overriding the one given to [`Self::new`]).
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self
+    }
+
+    /// Sets the early-refresh ratio applied to `tokenTtl` (clamped to `0.0..=1.0`).
+    pub fn with_token_refresh_ratio(mut self, ratio: f64) -> Self {
+        self.token_refresh_ratio = ratio;
+        self
+    }
+
+    /// Sets the login path.
+    pub fn with_auth_path(mut self, path: impl Into<String>) -> Self {
+        self.auth_path = path.into();
+        self
+    }
+
+    /// Whether a login can be attempted (both credential fields are set).
+    pub fn has_credentials(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
+    }
+}
+
+/// How long a freshly issued token is reused before it is refreshed early.
+///
+/// Kept as a free function so the 90% policy is unit-testable without sleeping.
+fn refresh_deadline(ttl: std::time::Duration, ratio: f64) -> std::time::Duration {
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_TOKEN_REFRESH_RATIO
+    };
+    ttl.mul_f64(ratio)
+}
+
+/// Cached credential-based access token (NACOS-03).
+#[derive(Default)]
+struct AuthState {
+    token: Option<String>,
+    /// Instant after which the token is refreshed early (ratio of `tokenTtl`).
+    refresh_at: Option<std::time::Instant>,
 }
 
 /// A prompt subscription kept by [`NacosHttpAiService`].
@@ -178,6 +275,8 @@ pub struct NacosHttpAiService {
     config: NacosHttpConfig,
     transport: Arc<dyn NacosHttpTransport>,
     subscriptions: Mutex<Subscriptions>,
+    /// Shared so [`NacosHttpAiService::for_namespace`] views reuse one login.
+    auth: Arc<Mutex<AuthState>>,
 }
 
 impl std::fmt::Debug for NacosHttpAiService {
@@ -195,6 +294,24 @@ impl NacosHttpAiService {
             config,
             transport,
             subscriptions: Mutex::new(Subscriptions::default()),
+            auth: Arc::new(Mutex::new(AuthState::default())),
+        }
+    }
+
+    /// A view of this service that addresses `namespace` instead of the configured one.
+    ///
+    /// This is the **method-level optional override** of NACOS-16: the returned service shares
+    /// the transport, the login cache and the configuration, but every request it builds
+    /// carries `namespaceId=<namespace>`. Its subscription bookkeeping is independent, so it
+    /// never mixes cards/prompts of two namespaces.
+    pub fn for_namespace(&self, namespace: impl Into<String>) -> NacosHttpAiService {
+        let mut config = self.config.clone();
+        config.namespace = namespace.into();
+        Self {
+            config,
+            transport: Arc::clone(&self.transport),
+            subscriptions: Mutex::new(Subscriptions::default()),
+            auth: Arc::clone(&self.auth),
         }
     }
 
@@ -268,16 +385,25 @@ impl NacosHttpAiService {
 
     // ---- internals ----
 
-    /// Builds a full URL with the query parameters (and the `accessToken`, when configured).
+    /// Builds a full URL with the query parameters plus the configured `namespaceId`.
+    ///
+    /// The `accessToken` is **not** part of this URL: it is injected per attempt by
+    /// [`Self::execute_with_token`], so a refreshed token is always the one sent.
     fn url(&self, path: &str, query: &[(&str, String)]) -> String {
+        self.build_url(path, query, true)
+    }
+
+    /// Builds a URL, optionally without the `namespaceId` (used by the auth endpoint, which is
+    /// namespace independent).
+    fn build_url(&self, path: &str, query: &[(&str, String)], with_namespace: bool) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         let mut pairs: Vec<String> = query
             .iter()
             .filter(|(_, value)| !value.is_empty())
             .map(|(key, value)| format!("{}={}", key, urlencode(value)))
             .collect();
-        if let Some(token) = &self.config.access_token {
-            pairs.push(format!("accessToken={}", urlencode(token)));
+        if with_namespace && !self.config.namespace.is_empty() {
+            pairs.push(format!("namespaceId={}", urlencode(&self.config.namespace)));
         }
         if pairs.is_empty() {
             format!("{base}{path}")
@@ -286,11 +412,120 @@ impl NacosHttpAiService {
         }
     }
 
+    /// Executes `request`, injecting the current access token.
+    ///
+    /// When credentials are configured and the server rejects the token (`401`/`403`), the
+    /// token is refreshed once and the original request is replayed — mirroring the Nacos SDK,
+    /// which re-authenticates on a token expiry rejection (NACOS-03).
     async fn send(&self, request: HttpRequest) -> AiServiceResult<HttpResponse> {
+        let token = self.access_token().await?;
+        let response = self.execute_with_token(&request, token.as_deref()).await?;
+        if matches!(response.status, 401 | 403) && self.config.has_credentials() {
+            warn!(status = response.status, "Nacos rejected the accessToken, logging in again");
+            self.invalidate_token();
+            if let Some(refreshed) = self.access_token().await? {
+                return self.execute_with_token(&request, Some(&refreshed)).await;
+            }
+        }
+        Ok(response)
+    }
+
+    /// Sends `request` with `accessToken` appended to its query string.
+    async fn execute_with_token(
+        &self,
+        request: &HttpRequest,
+        token: Option<&str>,
+    ) -> AiServiceResult<HttpResponse> {
+        let mut request = request.clone();
+        if let Some(token) = token.filter(|token| !token.is_empty()) {
+            request.url = append_query(&request.url, "accessToken", token);
+        }
         self.transport
             .execute(request)
             .await
-            .map_err(|e| AiServiceError::new(500, format!("nacos http transport failed: {e}")))
+            .map_err(|e| AiServiceError::transport(format!("nacos http transport failed: {e}")))
+    }
+
+    /// The access token to send: the cached/refreshed credential token when credentials are
+    /// configured, else the static [`NacosHttpConfig::access_token`].
+    async fn access_token(&self) -> AiServiceResult<Option<String>> {
+        if !self.config.has_credentials() {
+            return Ok(self.config.access_token.clone());
+        }
+        {
+            let guard = self.auth.lock().unwrap();
+            if let (Some(token), Some(refresh_at)) = (&guard.token, guard.refresh_at) {
+                if std::time::Instant::now() < refresh_at {
+                    return Ok(Some(token.clone()));
+                }
+            }
+        }
+        match self.login().await {
+            Ok((token, ttl)) => {
+                let refresh_at = std::time::Instant::now()
+                    + refresh_deadline(ttl, self.config.token_refresh_ratio);
+                let mut guard = self.auth.lock().unwrap();
+                guard.token = Some(token.clone());
+                guard.refresh_at = Some(refresh_at);
+                Ok(Some(token))
+            }
+            Err(error) => {
+                // Credential login is unavailable (auth disabled server-side, bad password,
+                // transport failure): fall back to the statically configured token.
+                warn!(error = %error, "Nacos login failed, falling back to the static accessToken");
+                self.invalidate_token();
+                Ok(self.config.access_token.clone())
+            }
+        }
+    }
+
+    /// Logs in through `/v1/auth/login`, returning `(accessToken, tokenTtl)`.
+    ///
+    /// Nacos answers `{"accessToken":"..","tokenTtl":18000,"globalAdmin":false}`; a missing
+    /// `tokenTtl` falls back to [`DEFAULT_TOKEN_TTL`] (the Nacos server default of 5 hours).
+    async fn login(&self) -> AiServiceResult<(String, std::time::Duration)> {
+        let url = self.build_url(
+            &self.config.auth_path,
+            &[
+                ("username", self.config.username.clone().unwrap_or_default()),
+                ("password", self.config.password.clone().unwrap_or_default()),
+            ],
+            false,
+        );
+        // Nacos reads `username`/`password` from the (query) parameters; a body-less POST keeps
+        // the request compatible with instances that only accept form/query credentials.
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            url,
+            body: None,
+            content_type: None,
+        };
+        let response = self.execute_with_token(&request, None).await?;
+        if !response.is_success() {
+            return Err(error_from_response(&response));
+        }
+        let value: Value = serde_json::from_slice(&response.body)
+            .map_err(|e| AiServiceError::serde(format!("invalid nacos login response: {e}")))?;
+        let value = unwrap_envelope(value)?;
+        let token = value
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| AiServiceError::serde("nacos login response carried no accessToken"))?;
+        let ttl = value
+            .get("tokenTtl")
+            .and_then(Value::as_f64)
+            .filter(|ttl| *ttl > 0.0)
+            .map(std::time::Duration::from_secs_f64)
+            .unwrap_or(DEFAULT_TOKEN_TTL);
+        Ok((token.to_string(), ttl))
+    }
+
+    /// Drops the cached credential token so the next call logs in again.
+    fn invalidate_token(&self) {
+        let mut guard = self.auth.lock().unwrap();
+        guard.token = None;
+        guard.refresh_at = None;
     }
 
     /// Runs a `GET` and returns the (envelope-unwrapped) JSON body.
@@ -302,10 +537,9 @@ impl NacosHttpAiService {
         if !response.is_success() {
             return Err(error_from_response(&response));
         }
-        let value: Value = serde_json::from_slice(&response.body).map_err(|e| {
-            AiServiceError::new(500, format!("invalid nacos response: {e}"))
-        })?;
-        Ok(Some(unwrap_envelope(value)))
+        let value: Value = serde_json::from_slice(&response.body)
+            .map_err(|e| AiServiceError::serde(format!("invalid nacos response: {e}")))?;
+        Ok(Some(unwrap_envelope(value)?))
     }
 
     async fn fetch_agent_card(
@@ -323,9 +557,8 @@ impl NacosHttpAiService {
         let Some(value) = self.get_json(url).await? else {
             return Ok(None);
         };
-        let card = serde_json::from_value::<NacosAgentCard>(value).map_err(|e| {
-            AiServiceError::new(500, format!("invalid agent card payload: {e}"))
-        })?;
+        let card = serde_json::from_value::<NacosAgentCard>(value)
+            .map_err(|e| AiServiceError::serde(format!("invalid agent card payload: {e}")))?;
         Ok(Some(card))
     }
 
@@ -359,21 +592,12 @@ impl NacosAiService for NacosHttpAiService {
     ) -> AiServiceResult<()> {
         let url = self.url(
             &self.config.agent_path,
-            &[
-                ("setAsLatest", set_as_latest.to_string()),
-                (
-                    "namespaceId",
-                    self.config.namespace.clone().unwrap_or_default(),
-                ),
-            ],
+            &[("setAsLatest", set_as_latest.to_string())],
         );
         let body = serde_json::to_vec(card)
             .map_err(|e| AiServiceError::new(AiServiceError::INVALID_PARAM, e.to_string()))?;
         let response = self.send(HttpRequest::post_json(url, body)).await?;
-        if !response.is_success() {
-            return Err(error_from_response(&response));
-        }
-        Ok(())
+        check_write_response(&response)
     }
 
     async fn register_agent_endpoint(
@@ -383,21 +607,12 @@ impl NacosAiService for NacosHttpAiService {
     ) -> AiServiceResult<()> {
         let url = self.url(
             &self.config.agent_endpoint_path,
-            &[
-                ("agentName", agent_name.to_string()),
-                (
-                    "namespaceId",
-                    self.config.namespace.clone().unwrap_or_default(),
-                ),
-            ],
+            &[("agentName", agent_name.to_string())],
         );
         let body = serde_json::to_vec(endpoint)
             .map_err(|e| AiServiceError::new(AiServiceError::INVALID_PARAM, e.to_string()))?;
         let response = self.send(HttpRequest::post_json(url, body)).await?;
-        if !response.is_success() {
-            return Err(error_from_response(&response));
-        }
-        Ok(())
+        check_write_response(&response)
     }
 
     async fn get_agent_card(
@@ -499,18 +714,48 @@ impl NacosHttpAiService {
 }
 
 /// Unwraps the Nacos `{"code":0,"data":...}` envelope (bare payloads pass through).
-fn unwrap_envelope(value: Value) -> Value {
+///
+/// A non-zero `code` is a Nacos **business** rejection: Nacos answers `HTTP 200` in that case,
+/// so it must be turned into an error here, otherwise a refused write would look successful and
+/// a refused read would be misreported as a decode failure (NACOS-11).
+fn unwrap_envelope(value: Value) -> AiServiceResult<Value> {
     match value {
         Value::Object(mut map) => {
-            let has_code = map.contains_key("code") || map.contains_key("success");
-            if has_code {
+            let code = map.get("code").and_then(Value::as_i64);
+            if let Some(code) = code.filter(|code| *code != 0) {
+                let message = map
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("nacos business error {code}"));
+                return Err(AiServiceError::new(code, message));
+            }
+            let has_envelope = code.is_some() || map.contains_key("success");
+            if has_envelope {
                 if let Some(data) = map.remove("data") {
-                    return data;
+                    return Ok(data);
                 }
             }
-            Value::Object(map)
+            Ok(Value::Object(map))
         }
-        other => other,
+        other => Ok(other),
+    }
+}
+
+/// Validates a mutating response: a success status *and* a non-error envelope.
+///
+/// A plain-text acknowledgement (`ok`) is accepted, mirroring the Nacos v1 endpoints that
+/// answer without a JSON body (NACOS-11).
+fn check_write_response(response: &HttpResponse) -> AiServiceResult<()> {
+    if !response.is_success() {
+        return Err(error_from_response(response));
+    }
+    if response.body.is_empty() {
+        return Ok(());
+    }
+    match serde_json::from_slice::<Value>(&response.body) {
+        Ok(value) => unwrap_envelope(value).map(|_| ()),
+        Err(_) => Ok(()),
     }
 }
 
@@ -531,22 +776,34 @@ fn parse_prompt(value: &Value) -> Option<NacosPrompt> {
     })
 }
 
-/// Maps an error response onto [`AiServiceError`], preserving a Nacos `code`/`message` body.
+/// Maps an error response onto [`AiServiceError`].
+///
+/// A Nacos error envelope keeps its business `code`/`message` ([`AiServiceError::Business`]);
+/// a bare status answer becomes [`AiServiceError::Http`] so the caller can tell a retryable
+/// 5xx from a business rejection.
 fn error_from_response(response: &HttpResponse) -> AiServiceError {
     let text = response.text();
     let parsed: Option<Value> = serde_json::from_str(&text).ok();
-    let code = parsed
-        .as_ref()
-        .and_then(|v| v.get("code"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(i64::from(response.status));
     let message = parsed
         .as_ref()
         .and_then(|v| v.get("message"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| text.trim().to_string());
-    AiServiceError::new(code, message)
+    match parsed
+        .as_ref()
+        .and_then(|v| v.get("code"))
+        .and_then(Value::as_i64)
+    {
+        Some(code) => AiServiceError::new(code, message),
+        None => AiServiceError::http(response.status, message),
+    }
+}
+
+/// Appends one query parameter to `url`.
+fn append_query(url: &str, key: &str, value: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{key}={}", urlencode(value))
 }
 
 /// Percent-encodes a query value (RFC 3986 unreserved characters pass through).
@@ -611,7 +868,8 @@ mod tests {
 
     fn service(transport: Arc<FakeTransport>) -> NacosHttpAiService {
         NacosHttpAiService::new(
-            NacosHttpConfig::new("http://nacos:8848/nacos/").with_access_token("tok en"),
+            NacosHttpConfig::new("http://nacos:8848/nacos/", "public")
+                .with_access_token("tok en"),
             transport,
         )
     }
@@ -634,7 +892,7 @@ mod tests {
         assert_eq!(card.name, "remote");
         assert_eq!(
             transport.requests()[0].url,
-            "http://nacos:8848/nacos/v1/ai/agent?agentName=remote&version=1.2&accessToken=tok%20en"
+            "http://nacos:8848/nacos/v1/ai/agent?agentName=remote&version=1.2&namespaceId=public&accessToken=tok%20en"
         );
     }
 
@@ -647,7 +905,7 @@ mod tests {
         let service = service(Arc::clone(&transport));
         assert!(service.get_agent_card("missing", None).await.unwrap().is_none());
         let error = service.get_agent_card("broken", None).await.unwrap_err();
-        assert!(error.message.contains("invalid agent card payload"));
+        assert!(error.message().contains("invalid agent card payload"));
     }
 
     #[tokio::test]
@@ -676,7 +934,7 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(
             request.url,
-            "http://nacos:8848/nacos/v1/ai/agent?setAsLatest=true&accessToken=tok%20en"
+            "http://nacos:8848/nacos/v1/ai/agent?setAsLatest=true&namespaceId=public&accessToken=tok%20en"
         );
         assert_eq!(request.content_type.as_deref(), Some("application/json"));
         let posted: NacosAgentCard = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
@@ -692,8 +950,9 @@ mod tests {
         let service = service(Arc::clone(&transport));
         let card = NacosAgentCard::new("local", "http://agent:9000");
         let error = service.release_agent_card(&card, false).await.unwrap_err();
-        assert_eq!(error.code, 12001);
-        assert_eq!(error.message, "invalid param");
+        assert_eq!(error.code(), 12001);
+        assert_eq!(error.message(), "invalid param");
+        assert!(matches!(error, AiServiceError::Business { code: 12001, .. }));
     }
 
     #[tokio::test]
@@ -839,12 +1098,231 @@ mod tests {
     fn urls_skip_blank_parameters() {
         let transport = FakeTransport::new(vec![]);
         let service = NacosHttpAiService::new(
-            NacosHttpConfig::new("http://nacos:8848/nacos").with_namespace("dev"),
+            NacosHttpConfig::new("http://nacos:8848/nacos", "dev"),
             transport,
         );
         assert_eq!(
             service.url("/v1/ai/prompt", &[("promptKey", "k".into()), ("label", String::new())]),
-            "http://nacos:8848/nacos/v1/ai/prompt?promptKey=k"
+            "http://nacos:8848/nacos/v1/ai/prompt?promptKey=k&namespaceId=dev"
         );
+    }
+
+    /// NACOS-04: the read paths (card / prompt / skill) address the configured namespace too.
+    #[tokio::test]
+    async fn read_paths_carry_the_configured_namespace() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, "{\"template\":\"hi\"}"),
+            HttpResponse::new(200, vec![0x50, 0x4b]),
+        ]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "dev"),
+            transport.clone(),
+        );
+        let listener: PromptListener = Arc::new(|_, _| {});
+        service.get_agent_card("remote", None).await.unwrap();
+        service
+            .subscribe_prompt("greeting", None, None, listener)
+            .await
+            .unwrap();
+        service.download_skill_zip("calc").await.unwrap();
+
+        for request in transport.requests() {
+            assert!(
+                request.url.contains("namespaceId=dev"),
+                "missing namespaceId in {}",
+                request.url
+            );
+        }
+    }
+
+    /// NACOS-04/16: an empty namespace means "server default" and is omitted.
+    #[tokio::test]
+    async fn an_empty_namespace_is_omitted_from_the_query() {
+        let transport = FakeTransport::new(vec![HttpResponse::new(200, card_json("remote"))]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", ""),
+            transport.clone(),
+        );
+        service.get_agent_card("remote", None).await.unwrap();
+        assert!(!transport.requests()[0].url.contains("namespaceId"));
+    }
+
+    /// NACOS-16: a scoped view addresses another namespace over the same transport.
+    #[tokio::test]
+    async fn a_scoped_service_addresses_another_namespace() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let parent = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "dev"),
+            transport.clone(),
+        );
+        let scoped = parent.for_namespace("staging");
+        scoped.get_agent_card("remote", None).await.unwrap();
+        parent.get_agent_card("remote", None).await.unwrap();
+
+        let requests = transport.requests();
+        assert!(requests[0].url.contains("namespaceId=staging"));
+        assert!(requests[1].url.contains("namespaceId=dev"));
+    }
+
+    /// A Nacos login payload (`tokenTtl` in seconds, like the server).
+    fn login_json(token: &str) -> String {
+        format!("{{\"accessToken\":\"{token}\",\"tokenTtl\":18000}}")
+    }
+
+    fn credential_service(
+        transport: Arc<FakeTransport>,
+        username: &str,
+        password: &str,
+    ) -> NacosHttpAiService {
+        NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_credentials(username, password),
+            transport,
+        )
+    }
+
+    /// NACOS-03: credentials log in through `/v1/auth/login`; the token is then reused.
+    #[tokio::test]
+    async fn credentials_log_in_once_and_the_token_is_reused() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, login_json("t1")),
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let service = credential_service(Arc::clone(&transport), "nacos", "s3cret");
+        service.get_agent_card("remote", None).await.unwrap();
+        service.get_agent_card("remote", None).await.unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3, "one login for two calls: {requests:?}");
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].url,
+            "http://nacos:8848/nacos/v1/auth/login?username=nacos&password=s3cret"
+        );
+        assert!(requests[1].url.ends_with("accessToken=t1"));
+        assert!(requests[2].url.ends_with("accessToken=t1"));
+    }
+
+    /// NACOS-03: a rejected token triggers exactly one re-login and the request is replayed.
+    #[tokio::test]
+    async fn a_rejected_token_is_renewed_once_and_the_request_replayed() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, login_json("t1")),
+            HttpResponse::new(401, "{\"code\":403,\"message\":\"token expired\"}"),
+            HttpResponse::new(200, login_json("t2")),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let service = credential_service(Arc::clone(&transport), "nacos", "s3cret");
+        let card = service
+            .get_agent_card("remote", None)
+            .await
+            .unwrap()
+            .expect("a card");
+        assert_eq!(card.name, "remote");
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4, "login, 401, re-login, replay: {requests:?}");
+        assert!(requests[1].url.ends_with("accessToken=t1"));
+        assert!(requests[2].url.contains("/v1/auth/login"));
+        assert!(requests[3].url.ends_with("accessToken=t2"));
+    }
+
+    /// NACOS-03: a token is refreshed at 90% of its TTL (no sleeping needed for the policy).
+    #[test]
+    fn the_refresh_deadline_is_ninety_percent_of_the_ttl() {
+        assert_eq!(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public").token_refresh_ratio,
+            DEFAULT_TOKEN_REFRESH_RATIO
+        );
+        let deadline = refresh_deadline(std::time::Duration::from_secs(18_000), 0.9);
+        assert!((deadline.as_secs_f64() - 16_200.0).abs() < 0.001, "{deadline:?}");
+        // A non-finite ratio falls back to the default instead of producing a bogus deadline.
+        assert_eq!(
+            refresh_deadline(std::time::Duration::from_secs(10), f64::NAN),
+            std::time::Duration::from_secs(9)
+        );
+    }
+
+    /// NACOS-03: with a ratio of 0 the cached token is due immediately, so each call re-logs in.
+    #[tokio::test]
+    async fn an_expired_token_is_refreshed_before_the_request() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, login_json("t1")),
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, login_json("t2")),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_credentials("nacos", "s3cret")
+                .with_token_refresh_ratio(0.0),
+            transport.clone(),
+        );
+        service.get_agent_card("remote", None).await.unwrap();
+        service.get_agent_card("remote", None).await.unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].url.ends_with("accessToken=t1"));
+        assert!(requests[3].url.ends_with("accessToken=t2"));
+    }
+
+    /// NACOS-03: when the login itself fails, the static token is used.
+    #[tokio::test]
+    async fn a_failed_login_falls_back_to_the_static_token() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(500, "auth is disabled"),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let service = NacosHttpAiService::new(
+            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_credentials("nacos", "s3cret")
+                .with_access_token("static"),
+            transport.clone(),
+        );
+        service.get_agent_card("remote", None).await.unwrap();
+
+        let requests = transport.requests();
+        assert!(requests[0].url.contains("/v1/auth/login"));
+        assert!(requests[1].url.ends_with("accessToken=static"));
+    }
+
+    /// NACOS-11: a `200` carrying a business error code is a failure on read and on write.
+    #[tokio::test]
+    async fn a_business_error_code_in_a_success_response_is_an_error() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, "{\"code\":300,\"message\":\"agent exists\"}"),
+            HttpResponse::new(200, "{\"code\":404,\"message\":\"no such agent\"}"),
+        ]);
+        let service = service(Arc::clone(&transport));
+        let card = NacosAgentCard::new("local", "http://agent:9000");
+        let write = service.release_agent_card(&card, false).await.unwrap_err();
+        assert_eq!(write.code(), 300);
+        assert_eq!(write.message(), "agent exists");
+
+        let read = service.get_agent_card("missing", None).await.unwrap_err();
+        assert_eq!(read.code(), 404);
+        assert!(read.is_not_found());
+    }
+
+    /// NACOS-15: the error kind drives the retry decision.
+    #[test]
+    fn the_error_kind_drives_the_retry_decision() {
+        assert!(AiServiceError::transport("timeout").is_retryable());
+        assert!(AiServiceError::http(503, "unavailable").is_retryable());
+        assert!(AiServiceError::http(429, "slow down").is_retryable());
+        assert!(!AiServiceError::http(404, "gone").is_retryable());
+        assert!(!AiServiceError::new(300, "agent exists").is_retryable());
+        assert!(!AiServiceError::serde("bad json").is_retryable());
+
+        assert_eq!(AiServiceError::transport("timeout").code(), 500);
+        assert_eq!(AiServiceError::http(503, "unavailable").code(), 503);
+        assert!(AiServiceError::http(404, "gone").is_not_found());
+        assert!(AiServiceError::new(AiServiceError::NOT_FOUND, "gone").is_not_found());
     }
 }

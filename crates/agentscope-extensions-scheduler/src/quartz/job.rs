@@ -129,18 +129,36 @@ pub(crate) fn spawn_job(
                     if task.is_paused() {
                         continue;
                     }
+                    // The slot is the planned fire instant, so two nodes that share
+                    // the schedule derive the same lock key for the same occurrence.
+                    let slot = format!("cron:{}", next.timestamp_millis());
                     // A CRON trigger keeps firing after an interrupt (only the
                     // FIXED_DELAY chain is rescheduled in Java).
-                    let _ = fire(&task).await;
+                    let _ = fire(&ctx, &task, &slot).await;
                 }
             }
             ScheduleMode::FIXED_RATE => {
                 let period = Duration::from_millis(schedule_config.fixed_rate().unwrap_or(1));
+                let period_ms = period.as_millis().max(1) as i64;
                 let mut ticker = tokio::time::interval(period);
-                // First tick fires immediately; consume it so we honour the
-                // "start after initial delay" semantics.
+                // Tokio's first tick is immediate. Consuming it must **not** push the
+                // first firing out by a whole period: Quartz starts the trigger at
+                // `now + initialDelay` (already slept above) and repeats every period
+                // afterwards. So the loop fires first and waits for the next tick after.
                 ticker.tick().await;
                 loop {
+                    if task.is_cancelled() {
+                        return;
+                    }
+                    task.wait_if_paused().await;
+                    if task.is_cancelled() {
+                        return;
+                    }
+                    // FIXED_RATE has no shared start instant across instances, so the
+                    // slot is the wall-clock period bucket: occurrences that fall in
+                    // the same period share one lock key.
+                    let slot = format!("rate:{}", Utc::now().timestamp_millis() / period_ms);
+                    let _ = fire(&ctx, &task, &slot).await;
                     // Only the wait for the next tick is raced against cancel: an
                     // execution in flight is never dropped, so `shutdown(true)` /
                     // `deleteJob` (which never interrupt a running job in Java) can
@@ -149,14 +167,6 @@ pub(crate) fn spawn_job(
                         _ = ticker.tick() => {}
                         _ = task.cancelled() => return,
                     }
-                    if task.is_cancelled() {
-                        return;
-                    }
-                    task.wait_if_paused().await;
-                    if task.is_cancelled() {
-                        return;
-                    }
-                    let _ = fire(&task).await;
                 }
             }
             ScheduleMode::FIXED_DELAY => {
@@ -171,7 +181,10 @@ pub(crate) fn spawn_job(
                     }
                     // `AgentQuartzJob` skips `rescheduleNextFixedDelay` when the
                     // job was interrupted during the run, which stops the chain.
-                    if fire(&task).await {
+                    // FIXED_DELAY has no shared schedule, so the slot is the
+                    // wall-clock instant of this firing.
+                    let slot = format!("delay:{}", Utc::now().timestamp_millis());
+                    if fire(&ctx, &task, &slot).await {
                         tracing::info!(
                             task = %task.name(),
                             "fixed-delay task interrupted; skipping reschedule"
@@ -189,15 +202,45 @@ pub(crate) fn spawn_job(
 }
 
 /// Fires one execution; returns `true` when the execution was interrupted.
-async fn fire(task: &Arc<QuartzScheduleAgentTask>) -> bool {
-    match task.execute().await {
+///
+/// Two host seams run before the execution itself:
+/// * [`crate::common::scheduler::SchedulerLock`] (SCHED-05) — a denied slot means
+///   another instance owns this firing, so nothing runs here;
+/// * the scheduler-wide semaphore (SCHED-09) — a firing waits for a permit, the
+///   way a Quartz trigger waits for a worker thread.
+async fn fire(ctx: &JobContext, task: &Arc<QuartzScheduleAgentTask>, slot: &str) -> bool {
+    let lock_key = format!("{}:{}:{slot}", ctx.scheduler_id, task.name());
+    if !ctx.lock.try_acquire(&lock_key).await {
+        tracing::debug!(
+            task = %task.name(),
+            slot = %slot,
+            "another instance owns this firing slot; skipping"
+        );
+        return false;
+    }
+
+    // A cancel while waiting for a permit must not leave the lock behind.
+    let permit = tokio::select! {
+        biased;
+        _ = task.cancelled() => None,
+        permit = ctx.semaphore.acquire() => permit.ok(),
+    };
+    let Some(permit) = permit else {
+        ctx.lock.release(&lock_key).await;
+        return true;
+    };
+
+    let interrupted = match task.execute().await {
         Ok(_) => false,
         Err(Error::Interrupted(_)) => true,
         Err(e) => {
             tracing::warn!(task = %task.name(), error = %e, "scheduled execution failed");
             false
         }
-    }
+    };
+    drop(permit);
+    ctx.lock.release(&lock_key).await;
+    interrupted
 }
 
 #[cfg(test)]

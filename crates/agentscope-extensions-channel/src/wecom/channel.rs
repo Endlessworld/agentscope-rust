@@ -43,6 +43,9 @@ use crate::common::{
 };
 
 /// Typed registry of `WeComChannel` handles, keyed by `channel_id`.
+/// Channel type name, mirroring `WeComChannel.TYPE` (the `agentscope.json#channels[*].type` key).
+pub const CHANNEL_TYPE: &str = "wecom";
+
 pub type WeComChannelRegistry = ChannelRegistry<WeComChannel>;
 
 /// Result of a callback request, decoupled from any web framework so the controller stays a thin

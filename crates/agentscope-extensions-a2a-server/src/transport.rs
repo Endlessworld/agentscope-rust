@@ -377,13 +377,16 @@ impl TransportWrapper for JsonRpcTransportWrapper {
 /// Whether a JSON-RPC method is answered with a stream of responses.
 ///
 /// Mirrors Java `JsonRpcTransportWrapper#handleStreamRequest`, which accepts both
-/// `message/stream` and `tasks/resubscribe`. **Deviation**: only `message/stream` streams here.
-/// Java can honor a resubscribe because the SDK keeps a per-task event queue; this handler has no
-/// queue (each run's events are relayed once, then recorded as artifacts), so `tasks/resubscribe`
-/// would have to re-run the agent. It therefore stays a non-streaming method and answers
-/// `-32601` (`dispatch` has no arm for it).
+/// `SendStreamingMessage` (`message/stream`) and `SubscribeToTask` (`tasks/resubscribe`).
+/// **Deviation**: only the streaming message methods stream here — Java can honor a resubscribe
+/// because the SDK keeps a per-task event queue; this handler has no queue (each run's events are
+/// relayed once, then recorded as artifacts), so `SubscribeToTask` would have to re-run the agent.
+/// It therefore stays a non-streaming method and answers `-32601` (`dispatch` has no arm for it).
 pub fn is_streaming_method(method: &str) -> bool {
-    matches!(method, methods::MESSAGE_STREAM)
+    matches!(
+        method,
+        methods::MESSAGE_STREAM | methods::LEGACY_MESSAGE_STREAM
+    )
 }
 
 /// Serializes a response, falling back to an internal error if it cannot be encoded.
@@ -600,6 +603,7 @@ mod tests {
     #[test]
     fn streaming_method_detection_matches_the_a2a_methods() {
         assert!(is_streaming_method(methods::MESSAGE_STREAM));
+        assert!(is_streaming_method(methods::LEGACY_MESSAGE_STREAM));
         assert!(!is_streaming_method(methods::MESSAGE_SEND));
         // No per-task event queue: resubscribe would have to re-run the agent, so it stays a
         // non-streaming (unsupported) method rather than silently starting a second run.
@@ -660,7 +664,8 @@ mod tests {
     fn send_helpers_parse_a_raw_jsonrpc_body() {
         // Guards the fixtures above: a malformed body would make the tests vacuous.
         let request: JsonRpcRequest = serde_json::from_str(&send_body()).unwrap();
-        assert_eq!(request.method, methods::MESSAGE_SEND);
+        // The fixture is deliberately a 0.3 body: the server still answers the legacy method name.
+        assert_eq!(request.method, methods::LEGACY_MESSAGE_SEND);
         let message = Message::new("m", MessageRole::User, vec![Part::text("hi")]);
         assert_eq!(message.parts.len(), 1);
         assert_eq!(AgentEventType::AgentStart.wire_name(), "AGENT_START");

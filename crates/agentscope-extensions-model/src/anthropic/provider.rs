@@ -11,6 +11,7 @@ use agentscope_core::{Error, Model, ModelCreationContext, ModelProvider, Result}
 
 use crate::anthropic::credential::AnthropicCredential;
 use crate::anthropic::model::{default_transport, AnthropicChatModel};
+use crate::common::SharedTransport;
 
 /// Provider id used in `provider:model` ids.
 pub const PROVIDER_ID: &str = "anthropic";
@@ -20,6 +21,12 @@ pub const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 
 /// Context option carrying a bearer token for compatible gateways.
 pub const OPTION_AUTH_TOKEN: &str = "authToken";
+
+/// Context option overriding the reported context window size.
+pub const OPTION_CONTEXT_WINDOW_SIZE: &str = "contextWindowSize";
+
+/// Context option carrying the prompt-cache TTL (e.g. `"1h"`).
+pub const OPTION_CACHE_TTL: &str = "cacheTtl";
 
 /// Provider plugin that builds [`AnthropicChatModel`] instances.
 #[derive(Debug, Default, Clone, Copy)]
@@ -72,6 +79,31 @@ impl ModelProvider for AnthropicModelProvider {
                 ctx.model
             )));
         }
+        let model = self.create_with_transport(ctx, default_transport())?;
+        Ok(Arc::new(model))
+    }
+}
+
+impl AnthropicModelProvider {
+    /// Builds the concrete [`AnthropicChatModel`] for `ctx` on top of `transport`.
+    ///
+    /// Unlike [`ModelProvider::create`] this does **not** re-check the model-id
+    /// claim: it is the construction entry used by hosts that dispatch on the
+    /// wire protocol (see [`crate::assembly`]), where the protocol — not the
+    /// model id — already selected this implementation. That matters for
+    /// Anthropic-compatible gateways whose model ids are not `claude*`.
+    pub fn create_with_transport(
+        &self,
+        ctx: ModelCreationContext,
+        transport: SharedTransport,
+    ) -> Result<AnthropicChatModel> {
+        let model_name = Self::strip_prefix(&ctx.model).to_string();
+        if model_name.is_empty() {
+            return Err(Error::Model(format!(
+                "Unsupported Anthropic model id: {}",
+                ctx.model
+            )));
+        }
 
         let auth_token = ctx
             .options
@@ -89,35 +121,36 @@ impl ModelProvider for AnthropicModelProvider {
         let context_window_size = ctx
             .options
             .additional_body_params
-            .get("contextWindowSize")
+            .get(OPTION_CONTEXT_WINDOW_SIZE)
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
         let cache_ttl = ctx
             .options
             .additional_body_params
-            .get("cacheTtl")
+            .get(OPTION_CACHE_TTL)
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // Provider knobs are consumed here and must not be replayed as wire
+        // fields: Anthropic rejects unknown top-level body keys with HTTP 400
+        // (MODEL-09).
+        let mut default_options = ctx.options.clone();
+        for key in [OPTION_AUTH_TOKEN, OPTION_CACHE_TTL, OPTION_CONTEXT_WINDOW_SIZE] {
+            default_options.additional_body_params.remove(key);
+        }
 
         let base_url = crate::common::resolve_base_url(
             ctx.base_url.clone(),
             BASE_URL_ENV,
             crate::anthropic::credential::DEFAULT_BASE_URL,
         );
-        let mut model = AnthropicChatModel::new(
-            model_name,
-            auth_mode,
-            secret,
-            Some(base_url),
-            default_transport(),
-        )
-        .with_default_options(ctx.options.clone())
-        .with_stream(ctx.stream.unwrap_or(true))
-        .with_context_window_size(context_window_size);
+        let mut model = AnthropicChatModel::new(model_name, auth_mode, secret, Some(base_url), transport)
+            .with_default_options(default_options)
+            .with_stream(ctx.stream.unwrap_or(true))
+            .with_context_window_size(context_window_size);
         if let Some(ttl) = cache_ttl {
             model = model.with_cache_ttl(ttl);
         }
-        Ok(Arc::new(model))
+        Ok(model)
     }
 }
 

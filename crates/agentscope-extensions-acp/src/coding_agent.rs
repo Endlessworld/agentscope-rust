@@ -766,13 +766,16 @@ impl AcpCodingAgent {
                 async move |req: CloseSessionRequest, responder, _cx| {
                     let sid = req.session_id;
                     if let Some(session) = a_close.get_session(&sid) {
-                        // Cancel the in-flight prompt, wait for its run to release the journal,
-                        // and mark the session closed so a prompt that finishes later cannot
-                        // re-insert it into the registry.
+                        // Mark the session closed *first*: a prompt that finishes later must
+                        // not re-insert it into the registry, and a turn stuck on a provider
+                        // that never answers must stop at once instead of waiting out the
+                        // settle grace (the closed flag short-circuits that wait).
+                        session.close();
+                        // Then let the cancelled run release the journal before the session
+                        // leaves the registry.
                         let _ = session
                             .cancel_and_wait(std::time::Duration::from_secs(15))
                             .await;
-                        session.close();
                     }
                     a_close.remove_session(&sid);
                     responder.respond(CloseSessionResponse::new())
@@ -789,7 +792,7 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: LoadSessionRequest, responder, _cx| {
+                async move |req: LoadSessionRequest, responder, cx| {
                     let sid = req.session_id;
                     let session = match a_load.get_session(&sid) {
                         Some(s) => s,
@@ -813,6 +816,13 @@ impl AcpCodingAgent {
                     }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
+                    // ACP v1 `loadSession` requires the agent to replay the whole conversation
+                    // before answering: the client has no state for this session, so it renders
+                    // exactly the `session/update`s that arrive. Without this the IDE showed an
+                    // empty transcript while the agent still answered with the full context.
+                    for notification in session.replay_notifications().await {
+                        let _ = cx.send_notification(notification);
+                    }
                     let response = LoadSessionResponse::new()
                         .modes(modes)
                         .config_options(config_options);

@@ -828,17 +828,13 @@ fn build_model(
 /// wire protocol. `base_url` always stops at the version prefix (e.g.
 /// `https://opencode.ai/zen/go/v1`); the protocol decides the endpoint suffix.
 fn build_model_for_protocol(ctx: &ModelCreationContext) -> Result<Arc<dyn Model>, String> {
-    let model = match ctx.protocol {
-        ApiProtocol::ChatCompletions => OpenAiChatModel::from_context(ctx)
-            .map(|m| Arc::new(m) as Arc<dyn Model>)
-            .map_err(|e| e.to_string())?,
-        ApiProtocol::Responses => OpenAiResponsesModel::from_context(ctx)
-            .map(|m| Arc::new(m) as Arc<dyn Model>)
-            .map_err(|e| e.to_string())?,
-        ApiProtocol::Messages => AnthropicMessagesModel::from_context(ctx)
-            .map(|m| Arc::new(m) as Arc<dyn Model>)
-            .map_err(|e| e.to_string())?,
-    };
+    // MODEL-01: the protocol→implementation mapping lives in the model crate's
+    // `assembly` seam, so the host and the providers cannot drift apart.
+    let model = agentscope_extensions_model::assembly::build_model_for_protocol(
+        ctx,
+        agentscope_extensions_model::assembly::ProtocolImplementations::new(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(match &ctx.catalog {
         Some(descriptor) => CatalogAwareModel::from_descriptor(model, Arc::clone(descriptor)),
         None => CatalogAwareModel::wrap(

@@ -11,7 +11,7 @@ agentscope-harness = { path = "../agentscope-harness" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing = { workspace = true }
 # --- Real COS backend (Java: `com.qcloud:cos_api` -> hand-written REST client) ---
 # The official Java SDK bundles the HTTP layer and the v5 signature algorithm; the

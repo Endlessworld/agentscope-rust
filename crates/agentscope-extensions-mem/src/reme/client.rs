@@ -106,12 +106,15 @@ impl ReMeClient {
         vec![("Content-Type".to_string(), "application/json".to_string())]
     }
 
-    async fn post(&self, endpoint: &str, body: &str) -> Result<String> {
+    /// POSTs `body` to `endpoint`, tagging a non-2xx failure with the Java vendor and
+    /// operation names (`ReMeClient#executePost`).
+    async fn post(&self, operation: &'static str, endpoint: &str, body: &str) -> Result<String> {
         let url = format!("{}{}", self.api_base_url, endpoint);
         let raw = self
             .transport
             .post_json(&url, &Self::headers(), body)
-            .await?;
+            .await
+            .map_err(|err| err.with_context("ReMe", operation))?;
         // Java returns an empty response object for null/blank bodies.
         if raw.trim().is_empty() {
             return Ok("{}".to_string());
@@ -122,14 +125,14 @@ impl ReMeClient {
     /// Adds memories: `POST /summary_personal_memory`.
     pub async fn add(&self, request: &ReMeAddRequest) -> Result<ReMeAddResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post(SUMMARY_ENDPOINT, &body).await?;
+        let raw = self.post("summary_personal_memory", SUMMARY_ENDPOINT, &body).await?;
         Ok(parse_or_default::<ReMeAddResponse>(&raw)?)
     }
 
     /// Searches memories: `POST /retrieve_personal_memory`.
     pub async fn search(&self, request: &ReMeSearchRequest) -> Result<ReMeSearchResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post(RETRIEVE_ENDPOINT, &body).await?;
+        let raw = self.post("retrieve_personal_memory", RETRIEVE_ENDPOINT, &body).await?;
         Ok(parse_or_default::<ReMeSearchResponse>(&raw)?)
     }
 }
@@ -221,5 +224,33 @@ mod tests {
             .unwrap()
             .metrics()
             .is_none());
+    }
+
+    /// MEM-02: the ReMe client uses Java's endpoint-derived operation names
+    /// (`ReMeClient#add` / `#search`).
+    #[tokio::test]
+    async fn http_failures_name_the_vendor_and_the_operation() {
+        let mock = MockTransport::new();
+        mock.push_response(Err(MemError::http_status(401, "unauthorized")));
+        let client =
+            ReMeClient::with_transport(Arc::new(mock.clone()), "https://reme.test").unwrap();
+        let err = client
+            .add(&ReMeAddRequest::new("ws", Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ReMe API summary_personal_memory failed with status 401: unauthorized"
+        );
+
+        mock.push_response(Err(MemError::http_status(503, "busy")));
+        let err = client
+            .search(&ReMeSearchRequest::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ReMe API retrieve_personal_memory failed with status 503: busy"
+        );
     }
 }

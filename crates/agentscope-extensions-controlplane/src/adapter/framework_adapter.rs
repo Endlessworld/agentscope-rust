@@ -83,7 +83,10 @@ pub trait FrameworkAdapter: Send + Sync {
     ) -> ControlPlaneResult<()>;
 
     /// Removes the interception and restores the framework object.
-    fn detach(&mut self) -> ControlPlaneResult<()>;
+    ///
+    /// Takes `&self` rather than `&mut self` so the contract HTTP server's provider handle can
+    /// share the adapter with the bridge (mirrors Java `FrameworkAdapter.detach()`).
+    fn detach(&self) -> ControlPlaneResult<()>;
 
     /// Called when the owning bridge is attached, so the adapter can obtain a reporter
     /// handle for publishing events out-of-band. Default: no-op.
@@ -129,6 +132,84 @@ pub trait FrameworkAdapter: Send + Sync {
             "{CAP_SESSION_COMMAND}:{command}"
         )))
     }
+
+    // ─── optional operations added for Java `FrameworkAdapter` parity ───
+
+    /// Known workspaces (`GET /agentscope/workspaces`, capability `workspace-inventory`).
+    async fn list_workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        Err(ControlPlaneError::Unsupported(
+            CAP_WORKSPACE_INVENTORY.to_string(),
+        ))
+    }
+
+    /// Session todo list (`GET .../tasks`, capability `task-query`).
+    async fn list_tasks(&self, _session_id: &str) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        Err(ControlPlaneError::Unsupported(CAP_TASK_QUERY.to_string()))
+    }
+
+    /// Background subagent tasks (`GET .../subagent-tasks`, capability
+    /// `subagent-task-query`).
+    async fn list_subagent_tasks(
+        &self,
+        _session_id: &str,
+    ) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        Err(ControlPlaneError::Unsupported(
+            CAP_SUBAGENT_TASK_QUERY.to_string(),
+        ))
+    }
+
+    /// Cancels one background subagent task (`DELETE .../subagent-tasks/{taskId}`, capability
+    /// `subagent-task-command`).
+    async fn cancel_subagent_task(&self, _session_id: &str, _task_id: &str) -> ControlPlaneResult<()> {
+        Err(ControlPlaneError::Unsupported(
+            CAP_SUBAGENT_TASK_COMMAND.to_string(),
+        ))
+    }
+
+    /// Enters or leaves plan mode (`POST .../plan-mode`, capability `plan-mode`).
+    ///
+    /// `params` is the request body; `{"active": true|false}` is the canonical shape
+    /// (absent `active` means "enter").
+    async fn set_plan_mode(
+        &self,
+        _session_id: &str,
+        _params: serde_json::Value,
+    ) -> ControlPlaneResult<()> {
+        Err(ControlPlaneError::Unsupported(CAP_PLAN_MODE.to_string()))
+    }
+
+    /// Injects a control-plane user message into the live session (`POST .../messages`,
+    /// capability `conversation-inbound`).
+    async fn inject_user_message(&self, _session_id: &str, _content: &str) -> ControlPlaneResult<()> {
+        Err(ControlPlaneError::Unsupported(
+            CAP_CONVERSATION_INBOUND.to_string(),
+        ))
+    }
+
+    /// Runs a control-plane conversation turn, returning the terminal assistant reply
+    /// (capability `conversation-inbound`).
+    async fn run_conversation_turn(
+        &self,
+        _session_id: &str,
+        _content: &str,
+    ) -> ControlPlaneResult<String> {
+        Err(ControlPlaneError::Unsupported(
+            CAP_CONVERSATION_INBOUND.to_string(),
+        ))
+    }
+
+    /// Effective definition snapshot merged into `GET /agentscope/info` → `agentConfig`.
+    fn build_agent_config(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    /// Materializes a downstream AgentTask delivery (capability `agent-task`).
+    async fn handle_agent_task(
+        &self,
+        _assignment: crate::model::AgentTaskAssignment,
+    ) -> ControlPlaneResult<()> {
+        Err(ControlPlaneError::Unsupported(CAP_AGENT_TASK.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -155,7 +236,7 @@ mod tests {
         ) -> ControlPlaneResult<()> {
             Ok(())
         }
-        fn detach(&mut self) -> ControlPlaneResult<()> {
+        fn detach(&self) -> ControlPlaneResult<()> {
             Ok(())
         }
         async fn extract_context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
@@ -171,5 +252,56 @@ mod tests {
         assert!(a.list_messages("s1", 0, 10).await.is_err());
         assert!(a.list_subagents().await.is_err());
         assert!(a.execute_command("s1", COMMAND_ABORT, None).await.is_err());
+    }
+
+    /// Every one of the nine methods Java's `FrameworkAdapter` adds beyond the Rust skeleton
+    /// must default to an honest `Unsupported(capability)` instead of silently succeeding.
+    #[tokio::test]
+    async fn java_parity_defaults_report_unsupported_capabilities() {
+        let a = NoopAdapter;
+        let unsupported = |result: ControlPlaneResult<()>, cap: &str| match result {
+            Err(ControlPlaneError::Unsupported(reason)) => assert_eq!(reason, cap),
+            other => panic!("expected Unsupported({cap}), got {other:?}"),
+        };
+        unsupported(a.list_workspaces().await.map(|_| ()), CAP_WORKSPACE_INVENTORY);
+        unsupported(a.list_tasks("s1").await.map(|_| ()), CAP_TASK_QUERY);
+        unsupported(
+            a.list_subagent_tasks("s1").await.map(|_| ()),
+            CAP_SUBAGENT_TASK_QUERY,
+        );
+        unsupported(
+            a.cancel_subagent_task("s1", "t1").await,
+            CAP_SUBAGENT_TASK_COMMAND,
+        );
+        unsupported(
+            a.set_plan_mode("s1", serde_json::json!({ "active": true }))
+                .await,
+            CAP_PLAN_MODE,
+        );
+        unsupported(
+            a.inject_user_message("s1", "hi").await,
+            CAP_CONVERSATION_INBOUND,
+        );
+        unsupported(
+            a.run_conversation_turn("s1", "hi").await.map(|_| ()),
+            CAP_CONVERSATION_INBOUND,
+        );
+        let assignment = crate::model::AgentTaskAssignment {
+            attempt_id: "attempt-1".into(),
+            agent_task_id: "task-1".into(),
+            run_id: "run-1".into(),
+            node_id: "node-1".into(),
+            generation: 1,
+            command: "dispatch".into(),
+            context_url: String::new(),
+            task_token: String::new(),
+            attempt_token: String::new(),
+            session_id: "s1".into(),
+            payload: Vec::new(),
+            timestamp: 0,
+        };
+        unsupported(a.handle_agent_task(assignment).await, CAP_AGENT_TASK);
+        // `build_agent_config` is a benign empty map, not an error (Java `Map.of()`).
+        assert!(a.build_agent_config().is_empty());
     }
 }

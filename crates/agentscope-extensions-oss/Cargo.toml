@@ -21,9 +21,9 @@ agentscope-harness = { path = "../agentscope-harness" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-# `tokio` is only used by the optional S3 backend (it owns a private runtime to drive
-# `rust-s3` from the synchronous trait), so it is gated behind the `s3` feature and the
-# default build stays free of the async runtime.
+# `tokio` is only used by the optional S3 backend (its dedicated worker thread owns a
+# private runtime to drive `rust-s3` from the synchronous trait), so it is gated
+# behind the `s3` feature and the default build stays free of the async runtime.
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "time"] }
 tracing = { workspace = true }
 # Generic S3 backend. `default-features = false` avoids native-tls/OpenSSL; the

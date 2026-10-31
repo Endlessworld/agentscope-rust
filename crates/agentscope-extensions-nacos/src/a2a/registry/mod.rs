@@ -528,6 +528,80 @@ impl AgentRegistry for NacosAgentRegistry {
     }
 }
 
+// ===========================================================================
+// Protocol-side interop (NACOS-01)
+// ===========================================================================
+
+/// Implements the **protocol** registry interface
+/// (`agentscope_extensions_a2a_server::registry::AgentRegistry`), so the A2A server's
+/// `AgentRegistryService` can register a served agent into Nacos ("post-endpoint-ready").
+///
+/// Mirrors Java `NacosAgentRegistry implements io.agentscope.core.a2a.server.registry.AgentRegistry`.
+/// The protocol trait is synchronous (like Java's `void register(..)`) while
+/// [`NacosAiService`] is async, so the call is driven to completion with
+/// [`futures::executor::block_on`]; failures are reported per registry by
+/// `AgentRegistryService` instead of aborting the other registries.
+impl agentscope_extensions_a2a_server::registry::AgentRegistry for NacosAgentRegistry {
+    fn registry_name(&self) -> String {
+        <Self as AgentRegistry>::registry_name(self)
+    }
+
+    fn register(
+        &self,
+        agent_card: &agentscope_extensions_a2a_client::model::AgentCard,
+        transport_properties: &[agentscope_extensions_a2a_client::transport_properties::TransportProperties],
+    ) -> Result<(), agentscope_extensions_a2a_server::registry::AgentRegistryError> {
+        let card = A2aAgentCard {
+            inner: agent_card.clone(),
+        };
+        let transports = transport_properties
+            .iter()
+            .map(protocol_transport_to_local)
+            .collect::<Result<Vec<_>, _>>()?;
+        futures::executor::block_on(<Self as AgentRegistry>::register(self, &card, transports))
+            .map_err(
+                |error| -> agentscope_extensions_a2a_server::registry::AgentRegistryError {
+                    error.into()
+                },
+            )
+    }
+}
+
+/// Converts protocol-side transport properties into this crate's **required-shape** version.
+///
+/// The protocol type models `host`/`port` as optional (with `443`/`80` defaults) because it
+/// also *describes* a server; registration only ever feeds endpoints that are actually
+/// deployed, so a missing host is reported instead of silently registering an empty address
+/// (see NACOS-X08). The port falls back to [`effective_port`] (`443`/`80`), matching the
+/// protocol's own interface synthesis.
+///
+/// [`effective_port`]: agentscope_extensions_a2a_client::transport_properties::TransportProperties::effective_port
+fn protocol_transport_to_local(
+    transport: &agentscope_extensions_a2a_client::transport_properties::TransportProperties,
+) -> Result<TransportProperties, String> {
+    let host = transport
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "A2A endpoint `{}` has no `host`, cannot register it to Nacos.",
+                transport.transport_type
+            )
+        })?;
+    Ok(TransportProperties {
+        transport_type: transport.transport_type.clone(),
+        host: host.to_string(),
+        port: i32::from(transport.effective_port()),
+        path: transport
+            .path
+            .clone()
+            .filter(|path| !path.trim().is_empty()),
+        support_tls: transport.support_tls,
+    })
+}
+
 impl NacosAgentRegistry {
     fn build_transport_properties(
         &self,
@@ -750,9 +824,9 @@ mod tests {
         // Mirrors Java's `NacosRuntimeException(NacosException.INVALID_PARAM, ..)`.
         let env = vec![("NACOS_A2A_AGENT_JSONRPC_PORT", "no_number")];
         let err = NacosA2aTransportPropertiesEnvParser::parse(env).unwrap_err();
-        assert_eq!(err.code, AiServiceError::INVALID_PARAM);
+        assert_eq!(err.code(), AiServiceError::INVALID_PARAM);
         assert!(err
-            .message
+            .message()
             .contains("Invalid `port` value for transport `JSONRPC`: no_number"));
     }
 
@@ -795,6 +869,50 @@ mod tests {
         assert_eq!(endpoints[0].1.address.as_deref(), Some("localhost"));
         assert_eq!(endpoints[0].1.port, 8080);
         assert_eq!(endpoints[0].1.transport, "JSONRPC");
+    }
+
+    /// NACOS-01: the protocol `AgentRegistryService` drives this registry end to end.
+    #[test]
+    fn the_protocol_registry_service_registers_the_agent_into_nacos() {
+        use agentscope_extensions_a2a_client::transport_properties::TransportProperties as ProtocolTransportProperties;
+        use agentscope_extensions_a2a_server::registry::AgentRegistryService;
+
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let registry = Arc::new(
+            NacosAgentRegistry::builder(svc.clone())
+                .nacos_a2a_properties(
+                    NacosA2aRegistryProperties::builder()
+                        .set_as_latest(true)
+                        .build(),
+                )
+                .build(),
+        );
+        let service = AgentRegistryService::new(vec![registry]);
+
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+        let transports = vec![ProtocolTransportProperties::builder("JSONRPC")
+            .host("10.0.0.1")
+            .port(9000)
+            .path("/a2a")
+            .build()];
+
+        let report = service.register(&card.inner, &transports);
+        assert_eq!(report.succeeded, vec!["Nacos".to_string()]);
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(svc.released_cards(), vec![("agent".to_string(), true)]);
+        let endpoints = svc.registered_endpoints();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].1.address.as_deref(), Some("10.0.0.1"));
+        assert_eq!(endpoints[0].1.port, 9000);
+        assert_eq!(endpoints[0].1.path.as_deref(), Some("/a2a"));
+
+        // A transport without a host fails the registration instead of registering `""`.
+        let broken = vec![ProtocolTransportProperties::builder("GRPC").build()];
+        let report = service.register(&card.inner, &broken);
+        assert!(report.succeeded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "Nacos");
+        assert!(report.failed[0].1.contains("host"), "{report:?}");
     }
 
     #[tokio::test]

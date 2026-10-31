@@ -36,6 +36,10 @@ use crate::common::{
 };
 
 /// Typed registry of `DingTalkChannel` handles, keyed by `channel_id`.
+/// Channel type name, mirroring `DingTalkChannel.TYPE` (the `agentscope.json#channels[*].type`
+/// key used by the host's config dispatcher).
+pub const CHANNEL_TYPE: &str = "dingtalk";
+
 pub type DingTalkChannelRegistry = ChannelRegistry<DingTalkChannel>;
 
 /// DingTalk channel adapter: shared routing/gateway state plus DingTalk-specific collaborators.

@@ -186,9 +186,34 @@ impl ChannelCore {
         }
     }
 
-    /// Number of inbound events that passed both guards (idempotency + bot-loop).
+    /// Number of inbound events that passed both guards (idempotency + bot-loop) **and were
+    /// recorded**, i.e. handled at least once.
     pub fn admitted(&self) -> usize {
         self.admitted.load(Ordering::Relaxed)
+    }
+
+    /// Whether `key` was already recorded, without recording it.
+    ///
+    /// Platforms that must not lose an event on a transient dispatch failure peek first and call
+    /// [`ChannelCore::record`] only once the event was handled. See
+    /// [`InboundEventDeduplicator::contains`].
+    pub fn is_duplicate(&self, key: Option<&str>) -> bool {
+        match key {
+            Some(key) if !key.trim().is_empty() => self
+                .deduplicator
+                .contains(&format!("{}|{key}", self.ctx.channel_id())),
+            _ => false,
+        }
+    }
+
+    /// Record `key` after the event was handled, and count it as admitted.
+    ///
+    /// Kept separate from [`ChannelCore::admit`] because the idempotency key must only be consumed
+    /// once the work succeeded: otherwise a 5xx plus the provider's retry would hit the duplicate
+    /// key and drop the event silently.
+    pub fn record(&self, key: Option<&str>) {
+        let _ = self.is_first_seen(key);
+        self.admitted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Run the two inbound guards in the Java order (idempotency, then bot-loop) and count the
@@ -331,6 +356,48 @@ mod tests {
         assert!(!c.allow_peer("direct:u1"));
         // A different peer keeps its own budget.
         assert!(c.allow_peer("direct:u2"));
+    }
+
+    #[test]
+    fn record_only_after_success_keeps_the_event_redeliverable() {
+        let c = ChannelCore::with_components(
+            "feishu",
+            ChannelConfig::of("feishu"),
+            Arc::new(IdempotencyStore::with_defaults()),
+            BotLoopGuard::with_defaults(),
+        );
+        // Peeking never consumes the key, so a failed dispatch can be retried with the same id.
+        assert!(!c.is_duplicate(Some("evt-1")));
+        assert!(!c.is_duplicate(Some("evt-1")));
+        assert_eq!(c.admitted(), 0);
+
+        c.record(Some("evt-1"));
+        assert!(c.is_duplicate(Some("evt-1")));
+        assert_eq!(c.admitted(), 1);
+
+        // Absent / blank keys are never duplicates and are never counted.
+        assert!(!c.is_duplicate(None));
+        assert!(!c.is_duplicate(Some("  ")));
+    }
+
+    #[test]
+    fn a_deduplicator_that_cannot_peek_falls_back_to_java_behaviour() {
+        /// Only implements the required method, so `contains` keeps its default `false`.
+        struct NoPeek;
+        impl InboundEventDeduplicator for NoPeek {
+            fn first_seen(&self, _key: &str) -> bool {
+                true
+            }
+        }
+        let c = ChannelCore::with_components(
+            "feishu",
+            ChannelConfig::of("feishu"),
+            Arc::new(NoPeek),
+            BotLoopGuard::with_defaults(),
+        );
+        c.record(Some("evt-1"));
+        // No entry-level de-duplication ("durable intake owns deduplication"), never a drop.
+        assert!(!c.is_duplicate(Some("evt-1")));
     }
 
     #[test]

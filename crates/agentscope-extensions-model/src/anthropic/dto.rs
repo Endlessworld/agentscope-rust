@@ -314,6 +314,16 @@ pub struct AnthropicUsage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    /// Extended-thinking token accounting (`output_tokens_details.thinking_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<AnthropicOutputTokensDetails>,
+}
+
+/// Token accounting for the extended-thinking portion of the output.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AnthropicOutputTokensDetails {
+    #[serde(default)]
+    pub thinking_tokens: u64,
 }
 
 impl AnthropicUsage {
@@ -327,6 +337,13 @@ impl AnthropicUsage {
     /// Straightforward read-only cache hits.
     pub fn cached(&self) -> u64 {
         self.cache_read_input_tokens.unwrap_or(0)
+    }
+
+    /// Extended-thinking tokens (`output_tokens_details.thinking_tokens`).
+    pub fn reasoning(&self) -> u64 {
+        self.output_tokens_details
+            .map(|details| details.thinking_tokens)
+            .unwrap_or(0)
     }
 }
 
@@ -472,9 +489,11 @@ mod tests {
             output_tokens: 3,
             cache_creation_input_tokens: Some(2),
             cache_read_input_tokens: Some(5),
+            ..Default::default()
         };
         assert_eq!(usage.total_input(), 17);
         assert_eq!(usage.cached(), 5);
+        assert_eq!(usage.reasoning(), 0);
     }
 
     #[test]

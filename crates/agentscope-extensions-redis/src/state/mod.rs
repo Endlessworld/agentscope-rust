@@ -49,6 +49,13 @@ pub const DEFAULT_KEY_PREFIX: &str = "agentscope:session:";
 
 const HASH_SUFFIX: &str = ":_hash";
 
+/// Removes one member from the session key index (`SREM`).
+///
+/// Used by [`AgentStateStore::delete_key`]: the index member must disappear together with
+/// the payload. It runs as a single-key script so it stays routable by its own slot (a
+/// multi-key command could cross slots on Redis Cluster).
+pub(crate) const DISCARD_TRACKED_KEY_SCRIPT: &str = "return redis.call('SREM', KEYS[1], ARGV[1])";
+
 /// A versioned state value (payload + version), mirroring Java `VersionedState`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionedState {
@@ -315,6 +322,18 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
+    /// Deletes one state value, leaving the rest of the session intact.
+    ///
+    /// Redis can honour this, so the default "unsupported" error of the core trait would be
+    /// a silent capability gap (COS / MongoDB / OSS all implement it). The `:_keys` index
+    /// tells the payload shape apart: a `{key}:list` member means the list plus its
+    /// `:_hash` marker, any other member means the JSON string plus its `:ver` counter.
+    /// Commands are issued one key per call, like [`AgentStateStore::delete`], because a V0
+    /// layout can put the two keys in different cluster slots.
+    async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Result<()> {
+        self.delete_key_inner(user_id, session_id, key).await
+    }
+
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
         let user_segment = key_layout::normalize_user(user_id);
         let pattern = match self.key_layout_version {
@@ -469,6 +488,61 @@ impl RedisAgentStateStore {
         // single multi-key `DEL` would be rejected with CROSSSLOT on Redis Cluster.
         for key in to_delete {
             self.client.delete_keys(&[key]).await?;
+        }
+        Ok(())
+    }
+
+    /// Per-key delete shared by the [`AgentStateStore::delete_key`] override.
+    async fn delete_key_inner(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<()> {
+        if key.trim().is_empty() {
+            return Err(Error::Other("key must not be blank".into()));
+        }
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let keys_key = layout.keys_key();
+        let tracked = self.client.get_set_members(&keys_key).await?;
+        // `:_keys` stores the *list* member as `{key}:list`; a single value is stored as the
+        // bare key name. Both shapes can exist under one key name (a `save` followed by a
+        // `save_list`), so each tracked shape is removed on its own.
+        let list_track_key = layout.list_track_key(key);
+        let is_list = tracked.iter().any(|member| member == &list_track_key);
+        let is_single = tracked.iter().any(|member| member == key);
+
+        let mut payload_keys = Vec::new();
+        if is_single || !is_list {
+            // Untracked keys have no index member to classify them by, so the single-value
+            // shape is assumed (the two shapes never share a Redis key).
+            let state_key = layout.state_key(key);
+            let version_key = version_support::version_key(&state_key);
+            payload_keys.push(state_key);
+            payload_keys.push(version_key);
+        }
+        if is_list {
+            let list_key = layout.list_key(key);
+            payload_keys.push(list_key.clone());
+            payload_keys.push(format!("{list_key}{HASH_SUFFIX}"));
+        }
+        // One key per command, for the same CROSSSLOT reason as `delete_inner`.
+        for payload_key in payload_keys {
+            self.client.delete_keys(&[payload_key]).await?;
+        }
+
+        let mut discarded_members = Vec::new();
+        if is_single {
+            discarded_members.push(key.to_string());
+        }
+        if is_list {
+            discarded_members.push(list_track_key);
+        }
+        for member in discarded_members {
+            let _ = self
+                .client
+                .eval_script(DISCARD_TRACKED_KEY_SCRIPT, &[keys_key.clone()], &[member])
+                .await?;
         }
         Ok(())
     }
@@ -922,6 +996,131 @@ mod tests {
         assert_eq!(adapter.delete_calls(), 0, "no DEL issued for an empty slot");
         store.delete(Some("u1"), "  ").await;
         assert_eq!(adapter.delete_calls(), 0);
+    }
+
+    // ---- per-key delete (core `AgentStateStore::delete_key`) --------------
+
+    #[tokio::test]
+    async fn delete_key_removes_one_value_and_keeps_the_rest_of_the_session() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "a", json!(1)).await;
+        store.save(Some("u1"), "s1", "b", json!(2)).await;
+        store.save_list(Some("u1"), "s1", "l", &[json!(3)]).await;
+
+        AgentStateStore::delete_key(&store, Some("u1"), "s1", "a")
+            .await
+            .expect("Redis supports per-key delete");
+
+        assert_eq!(store.get(Some("u1"), "s1", "a").await, None);
+        assert!(adapter.string_of("t:session:u1/s1:a").is_none());
+        assert!(
+            adapter.string_of("t:session:u1/s1:a:ver").is_none(),
+            "the version counter goes with the payload"
+        );
+        assert_eq!(store.get(Some("u1"), "s1", "b").await, Some(json!(2)));
+        assert_eq!(store.get_list(Some("u1"), "s1", "l").await, vec![json!(3)]);
+        assert_eq!(
+            adapter.set_members("t:session:u1/s1:_keys"),
+            vec!["b".to_string(), "l:list".to_string()],
+            "only the deleted key's index member is dropped"
+        );
+        assert!(
+            store.exists(Some("u1"), "s1").await,
+            "the session still has data"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_key_removes_a_list_with_its_hash_marker() {
+        let (store, adapter) = store();
+        store
+            .save_list(Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await;
+        store.save(Some("u1"), "s1", "kept", json!("v")).await;
+
+        AgentStateStore::delete_key(&store, Some("u1"), "s1", "l")
+            .await
+            .expect("per-key delete accepts a list");
+
+        assert!(adapter.list("t:session:u1/s1:l:list").is_empty());
+        assert!(adapter.string_of("t:session:u1/s1:l:list:_hash").is_none());
+        assert!(store.get_list(Some("u1"), "s1", "l").await.is_empty());
+        assert_eq!(
+            adapter.set_members("t:session:u1/s1:_keys"),
+            vec!["kept".to_string()]
+        );
+        assert_eq!(store.get(Some("u1"), "s1", "kept").await, Some(json!("v")));
+    }
+
+    #[tokio::test]
+    async fn delete_key_removes_both_shapes_when_one_key_name_holds_both() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!("single")).await;
+        store
+            .save_list(Some("u1"), "s1", "k", &[json!(1), json!(2)])
+            .await;
+
+        AgentStateStore::delete_key(&store, Some("u1"), "s1", "k")
+            .await
+            .expect("per-key delete drops every shape stored under the key name");
+
+        assert!(adapter.string_of("t:session:u1/s1:k").is_none());
+        assert!(
+            adapter.string_of("t:session:u1/s1:k:ver").is_none(),
+            "the single value's version counter goes too"
+        );
+        assert!(adapter.list("t:session:u1/s1:k:list").is_empty());
+        assert!(adapter.string_of("t:session:u1/s1:k:list:_hash").is_none());
+        assert!(
+            adapter.set_members("t:session:u1/s1:_keys").is_empty(),
+            "both the bare key and the `k:list` index members are dropped"
+        );
+        assert!(!store.exists(Some("u1"), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn delete_key_is_idempotent_and_leaves_untracked_keys_alone() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "tracked", json!(1)).await;
+
+        // A key that was never written: no index rewrite, no collateral deletion.
+        AgentStateStore::delete_key(&store, Some("u1"), "s1", "never-written")
+            .await
+            .expect("deleting an absent key is not an error");
+        assert_eq!(
+            store.get(Some("u1"), "s1", "tracked").await,
+            Some(json!(1))
+        );
+        assert_eq!(
+            adapter.set_members("t:session:u1/s1:_keys"),
+            vec!["tracked".to_string()]
+        );
+
+        // Deleting the tracked key twice is a no-op the second time.
+        AgentStateStore::delete_key(&store, Some("u1"), "s1", "tracked")
+            .await
+            .expect("first delete succeeds");
+        AgentStateStore::delete_key(&store, Some("u1"), "s1", "tracked")
+            .await
+            .expect("second delete is a no-op");
+        assert_eq!(store.get(Some("u1"), "s1", "tracked").await, None);
+        assert!(adapter.set_members("t:session:u1/s1:_keys").is_empty());
+        assert!(
+            !store.exists(Some("u1"), "s1").await,
+            "the emptied session is gone, exactly as Redis drops an emptied set"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_key_rejects_a_blank_session_or_key_before_io() {
+        let (store, adapter) = store();
+        assert!(AgentStateStore::delete_key(&store, Some("u1"), "  ", "k")
+            .await
+            .is_err());
+        assert!(AgentStateStore::delete_key(&store, Some("u1"), "s1", "  ")
+            .await
+            .is_err());
+        assert_eq!(adapter.delete_calls(), 0, "nothing is deleted");
     }
 
     // ---- list save / get -------------------------------------------------

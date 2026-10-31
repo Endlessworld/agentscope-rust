@@ -23,6 +23,27 @@
 //! `retrieve_msgs` bridge on the Mem0 adapter that maps hits back to core [`Msg`]s),
 //! preserving the Java behaviour without introducing a parallel abstraction.
 //!
+//! ## Framework assembly: `MemLongTermMemoryMiddleware` (MEM-01)
+//!
+//! The Java hook (`StaticLongTermMemoryHook`) and its `ReActAgent.Builder.longTermMemory*`
+//! setters are deprecated with the note "reimplement as a `MiddlewareBase` if required",
+//! and without such a seam this crate had no production wiring point at all — every host
+//! had to hand-write the retrieve/record call sites. [`middleware`] provides that seam:
+//!
+//! ```text
+//! let memory = Arc::new(Mem0LongTermMemory::new(client, config)?);
+//! let mut chain = MiddlewareChain::new();
+//! chain.add(Box::new(MemLongTermMemoryMiddleware::new(memory)));
+//! let agent = HarnessAgent::builder().model(model).middleware(chain).build();
+//! ```
+//!
+//! [`MemLongTermMemoryMiddleware`] retrieves on `on_reasoning` (appending a
+//! `long_term_memory` USER message — the Java `PreReasoningEvent` behaviour) and records
+//! the finished conversation on `on_agent` (the Java `PostCallEvent` behaviour), using
+//! the never-fail path in both directions so a memory outage cannot abort a turn. The
+//! [`LongTermMemoryBackend`] trait is the narrow seam over the three adapters; it is not
+//! a revival of the removed `LongTermMemory` interface.
+//!
 //! ## Construction is validated
 //!
 //! Every client constructor (`Mem0Client::new` / `Mem0Client::with_api_type` /
@@ -79,16 +100,24 @@ pub mod bailian;
 pub mod error;
 pub mod http;
 pub mod mem0;
+pub mod middleware;
 pub mod reme;
 pub mod retry;
 pub mod telemetry;
+pub use middleware::{
+    long_term_memory_message, wrap_long_term_memory, LongTermMemoryBackend,
+    MemLongTermMemoryMiddleware, LONG_TERM_MEMORY_MESSAGE_NAME, LONG_TERM_MEMORY_PREFIX,
+    LONG_TERM_MEMORY_SUFFIX,
+};
 
 pub use bailian::{
     BailianAddRequest, BailianAddResponse, BailianLongTermMemory, BailianLongTermMemoryConfig,
     BailianMemoryClient, BailianMemoryNode, BailianMessage, BailianSearchRequest,
     BailianSearchResponse, ADD_MEMORY_ENDPOINT,
 };
-pub use error::{MemError, Result};
+pub use error::{
+    MemError, Result, UNSPECIFIED_OPERATION, UNSPECIFIED_VENDOR,
+};
 pub use http::{HttpTransport, ReqwestTransport, DEFAULT_CONNECT_TIMEOUT};
 pub use retry::{RetryPolicy, RetryTransport};
 pub use telemetry::{InstrumentedTransport, MemMetrics, MemMetricsSnapshot};

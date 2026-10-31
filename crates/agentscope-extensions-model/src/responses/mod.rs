@@ -506,7 +506,10 @@ impl ResponsesIncrementer {
                     let incoming = ChatUsage {
                         input_tokens: u.input_tokens as u64,
                         output_tokens: u.output_tokens as u64,
-                        cached_tokens: 0,
+                        // Java `ResponsesHelper#extractUsage` reads the cached and
+                        // reasoning breakdowns from the same `usage` object.
+                        cached_tokens: u.input_tokens_details.cached_tokens as u64,
+                        reasoning_tokens: u.output_tokens_details.reasoning_tokens as u64,
                         time: 0.0,
                         ..Default::default()
                     };
@@ -716,6 +719,38 @@ mod tests {
             ContentBlock::Text(t) => assert_eq!(t.text, "hello"),
             _ => panic!("expected text block"),
         }
+    }
+
+    #[test]
+    fn completed_event_carries_cached_and_reasoning_token_breakdown() {
+        // Java `ResponsesHelper#extractUsage` reads `input_tokens_details.cached_tokens`
+        // and `output_tokens_details.reasoning_tokens` (MODEL-11).
+        let mut acc = ResponsesIncrementer::default();
+        let event: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 4 },
+                    "output_tokens": 6,
+                    "output_tokens_details": { "reasoning_tokens": 2 },
+                    "total_tokens": 16
+                }
+            }
+        }))
+        .expect("completed event");
+        let _ = acc.accumulate(&event);
+        let final_resp = acc.into_final().expect("final response");
+        assert_eq!(final_resp.usage.input_tokens, 10);
+        assert_eq!(final_resp.usage.cached_tokens, 4);
+        assert_eq!(final_resp.usage.reasoning_tokens, 2);
     }
 
     #[test]

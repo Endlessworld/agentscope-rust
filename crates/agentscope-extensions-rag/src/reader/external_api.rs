@@ -91,6 +91,42 @@ impl ExternalApiResponseParser for BodyAsMarkdown {
     }
 }
 
+/// Posts `{"file_path": "<path>"}` to a document-parsing endpoint.
+///
+/// This is the request shape [`ExternalApiReader::for_parsing_service`] registers; it covers the
+/// common "send me a path, get markdown back" service. A host whose service expects an upload or a
+/// different JSON envelope injects its own [`ExternalApiRequestBuilder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBodyRequest {
+    endpoint: String,
+}
+
+impl FileBodyRequest {
+    /// Creates the request builder for `endpoint`.
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+
+    /// The endpoint path-requests are posted to.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl ExternalApiRequestBuilder for FileBodyRequest {
+    fn build_request(&self, file_path: &str) -> Result<HttpRequest> {
+        let body = serde_json::to_string(&serde_json::json!({ "file_path": file_path }))
+            .map_err(|error| {
+                RagError::Reader(format!(
+                    "failed to serialize the parsing-service request: {error}"
+                ))
+            })?;
+        Ok(HttpRequest::post_json(self.endpoint.clone(), body))
+    }
+}
+
 /// Calls an external parsing API, then chunks the returned markdown into [`Document`]s.
 pub struct ExternalApiReader {
     request_builder: Arc<dyn ExternalApiRequestBuilder>,
@@ -121,6 +157,30 @@ impl ExternalApiReader {
     /// Starts a builder holding the Java defaults.
     pub fn builder() -> ExternalApiReaderBuilder {
         ExternalApiReaderBuilder::default()
+    }
+
+    /// A reader wired to a hosted document-parsing service (tracker RAG-09).
+    ///
+    /// The returned builder already registers the JSON request shape ([`FileBodyRequest`]), the
+    /// markdown response parser ([`BodyAsMarkdown`]) and `supported_formats(["pdf", "docx"])`, so
+    /// PDF / DOCX ingestion works **without** the optional `pdf` / `docx` cargo features:
+    ///
+    /// ```no_run
+    /// use agentscope_extensions_rag::reader::ExternalApiReader;
+    ///
+    /// let reader = ExternalApiReader::for_parsing_service("https://parser.example/v1/parse")
+    ///     .build()?;
+    /// # Ok::<(), agentscope_extensions_rag::RagError>(())
+    /// ```
+    ///
+    /// The HTTP transport is registered as well: unless the caller injects one with
+    /// [`ExternalApiReaderBuilder::transport`], [`ReqwestTransport`] is built from the configured
+    /// connect / read timeouts.
+    pub fn for_parsing_service(endpoint: impl Into<String>) -> ExternalApiReaderBuilder {
+        ExternalApiReader::builder()
+            .request_builder(Arc::new(FileBodyRequest::new(endpoint)))
+            .response_parser(Arc::new(BodyAsMarkdown))
+            .supported_formats(["pdf", "docx"])
     }
 
     /// Replaces the HTTP transport (tests / custom HTTP stacks).
@@ -739,6 +799,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(reader.supported_formats(), vec!["pdf", "docx"]);
+    }
+
+    #[test]
+    fn the_parsing_service_request_is_json_with_the_file_path() {
+        let request = FileBodyRequest::new("https://parser.test/v1/parse")
+            .build_request("C:\\docs\\a b.pdf")
+            .unwrap();
+        assert_eq!(request.method, crate::transport::HttpMethod::Post);
+        assert_eq!(request.url, "https://parser.test/v1/parse");
+        assert_eq!(
+            request.header("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["file_path"], "C:\\docs\\a b.pdf");
+        assert_eq!(body.as_object().unwrap().len(), 1, "only `file_path` is sent");
+        assert_eq!(
+            FileBodyRequest::new("https://parser.test").endpoint(),
+            "https://parser.test"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_parsing_service_reader_advertises_pdf_and_docx_and_chunks_the_reply() {
+        let path = temp_file("service.pdf");
+        let transport = MockTransport::with_responses(vec![HttpResponse::new(
+            200,
+            "page one\n\npage two",
+        )]);
+        let reader = ExternalApiReader::for_parsing_service("https://parser.test/v1/parse")
+            .transport(transport.clone())
+            .chunk_size(512)
+            .overlap_size(0)
+            .build()
+            .unwrap();
+
+        assert_eq!(reader.supported_formats(), vec!["pdf", "docx"]);
+        assert_eq!(reader.chunk_size(), 512);
+
+        let documents = reader
+            .read(ReaderInput::from_file(path.clone()))
+            .await
+            .unwrap();
+        let expected_doc_id = generate_doc_id_sha256(&path.display().to_string());
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].metadata.content_text(),
+            "page one\n\npage two"
+        );
+        assert_eq!(documents[0].metadata.doc_id, expected_doc_id);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1, "the registered transport carried the call");
+        assert_eq!(requests[0].url, "https://parser.test/v1/parse");
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["file_path"], path.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn the_parsing_service_reader_still_requires_an_existing_file() {
+        let transport = MockTransport::with_responses(Vec::new());
+        let reader = ExternalApiReader::for_parsing_service("https://parser.test/v1/parse")
+            .transport(transport.clone())
+            .build()
+            .unwrap();
+        let error = reader
+            .read(ReaderInput::from_string("definitely/missing.docx".to_string()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("File does not exist"), "err={error}");
+        assert!(transport.requests().is_empty());
     }
 
     #[tokio::test]

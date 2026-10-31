@@ -37,6 +37,9 @@ use crate::common::{
 /// The only webhook event this adapter maps (MVP), mirroring the Java controller.
 pub const NOTE_HOOK_EVENT: &str = "Note Hook";
 
+/// Channel type name, mirroring `GitLabChannel.TYPE` (the `agentscope.json#channels[*].type` key).
+pub const CHANNEL_TYPE: &str = "gitlab";
+
 /// Typed registry of `GitLabChannel` handles, keyed by `channel_id`.
 pub type GitLabChannelRegistry = ChannelRegistry<GitLabChannel>;
 
@@ -48,8 +51,10 @@ pub enum GitLabCallbackOutcome {
     Unauthorized,
     /// The body was not valid JSON (400).
     BadRequest,
-    /// Hook acknowledged: unsupported event, duplicate, self-authored, or dispatched (200).
+    /// Hook acknowledged: unsupported action, duplicate, self-authored, or dispatched (200).
     Accepted,
+    /// The hook type is not handled at all (204 No Content), mirroring Java's `noContent()`.
+    Ignored,
 }
 
 /// GitLab channel adapter: shared routing/gateway state plus GitLab-specific collaborators.
@@ -142,10 +147,26 @@ impl GitLabChannel {
         &self.core
     }
 
+    /// Startup hook, mirroring the Java `GitLabChannel#start` (`botIdentityResolver.refresh()`).
+    ///
+    /// Best-effort by design: a failed `GET /user` leaves the identity unknown, logs a warning and
+    /// never fails startup. Without a resolved id `is_self` is always false, so the bot could
+    /// loop on its own notes.
+    pub async fn start(&self) {
+        let resolved = self.bot_identity.refresh().await;
+        if resolved.is_none() && !self.bot_identity.identity().is_resolved() {
+            tracing::warn!(
+                "GitLab bot identity is unresolved; self-authored notes will not be dropped \
+                 until a later refresh succeeds"
+            );
+        }
+    }
+
     /// Full webhook pipeline, in the Java order: `X-Gitlab-Token` check -> event-type gate ->
     /// JSON parse -> mapping -> bot-loop self-detection -> de-duplication -> dispatch. Every
     /// drop/failure is acknowledged with [`GitLabCallbackOutcome::Accepted`] so GitLab stops
-    /// retrying (Java logs and still answers 2xx).
+    /// retrying (Java logs and still answers 2xx); hook types this adapter never handles answer
+    /// [`GitLabCallbackOutcome::Ignored`] (204).
     pub async fn handle_webhook(
         &self,
         event_type: &str,
@@ -157,9 +178,10 @@ impl GitLabChannel {
             return GitLabCallbackOutcome::Unauthorized;
         }
 
-        // 2. Only Note Hook is mapped in the MVP; other event types are acked silently.
+        // 2. Only Note Hook is mapped in the MVP; other hook types are "not handled" (204), which
+        //    Java answers with `noContent()` and not with a 200.
         if event_type != NOTE_HOOK_EVENT {
-            return GitLabCallbackOutcome::Accepted;
+            return GitLabCallbackOutcome::Ignored;
         }
 
         // 3. Parse the JSON body; invalid JSON is the only client error.
@@ -215,6 +237,7 @@ mod tests {
     use agentscope_harness::agent::Peer;
 
     use crate::common::testing::RecordingTransport;
+    use crate::common::PreparedResponse;
     use crate::github::bot_identity::BotIdentity;
 
     const API_BASE: &str = "https://gitlab.com/api/v4";
@@ -223,6 +246,10 @@ mod tests {
     const BOT_ID: i64 = 99;
 
     fn payload(author_id: i64, note: &str) -> String {
+        payload_with_note_id(NOTE_ID, author_id, note)
+    }
+
+    fn payload_with_note_id(note_id: i64, author_id: i64, note: &str) -> String {
         serde_json::json!({
             "object_kind": "note",
             "user": { "id": author_id, "username": "alice" },
@@ -231,7 +258,7 @@ mod tests {
                 "namespace": "grp"
             },
             "object_attributes": {
-                "id": NOTE_ID,
+                "id": note_id,
                 "note": note,
                 "noteable_type": "Issue",
                 "system": false
@@ -305,9 +332,65 @@ mod tests {
         assert_eq!(
             c.handle_webhook("Push Hook", Some(WEBHOOK_TOKEN), &body)
                 .await,
-            GitLabCallbackOutcome::Accepted
+            GitLabCallbackOutcome::Ignored
         );
         assert_eq!(c.core().admitted(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_resolves_the_bot_identity_so_self_notes_are_dropped() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, format!(r#"{{"id":{BOT_ID},"username":"glab-bot"}}"#)),
+        ]));
+        let c = GitLabChannel::from_json(
+            "gitlab",
+            ChannelConfig::of("gitlab"),
+            &serde_json::json!({"token": "t", "webhookToken": WEBHOOK_TOKEN}),
+            transport.clone(),
+        )
+        .unwrap();
+
+        // Unresolved: self-detection is off, so the bot's own note reaches dispatch.
+        assert!(!c.bot_identity().is_self(Some(BOT_ID)));
+        let body = payload_with_note_id(1, BOT_ID, "hi");
+        assert_eq!(
+            c.handle_webhook(NOTE_HOOK_EVENT, Some(WEBHOOK_TOKEN), &body)
+                .await,
+            GitLabCallbackOutcome::Accepted
+        );
+        assert_eq!(c.core().admitted(), 1);
+
+        // Startup hook (`GET /user`), exactly the Java `start()` call.
+        c.start().await;
+        assert_eq!(transport.request_count(), 1);
+        assert!(c.bot_identity().is_self(Some(BOT_ID)));
+        assert_eq!(c.bot_identity().bot_username().as_deref(), Some("glab-bot"));
+
+        // The bot's own note is now dropped instead of feeding a reply loop.
+        let body = payload_with_note_id(2, BOT_ID, "hi");
+        assert_eq!(
+            c.handle_webhook(NOTE_HOOK_EVENT, Some(WEBHOOK_TOKEN), &body)
+                .await,
+            GitLabCallbackOutcome::Accepted
+        );
+        assert_eq!(c.core().admitted(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_keeps_the_bot_identity_unknown() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, "{}"),
+        ]));
+        let c = GitLabChannel::from_json(
+            "gitlab",
+            ChannelConfig::of("gitlab"),
+            &serde_json::json!({"token": "t", "webhookToken": WEBHOOK_TOKEN}),
+            transport,
+        )
+        .unwrap();
+        c.start().await;
+        assert_eq!(c.bot_identity().bot_user_id(), -1);
+        assert!(!c.bot_identity().is_self(Some(BOT_ID)));
     }
 
     #[tokio::test]

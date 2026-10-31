@@ -74,13 +74,17 @@ async fn dispatch(
     let Some(channel) = registry.get(&channel_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let raw_body = String::from_utf8_lossy(&body);
+    // Strict decoding: the SHA-1 signature covers the exact callback bytes, so invalid UTF-8 is a
+    // 400 instead of a lossily rewritten (and then unverifiable) body.
+    let Ok(raw_body) = std::str::from_utf8(&body) else {
+        return into_response(WeComCallbackOutcome::BadRequest);
+    };
     let outcome = channel
         .handle_callback(
             query.msg_signature.as_deref(),
             query.timestamp.as_deref(),
             query.nonce.as_deref(),
-            &raw_body,
+            raw_body,
         )
         .await;
     into_response(outcome)
@@ -252,6 +256,26 @@ mod tests {
             Bytes::from_static(b"<xml/>"),
         )
         .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_non_utf8_body() {
+        let registry = registry_with_channel().await;
+        let response = dispatch(
+            State(registry),
+            Path("wecom".to_string()),
+            Query(WeComQuery {
+                msg_signature: Some("s".to_string()),
+                timestamp: Some("1".to_string()),
+                nonce: Some("n".to_string()),
+                echostr: None,
+            }),
+            Bytes::from_static(b"<xml><Encrypt>\xff\xfe</Encrypt></xml>"),
+        )
+        .await;
+        // Before the strict decode the bytes were lossily rewritten and then failed the
+        // signature check (401); invalid UTF-8 cannot be a valid WeCom payload at all.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 

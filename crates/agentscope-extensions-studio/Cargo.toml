@@ -25,5 +25,13 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread"] }
+# `net`/`test-util`: the manager regression test plays a local Socket.IO server and the
+# batch-export tests drive `tokio::time::pause`/`advance` instead of sleeping.
+tokio = { workspace = true, features = [
+    "io-std",
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "test-util",
+] }
 

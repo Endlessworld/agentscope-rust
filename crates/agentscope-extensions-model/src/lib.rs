@@ -18,6 +18,20 @@
 //!
 //! See `docs/extensions/MODEL__GAP_TRACKER.md` for the authoritative gap list.
 //!
+//! ## Production assembly
+//!
+//! [`assembly`] is the protocol-driven construction point for hosts that are
+//! configured with a wire protocol rather than a vendor. It makes the
+//! capability-rich adapters reachable in production:
+//! [`assembly::build_model_for_protocol`] with
+//! [`assembly::ProtocolImplementations::full_capability`] selects the Anthropic
+//! transport-seam Messages adapter (`cache_control` / thinking / server tools /
+//! deferred tool search) and the OpenAI-official Responses adapter (server
+//! tools / `tool_search` / `prompt_cache`), instead of the SDK-backed ones.
+//! [`assembly::full_registry`] does the same for
+//! [`ModelRegistry`](agentscope_core::ModelRegistry) based hosts. See
+//! `docs/extensions/MODEL__GAP_TRACKER.md` MODEL-01.
+//!
 //! ## Registry resolution semantics
 //! [`ModelRegistry`](agentscope_core::ModelRegistry) belongs to core and is
 //! deliberately **uncached**: `register` takes `&mut self` and replaces the
@@ -30,6 +44,7 @@
 //! `tests/registry_semantics.rs`; moving to a cached registry is a **core-side**
 //! change, recorded in `docs/extensions/MODEL__GAP_TRACKER.md` §4.2 #11.
 
+pub mod assembly;
 pub mod anthropic;
 pub mod anthropic_async;
 pub mod common;
@@ -41,6 +56,11 @@ pub mod openai_official;
 pub mod relay;
 pub mod responses;
 
+pub use assembly::{
+    build_messages_wire_model, build_model_for_protocol, build_model_for_protocol_with_transport,
+    build_openai_official_model, full_registry, implementation_for, MessagesImplementation,
+    ModelImplementation, ProtocolImplementations, ResponsesImplementation,
+};
 pub use anthropic::AnthropicServerTool;
 pub use anthropic::{AnthropicChatModel, AnthropicModelProvider};
 pub use anthropic_async::{

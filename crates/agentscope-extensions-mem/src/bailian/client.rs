@@ -127,12 +127,15 @@ impl BailianMemoryClient {
         ]
     }
 
-    async fn post(&self, endpoint: &str, body: &str) -> Result<String> {
+    /// POSTs `body` to `endpoint`, tagging a non-2xx failure with the Java vendor and
+    /// operation names (`BailianMemoryClient#executePost`).
+    async fn post(&self, operation: &'static str, endpoint: &str, body: &str) -> Result<String> {
         let url = format!("{}{}", self.api_base_url, endpoint);
         let raw = self
             .transport
             .post_json(&url, &self.headers(), body)
-            .await?;
+            .await
+            .map_err(|err| err.with_context("Bailian", operation))?;
         if raw.trim().is_empty() {
             return Err(MemError::Transport(
                 "Bailian API returned empty response".into(),
@@ -144,14 +147,14 @@ impl BailianMemoryClient {
     /// Adds memories: `POST /api/v2/apps/memory/add`.
     pub async fn add(&self, request: &BailianAddRequest) -> Result<BailianAddResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post(ADD_MEMORY_ENDPOINT, &body).await?;
+        let raw = self.post("add memory", ADD_MEMORY_ENDPOINT, &body).await?;
         Ok(serde_json::from_str(&raw)?)
     }
 
     /// Searches memories: `POST /api/v2/apps/memory/memory_nodes/search`.
     pub async fn search(&self, request: &BailianSearchRequest) -> Result<BailianSearchResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post(SEARCH_MEMORY_ENDPOINT, &body).await?;
+        let raw = self.post("search memory", SEARCH_MEMORY_ENDPOINT, &body).await?;
         Ok(serde_json::from_str(&raw)?)
     }
 }
@@ -191,5 +194,37 @@ mod tests {
         .unwrap();
         assert_eq!(client.api_base_url(), "https://bailian.test");
         assert!(client.metrics().is_some());
+    }
+
+    /// MEM-02: the Bailian client uses Java's `"add memory"` / `"search memory"`
+    /// operation names (`BailianMemoryClient#executePost`).
+    #[tokio::test]
+    async fn http_failures_name_the_vendor_and_the_operation() {
+        let mock = MockTransport::new();
+        mock.push_response(Err(MemError::http_status(403, "forbidden")));
+        let client = BailianMemoryClient::with_transport(
+            Arc::new(mock.clone()),
+            "key",
+            DEFAULT_BASE_URL,
+        )
+        .unwrap();
+        let err = client
+            .add(&crate::bailian::dto::BailianAddRequest::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Bailian API add memory failed with status 403: forbidden"
+        );
+
+        mock.push_response(Err(MemError::http_status(429, "slow down")));
+        let err = client
+            .search(&crate::bailian::dto::BailianSearchRequest::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Bailian API search memory failed with status 429: slow down"
+        );
     }
 }

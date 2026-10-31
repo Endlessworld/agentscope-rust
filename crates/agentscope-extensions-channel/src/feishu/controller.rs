@@ -42,13 +42,17 @@ async fn callback(
     let Some(channel) = registry.get(&channel_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let raw_body = String::from_utf8_lossy(&body);
+    // Strict decoding: the signature is verified over the exact bytes Feishu signed, so invalid
+    // UTF-8 must be a 400 instead of being rewritten to U+FFFD.
+    let Ok(raw_body) = std::str::from_utf8(&body) else {
+        return into_response(FeishuCallbackOutcome::BadRequest);
+    };
     let outcome = channel
         .handle_callback(
             header(&headers, SIGNATURE_HEADER),
             header(&headers, TIMESTAMP_HEADER),
             header(&headers, NONCE_HEADER),
-            &raw_body,
+            raw_body,
         )
         .await;
     into_response(outcome)
@@ -67,6 +71,9 @@ fn into_response(outcome: FeishuCallbackOutcome) -> Response {
             axum::Json(json!({ "challenge": challenge })).into_response()
         }
         FeishuCallbackOutcome::Accepted => axum::Json(json!({})).into_response(),
+        // Dispatch failed: tell Feishu to redeliver instead of acknowledging a lost message
+        // (Java `onErrorResume(... HttpStatus.SERVICE_UNAVAILABLE)`).
+        FeishuCallbackOutcome::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -85,7 +92,7 @@ mod tests {
     async fn registry_with_channel() -> Arc<FeishuChannelRegistry> {
         let props = FeishuChannelProperties::from_json(
             "feishu",
-            &json!({"appId": "cli_x", "appSecret": "s"}),
+            &json!({"appId": "cli_x", "appSecret": "s", "verificationToken": "vt"}),
         )
         .unwrap();
         let token: Arc<dyn AccessTokenProvider> = Arc::new(StaticTokenProvider::new("tok"));
@@ -122,6 +129,51 @@ mod tests {
             into_response(FeishuCallbackOutcome::Accepted).status(),
             StatusCode::OK
         );
+        assert_eq!(
+            into_response(FeishuCallbackOutcome::Unavailable).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_body_is_a_bad_request() {
+        let registry = registry_with_channel().await;
+        let response = callback(
+            State(registry),
+            Path("feishu".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{\"challenge\":\"\xff\xfe\"}"),
+        )
+        .await;
+        // Before the strict decode the invalid bytes were lossily replaced and then handled as a
+        // normal (lossy) payload.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_failure_answers_503_so_feishu_redelivers() {
+        // The registry holds a channel without a gateway, so dispatch cannot run.
+        let registry = registry_with_channel().await;
+        let body = Bytes::from_static(
+            br#"{"header":{"event_id":"e1","token":"vt"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","message_type":"text","content":"{\"text\":\"hi\"}","chat_id":"oc_1","chat_type":"p2p"}}}"#,
+        );
+        let first = callback(
+            State(registry.clone()),
+            Path("feishu".to_string()),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Same `event_id` again: the failed delivery did not consume the idempotency key.
+        let second = callback(
+            State(registry),
+            Path("feishu".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

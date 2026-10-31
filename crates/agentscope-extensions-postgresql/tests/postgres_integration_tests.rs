@@ -14,10 +14,12 @@
 //! Without the variable (or when the server is unreachable) every test prints a `skipping`
 //! line and returns successfully, so `cargo test` stays green in CI without a database.
 //!
-//! Note on runtimes: [`PgSimpleClient`] drives `tokio-postgres` with its own runtime and
-//! `block_on`, so **synchronous** calls (`BaseStore`, advisory `try_enter`, DDL) must not run
-//! inside a Tokio runtime. The async store traits bridge to `spawn_blocking` and are driven
-//! from an explicit runtime created here.
+//! Note on runtimes (PG-01): [`PgSimpleClient`] drives `tokio-postgres` on its own runtime,
+//! and its `block_on` bridge is runtime-safe: a **synchronous** call (`BaseStore`, advisory
+//! `try_enter`, DDL) made from inside a multi-threaded Tokio runtime uses `block_in_place`
+//! instead of panicking, which is exactly what the harness `RemoteFilesystem` needs (it
+//! awaits `BaseStore` from inside `async fn`s). The async store traits additionally bridge to
+//! `spawn_blocking`.
 #![cfg(feature = "postgres-driver")]
 
 use std::sync::Arc;
@@ -211,6 +213,48 @@ fn snapshot_roundtrip_on_a_live_server() {
         assert_eq!(client_snapshot.download("s1").await.unwrap(), b"archive-v2");
         assert!(client_snapshot.download("absent").await.is_err());
     });
+
+    drop_table(client.as_ref(), &table);
+}
+
+/// PG-01 acceptance: the harness awaits `BaseStore` from inside `async fn`s, i.e. on a Tokio
+/// worker. Before the fix `PgSimpleClient` called `Runtime::block_on` unconditionally there and
+/// panicked with "cannot block the current thread from within a runtime" on the first
+/// `read`/`write`; the driver now blocks in place instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn base_store_operations_inside_a_multi_thread_runtime_do_not_panic() {
+    let Some(client) = connect() else { return };
+    let table = unique("agentscope_it_rt");
+    drop_table(client.as_ref(), &table);
+
+    // DDL runs synchronously — on this runtime's worker thread.
+    let store = PostgresStore::builder(client.clone())
+        .table(table.clone())
+        .unwrap()
+        .initialize_schema(true)
+        .build()
+        .unwrap();
+
+    let ns = vec!["filesystem".to_string()];
+    store.put(&ns, "k", value(json!({"v": 1})));
+    assert_eq!(store.get(&ns, "k"), Some(value(json!({"v": 1}))));
+
+    // Advisory-lock / transaction paths drive extra connections from the same worker.
+    assert!(store.put_if_version(&ns, "k", value(json!({"v": 2})), 1));
+    assert_eq!(store.get(&ns, "k").unwrap().version, 2);
+
+    // The advisory-lock guard opens a dedicated session and drives it through the same
+    // `block_on` bridge — this used to panic as well.
+    let guard = PostgresSandboxExecutionGuard::builder(client.clone()).build();
+    let key = SandboxIsolationKey::new("session", unique("lock"));
+    let lease = guard
+        .try_enter(&key)
+        .expect("advisory lock must be acquired from a worker thread");
+    assert!(lease.is_open());
+    drop(lease);
+
+    store.delete(&ns, "k");
+    assert!(store.get(&ns, "k").is_none());
 
     drop_table(client.as_ref(), &table);
 }

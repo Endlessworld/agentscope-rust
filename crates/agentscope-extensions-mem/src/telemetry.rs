@@ -141,10 +141,7 @@ mod tests {
     #[tokio::test]
     async fn records_failed_attempts_and_returns_the_error_unchanged() {
         let mock = MockTransport::new();
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 500,
-            body: "boom".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(500, "boom")));
         let (transport, metrics) = instrumented(&mock);
         let err = transport.post_json("http://x/a", &[], "{}").await.unwrap_err();
         assert!(matches!(err, MemError::HttpStatus { status: 500, .. }));

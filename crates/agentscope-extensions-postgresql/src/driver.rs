@@ -2,22 +2,61 @@
 //!
 //! [`PostgresClient`] is synchronous by design (it serves the sync `BaseStore` trait),
 //! while `tokio-postgres` is async. This adapter bridges the two by driving the async
-//! client on a dedicated runtime handle with `block_on`. Callers who already run inside a
-//! multi-threaded runtime should be aware that this blocks the calling thread; the stores
-//! wrap it in `spawn_blocking` for the async traits.
+//! client on a dedicated runtime with [`block_on`], which is safe to call **both** from a
+//! plain thread and from inside an existing Tokio runtime (PG-01): the harness
+//! `RemoteFilesystem` awaits the synchronous `BaseStore` methods from inside `async fn`s,
+//! so a bare `Runtime::block_on` would panic on the first `read`/`write`.
+//!
+//! Calls made from a multi-threaded runtime still block the calling worker
+//! (`block_in_place` hands it back to the scheduler first); the async traits additionally
+//! hop onto the blocking pool via [`crate::blocking`].
 //!
 //! This module is intentionally minimal: it establishes a connection and executes
 //! `(sql, params)` statements, mapping `$n` bind arguments in order.
 
 use std::sync::Arc;
 
-use tokio::runtime::Runtime;
+use tokio::runtime::{Runtime, RuntimeFlavor};
 use tokio_postgres::{Client, Config, NoTls};
 
 use crate::client::{
     Cell, PostgresClient, PostgresLockSession, QueryOutcome, Row, SqlStatement, SqlValue,
 };
 use crate::error::{PgResult, PostgresError};
+
+/// Runs `future` to completion on `runtime`, **even when the caller already sits inside a
+/// Tokio runtime** (PG-01).
+///
+/// `Runtime::block_on` panics ("cannot block the current thread from within a runtime") when
+/// the calling thread is driving another runtime, and the harness `RemoteFilesystem` calls
+/// the **synchronous** [`BaseStore`](agentscope_harness::filesystem::BaseStore) methods from
+/// inside `async fn`s — exactly that situation. So:
+///
+/// * no ambient runtime (plain thread, `spawn_blocking` pool thread) → drive `runtime`;
+/// * multi-threaded ambient runtime → [`tokio::task::block_in_place`] first, which hands the
+///   worker back to its scheduler, then block on the ambient handle;
+/// * current-thread ambient runtime → `block_in_place` is illegal there and blocking the only
+///   worker would deadlock, so the future is driven on `runtime` from a scoped thread.
+fn block_on<F, T>(runtime: &Runtime, future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::scope(|scope| {
+            match scope.spawn(|| runtime.block_on(future)).join() {
+                Ok(value) => value,
+                // Propagate a panic from the driving thread (e.g. a driver panic) instead of
+                // swallowing it as a join error.
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }),
+        Err(_) => runtime.block_on(future),
+    }
+}
 
 /// A synchronous [`PostgresClient`] over a live `tokio-postgres` connection.
 pub struct PgSimpleClient {
@@ -48,8 +87,9 @@ impl PgSimpleClient {
             .enable_all()
             .build()
             .map_err(|e| PostgresError::Query(format!("failed to build runtime: {e}")))?;
-        let (client, connection) = runtime
-            .block_on(async { parsed.connect(NoTls).await })
+        let cfg = parsed.clone();
+        let connecting = async move { cfg.connect(NoTls).await };
+        let (client, connection) = block_on(&runtime, connecting)
             .map_err(|e| PostgresError::Query(format!("connection failed: {e}")))?;
         runtime.spawn(async move {
             if let Err(e) = connection.await {
@@ -65,9 +105,9 @@ impl PgSimpleClient {
 
     /// Opens one extra connection driven by the same runtime.
     fn connect_extra(&self, purpose: &'static str) -> PgResult<Client> {
-        let (client, connection) = self
-            .runtime
-            .block_on(async { self.config.connect(NoTls).await })
+        let config = self.config.clone();
+        let connecting = async move { config.connect(NoTls).await };
+        let (client, connection) = block_on(&self.runtime, connecting)
             .map_err(|e| PostgresError::Query(format!("{purpose} connection failed: {e}")))?;
         self.runtime.spawn(async move {
             if let Err(e) = connection.await {
@@ -104,7 +144,7 @@ impl PgLockSession {
 
     fn advisory_call(&self, sql: &str, lock_name: i64) -> PgResult<bool> {
         let client = self.client()?;
-        self.runtime.block_on(async {
+        block_on(&self.runtime, async {
             let row = client
                 .query_one(sql, &[&lock_name])
                 .await
@@ -149,8 +189,7 @@ fn boxed(value: &SqlValue) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send
 
 impl PostgresClient for PgSimpleClient {
     fn query(&self, sql: &str, params: &[SqlValue]) -> PgResult<QueryOutcome> {
-        self.runtime
-            .block_on(execute_statement(&self.client, sql, params))
+        block_on(&self.runtime, execute_statement(&self.client, sql, params))
     }
 
     fn open_lock_session(&self) -> PgResult<Box<dyn PostgresLockSession>> {
@@ -166,7 +205,7 @@ impl PostgresClient for PgSimpleClient {
         // Java `executeInWriteTransaction`: a dedicated connection, autocommit off,
         // commit on success, roll back on the first failure.
         let client = self.connect_extra("write transaction")?;
-        self.runtime.block_on(async {
+        block_on(&self.runtime, async {
             client
                 .batch_execute("BEGIN")
                 .await
@@ -193,7 +232,7 @@ impl PostgresClient for PgSimpleClient {
     }
 
     fn execute_batch(&self, sql: &str) -> PgResult<()> {
-        self.runtime.block_on(async {
+        block_on(&self.runtime, async {
             self.client
                 .batch_execute(sql)
                 .await
@@ -267,4 +306,47 @@ fn try_bool(row: &tokio_postgres::Row, i: usize) -> Option<bool> {
 }
 fn try_bytes(row: &tokio_postgres::Row, i: usize) -> Option<Vec<u8>> {
     row.try_get::<_, Option<Vec<u8>>>(i).ok().flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A runtime shaped like the one [`PgSimpleClient`] owns.
+    fn driver_runtime() -> Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("driver runtime")
+    }
+
+    /// PG-01 regression: the driver used to call `Runtime::block_on` unconditionally, which
+    /// panics with "cannot block the current thread from within a runtime" exactly here —
+    /// on a Tokio worker, i.e. on the harness `RemoteFilesystem` path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_on_works_from_inside_a_multi_thread_runtime() {
+        let runtime = driver_runtime();
+        assert_eq!(block_on(&runtime, async { 1u32 }), 1);
+        // The worker must still be usable afterwards (`block_in_place` restored it).
+        assert_eq!(block_on(&runtime, async { 2u32 }), 2);
+        let joined = tokio::spawn(async { 3u32 }).await.expect("worker survived");
+        assert_eq!(joined, 3);
+    }
+
+    /// `block_in_place` is illegal on a current-thread runtime, so that branch drives the
+    /// future on the driver runtime from a scoped thread instead of deadlocking the worker.
+    #[tokio::test]
+    async fn block_on_works_from_inside_a_current_thread_runtime() {
+        let runtime = driver_runtime();
+        assert_eq!(block_on(&runtime, async { 41u32 }), 41);
+    }
+
+    /// Plain threads (and the `spawn_blocking` pool, which has no ambient context) keep
+    /// using the driver runtime directly.
+    #[test]
+    fn block_on_works_without_an_ambient_runtime() {
+        let runtime = driver_runtime();
+        assert_eq!(block_on(&runtime, async { 7u32 }), 7);
+    }
 }

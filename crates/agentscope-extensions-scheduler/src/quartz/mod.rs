@@ -26,10 +26,12 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 
 use agentscope_core::message::Msg;
 
 use crate::common::config::{AgentConfig, RuntimeAgentConfig, ScheduleConfig, ScheduleMode};
+use crate::common::scheduler::lock::{NoopSchedulerLock, SchedulerLock};
 use crate::common::scheduler::scheduler::{AgentScheduler, SchedulerError};
 use crate::common::scheduler::task::{AgentFactory, ScheduleAgentTask};
 
@@ -39,12 +41,24 @@ use self::job::{spawn_job, CronPlan};
 pub struct QuartzAgentScheduler {
     scheduler_id: String,
     factory: Arc<dyn AgentFactory>,
+    /// Cross-instance lock consulted before each automatic firing.
+    ///
+    /// Defaults to [`NoopSchedulerLock`] (single-instance premise); a host that
+    /// runs several instances injects a real one via
+    /// [`QuartzAgentSchedulerBuilder::scheduler_lock`].
+    lock: Arc<dyn SchedulerLock>,
+    /// Cap on simultaneous scheduled executions, standing in for Quartz's
+    /// thread pool. Manual `trigger`/`run` calls do not take a permit.
+    concurrency: Arc<Semaphore>,
     /// name -> running job handle
     jobs: RwLock<HashMap<String, Arc<QuartzScheduleAgentTask>>>,
     shutdown: AtomicBool,
 }
 
 impl QuartzAgentScheduler {
+    /// The default concurrency cap, matching Quartz's
+    /// `org.quartz.threadPool.threadCount` default of 10.
+    pub const DEFAULT_MAX_CONCURRENCY: usize = 10;
     /// Creates a new scheduler with the given agent factory.
     ///
     /// The instance is **not** registered in the process-wide registry yet: Java
@@ -61,6 +75,8 @@ impl QuartzAgentScheduler {
         Self {
             scheduler_id,
             factory,
+            lock: Arc::new(NoopSchedulerLock),
+            concurrency: Arc::new(Semaphore::new(Self::DEFAULT_MAX_CONCURRENCY)),
             jobs: RwLock::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
         }
@@ -84,12 +100,15 @@ impl QuartzAgentScheduler {
     /// Java's `Builder#autoStart` has no Rust counterpart (a tokio job loop starts
     /// with its task, there is no scheduler-wide start/standby switch); a custom
     /// Quartz `Scheduler` cannot be injected either. What remains is the
-    /// deterministic `schedulerId`, which matters for registry lookups across
-    /// restarts.
+    /// deterministic `schedulerId` (registry lookups across restarts) plus the two
+    /// host seams: the cross-instance [`SchedulerLock`] and the concurrency limiter
+    /// that stands in for Quartz's thread pool.
     pub fn builder(factory: Arc<dyn AgentFactory>) -> QuartzAgentSchedulerBuilder {
         QuartzAgentSchedulerBuilder {
             factory,
             scheduler_id: None,
+            lock: None,
+            concurrency: None,
         }
     }
 
@@ -165,6 +184,8 @@ impl QuartzAgentScheduler {
     fn context(&self) -> JobContext {
         JobContext {
             scheduler_id: self.scheduler_id.clone(),
+            lock: self.lock.clone(),
+            semaphore: self.concurrency.clone(),
         }
     }
 
@@ -257,6 +278,8 @@ impl QuartzAgentScheduler {
 pub struct QuartzAgentSchedulerBuilder {
     factory: Arc<dyn AgentFactory>,
     scheduler_id: Option<String>,
+    lock: Option<Arc<dyn SchedulerLock>>,
+    concurrency: Option<Arc<Semaphore>>,
 }
 
 impl QuartzAgentSchedulerBuilder {
@@ -266,13 +289,47 @@ impl QuartzAgentSchedulerBuilder {
         self
     }
 
+    /// Injects the cross-instance lock consulted before every automatic firing.
+    ///
+    /// The default is [`NoopSchedulerLock`], i.e. the documented single-instance
+    /// premise. Inject a storage-backed implementation (JDBC/Redis) when several
+    /// scheduler processes share the same schedules.
+    pub fn scheduler_lock(mut self, lock: Arc<dyn SchedulerLock>) -> Self {
+        self.lock = Some(lock);
+        self
+    }
+
+    /// Injects an explicit concurrency limiter (Java's Quartz thread pool).
+    ///
+    /// The semaphore is shared by every task of this scheduler and bounds the
+    /// *automatic* firings; a firing waits for a permit, exactly like a Quartz
+    /// trigger waits for a worker thread. Manual `trigger`/`run` calls bypass it.
+    pub fn concurrency_limiter(mut self, semaphore: Arc<Semaphore>) -> Self {
+        self.concurrency = Some(semaphore);
+        self
+    }
+
+    /// Sets the maximum number of simultaneous executions (default
+    /// [`QuartzAgentScheduler::DEFAULT_MAX_CONCURRENCY`] = 10, matching Quartz).
+    pub fn max_concurrency(mut self, max: usize) -> Self {
+        self.concurrency = Some(Arc::new(Semaphore::new(max.max(1))));
+        self
+    }
+
     /// Builds the scheduler (not registered; see
     /// [`QuartzAgentScheduler::new_shared`]).
     pub fn build(self) -> QuartzAgentScheduler {
         let id = self
             .scheduler_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        QuartzAgentScheduler::with_id(self.factory, id)
+        let mut scheduler = QuartzAgentScheduler::with_id(self.factory, id);
+        if let Some(lock) = self.lock {
+            scheduler.lock = lock;
+        }
+        if let Some(concurrency) = self.concurrency {
+            scheduler.concurrency = concurrency;
+        }
+        scheduler
     }
 
     /// Builds the scheduler and registers it in the process-wide registry.
@@ -310,6 +367,10 @@ fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<Arc<CronPlan>
 #[derive(Clone)]
 pub(crate) struct JobContext {
     pub(crate) scheduler_id: String,
+    /// Cross-instance lock consulted before each firing.
+    pub(crate) lock: Arc<dyn SchedulerLock>,
+    /// Concurrency cap shared by every task of the scheduler.
+    pub(crate) semaphore: Arc<Semaphore>,
 }
 
 #[async_trait]
@@ -924,6 +985,300 @@ mod tests {
         );
         assert!(qt.is_cancelled());
         assert!(!sched.cancel("A").await);
+
+        sched.shutdown().await;
+    }
+
+    /// Factory standing in for a host with a provider registry: it turns the
+    /// serializable `model_name` into a `Model` and runs from the config it is
+    /// handed (see `AgentFactory::resolve_model`).
+    struct ModelResolvingFactory {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentFactory for ModelResolvingFactory {
+        fn resolve_model(
+            &self,
+            config: &RuntimeAgentConfig,
+        ) -> Option<Arc<dyn agentscope_core::model::Model>> {
+            (config.model_name() == "qwen-max").then(|| crate::test_support::stub_model("ok"))
+        }
+
+        async fn run(
+            &self,
+            config: &RuntimeAgentConfig,
+            _messages: Vec<Msg>,
+        ) -> agentscope_core::error::Result<Msg> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The factory-resolved model is injected into the config, so building
+            // the agent from `config.model()` works exactly like Java.
+            assert_eq!(
+                config.model().expect("resolved model injected").model_name(),
+                "stub-model"
+            );
+            Ok(Msg::assistant("ran"))
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_default_runs_with_a_factory_resolved_model() {
+        // SCHED-01 acceptance: `schedule(AgentConfig)` only carries a model *name*
+        // (`RuntimeAgentConfig::from` has `model: None`). Before
+        // `AgentFactory::resolve_model` the run aborted with
+        // `Model cannot be null.` before the host factory was ever consulted.
+        let factory = Arc::new(ModelResolvingFactory {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sched = QuartzAgentScheduler::new(factory.clone());
+        let cfg = AgentConfig::builder()
+            .name("A")
+            .model_name("qwen-max")
+            .sys_prompt("sys")
+            .build()
+            .unwrap();
+
+        let task = sched.schedule(cfg, ScheduleConfig::none()).await.unwrap();
+        task.run_empty().await.unwrap();
+
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+        assert_eq!(qt.execution_count(), 1);
+        assert_eq!(factory.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Lock that records the keys it is shown and grants or denies them.
+    struct RecordingLock {
+        granted: std::sync::Mutex<Vec<String>>,
+        released: std::sync::Mutex<Vec<String>>,
+        grant: bool,
+        acquired: tokio::sync::Notify,
+        released_signal: tokio::sync::Notify,
+    }
+
+    impl RecordingLock {
+        fn new(grant: bool) -> Arc<Self> {
+            Arc::new(Self {
+                granted: std::sync::Mutex::new(Vec::new()),
+                released: std::sync::Mutex::new(Vec::new()),
+                grant,
+                acquired: tokio::sync::Notify::new(),
+                released_signal: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SchedulerLock for RecordingLock {
+        async fn try_acquire(&self, key: &str) -> bool {
+            self.granted.lock().unwrap().push(key.to_string());
+            self.acquired.notify_one();
+            self.grant
+        }
+
+        async fn release(&self, key: &str) {
+            self.released.lock().unwrap().push(key.to_string());
+            self.released_signal.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_scheduler_lock_gates_every_firing() {
+        // SCHED-05: the default lock is a no-op (single-instance premise); an
+        // injected one must be consulted before the firing and released after it.
+        let lock = RecordingLock::new(true);
+        let sched = Arc::new(
+            QuartzAgentScheduler::builder(Arc::new(EchoFactory))
+                .scheduler_lock(lock.clone())
+                .build(),
+        );
+        let cfg = ScheduleConfig::builder()
+            .fixed_rate(60_000)
+            .initial_delay(1)
+            .build()
+            .unwrap();
+        let task = sched
+            .schedule_runtime(runtime("Locked"), cfg, None)
+            .await
+            .unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        // `notify_one` stores a permit when nobody waits yet, so registering the
+        // waiter after `schedule_runtime` cannot miss the first acquisition.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lock.acquired.notified(),
+        )
+        .await
+        .expect("the injected lock was never consulted");
+
+        let granted = lock.granted.lock().unwrap().clone();
+        assert_eq!(granted.len(), 1, "one firing, one lock acquisition");
+        assert!(
+            granted[0].starts_with(sched.scheduler_id()),
+            "the key must be namespaced by the scheduler id: {}",
+            granted[0]
+        );
+        assert!(
+            granted[0].contains("Locked") && granted[0].contains(":rate:"),
+            "unexpected slot key: {}",
+            granted[0]
+        );
+
+        // Wait for the release: it happens after the execution completed, so the
+        // run is counted and there is no cancel/execute race.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lock.released_signal.notified(),
+        )
+        .await
+        .expect("the granted slot was never released");
+        assert_eq!(
+            lock.released.lock().unwrap().clone(),
+            granted,
+            "the granted slot must be released after the firing"
+        );
+        assert_eq!(qt.execution_count(), 1);
+
+        assert!(sched.cancel("Locked").await);
+    }
+
+    #[tokio::test]
+    async fn a_denied_slot_skips_the_execution() {
+        // Two instances share a schedule; the lock owner is the other node, so
+        // this one must not run (and must not release a lock it never held).
+        let lock = RecordingLock::new(false);
+        let sched = Arc::new(
+            QuartzAgentScheduler::builder(Arc::new(EchoFactory))
+                .scheduler_lock(lock.clone())
+                .build(),
+        );
+        let cfg = ScheduleConfig::builder()
+            .fixed_delay(60_000)
+            .initial_delay(1)
+            .build()
+            .unwrap();
+        let task = sched
+            .schedule_runtime(runtime("Denied"), cfg, None)
+            .await
+            .unwrap();
+        let qt = task
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lock.acquired.notified(),
+        )
+        .await
+        .expect("the injected lock was never consulted");
+
+        assert_eq!(qt.execution_count(), 0, "a denied slot must not execute");
+        assert!(lock.granted.lock().unwrap()[0].contains(":delay:"));
+        assert!(
+            lock.released.lock().unwrap().is_empty(),
+            "a denied slot is never released"
+        );
+
+        sched.shutdown().await;
+    }
+
+    /// Factory whose executions block on a shared gate (no timing involved).
+    struct GatedFactory {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        started: std::sync::atomic::AtomicUsize,
+        progress: tokio::sync::watch::Sender<usize>,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl AgentFactory for GatedFactory {
+        async fn run(
+            &self,
+            _config: &RuntimeAgentConfig,
+            _messages: Vec<Msg>,
+        ) -> agentscope_core::error::Result<Msg> {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_active.fetch_max(active, AtomicOrdering::SeqCst);
+            let started = self.started.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            let _ = self.progress.send(started);
+            // Blocks until the test opens the gate.
+            let permit = self.gate.acquire().await.expect("gate stays open");
+            drop(permit);
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(Msg::assistant("gated"))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_bounds_simultaneous_executions() {
+        // SCHED-09: Quartz bounds concurrent jobs with its thread pool (default
+        // 10); without a limiter every task's tokio loop fires immediately.
+        let gate = Arc::new(Semaphore::new(0));
+        let (progress, mut rx) = tokio::sync::watch::channel(0usize);
+        let factory = Arc::new(GatedFactory {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            started: std::sync::atomic::AtomicUsize::new(0),
+            progress,
+            gate: gate.clone(),
+        });
+        let sched = Arc::new(
+            QuartzAgentScheduler::builder(factory.clone())
+                .max_concurrency(2)
+                .build(),
+        );
+        for name in ["A", "B", "C"] {
+            let cfg = ScheduleConfig::builder()
+                .fixed_delay(60_000)
+                .initial_delay(1)
+                .build()
+                .unwrap();
+            sched
+                .schedule_runtime(runtime(name), cfg, None)
+                .await
+                .unwrap();
+        }
+
+        // Exactly the configured two executions get in; the third waits for a
+        // permit (without the limiter all three would already be running).
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut started = *rx.borrow_and_update();
+            while started < 2 {
+                rx.changed().await.expect("factory dropped");
+                started = *rx.borrow_and_update();
+            }
+        })
+        .await
+        .expect("two executions never started");
+        assert_eq!(factory.active.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Opening the gate lets the queued firing in; the peak must stay at the
+        // configured limit.
+        gate.add_permits(3);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut started = *rx.borrow_and_update();
+            while started < 3 {
+                rx.changed().await.expect("factory dropped");
+                started = *rx.borrow_and_update();
+            }
+        })
+        .await
+        .expect("the queued execution never started");
+        assert_eq!(
+            factory.max_active.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the concurrency limit was exceeded"
+        );
 
         sched.shutdown().await;
     }

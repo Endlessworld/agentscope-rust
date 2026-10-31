@@ -389,7 +389,7 @@ mod tests {
 
         assert_eq!(
             transport.last_method.lock().unwrap().as_deref(),
-            Some("message/send")
+            Some(methods::MESSAGE_SEND)
         );
         assert_eq!(
             transport.last_url.lock().unwrap().as_deref(),
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(fetched.id, "t-1");
         assert_eq!(
             transport.last_method.lock().unwrap().as_deref(),
-            Some("tasks/get")
+            Some(methods::TASKS_GET)
         );
     }
 
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(canceled.status.state, TaskState::Canceled);
         assert_eq!(
             transport.last_method.lock().unwrap().as_deref(),
-            Some("tasks/cancel")
+            Some(methods::TASKS_CANCEL)
         );
     }
 

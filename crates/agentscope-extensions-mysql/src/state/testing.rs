@@ -114,6 +114,37 @@ impl InMemoryStateBackend {
             );
     }
 
+    /// Seeds a single row with an explicit `version`, the way a pre-versioning database
+    /// (whose DDL defaulted the column to `0`) or a concurrent writer leaves it behind.
+    ///
+    /// Needed by the `save_if_version(.., Some(0))` fallback tests: a row with
+    /// `version = 0` makes the atomic INSERT conflict while still being updatable with
+    /// `WHERE version = 0`.
+    pub fn seed_single(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        value_json: &str,
+        version: i64,
+    ) {
+        let key = Self::key(user_id, session_id);
+        self.rows
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .entry(state_key.to_string())
+            .or_default()
+            .insert(super::SINGLE_STATE_INDEX, value_json.to_string());
+        self.versions
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .insert(state_key.to_string(), version);
+    }
+
     /// Whether the modelled database exists.
     pub fn has_database(&self, database_name: &str) -> bool {
         self.schema.lock().unwrap().databases.contains_key(database_name)

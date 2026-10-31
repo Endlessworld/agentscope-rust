@@ -41,12 +41,17 @@ async fn webhook(
     let Some(channel) = registry.get(&channel_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let raw_body = String::from_utf8_lossy(&body);
+    // Strict decoding: signature verification and JSON parsing both need the exact bytes the
+    // provider sent. `from_utf8_lossy` would rewrite invalid bytes to U+FFFD, so a valid
+    // signature would be computed over different bytes and the delivery rejected as 401.
+    let Ok(raw_body) = std::str::from_utf8(&body) else {
+        return into_response(GitHubCallbackOutcome::BadRequest);
+    };
     let outcome = channel
         .handle_webhook(
             header(&headers, EVENT_HEADER).unwrap_or_default(),
             header(&headers, SIGNATURE_HEADER),
-            &raw_body,
+            raw_body,
         )
         .await;
     into_response(outcome)
@@ -62,6 +67,9 @@ fn into_response(outcome: GitHubCallbackOutcome) -> Response {
         GitHubCallbackOutcome::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
         GitHubCallbackOutcome::BadRequest => StatusCode::BAD_REQUEST.into_response(),
         GitHubCallbackOutcome::Accepted => axum::Json(json!({})).into_response(),
+        // Unhandled event type: Java answers `204 No Content` so monitoring can tell it apart
+        // from a handled (200) delivery.
+        GitHubCallbackOutcome::Ignored => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
@@ -121,6 +129,45 @@ mod tests {
             into_response(GitHubCallbackOutcome::Accepted).status(),
             StatusCode::OK
         );
+        assert_eq!(
+            into_response(GitHubCallbackOutcome::Ignored).status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unhandled_event_type_is_204() {
+        let registry = registry_with_channel().await;
+        let body = r#"{"action":"created"}"#;
+        let signature = GitHubSignatureVerifier::new("s").unwrap().sign(body.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(EVENT_HEADER, "push".parse().unwrap());
+        headers.insert(SIGNATURE_HEADER, signature.parse().unwrap());
+        let response = webhook(
+            State(registry),
+            Path("github".to_string()),
+            headers,
+            Bytes::from(body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_body_is_a_bad_request_not_a_signature_failure() {
+        let registry = registry_with_channel().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(EVENT_HEADER, "issue_comment".parse().unwrap());
+        headers.insert(SIGNATURE_HEADER, "sha256=deadbeef".parse().unwrap());
+        let response = webhook(
+            State(registry),
+            Path("github".to_string()),
+            headers,
+            Bytes::from_static(b"{\"comment\":\"\xff\xfe\"}"),
+        )
+        .await;
+        // Before the strict decode this was lossily rewritten and reported as 401.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

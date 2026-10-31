@@ -77,9 +77,11 @@ pub trait SessionStateDialect: TableNameConfigurable + Send + Sync {
     /// follow-up `SELECT version` and the caller would observe *that* writer's version.
     ///
     /// Returns `None` when the dialect cannot express a returning upsert — MySQL has no
-    /// `RETURNING`, and H2's `MERGE` has no portable returning form. Callers must then
-    /// fall back to UPSERT followed by a separate `SELECT version`, which is a **known
-    /// non-atomic degradation**, not an equivalent.
+    /// `RETURNING`, and H2's `MERGE` has no portable returning form. The caller then falls
+    /// back to an UPSERT followed by a separate `SELECT version` **inside one transaction**
+    /// (`JdbcAgentStateStore::upsert_then_read_version`), so the write still holds the row
+    /// lock until the version has been read and the caller never observes another writer's
+    /// version.
     fn session_state_upsert_returning_version(
         &self,
         _slot_id: &str,

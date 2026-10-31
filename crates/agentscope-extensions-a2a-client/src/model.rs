@@ -10,18 +10,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Well-known JSON-RPC method names used by the A2A transport.
+///
+/// A2A 1.0 renamed every JSON-RPC method to PascalCase (Java `org.a2aproject.sdk.spec.A2AMethods`
+/// in `a2a-java-sdk` 1.4); the 0.3.0 slash-separated names are kept as `LEGACY_*` aliases that the
+/// server still dispatches for two release cycles (the client only ever sends the 1.0 names).
 pub mod methods {
-    pub const MESSAGE_SEND: &str = "message/send";
-    pub const MESSAGE_STREAM: &str = "message/stream";
-    pub const TASKS_GET: &str = "tasks/get";
-    pub const TASKS_CANCEL: &str = "tasks/cancel";
-    pub const TASKS_RESUBSCRIBE: &str = "tasks/resubscribe";
-    pub const PUSH_CONFIG_SET: &str = "tasks/pushNotificationConfig/set";
-    pub const PUSH_CONFIG_GET: &str = "tasks/pushNotificationConfig/get";
-    pub const PUSH_CONFIG_LIST: &str = "tasks/pushNotificationConfig/list";
-    pub const PUSH_CONFIG_DELETE: &str = "tasks/pushNotificationConfig/delete";
-    pub const AGENT_CARD_GET: &str = "agent/getAuthenticatedExtendedCard";
+    // ---- A2A 1.0 (the only names this crate sends) ----
+    pub const MESSAGE_SEND: &str = "SendMessage";
+    pub const MESSAGE_STREAM: &str = "SendStreamingMessage";
+    pub const TASKS_GET: &str = "GetTask";
+    pub const TASKS_CANCEL: &str = "CancelTask";
+    pub const TASKS_RESUBSCRIBE: &str = "SubscribeToTask";
+    pub const PUSH_CONFIG_SET: &str = "CreateTaskPushNotificationConfig";
+    pub const PUSH_CONFIG_GET: &str = "GetTaskPushNotificationConfig";
+    pub const PUSH_CONFIG_LIST: &str = "ListTaskPushNotificationConfigs";
+    pub const PUSH_CONFIG_DELETE: &str = "DeleteTaskPushNotificationConfig";
+    pub const AGENT_CARD_GET: &str = "GetExtendedAgentCard";
+
+    // ---- A2A 0.3 aliases (dispatch-only compatibility, remove after two cycles) ----
+    pub const LEGACY_MESSAGE_SEND: &str = "message/send";
+    pub const LEGACY_MESSAGE_STREAM: &str = "message/stream";
+    pub const LEGACY_TASKS_GET: &str = "tasks/get";
+    pub const LEGACY_TASKS_CANCEL: &str = "tasks/cancel";
+    pub const LEGACY_TASKS_RESUBSCRIBE: &str = "tasks/resubscribe";
+    pub const LEGACY_PUSH_CONFIG_SET: &str = "tasks/pushNotificationConfig/set";
+    pub const LEGACY_PUSH_CONFIG_GET: &str = "tasks/pushNotificationConfig/get";
+    pub const LEGACY_PUSH_CONFIG_LIST: &str = "tasks/pushNotificationConfig/list";
+    pub const LEGACY_PUSH_CONFIG_DELETE: &str = "tasks/pushNotificationConfig/delete";
+    pub const LEGACY_AGENT_CARD_GET: &str = "agent/getAuthenticatedExtendedCard";
 }
+
+/// A2A wire protocol version implemented by this crate (`AgentInterface.protocolVersion`).
+///
+/// A2A 1.0 spells the version `1.0` (not `1.0.0`); it is set on every `supportedInterfaces` entry.
+pub const PROTOCOL_VERSION: &str = "1.0";
 
 /// Default relative path of the well-known agent card.
 pub const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
@@ -476,12 +498,79 @@ pub struct AgentCapabilities {
 /// A2A security scheme (kept as opaque JSON for forward compatibility).
 pub type SecurityScheme = Value;
 
-/// A named transport (protocol binding) exposed by an agent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A named transport (protocol binding) exposed by an agent (A2A 1.0 `AgentInterface`).
+///
+/// Wire shape (1.0): `{"url": "...", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}`.
+/// `tenant` is not modelled (this crate never pins an interface to a tenant).
+///
+/// The Rust field is still spelled `transport` so that sibling crates constructing the struct keep
+/// compiling; the wire name is the 1.0 `protocolBinding` and the 0.3 `transport` name is accepted on
+/// deserialization.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentInterface {
     pub url: String,
-    #[serde(rename = "transport")]
+    /// The protocol binding, e.g. `JSONRPC` (wire key `protocolBinding`).
     pub transport: String,
+}
+
+impl AgentInterface {
+    /// Builds an interface for `url` over the `JSONRPC` binding.
+    pub fn json_rpc(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            transport: "JSONRPC".to_string(),
+        }
+    }
+}
+
+impl Serialize for AgentInterface {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("url", &self.url)?;
+        map.serialize_entry("protocolBinding", &self.transport)?;
+        map.serialize_entry("protocolVersion", PROTOCOL_VERSION)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentInterface {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InterfaceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InterfaceVisitor {
+            type Value = AgentInterface;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an A2A agent interface object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<AgentInterface, A::Error> {
+                let mut url = String::new();
+                let mut binding = String::new();
+                while let Some(key) = access.next_key::<String>()? {
+                    match key.as_str() {
+                        "url" => url = access.next_value::<Option<String>>()?.unwrap_or_default(),
+                        "protocolBinding" | "transport" => {
+                            binding = access.next_value::<Option<String>>()?.unwrap_or_default();
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = access.next_value()?;
+                        }
+                    }
+                }
+                Ok(AgentInterface {
+                    url,
+                    transport: binding,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(InterfaceVisitor)
+    }
 }
 
 /// A skill advertised by an agent card.
@@ -502,47 +591,40 @@ pub struct AgentSkill {
 }
 
 /// A2A agent card: the discovery document served at the well-known URI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Serialization follows A2A 1.0: the discoverable endpoints live in `supportedInterfaces` (the
+/// preferred one first), the security requirements are `securityRequirements`, and the 0.3
+/// top-level `url` / `preferredTransport` / `additionalInterfaces` / `protocolVersion` / `security`
+/// keys are **not** emitted any more. Deserialization accepts both shapes, so a 0.3 card still
+/// parses: `supportedInterfaces[0]` maps onto [`url`](Self::url) +
+/// [`preferred_transport`](Self::preferred_transport) and the rest onto
+/// [`additional_interfaces`](Self::additional_interfaces).
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentCard {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// A URL to the documentation for this agent (A2A spec `documentationUrl`).
-    #[serde(rename = "documentationUrl", skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
+    /// URL of the preferred interface (1.0: `supportedInterfaces[0].url`).
     pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(rename = "protocolVersion", skip_serializing_if = "Option::is_none")]
+    /// 0.3 top-level `protocolVersion`, kept for parsing old cards only (never serialized).
     pub protocol_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<AgentProvider>,
-    #[serde(rename = "preferredTransport", skip_serializing_if = "Option::is_none")]
+    /// Protocol binding of the preferred interface (1.0: `supportedInterfaces[0].protocolBinding`).
     pub preferred_transport: Option<String>,
-    #[serde(
-        rename = "additionalInterfaces",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Non-preferred interfaces (1.0: `supportedInterfaces[1..]`).
     pub additional_interfaces: Option<Vec<AgentInterface>>,
-    /// Base64-encoded public key (A2A spec field).
-    #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
+    /// Icon URL (A2A spec field `iconUrl`).
     pub icon_url: Option<String>,
     pub capabilities: AgentCapabilities,
-    #[serde(rename = "defaultInputModes")]
     pub default_input_modes: Vec<String>,
-    #[serde(rename = "defaultOutputModes")]
     pub default_output_modes: Vec<String>,
     pub skills: Vec<AgentSkill>,
-    #[serde(rename = "securitySchemes", skip_serializing_if = "Option::is_none")]
     pub security_schemes: Option<serde_json::Map<String, Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Security requirements, wire key `securityRequirements` in 1.0 (`security` in 0.3).
     pub security: Option<Vec<serde_json::Map<String, Value>>>,
-    #[serde(
-        rename = "supportsAuthenticatedExtendedCard",
-        skip_serializing_if = "Option::is_none"
-    )]
     pub supports_authenticated_extended_card: Option<bool>,
-    #[serde(rename = "signatures", skip_serializing_if = "Option::is_none")]
     pub signatures: Option<Vec<Value>>,
 }
 
@@ -569,6 +651,189 @@ impl AgentCard {
             supports_authenticated_extended_card: None,
             signatures: None,
         }
+    }
+
+    /// The 1.0 `supportedInterfaces` list: the preferred interface first, then the others.
+    ///
+    /// Mirrors Java `AgentScopeAgentCardConverter#supportedInterfaces`.
+    pub fn supported_interfaces(&self) -> Vec<AgentInterface> {
+        let mut interfaces: Vec<AgentInterface> = Vec::new();
+        if !self.url.is_empty() {
+            interfaces.push(AgentInterface {
+                url: self.url.clone(),
+                transport: self
+                    .preferred_transport
+                    .clone()
+                    .filter(|binding| !binding.is_empty())
+                    .unwrap_or_else(|| "JSONRPC".to_string()),
+            });
+        }
+        if let Some(additional) = &self.additional_interfaces {
+            for interface in additional {
+                if !interfaces.contains(interface) {
+                    interfaces.push(interface.clone());
+                }
+            }
+        }
+        interfaces
+    }
+
+    /// Rebuilds a card from a JSON object, accepting the 1.0 and the 0.3 shapes.
+    fn from_wire(value: Value) -> Result<Self, String> {
+        let Value::Object(map) = value else {
+            return Err("agent card must be a JSON object".to_string());
+        };
+
+        let name = string_field(&map, "name")
+            .ok_or_else(|| "agent card is missing `name`".to_string())?;
+
+        let interfaces =
+            optional_field::<Vec<AgentInterface>>(&map, "supportedInterfaces")?.unwrap_or_default();
+
+        let (url, preferred_transport, additional_interfaces) = if interfaces.is_empty() {
+            (
+                string_field(&map, "url").unwrap_or_default(),
+                string_field(&map, "preferredTransport"),
+                optional_field::<Vec<AgentInterface>>(&map, "additionalInterfaces")?,
+            )
+        } else {
+            let mut interfaces = interfaces.into_iter();
+            let preferred = interfaces.next().unwrap_or_default();
+            let rest: Vec<AgentInterface> = interfaces.collect();
+            (
+                preferred.url,
+                Some(preferred.transport),
+                if rest.is_empty() { None } else { Some(rest) },
+            )
+        };
+
+        let security = match optional_field::<Vec<serde_json::Map<String, Value>>>(
+            &map,
+            "securityRequirements",
+        )? {
+            Some(requirements) => Some(requirements),
+            None => optional_field(&map, "security")?,
+        };
+
+        Ok(Self {
+            name,
+            description: string_field(&map, "description"),
+            documentation_url: string_field(&map, "documentationUrl"),
+            url,
+            version: string_field(&map, "version"),
+            protocol_version: string_field(&map, "protocolVersion"),
+            provider: optional_field(&map, "provider")?,
+            preferred_transport,
+            additional_interfaces,
+            icon_url: string_field(&map, "iconUrl"),
+            capabilities: optional_field(&map, "capabilities")?.unwrap_or_default(),
+            default_input_modes: optional_field(&map, "defaultInputModes")?.unwrap_or_default(),
+            default_output_modes: optional_field(&map, "defaultOutputModes")?.unwrap_or_default(),
+            skills: optional_field(&map, "skills")?.unwrap_or_default(),
+            security_schemes: optional_field(&map, "securitySchemes")?,
+            security,
+            supports_authenticated_extended_card: optional_field(
+                &map,
+                "supportsAuthenticatedExtendedCard",
+            )?,
+            signatures: optional_field(&map, "signatures")?,
+        })
+    }
+}
+
+/// Reads an optional string field from a JSON object.
+fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    map.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Reads and decodes an optional field, reporting the key when the shape is wrong.
+fn optional_field<T: serde::de::DeserializeOwned>(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<T>, String> {
+    match map.get(key) {
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| format!("invalid `{key}`: {error}")),
+        None => Ok(None),
+    }
+}
+
+impl Default for AgentInterface {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            transport: String::new(),
+        }
+    }
+}
+
+impl Serialize for AgentCard {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("name", &self.name)?;
+        if let Some(value) = &self.description {
+            map.serialize_entry("description", value)?;
+        }
+        if let Some(value) = &self.documentation_url {
+            map.serialize_entry("documentationUrl", value)?;
+        }
+        if let Some(value) = &self.version {
+            map.serialize_entry("version", value)?;
+        }
+        if let Some(value) = &self.provider {
+            map.serialize_entry("provider", value)?;
+        }
+        map.serialize_entry("supportedInterfaces", &self.supported_interfaces())?;
+        if let Some(value) = &self.icon_url {
+            map.serialize_entry("iconUrl", value)?;
+        }
+        map.serialize_entry("capabilities", &self.capabilities)?;
+        map.serialize_entry("defaultInputModes", &self.default_input_modes)?;
+        map.serialize_entry("defaultOutputModes", &self.default_output_modes)?;
+        map.serialize_entry("skills", &self.skills)?;
+        if let Some(value) = &self.security_schemes {
+            map.serialize_entry("securitySchemes", value)?;
+        }
+        if let Some(value) = &self.security {
+            map.serialize_entry("securityRequirements", value)?;
+        }
+        if let Some(value) = &self.supports_authenticated_extended_card {
+            map.serialize_entry("supportsAuthenticatedExtendedCard", value)?;
+        }
+        if let Some(value) = &self.signatures {
+            map.serialize_entry("signatures", value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentCard {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CardVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CardVisitor {
+            type Value = AgentCard;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an A2A agent card object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<AgentCard, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some(key) = access.next_key::<String>()? {
+                    let value: Value = access.next_value()?;
+                    fields.insert(key, value);
+                }
+                AgentCard::from_wire(Value::Object(fields)).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_map(CardVisitor)
     }
 }
 
@@ -676,6 +941,8 @@ impl JsonRpcError {
     pub const INTERNAL_ERROR: i64 = -32603;
     /// A2A-specific: task not found.
     pub const TASK_NOT_FOUND: i64 = -32001;
+    /// A2A-specific: the operation is not supported by this server (1.0 `UnsupportedOperationError`).
+    pub const UNSUPPORTED_OPERATION: i64 = -32004;
 
     pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
@@ -779,15 +1046,111 @@ mod tests {
         assert!(!TaskState::Working.is_terminal());
     }
 
+    // Bound to the `A2AMethods` literals of `a2a-java-sdk` 1.4.0.Final: before the 1.0 migration
+    // every constant was a 0.3 slash-separated name, so this fails on the 0.3 wire.
+    #[test]
+    fn wire_method_names_follow_a2a_1_0() {
+        assert_eq!(methods::MESSAGE_SEND, "SendMessage");
+        assert_eq!(methods::MESSAGE_STREAM, "SendStreamingMessage");
+        assert_eq!(methods::TASKS_GET, "GetTask");
+        assert_eq!(methods::TASKS_CANCEL, "CancelTask");
+        assert_eq!(methods::TASKS_RESUBSCRIBE, "SubscribeToTask");
+        assert_eq!(methods::PUSH_CONFIG_SET, "CreateTaskPushNotificationConfig");
+        assert_eq!(methods::PUSH_CONFIG_GET, "GetTaskPushNotificationConfig");
+        assert_eq!(methods::PUSH_CONFIG_LIST, "ListTaskPushNotificationConfigs");
+        assert_eq!(methods::PUSH_CONFIG_DELETE, "DeleteTaskPushNotificationConfig");
+        assert_eq!(methods::AGENT_CARD_GET, "GetExtendedAgentCard");
+        // The 0.3 names survive only as dispatch aliases.
+        assert_eq!(methods::LEGACY_MESSAGE_SEND, "message/send");
+        assert_eq!(methods::LEGACY_TASKS_GET, "tasks/get");
+        assert_ne!(methods::MESSAGE_SEND, methods::LEGACY_MESSAGE_SEND);
+    }
+
     #[test]
     fn agent_card_defaults_and_round_trip() {
         let card = AgentCard::new("test-agent", "http://localhost:8080");
         let json = serde_json::to_value(&card).unwrap();
         assert_eq!(json["name"], "test-agent");
-        assert_eq!(json["preferredTransport"], "JSONRPC");
+        assert_eq!(json["supportedInterfaces"][0]["url"], "http://localhost:8080");
+        assert_eq!(json["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
+        assert_eq!(json["supportedInterfaces"][0]["protocolVersion"], "1.0");
         assert_eq!(json["defaultInputModes"][0], "text/plain");
         let back: AgentCard = serde_json::from_value(json).unwrap();
         assert_eq!(back, card);
+    }
+
+    #[test]
+    fn agent_card_serializes_the_a2a_1_0_shape() {
+        let mut card = AgentCard::new("a2a-agent", "http://localhost:8080");
+        card.additional_interfaces = Some(vec![AgentInterface {
+            url: "http://localhost:9090".to_string(),
+            transport: "GRPC".to_string(),
+        }]);
+        card.security = Some(vec![serde_json::Map::from_iter([(
+            "apiKey".to_string(),
+            serde_json::json!(["read"]),
+        )])]);
+
+        let json = serde_json::to_value(&card).unwrap();
+        let interfaces = json["supportedInterfaces"].as_array().unwrap();
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0]["url"], "http://localhost:8080");
+        assert_eq!(interfaces[0]["protocolBinding"], "JSONRPC");
+        assert_eq!(interfaces[1]["url"], "http://localhost:9090");
+        assert_eq!(interfaces[1]["protocolBinding"], "GRPC");
+        assert_eq!(interfaces[1]["protocolVersion"], "1.0");
+        assert!(interfaces[1].get("transport").is_none());
+        assert_eq!(json["securityRequirements"][0]["apiKey"][0], "read");
+        // The 0.3 top-level discovery keys are gone.
+        for legacy in [
+            "url",
+            "preferredTransport",
+            "additionalInterfaces",
+            "protocolVersion",
+            "security",
+        ] {
+            assert!(json.get(legacy).is_none(), "unexpected 0.3 key {legacy}");
+        }
+
+        let back: AgentCard = serde_json::from_value(json).unwrap();
+        assert_eq!(back.url, "http://localhost:8080");
+        assert_eq!(back.preferred_transport.as_deref(), Some("JSONRPC"));
+        assert_eq!(back.additional_interfaces.as_ref().unwrap().len(), 1);
+        assert_eq!(back.security, card.security);
+    }
+
+    #[test]
+    fn agent_card_still_parses_a_0_3_card() {
+        let legacy = serde_json::json!({
+            "name": "legacy-agent",
+            "url": "http://localhost:8080",
+            "protocolVersion": "0.3.0",
+            "preferredTransport": "JSONRPC",
+            "additionalInterfaces": [
+                { "url": "http://localhost:9090", "transport": "GRPC" }
+            ],
+            "capabilities": { "streaming": true },
+            "defaultInputModes": ["text"],
+            "defaultOutputModes": ["text"],
+            "skills": [],
+            "security": [ { "apiKey": ["read"] } ]
+        });
+
+        let card: AgentCard = serde_json::from_value(legacy).unwrap();
+        assert_eq!(card.name, "legacy-agent");
+        assert_eq!(card.url, "http://localhost:8080");
+        assert_eq!(card.protocol_version.as_deref(), Some("0.3.0"));
+        assert_eq!(card.preferred_transport.as_deref(), Some("JSONRPC"));
+        assert_eq!(card.additional_interfaces.as_ref().unwrap()[0].transport, "GRPC");
+        assert_eq!(
+            card.security.as_ref().unwrap()[0]["apiKey"][0],
+            serde_json::json!("read")
+        );
+
+        // …and is re-emitted in the 1.0 shape.
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(json["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
+        assert!(json.get("url").is_none());
     }
 
     #[test]

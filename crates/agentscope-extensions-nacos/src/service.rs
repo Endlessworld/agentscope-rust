@@ -13,11 +13,49 @@ use async_trait::async_trait;
 use crate::a2a::model::{NacosAgentCard, NacosAgentEndpoint};
 
 /// Error type for Nacos AI operations, mirroring `NacosException`.
+///
+/// **2026-10-31 (NACOS-15 ruling A)**: the previous single `{code, message}` struct is now a
+/// classified enum, so callers can branch on *why* a call failed instead of inferring it from
+/// a synthetic `500` code:
+///
+/// * [`AiServiceError::Transport`] — connect/timeout/DNS failure; safe to retry (NACOS-06);
+/// * [`AiServiceError::Http`] — a non-success HTTP status without a Nacos envelope;
+/// * [`AiServiceError::Business`] — a Nacos business code (`code != 0`, e.g. `NOT_FOUND`);
+/// * [`AiServiceError::Serde`] — the payload could not be decoded (never retryable).
+///
+/// The historical `code`/`message` contract is preserved through [`Self::code`] /
+/// [`Self::message`] plus the [`Self::new`] / [`Self::not_found`] constructors, so existing
+/// Java-side reasoning (`NacosException#getErrCode`) still applies.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("nacos error {code}: {message}")]
-pub struct AiServiceError {
-    pub code: i64,
-    pub message: String,
+pub enum AiServiceError {
+    /// The transport failed before a response was read (retryable).
+    #[error("nacos transport error: {message}")]
+    Transport {
+        /// Human-readable detail.
+        message: String,
+    },
+    /// The server answered with a non-success HTTP status and no Nacos error envelope.
+    #[error("nacos http error {status}: {message}")]
+    Http {
+        /// HTTP status code.
+        status: u16,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// The server answered with a Nacos business error code (`code != 0`).
+    #[error("nacos error {code}: {message}")]
+    Business {
+        /// Nacos error code (`NacosException#getErrCode`).
+        code: i64,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// The response payload could not be decoded into the expected model.
+    #[error("nacos decode error: {message}")]
+    Serde {
+        /// Human-readable detail.
+        message: String,
+    },
 }
 
 impl AiServiceError {
@@ -26,9 +64,32 @@ impl AiServiceError {
     /// Nacos `INVALID_PARAM` error code, mirrored from `NacosException.INVALID_PARAM`.
     pub const INVALID_PARAM: i64 = 400;
 
+    /// Builds a [`AiServiceError::Business`] error, mirroring `new NacosException(code, message)`.
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        Self {
+        Self::Business {
             code,
+            message: message.into(),
+        }
+    }
+
+    /// Builds a [`AiServiceError::Transport`] error.
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::Transport {
+            message: message.into(),
+        }
+    }
+
+    /// Builds a [`AiServiceError::Http`] error.
+    pub fn http(status: u16, message: impl Into<String>) -> Self {
+        Self::Http {
+            status,
+            message: message.into(),
+        }
+    }
+
+    /// Builds a [`AiServiceError::Serde`] error.
+    pub fn serde(message: impl Into<String>) -> Self {
+        Self::Serde {
             message: message.into(),
         }
     }
@@ -37,8 +98,40 @@ impl AiServiceError {
         Self::new(Self::NOT_FOUND, message)
     }
 
+    /// The Nacos error code a caller would see from `NacosException#getErrCode`.
+    ///
+    /// Transport/decode failures have no Nacos code, so they report the historical `500`.
+    pub fn code(&self) -> i64 {
+        match self {
+            Self::Transport { .. } | Self::Serde { .. } => 500,
+            Self::Http { status, .. } => i64::from(*status),
+            Self::Business { code, .. } => *code,
+        }
+    }
+
+    /// The human-readable detail.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Transport { message }
+            | Self::Serde { message }
+            | Self::Http { message, .. }
+            | Self::Business { message, .. } => message.as_str(),
+        }
+    }
+
     pub fn is_not_found(&self) -> bool {
-        self.code == Self::NOT_FOUND
+        self.code() == Self::NOT_FOUND
+    }
+
+    /// Whether the operation may succeed when retried (transport failure, 429 or 5xx).
+    ///
+    /// Mirrors the Nacos SDK retry policy: business codes and decode failures are terminal.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
+            Self::Business { .. } | Self::Serde { .. } => false,
+        }
     }
 }
 

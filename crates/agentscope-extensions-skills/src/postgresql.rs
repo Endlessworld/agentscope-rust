@@ -161,6 +161,12 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         };
         if repo.cfg.create_if_not_exist {
             repo.create_schema_and_tables()?;
+        } else {
+            // Java: `verifySchemaExists()` + `verifyTablesExist()` -> IllegalStateException.
+            // SKILLS-02: without this the construction succeeded and the first read failed with a
+            // driver error that lost the actionable "use createIfNotExist=true" hint.
+            repo.verify_schema_exists()?;
+            repo.verify_tables_exist()?;
         }
         repo.metadata_json_supported = repo.detect_metadata_json_column_support();
         Ok(repo)
@@ -240,6 +246,45 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         conn.execute(&create_schema, &[])?;
         conn.execute(&skills_sql, &[])?;
         conn.execute(&resources_sql, &[])?;
+        Ok(())
+    }
+
+    /// Verifies the schema exists (`verifySchemaExists`), used when `createIfNotExist=false`.
+    fn verify_schema_exists(&self) -> Result<(), SkillRepositoryError> {
+        let sql = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?";
+        let mut conn = self.db.connection()?;
+        if conn
+            .query(sql, &[SqlParam::Text(self.cfg.schema_name.clone())])?
+            .is_empty()
+        {
+            return Err(SkillRepositoryError::Database(format!(
+                "schema does not exist: {} (use createIfNotExist=true to auto-create)",
+                self.cfg.schema_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Verifies both tables exist (`verifyTablesExist`), used when `createIfNotExist=false`.
+    fn verify_tables_exist(&self) -> Result<(), SkillRepositoryError> {
+        self.verify_table_exists(&self.cfg.skills_table_name)?;
+        self.verify_table_exists(&self.cfg.resources_table_name)
+    }
+
+    fn verify_table_exists(&self, table: &str) -> Result<(), SkillRepositoryError> {
+        let sql = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                   WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+        let params = [
+            SqlParam::Text(self.cfg.schema_name.clone()),
+            SqlParam::Text(table.to_string()),
+        ];
+        let mut conn = self.db.connection()?;
+        if conn.query(sql, &params)?.is_empty() {
+            return Err(SkillRepositoryError::Database(format!(
+                "table does not exist: {}.{} (use createIfNotExist=true to auto-create)",
+                self.cfg.schema_name, table
+            )));
+        }
         Ok(())
     }
 
@@ -748,6 +793,15 @@ mod tests {
                 &[],
             )
             .unwrap();
+        // SKILLS-02: construction with `create_if_not_exist=false` now verifies both tables.
+        db.connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE agentscope_skill_resources (id BIGINT, resource_path VARCHAR(500), \
+                 resource_content TEXT)",
+                &[],
+            )
+            .unwrap();
         let r = PostgresSkillRepository::with_config(
             db,
             PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
@@ -767,6 +821,15 @@ mod tests {
                 &[],
             )
             .unwrap();
+        // SKILLS-02: construction with `create_if_not_exist=false` now verifies both tables.
+        db.connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE agentscope_skill_resources (id BIGINT, resource_path VARCHAR(500), \
+                 resource_content TEXT)",
+                &[],
+            )
+            .unwrap();
         let r = PostgresSkillRepository::with_config(
             db,
             PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
@@ -778,6 +841,65 @@ mod tests {
         let loaded = r.get_skill("p").unwrap();
         assert_eq!(loaded.description(), "pg skill");
         assert_eq!(loaded.metadata().len(), 2);
+    }
+
+    // Java: `verifySchemaExists` / `verifyTablesExist` in the ctor's else branch (SKILLS-02).
+    #[test]
+    fn create_if_not_exist_false_requires_the_schema() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let error = match PostgresSkillRepository::with_config(
+            db,
+            PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
+        ) {
+            Ok(_) => panic!("an empty database must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(error, SkillRepositoryError::Database(_)));
+        assert!(
+            error.to_string().contains("schema does not exist: agentscope"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("createIfNotExist"), "{error}");
+    }
+
+    #[test]
+    fn create_if_not_exist_false_reports_the_missing_table() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        db.connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE agentscope_skills (id BIGINT, name VARCHAR(255), description TEXT, \
+                 skill_content TEXT, source VARCHAR(255), metadata_json TEXT NULL)",
+                &[],
+            )
+            .unwrap();
+        let error = match PostgresSkillRepository::with_config(
+            Arc::clone(&db),
+            PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
+        ) {
+            Ok(_) => panic!("a missing resources table must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("table does not exist: agentscope.agentscope_skill_resources"),
+            "{error}"
+        );
+    }
+
+    /// The happy path of the same verification: a schema built by one repository is accepted by a
+    /// second one constructed with `create_if_not_exist=false`.
+    #[test]
+    fn create_if_not_exist_false_accepts_a_schema_built_by_new() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        PostgresSkillRepository::new(Arc::clone(&db)).unwrap();
+        let repo = PostgresSkillRepository::with_config(
+            db,
+            PostgresSkillRepositoryConfig::new().create_if_not_exist(false),
+        )
+        .expect("an existing schema must pass verification");
+        assert_eq!(repo.schema_name(), "agentscope");
     }
 
     #[test]

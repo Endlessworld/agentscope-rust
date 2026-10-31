@@ -140,7 +140,10 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let raw = String::from_utf8_lossy(&body);
+    // Strict decoding: XML parsing and the SHA-1 signature both need the exact bytes.
+    let Ok(raw) = std::str::from_utf8(&body) else {
+        return into_response(DingTalkCallbackOutcome::BadRequest);
+    };
     let outcome = controller
         .dispatch(
             &channel_id,
@@ -148,7 +151,7 @@ async fn handle(
             header_value(&headers, "sign"),
             header_value(&headers, "msg_signature"),
             header_value(&headers, "nonce"),
-            &raw,
+            raw,
         )
         .await;
     into_response(outcome)
@@ -296,6 +299,21 @@ mod tests {
     fn encrypted_body(channel: &DingTalkChannel, json: &str) -> String {
         let encrypted = channel.crypto().unwrap().encrypt(json, None).unwrap();
         format!(r#"{{"encrypt":"{encrypted}"}}"#)
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_body_is_a_bad_request() {
+        let (controller, _) = setup(serde_json::json!({})).await;
+        let response = handle(
+            State(controller),
+            Path("dt-test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{\"encrypt\":\"\xff\xfe\"}"),
+        )
+        .await;
+        // Before the strict decode the bytes were lossily rewritten, handed to the signature
+        // check and answered as 401.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

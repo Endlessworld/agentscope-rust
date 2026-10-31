@@ -6,9 +6,8 @@
 //! * a `":_hash"` companion row for list change detection;
 //! * versioned CAS via `save_if_version` (version starts at 1, `0` = unversioned);
 //! * every [`AgentStateStore`] method is `async` but the SQL seam is synchronous, so each one
-//!   hops onto the blocking pool ([`crate::blocking`]) before touching the client — calling
-//!   `PgSimpleClient` directly from an async context would `block_on` inside a runtime and
-//!   panic.
+//!   hops onto the blocking pool ([`crate::blocking`]) before touching the client instead of
+//!   blocking a runtime worker.
 
 use std::sync::Arc;
 
@@ -169,9 +168,9 @@ impl PostgresAgentStateStore {
     /// Runs a blocking store operation on the blocking pool.
     ///
     /// [`AgentStateStore`] is async but [`PostgresClient`] is synchronous, and `PgSimpleClient`
-    /// drives the latter with its own runtime + `block_on` — which panics when the calling
-    /// thread is already inside a Tokio runtime. Every async method therefore hops onto the
-    /// blocking pool first, exactly as documented in [`crate::blocking`].
+    /// bridges the two with `block_on` on its own runtime. That no longer panics inside a
+    /// runtime (PG-01), but it still blocks the calling worker; every async method therefore
+    /// hops onto the blocking pool first, exactly as documented in [`crate::blocking`].
     async fn run_blocking<T, F>(&self, op: F) -> PgResult<T>
     where
         F: FnOnce(Self) -> PgResult<T> + Send + 'static,
@@ -508,9 +507,12 @@ impl PostgresAgentStateStore {
         items: &[Value],
         start_index: usize,
     ) -> PgResult<Vec<SqlStatement>> {
+        // PG-03: list rows bind `version` explicitly (1) instead of relying on the column
+        // default. `0` is the absent-row sentinel of the CAS path, so a list row left at the
+        // legacy `DEFAULT 0` makes `save_if_version(key, 0)` overwrite data it must reject.
         let sql = format!(
-            "INSERT INTO {full_table} (session_id, state_key, item_index, state_data) \
-             VALUES ($1, $2, $3, $4)"
+            "INSERT INTO {full_table} (session_id, state_key, item_index, state_data, version) \
+             VALUES ($1, $2, $3, $4, $5)"
         );
         let mut statements = Vec::with_capacity(items.len());
         for (offset, item) in items.iter().enumerate() {
@@ -523,6 +525,7 @@ impl PostgresAgentStateStore {
                     SqlValue::text(key),
                     SqlValue::int((start_index + offset) as i32),
                     SqlValue::text(json),
+                    SqlValue::BigInt(1),
                 ],
             ));
         }
@@ -531,11 +534,15 @@ impl PostgresAgentStateStore {
 
     fn save_hash_stmt(full_table: &str, slot: &str, hash_key: &str, hash: &str) -> SqlStatement {
         let now = chrono::Utc::now().timestamp_millis();
+        // PG-03: the `:_hash` companion row binds `version = 1` too (see
+        // `insert_items_stmts`); an upsert normalises rows left at the legacy `DEFAULT 0`.
         let sql = format!(
-            "INSERT INTO {full_table} (session_id, state_key, item_index, state_data, updated_at) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO {full_table} \
+             (session_id, state_key, item_index, state_data, version, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (session_id, state_key, item_index) DO UPDATE SET \
                  state_data = EXCLUDED.state_data, \
+                 version = EXCLUDED.version, \
                  updated_at = EXCLUDED.updated_at"
         );
         SqlStatement::new(
@@ -545,6 +552,7 @@ impl PostgresAgentStateStore {
                 SqlValue::text(hash_key),
                 SqlValue::int(SINGLE_STATE_INDEX),
                 SqlValue::text(hash),
+                SqlValue::BigInt(1),
                 SqlValue::Timestamp(now),
             ],
         )
@@ -1175,6 +1183,59 @@ mod tests {
         assert_eq!(c.session_row_count(), 3);
     }
 
+    // PG-03: list rows and the `:_hash` companion row must bind `version = 1` explicitly.
+    //
+    // Before the fix both INSERTs omitted the column, so on the shipped
+    // `version ... DEFAULT 0` table every list row sat at version **0** — the "row absent"
+    // sentinel of the CAS path — which made `save_if_version(key, 0)` treat an existing list
+    // as absent and overwrite its first item.
+    #[test]
+    fn list_and_hash_inserts_bind_version_one() {
+        let items = PostgresAgentStateStore::insert_items_stmts(
+            "\"s\".\"t\"",
+            "slot",
+            "items",
+            &[json!(1), json!(2)],
+            0,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        for stmt in &items {
+            assert!(
+                stmt.sql.contains("state_data, version)"),
+                "list insert must bind the version column: {}",
+                stmt.sql
+            );
+            assert_eq!(stmt.params.last(), Some(&SqlValue::BigInt(1)));
+        }
+
+        let hash =
+            PostgresAgentStateStore::save_hash_stmt("\"s\".\"t\"", "slot", "items:_hash", "h");
+        assert!(hash
+            .sql
+            .contains("(session_id, state_key, item_index, state_data, version, updated_at)"));
+        assert!(hash.sql.contains("version = EXCLUDED.version"));
+        assert!(hash.params.contains(&SqlValue::BigInt(1)));
+    }
+
+    /// PG-03 acceptance: after `save_list`, a create-only CAS on the same key is a genuine
+    /// conflict and the list is untouched — every list row already rests at version 1.
+    #[tokio::test]
+    async fn create_if_absent_after_save_list_is_rejected_and_list_is_intact() {
+        let c = client();
+        let s = store(&c);
+        let values = vec![json!({"i": 1}), json!({"i": 2})];
+        s.save_list(None, "s1", "items", &values).await;
+
+        assert_eq!(
+            s.save_if_version(None, "s1", "items", &json!({"i": 9}), 0)
+                .unwrap(),
+            UNVERSIONED
+        );
+        assert_eq!(s.get_list(None, "s1", "items").await, values);
+        assert_eq!(s.version_of(None, "s1", "items").unwrap(), 1);
+    }
+
     // Java: PostgresAgentStateStoreTest#saveListAppendsNewItems
     #[tokio::test]
     async fn save_list_appends_without_rewriting_when_prefix_unchanged() {
@@ -1522,8 +1583,9 @@ mod tests {
     /// Wraps [`MemoryClient`] but fails if a query runs on the thread polling the async test.
     ///
     /// The SQL seam ([`PostgresClient`]) is synchronous and the real driver
-    /// (`PgSimpleClient`) calls `block_on` internally, which panics inside a runtime. Every
-    /// `AgentStateStore` method is therefore contractually required to go through
+    /// (`PgSimpleClient`) blocks the calling thread while it drives `tokio-postgres` (PG-01
+    /// made that safe inside a runtime, but it still blocks a worker). Every `AgentStateStore`
+    /// method is therefore contractually required to go through
     /// [`PostgresAgentStateStore::run_blocking`]; this client enforces that contract by
     /// rejecting the runtime's own polling thread (blocking-pool threads are fine).
     #[derive(Debug)]

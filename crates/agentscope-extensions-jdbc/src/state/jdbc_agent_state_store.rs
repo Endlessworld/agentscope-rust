@@ -18,7 +18,7 @@ use agentscope_core::state::AgentStateStore;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::backend::{JdbcError, JdbcResult, SharedExecutor};
+use crate::backend::{ColumnValue, JdbcError, JdbcResult, JdbcSession, SharedExecutor};
 use crate::dialect::{
     validate_table_schema, AbstractJdbcDialect, BoundSql, SessionStateDialect, SqlParam,
 };
@@ -136,17 +136,37 @@ impl JdbcAgentStateStore {
         Ok(())
     }
 
+    /// Rejects negative expected versions other than [`UNVERSIONED`], mirroring the Java
+    /// `JdbcAgentStateStore.saveIfVersion` guard (`expectedVersion != UNVERSIONED &&
+    /// expectedVersion < 0` → `IllegalArgumentException`).
+    fn validate_expected_version(expected_version: i64) -> JdbcResult<()> {
+        if expected_version != UNVERSIONED && expected_version < 0 {
+            return Err(JdbcError::Database(format!(
+                "expectedVersion must be >= 0 or UNVERSIONED: {expected_version}"
+            )));
+        }
+        Ok(())
+    }
+
     fn json_of(value: &Value) -> JdbcResult<String> {
         serde_json::to_string(value)
             .map_err(|e| JdbcError::Database(format!("serialize state: {e}")))
     }
 
     /// Reads the stored hash for a list key, if any.
-    fn stored_hash(&self, slot_id: &str, hash_key: &str) -> JdbcResult<Option<String>> {
+    ///
+    /// Runs on `session` so that it can take part in the same transaction as the write it
+    /// guards (see [`Self::save_list_impl`]).
+    fn stored_hash(
+        &self,
+        session: &mut dyn JdbcSession,
+        slot_id: &str,
+        hash_key: &str,
+    ) -> JdbcResult<Option<String>> {
         let bound = self
             .dialect
             .session_state_select(slot_id, hash_key, SINGLE_STATE_INDEX as i32);
-        let rows = self.executor.query(&bound)?;
+        let rows = session.query(&bound)?;
         Ok(rows
             .into_iter()
             .next()
@@ -155,9 +175,14 @@ impl JdbcAgentStateStore {
     }
 
     /// Reads the number of stored items for a list key (`MAX(item_index) + 1`).
-    fn list_count(&self, slot_id: &str, key: &str) -> JdbcResult<usize> {
+    fn list_count(
+        &self,
+        session: &mut dyn JdbcSession,
+        slot_id: &str,
+        key: &str,
+    ) -> JdbcResult<usize> {
         let bound = self.dialect.session_state_select_max_index(slot_id, key);
-        let rows = self.executor.query(&bound)?;
+        let rows = session.query(&bound)?;
         let max = rows
             .into_iter()
             .next()
@@ -175,13 +200,22 @@ impl JdbcAgentStateStore {
         let bound = self
             .dialect
             .session_state_select(slot_id, key, SINGLE_STATE_INDEX as i32);
-        let rows = self.executor.query(&bound)?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .and_then(|r| r.into_iter().nth(1))
-            .and_then(|c| c.as_int())
-            .unwrap_or(0))
+        Ok(version_from_rows(self.executor.query(&bound)?))
+    }
+
+    /// [`Self::read_version_at`] on an already-open session, so the read can share a
+    /// transaction with the write whose version it reports (see
+    /// [`Self::upsert_then_read_version`]).
+    fn read_version_in(
+        &self,
+        session: &mut dyn JdbcSession,
+        slot_id: &str,
+        key: &str,
+    ) -> JdbcResult<i64> {
+        let bound = self
+            .dialect
+            .session_state_select(slot_id, key, SINGLE_STATE_INDEX as i32);
+        Ok(version_from_rows(session.query(&bound)?))
     }
 
     /// Whether this backend supports optimistic concurrency, mirroring the Java
@@ -249,6 +283,10 @@ impl JdbcAgentStateStore {
     /// * otherwise — writes only when the stored version equals `expected_version`.
     ///
     /// Returns the new version on success, or [`UNVERSIONED`] on conflict (nothing written).
+    /// Any other negative `expected_version` is rejected up front (mirrors the Java
+    /// `IllegalArgumentException`): such a token can never match a stored version, so treating
+    /// it as a conflict would report "another writer got there first" instead of "the caller
+    /// passed a nonsensical token".
     pub fn save_if_version(
         &self,
         user_id: Option<&str>,
@@ -259,6 +297,7 @@ impl JdbcAgentStateStore {
     ) -> JdbcResult<i64> {
         Self::validate_session(session_id)?;
         Self::validate_key(key)?;
+        Self::validate_expected_version(expected_version)?;
         let slot = Self::slot_id(user_id, session_id);
         let json = Self::json_of(&value)?;
 
@@ -339,12 +378,13 @@ impl JdbcAgentStateStore {
     /// version`), so no concurrent writer can interleave between the write and the read.
     ///
     /// Fallback path: dialects without `RETURNING` (MySQL's `ON DUPLICATE KEY UPDATE`,
-    /// H2's `MERGE`) run the UPSERT then a separate `SELECT version`. That is a **known
-    /// non-atomic degradation**: a concurrent `save`/`save_if_version` committing in
-    /// between makes the returned version belong to that other write. It is still
-    /// monotonic (never lower than our own write's version) and always reflects committed
-    /// data, so callers can use it as a CAS token — they just cannot assume it identifies
-    /// *their* payload.
+    /// H2's `MERGE`) run the UPSERT then a separate `SELECT version`.
+    ///
+    /// Those two statements share **one transaction** (mirroring Java's
+    /// `executeInWriteTransaction`): the UPSERT holds the row lock until commit, so a
+    /// concurrent writer cannot commit in between and the version handed back is the one this
+    /// write produced. Without the transaction the follow-up `SELECT` could report *another*
+    /// writer's version — a CAS token this call never wrote.
     fn upsert_returning_version(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<i64> {
         let Some(bound) = self.dialect.session_state_upsert_returning_version(
             slot_id,
@@ -352,8 +392,7 @@ impl JdbcAgentStateStore {
             SINGLE_STATE_INDEX as i32,
             json,
         ) else {
-            self.save_single(slot_id, key, json)?;
-            return self.read_version_at(slot_id, key);
+            return self.upsert_then_read_version(slot_id, key, json);
         };
         let rows = self.executor.query(&bound)?;
         let version = rows
@@ -364,69 +403,99 @@ impl JdbcAgentStateStore {
         match version {
             Some(v) => Ok(v),
             // A dialect advertising a returning UPSERT must hand back exactly one row; if it
-            // does not, fall back to a plain read instead of reporting a bogus version.
+            // does not, fall back to a plain read instead of reporting a bogus version (and
+            // without a second write: the UPSERT above already landed).
             None => self.read_version_at(slot_id, key),
         }
     }
 
+    /// UPSERT followed by `SELECT version` inside one transaction — the no-`RETURNING`
+    /// equivalent of [`Self::upsert_returning_version`]'s single statement.
+    fn upsert_then_read_version(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<i64> {
+        let mut version = 0i64;
+        self.executor
+            .in_transaction(&mut |session: &mut dyn JdbcSession| -> JdbcResult<()> {
+                let bound = self.dialect.session_state_upsert(
+                    slot_id,
+                    key,
+                    SINGLE_STATE_INDEX as i32,
+                    json,
+                );
+                session.execute(&bound)?;
+                version = self.read_version_in(session, slot_id, key)?;
+                Ok(())
+            })?;
+        Ok(version)
+    }
+
     /// Saves a list using hash-based change detection, mirroring Java semantics.
+    ///
+    /// The whole read-modify-write — read `:_hash`, read `MAX(item_index)`, then insert the
+    /// tail / rewrite the list — runs inside **one** [`JdbcExecutor::in_transaction`] call,
+    /// mirroring Java's `executeInWriteTransaction`. Without that envelope a second writer
+    /// (another process, another pool connection) can commit between our reads and our
+    /// writes: our `existing` count is then stale, the tail INSERT hits the
+    /// `(session_id, state_key, item_index)` primary key, and the whole batch is rolled back
+    /// — an append silently lost. With the envelope the reads and writes are serialized
+    /// against every other writer of the same rows, so the index we append at is the index
+    /// that is actually committed.
     fn save_list_impl(&self, slot_id: &str, key: &str, values: &[Value]) -> JdbcResult<()> {
         if values.is_empty() {
             return Ok(());
         }
         let hash_key = format!("{key}{HASH_KEY_SUFFIX}");
         let current_hash = core_compute_hash(values);
-        let stored = self.stored_hash(slot_id, &hash_key)?;
-        let existing = self.list_count(slot_id, key)?;
+        // Serialize before opening the transaction so a bad value cannot leave one behind.
+        let payloads = values.iter().map(Self::json_of).collect::<JdbcResult<Vec<_>>>()?;
 
-        // Reuse core's list-hash change detection (mirrors Java `ListHashUtil.needsFullRewrite`)
-        // rather than inventing a parallel heuristic. `needs_full_rewrite` hashes the stored
-        // prefix of the incoming list and compares it against the persisted hash.
-        let needs_full_rewrite = core_needs_full_rewrite(values, stored.as_deref(), existing);
+        self.executor
+            .in_transaction(&mut |session: &mut dyn JdbcSession| -> JdbcResult<()> {
+                let stored = self.stored_hash(session, slot_id, &hash_key)?;
+                let existing = self.list_count(session, slot_id, key)?;
 
-        if needs_full_rewrite {
-            let mut batch = Vec::with_capacity(values.len() + 2);
-            batch.push(self.dialect.session_state_delete_by_key(slot_id, key));
-            for (index, value) in values.iter().enumerate() {
-                batch.push(self.dialect.session_state_insert(
+                // Reuse core's list-hash change detection (mirrors Java
+                // `ListHashUtil.needsFullRewrite`) rather than inventing a parallel heuristic.
+                // `needs_full_rewrite` hashes the stored prefix of the incoming list and
+                // compares it against the persisted hash.
+                let needs_full_rewrite =
+                    core_needs_full_rewrite(values, stored.as_deref(), existing);
+
+                if needs_full_rewrite {
+                    session.execute(&self.dialect.session_state_delete_by_key(slot_id, key))?;
+                    for (index, payload) in payloads.iter().enumerate() {
+                        session.execute(&self.dialect.session_state_insert(
+                            slot_id,
+                            key,
+                            index as i32,
+                            payload,
+                        ))?;
+                    }
+                } else if values.len() > existing {
+                    // Incremental append: only the tail beyond the stored prefix is inserted.
+                    for (offset, payload) in payloads[existing..].iter().enumerate() {
+                        session.execute(&self.dialect.session_state_insert(
+                            slot_id,
+                            key,
+                            (existing + offset) as i32,
+                            payload,
+                        ))?;
+                    }
+                } else {
+                    // Nothing changed: an identical list is a no-op (no hash rewrite either).
+                    return Ok(());
+                }
+
+                // The tail inserts and the hash upsert use different SQL templates
+                // (INSERT vs UPSERT); both run in the same transaction as the reads above,
+                // so a duplicate-PK abort can no longer leave the list half written.
+                session.execute(&self.dialect.session_state_upsert(
                     slot_id,
-                    key,
-                    index as i32,
-                    &Self::json_of(value)?,
-                ));
-            }
-            batch.push(self.dialect.session_state_upsert(
-                slot_id,
-                &hash_key,
-                SINGLE_STATE_INDEX as i32,
-                &current_hash,
-            ));
-            self.executor.execute_batch(&batch)?;
-        } else if values.len() > existing {
-            // Incremental append: only the tail beyond the stored prefix is inserted.
-            let tail = &values[existing..];
-            let mut batch = Vec::with_capacity(tail.len() + 1);
-            for (offset, value) in tail.iter().enumerate() {
-                batch.push(self.dialect.session_state_insert(
-                    slot_id,
-                    key,
-                    (existing + offset) as i32,
-                    &Self::json_of(value)?,
-                ));
-            }
-            batch.push(self.dialect.session_state_upsert(
-                slot_id,
-                &hash_key,
-                SINGLE_STATE_INDEX as i32,
-                &current_hash,
-            ));
-            // The tail inserts and the hash upsert use different SQL templates
-            // (INSERT vs UPSERT), so run them as a plain multi-statement transaction.
-            // Preparing only `batch[0]`'s SQL would execute the hash upsert with the
-            // INSERT template and corrupt/lose the append.
-            self.executor.execute_batch(&batch)?;
-        }
-        Ok(())
+                    &hash_key,
+                    SINGLE_STATE_INDEX as i32,
+                    &current_hash,
+                ))?;
+                Ok(())
+            })
     }
 }
 
@@ -457,7 +526,12 @@ impl AgentStateStore for JdbcAgentStateStore {
         }
         let slot = Self::slot_id(user_id, session_id);
         if let Err(e) = self.save_list_impl(&slot, key, values) {
-            tracing::warn!("[jdbc-state] save_list failed for {key}: {e}");
+            // The read-modify-write runs in one transaction, so a failure here means the whole
+            // append was rolled back — the stored list is still at its previous length, never
+            // half written. (A caller-visible failure channel is JDBC-12, blocked on core.)
+            tracing::warn!(
+                "[jdbc-state] save_list failed for {key}; the whole append was rolled back: {e}"
+            );
         }
     }
 
@@ -592,6 +666,16 @@ impl AgentStateStore for JdbcAgentStateStore {
             }
         }
     }
+}
+
+/// Extracts the `version` column (second column of the versioned projection) from a
+/// session-state select result. An absent row reports `0`, mirroring Java's `readVersion`.
+fn version_from_rows(rows: Vec<Vec<ColumnValue>>) -> i64 {
+    rows.into_iter()
+        .next()
+        .and_then(|r| r.into_iter().nth(1))
+        .and_then(|c| c.as_int())
+        .unwrap_or(0)
 }
 
 /// Builds a `LIKE` prefix pattern matching exactly `prefix` followed by anything,

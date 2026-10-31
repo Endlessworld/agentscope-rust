@@ -524,17 +524,17 @@ mod tests {
     async fn record_lossy_swallows_http_errors() {
         // Mirrors Java `testRecordWithHttpError`: `onErrorComplete()`.
         let (mock, adapter) = adapter(BailianLongTermMemoryConfig::new("key", "user"));
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 500,
-            body: "{\"error\":\"Internal error\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(
+            500,
+            "{\"error\":\"Internal error\"}",
+        )));
         // The strict API keeps the error visible...
         assert!(adapter.record(&[Msg::user("hi")]).await.is_err());
         // ...while the Java-parity variant swallows it.
-        mock.push_response(Err(MemError::HttpStatus {
-            status: 500,
-            body: "{\"error\":\"Internal error\"}".into(),
-        }));
+        mock.push_response(Err(MemError::http_status(
+            500,
+            "{\"error\":\"Internal error\"}",
+        )));
         adapter.record_lossy(&[Msg::user("hi")]).await;
     }
 

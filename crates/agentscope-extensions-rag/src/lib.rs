@@ -23,8 +23,13 @@
 //!   [`OllamaTextEmbedding`](embedding::OllamaTextEmbedding)).
 //! * [`reader`] — [`Reader`](reader::Reader), [`TextReader`](reader::TextReader),
 //!   [`ImageReader`](reader::ImageReader), [`ExternalApiReader`](reader::ExternalApiReader)
-//!   (caller-injected parsing API), the `ReaderUtils` id helpers and the
-//!   character/paragraph/token chunking algorithms.
+//!   (caller-injected parsing API, plus [`for_parsing_service`](reader::ExternalApiReader::for_parsing_service)
+//!   for a hosted JSON parser), the `ReaderUtils` id helpers, the character/paragraph/token
+//!   chunking algorithms and the [`input_as_bytes`](reader::input_as_bytes) resolver. The PDF /
+//!   DOCX readers ([`PdfReader`](reader::PdfReader), [`DocxReader`](reader::DocxReader)) always
+//!   exist and take an injected extraction seam; the optional `pdf` / `docx` features only add the
+//!   bundled `pdftotext` / `pandoc` extractors, and with a feature off `new()` reports
+//!   `RagError::Reader` instead of ingesting an empty document (tracker RAG-09).
 //! * [`message`] — mapping retrieved documents onto [`agentscope_core::message::Msg`],
 //!   covering both the agentic-tool format and the generic-hook `<retrieved_knowledge>`
 //!   injection.
@@ -89,9 +94,10 @@ pub use message::{
 };
 pub use model::{Document, DocumentMetadata, RetrieveConfig};
 pub use reader::{
-    chunk_text, BodyAsMarkdown, ExternalApiReader, ExternalApiReaderBuilder,
-    ExternalApiRequestBuilder, ExternalApiResponseParser, ImageReader, Reader, ReaderInput,
-    SplitStrategy, TextReader,
+    chunk_text, input_as_bytes, BodyAsMarkdown, DocxReader, DocxTextExtractor, ExternalApiReader,
+    ExternalApiReaderBuilder, ExternalApiRequestBuilder, ExternalApiResponseParser,
+    FileBodyRequest, ImageReader, PdfReader, PdfTextExtractor, Reader, ReaderInput, SplitStrategy,
+    TextReader,
 };
 pub use simple::{in_memory_knowledge, EmptyKnowledge, SimpleKnowledge};
 pub use store::{

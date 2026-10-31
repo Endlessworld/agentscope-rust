@@ -63,6 +63,14 @@ pub mod server_constants {
     pub const IS_STREAM_KEY: &str = "isStream";
 }
 
+/// Message returned by the four push-notification methods.
+///
+/// Push notifications are a documented design decision (the card keeps
+/// `capabilities.pushNotifications: false`), so the methods report the A2A 1.0
+/// `UnsupportedOperationError` instead of the generic method-not-found.
+pub const PUSH_NOT_SUPPORTED_MESSAGE: &str =
+    "Push notifications are not supported by this agent";
+
 /// Per-request options handed to an [`AgentRunner`].
 ///
 /// Mirrors Java `io.agentscope.core.a2a.server.executor.runner.AgentRequestOptions`.
@@ -512,10 +520,14 @@ fn part_metadata_mut(part: &mut Part) -> &mut agentscope_core::message::JsonMap 
 /// queue manager. This handler implements the same dispatch table over [`AgentRunner`], with
 /// no background queues so that tests stay deterministic:
 ///
-/// * `message/send` - runs the agent to completion, records the artifacts, returns the task
-/// * `message/stream` - relays the agent's incremental output as status/artifact events
-/// * `tasks/get` / `tasks/cancel` - task store lookups
-/// * `agent/getAuthenticatedExtendedCard` - returns the served card
+/// * `SendMessage` (0.3 alias `message/send`) - runs the agent to completion, records the
+///   artifacts, returns the task
+/// * `SendStreamingMessage` (0.3 alias `message/stream`) - relays the agent's incremental output
+///   as status/artifact events
+/// * `GetTask` / `CancelTask` (0.3 aliases `tasks/get` / `tasks/cancel`) - task store lookups
+/// * `GetExtendedAgentCard` (0.3 alias `agent/getAuthenticatedExtendedCard`) - returns the served
+///   card
+/// * the four push-notification methods - answer `UnsupportedOperationError` (`-32004`)
 ///
 /// Output assembly follows [`AgentExecuteProperties`]: which agent events become visible
 /// [`Msg`]s is decided by [`AgentOutputProjector`], and a non-blocking run only completes with a
@@ -601,12 +613,30 @@ impl A2aRequestHandler {
         request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcError> {
         match request.method.as_str() {
-            methods::MESSAGE_SEND => self.message_send(request).await,
-            methods::MESSAGE_STREAM => self.message_stream(request).await,
-            methods::TASKS_GET => self.tasks_get(request),
-            methods::TASKS_CANCEL => self.tasks_cancel(request),
-            methods::AGENT_CARD_GET => serde_json::to_value(&self.agent_card)
-                .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string())),
+            methods::MESSAGE_SEND | methods::LEGACY_MESSAGE_SEND => self.message_send(request).await,
+            methods::MESSAGE_STREAM | methods::LEGACY_MESSAGE_STREAM => {
+                self.message_stream(request).await
+            }
+            methods::TASKS_GET | methods::LEGACY_TASKS_GET => self.tasks_get(request),
+            methods::TASKS_CANCEL | methods::LEGACY_TASKS_CANCEL => self.tasks_cancel(request),
+            methods::AGENT_CARD_GET | methods::LEGACY_AGENT_CARD_GET => {
+                serde_json::to_value(&self.agent_card)
+                    .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))
+            }
+            // Push notifications are a design decision: not implemented (the card advertises
+            // `pushNotifications: false`), so the four methods answer `UnsupportedOperationError`
+            // (`-32004`) instead of the generic `-32601`, mirroring the A2A 1.0 error taxonomy.
+            methods::PUSH_CONFIG_SET
+            | methods::LEGACY_PUSH_CONFIG_SET
+            | methods::PUSH_CONFIG_GET
+            | methods::LEGACY_PUSH_CONFIG_GET
+            | methods::PUSH_CONFIG_LIST
+            | methods::LEGACY_PUSH_CONFIG_LIST
+            | methods::PUSH_CONFIG_DELETE
+            | methods::LEGACY_PUSH_CONFIG_DELETE => Err(JsonRpcError::new(
+                JsonRpcError::UNSUPPORTED_OPERATION,
+                PUSH_NOT_SUPPORTED_MESSAGE,
+            )),
             other => Err(JsonRpcError::new(
                 JsonRpcError::METHOD_NOT_FOUND,
                 format!("unsupported method: {other}"),
@@ -1801,6 +1831,59 @@ mod tests {
         let response =
             rt().block_on(handler.handle(&JsonRpcRequest::new("does/not/exist", None, None)));
         assert_eq!(response.error.unwrap().code, JsonRpcError::METHOD_NOT_FOUND);
+    }
+
+    // 2026-10-31 A2A 1.0 migration: every method name is PascalCase, and the 0.3 names stay
+    // dispatchable for two release cycles.
+    #[test]
+    fn the_wire_method_names_are_a2a_1_0_pascal_case() {
+        assert_eq!(methods::MESSAGE_SEND, "SendMessage");
+        assert_eq!(methods::MESSAGE_STREAM, "SendStreamingMessage");
+        assert_eq!(methods::TASKS_GET, "GetTask");
+        assert_eq!(methods::TASKS_CANCEL, "CancelTask");
+        assert_eq!(methods::TASKS_RESUBSCRIBE, "SubscribeToTask");
+        assert_eq!(methods::AGENT_CARD_GET, "GetExtendedAgentCard");
+        assert_eq!(methods::LEGACY_MESSAGE_SEND, "message/send");
+    }
+
+    #[test]
+    fn legacy_0_3_method_names_are_still_dispatched() {
+        let handler = handler();
+        let params = MessageSendParams {
+            message: Message::new("m-1", MessageRole::User, vec![Part::text("legacy")]),
+            configuration: None,
+            metadata: None,
+        };
+        let response = rt().block_on(handler.handle(&JsonRpcRequest::new(
+            methods::LEGACY_MESSAGE_SEND,
+            Some(serde_json::to_value(params).unwrap()),
+            Some(serde_json::Value::from(1)),
+        )));
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let task: Task = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(task.status.state, TaskState::Completed);
+    }
+
+    // Push notifications are a design decision (the card keeps `pushNotifications: false`): the
+    // four methods answer the A2A 1.0 `UnsupportedOperationError`, not the generic `-32601`.
+    #[test]
+    fn push_notification_methods_report_unsupported_operation() {
+        let handler = handler();
+        for method in [
+            methods::PUSH_CONFIG_SET,
+            methods::PUSH_CONFIG_GET,
+            methods::PUSH_CONFIG_LIST,
+            methods::PUSH_CONFIG_DELETE,
+            methods::LEGACY_PUSH_CONFIG_SET,
+            methods::LEGACY_PUSH_CONFIG_GET,
+            methods::LEGACY_PUSH_CONFIG_LIST,
+            methods::LEGACY_PUSH_CONFIG_DELETE,
+        ] {
+            let response = rt().block_on(handler.handle(&JsonRpcRequest::new(method, None, None)));
+            let error = response.error.unwrap_or_else(|| panic!("{method} must fail"));
+            assert_eq!(error.code, JsonRpcError::UNSUPPORTED_OPERATION, "{method}");
+            assert_eq!(error.message, PUSH_NOT_SUPPORTED_MESSAGE, "{method}");
+        }
     }
 
     #[test]

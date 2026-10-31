@@ -18,7 +18,7 @@ pub mod outbound;
 pub mod properties;
 pub mod token;
 
-pub use channel::{FeishuCallbackOutcome, FeishuChannel, FeishuChannelRegistry};
+pub use channel::{FeishuCallbackOutcome, FeishuChannel, FeishuChannelRegistry, CHANNEL_TYPE};
 pub use crypto::FeishuCrypto;
 pub use inbound::FeishuInboundMapper;
 pub use outbound::FeishuOutboundClient;

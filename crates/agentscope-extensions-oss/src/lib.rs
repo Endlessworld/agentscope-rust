@@ -66,10 +66,14 @@
 //! # fn main() {}
 //! ```
 //!
-//! > **Blocking note:** [`OssClient`] is synchronous and `S3OssClient` drives
-//! > its requests on a dedicated Tokio runtime via `block_on`. Do **not** call
-//! > its methods directly from a Tokio worker thread; wrap them in
-//! > `tokio::task::spawn_blocking` (or `block_in_place`) instead.
+//! > **Blocking note:** [`OssClient`] is synchronous. `S3OssClient` does **not**
+//! > `block_on` on the caller's thread: every request is shipped to a dedicated
+//! > worker thread that owns the Tokio runtime, so the stores can be used from
+//! > async contexts (Tokio worker threads, current-thread runtimes) as well as
+//! > from plain threads without a nested-runtime panic. Note the caller thread
+//! > still *blocks* for the duration of a request (that is what a synchronous
+//! > trait means), so very high-throughput async callers should still
+//! > `tokio::task::spawn_blocking` around batch operations.
 
 pub mod base_store;
 pub mod client;

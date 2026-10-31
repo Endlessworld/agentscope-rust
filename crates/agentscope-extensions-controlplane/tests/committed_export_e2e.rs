@@ -40,7 +40,7 @@ impl Model for FakeModel {
     }
 }
 
-fn temp_bridge() -> ControlPlaneBridge {
+async fn temp_bridge() -> ControlPlaneBridge {
     let cfg = ControlPlaneConfig::builder("friday")
         .instance_key("p0-13")
         .enable_events(true)
@@ -52,7 +52,7 @@ fn temp_bridge() -> ControlPlaneBridge {
         )
         .build()
         .unwrap();
-    ControlPlaneBridge::new(cfg).start().unwrap()
+    ControlPlaneBridge::new(cfg).start().await.unwrap()
 }
 
 fn agent_with_sink(sink: Arc<dyn SessionExportSink>) -> ReActAgent {
@@ -89,7 +89,7 @@ fn message_fact(seq: u64, text: &str) -> NativeSessionEvent {
 /// nothing and `source_watermark` stayed 0.
 #[tokio::test]
 async fn committed_events_from_a_real_run_reach_the_journal_once() {
-    let bridge = temp_bridge();
+    let bridge = temp_bridge().await;
     let agent = agent_with_sink(bridge.committed_event_sink());
 
     let reply = agent.call(vec![Msg::user("hello agent")]).await.unwrap();
@@ -140,7 +140,7 @@ async fn committed_events_from_a_real_run_reach_the_journal_once() {
 /// duplicate would append another Level-2 event.
 #[tokio::test]
 async fn duplicate_native_watermark_exports_once() {
-    let bridge = temp_bridge();
+    let bridge = temp_bridge().await;
     let sink = bridge.committed_event_sink();
     let fact = message_fact(5, "dedupe me");
 
@@ -177,7 +177,7 @@ async fn source_watermark_is_durable_across_bridge_reopen() {
     let fact = message_fact(9, "survive restart");
 
     {
-        let bridge = ControlPlaneBridge::new(cfg.clone()).start().unwrap();
+        let bridge = ControlPlaneBridge::new(cfg.clone()).start().await.unwrap();
         bridge
             .committed_event_sink()
             .accept_for("s1", &fact)
@@ -185,7 +185,7 @@ async fn source_watermark_is_durable_across_bridge_reopen() {
         assert_eq!(bridge.pending_event_count(), 1);
     }
 
-    let reopened = ControlPlaneBridge::new(cfg).start().unwrap();
+    let reopened = ControlPlaneBridge::new(cfg).start().await.unwrap();
     assert_eq!(reopened.source_watermark("s1"), 9);
     reopened
         .committed_event_sink()
@@ -205,7 +205,7 @@ async fn source_watermark_is_durable_across_bridge_reopen() {
 /// start journaling behind the host's back.
 #[tokio::test]
 async fn no_sink_configured_is_a_noop() {
-    let bridge = temp_bridge();
+    let bridge = temp_bridge().await;
     let agent = ReActAgent::builder()
         .name("friday")
         .model(Arc::new(FakeModel))

@@ -588,10 +588,23 @@ mod tests {
         let json = serde_json::to_value(&card).unwrap();
         assert_eq!(json["documentationUrl"], "http://docs");
         assert_eq!(json["name"], "demo");
-        assert_eq!(json["preferredTransport"], "JSONRPC");
-        // Flattened wrapper must deserialize back into the same card.
+        // A2A 1.0 moved the endpoints into `supportedInterfaces`; the old flat
+        // `preferredTransport` key is no longer emitted (PROTO-A2A-01).
+        assert!(json.get("preferredTransport").is_none());
+        assert_eq!(
+            json["supportedInterfaces"][0]["protocolBinding"],
+            "JSONRPC"
+        );
+        assert_eq!(json["supportedInterfaces"][0]["url"], "http://localhost:8080");
+        // Flattened wrapper must deserialize back into the same card. The card-level
+        // `protocolVersion` is not part of the 1.0 wire shape (every interface
+        // carries it), so only the stable fields are compared.
         let back: A2aAgentCard = serde_json::from_value(json).unwrap();
-        assert_eq!(back, card);
+        assert_eq!(back.url, card.url);
+        assert_eq!(back.preferred_transport, card.preferred_transport);
+        assert_eq!(back.additional_interfaces, card.additional_interfaces);
+        assert_eq!(back.skills, card.skills);
+        assert_eq!(back.documentation_url, card.documentation_url);
     }
 
     #[test]

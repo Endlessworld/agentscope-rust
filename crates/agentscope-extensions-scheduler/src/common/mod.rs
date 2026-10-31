@@ -13,6 +13,6 @@ pub use config::{
     ScheduleMode, ScheduleZoneError, StaticModelConfig,
 };
 pub use scheduler::{
-    AgentFactory, AgentScheduler, BaseScheduleAgentTask, ScheduleAgentTask, SchedulerError,
-    TaskControl,
+    AgentFactory, AgentScheduler, BaseScheduleAgentTask, NoopSchedulerLock, ScheduleAgentTask,
+    SchedulerError, SchedulerLock, TaskControl,
 };

@@ -5,7 +5,27 @@
 //! * [`common`]    — shared config + `AgentScheduler` / `ScheduleAgentTask` contracts
 //!   (the crate-internal shared layer).
 //! * [`quartz`]    — Quartz-equivalent scheduler built on tokio timers.
-//! * [`xxljob`]    — XXL-Job-style job handler registry.
+//! * [`xxljob`]    — XXL-Job-style job handler registry, plus the host bridge
+//!   contract for the executor protocol ([`ExecutorBridge`]).
+//!
+//! # Deployment premise
+//!
+//! * **One scheduler instance per schedule.** Tasks live in a process-local map
+//!   with no shared store, so two instances scheduling the same CRON would both
+//!   fire it (tracker `SCHED-05`). A host that really runs several instances
+//!   injects a [`SchedulerLock`] backed by its storage layer
+//!   (`QuartzAgentSchedulerBuilder::scheduler_lock`); the default
+//!   [`NoopSchedulerLock`] grants every slot, which *is* the single-instance
+//!   premise. Manual `trigger`/`run` calls always execute locally, like Java
+//!   `triggerJob`.
+//! * **Concurrency is bounded** by a semaphore (tracker `SCHED-09`): scheduled
+//!   firings of one scheduler run at most
+//!   [`QuartzAgentScheduler::DEFAULT_MAX_CONCURRENCY`] (10, Quartz's default
+//!   thread-pool size) at a time unless the builder sets another limit. Manual
+//!   `trigger`/`run` calls are not throttled.
+//! * **xxl-job transport belongs to the host** (tracker `SCHED-06`): the crate
+//!   embeds no HTTP server and exposes [`ExecutorBridge`] with the
+//!   [`DispatchRequest`] → `XxlJobContext` field mapping instead.
 //!
 //! See `docs/extensions/SCHEDULER__GAP_TRACKER.md` for migration status.
 
@@ -15,17 +35,18 @@ pub mod xxljob;
 
 pub use common::{
     AgentConfig, AgentConfigBuilder, AgentConfigError, AgentFactory, AgentScheduler,
-    BaseScheduleAgentTask, ModelConfig, RuntimeAgentConfig, RuntimeAgentConfigBuilder,
-    ScheduleAgentTask, ScheduleConfig, ScheduleConfigBuilder, ScheduleConfigError, ScheduleMode,
-    ScheduleZoneError, SchedulerError, StaticModelConfig, TaskControl,
+    BaseScheduleAgentTask, ModelConfig, NoopSchedulerLock, RuntimeAgentConfig,
+    RuntimeAgentConfigBuilder, ScheduleAgentTask, ScheduleConfig, ScheduleConfigBuilder,
+    ScheduleConfigError, ScheduleMode, ScheduleZoneError, SchedulerError, SchedulerLock,
+    StaticModelConfig, TaskControl,
 };
 pub use quartz::{
     CronExpression, CronParseError, QuartzAgentScheduler, QuartzAgentSchedulerBuilder,
     QuartzScheduleAgentTask, SchedulerRegistry, TaskStatus,
 };
 pub use xxljob::{
-    XxlJobAgentScheduler, XxlJobContext, XxlJobHandleCode, XxlJobHandleResult, XxlJobHelper,
-    XxlJobLogMiddleware,
+    DispatchRequest, ExecuteResponse, ExecutorBridge, XxlJobAgentScheduler, XxlJobContext,
+    XxlJobHandleCode, XxlJobHandleResult, XxlJobHelper, XxlJobLogMiddleware,
 };
 
 /// Test-only helpers shared across module unit tests.

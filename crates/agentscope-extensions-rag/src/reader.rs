@@ -3,11 +3,19 @@
 //! Ports `io.agentscope.core.rag.reader` (`Reader`, `ReaderInput`, `AbstractChunkingReader`,
 //! `TextReader`, `TextChunker`, `SplitStrategy`, `ReaderUtils`, `ImageReader`, `ExternalApiReader`).
 //!
-//! The Java `TikaReader` / `PDFReader` / `WordReader` depend on JVM libraries (Apache Tika,
-//! PDFBox, POI) and are a deliberate non-migration (tracker §3.3, P2). `TextReader`, the
-//! chunking algorithm, the dependency-free [`ImageReader`], the id helpers (`ReaderUtils`) and
-//! the [`ExternalApiReader`] (caller-injected request/response contract over
+//! Java's `TikaReader` depends on Apache Tika and is a deliberate non-migration (tracker §3.3,
+//! P2). `TextReader`, the chunking algorithm, the dependency-free [`ImageReader`], the id helpers
+//! (`ReaderUtils`) and the [`ExternalApiReader`] (caller-injected request/response contract over
 //! [`crate::transport`]) are fully ported.
+//!
+//! The Java `PDFReader` / `WordReader` (PDFBox / POI) are ported as **format readers with a
+//! pluggable extraction seam** ([`pdf::PdfReader`], [`docx::DocxReader`], tracker RAG-09). They
+//! bundle no third-party parser: text extraction is either injected ([`pdf::PdfTextExtractor`] /
+//! [`docx::DocxTextExtractor`]) or provided by the optional `pdf` / `docx` cargo features, which
+//! add dependency-free extractors that shell out to `pdftotext` / `pandoc`. With the feature off
+//! the reader reports a [`RagError::Reader`] instead of silently ingesting nothing. Scanned
+//! documents / OCR are out of scope; a hosted parsing service is reachable through
+//! [`ExternalApiReader::for_parsing_service`].
 
 use agentscope_core::message::ContentBlock;
 use async_trait::async_trait;
@@ -15,15 +23,19 @@ use async_trait::async_trait;
 use crate::error::{RagError, Result};
 use crate::model::{Document, DocumentMetadata};
 
+pub mod docx;
 pub mod external_api;
 pub mod image;
+pub mod pdf;
 pub mod utils;
 
+pub use docx::{DocxReader, DocxTextExtractor};
 pub use external_api::{
     BodyAsMarkdown, ExternalApiReader, ExternalApiReaderBuilder, ExternalApiRequestBuilder,
-    ExternalApiResponseParser,
+    ExternalApiResponseParser, FileBodyRequest,
 };
 pub use image::{ImageReader, SUPPORTED_FORMATS};
+pub use pdf::{PdfReader, PdfTextExtractor};
 pub use utils::{
     bytes_to_hex, generate_doc_id, generate_doc_id_md5, generate_doc_id_sha256, DocIdAlgorithm,
 };
@@ -111,6 +123,66 @@ pub(crate) fn input_as_path(input: &ReaderInput) -> String {
         ReaderInput::String(value) => value.clone(),
         ReaderInput::File(path) => path.display().to_string(),
     }
+}
+
+/// Resolves a [`ReaderInput`] to its raw bytes (the binary counterpart of
+/// [`ReaderInput::as_string`]).
+///
+/// A [`ReaderInput::String`] yields the string's UTF-8 bytes; a [`ReaderInput::File`] yields the
+/// file's contents, with the same [`RagError::Reader`] surface as [`ReaderInput::as_string`].
+/// Binary format readers use this to hand the untouched document to an extractor
+/// (tracker RAG-09).
+///
+/// Note that path-based readers ([`ImageReader`], [`ExternalApiReader`], [`pdf::PdfReader`],
+/// [`docx::DocxReader`]) interpret even a `String` input as a path and therefore resolve their
+/// bytes with [`input_path_bytes`], not with this function.
+pub fn input_as_bytes(input: &ReaderInput) -> Result<Vec<u8>> {
+    match input {
+        ReaderInput::String(value) => Ok(value.clone().into_bytes()),
+        ReaderInput::File(_) => input_path_bytes(input),
+    }
+}
+
+/// Resolves a path-shaped input (a [`ReaderInput::File`], or a path carried in
+/// [`ReaderInput::String`]) to the file's raw bytes.
+///
+/// Mirrors the [`ReaderInput::as_string`] error surface (`File does not exist: ...` /
+/// `Failed to read ...`).
+pub(crate) fn input_path_bytes(input: &ReaderInput) -> Result<Vec<u8>> {
+    let path = std::path::PathBuf::from(input_as_path(input));
+    if !path.exists() {
+        return Err(RagError::Reader(format!(
+            "File does not exist: {}",
+            path.display()
+        )));
+    }
+    std::fs::read(&path)
+        .map_err(|e| RagError::Reader(format!("Failed to read {}: {e}", path.display())))
+}
+
+/// Chunks `text` and builds one [`Document`] per chunk, with `doc_id` and chunk ids `"0"`, `"1"`, ...
+///
+/// Shared by [`TextReader::create_documents`] and the binary format readers ([`pdf::PdfReader`],
+/// [`docx::DocxReader`]), which chunk extracted text exactly like `TextReader`.
+pub(crate) fn chunk_documents(
+    text: &str,
+    doc_id: &str,
+    chunk_size: usize,
+    strategy: SplitStrategy,
+    overlap_size: usize,
+) -> Result<Vec<Document>> {
+    let chunks = chunk_text(text, chunk_size, strategy, overlap_size)?;
+    Ok(chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            Document::new(DocumentMetadata::new(
+                ContentBlock::Text(agentscope_core::message::TextBlock::new(chunk.clone())),
+                doc_id,
+                index.to_string(),
+            ))
+        })
+        .collect())
 }
 
 /// Validates chunking parameters.
@@ -358,7 +430,7 @@ impl Reader for TextReader {
 /// Java uses `UUID.randomUUID()`. A random id would make chunk ids non-reproducible and
 /// would prevent deterministic tests, so the Rust port derives a version-3 UUID from the
 /// input source instead (see tracker §2.1 for the deliberate deviation).
-fn doc_id_for_input(input: &ReaderInput) -> String {
+pub(crate) fn doc_id_for_input(input: &ReaderInput) -> String {
     let seed = match input {
         ReaderInput::String(_) => "reader-input:string".to_string(),
         ReaderInput::File(path) => format!("reader-input:file:{}", path.display()),
@@ -463,5 +535,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RagError::Reader(_)));
+    }
+
+    #[test]
+    fn input_as_bytes_returns_text_bytes_and_file_contents() {
+        let text = input_as_bytes(&ReaderInput::from_string("h\u{e9}llo")).unwrap();
+        assert_eq!(text, "h\u{e9}llo".as_bytes());
+
+        let path = std::env::temp_dir().join(format!(
+            "rag-reader-bytes-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, [0x25u8, 0x50, 0x44, 0x46, 0x00, 0xff]).unwrap();
+        let bytes = input_as_bytes(&ReaderInput::from_file(path.clone())).unwrap();
+        assert_eq!(bytes, vec![0x25, 0x50, 0x44, 0x46, 0x00, 0xff]);
+        assert_eq!(
+            input_path_bytes(&ReaderInput::from_file(path.clone())).unwrap(),
+            bytes,
+            "a path-shaped input resolves to the same file bytes"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn input_as_bytes_reports_a_missing_file_like_as_string() {
+        let missing = ReaderInput::from_file("definitely/missing.pdf");
+        let error = input_as_bytes(&missing).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            missing.as_string().unwrap_err().to_string(),
+            "both resolvers share one error surface"
+        );
+        assert!(error.to_string().contains("File does not exist"));
+
+        // A path carried in `String` is resolved by the path-shaped helper.
+        let error =
+            input_path_bytes(&ReaderInput::from_string("definitely/missing.pdf")).unwrap_err();
+        assert!(error.to_string().contains("File does not exist"));
     }
 }

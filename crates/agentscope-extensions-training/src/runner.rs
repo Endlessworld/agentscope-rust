@@ -1017,6 +1017,22 @@ impl TrainingRouter {
 // TrainingHook (explicit assembly, Java `AgentBase.addSystemHook`)
 // ---------------------------------------------------------------------------
 
+/// [`RuntimeContext`] extension key carrying this call's [`TrainingAnnotation`].
+///
+/// The string is deliberately identical to Java's `TrainingContext.REACTOR_KEY`, so the
+/// marker keeps the same name in both languages. Hosts attach it per call through
+/// [`ReActAgent::stream_events_with_extensions`] (or `run_stream_with_extensions`), which
+/// is the Rust counterpart of Reactor's `contextWrite`: the marking applies to that call
+/// only. See [`TrainingHook`].
+pub const TRAINING_ANNOTATION_CONTEXT_KEY: &str = "agentscope.training.marker";
+
+/// Fallback annotation source for [`TrainingHook`], used when the call context carries no
+/// [`TrainingAnnotation`] under [`TRAINING_ANNOTATION_CONTEXT_KEY`].
+///
+/// This is the zero-host-change compatibility path: it has global (or thread-bound, if the
+/// closure reads a thread-local) semantics rather than per-call precision.
+pub type AnnotationProvider = Arc<dyn Fn() -> Option<TrainingAnnotation> + Send + Sync>;
+
 /// Middleware that drives a [`TrainingRouter`] once a production call finishes.
 ///
 /// Java's `TrainingRunner.start()` registers the router through
@@ -1050,11 +1066,27 @@ impl TrainingRouter {
 ///
 /// A call that fails before producing an `AGENT_RESULT` (for example an interrupted
 /// run) has no reply message, so it is skipped instead of being trained on.
+///
+/// The training marker reaches the hook through two sources, in this order:
+///
+/// 1. the call-scoped [`RuntimeContext`] extension stored under
+///    [`TRAINING_ANNOTATION_CONTEXT_KEY`] — the exact semantics of Java's
+///    `TrainingContext.mark()` (`contextWrite`): per call, nothing leaks to later runs;
+/// 2. the fallback [`TrainingHook::annotation_provider`] installed by the host, for
+///    deployments that cannot inject per-call extensions.
+///
+/// The context always wins, so a call that explicitly clears its marking is not
+/// overridden by a global provider.
 pub struct TrainingHook {
     router: Arc<TrainingRouter>,
     spec: Mutex<ShadowAgentSpec>,
     agent: Mutex<Option<Weak<ReActAgent>>>,
     completed_calls: Arc<AtomicUsize>,
+    /// Fallback annotation source, consulted only when the call context carries none.
+    annotation_provider: Mutex<Option<AnnotationProvider>>,
+    /// Number of shadow rounds this hook has driven (sum of `run_shadow` reports).
+    /// `0` for a completed call means the call was not selected for training.
+    shadow_rounds: Arc<AtomicUsize>,
     /// When `false` the hook stays installed but behaves like the default middleware
     /// (pure passthrough). This is the Rust counterpart of Java
     /// `AgentBase.removeSystemHook(router)`: a built [`MiddlewareChain`] cannot be
@@ -1070,6 +1102,8 @@ impl TrainingHook {
             spec: Mutex::new(ShadowAgentSpec::default()),
             agent: Mutex::new(None),
             completed_calls: Arc::new(AtomicUsize::new(0)),
+            annotation_provider: Mutex::new(None),
+            shadow_rounds: Arc::new(AtomicUsize::new(0)),
             enabled: AtomicBool::new(true),
         }
     }
@@ -1118,6 +1152,53 @@ impl TrainingHook {
         self.completed_calls.load(Ordering::SeqCst)
     }
 
+    /// Number of shadow rounds this hook has driven so far.
+    ///
+    /// This is the count of run reports returned by
+    /// [`TrainingRouter::run_shadow`], so a completed call with `0` rounds was not
+    /// selected for training (e.g. an unmarked call under
+    /// [`crate::strategy::ExplicitMarkingStrategy`]).
+    pub fn shadow_rounds(&self) -> usize {
+        self.shadow_rounds.load(Ordering::SeqCst)
+    }
+
+    /// Installs a fallback annotation provider (builder style).
+    ///
+    /// The provider is consulted **only** when the call did not carry a
+    /// [`TrainingAnnotation`] in its [`RuntimeContext`] (see
+    /// [`TRAINING_ANNOTATION_CONTEXT_KEY`]), so per-call marking always wins.
+    pub fn annotation_provider(self, provider: AnnotationProvider) -> Self {
+        self.set_annotation_provider(provider);
+        self
+    }
+
+    /// Installs (or replaces) the fallback annotation provider in place.
+    ///
+    /// Use this when the hook is already installed in a [`MiddlewareChain`] (the
+    /// builder-style [`Self::annotation_provider`] consumes the hook).
+    pub fn set_annotation_provider(&self, provider: AnnotationProvider) {
+        *self.annotation_provider.lock().unwrap() = Some(provider);
+    }
+
+    /// Removes the fallback annotation provider.
+    pub fn clear_annotation_provider(&self) {
+        *self.annotation_provider.lock().unwrap() = None;
+    }
+
+    /// Resolves the annotation for one call: the call-scoped [`RuntimeContext`] extension
+    /// first (Java `TrainingContext.getCurrent`), the installed provider second.
+    fn resolve_annotation(&self, ctx: &RuntimeContext) -> Option<TrainingAnnotation> {
+        if let Some(annotation) =
+            ctx.extension::<TrainingAnnotation>(TRAINING_ANNOTATION_CONTEXT_KEY)
+        {
+            return Some((*annotation).clone());
+        }
+        // Clone the `Arc` and drop the guard before calling out, so a provider that
+        // touches this hook cannot deadlock on the same mutex.
+        let provider = self.annotation_provider.lock().unwrap().clone();
+        provider.and_then(|provider| provider())
+    }
+
     /// The router this hook drives.
     pub fn router(&self) -> Arc<TrainingRouter> {
         Arc::clone(&self.router)
@@ -1131,13 +1212,16 @@ impl Middleware for TrainingHook {
 
     fn on_agent(
         &self,
-        _ctx: &RuntimeContext,
+        ctx: &RuntimeContext,
         input: AgentInput,
         next: Next<AgentInput>,
     ) -> EventStream {
         if !self.is_enabled() {
             return next(input);
         }
+        // Resolve the training marker before the inner stream runs: it is call-scoped
+        // state (TRAIN-01/TRAIN-11), not hook-level configuration.
+        let annotation = self.resolve_annotation(ctx);
         let inputs = input.messages.clone();
         let reply: Arc<Mutex<Option<Msg>>> = Arc::new(Mutex::new(None));
         let reply_slot = Arc::clone(&reply);
@@ -1154,6 +1238,7 @@ impl Middleware for TrainingHook {
         let router = Arc::clone(&self.router);
         let spec = self.spec.lock().unwrap().clone();
         let completed = Arc::clone(&self.completed_calls);
+        let shadow_rounds = Arc::clone(&self.shadow_rounds);
         let tail = futures::stream::once(async move {
             let Some(agent) = agent.and_then(|weak| weak.upgrade()) else {
                 return;
@@ -1162,9 +1247,17 @@ impl Middleware for TrainingHook {
                 return;
             };
             let agent_name = agent.name().to_string();
-            router
-                .run_shadow(&agent_name, &agent, inputs, output, None, spec)
+            let reports = router
+                .run_shadow(
+                    &agent_name,
+                    &agent,
+                    inputs,
+                    output,
+                    annotation.as_ref(),
+                    spec,
+                )
                 .await;
+            shadow_rounds.fetch_add(reports.len(), Ordering::SeqCst);
             completed.fetch_add(1, Ordering::SeqCst);
         })
         .filter_map(|_| async { None::<Result<AgentEvent>> });
@@ -1428,6 +1521,8 @@ mod tests {
     use super::*;
     use crate::reward::ZeroRewardCalculator;
     use crate::strategy::{SamplingRateStrategy, TrainingAnnotation};
+    use agentscope_core::agent::{Extensions, StreamOptions};
+    use futures::StreamExt as _;
 
     #[test]
     fn run_execution_context_collects() {
@@ -1790,6 +1885,18 @@ mod tests {
             shared.task_registry(),
             &TaskExecutionRegistry::global()
         ));
+    }
+
+    #[test]
+    fn default_router_never_touches_the_global_registries() {
+        // HARNESS-17: the default `TrainingRouter::new` must be instance-scoped, so two
+        // tests running in parallel cannot observe each other's run counters (the old
+        // process-wide registry made them share one namespace and required `clear_all()`).
+        let task = task_id_generator::generate();
+        let router = router_with(0.0, 1);
+        assert_eq!(router.run_registry().allocate_run_id(&task), "0");
+        assert_eq!(router.run_registry().get_current_run_count(&task), 1);
+        assert_eq!(RunRegistry::global().get_current_run_count(&task), 0);
     }
 
     #[test]
@@ -2268,5 +2375,253 @@ mod tests {
         // The production agent keeps working; only the training hook went quiet.
         agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(hook.completed_calls(), 1);
+    }
+
+    // --- TRAIN-01 / TRAIN-11: the training marker reaches the automatic path -------
+
+    /// Loopback stand-in for the Trinity endpoint used by accepted shadow runs.
+    ///
+    /// A shadow run posts an OpenAI-compatible **non-streaming** completion to
+    /// `/v1/chat/completions` (the adapter forces `stream=false`), then the router posts
+    /// `/feedback`. Both are answered with fixed JSON, so the hook tests stay fully
+    /// offline (no live model, no Trinity server) and deterministic: a real refused
+    /// connection would be retried by the core model policy with 2s..60s backoff.
+    mod trinity_mock {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        fn header_end(buf: &[u8]) -> Option<usize> {
+            buf.windows(4).position(|w| w == b"\r\n\r\n")
+        }
+
+        fn content_length(head: &str) -> usize {
+            head.lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        }
+
+        /// Serves exactly `expected_requests` connections, replying with the status body
+        /// for `/feedback` and an OpenAI completion for everything else.
+        ///
+        /// Returns the endpoint, the number of requests already answered (assert before
+        /// joining the thread: a short count means the test failed, and `join` would
+        /// block on an `accept` that never comes).
+        pub fn spawn(
+            expected_requests: usize,
+        ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<Vec<String>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let served = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&served);
+            let handle = std::thread::spawn(move || {
+                let mut lines = Vec::new();
+                for _ in 0..expected_requests {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return lines;
+                    };
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(end) = header_end(&buf) {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                            if buf.len() >= end + 4 + content_length(&head) {
+                                break;
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let (head, _body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+                    let request_line = head.lines().next().unwrap_or("").to_string();
+                    let body = if request_line.contains("/feedback") {
+                        r#"{"status":"success","message":"ok"}"#
+                    } else {
+                        // Only the fields the decoder reads, all of which default.
+                        r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"shadow ok"},"finish_reason":"stop"}]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    lines.push(request_line);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                lines
+            });
+            (format!("http://{addr}"), served, handle)
+        }
+    }
+
+    /// Router that only trains calls carrying an explicit marking.
+    fn explicit_marking_router(endpoint: &str) -> TrainingRouter {
+        let config = TrainingConfig::builder()
+            .trinity_endpoint(endpoint)
+            .selection_strategy(Arc::new(crate::strategy::ExplicitMarkingStrategy::create()))
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .repeat_time(1)
+            .build()
+            .unwrap();
+        let client = TrinityClient::builder().endpoint(endpoint).build().unwrap();
+        TrainingRouter::new(config, client)
+    }
+
+    fn reply_agent(chain: MiddlewareChain) -> Arc<ReActAgent> {
+        Arc::new(
+            ReActAgent::builder()
+                .name("prod")
+                .model(Arc::new(model_support::ReplyModel))
+                .middleware_chain(chain)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Drains an event stream to completion: the hook's post-call step sits at the tail
+    /// of the stream, so it only runs once every item has been consumed.
+    async fn drain(mut stream: EventStream) -> Vec<Result<AgentEvent>> {
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn training_hook_trains_calls_marked_through_runtime_context() {
+        let (endpoint, served, server) = trinity_mock::spawn(2);
+        let router = Arc::new(explicit_marking_router(&endpoint));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(Arc::clone(&router)));
+        hook.install(&mut chain);
+        let agent = reply_agent(chain);
+        hook.bind_agent(&agent);
+
+        // TRAIN-11 (a): the marking is call-scoped state in `RuntimeContext.extensions`,
+        // the Rust counterpart of Java's `TrainingContext.mark()` + `contextWrite`. Before
+        // the fix the hook hard-coded `None`, so this call trained nothing.
+        let mut extensions = Extensions::new();
+        extensions.insert(
+            TRAINING_ANNOTATION_CONTEXT_KEY,
+            TrainingAnnotation::enabled(),
+        );
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            drain(agent.stream_events_with_extensions(
+                vec![Msg::user("hi")],
+                StreamOptions::default(),
+                extensions,
+            )),
+        )
+        .await
+        .expect("a marked call must not stall on the fake Trinity endpoint");
+        assert!(events.iter().all(|event| event.is_ok()));
+
+        assert_eq!(hook.completed_calls(), 1);
+        // One shadow round ran: chat completion + feedback, both served locally.
+        assert_eq!(hook.shadow_rounds(), 1);
+        assert_eq!(router.task_registry().get_task_count(), 1);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let lines = server.join().unwrap();
+        assert!(
+            lines[0].starts_with("POST /v1/chat/completions"),
+            "unexpected request: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("POST /feedback"),
+            "unexpected request: {}",
+            lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn training_hook_skips_calls_without_a_marking() {
+        // A closed port is safe here: the call is rejected by the strategy before any
+        // shadow run (and therefore any request) is attempted.
+        let router = Arc::new(explicit_marking_router("http://127.0.0.1:1"));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(Arc::clone(&router)));
+        hook.install(&mut chain);
+        let agent = reply_agent(chain);
+        hook.bind_agent(&agent);
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        // The hook still observed the call, but no annotation means no training data.
+        assert_eq!(hook.completed_calls(), 1);
+        assert_eq!(hook.shadow_rounds(), 0);
+        assert_eq!(router.task_registry().get_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn training_hook_annotation_provider_marks_calls_without_host_changes() {
+        let (endpoint, served, server) = trinity_mock::spawn(2);
+        let router = Arc::new(explicit_marking_router(&endpoint));
+        let mut chain = MiddlewareChain::new();
+        // TRAIN-11 (b): the fallback provider needs no extension injection, so a host
+        // that just calls `agent.call(...)` still trains.
+        let hook = Arc::new(
+            TrainingHook::new(Arc::clone(&router))
+                .annotation_provider(Arc::new(|| Some(TrainingAnnotation::enabled()))),
+        );
+        hook.install(&mut chain);
+        let agent = reply_agent(chain);
+        hook.bind_agent(&agent);
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), agent.call(vec![Msg::user("hi")]))
+            .await
+            .expect("a marked call must not stall on the fake Trinity endpoint")
+            .unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        assert_eq!(hook.completed_calls(), 1);
+        assert_eq!(hook.shadow_rounds(), 1);
+        assert_eq!(router.task_registry().get_task_count(), 1);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_scoped_annotation_wins_over_the_provider() {
+        let router = Arc::new(explicit_marking_router("http://127.0.0.1:1"));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(
+            TrainingHook::new(Arc::clone(&router))
+                .annotation_provider(Arc::new(|| Some(TrainingAnnotation::enabled()))),
+        );
+        hook.install(&mut chain);
+        let agent = reply_agent(chain);
+        hook.bind_agent(&agent);
+
+        // The call explicitly opts out; a global provider must not override it.
+        let mut extensions = Extensions::new();
+        extensions.insert(
+            TRAINING_ANNOTATION_CONTEXT_KEY,
+            TrainingAnnotation::builder().enabled(false).build(),
+        );
+        let events = drain(agent.stream_events_with_extensions(
+            vec![Msg::user("hi")],
+            StreamOptions::default(),
+            extensions,
+        ))
+        .await;
+        assert!(events.iter().all(|event| event.is_ok()));
+        assert_eq!(hook.completed_calls(), 1);
+        assert_eq!(hook.shadow_rounds(), 0);
     }
 }

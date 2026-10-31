@@ -86,6 +86,14 @@ pub fn qualified_table(schema: Option<&str>, table: &str) -> String {
 }
 
 /// SQL for the agent session-state table.
+///
+/// `version ... DEFAULT 1` (PG-03): every write path binds `version = 1` explicitly, so the
+/// default only matters for rows inserted by a **foreign** writer. `0` is the sentinel
+/// `get_versioned()` reports for "row absent", so defaulting to `0` made any row created
+/// without an explicit version look absent to `save_if_version(.., 0)` and turned the
+/// "create if absent" CAS into a phantom success on an existing row. Java still says
+/// `DEFAULT 0` (its own comment calls that the wrong default); this is a deliberate,
+/// documented DDL difference — see `docs/migrations/postgresql_session_version_default.md`.
 pub fn sessions_ddl(full_table: &str) -> String {
     format!(
         r#"CREATE TABLE IF NOT EXISTS {full_table} (
@@ -93,7 +101,7 @@ pub fn sessions_ddl(full_table: &str) -> String {
     state_key  VARCHAR(255) NOT NULL,
     item_index INT          NOT NULL DEFAULT 0,
     state_data TEXT         NOT NULL,
-    version    BIGINT       NOT NULL DEFAULT 0,
+    version    BIGINT       NOT NULL DEFAULT 1,
     created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (session_id, state_key, item_index)
@@ -303,13 +311,20 @@ mod tests {
     }
 
     /// Java: the three shipped `CREATE TABLE IF NOT EXISTS` templates.
+    ///
+    /// PG-03: `version` defaults to **1**, not Java's `0` — `0` is the "row absent" sentinel
+    /// of the CAS path, so a `0` default made an existing row look absent to
+    /// `save_if_version(.., 0)` and let it overwrite data it should have rejected.
     #[test]
     fn sessions_ddl_declares_primary_key_and_version_column() {
         let ddl = sessions_ddl("\"s\".\"t\"");
         assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS \"s\".\"t\""));
         assert!(ddl.contains("PRIMARY KEY (session_id, state_key, item_index)"));
         assert!(ddl.contains("state_data TEXT         NOT NULL"));
-        assert!(ddl.contains("version    BIGINT       NOT NULL DEFAULT 0"));
+        assert!(ddl.contains("version    BIGINT       NOT NULL DEFAULT 1"));
+        // Regression guard: the absent-row sentinel must never be the version default
+        // (`item_index ... DEFAULT 0` is unrelated and stays).
+        assert!(!ddl.contains("version    BIGINT       NOT NULL DEFAULT 0"));
     }
 
     /// Java: the KV store DDL.

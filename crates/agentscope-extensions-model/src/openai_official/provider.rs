@@ -19,6 +19,7 @@ use super::credential::OpenAIOfficialCredential;
 use super::formatter::ResponsesMultiAgentFormatter;
 use super::model::{default_transport, OpenAIResponsesChatModel};
 use super::server_tool::OpenAIServerTool;
+use crate::common::SharedTransport;
 
 /// Provider plugin that builds [`OpenAIResponsesChatModel`] instances.
 #[derive(Debug, Default, Clone, Copy)]
@@ -77,6 +78,24 @@ impl ModelProvider for OpenAIOfficialModelProvider {
                 ctx.model
             )));
         }
+        let model = self.create_with_transport(ctx, default_transport())?;
+        Ok(Arc::new(model))
+    }
+}
+
+impl OpenAIOfficialModelProvider {
+    /// Builds the concrete [`OpenAIResponsesChatModel`] for `ctx` on top of
+    /// `transport`.
+    ///
+    /// Unlike [`ModelProvider::create`] this does **not** re-check the model-id
+    /// claim: it is the construction entry used by hosts that dispatch on the
+    /// wire protocol (see [`crate::assembly`]), e.g. an OpenAI-compatible
+    /// gateway serving `/responses` under a non-`gpt*` model id.
+    pub fn create_with_transport(
+        &self,
+        ctx: ModelCreationContext,
+        transport: SharedTransport,
+    ) -> Result<OpenAIResponsesChatModel> {
         let model_name = Self::strip_prefix(&ctx.model).to_string();
         if model_name.is_empty() {
             return Err(Error::Model(format!(
@@ -103,13 +122,12 @@ impl ModelProvider for OpenAIOfficialModelProvider {
         let server_tools = take_server_tools(&mut options)?;
         let proxy = take_proxy(&mut options)?;
 
-        let mut model =
-            OpenAIResponsesChatModel::new(model_name, api_key, Some(base_url), default_transport())
-                .with_default_options(options)
-                .with_stream(ctx.stream.unwrap_or(true))
-                .with_strict_tools(strict_tools)
-                .with_strict_json_schema(strict_json_schema)
-                .with_server_tools(server_tools);
+        let mut model = OpenAIResponsesChatModel::new(model_name, api_key, Some(base_url), transport)
+            .with_default_options(options)
+            .with_stream(ctx.stream.unwrap_or(true))
+            .with_strict_tools(strict_tools)
+            .with_strict_json_schema(strict_json_schema)
+            .with_server_tools(server_tools);
         if let Some(formatter) = formatter {
             model = model.with_formatter(formatter);
         }
@@ -119,7 +137,7 @@ impl ModelProvider for OpenAIOfficialModelProvider {
         if let Some(size) = context_window_size {
             model = model.with_context_window_size(size);
         }
-        Ok(Arc::new(model))
+        Ok(model)
     }
 }
 

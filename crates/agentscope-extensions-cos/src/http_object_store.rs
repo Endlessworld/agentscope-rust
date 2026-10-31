@@ -59,13 +59,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::{Method, Response};
+use reqwest::{Method, Response, StatusCode};
 
 use crate::multipart::{self, MultipartPlan};
 use crate::object_store::{CosObjectStore, ObjectListPage, DEFAULT_LIST_PAGE_SIZE};
@@ -75,6 +75,27 @@ use crate::{CosError, Result};
 
 /// Default signature validity (matches the COS SDK default of 15 minutes).
 pub const DEFAULT_SIGN_EXPIRE_SECS: u64 = 900;
+
+/// Default TCP/TLS connect timeout, mirroring the Java SDK `ClientConfig`
+/// `connectionTimeout` default (50 s).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// Default per-read idle timeout, mirroring the Java SDK `ClientConfig`
+/// `socketTimeout` default (50 s). It applies to **each** read and resets after a
+/// successful one, so a long transfer that keeps making progress is never cut off
+/// (unlike a total request deadline).
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// Default number of retries for idempotent requests, mirroring the Java SDK
+/// `ClientConfig` `maxErrorRetry` default.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Delay before the *second* attempt; doubles on every further attempt
+/// (`100ms`, `200ms`, `400ms`, ...) and is capped at [`MAX_RETRY_DELAY`].
+pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Upper bound for a single retry delay.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// COS caps `max-keys` at 1000.
 pub const MAX_LIST_KEYS: usize = 1000;
@@ -102,6 +123,9 @@ pub struct CosHttpConfig {
     multipart_threshold: u64,
     multipart_part_size: u64,
     multipart_concurrency: usize,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    max_retries: u32,
     clock: ClockFn,
 }
 
@@ -116,6 +140,9 @@ impl std::fmt::Debug for CosHttpConfig {
             .field("multipart_threshold", &self.multipart_threshold)
             .field("multipart_part_size", &self.multipart_part_size)
             .field("multipart_concurrency", &self.multipart_concurrency)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .field("max_retries", &self.max_retries)
             .finish_non_exhaustive()
     }
 }
@@ -136,6 +163,9 @@ impl CosHttpConfig {
             multipart_threshold: multipart::DEFAULT_MULTIPART_THRESHOLD,
             multipart_part_size: multipart::DEFAULT_MULTIPART_PART_SIZE,
             multipart_concurrency: multipart::DEFAULT_MULTIPART_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
             clock: Arc::new(now_secs),
         }
     }
@@ -180,6 +210,21 @@ impl CosHttpConfig {
         self.multipart_concurrency
     }
 
+    /// TCP/TLS connect timeout applied by the internally built HTTP client.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Per-read idle timeout applied by the internally built HTTP client.
+    pub fn read_timeout(&self) -> Duration {
+        self.read_timeout
+    }
+
+    /// Number of retries allowed for idempotent requests (`0` = none).
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
     /// The `host[:port]` that is signed as the `host` header.
     pub fn host(&self) -> String {
         let base = self.base_url();
@@ -218,6 +263,9 @@ pub struct CosHttpObjectStoreBuilder {
     multipart_threshold: Option<u64>,
     multipart_part_size: Option<u64>,
     multipart_concurrency: Option<usize>,
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    max_retries: Option<u32>,
     clock: Option<ClockFn>,
     client: Option<reqwest::Client>,
 }
@@ -311,6 +359,37 @@ impl CosHttpObjectStoreBuilder {
         self
     }
 
+    /// TCP/TLS connect timeout (defaults to [`DEFAULT_CONNECT_TIMEOUT`]).
+    ///
+    /// Ignored when a pre-configured client is supplied through
+    /// [`Self::http_client`] (that client owns its own timeouts).
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Per-read idle timeout (defaults to [`DEFAULT_READ_TIMEOUT`]).
+    ///
+    /// Semantics match the Java SDK `socketTimeout`: each read gets the full
+    /// budget and it resets after a successful read, so slow-but-progressing
+    /// downloads are not aborted. Ignored when a pre-configured client is supplied
+    /// through [`Self::http_client`].
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    /// Retries allowed for idempotent requests (`GET`/`HEAD`/`PUT`/`DELETE`)
+    /// after a transport error, timeout, `408`, `429` or `5xx` (defaults to
+    /// [`DEFAULT_MAX_RETRIES`]; `0` disables retries).
+    ///
+    /// `POST` is never retried: it creates server-side state (`?uploads`,
+    /// `CompleteMultipartUpload`, `?delete`).
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = Some(retries);
+        self
+    }
+
     /// Supplies a pre-configured HTTP client (proxy, timeouts, ...).
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.client = Some(client);
@@ -375,10 +454,26 @@ impl CosHttpObjectStoreBuilder {
             ));
         }
 
+        let connect_timeout = self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        if connect_timeout.is_zero() {
+            return Err(CosError::Config(
+                "connect timeout must be greater than zero".to_string(),
+            ));
+        }
+        let read_timeout = self.read_timeout.unwrap_or(DEFAULT_READ_TIMEOUT);
+        if read_timeout.is_zero() {
+            return Err(CosError::Config(
+                "read timeout must be greater than zero".to_string(),
+            ));
+        }
+        let max_retries = self.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+
         let client = match self.client {
             Some(client) => client,
             None => reqwest::Client::builder()
                 .user_agent(USER_AGENT)
+                .connect_timeout(connect_timeout)
+                .read_timeout(read_timeout)
                 .build()
                 .map_err(|e| CosError::Backend(format!("failed to build HTTP client: {e}")))?,
         };
@@ -396,6 +491,9 @@ impl CosHttpObjectStoreBuilder {
                     .unwrap_or(multipart::DEFAULT_MULTIPART_THRESHOLD),
                 multipart_part_size,
                 multipart_concurrency,
+                connect_timeout,
+                read_timeout,
+                max_retries,
                 clock: self.clock.unwrap_or_else(|| Arc::new(now_secs)),
             }),
             closed: Arc::new(AtomicBool::new(false)),
@@ -496,6 +594,9 @@ impl CosHttpObjectStore {
                 multipart_threshold: self.config.multipart_threshold,
                 multipart_part_size: self.config.multipart_part_size,
                 multipart_concurrency: self.config.multipart_concurrency,
+                connect_timeout: self.config.connect_timeout,
+                read_timeout: self.config.read_timeout,
+                max_retries: self.config.max_retries,
                 clock: Arc::clone(&self.config.clock),
             }),
             closed: Arc::clone(&self.closed),
@@ -749,6 +850,12 @@ impl CosHttpObjectStore {
     }
 
     /// Signs and sends a request; `object_key` is `None` for bucket-level APIs.
+    ///
+    /// Transient failures are retried with exponential backoff and jitter for
+    /// **idempotent** operations (`GET`/`HEAD`/`PUT`/`DELETE`): transport errors,
+    /// timeouts, `408`, `429` and `5xx`. Other `4xx` answers are caller errors and
+    /// are returned immediately. `POST` is never replayed because it creates
+    /// server-side state (`?uploads`, `CompleteMultipartUpload`, `?delete`).
     async fn send(
         &self,
         method: Method,
@@ -759,6 +866,64 @@ impl CosHttpObjectStore {
     ) -> Result<Response> {
         self.ensure_open()?;
 
+        let max_attempts = if method_is_idempotent(&method) {
+            self.config.max_retries.saturating_add(1)
+        } else {
+            1
+        };
+
+        let mut body = body;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            // A body can only be replayed while an extra copy exists: keep one as
+            // long as another attempt is still allowed, and move the original on the
+            // last allowed attempt (the failure-free path when `max_retries == 0`).
+            let payload = if attempt < max_attempts {
+                body.clone()
+            } else {
+                body.take()
+            };
+
+            let result = self
+                .send_once(&method, object_key, params, payload, extra_headers)
+                .await;
+
+            let retryable = attempt < max_attempts
+                && (match &result {
+                    Ok(response) => is_retryable_status(response.status()),
+                    Err(error) => error.is_retryable(),
+                });
+            if !retryable {
+                return result;
+            }
+
+            let reason = match &result {
+                Ok(response) => format!("HTTP {}", response.status().as_u16()),
+                Err(error) => error.to_string(),
+            };
+            tracing::warn!(
+                attempt,
+                max_attempts,
+                method = method.as_str(),
+                reason = %reason,
+                "COS request failed, retrying with backoff"
+            );
+            // Release the response (and its connection slot) before sleeping.
+            drop(result);
+            tokio::time::sleep(retry_delay(attempt)).await;
+        }
+    }
+
+    /// One signed attempt of [`Self::send`].
+    async fn send_once(
+        &self,
+        method: &Method,
+        object_key: Option<&str>,
+        params: &[(String, String)],
+        body: Option<Vec<u8>>,
+        extra_headers: &[(String, String)],
+    ) -> Result<Response> {
         let raw_path = match object_key {
             Some(key) => format!("/{key}"),
             None => "/".to_string(),
@@ -788,7 +953,7 @@ impl CosHttpObjectStore {
 
         let mut request = self
             .client
-            .request(method, url)
+            .request(method.clone(), url)
             .header(reqwest::header::AUTHORIZATION, signed.authorization);
         for (name, value) in &headers {
             // `host` is produced by the HTTP layer from the URL; re-setting it would
@@ -846,6 +1011,42 @@ async fn ensure_success(response: Response) -> Result<Response> {
     } else {
         Err(error_from_response(response).await)
     }
+}
+
+/// Whether replaying the request is safe.
+///
+/// COS `POST` creates server-side state (`?uploads`, `CompleteMultipartUpload`,
+/// `?delete`), so it is never retried; `GET`/`HEAD`/`PUT`/`DELETE` are idempotent.
+fn method_is_idempotent(method: &Method) -> bool {
+    *method == Method::GET
+        || *method == Method::HEAD
+        || *method == Method::PUT
+        || *method == Method::DELETE
+}
+
+/// Transient statuses worth another attempt.
+///
+/// Every other `4xx` (`403` signature errors, `404`, `409`, ...) is a caller error
+/// that a retry cannot fix.
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff with full jitter: `base * 2^(attempt - 1)`, capped at
+/// [`MAX_RETRY_DELAY`], then spread over the upper half of that window so a herd
+/// of clients does not retry in lock-step.
+fn retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    let base_ms = DEFAULT_RETRY_BASE_DELAY.as_millis() as u64;
+    let cap_ms = MAX_RETRY_DELAY.as_millis() as u64;
+    let ceiling = (base_ms << shift).min(cap_ms);
+    // Clock-derived jitter keeps the delay inside `[ceiling / 2, ceiling]`.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+    let half = ceiling / 2;
+    Duration::from_millis((half + nanos % (half + 1)).min(ceiling))
 }
 
 #[async_trait]
@@ -1160,6 +1361,7 @@ mod tests {
 
     use super::*;
     use httpmock::prelude::*;
+    use std::sync::atomic::AtomicUsize;
 
     const CLOCK: i64 = 1_700_000_000;
     const KEY_TIME: &str = "1700000000;1700000900";
@@ -2403,5 +2605,223 @@ mod tests {
             store.presign_put("k", None).unwrap_err(),
             CosError::Closed
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Timeouts and retries (COS-01)
+    // ------------------------------------------------------------------
+
+    /// How often [`fail_first_two_attempts`] was consulted; reset per test.
+    static RETRY_PROBE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Matches only the first two `GET /retry.txt` attempts, so httpmock answers
+    /// `503` twice and the later, lower-priority `200` mock serves the third try.
+    fn fail_first_two_attempts(request: &HttpMockRequest) -> bool {
+        if request.method != "GET" || request.path != "/retry.txt" {
+            return false;
+        }
+        RETRY_PROBE.fetch_add(1, Ordering::SeqCst) < 2
+    }
+
+    fn retrying_store(server: &MockServer, max_retries: u32) -> CosHttpObjectStore {
+        CosHttpObjectStore::builder()
+            .bucket(BUCKET)
+            .region("ap-beijing")
+            .secret_id("AKIDexample")
+            .secret_key("secret-key")
+            .endpoint(server.base_url())
+            .clock(clock())
+            .max_retries(max_retries)
+            .build()
+            .unwrap()
+    }
+
+    /// `503` twice, then `200`: three requests in total and a successful read.
+    #[tokio::test]
+    async fn retries_transient_statuses_and_then_succeeds() {
+        RETRY_PROBE.store(0, Ordering::SeqCst);
+        let server = MockServer::start_async().await;
+        let store = retrying_store(&server, 2);
+
+        let flaky = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/retry.txt")
+                    .matches(fail_first_two_attempts);
+                then.status(503)
+                    .body("<Error><Code>ServiceUnavailable</Code></Error>");
+            })
+            .await;
+        let healthy = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/retry.txt");
+                then.status(200).body("hello");
+            })
+            .await;
+
+        // Attempt 1 -> 503, attempt 2 -> 503, attempt 3 -> 200.
+        assert_eq!(store.get("retry.txt").await.unwrap().unwrap(), b"hello");
+        flaky.assert_hits_async(2).await;
+        healthy.assert_hits_async(1).await;
+    }
+
+    /// The retry budget is bounded: `max_retries(1)` means two requests.
+    #[tokio::test]
+    async fn retries_stop_after_the_budget_is_spent() {
+        let server = MockServer::start_async().await;
+        let store = retrying_store(&server, 1);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/always-503");
+                then.status(503).body(
+                    "<Error><Code>ServiceUnavailable</Code><Message>later</Message></Error>",
+                );
+            })
+            .await;
+
+        let err = store.get("always-503").await.unwrap_err();
+        assert_eq!(err.status(), Some(503));
+        assert!(err.is_retryable());
+        mock.assert_hits_async(2).await;
+    }
+
+    /// `403` is a caller error: retrying it would only waste requests.
+    #[tokio::test]
+    async fn permanent_client_errors_are_not_retried() {
+        let server = MockServer::start_async().await;
+        let store = retrying_store(&server, 3);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/denied.txt");
+                then.status(403)
+                    .body("<Error><Code>AccessDenied</Code></Error>");
+            })
+            .await;
+
+        let err = store.get("denied.txt").await.unwrap_err();
+        assert_eq!(err.status(), Some(403));
+        assert!(!err.is_retryable());
+        mock.assert_hits_async(1).await;
+    }
+
+    /// `POST` creates server-side state, so it is attempted at most once.
+    #[tokio::test]
+    async fn post_is_never_retried() {
+        let server = MockServer::start_async().await;
+        let store = retrying_store(&server, 3);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/batch");
+                then.status(503)
+                    .body("<Error><Code>ServiceUnavailable</Code></Error>");
+            })
+            .await;
+
+        let response = store
+            .send(Method::POST, Some("batch"), &[], None, &[])
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 503);
+        mock.assert_hits_async(1).await;
+    }
+
+    /// A stalled response is cut off by the per-read timeout instead of blocking
+    /// forever, and surfaces as a retryable backend error.
+    #[tokio::test]
+    async fn read_timeout_is_a_retryable_backend_error() {
+        let server = MockServer::start_async().await;
+        let store = CosHttpObjectStore::builder()
+            .bucket(BUCKET)
+            .region("ap-beijing")
+            .secret_id("AKIDexample")
+            .secret_key("secret-key")
+            .endpoint(server.base_url())
+            .clock(clock())
+            .read_timeout(Duration::from_millis(150))
+            .max_retries(0)
+            .build()
+            .unwrap();
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/slow.txt");
+                then.status(200)
+                    .body("too late")
+                    .delay(Duration::from_millis(1500));
+            })
+            .await;
+
+        let err = store.get("slow.txt").await.unwrap_err();
+        assert!(
+            matches!(err, CosError::Backend(_)),
+            "expected a transport error, got {err:?}"
+        );
+        assert!(err.is_retryable());
+        mock.assert_hits_async(1).await;
+    }
+
+    #[test]
+    fn builder_validates_timeouts_and_exposes_retry_settings() {
+        let err = CosHttpObjectStore::builder()
+            .bucket(BUCKET)
+            .region("ap-beijing")
+            .secret_id("id")
+            .secret_key("key")
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("connect timeout"));
+
+        let err = CosHttpObjectStore::builder()
+            .bucket(BUCKET)
+            .region("ap-beijing")
+            .secret_id("id")
+            .secret_key("key")
+            .read_timeout(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("read timeout"));
+
+        let store = CosHttpObjectStore::builder()
+            .bucket(BUCKET)
+            .region("ap-beijing")
+            .secret_id("id")
+            .secret_key("key")
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(10))
+            .max_retries(7)
+            .build()
+            .unwrap();
+        assert_eq!(store.config().connect_timeout(), Duration::from_secs(5));
+        assert_eq!(store.config().read_timeout(), Duration::from_secs(10));
+        assert_eq!(store.config().max_retries(), 7);
+
+        let defaults = CosHttpObjectStore::new(BUCKET, "ap-beijing", "id", "key").unwrap();
+        assert_eq!(defaults.config().connect_timeout(), DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(defaults.config().read_timeout(), DEFAULT_READ_TIMEOUT);
+        assert_eq!(defaults.config().max_retries(), DEFAULT_MAX_RETRIES);
+    }
+
+    #[test]
+    fn retry_delay_grows_then_saturates_at_the_cap() {
+        // Attempt windows: [base/2, base], [base, 2*base], [2*base, 4*base], ...
+        assert!(retry_delay(1) >= DEFAULT_RETRY_BASE_DELAY / 2);
+        assert!(retry_delay(1) <= DEFAULT_RETRY_BASE_DELAY);
+        let third = retry_delay(3);
+        assert!(third >= Duration::from_millis(200), "{third:?}");
+        assert!(third <= Duration::from_millis(400), "{third:?}");
+        for attempt in 1..=10u32 {
+            let delay = retry_delay(attempt);
+            assert!(delay <= MAX_RETRY_DELAY, "attempt {attempt}: {delay:?}");
+        }
+    }
+
+    #[test]
+    fn only_transient_statuses_are_retryable() {
+        for status in [408u16, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [400u16, 401, 403, 404, 409, 501] {
+            assert!(!is_retryable_status(StatusCode::from_u16(status).unwrap()));
+        }
     }
 }

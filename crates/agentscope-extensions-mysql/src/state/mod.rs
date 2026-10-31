@@ -83,7 +83,9 @@ pub fn create_sessions_table_sql(database_name: &str, table_name: &str) -> Strin
 /// `DEFAULT 1` (not `0`): the ALTER backfills every pre-existing row with the default, and
 /// `0` is the sentinel [`StateBackend::read_version`] reports for "row absent". Backfilling
 /// `0` would make those rows look absent to `save_if_version(.., Some(0))`, which takes the
-/// INSERT branch and hits a duplicate key — a phantom CAS conflict.
+/// INSERT branch and hits a duplicate key — a phantom CAS conflict. (The `version = 0`
+/// fallback in [`MysqlAgentStateStore::save_if_version`] heals such rows, but not
+/// backfilling `0` in the first place is still the right migration.)
 pub fn add_version_column_sql(database_name: &str, table_name: &str) -> String {
     format!(
         "ALTER TABLE `{database_name}`.`{table_name}` \
@@ -374,12 +376,15 @@ impl MysqlAgentStateStore {
     ///
     /// * `expected_version == None` (Rust's `UNVERSIONED`) — unconditional upsert that
     ///   bumps the version (`1` on insert, `n + 1` on update).
-    /// * `Some(0)` — create-if-absent: an atomic `INSERT`; an existing row is a conflict.
+    /// * `Some(0)` — create-if-absent: an atomic `INSERT`; a duplicate key falls back to
+    ///   `UPDATE ... WHERE version = 0`, healing a row that already exists with
+    ///   `version = 0` (the pre-versioning DDL default). A row that is already versioned
+    ///   (`>= 1`) is still a conflict.
     /// * `Some(n)` — an atomic `UPDATE ... WHERE version = n`; a version mismatch (or a
     ///   missing row) is a conflict.
     ///
-    /// Every branch is a single backend statement, so two concurrent writers cannot both
-    /// pass the same expectation.
+    /// Every branch is one or two backend statements, each of them a single conditional
+    /// statement, so two concurrent writers cannot both pass the same expectation.
     pub async fn save_if_version(
         &self,
         user_id: Option<&str>,
@@ -396,12 +401,20 @@ impl MysqlAgentStateStore {
                 .backend
                 .save_single_versioned(user_id, session_id, key, &json),
             Some(0) => {
-                match self
+                let inserted = self
                     .backend
-                    .insert_single_if_absent(user_id, session_id, key, &json)?
-                {
+                    .insert_single_if_absent(user_id, session_id, key, &json)?;
+                match inserted {
                     CasOutcome::Applied(version) => Ok(version),
-                    CasOutcome::Conflict => Err(self.conflict(user_id, session_id, key, 0)),
+                    // Java `saveIfVersion` falls back to `updateIfVersion(.., 0L)` when
+                    // `insertIfAbsent` reports UNVERSIONED: a row can already exist with
+                    // `version = 0` (the pre-versioning DDL default), and without the
+                    // fallback that key could never be created through `Some(0)` again.
+                    // The fallback is still a single conditional statement, so the CAS
+                    // stays atomic.
+                    CasOutcome::Conflict => {
+                        self.update_zero_fallback(user_id, session_id, key, &json)
+                    }
                 }
             }
             Some(expected) => {
@@ -413,6 +426,27 @@ impl MysqlAgentStateStore {
                     CasOutcome::Conflict => Err(self.conflict(user_id, session_id, key, expected)),
                 }
             }
+        }
+    }
+
+    /// `updateIfVersion(.., 0)` fallback for `save_if_version(.., Some(0))`, mirroring Java
+    /// `saveIfVersion`: after the atomic `INSERT` hit a duplicate key, try to take over a
+    /// row that is still unversioned (`version = 0`, the DDL default of pre-versioning
+    /// tables). A row already at `version >= 1` remains a conflict, so create-if-absent is
+    /// still a real CAS.
+    fn update_zero_fallback(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        json: &str,
+    ) -> MysqlResult<i64> {
+        match self
+            .backend
+            .update_single_if_version(user_id, session_id, key, json, 0)?
+        {
+            CasOutcome::Applied(version) => Ok(version),
+            CasOutcome::Conflict => Err(self.conflict(user_id, session_id, key, 0)),
         }
     }
 
@@ -516,7 +550,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         key: &str,
         value: serde_json::Value,
     ) {
-        if require_session_id(session_id).is_err() {
+        if !key_access_is_valid(session_id, key) {
             return;
         }
         if let Ok(json) = serde_json::to_string(&value) {
@@ -551,7 +585,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Option<serde_json::Value> {
-        if require_session_id(session_id).is_err() {
+        if !key_access_is_valid(session_id, key) {
             return None;
         }
         let json = self.backend.get_single(user_id, session_id, key).ok()??;
@@ -564,7 +598,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Vec<serde_json::Value> {
-        if require_session_id(session_id).is_err() {
+        if !key_access_is_valid(session_id, key) {
             return Vec::new();
         }
         self.backend
@@ -603,7 +637,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> agentscope_core::state::VersionedState {
-        if require_session_id(session_id).is_err() {
+        if !key_access_is_valid(session_id, key) {
             return agentscope_core::state::VersionedState {
                 value: None,
                 version: agentscope_core::state::UNVERSIONED,
@@ -657,6 +691,25 @@ fn ensure_version_column(
         return Ok(());
     }
     backend.execute_ddl(&add_version_column_sql(database_name, table_name))
+}
+
+/// Applies Java's `validateSessionId` + `validateStateKey` pair at the infallible
+/// [`AgentStateStore`] entry points (`save` / `get` / `get_list` / `get_versioned`), which
+/// must swallow errors by contract.
+///
+/// Java calls `validateStateKey` in every one of `save` / `get` / `getList` / `exists` /
+/// `delete`; the Rust trait only passes a key to the first three (the session-wide
+/// `exists` / `delete` have no key parameter). Without the guard a key longer than
+/// `VARCHAR(255)` reaches MySQL, where non-strict mode truncates it and two distinct keys
+/// sharing a 255-character prefix silently collide.
+fn key_access_is_valid(session_id: &str, key: &str) -> bool {
+    match require_session_id(session_id).and_then(|_| validate_state_key(key)) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::debug!("rejected state access with an invalid identifier: {err}");
+            false
+        }
+    }
 }
 
 fn require_session_id(session_id: &str) -> MysqlResult<String> {
@@ -918,6 +971,50 @@ mod tests {
         assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!(1)));
     }
 
+    /// Java `saveIfVersionZeroFallsBackToUpdateOnDuplicateKey`: the atomic INSERT conflicts
+    /// because the row exists, but the row is still at `version = 0` (pre-versioning DDL
+    /// default), so `save_if_version(.., Some(0))` must fall back to
+    /// `UPDATE ... WHERE version = 0` and heal it instead of failing forever.
+    #[tokio::test]
+    async fn save_if_version_zero_heals_legacy_row_with_version_zero() {
+        let (s, backend) = store_with_backend();
+        backend.seed_single(Some("u"), "sess", "k", r#"{"legacy":true}"#, 0);
+        assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 0);
+
+        let version = s
+            .save_if_version(Some("u"), "sess", "k", json!({"fresh": true}), Some(0))
+            .await
+            .expect("version = 0 row must be healed by the UPDATE fallback");
+
+        assert_eq!(version, 1);
+        assert_eq!(
+            s.get(Some("u"), "sess", "k").await,
+            Some(json!({"fresh": true}))
+        );
+        assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 1);
+    }
+
+    /// Java `saveIfVersionZeroConflictWhenRowAlreadyVersioned`: the fallback only matches
+    /// `version = 0`, so a row that has been written at least once stays a conflict and is
+    /// left untouched.
+    #[tokio::test]
+    async fn save_if_version_zero_conflicts_when_row_already_versioned() {
+        let (s, backend) = store_with_backend();
+        backend.seed_single(Some("u"), "sess", "k", r#"{"old":true}"#, 5);
+
+        let err = s
+            .save_if_version(Some("u"), "sess", "k", json!({"new": true}), Some(0))
+            .await
+            .expect_err("a row at version 5 must reject create-if-absent");
+        assert!(matches!(err, MysqlError::InvalidArgument(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("expected 0, found 5"),
+            "conflict message should report the stored version: {err}"
+        );
+        assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!({"old": true})));
+        assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 5);
+    }
+
     #[tokio::test]
     async fn cas_conflict_does_not_write() {
         let s = store();
@@ -1176,6 +1273,34 @@ mod tests {
         let at_limit = "k".repeat(MAX_STATE_IDENTIFIER_LENGTH);
         assert_eq!(s.read_version(Some("u"), "sess", &at_limit).unwrap(), 0);
         assert!(validate_state_key("ok").is_ok());
+    }
+
+    /// Java `save` / `get` / `getList` all call `validateStateKey` before touching the
+    /// backend. The Rust trait entry points are infallible, so an invalid key must drop the
+    /// access instead of writing or reading a value that MySQL would truncate to 255 chars.
+    #[tokio::test]
+    async fn infallible_entries_reject_invalid_state_keys() {
+        let (s, backend) = store_with_backend();
+        let long = "k".repeat(MAX_STATE_IDENTIFIER_LENGTH + 1);
+
+        // `save` must not reach the backend at all.
+        s.save(Some("u"), "sess", &long, json!(1)).await;
+        assert_eq!(backend.get_single(Some("u"), "sess", &long).unwrap(), None);
+
+        // A row that already exists under such a key (written before this guard) must not be
+        // readable through the truncated key either.
+        backend.seed_single(Some("u"), "sess", &long, r#"{"secret":1}"#, 1);
+        assert_eq!(s.get(Some("u"), "sess", &long).await, None);
+        assert!(s.get_list(Some("u"), "sess", &long).await.is_empty());
+
+        // Blank keys are rejected the same way (Java: "stateKey must not be blank").
+        s.save(Some("u"), "sess", "   ", json!(3)).await;
+        assert_eq!(s.get(Some("u"), "sess", "   ").await, None);
+
+        // Boundary: a key at the limit is still accepted.
+        let at_limit = "k".repeat(MAX_STATE_IDENTIFIER_LENGTH);
+        s.save(Some("u"), "sess", &at_limit, json!(2)).await;
+        assert_eq!(s.get(Some("u"), "sess", &at_limit).await, Some(json!(2)));
     }
 
     /// `truncate_all_sessions` issues the Java `TRUNCATE TABLE` statement, and the rows are

@@ -92,6 +92,14 @@ pub struct OpenAiChatModel {
     /// Model-level default for the JSON-schema `strict` flag, applied only when the
     /// request-level schema leaves `strict` unset. Mirrors Java `strictJsonSchema`.
     strict_json_schema: Option<bool>,
+    /// Creation-time options, merged *under* every per-call request.
+    ///
+    /// Mirrors Java `OpenAIChatModel`: the builder options are merged into the
+    /// effective options (`mergeOptions(options, configuredOptions)`), so a
+    /// configured `temperature` / `maxTokens` / `responseFormat` /
+    /// `additionalBodyParams` / thinking knob reaches the wire even when the
+    /// call site only passes the per-request options.
+    default_options: GenerateOptions,
 }
 
 impl OpenAiChatModel {
@@ -151,6 +159,7 @@ impl OpenAiChatModel {
             descriptor,
             reasoning_passback,
             strict_json_schema: None,
+            default_options: GenerateOptions::default(),
             model_name,
         })
     }
@@ -205,49 +214,78 @@ impl OpenAiChatModel {
         let strict_json_schema = ctx
             .options
             .additional_body_params
-            .get("strictJsonSchema")
+            .get(STRICT_JSON_SCHEMA_OPTION)
             .and_then(|v| v.as_bool());
+        // Creation-time options are merged *under* every per-call request
+        // (Java `OpenAIChatModel#doStream0` → `mergeOptions(options, configuredOptions)`).
+        // `strictJsonSchema` was already consumed into the model-level default
+        // above and is a provider knob, not a wire field (MODEL-09), so it must
+        // not be re-sent through `additional_body_params`.
+        let mut default_options = ctx.options.clone();
+        default_options
+            .additional_body_params
+            .remove(STRICT_JSON_SCHEMA_OPTION);
+        if default_options.stream.is_none() {
+            default_options.stream = ctx.stream;
+        }
         Ok(Self {
             client,
             capabilities: ModelCapabilities::new().context_window_size(context),
             descriptor,
             reasoning_passback,
             strict_json_schema,
+            default_options,
             model_name,
         })
+    }
+
+    /// Sets the creation-time options merged under every request.
+    ///
+    /// Per-call options always win; this only fills the gaps (mirrors Java's
+    /// `OpenAIChatModel.Builder#defaultOptions`).
+    pub fn with_default_options(mut self, options: GenerateOptions) -> Self {
+        self.default_options = options;
+        self
+    }
+
+    /// The creation-time options merged under every request.
+    pub fn default_options(&self) -> &GenerateOptions {
+        &self.default_options
     }
 
     /// Access the underlying async-openai client (e.g. for retry middleware).
     pub fn client(&self) -> &Client<OpenAIConfig> {
         &self.client
     }
-}
 
-#[async_trait::async_trait]
-impl Model for OpenAiChatModel {
-    fn stream(
+    /// The model id that will reach the wire for a given per-call option set.
+    fn effective_model_name(&self, options: &GenerateOptions) -> String {
+        options
+            .model_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                self.default_options
+                    .model_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or_else(|| self.model_name.clone())
+    }
+
+    /// Builds the serialized Chat Completions body for one call.
+    ///
+    /// Creation-time options ([`Self::with_default_options`], populated from
+    /// `ModelCreationContext.options`) are merged **under** the per-call options,
+    /// exactly like Java's `mergeOptions(options, configuredOptions)`. Extracted
+    /// from [`Model::stream`] so the merge can be asserted without a network.
+    pub fn prepare_body(
         &self,
         messages: Vec<Msg>,
         tools: Vec<ToolSchema>,
         options: GenerateOptions,
-    ) -> BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
-        let client = self.client.clone();
-        let model_name = options
-            .model_name
-            .clone()
-            .unwrap_or_else(|| self.model_name.clone());
-        if let Some(descriptor) = &self.descriptor {
-            if !descriptor.input_modalities.contains("image")
-                && messages.iter().any(has_image_block)
-            {
-                let message = format!(
-                    "model '{}' does not accept image input; switch to a vision-capable model",
-                    self.model_name
-                );
-                return futures::stream::once(async move { Err(Error::Model(message)) }).boxed();
-            }
-        }
-        let mut options = options;
+    ) -> (serde_json::Value, bool) {
+        let mut options = GenerateOptions::merge_options(&options, &self.default_options);
         if let Some(max_output) = self.descriptor.as_ref().map(|d| d.max_output) {
             if max_output > 0 {
                 let max_output = max_output.min(u32::MAX as usize) as u32;
@@ -257,6 +295,7 @@ impl Model for OpenAiChatModel {
                     .map(|value| value.min(max_output));
             }
         }
+        let model_name = self.effective_model_name(&options);
         // Vendor-specific body params (e.g. `enable_thinking`) must reach the
         // wire: `CreateChatCompletionRequest` has no extension field, so the
         // typed request is serialized to a JSON object and the extra params
@@ -266,6 +305,9 @@ impl Model for OpenAiChatModel {
         // extras so OpenAI-compatible backends never see it.
         let mut extra_body = options.additional_body_params.clone();
         extra_body.remove(crate::common::MULTI_AGENT_FORMATTER_KEY);
+        // `thinking_budget` has no typed field in `async-openai`; Java's
+        // `OpenAIRequest#thinkingBudget` sends it as a top-level wire field.
+        let thinking_budget = options.thinking_budget;
         // Capture the transport mode before `options` is moved into the builder.
         // `None` keeps the historical streaming default.
         let streaming = options.stream.unwrap_or(true);
@@ -282,18 +324,21 @@ impl Model for OpenAiChatModel {
         // Serialize eagerly; on failure fall back to the typed request so the
         // call still proceeds (this can only fail on non-string map keys).
         let mut body: serde_json::Value = match serde_json::to_value(&request) {
-            Ok(mut v) => {
-                if !extra_body.is_empty() {
-                    if let Some(obj) = v.as_object_mut() {
-                        for (k, v) in extra_body {
-                            obj.insert(k, v);
-                        }
-                    }
-                }
-                v
-            }
+            Ok(v) => v,
             Err(_) => serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
         };
+        if let Some(budget) = thinking_budget {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("thinking_budget".to_string(), serde_json::Value::from(budget));
+            }
+        }
+        if !extra_body.is_empty() {
+            if let Some(object) = body.as_object_mut() {
+                for (key, value) in extra_body {
+                    object.insert(key, value);
+                }
+            }
+        }
         // `async-openai` cannot model DeepSeek's `reasoning_content` field, so it
         // is injected into the serialized assistant messages here. The typed
         // conversion is not 1:1 (a tool message may fan out to N wire messages),
@@ -304,6 +349,31 @@ impl Model for OpenAiChatModel {
         // Vendor-specific sanitising (DeepSeek/GLM/Kimi/MiniMax). Runs last so it
         // sees both `additional_body_params` and the injected reasoning fields.
         crate::openai::compat::apply_vendor_rules(&model_name, &mut body);
+        (body, streaming)
+    }
+}
+
+#[async_trait::async_trait]
+impl Model for OpenAiChatModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        tools: Vec<ToolSchema>,
+        options: GenerateOptions,
+    ) -> BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
+        let client = self.client.clone();
+        if let Some(descriptor) = &self.descriptor {
+            if !descriptor.input_modalities.contains("image")
+                && messages.iter().any(has_image_block)
+            {
+                let message = format!(
+                    "model '{}' does not accept image input; switch to a vision-capable model",
+                    self.model_name
+                );
+                return futures::stream::once(async move { Err(Error::Model(message)) }).boxed();
+            }
+        }
+        let (body, streaming) = self.prepare_body(messages, tools, options);
 
         // Non-streaming path. `GenerateOptions::stream == Some(false)` is what
         // OpenAI-compatible backends that do not speak SSE expect (e.g. the
@@ -410,6 +480,10 @@ impl Model for OpenAiChatModel {
         true
     }
 }
+
+/// Provider option key carrying the model-level JSON-schema `strict` default.
+/// Consumed by [`OpenAiChatModel::from_context`], never sent on the wire.
+const STRICT_JSON_SCHEMA_OPTION: &str = "strictJsonSchema";
 
 /// Provider that registers [`OpenAiChatModel`] under the `openai` provider id.
 /// Provider for OpenAI and OpenAI-compatible gateways.
@@ -1419,6 +1493,56 @@ mod tests {
         assert_eq!(req.max_tokens, Some(64));
         assert!(req.max_completion_tokens.is_none());
         assert_eq!(req.temperature, Some(0.2), "deepseek accepts temperature");
+    }
+
+    #[test]
+    fn creation_time_options_reach_the_request_body() {
+        // MODEL-02: `ModelCreationContext.options` must be merged *under* each
+        // request (Java `mergeOptions(options, configuredOptions)`), otherwise the
+        // builder-configured knobs (and the reasoning suffix that seeds
+        // `thinking_budget`) never reach the wire.
+        let mut defaults = GenerateOptions::builder()
+            .temperature(0.3)
+            .max_tokens(128)
+            .thinking_budget(1024)
+            .build();
+        defaults
+            .additional_body_params
+            .insert("enable_thinking".to_string(), serde_json::json!(true));
+        defaults.additional_body_params.insert(
+            STRICT_JSON_SCHEMA_OPTION.to_string(),
+            serde_json::json!(true),
+        );
+        let ctx = ModelCreationContext::new("openai", "gateway-chat")
+            .api_key("sk-test")
+            .base_url("https://example.test/v1")
+            .options(defaults);
+        let model = OpenAiChatModel::from_context(&ctx).expect("model");
+
+        let (body, streaming) =
+            model.prepare_body(vec![sample_msg()], vec![], GenerateOptions::default());
+        assert!(streaming, "the historical streaming default is kept");
+        let temperature = body["temperature"].as_f64().expect("temperature");
+        assert!((temperature - 0.3).abs() < 1e-6, "body: {body:?}");
+        assert_eq!(body["max_completion_tokens"], serde_json::json!(128));
+        assert_eq!(body["thinking_budget"], serde_json::json!(1024));
+        assert_eq!(body["enable_thinking"], serde_json::json!(true));
+        assert!(
+            body.get(STRICT_JSON_SCHEMA_OPTION).is_none(),
+            "provider knob leaked into the wire body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn per_call_options_win_over_creation_defaults() {
+        let ctx = ModelCreationContext::new("openai", "gateway-chat")
+            .api_key("sk-test")
+            .options(GenerateOptions::builder().temperature(0.9).build());
+        let model = OpenAiChatModel::from_context(&ctx).expect("model");
+        let per_call = GenerateOptions::builder().temperature(0.1).build();
+        let (body, _) = model.prepare_body(vec![sample_msg()], vec![], per_call);
+        let temperature = body["temperature"].as_f64().expect("temperature");
+        assert!((temperature - 0.1).abs() < 1e-6, "body: {body:?}");
     }
 
     #[test]

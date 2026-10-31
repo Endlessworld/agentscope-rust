@@ -101,9 +101,9 @@ impl StudioManager {
     /// Runs initialization with an explicit WebSocket transport.
     ///
     /// Hosts that want the real Socket.IO connection pass a
-    /// [`SocketIoTransport`](super::socket_io::SocketIoTransport) built over a shared
-    /// [`PendingInputRegistry`]; the default is a no-op transport so tests stay offline. The
-    /// HTTP side uses the `reqwest` transport.
+    /// [`SocketIoTransport`](super::socket_io::SocketIoTransport); the [`PendingInputRegistry`] it
+    /// owns is reused by the installed client automatically. The default is a no-op transport so
+    /// tests stay offline. The HTTP side uses the `reqwest` transport.
     pub async fn initialize_with_transport(
         config: StudioConfig,
         transport: Arc<dyn StudioTransport>,
@@ -117,16 +117,31 @@ impl StudioManager {
     /// Both seams are injectable so the whole startup path (`registerRun` + socket connect) can
     /// run offline; production hosts pass [`ReqwestStudioTransport`] and a
     /// [`SocketIoTransport`](super::socket_io::SocketIoTransport).
+    ///
+    /// When the transport owns a [`PendingInputRegistry`]
+    /// ([`StudioTransport::input_registry`]), the WebSocket client is built over that same
+    /// registry, so `wait_for_input` via [`StudioManager::web_socket_client`] sees the events
+    /// the transport decodes (STUDIO-01).
     pub async fn initialize_with_transports(
         config: StudioConfig,
         http_transport: Arc<dyn StudioHttpTransport>,
         transport: Arc<dyn StudioTransport>,
     ) -> StudioResult<()> {
         let client = Arc::new(StudioClient::with_transport(config.clone(), http_transport));
-        let ws_client = Arc::new(StudioWebSocketClient::with_transport(
-            config.clone(),
-            transport,
-        ));
+        // The transport resolves `forwardUserInput` into its own registry; reuse that exact
+        // registry for the client so `wait_for_input` observes those events (STUDIO-01).
+        let shared_registry = transport.input_registry();
+        let ws_client = match shared_registry {
+            Some(registry) => Arc::new(StudioWebSocketClient::with_transport_and_registry(
+                config.clone(),
+                transport,
+                registry,
+            )),
+            None => Arc::new(StudioWebSocketClient::with_transport(
+                config.clone(),
+                transport,
+            )),
+        };
 
         // Register the run and (best-effort) connect the socket.
         client.register_run().await?;

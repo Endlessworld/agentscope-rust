@@ -4,6 +4,19 @@ use std::time::Duration;
 use chrono::Utc;
 use uuid::Uuid;
 
+/// Default periodic span-export interval.
+///
+/// Matches the OTel SDK `BatchSpanProcessor` default schedule delay (5s), which is what Java's
+/// `TelemetryTracer.Builder#build` installs. A long-lived process would otherwise never export
+/// its finished spans (STUDIO-02).
+pub const DEFAULT_TELEMETRY_BATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default maximum number of spans per export call.
+///
+/// Matches the OTel SDK `BatchSpanProcessor` default `max_export_batch_size` (512): a full batch
+/// is exported immediately, bounding both latency and the in-memory buffer.
+pub const DEFAULT_TELEMETRY_BATCH_SIZE: usize = 512;
+
 /// Configuration for AgentScope Studio integration.
 ///
 /// Holds all parameters needed to connect to and communicate with Studio,
@@ -19,6 +32,8 @@ pub struct StudioConfig {
     pub(crate) reconnect_attempts: u32,
     pub(crate) reconnect_delay: Duration,
     pub(crate) reconnect_max_delay: Duration,
+    pub(crate) telemetry_batch_interval: Duration,
+    pub(crate) telemetry_batch_size: usize,
 }
 
 impl StudioConfig {
@@ -78,6 +93,19 @@ impl StudioConfig {
     pub fn socket_url(&self) -> String {
         self.studio_url.trim_end_matches('/').to_string()
     }
+
+    /// How often the telemetry exporter flushes finished spans (default 5s).
+    ///
+    /// Consumed by
+    /// [`TelemetryTracing::with_config`](crate::telemetry::TelemetryTracing::with_config).
+    pub fn telemetry_batch_interval(&self) -> Duration {
+        self.telemetry_batch_interval
+    }
+
+    /// Maximum number of spans exported in one call (default 512).
+    pub fn telemetry_batch_size(&self) -> usize {
+        self.telemetry_batch_size
+    }
 }
 
 /// Builder for [`StudioConfig`].
@@ -92,6 +120,8 @@ pub struct StudioConfigBuilder {
     reconnect_attempts: u32,
     reconnect_delay: Duration,
     reconnect_max_delay: Duration,
+    telemetry_batch_interval: Duration,
+    telemetry_batch_size: usize,
 }
 
 impl Default for StudioConfigBuilder {
@@ -106,6 +136,8 @@ impl Default for StudioConfigBuilder {
             reconnect_attempts: 3,
             reconnect_delay: Duration::from_secs(1),
             reconnect_max_delay: Duration::from_secs(5),
+            telemetry_batch_interval: DEFAULT_TELEMETRY_BATCH_INTERVAL,
+            telemetry_batch_size: DEFAULT_TELEMETRY_BATCH_SIZE,
         }
     }
 }
@@ -165,6 +197,18 @@ impl StudioConfigBuilder {
         self
     }
 
+    /// Sets how often finished spans are flushed to the exporter (default 5s).
+    pub fn telemetry_batch_interval(mut self, telemetry_batch_interval: Duration) -> Self {
+        self.telemetry_batch_interval = telemetry_batch_interval;
+        self
+    }
+
+    /// Sets the maximum number of spans exported in one call (default 512).
+    pub fn telemetry_batch_size(mut self, telemetry_batch_size: usize) -> Self {
+        self.telemetry_batch_size = telemetry_batch_size;
+        self
+    }
+
     /// Builds the [`StudioConfig`], deriving `tracing_url` when unset.
     pub fn build(self) -> StudioConfig {
         let base = self.studio_url.trim_end_matches('/').to_string();
@@ -181,6 +225,8 @@ impl StudioConfigBuilder {
             reconnect_attempts: self.reconnect_attempts,
             reconnect_delay: self.reconnect_delay,
             reconnect_max_delay: self.reconnect_max_delay,
+            telemetry_batch_interval: self.telemetry_batch_interval,
+            telemetry_batch_size: self.telemetry_batch_size,
         }
     }
 }
@@ -199,6 +245,13 @@ mod tests {
         assert_eq!(cfg.reconnect_attempts(), 3);
         assert_eq!(cfg.reconnect_delay(), Duration::from_secs(1));
         assert_eq!(cfg.reconnect_max_delay(), Duration::from_secs(5));
+        // Java `TelemetryTracer.Builder#build` installs an OTel `BatchSpanProcessor` with the
+        // SDK defaults (5s schedule delay / 512 spans per batch).
+        assert_eq!(
+            cfg.telemetry_batch_interval(),
+            DEFAULT_TELEMETRY_BATCH_INTERVAL
+        );
+        assert_eq!(cfg.telemetry_batch_size(), DEFAULT_TELEMETRY_BATCH_SIZE);
         assert!(!cfg.run_id().is_empty());
         assert!(cfg.run_name().starts_with("run_"));
     }

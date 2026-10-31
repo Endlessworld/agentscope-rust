@@ -22,7 +22,7 @@ pub mod properties;
 pub mod signature;
 pub mod token;
 
-pub use channel::{WeComCallbackOutcome, WeComChannel, WeComChannelRegistry};
+pub use channel::{WeComCallbackOutcome, WeComChannel, WeComChannelRegistry, CHANNEL_TYPE};
 pub use crypto::WeComCrypto;
 pub use inbound::WeComInboundMapper;
 pub use outbound::WeComOutboundClient;

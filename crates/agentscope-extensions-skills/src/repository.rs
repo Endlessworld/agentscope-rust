@@ -225,6 +225,15 @@ impl RepoBackedSkillRepository {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+
+    /// Like the harness [`SkillRepository::load`], but keeps the backend error.
+    ///
+    /// The harness trait returns `Vec<AgentSkill>` (no error channel), so [`Self::load`] can only
+    /// log a failure. Callers that must distinguish "this repository has no skills" from "the
+    /// backend is broken" use this method instead of guessing from an empty vector.
+    pub fn try_load(&self) -> Result<Vec<AgentSkill>, SkillRepositoryError> {
+        self.inner.get_all_skills()
+    }
 }
 
 impl SkillRepository for RepoBackedSkillRepository {
@@ -245,8 +254,23 @@ impl SkillRepository for RepoBackedSkillRepository {
     }
 
     fn load(&self) -> Vec<AgentSkill> {
-        // Best-effort: the harness loader treats a failed repository as empty.
-        self.inner.get_all_skills().unwrap_or_default()
+        // SKILLS-01: the harness trait has no error channel, so a backend failure used to be
+        // swallowed into an empty list - indistinguishable from "this repository is empty". A
+        // real agent mounting a MySQL/PostgreSQL repository then ran with zero skills and no
+        // hint that anything was wrong. Warn loudly (and keep the error reachable through
+        // `try_load`) instead of serving a fake empty table.
+        match self.try_load() {
+            Ok(skills) => skills,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %self.id,
+                    source = %self.inner.get_source(),
+                    error = %e,
+                    "skill repository failed to load; serving no skills from this repository"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Exposes the skill directory so `load_skill_through_path` works for extension backends.
@@ -369,6 +393,9 @@ mod tests {
         skills: Vec<AgentSkill>,
         source: String,
         dir: Option<PathBuf>,
+        /// When `true`, `get_all_skills` reports a backend failure, standing in for a broken
+        /// SQL backend (SKILLS-01).
+        fail_load: bool,
     }
 
     impl AgentSkillRepository for DummyRepo {
@@ -383,6 +410,12 @@ mod tests {
             Ok(self.skills.iter().map(|s| s.name().to_string()).collect())
         }
         fn get_all_skills(&self) -> Result<Vec<AgentSkill>, SkillRepositoryError> {
+            if self.fail_load {
+                // SKILLS-01: a driver / transport failure, not an empty repository.
+                return Err(SkillRepositoryError::Database(
+                    "connection lost while listing skills".to_string(),
+                ));
+            }
             Ok(self.skills.clone())
         }
         fn save(&self, _s: &[AgentSkill], _f: bool) -> Result<bool, SkillRepositoryError> {
@@ -423,6 +456,7 @@ mod tests {
             skills: vec![skill("alpha"), skill("beta")],
             source: "git-demo".to_string(),
             dir: None,
+            fail_load: false,
         };
         let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
         assert_eq!(adapter.source(), "git-demo");
@@ -438,6 +472,7 @@ mod tests {
             skills: vec![],
             source: "s".to_string(),
             dir: None,
+            fail_load: false,
         };
         let adapter = RepoBackedSkillRepository::new(Arc::new(repo), Some("id".into()));
         assert_eq!(adapter.repo_id(), "id");
@@ -459,6 +494,7 @@ mod tests {
             skills: vec![skill("alpha")],
             source: "git-demo".to_string(),
             dir: Some(dir.clone()),
+            fail_load: false,
         };
         let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
         // Both `AgentSkillRepository` and the harness `SkillRepository` expose `skill_dir`, so
@@ -483,6 +519,7 @@ mod tests {
             skills: vec![stored],
             source: "mysql".to_string(),
             dir: None,
+            fail_load: false,
         };
         let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
         let dir = SkillRepository::skill_dir(&adapter, "calc").expect("materialised skill dir");
@@ -537,6 +574,7 @@ mod tests {
                 skills: vec![stored],
                 source: "postgresql".to_string(),
                 dir: None,
+                fail_load: false,
             }),
             None,
         ));
@@ -571,11 +609,39 @@ mod tests {
                 skills: vec![skill("alpha")],
                 source: "git-demo".to_string(),
                 dir: None,
+                fail_load: false,
             }),
             None,
         );
         // Identity is the harness `repo_id` + skill name; no digest is cached per skill.
         assert_eq!(adapter.repo_id(), "ext:git-demo");
         assert!(adapter.materialized.lock().unwrap().is_empty());
+    }
+
+    /// SKILLS-01: a broken backend must not masquerade as an empty repository.
+    ///
+    /// The harness trait `load()` has no error channel, so it returns no skills - but it warns, and
+    /// the real error stays reachable through `try_load()`. Before the fix the failure was
+    /// swallowed with `unwrap_or_default()`, so a misconfigured MySQL / PostgreSQL repository
+    /// looked exactly like an empty one and the agent silently ran without skills.
+    #[test]
+    fn adapter_keeps_backend_failures_reachable() {
+        let repo = DummyRepo {
+            skills: vec![],
+            source: "mysql".to_string(),
+            dir: None,
+            fail_load: true,
+        };
+        let adapter = RepoBackedSkillRepository::new(Arc::new(repo), None);
+        assert!(adapter.load().is_empty());
+        let error = match adapter.try_load() {
+            Ok(skills) => panic!("expected a backend error, got {} skills", skills.len()),
+            Err(e) => e,
+        };
+        assert!(
+            error.to_string().contains("connection lost while listing skills"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(error, SkillRepositoryError::Database(_)));
     }
 }

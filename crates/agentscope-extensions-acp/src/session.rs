@@ -351,6 +351,21 @@ impl Drop for RunningPrompt {
     }
 }
 
+/// Resolves once the session's cancel generation moves away from `started`.
+///
+/// [`AcpAgentSession::cancel`] is a plain atomic bump (it is called from synchronous contexts,
+/// including the connection's notification handler), so there is nothing to await on directly.
+/// A short poll keeps that signature while still letting a prompt that is waiting for its turn
+/// notice a cancel within one tick instead of running the turn anyway.
+async fn cancel_epoch_moved(epoch: &std::sync::atomic::AtomicU64, started: u64) {
+    loop {
+        if epoch.load(Ordering::SeqCst) != started {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// What a turn is started from.
 ///
 /// A prompt carries user content; a wakeup carries none and exists only so the middlewares
@@ -1432,6 +1447,106 @@ impl AcpAgentSession {
         Some(stop)
     }
 
+    /// Builds the `session/update` replay a client needs after `session/load`.
+    ///
+    /// ACP v1 `loadSession` requires the agent to replay the whole conversation: the client
+    /// has no state for that session and renders whatever `session/update`s arrive before the
+    /// response. This session advertised `load_session(true)` but replayed nothing, so an IDE
+    /// that reconnected after a restart showed an empty transcript while the agent still
+    /// answered with the full context.
+    ///
+    /// The recovery view (`HarnessAgent::inspect_session`) only carries the rebuilt
+    /// `state_json`, which is state, not a message list, so it is used as the "is the
+    /// committed journal readable" check; the replay order comes from
+    /// `HarnessAgent::session_transcript`, which folds the same committed prefix into messages.
+    /// Text becomes `user_message_chunk` / `agent_message_chunk` tagged with a per-message id,
+    /// and a tool call becomes a completed `tool_call`, which is what a client needs to redraw
+    /// the turn.
+    ///
+    /// An unreadable journal is not an error for `load`: the session may have been created by
+    /// this very request for a cwd that has no history yet, so the replay is simply empty.
+    pub async fn replay_notifications(
+        &self,
+    ) -> Vec<agent_client_protocol::schema::v1::SessionNotification> {
+        use agent_client_protocol::schema::v1::{
+            ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall,
+            ToolCallStatus,
+        };
+        use agentscope_core::message::{ContentBlock as CoreBlock, MsgRole};
+
+        let ctx = self.session_context();
+        if let Err(error) = self.agent.inspect_session(&ctx).await {
+            tracing::warn!(
+                session = %self.session_id,
+                %error,
+                "cannot inspect the session; session/load will replay nothing"
+            );
+            return Vec::new();
+        }
+        let transcript = match self.agent.session_transcript(&ctx).await {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    %error,
+                    "cannot read the transcript; session/load will replay nothing"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut notifications = Vec::new();
+        for message in transcript.messages {
+            // One message id per historical message: clients group chunks by it exactly as
+            // they do for a live turn, so a replayed turn renders as one bubble.
+            let message_id = MessageId::new(format!("history-{}", message.id));
+            for block in &message.content {
+                match (message.role, block) {
+                    (MsgRole::User, CoreBlock::Text(text)) => notifications.push(
+                        SessionNotification::new(
+                            self.session_id.clone(),
+                            SessionUpdate::UserMessageChunk(
+                                ContentChunk::new(ContentBlock::Text(TextContent::new(
+                                    text.text.clone(),
+                                )))
+                                .message_id(message_id.clone()),
+                            ),
+                        ),
+                    ),
+                    (MsgRole::Assistant, CoreBlock::Text(text)) => notifications.push(
+                        SessionNotification::new(
+                            self.session_id.clone(),
+                            SessionUpdate::AgentMessageChunk(
+                                ContentChunk::new(ContentBlock::Text(TextContent::new(
+                                    text.text.clone(),
+                                )))
+                                .message_id(message_id.clone()),
+                            ),
+                        ),
+                    ),
+                    (MsgRole::Assistant, CoreBlock::ToolUse(tool)) => notifications.push(
+                        SessionNotification::new(
+                            self.session_id.clone(),
+                            SessionUpdate::ToolCall(
+                                ToolCall::new(tool.id.clone(), event::human_title(&tool.name))
+                                    .name(tool.name.clone())
+                                    .kind(event::tool_kind_for(&tool.name))
+                                    // A committed tool call already ran (or its turn ended):
+                                    // replaying it as pending would leave a spinner forever.
+                                    .status(ToolCallStatus::Completed)
+                                    .raw_input(serde_json::Value::Object(tool.input.clone())),
+                            ),
+                        ),
+                    ),
+                    // Thinking and tool results are not replayed: the transcript view owns the
+                    // message order, and the tool call above already carries its arguments.
+                    _ => {}
+                }
+            }
+        }
+        notifications
+    }
+
     /// The bus this session's agent enqueues inbox hints and wakeup requests into.
     ///
     /// A host that wakes idle sessions drains [`WAKEUPS_KEY`] through it: a finished
@@ -1658,6 +1773,16 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
     {
+        // The turn's own cancellation generation, captured *before* the admission wait.
+        //
+        // A cancel is addressed to the session, not to a single request: a client that pressed
+        // Stop while its prompt was still queued behind the previous turn expects that prompt to
+        // stop, not to start running once the lock is free. Capturing the generation after the
+        // wait made such a cancel indistinguishable from "this turn started after the cancel"
+        // and silently ignored it, so the prompt ran (and billed) anyway.
+        let cancel_epoch = Arc::clone(&self.cancel_epoch);
+        let my_epoch = cancel_epoch.load(Ordering::SeqCst);
+        let closed = Arc::clone(&self.closed);
         // One prompt turn per session. A client may send a follow-up before the previous
         // response arrives (a retry, a Stop followed by a new message); without this lock the
         // second run raced the first and was rejected as `turn_unfinished`, losing the input.
@@ -1675,10 +1800,13 @@ impl AcpAgentSession {
             } => {
                 return StopReason::Cancelled;
             }
+            _ = cancel_epoch_moved(&cancel_epoch, my_epoch) => {
+                return StopReason::Cancelled;
+            }
             _ = async {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    if self.closed.load(Ordering::SeqCst) {
+                    if closed.load(Ordering::SeqCst) {
                         return;
                     }
                 }
@@ -1686,16 +1814,17 @@ impl AcpAgentSession {
                 return StopReason::Cancelled;
             }
         };
-        if self.closed.load(Ordering::SeqCst) {
+        if cancel_epoch.load(Ordering::SeqCst) != my_epoch {
+            // Cancelled while waiting for the previous turn (and the lock took priority in the
+            // select above): the queued prompt must not run.
+            return StopReason::Cancelled;
+        }
+        if closed.load(Ordering::SeqCst) {
             // Closed while this prompt waited for the previous turn to finish.
             return StopReason::Cancelled;
         }
         self.running.store(true, Ordering::SeqCst);
         let _running = RunningPrompt(Arc::clone(&self.running));
-        // The turn's own cancellation generation. A cancel that already happened before this
-        // prompt started does not apply to it.
-        let cancel_epoch = Arc::clone(&self.cancel_epoch);
-        let my_epoch = cancel_epoch.load(Ordering::SeqCst);
         // Turn-level usage: reset at the start of each prompt turn, accumulate
         // from every model call, and report back as `PromptResponse.usage`.
         self.turn_usage = ChatUsage::default();
@@ -1884,6 +2013,12 @@ impl AcpAgentSession {
         // perfectly healthy run. A transient storage hiccup must stay invisible; only a
         // sustained inability to read the run's state is a real stall.
         const POLL_FAILURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // How long a *closed* session may spend closing its abandoned turn.
+        //
+        // The journal close needs the writer lease, which a run that never returns (a hung
+        // provider) keeps renewing, so an unbounded wait turns `session/close` into exactly the
+        // hang it is supposed to end. Nobody is left to observe a half-finished close there.
+        const CLOSED_TURN_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
         // A run stopped by something other than this client's cancel is resumed in place.
         // Bounded so a permanently interrupted environment is reported instead of retried
         // forever; an interruption is not a failure and must not discard the user's prompt.
@@ -1970,6 +2105,22 @@ impl AcpAgentSession {
                             c.cancelled().await;
                         } else {
                             std::future::pending::<()>().await;
+                        }
+                    } => {
+                        cancelled = true;
+                        break;
+                    }
+                    // The session was torn down while the run was in flight (`session/close`,
+                    // LRU eviction, host shutdown). Closing also bumps the cancel generation,
+                    // but the closed flag is the authoritative teardown signal: it must not
+                    // depend on that bump being observed here, or a host that closes a session
+                    // whose provider never answers could not stop the turn at all.
+                    _ = async {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            if closed.load(Ordering::SeqCst) {
+                                return;
+                            }
                         }
                     } => {
                         cancelled = true;
@@ -2106,31 +2257,43 @@ impl AcpAgentSession {
                     self.agent.interrupt_run(run_id);
                 }
 
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
-                    let current = session.task(&task.command_id).await;
-                    let current = match current {
-                        Ok(current) => current,
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            continue;
+                // A closed session has nobody left to answer (`session/close`, LRU eviction,
+                // host shutdown): close the turn now instead of waiting out the settle grace for
+                // a run that may never return (a hung provider). Waiting made teardown take the
+                // full 10s and left the client's `session/close` hanging. A live client keeps the
+                // grace below so the next prompt is not refused with "turn_unfinished" while the
+                // run is still winding down.
+                if !closed.load(Ordering::SeqCst) {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while std::time::Instant::now() < deadline {
+                        // Teardown while the run winds down: stop waiting, the session is gone.
+                        if closed.load(Ordering::SeqCst) {
+                            break;
                         }
-                    };
-                    if current.settled() {
-                        break;
-                    }
-                    // Adopt the run id the moment the dispatcher publishes it, then keep the
-                    // signal aimed at that exact run.
-                    if signalled.is_none() {
-                        if let Some(run_id) = current.run_id.clone() {
-                            self.agent.interrupt_run(&run_id);
-                            signalled = Some(run_id);
+                        let current = session.task(&task.command_id).await;
+                        let current = match current {
+                            Ok(current) => current,
+                            Err(_) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                continue;
+                            }
+                        };
+                        if current.settled() {
+                            break;
                         }
+                        // Adopt the run id the moment the dispatcher publishes it, then keep the
+                        // signal aimed at that exact run.
+                        if signalled.is_none() {
+                            if let Some(run_id) = current.run_id.clone() {
+                                self.agent.interrupt_run(&run_id);
+                                signalled = Some(run_id);
+                            }
+                        }
+                        if let Some(run_id) = signalled.as_deref() {
+                            let _ = session.interrupt_run(run_id).await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
-                    if let Some(run_id) = signalled.as_deref() {
-                        let _ = session.interrupt_run(run_id).await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
 
                 // Close the turn before returning. `cancel_pending` retries the writer lease
@@ -2139,9 +2302,23 @@ impl AcpAgentSession {
                 // interrupted mid-tool, and a turn left open would block the next prompt. Never
                 // fire-and-forget this — a silently failed close is exactly the "stuck session"
                 // symptom.
-                if let Err(error) =
-                    agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await
-                {
+                //
+                // A *closed* session is the one exception: no client is left and no later prompt
+                // can be rejected, while the still-live run holds the journal writer lease. There
+                // the close is attempted with a short bound instead of waiting out the lease, so
+                // `session/close` cannot hang on the very turn it is tearing down.
+                let closed_now = closed.load(Ordering::SeqCst);
+                let close = agentscope_core::session::abandon_turn(session.log(), &task.turn_id);
+                let close = async {
+                    if closed_now {
+                        tokio::time::timeout(CLOSED_TURN_CLOSE_GRACE, close)
+                            .await
+                            .unwrap_or_else(|_| Ok(false))
+                    } else {
+                        close.await
+                    }
+                };
+                if let Err(error) = close.await {
                     tracing::warn!(
                         session = %self.session_id,
                         turn = %task.turn_id,

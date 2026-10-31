@@ -610,7 +610,7 @@ mod tests {
     use std::pin::Pin;
 
     use crate::model::{
-        AgentCard, Artifact, JsonRpcRequest, JsonRpcResponse, Message, MessageRole, Part,
+        methods, AgentCard, Artifact, JsonRpcRequest, JsonRpcResponse, Message, MessageRole, Part,
         TaskState, TaskStatus,
     };
 
@@ -739,7 +739,7 @@ mod tests {
             .expect("call succeeds");
 
         assert_eq!(reply.text_content(), "real answer");
-        assert_eq!(transport.methods(), vec!["message/send".to_string()]);
+        assert_eq!(transport.methods(), vec![methods::MESSAGE_SEND.to_string()]);
         // History keeps the input and the reply, mirroring `addToHistory`.
         let history = agent.history();
         assert_eq!(history.len(), 2);
@@ -796,7 +796,10 @@ mod tests {
         assert_eq!(reply.text_content(), "late answer");
         assert_eq!(
             transport.methods(),
-            vec!["message/send".to_string(), "tasks/get".to_string()]
+            vec![
+                methods::MESSAGE_SEND.to_string(),
+                methods::TASKS_GET.to_string()
+            ]
         );
         assert!(agent.running_call_ids().is_empty());
     }
@@ -837,7 +840,7 @@ mod tests {
         runtime.block_on(handle).unwrap();
 
         assert_eq!(reply.text_content(), "Task t-1 interrupt successfully.");
-        assert!(transport.methods().contains(&"tasks/cancel".to_string()));
+        assert!(transport.methods().contains(&methods::TASKS_CANCEL.to_string()));
     }
 
     // Java: `1524b3191` — a card that cannot be resolved fails the call immediately.

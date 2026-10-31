@@ -35,6 +35,11 @@ pub const OWNED_METADATA_KEY: &str = "agentscope.sandbox.sandbox_owned";
 pub const EXTRA_METADATA_KEY: &str = "agentscope.sandbox.extra";
 /// Metadata key holding the JSON-serialized [`WorkspaceSpec`].
 pub const WORKSPACE_SPEC_METADATA_KEY: &str = "agentscope.sandbox.workspace_spec";
+/// Metadata key holding the remote sandbox id, so `resume` reconnects instead of recreating.
+pub const SANDBOX_ID_METADATA_KEY: &str = "agentscope.sandbox.sandbox_id";
+/// Backend `extra` keys consulted when [`SANDBOX_ID_METADATA_KEY`] is absent (states persisted by
+/// older builds only carried the id inside the backend extras).
+pub const SANDBOX_ID_FALLBACK_EXTRA_KEYS: [&str; 2] = ["claim_name", "sandbox_id"];
 
 /// Remote path used to stage base64 workspace archives during hydration.
 pub const WS_B64_TMP_PATH: &str = "/tmp/agentscope-ws.b64";
@@ -146,6 +151,15 @@ impl RemoteSandboxStateData {
             OWNED_METADATA_KEY.to_string(),
             self.sandbox_owned.to_string(),
         );
+        if let Some(sandbox_id) = self
+            .sandbox_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            // Persisted so `resume` reconnects to the same remote sandbox (Java keeps the id on
+            // every `*SandboxState` subclass).
+            metadata.insert(SANDBOX_ID_METADATA_KEY.to_string(), sandbox_id.to_string());
+        }
         if !self.extra.is_empty() {
             match serde_json::to_string(&self.extra) {
                 Ok(json) => {
@@ -213,10 +227,22 @@ impl RemoteSandboxStateData {
             .metadata
             .get(WORKSPACE_SPEC_METADATA_KEY)
             .and_then(|raw| serde_json::from_str::<WorkspaceSpec>(raw).ok());
+        // Prefer the dedicated metadata key; older persisted states only carry the id inside the
+        // backend extras (Kubernetes `claim_name`, E2B `sandbox_id`).
+        let sandbox_id = remote
+            .metadata
+            .get(SANDBOX_ID_METADATA_KEY)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                SANDBOX_ID_FALLBACK_EXTRA_KEYS
+                    .iter()
+                    .find_map(|key| extra.get(*key).cloned())
+            });
         Ok(Self {
             session_id: remote.session_id.clone(),
             backend,
-            sandbox_id: None,
+            sandbox_id,
             endpoint: remote.endpoint.clone(),
             token: remote.token.clone(),
             workspace_root,
@@ -829,6 +855,14 @@ mod tests {
                         .map(String::as_str),
                     Some("e2b")
                 );
+                // The remote sandbox id is persisted so `resume` can reconnect (SANDBOX-03).
+                assert_eq!(
+                    remote
+                        .metadata
+                        .get(SANDBOX_ID_METADATA_KEY)
+                        .map(String::as_str),
+                    Some("sbx-1")
+                );
             }
             other => panic!("expected remote state, got {other:?}"),
         }
@@ -920,6 +954,8 @@ mod tests {
         commands: Mutex<Vec<String>>,
         alive: Mutex<bool>,
         native_transfer: bool,
+        /// Number of `create_sandbox` calls, so tests can prove `resume` does not recreate.
+        creates: Mutex<usize>,
     }
 
     /// Stand-in native file-transfer adapter (see the harness-gap note in `kubernetes_files`).
@@ -952,6 +988,7 @@ mod tests {
         }
         async fn create_sandbox(&self, _session_id: &str) -> SandboxResult<RemoteSandboxHandle> {
             *self.alive.lock().unwrap() = true;
+            *self.creates.lock().unwrap() += 1;
             Ok(RemoteSandboxHandle::new("fake-1", BTreeMap::new()))
         }
         async fn connect_sandbox(&self, sandbox_id: &str) -> SandboxResult<RemoteSandboxHandle> {
@@ -995,6 +1032,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(false),
             native_transfer: false,
+            creates: Mutex::new(0),
         });
         let client = RemoteSandboxClient::new(backend.clone());
         let spec = WorkspaceSpec::new("/workspace").with_file("README.md", "hi");
@@ -1036,6 +1074,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(false),
             native_transfer: false,
+            creates: Mutex::new(0),
         });
         let client = RemoteSandboxClient::new(backend).with_snapshot_spec(Arc::new(
             agentscope_harness::agent::sandbox::RemoteSnapshotSpec::new(Arc::new(
@@ -1067,6 +1106,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(true),
             native_transfer: false,
+            creates: Mutex::new(0),
         });
         let client = RemoteSandboxClient::new(backend);
         let state = sample_data().to_harness_state();
@@ -1080,13 +1120,90 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(false),
             native_transfer: false,
+            creates: Mutex::new(0),
         });
-        let client = RemoteSandboxClient::new(backend);
-        let json = client
-            .serialize_state(&sample_data().to_harness_state())
-            .unwrap();
+        let client = RemoteSandboxClient::new(backend.clone());
+
+        // 1. Create + start so a live remote sandbox (and thus its id) exists.
+        let spec = WorkspaceSpec::new("/workspace").with_file("a.txt", "hi");
+        let mut sandbox = client.create(&spec, None, None).await.unwrap();
+        sandbox.start().await.unwrap();
+        assert_eq!(*backend.creates.lock().unwrap(), 1, "start creates once");
+
+        // 2. Persist and restore through the harness (de)serializer.
+        let json = client.serialize_state(sandbox.state()).unwrap();
         let parsed = client.deserialize_state(&json).unwrap();
-        assert_eq!(parsed.session_id(), "sess-1");
+        assert_eq!(parsed.session_id(), sandbox.state().session_id());
+        let persisted_id = match &parsed {
+            SandboxState::Remote(remote) => remote
+                .metadata
+                .get(SANDBOX_ID_METADATA_KEY)
+                .cloned()
+                .expect("the remote sandbox id is persisted in the state metadata"),
+            other => panic!("expected a remote state, got {other:?}"),
+        };
+        assert_eq!(persisted_id, "fake-1");
+
+        // 3. `resume` must reconnect to that id instead of creating a second sandbox.
+        let mut resumed = client.resume(&parsed).await.unwrap();
+        match resumed.state() {
+            SandboxState::Remote(remote) => assert_eq!(
+                remote
+                    .metadata
+                    .get(SANDBOX_ID_METADATA_KEY)
+                    .map(String::as_str),
+                Some("fake-1")
+            ),
+            other => panic!("expected a remote state, got {other:?}"),
+        }
+        resumed.start().await.unwrap();
+        assert_eq!(*backend.creates.lock().unwrap(), 1, "resume must not call create_sandbox");
+    }
+
+    #[test]
+    fn resume_recovers_the_sandbox_id_from_backend_extras() {
+        // States persisted before the metadata key existed only carried the id inside the
+        // backend extras (Kubernetes `claim_name`, E2B `sandbox_id`).
+        let state_with = |extra: BTreeMap<String, String>| {
+            let mut metadata = HashMap::new();
+            metadata.insert(BACKEND_METADATA_KEY.to_string(), "kubernetes".to_string());
+            metadata.insert(
+                EXTRA_METADATA_KEY.to_string(),
+                serde_json::to_string(&extra).unwrap(),
+            );
+            SandboxState::Remote(RemoteSandboxState {
+                session_id: "sess-7".to_string(),
+                endpoint: "memory://fake".to_string(),
+                token: None,
+                workspace_root_ready: false,
+                workspace_projection_hash: None,
+                metadata,
+                snapshot: None,
+            })
+        };
+
+        for (key, value) in [("claim_name", "claim-7"), ("sandbox_id", "sbx-7")] {
+            let mut extra = BTreeMap::new();
+            extra.insert(key.to_string(), value.to_string());
+            let data = RemoteSandboxStateData::from_harness_state(&state_with(extra)).unwrap();
+            assert_eq!(data.sandbox_id.as_deref(), Some(value), "fallback key {key}");
+            // The recovered id is promoted into the dedicated metadata key on re-projection.
+            match data.to_harness_state() {
+                SandboxState::Remote(remote) => assert_eq!(
+                    remote
+                        .metadata
+                        .get(SANDBOX_ID_METADATA_KEY)
+                        .map(String::as_str),
+                    Some(value)
+                ),
+                other => panic!("expected a remote state, got {other:?}"),
+            }
+        }
+
+        // A state with no id anywhere still falls back to creating a sandbox.
+        let data =
+            RemoteSandboxStateData::from_harness_state(&state_with(BTreeMap::new())).unwrap();
+        assert!(data.sandbox_id.is_none());
     }
 
     #[tokio::test]
@@ -1095,6 +1212,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(true),
             native_transfer: true,
+            creates: Mutex::new(0),
         });
         let mut sandbox = RemoteSandbox::new(backend.clone(), sample_data(), None);
         // The adapter is refreshed in `ensure_handle`, so it is absent until the sandbox starts.
@@ -1107,6 +1225,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(true),
             native_transfer: false,
+            creates: Mutex::new(0),
         });
         let mut plain = RemoteSandbox::new(backend, sample_data(), None);
         plain.start().await.unwrap();
@@ -1121,6 +1240,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             alive: Mutex::new(true),
             native_transfer: true,
+            creates: Mutex::new(0),
         });
         let mut sandbox = RemoteSandbox::new(backend.clone(), sample_data(), None);
         sandbox.start().await.unwrap();

@@ -179,12 +179,16 @@ pub trait JdbcExecutor: Send + Sync + std::fmt::Debug {
     /// backends override it.
     ///
     /// **Precondition for multi-statement writers** — `JdbcAgentSkillRepository` writes
-    /// `agentscope_skills` and then, using the id it read back, `agentscope_skill_resources`.
-    /// An executor that does **not** override this method has no atomicity at all, so a failed
-    /// resource insert leaves an orphan skill row. In this crate `RusqliteExecutor` and every
-    /// `backend::driver::DriverExecutor` override it (`BEGIN` … `COMMIT` / `ROLLBACK` on one
-    /// connection); any new executor **must** do the same, or the skill repository must not be
-    /// wired to it.
+    /// `agentscope_skills` and then, using the id it read back, `agentscope_skill_resources`;
+    /// `JdbcAgentStateStore` reads a list's hash and item count and then writes the append (or
+    /// the rewrite) plus the hash row; `save_if_version(UNVERSIONED)` on a dialect without a
+    /// returning UPSERT writes and then reads the version. An executor that does **not**
+    /// override this method has no atomicity at all in those paths: a failed resource insert
+    /// leaves an orphan skill row, a concurrent writer makes the append collide on the item
+    /// index, and the version read can report another writer's version. In this crate
+    /// `RusqliteExecutor` and every `backend::driver::DriverExecutor` override it (`BEGIN` …
+    /// `COMMIT` / `ROLLBACK` on one connection); any new executor **must** do the same, or the
+    /// skill repository and the state store must not be wired to it.
     fn in_transaction(
         &self,
         work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,

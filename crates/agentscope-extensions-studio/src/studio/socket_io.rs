@@ -363,6 +363,14 @@ impl SocketIoTransport {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    /// The registry incoming `forwardUserInput` events are resolved into.
+    ///
+    /// The manager hands this same registry to the `StudioWebSocketClient` it builds, so
+    /// `wait_for_input` observes the events decoded here (STUDIO-01).
+    pub fn registry(&self) -> Arc<PendingInputRegistry> {
+        Arc::clone(&self.registry)
+    }
 }
 
 #[async_trait]
@@ -496,6 +504,10 @@ impl StudioTransport for SocketIoTransport {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn input_registry(&self) -> Option<Arc<PendingInputRegistry>> {
+        Some(self.registry())
     }
 }
 

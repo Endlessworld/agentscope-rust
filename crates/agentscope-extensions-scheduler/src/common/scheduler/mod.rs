@@ -4,8 +4,10 @@
 //! BaseScheduleAgentTask}`. This is the crate-internal shared layer consumed by
 //! both backends.
 
+pub mod lock;
 pub mod scheduler;
 pub mod task;
 
+pub use lock::{NoopSchedulerLock, SchedulerLock};
 pub use scheduler::{AgentScheduler, SchedulerError};
 pub use task::{AgentFactory, BaseScheduleAgentTask, ScheduleAgentTask, TaskControl};

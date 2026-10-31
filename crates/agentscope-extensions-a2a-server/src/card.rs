@@ -8,8 +8,8 @@
 use agentscope_extensions_a2a_client::model::{AgentCard, AgentInterface};
 /// Java `AgentScopeAgentCardConverter` constants.
 pub mod card_converter {
-    /// Protocol version advertised by the AgentScope A2A server.
-    pub const PROTOCOL_VERSION: &str = "0.3.0";
+    /// Protocol version stamped on every `supportedInterfaces` entry (A2A 1.0).
+    pub const PROTOCOL_VERSION: &str = agentscope_extensions_a2a_client::model::PROTOCOL_VERSION;
     /// Default card version.
     pub const DEFAULT_VERSION: &str = "1.0.0";
     /// Default transport when none is configured.
@@ -169,9 +169,14 @@ pub trait AgentDescriptor: Send + Sync {
 ///
 /// Mirrors Java `io.agentscope.core.a2a.server.card.AgentScopeAgentCardConverter`. Build rules:
 ///
-/// * `capabilities`: always `streaming = true`, `pushNotifications = false`,
-///   `stateTransitionHistory = false` (not configurable).
-/// * `protocolVersion`: always [`card_converter::PROTOCOL_VERSION`].
+/// * `capabilities`: always `streaming = true`, `pushNotifications = false` (Java also pins
+///   `extendedAgentCard = false`; the shared DTO has no such field yet, so 1.0 clients read the
+///   capability as absent, i.e. `false`). `stateTransitionHistory` is a 0.3 flag and is no longer
+///   advertised (Java's 1.0 converter sets only the three flags above).
+/// * `supportedInterfaces`: the preferred interface first, then the others (A2A 1.0 wire shape);
+///   each entry carries `protocolBinding` and `protocolVersion: 1.0`. The card keeps the preferred
+///   interface in `url` / `preferredTransport` and the others in `additionalInterfaces`; see
+///   [`AgentCard`]'s `Serialize` impl for the 1.0 rendering.
 /// * `supportsAuthenticatedExtendedCard`: always `false`.
 /// * `version`: configured value, else `1.0.0`.
 /// * `defaultInputModes` / `defaultOutputModes`: configured value, else `["text"]`.
@@ -214,7 +219,7 @@ pub fn create_agent_card(
                 .clone()
                 .unwrap_or_else(|| card_converter::DEFAULT_VERSION.to_string()),
         ),
-        protocol_version: Some(card_converter::PROTOCOL_VERSION.to_string()),
+        protocol_version: None,
         provider: config.provider.clone(),
         preferred_transport: preferred.map(|i| i.transport),
         additional_interfaces: Some(additional_interfaces),
@@ -222,7 +227,8 @@ pub fn create_agent_card(
         capabilities: agentscope_extensions_a2a_client::model::AgentCapabilities {
             streaming: Some(true),
             push_notifications: Some(false),
-            state_transition_history: Some(false),
+            // 0.3-only flag: A2A 1.0 dropped it in favour of `extendedAgentCard`.
+            state_transition_history: None,
             extensions: None,
         },
         default_input_modes: modes(&config.default_input_modes),
@@ -310,12 +316,14 @@ mod tests {
         assert_eq!(card.name, "runner-agent");
         assert_eq!(card.description.as_deref(), Some("runner description"));
         assert_eq!(card.version.as_deref(), Some("1.0.0"));
-        assert_eq!(card.protocol_version.as_deref(), Some("0.3.0"));
+        assert_eq!(card.protocol_version, None);
         assert_eq!(card.preferred_transport.as_deref(), Some("JSONRPC"));
         assert_eq!(card.url, "http://localhost:8080");
         assert_eq!(card.default_input_modes, vec!["text".to_string()]);
         assert_eq!(card.capabilities.streaming, Some(true));
         assert_eq!(card.capabilities.push_notifications, Some(false));
+        // A2A 1.0 dropped `stateTransitionHistory`; only the three 1.0 flags are advertised.
+        assert_eq!(card.capabilities.state_transition_history, None);
         assert_eq!(card.supports_authenticated_extended_card, Some(false));
         assert!(card.skills.is_empty());
         assert_eq!(card.additional_interfaces.as_ref().unwrap().len(), 1);
@@ -346,5 +354,51 @@ mod tests {
         assert_eq!(card.default_input_modes, vec!["text/plain".to_string()]);
         assert_eq!(card.default_output_modes, vec!["text".to_string()]);
         assert_eq!(card.skills.len(), 1);
+    }
+
+    #[test]
+    fn create_agent_card_serializes_the_a2a_1_0_shape() {
+        let config = ConfigurableAgentCard::builder()
+            .security(vec![serde_json::Map::from_iter([(
+                "apiKey".to_string(),
+                serde_json::json!(["read"]),
+            )])])
+            .build();
+        let transports = vec![
+            TransportProperties::builder("JSONRPC")
+                .host("localhost")
+                .port(8080)
+                .build(),
+            TransportProperties::builder("GRPC")
+                .host("localhost")
+                .port(9090)
+                .build(),
+        ];
+
+        let card = create_agent_card(&config, &descriptor(), &transports);
+        let json = serde_json::to_value(&card).unwrap();
+
+        let interfaces = json["supportedInterfaces"].as_array().unwrap();
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0]["protocolBinding"], "JSONRPC");
+        assert_eq!(interfaces[0]["url"], "http://localhost:8080");
+        assert_eq!(interfaces[0]["protocolVersion"], "1.0");
+        assert_eq!(interfaces[1]["protocolBinding"], "GRPC");
+        assert_eq!(interfaces[1]["url"], "http://localhost:9090");
+        assert_eq!(json["securityRequirements"][0]["apiKey"][0], "read");
+        assert_eq!(json["capabilities"]["pushNotifications"], false);
+        assert_eq!(json["capabilities"]["streaming"], true);
+        assert!(json["capabilities"].get("stateTransitionHistory").is_none());
+
+        // The 0.3 discovery keys must not be emitted any more.
+        for legacy in [
+            "url",
+            "preferredTransport",
+            "additionalInterfaces",
+            "protocolVersion",
+            "security",
+        ] {
+            assert!(json.get(legacy).is_none(), "unexpected 0.3 key {legacy}");
+        }
     }
 }

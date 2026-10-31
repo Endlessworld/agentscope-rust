@@ -5,7 +5,9 @@
 //! `JobHandler` per agent; the actual cron schedule lives in the XXL-Job admin
 //! console. Rust has no xxl-job SDK, so we provide an equivalent in-process
 //! `JobHandler` registry plus a local `trigger` used by tests and by a host
-//! application that bridges an external scheduler.
+//! application that bridges an external scheduler. The executor protocol itself
+//! (registry/beat/run/idleBeat/kill/log endpoints) stays in the host: this crate
+//! only defines its contract in [`bridge`].
 //!
 //! Semantics preserved from Java:
 //! * only `ScheduleMode::NONE` is accepted at registration time;
@@ -17,9 +19,11 @@
 //!   error-carrying equivalent of Java's `UnsupportedOperationException`;
 //! * `shutdown` clears all handlers (Java additionally destroys the executor).
 
+pub mod bridge;
 pub mod context;
 mod log;
 
+pub use bridge::{DispatchRequest, ExecuteResponse, ExecutorBridge};
 pub use context::{XxlJobContext, XxlJobHandleCode, XxlJobHandleResult, XxlJobHelper};
 pub use log::XxlJobLogMiddleware;
 

@@ -217,16 +217,16 @@ mod tests {
     fn retryability_matches_transient_failures_only() {
         assert!(RetryPolicy::is_retryable(&MemError::Transport("e".into())));
         for status in [408_u16, 429, 500, 502, 503] {
-            assert!(RetryPolicy::is_retryable(&MemError::HttpStatus {
+            assert!(RetryPolicy::is_retryable(&MemError::http_status(
                 status,
-                body: String::new()
-            }));
+                String::new()
+            )));
         }
         for status in [400_u16, 401, 403, 404, 422] {
-            assert!(!RetryPolicy::is_retryable(&MemError::HttpStatus {
+            assert!(!RetryPolicy::is_retryable(&MemError::http_status(
                 status,
-                body: String::new()
-            }));
+                String::new()
+            )));
         }
         assert!(!RetryPolicy::is_retryable(&MemError::Config("c".into())));
         let json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
@@ -249,20 +249,14 @@ mod tests {
     #[tokio::test]
     async fn retries_server_errors_but_not_client_errors() {
         let server = MockTransport::new();
-        server.push_response(Err(MemError::HttpStatus {
-            status: 503,
-            body: "busy".into(),
-        }));
+        server.push_response(Err(MemError::http_status(503, "busy")));
         server.push_body("ok");
         let retry = transport(&server, fast_policy(3));
         assert_eq!(retry.post_json("http://x/y", &[], "{}").await.unwrap(), "ok");
         assert_eq!(server.requests().len(), 2);
 
         let client_err = MockTransport::new();
-        client_err.push_response(Err(MemError::HttpStatus {
-            status: 400,
-            body: "bad request".into(),
-        }));
+        client_err.push_response(Err(MemError::http_status(400, "bad request")));
         let retry = transport(&client_err, fast_policy(3));
         assert!(retry.post_json("http://x/y", &[], "{}").await.is_err());
         assert_eq!(client_err.requests().len(), 1);

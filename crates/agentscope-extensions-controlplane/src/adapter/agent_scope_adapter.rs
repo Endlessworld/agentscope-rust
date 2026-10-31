@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use agentscope_core::agent::react_agent::ReActAgent;
+use agentscope_core::agent::CallableAgent;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole};
-use agentscope_core::state::AgentState;
+use agentscope_core::state::{AgentState, Task, TaskState};
 use agentscope_core::Agent as _;
 use agentscope_harness::agent::HarnessAgent;
 
@@ -263,7 +264,7 @@ impl FrameworkAdapter for AgentScopeAdapter {
         Ok(())
     }
 
-    fn detach(&mut self) -> ControlPlaneResult<()> {
+    fn detach(&self) -> ControlPlaneResult<()> {
         *self.target.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
     }
@@ -462,6 +463,270 @@ impl FrameworkAdapter for AgentScopeAdapter {
             ))),
         }
     }
+
+    /// Todo list for `GET .../tasks`, read from the live `AgentState.tasks_context`
+    /// (mirrors `AgentScopeAdapter.listTasks`).
+    async fn list_tasks(&self, session_id: &str) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        let target = self.require_target()?;
+        let state = self.resolve_state(&target, session_id).await;
+        Ok(state
+            .as_ref()
+            .map(|s| s.tasks_context().tasks().iter().map(task_json).collect())
+            .unwrap_or_default())
+    }
+
+    /// Workspaces reported by the host runtime source (mirrors `listWorkspaces`).
+    async fn list_workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        let src = self.runtime_source().ok_or_else(|| {
+            ControlPlaneError::Unsupported(
+                "workspace-inventory is not supported by this adapter".into(),
+            )
+        })?;
+        src.list_workspaces().await
+    }
+
+    /// Background subagent tasks for `GET .../subagent-tasks`.
+    async fn list_subagent_tasks(
+        &self,
+        session_id: &str,
+    ) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        let src = self.runtime_source().ok_or_else(|| {
+            ControlPlaneError::Unsupported(
+                "subagent-task-query is not supported by this adapter".into(),
+            )
+        })?;
+        src.list_subagent_tasks(session_id).await
+    }
+
+    /// Cancels one background subagent task; a task the host did not find is a 404.
+    async fn cancel_subagent_task(&self, session_id: &str, task_id: &str) -> ControlPlaneResult<()> {
+        let src = self.runtime_source().ok_or_else(|| {
+            ControlPlaneError::Unsupported(
+                "subagent-task-command is not supported by this adapter".into(),
+            )
+        })?;
+        if src.cancel_subagent_task(session_id, task_id).await? {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::NotFound(format!(
+                "subagent task not found or cancel failed: {task_id}"
+            )))
+        }
+    }
+
+    /// Enters/leaves plan mode (mirrors `AgentScopeAdapter.setPlanMode`).
+    ///
+    /// The host runtime source wins when it handles the switch; otherwise the flag is written
+    /// into the agent's **live** state handle so the next turn observes it.
+    async fn set_plan_mode(
+        &self,
+        session_id: &str,
+        params: serde_json::Value,
+    ) -> ControlPlaneResult<()> {
+        let active = plan_active(&params);
+        let target = self.require_target()?;
+        if let Some(src) = self.runtime_source() {
+            if src
+                .set_plan_mode(session_id, self.user_of(session_id).as_deref(), active)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        let react = Self::react_of(&target).ok_or_else(|| {
+            ControlPlaneError::Config(format!(
+                "agentscope-rust: no live state for session {session_id}"
+            ))
+        })?;
+        let handle = react.state_handle();
+        let mut state = handle.lock().unwrap_or_else(|p| p.into_inner());
+        state.plan_mode_context.set_plan_active(active);
+        Ok(())
+    }
+
+    /// Injects a user message through the framework's own `call` path.
+    async fn inject_user_message(&self, session_id: &str, content: &str) -> ControlPlaneResult<()> {
+        self.call_user_message(session_id, content).await.map(|_| ())
+    }
+
+    /// Runs one control-plane turn and returns the terminal assistant reply.
+    async fn run_conversation_turn(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> ControlPlaneResult<String> {
+        let reply = self.call_user_message(session_id, content).await?;
+        Ok(reply.text_content())
+    }
+
+    /// Effective definition snapshot merged into `GET /agentscope/info` → `agentConfig`.
+    fn build_agent_config(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut cfg = serde_json::Map::new();
+        let Some(target) = self.target() else {
+            return cfg;
+        };
+        let react = Self::react_of(&target);
+        let name = react.map(|r| r.name().to_string()).unwrap_or_default();
+        if !name.is_empty() {
+            cfg.insert("name".into(), name.into());
+        }
+        let description = react.map(|r| r.description().to_string()).unwrap_or_default();
+        if !description.is_empty() {
+            cfg.insert("description".into(), description.into());
+        }
+        let sys_prompt = react.map(|r| r.sys_prompt().to_string()).unwrap_or_default();
+        if !sys_prompt.is_empty() {
+            cfg.insert("systemPrompt".into(), truncate_prompt(&sys_prompt).into());
+        }
+        if let Some(model) = react.map(|r| r.model()) {
+            let model_name = model.model_name().to_string();
+            if !model_name.is_empty() {
+                cfg.insert("model".into(), model_name.into());
+            }
+            cfg.insert(
+                "contextWindow".into(),
+                (model.context_window_size() as i64).into(),
+            );
+        }
+        if let Some(r) = react {
+            cfg.insert("maxIters".into(), r.max_iters().into());
+            cfg.insert("maxTurns".into(), r.max_iters().into());
+        }
+        let groups = target
+            .downcast_ref::<HarnessAgent>()
+            .map(|h| h.toolkit().get_active_groups())
+            .unwrap_or_default();
+        let tools = self.tools_of(&target, &groups);
+        if !tools.is_empty() {
+            cfg.insert(
+                "tools".into(),
+                serde_json::Value::Array(
+                    tools
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "name": t.name.clone(),
+                                "description": t.description.clone(),
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(src) = self.runtime_source() {
+            src.enrich_agent_config(&mut cfg);
+        }
+        cfg
+    }
+
+    /// Materializes a downstream AgentTask delivery through the host starter.
+    async fn handle_agent_task(
+        &self,
+        assignment: crate::model::AgentTaskAssignment,
+    ) -> ControlPlaneResult<()> {
+        let starter = self
+            .agent_task_starter
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                ControlPlaneError::Unsupported(
+                    "agentscope-rust: AgentTask requires an AgentTaskStarter".into(),
+                )
+            })?;
+        starter.start(assignment).await
+    }
+}
+
+impl AgentScopeAdapter {
+    /// Runs one user message through the live agent, mirroring
+    /// `AgentScopeAdapter.callUserMessage`.
+    async fn call_user_message(&self, session_id: &str, content: &str) -> ControlPlaneResult<Msg> {
+        let target = self.require_target()?;
+        let messages = vec![Msg::user(content)];
+        let result = if let Some(harness) = target.downcast_ref::<HarnessAgent>() {
+            harness.call(messages).await
+        } else if let Some(react) = target.downcast_ref::<ReActAgent>() {
+            react.call(messages).await
+        } else {
+            return Err(ControlPlaneError::Config(format!(
+                "agentscope-rust: session {session_id} has no callable agent"
+            )));
+        };
+        result.map_err(|error| ControlPlaneError::Internal(format!("agent call failed: {error}")))
+    }
+}
+
+/// Contract `Task` shape for `GET .../tasks`, mirroring `AgentScopeAdapter.toTaskJson`.
+fn task_json(task: &Task) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert("id".into(), task.id.clone().into());
+    out.insert("subject".into(), task.subject.clone().into());
+    if !task.description.is_empty() {
+        out.insert("description".into(), task.description.clone().into());
+    }
+    out.insert("state".into(), task_state_wire(task.state).into());
+    if let Some(owner) = task.owner.as_ref().filter(|owner| !owner.is_empty()) {
+        out.insert("owner".into(), owner.clone().into());
+    }
+    out.insert(
+        "blockedBy".into(),
+        serde_json::Value::Array(task.blocked_by.iter().cloned().map(Into::into).collect()),
+    );
+    if !task.created_at.is_empty() {
+        out.insert("updatedAt".into(), task.created_at.clone().into());
+    }
+    out.insert(
+        "frameworkMeta".into(),
+        serde_json::Value::Object(task.metadata.clone()),
+    );
+    serde_json::Value::Object(out)
+}
+
+/// Wire name of a task state (core `TaskState` serialises to the same strings).
+fn task_state_wire(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Pending => "pending",
+        TaskState::InProgress => "in_progress",
+        TaskState::Completed => "completed",
+    }
+}
+
+/// Parses the plan-mode body, mirroring `AgentScopeAdapter.parsePlanActive`.
+///
+/// An absent / unparsable body means "enter": the control plane only shows the button when
+/// it intends to turn plan mode on.
+fn plan_active(params: &serde_json::Value) -> bool {
+    let Some(object) = params.as_object() else {
+        return true;
+    };
+    if let Some(active) = object.get("active") {
+        match active {
+            serde_json::Value::Bool(active) => return *active,
+            serde_json::Value::Null => {}
+            other => {
+                return other
+                    .as_str()
+                    .map(|text| text.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true)
+            }
+        }
+    }
+    match object.get("mode").and_then(|mode| mode.as_str()) {
+        Some(mode) => !matches!(mode.to_ascii_lowercase().as_str(), "exit" | "off" | "false"),
+        None => true,
+    }
+}
+
+/// Truncates an over-long system prompt for `/agentscope/info` (Java caps at 8000).
+fn truncate_prompt(prompt: &str) -> String {
+    const MAX_CHARS: usize = 8000;
+    if prompt.chars().count() <= MAX_CHARS {
+        return prompt.to_string();
+    }
+    let mut out: String = prompt.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
 }
 
 /// Estimates tokens occupying the model context window.
@@ -711,7 +976,9 @@ mod tests {
         let adapter = AgentScopeAdapter::new(None);
         let middleware = adapter.middleware();
         let target: Arc<dyn Any + Send + Sync> = Arc::new(react_agent());
-        let bridge = crate::instrument(target, cfg, Box::new(adapter)).unwrap();
+        let bridge = crate::instrument(target, cfg, Box::new(adapter))
+            .await
+            .unwrap();
 
         let mut ctx = RuntimeContext::default();
         ctx.session_id = Some("s-attach".into());
@@ -723,5 +990,185 @@ mod tests {
             bridge.is_known_session("s-attach"),
             "on_bridge_attached did not reach AdapterShared; Level-2 events were dropped"
         );
+    }
+
+    /// A runtime source that supports every optional capability, so the capability bits can be
+    /// probed one by one.
+    struct FullRuntimeSource;
+
+    #[async_trait]
+    impl AgentRuntimeSource for FullRuntimeSource {
+        async fn list_subagents(&self) -> ControlPlaneResult<Vec<crate::model::SubagentInfo>> {
+            Ok(vec![crate::model::SubagentInfo {
+                name: "sub-1".into(),
+                ..Default::default()
+            }])
+        }
+        async fn list_workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+            Ok(vec![serde_json::json!({ "path": "/work", "mode": "rw" })])
+        }
+        async fn list_subagent_tasks(
+            &self,
+            _session_id: &str,
+        ) -> ControlPlaneResult<Vec<serde_json::Value>> {
+            Ok(vec![serde_json::json!({ "id": "t1", "status": "running" })])
+        }
+        async fn cancel_subagent_task(
+            &self,
+            _session_id: &str,
+            _task_id: &str,
+        ) -> ControlPlaneResult<bool> {
+            Ok(true)
+        }
+        async fn set_plan_mode(
+            &self,
+            _session_id: &str,
+            _user_id: Option<&str>,
+            _active: bool,
+        ) -> ControlPlaneResult<bool> {
+            Ok(false)
+        }
+    }
+
+    fn attached_adapter() -> (AgentScopeAdapter, Arc<ReActAgent>, String) {
+        let mut adapter = AgentScopeAdapter::new(None);
+        let agent = Arc::new(react_agent());
+        let session = agent.agent_state().session_id.clone();
+        let target: Arc<dyn Any + Send + Sync> = agent.clone();
+        adapter
+            .attach(target, Arc::new(|_e: SessionEvent| {}))
+            .unwrap();
+        (adapter, agent, session)
+    }
+
+    /// CP-03: every declared capability must map to a callable implementation. Before the
+    /// parity methods existed the adapter declared `task-query` / `plan-mode` /
+    /// `export-transcript` / `conversation-inbound` while their trait defaults returned
+    /// `Unsupported`, so the control plane showed buttons that always failed.
+    #[tokio::test]
+    async fn declared_capabilities_map_to_non_unsupported_operations() {
+        let (adapter, _agent, session) = attached_adapter();
+        let caps = adapter.capabilities();
+        assert!(caps.contains(&CAP_TASK_QUERY.to_string()));
+        assert!(caps.contains(&CAP_PLAN_MODE.to_string()));
+        assert!(caps.contains(&CAP_EXPORT_TRANSCRIPT.to_string()));
+        assert!(caps.contains(&CAP_CONVERSATION_INBOUND.to_string()));
+
+        for capability in caps {
+            let outcome: ControlPlaneResult<()> = match capability.as_str() {
+                CAP_CONTEXT_QUERY => adapter.extract_context(&session).await.map(|_| ()),
+                CAP_MESSAGE_QUERY => adapter.list_messages(&session, 0, 10).await.map(|_| ()),
+                CAP_SESSION_COMMAND | CAP_SESSION_ABORT => adapter
+                    .execute_command(&session, COMMAND_ABORT, None)
+                    .await
+                    .map(|_| ()),
+                CAP_TASK_QUERY => adapter.list_tasks(&session).await.map(|_| ()),
+                CAP_PLAN_MODE => adapter
+                    .set_plan_mode(&session, serde_json::json!({ "active": true }))
+                    .await,
+                CAP_EXPORT_TRANSCRIPT => {
+                    adapter.list_messages(&session, 0, i64::MAX).await.map(|_| ())
+                }
+                // The probe only needs to prove the route is wired, not that the stub model
+                // can answer: a real `Unsupported` is what the capability bit forbids.
+                CAP_CONVERSATION_INBOUND => adapter.inject_user_message(&session, "hi").await,
+                other => panic!("declared capability {other} has no probe"),
+            };
+            assert!(
+                !matches!(outcome, Err(ControlPlaneError::Unsupported(_))),
+                "capability {capability} is declared but its operation is unsupported"
+            );
+        }
+    }
+
+    /// CP-03: the runtime-source-gated bits are only declared when the source is installed.
+    #[tokio::test]
+    async fn runtime_source_capabilities_are_declared_and_callable() {
+        let (mut adapter, _agent, session) = attached_adapter();
+        adapter.set_runtime_source(Arc::new(FullRuntimeSource));
+        let caps = adapter.capabilities();
+        for cap in [
+            CAP_SUBAGENT_INVENTORY,
+            CAP_WORKSPACE_INVENTORY,
+            CAP_SUBAGENT_TASK_QUERY,
+            CAP_SUBAGENT_TASK_COMMAND,
+        ] {
+            assert!(caps.contains(&cap.to_string()), "{cap} not declared");
+        }
+        assert!(adapter.list_subagents().await.is_ok());
+        assert_eq!(adapter.list_workspaces().await.unwrap().len(), 1);
+        assert_eq!(adapter.list_subagent_tasks(&session).await.unwrap().len(), 1);
+        adapter.cancel_subagent_task(&session, "t1").await.unwrap();
+    }
+
+    /// CP-03: `list_tasks` reads the live task context, not the event-derived view.
+    #[tokio::test]
+    async fn list_tasks_reads_the_live_task_context() {
+        let (adapter, agent, session) = attached_adapter();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .tasks_context
+            .tasks_mut()
+            .push(
+                Task::builder()
+                    .id("t1")
+                    .subject("write docs")
+                    .state(TaskState::InProgress)
+                    .build(),
+            );
+        let tasks = adapter.list_tasks(&session).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "t1");
+        assert_eq!(tasks[0]["subject"], "write docs");
+        assert_eq!(tasks[0]["state"], "in_progress");
+    }
+
+    /// CP-03: `set_plan_mode` writes the live state so the next turn sees the flag.
+    #[tokio::test]
+    async fn set_plan_mode_updates_the_live_state() {
+        let (adapter, agent, session) = attached_adapter();
+        adapter
+            .set_plan_mode(&session, serde_json::json!({ "active": true }))
+            .await
+            .unwrap();
+        assert!(agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .plan_mode_context
+            .plan_active());
+        adapter
+            .set_plan_mode(&session, serde_json::json!({ "active": false }))
+            .await
+            .unwrap();
+        assert!(!agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .plan_mode_context
+            .plan_active());
+    }
+
+    /// CP-03: `build_agent_config` feeds `GET /agentscope/info` → `agentConfig`.
+    #[test]
+    fn build_agent_config_reports_the_effective_definition() {
+        let (adapter, _agent, _session) = attached_adapter();
+        let cfg = adapter.build_agent_config();
+        assert_eq!(cfg["name"], "friday");
+        assert_eq!(cfg["systemPrompt"], "you are helpful");
+        assert_eq!(cfg["model"], "stub-model");
+        assert_eq!(cfg["maxIters"], 7);
+        assert_eq!(cfg["maxTurns"], 7);
+    }
+
+    #[test]
+    fn plan_active_body_parsing_matches_java() {
+        assert!(plan_active(&serde_json::json!({})));
+        assert!(plan_active(&serde_json::json!({ "active": true })));
+        assert!(!plan_active(&serde_json::json!({ "active": false })));
+        assert!(plan_active(&serde_json::json!({ "mode": "enter" })));
+        assert!(!plan_active(&serde_json::json!({ "mode": "EXIT" })));
     }
 }

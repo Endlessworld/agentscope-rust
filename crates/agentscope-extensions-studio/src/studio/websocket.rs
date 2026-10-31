@@ -52,6 +52,20 @@ pub trait StudioTransport: Send + Sync {
 
     /// Whether the transport currently holds an open connection.
     fn is_connected(&self) -> bool;
+
+    /// The registry this transport resolves incoming `forwardUserInput` events into.
+    ///
+    /// A transport that owns its pending-request table (like
+    /// [`SocketIoTransport`](super::socket_io::SocketIoTransport)) returns it here so the
+    /// manager can build the [`StudioWebSocketClient`] over the *same* registry — otherwise
+    /// `wait_for_input` waits on a table nobody ever resolves (STUDIO-01).
+    ///
+    /// The default `None` means "the client keeps its own registry", which is correct for
+    /// transports that never resolve requests themselves ([`NoopStudioTransport`], test
+    /// doubles fed through [`StudioWebSocketClient::handle_user_input`]).
+    fn input_registry(&self) -> Option<Arc<PendingInputRegistry>> {
+        None
+    }
 }
 
 /// A no-op transport used when Studio is unavailable or in tests.

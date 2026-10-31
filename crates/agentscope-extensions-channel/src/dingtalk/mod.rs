@@ -25,7 +25,7 @@ pub mod properties;
 pub mod stream;
 pub mod token;
 
-pub use channel::{DingTalkChannel, DingTalkChannelRegistry};
+pub use channel::{DingTalkChannel, DingTalkChannelRegistry, CHANNEL_TYPE};
 pub use controller::{DingTalkCallbackController, DingTalkCallbackOutcome};
 pub use crypto::DingTalkCallbackCrypto;
 pub use inbound::DingTalkInboundMapper;

@@ -444,6 +444,20 @@ impl RedisClientAdapter for MemoryRedisAdapter {
         keys: &[String],
         args: &[String],
     ) -> Result<Option<i64>> {
+        let is_discard = script == crate::state::DISCARD_TRACKED_KEY_SCRIPT;
+        if is_discard && keys.len() == 1 && args.len() == 1 {
+            let mut sets = self.sets_guard();
+            let Some(members) = sets.get_mut(&keys[0]) else {
+                return Ok(Some(0));
+            };
+            let removed = members.remove(&args[0]);
+            let now_empty = members.is_empty();
+            if now_empty {
+                // A real Redis drops a set key once its last member is removed (`SREM`).
+                sets.remove(&keys[0]);
+            }
+            return Ok(Some(if removed { 1 } else { 0 }));
+        }
         if script != crate::state::version_support::SAVE_SCRIPT {
             return Err(Error::Other(
                 "unsupported Lua script (memory double)".to_string(),
@@ -736,5 +750,10 @@ impl StoreCommands for MemoryStoreCommands {
     fn ping(&self) -> Result<()> {
         self.guard().ping_calls += 1;
         self.check()
+    }
+
+    fn client_id(&self) -> Result<i64> {
+        self.check()?;
+        Ok(0)
     }
 }

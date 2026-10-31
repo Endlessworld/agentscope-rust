@@ -18,6 +18,9 @@ agentscope-harness = { path = "../agentscope-harness" }
 # A2A wire model (AgentCard / AgentSkill / AgentCapabilities / AgentProvider /
 # AgentInterface) is reused from the protocol crate instead of being re-declared.
 agentscope-extensions-a2a-client = { path = "../agentscope-extensions-a2a-client" }
+# Protocol-side `AgentRegistry` (NACOS-01) lives in the A2A server crate; implementing it is
+# what makes the Nacos registry reachable from `AgentRegistryService`.
+agentscope-extensions-a2a-server = { path = "../agentscope-extensions-a2a-server" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

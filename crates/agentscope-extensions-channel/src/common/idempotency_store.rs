@@ -24,11 +24,26 @@ pub trait InboundEventDeduplicator: Send + Sync {
     /// retention horizon (`true` = the caller should proceed, `false` = redelivery, drop it). A
     /// `null`/empty key is always first-seen.
     fn first_seen(&self, key: &str) -> bool;
+
+    /// Whether `key` is currently inside the retention horizon, **without recording it**.
+    ///
+    /// Callers use this to reject a redelivery *before* doing the work while only recording the
+    /// key *after* it succeeded. The default `false` keeps the Java behaviour for implementations
+    /// that cannot answer cheaply: de-duplication then happens once the event has been handled
+    /// ("durable intake owns deduplication"), so a transient failure never becomes a permanent
+    /// drop.
+    fn contains(&self, key: &str) -> bool {
+        false
+    }
 }
 
 impl InboundEventDeduplicator for IdempotencyStore {
     fn first_seen(&self, key: &str) -> bool {
         IdempotencyStore::first_seen(self, key)
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        IdempotencyStore::contains(self, key)
     }
 }
 
@@ -138,6 +153,29 @@ impl IdempotencyStore {
         true
     }
 
+    /// Whether `key` is currently recorded, **without** recording it.
+    ///
+    /// This is the read-only half of [`IdempotencyStore::first_seen`]: callers that must not burn
+    /// a key before the work succeeded (a webhook that answers 503 for a retry, for example) peek
+    /// first and record afterwards.
+    pub fn contains(&self, key: &str) -> bool {
+        self.contains_at(key, now_ms())
+    }
+
+    /// [`IdempotencyStore::contains`] with an injected clock (offline tests).
+    pub fn contains_at(&self, key: &str, now_ms: i64) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        let mut inner = self.inner.lock().expect("idempotency store mutex poisoned");
+        inner.sweep(now_ms, self.ttl_ms, self.max_entries);
+        inner
+            .entries
+            .get(key)
+            .map(|entry| now_ms - entry.seen_at_ms <= self.ttl_ms)
+            .unwrap_or(false)
+    }
+
     /// Current number of tracked keys (observability / tests).
     pub fn size(&self) -> usize {
         self.inner
@@ -213,6 +251,22 @@ mod tests {
         // ... and so is one that would have been accepted under the old stamp.
         assert!(!store.first_seen_at("msg-1", 1_900));
         assert!(store.first_seen_at("msg-1", 2_002));
+    }
+
+    #[test]
+    fn contains_peeks_without_recording() {
+        let store = IdempotencyStore::new(1_000, 100).unwrap();
+        assert!(!store.contains_at("msg-1", 0));
+        assert_eq!(store.size(), 0, "a peek must not consume the key");
+
+        assert!(store.first_seen_at("msg-1", 0));
+        assert!(store.contains_at("msg-1", 999));
+        // Same TTL boundary rule as `first_seen`: strictly greater than the TTL is expired.
+        assert!(store.contains_at("msg-1", 1_000));
+        assert!(!store.contains_at("msg-1", 1_001));
+        // An empty key never carries identity on either side of the API.
+        assert!(!store.contains_at("", 0));
+        assert_eq!(store.size(), 1);
     }
 
     #[test]

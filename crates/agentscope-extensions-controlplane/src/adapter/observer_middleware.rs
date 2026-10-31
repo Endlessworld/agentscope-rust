@@ -266,7 +266,7 @@ mod tests {
     use crate::config::ControlPlaneConfig;
     use agentscope_core::message::Msg;
 
-    fn shared_with_reporter() -> (Arc<AdapterShared>, ControlPlaneBridge) {
+    async fn shared_with_reporter() -> (Arc<AdapterShared>, ControlPlaneBridge) {
         let cfg = ControlPlaneConfig::builder("friday")
             .instance_key("rep-1")
             .event_journal_dir(
@@ -277,7 +277,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let bridge = ControlPlaneBridge::new(cfg).start().unwrap();
+        let bridge = ControlPlaneBridge::new(cfg).start().await.unwrap();
         let shared = Arc::new(AdapterShared::default());
         *shared.reporter.lock().unwrap() = Some(bridge.reporter());
         (shared, bridge)
@@ -291,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_agent_emits_session_start_and_input_messages() {
-        let (shared, _bridge) = shared_with_reporter();
+        let (shared, _bridge) = shared_with_reporter().await;
         let mw = ControlPlaneObserverMiddleware::new(shared);
         let mut ctx = ctx("s1");
         ctx.delta_tx = None;
@@ -311,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_agent_forwards_stream_unchanged_when_attached() {
-        let (shared, _bridge) = shared_with_reporter();
+        let (shared, _bridge) = shared_with_reporter().await;
         let mw = ControlPlaneObserverMiddleware::new(shared);
         let input = AgentInput::new(vec![Msg::user("hi")]);
         let next: Next<AgentInput> = Box::new(|_i| {

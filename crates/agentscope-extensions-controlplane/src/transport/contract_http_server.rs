@@ -135,6 +135,20 @@ impl ContractHttpServer {
         Ok(())
     }
 
+    /// Stops accepting connections without awaiting the accept loop.
+    ///
+    /// Used by [`ControlPlaneBridge::close`](crate::bridge::ControlPlaneBridge::close), which is
+    /// synchronous; the graceful [`shutdown`](Self::shutdown) is available when a caller can
+    /// afford to await the task.
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.task.take() {
+            handle.abort();
+        }
+    }
+
     /// Stops the server and waits for the accept loop to finish.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown.take() {
@@ -431,7 +445,7 @@ async fn post_message(
     match state.provider.post_message(&id, body).await {
         Ok(()) => {
             let phase = state.provider.session_phase(&id);
-            let mut out = command_accepted(&headers, &id, &phase);
+            let out = command_accepted(&headers, &id, &phase);
             // Inbound injection is accepted asynchronously (HTTP 202).
             (StatusCode::ACCEPTED, Json(out)).into_response()
         }

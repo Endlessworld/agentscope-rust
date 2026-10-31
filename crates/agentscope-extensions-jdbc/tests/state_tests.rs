@@ -10,10 +10,15 @@
 
 use std::sync::Arc;
 
+use agentscope_extensions_jdbc::backend::is_unique_violation;
 use agentscope_extensions_jdbc::dialect::vendor::SqliteDialect;
-use agentscope_extensions_jdbc::dialect::{AbstractJdbcDialect, SessionStateDialect};
+use agentscope_extensions_jdbc::dialect::{
+    AbstractJdbcDialect, BoundSql, DialectKind, SessionStateDialect, SkillDialect,
+    SkillResourcesDialect, SnapshotDialect, StoreDialect, TableNameConfigurable, TableNames,
+};
 use agentscope_extensions_jdbc::{
-    AgentStateStore, JdbcAgentStateStore, JdbcExecutor, RusqliteExecutor, UNVERSIONED,
+    AgentStateStore, ColumnValue, JdbcAgentStateStore, JdbcError, JdbcExecutor, JdbcResult,
+    JdbcSession, RusqliteExecutor, UNVERSIONED,
 };
 
 fn new_store() -> JdbcAgentStateStore {
@@ -61,39 +66,63 @@ fn text_of(v: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// What the injected "competing writer" writes when the interpose point is reached.
+#[derive(Debug, Clone, Copy)]
+enum CompetingWrite {
+    /// Overwrite the single key `u:s` / `k` (an `UNVERSIONED`-style UPSERT that bumps
+    /// `version` and replaces the payload).
+    SingleKey,
+    /// Rewrite the list `u:s` / `l` to `[a1, b2]` — a concurrent writer whose append raced
+    /// with ours.
+    ListAppend,
+}
+
 /// Wraps a real executor to observe how many statements a call issues, and to let a test
-/// inject a *competing writer* at a precise point (GAP-01).
+/// inject a *competing writer* at a precise point (GAP-01 / JDBC-01 / JDBC-02).
 ///
 /// Interposition happens **after** the triggering statement has completed but before the
-/// caller regains control. That is exactly the window a non-atomic
-/// "UPSERT then SELECT version" implementation exposes: the write lands, another writer
-/// commits, and the follow-up read reports the other writer's version. For a
-/// `RETURNING`-based implementation the row is already produced by the single statement, so
-/// interposition cannot corrupt what the caller sees.
+/// caller regains control. That is exactly the window a non-atomic read-modify-write (or
+/// "UPSERT then SELECT version") exposes: the write lands, another writer commits, and the
+/// follow-up read reports the other writer's state. A single-statement or transactional
+/// implementation cannot be corrupted this way, and statements that run inside
+/// `in_transaction` never reach this wrapper at all.
 #[derive(Debug)]
 struct InstrumentedExecutor {
     inner: Arc<RusqliteExecutor>,
-    /// Statements touching the session-state table, in order.
+    /// Statements touching the session-state table issued *outside* a transaction, in order.
     session_statements: std::sync::atomic::AtomicUsize,
-    /// Fire the competing write right after the Nth session statement
+    /// Statements touching the session-state table issued *inside* `in_transaction`.
+    transaction_statements: std::sync::atomic::AtomicUsize,
+    /// Statements that aborted with a unique/primary-key violation.
+    conflicts: std::sync::atomic::AtomicUsize,
+    /// Fire the competing write right after the Nth outside-transaction session statement
     /// (`usize::MAX` = disarmed). Starts disarmed so schema creation is not counted.
     interpose_after: std::sync::atomic::AtomicUsize,
     interposed: std::sync::atomic::AtomicBool,
+    competing: CompetingWrite,
 }
 
 impl InstrumentedExecutor {
-    fn new(inner: Arc<RusqliteExecutor>) -> Self {
+    fn new(inner: Arc<RusqliteExecutor>, competing: CompetingWrite) -> Self {
         Self {
             inner,
             session_statements: std::sync::atomic::AtomicUsize::new(0),
+            transaction_statements: std::sync::atomic::AtomicUsize::new(0),
+            conflicts: std::sync::atomic::AtomicUsize::new(0),
             interpose_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
             interposed: std::sync::atomic::AtomicBool::new(false),
+            competing,
         }
     }
 
-    /// Starts counting from zero and arms the competing write for after statement `n`.
+    /// Starts counting from zero and arms the competing write for after outside-transaction
+    /// statement `n`.
     fn arm_after(&self, n: usize) {
         self.session_statements
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.transaction_statements
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.conflicts
             .store(0, std::sync::atomic::Ordering::SeqCst);
         self.interposed
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -101,27 +130,77 @@ impl InstrumentedExecutor {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Stops injecting the competing writer; later statements are only counted.
+    fn disarm(&self) {
+        self.interpose_after
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn session_statement_count(&self) -> usize {
         self.session_statements
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn transaction_statement_count(&self) -> usize {
+        self.transaction_statements
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn conflict_count(&self) -> usize {
+        self.conflicts.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn was_interposed(&self) -> bool {
         self.interposed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A competing `save_if_version(UNVERSIONED)`-style overwrite of the same key, run as a
-    /// separate UPSERT (it bumps `version` and replaces the payload).
+    fn record_error(&self, error: Option<&JdbcError>) {
+        if let Some(error) = error {
+            if is_unique_violation(error) {
+                self.conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A competing writer's committed write, injected exactly at the read/write boundary.
     fn interpose_competing_write(&self) {
-        let bound = SqliteDialect::new().session_state_upsert(
-            "u:s",
-            "k",
-            0,
-            &serde_json::to_string(&text("competitor")).unwrap(),
-        );
-        self.inner
-            .execute(&bound)
-            .expect("competing write must succeed");
+        let dialect = SqliteDialect::new();
+        match self.competing {
+            CompetingWrite::SingleKey => {
+                let bound = dialect.session_state_upsert(
+                    "u:s",
+                    "k",
+                    0,
+                    &serde_json::to_string(&text("competitor")).unwrap(),
+                );
+                self.inner
+                    .execute(&bound)
+                    .expect("competing write must succeed");
+            }
+            CompetingWrite::ListAppend => {
+                self.inner
+                    .execute(&dialect.session_state_delete_by_key("u:s", "l"))
+                    .expect("competing rewrite must succeed");
+                for (index, value) in [text("a1"), text("b2")].iter().enumerate() {
+                    let bound = dialect.session_state_insert(
+                        "u:s",
+                        "l",
+                        index as i32,
+                        &serde_json::to_string(value).unwrap(),
+                    );
+                    self.inner
+                        .execute(&bound)
+                        .expect("competing append must succeed");
+                }
+                let hash =
+                    agentscope_core::state::list_hash::compute_hash(&[text("a1"), text("b2")]);
+                let bound = dialect.session_state_upsert("u:s", "l:_hash", 0, &hash);
+                self.inner
+                    .execute(&bound)
+                    .expect("competing hash write must succeed");
+            }
+        }
     }
 
     fn observe(&self, sql: &str) {
@@ -145,32 +224,88 @@ impl InstrumentedExecutor {
     }
 }
 
-impl JdbcExecutor for InstrumentedExecutor {
-    fn execute(
-        &self,
-        bound: &agentscope_extensions_jdbc::dialect::BoundSql,
-    ) -> agentscope_extensions_jdbc::JdbcResult<usize> {
-        let affected = self.inner.execute(bound)?;
-        self.observe(&bound.sql);
-        Ok(affected)
+/// Connection-scoped view over the inner transaction: counts statements and duplicate-key
+/// aborts that happen **inside** it.
+struct CountingSession<'a> {
+    inner: &'a dyn JdbcSession,
+    statements: &'a std::sync::atomic::AtomicUsize,
+    conflicts: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl CountingSession<'_> {
+    fn observe(&self, error: Option<&JdbcError>) {
+        self.statements
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(error) = error {
+            if is_unique_violation(error) {
+                self.conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl JdbcSession for CountingSession<'_> {
+    fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
+        let result = self.inner.execute(bound);
+        self.observe(result.as_ref().err());
+        result
     }
 
-    fn query(
-        &self,
-        bound: &agentscope_extensions_jdbc::dialect::BoundSql,
-    ) -> agentscope_extensions_jdbc::JdbcResult<Vec<Vec<agentscope_extensions_jdbc::ColumnValue>>>
-    {
-        let rows = self.inner.query(bound)?;
+    fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+        let result = self.inner.query(bound);
+        self.observe(result.as_ref().err());
+        result
+    }
+}
+
+impl JdbcExecutor for InstrumentedExecutor {
+    fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
+        let result = self.inner.execute(bound);
+        self.record_error(result.as_ref().err());
         self.observe(&bound.sql);
-        Ok(rows)
+        result
+    }
+
+    fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+        let result = self.inner.query(bound);
+        self.record_error(result.as_ref().err());
+        self.observe(&bound.sql);
+        result
+    }
+
+    /// Delegates to the inner backend's transaction, wrapping the session so the test can see
+    /// how many statements ran **inside** it and whether any of them aborted on a duplicate
+    /// key. Statements inside the transaction never reach this wrapper's `execute`/`query`,
+    /// which is exactly why a competing writer can no longer be injected mid-transaction: the
+    /// transaction is the fix, and this observation is its proof.
+    fn in_transaction(
+        &self,
+        work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,
+    ) -> JdbcResult<()> {
+        self.inner
+            .in_transaction(&mut |session: &mut dyn JdbcSession| {
+                let mut counting = CountingSession {
+                    inner: &*session,
+                    statements: &self.transaction_statements,
+                    conflicts: &self.conflicts,
+                };
+                work(&mut counting)
+            })
     }
 }
 
 fn new_instrumented_store() -> (JdbcAgentStateStore, Arc<InstrumentedExecutor>) {
+    new_instrumented_store_with(Arc::new(SqliteDialect::new()), CompetingWrite::SingleKey)
+}
+
+fn new_instrumented_store_with(
+    dialect: Arc<dyn AbstractJdbcDialect>,
+    competing: CompetingWrite,
+) -> (JdbcAgentStateStore, Arc<InstrumentedExecutor>) {
     let inner = Arc::new(RusqliteExecutor::in_memory().unwrap());
-    let instrumented = Arc::new(InstrumentedExecutor::new(inner));
+    let instrumented = Arc::new(InstrumentedExecutor::new(inner, competing));
     let executor: Arc<dyn JdbcExecutor> = instrumented.clone();
-    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
     let store = JdbcAgentStateStore::with_schema(executor, dialect).unwrap();
     (store, instrumented)
 }
@@ -810,4 +945,232 @@ async fn save_if_version_zero_does_not_overwrite_a_versioned_row() {
         "a rejected create-if-absent must not modify the stored value"
     );
     assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 3);
+}
+
+// ---------------------------------------------------------------------------
+//  JDBC-01: `save_list`'s read-modify-write is one unit of work
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn save_list_append_is_atomic_against_a_writer_committing_mid_write() {
+    // Java: JdbcAgentStateStore.save(lists) wraps the whole read-modify-write in
+    // `executeInWriteTransaction`. The competing writer is injected exactly between this
+    // call's reads (`:_hash`, `MAX(item_index)`) and its writes — the window a
+    // non-transactional implementation leaves open:
+    //
+    //  * without the transaction the stale `existing` count makes the tail INSERT collide
+    //    with the competitor's row, the batch is rolled back and `save_list` only logs a
+    //    warning — an append silently lost;
+    //  * with it no statement of this call runs outside the transaction, so the reads and
+    //    writes are one unit of work and no duplicate-key abort can lose the append.
+    let (store, instrumented) = new_instrumented_store_with(
+        Arc::new(SqliteDialect::new()),
+        CompetingWrite::ListAppend,
+    );
+    // Base state: the list already holds `a1`.
+    store
+        .save_list(Some("u"), "s", "l", &[text("a1")])
+        .await;
+    // Arm the competing writer for after this call's second session statement (the
+    // `MAX(item_index)` read).
+    instrumented.arm_after(2);
+
+    store
+        .save_list(Some("u"), "s", "l", &[text("a1"), text("a2")])
+        .await;
+
+    let conflicts = instrumented.conflict_count();
+    let outside = instrumented.session_statement_count();
+    let inside = instrumented.transaction_statement_count();
+    instrumented.disarm();
+
+    assert_eq!(
+        outside, 0,
+        "every statement of a save_list append must run inside the transaction"
+    );
+    assert!(
+        inside >= 4,
+        "both reads, the tail INSERT and the hash UPSERT must be inside the transaction, saw {inside}"
+    );
+    assert_eq!(
+        conflicts, 0,
+        "the append must not abort on a duplicate key — that would be a silently lost append"
+    );
+    let items = store.get_list(Some("u"), "s", "l").await;
+    assert_eq!(
+        items.iter().map(text_of).collect::<Vec<_>>(),
+        vec!["a1".to_string(), "a2".to_string()],
+        "the append is durable: nothing was dropped"
+    );
+
+    // A second append on top of the committed prefix still works incrementally.
+    store
+        .save_list(Some("u"), "s", "l", &[text("a1"), text("a2"), text("a3")])
+        .await;
+    let items = store.get_list(Some("u"), "s", "l").await;
+    assert_eq!(
+        items.iter().map(text_of).collect::<Vec<_>>(),
+        vec!["a1".to_string(), "a2".to_string(), "a3".to_string()],
+        "total entries = base + both appends, with nothing lost"
+    );
+}
+
+// ---------------------------------------------------------------------------
+//  JDBC-02: `UNVERSIONED` write-then-read is one unit of work
+// ---------------------------------------------------------------------------
+
+/// A `SqliteDialect` that offers **no** returning UPSERT — the shape MySQL (no `RETURNING`)
+/// and H2/ANSI (no portable returning form) have. Everything else is delegated, so the store
+/// runs the same SQLite SQL while `save_if_version(UNVERSIONED)` takes the UPSERT-then-
+/// `SELECT version` fallback.
+struct NoReturningSqliteDialect {
+    inner: SqliteDialect,
+}
+
+impl NoReturningSqliteDialect {
+    fn new() -> Self {
+        Self {
+            inner: SqliteDialect::new(),
+        }
+    }
+}
+
+impl TableNameConfigurable for NoReturningSqliteDialect {
+    fn table_names(&self) -> &TableNames {
+        self.inner.table_names()
+    }
+}
+
+impl StoreDialect for NoReturningSqliteDialect {
+    fn store_create_table_ddls(&self) -> Vec<String> {
+        self.inner.store_create_table_ddls()
+    }
+
+    fn store_upsert(
+        &self,
+        namespace_path: &str,
+        key: &str,
+        json: &str,
+        timestamp: i64,
+    ) -> BoundSql {
+        self.inner.store_upsert(namespace_path, key, json, timestamp)
+    }
+}
+
+impl SessionStateDialect for NoReturningSqliteDialect {
+    fn session_state_create_table_ddls(&self) -> Vec<String> {
+        self.inner.session_state_create_table_ddls()
+    }
+
+    fn session_state_check_table_exists(&self, table_name: &str) -> BoundSql {
+        self.inner.session_state_check_table_exists(table_name)
+    }
+
+    fn session_state_upsert(&self, slot_id: &str, key: &str, index: i32, json: &str) -> BoundSql {
+        self.inner.session_state_upsert(slot_id, key, index, json)
+    }
+
+    // `session_state_upsert_returning_version` deliberately keeps the trait default (`None`):
+    // that is what puts the store on the write-then-read fallback.
+}
+
+impl SnapshotDialect for NoReturningSqliteDialect {
+    fn snapshot_create_table_ddls(&self) -> Vec<String> {
+        self.inner.snapshot_create_table_ddls()
+    }
+
+    fn snapshot_upsert(&self, snapshot_id: &str, data: &[u8]) -> BoundSql {
+        self.inner.snapshot_upsert(snapshot_id, data)
+    }
+}
+
+impl SkillDialect for NoReturningSqliteDialect {
+    fn skill_create_table_ddls(&self) -> Vec<String> {
+        self.inner.skill_create_table_ddls()
+    }
+}
+
+impl SkillResourcesDialect for NoReturningSqliteDialect {
+    fn skill_resources_create_table_ddls(&self) -> Vec<String> {
+        self.inner.skill_resources_create_table_ddls()
+    }
+}
+
+impl AbstractJdbcDialect for NoReturningSqliteDialect {
+    fn kind(&self) -> DialectKind {
+        DialectKind::Sqlite
+    }
+
+    fn table_columns_query(&self, table_name: &str) -> BoundSql {
+        self.inner.table_columns_query(table_name)
+    }
+}
+
+#[tokio::test]
+async fn unversioned_write_without_returning_reports_its_own_version() {
+    // Java: JdbcAgentStateStore.saveIfVersion uses `executeInWriteTransaction`, so the UPSERT
+    // and the `SELECT version` cannot be split by another writer. Without the transaction the
+    // competitor injected right after the UPSERT bumps the row to version 2 and our follow-up
+    // SELECT reports 2 — a version this call never wrote.
+    let (store, instrumented) = new_instrumented_store_with(
+        Arc::new(NoReturningSqliteDialect::new()),
+        CompetingWrite::SingleKey,
+    );
+    instrumented.arm_after(1);
+
+    let returned = store
+        .save_if_version(Some("u"), "s", "k", text("mine"), UNVERSIONED)
+        .unwrap();
+
+    let outside = instrumented.session_statement_count();
+    let inside = instrumented.transaction_statement_count();
+    instrumented.disarm();
+
+    assert_eq!(
+        outside, 0,
+        "the fallback UPSERT and its version read must both run inside the transaction"
+    );
+    assert_eq!(
+        inside, 2,
+        "no-RETURNING fallback = UPSERT + SELECT version, both inside one transaction"
+    );
+    assert_eq!(
+        returned, 1,
+        "must report the version this write produced, not a concurrent writer's"
+    );
+    assert_eq!(store.read_version(Some("u"), "s", "k").unwrap(), 1);
+    assert_eq!(
+        text_of(&store.get(Some("u"), "s", "k").await.unwrap()),
+        "mine"
+    );
+}
+
+// ---------------------------------------------------------------------------
+//  JDBC-03: negative `expected_version` is rejected up front
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn save_if_version_negative_expected_is_rejected() {
+    // Java: JdbcAgentStateStore.saveIfVersion throws IllegalArgumentException for a negative
+    // expected version other than UNVERSIONED — a token that can never match a stored version,
+    // so reporting it as a conflict would blame another writer for a caller bug.
+    let store = new_store();
+    let err = store
+        .save_if_version(Some("u"), "s", "k", text("a"), -2)
+        .expect_err("a negative expected version must be rejected, not reported as a conflict");
+    assert!(err.to_string().contains("expectedVersion"), "{err}");
+    let untouched = store.get_versioned(Some("u"), "s", "k").unwrap();
+    assert!(
+        !untouched.is_present(),
+        "a rejected write must not touch the store"
+    );
+
+    // The core trait method is infallible, so it reports the rejection as UNVERSIONED — and
+    // still writes nothing.
+    assert_eq!(
+        AgentStateStore::save_if_version(&store, Some("u"), "s", "k", text("a"), -2).await,
+        UNVERSIONED
+    );
+    let after_trait_call = store.get_versioned(Some("u"), "s", "k").unwrap();
+    assert!(!after_trait_call.is_present());
 }

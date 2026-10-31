@@ -35,6 +35,13 @@ use crate::common::{
     InboundEventDeduplicator, Result,
 };
 
+/// Channel type name, mirroring `GitHubChannel.TYPE` (the `agentscope.json#channels[*].type` key).
+pub const CHANNEL_TYPE: &str = "github";
+
+/// The webhook events this adapter maps. Java answers **204 No Content** for every other event.
+pub const SUPPORTED_EVENT_TYPES: &[&str] =
+    &["issue_comment", "pull_request_review_comment"];
+
 /// Typed registry of `GitHubChannel` handles, keyed by `channel_id`.
 pub type GitHubChannelRegistry = ChannelRegistry<GitHubChannel>;
 
@@ -48,6 +55,9 @@ pub enum GitHubCallbackOutcome {
     BadRequest,
     /// Delivery acknowledged: duplicate, unsupported action, self-authored, or dispatched (200).
     Accepted,
+    /// The event type is not handled at all (204 No Content), mirroring Java's
+    /// `ResponseEntity.noContent()`: "nothing to do here" must be distinguishable from "handled".
+    Ignored,
 }
 
 /// GitHub channel adapter: shared routing/gateway state plus GitHub-specific collaborators.
@@ -150,9 +160,26 @@ impl GitHubChannel {
         &self.core
     }
 
-    /// Full webhook pipeline, in the Java order: signature check -> JSON parse -> mapping ->
-    /// bot-loop self-detection -> de-duplication -> dispatch. Every drop/failure is acknowledged
-    /// with [`GitHubCallbackOutcome::Accepted`] so GitHub stops retrying.
+    /// Startup hook, mirroring the Java `GitHubChannel#start` (`botIdentityResolver.refresh()`).
+    ///
+    /// Resolving the bot's own id is what makes self-authored comments droppable; without it
+    /// `is_self` is always false and the bot can loop on its own replies. The lookup stays
+    /// **best-effort**: a transport/parse failure keeps the identity unknown, logs a warning and
+    /// never fails startup (Java catches and logs at WARN).
+    pub async fn start(&self) {
+        let resolved = self.bot_identity.refresh().await;
+        if resolved.is_none() && !self.bot_identity.identity().is_resolved() {
+            tracing::warn!(
+                "GitHub bot identity is unresolved; self-authored comments will not be dropped \
+                 until a later refresh succeeds"
+            );
+        }
+    }
+
+    /// Full webhook pipeline, in the Java order: signature check -> event-type gate -> JSON parse
+    /// -> mapping -> bot-loop self-detection -> de-duplication -> dispatch. Every drop/failure is
+    /// acknowledged with [`GitHubCallbackOutcome::Accepted`] so GitHub stops retrying; event types
+    /// this adapter never handles answer [`GitHubCallbackOutcome::Ignored`] (204).
     pub async fn handle_webhook(
         &self,
         event_type: &str,
@@ -164,18 +191,24 @@ impl GitHubChannel {
             return GitHubCallbackOutcome::Unauthorized;
         }
 
-        // 2. Parse the JSON body; invalid JSON is the only client error.
+        // 2. Event-type gate (Java `noContent()`): an unhandled event type is not a "handled and
+        //    dropped" delivery, so it must not be reported as 200.
+        if !SUPPORTED_EVENT_TYPES.contains(&event_type) {
+            return GitHubCallbackOutcome::Ignored;
+        }
+
+        // 3. Parse the JSON body; invalid JSON is the only client error.
         let payload: Value = match serde_json::from_str(raw_body) {
             Ok(value) => value,
             Err(_) => return GitHubCallbackOutcome::BadRequest,
         };
 
-        // 3. Map to an `InboundMessage`; unsupported events/actions are acknowledged silently.
+        // 4. Map to an `InboundMessage`; unsupported actions are acknowledged silently.
         let Some(inbound) = self.mapper.map(event_type, &payload) else {
             return GitHubCallbackOutcome::Accepted;
         };
 
-        // 4. Bot-loop self-detection: drop comments authored by the bot itself.
+        // 5. Bot-loop self-detection: drop comments authored by the bot itself.
         if self
             .bot_identity
             .is_self(GitHubInboundMapper::extract_commenter_id(&payload))
@@ -183,13 +216,13 @@ impl GitHubChannel {
             return GitHubCallbackOutcome::Accepted;
         }
 
-        // 5. De-duplication by `comment.id` followed by the per-peer bot-loop guard.
+        // 6. De-duplication by `comment.id` followed by the per-peer bot-loop guard.
         let dedupe_key = GitHubInboundMapper::extract_comment_id(&payload).map(|id| id.to_string());
         if !self.core.admit(dedupe_key.as_deref(), &inbound.peer.key()) {
             return GitHubCallbackOutcome::Accepted;
         }
 
-        // 6. Dispatch; the channel delivers the reply through its own transport. Failures are
+        // 7. Dispatch; the channel delivers the reply through its own transport. Failures are
         //    swallowed so the provider stops retrying (Java logs and still answers 200).
         let _ = PlatformChannel::dispatch(self, inbound).await;
         GitHubCallbackOutcome::Accepted
@@ -217,8 +250,8 @@ mod tests {
     use agentscope_harness::agent::Peer;
 
     use crate::common::testing::RecordingTransport;
-    use crate::common::IdempotencyStore;
-    use crate::github::bot_identity::BotIdentity;
+    use crate::common::{IdempotencyStore, PreparedResponse};
+    use crate::github::bot_identity::{BotIdentity, UNRESOLVED_USER_ID};
 
     const API_BASE: &str = "https://api.github.com";
     const SECRET: &str = "topsecret";
@@ -230,6 +263,10 @@ mod tests {
     }
 
     fn payload(commenter_id: i64) -> String {
+        payload_with(COMMENT_ID, commenter_id)
+    }
+
+    fn payload_with(comment_id: i64, commenter_id: i64) -> String {
         serde_json::json!({
             "action": "created",
             "repository": {
@@ -238,7 +275,7 @@ mod tests {
             },
             "issue": { "number": 7 },
             "comment": {
-                "id": COMMENT_ID,
+                "id": comment_id,
                 "body": "hello",
                 "user": { "id": commenter_id, "login": "alice" }
             }
@@ -347,9 +384,67 @@ mod tests {
         assert_eq!(
             c.handle_webhook("push", signed(&body).as_deref(), &body)
                 .await,
-            GitHubCallbackOutcome::Accepted
+            GitHubCallbackOutcome::Ignored
         );
         assert_eq!(c.core().admitted(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_resolves_the_bot_identity_so_self_comments_are_dropped() {
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, format!(r#"{{"id":{BOT_ID},"login":"my-bot"}}"#)),
+        ]));
+        let c = GitHubChannel::from_json(
+            "github",
+            ChannelConfig::of("github"),
+            &serde_json::json!({"token": "t", "webhookSecret": SECRET}),
+            transport.clone(),
+        )
+        .unwrap();
+
+        // Before the startup hook the identity is unknown, so the bot's own comment is processed.
+        assert!(!c.bot_identity().is_self(Some(BOT_ID)));
+        let body = payload_with(1, BOT_ID);
+        assert_eq!(
+            c.handle_webhook("issue_comment", signed(&body).as_deref(), &body)
+                .await,
+            GitHubCallbackOutcome::Accepted
+        );
+        assert_eq!(c.core().admitted(), 1);
+
+        // Startup hook (`GET /user`), exactly the Java `start()` call.
+        c.start().await;
+        assert_eq!(transport.request_count(), 1);
+        assert!(c.bot_identity().is_self(Some(BOT_ID)));
+        assert_eq!(c.bot_identity().bot_login().as_deref(), Some("my-bot"));
+
+        // Now the bot's own comment is dropped instead of feeding a reply loop.
+        let body = payload_with(2, BOT_ID);
+        assert_eq!(
+            c.handle_webhook("issue_comment", signed(&body).as_deref(), &body)
+                .await,
+            GitHubCallbackOutcome::Accepted
+        );
+        assert_eq!(c.core().admitted(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_keeps_the_bot_identity_unknown() {
+        // Unusable `GET /user` body: startup must succeed, the identity simply stays unknown.
+        let transport = Arc::new(RecordingTransport::with_responses(vec![
+            PreparedResponse::new(200, "{}"),
+        ]));
+        let c = GitHubChannel::from_json(
+            "github",
+            ChannelConfig::of("github"),
+            &serde_json::json!({"token": "t", "webhookSecret": SECRET}),
+            transport,
+        )
+        .unwrap();
+        c.start().await;
+        assert_eq!(c.bot_identity().bot_user_id(), UNRESOLVED_USER_ID);
+        assert!(!c.bot_identity().identity().is_resolved());
+        assert!(!c.bot_identity().is_self(Some(BOT_ID)));
     }
 
     #[tokio::test]

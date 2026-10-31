@@ -28,23 +28,24 @@ pub const FRAMEWORK_NAME: &str = "agentscope-rust";
 /// Instruments an already-built agent, mirroring `ControlPlane.instrument`.
 ///
 /// No Level-2 events are emitted unless the adapter was wired as a middleware at
-/// construction time; see [`ControlPlaneBridge`].
-pub fn instrument(
+/// construction time; see [`ControlPlaneBridge`]. Async because starting the bridge opens
+/// its channels (contract server, self-registration).
+pub async fn instrument(
     target: std::sync::Arc<dyn std::any::Any + Send + Sync>,
     config: ControlPlaneConfig,
     adapter: Box<dyn FrameworkAdapter>,
 ) -> ControlPlaneResult<ControlPlaneBridge> {
     let mut bridge = ControlPlaneBridge::new(config);
     bridge.attach(target, adapter)?;
-    bridge.start()
+    bridge.start().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn instrument_requires_handleable_target() {
+    #[tokio::test]
+    async fn instrument_requires_handleable_target() {
         struct RejectAdapter;
         use async_trait::async_trait;
         #[async_trait]
@@ -65,7 +66,7 @@ mod tests {
             ) -> ControlPlaneResult<()> {
                 Ok(())
             }
-            fn detach(&mut self) -> ControlPlaneResult<()> {
+            fn detach(&self) -> ControlPlaneResult<()> {
                 Ok(())
             }
             async fn extract_context(&self, s: &str) -> ControlPlaneResult<model::ContextSnapshot> {
@@ -77,6 +78,8 @@ mod tests {
             .build()
             .unwrap();
         let target: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(42u32);
-        assert!(instrument(target, cfg, Box::new(RejectAdapter)).is_err());
+        assert!(instrument(target, cfg, Box::new(RejectAdapter))
+            .await
+            .is_err());
     }
 }

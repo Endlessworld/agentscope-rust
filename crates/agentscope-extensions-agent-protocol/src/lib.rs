@@ -1389,20 +1389,36 @@ async fn get_task(
     }
 }
 
-/// `GET /tasks/{taskId}/wait?timeoutMs=`.
+/// `GET /tasks/{taskId}/wait?timeout_seconds=`.
 async fn wait_task(
     axum::extract::State(store): axum::extract::State<Arc<AgentProtocolTaskStore>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> axum::response::Response {
-    let timeout_ms = params
-        .get("timeoutMs")
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(store.properties().sse_timeout_ms);
+    let timeout_ms = wait_timeout_ms(&params, store.properties().sse_timeout_ms);
     match store.wait_for(&task_id, timeout_ms).await {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(err) => api_error(status_for(&err), err.to_string()),
     }
+}
+
+/// Resolves the `/wait` deadline in milliseconds.
+///
+/// Java `AgentProtocolController#waitFor` takes `timeout_seconds` (seconds, default 7200), which is
+/// what this repository's harness client sends; `timeoutMs` stays supported as the legacy Rust
+/// spelling. Before 2026-10-31 only `timeoutMs` was read, so a client's 30 s wait silently fell
+/// back to `sseTimeoutMs` (3 h).
+fn wait_timeout_ms(params: &HashMap<String, String>, default_ms: u64) -> u64 {
+    if let Some(seconds) = params
+        .get("timeout_seconds")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        return seconds.saturating_mul(1_000);
+    }
+    params
+        .get("timeoutMs")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default_ms)
 }
 
 /// `POST /tasks/{taskId}/cancel`.
@@ -1435,21 +1451,72 @@ async fn resume_task(
 
 /// `GET /tasks/{taskId}/events`, an SSE stream of `RemoteAgentEvent` frames.
 ///
-/// The frame format is Java's `ServerSentEvent` encoding: `id: <seq>\ndata: <json>\n\n`.
+/// The frame format is Java's `ServerSentEvent` encoding:
+/// `id: <seq>\nevent: <TYPE>\ndata: <json>\n\n`.
 async fn task_events(
     axum::extract::State(store): axum::extract::State<Arc<AgentProtocolTaskStore>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if store.snapshot(&task_id).is_none() {
         return api_error(axum::http::StatusCode::NOT_FOUND, "task not found");
     }
-    let from_seq = params
-        .get("fromSeq")
-        .and_then(|raw| raw.parse::<i64>().ok())
-        .unwrap_or(0);
+    let from_seq = replay_from_seq(
+        &params,
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok()),
+    );
 
-    let subscription = store.event_bus().subscribe(&task_id, from_seq);
+    let body = axum::body::Body::from_stream(event_stream(
+        store.event_bus().clone(),
+        task_id,
+        from_seq,
+    ));
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Resolves the SSE replay cursor.
+///
+/// Mirrors Java `AgentProtocolController#events`: the `from_seq` query parameter wins when it is
+/// `> 0`, then the `Last-Event-ID` header (sent by an `EventSource` reconnect). The legacy Rust
+/// `fromSeq` query spelling stays supported as a last resort. Before 2026-10-31 only `fromSeq` was
+/// read, so a reconnecting client always replayed from `0`.
+fn replay_from_seq(params: &HashMap<String, String>, last_event_id: Option<&str>) -> i64 {
+    if let Some(seq) = params
+        .get("from_seq")
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+    {
+        if seq > 0 {
+            return seq;
+        }
+    }
+    if let Some(raw) = last_event_id {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            if let Ok(seq) = raw.parse::<i64>() {
+                return seq;
+            }
+        }
+    }
+    params
+        .get("fromSeq")
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Builds the SSE byte stream: the buffered replay first, then the live events.
+fn event_stream(
+    bus: Arc<dyn AgentProtocolEventBus>,
+    task_id: String,
+    from_seq: i64,
+) -> futures::stream::BoxStream<'static, Result<Vec<u8>, std::convert::Infallible>> {
+    let subscription = bus.subscribe(&task_id, from_seq);
     let replayed = futures::stream::iter(
         subscription
             .replayed
@@ -1469,18 +1536,21 @@ async fn task_events(
         None => futures::stream::empty().boxed(),
     };
 
-    let body = axum::body::Body::from_stream(replayed.chain(live));
-    axum::response::Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
-        .header(axum::http::header::CACHE_CONTROL, "no-cache")
-        .body(body)
-        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    replayed.chain(live).boxed()
 }
 
 /// Encodes one event as an SSE frame.
+///
+/// Java `toSse` writes `id`, `event` (`RemoteEventType.name()`, or `message` when the event has no
+/// type) and `data`; the `event:` line lets an `EventSource` dispatch to a named listener.
 fn sse_frame(event: &RemoteAgentEvent) -> Vec<u8> {
     let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-    format!("id: {}\ndata: {}\n\n", event.seq, data).into_bytes()
+    let name = event
+        .kind
+        .and_then(|kind| serde_json::to_value(kind).ok())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "message".to_string());
+    format!("id: {}\nevent: {}\ndata: {}\n\n", event.seq, name, data).into_bytes()
 }
 
 /// Reads the current snapshot, or an empty object when the task vanished mid-request.
@@ -1932,9 +2002,83 @@ mod tests {
             ..Default::default()
         };
         let frame = String::from_utf8(sse_frame(&event)).unwrap();
-        assert!(frame.starts_with("id: 7\ndata: {"));
+        assert!(frame.starts_with("id: 7\nevent: TEXT_DELTA\ndata: {"));
         assert!(frame.ends_with("}\n\n"));
         assert!(frame.contains("\"type\":\"TEXT_DELTA\""));
+
+        // Java `toSse` falls back to `message` for an event without a type.
+        let untyped = RemoteAgentEvent {
+            seq: 8,
+            ..Default::default()
+        };
+        let frame = String::from_utf8(sse_frame(&untyped)).unwrap();
+        assert!(frame.starts_with("id: 8\nevent: message\ndata: {"));
+    }
+
+    // Java `AgentProtocolController#waitFor`: `timeout_seconds` (seconds) is the wire parameter;
+    // `timeoutMs` remains as the legacy Rust spelling. Before 2026-10-31 only the latter was read.
+    #[test]
+    fn wait_timeout_seconds_wins_over_the_legacy_millisecond_parameter() {
+        let seconds = HashMap::from([("timeout_seconds".to_string(), "30".to_string())]);
+        assert_eq!(wait_timeout_ms(&seconds, 10_800_000), 30_000);
+
+        let both = HashMap::from([
+            ("timeout_seconds".to_string(), "30".to_string()),
+            ("timeoutMs".to_string(), "500".to_string()),
+        ]);
+        assert_eq!(wait_timeout_ms(&both, 10_800_000), 30_000);
+
+        let legacy = HashMap::from([("timeoutMs".to_string(), "1500".to_string())]);
+        assert_eq!(wait_timeout_ms(&legacy, 10_800_000), 1_500);
+
+        assert_eq!(wait_timeout_ms(&HashMap::new(), 10_800_000), 10_800_000);
+    }
+
+    // Java `#events`: `from_seq` first, then the `Last-Event-ID` reconnect header, then `fromSeq`.
+    #[test]
+    fn event_replay_cursor_prefers_from_seq_then_the_last_event_id_header() {
+        let query = HashMap::from([("from_seq".to_string(), "4".to_string())]);
+        assert_eq!(replay_from_seq(&query, Some("9")), 4);
+
+        let zero = HashMap::from([("from_seq".to_string(), "0".to_string())]);
+        assert_eq!(replay_from_seq(&zero, Some("9")), 9);
+
+        assert_eq!(replay_from_seq(&HashMap::new(), Some(" 5 ")), 5);
+        assert_eq!(replay_from_seq(&HashMap::new(), Some("not-a-seq")), 0);
+        assert_eq!(replay_from_seq(&HashMap::new(), Some("  ")), 0);
+
+        let legacy = HashMap::from([("fromSeq".to_string(), "2".to_string())]);
+        assert_eq!(replay_from_seq(&legacy, None), 2);
+        assert_eq!(replay_from_seq(&HashMap::new(), None), 0);
+    }
+
+    // The SSE stream must resume after the requested seq instead of replaying from 0.
+    #[test]
+    fn event_stream_replays_after_the_requested_seq() {
+        let bus: Arc<dyn AgentProtocolEventBus> = Arc::new(AgentProtocolTaskEventBus::new(16));
+        for _ in 0..3 {
+            bus.publish(
+                "t-1",
+                RemoteAgentEvent {
+                    kind: Some(RemoteEventType::TextDelta),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let frames: Vec<String> = rt().block_on(async {
+            use futures::StreamExt as _;
+            event_stream(bus, "t-1".to_string(), 1)
+                .take(2)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|frame| String::from_utf8(frame.unwrap()).unwrap())
+                .collect()
+        });
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].starts_with("id: 2\nevent: TEXT_DELTA\n"));
+        assert!(frames[1].starts_with("id: 3\nevent: TEXT_DELTA\n"));
     }
 
     #[test]

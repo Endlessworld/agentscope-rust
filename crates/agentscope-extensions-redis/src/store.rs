@@ -81,6 +81,12 @@ pub(crate) trait StoreCommands: Send + Sync + std::fmt::Debug {
 
     /// `PING` — validates a freshly opened connection.
     fn ping(&self) -> Result<()>;
+
+    /// `CLIENT ID` — the server-side id of the connection currently in use.
+    ///
+    /// Diagnostics only: it opens the lazily wired connection, and after a reconnect the id
+    /// changes, which is how the live test proves the socket was rebuilt (not reused).
+    fn client_id(&self) -> Result<i64>;
 }
 
 /// Production [`StoreCommands`] backed by a blocking [`redis::Connection`].
@@ -89,6 +95,11 @@ pub(crate) trait StoreCommands: Send + Sync + std::fmt::Debug {
 /// performs no I/O. [`RedisStore::connect`] additionally issues `PING` to validate the
 /// endpoint eagerly, while [`RedisStore::connect_lazy`] (used by
 /// [`crate::RedisDistributedStore::base_store`]) stays pure wiring.
+///
+/// The connection is **not** permanent: a command that fails because the socket died
+/// evicts it and retries once on a fresh connection (see [`run_with_reconnect`]). Java gets
+/// the same behaviour for free from `JedisPooled`, which takes a pooled connection per
+/// command.
 pub(crate) struct BlockingRedisCommands {
     /// Normalised URL used to open the connection on first use.
     url: String,
@@ -134,26 +145,83 @@ impl BlockingRedisCommands {
         }
     }
 
-    /// Runs `f` against a live connection, opening one on first use.
+    /// Runs `f` against a live connection, opening one on first use and rebuilding it once
+    /// if the command fails because the socket died.
     fn with_conn<T>(
         &self,
         context: &str,
-        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+        f: impl FnMut(&mut redis::Connection) -> redis::RedisResult<T>,
     ) -> Result<T> {
         let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.is_none() {
-            let client = redis::Client::open(self.url.clone())
-                .map_err(|e| Error::Other(format!("Invalid Redis URL: {e}")))?;
-            let conn = client.get_connection().map_err(|e| map_err("connect", e))?;
-            *guard = Some(conn);
-        }
-        let conn = guard.as_mut().expect("connection initialised above");
-        f(conn).map_err(|e| map_err(context, e))
+        run_with_reconnect(&mut guard, context, || open_blocking_connection(&self.url), f)
     }
 }
 
 fn map_err(context: &str, e: redis::RedisError) -> Error {
     Error::Other(format!("Redis {context}: {e}"))
+}
+
+/// True for errors that mean the socket itself is unusable: server restart, failover,
+/// firewall dropping an idle connection, keep-alive timeout.
+///
+/// Such a connection can never serve another command, so it is dropped instead of reused.
+fn is_connection_failure(error: &redis::RedisError) -> bool {
+    error.is_io_error() || error.is_connection_dropped()
+}
+
+/// Opens a blocking connection to an already normalised URL.
+fn open_blocking_connection(url: &str) -> Result<redis::Connection> {
+    if url.trim().is_empty() {
+        return Err(Error::Other(
+            "Redis connection was supplied pre-opened and cannot be reconnected (no URL)".into(),
+        ));
+    }
+    let client = redis::Client::open(url.to_string())
+        .map_err(|error| Error::Other(format!("Invalid Redis URL: {error}")))?;
+    client
+        .get_connection()
+        .map_err(|error| map_err("connect", error))
+}
+
+/// Runs `op` against the connection cached in `slot`, opening one on first use and
+/// **evicting it and retrying once** when the command fails for a connection-level reason.
+///
+/// The harness [`BaseStore`] trait is synchronous, so this store holds one blocking
+/// connection instead of taking a pooled connection per command (which is what Java's
+/// `JedisPooled` does, and why it recovers from a restart for free). Without the eviction a
+/// single socket error would make every later workspace KV operation fail for the rest of
+/// the process lifetime.
+///
+/// Only *connection* failures are retried ([`is_connection_failure`]): a command that
+/// reached the server and failed (a Lua error, a wrong type, a CAS conflict) must not run
+/// twice. The connection type is generic so the eviction/retry rule is covered offline with
+/// a fake connection (see the module tests).
+fn run_with_reconnect<T, C>(
+    slot: &mut Option<C>,
+    context: &str,
+    mut connect: impl FnMut() -> Result<C>,
+    mut op: impl FnMut(&mut C) -> redis::RedisResult<T>,
+) -> Result<T> {
+    if slot.is_none() {
+        *slot = Some(connect()?);
+    }
+    let attempt = {
+        let conn = slot.as_mut().expect("connection initialised above");
+        op(conn)
+    };
+    match attempt {
+        Ok(value) => Ok(value),
+        Err(error) if is_connection_failure(&error) => {
+            tracing::warn!(
+                "Redis {context} hit a dead connection ({error}); reconnecting and retrying once"
+            );
+            // Drop the dead socket first: reconnecting over it would fail again.
+            *slot = None;
+            let conn = slot.insert(connect()?);
+            op(conn).map_err(|error| map_err(context, error))
+        }
+        Err(error) => Err(map_err(context, error)),
+    }
 }
 
 impl StoreCommands for BlockingRedisCommands {
@@ -194,6 +262,12 @@ impl StoreCommands for BlockingRedisCommands {
     fn ping(&self) -> Result<()> {
         self.with_conn("PING", |conn| {
             redis::cmd("PING").query::<String>(conn).map(|_| ())
+        })
+    }
+
+    fn client_id(&self) -> Result<i64> {
+        self.with_conn("CLIENT ID", |conn| {
+            redis::cmd("CLIENT").arg("ID").query(conn)
         })
     }
 }
@@ -264,6 +338,16 @@ impl RedisStore {
     /// The configured, normalized key prefix.
     pub fn key_prefix(&self) -> &str {
         &self.key_prefix
+    }
+
+    /// The server-side id (`CLIENT ID`) of the blocking connection the store currently
+    /// holds.
+    ///
+    /// Diagnostics only: it opens the lazily wired connection if needed. After a connection
+    /// failure the id changes, which is how the live reconnect test proves the dead socket
+    /// was rebuilt rather than reused.
+    pub fn client_id(&self) -> Result<i64> {
+        self.commands.client_id()
     }
 
     // ---- key helpers -------------------------------------------------------
@@ -696,5 +780,126 @@ mod tests {
         let item = store.get(&ns, "k").expect("hash exists");
         assert!(item.value.is_empty());
         assert_eq!(item.version, 4, "version is still surfaced");
+    }
+
+    // ---- connection eviction / reconnect (REDIS-03) ----------------------
+
+    /// Stand-in for a blocking `redis::Connection`: only the identity matters, because the
+    /// rule under test is "which socket does the next command run on".
+    #[derive(Debug)]
+    struct FakeConnection {
+        id: u32,
+    }
+
+    /// A dead socket: `is_io_error()` is true, i.e. exactly what a Redis restart / failover
+    /// makes `redis::Connection` return.
+    fn dead_socket() -> redis::RedisError {
+        redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection reset by peer",
+        ))
+    }
+
+    #[test]
+    fn a_dead_connection_is_evicted_and_the_command_is_retried_once() {
+        let mut slot: Option<FakeConnection> = None;
+        let mut opened = 0u32;
+        let mut calls = 0u32;
+
+        let id = run_with_reconnect(
+            &mut slot,
+            "HGETALL",
+            || {
+                opened += 1;
+                Ok(FakeConnection { id: opened })
+            },
+            |conn| {
+                calls += 1;
+                if calls == 1 {
+                    Err(dead_socket())
+                } else {
+                    Ok(conn.id)
+                }
+            },
+        )
+        .expect("the retried command succeeds on the fresh connection");
+
+        assert_eq!(id, 2, "the retry ran on the newly opened connection");
+        assert_eq!(opened, 2, "the dead socket must be replaced");
+        assert_eq!(calls, 2, "exactly one retry");
+        assert_eq!(
+            slot.as_ref().map(|conn| conn.id),
+            Some(2),
+            "the fresh connection is cached for later commands"
+        );
+    }
+
+    #[test]
+    fn a_command_error_that_is_not_a_connection_error_is_never_retried() {
+        let mut slot: Option<FakeConnection> = None;
+        let mut opened = 0u32;
+        let mut calls = 0u32;
+
+        let error = run_with_reconnect::<i64, FakeConnection>(
+            &mut slot,
+            "EVAL",
+            || {
+                opened += 1;
+                Ok(FakeConnection { id: opened })
+            },
+            |_conn| {
+                calls += 1;
+                Err(redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "expected a string reply",
+                )))
+            },
+        )
+        .expect_err("a real server error must surface");
+
+        assert_eq!(calls, 1, "a command that reached the server is not re-sent");
+        assert_eq!(opened, 1);
+        assert!(slot.is_some(), "a live connection is kept");
+        assert!(error.to_string().contains("Redis EVAL"), "{error}");
+    }
+
+    #[test]
+    fn a_second_connection_error_gives_up_after_one_retry() {
+        let mut slot: Option<FakeConnection> = None;
+        let mut opened = 0u32;
+        let mut calls = 0u32;
+
+        let error = run_with_reconnect::<i64, FakeConnection>(
+            &mut slot,
+            "ZRANGEBYLEX",
+            || {
+                opened += 1;
+                Ok(FakeConnection { id: opened })
+            },
+            |_conn| {
+                calls += 1;
+                Err(dead_socket())
+            },
+        )
+        .expect_err("two dead sockets must fail instead of looping");
+
+        assert_eq!(calls, 2, "one retry, then give up");
+        assert_eq!(opened, 2, "no extra connection is opened");
+        assert!(error.to_string().contains("Redis ZRANGEBYLEX"), "{error}");
+    }
+
+    #[test]
+    fn a_preopened_connection_reports_that_it_cannot_be_reconnected() {
+        // `RedisStore::from_connection` has no URL, so a dead socket cannot be rebuilt: the
+        // failure must say so instead of surfacing an empty-URL parse error.
+        // (`redis::Connection` has no `Debug`, so `expect_err` is not usable here.)
+        let error = match open_blocking_connection("") {
+            Ok(_) => panic!("a pre-opened connection has no URL to reconnect to"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("cannot be reconnected"),
+            "{error}"
+        );
     }
 }
