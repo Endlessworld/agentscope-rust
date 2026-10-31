@@ -19,3 +19,6 @@ uuid = { workspace = true }
 [dev-dependencies]
 # Only the test stub models build a `BoxStream`; production code never touches it.
 futures = { workspace = true }
+# `test-util`: the misfire / first-firing tests drive `tokio::time` with a paused
+# clock instead of sleeping real time, so cadence assertions stay deterministic.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -6,7 +6,8 @@
 //! * `CRON`        — evaluated by the crate-local cron parser and fired at the
 //!   exact `next_fire_time` of the configured zone (`ScheduleConfig::zone_id`,
 //!   UTC when unset).
-//! * `FIXED_RATE`  — `tokio::time::interval`, constant interval between starts.
+//! * `FIXED_RATE`  — explicit `period` grid, constant interval between starts
+//!   (missed slots are dropped, Quartz's `SMART` misfire policy).
 //! * `FIXED_DELAY` — `sleep(delay)` after each completion (sequential).
 //!
 //! `pause` / `resume` / `interrupt` / `getStatus` are preserved.
@@ -51,7 +52,11 @@ pub struct QuartzAgentScheduler {
     /// thread pool. Manual `trigger`/`run` calls do not take a permit.
     concurrency: Arc<Semaphore>,
     /// name -> running job handle
-    jobs: RwLock<HashMap<String, Arc<QuartzScheduleAgentTask>>>,
+    ///
+    /// Shared through an `Arc` so an owned task can hold a `Weak` reference and
+    /// remove itself on cancel (Java `scheduler.cancel(getName())`); the `Weak`
+    /// keeps the task → scheduler edge from forming a reference cycle.
+    jobs: Arc<RwLock<HashMap<String, Arc<QuartzScheduleAgentTask>>>>,
     shutdown: AtomicBool,
 }
 
@@ -77,7 +82,7 @@ impl QuartzAgentScheduler {
             factory,
             lock: Arc::new(NoopSchedulerLock),
             concurrency: Arc::new(Semaphore::new(Self::DEFAULT_MAX_CONCURRENCY)),
-            jobs: RwLock::new(HashMap::new()),
+            jobs: Arc::new(RwLock::new(HashMap::new())),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -160,14 +165,31 @@ impl QuartzAgentScheduler {
         // reaches `tasks.put(...)`).
         let cron = resolve_cron(&schedule_config)?;
 
-        let task = Arc::new(QuartzScheduleAgentTask::new(
+        let task = QuartzScheduleAgentTask::new(
             runtime,
             schedule_config.clone(),
             name.clone(),
             self.factory.clone(),
             input,
             cron.clone(),
-        ));
+        );
+        // A task cancelled through its own handle (`ScheduleAgentTask::cancel`) must
+        // leave the scheduler map, exactly like Java `BaseScheduleAgentTask#cancel`
+        // → `scheduler.cancel(getName())`; otherwise a later `schedule` of the same
+        // name would hand back the dead task. The hook keeps a `Weak` map handle so
+        // the task → scheduler edge cannot form a reference cycle.
+        let jobs = Arc::downgrade(&self.jobs);
+        let task = Arc::new(task.with_cancel_hook(Arc::new(move |cancelled: &str| {
+            let Some(jobs) = jobs.upgrade() else {
+                return;
+            };
+            if jobs.write().unwrap().remove(cancelled).is_some() {
+                tracing::debug!(
+                    task = %cancelled,
+                    "cancelled task removed from the scheduler"
+                );
+            }
+        })));
 
         self.jobs
             .write()
@@ -1278,6 +1300,164 @@ mod tests {
             factory.max_active.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the concurrency limit was exceeded"
+        );
+
+        sched.shutdown().await;
+    }
+
+    /// Factory that counts firings and can sleep, for cadence tests.
+    struct CountingFactory {
+        fires: std::sync::atomic::AtomicUsize,
+        work: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl AgentFactory for CountingFactory {
+        async fn run(
+            &self,
+            _config: &RuntimeAgentConfig,
+            _messages: Vec<Msg>,
+        ) -> agentscope_core::error::Result<Msg> {
+            self.fires
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.work.is_zero() {
+                tokio::time::sleep(self.work).await;
+            }
+            Ok(Msg::assistant("counted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_cancel_removes_it_from_the_scheduler() {
+        // SCHED-02: Java `BaseScheduleAgentTask#cancel` sets the flag *and* calls
+        // `scheduler.cancel(getName())`, so the task leaves the scheduler and the
+        // name can be scheduled again. Keeping the dead entry made a later
+        // `schedule` hand back a task that failed every run with
+        // "Cannot run a cancelled task".
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        let first = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+        first.cancel();
+        assert!(first
+            .as_any()
+            .downcast_ref::<QuartzScheduleAgentTask>()
+            .unwrap()
+            .is_cancelled());
+        assert!(
+            sched.get_scheduled_agent("A").is_none(),
+            "cancel must drop the scheduler entry"
+        );
+        assert!(sched.all_schedule_agent_tasks().is_empty());
+
+        // Same name is free again, and the replacement really executes.
+        let second = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+        assert_ne!(second.id(), first.id());
+        assert!(sched.trigger("A").await.is_ok());
+        assert_eq!(
+            second
+                .as_any()
+                .downcast_ref::<QuartzScheduleAgentTask>()
+                .unwrap()
+                .execution_count(),
+            1
+        );
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_stays_dead_after_it_left_the_scheduler() {
+        // Leaving the scheduler must not resurrect the task: it is still cancelled,
+        // it just no longer owns the name. Java's `cancel` has the same two
+        // effects (`cancelled` flag + `tasks.remove`).
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        let task = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+        task.cancel();
+        // Already removed, so the scheduler has nothing left to cancel.
+        assert!(!sched.cancel("A").await);
+
+        let err = task.run_empty().await.unwrap_err();
+        match err {
+            agentscope_core::error::Error::Agent(message) => {
+                assert!(message.contains("cancelled"), "unexpected message: {message}")
+            }
+            other => panic!("expected an agent error, got {other:?}"),
+        }
+
+        // Shutdown must tolerate the task already being gone.
+        sched.shutdown().await;
+        assert!(sched.get_scheduled_agent("A").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_rate_skips_missed_ticks_instead_of_bursting() {
+        // SCHED-03: 100 ms cadence with 350 ms of work per run. Tokio's default
+        // `Burst` replays every tick that elapsed during a run (a firing every
+        // 350 ms, so 4 firings in the window); Quartz's SMART policy drops them and
+        // keeps the original grid, so the firings are at 0/400/800 ms.
+        let factory = Arc::new(CountingFactory {
+            fires: std::sync::atomic::AtomicUsize::new(0),
+            work: std::time::Duration::from_millis(350),
+        });
+        let sched = Arc::new(QuartzAgentScheduler::new(factory.clone()));
+        let cfg = ScheduleConfig::builder().fixed_rate(100).build().unwrap();
+        sched
+            .schedule_runtime(runtime("Rate"), cfg, None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let fires = factory.fires.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            fires <= 3,
+            "missed ticks must be dropped instead of replayed (fired {fires} times)"
+        );
+
+        sched.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_rate_first_firing_happens_right_after_the_initial_delay() {
+        // SCHED-04: Quartz starts the simple trigger at `startAt = now +
+        // initialDelay` and repeats every period afterwards. Consuming tokio's
+        // immediate first tick *before* the first firing pushed the first run a
+        // whole period late (200 ms + 500 ms instead of 200 ms).
+        let factory = Arc::new(CountingFactory {
+            fires: std::sync::atomic::AtomicUsize::new(0),
+            work: std::time::Duration::ZERO,
+        });
+        let sched = Arc::new(QuartzAgentScheduler::new(factory.clone()));
+        let cfg = ScheduleConfig::builder()
+            .fixed_rate(500)
+            .initial_delay(200)
+            .build()
+            .unwrap();
+        sched
+            .schedule_runtime(runtime("Rate"), cfg, None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            factory.fires.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first firing must happen at the initial delay, not one period later"
+        );
+
+        // The cadence stays on the original grid: the second firing is at 700 ms.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            factory.fires.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second firing must land at initial delay + one period"
         );
 
         sched.shutdown().await;

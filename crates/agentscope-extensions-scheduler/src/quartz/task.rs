@@ -142,6 +142,17 @@ impl QuartzScheduleAgentTask {
         self
     }
 
+    /// Registers the callback that drops this task from its owning scheduler.
+    ///
+    /// Java `BaseScheduleAgentTask#cancel` sets its flag and then calls
+    /// `scheduler.cancel(getName())`, which removes the task from the scheduler's
+    /// map. The Rust scheduler wires the same removal here, so a cancelled task
+    /// cannot be handed back by a later `schedule` of the same name.
+    pub(crate) fn with_cancel_hook(mut self, cb: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.inner = self.inner.with_on_cancel(cb);
+        self
+    }
+
     pub(crate) fn attach(&self, handle: JoinHandle<()>) {
         *self.handle.lock().unwrap() = Some(handle);
     }

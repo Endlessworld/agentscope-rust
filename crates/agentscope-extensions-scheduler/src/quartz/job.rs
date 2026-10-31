@@ -12,6 +12,12 @@
 //! Interrupting an execution (`InterruptableJob#interrupt` in Java) aborts the
 //! in-flight run; for `FIXED_DELAY` it also stops the reschedule chain, matching
 //! `AgentQuartzJob`.
+//!
+//! Missed firings follow Quartz's `SMART` misfire policy: a slot that elapsed
+//! while the previous execution was still in flight (or while the task was
+//! paused) fires once immediately and the cadence then resumes from the current
+//! time, instead of replaying the whole backlog (`tokio`'s default `Burst`).
+//! `FIXED_RATE` keeps the original grid and simply drops the missed ticks.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +65,36 @@ impl CronPlan {
     }
 }
 
+/// One planned cron firing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CronFiring {
+    /// The planned fire instant; also the cross-instance lock slot, so two nodes
+    /// that share the schedule derive the same key for the same occurrence.
+    pub(crate) at: DateTime<Utc>,
+    /// The slot already elapsed (the previous execution overran it, or the task
+    /// was paused across it) — Quartz calls this a misfire.
+    pub(crate) missed: bool,
+}
+
+/// The next firing of a cron loop, computed from the slot the loop is working
+/// towards (`cursor`) rather than from `now`.
+///
+/// Using the cursor is what makes a misfire visible: with a plain
+/// `next_fire_time(now)` a slot that elapsed during a slow run is silently
+/// dropped, while Quartz's `SMART` policy (`FIRE_ONCE_NOW`) fires it once late
+/// and then resumes the cadence.
+pub(crate) fn next_firing(
+    plan: &CronPlan,
+    cursor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<CronFiring> {
+    let at = plan.next_fire_time(cursor)?;
+    Some(CronFiring {
+        at,
+        missed: at <= now,
+    })
+}
+
 /// Spawns the job loop for `task` and returns its handle.
 pub(crate) fn spawn_job(
     ctx: JobContext,
@@ -95,6 +131,10 @@ pub(crate) fn spawn_job(
                     task.cancelled().await;
                     return;
                 };
+                // The slot the loop is working towards: every next firing is
+                // computed from it (not from `now`), which is what makes a misfire
+                // detectable (SCHED-03).
+                let mut cursor = Utc::now();
                 loop {
                     if task.is_cancelled() {
                         return;
@@ -107,7 +147,8 @@ pub(crate) fn spawn_job(
                     // second, so a slow execution or a scheduler hiccup cannot
                     // silently skip a whole minute (`next_after` is now on the
                     // production path, not only in tests).
-                    let Some(next) = plan.next_fire_time(Utc::now()) else {
+                    let now = Utc::now();
+                    let Some(firing) = next_firing(&plan, cursor, now) else {
                         // Quartz marks a trigger with no future fire time
                         // `COMPLETE`.
                         tracing::info!(
@@ -117,35 +158,55 @@ pub(crate) fn spawn_job(
                         task.mark_completed();
                         return;
                     };
-                    let wait = (next - Utc::now()).to_std().unwrap_or(Duration::ZERO);
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = task.cancelled() => return,
+                    if firing.missed {
+                        // Quartz `SMART` policy = `FIRE_ONCE_NOW`: the slot elapsed
+                        // while the previous run was still in flight (or while the
+                        // task was paused), so fire it right away instead of
+                        // dropping it silently.
+                        tracing::warn!(
+                            task = %task.name(),
+                            slot = %firing.at,
+                            "missed cron firing: firing it once immediately"
+                        );
+                    } else {
+                        let wait = (firing.at - now).to_std().unwrap_or(Duration::ZERO);
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = task.cancelled() => return,
+                        }
+                        if task.is_cancelled() {
+                            return;
+                        }
                     }
-                    if task.is_cancelled() {
-                        return;
-                    }
-                    // Quartz skips a firing whose trigger is paused at fire time.
+                    // Quartz skips a firing whose trigger is paused at fire time;
+                    // the cursor keeps the slot, so resuming catches it up once.
                     if task.is_paused() {
                         continue;
                     }
                     // The slot is the planned fire instant, so two nodes that share
                     // the schedule derive the same lock key for the same occurrence.
-                    let slot = format!("cron:{}", next.timestamp_millis());
+                    let slot = format!("cron:{}", firing.at.timestamp_millis());
                     // A CRON trigger keeps firing after an interrupt (only the
                     // FIXED_DELAY chain is rescheduled in Java).
                     let _ = fire(&ctx, &task, &slot).await;
+                    // The next slot is computed from the one just fired; after a
+                    // catch-up the timeline restarts from *now*, so a run that is
+                    // always too slow cannot turn into an unbounded burst.
+                    cursor = if firing.missed { Utc::now() } else { firing.at };
                 }
             }
             ScheduleMode::FIXED_RATE => {
                 let period = Duration::from_millis(schedule_config.fixed_rate().unwrap_or(1));
                 let period_ms = period.as_millis().max(1) as i64;
-                let mut ticker = tokio::time::interval(period);
-                // Tokio's first tick is immediate. Consuming it must **not** push the
-                // first firing out by a whole period: Quartz starts the trigger at
-                // `now + initialDelay` (already slept above) and repeats every period
-                // afterwards. So the loop fires first and waits for the next tick after.
-                ticker.tick().await;
+                // The cadence grid is kept explicitly instead of with
+                // `tokio::time::interval`: an `interval` whose deadline already
+                // elapsed yields immediately (`Burst` and `Skip` alike), so a run
+                // that outlasts the period makes the loop fire back to back with no
+                // cadence at all. Quartz's `SMART` misfire policy instead drops the
+                // occurrences that elapsed during the run and stays on the grid. The
+                // grid starts when the task starts, i.e. at `now + initialDelay`
+                // (slept above), so the first firing is not a period late either.
+                let mut next = tokio::time::Instant::now();
                 loop {
                     if task.is_cancelled() {
                         return;
@@ -159,12 +220,19 @@ pub(crate) fn spawn_job(
                     // the same period share one lock key.
                     let slot = format!("rate:{}", Utc::now().timestamp_millis() / period_ms);
                     let _ = fire(&ctx, &task, &slot).await;
-                    // Only the wait for the next tick is raced against cancel: an
+                    // First grid point strictly after this run finished; the
+                    // occurrences that elapsed meanwhile are dropped, not replayed.
+                    next += period;
+                    let now = tokio::time::Instant::now();
+                    while next <= now {
+                        next += period;
+                    }
+                    // Only the wait for the next slot is raced against cancel: an
                     // execution in flight is never dropped, so `shutdown(true)` /
                     // `deleteJob` (which never interrupt a running job in Java) can
                     // wait for it to finish.
                     tokio::select! {
-                        _ = ticker.tick() => {}
+                        _ = tokio::time::sleep_until(next) => {}
                         _ = task.cancelled() => return,
                     }
                 }
@@ -289,6 +357,38 @@ mod tests {
             .next_fire_time(Utc.with_ymd_and_hms(2026, 9, 18, 1, 0, 0).unwrap())
             .unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 9, 19, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn a_slot_that_elapsed_during_a_run_is_reported_as_missed() {
+        // Every second. The loop is working towards 10:00:01 but only looks again
+        // at 10:00:03 (the previous run overran), so that slot is a misfire: Quartz
+        // `SMART` fires it once now instead of silently dropping it.
+        let plan = plan("* * * * * ?", 0);
+        let cursor = Utc.with_ymd_and_hms(2026, 10, 31, 10, 0, 0).unwrap();
+        let firing = next_firing(&plan, cursor, cursor).unwrap();
+        assert_eq!(
+            firing.at,
+            Utc.with_ymd_and_hms(2026, 10, 31, 10, 0, 1).unwrap()
+        );
+        assert!(!firing.missed);
+
+        let late = Utc.with_ymd_and_hms(2026, 10, 31, 10, 0, 3).unwrap();
+        let firing = next_firing(&plan, cursor, late).unwrap();
+        assert_eq!(
+            firing.at,
+            Utc.with_ymd_and_hms(2026, 10, 31, 10, 0, 1).unwrap()
+        );
+        assert!(firing.missed);
+
+        // After a catch-up the loop restarts from *now*, so the next slot is a
+        // future one and the whole backlog is never replayed.
+        let resumed = next_firing(&plan, late, late).unwrap();
+        assert_eq!(
+            resumed.at,
+            Utc.with_ymd_and_hms(2026, 10, 31, 10, 0, 4).unwrap()
+        );
+        assert!(!resumed.missed);
     }
 
     #[test]
